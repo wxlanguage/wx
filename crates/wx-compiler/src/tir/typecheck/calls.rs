@@ -38,7 +38,6 @@ impl BodyContext<'_, '_, '_, '_> {
 	pub(super) fn build_function_call(
 		&mut self,
 		function_index: FunctionIdx,
-		callee: &Spanned<ast::Expression>,
 		segment: &ast::PathSegment,
 		arguments: &[Separated<Spanned<ast::Expression>>],
 		expected: TypeIndex,
@@ -105,18 +104,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		self.check_param_bounds(
 			env, owner, segment, &params, &type_args, &given,
 		);
-		let callee_ty =
-			self.cx.types.intern_function(function_index, &type_args);
-		let callee_ty = self.cx.types.collapse_error(callee_ty);
-		let callee = self.body.push(
-			ExprKind::Function(function_index),
-			callee_ty,
-			callee.span,
-		);
 		let args = self.body.push_args(given.iter().map(|&(_, value)| value));
 		let ty = self.instantiate(return_type, env, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
-		self.body.push(ExprKind::Call { callee, args }, ty, span)
+		let type_args = self.cx.types.push_list(&type_args);
+		self.body.push(
+			ExprKind::Call {
+				function: function_index,
+				type_args,
+				args,
+			},
+			ty,
+			span,
+		)
 	}
 
 	/// `ty`, written with the parameters of `env`, with `args` for them. A

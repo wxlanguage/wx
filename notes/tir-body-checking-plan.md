@@ -11,8 +11,8 @@ the end; several sections depend on their answers.
 (`body.rs`) for a constant initializer or an enum discriminant. It covers:
 literals (with in-place coercion of untyped subtrees, typeset targets included),
 grouping, unary/binary operators through their traits (`PrimitiveBinary`/
-`PrimitiveUnary` on a primitive scalar, `ConcreteMethodCall`/`AbstractMethodCall`
-otherwise), tuples, paths to
+`PrimitiveUnary` on a primitive scalar, `Call`/`AbstractCall` of the operator's
+method otherwise), tuples, paths to
 constants and variants, and struct construction by position or name with local
 inference of the struct's type arguments (`meet`/`learn`) and bound checks at
 the call (`check_now`). Every other form is a `todo!()`, so turning function
@@ -254,19 +254,22 @@ The assignment kinds stay separate, for the reasons they were split in the old
 checker: a place is an address computed once and written through (`Store`,
 `*CompoundStore`), the other targets are expressions (`Assign`,
 `*CompoundAssign`); and an abstract target type keeps the trait's declaration
-for monomorphization. Operator and compound nodes are named on two axes. The
-prefix says what defines the operation: `Primitive` (the primitive scalar's
-operator, holding `op`), `Concrete` (the method of the impl selected for a
-concrete type) or `Abstract` (the trait's declaration, its impl selected at
-monomorphization), both holding `method`. The rest says where the result goes:
-`Assign` (a local or a field of one), `Store` (a place in linear memory), or
-nowhere (a value):
+for monomorphization. Operator, call and compound nodes are sorted on two
+axes. The first is what defines the operation: a primitive scalar's operator
+(`Primitive*`, holding `op`); a known function (`Call`, `ConcreteCompound*`,
+the selected impl's method for an operator); or a trait's declaration, its impl
+selected at monomorphization (`AbstractCall`, `AbstractCompound*`). Every
+function is held with its type arguments as one flat `TypeList`: an impl's
+arguments, then the function's own (`[Self, own...]` for a trait's
+declaration), the layout `substitute`/`learn` and signatures already use. The
+second, for a compound assignment, is where the result goes: `Assign` (a local
+or a field of one) or `Store` (a place in linear memory):
 
 | | value | into a local | into memory |
 |---|---|---|---|
-| `Primitive` | `PrimitiveBinary`, `PrimitiveUnary` | `PrimitiveCompoundAssign` | `PrimitiveCompoundStore` |
-| `Concrete` | `ConcreteMethodCall` | `ConcreteCompoundAssign` | `ConcreteCompoundStore` |
-| `Abstract` | `AbstractMethodCall` | `AbstractCompoundAssign` | `AbstractCompoundStore` |
+| native op | `PrimitiveBinary`, `PrimitiveUnary` | `PrimitiveCompoundAssign` | `PrimitiveCompoundStore` |
+| known function | `Call` | `ConcreteCompoundAssign` | `ConcreteCompoundStore` |
+| trait declaration | `AbstractCall` | `AbstractCompoundAssign` | `AbstractCompoundStore` |
 
 Compared with the old checker, which had four compound nodes that always held a
 method (primitives went through their `#[inline]` impls), the `Primitive`
@@ -279,28 +282,29 @@ A `Load` is pushed only where a place's value is used, so `.&` and the left of
 ### Calls
 
 ```rust
-ExprKind::Call { callee: Callee, args: ExprRange, order: ArgOrder }
-enum Callee {
-    Function { func_index: FunctionIdx, type_args: TypeList },     // direct, `f::<T>(..)`
-    Method { method: FunctionIdx, type_args: TypeList },           // selected impl member
-    Generic { method: FunctionIdx, type_args: TypeList },          // trait declaration, abstract receiver
-    Indirect(ExprIdx),                                             // a `func(A) -> R` value
-}
+/// Direct: a free function, `Type::f(..)`, `x.m(..)`, an operator's impl method.
+ExprKind::Call { function: FunctionIdx, type_args: TypeList, args: ExprRange }
+/// A trait's declaration: an abstract receiver, or an impl inheriting a default.
+ExprKind::AbstractCall { method: FunctionIdx, type_args: TypeList, args: ExprRange }
+// later: IndirectCall { callee: ExprIdx, args: ExprRange }, a `func(A) -> R` value
 ```
 
-`ConcreteMethodCall`/`AbstractMethodCall` from operators fold into this. Struct
-construction stays its own kind (no callee). Inference for a function call is
-struct construction generalised: the callee's parameter frame plays the struct's
-role, the parameter types the fields', and the return type is met with the
-expected type first. `struct_type_args`/`learn_field`/`field_type`/
-`report_uninferred`/`check_struct_bounds` become one "instantiate a generic
-frame at a call" helper used by both. Named arguments map through
-`FunctionDef::params` exactly as fields do through `StructDef::lookup`.
+A call is direct whenever the function is known, so a method call is a `Call`
+like any other: `x.m(a)` and `T::m(x, a)` build the same node, the receiver
+first in `args`, and which spelling was written is in the name resolutions.
+Only a trait's declaration (`AbstractCall`) and a runtime value
+(`IndirectCall`, not yet) are calls of something else. Struct construction
+stays its own kind. Inference for a function call is struct construction
+generalised: the callee's parameter frame plays the struct's role, the
+parameter types the fields', and the return type is met with the expected type
+first. For a method, the frame's leading slots are the impl's, filled by impl
+selection (`match_impl_target`, `find_trait_impl`); the written `::<..>` and
+`learn` fill the method's own.
 
 `Type::Function` (a function item's zero-sized type) is what a bare path to a
 function evaluates to; it coerces to `Type::FunctionRef` where one is expected.
-Calling a value of a user type that implements `Call` would be
-`Callee::Method` on `Call::call` (see Q3).
+Calling a value of a user type that implements `Call` would be a `Call` of
+`Call::call`'s impl (see Q3).
 
 ### Patterns
 
@@ -409,7 +413,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   pitfall). New code can do it from the start since impl members carry
   visibility; decide the rule for trait default methods (fall back to the
   trait's visibility).
-- **Impl conformance** is not a body concern, but `AbstractMethodCall` to a
+- **Impl conformance** is not a body concern, but `AbstractCall` to a
   default the impl does not override assumes it. Keep it on the list.
 - **Constant evaluation of richer bodies**: the evaluator returns `NotConst`
   for anything it does not know, so new kinds are safe by default. Whether
@@ -435,5 +439,5 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   see the table under places and assignment.
 - **Q5. Typeset-abstract literal arithmetic in bodies.** Coercion of literals
   to an abstract typeset-bounded `T` exists for constants; in a body, an operator
-  on `T` gives a `AbstractMethodCall`. Is anything beyond that expected (for
+  on `T` gives an `AbstractCall`. Is anything beyond that expected (for
   example `as` casts between typeset members)?

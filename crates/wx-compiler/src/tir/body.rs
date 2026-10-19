@@ -17,7 +17,7 @@
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, StructIdx};
-use super::types::TypeIndex;
+use super::types::{TypeIndex, TypeList};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
@@ -99,13 +99,15 @@ pub(super) enum ExprKind {
 	/// A function as a value, of its own zero-sized type (`Type::Function`,
 	/// which carries the type arguments).
 	Function(FunctionIdx),
-	// Operators and compound assignment. A name says what defines the
-	// operation: `Primitive`, the operator of a primitive scalar (it holds the
-	// `op`); `Concrete`, the method of the impl selected for a concrete type;
-	// `Abstract`, the trait's declaration of the method, for an abstract type,
-	// whose impl is selected at monomorphization (both hold the `method`).
-	// It then says where the result goes: `Assign`, a local or a field of
-	// one; `Store`, a place in linear memory; neither, it is a value.
+	// Operators, calls and compound assignment. What defines the operation:
+	// a primitive scalar's operator (`Primitive*`, holding the `op`); a known
+	// function (`Call`, `ConcreteCompound*`); or a trait's declaration, whose
+	// impl is selected at monomorphization (`AbstractCall`,
+	// `AbstractCompound*`). A compound assignment's name then says where the
+	// result goes: `Assign`, a local or a field of one; `Store`, a place in
+	// linear memory. Every function is held with its type arguments, flat: an
+	// impl's arguments and then the function's own, or `Self` and then the
+	// declaration's own for a trait's.
 	/// `op operand` on a primitive scalar.
 	PrimitiveUnary {
 		op: UnaryOp,
@@ -118,22 +120,21 @@ pub(super) enum ExprKind {
 		lhs: ExprIdx,
 		rhs: ExprIdx,
 	},
-	/// An operator on a concrete type: a call of the selected impl's method,
-	/// the receiver first in `args`.
-	ConcreteMethodCall {
-		method: FunctionIdx,
-		args: ExprRange,
-	},
-	/// An operator on an abstract type: a call of the trait's declaration of
-	/// the method, the receiver first in `args`.
-	AbstractMethodCall {
-		method: FunctionIdx,
-		args: ExprRange,
-	},
-	/// A call of `callee`, a `Function` node whose type carries the type
-	/// arguments the call was checked with.
+	/// A direct call of a known function: a free function, `Type::f(..)`,
+	/// `x.m(..)`, or the impl method an operator on a concrete type selects.
+	/// A method's receiver is the first of `args`.
 	Call {
-		callee: ExprIdx,
+		function: FunctionIdx,
+		type_args: TypeList,
+		args: ExprRange,
+	},
+	/// A call of a trait's declaration, whose impl is selected once `Self`
+	/// is known: for an abstract receiver, or a concrete one whose impl
+	/// inherits the trait's default. A method's receiver is the first of
+	/// `args`.
+	AbstractCall {
+		method: FunctionIdx,
+		type_args: TypeList,
 		args: ExprRange,
 	},
 	/// A tuple of its elements, in order: `(a, b)`, `(a,)` or `()`.
@@ -229,6 +230,7 @@ pub(super) enum ExprKind {
 	/// method.
 	ConcreteCompoundAssign {
 		method: FunctionIdx,
+		type_args: TypeList,
 		target: ExprIdx,
 		value: ExprIdx,
 	},
@@ -236,6 +238,7 @@ pub(super) enum ExprKind {
 	/// declaration of the method.
 	AbstractCompoundAssign {
 		method: FunctionIdx,
+		type_args: TypeList,
 		target: ExprIdx,
 		value: ExprIdx,
 	},
@@ -250,6 +253,7 @@ pub(super) enum ExprKind {
 	/// method.
 	ConcreteCompoundStore {
 		method: FunctionIdx,
+		type_args: TypeList,
 		place: PlaceIdx,
 		value: ExprIdx,
 	},
@@ -257,6 +261,7 @@ pub(super) enum ExprKind {
 	/// declaration of the method.
 	AbstractCompoundStore {
 		method: FunctionIdx,
+		type_args: TypeList,
 		place: PlaceIdx,
 		value: ExprIdx,
 	},

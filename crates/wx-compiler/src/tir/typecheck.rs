@@ -9,7 +9,7 @@
 //! Operators are checked through their trait (`OperatorTraits`): the trait
 //! decides whether the operator applies to a type. The node built for it is a
 //! `PrimitiveBinary`/`PrimitiveUnary` on a primitive scalar, and a call of the
-//! impl's or the trait's method otherwise (`ConcreteMethodCall`/`AbstractMethodCall`).
+//! impl's method (`Call`) or the trait's declaration (`AbstractCall`) otherwise.
 //!
 //! Untyped literals keep the pseudo-types `Integer`/`Float`/`String` until
 //! context gives them one (`coerce`), which rewrites the subtree in place. A
@@ -53,7 +53,9 @@ use super::operators::{
 use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
-use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
+use super::types::{
+	Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+};
 use crate::ast::{self, BinaryOp, Keyword, Ownership, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -651,7 +653,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Arguments::Positional(arguments),
 				) => self.build_function_call(
 					function_index,
-					callee,
 					segments.last().unwrap(),
 					arguments,
 					expected,
@@ -1389,7 +1390,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			};
 			return (kind, ty);
 		}
-		(self.method_call(lookup, [operand]), ty)
+		(self.method_call(lookup, ty, [operand]), ty)
 	}
 
 	/// The node for a binary operator on operands of concrete type `ty`, and
@@ -1437,7 +1438,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			};
 			return (kind, result);
 		}
-		(self.method_call(lookup, [lhs, rhs]), result)
+		(self.method_call(lookup, ty, [lhs, rhs]), result)
 	}
 
 	/// Whether `ty` implements the operator's trait, and through what. `None`
@@ -1491,46 +1492,59 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		found
 	}
 
-	/// A call to the operator's method: the selected impl's own, or the trait's
-	/// declaration when the receiver is abstract or the impl inherits a default.
+	/// A call of the operator's method on operands of type `ty`: the selected
+	/// impl's own, or the trait's declaration when the receiver is abstract
+	/// or the impl inherits a default.
 	fn method_call<const N: usize>(
 		&mut self,
 		selected: (OperatorMethod, TraitImplLookup),
+		ty: TypeIndex,
 		args: [ExprIdx; N],
 	) -> ExprKind {
 		let args = self.body.push_args(args);
-		match self.select_operator_method(selected) {
-			SelectedMethod::Concrete(method) => {
-				ExprKind::ConcreteMethodCall { method, args }
-			}
-			SelectedMethod::Abstract(method) => {
-				ExprKind::AbstractMethodCall { method, args }
+		match self.select_operator_method(selected, ty) {
+			SelectedMethod::Concrete {
+				function,
+				type_args,
+			} => ExprKind::Call {
+				function,
+				type_args,
+				args,
+			},
+			SelectedMethod::Abstract { method, type_args } => {
+				ExprKind::AbstractCall {
+					method,
+					type_args,
+					args,
+				}
 			}
 		}
 	}
 
-	/// Which method an operator calls: the selected impl's own, or the
-	/// trait's declaration when the receiver is abstract or the impl inherits
-	/// a default.
+	/// Which method an operator on operands of type `ty` calls, with its type
+	/// arguments: the selected impl's own, with the impl's arguments, or the
+	/// trait's declaration, with `ty` as `Self`, when the receiver is
+	/// abstract or the impl inherits a default.
 	fn select_operator_method(
-		&self,
+		&mut self,
 		(method, lookup): (OperatorMethod, TraitImplLookup),
+		ty: TypeIndex,
 	) -> SelectedMethod {
-		let TraitImplLookup::Concrete { impl_index, .. } = lookup else {
-			return SelectedMethod::Abstract(method.method);
-		};
-		match self
-			.cx
-			.defs
-			.select_trait_member(impl_index, MemberKind::Method(method.method))
-		{
-			TraitMemberSelection::Impl(
-				MemberKind::Method(selected) | MemberKind::Function(selected),
-			) => SelectedMethod::Concrete(selected),
-			TraitMemberSelection::Impl(_)
-			| TraitMemberSelection::TraitDeclaration(_) => {
-				SelectedMethod::Abstract(method.method)
-			}
+		if let TraitImplLookup::Concrete { impl_index, args } = lookup
+			&& let TraitMemberSelection::Impl(
+				MemberKind::Method(function) | MemberKind::Function(function),
+			) = self.cx.defs.select_trait_member(
+				impl_index,
+				MemberKind::Method(method.method),
+			) {
+			return SelectedMethod::Concrete {
+				function,
+				type_args: self.cx.types.push_list(&args),
+			};
+		}
+		SelectedMethod::Abstract {
+			method: method.method,
+			type_args: self.cx.types.push_list(&[ty]),
 		}
 	}
 
@@ -2041,14 +2055,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 pub(super) const STRING_TARGETS_NOTE: &str = "a string literal is a shared \
 	byte slice or byte array in a memory: `heap::&[u8]` or `heap::&[u8; N]`";
 
-/// The method an operator dispatches to.
+/// The method an operator dispatches to, with its type arguments.
 #[derive(Clone, Copy)]
 enum SelectedMethod {
 	/// The selected impl's own method, called directly.
-	Concrete(FunctionIdx),
+	Concrete {
+		function: FunctionIdx,
+		type_args: TypeList,
+	},
 	/// The trait's declaration, whose impl is selected once the receiver is
 	/// known.
-	Abstract(FunctionIdx),
+	Abstract {
+		method: FunctionIdx,
+		type_args: TypeList,
+	},
 }
 
 /// A call's arguments, by position or by name.
@@ -2498,17 +2518,21 @@ mod tests {
 				ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 					list(op.as_str(), &[lhs, rhs])
 				}
-				ExprKind::ConcreteMethodCall { method, args } => {
-					let method = self.function_name(method);
-					list(&format!("call {method}"), body.args(args))
-				}
-				ExprKind::AbstractMethodCall { method, args } => {
-					let method = self.function_name(method);
-					list(&format!("generic {method}"), body.args(args))
-				}
-				ExprKind::Call { callee, args } => {
-					let callee = self.render(body, callee);
+				ExprKind::Call {
+					function,
+					type_args,
+					args,
+				} => {
+					let callee = self.callee(function, type_args);
 					list(&format!("call {callee}"), body.args(args))
+				}
+				ExprKind::AbstractCall {
+					method,
+					type_args,
+					args,
+				} => {
+					let callee = self.callee(method, type_args);
+					list(&format!("abstract {callee}"), body.args(args))
 				}
 				ExprKind::Tuple { elements } => {
 					list("tuple", body.args(elements))
@@ -2587,18 +2611,23 @@ mod tests {
 				}
 				ExprKind::ConcreteCompoundAssign {
 					method,
+					type_args,
 					target,
 					value,
 				} => list(
-					&format!("assign call {}", self.function_name(method)),
+					&format!("assign call {}", self.callee(method, type_args)),
 					&[target, value],
 				),
 				ExprKind::AbstractCompoundAssign {
 					method,
+					type_args,
 					target,
 					value,
 				} => list(
-					&format!("assign generic {}", self.function_name(method)),
+					&format!(
+						"assign abstract {}",
+						self.callee(method, type_args)
+					),
 					&[target, value],
 				),
 				ExprKind::PrimitiveCompoundStore { op, place, value } => {
@@ -2611,21 +2640,23 @@ mod tests {
 				}
 				ExprKind::ConcreteCompoundStore {
 					method,
+					type_args,
 					place,
 					value,
 				} => format!(
 					"(store call {} {} {})",
-					self.function_name(method),
+					self.callee(method, type_args),
 					self.render_place(body, place),
 					self.render(body, value)
 				),
 				ExprKind::AbstractCompoundStore {
 					method,
+					type_args,
 					place,
 					value,
 				} => format!(
-					"(store generic {} {} {})",
-					self.function_name(method),
+					"(store abstract {} {} {})",
+					self.callee(method, type_args),
 					self.render_place(body, place),
 					self.render(body, value)
 				),
@@ -2648,6 +2679,23 @@ mod tests {
 		fn function_name(&self, index: super::FunctionIdx) -> &str {
 			let name = self.defs.functions[usize::from(index)].name.inner;
 			self.context.strings.resolve(name).unwrap()
+		}
+
+		/// A called function's name, with its type arguments when it has
+		/// any: `add`, `id<u8>`.
+		fn callee(
+			&self,
+			index: super::FunctionIdx,
+			type_args: super::TypeList,
+		) -> String {
+			let name = self.function_name(index);
+			let type_args = self.context.types.list(type_args);
+			if type_args.is_empty() {
+				return name.to_string();
+			}
+			let type_args: Vec<String> =
+				type_args.iter().map(|&ty| self.display(ty)).collect();
+			format!("{name}<{}>", type_args.join(", "))
 		}
 
 		fn local_name(&self, body: &Body, local: super::LocalIdx) -> String {
@@ -3139,6 +3187,29 @@ mod tests {
 	}
 
 	#[test]
+	fn an_operator_call_carries_its_type_arguments() {
+		test_case!(
+			case = indoc! {"
+				struct W<T>(x: T);
+				impl<T> Add for W<T> { func add(self, rhs: Self) -> Self { rhs } }
+				func concrete(w: W<u8>) -> W<u8> { w + w }
+				func generic<T: Add>(t: T) -> T { t + t }
+				func assigned(w: W<u8>) { local mut v = w; v += w; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("concrete"), "(block => (call add<u8> w#0 w#0))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (abstract add<T> t#0 t#0))"
+		);
+		assert_eq!(
+			case.shape("assigned"),
+			"(block (local v#1 w#0) (assign call add<u8> v#1 w#0))"
+		);
+	}
+
+	#[test]
 	fn compound_assignment_dispatches_like_its_operator() {
 		test_case!(
 			case = indoc! {"
@@ -3162,7 +3233,7 @@ mod tests {
 		);
 		assert_eq!(
 			case.shape("generic"),
-			"(block (local u#1 t#0) (assign generic add u#1 t#0))"
+			"(block (local u#1 t#0) (assign abstract add<T> u#1 t#0))"
 		);
 	}
 
@@ -3292,17 +3363,7 @@ mod tests {
 		assert_eq!(case.body_type("from_argument"), "u16");
 		assert_eq!(case.body_type("from_expected"), "u8");
 		assert_eq!(case.locals("from_turbofish"), [("x".into(), "i64".into())]);
-		let body = case.body("from_expected");
-		let ExprKind::Block {
-			result: Some(call), ..
-		} = body.kind(body.root())
-		else {
-			unreachable!()
-		};
-		let ExprKind::Call { callee, .. } = body.kind(call) else {
-			unreachable!()
-		};
-		assert_eq!(case.display(body.ty(callee)), "id<u8>");
+		assert_eq!(case.shape("from_expected"), "(block => (call id<u8> 1))");
 	}
 
 	#[test]

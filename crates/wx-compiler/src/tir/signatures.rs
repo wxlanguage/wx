@@ -4688,17 +4688,21 @@ pub(super) mod tests {
 						render(case, body, lhs),
 						render(case, body, rhs)
 					),
-					ExprKind::ConcreteMethodCall { method, args }
-					| ExprKind::AbstractMethodCall { method, args } => {
-						let generic = matches!(
+					ExprKind::Call {
+						function: method,
+						args,
+						..
+					}
+					| ExprKind::AbstractCall { method, args, .. } => {
+						let abstract_call = matches!(
 							body.kind(expr),
-							ExprKind::AbstractMethodCall { .. }
+							ExprKind::AbstractCall { .. }
 						);
 						let name =
 							case.defs.functions[usize::from(method)].name.inner;
 						let mut text = format!(
 							"({}{}",
-							if generic { "generic " } else { "call " },
+							if abstract_call { "abstract " } else { "call " },
 							case.context.strings.resolve(name).unwrap()
 						);
 						for &arg in body.args(args) {
@@ -4896,7 +4900,7 @@ pub(super) mod tests {
 			assert_eq!(shape(&case, "X"), "(V):V");
 			assert_eq!(shape(&case, "Y"), "(call add X:V X:V):V");
 			// `ne` is the trait's default: dispatched through the declaration.
-			assert_eq!(shape(&case, "Z"), "(generic ne X:V X:V):bool");
+			assert_eq!(shape(&case, "Z"), "(abstract ne X:V X:V):bool");
 		}
 
 		#[test]

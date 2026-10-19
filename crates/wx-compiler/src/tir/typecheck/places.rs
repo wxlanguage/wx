@@ -15,7 +15,7 @@ use super::{BodyContext, SelectedMethod};
 use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
-use crate::tir::defs::{FunctionIdx, Visibility};
+use crate::tir::defs::Visibility;
 use crate::tir::operators::is_primitive_binary;
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
@@ -30,10 +30,8 @@ enum Operand {
 enum CompoundMethod {
 	/// The primitive scalar's operator.
 	Primitive,
-	/// The selected impl's method.
-	Concrete(FunctionIdx),
-	/// The trait's declaration of the method.
-	Abstract(FunctionIdx),
+	/// The operator's method: the selected impl's, or the trait's declaration.
+	Method(SelectedMethod),
 }
 
 impl BodyContext<'_, '_, '_, '_> {
@@ -368,20 +366,24 @@ impl BodyContext<'_, '_, '_, '_> {
 							value,
 						}
 					}
-					CompoundMethod::Concrete(method) => {
-						ExprKind::ConcreteCompoundStore {
-							method,
-							place,
-							value,
-						}
-					}
-					CompoundMethod::Abstract(method) => {
-						ExprKind::AbstractCompoundStore {
-							method,
-							place,
-							value,
-						}
-					}
+					CompoundMethod::Method(SelectedMethod::Concrete {
+						function,
+						type_args,
+					}) => ExprKind::ConcreteCompoundStore {
+						method: function,
+						type_args,
+						place,
+						value,
+					},
+					CompoundMethod::Method(SelectedMethod::Abstract {
+						method,
+						type_args,
+					}) => ExprKind::AbstractCompoundStore {
+						method,
+						type_args,
+						place,
+						value,
+					},
 				};
 				self.body.push(kind, TypeIndex::UNIT, span)
 			}
@@ -414,20 +416,24 @@ impl BodyContext<'_, '_, '_, '_> {
 							value,
 						}
 					}
-					CompoundMethod::Concrete(method) => {
-						ExprKind::ConcreteCompoundAssign {
-							method,
-							target,
-							value,
-						}
-					}
-					CompoundMethod::Abstract(method) => {
-						ExprKind::AbstractCompoundAssign {
-							method,
-							target,
-							value,
-						}
-					}
+					CompoundMethod::Method(SelectedMethod::Concrete {
+						function,
+						type_args,
+					}) => ExprKind::ConcreteCompoundAssign {
+						method: function,
+						type_args,
+						target,
+						value,
+					},
+					CompoundMethod::Method(SelectedMethod::Abstract {
+						method,
+						type_args,
+					}) => ExprKind::AbstractCompoundAssign {
+						method,
+						type_args,
+						target,
+						value,
+					},
 				};
 				self.body.push(kind, TypeIndex::UNIT, span)
 			}
@@ -454,14 +460,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		if is_primitive_binary(plain, ty) {
 			return Some(CompoundMethod::Primitive);
 		}
-		Some(match self.select_operator_method(selected) {
-			SelectedMethod::Concrete(method) => {
-				CompoundMethod::Concrete(method)
-			}
-			SelectedMethod::Abstract(method) => {
-				CompoundMethod::Abstract(method)
-			}
-		})
+		Some(CompoundMethod::Method(
+			self.select_operator_method(selected, ty),
+		))
 	}
 
 	/// Reports a write through a shared pointer.
