@@ -1,6 +1,10 @@
 //! Expression checking: lowers written expressions into a `Body`, with every
-//! node typed. One checker for every expression, whatever owns it; constant
-//! initializers are the first owner, function bodies follow.
+//! node typed. One checker for every expression, whatever owns it: a
+//! constant's or global's initializer, or a function's block.
+//!
+//! Blocks, locals and control flow are in `blocks`, places and assignment in
+//! `places`, function calls in `calls`, casts in `casts`. A form the checker does not cover yet
+//! is reported once (`UnsupportedExpression`) and checked as an error node.
 //!
 //! Operators are checked through their trait (`OperatorTraits`): the trait
 //! decides whether the operator applies to a type. The node built for it is a
@@ -16,28 +20,37 @@
 //! (`TypeInterner::meet`/`learn`); what none of them gives needs an
 //! annotation.
 
+mod blocks;
+mod calls;
+mod casts;
+mod places;
+
+use std::collections::HashMap;
+
 use codespan_reporting::diagnostic::{Diagnostic, Label};
+use string_interner::symbol::SymbolU32;
 
 use super::body::{
-	ArgOrder, Body, BodyBuilder, ExprIdx, ExprKind, ExprRange, ParamIdx,
+	ArgOrder, Body, BodyBuilder, BodyOwner, ExprIdx, ExprKind, ExprRange,
+	LocalIdx, ParamIdx, Scope, ScopeIdx, ScopeKind,
 };
 use super::defs::{
-	BindingTarget, ConstIdx, DefKey, DefKind, FieldIdx, MemberKind, StructIdx,
-	Tier, TypesetIdx,
+	BindingTarget, ConstIdx, DefKey, DefKind, FieldIdx, FunctionIdx,
+	MemberKind, StructIdx, Tier, TypesetIdx,
 };
 use super::imports::report_private_identifier;
 use super::literals::{CharLiteralError, parse_char_literal};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
 use super::operators::{
-	Scalar, is_builtin_binary, is_builtin_unary, is_comparison,
+	OperatorMethod, Scalar, is_builtin_binary, is_builtin_unary, is_comparison,
 };
-use super::paths::PathResolver;
+use super::paths::{PathResolver, PathWalk};
+use super::resolutions::{NameResolutions, Referent};
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
-use crate::ast::{self, BinaryOp, Spanned, UnaryOp};
+use crate::ast::{self, BinaryOp, Keyword, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::operators::OperatorMethod;
 use crate::vfs::FileId;
 
 /// Checks the expressions of one definition into a `Body`.
@@ -45,19 +58,49 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 	body: BodyBuilder,
 	/// Where the expressions are written. Its type scope is the root for a
-	/// free constant, the impl's or trait's `Self` scope for an associated one.
+	/// free constant, the impl's or trait's `Self` scope for an associated one,
+	/// the function's own for a function's block.
 	scope: LexicalScope,
+	owner: BodyOwner,
+	/// The block scope being checked.
+	current: ScopeIdx,
+	/// The locals each scope declares, by name. A name is looked up in the
+	/// current scope, then in each enclosing one; a later declaration of the
+	/// same name in one scope replaces the entry, which shadows the earlier.
+	names: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+	/// What each scope's value is checked against, index-aligned with the
+	/// body's scopes.
+	scope_types: Vec<ScopeType>,
+	/// Whether each label is named by a `break` or `continue`, index-aligned
+	/// with the body's labels.
+	label_used: Vec<bool>,
+}
+
+/// The type a scope's value is held to while its block is checked.
+#[derive(Clone, Copy)]
+struct ScopeType {
+	/// What the context expects of the scope's value; `INFER` for nothing.
+	expected: TypeIndex,
+	/// The type the first value given to the scope settled on (its result,
+	/// a `break`, a `return`); `INFER` until one does.
+	ty: TypeIndex,
 }
 
 impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	pub(super) fn new(
 		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 		scope: LexicalScope,
+		owner: BodyOwner,
 	) -> Self {
 		Self {
 			cx,
 			body: BodyBuilder::default(),
 			scope,
+			owner,
+			current: ScopeIdx::ROOT,
+			names: HashMap::new(),
+			scope_types: Vec::new(),
+			label_used: Vec::new(),
 		}
 	}
 
@@ -68,7 +111,42 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expected: TypeIndex,
 	) -> Body {
 		let expected = self.normalized(expected, self.scope.env);
+		self.enter_root(expr.span, expected);
 		let root = self.check(expr, expected);
+		self.finish(root)
+	}
+
+	/// Pushes the root scope, which every body has.
+	fn enter_root(&mut self, span: TextSpan, expected: TypeIndex) {
+		let root = self.body.push_scope(Scope {
+			kind: ScopeKind::Root,
+			parent: None,
+			label: None,
+			span,
+		});
+		debug_assert_eq!(root, ScopeIdx::ROOT);
+		self.scope_types.push(ScopeType {
+			expected,
+			ty: TypeIndex::INFER,
+		});
+	}
+
+	fn finish(self, root: ExprIdx) -> Body {
+		for (at, &used) in self.label_used.iter().enumerate() {
+			if !used {
+				let label =
+					self.body.label(super::body::LabelIdx::new(at as u32));
+				self.cx.diagnostics.push(
+					Diagnostic::warning()
+						.with_code(DiagnosticCode::UnusedLabel.code())
+						.with_message("unused label")
+						.with_label(Label::primary(
+							self.scope.file_id,
+							label.name.span,
+						)),
+				);
+			}
+		}
 		self.body.finish(root)
 	}
 
@@ -82,11 +160,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		repr: TypeIndex,
 	) -> Body {
 		let span = variant.name.span;
+		self.enter_root(span, repr);
 		// A missing or non-integer repr was reported on the enum; checking each
 		// value against it would only repeat that.
 		if repr == TypeIndex::ERROR {
 			let root = self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
-			return self.body.finish(root);
+			return self.finish(root);
 		}
 		let root = match (variant.value.as_deref(), previous) {
 			(Some(value), _) => self.check(value, repr),
@@ -114,11 +193,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 		};
-		self.body.finish(root)
+		self.finish(root)
 	}
 
 	/// Builds `expr` and holds it to `expected`: an untyped literal takes that
-	/// type, any other type must equal it. `INFER` and `ERROR` expect nothing.
+	/// type, any other type must equal it, and `!` fits any type, since no
+	/// value ever arrives. `INFER` and `ERROR` expect nothing.
 	fn check(
 		&mut self,
 		expr: &Spanned<ast::Expression>,
@@ -135,7 +215,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let actual = self.body.ty(expr);
 		if self.cx.types.has_untyped(actual) {
 			self.coerce(expr, expected);
-		} else if actual != TypeIndex::ERROR && actual != expected {
+		} else if actual != TypeIndex::ERROR
+			&& actual != TypeIndex::NEVER
+			&& actual != expected
+		{
 			let diagnostic = self.report_type_mismatch(expected, actual, expr);
 			self.cx.diagnostics.push(diagnostic);
 			// Reported: nothing reads a value from it, or reports it again.
@@ -197,11 +280,117 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Tuple { elements } => {
 				self.build_tuple(elements, expected, span)
 			}
+			ast::Expression::Block { statements } => {
+				self.build_block(statements, expected, None, span)
+			}
+			ast::Expression::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => self.build_if_else(
+				condition,
+				then_block,
+				else_block.as_deref(),
+				expected,
+				None,
+				span,
+			),
+			ast::Expression::Loop { block } => {
+				self.build_loop(block, expected, None, span)
+			}
+			ast::Expression::Label { label, block } => {
+				self.build_labelled(*label, block, expected, span)
+			}
+			ast::Expression::Break { label, value } => {
+				self.build_break(*label, value.as_deref(), span)
+			}
+			ast::Expression::Continue { label } => {
+				self.build_continue(*label, span)
+			}
+			ast::Expression::Return { value } => {
+				self.build_return(value.as_deref(), span)
+			}
+			ast::Expression::Deref { .. }
+			| ast::Expression::ObjectAccess { .. } => self.build_read(expr),
+			ast::Expression::AddressOf { value } => {
+				self.build_address_of(value, span)
+			}
+			ast::Expression::Placeholder => {
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::InvalidAssignmentTarget.code(),
+						)
+						.with_message(
+							"`_` can only be used on the left of an assignment",
+						)
+						.with_label(Label::primary(self.scope.file_id, span)),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
 			ast::Expression::Error => {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
-			_ => todo!("checking this expression form"),
+			ast::Expression::Cast { value, ty } => {
+				self.build_cast(value, ty, expected, span)
+			}
+			ast::Expression::MethodCall(_)
+			| ast::Expression::NamedMethodCall(_) => {
+				self.unsupported(span, "a method call")
+			}
+			ast::Expression::TypeApplication { .. } => {
+				self.unsupported(span, "a type application")
+			}
+			ast::Expression::Match { .. } => {
+				self.unsupported(span, "a `match`")
+			}
+			ast::Expression::String => {
+				self.unsupported(span, "a string literal")
+			}
+			ast::Expression::QualifiedPath { .. }
+			| ast::Expression::Grouped { .. } => {
+				self.unsupported(span, "a qualified path")
+			}
+			ast::Expression::ArrayList { .. }
+			| ast::Expression::ArrayRepeat { .. } => {
+				self.unsupported(span, "an array literal")
+			}
+			ast::Expression::Index { .. }
+			| ast::Expression::SliceRange { .. } => self.unsupported(span, "indexing"),
 		}
+	}
+
+	/// Reports a form the checker does not cover yet and stands in an error
+	/// node for it, so nothing around it reports again. Nothing inside it is
+	/// checked.
+	fn unsupported(&mut self, span: TextSpan, what: &str) -> ExprIdx {
+		self.report_unsupported(span, what);
+		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+	}
+
+	/// Reports that `value`, untyped, needs a type from its context, and
+	/// leaves it at `ERROR`.
+	fn report_annotation_required(&mut self, value: ExprIdx) {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypeAnnotationRequired.code())
+				.with_message("type annotation required")
+				.with_label(
+					self.source_span(value)
+						.primary_label()
+						.with_message("the type of this value is not known"),
+				),
+		);
+		self.body.set_ty(value, TypeIndex::ERROR);
+	}
+
+	fn report_unsupported(&mut self, span: TextSpan, what: &str) {
+		self.cx.diagnostics.push(
+			Diagnostic::bug()
+				.with_code(DiagnosticCode::UnsupportedExpression.code())
+				.with_message(format!("checking {what} is not supported yet"))
+				.with_label(Label::primary(self.scope.file_id, span)),
+		);
 	}
 
 	/// A tuple, each element built with the expected type's element at its
@@ -265,25 +454,25 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// A value path. Only constants, enum variants and struct names are
-	/// checked yet.
+	/// A value path: a local, or an item in scope. Locals come first, so a
+	/// local shadows an item of the same name.
 	fn build_path(
 		&mut self,
 		segments: &[ast::PathSegment],
 		span: TextSpan,
 	) -> ExprIdx {
-		let walk = PathResolver::new(
-			self.cx.diagnostics,
-			self.cx.resolutions,
-			self.cx.strings,
-			self.cx.defs,
-		)
-		.walk_path(
-			self.scope.file_id,
-			self.scope.namespace,
-			segments,
-			Tier::Value,
-		);
+		if let [segment] = segments
+			&& segment.type_args.is_empty()
+			&& let Some(local) = self.lookup_local(segment.ident.inner)
+		{
+			self.record_local(local, segment.ident.span);
+			let ty = self.body.local(local).ty;
+			return self.body.push(ExprKind::Local(local), ty, span);
+		}
+		let walk = match self.walk_value_path(segments, span) {
+			Ok(walk) => walk,
+			Err(error) => return error,
+		};
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
@@ -302,7 +491,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			));
 		}
 		if !walk.is_complete(segments) {
-			todo!("checking a value path through a type");
+			return self.unsupported(span, "a path through a type");
 		}
 		match kind {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
@@ -327,24 +516,39 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
-			_ => todo!("checking a path to a `{}`", kind.noun()),
+			DefKind::Function(function_index) => self.build_function_value(
+				function_index,
+				segments.last().unwrap(),
+				span,
+			),
+			DefKind::Global(global_index) => {
+				let ty = self.cx.global_value_type(global_index);
+				let ty = self.normalized(ty, TypeEnvIdx::ROOT);
+				self.body.push(ExprKind::Global(global_index), ty, span)
+			}
+			_ => {
+				self.unsupported(span, &format!("a path to a {}", kind.noun()))
+			}
 		}
 	}
 
-	/// A call. Only the construction of a struct is checked yet.
-	fn build_call(
+	/// Walks a value path through the namespace graph. A path that continues
+	/// through a type (`Self::X`, `Enum::function`) needs member lookup, which
+	/// is not checked yet: it is reported as unsupported, with an error node,
+	/// rather than as a name the walk could not find.
+	fn walk_value_path(
 		&mut self,
-		callee: &Spanned<ast::Expression>,
-		arguments: Arguments<'_>,
-		expected: TypeIndex,
+		segments: &[ast::PathSegment],
 		span: TextSpan,
-	) -> ExprIdx {
-		let ast::Expression::Path(segments) = &callee.inner else {
-			todo!("checking a call of a computed callee");
-		};
+	) -> Result<PathWalk, ExprIdx> {
+		if segments[0].ident.inner == Keyword::SelfPascal.symbol() {
+			return Err(self.unsupported(span, "a path through `Self`"));
+		}
+		let mut diagnostics = Vec::new();
+		let mut resolutions = NameResolutions::default();
 		let walk = PathResolver::new(
-			self.cx.diagnostics,
-			self.cx.resolutions,
+			&mut diagnostics,
+			&mut resolutions,
 			self.cx.strings,
 			self.cx.defs,
 		)
@@ -354,6 +558,73 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			segments,
 			Tier::Value,
 		);
+		// Not found in an enum: the name may be one of its impls' members.
+		if walk.target.def_key().is_none() && walk.stopped_at > 0 {
+			let prefix = &segments[walk.stopped_at as usize - 1];
+			let site = (
+				SourceSpan::new(self.scope.file_id, prefix.ident.span),
+				Tier::Type,
+			);
+			if let Some(
+				Referent::Definition(key)
+				| Referent::Import {
+					definition: key, ..
+				},
+			) = resolutions.by_site.get(&site)
+				&& let DefKind::Enum(_) = key.symbol_kind(self.cx.defs)
+			{
+				return Err(self.unsupported(span, "a path through a type"));
+			}
+		}
+		self.cx.diagnostics.extend(diagnostics);
+		self.cx.resolutions.by_site.extend(resolutions.by_site);
+		Ok(walk)
+	}
+
+	/// The local `name` refers to from the current scope: declared in it or in
+	/// a scope around it.
+	fn lookup_local(&self, name: SymbolU32) -> Option<LocalIdx> {
+		let mut scope = Some(self.current);
+		while let Some(at) = scope {
+			if let Some(&local) = self.names.get(&(at, name)) {
+				return Some(local);
+			}
+			scope = self.body.scope(at).parent;
+		}
+		None
+	}
+
+	fn record_local(&mut self, local: LocalIdx, span: TextSpan) {
+		self.cx.resolutions.by_site.insert(
+			(SourceSpan::new(self.scope.file_id, span), Tier::Value),
+			Referent::Local {
+				owner: self.owner,
+				local,
+			},
+		);
+	}
+
+	/// A call: of a function named by a path, or the construction of a
+	/// struct.
+	fn build_call(
+		&mut self,
+		callee: &Spanned<ast::Expression>,
+		arguments: Arguments<'_>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let ast::Expression::Path(segments) = &callee.inner else {
+			return self.unsupported(span, "a call of a computed callee");
+		};
+		if let [segment] = &**segments
+			&& self.lookup_local(segment.ident.inner).is_some()
+		{
+			return self.unsupported(span, "a call of a local");
+		}
+		let walk = match self.walk_value_path(segments, span) {
+			Ok(walk) => walk,
+			Err(error) => return error,
+		};
 		let Some(key) = walk.target.def_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
@@ -371,7 +642,28 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Some(key),
 				));
 			}
-			todo!("checking a call of a `{}`", kind.noun());
+			return match (kind, walk.is_complete(segments), arguments) {
+				(
+					DefKind::Function(function_index),
+					true,
+					Arguments::Positional(arguments),
+				) => self.build_function_call(
+					function_index,
+					callee,
+					segments.last().unwrap(),
+					arguments,
+					expected,
+					span,
+				),
+				(DefKind::Function(_), true, Arguments::Named(_)) => {
+					self.unsupported(span, "a function call by name")
+				}
+				(_, false, _) => {
+					self.unsupported(span, "a path through a type")
+				}
+				_ => self
+					.unsupported(span, &format!("a call of a {}", kind.noun())),
+			};
 		};
 		let segment = segments.last().unwrap();
 		if let BindingTarget::Inaccessible(key) = walk.target {
@@ -394,14 +686,32 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.named_fields(struct_index, &mut type_args, arguments, span)
 			}
 		};
-		self.report_uninferred(struct_index, segment, expected, &mut type_args);
+		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
+		let poisoned = expected == TypeIndex::ERROR
+			|| given.iter().any(|&(_, value)| {
+				self.cx.types.has_error(self.body.ty(value))
+			});
+		self.report_uninferred(
+			params_env,
+			segment.ident.span,
+			poisoned,
+			&mut type_args,
+		);
 		// Every argument is known now, so each value is held to its field's
 		// final type: an untyped literal takes it only here.
 		for &(field, value) in &given {
 			let field_ty = self.field_type(struct_index, &type_args, field);
 			self.expect(value, field_ty);
 		}
-		self.check_struct_bounds(struct_index, segment, &type_args, &given);
+		let declared = self.cx.struct_field_types(struct_index).to_vec();
+		self.check_param_bounds(
+			params_env,
+			TypeEnvOwner::Struct(struct_index),
+			segment,
+			&declared,
+			&type_args,
+			&given,
+		);
 		let order = match arguments {
 			Arguments::Positional(_) => ArgOrder::InOrder,
 			Arguments::Named(_) => self.body.push_permutation(
@@ -435,30 +745,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Box<[TypeIndex]> {
 		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
 		let count = self.cx.type_envs.param_names(params_env).len();
-		let mut type_args = if segment.type_args.is_empty() {
-			vec![TypeIndex::INFER; count].into_boxed_slice()
-		} else {
-			let mut obligations = Vec::new();
-			let mut written = Vec::with_capacity(segment.type_args.len());
-			for arg in &segment.type_args {
-				written.push(self.cx.resolve_type(
-					&mut obligations,
-					self.scope,
-					arg,
-					InferPolicy::Allow,
-				));
-			}
-			self.cx.check_now(&obligations);
-			if !self.cx.check_type_arg_count(
-				self.scope,
-				segment,
-				params_env,
-				TypeEnvOwner::Struct(struct_index),
-			) {
-				return vec![TypeIndex::ERROR; count].into_boxed_slice();
-			}
-			written.into_boxed_slice()
-		};
+		let mut type_args = self.written_type_args(
+			segment,
+			params_env,
+			TypeEnvOwner::Struct(struct_index),
+		);
 		if expected == TypeIndex::INFER {
 			return type_args;
 		}
@@ -481,21 +772,56 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		type_args
 	}
 
-	/// Records and checks the bounds of the struct's parameters for its final
-	/// type arguments, at the call, wherever they were learned from. Each is
-	/// reported at its written argument, else at the value of a field whose
-	/// declared type is that parameter, else at the struct's name.
-	fn check_struct_bounds(
+	/// The type arguments written on `segment` for the parameters of
+	/// `params_env` (`_` anywhere in one is unknown); `INFER` per parameter
+	/// when none are written, `ERROR` per parameter when the count is wrong.
+	fn written_type_args(
 		&mut self,
-		struct_index: StructIdx,
 		segment: &ast::PathSegment,
+		params_env: TypeEnvIdx,
+		owner: TypeEnvOwner,
+	) -> Box<[TypeIndex]> {
+		let count = self.cx.type_envs.param_names(params_env).len();
+		if segment.type_args.is_empty() {
+			return vec![TypeIndex::INFER; count].into_boxed_slice();
+		}
+		let mut obligations = Vec::new();
+		let mut written = Vec::with_capacity(segment.type_args.len());
+		for arg in &segment.type_args {
+			written.push(self.cx.resolve_type(
+				&mut obligations,
+				self.scope,
+				arg,
+				InferPolicy::Allow,
+			));
+		}
+		self.cx.check_now(&obligations);
+		if !self
+			.cx
+			.check_type_arg_count(self.scope, segment, params_env, owner)
+		{
+			return vec![TypeIndex::ERROR; count].into_boxed_slice();
+		}
+		written.into_boxed_slice()
+	}
+
+	/// Records and checks the bounds of the parameters of `params_env` (a
+	/// struct's or a function's) for their final type arguments, at the call,
+	/// wherever they were learned from. Each is reported at its written
+	/// argument, else at the value given for a field or parameter whose
+	/// declared type (`declared`) is that parameter, else at the name.
+	fn check_param_bounds(
+		&mut self,
+		params_env: TypeEnvIdx,
+		owner: TypeEnvOwner,
+		segment: &ast::PathSegment,
+		declared: &[TypeIndex],
 		type_args: &[TypeIndex],
 		given: &[(usize, ExprIdx)],
 	) {
 		if type_args.is_empty() {
 			return;
 		}
-		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
 		let arguments = self.cx.types.push_list(type_args);
 		let mut obligations = Vec::new();
 		for (index, &argument) in type_args.iter().enumerate() {
@@ -506,9 +832,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						self.cx.type_envs.param_types(params_env)[index];
 					let mut span = segment.ident.span;
 					for &(field, value) in given {
-						if self.cx.struct_field_types(struct_index)[field]
-							== param
-						{
+						if declared[field] == param {
 							span = self.body.span(value);
 							break;
 						}
@@ -529,30 +853,29 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					span,
 				},
 				SourceSpan::new(self.scope.file_id, span),
-				TypeEnvOwner::Struct(struct_index),
+				owner,
 			);
 		}
 		self.cx.check_now(&obligations);
 	}
 
 	/// Reports each parameter whose argument is still not fully known (an
-	/// `INFER` anywhere in it), and makes it `ERROR`.
-	/// Nothing is reported against an `ERROR` expectation: whoever made it
-	/// has said why.
+	/// `INFER` anywhere in it), and makes it `ERROR`. Nothing is reported in a
+	/// `poisoned` call (an `ERROR` expectation, an argument that failed):
+	/// whatever failed has said why, and may be why nothing was learned.
 	fn report_uninferred(
 		&mut self,
-		struct_index: StructIdx,
-		segment: &ast::PathSegment,
-		expected: TypeIndex,
+		params_env: TypeEnvIdx,
+		span: TextSpan,
+		poisoned: bool,
 		args: &mut [TypeIndex],
 	) {
-		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
 		for at in 0..args.len() {
 			if !self.cx.types.has_infer(args[at]) {
 				continue;
 			}
 			args[at] = TypeIndex::ERROR;
-			if expected == TypeIndex::ERROR {
+			if poisoned {
 				continue;
 			}
 			let name = self.cx.type_envs.param_names(params_env)[at].inner;
@@ -564,7 +887,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						"cannot infer type for type parameter `{name}`"
 					))
 					.with_label(
-						Label::primary(self.scope.file_id, segment.ident.span)
+						Label::primary(self.scope.file_id, span)
 							.with_message("type annotation required"),
 					),
 			);
@@ -611,7 +934,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				args,
 			},
 		);
-		self.normalized(ty, self.scope.env)
+		let ty = self.normalized(ty, self.scope.env);
+		self.cx.types.collapse_error(ty)
 	}
 
 	/// The fields of `Point(1, 2)`: the n-th argument gives the n-th field.
@@ -908,8 +1232,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					span,
 				);
 			}
-			BinaryOp::Assign
-			| BinaryOp::AddAssign
+			BinaryOp::Assign => {
+				return self.build_assign(left, right, span);
+			}
+			BinaryOp::AddAssign
 			| BinaryOp::SubAssign
 			| BinaryOp::MulAssign
 			| BinaryOp::DivAssign
@@ -919,7 +1245,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			| BinaryOp::BitXorAssign
 			| BinaryOp::LeftShiftAssign
 			| BinaryOp::RightShiftAssign => {
-				todo!("checking an assignment");
+				return self.build_compound_assign(op, left, right, span);
 			}
 			_ => {}
 		}
@@ -1027,7 +1353,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let Some(lookup) = self.operator_impl(
 			ty,
 			self.cx.operators.unary(op.inner),
-			operand,
+			self.body.span(operand),
 			op.span,
 			op.inner.as_str(),
 			DiagnosticCode::UnaryOperatorCannotBeApplied,
@@ -1055,10 +1381,23 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		rhs: ExprIdx,
 		ty: TypeIndex,
 	) -> (ExprKind, TypeIndex) {
+		// Enums and pointers compare natively, by discriminant and address.
+		if is_comparison(op.inner)
+			&& matches!(
+				self.cx.types.resolve(ty),
+				Type::Enum { .. } | Type::Pointer { .. }
+			) {
+			let kind = ExprKind::Binary {
+				op: op.inner,
+				lhs,
+				rhs,
+			};
+			return (kind, TypeIndex::BOOL);
+		}
 		let Some(lookup) = self.operator_impl(
 			ty,
 			self.cx.operators.binary(op.inner),
-			lhs,
+			self.body.span(lhs),
 			op.span,
 			op.inner.as_str(),
 			DiagnosticCode::BinaryOperatorCannotBeApplied,
@@ -1089,7 +1428,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		ty: TypeIndex,
 		method: Option<OperatorMethod>,
-		operand: ExprIdx,
+		operand_span: TextSpan,
 		op_span: TextSpan,
 		op_text: &str,
 		code: DiagnosticCode,
@@ -1124,7 +1463,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						"operator `{op_text}` cannot be applied to type `{}`",
 						self.cx.type_formatter().display_type(ty)
 					))
-					.with_label(self.source_span(operand).primary_label())
+					.with_label(Label::primary(
+						self.scope.file_id,
+						operand_span,
+					))
 					.with_label(Label::secondary(self.scope.file_id, op_span)),
 			);
 		}
@@ -1135,15 +1477,29 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// declaration when the receiver is abstract or the impl inherits a default.
 	fn method_call<const N: usize>(
 		&mut self,
-		(method, lookup): (super::operators::OperatorMethod, TraitImplLookup),
+		selected: (OperatorMethod, TraitImplLookup),
 		args: [ExprIdx; N],
 	) -> ExprKind {
 		let args = self.body.push_args(args);
+		match self.select_operator_method(selected) {
+			SelectedMethod::Concrete(method) => {
+				ExprKind::MethodCall { method, args }
+			}
+			SelectedMethod::Generic(method) => {
+				ExprKind::GenericMethodCall { method, args }
+			}
+		}
+	}
+
+	/// Which method an operator calls: the selected impl's own, or the
+	/// trait's declaration when the receiver is abstract or the impl inherits
+	/// a default.
+	fn select_operator_method(
+		&self,
+		(method, lookup): (OperatorMethod, TraitImplLookup),
+	) -> SelectedMethod {
 		let TraitImplLookup::Concrete { impl_index, .. } = lookup else {
-			return ExprKind::GenericMethodCall {
-				method: method.method,
-				args,
-			};
+			return SelectedMethod::Generic(method.method);
 		};
 		match self
 			.cx
@@ -1152,15 +1508,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		{
 			TraitMemberSelection::Impl(
 				MemberKind::Method(selected) | MemberKind::Function(selected),
-			) => ExprKind::MethodCall {
-				method: selected,
-				args,
-			},
+			) => SelectedMethod::Concrete(selected),
 			TraitMemberSelection::Impl(_)
-			| TraitMemberSelection::TraitDeclaration(_) => ExprKind::GenericMethodCall {
-				method: method.method,
-				args,
-			},
+			| TraitMemberSelection::TraitDeclaration(_) => {
+				SelectedMethod::Generic(method.method)
+			}
 		}
 	}
 
@@ -1205,8 +1557,32 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.body.set_ty(expr, TypeIndex::ERROR);
 			return;
 		}
-		if let ExprKind::Tuple { elements } = self.body.kind(expr) {
-			return self.coerce_tuple(expr, elements, target);
+		match self.body.kind(expr) {
+			ExprKind::Tuple { elements } => {
+				return self.coerce_tuple(expr, elements, target);
+			}
+			// A block is untyped through its result, an `if` through its
+			// branches: each untyped one takes the type.
+			ExprKind::Block {
+				result: Some(result),
+				..
+			} => {
+				self.coerce(result, target);
+				return self.body.set_ty(expr, target);
+			}
+			ExprKind::IfElse {
+				then_block,
+				else_block: Some(else_block),
+				..
+			} => {
+				for branch in [then_block, else_block] {
+					if self.cx.types.has_untyped(self.body.ty(branch)) {
+						self.coerce(branch, target);
+					}
+				}
+				return self.body.set_ty(expr, target);
+			}
+			_ => {}
 		}
 		// The common case: one concrete number, held on the stack.
 		if Integer::from_type(target).is_some()
@@ -1540,11 +1916,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		actual: TypeIndex,
 		expr: ExprIdx,
 	) -> Diagnostic<FileId> {
+		self.mismatch_at(expected, actual, self.body.span(expr))
+	}
+
+	fn mismatch_at(
+		&self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		span: TextSpan,
+	) -> Diagnostic<FileId> {
 		let formatter = self.cx.type_formatter();
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMistmatch.code())
 			.with_message("type mismatch")
-			.with_label(self.source_span(expr).primary_label().with_message(
+			.with_label(Label::primary(self.scope.file_id, span).with_message(
 				format!(
 					"expected `{}`, found `{}`",
 					formatter.display_type(expected),
@@ -1558,7 +1943,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 }
 
+/// The method an operator dispatches to.
+#[derive(Clone, Copy)]
+enum SelectedMethod {
+	/// The impl's own method, called directly.
+	Concrete(FunctionIdx),
+	/// The trait's declaration, selected once the receiver is known.
+	Generic(FunctionIdx),
+}
+
 /// A call's arguments, by position or by name.
+#[derive(Clone, Copy)]
 enum Arguments<'e> {
 	Positional(&'e [ast::Separated<Spanned<ast::Expression>>]),
 	Named(&'e [ast::Separated<Spanned<ast::NamedArgument>>]),
@@ -1754,5 +2149,1111 @@ impl Integer {
 			Self::I64 => i64::MIN,
 			Self::U64 => 0,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use codespan_reporting::diagnostic::Diagnostic;
+	use indoc::indoc;
+
+	use super::super::body::{Body, ExprIdx, ExprKind, PlaceIdx, PlaceKind};
+	use super::super::defs::{
+		AstEntry, DefKind, DefinitionRegistry, Scope, Tier,
+	};
+	use super::super::eval::{ConstScalar, ConstValueState};
+	use super::super::impls::ImplDispatch;
+	use super::super::paths::PathResolver;
+	use super::super::resolutions::{NameResolutions, Referent};
+	use super::super::signatures::TypeContext;
+	use super::super::types::{Type, TypeIndex};
+	use crate::ast::{self, Spanned};
+	use crate::diagnostics::{DiagnosticCode, TextSpan};
+	use crate::testing::DiagnosticView;
+	use crate::vfs::{self, FileId};
+
+	const STDLIB: &str = include_str!("../../std/main.wx");
+
+	/// `test_case!(case = "source")` declares the graph, the inputs and the
+	/// swept `TestCase` borrowing them as three locals of the calling test.
+	/// The test's items are appended to the real stdlib, so operators,
+	/// memories and globals are checked against its actual traits.
+	macro_rules! test_case {
+		($case:ident = $source:expr $(,)?) => {
+			let mut graph = source_graph($source);
+			let mut inputs = TestInputs::new(&mut graph);
+			let $case = TestCase::new(&mut inputs);
+		};
+	}
+
+	fn source_graph(source: &str) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		let root_id = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(
+					std::collections::HashMap::from([(
+						"main.wx".to_string(),
+						format!("{STDLIB}\n{source}"),
+					)]),
+				),
+			)
+			.unwrap();
+		builder.set_stdlib(root_id);
+		builder.build(root_id)
+	}
+
+	/// Everything a `TypeContext` borrows, kept on the test's stack.
+	struct TestInputs<'g> {
+		graph: &'g vfs::CompilationUnit,
+		defs: DefinitionRegistry,
+		ast_nodes: Vec<AstEntry<'g>>,
+		impl_dispatch: ImplDispatch,
+		diagnostics: Vec<Diagnostic<FileId>>,
+		resolutions: NameResolutions,
+	}
+
+	impl<'g> TestInputs<'g> {
+		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
+			let (defs, ast_nodes) = DefinitionRegistry::build(
+				&graph.packages,
+				&graph.files,
+				&mut graph.strings,
+				&mut diagnostics,
+				&mut resolutions,
+				graph.stdlib_package,
+				graph.root_package,
+			);
+			let graph = &*graph;
+			let impl_dispatch = ImplDispatch::build(
+				&mut diagnostics,
+				&mut resolutions,
+				&graph.strings,
+				&defs,
+				&ast_nodes,
+			);
+			Self {
+				graph,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+				diagnostics,
+				resolutions,
+			}
+		}
+	}
+
+	struct TestCase<'a> {
+		graph: &'a vfs::CompilationUnit,
+		defs: &'a DefinitionRegistry,
+		context: TypeContext<'a, 'a, 'a>,
+	}
+
+	impl<'a> TestCase<'a> {
+		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
+			let TestInputs {
+				graph,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+				diagnostics,
+				resolutions,
+			} = inputs;
+			let mut context = TypeContext::new(
+				diagnostics,
+				resolutions,
+				&graph.strings,
+				&graph.files,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+			);
+			context.sweep();
+			// The stdlib's own bodies use forms the checker does not cover
+			// yet; those reports are not what this suite is about.
+			let stdlib_end = STDLIB.len() as u32;
+			context.diagnostics.retain(|diagnostic| {
+				let in_stdlib =
+					diagnostic.labels.first().is_some_and(|label| {
+						(label.range.start as u32) < stdlib_end
+					});
+				!(in_stdlib
+					&& diagnostic.code.as_deref()
+						== Some(DiagnosticCode::UnsupportedExpression.code()))
+			});
+			Self {
+				graph,
+				defs,
+				context,
+			}
+		}
+
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new(
+				"typecheck",
+				self.context.diagnostics,
+				&self.graph.files,
+			)
+		}
+
+		fn resolve(&self, name: &str) -> DefKind {
+			let root = Scope::Package(self.defs.root_package);
+			let file_id = self.defs.namespaces.file_id(root.into());
+			let segments: Box<[ast::PathSegment]> = name
+				.split("::")
+				.map(|segment| ast::PathSegment {
+					ident: Spanned {
+						inner: self.graph.strings.get(segment).unwrap(),
+						span: TextSpan::new(0, 0),
+					},
+					type_args: Box::new([]),
+				})
+				.collect();
+			let mut scratch = Vec::new();
+			let mut resolutions = NameResolutions::default();
+			PathResolver::new(
+				&mut scratch,
+				&mut resolutions,
+				&self.graph.strings,
+				self.defs,
+			)
+			.resolve_path(file_id, root, &segments, Tier::Value)
+			.def_key()
+			.unwrap_or_else(|| panic!("expected `{name}` to resolve"))
+			.symbol_kind(self.defs)
+		}
+
+		/// The checked block of the function `name`.
+		fn body(&self, name: &str) -> &Body {
+			let DefKind::Function(index) = self.resolve(name) else {
+				panic!("expected `{name}` to be a function");
+			};
+			self.context.function_bodies[usize::from(index)]
+				.as_ref()
+				.expect("a function with a block has a body")
+		}
+
+		fn display(&self, ty: TypeIndex) -> String {
+			self.context.type_formatter().display_type(ty).to_string()
+		}
+
+		/// The type of `name`'s whole block.
+		fn body_type(&self, name: &str) -> String {
+			let body = self.body(name);
+			self.display(body.ty(body.root()))
+		}
+
+		/// The function `name`'s block as an S-expression; see `render`.
+		fn shape(&self, name: &str) -> String {
+			let body = self.body(name);
+			self.render(body, body.root())
+		}
+
+		/// Renders a node without types: `(block (local x 1) => (+ x 2))`.
+		/// A local is its name and declaration index (`x#1`), so shadowing
+		/// shows; a jump names the label it leaves, or `loop`/`block`.
+		fn render(&self, body: &Body, expr: ExprIdx) -> String {
+			let list = |text: &str, items: &[ExprIdx]| {
+				let mut text = format!("({text}");
+				for &item in items {
+					text.push(' ');
+					text.push_str(&self.render(body, item));
+				}
+				text + ")"
+			};
+			let name = |symbol| self.graph.strings.resolve(symbol).unwrap();
+			match body.kind(expr) {
+				ExprKind::Error => "error".to_string(),
+				ExprKind::Int(value) => value.to_string(),
+				ExprKind::Float(value) => format!("{value:?}"),
+				ExprKind::Bool(value) => value.to_string(),
+				ExprKind::Char(value) => format!("{value:?}"),
+				ExprKind::Const(index) | ExprKind::NextDiscriminant(index) => {
+					name(self.defs.constants[usize::from(index)].name.inner)
+						.to_string()
+				}
+				ExprKind::Local(local) => self.local_name(body, local),
+				ExprKind::Global(index) => {
+					name(self.defs.globals[usize::from(index)].name.inner)
+						.to_string()
+				}
+				ExprKind::Function(index) => {
+					name(self.defs.functions[usize::from(index)].name.inner)
+						.to_string()
+				}
+				ExprKind::Placeholder => "_".to_string(),
+				ExprKind::Unary { op, operand } => {
+					list(op.as_str(), &[operand])
+				}
+				ExprKind::Binary { op, lhs, rhs } => {
+					list(op.as_str(), &[lhs, rhs])
+				}
+				ExprKind::MethodCall { method, args } => {
+					let method = self.function_name(method);
+					list(&format!("call {method}"), body.args(args))
+				}
+				ExprKind::GenericMethodCall { method, args } => {
+					let method = self.function_name(method);
+					list(&format!("generic {method}"), body.args(args))
+				}
+				ExprKind::Call { callee, args } => {
+					let callee = self.render(body, callee);
+					list(&format!("call {callee}"), body.args(args))
+				}
+				ExprKind::Tuple { elements } => {
+					list("tuple", body.args(elements))
+				}
+				ExprKind::StructConstructor {
+					struct_index, args, ..
+				} => list(
+					name(
+						self.defs.structs[usize::from(struct_index)].name.inner,
+					),
+					body.args(args),
+				),
+				ExprKind::Cast { value } => {
+					let ty = self.display(body.ty(expr));
+					format!("(as {} {ty})", self.render(body, value))
+				}
+				ExprKind::FieldAccess { object, field } => format!(
+					"(. {} {})",
+					self.render(body, object),
+					self.field_name(body.ty(object), field)
+				),
+				ExprKind::Load(place) => {
+					format!("(load {})", self.render_place(body, place))
+				}
+				ExprKind::AddressOf(place) => {
+					format!("(.& {})", self.render_place(body, place))
+				}
+				ExprKind::Block {
+					statements, result, ..
+				} => {
+					let mut text = list("block", body.args(statements));
+					if let Some(result) = result {
+						text.pop();
+						text.push_str(" => ");
+						text.push_str(&self.render(body, result));
+						text.push(')');
+					}
+					text
+				}
+				ExprKind::LocalDeclaration { local, value } => format!(
+					"(local {} {})",
+					self.local_name(body, local),
+					self.render(body, value)
+				),
+				ExprKind::IfElse {
+					condition,
+					then_block,
+					else_block,
+				} => {
+					let mut items = vec![condition, then_block];
+					items.extend(else_block);
+					list("if", &items)
+				}
+				ExprKind::Loop { statements, .. } => {
+					list("loop", body.args(statements))
+				}
+				ExprKind::Break { scope, value } => {
+					let target = self.scope_name(body, scope);
+					list(&format!("break {target}"), value.as_slice())
+				}
+				ExprKind::Continue { scope } => {
+					format!("(continue {})", self.scope_name(body, scope))
+				}
+				ExprKind::Return { value } => list("return", value.as_slice()),
+				ExprKind::Assign { target, value } => {
+					list("=", &[target, value])
+				}
+				ExprKind::Store { place, value } => format!(
+					"(store {} {})",
+					self.render_place(body, place),
+					self.render(body, value)
+				),
+				ExprKind::CompoundAssign {
+					op,
+					target,
+					value,
+					method,
+				} => list(
+					&format!("{}={}", op.as_str(), self.via(method)),
+					&[target, value],
+				),
+				ExprKind::GenericCompoundAssign {
+					op, target, value, ..
+				} => {
+					list(&format!("generic {}=", op.as_str()), &[target, value])
+				}
+				ExprKind::CompoundStore {
+					op,
+					place,
+					value,
+					method,
+				} => format!(
+					"(store {}={} {} {})",
+					op.as_str(),
+					self.via(method),
+					self.render_place(body, place),
+					self.render(body, value)
+				),
+				ExprKind::GenericCompoundStore {
+					op, place, value, ..
+				} => format!(
+					"(store generic {}= {} {})",
+					op.as_str(),
+					self.render_place(body, place),
+					self.render(body, value)
+				),
+			}
+		}
+
+		fn render_place(&self, body: &Body, place: PlaceIdx) -> String {
+			match body.place(place).kind {
+				PlaceKind::Deref { pointer } => {
+					format!("(* {})", self.render(body, pointer))
+				}
+				PlaceKind::Field { object, field } => format!(
+					"(. {} {})",
+					self.render_place(body, object),
+					self.field_name(body.place(object).ty, field)
+				),
+			}
+		}
+
+		fn via(&self, method: Option<super::FunctionIdx>) -> String {
+			method.map_or(String::new(), |method| {
+				format!(" via {}", self.function_name(method))
+			})
+		}
+
+		fn function_name(&self, index: super::FunctionIdx) -> &str {
+			let name = self.defs.functions[usize::from(index)].name.inner;
+			self.graph.strings.resolve(name).unwrap()
+		}
+
+		fn local_name(&self, body: &Body, local: super::LocalIdx) -> String {
+			let name = body.local(local).name.inner;
+			format!(
+				"{}#{}",
+				self.graph.strings.resolve(name).unwrap(),
+				u32::from(local)
+			)
+		}
+
+		fn field_name(
+			&self,
+			object: TypeIndex,
+			field: super::FieldIdx,
+		) -> &str {
+			let Type::Struct { struct_index, .. } =
+				*self.context.types.resolve(object)
+			else {
+				panic!("a field of a non-struct");
+			};
+			let field = self.defs.structs[usize::from(struct_index)].fields
+				[usize::from(field)]
+			.name
+			.unwrap();
+			self.graph.strings.resolve(field.inner).unwrap()
+		}
+
+		/// A jump's target: its label, else the kind of scope it leaves.
+		fn scope_name(&self, body: &Body, scope: super::ScopeIdx) -> String {
+			let scope = body.scope(scope);
+			match scope.label {
+				Some(label) => self
+					.graph
+					.strings
+					.resolve(body.label(label).name.inner)
+					.unwrap()
+					.to_string(),
+				None => format!("{:?}", scope.kind).to_lowercase(),
+			}
+		}
+
+		/// The `(name, type)` of every local of `function`, in declaration
+		/// order.
+		fn locals(&self, function: &str) -> Vec<(String, String)> {
+			self.body(function)
+				.locals()
+				.iter()
+				.map(|local| {
+					let name =
+						self.graph.strings.resolve(local.name.inner).unwrap();
+					(name.to_string(), self.display(local.ty))
+				})
+				.collect()
+		}
+	}
+
+	#[test]
+	fn the_embedded_stdlib_reports_nothing_but_unsupported_forms() {
+		test_case!(case = "");
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn parameters_are_locals_of_the_root_scope() {
+		const SOURCE: &str = "func f(a: u32, mut b: u32) -> u32 { a + b }";
+		test_case!(case = SOURCE);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("f"), "(block => (+ a#0 b#1))");
+		assert_eq!(
+			case.locals("f"),
+			[("a".into(), "u32".into()), ("b".into(), "u32".into())]
+		);
+		let body = case.body("f");
+		assert_eq!(
+			body.local(super::LocalIdx::new(0)).scope,
+			super::ScopeIdx::ROOT
+		);
+		assert_eq!(
+			body.scope(super::ScopeIdx::ROOT).kind,
+			super::ScopeKind::Root
+		);
+		// Each use of a parameter is recorded as a reference to it.
+		let file_id = case
+			.defs
+			.namespaces
+			.file_id(Scope::Package(case.defs.root_package).into());
+		let start = (STDLIB.len() + 1 + SOURCE.find("a + b").unwrap()) as u32;
+		let site = (
+			crate::diagnostics::SourceSpan::new(
+				file_id,
+				TextSpan::new(start, start + 1),
+			),
+			Tier::Value,
+		);
+		assert!(matches!(
+			case.context.resolutions.by_site.get(&site),
+			Some(Referent::Local { local, .. }) if u32::from(*local) == 0
+		));
+	}
+
+	#[test]
+	fn a_block_result_takes_the_return_type() {
+		test_case!(
+			case = indoc! {"
+				func literal() -> u8 { 200 + 50 }
+				func nothing() {}
+				func diverges() -> u32 { loop {} }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("literal"), "u8");
+		assert_eq!(case.body_type("nothing"), "()");
+		assert_eq!(case.body_type("diverges"), "!");
+	}
+
+	#[test]
+	fn a_block_without_a_result_does_not_give_a_value() {
+		test_case!(case = "func f() -> u32 { local x: u32 = 1; }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn a_local_takes_its_written_type_or_its_values() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u64) {
+					local x: u8 = 1;
+					local y = a;
+					local z = (x, y);
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.locals("f"),
+			[
+				("a".into(), "u64".into()),
+				("x".into(), "u8".into()),
+				("y".into(), "u64".into()),
+				("z".into(), "(u8, u64)".into()),
+			]
+		);
+	}
+
+	#[test]
+	fn a_local_of_an_untyped_literal_needs_a_type() {
+		test_case!(case = "func f() { local x = 1; }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+		assert_eq!(case.locals("f"), [("x".into(), "{unknown}".into())]);
+	}
+
+	#[test]
+	fn a_later_local_shadows_an_earlier_one_from_its_declaration_on() {
+		test_case!(
+			case = "func f() -> u32 { local x: u32 = 1; local x = x + 1; x }"
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block (local x#0 1) (local x#1 (+ x#0 1)) => x#1)"
+		);
+	}
+
+	#[test]
+	fn a_local_is_visible_only_in_its_block() {
+		test_case!(
+			case = indoc! {"
+				func f() -> u32 {
+					block { local inner: u32 = 1; };
+					inner
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+		let body = case.body("f");
+		let inner = body.local(super::LocalIdx::new(0));
+		assert_ne!(inner.scope, super::ScopeIdx::ROOT);
+		assert_eq!(body.scope(inner.scope).parent, Some(super::ScopeIdx::ROOT));
+	}
+
+	#[test]
+	fn a_local_shadows_an_item_of_the_same_name() {
+		test_case!(
+			case = "const x: u8 = 1; func f() -> u16 { local x: u16 = 2; x }"
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("f"), "(block (local x#0 2) => x#0)");
+	}
+
+	#[test]
+	fn a_statement_value_must_be_used_or_dropped() {
+		test_case!(
+			case = indoc! {"
+				func one() -> u32 { 1 }
+				func f() {
+					one();
+					_ = one();
+					local _ = one();
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnusedValue]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (call one) (= _ (call one)) (= _ (call one)))"
+		);
+	}
+
+	#[test]
+	fn code_after_a_diverging_statement_is_unreachable() {
+		test_case!(case = "func f() -> u32 { return 1; local x: u32 = 2; x }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnreachableCode]);
+		case.diagnostics()
+			.assert_warning(DiagnosticCode::UnreachableCode);
+		assert_eq!(case.body_type("f"), "u32");
+	}
+
+	#[test]
+	fn if_branches_share_a_type() {
+		test_case!(
+			case = indoc! {"
+				func pick(c: bool, a: u8) -> u8 { if c { a } else { 1 } }
+				func nested(c: bool) -> u16 { if c { 1 } else { if !c { 2 } else { 3 } } }
+				func diverging(c: bool, a: u8) -> u8 { if c { return a; } else { a } }
+				func statement(c: bool) { if c { pick(c, 1); } }
+				func untyped(c: bool) { local x: i64 = if c { 1 } else { 2 }; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnusedValue]);
+		assert_eq!(
+			case.shape("pick"),
+			"(block => (if c#0 (block => a#1) (block => 1)))"
+		);
+		assert_eq!(case.body_type("diverging"), "u8");
+		assert_eq!(case.body_type("nested"), "u16");
+		// Context reaches literals through both branches.
+		let body = case.body("untyped");
+		let ExprKind::Block { statements, .. } = body.kind(body.root()) else {
+			unreachable!()
+		};
+		let ExprKind::LocalDeclaration { value, .. } =
+			body.kind(body.args(statements)[0])
+		else {
+			unreachable!()
+		};
+		assert_eq!(case.display(body.ty(value)), "i64");
+		let ExprKind::IfElse { then_block, .. } = body.kind(value) else {
+			unreachable!()
+		};
+		let ExprKind::Block {
+			result: Some(result),
+			..
+		} = body.kind(then_block)
+		else {
+			unreachable!()
+		};
+		assert_eq!(case.display(body.ty(result)), "i64");
+	}
+
+	#[test]
+	fn an_untyped_branch_takes_the_other_branchs_type() {
+		test_case!(
+			case =
+				"func f(c: bool, a: u8) { local x = if c { 1 } else { a }; }"
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.locals("f")[2], ("x".into(), "u8".into()));
+	}
+
+	#[test]
+	fn if_errors_are_reported_where_they_are_written() {
+		test_case!(
+			case = indoc! {"
+				func condition(a: u8) { if a { } }
+				func mismatch(c: bool, a: u8, b: u16) { local x = if c { a } else { b }; }
+				func missing_else(c: bool, a: u8) -> u8 { if c { a } }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::MissingElseBlock,
+		]);
+	}
+
+	#[test]
+	fn a_loop_is_typed_by_its_breaks() {
+		test_case!(
+			case = indoc! {"
+				func first(n: u32) -> u32 {
+					local mut i: u32 = 0;
+					loop {
+						if i == n { break i; }
+						i += 1;
+					}
+				}
+				func endless() -> u8 { loop {} }
+				func unit() { loop { break; } }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("first"),
+			"(block (local i#1 0) => (loop (if (== i#1 n#0) (block (break loop i#1))) \
+			 (+= i#1 1)))"
+		);
+		assert_eq!(case.body_type("endless"), "!");
+		let body = case.body("unit");
+		let ExprKind::Block {
+			result: Some(lp), ..
+		} = body.kind(body.root())
+		else {
+			unreachable!()
+		};
+		assert_eq!(case.display(body.ty(lp)), "()");
+	}
+
+	#[test]
+	fn break_values_must_agree() {
+		test_case!(
+			case = indoc! {"
+				func f(c: bool, a: u8, b: u16) {
+					local x = loop { if c { break a; } break b; };
+				}
+				func untyped() { local x = loop { break 1; }; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+	}
+
+	#[test]
+	fn a_label_names_the_scope_a_jump_leaves() {
+		test_case!(
+			case = indoc! {"
+				func f(c: bool) -> u32 {
+					outer: loop {
+						loop {
+							if c { break :outer 1; }
+							continue :outer;
+						}
+					}
+				}
+				func labelled_block(c: bool) -> u8 {
+					found: block {
+						if c { break :found 1; }
+						2
+					}
+				}
+				func labelled_if(c: bool) -> u8 {
+					l: if c { break :l 1; } else { 2 }
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block => (loop (loop (if c#0 (block (break outer 1))) \
+			 (continue outer))))"
+		);
+		assert_eq!(case.body_type("f"), "u32");
+		assert_eq!(
+			case.shape("labelled_block"),
+			"(block => (block (if c#0 (block (break found 1))) => 2))"
+		);
+		// Both branches of a labelled `if` share its label.
+		let body = case.body("labelled_if");
+		let ExprKind::Block {
+			result: Some(branching),
+			..
+		} = body.kind(body.root())
+		else {
+			unreachable!()
+		};
+		let ExprKind::IfElse {
+			then_block,
+			else_block: Some(else_block),
+			..
+		} = body.kind(branching)
+		else {
+			unreachable!()
+		};
+		let scope_of = |block| match body.kind(block) {
+			ExprKind::Block { scope, .. } => body.scope(scope).label,
+			_ => unreachable!(),
+		};
+		assert!(scope_of(then_block).is_some());
+		assert_eq!(scope_of(then_block), scope_of(else_block));
+	}
+
+	#[test]
+	fn jumps_need_a_target() {
+		test_case!(
+			case = indoc! {"
+				func outside() { break; }
+				func outside_continue() { continue; }
+				func unknown() { loop { break :nowhere; } }
+				func not_a_loop() { l: block { continue :l; } }
+				func unused() { l: loop { break; } }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::BreakOutsideOfLoop,
+			DiagnosticCode::ContinueOutsideOfLoop,
+			DiagnosticCode::UndeclaredLabel,
+			DiagnosticCode::ContinueOutsideOfLoop,
+			DiagnosticCode::UnusedLabel,
+		]);
+		case.diagnostics()
+			.assert_warning(DiagnosticCode::UnusedLabel);
+	}
+
+	#[test]
+	fn return_gives_the_function_its_value() {
+		test_case!(
+			case = indoc! {"
+				func early(c: bool) -> u8 { if c { return 1; } 2 }
+				func bare() { return; }
+				func wrong() -> u8 { return; }
+				func mismatch(a: u16) -> u8 { return a; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(
+			case.shape("early"),
+			"(block (if c#0 (block (return 1))) => 2)"
+		);
+	}
+
+	#[test]
+	fn assignment_writes_a_mutable_local_or_global() {
+		test_case!(
+			case = indoc! {"
+				global mut counter: u32 = 0;
+				global limit: u32 = 10;
+				func f() {
+					local mut x: u8 = 1;
+					x = 2;
+					counter = 3;
+				}
+				func errors() {
+					local x: u8 = 1;
+					x = 2;
+					limit = 1;
+					errors() = ();
+					_ = 1;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::InvalidAssignmentTarget,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local x#0 1) (= x#0 2) (= counter 3))"
+		);
+	}
+
+	#[test]
+	fn compound_assignment_dispatches_like_its_operator() {
+		test_case!(
+			case = indoc! {"
+				struct V(x: u32);
+				impl Add for V { func add(self, rhs: Self) -> Self { rhs } }
+				func scalar() { local mut a: u32 = 1; a += 2; a <<= 1; }
+				func overloaded(v: V) { local mut w = v; w += v; }
+				func generic<T: Add>(t: T) { local mut u = t; u += t; }
+				func missing(c: bool) { local mut d = c; d -= c; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::BinaryOperatorCannotBeApplied]);
+		assert_eq!(
+			case.shape("scalar"),
+			"(block (local a#0 1) (+= a#0 2) (<<= a#0 1))"
+		);
+		assert_eq!(
+			case.shape("overloaded"),
+			"(block (local w#1 v#0) (+= via add w#1 v#0))"
+		);
+		assert_eq!(
+			case.shape("generic"),
+			"(block (local u#1 t#0) (generic += u#1 t#0))"
+		);
+	}
+
+	#[test]
+	fn a_field_of_a_value_is_read_and_written_through_its_root() {
+		test_case!(
+			case = indoc! {"
+				struct Inner(v: u8);
+				struct Outer(inner: Inner, n: u32);
+				struct Wrap<T>(value: T);
+				func read(o: Outer) -> u8 { o.inner.v }
+				func generic(w: Wrap<u16>) -> u16 { w.value }
+				func write(o: Outer) { local mut p = o; p.inner.v = 1; p.n += 1; }
+				func immutable(o: Outer) { o.n = 1; }
+				func temporary(o: Outer) { read(o).v = 1; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::UnknownStructField,
+		]);
+		assert_eq!(case.shape("read"), "(block => (. (. o#0 inner) v))");
+		assert_eq!(case.body_type("generic"), "u16");
+		assert_eq!(
+			case.shape("write"),
+			"(block (local p#1 o#0) (= (. (. p#1 inner) v) 1) (+= (. p#1 n) 1))"
+		);
+	}
+
+	#[test]
+	fn field_access_checks_the_field() {
+		test_case!(
+			case = indoc! {"
+				mod m { pub struct S(pub open: u8, closed: u8); }
+				func f(s: m::S) -> u8 { s.open + s.closed }
+				func g(s: m::S) -> u8 { s.missing }
+				func h(x: u8) -> u8 { x.field }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PrivateStructField,
+			DiagnosticCode::UnknownStructField,
+			DiagnosticCode::UnknownStructField,
+		]);
+	}
+
+	#[test]
+	fn a_place_in_memory_is_read_written_and_addressed() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Node(value: u32, next: heap::*Node);
+				func read(p: heap::&Node) -> u32 { p.*.value }
+				func write(p: heap::*Node) { p.* = Node(1, p); p.*.value += 2; }
+				func address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
+				func next(p: heap::*Node) -> u32 { p.*.next.*.value }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("read"), "(block => (load (. (* p#0) value)))");
+		assert_eq!(
+			case.shape("write"),
+			"(block (store (* p#0) (Node 1 p#0)) (store += (. (* p#0) value) 2))"
+		);
+		assert_eq!(case.shape("address"), "(block => (.& (. (* p#0) value)))");
+		assert_eq!(
+			case.shape("next"),
+			"(block => (load (. (* (load (. (* p#0) next))) value)))"
+		);
+	}
+
+	#[test]
+	fn a_place_is_written_only_through_an_exclusive_pointer() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func shared(p: heap::&u32) { p.* = 1; }
+				func not_a_pointer(x: u32) -> u32 { x.* }
+				func local_address(x: u32) -> heap::&u32 { x.& }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::CannotDerefNonPointer,
+			DiagnosticCode::InvalidAssignmentTarget,
+		]);
+	}
+
+	#[test]
+	fn a_call_checks_its_arguments_against_the_parameters() {
+		test_case!(
+			case = indoc! {"
+				func add(a: u32, b: u32) -> u32 { a + b }
+				func f() -> u32 { add(1, 2) }
+				func count() -> u32 { add(1) }
+				func mismatch(c: bool) -> u32 { add(c, 2) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(case.shape("f"), "(block => (call add 1 2))");
+	}
+
+	#[test]
+	fn a_generic_call_learns_its_type_arguments() {
+		test_case!(
+			case = indoc! {"
+				trait Number {}
+				impl Number for u32 {}
+				impl Number for i64 {}
+				func id<T>(x: T) -> T { x }
+				func zero<T: Number>() -> T { loop {} }
+				func from_argument(a: u16) -> u16 { id(a) }
+				func from_expected() -> u8 { id(1) }
+				func from_turbofish() { local x = zero::<i64>(); }
+				func from_result() -> u32 { zero() }
+				func nothing() { _ = zero(); }
+				func unsatisfied() { local x = zero::<bool>(); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		assert_eq!(case.body_type("from_argument"), "u16");
+		assert_eq!(case.body_type("from_expected"), "u8");
+		assert_eq!(case.locals("from_turbofish"), [("x".into(), "i64".into())]);
+		let body = case.body("from_expected");
+		let ExprKind::Block {
+			result: Some(call), ..
+		} = body.kind(body.root())
+		else {
+			unreachable!()
+		};
+		let ExprKind::Call { callee, .. } = body.kind(call) else {
+			unreachable!()
+		};
+		assert_eq!(case.display(body.ty(callee)), "id<u8>");
+	}
+
+	#[test]
+	fn a_function_is_a_value_of_its_own_type() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func f() { local g = id::<u8>; local h = id; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+		assert_eq!(case.locals("f")[0], ("g".into(), "id<u8>".into()));
+	}
+
+	#[test]
+	fn casts_convert_between_scalars_and_pointers() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func numbers(a: u8) -> f64 { (a as i32) as f64 }
+				func literal() -> u8 { 300 as u8 }
+				func inferred(a: u16) -> u32 { a as _ }
+				func give_up(p: heap::*u8) -> heap::&u8 { p as heap::&u8 }
+				func address(p: heap::&u8) -> u32 { p as u32 }
+				func from_int(a: u32) -> heap::*u8 { a as heap::*u8 }
+				func enum_value(o: Ordering) -> i8 { o as i8 }
+				func gain(p: heap::&u8) -> heap::*u8 { p as heap::*u8 }
+				func float_to_bool(f: f32) -> bool { f as bool }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+		]);
+		assert_eq!(case.shape("numbers"), "(block => (as (as a#0 i32) f64))");
+		assert_eq!(case.shape("inferred"), "(block => (as a#0 u32))");
+	}
+
+	#[test]
+	fn enums_and_pointers_compare_natively() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func less(o: Ordering) -> bool { o == Ordering::Less }
+				func same(a: heap::&u8, b: heap::&u8) -> bool { a != b }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("less"), "(block => (== o#0 Less))");
+	}
+
+	#[test]
+	fn a_constant_comparing_variants_is_evaluated() {
+		test_case!(
+			case = "const SAME: bool = Ordering::Less == Ordering::Greater;"
+		);
+		case.diagnostics().assert_none();
+		let DefKind::Const(index) = case.resolve("SAME") else {
+			panic!("expected a constant");
+		};
+		assert_eq!(
+			case.context.const_values[usize::from(index)],
+			ConstValueState::Evaluated(Box::new([ConstScalar::bool(false)]))
+		);
+	}
+
+	#[test]
+	fn a_global_initializer_is_checked_against_its_type() {
+		test_case!(case = "global small: u8 = 300;");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+	}
+
+	#[test]
+	fn an_unsupported_form_is_reported_once_as_a_bug() {
+		test_case!(
+			case = indoc! {"
+				func f(o: Ordering) -> Ordering { o.reverse() }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
+		assert_eq!(case.shape("f"), "(block => error)");
 	}
 }

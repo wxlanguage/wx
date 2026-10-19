@@ -247,8 +247,31 @@ impl TypeContext<'_, '_, '_> {
 		let own = |kind| Halt::Own(EvalError { span, kind });
 		match kind {
 			ExprKind::Error => return Err(Halt::Silent),
+			// Locals, calls, control flow and memory are not evaluated (yet).
 			ExprKind::MethodCall { .. }
-			| ExprKind::GenericMethodCall { .. } => {
+			| ExprKind::GenericMethodCall { .. }
+			| ExprKind::Local(_)
+			| ExprKind::Global(_)
+			| ExprKind::Function(_)
+			| ExprKind::Placeholder
+			| ExprKind::Call { .. }
+			| ExprKind::Cast { .. }
+			| ExprKind::FieldAccess { .. }
+			| ExprKind::Load(_)
+			| ExprKind::AddressOf(_)
+			| ExprKind::Block { .. }
+			| ExprKind::LocalDeclaration { .. }
+			| ExprKind::IfElse { .. }
+			| ExprKind::Loop { .. }
+			| ExprKind::Break { .. }
+			| ExprKind::Continue { .. }
+			| ExprKind::Return { .. }
+			| ExprKind::Assign { .. }
+			| ExprKind::Store { .. }
+			| ExprKind::CompoundAssign { .. }
+			| ExprKind::GenericCompoundAssign { .. }
+			| ExprKind::CompoundStore { .. }
+			| ExprKind::GenericCompoundStore { .. } => {
 				return Err(own(EvalErrorKind::NotConst));
 			}
 			ExprKind::Int(value) => match Scalar::from_type(ty) {

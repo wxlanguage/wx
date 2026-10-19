@@ -27,7 +27,7 @@ use crate::tir::defs::TypeAliasIdx;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::{FileId, Files};
 
-use super::body::Body;
+use super::body::{Body, BodyOwner};
 use super::bounds::{
 	BindingRequirement, BoundArena, BoundClauses, BoundId, ClauseArena,
 	ClauseRange, SourceAssocBinding, SourceTraitBound, TraitClause,
@@ -137,6 +137,17 @@ pub struct FunctionSignature {
 	param_types: Box<[TypeIndex]>,
 	/// `TypeIndex::UNIT` when the source omits `-> Result`.
 	return_type: TypeIndex,
+}
+
+impl FunctionSignature {
+	/// The parameter types as written, `self` included.
+	pub(super) fn params(&self) -> &[TypeIndex] {
+		&self.param_types
+	}
+
+	pub(super) fn return_type(&self) -> TypeIndex {
+		self.return_type
+	}
 }
 
 /// Field *types* only — names/dedup/lookup already settled in
@@ -298,8 +309,9 @@ impl TypeContext<'_, '_, '_> {
 
 	/// The body phase. Every signature exists and every fact is final, so a
 	/// body may ask the type system anything; nothing it does is recorded for
-	/// later. Constant initializers and enum discriminants so far, in
-	/// definition order, which is the order their diagnostics come out in.
+	/// later. Constant initializers, enum discriminants, function blocks and
+	/// global initializers, in definition order, which is the order their
+	/// diagnostics come out in.
 	fn check_bodies(&mut self) {
 		let ast_nodes = self.ast_nodes;
 		for entry in ast_nodes {
@@ -315,9 +327,78 @@ impl TypeContext<'_, '_, '_> {
 				AstNodeRef::Enum { enum_index, .. } => {
 					self.check_discriminants(enum_index);
 				}
+				AstNodeRef::Function { item, .. } => {
+					if let ast::Item::Function {
+						signature, block, ..
+					} = item
+					{
+						self.check_function_body(entry, signature, block);
+					}
+				}
+				AstNodeRef::TraitFunction { item, .. } => {
+					// A required trait method has no block.
+					if let ast::TraitItem::Function {
+						signature,
+						body: Some(block),
+						..
+					} = item
+					{
+						self.check_function_body(entry, signature, block);
+					}
+				}
+				AstNodeRef::TraitImplFunction { item, .. }
+				| AstNodeRef::InherentImplFunction { item, .. } => {
+					if let ast::ImplItem::Function {
+						signature, block, ..
+					} = item
+					{
+						self.check_function_body(entry, signature, block);
+					}
+				}
+				AstNodeRef::Global { global_index, item } => {
+					let ast::Item::Global { value, .. } = item else {
+						unreachable!("a global's entry is a global")
+					};
+					let scope = LexicalScope {
+						file_id: entry.file_id,
+						namespace: entry.namespace,
+						env: TypeEnvIdx::ROOT,
+					};
+					let ty = self.global_value_type(global_index);
+					let body = BodyContext::new(
+						self,
+						scope,
+						BodyOwner::Global(global_index),
+					)
+					.check_body(value, ty);
+					self.global_bodies[usize::from(global_index)] = Some(body);
+				}
 				_ => {}
 			}
 		}
+	}
+
+	/// Checks a function's block into its `Body` (`function_bodies`), in the
+	/// function's own type scope: its parameters, and an enclosing impl's or
+	/// trait's.
+	fn check_function_body(
+		&mut self,
+		entry: &AstEntry<'_>,
+		signature: &ast::FunctionSignature,
+		block: &Spanned<ast::Expression>,
+	) {
+		let DefId::Function(function_index) = entry.node.def_id() else {
+			unreachable!("a function's entry is a function")
+		};
+		let scope = LexicalScope {
+			file_id: entry.file_id,
+			namespace: entry.namespace,
+			env: self.functions[usize::from(function_index)].type_params,
+		};
+		let body =
+			BodyContext::new(self, scope, BodyOwner::Function(function_index))
+				.check_function(function_index, signature, block);
+		self.function_bodies[usize::from(function_index)] = Some(body);
 	}
 
 	#[cfg(test)]
@@ -551,6 +632,12 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) const_values: Vec<ConstValueState>,
 	/// The constants being evaluated, outermost first.
 	pub(super) const_stack: Vec<ConstIdx>,
+	/// Each function's checked block, by `FunctionIdx`; `None` for one
+	/// without a block (a declaration, an import, a required trait method).
+	pub(super) function_bodies: Vec<Option<Body>>,
+	/// Each global's checked initializer, by `GlobalIdx`; `None` for an
+	/// imported one.
+	pub(super) global_bodies: Vec<Option<Body>>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
 	/// Resolved, exportable targets keyed by decoded external name; filled by `sweep`.
@@ -671,6 +758,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				})
 				.collect(),
 			const_bodies: defs.constants.iter().map(|_| None).collect(),
+			function_bodies: defs.functions.iter().map(|_| None).collect(),
+			global_bodies: defs.globals.iter().map(|_| None).collect(),
 			const_values: defs
 				.constants
 				.iter()
@@ -1030,6 +1119,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// The integer type an enum's variant values are held in, or `ERROR`.
 	pub(super) fn enum_repr(&self, enum_index: EnumIdx) -> TypeIndex {
 		self.enums[usize::from(enum_index)].repr
+	}
+
+	/// A global's value type, as written; `ERROR` when it is missing.
+	pub(super) fn global_value_type(
+		&self,
+		global_index: GlobalIdx,
+	) -> TypeIndex {
+		let index =
+			self.defs.globals[usize::from(global_index)].value_assoc_type_index;
+		self.assoc_types[usize::from(index)]
+			.as_ref()
+			.and_then(|signature| signature.value)
+			.unwrap_or(TypeIndex::ERROR)
 	}
 
 	pub(super) fn constant_type(
@@ -1471,6 +1573,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						namespace,
 						env: TypeEnvIdx::ROOT,
 					},
+					BodyOwner::Const(const_index),
 				)
 				.check_variant_value(item, previous, repr);
 				self.const_bodies[usize::from(const_index)] = Some(body);
@@ -1485,7 +1588,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			namespace,
 			env,
 		};
-		let body = BodyContext::new(self, scope).check_body(value, ty);
+		let body = BodyContext::new(self, scope, BodyOwner::Const(const_index))
+			.check_body(value, ty);
 		self.const_bodies[usize::from(const_index)] = Some(body);
 	}
 
@@ -4675,6 +4779,8 @@ pub(super) mod tests {
 						}
 						text + ")"
 					}
+					// Function bodies' forms; the typecheck suite renders them.
+					kind => format!("{kind:?}"),
 				};
 				let ty =
 					case.context.type_formatter().display_type(body.ty(expr));
@@ -6276,6 +6382,13 @@ pub(super) mod tests {
 				impl_dispatch,
 			);
 			context.sweep();
+			// The body checker does not cover every form the stdlib's
+			// function bodies use yet; what it does not cover is reported as
+			// unsupported, which these tests do not concern.
+			context.diagnostics.retain(|diagnostic| {
+				diagnostic.code.as_deref()
+					!= Some(DiagnosticCode::UnsupportedExpression.code())
+			});
 			Self {
 				graph,
 				defs,
@@ -6955,7 +7068,7 @@ pub(super) mod tests {
 	#[test]
 	fn never_and_unit_are_written_types() {
 		test_case!(
-			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f(a: !, b: ()) -> ! {}"
+			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f(a: !, b: ()) -> ! { loop {} }"
 		);
 		case.diagnostics().assert_none();
 		let signature = case.function_signature("f");
@@ -8404,7 +8517,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			type i32;
-			func f(x: colors::Color) -> Alias {}
+			func f(x: colors::Color) -> Alias { loop {} }
 			const FIRST: Alias = colors::Color::Red;
 			struct Paint( color: Alias );
 			type Alias = colors::Color;
@@ -8577,7 +8690,7 @@ pub(super) mod tests {
 		] {
 			test_case!(
 				case = &format!(
-					"func f(x: Color) -> Color {{}} {declaration} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+					"func f(x: Color) -> Color {{ loop {{}} }} {declaration} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
 				)
 			);
 			assert_eq!(
@@ -15181,13 +15294,13 @@ pub(super) mod tests {
 				enum Small: u8 { A = 0 }
 				global int: u32 = 0;
 				global float: f64 = 0;
-				global newtype: Meters = 0;
-				global with_empty: Tagged = 0;
-				global tuple: (f32,) = 0;
-				global generic: Wrap<u64> = 0;
-				global variant: Small = 0;
-				global pointer: heap::&u32 = 0;
-				global reference: func(u32) -> u32 = 0;
+				global newtype: Meters = Meters(0);
+				global with_empty: Tagged = Tagged(0, ());
+				global tuple: (f32,) = (0,);
+				global generic: Wrap<u64> = Wrap(0);
+				global variant: Small = Small::A;
+				global pointer: heap::&u32 = 0 as heap::&u32;
+				global reference: func(u32) -> u32 = loop {};
 				global size: <heap as Memory>::Size = 0;
 			"});
 			test_case!(mut case = &source);
@@ -15217,10 +15330,10 @@ pub(super) mod tests {
 			let source = with_value_type(indoc! {"
 				struct Pair(u32, f64);
 				struct Unit();
-				global pair: Pair = 0;
-				global unit: Unit = 0;
-				global empty: () = 0;
-				global slice: heap::&[u8] = 0;
+				global pair: Pair = Pair(0, 0);
+				global unit: Unit = Unit();
+				global empty: () = ();
+				global slice: heap::&[u8] = loop {};
 			"});
 			test_case!(mut case = &source);
 			case.diagnostics().assert_codes(&[
@@ -15732,7 +15845,7 @@ pub(super) mod tests {
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
-                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: T::Item, y: i32) -> i32 {}
+                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: T::Item, y: i32) -> i32 { loop {} }
             "}
 			);
 			case.diagnostics()
@@ -15776,7 +15889,7 @@ pub(super) mod tests {
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
-                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: (T::Item, i32), y: func(i32) -> T::Item) -> func(T::Item) -> i32 {}
+                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: (T::Item, i32), y: func(i32) -> T::Item) -> func(T::Item) -> i32 { loop {} }
             "});
 			// `Need<i32>` needs `i32: Marker`: reported once, where it is written.
 			// Nothing is rewritten, so every shape that mentions `T::Item` still
@@ -16220,7 +16333,7 @@ pub(super) mod tests {
 			type i32;
 			trait Global { type Value; }
 			global counter: i32 = 0;
-			func id<T>(x: T) -> T {}
+			func id<T>(x: T) -> T { loop {} }
 			func takes(g: counter, f: id<i32>, me: takes) {}
 			func bare(f: id) {}
 			func applied(g: counter<i32>) {}
@@ -16273,7 +16386,7 @@ pub(super) mod tests {
 			type bool;
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			func none() {}
-			func one(x: i32) -> bool {}
+			func one(x: i32) -> bool { loop {} }
 			func many(x: i32, y: bool) {}
 			import "env" as host { func log(x: bool) -> i32; }
 			func nullary(x: <none as Call>::Args, y: none::Result) {}
@@ -16304,7 +16417,7 @@ pub(super) mod tests {
 			mut case = indoc! {"
 			type i32;
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			func id<T>(x: T) -> T {}
+			func id<T>(x: T) -> T { loop {} }
 			func f(x: id<i32>::Args, y: <id<i32> as Call>::Result) {}
 		"}
 		);
@@ -16324,8 +16437,8 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Point();
 			impl Point {
-				func at(self, x: i32) -> bool {}
-				func origin() -> Point {}
+				func at(self, x: i32) -> bool { loop {} }
+				func origin() -> Point { loop {} }
 			}
 			func f(a: Point::at::Args, b: Point::at::Result, c: Point::origin::Args) {}
 		"}
@@ -16352,7 +16465,7 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Wrap<T>();
 			impl<T> Wrap<T> {
-				func get<U>(self, u: U) -> T {}
+				func get<U>(self, u: U) -> T { loop {} }
 			}
 			func f(a: Wrap<i32>::get<bool>::Args, b: Wrap<i32>::get<bool>::Result) {}
 		"}
@@ -16379,10 +16492,10 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Make {
 				func make(x: i32) -> Self;
-				func fresh() -> Self {}
+				func fresh() -> Self { loop {} }
 			}
 			struct Point();
-			impl Make for Point { func make(x: i32) -> Point {} }
+			impl Make for Point { func make(x: i32) -> Point { loop {} } }
 			func direct(x: Point::make, y: Point::fresh::Result) {}
 			func qualified(
 				x: <Point as Make>::make,
@@ -16446,10 +16559,10 @@ pub(super) mod tests {
 			type u8;
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Foo<T>();
-			impl<T> Foo<T> { func new<U>(x: U) -> T {} }
+			impl<T> Foo<T> { func new<U>(x: U) -> T { loop {} } }
 			trait Make { func make<U>(x: U) -> Self; }
 			struct Wrap<T>();
-			impl<T> Make for Wrap<T> { func make<U>(x: U) -> Wrap<T> {} }
+			impl<T> Make for Wrap<T> { func make<U>(x: U) -> Wrap<T> { loop {} } }
 			func f(
 				a: Foo<i32>::new<u8>::Args,
 				b: Foo<i32>::new<u8>::Result,
@@ -16479,8 +16592,8 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Make { func make() -> Self; }
 			struct Point();
-			impl Point { func make() -> i32 {} }
-			impl Make for Point { func make() -> Point {} }
+			impl Point { func make() -> i32 { loop {} } }
+			impl Make for Point { func make() -> Point { loop {} } }
 			func f(x: Point::make::Result, y: <Point as Make>::make::Result) {}
 		"}
 		);
@@ -16574,7 +16687,7 @@ pub(super) mod tests {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			func f() -> f::Result {}
+			func f() -> f::Result { loop {} }
 		"}
 		);
 		case.diagnostics()
@@ -16615,9 +16728,9 @@ pub(super) mod tests {
 			impl Call for Adder {
 				type Args = i32;
 				type Result = i32;
-				func call(self, args: Self::Args) -> Self::Result {}
+				func call(self, args: Self::Args) -> Self::Result { loop {} }
 			}
-			func handler(x: i32) -> i32 {}
+			func handler(x: i32) -> i32 { loop {} }
 			struct Callable<F: Call>();
 			struct Item<F: Function>();
 			func callables(a: Callable<Adder>, b: Callable<handler>, c: Adder::Result) {}
@@ -16644,9 +16757,9 @@ pub(super) mod tests {
 			trait Service { func make() -> Self; }
 			struct Wrap<T>();
 			struct Plain();
-			impl<T> Wrap<T> { func get(self) -> Self {} }
-			impl Plain { func get(self) -> Self {} }
-			impl Service for Plain { func make() -> Self {} }
+			impl<T> Wrap<T> { func get(self) -> Self { loop {} } }
+			impl Plain { func get(self) -> Self { loop {} } }
+			impl Service for Plain { func make() -> Self { loop {} } }
 		"};
 		test_case!(case = SOURCE);
 		case.diagnostics().assert_none();
@@ -16742,7 +16855,7 @@ pub(super) mod tests {
 			trait Number {}
 			impl Number for i32 {}
 			struct Wrap<T>();
-			impl<T: Number> Wrap<T> { func get<U>(self, x: T, y: U) -> (T, U) {} }
+			impl<T: Number> Wrap<T> { func get<U>(self, x: T, y: U) -> (T, U) { loop {} } }
 			func free<V>(v: V) {}
 			trait Service { func make<W>(w: W) -> Self; }
 		"}

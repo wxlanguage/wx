@@ -1985,7 +1985,7 @@ pub func memory_copy<
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
-pub typeset PointerSize: Mul + UnsignedInt { u32, u64 }
+pub typeset PointerSize: Mul + PartialEq + UnsignedInt { u32, u64 }
 
 func global_get<G: Global>(g: G) -> G::Value;
 

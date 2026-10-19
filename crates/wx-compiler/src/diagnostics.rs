@@ -237,6 +237,7 @@ define_diagnostic_codes! {
 		TypeArgumentsNotAllowed => "E2111",
 		AssocTypeEqualityMismatch => "E2112",
 		UnknownPackage => "E2113",
+		UnsupportedExpression => "E2114",
 	}
 }
 

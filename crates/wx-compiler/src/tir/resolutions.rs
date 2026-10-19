@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use super::body::{BodyOwner, LabelIdx, LocalIdx};
 use super::defs::{
 	DefKey, InherentImplIdx, MemberKind, Tier, TraitImplIdx, UseItemIndex,
 };
@@ -54,6 +55,10 @@ pub(super) enum Referent {
 	TraitImplSelf(TraitImplIdx),
 	/// A member selected through a type: `T::A`, `<X as Tr>::A`.
 	Member(MemberKind),
+	/// A local of the body `owner`: a parameter or a `local`.
+	Local { owner: BodyOwner, local: LocalIdx },
+	/// A label of the body `owner`, named by a `break` or `continue`.
+	Label { owner: BodyOwner, label: LabelIdx },
 }
 
 impl Referent {

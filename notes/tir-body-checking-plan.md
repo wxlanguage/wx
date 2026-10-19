@@ -173,14 +173,18 @@ current: ScopeIdx,
 /// Scope-relative lookup, as in the old `ExprContext::lookup`.
 names: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
 /// Index-aligned with `Body::scopes`.
-scope_types: Vec<ScopeTyping>,
+scope_types: Vec<ScopeType>,
 
-struct ScopeTyping {
+struct ScopeType {
     expected: TypeIndex,     // INFER = unconstrained
-    ty: TypeIndex,           // INFER until a tail or a break value settles it
-    breaks: Vec<ExprIdx>,    // valued breaks, to coerce untyped ones once `ty` is known
+    ty: TypeIndex,           // INFER until a result, `break` or `return` settles it
 }
 ```
+
+An untyped `break` or `return` value with nothing to hold it to needs an
+annotation, as in the old checker; only a block's result may stay untyped, for
+its context to coerce. (Collecting a scope's untyped `break`s to coerce them
+later was considered and left out until a case needs it.)
 
 To resolve a name, probe `(current, name)`, then `(parent, name)`, and so on up
 to the root: one hash probe per enclosing block, so the cost grows with nesting
@@ -220,51 +224,37 @@ with anything.
 `expect` needs one rule it lacks today: `!` is accepted wherever any type is
 expected.
 
-### Places
+### Places and assignment
 
-Reads, writes and `.&` all need to know what is a location. Keep the
-place/value split from `tir-place-value-split.md`, in arena form, and let it
-include locals so assignment is one node:
+Implemented as the old checker had it, in arena form. A place is a location in
+linear memory only, always reached through a pointer:
 
 ```rust
-index_newtype!(PlaceIdx);
 enum PlaceKind {
-    Local(LocalIdx),
-    Global(GlobalIdx),                                  // if Q2 says globals are places
-    Deref { pointer: ExprIdx },                         // `p.*`, the only way into memory
-    Field { base: PlaceIdx, field: FieldIdx },
-    Index { base: PlaceIdx, index: ExprIdx },
-    Temp(ExprIdx),                                      // `make().x`: an rvalue, not assignable
+    Deref { pointer: ExprIdx },              // `p.*`, the only way into memory
+    Field { object: PlaceIdx, field: FieldIdx },
 }
-struct Place { kind: PlaceKind, ty: TypeIndex, memory: Option<TypeIndex>, mutable: bool }
+struct Place { kind, ty, memory: TypeIndex, mutable: bool, span }
 
-ExprKind::Load(PlaceIdx)                                // reading `x`, `p.*.y`, `t.x`
-ExprKind::AddressOf(PlaceIdx)                           // `.&`; requires `memory: Some(_)`
-ExprKind::Assign { place: PlaceIdx, value: ExprIdx }
-ExprKind::CompoundAssign { op: BinaryOp, place: PlaceIdx, value: ExprIdx, dispatch: OpDispatch }
-ExprKind::Discard(ExprIdx)                              // `_ = e`
+ExprKind::Load(PlaceIdx)                     // reading `p.*`, `p.*.x`
+ExprKind::AddressOf(PlaceIdx)                // `.&`
+ExprKind::FieldAccess { object, field }      // a field of a value (local, call result)
 ```
 
-`memory`/`mutable` are computed once when the place is built (from the root
-`Deref`'s pointer, a `local mut`, a `global mut`), so "cannot assign",
-"cannot take address of a local" and "store through `&T`" are each a field read.
-This collapses the old six assignment kinds into two, and lets MIR compute an
-address once for both halves of `p.*.x += 1`.
+A local, a global or a field of a value is not a place: it has no address, and
+whether it is assignable is a property of the expression (`Local`, `Global`,
+`FieldAccess` rooted in one, `Placeholder`). There is no temporary root:
+deciding where a call's result lives is MIR's job. The assignment kinds stay
+separate, for the reasons they were split in the old checker: a place is an
+address computed once and written through (`Store`, `CompoundStore`), the other
+targets are expressions (`Assign`, `CompoundAssign`); and an abstract target
+type keeps the trait's declaration for monomorphization (`GenericCompoundAssign`,
+`GenericCompoundStore`). A concrete compound assignment carries
+`method: Option<FunctionIdx>`, `None` for the builtin operator on a primitive
+scalar, so no separate dispatch type is needed.
 
-### Operator dispatch as a value
-
-Today the operator decision is spread over three kinds (`Binary`,
-`MethodCall`, `GenericMethodCall`). Compound assignment needs the same decision
-without being a call, so name it once:
-
-```rust
-enum OpDispatch { Builtin, Method(FunctionIdx), Generic(FunctionIdx) }
-```
-
-`select_binary`/`select_unary` return it; `Binary`/`Unary` keep their shape for
-the builtin case (the evaluator and MIR like them), and `CompoundAssign` stores
-it. Whether `Binary` itself should carry `dispatch` instead of turning into a
-`MethodCall` is a taste call; the latter keeps the evaluator simpler.
+A `Load` is pushed only where a place's value is used, so `.&` and the left of
+`=` take the place itself and no node is orphaned.
 
 ### Calls
 
@@ -411,9 +401,9 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `Call` (a user struct) be accepted now, or only function items and
   `func(..)` references, with `Call` left to bounds (`F: Call`) for the moment?
 - **Q4. Operator nodes.** Keep `Binary`/`Unary` for builtins and a call node
-  for overloaded operators (today's split), or one operator node carrying
-  `OpDispatch`? The plan above keeps today's split and uses `OpDispatch` only
-  for compound assignment.
+  for overloaded operators (today's split), or one operator node carrying how it
+  was dispatched? The implementation keeps today's split; compound assignment
+  records `method: Option<FunctionIdx>`.
 - **Q5. Typeset-abstract literal arithmetic in bodies.** Coercion of literals
   to an abstract typeset-bounded `T` exists for constants; in a body, an operator
   on `T` gives a `GenericMethodCall`. Is anything beyond that expected (for
