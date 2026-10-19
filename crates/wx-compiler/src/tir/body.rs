@@ -88,7 +88,19 @@ pub(super) enum ExprKind {
 	/// A string literal's contents, unescaped. Its type is a shared byte
 	/// slice or byte array its context gives (`Type::String` until then).
 	String(SymbolU32),
-	Const(ConstIdx),
+	/// A known constant's value: a free one, a variant, or an impl's (an
+	/// inherent impl's, or the one a concrete trait impl defines), with its
+	/// flat type arguments, the impl's; empty when it has none.
+	Const {
+		constant: ConstIdx,
+		type_args: TypeList,
+	},
+	/// A trait's declaration of a constant, whose impl is selected once
+	/// `Self` is known; `type_args` is `[Self]`.
+	AbstractConst {
+		constant: ConstIdx,
+		type_args: TypeList,
+	},
 	/// An enum variant written without a value: the value of the variant
 	/// before it, plus one, in the enum's repr.
 	NextDiscriminant(ConstIdx),

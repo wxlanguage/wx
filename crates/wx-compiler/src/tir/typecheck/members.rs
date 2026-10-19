@@ -20,13 +20,18 @@ use super::{Arguments, BodyContext};
 use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind};
-use crate::tir::defs::{BindingKey, MemberKind, Tier, TraitIdx, Visibility};
+use crate::tir::defs::{
+	BindingKey, ConstIdx, DefKind, MemberKind, Tier, TraitIdx, Visibility,
+};
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
 	ApplicableMember, MemberLookup, TraitImplLookup, TraitMemberSelection,
 	report_ambiguous_type_member,
 };
 use crate::tir::resolutions::Referent;
+use crate::tir::satisfaction::{
+	TypeArgsNotAllowedOn, report_type_args_not_allowed,
+};
 use crate::tir::signatures::InferPolicy;
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
@@ -58,7 +63,13 @@ enum Member {
 	Function(Callee),
 	/// A function taking `self`.
 	Method(Callee),
-	Constant,
+	/// A constant, with the arguments of the impl or trait around it, as a
+	/// callee has them.
+	Constant {
+		constant: ConstIdx,
+		leading: Box<[TypeIndex]>,
+		dispatch: Dispatch,
+	},
 }
 
 impl BodyContext<'_, '_, '_, '_> {
@@ -136,11 +147,66 @@ impl BodyContext<'_, '_, '_, '_> {
 			Some(Member::Function(callee) | Member::Method(callee)) => {
 				self.build_function_value(callee, path.member, span)
 			}
-			Some(Member::Constant) => {
-				self.unsupported(span, "an associated constant")
-			}
+			Some(Member::Constant {
+				constant,
+				leading,
+				dispatch,
+			}) => self.build_constant(
+				constant,
+				&leading,
+				dispatch,
+				path.member,
+				span,
+			),
 			None => self.body.push(ExprKind::Error, TypeIndex::ERROR, span),
 		}
+	}
+
+	/// `Type::CONSTANT`: a known constant's value, or a trait's declaration
+	/// of it for an abstract receiver or an impl inheriting its default.
+	/// Its type is the declared one, with the impl's arguments, or the
+	/// receiver as `Self`.
+	fn build_constant(
+		&mut self,
+		constant: ConstIdx,
+		leading: &[TypeIndex],
+		dispatch: Dispatch,
+		member: &ast::PathSegment,
+		span: TextSpan,
+	) -> ExprIdx {
+		if !member.type_args.is_empty() {
+			self.cx.diagnostics.push(report_type_args_not_allowed(
+				self.cx.strings,
+				self.cx.defs,
+				self.scope.file_id,
+				member,
+				TypeArgsNotAllowedOn::Declaration(DefKind::Const(constant)),
+			));
+		}
+		let (declared, env) = self.cx.constant_type(constant);
+		debug_assert_eq!(self.cx.type_envs.generic_count(env), leading.len());
+		let ty = self.cx.types.substitute(
+			declared,
+			Substitution {
+				envs: &self.cx.type_envs,
+				env,
+				args: leading,
+			},
+		);
+		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.cx.types.collapse_error(ty);
+		let type_args = self.cx.types.push_list(leading);
+		let kind = match dispatch {
+			Dispatch::Direct => ExprKind::Const {
+				constant,
+				type_args,
+			},
+			Dispatch::Abstract => ExprKind::AbstractConst {
+				constant,
+				type_args,
+			},
+		};
+		self.body.push(kind, ty, span)
 	}
 
 	/// `Type::member(a, b)`: a call of the function the member selects, by
@@ -166,7 +232,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					expected,
 					span,
 				),
-			Some(Member::Constant) => {
+			Some(Member::Constant { .. }) => {
 				self.unsupported(span, "a call of an associated constant")
 			}
 			None => self.body.push(ExprKind::Error, TypeIndex::ERROR, span),
@@ -198,7 +264,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			MemberPath::new(pointee.unwrap_or(receiver_ty), &call.method);
 		let callee = match self.select_member(&path) {
 			Some(Member::Method(callee)) => callee,
-			Some(Member::Function(_) | Member::Constant) => {
+			Some(Member::Function(_) | Member::Constant { .. }) => {
 				self.report_not_a_method(receiver_ty, &call.method);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
@@ -370,7 +436,11 @@ impl BodyContext<'_, '_, '_, '_> {
 				dispatch,
 				impl_bounds,
 			}),
-			MemberKind::Constant(_) => Member::Constant,
+			MemberKind::Constant(constant) => Member::Constant {
+				constant,
+				leading,
+				dispatch,
+			},
 			MemberKind::AssociatedType(_) => {
 				unreachable!("a value lookup finds no associated type")
 			}

@@ -4682,7 +4682,9 @@ pub(super) mod tests {
 					ExprKind::Float(value) => format!("{value:?}"),
 					ExprKind::Bool(value) => value.to_string(),
 					ExprKind::Char(value) => format!("{value:?}"),
-					ExprKind::Const(index) => {
+					ExprKind::Const {
+						constant: index, ..
+					} => {
 						let name =
 							case.defs.constants[usize::from(index)].name.inner;
 						case.context.strings.resolve(name).unwrap().to_string()

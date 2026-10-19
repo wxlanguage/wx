@@ -291,8 +291,16 @@ impl TypeContext<'_, '_, '_> {
 			},
 			ExprKind::Bool(value) => stack.push(ConstScalar::bool(value)),
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
-			ExprKind::Const(const_index) => {
-				self.read_constant(const_index, span, stack)?;
+			// An impl's constant may depend on the impl's arguments, which
+			// evaluation does not substitute (yet).
+			ExprKind::Const {
+				constant,
+				type_args,
+			} if type_args.is_empty() => {
+				self.read_constant(constant, span, stack)?;
+			}
+			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
+				return Err(own(EvalErrorKind::NotConst));
 			}
 			ExprKind::NextDiscriminant(previous) => {
 				self.read_constant(previous, span, stack)?;

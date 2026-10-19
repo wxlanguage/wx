@@ -123,7 +123,7 @@ pub struct TypeList {
 }
 
 impl TypeList {
-	const EMPTY: TypeList = TypeList { start: 0, len: 0 };
+	pub(super) const EMPTY: TypeList = TypeList { start: 0, len: 0 };
 
 	pub fn len(self) -> usize {
 		self.len as usize

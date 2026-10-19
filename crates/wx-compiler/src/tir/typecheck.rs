@@ -519,7 +519,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
 				let (ty, scope) = self.cx.constant_type(const_index);
 				let ty = self.normalized(ty, scope);
-				self.body.push(ExprKind::Const(const_index), ty, span)
+				let kind = ExprKind::Const {
+					constant: const_index,
+					type_args: TypeList::EMPTY,
+				};
+				self.body.push(kind, ty, span)
 			}
 			DefKind::Struct(struct_index) => {
 				let name = self.cx.defs.structs[usize::from(struct_index)].name;
@@ -2734,7 +2738,18 @@ mod tests {
 						self.context.strings.resolve(contents).unwrap()
 					)
 				}
-				ExprKind::Const(index) | ExprKind::NextDiscriminant(index) => {
+				ExprKind::Const {
+					constant,
+					type_args,
+				} => self.constant_name(constant, type_args),
+				ExprKind::AbstractConst {
+					constant,
+					type_args,
+				} => format!(
+					"(abstract {})",
+					self.constant_name(constant, type_args)
+				),
+				ExprKind::NextDiscriminant(index) => {
 					name(self.defs.constants[usize::from(index)].name.inner)
 						.to_string()
 				}
@@ -2916,6 +2931,19 @@ mod tests {
 			self.context.strings.resolve(name).unwrap()
 		}
 
+		/// A constant's name, with its type arguments when it has any.
+		fn constant_name(
+			&self,
+			index: super::ConstIdx,
+			type_args: super::TypeList,
+		) -> String {
+			let name = self.defs.constants[usize::from(index)].name.inner;
+			self.with_type_args(
+				self.context.strings.resolve(name).unwrap(),
+				type_args,
+			)
+		}
+
 		/// A called function's name, with its type arguments when it has
 		/// any: `add`, `id<u8>`.
 		fn callee(
@@ -2923,7 +2951,14 @@ mod tests {
 			index: super::FunctionIdx,
 			type_args: super::TypeList,
 		) -> String {
-			let name = self.function_name(index);
+			self.with_type_args(self.function_name(index), type_args)
+		}
+
+		fn with_type_args(
+			&self,
+			name: &str,
+			type_args: super::TypeList,
+		) -> String {
 			let type_args = self.context.types.list(type_args);
 			if type_args.is_empty() {
 				return name.to_string();
@@ -4011,6 +4046,49 @@ mod tests {
 			.assert_error_saying("`Self` is `E`, which is not a struct");
 		case.diagnostics()
 			.assert_error_saying("`Self` names no struct here");
+	}
+
+	#[test]
+	fn an_associated_constant_is_read_like_its_function_would_be_called() {
+		test_case!(
+			case = indoc! {"
+				trait Sized {
+					const SIZE: u32;
+					const ALIGN: u32 = 4;
+				}
+				struct P();
+				impl Sized for P { const SIZE: u32 = 8; }
+				impl P { const ORIGIN: u8 = 0; }
+				struct W<T>(x: T);
+				impl<T> W<T> { const ID: u32 = 1; }
+				func inherent() -> u8 { P::ORIGIN }
+				func generic_inherent() -> u32 { W::<u8>::ID }
+				func trait_impl() -> u32 { P::SIZE }
+				func inherited() -> u32 { P::ALIGN }
+				func abstract_receiver<T: Sized>() -> u32 { T::SIZE }
+				func qualified() -> u32 { <P as Sized>::SIZE }
+				const EVALUATED: u8 = P::ORIGIN;
+				func written() -> u8 { P::ORIGIN::<u8> }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
+		assert_eq!(case.shape("inherent"), "(block => ORIGIN)");
+		assert_eq!(case.shape("generic_inherent"), "(block => ID<u8>)");
+		assert_eq!(case.shape("trait_impl"), "(block => SIZE)");
+		assert_eq!(case.shape("inherited"), "(block => (abstract ALIGN<P>))");
+		assert_eq!(
+			case.shape("abstract_receiver"),
+			"(block => (abstract SIZE<T>))"
+		);
+		assert_eq!(case.shape("qualified"), "(block => SIZE)");
+		let DefKind::Const(index) = case.resolve("EVALUATED") else {
+			panic!("expected a constant");
+		};
+		assert!(matches!(
+			case.context.const_values[usize::from(index)],
+			ConstValueState::Evaluated(_)
+		));
 	}
 
 	#[test]

@@ -387,9 +387,15 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   inherent impls declare a name once, so there is at most one). Its bounds
   wait for the call (`Callee::impl_bounds`), which proves them after learning
   from the expected type and the arguments, as it does the function's own.
-  Trait members are not looked up on such a receiver yet. Open: associated
-  constants (a trait's on an abstract receiver needs a node of its own, as in
-  the old checker).
+  Trait members are not looked up on such a receiver yet.
+- **Associated constants** (done): selected like functions, and read as the
+  same pair the calls have: `Const { constant, type_args }` for a known
+  constant (free, a variant, an inherent impl's or the one a concrete trait
+  impl defines, with the impl's arguments) and `AbstractConst { constant,
+  type_args: [Self] }` for a trait's declaration. Its type is the declared one
+  with those arguments substituted. Constant evaluation reads only a `Const`
+  without arguments; an impl's constant that depends on the impl's arguments,
+  and an abstract one, are not evaluated yet.
 - **`Self` as a value** (done): inside an impl whose target is a struct,
   `Self(..)` and `Self({ .. })` construct it with the target's arguments
   (`impl<Mem> Layout<Mem>` builds `Layout<Mem>`), checked where every field is
