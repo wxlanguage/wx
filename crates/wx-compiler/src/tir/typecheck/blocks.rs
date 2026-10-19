@@ -89,7 +89,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		mut_span: Option<TextSpan>,
 	) -> LocalIdx {
 		let local = self.body.push_local(body::Local { name, ty, mut_span });
-		self.names.insert((self.current, name.inner), local);
+		self.lookup.insert((self.current, name.inner), local);
 		local
 	}
 

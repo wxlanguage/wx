@@ -170,7 +170,7 @@ first from its own `Let` onwards. That is what rustc models with its
 ```rust
 current: ScopeIdx,
 /// Scope-relative lookup, as in the old `ExprContext::lookup`.
-names: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+lookup: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
 /// Index-aligned with `Body::scopes`.
 scope_types: Vec<ScopeType>,
 

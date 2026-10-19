@@ -69,12 +69,13 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// The locals each scope declares, by name. A name is looked up in the
 	/// current scope, then in each enclosing one; a later declaration of the
 	/// same name in one scope replaces the entry, which shadows the earlier.
-	names: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+	lookup: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
 	/// What each scope's value is checked against, index-aligned with the
 	/// body's scopes.
 	scope_types: Vec<ScopeType>,
 	/// Whether each label is named by a `break` or `continue`, index-aligned
-	/// with the body's labels.
+	/// with the body's labels: a label never named is reported as unused
+	/// when the body is finished.
 	label_used: Vec<bool>,
 }
 
@@ -100,7 +101,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			scope,
 			owner,
 			current: ScopeIdx::ROOT,
-			names: HashMap::new(),
+			lookup: HashMap::new(),
 			scope_types: Vec::new(),
 			label_used: Vec::new(),
 		}
@@ -589,7 +590,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn lookup_local(&self, name: SymbolU32) -> Option<LocalIdx> {
 		let mut scope = Some(self.current);
 		while let Some(at) = scope {
-			if let Some(&local) = self.names.get(&(at, name)) {
+			if let Some(&local) = self.lookup.get(&(at, name)) {
 				return Some(local);
 			}
 			scope = self.body.scope(at).parent;
