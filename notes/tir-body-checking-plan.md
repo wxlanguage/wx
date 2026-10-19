@@ -389,10 +389,10 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   data), indexing, slice ranges. There is no ambient memory: a pointer type
   always names its memory (`heap::*T`, `Mem::*T`; an untagged one is
   `PointerWithoutMemory`, E2038), and the compiler never picks one from how
-  many are declared. So a literal that becomes static data needs its memory
-  from somewhere explicit (the expected type, or a written tag); decide which,
-  and what a string literal node carries (its decoded bytes, or a span decoded
-  later). A literal also needs a static-data story that MIR used to own.
+  many are declared. A literal that becomes static data takes its type, and so
+  its memory, from the expected type (decided); without one it needs an
+  annotation. Still open: what a string literal node carries (its decoded
+  bytes, or a span decoded later). A literal also needs a static-data story that MIR used to own.
 - **Calls through `Call`** for non-function values (Q3), and whether
   `Callee::Indirect` is a separate path or `Call::call` on `FunctionRef`.
 - **Method-call privacy**, which the old checker never enforced (CLAUDE.md

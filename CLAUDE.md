@@ -54,7 +54,7 @@ cargo clippy --workspace --no-deps -- -D warnings
 cargo fmt
 ```
 
-Current baseline (mid-refactor, see below): 721 `wx-compiler` tests pass; `wx-fmt`/`wx-lsp`/`wx-cli` do not compile and clippy is not clean (hundreds of dead-code warnings from the disabled stages). The earlier 1023 + 43 + 63 baseline predates the TIR rewrite.
+Current baseline (mid-refactor, see below): 724 `wx-compiler` tests pass; `wx-fmt`/`wx-lsp`/`wx-cli` do not compile and clippy is not clean (hundreds of dead-code warnings from the disabled stages). The earlier 1023 + 43 + 63 baseline predates the TIR rewrite.
 
 ## Crates & binaries
 
@@ -209,7 +209,7 @@ Each interned type carries `TypeFlags` (`HAS_INFER`, `HAS_ERROR`, `HAS_UNTYPED`,
 
 - Primitives: `i32`, `i64`, `u32`, `u64`, `f32`, `f64`, `bool`, `char`, `u8`, `i8`, `u16`, `i16`. They are **real items** — `#[intrinsic] pub type X;` declarations in `std/main.wx`, bound by `ensure_signature` to the matching pre-interned `TypeIndex` — not a hardcoded string match, so they carry `DefId`s and LSP go-to-definition/hover/find-references work on them.
 - Pointers, slices and arrays always carry an ownership sigil — `*T`/`&T`, `*[T]`/`&[T]`, `*[T; N]`/`&[T; N]` (`*` exclusive, `&` shared); there is no bare `[]T` and no `*mut T`. `.&` yields a shared reference (there is no `.&mut`). Each also belongs to a memory, always written (`heap::&[u8]`, or a memory parameter `Mem::*T`): there is no ambient or default memory, and an untagged pointer type is an error (E2038) however many memories are declared. The type formatter always prints that memory prefix — so a slice surfaces in diagnostics as `heap::&[u8]`, never `&[u8]`
-- String literals have type `&[u8]` (a shared byte slice); there is no separate `string` type
+- String literals are shared byte slices (`Mem::&[u8]`), with the memory taken from the expected type; there is no separate `string` type
 - `local` / `local mut` declarations; `global` / `global mut` for module-level state. A global's value type must be one Wasm value (`Global::Value: ValueType`): `u32`, `Meters(u32)`, a pointer or `func(A) -> R` are, `()`, a slice or `Pair(u32, u32)` are not
 - **`local <pattern> = expr` destructuring** — tuples, struct patterns written exactly like construction (`Point(a, b)`, `Point({ x, y: py, .. })`, with a full path), `_` (a drop, binds nothing), arbitrary nesting, and `..` to opt out of exhaustiveness. This is not sugar: there is no `t.0`, so destructuring is the only way to take a tuple apart. Nesting flattens to projection paths, and indices are *declaration* indices mapped through `decl_to_phys` — tuples are alignment-sorted exactly like structs.
 - `const` — compile-time evaluated, inlined at every reference site, never emitted as a WASM global
