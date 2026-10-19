@@ -1,6 +1,6 @@
 //! Constant evaluation: folds a constant's checked `Body` into a value.
 //!
-//! The evaluator handles literals, builtin operators over them, references to
+//! The evaluator handles literals, primitive operators over them, references to
 //! other constants and the construction of structs, and nothing else: whatever
 //! else a body holds (a call, a form the checker does not cover yet) is not a
 //! constant. Arithmetic follows the operand type exactly, and a result outside
@@ -248,8 +248,8 @@ impl TypeContext<'_, '_, '_> {
 		match kind {
 			ExprKind::Error => return Err(Halt::Silent),
 			// Locals, calls, control flow and memory are not evaluated (yet).
-			ExprKind::MethodCall { .. }
-			| ExprKind::GenericMethodCall { .. }
+			ExprKind::ImplMethodCall { .. }
+			| ExprKind::TraitMethodCall { .. }
 			| ExprKind::Local(_)
 			| ExprKind::Global(_)
 			| ExprKind::Function(_)
@@ -268,10 +268,12 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::Return { .. }
 			| ExprKind::Assign { .. }
 			| ExprKind::Store { .. }
-			| ExprKind::CompoundAssign { .. }
-			| ExprKind::GenericCompoundAssign { .. }
-			| ExprKind::CompoundStore { .. }
-			| ExprKind::GenericCompoundStore { .. } => {
+			| ExprKind::PrimitiveCompoundAssign { .. }
+			| ExprKind::ImplCompoundAssign { .. }
+			| ExprKind::TraitCompoundAssign { .. }
+			| ExprKind::PrimitiveCompoundStore { .. }
+			| ExprKind::ImplCompoundStore { .. }
+			| ExprKind::TraitCompoundStore { .. } => {
 				return Err(own(EvalErrorKind::NotConst));
 			}
 			ExprKind::Int(value) => match Scalar::from_type(ty) {
@@ -301,7 +303,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 			// A negated literal is one literal, so `-128` fits an `i8` although
 			// `128` does not.
-			ExprKind::Unary {
+			ExprKind::PrimitiveUnary {
 				op: UnaryOp::InvertSign,
 				operand,
 			} if let ExprKind::Int(value) = body.kind(operand)
@@ -313,7 +315,7 @@ impl TypeContext<'_, '_, '_> {
 					))?,
 				);
 			}
-			ExprKind::Unary { op, operand } => {
+			ExprKind::PrimitiveUnary { op, operand } => {
 				self.eval(owner, operand, stack)?;
 				let operand = stack.pop().expect("an operand's value");
 				stack.push(unary(op, operand).map_err(own)?);
@@ -363,7 +365,7 @@ impl TypeContext<'_, '_, '_> {
 					}
 				}
 			}
-			ExprKind::Binary { op, lhs, rhs } => {
+			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				self.eval(owner, lhs, stack)?;
 				// `&&` and `||` do not evaluate a right side they do not need;
 				// otherwise the right side is the answer.
@@ -996,7 +998,7 @@ fn integer_unary(op: UnaryOp, operand: ConstScalar) -> Option<ConstScalar> {
 		}
 		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
 			unreachable!(
-				"the checker builds builtin operators on their scalars"
+				"the checker builds primitive operators on their scalars"
 			)
 		}
 	})
@@ -1207,7 +1209,7 @@ fn integer_binary(
 		}
 		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
 			unreachable!(
-				"the checker builds builtin operators on their scalars"
+				"the checker builds primitive operators on their scalars"
 			)
 		}
 	})

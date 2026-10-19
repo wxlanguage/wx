@@ -10,8 +10,9 @@ the end; several sections depend on their answers.
 `BodyContext` (`typecheck.rs`) checks one expression tree into a `Body`
 (`body.rs`) for a constant initializer or an enum discriminant. It covers:
 literals (with in-place coercion of untyped subtrees, typeset targets included),
-grouping, unary/binary operators through their traits (builtin node on a
-primitive scalar, `MethodCall`/`GenericMethodCall` otherwise), tuples, paths to
+grouping, unary/binary operators through their traits (`PrimitiveBinary`/
+`PrimitiveUnary` on a primitive scalar, `ImplMethodCall`/`TraitMethodCall`
+otherwise), tuples, paths to
 constants and variants, and struct construction by position or name with local
 inference of the struct's type arguments (`meet`/`learn`) and bound checks at
 the call (`check_now`). Every other form is a `todo!()`, so turning function
@@ -56,7 +57,7 @@ Changed, because the rest of TIR moved on:
 | `EvalMode::{Comptime, Runtime}` deciding whether operators dispatch | Gone already: scalars always get builtin nodes, the evaluator folds them |
 | Generic call inference via `infer_type_args` + `substitute_expected_type` + `type_satisfies_annotation` | `meet`/`learn` (struct construction already uses them) |
 | Bound checks via `check_bounds(BoundOrigin, ..)` | `record_bounds_check` + `check_now` |
-| `Place` tree for memory only; `Assign`/`Store`, `CompoundAssign`/`CompoundStore`/two generic twins | One place arena including locals; one `Assign`, one `CompoundAssign` (below) |
+| `Place` tree for memory only; `Assign`/`Store`, `CompoundAssign`/`CompoundStore`/two generic twins | Kept: memory-only places, `Assign`/`Store`, compound nodes on both targets, plus `Primitive*` variants (below) |
 | `ast::Expression::String(symbol)`, `StructInit` | AST changed: strings are span-only, structs are call-shaped |
 | Method/assoc lookup in `builder/calls.rs` + `members.rs` | `TypeContext::resolve_applicable_member`, `resolve_trait_qualified_value`, `select_trait_member` exist and are pure enough to call from a body |
 | Globals as plain lvalues | `Type::Global` is nominal with `impl Global`/`GlobalMut` (`get`/`set`); see Q2 |
@@ -243,17 +244,34 @@ ExprKind::FieldAccess { object, field }      // a field of a value (local, call 
 
 A local or a field of a value is not a place: it has no address, and whether
 it is assignable is a property of the expression (`Local`, `FieldAccess`
-rooted in one, `Placeholder`). A global's name is its handle (`Type::Global`),
+rooted in one). A global's name is its handle (`Type::Global`),
 not a location: it is read with `Global::get` and written with
 `GlobalMut::set`, so `=` on it is an invalid target. There is no temporary root:
-deciding where a call's result lives is MIR's job. The assignment kinds stay
-separate, for the reasons they were split in the old checker: a place is an
-address computed once and written through (`Store`, `CompoundStore`), the other
-targets are expressions (`Assign`, `CompoundAssign`); and an abstract target
-type keeps the trait's declaration for monomorphization (`GenericCompoundAssign`,
-`GenericCompoundStore`). A concrete compound assignment carries
-`method: Option<FunctionIdx>`, `None` for the builtin operator on a primitive
-scalar, so no separate dispatch type is needed.
+deciding where a call's result lives is MIR's job. `_ = value` is its own
+`Drop`, not an assignment.
+
+The assignment kinds stay separate, for the reasons they were split in the old
+checker: a place is an address computed once and written through (`Store`,
+`*CompoundStore`), the other targets are expressions (`Assign`,
+`*CompoundAssign`); and an abstract target type keeps the trait's declaration
+for monomorphization. Operator and compound nodes are named on two axes. The
+prefix says what defines the operation: `Primitive` (the primitive scalar's
+operator, holding `op`), `Impl` (the method of the impl selected for a concrete
+type) or `Trait` (the trait's declaration, its impl selected at
+monomorphization), both holding `method`. The rest says where the result goes:
+`Assign` (a local or a field of one), `Store` (a place in linear memory), or
+nowhere (a value):
+
+| | value | into a local | into memory |
+|---|---|---|---|
+| `Primitive` | `PrimitiveBinary`, `PrimitiveUnary` | `PrimitiveCompoundAssign` | `PrimitiveCompoundStore` |
+| `Impl` | `ImplMethodCall` | `ImplCompoundAssign` | `ImplCompoundStore` |
+| `Trait` | `TraitMethodCall` | `TraitCompoundAssign` | `TraitCompoundStore` |
+
+Compared with the old checker, which had four compound nodes that always held a
+method (primitives went through their `#[inline]` impls), the `Primitive`
+variants are new: plain operators on primitives already build
+`PrimitiveBinary`, so `op=` follows them.
 
 A `Load` is pushed only where a place's value is used, so `.&` and the left of
 `=` take the place itself and no node is orphaned.
@@ -270,7 +288,7 @@ enum Callee {
 }
 ```
 
-`MethodCall`/`GenericMethodCall` from operators fold into this. Struct
+`ImplMethodCall`/`TraitMethodCall` from operators fold into this. Struct
 construction stays its own kind (no callee). Inference for a function call is
 struct construction generalised: the callee's parameter frame plays the struct's
 role, the parameter types the fields', and the return type is met with the
@@ -379,7 +397,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   pitfall). New code can do it from the start since impl members carry
   visibility; decide the rule for trait default methods (fall back to the
   trait's visibility).
-- **Impl conformance** is not a body concern, but `GenericMethodCall` to a
+- **Impl conformance** is not a body concern, but `TraitMethodCall` to a
   default the impl does not override assumes it. Keep it on the list.
 - **Constant evaluation of richer bodies**: the evaluator returns `NotConst`
   for anything it does not know, so new kinds are safe by default. Whether
@@ -400,11 +418,10 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 - **Q3. Calls through `Call`.** Should `f(x)` on a value whose type implements
   `Call` (a user struct) be accepted now, or only function items and
   `func(..)` references, with `Call` left to bounds (`F: Call`) for the moment?
-- **Q4. Operator nodes.** Keep `Binary`/`Unary` for builtins and a call node
-  for overloaded operators (today's split), or one operator node carrying how it
-  was dispatched? The implementation keeps today's split; compound assignment
-  records `method: Option<FunctionIdx>`.
+- **Q4. Operator nodes.** Decided: one node per way an operation is defined
+  (`Primitive`/`Impl`/`Trait`) and per destination (value, `Assign`, `Store`);
+  see the table under places and assignment.
 - **Q5. Typeset-abstract literal arithmetic in bodies.** Coercion of literals
   to an abstract typeset-bounded `T` exists for constants; in a body, an operator
-  on `T` gives a `GenericMethodCall`. Is anything beyond that expected (for
+  on `T` gives a `TraitMethodCall`. Is anything beyond that expected (for
   example `as` casts between typeset members)?

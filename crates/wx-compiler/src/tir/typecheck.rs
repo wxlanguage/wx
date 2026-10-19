@@ -8,7 +8,8 @@
 //!
 //! Operators are checked through their trait (`OperatorTraits`): the trait
 //! decides whether the operator applies to a type. The node built for it is a
-//! builtin `Binary`/`Unary` on a primitive scalar, and a method call otherwise.
+//! `PrimitiveBinary`/`PrimitiveUnary` on a primitive scalar, and a call of the
+//! impl's or the trait's method otherwise (`ImplMethodCall`/`TraitMethodCall`).
 //!
 //! Untyped literals keep the pseudo-types `Integer`/`Float` until context
 //! gives them one (`coerce`), which rewrites the subtree in place.
@@ -43,7 +44,8 @@ use super::literals::{CharLiteralError, parse_char_literal};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
 use super::operators::{
-	OperatorMethod, Scalar, is_builtin_binary, is_builtin_unary, is_comparison,
+	OperatorMethod, Scalar, is_comparison, is_primitive_binary,
+	is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
 use super::resolutions::{NameResolutions, Referent};
@@ -1199,7 +1201,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.body.ty(operand);
 		if ty.is_untyped() {
 			return self.body.push(
-				ExprKind::Unary {
+				ExprKind::PrimitiveUnary {
 					op: op.inner,
 					operand,
 				},
@@ -1224,7 +1226,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				let lhs = self.check(left, TypeIndex::BOOL);
 				let rhs = self.check(right, TypeIndex::BOOL);
 				return self.body.push(
-					ExprKind::Binary {
+					ExprKind::PrimitiveBinary {
 						op: op.inner,
 						lhs,
 						rhs,
@@ -1304,7 +1306,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					TypeIndex::INTEGER
 				};
 				return self.body.push(
-					ExprKind::Binary {
+					ExprKind::PrimitiveBinary {
 						op: op.inner,
 						lhs,
 						rhs,
@@ -1362,9 +1364,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return (ExprKind::Error, TypeIndex::ERROR);
 		};
 		if Scalar::from_type(ty)
-			.is_some_and(|scalar| is_builtin_unary(op.inner, scalar))
+			.is_some_and(|scalar| is_primitive_unary(op.inner, scalar))
 		{
-			let kind = ExprKind::Unary {
+			let kind = ExprKind::PrimitiveUnary {
 				op: op.inner,
 				operand,
 			};
@@ -1388,7 +1390,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.cx.types.resolve(ty),
 				Type::Enum { .. } | Type::Pointer { .. }
 			) {
-			let kind = ExprKind::Binary {
+			let kind = ExprKind::PrimitiveBinary {
 				op: op.inner,
 				lhs,
 				rhs,
@@ -1411,9 +1413,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ty
 		};
 		if Scalar::from_type(ty)
-			.is_some_and(|scalar| is_builtin_binary(op.inner, scalar))
+			.is_some_and(|scalar| is_primitive_binary(op.inner, scalar))
 		{
-			let kind = ExprKind::Binary {
+			let kind = ExprKind::PrimitiveBinary {
 				op: op.inner,
 				lhs,
 				rhs,
@@ -1483,11 +1485,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> ExprKind {
 		let args = self.body.push_args(args);
 		match self.select_operator_method(selected) {
-			SelectedMethod::Concrete(method) => {
-				ExprKind::MethodCall { method, args }
+			SelectedMethod::Impl(method) => {
+				ExprKind::ImplMethodCall { method, args }
 			}
-			SelectedMethod::Generic(method) => {
-				ExprKind::GenericMethodCall { method, args }
+			SelectedMethod::Trait(method) => {
+				ExprKind::TraitMethodCall { method, args }
 			}
 		}
 	}
@@ -1500,7 +1502,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		(method, lookup): (OperatorMethod, TraitImplLookup),
 	) -> SelectedMethod {
 		let TraitImplLookup::Concrete { impl_index, .. } = lookup else {
-			return SelectedMethod::Generic(method.method);
+			return SelectedMethod::Trait(method.method);
 		};
 		match self
 			.cx
@@ -1509,10 +1511,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		{
 			TraitMemberSelection::Impl(
 				MemberKind::Method(selected) | MemberKind::Function(selected),
-			) => SelectedMethod::Concrete(selected),
+			) => SelectedMethod::Impl(selected),
 			TraitMemberSelection::Impl(_)
 			| TraitMemberSelection::TraitDeclaration(_) => {
-				SelectedMethod::Generic(method.method)
+				SelectedMethod::Trait(method.method)
 			}
 		}
 	}
@@ -1615,7 +1617,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.coerce_int(expr, expr, target, targets, value, false);
 			}
 			ExprKind::Float(_) => self.coerce_float(expr, target, targets),
-			ExprKind::Unary { op, operand } => {
+			ExprKind::PrimitiveUnary { op, operand } => {
 				for fit in targets {
 					if !fit.fits_unary(op) {
 						return self.report_misfit(expr, target, fit);
@@ -1637,7 +1639,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					self.body.set_ty(expr, target);
 				}
 			}
-			ExprKind::Binary { op, lhs, rhs } => {
+			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				debug_assert!(
 					!is_comparison(op),
 					"a comparison is never untyped"
@@ -1947,10 +1949,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 /// The method an operator dispatches to.
 #[derive(Clone, Copy)]
 enum SelectedMethod {
-	/// The impl's own method, called directly.
-	Concrete(FunctionIdx),
-	/// The trait's declaration, selected once the receiver is known.
-	Generic(FunctionIdx),
+	/// The selected impl's own method, called directly.
+	Impl(FunctionIdx),
+	/// The trait's declaration, whose impl is selected once the receiver is
+	/// known.
+	Trait(FunctionIdx),
 }
 
 /// A call's arguments, by position or by name.
@@ -2384,17 +2387,17 @@ mod tests {
 					name(self.defs.functions[usize::from(index)].name.inner)
 						.to_string()
 				}
-				ExprKind::Unary { op, operand } => {
+				ExprKind::PrimitiveUnary { op, operand } => {
 					list(op.as_str(), &[operand])
 				}
-				ExprKind::Binary { op, lhs, rhs } => {
+				ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 					list(op.as_str(), &[lhs, rhs])
 				}
-				ExprKind::MethodCall { method, args } => {
+				ExprKind::ImplMethodCall { method, args } => {
 					let method = self.function_name(method);
 					list(&format!("call {method}"), body.args(args))
 				}
-				ExprKind::GenericMethodCall { method, args } => {
+				ExprKind::TraitMethodCall { method, args } => {
 					let method = self.function_name(method);
 					list(&format!("generic {method}"), body.args(args))
 				}
@@ -2474,37 +2477,50 @@ mod tests {
 					self.render_place(body, place),
 					self.render(body, value)
 				),
-				ExprKind::CompoundAssign {
-					op,
+				ExprKind::PrimitiveCompoundAssign { op, target, value } => {
+					list(&format!("{}=", op.as_str()), &[target, value])
+				}
+				ExprKind::ImplCompoundAssign {
+					method,
 					target,
 					value,
-					method,
 				} => list(
-					&format!("{}={}", op.as_str(), self.via(method)),
+					&format!("assign call {}", self.function_name(method)),
 					&[target, value],
 				),
-				ExprKind::GenericCompoundAssign {
-					op, target, value, ..
-				} => {
-					list(&format!("generic {}=", op.as_str()), &[target, value])
+				ExprKind::TraitCompoundAssign {
+					method,
+					target,
+					value,
+				} => list(
+					&format!("assign generic {}", self.function_name(method)),
+					&[target, value],
+				),
+				ExprKind::PrimitiveCompoundStore { op, place, value } => {
+					format!(
+						"(store {}= {} {})",
+						op.as_str(),
+						self.render_place(body, place),
+						self.render(body, value)
+					)
 				}
-				ExprKind::CompoundStore {
-					op,
+				ExprKind::ImplCompoundStore {
+					method,
 					place,
 					value,
-					method,
 				} => format!(
-					"(store {}={} {} {})",
-					op.as_str(),
-					self.via(method),
+					"(store call {} {} {})",
+					self.function_name(method),
 					self.render_place(body, place),
 					self.render(body, value)
 				),
-				ExprKind::GenericCompoundStore {
-					op, place, value, ..
+				ExprKind::TraitCompoundStore {
+					method,
+					place,
+					value,
 				} => format!(
-					"(store generic {}= {} {})",
-					op.as_str(),
+					"(store generic {} {} {})",
+					self.function_name(method),
 					self.render_place(body, place),
 					self.render(body, value)
 				),
@@ -2522,12 +2538,6 @@ mod tests {
 					self.field_name(body.place(object).ty, field)
 				),
 			}
-		}
-
-		fn via(&self, method: Option<super::FunctionIdx>) -> String {
-			method.map_or(String::new(), |method| {
-				format!(" via {}", self.function_name(method))
-			})
 		}
 
 		fn function_name(&self, index: super::FunctionIdx) -> &str {
@@ -3034,11 +3044,11 @@ mod tests {
 		);
 		assert_eq!(
 			case.shape("overloaded"),
-			"(block (local w#1 v#0) (+= via add w#1 v#0))"
+			"(block (local w#1 v#0) (assign call add w#1 v#0))"
 		);
 		assert_eq!(
 			case.shape("generic"),
-			"(block (local u#1 t#0) (generic += u#1 t#0))"
+			"(block (local u#1 t#0) (assign generic add u#1 t#0))"
 		);
 	}
 

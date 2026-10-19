@@ -4593,11 +4593,11 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn builtin_operators_match_the_stdlib_impls() {
+	fn primitive_operators_match_the_stdlib_impls() {
 		use crate::tir::operators::{
-			Scalar, is_builtin_binary, is_builtin_unary,
+			Scalar, is_primitive_binary, is_primitive_unary,
 		};
-		// The compiler builds `Binary`/`Unary` exactly where the stdlib has a
+		// The compiler builds `PrimitiveBinary`/`PrimitiveUnary` exactly where the stdlib has a
 		// primitive impl, so the two must name the same pairs.
 		test_case!(case = include_str!("../../std/main.wx"));
 		let implements = |trait_index: TraitIdx, scalar: Scalar| {
@@ -4635,7 +4635,7 @@ pub(super) mod tests {
 			for scalar in Scalar::ALL {
 				assert_eq!(
 					implements(method.trait_index, scalar),
-					is_builtin_binary(op, scalar),
+					is_primitive_binary(op, scalar),
 					"`{}` on {scalar:?}",
 					op.as_str()
 				);
@@ -4650,7 +4650,7 @@ pub(super) mod tests {
 			for scalar in Scalar::ALL {
 				assert_eq!(
 					implements(method.trait_index, scalar),
-					is_builtin_unary(op, scalar),
+					is_primitive_unary(op, scalar),
 					"{op:?} on {scalar:?}"
 				);
 			}
@@ -4706,24 +4706,24 @@ pub(super) mod tests {
 							case.graph.strings.resolve(name).unwrap()
 						)
 					}
-					ExprKind::Unary { op, operand } => {
+					ExprKind::PrimitiveUnary { op, operand } => {
 						format!(
 							"({} {})",
 							op.as_str(),
 							render(case, body, operand)
 						)
 					}
-					ExprKind::Binary { op, lhs, rhs } => format!(
+					ExprKind::PrimitiveBinary { op, lhs, rhs } => format!(
 						"({} {} {})",
 						op.as_str(),
 						render(case, body, lhs),
 						render(case, body, rhs)
 					),
-					ExprKind::MethodCall { method, args }
-					| ExprKind::GenericMethodCall { method, args } => {
+					ExprKind::ImplMethodCall { method, args }
+					| ExprKind::TraitMethodCall { method, args } => {
 						let generic = matches!(
 							body.kind(expr),
-							ExprKind::GenericMethodCall { .. }
+							ExprKind::TraitMethodCall { .. }
 						);
 						let name =
 							case.defs.functions[usize::from(method)].name.inner;

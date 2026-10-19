@@ -16,7 +16,7 @@ use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
 use crate::tir::defs::{FunctionIdx, Visibility};
-use crate::tir::operators::{Scalar, is_builtin_binary};
+use crate::tir::operators::{Scalar, is_primitive_binary};
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
 /// What the left of `=`, the operand of `.&` or the object of `.field` is.
@@ -26,12 +26,14 @@ enum Operand {
 	Value(ExprIdx),
 }
 
-/// What `op=` calls.
+/// What defines an `op=`, as in the `*Compound*` node names.
 enum CompoundMethod {
-	/// The builtin operator on a primitive scalar.
-	Builtin,
-	Concrete(FunctionIdx),
-	Generic(FunctionIdx),
+	/// The primitive scalar's operator.
+	Primitive,
+	/// The selected impl's method.
+	Impl(FunctionIdx),
+	/// The trait's declaration of the method.
+	Trait(FunctionIdx),
 }
 
 impl BodyContext<'_, '_, '_, '_> {
@@ -359,26 +361,25 @@ impl BodyContext<'_, '_, '_, '_> {
 					);
 				};
 				let kind = match method {
-					CompoundMethod::Builtin => ExprKind::CompoundStore {
-						op: plain,
-						place,
-						value,
-						method: None,
-					},
-					CompoundMethod::Concrete(method) => {
-						ExprKind::CompoundStore {
+					CompoundMethod::Primitive => {
+						ExprKind::PrimitiveCompoundStore {
 							op: plain,
 							place,
 							value,
-							method: Some(method),
 						}
 					}
-					CompoundMethod::Generic(method) => {
-						ExprKind::GenericCompoundStore {
-							op: plain,
+					CompoundMethod::Impl(method) => {
+						ExprKind::ImplCompoundStore {
+							method,
 							place,
 							value,
+						}
+					}
+					CompoundMethod::Trait(method) => {
+						ExprKind::TraitCompoundStore {
 							method,
+							place,
+							value,
 						}
 					}
 				};
@@ -406,26 +407,25 @@ impl BodyContext<'_, '_, '_, '_> {
 					);
 				};
 				let kind = match method {
-					CompoundMethod::Builtin => ExprKind::CompoundAssign {
-						op: plain,
-						target,
-						value,
-						method: None,
-					},
-					CompoundMethod::Concrete(method) => {
-						ExprKind::CompoundAssign {
+					CompoundMethod::Primitive => {
+						ExprKind::PrimitiveCompoundAssign {
 							op: plain,
 							target,
 							value,
-							method: Some(method),
 						}
 					}
-					CompoundMethod::Generic(method) => {
-						ExprKind::GenericCompoundAssign {
-							op: plain,
+					CompoundMethod::Impl(method) => {
+						ExprKind::ImplCompoundAssign {
+							method,
 							target,
 							value,
+						}
+					}
+					CompoundMethod::Trait(method) => {
+						ExprKind::TraitCompoundAssign {
 							method,
+							target,
+							value,
 						}
 					}
 				};
@@ -452,15 +452,13 @@ impl BodyContext<'_, '_, '_, '_> {
 			DiagnosticCode::BinaryOperatorCannotBeApplied,
 		)?;
 		if Scalar::from_type(ty)
-			.is_some_and(|scalar| is_builtin_binary(plain, scalar))
+			.is_some_and(|scalar| is_primitive_binary(plain, scalar))
 		{
-			return Some(CompoundMethod::Builtin);
+			return Some(CompoundMethod::Primitive);
 		}
 		Some(match self.select_operator_method(selected) {
-			SelectedMethod::Concrete(method) => {
-				CompoundMethod::Concrete(method)
-			}
-			SelectedMethod::Generic(method) => CompoundMethod::Generic(method),
+			SelectedMethod::Impl(method) => CompoundMethod::Impl(method),
+			SelectedMethod::Trait(method) => CompoundMethod::Trait(method),
 		})
 	}
 

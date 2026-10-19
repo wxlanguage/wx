@@ -79,7 +79,8 @@ pub(super) enum ArgOrder {
 pub(super) enum ExprKind {
 	/// Already reported; whatever reads it stays silent.
 	Error,
-	/// A literal's magnitude, as written; `-1` is `Unary` over `Int(1)`.
+	/// A literal's magnitude, as written; `-1` is `PrimitiveUnary` over
+	/// `Int(1)`.
 	Int(u64),
 	Float(f64),
 	Bool(bool),
@@ -95,27 +96,34 @@ pub(super) enum ExprKind {
 	/// A function as a value, of its own zero-sized type (`Type::Function`,
 	/// which carries the type arguments).
 	Function(FunctionIdx),
-	/// A builtin operator: the operand is a primitive scalar.
-	Unary {
+	// Operators and compound assignment. A name says what defines the
+	// operation: `Primitive`, the operator of a primitive scalar (it holds the
+	// `op`); `Impl`, the method of the impl selected for a concrete type;
+	// `Trait`, the trait's declaration of the method, for an abstract type,
+	// whose impl is selected at monomorphization (both hold the `method`).
+	// It then says where the result goes: `Assign`, a local or a field of
+	// one; `Store`, a place in linear memory; neither, it is a value.
+	/// `op operand` on a primitive scalar.
+	PrimitiveUnary {
 		op: UnaryOp,
 		operand: ExprIdx,
 	},
-	/// A builtin operator: both operands are the same primitive scalar, or
-	/// `bool` for `&&`/`||`.
-	Binary {
+	/// `lhs op rhs` where both are the same primitive scalar, or `bool` for
+	/// `&&`/`||`.
+	PrimitiveBinary {
 		op: BinaryOp,
 		lhs: ExprIdx,
 		rhs: ExprIdx,
 	},
-	/// An operator on a concrete non-primitive type: a call to the selected
-	/// impl's method, the receiver first in `args`.
-	MethodCall {
+	/// An operator on a concrete type: a call of the selected impl's method,
+	/// the receiver first in `args`.
+	ImplMethodCall {
 		method: FunctionIdx,
 		args: ExprRange,
 	},
-	/// An operator on an abstract type: the trait's declaration of the method,
-	/// selected once the receiver is known (monomorphization).
-	GenericMethodCall {
+	/// An operator on an abstract type: a call of the trait's declaration of
+	/// the method, the receiver first in `args`.
+	TraitMethodCall {
 		method: FunctionIdx,
 		args: ExprRange,
 	},
@@ -206,38 +214,48 @@ pub(super) enum ExprKind {
 		place: PlaceIdx,
 		value: ExprIdx,
 	},
-	/// `target op= value` on a concrete type: `target = target op value`, with
-	/// `target` evaluated once (`Assign`'s targets). `method` is the selected
-	/// impl's method, `None` when `op` is builtin on a primitive scalar.
-	CompoundAssign {
+	/// `target op= value` on a primitive scalar (`op` is `Add`, not
+	/// `AddAssign`): `target = target op value`, with `target` evaluated once.
+	/// `target` is one of `Assign`'s.
+	PrimitiveCompoundAssign {
 		op: BinaryOp,
 		target: ExprIdx,
 		value: ExprIdx,
-		method: Option<FunctionIdx>,
 	},
-	/// `CompoundAssign` on an abstract type: `method` is the trait's
-	/// declaration, selected once the target's type is known
-	/// (monomorphization), as for `GenericMethodCall`.
-	GenericCompoundAssign {
-		op: BinaryOp,
+	/// `target op= value` on a concrete type, through the selected impl's
+	/// method.
+	ImplCompoundAssign {
+		method: FunctionIdx,
 		target: ExprIdx,
 		value: ExprIdx,
-		method: FunctionIdx,
 	},
-	/// `CompoundAssign` through a place in linear memory: its address is
-	/// computed once and used for both the read and the write.
-	CompoundStore {
+	/// `target op= value` on an abstract type, through the trait's
+	/// declaration of the method.
+	TraitCompoundAssign {
+		method: FunctionIdx,
+		target: ExprIdx,
+		value: ExprIdx,
+	},
+	/// `place op= value` on a primitive scalar, for a place in linear memory:
+	/// its address is computed once and used for both the read and the write.
+	PrimitiveCompoundStore {
 		op: BinaryOp,
 		place: PlaceIdx,
 		value: ExprIdx,
-		method: Option<FunctionIdx>,
 	},
-	/// `GenericCompoundAssign` through a place in linear memory.
-	GenericCompoundStore {
-		op: BinaryOp,
+	/// `place op= value` on a concrete type, through the selected impl's
+	/// method.
+	ImplCompoundStore {
+		method: FunctionIdx,
 		place: PlaceIdx,
 		value: ExprIdx,
+	},
+	/// `place op= value` on an abstract type, through the trait's
+	/// declaration of the method.
+	TraitCompoundStore {
 		method: FunctionIdx,
+		place: PlaceIdx,
+		value: ExprIdx,
 	},
 }
 
@@ -518,20 +536,25 @@ impl BodyBuilder {
 
 	fn children(&self, kind: ExprKind) -> impl Iterator<Item = ExprIdx> + '_ {
 		let (fixed, args): ([Option<ExprIdx>; 3], &[ExprIdx]) = match kind {
-			ExprKind::Unary { operand, .. } => {
+			ExprKind::PrimitiveUnary { operand, .. } => {
 				([Some(operand), None, None], &[])
 			}
-			ExprKind::Binary { lhs, rhs, .. }
+			ExprKind::PrimitiveBinary { lhs, rhs, .. }
 			| ExprKind::Assign {
 				target: lhs,
 				value: rhs,
 			}
-			| ExprKind::CompoundAssign {
+			| ExprKind::PrimitiveCompoundAssign {
 				target: lhs,
 				value: rhs,
 				..
 			}
-			| ExprKind::GenericCompoundAssign {
+			| ExprKind::ImplCompoundAssign {
+				target: lhs,
+				value: rhs,
+				..
+			}
+			| ExprKind::TraitCompoundAssign {
 				target: lhs,
 				value: rhs,
 				..
@@ -541,8 +564,9 @@ impl BodyBuilder {
 			| ExprKind::Drop { value }
 			| ExprKind::LocalDeclaration { value, .. }
 			| ExprKind::Store { value, .. }
-			| ExprKind::CompoundStore { value, .. }
-			| ExprKind::GenericCompoundStore { value, .. } => {
+			| ExprKind::PrimitiveCompoundStore { value, .. }
+			| ExprKind::ImplCompoundStore { value, .. }
+			| ExprKind::TraitCompoundStore { value, .. } => {
 				([Some(value), None, None], &[])
 			}
 			ExprKind::IfElse {
@@ -565,8 +589,8 @@ impl BodyBuilder {
 				&self.extra[statements.start as usize
 					..(statements.start + statements.len) as usize],
 			),
-			ExprKind::MethodCall { args, .. }
-			| ExprKind::GenericMethodCall { args, .. }
+			ExprKind::ImplMethodCall { args, .. }
+			| ExprKind::TraitMethodCall { args, .. }
 			| ExprKind::StructConstructor { args, .. }
 			| ExprKind::Tuple { elements: args }
 			| ExprKind::Loop {
