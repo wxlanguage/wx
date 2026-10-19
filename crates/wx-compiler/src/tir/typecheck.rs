@@ -2617,10 +2617,6 @@ mod tests {
 			[("a".into(), "u32".into()), ("b".into(), "u32".into())]
 		);
 		let body = case.body("f");
-		assert_eq!(
-			body.local(super::LocalIdx::new(0)).scope,
-			super::ScopeIdx::ROOT
-		);
 		assert!(body.scope(super::ScopeIdx::ROOT).parent.is_none());
 		// Each use of a parameter is recorded as a reference to it.
 		let file_id = case
@@ -2718,10 +2714,6 @@ mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
-		let body = case.body("f");
-		let inner = body.local(super::LocalIdx::new(0));
-		assert_ne!(inner.scope, super::ScopeIdx::ROOT);
-		assert_eq!(body.scope(inner.scope).parent, Some(super::ScopeIdx::ROOT));
 	}
 
 	#[test]

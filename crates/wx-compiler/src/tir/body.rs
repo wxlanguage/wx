@@ -295,9 +295,6 @@ pub(super) struct Local {
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) ty: TypeIndex,
 	pub(super) mut_span: Option<TextSpan>,
-	/// The block it is declared in; it is visible from its declaration to the
-	/// end of that block.
-	pub(super) scope: ScopeIdx,
 }
 
 /// A location in linear memory. Every place is reached through a pointer, so

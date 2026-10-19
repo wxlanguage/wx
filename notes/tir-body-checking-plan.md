@@ -53,7 +53,7 @@ Changed, because the rest of TIR moved on:
 | --- | --- |
 | Boxed `Expression` tree, `Result<Expression, ()>` (a failure drops the node) | Arena, failures are `ExprKind::Error` nodes typed `ERROR` |
 | `accesses: Vec<..>` on locals, labels, items | `NameResolutions`; add `Referent::Local` |
-| `BlockScope` holding its own `Vec<Local>`, locals addressed by `(ScopeIndex, LocalIndex)`, a separate `BlockLabel` arena | The scope tree is kept in the `Body`; a local is one `LocalIdx` with a `scope` field; labels stay their own arena (`Body::labels`, a scope points at one); typing state per scope stays in the checker |
+| `BlockScope` holding its own `Vec<Local>`, locals addressed by `(ScopeIndex, LocalIndex)`, a separate `BlockLabel` arena | The scope tree is kept in the `Body`; a local is one `LocalIdx`; labels stay their own arena (`Body::labels`, a scope points at one); typing state per scope stays in the checker |
 | `EvalMode::{Comptime, Runtime}` deciding whether operators dispatch | Gone already: scalars always get builtin nodes, the evaluator folds them |
 | Generic call inference via `infer_type_args` + `substitute_expected_type` + `type_satisfies_annotation` | `meet`/`learn` (struct construction already uses them) |
 | Bound checks via `check_bounds(BoundOrigin, ..)` | `record_bounds_check` + `check_now` |
@@ -117,9 +117,6 @@ struct Local {
     name: Spanned<SymbolU32>,
     ty: TypeIndex,
     mutable: Option<TextSpan>,
-    /// The block it is declared in. It is visible from its `Let` to the end
-    /// of that block.
-    scope: ScopeIdx,
 }
 
 /// A written block label, as the old `BlockLabel`. One label can name two
@@ -155,14 +152,15 @@ leaves that branch's scope, which ends the `if`.
 `return` keeps its own kind, since MIR emits it differently, but is typed by
 the same rule as a `break` out of scope 0.
 
-**A local has one identity, `LocalIdx`, plus a pointer to its scope.** The old
-model numbered locals per scope and addressed one by `(ScopeIndex, LocalIndex)`.
-Here the scope is a field of the local rather than half of its name, so
-`Referent::Local { owner: BodyOwner, local: LocalIdx }`, a pattern binding and a
-place all carry one index. LocalIdx order is declaration order, so "the locals
-of scope S, in order" is a filter over `locals`. If a consumer needs that list
-often, it can be cached on `Scope` later; storing both from the start would give
-the same fact two homes. Shadowing is explicit: `local x = 1; local x = x + 1;`
+**A local has one identity, `LocalIdx`.** The old model numbered locals per
+scope and addressed one by `(ScopeIndex, LocalIndex)`. Here the scope is not
+half of its name, so `Referent::Local { owner: BodyOwner, local: LocalIdx }`
+and a pattern binding carry one index. Which block declares a local is not
+stored on it: the checker only needs it while resolving names (the
+`(scope, name)` map), and afterwards the tree holds it (a `LocalDeclaration`
+sits among one block's statements; parameters are in the root). If a consumer
+(MIR's slot sharing, the LSP) needs a direct "locals of scope S" lookup, it is
+added then. Shadowing is explicit: `local x = 1; local x = x + 1;`
 is two `Local`s with the same name in the same scope, and the second hides the
 first from its own `Let` onwards. That is what rustc models with its
 "remainder" scopes, and here it falls out of declaration order.
