@@ -85,6 +85,9 @@ pub(super) enum ExprKind {
 	Float(f64),
 	Bool(bool),
 	Char(char),
+	/// A string literal's contents, unescaped. Its type is a shared byte
+	/// slice or byte array its context gives (`Type::String` until then).
+	String(SymbolU32),
 	Const(ConstIdx),
 	/// An enum variant written without a value: the value of the variant
 	/// before it, plus one, in the enum's repr.

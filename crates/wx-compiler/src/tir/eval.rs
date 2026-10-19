@@ -248,7 +248,8 @@ impl TypeContext<'_, '_, '_> {
 		match kind {
 			ExprKind::Error => return Err(Halt::Silent),
 			// Locals, calls, control flow and memory are not evaluated (yet).
-			ExprKind::ConcreteMethodCall { .. }
+			ExprKind::String(_)
+			| ExprKind::ConcreteMethodCall { .. }
 			| ExprKind::AbstractMethodCall { .. }
 			| ExprKind::Local(_)
 			| ExprKind::Global(_)

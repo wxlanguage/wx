@@ -80,6 +80,7 @@ impl ImplTarget {
 			| Type::Never
 			| Type::Integer
 			| Type::Float
+			| Type::String
 			| Type::Tuple { .. }
 			| Type::FunctionRef { .. }
 			| Type::Pointer { .. }

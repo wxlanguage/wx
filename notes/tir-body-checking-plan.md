@@ -385,17 +385,24 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 
 ### 3. Think first
 
-- **Pointers and memory**: string literals, array literals and repeats (static
-  data), indexing, slice ranges. There is no ambient memory: a pointer type
-  always names its memory (`heap::*T`, `Mem::*T`; an untagged one is
-  `PointerWithoutMemory`, E2038), and the compiler never picks one from how
-  many are declared. A literal that becomes static data takes its type, and so
-  its memory, from the expected type (decided); without one it needs an
-  annotation. A string literal node carries its unescaped contents as a
-  `SymbolU32` (decided), decoded with `literals::unescape_string_literal`, as
-  `defs.rs` already does for `import` module names; its span is the node's,
-  like every expression's. `TypeContext::strings` is `&mut StringInterner`,
-  so the body phase can intern the decoded contents. A literal also needs a static-data story that MIR used to own.
+- **Pointers and memory**: array literals and repeats (static data), indexing,
+  slice ranges. There is no ambient memory: a pointer type always names its
+  memory (`heap::*T`, `Mem::*T`; an untagged one is `PointerWithoutMemory`,
+  E2038), and the compiler never picks one from how many are declared. A
+  literal that becomes static data takes its type, and so its memory, from its
+  context; without one it needs an annotation. A static-data story for MIR is
+  still open.
+- **String literals** (done): `ExprKind::String(SymbolU32)` holds the
+  unescaped contents (`literals::unescape_string_literal`, interned through
+  `TypeContext::strings`, which is `&mut`). Like a number, a string literal is
+  untyped (`Type::String`, `HAS_UNTYPED`) until its context gives it a type,
+  and `coerce` accepts a shared byte slice `M::&[u8]` or a shared byte array of
+  exactly its length `M::&[u8; N]`, in any memory, abstract ones included. So
+  it can wait for a generic call to learn its memory (`take("abc", p)`).
+  Exclusive targets are rejected (the data is read-only), a wrong length is
+  `ArraySizeMismatch`, operators on an untyped string are reported, and a cast
+  accepts what coercion would. Constant evaluation gives `NotConst` until
+  static data is designed. Open: `heap::&[u8; _]`, inferring the length.
 - **Calls through `Call`** for non-function values (Q3), and whether
   `Callee::Indirect` is a separate path or `Call::call` on `FunctionRef`.
 - **Method-call privacy**, which the old checker never enforced (CLAUDE.md

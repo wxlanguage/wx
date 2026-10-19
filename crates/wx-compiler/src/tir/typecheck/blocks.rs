@@ -411,8 +411,11 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.coerce(second, first_ty);
 				first_ty
 			}
-			// Two literals are a float if either is.
-			(true, true) if first_ty.is_untyped() && second_ty.is_untyped() => {
+			// Two numeric literals are a float if either is.
+			(true, true)
+				if first_ty.is_comptime_number()
+					&& second_ty.is_comptime_number() =>
+			{
 				TypeIndex::FLOAT
 			}
 			_ => {

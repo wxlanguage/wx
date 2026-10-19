@@ -5,12 +5,13 @@
 //! (its discriminant), between
 //! pointers into the same memory, and between a pointer and its memory's
 //! `Size`. A pointer cast may give up exclusivity (`*T as &T`) but never gain
-//! it (`&T as *T`), so a shared pointer stays read-only. `as _` casts to the
-//! expected type.
+//! it (`&T as *T`), so a shared pointer stays read-only. A string literal is
+//! cast to what it can be coerced to: a shared byte slice or byte array of its
+//! length. `as _` casts to the expected type.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
-use super::BodyContext;
+use super::{BodyContext, STRING_TARGETS_NOTE};
 use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind};
@@ -58,9 +59,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		if source == TypeIndex::ERROR || target == TypeIndex::ERROR {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
-		// A literal is given the type it is cast to, or for a pointer, the
-		// memory's `Size`.
-		if self.cx.types.has_untyped(source) {
+		// A string literal is cast to what it could be coerced to; checking
+		// it is coercing it.
+		if source == TypeIndex::STRING {
+			if !is_byte_slice_or_array(self, target) {
+				return self.report_invalid_cast(value, source, target, span);
+			}
+			self.coerce(value, target);
+			if self.body.ty(value) == TypeIndex::ERROR {
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
+		// A numeric literal is given the type it is cast to, or for a
+		// pointer, the memory's `Size`.
+		} else if self.cx.types.has_untyped(source) {
 			let literal_target = match *self.cx.types.resolve(target) {
 				Type::Pointer { memory, .. } => self.memory_size(memory),
 				_ if Scalar::from_type(target).is_some() => target,
@@ -170,11 +181,31 @@ impl BodyContext<'_, '_, '_, '_> {
 				Label::primary(self.scope.file_id, span)
 					.with_message("invalid cast"),
 			);
-		if self.cx.types.has_untyped(self.body.ty(value)) {
+		let value_ty = self.body.ty(value);
+		if value_ty == TypeIndex::STRING {
+			diagnostic = diagnostic.with_note(STRING_TARGETS_NOTE);
+		} else if self.cx.types.has_untyped(value_ty) {
 			diagnostic = diagnostic
 				.with_note("a literal is cast only to a number or a pointer");
 		}
 		self.cx.diagnostics.push(diagnostic);
 		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 	}
+}
+
+/// Whether `target` is a shared byte slice or byte array: what a string
+/// literal is cast to. Its length, for an array, is coercion's to check.
+fn is_byte_slice_or_array(cx: &BodyContext, target: TypeIndex) -> bool {
+	matches!(
+		*cx.cx.types.resolve(target),
+		Type::Slice {
+			of: TypeIndex::U8,
+			ownership: Ownership::Shared,
+			..
+		} | Type::Array {
+			of: TypeIndex::U8,
+			ownership: Ownership::Shared,
+			..
+		}
+	)
 }

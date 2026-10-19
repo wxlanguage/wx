@@ -55,7 +55,9 @@ impl TypeIndex {
 	}
 
 	pub fn is_untyped(self) -> bool {
-		self == TypeIndex::INTEGER || self == TypeIndex::FLOAT
+		self == TypeIndex::INTEGER
+			|| self == TypeIndex::FLOAT
+			|| self == TypeIndex::STRING
 	}
 
 	#[inline]
@@ -106,6 +108,7 @@ impl TypeIndex {
 	pub const F64: TypeIndex = TypeIndex(15);
 	pub const BOOL: TypeIndex = TypeIndex(16);
 	pub const CHAR: TypeIndex = TypeIndex(17);
+	pub const STRING: TypeIndex = TypeIndex(18);
 }
 
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
@@ -155,6 +158,10 @@ pub enum Type {
 	Never,
 	Integer,
 	Float,
+	/// An untyped string literal's type: a shared byte slice or a shared
+	/// byte array of the literal's length, in a memory its context gives
+	/// (`coerce`).
+	String,
 	U8,
 	I8,
 	U16,
@@ -557,6 +564,7 @@ impl TypeInterner {
 			Type::F64,
 			Type::Bool,
 			Type::Char,
+			Type::String,
 		] {
 			types.intern(ty);
 		}
@@ -694,7 +702,9 @@ impl TypeInterner {
 		match ty {
 			Type::Infer => TypeFlags::HAS_INFER,
 			Type::Error => TypeFlags::HAS_ERROR,
-			Type::Integer | Type::Float => TypeFlags::HAS_UNTYPED,
+			Type::Integer | Type::Float | Type::String => {
+				TypeFlags::HAS_UNTYPED
+			}
 			Type::Tuple { elements: list }
 			| Type::Struct {
 				type_args: list, ..
@@ -1252,6 +1262,7 @@ impl TypeInterner {
 			| Type::Never
 			| Type::Integer
 			| Type::Float
+			| Type::String
 			| Type::U8
 			| Type::I8
 			| Type::U16

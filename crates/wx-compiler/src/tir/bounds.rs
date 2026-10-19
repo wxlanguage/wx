@@ -916,6 +916,7 @@ pub(super) fn known_distinct(
 			| Type::Infer
 			| Type::Integer
 			| Type::Float
+			| Type::String
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. },
 			_,
@@ -926,6 +927,7 @@ pub(super) fn known_distinct(
 			| Type::Infer
 			| Type::Integer
 			| Type::Float
+			| Type::String
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. },
 		) => false,

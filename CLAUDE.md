@@ -13,7 +13,7 @@ The type checker is being rewritten. Only the front half is live:
 - **Compiled and tested:** `ast`, `vfs`, `diagnostics`, and `tir` phases 1–2 (`defs.rs`, `imports.rs`, `paths.rs`, `impls.rs`, `signatures.rs` and their support modules, see "TIR" below). The embedded stdlib sweeps with zero diagnostics.
 - **Commented out** in `lib.rs`: `mir`, `opt`, `codegen`, `wasm`. In `tir/mod.rs`: the `TIR` struct, `TIR::build`, `mod builder` (the old body checker, ~22k lines under `tir/builder/`, kept only as the reference to port from) and `mod tests` (`tir/tests.rs` and `tir/snapshots/` are the old suite and are not compiled).
 - **Not compiling:** `wx-fmt`, `wx-lsp`, `wx-cli` (and so `wx` itself) reference things that no longer exist. This is expected mid-refactor state; don't "fix" it as a side effect of unrelated work.
-- **Function bodies, basic version:** `BodyContext` (`typecheck.rs`, with `typecheck/{blocks,calls,casts,places}.rs`) checks constant and global initializers and function blocks: blocks and scopes, locals, `if`, `loop`/labels/`break`/`continue`/`return`, direct function calls with inferred type arguments, casts, places (`.*`, field access, `.&`) and the assignment family. Method calls, paths through a type (`Self::X`, `Enum::function`), `match`, destructuring, strings, arrays and indexing are reported as `UnsupportedExpression` (E2114, bug severity); the stdlib still uses some, so the TIR test harnesses drop the stdlib's own E2114 reports. Plan: `notes/tir-body-checking-plan.md`.
+- **Function bodies, basic version:** `BodyContext` (`typecheck.rs`, with `typecheck/{blocks,calls,casts,places}.rs`) checks constant and global initializers and function blocks: blocks and scopes, locals, `if`, `loop`/labels/`break`/`continue`/`return`, direct function calls with inferred type arguments, casts, places (`.*`, field access, `.&`) and the assignment family. String literals are checked (untyped until context gives them a byte slice or array). Method calls, paths through a type (`Self::X`, `Enum::function`), `match`, destructuring, arrays and indexing are reported as `UnsupportedExpression` (E2114, bug severity); the stdlib still uses some, so the TIR test harnesses drop the stdlib's own E2114 reports. Plan: `notes/tir-body-checking-plan.md`.
 - **Not started:** impl conformance, wiring a new `TIR::build`.
 
 Design and rationale: `notes/tir-type-context.md`. Everything below that mentions `tir/builder/`, the `TIR` struct, `TIR::build`, MIR/opt/codegen, or the CLI describes the **previous, still-reference-worthy design**, not what currently builds.
@@ -54,7 +54,7 @@ cargo clippy --workspace --no-deps -- -D warnings
 cargo fmt
 ```
 
-Current baseline (mid-refactor, see below): 724 `wx-compiler` tests pass; `wx-fmt`/`wx-lsp`/`wx-cli` do not compile and clippy is not clean (hundreds of dead-code warnings from the disabled stages). The earlier 1023 + 43 + 63 baseline predates the TIR rewrite.
+Current baseline (mid-refactor, see below): 728 `wx-compiler` tests pass; `wx-fmt`/`wx-lsp`/`wx-cli` do not compile and clippy is not clean (hundreds of dead-code warnings from the disabled stages). The earlier 1023 + 43 + 63 baseline predates the TIR rewrite.
 
 ## Crates & binaries
 
@@ -174,7 +174,7 @@ Semantic queries (`find_trait_impl_query`, `normalize_*`, `resolve_type_member`,
 
 ## Type system
 
-Every type is a `TypeIndex` (u32) into `tir.types` (a `TypeInterner`). The first 18 slots are pre-interned by the hardcoded `vec![Type::Infer, Type::Error, ..., Type::Char]` literal in **`TypeInterner::new()` (`tir/types.rs`)** — the reverse `index_lookup` is built by iterating over it — and MUST match the `TypeIndex` constants declared in the same file. Never reorder them; add new pre-interned types at the end only.
+Every type is a `TypeIndex` (u32) into `tir.types` (a `TypeInterner`). The first 19 slots are pre-interned by the hardcoded `vec![Type::Infer, Type::Error, ..., Type::Char]` literal in **`TypeInterner::new()` (`tir/types.rs`)** — the reverse `index_lookup` is built by iterating over it — and MUST match the `TypeIndex` constants declared in the same file. Never reorder them; add new pre-interned types at the end only.
 
 | Constant  | Index |
 | --------- | ----- |
@@ -196,8 +196,11 @@ Every type is a `TypeIndex` (u32) into `tir.types` (a `TypeInterner`). The first
 | `F64`     | 15    |
 | `BOOL`    | 16    |
 | `CHAR`    | 17    |
+| `STRING`  | 18    |
 
 Each interned type carries `TypeFlags` (`HAS_INFER`, `HAS_ERROR`, `HAS_UNTYPED`, `HAS_PARAM`, `HAS_PROJECTION`), computed once in `TypeInterner::insert` from its own kind and its parts' flags, as rustc does: `has_infer`/`has_error`/`has_untyped`/`has_param`/`has_projection` answer "anywhere inside" without walking the type. `substitute` returns a type without `HAS_PARAM` unchanged and `Solver::normalize` one without `HAS_PROJECTION`, so a flag must never be missing where its variant occurs. Only `AssocTypeProjection` is a projection: a trait's function type (`<Point as Make>::make`, the declaration over `Self`) is nominal and never normalized into the impl's member; the impl is chosen where the call is resolved. A new compound `Type` variant must say in `flags_of` which parts it inherits from.
+
+`INTEGER`, `FLOAT` and `STRING` are untyped literals' pseudo-types (`HAS_UNTYPED`): a literal keeps one until its context gives it a type, and `coerce` rewrites it in place. A string literal becomes a shared byte slice (`heap::&[u8]`) or a shared byte array of exactly its length (`heap::&[u8; 5]`), in whatever memory the context names, abstract ones included.
 
 `INFER` (slot 0) is a type inference placeholder — used internally when a generic type argument cannot yet be determined, and will be the type of user-written `_` in type annotations. Must never reach MIR or codegen.
 
@@ -209,7 +212,7 @@ Each interned type carries `TypeFlags` (`HAS_INFER`, `HAS_ERROR`, `HAS_UNTYPED`,
 
 - Primitives: `i32`, `i64`, `u32`, `u64`, `f32`, `f64`, `bool`, `char`, `u8`, `i8`, `u16`, `i16`. They are **real items** — `#[intrinsic] pub type X;` declarations in `std/main.wx`, bound by `ensure_signature` to the matching pre-interned `TypeIndex` — not a hardcoded string match, so they carry `DefId`s and LSP go-to-definition/hover/find-references work on them.
 - Pointers, slices and arrays always carry an ownership sigil — `*T`/`&T`, `*[T]`/`&[T]`, `*[T; N]`/`&[T; N]` (`*` exclusive, `&` shared); there is no bare `[]T` and no `*mut T`. `.&` yields a shared reference (there is no `.&mut`). Each also belongs to a memory, always written (`heap::&[u8]`, or a memory parameter `Mem::*T`): there is no ambient or default memory, and an untagged pointer type is an error (E2038) however many memories are declared. The type formatter always prints that memory prefix — so a slice surfaces in diagnostics as `heap::&[u8]`, never `&[u8]`
-- String literals are shared byte slices (`Mem::&[u8]`), with the memory taken from the expected type; there is no separate `string` type
+- String literals are untyped until their context gives them a shared byte slice (`Mem::&[u8]`) or a shared byte array of their length (`Mem::&[u8; N]`); the node holds the unescaped contents as a symbol. There is no separate `string` type
 - `local` / `local mut` declarations; `global` / `global mut` for module-level state. A global's value type must be one Wasm value (`Global::Value: ValueType`): `u32`, `Meters(u32)`, a pointer or `func(A) -> R` are, `()`, a slice or `Pair(u32, u32)` are not
 - **`local <pattern> = expr` destructuring** — tuples, struct patterns written exactly like construction (`Point(a, b)`, `Point({ x, y: py, .. })`, with a full path), `_` (a drop, binds nothing), arbitrary nesting, and `..` to opt out of exhaustiveness. This is not sugar: there is no `t.0`, so destructuring is the only way to take a tuple apart. Nesting flattens to projection paths, and indices are *declaration* indices mapped through `decl_to_phys` — tuples are alignment-sorted exactly like structs.
 - `const` — compile-time evaluated, inlined at every reference site, never emitted as a WASM global

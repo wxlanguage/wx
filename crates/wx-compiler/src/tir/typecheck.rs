@@ -11,8 +11,10 @@
 //! `PrimitiveBinary`/`PrimitiveUnary` on a primitive scalar, and a call of the
 //! impl's or the trait's method otherwise (`ConcreteMethodCall`/`AbstractMethodCall`).
 //!
-//! Untyped literals keep the pseudo-types `Integer`/`Float` until context
-//! gives them one (`coerce`), which rewrites the subtree in place.
+//! Untyped literals keep the pseudo-types `Integer`/`Float`/`String` until
+//! context gives them one (`coerce`), which rewrites the subtree in place. A
+//! string literal becomes a shared byte slice or a shared byte array of its
+//! length, in the memory its context names.
 //!
 //! A struct's name is a value only to be called: calling it constructs the
 //! struct (`StructConstructor`). It is not a function, and naming it without a call is
@@ -40,7 +42,9 @@ use super::defs::{
 	MemberKind, StructIdx, Tier, TypesetIdx,
 };
 use super::imports::report_private_identifier;
-use super::literals::{CharLiteralError, parse_char_literal};
+use super::literals::{
+	CharLiteralError, parse_char_literal, unescape_string_literal,
+};
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
 use super::operators::{
@@ -51,7 +55,7 @@ use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
-use crate::ast::{self, BinaryOp, Keyword, Spanned, UnaryOp};
+use crate::ast::{self, BinaryOp, Keyword, Ownership, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
 
@@ -323,9 +327,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Match { .. } => {
 				self.unsupported(span, "a `match`")
 			}
-			ast::Expression::String => {
-				self.unsupported(span, "a string literal")
-			}
+			ast::Expression::String => self.build_string(span),
 			ast::Expression::QualifiedPath { .. }
 			| ast::Expression::Grouped { .. } => {
 				self.unsupported(span, "a qualified path")
@@ -405,6 +407,28 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.cx.types.collapse_error(ty);
 		let elements = self.body.push_args(values);
 		self.body.push(ExprKind::Tuple { elements }, ty, span)
+	}
+
+	/// A string literal stays untyped (`Type::String`) until its context
+	/// gives it a byte slice or a byte array (`coerce`).
+	fn build_string(&mut self, span: TextSpan) -> ExprIdx {
+		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
+		match unescape_string_literal(span.extract_str(source)) {
+			Ok(contents) => {
+				let symbol = self.cx.strings.get_or_intern(contents);
+				self.body.push(
+					ExprKind::String(symbol),
+					TypeIndex::STRING,
+					span,
+				)
+			}
+			Err(error) => {
+				self.cx.diagnostics.push(
+					error.diagnostic(SourceSpan::new(self.scope.file_id, span)),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+		}
 	}
 
 	fn build_char(&mut self, span: TextSpan) -> ExprIdx {
@@ -1175,6 +1199,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// untyped until context coerces both.
 		let operand = self.build(operand, expected);
 		let ty = self.body.ty(operand);
+		if ty == TypeIndex::STRING {
+			return self.report_operator_on_string(
+				DiagnosticCode::UnaryOperatorCannotBeApplied,
+				op.inner.as_str(),
+				operand,
+				span,
+			);
+		}
 		if ty.is_untyped() {
 			return self.body.push(
 				ExprKind::PrimitiveUnary {
@@ -1252,6 +1284,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.cx.types.has_untyped(right_ty),
 		) {
 			(true, true) => {
+				// A string literal has no operators of its own; typed, it
+				// has its slice's or array's.
+				for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
+					if ty == TypeIndex::STRING {
+						return self.report_operator_on_string(
+							DiagnosticCode::BinaryOperatorCannotBeApplied,
+							op.inner.as_str(),
+							operand,
+							span,
+						);
+					}
+				}
 				if is_comparison(op.inner) {
 					self.cx.diagnostics.push(
 						Diagnostic::error()
@@ -1537,6 +1581,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return;
 		}
 		match self.body.kind(expr) {
+			ExprKind::String(contents) => {
+				return self.coerce_string(expr, contents, target);
+			}
 			ExprKind::Tuple { elements } => {
 				return self.coerce_tuple(expr, elements, target);
 			}
@@ -1859,6 +1906,79 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		);
 	}
 
+	/// A string literal becomes a shared byte slice, `M::&[u8]`, or a shared
+	/// byte array of its length, `M::&[u8; N]`, in whatever memory `target`
+	/// names. Its data is static and read-only, so an exclusive pointer is
+	/// not one it can become.
+	fn coerce_string(
+		&mut self,
+		expr: ExprIdx,
+		contents: SymbolU32,
+		target: TypeIndex,
+	) {
+		if self.cx.types.has_infer(target) {
+			self.report_annotation_required(expr);
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		}
+		let fits = match *self.cx.types.resolve(target) {
+			Type::Slice {
+				of: TypeIndex::U8,
+				ownership: Ownership::Shared,
+				..
+			} => true,
+			Type::Array {
+				of: TypeIndex::U8,
+				ownership: Ownership::Shared,
+				size,
+				..
+			} => {
+				let length = self.cx.strings.resolve(contents).unwrap().len();
+				if usize::try_from(size).is_ok_and(|size| size == length) {
+					true
+				} else {
+					let target = self.cx.type_formatter().display_type(target);
+					return self.push_error(
+						DiagnosticCode::ArraySizeMismatch,
+						format!(
+							"this string literal is {length} bytes long, but \
+							 `{target}` holds {size}"
+						),
+						expr,
+					);
+				}
+			}
+			_ => false,
+		};
+		if fits {
+			return self.body.set_ty(expr, target);
+		}
+		let diagnostic = self
+			.report_unable_to_coerce(expr, target)
+			.with_note(STRING_TARGETS_NOTE);
+		self.cx.diagnostics.push(diagnostic);
+		self.body.set_ty(expr, TypeIndex::ERROR);
+	}
+
+	/// An operator applied to an untyped string literal.
+	fn report_operator_on_string(
+		&mut self,
+		code: DiagnosticCode,
+		op: &str,
+		operand: ExprIdx,
+		span: TextSpan,
+	) -> ExprIdx {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(code.code())
+				.with_message(format!(
+					"cannot apply `{op}` to a string literal"
+				))
+				.with_label(self.source_span(operand).primary_label())
+				.with_note(STRING_TARGETS_NOTE),
+		);
+		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+	}
+
 	fn report_unable_to_coerce(
 		&self,
 		expr: ExprIdx,
@@ -1921,6 +2041,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		SourceSpan::new(self.scope.file_id, self.body.span(expr))
 	}
 }
+
+/// What a string literal can become, for the notes that reject one.
+pub(super) const STRING_TARGETS_NOTE: &str = "a string literal is a shared \
+	byte slice or byte array in a memory: `heap::&[u8]` or `heap::&[u8; N]`";
 
 /// The method an operator dispatches to.
 #[derive(Clone, Copy)]
@@ -2354,6 +2478,12 @@ mod tests {
 				ExprKind::Float(value) => format!("{value:?}"),
 				ExprKind::Bool(value) => value.to_string(),
 				ExprKind::Char(value) => format!("{value:?}"),
+				ExprKind::String(contents) => {
+					format!(
+						"{:?}",
+						self.context.strings.resolve(contents).unwrap()
+					)
+				}
 				ExprKind::Const(index) | ExprKind::NextDiscriminant(index) => {
 					name(self.defs.constants[usize::from(index)].name.inner)
 						.to_string()
@@ -3216,6 +3346,101 @@ mod tests {
 		]);
 		assert_eq!(case.shape("numbers"), "(block => (as (as a#0 i32) f64))");
 		assert_eq!(case.shape("inferred"), "(block => (as a#0 u32))");
+	}
+
+	#[test]
+	fn a_string_literal_takes_a_byte_slice_or_array_from_its_context() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func slice() -> heap::&[u8] { "hello" }
+				func array() -> heap::&[u8; 5] { "hello" }
+				func escaped() -> heap::&[u8; 2] { "a\n" }
+				func annotated() { local s: heap::&[u8; 3] = "abc"; }
+				func branches(c: bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func tuple() -> (heap::&[u8], u8) { ("a", 1) }
+				func any_memory<Mem: Memory>() -> Mem::&[u8] { "abstract" }
+			"#}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("slice"), r#"(block => "hello")"#);
+		assert_eq!(case.body_type("slice"), "heap::&[u8]");
+		assert_eq!(case.body_type("array"), "heap::&[u8; 5]");
+		assert_eq!(case.shape("escaped"), r#"(block => "a\n")"#);
+		assert_eq!(
+			case.locals("annotated"),
+			[("s".into(), "heap::&[u8; 3]".into())]
+		);
+		assert_eq!(case.body_type("branches"), "heap::&[u8]");
+		assert_eq!(case.body_type("tuple"), "(heap::&[u8], u8)");
+		assert_eq!(case.body_type("any_memory"), "Mem::&[u8]");
+	}
+
+	#[test]
+	fn a_string_literal_waits_for_a_generic_call_to_learn_its_memory() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func take<Mem: Memory>(s: Mem::&[u8], p: Mem::&u8) {}
+				func call(p: heap::&u8) { take("abc", p); }
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_string_literal_is_a_shared_byte_type_of_its_length() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func length() -> heap::&[u8; 4] { "abc" }
+				func exclusive() -> heap::*[u8] { "abc" }
+				func number() -> u32 { "abc" }
+				func untyped() { local s = "abc"; }
+				func operator() -> heap::&[u8] { "a" + "b" }
+				func negate() -> heap::&[u8] { -"a" }
+				func expected(c: bool) -> heap::&[u8] { if c { "a" } else { 1 } }
+				func joined(c: bool) { local x = if c { "a" } else { 1 }; }
+				func escape() -> heap::&[u8] { "\q" }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::BinaryOperatorCannotBeApplied,
+			DiagnosticCode::UnaryOperatorCannotBeApplied,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::UnknownCharacterEscape,
+		]);
+		case.diagnostics().assert_error_saying(
+			"this string literal is 3 bytes long, but `heap::&[u8; 4]` holds 4",
+		);
+	}
+
+	#[test]
+	fn a_string_literal_is_cast_to_what_it_can_become() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func array() -> heap::&[u8; 3] { "abc" as heap::&[u8; 3] }
+				func slice() -> heap::&[u8] { "abc" as heap::&[u8] }
+				func number() -> u32 { "abc" as u32 }
+				func exclusive() -> heap::*[u8] { "abc" as heap::*[u8] }
+				func length() -> heap::&[u8; 2] { "abc" as heap::&[u8; 2] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::ArraySizeMismatch,
+		]);
+		assert_eq!(
+			case.shape("array"),
+			r#"(block => (as "abc" heap::&[u8; 3]))"#
+		);
 	}
 
 	#[test]
