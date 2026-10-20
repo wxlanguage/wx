@@ -210,6 +210,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			ast::ValuePattern::Or(alternatives) => {
 				let mut checked = Vec::with_capacity(alternatives.len());
+				let mut binds = false;
 				for alternative in alternatives {
 					let alternative = &alternative.inner;
 					let bound = site.bindings.len();
@@ -220,6 +221,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						site,
 					));
 					if let Some(name) = site.bindings.get(bound) {
+						binds = true;
 						self.cx.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
@@ -234,6 +236,9 @@ impl BodyContext<'_, '_, '_, '_> {
 								)),
 						);
 					}
+				}
+				if binds {
+					return self.error_pattern(span);
 				}
 				let alternatives = self.body.push_patterns(checked);
 				self.body.push_pattern(

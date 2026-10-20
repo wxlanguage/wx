@@ -386,9 +386,10 @@ declares its bindings in a scope of its own around its body. A `case` in a
 are still declared, against `ERROR`); a name bound twice is E2116; a binding
 in an alternative of `|` is E2068.
 
-**Usefulness** (next). One pass, Maranget's "Warnings for pattern matching"
-(rustc's `rustc_pattern_analysis`), in `tir/usefulness.rs`, run by
-`BodyContext` once a match's arms are built. The question is whether a row `q`
+**Usefulness** (done). One pass, Maranget's "Warnings for pattern matching"
+(rustc's `rustc_pattern_analysis`), in `tir/usefulness.rs` (pure: types are
+asked of a `Shapes`), run by `BodyContext` once a match's arms are built
+(`typecheck/exhaustiveness.rs`: lowering, `Shapes`, witnesses, reports). The question is whether a row `q`
 is useful after rows `P`: does some value match `q` and no row of `P`. Arm *i*
 is unreachable (W2010) when it is not useful after arms *0..i*; the match is
 non-exhaustive (E2066) when `_` is still useful after every arm, with up to
@@ -417,6 +418,12 @@ three witnesses (the values no arm matches) in the report.
 - An opaque constant never makes a match exhaustive, nor is it unreachable
   unless a wildcard arm precedes it. `local` patterns hold no tests, so they
   always match and are not checked.
+- Constants (and an enum's variants) are evaluated only in a function's
+  block, where every constant's body can be built on demand; an initializer's
+  match treats them as opaque and an enum as unlisted, so it needs `_`.
+- A match with an `Error` pattern, or a scrutinee whose type has an error, is
+  not checked: what failed has said why. A binding inside `|` makes the `|`
+  an `Error` for the same reason.
 
 **AST** (done). The mode is the type, so the parser decides it and TIR never
 reinterprets a name: `BindPattern` (`Wildcard`, `Binding`, `Destructure`,
@@ -519,7 +526,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 - **Field access** `x.y` on a value and through a place. Field privacy is
   enforced here (the old checker did, for all three sites).
 - **Patterns** (designed, see "Patterns"), in this order: the parser, the pattern
-  arena, `local` destructuring and `match` (done); the usefulness pass.
+  arena, `local` destructuring, `match` and the usefulness pass (done).
 
 ### 3. Think first
 

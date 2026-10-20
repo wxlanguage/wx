@@ -156,6 +156,23 @@ impl TypeContext<'_, '_, '_> {
 		self.diagnostics.push(diagnostic);
 	}
 
+	/// A constant's value as a pattern compares with it: the bits of its one
+	/// Wasm number (a narrow signed integer sign-extended, as it is held).
+	/// `None` when it has no value or is more than one number.
+	pub(super) fn constant_bits(
+		&mut self,
+		const_index: ConstIdx,
+	) -> Option<u64> {
+		match self.const_value(const_index) {
+			Ok([scalar]) => match scalar.val {
+				Val::I32(bits) => Some(u64::from(bits)),
+				Val::I64(bits) => Some(bits),
+				Val::F32(_) | Val::F64(_) | Val::V128(_) => None,
+			},
+			_ => None,
+		}
+	}
+
 	/// The memoized value of a constant.
 	fn const_value(
 		&mut self,

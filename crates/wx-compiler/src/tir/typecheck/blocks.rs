@@ -297,7 +297,8 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// `match scrutinee { pattern -> { .. }, .. }`. Each arm's bindings are
 	/// declared in a scope of its own, around its body. The arms share a type
-	/// as an `if`'s branches do.
+	/// as an `if`'s branches do. The arms must cover every value, and each
+	/// must match one the arms before it do not (`exhaustiveness`).
 	pub(super) fn build_match(
 		&mut self,
 		scrutinee: &Spanned<ast::Expression>,
@@ -335,6 +336,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let bodies: Vec<ExprIdx> = built.iter().map(|arm| arm.body).collect();
 		let ty = self.join_arms(&bodies);
+		self.check_match_usefulness(scrutinee, &built);
 		let arms = self.body.push_arms(built);
 		self.body
 			.push(ExprKind::Match { scrutinee, arms }, ty, span)

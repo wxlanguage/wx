@@ -27,6 +27,7 @@
 mod blocks;
 mod calls;
 mod casts;
+mod exhaustiveness;
 mod members;
 mod patterns;
 mod places;
@@ -4500,5 +4501,102 @@ mod tests {
 			case.member_shape("first"),
 			"(block (local (W x#1 _) self#0) => x#1)"
 		);
+	}
+
+	#[test]
+	fn a_match_must_cover_every_value() {
+		test_case!(
+			case = indoc! {"
+				enum Dir: u8 { North = 0, East, South, West }
+				struct P(x: bool, y: bool);
+				func a(d: Dir) -> u8 {
+					match d { case Dir::North -> { 0 }, case Dir::East -> { 1 } }
+				}
+				func b(d: Dir) -> u8 {
+					match d {
+						case Dir::North | Dir::East -> { 0 },
+						case Dir::South | Dir::West -> { 1 },
+					}
+				}
+				func c(x: bool, d: Dir) {
+					match (x, d) { case (true, _) -> {}, case (_, Dir::North) -> {} }
+				}
+				func i(x: u8) -> u8 { match x { case 0 -> { 0 }, case 1 -> { 1 } } }
+				func s(p: P) {
+					match p { case P(true, _) -> {}, case P(false, true) -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::NonExhaustiveMatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: patterns `Dir::South` and `Dir::West` not \
+			 covered",
+		);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: patterns `(false, Dir::East)`, \
+			 `(false, Dir::South)` and `(false, Dir::West)` not covered",
+		);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: pattern `2` not covered",
+		);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: pattern `P(false, false)` not covered",
+		);
+	}
+
+	#[test]
+	fn an_arm_the_arms_before_it_cover_is_unreachable() {
+		test_case!(
+			case = indoc! {"
+				const ZERO: u8 = 0;
+				func u(x: u8) { match x { _ -> {}, case 0 -> {} } }
+				func v(b: bool) {
+					match b { case true -> {}, case false -> {}, _ -> {} }
+				}
+				func w(x: u8) { match x { case 0 | 1 -> {}, case 1 -> {}, _ -> {} } }
+				func z(x: u8) { match x { case ZERO -> {}, case 0 -> {}, _ -> {} } }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+		case.diagnostics()
+			.assert_warning(DiagnosticCode::UnreachableMatchArm);
+	}
+
+	#[test]
+	fn a_constant_counts_by_its_value_unless_it_is_abstract() {
+		test_case!(
+			case = indoc! {"
+				enum Dir: u8 { North = 0, East, South }
+				const N: Dir = Dir::North;
+				trait Lim { const MAX: u8; }
+				func k(d: Dir) {
+					match d { case N -> {}, case Dir::East | Dir::South -> {} }
+				}
+				func l<T: Lim>(x: u8) { match x { case T::MAX -> {} } }
+				func m<T: Lim>(x: u8) { match x { case T::MAX -> {}, _ -> {} } }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::NonExhaustiveMatch]);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: pattern `_` not covered",
+		);
+	}
+
+	#[test]
+	fn a_match_with_a_failed_pattern_is_not_checked_for_coverage() {
+		test_case!(case = "func f(x: u8) { match x { case nope -> {} } }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}
 }
