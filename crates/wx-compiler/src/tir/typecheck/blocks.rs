@@ -9,6 +9,7 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
+use super::patterns::PatternSite;
 use super::{BodyContext, ScopeType};
 use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
@@ -82,7 +83,7 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// Declares a local in the current scope. It is visible from here on, and
 	/// hides any local of the same name declared before it.
-	fn declare_local(
+	pub(super) fn declare_local(
 		&mut self,
 		name: Spanned<SymbolU32>,
 		ty: TypeIndex,
@@ -288,23 +289,84 @@ impl BodyContext<'_, '_, '_, '_> {
 		} else {
 			TypeIndex::UNIT
 		};
-		match &pattern.inner {
-			ast::BindPattern::Binding { mut_span, name } => {
-				let local = self.declare_local(*name, local_ty, *mut_span);
-				self.body.push(
-					ExprKind::LocalDeclaration { local, value },
-					ty,
-					span,
-				)
+		let pattern =
+			self.check_pattern(pattern, local_ty, &mut PatternSite::local());
+		self.body
+			.push(ExprKind::LocalDeclaration { pattern, value }, ty, span)
+	}
+
+	/// `match scrutinee { pattern -> { .. }, .. }`. Each arm's bindings are
+	/// declared in a scope of its own, around its body. The arms share a type
+	/// as an `if`'s branches do.
+	pub(super) fn build_match(
+		&mut self,
+		scrutinee: &Spanned<ast::Expression>,
+		arms: &[Separated<Spanned<ast::MatchArm>>],
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let scrutinee = self.build(scrutinee, TypeIndex::INFER);
+		let mut scrutinee_ty = self.body.ty(scrutinee);
+		if self.cx.types.has_untyped(scrutinee_ty) {
+			self.report_annotation_required(scrutinee);
+			scrutinee_ty = TypeIndex::ERROR;
+		}
+		let mut built = Vec::with_capacity(arms.len());
+		for arm in arms {
+			let arm = &arm.inner;
+			let scope = self.enter_scope(
+				ScopeKind::Block,
+				None,
+				arm.span,
+				TypeIndex::INFER,
+			);
+			let pattern = self.check_pattern(
+				&arm.inner.pattern,
+				scrutinee_ty,
+				&mut PatternSite::arm(),
+			);
+			let body = self.build_branch(&arm.inner.body, expected, None);
+			self.leave_scope(scope);
+			built.push(body::Arm {
+				scope,
+				pattern,
+				body,
+			});
+		}
+		let bodies: Vec<ExprIdx> = built.iter().map(|arm| arm.body).collect();
+		let ty = self.join_arms(&bodies);
+		let arms = self.body.push_arms(built);
+		self.body
+			.push(ExprKind::Match { scrutinee, arms }, ty, span)
+	}
+
+	/// The type a match's arms share: the first typed one's, which an
+	/// untyped arm takes; `!` gives way to the others, and with no arm the
+	/// match is `!`.
+	fn join_arms(&mut self, arms: &[ExprIdx]) -> TypeIndex {
+		let Some(&first) = arms
+			.iter()
+			.find(|&&arm| self.body.ty(arm) != TypeIndex::NEVER)
+		else {
+			return TypeIndex::NEVER;
+		};
+		let mut joined = first;
+		let mut ty = self.body.ty(first);
+		for &arm in arms {
+			if arm == first || self.body.ty(arm) == TypeIndex::NEVER {
+				continue;
 			}
-			// TODO: patterns, `_` among them, need their own representation.
-			ast::BindPattern::Wildcard
-			| ast::BindPattern::Destructure(_)
-			| ast::BindPattern::Marked(_) => {
-				self.report_unsupported(pattern.span, "a pattern");
-				self.body.push(ExprKind::Error, ty, span)
+			ty = self.join_branches(joined, arm);
+			if ty == TypeIndex::ERROR {
+				return ty;
+			}
+			// An untyped arm that gave way keeps the typed one as the one the
+			// rest join.
+			if !self.cx.types.has_untyped(self.body.ty(arm)) {
+				joined = arm;
 			}
 		}
+		ty
 	}
 
 	/// `if condition { .. } else { .. }`. Without `else` the `if` is `()`, so

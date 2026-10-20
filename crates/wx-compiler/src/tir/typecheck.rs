@@ -2,8 +2,9 @@
 //! node typed. One checker for every expression, whatever owns it: a
 //! constant's or global's initializer, or a function's block.
 //!
-//! Blocks, locals and control flow are in `blocks`, places and assignment in
-//! `places`, function calls in `calls`, casts in `casts`. A form the checker does not cover yet
+//! Blocks, locals and control flow are in `blocks`, patterns in `patterns`,
+//! places and assignment in `places`, function calls in `calls`, casts in
+//! `casts`. A form the checker does not cover yet
 //! is reported once (`UnsupportedExpression`) and checked as an error node.
 //!
 //! Operators are checked through their trait (`OperatorTraits`): the trait
@@ -27,6 +28,7 @@ mod blocks;
 mod calls;
 mod casts;
 mod members;
+mod patterns;
 mod places;
 
 use calls::Callee;
@@ -331,8 +333,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::TypeApplication { .. } => {
 				self.unsupported(span, "a type application")
 			}
-			ast::Expression::Match { .. } => {
-				self.unsupported(span, "a `match`")
+			ast::Expression::Match { scrutinee, arms } => {
+				self.build_match(scrutinee, arms, expected, span)
 			}
 			ast::Expression::String => self.build_string(span),
 			ast::Expression::QualifiedPath { .. }
@@ -1831,6 +1833,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				}
 				return self.body.set_ty(expr, target);
 			}
+			ExprKind::Match { arms, .. } => {
+				let bodies: Vec<ExprIdx> =
+					self.body.arms(arms).iter().map(|arm| arm.body).collect();
+				for arm in bodies {
+					if self.cx.types.has_untyped(self.body.ty(arm)) {
+						self.coerce(arm, target);
+					}
+				}
+				return self.body.set_ty(expr, target);
+			}
 			_ => {}
 		}
 		// The common case: one concrete number, held on the stack.
@@ -2822,11 +2834,23 @@ mod tests {
 					}
 					text
 				}
-				ExprKind::LocalDeclaration { local, value } => format!(
+				ExprKind::LocalDeclaration { pattern, value } => format!(
 					"(local {} {})",
-					self.local_name(body, local),
+					self.render_pattern(body, pattern),
 					self.render(body, value)
 				),
+				ExprKind::Match { scrutinee, arms } => {
+					let mut text =
+						format!("(match {}", self.render(body, scrutinee));
+					for arm in body.arms(arms) {
+						text.push_str(&format!(
+							" ({} => {})",
+							self.render_pattern(body, arm.pattern),
+							self.render(body, arm.body)
+						));
+					}
+					text + ")"
+				}
 				ExprKind::IfElse {
 					condition,
 					then_block,
@@ -2910,6 +2934,70 @@ mod tests {
 					self.render_place(body, place),
 					self.render(body, value)
 				),
+			}
+		}
+
+		/// Renders a pattern: a binding is its local (`x#1`), a destructuring
+		/// lists one child per element or field (`(tuple a#0 _)`,
+		/// `(Point a#0 _)`), an integer reads as its type's value.
+		fn render_pattern(
+			&self,
+			body: &Body,
+			pattern: super::super::body::PatIdx,
+		) -> String {
+			use super::super::body::PatKind;
+			let list = |head: &str, children: &[super::super::body::PatIdx]| {
+				let mut text = format!("({head}");
+				for &child in children {
+					text.push(' ');
+					text.push_str(&self.render_pattern(body, child));
+				}
+				text + ")"
+			};
+			match body.pattern(pattern) {
+				PatKind::Wildcard => "_".to_string(),
+				PatKind::Bind(local) => self.local_name(body, local),
+				PatKind::Tuple(elements) => {
+					list("tuple", body.patterns(elements))
+				}
+				PatKind::Struct {
+					struct_index,
+					fields,
+				} => {
+					let name =
+						self.defs.structs[usize::from(struct_index)].name.inner;
+					let name = self.context.strings.resolve(name).unwrap();
+					list(name, body.patterns(fields))
+				}
+				PatKind::Int(bits) => {
+					let integer =
+						super::Integer::from_type(body.pattern_ty(pattern))
+							.unwrap();
+					if integer.is_signed() {
+						let width = integer.mask().count_ones();
+						let shift = 64 - width;
+						(((bits << shift) as i64) >> shift).to_string()
+					} else {
+						bits.to_string()
+					}
+				}
+				PatKind::Bool(value) => value.to_string(),
+				PatKind::Char(value) => format!("{value:?}"),
+				PatKind::Constant {
+					constant,
+					type_args,
+				} => self.constant_name(constant, type_args),
+				PatKind::AbstractConstant {
+					constant,
+					type_args,
+				} => format!(
+					"(abstract {})",
+					self.constant_name(constant, type_args)
+				),
+				PatKind::Or(alternatives) => {
+					list("|", body.patterns(alternatives))
+				}
+				PatKind::Error => "error".to_string(),
 			}
 		}
 
@@ -4194,12 +4282,223 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(o: Ordering) -> Ordering {
-					match o { case Ordering::Less -> { o }, _ -> { o } }
+					o[0]
 				}
 			"}
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
 		assert_eq!(case.shape("f"), "(block => error)");
+	}
+
+	#[test]
+	fn a_local_pattern_takes_its_value_apart() {
+		test_case!(
+			case = indoc! {"
+				struct Point(x: u32, y: i64);
+				struct W<T>(a: T, b: bool);
+				func f(p: Point, t: (u8, (u16, u32)), w: W<u8>) {
+					local Point(x, y) = p;
+					local Point({ y: py, .. }) = p;
+					local (a, (_, c)) = t;
+					local (.., (d, ..)) = t;
+					local W(e, mut g) = w;
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local (Point x#3 y#4) p#0) \
+			 (local (Point _ py#5) p#0) \
+			 (local (tuple a#6 (tuple _ c#7)) t#1) \
+			 (local (tuple _ (tuple d#8 _)) t#1) \
+			 (local (W e#9 g#10) w#2))"
+		);
+		let types: Vec<String> = case.locals("f")[3..]
+			.iter()
+			.map(|(_, ty)| ty.clone())
+			.collect();
+		assert_eq!(
+			types,
+			["u32", "i64", "i64", "u8", "u32", "u16", "u8", "bool"]
+		);
+	}
+
+	#[test]
+	fn a_local_pattern_must_fit_its_value() {
+		test_case!(
+			case = indoc! {"
+				struct Point(x: u32, y: u32);
+				struct Pair(u32, u32);
+				func f(p: Point, t: (u32, u32), q: Pair) {
+					local (a, b, c) = t;
+					local Point(x, .., ..) = p;
+					local Point({ x }) = p;
+					local Point({ z, .. }) = p;
+					local (n, n) = t;
+					local Pair({ .. }) = q;
+					local (m, k) = p;
+					local Pair(r, s) = p;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::DuplicateRestPattern,
+			DiagnosticCode::MissingStructFields,
+			DiagnosticCode::UnknownStructField,
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::TupleStructBracePattern,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"this pattern has 3 elements but the tuple has 2",
+		);
+		case.diagnostics()
+			.assert_error_saying("pattern does not mention field `y`");
+	}
+
+	#[test]
+	fn a_local_pattern_cannot_test_a_value() {
+		test_case!(
+			case = indoc! {"
+				func f(t: (u32, u32)) -> u32 {
+					local (a, case 0) = t;
+					a
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::RefutablePatternInLocal]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local (tuple a#1 error) t#0) => a#1)"
+		);
+	}
+
+	#[test]
+	fn a_match_checks_each_arm_against_the_scrutinee() {
+		test_case!(
+			case = indoc! {"
+				func sign(x: i32) -> i32 {
+					match x {
+						case 0 -> { 0 },
+						case -1 | -128 -> { 1 },
+						n -> { n },
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("sign"),
+			"(block => (match x#0 \
+			 (0 => (block => 0)) \
+			 ((| -1 -128) => (block => 1)) \
+			 (n#1 => (block => n#1))))"
+		);
+		assert_eq!(case.body_type("sign"), "i32");
+	}
+
+	#[test]
+	fn a_match_compares_with_constants_and_destructures() {
+		test_case!(
+			case = indoc! {"
+				enum Dir: u8 { North = 0, South = 1 }
+				const LIMIT: u8 = 10;
+				struct P(x: u8, d: Dir);
+				trait Lim { const MAX: u8; }
+				struct S();
+				impl S { const ZERO: u8 = 0; }
+				func f<T: Lim>(p: P) -> u8 {
+					match p {
+						case P(0, Dir::North) -> { 1 },
+						case P(LIMIT, local d) -> { 2 },
+						P(x, case Dir::South) -> { x },
+						case P(S::ZERO | T::MAX, _) -> { 3 },
+						_ -> { 4 },
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block => (match p#0 \
+			 ((P 0 North) => (block => 1)) \
+			 ((P LIMIT d#1) => (block => 2)) \
+			 ((P x#2 South) => (block => x#2)) \
+			 ((P (| ZERO (abstract MAX<T>)) _) => (block => 3)) \
+			 (_ => (block => 4))))"
+		);
+	}
+
+	#[test]
+	fn a_value_in_a_pattern_is_a_constant_of_the_matched_type() {
+		test_case!(
+			case = indoc! {"
+				const C: u8 = 1;
+				func g() {}
+				func f(x: u8, b: bool) {
+					local y: u8 = 1;
+					match x { case y -> {}, _ -> {} }
+					match x { case g -> {}, _ -> {} }
+					match x { case 300 -> {}, case -1 -> {}, _ -> {} }
+					match x { case true -> {}, _ -> {} }
+					match b { case C -> {}, _ -> {} }
+					match x { case 1 | local z -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::InvalidMatchPattern,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::InvalidMatchPattern,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`y` is a local; a pattern compares with constants, and `local y` \
+			 would bind a new one",
+		);
+	}
+
+	#[test]
+	fn match_arms_share_a_type() {
+		test_case!(
+			case = indoc! {"
+				func f(x: u8) -> u64 { match x { case 0 -> { 1 }, _ -> { 2 } } }
+				func g(x: u8) -> u8 {
+					match x { case 0 -> { return 0 }, _ -> { x } }
+				}
+				func h(x: u8) { local v = match x { case 0 -> { 1 }, _ -> { true } }; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
+		assert_eq!(case.body_type("f"), "u64");
+		assert_eq!(case.body_type("g"), "u8");
+	}
+
+	#[test]
+	fn self_destructures_the_struct_its_impl_is_for() {
+		test_case!(
+			case = indoc! {"
+				struct W(x: u32, y: u32);
+				impl W {
+					func first(self) -> u32 { local Self(x, ..) = self; x }
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.member_shape("first"),
+			"(block (local (W x#1 _) self#0) => x#1)"
+		);
 	}
 }

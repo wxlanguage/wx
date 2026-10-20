@@ -13,6 +13,11 @@
 //! node inside it, so a `break` can name the scope it leaves. Places, the
 //! locations in linear memory an expression reads, writes or takes the address
 //! of, have an arena of their own, pushed children first like expressions.
+//!
+//! Patterns, what a `local` or a match arm takes apart, binds and tests, have
+//! one more, shared by both, pushed children first too. A pattern is typed
+//! and resolved: the mode it was written in is gone, and destructuring has
+//! one child per element or field of its type, in declaration order.
 
 use string_interner::symbol::SymbolU32;
 
@@ -30,6 +35,7 @@ index_newtype!(ScopeIdx);
 index_newtype!(LocalIdx);
 index_newtype!(LabelIdx);
 index_newtype!(PlaceIdx);
+index_newtype!(PatIdx);
 
 impl ScopeIdx {
 	/// Every body's outermost scope: a function's parameters are declared in
@@ -60,6 +66,74 @@ impl ExprRange {
 	pub(super) fn len(self) -> usize {
 		self.len as usize
 	}
+}
+
+/// A run of `Body::pat_lists`: the children of a tuple, struct or `|`
+/// pattern.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct PatRange {
+	start: u32,
+	len: u32,
+}
+
+/// A run of `Body::arms`: a match's arms, in written order.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct ArmRange {
+	start: u32,
+	len: u32,
+}
+
+/// One arm of a match. Its bindings are declared in `scope`, which holds
+/// `body`.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct Arm {
+	pub(super) scope: ScopeIdx,
+	pub(super) pattern: PatIdx,
+	pub(super) body: ExprIdx,
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum PatKind {
+	// Structure: always matches, and takes the value apart.
+	/// `_`, an element or field `..` covers, or a field a named pattern
+	/// leaves out.
+	Wildcard,
+	Bind(LocalIdx),
+	/// One child per element of the tuple's type.
+	Tuple(PatRange),
+	/// One child per field, in declaration order. The type arguments are the
+	/// pattern's type's.
+	Struct {
+		struct_index: StructIdx,
+		fields: PatRange,
+	},
+
+	// Tests: match only some values, so only a match arm holds them.
+	/// The value's bits in the pattern's type: `-1` as an `i8` is `0xFF`.
+	Int(u64),
+	Bool(bool),
+	Char(char),
+	/// A known constant: a variant, a free one, or an impl's, with its flat
+	/// type arguments as `ExprKind::Const` holds them.
+	Constant {
+		constant: ConstIdx,
+		type_args: TypeList,
+	},
+	/// A trait's declaration of a constant; `type_args` is `[Self]`.
+	AbstractConstant {
+		constant: ConstIdx,
+		type_args: TypeList,
+	},
+	/// Alternatives, none of which binds.
+	Or(PatRange),
+
+	/// Already reported; whatever reads it stays silent, and exhaustiveness
+	/// counts it as `_`.
+	Error,
 }
 
 /// How the written order of arguments relates to the declared order of what
@@ -184,10 +258,17 @@ pub(super) enum ExprKind {
 		statements: ExprRange,
 		result: Option<ExprIdx>,
 	},
-	/// `local name = value`. Typed `()`, or `!` when the value diverges.
+	/// `local pattern = value`. Typed `()`, or `!` when the value diverges.
+	/// The pattern always matches: it holds no tests.
 	LocalDeclaration {
-		local: LocalIdx,
+		pattern: PatIdx,
 		value: ExprIdx,
+	},
+	/// `match scrutinee { arms }`: the first arm whose pattern matches runs.
+	/// Its type is the arms' bodies', as an `if`'s is its branches'.
+	Match {
+		scrutinee: ExprIdx,
+		arms: ArmRange,
 	},
 	IfElse {
 		condition: ExprIdx,
@@ -282,8 +363,8 @@ pub(super) enum ExprKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum ScopeKind {
-	/// A block, an `if`/`else` branch, or the body itself (the root scope,
-	/// the one without a parent).
+	/// A block, an `if`/`else` branch, a match arm (holding its bindings),
+	/// or the body itself (the root scope, the one without a parent).
 	Block,
 	/// A loop's block, which `continue` restarts.
 	Loop,
@@ -354,6 +435,11 @@ pub(super) struct Body {
 	labels: Vec<Label>,
 	locals: Vec<Local>,
 	places: Vec<Place>,
+	pat_kinds: Vec<PatKind>,
+	pat_types: Vec<TypeIndex>,
+	pat_spans: Vec<TextSpan>,
+	pat_lists: Vec<PatIdx>,
+	arms: Vec<Arm>,
 	root: ExprIdx,
 }
 
@@ -410,6 +496,27 @@ impl Body {
 	pub(super) fn place(&self, place: PlaceIdx) -> &Place {
 		&self.places[usize::from(place)]
 	}
+
+	pub(super) fn pattern(&self, pattern: PatIdx) -> PatKind {
+		self.pat_kinds[usize::from(pattern)]
+	}
+
+	pub(super) fn pattern_ty(&self, pattern: PatIdx) -> TypeIndex {
+		self.pat_types[usize::from(pattern)]
+	}
+
+	pub(super) fn pattern_span(&self, pattern: PatIdx) -> TextSpan {
+		self.pat_spans[usize::from(pattern)]
+	}
+
+	pub(super) fn patterns(&self, range: PatRange) -> &[PatIdx] {
+		&self.pat_lists
+			[range.start as usize..(range.start + range.len) as usize]
+	}
+
+	pub(super) fn arms(&self, range: ArmRange) -> &[Arm] {
+		&self.arms[range.start as usize..(range.start + range.len) as usize]
+	}
 }
 
 /// Builds a `Body`. The checker owns one while it walks a definition, and may
@@ -425,6 +532,11 @@ pub(super) struct BodyBuilder {
 	labels: Vec<Label>,
 	locals: Vec<Local>,
 	places: Vec<Place>,
+	pat_kinds: Vec<PatKind>,
+	pat_types: Vec<TypeIndex>,
+	pat_spans: Vec<TextSpan>,
+	pat_lists: Vec<PatIdx>,
+	arms: Vec<Arm>,
 }
 
 impl BodyBuilder {
@@ -492,6 +604,39 @@ impl BodyBuilder {
 		index
 	}
 
+	pub(super) fn push_pattern(
+		&mut self,
+		kind: PatKind,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> PatIdx {
+		let index = PatIdx::new(u32::try_from(self.pat_kinds.len()).unwrap());
+		self.pat_kinds.push(kind);
+		self.pat_types.push(ty);
+		self.pat_spans.push(span);
+		index
+	}
+
+	pub(super) fn push_patterns(
+		&mut self,
+		patterns: impl IntoIterator<Item = PatIdx>,
+	) -> PatRange {
+		let start = u32::try_from(self.pat_lists.len()).unwrap();
+		self.pat_lists.extend(patterns);
+		let len = u32::try_from(self.pat_lists.len()).unwrap() - start;
+		PatRange { start, len }
+	}
+
+	pub(super) fn push_arms(
+		&mut self,
+		arms: impl IntoIterator<Item = Arm>,
+	) -> ArmRange {
+		let start = u32::try_from(self.arms.len()).unwrap();
+		self.arms.extend(arms);
+		let len = u32::try_from(self.arms.len()).unwrap() - start;
+		ArmRange { start, len }
+	}
+
 	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
 		self.kinds[usize::from(expr)]
 	}
@@ -520,6 +665,27 @@ impl BodyBuilder {
 		&self.places[usize::from(place)]
 	}
 
+	pub(super) fn pattern(&self, pattern: PatIdx) -> PatKind {
+		self.pat_kinds[usize::from(pattern)]
+	}
+
+	pub(super) fn pattern_ty(&self, pattern: PatIdx) -> TypeIndex {
+		self.pat_types[usize::from(pattern)]
+	}
+
+	pub(super) fn pattern_span(&self, pattern: PatIdx) -> TextSpan {
+		self.pat_spans[usize::from(pattern)]
+	}
+
+	pub(super) fn patterns(&self, range: PatRange) -> &[PatIdx] {
+		&self.pat_lists
+			[range.start as usize..(range.start + range.len) as usize]
+	}
+
+	pub(super) fn arms(&self, range: ArmRange) -> &[Arm] {
+		&self.arms[range.start as usize..(range.start + range.len) as usize]
+	}
+
 	pub(super) fn set_kind(&mut self, expr: ExprIdx, kind: ExprKind) {
 		self.kinds[usize::from(expr)] = kind;
 	}
@@ -540,6 +706,11 @@ impl BodyBuilder {
 			labels: self.labels,
 			locals: self.locals,
 			places: self.places,
+			pat_kinds: self.pat_kinds,
+			pat_types: self.pat_types,
+			pat_spans: self.pat_spans,
+			pat_lists: self.pat_lists,
+			arms: self.arms,
 			root,
 		}
 	}
@@ -552,5 +723,10 @@ mod tests {
 	#[test]
 	fn an_expression_node_stays_small() {
 		assert!(std::mem::size_of::<ExprKind>() <= 24);
+	}
+
+	#[test]
+	fn a_pattern_node_stays_small() {
+		assert!(std::mem::size_of::<PatKind>() <= 16);
 	}
 }

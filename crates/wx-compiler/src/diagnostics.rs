@@ -238,6 +238,8 @@ define_diagnostic_codes! {
 		AssocTypeEqualityMismatch => "E2112",
 		UnknownPackage => "E2113",
 		UnsupportedExpression => "E2114",
+		RefutablePatternInLocal => "E2115",
+		DuplicatePatternBinding => "E2116",
 	}
 }
 

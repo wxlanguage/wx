@@ -164,8 +164,6 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// `Type::CONSTANT`: a known constant's value, or a trait's declaration
 	/// of it for an abstract receiver or an impl inheriting its default.
-	/// Its type is the declared one, with the impl's arguments, or the
-	/// receiver as `Self`.
 	fn build_constant(
 		&mut self,
 		constant: ConstIdx,
@@ -174,6 +172,58 @@ impl BodyContext<'_, '_, '_, '_> {
 		member: &ast::PathSegment,
 		span: TextSpan,
 	) -> ExprIdx {
+		let (kind, ty) =
+			self.constant_value(constant, leading, dispatch, member);
+		self.body.push(kind, ty, span)
+	}
+
+	/// `Type::CONSTANT` in a pattern: the constant the member selects, as
+	/// `ExprKind::Const` or `ExprKind::AbstractConst`, with its type. `None`
+	/// when it selects nothing or is not a constant (reported).
+	pub(super) fn select_constant(
+		&mut self,
+		path: MemberPath<'_>,
+	) -> Option<(ExprKind, TypeIndex)> {
+		match self.select_member(&path)? {
+			Member::Constant {
+				constant,
+				leading,
+				dispatch,
+			} => Some(self.constant_value(
+				constant,
+				&leading,
+				dispatch,
+				path.member,
+			)),
+			Member::Function(_) | Member::Method(_) => {
+				let name = self.cx.strings.resolve(path.member.ident.inner);
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::InvalidMatchPattern.code())
+						.with_message(format!(
+							"expected a constant, found function `{}`",
+							name.unwrap()
+						))
+						.with_label(Label::primary(
+							self.scope.file_id,
+							path.member.ident.span,
+						))
+						.with_note("a pattern compares with constants"),
+				);
+				None
+			}
+		}
+	}
+
+	/// A selected constant's node kind and type: the declared type, with the
+	/// impl's arguments, or the receiver as `Self`.
+	fn constant_value(
+		&mut self,
+		constant: ConstIdx,
+		leading: &[TypeIndex],
+		dispatch: Dispatch,
+		member: &ast::PathSegment,
+	) -> (ExprKind, TypeIndex) {
 		if !member.type_args.is_empty() {
 			self.cx.diagnostics.push(report_type_args_not_allowed(
 				self.cx.strings,
@@ -206,7 +256,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				type_args,
 			},
 		};
-		self.body.push(kind, ty, span)
+		(kind, ty)
 	}
 
 	/// `Type::member(a, b)`: a call of the function the member selects, by

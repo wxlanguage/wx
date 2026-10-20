@@ -368,31 +368,55 @@ the scrutinee's, or a `local`'s value (or annotation). A struct pattern names
 its struct (`Point(..)`, `Self(..)`), checks field privacy as construction
 does, and takes at most one `..`. Each match arm owns a scope for its bindings.
 
-**TIR.** One arena in `Body`, shared by `local` and `match`:
+**TIR** (done). One pattern arena in `Body`, shared by `local` and `match`
+(`PatKind`, with a type and a span per pattern, children in `pat_lists`). A
+pattern is typed and resolved, so the mode is gone. The kinds group by what
+they do: structure (`Wildcard`, `Bind(LocalIdx)`, `Tuple`, `Struct`) always
+matches; tests (`Int`, `Bool`, `Char`, `Constant`, `AbstractConstant`, `Or`)
+match only some values, so only a match arm holds them; `Error` is reported
+and counts as `_`. Destructuring has one child per element or field of its
+type, in declaration order: what `..` covers, and a field a named pattern
+leaves out, is a `Wildcard`, so a struct's arity is its field count however it
+was written, and no `ArgOrder` or rest flag survives. `Int` is the value's
+bits in the pattern's type (`-1: i8` is `0xFF`), one spelling per value.
+`ExprKind::LocalDeclaration { pattern, value }` and `ExprKind::Match {
+scrutinee, arms }` with `Body::arms` (`Arm { scope, pattern, body }`): each arm
+declares its bindings in a scope of its own around its body. A `case` in a
+`local` is E2115 at the keyword, and its pattern becomes `Error` (its bindings
+are still declared, against `ERROR`); a name bound twice is E2116; a binding
+in an alternative of `|` is E2068.
 
-```rust
-index_newtype!(PatIdx);
-enum PatKind {
-    Wildcard,
-    Bind(LocalIdx),
-    Tuple(PatRange),
-    Struct { struct_index: StructIdx, fields: PatRange, order: ArgOrder, rest: bool },
-    // value mode
-    Int { value: u64, negative: bool },
-    Bool(bool),
-    Char(char),
-    Constant { constant: ConstIdx, type_args: TypeList },
-    AbstractConstant { constant: ConstIdx, type_args: TypeList },
-    Or(PatRange),
-}
-// Body gains pats: Vec<PatKind>, with a type and a span each.
-```
+**Usefulness** (next). One pass, Maranget's "Warnings for pattern matching"
+(rustc's `rustc_pattern_analysis`), in `tir/usefulness.rs`, run by
+`BodyContext` once a match's arms are built. The question is whether a row `q`
+is useful after rows `P`: does some value match `q` and no row of `P`. Arm *i*
+is unreachable (W2010) when it is not useful after arms *0..i*; the match is
+non-exhaustive (E2066) when `_` is still useful after every arm, with up to
+three witnesses (the values no arm matches) in the report.
 
-`ExprKind::LocalDeclaration` takes a `PatIdx`; `ExprKind::Match { scrutinee,
-arms }` holds `(PatIdx, ExprIdx)` pairs. Exhaustiveness and unreachable arms
-are one usefulness pass (Maranget's algorithm, as rustc's
-`rustc_pattern_analysis`): enum variants and `bool` are finite, integers and
-`char` need a catch-all, tuples and structs are products.
+- Constructors: a tuple or struct is the single constructor of its type, with
+  one sub-pattern per element or field; `Bool`, `Int`, `Char` and a variant (by
+  its discriminant) are values; a `Constant` that `eval` reduces to a scalar or
+  a variant is that value; any other constant, and `AbstractConstant`, is
+  opaque; `Wildcard`, `Bind` and `Error` are wildcards; an `Or` is a row per
+  alternative.
+- A type's constructor set: `Single` (tuple, struct, `()`), `Bool`, an enum's
+  `Variants`, `Integers { count }` (2^bits; `char`'s valid scalar values),
+  `Empty` (`!`), `Unlisted` (floats, pointers, parameters: only `_` covers
+  them).
+- `useful(P, q)`: an empty `q` is useful when `P` has no rows. A constructor
+  head `c` recurses on both specialised by `c` (rows headed by `c` replaced by
+  its sub-patterns, wildcard heads by as many wildcards, others dropped, an
+  opaque head dropped too). A wildcard head: when `P`'s first column covers the
+  whole set, useful when it is for some `c`; else against the default rows
+  (wildcard heads, removed), and a missing constructor heads the witness. An
+  opaque head is useful against the default rows only.
+- No range patterns yet, so a set of literals is complete only when it lists
+  every value of its type (all 256 of a `u8`); the witness is the smallest
+  value no arm lists.
+- An opaque constant never makes a match exhaustive, nor is it unreachable
+  unless a wildcard arm precedes it. `local` patterns hold no tests, so they
+  always match and are not checked.
 
 **AST** (done). The mode is the type, so the parser decides it and TIR never
 reinterprets a name: `BindPattern` (`Wildcard`, `Binding`, `Destructure`,
@@ -494,9 +518,8 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   Globals are handles, written through `GlobalMut::set` (Q2).
 - **Field access** `x.y` on a value and through a place. Field privacy is
   enforced here (the old checker did, for all three sites).
-- **Patterns** (designed, see "Patterns"), in this order: the parser (done);
-  `local` destructuring, binding mode only, with the pattern arena; then `match`, with
-  value mode, arm scopes and the usefulness pass.
+- **Patterns** (designed, see "Patterns"), in this order: the parser, the pattern
+  arena, `local` destructuring and `match` (done); the usefulness pass.
 
 ### 3. Think first
 

@@ -261,6 +261,7 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::AddressOf(_)
 			| ExprKind::Block { .. }
 			| ExprKind::LocalDeclaration { .. }
+			| ExprKind::Match { .. }
 			| ExprKind::IfElse { .. }
 			| ExprKind::Loop { .. }
 			| ExprKind::Break { .. }
