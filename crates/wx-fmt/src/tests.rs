@@ -1702,7 +1702,7 @@ fn test_format_trailing_comments_keep_their_line() {
             // own-line, documents b
             local b = 2;
             match v {
-                0 -> { a }, // trailing on arm
+                case 0 -> { a }, // trailing on arm
                 // own-line before arm
                 _ -> { b },
             }

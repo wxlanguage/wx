@@ -93,6 +93,148 @@ impl TestCase {
 		}
 	}
 
+	/// A pattern as an S-expression that names every node, so the mode the
+	/// parser chose is visible: a binding is `x`, a value path `(value x)`.
+	fn pattern(&self, pattern: &BindPattern) -> String {
+		match pattern {
+			BindPattern::Wildcard => "_".to_string(),
+			BindPattern::Binding { mut_span, name } => match mut_span {
+				Some(_) => format!("mut {}", self.name(name.inner)),
+				None => self.name(name.inner).to_string(),
+			},
+			BindPattern::Destructure(destructure) => {
+				self.destructure(destructure, |pattern| self.pattern(pattern))
+			}
+			BindPattern::Marked(marked) => self.marked(marked),
+		}
+	}
+
+	fn value_pattern(&self, pattern: &ValuePattern) -> String {
+		match pattern {
+			ValuePattern::Wildcard => "_".to_string(),
+			ValuePattern::Literal(PatternLiteral::Int {
+				minus_span,
+				value,
+			}) => {
+				let sign = if minus_span.is_some() { "-" } else { "" };
+				format!("{sign}{value}")
+			}
+			ValuePattern::Literal(PatternLiteral::Char) => "char".to_string(),
+			ValuePattern::Literal(PatternLiteral::Bool(value)) => {
+				value.to_string()
+			}
+			ValuePattern::Path(path) => format!("(value {})", self.path(path)),
+			ValuePattern::Or(alternatives) => {
+				let alternatives = alternatives
+					.iter()
+					.map(|alternative| {
+						self.value_pattern(&alternative.inner.inner)
+					})
+					.collect::<Vec<_>>();
+				format!("(| {})", alternatives.join(" "))
+			}
+			ValuePattern::Destructure(destructure) => self
+				.destructure(destructure, |pattern| {
+					self.value_pattern(pattern)
+				}),
+			ValuePattern::Marked(marked) => self.marked(marked),
+		}
+	}
+
+	fn marked(&self, marked: &Marked) -> String {
+		match marked {
+			Marked::Case { pattern, .. } => {
+				format!("(case {})", self.value_pattern(&pattern.inner))
+			}
+			Marked::Local { pattern, .. } => {
+				format!("(local {})", self.pattern(&pattern.inner))
+			}
+		}
+	}
+
+	fn destructure<P>(
+		&self,
+		destructure: &Destructure<P>,
+		child: impl Fn(&P) -> String,
+	) -> String {
+		let elements = |elements: &PatternElements<P>| {
+			elements
+				.iter()
+				.map(|element| match &element.inner.inner {
+					PatternElement::Pattern(pattern) => child(pattern),
+					PatternElement::Rest => "..".to_string(),
+				})
+				.collect::<Vec<_>>()
+		};
+		match destructure {
+			Destructure::Tuple { elements: items } => {
+				let mut parts = vec!["tuple".to_string()];
+				parts.extend(elements(items));
+				format!("({})", parts.join(" "))
+			}
+			Destructure::Struct {
+				path,
+				elements: items,
+			} => {
+				let mut parts = vec![self.path(path)];
+				parts.extend(elements(items));
+				format!("({})", parts.join(" "))
+			}
+			Destructure::NamedStruct { path, fields } => {
+				let fields = fields
+					.iter()
+					.map(|item| match &item.inner.inner {
+						PatternFieldItem::Field(field) => {
+							match &field.pattern {
+								Some(pattern) => format!(
+									"{}: {}",
+									self.name(field.name.inner),
+									child(&pattern.inner)
+								),
+								None => self.name(field.name.inner).to_string(),
+							}
+						}
+						PatternFieldItem::Rest => "..".to_string(),
+					})
+					.collect::<Vec<_>>();
+				format!("({} {{ {} }})", self.path(path), fields.join(", "))
+			}
+		}
+	}
+
+	fn path(&self, path: &[PathSegment]) -> String {
+		path.iter()
+			.map(|segment| self.name(segment.ident.inner))
+			.collect::<Vec<_>>()
+			.join("::")
+	}
+
+	/// Every `local` pattern in function `index`, rendered.
+	fn local_patterns(&self, index: usize) -> Vec<String> {
+		self.function_block(index)
+			.iter()
+			.filter_map(|statement| match &statement.inner.inner {
+				Statement::LocalDefinition { pattern, .. } => {
+					Some(self.pattern(&pattern.inner))
+				}
+				Statement::Expression(_) => None,
+			})
+			.collect()
+	}
+
+	/// Every arm pattern of the match that is function `index`'s first
+	/// statement, rendered.
+	fn arm_patterns(&self, index: usize) -> Vec<String> {
+		let Expression::Match { arms, .. } =
+			statement_expression(self.function_block(index), 0)
+		else {
+			panic!("expected a match")
+		};
+		arms.iter()
+			.map(|arm| self.pattern(&arm.inner.inner.pattern.inner))
+			.collect()
+	}
+
 	fn item(&self, index: usize) -> &Item {
 		&self.ast.items[index].inner.inner
 	}
@@ -204,7 +346,7 @@ fn local_definition_value(
 fn local_definition_pattern(
 	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &Pattern {
+) -> &BindPattern {
 	let Statement::LocalDefinition { pattern, .. } =
 		&statements[index].inner.inner
 	else {
@@ -294,7 +436,7 @@ fn test_function_mut_param() {
 
 	// `mut` on a local lives on its binding pattern, not on the statement
 	let statements = case.function_block(0);
-	let Pattern::Binding { mut_span, name } =
+	let BindPattern::Binding { mut_span, name } =
 		local_definition_pattern(statements, 0)
 	else {
 		panic!("expected a binding pattern")
@@ -775,8 +917,8 @@ fn test_match_int_literal_patterns() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 -> { 1 },
+                case 0 -> { 0 },
+                case 1 | 2 -> { 1 },
                 _ -> { -1 },
             }
         }
@@ -784,27 +926,13 @@ fn test_match_int_literal_patterns() {
 	case.diagnostics().assert_none();
 
 	let statements = case.function_block(0);
-	let Expression::Match { scrutinee, arms } =
+	let Expression::Match { scrutinee, .. } =
 		statement_expression(statements, 0)
 	else {
 		panic!("expected a match")
 	};
 	assert!(matches!(scrutinee.inner, Expression::Path(_)));
-	assert_eq!(arms.len(), 3);
-
-	// arm patterns are ordinary expressions at parse time; TIR is what
-	// later decides which of them are valid patterns
-	let patterns: Vec<&Expression> = arms
-		.iter()
-		.map(|arm| &arm.inner.inner.pattern.inner)
-		.collect();
-	assert!(matches!(patterns[0], Expression::Int { value: 0 }));
-	assert!(matches!(patterns[1], Expression::Int { value: 1 }));
-	assert!(
-		matches!(patterns[2], Expression::Placeholder),
-		"`_` should parse as a placeholder, got {:?}",
-		patterns[2]
-	);
+	assert_eq!(case.arm_patterns(0), ["(case 0)", "(case (| 1 2))", "_"]);
 }
 
 #[test]
@@ -818,35 +946,21 @@ fn test_match_enum_variant_patterns() {
 
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                FileDescriptor::StdOut -> { 1 },
-                FileDescriptor::StdErr -> { 2 },
+                case FileDescriptor::StdIn -> { 0 },
+                case FileDescriptor::StdOut -> { 1 },
+                case FileDescriptor::StdErr -> { 2 },
             }
         }
     "});
 	case.diagnostics().assert_none();
-
-	let statements = case.function_block(1);
-	let Expression::Match { arms, .. } = statement_expression(statements, 0)
-	else {
-		panic!("expected a match")
-	};
-	assert_eq!(arms.len(), 3);
-
-	// each arm pattern is a two-segment path `Enum::Variant`
-	let variants: Vec<&str> = arms
-		.iter()
-		.map(|arm| {
-			let Expression::Path(segments) = &arm.inner.inner.pattern.inner
-			else {
-				panic!("expected a path pattern")
-			};
-			assert_eq!(segments.len(), 2);
-			assert_eq!(case.name(segments[0].ident.inner), "FileDescriptor");
-			case.name(segments[1].ident.inner)
-		})
-		.collect();
-	assert_eq!(variants, ["StdIn", "StdOut", "StdErr"]);
+	assert_eq!(
+		case.arm_patterns(1),
+		[
+			"(case (value FileDescriptor::StdIn))",
+			"(case (value FileDescriptor::StdOut))",
+			"(case (value FileDescriptor::StdErr))",
+		]
+	);
 }
 
 #[test]
@@ -861,7 +975,7 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
             match x {
-                0 { 1 },
+                case 0 { 1 },
                 _ -> { 0 },
             }
         }
@@ -1104,10 +1218,7 @@ fn old_struct_forms_are_reported_and_read_as_the_new_ones() {
 	let statements = case.function_block(1);
 	let (_, arguments) = named_call(local_definition_value(statements, 0));
 	assert_eq!(arguments.len(), 2);
-	assert!(matches!(
-		local_definition_pattern(statements, 1),
-		Pattern::NamedStruct { .. }
-	));
+	assert_eq!(case.local_patterns(1)[1], "(Point { x, .. })");
 }
 
 #[test]
@@ -1462,20 +1573,7 @@ fn test_pattern_simple_binding() {
         }
     "});
 	case.diagnostics().assert_none();
-	let stmts = case.function_block(0);
-
-	assert!(matches!(
-		local_definition_pattern(stmts, 0),
-		Pattern::Binding { mut_span: None, name } if case.strings.resolve(name.inner) == Some("x")
-	));
-	assert!(matches!(
-		local_definition_pattern(stmts, 1),
-		Pattern::Binding { mut_span: Some(_), name } if case.strings.resolve(name.inner) == Some("y")
-	));
-	assert!(matches!(
-		local_definition_pattern(stmts, 2),
-		Pattern::Wildcard
-	));
+	assert_eq!(case.local_patterns(0), ["x", "mut y", "_"]);
 }
 
 #[test]
@@ -1485,40 +1583,23 @@ fn test_pattern_tuple_destructuring() {
             local (a, b) = pair;
             local (mut c, _) = pair;
             local (x, (y, z)) = pair;
+            local (a, ..) = pair;
+            local (.., z) = pair;
+            local (a, .., z) = pair;
         }
     "});
 	case.diagnostics().assert_none();
-	let stmts = case.function_block(0);
-
-	let Pattern::Tuple { elements } = local_definition_pattern(stmts, 0) else {
-		panic!("expected tuple pattern")
-	};
-	assert_eq!(elements.len(), 2);
-	assert!(matches!(
-		&elements[0].inner.inner,
-		Pattern::Binding { mut_span: None, .. }
-	));
-	assert!(matches!(
-		&elements[1].inner.inner,
-		Pattern::Binding { mut_span: None, .. }
-	));
-
-	let Pattern::Tuple { elements } = local_definition_pattern(stmts, 1) else {
-		panic!("expected tuple pattern")
-	};
-	assert!(matches!(
-		&elements[0].inner.inner,
-		Pattern::Binding {
-			mut_span: Some(_),
-			..
-		}
-	));
-	assert!(matches!(&elements[1].inner.inner, Pattern::Wildcard));
-
-	let Pattern::Tuple { elements } = local_definition_pattern(stmts, 2) else {
-		panic!("expected tuple pattern")
-	};
-	assert!(matches!(&elements[1].inner.inner, Pattern::Tuple { .. }));
+	assert_eq!(
+		case.local_patterns(0),
+		[
+			"(tuple a b)",
+			"(tuple mut c _)",
+			"(tuple x (tuple y z))",
+			"(tuple a ..)",
+			"(tuple .. z)",
+			"(tuple a .. z)",
+		]
+	);
 }
 
 #[test]
@@ -1532,64 +1613,153 @@ fn test_pattern_struct_destructuring() {
         }
     "});
 	case.diagnostics().assert_none();
-	let stmts = case.function_block(0);
-
-	let named_pattern = |index: usize| {
-		let Pattern::NamedStruct {
-			path,
-			fields: items,
-		} = local_definition_pattern(stmts, index)
-		else {
-			panic!("expected a named struct pattern")
-		};
-		(path, struct_pattern_fields(items))
-	};
-
-	let (path, (fields, rest)) = named_pattern(0);
-	assert_eq!(path.len(), 1);
-	assert_eq!(case.strings.resolve(path[0].ident.inner), Some("Point"));
-	assert!(rest.is_empty());
-	assert_eq!(fields.len(), 2);
-	assert!(
-		fields.iter().all(|field| field.pattern.is_none()),
-		"shorthand fields have no sub-pattern"
+	assert_eq!(
+		case.local_patterns(0),
+		[
+			"(Point { x, y })",
+			"(Point { x: a, y: b })",
+			"(geom::Point { x, .. })",
+			"(Point a ..)",
+		]
 	);
-
-	let (_, (fields, _)) = named_pattern(1);
-	assert!(
-		fields.iter().all(|field| field.pattern.is_some()),
-		"renamed fields have a sub-pattern"
-	);
-
-	// A multi-segment path names a struct in another module, and `..` stands
-	// in for the fields the pattern does not bind.
-	let (path, (fields, rest)) = named_pattern(2);
-	assert_eq!(path.len(), 2);
-	assert_eq!(case.strings.resolve(path[0].ident.inner), Some("geom"));
-	assert_eq!(case.strings.resolve(path[1].ident.inner), Some("Point"));
-	assert_eq!(fields.len(), 1);
-	assert!(!rest.is_empty());
-
-	assert!(matches!(
-		local_definition_pattern(stmts, 3),
-		Pattern::Struct { elements, .. } if elements.len() == 2
-	));
 }
 
-/// Splits a named struct pattern's raw items into its fields and its `..`
-/// rest markers.
-fn struct_pattern_fields(
-	items: &[Separated<Spanned<NamedPatternItem>>],
-) -> (Vec<&PatternField>, Vec<&Spanned<NamedPatternItem>>) {
-	let mut fields = Vec::new();
-	let mut rest = Vec::new();
-	for item in items {
-		match &item.inner.inner {
-			NamedPatternItem::Field(field) => fields.push(field),
-			NamedPatternItem::Rest => rest.push(&item.inner),
-		}
+#[test]
+fn test_pattern_rests_are_kept_as_written() {
+	// More than one `..` is a semantic error, not a syntax one: the parser
+	// keeps every rest where it was written and leaves the judgement to TIR.
+	let case = TestCase::new(indoc! {"
+        func f(p: Point) {
+            local (.., a, ..) = p;
+            local Point(.., ..) = p;
+            local Point({ .., x, .. }) = p;
+        }
+    "});
+	case.diagnostics().assert_none();
+	assert_eq!(
+		case.local_patterns(0),
+		["(tuple .. a ..)", "(Point .. ..)", "(Point { .., x, .. })"]
+	);
+}
+
+#[test]
+fn test_pattern_case_switches_to_value_mode() {
+	// Under `case` a name is a value path, a literal is allowed, and `local`
+	// switches back to binding.
+	let case = TestCase::new(indoc! {"
+        func f(p: Point) {
+            match p {
+                case Point(0, 0) -> {},
+                case Point(local x, MAX) -> {},
+                Point(x, case 0) -> {},
+                Point(case -1, case 'a' | true) -> {},
+                case (local mut x, _) -> {},
+                case Point({ x, y: local y }) -> {},
+                x -> {},
+            }
+        }
+    "});
+	case.diagnostics().assert_none();
+	assert_eq!(
+		case.arm_patterns(0),
+		[
+			"(case (Point 0 0))",
+			"(case (Point (local x) (value MAX)))",
+			"(Point x (case 0))",
+			"(Point (case -1) (case (| char true)))",
+			"(case (tuple (local mut x) _))",
+			"(case (Point { x, y: (local y) }))",
+			"x",
+		]
+	);
+}
+
+#[test]
+fn test_pattern_case_binds_looser_than_alternatives() {
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) {
+            match x {
+                case 1 | 2 | 3 -> {},
+                case 1 | local y -> {},
+            }
+        }
+    "});
+	case.diagnostics().assert_none();
+	assert_eq!(
+		case.arm_patterns(0),
+		["(case (| 1 2 3))", "(case (| 1 (local y)))"]
+	);
+}
+
+#[test]
+fn test_pattern_redundant_marker_is_kept_and_warned() {
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) {
+            local local y = x;
+            match x {
+                case case 0 -> {},
+                case (local local z, case 1) -> {},
+            }
+        }
+    "});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::RedundantPatternMarker,
+		DiagnosticCode::RedundantPatternMarker,
+		DiagnosticCode::RedundantPatternMarker,
+		DiagnosticCode::RedundantPatternMarker,
+	]);
+	case.diagnostics()
+		.assert_warning(DiagnosticCode::RedundantPatternMarker);
+	assert_eq!(case.local_patterns(0), ["(local y)"]);
+	let Statement::Expression(expression) =
+		&case.function_block(0)[1].inner.inner
+	else {
+		panic!("expected a match")
+	};
+	let Expression::Match { arms, .. } = &expression.inner else {
+		panic!("expected a match")
+	};
+	let arms: Vec<String> = arms
+		.iter()
+		.map(|arm| case.pattern(&arm.inner.inner.pattern.inner))
+		.collect();
+	assert_eq!(
+		arms,
+		[
+			"(case (case 0))",
+			"(case (tuple (local (local z)) (case 1)))"
+		]
+	);
+}
+
+#[test]
+fn test_pattern_value_needs_case() {
+	for pattern in ["0", "-1", "'a'", "true", "Ordering::Less", "x::<u32>"] {
+		let case = TestCase::new(&format!(
+			"func f(x: i32) {{ match x {{ {pattern} -> {{}} }} }}"
+		));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::InvalidBindingPattern]);
+		case.diagnostics()
+			.assert_error_saying("a value in a pattern needs `case`");
 	}
-	(fields, rest)
+}
+
+#[test]
+fn test_pattern_mut_under_case_needs_local() {
+	let case =
+		TestCase::new("func f(x: i32) { match x { case (mut y, 0) -> {} } }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::InvalidBindingPattern]);
+	case.diagnostics()
+		.assert_error_saying("a binding under `case` needs `local`");
+}
+
+#[test]
+fn test_case_is_a_keyword() {
+	let case = TestCase::new("func f() { case; }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
 }
 
 #[test]
@@ -1602,11 +1772,10 @@ fn test_pattern_with_type_annotation() {
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
 
-	let Statement::LocalDefinition { pattern, ty, .. } = &stmts[0].inner.inner
-	else {
+	let Statement::LocalDefinition { ty, .. } = &stmts[0].inner.inner else {
 		panic!("expected local definition")
 	};
-	assert!(matches!(pattern.inner, Pattern::Tuple { .. }));
+	assert_eq!(case.local_patterns(0), ["(tuple a b)"]);
 	assert!(ty.is_some(), "type annotation should be present");
 }
 

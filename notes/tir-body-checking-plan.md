@@ -394,12 +394,19 @@ are one usefulness pass (Maranget's algorithm, as rustc's
 `rustc_pattern_analysis`): enum variants and `bool` are finite, integers and
 `char` need a catch-all, tuples and structs are products.
 
-**AST.** `ast::Pattern` gains the value leaves (a literal, possibly negated; a
-path), `Or`, and the two markers, kept with their keyword spans for the
-formatter and the redundancy warning. The parser decides the mode, so a bare
-name reaches the AST as a `Binding` or a one-segment value path, never as
-something TIR must reinterpret. `MatchArm::pattern` becomes a `Pattern`
-instead of an expression.
+**AST** (done). The mode is the type, so the parser decides it and TIR never
+reinterprets a name: `BindPattern` (`Wildcard`, `Binding`, `Destructure`,
+`Marked`) and `ValuePattern` (`Wildcard`, `Literal`, `Path`, `Or`,
+`Destructure`, `Marked`). `Destructure<P>` (`Tuple`, `Struct`, `NamedStruct`)
+is shared, its children in the same mode, and its lists are the raw sequences
+as written (`PatternElement::{Pattern, Rest}`, `PatternFieldItem::{Field,
+Rest}`): `(a, ..)`, `(.., z)` and two `..` all parse, and TIR judges them.
+`Marked::{Case, Local}` keeps every marker with its keyword span; one in the
+mode it names (`Marked::Case` in a `ValuePattern`, `Marked::Local` in a
+`BindPattern`) is redundant, which the parser warns about (W1003) and wx-fmt
+leaves out. A value without `case` is reported (E1015) and read as `_`; `mut`
+under `case` asks for `local mut`. `MatchArm::pattern` and `local` both take a
+`BindPattern`.
 
 ## Order of work
 
@@ -487,9 +494,8 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   Globals are handles, written through `GlobalMut::set` (Q2).
 - **Field access** `x.y` on a value and through a place. Field privacy is
   enforced here (the old checker did, for all three sites).
-- **Patterns** (designed, see "Patterns"), in this order: the parser (modes,
-  markers, value leaves, `MatchArm::pattern` as a pattern); `local`
-  destructuring, binding mode only, with the pattern arena; then `match`, with
+- **Patterns** (designed, see "Patterns"), in this order: the parser (done);
+  `local` destructuring, binding mode only, with the pattern arena; then `match`, with
   value mode, arm scopes and the usefulness pass.
 
 ### 3. Think first

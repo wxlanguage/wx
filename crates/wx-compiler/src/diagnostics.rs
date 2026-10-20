@@ -116,6 +116,7 @@ define_diagnostic_codes! {
 		MissingPackageAlias => "E1021",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
+		RedundantPatternMarker => "W1003",
 
 		// TIR diagnostics (E2xxx/W2xxx).
 		DuplicateDefinition => "E2000",

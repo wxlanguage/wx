@@ -30,9 +30,9 @@ pub func cos(x: f64) -> f64 {
     // argument reduction needed
     local (n, y0, y1) = rem_pio2(x);
     match n & 3 {
-        0 -> { k_cos(y0, y1) },
-        1 -> { -k_sin(y0, y1, 1) },
-        2 -> { -k_cos(y0, y1) },
+        case 0 -> { k_cos(y0, y1) },
+        case 1 -> { -k_sin(y0, y1, 1) },
+        case 2 -> { -k_cos(y0, y1) },
         _ -> { k_sin(y0, y1, 1) }
     }
 }

@@ -239,7 +239,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// annotation.
 	fn build_local(
 		&mut self,
-		pattern: &Spanned<ast::Pattern>,
+		pattern: &Spanned<ast::BindPattern>,
 		ty: Option<&Spanned<ast::TypeExpression>>,
 		value: &Spanned<ast::Expression>,
 		span: TextSpan,
@@ -289,7 +289,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			TypeIndex::UNIT
 		};
 		match &pattern.inner {
-			ast::Pattern::Binding { mut_span, name } => {
+			ast::BindPattern::Binding { mut_span, name } => {
 				let local = self.declare_local(*name, local_ty, *mut_span);
 				self.body.push(
 					ExprKind::LocalDeclaration { local, value },
@@ -298,10 +298,9 @@ impl BodyContext<'_, '_, '_, '_> {
 				)
 			}
 			// TODO: patterns, `_` among them, need their own representation.
-			ast::Pattern::Wildcard
-			| ast::Pattern::Tuple { .. }
-			| ast::Pattern::Struct { .. }
-			| ast::Pattern::NamedStruct { .. } => {
+			ast::BindPattern::Wildcard
+			| ast::BindPattern::Destructure(_)
+			| ast::BindPattern::Marked(_) => {
 				self.report_unsupported(pattern.span, "a pattern");
 				self.body.push(ExprKind::Error, ty, span)
 			}

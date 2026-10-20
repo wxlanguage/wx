@@ -4194,7 +4194,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(o: Ordering) -> Ordering {
-					match o { Ordering::Less -> { o }, _ -> { o } }
+					match o { case Ordering::Less -> { o }, _ -> { o } }
 				}
 			"}
 		);
