@@ -316,38 +316,33 @@ fn report_chained_comparisons(
         .with_note("consider using logical operator like `&&` or `||` to split the comparisons or use parentheses to group them")
 }
 
-/// A literal or a path where a pattern binds names.
-fn report_value_pattern_needs_case(
+/// A `const` before a path that is a constant already: it changes nothing,
+/// and the path is what the pattern means.
+fn report_redundant_const(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::warning()
+		.with_code(DiagnosticCode::RedundantPatternMarker.code())
+		.with_message("redundant `const`")
+		.with_label(
+			Label::primary(file_id, span)
+				.with_message("this path is a constant already"),
+		)
+		.with_note("drop the `const`")
+}
+
+/// `local` in a pattern: a name binds by default, so the marker says
+/// nothing.
+fn report_redundant_local(
 	file_id: FileId,
 	span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::InvalidBindingPattern.code())
-		.with_message("a value in a pattern needs `case`")
-		.with_label(
-			Label::primary(file_id, span)
-				.with_message("this pattern binds names"),
-		)
-		.with_note("write `case` before a pattern to compare with values")
-}
-
-/// A marker written in the mode it switches to.
-fn report_redundant_pattern_marker(
-	file_id: FileId,
-	span: TextSpan,
-	marker: Keyword,
-) -> Diagnostic<FileId> {
-	let (keyword, mode) = match marker {
-		Keyword::Case => ("case", "compares with values"),
-		_ => ("local", "binds names"),
-	};
-	Diagnostic::warning()
-		.with_code(DiagnosticCode::RedundantPatternMarker.code())
-		.with_message(format!("redundant `{keyword}`"))
-		.with_label(
-			Label::primary(file_id, span)
-				.with_message(format!("this pattern already {mode}")),
-		)
+		.with_message("`local` is not needed in a pattern")
+		.with_label(Label::primary(file_id, span))
+		.with_note("a name binds by default")
 }
 
 fn report_reserved_identifier(
@@ -1257,12 +1252,12 @@ pub struct NamedArgument {
 }
 
 /// One arm of a `match` expression: `{pattern} -> { ... }`. The pattern
-/// starts in binding mode, as a `local`'s does; `case` switches it to
-/// comparing with values.
+/// says what each of its terms is on its own: a name binds, a literal
+/// compares with that value, a qualified path with that constant.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct MatchArm {
-	pub pattern: Spanned<BindPattern>,
+	pub pattern: Spanned<Pattern>,
 	pub body: Box<Spanned<Expression>>,
 }
 
@@ -1464,11 +1459,18 @@ pub enum TypeExpression {
 	},
 }
 
-/// A pattern in *binding mode*: what `local` and a match arm start in. A bare
-/// name binds, and a value can only be tested under `case`.
+/// A pattern, as written. What each term *is* follows from its own shape:
+/// a name binds, a literal compares with that value, a qualified path
+/// compares with that constant — and `const` marks the one case that is
+/// ambiguous, a single-segment name that should compare with a constant
+/// instead of binding.
+///
+/// The parser resolves every term while parsing, so a name reaches the AST
+/// already decided — a [`Pattern::Binding`] or a [`Pattern::ValuePath`] —
+/// and never as something a later stage has to reinterpret.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum BindPattern {
+pub enum Pattern {
 	/// `_`
 	Wildcard,
 	/// `[mut] name`
@@ -1476,96 +1478,71 @@ pub enum BindPattern {
 		mut_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 	},
-	Destructure(Destructure<BindPattern>),
-	Marked(Marked),
-}
-
-/// A pattern in *value mode*: under a `case`. A name is a value path, never a
-/// binding, so what a single name means never depends on what is in scope.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub enum ValuePattern {
-	/// `_`
-	Wildcard,
+	/// `const MAX`, `Ordering::Less`, `Self::LIMIT`
+	ValuePath {
+		path: Box<[PathSegment]>,
+	},
 	/// `0`, `-1`, `'a'`, `true`
 	Literal(PatternLiteral),
-	/// `MAX`, `Ordering::Less`, `Self::LIMIT`
-	Path(Box<[PathSegment]>),
 	/// `A | B | C`; each separator is a `|`.
-	Or(Box<[Separated<Spanned<ValuePattern>>]>),
-	Destructure(Destructure<ValuePattern>),
-	Marked(Marked),
+	Or(Box<[Separated<Spanned<Pattern>>]>),
+	Destructure(Destructure),
+	/// A pattern the parser could not read: the diagnostic is already out,
+	/// and nothing here can be checked.
+	Error,
 }
 
-/// A mode marker, kept wherever it is written. It switches to the mode it
-/// names, so one written in that mode already (`Marked::Case` in a
-/// [`ValuePattern`], `Marked::Local` in a [`BindPattern`]) is redundant: the
-/// parser warns about it and the formatter leaves it out.
+/// Destructuring; each of its children is a pattern of its own.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum Marked {
-	/// `case P`
-	Case {
-		case_span: TextSpan,
-		pattern: Box<Spanned<ValuePattern>>,
-	},
-	/// `local P`
-	Local {
-		local_span: TextSpan,
-		pattern: Box<Spanned<BindPattern>>,
-	},
-}
-
-/// Destructuring, the same in both modes; the children inherit the mode.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub enum Destructure<P> {
+pub enum Destructure {
 	/// `(a, .., z)`
-	Tuple { elements: PatternElements<P> },
+	Tuple { elements: PatternElements },
 	/// `Name(pat, ..)` or `module::Name(pat, ..)`, written exactly as its
 	/// construction is (`Name(1, 2)`), so a pattern and a value read the same
 	/// way.
 	Struct {
 		path: Box<[PathSegment]>,
-		elements: PatternElements<P>,
+		elements: PatternElements,
 	},
 	/// `Name({ field, other: pat, .. })`, as `Name({ x: 1, y: 2 })` constructs
 	/// it.
 	NamedStruct {
 		path: Box<[PathSegment]>,
-		fields: PatternFields<P>,
+		fields: PatternFields,
 	},
 }
 
 /// A positional list exactly as written: how many `..` there are and where
 /// is a semantic question TIR answers, not a parse-time assumption.
-pub type PatternElements<P> = Box<[Separated<Spanned<PatternElement<P>>>]>;
+pub type PatternElements = Box<[Separated<Spanned<PatternElement>>]>;
 
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum PatternElement<P> {
-	Pattern(P),
+pub enum PatternElement {
+	Pattern(Pattern),
 	/// `..`
 	Rest,
 }
 
 /// A named list exactly as written; see [`PatternElements`].
-pub type PatternFields<P> = Box<[Separated<Spanned<PatternFieldItem<P>>>]>;
+pub type PatternFields = Box<[Separated<Spanned<PatternFieldItem>>]>;
 
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum PatternFieldItem<P> {
-	Field(PatternField<P>),
+pub enum PatternFieldItem {
+	Field(PatternField),
 	/// `..`
 	Rest,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub struct PatternField<P> {
+pub struct PatternField {
 	pub name: Spanned<SymbolU32>,
-	/// `None` = shorthand `{ x }`, the same as `{ x: x }` in the field's mode.
-	pub pattern: Option<Spanned<P>>,
+	/// `None` = shorthand `{ x }`: the field binds a local of its own name,
+	/// the same as `{ x: x }`.
+	pub pattern: Option<Spanned<Pattern>>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1579,6 +1556,14 @@ pub enum PatternLiteral {
 	/// `'a'`, decoded from the pattern's span as a char expression is.
 	Char,
 	Bool(bool),
+	/// `1.5` — the text is recovered from the span, as an expression's
+	/// float is. A float has no single value to compare with, so the
+	/// checker refuses it.
+	Float,
+	/// `"hi"` — the raw text is recovered from the span, as an
+	/// expression's string is. A string has no equality, so the checker
+	/// refuses it.
+	String,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1588,7 +1573,7 @@ pub enum Statement {
 	Expression(Box<Spanned<Expression>>),
 	/// `local <pattern> [: type] = {expr}`
 	LocalDefinition {
-		pattern: Spanned<BindPattern>,
+		pattern: Spanned<Pattern>,
 		ty: Option<Box<Spanned<TypeExpression>>>,
 		value: Box<Spanned<Expression>>,
 	},
@@ -2177,7 +2162,6 @@ define_keywords! {
 	Crate => "crate",
 	Super => "super",
 	Block => "block",
-	Case => "case",
 }
 
 impl Keyword {
@@ -2188,38 +2172,11 @@ impl Keyword {
 	}
 }
 
-/// What the pattern parser builds in each mode, so destructuring, which reads
-/// the same in both, is parsed once.
-trait PatternMode: Sized {
-	fn parse(parser: &mut Parser) -> Result<Spanned<Self>, ()>;
-	fn destructure(destructure: Destructure<Self>) -> Self;
-}
-
-impl PatternMode for BindPattern {
-	fn parse(parser: &mut Parser) -> Result<Spanned<Self>, ()> {
-		Parser::parse_bind_pattern(parser)
-	}
-
-	fn destructure(destructure: Destructure<Self>) -> Self {
-		BindPattern::Destructure(destructure)
-	}
-}
-
-impl PatternMode for ValuePattern {
-	fn parse(parser: &mut Parser) -> Result<Spanned<Self>, ()> {
-		Parser::parse_value_pattern(parser)
-	}
-
-	fn destructure(destructure: Destructure<Self>) -> Self {
-		ValuePattern::Destructure(destructure)
-	}
-}
-
-/// A pattern that starts with a path: a struct pattern, or a path alone,
-/// which each mode reads differently.
-enum PathPattern<P> {
-	Destructure(Spanned<P>),
+/// What a path turned out to be: a path, or the old `Path::{ .. }` form,
+/// which is reported and read as an error.
+enum PathTerm {
 	Path(Box<[PathSegment]>),
+	Old(Spanned<Pattern>),
 }
 
 pub struct Parser<'input> {
@@ -4529,7 +4486,7 @@ impl<'ctx> Parser<'ctx> {
 			separator_token: Token::Comma,
 			item_handler:
 				|parser: &mut Parser| -> Result<Spanned<MatchArm>, ()> {
-					let pattern = Parser::parse_bind_pattern(parser)?;
+					let pattern = Parser::parse_pattern(parser)?;
 					parser.next_expect(Token::MinusRightArrow)?;
 					let body = Parser::parse_block_expression(parser)?;
 					let span = TextSpan::new(pattern.span.start, body.span.end);
@@ -4777,17 +4734,17 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// `..`, or one element in the list's mode.
-	fn parse_pattern_element<P: PatternMode>(
+	/// `..`, or one element in the list.
+	fn parse_pattern_element(
 		parser: &mut Parser,
-	) -> Result<Spanned<PatternElement<P>>, ()> {
+	) -> Result<Spanned<PatternElement>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
 				inner: PatternElement::Rest,
 				span: dot_dot.span,
 			});
 		}
-		let pattern = P::parse(parser)?;
+		let pattern = Parser::parse_pattern(parser)?;
 		Ok(Spanned {
 			inner: PatternElement::Pattern(pattern.inner),
 			span: pattern.span,
@@ -4795,9 +4752,9 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// `..`, `name` or `name: pat`.
-	fn parse_pattern_field_item<P: PatternMode>(
+	fn parse_pattern_field_item(
 		parser: &mut Parser,
-	) -> Result<Spanned<PatternFieldItem<P>>, ()> {
+	) -> Result<Spanned<PatternFieldItem>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
 				inner: PatternFieldItem::Rest,
@@ -4810,7 +4767,7 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		};
 		let pattern = if parser.lexer.next_if(Token::Colon).is_some() {
-			Some(P::parse(parser)?)
+			Some(Parser::parse_pattern(parser)?)
 		} else {
 			None
 		};
@@ -4825,33 +4782,33 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// `{ field, other: pat, .. }`, braces included, as written.
-	fn parse_pattern_fields<P: PatternMode>(
+	fn parse_pattern_fields(
 		parser: &mut Parser,
-	) -> Result<Spanned<PatternFields<P>>, ()> {
+	) -> Result<Spanned<PatternFields>, ()> {
 		SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
 			should_warn_missing_separator: None,
-			item_handler: Parser::parse_pattern_field_item::<P>,
+			item_handler: Parser::parse_pattern_field_item,
 		}
 		.parse(parser)
 	}
 
 	/// `(pat, .., pat)`.
-	fn parse_tuple_pattern<P: PatternMode>(
+	fn parse_tuple_pattern(
 		parser: &mut Parser,
-	) -> Result<Spanned<P>, ()> {
+	) -> Result<Spanned<Pattern>, ()> {
 		let elements = SeparatedGroup {
 			open_token: Token::OpenParen,
 			close_token: Token::CloseParen,
 			separator_token: Token::Comma,
 			should_warn_missing_separator: None,
-			item_handler: Parser::parse_pattern_element::<P>,
+			item_handler: Parser::parse_pattern_element,
 		}
 		.parse(parser)?;
 		Ok(Spanned {
-			inner: P::destructure(Destructure::Tuple {
+			inner: Pattern::Destructure(Destructure::Tuple {
 				elements: elements.inner,
 			}),
 			span: elements.span,
@@ -4860,17 +4817,17 @@ impl<'ctx> Parser<'ctx> {
 
 	/// `Path(pat, ..)` or `Path({ field, .. })`, with `path` consumed and `(`
 	/// next — decided on the token after `(`, exactly as a call's arguments.
-	fn parse_struct_pattern<P: PatternMode>(
+	fn parse_struct_pattern(
 		parser: &mut Parser,
 		path: Box<[PathSegment]>,
-	) -> Result<Spanned<P>, ()> {
+	) -> Result<Spanned<Pattern>, ()> {
 		let path_start = path.first().unwrap().ident.span.start;
 		let open_span = parser.next_expect(Token::OpenParen)?.span;
 		if parser.lexer.peek().inner == Token::OpenBrace {
-			let fields = Parser::parse_pattern_fields::<P>(parser)?;
+			let fields = Parser::parse_pattern_fields(parser)?;
 			let close_span = parser.next_expect(Token::CloseParen)?.span;
 			return Ok(Spanned {
-				inner: P::destructure(Destructure::NamedStruct {
+				inner: Pattern::Destructure(Destructure::NamedStruct {
 					path,
 					fields: fields.inner,
 				}),
@@ -4882,11 +4839,11 @@ impl<'ctx> Parser<'ctx> {
 			close_token: Token::CloseParen,
 			separator_token: Token::Comma,
 			should_warn_missing_separator: None,
-			item_handler: Parser::parse_pattern_element::<P>,
+			item_handler: Parser::parse_pattern_element,
 		}
 		.parse_after_open(parser, open_span)?;
 		Ok(Spanned {
-			inner: P::destructure(Destructure::Struct {
+			inner: Pattern::Destructure(Destructure::Struct {
 				path,
 				elements: elements.inner,
 			}),
@@ -4894,14 +4851,15 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// `Path::{ ... }`, the old named pattern, with `::` consumed and `{`
-	/// next: reported, and read as `Path({ ... })`.
-	fn parse_old_struct_pattern<P: PatternMode>(
+	/// `Path::{ ... }`, the old named pattern: gone. The fields are read and
+	/// dropped, so the rest of the file still parses, and the pattern itself
+	/// is an error.
+	fn parse_old_struct_pattern(
 		parser: &mut Parser,
-		path: Box<[PathSegment]>,
-	) -> Result<Spanned<P>, ()> {
+		path: &[PathSegment],
+	) -> Result<PathTerm, ()> {
 		let path_start = path.first().unwrap().ident.span.start;
-		let named = Parser::parse_pattern_fields::<P>(parser)?;
+		let named = Parser::parse_pattern_fields(parser)?;
 		let span = TextSpan::new(path_start, named.span.end);
 		parser.ast.diagnostics.push(
 			Diagnostic::error()
@@ -4912,21 +4870,14 @@ impl<'ctx> Parser<'ctx> {
 				.with_label(Label::primary(parser.ast.file_id, span))
 				.with_note("write `Name({ field, .. })` or `Name(a, b)`"),
 		);
-		Ok(Spanned {
-			inner: P::destructure(Destructure::NamedStruct {
-				path,
-				fields: named.inner,
-			}),
+		Ok(PathTerm::Old(Spanned {
+			inner: Pattern::Error,
 			span,
-		})
+		}))
 	}
 
-	/// A pattern that starts with a path, the next token. A struct pattern
-	/// (`Path(..)`, or the old `Path::{ .. }`) is parsed in the caller's mode;
-	/// a path followed by neither is handed back for the mode to judge.
-	fn parse_path_pattern<P: PatternMode>(
-		parser: &mut Parser,
-	) -> Result<PathPattern<P>, ()> {
+	/// A path: one or more segments, `A::B`.
+	fn parse_path(parser: &mut Parser) -> Result<PathTerm, ()> {
 		let name_span = parser.next_expect(Token::Identifier)?.span;
 		let mut segments = vec![PathSegment {
 			ident: Spanned {
@@ -4944,13 +4895,9 @@ impl<'ctx> Parser<'ctx> {
 					let (type_args, _close) = parser.parse_type_args()?;
 					segments.last_mut().unwrap().type_args = type_args;
 				}
-				// `::{ ... }` — the old named pattern
+				// `::{ ... }` — the old named pattern, gone
 				Token::OpenBrace => {
-					return Parser::parse_old_struct_pattern(
-						parser,
-						segments.into(),
-					)
-					.map(PathPattern::Destructure);
+					return Parser::parse_old_struct_pattern(parser, &segments);
 				}
 				// `::ident` — another path segment
 				Token::Identifier => {
@@ -4974,27 +4921,184 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		if parser.lexer.peek().inner == Token::OpenParen {
-			return Parser::parse_struct_pattern(parser, segments.into())
-				.map(PathPattern::Destructure);
-		}
-		Ok(PathPattern::Path(segments.into()))
+		Ok(PathTerm::Path(segments.into()))
 	}
 
-	/// A pattern in binding mode: what `local` and a match arm start in.
-	fn parse_bind_pattern(
+	/// A term that starts with a path: a struct pattern (`Path(..)`), a
+	/// qualified path (a constant), or a single-segment name (a binding).
+	fn parse_path_pattern(parser: &mut Parser) -> Result<Spanned<Pattern>, ()> {
+		let segments = match Parser::parse_path(parser)? {
+			PathTerm::Path(segments) => segments,
+			PathTerm::Old(pattern) => return Ok(pattern),
+		};
+
+		if parser.lexer.peek().inner == Token::OpenParen {
+			return Parser::parse_struct_pattern(parser, segments);
+		}
+
+		// A single segment with no type arguments is a name, and a name
+		// binds; anything longer is a path, and a path is a constant.
+		let span = TextSpan::new(
+			segments[0].ident.span.start,
+			segments.last().unwrap().ident.span.end,
+		);
+		match &*segments {
+			[segment] if segment.type_args.is_empty() => Ok(Spanned {
+				inner: Pattern::Binding {
+					mut_span: None,
+					name: segment.ident,
+				},
+				span,
+			}),
+			_ => Ok(Spanned {
+				inner: Pattern::ValuePath { path: segments },
+				span,
+			}),
+		}
+	}
+
+	/// `const P`: a name marked `const` compares with the constant of that
+	/// name instead of binding it. Only a path can be marked: a literal is
+	/// a comparison already, and a destructure has no name to mark.
+	fn parse_const_pattern(
 		parser: &mut Parser,
-	) -> Result<Spanned<BindPattern>, ()> {
+		const_span: TextSpan,
+	) -> Result<Spanned<Pattern>, ()> {
+		let path = match Parser::parse_path(parser)? {
+			PathTerm::Path(path) => path,
+			PathTerm::Old(_) => return Err(()),
+		};
+		// A path of one segment is a name, which is ambiguous: the marker
+		// is what says it is a constant. A longer path is a constant
+		// already, and the marker says nothing.
+		let ambiguous = matches!(
+			&*path,
+			[segment] if segment.type_args.is_empty()
+		);
+		if !ambiguous {
+			parser
+				.ast
+				.diagnostics
+				.push(report_redundant_const(parser.ast.file_id, const_span));
+		}
+		let span = TextSpan::new(
+			const_span.start,
+			path.last().unwrap().ident.span.end,
+		);
+		Ok(Spanned {
+			inner: Pattern::ValuePath { path },
+			span,
+		})
+	}
+
+	/// A pattern, alternatives included: `|` joins them.
+	fn parse_pattern(parser: &mut Parser) -> Result<Spanned<Pattern>, ()> {
+		let first = Parser::parse_primary(parser)?;
+		if parser.lexer.peek().inner != Token::Vbar {
+			return Ok(first);
+		}
+		let start = first.span.start;
+		let mut alternatives = Vec::new();
+		let mut current = first;
+		while let Some(bar) = parser.lexer.next_if(Token::Vbar) {
+			alternatives.push(Separated {
+				inner: current,
+				separator: Some(bar.span),
+			});
+			current = Parser::parse_primary(parser)?;
+		}
+		let end = current.span.end;
+		alternatives.push(Separated {
+			inner: current,
+			separator: None,
+		});
+		Ok(Spanned {
+			inner: Pattern::Or(alternatives.into()),
+			span: TextSpan::new(start, end),
+		})
+	}
+
+	/// One term of a pattern. What it is follows from its own shape: a
+	/// literal compares with that value, a qualified path with that
+	/// constant, and a name binds — unless `const` says it is a constant.
+	fn parse_primary(parser: &mut Parser) -> Result<Spanned<Pattern>, ()> {
 		let token = parser.lexer.peek();
 		match token.inner {
 			Token::OpenParen => Parser::parse_tuple_pattern(parser),
+			Token::Int => {
+				let token = parser.lexer.next();
+				let value = parser.integer_literal(token.span);
+				Ok(Spanned {
+					inner: Pattern::Literal(PatternLiteral::Int {
+						minus_span: None,
+						value,
+					}),
+					span: token.span,
+				})
+			}
+			Token::Char => {
+				let span = parser.lexer.next().span;
+				Ok(Spanned {
+					inner: Pattern::Literal(PatternLiteral::Char),
+					span,
+				})
+			}
+			Token::Float | Token::String => {
+				// A float has no single value to compare with and a string
+				// has no equality at all, so neither can be matched — but
+				// that is the checker's judgement, not the parser's: the
+				// pattern is read, and the rest of the file still parses.
+				let token = parser.lexer.next();
+				let literal = match token.inner {
+					Token::Float => PatternLiteral::Float,
+					_ => PatternLiteral::String,
+				};
+				Ok(Spanned {
+					inner: Pattern::Literal(literal),
+					span: token.span,
+				})
+			}
+			Token::Minus => {
+				let minus = parser.lexer.next().span;
+				match parser.lexer.peek().inner {
+					Token::Int => {
+						let token = parser.lexer.next();
+						let value = parser.integer_literal(token.span);
+						Ok(Spanned {
+							inner: Pattern::Literal(PatternLiteral::Int {
+								minus_span: Some(minus),
+								value,
+							}),
+							span: TextSpan::new(minus.start, token.span.end),
+						})
+					}
+					Token::Float => {
+						let token = parser.lexer.next();
+						let span = TextSpan::new(minus.start, token.span.end);
+						Ok(Spanned {
+							inner: Pattern::Literal(PatternLiteral::Float),
+							span,
+						})
+					}
+					_ => {
+						// `-` must be followed by the number it negates.
+						let token = parser.lexer.next();
+						parser.ast.diagnostics.push(report_unexpected_token(
+							parser.ast.file_id,
+							token,
+							Token::Int,
+						));
+						Err(())
+					}
+				}
+			}
 			Token::Identifier => {
 				let text = token.span.extract_str(parser.source);
 				match Keyword::try_from(text) {
 					Ok(Keyword::Underscore) => {
 						let span = parser.lexer.next().span;
 						Ok(Spanned {
-							inner: BindPattern::Wildcard,
+							inner: Pattern::Wildcard,
 							span,
 						})
 					}
@@ -5007,287 +5111,35 @@ impl<'ctx> Parser<'ctx> {
 							span: name_span,
 						};
 						Ok(Spanned {
-							inner: BindPattern::Binding {
+							inner: Pattern::Binding {
 								mut_span: Some(mut_span),
 								name,
 							},
 							span: TextSpan::new(mut_span.start, name_span.end),
 						})
 					}
-					Ok(Keyword::Case) => {
-						let case_span = parser.lexer.next().span;
-						let pattern = Parser::parse_value_pattern(parser)?;
-						let span =
-							TextSpan::new(case_span.start, pattern.span.end);
-						Ok(Spanned {
-							inner: BindPattern::Marked(Marked::Case {
-								case_span,
-								pattern: Box::new(pattern),
-							}),
-							span,
-						})
+					Ok(Keyword::Const) => {
+						let const_span = parser.lexer.next().span;
+						Parser::parse_const_pattern(parser, const_span)
 					}
 					Ok(Keyword::Local) => {
-						let local_span = parser.lexer.next().span;
-						parser.ast.diagnostics.push(
-							report_redundant_pattern_marker(
-								parser.ast.file_id,
-								local_span,
-								Keyword::Local,
-							),
-						);
-						let pattern = Parser::parse_bind_pattern(parser)?;
-						let span =
-							TextSpan::new(local_span.start, pattern.span.end);
-						Ok(Spanned {
-							inner: BindPattern::Marked(Marked::Local {
-								local_span,
-								pattern: Box::new(pattern),
-							}),
+						let span = parser.lexer.next().span;
+						parser.ast.diagnostics.push(report_redundant_local(
+							parser.ast.file_id,
 							span,
-						})
+						));
+						Err(())
 					}
 					Ok(Keyword::True) | Ok(Keyword::False) => {
 						let span = parser.lexer.next().span;
-						parser.ast.diagnostics.push(
-							report_value_pattern_needs_case(
-								parser.ast.file_id,
-								span,
-							),
-						);
 						Ok(Spanned {
-							inner: BindPattern::Wildcard,
-							span,
-						})
-					}
-					_ => match Parser::parse_path_pattern(parser)? {
-						PathPattern::Destructure(pattern) => Ok(pattern),
-						PathPattern::Path(path) => {
-							let span = TextSpan::new(
-								path[0].ident.span.start,
-								path.last().unwrap().ident.span.end,
-							);
-							match &*path {
-								[segment] if segment.type_args.is_empty() => {
-									Ok(Spanned {
-										inner: BindPattern::Binding {
-											mut_span: None,
-											name: segment.ident,
-										},
-										span,
-									})
-								}
-								_ => {
-									parser.ast.diagnostics.push(
-										report_value_pattern_needs_case(
-											parser.ast.file_id,
-											span,
-										),
-									);
-									Ok(Spanned {
-										inner: BindPattern::Wildcard,
-										span,
-									})
-								}
-							}
-						}
-					},
-				}
-			}
-			Token::Int | Token::Float | Token::Char | Token::String => {
-				let span = parser.lexer.next().span;
-				parser.ast.diagnostics.push(report_value_pattern_needs_case(
-					parser.ast.file_id,
-					span,
-				));
-				Ok(Spanned {
-					inner: BindPattern::Wildcard,
-					span,
-				})
-			}
-			Token::Minus => {
-				let minus = parser.lexer.next().span;
-				let end = match parser.lexer.peek().inner {
-					Token::Int | Token::Float => parser.lexer.next().span.end,
-					_ => minus.end,
-				};
-				let span = TextSpan::new(minus.start, end);
-				parser.ast.diagnostics.push(report_value_pattern_needs_case(
-					parser.ast.file_id,
-					span,
-				));
-				Ok(Spanned {
-					inner: BindPattern::Wildcard,
-					span,
-				})
-			}
-			_ => {
-				let token = parser.lexer.next();
-				parser.ast.diagnostics.push(report_unexpected_token(
-					parser.ast.file_id,
-					token,
-					Token::Identifier,
-				));
-				Err(())
-			}
-		}
-	}
-
-	/// A pattern in value mode, alternatives included: `case` binds looser
-	/// than `|`, so `case 5 | 10` is `case (5 | 10)`.
-	fn parse_value_pattern(
-		parser: &mut Parser,
-	) -> Result<Spanned<ValuePattern>, ()> {
-		let first = Parser::parse_value_alternative(parser)?;
-		if parser.lexer.peek().inner != Token::Vbar {
-			return Ok(first);
-		}
-		let start = first.span.start;
-		let mut alternatives = Vec::new();
-		let mut current = first;
-		while let Some(bar) = parser.lexer.next_if(Token::Vbar) {
-			alternatives.push(Separated {
-				inner: current,
-				separator: Some(bar.span),
-			});
-			current = Parser::parse_value_alternative(parser)?;
-		}
-		let end = current.span.end;
-		alternatives.push(Separated {
-			inner: current,
-			separator: None,
-		});
-		Ok(Spanned {
-			inner: ValuePattern::Or(alternatives.into()),
-			span: TextSpan::new(start, end),
-		})
-	}
-
-	/// One alternative of a value-mode pattern.
-	fn parse_value_alternative(
-		parser: &mut Parser,
-	) -> Result<Spanned<ValuePattern>, ()> {
-		let token = parser.lexer.peek();
-		match token.inner {
-			Token::OpenParen => Parser::parse_tuple_pattern(parser),
-			Token::Int => {
-				let token = parser.lexer.next();
-				let value = parser.integer_literal(token.span);
-				Ok(Spanned {
-					inner: ValuePattern::Literal(PatternLiteral::Int {
-						minus_span: None,
-						value,
-					}),
-					span: token.span,
-				})
-			}
-			Token::Minus => {
-				let minus_span = parser.lexer.next().span;
-				let token = parser.next_expect(Token::Int)?;
-				let value = parser.integer_literal(token.span);
-				Ok(Spanned {
-					inner: ValuePattern::Literal(PatternLiteral::Int {
-						minus_span: Some(minus_span),
-						value,
-					}),
-					span: TextSpan::new(minus_span.start, token.span.end),
-				})
-			}
-			Token::Char => {
-				let span = parser.lexer.next().span;
-				Ok(Spanned {
-					inner: ValuePattern::Literal(PatternLiteral::Char),
-					span,
-				})
-			}
-			Token::Identifier => {
-				let text = token.span.extract_str(parser.source);
-				match Keyword::try_from(text) {
-					Ok(Keyword::Underscore) => {
-						let span = parser.lexer.next().span;
-						Ok(Spanned {
-							inner: ValuePattern::Wildcard,
-							span,
-						})
-					}
-					Ok(keyword @ (Keyword::True | Keyword::False)) => {
-						let span = parser.lexer.next().span;
-						Ok(Spanned {
-							inner: ValuePattern::Literal(PatternLiteral::Bool(
-								matches!(keyword, Keyword::True),
+							inner: Pattern::Literal(PatternLiteral::Bool(
+								matches!(text, "true"),
 							)),
 							span,
 						})
 					}
-					Ok(Keyword::Case) => {
-						let case_span = parser.lexer.next().span;
-						parser.ast.diagnostics.push(
-							report_redundant_pattern_marker(
-								parser.ast.file_id,
-								case_span,
-								Keyword::Case,
-							),
-						);
-						let pattern = Parser::parse_value_pattern(parser)?;
-						let span =
-							TextSpan::new(case_span.start, pattern.span.end);
-						Ok(Spanned {
-							inner: ValuePattern::Marked(Marked::Case {
-								case_span,
-								pattern: Box::new(pattern),
-							}),
-							span,
-						})
-					}
-					Ok(Keyword::Local) => {
-						let local_span = parser.lexer.next().span;
-						let pattern = Parser::parse_bind_pattern(parser)?;
-						let span =
-							TextSpan::new(local_span.start, pattern.span.end);
-						Ok(Spanned {
-							inner: ValuePattern::Marked(Marked::Local {
-								local_span,
-								pattern: Box::new(pattern),
-							}),
-							span,
-						})
-					}
-					Ok(Keyword::Mut) => {
-						let span = parser.lexer.next().span;
-						parser.ast.diagnostics.push(
-							Diagnostic::error()
-								.with_code(
-									DiagnosticCode::InvalidBindingPattern
-										.code(),
-								)
-								.with_message(
-									"a binding under `case` needs `local`",
-								)
-								.with_label(Label::primary(
-									parser.ast.file_id,
-									span,
-								))
-								.with_note("write `local mut name`"),
-						);
-						let name = parser.next_expect(Token::Identifier)?.span;
-						Ok(Spanned {
-							inner: ValuePattern::Wildcard,
-							span: TextSpan::new(span.start, name.end),
-						})
-					}
-					_ => match Parser::parse_path_pattern(parser)? {
-						PathPattern::Destructure(pattern) => Ok(pattern),
-						PathPattern::Path(path) => {
-							let span = TextSpan::new(
-								path[0].ident.span.start,
-								path.last().unwrap().ident.span.end,
-							);
-							Ok(Spanned {
-								inner: ValuePattern::Path(path),
-								span,
-							})
-						}
-					},
+					_ => Parser::parse_path_pattern(parser),
 				}
 			}
 			_ => {
@@ -5307,7 +5159,7 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<Statement>, ()> {
 		let local_keyword = parser.lexer.next();
 
-		let pattern = Parser::parse_bind_pattern(parser)?;
+		let pattern = Parser::parse_pattern(parser)?;
 
 		let ty = match parser.lexer.next_if(Token::Colon) {
 			Some(_) => Some(Box::new(parser.parse_type_expression()?)),

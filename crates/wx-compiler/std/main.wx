@@ -144,16 +144,16 @@ impl Ordering {
     #[inline]
     pub func reverse(self) -> Ordering {
         match self {
-            case Ordering::Less -> { Ordering::Greater },
-            case Ordering::Equal -> { Ordering::Equal },
-            case Ordering::Greater -> { Ordering::Less }
+            Ordering::Less -> { Ordering::Greater },
+            Ordering::Equal -> { Ordering::Equal },
+            Ordering::Greater -> { Ordering::Less }
         }
     }
 
     #[inline]
     pub func then(self, other: Ordering) -> Ordering {
         match self {
-            case Ordering::Equal -> { other },
+            Ordering::Equal -> { other },
             _ -> { self }
         }
     }

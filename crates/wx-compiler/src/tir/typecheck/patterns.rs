@@ -2,13 +2,14 @@
 //!
 //! A pattern is checked against the type it is given (a `local`'s value's, a
 //! match's scrutinee's), from the outside in, into the body's pattern arena.
-//! The mode it was written in is gone by then: the parser decided what every
-//! name is, so a marker is looked through. Destructuring has one child per
-//! element or field of its type, in declaration order, whatever was written:
-//! what `..` covers, and a field a named pattern leaves out, is a `Wildcard`.
+//! What each term is was decided while parsing: a name binds, a literal
+//! tests, a qualified path compares with a constant. Destructuring has one
+//! child per element or field of its type, in declaration order, whatever was
+//! written: what `..` covers, and a field a named pattern leaves out, is a
+//! `Wildcard`.
 //!
-//! A value path never sees locals: `case y` names a constant `y`, and a local
-//! of that name only earns a note on the "cannot find" report.
+//! A value path never sees locals: `const y` names a constant `y`, and a
+//! local of that name only earns a note on the "cannot find" report.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
@@ -24,7 +25,12 @@ use crate::tir::types::{Type, TypeEnvOwner, TypeIndex, TypeList};
 
 /// Where a pattern is written, and the names it has bound so far.
 pub(super) struct PatternSite {
+	/// Whether the pattern may test a value. A match arm may; a `local`
+	/// always matches, so a test in one is a mistake.
 	refutable: bool,
+	/// Whether a test in a `local` has already been reported: one mistake is
+	/// one report, however many tests the pattern holds.
+	reported_refutable: bool,
 	/// Every name the pattern binds, to report one bound twice.
 	bindings: Vec<Spanned<SymbolU32>>,
 }
@@ -35,6 +41,7 @@ impl PatternSite {
 	pub(super) fn local() -> Self {
 		Self {
 			refutable: false,
+			reported_refutable: false,
 			bindings: Vec::new(),
 		}
 	}
@@ -43,74 +50,9 @@ impl PatternSite {
 	pub(super) fn arm() -> Self {
 		Self {
 			refutable: true,
+			reported_refutable: false,
 			bindings: Vec::new(),
 		}
-	}
-}
-
-/// The syntax of one mode, so destructuring, which reads the same in both, is
-/// checked once.
-trait PatternSyntax {
-	fn check(
-		cx: &mut BodyContext<'_, '_, '_, '_>,
-		pattern: &Self,
-		span: TextSpan,
-		expected: TypeIndex,
-		site: &mut PatternSite,
-	) -> PatIdx;
-
-	/// `{ x }` in a named struct pattern: `{ x: x }` in this mode.
-	fn check_shorthand(
-		cx: &mut BodyContext<'_, '_, '_, '_>,
-		name: Spanned<SymbolU32>,
-		expected: TypeIndex,
-		site: &mut PatternSite,
-	) -> PatIdx;
-}
-
-impl PatternSyntax for ast::BindPattern {
-	fn check(
-		cx: &mut BodyContext<'_, '_, '_, '_>,
-		pattern: &Self,
-		span: TextSpan,
-		expected: TypeIndex,
-		site: &mut PatternSite,
-	) -> PatIdx {
-		cx.check_bind_pattern(pattern, span, expected, site)
-	}
-
-	fn check_shorthand(
-		cx: &mut BodyContext<'_, '_, '_, '_>,
-		name: Spanned<SymbolU32>,
-		expected: TypeIndex,
-		site: &mut PatternSite,
-	) -> PatIdx {
-		cx.bind(name, None, expected, name.span, site)
-	}
-}
-
-impl PatternSyntax for ast::ValuePattern {
-	fn check(
-		cx: &mut BodyContext<'_, '_, '_, '_>,
-		pattern: &Self,
-		span: TextSpan,
-		expected: TypeIndex,
-		site: &mut PatternSite,
-	) -> PatIdx {
-		cx.check_value_pattern(pattern, span, expected, site)
-	}
-
-	fn check_shorthand(
-		cx: &mut BodyContext<'_, '_, '_, '_>,
-		name: Spanned<SymbolU32>,
-		expected: TypeIndex,
-		_site: &mut PatternSite,
-	) -> PatIdx {
-		let path = [ast::PathSegment {
-			ident: name,
-			type_args: Box::new([]),
-		}];
-		cx.check_value_path(&path, name.span, expected)
 	}
 }
 
@@ -119,102 +61,42 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// current scope.
 	pub(super) fn check_pattern(
 		&mut self,
-		pattern: &Spanned<ast::BindPattern>,
+		pattern: &Spanned<ast::Pattern>,
 		expected: TypeIndex,
 		site: &mut PatternSite,
 	) -> PatIdx {
-		self.check_bind_pattern(&pattern.inner, pattern.span, expected, site)
+		self.check_one_pattern(&pattern.inner, pattern.span, expected, site)
 	}
 
-	fn check_bind_pattern(
+	fn check_one_pattern(
 		&mut self,
-		pattern: &ast::BindPattern,
+		pattern: &ast::Pattern,
 		span: TextSpan,
 		expected: TypeIndex,
 		site: &mut PatternSite,
 	) -> PatIdx {
 		match pattern {
-			ast::BindPattern::Wildcard => {
+			ast::Pattern::Wildcard => {
 				self.body.push_pattern(PatKind::Wildcard, expected, span)
 			}
-			ast::BindPattern::Binding { mut_span, name } => {
+			ast::Pattern::Binding { mut_span, name } => {
 				self.bind(*name, *mut_span, expected, span, site)
 			}
-			ast::BindPattern::Destructure(destructure) => {
-				self.check_destructure(destructure, span, expected, site)
-			}
-			ast::BindPattern::Marked(ast::Marked::Local {
-				pattern, ..
-			}) => self.check_bind_pattern(
-				&pattern.inner,
-				pattern.span,
-				expected,
-				site,
-			),
-			ast::BindPattern::Marked(ast::Marked::Case {
-				case_span,
-				pattern,
-			}) => {
-				if site.refutable {
-					return self.check_value_pattern(
-						&pattern.inner,
-						pattern.span,
-						expected,
-						site,
-					);
-				}
-				self.cx.diagnostics.push(
-					Diagnostic::error()
-						.with_code(
-							DiagnosticCode::RefutablePatternInLocal.code(),
-						)
-						.with_message("a `local` pattern cannot test a value")
-						.with_label(
-							Label::primary(self.scope.file_id, *case_span)
-								.with_message("this tests a value"),
-						)
-						.with_note(
-							"a `local` always matches; test values with \
-							 `match`",
-						),
-				);
-				// Its bindings are still declared, so their uses resolve.
-				self.check_value_pattern(
-					&pattern.inner,
-					pattern.span,
-					TypeIndex::ERROR,
-					site,
-				);
-				self.body
-					.push_pattern(PatKind::Error, TypeIndex::ERROR, span)
-			}
-		}
-	}
-
-	fn check_value_pattern(
-		&mut self,
-		pattern: &ast::ValuePattern,
-		span: TextSpan,
-		expected: TypeIndex,
-		site: &mut PatternSite,
-	) -> PatIdx {
-		match pattern {
-			ast::ValuePattern::Wildcard => {
-				self.body.push_pattern(PatKind::Wildcard, expected, span)
-			}
-			ast::ValuePattern::Literal(literal) => {
-				self.check_literal(literal, span, expected)
-			}
-			ast::ValuePattern::Path(path) => {
+			ast::Pattern::ValuePath { path } => {
+				let expected = self.check_refutable(site, span, expected);
 				self.check_value_path(path, span, expected)
 			}
-			ast::ValuePattern::Or(alternatives) => {
+			ast::Pattern::Literal(literal) => {
+				let expected = self.check_refutable(site, span, expected);
+				self.check_literal(literal, span, expected)
+			}
+			ast::Pattern::Or(alternatives) => {
 				let mut checked = Vec::with_capacity(alternatives.len());
 				let mut binds = false;
 				for alternative in alternatives {
 					let alternative = &alternative.inner;
 					let bound = site.bindings.len();
-					checked.push(self.check_value_pattern(
+					checked.push(self.check_one_pattern(
 						&alternative.inner,
 						alternative.span,
 						expected,
@@ -247,26 +129,39 @@ impl BodyContext<'_, '_, '_, '_> {
 					span,
 				)
 			}
-			ast::ValuePattern::Destructure(destructure) => {
+			ast::Pattern::Destructure(destructure) => {
 				self.check_destructure(destructure, span, expected, site)
 			}
-			ast::ValuePattern::Marked(ast::Marked::Case {
-				pattern, ..
-			}) => self.check_value_pattern(
-				&pattern.inner,
-				pattern.span,
-				expected,
-				site,
-			),
-			ast::ValuePattern::Marked(ast::Marked::Local {
-				pattern, ..
-			}) => self.check_bind_pattern(
-				&pattern.inner,
-				pattern.span,
-				expected,
-				site,
-			),
+			ast::Pattern::Error => self.error_pattern(span),
 		}
+	}
+
+	/// A `local` always matches, so a test in one is a mistake. The rest of
+	/// the pattern is still checked, so the bindings it makes resolve; the
+	/// test itself is checked against `ERROR`, so it says nothing more.
+	fn check_refutable(
+		&mut self,
+		site: &mut PatternSite,
+		span: TextSpan,
+		expected: TypeIndex,
+	) -> TypeIndex {
+		if site.refutable || site.reported_refutable {
+			return expected;
+		}
+		site.reported_refutable = true;
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::RefutablePatternInLocal.code())
+				.with_message("a `local` pattern cannot test a value")
+				.with_label(
+					Label::primary(self.scope.file_id, span)
+						.with_message("this tests a value"),
+				)
+				.with_note(
+					"a `local` always matches; test values with `match`",
+				),
+		);
+		TypeIndex::ERROR
 	}
 
 	/// A binding: a local of the matched part's type.
@@ -301,9 +196,9 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	/// A tuple or struct pattern, with one child per element or field.
-	fn check_destructure<P: PatternSyntax>(
+	fn check_destructure(
 		&mut self,
-		destructure: &ast::Destructure<P>,
+		destructure: &ast::Destructure,
 		span: TextSpan,
 		expected: TypeIndex,
 		site: &mut PatternSite,
@@ -391,16 +286,16 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// or a struct's fields: the written ones before the first `..` take the
 	/// first types, those after it the last, and `..` covers what is between.
 	/// `None` when the counts cannot fit (reported, every child still checked).
-	fn check_elements<P: PatternSyntax>(
+	fn check_elements(
 		&mut self,
-		elements: &ast::PatternElements<P>,
+		elements: &ast::PatternElements,
 		types: &[TypeIndex],
 		span: TextSpan,
 		site: &mut PatternSite,
 		struct_index: Option<StructIdx>,
 	) -> Option<Vec<PatIdx>> {
 		let mut rest: Option<(usize, TextSpan)> = None;
-		let mut written: Vec<(&P, TextSpan)> = Vec::new();
+		let mut written: Vec<(&ast::Pattern, TextSpan)> = Vec::new();
 		for item in elements {
 			match &item.inner.inner {
 				ast::PatternElement::Pattern(pattern) => {
@@ -428,7 +323,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				struct_index,
 			);
 			for (pattern, span) in written {
-				P::check(self, pattern, span, TypeIndex::ERROR, site);
+				self.check_one_pattern(pattern, span, TypeIndex::ERROR, site);
 			}
 			return None;
 		}
@@ -436,7 +331,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		let after = written.len() - before;
 		let mut children = Vec::with_capacity(count);
 		for (at, &(pattern, span)) in written[..before].iter().enumerate() {
-			children.push(P::check(self, pattern, span, types[at], site));
+			children
+				.push(self.check_one_pattern(pattern, span, types[at], site));
 		}
 		if let Some((_, rest_span)) = rest {
 			for &ty in &types[before..count - after] {
@@ -449,7 +345,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		for (at, &(pattern, span)) in written[before..].iter().enumerate() {
 			let ty = types[count - after + at];
-			children.push(P::check(self, pattern, span, ty, site));
+			children.push(self.check_one_pattern(pattern, span, ty, site));
 		}
 		Some(children)
 	}
@@ -457,9 +353,9 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// The children of `Name({ x, y: pat, .. })`, one per field in
 	/// declaration order. A field not named is covered by `..`; without one
 	/// it is reported and matched as `_`.
-	fn check_fields<P: PatternSyntax>(
+	fn check_fields(
 		&mut self,
-		fields: &ast::PatternFields<P>,
+		fields: &ast::PatternFields,
 		struct_index: StructIdx,
 		types: &[TypeIndex],
 		span: TextSpan,
@@ -591,17 +487,23 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	/// `x` or `x: pat` in a named struct pattern, against the field's type.
-	fn check_field<P: PatternSyntax>(
+	fn check_field(
 		&mut self,
-		field: &ast::PatternField<P>,
+		field: &ast::PatternField,
 		expected: TypeIndex,
 		site: &mut PatternSite,
 	) -> PatIdx {
 		match &field.pattern {
-			Some(pattern) => {
-				P::check(self, &pattern.inner, pattern.span, expected, site)
+			Some(pattern) => self.check_one_pattern(
+				&pattern.inner,
+				pattern.span,
+				expected,
+				site,
+			),
+			// `{ x }` — the field binds a local of its own name.
+			None => {
+				self.bind(field.name, None, expected, field.name.span, site)
 			}
-			None => P::check_shorthand(self, field.name, expected, site),
 		}
 	}
 
@@ -734,6 +636,23 @@ impl BodyContext<'_, '_, '_, '_> {
 					return self.error_pattern(span);
 				}
 				PatKind::Bool(value)
+			}
+			ast::PatternLiteral::Float => {
+				self.report_unmatchable_literal(
+					span,
+					"a float",
+					"float equality is partial: `0.1 + 0.2` is not `0.3`, so \
+					 a float has no single value to compare with",
+				);
+				return self.error_pattern(span);
+			}
+			ast::PatternLiteral::String => {
+				self.report_unmatchable_literal(
+					span,
+					"a string",
+					"a string has no equality to compare with",
+				);
+				return self.error_pattern(span);
 			}
 			ast::PatternLiteral::Char => {
 				if expected != TypeIndex::CHAR {
@@ -895,7 +814,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let name = self.cx.strings.resolve(segment.ident.inner).unwrap();
 		let note = format!(
 			"`{name}` is a local; a pattern compares with constants, and \
-			 `local {name}` would bind a new one"
+			 `{name}` would bind a new one"
 		);
 		let site = std::ops::Range::from(segment.ident.span);
 		if let Some(report) = self.cx.diagnostics.last_mut()
@@ -908,16 +827,15 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// The children of a pattern that matched nothing it could take apart,
 	/// checked against `ERROR` so their bindings are still declared.
-	fn check_poisoned<P: PatternSyntax>(
+	fn check_poisoned(
 		&mut self,
-		elements: &ast::PatternElements<P>,
+		elements: &ast::PatternElements,
 		span: TextSpan,
 		site: &mut PatternSite,
 	) -> PatIdx {
 		for item in elements {
 			if let ast::PatternElement::Pattern(pattern) = &item.inner.inner {
-				P::check(
-					self,
+				self.check_one_pattern(
 					pattern,
 					item.inner.span,
 					TypeIndex::ERROR,
@@ -931,6 +849,23 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn error_pattern(&mut self, span: TextSpan) -> PatIdx {
 		self.body
 			.push_pattern(PatKind::Error, TypeIndex::ERROR, span)
+	}
+
+	/// A float has no single value to compare with, and a string has no
+	/// equality at all, so neither can be matched.
+	fn report_unmatchable_literal(
+		&mut self,
+		span: TextSpan,
+		kind: &str,
+		note: &str,
+	) {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::UnmatchableLiteral.code())
+				.with_message(format!("{kind} cannot be matched"))
+				.with_label(Label::primary(self.scope.file_id, span))
+				.with_note(note),
+		);
 	}
 
 	fn report_pattern_mismatch(

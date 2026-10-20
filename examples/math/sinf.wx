@@ -60,9 +60,9 @@ pub func sinf(x: f32) -> f32 {
     // general argument reduction needed
     local (n, y) = rem_pio2f(x);
     match n & 3 {
-        case 0 -> { k_sinf(y) },
-        case 1 -> { k_cosf(y) },
-        case 2 -> { k_sinf(-y) },
+        0 -> { k_sinf(y) },
+        1 -> { k_cosf(y) },
+        2 -> { k_sinf(-y) },
         _ -> { -k_cosf(y) }
     }
 }

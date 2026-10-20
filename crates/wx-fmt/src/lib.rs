@@ -48,7 +48,6 @@ define_text! {
 		TypeKw  => "type ",
 		Typeset => "typeset ",
 		Local   => "local ",
-		Case    => "case ",
 		Loop    => "loop ",
 		If      => "if ",
 		Match   => "match ",
@@ -2603,103 +2602,68 @@ impl<'a> Builder<'a> {
 		}
 	}
 
-	/// A binding-mode pattern. A redundant `local` (one inside binding mode
-	/// already) is left out: only a marker that switches modes is printed.
+	/// A pattern. What each term is follows from its own shape, so there is
+	/// one way to print each of them: a name binds, a literal is printed as
+	/// it was written, a qualified path compares with that constant, and a
+	/// one-segment path is a constant marked with `const`.
 	fn build_pattern(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		pattern: &ast::BindPattern,
-		// Taken for `build_destructure`'s `child`; nothing here prints source.
-		_span: TextSpan,
+		pattern: &ast::Pattern,
+		span: TextSpan,
 	) {
 		match pattern {
-			ast::BindPattern::Wildcard => out.push(self.text(Text::Underscore)),
-			ast::BindPattern::Binding { mut_span, name } => {
+			ast::Pattern::Wildcard => out.push(self.text(Text::Underscore)),
+			ast::Pattern::Binding { mut_span, name } => {
 				if mut_span.is_some() {
 					out.push(self.text(Text::Mut));
 				}
 				out.push(self.symbol(name.inner));
 			}
-			ast::BindPattern::Destructure(destructure) => {
-				self.build_destructure(out, destructure, Self::build_pattern);
-			}
-			ast::BindPattern::Marked(ast::Marked::Case {
-				pattern: inner,
-				..
-			}) => {
-				out.push(self.text(Text::Case));
-				self.build_value_pattern(out, &inner.inner, inner.span);
-			}
-			ast::BindPattern::Marked(ast::Marked::Local {
-				pattern: inner,
-				..
-			}) => self.build_pattern(out, &inner.inner, inner.span),
-		}
-	}
-
-	/// A value-mode pattern; a redundant `case` is left out, as in
-	/// [`Self::build_pattern`].
-	fn build_value_pattern(
-		&mut self,
-		out: &mut Vec<NodeId>,
-		pattern: &ast::ValuePattern,
-		span: TextSpan,
-	) {
-		match pattern {
-			ast::ValuePattern::Wildcard => {
-				out.push(self.text(Text::Underscore))
-			}
-			ast::ValuePattern::Literal(_) => {
-				out.push(self.source_text(span));
-			}
-			ast::ValuePattern::Path(path) => {
+			ast::Pattern::ValuePath { path } => {
+				// A path of one segment can only be a constant the author
+				// marked with `const`; a longer one is a constant already.
+				if let [segment] = &**path
+					&& segment.type_args.is_empty()
+				{
+					out.push(self.text(Text::Const));
+				}
 				out.push(self.build_value_path(path));
 			}
-			ast::ValuePattern::Or(alternatives) => {
+			ast::Pattern::Literal(_) => {
+				out.push(self.source_text(span));
+			}
+			ast::Pattern::Or(alternatives) => {
 				for (i, alternative) in alternatives.iter().enumerate() {
 					if i > 0 {
 						out.push(self.text(Text::VbarSp));
 					}
 					let alternative = &alternative.inner;
-					self.build_value_pattern(
+					self.build_pattern(
 						out,
 						&alternative.inner,
 						alternative.span,
 					);
 				}
 			}
-			ast::ValuePattern::Destructure(destructure) => {
-				self.build_destructure(
-					out,
-					destructure,
-					Self::build_value_pattern,
-				);
+			ast::Pattern::Destructure(destructure) => {
+				self.build_destructure(out, destructure);
 			}
-			ast::ValuePattern::Marked(ast::Marked::Case {
-				pattern: inner,
-				..
-			}) => self.build_value_pattern(out, &inner.inner, inner.span),
-			ast::ValuePattern::Marked(ast::Marked::Local {
-				pattern: inner,
-				..
-			}) => {
-				out.push(self.text(Text::Local));
-				self.build_pattern(out, &inner.inner, inner.span);
+			ast::Pattern::Error => {
+				out.push(self.source_text(span));
 			}
 		}
 	}
 
-	/// Destructuring, the same in both modes; `child` prints each
-	/// subpattern in the mode it inherits.
-	fn build_destructure<P>(
+	/// Destructuring; each of its children is a pattern of its own.
+	fn build_destructure(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		destructure: &ast::Destructure<P>,
-		child: fn(&mut Self, &mut Vec<NodeId>, &P, TextSpan),
+		destructure: &ast::Destructure,
 	) {
 		let elements = |this: &mut Self,
 		                out: &mut Vec<NodeId>,
-		                elements: &ast::PatternElements<P>| {
+		                elements: &ast::PatternElements| {
 			out.push(this.text(Text::LParen));
 			for (i, element) in elements.iter().enumerate() {
 				if i > 0 {
@@ -2707,7 +2671,7 @@ impl<'a> Builder<'a> {
 				}
 				match &element.inner.inner {
 					ast::PatternElement::Pattern(pattern) => {
-						child(this, out, pattern, element.inner.span);
+						this.build_pattern(out, pattern, element.inner.span);
 					}
 					ast::PatternElement::Rest => {
 						out.push(this.text(Text::DotDot));
@@ -2742,7 +2706,11 @@ impl<'a> Builder<'a> {
 							out.push(self.symbol(field.name.inner));
 							if let Some(pattern) = &field.pattern {
 								out.push(self.text(Text::ColonSp));
-								child(self, out, &pattern.inner, pattern.span);
+								self.build_pattern(
+									out,
+									&pattern.inner,
+									pattern.span,
+								);
 							}
 						}
 						ast::PatternFieldItem::Rest => {

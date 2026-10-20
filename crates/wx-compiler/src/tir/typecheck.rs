@@ -4367,7 +4367,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(t: (u32, u32)) -> u32 {
-					local (a, case 0) = t;
+					local (a, 0) = t;
 					a
 				}
 			"}
@@ -4386,8 +4386,8 @@ mod tests {
 			case = indoc! {"
 				func sign(x: i32) -> i32 {
 					match x {
-						case 0 -> { 0 },
-						case -1 | -128 -> { 1 },
+						0 -> { 0 },
+						-1 | -128 -> { 1 },
 						n -> { n },
 					}
 				}
@@ -4416,10 +4416,10 @@ mod tests {
 				impl S { const ZERO: u8 = 0; }
 				func f<T: Lim>(p: P) -> u8 {
 					match p {
-						case P(0, Dir::North) -> { 1 },
-						case P(LIMIT, local d) -> { 2 },
-						P(x, case Dir::South) -> { x },
-						case P(S::ZERO | T::MAX, _) -> { 3 },
+						P(0, Dir::North) -> { 1 },
+						P(const LIMIT, d) -> { 2 },
+						P(x, Dir::South) -> { x },
+						P(S::ZERO | T::MAX, _) -> { 3 },
 						_ -> { 4 },
 					}
 				}
@@ -4438,6 +4438,44 @@ mod tests {
 	}
 
 	#[test]
+	fn tmp_probe() {
+		test_case!(
+			case = indoc! {r#"
+				const MAX: u32 = 7;
+				const V: u32 = 7;
+				global g: u32 = match V { MAX -> 1, 7 -> 2 };
+				func f(v: u32) -> u32 {
+					match V { MAX -> 1, 7 -> 2 }
+				}
+			"#}
+		);
+		println!("SHAPE: {}", case.shape("f"));
+		case.diagnostics().assert_error_saying("zzz-not-there");
+	}
+
+	#[test]
+	fn a_float_or_a_string_cannot_be_matched() {
+		// The parser reads them; a float has no single value to compare
+		// with, and a string has no equality at all.
+		test_case!(
+			case = indoc! {r#"
+				func f(x: f32, s: u8) {
+					match x { 1.5 -> {}, _ -> {} }
+					match s { "hi" -> {}, _ -> {} }
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnmatchableLiteral,
+			DiagnosticCode::UnmatchableLiteral,
+		]);
+		case.diagnostics()
+			.assert_error_saying("a float cannot be matched");
+		case.diagnostics()
+			.assert_error_saying("a string cannot be matched");
+	}
+
+	#[test]
 	fn a_value_in_a_pattern_is_a_constant_of_the_matched_type() {
 		test_case!(
 			case = indoc! {"
@@ -4445,12 +4483,12 @@ mod tests {
 				func g() {}
 				func f(x: u8, b: bool) {
 					local y: u8 = 1;
-					match x { case y -> {}, _ -> {} }
-					match x { case g -> {}, _ -> {} }
-					match x { case 300 -> {}, case -1 -> {}, _ -> {} }
-					match x { case true -> {}, _ -> {} }
-					match b { case C -> {}, _ -> {} }
-					match x { case 1 | local z -> {}, _ -> {} }
+					match x { const y -> {}, _ -> {} }
+					match x { const g -> {}, _ -> {} }
+					match x { 300 -> {}, -1 -> {}, _ -> {} }
+					match x { true -> {}, _ -> {} }
+					match b { const C -> {}, _ -> {} }
+					match x { 1 | z -> {}, _ -> {} }
 				}
 			"}
 		);
@@ -4464,8 +4502,8 @@ mod tests {
 			DiagnosticCode::InvalidMatchPattern,
 		]);
 		case.diagnostics().assert_error_saying(
-			"`y` is a local; a pattern compares with constants, and `local y` \
-			 would bind a new one",
+			"`y` is a local; a pattern compares with constants, and `y` would \
+			 bind a new one",
 		);
 	}
 
@@ -4473,11 +4511,11 @@ mod tests {
 	fn match_arms_share_a_type() {
 		test_case!(
 			case = indoc! {"
-				func f(x: u8) -> u64 { match x { case 0 -> { 1 }, _ -> { 2 } } }
+				func f(x: u8) -> u64 { match x { 0 -> { 1 }, _ -> { 2 } } }
 				func g(x: u8) -> u8 {
-					match x { case 0 -> { return 0 }, _ -> { x } }
+					match x { 0 -> { return 0 }, _ -> { x } }
 				}
-				func h(x: u8) { local v = match x { case 0 -> { 1 }, _ -> { true } }; }
+				func h(x: u8) { local v = match x { 0 -> { 1 }, _ -> { true } }; }
 			"}
 		);
 		case.diagnostics()
@@ -4510,20 +4548,20 @@ mod tests {
 				enum Dir: u8 { North = 0, East, South, West }
 				struct P(x: bool, y: bool);
 				func a(d: Dir) -> u8 {
-					match d { case Dir::North -> { 0 }, case Dir::East -> { 1 } }
+					match d { Dir::North -> { 0 }, Dir::East -> { 1 } }
 				}
 				func b(d: Dir) -> u8 {
 					match d {
-						case Dir::North | Dir::East -> { 0 },
-						case Dir::South | Dir::West -> { 1 },
+						Dir::North | Dir::East -> { 0 },
+						Dir::South | Dir::West -> { 1 },
 					}
 				}
 				func c(x: bool, d: Dir) {
-					match (x, d) { case (true, _) -> {}, case (_, Dir::North) -> {} }
+					match (x, d) { (true, _) -> {}, (_, Dir::North) -> {} }
 				}
-				func i(x: u8) -> u8 { match x { case 0 -> { 0 }, case 1 -> { 1 } } }
+				func i(x: u8) -> u8 { match x { 0 -> { 0 }, 1 -> { 1 } } }
 				func s(p: P) {
-					match p { case P(true, _) -> {}, case P(false, true) -> {} }
+					match p { P(true, _) -> {}, P(false, true) -> {} }
 				}
 			"}
 		);
@@ -4554,12 +4592,12 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				const ZERO: u8 = 0;
-				func u(x: u8) { match x { _ -> {}, case 0 -> {} } }
+				func u(x: u8) { match x { _ -> {}, 0 -> {} } }
 				func v(b: bool) {
-					match b { case true -> {}, case false -> {}, _ -> {} }
+					match b { true -> {}, false -> {}, _ -> {} }
 				}
-				func w(x: u8) { match x { case 0 | 1 -> {}, case 1 -> {}, _ -> {} } }
-				func z(x: u8) { match x { case ZERO -> {}, case 0 -> {}, _ -> {} } }
+				func w(x: u8) { match x { 0 | 1 -> {}, 1 -> {}, _ -> {} } }
+				func z(x: u8) { match x { const ZERO -> {}, 0 -> {}, _ -> {} } }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -4580,10 +4618,10 @@ mod tests {
 				const N: Dir = Dir::North;
 				trait Lim { const MAX: u8; }
 				func k(d: Dir) {
-					match d { case N -> {}, case Dir::East | Dir::South -> {} }
+					match d { const N -> {}, Dir::East | Dir::South -> {} }
 				}
-				func l<T: Lim>(x: u8) { match x { case T::MAX -> {} } }
-				func m<T: Lim>(x: u8) { match x { case T::MAX -> {}, _ -> {} } }
+				func l<T: Lim>(x: u8) { match x { T::MAX -> {} } }
+				func m<T: Lim>(x: u8) { match x { T::MAX -> {}, _ -> {} } }
 			"}
 		);
 		case.diagnostics()
@@ -4595,7 +4633,7 @@ mod tests {
 
 	#[test]
 	fn a_match_with_a_failed_pattern_is_not_checked_for_coverage() {
-		test_case!(case = "func f(x: u8) { match x { case nope -> {} } }");
+		test_case!(case = "func f(x: u8) { match x { const nope -> {} } }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}

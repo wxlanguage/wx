@@ -308,83 +308,96 @@ Calling a value of a user type that implements `Call` would be a `Call` of
 
 ### Patterns
 
-Decided design; not implemented yet. One pattern grammar serves `local` and
-`match` arms. Function parameters are never patterns: a parameter is
-`[mut] name`, since a call by name needs every parameter to have one.
+Done. One pattern grammar serves `local` and `match` arms. Function parameters
+are never patterns: a parameter is `[mut] name`, since a call by name needs
+every parameter to have one.
 
-**Two modes.** A pattern is parsed in *binding mode* or *value mode*, and every
-subpattern inherits its parent's mode unless it is marked. `case P` parses `P`
-in value mode; `local P` parses `P` in binding mode. A pattern starts in
-binding mode.
+**What a term is follows from its own shape.** There is no mode to switch: a
+name binds, a literal compares with that value, a qualified path compares with
+that constant, and a destructure takes its children apart.
 
-| | binding mode (default) | value mode |
+| written | what it is | why it cannot be anything else |
 |---|---|---|
-| bare name `x` | a binding | a value, resolved as a path |
-| path `a::B` | error: a value needs `case` | a value |
-| literal `0`, `-1`, `'a'`, `true` | error: a value needs `case` | a value |
-| `_`, `(..)`, `P(..)`, `P({ .. })` | destructures | destructures; children in value mode |
-| `A \| B` | not allowed (yet) | an or-pattern; its alternatives bind nothing (yet) |
-| `mut x` | a mutable binding | written `local mut x` |
-| switch | `case P` | `local P` |
+| `x` | a binding | a name *can* bind, so it does |
+| `const x` | a constant | the one ambiguous case, marked |
+| `0`, `-1`, `'a'`, `true` | a test | a literal cannot bind |
+| `Ordering::Less` | a constant | a qualified path cannot bind |
+| `mut x` | a mutable binding | |
+| `_` | a wildcard | |
+| `Point(x, 0)`, `Point({ x, .. })`, `(x, y)` | a destructure | each child is a pattern of its own |
+| `A \| B` | an or-pattern | its alternatives bind nothing |
 
 ```
 match point {
-    case Point(0, 0) -> origin(),
-    case Point(local x, 0) -> on_x_axis(x),
-    Point(x, case 0) -> on_x_axis(x),
-    Point(case 0, case 5 | 10) -> { .. },
+    Point(0, 0) -> origin(),
+    Point(x, 0) -> on_x_axis(x),
+    Point(const MAX, 0) -> at_the_limit(),
+    Point(x, 5 | 10) -> { .. },
     (x, y) -> { .. },
     _ -> { .. },
 }
 ```
 
-`case` binds looser than `|`: `case 5 | 10` is `case (5 | 10)`. A redundant
-marker (`case` inside value mode, `local` inside binding mode) parses and is
-warned about. Arms keep `->`. `case` becomes a keyword.
+`const` takes a path and nothing else: a literal is a comparison on its own, a
+destructure has no name to mark, and a name of one segment is the only thing
+the marker can mean. It binds tighter than `|`, so `const A | const B` is two
+constants. Before a path that is a constant already (`const Ordering::Less`)
+it is redundant, and is warned about (W1003) and dropped.
 
-**Why modes.** A single name in a pattern means one thing by syntax alone: the
-mode, not name lookup, decides whether `MAX` binds or compares, so renaming or
-removing a constant is an error ("cannot find value `MAX`") and never a silent
-catch-all, as it is in Rust.
+**Why a marker at all.** A single name in a pattern means one thing by syntax
+alone: the marker, not name lookup, decides whether `MAX` binds or compares, so
+renaming or removing a constant is an error ("cannot find value `MAX`") and
+never a silent catch-all, as it is in Rust. A qualified path needs no marker
+precisely because it cannot bind.
 
 **Refutability is syntactic.** wx enums carry no data, so destructuring a tuple
-or a struct always matches, and a pattern can fail only where it is in value
-mode. A `local` statement therefore takes a pattern without `case`; a `case`
-there is an error ("a `local` pattern cannot test a value"), and a plain
-`local (5, 'a') = x` is already one, a literal needing `case`. A match arm takes
+or a struct always matches, and a pattern can fail only where it holds a
+literal or a constant. A `local` statement therefore takes a pattern that
+holds neither: a test in one is E2115, at the test itself. A match arm takes
 any pattern.
 
 **Values are constants.** A value leaf is a literal, an enum variant, a
-`const`, or an associated constant (`case u32::MAX`, `case Self::LIMIT`),
-resolved as a value path that never sees locals: `case y` for a local `y` is
-"cannot find value `y`", with a note that a local cannot be compared in a
-pattern. An untyped literal takes the type it is checked against. A struct in
-value mode is compared structurally, field by field, never through
-`PartialEq`. An abstract constant (`case T::LIMIT`) is accepted and never
-counts towards exhaustiveness.
+`const`, or an associated constant (`const u32::MAX`, `Self::LIMIT`), resolved
+as a value path that never sees locals: `const y` for a local `y` is "cannot
+find value `y`", with a note that a local cannot be compared in a pattern. An
+untyped literal takes the type it is checked against. A struct is compared
+structurally, field by field, never through `PartialEq`. An abstract constant
+(`T::LIMIT`) is accepted and never counts towards exhaustiveness.
+
+A float has no single value to compare with, and a string has no equality at
+all, so neither can be matched: the parser reads them and the checker refuses
+them (E2117).
 
 **Checking flows down.** A pattern is checked against the type it is given:
 the scrutinee's, or a `local`'s value (or annotation). A struct pattern names
 its struct (`Point(..)`, `Self(..)`), checks field privacy as construction
 does, and takes at most one `..`. Each match arm owns a scope for its bindings.
 
+**AST** (done). One `Pattern` tree, with the leaves already resolved by the
+parser: `Wildcard`, `Binding` (a name, with its `mut` span), `ValuePath` (a
+constant, by path), `Literal` (an int, a char, a bool, a float, a string), `Or`,
+`Destructure` (a tuple, a struct, a named struct), and `Error` for a pattern
+the parser could not read. The leaves record what a term *is*, so no later
+stage has to know a mode — `const MAX` and `MAX` are different leaves, and
+`{ x }` in a named struct pattern is a binding, recorded as the field's own
+name with no pattern of its own.
+
 **TIR** (done). One pattern arena in `Body`, shared by `local` and `match`
 (`PatKind`, with a type and a span per pattern, children in `pat_lists`). A
-pattern is typed and resolved, so the mode is gone. The kinds group by what
-they do: structure (`Wildcard`, `Bind(LocalIdx)`, `Tuple`, `Struct`) always
-matches; tests (`Int`, `Bool`, `Char`, `Constant`, `AbstractConstant`, `Or`)
-match only some values, so only a match arm holds them; `Error` is reported
-and counts as `_`. Destructuring has one child per element or field of its
-type, in declaration order: what `..` covers, and a field a named pattern
-leaves out, is a `Wildcard`, so a struct's arity is its field count however it
-was written, and no `ArgOrder` or rest flag survives. `Int` is the value's
-bits in the pattern's type (`-1: i8` is `0xFF`), one spelling per value.
-`ExprKind::LocalDeclaration { pattern, value }` and `ExprKind::Match {
-scrutinee, arms }` with `Body::arms` (`Arm { scope, pattern, body }`): each arm
-declares its bindings in a scope of its own around its body. A `case` in a
-`local` is E2115 at the keyword, and its pattern becomes `Error` (its bindings
-are still declared, against `ERROR`); a name bound twice is E2116; a binding
-in an alternative of `|` is E2068.
+pattern is typed and resolved. The kinds group by what they do: structure
+(`Wildcard`, `Bind(LocalIdx)`, `Tuple`, `Struct`) always matches; tests (`Int`,
+`Bool`, `Char`, `Constant`, `AbstractConstant`, `Or`) match only some values,
+so only a match arm holds them; `Error` is reported and counts as `_`.
+Destructuring has one child per element or field of its type, in declaration
+order: what `..` covers, and a field a named pattern leaves out, is a
+`Wildcard`, so a struct's arity is its field count however it was written, and
+no `ArgOrder` or rest flag survives. `Int` is the value's bits in the pattern's
+type (`-1: i8` is `0xFF`), one spelling per value. `ExprKind::LocalDeclaration
+{ pattern, value }` and `ExprKind::Match { scrutinee, arms }` with `Body::arms`
+(`Arm { scope, pattern, body }`): each arm declares its bindings in a scope of
+its own around its body. A test in a `local` is E2115, at the test, and the
+pattern becomes `Error` (its bindings are still declared); a name bound twice
+is E2116; a binding in an alternative of `|` is E2068.
 
 **Usefulness** (done). One pass, Maranget's "Warnings for pattern matching"
 (rustc's `rustc_pattern_analysis`), in `tir/usefulness.rs` (pure: types are
@@ -424,20 +437,6 @@ three witnesses (the values no arm matches) in the report.
 - A match with an `Error` pattern, or a scrutinee whose type has an error, is
   not checked: what failed has said why. A binding inside `|` makes the `|`
   an `Error` for the same reason.
-
-**AST** (done). The mode is the type, so the parser decides it and TIR never
-reinterprets a name: `BindPattern` (`Wildcard`, `Binding`, `Destructure`,
-`Marked`) and `ValuePattern` (`Wildcard`, `Literal`, `Path`, `Or`,
-`Destructure`, `Marked`). `Destructure<P>` (`Tuple`, `Struct`, `NamedStruct`)
-is shared, its children in the same mode, and its lists are the raw sequences
-as written (`PatternElement::{Pattern, Rest}`, `PatternFieldItem::{Field,
-Rest}`): `(a, ..)`, `(.., z)` and two `..` all parse, and TIR judges them.
-`Marked::{Case, Local}` keeps every marker with its keyword span; one in the
-mode it names (`Marked::Case` in a `ValuePattern`, `Marked::Local` in a
-`BindPattern`) is redundant, which the parser warns about (W1003) and wx-fmt
-leaves out. A value without `case` is reported (E1015) and read as `_`; `mut`
-under `case` asks for `local mut`. `MatchArm::pattern` and `local` both take a
-`BindPattern`.
 
 ### Pattern limitations (as of the usefulness pass)
 

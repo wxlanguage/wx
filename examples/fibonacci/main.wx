@@ -85,9 +85,9 @@ func binary_search<
 
         local mid = low + (high - low) / 2;
         match arr[mid].cmp(target) {
-            case Ordering::Less -> { low = mid + 1 },
-            case Ordering::Greater -> { high = mid },
-            case Ordering::Equal -> { return (true, mid) },
+            Ordering::Less -> { low = mid + 1 },
+            Ordering::Greater -> { high = mid },
+            Ordering::Equal -> { return (true, mid) },
         }
     }
 }

@@ -240,7 +240,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// annotation.
 	fn build_local(
 		&mut self,
-		pattern: &Spanned<ast::BindPattern>,
+		pattern: &Spanned<ast::Pattern>,
 		ty: Option<&Spanned<ast::TypeExpression>>,
 		value: &Spanned<ast::Expression>,
 		span: TextSpan,
