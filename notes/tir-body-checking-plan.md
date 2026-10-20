@@ -439,6 +439,62 @@ leaves out. A value without `case` is reported (E1015) and read as `_`; `mut`
 under `case` asks for `local mut`. `MatchArm::pattern` and `local` both take a
 `BindPattern`.
 
+### Pattern limitations (as of the usefulness pass)
+
+What patterns, `match` and exhaustiveness do not do yet, or do on purpose in a
+restricted way:
+
+- **Constants in initializers are opaque to exhaustiveness.** Constants and
+  enum variants are evaluated only in a function's block. A `match` in a
+  constant's or global's initializer treats every named constant as opaque and
+  every enum as unlisted, so it always needs `_`. Lifting the rule overflows
+  the stack today: `const_value` calls `ensure_const_body` *before* it marks
+  the constant `InProgress`, and `ensure_const_body` only checks whether the
+  body exists, so two initializers whose patterns name each other rebuild each
+  other's bodies forever (reproduced). The fix being tried: mark `InProgress`
+  and push `const_stack` before building the body, and in `check_bodies` call
+  `evaluate_constant` before `ensure_const_body` (else the direct build there
+  still builds a body twice). With it there is no overflow, but the
+  diagnostics of a mutual pair were not yet what was expected (an extra E2066
+  and a different order); not finished, reverted.
+- **`eval` folds no `match`.** `ExprKind::Match` (like `IfElse`) is not a
+  constant expression, so a constant whose initializer is a `match` is E2057.
+- **`|` alternatives cannot bind** (E2068); a `|` that tries becomes `Error`.
+- **No range patterns.** An integer or `char` match is exhaustive only with
+  `_` or every value listed; the witness is the smallest value no arm lists.
+- **Opaque constants never count towards exhaustiveness:** a trait's
+  constant (`T::MAX`), a constant with type arguments, a struct-valued
+  constant, or one `eval` cannot reduce to one number. An enum one of whose
+  variants has no value is unlisted (needs `_`).
+- **A redundant alternative is not reported** (`case 1 | 1`); only whole arms
+  are (W2010).
+- **Non-exhaustive reports** name at most three witnesses ("and more"), one
+  per missing variant; an integer gets one witness; `_` when no arm names a
+  constructor of that column.
+- **A match with a failed pattern** (`Error` anywhere) or an erroneous
+  scrutinee type skips the usefulness pass entirely.
+- **No patterns through pointers**, as there is no auto-deref: destructuring
+  a `*T` is a type mismatch.
+- **Struct pattern privacy** is construction's: the struct must be
+  constructible here (every field visible), even with `..`.
+- **Shorthand fields:** `{ mut x }` does not parse (write `{ x: mut x }`);
+  `{ x }` under `case` names a constant `x`, as the mode rule says.
+- **Untyped scrutinee or value:** `match 1 { .. }` and `local (a, b) = (1, 2)`
+  need a type (annotation required).
+- **Literals:** floats and strings are not pattern literals.
+- **`case` in a `local`** (E2115) turns the whole marked subpattern into
+  `Error`; its bindings are still declared, typed `ERROR`.
+- **Parse recovery:** a value written without `case` is E1015 and read as
+  `_`.
+- **`!` scrutinee:** zero arms are exhaustive, and any arm there is reported
+  unreachable.
+- **Dead nodes:** a failed value path (`resolve_value_path` returning an error
+  node) and the inner pattern of a reported `case` in a `local` leave nodes in
+  the arenas that nothing references, as an extra call argument already does.
+- **Not done elsewhere:** MIR lowering of patterns and `match` (MIR is
+  disabled); the Zed grammar does not know `case`; wx-fmt's printing of a
+  comment between a dropped redundant marker and its pattern is unverified.
+
 ## Order of work
 
 Each step ends with tests in `signatures.rs`'s suite style and with no
