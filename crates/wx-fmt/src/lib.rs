@@ -2620,7 +2620,7 @@ impl<'a> Builder<'a> {
 				}
 				out.push(self.symbol(name.inner));
 			}
-			ast::Pattern::ValuePath { path } => {
+			ast::Pattern::Constant { path } => {
 				// A path of one segment can only be a constant the author
 				// marked with `const`; a longer one is a constant already.
 				if let [segment] = &**path

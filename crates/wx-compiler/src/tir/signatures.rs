@@ -27,7 +27,7 @@ use crate::tir::defs::TypeAliasIdx;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::{FileId, Files};
 
-use super::body::{Body, BodyOwner};
+use super::body::{Body, BodyOwner, ConstBody};
 use super::bounds::{
 	BindingRequirement, BoundArena, BoundClauses, BoundId, ClauseArena,
 	ClauseRange, SourceAssocBinding, SourceTraitBound, TraitClause,
@@ -625,9 +625,9 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub(super) functions: Vec<FunctionSignature>,
 	pub(super) constants: Vec<ConstantSignature>,
-	/// Each constant's checked initializer, by `ConstIdx`; filled on demand
-	/// (`ensure_const_body`). `None` for a trait constant without a default.
-	pub(super) const_bodies: Vec<Option<Body>>,
+	/// Each constant's checked initializer, by `ConstIdx`; built on demand
+	/// (`ensure_const_body`). A trait constant without a default has none.
+	pub(super) const_bodies: Vec<ConstBody>,
 	/// Each constant's value query state, by `ConstIdx` (`eval.rs`).
 	pub(super) const_values: Vec<ConstValueState>,
 	/// The constants being evaluated, outermost first.
@@ -758,7 +758,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					scope: TypeEnvIdx::ROOT,
 				})
 				.collect(),
-			const_bodies: defs.constants.iter().map(|_| None).collect(),
+			const_bodies: defs
+				.constants
+				.iter()
+				.map(|_| ConstBody::NotBuilt)
+				.collect(),
 			function_bodies: defs.functions.iter().map(|_| None).collect(),
 			global_bodies: defs.globals.iter().map(|_| None).collect(),
 			const_values: defs
@@ -1526,8 +1530,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Checks a constant's initializer into its `Body` (`const_bodies`), once.
 	/// On demand: evaluating one constant may need another's body first.
 	pub(super) fn ensure_const_body(&mut self, const_index: ConstIdx) {
-		if self.const_bodies[usize::from(const_index)].is_some() {
-			return;
+		match &self.const_bodies[usize::from(const_index)] {
+			ConstBody::Built(_) | ConstBody::Building => return,
+			ConstBody::NotBuilt => {}
 		}
 		let def_id = DefId::Const(const_index);
 		let entry =
@@ -1567,6 +1572,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					self.defs.enums[usize::from(enum_index)].variants.start;
 				let previous = (const_index != first)
 					.then(|| ConstIdx::new(u32::from(const_index) - 1));
+				self.const_bodies[usize::from(const_index)] =
+					ConstBody::Building;
 				let body = BodyContext::new(
 					self,
 					LexicalScope {
@@ -1577,7 +1584,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					BodyOwner::Const(const_index),
 				)
 				.check_variant_value(item, previous, repr);
-				self.const_bodies[usize::from(const_index)] = Some(body);
+				self.const_bodies[usize::from(const_index)] =
+					ConstBody::Built(body);
 				return;
 			}
 			_ => unreachable!("a constant's entry is a constant"),
@@ -1589,9 +1597,25 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			namespace,
 			env,
 		};
+		// Mark the body as being built before building it. Building it may
+		// read this constant's value — a pattern in its initializer names
+		// it — and a read of a constant whose body is being built must not
+		// build that body again: the two builds would ask each other for a
+		// value forever.
+		self.const_bodies[usize::from(const_index)] = ConstBody::Building;
 		let body = BodyContext::new(self, scope, BodyOwner::Const(const_index))
 			.check_body(value, ty);
-		self.const_bodies[usize::from(const_index)] = Some(body);
+		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
+	}
+
+	/// A constant's body, if it is built. `None` when it is not built yet,
+	/// when it is being built, or when it has none (a required trait
+	/// constant).
+	pub(super) fn const_body(&self, const_index: ConstIdx) -> Option<&Body> {
+		match &self.const_bodies[usize::from(const_index)] {
+			ConstBody::Built(body) => Some(body),
+			ConstBody::NotBuilt | ConstBody::Building => None,
+		}
 	}
 
 	/// Resolves and validates a `memory` declaration's `Size` and fills in
@@ -4663,8 +4687,8 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{name}` to be a constant");
 			};
-			case.context.const_bodies[usize::from(index)]
-				.as_ref()
+			case.context
+				.const_body(index)
 				.expect("a constant with an initializer has a body")
 		}
 

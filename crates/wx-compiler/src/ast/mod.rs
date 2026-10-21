@@ -1466,7 +1466,7 @@ pub enum TypeExpression {
 /// instead of binding.
 ///
 /// The parser resolves every term while parsing, so a name reaches the AST
-/// already decided — a [`Pattern::Binding`] or a [`Pattern::ValuePath`] —
+/// already decided — a [`Pattern::Binding`] or a [`Pattern::Constant`] —
 /// and never as something a later stage has to reinterpret.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1478,8 +1478,10 @@ pub enum Pattern {
 		mut_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 	},
-	/// `const MAX`, `Ordering::Less`, `Self::LIMIT`
-	ValuePath {
+	/// A constant, named by a path: `const MAX`, `Ordering::Less`,
+	/// `Self::LIMIT`. A path of one segment can only be a constant the
+	/// author marked with `const`; a longer one names a constant already.
+	Constant {
 		path: Box<[PathSegment]>,
 	},
 	/// `0`, `-1`, `'a'`, `true`
@@ -1548,11 +1550,12 @@ pub struct PatternField {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum PatternLiteral {
-	/// `1`, `-1`; the pattern's span covers the sign.
-	Int {
-		minus_span: Option<TextSpan>,
-		value: u64,
-	},
+	/// `1`; the value is the number itself.
+	Int(u64),
+	/// `-1`; the value is the magnitude, and the sign is the variant that
+	/// holds it — a negative literal is a literal of its own, not a
+	/// positive one with a sign attached.
+	NegInt(u64),
 	/// `'a'`, decoded from the pattern's span as a char expression is.
 	Char,
 	Bool(bool),
@@ -4951,7 +4954,7 @@ impl<'ctx> Parser<'ctx> {
 				span,
 			}),
 			_ => Ok(Spanned {
-				inner: Pattern::ValuePath { path: segments },
+				inner: Pattern::Constant { path: segments },
 				span,
 			}),
 		}
@@ -4986,7 +4989,7 @@ impl<'ctx> Parser<'ctx> {
 			path.last().unwrap().ident.span.end,
 		);
 		Ok(Spanned {
-			inner: Pattern::ValuePath { path },
+			inner: Pattern::Constant { path },
 			span,
 		})
 	}
@@ -5029,10 +5032,7 @@ impl<'ctx> Parser<'ctx> {
 				let token = parser.lexer.next();
 				let value = parser.integer_literal(token.span);
 				Ok(Spanned {
-					inner: Pattern::Literal(PatternLiteral::Int {
-						minus_span: None,
-						value,
-					}),
+					inner: Pattern::Literal(PatternLiteral::Int(value)),
 					span: token.span,
 				})
 			}
@@ -5065,10 +5065,9 @@ impl<'ctx> Parser<'ctx> {
 						let token = parser.lexer.next();
 						let value = parser.integer_literal(token.span);
 						Ok(Spanned {
-							inner: Pattern::Literal(PatternLiteral::Int {
-								minus_span: Some(minus),
+							inner: Pattern::Literal(PatternLiteral::NegInt(
 								value,
-							}),
+							)),
 							span: TextSpan::new(minus.start, token.span.end),
 						})
 					}

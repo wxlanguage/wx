@@ -3,15 +3,16 @@
 //!
 //! A constant compares as its value when it is one number this body can
 //! evaluate, else it is opaque: it covers nothing but itself, so a match
-//! naming it still needs `_`. Constants are evaluated only in a function's
-//! block; an initializer's patterns treat every named constant, and an enum's
-//! variants, as values no list covers.
+//! naming it still needs `_`. A constant's value is known wherever a pattern
+//! may name it, a function's block or an initializer's alike; one that is
+//! still being built, or that `eval` cannot reduce to a number, is opaque,
+//! and an enum whose variants have no value is unlisted.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
-use crate::tir::body::{Arm, BodyOwner, ExprIdx, PatIdx, PatKind};
+use crate::tir::body::{Arm, ExprIdx, PatIdx, PatternKind};
 use crate::tir::defs::{ConstIdx, EnumIdx};
 use crate::tir::types::{Type, TypeIndex, TypeList};
 use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
@@ -105,9 +106,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		let ty = self.body.pattern_ty(pattern);
 		let value = |value: u64| Pat::Ctor(Ctor::Value(value), Vec::new());
 		Some(match self.body.pattern(pattern) {
-			PatKind::Wildcard | PatKind::Bind(_) => Pat::Wild,
-			PatKind::Tuple(children)
-			| PatKind::Struct {
+			PatternKind::Wildcard | PatternKind::Bind(_) => Pat::Wild,
+			PatternKind::Tuple(children)
+			| PatternKind::Struct {
 				fields: children, ..
 			} => {
 				let children = self.body.patterns(children).to_vec();
@@ -117,20 +118,20 @@ impl BodyContext<'_, '_, '_, '_> {
 				}
 				Pat::Ctor(Ctor::Single, lowered)
 			}
-			PatKind::Int(bits) => value(bits),
-			PatKind::Bool(bit) => value(u64::from(bit)),
-			PatKind::Char(c) => value(u64::from(c)),
-			PatKind::Constant {
+			PatternKind::Int(bits) => value(bits),
+			PatternKind::Bool(bit) => value(u64::from(bit)),
+			PatternKind::Char(c) => value(u64::from(c)),
+			PatternKind::Constant {
 				constant,
 				type_args,
 			} => match self.pattern_constant_value(constant, type_args, ty) {
 				Some(bits) => value(bits),
 				None => Pat::Ctor(Ctor::Opaque, Vec::new()),
 			},
-			PatKind::AbstractConstant { .. } => {
+			PatternKind::AbstractConstant { .. } => {
 				Pat::Ctor(Ctor::Opaque, Vec::new())
 			}
-			PatKind::Or(alternatives) => {
+			PatternKind::Or(alternatives) => {
 				let alternatives = self.body.patterns(alternatives).to_vec();
 				let mut lowered = Vec::with_capacity(alternatives.len());
 				for alternative in alternatives {
@@ -138,7 +139,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				}
 				Pat::Or(lowered)
 			}
-			PatKind::Error => return None,
+			PatternKind::Error => return None,
 		})
 	}
 
@@ -150,9 +151,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		type_args: TypeList,
 		ty: TypeIndex,
 	) -> Option<u64> {
-		if !matches!(self.owner, BodyOwner::Function(_))
-			|| !self.cx.types.list(type_args).is_empty()
-		{
+		if !self.cx.types.list(type_args).is_empty() {
 			return None;
 		}
 		let bits = self.cx.constant_bits(constant)?;
@@ -171,9 +170,6 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// The value of each of an enum's variants, in written order, each once;
 	/// `None` when one has no value here.
 	fn variant_values(&mut self, enum_index: EnumIdx) -> Option<Vec<u64>> {
-		if !matches!(self.owner, BodyOwner::Function(_)) {
-			return None;
-		}
 		let variants =
 			self.cx.defs.enums[usize::from(enum_index)].variants.clone();
 		let mut values = Vec::new();

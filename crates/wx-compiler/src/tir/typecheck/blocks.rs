@@ -9,7 +9,7 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
-use super::patterns::PatternSite;
+use super::patterns::PatternContext;
 use super::{BodyContext, ScopeType};
 use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
@@ -290,7 +290,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			TypeIndex::UNIT
 		};
 		let pattern =
-			self.check_pattern(pattern, local_ty, &mut PatternSite::local());
+			self.check_pattern(pattern, local_ty, &mut PatternContext::local());
 		self.body
 			.push(ExprKind::LocalDeclaration { pattern, value }, ty, span)
 	}
@@ -324,7 +324,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			let pattern = self.check_pattern(
 				&arm.inner.pattern,
 				scrutinee_ty,
-				&mut PatternSite::arm(),
+				&mut PatternContext::arm(),
 			);
 			let body = self.build_branch(&arm.inner.body, expected, None);
 			self.leave_scope(scope);

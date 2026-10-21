@@ -22,7 +22,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::body::{ArgOrder, ExprIdx, ExprKind};
+use super::body::{ArgOrder, ConstBody, ExprIdx, ExprKind};
 use super::defs::{ConstIdx, EnumIdx, StructIdx};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
@@ -194,7 +194,20 @@ impl TypeContext<'_, '_, '_> {
 			Err(state) => return self.settle_constant(const_index, state),
 		};
 		self.ensure_const_body(const_index);
-		let Some(body) = &self.const_bodies[usize::from(const_index)] else {
+		let Some(body) = self.const_body(const_index) else {
+			// The body is being built, and we are inside its own build: its
+			// value cannot be known yet, and building its body again would
+			// ask it for its value again. The caller reads it as "no value
+			// here", which is what a constant whose value is not known
+			// means.
+			if matches!(
+				self.const_bodies[usize::from(const_index)],
+				ConstBody::Building
+			) {
+				return Err(Unevaluable::Silent);
+			}
+			// A constant with no initializer at all: a required trait
+			// constant.
 			return self.settle_constant(const_index, ConstValueState::NoValue);
 		};
 		let root = body.root();
@@ -255,7 +268,7 @@ impl TypeContext<'_, '_, '_> {
 		expr: ExprIdx,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let body = self.const_bodies[usize::from(owner)].as_ref().unwrap();
+		let body = self.const_body(owner).unwrap();
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
 		if ty == TypeIndex::ERROR {
@@ -349,8 +362,7 @@ impl TypeContext<'_, '_, '_> {
 			// Its values are its elements', in order, as its type's layout is.
 			ExprKind::Tuple { elements } => {
 				for at in 0..elements.len() {
-					let body =
-						self.const_bodies[usize::from(owner)].as_ref().unwrap();
+					let body = self.const_body(owner).unwrap();
 					let element = body.args(elements)[at];
 					self.eval(owner, element, stack)?;
 				}
@@ -370,8 +382,7 @@ impl TypeContext<'_, '_, '_> {
 				let start = stack.len();
 				let mut fields = Vec::new();
 				for at in 0..count {
-					let body =
-						self.const_bodies[usize::from(owner)].as_ref().unwrap();
+					let body = self.const_body(owner).unwrap();
 					let (arg, field) =
 						(body.args(args)[at], body.declared_index(order, at));
 					let field_start = stack.len();
@@ -585,8 +596,7 @@ impl TypeContext<'_, '_, '_> {
 				);
 			for &(_, variant) in group {
 				// The written value, or the name of a variant counted on.
-				let body =
-					self.const_bodies[usize::from(variant)].as_ref().unwrap();
+				let body = self.const_body(variant).unwrap();
 				let span = body.span(body.root());
 				diagnostic = diagnostic.with_label(
 					SourceSpan::new(file_id, span)

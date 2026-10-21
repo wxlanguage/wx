@@ -241,6 +241,8 @@ define_diagnostic_codes! {
 		RefutablePatternInLocal => "E2115",
 		DuplicatePatternBinding => "E2116",
 		UnmatchableLiteral => "E2117",
+		NotBoundInAllAlternatives => "E2118",
+		InconsistentPatternBinding => "E2119",
 	}
 }
 

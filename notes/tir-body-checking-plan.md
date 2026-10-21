@@ -325,7 +325,7 @@ that constant, and a destructure takes its children apart.
 | `mut x` | a mutable binding | |
 | `_` | a wildcard | |
 | `Point(x, 0)`, `Point({ x, .. })`, `(x, y)` | a destructure | each child is a pattern of its own |
-| `A \| B` | an or-pattern | its alternatives bind nothing |
+| `A \| B` | an or-pattern | its alternatives bind the same names |
 
 ```
 match point {
@@ -374,10 +374,10 @@ its struct (`Point(..)`, `Self(..)`), checks field privacy as construction
 does, and takes at most one `..`. Each match arm owns a scope for its bindings.
 
 **AST** (done). One `Pattern` tree, with the leaves already resolved by the
-parser: `Wildcard`, `Binding` (a name, with its `mut` span), `ValuePath` (a
-constant, by path), `Literal` (an int, a char, a bool, a float, a string), `Or`,
-`Destructure` (a tuple, a struct, a named struct), and `Error` for a pattern
-the parser could not read. The leaves record what a term *is*, so no later
+parser: `Wildcard`, `Binding` (a name, with its `mut` span), `Constant` (a
+constant, by path), `Literal` (an int — `Int` or `NegInt`, the sign being the
+variant — a char, a bool, a float, a string), `Or`, `Destructure` (a tuple, a
+struct, a named struct), and `Error` for a pattern the parser could not read. The leaves record what a term *is*, so no later
 stage has to know a mode — `const MAX` and `MAX` are different leaves, and
 `{ x }` in a named struct pattern is a binding, recorded as the field's own
 name with no pattern of its own.
@@ -395,9 +395,35 @@ no `ArgOrder` or rest flag survives. `Int` is the value's bits in the pattern's
 type (`-1: i8` is `0xFF`), one spelling per value. `ExprKind::LocalDeclaration
 { pattern, value }` and `ExprKind::Match { scrutinee, arms }` with `Body::arms`
 (`Arm { scope, pattern, body }`): each arm declares its bindings in a scope of
-its own around its body. A test in a `local` is E2115, at the test, and the
-pattern becomes `Error` (its bindings are still declared); a name bound twice
-is E2116; a binding in an alternative of `|` is E2068.
+its own around its body. A test in a `local` is E2115, at the first test; every
+test in the pattern then becomes `Error`, so the pattern takes the value apart
+and binds without testing (its bindings are still declared), and only the
+first test is reported. A name bound twice in the same pattern is E2116.
+
+The alternatives of a `|` bind the same names, as in rustc. The same name in
+two alternatives is *one* local, which both alternatives bind: the arm's body
+reads that one local. A name one alternative binds and another does not is
+E2118 (one report per name, a label on each alternative that lacks it); the
+same name bound differently in two alternatives — one `mut`, one not — is
+E2119; and the same name of a different type in two alternatives is E2001,
+with the type it was first introduced with. Each `|` is checked on its own,
+and an alternative's names are those bound anywhere inside it, so a nested `|`
+counts towards the enclosing one.
+
+A name bound twice in one alternative is E2116, and is still the local the
+alternatives share: the two bindings are one variable, so they are of one
+type (E2001 says so when they are not). A name bound in two *products* — two
+sibling `|`s in one pattern, or a `|` and the pattern around it — is two
+variables, and E2116 says so.
+
+The two kinds of place a name can be bound are a **product** (one value taken
+apart: a tuple, a struct, one alternative) and the **alternatives** of a `|`
+(one value matched several ways). A name in a product names a different value
+each time it is bound; a name in the alternatives names the same value, seen
+two ways. That is the whole difference, and it is what decides whether a
+second binding of a name is a mistake (E2116) or the same variable again
+(shared). rustc splits it the same way (`PatBoundCtx::{Product, Or}` in
+`rustc_resolve/src/late.rs`).
 
 **Usefulness** (done). One pass, Maranget's "Warnings for pattern matching"
 (rustc's `rustc_pattern_analysis`), in `tir/usefulness.rs` (pure: types are
@@ -431,34 +457,35 @@ three witnesses (the values no arm matches) in the report.
 - An opaque constant never makes a match exhaustive, nor is it unreachable
   unless a wildcard arm precedes it. `local` patterns hold no tests, so they
   always match and are not checked.
-- Constants (and an enum's variants) are evaluated only in a function's
-  block, where every constant's body can be built on demand; an initializer's
-  match treats them as opaque and an enum as unlisted, so it needs `_`.
+- Constants (and an enum's variants) are evaluated wherever a pattern may
+  name them, a function's block or an initializer's alike. A constant whose
+  value is not known — one that is still being built, one `eval` cannot
+  reduce to a number — is opaque, and an enum whose variants have no value
+  is unlisted; both need `_`.
 - A match with an `Error` pattern, or a scrutinee whose type has an error, is
-  not checked: what failed has said why. A binding inside `|` makes the `|`
-  an `Error` for the same reason.
+  not checked: what failed has said why.
 
 ### Pattern limitations (as of the usefulness pass)
 
 What patterns, `match` and exhaustiveness do not do yet, or do on purpose in a
 restricted way:
 
-- **Constants in initializers are opaque to exhaustiveness.** Constants and
-  enum variants are evaluated only in a function's block. A `match` in a
-  constant's or global's initializer treats every named constant as opaque and
-  every enum as unlisted, so it always needs `_`. Lifting the rule overflows
-  the stack today: `const_value` calls `ensure_const_body` *before* it marks
-  the constant `InProgress`, and `ensure_const_body` only checks whether the
-  body exists, so two initializers whose patterns name each other rebuild each
-  other's bodies forever (reproduced). The fix being tried: mark `InProgress`
-  and push `const_stack` before building the body, and in `check_bodies` call
-  `evaluate_constant` before `ensure_const_body` (else the direct build there
-  still builds a body twice). With it there is no overflow, but the
-  diagnostics of a mutual pair were not yet what was expected (an extra E2066
-  and a different order); not finished, reverted.
+- **A constant's value is known wherever a pattern may name it.** A `match` in
+  a constant's or global's initializer compares with the constants it names,
+  as one in a function's block does. The rule was lifted once a constant's
+  body could be built without looping: `const_value` calls
+  `ensure_const_body` *before* it marks the constant `InProgress`, and
+  `ensure_const_body` only checked whether the body exists, so two
+  initializers whose patterns name each other rebuilt each other's bodies
+  forever (reproduced: a stack overflow). Now a body is `NotBuilt`,
+  `Building` or `Built`, and a body that is being built is not built again: a
+  read of that constant's value finds none ("not known yet"), which is what
+  the reader needs to know. A constant whose value is not known is opaque, and
+  an enum whose variants have no value is unlisted; both need `_`.
 - **`eval` folds no `match`.** `ExprKind::Match` (like `IfElse`) is not a
   constant expression, so a constant whose initializer is a `match` is E2057.
-- **`|` alternatives cannot bind** (E2068); a `|` that tries becomes `Error`.
+- **`|` alternatives bind the same names** (E2118, E2119, E2001); the same
+  name in two alternatives is one local.
 - **No range patterns.** An integer or `char` match is exhaustive only with
   `_` or every value listed; the witness is the smallest value no arm lists.
 - **Opaque constants never count towards exhaustiveness:** a trait's
@@ -481,10 +508,10 @@ restricted way:
 - **Untyped scrutinee or value:** `match 1 { .. }` and `local (a, b) = (1, 2)`
   need a type (annotation required).
 - **Literals:** floats and strings are not pattern literals.
-- **`case` in a `local`** (E2115) turns the whole marked subpattern into
-  `Error`; its bindings are still declared, typed `ERROR`.
-- **Parse recovery:** a value written without `case` is E1015 and read as
-  `_`.
+- **A test in a `local`** (E2115) turns each test into `Error`; the pattern
+  still takes the value apart, and its bindings are still declared.
+- **Parse recovery:** a `local` marker in a pattern is E1015, and the pattern
+  is read as broken.
 - **`!` scrutinee:** zero arms are exhaustive, and any arm there is reported
   unreachable.
 - **Dead nodes:** a failed value path (`resolve_value_path` returning an error

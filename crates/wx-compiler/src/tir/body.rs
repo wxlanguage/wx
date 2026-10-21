@@ -52,6 +52,23 @@ pub(super) enum BodyOwner {
 	Global(GlobalIdx),
 }
 
+/// A constant's checked initializer, and how far along it is.
+///
+/// A body is built on demand (`ensure_const_body`), and building it may read
+/// another constant's value — a pattern that names it — which may build
+/// *this* constant's body in turn. The `Building` state is what stops that
+/// from repeating: a body that is already being built is not built again.
+pub(super) enum ConstBody {
+	/// Not built yet.
+	NotBuilt,
+	/// Being built now. A read of this constant's value finds none: its
+	/// value cannot be known until its body is built, and its body cannot be
+	/// built while it is being built.
+	Building,
+	/// Built.
+	Built(Body),
+}
+
 /// A run of `Body::extra`: the arguments of a call or a construction, in the
 /// order they are written, which is the order they are evaluated in; or the
 /// statements of a block.
@@ -72,7 +89,7 @@ impl ExprRange {
 /// pattern.
 #[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) struct PatRange {
+pub(super) struct PatternRange {
 	start: u32,
 	len: u32,
 }
@@ -97,19 +114,19 @@ pub(super) struct Arm {
 
 #[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum PatKind {
+pub(super) enum PatternKind {
 	// Structure: always matches, and takes the value apart.
 	/// `_`, an element or field `..` covers, or a field a named pattern
 	/// leaves out.
 	Wildcard,
 	Bind(LocalIdx),
 	/// One child per element of the tuple's type.
-	Tuple(PatRange),
+	Tuple(PatternRange),
 	/// One child per field, in declaration order. The type arguments are the
 	/// pattern's type's.
 	Struct {
 		struct_index: StructIdx,
-		fields: PatRange,
+		fields: PatternRange,
 	},
 
 	// Tests: match only some values, so only a match arm holds them.
@@ -128,8 +145,9 @@ pub(super) enum PatKind {
 		constant: ConstIdx,
 		type_args: TypeList,
 	},
-	/// Alternatives, none of which binds.
-	Or(PatRange),
+	/// Alternatives, which bind the same names: the same name in two of
+	/// them is one local.
+	Or(PatternRange),
 
 	/// Already reported; whatever reads it stays silent, and exhaustiveness
 	/// counts it as `_`.
@@ -435,7 +453,7 @@ pub(super) struct Body {
 	labels: Vec<Label>,
 	locals: Vec<Local>,
 	places: Vec<Place>,
-	pat_kinds: Vec<PatKind>,
+	pat_kinds: Vec<PatternKind>,
 	pat_types: Vec<TypeIndex>,
 	pat_spans: Vec<TextSpan>,
 	pat_lists: Vec<PatIdx>,
@@ -497,7 +515,7 @@ impl Body {
 		&self.places[usize::from(place)]
 	}
 
-	pub(super) fn pattern(&self, pattern: PatIdx) -> PatKind {
+	pub(super) fn pattern(&self, pattern: PatIdx) -> PatternKind {
 		self.pat_kinds[usize::from(pattern)]
 	}
 
@@ -509,7 +527,7 @@ impl Body {
 		self.pat_spans[usize::from(pattern)]
 	}
 
-	pub(super) fn patterns(&self, range: PatRange) -> &[PatIdx] {
+	pub(super) fn patterns(&self, range: PatternRange) -> &[PatIdx] {
 		&self.pat_lists
 			[range.start as usize..(range.start + range.len) as usize]
 	}
@@ -532,7 +550,7 @@ pub(super) struct BodyBuilder {
 	labels: Vec<Label>,
 	locals: Vec<Local>,
 	places: Vec<Place>,
-	pat_kinds: Vec<PatKind>,
+	pat_kinds: Vec<PatternKind>,
 	pat_types: Vec<TypeIndex>,
 	pat_spans: Vec<TextSpan>,
 	pat_lists: Vec<PatIdx>,
@@ -606,7 +624,7 @@ impl BodyBuilder {
 
 	pub(super) fn push_pattern(
 		&mut self,
-		kind: PatKind,
+		kind: PatternKind,
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> PatIdx {
@@ -620,11 +638,11 @@ impl BodyBuilder {
 	pub(super) fn push_patterns(
 		&mut self,
 		patterns: impl IntoIterator<Item = PatIdx>,
-	) -> PatRange {
+	) -> PatternRange {
 		let start = u32::try_from(self.pat_lists.len()).unwrap();
 		self.pat_lists.extend(patterns);
 		let len = u32::try_from(self.pat_lists.len()).unwrap() - start;
-		PatRange { start, len }
+		PatternRange { start, len }
 	}
 
 	pub(super) fn push_arms(
@@ -665,7 +683,7 @@ impl BodyBuilder {
 		&self.places[usize::from(place)]
 	}
 
-	pub(super) fn pattern(&self, pattern: PatIdx) -> PatKind {
+	pub(super) fn pattern(&self, pattern: PatIdx) -> PatternKind {
 		self.pat_kinds[usize::from(pattern)]
 	}
 
@@ -677,7 +695,7 @@ impl BodyBuilder {
 		self.pat_spans[usize::from(pattern)]
 	}
 
-	pub(super) fn patterns(&self, range: PatRange) -> &[PatIdx] {
+	pub(super) fn patterns(&self, range: PatternRange) -> &[PatIdx] {
 		&self.pat_lists
 			[range.start as usize..(range.start + range.len) as usize]
 	}
@@ -727,6 +745,6 @@ mod tests {
 
 	#[test]
 	fn a_pattern_node_stays_small() {
-		assert!(std::mem::size_of::<PatKind>() <= 16);
+		assert!(std::mem::size_of::<PatternKind>() <= 16);
 	}
 }

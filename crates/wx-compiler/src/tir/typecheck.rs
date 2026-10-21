@@ -2946,7 +2946,7 @@ mod tests {
 			body: &Body,
 			pattern: super::super::body::PatIdx,
 		) -> String {
-			use super::super::body::PatKind;
+			use super::super::body::PatternKind;
 			let list = |head: &str, children: &[super::super::body::PatIdx]| {
 				let mut text = format!("({head}");
 				for &child in children {
@@ -2956,12 +2956,12 @@ mod tests {
 				text + ")"
 			};
 			match body.pattern(pattern) {
-				PatKind::Wildcard => "_".to_string(),
-				PatKind::Bind(local) => self.local_name(body, local),
-				PatKind::Tuple(elements) => {
+				PatternKind::Wildcard => "_".to_string(),
+				PatternKind::Bind(local) => self.local_name(body, local),
+				PatternKind::Tuple(elements) => {
 					list("tuple", body.patterns(elements))
 				}
-				PatKind::Struct {
+				PatternKind::Struct {
 					struct_index,
 					fields,
 				} => {
@@ -2970,7 +2970,7 @@ mod tests {
 					let name = self.context.strings.resolve(name).unwrap();
 					list(name, body.patterns(fields))
 				}
-				PatKind::Int(bits) => {
+				PatternKind::Int(bits) => {
 					let integer =
 						super::Integer::from_type(body.pattern_ty(pattern))
 							.unwrap();
@@ -2982,23 +2982,23 @@ mod tests {
 						bits.to_string()
 					}
 				}
-				PatKind::Bool(value) => value.to_string(),
-				PatKind::Char(value) => format!("{value:?}"),
-				PatKind::Constant {
+				PatternKind::Bool(value) => value.to_string(),
+				PatternKind::Char(value) => format!("{value:?}"),
+				PatternKind::Constant {
 					constant,
 					type_args,
 				} => self.constant_name(constant, type_args),
-				PatKind::AbstractConstant {
+				PatternKind::AbstractConstant {
 					constant,
 					type_args,
 				} => format!(
 					"(abstract {})",
 					self.constant_name(constant, type_args)
 				),
-				PatKind::Or(alternatives) => {
+				PatternKind::Or(alternatives) => {
 					list("|", body.patterns(alternatives))
 				}
-				PatKind::Error => "error".to_string(),
+				PatternKind::Error => "error".to_string(),
 			}
 		}
 
@@ -4438,19 +4438,67 @@ mod tests {
 	}
 
 	#[test]
-	fn tmp_probe() {
+	fn a_constant_has_its_value_wherever_a_pattern_may_name_it() {
+		// A constant's value is known wherever a pattern may name it: in a
+		// function's block, in a global's initializer, in a constant's own.
 		test_case!(
-			case = indoc! {r#"
-				const MAX: u32 = 7;
-				const V: u32 = 7;
-				global g: u32 = match V { MAX -> 1, 7 -> 2 };
-				func f(v: u32) -> u32 {
-					match V { MAX -> 1, 7 -> 2 }
+			case = indoc! {"
+				enum Dir: u8 { North = 0, East = 1, South = 2 }
+				const N: Dir = Dir::North;
+				global g: Dir = match (N) {
+					const N -> { Dir::North },
+					Dir::North -> { Dir::South },
+					_ -> { Dir::East },
+				};
+				// The variants are known here too, so listing them all is
+				// enough: no `_` is needed.
+				global h: Dir = match (N) {
+					Dir::North -> { Dir::North },
+					Dir::East -> { Dir::East },
+					Dir::South -> { Dir::South },
+				};
+				func f(d: Dir) {
+					match d {
+						const N -> {},
+						Dir::North -> {},
+						_ -> {},
+					}
 				}
-			"#}
+			"}
 		);
-		println!("SHAPE: {}", case.shape("f"));
-		case.diagnostics().assert_error_saying("zzz-not-there");
+		// In both, the second arm is covered by the first.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+	}
+
+	#[test]
+	fn constants_whose_initializers_name_each_other_do_not_loop() {
+		// Each initializer's pattern names the other, so building one body
+		// asks for the other's value, which builds the other's body, which
+		// asks for the first one's value again. The answer is "not known
+		// yet", not a rebuild.
+		test_case!(
+			case = indoc! {"
+				const A: bool = match (true) { const B -> { true }, _ -> { false } };
+				const B: bool = match (true) { const A -> { true }, _ -> { false } };
+				func f() -> bool {
+					match (true) {
+						const A -> { match (true) { const B -> { true }, _ -> { false } } },
+						_ -> { false },
+					}
+				}
+			"}
+		);
+		// Neither initializer is a constant expression: a `match` is not one.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotConstEvaluatable,
+			DiagnosticCode::NotConstEvaluatable,
+		]);
+		// And each match is exhaustive: the `_` arm covers what the
+		// constant, whose value is not known, does not — so no
+		// "non-exhaustive" is among the codes above.
 	}
 
 	#[test]
@@ -4473,6 +4521,181 @@ mod tests {
 			.assert_error_saying("a float cannot be matched");
 		case.diagnostics()
 			.assert_error_saying("a string cannot be matched");
+	}
+
+	#[test]
+	fn every_test_in_a_local_pattern_poisons_the_pattern() {
+		// A `local` always matches: every test in it is a mistake, and each
+		// one poisons its own pattern, so the pattern takes the value apart
+		// and binds without testing. Only the first test is reported.
+		test_case!(
+			case = indoc! {"
+				const C: u8 = 1;
+				func f(x: (u8, u8)) {
+					local (a, 5) = x;
+					local (b, const C) = x;
+					local (c, 5) | (0, 10) = x;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::NotBoundInAllAlternatives,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local (tuple a#1 error) x#0) (local (tuple b#2 error) x#0) \
+			 (local (| (tuple c#3 error) (tuple error error)) x#0))"
+		);
+	}
+
+	#[test]
+	fn a_name_bound_twice_in_one_alternative_is_still_one_local() {
+		// The name is bound twice in the second alternative, which is a
+		// mistake, but it is still the one local the alternatives share: the
+		// two bindings are of different types, and that is said too.
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i32, i64)) {
+					match x { (a, 5, 6) | (a, b, a) -> { local _ = a; }, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block => (match x#0 ((| (tuple a#1 5 6) (tuple a#1 b#2 a#1)) => \
+			 (block (local _ a#1))) (_ => (block))))"
+		);
+	}
+
+	#[test]
+	fn the_same_name_in_two_alternatives_is_one_local() {
+		// The same name in two alternatives is one local, which the arm's
+		// body reads.
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					match x { (a, 5) | (a, 10) -> { local _ = a; }, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block => (match x#0 ((| (tuple a#1 5) (tuple a#1 10)) => (block \
+			 (local _ a#1))) (_ => (block))))"
+		);
+	}
+
+	#[test]
+	fn a_binding_bound_differently_in_two_alternatives_is_an_error() {
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					match x { (mut a, 5) | (a, 10) -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::InconsistentPatternBinding]);
+		case.diagnostics().assert_error_saying(
+			"variable `a` is bound inconsistently across alternatives separated \
+			 by `|`",
+		);
+	}
+
+	#[test]
+	fn a_binding_must_have_the_same_type_in_all_alternatives() {
+		// The two alternatives bind `a` and `b` at different types, so
+		// neither can be one local of one type.
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					match x { (a, b) | (b, a) -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"in the same arm, a binding must have the same type in all \
+			 alternatives",
+		);
+	}
+
+	#[test]
+	fn nested_alternatives_bind_the_same_names() {
+		// Each `|` is checked on its own: the inner one binds `a` in one
+		// alternative and `b` in the other, and the outer one sees both.
+		test_case!(
+			case = indoc! {"
+				func f(x: ((i32, i32), i32)) {
+					match x { ((a, 1) | (a, 2), 3) -> {}, _ -> {} }
+					match x { ((a, 1) | (b, 2), 3) -> {}, _ -> {} }
+					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+		]);
+	}
+
+	#[test]
+	fn a_name_bound_twice_in_one_pattern_is_an_error() {
+		// A name bound in the same product is bound twice: the alternatives
+		// of a `|` share a name, but two groups in one pattern do not.
+		test_case!(
+			case = indoc! {"
+				func f(x: ((i32, i32), (i32, i32))) {
+					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) -> {}, _ -> {} }
+				}
+				func g(x: ((i32, i32), i32)) {
+					match x { ((a, 1) | (a, 2), a) -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::DuplicatePatternBinding,
+		]);
+	}
+
+	#[test]
+	fn a_local_pattern_binds_the_same_names_in_its_alternatives() {
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					local (a, b) | (a, b) = x;
+				}
+				func g(x: (i32, i64)) {
+					local (a, 5) | (0, 10) = x;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::NotBoundInAllAlternatives,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local (| (tuple a#1 b#2) (tuple a#1 b#2)) x#0))"
+		);
 	}
 
 	#[test]
@@ -4499,7 +4722,8 @@ mod tests {
 			DiagnosticCode::IntegerLiteralOutOfRange,
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
-			DiagnosticCode::InvalidMatchPattern,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::UnreachableMatchArm,
 		]);
 		case.diagnostics().assert_error_saying(
 			"`y` is a local; a pattern compares with constants, and `y` would \

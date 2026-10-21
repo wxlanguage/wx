@@ -103,15 +103,15 @@ impl TestCase {
 				Some(_) => format!("mut {}", self.name(name.inner)),
 				None => self.name(name.inner).to_string(),
 			},
-			Pattern::ValuePath { path } => match &**path {
+			Pattern::Constant { path } => match &**path {
 				[segment] if segment.type_args.is_empty() => {
 					format!("(const {})", self.name(segment.ident.inner))
 				}
-				_ => format!("(value {})", self.path(path)),
+				_ => format!("(const {})", self.path(path)),
 			},
-			Pattern::Literal(PatternLiteral::Int { minus_span, value }) => {
-				let sign = if minus_span.is_some() { "-" } else { "" };
-				format!("{sign}{value}")
+			Pattern::Literal(PatternLiteral::Int(value)) => value.to_string(),
+			Pattern::Literal(PatternLiteral::NegInt(value)) => {
+				format!("-{value}")
 			}
 			Pattern::Literal(PatternLiteral::Char) => "char".to_string(),
 			Pattern::Literal(PatternLiteral::Float) => "float".to_string(),
@@ -929,9 +929,9 @@ fn test_match_enum_variant_patterns() {
 	assert_eq!(
 		case.arm_patterns(1),
 		[
-			"(value FileDescriptor::StdIn)",
-			"(value FileDescriptor::StdOut)",
-			"(value FileDescriptor::StdErr)",
+			"(const FileDescriptor::StdIn)",
+			"(const FileDescriptor::StdOut)",
+			"(const FileDescriptor::StdErr)",
 		]
 	);
 }
@@ -1686,7 +1686,7 @@ fn test_pattern_redundant_const_is_dropped_and_warned() {
 		.assert_warning(DiagnosticCode::RedundantPatternMarker);
 	assert_eq!(
 		case.arm_patterns(0),
-		["(value Ordering::Less)", "(const MAX)"]
+		["(const Ordering::Less)", "(const MAX)"]
 	);
 }
 
