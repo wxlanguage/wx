@@ -184,6 +184,8 @@ impl<'r> PathResolver<'r> {
 		);
 
 		let mut base = Namespace::from(accessor);
+		// The binding that entered `base`, for a walk that stops at an enum.
+		let mut entered_by = None;
 		let mut first_inaccessible = None;
 		let mut first_namespace_with_type_args = None;
 		for (index, segment) in segments.iter().enumerate() {
@@ -274,6 +276,26 @@ impl<'r> PathResolver<'r> {
 							Some((index as u32, def_key));
 					}
 					base = namespace;
+					entered_by = Some((*target, *visibility, *import));
+				}
+				// An enum's table holds only its variants; a name it does not
+				// bind may be a member of its impls, which is the caller's to
+				// look up past the enum, as past any other type.
+				BindingLookup::NotFound
+					if let Namespace::Enum(_) = base
+						&& let Some((target, visibility, import)) =
+							entered_by =>
+				{
+					return PathResolution {
+						stopped_at: index as u32 - 1,
+						stopped_with: BindingLookup::Found {
+							target,
+							visibility,
+							import,
+						},
+						first_inaccessible,
+						first_namespace_with_type_args,
+					};
 				}
 				BindingLookup::NotFound | BindingLookup::Ambiguous(_) => {
 					return PathResolution {

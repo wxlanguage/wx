@@ -185,7 +185,7 @@ pub func slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
 
 pub func slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
 
-pub func slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T];
+pub func slice_from_parts<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::*[T];
 
 pub func i64_extend_i32(value: i32) -> i64;
 
@@ -1985,7 +1985,7 @@ pub func memory_copy<
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
-pub typeset PointerSize: Mul + UnsignedInt { u32, u64 }
+pub typeset PointerSize: Mul + PartialEq + UnsignedInt { u32, u64 }
 
 func global_get<G: Global>(g: G) -> G::Value;
 
@@ -2061,12 +2061,12 @@ pub struct Layout<Mem: Memory>(
 impl<Mem: Memory> Layout<Mem> {
     #[inline]
     pub func of<T>() -> Self {
-        Self({ size: size_of::<T>(), align: align_of::<T>() })
+        Self({ size: size_of::<T, Mem>(), align: align_of::<T, Mem>() })
     }
 
     #[inline]
     pub func array<T>(count: Mem::Size) -> Self {
-        Self({ align: align_of::<T>(), size: size_of::<T>() * count })
+        Self({ align: align_of::<T, Mem>(), size: size_of::<T, Mem>() * count })
     }
 
     #[inline]
@@ -2095,9 +2095,9 @@ pub trait Allocator {
     #[inline]
     func allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts(
-            self.allocate(Layout::array::<T>(len)) as Self::Mem::&T,
+            self.allocate(Layout::array::<T>(len)) as Self::Mem::*T,
             len,
-        ) as _
+        )
     }
 }
 

@@ -30,6 +30,7 @@ mod signatures;
 mod solver;
 mod typecheck;
 mod types;
+mod usefulness;
 
 // use crate::index::index_newtype;
 

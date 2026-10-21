@@ -128,6 +128,7 @@ impl TypeFormatter<'_> {
 			Type::Never => f.push('!'),
 			Type::Integer => f.push_str("{integer}"),
 			Type::Float => f.push_str("{float}"),
+			Type::String => f.push_str("{string}"),
 			Type::U8 => f.push_str("u8"),
 			Type::I8 => f.push_str("i8"),
 			Type::U16 => f.push_str("u16"),
@@ -401,7 +402,7 @@ mod tests {
 			let mut signatures = TypeContext::new(
 				&mut diagnostics,
 				&mut resolutions,
-				&graph.strings,
+				&mut graph.strings,
 				&graph.files,
 				&defs,
 				&ast_nodes,

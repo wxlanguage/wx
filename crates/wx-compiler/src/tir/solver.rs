@@ -1305,6 +1305,7 @@ impl Solver {
 			| Type::Never
 			| Type::Integer
 			| Type::Float
+			| Type::String
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1433,7 +1434,11 @@ impl Solver {
 		}
 		let ty = self.normalize_head_query(view, assumption_context, ty)?;
 		let known = match *view.types.resolve(ty) {
-			Type::Error | Type::Infer | Type::Integer | Type::Float => {
+			Type::Error
+			| Type::Infer
+			| Type::Integer
+			| Type::Float
+			| Type::String => {
 				return Err(SolverError::Poisoned);
 			}
 			Type::Never

@@ -1112,7 +1112,7 @@ pub(super) fn report_no_such_type_member(
 
 /// Inherent members win before trait candidates are gathered, so ambiguous
 /// associated-type candidates always have trait declaration identities.
-fn report_ambiguous_type_member(
+pub(super) fn report_ambiguous_type_member(
 	file_id: FileId,
 	strings: &StringInterner,
 	defs: &DefinitionRegistry,

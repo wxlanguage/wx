@@ -27,7 +27,7 @@ use crate::tir::defs::TypeAliasIdx;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::{FileId, Files};
 
-use super::body::Body;
+use super::body::{Body, BodyOwner, ConstBody};
 use super::bounds::{
 	BindingRequirement, BoundArena, BoundClauses, BoundId, ClauseArena,
 	ClauseRange, SourceAssocBinding, SourceTraitBound, TraitClause,
@@ -36,9 +36,9 @@ use super::bounds::{
 };
 use super::defs::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingTarget, ConstIdx,
-	DefId, DefKind, DefinitionRegistry, EnumIdx, FunctionIdx, GlobalIdx,
-	InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier, TraitIdx,
-	TraitImplIdx, TypesetIdx,
+	DefId, DefKey, DefKind, DefinitionRegistry, EnumIdx, FunctionIdx,
+	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier,
+	TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
@@ -137,6 +137,17 @@ pub struct FunctionSignature {
 	param_types: Box<[TypeIndex]>,
 	/// `TypeIndex::UNIT` when the source omits `-> Result`.
 	return_type: TypeIndex,
+}
+
+impl FunctionSignature {
+	/// The parameter types as written, `self` included.
+	pub(super) fn params(&self) -> &[TypeIndex] {
+		&self.param_types
+	}
+
+	pub(super) fn return_type(&self) -> TypeIndex {
+		self.return_type
+	}
 }
 
 /// Field *types* only — names/dedup/lookup already settled in
@@ -298,8 +309,9 @@ impl TypeContext<'_, '_, '_> {
 
 	/// The body phase. Every signature exists and every fact is final, so a
 	/// body may ask the type system anything; nothing it does is recorded for
-	/// later. Constant initializers and enum discriminants so far, in
-	/// definition order, which is the order their diagnostics come out in.
+	/// later. Constant initializers, enum discriminants, function blocks and
+	/// global initializers, in definition order, which is the order their
+	/// diagnostics come out in.
 	fn check_bodies(&mut self) {
 		let ast_nodes = self.ast_nodes;
 		for entry in ast_nodes {
@@ -315,9 +327,78 @@ impl TypeContext<'_, '_, '_> {
 				AstNodeRef::Enum { enum_index, .. } => {
 					self.check_discriminants(enum_index);
 				}
+				AstNodeRef::Function { item, .. } => {
+					if let ast::Item::Function {
+						signature, block, ..
+					} = item
+					{
+						self.check_function_body(entry, signature, block);
+					}
+				}
+				AstNodeRef::TraitFunction { item, .. } => {
+					// A required trait method has no block.
+					if let ast::TraitItem::Function {
+						signature,
+						body: Some(block),
+						..
+					} = item
+					{
+						self.check_function_body(entry, signature, block);
+					}
+				}
+				AstNodeRef::TraitImplFunction { item, .. }
+				| AstNodeRef::InherentImplFunction { item, .. } => {
+					if let ast::ImplItem::Function {
+						signature, block, ..
+					} = item
+					{
+						self.check_function_body(entry, signature, block);
+					}
+				}
+				AstNodeRef::Global { global_index, item } => {
+					let ast::Item::Global { value, .. } = item else {
+						unreachable!("a global's entry is a global")
+					};
+					let scope = LexicalScope {
+						file_id: entry.file_id,
+						namespace: entry.namespace,
+						env: TypeEnvIdx::ROOT,
+					};
+					let ty = self.global_value_type(global_index);
+					let body = BodyContext::new(
+						self,
+						scope,
+						BodyOwner::Global(global_index),
+					)
+					.check_body(value, ty);
+					self.global_bodies[usize::from(global_index)] = Some(body);
+				}
 				_ => {}
 			}
 		}
+	}
+
+	/// Checks a function's block into its `Body` (`function_bodies`), in the
+	/// function's own type scope: its parameters, and an enclosing impl's or
+	/// trait's.
+	fn check_function_body(
+		&mut self,
+		entry: &AstEntry<'_>,
+		signature: &ast::FunctionSignature,
+		block: &Spanned<ast::Expression>,
+	) {
+		let DefId::Function(function_index) = entry.node.def_id() else {
+			unreachable!("a function's entry is a function")
+		};
+		let scope = LexicalScope {
+			file_id: entry.file_id,
+			namespace: entry.namespace,
+			env: self.functions[usize::from(function_index)].type_params,
+		};
+		let body =
+			BodyContext::new(self, scope, BodyOwner::Function(function_index))
+				.check_function(function_index, signature, block);
+		self.function_bodies[usize::from(function_index)] = Some(body);
 	}
 
 	#[cfg(test)]
@@ -507,7 +588,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	/// Every written name resolved so far; see `resolutions.rs`.
 	pub(super) resolutions: &'ctx mut NameResolutions,
-	pub(super) strings: &'ctx StringInterner,
+	pub(super) strings: &'ctx mut StringInterner,
 	/// Source text, for literals whose value is read from their span.
 	pub(super) files: &'ctx Files,
 	pub(super) defs: &'ctx DefinitionRegistry,
@@ -544,13 +625,19 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub(super) functions: Vec<FunctionSignature>,
 	pub(super) constants: Vec<ConstantSignature>,
-	/// Each constant's checked initializer, by `ConstIdx`; filled on demand
-	/// (`ensure_const_body`). `None` for a trait constant without a default.
-	pub(super) const_bodies: Vec<Option<Body>>,
+	/// Each constant's checked initializer, by `ConstIdx`; built on demand
+	/// (`ensure_const_body`). A trait constant without a default has none.
+	pub(super) const_bodies: Vec<ConstBody>,
 	/// Each constant's value query state, by `ConstIdx` (`eval.rs`).
 	pub(super) const_values: Vec<ConstValueState>,
 	/// The constants being evaluated, outermost first.
 	pub(super) const_stack: Vec<ConstIdx>,
+	/// Each function's checked block, by `FunctionIdx`; `None` for one
+	/// without a block (a declaration, an import, a required trait method).
+	pub(super) function_bodies: Vec<Option<Body>>,
+	/// Each global's checked initializer, by `GlobalIdx`; `None` for an
+	/// imported one.
+	pub(super) global_bodies: Vec<Option<Body>>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
 	/// Resolved, exportable targets keyed by decoded external name; filled by `sweep`.
@@ -566,7 +653,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) fn new(
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		resolutions: &'ctx mut NameResolutions,
-		strings: &'ctx StringInterner,
+		strings: &'ctx mut StringInterner,
 		files: &'ctx Files,
 		defs: &'ctx DefinitionRegistry,
 		ast_nodes: &'ast [AstEntry<'ast>],
@@ -596,13 +683,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			})
 			.collect();
 
+		let operators = OperatorTraits::new(defs, strings);
 		Self {
 			diagnostics,
 			resolutions,
 			strings,
 			files,
 			defs,
-			operators: OperatorTraits::new(defs, strings),
+			operators,
 			ast_nodes,
 			query_state,
 			query_stack: Vec::new(),
@@ -670,7 +758,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					scope: TypeEnvIdx::ROOT,
 				})
 				.collect(),
-			const_bodies: defs.constants.iter().map(|_| None).collect(),
+			const_bodies: defs
+				.constants
+				.iter()
+				.map(|_| ConstBody::NotBuilt)
+				.collect(),
+			function_bodies: defs.functions.iter().map(|_| None).collect(),
+			global_bodies: defs.globals.iter().map(|_| None).collect(),
 			const_values: defs
 				.constants
 				.iter()
@@ -849,7 +943,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// What `Self` means inside an impl: the impl's target, found through the
 	/// frame every impl owns. `None` outside an impl, and in the impl's own
 	/// header, whose target is what `Self` would name.
-	fn resolve_impl_self(
+	pub(super) fn resolve_impl_self(
 		&self,
 		env: TypeEnvIdx,
 	) -> Option<(ImplKind, TypeIndex)> {
@@ -868,7 +962,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Type arguments written on an impl's `Self`, which already names the
 	/// target with its arguments: the target is shown, and a struct's own
 	/// name suggested for writing other arguments.
-	fn report_type_args_on_impl_self(
+	pub(super) fn report_type_args_on_impl_self(
 		&self,
 		file_id: FileId,
 		segment: &ast::PathSegment,
@@ -1030,6 +1124,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// The integer type an enum's variant values are held in, or `ERROR`.
 	pub(super) fn enum_repr(&self, enum_index: EnumIdx) -> TypeIndex {
 		self.enums[usize::from(enum_index)].repr
+	}
+
+	/// A global's value type, as written; `ERROR` when it is missing.
+	pub(super) fn global_value_type(
+		&self,
+		global_index: GlobalIdx,
+	) -> TypeIndex {
+		let index =
+			self.defs.globals[usize::from(global_index)].value_assoc_type_index;
+		self.assoc_types[usize::from(index)]
+			.as_ref()
+			.and_then(|signature| signature.value)
+			.unwrap_or(TypeIndex::ERROR)
 	}
 
 	pub(super) fn constant_type(
@@ -1423,8 +1530,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Checks a constant's initializer into its `Body` (`const_bodies`), once.
 	/// On demand: evaluating one constant may need another's body first.
 	pub(super) fn ensure_const_body(&mut self, const_index: ConstIdx) {
-		if self.const_bodies[usize::from(const_index)].is_some() {
-			return;
+		match &self.const_bodies[usize::from(const_index)] {
+			ConstBody::Built(_) | ConstBody::Building => return,
+			ConstBody::NotBuilt => {}
 		}
 		let def_id = DefId::Const(const_index);
 		let entry =
@@ -1464,6 +1572,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					self.defs.enums[usize::from(enum_index)].variants.start;
 				let previous = (const_index != first)
 					.then(|| ConstIdx::new(u32::from(const_index) - 1));
+				self.const_bodies[usize::from(const_index)] =
+					ConstBody::Building;
 				let body = BodyContext::new(
 					self,
 					LexicalScope {
@@ -1471,9 +1581,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						namespace,
 						env: TypeEnvIdx::ROOT,
 					},
+					BodyOwner::Const(const_index),
 				)
 				.check_variant_value(item, previous, repr);
-				self.const_bodies[usize::from(const_index)] = Some(body);
+				self.const_bodies[usize::from(const_index)] =
+					ConstBody::Built(body);
 				return;
 			}
 			_ => unreachable!("a constant's entry is a constant"),
@@ -1485,8 +1597,25 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			namespace,
 			env,
 		};
-		let body = BodyContext::new(self, scope).check_body(value, ty);
-		self.const_bodies[usize::from(const_index)] = Some(body);
+		// Mark the body as being built before building it. Building it may
+		// read this constant's value — a pattern in its initializer names
+		// it — and a read of a constant whose body is being built must not
+		// build that body again: the two builds would ask each other for a
+		// value forever.
+		self.const_bodies[usize::from(const_index)] = ConstBody::Building;
+		let body = BodyContext::new(self, scope, BodyOwner::Const(const_index))
+			.check_body(value, ty);
+		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
+	}
+
+	/// A constant's body, if it is built. `None` when it is not built yet,
+	/// when it is being built, or when it has none (a required trait
+	/// constant).
+	pub(super) fn const_body(&self, const_index: ConstIdx) -> Option<&Body> {
+		match &self.const_bodies[usize::from(const_index)] {
+			ConstBody::Built(body) => Some(body),
+			ConstBody::NotBuilt | ConstBody::Building => None,
+		}
 	}
 
 	/// Resolves and validates a `memory` declaration's `Size` and fills in
@@ -2588,37 +2717,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// The memory an untagged pointer/slice/array type implicitly belongs
-	/// to: the sole `memory` declaration visible to the whole compilation,
-	/// if there's exactly one. Zero or several are both errors — there's no
-	/// sense in which one memory could be "the" ambient one among several,
-	/// and nothing to be ambient at all with none declared. A concrete
-	/// memory needs none of its own signature forced to be interned here:
-	/// `Type::Memory` carries only `memory_index`, so this is pure identity,
-	/// unlike the legacy builder's version (which had to force the size).
-	fn resolve_ambient_memory(
-		&mut self,
-		file_id: FileId,
-		span: TextSpan,
-	) -> Result<TypeIndex, ()> {
-		match self.defs.memories.len() {
-			0 => {
-				self.diagnostics
-					.push(report_no_memory_for_pointer(file_id, span));
-				Err(())
-			}
-			1 => {
-				let memory_index = MemoryIdx::new(0);
-				Ok(self.types.intern(Type::Memory { memory_index }))
-			}
-			_ => {
-				self.diagnostics
-					.push(report_ambiguous_pointer_memory(file_id, span));
-				Err(())
-			}
-		}
-	}
-
 	/// A tag is an ordinary type with an additional Memory requirement.
 	fn resolve_memory_tag(
 		&mut self,
@@ -2654,10 +2752,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		ty
 	}
 
-	/// The memory a pointer/slice/array type belongs to — an explicit
-	/// `heap::` tag if it has one, the ambient one otherwise. Shared by
-	/// `Pointer`/`Slice`/`Array`'s three arms in `resolve_type`, which
-	/// otherwise differ only in which `Type` variant they intern.
+	/// The memory a pointer/slice/array type belongs to: its `heap::` tag.
+	/// A type without one is an error; there is no default memory to guess
+	/// from, however many are declared. Shared by `Pointer`/`Slice`/
+	/// `Array`'s three arms in `resolve_type`, which otherwise differ only in
+	/// which `Type` variant they intern.
 	fn resolve_pointer_memory(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
@@ -2673,7 +2772,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				segments,
 				infer_policy,
 			)),
-			None => self.resolve_ambient_memory(scope.file_id, span),
+			None => {
+				self.diagnostics
+					.push(report_pointer_without_memory(scope.file_id, span));
+				Err(())
+			}
 		}
 	}
 
@@ -2759,7 +2862,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	}
 
 	/// Resolve both ordinary type paths and explicit memory tags.
-	fn resolve_type_path(
+	pub(super) fn resolve_type_path(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
 		scope: LexicalScope,
@@ -2859,17 +2962,209 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				));
 			}
 
-			let resolved = match def_key.symbol_kind(self.defs) {
-				// An intrinsic alias takes no arguments: it is a primitive,
-				// not an alias with an empty parameter list.
-				kind @ DefKind::TypeAlias(type_alias_index)
-					if !stopped.type_args.is_empty()
-						&& self
-							.defs
-							.intrinsics
-							.identity_of(type_alias_index)
-							.is_some() =>
-				{
+			let resolved = self.resolve_named_type(
+				obligations,
+				scope,
+				def_key,
+				stopped,
+				infer_policy,
+			);
+
+			(resolved, walk.stopped_at as usize + 1)
+		};
+
+		// Whatever's left continues through impl dispatch or a
+		// bound instead of the scope.namespace graph — `members.rs`'s
+		// job, not this module's.
+		self.resolve_type_member_path(
+			obligations,
+			scope,
+			current,
+			&segments[next..],
+			infer_policy,
+		)
+	}
+
+	/// The type a definition a path stopped at names, with the arguments
+	/// written on its segment (`stopped`): a struct, enum, alias, memory,
+	/// global or function. Anything else is reported as not a type.
+	pub(super) fn resolve_named_type(
+		&mut self,
+		obligations: &mut Vec<Obligation>,
+		scope: LexicalScope,
+		def_key: DefKey,
+		stopped: &ast::PathSegment,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		match def_key.symbol_kind(self.defs) {
+			// An intrinsic alias takes no arguments: it is a primitive,
+			// not an alias with an empty parameter list.
+			kind @ DefKind::TypeAlias(type_alias_index)
+				if !stopped.type_args.is_empty()
+					&& self
+						.defs
+						.intrinsics
+						.identity_of(type_alias_index)
+						.is_some() =>
+			{
+				// Resolved only to report what is wrong inside them.
+				for arg in &stopped.type_args {
+					self.resolve_type_expression(
+						obligations,
+						scope,
+						arg,
+						infer_policy,
+					);
+				}
+				self.diagnostics.push(report_type_args_not_allowed(
+					self.strings,
+					self.defs,
+					scope.file_id,
+					stopped,
+					TypeArgsNotAllowedOn::Declaration(kind),
+				));
+				// What it names is unambiguous, so the type is kept.
+				self.defs.intrinsics.identity_of(type_alias_index).unwrap()
+			}
+			DefKind::TypeAlias(type_alias_index) => {
+				let def_id = DefId::TypeAlias(type_alias_index);
+				let reference =
+					SourceSpan::new(scope.file_id, stopped.ident.span);
+				let status = self.ensure_signature(QueryInfo {
+					def_id,
+					requested_at: Some(reference),
+				});
+				match status {
+					SignatureStatus::Cycle => {
+						let diagnostic =
+							self.report_cyclic_type_alias(def_id, reference);
+						self.diagnostics.push(diagnostic);
+						TypeIndex::ERROR
+					}
+					SignatureStatus::CycleReported => TypeIndex::ERROR,
+					SignatureStatus::Available(
+						SignatureLocation::TypeAlias(index),
+					) => {
+						let TypeAliasSignature {
+							type_params,
+							target,
+						} = self.type_aliases[usize::from(index)];
+						let resolved_args: Box<[TypeIndex]> = stopped
+							.type_args
+							.iter()
+							.map(|arg| {
+								self.resolve_type_expression(
+									obligations,
+									scope,
+									arg,
+									infer_policy,
+								)
+							})
+							.collect();
+						let type_args = self.resolve_type_args(
+							obligations,
+							scope,
+							stopped,
+							type_params,
+							&[],
+							&resolved_args,
+							TypeEnvOwner::TypeAlias(index),
+						);
+						self.types.substitute(
+							target,
+							Substitution {
+								envs: &self.type_envs,
+								env: type_params,
+								args: &type_args,
+							},
+						)
+					}
+					SignatureStatus::Available(_) => unreachable!(
+						"a TypeAlias DefId always resolves to SignatureLocation::TypeAlias"
+					),
+				}
+			}
+			DefKind::Struct(struct_index) => {
+				// Only forces resolution for a genuine forward
+				// reference (`Pending`); an in-progress struct
+				// is left alone so `check_struct_direct_recursion`
+				// downstream still gets to observe `Cycle`
+				// itself. Either way `type_params` (written
+				// before fields, see `RecordStruct`/
+				// `TupleStruct` above) is already valid to
+				// read by the time we get here.
+				let def_id = DefId::Struct(struct_index);
+				if matches!(
+					self.query_state[&def_id].state,
+					QueryState::Pending
+				) {
+					let _ = self.ensure_signature(QueryInfo {
+						def_id,
+						requested_at: Some(SourceSpan::new(
+							scope.file_id,
+							stopped.ident.span,
+						)),
+					});
+				}
+				let params_env =
+					self.structs[usize::from(struct_index)].type_params;
+
+				let resolved_args: Box<[TypeIndex]> = stopped
+					.type_args
+					.iter()
+					.map(|arg| {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						)
+					})
+					.collect();
+				let type_args = self.resolve_type_args(
+					obligations,
+					scope,
+					stopped,
+					params_env,
+					&[],
+					&resolved_args,
+					TypeEnvOwner::Struct(struct_index),
+				);
+				self.types.intern_struct(struct_index, &type_args)
+			}
+			DefKind::Enum(enum_index) => {
+				if !stopped.type_args.is_empty() {
+					// Resolved only to report what is wrong inside them.
+					for arg in &stopped.type_args {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						);
+					}
+					self.diagnostics.push(report_type_args_not_allowed(
+						self.strings,
+						self.defs,
+						scope.file_id,
+						stopped,
+						TypeArgsNotAllowedOn::Declaration(DefKind::Enum(
+							enum_index,
+						)),
+					));
+					TypeIndex::ERROR
+				} else {
+					// Nominal identity is available from definition collection;
+					// naming an enum does not depend on resolving its repr.
+					self.types.intern(Type::Enum { enum_index })
+				}
+			}
+			// Every memory declaration is its own nominal type,
+			// including when referenced as a memory tag.
+			kind @ DefKind::Memory(memory_index) => {
+				if stopped.type_args.is_empty() {
+					self.types.intern(Type::Memory { memory_index })
+				} else {
 					// Resolved only to report what is wrong inside them.
 					for arg in &stopped.type_args {
 						self.resolve_type_expression(
@@ -2886,276 +3181,104 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						stopped,
 						TypeArgsNotAllowedOn::Declaration(kind),
 					));
-					// What it names is unambiguous, so the type is kept.
-					self.defs.intrinsics.identity_of(type_alias_index).unwrap()
+					TypeIndex::ERROR
 				}
-				DefKind::TypeAlias(type_alias_index) => {
-					let def_id = DefId::TypeAlias(type_alias_index);
-					let reference =
-						SourceSpan::new(scope.file_id, stopped.ident.span);
-					let status = self.ensure_signature(QueryInfo {
+			}
+			kind @ (DefKind::Module(_)
+			| DefKind::Package(_)
+			| DefKind::PackageInstance(_)
+			| DefKind::Import(_)
+			| DefKind::Trait(_)
+			| DefKind::TypeSet(_)) => {
+				self.diagnostics.push(report_not_a_type(
+					scope.file_id,
+					self.strings,
+					stopped.ident,
+					kind,
+				));
+				TypeIndex::ERROR
+			}
+			// A free function is its own zero-sized type, applied
+			// like a struct (`foo<i32>`). The type-param frame is
+			// pushed before the parameters are lowered, so a
+			// function naming itself reads a valid `type_params`.
+			DefKind::Function(func_index) => {
+				let def_id = DefId::Function(func_index);
+				if matches!(
+					self.query_state[&def_id].state,
+					QueryState::Pending
+				) {
+					let _ = self.ensure_signature(QueryInfo {
 						def_id,
-						requested_at: Some(reference),
+						requested_at: Some(SourceSpan::new(
+							scope.file_id,
+							stopped.ident.span,
+						)),
 					});
-					match status {
-						SignatureStatus::Cycle => {
-							let diagnostic = self
-								.report_cyclic_type_alias(def_id, reference);
-							self.diagnostics.push(diagnostic);
-							TypeIndex::ERROR
-						}
-						SignatureStatus::CycleReported => TypeIndex::ERROR,
-						SignatureStatus::Available(
-							SignatureLocation::TypeAlias(index),
-						) => {
-							let TypeAliasSignature {
-								type_params,
-								target,
-							} = self.type_aliases[usize::from(index)];
-							let resolved_args: Box<[TypeIndex]> = stopped
-								.type_args
-								.iter()
-								.map(|arg| {
-									self.resolve_type_expression(
-										obligations,
-										scope,
-										arg,
-										infer_policy,
-									)
-								})
-								.collect();
-							let type_args = self.resolve_type_args(
-								obligations,
-								scope,
-								stopped,
-								type_params,
-								&[],
-								&resolved_args,
-								TypeEnvOwner::TypeAlias(index),
-							);
-							self.types.substitute(
-								target,
-								Substitution {
-									envs: &self.type_envs,
-									env: type_params,
-									args: &type_args,
-								},
-							)
-						}
-						SignatureStatus::Available(_) => unreachable!(
-							"a TypeAlias DefId always resolves to SignatureLocation::TypeAlias"
-						),
-					}
 				}
-				DefKind::Struct(struct_index) => {
-					// Only forces resolution for a genuine forward
-					// reference (`Pending`); an in-progress struct
-					// is left alone so `check_struct_direct_recursion`
-					// downstream still gets to observe `Cycle`
-					// itself. Either way `type_params` (written
-					// before fields, see `RecordStruct`/
-					// `TupleStruct` above) is already valid to
-					// read by the time we get here.
-					let def_id = DefId::Struct(struct_index);
-					if matches!(
-						self.query_state[&def_id].state,
-						QueryState::Pending
-					) {
-						let _ = self.ensure_signature(QueryInfo {
-							def_id,
-							requested_at: Some(SourceSpan::new(
-								scope.file_id,
-								stopped.ident.span,
-							)),
-						});
+				let params_env =
+					self.functions[usize::from(func_index)].type_params;
+				let resolved_args: Box<[TypeIndex]> = stopped
+					.type_args
+					.iter()
+					.map(|arg| {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						)
+					})
+					.collect();
+				let type_args = self.resolve_type_args(
+					obligations,
+					scope,
+					stopped,
+					params_env,
+					&[],
+					&resolved_args,
+					TypeEnvOwner::Function(func_index),
+				);
+				self.types.intern_function(func_index, &type_args)
+			}
+			// Every global is its own nominal type, the one its
+			// `Global` impl targets; it takes no arguments.
+			kind @ DefKind::Global(global_index) => {
+				if stopped.type_args.is_empty() {
+					self.types.intern(Type::Global { global_index })
+				} else {
+					// Resolved only to report what is wrong inside them.
+					for arg in &stopped.type_args {
+						self.resolve_type_expression(
+							obligations,
+							scope,
+							arg,
+							infer_policy,
+						);
 					}
-					let params_env =
-						self.structs[usize::from(struct_index)].type_params;
-
-					let resolved_args: Box<[TypeIndex]> = stopped
-						.type_args
-						.iter()
-						.map(|arg| {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							)
-						})
-						.collect();
-					let type_args = self.resolve_type_args(
-						obligations,
-						scope,
-						stopped,
-						params_env,
-						&[],
-						&resolved_args,
-						TypeEnvOwner::Struct(struct_index),
-					);
-					self.types.intern_struct(struct_index, &type_args)
-				}
-				DefKind::Enum(enum_index) => {
-					if !stopped.type_args.is_empty() {
-						// Resolved only to report what is wrong inside them.
-						for arg in &stopped.type_args {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							);
-						}
-						self.diagnostics.push(report_type_args_not_allowed(
-							self.strings,
-							self.defs,
-							scope.file_id,
-							stopped,
-							TypeArgsNotAllowedOn::Declaration(DefKind::Enum(
-								enum_index,
-							)),
-						));
-						TypeIndex::ERROR
-					} else {
-						// Nominal identity is available from definition collection;
-						// naming an enum does not depend on resolving its repr.
-						self.types.intern(Type::Enum { enum_index })
-					}
-				}
-				// Every memory declaration is its own nominal type,
-				// including when referenced as a memory tag.
-				kind @ DefKind::Memory(memory_index) => {
-					if stopped.type_args.is_empty() {
-						self.types.intern(Type::Memory { memory_index })
-					} else {
-						// Resolved only to report what is wrong inside them.
-						for arg in &stopped.type_args {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							);
-						}
-						self.diagnostics.push(report_type_args_not_allowed(
-							self.strings,
-							self.defs,
-							scope.file_id,
-							stopped,
-							TypeArgsNotAllowedOn::Declaration(kind),
-						));
-						TypeIndex::ERROR
-					}
-				}
-				kind @ (DefKind::Module(_)
-				| DefKind::Package(_)
-				| DefKind::PackageInstance(_)
-				| DefKind::Import(_)
-				| DefKind::Trait(_)
-				| DefKind::TypeSet(_)) => {
-					self.diagnostics.push(report_not_a_type(
-						scope.file_id,
+					self.diagnostics.push(report_type_args_not_allowed(
 						self.strings,
-						stopped.ident,
-						kind,
+						self.defs,
+						scope.file_id,
+						stopped,
+						TypeArgsNotAllowedOn::Declaration(kind),
 					));
 					TypeIndex::ERROR
 				}
-				// A free function is its own zero-sized type, applied
-				// like a struct (`foo<i32>`). The type-param frame is
-				// pushed before the parameters are lowered, so a
-				// function naming itself reads a valid `type_params`.
-				DefKind::Function(func_index) => {
-					let def_id = DefId::Function(func_index);
-					if matches!(
-						self.query_state[&def_id].state,
-						QueryState::Pending
-					) {
-						let _ = self.ensure_signature(QueryInfo {
-							def_id,
-							requested_at: Some(SourceSpan::new(
-								scope.file_id,
-								stopped.ident.span,
-							)),
-						});
-					}
-					let params_env =
-						self.functions[usize::from(func_index)].type_params;
-					let resolved_args: Box<[TypeIndex]> = stopped
-						.type_args
-						.iter()
-						.map(|arg| {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							)
-						})
-						.collect();
-					let type_args = self.resolve_type_args(
-						obligations,
-						scope,
-						stopped,
-						params_env,
-						&[],
-						&resolved_args,
-						TypeEnvOwner::Function(func_index),
-					);
-					self.types.intern_function(func_index, &type_args)
-				}
-				// Every global is its own nominal type, the one its
-				// `Global` impl targets; it takes no arguments.
-				kind @ DefKind::Global(global_index) => {
-					if stopped.type_args.is_empty() {
-						self.types.intern(Type::Global { global_index })
-					} else {
-						// Resolved only to report what is wrong inside them.
-						for arg in &stopped.type_args {
-							self.resolve_type_expression(
-								obligations,
-								scope,
-								arg,
-								infer_policy,
-							);
-						}
-						self.diagnostics.push(report_type_args_not_allowed(
-							self.strings,
-							self.defs,
-							scope.file_id,
-							stopped,
-							TypeArgsNotAllowedOn::Declaration(kind),
-						));
-						TypeIndex::ERROR
-					}
-				}
-				// Value-tier only — a `Tier::Type` walk
-				// can never stop on one of these.
-				DefKind::EnumVariant(_) | DefKind::Const(_) => unreachable!(
-					"value-tier DefKind from a type-scope.namespace path walk"
-				),
-				// Never constructed anywhere — associated types are
-				// only ever reached through `resolve_type_member_path`'s
-				// own `MemberKind::AssociatedType`, never as a
-				// top-level scope.namespace symbol.
-				DefKind::TraitAssocType(_) => unreachable!(
-					"TraitAssocType is never registered as a scope.namespace symbol"
-				),
-			};
-
-			(resolved, walk.stopped_at as usize + 1)
-		};
-
-		// Whatever's left continues through impl dispatch or a
-		// bound instead of the scope.namespace graph — `members.rs`'s
-		// job, not this module's.
-		self.resolve_type_member_path(
-			obligations,
-			scope,
-			current,
-			&segments[next..],
-			infer_policy,
-		)
+			}
+			// Value-tier only — a `Tier::Type` walk
+			// can never stop on one of these.
+			DefKind::EnumVariant(_) | DefKind::Const(_) => unreachable!(
+				"value-tier DefKind from a type-scope.namespace path walk"
+			),
+			// Never constructed anywhere — associated types are
+			// only ever reached through `resolve_type_member_path`'s
+			// own `MemberKind::AssociatedType`, never as a
+			// top-level scope.namespace symbol.
+			DefKind::TraitAssocType(_) => unreachable!(
+				"TraitAssocType is never registered as a scope.namespace symbol"
+			),
+		}
 	}
 
 	/// The written arguments for a member function's own parameters. Without
@@ -4090,7 +4213,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// `None` if the path failed to resolve to a real trait; already
 	/// diagnosed either way, by `resolve_path` itself or by the "expected a
 	/// trait" report below.
-	fn resolve_trait_bound_path(
+	pub(super) fn resolve_trait_bound_path(
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
@@ -4308,28 +4431,22 @@ fn report_missing_constant_type(
 		)
 }
 
-fn report_no_memory_for_pointer(
+fn report_pointer_without_memory(
 	file_id: FileId,
 	span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::NoMemoryForPointer.code())
-		.with_message("a pointer type requires a linear memory")
-		.with_label(SourceSpan::new(file_id, span).primary_label())
-		.with_note("declare a memory in this module: `memory <name>: u32;`")
-}
-
-fn report_ambiguous_pointer_memory(
-	file_id: FileId,
-	span: TextSpan,
-) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::AmbiguousPointerMemory.code())
-		.with_message(
-			"pointer type is ambiguous: multiple memories are declared",
+		.with_code(DiagnosticCode::PointerWithoutMemory.code())
+		.with_message("a pointer type must name its memory")
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("no memory written here"),
 		)
-		.with_label(SourceSpan::new(file_id, span).primary_label())
-		.with_note("specify which memory with `<memory_name>::*T` syntax")
+		.with_note(
+			"write the memory before the sigil: `heap::*T`, or a memory \
+			 parameter `Mem::*T`",
+		)
 }
 
 #[cfg(test)]
@@ -4431,7 +4548,7 @@ pub(super) mod tests {
 				panic!("expected an associated type, got {referent:?}");
 			};
 			assert_eq!(
-				case.graph.strings.resolve(
+				case.context.strings.resolve(
 					case.defs.assoc_types[usize::from(index)].name.inner
 				),
 				Some("A")
@@ -4489,11 +4606,11 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn builtin_operators_match_the_stdlib_impls() {
+	fn primitive_operators_match_the_stdlib_impls() {
 		use crate::tir::operators::{
-			Scalar, is_builtin_binary, is_builtin_unary,
+			Scalar, is_primitive_binary, is_primitive_unary,
 		};
-		// The compiler builds `Binary`/`Unary` exactly where the stdlib has a
+		// The compiler builds `PrimitiveBinary`/`PrimitiveUnary` exactly where the stdlib has a
 		// primitive impl, so the two must name the same pairs.
 		test_case!(case = include_str!("../../std/main.wx"));
 		let implements = |trait_index: TraitIdx, scalar: Scalar| {
@@ -4531,7 +4648,7 @@ pub(super) mod tests {
 			for scalar in Scalar::ALL {
 				assert_eq!(
 					implements(method.trait_index, scalar),
-					is_builtin_binary(op, scalar),
+					is_primitive_binary(op, scalar.ty()),
 					"`{}` on {scalar:?}",
 					op.as_str()
 				);
@@ -4546,7 +4663,7 @@ pub(super) mod tests {
 			for scalar in Scalar::ALL {
 				assert_eq!(
 					implements(method.trait_index, scalar),
-					is_builtin_unary(op, scalar),
+					is_primitive_unary(op, scalar.ty()),
 					"{op:?} on {scalar:?}"
 				);
 			}
@@ -4570,8 +4687,8 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{name}` to be a constant");
 			};
-			case.context.const_bodies[usize::from(index)]
-				.as_ref()
+			case.context
+				.const_body(index)
 				.expect("a constant with an initializer has a body")
 		}
 
@@ -4589,44 +4706,50 @@ pub(super) mod tests {
 					ExprKind::Float(value) => format!("{value:?}"),
 					ExprKind::Bool(value) => value.to_string(),
 					ExprKind::Char(value) => format!("{value:?}"),
-					ExprKind::Const(index) => {
+					ExprKind::Const {
+						constant: index, ..
+					} => {
 						let name =
 							case.defs.constants[usize::from(index)].name.inner;
-						case.graph.strings.resolve(name).unwrap().to_string()
+						case.context.strings.resolve(name).unwrap().to_string()
 					}
 					ExprKind::NextDiscriminant(index) => {
 						let name =
 							case.defs.constants[usize::from(index)].name.inner;
 						format!(
 							"(next {})",
-							case.graph.strings.resolve(name).unwrap()
+							case.context.strings.resolve(name).unwrap()
 						)
 					}
-					ExprKind::Unary { op, operand } => {
+					ExprKind::PrimitiveUnary { op, operand } => {
 						format!(
 							"({} {})",
 							op.as_str(),
 							render(case, body, operand)
 						)
 					}
-					ExprKind::Binary { op, lhs, rhs } => format!(
+					ExprKind::PrimitiveBinary { op, lhs, rhs } => format!(
 						"({} {} {})",
 						op.as_str(),
 						render(case, body, lhs),
 						render(case, body, rhs)
 					),
-					ExprKind::MethodCall { method, args }
-					| ExprKind::GenericMethodCall { method, args } => {
-						let generic = matches!(
+					ExprKind::Call {
+						function: method,
+						args,
+						..
+					}
+					| ExprKind::AbstractCall { method, args, .. } => {
+						let abstract_call = matches!(
 							body.kind(expr),
-							ExprKind::GenericMethodCall { .. }
+							ExprKind::AbstractCall { .. }
 						);
 						let name =
 							case.defs.functions[usize::from(method)].name.inner;
 						let mut text = format!(
 							"({}{}",
-							if generic { "generic " } else { "call " },
-							case.graph.strings.resolve(name).unwrap()
+							if abstract_call { "abstract " } else { "call " },
+							case.context.strings.resolve(name).unwrap()
 						);
 						for &arg in body.args(args) {
 							text.push(' ');
@@ -4656,7 +4779,7 @@ pub(super) mod tests {
 						order,
 					} => {
 						let def = &case.defs.structs[usize::from(struct_index)];
-						let strings = &case.graph.strings;
+						let strings = &case.context.strings;
 						let mut text = format!(
 							"({}",
 							strings.resolve(def.name.inner).unwrap()
@@ -4675,6 +4798,8 @@ pub(super) mod tests {
 						}
 						text + ")"
 					}
+					// Function bodies' forms; the typecheck suite renders them.
+					kind => format!("{kind:?}"),
 				};
 				let ty =
 					case.context.type_formatter().display_type(body.ty(expr));
@@ -4821,7 +4946,7 @@ pub(super) mod tests {
 			assert_eq!(shape(&case, "X"), "(V):V");
 			assert_eq!(shape(&case, "Y"), "(call add X:V X:V):V");
 			// `ne` is the trait's default: dispatched through the declaration.
-			assert_eq!(shape(&case, "Z"), "(generic ne X:V X:V):bool");
+			assert_eq!(shape(&case, "Z"), "(abstract ne X:V X:V):bool");
 		}
 
 		#[test]
@@ -5652,7 +5777,7 @@ pub(super) mod tests {
 			member_name: &str,
 		) -> TypeIndex {
 			let trait_index = case.trait_index(trait_name);
-			let name = case.graph.strings.get(member_name).unwrap();
+			let name = case.context.strings.get(member_name).unwrap();
 			let assoc_type_index = case.defs.traits[usize::from(trait_index)]
 				.members
 				.iter()
@@ -5707,7 +5832,7 @@ pub(super) mod tests {
 				("plain", None),
 				("unrelated", Some(other)),
 			] {
-				let name_symbol = case.graph.strings.get(name).unwrap();
+				let name_symbol = case.context.strings.get(name).unwrap();
 				let index = case
 					.defs
 					.functions
@@ -6111,7 +6236,7 @@ pub(super) mod tests {
 		check(&mut TypeContext::new(
 			&mut diagnostics,
 			&mut resolutions,
-			&graph.strings,
+			&mut graph.strings,
 			&graph.files,
 			&defs,
 			&ast_nodes,
@@ -6208,7 +6333,8 @@ pub(super) mod tests {
 	/// own stack, declared before the `TestCase` that borrows them, which
 	/// `test_case!` spells out in one line.
 	struct TestInputs<'g> {
-		graph: &'g vfs::CompilationUnit,
+		files: &'g Files,
+		strings: &'g mut StringInterner,
 		defs: DefinitionRegistry,
 		ast_nodes: Vec<AstEntry<'g>>,
 		impl_dispatch: ImplDispatch,
@@ -6218,27 +6344,34 @@ pub(super) mod tests {
 
 	impl<'g> TestInputs<'g> {
 		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+			let vfs::CompilationUnit {
+				files,
+				packages,
+				strings,
+				stdlib_package,
+				root_package,
+			} = graph;
 			let mut diagnostics = Vec::new();
 			let mut resolutions = NameResolutions::default();
 			let (defs, ast_nodes) = DefinitionRegistry::build(
-				&graph.packages,
-				&graph.files,
-				&mut graph.strings,
+				packages,
+				files,
+				strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
-				graph.root_package,
+				*stdlib_package,
+				*root_package,
 			);
-			let graph = &*graph;
 			let impl_dispatch = ImplDispatch::build(
 				&mut diagnostics,
 				&mut resolutions,
-				&graph.strings,
+				strings,
 				&defs,
 				&ast_nodes,
 			);
 			Self {
-				graph,
+				files,
+				strings,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -6251,7 +6384,6 @@ pub(super) mod tests {
 	/// A live, fully swept `TypeContext` over `TestInputs`, plus the graph
 	/// and definitions tests read alongside it.
 	struct TestCase<'a> {
-		graph: &'a vfs::CompilationUnit,
 		defs: &'a DefinitionRegistry,
 		context: TypeContext<'a, 'a, 'a>,
 	}
@@ -6259,7 +6391,8 @@ pub(super) mod tests {
 	impl<'a> TestCase<'a> {
 		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
 			let TestInputs {
-				graph,
+				files,
+				strings,
 				defs,
 				ast_nodes,
 				impl_dispatch,
@@ -6269,18 +6402,21 @@ pub(super) mod tests {
 			let mut context = TypeContext::new(
 				diagnostics,
 				resolutions,
-				&graph.strings,
-				&graph.files,
+				strings,
+				files,
 				defs,
 				ast_nodes,
 				impl_dispatch,
 			);
 			context.sweep();
-			Self {
-				graph,
-				defs,
-				context,
-			}
+			// The body checker does not cover every form the stdlib's
+			// function bodies use yet; what it does not cover is reported as
+			// unsupported, which these tests do not concern.
+			context.diagnostics.retain(|diagnostic| {
+				diagnostic.code.as_deref()
+					!= Some(DiagnosticCode::UnsupportedExpression.code())
+			});
+			Self { defs, context }
 		}
 
 		/// Resolves `name` as a type-position path from the root namespace —
@@ -6304,7 +6440,7 @@ pub(super) mod tests {
 				.map(|segment| ast::PathSegment {
 					ident: Spanned {
 						inner: self
-							.graph
+							.context
 							.strings
 							.get(segment)
 							.expect("already interned from source"),
@@ -6318,7 +6454,7 @@ pub(super) mod tests {
 			let target = PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				&self.graph.strings,
+				self.context.strings,
 				self.defs,
 			)
 			.resolve_path(file_id, root, &segments, tier);
@@ -6360,7 +6496,7 @@ pub(super) mod tests {
 			DiagnosticView::new(
 				"siganture",
 				&self.context.diagnostics,
-				&self.graph.files,
+				&self.context.files,
 			)
 		}
 
@@ -6397,7 +6533,7 @@ pub(super) mod tests {
 		) -> &AssocTypeSignature {
 			let trait_index = self.trait_index(trait_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6429,7 +6565,7 @@ pub(super) mod tests {
 		) -> &FunctionSignature {
 			let trait_index = self.trait_index(trait_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6458,7 +6594,7 @@ pub(super) mod tests {
 		) -> &ConstantSignature {
 			let trait_index = self.trait_index(trait_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6499,7 +6635,7 @@ pub(super) mod tests {
 			name: &str,
 		) -> MemberKind {
 			let impl_index = self.trait_impl_index(struct_path, trait_path);
-			let symbol = self.graph.strings.get(name).unwrap();
+			let symbol = self.context.strings.get(name).unwrap();
 			let definition = &self.defs.trait_impls[usize::from(impl_index)];
 			let &index =
 				definition.bindings.get(&BindingKey::value(symbol)).unwrap();
@@ -6549,7 +6685,7 @@ pub(super) mod tests {
 		) -> &FunctionSignature {
 			let impl_index = self.inherent_impl_index(struct_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6578,7 +6714,7 @@ pub(super) mod tests {
 		) -> &ConstantSignature {
 			let impl_index = self.inherent_impl_index(struct_path);
 			let symbol = self
-				.graph
+				.context
 				.strings
 				.get(name)
 				.expect("already interned from source");
@@ -6955,7 +7091,7 @@ pub(super) mod tests {
 	#[test]
 	fn never_and_unit_are_written_types() {
 		test_case!(
-			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f(a: !, b: ()) -> ! {}"
+			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f(a: !, b: ()) -> ! { loop {} }"
 		);
 		case.diagnostics().assert_none();
 		let signature = case.function_signature("f");
@@ -8404,7 +8540,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			type i32;
-			func f(x: colors::Color) -> Alias {}
+			func f(x: colors::Color) -> Alias { loop {} }
 			const FIRST: Alias = colors::Color::Red;
 			struct Paint( color: Alias );
 			type Alias = colors::Color;
@@ -8577,7 +8713,7 @@ pub(super) mod tests {
 		] {
 			test_case!(
 				case = &format!(
-					"func f(x: Color) -> Color {{}} {declaration} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+					"func f(x: Color) -> Color {{ loop {{}} }} {declaration} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
 				)
 			);
 			assert_eq!(
@@ -9058,7 +9194,7 @@ pub(super) mod tests {
 
 		let impl_def = &case.defs.trait_impls[usize::from(impl_index)];
 		let item_symbol = case
-			.graph
+			.context
 			.strings
 			.get("Item")
 			.expect("already interned from source");
@@ -9588,7 +9724,7 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn pointer_type_resolves_through_the_sole_declared_memory() {
+	fn pointer_type_resolves_through_its_memory_tag() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9596,7 +9732,7 @@ pub(super) mod tests {
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
-			func f(x: *u32);
+			func f(x: heap::*u32);
 		"}
 		);
 		assert!(
@@ -9633,7 +9769,7 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn pointer_type_with_no_memory_declared_is_diagnosed() {
+	fn pointer_type_without_a_memory_is_diagnosed_with_no_memory_declared() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9641,16 +9777,8 @@ pub(super) mod tests {
 			func f(x: *u32);
 		"}
 		);
-		assert_eq!(
-			case.context.diagnostics.len(),
-			1,
-			"{:?}",
-			case.context.diagnostics
-		);
-		assert_eq!(
-			case.context.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::NoMemoryForPointer.code())
-		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PointerWithoutMemory]);
 		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
 		else {
 			panic!("expected `f` to be a function");
@@ -9660,7 +9788,28 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn pointer_type_with_multiple_memories_is_diagnosed_as_ambiguous() {
+	fn pointer_type_without_a_memory_is_diagnosed_even_with_one_memory() {
+		// A sole declared memory is not taken as the default: the memory is
+		// always written.
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			typeset PointerSize { u32 }
+			trait Memory { type Size: PointerSize; }
+			memory heap: u32;
+			func f(x: *u32, y: &[u32], z: *[u32; 2]);
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PointerWithoutMemory,
+			DiagnosticCode::PointerWithoutMemory,
+			DiagnosticCode::PointerWithoutMemory,
+		]);
+	}
+
+	#[test]
+	fn pointer_type_without_a_memory_is_diagnosed_with_several_memories() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9672,26 +9821,12 @@ pub(super) mod tests {
 			func f(x: *u32);
 		"}
 		);
-		assert_eq!(
-			case.context.diagnostics.len(),
-			1,
-			"{:?}",
-			case.context.diagnostics
-		);
-		assert_eq!(
-			case.context.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::AmbiguousPointerMemory.code())
-		);
-		let DefKind::Function(function_index) = case.resolve(Tier::Value, "f")
-		else {
-			panic!("expected `f` to be a function");
-		};
-		let signature = &case.context.functions[usize::from(function_index)];
-		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PointerWithoutMemory]);
 	}
 
 	#[test]
-	fn slice_and_array_types_resolve_through_the_sole_declared_memory() {
+	fn slice_and_array_types_resolve_through_their_memory_tag() {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -9699,7 +9834,7 @@ pub(super) mod tests {
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
-			func f(s: &[u32], a: *[u32; 4]);
+			func f(s: heap::&[u32], a: heap::*[u32; 4]);
 		"}
 		);
 		assert!(
@@ -11927,8 +12062,8 @@ pub(super) mod tests {
 			trait Container { type Item; }
 			struct Wrapper();
 			impl Container for Wrapper { type Item = i32; }
-			type Actual = func((Wrapper::Item, Wrapper::Item), *Wrapper::Item) -> Wrapper::Item;
-			type Expected = func((i32, i32), *i32) -> i32;
+			type Actual = func((Wrapper::Item, Wrapper::Item), heap::*Wrapper::Item) -> Wrapper::Item;
+			type Expected = func((i32, i32), heap::*i32) -> i32;
 			func f(a: Actual, b: Expected) {}
 		"}
 		);
@@ -14258,12 +14393,14 @@ pub(super) mod tests {
 
 		macro_rules! checked_case {
 			($case:ident = $source:expr $(,)?) => {
-				test_case!($case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!($case from graph);
 			};
 			(mut $case:ident = $source:expr $(,)?) => {
-				test_case!(mut $case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!(mut $case from graph);
 			};
 		}
 
@@ -14408,7 +14545,8 @@ pub(super) mod tests {
 					.functions
 					.iter()
 					.position(|def| {
-						case.graph.strings.resolve(def.name.inner) == Some(name)
+						case.context.strings.resolve(def.name.inner)
+							== Some(name)
 					})
 					.unwrap()
 			};
@@ -14467,7 +14605,7 @@ pub(super) mod tests {
 				.functions
 				.iter()
 				.position(|def| {
-					case.graph.strings.resolve(def.name.inner)
+					case.context.strings.resolve(def.name.inner)
 						== Some("provided")
 				})
 				.unwrap();
@@ -14580,12 +14718,14 @@ pub(super) mod tests {
 
 		macro_rules! checked_case {
 			($case:ident = $source:expr $(,)?) => {
-				test_case!($case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!($case from graph);
 			};
 			(mut $case:ident = $source:expr $(,)?) => {
-				test_case!(mut $case = $source);
-				assert_graph_clean($case.graph);
+				let graph = source_graph($source);
+				assert_graph_clean(&graph);
+				test_case!(mut $case from graph);
 			};
 		}
 
@@ -14707,7 +14847,7 @@ pub(super) mod tests {
 				Some(DiagnosticCode::NotATraitMember.code())
 			);
 			let signature = |name| {
-				let name = case.graph.strings.get(name).unwrap();
+				let name = case.context.strings.get(name).unwrap();
 				let index = case
 					.defs
 					.functions
@@ -15181,13 +15321,13 @@ pub(super) mod tests {
 				enum Small: u8 { A = 0 }
 				global int: u32 = 0;
 				global float: f64 = 0;
-				global newtype: Meters = 0;
-				global with_empty: Tagged = 0;
-				global tuple: (f32,) = 0;
-				global generic: Wrap<u64> = 0;
-				global variant: Small = 0;
-				global pointer: heap::&u32 = 0;
-				global reference: func(u32) -> u32 = 0;
+				global newtype: Meters = Meters(0);
+				global with_empty: Tagged = Tagged(0, ());
+				global tuple: (f32,) = (0,);
+				global generic: Wrap<u64> = Wrap(0);
+				global variant: Small = Small::A;
+				global pointer: heap::&u32 = 0 as heap::&u32;
+				global reference: func(u32) -> u32 = loop {};
 				global size: <heap as Memory>::Size = 0;
 			"});
 			test_case!(mut case = &source);
@@ -15217,10 +15357,10 @@ pub(super) mod tests {
 			let source = with_value_type(indoc! {"
 				struct Pair(u32, f64);
 				struct Unit();
-				global pair: Pair = 0;
-				global unit: Unit = 0;
-				global empty: () = 0;
-				global slice: heap::&[u8] = 0;
+				global pair: Pair = Pair(0, 0);
+				global unit: Unit = Unit();
+				global empty: () = ();
+				global slice: heap::&[u8] = loop {};
 			"});
 			test_case!(mut case = &source);
 			case.diagnostics().assert_codes(&[
@@ -15514,7 +15654,7 @@ pub(super) mod tests {
 			);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-			let sibling = case.graph.strings.get("sibling").unwrap();
+			let sibling = case.context.strings.get("sibling").unwrap();
 			let index = case
 				.defs
 				.functions
@@ -15732,7 +15872,7 @@ pub(super) mod tests {
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
-                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: T::Item, y: i32) -> i32 {}
+                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: T::Item, y: i32) -> i32 { loop {} }
             "}
 			);
 			case.diagnostics()
@@ -15776,7 +15916,7 @@ pub(super) mod tests {
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
-                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: (T::Item, i32), y: func(i32) -> T::Item) -> func(T::Item) -> i32 {}
+                func bad<T: Container where { Item = Need<U::Item> }, U: Container where { Item = i32 }>(x: (T::Item, i32), y: func(i32) -> T::Item) -> func(T::Item) -> i32 { loop {} }
             "});
 			// `Need<i32>` needs `i32: Marker`: reported once, where it is written.
 			// Nothing is rewritten, so every shape that mentions `T::Item` still
@@ -15953,7 +16093,7 @@ pub(super) mod tests {
 		assert_eq!(case.context.exports.len(), 2);
 		for (external, path) in [("left", "left::f"), ("f", "right::f")] {
 			let export = case.context.exports
-				[&case.graph.strings.get(external).unwrap()];
+				[&case.context.strings.get(external).unwrap()];
 			let DefKind::Function(index) = case.resolve(Tier::Value, path)
 			else {
 				panic!("expected a function");
@@ -16021,7 +16161,7 @@ pub(super) mod tests {
 			panic!("expected a function");
 		};
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("f").unwrap()],
+			case.context.exports[&case.context.strings.get("f").unwrap()],
 			ExportedItem::Function(index)
 		);
 	}
@@ -16075,15 +16215,15 @@ pub(super) mod tests {
 			panic!("expected a global");
 		};
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("run").unwrap()],
+			case.context.exports[&case.context.strings.get("run").unwrap()],
 			ExportedItem::Function(function)
 		);
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("heap").unwrap()],
+			case.context.exports[&case.context.strings.get("heap").unwrap()],
 			ExportedItem::Memory(memory)
 		);
 		assert_eq!(
-			case.context.exports[&case.graph.strings.get("counter").unwrap()],
+			case.context.exports[&case.context.strings.get("counter").unwrap()],
 			ExportedItem::Global(global)
 		);
 	}
@@ -16130,14 +16270,16 @@ pub(super) mod tests {
 		case.diagnostics().assert_none();
 		assert_eq!(case.defs.exports.len(), 1);
 		let export =
-			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
-		assert_eq!(export.name.inner, case.graph.strings.get("f").unwrap());
+			&case.defs.exports[&case.context.strings.get("run").unwrap()];
+		assert_eq!(export.name.inner, case.context.strings.get("f").unwrap());
 		assert!(
 			case.defs
 				.namespaces
 				.symbols(Namespace::Package(dep))
 				.bindings
-				.get(&BindingKey::value(case.graph.strings.get("run").unwrap()))
+				.get(&BindingKey::value(
+					case.context.strings.get("run").unwrap()
+				))
 				.is_none()
 		);
 	}
@@ -16220,7 +16362,7 @@ pub(super) mod tests {
 			type i32;
 			trait Global { type Value; }
 			global counter: i32 = 0;
-			func id<T>(x: T) -> T {}
+			func id<T>(x: T) -> T { loop {} }
 			func takes(g: counter, f: id<i32>, me: takes) {}
 			func bare(f: id) {}
 			func applied(g: counter<i32>) {}
@@ -16273,7 +16415,7 @@ pub(super) mod tests {
 			type bool;
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			func none() {}
-			func one(x: i32) -> bool {}
+			func one(x: i32) -> bool { loop {} }
 			func many(x: i32, y: bool) {}
 			import "env" as host { func log(x: bool) -> i32; }
 			func nullary(x: <none as Call>::Args, y: none::Result) {}
@@ -16304,7 +16446,7 @@ pub(super) mod tests {
 			mut case = indoc! {"
 			type i32;
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			func id<T>(x: T) -> T {}
+			func id<T>(x: T) -> T { loop {} }
 			func f(x: id<i32>::Args, y: <id<i32> as Call>::Result) {}
 		"}
 		);
@@ -16324,8 +16466,8 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Point();
 			impl Point {
-				func at(self, x: i32) -> bool {}
-				func origin() -> Point {}
+				func at(self, x: i32) -> bool { loop {} }
+				func origin() -> Point { loop {} }
 			}
 			func f(a: Point::at::Args, b: Point::at::Result, c: Point::origin::Args) {}
 		"}
@@ -16352,7 +16494,7 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Wrap<T>();
 			impl<T> Wrap<T> {
-				func get<U>(self, u: U) -> T {}
+				func get<U>(self, u: U) -> T { loop {} }
 			}
 			func f(a: Wrap<i32>::get<bool>::Args, b: Wrap<i32>::get<bool>::Result) {}
 		"}
@@ -16379,10 +16521,10 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Make {
 				func make(x: i32) -> Self;
-				func fresh() -> Self {}
+				func fresh() -> Self { loop {} }
 			}
 			struct Point();
-			impl Make for Point { func make(x: i32) -> Point {} }
+			impl Make for Point { func make(x: i32) -> Point { loop {} } }
 			func direct(x: Point::make, y: Point::fresh::Result) {}
 			func qualified(
 				x: <Point as Make>::make,
@@ -16394,7 +16536,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_none();
 		let declaration = |name| {
-			let name = case.graph.strings.get(name).unwrap();
+			let name = case.context.strings.get(name).unwrap();
 			FunctionIdx::new(
 				u32::try_from(
 					case.defs
@@ -16446,10 +16588,10 @@ pub(super) mod tests {
 			type u8;
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Foo<T>();
-			impl<T> Foo<T> { func new<U>(x: U) -> T {} }
+			impl<T> Foo<T> { func new<U>(x: U) -> T { loop {} } }
 			trait Make { func make<U>(x: U) -> Self; }
 			struct Wrap<T>();
-			impl<T> Make for Wrap<T> { func make<U>(x: U) -> Wrap<T> {} }
+			impl<T> Make for Wrap<T> { func make<U>(x: U) -> Wrap<T> { loop {} } }
 			func f(
 				a: Foo<i32>::new<u8>::Args,
 				b: Foo<i32>::new<u8>::Result,
@@ -16479,8 +16621,8 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Make { func make() -> Self; }
 			struct Point();
-			impl Point { func make() -> i32 {} }
-			impl Make for Point { func make() -> Point {} }
+			impl Point { func make() -> i32 { loop {} } }
+			impl Make for Point { func make() -> Point { loop {} } }
 			func f(x: Point::make::Result, y: <Point as Make>::make::Result) {}
 		"}
 		);
@@ -16574,7 +16716,7 @@ pub(super) mod tests {
 		test_case!(
 			case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			func f() -> f::Result {}
+			func f() -> f::Result { loop {} }
 		"}
 		);
 		case.diagnostics()
@@ -16615,9 +16757,9 @@ pub(super) mod tests {
 			impl Call for Adder {
 				type Args = i32;
 				type Result = i32;
-				func call(self, args: Self::Args) -> Self::Result {}
+				func call(self, args: Self::Args) -> Self::Result { loop {} }
 			}
-			func handler(x: i32) -> i32 {}
+			func handler(x: i32) -> i32 { loop {} }
 			struct Callable<F: Call>();
 			struct Item<F: Function>();
 			func callables(a: Callable<Adder>, b: Callable<handler>, c: Adder::Result) {}
@@ -16644,9 +16786,9 @@ pub(super) mod tests {
 			trait Service { func make() -> Self; }
 			struct Wrap<T>();
 			struct Plain();
-			impl<T> Wrap<T> { func get(self) -> Self {} }
-			impl Plain { func get(self) -> Self {} }
-			impl Service for Plain { func make() -> Self {} }
+			impl<T> Wrap<T> { func get(self) -> Self { loop {} } }
+			impl Plain { func get(self) -> Self { loop {} } }
+			impl Service for Plain { func make() -> Self { loop {} } }
 		"};
 		test_case!(case = SOURCE);
 		case.diagnostics().assert_none();
@@ -16742,7 +16884,7 @@ pub(super) mod tests {
 			trait Number {}
 			impl Number for i32 {}
 			struct Wrap<T>();
-			impl<T: Number> Wrap<T> { func get<U>(self, x: T, y: U) -> (T, U) {} }
+			impl<T: Number> Wrap<T> { func get<U>(self, x: T, y: U) -> (T, U) { loop {} } }
 			func free<V>(v: V) {}
 			trait Service { func make<W>(w: W) -> Self; }
 		"}

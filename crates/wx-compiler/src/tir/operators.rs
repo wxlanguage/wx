@@ -3,9 +3,10 @@
 //!
 //! Every operator is checked through its trait, so whether it applies to a
 //! type and what it returns are the trait's answer. Only the node built for it
-//! differs: on a primitive scalar the operation is builtin (`Binary`/`Unary`,
-//! lowered to native instructions and folded by constant evaluation), on any
-//! other type it is a call to the selected method. The builtin table below must
+//! differs: on a primitive scalar the operation is the primitive's own
+//! (`PrimitiveBinary`/`PrimitiveUnary`, lowered to native instructions and
+//! folded by constant evaluation), on any other type it is a call of the
+//! impl's or the trait's method. The primitive table below must
 //! name exactly the primitive impls the stdlib defines; a test holds the two
 //! together.
 
@@ -116,11 +117,14 @@ impl Scalar {
 	}
 }
 
-/// Whether the compiler implements `op` natively on `scalar`. Mirrors the
-/// stdlib's primitive impls of the operator traits exactly
-/// (`builtin_operators_match_the_stdlib_impls`); `&&`/`||` are not
-/// overloadable and exist only on `bool`.
-pub(super) fn is_builtin_binary(op: BinaryOp, scalar: Scalar) -> bool {
+/// Whether the compiler implements `op` natively on `ty`, a primitive
+/// scalar; `false` for any other type. Mirrors the stdlib's primitive impls of
+/// the operator traits exactly (`primitive_operators_match_the_stdlib_impls`);
+/// `&&`/`||` are not overloadable and exist only on `bool`.
+pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
+	let Some(scalar) = Scalar::from_type(ty) else {
+		return false;
+	};
 	let numeric = scalar.is_integer() || scalar.is_float();
 	match op {
 		BinaryOp::Add
@@ -153,8 +157,11 @@ pub(super) fn is_builtin_binary(op: BinaryOp, scalar: Scalar) -> bool {
 	}
 }
 
-/// See `is_builtin_binary`.
-pub(super) fn is_builtin_unary(op: UnaryOp, scalar: Scalar) -> bool {
+/// See `is_primitive_binary`.
+pub(super) fn is_primitive_unary(op: UnaryOp, ty: TypeIndex) -> bool {
+	let Some(scalar) = Scalar::from_type(ty) else {
+		return false;
+	};
 	match op {
 		UnaryOp::InvertSign => scalar.is_float() || scalar.is_signed(),
 		UnaryOp::BitNot => scalar.is_integer(),

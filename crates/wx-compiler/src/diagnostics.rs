@@ -116,6 +116,7 @@ define_diagnostic_codes! {
 		MissingPackageAlias => "E1021",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
+		RedundantPatternMarker => "W1003",
 
 		// TIR diagnostics (E2xxx/W2xxx).
 		DuplicateDefinition => "E2000",
@@ -163,8 +164,7 @@ define_diagnostic_codes! {
 		AssociatedTypeInInherentImpl => "E2035",
 		MissingEnumRepr => "E2036",
 		CannotDerefNonPointer => "E2037",
-		NoMemoryForPointer => "E2038",
-		AmbiguousPointerMemory => "E2039",
+		PointerWithoutMemory => "E2038",
 		TypeArgumentCountMismatch => "E2040",
 		InvalidCast => "E2041",
 		IndexOnNonIndexable => "E2042",
@@ -237,6 +237,12 @@ define_diagnostic_codes! {
 		TypeArgumentsNotAllowed => "E2111",
 		AssocTypeEqualityMismatch => "E2112",
 		UnknownPackage => "E2113",
+		UnsupportedExpression => "E2114",
+		RefutablePatternInLocal => "E2115",
+		DuplicatePatternBinding => "E2116",
+		UnmatchableLiteral => "E2117",
+		NotBoundInAllAlternatives => "E2118",
+		InconsistentPatternBinding => "E2119",
 	}
 }
 

@@ -733,6 +733,43 @@ fn test_format_local_patterns() {
 }
 
 #[test]
+fn test_format_pattern_constants() {
+	// A constant named by one segment is written `const name`; a qualified
+	// path is a constant on its own.
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) {
+            match x {
+                const MAX -> {},
+                Ordering::Less -> {},
+                _ -> {},
+            }
+        }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            func f(x: i32) {
+                match x {
+                    const MAX -> {},
+                    Ordering::Less -> {},
+                    _ -> {},
+                }
+            }
+        "}
+	);
+}
+
+#[test]
 fn test_format_impl_trait_items() {
 	let case = TestCase::new(indoc! {"
         impl Iterator for Range {

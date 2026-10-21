@@ -903,7 +903,8 @@ fn completion_excludes_impl_methods_and_associated_functions() {
 		}
 	" };
 	// Cursor on the blank line inside `test`'s body.
-	let cursor = source.find("func test() {\n").unwrap() + "func test() {\n".len();
+	let cursor =
+		source.find("func test() {\n").unwrap() + "func test() {\n".len();
 
 	let (_, compiled) = compile_source(&root, source);
 	let file_id = file_id_for(&compiled, &root);
@@ -958,7 +959,8 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 
 		}
 	" };
-	let cursor = source.find("func test() {\n").unwrap() + "func test() {\n".len();
+	let cursor =
+		source.find("func test() {\n").unwrap() + "func test() {\n".len();
 
 	let (_, compiled) = compile_source(&root, source);
 	let file_id = file_id_for(&compiled, &root);
@@ -1016,8 +1018,7 @@ fn completion_sorts_locals_before_globals() {
 	let root = PathBuf::from("/test/main.wx");
 	// "zeta" (local) would sort after "alpha" (global) alphabetically by
 	// label — locals should still come first via `sort_text`.
-	let source =
-		"func alpha() -> i32 { 0 }\nfunc main() -> i32 {\n    local zeta = 1;\n\n}";
+	let source = "func alpha() -> i32 { 0 }\nfunc main() -> i32 {\n    local zeta = 1;\n\n}";
 	let cursor = source.find("1;\n").unwrap() + "1;\n".len();
 
 	let (_, compiled) = compile_source(&root, source);
@@ -2506,9 +2507,10 @@ fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
 	let outer = PathBuf::from("/watch-test");
 	let inner = outer.join("nested");
 	let file = inner.join("main.wx");
-	state
-		.open_documents
-		.insert(file.clone(), open_document("func main() {} export { main }"));
+	state.open_documents.insert(
+		file.clone(),
+		open_document("func main() {} export { main }"),
+	);
 	state.open_documents.insert(
 		outer.join("wx.json"),
 		open_document(r#"{"type":"bin","entry":"nested/main.wx"}"#),
@@ -2711,9 +2713,10 @@ async fn watched_file_events_skip_documents_the_editor_already_owns() {
 		root.join("wx.json"),
 		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
 	);
-	state
-		.open_documents
-		.insert(file.clone(), open_document("func main() {} export { main }"));
+	state.open_documents.insert(
+		file.clone(),
+		open_document("func main() {} export { main }"),
+	);
 	compute_refresh(&mut state, &file, &mut Vec::new());
 	assert!(state.cached.contains_key(&root));
 

@@ -611,7 +611,7 @@ mod tests {
 	/// call; only `f`'s own, owned return value does.
 	fn with_resolved<R>(
 		source: &str,
-		f: impl FnOnce(&mut TypeContext, &vfs::CompilationUnit) -> R,
+		f: impl FnOnce(&mut TypeContext) -> R,
 	) -> R {
 		let mut vfs_builder = vfs::CompilationUnitBuilder::new();
 		let root_id = vfs_builder
@@ -647,7 +647,7 @@ mod tests {
 		let mut builder = TypeContext::new(
 			&mut diagnostics,
 			&mut resolutions,
-			&graph.strings,
+			&mut graph.strings,
 			&graph.files,
 			&defs,
 			&ast_nodes,
@@ -656,26 +656,21 @@ mod tests {
 		builder.sweep();
 		assert!(builder.diagnostics.is_empty(), "{:?}", builder.diagnostics);
 
-		f(&mut builder, &graph)
+		f(&mut builder)
 	}
 
 	/// Resolves `path` (`::`-separated) as a `tier`-tier path from the root
 	/// namespace — same mechanism a written bound or type actually uses,
 	/// mirroring `signatures::tests::TestCase::resolve`.
-	fn resolve(
-		builder: &TypeContext,
-		graph: &vfs::CompilationUnit,
-		tier: Tier,
-		path: &str,
-	) -> DefKind {
-		let root = Scope::Package(graph.root_package);
+	fn resolve(builder: &TypeContext, tier: Tier, path: &str) -> DefKind {
+		let root = Scope::Package(builder.defs.root_package);
 		let file_id = builder.defs.namespaces.file_id(root.into());
 
 		let segments: Box<[ast::PathSegment]> = path
 			.split("::")
 			.map(|segment| ast::PathSegment {
 				ident: Spanned {
-					inner: graph
+					inner: builder
 						.strings
 						.get(segment)
 						.expect("already interned from source"),
@@ -689,7 +684,7 @@ mod tests {
 		let target = PathResolver::new(
 			&mut diagnostics,
 			&mut resolutions,
-			&graph.strings,
+			builder.strings,
 			builder.defs,
 		)
 		.resolve_path(file_id, root, &segments, tier);
@@ -701,13 +696,8 @@ mod tests {
 			.symbol_kind(builder.defs)
 	}
 
-	fn trait_index(
-		builder: &TypeContext,
-		graph: &vfs::CompilationUnit,
-		path: &str,
-	) -> TraitIdx {
-		let DefKind::Trait(trait_index) =
-			resolve(builder, graph, Tier::Type, path)
+	fn trait_index(builder: &TypeContext, path: &str) -> TraitIdx {
+		let DefKind::Trait(trait_index) = resolve(builder, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a trait");
 		};
@@ -717,13 +707,9 @@ mod tests {
 	/// The `TraitIndex` of `path`'s compiler-generated backing trait — what
 	/// a `T: <path>` bound naming this typeset actually resolves to. See
 	/// `TypeSetSignature`'s own doc comment.
-	fn typeset_trait_index(
-		builder: &TypeContext,
-		graph: &vfs::CompilationUnit,
-		path: &str,
-	) -> TraitIdx {
+	fn typeset_trait_index(builder: &TypeContext, path: &str) -> TraitIdx {
 		let DefKind::TypeSet(typeset_index) =
-			resolve(builder, graph, Tier::Type, path)
+			resolve(builder, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a typeset");
 		};
@@ -733,13 +719,8 @@ mod tests {
 	/// `path`'s own `TypeIndex` — a non-generic struct only(a generic
 	/// struct's instantiated `TypeIndex` needs type-argument resolution,
 	/// which isn't implemented yet — see `impls.rs::resolve_impl_target`).
-	fn struct_type(
-		builder: &mut TypeContext,
-		graph: &vfs::CompilationUnit,
-		path: &str,
-	) -> TypeIndex {
-		let DefKind::Struct(struct_index) =
-			resolve(builder, graph, Tier::Type, path)
+	fn struct_type(builder: &mut TypeContext, path: &str) -> TypeIndex {
+		let DefKind::Struct(struct_index) = resolve(builder, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a struct");
 		};
@@ -755,12 +736,11 @@ mod tests {
 	/// harness reach a `TypeParam` receiver without a wider accessor.
 	fn generic_param_type(
 		builder: &mut TypeContext,
-		graph: &vfs::CompilationUnit,
 		function_path: &str,
 		param_index: u32,
 	) -> TypeIndex {
 		let DefKind::Function(function_index) =
-			resolve(builder, graph, Tier::Value, function_path)
+			resolve(builder, Tier::Value, function_path)
 		else {
 			panic!("expected `{function_path}` to be a function");
 		};
@@ -774,8 +754,8 @@ mod tests {
 			indoc! {"
 			trait Foo {}
 		"},
-			|builder, graph| {
-				let foo = trait_index(builder, graph, "Foo");
+			|builder| {
+				let foo = trait_index(builder, "Foo");
 				assert!(
 					(builder
 						.find_trait_impl_query(
@@ -808,9 +788,9 @@ mod tests {
 				struct S();
 				impl Foo for S {}
 			"},
-			|builder, graph| {
-				let foo = trait_index(builder, graph, "Foo");
-				let s = struct_type(builder, graph, "S");
+			|builder| {
+				let foo = trait_index(builder, "Foo");
+				let s = struct_type(builder, "S");
 				assert!(
 					(builder
 						.find_trait_impl_query(TypeEnvIdx::ROOT, s, foo)
@@ -830,9 +810,9 @@ mod tests {
 				struct S();
 				impl Foo for S {}
 			"},
-			|builder, graph| {
-				let bar = trait_index(builder, graph, "Bar");
-				let s = struct_type(builder, graph, "S");
+			|builder| {
+				let bar = trait_index(builder, "Bar");
+				let s = struct_type(builder, "S");
 				assert!(
 					!(builder
 						.find_trait_impl_query(TypeEnvIdx::ROOT, s, bar)
@@ -850,9 +830,9 @@ mod tests {
 				struct S();
 				typeset Nums { S }
 			"},
-			|builder, graph| {
-				let nums = typeset_trait_index(builder, graph, "Nums");
-				let s = struct_type(builder, graph, "S");
+			|builder| {
+				let nums = typeset_trait_index(builder, "Nums");
+				let s = struct_type(builder, "S");
 				assert!(
 					(builder
 						.find_trait_impl_query(TypeEnvIdx::ROOT, s, nums)
@@ -871,9 +851,9 @@ mod tests {
 				trait Bound {}
 				func target<T: Bound>(x: T) {}
 			"},
-			|builder, graph| {
-				let bound = trait_index(builder, graph, "Bound");
-				let t = generic_param_type(builder, graph, "target", 0);
+			|builder| {
+				let bound = trait_index(builder, "Bound");
+				let t = generic_param_type(builder, "target", 0);
 				assert!(
 					(builder
 						.find_trait_impl_query(TypeEnvIdx::ROOT, t, bound)
@@ -893,9 +873,9 @@ mod tests {
 				trait Other {}
 				func target<T: Bound>(x: T) {}
 			"},
-			|builder, graph| {
-				let other = trait_index(builder, graph, "Other");
-				let t = generic_param_type(builder, graph, "target", 0);
+			|builder| {
+				let other = trait_index(builder, "Other");
+				let t = generic_param_type(builder, "target", 0);
 				assert!(
 					!(builder
 						.find_trait_impl_query(TypeEnvIdx::ROOT, t, other)
@@ -915,9 +895,9 @@ mod tests {
 				trait Sub: Super {}
 				func target<T: Sub>(x: T) {}
 			"},
-			|builder, graph| {
-				let super_trait = trait_index(builder, graph, "Super");
-				let t = generic_param_type(builder, graph, "target", 0);
+			|builder| {
+				let super_trait = trait_index(builder, "Super");
+				let t = generic_param_type(builder, "target", 0);
 				assert!(
 					(builder
 						.find_trait_impl_query(TypeEnvIdx::ROOT, t, super_trait)

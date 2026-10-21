@@ -10,8 +10,9 @@ the end; several sections depend on their answers.
 `BodyContext` (`typecheck.rs`) checks one expression tree into a `Body`
 (`body.rs`) for a constant initializer or an enum discriminant. It covers:
 literals (with in-place coercion of untyped subtrees, typeset targets included),
-grouping, unary/binary operators through their traits (builtin node on a
-primitive scalar, `MethodCall`/`GenericMethodCall` otherwise), tuples, paths to
+grouping, unary/binary operators through their traits (`PrimitiveBinary`/
+`PrimitiveUnary` on a primitive scalar, `Call`/`AbstractCall` of the operator's
+method otherwise), tuples, paths to
 constants and variants, and struct construction by position or name with local
 inference of the struct's type arguments (`meet`/`learn`) and bound checks at
 the call (`check_now`). Every other form is a `todo!()`, so turning function
@@ -52,11 +53,11 @@ Changed, because the rest of TIR moved on:
 | --- | --- |
 | Boxed `Expression` tree, `Result<Expression, ()>` (a failure drops the node) | Arena, failures are `ExprKind::Error` nodes typed `ERROR` |
 | `accesses: Vec<..>` on locals, labels, items | `NameResolutions`; add `Referent::Local` |
-| `BlockScope` holding its own `Vec<Local>`, locals addressed by `(ScopeIndex, LocalIndex)`, a separate `BlockLabel` arena | The scope tree is kept in the `Body`; a local is one `LocalIdx` with a `scope` field; labels stay their own arena (`Body::labels`, a scope points at one); typing state per scope stays in the checker |
+| `BlockScope` holding its own `Vec<Local>`, locals addressed by `(ScopeIndex, LocalIndex)`, a separate `BlockLabel` arena | The scope tree is kept in the `Body`; a local is one `LocalIdx`; labels stay their own arena (`Body::labels`, a scope points at one); typing state per scope stays in the checker |
 | `EvalMode::{Comptime, Runtime}` deciding whether operators dispatch | Gone already: scalars always get builtin nodes, the evaluator folds them |
 | Generic call inference via `infer_type_args` + `substitute_expected_type` + `type_satisfies_annotation` | `meet`/`learn` (struct construction already uses them) |
 | Bound checks via `check_bounds(BoundOrigin, ..)` | `record_bounds_check` + `check_now` |
-| `Place` tree for memory only; `Assign`/`Store`, `CompoundAssign`/`CompoundStore`/two generic twins | One place arena including locals; one `Assign`, one `CompoundAssign` (below) |
+| `Place` tree for memory only; `Assign`/`Store`, `CompoundAssign`/`CompoundStore`/two generic twins | Kept: memory-only places, `Assign`/`Store`, compound nodes on both targets, plus `Primitive*` variants (below) |
 | `ast::Expression::String(symbol)`, `StructInit` | AST changed: strings are span-only, structs are call-shaped |
 | Method/assoc lookup in `builder/calls.rs` + `members.rs` | `TypeContext::resolve_applicable_member`, `resolve_trait_qualified_value`, `select_trait_member` exist and are pure enough to call from a body |
 | Globals as plain lvalues | `Type::Global` is nominal with `impl Global`/`GlobalMut` (`get`/`set`); see Q2 |
@@ -103,9 +104,9 @@ struct Scope {
 }
 
 enum ScopeKind {
-    Root,
-    /// `block { .. }`, an `if`/`else` branch, a match arm's body. Its type is
-    /// its tail's, or a `break` value's when it is labelled.
+    /// `block { .. }`, an `if`/`else` branch, a match arm's body, or the body
+    /// itself (the root is the scope without a parent). Its type is its
+    /// tail's, or a `break` value's when it is labelled.
     Block,
     /// `loop { .. }`: `continue` re-enters it, its type comes only from `break`.
     Loop,
@@ -116,9 +117,6 @@ struct Local {
     name: Spanned<SymbolU32>,
     ty: TypeIndex,
     mutable: Option<TextSpan>,
-    /// The block it is declared in. It is visible from its `Let` to the end
-    /// of that block.
-    scope: ScopeIdx,
 }
 
 /// A written block label, as the old `BlockLabel`. One label can name two
@@ -154,14 +152,15 @@ leaves that branch's scope, which ends the `if`.
 `return` keeps its own kind, since MIR emits it differently, but is typed by
 the same rule as a `break` out of scope 0.
 
-**A local has one identity, `LocalIdx`, plus a pointer to its scope.** The old
-model numbered locals per scope and addressed one by `(ScopeIndex, LocalIndex)`.
-Here the scope is a field of the local rather than half of its name, so
-`Referent::Local { owner: BodyOwner, local: LocalIdx }`, a pattern binding and a
-place all carry one index. LocalIdx order is declaration order, so "the locals
-of scope S, in order" is a filter over `locals`. If a consumer needs that list
-often, it can be cached on `Scope` later; storing both from the start would give
-the same fact two homes. Shadowing is explicit: `local x = 1; local x = x + 1;`
+**A local has one identity, `LocalIdx`.** The old model numbered locals per
+scope and addressed one by `(ScopeIndex, LocalIndex)`. Here the scope is not
+half of its name, so `Referent::Local { owner: BodyOwner, local: LocalIdx }`
+and a pattern binding carry one index. Which block declares a local is not
+stored on it: the checker only needs it while resolving names (the
+`(scope, name)` map), and afterwards the tree holds it (a `LocalDeclaration`
+sits among one block's statements; parameters are in the root). If a consumer
+(MIR's slot sharing, the LSP) needs a direct "locals of scope S" lookup, it is
+added then. Shadowing is explicit: `local x = 1; local x = x + 1;`
 is two `Local`s with the same name in the same scope, and the second hides the
 first from its own `Let` onwards. That is what rustc models with its
 "remainder" scopes, and here it falls out of declaration order.
@@ -171,16 +170,20 @@ first from its own `Let` onwards. That is what rustc models with its
 ```rust
 current: ScopeIdx,
 /// Scope-relative lookup, as in the old `ExprContext::lookup`.
-names: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+lookup: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
 /// Index-aligned with `Body::scopes`.
-scope_types: Vec<ScopeTyping>,
+scope_types: Vec<ScopeType>,
 
-struct ScopeTyping {
+struct ScopeType {
     expected: TypeIndex,     // INFER = unconstrained
-    ty: TypeIndex,           // INFER until a tail or a break value settles it
-    breaks: Vec<ExprIdx>,    // valued breaks, to coerce untyped ones once `ty` is known
+    ty: TypeIndex,           // INFER until a result, `break` or `return` settles it
 }
 ```
+
+An untyped `break` or `return` value with nothing to hold it to needs an
+annotation, as in the old checker; only a block's result may stay untyped, for
+its context to coerce. (Collecting a scope's untyped `break`s to coerce them
+later was considered and left out until a case needs it.)
 
 To resolve a name, probe `(current, name)`, then `(parent, name)`, and so on up
 to the root: one hash probe per enclosing block, so the cost grows with nesting
@@ -197,9 +200,11 @@ up from `current` to the first scope whose label has that name (`break :outer`),
 giving `(ScopeIdx, LabelIdx)`; the jump stores the scope and the use records
 `Referent::Label { owner: BodyOwner, label: LabelIdx }`. An unlabelled `break`
 or `continue` takes the nearest `Loop`, `return` the root. The label's old
-`accesses: Vec<TextSpan>` is that resolution entry now, so the checker keeps
-only a `used: Vec<bool>` beside `labels` for the unused-label warning
-(`report_stack_warnings`'s check), rather than scanning the table.
+`accesses: Vec<TextSpan>` is that resolution entry now, and the checker keeps
+nothing beside it. Unused labels (and later unused locals and imports) are not
+reported while checking: they are the inverse of the resolutions table, and
+will be reported together from it in one pass (for a body, a range query over
+its span).
 
 For comparison, rustc keeps the same facts, spread over a few phases. Name
 resolution uses ribs. HIR records each `break` target as the id of the
@@ -220,100 +225,301 @@ with anything.
 `expect` needs one rule it lacks today: `!` is accepted wherever any type is
 expected.
 
-### Places
+### Places and assignment
 
-Reads, writes and `.&` all need to know what is a location. Keep the
-place/value split from `tir-place-value-split.md`, in arena form, and let it
-include locals so assignment is one node:
+Implemented as the old checker had it, in arena form. A place is a location in
+linear memory only, always reached through a pointer:
 
 ```rust
-index_newtype!(PlaceIdx);
 enum PlaceKind {
-    Local(LocalIdx),
-    Global(GlobalIdx),                                  // if Q2 says globals are places
-    Deref { pointer: ExprIdx },                         // `p.*`, the only way into memory
-    Field { base: PlaceIdx, field: FieldIdx },
-    Index { base: PlaceIdx, index: ExprIdx },
-    Temp(ExprIdx),                                      // `make().x`: an rvalue, not assignable
+    Deref { pointer: ExprIdx },              // `p.*`, the only way into memory
+    Field { object: PlaceIdx, field: FieldIdx },
 }
-struct Place { kind: PlaceKind, ty: TypeIndex, memory: Option<TypeIndex>, mutable: bool }
+struct Place { kind, ty, memory: TypeIndex, mutable: bool, span }
 
-ExprKind::Load(PlaceIdx)                                // reading `x`, `p.*.y`, `t.x`
-ExprKind::AddressOf(PlaceIdx)                           // `.&`; requires `memory: Some(_)`
-ExprKind::Assign { place: PlaceIdx, value: ExprIdx }
-ExprKind::CompoundAssign { op: BinaryOp, place: PlaceIdx, value: ExprIdx, dispatch: OpDispatch }
-ExprKind::Discard(ExprIdx)                              // `_ = e`
+ExprKind::Load(PlaceIdx)                     // reading `p.*`, `p.*.x`
+ExprKind::AddressOf(PlaceIdx)                // `.&`
+ExprKind::FieldAccess { object, field }      // a field of a value (local, call result)
 ```
 
-`memory`/`mutable` are computed once when the place is built (from the root
-`Deref`'s pointer, a `local mut`, a `global mut`), so "cannot assign",
-"cannot take address of a local" and "store through `&T`" are each a field read.
-This collapses the old six assignment kinds into two, and lets MIR compute an
-address once for both halves of `p.*.x += 1`.
+A local or a field of a value is not a place: it has no address, and whether
+it is assignable is a property of the expression (`Local`, `FieldAccess`
+rooted in one). A global's name is its handle (`Type::Global`),
+not a location: it is read with `Global::get` and written with
+`GlobalMut::set`, so `=` on it is an invalid target. There is no temporary root:
+deciding where a call's result lives is MIR's job. `_ = value` is its own
+`Drop`, not an assignment.
 
-### Operator dispatch as a value
+The assignment kinds stay separate, for the reasons they were split in the old
+checker: a place is an address computed once and written through (`Store`,
+`*CompoundStore`), the other targets are expressions (`Assign`,
+`*CompoundAssign`); and an abstract target type keeps the trait's declaration
+for monomorphization. Operator, call and compound nodes are sorted on two
+axes. The first is what defines the operation: a primitive scalar's operator
+(`Primitive*`, holding `op`); a known function (`Call`, `ConcreteCompound*`,
+the selected impl's method for an operator); or a trait's declaration, its impl
+selected at monomorphization (`AbstractCall`, `AbstractCompound*`). Every
+function is held with its type arguments as one flat `TypeList`: an impl's
+arguments, then the function's own (`[Self, own...]` for a trait's
+declaration), the layout `substitute`/`learn` and signatures already use. The
+second, for a compound assignment, is where the result goes: `Assign` (a local
+or a field of one) or `Store` (a place in linear memory):
 
-Today the operator decision is spread over three kinds (`Binary`,
-`MethodCall`, `GenericMethodCall`). Compound assignment needs the same decision
-without being a call, so name it once:
+| | value | into a local | into memory |
+|---|---|---|---|
+| native op | `PrimitiveBinary`, `PrimitiveUnary` | `PrimitiveCompoundAssign` | `PrimitiveCompoundStore` |
+| known function | `Call` | `ConcreteCompoundAssign` | `ConcreteCompoundStore` |
+| trait declaration | `AbstractCall` | `AbstractCompoundAssign` | `AbstractCompoundStore` |
 
-```rust
-enum OpDispatch { Builtin, Method(FunctionIdx), Generic(FunctionIdx) }
-```
+Compared with the old checker, which had four compound nodes that always held a
+method (primitives went through their `#[inline]` impls), the `Primitive`
+variants are new: plain operators on primitives already build
+`PrimitiveBinary`, so `op=` follows them.
 
-`select_binary`/`select_unary` return it; `Binary`/`Unary` keep their shape for
-the builtin case (the evaluator and MIR like them), and `CompoundAssign` stores
-it. Whether `Binary` itself should carry `dispatch` instead of turning into a
-`MethodCall` is a taste call; the latter keeps the evaluator simpler.
+A `Load` is pushed only where a place's value is used, so `.&` and the left of
+`=` take the place itself and no node is orphaned.
 
 ### Calls
 
 ```rust
-ExprKind::Call { callee: Callee, args: ExprRange, order: ArgOrder }
-enum Callee {
-    Function { func_index: FunctionIdx, type_args: TypeList },     // direct, `f::<T>(..)`
-    Method { method: FunctionIdx, type_args: TypeList },           // selected impl member
-    Generic { method: FunctionIdx, type_args: TypeList },          // trait declaration, abstract receiver
-    Indirect(ExprIdx),                                             // a `func(A) -> R` value
-}
+/// Direct: a free function, `Type::f(..)`, `x.m(..)`, an operator's impl method.
+ExprKind::Call { function: FunctionIdx, type_args: TypeList, args: ExprRange }
+/// A trait's declaration: an abstract receiver, or an impl inheriting a default.
+ExprKind::AbstractCall { method: FunctionIdx, type_args: TypeList, args: ExprRange }
+// later: IndirectCall { callee: ExprIdx, args: ExprRange }, a `func(A) -> R` value
 ```
 
-`MethodCall`/`GenericMethodCall` from operators fold into this. Struct
-construction stays its own kind (no callee). Inference for a function call is
-struct construction generalised: the callee's parameter frame plays the struct's
-role, the parameter types the fields', and the return type is met with the
-expected type first. `struct_type_args`/`learn_field`/`field_type`/
-`report_uninferred`/`check_struct_bounds` become one "instantiate a generic
-frame at a call" helper used by both. Named arguments map through
-`FunctionDef::params` exactly as fields do through `StructDef::lookup`.
+A call is direct whenever the function is known, so a method call is a `Call`
+like any other: `x.m(a)` and `T::m(x, a)` build the same node, the receiver
+first in `args`, and which spelling was written is in the name resolutions.
+Only a trait's declaration (`AbstractCall`) and a runtime value
+(`IndirectCall`, not yet) are calls of something else. Struct construction
+stays its own kind. Inference for a function call is struct construction
+generalised: the callee's parameter frame plays the struct's role, the
+parameter types the fields', and the return type is met with the expected type
+first. For a method, the frame's leading slots are the impl's, filled by impl
+selection (`match_impl_target`, `find_trait_impl`); the written `::<..>` and
+`learn` fill the method's own.
 
 `Type::Function` (a function item's zero-sized type) is what a bare path to a
 function evaluates to; it coerces to `Type::FunctionRef` where one is expected.
-Calling a value of a user type that implements `Call` would be
-`Callee::Method` on `Call::call` (see Q3).
+Calling a value of a user type that implements `Call` would be a `Call` of
+`Call::call`'s impl (see Q3).
 
 ### Patterns
 
-```rust
-index_newtype!(PatIdx);
-enum PatKind {
-    Wildcard,
-    Bind(LocalIdx),
-    Tuple(PatRange),
-    Struct { struct_index: StructIdx, fields: PatRange, order: ArgOrder, rest: bool },
-    // match only:
-    Literal(ExprIdx),            // an integer/bool/char literal node, already coerced
-    Variant(ConstIdx),
+Done. One pattern grammar serves `local` and `match` arms. Function parameters
+are never patterns: a parameter is `[mut] name`, since a call by name needs
+every parameter to have one.
+
+**What a term is follows from its own shape.** There is no mode to switch: a
+name binds, a literal compares with that value, a qualified path compares with
+that constant, and a destructure takes its children apart.
+
+| written | what it is | why it cannot be anything else |
+|---|---|---|
+| `x` | a binding | a name *can* bind, so it does |
+| `const x` | a constant | the one ambiguous case, marked |
+| `0`, `-1`, `'a'`, `true` | a test | a literal cannot bind |
+| `Ordering::Less` | a constant | a qualified path cannot bind |
+| `mut x` | a mutable binding | |
+| `_` | a wildcard | |
+| `Point(x, 0)`, `Point({ x, .. })`, `(x, y)` | a destructure | each child is a pattern of its own |
+| `A \| B` | an or-pattern | its alternatives bind the same names |
+
+```
+match point {
+    Point(0, 0) -> origin(),
+    Point(x, 0) -> on_x_axis(x),
+    Point(const MAX, 0) -> at_the_limit(),
+    Point(x, 5 | 10) -> { .. },
+    (x, y) -> { .. },
+    _ -> { .. },
 }
-// Body gains: pats: Vec<PatKind>, pat_types: Vec<TypeIndex>, pat_spans, pat_extra
 ```
 
-`local` destructuring and `match` arms share it. `ArgOrder` already models
-"which field does the n-th element give", so struct patterns reuse it. MIR's
-flattened `PathStep` list is a walk over this. Match arms are still parsed as
-expressions (`ast::MatchArm::pattern`), so the pattern lowerer reads expression
-syntax; that is fine for literals, `_` and variant paths, and is where an
-or-pattern or a binding pattern would need a parser change later.
+`const` takes a path and nothing else: a literal is a comparison on its own, a
+destructure has no name to mark, and a name of one segment is the only thing
+the marker can mean. It binds tighter than `|`, so `const A | const B` is two
+constants. Before a path that is a constant already (`const Ordering::Less`)
+it is redundant, and is warned about (W1003) and dropped.
+
+**Why a marker at all.** A single name in a pattern means one thing by syntax
+alone: the marker, not name lookup, decides whether `MAX` binds or compares, so
+renaming or removing a constant is an error ("cannot find value `MAX`") and
+never a silent catch-all, as it is in Rust. A qualified path needs no marker
+precisely because it cannot bind.
+
+**Refutability is syntactic.** wx enums carry no data, so destructuring a tuple
+or a struct always matches, and a pattern can fail only where it holds a
+literal or a constant. A `local` statement therefore takes a pattern that
+holds neither: a test in one is E2115, at the test itself. A match arm takes
+any pattern.
+
+**Values are constants.** A value leaf is a literal, an enum variant, a
+`const`, or an associated constant (`const u32::MAX`, `Self::LIMIT`), resolved
+as a value path that never sees locals: `const y` for a local `y` is "cannot
+find value `y`", with a note that a local cannot be compared in a pattern. An
+untyped literal takes the type it is checked against. A struct is compared
+structurally, field by field, never through `PartialEq`. An abstract constant
+(`T::LIMIT`) is accepted and never counts towards exhaustiveness.
+
+A float has no single value to compare with, and a string has no equality at
+all, so neither can be matched: the parser reads them and the checker refuses
+them (E2117).
+
+**Checking flows down.** A pattern is checked against the type it is given:
+the scrutinee's, or a `local`'s value (or annotation). A struct pattern names
+its struct (`Point(..)`, `Self(..)`), checks field privacy as construction
+does, and takes at most one `..`. Each match arm owns a scope for its bindings.
+
+**AST** (done). One `Pattern` tree, with the leaves already resolved by the
+parser: `Wildcard`, `Binding` (a name, with its `mut` span), `Constant` (a
+constant, by path), `Literal` (an int — `Int` or `NegInt`, the sign being the
+variant — a char, a bool, a float, a string), `Or`, `Destructure` (a tuple, a
+struct, a named struct), and `Error` for a pattern the parser could not read. The leaves record what a term *is*, so no later
+stage has to know a mode — `const MAX` and `MAX` are different leaves, and
+`{ x }` in a named struct pattern is a binding, recorded as the field's own
+name with no pattern of its own.
+
+**TIR** (done). One pattern arena in `Body`, shared by `local` and `match`
+(`PatKind`, with a type and a span per pattern, children in `pat_lists`). A
+pattern is typed and resolved. The kinds group by what they do: structure
+(`Wildcard`, `Bind(LocalIdx)`, `Tuple`, `Struct`) always matches; tests (`Int`,
+`Bool`, `Char`, `Constant`, `AbstractConstant`, `Or`) match only some values,
+so only a match arm holds them; `Error` is reported and counts as `_`.
+Destructuring has one child per element or field of its type, in declaration
+order: what `..` covers, and a field a named pattern leaves out, is a
+`Wildcard`, so a struct's arity is its field count however it was written, and
+no `ArgOrder` or rest flag survives. `Int` is the value's bits in the pattern's
+type (`-1: i8` is `0xFF`), one spelling per value. `ExprKind::LocalDeclaration
+{ pattern, value }` and `ExprKind::Match { scrutinee, arms }` with `Body::arms`
+(`Arm { scope, pattern, body }`): each arm declares its bindings in a scope of
+its own around its body. A test in a `local` is E2115, at the first test; every
+test in the pattern then becomes `Error`, so the pattern takes the value apart
+and binds without testing (its bindings are still declared), and only the
+first test is reported. A name bound twice in the same pattern is E2116.
+
+The alternatives of a `|` bind the same names, as in rustc. The same name in
+two alternatives is *one* local, which both alternatives bind: the arm's body
+reads that one local. A name one alternative binds and another does not is
+E2118 (one report per name, a label on each alternative that lacks it); the
+same name bound differently in two alternatives — one `mut`, one not — is
+E2119; and the same name of a different type in two alternatives is E2001,
+with the type it was first introduced with. Each `|` is checked on its own,
+and an alternative's names are those bound anywhere inside it, so a nested `|`
+counts towards the enclosing one.
+
+A name bound twice in one alternative is E2116, and is still the local the
+alternatives share: the two bindings are one variable, so they are of one
+type (E2001 says so when they are not). A name bound in two *products* — two
+sibling `|`s in one pattern, or a `|` and the pattern around it — is two
+variables, and E2116 says so.
+
+The two kinds of place a name can be bound are a **product** (one value taken
+apart: a tuple, a struct, one alternative) and the **alternatives** of a `|`
+(one value matched several ways). A name in a product names a different value
+each time it is bound; a name in the alternatives names the same value, seen
+two ways. That is the whole difference, and it is what decides whether a
+second binding of a name is a mistake (E2116) or the same variable again
+(shared). rustc splits it the same way (`PatBoundCtx::{Product, Or}` in
+`rustc_resolve/src/late.rs`).
+
+**Usefulness** (done). One pass, Maranget's "Warnings for pattern matching"
+(rustc's `rustc_pattern_analysis`), in `tir/usefulness.rs` (pure: types are
+asked of a `Shapes`), run by `BodyContext` once a match's arms are built
+(`typecheck/exhaustiveness.rs`: lowering, `Shapes`, witnesses, reports). The question is whether a row `q`
+is useful after rows `P`: does some value match `q` and no row of `P`. Arm *i*
+is unreachable (W2010) when it is not useful after arms *0..i*; the match is
+non-exhaustive (E2066) when `_` is still useful after every arm, with up to
+three witnesses (the values no arm matches) in the report.
+
+- Constructors: a tuple or struct is the single constructor of its type, with
+  one sub-pattern per element or field; `Bool`, `Int`, `Char` and a variant (by
+  its discriminant) are values; a `Constant` that `eval` reduces to a scalar or
+  a variant is that value; any other constant, and `AbstractConstant`, is
+  opaque; `Wildcard`, `Bind` and `Error` are wildcards; an `Or` is a row per
+  alternative.
+- A type's constructor set: `Single` (tuple, struct, `()`), `Bool`, an enum's
+  `Variants`, `Integers { count }` (2^bits; `char`'s valid scalar values),
+  `Empty` (`!`), `Unlisted` (floats, pointers, parameters: only `_` covers
+  them).
+- `useful(P, q)`: an empty `q` is useful when `P` has no rows. A constructor
+  head `c` recurses on both specialised by `c` (rows headed by `c` replaced by
+  its sub-patterns, wildcard heads by as many wildcards, others dropped, an
+  opaque head dropped too). A wildcard head: when `P`'s first column covers the
+  whole set, useful when it is for some `c`; else against the default rows
+  (wildcard heads, removed), and a missing constructor heads the witness. An
+  opaque head is useful against the default rows only.
+- No range patterns yet, so a set of literals is complete only when it lists
+  every value of its type (all 256 of a `u8`); the witness is the smallest
+  value no arm lists.
+- An opaque constant never makes a match exhaustive, nor is it unreachable
+  unless a wildcard arm precedes it. `local` patterns hold no tests, so they
+  always match and are not checked.
+- Constants (and an enum's variants) are evaluated wherever a pattern may
+  name them, a function's block or an initializer's alike. A constant whose
+  value is not known — one that is still being built, one `eval` cannot
+  reduce to a number — is opaque, and an enum whose variants have no value
+  is unlisted; both need `_`.
+- A match with an `Error` pattern, or a scrutinee whose type has an error, is
+  not checked: what failed has said why.
+
+### Pattern limitations (as of the usefulness pass)
+
+What patterns, `match` and exhaustiveness do not do yet, or do on purpose in a
+restricted way:
+
+- **A constant's value is known wherever a pattern may name it.** A `match` in
+  a constant's or global's initializer compares with the constants it names,
+  as one in a function's block does. The rule was lifted once a constant's
+  body could be built without looping: `const_value` calls
+  `ensure_const_body` *before* it marks the constant `InProgress`, and
+  `ensure_const_body` only checked whether the body exists, so two
+  initializers whose patterns name each other rebuilt each other's bodies
+  forever (reproduced: a stack overflow). Now a body is `NotBuilt`,
+  `Building` or `Built`, and a body that is being built is not built again: a
+  read of that constant's value finds none ("not known yet"), which is what
+  the reader needs to know. A constant whose value is not known is opaque, and
+  an enum whose variants have no value is unlisted; both need `_`.
+- **`eval` folds no `match`.** `ExprKind::Match` (like `IfElse`) is not a
+  constant expression, so a constant whose initializer is a `match` is E2057.
+- **`|` alternatives bind the same names** (E2118, E2119, E2001); the same
+  name in two alternatives is one local.
+- **No range patterns.** An integer or `char` match is exhaustive only with
+  `_` or every value listed; the witness is the smallest value no arm lists.
+- **Opaque constants never count towards exhaustiveness:** a trait's
+  constant (`T::MAX`), a constant with type arguments, a struct-valued
+  constant, or one `eval` cannot reduce to one number. An enum one of whose
+  variants has no value is unlisted (needs `_`).
+- **A redundant alternative is not reported** (`case 1 | 1`); only whole arms
+  are (W2010).
+- **Non-exhaustive reports** name at most three witnesses ("and more"), one
+  per missing variant; an integer gets one witness; `_` when no arm names a
+  constructor of that column.
+- **A match with a failed pattern** (`Error` anywhere) or an erroneous
+  scrutinee type skips the usefulness pass entirely.
+- **No patterns through pointers**, as there is no auto-deref: destructuring
+  a `*T` is a type mismatch.
+- **Struct pattern privacy** is construction's: the struct must be
+  constructible here (every field visible), even with `..`.
+- **Shorthand fields:** `{ mut x }` does not parse (write `{ x: mut x }`);
+  `{ x }` under `case` names a constant `x`, as the mode rule says.
+- **Untyped scrutinee or value:** `match 1 { .. }` and `local (a, b) = (1, 2)`
+  need a type (annotation required).
+- **Literals:** floats and strings are not pattern literals.
+- **A test in a `local`** (E2115) turns each test into `Error`; the pattern
+  still takes the value apart, and its bindings are still declared.
+- **Parse recovery:** a `local` marker in a pattern is E1015, and the pattern
+  is read as broken.
+- **`!` scrutinee:** zero arms are exhaustive, and any arm there is reported
+  unreachable.
+- **Dead nodes:** a failed value path (`resolve_value_path` returning an error
+  node) and the inner pattern of a reported `case` in a `local` leave nodes in
+  the arenas that nothing references, as an extra call argument already does.
+- **Not done elsewhere:** MIR lowering of patterns and `match` (MIR is
+  disabled); the Zed grammar does not know `case`; wx-fmt's printing of a
+  comment between a dropped redundant marker and its pattern is unverified.
 
 ## Order of work
 
@@ -354,40 +560,83 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 
 ### 2. Moderate (needs a small design decision, listed in the section)
 
-- **Method calls** `x.m(..)` and **type-relative paths** `T::f`, `Self::CONST`,
-  `<T as Tr>::f`, `heap::DATA_END`: `resolve_applicable_member` with a value
-  key, then `select_trait_member`. Decision: how the impl's own parameters are
-  inferred from the receiver for `impl<T> Wrapper<T> { func m(self) }`. Proposal:
-  `learn` the impl's frame from the impl target against the receiver type (the
-  same walk `learn` does for a field), then the method's own frame from its
-  arguments. A trait-owned constant on an abstract receiver needs a node of its
-  own (`AbstractConst { receiver, const_index }`), as in the old checker.
+- **Type-relative paths** (functions done): `Ordering::of`, `Self::f`, `T::f`,
+  `W::<u8>::new`, `<T>::f` and `<T as Tr>::f` (`typecheck/members.rs`). A value
+  path starting at a type parameter or `Self` names a type from its first
+  segment; any other walks the namespace graph and continues past the type it
+  stops at (an enum is such a stop for a name it does not bind). The member is
+  found by `resolve_applicable_member` (or the named trait alone), and becomes
+  a `Callee`: the function, its leading type arguments (the impl's, from
+  `match_impl_target` or `find_trait_impl`; `[Self]` for a trait's
+  declaration) and whether it is reached directly or abstractly. The call then
+  learns the function's own arguments as any call does. An inherent member is
+  as visible as written, a trait's member as the trait.
+  A generic struct named without its arguments (`Layout::of::<T>()`) is the
+  receiver `Layout<_>`: the call's flat list is the impl's slots, `INFER`
+  where the receiver does not say, then the method's own. The inherent impl is
+  chosen by shape: its slots are learned from the receiver, and it is a
+  candidate when its instantiated target still meets the receiver (a type's
+  inherent impls declare a name once, so there is at most one). Its bounds
+  wait for the call (`Callee::impl_bounds`), which proves them after learning
+  from the expected type and the arguments, as it does the function's own.
+  Trait members are not looked up on such a receiver yet.
+- **Associated constants** (done): selected like functions, and read as the
+  same pair the calls have: `Const { constant, type_args }` for a known
+  constant (free, a variant, an inherent impl's or the one a concrete trait
+  impl defines, with the impl's arguments) and `AbstractConst { constant,
+  type_args: [Self] }` for a trait's declaration. Its type is the declared one
+  with those arguments substituted. Constant evaluation reads only a `Const`
+  without arguments; an impl's constant that depends on the impl's arguments,
+  and an abstract one, are not evaluated yet.
+- **`Self` as a value** (done): inside an impl whose target is a struct,
+  `Self(..)` and `Self({ .. })` construct it with the target's arguments
+  (`impl<Mem> Layout<Mem>` builds `Layout<Mem>`), checked where every field is
+  visible like any construction. Bare `Self` is a struct used as a value
+  (E2110). In a trait's default body, outside an impl, or for a target that is
+  not a struct, `Self` names nothing to construct (E2009).
+- **Method calls** `x.m(..)` (done): the same `Callee`, the checked receiver
+  its first argument, learned from like any argument. Only a member taking
+  `self` is a method. No auto-deref: a pointer receiver finds the pointee's
+  methods that take `self` by pointer (`self: M::*Self`), and is itself
+  `self`; a by-value method through a pointer is reported, pointing at `.*`.
+  An untyped receiver (`(1).add(2)`) needs an annotation. Open: calls by name
+  (`x.m({ a })`, `T::f({ a })`), as for free functions.
 - **`loop`/`break`/`continue`/labels**: `Break`/`Continue` naming their scope. Decision: whether a
   loop without any valued `break` is `!` (old behaviour; yes).
 - **Assignment and compound assignment**: the place arena, mutability checks.
-  Decision: Q2 (globals).
+  Globals are handles, written through `GlobalMut::set` (Q2).
 - **Field access** `x.y` on a value and through a place. Field privacy is
   enforced here (the old checker did, for all three sites).
-- **`match`** on enums, `bool`, integers and `char`: patterns, exhaustiveness
-  (enum variants and `bool` by set, integers need `_`), unreachable arms.
-- **`local` destructuring**: the pattern arena; mostly a port of
-  `collect_pattern_bindings`, minus the path bookkeeping.
+- **Patterns** (designed, see "Patterns"), in this order: the parser, the pattern
+  arena, `local` destructuring, `match` and the usefulness pass (done).
 
 ### 3. Think first
 
-- **Pointers and memory**: `.*`, `.&`, string literals (`&[u8]` in the ambient
-  memory), array literals and repeats (static data), indexing, slice ranges.
-  Each needs "which memory", which today lives only in the type resolver's
-  ambient lookup; a literal also needs a static-data story that MIR used to
-  own. Decide where ambient-memory resolution lives for expressions and what a
-  string literal node carries (its decoded bytes, or a span decoded later).
+- **Pointers and memory**: array literals and repeats (static data), indexing,
+  slice ranges. There is no ambient memory: a pointer type always names its
+  memory (`heap::*T`, `Mem::*T`; an untagged one is `PointerWithoutMemory`,
+  E2038), and the compiler never picks one from how many are declared. A
+  literal that becomes static data takes its type, and so its memory, from its
+  context; without one it needs an annotation. A static-data story for MIR is
+  still open.
+- **String literals** (done): `ExprKind::String(SymbolU32)` holds the
+  unescaped contents (`literals::unescape_string_literal`, interned through
+  `TypeContext::strings`, which is `&mut`). Like a number, a string literal is
+  untyped (`Type::String`, `HAS_UNTYPED`) until its context gives it a type,
+  and `coerce` accepts a shared byte slice `M::&[u8]` or a shared byte array of
+  exactly its length `M::&[u8; N]`, in any memory, abstract ones included. So
+  it can wait for a generic call to learn its memory (`take("abc", p)`).
+  Exclusive targets are rejected (the data is read-only), a wrong length is
+  `ArraySizeMismatch`, operators on an untyped string are reported, and a cast
+  accepts what coercion would. Constant evaluation gives `NotConst` until
+  static data is designed. Open: `heap::&[u8; _]`, inferring the length.
 - **Calls through `Call`** for non-function values (Q3), and whether
   `Callee::Indirect` is a separate path or `Call::call` on `FunctionRef`.
 - **Method-call privacy**, which the old checker never enforced (CLAUDE.md
   pitfall). New code can do it from the start since impl members carry
   visibility; decide the rule for trait default methods (fall back to the
   trait's visibility).
-- **Impl conformance** is not a body concern, but `GenericMethodCall` to a
+- **Impl conformance** is not a body concern, but `AbstractCall` to a
   default the impl does not override assumes it. Keep it on the list.
 - **Constant evaluation of richer bodies**: the evaluator returns `NotConst`
   for anything it does not know, so new kinds are safe by default. Whether
@@ -400,21 +649,19 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   inference variables across statements; `local x = 5;` needs a type)? Everything
   above assumes yes; the alternative needs a fulfillment context and deferred
   obligations per body, which `check_now` deliberately avoids.
-- **Q2. Globals.** A global's type is now nominal (`Type::Global`, with `impl
-  Global { get }` and `impl GlobalMut { set }`), but the examples read and
-  assign them as plain values (`bump = new_end; bump as u32`). Is the plan that
-  the name `bump` in an expression means its value and is a place (implicit
-  `get`/`set`), or that it means the handle and the user writes `bump.get()` /
-  `bump.set(x)`? Same question, smaller, for a memory's name (`heap.grow(1)` is a
-  handle; is it ever a value otherwise?).
+- **Q2. Globals.** Decided: a global's name means its handle, of its nominal
+  type `Type::Global` (with `impl Global { get }` and, for `global mut`,
+  `impl GlobalMut { set }`). Its value is `g.get()`, a write is `g.set(x)`;
+  `g = x` and `g op= x` are invalid assignment targets. The global's impls
+  declare no members, so `g.get()` is an `AbstractCall` of `Global::get` with
+  the global as `Self`, which MIR lowers to `global.get`.
 - **Q3. Calls through `Call`.** Should `f(x)` on a value whose type implements
   `Call` (a user struct) be accepted now, or only function items and
   `func(..)` references, with `Call` left to bounds (`F: Call`) for the moment?
-- **Q4. Operator nodes.** Keep `Binary`/`Unary` for builtins and a call node
-  for overloaded operators (today's split), or one operator node carrying
-  `OpDispatch`? The plan above keeps today's split and uses `OpDispatch` only
-  for compound assignment.
+- **Q4. Operator nodes.** Decided: one node per way an operation is defined
+  (`Primitive`/`Concrete`/`Abstract`) and per destination (value, `Assign`, `Store`);
+  see the table under places and assignment.
 - **Q5. Typeset-abstract literal arithmetic in bodies.** Coercion of literals
   to an abstract typeset-bounded `T` exists for constants; in a body, an operator
-  on `T` gives a `GenericMethodCall`. Is anything beyond that expected (for
+  on `T` gives an `AbstractCall`. Is anything beyond that expected (for
   example `as` casts between typeset members)?

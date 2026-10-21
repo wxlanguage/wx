@@ -88,6 +88,7 @@ define_text! {
 		As               => " as ",
 		ColonSp          => ": ",
 		CommaSp          => ", ",
+		VbarSp           => " | ",
 		PlusSp           => " + ",
 		EqSp             => " = ",
 		EqBare           => " =",
@@ -1495,8 +1496,9 @@ impl<'a> Builder<'a> {
 						start: arm.inner.span.start,
 					},
 				);
-				let mut an: Vec<NodeId> =
-					vec![self.build_expression(&arm.inner.inner.pattern)];
+				let mut an: Vec<NodeId> = Vec::new();
+				let pattern = &arm.inner.inner.pattern;
+				self.build_pattern(&mut an, &pattern.inner, pattern.span);
 				an.push(self.text(Text::Arrow));
 				let body = &arm.inner.inner.body;
 				let body = self.build_block_content(
@@ -2459,8 +2461,8 @@ impl<'a> Builder<'a> {
 			ast::Expression::MethodCall(mc) => {
 				let mut items = self.build_method_callee(
 					&mc.object,
-					&mc.method,
-					&mc.type_args,
+					&mc.method.ident,
+					&mc.method.type_args,
 				);
 				self.build_call_args(&mut items, &mc.arguments);
 				let concat = self.arena.concat(items);
@@ -2476,8 +2478,8 @@ impl<'a> Builder<'a> {
 			ast::Expression::NamedMethodCall(mc) => {
 				let mut items = self.build_method_callee(
 					&mc.object,
-					&mc.method,
-					&mc.type_args,
+					&mc.method.ident,
+					&mc.method.type_args,
 				);
 				self.build_named_call_args(&mut items, &mc.arguments);
 				let concat = self.arena.concat(items);
@@ -2600,7 +2602,16 @@ impl<'a> Builder<'a> {
 		}
 	}
 
-	fn build_pattern(&mut self, out: &mut Vec<NodeId>, pattern: &ast::Pattern) {
+	/// A pattern. What each term is follows from its own shape, so there is
+	/// one way to print each of them: a name binds, a literal is printed as
+	/// it was written, a qualified path compares with that constant, and a
+	/// one-segment path is a constant marked with `const`.
+	fn build_pattern(
+		&mut self,
+		out: &mut Vec<NodeId>,
+		pattern: &ast::Pattern,
+		span: TextSpan,
+	) {
 		match pattern {
 			ast::Pattern::Wildcard => out.push(self.text(Text::Underscore)),
 			ast::Pattern::Binding { mut_span, name } => {
@@ -2609,35 +2620,78 @@ impl<'a> Builder<'a> {
 				}
 				out.push(self.symbol(name.inner));
 			}
-			ast::Pattern::Tuple { elements } => {
-				out.push(self.text(Text::LParen));
-				for (i, element) in elements.iter().enumerate() {
-					if i > 0 {
-						out.push(self.text(Text::CommaSp));
-					}
-					self.build_pattern(out, &element.inner.inner);
+			ast::Pattern::Constant { path } => {
+				// A path of one segment can only be a constant the author
+				// marked with `const`; a longer one is a constant already.
+				if let [segment] = &**path
+					&& segment.type_args.is_empty()
+				{
+					out.push(self.text(Text::Const));
 				}
-				out.push(self.text(Text::RParen));
-			}
-			ast::Pattern::Struct { path, elements } => {
 				out.push(self.build_value_path(path));
-				out.push(self.text(Text::LParen));
-				for (i, element) in elements.iter().enumerate() {
+			}
+			ast::Pattern::Literal(_) => {
+				out.push(self.source_text(span));
+			}
+			ast::Pattern::Or(alternatives) => {
+				for (i, alternative) in alternatives.iter().enumerate() {
 					if i > 0 {
-						out.push(self.text(Text::CommaSp));
+						out.push(self.text(Text::VbarSp));
 					}
-					match &element.inner.inner {
-						ast::PositionalPatternItem::Element(pattern) => {
-							self.build_pattern(out, pattern);
-						}
-						ast::PositionalPatternItem::Rest => {
-							out.push(self.text(Text::DotDot));
-						}
+					let alternative = &alternative.inner;
+					self.build_pattern(
+						out,
+						&alternative.inner,
+						alternative.span,
+					);
+				}
+			}
+			ast::Pattern::Destructure(destructure) => {
+				self.build_destructure(out, destructure);
+			}
+			ast::Pattern::Error => {
+				out.push(self.source_text(span));
+			}
+		}
+	}
+
+	/// Destructuring; each of its children is a pattern of its own.
+	fn build_destructure(
+		&mut self,
+		out: &mut Vec<NodeId>,
+		destructure: &ast::Destructure,
+	) {
+		let elements = |this: &mut Self,
+		                out: &mut Vec<NodeId>,
+		                elements: &ast::PatternElements| {
+			out.push(this.text(Text::LParen));
+			for (i, element) in elements.iter().enumerate() {
+				if i > 0 {
+					out.push(this.text(Text::CommaSp));
+				}
+				match &element.inner.inner {
+					ast::PatternElement::Pattern(pattern) => {
+						this.build_pattern(out, pattern, element.inner.span);
+					}
+					ast::PatternElement::Rest => {
+						out.push(this.text(Text::DotDot));
 					}
 				}
-				out.push(self.text(Text::RParen));
 			}
-			ast::Pattern::NamedStruct { path, fields } => {
+			out.push(this.text(Text::RParen));
+		};
+		match destructure {
+			ast::Destructure::Tuple { elements: items } => {
+				elements(self, out, items);
+			}
+			ast::Destructure::Struct {
+				path,
+				elements: items,
+			} => {
+				out.push(self.build_value_path(path));
+				elements(self, out, items);
+			}
+			ast::Destructure::NamedStruct { path, fields } => {
 				out.push(self.build_value_path(path));
 				out.push(self.text(Text::LParen));
 				out.push(self.text(Text::LBrace));
@@ -2648,14 +2702,18 @@ impl<'a> Builder<'a> {
 						Text::Space
 					}));
 					match &item.inner.inner {
-						ast::NamedPatternItem::Field(field) => {
+						ast::PatternFieldItem::Field(field) => {
 							out.push(self.symbol(field.name.inner));
-							if let Some(pat) = &field.pattern {
+							if let Some(pattern) = &field.pattern {
 								out.push(self.text(Text::ColonSp));
-								self.build_pattern(out, &pat.inner);
+								self.build_pattern(
+									out,
+									&pattern.inner,
+									pattern.span,
+								);
 							}
 						}
-						ast::NamedPatternItem::Rest => {
+						ast::PatternFieldItem::Rest => {
 							out.push(self.text(Text::DotDot));
 						}
 					}
@@ -2680,7 +2738,7 @@ impl<'a> Builder<'a> {
 				value,
 			} => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Local)];
-				self.build_pattern(&mut items, &pattern.inner);
+				self.build_pattern(&mut items, &pattern.inner, pattern.span);
 				if let Some(annotation) = type_annotation {
 					items.push(self.text(Text::ColonSp));
 					items.push(self.build_type_expression(&annotation.inner));

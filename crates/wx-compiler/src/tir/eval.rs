@@ -1,6 +1,6 @@
 //! Constant evaluation: folds a constant's checked `Body` into a value.
 //!
-//! The evaluator handles literals, builtin operators over them, references to
+//! The evaluator handles literals, primitive operators over them, references to
 //! other constants and the construction of structs, and nothing else: whatever
 //! else a body holds (a call, a form the checker does not cover yet) is not a
 //! constant. Arithmetic follows the operand type exactly, and a result outside
@@ -22,7 +22,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::body::{ArgOrder, ExprIdx, ExprKind};
+use super::body::{ArgOrder, ConstBody, ExprIdx, ExprKind};
 use super::defs::{ConstIdx, EnumIdx, StructIdx};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
@@ -156,6 +156,23 @@ impl TypeContext<'_, '_, '_> {
 		self.diagnostics.push(diagnostic);
 	}
 
+	/// A constant's value as a pattern compares with it: the bits of its one
+	/// Wasm number (a narrow signed integer sign-extended, as it is held).
+	/// `None` when it has no value or is more than one number.
+	pub(super) fn constant_bits(
+		&mut self,
+		const_index: ConstIdx,
+	) -> Option<u64> {
+		match self.const_value(const_index) {
+			Ok([scalar]) => match scalar.val {
+				Val::I32(bits) => Some(u64::from(bits)),
+				Val::I64(bits) => Some(bits),
+				Val::F32(_) | Val::F64(_) | Val::V128(_) => None,
+			},
+			_ => None,
+		}
+	}
+
 	/// The memoized value of a constant.
 	fn const_value(
 		&mut self,
@@ -177,7 +194,20 @@ impl TypeContext<'_, '_, '_> {
 			Err(state) => return self.settle_constant(const_index, state),
 		};
 		self.ensure_const_body(const_index);
-		let Some(body) = &self.const_bodies[usize::from(const_index)] else {
+		let Some(body) = self.const_body(const_index) else {
+			// The body is being built, and we are inside its own build: its
+			// value cannot be known yet, and building its body again would
+			// ask it for its value again. The caller reads it as "no value
+			// here", which is what a constant whose value is not known
+			// means.
+			if matches!(
+				self.const_bodies[usize::from(const_index)],
+				ConstBody::Building
+			) {
+				return Err(Unevaluable::Silent);
+			}
+			// A constant with no initializer at all: a required trait
+			// constant.
 			return self.settle_constant(const_index, ConstValueState::NoValue);
 		};
 		let root = body.root();
@@ -238,7 +268,7 @@ impl TypeContext<'_, '_, '_> {
 		expr: ExprIdx,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let body = self.const_bodies[usize::from(owner)].as_ref().unwrap();
+		let body = self.const_body(owner).unwrap();
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
 		if ty == TypeIndex::ERROR {
@@ -247,8 +277,34 @@ impl TypeContext<'_, '_, '_> {
 		let own = |kind| Halt::Own(EvalError { span, kind });
 		match kind {
 			ExprKind::Error => return Err(Halt::Silent),
-			ExprKind::MethodCall { .. }
-			| ExprKind::GenericMethodCall { .. } => {
+			// Locals, calls, control flow and memory are not evaluated (yet).
+			ExprKind::String(_)
+			| ExprKind::AbstractCall { .. }
+			| ExprKind::Local(_)
+			| ExprKind::Global(_)
+			| ExprKind::Function(_)
+			| ExprKind::Drop { .. }
+			| ExprKind::Call { .. }
+			| ExprKind::Cast { .. }
+			| ExprKind::FieldAccess { .. }
+			| ExprKind::Load(_)
+			| ExprKind::AddressOf(_)
+			| ExprKind::Block { .. }
+			| ExprKind::LocalDeclaration { .. }
+			| ExprKind::Match { .. }
+			| ExprKind::IfElse { .. }
+			| ExprKind::Loop { .. }
+			| ExprKind::Break { .. }
+			| ExprKind::Continue { .. }
+			| ExprKind::Return { .. }
+			| ExprKind::Assign { .. }
+			| ExprKind::Store { .. }
+			| ExprKind::PrimitiveCompoundAssign { .. }
+			| ExprKind::ConcreteCompoundAssign { .. }
+			| ExprKind::AbstractCompoundAssign { .. }
+			| ExprKind::PrimitiveCompoundStore { .. }
+			| ExprKind::ConcreteCompoundStore { .. }
+			| ExprKind::AbstractCompoundStore { .. } => {
 				return Err(own(EvalErrorKind::NotConst));
 			}
 			ExprKind::Int(value) => match Scalar::from_type(ty) {
@@ -266,8 +322,16 @@ impl TypeContext<'_, '_, '_> {
 			},
 			ExprKind::Bool(value) => stack.push(ConstScalar::bool(value)),
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
-			ExprKind::Const(const_index) => {
-				self.read_constant(const_index, span, stack)?;
+			// An impl's constant may depend on the impl's arguments, which
+			// evaluation does not substitute (yet).
+			ExprKind::Const {
+				constant,
+				type_args,
+			} if type_args.is_empty() => {
+				self.read_constant(constant, span, stack)?;
+			}
+			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
+				return Err(own(EvalErrorKind::NotConst));
 			}
 			ExprKind::NextDiscriminant(previous) => {
 				self.read_constant(previous, span, stack)?;
@@ -278,7 +342,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 			// A negated literal is one literal, so `-128` fits an `i8` although
 			// `128` does not.
-			ExprKind::Unary {
+			ExprKind::PrimitiveUnary {
 				op: UnaryOp::InvertSign,
 				operand,
 			} if let ExprKind::Int(value) = body.kind(operand)
@@ -290,7 +354,7 @@ impl TypeContext<'_, '_, '_> {
 					))?,
 				);
 			}
-			ExprKind::Unary { op, operand } => {
+			ExprKind::PrimitiveUnary { op, operand } => {
 				self.eval(owner, operand, stack)?;
 				let operand = stack.pop().expect("an operand's value");
 				stack.push(unary(op, operand).map_err(own)?);
@@ -298,8 +362,7 @@ impl TypeContext<'_, '_, '_> {
 			// Its values are its elements', in order, as its type's layout is.
 			ExprKind::Tuple { elements } => {
 				for at in 0..elements.len() {
-					let body =
-						self.const_bodies[usize::from(owner)].as_ref().unwrap();
+					let body = self.const_body(owner).unwrap();
 					let element = body.args(elements)[at];
 					self.eval(owner, element, stack)?;
 				}
@@ -319,8 +382,7 @@ impl TypeContext<'_, '_, '_> {
 				let start = stack.len();
 				let mut fields = Vec::new();
 				for at in 0..count {
-					let body =
-						self.const_bodies[usize::from(owner)].as_ref().unwrap();
+					let body = self.const_body(owner).unwrap();
 					let (arg, field) =
 						(body.args(args)[at], body.declared_index(order, at));
 					let field_start = stack.len();
@@ -340,7 +402,7 @@ impl TypeContext<'_, '_, '_> {
 					}
 				}
 			}
-			ExprKind::Binary { op, lhs, rhs } => {
+			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				self.eval(owner, lhs, stack)?;
 				// `&&` and `||` do not evaluate a right side they do not need;
 				// otherwise the right side is the answer.
@@ -534,8 +596,7 @@ impl TypeContext<'_, '_, '_> {
 				);
 			for &(_, variant) in group {
 				// The written value, or the name of a variant counted on.
-				let body =
-					self.const_bodies[usize::from(variant)].as_ref().unwrap();
+				let body = self.const_body(variant).unwrap();
 				let span = body.span(body.root());
 				diagnostic = diagnostic.with_label(
 					SourceSpan::new(file_id, span)
@@ -973,7 +1034,7 @@ fn integer_unary(op: UnaryOp, operand: ConstScalar) -> Option<ConstScalar> {
 		}
 		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
 			unreachable!(
-				"the checker builds builtin operators on their scalars"
+				"the checker builds primitive operators on their scalars"
 			)
 		}
 	})
@@ -1184,7 +1245,7 @@ fn integer_binary(
 		}
 		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
 			unreachable!(
-				"the checker builds builtin operators on their scalars"
+				"the checker builds primitive operators on their scalars"
 			)
 		}
 	})
