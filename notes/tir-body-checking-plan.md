@@ -449,9 +449,13 @@ known statically can be named.
   unnamed parameter), and dropped arguments are built with nothing expected.
   Then the same final `expect` and bound checks as a positional call.
 - A struct construction is a call of its constructor and is checked by the
-  same code: `CallTarget` (`typecheck/calls.rs`) is `Function` or
-  `StructConstructor`, whose parameters are the struct's fields, and
-  `build_arguments` checks either's arguments by position or by name. The
+  same code: `CallTarget` (`typecheck/calls.rs`) is read once per call from
+  a function or a struct, whose parameters are its fields (the type
+  parameters' frame, the parameter types, the parameter names), and
+  `build_arguments` checks either's arguments by position or by name. Only
+  diagnostics and bound ownership ask which declaration it is
+  (`CallTargetKind`); `StructDef` keeps its field names and `pub`s as two
+  index-aligned lists, as `FunctionDef` keeps its parameter names. The
   diagnostics are shared too: E2016 and E2120–E2123, naming the target
   ("function `f`", "struct constructor `Point`") with a label at its
   declaration. E2086 is gone; struct patterns keep E2025–E2027 and E2088

@@ -10,9 +10,10 @@
 //! arguments stay in written order, which is the order they are evaluated in.
 //!
 //! A struct construction is a call of the struct's constructor, whose
-//! parameters are its fields: both are checked against a `CallTarget` by the
-//! same code, with the same diagnostics. Each argument keeps the type it was
-//! built with (`GivenArgument`), which is final unless it had an unknown part.
+//! parameters are its fields: both are checked against a `CallTarget`,
+//! read once per call, by the same code, with the same diagnostics. Each
+//! argument keeps the type it was built with (`GivenArgument`), which is
+//! final unless it had an unknown part.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
@@ -77,29 +78,72 @@ pub(super) struct GivenArgument {
 	pub(super) expected: TypeIndex,
 }
 
-/// What a call calls: a function, or a struct's constructor, whose
-/// parameters are the struct's fields. A call's arguments are checked against
-/// either the same way, by position or by name.
+/// What a call calls, read once per call: a function, or a struct's
+/// constructor, whose parameters are the struct's fields. A call's arguments
+/// are checked against either the same way, by position or by name.
+pub(super) struct CallTarget<'ctx> {
+	pub(super) kind: CallTargetKind,
+	/// The frames the parameter types are written with: the whole chain the
+	/// call's flat type arguments instantiate.
+	pub(super) type_env: TypeEnvIdx,
+	/// Each parameter's type as declared, `self` included.
+	pub(super) param_types: TypeList,
+	/// Each parameter's name as a call by name spells it, `None` when it is
+	/// unnamed. A function's are its naming declaration's.
+	pub(super) param_names: &'ctx [Option<Spanned<SymbolU32>>],
+}
+
+impl<'ctx> CallTarget<'ctx> {
+	pub(super) fn function(
+		cx: &TypeContext<'_, 'ctx, '_>,
+		function: FunctionIdx,
+	) -> Self {
+		let signature = &cx.functions[usize::from(function)];
+		Self {
+			kind: CallTargetKind::Function(function),
+			type_env: signature.type_params,
+			param_types: signature.param_types,
+			param_names: &cx.defs.functions
+				[usize::from(naming_declaration(cx, function))]
+			.params,
+		}
+	}
+
+	pub(super) fn struct_constructor(
+		cx: &TypeContext<'_, 'ctx, '_>,
+		struct_index: StructIdx,
+	) -> Self {
+		let signature = &cx.structs[usize::from(struct_index)];
+		Self {
+			kind: CallTargetKind::StructConstructor(struct_index),
+			type_env: signature.type_params,
+			param_types: signature.field_types,
+			param_names: &cx.defs.structs[usize::from(struct_index)]
+				.field_names,
+		}
+	}
+
+	/// The first parameter from `from` on named `name`: a later one of the
+	/// same name was reported on the declaration.
+	fn find_param(&self, name: SymbolU32, from: usize) -> Option<ParamIdx> {
+		self.param_names
+			.iter()
+			.enumerate()
+			.skip(from)
+			.find(|(_, param)| param.is_some_and(|param| param.inner == name))
+			.map(|(at, _)| ParamIdx::new(at as u32))
+	}
+}
+
+/// Which declaration a `CallTarget` is, for what the checking itself does not
+/// need: what a diagnostic names, and who owns a bound.
 #[derive(Clone, Copy)]
-pub(super) enum CallTarget {
+pub(super) enum CallTargetKind {
 	Function(FunctionIdx),
 	StructConstructor(StructIdx),
 }
 
-impl CallTarget {
-	/// The frames the parameter types are written with: the whole chain the
-	/// call's flat type arguments instantiate.
-	fn type_params(self, cx: &TypeContext<'_, '_, '_>) -> TypeEnvIdx {
-		match self {
-			Self::Function(function) => {
-				cx.functions[usize::from(function)].type_params
-			}
-			Self::StructConstructor(struct_index) => {
-				cx.structs[usize::from(struct_index)].type_params
-			}
-		}
-	}
-
+impl CallTargetKind {
 	pub(super) fn owner(self) -> TypeEnvOwner {
 		match self {
 			Self::Function(function) => TypeEnvOwner::Function(function),
@@ -109,85 +153,9 @@ impl CallTarget {
 		}
 	}
 
-	fn param_count(self, cx: &TypeContext<'_, '_, '_>) -> usize {
-		match self {
-			Self::Function(function) => {
-				cx.functions[usize::from(function)].param_types.len()
-			}
-			Self::StructConstructor(struct_index) => {
-				cx.structs[usize::from(struct_index)].field_types.len()
-			}
-		}
-	}
-
-	/// The parameter's type as declared, `self` included.
-	pub(super) fn param_type(
-		self,
-		cx: &TypeContext<'_, '_, '_>,
-		param: ParamIdx,
-	) -> TypeIndex {
-		match self {
-			Self::Function(function) => {
-				let params = cx.functions[usize::from(function)].param_types;
-				cx.types.list(params)[usize::from(param)]
-			}
-			Self::StructConstructor(struct_index) => cx
-				.types
-				.list(cx.structs[usize::from(struct_index)].field_types)
-				[usize::from(param)],
-		}
-	}
-
-	/// The parameter's name as a call by name spells it, `None` when it is
-	/// unnamed. A function's are its naming declaration's.
-	fn param_name(
-		self,
-		cx: &TypeContext<'_, '_, '_>,
-		param: ParamIdx,
-	) -> Option<SymbolU32> {
-		let name = match self {
-			Self::Function(function) => {
-				cx.defs.functions[usize::from(naming_declaration(cx, function))]
-					.params[usize::from(param)]
-			}
-			Self::StructConstructor(struct_index) => {
-				cx.defs.structs[usize::from(struct_index)].fields
-					[usize::from(param)]
-				.name
-			}
-		};
-		name.map(|name| name.inner)
-	}
-
-	/// The first parameter from `from` on named `name`: a later one of the
-	/// same name was reported on the declaration.
-	fn find_param(
-		self,
-		cx: &TypeContext<'_, '_, '_>,
-		name: SymbolU32,
-		from: usize,
-	) -> Option<ParamIdx> {
-		match self {
-			Self::Function(function) => cx.defs.functions
-				[usize::from(naming_declaration(cx, function))]
-			.params
-			.iter()
-			.enumerate()
-			.skip(from)
-			.find(|(_, param)| param.is_some_and(|param| param.inner == name))
-			.map(|(at, _)| ParamIdx::new(at as u32)),
-			Self::StructConstructor(struct_index) => cx.defs.structs
-				[usize::from(struct_index)]
-			.lookup
-			.get(&name)
-			.map(|&field| ParamIdx::new(usize::from(field) as u32))
-			.filter(|&param| usize::from(param) >= from),
-		}
-	}
-
-	/// What kind of target a diagnostic names: "function" or "struct
+	/// What a diagnostic calls the target: "function" or "struct
 	/// constructor".
-	fn kind(self) -> &'static str {
+	fn describe(self) -> &'static str {
 		match self {
 			Self::Function(_) => "function",
 			Self::StructConstructor(_) => "struct constructor",
@@ -267,7 +235,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let type_list = self.cx.types.push_list(&type_args);
 		self.check_impl_bounds(&callee, segment, type_list);
 		self.check_param_bounds(
-			CallTarget::Function(function),
+			&CallTarget::function(self.cx, function),
 			own,
 			segment,
 			type_list,
@@ -290,7 +258,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let target = CallTarget::Function(callee.function);
+		let target = CallTarget::function(self.cx, callee.function);
 		let return_type =
 			self.cx.functions[usize::from(callee.function)].return_type;
 		let (env, own) = self.function_frames(callee.function);
@@ -311,7 +279,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let Some(receiver) = receiver {
 			let receiver_param = ParamIdx::new(0);
 			self.learn_argument(
-				target,
+				&target,
 				&mut type_args,
 				receiver_param,
 				receiver,
@@ -325,7 +293,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			});
 		}
 		let reported = self.build_arguments(
-			target,
+			&target,
 			&mut type_args,
 			arguments,
 			&mut given,
@@ -343,11 +311,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			poisoned,
 			&mut type_args,
 		);
-		self.expect_arguments(target, &type_args, &given);
+		self.expect_arguments(&target, &type_args, &given);
 		// One stored list for the bound checks and the node.
 		let type_list = self.cx.types.push_list(&type_args);
 		self.check_impl_bounds(&callee, segment, type_list);
-		self.check_param_bounds(target, own, segment, type_list, &given);
+		self.check_param_bounds(&target, own, segment, type_list, &given);
 		let order = match arguments {
 			Arguments::Positional(_) => ArgOrder::InOrder,
 			Arguments::Named(_) => self
@@ -383,7 +351,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// why a type argument stays unknown.
 	pub(super) fn build_arguments(
 		&mut self,
-		target: CallTarget,
+		target: &CallTarget<'_>,
 		type_args: &mut [TypeIndex],
 		arguments: Arguments<'_>,
 		given: &mut Vec<GivenArgument>,
@@ -406,15 +374,15 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// are instantiated again.
 	pub(super) fn expect_arguments(
 		&mut self,
-		target: CallTarget,
+		target: &CallTarget<'_>,
 		type_args: &[TypeIndex],
 		given: &[GivenArgument],
 	) {
-		let env = target.type_params(self.cx);
 		for argument in given {
 			let ty = if self.cx.types.has_infer(argument.expected) {
-				let declared = target.param_type(self.cx, argument.param);
-				self.instantiate(declared, env, type_args)
+				let declared = self.cx.types.list(target.param_types)
+					[usize::from(argument.param)];
+				self.instantiate(declared, target.type_env, type_args)
 			} else {
 				argument.expected
 			};
@@ -425,17 +393,17 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// What `value`, given for `param`, teaches the call's type arguments.
 	fn learn_argument(
 		&mut self,
-		target: CallTarget,
+		target: &CallTarget<'_>,
 		type_args: &mut [TypeIndex],
 		param: ParamIdx,
 		value: ExprIdx,
 	) {
-		let declared = target.param_type(self.cx, param);
-		let env = target.type_params(self.cx);
+		let declared =
+			self.cx.types.list(target.param_types)[usize::from(param)];
 		let actual = self.body.ty(value);
 		self.cx.types.learn(
 			&self.cx.type_envs,
-			env,
+			target.type_env,
 			type_args,
 			declared,
 			actual,
@@ -447,15 +415,14 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// dropped.
 	fn positional_arguments(
 		&mut self,
-		target: CallTarget,
+		target: &CallTarget<'_>,
 		type_args: &mut [TypeIndex],
 		arguments: &[Separated<Spanned<ast::Expression>>],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
 		let skipped = given.len();
-		let env = target.type_params(self.cx);
-		let open = target.param_count(self.cx) - skipped;
+		let open = target.param_types.len() - skipped;
 		let reported = arguments.len() != open;
 		if reported {
 			self.report_argument_count(target, open, arguments.len(), span);
@@ -467,8 +434,9 @@ impl BodyContext<'_, '_, '_, '_> {
 				continue;
 			}
 			let param = ParamIdx::new((skipped + at) as u32);
-			let declared = target.param_type(self.cx, param);
-			let hint = self.instantiate(declared, env, type_args);
+			let declared =
+				self.cx.types.list(target.param_types)[usize::from(param)];
+			let hint = self.instantiate(declared, target.type_env, type_args);
 			let value = self.build(&argument.inner, hint);
 			self.learn_argument(target, type_args, param, value);
 			given.push(GivenArgument {
@@ -486,22 +454,19 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// is built and dropped.
 	fn named_arguments(
 		&mut self,
-		target: CallTarget,
+		target: &CallTarget<'_>,
 		type_args: &mut [TypeIndex],
 		arguments: &[Separated<Spanned<ast::NamedArgument>>],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
 		let skipped = given.len();
-		let env = target.type_params(self.cx);
-		let count = target.param_count(self.cx);
-		let positional_only = (skipped..count).any(|at| {
-			target
-				.param_name(self.cx, ParamIdx::new(at as u32))
-				.is_none()
-		});
+		let count = target.param_names.len();
+		let positional_only =
+			target.param_names[skipped..].iter().any(Option::is_none);
 		if positional_only {
-			let (kind, target_name) = (target.kind(), target.name(self.cx));
+			let (kind, target_name) =
+				(target.kind.describe(), target.kind.name(self.cx));
 			self.cx.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::PositionalOnlyCall.code())
@@ -510,7 +475,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						 it is called by position"
 					))
 					.with_label(Label::primary(self.scope.file_id, span))
-					.with_label(target.declared_here(self.cx)),
+					.with_label(target.kind.declared_here(self.cx)),
 			);
 			for argument in arguments {
 				self.build_named_argument(
@@ -528,18 +493,20 @@ impl BodyContext<'_, '_, '_, '_> {
 		for argument in arguments {
 			let argument = &argument.inner.inner;
 			let name = argument.name;
-			let param = target.find_param(self.cx, name.inner, skipped);
+			let param = target.find_param(name.inner, skipped);
 			let hint = match param {
 				Some(param) => {
-					let declared = target.param_type(self.cx, param);
-					self.instantiate(declared, env, type_args)
+					let declared = self.cx.types.list(target.param_types)
+						[usize::from(param)];
+					self.instantiate(declared, target.type_env, type_args)
 				}
 				None => TypeIndex::INFER,
 			};
 			let value = self.build_named_argument(argument, hint);
 			let param_name = self.cx.strings.resolve(name.inner).unwrap();
 			let Some(param) = param else {
-				let (kind, target_name) = (target.kind(), target.name(self.cx));
+				let (kind, target_name) =
+					(target.kind.describe(), target.kind.name(self.cx));
 				self.cx.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::UnknownParameterName.code())
@@ -551,7 +518,7 @@ impl BodyContext<'_, '_, '_, '_> {
 							self.scope.file_id,
 							name.span,
 						))
-						.with_label(target.declared_here(self.cx)),
+						.with_label(target.kind.declared_here(self.cx)),
 				);
 				reported = true;
 				continue;
@@ -593,15 +560,16 @@ impl BodyContext<'_, '_, '_, '_> {
 			.map(|at| ParamIdx::new(at as u32))
 			.filter(|&param| !named.iter().any(|&(named, _)| named == param))
 			.filter_map(|param| {
-				let name = target.param_name(self.cx, param)?;
-				(target.find_param(self.cx, name, skipped) == Some(param)).then(
-					|| format!("`{}`", self.cx.strings.resolve(name).unwrap()),
-				)
+				let name = target.param_names[usize::from(param)]?.inner;
+				(target.find_param(name, skipped) == Some(param)).then(|| {
+					format!("`{}`", self.cx.strings.resolve(name).unwrap())
+				})
 			})
 			.collect();
 		if !missing.is_empty() {
 			reported = true;
-			let (kind, target_name) = (target.kind(), target.name(self.cx));
+			let (kind, target_name) =
+				(target.kind.describe(), target.kind.name(self.cx));
 			self.cx.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::MissingArguments.code())
@@ -612,7 +580,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						missing.join(", ")
 					))
 					.with_label(Label::primary(self.scope.file_id, span))
-					.with_label(target.declared_here(self.cx)),
+					.with_label(target.kind.declared_here(self.cx)),
 			);
 		}
 		reported
@@ -734,13 +702,14 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	fn report_argument_count(
 		&mut self,
-		target: CallTarget,
+		target: &CallTarget<'_>,
 		expected: usize,
 		found: usize,
 		span: TextSpan,
 	) {
 		let plural = |n: usize| if n == 1 { "" } else { "s" };
-		let (kind, target_name) = (target.kind(), target.name(self.cx));
+		let (kind, target_name) =
+			(target.kind.describe(), target.kind.name(self.cx));
 		self.cx.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::ArgumentCountMismatch.code())
@@ -758,7 +727,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						),
 					),
 				)
-				.with_label(target.declared_here(self.cx)),
+				.with_label(target.kind.declared_here(self.cx)),
 		);
 	}
 }

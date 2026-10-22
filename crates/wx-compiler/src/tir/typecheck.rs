@@ -793,16 +793,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let target = CallTarget::StructConstructor(struct_index);
+		let target = CallTarget::struct_constructor(self.cx, struct_index);
 		let mut given = Vec::new();
 		let reported = self.build_arguments(
-			target,
+			&target,
 			&mut type_args,
 			arguments,
 			&mut given,
 			span,
 		);
-		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
 		// A reported argument list may be why a type argument stays unknown.
 		let poisoned = expected == TypeIndex::ERROR
 			|| reported
@@ -810,14 +809,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.cx.types.has_error(self.body.ty(argument.value))
 			});
 		self.report_uninferred(
-			params_env,
+			target.type_env,
 			segment.ident.span,
 			poisoned,
 			&mut type_args,
 		);
-		self.expect_arguments(target, &type_args, &given);
+		self.expect_arguments(&target, &type_args, &given);
 		let type_list = self.cx.types.push_list(&type_args);
-		self.check_param_bounds(target, params_env, segment, type_list, &given);
+		self.check_param_bounds(
+			&target,
+			target.type_env,
+			segment,
+			type_list,
+			&given,
+		);
 		let order = match arguments {
 			Arguments::Positional(_) => ArgOrder::InOrder,
 			Arguments::Named(_) => self
@@ -923,7 +928,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// caller shares with whatever else reads it (the call's node).
 	fn check_param_bounds(
 		&mut self,
-		target: CallTarget,
+		target: &CallTarget<'_>,
 		params_env: TypeEnvIdx,
 		segment: &ast::PathSegment,
 		arguments: TypeList,
@@ -944,7 +949,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						self.cx.type_envs.param_types(params_env)[index];
 					let mut span = segment.ident.span;
 					for argument in given {
-						if target.param_type(self.cx, argument.param) == param {
+						if self.cx.types.list(target.param_types)
+							[usize::from(argument.param)]
+							== param
+						{
 							span = self.body.span(argument.value);
 							break;
 						}
@@ -965,7 +973,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					span,
 				},
 				SourceSpan::new(self.scope.file_id, span),
-				target.owner(),
+				target.kind.owner(),
 			);
 		}
 		self.cx.check_now(&obligations);
@@ -1109,11 +1117,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// its constructor is.
 	fn constructor_accessible(&self, struct_index: StructIdx) -> bool {
 		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		def.fields.iter().all(|field| {
+		def.field_pub_spans.iter().all(|&pub_span| {
 			self.cx.defs.namespaces.is_accessible_from(
 				self.scope.namespace,
 				def.namespace.into(),
-				Visibility::from(field.pub_span),
+				Visibility::from(pub_span),
 			)
 		})
 	}
@@ -1144,11 +1152,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let strings = &*self.cx.strings;
 		let name = strings.resolve(def.name.inner).unwrap();
 		let private: Vec<String> = def
-			.fields
+			.field_names
 			.iter()
+			.zip(&def.field_pub_spans)
 			.enumerate()
-			.filter(|(_, field)| field.pub_span.is_none())
-			.map(|(at, field)| match field.name {
+			.filter(|(_, (_, pub_span))| pub_span.is_none())
+			.map(|(at, (name, _))| match name {
 				Some(name) => {
 					format!("`{}`", strings.resolve(name.inner).unwrap())
 				}
@@ -1173,9 +1182,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			.with_label(
 				site.primary_label().with_message("private constructor"),
 			);
-		for field in def.fields.iter().filter(|field| field.pub_span.is_none())
+		for (name, pub_span) in def.field_names.iter().zip(&def.field_pub_spans)
 		{
-			if let Some(field_name) = field.name {
+			if pub_span.is_none()
+				&& let Some(field_name) = name
+			{
 				diagnostic = diagnostic.with_label(
 					SourceSpan::new(def.file_id, field_name.span)
 						.secondary_label()
@@ -2905,9 +2916,8 @@ mod tests {
 			else {
 				panic!("a field of a non-struct");
 			};
-			let field = self.defs.structs[usize::from(struct_index)].fields
-				[usize::from(field)]
-			.name
+			let field = self.defs.structs[usize::from(struct_index)]
+				.field_names[usize::from(field)]
 			.unwrap();
 			self.context.strings.resolve(field.inner).unwrap()
 		}

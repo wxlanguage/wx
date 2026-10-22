@@ -201,7 +201,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			return None;
 		};
 		let visibility =
-			Visibility::from(def.fields[usize::from(field)].pub_span);
+			Visibility::from(def.field_pub_spans[usize::from(field)]);
 		if !self.cx.defs.namespaces.is_accessible_from(
 			self.scope.namespace,
 			def.namespace.into(),

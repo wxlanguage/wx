@@ -735,7 +735,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				.enumerate()
 				.filter(|(_, given)| given.is_none())
 				.map(|(at, _)| {
-					let name = def.fields[at].name.unwrap().inner;
+					let name = def.field_names[at].unwrap().inner;
 					format!("`{}`", self.cx.strings.resolve(name).unwrap())
 				})
 				.collect();

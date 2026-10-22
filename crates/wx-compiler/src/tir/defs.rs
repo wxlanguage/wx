@@ -233,7 +233,10 @@ pub struct StructDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
-	pub fields: Box<[FieldDef]>,
+	/// Each field's name, `None` for a positional field.
+	pub field_names: Box<[Option<Spanned<SymbolU32>>]>,
+	/// Each field's `pub`, index-aligned with `field_names`.
+	pub field_pub_spans: Box<[Option<TextSpan>]>,
 	/// The named fields by name, each to its first occurrence.
 	#[cfg_attr(
 		test,
@@ -246,15 +249,8 @@ impl StructDef {
 	/// Whether every field has a name: only then can the struct be
 	/// constructed (`P({ x: 1, y: 2 })`) or destructured by name.
 	pub fn is_fully_named(&self) -> bool {
-		self.fields.iter().all(|field| field.name.is_some())
+		self.field_names.iter().all(Option::is_some)
 	}
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct FieldDef {
-	/// `None` for a positional field.
-	pub name: Option<Spanned<SymbolU32>>,
-	pub pub_span: Option<TextSpan>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -2696,13 +2692,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
-				let mut field_defs: Vec<FieldDef> =
+				let mut field_names: Vec<Option<Spanned<SymbolU32>>> =
 					Vec::with_capacity(fields.len());
+				let mut field_pub_spans = Vec::with_capacity(fields.len());
 				let mut lookup: FxHashMap<SymbolU32, FieldIdx> =
 					FxHashMap::default();
 				for field in fields.iter().map(|f| &f.inner.inner) {
-					let index =
-						FieldIdx::new(u32::try_from(field_defs.len()).unwrap());
+					let index = FieldIdx::new(
+						u32::try_from(field_names.len()).unwrap(),
+					);
 					// A duplicate name keeps its slot (positions still match
 					// the declaration) but is unreachable by name.
 					let name = field.binding.and_then(ast::Binding::name);
@@ -2712,9 +2710,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								.push(report_self_field(file_id, name.span));
 						}
 						if let Some(&first_index) = lookup.get(&name.inner) {
-							let first_name = field_defs
+							let first_name = field_names
 								[usize::from(first_index)]
-							.name
 							.expect("only named fields are looked up");
 							self.diagnostics.push(
 								report_duplicate_struct_field(
@@ -2728,17 +2725,16 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							lookup.insert(name.inner, index);
 						}
 					}
-					field_defs.push(FieldDef {
-						name,
-						pub_span: field.pub_span,
-					});
+					field_names.push(name);
+					field_pub_spans.push(field.pub_span);
 				}
 
 				self.structs.push(StructDef {
 					file_id,
 					namespace,
 					name: *name,
-					fields: field_defs.into_boxed_slice(),
+					field_names: field_names.into_boxed_slice(),
+					field_pub_spans: field_pub_spans.into_boxed_slice(),
 					lookup,
 				});
 				self.ast_nodes.push(AstEntry {
@@ -4911,13 +4907,13 @@ mod tests {
 		};
 		let struct_def = &case.defs.structs[usize::from(point_struct_index)];
 
-		let (fields, lookup) = (&struct_def.fields, &struct_def.lookup);
+		let (names, lookup) = (&struct_def.field_names, &struct_def.lookup);
 		// Both occurrences keep a real field slot — duplicate name isn't
 		// dropped, only unreachable by name — so a later field's index
 		// still matches its declaration position.
-		assert_eq!(fields.len(), 2);
-		let name = fields[0].name.unwrap().inner;
-		assert_eq!(fields[1].name.unwrap().inner, name);
+		assert_eq!(names.len(), 2);
+		let name = names[0].unwrap().inner;
+		assert_eq!(names[1].unwrap().inner, name);
 		// `lookup` only ever points at the first occurrence.
 		assert_eq!(lookup.get(&name), Some(&FieldIdx::new(0)));
 	}

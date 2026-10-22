@@ -4743,10 +4743,11 @@ pub(super) mod tests {
 						for (at, &arg) in body.args(args).iter().enumerate() {
 							text.push(' ');
 							if let ArgOrder::Permuted { .. } = order {
-								let field = &def.fields[usize::from(
+								let name = def.field_names[usize::from(
 									body.declared_index(order, at),
-								)];
-								let name = field.name.unwrap().inner;
+								)]
+								.unwrap()
+								.inner;
 								text.push_str(strings.resolve(name).unwrap());
 								text.push('=');
 							}
