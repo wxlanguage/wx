@@ -3,7 +3,7 @@ use std::*;
 trait Hasher {
   func write<Mem: std::Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
 
-  func finish(self) -> u64;
+  func finish(self: Self) -> u64;
 
   #[inline]
   func hash<Mem: Memory, T: Hash>(self: Mem::*Self, value: Mem::&T) {
@@ -37,7 +37,7 @@ impl Hasher for DefaultHasher {
     };
   }
 
-  func finish(self) -> u64 {
+  func finish(self: Self) -> u64 {
     self.value
   }
 }

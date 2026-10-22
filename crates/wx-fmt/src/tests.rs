@@ -215,7 +215,7 @@ fn test_format_impl_items() {
 	let case = TestCase::new(indoc! {"
         impl i32 {
             #[inline]
-            pub func double(self) -> i32 {
+            pub func double(self: Self) -> i32 {
                 self * 2
             }
 
@@ -237,7 +237,7 @@ fn test_format_impl_items() {
 		indoc! {"
             impl i32 {
                 #[inline]
-                pub func double(self) -> i32 {
+                pub func double(self: Self) -> i32 {
                     self * 2
                 }
 
@@ -254,10 +254,10 @@ fn test_format_trait_items() {
             type Output: Show + Clone;
 
             const SIZE: u32;
-            func render(self);
+            func render(self: Self);
 
             #[inline]
-            func grow(self, delta: u32) -> u32 {
+            func grow(self: Self, delta: u32) -> u32 {
                 delta
             }
         }
@@ -280,10 +280,10 @@ fn test_format_trait_items() {
 
                 const SIZE: u32;
 
-                func render(self);
+                func render(self: Self);
 
                 #[inline]
-                func grow(self, delta: u32) -> u32 {
+                func grow(self: Self, delta: u32) -> u32 {
                     delta
                 }
             }
@@ -446,6 +446,36 @@ fn test_format_struct_items() {
 
             struct Unit(
                 value: f64,
+            );
+        "}
+	);
+}
+
+/// Parameters and fields print as written, `_: T` included.
+#[test]
+fn test_format_parameter_and_field_slots() {
+	let case = TestCase::new(indoc! {"
+        func f(i32, _: u8, mut d: i32) {}
+        struct S(_: u8, pub mut e: i32);
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+			trailing_comma: true,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            func f(i32, _: u8, mut d: i32) {}
+
+            struct S(
+                _: u8,
+                pub mut e: i32,
             );
         "}
 	);
@@ -775,7 +805,7 @@ fn test_format_impl_trait_items() {
         impl Iterator for Range {
             type Item = i32;
 
-            func next(self) -> Self::Item {
+            func next(self: Self) -> Self::Item {
                 0
             }
         }
@@ -796,7 +826,7 @@ fn test_format_impl_trait_items() {
             impl Iterator for Range {
                 type Item = i32;
 
-                func next(self) -> Self::Item {
+                func next(self: Self) -> Self::Item {
                     0
                 }
             }
@@ -1594,7 +1624,7 @@ fn test_format_impl_trait_multi_segment() {
 	// the ImplTrait trait_name field).
 	let case = TestCase::new(indoc! {"
         impl module::Drawable for Point {
-            func draw(self) {}
+            func draw(self: Self) {}
         }
     "});
 	let output = format(
@@ -1611,7 +1641,7 @@ fn test_format_impl_trait_multi_segment() {
 		output,
 		indoc! {"
             impl module::Drawable for Point {
-                func draw(self) {}
+                func draw(self: Self) {}
             }
         "}
 	);
@@ -1624,7 +1654,7 @@ fn test_format_impl_trait_generic_type_params() {
 	// silently changing the code's meaning.
 	let case = TestCase::new(indoc! {"
         impl<T> Trait for Wrapper<T> {
-            func get(self) -> T {
+            func get(self: Self) -> T {
                 self.value
             }
         }
@@ -1643,7 +1673,7 @@ fn test_format_impl_trait_generic_type_params() {
 		output,
 		indoc! {"
             impl<T> Trait for Wrapper<T> {
-                func get(self) -> T {
+                func get(self: Self) -> T {
                     self.value
                 }
             }
@@ -1724,11 +1754,11 @@ fn test_format_trailing_comments_keep_their_line() {
 
         impl S {
             // leading on first member
-            func a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             } // trailing on member
 
-            func b(self) -> u32 {
+            func b(self: Self) -> u32 {
                 self.y
             }
         }
@@ -1898,7 +1928,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
         }
 
         impl S { // opens an `impl`
-            func a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
@@ -1914,7 +1944,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
         }
 
         trait T { // opens a `trait`
-            func t(self) -> u32;
+            func t(self: Self) -> u32;
         }
 
         export { // opens an `export`
@@ -1940,7 +1970,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
 
         impl S {
             // opens an `impl`
-            func a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
@@ -1960,7 +1990,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
 
         trait T {
             // opens a `trait`
-            func t(self) -> u32;
+            func t(self: Self) -> u32;
         }
 
         export {
@@ -2026,10 +2056,10 @@ fn test_format_trait_body_comments_are_kept_in_place() {
 	let source = indoc! {"
         trait T {
             // opens the trait
-            func a(self) -> u32; // trails a member
+            func a(self: Self) -> u32; // trails a member
 
             // own-line before b
-            func b(self) -> u32;
+            func b(self: Self) -> u32;
             // after the last member
         }
     "};
@@ -2080,7 +2110,7 @@ fn test_format_blank_line_between_leading_comments() {
             // one
 
             // two
-            func a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
@@ -2170,7 +2200,7 @@ fn test_format_no_blank_line_after_a_list_opener() {
 
         impl S {
 
-            func a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
@@ -2188,7 +2218,7 @@ fn test_format_no_blank_line_after_a_list_opener() {
         );
 
         impl S {
-            func a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
@@ -2495,13 +2525,14 @@ fn function_bodies_always_break() {
 	// Methods follow the same rule; generic signatures wrap before the body.
 	{
 		for source in [
-			"impl Point { func f(self) -> i32 { 1 } }",
-			"trait T { func f(self) -> i32 { 1 } }",
-			"impl T for Point { func f(self) -> i32 { 1 } }",
+			"impl Point { func f(self: Self) -> i32 { 1 } }",
+			"trait T { func f(self: Self) -> i32 { 1 } }",
+			"impl T for Point { func f(self: Self) -> i32 { 1 } }",
 		] {
 			let output = checked_format(source, 80, 4);
 			assert!(
-				output.contains("func f(self) -> i32 {\n        1\n    }"),
+				output
+					.contains("func f(self: Self) -> i32 {\n        1\n    }"),
 				"{output}"
 			);
 			let output = checked_format(source, 24, 4);
@@ -2746,7 +2777,7 @@ fn test_format_current_syntax_forms() {
         trait Tr {
             type A: Bound = u32;
 
-            func f(self);
+            func f(self: Self);
         }
 
         func main() {
@@ -2789,7 +2820,7 @@ fn test_format_current_syntax_forms() {
             trait Tr {
                 type A: Bound = u32;
 
-                func f(self);
+                func f(self: Self);
             }
 
             func main() {

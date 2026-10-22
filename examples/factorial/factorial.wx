@@ -15,21 +15,21 @@
 // struct X(i32, i32);
 
 // trait PartialOrd {
-//     func partial_cmp(self, other: Self) -> Option<Ordering>;
+//     func partial_cmp(self: Self, other: Self) -> Option<Ordering>;
 
-//     func lt(self, other: Self) -> bool {
+//     func lt(self: Self, other: Self) -> bool {
 //         self.partial_cmp(other) == Some(Ordering::Less)
 //     }
 
-//     func le(self, other: Self) -> bool {
+//     func le(self: Self, other: Self) -> bool {
 //         self.partial_cmp(other) != Some(Ordering::Greater)
 //     }
 
-//     func gt(self, other: Self) -> bool {
+//     func gt(self: Self, other: Self) -> bool {
 //         self.partial_cmp(other) == Some(Ordering::Greater)
 //     }
 
-//     func ge(self, other: Self) -> bool {
+//     func ge(self: Self, other: Self) -> bool {
 //         self.partial_cmp(other) != Some(Ordering::Less)
 //     }
 // }
@@ -41,17 +41,17 @@
 // }
 
 // pub trait Ord: PartialOrd {
-//     func cmp(self, other: Self) -> Ordering;
+//     func cmp(self: Self, other: Self) -> Ordering;
 
-//     func min(self, other: Self) -> Self {
+//     func min(self: Self, other: Self) -> Self {
 //         if self < other { self } else { other }
 //     }
 
-//     func max(self, other: Self) -> Self {
+//     func max(self: Self, other: Self) -> Self {
 //         if self < other { self } else { other }
 //     }
 
-//     func clamp(self, min: Self, max: Self) -> Self {
+//     func clamp(self: Self, min: Self, max: Self) -> Self {
 //         if min < max { trap() };
 //         if self < min { return min };
 //         if self > max { return max };

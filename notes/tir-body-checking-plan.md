@@ -303,8 +303,161 @@ selection (`match_impl_target`, `find_trait_impl`); the written `::<..>` and
 
 `Type::Function` (a function item's zero-sized type) is what a bare path to a
 function evaluates to; it coerces to `Type::FunctionRef` where one is expected.
-Calling a value of a user type that implements `Call` would be a `Call` of
-`Call::call`'s impl (see Q3).
+Calling a value of a user type that implements `Call` is a `Call` of
+`Call::call`'s impl (Q3); a type itself is never called.
+
+### Named calls and parameter names
+
+Decided 2026-10-22; part 1 implemented, parts 2 and 3 not yet. A call may name its arguments,
+`f({ b: 2, a })`, as a struct construction already can. Three pieces, in the
+order they are built: a parameter may be unnamed, a trait impl's parameters
+take their names from the trait, and a call by name binds each argument to the
+parameter of its name. Supersedes `notes/wx-named-invocation-and-struct-constructors.md`
+where the two differ (that note's record structs and named-only constructors
+predate the one-form struct).
+
+**1. Parameters and fields share one grammar** (done). Both are a binding
+and a type, written the same way and parsed by one function
+(`Parser::parse_binding_and_type`):
+
+```
+param, field ::= binding ":" Type   // both parts
+               | Type               // the binding left out: `_: Type`
+binding      ::= "_" | name | "mut" name
+field        ::= ["pub"] (as above)
+```
+
+A binding is the same leaf a `local` pattern binds with, and it is always
+followed by `:`. Anything without a `:` is a type, with no exception: `x`
+alone is the type `x` (as it was already for a struct field), and `_` alone is
+the type `_`, the inference placeholder, which a signature never accepts.
+There is no parameter or field without a type, the receiver's included:
+`self` is a name like any other and is written `self: Self` (or
+`self: M::*Self`); its type is never implied.
+
+| written | parameter | field |
+|---|---|---|
+| `i32`, `_: i32` | unnamed, binds nothing | unnamed: built and destructured by position only |
+| `x: i32` | an immutable local `x` | a field `x` |
+| `mut x: i32` | a mutable local `x` | a mutable field `x` (designed, not checked yet) |
+| `self: Self` | the receiver, first in a trait or impl function | reported: a field cannot be named `self` (E1008) |
+| `x` | the type `x`: "cannot find type `x`" | the same |
+| `_` | the type `_`: rejected, signatures do not infer | the same |
+| `self`, `mut x`, `mut i32` | E1023 "expected a type annotation" | the same |
+| `mut _: i32`, `mut *u8`, `mut heap::*u8` | E1022 "`mut` needs a name" | the same |
+
+`mut` always means that the named place may be reassigned; what differs is
+whose it is. A parameter's belongs to the body, so its `mut` is invisible to
+callers, absent from function types, and free in trait impls. A field's
+belongs to the value, so its `mut` is part of the struct's type (below).
+Without a name there is nothing to reach it by: an unnamed parameter binds no
+local, and wx has no positional field access (`t.0` is never added, since
+`t.0.1` would be ambiguous with the float `0.1`), so `mut` needs a name in
+both.
+
+An unnamed parameter is how a parameter is ignored: the body cannot read what
+it cannot name, and it needs no unused-parameter exemption later. Function
+types `func(A, B) -> R` stay unnamed; a declaration names its parameters.
+
+- AST: `Binding` is `Wildcard(span)` (`_`) or `Name { mut_span, name }`, so
+  `mut _` cannot be represented; `FunctionParam { binding: Option<Binding>,
+  ty }` and `StructField { pub_span, binding: Option<Binding>, ty }`, `None`
+  when the binding is left out. `_: T` and `T` mean the same; the AST keeps
+  which was written. The type is always
+  present: a binding written without one (`self`, `mut x`) keeps its name
+  and is given `TypeExpression::Error`, which resolves to `ERROR` silently,
+  so the parameter and those after it survive.
+- Where a `self` may stand is not the parser's question: `defs` reports one
+  that is not first in a trait or impl function (E2098, as before) and a
+  field named `self`; a free function's `self` is reported once and its type
+  not resolved.
+- `defs`: `FunctionDef::params` holds `Option<Spanned<SymbolU32>>` per
+  parameter; the duplicate-name check (E2097) skips unnamed ones.
+- `signatures`: every parameter's type is resolved as written, the receiver's
+  too; E2099 (`MissingParameterType`) and the receiver's implied `Self` are
+  gone.
+- Bodies: a named parameter is a local of the root scope; an unnamed one binds
+  none. `Body::params` maps each parameter to its local (`None` when
+  unnamed), so `Local::name` stays required. MIR gives every parameter a Wasm
+  parameter and reads a named one through its local.
+- wx-fmt prints parameters and fields as written, `_: T` included.
+- The AST test harness now uses the keyword-seeded interner
+  (`Keyword::create_interner`), as every compilation does.
+- Later, maybe: `Pattern::Wildcard` and `Pattern::Binding { mut_span, name }`
+  are `Binding`'s two cases, and the pattern leaf could hold one.
+
+**Field mutability** (designed, not checked). Wasm GC declares each struct
+field mutable or not, and the mutability is part of the type: `struct.set`
+needs a mutable field, two struct types differing only in it are different
+types, and only an immutable field may be refined in a subtype. wx makes it
+explicit rather than inferring it, and gives it to every struct, GC or not.
+Open: the checker rule for a linear-memory struct (a write through a place
+needs an exclusive pointer *and* a `mut` field?), and that fields are then
+immutable unless marked, which breaks the field writes in `examples/vec`,
+`examples/arena`, `examples/hashing` and `examples/snake`.
+
+**2. A trait impl's parameters are named by the trait.** Where a trait's
+declaration names a parameter, the impl's function either uses that name or
+leaves the parameter unnamed (ignored); where the trait leaves it unnamed, the
+impl may name it freely, since that name is only a local. `mut` is free (it
+belongs to the local, not the interface); `self` matches by position.
+
+- Why: a trait method has one spelling. `T::add({ rhs })` in generic code and
+  `Point::add({ rhs })` in concrete code are the same call, and whether an impl
+  overrides a default (`Call` or `AbstractCall`) never changes which names are
+  valid. Parameter names are API, and the trait is their one owner.
+- A different name inside the impl is a `local`: `local other = rhs;`. A trait
+  name that hides an item the body needs is reached by a qualified path
+  (`crate::size(..)`, `super::size(..)`), which never looks at locals.
+- Checked in `check_declarations`, for each function of a trait impl: its
+  declaration is `declared_trait_member(trait, value key of its name)`, and
+  the names are compared position by position. A parameter count or receiver
+  mismatch is conformance's, not this check's. New diagnostic: "parameter
+  `other` is named `rhs` in trait `Add`", at the impl's name, with the trait's
+  as a secondary label; help: use the trait's name, or leave it unnamed if
+  unused.
+- Costs, accepted: renaming a trait parameter breaks every impl that uses it
+  (one that leaves it unnamed is unaffected).
+- Inherent impls and free functions own their names; synthetic impls (`Call`
+  for functions, `Memory`, `Global`) have no written parameters.
+- Later, maybe: `_` or `a: _` taking the type from the trait. Left out:
+  every signature stays readable on its own, and adding it breaks nothing.
+
+**3. Calls by name.** `f({ a: 1, b })`, `T::f({ .. })`, `<T as Tr>::f({ .. })`
+and `x.m({ .. })`, whose receiver gives `self`. Only a call whose function is
+known statically can be named.
+
+- The names are the selected function's declaration's; for a trait impl's
+  function, its trait declaration's (by rule 2 they agree wherever the trait
+  names one, and an impl's unnamed parameter must not make a concrete call
+  positional only).
+- A function with an unnamed parameter (past the receiver) is called by
+  position only; naming it is an error, as `X({ .. })` is for
+  `struct X(i32, b: i32)` (`TupleStructBraceLiteral`), ideally one wording for
+  both.
+- Proposed: `self` is the receiver, never a name, so a method is called by name
+  only with method syntax; `T::m({ .. })` for a method reports that and points
+  at `x.m({ .. })`.
+- Checking, as `named_fields` does for a struct: arguments in written order;
+  each name finds its parameter (the first of that name); each value is built
+  with the parameter's type as known so far and learned from; an unknown name,
+  a name given twice and missing parameters are reported (new codes E2120
+  `UnknownParameterName`, E2121 `DuplicateNamedArgument`, E2122
+  `MissingArguments`; whether the struct codes E2025–E2027 fold into them is
+  open), and dropped arguments are built with nothing expected. Then the same
+  final `expect` and bound checks as a positional call.
+- Body: `Call` and `AbstractCall` gain `order: ArgOrder`, as
+  `StructConstructor` has. `args` stay in written order, which is the
+  evaluation order; the permutation says which parameter each gives; a
+  receiver is first and gives parameter 0. MIR evaluates in written order and
+  passes in parameter order, through temporaries where the two differ.
+- Not by name: a call through a value (a local of `func(A) -> R` type, or a
+  value whose type implements `Call`) is positional, since `Call::Args` is a
+  tuple. A named call there reports "a call through a value takes its
+  arguments by position".
+- Not yet: a named argument records no `Referent` (nor does a field name in
+  a construction); go-to-definition and rename on `{ a: .. }` need a
+  `Referent::Param` and a field counterpart, together.
 
 ### Patterns
 
@@ -599,8 +752,8 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `self` is a method. No auto-deref: a pointer receiver finds the pointee's
   methods that take `self` by pointer (`self: M::*Self`), and is itself
   `self`; a by-value method through a pointer is reported, pointing at `.*`.
-  An untyped receiver (`(1).add(2)`) needs an annotation. Open: calls by name
-  (`x.m({ a })`, `T::f({ a })`), as for free functions.
+  An untyped receiver (`(1).add(2)`) needs an annotation. Calls by name:
+  see "Named calls and parameter names".
 - **`loop`/`break`/`continue`/labels**: `Break`/`Continue` naming their scope. Decision: whether a
   loop without any valued `break` is `!` (old behaviour; yes).
 - **Assignment and compound assignment**: the place arena, mutability checks.
@@ -609,6 +762,9 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   enforced here (the old checker did, for all three sites).
 - **Patterns** (designed, see "Patterns"), in this order: the parser, the pattern
   arena, `local` destructuring, `match` and the usefulness pass (done).
+- **Named calls** (designed, see "Named calls and parameter names"), in this
+  order: the parameter and field grammar (done), the check that a trait impl's parameters
+  use the trait's names, then calls by name.
 
 ### 3. Think first
 
@@ -655,9 +811,10 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `g = x` and `g op= x` are invalid assignment targets. The global's impls
   declare no members, so `g.get()` is an `AbstractCall` of `Global::get` with
   the global as `Self`, which MIR lowers to `global.get`.
-- **Q3. Calls through `Call`.** Should `f(x)` on a value whose type implements
-  `Call` (a user struct) be accepted now, or only function items and
-  `func(..)` references, with `Call` left to bounds (`F: Call`) for the moment?
+- **Q3. Calls through `Call`.** Decided: a value whose type implements `Call`
+  is callable, `f(x)` on it is a `Call` of `Call::call`'s impl, by position
+  only. A type is never called as a value: a struct's name constructs it, any
+  other type named as a callee is an error.
 - **Q4. Operator nodes.** Decided: one node per way an operation is defined
   (`Primitive`/`Concrete`/`Abstract`) and per destination (value, `Assign`, `Store`);
   see the table under places and assignment.

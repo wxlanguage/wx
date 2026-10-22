@@ -309,7 +309,8 @@ pub struct FunctionDef {
 	pub namespace: Scope,
 	pub owner: FunctionOwner,
 	pub name: Spanned<SymbolU32>,
-	pub params: Box<[Spanned<SymbolU32>]>,
+	/// Each parameter's name, `None` for an unnamed one.
+	pub params: Box<[Option<Spanned<SymbolU32>>]>,
 	pub function_impls: FunctionImpls,
 }
 
@@ -2702,7 +2703,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						FieldIdx::new(u32::try_from(field_defs.len()).unwrap());
 					// A duplicate name keeps its slot (positions still match
 					// the declaration) but is unreachable by name.
-					if let Some(name) = field.name {
+					let name = field.binding.and_then(ast::Binding::name);
+					if let Some(name) = name {
+						if name.inner == Keyword::SelfLower.symbol() {
+							self.diagnostics
+								.push(report_self_field(file_id, name.span));
+						}
 						if let Some(&first_index) = lookup.get(&name.inner) {
 							let first_name = field_defs
 								[usize::from(first_index)]
@@ -2721,7 +2727,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						}
 					}
 					field_defs.push(FieldDef {
-						name: field.name,
+						name,
 						pub_span: field.pub_span,
 					});
 				}
@@ -3011,7 +3017,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								&signature.params,
 							);
 							let is_method = params.first().is_some_and(|p| {
-								p.inner == Keyword::SelfLower.symbol()
+								p.is_some_and(|p| {
+									p.inner == Keyword::SelfLower.symbol()
+								})
 							});
 							let function_impls = self
 								.synthesize_function_impls(
@@ -3178,7 +3186,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								&signature.params,
 							);
 							let is_method = params.first().is_some_and(|p| {
-								p.inner == Keyword::SelfLower.symbol()
+								p.is_some_and(|p| {
+									p.inner == Keyword::SelfLower.symbol()
+								})
 							});
 							let function_impls = self
 								.synthesize_function_impls(
@@ -3599,7 +3609,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								&signature.params,
 							);
 							let is_method = params.first().is_some_and(|p| {
-								p.inner == Keyword::SelfLower.symbol()
+								p.is_some_and(|p| {
+									p.inner == Keyword::SelfLower.symbol()
+								})
 							});
 							let function_impls = self
 								.synthesize_function_impls(
@@ -3814,28 +3826,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
-	) -> Box<[Spanned<SymbolU32>]> {
-		let mut names: Vec<Spanned<SymbolU32>> =
-			Vec::with_capacity(params.len());
-		for param in params.iter().map(|param| &param.inner.inner) {
-			if let Some(&first) =
-				names.iter().find(|s| s.inner == param.name.inner)
-			{
-				self.diagnostics.push(report_duplicate_function_parameter(
-					self.strings,
-					file_id,
-					param.name,
-					first,
-				));
-			}
-
-			if param.name.inner == Keyword::SelfLower.symbol() {
+	) -> Box<[Option<Spanned<SymbolU32>>]> {
+		let names = self.scan_param_names(file_id, params);
+		for name in names.iter().flatten() {
+			if name.inner == Keyword::SelfLower.symbol() {
 				self.diagnostics
-					.push(report_self_param_position(file_id, param.name.span));
+					.push(report_self_param_position(file_id, name.span));
 			}
-			names.push(param.name);
 		}
-		names.into_boxed_slice()
+		names
 	}
 
 	/// Validates a trait/impl function's parameter list: every name unique,
@@ -3844,21 +3843,40 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// `MemberKind::Method` or `MemberKind::Function` — is for the caller
 	/// to read straight off `params.first()` against
 	/// `Keyword::SelfLower.symbol()`, same constant-time check this uses;
-	/// nothing here needs to hand that fact back out. Whether every other
-	/// parameter is explicitly typed is a signature-phase concern
-	/// (`MissingParameterType`), not this prescan's.
+	/// nothing here needs to hand that fact back out.
 	fn scan_impl_function_params(
 		&mut self,
 		file_id: FileId,
 		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
-	) -> Box<[Spanned<SymbolU32>]> {
-		let mut names: Vec<Spanned<SymbolU32>> =
-			Vec::with_capacity(params.len());
-		for (index, param) in params.iter().enumerate() {
-			let p = &param.inner.inner;
-			let name = p.name;
+	) -> Box<[Option<Spanned<SymbolU32>>]> {
+		let names = self.scan_param_names(file_id, params);
+		for (index, name) in names.iter().enumerate() {
+			if let Some(name) = name
+				&& name.inner == Keyword::SelfLower.symbol()
+				&& index != 0
+			{
+				self.diagnostics
+					.push(report_self_param_position(file_id, name.span));
+			}
+		}
+		names
+	}
 
-			if let Some(&first) = names.iter().find(|s| s.inner == name.inner) {
+	/// Each parameter's name, `None` for an unnamed one, reporting a name
+	/// bound twice. Unnamed parameters never clash.
+	fn scan_param_names(
+		&mut self,
+		file_id: FileId,
+		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
+	) -> Box<[Option<Spanned<SymbolU32>>]> {
+		let mut names: Vec<Option<Spanned<SymbolU32>>> =
+			Vec::with_capacity(params.len());
+		for param in params.iter().map(|param| &param.inner.inner) {
+			let name = param.binding.and_then(ast::Binding::name);
+			if let Some(name) = name
+				&& let Some(&first) =
+					names.iter().flatten().find(|s| s.inner == name.inner)
+			{
 				self.diagnostics.push(report_duplicate_function_parameter(
 					self.strings,
 					file_id,
@@ -3866,13 +3884,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					first,
 				));
 			}
-
-			let is_self = name.inner == Keyword::SelfLower.symbol();
-			if is_self && index != 0 {
-				self.diagnostics
-					.push(report_self_param_position(file_id, name.span));
-			}
-
 			names.push(name);
 		}
 		names.into_boxed_slice()
@@ -3936,6 +3947,13 @@ fn report_self_param_position(
 		.with_message(
 			"`self` parameter is only allowed as the first parameter of an associated function",
 		)
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+}
+
+fn report_self_field(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::ReservedIdentifier.code())
+		.with_message("a field cannot be named `self`")
 		.with_label(SourceSpan::new(file_id, span).primary_label())
 }
 
@@ -4368,7 +4386,7 @@ mod tests {
 		// lookups specifically so this can't happen.
 		let case = TestCase::new_stdlib(indoc! {"
 			type Add;
-			trait u8 { func f(self) -> Self; }
+			trait u8 { func f(self: Self) -> Self; }
 		"});
 		case.diagnostics().assert_none();
 		assert!(
@@ -4490,19 +4508,19 @@ mod tests {
 			const VALUE: Unknown = missing;
 			trait Api {
 				func make() -> Unknown;
-				func get(self, value: Unknown) -> Unknown;
+				func get(self: Self, value: Unknown) -> Unknown;
 				const VALUE: Unknown;
 				type Item: Unknown;
 			}
 			struct Host();
 			impl Host {
 				func make() -> Unknown { missing }
-				func get(self, value: Unknown) -> Unknown { missing }
+				func get(self: Self, value: Unknown) -> Unknown { missing }
 				const VALUE: Unknown = missing;
 			}
 			impl Api for Host {
 				func make() -> Unknown { missing }
-				func get(self, value: Unknown) -> Unknown { missing }
+				func get(self: Self, value: Unknown) -> Unknown { missing }
 				const VALUE: Unknown = missing;
 				type Item = Unknown;
 			}
@@ -4667,7 +4685,9 @@ mod tests {
 		};
 		assert_eq!(
 			case.graph.strings.resolve(
-				case.defs.functions[usize::from(index)].params[0].inner
+				case.defs.functions[usize::from(index)].params[0]
+					.unwrap()
+					.inner
 			),
 			Some("original")
 		);
@@ -4802,7 +4822,9 @@ mod tests {
 			};
 			assert_eq!(
 				case.graph.strings.resolve(
-					case.defs.functions[usize::from(index)].params[0].inner
+					case.defs.functions[usize::from(index)].params[0]
+						.unwrap()
+						.inner
 				),
 				Some("original")
 			);
@@ -4918,7 +4940,11 @@ mod tests {
 			else {
 				panic!("expected `{path}` to be a function");
 			};
-			let params = &case.defs.functions[usize::from(index)].params;
+			let params: Vec<_> = case.defs.functions[usize::from(index)]
+				.params
+				.iter()
+				.map(|param| param.unwrap())
+				.collect();
 			assert_eq!(params.len(), 2);
 			assert_eq!(params[0].inner, params[1].inner);
 			let labels = &case.diagnostics[0].labels;
@@ -4930,15 +4956,22 @@ mod tests {
 	#[test]
 	fn self_in_a_free_function_is_rejected() {
 		for source in [
-			"func f(self) {}",
-			"func f(self);",
-			r#"import "env" as host { func f(self); }"#,
-			r#"import "env" as host { func f(x: i32, self); }"#,
+			"func f(self: Self) {}",
+			"func f(self: Self);",
+			r#"import "env" as host { func f(self: Self); }"#,
+			r#"import "env" as host { func f(x: i32, self: Self); }"#,
 		] {
 			let case = TestCase::new(source);
 			case.diagnostics()
 				.assert_error(DiagnosticCode::SelfParamPosition);
 		}
+	}
+
+	#[test]
+	fn a_field_cannot_be_named_self() {
+		let case = TestCase::new("struct S(self: i32);");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
 	}
 
 	#[test]
@@ -4955,7 +4988,9 @@ mod tests {
 			let names: Vec<_> = function
 				.params
 				.iter()
-				.map(|param| case.graph.strings.resolve(param.inner).unwrap())
+				.map(|param| {
+					case.graph.strings.resolve(param.unwrap().inner).unwrap()
+				})
 				.collect();
 			assert_eq!(names, ["x", "x", "tail"]);
 			case.diagnostics().assert_error_with(
@@ -4973,9 +5008,9 @@ mod tests {
 	#[test]
 	fn self_not_first_in_an_associated_function_is_rejected() {
 		for source in [
-			"trait T { func f(x: i32, self); }",
-			"struct S(); impl S { func f(x: i32, self) {} }",
-			"trait T {} struct S(); impl T for S { func f(x: i32, self) {} }",
+			"trait T { func f(x: i32, self: Self); }",
+			"struct S(); impl S { func f(x: i32, self: Self) {} }",
+			"trait T {} struct S(); impl T for S { func f(x: i32, self: Self) {} }",
 		] {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
@@ -4992,7 +5027,7 @@ mod tests {
 
 	#[test]
 	fn repeated_self_reports_both_duplicate_name_and_invalid_position() {
-		let source = "trait T { func f(self, self); }";
+		let source = "trait T { func f(self: Self, self: Self); }";
 		let case = TestCase::new_stdlib(source);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::DuplicateFunctionParameter,
@@ -5021,16 +5056,16 @@ mod tests {
 	fn receiver_presence_classifies_trait_and_impl_functions() {
 		let case = TestCase::new_stdlib(indoc! {"
 			trait T {
-				func method(self, x: i32);
+				func method(self: Self, x: i32);
 				func associated(x: i32);
 			}
 			struct S();
 			impl S {
-				func method(self, x: i32) {}
+				func method(self: Self, x: i32) {}
 				func associated(x: i32) {}
 			}
 			impl T for S {
-				func method(self, x: i32) {}
+				func method(self: Self, x: i32) {}
 				func associated(x: i32) {}
 			}
 		"});

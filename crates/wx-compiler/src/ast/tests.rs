@@ -19,7 +19,10 @@ struct TestCase {
 
 impl TestCase {
 	fn new(source: &str) -> Self {
-		let mut strings = StringInterner::new();
+		// Keywords pre-interned, as every compilation's interner is: the
+		// parser names some by `Keyword::symbol` (`self` alone is `self:
+		// Self`).
+		let mut strings = Keyword::create_interner();
 		let mut files = Files::new();
 		let file_id = files
 			.add("main.wx".to_string(), source.to_string(), FileOrigin::Local)
@@ -404,8 +407,11 @@ fn test_function_mut_param() {
 	case.diagnostics().assert_none();
 
 	let param = &case.function_signature(0).params[0].inner.inner;
-	assert_eq!(case.name(param.name.inner), "n");
-	assert!(param.mut_span.is_some(), "`mut n` should record a mut span");
+	let Some(Binding::Name { mut_span, name }) = param.binding else {
+		panic!("`n` is named")
+	};
+	assert_eq!(case.name(name.inner), "n");
+	assert!(mut_span.is_some(), "`mut n` should record a mut span");
 
 	// `mut` on a local lives on its binding pattern, not on the statement
 	let statements = case.function_block(0);
@@ -432,7 +438,7 @@ fn test_fn_pointer_param() {
 	case.diagnostics().assert_none();
 
 	let param = &case.function_signature(0).params[0].inner.inner;
-	let ty = &param.ty.as_ref().expect("`f` is annotated").inner;
+	let ty = &param.ty.inner;
 	let TypeExpression::Function { params, result } = ty else {
 		panic!("expected a function type, got {ty:?}")
 	};
@@ -488,7 +494,7 @@ fn test_impl() {
 	let case = TestCase::new(indoc! {"
         impl i32 {
             #[inline]
-            pub func double(self) -> i32 {
+            pub func double(self: Self) -> i32 {
                 self * 2
             }
         }
@@ -519,7 +525,7 @@ fn test_impl_trait_for_type() {
 	// impl Trait for Type — trait implementation block
 	let case = TestCase::new(indoc! {"
         impl Drawable for Point {
-            func draw(self) {
+            func draw(self: Self) {
                 draw_point(self.x, self.y)
             }
         }
@@ -572,10 +578,10 @@ fn test_trait_items() {
         trait Widget: Drawable + Sized {
             const SIZE: u32;
 
-            func render(self);
+            func render(self: Self);
 
             #[inline]
-            func grow(self, delta: u32) -> u32 {
+            func grow(self: Self, delta: u32) -> u32 {
                 delta
             }
         }
@@ -611,7 +617,10 @@ fn test_trait_items() {
 		panic!("expected a trait method")
 	};
 	assert_eq!(case.name(signature.name.inner), "render");
-	assert!(body.is_none(), "`func render(self);` has no default body");
+	assert!(
+		body.is_none(),
+		"`func render(self: Self);` has no default body"
+	);
 
 	let TraitItem::Function {
 		signature,
@@ -633,7 +642,7 @@ fn test_pub_not_permitted_in_trait_items() {
         trait Widget {
             pub const SIZE: u32;
             pub type Assoc;
-            pub func render(self);
+            pub func render(self: Self);
         }
     "});
 
@@ -657,11 +666,11 @@ fn test_pub_not_permitted_in_trait_impl_items() {
         impl Widget for Button {
             pub const SIZE: u32 = 1;
             pub type Assoc = u32;
-            pub func render(self) {}
+            pub func render(self: Self) {}
         }
 
         impl Button {
-            pub func area(self) -> u32 { 1 }
+            pub func area(self: Self) -> u32 { 1 }
         }
     "});
 
@@ -1208,7 +1217,13 @@ fn struct_fields_have_optional_names() {
 	let names = |index: usize| -> Vec<Option<String>> {
 		case.struct_fields(index)
 			.iter()
-			.map(|f| f.inner.inner.name.map(|n| case.name(n.inner).to_string()))
+			.map(|f| {
+				f.inner
+					.inner
+					.binding
+					.and_then(Binding::name)
+					.map(|n| case.name(n.inner).to_string())
+			})
 			.collect()
 	};
 	assert_eq!(names(0), [Some("x".into()), Some("y".into())]);
@@ -1226,6 +1241,201 @@ fn struct_fields_have_optional_names() {
 		TypeExpression::Pointer { .. }
 	));
 	assert!(case.struct_fields(1)[1].inner.inner.pub_span.is_some());
+}
+
+/// A parameter and a field are both written `binding: Type`, or `Type`
+/// alone. A binding (`_`, `name`, `mut name`) is always followed by `:`, so
+/// anything else is a type.
+#[test]
+fn parameters_and_fields_share_the_slot_grammar() {
+	let case = TestCase::new(indoc! {"
+        func f(i32, _: u8, c: i32, mut d: i32, x, _) {}
+        struct S(i32, _: u8, c: i32, mut d: i32, pub mut e: i32, x, _);
+    "});
+	case.diagnostics().assert_none();
+	let expected: [Option<&str>; 6] =
+		[None, None, Some("c"), Some("d"), None, None];
+	let params = &case.function_signature(0).params;
+	let names: Vec<_> = params
+		.iter()
+		.map(|param| {
+			param
+				.inner
+				.inner
+				.binding
+				.and_then(Binding::name)
+				.map(|n| case.name(n.inner))
+		})
+		.collect();
+	assert_eq!(names, expected);
+	let muts: Vec<_> = params
+		.iter()
+		.map(|param| {
+			param.inner.inner.binding.is_some_and(|b| {
+				matches!(
+					b,
+					Binding::Name {
+						mut_span: Some(_),
+						..
+					}
+				)
+			})
+		})
+		.collect();
+	assert_eq!(muts, [false, false, false, true, false, false]);
+	// `_:` is written, a binding that binds nothing; a type alone has none.
+	assert!(params[0].inner.inner.binding.is_none());
+	assert!(matches!(
+		params[1].inner.inner.binding,
+		Some(Binding::Wildcard(_))
+	));
+	// `x` alone is the type `x`, `_` alone the type `_`.
+	let ty = |index: usize| &params[index].inner.inner.ty.inner;
+	assert!(
+		matches!(ty(4), TypeExpression::Path(segments) if segments.len() == 1)
+	);
+	assert!(matches!(ty(5), TypeExpression::Infer));
+
+	let fields = case.struct_fields(1);
+	let names: Vec<_> = fields
+		.iter()
+		.map(|field| {
+			field
+				.inner
+				.inner
+				.binding
+				.and_then(Binding::name)
+				.map(|n| case.name(n.inner))
+		})
+		.collect();
+	assert_eq!(
+		names,
+		[None, None, Some("c"), Some("d"), Some("e"), None, None]
+	);
+	let muts: Vec<_> = fields
+		.iter()
+		.map(|field| {
+			field.inner.inner.binding.is_some_and(|b| {
+				matches!(
+					b,
+					Binding::Name {
+						mut_span: Some(_),
+						..
+					}
+				)
+			})
+		})
+		.collect();
+	assert_eq!(muts, [false, false, false, true, true, false, false]);
+	assert!(fields[4].inner.inner.pub_span.is_some());
+}
+
+/// `self` is a binding like any other: its type is written.
+#[test]
+fn the_receiver_is_written_with_its_type() {
+	let case = TestCase::new(indoc! {"
+        func a(self: Self) {}
+        func b(mut self: heap::*Self) {}
+    "});
+	case.diagnostics().assert_none();
+	for index in 0..2 {
+		let param = &case.function_signature(index).params[0].inner.inner;
+		let Some(Binding::Name { mut_span, name }) = param.binding else {
+			panic!("`self` is a name")
+		};
+		assert_eq!(case.name(name.inner), "self");
+		assert_eq!(mut_span.is_some(), index == 1);
+	}
+}
+
+/// A binding needs a type, and `mut` needs a name, in a parameter and in a
+/// field alike.
+#[test]
+fn a_binding_needs_a_type_and_mut_a_name() {
+	for (source, code, message) in [
+		(
+			"func f(self) {}",
+			DiagnosticCode::MissingTypeAnnotation,
+			"expected a type annotation",
+		),
+		(
+			"func f(mut self) {}",
+			DiagnosticCode::MissingTypeAnnotation,
+			"expected a type annotation",
+		),
+		(
+			"func f(mut i32) {}",
+			DiagnosticCode::MissingTypeAnnotation,
+			"expected a type annotation",
+		),
+		(
+			"func f(mut x) {}",
+			DiagnosticCode::MissingTypeAnnotation,
+			"expected a type annotation",
+		),
+		(
+			"func f(mut heap::*u8) {}",
+			DiagnosticCode::InvalidMutBinding,
+			"`mut` needs a name",
+		),
+		(
+			"struct S(mut i32);",
+			DiagnosticCode::MissingTypeAnnotation,
+			"expected a type annotation",
+		),
+		(
+			"func f(mut _: i32) {}",
+			DiagnosticCode::InvalidMutBinding,
+			"`mut` needs a name",
+		),
+		(
+			"func f(mut _) {}",
+			DiagnosticCode::InvalidMutBinding,
+			"`mut` needs a name",
+		),
+		(
+			"func f(mut *u8) {}",
+			DiagnosticCode::InvalidMutBinding,
+			"`mut` needs a name",
+		),
+		(
+			"struct S(mut _: i32);",
+			DiagnosticCode::InvalidMutBinding,
+			"`mut` needs a name",
+		),
+	] {
+		let case = TestCase::new(source);
+		let diagnostics = case.diagnostics();
+		diagnostics.assert_codes(&[code]);
+		diagnostics.assert_error_saying(message);
+	}
+}
+
+/// A binding written without its type keeps its name and is given an error
+/// type, so the parameter, and those after it, are still there.
+#[test]
+fn a_binding_without_a_type_recovers_with_an_error_type() {
+	let case = TestCase::new("func f(self, mut x, y: i32) {}");
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::MissingTypeAnnotation,
+		DiagnosticCode::MissingTypeAnnotation,
+	]);
+	let params = &case.function_signature(0).params;
+	let names: Vec<_> = params
+		.iter()
+		.map(|param| {
+			param
+				.inner
+				.inner
+				.binding
+				.and_then(Binding::name)
+				.map(|n| case.name(n.inner))
+		})
+		.collect();
+	assert_eq!(names, [Some("self"), Some("x"), Some("y")]);
+	for param in &params[..2] {
+		assert!(matches!(param.inner.inner.ty.inner, TypeExpression::Error));
+	}
 }
 
 #[test]
@@ -1932,13 +2142,13 @@ fn test_module_pub_items_and_associated_types() {
 
         pub trait Iterator {
             type Item: Show + Clone;
-            func next(self) -> Self::Item;
+            func next(self: Self) -> Self::Item;
         }
 
         impl Iterator for Range {
             type Item = i32;
 
-            func next(self) -> Self::Item {
+            func next(self: Self) -> Self::Item {
                 0
             }
         }
@@ -2284,7 +2494,7 @@ fn test_generic_application_type_args() {
 	let Item::Function { signature, .. } = case.item(1) else {
 		panic!("expected function")
 	};
-	let param_ty = &signature.params[0].inner.inner.ty.as_ref().unwrap().inner;
+	let param_ty = &signature.params[0].inner.inner.ty.inner;
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
@@ -2304,7 +2514,7 @@ fn test_path_continues_after_a_segment_with_type_args() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
-	let param_ty = &signature.params[0].inner.inner.ty.as_ref().unwrap().inner;
+	let param_ty = &signature.params[0].inner.inner.ty.inner;
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
@@ -2353,7 +2563,7 @@ fn test_impl_trait_multi_segment_trait_name() {
 	// `impl gfx::Drawable for Point` — trait_name must be two path segments.
 	let case = TestCase::new(indoc! {"
         impl gfx::Drawable for Point {
-            func draw(self) {}
+            func draw(self: Self) {}
         }
     "});
 	case.diagnostics().assert_none();
@@ -2630,15 +2840,7 @@ fn test_qualified_and_grouped_paths_in_type_position() {
 	case.diagnostics().assert_none();
 
 	let params = &case.function_signature(0).params;
-	let ty = |index: usize| {
-		&params[index]
-			.inner
-			.inner
-			.ty
-			.as_ref()
-			.expect("annotated")
-			.inner
-	};
+	let ty = |index: usize| &params[index].inner.inner.ty.inner;
 	let TypeExpression::QualifiedPath { root, segments } = ty(0) else {
 		panic!("expected a qualified path type")
 	};
@@ -2662,13 +2864,8 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
 
 	let params = &case.function_signature(0).params;
 	for index in 0..2 {
-		let TypeExpression::QualifiedPath { root, segments } = &params[index]
-			.inner
-			.inner
-			.ty
-			.as_ref()
-			.expect("annotated")
-			.inner
+		let TypeExpression::QualifiedPath { root, segments } =
+			&params[index].inner.inner.ty.inner
 		else {
 			panic!("expected a qualified path type")
 		};
@@ -2751,12 +2948,7 @@ fn test_never_type() {
 	let case = TestCase::new("func f(a: !) -> ! {}");
 	case.diagnostics().assert_none();
 	let signature = case.function_signature(0);
-	let param = signature.params[0]
-		.inner
-		.inner
-		.ty
-		.as_ref()
-		.expect("annotated");
+	let param = &signature.params[0].inner.inner.ty;
 	assert!(matches!(param.inner, TypeExpression::Never));
 	let result = signature.result.as_ref().expect("a result type");
 	assert!(matches!(result.inner, TypeExpression::Never));
@@ -2774,13 +2966,7 @@ fn test_infer_and_memory_tagged_types() {
 	// a memory-tagged type names the memory its pointer or slice belongs to
 	let params = &case.function_signature(0).params;
 	for index in [0, 1] {
-		let ty = &params[index]
-			.inner
-			.inner
-			.ty
-			.as_ref()
-			.expect("annotated")
-			.inner;
+		let ty = &params[index].inner.inner.ty.inner;
 		let memory = match ty {
 			TypeExpression::Pointer { memory, .. }
 			| TypeExpression::Slice { memory, .. } => {

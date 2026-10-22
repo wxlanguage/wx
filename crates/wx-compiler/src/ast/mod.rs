@@ -345,6 +345,34 @@ fn report_redundant_local(
 		.with_note("a name binds by default")
 }
 
+fn report_mut_without_name(
+	file_id: FileId,
+	mut_span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::InvalidMutBinding.code())
+		.with_message("`mut` needs a name")
+		.with_label(
+			Label::primary(file_id, mut_span)
+				.with_message("nothing without a name can be mutated"),
+		)
+		.with_note("write `mut name: Type`, or leave out `mut`")
+}
+
+fn report_binding_without_type(
+	file_id: FileId,
+	name_span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MissingTypeAnnotation.code())
+		.with_message("expected a type annotation")
+		.with_label(
+			Label::primary(file_id, name_span)
+				.with_message("expected `: Type` after this name"),
+		)
+		.with_note("write `name: Type`")
+}
+
 fn report_reserved_identifier(
 	file_id: FileId,
 	span: TextSpan,
@@ -1397,6 +1425,9 @@ pub enum Ownership {
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum TypeExpression {
+	/// A type the parser expected and did not find, already reported; it
+	/// resolves to `ERROR` without a word.
+	Error,
 	/// `_` — explicit inference placeholder; type-resolution context decides
 	/// whether it stays `INFER` or is rejected as `ERROR`.
 	Infer,
@@ -1591,12 +1622,39 @@ impl Statement {
 	}
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
+/// What a parameter or a field is bound to, written before a `:`. One left
+/// out is no `Binding` at all, and binds nothing as `_` does.
+pub enum Binding {
+	/// `_`: binds nothing.
+	Wildcard(TextSpan),
+	/// `name` or `mut name`.
+	Name {
+		mut_span: Option<TextSpan>,
+		name: Spanned<SymbolU32>,
+	},
+}
+
+impl Binding {
+	/// The name bound, `None` for `_`.
+	pub fn name(self) -> Option<Spanned<SymbolU32>> {
+		match self {
+			Binding::Wildcard(_) => None,
+			Binding::Name { name, .. } => Some(name),
+		}
+	}
+}
+
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+/// A parameter, written like a struct field: `binding: Type`, or `Type`
+/// alone, which binds nothing as `_: Type` does. The receiver is
+/// `self: Type`.
 pub struct FunctionParam {
-	pub mut_span: Option<TextSpan>,
-	pub name: Spanned<SymbolU32>,
-	pub ty: Option<Box<Spanned<TypeExpression>>>,
+	pub binding: Option<Binding>,
+	pub ty: Box<Spanned<TypeExpression>>,
 }
 
 /// The payload of an attribute, following the meta item grammar.
@@ -1948,8 +2006,9 @@ pub enum Item {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct StructField {
 	pub pub_span: Option<TextSpan>,
-	/// `None` for a positional field: `struct Pair(i32, i32);`.
-	pub name: Option<Spanned<SymbolU32>>,
+	/// `None` for a positional field: `struct Pair(i32, i32);`. A binding's
+	/// `mut` is parsed; what it allows is not checked yet.
+	pub binding: Option<Binding>,
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
@@ -2506,24 +2565,6 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	#[inline]
-	fn peek_expect(
-		&mut self,
-		expected_token: Token,
-	) -> Result<Spanned<Token>, ()> {
-		let token = self.lexer.peek();
-		if token.inner == expected_token {
-			Ok(token)
-		} else {
-			self.ast.diagnostics.push(report_unexpected_token(
-				self.ast.file_id,
-				token,
-				expected_token,
-			));
-			Err(())
-		}
-	}
-
-	#[inline]
 	fn peek_keyword(&mut self) -> Option<Keyword> {
 		let token = self.lexer.peek();
 		match token.inner {
@@ -2653,44 +2694,124 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_function_param_item(
 		parser: &mut Parser,
 	) -> Result<Spanned<FunctionParam>, ()> {
-		let token = parser.peek_expect(Token::Identifier)?;
-		let mut_span =
-			match Keyword::try_from(token.span.extract_str(parser.source)) {
-				Ok(Keyword::Mut) => Some(parser.lexer.next().span),
-				_ => None,
-			};
+		let start = parser.lexer.peek().span.start;
+		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
+		Ok(Spanned {
+			span: TextSpan::new(start, ty.span.end),
+			inner: FunctionParam {
+				binding,
+				ty: Box::new(ty),
+			},
+		})
+	}
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let text = name_span.extract_str(parser.source);
-		match Keyword::try_from(text) {
-			Ok(Keyword::SelfLower) | Err(_) => {}
-			Ok(_) => {
-				parser.ast.diagnostics.push(report_reserved_identifier(
+	/// What a parameter or a struct field is written as: `binding: Type`, or
+	/// `Type` alone, which binds nothing. A binding is `_`, `name` or
+	/// `mut name`, and is always followed by `:`, so anything else is a type
+	/// (`x` alone is the type `x`). `self` is a name like any other, and is
+	/// written with its type; where it may stand is checked by the item it
+	/// is in.
+	fn parse_binding_and_type(
+		parser: &mut Parser,
+	) -> Result<(Option<Binding>, Spanned<TypeExpression>), ()> {
+		let mut_span = matches!(parser.peek_keyword(), Some(Keyword::Mut))
+			.then(|| parser.lexer.next().span);
+
+		let token = parser.lexer.peek();
+		let keyword = Keyword::try_from(token.span.extract_str(parser.source));
+		let named = token.inner == Token::Identifier
+			&& matches!(
+				keyword,
+				Err(_) | Ok(Keyword::Underscore | Keyword::SelfLower)
+			);
+		if !named {
+			if let Some(mut_span) = mut_span {
+				parser.ast.diagnostics.push(report_mut_without_name(
+					parser.ast.file_id,
+					mut_span,
+				));
+			}
+			return Ok((None, parser.parse_type_expression()?));
+		}
+
+		let name_span = parser.lexer.next().span;
+		let underscore = matches!(keyword, Ok(Keyword::Underscore));
+		// `self` is never a type, so it is always a name.
+		let receiver = matches!(keyword, Ok(Keyword::SelfLower));
+		let name = Spanned {
+			inner: parser
+				.strings
+				.get_or_intern(name_span.extract_str(parser.source)),
+			span: name_span,
+		};
+		if parser.lexer.next_if(Token::Colon).is_some() {
+			let binding = if underscore {
+				if let Some(mut_span) = mut_span {
+					parser.ast.diagnostics.push(report_mut_without_name(
+						parser.ast.file_id,
+						mut_span,
+					));
+				}
+				Binding::Wildcard(name_span)
+			} else {
+				Binding::Name { mut_span, name }
+			};
+			return Ok((Some(binding), parser.parse_type_expression()?));
+		}
+		// Not followed by `:`: a type, unless it can only be a name, which is
+		// then given an error type.
+		let missing = Spanned {
+			inner: TypeExpression::Error,
+			span: TextSpan::new(name_span.end, name_span.end),
+		};
+		match mut_span {
+			// `mut _`: the type `_`, without the `mut`.
+			Some(mut_span) if underscore => {
+				parser.ast.diagnostics.push(report_mut_without_name(
+					parser.ast.file_id,
+					mut_span,
+				));
+				Ok((
+					None,
+					Spanned {
+						inner: TypeExpression::Infer,
+						span: name_span,
+					},
+				))
+			}
+			// `mut heap::*u8`: `mut` before a type that goes on past its
+			// first name.
+			Some(mut_span)
+				if !receiver
+					&& !matches!(
+						parser.lexer.peek().inner,
+						Token::Comma | Token::CloseParen
+					) =>
+			{
+				parser.ast.diagnostics.push(report_mut_without_name(
+					parser.ast.file_id,
+					mut_span,
+				));
+				Ok((None, parser.parse_type_path_from(name)?))
+			}
+			// `_` is the type `_`.
+			None if underscore => Ok((
+				None,
+				Spanned {
+					inner: TypeExpression::Infer,
+					span: name_span,
+				},
+			)),
+			None if !receiver => Ok((None, parser.parse_type_path_from(name)?)),
+			// `mut x`, `self` or `mut self`: a name, but no type.
+			_ => {
+				parser.ast.diagnostics.push(report_binding_without_type(
 					parser.ast.file_id,
 					name_span,
 				));
+				Ok((Some(Binding::Name { mut_span, name }), missing))
 			}
 		}
-
-		let name = Spanned {
-			inner: parser.strings.get_or_intern(text),
-			span: name_span,
-		};
-
-		let colon = parser.lexer.next_if(Token::Colon);
-		let (ty, span) = match colon {
-			Some(_) => {
-				let ty = parser.parse_type_expression()?;
-				let span = TextSpan::new(name_span.start, ty.span.end);
-				(Some(Box::new(ty)), span)
-			}
-			None => (None, name_span),
-		};
-
-		Ok(Spanned {
-			inner: FunctionParam { mut_span, name, ty },
-			span,
-		})
 	}
 
 	fn parse_function_signature(
@@ -5883,14 +6004,6 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_struct_field_pub_span(parser: &mut Parser) -> Option<TextSpan> {
-		let peek = parser.lexer.peek();
-		match Keyword::try_from(peek.span.extract_str(parser.source)) {
-			Ok(Keyword::Pub) => Some(parser.lexer.next().span),
-			_ => None,
-		}
-	}
-
 	fn parse_struct_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let struct_span = parser.lexer.next().span;
 
@@ -5962,33 +6075,15 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_struct_field(
 		parser: &mut Parser,
 	) -> Result<Spanned<StructField>, ()> {
-		let pub_span = Parser::parse_struct_field_pub_span(parser);
-		let peek = parser.lexer.peek();
-		let plain_identifier = peek.inner == Token::Identifier
-			&& Keyword::try_from(peek.span.extract_str(parser.source)).is_err();
-		let (name, ty) = if plain_identifier {
-			let token = parser.lexer.next();
-			let ident = Spanned {
-				inner: parser.intern_identifier(token.span),
-				span: token.span,
-			};
-			if parser.lexer.next_if(Token::Colon).is_some() {
-				(Some(ident), parser.parse_type_expression()?)
-			} else {
-				(None, parser.parse_type_path_from(ident)?)
-			}
-		} else {
-			(None, parser.parse_type_expression()?)
-		};
-		let start = pub_span
-			.or(name.map(|name| name.span))
-			.unwrap_or(ty.span)
-			.start;
+		let start = parser.lexer.peek().span.start;
+		let pub_span = matches!(parser.peek_keyword(), Some(Keyword::Pub))
+			.then(|| parser.lexer.next().span);
+		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
 			span: TextSpan::new(start, ty.span.end),
 			inner: StructField {
 				pub_span,
-				name,
+				binding,
 				ty: Box::new(ty),
 			},
 		})

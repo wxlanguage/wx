@@ -1256,28 +1256,30 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let param_types: Box<[TypeIndex]> = signature
 			.params
 			.iter()
-			.map(|param| match &param.inner.inner.ty {
-				Some(ty) => self.resolve_type(
+			.map(|param| {
+				// A free function has no `Self`: its `self` was reported
+				// where it is written.
+				let receiver = param
+					.inner
+					.inner
+					.binding
+					.and_then(ast::Binding::name)
+					.is_some_and(|name| {
+						name.inner == Keyword::SelfLower.symbol()
+					});
+				if receiver {
+					return TypeIndex::ERROR;
+				}
+				self.resolve_type(
 					obligations,
 					LexicalScope {
 						file_id,
 						namespace,
 						env: type_env,
 					},
-					ty,
+					&param.inner.inner.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
-				),
-				None => {
-					let name = param.inner.inner.name;
-					if name.inner != Keyword::SelfLower.symbol() {
-						self.diagnostics.push(report_missing_parameter_type(
-							self.strings,
-							file_id,
-							name,
-						));
-					}
-					TypeIndex::ERROR
-				}
+				)
 			})
 			.collect();
 
@@ -1347,7 +1349,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			"checked by impls.rs's dispatch pass before any signature is resolved",
 		);
 		let args_span = match &signature.params[..] {
-			[param] => param.inner.inner.ty.as_ref().map(|ty| ty.span),
+			[param] => Some(param.inner.inner.ty.span),
 			_ => None,
 		};
 		let result_span = signature.result.as_ref().map(|result| result.span);
@@ -1405,8 +1407,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	}
 
 	/// Resolve a member in its parent's scope (the trait's or the impl's),
-	/// with a child frame for method generics; `self_type` is what `Self`
-	/// means there. Definition collection already validates receiver position.
+	/// with a child frame for method generics. Definition collection already
+	/// validates receiver position.
 	fn resolve_member_function_signature(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
@@ -1414,7 +1416,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		namespace: Scope,
 		function_index: FunctionIdx,
 		parent: TypeEnvIdx,
-		self_type: TypeIndex,
 		signature: &ast::FunctionSignature,
 	) -> SignatureLocation {
 		let scope = self.resolve_generic_params(
@@ -1426,42 +1427,24 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&signature.type_params,
 		);
 
-		// Definition collection diagnoses misplaced receivers. Only an
-		// untyped first `self` gets the enclosing Self type here.
-		let is_method = signature.params.first().is_some_and(|p| {
-			p.inner.inner.name.inner == Keyword::SelfLower.symbol()
-		});
-
-		let mut param_types: Vec<TypeIndex> =
-			Vec::with_capacity(signature.params.len());
-		for (index, param) in signature.params.iter().enumerate() {
-			let ty = match &param.inner.inner.ty {
-				Some(ty) => self.resolve_type(
+		// Definition collection diagnoses misplaced receivers; a `self`
+		// written alone is `self: Self`, resolved like any written type.
+		let param_types: Vec<TypeIndex> = signature
+			.params
+			.iter()
+			.map(|param| {
+				self.resolve_type(
 					obligations,
 					LexicalScope {
 						file_id,
 						namespace,
 						env: scope,
 					},
-					ty,
+					&param.inner.inner.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
-				),
-				// The parent frame binds Self to the trait parameter or impl target.
-				None if index == 0 && is_method => self_type,
-				None => {
-					let name = param.inner.inner.name;
-					if name.inner != Keyword::SelfLower.symbol() {
-						self.diagnostics.push(report_missing_parameter_type(
-							self.strings,
-							file_id,
-							name,
-						));
-					}
-					TypeIndex::ERROR
-				}
-			};
-			param_types.push(ty);
-		}
+				)
+			})
+			.collect();
 
 		let return_type = match &signature.result {
 			Some(result) => self.resolve_type(
@@ -1951,7 +1934,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					requested_at: None,
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
-				let self_type = self.type_envs.param_types(self_scope)[0];
 
 				self.resolve_member_function_signature(
 					obligations,
@@ -1959,7 +1941,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					namespace,
 					function_index,
 					self_scope,
-					self_type,
 					signature,
 				)
 			}
@@ -2079,15 +2060,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let header = self.trait_impls[usize::from(block_index)]
 					.as_ref()
 					.expect("trait impl header is resolved");
-				let (scope, self_type) =
-					(header.type_params, header.target.inner);
+				let scope = header.type_params;
 				self.resolve_member_function_signature(
 					obligations,
 					file_id,
 					namespace,
 					function_index,
 					scope,
-					self_type,
 					signature,
 				)
 			}
@@ -2443,15 +2422,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let header = self.inherent_impls[usize::from(block_index)]
 					.as_ref()
 					.expect("inherent impl header is resolved");
-				let (scope, self_type) =
-					(header.type_params, header.target.inner);
+				let scope = header.type_params;
 				self.resolve_member_function_signature(
 					obligations,
 					file_id,
 					namespace,
 					function_index,
 					scope,
-					self_type,
 					signature,
 				)
 			}
@@ -3372,6 +3349,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		match &type_expr.inner {
+			// Reported by the parser.
+			ast::TypeExpression::Error => TypeIndex::ERROR,
 			ast::TypeExpression::Infer => match infer_policy {
 				InferPolicy::Allow => TypeIndex::INFER,
 				InferPolicy::Reject(kind) => {
@@ -4386,24 +4365,6 @@ fn report_duplicate_function_param(
 		)
 }
 
-fn report_missing_parameter_type(
-	strings: &StringInterner,
-	file_id: FileId,
-	name: Spanned<SymbolU32>,
-) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(name.inner).unwrap();
-	Diagnostic::error()
-		.with_code(DiagnosticCode::MissingParameterType.code())
-		.with_message(format!(
-			"parameter `{name_str}` requires an explicit type"
-		))
-		.with_label(
-			SourceSpan::new(file_id, name.span)
-				.primary_label()
-				.with_message("expected `: Type` here"),
-		)
-}
-
 /// Same wording as rustc's own `missing type for \`const\` item` message.
 /// No suggested type yet, unlike rustc's `help:` — worth adding once this
 /// architecture can infer one from the value expression.
@@ -4930,8 +4891,8 @@ pub(super) mod tests {
 			test_case!(
 				case = &with_std(
 					"struct V();
-					impl Add for V { func add(self, rhs: Self) -> Self { self } }
-					impl PartialEq for V { func eq(self, other: Self) -> bool { true } }
+					impl Add for V { func add(self: Self, rhs: Self) -> Self { self } }
+					impl PartialEq for V { func eq(self: Self, other: Self) -> bool { true } }
 					const X: V = V();
 					const Y: V = X + X;
 					const Z: bool = X != X;"
@@ -5224,7 +5185,7 @@ pub(super) mod tests {
 			test_case!(
 				case = &with_std(
 					"struct V();
-					impl PartialEq for V { func eq(self, other: Self) -> bool { true } }
+					impl PartialEq for V { func eq(self: Self, other: Self) -> bool { true } }
 					const X: V = V();
 					const Y: bool = X == X;"
 				)
@@ -8371,49 +8332,68 @@ pub(super) mod tests {
 		assert_eq!(case.type_alias("X").target, TypeIndex::ERROR);
 	}
 
+	/// A free function has no `Self`, so its `self` is reported once, where
+	/// it is written, and its type (`Self`, when written alone) is not
+	/// resolved again.
 	#[test]
-	fn an_untyped_free_function_parameter_is_diagnosed_here_not_in_prescan() {
+	fn self_in_a_free_function_is_reported_once() {
+		for source in [
+			"func f(self: Self); pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			"func f(mut self: Self); pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+		] {
+			test_case!(case = source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::SelfParamPosition]);
+		}
+	}
+
+	/// A parameter is written like a struct field: a lone identifier is its
+	/// type, never a name without one.
+	#[test]
+	fn a_lone_identifier_parameter_is_its_type() {
 		for source in [
 			"func f(x) { } pub trait Call { type Args; type Result; } pub trait Function: Call {}",
 			"func f(x); pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			"trait Foo { func get(self: Self, x) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			"struct S(); impl S { func get(self: Self, x) -> Self { self } } pub trait Call { type Args; type Result; } pub trait Function: Call {}",
 		] {
 			test_case!(case = source);
-
-			assert_eq!(
-				case.context.diagnostics.len(),
-				1,
-				"{:?}",
-				case.context.diagnostics
-			);
-			assert_eq!(
-				case.context.diagnostics[0].code.as_deref(),
-				Some(DiagnosticCode::MissingParameterType.code())
-			);
-			assert_eq!(
-				case.function_signature("f").param_types[0],
-				TypeIndex::ERROR
-			);
+			let diagnostics = case.diagnostics();
+			diagnostics.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+			diagnostics
+				.assert_error_saying("cannot find type `x` in this scope");
 		}
 	}
 
 	#[test]
-	fn an_untyped_non_self_trait_function_parameter_is_diagnosed() {
+	fn an_unnamed_parameter_has_its_written_type() {
 		test_case!(
-			case = "trait Foo { func get(self, x) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+			case = indoc! {"
+				pub type i32;
+				pub type u8;
+				func f(i32, _: u8, c: i32);
+				pub trait Call { type Args; type Result; }
+				pub trait Function: Call {}
+			"}
 		);
-
+		case.diagnostics().assert_none();
 		assert_eq!(
-			case.context.diagnostics.len(),
-			1,
-			"{:?}",
-			case.context.diagnostics
+			&*case.function_signature("f").param_types,
+			&[TypeIndex::I32, TypeIndex::U8, TypeIndex::I32]
 		);
-		assert_eq!(
-			case.context.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::MissingParameterType.code())
-		);
-		let sig = case.trait_function_signature("Foo", "get");
-		assert_eq!(sig.param_types[1], TypeIndex::ERROR);
+		let DefKind::Function(index) = case.resolve(Tier::Value, "f") else {
+			panic!("expected a function");
+		};
+		let names: Vec<_> = case.defs.functions[usize::from(index)]
+			.params
+			.iter()
+			.map(|param| {
+				param.map(|name| {
+					case.context.strings.resolve(name.inner).unwrap()
+				})
+			})
+			.collect();
+		assert_eq!(names, [None, None, Some("c")]);
 	}
 
 	#[test]
@@ -10526,7 +10506,7 @@ pub(super) mod tests {
 	#[test]
 	fn an_untyped_self_param_resolves_to_the_traits_own_self() {
 		test_case!(
-			case = "trait Foo { func get(self) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+			case = "trait Foo { func get(self: Self) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
 		);
 
 		assert!(
@@ -10548,7 +10528,7 @@ pub(super) mod tests {
 		test_case!(
 			case = indoc! {"
 			struct S();
-			impl S { func get(self) -> Self { self } }
+			impl S { func get(self: Self) -> Self { self } }
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
@@ -10595,38 +10575,14 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn a_non_self_untyped_inherent_impl_function_parameter_is_diagnosed() {
-		test_case!(
-			case = indoc! {"
-			struct S();
-			impl S { func get(self, x) -> Self { self } }
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
-		"}
-		);
-
-		assert_eq!(
-			case.context.diagnostics.len(),
-			1,
-			"{:?}",
-			case.context.diagnostics
-		);
-		assert_eq!(
-			case.context.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::MissingParameterType.code())
-		);
-		let sig = case.inherent_function_signature("S", "get");
-		assert_eq!(sig.param_types[1], TypeIndex::ERROR);
-	}
-
-	#[test]
 	fn trait_impl_methods_and_associated_functions_use_the_concrete_self_type()
 	{
 		test_case!(
 			case = indoc! {"
-			trait Service { func get(self) -> Self; func make(x: Self) -> Self; }
+			trait Service { func get(self: Self) -> Self; func make(x: Self) -> Self; }
 			struct S();
 			impl Service for S {
-				func get(self) -> Self { self }
+				func get(self: Self) -> Self { self }
 				func make(x: Self) -> Self { x }
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -10658,15 +10614,15 @@ pub(super) mod tests {
 			typeset Number { i32 }
 			trait Service {
 				type Item;
-				func get<U>(self, x: Self::Item, y: U) -> Self;
-				func shadow<T>(self, x: T) -> Self;
+				func get<U>(self: Self, x: Self::Item, y: U) -> Self;
+				func shadow<T>(self: Self, x: T) -> Self;
 				const VALUE: Self::Item;
 			}
 			struct Wrap<T>();
 			impl<T: Number> Service for Wrap<T> {
 				type Item = T;
-				func get<U>(self, x: T, y: U) -> Self { self }
-				func shadow<T>(self, x: T) -> Self { self }
+				func get<U>(self: Self, x: T, y: U) -> Self { self }
+				func shadow<T>(self: Self, x: T) -> Self { self }
 				const VALUE: T = 0;
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -10717,12 +10673,12 @@ pub(super) mod tests {
 			struct Need<T: Marker>();
 			trait Service {
 				type Item: Marker;
-				func get<U: Container where { Item: Marker }>(self, x: Need<Self::Item>, y: Need<U::Item>);
+				func get<U: Container where { Item: Marker }>(self: Self, x: Need<Self::Item>, y: Need<U::Item>);
 			}
 			struct Wrap<T>();
 			impl<T: Marker> Service for Wrap<T> {
 				type Item = T;
-				func get<U: Container where { Item = i32 }>(self, x: Need<T>, y: Need<U::Item>) {}
+				func get<U: Container where { Item = i32 }>(self: Self, x: Need<T>, y: Need<U::Item>) {}
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
@@ -10760,11 +10716,11 @@ pub(super) mod tests {
 			struct Need<T: Marker>();
 			trait Container { type A; type B; }
 			trait Service {
-				func get<U: Container where { A = Need<U::B>, B = i32 }>(self, x: U::A);
+				func get<U: Container where { A = Need<U::B>, B = i32 }>(self: Self, x: U::A);
 			}
 			struct S();
 			impl Service for S {
-				func get<U: Container where { A = Need<U::B>, B = i32 }>(self, x: U::A) {}
+				func get<U: Container where { A = Need<U::B>, B = i32 }>(self: Self, x: U::A) {}
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
@@ -10794,10 +10750,10 @@ pub(super) mod tests {
 			type i32;
 			trait Marker {}
 			struct Need<T: Marker>();
-			trait Service { func get(self, x: i32); const VALUE: i32; }
+			trait Service { func get(self: Self, x: i32); const VALUE: i32; }
 			struct S();
 			impl Service for S {
-				func get(self, x: Need<i32>) {}
+				func get(self: Self, x: Need<i32>) {}
 				const VALUE: Need<i32> = Need();
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -10892,10 +10848,10 @@ pub(super) mod tests {
 		test_case!(
 			case = indoc! {"
 			type i32;
-			trait Service { func get(self, x: i32, y: i32) -> i32; const VALUE: i32; }
+			trait Service { func get(self: Self, x: i32, y: i32) -> i32; const VALUE: i32; }
 			struct S();
 			impl Service for S {
-				func get(self, x, y: _) -> _ {}
+				func get(self: Self, x, y: _) -> _ {}
 				const VALUE: _ = 0;
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -10912,9 +10868,10 @@ pub(super) mod tests {
 				.diagnostics
 				.iter()
 				.filter(|d| d.code.as_deref()
-					== Some(DiagnosticCode::MissingParameterType.code()))
+					== Some(DiagnosticCode::UndeclaredIdentifier.code()))
 				.count(),
-			1
+			1,
+			"`x` alone is a type"
 		);
 		assert_eq!(
 			case.context
@@ -10944,9 +10901,9 @@ pub(super) mod tests {
 			with_pending_signatures(
 				indoc! {"
 				type i32;
-				trait Service { func get(self) -> Self; const VALUE: i32; }
+				trait Service { func get(self: Self) -> Self; const VALUE: i32; }
 				struct S();
-				impl Service for S { func get(self) -> Self { self } const VALUE: i32 = 0; }
+				impl Service for S { func get(self: Self) -> Self { self } const VALUE: i32 = 0; }
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			"},
 				|builder| {
@@ -11010,7 +10967,7 @@ pub(super) mod tests {
 	#[test]
 	fn a_trait_functions_own_generic_param_is_distinct_from_self() {
 		test_case!(
-			case = "trait Foo { func get<T>(self, x: T) -> T; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+			case = "trait Foo { func get<T>(self: Self, x: T) -> T; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
 		);
 
 		assert!(
@@ -11108,7 +11065,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			trait Foo {
 				const X: Self;
-				func get(self) -> Self;
+				func get(self: Self) -> Self;
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
@@ -11122,7 +11079,7 @@ pub(super) mod tests {
 		assert_eq!(
 			case.trait_const_signature("Foo", "X").ty,
 			case.trait_function_signature("Foo", "get").return_type,
-			"`const X: Self` and `func get(self) -> Self` should resolve to \
+			"`const X: Self` and `func get(self: Self) -> Self` should resolve to \
 			 the same TypeParam"
 		);
 	}
@@ -11674,7 +11631,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			trait Global {
 				type Value;
-				func get(self) -> Self::Value;
+				func get(self: Self) -> Self::Value;
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
@@ -11709,7 +11666,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			trait Global {
 				type Value;
-				func get(self) -> <Self>::Value;
+				func get(self: Self) -> <Self>::Value;
 			}
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
@@ -14529,8 +14486,8 @@ pub(super) mod tests {
                 trait Container { type Item; }
                 struct Host<T>();
                 impl<T: Outer> Host<T> {
-                    func scoped<U: Container where { Item = T } + Container where { Item: Marker }>(self, x: U::Item) {}
-                    func plain(self, x: T) {}
+                    func scoped<U: Container where { Item = T } + Container where { Item: Marker }>(self: Self, x: U::Item) {}
+                    func plain(self: Self, x: T) {}
                 }
                 func free() {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -14590,7 +14547,7 @@ pub(super) mod tests {
                 trait Parent {}
                 trait Child: Parent {
                     type Item: Project where { Output = Self };
-                    func provided(self, x: Self::Item) {}
+                    func provided(self: Self, x: Self::Item) {}
                 }
                 func user<T: Child>(x: T::Item) {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
@@ -16466,7 +16423,7 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Point();
 			impl Point {
-				func at(self, x: i32) -> bool { loop {} }
+				func at(self: Self, x: i32) -> bool { loop {} }
 				func origin() -> Point { loop {} }
 			}
 			func f(a: Point::at::Args, b: Point::at::Result, c: Point::origin::Args) {}
@@ -16494,7 +16451,7 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Wrap<T>();
 			impl<T> Wrap<T> {
-				func get<U>(self, u: U) -> T { loop {} }
+				func get<U>(self: Self, u: U) -> T { loop {} }
 			}
 			func f(a: Wrap<i32>::get<bool>::Args, b: Wrap<i32>::get<bool>::Result) {}
 		"}
@@ -16750,14 +16707,14 @@ pub(super) mod tests {
 			pub trait Call {
 				type Args;
 				type Result;
-				func call(self, args: Self::Args) -> Self::Result;
+				func call(self: Self, args: Self::Args) -> Self::Result;
 			}
 			pub trait Function: Call {}
 			struct Adder(value: i32);
 			impl Call for Adder {
 				type Args = i32;
 				type Result = i32;
-				func call(self, args: Self::Args) -> Self::Result { loop {} }
+				func call(self: Self, args: Self::Args) -> Self::Result { loop {} }
 			}
 			func handler(x: i32) -> i32 { loop {} }
 			struct Callable<F: Call>();
@@ -16786,8 +16743,8 @@ pub(super) mod tests {
 			trait Service { func make() -> Self; }
 			struct Wrap<T>();
 			struct Plain();
-			impl<T> Wrap<T> { func get(self) -> Self { loop {} } }
-			impl Plain { func get(self) -> Self { loop {} } }
+			impl<T> Wrap<T> { func get(self: Self) -> Self { loop {} } }
+			impl Plain { func get(self: Self) -> Self { loop {} } }
 			impl Service for Plain { func make() -> Self { loop {} } }
 		"};
 		test_case!(case = SOURCE);
@@ -16842,8 +16799,15 @@ pub(super) mod tests {
 		assert_eq!(
 			referents[1..],
 			[
+				// `self: Self` and `-> Self` in each inherent impl.
 				Some(Referent::InherentImplSelf(
 					case.inherent_impl_index("Wrap")
+				)),
+				Some(Referent::InherentImplSelf(
+					case.inherent_impl_index("Wrap")
+				)),
+				Some(Referent::InherentImplSelf(
+					case.inherent_impl_index("Plain")
 				)),
 				Some(Referent::InherentImplSelf(
 					case.inherent_impl_index("Plain")
@@ -16884,7 +16848,7 @@ pub(super) mod tests {
 			trait Number {}
 			impl Number for i32 {}
 			struct Wrap<T>();
-			impl<T: Number> Wrap<T> { func get<U>(self, x: T, y: U) -> (T, U) { loop {} } }
+			impl<T: Number> Wrap<T> { func get<U>(self: Self, x: T, y: U) -> (T, U) { loop {} } }
 			func free<V>(v: V) {}
 			trait Service { func make<W>(w: W) -> Self; }
 		"}

@@ -1735,19 +1735,17 @@ impl<'a> Builder<'a> {
 						start: field.inner.span.start,
 					},
 				);
-				let mut fn_: Vec<NodeId> = Vec::new();
+				let mut func: Vec<NodeId> = Vec::new();
 				if field.inner.inner.pub_span.is_some() {
-					fn_.push(self.text(Text::Pub));
+					func.push(self.text(Text::Pub));
 				}
-				if let Some(name) = &field.inner.inner.name {
-					fn_.push(self.symbol(name.inner));
-					fn_.push(self.text(Text::ColonSp));
-				}
-				fn_.push(
-					self.build_type_expression(&field.inner.inner.ty.inner),
+				self.build_binding_and_type(
+					&mut func,
+					field.inner.inner.binding,
+					&field.inner.inner.ty.inner,
 				);
-				fn_.push(self.text(Text::Comma));
-				field_items.push(self.arena.concat(fn_));
+				func.push(self.text(Text::Comma));
+				field_items.push(self.arena.concat(func));
 			}
 			self.push_between(
 				&mut field_items,
@@ -1943,14 +1941,11 @@ impl<'a> Builder<'a> {
 		if !signature.params.is_empty() {
 			let mut params: Vec<NodeId> = vec![self.line()];
 			for (index, param) in signature.params.iter().enumerate() {
-				if param.inner.inner.mut_span.is_some() {
-					params.push(self.text(Text::Mut));
-				}
-				params.push(self.symbol(param.inner.inner.name.inner));
-				if let Some(ty) = &param.inner.inner.ty {
-					params.push(self.text(Text::ColonSp));
-					params.push(self.build_type_expression(&ty.inner));
-				}
+				self.build_binding_and_type(
+					&mut params,
+					param.inner.inner.binding,
+					&param.inner.inner.ty.inner,
+				);
 				if index + 1 < signature.params.len() {
 					params.push(self.text(Text::Comma));
 					params.push(self.soft_line());
@@ -1970,6 +1965,30 @@ impl<'a> Builder<'a> {
 			out.push(self.text(Text::Arrow));
 			out.push(self.build_type_expression(&result.inner));
 		}
+	}
+
+	/// A parameter or a field without its separator, as written.
+	fn build_binding_and_type(
+		&mut self,
+		out: &mut Vec<NodeId>,
+		binding: Option<ast::Binding>,
+		ty: &ast::TypeExpression,
+	) {
+		match binding {
+			Some(ast::Binding::Wildcard(_)) => {
+				out.push(self.text(Text::Underscore));
+				out.push(self.text(Text::ColonSp));
+			}
+			Some(ast::Binding::Name { mut_span, name }) => {
+				if mut_span.is_some() {
+					out.push(self.text(Text::Mut));
+				}
+				out.push(self.symbol(name.inner));
+				out.push(self.text(Text::ColonSp));
+			}
+			None => {}
+		}
+		out.push(self.build_type_expression(ty));
 	}
 
 	fn build_global_definition(
@@ -2914,6 +2933,8 @@ impl<'a> Builder<'a> {
 				let segments = self.build_type_path(segments);
 				self.build_qualified_path(inner_node, None, segments)
 			}
+			// The formatter never runs on a file that failed to parse.
+			ast::TypeExpression::Error => unreachable!(),
 			ast::TypeExpression::Infer => self.text(Text::Underscore),
 			ast::TypeExpression::Never => self.text(Text::Bang),
 			ast::TypeExpression::Path(path) => self.build_type_path(path),

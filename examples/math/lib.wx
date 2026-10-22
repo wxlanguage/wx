@@ -16,9 +16,9 @@ pub use sin::sin;
 pub use cos::cos;
 
 trait Float {
-    func cos(self) -> Self;
+    func cos(self: Self) -> Self;
 
-    func sin(self) -> Self;
+    func sin(self: Self) -> Self;
 
     const PI: Self;
 
@@ -26,11 +26,11 @@ trait Float {
 }
 
 impl Float for f32 {
-    func sin(self) -> Self {
+    func sin(self: Self) -> Self {
         sinf(self)
     }
 
-    func cos(self) -> Self {
+    func cos(self: Self) -> Self {
         cosf(self)
     }
 
@@ -42,11 +42,11 @@ impl Float for f32 {
 }
 
 impl Float for f64 {
-    func sin(self) -> Self {
+    func sin(self: Self) -> Self {
         sin(self)
     }
 
-    func cos(self) -> Self {
+    func cos(self: Self) -> Self {
         cos(self)
     }
 

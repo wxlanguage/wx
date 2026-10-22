@@ -3149,6 +3149,21 @@ mod tests {
 		));
 	}
 
+	/// An unnamed parameter is passed like any other, but binds no local.
+	#[test]
+	fn an_unnamed_parameter_binds_no_local() {
+		test_case!(case = "func f(u32, _: u8, c: u32) -> u32 { c }");
+		case.diagnostics().assert_none();
+		assert_eq!(case.locals("f"), [("c".into(), "u32".into())]);
+		let params: Vec<_> = case
+			.body("f")
+			.params()
+			.iter()
+			.map(|local| local.map(u32::from))
+			.collect();
+		assert_eq!(params, [None, None, Some(0)]);
+	}
+
 	#[test]
 	fn a_block_result_takes_the_return_type() {
 		test_case!(
@@ -3550,7 +3565,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct W<T>(x: T);
-				impl<T> Add for W<T> { func add(self, rhs: Self) -> Self { rhs } }
+				impl<T> Add for W<T> { func add(self: Self, rhs: Self) -> Self { rhs } }
 				func concrete(w: W<u8>) -> W<u8> { w + w }
 				func generic<T: Add>(t: T) -> T { t + t }
 				func assigned(w: W<u8>) { local mut v = w; v += w; }
@@ -3573,7 +3588,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct V(x: u32);
-				impl Add for V { func add(self, rhs: Self) -> Self { rhs } }
+				impl Add for V { func add(self: Self, rhs: Self) -> Self { rhs } }
 				func scalar() { local mut a: u32 = 1; a += 2; a <<= 1; }
 				func overloaded(v: V) { local mut w = v; w += v; }
 				func generic<T: Add>(t: T) { local mut u = t; u += t; }
@@ -3931,7 +3946,7 @@ mod tests {
 				struct W<T>(x: T);
 				impl<T> W<T> {
 					pub func new(x: T) -> W<T> { W(x) }
-					pub func get(self) -> T { loop {} }
+					pub func get(self: Self) -> T { loop {} }
 					func again(x: T) -> W<T> { Self::new(x) }
 				}
 				trait Make { func make() -> Self; }
@@ -4187,12 +4202,12 @@ mod tests {
 				memory heap: u32;
 				struct W<T>(x: T);
 				impl<T> W<T> {
-					pub func get(self) -> T { loop {} }
-					pub func map<U>(self, u: U) -> W<U> { W(u) }
+					pub func get(self: Self) -> T { loop {} }
+					pub func map<U>(self: Self, u: U) -> W<U> { W(u) }
 					pub func by_pointer(self: heap::*Self) -> T { loop {} }
 				}
-				trait Twice { func twice(self) -> Self; }
-				impl Twice for u8 { func twice(self) -> Self { self } }
+				trait Twice { func twice(self: Self) -> Self; }
+				impl Twice for u8 { func twice(self: Self) -> Self { self } }
 				func inherent(w: W<u8>) -> u8 { w.get() }
 				func own_args(w: W<u8>) -> W<bool> { w.map(true) }
 				func turbofish(w: W<u8>) -> W<u16> { w.map::<u16>(1) }
@@ -4255,7 +4270,7 @@ mod tests {
 				memory heap: u32;
 				struct S();
 				impl S {
-					pub func by_value(self) {}
+					pub func by_value(self: Self) {}
 					pub func associated() {}
 				}
 				func missing(s: S) { s.nothing(); }
@@ -4754,7 +4769,7 @@ mod tests {
 			case = indoc! {"
 				struct W(x: u32, y: u32);
 				impl W {
-					func first(self) -> u32 { local Self(x, ..) = self; x }
+					func first(self: Self) -> u32 { local Self(x, ..) = self; x }
 				}
 			"}
 		);

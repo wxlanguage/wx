@@ -23,9 +23,10 @@ use crate::tir::signatures::InferPolicy;
 use crate::tir::types::TypeIndex;
 
 impl BodyContext<'_, '_, '_, '_> {
-	/// Checks a function's block as its body. Its parameters are the root
-	/// scope's first locals, and the block's statements are written directly
-	/// in the root scope, which `return` leaves.
+	/// Checks a function's block as its body. Its named parameters are the
+	/// root scope's first locals (`Body::params` says which parameter each
+	/// is), and the block's statements are written directly in the root
+	/// scope, which `return` leaves.
 	pub(in crate::tir) fn check_function(
 		mut self,
 		function_index: FunctionIdx,
@@ -44,7 +45,14 @@ impl BodyContext<'_, '_, '_, '_> {
 			let param = &param.inner.inner;
 			let ty = self.normalized(ty, env);
 			let ty = self.cx.types.collapse_error(ty);
-			self.declare_local(param.name, ty, param.mut_span);
+			// An unnamed parameter binds nothing, so it has no local.
+			let local = match param.binding {
+				Some(ast::Binding::Name { mut_span, name }) => {
+					Some(self.declare_local(name, ty, mut_span))
+				}
+				Some(ast::Binding::Wildcard(_)) | None => None,
+			};
+			self.body.push_param(local);
 		}
 		let root = self.build_block_in(
 			ScopeIdx::ROOT,

@@ -452,6 +452,9 @@ pub(super) struct Body {
 	scopes: Vec<Scope>,
 	labels: Vec<Label>,
 	locals: Vec<Local>,
+	/// The local each parameter binds, in order; `None` for an unnamed
+	/// parameter, which binds nothing. Empty for an initializer.
+	params: Vec<Option<LocalIdx>>,
 	places: Vec<Place>,
 	pat_kinds: Vec<PatternKind>,
 	pat_types: Vec<TypeIndex>,
@@ -511,6 +514,11 @@ impl Body {
 		&self.locals
 	}
 
+	/// The local each parameter binds, `None` for an unnamed one.
+	pub(super) fn params(&self) -> &[Option<LocalIdx>] {
+		&self.params
+	}
+
 	pub(super) fn place(&self, place: PlaceIdx) -> &Place {
 		&self.places[usize::from(place)]
 	}
@@ -549,6 +557,7 @@ pub(super) struct BodyBuilder {
 	scopes: Vec<Scope>,
 	labels: Vec<Label>,
 	locals: Vec<Local>,
+	params: Vec<Option<LocalIdx>>,
 	places: Vec<Place>,
 	pat_kinds: Vec<PatternKind>,
 	pat_types: Vec<TypeIndex>,
@@ -608,6 +617,11 @@ impl BodyBuilder {
 		let index = LabelIdx::new(u32::try_from(self.labels.len()).unwrap());
 		self.labels.push(label);
 		index
+	}
+
+	/// Records the local the next parameter binds, if it has a name.
+	pub(super) fn push_param(&mut self, local: Option<LocalIdx>) {
+		self.params.push(local);
 	}
 
 	pub(super) fn push_local(&mut self, local: Local) -> LocalIdx {
@@ -723,6 +737,7 @@ impl BodyBuilder {
 			scopes: self.scopes,
 			labels: self.labels,
 			locals: self.locals,
+			params: self.params,
 			places: self.places,
 			pat_kinds: self.pat_kinds,
 			pat_types: self.pat_types,

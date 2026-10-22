@@ -36,13 +36,13 @@ enum Option: u8 {
 trait Receiver {
     type Target;
 
-    func receive(self) -> Self::Target;
+    func receive(self: Self) -> Self::Target;
 }
 
 impl Receiver for i32 {
     type Target = i32;
 
-    func receive(self) -> i32 {
+    func receive(self: Self) -> i32 {
         self
     }
 }
@@ -52,7 +52,7 @@ impl<Idx> IntoIterator for Range<Idx> {
 
     type IntoIter = RangeIter<Self::Item>;
 
-    func into_iter(self) -> Self::IntoIter {
+    func into_iter(self: Self) -> Self::IntoIter {
         RangeIter({ start: self.start, end: self.end })
     }
 }
@@ -83,7 +83,7 @@ trait IntoIterator {
 
     type IntoIter: Iterator where { Item = Self::Item };
 
-    func into_iter(self) -> Self::IntoIter;
+    func into_iter(self: Self) -> Self::IntoIter;
 }
 
 struct BumpAllocator(
