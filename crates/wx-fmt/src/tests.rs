@@ -5,16 +5,19 @@ use wx_compiler::vfs;
 use super::*;
 
 #[allow(unused)]
-struct TestCase {
-	interner: ast::StringInterner,
+pub(super) struct TestCase {
+	pub(super) interner: ast::StringInterner,
 	files: vfs::Files,
-	ast: ast::AST,
+	pub(super) ast: ast::AST,
 }
 
 impl TestCase {
-	fn new(source: &str) -> Self {
-		let mut interner = ast::StringInterner::new();
-		let mut files = vfs::Files::new();
+	pub(super) fn new(source: &str) -> Self {
+		// The builder's interner is the one the real pipeline parses with: it
+		// has the keywords pre-interned, which `StringInterner::new()` does not.
+		let builder = vfs::CompilationUnitBuilder::new();
+		let mut interner = builder.strings;
+		let mut files = builder.files;
 		let file_id = files
 			.add(
 				"main.wx".to_string(),
@@ -22,13 +25,7 @@ impl TestCase {
 				vfs::FileOrigin::Local,
 			)
 			.unwrap();
-		let mut id_generator = ast::DefIdGenerator::new();
-		let ast = ast::Parser::parse(
-			file_id,
-			&files,
-			&mut interner,
-			&mut id_generator,
-		);
+		let ast = ast::Parser::parse(file_id, &files, &mut interner);
 
 		TestCase {
 			interner,
@@ -41,7 +38,7 @@ impl TestCase {
 #[test]
 fn test_format_simple_function() {
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 {
+        func add(a: i32, b: i32) -> i32 {
             a + b
         }
 
@@ -54,20 +51,19 @@ fn test_format_simple_function() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn add(a: i32, b: i32) -> i32 {
+            func add(a: i32, b: i32) -> i32 {
                 a + b
             }
 
             export {
                 add,
                 add as \"plus\",
-                minus
+                minus,
             }
         "}
 	);
@@ -94,7 +90,6 @@ fn test_format_use_trees() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(output, source);
@@ -104,12 +99,12 @@ fn test_format_use_trees() {
 fn test_format_import_block() {
 	let case = TestCase::new(indoc! {"
         import \"math\" as math {
-            fn sqrt(f64) -> f64;
-            fn pow(base: f64, exponent: f64) -> f64;
-            fn log(x: string);
+            func sqrt(f64) -> f64;
+            func pow(base: f64, exponent: f64) -> f64;
+            func log(x: string);
         }
 
-        fn main() {
+        func main() {
             local x = sqrt(2.0);
             local y = pow(x, 2.0);
         }
@@ -123,25 +118,24 @@ fn test_format_import_block() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
             import \"math\" as math {
-                fn sqrt(f64) -> f64;
-                fn pow(base: f64, exponent: f64) -> f64;
-                fn log(x: string);
+                func sqrt(f64) -> f64;
+                func pow(base: f64, exponent: f64) -> f64;
+                func log(x: string);
             }
 
-            fn main() {
+            func main() {
                 local x = sqrt(2.0);
                 local y = pow(x, 2.0);
             }
 
             export {
-                main
+                main,
             }
         "}
 	);
@@ -151,7 +145,7 @@ fn test_format_import_block() {
 fn test_format_single_import_function_stays_inline() {
 	let case = TestCase::new(indoc! {"
         import \"console\" as console {
-            fn log(message: string);
+            func log(message: string);
          }
     "});
 	let output = format(
@@ -161,14 +155,13 @@ fn test_format_single_import_function_stays_inline() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
             import \"console\" as console {
-                fn log(message: string);
+                func log(message: string);
             }
         "}
 	);
@@ -178,11 +171,11 @@ fn test_format_single_import_function_stays_inline() {
 fn test_format_module_items() {
 	let case = TestCase::new(indoc! {"
         pub mod wasm {
-            pub fn answer() -> i32{
+            pub func answer() -> i32{
                 42
             }
 
-            fn helper(  ) {}
+            func helper(  ) {}
         }
 
         mod math;
@@ -194,18 +187,17 @@ fn test_format_module_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
             pub mod wasm {
-                pub fn answer() -> i32 {
+                pub func answer() -> i32 {
                     42
                 }
 
-                fn helper() {}
+                func helper() {}
             }
 
             mod math;
@@ -218,7 +210,7 @@ fn test_format_impl_items() {
 	let case = TestCase::new(indoc! {"
         impl i32 {
             #[inline]
-            pub fn double(self) -> i32 {
+            pub func double(self: Self) -> i32 {
                 self * 2
             }
 
@@ -232,7 +224,6 @@ fn test_format_impl_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -240,7 +231,7 @@ fn test_format_impl_items() {
 		indoc! {"
             impl i32 {
                 #[inline]
-                pub fn double(self) -> i32 {
+                pub func double(self: Self) -> i32 {
                     self * 2
                 }
 
@@ -257,10 +248,10 @@ fn test_format_trait_items() {
             type Output: Show + Clone;
 
             const SIZE: u32;
-            fn render(self);
+            func render(self: Self);
 
             #[inline]
-            fn grow(self, delta: u32) -> u32 {
+            func grow(self: Self, delta: u32) -> u32 {
                 delta
             }
         }
@@ -272,7 +263,6 @@ fn test_format_trait_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -283,10 +273,10 @@ fn test_format_trait_items() {
 
                 const SIZE: u32;
 
-                fn render(self);
+                func render(self: Self);
 
                 #[inline]
-                fn grow(self, delta: u32) -> u32 {
+                func grow(self: Self, delta: u32) -> u32 {
                     delta
                 }
             }
@@ -305,7 +295,6 @@ fn test_format_where_clause_assoc_type_bound() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -313,16 +302,16 @@ fn test_format_where_clause_assoc_type_bound() {
 	// `Assoc: Bound` alongside the existing `Assoc = Type` equality form.
 	assert_eq!(
 		fmt(
-			"fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem) -> Mem {}"
+			"func grow<Mem: Memory where { Size: Unsigned }>(mem: Mem) -> Mem {}"
 		),
-		"fn grow<Mem: Memory where { Size: Unsigned }>(mem: Mem) -> Mem {}\n",
+		"func grow<Mem: Memory where { Size: Unsigned }>(mem: Mem) -> Mem {}\n",
 	);
 
 	assert_eq!(
 		fmt(
-			"fn f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}"
+			"func f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}"
 		),
-		"fn f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}\n",
+		"func f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}\n",
 	);
 }
 
@@ -332,11 +321,11 @@ fn test_format_qualified_path() {
 	// type) and expression position (a call), with and without the `as
 	// Trait` part.
 	let case = TestCase::new(indoc! {"
-        fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+        func grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
             <Thing as Greeter>::greet(mem)
         }
 
-        fn plain(x: <T>::Item) -> <T>::Item {
+        func plain(x: <T>::Item) -> <T>::Item {
             <T>::method(x)
         }
     "});
@@ -347,17 +336,16 @@ fn test_format_qualified_path() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+            func grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
                 <Thing as Greeter>::greet(mem)
             }
 
-            fn plain(x: <T>::Item) -> <T>::Item {
+            func plain(x: <T>::Item) -> <T>::Item {
                 <T>::method(x)
             }
         "}
@@ -378,7 +366,6 @@ fn test_format_const_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -407,7 +394,6 @@ fn test_format_enum_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -425,9 +411,9 @@ fn test_format_enum_items() {
 #[test]
 fn test_format_struct_items() {
 	let case = TestCase::new(indoc! {"
-        pub struct Point { pub x: i32, y: i32 }
+        pub struct Point(pub x: i32, y: i32);
 
-        struct Unit { value: f64 }
+        struct Unit(value: f64);
     "});
 	let output = format(
 		&case.ast,
@@ -436,20 +422,48 @@ fn test_format_struct_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            pub struct Point {
+            pub struct Point(
                 pub x: i32,
                 y: i32,
-            }
+            );
 
-            struct Unit {
+            struct Unit(
                 value: f64,
-            }
+            );
+        "}
+	);
+}
+
+/// Parameters and fields print as written, `_: T` included.
+#[test]
+fn test_format_parameter_and_field_slots() {
+	let case = TestCase::new(indoc! {"
+        func f(i32, _: u8, mut d: i32) {}
+        struct S(_: u8, pub mut e: i32);
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            func f(i32, _: u8, mut d: i32) {}
+
+            struct S(
+                _: u8,
+                pub mut e: i32,
+            );
         "}
 	);
 }
@@ -467,7 +481,6 @@ fn test_format_typeset_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -479,11 +492,33 @@ fn test_format_typeset_items() {
 	);
 }
 
+#[test]
+fn test_format_typeset_with_bound_clause() {
+	let case = TestCase::new(indoc! {"
+        typeset  Integer :  Add+Sub  { i32 , i64 }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            typeset Integer: Add + Sub { i32, i64 }
+        "}
+	);
+}
+
 /// Regression test for a formatter bug where `Item::Trait`/`Item::Enum`/
 /// `Item::Const`/`Item::Global`'s dispatch arms in `build_item` destructured
 /// `attributes` away via `..` and never passed it to their respective
 /// `build_*_definition` functions — silently dropping any `#[...]` on those
-/// four item kinds (unlike `fn`/`struct`/`typeset`/`type`, which were never
+/// four item kinds (unlike `func`/`struct`/`typeset`/`type`, which were never
 /// affected). Caught by round-tripping `std/main.wx`'s `#[tag = "add"]`-style
 /// operator traits through `wx format`.
 #[test]
@@ -491,7 +526,7 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 	let case = TestCase::new(indoc! {r#"
         #[tag = "add"]
         pub trait Add {
-            fn add(self: Self, rhs: Self) -> Self;
+            func add(self: Self, rhs: Self) -> Self;
         }
 
         #[tag = "example"]
@@ -510,7 +545,6 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -518,7 +552,7 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 		indoc! {r#"
             #[tag = "add"]
             pub trait Add {
-                fn add(self: Self, rhs: Self) -> Self;
+                func add(self: Self, rhs: Self) -> Self;
             }
 
             #[tag = "example"]
@@ -540,9 +574,9 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 #[test]
 fn test_format_generic_struct_stays_inline() {
 	let case = TestCase::new(indoc! {"
-        struct Pair<A, B> { first: A, second: B }
+        struct Pair<A, B>(first: A, second: B);
 
-        struct Wrapper<T> { value: T }
+        struct Wrapper<T>(value: T);
     "});
 	let output = format(
 		&case.ast,
@@ -551,20 +585,19 @@ fn test_format_generic_struct_stays_inline() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            struct Pair<A, B> {
+            struct Pair<A, B>(
                 first: A,
                 second: B,
-            }
+            );
 
-            struct Wrapper<T> {
+            struct Wrapper<T>(
                 value: T,
-            }
+            );
         "}
 	);
 }
@@ -572,11 +605,11 @@ fn test_format_generic_struct_stays_inline() {
 #[test]
 fn test_format_generic_function() {
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(value: T) -> T {
+        func identity<T>(value: T) -> T {
             value
         }
 
-        fn zip<A, B: Clone + Debug>(a: A, b: B) -> A {
+        func zip<A, B: Clone + Debug>(a: A, b: B) -> A {
             a
         }
     "});
@@ -587,17 +620,16 @@ fn test_format_generic_function() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn identity<T>(value: T) -> T {
+            func identity<T>(value: T) -> T {
                 value
             }
 
-            fn zip<A, B: Clone + Debug>(a: A, b: B) -> A {
+            func zip<A, B: Clone + Debug>(a: A, b: B) -> A {
                 a
             }
         "}
@@ -607,9 +639,9 @@ fn test_format_generic_function() {
 #[test]
 fn test_format_struct_init() {
 	let case = TestCase::new(indoc! {"
-        fn main() {
-            local a = Point::{ x: 1, y: 2 };
-            local b = Point::{ x: 1, y: 2, z: 3, w: 4, extra_long_field: 99 }
+        func main() {
+            local a = Point({ x: 1, y: 2 });
+            local b = Point({ x: 1, y: 2, z: 3, w: 4, extra_long_field: 99 })
         }
     "});
 	let output = format(
@@ -619,21 +651,20 @@ fn test_format_struct_init() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn main() {
-                local a = Point::{ x: 1, y: 2 };
-                local b = Point::{
+            func main() {
+                local a = Point({ x: 1, y: 2 });
+                local b = Point({
                     x: 1,
                     y: 2,
                     z: 3,
                     w: 4,
                     extra_long_field: 99,
-                }
+                });
             }
         "}
 	);
@@ -642,8 +673,8 @@ fn test_format_struct_init() {
 #[test]
 fn test_format_struct_init_block_value() {
 	let case = TestCase::new(indoc! {"
-        fn main() -> i32 {
-            local p = Point::{ x: g: { break :g 5 }, y: 10 }
+        func main() -> i32 {
+            local p = Point({ x: g: block { break :g 5 }, y: 10 })
         }
     "});
 	let output = format(
@@ -653,17 +684,16 @@ fn test_format_struct_init_block_value() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn main() -> i32 {
-                local p = Point::{
-                    x: g: { break :g 5 },
+            func main() -> i32 {
+                local p = Point({
+                    x: g: block { break :g 5 },
                     y: 10,
-                }
+                });
             }
         "}
 	);
@@ -672,15 +702,15 @@ fn test_format_struct_init_block_value() {
 #[test]
 fn test_format_local_patterns() {
 	let case = TestCase::new(indoc! {"
-        fn f(p: Point, pair: (i32, i32)) {
+        func f(p: Point, pair: (i32, i32)) {
             local x = 1;
             local mut y = 2;
             local _ = 3;
             local (a,b) = pair;
             local (mut c,_) = pair;
-            local Point::{x,y:renamed} = p;
-            local geom::Point::{x,..} = p;
-            local Point::{..} = p;
+            local Point({x,y:renamed}) = p;
+            local geom::Point({x,..}) = p;
+            local Point({..}) = p;
             local (a,b): (i32,i32) = pair;
         }
     "});
@@ -691,22 +721,57 @@ fn test_format_local_patterns() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn f(p: Point, pair: (i32, i32)) {
+            func f(p: Point, pair: (i32, i32)) {
                 local x = 1;
                 local mut y = 2;
                 local _ = 3;
                 local (a, b) = pair;
                 local (mut c, _) = pair;
-                local Point::{ x, y: renamed } = p;
-                local geom::Point::{ x, .. } = p;
-                local Point::{ .. } = p;
+                local Point({ x, y: renamed }) = p;
+                local geom::Point({ x, .. }) = p;
+                local Point({ .. }) = p;
                 local (a, b): (i32, i32) = pair;
+            }
+        "}
+	);
+}
+
+#[test]
+fn test_format_pattern_constants() {
+	// A constant named by one segment is written `const name`; a qualified
+	// path is a constant on its own.
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) {
+            match x {
+                const MAX -> {},
+                Ordering::Less -> {},
+                _ -> {},
+            }
+        }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            func f(x: i32) {
+                match x {
+                    const MAX -> {},
+                    Ordering::Less -> {},
+                    _ -> {},
+                }
             }
         "}
 	);
@@ -718,7 +783,7 @@ fn test_format_impl_trait_items() {
         impl Iterator for Range {
             type Item = i32;
 
-            fn next(self) -> Self::Item {
+            func next(self: Self) -> Self::Item {
                 0
             }
         }
@@ -730,7 +795,6 @@ fn test_format_impl_trait_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -739,7 +803,7 @@ fn test_format_impl_trait_items() {
             impl Iterator for Range {
                 type Item = i32;
 
-                fn next(self) -> Self::Item {
+                func next(self: Self) -> Self::Item {
                     0
                 }
             }
@@ -749,9 +813,9 @@ fn test_format_impl_trait_items() {
 
 #[test]
 fn test_format_block_like_statement_semicolon() {
-	// Without explicit `;`: formatter does not add one after block-like statements.
+	// Flat non-final block-like expressions acquire a separator.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             if true {}
             42
         }
@@ -763,23 +827,21 @@ fn test_format_block_like_statement_semicolon() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn f() -> i32 {
-                if true {}
+            func f() -> i32 {
+                if true {};
                 42
             }
         "}
 	);
 
-	// With explicit `;`: formatter preserves it so the user can visually
-	// separate the block statement from the expression that follows.
+	// The same flat form results when the source already has a separator.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             if true {};
             42
         }
@@ -791,13 +853,12 @@ fn test_format_block_like_statement_semicolon() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            fn f() -> i32 {
+            func f() -> i32 {
                 if true {};
                 42
             }
@@ -816,16 +877,15 @@ fn test_format_call_args_wrap() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
 
 	// Short call: stays on one line.
 	assert_eq!(
-		fmt("fn f() { foo(1, 2, 3); }"),
+		fmt("func f() { foo(1, 2, 3); }"),
 		indoc! {"
-            fn f() {
+            func f() {
                 foo(1, 2, 3);
             }
         "},
@@ -834,10 +894,10 @@ fn test_format_call_args_wrap() {
 	// Long call: each argument on its own line.
 	assert_eq!(
 		fmt(
-			"fn f() { host::draw_rect(food_x * CELL_SIZE, food_y * CELL_SIZE, CELL_SIZE, CELL_SIZE, 0xFFFFFF00); }"
+			"func f() { host::draw_rect(food_x * CELL_SIZE, food_y * CELL_SIZE, CELL_SIZE, CELL_SIZE, 0xFFFFFF00); }"
 		),
 		indoc! {"
-            fn f() {
+            func f() {
                 host::draw_rect(
                     food_x * CELL_SIZE,
                     food_y * CELL_SIZE,
@@ -852,10 +912,10 @@ fn test_format_call_args_wrap() {
 	// Long method call wraps the same way.
 	assert_eq!(
 		fmt(
-			"fn f() { obj.render(food_x * CELL_SIZE, food_y * CELL_SIZE, CELL_SIZE, CELL_SIZE, 0xFFFFFF00); }"
+			"func f() { obj.render(food_x * CELL_SIZE, food_y * CELL_SIZE, CELL_SIZE, CELL_SIZE, 0xFFFFFF00); }"
 		),
 		indoc! {"
-            fn f() {
+            func f() {
                 obj.render(
                     food_x * CELL_SIZE,
                     food_y * CELL_SIZE,
@@ -879,16 +939,15 @@ fn test_format_local_definition_wraps() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
 
 	// Short assignment stays on one line.
 	assert_eq!(
-		fmt("fn f() { local x = 42; }"),
+		fmt("func f() { local x = 42; }"),
 		indoc! {"
-            fn f() {
+            func f() {
                 local x = 42;
             }
         "},
@@ -898,30 +957,30 @@ fn test_format_local_definition_wraps() {
 	// Using FB_WIDTH (a named constant) makes the expression exceed 80 cols.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; fn set_pixel(x: u32, y: u32) { local base: heap::*u8 = (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8; }"
+			"memory heap: Memory32; func set_pixel(x: u32, y: u32) { local base: heap::*u8 = (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8; }"
 		),
 		indoc! {"
-            memory heap: Memory where { Size = u32 };
+            memory heap: Memory32;
 
-            fn set_pixel(x: u32, y: u32) {
+            func set_pixel(x: u32, y: u32) {
                 local base: heap::*u8 =
                     (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8;
             }
         "},
 	);
 
-	// Block-like value (struct init): = stays on the same line, struct breaks inside.
+	// Block-like value (call by name): = stays on the same line, the braces break inside.
 	assert_eq!(
 		fmt(
-			"fn f() { local p = Point::{ x: very_long_name_one, y: very_long_name_two, z: very_long_name_three }; }"
+			"func f() { local p = Point({ x: very_long_name_one, y: very_long_name_two, z: very_long_name_three }); }"
 		),
 		indoc! {"
-            fn f() {
-                local p = Point::{
+            func f() {
+                local p = Point({
                     x: very_long_name_one,
                     y: very_long_name_two,
                     z: very_long_name_three,
-                };
+                });
             }
         "},
 	);
@@ -932,19 +991,19 @@ fn test_format_local_definition_wraps() {
 	// Regression test for a bug where each level (the `local =` wrapper, the
 	// call's argument-list wrapper, and every nested struct literal's own
 	// wrapper) stacked its own indent on top of the others, since
-	// `measure_flat` reports groups containing a hard line as short/"fits"
+	// the old `measure_flat` reported hard-line groups as short/"fits"
 	// and `Indent` bumps the indent level regardless of whether the group
 	// it's in is actually rendered Flat or Break.
 	assert_eq!(
 		fmt(
-			"fn f() { local p = alloc(Outer::{ tag: 1, inner: Inner::{ id: 2, timeout: 3 } }); }"
+			"func f() { local p = alloc(Outer({ tag: 10001, inner: Inner({ id: 20002, timeout: 30003 }) })); }"
 		),
 		indoc! {"
-            fn f() {
-                local p = alloc(Outer::{
-                    tag: 1,
-                    inner: Inner::{ id: 2, timeout: 3 },
-                });
+            func f() {
+                local p = alloc(Outer({
+                    tag: 10001,
+                    inner: Inner({ id: 20002, timeout: 30003 }),
+                }));
             }
         "},
 	);
@@ -961,7 +1020,6 @@ fn test_format_inline_blocks() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -969,12 +1027,12 @@ fn test_format_inline_blocks() {
 	// Single-statement if guard: fits → inline.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; fn check(data: heap::&[u8]) -> bool { if data.len() < 4 { return false }; true }"
+			"memory heap: Memory32; func check(data: heap::&[u8]) -> bool { if data.len() < 4 { return false }; true }"
 		),
 		indoc! {"
-            memory heap: Memory where { Size = u32 };
+            memory heap: Memory32;
 
-            fn check(data: heap::&[u8]) -> bool {
+            func check(data: heap::&[u8]) -> bool {
                 if data.len() < 4 { return false };
                 true
             }
@@ -984,10 +1042,10 @@ fn test_format_inline_blocks() {
 	// if-else as a value expression: both branches fit → inline.
 	assert_eq!(
 		fmt(
-			"fn pick(cond: bool) -> i32 { local x: i32 = if cond { 5 } else { 6 }; x }"
+			"func pick(cond: bool) -> i32 { local x: i32 = if cond { 5 } else { 6 }; x }"
 		),
 		indoc! {"
-            fn pick(cond: bool) -> i32 {
+            func pick(cond: bool) -> i32 {
                 local x: i32 = if cond { 5 } else { 6 };
                 x
             }
@@ -998,10 +1056,10 @@ fn test_format_inline_blocks() {
 	// indent=4, cond takes 43 chars → remaining=33; block flat=50 > 33 → Break.
 	assert_eq!(
 		fmt(
-			"fn f() -> i32 { if some_very_long_condition_variable { return some_very_long_return_value_here } 0 }"
+			"func f() -> i32 { if some_very_long_condition_variable { return some_very_long_return_value_here } 0 }"
 		),
 		indoc! {"
-            fn f() -> i32 {
+            func f() -> i32 {
                 if some_very_long_condition_variable {
                     return some_very_long_return_value_here
                 }
@@ -1012,13 +1070,42 @@ fn test_format_inline_blocks() {
 
 	// Multi-statement block always breaks even when short.
 	assert_eq!(
-		fmt("fn f() -> i32 { local x = 1; x }"),
+		fmt("func f() -> i32 { local x = 1; x }"),
 		indoc! {"
-            fn f() -> i32 {
+            func f() -> i32 {
                 local x = 1;
                 x
             }
         "},
+	);
+}
+
+#[test]
+fn test_format_keeps_pub_on_memory_and_global() {
+	let fmt = |src: &str| -> String {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+			},
+		)
+	};
+
+	assert_eq!(
+		fmt("pub memory heap: Memory32;"),
+		"pub memory heap: Memory32;\n"
+	);
+	assert_eq!(
+		fmt("#[memory_limits(min_pages = 4)] pub memory heap: Memory32;"),
+		"#[memory_limits(min_pages = 4)]\npub memory heap: Memory32;\n",
+	);
+	assert_eq!(
+		fmt("pub global mut g: u32 = 0;"),
+		"pub global mut g: u32 = 0;\n"
 	);
 }
 
@@ -1033,39 +1120,31 @@ fn test_format_memory_config() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
 
 	// No config block
-	assert_eq!(
-		fmt("memory heap: Memory where { Size = u32 };"),
-		"memory heap: Memory where { Size = u32 };\n",
-	);
+	assert_eq!(fmt("memory heap: Memory32;"), "memory heap: Memory32;\n",);
 
 	// min_pages only
 	assert_eq!(
-		fmt(
-			"#[memory_limits(min_pages = 4)] memory heap: Memory where { Size = u32 };"
-		),
-		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory where { Size = u32 };\n",
+		fmt("#[memory_limits(min_pages = 4)] memory heap: Memory32;"),
+		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory32;\n",
 	);
 
 	// max_pages only
 	assert_eq!(
-		fmt(
-			"#[memory_limits(max_pages = 10)] memory heap: Memory where { Size = u32 };"
-		),
-		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
+		fmt("#[memory_limits(max_pages = 10)] memory heap: Memory32;"),
+		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory32;\n",
 	);
 
 	// both fields
 	assert_eq!(
 		fmt(
-			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory where { Size = u32 };"
+			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory32;"
 		),
-		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory where { Size = u32 };\n",
+		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory32;\n",
 	);
 }
 
@@ -1080,16 +1159,15 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
 
 	// Short chain: fits on one line, stays flat.
 	assert_eq!(
-		fmt("fn f(a: i32, b: i32, c: i32) -> i32 { a | b | c }"),
+		fmt("func f(a: i32, b: i32, c: i32) -> i32 { a | b | c }"),
 		indoc! {"
-            fn f(a: i32, b: i32, c: i32) -> i32 {
+            func f(a: i32, b: i32, c: i32) -> i32 {
                 a | b | c
             }
         "},
@@ -1098,12 +1176,12 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 	// Long chain: exceeds 80 columns, each operand on its own line.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory where { Size = u32 }; fn read(data: heap::&[u8], off: u32) -> i32 { (data[off] as i32) | ((data[off + 1] as i32) << 8) | ((data[off + 2] as i32) << 16) | ((data[off + 3] as i32) << 24) }"
+			"memory heap: Memory32; func read(data: heap::&[u8], off: u32) -> i32 { (data[off] as i32) | ((data[off + 1] as i32) << 8) | ((data[off + 2] as i32) << 16) | ((data[off + 3] as i32) << 24) }"
 		),
 		indoc! {"
-            memory heap: Memory where { Size = u32 };
+            memory heap: Memory32;
 
-            fn read(data: heap::&[u8], off: u32) -> i32 {
+            func read(data: heap::&[u8], off: u32) -> i32 {
                 (data[off] as i32)
                     | ((data[off + 1] as i32) << 8)
                     | ((data[off + 2] as i32) << 16)
@@ -1172,14 +1250,14 @@ fn test_format_comments_preserved() {
 	// Comment between statements inside a function body.
 	assert_eq!(
 		fmt(indoc! {"
-            fn f() {
+            func f() {
                 local x: i32 = 1;
                 // compute y
                 local y: i32 = 2;
             }
         "}),
 		indoc! {"
-            fn f() {
+            func f() {
                 local x: i32 = 1;
                 // compute y
                 local y: i32 = 2;
@@ -1190,13 +1268,13 @@ fn test_format_comments_preserved() {
 	// Comment as the first thing in a block, before any statement.
 	assert_eq!(
 		fmt(indoc! {"
-            fn f() -> i32 {
+            func f() -> i32 {
                 // load value
                 42
             }
         "}),
 		indoc! {"
-            fn f() -> i32 {
+            func f() -> i32 {
                 // load value
                 42
             }
@@ -1206,13 +1284,13 @@ fn test_format_comments_preserved() {
 	// Comment as the last thing in a block, after the final expression.
 	assert_eq!(
 		fmt(indoc! {"
-            fn f() -> i32 {
+            func f() -> i32 {
                 42
                 // load value
             }
         "}),
 		indoc! {"
-            fn f() -> i32 {
+            func f() -> i32 {
                 42
                 // load value
             }
@@ -1222,31 +1300,31 @@ fn test_format_comments_preserved() {
 	// Comment as the only content of an otherwise empty block.
 	assert_eq!(
 		fmt(indoc! {"
-            fn f() {
+            func f() {
                 // nothing here yet
             }
         "}),
 		indoc! {"
-            fn f() {
+            func f() {
                 // nothing here yet
             }
         "},
 	);
 
 	// Truly empty block still collapses to `{}`.
-	assert_eq!(fmt("fn f() {}\n"), "fn f() {}\n");
+	assert_eq!(fmt("func f() {}\n"), "func f() {}\n");
 
 	// Doc comment preserved like a regular comment.
 	assert_eq!(
 		fmt(indoc! {"
             /// Returns the sum.
-            fn add(a: i32, b: i32) -> i32 {
+            func add(a: i32, b: i32) -> i32 {
                 a + b
             }
         "}),
 		indoc! {"
             /// Returns the sum.
-            fn add(a: i32, b: i32) -> i32 {
+            func add(a: i32, b: i32) -> i32 {
                 a + b
             }
         "},
@@ -1269,12 +1347,12 @@ fn test_format_comments_preserved() {
 	// Comment as the only content of an otherwise empty import block.
 	assert_eq!(
 		fmt(indoc! {"
-            import \"env\" {
+            import \"env\" as env {
                 // nothing yet
             }
         "}),
 		indoc! {"
-            import \"env\" {
+            import \"env\" as env {
                 // nothing yet
             }
         "},
@@ -1283,8 +1361,12 @@ fn test_format_comments_preserved() {
 	// Leading/gap/trailing comments around export entries.
 	assert_eq!(
 		fmt(indoc! {"
-            fn heap() -> i32 { 1 }
-            fn other() -> i32 { 2 }
+            func heap() -> i32 {
+                1
+            }
+            func other() -> i32 {
+                2
+            }
             export {
                 // leading comment
                 heap,
@@ -1294,11 +1376,11 @@ fn test_format_comments_preserved() {
             }
         "}),
 		indoc! {"
-            fn heap() -> i32 {
+            func heap() -> i32 {
                 1
             }
 
-            fn other() -> i32 {
+            func other() -> i32 {
                 2
             }
 
@@ -1306,7 +1388,7 @@ fn test_format_comments_preserved() {
                 // leading comment
                 heap,
                 // middle comment
-                other
+                other,
                 // trailing comment
             }
         "},
@@ -1315,20 +1397,23 @@ fn test_format_comments_preserved() {
 	// Truly empty export/import blocks collapse to one line, matching
 	// every other empty brace body (struct/module/trait/enum/impl).
 	assert_eq!(fmt("export {}\n"), "export {}\n");
-	assert_eq!(fmt("import \"env\" {}\n"), "import \"env\" {}\n");
+	assert_eq!(
+		fmt("import \"env\" as env {}\n"),
+		"import \"env\" as env {}\n"
+	);
 
 	// Comment as the only content of an otherwise empty body, for every
 	// other brace-bodied item kind.
 	assert_eq!(
 		fmt(indoc! {"
-            struct Foo {
+            struct Foo(
                 // fields tbd
-            }
+            );
         "}),
 		indoc! {"
-            struct Foo {
+            struct Foo(
                 // fields tbd
-            }
+            );
         "},
 	);
 	assert_eq!(
@@ -1369,13 +1454,13 @@ fn test_format_comments_preserved() {
 	);
 	assert_eq!(
 		fmt(indoc! {"
-            struct Foo {}
+            struct Foo();
             impl Foo {
                 // methods tbd
             }
         "}),
 		indoc! {"
-            struct Foo {}
+            struct Foo();
 
             impl Foo {
                 // methods tbd
@@ -1385,7 +1470,7 @@ fn test_format_comments_preserved() {
 	assert_eq!(
 		fmt(indoc! {"
             trait T {}
-            struct Foo {}
+            struct Foo();
             impl T for Foo {
                 // methods tbd
             }
@@ -1393,7 +1478,7 @@ fn test_format_comments_preserved() {
 		indoc! {"
             trait T {}
 
-            struct Foo {}
+            struct Foo();
 
             impl T for Foo {
                 // methods tbd
@@ -1408,20 +1493,20 @@ fn test_format_comments_preserved() {
 	// silently dropped.
 	assert_eq!(
 		fmt(indoc! {"
-            struct Foo {}
+            struct Foo();
             impl Foo {
                 // first method
-                fn bar(self: Self) -> Self {
+                func bar(self: Self) -> Self {
                     self
                 }
             }
         "}),
 		indoc! {"
-            struct Foo {}
+            struct Foo();
 
             impl Foo {
                 // first method
-                fn bar(self: Self) -> Self {
+                func bar(self: Self) -> Self {
                     self
                 }
             }
@@ -1433,13 +1518,13 @@ fn test_format_comments_preserved() {
 		fmt(indoc! {"
             trait T {
                 // first method
-                fn bar(self: Self) -> Self;
+                func bar(self: Self) -> Self;
             }
         "}),
 		indoc! {"
             trait T {
                 // first method
-                fn bar(self: Self) -> Self;
+                func bar(self: Self) -> Self;
             }
         "},
 	);
@@ -1448,7 +1533,9 @@ fn test_format_comments_preserved() {
 #[test]
 fn test_format_long_type_params_wrap() {
 	let case = TestCase::new(indoc! {"
-        pub fn memory_copy<Size: PointerSize, SrcMem: Memory where { Size = Size }, DstMem: Memory where { Size = Size }>(dst: DstMem::*u8, src: SrcMem::&u8, len: Size) {}
+        pub func memory_copy<Size: PointerSize, SrcMem: Memory where {
+            Size = Size
+        }, DstMem: Memory where { Size = Size }>(dst: DstMem::*u8, src: SrcMem::&u8, len: Size) {}
     "});
 	let output = format(
 		&case.ast,
@@ -1457,13 +1544,12 @@ fn test_format_long_type_params_wrap() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
-            pub fn memory_copy<
+            pub func memory_copy<
                 Size: PointerSize,
                 SrcMem: Memory where { Size = Size },
                 DstMem: Memory where { Size = Size },
@@ -1475,7 +1561,7 @@ fn test_format_long_type_params_wrap() {
 #[test]
 fn test_format_address_of() {
 	let case = TestCase::new(indoc! {r#"
-        fn f(ptr: &i32) {
+        func f(ptr: &i32) {
             local a = ptr.*.&;
         }
     "#});
@@ -1486,13 +1572,12 @@ fn test_format_address_of() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {r#"
-            fn f(ptr: &i32) {
+            func f(ptr: &i32) {
                 local a = ptr.*.&;
             }
         "#}
@@ -1506,7 +1591,7 @@ fn test_format_impl_trait_multi_segment() {
 	// the ImplTrait trait_name field).
 	let case = TestCase::new(indoc! {"
         impl module::Drawable for Point {
-            fn draw(self) {}
+            func draw(self: Self) {}
         }
     "});
 	let output = format(
@@ -1516,14 +1601,13 @@ fn test_format_impl_trait_multi_segment() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
             impl module::Drawable for Point {
-                fn draw(self) {}
+                func draw(self: Self) {}
             }
         "}
 	);
@@ -1536,7 +1620,7 @@ fn test_format_impl_trait_generic_type_params() {
 	// silently changing the code's meaning.
 	let case = TestCase::new(indoc! {"
         impl<T> Trait for Wrapper<T> {
-            fn get(self) -> T {
+            func get(self: Self) -> T {
                 self.value
             }
         }
@@ -1548,14 +1632,13 @@ fn test_format_impl_trait_generic_type_params() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
 		output,
 		indoc! {"
             impl<T> Trait for Wrapper<T> {
-                fn get(self) -> T {
+                func get(self: Self) -> T {
                     self.value
                 }
             }
@@ -1570,7 +1653,7 @@ fn test_format_deep_indent_past_max_width_does_not_panic() {
 	// `max_line_width - position`, underflowing (panicking in debug builds).
 	// It must saturate to 0 (always break) instead.
 	let case = TestCase::new(indoc! {"
-        fn f() {
+        func f() {
           if true {
             if true {
               if true {
@@ -1589,7 +1672,6 @@ fn test_format_deep_indent_past_max_width_does_not_panic() {
 		RendererConfig {
 			max_line_width: 10,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert!(!output.is_empty());
@@ -1622,12 +1704,12 @@ fn test_format_trailing_comments_keep_their_line() {
         const A: u32 = 1; // trailing on item
         const B: u32 = 2;
 
-        struct S {
+        struct S(
             // leading on first field
             x: u32, // trailing on field
             y: u32,
             // own-line before closing brace
-        }
+        );
 
         enum E: u32 {
             A = 0, // trailing on variant
@@ -1636,16 +1718,16 @@ fn test_format_trailing_comments_keep_their_line() {
 
         impl S {
             // leading on first member
-            fn a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             } // trailing on member
 
-            fn b(self) -> u32 {
+            func b(self: Self) -> u32 {
                 self.y
             }
         }
 
-        fn g(v: u32) -> u32 {
+        func g(v: u32) -> u32 {
             local a = 1; // trailing on statement
 
             // own-line, documents b
@@ -1653,7 +1735,7 @@ fn test_format_trailing_comments_keep_their_line() {
             match v {
                 0 -> { a }, // trailing on arm
                 // own-line before arm
-                _ -> { b }
+                _ -> { b },
             }
             // own-line before closing brace
         }
@@ -1724,7 +1806,7 @@ fn test_format_blank_lines_around_attributes() {
         /// Doc line one.
         /// Doc line two.
         #[inline]
-        pub fn f() -> u32 {
+        pub func f() -> u32 {
             1
         }
     "};
@@ -1735,7 +1817,7 @@ fn test_format_blank_lines_around_attributes() {
         /// Doc, then a blank, then the attribute.
 
         #[inline]
-        pub fn f() -> u32 {
+        pub func f() -> u32 {
             1
         }
     "};
@@ -1747,7 +1829,7 @@ fn test_format_blank_lines_around_attributes() {
         const A: u32 = 1;
 
         #[inline]
-        pub fn f() -> u32 {
+        pub func f() -> u32 {
             1
         }
     "};
@@ -1759,7 +1841,7 @@ fn test_format_blank_lines_around_attributes() {
 #[test]
 fn test_format_no_trailing_whitespace() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local a = 1;
 
             a
@@ -1801,32 +1883,32 @@ fn test_format_comment_after_a_list_opener_wraps() {
             pub const A: u32 = 1;
         }
 
-        struct S { // opens a `struct`
+        struct S( // opens a `struct`
             x: u32,
-        }
+        );
 
         enum E: u32 { // opens an `enum`
             A = 0,
         }
 
         impl S { // opens an `impl`
-            fn a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
 
-        import \"env\" { // opens an `import`
-            fn h() -> u32;
+        import \"env\" as env { // opens an `import`
+            func h() -> u32;
         }
 
-        fn g(v: u32) -> u32 { // opens a block
+        func g(v: u32) -> u32 { // opens a block
             match v { // opens a `match`
-                _ -> { v }
+                _ -> { v },
             }
         }
 
         trait T { // opens a `trait`
-            fn t(self) -> u32;
+            func t(self: Self) -> u32;
         }
 
         export { // opens an `export`
@@ -1840,10 +1922,10 @@ fn test_format_comment_after_a_list_opener_wraps() {
             pub const A: u32 = 1;
         }
 
-        struct S {
+        struct S(
             // opens a `struct`
             x: u32,
-        }
+        );
 
         enum E: u32 {
             // opens an `enum`
@@ -1852,27 +1934,27 @@ fn test_format_comment_after_a_list_opener_wraps() {
 
         impl S {
             // opens an `impl`
-            fn a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
 
-        import \"env\" {
+        import \"env\" as env {
             // opens an `import`
-            fn h() -> u32;
+            func h() -> u32;
         }
 
-        fn g(v: u32) -> u32 {
+        func g(v: u32) -> u32 {
             // opens a block
             match v {
                 // opens a `match`
-                _ -> { v }
+                _ -> { v },
             }
         }
 
         trait T {
             // opens a `trait`
-            fn t(self) -> u32;
+            func t(self: Self) -> u32;
         }
 
         export {
@@ -1905,12 +1987,12 @@ fn test_format_trailing_comment_after_a_non_block_item_is_kept() {
         const X: i32 = 5; // documents X, not Y
         const Y: i32 = 6;
 
-        struct S {
+        struct S(
             x: u32, // documents x
             y: u32,
-        }
+        );
 
-        fn g() -> i32 {
+        func g() -> i32 {
             local a = 1; // documents a
             a
         }
@@ -1938,10 +2020,10 @@ fn test_format_trait_body_comments_are_kept_in_place() {
 	let source = indoc! {"
         trait T {
             // opens the trait
-            fn a(self) -> u32; // trails a member
+            func a(self: Self) -> u32; // trails a member
 
             // own-line before b
-            fn b(self) -> u32;
+            func b(self: Self) -> u32;
             // after the last member
         }
     "};
@@ -1981,23 +2063,23 @@ fn test_format_blank_line_between_leading_comments() {
 	};
 
 	let source = indoc! {"
-        struct S {
+        struct S(
             // one
 
             // two
             x: u32,
-        }
+        );
 
         impl S {
             // one
 
             // two
-            fn a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
 
-        fn g() -> u32 {
+        func g() -> u32 {
             // one
 
             // two
@@ -2028,18 +2110,18 @@ fn test_format_empty_body_comments_match_a_non_empty_one() {
 	// The only difference between the two is the field. It must not be what
 	// decides whether the blank line between the comments survives.
 	let source = indoc! {"
-        struct Empty {
+        struct Empty(
             // one
 
             // two
-        }
+        );
 
-        struct HasAField {
+        struct HasAField(
             // one
 
             // two
             x: u32,
-        }
+        );
 
         impl Empty {
             // one
@@ -2047,7 +2129,7 @@ fn test_format_empty_body_comments_match_a_non_empty_one() {
             // two
         }
 
-        fn f() {
+        func f() {
             // one
 
             // two
@@ -2074,38 +2156,38 @@ fn test_format_no_blank_line_after_a_list_opener() {
 	};
 
 	let source = indoc! {"
-        struct S {
+        struct S(
 
             // separated from the brace
             x: u32,
-        }
+        );
 
         impl S {
 
-            fn a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
 
-        fn g() -> u32 {
+        func g() -> u32 {
 
             1
         }
     "};
 
 	let expected = indoc! {"
-        struct S {
+        struct S(
             // separated from the brace
             x: u32,
-        }
+        );
 
         impl S {
-            fn a(self) -> u32 {
+            func a(self: Self) -> u32 {
                 self.x
             }
         }
 
-        fn g() -> u32 {
+        func g() -> u32 {
             1
         }
     "};
@@ -2113,3 +2195,858 @@ fn test_format_no_blank_line_after_a_list_opener() {
 	assert_eq!(fmt(source), expected);
 	assert_eq!(fmt(expected), expected);
 }
+
+#[test]
+fn export_aliases_preserve_their_quoted_source_spelling() {
+	let fmt = |src: &str| {
+		let case = TestCase::new(src);
+		format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+			},
+		)
+	};
+	let source = r#"export { f as "line\n", f as "slash\\n", f as "quote\"" }
+"#;
+	let formatted = fmt(source);
+	assert!(formatted.contains(r#""line\n""#));
+	assert!(formatted.contains(r#""slash\\n""#));
+	assert!(formatted.contains(r#""quote\"""#));
+	assert_eq!(fmt(&formatted), formatted);
+}
+
+#[test]
+fn raw_ast_strings_preserve_original_spelling_when_formatted() {
+	let fmt = |source: &str| {
+		let case = TestCase::new(source);
+		format(
+			&case.ast,
+			&case.interner,
+			source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+			},
+		)
+	};
+	let source = indoc! {"
+        #[tag = \"line\\nslash\\\\n\"]
+        #[other(value = \"line\\nslash\\\\n\")]
+        func f() {
+            local text = \"line\\nslash\\\\n\";
+        }
+
+        import \"line\\nslash\\\\n\" as host {
+            func imported();
+        }
+
+        export {
+            f as \"line\\nslash\\\\n\",
+        }
+    "};
+	let formatted = fmt(source);
+	assert_eq!(formatted.matches(r#""line\nslash\\n""#).count(), 5);
+	assert_eq!(fmt(&formatted), formatted);
+}
+
+// Formatting must keep what the author wrote readable as the same program:
+// the output reparses cleanly, formats to itself, and every block keeps the
+// role of its statements (see `preserve_roles`). The tests below go through
+// `checked_format` so each case gets all three checks.
+
+fn checked_format(source: &str, width: u32, indent: u8) -> String {
+	let case = TestCase::new(source);
+	assert!(
+		case.ast.diagnostics.is_empty(),
+		"{:#?}\n{source}",
+		case.ast.diagnostics
+	);
+	let config = RendererConfig {
+		max_line_width: width,
+		indent_width: indent,
+	};
+	let output = format(&case.ast, &case.interner, source, config);
+	let reparsed = TestCase::new(&output);
+	assert!(
+		reparsed.ast.diagnostics.is_empty(),
+		"{:#?}\n{output}",
+		reparsed.ast.diagnostics
+	);
+	assert_eq!(
+		format(&reparsed.ast, &reparsed.interner, &output, config),
+		output,
+		"idempotence: {source}"
+	);
+	for (before, after) in case.ast.items.iter().zip(&reparsed.ast.items) {
+		if let (
+			ast::Item::Function { block: a, .. },
+			ast::Item::Function { block: b, .. },
+		) = (&before.inner.inner, &after.inner.inner)
+		{
+			preserve_roles(&a.inner, &b.inner);
+		}
+	}
+	output
+}
+
+// Compare nested block roles while allowing precisely the two authorized
+// normalizations: non-final block-like separators and local definitions.
+fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
+	use ast::Expression as E;
+	assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
+	match (a, b) {
+		(E::Block { statements: a }, E::Block { statements: b }) => {
+			assert_eq!(a.len(), b.len());
+			let count = a.len();
+			for (i, (a, b)) in a.iter().zip(b).enumerate() {
+				match (&a.inner.inner, &b.inner.inner) {
+					(
+						ast::Statement::Expression(x),
+						ast::Statement::Expression(y),
+					) => {
+						if i + 1 == count || !x.inner.is_block_like() {
+							assert_eq!(
+								a.separator.is_some(),
+								b.separator.is_some(),
+								"expression role changed"
+							);
+						}
+						preserve_roles(&x.inner, &y.inner);
+					}
+					(
+						ast::Statement::LocalDefinition { value: x, .. },
+						ast::Statement::LocalDefinition { value: y, .. },
+					) => {
+						assert!(b.separator.is_some());
+						preserve_roles(&x.inner, &y.inner);
+					}
+					_ => panic!("statement kind changed"),
+				}
+			}
+		}
+		(
+			E::IfElse {
+				condition: ac,
+				then_block: at,
+				else_block: ae,
+			},
+			E::IfElse {
+				condition: bc,
+				then_block: bt,
+				else_block: be,
+			},
+		) => {
+			preserve_roles(&ac.inner, &bc.inner);
+			preserve_roles(&at.inner, &bt.inner);
+			assert_eq!(ae.is_some(), be.is_some());
+			if let (Some(a), Some(b)) = (ae, be) {
+				preserve_roles(&a.inner, &b.inner);
+			}
+		}
+		(
+			E::Loop { block: a } | E::Label { block: a, .. },
+			E::Loop { block: b } | E::Label { block: b, .. },
+		) => preserve_roles(&a.inner, &b.inner),
+		(
+			E::Match {
+				scrutinee: a,
+				arms: aa,
+			},
+			E::Match {
+				scrutinee: b,
+				arms: ba,
+			},
+		) => {
+			preserve_roles(&a.inner, &b.inner);
+			assert_eq!(aa.len(), ba.len());
+			for (a, b) in aa.iter().zip(ba) {
+				preserve_roles(
+					&a.inner.inner.body.inner,
+					&b.inner.inner.body.inner,
+				);
+			}
+		}
+		(
+			E::NamedCall { arguments: a, .. },
+			E::NamedCall { arguments: b, .. },
+		) => {
+			assert_eq!(a.len(), b.len());
+			for (a, b) in a.iter().zip(b) {
+				if let (Some(a), Some(b)) =
+					(&a.inner.inner.value, &b.inner.inner.value)
+				{
+					preserve_roles(&a.inner, &b.inner);
+				}
+			}
+		}
+		(E::NamedMethodCall(a), E::NamedMethodCall(b)) => {
+			preserve_roles(&a.object.inner, &b.object.inner);
+			assert_eq!(a.arguments.len(), b.arguments.len());
+			for (a, b) in a.arguments.iter().zip(&b.arguments) {
+				if let (Some(a), Some(b)) =
+					(&a.inner.inner.value, &b.inner.inner.value)
+				{
+					preserve_roles(&a.inner, &b.inner);
+				}
+			}
+		}
+		(
+			E::Return { value: a } | E::Break { value: a, .. },
+			E::Return { value: b } | E::Break { value: b, .. },
+		) => {
+			if let (Some(a), Some(b)) = (a, b) {
+				preserve_roles(&a.inner, &b.inner);
+			}
+		}
+		_ => {}
+	}
+}
+
+#[test]
+fn executable_block_eligibility() {
+	for (body, expected) in [
+		("", "func f() {}\n"),
+		("foo()", "func f() { foo() }\n"),
+		("a + b", "func f() { a + b }\n"),
+		("foo();", "func f() {\n    foo();\n}\n"),
+		("local a = 1", "func f() {\n    local a = 1;\n}\n"),
+		("local a = 1;", "func f() {\n    local a = 1;\n}\n"),
+		("foo(); bar()", "func f() {\n    foo();\n    bar()\n}\n"),
+		("_ = foo()", "func f() { _ = foo() }\n"),
+		("return 1", "func f() { return 1 }\n"),
+		("return 1;", "func f() {\n    return 1;\n}\n"),
+		("break 1", "func f() { break 1 }\n"),
+		("continue", "func f() { continue }\n"),
+	] {
+		assert_eq!(
+			checked_format(
+				&format!("func f() {{ block {{ {body} }} }}"),
+				80,
+				4
+			),
+			format!(
+				"func f() {{\n    block {}\n}}\n",
+				expected
+					.strip_prefix("func f() ")
+					.unwrap()
+					.trim_end()
+					.replace("\n", "\n    ")
+			)
+		);
+	}
+	for body in [
+		"// leading\nfoo()",
+		"foo() // trailing\n",
+		"foo()\n// trailing\n",
+		"// empty\n",
+	] {
+		let output = checked_format(&format!("func f() {{ {body} }}"), 80, 4);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+		assert!(output.contains("//"));
+	}
+}
+
+#[test]
+fn function_bodies_always_break() {
+	// A body always breaks, but never expands a short signature.
+	{
+		let flat = "func f(x: i32) -> i32 { x }";
+		for width in [flat.len() - 1, flat.len(), flat.len() + 1] {
+			let output = checked_format(flat, width as u32, 4);
+			assert!(output.ends_with("{\n    x\n}\n"), "{output}");
+			assert!(output.starts_with("func f(x: i32) -> i32 {"));
+		}
+		for body in ["foo()", "foo();", "a + b", "return 1", "_ = foo()"] {
+			assert_eq!(
+				checked_format(&format!("func f() {{ {body} }}"), 120, 4),
+				format!("func f() {{\n    {body}\n}}\n"),
+			);
+		}
+		assert_eq!(checked_format("func f() {}", 120, 4), "func f() {}\n");
+
+		let output = checked_format(
+			"func many(first: i32, second: i32, third: i32) -> i32 { first }",
+			36,
+			4,
+		);
+		assert!(output.starts_with("func many(\n"), "{output}");
+		assert!(output.ends_with(") -> i32 {\n    first\n}\n"), "{output}");
+		for body in ["if x { a() } else { b() }", "a(); b()"] {
+			let output =
+				checked_format(&format!("func f(x: bool) {{ {body} }}"), 80, 4);
+			assert!(output.starts_with("func f(x: bool) {\n"), "{output}");
+		}
+		assert_eq!(
+			checked_format("#[inline] func f() { 1 }", 80, 4),
+			"#[inline]\nfunc f() {\n    1\n}\n"
+		);
+		let output = checked_format(
+			"func f() { very_long_function_name(argument) }",
+			35,
+			2,
+		);
+		assert_eq!(
+			output,
+			"func f() {\n  very_long_function_name(argument)\n}\n"
+		);
+	}
+
+	// Methods follow the same rule; generic signatures wrap before the body.
+	{
+		for source in [
+			"impl Point { func f(self: Self) -> i32 { 1 } }",
+			"trait T { func f(self: Self) -> i32 { 1 } }",
+			"impl T for Point { func f(self: Self) -> i32 { 1 } }",
+		] {
+			let output = checked_format(source, 80, 4);
+			assert!(
+				output
+					.contains("func f(self: Self) -> i32 {\n        1\n    }"),
+				"{output}"
+			);
+			let output = checked_format(source, 24, 4);
+			assert!(output.contains("-> i32 {\n"), "{output}");
+			assert!(!output.contains("{ 1 }"), "{output}");
+		}
+		let output = checked_format(
+			"func f<First: VeryLongBound, Second: AnotherVeryLongBound>(x: First) -> First { x }",
+			40,
+			4,
+		);
+		assert!(output.starts_with("func f<\n"), "{output}");
+		assert!(output.ends_with("{\n    x\n}\n"), "{output}");
+	}
+}
+
+#[test]
+fn block_like_statement_separators() {
+	// Every block-like form, with and without its optional `;`.
+	{
+		for expression in [
+			"block { foo() }",
+			"if true { foo() } else { bar() }",
+			"loop { break 1 }",
+			"label: block { break :label 1 }",
+			"if true {}",
+			"block {}",
+			"loop {}",
+			"label: block {}",
+			"match n {}",
+		] {
+			for separator in ["", ";"] {
+				let source =
+					format!("func f() {{ {expression}{separator} next() }}");
+				let output = checked_format(&source, 120, 4);
+				assert!(
+					output.contains(&format!("    {expression};\n    next()")),
+					"{output}"
+				);
+				let final_source =
+					format!("func f() {{ {expression}{separator} }}");
+				assert_eq!(
+					checked_format(&final_source, 120, 4),
+					format!("func f() {{\n    {expression}{separator}\n}}\n")
+				);
+			}
+		}
+		for expression in [
+			"block { foo(); }",
+			"if true { foo(); } else { bar() }",
+			"loop { break 1; }",
+			"label: block { break :label 1; }",
+			"match n { _ -> { 1 } }",
+		] {
+			for separator in ["", ";"] {
+				let output = checked_format(
+					&format!("func f() {{ {expression}{separator} next() }}"),
+					80,
+					4,
+				);
+				assert!(output.contains("\n    }\n    next()"), "{output}");
+				let output = checked_format(
+					&format!("func f() {{ {expression}{separator} }}"),
+					80,
+					4,
+				);
+				assert!(
+					output.ends_with(&format!("    }}{separator}\n}}\n")),
+					"{output}"
+				);
+			}
+		}
+	}
+
+	// The flat `;` counts toward the width the line must fit.
+	{
+		for expression in [
+			"if true { foo() } else { bar() }",
+			"loop { break value }",
+			"label: block { break :label 1 }",
+		] {
+			let boundary = 4 + expression.len() + 1;
+			for width in [boundary - 1, boundary, boundary + 1] {
+				for separator in ["", ";"] {
+					let output = checked_format(
+						&format!(
+							"func f() {{ {expression}{separator} next() }}"
+						),
+						width as u32,
+						4,
+					);
+					if width >= boundary {
+						assert!(
+							output.contains(&format!("    {expression};\n")),
+							"{output}"
+						);
+					} else {
+						assert!(
+							output.contains("\n    }\n    next()"),
+							"{output}"
+						);
+					}
+				}
+			}
+		}
+	}
+
+	// Empty bodies follow the mode of the group that owns them.
+	{
+		for expression in [
+			"if test(a) {}",
+			"if !test(a) {}",
+			"match test(a) {}",
+			"loop {}",
+			"block {}",
+			"label: block {}",
+		] {
+			for separator in ["", ";"] {
+				let source =
+					format!("func f() {{ {expression}{separator} next() }}");
+				let boundary = (4 + expression.len() + 1) as u32;
+				for width in [boundary - 1, boundary, boundary + 1] {
+					let output = checked_format(&source, width, 4);
+					// Below the flat width, the owning group chooses Break even
+					// though the nested condition and empty braces stay on one line.
+					let semi = if width >= boundary { ";" } else { "" };
+					assert_eq!(
+						output,
+						format!(
+							"func f() {{\n    {expression}{semi}\n    next()\n}}\n"
+						)
+					);
+				}
+				let output = checked_format(&source, 8, 4);
+				assert!(!output.contains("{};"), "{output}");
+			}
+		}
+	}
+}
+
+#[test]
+fn branch_coordination_and_comments() {
+	for body in [
+		"foo();",
+		"prepare(); foo()",
+		"// branch\nfoo()",
+		"foo() // branch\n",
+	] {
+		for (a, b) in [(body, "bar()"), ("bar()", body)] {
+			let output = checked_format(
+				&format!(
+					"func f() {{ if true {{ {a} }} else {{ {b} }}; next() }}"
+				),
+				80,
+				4,
+			);
+			assert!(output.contains("if true {\n"), "{output}");
+			assert!(output.contains("} else {\n"), "{output}");
+			assert!(output.contains("\n    }\n    next()"), "{output}");
+		}
+	}
+	let output = checked_format(
+		"func f() { if true { foo() } // boundary\nnext() }",
+		80,
+		4,
+	);
+	assert!(
+		output.contains("if true { foo() }; // boundary\n"),
+		"{output}"
+	);
+	let output = checked_format(
+		"func f() { if true { foo(); }; // boundary\nnext() }",
+		80,
+		4,
+	);
+	assert!(output.contains("    } // boundary\n"), "{output}");
+}
+
+#[test]
+fn mandatory_lines_prevent_flat_layout() {
+	// A nested block that must break stops its parents going flat.
+	{
+		let output = checked_format(
+			"func f() { return if true { a(); } else { b() } }",
+			120,
+			4,
+		);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+		assert!(output.contains("} else {\n"), "{output}");
+		// The top-level rule deliberately allows an unterminated return whose
+		// operand is block-like when the whole thing is physically one line.
+		assert_eq!(
+			checked_format(
+				"func f() { return if true { a() } else { b() } }",
+				120,
+				4
+			),
+			"func f() {\n    return if true { a() } else { b() }\n}\n"
+		);
+		let output = checked_format(
+			"func f() { wrap(Point({ x: block { a(); } })) }",
+			120,
+			4,
+		);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+	}
+
+	// So does a newline inside a source token.
+	{
+		let output = checked_format(
+			r#"func f() { "one
+two" }"#,
+			120,
+			4,
+		);
+		assert!(output.starts_with("func f() {\n"), "{output}");
+		assert!(output.contains("one\ntwo"), "{output}");
+	}
+}
+
+/// A call by name that fits stays on one line, whatever its callee: a path,
+/// a qualified path, a method with or without a turbofish, a receiver named
+/// `self`, shorthand and an empty list. Spacing and line breaks in the source
+/// don't matter.
+#[test]
+fn a_call_by_name_that_fits_stays_on_one_line() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() {
+                    g({b:1,a});
+                    geom::make({ x : 1 , y });
+                    <T as Make>::make({self: x});
+                    Self::m({ self });
+                    x.m({ y , z:2 });
+                    x.m::<u32>({ a });
+                    h({});
+                    g({
+                        a: 1,
+                        b: 2,
+                    });
+                }
+            "},
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                g({ b: 1, a });
+                geom::make({ x: 1, y });
+                <T as Make>::make({ self: x });
+                Self::m({ self });
+                x.m({ y, z: 2 });
+                x.m::<u32>({ a });
+                h({});
+                g({ a: 1, b: 2 });
+            }
+        "},
+	);
+}
+
+/// A call by name that doesn't fit puts each argument on a line of its own,
+/// with a trailing comma, its braces hugging the parentheses. Wherever it
+/// stands, the call itself stays where it starts: a local's value doesn't
+/// move below the `=`. An argument that fits stays flat.
+#[test]
+fn a_call_by_name_that_does_not_fit_breaks_one_argument_per_line() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() -> u32 {
+                    connect({ host: primary_host, port: 8080, retries: 3 });
+                    local c = connect({ host: primary_host, port: 8080 });
+                    socket.send({ payload: buffer, flags: 0, timeout: 30 });
+                    open({ path: read_path({ dir: a, name: b }), mode: 0 });
+                    return connect({ host: primary_host, port: 8080 });
+                }
+            "},
+			50,
+			4,
+		),
+		indoc! {"
+            func f() -> u32 {
+                connect({
+                    host: primary_host,
+                    port: 8080,
+                    retries: 3,
+                });
+                local c = connect({
+                    host: primary_host,
+                    port: 8080,
+                });
+                socket.send({
+                    payload: buffer,
+                    flags: 0,
+                    timeout: 30,
+                });
+                open({
+                    path: read_path({ dir: a, name: b }),
+                    mode: 0,
+                });
+                return connect({
+                    host: primary_host,
+                    port: 8080,
+                });
+            }
+        "},
+	);
+}
+
+/// A call by name that is the only argument of a call hugs it: the outer
+/// parentheses wrap its braces with no line of their own.
+#[test]
+fn a_call_by_name_hugs_the_call_it_is_the_only_argument_of() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() {
+                    wrap(make({ alpha: 1000000, beta: 2000000, gamma: 3 }));
+                    wrap(x.m({ alpha: 1000000, beta: 2000000, gamma: 3 }));
+                }
+            "},
+			50,
+			4,
+		),
+		indoc! {"
+            func f() {
+                wrap(make({
+                    alpha: 1000000,
+                    beta: 2000000,
+                    gamma: 3,
+                }));
+                wrap(x.m({
+                    alpha: 1000000,
+                    beta: 2000000,
+                    gamma: 3,
+                }));
+            }
+        "},
+	);
+}
+
+/// An argument whose value is a block (`block`, `if`, `match`) can't share a
+/// line, so the call breaks however short it is, function or method alike.
+#[test]
+fn a_block_value_breaks_a_call_by_name() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() {
+                    g({ a: block { y(); }, b: 2 });
+                    x.m({ a: if c { 1 } else { 2 } });
+                    g({ a: match v { _ -> { 1 } } });
+                }
+            "},
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                g({
+                    a: block {
+                        y();
+                    },
+                    b: 2,
+                });
+                x.m({
+                    a: if c { 1 } else { 2 },
+                });
+                g({
+                    a: match v {
+                        _ -> { 1 },
+                    },
+                });
+            }
+        "},
+	);
+}
+
+/// Forms that exist only in the current syntax, each written the way the
+/// formatter should leave it: a single `export`, `use` globs and groups,
+/// package instances, structs with unnamed fields, patterns that mirror construction, calls by
+/// name, memory-tagged and qualified paths, and an associated type default.
+#[test]
+fn test_format_current_syntax_forms() {
+	let source = indoc! {"
+        memory heap: Memory32;
+
+        crate \"math\" as math;
+        pub crate \"math\" as math2;
+
+        export main;
+
+        use a::b::*;
+        use a::{b, c::{d, e as f}, g::*};
+
+        struct Pair(i32, pub u8);
+
+        struct Unit();
+
+        trait Tr {
+            type A: Bound = u32;
+
+            func f(self: Self);
+        }
+
+        func main() {
+            local Pair(a, ..) = p;
+            local Named({ x, y: (q, _), .. }) = n;
+            local v = obj.method::<u32>({ a: 1, b });
+            local w = <Vec<u32> as Tr>::A::f::<u8>(x);
+            local z = <u32>::MAX;
+            local f: func(a: i32, i32) -> heap::*u8 = g;
+        }
+    "};
+	let case = TestCase::new(source);
+	assert!(
+		case.ast.diagnostics.is_empty(),
+		"{:#?}",
+		case.ast.diagnostics
+	);
+	let output =
+		format(&case.ast, &case.interner, source, RendererConfig::default());
+	assert_eq!(
+		output,
+		indoc! {"
+            memory heap: Memory32;
+
+            crate \"math\" as math;
+            pub crate \"math\" as math2;
+
+            export main;
+
+            use a::b::*;
+            use a::{b, c::{d, e as f}, g::*};
+
+            struct Pair(
+                i32,
+                pub u8,
+            );
+
+            struct Unit();
+
+            trait Tr {
+                type A: Bound = u32;
+
+                func f(self: Self);
+            }
+
+            func main() {
+                local Pair(a, ..) = p;
+                local Named({ x, y: (q, _), .. }) = n;
+                local v = obj.method::<u32>({ a: 1, b });
+                local w = <Vec<u32> as Tr>::A::f::<u8>(x);
+                local z = <u32>::MAX;
+                local f: func(a: i32, i32) -> heap::*u8 = g;
+            }
+        "}
+	);
+}
+
+// Disabled with the old `TIR::build` it drives: this checks that formatting
+// changes neither the diagnostics nor the body types of a program. Port it onto
+// the new `TypeContext` once function bodies are checked again.
+// #[test]
+// fn diagnostics_and_tir_types_survive_formatting() {
+// 	use std::collections::HashMap;
+// 	use wx_compiler::tir::TIR;
+// 	fn build(source: &str) -> (vfs::CompilationUnit, TIR) {
+// 		let mut builder = vfs::CompilationUnitBuilder::new();
+// 		builder.load_stdlib();
+// 		let root = builder
+// 			.load_binary(
+// 				vfs::AbsolutePath::new("/main.wx"),
+// 				&vfs::VirtualFileSource::new(HashMap::from([(
+// 					vfs::AbsolutePath::new("/main.wx"),
+// 					source.to_owned(),
+// 				)])),
+// 			)
+// 			.unwrap();
+// 		let mut graph = builder.build(root);
+// 		let tir = TIR::build(&mut graph);
+// 		(graph, tir)
+// 	}
+// 	for (source, invalid) in [
+// 		(
+// 			"func calculate() -> i32 { 1 } func f() { calculate(); } export { f }",
+// 			true,
+// 		),
+// 		(
+// 			"func effect() {} func f(flag: bool) -> i32 { if flag { effect() } else { effect() }; if flag { effect(); }; local x: i32 = 1; x } export { f }",
+// 			false,
+// 		),
+// 		(
+// 			"func f() -> i32 { local x: i32 = loop { break 1 }; x } export { f }",
+// 			false,
+// 		),
+// 		("func f() { local x: i32 = 1 } export { f }", false),
+// 	] {
+// 		let (_graph, before) = build(source);
+// 		if !invalid {
+// 			assert!(
+// 				!before.diagnostics.iter().any(|d| d
+// 					.code
+// 					.as_deref()
+// 					.is_some_and(|code| code.starts_with('E'))),
+// 				"{:#?}",
+// 				before.diagnostics
+// 			);
+// 		}
+// 		assert_eq!(
+// 			before.diagnostics.iter().any(|d| d.code.as_deref()
+// 				== Some(DiagnosticCode::UnusedValue.code())),
+// 			invalid,
+// 			"{:#?}",
+// 			before.diagnostics
+// 		);
+// 		for width in [30, 120] {
+// 			let output = checked_format(source, width, 4);
+// 			let (_, after) = build(&output);
+// 			let diagnostics = |tir: &TIR| {
+// 				tir.diagnostics
+// 					.iter()
+// 					.map(|d| (d.severity, d.code.clone(), d.message.clone()))
+// 					.collect::<Vec<_>>()
+// 			};
+// 			assert_eq!(diagnostics(&before), diagnostics(&after));
+// 			assert_eq!(
+// 				before
+// 					.items
+// 					.bodies
+// 					.iter()
+// 					.map(|b| b.block.ty)
+// 					.collect::<Vec<_>>(),
+// 				after
+// 					.items
+// 					.bodies
+// 					.iter()
+// 					.map(|b| b.block.ty)
+// 					.collect::<Vec<_>>()
+// 			);
+// 		}
+// 	}
+// }

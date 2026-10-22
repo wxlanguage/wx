@@ -390,7 +390,7 @@ mod tests {
 
 	fn test_func(uses: Vec<Vec<DataNodeIndex>>) -> Function {
 		let mut func =
-			Function::new(crate::ast::DefIdGenerator::new().generate(), 0);
+			Function::new(crate::ast::DefIdGenerator::new().next(), 0);
 		func.data_nodes = uses
 			.into_iter()
 			.map(|uses| crate::opt::DataNode {
@@ -434,7 +434,7 @@ mod tests {
 	#[test]
 	fn loop_param_after_edge_does_not_panic() {
 		let mut func =
-			Function::new(crate::ast::DefIdGenerator::new().generate(), 0);
+			Function::new(crate::ast::DefIdGenerator::new().next(), 0);
 		// node 0: LoopParam, before=constant (unused here), after=node 1.
 		// node 1: some pure expression computed inside the loop body,
 		// created *after* node 0's placeholder — records "node 0 is used

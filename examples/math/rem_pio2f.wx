@@ -18,7 +18,7 @@ const PIO2_1: f64 = 1.57079631090164184570e+00;
 // pi/2 - PIO2_1
 const PIO2_1T: f64 = 1.58932547735281966916e-08;
 
-pub fn rem_pio2f(x: f32) -> (i32, f64) {
+pub func rem_pio2f(x: f32) -> (i32, f64) {
     local x64: f64 = x.promote();
     local ix: u32 = x.to_bits() & 0x7fffffff;
 

@@ -13,7 +13,7 @@ fn main() {
 	// indentation/newlines (what the whitespace-skip path exercises).
 	let unit = r#"
 /// Compute something over the given inputs.
-fn transform(count: i32, scale: f64) -> f64 {
+func transform(count: i32, scale: f64) -> f64 {
     local mut total = 0.0;
     local limit = 0xFF_u32;
     local mask  = 0b1010_1010;

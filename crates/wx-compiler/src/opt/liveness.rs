@@ -99,20 +99,51 @@ fn mark_block_roots(
 				}
 				mark_block_roots(func, *body, live, worklist);
 			}
+			ControlNode::BlockJoin {
+				body,
+				outputs,
+				fallthrough_updates,
+				fallthrough_value,
+				result,
+			} => {
+				for &output in outputs.iter() {
+					mark_node_live(output, live, worklist);
+				}
+				// Unlike Loop (whose fallthrough is always Unit/Never by
+				// construction), a block-join's fallthrough can be a real
+				// value even when no phi was needed — mirrors IfElse's
+				// identical pattern above.
+				if outputs.is_empty() {
+					mark_stack_result_live(*result, live, worklist);
+				}
+				// The fallthrough's own raw contribution to the block's
+				// value phis — mirrors Break's own `value` field, marked
+				// unconditionally below regardless of whether a phi was
+				// actually needed for it.
+				mark_stack_result_live(*fallthrough_value, live, worklist);
+				// fallthrough_updates' `current` values have no other path
+				// to liveness: a JoinParam carries no back-reference to
+				// what was committed into it (unlike Phi/LoopParam).
+				for &(_, current) in fallthrough_updates.iter() {
+					mark_node_live(current, live, worklist);
+				}
+				mark_block_roots(func, *body, live, worklist);
+			}
 			ControlNode::Break {
 				value,
-				loop_param_updates,
+				carried_binding_updates,
 				..
 			} => {
 				mark_stack_result_live(*value, live, worklist);
-				for &(_, current) in loop_param_updates.iter() {
+				for &(_, current) in carried_binding_updates.iter() {
 					mark_node_live(current, live, worklist);
 				}
 			}
 			ControlNode::Continue {
-				loop_param_updates, ..
+				carried_binding_updates,
+				..
 			} => {
-				for &(_, current) in loop_param_updates.iter() {
+				for &(_, current) in carried_binding_updates.iter() {
 					mark_node_live(current, live, worklist);
 				}
 			}
@@ -269,6 +300,9 @@ fn mark_node_inputs_live(
 		| DataNodeKind::MemoryOffset { .. }
 		| DataNodeKind::MemoryIndex { .. }
 		| DataNodeKind::MemorySizeResult { .. }
-		| DataNodeKind::AggregateCallResult { .. } => {}
+		| DataNodeKind::AggregateCallResult { .. }
+		// JoinParam has no before/after (unlike LoopParam, above) and no
+		// operand fields of its own.
+		| DataNodeKind::JoinParam { .. } => {}
 	}
 }

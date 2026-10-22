@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use crate::mir;
 use crate::opt::liveness::DataLiveness;
 use crate::opt::{
-	BlockIndex, ControlNode, DataNode, DataNodeIndex, DataNodeKind, Function,
-	MemAccess, ScalarType, StackResult, SwitchCase,
+	BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function, MemAccess,
+	ScalarType, StackResult, SwitchCase,
 };
 use crate::wasm::{self, BlockType, Instruction, Local, MemArg};
 
@@ -51,7 +51,9 @@ pub struct Scheduler<'f> {
 	locals: Vec<Local>,
 	/// Maps a scalar data-node index to its WASM local index.
 	node_to_local: HashMap<DataNodeIndex, u32>,
-	/// Maps an aggregate data-node index to its per-field WASM local indices.
+	/// Maps an aggregate data-node index to one WASM local per *scalar* it
+	/// contains, in `mir::ScalarTable` order — not one per field, since a
+	/// nested field spans several scalars and a zero-sized field spans none.
 	node_to_aggregate_locals: HashMap<DataNodeIndex, Box<[u32]>>,
 	/// Output instruction stream.
 	body: Vec<Instruction>,
@@ -75,14 +77,16 @@ impl<'f> Scheduler<'f> {
 	pub fn schedule(func: &'f Function, mir: &'f mir::MIR) -> wasm::Function {
 		let sig = &mir.signatures[{
 			// Find the function's signature via its DefId.
-			mir.functions
-				.iter()
-				.find(|f| f.id == func.id)
-				.expect("function not found")
-				.signature_index as usize
+			usize::from(
+				mir.functions
+					.iter()
+					.find(|f| f.id == func.id)
+					.expect("function not found")
+					.signature_index,
+			)
 		}];
 
-		// Aggregate params are flattened to one local per field.
+		// Aggregate params are flattened to one local per scalar.
 		let locals: Vec<Local> = sig
 			.params()
 			.iter()
@@ -162,24 +166,29 @@ impl<'f> Scheduler<'f> {
 						DataNodeKind::AggregateCallResult {
 							aggregate_index,
 						} => {
-							// Multi-value return: fields arrive deepest-first; pop in
-							// reverse so each local.set captures the correct field.
+							// Multi-value return: one WASM value per scalar, not
+							// per field — a nested field returns several. This
+							// has to agree with the signature that
+							// `codegen::intern_signature` derived from the same
+							// `ScalarTable`. Values arrive deepest-first, so pop
+							// in reverse.
 							//
 							// Always spill: result may be referenced via control-node
 							// args (return, call) not tracked in DataNode::uses.
-							let mut locals = Vec::with_capacity(
-								self.mir.aggregates[aggregate_index as usize]
-									.values
-									.len(),
-							);
-							for &t in self.mir.aggregates
-								[aggregate_index as usize]
-								.values
+							let scalar_types: Vec<ScalarType> = self
+								.mir
+								.aggregate(aggregate_index)
+								.scalars
 								.iter()
-								.rev()
-							{
-								let ty = ScalarType::try_from(t)
-									.expect("field must be scalar");
+								.map(|scalar| {
+									ScalarType::try_from(scalar.ty).expect(
+										"a ScalarTable entry is scalar by construction",
+									)
+								})
+								.collect();
+							let mut locals =
+								Vec::with_capacity(scalar_types.len());
+							for ty in scalar_types.into_iter().rev() {
 								let local = self.alloc_local(ty);
 								self.body.push(Instruction::LocalSet(local));
 								locals.push(local);
@@ -192,9 +201,7 @@ impl<'f> Scheduler<'f> {
 						}
 						_ => {
 							// Scalar result: spill to a local if used, drop otherwise.
-							if self.should_spill(
-								&self.func.data_nodes[*result_node as usize],
-							) {
+							if self.should_spill(*result_node) {
 								let ty = self.func.data_nodes
 									[*result_node as usize]
 									.kind
@@ -391,7 +398,7 @@ impl<'f> Scheduler<'f> {
 				// Break handlers inside the body can write to them before `br`.
 				for phi in self
 					.func
-					.loop_data(*body)
+					.join_data(*body)
 					.break_result_outputs
 					.iter()
 					.copied()
@@ -441,49 +448,108 @@ impl<'f> Scheduler<'f> {
 				self.body.push(Instruction::End); // Block
 			}
 
-			ControlNode::Break {
-				target,
-				value,
-				loop_param_updates,
+			ControlNode::BlockJoin {
+				body,
+				outputs,
+				fallthrough_updates,
+				fallthrough_value,
+				result: _,
 			} => {
-				if let StackResult::Value(v) = value {
-					// Store break value into phi locals; LocalSet in reverse
-					// because emit_value pushes fields lowest-first.
-					let n_phis =
-						self.func.loop_data(*target).break_result_outputs.len();
-					if n_phis > 0 {
+				// Every genuinely divergent binding always goes through a
+				// pre-allocated local — same convention IfElse/Switch/Loop
+				// already follow when they have phi outputs, applied
+				// unconditionally here (an arbitrary, not statically
+				// enumerable, number of exits can reach this join, exactly
+				// like Loop's break-exits). Unlike Loop's own outputs,
+				// JoinParam has no `before` value to initialize with — it's
+				// only ever a write target, never read during construction
+				// (see `DataNodeKind::JoinParam`'s doc comment) — so a plain
+				// `pre_alloc_phi_outputs` (no init store) is exactly right.
+				self.pre_alloc_phi_outputs(outputs);
+
+				// Also pre-allocate locals for the block's own *value* phis
+				// (break_result_outputs — the merged result of every
+				// `break <value>` plus the fallthrough's own tail value),
+				// mirroring Loop's identical separate pre-allocation step
+				// above. Cloned out first to avoid borrowing `self.func`
+				// and `self` mutably at once.
+				let break_result_outputs: Vec<DataNodeIndex> =
+					self.func.join_data(*body).break_result_outputs.clone();
+				self.pre_alloc_phi_outputs(&break_result_outputs);
+
+				self.body.push(Instruction::Block {
+					ty: BlockType::Empty,
+				});
+				self.emit_block(*body);
+
+				// The fallthrough's own contribution to the block's *value*
+				// phis — mirrors exactly what `Break`'s handler does with its
+				// own `value` field, just at the tail of the body instead of
+				// before a `br` (falling off the end has no `ControlNode` of
+				// its own to carry this, hence `fallthrough_value` living on
+				// `BlockJoin` itself).
+				if let StackResult::Value(v) = fallthrough_value {
+					if !break_result_outputs.is_empty() {
 						self.emit_value(*v);
-						for phi in self
-							.func
-							.loop_data(*target)
-							.break_result_outputs
-							.iter()
-							.copied()
-							.rev()
-						{
+						for phi in break_result_outputs.iter().copied().rev() {
 							let phi_local =
 								*self.node_to_local.get(&phi).expect(
-									"break result phi local must be pre-allocated by Loop handler",
+									"break result phi local must be pre-allocated by the Loop/BlockJoin handler",
 								);
 							self.body.push(Instruction::LocalSet(phi_local));
 						}
 					}
 				}
-				// This break's own current values for the target loop's
-				// carried bindings — committed here because the loop's normal
-				// "commit, then branch back" tail code only runs on ordinary
-				// fallthrough, which this `br` bypasses entirely. See
-				// `Builder::loop_param_updates`.
-				self.emit_loop_param_updates(loop_param_updates);
+
+				// The fallthrough path's own commit — same role as a
+				// break/continue's carried_binding_updates, but unconditional
+				// at the tail of the body (falling off the end has no
+				// ControlNode of its own to attach this to).
+				self.emit_carried_binding_updates(fallthrough_updates);
+				self.body.push(Instruction::End);
+			}
+
+			ControlNode::Break {
+				target,
+				value,
+				carried_binding_updates,
+			} => {
+				if let StackResult::Value(v) = value {
+					// Store break value into phi locals; LocalSet in reverse
+					// because emit_value pushes fields lowest-first.
+					let n_phis =
+						self.func.join_data(*target).break_result_outputs.len();
+					if n_phis > 0 {
+						self.emit_value(*v);
+						let phis: Vec<DataNodeIndex> = self
+							.func
+							.join_data(*target)
+							.break_result_outputs
+							.clone();
+						for phi in phis.into_iter().rev() {
+							let phi_local =
+								*self.node_to_local.get(&phi).expect(
+									"break result phi local must be pre-allocated by the Loop/BlockJoin handler",
+								);
+							self.body.push(Instruction::LocalSet(phi_local));
+						}
+					}
+				}
+				// This break's own current values for the target's carried
+				// bindings — committed here because the target's normal
+				// "commit, then branch back/fall through" tail code only
+				// runs on the ordinary path, which this `br` bypasses
+				// entirely. See `Builder::carried_binding_updates`.
+				self.emit_carried_binding_updates(carried_binding_updates);
 				let depth = self.break_depth(block_idx, *target);
 				self.body.push(Instruction::Br(depth));
 			}
 
 			ControlNode::Continue {
 				target,
-				loop_param_updates,
+				carried_binding_updates,
 			} => {
-				self.emit_loop_param_updates(loop_param_updates);
+				self.emit_carried_binding_updates(carried_binding_updates);
 				let depth = self.continue_depth(block_idx, *target);
 				self.body.push(Instruction::Br(depth));
 			}
@@ -508,7 +574,7 @@ impl<'f> Scheduler<'f> {
 			} => {
 				self.emit_value(*delta);
 				self.body.push(Instruction::MemoryGrow(*memory));
-				if self.should_spill(&self.func.data_nodes[*result as usize]) {
+				if self.should_spill(*result) {
 					let ty = self.func.data_nodes[*result as usize]
 						.kind
 						.unwrap_scalar();
@@ -780,7 +846,7 @@ impl<'f> Scheduler<'f> {
 			if !self.func.data_nodes[node as usize].kind.is_pure() {
 				continue;
 			}
-			if !self.should_spill(&self.func.data_nodes[node as usize]) {
+			if !self.should_spill(node) {
 				continue;
 			}
 			let mut blocks_iter = entries.iter().map(|&(b, _)| b);
@@ -818,11 +884,12 @@ impl<'f> Scheduler<'f> {
 	}
 
 	/// Reverse lookup from a nested block to the `(parent_block,
-	/// statement_index)` of the `IfElse`/`Switch`/`Loop` statement that owns
-	/// it — the position `owning_statement_index` walks toward when
-	/// resolving a descendant reader up to some ancestor block. Built once,
-	/// in a single forward pass over every block's own statements; `None`
-	/// for the function's root block, which has no owning statement.
+	/// statement_index)` of the `IfElse`/`Switch`/`Loop`/`BlockJoin`
+	/// statement that owns it — the position `owning_statement_index` walks
+	/// toward when resolving a descendant reader up to some ancestor block.
+	/// Built once, in a single forward pass over every block's own
+	/// statements; `None` for the function's root block, which has no
+	/// owning statement.
 	fn compute_child_owning_stmt(&self) -> Vec<Option<(BlockIndex, u32)>> {
 		let mut table = vec![None; self.func.blocks.len()];
 		for block_idx in 0..self.func.blocks.len() as BlockIndex {
@@ -847,7 +914,8 @@ impl<'f> Scheduler<'f> {
 							table[case.block as usize] = Some((block_idx, i));
 						}
 					}
-					ControlNode::Loop { body, .. } => {
+					ControlNode::Loop { body, .. }
+					| ControlNode::BlockJoin { body, .. } => {
 						table[*body as usize] = Some((block_idx, i));
 					}
 					_ => {}
@@ -1059,9 +1127,39 @@ impl<'f> Scheduler<'f> {
 						);
 					}
 				}
+				ControlNode::BlockJoin {
+					body,
+					outputs,
+					fallthrough_updates,
+					..
+				} => {
+					// JoinParam nodes themselves are impure (excluded from
+					// placement entirely); nothing pure to record for
+					// `outputs` here — mirrors Loop, above.
+					for &o in outputs.iter() {
+						record_read(
+							&mut consuming_blocks[o as usize],
+							block_idx,
+							i,
+						);
+					}
+					// fallthrough_updates is computed at the join block's
+					// own tail, not at the statement holding this
+					// ControlNode — mirrors how IfElse's phi sources
+					// (above) are recorded against then_block/else_block's
+					// own tail, not the parent's position.
+					let body_tail = self.block_tail(*body);
+					for &(_, current) in fallthrough_updates.iter() {
+						record_read(
+							&mut consuming_blocks[current as usize],
+							*body,
+							body_tail,
+						);
+					}
+				}
 				ControlNode::Break {
 					value,
-					loop_param_updates,
+					carried_binding_updates,
 					..
 				} => {
 					if let StackResult::Value(n) = value {
@@ -1071,7 +1169,7 @@ impl<'f> Scheduler<'f> {
 							i,
 						);
 					}
-					for &(_, current) in loop_param_updates.iter() {
+					for &(_, current) in carried_binding_updates.iter() {
 						record_read(
 							&mut consuming_blocks[current as usize],
 							block_idx,
@@ -1080,9 +1178,10 @@ impl<'f> Scheduler<'f> {
 					}
 				}
 				ControlNode::Continue {
-					loop_param_updates, ..
+					carried_binding_updates,
+					..
 				} => {
-					for &(_, current) in loop_param_updates.iter() {
+					for &(_, current) in carried_binding_updates.iter() {
 						record_read(
 							&mut consuming_blocks[current as usize],
 							block_idx,
@@ -1250,7 +1349,8 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::MemoryIndex { .. }
 			| DataNodeKind::MemorySizeResult { .. }
 			| DataNodeKind::AggregateCallResult { .. }
-			| DataNodeKind::LoopParam { .. } => {}
+			| DataNodeKind::LoopParam { .. }
+			| DataNodeKind::JoinParam { .. } => {}
 		}
 	}
 
@@ -1360,7 +1460,7 @@ impl<'f> Scheduler<'f> {
 			}
 			return;
 		}
-		if self.should_spill(&self.func.data_nodes[node as usize]) {
+		if self.should_spill(node) {
 			let local = self.ensure_local(node);
 			self.body.push(Instruction::LocalGet(local));
 			return;
@@ -1847,42 +1947,17 @@ impl<'f> Scheduler<'f> {
 			}
 
 			DataNodeKind::AggregateGet {
-				aggregate,
-				field_index,
-				..
+				aggregate, scalar, ..
 			} => {
-				// Ensure the aggregate's per-*leaf* locals are populated (see
-				// `ensure_aggregate_locals`), then find the one belonging to
-				// this (always-scalar, per `get_aggregate_field`) top-level
-				// field: `node_to_aggregate_locals` is flattened, so a field
-				// preceded by a nested-aggregate sibling doesn't sit at
-				// `field_index` directly — skip past every leaf contributed
-				// by earlier sibling fields first.
+				// `node_to_aggregate_locals` holds one local per WASM value in
+				// `ScalarTable` order, and `scalar` indexes that same order —
+				// so this is a direct lookup. It used to be a field index,
+				// which meant re-deriving the field-to-value mapping here on
+				// every emission.
 				self.ensure_aggregate_locals(aggregate);
-				let aggregate_index =
-					match &self.func.data_nodes[aggregate as usize].kind {
-						DataNodeKind::Aggregate {
-							aggregate_index, ..
-						}
-						| DataNodeKind::AggregateCallResult {
-							aggregate_index,
-						} => *aggregate_index,
-						_ => unreachable!(
-							"AggregateGet::aggregate must itself be an aggregate node"
-						),
-					};
-				let leaf_offset: usize = self.mir.aggregates
-					[aggregate_index as usize]
-					.values[..field_index as usize]
-					.iter()
-					.map(|&t| {
-						wasm::flatten_type_to_scalars(t, &self.mir.aggregates)
-							.len()
-					})
-					.sum();
-				let field_local =
-					self.node_to_aggregate_locals[&aggregate][leaf_offset];
-				self.body.push(Instruction::LocalGet(field_local));
+				let local = self.node_to_aggregate_locals[&aggregate]
+					[usize::from(scalar)];
+				self.body.push(Instruction::LocalGet(local));
 			}
 
 			DataNodeKind::Phi { .. } => {
@@ -1896,6 +1971,21 @@ impl<'f> Scheduler<'f> {
 				// Unmodified loop param (before == after, should_spill = false):
 				// the value never changes, so just re-emit the `before` value directly.
 				self.emit_value(before);
+			}
+
+			DataNodeKind::JoinParam { .. } => {
+				// Unlike LoopParam, a JoinParam has no "before" value to fall
+				// back to — it's never read during construction (see its own
+				// doc comment), only ever committed to by an exit. By
+				// construction, `should_spill` (above) is exact for this
+				// kind: a JoinParam only ever reaches `emit_value` when it's
+				// genuinely divergent, and a genuinely divergent one always
+				// has a pre-allocated local, so `should_spill` returns true
+				// and this arm is never actually reached — if it ever is,
+				// that's a real bug upstream, not something to paper over.
+				unreachable!(
+					"JoinParam reached emit_value_inline: should_spill should always be true for a JoinParam actually referenced"
+				)
 			}
 
 			DataNodeKind::CallResult { .. }
@@ -1918,8 +2008,8 @@ impl<'f> Scheduler<'f> {
 
 	/// Returns true if this node must be computed into a WASM local rather than
 	/// inlined at each use site.
-	fn should_spill(&self, node: &DataNode) -> bool {
-		match &node.kind {
+	fn should_spill(&self, idx: DataNodeIndex) -> bool {
+		match &self.func.data_nodes[idx as usize].kind {
 			// Constants and params are always cheaper to re-emit than to spill.
 			DataNodeKind::Int { .. }
 			| DataNodeKind::Float { .. }
@@ -1928,8 +2018,34 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::StaticDataRef { .. }
 			| DataNodeKind::MemoryOffset { .. } => false,
 
-			// Loop params whose before == after were never modified; skip.
-			DataNodeKind::LoopParam { before, after, .. } => before != after,
+			// A loop param needs a local exactly when `patch_loop_binding`
+			// (opt/builder.rs) decided it was loop-carried and pushed it into
+			// `ControlNode::Loop::outputs` — which is exactly when the owning
+			// `Loop` handler pre-allocated it a local, below (~line 389). By
+			// the time any reference to a LoopParam reaches here, that
+			// handler has always already run (a loop's own body is scheduled
+			// after its pre-allocation loop, and any reference after the
+			// loop is later still), so this is an exact check — not the
+			// `before != after` shortcut this used to be: that comparison
+			// alone misses a binding a `break`/`continue` mutated on a path
+			// the fallthrough happens to leave unchanged (see
+			// `JoinData::divergent_params`), which `outputs`/pre-allocation
+			// already correctly account for.
+			DataNodeKind::LoopParam { .. } => {
+				self.node_to_local.contains_key(&idx)
+			}
+
+			// A join param needs a local exactly when it was found genuinely
+			// divergent and pushed into `ControlNode::BlockJoin::outputs` —
+			// same reasoning as `LoopParam`, above. Deliberately *not* left
+			// to the `uses.len() > 1` catch-all below: `register_uses` never
+			// populates a `JoinParam`'s `.uses` at all (it has no operand
+			// fields — see `Function::register_uses`), so the catch-all
+			// would always read `uses.len() == 0` and wrongly return `false`
+			// even for a genuinely divergent, pre-allocated one.
+			DataNodeKind::JoinParam { .. } => {
+				self.node_to_local.contains_key(&idx)
+			}
 
 			// Phi nodes that folded away (left == right) don't need a local.
 			DataNodeKind::Phi { left, right, .. } => left != right,
@@ -1953,22 +2069,22 @@ impl<'f> Scheduler<'f> {
 			// read's descendants), and subsequent uses read the saved local.
 			DataNodeKind::GlobalGet { .. } => true,
 
-			// Aggregates live in per-field locals, not on the stack.
+			// Aggregates live in per-scalar locals, not on the stack.
 			DataNodeKind::Aggregate { .. } => true,
 
 			// For all other ops: spill only if the result is consumed more than once.
-			_ => node.uses.len() > 1,
+			_ => self.func.data_nodes[idx as usize].uses.len() > 1,
 		}
 	}
 
-	/// Ensure per-*leaf* WASM locals exist for an `Aggregate` node.
+	/// Ensure per-*scalar* WASM locals exist for an `Aggregate` node.
 	/// Emits each scalar field expression and spills it to a fresh local; a
 	/// field that is itself an aggregate has no local of its own — it's
-	/// walked into recursively, and its own (already- or newly-computed)
-	/// leaf locals are spliced in directly, so `node_to_aggregate_locals`
-	/// always ends up holding one entry per *leaf* scalar, flattened in the
-	/// same pre-order as `wasm::flatten_type_to_scalars`. Records the mapping in
-	/// `node_to_aggregate_locals`.
+	/// walked into recursively and its own (already- or newly-computed)
+	/// locals are spliced in directly, and a zero-sized field contributes
+	/// none. So `node_to_aggregate_locals` always ends up holding one entry
+	/// per scalar, in the same order as the aggregate's `mir::ScalarTable`,
+	/// which is what lets `AggregateGet`'s `ScalarIndex` index it directly.
 	///
 	/// For `AggregateCallResult` nodes this must never be called — their locals
 	/// are populated by `emit_control` when the call instruction is emitted.
@@ -1991,19 +2107,20 @@ impl<'f> Scheduler<'f> {
 					"ensure_aggregate_locals called on non-aggregate node"
 				),
 			};
-		let mut locals = Vec::with_capacity(fields.len());
-		for (i, &field_node) in fields.iter().enumerate() {
-			let field_ty =
-				self.mir.aggregates[aggregate_index as usize].values[i];
-			match field_ty {
-				mir::Type::Aggregate { .. } => {
+		let mir = self.mir;
+		let agg = mir.aggregate(aggregate_index);
+		let mut locals = Vec::with_capacity(agg.scalars.len());
+		for (field, &field_node) in agg.fields.iter().zip(fields.iter()) {
+			match field.ty {
+				mir::ValueType::Unit | mir::ValueType::Never => {}
+				mir::ValueType::Aggregate { .. } => {
 					self.ensure_aggregate_locals(field_node);
 					locals.extend_from_slice(
 						&self.node_to_aggregate_locals[&field_node],
 					);
 				}
-				_ => {
-					let scalar_ty = ScalarType::try_from(field_ty)
+				ty => {
+					let scalar_ty = ScalarType::try_from(ty)
 						.expect("non-aggregate field must be scalar");
 					self.emit_value(field_node);
 					let local = self.alloc_local(scalar_ty);
@@ -2073,12 +2190,13 @@ impl<'f> Scheduler<'f> {
 		}
 	}
 
-	/// Commits a `break`/`continue` site's own current values for its target
-	/// loop's carried bindings, immediately before the `br` that leaves the
-	/// current block. See `Builder::loop_param_updates` for why every such
-	/// site must do this independently rather than relying on the loop's own
-	/// (fallthrough-only) tail code.
-	fn emit_loop_param_updates(
+	/// Commits a `break`/`continue` site's own current values for its
+	/// target's carried bindings, immediately before the `br` that leaves
+	/// the current block — or, for a block-join's fallthrough, immediately
+	/// before falling off the end. See `Builder::carried_binding_updates`
+	/// for why every such site must do this independently rather than
+	/// relying on the target's own (ordinary-path-only) tail code.
+	fn emit_carried_binding_updates(
 		&mut self,
 		updates: &[(DataNodeIndex, DataNodeIndex)],
 	) {
@@ -2094,7 +2212,7 @@ impl<'f> Scheduler<'f> {
 		}
 		for &(param, _) in updates.iter().rev() {
 			let local = *self.node_to_local.get(&param).expect(
-				"loop param local must be pre-allocated by the Loop handler",
+				"carried binding local must be pre-allocated by the Loop/BlockJoin handler",
 			);
 			self.body.push(Instruction::LocalSet(local));
 		}
@@ -2281,7 +2399,11 @@ impl<'f> Scheduler<'f> {
 
 	// ── Index resolution ───────────────────────────────────────────────────────
 
-	fn emit_call(&mut self, callee_node: DataNodeIndex, callee_sig: u32) {
+	fn emit_call(
+		&mut self,
+		callee_node: DataNodeIndex,
+		callee_sig: mir::SignatureIndex,
+	) {
 		match &self.func.data_nodes[callee_node as usize].kind {
 			DataNodeKind::FunctionRef { id } => {
 				self.body.push(Instruction::Call(*id));

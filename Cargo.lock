@@ -2240,9 +2240,11 @@ name = "wx-compiler"
 version = "0.5.0"
 dependencies = [
  "codespan-reporting",
+ "hashbrown 0.17.1",
  "indoc",
  "insta",
  "leb128fmt",
+ "rustc-hash",
  "serde",
  "serde_json",
  "string-interner",

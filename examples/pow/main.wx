@@ -1,6 +1,6 @@
 use std::*;
 
-pub fn pow(base: i32, mut exp: i32) -> i32 {
+pub func pow(base: i32, mut exp: i32) -> i32 {
   if exp < 0 { return 0 };
 
   local mut result: i32 = 1;

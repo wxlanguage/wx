@@ -1,10 +1,60 @@
-fn factorial(n: i32) -> i32 {
-  if n <= 1 {
-    return 1
-  }
-  n * factorial(n - 1)
-}
+// func factorial(n: i32) -> i32 {
+//     if n <= 1 { return 1 };
+//     n * factorial(n - 1)
+// }
 
-export {
-  factorial
-}
+// export {
+//     factorial
+// }
+
+// variant Option<T> {
+//     Some(T),
+//     None,
+// }
+
+// struct X(i32, i32);
+
+// trait PartialOrd {
+//     func partial_cmp(self: Self, other: Self) -> Option<Ordering>;
+
+//     func lt(self: Self, other: Self) -> bool {
+//         self.partial_cmp(other) == Some(Ordering::Less)
+//     }
+
+//     func le(self: Self, other: Self) -> bool {
+//         self.partial_cmp(other) != Some(Ordering::Greater)
+//     }
+
+//     func gt(self: Self, other: Self) -> bool {
+//         self.partial_cmp(other) == Some(Ordering::Greater)
+//     }
+
+//     func ge(self: Self, other: Self) -> bool {
+//         self.partial_cmp(other) != Some(Ordering::Less)
+//     }
+// }
+
+// pub enum Ordering: i8 {
+//     Less = -1,
+//     Equal = 0,
+//     Greater = 1,
+// }
+
+// pub trait Ord: PartialOrd {
+//     func cmp(self: Self, other: Self) -> Ordering;
+
+//     func min(self: Self, other: Self) -> Self {
+//         if self < other { self } else { other }
+//     }
+
+//     func max(self: Self, other: Self) -> Self {
+//         if self < other { self } else { other }
+//     }
+
+//     func clamp(self: Self, min: Self, max: Self) -> Self {
+//         if min < max { trap() };
+//         if self < min { return min };
+//         if self > max { return max };
+//         self
+//     }
+// }

@@ -14,7 +14,7 @@ const S3_PIO2: f64 = 3. * f64::FRAC_PI_2; // 0x4012D97C, 0x7F3321D2
 const S4_PIO2: f64 = 4. * f64::FRAC_PI_2; // 0x401921FB, 0x54442D18
 
 /// The sine of `x`, with `x` in radians.
-pub fn sinf(x: f32) -> f32 {
+pub func sinf(x: f32) -> f32 {
     local x64 = x.promote();
 
     local mut ix = x.to_bits();
