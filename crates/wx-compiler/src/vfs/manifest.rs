@@ -36,20 +36,18 @@ pub struct PackageManifest {
 /// the reverse, so this crate has no way to name that type. `wx-fmt` reads
 /// this struct directly and overlays whatever's `Some` onto
 /// `RendererConfig::default()`; there's deliberately no second, duplicate
-/// set of these three fields anywhere.
+/// set of these fields anywhere.
 ///
 /// Every field optional and defaulted, at both the struct level (a manifest
 /// with no `"format"` key at all) and per-field (one that sets only e.g.
 /// `max_line_width`) — a manifest should be able to override a single
-/// setting without restating the other two.
+/// setting without restating the other.
 #[derive(serde::Deserialize, Default, Clone, Copy)]
 pub struct FormatManifest {
 	#[serde(default)]
 	pub max_line_width: Option<u32>,
 	#[serde(default)]
 	pub indent_width: Option<u8>,
-	#[serde(default)]
-	pub trailing_comma: Option<bool>,
 }
 
 /// A `dependencies` key: the name a package is known by inside the package
@@ -224,7 +222,6 @@ mod tests {
 
 		assert_eq!(manifest.format.max_line_width, None);
 		assert_eq!(manifest.format.indent_width, None);
-		assert_eq!(manifest.format.trailing_comma, None);
 	}
 
 	#[test]
@@ -235,8 +232,7 @@ mod tests {
 				"entry": "main.wx",
 				"format": {
 					"max_line_width": 100,
-					"indent_width": 2,
-					"trailing_comma": false
+					"indent_width": 2
 				}
 			}"#,
 		)
@@ -244,11 +240,10 @@ mod tests {
 
 		assert_eq!(manifest.format.max_line_width, Some(100));
 		assert_eq!(manifest.format.indent_width, Some(2));
-		assert_eq!(manifest.format.trailing_comma, Some(false));
 	}
 
 	/// A manifest should be able to override a single setting without
-	/// restating the other two.
+	/// restating the other.
 	#[test]
 	fn manifest_format_section_fields_are_individually_optional() {
 		let manifest = PackageManifest::parse(
@@ -262,7 +257,6 @@ mod tests {
 
 		assert_eq!(manifest.format.max_line_width, Some(100));
 		assert_eq!(manifest.format.indent_width, None);
-		assert_eq!(manifest.format.trailing_comma, None);
 	}
 
 	#[test]

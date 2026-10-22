@@ -54,7 +54,7 @@ cargo clippy --workspace --no-deps -- -D warnings
 cargo fmt
 ```
 
-Current baseline (mid-refactor, see below): 797 `wx-compiler` and 55 `wx-fmt` tests pass; `wx-lsp`/`wx-cli` do not compile and clippy is not clean (hundreds of dead-code warnings from the disabled stages). The earlier 1023 + 43 + 63 baseline predates the TIR rewrite.
+Current baseline (mid-refactor, see below): 799 `wx-compiler` and 59 `wx-fmt` tests pass; `wx-lsp`/`wx-cli` do not compile and clippy is not clean (hundreds of dead-code warnings from the disabled stages). The earlier 1023 + 43 + 63 baseline predates the TIR rewrite.
 
 ## Crates & binaries
 
@@ -95,8 +95,7 @@ Every compilation is rooted at a **package**, and every package needs a `wx.json
   },
   "format": {                // all optional; each falls back to RendererConfig::default
     "max_line_width": 80,
-    "indent_width": 4,
-    "trailing_comma": true
+    "indent_width": 4
   }
 }
 ```

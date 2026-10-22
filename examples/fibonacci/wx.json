@@ -3,7 +3,6 @@
   "entry": "main.wx",
   "format": {
     "max_line_width": 60,
-    "indent_width": 4,
-    "trailing_comma": false
+    "indent_width": 4
   }
 }

@@ -51,7 +51,6 @@ fn test_format_simple_function() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -64,7 +63,7 @@ fn test_format_simple_function() {
             export {
                 add,
                 add as \"plus\",
-                minus
+                minus,
             }
         "}
 	);
@@ -91,7 +90,6 @@ fn test_format_use_trees() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(output, source);
@@ -120,7 +118,6 @@ fn test_format_import_block() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -138,7 +135,7 @@ fn test_format_import_block() {
             }
 
             export {
-                main
+                main,
             }
         "}
 	);
@@ -158,7 +155,6 @@ fn test_format_single_import_function_stays_inline() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -191,7 +187,6 @@ fn test_format_module_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -229,7 +224,6 @@ fn test_format_impl_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -269,7 +263,6 @@ fn test_format_trait_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -302,7 +295,6 @@ fn test_format_where_clause_assoc_type_bound() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -344,7 +336,6 @@ fn test_format_qualified_path() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -375,7 +366,6 @@ fn test_format_const_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -404,7 +394,6 @@ fn test_format_enum_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -433,7 +422,6 @@ fn test_format_struct_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -465,7 +453,6 @@ fn test_format_parameter_and_field_slots() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -494,7 +481,6 @@ fn test_format_typeset_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -518,7 +504,6 @@ fn test_format_typeset_with_bound_clause() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -560,7 +545,6 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -601,7 +585,6 @@ fn test_format_generic_struct_stays_inline() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -637,7 +620,6 @@ fn test_format_generic_function() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -669,7 +651,6 @@ fn test_format_struct_init() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -703,7 +684,6 @@ fn test_format_struct_init_block_value() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -741,7 +721,6 @@ fn test_format_local_patterns() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -782,7 +761,6 @@ fn test_format_pattern_constants() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -817,7 +795,6 @@ fn test_format_impl_trait_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -850,7 +827,6 @@ fn test_format_block_like_statement_semicolon() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -877,7 +853,6 @@ fn test_format_block_like_statement_semicolon() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -902,7 +877,6 @@ fn test_format_call_args_wrap() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -965,7 +939,6 @@ fn test_format_local_definition_wraps() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -1047,7 +1020,6 @@ fn test_format_inline_blocks() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -1119,7 +1091,6 @@ fn test_format_keeps_pub_on_memory_and_global() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -1149,7 +1120,6 @@ fn test_format_memory_config() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -1189,7 +1159,6 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -1419,7 +1388,7 @@ fn test_format_comments_preserved() {
                 // leading comment
                 heap,
                 // middle comment
-                other
+                other,
                 // trailing comment
             }
         "},
@@ -1575,7 +1544,6 @@ fn test_format_long_type_params_wrap() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -1604,7 +1572,6 @@ fn test_format_address_of() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -1634,7 +1601,6 @@ fn test_format_impl_trait_multi_segment() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -1666,7 +1632,6 @@ fn test_format_impl_trait_generic_type_params() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert_eq!(
@@ -1707,7 +1672,6 @@ fn test_format_deep_indent_past_max_width_does_not_panic() {
 		RendererConfig {
 			max_line_width: 10,
 			indent_width: 4,
-			trailing_comma: true,
 		},
 	);
 	assert!(!output.is_empty());
@@ -2243,7 +2207,6 @@ fn export_aliases_preserve_their_quoted_source_spelling() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -2267,7 +2230,6 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
-				trailing_comma: true,
 			},
 		)
 	};
@@ -2306,7 +2268,6 @@ fn checked_format(source: &str, width: u32, indent: u8) -> String {
 	let config = RendererConfig {
 		max_line_width: width,
 		indent_width: indent,
-		..RendererConfig::default()
 	};
 	let output = format(&case.ast, &case.interner, source, config);
 	let reparsed = TestCase::new(&output);
@@ -2413,7 +2374,19 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 			E::NamedCall { arguments: a, .. },
 			E::NamedCall { arguments: b, .. },
 		) => {
+			assert_eq!(a.len(), b.len());
 			for (a, b) in a.iter().zip(b) {
+				if let (Some(a), Some(b)) =
+					(&a.inner.inner.value, &b.inner.inner.value)
+				{
+					preserve_roles(&a.inner, &b.inner);
+				}
+			}
+		}
+		(E::NamedMethodCall(a), E::NamedMethodCall(b)) => {
+			preserve_roles(&a.object.inner, &b.object.inner);
+			assert_eq!(a.arguments.len(), b.arguments.len());
+			for (a, b) in a.arguments.iter().zip(&b.arguments) {
 				if let (Some(a), Some(b)) =
 					(&a.inner.inner.value, &b.inner.inner.value)
 				{
@@ -2751,6 +2724,165 @@ two" }"#,
 		assert!(output.starts_with("func f() {\n"), "{output}");
 		assert!(output.contains("one\ntwo"), "{output}");
 	}
+}
+
+/// A call by name that fits stays on one line, whatever its callee: a path,
+/// a qualified path, a method with or without a turbofish, a receiver named
+/// `self`, shorthand and an empty list. Spacing and line breaks in the source
+/// don't matter.
+#[test]
+fn a_call_by_name_that_fits_stays_on_one_line() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() {
+                    g({b:1,a});
+                    geom::make({ x : 1 , y });
+                    <T as Make>::make({self: x});
+                    Self::m({ self });
+                    x.m({ y , z:2 });
+                    x.m::<u32>({ a });
+                    h({});
+                    g({
+                        a: 1,
+                        b: 2,
+                    });
+                }
+            "},
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                g({ b: 1, a });
+                geom::make({ x: 1, y });
+                <T as Make>::make({ self: x });
+                Self::m({ self });
+                x.m({ y, z: 2 });
+                x.m::<u32>({ a });
+                h({});
+                g({ a: 1, b: 2 });
+            }
+        "},
+	);
+}
+
+/// A call by name that doesn't fit puts each argument on a line of its own,
+/// with a trailing comma, its braces hugging the parentheses. Wherever it
+/// stands, the call itself stays where it starts: a local's value doesn't
+/// move below the `=`. An argument that fits stays flat.
+#[test]
+fn a_call_by_name_that_does_not_fit_breaks_one_argument_per_line() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() -> u32 {
+                    connect({ host: primary_host, port: 8080, retries: 3 });
+                    local c = connect({ host: primary_host, port: 8080 });
+                    socket.send({ payload: buffer, flags: 0, timeout: 30 });
+                    open({ path: read_path({ dir: a, name: b }), mode: 0 });
+                    return connect({ host: primary_host, port: 8080 });
+                }
+            "},
+			50,
+			4,
+		),
+		indoc! {"
+            func f() -> u32 {
+                connect({
+                    host: primary_host,
+                    port: 8080,
+                    retries: 3,
+                });
+                local c = connect({
+                    host: primary_host,
+                    port: 8080,
+                });
+                socket.send({
+                    payload: buffer,
+                    flags: 0,
+                    timeout: 30,
+                });
+                open({
+                    path: read_path({ dir: a, name: b }),
+                    mode: 0,
+                });
+                return connect({
+                    host: primary_host,
+                    port: 8080,
+                });
+            }
+        "},
+	);
+}
+
+/// A call by name that is the only argument of a call hugs it: the outer
+/// parentheses wrap its braces with no line of their own.
+#[test]
+fn a_call_by_name_hugs_the_call_it_is_the_only_argument_of() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() {
+                    wrap(make({ alpha: 1000000, beta: 2000000, gamma: 3 }));
+                    wrap(x.m({ alpha: 1000000, beta: 2000000, gamma: 3 }));
+                }
+            "},
+			50,
+			4,
+		),
+		indoc! {"
+            func f() {
+                wrap(make({
+                    alpha: 1000000,
+                    beta: 2000000,
+                    gamma: 3,
+                }));
+                wrap(x.m({
+                    alpha: 1000000,
+                    beta: 2000000,
+                    gamma: 3,
+                }));
+            }
+        "},
+	);
+}
+
+/// An argument whose value is a block (`block`, `if`, `match`) can't share a
+/// line, so the call breaks however short it is, function or method alike.
+#[test]
+fn a_block_value_breaks_a_call_by_name() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f() {
+                    g({ a: block { y(); }, b: 2 });
+                    x.m({ a: if c { 1 } else { 2 } });
+                    g({ a: match v { _ -> { 1 } } });
+                }
+            "},
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                g({
+                    a: block {
+                        y();
+                    },
+                    b: 2,
+                });
+                x.m({
+                    a: if c { 1 } else { 2 },
+                });
+                g({
+                    a: match v {
+                        _ -> { 1 },
+                    },
+                });
+            }
+        "},
+	);
 }
 
 /// Forms that exist only in the current syntax, each written the way the

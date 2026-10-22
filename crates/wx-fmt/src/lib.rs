@@ -1803,9 +1803,9 @@ impl<'a> Builder<'a> {
 
 				let mut en: Vec<NodeId> =
 					vec![self.build_export_entry(&entry.inner.inner)];
-				if entry.separator.is_some() {
-					en.push(self.text(Text::Comma));
-				}
+				// An export block always breaks, so every entry ends with a
+				// comma, the last one included.
+				en.push(self.text(Text::Comma));
 				entry_items.push(self.arena.concat(en));
 			}
 
@@ -3051,7 +3051,6 @@ impl<'a> Builder<'a> {
 pub struct RendererConfig {
 	pub max_line_width: u32,
 	pub indent_width: u8,
-	pub trailing_comma: bool,
 }
 
 impl Default for RendererConfig {
@@ -3059,7 +3058,6 @@ impl Default for RendererConfig {
 		Self {
 			max_line_width: 80,
 			indent_width: 4,
-			trailing_comma: true,
 		}
 	}
 }
@@ -3080,9 +3078,6 @@ impl RendererConfig {
 				.max_line_width
 				.unwrap_or(default.max_line_width),
 			indent_width: format.indent_width.unwrap_or(default.indent_width),
-			trailing_comma: format
-				.trailing_comma
-				.unwrap_or(default.trailing_comma),
 		}
 	}
 }
