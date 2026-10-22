@@ -1135,6 +1135,27 @@ fn test_named_method_call_and_turbofish() {
 }
 
 #[test]
+fn a_receiver_is_given_by_name_as_self() {
+	// `self` names a method's receiver; any other keyword is no name.
+	let case = TestCase::new(indoc! {"
+        func f(s: S) {
+            S::m({ self: s, n: 1 });
+            S::m({ self });
+        }
+    "});
+	case.diagnostics().assert_none();
+	let stmts = case.function_block(0);
+	for index in 0..2 {
+		let (_, arguments) = named_call(statement_expression(stmts, index));
+		assert_eq!(case.name(arguments[0].inner.inner.name.inner), "self");
+	}
+
+	let case = TestCase::new("func f() { g({ loop: 1 }); }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
+}
+
+#[test]
 fn named_and_positional_arguments_do_not_mix() {
 	for source in [
 		"func f() { g({ a: 1 }, 2); }",
@@ -1807,6 +1828,32 @@ fn test_pattern_struct_destructuring() {
 			"(Point a ..)",
 		]
 	);
+}
+
+#[test]
+fn a_pattern_path_starts_where_an_expression_path_can() {
+	// `Self`, `crate` and `super` lead a path, and `super` continues one;
+	// any other keyword is no name.
+	let case = TestCase::new(indoc! {"
+        func f(p: Point) {
+            local Self(a, ..) = p;
+            local crate::geom::Point({ x, .. }) = p;
+            local super::super::Point(b, ..) = p;
+        }
+    "});
+	case.diagnostics().assert_none();
+	assert_eq!(
+		case.local_patterns(0),
+		[
+			"(Self a ..)",
+			"(crate::geom::Point { x, .. })",
+			"(super::super::Point b ..)",
+		]
+	);
+
+	let case = TestCase::new("func f(p: P) { local loop(a) = p; }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
 }
 
 #[test]

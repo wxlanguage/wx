@@ -2361,7 +2361,14 @@ mod tests {
 			)
 			.unwrap();
 		builder.set_stdlib(root_id);
-		builder.build(root_id)
+		let graph = builder.build(root_id);
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_parser_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		graph
 	}
 
 	/// Everything a `TypeContext` borrows, kept on the test's stack.

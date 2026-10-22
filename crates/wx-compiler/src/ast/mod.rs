@@ -3961,13 +3961,18 @@ impl<'ctx> Parser<'ctx> {
 		.parse(parser)
 	}
 
-	/// `name: expr`, or the shorthand `name` for `name: name`.
+	/// `name: expr`, or the shorthand `name` for `name: name`. `self` is a
+	/// name here, a method's receiver (`T::m({ self: x })`).
 	fn parse_named_argument(
 		parser: &mut Parser,
 	) -> Result<Spanned<NamedArgument>, ()> {
 		let name_token = parser.next_expect(Token::Identifier)?;
+		let text = name_token.span.extract_str(parser.source);
 		let name = Spanned {
-			inner: parser.intern_identifier(name_token.span),
+			inner: match Keyword::try_from(text) {
+				Ok(Keyword::SelfLower) => parser.strings.get_or_intern(text),
+				_ => parser.intern_identifier(name_token.span),
+			},
 			span: name_token.span,
 		};
 		let (value, span) = if parser.lexer.next_if(Token::Colon).is_some() {
@@ -5000,12 +5005,20 @@ impl<'ctx> Parser<'ctx> {
 		}))
 	}
 
-	/// A path: one or more segments, `A::B`.
+	/// A path: one or more segments, `A::B`. As in an expression, it may
+	/// start at `Self`, `crate` or `super`.
 	fn parse_path(parser: &mut Parser) -> Result<PathTerm, ()> {
 		let name_span = parser.next_expect(Token::Identifier)?.span;
+		let text = name_span.extract_str(parser.source);
+		let first = match Keyword::try_from(text) {
+			Ok(Keyword::SelfPascal | Keyword::Crate | Keyword::Super) => {
+				parser.strings.get_or_intern(text)
+			}
+			_ => parser.intern_identifier(name_span),
+		};
 		let mut segments = vec![PathSegment {
 			ident: Spanned {
-				inner: parser.intern_identifier(name_span),
+				inner: first,
 				span: name_span,
 			},
 			type_args: Box::new([]),
@@ -5025,10 +5038,13 @@ impl<'ctx> Parser<'ctx> {
 				}
 				// `::ident` — another path segment
 				Token::Identifier => {
+					// A later segment is a name, `super` included, as in an
+					// expression.
 					let seg_span = parser.next_expect(Token::Identifier)?.span;
+					let seg_text = seg_span.extract_str(parser.source);
 					segments.push(PathSegment {
 						ident: Spanned {
-							inner: parser.intern_identifier(seg_span),
+							inner: parser.strings.get_or_intern(seg_text),
 							span: seg_span,
 						},
 						type_args: Box::new([]),
