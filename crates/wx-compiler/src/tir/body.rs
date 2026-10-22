@@ -226,20 +226,24 @@ pub(super) enum ExprKind {
 	},
 	/// A direct call of a known function: a free function, `Type::f(..)`,
 	/// `x.m(..)`, or the impl method an operator on a concrete type selects.
-	/// A method's receiver is the first of `args`.
+	/// A method's receiver is the first of `args`. `args` are in written
+	/// order, the order they are evaluated in, and `order` says which
+	/// parameter each gives.
 	Call {
 		function: FunctionIdx,
 		type_args: TypeList,
 		args: ExprRange,
+		order: ArgOrder,
 	},
 	/// A call of a trait's declaration, whose impl is selected once `Self`
 	/// is known: for an abstract receiver, or a concrete one whose impl
 	/// inherits the trait's default. A method's receiver is the first of
-	/// `args`.
+	/// `args`; `order` as for `Call`.
 	AbstractCall {
 		method: FunctionIdx,
 		type_args: TypeList,
 		args: ExprRange,
+		order: ArgOrder,
 	},
 	/// A tuple of its elements, in order: `(a, b)`, `(a,)` or `()`.
 	Tuple {
@@ -595,8 +599,8 @@ impl BodyBuilder {
 		ExprRange { start, len }
 	}
 
-	/// Records the field each argument of a call written by name gives, in
-	/// the order of the arguments.
+	/// Records the field or parameter each argument of a call written by name
+	/// gives, in the order of the arguments.
 	pub(super) fn push_permutation(
 		&mut self,
 		declared: impl IntoIterator<Item = ParamIdx>,
@@ -755,7 +759,7 @@ mod tests {
 
 	#[test]
 	fn an_expression_node_stays_small() {
-		assert!(std::mem::size_of::<ExprKind>() <= 24);
+		assert!(std::mem::size_of::<ExprKind>() <= 32);
 	}
 
 	#[test]

@@ -212,7 +212,6 @@ define_diagnostic_codes! {
 		CannotImplementTypeset => "E2083",
 		FloatLiteralOverflow => "E2084",
 		FloatLiteralUnderflow => "E2085",
-		TupleStructBraceLiteral => "E2086",
 		DuplicateRestPattern => "E2087",
 		TupleStructBracePattern => "E2088",
 		RecordStructPositionalPattern => "E2089",
@@ -244,6 +243,10 @@ define_diagnostic_codes! {
 		UnmatchableLiteral => "E2117",
 		NotBoundInAllAlternatives => "E2118",
 		InconsistentPatternBinding => "E2119",
+		UnknownParameterName => "E2120",
+		DuplicateNamedArgument => "E2121",
+		MissingArguments => "E2122",
+		PositionalOnlyCall => "E2123",
 	}
 }
 

@@ -9,7 +9,7 @@
 //! same traversal and budget, reducing assumed equalities without selecting
 //! providers. Structural substitution remains independent in `types.rs`.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
@@ -361,11 +361,11 @@ pub(super) struct Solver {
 	/// retried), so neither is remembered. Every
 	/// stored answer was final when computed, so no "facts are final" switch is
 	/// needed.
-	pub(super) normalized: HashMap<Normalization, TypeIndex>,
+	pub(super) normalized: FxHashMap<Normalization, TypeIndex>,
 	/// The verdict on each definition asked about; absent is `Unchecked`. A
 	/// definition is `InProgress` exactly while its judgement's frame
 	/// (`SolverFrame::Judgement`, `SolverFrame::Requirements`) is on the stack.
-	pub(super) verdicts: HashMap<Definition, Verdict>,
+	pub(super) verdicts: FxHashMap<Definition, Verdict>,
 }
 
 impl Solver {
@@ -379,8 +379,8 @@ impl Solver {
 				blocked_at: None,
 				lowest_frame_read: usize::MAX,
 			},
-			normalized: HashMap::new(),
-			verdicts: HashMap::new(),
+			normalized: FxHashMap::default(),
+			verdicts: FxHashMap::default(),
 		}
 	}
 
@@ -1531,10 +1531,12 @@ impl Solver {
 			} => {
 				let signature = &view.structs[usize::from(struct_index)];
 				let (env, fields) =
-					(signature.type_params, &*signature.field_types);
+					(signature.type_params, signature.field_types);
 				let args: Box<[TypeIndex]> = view.types.list(type_args).into();
 				let mut known = true;
-				for &field in fields {
+				// Read one field at a time: substituting may store more lists.
+				for at in 0..fields.len() {
+					let field = view.types.list(fields)[at];
 					let field = view.types.substitute(
 						field,
 						Substitution {

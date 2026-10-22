@@ -282,7 +282,9 @@ impl Shapes for BodyContext<'_, '_, '_, '_> {
 				type_args,
 			} => {
 				let type_args = self.cx.types.list(type_args).to_vec();
-				let count = self.cx.struct_field_types(struct_index).len();
+				let count = self.cx.structs[usize::from(struct_index)]
+					.field_types
+					.len();
 				(0..count)
 					.map(|field| {
 						self.field_type(struct_index, &type_args, field)

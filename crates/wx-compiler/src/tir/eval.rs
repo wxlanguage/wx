@@ -536,8 +536,9 @@ impl TypeContext<'_, '_, '_> {
 				let count =
 					self.structs[usize::from(struct_index)].field_types.len();
 				for at in 0..count {
-					let field =
-						self.structs[usize::from(struct_index)].field_types[at];
+					let fields =
+						self.structs[usize::from(struct_index)].field_types;
+					let field = self.types.list(fields)[at];
 					let field = self.types.substitute(
 						field,
 						Substitution {

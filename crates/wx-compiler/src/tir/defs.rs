@@ -5,7 +5,7 @@
 
 // use super::*;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::ops::Range;
 
 use codespan_reporting::diagnostic::Diagnostic;
@@ -45,7 +45,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	modules: Vec<ModuleDef>,
 	imports: Vec<ImportDef>,
 	ast_nodes: Vec<AstEntry<'ast>>,
-	exports: HashMap<SymbolU32, ExportEntrySource>,
+	exports: FxHashMap<SymbolU32, ExportEntrySource>,
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
@@ -62,7 +62,8 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	use_paths: Vec<UsePathSegment>,
 	intrinsics: IntrinsicDefs,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
-	pending_named_imports: HashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
+	pending_named_imports:
+		FxHashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
 	/// Every glob `use` item — `pub` or not — grouped by the namespace it's
 	/// *declared* in — no name dimension, unlike `pending_named_imports`,
 	/// since a glob doesn't claim one. Lets glob resolution find "what does
@@ -73,7 +74,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	/// lookup time includes private edges just as much as `pub` ones, so
 	/// cycle detection has to see the whole graph, not just its `pub`
 	/// subset.
-	pending_glob_targets: HashMap<Scope, SmallVec<UseItemIndex>>,
+	pending_glob_targets: FxHashMap<Scope, SmallVec<UseItemIndex>>,
 }
 
 index_newtype!(UsePathIndex);
@@ -197,7 +198,7 @@ pub struct TraitDef {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: HashMap<BindingKey, MemberIdx>,
+	pub bindings: FxHashMap<BindingKey, MemberIdx>,
 	pub members: Vec<TraitMemberDef>,
 }
 
@@ -210,7 +211,7 @@ pub struct TraitImplDef {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: HashMap<BindingKey, MemberIdx>,
+	pub bindings: FxHashMap<BindingKey, MemberIdx>,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -221,7 +222,7 @@ pub struct InherentImplDef {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: HashMap<BindingKey, MemberIdx>,
+	pub bindings: FxHashMap<BindingKey, MemberIdx>,
 	pub members: Vec<InherentMemberDef>,
 }
 
@@ -238,7 +239,7 @@ pub struct StructDef {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub lookup: HashMap<SymbolU32, FieldIdx>,
+	pub lookup: FxHashMap<SymbolU32, FieldIdx>,
 }
 
 impl StructDef {
@@ -623,7 +624,7 @@ pub(super) struct DefinitionRegistry {
 	pub modules: Vec<ModuleDef>,
 	pub imports: Vec<ImportDef>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
-	pub exports: HashMap<SymbolU32, ExportEntrySource>,
+	pub exports: FxHashMap<SymbolU32, ExportEntrySource>,
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
@@ -974,7 +975,7 @@ pub struct SymbolTable {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: HashMap<BindingKey, Binding>,
+	pub bindings: FxHashMap<BindingKey, Binding>,
 	pub items: Vec<ItemDef>,
 }
 
@@ -982,7 +983,7 @@ impl SymbolTable {
 	fn new(file_id: FileId) -> Self {
 		Self {
 			file_id,
-			bindings: HashMap::new(),
+			bindings: FxHashMap::default(),
 			items: Vec::new(),
 		}
 	}
@@ -1906,10 +1907,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_items: Vec::new(),
 			use_paths: Vec::new(),
 			ast_nodes: Vec::new(),
-			exports: HashMap::new(),
+			exports: FxHashMap::default(),
 			intrinsics: IntrinsicDefs::default(),
-			pending_named_imports: HashMap::new(),
-			pending_glob_targets: HashMap::new(),
+			pending_named_imports: FxHashMap::default(),
+			pending_glob_targets: FxHashMap::default(),
 		};
 
 		let file_namespaces = builder.compute_file_namespaces(packages);
@@ -2090,7 +2091,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				kind: MemberKind::AssociatedType(size_assoc_type_index),
 				span: name_span,
 			}],
-			bindings: HashMap::from([(
+			bindings: FxHashMap::from_iter([(
 				BindingKey::ty(size_symbol),
 				MemberIdx::new(0),
 			)]),
@@ -2126,7 +2127,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				kind: MemberKind::AssociatedType(value_assoc_type_index),
 				span: name_span,
 			}],
-			bindings: HashMap::from([(
+			bindings: FxHashMap::from_iter([(
 				BindingKey::ty(value_symbol),
 				MemberIdx::new(0),
 			)]),
@@ -2139,7 +2140,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				file_id,
 				namespace,
 				members: Vec::new(),
-				bindings: HashMap::new(),
+				bindings: FxHashMap::default(),
 			})
 		});
 		(
@@ -2192,7 +2193,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					span: name_span,
 				},
 			],
-			bindings: HashMap::from([
+			bindings: FxHashMap::from_iter([
 				(BindingKey::ty(args_symbol), MemberIdx::new(0)),
 				(BindingKey::ty(result_symbol), MemberIdx::new(1)),
 			]),
@@ -2201,7 +2202,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			file_id,
 			namespace,
 			members: Vec::new(),
-			bindings: HashMap::new(),
+			bindings: FxHashMap::default(),
 		});
 		FunctionImpls {
 			call_impl_index,
@@ -2697,7 +2698,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 				let mut field_defs: Vec<FieldDef> =
 					Vec::with_capacity(fields.len());
-				let mut lookup: HashMap<SymbolU32, FieldIdx> = HashMap::new();
+				let mut lookup: FxHashMap<SymbolU32, FieldIdx> =
+					FxHashMap::default();
 				for field in fields.iter().map(|f| &f.inner.inner) {
 					let index =
 						FieldIdx::new(u32::try_from(field_defs.len()).unwrap());
@@ -3005,8 +3007,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 
 				let mut members: Vec<TraitMemberDef> = Vec::new();
-				let mut bindings: HashMap<BindingKey, MemberIdx> =
-					HashMap::new();
+				let mut bindings: FxHashMap<BindingKey, MemberIdx> =
+					FxHashMap::default();
 				for item in items.iter() {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
@@ -3162,8 +3164,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			ast::Item::InherentImpl { items, .. } => {
 				let mut members: Vec<InherentMemberDef> = Vec::new();
-				let mut bindings: HashMap<BindingKey, MemberIdx> =
-					HashMap::new();
+				let mut bindings: FxHashMap<BindingKey, MemberIdx> =
+					FxHashMap::default();
 				let block_index = InherentImplIdx(
 					u32::try_from(self.inherent_impls.len()).unwrap(),
 				);
@@ -3552,7 +3554,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					namespace,
 					pub_span: *pub_span,
 					name: *name,
-					bindings: HashMap::new(),
+					bindings: FxHashMap::default(),
 					members: Vec::new(),
 				});
 				let member_impls: Box<[TraitImplIdx]> = members
@@ -3562,7 +3564,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							file_id,
 							namespace,
 							members: Vec::new(),
-							bindings: HashMap::new(),
+							bindings: FxHashMap::default(),
 						})
 					})
 					.collect();
@@ -3584,15 +3586,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			ast::Item::TraitImpl { items, .. } => {
 				let mut members: Vec<TraitMemberDef> = Vec::new();
-				let mut bindings: HashMap<BindingKey, MemberIdx> =
-					HashMap::new();
+				let mut bindings: FxHashMap<BindingKey, MemberIdx> =
+					FxHashMap::default();
 				// Reserved before the members, whose synthetic impls (each
 				// function's `Call` and `Function`) take slots after it.
 				let block_index = self.push_trait_impl(TraitImplDef {
 					file_id,
 					namespace,
 					members: Vec::new(),
-					bindings: HashMap::new(),
+					bindings: FxHashMap::default(),
 				});
 				self.ast_nodes.push(AstEntry {
 					file_id,

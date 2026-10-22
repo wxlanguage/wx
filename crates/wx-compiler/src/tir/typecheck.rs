@@ -32,21 +32,21 @@ mod members;
 mod patterns;
 mod places;
 
-use calls::Callee;
+use calls::{CallTarget, Callee, GivenArgument};
 use members::MemberPath;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::body::{
 	ArgOrder, Body, BodyBuilder, BodyOwner, ExprIdx, ExprKind, ExprRange,
-	LocalIdx, ParamIdx, Scope, ScopeIdx, ScopeKind,
+	LocalIdx, Scope, ScopeIdx, ScopeKind,
 };
 use super::defs::{
-	BindingTarget, ConstIdx, DefKey, DefKind, FieldIdx, FunctionIdx,
-	MemberKind, StructIdx, Tier, TypesetIdx, Visibility,
+	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
+	StructIdx, Tier, TypesetIdx, Visibility,
 };
 use super::imports::report_private_identifier;
 use super::literals::{
@@ -81,7 +81,7 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// The locals each scope declares, by name. A name is looked up in the
 	/// current scope, then in each enclosing one; a later declaration of the
 	/// same name in one scope replaces the entry, which shadows the earlier.
-	lookup: HashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+	lookup: FxHashMap<(ScopeIdx, SymbolU32), LocalIdx>,
 	/// What each scope's value is checked against, index-aligned with the
 	/// body's scopes.
 	scope_types: Vec<ScopeType>,
@@ -109,7 +109,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			scope,
 			owner,
 			current: ScopeIdx::ROOT,
-			lookup: HashMap::new(),
+			lookup: FxHashMap::default(),
 			scope_types: Vec::new(),
 		}
 	}
@@ -325,12 +325,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Cast { value, ty } => {
 				self.build_cast(value, ty, expected, span)
 			}
-			ast::Expression::MethodCall(call) => {
-				self.build_method_call(call, expected, span)
-			}
-			ast::Expression::NamedMethodCall(_) => {
-				self.unsupported(span, "a method call by name")
-			}
+			ast::Expression::MethodCall(call) => self.build_method_call(
+				&call.object,
+				&call.method,
+				Arguments::Positional(&call.arguments),
+				expected,
+				span,
+			),
+			ast::Expression::NamedMethodCall(call) => self.build_method_call(
+				&call.object,
+				&call.method,
+				Arguments::Named(&call.arguments),
+				expected,
+				span,
+			),
 			ast::Expression::TypeApplication { .. } => {
 				self.unsupported(span, "a type application")
 			}
@@ -739,11 +747,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Some(key),
 				));
 			}
-			return match (kind, arguments) {
-				(
-					DefKind::Function(function_index),
-					Arguments::Positional(arguments),
-				) => self.build_function_call(
+			return match kind {
+				DefKind::Function(function_index) => self.build_function_call(
 					Callee::free(function_index),
 					segments.last().unwrap(),
 					None,
@@ -751,9 +756,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					expected,
 					span,
 				),
-				(DefKind::Function(_), Arguments::Named(_)) => {
-					self.unsupported(span, "a function call by name")
-				}
 				_ => self
 					.unsupported(span, &format!("a call of a {}", kind.noun())),
 			};
@@ -791,21 +793,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let given = match arguments {
-			Arguments::Positional(arguments) => self.positional_fields(
-				struct_index,
-				&mut type_args,
-				arguments,
-				span,
-			),
-			Arguments::Named(arguments) => {
-				self.named_fields(struct_index, &mut type_args, arguments, span)
-			}
-		};
+		let target = CallTarget::StructConstructor(struct_index);
+		let mut given = Vec::new();
+		let reported = self.build_arguments(
+			target,
+			&mut type_args,
+			arguments,
+			&mut given,
+			span,
+		);
 		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
+		// A reported argument list may be why a type argument stays unknown.
 		let poisoned = expected == TypeIndex::ERROR
-			|| given.iter().any(|&(_, value)| {
-				self.cx.types.has_error(self.body.ty(value))
+			|| reported
+			|| given.iter().any(|argument| {
+				self.cx.types.has_error(self.body.ty(argument.value))
 			});
 		self.report_uninferred(
 			params_env,
@@ -813,28 +815,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			poisoned,
 			&mut type_args,
 		);
-		// Every argument is known now, so each value is held to its field's
-		// final type: an untyped literal takes it only here.
-		for &(field, value) in &given {
-			let field_ty = self.field_type(struct_index, &type_args, field);
-			self.expect(value, field_ty);
-		}
-		let declared = self.cx.struct_field_types(struct_index).to_vec();
-		self.check_param_bounds(
-			params_env,
-			TypeEnvOwner::Struct(struct_index),
-			segment,
-			&declared,
-			&type_args,
-			&given,
-		);
+		self.expect_arguments(target, &type_args, &given);
+		let type_list = self.cx.types.push_list(&type_args);
+		self.check_param_bounds(target, params_env, segment, type_list, &given);
 		let order = match arguments {
 			Arguments::Positional(_) => ArgOrder::InOrder,
-			Arguments::Named(_) => self.body.push_permutation(
-				given.iter().map(|&(field, _)| ParamIdx::new(field as u32)),
-			),
+			Arguments::Named(_) => self
+				.body
+				.push_permutation(given.iter().map(|argument| argument.param)),
 		};
-		let args = self.body.push_args(given.iter().map(|&(_, value)| value));
+		let args = self
+			.body
+			.push_args(given.iter().map(|argument| argument.value));
 		let ty = self.cx.types.intern_struct(struct_index, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
 		self.body.push(
@@ -926,34 +918,34 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// the call, wherever they were learned from. `type_args` are flat: the
 	/// frames around `params_env` first, whose bounds the selection of the
 	/// callee proved. Each is reported at its written argument, else at the
-	/// value given for a field or parameter whose declared type (`declared`)
-	/// is that parameter, else at the name.
+	/// value given for a parameter of `target` whose declared type is that
+	/// type parameter, else at the name. `arguments` is the stored list the
+	/// caller shares with whatever else reads it (the call's node).
 	fn check_param_bounds(
 		&mut self,
+		target: CallTarget,
 		params_env: TypeEnvIdx,
-		owner: TypeEnvOwner,
 		segment: &ast::PathSegment,
-		declared: &[TypeIndex],
-		type_args: &[TypeIndex],
-		given: &[(usize, ExprIdx)],
+		arguments: TypeList,
+		given: &[GivenArgument],
 	) {
 		let own = self.cx.type_envs.param_names(params_env).len();
 		if own == 0 {
 			return;
 		}
-		let arguments = self.cx.types.push_list(type_args);
 		let mut obligations = Vec::new();
-		let leading = type_args.len() - own;
-		for (index, &argument) in type_args[leading..].iter().enumerate() {
+		let leading = arguments.len() - own;
+		for index in 0..own {
+			let argument = self.cx.types.list(arguments)[leading + index];
 			let span = match segment.type_args.get(index) {
 				Some(written) => written.span,
 				None => {
 					let param =
 						self.cx.type_envs.param_types(params_env)[index];
 					let mut span = segment.ident.span;
-					for &(field, value) in given {
-						if declared[field] == param {
-							span = self.body.span(value);
+					for argument in given {
+						if target.param_type(self.cx, argument.param) == param {
+							span = self.body.span(argument.value);
 							break;
 						}
 					}
@@ -973,7 +965,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					span,
 				},
 				SourceSpan::new(self.scope.file_id, span),
-				owner,
+				target.owner(),
 			);
 		}
 		self.cx.check_now(&obligations);
@@ -1022,28 +1014,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// What `value`, given for `field`, teaches the struct's type arguments:
-	/// the parts of its type standing where the field's declared type names a
-	/// parameter.
-	fn learn_field(
-		&mut self,
-		struct_index: StructIdx,
-		type_args: &mut [TypeIndex],
-		field: usize,
-		value: ExprIdx,
-	) {
-		let declared = self.cx.struct_field_types(struct_index)[field];
-		let env = self.cx.structs[usize::from(struct_index)].type_params;
-		let actual = self.body.ty(value);
-		self.cx.types.learn(
-			&self.cx.type_envs,
-			env,
-			type_args,
-			declared,
-			actual,
-		);
-	}
-
 	/// A field's type, as expected of the value given for it: as declared,
 	/// with the struct's type arguments `args` for its parameters. An argument
 	/// not known yet leaves its parts `INFER`, which expect nothing.
@@ -1053,7 +1023,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		args: &[TypeIndex],
 		field: usize,
 	) -> TypeIndex {
-		let ty = self.cx.struct_field_types(struct_index)[field];
+		let ty = self
+			.cx
+			.types
+			.list(self.cx.structs[usize::from(struct_index)].field_types)[field];
 		let ty = self.cx.types.substitute(
 			ty,
 			Substitution {
@@ -1064,187 +1037,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		);
 		let ty = self.normalized(ty, self.scope.env);
 		self.cx.types.collapse_error(ty)
-	}
-
-	/// The fields of `Point(1, 2)`: the n-th argument gives the n-th field.
-	/// Each value is built with its field's type as known so far, and teaches
-	/// `type_args` what it can; it is held to the field's final type by the
-	/// caller. An argument past the last field is built and dropped.
-	fn positional_fields(
-		&mut self,
-		struct_index: StructIdx,
-		type_args: &mut [TypeIndex],
-		arguments: &[ast::Separated<Spanned<ast::Expression>>],
-		span: TextSpan,
-	) -> Vec<(usize, ExprIdx)> {
-		let count = self.cx.struct_field_types(struct_index).len();
-		if arguments.len() != count {
-			let plural = |n: usize| if n == 1 { "" } else { "s" };
-			let label =
-				Label::primary(self.scope.file_id, span).with_message(format!(
-					"expected {count} field{}, found {}",
-					plural(count),
-					arguments.len()
-				));
-			self.cx.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::ArgumentCountMismatch.code())
-					.with_message(format!(
-						"this struct takes {count} field{} but {} {} supplied",
-						plural(count),
-						arguments.len(),
-						if arguments.len() == 1 { "was" } else { "were" }
-					))
-					.with_label(label),
-			);
-		}
-		let mut given = Vec::with_capacity(count);
-		for (at, argument) in arguments.iter().enumerate() {
-			if at >= count {
-				self.build(&argument.inner, TypeIndex::INFER);
-				continue;
-			}
-			let hint = self.field_type(struct_index, type_args, at);
-			let value = self.build(&argument.inner, hint);
-			self.learn_field(struct_index, type_args, at, value);
-			given.push((at, value));
-		}
-		given
-	}
-
-	/// The fields of `Point({ y: 2, x })`, in written order, each with the
-	/// field it gives, built and learned from as `positional_fields` does. Only
-	/// a struct whose every field is named is built this way. An argument
-	/// naming no field, or a field already given, is built and dropped.
-	fn named_fields(
-		&mut self,
-		struct_index: StructIdx,
-		type_args: &mut [TypeIndex],
-		arguments: &[ast::Separated<Spanned<ast::NamedArgument>>],
-		span: TextSpan,
-	) -> Vec<(usize, ExprIdx)> {
-		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
-		let count = def.fields.len();
-		if !def.is_fully_named() {
-			self.cx.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::TupleStructBraceLiteral.code())
-					.with_message(format!(
-						"struct `{struct_name}` has unnamed fields, so it is \
-						 constructed with `{struct_name}(...)`"
-					))
-					.with_label(Label::primary(self.scope.file_id, span)),
-			);
-			return Vec::new();
-		}
-		// Each field given, with its name as written and its value.
-		let mut given: Vec<(FieldIdx, TextSpan, ExprIdx)> =
-			Vec::with_capacity(arguments.len());
-		for argument in arguments {
-			let argument = &argument.inner.inner;
-			let name = argument.name;
-			let field = self.cx.defs.structs[usize::from(struct_index)]
-				.lookup
-				.get(&name.inner)
-				.copied();
-			let hint = match field {
-				Some(field) => {
-					self.field_type(struct_index, type_args, usize::from(field))
-				}
-				None => TypeIndex::INFER,
-			};
-			let value = match &argument.value {
-				Some(value) => self.build(value, hint),
-				// `{ x }` is `{ x: x }`.
-				None => {
-					let path = [ast::PathSegment {
-						ident: name,
-						type_args: Box::new([]),
-					}];
-					self.build_path(&path, name.span)
-				}
-			};
-			let def = &self.cx.defs.structs[usize::from(struct_index)];
-			let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
-			let field_name = self.cx.strings.resolve(name.inner).unwrap();
-			let Some(field) = field else {
-				self.cx.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::UnknownStructField.code())
-						.with_message(format!(
-							"no such field `{field_name}` in struct \
-							 `{struct_name}`"
-						))
-						.with_label(
-							SourceSpan::new(self.scope.file_id, name.span)
-								.primary_label(),
-						),
-				);
-				continue;
-			};
-			if let Some(&(_, first, _)) =
-				given.iter().find(|&&(given, ..)| given == field)
-			{
-				self.cx.diagnostics.push(
-					Diagnostic::error()
-						.with_code(
-							DiagnosticCode::DuplicateStructFieldInit.code(),
-						)
-						.with_message(format!(
-							"field `{field_name}` specified more than once"
-						))
-						.with_label(Label::primary(
-							self.scope.file_id,
-							name.span,
-						))
-						.with_label(
-							Label::secondary(self.scope.file_id, first)
-								.with_message("first use of this field"),
-						),
-				);
-				continue;
-			}
-			self.learn_field(
-				struct_index,
-				type_args,
-				usize::from(field),
-				value,
-			);
-			given.push((field, name.span, value));
-		}
-		// A later field of a name declared twice is one no argument can name;
-		// the duplicate was reported on the struct.
-		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		let missing: Vec<String> = (0..count)
-			.map(|at| FieldIdx::new(at as u32))
-			.filter(|&field| {
-				let name = def.fields[usize::from(field)].name.unwrap().inner;
-				!given.iter().any(|&(given, ..)| given == field)
-					&& def.lookup.get(&name) == Some(&field)
-			})
-			.map(|field| {
-				let name = def.fields[usize::from(field)].name.unwrap().inner;
-				format!("`{}`", self.cx.strings.resolve(name).unwrap())
-			})
-			.collect();
-		if !missing.is_empty() {
-			let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
-			self.cx.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::MissingStructFields.code())
-					.with_message(format!(
-						"missing field{} {} in construction of `{struct_name}`",
-						if missing.len() == 1 { "" } else { "s" },
-						missing.join(", ")
-					))
-					.with_label(Label::primary(self.scope.file_id, span)),
-			);
-		}
-		given
-			.into_iter()
-			.map(|(field, _, value)| (usize::from(field), value))
-			.collect()
 	}
 
 	/// A struct's constructor is as visible as the struct and every one of
@@ -1727,12 +1519,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				function,
 				type_args,
 				args,
+				order: ArgOrder::InOrder,
 			},
 			SelectedMethod::Abstract { method, type_args } => {
 				ExprKind::AbstractCall {
 					method,
 					type_args,
 					args,
+					order: ArgOrder::InOrder,
 				}
 			}
 		}
@@ -1994,7 +1788,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		targets: &[LiteralTarget],
 	) {
 		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
-		let text = self.body.span(expr).extract_str(source).to_owned();
+		let text = self.body.span(expr).extract_str(source);
 		let mut value = None;
 		for fit in targets {
 			match fit.fits_float(&text) {
@@ -2511,7 +2305,9 @@ mod tests {
 	use codespan_reporting::diagnostic::Diagnostic;
 	use indoc::indoc;
 
-	use super::super::body::{Body, ExprIdx, ExprKind, PlaceIdx, PlaceKind};
+	use super::super::body::{
+		ArgOrder, Body, ExprIdx, ExprKind, ExprRange, PlaceIdx, PlaceKind,
+	};
 	use super::super::defs::{
 		AstEntry, DefKind, DefinitionRegistry, FunctionOwner, Scope, Tier,
 	};
@@ -2726,6 +2522,27 @@ mod tests {
 			self.render(body, body.root())
 		}
 
+		/// A call's arguments in written order; when they are permuted, each
+		/// is prefixed with the parameter it gives: `(call f 1=2 0=1)`.
+		fn render_call(
+			&self,
+			body: &Body,
+			head: &str,
+			args: ExprRange,
+			order: ArgOrder,
+		) -> String {
+			let mut text = format!("({head}");
+			for (at, &arg) in body.args(args).iter().enumerate() {
+				text.push(' ');
+				if let ArgOrder::Permuted { .. } = order {
+					let param = body.declared_index(order, at);
+					text.push_str(&format!("{}=", usize::from(param)));
+				}
+				text.push_str(&self.render(body, arg));
+			}
+			text + ")"
+		}
+
 		/// Renders a node without types: `(block (local x 1) => (+ x 2))`.
 		/// A local is its name and declaration index (`x#1`), so shadowing
 		/// shows; a jump names the label it leaves, or `loop`/`block`.
@@ -2785,17 +2602,29 @@ mod tests {
 					function,
 					type_args,
 					args,
+					order,
 				} => {
 					let callee = self.callee(function, type_args);
-					list(&format!("call {callee}"), body.args(args))
+					self.render_call(
+						body,
+						&format!("call {callee}"),
+						args,
+						order,
+					)
 				}
 				ExprKind::AbstractCall {
 					method,
 					type_args,
 					args,
+					order,
 				} => {
 					let callee = self.callee(method, type_args);
-					list(&format!("abstract {callee}"), body.args(args))
+					self.render_call(
+						body,
+						&format!("abstract {callee}"),
+						args,
+						order,
+					)
 				}
 				ExprKind::Tuple { elements } => {
 					list("tuple", body.args(elements))
@@ -3069,7 +2898,7 @@ mod tests {
 		fn field_name(
 			&self,
 			object: TypeIndex,
-			field: super::FieldIdx,
+			field: crate::tir::defs::FieldIdx,
 		) -> &str {
 			let Type::Struct { struct_index, .. } =
 				*self.context.types.resolve(object)
@@ -4289,8 +4118,278 @@ mod tests {
 			DiagnosticCode::ArgumentCountMismatch,
 		]);
 		case.diagnostics().assert_error_saying(
-			"this function takes 0 arguments but 1 was supplied",
+			"function `by_value` takes 0 arguments but 1 was supplied",
 		);
+	}
+
+	#[test]
+	fn a_call_by_name_binds_each_argument_to_its_parameter() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u32, b: i64) -> u32 { a }
+				func id<T>(value: T, flag: bool) -> T { value }
+				func by_name() -> u32 {
+					local a: u32 = 1;
+					f({ b: 2, a })
+				}
+				func in_order() -> u32 { f({ a: 1, b: 2 }) }
+				func positional() -> u32 { f(1, 2) }
+				func generic(x: u8) -> u8 { id({ flag: true, value: x }) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("by_name"),
+			"(block (local a#0 1) => (call f 1=2 0=a#0))"
+		);
+		assert_eq!(case.shape("in_order"), "(block => (call f 0=1 1=2))");
+		assert_eq!(case.shape("positional"), "(block => (call f 1 2))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (call id<u8> 1=true 0=x#0))"
+		);
+	}
+
+	#[test]
+	fn a_method_is_called_by_name_with_its_receiver_named_self() {
+		test_case!(
+			case = indoc! {"
+				struct S(n: u32);
+				impl S {
+					pub func pick(self: Self, n: u32, m: u32) -> u32 { n }
+				}
+				func method(s: S) -> u32 { s.pick({ m: 1, n: 2 }) }
+				func path(s: S) -> u32 { S::pick({ n: 2, self: s, m: 1 }) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("method"),
+			"(block => (call pick 0=s#0 2=1 1=2))"
+		);
+		assert_eq!(case.shape("path"), "(block => (call pick 1=2 0=s#0 2=1))");
+	}
+
+	#[test]
+	fn a_trait_impl_function_is_called_by_its_traits_names() {
+		test_case!(
+			case = indoc! {"
+				struct P(v: u32);
+				impl Add for P {
+					func add(self: Self, other: Self) -> Self { other }
+				}
+				func concrete(p: P, q: P) -> P { p.add({ rhs: q }) }
+				func path(p: P, q: P) -> P { P::add({ rhs: q, self: p }) }
+				func generic<T: Add>(a: T, b: T) -> T { a.add({ rhs: b }) }
+				func impl_name(p: P, q: P) -> P { p.add({ other: q }) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::MissingArguments,
+		]);
+		case.diagnostics().assert_error_saying(
+			"function `add` has no parameter named `other`",
+		);
+		assert_eq!(case.shape("concrete"), "(block => (call add 0=p#0 1=q#1))");
+		assert_eq!(case.shape("path"), "(block => (call add 1=q#1 0=p#0))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (abstract add<T> 0=a#0 1=b#1))"
+		);
+	}
+
+	#[test]
+	fn every_path_to_a_known_function_can_be_called_by_name() {
+		test_case!(
+			case = indoc! {"
+				trait Make {
+					func make(value: u32, scale: u32) -> Self;
+				}
+				struct S(n: u32);
+				impl Make for S {
+					func make(value: u32, _: u32) -> Self { S(value) }
+				}
+				impl S {
+					pub func twice(self: Self, by: u32) -> u32 { by }
+					pub func again(self: Self) -> u32 {
+						Self::twice({ by: 2, self })
+					}
+				}
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func new(x: T, flag: bool) -> W<T> { W(x) }
+				}
+				func qualified() -> S {
+					<S as Make>::make({ scale: 1, value: 2 })
+				}
+				func generic<T: Make>() -> T { T::make({ scale: 1, value: 2 }) }
+				func learned(a: u8) -> W<u8> { W::new({ flag: true, x: a }) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.member_shape("again"),
+			"(block => (call twice 1=2 0=self#0))"
+		);
+		assert_eq!(case.shape("qualified"), "(block => (call make 1=1 0=2))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (abstract make<T> 1=1 0=2))"
+		);
+		assert_eq!(
+			case.shape("learned"),
+			"(block => (call new<u8> 1=true 0=a#0))"
+		);
+	}
+
+	#[test]
+	fn a_call_by_name_follows_the_traits_names_even_where_it_leaves_one_out() {
+		test_case!(
+			case = indoc! {"
+				trait Scale {
+					func scale(self: Self, u32) -> Self;
+				}
+				struct S(n: u32);
+				impl Scale for S {
+					func scale(self: Self, by: u32) -> Self { self }
+				}
+				func named(s: S) -> S { s.scale({ by: 2 }) }
+				func positional(s: S) -> S { s.scale(2) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PositionalOnlyCall]);
+		case.diagnostics().assert_error_saying(
+			"function `scale` has an unnamed parameter, so it is called by \
+			 position",
+		);
+		assert_eq!(case.shape("positional"), "(block => (call scale s#0 2))");
+	}
+
+	#[test]
+	fn a_call_by_name_reaches_the_first_parameter_of_a_name_declared_twice() {
+		test_case!(
+			case = indoc! {"
+				func d(a: u32, a: u32) {}
+				func once() { d({ a: 1 }) }
+				func twice() { d({ a: 1, a: 2 }) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicateFunctionParameter,
+			DiagnosticCode::DuplicateNamedArgument,
+		]);
+		assert_eq!(case.shape("once"), "(block => (call d 0=1))");
+	}
+
+	#[test]
+	fn an_empty_call_by_name_gives_no_argument() {
+		test_case!(
+			case = indoc! {"
+				func none() {}
+				func some(a: u32) {}
+				func empty() { none({}) }
+				func missing() { some({}) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MissingArguments]);
+		assert_eq!(case.shape("empty"), "(block => (call none))");
+	}
+
+	#[test]
+	fn a_call_by_name_reports_what_does_not_match_its_parameters() {
+		test_case!(
+			case = indoc! {"
+				struct S();
+				impl S {
+					pub func m(self: Self, n: u32) {}
+				}
+				func f(a: u32, b: i64) {}
+				func g(u32, b: u32) {}
+				func unknown() { f({ a: 1, b: 2, c: 3 }) }
+				func twice() { f({ a: 1, a: 2, b: 3 }) }
+				func missing() { f({ b: 2 }) }
+				func unnamed() { g({ b: 1 }) }
+				func receiver(s: S) { s.m({ self: s, n: 1 }) }
+				func mismatch(x: i64) { f({ a: x, b: x }) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::DuplicateNamedArgument,
+			DiagnosticCode::MissingArguments,
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics()
+			.assert_error_saying("function `f` has no parameter named `c`");
+		case.diagnostics()
+			.assert_error_saying("argument `a` given more than once");
+		case.diagnostics().assert_error_saying(
+			"missing argument `a` in call to function `f`",
+		);
+		case.diagnostics().assert_error_saying(
+			"function `g` has an unnamed parameter, so it is called by \
+			 position",
+		);
+		case.diagnostics()
+			.assert_error_saying("function `m` has no parameter named `self`");
+		assert_eq!(case.shape("missing"), "(block => (call f 1=2))");
+	}
+
+	#[test]
+	fn a_reported_argument_list_does_not_also_report_an_uninferred_type() {
+		test_case!(
+			case = indoc! {"
+				func pair<T>(a: T, b: T) -> T { a }
+				func none<T>(flag: bool) -> T { loop {} }
+				func g<T>(T, b: u32) -> T { loop {} }
+				struct W<T>(x: T, y: T);
+				func missing() { pair(1); }
+				func missing_by_name() { pair({ a: 1 }); }
+				func extra() { none(true, 1); }
+				func unknown_name() { none({ flag: true, other: 1 }); }
+				func positional_only() { g({ b: 1 }); }
+				func construction() { W(1); }
+				func construction_by_name() { W({ x: 1 }); }
+				func uninferred() { none(true); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::MissingArguments,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::MissingArguments,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+		case.diagnostics().assert_error_saying(
+			"struct constructor `W` takes 2 arguments but 1 was supplied",
+		);
+		case.diagnostics().assert_error_saying(
+			"missing argument `y` in call to struct constructor `W`",
+		);
+	}
+
+	#[test]
+	fn an_argument_built_with_a_known_type_is_held_to_it() {
+		test_case!(
+			case = indoc! {"
+				func three<T>(a: T, b: T, c: T) -> T { a }
+				func f(x: u8, y: u16) { three(x, y, nothing); }
+			"}
+		);
+		// `T` is `u8` from `x` before `y` is built, so `y` is held to `u8`
+		// although the failed third argument leaves `T` an error.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::TypeMistmatch,
+		]);
 	}
 
 	#[test]

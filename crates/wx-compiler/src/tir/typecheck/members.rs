@@ -259,9 +259,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		(kind, ty)
 	}
 
-	/// `Type::member(a, b)`: a call of the function the member selects, by
-	/// position. A method is called like any function here, its receiver the
-	/// first argument.
+	/// `Type::member(a, b)` or `Type::member({ b, a })`: a call of the
+	/// function the member selects. A method is called like any function
+	/// here, its receiver the first argument, named `self` in a call by name.
 	pub(super) fn build_member_call(
 		&mut self,
 		path: MemberPath<'_>,
@@ -269,9 +269,6 @@ impl BodyContext<'_, '_, '_, '_> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let Arguments::Positional(arguments) = arguments else {
-			return self.unsupported(span, "a function call by name");
-		};
 		match self.select_member(&path) {
 			Some(Member::Function(callee) | Member::Method(callee)) => self
 				.build_function_call(
@@ -289,17 +286,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 	}
 
-	/// `receiver.method(a, b)`: a call of the method the receiver's type
-	/// has, the receiver its first argument. A pointer is not dereferenced: a
+	/// `receiver.method(a, b)` or `receiver.method({ b, a })`: a call of the
+	/// method the receiver's type has, the receiver its first argument. A pointer is not dereferenced: a
 	/// method of the pointee is found only when it takes `self` by pointer,
 	/// as `self: Mem::*Self` does, and the pointer itself is then `self`.
 	pub(super) fn build_method_call(
 		&mut self,
-		call: &ast::MethodCallExpr,
+		object: &Spanned<ast::Expression>,
+		method: &ast::PathSegment,
+		arguments: Arguments<'_>,
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let receiver = self.build(&call.object, TypeIndex::INFER);
+		let receiver = self.build(object, TypeIndex::INFER);
 		let receiver_ty = self.body.ty(receiver);
 		if self.cx.types.has_untyped(receiver_ty) {
 			self.report_annotation_required(receiver);
@@ -310,12 +309,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			Type::Pointer { to, .. } => Some(to),
 			_ => None,
 		};
-		let path =
-			MemberPath::new(pointee.unwrap_or(receiver_ty), &call.method);
+		let path = MemberPath::new(pointee.unwrap_or(receiver_ty), method);
 		let callee = match self.select_member(&path) {
 			Some(Member::Method(callee)) => callee,
 			Some(Member::Function(_) | Member::Constant { .. }) => {
-				self.report_not_a_method(receiver_ty, &call.method);
+				self.report_not_a_method(receiver_ty, method);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 			None => {
@@ -323,19 +321,20 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 		};
 		if pointee.is_some() {
-			let declared =
-				self.cx.functions[usize::from(callee.function)].params()[0];
+			let params =
+				self.cx.functions[usize::from(callee.function)].param_types;
+			let declared = self.cx.types.list(params)[0];
 			if !matches!(self.cx.types.resolve(declared), Type::Pointer { .. })
 			{
-				self.report_by_value_through_pointer(receiver_ty, &call.method);
+				self.report_by_value_through_pointer(receiver_ty, method);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 		}
 		self.build_function_call(
 			callee,
-			&call.method,
+			method,
 			Some(receiver),
-			&call.arguments,
+			arguments,
 			expected,
 			span,
 		)

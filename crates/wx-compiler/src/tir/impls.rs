@@ -2,7 +2,7 @@
 //! signature is resolved. This deliberately does not inspect type parameter
 //! bounds or expand user-written type aliases.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
@@ -97,8 +97,8 @@ pub(super) struct TraitImplHead {
 }
 
 pub(super) struct ImplDispatch {
-	inherent: HashMap<ImplTarget, Vec<InherentImplIdx>>,
-	traits: HashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
+	inherent: FxHashMap<ImplTarget, Vec<InherentImplIdx>>,
+	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
 	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
 	trait_headers: Vec<TraitImplHead>,
 }
@@ -109,8 +109,8 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	strings: &'a StringInterner,
 	defs: &'a DefinitionRegistry,
 	ast_nodes: &'a [AstEntry<'ast>],
-	inherent: HashMap<ImplTarget, Vec<InherentImplIdx>>,
-	traits: HashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
+	inherent: FxHashMap<ImplTarget, Vec<InherentImplIdx>>,
+	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
 	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
 	trait_headers: Vec<TraitImplHead>,
 }
@@ -178,8 +178,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			strings,
 			defs,
 			ast_nodes,
-			inherent: HashMap::new(),
-			traits: HashMap::new(),
+			inherent: FxHashMap::default(),
+			traits: FxHashMap::default(),
 			inherent_targets: vec![None; defs.inherent_impls.len()],
 			trait_headers: vec![
 				TraitImplHead {

@@ -35,14 +35,15 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> Body {
 		let env = self.scope.env;
 		let function = &self.cx.functions[usize::from(function_index)];
-		let (params, return_type) =
-			(function.params().to_vec(), function.return_type());
+		let (param_types, return_type) =
+			(function.param_types, function.return_type);
 		// A type with a reported part in it expects nothing more.
 		let return_type = self.normalized(return_type, env);
 		let return_type = self.cx.types.collapse_error(return_type);
 		self.enter_root(block.span, return_type);
-		for (param, ty) in signature.params.iter().zip(params) {
+		for (at, param) in signature.params.iter().enumerate() {
 			let param = &param.inner.inner;
+			let ty = self.cx.types.list(param_types)[at];
 			let ty = self.normalized(ty, env);
 			let ty = self.cx.types.collapse_error(ty);
 			// An unnamed parameter binds nothing, so it has no local.

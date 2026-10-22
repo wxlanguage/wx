@@ -308,7 +308,7 @@ Calling a value of a user type that implements `Call` is a `Call` of
 
 ### Named calls and parameter names
 
-Decided 2026-10-22; part 1 implemented, parts 2 and 3 not yet. A call may name its arguments,
+Decided 2026-10-22; parts 1 and 3 implemented, part 2 left to conformance. A call may name its arguments,
 `f({ b: 2, a })`, as a struct construction already can. Three pieces, in the
 order they are built: a parameter may be unnamed, a trait impl's parameters
 take their names from the trait, and a call by name binds each argument to the
@@ -396,7 +396,9 @@ needs an exclusive pointer *and* a `mut` field?), and that fields are then
 immutable unless marked, which breaks the field writes in `examples/vec`,
 `examples/arena`, `examples/hashing` and `examples/snake`.
 
-**2. A trait impl's parameters are named by the trait.** Where a trait's
+**2. A trait impl's parameters are named by the trait** (left to impl
+conformance, which is not implemented; calls by name do not depend on it,
+since they read the trait's names). Where a trait's
 declaration names a parameter, the impl's function either uses that name or
 leaves the parameter unnamed (ignored); where the trait leaves it unnamed, the
 impl may name it freely, since that name is only a local. `mut` is free (it
@@ -423,7 +425,7 @@ belongs to the local, not the interface); `self` matches by position.
 - Later, maybe: `_` or `a: _` taking the type from the trait. Left out:
   every signature stays readable on its own, and adding it breaks nothing.
 
-**3. Calls by name.** `f({ a: 1, b })`, `T::f({ .. })`, `<T as Tr>::f({ .. })`
+**3. Calls by name** (done). `f({ a: 1, b })`, `T::f({ .. })`, `<T as Tr>::f({ .. })`
 and `x.m({ .. })`, whose receiver gives `self`. Only a call whose function is
 known statically can be named.
 
@@ -432,29 +434,44 @@ known statically can be named.
   names one, and an impl's unnamed parameter must not make a concrete call
   positional only).
 - A function with an unnamed parameter (past the receiver) is called by
-  position only; naming it is an error, as `X({ .. })` is for
-  `struct X(i32, b: i32)` (`TupleStructBraceLiteral`), ideally one wording for
-  both.
-- Proposed: `self` is the receiver, never a name, so a method is called by name
-  only with method syntax; `T::m({ .. })` for a method reports that and points
-  at `x.m({ .. })`.
-- Checking, as `named_fields` does for a struct: arguments in written order;
+  position only; naming it is an error (E2123), with the same code and
+  wording as `X({ .. })` for `struct X(i32, b: i32)`.
+- Decided: `self` is a name like any other, so a method called through its
+  type names its receiver, `T::m({ self: x, rhs })`; method syntax gives it,
+  and naming `self` there is an unknown name (E2120), as is any name the
+  receiver already took.
+- Checking: arguments in written order;
   each name finds its parameter (the first of that name); each value is built
   with the parameter's type as known so far and learned from; an unknown name,
   a name given twice and missing parameters are reported (new codes E2120
   `UnknownParameterName`, E2121 `DuplicateNamedArgument`, E2122
-  `MissingArguments`; whether the struct codes E2025–E2027 fold into them is
-  open), and dropped arguments are built with nothing expected. Then the same
-  final `expect` and bound checks as a positional call.
+  `MissingArguments`, and E2123 `PositionalOnlyCall` for a target with an
+  unnamed parameter), and dropped arguments are built with nothing expected.
+  Then the same final `expect` and bound checks as a positional call.
+- A struct construction is a call of its constructor and is checked by the
+  same code: `CallTarget` (`typecheck/calls.rs`) is `Function` or
+  `StructConstructor`, whose parameters are the struct's fields, and
+  `build_arguments` checks either's arguments by position or by name. The
+  diagnostics are shared too: E2016 and E2120–E2123, naming the target
+  ("function `f`", "struct constructor `Point`") with a label at its
+  declaration. E2086 is gone; struct patterns keep E2025–E2027 and E2088
+  until they are looked at on their own, and field access keeps E2025.
 - Body: `Call` and `AbstractCall` gain `order: ArgOrder`, as
   `StructConstructor` has. `args` stay in written order, which is the
   evaluation order; the permutation says which parameter each gives; a
   receiver is first and gives parameter 0. MIR evaluates in written order and
   passes in parameter order, through temporaries where the two differ.
-- Not by name: a call through a value (a local of `func(A) -> R` type, or a
-  value whose type implements `Call`) is positional, since `Call::Args` is a
-  tuple. A named call there reports "a call through a value takes its
-  arguments by position".
+- Implementation: `build_function_call` and `build_construction` share
+  `build_arguments`, `expect_arguments` and `check_param_bounds`; a
+  function's names are found through `naming_declaration`, a struct's
+  through its field `lookup`. The call's type arguments are stored once and shared
+  by the bound checks and the node (`TypeList::prefix` gives the impl's).
+  `ArgOrder` grew `ExprKind` from 24 to 32 bytes; moving a call's fields
+  into a side record would bring it back.
+- Not yet: a call through a value (a local of `func(A) -> R` type, or a
+  value whose type implements `Call`) is not checked in either form (E2114).
+  It will be positional only, since `Call::Args` is a tuple; a named call
+  there will report "a call through a value takes its arguments by position".
 - Not yet: a named argument records no `Referent` (nor does a field name in
   a construction); go-to-definition and rename on `{ a: .. }` need a
   `Referent::Param` and a field counterpart, together.
@@ -462,8 +479,8 @@ known statically can be named.
 ### Patterns
 
 Done. One pattern grammar serves `local` and `match` arms. Function parameters
-are never patterns: a parameter is `[mut] name`, since a call by name needs
-every parameter to have one.
+are never patterns: a parameter is a binding (`_`, `name`, `mut name`) and a
+type, see "Named calls and parameter names".
 
 **What a term is follows from its own shape.** There is no mode to switch: a
 name binds, a literal compares with that value, a qualified path compares with
@@ -762,9 +779,9 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   enforced here (the old checker did, for all three sites).
 - **Patterns** (designed, see "Patterns"), in this order: the parser, the pattern
   arena, `local` destructuring, `match` and the usefulness pass (done).
-- **Named calls** (designed, see "Named calls and parameter names"), in this
-  order: the parameter and field grammar (done), the check that a trait impl's parameters
-  use the trait's names, then calls by name.
+- **Named calls** (done, see "Named calls and parameter names"): the
+  parameter and field grammar, then calls by name. The check that a trait
+  impl's parameters use the trait's names belongs to conformance.
 
 ### 3. Think first
 

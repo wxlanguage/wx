@@ -2244,6 +2244,7 @@ dependencies = [
  "indoc",
  "insta",
  "leb128fmt",
+ "rustc-hash",
  "serde",
  "serde_json",
  "string-interner",

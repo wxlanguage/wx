@@ -219,8 +219,11 @@ impl BodyContext<'_, '_, '_, '_> {
 					),
 			);
 		}
-		let declared =
-			self.cx.struct_field_types(struct_index)[usize::from(field)];
+		let declared = self
+			.cx
+			.types
+			.list(self.cx.structs[usize::from(struct_index)].field_types)
+			[usize::from(field)];
 		let args = self.cx.types.list(type_args).to_vec();
 		let ty = self.cx.types.substitute(
 			declared,

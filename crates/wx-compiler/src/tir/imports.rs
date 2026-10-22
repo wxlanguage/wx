@@ -2,7 +2,7 @@
 //! `defs.rs`'s prescan has populated every namespace's bindings and every
 //! `use` item/path segment.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
@@ -134,8 +134,8 @@ pub(super) struct ImportResolver<'r> {
 	use_items: &'r [UseItemDef],
 	use_paths: &'r [UsePathSegment],
 	pending_named_imports:
-		&'r HashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
-	pending_glob_targets: &'r HashMap<Scope, SmallVec<UseItemIndex>>,
+		&'r FxHashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
+	pending_glob_targets: &'r FxHashMap<Scope, SmallVec<UseItemIndex>>,
 
 	path_state: &'r mut [ResolveStatus<Namespace>],
 	item_state: &'r mut [ResolveStatus<()>],
@@ -159,11 +159,11 @@ impl<'r> ImportResolver<'r> {
 		namespaces: &mut Namespaces,
 		use_items: &[UseItemDef],
 		use_paths: &[UsePathSegment],
-		pending_named_imports: &HashMap<
+		pending_named_imports: &FxHashMap<
 			(Scope, SymbolU32),
 			SmallVec<UseItemIndex>,
 		>,
-		pending_glob_targets: &HashMap<Scope, SmallVec<UseItemIndex>>,
+		pending_glob_targets: &FxHashMap<Scope, SmallVec<UseItemIndex>>,
 	) {
 		let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
 		let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
@@ -1208,6 +1208,8 @@ pub(super) fn report_cannot_use_as_namespace(
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashMap;
+
 	use indoc::indoc;
 
 	use super::*;

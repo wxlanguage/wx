@@ -15,7 +15,7 @@
 //! `defs.rs` citizens: nobody writes `foo::T`, so a parameter is only ever
 //! reachable from the item that declares it.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::ops::Range;
 
 use codespan_reporting::diagnostic::Diagnostic;
@@ -53,7 +53,7 @@ use super::solver::{ImplMember, Solver, SolverError};
 use super::typecheck::BodyContext;
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
-	TypeInterner,
+	TypeInterner, TypeList,
 };
 
 /// One generic parameter's bounds — everything about a `Type::TypeParam`
@@ -134,20 +134,12 @@ pub struct FunctionSignature {
 	/// Without own parameters this is the parent's scope. Bounds remain in
 	/// the registry's parameter table; body assumptions use this same scope.
 	pub(super) type_params: TypeEnvIdx,
-	param_types: Box<[TypeIndex]>,
+	/// The parameter types as written, `self` included: a run of the
+	/// interner's lists, which the function's `Call::Args` tuple is built
+	/// from.
+	pub(super) param_types: TypeList,
 	/// `TypeIndex::UNIT` when the source omits `-> Result`.
-	return_type: TypeIndex,
-}
-
-impl FunctionSignature {
-	/// The parameter types as written, `self` included.
-	pub(super) fn params(&self) -> &[TypeIndex] {
-		&self.param_types
-	}
-
-	pub(super) fn return_type(&self) -> TypeIndex {
-		self.return_type
-	}
+	pub(super) return_type: TypeIndex,
 }
 
 /// Field *types* only — names/dedup/lookup already settled in
@@ -156,7 +148,9 @@ impl FunctionSignature {
 pub struct StructSignature {
 	/// See `TypeAliasSignature::type_params`.
 	pub(super) type_params: TypeEnvIdx,
-	pub(super) field_types: Box<[TypeIndex]>,
+	/// The field types as written, in declaration order: a run of the
+	/// interner's lists, like a function's `param_types`.
+	pub(super) field_types: TypeList,
 }
 
 /// The repr every variant's value is held in. A variant is a constant
@@ -414,8 +408,11 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// All declaration signatures are available; only the selected crate's entries remain.
-	fn resolve_exports(&mut self) -> HashMap<SymbolU32, ExportedItem> {
-		let mut exports = HashMap::with_capacity(self.defs.exports.len());
+	fn resolve_exports(&mut self) -> FxHashMap<SymbolU32, ExportedItem> {
+		let mut exports = FxHashMap::with_capacity_and_hasher(
+			self.defs.exports.len(),
+			Default::default(),
+		);
 		for (&external_name, source) in &self.defs.exports {
 			let file_id = source.external_span.file_id;
 			let reference = SourceSpan::new(file_id, source.name.span);
@@ -538,7 +535,7 @@ enum QueryState {
 /// `ensure_signature` never needs a second lookup to find the AST it's
 /// supposed to resolve.
 ///
-/// Keyed directly by `DefId` (`query_state: HashMap<DefId, QueryEntry>`
+/// Keyed directly by `DefId` (`query_state: FxHashMap<DefId, QueryEntry>`
 /// below) rather than through a `QueryKind`-tagged wrapper: signature
 /// resolution is the only query this engine runs — a body doesn't get one
 /// of its own, since (unlike a signature) it can't depend on anything that
@@ -596,7 +593,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) operators: OperatorTraits,
 	ast_nodes: &'ast [AstEntry<'ast>],
 	// The resolved data below is read across the sibling TIR modules.
-	query_state: HashMap<DefId, QueryEntry>,
+	query_state: FxHashMap<DefId, QueryEntry>,
 	/// In-progress queries, in call order.
 	pub(super) query_stack: Vec<QueryInfo>,
 	pub(super) solver: Solver,
@@ -641,7 +638,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
 	/// Resolved, exportable targets keyed by decoded external name; filled by `sweep`.
-	pub exports: HashMap<SymbolU32, ExportedItem>,
+	pub exports: FxHashMap<SymbolU32, ExportedItem>,
 	/// Built before the signature sweep and never mutated by its queries.
 	pub(super) impl_dispatch: &'dispatch ImplDispatch,
 	/// Every declaration's obligations, one contiguous run per declaration
@@ -668,7 +665,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// `Resolved(SignatureLocation)` once it actually finishes — for a
 		// pre-seeded kind that's still worth doing (its *data*, not just its
 		// identity, isn't ready before then), just not from this loop.
-		let query_state: HashMap<DefId, QueryEntry> = ast_nodes
+		let query_state: FxHashMap<DefId, QueryEntry> = ast_nodes
 			.iter()
 			.enumerate()
 			.map(|(index, entry)| {
@@ -723,7 +720,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.iter()
 				.map(|_| StructSignature {
 					type_params: TypeEnvIdx::ROOT,
-					field_types: Box::default(),
+					field_types: TypeList::EMPTY,
 				})
 				.collect(),
 			enums: defs
@@ -746,7 +743,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.iter()
 				.map(|_| FunctionSignature {
 					type_params: TypeEnvIdx::ROOT,
-					param_types: Box::default(),
+					param_types: TypeList::EMPTY,
 					return_type: TypeIndex::ERROR,
 				})
 				.collect(),
@@ -773,7 +770,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			const_stack: Vec::new(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
-			exports: HashMap::new(),
+			exports: FxHashMap::default(),
 			impl_dispatch,
 			obligations: Vec::new(),
 		}
@@ -1147,14 +1144,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		(signature.ty, signature.scope)
 	}
 
-	/// A struct's field types as written, in declaration order.
-	pub(super) fn struct_field_types(
-		&self,
-		struct_index: StructIdx,
-	) -> &[TypeIndex] {
-		&self.structs[usize::from(struct_index)].field_types
-	}
-
 	/// A typeset's member types.
 	pub(super) fn typeset_members(
 		&self,
@@ -1253,7 +1242,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&signature.type_params,
 		);
 
-		let param_types: Box<[TypeIndex]> = signature
+		let param_types: Vec<TypeIndex> = signature
 			.params
 			.iter()
 			.map(|param| {
@@ -1297,12 +1286,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			None => TypeIndex::UNIT,
 		};
 
+		let param_types = self.types.push_list(&param_types);
 		self.resolve_function_impls(
 			obligations,
 			file_id,
 			function_index,
 			type_env,
-			&param_types,
+			param_types,
 			return_type,
 			signature,
 		);
@@ -1324,17 +1314,20 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		file_id: FileId,
 		function_index: FunctionIdx,
 		type_env: TypeEnvIdx,
-		param_types: &[TypeIndex],
+		param_types: TypeList,
 		return_type: TypeIndex,
 		signature: &ast::FunctionSignature,
 	) {
 		let function_def = &self.defs.functions[usize::from(function_index)];
 		let function_impls = function_def.function_impls;
 		let name_span = function_def.name.span;
-		let args = if let [param] = param_types {
-			*param
-		} else {
-			self.types.intern_tuple(param_types)
+		// The tuple is interned over the signature's own list, so nothing is
+		// copied; none is the empty tuple, `()`.
+		let args = match *self.types.list(param_types) {
+			[param] => param,
+			_ => self.types.intern(Type::Tuple {
+				elements: param_types,
+			}),
 		};
 		// Instantiating `type_env` takes an argument for every parameter on
 		// its chain, outer first, so a member's type carries its parent's
@@ -1427,8 +1420,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&signature.type_params,
 		);
 
-		// Definition collection diagnoses misplaced receivers; a `self`
-		// written alone is `self: Self`, resolved like any written type.
+		// Definition collection diagnoses misplaced receivers.
 		let param_types: Vec<TypeIndex> = signature
 			.params
 			.iter()
@@ -1460,18 +1452,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			None => TypeIndex::UNIT,
 		};
 
+		let param_types = self.types.push_list(&param_types);
 		self.resolve_function_impls(
 			obligations,
 			file_id,
 			function_index,
 			scope,
-			&param_types,
+			param_types,
 			return_type,
 			signature,
 		);
 		self.functions[usize::from(function_index)] = FunctionSignature {
 			type_params: scope,
-			param_types: param_types.into_boxed_slice(),
+			param_types,
 			return_type,
 		};
 		SignatureLocation::Function(function_index)
@@ -2320,7 +2313,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 
 				self.structs[usize::from(struct_index)].field_types =
-					field_types.into_boxed_slice();
+					self.types.push_list(&field_types);
 				SignatureLocation::Struct(struct_index)
 			}
 			AstNodeRef::Function {
@@ -4412,6 +4405,8 @@ fn report_pointer_without_memory(
 
 #[cfg(test)]
 pub(super) mod tests {
+	use std::collections::HashMap;
+
 	use indoc::indoc;
 
 	use super::*;
@@ -5241,16 +5236,16 @@ pub(super) mod tests {
 				("const P: Point = Point(1);", ArgumentCountMismatch),
 				("const P: Point = Point(1, 2, 3);", ArgumentCountMismatch),
 				("const P: Point = Point(1, true);", TypeMistmatch),
-				("const P: Point = Point({ x: 1 });", MissingStructFields),
+				("const P: Point = Point({ x: 1 });", MissingArguments),
 				(
 					"const P: Point = Point({ x: 1, y: 2, z: 3 });",
-					UnknownStructField,
+					UnknownParameterName,
 				),
 				(
 					"const P: Point = Point({ x: 1, x: 2, y: 3 });",
-					DuplicateStructFieldInit,
+					DuplicateNamedArgument,
 				),
-				("const P: Pair = Pair({ a: 1 });", TupleStructBraceLiteral),
+				("const P: Pair = Pair({ a: 1 });", PositionalOnlyCall),
 				(
 					"const P: Point = Point::<u8>(1, 2);",
 					TypeArgumentCountMismatch,
@@ -6701,6 +6696,13 @@ pub(super) mod tests {
 			&self.context.type_aliases[usize::from(index)]
 		}
 
+		/// The field types of the struct at `path`, as written.
+		fn field_types(&self, path: &str) -> &[TypeIndex] {
+			self.context
+				.types
+				.list(self.struct_signature(path).field_types)
+		}
+
 		fn struct_signature(&self, path: &str) -> &StructSignature {
 			&self.context.structs[usize::from(self.struct_index(path))]
 		}
@@ -6745,9 +6747,8 @@ pub(super) mod tests {
 		/// Parameter `index` of the function at `path`, normalized in that
 		/// function's own scope.
 		fn normalized_param(&mut self, path: &str, index: usize) -> TypeIndex {
-			let signature = self.function_signature(path);
-			let (scope, ty) =
-				(signature.type_params, signature.param_types[index]);
+			let scope = self.function_signature(path).type_params;
+			let ty = self.param_types(path)[index];
 			self.normalized(scope, ty)
 		}
 
@@ -6758,18 +6759,15 @@ pub(super) mod tests {
 			path: &str,
 			index: usize,
 		) -> Result<TypeIndex, SolverError> {
-			let signature = self.function_signature(path);
-			let (scope, ty) =
-				(signature.type_params, signature.param_types[index]);
+			let scope = self.function_signature(path).type_params;
+			let ty = self.param_types(path)[index];
 			self.context.normalize_type_query(scope, ty)
 		}
 
 		/// The parameter exactly as written, with its projections unreduced.
 		fn is_projection_param(&self, path: &str, index: usize) -> bool {
 			matches!(
-				self.context
-					.types
-					.resolve(self.function_signature(path).param_types[index]),
+				self.context.types.resolve(self.param_types(path)[index]),
 				Type::AssocTypeProjection { .. }
 			)
 		}
@@ -6779,6 +6777,13 @@ pub(super) mod tests {
 			let signature = self.function_signature(path);
 			let (scope, ty) = (signature.type_params, signature.return_type);
 			self.normalized(scope, ty)
+		}
+
+		/// The parameter types of the function at `path`, as written.
+		fn param_types(&self, path: &str) -> &[TypeIndex] {
+			self.context
+				.types
+				.list(self.function_signature(path).param_types)
 		}
 
 		fn function_signature(&self, path: &str) -> &FunctionSignature {
@@ -7057,7 +7062,7 @@ pub(super) mod tests {
 		case.diagnostics().assert_none();
 		let signature = case.function_signature("f");
 		assert_eq!(
-			&*signature.param_types,
+			case.context.types.list(signature.param_types),
 			[TypeIndex::NEVER, TypeIndex::UNIT]
 		);
 		assert_eq!(signature.return_type, TypeIndex::NEVER);
@@ -7597,7 +7602,7 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		let field_types = &case.struct_signature("Point").field_types;
+		let field_types = case.field_types("Point");
 		assert_eq!(field_types.len(), 2);
 		assert_eq!(field_types[0], TypeIndex::I32);
 		assert_eq!(field_types[1], TypeIndex::I32);
@@ -7617,7 +7622,7 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		assert_eq!(case.struct_signature("Pair").field_types.len(), 2);
+		assert_eq!(case.field_types("Pair").len(), 2);
 	}
 
 	#[test]
@@ -7712,7 +7717,7 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		let field_ty = case.struct_signature("Holder").field_types[0];
+		let field_ty = case.field_types("Holder")[0];
 		let Type::Struct {
 			struct_index,
 			type_args: args,
@@ -7750,7 +7755,7 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		let field_ty = case.struct_signature("Holder").field_types[0];
+		let field_ty = case.field_types("Holder")[0];
 		let Type::Struct {
 			struct_index,
 			type_args: args,
@@ -7811,7 +7816,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].message,
 			"struct `Wrapper` takes 2 generic arguments but 1 generic argument was supplied"
 		);
-		let field_ty = case.struct_signature("Holder").field_types[0];
+		let field_ty = case.field_types("Holder")[0];
 		let Type::Struct {
 			type_args: args, ..
 		} = case.context.types.resolve(field_ty)
@@ -7886,7 +7891,7 @@ pub(super) mod tests {
 			DiagnosticCode::TypeArgumentsNotAllowed,
 			DiagnosticCode::TypeArgumentCountMismatch,
 		]);
-		let params = &case.function_signature("f").param_types;
+		let params = &case.param_types("f");
 		assert_eq!(params[0], TypeIndex::U8);
 		assert_eq!(params[1], TypeIndex::U8);
 		let Type::Tuple { elements } = case.context.types.resolve(params[2])
@@ -7910,7 +7915,7 @@ pub(super) mod tests {
 		"}
 		);
 		case.diagnostics().assert_none();
-		let param = case.function_signature("f").param_types[0];
+		let param = case.param_types("f")[0];
 		let Type::Tuple { elements } = case.context.types.resolve(param) else {
 			panic!("expected the alias's tuple");
 		};
@@ -7953,7 +7958,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].message,
 			"type arguments are not allowed on type parameter `T`"
 		);
-		let param = case.function_signature("f").param_types[0];
+		let param = case.param_types("f")[0];
 		assert!(matches!(
 			case.context.types.resolve(param),
 			Type::TypeParam { .. }
@@ -8110,7 +8115,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].message,
 			"type arguments are not allowed on module `m`"
 		);
-		let param = case.function_signature("f").param_types[0];
+		let param = case.param_types("f")[0];
 		assert!(matches!(
 			case.context.types.resolve(param),
 			Type::Struct { struct_index, .. }
@@ -8144,7 +8149,7 @@ pub(super) mod tests {
 			"the trait bound `S: Bound` is not satisfied"
 		);
 		// The violation is diagnosed; the written type is kept, not rewritten.
-		let field_ty = case.struct_signature("Holder").field_types[0];
+		let field_ty = case.field_types("Holder")[0];
 		let Type::Struct {
 			type_args: args, ..
 		} = case.context.types.resolve(field_ty)
@@ -8174,7 +8179,7 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		let field_ty = case.struct_signature("Holder").field_types[0];
+		let field_ty = case.field_types("Holder")[0];
 		let Type::Struct {
 			type_args: args, ..
 		} = case.context.types.resolve(field_ty)
@@ -8236,9 +8241,15 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let signature = case.function_signature("add");
-		assert_eq!(signature.param_types.len(), 2);
-		assert_eq!(signature.param_types[0], TypeIndex::I32);
-		assert_eq!(signature.param_types[1], TypeIndex::I32);
+		assert_eq!(case.context.types.list(signature.param_types).len(), 2);
+		assert_eq!(
+			case.context.types.list(signature.param_types)[0],
+			TypeIndex::I32
+		);
+		assert_eq!(
+			case.context.types.list(signature.param_types)[1],
+			TypeIndex::I32
+		);
 		assert_eq!(signature.return_type, TypeIndex::BOOL);
 	}
 
@@ -8269,7 +8280,10 @@ pub(super) mod tests {
 		);
 		let signature = case.function_signature("identity");
 		assert_eq!(case.param_count(signature.type_params), 1);
-		assert_eq!(signature.param_types[0], signature.return_type);
+		assert_eq!(
+			case.context.types.list(signature.param_types)[0],
+			signature.return_type
+		);
 	}
 
 	#[test]
@@ -8282,7 +8296,7 @@ pub(super) mod tests {
 		"}
 		);
 
-		assert_eq!(case.function_signature("f").param_types.len(), 2);
+		assert_eq!(case.param_types("f").len(), 2);
 		assert_eq!(
 			case.context.diagnostics.len(),
 			1,
@@ -8311,7 +8325,10 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let signature = case.function_signature("imported");
-		assert_eq!(signature.param_types[0], TypeIndex::I32);
+		assert_eq!(
+			case.context.types.list(signature.param_types)[0],
+			TypeIndex::I32
+		);
 		assert_eq!(signature.return_type, TypeIndex::I32);
 	}
 
@@ -8378,7 +8395,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(
-			&*case.function_signature("f").param_types,
+			&*case.param_types("f"),
 			&[TypeIndex::I32, TypeIndex::U8, TypeIndex::I32]
 		);
 		let DefKind::Function(index) = case.resolve(Tier::Value, "f") else {
@@ -8538,14 +8555,14 @@ pub(super) mod tests {
 			panic!("expected Color to be an enum");
 		};
 		let signature = case.function_signature("f");
-		let ty = signature.param_types[0];
+		let ty = case.context.types.list(signature.param_types)[0];
 		assert!(
 			matches!(case.context.types.resolve(ty), Type::Enum { enum_index: found } if *found == enum_index)
 		);
 		assert_ne!(ty, TypeIndex::I32);
 		assert_eq!(signature.return_type, ty);
 		assert_eq!(case.constant_signature("FIRST").ty, ty);
-		assert_eq!(case.struct_signature("Paint").field_types.as_ref(), [ty]);
+		assert_eq!(case.field_types("Paint"), [ty]);
 		assert_eq!(case.type_alias("Alias").target, ty);
 		assert_eq!(case.enum_signature("colors::Color").repr, TypeIndex::I32);
 	}
@@ -8659,7 +8676,9 @@ pub(super) mod tests {
 					QueryState::Pending
 				));
 				assert!(matches!(
-					builder.types.resolve(builder.functions[0].param_types[0]),
+					builder.types.resolve(
+						builder.types.list(builder.functions[0].param_types)[0]
+					),
 					Type::Enum { .. }
 				));
 				let _ = builder.ensure_signature(QueryInfo {
@@ -8708,10 +8727,15 @@ pub(super) mod tests {
 			);
 			let signature = case.function_signature("f");
 			assert!(matches!(
-				case.context.types.resolve(signature.param_types[0]),
+				case.context
+					.types
+					.resolve(case.context.types.list(signature.param_types)[0]),
 				Type::Enum { .. }
 			));
-			assert_eq!(signature.param_types[0], signature.return_type);
+			assert_eq!(
+				case.context.types.list(signature.param_types)[0],
+				signature.return_type
+			);
 			assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
 		}
 	}
@@ -8944,8 +8968,10 @@ pub(super) mod tests {
 				continue;
 			}
 			let signature = case.function_signature("f");
-			let (scope, written) =
-				(signature.type_params, signature.param_types[0]);
+			let (scope, written) = (
+				signature.type_params,
+				case.context.types.list(signature.param_types)[0],
+			);
 			assert!(matches!(
 				case.context.types.resolve(written),
 				Type::AssocTypeProjection { .. }
@@ -9013,8 +9039,13 @@ pub(super) mod tests {
 		case.diagnostics().assert_none();
 		let q = case.normalized_param("f", 0);
 		assert_eq!(case.normalized_param("g", 0), q);
-		let projection = case.function_signature("f").param_types[0];
-		assert_eq!(case.function_signature("g").param_types[0], projection);
+		let projection = case.param_types("f")[0];
+		assert_eq!(
+			case.context
+				.types
+				.list(case.function_signature("g").param_types)[0],
+			projection
+		);
 		let entries = case
 			.context
 			.solver
@@ -9045,7 +9076,7 @@ pub(super) mod tests {
 			"
 		);
 		case.diagnostics().assert_none();
-		let written = case.function_signature("f").param_types[0];
+		let written = case.param_types("f")[0];
 		assert_eq!(case.normalized_param("f", 0), written);
 		assert_eq!(case.normalized_param("f", 1), TypeIndex::U32);
 	}
@@ -9062,7 +9093,7 @@ pub(super) mod tests {
 			"
 		);
 		case.diagnostics().assert_none();
-		let written = case.function_signature("f").param_types[0];
+		let written = case.param_types("f")[0];
 		let Type::AssocTypeProjection { base, .. } =
 			*case.context.types.resolve(written)
 		else {
@@ -9356,8 +9387,10 @@ pub(super) mod tests {
 			case.diagnostics().assert_none();
 			for name in ["f", "g"] {
 				let signature = case.function_signature(name);
-				let (scope, written) =
-					(signature.type_params, signature.param_types[0]);
+				let (scope, written) = (
+					signature.type_params,
+					case.context.types.list(signature.param_types)[0],
+				);
 				assert!(matches!(
 					case.context.types.resolve(written),
 					Type::AssocTypeProjection { .. }
@@ -9385,10 +9418,7 @@ pub(super) mod tests {
 		// which name no `Next`; the projection is not reduced to find one.
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::NotATraitMember]);
-		assert_eq!(
-			case.function_signature("f").param_types[0],
-			TypeIndex::ERROR
-		);
+		assert_eq!(case.param_types("f")[0], TypeIndex::ERROR);
 	}
 
 	#[test]
@@ -9699,7 +9729,10 @@ pub(super) mod tests {
 			panic!("expected `host::log` to be a function");
 		};
 		let signature = &case.context.functions[usize::from(function_index)];
-		assert_eq!(signature.param_types.as_ref(), [TypeIndex::U32]);
+		assert_eq!(
+			case.context.types.list(signature.param_types),
+			[TypeIndex::U32]
+		);
 		assert_eq!(signature.return_type, TypeIndex::U32);
 	}
 
@@ -9729,7 +9762,8 @@ pub(super) mod tests {
 			panic!("expected `heap` to be a memory");
 		};
 		let signature = &case.context.functions[usize::from(function_index)];
-		let &[param_type] = signature.param_types.as_ref() else {
+		let &[param_type] = case.context.types.list(signature.param_types)
+		else {
 			panic!("expected exactly one parameter");
 		};
 		let Type::Pointer {
@@ -9764,7 +9798,10 @@ pub(super) mod tests {
 			panic!("expected `f` to be a function");
 		};
 		let signature = &case.context.functions[usize::from(function_index)];
-		assert_eq!(signature.param_types.as_ref(), [TypeIndex::ERROR]);
+		assert_eq!(
+			case.context.types.list(signature.param_types),
+			[TypeIndex::ERROR]
+		);
 	}
 
 	#[test]
@@ -9831,7 +9868,9 @@ pub(super) mod tests {
 			panic!("expected `heap` to be a memory");
 		};
 		let signature = &case.context.functions[usize::from(function_index)];
-		let &[slice_type, array_type] = signature.param_types.as_ref() else {
+		let &[slice_type, array_type] =
+			case.context.types.list(signature.param_types)
+		else {
 			panic!("expected exactly two parameters");
 		};
 		let Type::Slice {
@@ -9893,7 +9932,8 @@ pub(super) mod tests {
 			panic!("expected `heap2` to be a memory");
 		};
 		let signature = &case.context.functions[usize::from(function_index)];
-		let &[param_type] = signature.param_types.as_ref() else {
+		let &[param_type] = case.context.types.list(signature.param_types)
+		else {
 			panic!("expected exactly one parameter");
 		};
 		let Type::Pointer { memory, .. } =
@@ -9924,10 +9964,8 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		// The violation is diagnosed; the written pointer, tag included, is kept.
-		let Type::Pointer { to, memory, .. } = case
-			.context
-			.types
-			.resolve(case.function_signature("f").param_types[0])
+		let Type::Pointer { to, memory, .. } =
+			case.context.types.resolve(case.param_types("f")[0])
 		else {
 			panic!("expected a pointer");
 		};
@@ -9955,7 +9993,10 @@ pub(super) mod tests {
         "}
 		);
 		case.diagnostics().assert_none();
-		let params = &case.function_signature("test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("test").param_types);
 		assert_eq!(
 			case.context.types.resolve(params[1]),
 			&Type::Pointer {
@@ -9999,7 +10040,10 @@ pub(super) mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-		let params = &case.function_signature("unbounded").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("unbounded").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
@@ -10013,7 +10057,10 @@ pub(super) mod tests {
 				ownership: ast::Ownership::Exclusive
 			}
 		);
-		let params = &case.function_signature("inherited").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("inherited").param_types);
 		assert_eq!(
 			case.context.types.resolve(params[1]),
 			&Type::Pointer {
@@ -10040,7 +10087,10 @@ pub(super) mod tests {
         "}
 		);
 		case.diagnostics().assert_none();
-		let params = &case.function_signature("test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
 			Type::AssocTypeProjection { .. }
@@ -10069,8 +10119,10 @@ pub(super) mod tests {
         "}
 		);
 		case.diagnostics().assert_none();
-		let params =
-			&case.trait_function_signature("Tagged", "test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.trait_function_signature("Tagged", "test").param_types);
 		assert_eq!(
 			case.context.types.resolve(params[1]),
 			&Type::Pointer {
@@ -10108,7 +10160,10 @@ pub(super) mod tests {
         "}
 		);
 		case.diagnostics().assert_none();
-		let params = &case.function_signature("associated").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("associated").param_types);
 		assert_eq!(
 			case.context.types.resolve(params[1]),
 			&Type::Pointer {
@@ -10140,7 +10195,10 @@ pub(super) mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-		let params = &case.function_signature("bounded").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("bounded").param_types);
 		assert_eq!(
 			case.context.types.resolve(params[1]),
 			&Type::Pointer {
@@ -10150,11 +10208,11 @@ pub(super) mod tests {
 			}
 		);
 		// `Heap<M>` is not a memory without `M: Memory`: diagnosed, tag kept.
-		let Type::Pointer { memory, .. } = case
-			.context
-			.types
-			.resolve(case.function_signature("unbounded").param_types[0])
-		else {
+		let Type::Pointer { memory, .. } = case.context.types.resolve(
+			case.context
+				.types
+				.list(case.function_signature("unbounded").param_types)[0],
+		) else {
 			panic!("expected a pointer");
 		};
 		assert!(matches!(
@@ -10187,7 +10245,10 @@ pub(super) mod tests {
         "}
 		);
 		case.diagnostics().assert_none();
-		let params = &case.function_signature("test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
 			Type::Memory { .. }
@@ -10225,7 +10286,10 @@ pub(super) mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-		let params = &case.function_signature("test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
@@ -10266,9 +10330,11 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::NotATraitMember]);
 		assert_eq!(
-			case.context
-				.types
-				.resolve(case.function_signature("test").param_types[0]),
+			case.context.types.resolve(
+				case.context
+					.types
+					.list(case.function_signature("test").param_types)[0]
+			),
 			&Type::Pointer {
 				to: TypeIndex::U8,
 				memory: TypeIndex::ERROR,
@@ -10294,7 +10360,10 @@ pub(super) mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-		let params = &case.function_signature("test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
 			Type::AssocTypeProjection { .. }
@@ -10404,7 +10473,10 @@ pub(super) mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-		let params = &case.function_signature("test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
@@ -10449,7 +10521,10 @@ pub(super) mod tests {
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
-		let params = &case.function_signature("test").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
 			Type::TypeParam { .. }
@@ -10515,9 +10590,10 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let sig = case.trait_function_signature("Foo", "get");
-		assert_eq!(sig.param_types.len(), 1);
+		assert_eq!(case.context.types.list(sig.param_types).len(), 1);
 		assert_eq!(
-			sig.param_types[0], sig.return_type,
+			case.context.types.list(sig.param_types)[0],
+			sig.return_type,
 			"`self`'s type and a written `Self` return type should be the \
 			 exact same TypeParam"
 		);
@@ -10539,15 +10615,18 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let sig = case.inherent_function_signature("S", "get");
-		assert_eq!(sig.param_types.len(), 1);
+		assert_eq!(case.context.types.list(sig.param_types).len(), 1);
 		assert_eq!(
-			sig.param_types[0], sig.return_type,
+			case.context.types.list(sig.param_types)[0],
+			sig.return_type,
 			"`self` and a written `Self` return type should both resolve to \
 			 the impl's own concrete target"
 		);
 		assert!(
 			matches!(
-				case.context.types.resolve(sig.param_types[0]),
+				case.context
+					.types
+					.resolve(case.context.types.list(sig.param_types)[0]),
 				Type::Struct { .. }
 			),
 			"an inherent impl's `self` is a concrete type, not an abstract \
@@ -10600,7 +10679,10 @@ pub(super) mod tests {
 		for name in ["get", "make"] {
 			let signature =
 				case.trait_impl_function_signature("S", "Service", name);
-			assert_eq!(signature.param_types.as_ref(), [header.target.inner]);
+			assert_eq!(
+				case.context.types.list(signature.param_types),
+				[header.target.inner]
+			);
 			assert_eq!(signature.return_type, header.target.inner);
 			assert_eq!(signature.type_params, header.type_params);
 		}
@@ -10639,10 +10721,13 @@ pub(super) mod tests {
 			.unwrap();
 		let outer = case.context.type_envs.param_types(header.type_params)[0];
 		let get = case.trait_impl_function_signature("Wrap", "Service", "get");
-		assert_eq!(get.param_types[0], header.target.inner);
-		assert_eq!(get.param_types[1], outer);
 		assert_eq!(
-			get.param_types[2],
+			case.context.types.list(get.param_types)[0],
+			header.target.inner
+		);
+		assert_eq!(case.context.types.list(get.param_types)[1], outer);
+		assert_eq!(
+			case.context.types.list(get.param_types)[2],
 			case.context.type_envs.param_types(get.type_params)[0]
 		);
 		assert_eq!(get.return_type, header.target.inner);
@@ -10652,8 +10737,11 @@ pub(super) mod tests {
 		);
 		let shadow =
 			case.trait_impl_function_signature("Wrap", "Service", "shadow");
-		assert_ne!(shadow.param_types[1], outer);
-		assert_eq!(shadow.param_types[0], header.target.inner);
+		assert_ne!(case.context.types.list(shadow.param_types)[1], outer);
+		assert_eq!(
+			case.context.types.list(shadow.param_types)[0],
+			header.target.inner
+		);
 		assert_eq!(shadow.return_type, header.target.inner);
 		assert_eq!(
 			case.trait_impl_const_signature("Wrap", "Service", "VALUE")
@@ -10692,7 +10780,7 @@ pub(super) mod tests {
 			case.trait_impl_function_signature("Wrap", "Service", "get");
 		let (scope, written, return_type) = (
 			signature.type_params,
-			signature.param_types[2],
+			case.context.types.list(signature.param_types)[2],
 			signature.return_type,
 		);
 		// Stored as `Need<U::Item>`; under the method's own `Item = i32` that
@@ -10732,8 +10820,10 @@ pub(super) mod tests {
 		);
 		let signature =
 			case.trait_impl_function_signature("S", "Service", "get");
-		let (scope, written) =
-			(signature.type_params, signature.param_types[1]);
+		let (scope, written) = (
+			signature.type_params,
+			case.context.types.list(signature.param_types)[1],
+		);
 		// `U::A` is `Need<U::B>` and `U::B` is `i32`, in either written order.
 		let ty = case.normalized(scope, written);
 		let Type::Struct { type_args, .. } = case.context.types.resolve(ty)
@@ -10776,7 +10866,10 @@ pub(super) mod tests {
 		let signature =
 			case.trait_impl_function_signature("S", "Service", "get");
 		let constant = case.trait_impl_const_signature("S", "Service", "VALUE");
-		for ty in [signature.param_types[1], constant.ty] {
+		for ty in [
+			case.context.types.list(signature.param_types)[1],
+			constant.ty,
+		] {
 			let Type::Struct { type_args, .. } = case.context.types.resolve(ty)
 			else {
 				panic!("expected Need<i32>");
@@ -10885,7 +10978,7 @@ pub(super) mod tests {
 		let signature =
 			case.trait_impl_function_signature("S", "Service", "get");
 		assert_eq!(
-			&signature.param_types[1..],
+			&case.context.types.list(signature.param_types)[1..],
 			[TypeIndex::ERROR, TypeIndex::ERROR]
 		);
 		assert_eq!(signature.return_type, TypeIndex::ERROR);
@@ -10976,13 +11069,15 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let sig = case.trait_function_signature("Foo", "get");
-		assert_eq!(sig.param_types.len(), 2);
+		assert_eq!(case.context.types.list(sig.param_types).len(), 2);
 		assert_eq!(
-			sig.param_types[1], sig.return_type,
+			case.context.types.list(sig.param_types)[1],
+			sig.return_type,
 			"the param `x: T` and the `-> T` return type should share one TypeParam"
 		);
 		assert_ne!(
-			sig.param_types[0], sig.param_types[1],
+			case.context.types.list(sig.param_types)[0],
+			case.context.types.list(sig.param_types)[1],
 			"`self` (Self) and `x` (T) must resolve to different TypeParams"
 		);
 	}
@@ -11652,7 +11747,8 @@ pub(super) mod tests {
 			} => {
 				assert_eq!(*found_trait, trait_index);
 				assert_eq!(
-					*base, sig.param_types[0],
+					*base,
+					case.context.types.list(sig.param_types)[0],
 					"base should be `self`'s own type — the trait's Self"
 				);
 			}
@@ -11686,7 +11782,7 @@ pub(super) mod tests {
 				..
 			} => {
 				assert_eq!(*found_trait, trait_index);
-				assert_eq!(*base, sig.param_types[0]);
+				assert_eq!(*base, case.context.types.list(sig.param_types)[0]);
 			}
 			other => panic!("expected an AssocTypeProjection, got {other:?}"),
 		}
@@ -11710,11 +11806,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let trait_a = case.trait_index("A");
-		match case
-			.context
-			.types
-			.resolve(case.function_signature("f").param_types[0])
-		{
+		match case.context.types.resolve(case.param_types("f")[0]) {
 			Type::AssocTypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, trait_a);
 			}
@@ -11739,11 +11831,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let trait_b = case.trait_index("B");
-		match case
-			.context
-			.types
-			.resolve(case.function_signature("f").param_types[0])
-		{
+		match case.context.types.resolve(case.param_types("f")[0]) {
 			Type::AssocTypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, trait_b);
 			}
@@ -11772,10 +11860,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitMember.code())
 		);
-		assert_eq!(
-			case.function_signature("f").param_types[0],
-			TypeIndex::ERROR
-		);
+		assert_eq!(case.param_types("f")[0], TypeIndex::ERROR);
 	}
 
 	#[test]
@@ -11803,9 +11888,7 @@ pub(super) mod tests {
 		// The unsatisfied requirement is diagnosed once, where it was written;
 		// the type is kept as written.
 		assert!(matches!(
-			case.context
-				.types
-				.resolve(case.function_signature("f").param_types[0]),
+			case.context.types.resolve(case.param_types("f")[0]),
 			Type::AssocTypeProjection { .. }
 		));
 	}
@@ -11882,7 +11965,9 @@ pub(super) mod tests {
 		// The unqualified type is lowered to `ERROR` in place.
 		for name in ["unqualified", "partly"] {
 			assert_eq!(
-				case.function_signature(name).param_types[0],
+				case.context
+					.types
+					.list(case.function_signature(name).param_types)[0],
 				TypeIndex::ERROR
 			);
 		}
@@ -12032,7 +12117,7 @@ pub(super) mod tests {
 		// Written differently, the same function type once normalized.
 		let actual = case.normalized_param("f", 0);
 		assert_eq!(actual, case.normalized_param("f", 1));
-		assert_ne!(actual, case.function_signature("f").param_types[0]);
+		assert_ne!(actual, case.param_types("f")[0]);
 	}
 
 	/// A loop through two impl values has no single owner: each value is a
@@ -12241,7 +12326,9 @@ pub(super) mod tests {
 				);
 			}
 			assert_eq!(
-				case.function_signature("independent").param_types[0],
+				case.context
+					.types
+					.list(case.function_signature("independent").param_types)[0],
 				TypeIndex::I32
 			);
 		}
@@ -12736,10 +12823,7 @@ pub(super) mod tests {
 				]
 			};
 			case.diagnostics().assert_codes(expected);
-			assert_eq!(
-				case.function_signature("f").param_types[0],
-				TypeIndex::ERROR
-			);
+			assert_eq!(case.param_types("f")[0], TypeIndex::ERROR);
 		}
 	}
 
@@ -13150,8 +13234,10 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
 		let signature = case.function_signature("cyclic");
-		let (scope, written) =
-			(signature.type_params, signature.param_types[0]);
+		let (scope, written) = (
+			signature.type_params,
+			case.context.types.list(signature.param_types)[0],
+		);
 		assert!(matches!(
 			case.context.normalize_type_query(scope, written),
 			Err(SolverError::Poisoned)
@@ -13183,9 +13269,7 @@ pub(super) mod tests {
 		// The unsatisfied requirement is diagnosed once, where it was written;
 		// the type is kept as written.
 		assert!(matches!(
-			case.context
-				.types
-				.resolve(case.function_signature("f").param_types[0]),
+			case.context.types.resolve(case.param_types("f")[0]),
 			Type::AssocTypeProjection { .. }
 		));
 	}
@@ -13268,7 +13352,8 @@ pub(super) mod tests {
 		);
 		let sig = case.function_signature("f");
 		assert_eq!(
-			sig.param_types[0], sig.return_type,
+			case.context.types.list(sig.param_types)[0],
+			sig.return_type,
 			"`x: T::Size` and `-> T::Size` should resolve to the same projection"
 		);
 		assert!(matches!(
@@ -13297,10 +13382,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::NotATraitMember.code())
 		);
-		assert_eq!(
-			case.function_signature("f").param_types[0],
-			TypeIndex::ERROR
-		);
+		assert_eq!(case.param_types("f")[0], TypeIndex::ERROR);
 	}
 
 	#[test]
@@ -13324,10 +13406,7 @@ pub(super) mod tests {
 			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::AmbiguousTraitMember.code())
 		);
-		assert_eq!(
-			case.function_signature("f").param_types[0],
-			TypeIndex::ERROR
-		);
+		assert_eq!(case.param_types("f")[0], TypeIndex::ERROR);
 	}
 
 	/// Verified against real rustc (`trait B: A<X = u32> {}`, `trait C: A<X
@@ -13372,7 +13451,7 @@ pub(super) mod tests {
 		// resolves to a normal projection rather than `TypeIndex::ERROR`.
 		// Normalization cannot select either conflicting value, so the
 		// existing bound-conflict diagnostic remains the only error.
-		let param_ty = case.function_signature("f").param_types[0];
+		let param_ty = case.param_types("f")[0];
 		match case.context.types.resolve(param_ty) {
 			Type::AssocTypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, case.trait_index("A"));
@@ -13496,10 +13575,7 @@ pub(super) mod tests {
 			"{:?}",
 			case.context.diagnostics
 		);
-		assert_ne!(
-			case.function_signature("f").param_types[0],
-			TypeIndex::ERROR
-		);
+		assert_ne!(case.param_types("f")[0], TypeIndex::ERROR);
 	}
 
 	#[test]
@@ -13920,7 +13996,11 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		for name in ["tautology", "mutual", "structural"] {
-			for &ty in &case.function_signature(name).param_types {
+			for &ty in case
+				.context
+				.types
+				.list(case.function_signature(name).param_types)
+			{
 				assert!(matches!(
 					case.context.types.resolve(ty),
 					Type::AssocTypeProjection { .. }
@@ -13947,9 +14027,11 @@ pub(super) mod tests {
 		);
 		for name in ["f", "equivalent"] {
 			assert!(matches!(
-				case.context
-					.types
-					.resolve(case.function_signature(name).param_types[0]),
+				case.context.types.resolve(
+					case.context
+						.types
+						.list(case.function_signature(name).param_types)[0]
+				),
 				Type::AssocTypeProjection { .. }
 			));
 		}
@@ -14059,9 +14141,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		assert!(matches!(
-			case.context
-				.types
-				.resolve(case.function_signature("f").param_types[0]),
+			case.context.types.resolve(case.param_types("f")[0]),
 			Type::AssocTypeProjection { .. }
 		));
 	}
@@ -14153,8 +14233,10 @@ pub(super) mod tests {
 			assert!(
 				matches!(types.resolve(*base), Type::TypeParam { env, param_index } if *env == signature.type_params && *param_index == u_index)
 			);
-			let (scope, written) =
-				(signature.type_params, signature.param_types[0]);
+			let (scope, written) = (
+				signature.type_params,
+				case.context.types.list(signature.param_types)[0],
+			);
 			let normalized = case.normalized(scope, written);
 			let types = &case.context.types;
 			let Type::Struct { type_args, .. } = types.resolve(normalized)
@@ -14376,7 +14458,7 @@ pub(super) mod tests {
 			);
 			let signature = case.function_signature("f");
 			let assumption_context = signature.type_params;
-			let written = signature.param_types[0];
+			let written = case.context.types.list(signature.param_types)[0];
 			let params = case.context.type_envs.param_types(assumption_context);
 			let (t, u) = (params[0], params[1]);
 			// The parameter is stored as `T::Item` and means `U`; the evidence
@@ -14431,7 +14513,7 @@ pub(super) mod tests {
 			);
 			let signature = case.function_signature("f");
 			let assumption_context = signature.type_params;
-			let written = signature.param_types[0];
+			let written = case.context.types.list(signature.param_types)[0];
 			// `T::Item` means `Need<i32>`...
 			let stored = case.normalized(assumption_context, written);
 			let Type::Struct { type_args, .. } =
@@ -14519,7 +14601,10 @@ pub(super) mod tests {
 				"the normalized parameter's owner is not the body's context"
 			);
 			// `U::Item` is stored as written and means the outer parameter `T`.
-			let written = case.context.functions[scoped].param_types[1];
+			let written = case
+				.context
+				.types
+				.list(case.context.functions[scoped].param_types)[1];
 			assert_eq!(case.normalized(assumption_context, written), outer);
 			let plain_cx = case.context.functions[plain].type_params;
 			assert_eq!(
@@ -14571,14 +14656,16 @@ pub(super) mod tests {
 			let trait_self = case.context.type_envs.param_types(self_env)[0];
 			assert_eq!(assumption_context, self_env);
 			assert_eq!(
-				case.context.functions[index].param_types[0],
+				case.context
+					.types
+					.list(case.context.functions[index].param_types)[0],
 				trait_self
 			);
 			let facts = memberships(&case.context, assumption_context);
 			assert!(facts.contains(&(trait_self, TraitIdx::new(2))));
 			assert!(facts.contains(&(trait_self, TraitIdx::new(1))));
 			let signature = case.function_signature("user");
-			let subject = signature.param_types[0];
+			let subject = case.context.types.list(signature.param_types)[0];
 			let receiver =
 				case.context.type_envs.param_types(signature.type_params)[0];
 			// `Item`'s declaration states its equality with `Self` read as
@@ -14624,7 +14711,8 @@ pub(super) mod tests {
 			with_pending_signatures(&source, |builder| {
 				builder.sweep();
 				let env = builder.functions[0].type_params;
-				let ty = builder.functions[0].param_types[0];
+				let ty =
+					builder.types.list(builder.functions[0].param_types)[0];
 				builder.solver.set_limit_for_test(8);
 				// Overflow is returned as such, never folded into "not a member" or
 				// an error type; the site that asked owns the report.
@@ -14702,12 +14790,18 @@ pub(super) mod tests {
 				case.context.diagnostics
 			);
 			let signature = case.function_signature("f");
-			assert_eq!(signature.param_types[0], signature.param_types[1]);
+			assert_eq!(
+				case.context.types.list(signature.param_types)[0],
+				case.context.types.list(signature.param_types)[1]
+			);
 			let Type::AssocTypeProjection {
 				trait_index,
 				assoc_type_index,
 				base,
-			} = case.context.types.resolve(signature.param_types[0])
+			} = case
+				.context
+				.types
+				.resolve(case.context.types.list(signature.param_types)[0])
 			else {
 				panic!("ordinary projection expected")
 			};
@@ -14737,7 +14831,7 @@ pub(super) mod tests {
 				DiagnosticCode::TraitBoundViolation,
 			]);
 			assert!(
-				matches!(case.context.types.resolve(case.function_signature("g").param_types[0]), Type::AssocTypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
+				matches!(case.context.types.resolve(case.context.types.list(case.function_signature("g").param_types)[0]), Type::AssocTypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
 			);
 		}
 
@@ -14813,8 +14907,14 @@ pub(super) mod tests {
 					.unwrap();
 				&case.context.functions[index]
 			};
-			assert_ne!(signature("scoped").param_types[0], TypeIndex::ERROR);
-			assert_eq!(signature("sibling").param_types[0], TypeIndex::ERROR);
+			assert_ne!(
+				case.context.types.list(signature("scoped").param_types)[0],
+				TypeIndex::ERROR
+			);
+			assert_eq!(
+				case.context.types.list(signature("sibling").param_types)[0],
+				TypeIndex::ERROR
+			);
 		}
 
 		#[test]
@@ -15006,10 +15106,7 @@ pub(super) mod tests {
 				case.try_normalized_param("f", 0),
 				Err(SolverError::Poisoned)
 			);
-			assert_eq!(
-				case.function_signature("f").param_types[1],
-				TypeIndex::I32
-			);
+			assert_eq!(case.param_types("f")[1], TypeIndex::I32);
 		}
 
 		#[test]
@@ -15111,7 +15208,8 @@ pub(super) mod tests {
 					requested_at: None,
 				});
 				let env = builder.functions[0].type_params;
-				let ty = builder.functions[0].param_types[0];
+				let ty =
+					builder.types.list(builder.functions[0].param_types)[0];
 				let reference = SourceSpan::new(
 					builder.defs.functions[0].file_id,
 					TextSpan::new(0, 1),
@@ -15177,7 +15275,7 @@ pub(super) mod tests {
 					builder.sweep();
 					let signature = &builder.functions[index];
 					let assumption_context = signature.type_params;
-					let receiver = signature.param_types[0];
+					let receiver = builder.types.list(signature.param_types)[0];
 					let reference = SourceSpan::new(
 						builder.defs.functions[index].file_id,
 						TextSpan::new(0, 1),
@@ -15521,7 +15619,7 @@ pub(super) mod tests {
 					builder.sweep();
 					let signature = &builder.functions[0];
 					let env = signature.type_params;
-					let written = signature.param_types[0];
+					let written = builder.types.list(signature.param_types)[0];
 					let u = builder.type_envs.param_types(env)[1];
 					// The parameter is stored as written, `T::Item`, and under its
 					// own context means `U`...
@@ -15835,7 +15933,10 @@ pub(super) mod tests {
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 			let signature = case.function_signature("bad");
-			assert_eq!(signature.param_types[1], TypeIndex::I32);
+			assert_eq!(
+				case.context.types.list(signature.param_types)[1],
+				TypeIndex::I32
+			);
 			assert_eq!(signature.return_type, TypeIndex::I32);
 			// `x` is written as `T::Item`, which means `Need<i32>`.
 			assert!(case.is_projection_param("bad", 0));
@@ -15884,8 +15985,8 @@ pub(super) mod tests {
 			let (scope, written) = (
 				signature.type_params,
 				[
-					signature.param_types[0],
-					signature.param_types[1],
+					case.context.types.list(signature.param_types)[0],
+					case.context.types.list(signature.param_types)[1],
 					signature.return_type,
 				],
 			);
@@ -16341,7 +16442,10 @@ pub(super) mod tests {
 			index
 		};
 		let (id, takes) = (function("id"), function("takes"));
-		let params = &case.function_signature("takes").param_types;
+		let params = &case
+			.context
+			.types
+			.list(case.function_signature("takes").param_types);
 		assert_eq!(
 			case.context.types.resolve(params[0]),
 			&Type::Global {

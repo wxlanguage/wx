@@ -23,9 +23,10 @@
 //! indices, so it indexes straight into the right registry array
 //! (`defs.structs`, `defs.functions`, ...) without a lookup.
 
-use std::hash::{BuildHasher, RandomState};
+use std::hash::BuildHasher;
 
 use hashbrown::HashTable;
+use rustc_hash::FxBuildHasher;
 
 use crate::ast::Spanned;
 use crate::index::index_newtype;
@@ -131,6 +132,16 @@ impl TypeList {
 
 	pub fn is_empty(self) -> bool {
 		self.len == 0
+	}
+
+	/// The first `len` elements, sharing this list's storage: the arguments
+	/// of a flat list's outer frames.
+	pub(super) fn prefix(self, len: usize) -> TypeList {
+		assert!(len <= self.len(), "a prefix longer than its list");
+		TypeList {
+			start: self.start,
+			len: len as u32,
+		}
 	}
 
 	/// This list's elements, out of the interner's `lists`.
@@ -303,7 +314,7 @@ pub struct TypeInterner {
 	#[cfg_attr(test, serde(skip))]
 	index_lookup: HashTable<TypeIndex>,
 	#[cfg_attr(test, serde(skip))]
-	hasher: RandomState,
+	hasher: FxBuildHasher,
 }
 
 impl Type {
@@ -538,7 +549,7 @@ impl TypeInterner {
 			flags: Vec::new(),
 			lists: Vec::new(),
 			index_lookup: HashTable::new(),
-			hasher: RandomState::new(),
+			hasher: FxBuildHasher,
 		};
 		// Order must match the `TypeIndex` constants below.
 		for ty in [
