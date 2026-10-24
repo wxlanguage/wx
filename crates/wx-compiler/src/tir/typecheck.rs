@@ -4264,6 +4264,26 @@ mod tests {
 		assert_eq!(case.shape("f"), "(block => (abstract call<id<u8>> ID 1))");
 	}
 
+	/// `Value` is `Global`'s, bound through its subtrait `GlobalMut`.
+	#[test]
+	fn a_bound_on_a_supertraits_value_holds_for_each_global() {
+		test_case!(
+			case = indoc! {"
+				global mut hits: u32 = 0;
+				global mut flag: bool = false;
+				func bump<G: GlobalMut where { Value = u32 }>(g: G) {
+					g.set(g.get() + 1);
+				}
+				func f() { bump(hits); bump(flag); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<flag as Global>::Value == u32`",
+		);
+	}
+
 	#[test]
 	fn a_global_handle_is_a_zero_sized_constant() {
 		test_case!(

@@ -29,7 +29,7 @@ use super::signatures::{
 	TypeContext,
 };
 use super::solver::{Assumption, SolverError};
-use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
+use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner};
 
 /// What type-relative member applicability found.
 pub(super) enum MemberLookup {
@@ -63,9 +63,24 @@ impl From<SolverError> for MemberLookup {
 
 /// A resolved trait-associated type, ready to form a projection on a base.
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct AssocTypeProjectionTarget {
 	pub(super) trait_index: TraitIdx,
 	pub(super) assoc_type_index: AssocTypeIdx,
+}
+
+impl AssocTypeProjectionTarget {
+	pub(super) fn project(
+		self,
+		types: &mut TypeInterner,
+		base: TypeIndex,
+	) -> TypeIndex {
+		types.intern(Type::AssocTypeProjection {
+			trait_index: self.trait_index,
+			assoc_type_index: self.assoc_type_index,
+			base,
+		})
+	}
 }
 
 /// A member found through impl dispatch or trait bounds. Trait candidates
@@ -626,11 +641,7 @@ impl TypeContext<'_, '_, '_> {
 		base: TypeIndex,
 		member: AssocTypeProjectionTarget,
 	) -> TypeIndex {
-		self.types.intern(Type::AssocTypeProjection {
-			trait_index: member.trait_index,
-			assoc_type_index: member.assoc_type_index,
-			base,
-		})
+		member.project(&mut self.types, base)
 	}
 
 	/// Resolve the trait declaration named by the first segment of a

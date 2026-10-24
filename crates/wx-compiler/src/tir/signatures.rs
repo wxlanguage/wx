@@ -43,7 +43,10 @@ use super::defs::{
 use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
-use super::members::{AssocTypeProjectionTarget, TraitMemberSelection};
+use super::members::{
+	ApplicableMember, AssocTypeProjectionTarget, MemberLookup,
+	TraitMemberSelection, report_ambiguous_type_member,
+};
 use super::obligations::{BoundRequirements, Obligation};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
@@ -98,7 +101,7 @@ struct BoundOccurrence<'expr> {
 }
 
 struct BindingOccurrence<'expr> {
-	assoc_type_index: AssocTypeIdx,
+	target: AssocTypeProjectionTarget,
 	name: Spanned<SymbolU32>,
 	kind: BindingOccurrenceKind<'expr>,
 }
@@ -3870,13 +3873,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&& matches!(self.type_envs.owner(scope.env), TypeEnvOwner::Trait(_))
 		{
 			for occurrence in &occurrences {
-				let def_id = match self.defs.traits
-					[usize::from(occurrence.trait_index)]
-				.typeset
-				{
-					Some(typeset_index) => DefId::Typeset(typeset_index),
-					None => DefId::Trait(occurrence.trait_index),
-				};
+				let def_id = self.trait_def_id(occurrence.trait_index);
 				let reference = occurrence.span;
 				if let SignatureStatus::Cycle =
 					self.ensure_signature(QueryInfo {
@@ -3961,11 +3958,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			let BindingOccurrenceKind::Bound(nested) = &binding.kind else {
 				continue;
 			};
-			let projection = self.types.intern(Type::AssocTypeProjection {
-				base: subject,
-				trait_index: occurrence.trait_index,
-				assoc_type_index: binding.assoc_type_index,
-			});
+			let projection = binding.target.project(&mut self.types, subject);
 			for nested in nested {
 				self.collect_trait_clauses(out, projection, nested, origin);
 			}
@@ -4020,9 +4013,30 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let id = self.bounds.reserve(trait_index, span);
 		let mut occurrence_bindings = Vec::new();
 		for binding in bindings.iter() {
-			let Some(assoc_type_index) =
-				self.assoc_binding_index(trait_index, binding.name.inner)
-			else {
+			let target = match self.binding_target(
+				trait_index,
+				binding.name.inner,
+				span,
+			) {
+				MemberLookup::Found(member) => member.assoc_type_declaration(),
+				MemberLookup::Ambiguous(candidates) => {
+					let diagnostic = report_ambiguous_type_member(
+						file_id,
+						self.strings,
+						self.defs,
+						binding.name,
+						&candidates,
+					)
+					.with_note(
+						"name the trait that declares it in a bound of its own",
+					);
+					self.diagnostics.push(diagnostic);
+					continue;
+				}
+				MemberLookup::Error => continue,
+				_ => None,
+			};
+			let Some(target) = target else {
 				self.diagnostics.push(report_not_an_associated_type(
 					file_id,
 					self.strings,
@@ -4034,7 +4048,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			if occurrence_bindings
 				.iter()
 				.any(|b: &BindingOccurrence<'expr>| {
-					b.assoc_type_index == assoc_type_index
+					b.target.assoc_type_index == target.assoc_type_index
 				}) {
 				self.diagnostics.push(report_duplicate_assoc_type_binding(
 					file_id,
@@ -4059,7 +4073,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 			};
 			occurrence_bindings.push(BindingOccurrence {
-				assoc_type_index,
+				target,
 				name: binding.name,
 				kind,
 			});
@@ -4114,24 +4128,22 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								obligations,
 								scope.env,
 								BoundRequirements::AssociatedType {
-									declaration: binding.assoc_type_index,
-									trait_index: occurrence.trait_index,
+									declaration: binding
+										.target
+										.assoc_type_index,
+									trait_index: binding.target.trait_index,
 									receiver: subject,
 								},
 								value,
 								SourceSpan::new(scope.file_id, ty.span),
-								TypeEnvOwner::Trait(occurrence.trait_index),
+								TypeEnvOwner::Trait(binding.target.trait_index),
 							);
 						}
 						BindingRequirement::Equals(value)
 					}
 					BindingOccurrenceKind::Bound(nested) => {
 						let projection =
-							self.types.intern(Type::AssocTypeProjection {
-								trait_index: occurrence.trait_index,
-								assoc_type_index: binding.assoc_type_index,
-								base: subject,
-							});
+							binding.target.project(&mut self.types, subject);
 						self.fill_source_bounds(
 							obligations,
 							scope,
@@ -4144,7 +4156,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					}
 				};
 				source_bindings.push(SourceAssocBinding {
-					assoc_type_index: binding.assoc_type_index,
+					target: binding.target,
 					name: binding.name,
 					kind,
 				});
@@ -4160,17 +4172,50 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	fn assoc_binding_index(
-		&self,
+	/// The associated type a binding named `name` in a bound of
+	/// `trait_index` constrains: the trait's own, or else the one its
+	/// supertraits declare, as `T::Name` selects it (a trait reached twice is
+	/// one candidate). Only an associated type is a binding's target, so a
+	/// function of the same name is passed over.
+	fn binding_target(
+		&mut self,
 		trait_index: TraitIdx,
 		name: SymbolU32,
-	) -> Option<AssocTypeIdx> {
-		let trait_def = &self.defs.traits[usize::from(trait_index)];
-		let &member_index = trait_def.bindings.get(&BindingKey::ty(name))?;
-		match trait_def.members[usize::from(member_index)].kind {
-			MemberKind::AssociatedType(index) => Some(index),
-			_ => None,
+		reference: SourceSpan,
+	) -> MemberLookup {
+		let key = BindingKey::ty(name);
+		let defs = self.defs;
+		let declared = |trait_index| {
+			defs.declared_trait_member(trait_index, key)
+				.filter(|kind| matches!(kind, MemberKind::AssociatedType(_)))
+		};
+		if let Some(declaration) = declared(trait_index) {
+			return MemberLookup::Found(
+				ApplicableMember::AbstractTraitMember {
+					trait_index,
+					declaration,
+				},
+			);
 		}
+		// A trait still being built has no supertraits to read yet; the bound
+		// that reached it again reports the cycle.
+		let def_id = self.trait_def_id(trait_index);
+		if matches!(self.query_state[&def_id].state, QueryState::InProgress) {
+			return MemberLookup::Error;
+		}
+		let Some(env) = self.trait_env(trait_index, reference) else {
+			return MemberLookup::Error;
+		};
+		let own_self = self.type_envs.param_types(env)[0];
+		let range = self.param_bounds[usize::from(env)][0].clauses.traits;
+		let supertraits = self
+			.clauses
+			.traits(range)
+			.iter()
+			.filter(|clause| clause.subject == own_self)
+			.map(|clause| clause.trait_index)
+			.filter(|&supertrait| declared(supertrait).is_some());
+		Self::select_declared_member(self.defs, supertraits, key)
 	}
 
 	/// Resolves a bound's own path to the trait it names — shared between a
@@ -11350,6 +11395,168 @@ pub(super) mod tests {
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
 			"the trait bound `i32: Small` is not satisfied",
+		);
+	}
+
+	/// As rustc reads `T: Sub<Item = u32>`: a binding names the bound's own
+	/// member, or else the one its supertraits declare, as the projection
+	/// under the trait that declares it.
+	#[test]
+	fn a_binding_constrains_a_supertraits_associated_type() {
+		test_case!(
+			mut case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			trait Base { type Item; }
+			trait Derived: Base {}
+			trait Further: Derived {}
+			func direct<T: Derived where { Item = u32 }>(x: T::Item) {}
+			func transitive<T: Further where { Item = u32 }>(x: <T as Base>::Item) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.normalized_param("direct", 0), TypeIndex::U32);
+		assert_eq!(case.normalized_param("transitive", 0), TypeIndex::U32);
+	}
+
+	#[test]
+	fn a_binding_on_a_supertraits_associated_type_takes_a_nested_bound() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			trait Small {}
+			trait Base { type Item; }
+			trait Derived: Base {}
+			func f<T: Derived where { Item: Small }, U: Small>() {}
+			func g<T: Derived where { Item: Small }>() { f::<T, T::Item>(); }
+		"}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_traits_own_associated_type_wins_over_a_supertraits() {
+		test_case!(
+			mut case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			trait Base { type Item; }
+			trait Derived: Base { type Item; }
+			func f<T: Derived where { Item = u32 }>(
+				own: <T as Derived>::Item,
+				inherited: <T as Base>::Item,
+			) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::U32);
+		assert!(case.is_projection_param("f", 1));
+	}
+
+	/// A function holds its name in the type namespace too, but only an
+	/// associated type is a binding's target.
+	#[test]
+	fn a_binding_passes_over_a_function_of_the_same_name() {
+		test_case!(
+			mut case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			trait Base { type Item; }
+			trait Derived: Base { func Item(); }
+			func f<T: Derived where { Item = u32 }>(x: <T as Base>::Item) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::U32);
+	}
+
+	#[test]
+	fn a_supertrait_reached_twice_supplies_one_binding_target() {
+		test_case!(
+			mut case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			trait Base { type Item; }
+			trait Left: Base {}
+			trait Right: Base {}
+			trait Both: Left + Right {}
+			func f<T: Both where { Item = u32 }>(x: T::Item) {}
+		"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::U32);
+	}
+
+	#[test]
+	fn a_binding_two_supertraits_declare_is_ambiguous() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			trait Left { type Item; }
+			trait Right { type Item; }
+			trait Both: Left + Right {}
+			func f<T: Both where { Item = u32 }>() {}
+			func spelled<T: Both + Left where { Item = u32 }>() {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AmbiguousTraitMember]);
+		case.diagnostics()
+			.assert_error_saying("`Item` is ambiguous between multiple traits");
+	}
+
+	/// Both bindings are the projection under `Base`, so they conflict.
+	#[test]
+	fn a_supertrait_binding_conflicts_with_one_on_the_supertrait() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			type u64;
+			trait Base { type Item; }
+			trait Derived: Base {}
+			func f<T: Derived where { Item = u32 } + Base where { Item = u64 }>() {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateAssocTypeBinding]);
+		case.diagnostics().assert_error_saying(
+			"`T` requires conflicting bindings for `Base::Item`",
+		);
+	}
+
+	#[test]
+	fn a_binding_no_supertrait_declares_is_not_an_associated_type() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			trait Base { type Item; }
+			trait Derived: Base {}
+			func f<T: Derived where { Missing = u32 }>() {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::NotATraitMember]);
+	}
+
+	/// The lookup does not read a trait still being built; the supertrait
+	/// bound that closed the loop reports it, once.
+	#[test]
+	fn a_binding_in_a_supertrait_cycle_reports_the_cycle_once() {
+		test_case!(
+			case = indoc! {"
+			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u32;
+			trait A: A where { Item = u32 } {}
+		"}
+		);
+		assert_eq!(
+			case.context.diagnostics.len(),
+			1,
+			"{:?}",
+			case.context.diagnostics
 		);
 	}
 

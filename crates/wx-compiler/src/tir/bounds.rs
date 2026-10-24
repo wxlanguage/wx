@@ -44,7 +44,8 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::index::index_newtype;
 use crate::vfs::FileId;
 
-use super::defs::{AssocTypeIdx, DefId, DefKind, DefinitionRegistry, TraitIdx};
+use super::defs::{DefId, DefKind, DefinitionRegistry, TraitIdx};
+use super::members::AssocTypeProjectionTarget;
 use super::signatures::{
 	AssocTypeSignature, ParamBounds, QueryInfo, SignatureStatus,
 	TraitSignature, TypeContext,
@@ -76,7 +77,9 @@ pub(super) struct SourceTraitBound {
 /// One `Assoc = Type` or `Assoc: Bounds` clause inside a written bound.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct SourceAssocBinding {
-	pub(super) assoc_type_index: AssocTypeIdx,
+	/// The associated type it constrains, under the trait that declares it:
+	/// the bound's own trait, or one of its supertraits.
+	pub(super) target: AssocTypeProjectionTarget,
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) kind: BindingRequirement,
 }
@@ -291,11 +294,26 @@ impl TypeContext<'_, '_, '_> {
 	/// cycle, reported here at `bound`, and expands to nothing.
 	fn trait_clause_env(&mut self, bound: BoundId) -> Option<TypeEnvIdx> {
 		let trait_index = self.bounds.trait_index(bound);
-		let def_id = match self.defs.traits[usize::from(trait_index)].typeset {
+		self.trait_env(trait_index, self.bounds.span(bound))
+	}
+
+	/// The declaration whose signature holds `trait_index`'s: its typeset's
+	/// for a trait a typeset generates.
+	pub(super) fn trait_def_id(&self, trait_index: TraitIdx) -> DefId {
+		match self.defs.traits[usize::from(trait_index)].typeset {
 			Some(typeset_index) => DefId::Typeset(typeset_index),
 			None => DefId::Trait(trait_index),
-		};
-		let reference = self.bounds.span(bound);
+		}
+	}
+
+	/// The frame of `trait_index`, once its signature is available. While it
+	/// is being built, `reference` closes a cycle, reported here once.
+	pub(super) fn trait_env(
+		&mut self,
+		trait_index: TraitIdx,
+		reference: SourceSpan,
+	) -> Option<TypeEnvIdx> {
+		let def_id = self.trait_def_id(trait_index);
 		match self.ensure_signature(QueryInfo {
 			def_id,
 			requested_at: Some(reference),
@@ -439,11 +457,7 @@ impl EqualityClauseBuilder<'_> {
 				index: u32::try_from(index)
 					.expect("bound binding count exceeded u32 capacity"),
 			};
-			let projection = self.types.intern(Type::AssocTypeProjection {
-				base: subject,
-				trait_index: bound.trait_index,
-				assoc_type_index: binding.assoc_type_index,
-			});
+			let projection = binding.target.project(self.types, subject);
 			match &binding.kind {
 				BindingRequirement::Equals(value) => {
 					let written_since = self.out.len();
@@ -1020,8 +1034,9 @@ fn report_conflicting_assoc_type_binding(
 		unreachable!("conflict points to a source equality")
 	};
 	let subject_str = strings.resolve(subject).unwrap();
-	let trait_index = arena.get(conflict.first.bound).trait_index;
-	let trait_name = defs.traits[usize::from(trait_index)].name.inner;
+	let trait_name = defs.traits[usize::from(first.target.trait_index)]
+		.name
+		.inner;
 	let trait_str = strings.resolve(trait_name).unwrap();
 	let assoc_str = strings.resolve(first.name.inner).unwrap();
 	Diagnostic::error()

@@ -95,7 +95,7 @@ impl BoundFormatter<'_> {
 				f.push_str(", ");
 			}
 			let symbol = self.type_formatter.defs.assoc_types
-				[usize::from(binding.assoc_type_index)]
+				[usize::from(binding.target.assoc_type_index)]
 			.name
 			.inner;
 			f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
