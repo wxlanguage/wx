@@ -52,7 +52,10 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// `expr` as a place when it is one, else as a value.
 	fn build_operand(&mut self, expr: &Spanned<ast::Expression>) -> Operand {
 		match &expr.inner {
-			ast::Expression::Grouping { value } => self.build_operand(value),
+			// A tuple of one is its element.
+			ast::Expression::Tuple { elements } if elements.len() == 1 => {
+				self.build_operand(&elements[0].inner)
+			}
 			ast::Expression::Deref { pointer } => {
 				self.build_deref(pointer, expr.span)
 			}
@@ -458,7 +461,6 @@ impl BodyContext<'_, '_, '_, '_> {
 			target_span,
 			op.span,
 			op.inner.as_str(),
-			DiagnosticCode::BinaryOperatorCannotBeApplied,
 		)?;
 		if is_primitive_binary(plain, ty) {
 			return Some(CompoundMethod::Primitive);

@@ -832,10 +832,31 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `g = x` and `g op= x` are invalid assignment targets. The global's impls
   declare no members, so `g.get()` is an `AbstractCall` of `Global::get` with
   the global as `Self`, which MIR lowers to `global.get`.
-- **Q3. Calls through `Call`.** Decided: a value whose type implements `Call`
-  is callable, `f(x)` on it is a `Call` of `Call::call`'s impl, by position
-  only. A type is never called as a value: a struct's name constructs it, any
-  other type named as a callee is an error.
+- **Q3. Calls through `Call`.** Done (`build_value_call`): a value is called by
+  its type, as a call of `Call::call` with the value as `self` (`g(a, b)` is
+  `g.call((a, b))`), so a computed callee (`make()(1)`) is evaluated like any
+  receiver. A function item (zero-sized, `id<u8>`) selects the trait's
+  declaration over itself (its impl is its own, whose requirements are its
+  bounds, proven where it was named); its arguments are its function's, by
+  position or by name, packed into `Args` by a `Tuple` with an `order`, which
+  evaluates them as written and places them by parameter. There is no
+  implicit conversion to `func(A) -> R`.
+  A function reference `func(A) -> R` implements `Call` by a compiler rule
+  (`TraitImplLookup::Builtin`; `Args` is `A`, `Result` is `R`) and its call is
+  `ExprKind::CallRef`, which lowers to `call_ref`, not `call_indirect` (that
+  is for table handles). Any other type is a `Call` of its impl's `call`, or
+  an `AbstractCall` for an abstract `F: Call`, by position, with the
+  arguments forming `Args` as a parameter list forms a function type. A type
+  is never called as a value: a struct's name constructs it. Not yet:
+  constant values of item type (`eval`).
+  Every call follows one rule for its positional arguments
+  (`positional_arguments`): when they fill one parameter, the whole list is
+  its value, `()` for none and a tuple for several (`whole_argument_list`);
+  otherwise each gives one parameter and nothing is wrapped. So `g(a, b)` is
+  `g((a, b))` for `g(p: (A, B))`, a lone generic parameter learns the tuple,
+  a receiver fills its parameter first (`x.m(a, b)`, but `T::m(x, (a, b))`),
+  and a known parameter type that is no such tuple is a wrong count.
+  `Args` of a value is that one parameter, so the value calls agree.
 - **Q4. Operator nodes.** Decided: one node per way an operation is defined
   (`Primitive`/`Concrete`/`Abstract`) and per destination (value, `Assign`, `Store`);
   see the table under places and assignment.

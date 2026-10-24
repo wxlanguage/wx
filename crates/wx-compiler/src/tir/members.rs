@@ -202,8 +202,9 @@ pub(super) enum TraitImplLookup {
 	/// on an equivalent subject. No concrete provider was selected; dispatch
 	/// remains symbolic until instantiation.
 	Abstract,
-	/// A trait the compiler answers from the receiver's structure
-	/// (`ValueType`); no impl provides it.
+	/// A trait the compiler answers from the receiver's structure: `ValueType`,
+	/// and `Call` for a function reference, whose `Args` and `Result` are its
+	/// parameter and result types. No impl provides it.
 	Builtin,
 }
 
@@ -703,14 +704,13 @@ impl TypeContext<'_, '_, '_> {
 					declaration,
 				}
 			}
-			TraitImplLookup::Abstract => {
+			// A builtin impl has no members of its own: the declaration is
+			// what it provides.
+			TraitImplLookup::Abstract | TraitImplLookup::Builtin => {
 				ApplicableMember::AbstractTraitMember {
 					trait_index: required_trait,
 					declaration,
 				}
-			}
-			TraitImplLookup::Builtin => {
-				unreachable!("a builtin trait declares no members")
 			}
 		};
 		self.resolutions.by_site.insert(
@@ -899,7 +899,9 @@ impl TypeContext<'_, '_, '_> {
 						},
 					);
 				}
-				Ok(Some(TraitImplLookup::Abstract)) => {
+				Ok(Some(
+					TraitImplLookup::Abstract | TraitImplLookup::Builtin,
+				)) => {
 					Self::push_candidate(
 						&mut candidates,
 						ApplicableMember::AbstractTraitMember {
@@ -907,9 +909,6 @@ impl TypeContext<'_, '_, '_> {
 							declaration,
 						},
 					);
-				}
-				Ok(Some(TraitImplLookup::Builtin)) => {
-					unreachable!("a builtin trait declares no members")
 				}
 				Ok(None) => {}
 				Err(SolverError::Pending) => {

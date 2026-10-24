@@ -304,19 +304,19 @@ pub struct TypesetDef {
 pub struct FunctionDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
-	pub owner: FunctionOwner,
+	pub owner: MemberOwner,
 	pub name: Spanned<SymbolU32>,
 	/// Each parameter's name, `None` for an unnamed one.
 	pub params: Box<[Option<Spanned<SymbolU32>>]>,
 	pub function_impls: FunctionImpls,
 }
 
-/// Where a function is declared: directly in a scope (a free or imported
-/// function), or as a member of a trait or impl. A trait's declaration is
-/// the one whose type normalizes to an impl member's once `Self` is known.
+/// Where a function or a constant is declared: directly in a scope (a free
+/// or imported one), or as a member of a trait or impl. A trait's
+/// declaration is reached through the impl its `Self` selects.
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub enum FunctionOwner {
+pub enum MemberOwner {
 	Free,
 	Trait(TraitIdx),
 	InherentImpl(InherentImplIdx),
@@ -386,6 +386,8 @@ pub struct GlobalDef {
 pub struct ConstDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
+	/// An enum's variant is free: it is no trait's or impl's member.
+	pub owner: MemberOwner,
 	pub name: Spanned<SymbolU32>,
 }
 
@@ -690,6 +692,10 @@ pub struct IntrinsicDefs {
 	pub global: Option<TraitIdx>,
 	pub global_mut: Option<TraitIdx>,
 	pub call: Option<TraitIdx>,
+	/// `Call`'s declarations of `Args` and `Result`, which a function
+	/// reference's type answers by a compiler rule.
+	pub call_args: Option<AssocTypeIdx>,
+	pub call_result: Option<AssocTypeIdx>,
 	pub function: Option<TraitIdx>,
 	pub value_type: Option<TraitIdx>,
 }
@@ -2605,7 +2611,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				self.functions.push(FunctionDef {
 					file_id,
 					namespace,
-					owner: FunctionOwner::Free,
+					owner: MemberOwner::Free,
 					name: signature.name,
 					params,
 					function_impls,
@@ -2760,6 +2766,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					ConstDef {
 						file_id,
 						namespace,
+						owner: MemberOwner::Free,
 						name: variant.inner.inner.name,
 					}
 				}));
@@ -2905,6 +2912,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				self.constants.push(ConstDef {
 					file_id,
 					namespace,
+					owner: MemberOwner::Free,
 					name: *name,
 				});
 				let def_key = self.push_def(
@@ -3029,7 +3037,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
-									owner: FunctionOwner::Trait(trait_index),
+									owner: MemberOwner::Trait(trait_index),
 									name: signature.name,
 									params,
 									function_impls,
@@ -3062,6 +3070,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.constants.push(ConstDef {
 								file_id,
 								namespace,
+								owner: MemberOwner::Trait(trait_index),
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
@@ -3147,6 +3156,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					members.push(member);
 				}
 
+				if self.intrinsics.call == Some(trait_index) {
+					let mut declared = |name: &str| {
+						let key =
+							BindingKey::ty(self.strings.get_or_intern(name));
+						match members[usize::from(*bindings.get(&key)?)].kind {
+							MemberKind::AssociatedType(assoc) => Some(assoc),
+							_ => None,
+						}
+					};
+					let (args, result) = (declared("Args"), declared("Result"));
+					self.intrinsics.call_args = args;
+					self.intrinsics.call_result = result;
+				}
 				let actual_index = self.push_trait(TraitDef {
 					typeset: None,
 					file_id,
@@ -3198,7 +3220,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
-									owner: FunctionOwner::InherentImpl(
+									owner: MemberOwner::InherentImpl(
 										block_index,
 									),
 									name: signature.name,
@@ -3235,6 +3257,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.constants.push(ConstDef {
 								file_id,
 								namespace,
+								owner: MemberOwner::InherentImpl(block_index),
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
@@ -3411,7 +3434,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
-									owner: FunctionOwner::Free,
+									owner: MemberOwner::Free,
 									name: signature.name,
 									params,
 									function_impls,
@@ -3621,9 +3644,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								self.push_function(FunctionDef {
 									file_id,
 									namespace,
-									owner: FunctionOwner::TraitImpl(
-										block_index,
-									),
+									owner: MemberOwner::TraitImpl(block_index),
 									name: signature.name,
 									params,
 									function_impls,
@@ -3656,6 +3677,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 							self.constants.push(ConstDef {
 								file_id,
 								namespace,
+								owner: MemberOwner::TraitImpl(block_index),
 								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {

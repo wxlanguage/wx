@@ -23,28 +23,24 @@ use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ArgOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::defs::{
-	BindingKey, FunctionIdx, FunctionOwner, InherentImplIdx, MemberKind,
-	StructIdx,
+	AssocTypeIdx, BindingKey, FunctionIdx, MemberKind, MemberOwner, StructIdx,
 };
-use crate::tir::obligations::BoundRequirements;
+use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::signatures::TypeContext;
 use crate::tir::types::{
-	Substitution, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+	Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
 };
 use crate::vfs::FileId;
 
-/// The function a call or a path selects, with what the call knows of it
-/// before its arguments are checked.
+/// A function a path or a value selects, with its flat type arguments,
+/// every frame on its chain outer first: what the selection knows, `INFER`
+/// where it knows nothing. The bounds of the first `proven` arguments were
+/// proven where it was selected; the call proves the frames after them once
+/// it has learned them.
 pub(super) struct Callee {
 	pub(super) function: FunctionIdx,
-	/// The arguments of the frames around the function's own: an impl's, or
-	/// `Self` for a trait's declaration; empty for a free function.
-	pub(super) leading: Box<[TypeIndex]>,
-	pub(super) dispatch: Dispatch,
-	/// The inherent impl the callee was selected from before the impl's
-	/// arguments were known, whose bounds the call proves once it has learned
-	/// them (`Layout::of::<T>()`).
-	pub(super) impl_bounds: Option<InherentImplIdx>,
+	pub(super) type_args: Box<[TypeIndex]>,
+	pub(super) proven: usize,
 }
 
 /// How a callee is reached.
@@ -58,12 +54,35 @@ pub(super) enum Dispatch {
 }
 
 impl Callee {
-	pub(super) fn free(function: FunctionIdx) -> Self {
+	/// `function` with `leading` for the frames around its own (an impl's,
+	/// or `Self` for a trait's declaration), the first `proven` of them
+	/// proven, its own arguments left to the call.
+	pub(super) fn new(
+		cx: &TypeContext<'_, '_, '_>,
+		function: FunctionIdx,
+		leading: &[TypeIndex],
+		proven: usize,
+	) -> Self {
+		let env = cx.functions[usize::from(function)].type_params;
+		let mut type_args =
+			vec![TypeIndex::INFER; cx.type_envs.generic_count(env)]
+				.into_boxed_slice();
+		type_args[..leading.len()].copy_from_slice(leading);
 		Self {
 			function,
-			leading: Box::new([]),
-			dispatch: Dispatch::Direct,
-			impl_bounds: None,
+			type_args,
+			proven,
+		}
+	}
+}
+
+impl Dispatch {
+	/// How a function or a constant `owner` declares is reached: a trait's
+	/// declaration through the impl its `Self` selects, any other itself.
+	pub(super) fn of(owner: MemberOwner) -> Self {
+		match owner {
+			MemberOwner::Trait(_) => Self::Abstract,
+			_ => Self::Direct,
 		}
 	}
 }
@@ -201,7 +220,7 @@ fn naming_declaration(
 	function: FunctionIdx,
 ) -> FunctionIdx {
 	let def = &cx.defs.functions[usize::from(function)];
-	let FunctionOwner::TraitImpl(impl_index) = def.owner else {
+	let MemberOwner::TraitImpl(impl_index) = def.owner else {
 		return function;
 	};
 	let Some(trait_index) = cx.impl_dispatch.trait_header(impl_index).trait_def
@@ -220,30 +239,73 @@ fn naming_declaration(
 }
 
 impl BodyContext<'_, '_, '_, '_> {
-	/// A function named without a call. It needs every type argument of its
-	/// own written, since nothing else gives them.
+	/// A function named without a call. Its type arguments are written, or
+	/// given by an expected item type of the same function (`local g: id<u8>
+	/// = id;`); there are no arguments to learn from.
 	pub(super) fn build_function_value(
 		&mut self,
 		callee: Callee,
 		segment: &ast::PathSegment,
+		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let function = callee.function;
+		let Callee {
+			function,
+			mut type_args,
+			proven,
+		} = callee;
 		let (env, own) = self.function_frames(function);
-		let mut type_args = self.callee_type_args(&callee, own, segment);
-		self.report_uninferred(env, segment.ident.span, false, &mut type_args);
-		let type_list = self.cx.types.push_list(&type_args);
-		self.check_impl_bounds(&callee, segment, type_list);
-		self.check_param_bounds(
-			&CallTarget::function(self.cx, function),
-			own,
+		self.write_type_args(
 			segment,
-			type_list,
-			&[],
+			own,
+			TypeEnvOwner::Function(function),
+			&mut type_args,
 		);
+		let mut mismatched = false;
+		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
+			let expected = self.normalized(expected, self.scope.env);
+			let declared = self.cx.types.intern_function(
+				function,
+				self.cx.type_envs.identity_args(env),
+			);
+			self.cx.types.learn(
+				&self.cx.type_envs,
+				env,
+				&mut type_args,
+				declared,
+				expected,
+			);
+			// No item of another type can teach its arguments: what is wrong
+			// is the type, not a missing annotation.
+			let same_item = matches!(
+				*self.cx.types.resolve(expected),
+				Type::Function { func_index, .. } if func_index == function
+			);
+			if !same_item
+				&& !self.cx.types.has_infer(expected)
+				&& type_args.iter().any(|&arg| self.cx.types.has_infer(arg))
+			{
+				let diagnostic = self.mismatch_at(expected, declared, span);
+				self.cx.diagnostics.push(diagnostic);
+				mismatched = true;
+			}
+		}
+		self.settle_uninferred(
+			env,
+			segment.ident.span,
+			mismatched,
+			&mut type_args,
+		);
+		let type_list = self.cx.types.push_list(&type_args);
+		let target = CallTarget::function(self.cx, function);
+		self.check_callee_bounds(&target, proven, segment, type_list, &[]);
 		let ty = self.cx.types.intern_function(function, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
-		self.body.push(ExprKind::Function(function), ty, span)
+		let kind = ExprKind::Function {
+			function,
+			type_args: type_list,
+		};
+		self.body.push(kind, ty, span)
 	}
 
 	/// `f(a, b)`, `Type::f(a, b)` or `receiver.f(a, b)`: a call of `callee`,
@@ -258,11 +320,20 @@ impl BodyContext<'_, '_, '_, '_> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let target = CallTarget::function(self.cx, callee.function);
-		let return_type =
-			self.cx.functions[usize::from(callee.function)].return_type;
-		let (env, own) = self.function_frames(callee.function);
-		let mut type_args = self.callee_type_args(&callee, own, segment);
+		let Callee {
+			function,
+			mut type_args,
+			proven,
+		} = callee;
+		let target = CallTarget::function(self.cx, function);
+		let return_type = self.cx.functions[usize::from(function)].return_type;
+		let (env, own) = self.function_frames(function);
+		self.write_type_args(
+			segment,
+			own,
+			TypeEnvOwner::Function(function),
+			&mut type_args,
+		);
 		// The result is learned from first: a disagreement teaches nothing,
 		// and the call's own type is held to the expected one by the caller.
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
@@ -300,22 +371,21 @@ impl BodyContext<'_, '_, '_, '_> {
 			span,
 		);
 		// A reported argument list may be why a type argument stays unknown.
-		let poisoned = expected == TypeIndex::ERROR
+		let already_reported = expected == TypeIndex::ERROR
 			|| reported
 			|| given.iter().any(|argument| {
 				self.cx.types.has_error(self.body.ty(argument.value))
 			});
-		self.report_uninferred(
+		self.settle_uninferred(
 			env,
 			segment.ident.span,
-			poisoned,
+			already_reported,
 			&mut type_args,
 		);
 		self.expect_arguments(&target, &type_args, &given);
 		// One stored list for the bound checks and the node.
 		let type_list = self.cx.types.push_list(&type_args);
-		self.check_impl_bounds(&callee, segment, type_list);
-		self.check_param_bounds(&target, own, segment, type_list, &given);
+		self.check_callee_bounds(&target, proven, segment, type_list, &given);
 		let order = match arguments {
 			Arguments::Positional(_) => ArgOrder::InOrder,
 			Arguments::Named(_) => self
@@ -327,15 +397,16 @@ impl BodyContext<'_, '_, '_, '_> {
 			.push_args(given.iter().map(|argument| argument.value));
 		let ty = self.instantiate(return_type, env, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
-		let kind = match callee.dispatch {
+		let owner = self.cx.defs.functions[usize::from(function)].owner;
+		let kind = match Dispatch::of(owner) {
 			Dispatch::Direct => ExprKind::Call {
-				function: callee.function,
+				function,
 				type_args: type_list,
 				args,
 				order,
 			},
 			Dispatch::Abstract => ExprKind::AbstractCall {
-				method: callee.function,
+				method: function,
 				type_args: type_list,
 				args,
 				order,
@@ -412,7 +483,9 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// `f(a, b)`: the n-th argument gives the n-th parameter after those
 	/// `given` holds. An argument past the last parameter is built and
-	/// dropped.
+	/// dropped. When one parameter is left, the parentheses only mark the
+	/// call: the whole list is its value, `()` for none and a tuple for
+	/// several, so `g(a, b)` is `g((a, b))`.
 	fn positional_arguments(
 		&mut self,
 		target: &CallTarget<'_>,
@@ -423,6 +496,11 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> bool {
 		let skipped = given.len();
 		let open = target.param_types.len() - skipped;
+		if open == 1 && arguments.len() != 1 {
+			return self.whole_argument_list(
+				target, type_args, arguments, given, span,
+			);
+		}
 		let reported = arguments.len() != open;
 		if reported {
 			self.report_argument_count(target, open, arguments.len(), span);
@@ -446,6 +524,50 @@ impl BodyContext<'_, '_, '_, '_> {
 			});
 		}
 		reported
+	}
+
+	/// The written list as the value of the one parameter left, when it is
+	/// not one argument. The parameter's type must be able to be that tuple:
+	/// one not known yet learns it (`id(1, 2)`), any other is a wrong count.
+	fn whole_argument_list(
+		&mut self,
+		target: &CallTarget<'_>,
+		type_args: &mut [TypeIndex],
+		arguments: &[Separated<Spanned<ast::Expression>>],
+		given: &mut Vec<GivenArgument>,
+		span: TextSpan,
+	) -> bool {
+		let param = ParamIdx::new(given.len() as u32);
+		let declared =
+			self.cx.types.list(target.param_types)[usize::from(param)];
+		let hint = self.instantiate(declared, target.type_env, type_args);
+		let fits = match *self.cx.types.resolve(hint) {
+			Type::Tuple { elements } => elements.len() == arguments.len(),
+			_ => self.cx.types.has_infer(hint),
+		};
+		if !fits {
+			if hint != TypeIndex::ERROR {
+				self.report_argument_count(target, 1, arguments.len(), span);
+			}
+			for argument in arguments {
+				self.build(&argument.inner, TypeIndex::INFER);
+			}
+			return true;
+		}
+		let span = match (arguments.first(), arguments.last()) {
+			(Some(first), Some(last)) => {
+				TextSpan::new(first.inner.span.start, last.inner.span.end)
+			}
+			_ => span,
+		};
+		let value = self.build_tuple(arguments, hint, span);
+		self.learn_argument(target, type_args, param, value);
+		given.push(GivenArgument {
+			param,
+			value,
+			expected: hint,
+		});
+		false
 	}
 
 	/// `f({ b: 2, a })`: each argument gives the parameter of its name, in
@@ -599,7 +721,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					ident: argument.name,
 					type_args: Box::new([]),
 				}];
-				self.build_path(&path, argument.name.span)
+				self.build_path(&path, hint, argument.name.span)
 			}
 		}
 	}
@@ -622,61 +744,26 @@ impl BodyContext<'_, '_, '_, '_> {
 		(env, own)
 	}
 
-	/// Records and checks the bounds of the impl `callee` was selected from
-	/// with arguments still unknown, now that the stored flat list
-	/// `type_args` holds them; they lead it, so the impl's arguments are its
-	/// prefix. Reported at the callee's name.
-	fn check_impl_bounds(
+	/// Proves, for the final flat `type_args`, the bounds of each frame on
+	/// `target`'s chain after the first `proven` arguments: the selection
+	/// proved those.
+	fn check_callee_bounds(
 		&mut self,
-		callee: &Callee,
+		target: &CallTarget<'_>,
+		proven: usize,
 		segment: &ast::PathSegment,
 		type_args: TypeList,
+		given: &[GivenArgument],
 	) {
-		let Some(impl_index) = callee.impl_bounds else {
-			return;
-		};
-		let env = self.cx.inherent_impls[usize::from(impl_index)]
-			.as_ref()
-			.expect("a selected impl has a header")
-			.type_params;
-		let arguments = type_args.prefix(self.cx.type_envs.generic_count(env));
-		let reference = SourceSpan::new(self.scope.file_id, segment.ident.span);
-		let mut obligations = Vec::new();
-		for index in 0..arguments.len() {
-			let argument = self.cx.types.list(arguments)[index];
-			self.cx.record_bounds_check(
-				&mut obligations,
-				self.scope.env,
-				BoundRequirements::Parameter {
-					env,
-					index,
-					arguments,
-				},
-				Spanned {
-					inner: argument,
-					span: segment.ident.span,
-				},
-				reference,
-				TypeEnvOwner::InherentImpl(impl_index),
-			);
+		let mut frame = target.type_env;
+		while frame != TypeEnvIdx::ROOT {
+			if self.cx.type_envs.parent_count(frame) >= proven {
+				self.check_frame_bounds(
+					target, frame, segment, type_args, given,
+				);
+			}
+			frame = self.cx.type_envs.parent(frame).unwrap();
 		}
-		self.cx.check_now(&obligations);
-	}
-
-	/// A callee's flat type arguments before its call is checked: the leading
-	/// ones it was selected with, then those written for its own parameters.
-	fn callee_type_args(
-		&mut self,
-		callee: &Callee,
-		own: TypeEnvIdx,
-		segment: &ast::PathSegment,
-	) -> Box<[TypeIndex]> {
-		let written = self.written_type_args(
-			segment,
-			own,
-			TypeEnvOwner::Function(callee.function),
-		);
-		callee.leading.iter().chain(&written).copied().collect()
 	}
 
 	/// `ty`, written with the parameters of `env`, with `args` for them. A
@@ -728,6 +815,411 @@ impl BodyContext<'_, '_, '_, '_> {
 					),
 				)
 				.with_label(target.kind.declared_here(self.cx)),
+		);
+	}
+}
+
+/// What a value is called through.
+enum ValueCallee {
+	/// `Call::call` of the value's type: its impl's, or the trait's
+	/// declaration over `[V]` for an abstract `V: Call` or a function item.
+	Call(Callee),
+	/// A function reference, `func(A) -> R`, which is callable by a compiler
+	/// rule.
+	Reference { param: TypeIndex, result: TypeIndex },
+}
+
+impl BodyContext<'_, '_, '_, '_> {
+	/// `v(a, b)` where `v` is a value, checked already: a local, a constant,
+	/// or a computed callee. Its type says how it is called: through its
+	/// `Call` impl, with the value as `self` and the arguments forming its
+	/// `Args`, or as a function reference. A function item's arguments are
+	/// its function's, by position or by name; any other type's form `Args`
+	/// as a parameter list forms a function's type: none give `()`, one
+	/// gives it whole, several give the elements of a tuple.
+	pub(super) fn build_value_call(
+		&mut self,
+		value: ExprIdx,
+		arguments: Arguments<'_>,
+		span: TextSpan,
+	) -> ExprIdx {
+		let ty = self.normalized(self.body.ty(value), self.scope.env);
+		let callee = self.value_callee(value, ty);
+		let item = match *self.cx.types.resolve(ty) {
+			Type::Function {
+				func_index,
+				type_args,
+			} => Some((func_index, type_args)),
+			_ => None,
+		};
+		let callee = match (callee, arguments, item) {
+			(None, ..) => {
+				self.build_unchecked_arguments(arguments);
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
+			(Some(_), Arguments::Named(_), None) => {
+				self.report_named_value_call(ty, span);
+				self.build_unchecked_arguments(arguments);
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
+			(
+				Some(ValueCallee::Reference { param, result }),
+				Arguments::Positional(arguments),
+				_,
+			) => {
+				let (values, _) =
+					self.build_packed_arguments(ty, param, arguments, span);
+				let args = self.body.push_args(values);
+				let kind = ExprKind::CallRef {
+					callee: value,
+					args,
+				};
+				return self.body.push(kind, result, span);
+			}
+			(Some(ValueCallee::Call(callee)), ..) => callee,
+			(Some(ValueCallee::Reference { .. }), Arguments::Named(_), _) => {
+				unreachable!("a function reference is not an item")
+			}
+		};
+		let (packed, result) = match (item, arguments) {
+			(Some((function, type_args)), _) => {
+				self.build_item_arguments(function, type_args, arguments, span)
+			}
+			// Read from the trait, not the impl's `call`, whose shape nothing
+			// has checked yet.
+			(None, Arguments::Positional(arguments)) => {
+				let intrinsics = &self.cx.defs.intrinsics;
+				let (args, result) =
+					(intrinsics.call_args, intrinsics.call_result);
+				let args_type = self.call_projection(ty, args);
+				let (values, formed) =
+					self.build_packed_arguments(ty, args_type, arguments, span);
+				let packed_type =
+					if formed { args_type } else { TypeIndex::ERROR };
+				let packed = match *values {
+					[value] => value,
+					_ => {
+						self.pack(values, ArgOrder::InOrder, packed_type, span)
+					}
+				};
+				(packed, self.call_projection(ty, result))
+			}
+			(None, Arguments::Named(_)) => unreachable!("reported above"),
+		};
+		let type_args = self.cx.types.push_list(&callee.type_args);
+		let args = self.body.push_args([value, packed]);
+		let owner = self.cx.defs.functions[usize::from(callee.function)].owner;
+		let kind = match Dispatch::of(owner) {
+			Dispatch::Direct => ExprKind::Call {
+				function: callee.function,
+				type_args,
+				args,
+				order: ArgOrder::InOrder,
+			},
+			Dispatch::Abstract => ExprKind::AbstractCall {
+				method: callee.function,
+				type_args,
+				args,
+				order: ArgOrder::InOrder,
+			},
+		};
+		self.body.push(kind, result, span)
+	}
+
+	/// The `Args` of a call of the item of `function`, applied to
+	/// `type_args`, and its `Result`: the arguments are checked as a call of
+	/// the function checks them, by position or by name, and placed where its
+	/// parameter list puts them. Both types are read from the function, whose
+	/// bounds were proven where the item was named.
+	fn build_item_arguments(
+		&mut self,
+		function: FunctionIdx,
+		type_args: TypeList,
+		arguments: Arguments<'_>,
+		span: TextSpan,
+	) -> (ExprIdx, TypeIndex) {
+		let target = CallTarget::function(self.cx, function);
+		let mut type_args: Box<[TypeIndex]> =
+			self.cx.types.list(type_args).into();
+		let mut given = Vec::new();
+		let reported = self.build_arguments(
+			&target,
+			&mut type_args,
+			arguments,
+			&mut given,
+			span,
+		);
+		self.expect_arguments(&target, &type_args, &given);
+		let return_type = self.cx.functions[usize::from(function)].return_type;
+		let result = self.instantiate(return_type, target.type_env, &type_args);
+		if let ([argument], 1) = (&given[..], target.param_types.len()) {
+			return (argument.value, result);
+		}
+		let order = match arguments {
+			Arguments::Positional(_) => ArgOrder::InOrder,
+			Arguments::Named(_) => self
+				.body
+				.push_permutation(given.iter().map(|argument| argument.param)),
+		};
+		let ty = if reported {
+			TypeIndex::ERROR
+		} else {
+			let declared: Box<[TypeIndex]> =
+				self.cx.types.list(target.param_types).into();
+			let elements: Vec<TypeIndex> = declared
+				.iter()
+				.map(|&declared| {
+					self.instantiate(declared, target.type_env, &type_args)
+				})
+				.collect();
+			self.cx.types.intern_tuple(&elements)
+		};
+		let values = given.iter().map(|argument| argument.value).collect();
+		(self.pack(values, order, ty, span), result)
+	}
+
+	/// `<ty as Call>::{assoc}`, normalized; `ERROR` when std declares no such
+	/// member.
+	fn call_projection(
+		&mut self,
+		ty: TypeIndex,
+		assoc: Option<AssocTypeIdx>,
+	) -> TypeIndex {
+		let (Some(trait_index), Some(assoc_type_index)) =
+			(self.cx.defs.intrinsics.call, assoc)
+		else {
+			return TypeIndex::ERROR;
+		};
+		let projection = self.cx.types.intern(Type::AssocTypeProjection {
+			trait_index,
+			assoc_type_index,
+			base: ty,
+		});
+		let projection = self.normalized(projection, self.scope.env);
+		self.cx.types.collapse_error(projection)
+	}
+
+	/// The packed `Args` of a call of a value as a tuple of `values`,
+	/// spanning them.
+	fn pack(
+		&mut self,
+		values: Vec<ExprIdx>,
+		order: ArgOrder,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let span = match (values.first(), values.last()) {
+			(Some(&first), Some(&last)) => TextSpan::new(
+				self.body.span(first).start,
+				self.body.span(last).end,
+			),
+			_ => span,
+		};
+		let elements = self.body.push_args(values);
+		self.body
+			.push(ExprKind::Tuple { elements, order }, ty, span)
+	}
+
+	/// How a value of type `ty` is called, or `None` when it cannot be
+	/// (reported, unless `ty` is an error).
+	fn value_callee(
+		&mut self,
+		value: ExprIdx,
+		ty: TypeIndex,
+	) -> Option<ValueCallee> {
+		if self.cx.types.has_error(ty) {
+			return None;
+		}
+		let call = self.cx.defs.intrinsics.call.and_then(|call_trait| {
+			let members = &self.cx.defs.traits[usize::from(call_trait)].members;
+			members.iter().find_map(|member| match member.kind {
+				MemberKind::Method(function) => Some((call_trait, function)),
+				_ => None,
+			})
+		});
+		let Some((call_trait, declaration)) = call else {
+			self.report_not_callable(value, ty);
+			return None;
+		};
+		// A trait's declaration is selected over `[Self]`.
+		let over_self = |cx| Callee::new(cx, declaration, &[ty], 1);
+		// A function item's impl is its own, which requires its function's
+		// bounds, proven where the item was named.
+		if let Type::Function { .. } = self.cx.types.resolve(ty) {
+			return Some(ValueCallee::Call(over_self(self.cx)));
+		}
+		let found = if self.cx.types.has_untyped(ty) {
+			Ok(None)
+		} else {
+			self.cx
+				.find_trait_impl_query(self.scope.env, ty, call_trait)
+		};
+		let callee = match found {
+			Ok(Some(TraitImplLookup::Concrete { impl_index, args })) => {
+				match self.cx.defs.select_trait_member(
+					impl_index,
+					MemberKind::Method(declaration),
+				) {
+					TraitMemberSelection::Impl(
+						MemberKind::Method(function)
+						| MemberKind::Function(function),
+					) => Callee::new(self.cx, function, &args, args.len()),
+					_ => over_self(self.cx),
+				}
+			}
+			Ok(Some(TraitImplLookup::Abstract)) => over_self(self.cx),
+			Ok(Some(TraitImplLookup::Builtin)) => {
+				let Type::FunctionRef { param, result } =
+					*self.cx.types.resolve(ty)
+				else {
+					unreachable!(
+						"only a function reference is called by a rule"
+					)
+				};
+				return Some(ValueCallee::Reference { param, result });
+			}
+			Ok(None) => {
+				self.report_not_callable(value, ty);
+				return None;
+			}
+			Err(error) => {
+				let site =
+					SourceSpan::new(self.scope.file_id, self.body.span(value));
+				let _ = self.cx.report_solver_error::<()>(Err(error), site);
+				return None;
+			}
+		};
+		Some(ValueCallee::Call(callee))
+	}
+
+	/// The arguments of a call of a value, checked against `args_type`, the
+	/// one parameter type its callee takes: one argument is it whole, any
+	/// other number are the elements of a tuple. Also whether they form it
+	/// (when not, it is reported).
+	fn build_packed_arguments(
+		&mut self,
+		callee_type: TypeIndex,
+		args_type: TypeIndex,
+		arguments: &[Separated<Spanned<ast::Expression>>],
+		span: TextSpan,
+	) -> (Vec<ExprIdx>, bool) {
+		if let [argument] = arguments {
+			let value = self.build(&argument.inner, args_type);
+			return (vec![self.expect(value, args_type)], true);
+		}
+		let element_types: Option<Box<[TypeIndex]>> =
+			match *self.cx.types.resolve(args_type) {
+				Type::Tuple { elements }
+					if elements.len() == arguments.len() =>
+				{
+					Some(self.cx.types.list(elements).into())
+				}
+				_ => None,
+			};
+		if element_types.is_none() && args_type != TypeIndex::ERROR {
+			self.report_value_argument_count(
+				callee_type,
+				args_type,
+				arguments.len(),
+				span,
+			);
+		}
+		let values = arguments
+			.iter()
+			.enumerate()
+			.map(|(at, argument)| {
+				let hint = element_types
+					.as_ref()
+					.map_or(TypeIndex::ERROR, |types| types[at]);
+				let value = self.build(&argument.inner, hint);
+				self.expect(value, hint)
+			})
+			.collect();
+		(values, element_types.is_some())
+	}
+
+	/// Checks the arguments of a call that has no target, for their own
+	/// diagnostics.
+	fn build_unchecked_arguments(&mut self, arguments: Arguments<'_>) {
+		match arguments {
+			Arguments::Positional(arguments) => {
+				for argument in arguments {
+					self.build(&argument.inner, TypeIndex::ERROR);
+				}
+			}
+			Arguments::Named(arguments) => {
+				for argument in arguments {
+					self.build_named_argument(
+						&argument.inner.inner,
+						TypeIndex::ERROR,
+					);
+				}
+			}
+		}
+	}
+
+	fn report_not_callable(&mut self, value: ExprIdx, ty: TypeIndex) {
+		let ty = self.cx.type_formatter().display_type(ty);
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TraitBoundViolation.code())
+				.with_message(format!(
+					"the trait bound `{ty}: Call` is not satisfied"
+				))
+				.with_label(
+					Label::primary(self.scope.file_id, self.body.span(value))
+						.with_message(format!(
+							"the trait `Call` is not implemented for `{ty}`"
+						)),
+				),
+		);
+	}
+
+	fn report_named_value_call(&mut self, ty: TypeIndex, span: TextSpan) {
+		let ty = self.cx.type_formatter().display_type(ty);
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::PositionalOnlyCall.code())
+				.with_message(format!(
+					"a value of type `{ty}` is called through `Call`, so it is \
+					 called by position"
+				))
+				.with_label(Label::primary(self.scope.file_id, span)),
+		);
+	}
+
+	fn report_value_argument_count(
+		&mut self,
+		callee_type: TypeIndex,
+		args_type: TypeIndex,
+		found: usize,
+		span: TextSpan,
+	) {
+		let expected = match *self.cx.types.resolve(args_type) {
+			Type::Tuple { elements } if elements.is_empty() => {
+				"no arguments".to_string()
+			}
+			Type::Tuple { elements } => {
+				format!("1 or {} arguments", elements.len())
+			}
+			_ => "1 argument".to_string(),
+		};
+		let formatter = self.cx.type_formatter();
+		let (callee_type, args_type) = (
+			formatter.display_type(callee_type),
+			formatter.display_type(args_type),
+		);
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::ArgumentCountMismatch.code())
+				.with_message(format!(
+					"a value of type `{callee_type}` is called with \
+					 `{args_type}`, but {found} arguments were supplied"
+				))
+				.with_label(
+					Label::primary(self.scope.file_id, span)
+						.with_message(format!("expected {expected}")),
+				),
 		);
 	}
 }

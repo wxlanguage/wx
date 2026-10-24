@@ -2464,9 +2464,13 @@ impl<'a> Builder<'a> {
 			ast::Expression::Int { .. } | ast::Expression::Float => {
 				self.source_text(expression.span)
 			}
-			ast::Expression::Grouping { value } => {
+			// A tuple of one is its element; its parentheses may still group
+			// it, so they are kept and its comma is dropped.
+			ast::Expression::Tuple { elements }
+				if let [value] = &**elements =>
+			{
 				let open = self.text(Text::LParen);
-				let val = self.build_expression(value);
+				let val = self.build_expression(&value.inner);
 				let close = self.text(Text::RParen);
 				self.arena.concat3(open, val, close)
 			}
@@ -2596,9 +2600,9 @@ impl<'a> Builder<'a> {
 					let last_idx = elements.len() - 1;
 					let mut element_items: Vec<NodeId> = vec![self.line()];
 					for (index, element) in elements.iter().enumerate() {
-						let el = self.build_expression(element);
+						let el = self.build_expression(&element.inner);
 						let mut nodes: Vec<NodeId> = vec![el];
-						if index < last_idx || elements.len() == 1 {
+						if index < last_idx {
 							nodes.push(self.text(Text::Comma));
 						} else {
 							nodes.push(self.if_break_comma());
@@ -2700,6 +2704,15 @@ impl<'a> Builder<'a> {
 			out.push(this.text(Text::RParen));
 		};
 		match destructure {
+			// A tuple of one is its element, unless it groups alternatives.
+			ast::Destructure::Tuple { elements: items }
+				if let [item] = &**items
+					&& let ast::PatternElement::Pattern(pattern) =
+						&item.inner.inner
+					&& !matches!(pattern, ast::Pattern::Or(_)) =>
+			{
+				self.build_pattern(out, pattern, item.inner.span);
+			}
 			ast::Destructure::Tuple { elements: items } => {
 				elements(self, out, items);
 			}
@@ -3014,6 +3027,10 @@ impl<'a> Builder<'a> {
 				]);
 				self.arena.concat(items)
 			}
+			// A tuple of one is its element.
+			ast::TypeExpression::Tuple { elements } if elements.len() == 1 => {
+				self.build_type_expression(&elements[0].inner.inner)
+			}
 			ast::TypeExpression::Tuple { elements } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::LParen)];
 
@@ -3021,9 +3038,10 @@ impl<'a> Builder<'a> {
 					let last_idx = elements.len() - 1;
 					let mut element_items: Vec<NodeId> = vec![self.line()];
 					for (index, element) in elements.iter().enumerate() {
-						let ty = self.build_type_expression(&element.inner);
+						let ty =
+							self.build_type_expression(&element.inner.inner);
 						let mut nodes: Vec<NodeId> = vec![ty];
-						if index < last_idx || elements.len() == 1 {
+						if index < last_idx {
 							nodes.push(self.text(Text::Comma));
 						} else {
 							nodes.push(self.if_break_comma());

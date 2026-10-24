@@ -1106,10 +1106,6 @@ pub enum Expression {
 	/// (`coerce_untyped_float_expr`), because the correct rounding (f32 vs f64)
 	/// isn't known until then. Same span-only treatment as `Char` / `String`.
 	Float,
-	/// `({expr})` — transparent grouping, same type as inner
-	Grouping {
-		value: Box<Spanned<Expression>>,
-	},
 	/// `5 as i32`
 	Cast {
 		value: Box<Spanned<Expression>>,
@@ -1229,9 +1225,10 @@ pub enum Expression {
 		inner: Box<Spanned<TypeExpression>>,
 		segments: Box<[PathSegment]>,
 	},
-	/// `(a, b, c)` or `()`
+	/// `(a, b, c)`, `(a)`, `(a,)` or `()`: any parenthesized list, as
+	/// written. One element is that element, which TIR unwraps.
 	Tuple {
-		elements: Box<[Spanned<Expression>]>,
+		elements: Box<[Separated<Spanned<Expression>>]>,
 	},
 	/// `[a, b, c]`
 	ArrayList {
@@ -1438,9 +1435,10 @@ pub enum TypeExpression {
 	/// `<...>` generic arguments. Turbofish is never accepted in type
 	/// position, only in expression position (see `parse_value_path`).
 	Path(Box<[PathSegment]>),
-	/// `(T, U, V)` or `()`
+	/// `(T, U, V)`, `(T)`, `(T,)` or `()`: any parenthesized list, as
+	/// written. One element is that type, which TIR unwraps.
 	Tuple {
-		elements: Box<[Spanned<TypeExpression>]>,
+		elements: Box<[Separated<Spanned<TypeExpression>>]>,
 	},
 	/// `func(i32, i32) -> i32`
 	Function {
@@ -3477,22 +3475,11 @@ impl<'ctx> Parser<'ctx> {
 		}
 		.parse(self)?;
 
-		let span = grouped.span;
-		let mut elements = Vec::from(grouped.inner);
-
-		if elements.len() == 1 && elements[0].separator.is_none() {
-			let single = elements.remove(0);
-			return Ok(Spanned {
-				inner: single.inner.inner,
-				span,
-			});
-		}
-
-		let types: Box<[Spanned<TypeExpression>]> =
-			elements.into_iter().map(|s| s.inner).collect();
 		Ok(Spanned {
-			inner: TypeExpression::Tuple { elements: types },
-			span,
+			inner: TypeExpression::Tuple {
+				elements: grouped.inner,
+			},
+			span: grouped.span,
 		})
 	}
 
@@ -4324,26 +4311,11 @@ impl<'ctx> Parser<'ctx> {
 		}
 		.parse(parser)?;
 
-		let span = grouped.span;
-		let mut elements = Vec::from(grouped.inner);
-
-		// (expr) with no trailing comma — grouping, not a tuple
-		if elements.len() == 1 && elements[0].separator.is_none() {
-			let single = elements.remove(0);
-			return Ok(Spanned {
-				inner: Expression::Grouping {
-					value: Box::new(single.inner),
-				},
-				span,
-			});
-		}
-
-		// () or (expr,) or (a, b, ...) — tuple
-		let exprs: Box<[Spanned<Expression>]> =
-			elements.into_iter().map(|s| s.inner).collect();
 		Ok(Spanned {
-			inner: Expression::Tuple { elements: exprs },
-			span,
+			inner: Expression::Tuple {
+				elements: grouped.inner,
+			},
+			span: grouped.span,
 		})
 	}
 

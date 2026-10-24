@@ -258,7 +258,7 @@ fn expression_kind(expression: &Expression) -> &'static str {
 		Expression::MethodCall(_) => "method-call",
 		Expression::NamedMethodCall(_) => "named-method-call",
 		Expression::ObjectAccess { .. } => "field",
-		Expression::Grouping { .. } => "grouping",
+		Expression::Tuple { .. } => "tuple",
 		Expression::Cast { .. } => "cast",
 		Expression::Float { .. } => "float",
 		Expression::Char => "char",
@@ -1459,13 +1459,15 @@ fn a_binding_without_a_type_recovers_with_an_error_type() {
 	}
 }
 
+/// Parentheses always make a `Tuple`, recorded as written, separators
+/// included; what one element means is TIR's.
 #[test]
-fn test_grouping_and_tuple_expressions() {
+fn test_parenthesized_lists_are_tuples_as_written() {
 	let case = TestCase::new(indoc! {"
         func shapes(x: i32, y: i32) {
             local grouped = (x);
             local single = (x,);
-            local pair = (x, y);
+            local pair = (x, y,);
         }
     "});
 
@@ -1473,15 +1475,18 @@ fn test_grouping_and_tuple_expressions() {
 	let statements = case.function_block(0);
 	assert!(matches!(
 		local_definition_value(statements, 0),
-		Expression::Grouping { .. }
+		Expression::Tuple { elements }
+			if matches!(&**elements, [element] if element.separator.is_none())
 	));
 	assert!(matches!(
 		local_definition_value(statements, 1),
-		Expression::Tuple { elements } if elements.len() == 1
+		Expression::Tuple { elements }
+			if matches!(&**elements, [element] if element.separator.is_some())
 	));
 	assert!(matches!(
 		local_definition_value(statements, 2),
-		Expression::Tuple { elements } if elements.len() == 2
+		Expression::Tuple { elements }
+			if matches!(&**elements, [_, last] if last.separator.is_some())
 	));
 }
 

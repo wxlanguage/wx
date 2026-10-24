@@ -22,7 +22,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::body::{ArgOrder, ConstBody, ExprIdx, ExprKind};
+use super::body::{ArgOrder, ConstBody, ExprIdx, ExprKind, ExprRange};
 use super::defs::{ConstIdx, EnumIdx, StructIdx};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
@@ -259,6 +259,43 @@ impl TypeContext<'_, '_, '_> {
 			.expect("a settled state is final")
 	}
 
+	/// The values of `args`, evaluated in written order and held in the
+	/// declared order `order` gives them.
+	fn eval_ordered(
+		&mut self,
+		owner: ConstIdx,
+		args: ExprRange,
+		order: ArgOrder,
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		let ArgOrder::Permuted { .. } = order else {
+			for at in 0..args.len() {
+				let arg = self.const_body(owner).unwrap().args(args)[at];
+				self.eval(owner, arg, stack)?;
+			}
+			return Ok(());
+		};
+		let start = stack.len();
+		let mut declared = Vec::with_capacity(args.len());
+		for at in 0..args.len() {
+			let body = self.const_body(owner).unwrap();
+			let (arg, index) =
+				(body.args(args)[at], body.declared_index(order, at));
+			let arg_start = stack.len();
+			self.eval(owner, arg, stack)?;
+			declared.push((
+				usize::from(index),
+				arg_start - start..stack.len() - start,
+			));
+		}
+		declared.sort_unstable_by_key(|&(index, _)| index);
+		let written = stack.split_off(start);
+		for (_, range) in declared {
+			stack.extend_from_slice(&written[range]);
+		}
+		Ok(())
+	}
+
 	/// Folds one node of `owner`'s body onto `stack`: it pushes the node's
 	/// numbers. Each step reads the node by index, so no borrow of the body is
 	/// held while a constant it names is evaluated.
@@ -282,9 +319,10 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::AbstractCall { .. }
 			| ExprKind::Local(_)
 			| ExprKind::Global(_)
-			| ExprKind::Function(_)
+			| ExprKind::Function { .. }
 			| ExprKind::Drop { .. }
 			| ExprKind::Call { .. }
+			| ExprKind::CallRef { .. }
 			| ExprKind::Cast { .. }
 			| ExprKind::FieldAccess { .. }
 			| ExprKind::Load(_)
@@ -359,13 +397,10 @@ impl TypeContext<'_, '_, '_> {
 				let operand = stack.pop().expect("an operand's value");
 				stack.push(unary(op, operand).map_err(own)?);
 			}
-			// Its values are its elements', in order, as its type's layout is.
-			ExprKind::Tuple { elements } => {
-				for at in 0..elements.len() {
-					let body = self.const_body(owner).unwrap();
-					let element = body.args(elements)[at];
-					self.eval(owner, element, stack)?;
-				}
+			// Its values are its elements', in declared order, as its type's
+			// layout is.
+			ExprKind::Tuple { elements, order } => {
+				self.eval_ordered(owner, elements, order, stack)?;
 			}
 			ExprKind::StructConstructor {
 				struct_index,
@@ -378,29 +413,7 @@ impl TypeContext<'_, '_, '_> {
 				if args.len() != count {
 					return Err(Halt::Silent);
 				}
-				// Evaluated in written order, held in declaration order.
-				let start = stack.len();
-				let mut fields = Vec::new();
-				for at in 0..count {
-					let body = self.const_body(owner).unwrap();
-					let (arg, field) =
-						(body.args(args)[at], body.declared_index(order, at));
-					let field_start = stack.len();
-					self.eval(owner, arg, stack)?;
-					if matches!(order, ArgOrder::Permuted { .. }) {
-						fields.push((
-							usize::from(field),
-							field_start - start..stack.len() - start,
-						));
-					}
-				}
-				if !fields.is_empty() {
-					fields.sort_unstable_by_key(|&(field, _)| field);
-					let written = stack.split_off(start);
-					for (_, range) in fields {
-						stack.extend_from_slice(&written[range]);
-					}
-				}
+				self.eval_ordered(owner, args, order, stack)?;
 			}
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				self.eval(owner, lhs, stack)?;
@@ -470,7 +483,8 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		const_index: ConstIdx,
 	) -> Result<Vec<Scalar>, ConstValueState> {
-		let (ty, scope) = self.constant_type(const_index);
+		let signature = &self.constants[usize::from(const_index)];
+		let (ty, scope) = (signature.ty, signature.env);
 		let mut scalars = Vec::new();
 		self.push_scalars(scope, ty, &mut scalars, &mut Vec::new())?;
 		Ok(scalars)

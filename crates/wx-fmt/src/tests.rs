@@ -3050,3 +3050,44 @@ fn test_format_current_syntax_forms() {
 // 		}
 // 	}
 // }
+
+/// A tuple of one is its element, so a type or a pattern is printed as the
+/// element; an expression keeps the parentheses, which may group it.
+#[test]
+fn test_format_one_element_tuple_as_its_element() {
+	let case = TestCase::new(indoc! {"
+        func f(x: (u8,), w: (u16)) -> u8 { local (y,) = (x,); local (z) = y; z }
+        func g(a: u8, b: u8, c: u8) -> u8 { (a + b,) * c }
+        func h(v: u8) { match v { (1 | 2,) -> {}, _ -> {} } }
+    "});
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            func f(x: u8, w: u16) -> u8 {
+                local y = (x);
+                local z = y;
+                z
+            }
+
+            func g(a: u8, b: u8, c: u8) -> u8 {
+                (a + b) * c
+            }
+
+            func h(v: u8) {
+                match v {
+                    (1 | 2) -> {},
+                    _ -> {},
+                }
+            }
+        "}
+	);
+}

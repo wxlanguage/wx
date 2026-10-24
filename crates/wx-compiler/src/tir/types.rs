@@ -584,6 +584,12 @@ impl TypeInterner {
 
 	/// Interns a type whose list, if it has one, is already stored.
 	pub fn intern(&mut self, ty: Type) -> TypeIndex {
+		// There is no tuple of one: it is its element.
+		if let Type::Tuple { elements } = ty
+			&& let [element] = *self.list(elements)
+		{
+			return element;
+		}
 		let (shape, list) = ty.split_list();
 		let hash = self.hasher.hash_one((shape, list.slice(&self.lists)));
 		match self.find(hash, shape, list.slice(&self.lists)) {
@@ -593,6 +599,10 @@ impl TypeInterner {
 	}
 
 	pub fn intern_tuple(&mut self, elements: &[TypeIndex]) -> TypeIndex {
+		// There is no tuple of one: it is its element.
+		if let [element] = *elements {
+			return element;
+		}
 		let shape = Type::Tuple {
 			elements: TypeList::EMPTY,
 		};
@@ -1741,8 +1751,9 @@ mod tests {
 		let wide = pair(&mut types, TypeIndex::INFER, TypeIndex::U32);
 		assert_eq!(types.meet(left, wide), None);
 		assert_eq!(types.meet(TypeIndex::U8, TypeIndex::U16), None);
-		let short = types.intern_tuple(&[left]);
-		assert_eq!(types.meet(outer, short), None);
+		let long =
+			types.intern_tuple(&[left, TypeIndex::BOOL, TypeIndex::BOOL]);
+		assert_eq!(types.meet(outer, long), None);
 		// A reported part takes the other side with it.
 		assert_eq!(types.meet(TypeIndex::ERROR, both), Some(TypeIndex::ERROR));
 	}
@@ -2053,7 +2064,7 @@ mod tests {
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
 		let original = types.intern_tuple(&[t, u]);
-		let replacement = types.intern_tuple(&[t]);
+		let replacement = types.intern_tuple(&[t, t]);
 		let expected = types.intern_tuple(&[u, replacement]);
 
 		assert_eq!(
@@ -2066,7 +2077,7 @@ mod tests {
 				}
 			),
 			expected,
-			"T -> U and U -> (T,) are simultaneous replacements"
+			"T -> U and U -> (T, T) are simultaneous replacements"
 		);
 	}
 

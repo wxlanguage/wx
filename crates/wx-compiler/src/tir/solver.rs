@@ -94,6 +94,28 @@ pub(super) enum LayoutValue {
 	Abstract(TypeIndex),
 }
 
+/// The value of `assoc_type_index` for `receiver`, whose trait the compiler
+/// answers from its structure: `func(A) -> R`'s `Call::Args` is `A` and its
+/// `Call::Result` is `R`.
+fn builtin_assoc_value(
+	view: &SolverView<'_>,
+	receiver: TypeIndex,
+	assoc_type_index: AssocTypeIdx,
+) -> Option<TypeIndex> {
+	let Type::FunctionRef { param, result } = *view.types.resolve(receiver)
+	else {
+		return None;
+	};
+	let intrinsics = &view.defs.intrinsics;
+	if Some(assoc_type_index) == intrinsics.call_args {
+		Some(param)
+	} else if Some(assoc_type_index) == intrinsics.call_result {
+		Some(result)
+	} else {
+		None
+	}
+}
+
 /// `ty`, a projection path over `root`, with `root` replaced by `onto`.
 fn rebase(
 	types: &mut TypeInterner,
@@ -1068,8 +1090,25 @@ impl Solver {
 		else {
 			return Err(SolverError::Poisoned);
 		};
-		let TraitImplLookup::Concrete { impl_index, args } = found else {
-			return Ok(projection);
+		let (impl_index, args) = match found {
+			TraitImplLookup::Concrete { impl_index, args } => {
+				(impl_index, args)
+			}
+			TraitImplLookup::Builtin => {
+				let Some(value) =
+					builtin_assoc_value(view, next_base, assoc_type_index)
+				else {
+					return Ok(projection);
+				};
+				return self.normalize(
+					view,
+					assumption_context,
+					value,
+					depth,
+					facts,
+				);
+			}
+			TraitImplLookup::Abstract => return Ok(projection),
 		};
 		let member = ImplMember {
 			impl_index,
@@ -1365,6 +1404,14 @@ impl Solver {
 			self.normalize_head_query(view, assumption_context, receiver)?;
 		if normalized == TypeIndex::ERROR {
 			return Err(SolverError::Poisoned);
+		}
+		// A function reference is called by a compiler rule.
+		if Some(required_trait) == view.defs.intrinsics.call
+			&& matches!(
+				view.types.resolve(normalized),
+				Type::FunctionRef { .. }
+			) {
+			return Ok(Some(TraitImplLookup::Builtin));
 		}
 		if let Some(target) =
 			ImplTarget::from_type(view.types.resolve(normalized))

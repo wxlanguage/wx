@@ -63,12 +63,11 @@ enum Member {
 	Function(Callee),
 	/// A function taking `self`.
 	Method(Callee),
-	/// A constant, with the arguments of the impl or trait around it, as a
-	/// callee has them.
+	/// A constant, with its flat type arguments: the impl's, or `Self` for a
+	/// trait's declaration (a constant has no parameters of its own).
 	Constant {
 		constant: ConstIdx,
-		leading: Box<[TypeIndex]>,
-		dispatch: Dispatch,
+		type_args: Box<[TypeIndex]>,
 	},
 }
 
@@ -141,23 +140,17 @@ impl BodyContext<'_, '_, '_, '_> {
 	pub(super) fn build_member_value(
 		&mut self,
 		path: MemberPath<'_>,
+		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		match self.select_member(&path) {
 			Some(Member::Function(callee) | Member::Method(callee)) => {
-				self.build_function_value(callee, path.member, span)
+				self.build_function_value(callee, path.member, expected, span)
 			}
 			Some(Member::Constant {
 				constant,
-				leading,
-				dispatch,
-			}) => self.build_constant(
-				constant,
-				&leading,
-				dispatch,
-				path.member,
-				span,
-			),
+				type_args,
+			}) => self.build_constant(constant, &type_args, path.member, span),
 			None => self.body.push(ExprKind::Error, TypeIndex::ERROR, span),
 		}
 	}
@@ -167,13 +160,11 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn build_constant(
 		&mut self,
 		constant: ConstIdx,
-		leading: &[TypeIndex],
-		dispatch: Dispatch,
+		type_args: &[TypeIndex],
 		member: &ast::PathSegment,
 		span: TextSpan,
 	) -> ExprIdx {
-		let (kind, ty) =
-			self.constant_value(constant, leading, dispatch, member);
+		let (kind, ty) = self.constant_value(constant, type_args, member);
 		self.body.push(kind, ty, span)
 	}
 
@@ -187,14 +178,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		match self.select_member(&path)? {
 			Member::Constant {
 				constant,
-				leading,
-				dispatch,
-			} => Some(self.constant_value(
-				constant,
-				&leading,
-				dispatch,
-				path.member,
-			)),
+				type_args,
+			} => Some(self.constant_value(constant, &type_args, path.member)),
 			Member::Function(_) | Member::Method(_) => {
 				let name = self.cx.strings.resolve(path.member.ident.inner);
 				self.cx.diagnostics.push(
@@ -220,8 +205,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn constant_value(
 		&mut self,
 		constant: ConstIdx,
-		leading: &[TypeIndex],
-		dispatch: Dispatch,
+		type_args: &[TypeIndex],
 		member: &ast::PathSegment,
 	) -> (ExprKind, TypeIndex) {
 		if !member.type_args.is_empty() {
@@ -233,20 +217,24 @@ impl BodyContext<'_, '_, '_, '_> {
 				TypeArgsNotAllowedOn::Declaration(DefKind::Const(constant)),
 			));
 		}
-		let (declared, env) = self.cx.constant_type(constant);
-		debug_assert_eq!(self.cx.type_envs.generic_count(env), leading.len());
+		let signature = &self.cx.constants[usize::from(constant)];
+		debug_assert_eq!(
+			self.cx.type_envs.generic_count(signature.env),
+			type_args.len()
+		);
 		let ty = self.cx.types.substitute(
-			declared,
+			signature.ty,
 			Substitution {
 				envs: &self.cx.type_envs,
-				env,
-				args: leading,
+				env: signature.env,
+				args: type_args,
 			},
 		);
 		let ty = self.normalized(ty, self.scope.env);
 		let ty = self.cx.types.collapse_error(ty);
-		let type_args = self.cx.types.push_list(leading);
-		let kind = match dispatch {
+		let owner = self.cx.defs.constants[usize::from(constant)].owner;
+		let type_args = self.cx.types.push_list(type_args);
+		let kind = match Dispatch::of(owner) {
 			Dispatch::Direct => ExprKind::Const {
 				constant,
 				type_args,
@@ -265,6 +253,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	pub(super) fn build_member_call(
 		&mut self,
 		path: MemberPath<'_>,
+		callee_span: TextSpan,
 		arguments: Arguments<'_>,
 		expected: TypeIndex,
 		span: TextSpan,
@@ -279,8 +268,17 @@ impl BodyContext<'_, '_, '_, '_> {
 					expected,
 					span,
 				),
-			Some(Member::Constant { .. }) => {
-				self.unsupported(span, "a call of an associated constant")
+			Some(Member::Constant {
+				constant,
+				type_args,
+			}) => {
+				let callee = self.build_constant(
+					constant,
+					&type_args,
+					path.member,
+					callee_span,
+				);
+				self.build_value_call(callee, arguments, span)
 			}
 			None => self.body.push(ExprKind::Error, TypeIndex::ERROR, span),
 		}
@@ -421,13 +419,13 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 		self.check_member_access(found, key, member);
 		let receiver = self.normalized(receiver, self.scope.env);
-		let mut impl_bounds = None;
-		let (kind, leading, dispatch) = match found {
-			ApplicableMember::Inherent { impl_index, kind }
+		// The impl's arguments, and whether the selection proved them; a
+		// trait's declaration is selected over `[Self]` instead.
+		let (kind, impl_args, proven) = match found {
+			ApplicableMember::Inherent { kind, .. }
 				if let Some(impl_args) = learned =>
 			{
-				impl_bounds = Some(impl_index);
-				(kind, impl_args, Dispatch::Direct)
+				(kind, Some(impl_args), false)
 			}
 			ApplicableMember::Inherent { impl_index, kind } => {
 				let header = self.cx.inherent_impls[usize::from(impl_index)]
@@ -444,7 +442,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						header.type_params,
 					)
 					.expect("the selected impl's target matches the receiver");
-				(kind, leading, Dispatch::Direct)
+				(kind, Some(leading), true)
 			}
 			ApplicableMember::TraitImplMember {
 				trait_index,
@@ -462,33 +460,30 @@ impl BodyContext<'_, '_, '_, '_> {
 					else {
 						unreachable!("the lookup selected this impl")
 					};
-					(kind, args, Dispatch::Direct)
+					(kind, Some(args), true)
 				}
 				TraitMemberSelection::TraitDeclaration(declaration) => {
-					(declaration, Box::from([receiver]), Dispatch::Abstract)
+					(declaration, None, true)
 				}
 			},
 			ApplicableMember::AbstractTraitMember { declaration, .. } => {
-				(declaration, Box::from([receiver]), Dispatch::Abstract)
+				(declaration, None, true)
 			}
 		};
+		let leading = impl_args
+			.as_deref()
+			.unwrap_or(std::slice::from_ref(&receiver));
+		let proven = if proven { leading.len() } else { 0 };
 		Some(match kind {
-			MemberKind::Function(function) => Member::Function(Callee {
-				function,
-				leading,
-				dispatch,
-				impl_bounds,
-			}),
-			MemberKind::Method(function) => Member::Method(Callee {
-				function,
-				leading,
-				dispatch,
-				impl_bounds,
-			}),
+			MemberKind::Function(function) => Member::Function(Callee::new(
+				self.cx, function, leading, proven,
+			)),
+			MemberKind::Method(function) => {
+				Member::Method(Callee::new(self.cx, function, leading, proven))
+			}
 			MemberKind::Constant(constant) => Member::Constant {
 				constant,
-				leading,
-				dispatch,
+				type_args: impl_args.unwrap_or_else(|| Box::from([receiver])),
 			},
 			MemberKind::AssociatedType(_) => {
 				unreachable!("a value lookup finds no associated type")

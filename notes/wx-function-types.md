@@ -43,14 +43,29 @@ is sugar for it:
 | `func(A) -> R`       | `A`            |
 | `func(A, B) -> R`    | `(A, B)`       |
 | `func((A, B)) -> R`  | `(A, B)`, the same type as `func(A, B) -> R` |
-| `func((A,)) -> R`    | `(A,)`, distinct from `func(A) -> R` |
 
-- **`(T)` is grouping, `(T,)` is the one-element tuple,** as in Rust. So
-  `func(A)` and `func((A,))` are different types, and no one-element tuple appears
-  unless written.
+- **There is no one-element tuple.** `(T)` and `(T,)` are both `T`, in types,
+  expressions and patterns, as in ML: a trailing comma changes nothing in any
+  list. Rust needs `(A,)` because `Fn(A)` is `Fn<(A,)>`, its arguments always a
+  tuple; here one parameter's type is the parameter itself, so nothing needs a
+  tuple of one. So `func((A,))` is `func(A)`.
 - **A declared function's parameter type follows the same table:**
   `func f(a: A, b: B)` has `(A, B)`, `func f(x: A)` has `A`, `func f()` has `()`.
-  `func g(p: (A, B))` therefore has the same type as `func f(a: A, b: B)`.
+  `func g(p: (A, B))` therefore has the same `Call::Args`, and the same
+  reference type, as `func f(a: A, b: B)`. The two are still different
+  items, and are called differently.
+- **A declaration decides how it is called,** not its `Args`. The parentheses
+  of a call only mark it: when the arguments fill one parameter, the whole
+  list is that parameter's value (`()` for none, a tuple for several);
+  otherwise each argument gives one parameter, and nothing is wrapped. So
+  `g(a, b)`, `g((a, b))` and `g({ p: (a, b) })` call `g`, while `f(a, b)` and
+  `f({ a, b })` call `f` and `f((a, b))` is a wrong count. A generic lone
+  parameter learns the tuple (`id(1, 2)` gives `T = (_, _)`). A method's
+  receiver fills its first parameter, so `x.m(a, b)` for `m(self: Self, p:
+  (A, B))` is `p = (a, b)`, while `T::m(x, (a, b))` must wrap it. A function
+  reference or any other value called through `Call` has one unnamed
+  parameter, `Args`, so the same rule makes `r(a, b)` and `r((a, b))` the same
+  call.
 - **Rebuilding** needs no new syntax: `func(F::Args) -> F::Result` is exactly
   the type of `F`.
 - **Equality** is equality of the parameter types. The sugar is resolved when
@@ -221,8 +236,8 @@ func table_init<T: FuncTable, F: Function>(
    call (`apply(f, (5,))`), and `func(..u32)`, a type no item can have. Its one
    real objection to the one-parameter rule, that the ABI must flatten a tuple
    and a parameter list alike, is met by the flattening convention (§2).
-7. **`func(i32,)` forcing a one-element tuple.** It is only another spelling of
-   `func((i32,))`, and Rust readers expect it to mean `func(i32)`.
+7. **`func(i32,)` forcing a one-element tuple.** There is no one-element tuple;
+   `func(i32,)` is `func(i32)`.
 
 ---
 

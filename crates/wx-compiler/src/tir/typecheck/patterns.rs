@@ -475,6 +475,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		context: &mut PatternContext,
 	) -> PatIdx {
 		match destructure {
+			// A tuple of one is its element: `(p,)` and `(p)` are `p`.
+			ast::Destructure::Tuple { elements }
+				if let [element] = &**elements
+					&& let ast::PatternElement::Pattern(pattern) =
+						&element.inner.inner =>
+			{
+				self.check_one_pattern(
+					pattern,
+					element.inner.span,
+					expected,
+					context,
+				)
+			}
 			ast::Destructure::Tuple { elements } => {
 				let types = match *self.cx.types.resolve(expected) {
 					Type::Tuple { elements } => {
@@ -839,10 +852,13 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.cx.diagnostics.push(diagnostic);
 			}
 			let params = self.cx.structs[usize::from(struct_index)].type_params;
-			let written = self.written_type_args(
+			let count = self.cx.type_envs.param_names(params).len();
+			let mut written = vec![TypeIndex::INFER; count].into_boxed_slice();
+			self.write_type_args(
 				segment,
 				params,
 				TypeEnvOwner::Struct(struct_index),
+				&mut written,
 			);
 			(struct_index, written)
 		};
@@ -1030,8 +1046,9 @@ impl BodyContext<'_, '_, '_, '_> {
 				match kind {
 					DefKind::Const(constant)
 					| DefKind::EnumVariant(constant) => {
-						let (ty, scope) = self.cx.constant_type(constant);
-						let ty = self.normalized(ty, scope);
+						let signature =
+							&self.cx.constants[usize::from(constant)];
+						let ty = self.normalized(signature.ty, signature.env);
 						let kind = PatternKind::Constant {
 							constant,
 							type_args: TypeList::EMPTY,

@@ -63,7 +63,9 @@ use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
 };
-use crate::ast::{self, BinaryOp, Keyword, Ownership, Spanned, UnaryOp};
+use crate::ast::{
+	self, BinaryOp, Keyword, Ownership, Separated, Spanned, UnaryOp,
+};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
 
@@ -245,7 +247,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.push(ExprKind::Bool(false), TypeIndex::BOOL, span)
 			}
 			ast::Expression::Char => self.build_char(span),
-			ast::Expression::Grouping { value } => self.build(value, expected),
 			ast::Expression::Unary { operator, operand } => {
 				self.build_unary(*operator, operand, expected, span)
 			}
@@ -254,7 +255,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				operator,
 				right,
 			} => self.build_binary(*operator, left, right, expected, span),
-			ast::Expression::Path(segments) => self.build_path(segments, span),
+			ast::Expression::Path(segments) => {
+				self.build_path(segments, expected, span)
+			}
 			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
 				Arguments::Positional(arguments),
@@ -348,7 +351,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::String => self.build_string(span),
 			ast::Expression::QualifiedPath { .. }
 			| ast::Expression::Grouped { .. } => match self.resolve_rooted_path(expr) {
-				Ok(path) => self.build_member_value(path, span),
+				Ok(path) => self.build_member_value(path, expected, span),
 				Err(error) => error,
 			},
 			ast::Expression::ArrayList { .. }
@@ -396,13 +399,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// A tuple, each element built with the expected type's element at its
 	/// position when the expected type is a tuple as long. Its type is its
 	/// elements': one with an untyped literal in it is untyped, and takes its
-	/// type from context later, as a literal does (`coerce`).
+	/// type from context later, as a literal does (`coerce`). A tuple of one
+	/// is its element: `(x,)` is `(x)`.
 	fn build_tuple(
 		&mut self,
-		elements: &[Spanned<ast::Expression>],
+		elements: &[Separated<Spanned<ast::Expression>>],
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
+		if let [element] = elements {
+			return self.build(&element.inner, expected);
+		}
 		let hints = match *self.cx.types.resolve(expected) {
 			Type::Tuple { elements: hints }
 				if hints.len() == elements.len() =>
@@ -418,14 +425,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				Some(hints) => self.cx.types.list(hints)[at],
 				None => TypeIndex::INFER,
 			};
-			let value = self.build(element, hint);
+			let value = self.build(&element.inner, hint);
 			values.push(value);
 			types.push(self.body.ty(value));
 		}
 		let ty = self.cx.types.intern_tuple(&types);
 		let ty = self.cx.types.collapse_error(ty);
 		let elements = self.body.push_args(values);
-		self.body.push(ExprKind::Tuple { elements }, ty, span)
+		let kind = ExprKind::Tuple {
+			elements,
+			order: ArgOrder::InOrder,
+		};
+		self.body.push(kind, ty, span)
 	}
 
 	/// A string literal stays untyped (`Type::String`) until its context
@@ -481,6 +492,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn build_path(
 		&mut self,
 		segments: &[ast::PathSegment],
+		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		if let [segment] = segments
@@ -505,7 +517,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let walk = match self.resolve_value_path(segments, span) {
 			Ok(ValuePath::Item(walk)) => walk,
 			Ok(ValuePath::Member(path)) => {
-				return self.build_member_value(path, span);
+				return self.build_member_value(path, expected, span);
 			}
 			Err(error) => return error,
 		};
@@ -528,8 +540,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		match kind {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
-				let (ty, scope) = self.cx.constant_type(const_index);
-				let ty = self.normalized(ty, scope);
+				let signature = &self.cx.constants[usize::from(const_index)];
+				let ty = self.normalized(signature.ty, signature.env);
 				let kind = ExprKind::Const {
 					constant: const_index,
 					type_args: TypeList::EMPTY,
@@ -542,8 +554,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 			DefKind::Function(function_index) => self.build_function_value(
-				Callee::free(function_index),
+				Callee::new(self.cx, function_index, &[], 0),
 				segments.last().unwrap(),
+				expected,
 				span,
 			),
 			// A global's name is its handle, of its own nominal type: its value
@@ -669,8 +682,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		);
 	}
 
-	/// A call: of a function named by a path, or the construction of a
-	/// struct.
+	/// A call: of a function named by a path, the construction of a struct,
+	/// or of any other value whose type is callable (`build_value_call`).
 	fn build_call(
 		&mut self,
 		callee: &Spanned<ast::Expression>,
@@ -683,20 +696,28 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::QualifiedPath { .. }
 			| ast::Expression::Grouped { .. } => {
 				return match self.resolve_rooted_path(callee) {
-					Ok(path) => {
-						self.build_member_call(path, arguments, expected, span)
-					}
+					Ok(path) => self.build_member_call(
+						path,
+						callee.span,
+						arguments,
+						expected,
+						span,
+					),
 					Err(error) => error,
 				};
 			}
 			_ => {
-				return self.unsupported(span, "a call of a computed callee");
+				let callee = self.build(callee, TypeIndex::INFER);
+				return self.build_value_call(callee, arguments, span);
 			}
 		};
 		if let [segment] = &**segments
+			&& segment.type_args.is_empty()
 			&& self.lookup_local(segment.ident.inner).is_some()
 		{
-			return self.unsupported(span, "a call of a local");
+			let callee =
+				self.build_path(segments, TypeIndex::INFER, callee.span);
+			return self.build_value_call(callee, arguments, span);
 		}
 		// `Self(..)` constructs the struct the impl around it is for, with
 		// that target's arguments.
@@ -728,7 +749,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let walk = match self.resolve_value_path(segments, span) {
 			Ok(ValuePath::Item(walk)) => walk,
 			Ok(ValuePath::Member(path)) => {
-				return self.build_member_call(path, arguments, expected, span);
+				return self.build_member_call(
+					path,
+					callee.span,
+					arguments,
+					expected,
+					span,
+				);
 			}
 			Err(error) => return error,
 		};
@@ -736,6 +763,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		let kind = key.symbol_kind(self.cx.defs);
+		// Any other item is called as the value it names.
+		if !matches!(kind, DefKind::Struct(_) | DefKind::Function(_)) {
+			let callee =
+				self.build_path(segments, TypeIndex::INFER, callee.span);
+			return self.build_value_call(callee, arguments, span);
+		}
 		let DefKind::Struct(struct_index) = kind else {
 			if let BindingTarget::Inaccessible(_) = walk.target {
 				let segment = &segments[walk.stopped_at as usize];
@@ -747,18 +780,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Some(key),
 				));
 			}
-			return match kind {
-				DefKind::Function(function_index) => self.build_function_call(
-					Callee::free(function_index),
-					segments.last().unwrap(),
-					None,
-					arguments,
-					expected,
-					span,
-				),
-				_ => self
-					.unsupported(span, &format!("a call of a {}", kind.noun())),
+			let DefKind::Function(function_index) = kind else {
+				unreachable!("any other item is called as a value")
 			};
+			return self.build_function_call(
+				Callee::new(self.cx, function_index, &[], 0),
+				segments.last().unwrap(),
+				None,
+				arguments,
+				expected,
+				span,
+			);
 		};
 		let segment = segments.last().unwrap();
 		if let BindingTarget::Inaccessible(key) = walk.target {
@@ -803,20 +835,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			span,
 		);
 		// A reported argument list may be why a type argument stays unknown.
-		let poisoned = expected == TypeIndex::ERROR
+		let already_reported = expected == TypeIndex::ERROR
 			|| reported
 			|| given.iter().any(|argument| {
 				self.cx.types.has_error(self.body.ty(argument.value))
 			});
-		self.report_uninferred(
+		self.settle_uninferred(
 			target.type_env,
 			segment.ident.span,
-			poisoned,
+			already_reported,
 			&mut type_args,
 		);
 		self.expect_arguments(&target, &type_args, &given);
 		let type_list = self.cx.types.push_list(&type_args);
-		self.check_param_bounds(
+		self.check_frame_bounds(
 			&target,
 			target.type_env,
 			segment,
@@ -858,10 +890,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Box<[TypeIndex]> {
 		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
 		let count = self.cx.type_envs.param_names(params_env).len();
-		let mut type_args = self.written_type_args(
+		let mut type_args = vec![TypeIndex::INFER; count].into_boxed_slice();
+		self.write_type_args(
 			segment,
 			params_env,
 			TypeEnvOwner::Struct(struct_index),
+			&mut type_args,
 		);
 		if expected == TypeIndex::INFER {
 			return type_args;
@@ -885,68 +919,83 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		type_args
 	}
 
-	/// The type arguments written on `segment` for the parameters of
-	/// `params_env` (`_` anywhere in one is unknown); `INFER` per parameter
-	/// when none are written, `ERROR` per parameter when the count is wrong.
-	fn written_type_args(
+	/// Writes the type arguments written on `segment` for the parameters of
+	/// `params_env` into their slots of `type_args`, the flat list of its
+	/// chain. A `_` written as a whole argument leaves its slot as it is (`_`
+	/// inside one, `W<_>`, is written); a wrong count makes every slot of the
+	/// frame `ERROR`.
+	fn write_type_args(
 		&mut self,
 		segment: &ast::PathSegment,
 		params_env: TypeEnvIdx,
 		owner: TypeEnvOwner,
-	) -> Box<[TypeIndex]> {
-		let count = self.cx.type_envs.param_names(params_env).len();
+		type_args: &mut [TypeIndex],
+	) {
 		if segment.type_args.is_empty() {
-			return vec![TypeIndex::INFER; count].into_boxed_slice();
+			return;
 		}
+		let start = self.cx.type_envs.parent_count(params_env);
+		let len = self.cx.type_envs.param_names(params_env).len();
+		let slots = &mut type_args[start..start + len];
 		let mut obligations = Vec::new();
-		let mut written = Vec::with_capacity(segment.type_args.len());
-		for arg in &segment.type_args {
-			written.push(self.cx.resolve_type(
+		// Every written argument is resolved, extra ones too, for their own
+		// diagnostics.
+		for (at, arg) in segment.type_args.iter().enumerate() {
+			let ty = self.cx.resolve_type(
 				&mut obligations,
 				self.scope,
 				arg,
 				InferPolicy::Allow,
-			));
+			);
+			if let Some(slot) = slots.get_mut(at)
+				&& ty != TypeIndex::INFER
+			{
+				*slot = ty;
+			}
 		}
 		self.cx.check_now(&obligations);
 		if !self
 			.cx
 			.check_type_arg_count(self.scope, segment, params_env, owner)
 		{
-			return vec![TypeIndex::ERROR; count].into_boxed_slice();
+			slots.fill(TypeIndex::ERROR);
 		}
-		written.into_boxed_slice()
 	}
 
-	/// Records and checks the bounds of the parameters of `params_env` (a
-	/// struct's or a function's own frame) for their final type arguments, at
-	/// the call, wherever they were learned from. `type_args` are flat: the
-	/// frames around `params_env` first, whose bounds the selection of the
-	/// callee proved. Each is reported at its written argument, else at the
-	/// value given for a parameter of `target` whose declared type is that
-	/// type parameter, else at the name. `arguments` is the stored list the
-	/// caller shares with whatever else reads it (the call's node).
-	fn check_param_bounds(
+	/// Records and checks the bounds of the parameters of `frame`, a frame on
+	/// `target`'s chain, for their final type arguments, at the call,
+	/// wherever they were learned from. `arguments` are flat, the stored list
+	/// the caller shares with whatever else reads it (the call's node). Each
+	/// is reported at its written argument (the target's own frame is the
+	/// one written on `segment`), else at the value given for a parameter of
+	/// `target` whose declared type is that type parameter, else at the name.
+	fn check_frame_bounds(
 		&mut self,
 		target: &CallTarget<'_>,
-		params_env: TypeEnvIdx,
+		frame: TypeEnvIdx,
 		segment: &ast::PathSegment,
 		arguments: TypeList,
 		given: &[GivenArgument],
 	) {
-		let own = self.cx.type_envs.param_names(params_env).len();
+		let own = self.cx.type_envs.param_names(frame).len();
 		if own == 0 {
 			return;
 		}
+		let start = self.cx.type_envs.parent_count(frame);
+		let arguments = arguments.prefix(start + own);
+		let owner = self.cx.type_envs.owner(frame);
+		let written: &[_] = if owner == target.kind.owner() {
+			&segment.type_args
+		} else {
+			&[]
+		};
 		let mut obligations = Vec::new();
-		let leading = arguments.len() - own;
 		for index in 0..own {
-			let argument = self.cx.types.list(arguments)[leading + index];
-			let span = match segment.type_args.get(index) {
+			let argument = self.cx.types.list(arguments)[start + index];
+			let span = match written.get(index) {
 				Some(written) => written.span,
 				None => {
-					let param =
-						self.cx.type_envs.param_types(params_env)[index];
+					let param = self.cx.type_envs.param_types(frame)[index];
 					let mut span = segment.ident.span;
 					for argument in given {
 						if self.cx.types.list(target.param_types)
@@ -964,7 +1013,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				&mut obligations,
 				self.scope.env,
 				BoundRequirements::Parameter {
-					env: params_env,
+					env: frame,
 					index,
 					arguments,
 				},
@@ -973,22 +1022,22 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					span,
 				},
 				SourceSpan::new(self.scope.file_id, span),
-				target.kind.owner(),
+				owner,
 			);
 		}
 		self.cx.check_now(&obligations);
 	}
 
-	/// Reports each parameter on `params_env`'s chain whose argument in the
-	/// flat `args` is still not fully known (an `INFER` anywhere in it), and
-	/// makes it `ERROR`. Nothing is reported in a `poisoned` call (an `ERROR`
-	/// expectation, an argument that failed): whatever failed has said why,
-	/// and may be why nothing was learned.
-	fn report_uninferred(
+	/// Makes `ERROR` each argument in the flat `args` for `params_env`'s
+	/// chain that is still not fully known (an `INFER` anywhere in it), and
+	/// reports its parameter. Nothing is reported when `already_reported`
+	/// (an `ERROR` expectation, an argument that failed, a mismatched item):
+	/// whatever failed has said why, and may be why nothing was learned.
+	fn settle_uninferred(
 		&mut self,
 		params_env: TypeEnvIdx,
 		span: TextSpan,
-		poisoned: bool,
+		already_reported: bool,
 		args: &mut [TypeIndex],
 	) {
 		for at in 0..args.len() {
@@ -996,7 +1045,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				continue;
 			}
 			args[at] = TypeIndex::ERROR;
-			if poisoned {
+			if already_reported {
 				continue;
 			}
 			let frame = self
@@ -1221,7 +1270,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.body.ty(operand);
 		if ty == TypeIndex::STRING {
 			return self.report_operator_on_string(
-				DiagnosticCode::UnaryOperatorCannotBeApplied,
 				op.inner.as_str(),
 				operand,
 				span,
@@ -1309,7 +1357,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
 					if ty == TypeIndex::STRING {
 						return self.report_operator_on_string(
-							DiagnosticCode::BinaryOperatorCannotBeApplied,
 							op.inner.as_str(),
 							operand,
 							span,
@@ -1399,7 +1446,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.body.span(operand),
 			op.span,
 			op.inner.as_str(),
-			DiagnosticCode::UnaryOperatorCannotBeApplied,
 		) else {
 			return (ExprKind::Error, TypeIndex::ERROR);
 		};
@@ -1441,7 +1487,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.body.span(lhs),
 			op.span,
 			op.inner.as_str(),
-			DiagnosticCode::BinaryOperatorCannotBeApplied,
 		) else {
 			return (ExprKind::Error, TypeIndex::ERROR);
 		};
@@ -1469,8 +1514,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		method: Option<OperatorMethod>,
 		operand_span: TextSpan,
 		op_span: TextSpan,
-		op_text: &str,
-		code: DiagnosticCode,
+		op: &str,
 	) -> Option<(OperatorMethod, TraitImplLookup)> {
 		if ty == TypeIndex::ERROR {
 			return None;
@@ -1495,18 +1539,35 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			None => None,
 		};
 		if found.is_none() {
+			let ty = self.cx.type_formatter().display_type(ty).to_string();
+			let label = Label::primary(self.scope.file_id, operand_span);
+			let (message, label) = match method {
+				Some(method) => {
+					let name = self.cx.defs.traits
+						[usize::from(method.trait_index)]
+					.name
+					.inner;
+					let name = self.cx.strings.resolve(name).unwrap();
+					(
+						format!(
+							"the trait bound `{ty}: {name}` is not satisfied"
+						),
+						label.with_message(format!(
+							"the trait `{name}` is not implemented for `{ty}`"
+						)),
+					)
+				}
+				None => (format!("cannot apply `{op}` to `{ty}`"), label),
+			};
 			self.cx.diagnostics.push(
 				Diagnostic::error()
-					.with_code(code.code())
-					.with_message(format!(
-						"operator `{op_text}` cannot be applied to type `{}`",
-						self.cx.type_formatter().display_type(ty)
-					))
-					.with_label(Label::primary(
-						self.scope.file_id,
-						operand_span,
-					))
-					.with_label(Label::secondary(self.scope.file_id, op_span)),
+					.with_code(DiagnosticCode::TraitBoundViolation.code())
+					.with_message(message)
+					.with_label(label)
+					.with_label(
+						Label::secondary(self.scope.file_id, op_span)
+							.with_message(format!("required by `{op}`")),
+					),
 			);
 		}
 		found
@@ -1615,8 +1676,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ExprKind::String(contents) => {
 				return self.coerce_string(expr, contents, target);
 			}
-			ExprKind::Tuple { elements } => {
-				return self.coerce_tuple(expr, elements, target);
+			ExprKind::Tuple { elements, order } => {
+				return self.coerce_tuple(expr, elements, order, target);
 			}
 			// A block is untyped through its result, an `if` through its
 			// branches: each untyped one takes the type.
@@ -1763,6 +1824,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		expr: ExprIdx,
 		elements: ExprRange,
+		order: ArgOrder,
 		target: TypeIndex,
 	) {
 		let targets = match *self.cx.types.resolve(target) {
@@ -1779,12 +1841,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				return self.body.set_ty(expr, TypeIndex::ERROR);
 			}
 		};
-		let mut types = Vec::with_capacity(elements.len());
+		let mut types = vec![TypeIndex::ERROR; elements.len()];
 		for at in 0..elements.len() {
 			let element = self.body.args(elements)[at];
-			let element_target = self.cx.types.list(targets)[at];
+			let position = usize::from(self.body.declared_index(order, at));
+			let element_target = self.cx.types.list(targets)[position];
 			let element = self.expect(element, element_target);
-			types.push(self.body.ty(element));
+			types[position] = self.body.ty(element);
 		}
 		let ty = self.cx.types.intern_tuple(&types);
 		let ty = self.cx.types.collapse_error(ty);
@@ -2003,14 +2066,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// An operator applied to an untyped string literal.
 	fn report_operator_on_string(
 		&mut self,
-		code: DiagnosticCode,
 		op: &str,
 		operand: ExprIdx,
 		span: TextSpan,
 	) -> ExprIdx {
 		self.cx.diagnostics.push(
 			Diagnostic::error()
-				.with_code(code.code())
+				.with_code(DiagnosticCode::TraitBoundViolation.code())
 				.with_message(format!(
 					"cannot apply `{op}` to a string literal"
 				))
@@ -2320,7 +2382,7 @@ mod tests {
 		ArgOrder, Body, ExprIdx, ExprKind, ExprRange, PlaceIdx, PlaceKind,
 	};
 	use super::super::defs::{
-		AstEntry, DefKind, DefinitionRegistry, FunctionOwner, Scope, Tier,
+		AstEntry, DefKind, DefinitionRegistry, MemberOwner, Scope, Tier,
 	};
 	use super::super::eval::{ConstScalar, ConstValueState};
 	use super::super::impls::ImplDispatch;
@@ -2514,7 +2576,7 @@ mod tests {
 			let mut found = self.defs.functions.iter().enumerate().filter(
 				|&(index, function)| {
 					function.name.inner == symbol
-						&& !matches!(function.owner, FunctionOwner::Free)
+						&& !matches!(function.owner, MemberOwner::Free)
 						&& self.context.function_bodies[index].is_some()
 				},
 			);
@@ -2606,10 +2668,10 @@ mod tests {
 					name(self.defs.globals[usize::from(index)].name.inner)
 						.to_string()
 				}
-				ExprKind::Function(index) => {
-					name(self.defs.functions[usize::from(index)].name.inner)
-						.to_string()
-				}
+				ExprKind::Function {
+					function,
+					type_args,
+				} => self.callee(function, type_args),
 				ExprKind::PrimitiveUnary { op, operand } => {
 					list(op.as_str(), &[operand])
 				}
@@ -2644,8 +2706,13 @@ mod tests {
 						order,
 					)
 				}
-				ExprKind::Tuple { elements } => {
-					list("tuple", body.args(elements))
+				ExprKind::CallRef { callee, args } => {
+					let head =
+						format!("call_ref {}", self.render(body, callee));
+					list(&head, body.args(args))
+				}
+				ExprKind::Tuple { elements, order } => {
+					self.render_call(body, "tuple", elements, order)
 				}
 				ExprKind::StructConstructor {
 					struct_index, args, ..
@@ -3442,7 +3509,7 @@ mod tests {
 			"}
 		);
 		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::BinaryOperatorCannotBeApplied]);
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		assert_eq!(
 			case.shape("scalar"),
 			"(block (local a#0 1) (+= a#0 2) (<<= a#0 1))"
@@ -3600,6 +3667,304 @@ mod tests {
 	}
 
 	#[test]
+	fn a_function_item_held_in_a_value_is_called_through_call() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func pair(a: u8, b: u16) {}
+				func positional() -> u8 { local g = id::<u8>; g(1) }
+				func named() { local g = pair; g({ b: 2, a: 1 }); }
+				func shadowed(id: pair) { id(1, 2); }
+				func counted() { local g = pair; g(1); }
+				struct V(x: u32);
+				impl V { func area(self: Self, k: u32) -> u32 { k } }
+				func method(v: V) -> u32 { local m = V::area; m({ k: 1, self: v }) }
+				trait Make { func make(n: u32) -> Self; }
+				func declared<T: Make>() -> T { local g = T::make; g(1) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ArgumentCountMismatch]);
+		assert_eq!(
+			case.shape("positional"),
+			"(block (local g#0 id<u8>) => (abstract call<id<u8>> g#0 1))"
+		);
+		assert_eq!(
+			case.shape("named"),
+			"(block (local g#0 pair) (abstract call<pair> g#0 (tuple 1=2 0=1)))"
+		);
+		assert_eq!(
+			case.shape("shadowed"),
+			"(block (abstract call<pair> id#0 (tuple 1 2)))"
+		);
+		assert_eq!(
+			case.shape("counted"),
+			"(block (local g#0 pair) (abstract call<pair> g#0 (tuple 1)))"
+		);
+		assert_eq!(
+			case.shape("method"),
+			"(block (local m#1 area) => (abstract call<area> m#1 (tuple 1=1 \
+			 0=v#0)))"
+		);
+		assert_eq!(case.body_type("declared"), "T");
+		assert_eq!(
+			case.shape("declared"),
+			"(block (local g#0 make<T>) => (abstract call<<T as \
+			 Make>::make> g#0 1))"
+		);
+	}
+
+	#[test]
+	fn a_tuple_of_one_is_its_element() {
+		test_case!(
+			case = indoc! {"
+				func f(x: (u8,)) -> u8 { local (y,) = x; local (z) = y; (z,) }
+				func g(p: (u8, u16)) { local (..) = p; }
+				func h(mut a: u8) { (a,) = 1; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.locals("f"),
+			[
+				("x".into(), "u8".into()),
+				("y".into(), "u8".into()),
+				("z".into(), "u8".into())
+			]
+		);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local y#1 x#0) (local z#2 y#1) => z#2)"
+		);
+		assert_eq!(case.shape("g"), "(block (local (tuple _ _) p#0))");
+	}
+
+	#[test]
+	fn a_value_is_called_through_its_call_impl() {
+		test_case!(
+			case = indoc! {"
+				struct Adder(n: u32);
+				impl Call for Adder {
+					type Args = (u32, u32);
+					type Result = u32;
+					func call(self: Self, args: (u32, u32)) -> u32 { 0 }
+				}
+				func spread(a: Adder) -> u32 { a(1, 2) }
+				func whole(a: Adder, p: (u32, u32)) -> u32 { a(p) }
+				func apply<F: Call>(f: F, x: F::Args) -> F::Result { f(x) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("spread"),
+			"(block => (call call a#0 (tuple 1 2)))"
+		);
+		assert_eq!(case.shape("whole"), "(block => (call call a#0 p#1))");
+		assert_eq!(
+			case.shape("apply"),
+			"(block => (abstract call<F> f#0 x#1))"
+		);
+	}
+
+	#[test]
+	fn a_value_without_a_call_impl_cannot_be_called() {
+		test_case!(
+			case = indoc! {"
+				struct Adder(n: u32);
+				impl Call for Adder {
+					type Args = (u32, u32);
+					type Result = u32;
+					func call(self: Self, args: (u32, u32)) -> u32 { 0 }
+				}
+				func number(x: u32) { x(1); }
+				func named(a: Adder) { a({ args: (1, 2) }); }
+				func too_many(a: Adder) { _ = a(1, 2, 3); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::ArgumentCountMismatch,
+		]);
+	}
+
+	/// The parentheses of a call only mark it: when the arguments fill one
+	/// parameter, the whole list is its value.
+	#[test]
+	fn the_argument_list_is_the_value_of_a_lone_parameter() {
+		test_case!(
+			case = indoc! {"
+				func g(p: (u8, u16)) {}
+				func id<T>(x: T) -> T { x }
+				func unit(x: ()) {}
+				struct W(x: (u8, u16));
+				struct V();
+				impl V { func m(self: Self, p: (u8, u16)) {} }
+				func spread(a: u8, b: u16) { g(a, b); }
+				func whole(a: u8, b: u16) { g((a, b)); }
+				func named(a: u8, b: u16) { g({ p: (a, b) }); }
+				func learned() -> (u8, u16) { id(1, 2) }
+				func empty() { unit(); }
+				func construct(a: u8, b: u16) -> W { W(a, b) }
+				func method(v: V, a: u8, b: u16) { v.m(a, b); }
+				func qualified(v: V, a: u8, b: u16) { V::m(v, (a, b)); }
+				func item(a: u8, b: u16) { local k = g; k(a, b); }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("spread"), "(block (call g (tuple a#0 b#1)))");
+		assert_eq!(case.shape("whole"), "(block (call g (tuple a#0 b#1)))");
+		assert_eq!(
+			case.shape("learned"),
+			"(block => (call id<(u8, u16)> (tuple 1 2)))"
+		);
+		assert_eq!(case.shape("empty"), "(block (call unit (tuple)))");
+		assert_eq!(
+			case.shape("method"),
+			"(block (call m v#0 (tuple a#1 b#2)))"
+		);
+	}
+
+	/// Nothing is wrapped for a target of several parameters, and a lone
+	/// parameter of a known type that is no such tuple is a wrong count.
+	#[test]
+	fn the_argument_list_fills_several_parameters_one_each() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u8, b: u16) {}
+				func h(x: u32) {}
+				struct V();
+				impl V { func m(self: Self, p: (u8, u16)) {} }
+				func tupled(p: (u8, u16)) { f(p); }
+				func none() { h(); }
+				func several() { h(1, 2); }
+				func qualified(v: V, a: u8, b: u16) { V::m(v, a, b); }
+			"}
+		);
+		// The arguments that do fall on a parameter are still held to it.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	/// Conformance is not checked, so a `call` of the wrong shape must not
+	/// decide what the call takes: `Args` and `Result` are read from the impl.
+	#[test]
+	fn a_value_call_reads_args_and_result_from_its_call_impl() {
+		test_case!(
+			case = indoc! {"
+				struct X(n: u32);
+				impl Call for X {
+					type Args = u32;
+					type Result = u32;
+					func call(self: Self) -> u8 { 0 }
+				}
+				func f(x: X) -> u32 { x(1) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("f"), "u32");
+	}
+
+	#[test]
+	fn a_function_item_is_not_a_function_reference() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func f() { local g: func(u8) -> u8 = id; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn a_function_reference_is_callable_by_a_compiler_rule() {
+		test_case!(
+			case = indoc! {"
+				func twice(f: func(u32) -> u32, x: u32) -> u32 { f(f(x)) }
+				func spread(f: func(u32, u8) -> u8) -> u8 { f(1, 2) }
+				func whole(f: func(u32, u8) -> u8, p: (u32, u8)) -> u8 { f(p) }
+				func nothing(f: func()) { f(); }
+				func apply<F: Call>(f: F, x: F::Args) -> F::Result { f(x) }
+				func through(f: func(u32) -> u8) -> u8 { apply(f, 1) }
+				func projected(x: <func(u32) -> u8 as Call>::Result) -> u8 { x }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("twice"),
+			"(block => (call_ref f#0 (call_ref f#0 x#1)))"
+		);
+		assert_eq!(case.shape("spread"), "(block => (call_ref f#0 1 2))");
+		assert_eq!(case.shape("whole"), "(block => (call_ref f#0 p#1))");
+		assert_eq!(case.shape("nothing"), "(block (call_ref f#0))");
+		assert_eq!(case.body_type("through"), "u8");
+		assert_eq!(
+			case.shape("through"),
+			"(block => (call apply<func(u32) -> u8> f#0 1))"
+		);
+	}
+
+	#[test]
+	fn a_function_reference_is_called_by_position_with_its_parameter() {
+		test_case!(
+			case = indoc! {"
+				func named(f: func(u32) -> u32) { _ = f({ x: 1 }); }
+				func too_many(f: func(u32, u8) -> u8) { _ = f(1, 2, 3); }
+				func wrong(f: func(u32) -> u32) { _ = f(true); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	#[test]
+	fn a_computed_function_item_is_evaluated_as_the_receiver() {
+		test_case!(
+			case = indoc! {"
+				func pair(a: u8, b: u16) {}
+				func make() -> pair { pair }
+				func f() { make()({ b: 2, a: 1 }); }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block (abstract call<pair> (call make) (tuple 1=2 0=1)))"
+		);
+	}
+
+	#[test]
+	fn an_expected_item_type_gives_a_function_value_its_arguments() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func take(g: id<u8>) {}
+				func annotated() { local g: id<u8> = id; }
+				func argument() { take(id); }
+				func returned() -> id<u16> { id }
+				func generic<T>() { local g: id<T> = id; }
+				func other() { local g: id<u8> = take; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+		assert_eq!(case.locals("annotated"), [("g".into(), "id<u8>".into())]);
+		assert_eq!(case.shape("argument"), "(block (call take id<u8>))");
+		assert_eq!(case.shape("returned"), "(block => id<u16>)");
+		assert_eq!(case.locals("generic"), [("g".into(), "id<T>".into())]);
+	}
+
+	#[test]
 	fn a_cast_reinterprets_a_value_of_the_same_wasm_type() {
 		test_case!(
 			case = indoc! {"
@@ -3714,8 +4079,8 @@ mod tests {
 			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::TypeAnnotationRequired,
-			DiagnosticCode::BinaryOperatorCannotBeApplied,
-			DiagnosticCode::UnaryOperatorCannotBeApplied,
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::UnknownCharacterEscape,
@@ -3939,6 +4304,57 @@ mod tests {
 				impl<T: Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
 				func holds(a: u8) { local b = B::new(a); }
 				func violated() { local b = B::new(true); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+	}
+
+	#[test]
+	fn a_wrong_type_argument_count_makes_that_frame_an_error() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func pair<A, B>(a: A, b: B) {}
+				func plain() {}
+				struct W<T>(x: T);
+				impl<T> W<T> { func get(self: Self) -> T { local W(x) = self; x } }
+				func too_many() { _ = id::<u8, u16>(1); }
+				func too_few() { pair::<u8>(1, 2); }
+				func own_none() { plain::<u8>(); }
+				func method(w: W<u8>) -> u8 { w.get::<u8>() }
+				func construction() { _ = W::<u8, u16>(1); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+		]);
+		assert_eq!(
+			case.shape("too_many"),
+			"(block (drop (call id<{unknown}> 1)))"
+		);
+		assert_eq!(
+			case.shape("too_few"),
+			"(block (call pair<{unknown}, {unknown}> 1 2))"
+		);
+		assert_eq!(case.shape("own_none"), "(block (call plain))");
+		// The impl's argument, known from the receiver, is kept.
+		assert_eq!(case.shape("method"), "(block => (call get<u8> w#0))");
+	}
+
+	#[test]
+	fn a_function_value_proves_its_bounds_once_where_it_is_named() {
+		test_case!(
+			case = indoc! {"
+				trait Small {}
+				impl Small for u8 {}
+				func take<T: Small>(x: T) {}
+				func holds(a: u8) { local g = take::<u8>; g(a); }
+				func violated() { local g = take::<bool>; g(true); }
 			"}
 		);
 		case.diagnostics()

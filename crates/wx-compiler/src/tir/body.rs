@@ -200,9 +200,12 @@ pub(super) enum ExprKind {
 	Local(LocalIdx),
 	/// A global's handle, of its own nominal type (`Type::Global`).
 	Global(GlobalIdx),
-	/// A function as a value, of its own zero-sized type (`Type::Function`,
-	/// which carries the type arguments).
-	Function(FunctionIdx),
+	/// A function as a value, of its own zero-sized type (`Type::Function`),
+	/// with its type arguments, flat as a call's.
+	Function {
+		function: FunctionIdx,
+		type_args: TypeList,
+	},
 	// Operators, calls and compound assignment. What defines the operation:
 	// a primitive scalar's operator (`Primitive*`, holding the `op`); a known
 	// function (`Call`, `ConcreteCompound*`); or a trait's declaration, whose
@@ -245,9 +248,20 @@ pub(super) enum ExprKind {
 		args: ExprRange,
 		order: ArgOrder,
 	},
-	/// A tuple of its elements, in order: `(a, b)`, `(a,)` or `()`.
+	/// A call through a function reference, `f(a, b)` with `f: func(A) ->
+	/// R`, by position only. `args` are the written arguments, in evaluation
+	/// order after the callee: none give `()`, one gives `A` whole, several
+	/// give the elements of the tuple `A`.
+	CallRef {
+		callee: ExprIdx,
+		args: ExprRange,
+	},
+	/// A tuple of its elements: `(a, b)` or `()`. `elements` are in
+	/// evaluation order and `order` says which position each gives: in order
+	/// as written, permuted for the `Args` of a function item called by name.
 	Tuple {
 		elements: ExprRange,
+		order: ArgOrder,
 	},
 	/// A struct built from its fields, written as a call to its name;
 	/// `order` says which field each argument gives. A construction
@@ -587,6 +601,18 @@ impl BodyBuilder {
 	/// The arguments pushed as `range`.
 	pub(super) fn args(&self, range: ExprRange) -> &[ExprIdx] {
 		&self.extra[range.start as usize..(range.start + range.len) as usize]
+	}
+
+	/// The parameter the argument at `at`, in written order, gives.
+	pub(super) fn declared_index(
+		&self,
+		order: ArgOrder,
+		at: usize,
+	) -> ParamIdx {
+		match order {
+			ArgOrder::InOrder => ParamIdx::new(at as u32),
+			ArgOrder::Permuted { start } => self.arg_order[start as usize + at],
+		}
 	}
 
 	pub(super) fn push_args(

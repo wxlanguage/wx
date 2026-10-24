@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 use crate::ast::{Ownership, StringInterner};
 
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
-use super::defs::{DefinitionRegistry, FunctionOwner};
+use super::defs::{DefinitionRegistry, MemberOwner};
 use super::signatures::TypeContext;
 use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
 
@@ -250,7 +250,7 @@ impl TypeFormatter<'_> {
 				// A trait's declaration takes `Self` first; it is written as
 				// the receiver, `<Self as Trait>::f<own>`, always qualified
 				// for the same reason a projection is.
-				if let FunctionOwner::Trait(trait_index) = function.owner {
+				if let MemberOwner::Trait(trait_index) = function.owner {
 					let (&receiver, own) = type_args
 						.split_first()
 						.expect("a trait's function takes `Self` first");

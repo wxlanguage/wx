@@ -178,10 +178,10 @@ pub struct TypeSetSignature {
 /// which doesn't exist in this architecture yet (see `EnumSignature::repr`,
 /// deferred for the identical reason).
 pub struct ConstantSignature {
-	ty: TypeIndex,
+	pub(super) ty: TypeIndex,
 	/// The type scope the constant is declared in, where its type and
 	/// initializer are read.
-	scope: TypeEnvIdx,
+	pub(super) env: TypeEnvIdx,
 }
 
 /// One `AssocTypeIdx`'s resolved signature. `declared_bounds`/
@@ -752,7 +752,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.iter()
 				.map(|_| ConstantSignature {
 					ty: TypeIndex::ERROR,
-					scope: TypeEnvIdx::ROOT,
+					env: TypeEnvIdx::ROOT,
 				})
 				.collect(),
 			const_bodies: defs
@@ -1136,14 +1136,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.unwrap_or(TypeIndex::ERROR)
 	}
 
-	pub(super) fn constant_type(
-		&self,
-		const_index: ConstIdx,
-	) -> (TypeIndex, TypeEnvIdx) {
-		let signature = &self.constants[usize::from(const_index)];
-		(signature.ty, signature.scope)
-	}
-
 	/// A typeset's member types.
 	pub(super) fn typeset_members(
 		&self,
@@ -1499,7 +1491,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 		};
 		self.constants[usize::from(const_index)] =
-			ConstantSignature { ty, scope };
+			ConstantSignature { ty, env: scope };
 		SignatureLocation::Constant(const_index)
 	}
 
@@ -1566,7 +1558,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 			_ => unreachable!("a constant's entry is a constant"),
 		};
-		let env = self.constants[usize::from(const_index)].scope;
+		let env = self.constants[usize::from(const_index)].env;
 		let ty = self.constants[usize::from(const_index)].ty;
 		let scope = LexicalScope {
 			file_id,
@@ -1967,7 +1959,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 				self.constants[usize::from(const_index)] = ConstantSignature {
 					ty: resolved_ty,
-					scope: self_scope,
+					env: self_scope,
 				};
 				SignatureLocation::Constant(const_index)
 			}
@@ -2580,7 +2572,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let ty = self.types.intern(Type::Enum { enum_index });
 				self.constants[usize::from(const_index)] = ConstantSignature {
 					ty,
-					scope: TypeEnvIdx::ROOT,
+					env: TypeEnvIdx::ROOT,
 				};
 				SignatureLocation::Constant(const_index)
 			}
@@ -3587,10 +3579,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					elems.push(self.resolve_type_expression(
 						obligations,
 						scope,
-						element,
+						&element.inner,
 						infer_policy,
 					));
 				}
+				// A tuple of one is its element, which interning unwraps.
 				self.types.intern_tuple(&elems)
 			}
 			_ => todo!("this type-expression form isn't implemented yet"),
@@ -4412,7 +4405,7 @@ pub(super) mod tests {
 	use super::*;
 	use crate::testing::DiagnosticView;
 	use crate::tir::defs::{
-		DefinitionRegistry, FunctionOwner, Namespace, Scope, UseItemKind,
+		DefinitionRegistry, MemberOwner, Namespace, Scope, UseItemKind,
 	};
 	use crate::tir::impls::ImplTarget;
 	use crate::tir::solver::Verdict;
@@ -4713,7 +4706,7 @@ pub(super) mod tests {
 						}
 						text + ")"
 					}
-					ExprKind::Tuple { elements } => {
+					ExprKind::Tuple { elements, .. } => {
 						let mut text = "(".to_string();
 						for (at, &element) in
 							body.args(elements).iter().enumerate()
@@ -4865,15 +4858,15 @@ pub(super) mod tests {
 				),
 				(
 					"const A: bool = true + false;",
-					DiagnosticCode::BinaryOperatorCannotBeApplied,
+					DiagnosticCode::TraitBoundViolation,
 				),
 				(
 					"const A: bool = -true;",
-					DiagnosticCode::UnaryOperatorCannotBeApplied,
+					DiagnosticCode::TraitBoundViolation,
 				),
 				(
 					"const A: u8 = 1; const B: u8 = -A;",
-					DiagnosticCode::UnaryOperatorCannotBeApplied,
+					DiagnosticCode::TraitBoundViolation,
 				),
 				("const A: bool = true && 1;", DiagnosticCode::UnableToCoerce),
 			] {
@@ -5353,13 +5346,13 @@ pub(super) mod tests {
 				// The right side takes the left's type, so `1` is a `u8`.
 				(
 					"const M: u8 = 1; const C: bool = Wrapper(M) == Wrapper(1);",
-					&[BinaryOperatorCannotBeApplied],
+					&[TraitBoundViolation],
 				),
 				// Learned from `M` on both sides: what fails is the operator,
 				// which `Wrapper<u8>` does not implement, not the type.
 				(
 					"const M: u8 = 1; const C: bool = Wrapper(M) == Wrapper(M);",
-					&[BinaryOperatorCannotBeApplied],
+					&[TraitBoundViolation],
 				),
 				(
 					"const P: Pair<u8, u8> = Pair::<u8>(1, 2);",
@@ -5405,7 +5398,7 @@ pub(super) mod tests {
 			case.diagnostics().assert_none();
 			assert_eq!(shape(&case, "T"), "(1:u8, 2:u16):(u8, u16)");
 			assert_eq!(shape(&case, "U"), "():()");
-			assert_eq!(shape(&case, "O"), "(true:bool,):(bool,)");
+			assert_eq!(shape(&case, "O"), "true:bool");
 			assert_eq!(
 				shape(&case, "W"),
 				"(Wrapper (1:u8, true:bool):(u8, bool)):Wrapper<(u8, bool)>"
@@ -5451,7 +5444,7 @@ pub(super) mod tests {
 				(
 					"const M: u8 = 1;
 					const C: bool = Same((1, 2), (M, M)) == Same((M, M), (M, M));",
-					&[BinaryOperatorCannotBeApplied],
+					&[TraitBoundViolation],
 				),
 			] {
 				test_case!(
@@ -6909,13 +6902,13 @@ pub(super) mod tests {
 		assert_eq!(target("List"), target("Tupled"));
 		assert_eq!(target("Single"), target("Grouped"));
 		assert_eq!(target("Single"), target("TrailingComma"));
-		assert_ne!(target("Single"), target("OneTuple"));
+		// There is no tuple of one.
+		assert_eq!(target("Single"), target("OneTuple"));
 
 		let formatter = case.context.type_formatter();
 		for (name, written) in [
 			("List", "func(i32, bool) -> i32"),
 			("Single", "func(i32) -> ()"),
-			("OneTuple", "func((i32,)) -> ()"),
 			("Empty", "func() -> ()"),
 		] {
 			assert_eq!(formatter.display_type(target(name)), written);
@@ -8780,8 +8773,9 @@ pub(super) mod tests {
 			else {
 				panic!("`{path}` is an enum variant");
 			};
+			let signature = &case.context.constants[usize::from(const_index)];
 			assert_eq!(
-				case.context.constant_type(const_index),
+				(signature.ty, signature.env),
 				(color, TypeEnvIdx::ROOT),
 				"{path}"
 			);
@@ -12717,7 +12711,7 @@ pub(super) mod tests {
 				assoc_type_index: AssocTypeIdx::new(0),
 			});
 			for _ in 0..5 {
-				nested = builder.types.intern_tuple(&[nested]);
+				nested = builder.types.intern_tuple(&[nested, TypeIndex::I32]);
 			}
 			assert_eq!(
 				builder.normalize_type(TypeEnvIdx::ROOT, nested, reference),
@@ -13988,7 +13982,7 @@ pub(super) mod tests {
 			trait Pair { type First; type Second; }
 			func tautology<T: Pair where { First = T::First }>(x: T::First) {}
 			func mutual<T: Pair where { First = T::Second, Second = T::First }>(x: T::First, y: T::Second) {}
-			func structural<T: Pair where { First = (T::First,) }>(x: T::First) {}
+			func structural<T: Pair where { First = (T::First, T::First) }>(x: T::First) {}
 		"}
 		);
 		assert!(
@@ -14200,8 +14194,8 @@ pub(super) mod tests {
 			type i32;
 			trait Container { type Item; }
 			struct Wrap<X>();
-			func f<U: Container where { Item = i32 }, T: Container where { Item = Wrap<(U::Item,)> }>(x: T::Item) {}
-			func g<T: Container where { Item = Wrap<(U::Item,)> }, U: Container where { Item = i32 }>(x: T::Item) {}
+			func f<U: Container where { Item = i32 }, T: Container where { Item = Wrap<(U::Item, i32)> }>(x: T::Item) {}
+			func g<T: Container where { Item = Wrap<(U::Item, i32)> }, U: Container where { Item = i32 }>(x: T::Item) {}
 		"}
 		);
 		assert!(
@@ -14249,7 +14243,10 @@ pub(super) mod tests {
 			else {
 				panic!("expected normalized tuple");
 			};
-			assert_eq!(case.context.types.list(*elements), &[TypeIndex::I32]);
+			assert_eq!(
+				case.context.types.list(*elements),
+				&[TypeIndex::I32, TypeIndex::I32]
+			);
 		}
 	}
 
@@ -15379,7 +15376,7 @@ pub(super) mod tests {
 				global float: f64 = 0;
 				global newtype: Meters = Meters(0);
 				global with_empty: Tagged = Tagged(0, ());
-				global tuple: (f32,) = (0,);
+				global tuple: (f32, ()) = (0, ());
 				global generic: Wrap<u64> = Wrap(0);
 				global variant: Small = Small::A;
 				global pointer: heap::&u32 = 0 as heap::&u32;
@@ -16608,7 +16605,7 @@ pub(super) mod tests {
 							definition.name.inner == name
 								&& matches!(
 									definition.owner,
-									FunctionOwner::Trait(_)
+									MemberOwner::Trait(_)
 								)
 						})
 						.unwrap(),
