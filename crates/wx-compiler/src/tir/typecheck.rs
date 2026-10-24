@@ -342,9 +342,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				expected,
 				span,
 			),
-			ast::Expression::TypeApplication { .. } => {
-				self.unsupported(span, "a type application")
-			}
 			ast::Expression::Match { scrutinee, arms } => {
 				self.build_match(scrutinee, arms, expected, span)
 			}
@@ -3631,6 +3628,18 @@ mod tests {
 			DiagnosticCode::UnknownStructField,
 			DiagnosticCode::UnknownStructField,
 		]);
+	}
+
+	#[test]
+	fn a_field_takes_no_type_arguments() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8);
+				func f(p: P) -> u8 { p.x::<u8> }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 	}
 
 	#[test]

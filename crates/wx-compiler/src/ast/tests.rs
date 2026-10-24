@@ -1523,7 +1523,7 @@ fn test_call_field_namespace() {
 	else {
 		panic!("expected field access")
 	};
-	assert_eq!(case.name(member.inner), "x");
+	assert_eq!(case.name(member.ident.inner), "x");
 
 	let Expression::Path(segments) = local_definition_value(statements, 3)
 	else {
@@ -1645,18 +1645,18 @@ fn test_chained_member_access() {
 	else {
 		panic!("expected object access")
 	};
-	assert_eq!(case.name(member.inner), "y");
+	assert_eq!(case.name(member.ident.inner), "y");
 	let Expression::ObjectAccess { member: inner, .. } = &object.inner else {
 		panic!("`p.x.y` should nest as `(p.x).y`")
 	};
-	assert_eq!(case.name(inner.inner), "x");
+	assert_eq!(case.name(inner.ident.inner), "x");
 
 	let Expression::ObjectAccess { object, member } =
 		local_definition_value(statements, 1)
 	else {
 		panic!("expected object access")
 	};
-	assert_eq!(case.name(member.inner), "z");
+	assert_eq!(case.name(member.ident.inner), "z");
 	assert!(
 		matches!(object.inner, Expression::MethodCall(_)),
 		"`p.foo().z` should access the call's result"
@@ -2523,7 +2523,7 @@ fn test_turbofish_method_call() {
 	case.diagnostics().assert_none();
 
 	let statements = case.function_block(0);
-	// a method turbofish is a `MethodCall`, never a `TypeApplication`
+	// a called member's turbofish is a `MethodCall`'s
 	let Expression::MethodCall(call) = statement_expression(statements, 0)
 	else {
 		panic!("expected a method call")
@@ -2976,21 +2976,29 @@ fn test_bare_return_has_no_value() {
 }
 
 #[test]
-fn test_turbofish_on_a_non_path_expression_is_a_type_application() {
-	// A turbofish on a plain path attaches to the segment (see
-	// `test_turbofish_call`); on anything else it becomes its own node.
+fn test_turbofish_on_a_member_is_kept_on_its_segment() {
 	let case = TestCase::new(indoc! {"
-        func f() {
-            local a = (g)::<i32>;
+        func f(obj: Foo) {
+            local a = obj.m::<i32>;
         }
     "});
 	case.diagnostics().assert_none();
-	let Expression::TypeApplication { args, .. } =
+	let Expression::ObjectAccess { member, .. } =
 		local_definition_value(case.function_block(0), 0)
 	else {
-		panic!("expected a type application")
+		panic!("expected an object access")
 	};
-	assert_eq!(args.len(), 1);
+	assert_eq!(member.type_args.len(), 1);
+}
+
+#[test]
+fn test_turbofish_on_any_other_expression_is_an_error() {
+	for source in ["(g)::<i32>", "g(1)::<i32>", "a.*::<i32>"] {
+		let case =
+			TestCase::new(&format!("func f() {{ local a = {source}; }}"));
+		case.diagnostics()
+			.assert_error(DiagnosticCode::TypeArgumentsNotAllowed);
+	}
 }
 
 // ── remaining type expressions ───────────────────────────────────────────────

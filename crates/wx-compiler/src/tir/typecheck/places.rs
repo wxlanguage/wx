@@ -60,7 +60,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.build_deref(pointer, expr.span)
 			}
 			ast::Expression::ObjectAccess { object, member } => {
-				self.build_field(object, *member, expr.span)
+				self.build_field(object, member, expr.span)
 			}
 			_ => Operand::Value(self.build(expr, TypeIndex::INFER)),
 		}
@@ -120,9 +120,26 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn build_field(
 		&mut self,
 		object: &Spanned<ast::Expression>,
-		member: Spanned<SymbolU32>,
+		segment: &ast::PathSegment,
 		span: TextSpan,
 	) -> Operand {
+		let member = segment.ident;
+		if let (Some(first), Some(last)) =
+			(segment.type_args.first(), segment.type_args.last())
+		{
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
+					.with_message("type arguments are not allowed here")
+					.with_label(
+						Label::primary(
+							self.scope.file_id,
+							TextSpan::new(first.span.start, last.span.end),
+						)
+						.with_message("a field takes no type arguments"),
+					),
+			);
+		}
 		let object = self.build_operand(object);
 		let object_ty = match object {
 			Operand::Place(place) => self.body.place(place).ty,

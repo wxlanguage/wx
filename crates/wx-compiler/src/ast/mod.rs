@@ -396,6 +396,20 @@ fn report_invalid_namespace(
 		)
 }
 
+fn report_type_args_not_allowed(
+	file_id: FileId,
+	span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
+		.with_message("type arguments are not allowed here")
+		.with_label(
+			Label::primary(file_id, span).with_message(
+				"only a path or a method name takes type arguments",
+			),
+		)
+}
+
 fn report_unknown_token(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::UnknownToken.code())
@@ -1138,16 +1152,12 @@ pub enum Expression {
 	MethodCall(Box<MethodCallExpr>),
 	/// `{expr}.{method}::<...>({ x: a, y })`
 	NamedMethodCall(Box<MethodCallExpr<NamedArgument>>),
-	/// `{expr}::<Type1, Type2>` — turbofish type application on a non-path
-	/// expression. Method turbofish calls are represented as `MethodCall`.
-	TypeApplication {
-		callee: Box<Spanned<Expression>>,
-		args: Box<[Spanned<TypeExpression>]>,
-	},
-	/// `{expr}.{expr}`
+	/// `{expr}.{member}`, or `{expr}.{member}::<...>`: the type arguments
+	/// are only meaningful when a call follows, which makes it a
+	/// `MethodCall`; the checker rejects them on a field.
 	ObjectAccess {
 		object: Box<Spanned<Expression>>,
-		member: Spanned<SymbolU32>,
+		member: PathSegment,
 	},
 	/// `{expr}.*`
 	Deref {
@@ -4035,9 +4045,12 @@ impl<'ctx> Parser<'ctx> {
 				Ok(Spanned {
 					inner: Expression::ObjectAccess {
 						object: Box::new(object),
-						member: Spanned {
-							inner: member_symbol,
-							span: token.span,
+						member: PathSegment {
+							ident: Spanned {
+								inner: member_symbol,
+								span: token.span,
+							},
+							type_args: Box::new([]),
 						},
 					},
 					span,
@@ -4616,27 +4629,37 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// Handles `expr::<T, U>` turbofish when `expr` is NOT a bare identifier
-	/// (e.g. `obj.method::<T>()`).  Bare-identifier paths are already fully
-	/// consumed by `parse_identifier_expression`, so this led only fires on
-	/// non-path left-hand sides.
+	/// Handles `expr::<T, U>` when `expr` is not a path (paths take their
+	/// type arguments in `parse_identifier_expression`). Only a member
+	/// (`obj.method::<T>`) accepts them; they join its segment.
 	fn parse_type_application_expression(
 		parser: &mut Parser,
 		left: Spanned<Expression>,
 		_: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
-		_ = parser.lexer.next(); // consume `::`
+		let colons = parser.lexer.next(); // consume `::`
 
 		if parser.lexer.peek().inner == Token::LeftArrow {
 			let (args, close_span) = parser.parse_type_args()?;
 			let span = TextSpan::new(left.span.start, close_span.end);
-			return Ok(Spanned {
-				inner: Expression::TypeApplication {
-					callee: Box::new(left),
-					args,
-				},
-				span,
-			});
+			return match left.inner {
+				Expression::ObjectAccess { object, mut member }
+					if member.type_args.is_empty() =>
+				{
+					member.type_args = args;
+					Ok(Spanned {
+						inner: Expression::ObjectAccess { object, member },
+						span,
+					})
+				}
+				_ => {
+					parser.ast.diagnostics.push(report_type_args_not_allowed(
+						parser.ast.file_id,
+						TextSpan::new(colons.span.start, close_span.end),
+					));
+					Err(())
+				}
+			};
 		}
 
 		let bad = parser.lexer.peek();
@@ -4712,29 +4735,7 @@ impl<'ctx> Parser<'ctx> {
 		callee: Spanned<Expression>,
 	) -> Result<(Box<Spanned<Expression>>, PathSegment), Spanned<Expression>> {
 		match callee.inner {
-			Expression::ObjectAccess { object, member } => Ok((
-				object,
-				PathSegment {
-					ident: member,
-					type_args: Box::new([]),
-				},
-			)),
-			Expression::TypeApplication {
-				callee: inner,
-				args,
-			} if matches!(inner.inner, Expression::ObjectAccess { .. }) => {
-				let Expression::ObjectAccess { object, member } = inner.inner
-				else {
-					unreachable!()
-				};
-				Ok((
-					object,
-					PathSegment {
-						ident: member,
-						type_args: args,
-					},
-				))
-			}
+			Expression::ObjectAccess { object, member } => Ok((object, member)),
 			inner => Err(Spanned {
 				inner,
 				span: callee.span,

@@ -2524,10 +2524,12 @@ impl<'a> Builder<'a> {
 				self.source_text(expression.span)
 			}
 			ast::Expression::ObjectAccess { object, member } => {
-				let obj_id = self.build_expression(object);
-				let dot = self.text(Text::Dot);
-				let sym = self.symbol(member.inner);
-				self.arena.concat3(obj_id, dot, sym)
+				let items = self.build_method_callee(
+					object,
+					&member.ident,
+					&member.type_args,
+				);
+				self.arena.concat(items)
 			}
 			ast::Expression::Deref { pointer } => {
 				let ptr_id = self.build_expression(pointer);
@@ -2538,19 +2540,6 @@ impl<'a> Builder<'a> {
 				let val_id = self.build_expression(value);
 				let suffix = self.text(Text::DotAmp);
 				self.arena.concat2(val_id, suffix)
-			}
-			ast::Expression::TypeApplication { callee, args } => {
-				let callee_id = self.build_expression(callee);
-				let mut items: Vec<NodeId> =
-					vec![callee_id, self.text(Text::ColonColonLt)];
-				for (i, arg) in args.iter().enumerate() {
-					if i > 0 {
-						items.push(self.text(Text::CommaSp));
-					}
-					items.push(self.build_type_expression(&arg.inner));
-				}
-				items.push(self.text(Text::Gt));
-				self.arena.concat(items)
 			}
 			ast::Expression::ArrayList { elements } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::LBracket)];
