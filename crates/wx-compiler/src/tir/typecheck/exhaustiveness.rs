@@ -107,10 +107,23 @@ impl BodyContext<'_, '_, '_, '_> {
 		let value = |value: u64| Pat::Ctor(Ctor::Value(value), Vec::new());
 		Some(match self.body.pattern(pattern) {
 			PatternKind::Wildcard | PatternKind::Bind(_) => Pat::Wild,
-			PatternKind::Tuple(children)
-			| PatternKind::Struct {
-				fields: children, ..
+			// A struct is split as its fields' tuple; a lone field's value is
+			// not one, so it is the struct's one child.
+			PatternKind::Struct {
+				struct_index,
+				fields,
 			} => {
+				let fields = self.lower_pattern(fields)?;
+				let count = self.cx.structs[usize::from(struct_index)]
+					.field_types
+					.len();
+				if count == 1 {
+					Pat::Ctor(Ctor::Single, vec![fields])
+				} else {
+					fields
+				}
+			}
+			PatternKind::Tuple(children) => {
 				let children = self.body.patterns(children).to_vec();
 				let mut lowered = Vec::with_capacity(children.len());
 				for child in children {

@@ -54,18 +54,24 @@ is sugar for it:
   `func g(p: (A, B))` therefore has the same `Call::Args`, and the same
   reference type, as `func f(a: A, b: B)`. The two are still different
   items, and are called differently.
-- **A declaration decides how it is called,** not its `Args`. The parentheses
-  of a call only mark it: when the arguments fill one parameter, the whole
-  list is that parameter's value (`()` for none, a tuple for several);
-  otherwise each argument gives one parameter, and nothing is wrapped. So
-  `g(a, b)`, `g((a, b))` and `g({ p: (a, b) })` call `g`, while `f(a, b)` and
-  `f({ a, b })` call `f` and `f((a, b))` is a wrong count. A generic lone
-  parameter learns the tuple (`id(1, 2)` gives `T = (_, _)`). A method's
-  receiver fills its first parameter, so `x.m(a, b)` for `m(self: Self, p:
-  (A, B))` is `p = (a, b)`, while `T::m(x, (a, b))` must wrap it. A function
-  reference or any other value called through `Call` has one unnamed
-  parameter, `Args`, so the same rule makes `r(a, b)` and `r((a, b))` the same
-  call.
+- **A declaration decides how it is called,** not its `Args`. A positional
+  list is one value of the parameters it fills, and its shape must be theirs;
+  nothing is regrouped. When it fills one parameter, the parentheses only
+  mark the call and the whole list is that parameter's value (`()` for none,
+  a tuple for several); one value for several parameters is their tuple
+  (`f(p)`); otherwise each argument gives one parameter. So `g(a, b)`,
+  `g((a, b))` and `g({ p: (a, b) })` call `g`, and `f(a, b)`, `f((a, b))`,
+  `f(p)` and `f({ a, b })` call `f`. A generic lone parameter learns the
+  tuple (`id(1, 2)` gives `T = (_, _)`). A method's receiver fills its first
+  parameter and the list the rest, so for `m(self: Self, a: A, b: B)`,
+  `x.m(a, b)`, `x.m(p)` and `T::m(t)` with `t: (Self, A, B)` work, and
+  `T::m(x, p)` is a wrong count (`(Self, (A, B))` is not `(Self, A, B)`). A
+  struct is constructed the same way (`Point(p)`) and matched the same way
+  (`Point(p)` binds every field as one tuple). A function reference or any
+  other value called through `Call` has one unnamed parameter, `Args`, so the
+  same rule makes `r(a, b)` and `r((a, b))` the same call. A call node holds
+  this one value (`args`), with a method call's receiver beside it
+  (`MethodCall`).
 - **Rebuilding** needs no new syntax: `func(F::Args) -> F::Result` is exactly
   the type of `F`.
 - **Equality** is equality of the parameter types. The sugar is resolved when

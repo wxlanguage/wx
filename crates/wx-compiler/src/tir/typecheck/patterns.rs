@@ -489,30 +489,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				)
 			}
 			ast::Destructure::Tuple { elements } => {
-				let types = match *self.cx.types.resolve(expected) {
-					Type::Tuple { elements } => {
-						self.cx.types.list(elements).to_vec()
-					}
-					_ => {
-						if expected != TypeIndex::ERROR {
-							self.report_pattern_mismatch(
-								expected, "a tuple", span,
-							);
-						}
-						return self.check_poisoned(elements, span, context);
-					}
-				};
-				let Some(children) =
-					self.check_elements(elements, &types, span, context, None)
-				else {
-					return self.error_pattern(span);
-				};
-				let children = self.body.push_patterns(children);
-				self.body.push_pattern(
-					PatternKind::Tuple(children),
-					expected,
-					span,
-				)
+				self.check_tuple(elements, span, expected, context)
 			}
 			ast::Destructure::Struct { path, elements } => {
 				let Some((struct_index, ty, types)) =
@@ -520,16 +497,15 @@ impl BodyContext<'_, '_, '_, '_> {
 				else {
 					return self.check_poisoned(elements, span, context);
 				};
-				let Some(children) = self.check_elements(
+				let Some(fields) = self.check_field_list(
 					elements,
+					struct_index,
 					&types,
 					span,
 					context,
-					Some(struct_index),
 				) else {
 					return self.error_pattern(span);
 				};
-				let fields = self.body.push_patterns(children);
 				self.body.push_pattern(
 					PatternKind::Struct {
 						struct_index,
@@ -561,7 +537,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				) else {
 					return self.error_pattern(span);
 				};
-				let fields = self.body.push_patterns(children);
+				let fields = self.fields_value(children, &types, span);
 				self.body.push_pattern(
 					PatternKind::Struct {
 						struct_index,
@@ -572,6 +548,94 @@ impl BodyContext<'_, '_, '_, '_> {
 				)
 			}
 		}
+	}
+
+	/// `(a, b)` against `expected`, with one child per element.
+	fn check_tuple(
+		&mut self,
+		elements: &ast::PatternElements,
+		span: TextSpan,
+		expected: TypeIndex,
+		context: &mut PatternContext,
+	) -> PatIdx {
+		let types = match *self.cx.types.resolve(expected) {
+			Type::Tuple { elements } => self.cx.types.list(elements).to_vec(),
+			_ => {
+				if expected != TypeIndex::ERROR {
+					self.report_pattern_mismatch(expected, "a tuple", span);
+				}
+				return self.check_poisoned(elements, span, context);
+			}
+		};
+		let Some(children) =
+			self.check_elements(elements, &types, span, context, None)
+		else {
+			return self.error_pattern(span);
+		};
+		let children = self.body.push_patterns(children);
+		self.body
+			.push_pattern(PatternKind::Tuple(children), expected, span)
+	}
+
+	/// `Name(...)`: the written list as one value of the struct's fields, as
+	/// a construction gives them. One pattern for several fields (or none)
+	/// matches them all as a tuple (`P(p)`); several for a lone field whose
+	/// type is a tuple match that tuple (`W(a, b)`); otherwise each gives
+	/// one field. `None` when the counts cannot fit (reported).
+	fn check_field_list(
+		&mut self,
+		elements: &ast::PatternElements,
+		struct_index: StructIdx,
+		types: &[TypeIndex],
+		span: TextSpan,
+		context: &mut PatternContext,
+	) -> Option<PatIdx> {
+		match (types, &**elements) {
+			(_, [element])
+				if let ast::PatternElement::Pattern(pattern) =
+					&element.inner.inner =>
+			{
+				let ty = self.cx.types.intern_tuple(types);
+				Some(self.check_one_pattern(
+					pattern,
+					element.inner.span,
+					ty,
+					context,
+				))
+			}
+			(&[field], _)
+				if let Type::Tuple { .. } = self.cx.types.resolve(field) =>
+			{
+				Some(self.check_tuple(elements, span, field, context))
+			}
+			_ => {
+				let children = self.check_elements(
+					elements,
+					types,
+					span,
+					context,
+					Some(struct_index),
+				)?;
+				Some(self.fields_value(children, types, span))
+			}
+		}
+	}
+
+	/// One child per field as the value of them all: the child itself for a
+	/// lone field, else a tuple of them.
+	fn fields_value(
+		&mut self,
+		children: Vec<PatIdx>,
+		types: &[TypeIndex],
+		span: TextSpan,
+	) -> PatIdx {
+		if let [child] = *children {
+			return child;
+		}
+		let ty = self.cx.types.intern_tuple(types);
+		let children = self.body.push_patterns(children);
+		self.body
+			.push_pattern(PatternKind::Tuple(children), ty, span)
 	}
 
 	/// The children of a positional list against `types`, a tuple's elements

@@ -21,7 +21,7 @@ use string_interner::symbol::SymbolU32;
 use super::{Arguments, BodyContext};
 use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::body::{ArgOrder, ExprIdx, ExprKind, ParamIdx};
+use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::defs::{
 	AssocTypeIdx, BindingKey, FunctionIdx, MemberKind, MemberOwner, StructIdx,
 };
@@ -87,12 +87,15 @@ impl Dispatch {
 	}
 }
 
-/// An argument a call gives, as checked: the parameter it is for, its value,
-/// and the type it was built with, which it is held to at the end unless an
-/// unknown part of it needs instantiating again.
+/// An argument a call gives, as checked: the parameter it is for, or `None`
+/// for one value written for every parameter left (`f(p)`); the type that is
+/// declared for it, written with the target's parameters; its value; and the
+/// type it was built with, which it is held to at the end unless an unknown
+/// part of it needs instantiating again.
 #[derive(Clone, Copy)]
 pub(super) struct GivenArgument {
-	pub(super) param: ParamIdx,
+	pub(super) param: Option<ParamIdx>,
+	pub(super) declared: TypeIndex,
 	pub(super) value: ExprIdx,
 	pub(super) expected: TypeIndex,
 }
@@ -348,17 +351,13 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let mut given = Vec::new();
 		if let Some(receiver) = receiver {
-			let receiver_param = ParamIdx::new(0);
-			self.learn_argument(
-				&target,
-				&mut type_args,
-				receiver_param,
-				receiver,
-			);
+			let declared = self.cx.types.list(target.param_types)[0];
+			self.learn_argument(&target, &mut type_args, declared, receiver);
 			// Checked before its parameter's type was instantiated, so it is
 			// held to that type at the end.
 			given.push(GivenArgument {
-				param: receiver_param,
+				param: Some(ParamIdx::new(0)),
+				declared,
 				value: receiver,
 				expected: TypeIndex::INFER,
 			});
@@ -386,33 +385,107 @@ impl BodyContext<'_, '_, '_, '_> {
 		// One stored list for the bound checks and the node.
 		let type_list = self.cx.types.push_list(&type_args);
 		self.check_callee_bounds(&target, proven, segment, type_list, &given);
-		let order = match arguments {
-			Arguments::Positional(_) => ArgOrder::InOrder,
-			Arguments::Named(_) => self
-				.body
-				.push_permutation(given.iter().map(|argument| argument.param)),
-		};
-		let args = self
-			.body
-			.push_args(given.iter().map(|argument| argument.value));
+		let skipped = usize::from(receiver.is_some());
+		let args = self.arguments_value(
+			&target, &type_args, &given, skipped, reported, span,
+		);
 		let ty = self.instantiate(return_type, env, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
-		let owner = self.cx.defs.functions[usize::from(function)].owner;
-		let kind = match Dispatch::of(owner) {
-			Dispatch::Direct => ExprKind::Call {
-				function,
-				type_args: type_list,
-				args,
-				order,
-			},
-			Dispatch::Abstract => ExprKind::AbstractCall {
-				method: function,
-				type_args: type_list,
-				args,
-				order,
-			},
-		};
+		let kind = self.call_node(function, type_list, receiver, args);
 		self.body.push(kind, ty, span)
+	}
+
+	/// The node of a call of `function`: a trait's declaration is reached
+	/// through the impl its `Self` selects (`Abstract*`), any other directly;
+	/// a receiver makes it a method call.
+	fn call_node(
+		&self,
+		function: FunctionIdx,
+		type_args: TypeList,
+		receiver: Option<ExprIdx>,
+		args: ExprIdx,
+	) -> ExprKind {
+		let owner = self.cx.defs.functions[usize::from(function)].owner;
+		match (Dispatch::of(owner), receiver) {
+			(Dispatch::Direct, None) => ExprKind::Call {
+				function,
+				type_args,
+				args,
+			},
+			(Dispatch::Abstract, None) => ExprKind::AbstractCall {
+				method: function,
+				type_args,
+				args,
+			},
+			(Dispatch::Direct, Some(receiver)) => ExprKind::MethodCall {
+				function,
+				type_args,
+				receiver,
+				args,
+			},
+			(Dispatch::Abstract, Some(receiver)) => {
+				ExprKind::AbstractMethodCall {
+					method: function,
+					type_args,
+					receiver,
+					args,
+				}
+			}
+		}
+	}
+
+	/// The value of the parameters of `target` after the first `skipped` (a
+	/// method's receiver, which `given` holds first), as a call node holds
+	/// it, once every type argument is final: the one value written for them
+	/// all, the argument of a lone one, or a tuple of the arguments in
+	/// written order with the position each gives (`()` for none). A tuple of
+	/// a reported list is `ERROR`.
+	pub(super) fn arguments_value(
+		&mut self,
+		target: &CallTarget<'_>,
+		type_args: &[TypeIndex],
+		given: &[GivenArgument],
+		skipped: usize,
+		reported: bool,
+		span: TextSpan,
+	) -> ExprIdx {
+		let given = &given[skipped..];
+		let open = target.param_types.len() - skipped;
+		if let [argument] = given
+			&& (argument.param.is_none() || open == 1)
+		{
+			return argument.value;
+		}
+		let in_order = given.iter().enumerate().all(|(at, argument)| {
+			argument.param == Some(ParamIdx::new((skipped + at) as u32))
+		});
+		let order = if in_order {
+			ElementOrder::InOrder
+		} else {
+			self.body.push_permutation(given.iter().map(|argument| {
+				let param = argument.param.expect("a whole value is alone");
+				ParamIdx::new((usize::from(param) - skipped) as u32)
+			}))
+		};
+		let ty = if reported {
+			TypeIndex::ERROR
+		} else {
+			let declared = self.declared_after(target, skipped);
+			self.instantiate(declared, target.type_env, type_args)
+		};
+		self.pack(given.iter().map(|argument| argument.value), order, ty, span)
+	}
+
+	/// The declared type of `target`'s parameters after the first `skipped`,
+	/// as one value: their tuple, or a lone one's own type.
+	fn declared_after(
+		&mut self,
+		target: &CallTarget<'_>,
+		skipped: usize,
+	) -> TypeIndex {
+		self.cx.types.intern(Type::Tuple {
+			elements: target.param_types.suffix(skipped),
+		})
 	}
 
 	/// The arguments of a call of `target`, appended to `given` after the
@@ -451,9 +524,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) {
 		for argument in given {
 			let ty = if self.cx.types.has_infer(argument.expected) {
-				let declared = self.cx.types.list(target.param_types)
-					[usize::from(argument.param)];
-				self.instantiate(declared, target.type_env, type_args)
+				self.instantiate(argument.declared, target.type_env, type_args)
 			} else {
 				argument.expected
 			};
@@ -461,16 +532,15 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 	}
 
-	/// What `value`, given for `param`, teaches the call's type arguments.
+	/// What `value`, given for a parameter declared `declared`, teaches the
+	/// call's type arguments.
 	fn learn_argument(
 		&mut self,
 		target: &CallTarget<'_>,
 		type_args: &mut [TypeIndex],
-		param: ParamIdx,
+		declared: TypeIndex,
 		value: ExprIdx,
 	) {
-		let declared =
-			self.cx.types.list(target.param_types)[usize::from(param)];
 		let actual = self.body.ty(value);
 		self.cx.types.learn(
 			&self.cx.type_envs,
@@ -483,9 +553,10 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// `f(a, b)`: the n-th argument gives the n-th parameter after those
 	/// `given` holds. An argument past the last parameter is built and
-	/// dropped. When one parameter is left, the parentheses only mark the
-	/// call: the whole list is its value, `()` for none and a tuple for
-	/// several, so `g(a, b)` is `g((a, b))`.
+	/// dropped. The list is one value of the parameters left: when one is
+	/// left, the parentheses only mark the call, and the whole list is its
+	/// value (`g(a, b)` is `g((a, b))`); one argument for any other number
+	/// is their value as a tuple (`f(p)`).
 	fn positional_arguments(
 		&mut self,
 		target: &CallTarget<'_>,
@@ -500,6 +571,12 @@ impl BodyContext<'_, '_, '_, '_> {
 			return self.whole_argument_list(
 				target, type_args, arguments, given, span,
 			);
+		}
+		if open != 1
+			&& let [argument] = arguments
+		{
+			return self
+				.one_value_for_all(target, type_args, argument, given, span);
 		}
 		let reported = arguments.len() != open;
 		if reported {
@@ -516,14 +593,51 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.cx.types.list(target.param_types)[usize::from(param)];
 			let hint = self.instantiate(declared, target.type_env, type_args);
 			let value = self.build(&argument.inner, hint);
-			self.learn_argument(target, type_args, param, value);
+			self.learn_argument(target, type_args, declared, value);
 			given.push(GivenArgument {
-				param,
+				param: Some(param),
+				declared,
 				value,
 				expected: hint,
 			});
 		}
 		reported
+	}
+
+	/// `f(p)` for a target with any number of parameters left but one: `p`
+	/// is their value as one, a tuple of their types, and is held to it
+	/// whole. One that is no tuple is a wrong count, which is what it most
+	/// likely is (`f(a)` missing `b`).
+	fn one_value_for_all(
+		&mut self,
+		target: &CallTarget<'_>,
+		type_args: &mut [TypeIndex],
+		argument: &Separated<Spanned<ast::Expression>>,
+		given: &mut Vec<GivenArgument>,
+		span: TextSpan,
+	) -> bool {
+		let skipped = given.len();
+		let open = target.param_types.len() - skipped;
+		let declared = self.declared_after(target, skipped);
+		let hint = self.instantiate(declared, target.type_env, type_args);
+		let value = self.build(&argument.inner, hint);
+		let actual = self.body.ty(value);
+		let is_tuple =
+			matches!(self.cx.types.resolve(actual), Type::Tuple { .. });
+		if !is_tuple {
+			if !self.cx.types.has_error(actual) {
+				self.report_argument_count(target, open, 1, span);
+			}
+			return true;
+		}
+		self.learn_argument(target, type_args, declared, value);
+		given.push(GivenArgument {
+			param: None,
+			declared,
+			value,
+			expected: hint,
+		});
+		false
 	}
 
 	/// The written list as the value of the one parameter left, when it is
@@ -561,9 +675,10 @@ impl BodyContext<'_, '_, '_, '_> {
 			_ => span,
 		};
 		let value = self.build_tuple(arguments, hint, span);
-		self.learn_argument(target, type_args, param, value);
+		self.learn_argument(target, type_args, declared, value);
 		given.push(GivenArgument {
-			param,
+			param: Some(param),
+			declared,
 			value,
 			expected: hint,
 		});
@@ -668,10 +783,13 @@ impl BodyContext<'_, '_, '_, '_> {
 				reported = true;
 				continue;
 			}
-			self.learn_argument(target, type_args, param, value);
+			let declared =
+				self.cx.types.list(target.param_types)[usize::from(param)];
+			self.learn_argument(target, type_args, declared, value);
 			named.push((param, name.span));
 			given.push(GivenArgument {
-				param,
+				param: Some(param),
+				declared,
 				value,
 				expected: hint,
 			});
@@ -867,9 +985,8 @@ impl BodyContext<'_, '_, '_, '_> {
 				Arguments::Positional(arguments),
 				_,
 			) => {
-				let (values, _) =
+				let args =
 					self.build_packed_arguments(ty, param, arguments, span);
-				let args = self.body.push_args(values);
 				let kind = ExprKind::CallRef {
 					callee: value,
 					args,
@@ -892,37 +1009,15 @@ impl BodyContext<'_, '_, '_, '_> {
 				let (args, result) =
 					(intrinsics.call_args, intrinsics.call_result);
 				let args_type = self.call_projection(ty, args);
-				let (values, formed) =
+				let packed =
 					self.build_packed_arguments(ty, args_type, arguments, span);
-				let packed_type =
-					if formed { args_type } else { TypeIndex::ERROR };
-				let packed = match *values {
-					[value] => value,
-					_ => {
-						self.pack(values, ArgOrder::InOrder, packed_type, span)
-					}
-				};
 				(packed, self.call_projection(ty, result))
 			}
 			(None, Arguments::Named(_)) => unreachable!("reported above"),
 		};
 		let type_args = self.cx.types.push_list(&callee.type_args);
-		let args = self.body.push_args([value, packed]);
-		let owner = self.cx.defs.functions[usize::from(callee.function)].owner;
-		let kind = match Dispatch::of(owner) {
-			Dispatch::Direct => ExprKind::Call {
-				function: callee.function,
-				type_args,
-				args,
-				order: ArgOrder::InOrder,
-			},
-			Dispatch::Abstract => ExprKind::AbstractCall {
-				method: callee.function,
-				type_args,
-				args,
-				order: ArgOrder::InOrder,
-			},
-		};
+		let kind =
+			self.call_node(callee.function, type_args, Some(value), packed);
 		self.body.push(kind, result, span)
 	}
 
@@ -952,30 +1047,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		self.expect_arguments(&target, &type_args, &given);
 		let return_type = self.cx.functions[usize::from(function)].return_type;
 		let result = self.instantiate(return_type, target.type_env, &type_args);
-		if let ([argument], 1) = (&given[..], target.param_types.len()) {
-			return (argument.value, result);
-		}
-		let order = match arguments {
-			Arguments::Positional(_) => ArgOrder::InOrder,
-			Arguments::Named(_) => self
-				.body
-				.push_permutation(given.iter().map(|argument| argument.param)),
-		};
-		let ty = if reported {
-			TypeIndex::ERROR
-		} else {
-			let declared: Box<[TypeIndex]> =
-				self.cx.types.list(target.param_types).into();
-			let elements: Vec<TypeIndex> = declared
-				.iter()
-				.map(|&declared| {
-					self.instantiate(declared, target.type_env, &type_args)
-				})
-				.collect();
-			self.cx.types.intern_tuple(&elements)
-		};
-		let values = given.iter().map(|argument| argument.value).collect();
-		(self.pack(values, order, ty, span), result)
+		let args = self
+			.arguments_value(&target, &type_args, &given, 0, reported, span);
+		(args, result)
 	}
 
 	/// `<ty as Call>::{assoc}`, normalized; `ERROR` when std declares no such
@@ -999,23 +1073,24 @@ impl BodyContext<'_, '_, '_, '_> {
 		self.cx.types.collapse_error(projection)
 	}
 
-	/// The packed `Args` of a call of a value as a tuple of `values`,
-	/// spanning them.
-	fn pack(
+	/// A call's arguments as a tuple of `values`, spanning them (the call's
+	/// `span` for none).
+	pub(super) fn pack(
 		&mut self,
-		values: Vec<ExprIdx>,
-		order: ArgOrder,
+		values: impl IntoIterator<Item = ExprIdx>,
+		order: ElementOrder,
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let span = match (values.first(), values.last()) {
-			(Some(&first), Some(&last)) => TextSpan::new(
-				self.body.span(first).start,
-				self.body.span(last).end,
-			),
-			_ => span,
-		};
 		let elements = self.body.push_args(values);
+		let span = match self.body.args(elements) {
+			[first, .., last] => TextSpan::new(
+				self.body.span(*first).start,
+				self.body.span(*last).end,
+			),
+			&[only] => self.body.span(only),
+			[] => span,
+		};
 		self.body
 			.push(ExprKind::Tuple { elements, order }, ty, span)
 	}
@@ -1092,30 +1167,27 @@ impl BodyContext<'_, '_, '_, '_> {
 		Some(ValueCallee::Call(callee))
 	}
 
-	/// The arguments of a call of a value, checked against `args_type`, the
-	/// one parameter type its callee takes: one argument is it whole, any
-	/// other number are the elements of a tuple. Also whether they form it
-	/// (when not, it is reported).
+	/// The value of `args_type`, the one parameter type a called value takes,
+	/// from its written arguments: one argument is it whole, any other number
+	/// are the elements of a tuple, which is `ERROR` when they cannot form it
+	/// (reported).
 	fn build_packed_arguments(
 		&mut self,
 		callee_type: TypeIndex,
 		args_type: TypeIndex,
 		arguments: &[Separated<Spanned<ast::Expression>>],
 		span: TextSpan,
-	) -> (Vec<ExprIdx>, bool) {
+	) -> ExprIdx {
 		if let [argument] = arguments {
 			let value = self.build(&argument.inner, args_type);
-			return (vec![self.expect(value, args_type)], true);
+			return self.expect(value, args_type);
 		}
-		let element_types: Option<Box<[TypeIndex]>> =
-			match *self.cx.types.resolve(args_type) {
-				Type::Tuple { elements }
-					if elements.len() == arguments.len() =>
-				{
-					Some(self.cx.types.list(elements).into())
-				}
-				_ => None,
-			};
+		let element_types = match *self.cx.types.resolve(args_type) {
+			Type::Tuple { elements } if elements.len() == arguments.len() => {
+				Some(elements)
+			}
+			_ => None,
+		};
 		if element_types.is_none() && args_type != TypeIndex::ERROR {
 			self.report_value_argument_count(
 				callee_type,
@@ -1124,18 +1196,23 @@ impl BodyContext<'_, '_, '_, '_> {
 				span,
 			);
 		}
-		let values = arguments
+		// Built before they are packed: building each borrows the body.
+		let values: Vec<ExprIdx> = arguments
 			.iter()
 			.enumerate()
 			.map(|(at, argument)| {
-				let hint = element_types
-					.as_ref()
-					.map_or(TypeIndex::ERROR, |types| types[at]);
+				let hint = element_types.map_or(TypeIndex::ERROR, |types| {
+					self.cx.types.list(types)[at]
+				});
 				let value = self.build(&argument.inner, hint);
 				self.expect(value, hint)
 			})
 			.collect();
-		(values, element_types.is_some())
+		let ty = match element_types {
+			Some(_) => args_type,
+			None => TypeIndex::ERROR,
+		};
+		self.pack(values, ElementOrder::InOrder, ty, span)
 	}
 
 	/// Checks the arguments of a call that has no target, for their own

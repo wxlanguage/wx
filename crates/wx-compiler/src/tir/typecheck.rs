@@ -41,7 +41,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::body::{
-	ArgOrder, Body, BodyBuilder, BodyOwner, ExprIdx, ExprKind, ExprRange,
+	Body, BodyBuilder, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprRange,
 	LocalIdx, Scope, ScopeIdx, ScopeKind,
 };
 use super::defs::{
@@ -434,7 +434,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let elements = self.body.push_args(values);
 		let kind = ExprKind::Tuple {
 			elements,
-			order: ArgOrder::InOrder,
+			order: ElementOrder::InOrder,
 		};
 		self.body.push(kind, ty, span)
 	}
@@ -855,22 +855,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			type_list,
 			&given,
 		);
-		let order = match arguments {
-			Arguments::Positional(_) => ArgOrder::InOrder,
-			Arguments::Named(_) => self
-				.body
-				.push_permutation(given.iter().map(|argument| argument.param)),
-		};
-		let args = self
-			.body
-			.push_args(given.iter().map(|argument| argument.value));
+		let fields = self
+			.arguments_value(&target, &type_args, &given, 0, reported, span);
 		let ty = self.cx.types.intern_struct(struct_index, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
 		self.body.push(
 			ExprKind::StructConstructor {
 				struct_index,
-				args,
-				order,
+				fields,
 			},
 			ty,
 			span,
@@ -998,10 +990,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					let param = self.cx.type_envs.param_types(frame)[index];
 					let mut span = segment.ident.span;
 					for argument in given {
-						if self.cx.types.list(target.param_types)
-							[usize::from(argument.param)]
-							== param
-						{
+						if argument.declared == param {
 							span = self.body.span(argument.value);
 							break;
 						}
@@ -1186,7 +1175,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				.with_label(Label::primary(self.scope.file_id, span))
 				.with_note(format!(
 					"a struct's name is only a value when it is called: \
-					 `{name}(...)`"
+					 `{name}(...)`; to pass a constructor, pass a function \
+					 that calls it"
 				)),
 		);
 	}
@@ -1456,7 +1446,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			};
 			return (kind, ty);
 		}
-		(self.method_call(lookup, ty, [operand]), ty)
+		(self.method_call(lookup, ty, operand, None), ty)
 	}
 
 	/// The node for a binary operator on operands of concrete type `ty`, and
@@ -1503,7 +1493,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			};
 			return (kind, result);
 		}
-		(self.method_call(lookup, ty, [lhs, rhs]), result)
+		(self.method_call(lookup, ty, lhs, Some(rhs)), result)
 	}
 
 	/// Whether `ty` implements the operator's trait, and through what. `None`
@@ -1573,32 +1563,37 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		found
 	}
 
-	/// A call of the operator's method on operands of type `ty`: the selected
-	/// impl's own, or the trait's declaration when the receiver is abstract
-	/// or the impl inherits a default.
-	fn method_call<const N: usize>(
+	/// A call of the operator's method on operands of type `ty`, with the
+	/// first as the receiver and the other, if any, as its argument: the
+	/// selected impl's own, or the trait's declaration when the receiver is
+	/// abstract or the impl inherits a default.
+	fn method_call(
 		&mut self,
 		selected: (OperatorMethod, TraitImplLookup),
 		ty: TypeIndex,
-		args: [ExprIdx; N],
+		receiver: ExprIdx,
+		operand: Option<ExprIdx>,
 	) -> ExprKind {
-		let args = self.body.push_args(args);
+		let args = operand.unwrap_or_else(|| {
+			let span = self.body.span(receiver);
+			self.pack([], ElementOrder::InOrder, TypeIndex::UNIT, span)
+		});
 		match self.select_operator_method(selected, ty) {
 			SelectedMethod::Concrete {
 				function,
 				type_args,
-			} => ExprKind::Call {
+			} => ExprKind::MethodCall {
 				function,
 				type_args,
+				receiver,
 				args,
-				order: ArgOrder::InOrder,
 			},
 			SelectedMethod::Abstract { method, type_args } => {
-				ExprKind::AbstractCall {
+				ExprKind::AbstractMethodCall {
 					method,
 					type_args,
+					receiver,
 					args,
-					order: ArgOrder::InOrder,
 				}
 			}
 		}
@@ -1824,7 +1819,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		expr: ExprIdx,
 		elements: ExprRange,
-		order: ArgOrder,
+		order: ElementOrder,
 		target: TypeIndex,
 	) {
 		let targets = match *self.cx.types.resolve(target) {
@@ -2379,10 +2374,11 @@ mod tests {
 	use indoc::indoc;
 
 	use super::super::body::{
-		ArgOrder, Body, ExprIdx, ExprKind, ExprRange, PlaceIdx, PlaceKind,
+		Body, ElementOrder, ExprIdx, ExprKind, ExprRange, PlaceIdx, PlaceKind,
 	};
 	use super::super::defs::{
-		AstEntry, DefKind, DefinitionRegistry, MemberOwner, Scope, Tier,
+		AstEntry, DefKind, DefinitionRegistry, FunctionIdx, MemberOwner, Scope,
+		Tier,
 	};
 	use super::super::eval::{ConstScalar, ConstValueState};
 	use super::super::impls::ImplDispatch;
@@ -2609,18 +2605,42 @@ mod tests {
 			body: &Body,
 			head: &str,
 			args: ExprRange,
-			order: ArgOrder,
+			order: ElementOrder,
 		) -> String {
 			let mut text = format!("({head}");
 			for (at, &arg) in body.args(args).iter().enumerate() {
 				text.push(' ');
-				if let ArgOrder::Permuted { .. } = order {
+				if let ElementOrder::Permuted { .. } = order {
 					let param = body.declared_index(order, at);
 					text.push_str(&format!("{}=", usize::from(param)));
 				}
 				text.push_str(&self.render(body, arg));
 			}
 			text + ")"
+		}
+
+		/// A call's `head` and then its `args`, the value of `count`
+		/// parameters: a tuple of several is written as its elements, as the
+		/// call is; any other value, a lone parameter's, as itself.
+		fn render_arguments(
+			&self,
+			body: &Body,
+			head: &str,
+			count: usize,
+			args: ExprIdx,
+		) -> String {
+			match body.kind(args) {
+				ExprKind::Tuple { elements, order } if count != 1 => {
+					self.render_call(body, head, elements, order)
+				}
+				_ => format!("({head} {})", self.render(body, args)),
+			}
+		}
+
+		fn param_count(&self, function: FunctionIdx) -> usize {
+			self.context.functions[usize::from(function)]
+				.param_types
+				.len()
 		}
 
 		/// Renders a node without types: `(block (local x 1) => (+ x 2))`.
@@ -2682,46 +2702,84 @@ mod tests {
 					function,
 					type_args,
 					args,
-					order,
 				} => {
 					let callee = self.callee(function, type_args);
-					self.render_call(
+					self.render_arguments(
 						body,
 						&format!("call {callee}"),
+						self.param_count(function),
 						args,
-						order,
 					)
 				}
 				ExprKind::AbstractCall {
 					method,
 					type_args,
 					args,
-					order,
 				} => {
 					let callee = self.callee(method, type_args);
-					self.render_call(
+					self.render_arguments(
 						body,
 						&format!("abstract {callee}"),
+						self.param_count(method),
 						args,
-						order,
+					)
+				}
+				ExprKind::MethodCall {
+					function,
+					type_args,
+					receiver,
+					args,
+				} => {
+					let callee = self.callee(function, type_args);
+					let head = format!(
+						"call {callee} {}",
+						self.render(body, receiver)
+					);
+					self.render_arguments(
+						body,
+						&head,
+						self.param_count(function) - 1,
+						args,
+					)
+				}
+				ExprKind::AbstractMethodCall {
+					method,
+					type_args,
+					receiver,
+					args,
+				} => {
+					let callee = self.callee(method, type_args);
+					let head = format!(
+						"abstract {callee} {}",
+						self.render(body, receiver)
+					);
+					self.render_arguments(
+						body,
+						&head,
+						self.param_count(method) - 1,
+						args,
 					)
 				}
 				ExprKind::CallRef { callee, args } => {
 					let head =
 						format!("call_ref {}", self.render(body, callee));
-					list(&head, body.args(args))
+					self.render_arguments(body, &head, 0, args)
 				}
 				ExprKind::Tuple { elements, order } => {
 					self.render_call(body, "tuple", elements, order)
 				}
 				ExprKind::StructConstructor {
-					struct_index, args, ..
-				} => list(
-					name(
+					struct_index,
+					fields,
+				} => {
+					let name = name(
 						self.defs.structs[usize::from(struct_index)].name.inner,
-					),
-					body.args(args),
-				),
+					);
+					let count = self.context.structs[usize::from(struct_index)]
+						.field_types
+						.len();
+					self.render_arguments(body, name, count, fields)
+				}
 				ExprKind::Cast { value } => {
 					let ty = self.display(body.ty(expr));
 					format!("(as {} {ty})", self.render(body, value))
@@ -2882,7 +2940,15 @@ mod tests {
 					let name =
 						self.defs.structs[usize::from(struct_index)].name.inner;
 					let name = self.context.strings.resolve(name).unwrap();
-					list(name, body.patterns(fields))
+					let count = self.context.structs[usize::from(struct_index)]
+						.field_types
+						.len();
+					match body.pattern(fields) {
+						PatternKind::Tuple(children) if count != 1 => {
+							list(name, body.patterns(children))
+						}
+						_ => list(name, &[fields]),
+					}
 				}
 				PatternKind::Int(bits) => {
 					let integer =
@@ -3699,7 +3765,7 @@ mod tests {
 		);
 		assert_eq!(
 			case.shape("counted"),
-			"(block (local g#0 pair) (abstract call<pair> g#0 (tuple 1)))"
+			"(block (local g#0 pair) (abstract call<pair> g#0 (tuple)))"
 		);
 		assert_eq!(
 			case.shape("method"),
@@ -3825,8 +3891,9 @@ mod tests {
 		);
 	}
 
-	/// Nothing is wrapped for a target of several parameters, and a lone
-	/// parameter of a known type that is no such tuple is a wrong count.
+	/// Nothing is regrouped: a list of another length, one value that is no
+	/// tuple for several parameters, or several for a lone parameter of a
+	/// known type that is no such tuple, is a wrong count.
 	#[test]
 	fn the_argument_list_fills_several_parameters_one_each() {
 		test_case!(
@@ -3835,7 +3902,7 @@ mod tests {
 				func h(x: u32) {}
 				struct V();
 				impl V { func m(self: Self, p: (u8, u16)) {} }
-				func tupled(p: (u8, u16)) { f(p); }
+				func missing(a: u8) { f(a); }
 				func none() { h(); }
 				func several() { h(1, 2); }
 				func qualified(v: V, a: u8, b: u16) { V::m(v, a, b); }
@@ -3844,12 +3911,45 @@ mod tests {
 		// The arguments that do fall on a parameter are still held to it.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArgumentCountMismatch,
-			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::TypeMistmatch,
 		]);
+	}
+
+	/// One value written for several parameters is their value as one, as
+	/// the list they form would be: the call holds it whole.
+	#[test]
+	fn one_value_is_the_arguments_of_several_parameters() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u8, b: u16) -> u16 { b }
+				func none() {}
+				struct Point(x: u8, y: u16);
+				struct V();
+				impl V { func m(self: Self, a: u8, b: u16) {} }
+				func call(p: (u8, u16)) -> u16 { f(p) }
+				func literal() -> u16 { f((1, 2)) }
+				func unit() { none(()); }
+				func construct(p: (u8, u16)) -> Point { Point(p) }
+				func method(v: V, p: (u8, u16)) { v.m(p); }
+				func qualified(t: (V, u8, u16)) { V::m(t); }
+				func grouped(v: V, p: (u8, u16)) { V::m(v, p); }
+			"}
+		);
+		// `V::m(v, p)` is no regrouping: `p` falls on `a`.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(case.shape("call"), "(block => (call f p#0))");
+		// The same call as `f(1, 2)`.
+		assert_eq!(case.shape("literal"), "(block => (call f 1 2))");
+		assert_eq!(case.shape("unit"), "(block (call none))");
+		assert_eq!(case.shape("construct"), "(block => (Point p#0))");
+		assert_eq!(case.shape("method"), "(block (call m v#0 p#1))");
+		assert_eq!(case.shape("qualified"), "(block (call m t#0))");
 	}
 
 	/// Conformance is not checked, so a `call` of the wrong shape must not
@@ -4138,6 +4238,52 @@ mod tests {
 		assert_eq!(
 			case.context.const_values[usize::from(index)],
 			ConstValueState::Evaluated(Box::new([ConstScalar::bool(false)]))
+		);
+	}
+
+	#[test]
+	fn a_function_item_is_a_zero_sized_constant() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				const ID: id<u8> = id;
+				const AGAIN: id<u8> = ID;
+				func f() -> u8 { ID(1) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		for name in ["ID", "AGAIN"] {
+			let DefKind::Const(index) = case.resolve(name) else {
+				panic!("expected a constant");
+			};
+			assert_eq!(
+				case.context.const_values[usize::from(index)],
+				ConstValueState::Evaluated(Box::new([]))
+			);
+		}
+		assert_eq!(case.shape("f"), "(block => (abstract call<id<u8>> ID 1))");
+	}
+
+	#[test]
+	fn a_global_handle_is_a_zero_sized_constant() {
+		test_case!(
+			case = indoc! {"
+				global mut counter: u32 = 0;
+				const COUNTER: counter = counter;
+				func read() -> u32 { COUNTER.get() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		let DefKind::Const(index) = case.resolve("COUNTER") else {
+			panic!("expected a constant");
+		};
+		assert_eq!(
+			case.context.const_values[usize::from(index)],
+			ConstValueState::Evaluated(Box::new([]))
+		);
+		assert_eq!(
+			case.shape("read"),
+			"(block => (abstract get<counter> COUNTER))"
 		);
 	}
 
@@ -4575,7 +4721,7 @@ mod tests {
 			case.shape("by_name"),
 			"(block (local a#0 1) => (call f 1=2 0=a#0))"
 		);
-		assert_eq!(case.shape("in_order"), "(block => (call f 0=1 1=2))");
+		assert_eq!(case.shape("in_order"), "(block => (call f 1 2))");
 		assert_eq!(case.shape("positional"), "(block => (call f 1 2))");
 		assert_eq!(
 			case.shape("generic"),
@@ -4596,10 +4742,7 @@ mod tests {
 			"}
 		);
 		case.diagnostics().assert_none();
-		assert_eq!(
-			case.shape("method"),
-			"(block => (call pick 0=s#0 2=1 1=2))"
-		);
+		assert_eq!(case.shape("method"), "(block => (call pick s#0 1=1 0=2))");
 		assert_eq!(case.shape("path"), "(block => (call pick 1=2 0=s#0 2=1))");
 	}
 
@@ -4624,11 +4767,11 @@ mod tests {
 		case.diagnostics().assert_error_saying(
 			"function `add` has no parameter named `other`",
 		);
-		assert_eq!(case.shape("concrete"), "(block => (call add 0=p#0 1=q#1))");
+		assert_eq!(case.shape("concrete"), "(block => (call add p#0 q#1))");
 		assert_eq!(case.shape("path"), "(block => (call add 1=q#1 0=p#0))");
 		assert_eq!(
 			case.shape("generic"),
-			"(block => (abstract add<T> 0=a#0 1=b#1))"
+			"(block => (abstract add<T> a#0 b#1))"
 		);
 	}
 
@@ -4713,7 +4856,7 @@ mod tests {
 			DiagnosticCode::DuplicateFunctionParameter,
 			DiagnosticCode::DuplicateNamedArgument,
 		]);
-		assert_eq!(case.shape("once"), "(block => (call d 0=1))");
+		assert_eq!(case.shape("once"), "(block => (call d 1))");
 	}
 
 	#[test]
@@ -4982,6 +5125,67 @@ mod tests {
 			 ((P (| ZERO (abstract MAX<T>)) _) => (block => 3)) \
 			 (_ => (block => 4))))"
 		);
+	}
+
+	/// A struct pattern's list is one value of its fields, as a construction
+	/// gives them: one pattern for several fields matches them all as a
+	/// tuple, several for a lone tuple field match that tuple.
+	#[test]
+	fn a_struct_pattern_matches_its_fields_as_one_value() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8, y: u16);
+				struct W(x: (u8, u16));
+				struct Unit();
+				func whole(p: P) -> (u8, u16) { local P(t) = p; t }
+				func grouped(p: P) -> u8 { local P((a, b)) = p; a }
+				func any(p: P) { local P(_) = p; }
+				func spread(w: W) -> u8 { local W(a, b) = w; a }
+				func lone_rest(w: W) -> u16 { local W(.., b) = w; b }
+				func field(w: W) -> (u8, u16) { local W(t) = w; t }
+				func unit(u: Unit) { local Unit(e) = u; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.locals("whole")[1], ("t".into(), "(u8, u16)".into()));
+		assert_eq!(
+			case.locals("grouped")[1..],
+			[("a".into(), "u8".into()), ("b".into(), "u16".into())]
+		);
+		assert_eq!(
+			case.locals("spread")[1..],
+			[("a".into(), "u8".into()), ("b".into(), "u16".into())]
+		);
+		assert_eq!(case.locals("lone_rest")[1], ("b".into(), "u16".into()));
+		assert_eq!(case.locals("field")[1], ("t".into(), "(u8, u16)".into()));
+		assert_eq!(case.locals("unit")[1], ("e".into(), "()".into()));
+	}
+
+	#[test]
+	fn a_struct_pattern_of_its_fields_as_one_value_counts_for_exhaustiveness() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8, y: u16);
+				struct W(x: (u8, u16));
+				func covered(p: P) -> u8 {
+					match p { P(0, _) -> { 1 }, P(t) -> { 2 } }
+				}
+				func missing(p: P) -> u8 {
+					match p { P((0, _) | (1, _)) -> { 1 } }
+				}
+				func unreachable(w: W) -> u8 {
+					match w { W(0, _) -> { 1 }, W(_) -> { 2 }, W(a, b) -> { 3 } }
+				}
+				func count(p: P) { local P(a, b, c) = p; }
+				func lone(w: W) { local W(a, b, c) = w; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::ArgumentCountMismatch,
+		]);
 	}
 
 	#[test]

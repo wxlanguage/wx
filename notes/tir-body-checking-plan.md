@@ -268,8 +268,8 @@ or a field of one) or `Store` (a place in linear memory):
 | | value | into a local | into memory |
 |---|---|---|---|
 | native op | `PrimitiveBinary`, `PrimitiveUnary` | `PrimitiveCompoundAssign` | `PrimitiveCompoundStore` |
-| known function | `Call` | `ConcreteCompoundAssign` | `ConcreteCompoundStore` |
-| trait declaration | `AbstractCall` | `AbstractCompoundAssign` | `AbstractCompoundStore` |
+| known function | `Call`, `MethodCall` | `ConcreteCompoundAssign` | `ConcreteCompoundStore` |
+| trait declaration | `AbstractCall`, `AbstractMethodCall` | `AbstractCompoundAssign` | `AbstractCompoundStore` |
 
 Compared with the old checker, which had four compound nodes that always held a
 method (primitives went through their `#[inline]` impls), the `Primitive`
@@ -282,18 +282,28 @@ A `Load` is pushed only where a place's value is used, so `.&` and the left of
 ### Calls
 
 ```rust
-/// Direct: a free function, `Type::f(..)`, `x.m(..)`, an operator's impl method.
-ExprKind::Call { function: FunctionIdx, type_args: TypeList, args: ExprRange }
+/// Direct: a free function, `Type::f(..)`, `Type::m(x, ..)`.
+ExprKind::Call { function: FunctionIdx, type_args: TypeList, args: ExprIdx }
 /// A trait's declaration: an abstract receiver, or an impl inheriting a default.
-ExprKind::AbstractCall { method: FunctionIdx, type_args: TypeList, args: ExprRange }
-// later: IndirectCall { callee: ExprIdx, args: ExprRange }, a `func(A) -> R` value
+ExprKind::AbstractCall { method: FunctionIdx, type_args: TypeList, args: ExprIdx }
+/// `x.m(..)`, an operator's method, `Call::call` of a value; and its abstract twin.
+ExprKind::MethodCall { function, type_args, receiver: ExprIdx, args: ExprIdx }
+ExprKind::AbstractMethodCall { method, type_args, receiver: ExprIdx, args: ExprIdx }
+/// A `func(A) -> R` value.
+ExprKind::CallRef { callee: ExprIdx, args: ExprIdx }
 ```
 
-A call is direct whenever the function is known, so a method call is a `Call`
-like any other: `x.m(a)` and `T::m(x, a)` build the same node, the receiver
-first in `args`, and which spelling was written is in the name resolutions.
-Only a trait's declaration (`AbstractCall`) and a runtime value
-(`IndirectCall`, not yet) are calls of something else. Struct construction
+`args` is one value of the parameters the call's list fills: `()` for none,
+the argument itself for one, a `Tuple` of the arguments in written order with
+an `ElementOrder` for several (permuted for a call by name), or one value
+written for several (`f(p)`). A construction holds its fields the same way
+(`StructConstructor { fields }`). A method call keeps its receiver beside
+`args`: `x.m(a)` is a `MethodCall` and `T::m(x, a)` a `Call` whose `args`
+hold `x` too. They mean the same call; the receiver is apart because what it
+is given for differs from what an argument is (a `self: M::*Self` method is
+called on the pointer itself, and any receiver adjustment belongs there), and
+because `x.m(p)` for `m(self: Self, a: A, b: B)` has no value of
+`(Self, A, B)` without taking `p` apart. Struct construction
 stays its own kind. Inference for a function call is struct construction
 generalised: the callee's parameter frame plays the struct's role, the
 parameter types the fields', and the return type is met with the expected type
@@ -460,7 +470,8 @@ known statically can be named.
   ("function `f`", "struct constructor `Point`") with a label at its
   declaration. E2086 is gone; struct patterns keep E2025–E2027 and E2088
   until they are looked at on their own, and field access keeps E2025.
-- Body: `Call` and `AbstractCall` gain `order: ArgOrder`, as
+- Body (since replaced: a call holds one `args` value, see "Calls"):
+  `Call` and `AbstractCall` gain `order: ArgOrder`, as
   `StructConstructor` has. `args` stay in written order, which is the
   evaluation order; the permutation says which parameter each gives; a
   receiver is first and gives parameter 0. MIR evaluates in written order and
@@ -523,6 +534,18 @@ alone: the marker, not name lookup, decides whether `MAX` binds or compares, so
 renaming or removing a constant is an error ("cannot find value `MAX`") and
 never a silent catch-all, as it is in Rust. A qualified path needs no marker
 precisely because it cannot bind.
+
+**A struct's list is one value of its fields,** as a construction gives
+them, and as in Standard ML: `Point(x, y)` gives each field, `Point(p)` binds
+them all as one tuple `(i32, i32)` (not the first field: that is
+`Point(x, ..)`), `Point(_)` matches any point, and `Point((x, y))` is
+`Point(x, y)`. A lone field whose type is a tuple takes several, so
+`W(a, b)` and `W(a, ..)` match `W(x: (u8, u16))`. Nothing is regrouped:
+`Outer(a, b, c)` does not match `Outer(x: (u8, u8), y: u8)`. A
+`PatternKind::Struct` holds one child of the fields' tuple type, and
+exhaustiveness splits a struct as that tuple (a lone field as one child). No
+warning marks a lone name binding several fields; Python reads `Point(x)` as
+the first field, Rust and OCaml (for an n-ary constructor) reject it.
 
 **Refutability is syntactic.** wx enums carry no data, so destructuring a tuple
 or a struct always matches, and a pattern can fail only where it holds a
@@ -850,13 +873,17 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   is never called as a value: a struct's name constructs it. Not yet:
   constant values of item type (`eval`).
   Every call follows one rule for its positional arguments
-  (`positional_arguments`): when they fill one parameter, the whole list is
-  its value, `()` for none and a tuple for several (`whole_argument_list`);
-  otherwise each gives one parameter and nothing is wrapped. So `g(a, b)` is
-  `g((a, b))` for `g(p: (A, B))`, a lone generic parameter learns the tuple,
-  a receiver fills its parameter first (`x.m(a, b)`, but `T::m(x, (a, b))`),
-  and a known parameter type that is no such tuple is a wrong count.
-  `Args` of a value is that one parameter, so the value calls agree.
+  (`positional_arguments`): the list is one value of the parameters it
+  fills, and nothing is regrouped. When it fills one, the whole list is its
+  value, `()` for none and a tuple for several (`whole_argument_list`); one
+  value for several is their tuple (`one_value_for_all`, `f(p)`); otherwise
+  each gives one parameter. So `g(a, b)` is `g((a, b))` for `g(p: (A, B))`, a
+  lone generic parameter learns the tuple, a receiver fills its parameter
+  first (`x.m(a, b)`, `x.m(p)`; `T::m(x, p)` is a wrong count), a lone
+  value that is no tuple for several parameters is a wrong count (`f(a)`
+  missing `b`), and so is a known lone parameter type that is no such tuple.
+  `arguments_value` turns what was given into the node's one `args`. `Args`
+  of a value is that one parameter, so the value calls agree.
 - **Q4. Operator nodes.** Decided: one node per way an operation is defined
   (`Primitive`/`Concrete`/`Abstract`) and per destination (value, `Assign`, `Store`);
   see the table under places and assignment.

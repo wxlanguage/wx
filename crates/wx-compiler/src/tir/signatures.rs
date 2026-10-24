@@ -4621,7 +4621,7 @@ pub(super) mod tests {
 
 	mod const_initializers {
 		use super::*;
-		use crate::tir::body::{ArgOrder, Body, ExprIdx, ExprKind};
+		use crate::tir::body::{Body, ElementOrder, ExprIdx, ExprKind};
 		use crate::tir::eval::{ConstScalar, ConstValue, ConstValueState};
 
 		/// Test items appended to the real stdlib, so operators are checked
@@ -4688,11 +4688,23 @@ pub(super) mod tests {
 						args,
 						..
 					}
-					| ExprKind::AbstractCall { method, args, .. } => {
-						let abstract_call = matches!(
-							body.kind(expr),
-							ExprKind::AbstractCall { .. }
-						);
+					| ExprKind::AbstractCall { method, args, .. }
+					| ExprKind::MethodCall {
+						function: method,
+						args,
+						..
+					}
+					| ExprKind::AbstractMethodCall { method, args, .. } => {
+						let (abstract_call, receiver) = match body.kind(expr) {
+							ExprKind::AbstractCall { .. } => (true, None),
+							ExprKind::MethodCall { receiver, .. } => {
+								(false, Some(receiver))
+							}
+							ExprKind::AbstractMethodCall {
+								receiver, ..
+							} => (true, Some(receiver)),
+							_ => (false, None),
+						};
 						let name =
 							case.defs.functions[usize::from(method)].name.inner;
 						let mut text = format!(
@@ -4700,7 +4712,13 @@ pub(super) mod tests {
 							if abstract_call { "abstract " } else { "call " },
 							case.context.strings.resolve(name).unwrap()
 						);
-						for &arg in body.args(args) {
+						let count = case.context.functions[usize::from(method)]
+							.param_types
+							.len() - usize::from(receiver.is_some());
+						for arg in receiver
+							.into_iter()
+							.chain(arguments(body, count, args))
+						{
 							text.push(' ');
 							text.push_str(&render(case, body, arg));
 						}
@@ -4724,8 +4742,7 @@ pub(super) mod tests {
 					// A named argument shows the field it gives: `(P y=2:u8)`.
 					ExprKind::StructConstructor {
 						struct_index,
-						args,
-						order,
+						fields,
 					} => {
 						let def = &case.defs.structs[usize::from(struct_index)];
 						let strings = &case.context.strings;
@@ -4733,9 +4750,17 @@ pub(super) mod tests {
 							"({}",
 							strings.resolve(def.name.inner).unwrap()
 						);
-						for (at, &arg) in body.args(args).iter().enumerate() {
+						let (args, order) = match body.kind(fields) {
+							ExprKind::Tuple { elements, order }
+								if def.field_names.len() != 1 =>
+							{
+								(body.args(elements).to_vec(), order)
+							}
+							_ => (vec![fields], ElementOrder::InOrder),
+						};
+						for (at, &arg) in args.iter().enumerate() {
 							text.push(' ');
-							if let ArgOrder::Permuted { .. } = order {
+							if let ElementOrder::Permuted { .. } = order {
 								let name = def.field_names[usize::from(
 									body.declared_index(order, at),
 								)]
@@ -4754,6 +4779,20 @@ pub(super) mod tests {
 				let ty =
 					case.context.type_formatter().display_type(body.ty(expr));
 				format!("{node}:{ty}")
+			}
+			/// A call's `args`, the value of `count` parameters, as written:
+			/// a tuple of several as its elements, any other value itself.
+			fn arguments(
+				body: &Body,
+				count: usize,
+				args: ExprIdx,
+			) -> Vec<ExprIdx> {
+				match body.kind(args) {
+					ExprKind::Tuple { elements, .. } if count != 1 => {
+						body.args(elements).to_vec()
+					}
+					_ => vec![args],
+				}
 			}
 			let body = body(case, name);
 			render(case, body, body.root())
@@ -5202,10 +5241,7 @@ pub(super) mod tests {
 			// Arguments keep their written order; the value is in declaration
 			// order.
 			assert_eq!(shape(&case, "P"), "(Point y=2:i32 x=1:i32):Point");
-			assert_eq!(
-				shape(&case, "Q"),
-				"(Point x=x:i32 y=(- x:i32):i32):Point"
-			);
+			assert_eq!(shape(&case, "Q"), "(Point x:i32 (- x:i32):i32):Point");
 			assert_eq!(
 				shape(&case, "L"),
 				"(Line (Point 0:i32 0:i32):Point P:Point):Line"

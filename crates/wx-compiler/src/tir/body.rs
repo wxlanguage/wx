@@ -122,11 +122,13 @@ pub(super) enum PatternKind {
 	Bind(LocalIdx),
 	/// One child per element of the tuple's type.
 	Tuple(PatternRange),
-	/// One child per field, in declaration order. The type arguments are the
+	/// Its fields as one value, of the struct's field tuple (a lone field's
+	/// own type): a tuple of one child per field in declaration order, or any
+	/// pattern of that type (`P(p)`, `P(_)`). The type arguments are the
 	/// pattern's type's.
 	Struct {
 		struct_index: StructIdx,
-		fields: PatternRange,
+		fields: PatIdx,
 	},
 
 	// Tests: match only some values, so only a match arm holds them.
@@ -154,15 +156,15 @@ pub(super) enum PatternKind {
 	Error,
 }
 
-/// How the written order of arguments relates to the declared order of what
-/// they give.
+/// How the written order of a tuple's elements relates to the positions they
+/// give.
 #[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum ArgOrder {
-	/// The n-th argument gives the n-th parameter.
+pub(super) enum ElementOrder {
+	/// The n-th element gives the n-th position.
 	InOrder,
-	/// A run of `Body::arg_order` starting at `start` gives the parameter of
-	/// each argument, so it is as long as the arguments it belongs to.
+	/// A run of `Body::arg_order` starting at `start` gives the position of
+	/// each element, so it is as long as the elements it belongs to.
 	Permuted { start: u32 },
 }
 
@@ -228,49 +230,61 @@ pub(super) enum ExprKind {
 		rhs: ExprIdx,
 	},
 	/// A direct call of a known function: a free function, `Type::f(..)`,
-	/// `x.m(..)`, or the impl method an operator on a concrete type selects.
-	/// A method's receiver is the first of `args`. `args` are in written
-	/// order, the order they are evaluated in, and `order` says which
-	/// parameter each gives.
+	/// or `Type::m(x, ..)`. `args` is the value of its parameters as one, as
+	/// a parameter list forms its type: `()` for none, the argument itself
+	/// for one, a `Tuple` for several, or one value written for all of them
+	/// (`f(p)`).
 	Call {
 		function: FunctionIdx,
 		type_args: TypeList,
-		args: ExprRange,
-		order: ArgOrder,
+		args: ExprIdx,
 	},
 	/// A call of a trait's declaration, whose impl is selected once `Self`
 	/// is known: for an abstract receiver, or a concrete one whose impl
-	/// inherits the trait's default. A method's receiver is the first of
-	/// `args`; `order` as for `Call`.
+	/// inherits the trait's default. `args` as for `Call`.
 	AbstractCall {
 		method: FunctionIdx,
 		type_args: TypeList,
-		args: ExprRange,
-		order: ArgOrder,
+		args: ExprIdx,
+	},
+	/// `receiver.m(..)` of a known function: an impl method, the impl method
+	/// an operator on a concrete type selects, or `Call::call` of a value's
+	/// impl. The receiver gives the first parameter and is evaluated first;
+	/// `args` is the value of the parameters after it, as for `Call`.
+	MethodCall {
+		function: FunctionIdx,
+		type_args: TypeList,
+		receiver: ExprIdx,
+		args: ExprIdx,
+	},
+	/// `receiver.m(..)` of a trait's declaration, as `AbstractCall` is to
+	/// `Call`: an abstract receiver's method or operator, a default an impl
+	/// inherits, or `Call::call` of a function item or an abstract `F: Call`.
+	AbstractMethodCall {
+		method: FunctionIdx,
+		type_args: TypeList,
+		receiver: ExprIdx,
+		args: ExprIdx,
 	},
 	/// A call through a function reference, `f(a, b)` with `f: func(A) ->
-	/// R`, by position only. `args` are the written arguments, in evaluation
-	/// order after the callee: none give `()`, one gives `A` whole, several
-	/// give the elements of the tuple `A`.
+	/// R`, by position only, evaluated after the callee. `args` is its value
+	/// of `A`, as for `Call`.
 	CallRef {
 		callee: ExprIdx,
-		args: ExprRange,
+		args: ExprIdx,
 	},
 	/// A tuple of its elements: `(a, b)` or `()`. `elements` are in
 	/// evaluation order and `order` says which position each gives: in order
-	/// as written, permuted for the `Args` of a function item called by name.
+	/// as written, permuted for the arguments of a call by name.
 	Tuple {
 		elements: ExprRange,
-		order: ArgOrder,
+		order: ElementOrder,
 	},
 	/// A struct built from its fields, written as a call to its name;
-	/// `order` says which field each argument gives. A construction
-	/// missing a field, which is reported, has fewer arguments than the struct
-	/// has fields.
+	/// `fields` is their value as one, as `args` is a call's.
 	StructConstructor {
 		struct_index: StructIdx,
-		args: ExprRange,
-		order: ArgOrder,
+		fields: ExprIdx,
 	},
 	/// `value as T`; the node's type is `T`.
 	Cast {
@@ -503,15 +517,17 @@ impl Body {
 		&self.extra[range.start as usize..(range.start + range.len) as usize]
 	}
 
-	/// The parameter the argument at `at`, in written order, gives.
+	/// The position the element at `at`, in written order, gives.
 	pub(super) fn declared_index(
 		&self,
-		order: ArgOrder,
+		order: ElementOrder,
 		at: usize,
 	) -> ParamIdx {
 		match order {
-			ArgOrder::InOrder => ParamIdx::new(at as u32),
-			ArgOrder::Permuted { start } => self.arg_order[start as usize + at],
+			ElementOrder::InOrder => ParamIdx::new(at as u32),
+			ElementOrder::Permuted { start } => {
+				self.arg_order[start as usize + at]
+			}
 		}
 	}
 
@@ -603,15 +619,17 @@ impl BodyBuilder {
 		&self.extra[range.start as usize..(range.start + range.len) as usize]
 	}
 
-	/// The parameter the argument at `at`, in written order, gives.
+	/// The position the element at `at`, in written order, gives.
 	pub(super) fn declared_index(
 		&self,
-		order: ArgOrder,
+		order: ElementOrder,
 		at: usize,
 	) -> ParamIdx {
 		match order {
-			ArgOrder::InOrder => ParamIdx::new(at as u32),
-			ArgOrder::Permuted { start } => self.arg_order[start as usize + at],
+			ElementOrder::InOrder => ParamIdx::new(at as u32),
+			ElementOrder::Permuted { start } => {
+				self.arg_order[start as usize + at]
+			}
 		}
 	}
 
@@ -625,15 +643,15 @@ impl BodyBuilder {
 		ExprRange { start, len }
 	}
 
-	/// Records the field or parameter each argument of a call written by name
-	/// gives, in the order of the arguments.
+	/// Records the position each element of a tuple gives, in written order:
+	/// the arguments of a call by name.
 	pub(super) fn push_permutation(
 		&mut self,
 		declared: impl IntoIterator<Item = ParamIdx>,
-	) -> ArgOrder {
+	) -> ElementOrder {
 		let start = u32::try_from(self.arg_order.len()).unwrap();
 		self.arg_order.extend(declared);
-		ArgOrder::Permuted { start }
+		ElementOrder::Permuted { start }
 	}
 
 	pub(super) fn push_scope(&mut self, scope: Scope) -> ScopeIdx {

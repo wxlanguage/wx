@@ -144,6 +144,16 @@ impl TypeList {
 		}
 	}
 
+	/// The elements after the first `skip`, sharing this list's storage: a
+	/// method's parameters after its receiver.
+	pub(super) fn suffix(self, skip: usize) -> TypeList {
+		assert!(skip <= self.len(), "a suffix past its list");
+		TypeList {
+			start: self.start + skip as u32,
+			len: self.len - skip as u32,
+		}
+	}
+
 	/// This list's elements, out of the interner's `lists`.
 	fn slice(self, lists: &[TypeIndex]) -> &[TypeIndex] {
 		&lists[self.start as usize..][..self.len as usize]

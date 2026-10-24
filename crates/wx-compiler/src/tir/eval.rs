@@ -22,7 +22,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::body::{ArgOrder, ConstBody, ExprIdx, ExprKind, ExprRange};
+use super::body::{ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange};
 use super::defs::{ConstIdx, EnumIdx, StructIdx};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
@@ -259,28 +259,28 @@ impl TypeContext<'_, '_, '_> {
 			.expect("a settled state is final")
 	}
 
-	/// The values of `args`, evaluated in written order and held in the
-	/// declared order `order` gives them.
+	/// The values of a tuple's `elements`, evaluated in written order and
+	/// held in the positions `order` gives them.
 	fn eval_ordered(
 		&mut self,
 		owner: ConstIdx,
-		args: ExprRange,
-		order: ArgOrder,
+		elements: ExprRange,
+		order: ElementOrder,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let ArgOrder::Permuted { .. } = order else {
-			for at in 0..args.len() {
-				let arg = self.const_body(owner).unwrap().args(args)[at];
+		let ElementOrder::Permuted { .. } = order else {
+			for at in 0..elements.len() {
+				let arg = self.const_body(owner).unwrap().args(elements)[at];
 				self.eval(owner, arg, stack)?;
 			}
 			return Ok(());
 		};
 		let start = stack.len();
-		let mut declared = Vec::with_capacity(args.len());
-		for at in 0..args.len() {
+		let mut declared = Vec::with_capacity(elements.len());
+		for at in 0..elements.len() {
 			let body = self.const_body(owner).unwrap();
 			let (arg, index) =
-				(body.args(args)[at], body.declared_index(order, at));
+				(body.args(elements)[at], body.declared_index(order, at));
 			let arg_start = stack.len();
 			self.eval(owner, arg, stack)?;
 			declared.push((
@@ -318,10 +318,10 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::String(_)
 			| ExprKind::AbstractCall { .. }
 			| ExprKind::Local(_)
-			| ExprKind::Global(_)
-			| ExprKind::Function { .. }
 			| ExprKind::Drop { .. }
 			| ExprKind::Call { .. }
+			| ExprKind::MethodCall { .. }
+			| ExprKind::AbstractMethodCall { .. }
 			| ExprKind::CallRef { .. }
 			| ExprKind::Cast { .. }
 			| ExprKind::FieldAccess { .. }
@@ -358,6 +358,9 @@ impl TypeContext<'_, '_, '_> {
 				Some(Scalar::F64) => stack.push(ConstScalar::f64(value)),
 				_ => return Err(own(EvalErrorKind::NotConst)),
 			},
+			// A function item and a global's handle are zero-sized: the type
+			// says everything.
+			ExprKind::Function { .. } | ExprKind::Global(_) => {}
 			ExprKind::Bool(value) => stack.push(ConstScalar::bool(value)),
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
 			// An impl's constant may depend on the impl's arguments, which
@@ -402,18 +405,10 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::Tuple { elements, order } => {
 				self.eval_ordered(owner, elements, order, stack)?;
 			}
-			ExprKind::StructConstructor {
-				struct_index,
-				args,
-				order,
-			} => {
-				let count =
-					self.structs[usize::from(struct_index)].field_types.len();
-				// A missing field was reported.
-				if args.len() != count {
-					return Err(Halt::Silent);
-				}
-				self.eval_ordered(owner, args, order, stack)?;
+			// Its fields' value; one missing was reported, which makes it
+			// `ERROR`.
+			ExprKind::StructConstructor { fields, .. } => {
+				self.eval(owner, fields, stack)?;
 			}
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				self.eval(owner, lhs, stack)?;
