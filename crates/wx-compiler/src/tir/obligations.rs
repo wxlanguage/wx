@@ -161,25 +161,24 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// Checks `obligations` once every signature exists: a declaration's
-	/// own, or what a body recorded while lowering a written type. Every fact
-	/// is final then, so nothing can be pending; a failure reports itself.
-	pub(super) fn check_now(&mut self, obligations: &[Obligation]) {
+	/// own, or what a body recorded while lowering a written type. A failure
+	/// reports itself. Returns the ones that are pending: they read a
+	/// constant's value while constant bodies are still being built, which
+	/// only a constant's body can, and it decides them once every body exists.
+	#[must_use]
+	pub(super) fn check_now(
+		&mut self,
+		obligations: &[Obligation],
+	) -> Vec<Obligation> {
+		let mut pending = Vec::new();
 		for obligation in obligations {
-			// A constant named in a type is evaluated before anything
-			// normalizes that type to its value.
-			if let Obligation::CheckConstantType { constant, .. } = *obligation
-			{
-				let _ = self.constant_bits(constant);
-			}
 			if let Err(SolverError::Pending) =
 				self.obligation_checker().check(obligation)
 			{
-				debug_assert!(
-					false,
-					"a check cannot be pending once every signature is built"
-				);
+				pending.push(*obligation);
 			}
 		}
+		pending
 	}
 
 	/// A solver that cannot finish (budget or cycle) reports nothing; the

@@ -22,6 +22,7 @@
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, StructIdx};
+use super::obligations::Obligation;
 use super::types::{TypeIndex, TypeList};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
@@ -52,23 +53,40 @@ pub(super) enum BodyOwner {
 	Global(GlobalIdx),
 }
 
-/// A constant's checked initializer, and how far along it is.
-///
-/// A body is built on demand (`ensure_const_body`), and building it may read
-/// another constant's value — a pattern that names it — which may build
-/// *this* constant's body in turn. The `Building` state is what stops that
-/// from repeating: a body that is already being built is not built again.
+/// A constant's checked initializer. Every one is built before anything
+/// evaluates (`TypeContext::build_constant_bodies`), so evaluation reads a
+/// `NotBuilt` body only while bodies are being built, as `Pending`.
 pub(super) enum ConstBody {
 	/// Not built yet.
 	NotBuilt,
-	/// Being built now. A read of this constant's value finds none: its
-	/// value cannot be known until its body is built, and its body cannot be
-	/// built while it is being built.
-	Building,
 	/// Built.
 	Built(Body),
 	/// It has none: a required trait constant.
 	Missing,
+}
+
+/// A check a constant's body could not decide while it was built, because it
+/// needs a constant's value and not every body exists yet. Recorded beside the
+/// body and decided once every constant is built and every declaration is
+/// checked (`TypeContext::check_constant_bodies`). A function's or a global's
+/// body records none: every value is known by then.
+#[derive(Clone, Copy)]
+pub(super) enum DeferredCheck {
+	/// A requirement a written type recorded (`check_now`).
+	Obligation(Obligation),
+	/// `expr`'s type is `expected`; one of them holds a constant not
+	/// evaluated yet, as rustc's `ConstEquate`.
+	Equal { expr: ExprIdx, expected: TypeIndex },
+	/// A string or array literal `expr` of length `length` (a `Value`, or a
+	/// `Const` for a repeat's count) is as long as `target`, an array.
+	StaticLength {
+		expr: ExprIdx,
+		target: TypeIndex,
+		length: TypeIndex,
+	},
+	/// A `match`'s exhaustiveness and unreachable arms: a pattern compares
+	/// with a constant's value.
+	Match(ExprIdx),
 }
 
 /// A run of `Body::extra`: the arguments of a call or a construction, in the
@@ -511,23 +529,44 @@ pub(super) struct Body {
 	/// The string and array literals, in arena order (an inner one before the one
 	/// holding it): the static data lowering evaluates.
 	statics: Vec<ExprIdx>,
+	/// What building it left undecided; empty but for a constant's body
+	/// before `check_constant_bodies`.
+	deferred: Vec<DeferredCheck>,
 	root: ExprIdx,
 }
 
 impl Body {
-	/// The constants the body names (a free one, a variant, an impl's, and
-	/// the variant a discriminant counts on), whose values evaluating it can
-	/// read.
-	pub(super) fn named_constants(&self) -> impl Iterator<Item = ConstIdx> {
-		self.kinds.iter().filter_map(|kind| match *kind {
-			ExprKind::Const { constant, .. }
-			| ExprKind::NextDiscriminant(constant) => Some(constant),
-			_ => None,
-		})
-	}
-
 	pub(super) fn root(&self) -> ExprIdx {
 		self.root
+	}
+
+	pub(super) fn has_deferred(&self) -> bool {
+		!self.deferred.is_empty()
+	}
+
+	/// Back into a builder, to decide what building it left undecided:
+	/// the inverse of `BodyBuilder::finish`.
+	pub(super) fn resume(self) -> (BodyBuilder, ExprIdx) {
+		let builder = BodyBuilder {
+			kinds: self.kinds,
+			types: self.types,
+			spans: self.spans,
+			extra: self.extra,
+			arg_order: self.arg_order,
+			scopes: self.scopes,
+			labels: self.labels,
+			locals: self.locals,
+			params: self.params,
+			places: self.places,
+			pat_kinds: self.pat_kinds,
+			pat_types: self.pat_types,
+			pat_spans: self.pat_spans,
+			pat_lists: self.pat_lists,
+			arms: self.arms,
+			statics: self.statics,
+			deferred: self.deferred,
+		};
+		(builder, self.root)
 	}
 
 	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
@@ -632,9 +671,18 @@ pub(super) struct BodyBuilder {
 	pat_lists: Vec<PatIdx>,
 	arms: Vec<Arm>,
 	statics: Vec<ExprIdx>,
+	deferred: Vec<DeferredCheck>,
 }
 
 impl BodyBuilder {
+	pub(super) fn defer(&mut self, check: DeferredCheck) {
+		self.deferred.push(check);
+	}
+
+	pub(super) fn take_deferred(&mut self) -> Vec<DeferredCheck> {
+		std::mem::take(&mut self.deferred)
+	}
+
 	pub(super) fn push(
 		&mut self,
 		kind: ExprKind,
@@ -832,6 +880,7 @@ impl BodyBuilder {
 			pat_lists: self.pat_lists,
 			arms: self.arms,
 			statics: self.statics,
+			deferred: self.deferred,
 			root,
 		}
 	}

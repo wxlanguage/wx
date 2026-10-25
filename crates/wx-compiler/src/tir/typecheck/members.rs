@@ -115,7 +115,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					self.scope.namespace,
 					&root.trait_path,
 				);
-				self.cx.check_now(&obligations);
+				self.check_now(&obligations);
 				let Some(qualified) = qualified else {
 					return Err(self.body.push(
 						ExprKind::Error,
@@ -131,7 +131,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			_ => unreachable!("only a bracketed root starts a rooted path"),
 		};
-		self.cx.check_now(&obligations);
+		self.check_now(&obligations);
 		Ok(path)
 	}
 
@@ -368,7 +368,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					member.ident,
 					self.scope.file_id,
 				);
-				self.cx.check_now(&obligations);
+				self.check_now(&obligations);
 				match found {
 					Ok(found) => MemberLookup::Found(found),
 					Err(()) => MemberLookup::Error,

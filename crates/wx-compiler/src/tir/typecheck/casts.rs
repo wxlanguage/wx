@@ -37,7 +37,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			ty,
 			InferPolicy::Allow,
 		);
-		self.cx.check_now(&obligations);
+		self.check_now(&obligations);
 		let mut target = self.normalized(target, self.scope.env);
 		if target == TypeIndex::INFER {
 			target = expected;

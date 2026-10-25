@@ -262,7 +262,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				ty,
 				InferPolicy::Allow,
 			);
-			self.cx.check_now(&obligations);
+			self.check_now(&obligations);
 			self.normalized(ty, self.scope.env)
 		});
 		let value = match declared {
@@ -345,10 +345,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let bodies: Vec<ExprIdx> = built.iter().map(|arm| arm.body).collect();
 		let ty = self.join_arms(&bodies);
-		self.check_match_usefulness(scrutinee, &built);
 		let arms = self.body.push_arms(built);
-		self.body
-			.push(ExprKind::Match { scrutinee, arms }, ty, span)
+		let expr =
+			self.body
+				.push(ExprKind::Match { scrutinee, arms }, ty, span);
+		self.check_match_usefulness(expr);
+		expr
 	}
 
 	/// The type a match's arms share: the first typed one's, which an

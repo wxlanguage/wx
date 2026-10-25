@@ -40,7 +40,6 @@ use super::defs::{
 	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier,
 	TraitIdx, TraitImplIdx, TypesetIdx,
 };
-use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
 use super::members::{
@@ -278,7 +277,9 @@ impl TypeContext<'_, '_, '_> {
 				requested_at: None,
 			});
 		}
+		self.build_constant_bodies();
 		self.check_declarations();
+		self.check_constant_bodies();
 		self.check_bodies();
 		self.exports = self.resolve_exports();
 		debug_assert!(
@@ -297,33 +298,110 @@ impl TypeContext<'_, '_, '_> {
 		for entry in self.ast_nodes {
 			let range =
 				self.query_state[&entry.node.def_id()].obligations.clone();
-			self.check_now(
+			let pending = self.check_now(
 				&obligations[range.start as usize..range.end as usize],
+			);
+			debug_assert!(
+				pending.is_empty(),
+				"a declaration's check is never pending: every body exists"
 			);
 		}
 		self.obligations = obligations;
 	}
 
-	/// The body phase. Every signature exists and every fact is final, so a
-	/// body may ask the type system anything; nothing it does is recorded for
-	/// later. Constant initializers, enum discriminants, function blocks and
-	/// global initializers, in definition order, which is the order their
-	/// diagnostics come out in.
-	fn check_bodies(&mut self) {
-		let ast_nodes = self.ast_nodes;
-		for entry in ast_nodes {
+	/// Builds every constant's body (a variant's value included), in
+	/// definition order, before anything evaluates: the solver evaluates a
+	/// constant by reading its body and builds none, so every body an
+	/// evaluation can reach must exist first. Nothing has a value yet, so what
+	/// a body cannot decide without one is recorded beside it, and checked by
+	/// `check_constant_bodies`.
+	fn build_constant_bodies(&mut self) {
+		for entry in self.ast_nodes {
 			match entry.node {
 				AstNodeRef::Constant { const_index, .. }
 				| AstNodeRef::TraitConst { const_index, .. }
 				| AstNodeRef::TraitImplConstant { const_index, .. }
 				| AstNodeRef::InherentImplConst { const_index, .. }
 				| AstNodeRef::EnumVariant { const_index, .. } => {
-					self.ensure_const_body(const_index);
+					self.build_const_body(const_index);
+				}
+				_ => {}
+			}
+		}
+	}
+
+	/// Checks every constant once every body exists and every declaration is
+	/// checked: what building its body left undecided, its evaluation, and
+	/// the report of what it owns; an enum's discriminants. In definition
+	/// order, which is the order their diagnostics come out in.
+	fn check_constant_bodies(&mut self) {
+		for entry in self.ast_nodes {
+			match entry.node {
+				AstNodeRef::Constant { const_index, .. }
+				| AstNodeRef::TraitConst { const_index, .. }
+				| AstNodeRef::TraitImplConstant { const_index, .. }
+				| AstNodeRef::InherentImplConst { const_index, .. }
+				| AstNodeRef::EnumVariant { const_index, .. } => {
+					// Evaluated first, while its body is in place: a deferred
+					// check may read its value.
+					let _ = self.const_value(const_index);
+					self.decide_deferred(const_index);
 					self.evaluate_constant(const_index);
 				}
 				AstNodeRef::Enum { enum_index, .. } => {
 					self.check_discriminants(enum_index);
 				}
+				_ => {}
+			}
+		}
+	}
+
+	/// Decides what building a constant's body left undecided.
+	fn decide_deferred(&mut self, const_index: ConstIdx) {
+		let slot = &mut self.const_bodies[usize::from(const_index)];
+		if !matches!(slot, ConstBody::Built(body) if body.has_deferred()) {
+			return;
+		}
+		let ConstBody::Built(body) =
+			std::mem::replace(slot, ConstBody::NotBuilt)
+		else {
+			unreachable!()
+		};
+		let scope = self.const_scope(const_index);
+		let body = BodyContext::decide_deferred(
+			self,
+			scope,
+			BodyOwner::Const(const_index),
+			body,
+		);
+		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
+	}
+
+	/// Where a constant's initializer is written: a variant's in the root type
+	/// scope, an associated constant's in its impl's or trait's.
+	fn const_scope(&self, const_index: ConstIdx) -> LexicalScope {
+		let entry = &self.ast_nodes
+			[self.query_state[&DefId::Const(const_index)].ast_index as usize];
+		let env = match entry.node {
+			AstNodeRef::EnumVariant { .. } => TypeEnvIdx::ROOT,
+			_ => self.constants[usize::from(const_index)].env,
+		};
+		LexicalScope {
+			file_id: entry.file_id,
+			namespace: entry.namespace,
+			env,
+		}
+	}
+
+	/// The body phase. Every signature exists, every constant is built and
+	/// every fact is final, so a body may ask the type system anything;
+	/// nothing it does is recorded for later. Function blocks and global
+	/// initializers, in definition order, which is the order their
+	/// diagnostics come out in.
+	fn check_bodies(&mut self) {
+		let ast_nodes = self.ast_nodes;
+		for entry in ast_nodes {
+			match entry.node {
 				AstNodeRef::Function { item, .. } => {
 					if let ast::Item::Function {
 						signature, block, ..
@@ -625,8 +703,9 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub(super) functions: Vec<FunctionSignature>,
 	pub(super) constants: Vec<ConstantSignature>,
-	/// Each constant's checked initializer, by `ConstIdx`; built on demand
-	/// (`ensure_const_body`). A trait constant without a default has none.
+	/// Each constant's checked initializer, by `ConstIdx`; all built before
+	/// anything evaluates (`build_constant_bodies`). A trait constant without
+	/// a default has none.
 	pub(super) const_bodies: Vec<ConstBody>,
 	/// Each function's checked block, by `FunctionIdx`; `None` for one
 	/// without a block (a declaration, an import, a required trait method).
@@ -1510,19 +1589,25 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		SignatureLocation::Constant(const_index)
 	}
 
-	/// Checks a constant's initializer into its `Body` (`const_bodies`), once.
-	/// On demand: evaluating one constant may need another's body first.
-	pub(super) fn ensure_const_body(&mut self, const_index: ConstIdx) {
+	/// A constant's body; `None` when it has none (a required trait
+	/// constant) or, before `build_constant_bodies`, is not built yet.
+	pub(super) fn const_body(&self, const_index: ConstIdx) -> Option<&Body> {
 		match &self.const_bodies[usize::from(const_index)] {
-			ConstBody::Built(_) | ConstBody::Building | ConstBody::Missing => {
-				return;
-			}
-			ConstBody::NotBuilt => {}
+			ConstBody::Built(body) => Some(body),
+			ConstBody::NotBuilt | ConstBody::Missing => None,
 		}
+	}
+
+	/// Checks a constant's initializer into its `Body` (`const_bodies`).
+	fn build_const_body(&mut self, const_index: ConstIdx) {
+		debug_assert!(matches!(
+			self.const_bodies[usize::from(const_index)],
+			ConstBody::NotBuilt
+		));
 		let def_id = DefId::Const(const_index);
 		let entry =
 			&self.ast_nodes[self.query_state[&def_id].ast_index as usize];
-		let (file_id, namespace) = (entry.file_id, entry.namespace);
+		let scope = self.const_scope(const_index);
 		let value = match entry.node {
 			AstNodeRef::Constant { item, .. } => {
 				let ast::Item::Const { value, .. } = item else {
@@ -1559,15 +1644,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					self.defs.enums[usize::from(enum_index)].variants.start;
 				let previous = (const_index != first)
 					.then(|| ConstIdx::new(u32::from(const_index) - 1));
-				self.const_bodies[usize::from(const_index)] =
-					ConstBody::Building;
 				let body = BodyContext::new(
 					self,
-					LexicalScope {
-						file_id,
-						namespace,
-						env: TypeEnvIdx::ROOT,
-					},
+					scope,
 					BodyOwner::Const(const_index),
 				)
 				.check_variant_value(item, previous, repr);
@@ -1577,34 +1656,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 			_ => unreachable!("a constant's entry is a constant"),
 		};
-		let env = self.constants[usize::from(const_index)].env;
 		let ty = self.constants[usize::from(const_index)].ty;
-		let scope = LexicalScope {
-			file_id,
-			namespace,
-			env,
-		};
-		// Mark the body as being built before building it. Building it may
-		// read this constant's value — a pattern in its initializer names
-		// it — and a read of a constant whose body is being built must not
-		// build that body again: the two builds would ask each other for a
-		// value forever.
-		self.const_bodies[usize::from(const_index)] = ConstBody::Building;
 		let body = BodyContext::new(self, scope, BodyOwner::Const(const_index))
 			.check_body(value, ty);
 		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
-	}
-
-	/// A constant's body, if it is built. `None` when it is not built yet,
-	/// when it is being built, or when it has none (a required trait
-	/// constant).
-	pub(super) fn const_body(&self, const_index: ConstIdx) -> Option<&Body> {
-		match &self.const_bodies[usize::from(const_index)] {
-			ConstBody::Built(body) => Some(body),
-			ConstBody::NotBuilt | ConstBody::Building | ConstBody::Missing => {
-				None
-			}
-		}
 	}
 
 	/// Resolves and validates a `memory` declaration's `Size` and fills in
@@ -2937,32 +2992,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			);
 			return TypeIndex::ERROR;
 		};
-		// Named in a type inside its own value: its value would be needed
-		// to build the body that computes it.
-		if matches!(
-			self.const_bodies[usize::from(constant)],
-			ConstBody::Building
-		) || self.solver.const_values[usize::from(constant)]
-			== ConstValueState::InProgress
-		{
-			let def = &self.defs.constants[usize::from(constant)];
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::CyclicConstant.code())
-					.with_message(format!(
-						"cycle detected when evaluating constant `{}`",
-						self.strings.resolve(def.name.inner).unwrap()
-					))
-					.with_label(site.primary_label().with_message(
-						"its value is needed here, inside its own value",
-					))
-					.with_label(
-						SourceSpan::new(def.file_id, def.name.span)
-							.secondary_label(),
-					),
-			);
-			return TypeIndex::ERROR;
-		}
 		if let Some(size) = self.memory_size(memory) {
 			obligations.push(Obligation::CheckConstantType {
 				assumption_context: scope.env,

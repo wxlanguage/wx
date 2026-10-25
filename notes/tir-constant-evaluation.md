@@ -6,10 +6,10 @@ Status as of 2026-10-25, branch `tir-refactor`. Companion to
 
 - Committed: `6ff4e9f` (array lengths as type-level constants, `Type::Value`),
   `6acc3be` (lengths named by free constants, `Type::Const`).
-- Uncommitted experiment: constant evaluation moved onto the solver
-  (`impl Solver` in `eval.rs`), with bodies built on demand by a walk
-  (`ensure_named_bodies`, `Body::named_constants`). The walk is rejected; the
-  phase design below replaces it.
+- Uncommitted: constant evaluation moved onto the solver (`impl Solver` in
+  `eval.rs`), and on top of it the phase design below (sections 1, 2, 4, 5 and
+  6 of the implementation map). The on-demand walk (`ensure_named_bodies`,
+  `Body::named_constants`) is gone.
 
 ## Type-level constants
 
@@ -326,3 +326,71 @@ A flag on `BodyContext`; `BodyOwner::Const` already says which bodies it is.
    since no test has a forward reference inside a body.
 3. Value-free building and recorded checks (sections 4 and 5).
 4. Loop ownership (section 6), then tests and docs.
+
+### Progress and deviations (2026-10-25)
+
+Implemented: the five phases, the removal of the on-demand machinery and of
+the lowering-time cycle check, `DeferredCheck` (stored on `Body`, decided by
+`BodyContext::decide_deferred` over a resumed body), `ConstEquate` in
+`expect`, `coerce_static` with the literal's length as a `TypeIndex`
+(`check_static_length`), and deferred match usefulness. Tests: forward
+references in types, lengths and repeat counts, mismatches found once the
+value is known, a match on later constants and a later enum, the
+`const A: heap::&[u8; A]` loop.
+
+Where the code differs from the plan above:
+
+- **No flag on `BodyContext`.** Deferral is driven by `Pending` itself: a check
+  that meets `Pending` defers, and only a constant's body can meet it
+  (`BodyContext::defer` debug-asserts the owner). So `Unevaluable::Pending` and
+  `Halt::Pending` stay (the plan listed them for removal): they are how a
+  phase-2 read says "not yet". An evaluation in phase 2 whose bodies all exist
+  simply succeeds, and is final.
+- **Phase 4 order per constant:** evaluate first (while its body is in place, a
+  deferred check may read its own value), then the deferred checks, then the
+  report. Caveat: a constant may be evaluated (in phase 3 or here) before its
+  own deferred checks report a mismatch. The evaluator's scalar check against
+  the declared type guards the value; rustc instead refuses to evaluate a body
+  tainted by errors. Revisit if a wrong value shows up.
+- **The evaluation frame opens before the declared type is read**
+  (`constant_scalars` normalizes it), so a type naming its own constant is a
+  loop on the stack instead of unbounded recursion.
+- `const C: u32 = block { local a: heap::&[u8; C] = [0; _]; 1 }` is now only
+  E2057: the block is not evaluated, so no loop is ever closed. It becomes
+  E2109 once blocks with locals are evaluated.
+- A loop is reported by the constant (E2109) alone; the obligation that met it
+  sees `Poisoned` (`normalize_const` maps a cycle to it) and is silent, so
+  `report_solver_error` needed no change.
+
+Still open from the map: section 7's `layout.rs` handling of a `Const`
+length, and option 2 of section 3 if keeping whole written types gets bad.
+
+### Open: don't evaluate a body with errors (as rustc does)
+
+rustc finishes `typeck(C)` (obligations included) before `eval(C)` reads the
+body, and a body whose typeck reported an error is `tainted_by_errors`:
+const-eval answers `ErrorHandled::Reported` without evaluating, and readers are
+silent. The phase-4 caveat above is the gap. A sketch of closing it:
+
+1. **Taint.** `Body::tainted_by_errors`, set by `BodyContext` when the error
+   count rose while it built the body or decided its recorded checks (rustc's
+   older count-based taint). The solver reads a tainted body as `Poisoned`.
+2. **Ordering.** The taint only means something once the recorded checks are
+   decided, and our solver cannot decide them on demand. So the solver also
+   answers `Pending` for a body that still has recorded checks, and phase 4
+   becomes a fixpoint over those bodies: decide what can be, re-record what is
+   still `Pending`, repeat while there is progress (rustc's
+   `select_where_possible`). Then evaluate and report every constant.
+   `check_declarations` moves after the fixpoint, or it can meet a constant
+   whose checks are undecided.
+3. **What is left after the fixpoint is a loop**
+   (`const C: u32 = block { local a: heap::&[u8; C] = .. }`: rustc's
+   `typeck(C) -> eval(C) -> typeck(C)` cycle, E2109 instead of today's E2057).
+   Reporting it once per loop needs to know what each stuck body waited on:
+   (a) report every stuck constant (several reports per loop, and constants
+   that only wait on a loop report too), or (b) record the awaited constant
+   when an evaluation is `Pending` on an unfinished body (on the answer or on
+   the solver's frames), build the waits-for graph, and let the first-defined
+   constant of each loop own it, as impl-member loops are owned. (b) keeps the
+   one-diagnostic-per-loop rule, but `SolverError::Pending` has many origins
+   besides constants.

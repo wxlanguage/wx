@@ -41,8 +41,8 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::body::{
-	Body, BodyBuilder, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprRange,
-	LocalIdx, Scope, ScopeIdx, ScopeKind,
+	Body, BodyBuilder, BodyOwner, DeferredCheck, ElementOrder, ExprIdx,
+	ExprKind, ExprRange, LocalIdx, Scope, ScopeIdx, ScopeKind,
 };
 use super::defs::{
 	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
@@ -53,13 +53,14 @@ use super::literals::{
 	CharLiteralError, Integer, parse_char_literal, unescape_string_literal,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
-use super::obligations::BoundRequirements;
+use super::obligations::{BoundRequirements, Obligation};
 use super::operators::{
 	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
+use super::solver::SolverError;
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
 };
@@ -87,6 +88,10 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// What each scope's value is checked against, index-aligned with the
 	/// body's scopes.
 	scope_types: Vec<ScopeType>,
+	/// A constant's value read by the check under way was not known yet (a
+	/// body it needs is not built), so the check is deferred
+	/// (`DeferredCheck::Match`) rather than reported.
+	value_pending: bool,
 }
 
 /// The type a scope's value is held to while its block is checked.
@@ -113,7 +118,61 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			current: ScopeIdx::ROOT,
 			lookup: FxHashMap::default(),
 			scope_types: Vec::new(),
+			value_pending: false,
 		}
+	}
+
+	/// Decides what building a constant's body left undecided
+	/// (`DeferredCheck`), once every constant body is built and every
+	/// declaration is checked, and reports what fails.
+	pub(super) fn decide_deferred(
+		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
+		scope: LexicalScope,
+		owner: BodyOwner,
+		body: Body,
+	) -> Body {
+		let (builder, root) = body.resume();
+		let mut this = Self::new(cx, scope, owner);
+		this.body = builder;
+		for check in this.body.take_deferred() {
+			match check {
+				DeferredCheck::Obligation(obligation) => {
+					this.check_now(&[obligation]);
+				}
+				DeferredCheck::Equal { expr, expected } => {
+					this.expect(expr, expected);
+				}
+				DeferredCheck::StaticLength {
+					expr,
+					target,
+					length,
+				} => this.check_static_length(expr, target, length),
+				DeferredCheck::Match(expr) => this.check_match_usefulness(expr),
+			}
+		}
+		debug_assert!(
+			this.body.take_deferred().is_empty(),
+			"every constant body is built, so every value is known"
+		);
+		this.body.finish(root)
+	}
+
+	/// Checks what lowering a written type required. In a constant's body, a
+	/// check that needs a value not known yet is deferred.
+	fn check_now(&mut self, obligations: &[Obligation]) {
+		for obligation in self.cx.check_now(obligations) {
+			self.defer(DeferredCheck::Obligation(obligation));
+		}
+	}
+
+	/// Records a check to decide once every constant body is built. Only a
+	/// constant's body is built before then.
+	fn defer(&mut self, check: DeferredCheck) {
+		debug_assert!(
+			matches!(self.owner, BodyOwner::Const(_)),
+			"only a constant's body is built before every value is known"
+		);
+		self.body.defer(check);
 	}
 
 	/// Checks `expr` as the whole body, against `expected`.
@@ -212,6 +271,27 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&& actual != TypeIndex::NEVER
 			&& actual != expected
 		{
+			// A type left as written when a constant in it had no value yet
+			// (`normalized`) is compared once it has one.
+			if self.cx.types.has_projection(expected)
+				|| self.cx.types.has_projection(actual)
+			{
+				let scope = self.scope.env;
+				let expected_now =
+					self.cx.normalize_type_query(scope, expected);
+				let actual_now = self.cx.normalize_type_query(scope, actual);
+				match (expected_now, actual_now) {
+					(Err(SolverError::Pending), _)
+					| (_, Err(SolverError::Pending)) => {
+						self.defer(DeferredCheck::Equal { expr, expected });
+						return expr;
+					}
+					(Ok(expected), Ok(actual)) if expected == actual => {
+						return expr;
+					}
+					_ => {}
+				}
+			}
 			let diagnostic = self.report_type_mismatch(expected, actual, expr);
 			self.cx.diagnostics.push(diagnostic);
 			// Reported: nothing reads a value from it, or reports it again.
@@ -678,7 +758,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				prefix,
 				InferPolicy::Allow,
 			);
-			self.cx.check_now(&obligations);
+			self.check_now(&obligations);
 			return Ok(ValuePath::Member(MemberPath::new(receiver, member)));
 		}
 		let walk = PathResolver::new(
@@ -739,7 +819,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&prefix[stop + 1..],
 			InferPolicy::Allow,
 		);
-		self.cx.check_now(&obligations);
+		self.check_now(&obligations);
 		Ok(ValuePath::Member(MemberPath::new(receiver, member)))
 	}
 
@@ -1029,7 +1109,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				*slot = ty;
 			}
 		}
-		self.cx.check_now(&obligations);
+		self.check_now(&obligations);
 		if !self
 			.cx
 			.check_type_arg_count(self.scope, segment, params_env, owner)
@@ -1098,7 +1178,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				owner,
 			);
 		}
-		self.cx.check_now(&obligations);
+		self.check_now(&obligations);
 	}
 
 	/// Makes `ERROR` each argument in the flat `args` for `params_env`'s
@@ -2122,24 +2202,29 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.cx.diagnostics.push(diagnostic);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		};
+		// The literal's length as a type: a `Value`, or the `Const` a
+		// repeat's count names, compared with the target's once it has one.
 		let length = match kind {
 			ExprKind::String(contents) => {
 				let length = self.cx.strings.resolve(contents).unwrap().len();
-				Some(u64::try_from(length).unwrap())
+				let bits = u64::try_from(length).unwrap();
+				Some(self.cx.types.intern(Type::Value { bits }))
 			}
 			ExprKind::Array { elements } => {
 				for at in 0..elements.len() {
 					let element = self.body.args(elements)[at];
 					self.expect(element, of);
 				}
-				Some(u64::try_from(elements.len()).unwrap())
+				let bits = u64::try_from(elements.len()).unwrap();
+				Some(self.cx.types.intern(Type::Value { bits }))
 			}
 			// `[value; _]` is as long as the array it becomes.
 			ExprKind::ArrayRepeat { value, count: None } => {
 				self.expect(value, of);
-				match target_length.map(|length| *self.cx.types.resolve(length))
-				{
-					Some(Type::Value { bits }) => Some(bits),
+				match target_length {
+					Some(length) if length != TypeIndex::INFER => {
+						return self.body.set_ty(expr, target);
+					}
 					_ => {
 						self.report_annotation_required(expr);
 						return self.body.set_ty(expr, TypeIndex::ERROR);
@@ -2155,12 +2240,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.expect(count, length_type);
 				match self.body.kind(count) {
 					_ if self.body.ty(count) == TypeIndex::ERROR => None,
-					ExprKind::Int(count) => Some(count),
-					// One with no value was reported on the constant.
+					ExprKind::Int(bits) => {
+						Some(self.cx.types.intern(Type::Value { bits }))
+					}
 					ExprKind::Const {
 						constant,
 						type_args,
-					} if type_args.is_empty() => self.cx.constant_bits(constant),
+					} if type_args.is_empty() => {
+						Some(self.cx.types.intern_const(constant, &[]))
+					}
 					// An impl's constant may depend on the impl's arguments,
 					// which evaluation does not substitute (yet).
 					ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
@@ -2188,34 +2276,72 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		else {
 			return self.body.set_ty(expr, target);
 		};
-		match *self.cx.types.resolve(target_length) {
-			// A written `_` takes the literal's length.
-			Type::Infer => {
-				let length = self.cx.types.intern(Type::Value { bits: length });
-				let ty = self.cx.types.intern(Type::Array {
-					of,
-					length,
-					memory,
-					ownership: Ownership::Shared,
-				});
-				self.body.set_ty(expr, ty);
-			}
-			Type::Value { bits } if bits != length => {
-				let target = self.cx.type_formatter().display_type(target);
-				let literal = match kind {
-					ExprKind::String(_) => {
-						format!("this string literal is {length} bytes long")
-					}
-					_ => format!("this array literal has {length} elements"),
-				};
-				self.push_error(
-					DiagnosticCode::ArraySizeMismatch,
-					format!("{literal}, but `{target}` holds {bits}"),
-					expr,
-				);
-			}
-			_ => self.body.set_ty(expr, target),
+		// A written `_` takes the literal's length.
+		if target_length == TypeIndex::INFER {
+			let ty = self.cx.types.intern(Type::Array {
+				of,
+				length,
+				memory,
+				ownership: Ownership::Shared,
+			});
+			return self.body.set_ty(expr, ty);
 		}
+		self.body.set_ty(expr, target);
+		self.check_static_length(expr, target, length);
+	}
+
+	/// Checks that a string or array literal `expr` of length `length` is as
+	/// long as `target`, the array it becomes. In a constant's body, a length
+	/// that names a constant not evaluated yet is compared once it is.
+	fn check_static_length(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		length: TypeIndex,
+	) {
+		let Some((_, _, Some(target_length))) = self.static_target(target)
+		else {
+			unreachable!("a literal with a length becomes an array")
+		};
+		if target_length == length {
+			return;
+		}
+		let scope = self.scope.env;
+		let target_now = self.cx.normalize_type_query(scope, target_length);
+		let length_now = self.cx.normalize_type_query(scope, length);
+		let (expected, actual) = match (target_now, length_now) {
+			(Err(SolverError::Pending), _) | (_, Err(SolverError::Pending)) => {
+				return self.defer(DeferredCheck::StaticLength {
+					expr,
+					target,
+					length,
+				});
+			}
+			(Ok(expected), Ok(actual)) => (expected, actual),
+			// Reported where the constant is.
+			_ => return,
+		};
+		let (Type::Value { bits }, Type::Value { bits: length }) = (
+			*self.cx.types.resolve(expected),
+			*self.cx.types.resolve(actual),
+		) else {
+			return;
+		};
+		if bits == length {
+			return;
+		}
+		let target = self.cx.type_formatter().display_type(target);
+		let literal = match self.body.kind(expr) {
+			ExprKind::String(_) => {
+				format!("this string literal is {length} bytes long")
+			}
+			_ => format!("this array literal has {length} elements"),
+		};
+		self.push_error(
+			DiagnosticCode::ArraySizeMismatch,
+			format!("{literal}, but `{target}` holds {bits}"),
+			expr,
+		);
 	}
 
 	/// The element type, memory and length (`None` for a slice) of a shared
@@ -4580,7 +4706,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_constant_named_in_a_type_inside_its_own_value_is_a_cycle() {
+	fn a_constant_named_in_a_type_inside_its_own_value_waits_for_it() {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
@@ -4590,9 +4716,82 @@ mod tests {
 				};
 			"#}
 		);
-		// A block with locals is not evaluated (yet), which is reported too.
+		// The local's type is checked once `C` is evaluated, and a block
+		// with locals is not evaluated (yet): that is all there is to say.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::NotConstEvaluatable]);
+	}
+
+	#[test]
+	fn a_constant_whose_value_needs_its_own_type_is_a_cycle() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const A: heap::&[u8; A] = [0; _];
+			"#}
+		);
+		// `[0; _]` is as long as `A`'s type says, which is `A`'s value. The
+		// constant owns the loop; the checks that met it are silent.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
+	}
+
+	#[test]
+	fn a_constant_body_may_name_a_later_constant_in_a_type() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				struct Buf(data: heap::&[u8; N]);
+				const N: u32 = M * 2;
+				const TEXT: heap::&[u8; N] = "abcdefgh";
+				const COPY: heap::&[u8; 8] = TEXT;
+				const ZEROS: heap::&[u8; 8] = [0; N];
+				const M: u32 = 4;
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_length_named_by_a_later_constant_is_checked_once_it_is_known() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const TEXT: heap::&[u8; N] = "abc";
+				const COPY: heap::&[u8; 2] = TEXT;
+				const ZEROS: heap::&[u8; 2] = [0; N];
+				const N: u32 = 4;
+			"#}
+		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::CyclicConstant,
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArraySizeMismatch,
+		]);
+	}
+
+	#[test]
+	fn a_match_in_a_constant_reads_later_constants() {
+		test_case!(
+			case = indoc! {r#"
+				const PICK: u8 = match ON {
+					const YES -> { 1 },
+					const NO -> { 0 },
+				};
+				const ON: bool = true;
+				const YES: bool = true;
+				const NO: bool = false;
+				const SIDE: u8 = match Side::Left {
+					Side::Left -> { 1 },
+					Side::Right -> { 2 },
+				};
+				enum Side(u8) { Left = 0, Right = 1 }
+			"#}
+		);
+		// Both matches are exhaustive once the constants they read are known;
+		// a match is not evaluated (yet), which is all that is reported.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotConstEvaluatable,
 			DiagnosticCode::NotConstEvaluatable,
 		]);
 	}

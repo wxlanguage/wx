@@ -20,11 +20,12 @@
 //! one fails silently. An evaluation is a frame on the solver's stack, so a loop
 //! through constants is read from the same stack as a loop through projections,
 //! and is owned by its first-defined member: it is reported once whichever
-//! constant is asked first. The solver reads bodies and builds none:
-//! `TypeContext::const_value` builds the bodies an evaluation can reach first.
+//! constant is asked first. The solver reads bodies and builds none: every
+//! constant body is built before anything evaluates
+//! (`TypeContext::build_constant_bodies`), and while they are being built a
+//! value that reads one not built yet is `Pending`, never memoized.
 
 use codespan_reporting::diagnostic::Diagnostic;
-use rustc_hash::FxHashSet;
 use string_interner::symbol::SymbolU32;
 
 use super::body::{
@@ -227,45 +228,22 @@ impl TypeContext<'_, '_, '_> {
 
 	/// A constant's value as a pattern compares with it: the bits of its one
 	/// Wasm number (a narrow signed integer sign-extended, as it is held).
-	/// `None` when it has no value or is more than one number.
+	/// `None` when it is more than one number.
 	pub(super) fn constant_bits(
 		&mut self,
 		const_index: ConstIdx,
-	) -> Option<u64> {
-		self.const_value(const_index).ok().and_then(value_bits)
+	) -> Result<Option<u64>, Unevaluable> {
+		self.const_value(const_index).map(value_bits)
 	}
 
-	/// The memoized value of a constant. The solver evaluates it, and reads
-	/// bodies without building one, so the bodies it can reach are built
-	/// first: the constant's own, and those of the constants it names.
-	fn const_value(
+	/// The memoized value of a constant, evaluated by the solver. `Pending`
+	/// while a body it reads is not built (`build_constant_bodies`).
+	pub(super) fn const_value(
 		&mut self,
 		const_index: ConstIdx,
 	) -> Result<&[ConstScalar], Unevaluable> {
-		if self.solver.const_values[usize::from(const_index)]
-			== ConstValueState::Unevaluated
-		{
-			self.ensure_named_bodies(const_index);
-		}
 		let (solver, mut view) = self.solver_and_view();
 		solver.const_value(&mut view, const_index)
-	}
-
-	/// Builds `const_index`'s body and, through the constants each body
-	/// names, theirs. A body being built is left as it is: a read of its
-	/// value finds none.
-	fn ensure_named_bodies(&mut self, const_index: ConstIdx) {
-		let mut visited = FxHashSet::default();
-		let mut pending = vec![const_index];
-		while let Some(const_index) = pending.pop() {
-			if !visited.insert(const_index) {
-				continue;
-			}
-			self.ensure_const_body(const_index);
-			if let Some(body) = self.const_body(const_index) {
-				pending.extend(body.named_constants());
-			}
-		}
 	}
 
 	/// Reports each set of an enum's variants that share a value, once, on the
@@ -401,16 +379,8 @@ impl Solver {
 					.expect("a state past evaluation is final");
 			}
 		}
-		let scalars = match self.constant_scalars(view, const_index) {
-			Ok(scalars) => scalars,
-			Err(state) => return self.settle_constant(const_index, state),
-		};
 		let root = match &view.const_bodies[usize::from(const_index)] {
 			ConstBody::Built(body) => body.root(),
-			// We are inside its own build: its value cannot be known yet. The
-			// caller reads it as "no value here", which is what a constant
-			// whose value is not known means.
-			ConstBody::Building => return Err(Unevaluable::Silent),
 			// A required trait constant, with no initializer at all.
 			ConstBody::Missing => {
 				return self
@@ -418,6 +388,8 @@ impl Solver {
 			}
 			ConstBody::NotBuilt => return Err(Unevaluable::Pending),
 		};
+		// In progress before its declared type is read: the type may name
+		// the constant itself (`const A: heap::&[u8; A]`).
 		self.const_values[usize::from(const_index)] =
 			ConstValueState::InProgress;
 		self.state.frames.push(SolverFrame::Evaluation {
@@ -427,8 +399,12 @@ impl Solver {
 				self.recursion_limit,
 			),
 		});
+		let scalars = self.constant_scalars(view, const_index);
 		let mut stack = Vec::new();
-		let evaluated = self.eval(view, const_index, root, &mut stack);
+		let evaluated = match &scalars {
+			Ok(_) => self.eval(view, const_index, root, &mut stack),
+			Err(_) => Ok(()),
+		};
 		let Some(SolverFrame::Evaluation { outer_budget, .. }) =
 			self.state.frames.pop()
 		else {
@@ -437,6 +413,10 @@ impl Solver {
 			)
 		};
 		self.state.recursion_budget = outer_budget;
+		let scalars = match scalars {
+			Ok(scalars) => scalars,
+			Err(state) => return self.settle_constant(const_index, state),
+		};
 
 		let state = match evaluated {
 			Ok(())
@@ -645,17 +625,31 @@ impl Solver {
 							}
 						}
 					}
+					// As long as its array, whose length may name a constant.
 					None => {
 						let Type::Array { length, .. } =
 							*view.types.resolve(ty)
 						else {
 							unreachable!("`_` is the length of an array")
 						};
-						let Type::Value { bits } = *view.types.resolve(length)
-						else {
-							unreachable!("a checked array has a length")
-						};
-						bits
+						match *view.types.resolve(length) {
+							Type::Value { bits } => bits,
+							Type::Const {
+								constant,
+								type_args,
+							} if view.types.list(type_args).is_empty() => {
+								let start = stack.len();
+								self.read_constant(
+									view, constant, span, stack,
+								)?;
+								// One of another type was reported where the
+								// length names it.
+								let length = value_bits(&stack[start..]);
+								stack.truncate(start);
+								length.ok_or(Halt::Silent)?
+							}
+							_ => return Err(Halt::Silent),
+						}
 					}
 				};
 				self.place_static(view, owner, ty, span, count, start, stack)?;
