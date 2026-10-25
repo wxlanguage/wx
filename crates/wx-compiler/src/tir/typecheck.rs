@@ -4507,7 +4507,7 @@ mod tests {
 	}
 
 	#[test]
-	fn an_array_type_length_is_an_integer_literal_for_now() {
+	fn an_array_type_length_is_an_integer_literal_or_a_constant() {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
@@ -4521,9 +4521,79 @@ mod tests {
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::UnsupportedExpression,
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+	}
+
+	#[test]
+	fn a_constant_length_means_its_value() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				struct Buffer(data: heap::&[u8; TWO]);
+				const TWO: u32 = 1 + 1;
+				func same(a: heap::&[u8; TWO]) -> heap::&[u8; 2] { a }
+				func text() { local s: heap::&[u8; TWO] = "ab"; }
+				func repeat() { local z: heap::&[u8; TWO] = [0; _]; }
+				func long() { local s: heap::&[u8; TWO] = "abc"; }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ArraySizeMismatch]);
+	}
+
+	#[test]
+	fn a_constant_length_has_its_memorys_size_type() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const SHORT: u16 = 2;
+				const N: u32 = 2;
+				func narrow(a: heap::&[u8; SHORT]) {}
+				func abstract<M: Memory>(a: M::&[u8; N]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	#[test]
+	fn a_length_path_names_a_free_constant() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				trait Sized { const SIZE: u32; }
+				func f() {}
+				func function(a: heap::&[u8; f]) {}
+				func of_type<T: Sized>(a: heap::&[u8; T::SIZE]) {}
+				func missing(a: heap::&[u8; NOPE]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArrayRepeatCountNotConst,
+			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::UndeclaredIdentifier,
+		]);
+	}
+
+	#[test]
+	fn a_constant_named_in_a_type_inside_its_own_value_is_a_cycle() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const C: u32 = block {
+					local a: heap::&[u8; C] = [0; _];
+					1
+				};
+			"#}
+		);
+		// A block with locals is not evaluated (yet), which is reported too.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CyclicConstant,
+			DiagnosticCode::NotConstEvaluatable,
 		]);
 	}
 

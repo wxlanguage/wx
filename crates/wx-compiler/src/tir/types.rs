@@ -285,6 +285,15 @@ pub enum Type {
 	Value {
 		bits: u64,
 	},
+	/// A constant named in a type (`[u8; SIZE]`), with its flat type
+	/// arguments as a `Function`'s: an impl's, then its own, or `[Self]`
+	/// for a trait's declaration. Like a projection, it is replaced by what
+	/// it means, its `Value`, once that is known: a free constant's once it
+	/// is evaluated.
+	Const {
+		constant: ConstIdx,
+		type_args: TypeList,
+	},
 	/// `<Base as Trait>::Item`, pending normalization. The base can be
 	/// concrete or abstract. `assoc_type_index` always names the trait's
 	/// declaration, never an impl's value provider; substitution preserves
@@ -312,7 +321,8 @@ impl TypeFlags {
 	pub(super) const HAS_UNTYPED: Self = Self(1 << 2);
 	/// A `TypeParam` is in it: substitution can change the type.
 	pub(super) const HAS_PARAM: Self = Self(1 << 3);
-	/// An `AssocTypeProjection` is in it: normalization can change the type.
+	/// An `AssocTypeProjection` or a `Const` is in it: normalization can
+	/// change the type.
 	pub(super) const HAS_PROJECTION: Self = Self(1 << 4);
 
 	fn union(self, other: Self) -> Self {
@@ -370,6 +380,16 @@ impl Type {
 			} => (
 				Type::Function {
 					func_index,
+					type_args: TypeList::EMPTY,
+				},
+				type_args,
+			),
+			Type::Const {
+				constant,
+				type_args,
+			} => (
+				Type::Const {
+					constant,
 					type_args: TypeList::EMPTY,
 				},
 				type_args,
@@ -463,6 +483,22 @@ impl TypeInterner {
 				},
 				Type::Function {
 					func_index: b,
+					type_args: ys,
+				},
+			) if a == b => self.match_patterns(
+				self.list(*xs),
+				self.list(*ys),
+				envs,
+				env,
+				args,
+			),
+			(
+				Type::Const {
+					constant: a,
+					type_args: xs,
+				},
+				Type::Const {
+					constant: b,
 					type_args: ys,
 				},
 			) if a == b => self.match_patterns(
@@ -688,6 +724,29 @@ impl TypeInterner {
 		)
 	}
 
+	pub(super) fn intern_const(
+		&mut self,
+		constant: ConstIdx,
+		type_args: &[TypeIndex],
+	) -> TypeIndex {
+		let shape = Type::Const {
+			constant,
+			type_args: TypeList::EMPTY,
+		};
+		let hash = self.hasher.hash_one((shape, type_args));
+		if let Some(index) = self.find(hash, shape, type_args) {
+			return index;
+		}
+		let list = self.push_list(type_args);
+		self.insert(
+			hash,
+			Type::Const {
+				constant,
+				type_args: list,
+			},
+		)
+	}
+
 	/// Stores `elements` as a list of their own, not shared with an equal one:
 	/// a type's list is shared through the type, which is interned.
 	pub(super) fn push_list<'e>(
@@ -779,6 +838,13 @@ impl TypeInterner {
 			.union(self.flags[usize::from(result)]),
 			Type::AssocTypeProjection { base, .. } => {
 				TypeFlags::HAS_PROJECTION.union(self.flags[usize::from(base)])
+			}
+			Type::Const { type_args, .. } => {
+				let mut flags = TypeFlags::HAS_PROJECTION;
+				for &part in type_args.slice(&self.lists) {
+					flags = flags.union(self.flags[usize::from(part)]);
+				}
+				flags
 			}
 			Type::TypeParam { .. } => TypeFlags::HAS_PARAM,
 			Type::Never
@@ -917,6 +983,19 @@ impl TypeInterner {
 			) if func_index == other => {
 				let type_args = self.meet_lists(a, b)?;
 				Some(self.intern_function(func_index, &type_args))
+			}
+			(
+				Type::Const {
+					constant,
+					type_args: a,
+				},
+				Type::Const {
+					constant: other,
+					type_args: b,
+				},
+			) if constant == other => {
+				let type_args = self.meet_lists(a, b)?;
+				Some(self.intern_const(constant, &type_args))
 			}
 			(
 				Type::FunctionRef { param, result },
@@ -1079,6 +1158,18 @@ impl TypeInterner {
 				self.learn_lists(envs, env, slots, declared, actual)
 			}
 			(
+				Type::Const {
+					constant,
+					type_args: declared,
+				},
+				Type::Const {
+					constant: other,
+					type_args: actual,
+				},
+			) if constant == other => {
+				self.learn_lists(envs, env, slots, declared, actual)
+			}
+			(
 				Type::FunctionRef { param, result },
 				Type::FunctionRef {
 					param: other_param,
@@ -1229,6 +1320,13 @@ impl TypeInterner {
 				type_args,
 			} => match self.substitute_list(type_args, substitution) {
 				Some(type_args) => self.intern_function(func_index, &type_args),
+				None => ty,
+			},
+			Type::Const {
+				constant,
+				type_args,
+			} => match self.substitute_list(type_args, substitution) {
+				Some(type_args) => self.intern_const(constant, &type_args),
 				None => ty,
 			},
 			Type::FunctionRef { param, result } => {

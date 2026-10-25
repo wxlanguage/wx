@@ -18,11 +18,11 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::bounds::BoundArena;
-use super::defs::{AssocTypeIdx, TraitIdx};
+use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx};
 use super::format::TypeFormatter;
 use super::literals::Integer;
 use super::members::report_type_does_not_implement_trait;
-use super::signatures::{TypeContext, TypeSetSignature};
+use super::signatures::{ConstantSignature, TypeContext, TypeSetSignature};
 use super::solver::{
 	Definition, ImplMember, Solver, SolverError, SolverView, Verdict,
 };
@@ -106,6 +106,17 @@ pub(super) enum Obligation {
 		bits: u64,
 		reference: SourceSpan,
 	},
+	/// A constant named in a type (an array's length) has exactly the type
+	/// its position needs, `expected` as written: a constant of another type
+	/// is a mismatch, even one whose value would fit. Checking it first
+	/// evaluates the constant (`TypeContext::check_now`), so the type it is
+	/// written in can be normalized to its value afterwards.
+	CheckConstantType {
+		assumption_context: TypeEnvIdx,
+		constant: ConstIdx,
+		expected: TypeIndex,
+		reference: SourceSpan,
+	},
 	/// `Projection::name` was written, and the projection's declared bounds do
 	/// not name `name`. Whether its *value* has such a member depends on impls,
 	/// which construction cannot read, so the type was lowered to `ERROR` and
@@ -137,9 +148,11 @@ impl TypeContext<'_, '_, '_> {
 				param_bounds: &self.param_bounds,
 				clauses: &self.clauses,
 				type_envs: &self.type_envs,
+				const_values: &self.const_values,
 			},
 			bounds: &self.bounds,
 			typesets: &self.typesets,
+			constants: &self.constants,
 			strings: self.strings,
 			diagnostics: self.diagnostics,
 		}
@@ -149,9 +162,16 @@ impl TypeContext<'_, '_, '_> {
 	/// own, or what a body recorded while lowering a written type. Every fact
 	/// is final then, so nothing can be pending; a failure reports itself.
 	pub(super) fn check_now(&mut self, obligations: &[Obligation]) {
-		let mut checker = self.obligation_checker();
 		for obligation in obligations {
-			if let Err(SolverError::Pending) = checker.check(obligation) {
+			// A constant named in a type is evaluated before anything
+			// normalizes that type to its value.
+			if let Obligation::CheckConstantType { constant, .. } = *obligation
+			{
+				let _ = self.constant_bits(constant);
+			}
+			if let Err(SolverError::Pending) =
+				self.obligation_checker().check(obligation)
+			{
 				debug_assert!(
 					false,
 					"a check cannot be pending once every signature is built"
@@ -224,6 +244,7 @@ pub(super) struct ObligationChecker<'a> {
 	pub(super) view: SolverView<'a>,
 	pub(super) bounds: &'a BoundArena,
 	pub(super) typesets: &'a [TypeSetSignature],
+	pub(super) constants: &'a [ConstantSignature],
 	pub(super) strings: &'a StringInterner,
 	pub(super) diagnostics: &'a mut Vec<Diagnostic<FileId>>,
 }
@@ -251,6 +272,7 @@ impl ObligationChecker<'_> {
 			| Obligation::CheckAssocValue { reference, .. }
 			| Obligation::CheckImplRequirements { reference, .. }
 			| Obligation::CheckConstantFits { reference, .. }
+			| Obligation::CheckConstantType { reference, .. }
 			| Obligation::CheckProjectionMember { reference, .. } => reference,
 		};
 		// The obligation is the owning site: a normalization that diverged inside
@@ -386,6 +408,17 @@ impl ObligationChecker<'_> {
 				bits,
 				reference,
 			),
+			Obligation::CheckConstantType {
+				assumption_context,
+				constant,
+				expected,
+				reference,
+			} => self.check_constant_type(
+				assumption_context,
+				constant,
+				expected,
+				reference,
+			),
 			Obligation::CheckProjectionMember {
 				assumption_context,
 				projection,
@@ -477,5 +510,51 @@ impl ObligationChecker<'_> {
 			return Err(SolverError::Poisoned);
 		}
 		Ok(())
+	}
+
+	/// The constant's type, in its own scope, is `expected`, in the scope
+	/// the constant is named in.
+	fn check_constant_type(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		constant: ConstIdx,
+		expected: TypeIndex,
+		reference: SourceSpan,
+	) -> Result<(), SolverError> {
+		let signature = &self.constants[usize::from(constant)];
+		let (ty, env) = (signature.ty, signature.env);
+		let found =
+			self.solver.normalize_type_query(&mut self.view, env, ty)?;
+		let expected = self.solver.normalize_type_query(
+			&mut self.view,
+			assumption_context,
+			expected,
+		)?;
+		if found == expected
+			|| found == TypeIndex::ERROR
+			|| expected == TypeIndex::ERROR
+		{
+			return Ok(());
+		}
+		let formatter = self.type_formatter();
+		let (expected, found) = (
+			formatter.display_type(expected),
+			formatter.display_type(found),
+		);
+		let name = self.view.defs.constants[usize::from(constant)].name.inner;
+		let name = self.strings.resolve(name).unwrap();
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypeMistmatch.code())
+				.with_message(format!(
+					"an array's length is a `{expected}`, but `{name}` is a \
+					 `{found}`"
+				))
+				.with_label(reference.primary_label().with_message(format!(
+					"expected `{expected}`, found `{found}`"
+				)))
+				.with_note("an array's length is of its memory's `Size`"),
+		);
+		Err(SolverError::Poisoned)
 	}
 }

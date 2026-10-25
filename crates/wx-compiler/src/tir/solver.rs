@@ -19,8 +19,10 @@ use super::bounds::{
 	SelfSubstitution, known_distinct,
 };
 use super::defs::{
-	AssocTypeIdx, DefinitionRegistry, MemberKind, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
+	TraitImplIdx,
 };
+use super::eval::{ConstValueState, value_bits};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::layout::Layouts;
 use super::members::{TraitImplLookup, TraitMemberSelection};
@@ -30,7 +32,7 @@ use super::signatures::{
 };
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
-	TypeInterner,
+	TypeInterner, TypeList,
 };
 
 /// Why the solver (normalization and impl selection, which are one recursive
@@ -700,6 +702,7 @@ pub(super) struct SolverView<'a> {
 	pub(super) param_bounds: &'a [Box<[ParamBounds]>],
 	pub(super) clauses: &'a ClauseArena,
 	pub(super) type_envs: &'a TypeEnvArena,
+	pub(super) const_values: &'a [ConstValueState],
 }
 
 impl<'a> SolverView<'a> {
@@ -928,6 +931,17 @@ impl Solver {
 				depth,
 				facts,
 			),
+			Type::Const {
+				constant,
+				type_args,
+			} => self.normalize_const(
+				view,
+				assumption_context,
+				constant,
+				type_args,
+				depth,
+				facts,
+			),
 			_ => match depth {
 				NormalizationDepth::Shallow => Ok(ty),
 				NormalizationDepth::Deep => self.normalize_children(
@@ -941,6 +955,44 @@ impl Solver {
 		};
 		self.state.recursion_budget += 1;
 		result
+	}
+
+	/// A constant in a type means its value once it is evaluated, and stays
+	/// as written until then (`Pending`). A constant with type arguments is
+	/// not evaluated yet, so it keeps its normalized arguments.
+	fn normalize_const(
+		&mut self,
+		view: &mut SolverView<'_>,
+		assumption_context: TypeEnvIdx,
+		constant: ConstIdx,
+		type_args: TypeList,
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
+	) -> Result<TypeIndex, SolverError> {
+		if !type_args.is_empty() {
+			let mut type_args = view.types.list(type_args).to_vec();
+			for item in type_args.iter_mut() {
+				*item = self.normalize(
+					view,
+					assumption_context,
+					*item,
+					depth,
+					facts,
+				)?;
+			}
+			return Ok(view.types.intern_const(constant, &type_args));
+		}
+		match &view.const_values[usize::from(constant)] {
+			ConstValueState::Unevaluated | ConstValueState::InProgress => {
+				Err(SolverError::Pending)
+			}
+			ConstValueState::Evaluated(value) => match value_bits(value) {
+				Some(bits) => Ok(view.types.intern(Type::Value { bits })),
+				None => Err(SolverError::Poisoned),
+			},
+			// Reported by the constant's own check.
+			_ => Err(SolverError::Poisoned),
+		}
 	}
 
 	fn normalize_projection(
@@ -1346,9 +1398,11 @@ impl Solver {
 				)?,
 				ownership,
 			},
-			Type::AssocTypeProjection { .. } => unreachable!(
-				"projections are handled before structural traversal"
-			),
+			Type::AssocTypeProjection { .. } | Type::Const { .. } => {
+				unreachable!(
+					"projections are handled before structural traversal"
+				)
+			}
 			Type::Error
 			| Type::Infer
 			| Type::Never
@@ -1501,7 +1555,8 @@ impl Solver {
 			| Type::Float
 			| Type::String
 			| Type::ArrayLiteral
-			| Type::Value { .. } => {
+			| Type::Value { .. }
+			| Type::Const { .. } => {
 				return Err(SolverError::Poisoned);
 			}
 			Type::Never
@@ -2257,6 +2312,7 @@ impl TypeContext<'_, '_, '_> {
 				param_bounds: &self.param_bounds,
 				clauses: &self.clauses,
 				type_envs: &self.type_envs,
+				const_values: &self.const_values,
 			},
 		)
 	}

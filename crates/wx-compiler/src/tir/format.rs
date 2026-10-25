@@ -221,6 +221,15 @@ impl TypeFormatter<'_> {
 			Type::Value { bits } => {
 				let _ = write!(f, "{bits}");
 			}
+			// Written as its name, with its own arguments when it has any.
+			Type::Const {
+				constant,
+				type_args,
+			} => {
+				let def = &self.defs.constants[usize::from(*constant)];
+				f.push_str(self.strings.resolve(def.name.inner).unwrap());
+				self.write_type_args(f, self.types.list(*type_args));
+			}
 			Type::FunctionRef { param, result } => {
 				let (param, result) = (*param, *result);
 				f.push_str("func(");

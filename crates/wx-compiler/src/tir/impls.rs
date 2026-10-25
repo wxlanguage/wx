@@ -87,7 +87,8 @@ impl ImplTarget {
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. }
-			| Type::Value { .. } => return None,
+			| Type::Value { .. }
+			| Type::Const { .. } => return None,
 		})
 	}
 }

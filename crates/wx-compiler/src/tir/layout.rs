@@ -301,7 +301,8 @@ impl Solver {
 			| Type::Float
 			| Type::String
 			| Type::ArrayLiteral
-			| Type::Value { .. } => return Err(SolverError::Poisoned),
+			| Type::Value { .. }
+			| Type::Const { .. } => return Err(SolverError::Poisoned),
 			Type::Never
 			| Type::Function { .. }
 			| Type::Memory { .. }

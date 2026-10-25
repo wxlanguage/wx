@@ -2853,13 +2853,132 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.with_label(
 					site.primary_label().with_message("not an integer"),
 				),
-			ast::ConstArgument::Path(_) => Diagnostic::bug()
-				.with_code(DiagnosticCode::UnsupportedExpression.code())
-				.with_message("constant array lengths are not supported yet")
-				.with_label(site.primary_label()),
+			ast::ConstArgument::Path(ref segments) => {
+				return self.constant_length(
+					obligations,
+					scope,
+					memory,
+					segments,
+					site,
+				);
+			}
 		};
 		self.diagnostics.push(diagnostic);
 		TypeIndex::ERROR
+	}
+
+	/// A length named by a constant: the constant, whose type must be
+	/// `memory`'s `Size` (`CheckConstantType`), and whose value it means once
+	/// evaluated. Only a constant named through namespaces is supported; one
+	/// of a type (`T::SIZE`) has arguments evaluation cannot substitute yet.
+	fn constant_length(
+		&mut self,
+		obligations: &mut Vec<Obligation>,
+		scope: LexicalScope,
+		memory: TypeIndex,
+		segments: &[ast::PathSegment],
+		site: SourceSpan,
+	) -> TypeIndex {
+		let first = segments[0].ident.inner;
+		let through_type = self.type_envs.resolve(scope.env, first).is_some()
+			|| first == Keyword::SelfPascal.symbol();
+		let walk = (!through_type).then(|| {
+			PathResolver::new(
+				self.diagnostics,
+				self.resolutions,
+				self.strings,
+				self.defs,
+			)
+			.walk_path(
+				scope.file_id,
+				scope.namespace,
+				segments,
+				Tier::Value,
+			)
+		});
+		let target = match walk {
+			Some(walk) if walk.is_complete(segments) => walk.target,
+			// Reported where the walk failed.
+			Some(walk) if walk.target.def_key().is_none() => {
+				return TypeIndex::ERROR;
+			}
+			_ => {
+				self.diagnostics.push(
+					Diagnostic::bug()
+						.with_code(DiagnosticCode::UnsupportedExpression.code())
+						.with_message(
+							"a type's constant as an array length is not \
+							 supported yet",
+						)
+						.with_label(site.primary_label()),
+				);
+				return TypeIndex::ERROR;
+			}
+		};
+		let Some(key) = target.def_key() else {
+			return TypeIndex::ERROR;
+		};
+		let name = segments.last().unwrap().ident;
+		if let BindingTarget::Inaccessible(_) = target {
+			self.diagnostics.push(report_private_identifier(
+				&self.defs.namespaces,
+				self.strings,
+				name.inner,
+				SourceSpan::new(scope.file_id, name.span),
+				Some(key),
+			));
+		}
+		let kind = key.symbol_kind(self.defs);
+		let (DefKind::Const(constant) | DefKind::EnumVariant(constant)) = kind
+		else {
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::ArrayRepeatCountNotConst.code())
+					.with_message(format!(
+						"expected a constant, found {} `{}`",
+						kind.noun(),
+						self.strings.resolve(name.inner).unwrap()
+					))
+					.with_label(site.primary_label())
+					.with_note("an array's length is a literal or a constant"),
+			);
+			return TypeIndex::ERROR;
+		};
+		// Named in a type inside its own value: its value would be needed
+		// to build the body that computes it.
+		if matches!(
+			self.const_bodies[usize::from(constant)],
+			ConstBody::Building
+		) || self.const_values[usize::from(constant)]
+			== ConstValueState::InProgress
+		{
+			let def = &self.defs.constants[usize::from(constant)];
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::CyclicConstant.code())
+					.with_message(format!(
+						"cycle detected when evaluating constant `{}`",
+						self.strings.resolve(def.name.inner).unwrap()
+					))
+					.with_label(site.primary_label().with_message(
+						"its value is needed here, inside its own value",
+					))
+					.with_label(
+						SourceSpan::new(def.file_id, def.name.span)
+							.secondary_label(),
+					),
+			);
+			return TypeIndex::ERROR;
+		}
+		if let Some(size) = self.memory_size(memory) {
+			obligations.push(Obligation::CheckConstantType {
+				assumption_context: scope.env,
+				constant,
+				expected: size,
+				reference: site,
+			});
+		}
+		self.types.intern_const(constant, &[])
 	}
 
 	/// `memory`'s `Size`, `<memory as Memory>::Size`, as written; `None`

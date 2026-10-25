@@ -150,6 +150,21 @@ impl ConstValueState {
 	}
 }
 
+/// The bits of a value of one integer number; `None` for any other value.
+pub(super) fn value_bits(value: &[ConstScalar]) -> Option<u64> {
+	match value {
+		[scalar] => match scalar.val {
+			Val::I32(bits) => Some(u64::from(bits)),
+			Val::I64(bits) => Some(bits),
+			Val::F32(_)
+			| Val::F64(_)
+			| Val::V128(_)
+			| Val::MemoryOffset { .. } => None,
+		},
+		_ => None,
+	}
+}
+
 /// Why `const_value` has no value for its caller.
 enum Unevaluable {
 	/// The constant has no compile-time value; reading it is the reader's
@@ -194,17 +209,7 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		const_index: ConstIdx,
 	) -> Option<u64> {
-		match self.const_value(const_index) {
-			Ok([scalar]) => match scalar.val {
-				Val::I32(bits) => Some(u64::from(bits)),
-				Val::I64(bits) => Some(bits),
-				Val::F32(_)
-				| Val::F64(_)
-				| Val::V128(_)
-				| Val::MemoryOffset { .. } => None,
-			},
-			_ => None,
-		}
+		self.const_value(const_index).ok().and_then(value_bits)
 	}
 
 	/// The memoized value of a constant.
@@ -2064,7 +2069,8 @@ mod tests {
 				const SIZE: u32 = 2;
 				const SEVENS: heap::&[u16; 3] = [7; 3];
 				const ZEROS: heap::&[u8] = [0; SIZE];
-				const NINES: heap::&[u8; 2] = [9; _];
+				const NINES: heap::&[u8; TWO] = [9; _];
+				const TWO: u32 = SIZE;
 			"#}
 		);
 		case.diagnostics().assert_none();
