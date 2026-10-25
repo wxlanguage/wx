@@ -9,7 +9,7 @@ use std::*;
 
 #[memory_limits(min_pages = 1)]
 memory heap: Memory where { Size = u32 };
-enum FileDescriptor: u32 {
+enum FileDescriptor(u32) {
   Stdout = 1,
   PreopenedDir = 3,
 }
@@ -19,7 +19,7 @@ enum FileDescriptor: u32 {
 // value names a specific failure. These examples only ever care about the
 // success/failure distinction, so `Success` is the only variant declared —
 // see the WASI Preview 1 spec for the full errno list.
-enum Errno: i32 {
+enum Errno(i32) {
   Success = 0,
 }
 

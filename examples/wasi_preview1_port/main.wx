@@ -65,14 +65,14 @@ type Siflags = u16;
 // ── `$fd` (handle) ───────────────────────────────────────────────────────────
 // See the file-level comment (limitation 1) for why this is an enum rather
 // than a true opaque handle type.
-enum Fd: u32 {
+enum Fd(u32) {
     Stdin = 0,
     Stdout = 1,
     Stderr = 2,
 }
 
 // ── `$errno` ─────────────────────────────────────────────────────────────────
-enum Errno: u16 {
+enum Errno(u16) {
     Success = 0,
     TooBig = 1,
     Acces = 2,
@@ -197,14 +197,14 @@ mod Rights {
 // layout. `&[u8]` *is* `$ciovec` and `*[u8]` *is* `$iovec`; `&[&[u8]]` /
 // `&[*[u8]]` are the `_array` list variants. Used inline below.
 // ── `$whence` ────────────────────────────────────────────────────────────────
-enum Whence: u8 {
+enum Whence(u8) {
     Set = 0,
     Cur = 1,
     End = 2,
 }
 
 // ── `$filetype` ──────────────────────────────────────────────────────────────
-enum Filetype: u8 {
+enum Filetype(u8) {
     Unknown = 0,
     BlockDevice = 1,
     CharacterDevice = 2,
@@ -225,7 +225,7 @@ struct Dirent(
 );
 
 // ── `$advice` ────────────────────────────────────────────────────────────────
-enum Advice: u8 {
+enum Advice(u8) {
     Normal = 0,
     Sequential = 1,
     Random = 2,
@@ -287,7 +287,7 @@ struct Filestat(
 );
 
 // ── `$eventtype` ─────────────────────────────────────────────────────────────
-enum Eventtype: u8 {
+enum Eventtype(u8) {
     Clock = 0,
     FdRead = 1,
     FdWrite = 2,
@@ -362,7 +362,7 @@ struct Subscription(
 );
 
 // ── `$signal` ────────────────────────────────────────────────────────────────
-enum Signal: u8 {
+enum Signal(u8) {
     None = 0,
     Hup = 1,
     Int = 2,
@@ -413,7 +413,7 @@ mod Sdflags {
 }
 
 // ── `$preopentype` ───────────────────────────────────────────────────────────
-enum Preopentype: u8 {
+enum Preopentype(u8) {
     Dir = 0,
 }
 
@@ -435,7 +435,7 @@ struct Prestat(
 // `$clockid`, used by `$subscription_clock` above, declared last among the
 // plain enums only because `SubscriptionClock` needed it first — order
 // otherwise follows typenames.witx.
-enum ClockId: u32 {
+enum ClockId(u32) {
     Realtime = 0,
     Monotonic = 1,
     ProcessCputimeId = 2,

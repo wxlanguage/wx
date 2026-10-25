@@ -81,6 +81,7 @@ impl ImplTarget {
 			| Type::Integer
 			| Type::Float
 			| Type::String
+			| Type::ArrayLiteral
 			| Type::Tuple { .. }
 			| Type::FunctionRef { .. }
 			| Type::Pointer { .. }
@@ -659,7 +660,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	) -> Result<ImplTarget, ()> {
 		if params
 			.iter()
-			.any(|param| param.name.inner == path.segments[0].ident.inner)
+			.any(|param| param.name().inner == path.segments[0].ident.inner)
 		{
 			self.diagnostics.push(
 				Diagnostic::error()

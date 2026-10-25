@@ -98,9 +98,9 @@ impl TypeContext<'_, '_, '_> {
 				},
 				Spanned {
 					inner: argument,
-					span: written.span,
+					span: written.span(),
 				},
-				SourceSpan::new(scope.file_id, written.span),
+				SourceSpan::new(scope.file_id, written.span()),
 				owner,
 			);
 		}
@@ -486,7 +486,7 @@ pub(super) fn report_type_args_not_allowed(
 	let mut labels = vec![
 		SourceSpan::new(
 			file_id,
-			TextSpan::new(first.span.start, last.span.end),
+			TextSpan::new(first.span().start, last.span().end),
 		)
 		.primary_label()
 		.with_message(format!(
@@ -548,7 +548,7 @@ fn report_type_arg_count_mismatch(
 			)),
 	];
 	for (index, arg) in args.iter().enumerate() {
-		let label = SourceSpan::new(file_id, arg.span).secondary_label();
+		let label = SourceSpan::new(file_id, arg.span()).secondary_label();
 		labels.push(if index + 1 == args.len() {
 			if expected == 0 {
 				label.with_message("remove the unnecessary generics")

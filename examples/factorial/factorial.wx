@@ -34,7 +34,7 @@
 //     }
 // }
 
-// pub enum Ordering: i8 {
+// pub enum Ordering(i8) {
 //     Less = -1,
 //     Equal = 0,
 //     Greater = 1,

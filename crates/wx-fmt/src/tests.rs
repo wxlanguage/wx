@@ -381,7 +381,7 @@ fn test_format_const_items() {
 #[test]
 fn test_format_enum_items() {
 	let case = TestCase::new(indoc! {"
-        enum Status: i32 {
+        enum Status(i32) {
             Foo,
             Bar = 1,
             Baz,
@@ -399,10 +399,80 @@ fn test_format_enum_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            enum Status: i32 {
+            enum Status(i32) {
                 Foo,
                 Bar = 1,
                 Baz,
+            }
+        "}
+	);
+}
+
+#[test]
+fn an_old_enum_repr_is_formatted_in_parentheses() {
+	let case = TestCase::new("enum Status: i32 { Foo }\n");
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            enum Status(i32) {
+                Foo,
+            }
+        "}
+	);
+}
+
+#[test]
+fn a_constant_parameter_and_arguments_keep_only_the_meaningful_const() {
+	let case = TestCase::new(
+		"func f<T: Add, const N: u32>(b: Buffer<u8, const N>) { g::<const 5, const SIZE, const _>(); }\n",
+	);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            func f<T: Add, const N: u32>(b: Buffer<u8, const N>) {
+                g::<5, const SIZE, _>();
+            }
+        "}
+	);
+}
+
+#[test]
+fn an_array_length_is_formatted_without_a_marker() {
+	let case = TestCase::new(
+		"func f(a: heap::&[u8; const N]) { local b = [0; const T::SIZE]; }\n",
+	);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {"
+            func f(a: heap::&[u8; N]) {
+                local b = [0; T::SIZE];
             }
         "}
 	);
@@ -1711,7 +1781,7 @@ fn test_format_trailing_comments_keep_their_line() {
             // own-line before closing brace
         );
 
-        enum E: u32 {
+        enum E(u32) {
             A = 0, // trailing on variant
             B = 1,
         }
@@ -1887,7 +1957,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             x: u32,
         );
 
-        enum E: u32 { // opens an `enum`
+        enum E(u32) { // opens an `enum`
             A = 0,
         }
 
@@ -1927,7 +1997,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             x: u32,
         );
 
-        enum E: u32 {
+        enum E(u32) {
             // opens an `enum`
             A = 0,
         }

@@ -182,6 +182,18 @@ pub(super) enum ExprKind {
 	/// A string literal's contents, unescaped. Its type is a shared byte
 	/// slice or byte array its context gives (`Type::String` until then).
 	String(SymbolU32),
+	/// An array literal `[a, b, c]`. Its type is a shared array of its length
+	/// or a shared slice its context gives (`Type::ArrayLiteral` until then),
+	/// and each element has that type's element type.
+	Array {
+		elements: ExprRange,
+	},
+	/// A repeat `[value; count]`, typed as an array literal is; `count` is
+	/// an integer literal or a constant.
+	ArrayRepeat {
+		value: ExprIdx,
+		count: ExprIdx,
+	},
 	/// A known constant's value: a free one, a variant, or an impl's (an
 	/// inherent impl's, or the one a concrete trait impl defines), with its
 	/// flat type arguments, the impl's; empty when it has none.
@@ -493,6 +505,9 @@ pub(super) struct Body {
 	pat_spans: Vec<TextSpan>,
 	pat_lists: Vec<PatIdx>,
 	arms: Vec<Arm>,
+	/// The string and array literals, in arena order (an inner one before the one
+	/// holding it): the static data lowering evaluates.
+	statics: Vec<ExprIdx>,
 	root: ExprIdx,
 }
 
@@ -577,6 +592,10 @@ impl Body {
 	pub(super) fn arms(&self, range: ArmRange) -> &[Arm] {
 		&self.arms[range.start as usize..(range.start + range.len) as usize]
 	}
+
+	pub(super) fn statics(&self) -> &[ExprIdx] {
+		&self.statics
+	}
 }
 
 /// Builds a `Body`. The checker owns one while it walks a definition, and may
@@ -598,6 +617,7 @@ pub(super) struct BodyBuilder {
 	pat_spans: Vec<TextSpan>,
 	pat_lists: Vec<PatIdx>,
 	arms: Vec<Arm>,
+	statics: Vec<ExprIdx>,
 }
 
 impl BodyBuilder {
@@ -770,6 +790,11 @@ impl BodyBuilder {
 		self.kinds[usize::from(expr)] = kind;
 	}
 
+	/// Records a literal as static data (`Body::statics`).
+	pub(super) fn push_static(&mut self, expr: ExprIdx) {
+		self.statics.push(expr);
+	}
+
 	pub(super) fn set_ty(&mut self, expr: ExprIdx, ty: TypeIndex) {
 		self.types[usize::from(expr)] = ty;
 	}
@@ -792,6 +817,7 @@ impl BodyBuilder {
 			pat_spans: self.pat_spans,
 			pat_lists: self.pat_lists,
 			arms: self.arms,
+			statics: self.statics,
 			root,
 		}
 	}

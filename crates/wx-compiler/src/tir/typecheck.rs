@@ -351,9 +351,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				Ok(path) => self.build_member_value(path, expected, span),
 				Err(error) => error,
 			},
-			ast::Expression::ArrayList { .. }
-			| ast::Expression::ArrayRepeat { .. } => {
-				self.unsupported(span, "an array literal")
+			ast::Expression::ArrayList { elements } => {
+				self.build_array(elements, expected, span)
+			}
+			ast::Expression::ArrayRepeat { value, count } => {
+				self.build_array_repeat(value, count, expected, span)
 			}
 			ast::Expression::Index { .. }
 			| ast::Expression::SliceRange { .. } => self.unsupported(span, "indexing"),
@@ -436,6 +438,81 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.push(kind, ty, span)
 	}
 
+	/// An array literal stays untyped (`Type::ArrayLiteral`) until its
+	/// context gives it a shared array or slice (`coerce`). Its elements are
+	/// built with the expected element type as their hint.
+	fn build_array(
+		&mut self,
+		elements: &[Spanned<ast::Expression>],
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let hint = self.array_element_hint(expected);
+		let values: Vec<ExprIdx> = elements
+			.iter()
+			.map(|element| self.build(element, hint))
+			.collect();
+		let elements = self.body.push_args(values);
+		let expr = self.body.push(
+			ExprKind::Array { elements },
+			TypeIndex::ARRAY_LITERAL,
+			span,
+		);
+		self.body.push_static(expr);
+		expr
+	}
+
+	/// A repeat is untyped as an array literal is. Its count is a length in
+	/// the memory its context gives, of that memory's `Size`, so it is
+	/// checked when the repeat is coerced.
+	fn build_array_repeat(
+		&mut self,
+		value: &Spanned<ast::Expression>,
+		count: &Spanned<ast::ConstArgument>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let hint = self.array_element_hint(expected);
+		let value = self.build(value, hint);
+		let count = match &count.inner {
+			ast::ConstArgument::Literal(ast::Literal::Int(value)) => self
+				.body
+				.push(ExprKind::Int(*value), TypeIndex::INTEGER, count.span),
+			ast::ConstArgument::Literal(_) => {
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::TypeMistmatch.code())
+						.with_message("an array's length is an integer")
+						.with_label(
+							Label::primary(self.scope.file_id, count.span)
+								.with_message("not an integer"),
+						),
+				);
+				self.body
+					.push(ExprKind::Error, TypeIndex::ERROR, count.span)
+			}
+			ast::ConstArgument::Path(segments) => {
+				self.build_path(segments, TypeIndex::INFER, count.span)
+			}
+		};
+		let expr = self.body.push(
+			ExprKind::ArrayRepeat { value, count },
+			TypeIndex::ARRAY_LITERAL,
+			span,
+		);
+		self.body.push_static(expr);
+		expr
+	}
+
+	/// The element type an expected array or slice gives its literal's
+	/// elements; no constraint otherwise.
+	fn array_element_hint(&self, expected: TypeIndex) -> TypeIndex {
+		match *self.cx.types.resolve(expected) {
+			Type::Array { of, .. } | Type::Slice { of, .. } => of,
+			_ => TypeIndex::INFER,
+		}
+	}
+
 	/// A string literal stays untyped (`Type::String`) until its context
 	/// gives it a byte slice or a byte array (`coerce`).
 	fn build_string(&mut self, span: TextSpan) -> ExprIdx {
@@ -443,11 +520,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		match unescape_string_literal(span.extract_str(source)) {
 			Ok(contents) => {
 				let symbol = self.cx.strings.get_or_intern(contents);
-				self.body.push(
+				let expr = self.body.push(
 					ExprKind::String(symbol),
 					TypeIndex::STRING,
 					span,
-				)
+				);
+				self.body.push_static(expr);
+				expr
 			}
 			Err(error) => {
 				self.cx.diagnostics.push(
@@ -930,7 +1009,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// Every written argument is resolved, extra ones too, for their own
 		// diagnostics.
 		for (at, arg) in segment.type_args.iter().enumerate() {
-			let ty = self.cx.resolve_type(
+			let ty = self.cx.resolve_type_argument(
 				&mut obligations,
 				self.scope,
 				arg,
@@ -982,7 +1061,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		for index in 0..own {
 			let argument = self.cx.types.list(arguments)[start + index];
 			let span = match written.get(index) {
-				Some(written) => written.span,
+				Some(written) => written.span(),
 				None => {
 					let param = self.cx.type_envs.param_types(frame)[index];
 					let mut span = segment.ident.span;
@@ -1255,8 +1334,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// untyped until context coerces both.
 		let operand = self.build(operand, expected);
 		let ty = self.body.ty(operand);
-		if ty == TypeIndex::STRING {
-			return self.report_operator_on_string(
+		if ty == TypeIndex::STRING || ty == TypeIndex::ARRAY_LITERAL {
+			return self.report_operator_on_literal(
 				op.inner.as_str(),
 				operand,
 				span,
@@ -1339,11 +1418,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.cx.types.has_untyped(right_ty),
 		) {
 			(true, true) => {
-				// A string literal has no operators of its own; typed, it
-				// has its slice's or array's.
+				// A string or array literal has no operators of its own.
 				for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
-					if ty == TypeIndex::STRING {
-						return self.report_operator_on_string(
+					if ty == TypeIndex::STRING || ty == TypeIndex::ARRAY_LITERAL
+					{
+						return self.report_operator_on_literal(
 							op.inner.as_str(),
 							operand,
 							span,
@@ -1665,8 +1744,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return;
 		}
 		match self.body.kind(expr) {
-			ExprKind::String(contents) => {
-				return self.coerce_string(expr, contents, target);
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. } => {
+				return self.coerce_static(expr, target);
 			}
 			ExprKind::Tuple { elements, order } => {
 				return self.coerce_tuple(expr, elements, order, target);
@@ -2002,74 +2083,139 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		);
 	}
 
-	/// A string literal becomes a shared byte slice, `M::&[u8]`, or a shared
-	/// byte array of its length, `M::&[u8; N]`, in whatever memory `target`
-	/// names. Its data is static and read-only, so an exclusive pointer is
-	/// not one it can become.
-	fn coerce_string(
-		&mut self,
-		expr: ExprIdx,
-		contents: SymbolU32,
-		target: TypeIndex,
-	) {
+	/// A string or array literal is static data: it becomes a shared array
+	/// of its length or a shared slice, in whatever memory `target` names,
+	/// abstract ones included. The data is read-only, so an exclusive pointer
+	/// is not one it can become. A string's elements are bytes; an array
+	/// literal's are checked against the target's element type. A repeat's
+	/// count is a length in the memory, of its `Size`, and an integer literal
+	/// or a constant, since static data is laid out before the program runs.
+	fn coerce_static(&mut self, expr: ExprIdx, target: TypeIndex) {
 		if self.cx.types.has_infer(target) {
 			self.report_annotation_required(expr);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
-		let fits = match *self.cx.types.resolve(target) {
-			Type::Slice {
-				of: TypeIndex::U8,
-				ownership: Ownership::Shared,
-				..
-			} => true,
-			Type::Array {
-				of: TypeIndex::U8,
-				ownership: Ownership::Shared,
-				size,
-				..
-			} => {
+		let kind = self.body.kind(expr);
+		let fits = self.static_target(target).filter(|&(of, ..)| {
+			!matches!(kind, ExprKind::String(_)) || of == TypeIndex::U8
+		});
+		let Some((of, memory, size)) = fits else {
+			let note = match kind {
+				ExprKind::String(_) => STRING_TARGETS_NOTE,
+				_ => ARRAY_TARGETS_NOTE,
+			};
+			let diagnostic =
+				self.report_unable_to_coerce(expr, target).with_note(note);
+			self.cx.diagnostics.push(diagnostic);
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		};
+		let length = match kind {
+			ExprKind::String(contents) => {
 				let length = self.cx.strings.resolve(contents).unwrap().len();
-				if usize::try_from(size).is_ok_and(|size| size == length) {
-					true
-				} else {
-					let target = self.cx.type_formatter().display_type(target);
-					return self.push_error(
-						DiagnosticCode::ArraySizeMismatch,
-						format!(
-							"this string literal is {length} bytes long, but \
-							 `{target}` holds {size}"
-						),
-						expr,
-					);
+				Some(u64::try_from(length).unwrap())
+			}
+			ExprKind::Array { elements } => {
+				for at in 0..elements.len() {
+					let element = self.body.args(elements)[at];
+					self.expect(element, of);
+				}
+				Some(u64::try_from(elements.len()).unwrap())
+			}
+			ExprKind::ArrayRepeat { value, count } => {
+				self.expect(value, of);
+				let length_type = self.memory_size(memory);
+				self.expect(count, length_type);
+				match self.body.kind(count) {
+					_ if self.body.ty(count) == TypeIndex::ERROR => None,
+					ExprKind::Int(count) => Some(count),
+					// One with no value was reported on the constant.
+					ExprKind::Const {
+						constant,
+						type_args,
+					} if type_args.is_empty() => self.cx.constant_bits(constant),
+					// An impl's constant may depend on the impl's arguments,
+					// which evaluation does not substitute (yet).
+					ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
+						let span = self.body.span(count);
+						self.report_unsupported(
+							span,
+							"a repeat count of a generic constant",
+						);
+						return self.body.set_ty(expr, TypeIndex::ERROR);
+					}
+					_ => {
+						self.push_error(
+							DiagnosticCode::ArrayRepeatCountNotConst,
+							"an array's length is a literal or a constant"
+								.to_string(),
+							count,
+						);
+						return self.body.set_ty(expr, TypeIndex::ERROR);
+					}
 				}
 			}
-			_ => false,
+			_ => unreachable!("only static data is coerced as static data"),
 		};
-		if fits {
-			return self.body.set_ty(expr, target);
+		if let (Some(size), Some(length)) = (size, length)
+			&& u64::from(size) != length
+		{
+			let target = self.cx.type_formatter().display_type(target);
+			let literal = match kind {
+				ExprKind::String(_) => {
+					format!("this string literal is {length} bytes long")
+				}
+				_ => format!("this array literal has {length} elements"),
+			};
+			return self.push_error(
+				DiagnosticCode::ArraySizeMismatch,
+				format!("{literal}, but `{target}` holds {size}"),
+				expr,
+			);
 		}
-		let diagnostic = self
-			.report_unable_to_coerce(expr, target)
-			.with_note(STRING_TARGETS_NOTE);
-		self.cx.diagnostics.push(diagnostic);
-		self.body.set_ty(expr, TypeIndex::ERROR);
+		self.body.set_ty(expr, target);
 	}
 
-	/// An operator applied to an untyped string literal.
-	fn report_operator_on_string(
+	/// The element type, memory and length (`None` for a slice) of a shared
+	/// array or slice: what a string or array literal can become.
+	pub(super) fn static_target(
+		&self,
+		target: TypeIndex,
+	) -> Option<(TypeIndex, TypeIndex, Option<u32>)> {
+		match *self.cx.types.resolve(target) {
+			Type::Array {
+				of,
+				memory,
+				size,
+				ownership: Ownership::Shared,
+			} => Some((of, memory, Some(size))),
+			Type::Slice {
+				of,
+				memory,
+				ownership: Ownership::Shared,
+			} => Some((of, memory, None)),
+			_ => None,
+		}
+	}
+
+	/// An operator applied to an untyped string or array literal, which has
+	/// no operators of its own; typed, it has its slice's or array's.
+	fn report_operator_on_literal(
 		&mut self,
 		op: &str,
 		operand: ExprIdx,
 		span: TextSpan,
 	) -> ExprIdx {
+		let (noun, note) = if self.body.ty(operand) == TypeIndex::STRING {
+			("a string literal", STRING_TARGETS_NOTE)
+		} else {
+			("an array literal", ARRAY_TARGETS_NOTE)
+		};
 		self.cx.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TraitBoundViolation.code())
-				.with_message(format!(
-					"cannot apply `{op}` to a string literal"
-				))
+				.with_message(format!("cannot apply `{op}` to {noun}"))
 				.with_label(self.source_span(operand).primary_label())
-				.with_note(STRING_TARGETS_NOTE),
+				.with_note(note),
 		);
 		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 	}
@@ -2140,6 +2286,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 /// What a string literal can become, for the notes that reject one.
 pub(super) const STRING_TARGETS_NOTE: &str = "a string literal is a shared \
 	byte slice or byte array in a memory: `heap::&[u8]` or `heap::&[u8; N]`";
+
+pub(super) const ARRAY_TARGETS_NOTE: &str = "an array literal is a shared \
+	array or slice in a memory: `heap::&[T; N]` or `heap::&[T]`";
 
 /// The method an operator dispatches to, with its type arguments.
 #[derive(Clone, Copy)]
@@ -2664,6 +2813,12 @@ mod tests {
 						"{:?}",
 						self.context.strings.resolve(contents).unwrap()
 					)
+				}
+				ExprKind::Array { elements } => {
+					list("array", body.args(elements))
+				}
+				ExprKind::ArrayRepeat { value, count } => {
+					list("repeat", &[value, count])
 				}
 				ExprKind::Const {
 					constant,
@@ -4156,6 +4311,115 @@ mod tests {
 	}
 
 	#[test]
+	fn an_array_literal_takes_a_shared_array_or_slice_from_its_context() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				memory wide: u64;
+				const SIZE: u32 = 3;
+				func slice() -> heap::&[u32] { [1, 2, 3] }
+				func array() -> heap::&[u8; 2] { [1, 2] }
+				func empty() -> heap::&[u8] { [] }
+				func annotated() { local a: heap::&[u8; 1] = [9]; }
+				func nested() -> heap::&[heap::&[u8]] { [[1], [2, 3]] }
+				func repeat() -> heap::&[u16; 4] { [0; 4] }
+				func repeat_constant() -> heap::&[u16; 3] { [7; SIZE] }
+				func repeat_wide() -> wide::&[u8; 5] { [1; 5] }
+				func any_memory<Mem: Memory>() -> Mem::&[u8; 2] { [1; 2] }
+			"#}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("slice"), "(block => (array 1 2 3))");
+		assert_eq!(case.body_type("slice"), "heap::&[u32]");
+		assert_eq!(case.body_type("array"), "heap::&[u8; 2]");
+		assert_eq!(case.body_type("empty"), "heap::&[u8]");
+		assert_eq!(
+			case.locals("annotated"),
+			[("a".into(), "heap::&[u8; 1]".into())]
+		);
+		assert_eq!(case.body_type("nested"), "heap::&[heap::&[u8]]");
+		assert_eq!(case.shape("repeat"), "(block => (repeat 0 4))");
+		assert_eq!(case.body_type("repeat_constant"), "heap::&[u16; 3]");
+		assert_eq!(case.body_type("repeat_wide"), "wide::&[u8; 5]");
+		assert_eq!(case.body_type("any_memory"), "Mem::&[u8; 2]");
+		// A repeat's count is a length in its memory, of its `Size`.
+		let body = case.body("repeat_wide");
+		let ExprKind::ArrayRepeat { count, .. } = body.kind(body.statics()[0])
+		else {
+			panic!("expected a repeat");
+		};
+		assert_eq!(body.ty(count), TypeIndex::U64);
+		// Every literal is static data, an inner one before its outer one.
+		let body = case.body("nested");
+		let lengths: Vec<usize> = body
+			.statics()
+			.iter()
+			.map(|&expr| match body.kind(expr) {
+				ExprKind::Array { elements } => elements.len(),
+				_ => panic!("expected an array literal"),
+			})
+			.collect();
+		assert_eq!(lengths, [1, 2, 2]);
+	}
+
+	#[test]
+	fn an_array_literal_is_only_what_its_context_allows() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const LONG: u64 = 2;
+				func exclusive() -> heap::*[u8] { [1] }
+				func number() -> u32 { [1] }
+				func too_long() -> heap::&[u8; 2] { [1, 2, 3] }
+				func repeat_too_long() -> heap::&[u8; 2] { [0; 3] }
+				func element() -> heap::&[u8] { [true] }
+				func count_type() -> heap::&[u8; 2] { [0; LONG] }
+				func computed(n: u32) -> heap::&[u8; 2] { [0; n] }
+				func computed_slice(n: u32) -> heap::&[u8] { [0; n] }
+				func untyped() { local a = [1]; }
+				func operator() -> heap::&[u8] { [1] + [2] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArrayRepeatCountNotConst,
+			DiagnosticCode::ArrayRepeatCountNotConst,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn a_body_records_its_string_literals_as_static_data() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func branches(c: bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func none() -> u32 { 1 }
+			"#}
+		);
+		case.diagnostics().assert_none();
+		let body = case.body("branches");
+		let contents: Vec<&str> = body
+			.statics()
+			.iter()
+			.map(|&expr| {
+				let ExprKind::String(symbol) = body.kind(expr) else {
+					panic!("expected a string literal");
+				};
+				case.context.strings.resolve(symbol).unwrap()
+			})
+			.collect();
+		assert_eq!(contents, ["yes", "no"]);
+		assert!(case.body("none").statics().is_empty());
+	}
+
+	#[test]
 	fn a_string_literal_waits_for_a_generic_call_to_learn_its_memory() {
 		test_case!(
 			case = indoc! {r#"
@@ -4220,6 +4484,72 @@ mod tests {
 			case.shape("array"),
 			r#"(block => (as "abc" heap::&[u8; 3]))"#
 		);
+	}
+
+	#[test]
+	fn an_array_literal_is_cast_to_what_it_can_become() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func array() -> heap::&[u8; 2] { [1, 2] as heap::&[u8; 2] }
+				func slice() -> heap::&[u32] { [1, 2] as heap::&[u32] }
+				func repeat() -> heap::&[u8; 3] { [0; 3] as heap::&[u8; 3] }
+				func inferred() { local a = [1] as heap::&[u16]; }
+				func number() -> u32 { [1] as u32 }
+				func pointer() -> heap::*u32 { [1] as heap::*u32 }
+				func exclusive() -> heap::*[u8] { [1] as heap::*[u8] }
+				func length() -> heap::&[u8; 2] { [1] as heap::&[u8; 2] }
+				func element() -> heap::&[u8] { [true] as heap::&[u8] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::InvalidCast,
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(
+			case.shape("array"),
+			"(block => (as (array 1 2) heap::&[u8; 2]))"
+		);
+		assert_eq!(
+			case.locals("inferred"),
+			[("a".into(), "heap::&[u16]".into())]
+		);
+	}
+
+	#[test]
+	fn constant_parameters_and_arguments_are_not_checked_yet() {
+		test_case!(
+			case = indoc! {r#"
+				struct Buffer<const N: u32>(u8);
+				func f(b: Buffer<4>) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::UnsupportedExpression,
+		]);
+	}
+
+	#[test]
+	fn an_array_type_length_is_an_integer_literal_for_now() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 2;
+				func literal(a: heap::&[u8; 2]) {}
+				func constant(a: heap::&[u8; N]) {}
+				func not_integer(a: heap::&[u8; true]) {}
+				func too_long(a: heap::&[u8; 5000000000]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::UnsupportedExpression,
+		]);
 	}
 
 	#[test]
@@ -4327,7 +4657,7 @@ mod tests {
 	fn a_path_through_a_type_calls_its_member_directly() {
 		test_case!(
 			case = indoc! {"
-				enum E: u8 { A = 0 }
+				enum E(u8) { A = 0 }
 				impl E { pub func pick<T>(t: T) -> E { E::A } }
 				struct W<T>(x: T);
 				impl<T> W<T> {
@@ -4567,7 +4897,7 @@ mod tests {
 					func bare() { local w = Self; }
 					func written() -> W { Self::<u8>(1) }
 				}
-				enum E: u8 { A = 0 }
+				enum E(u8) { A = 0 }
 				impl E { func variant() -> E { Self(0) } }
 				trait Tr { func make() -> Self { Self() } }
 				func free() { Self(); }
@@ -5127,7 +5457,7 @@ mod tests {
 	fn a_match_compares_with_constants_and_destructures() {
 		test_case!(
 			case = indoc! {"
-				enum Dir: u8 { North = 0, South = 1 }
+				enum Dir(u8) { North = 0, South = 1 }
 				const LIMIT: u8 = 10;
 				struct P(x: u8, d: Dir);
 				trait Lim { const MAX: u8; }
@@ -5223,7 +5553,7 @@ mod tests {
 		// function's block, in a global's initializer, in a constant's own.
 		test_case!(
 			case = indoc! {"
-				enum Dir: u8 { North = 0, East = 1, South = 2 }
+				enum Dir(u8) { North = 0, East = 1, South = 2 }
 				const N: Dir = Dir::North;
 				global g: Dir = match (N) {
 					const N -> { Dir::North },
@@ -5549,7 +5879,7 @@ mod tests {
 	fn a_match_must_cover_every_value() {
 		test_case!(
 			case = indoc! {"
-				enum Dir: u8 { North = 0, East, South, West }
+				enum Dir(u8) { North = 0, East, South, West }
 				struct P(x: bool, y: bool);
 				func a(d: Dir) -> u8 {
 					match d { Dir::North -> { 0 }, Dir::East -> { 1 } }
@@ -5618,7 +5948,7 @@ mod tests {
 	fn a_constant_counts_by_its_value_unless_it_is_abstract() {
 		test_case!(
 			case = indoc! {"
-				enum Dir: u8 { North = 0, East, South }
+				enum Dir(u8) { North = 0, East, South }
 				const N: Dir = Dir::North;
 				trait Lim { const MAX: u8; }
 				func k(d: Dir) {

@@ -243,6 +243,20 @@ pub struct StructDef {
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
 	pub lookup: FxHashMap<SymbolU32, FieldIdx>,
+	/// How the fields are placed in linear memory.
+	pub order: FieldOrder,
+}
+
+/// How a struct's fields are placed in linear memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum FieldOrder {
+	/// In declaration order, as `#[fixed_order]` asks: a layout the program
+	/// shares with something outside it.
+	Fixed,
+	/// In descending alignment, which leaves the least padding.
+	Optimal,
 }
 
 impl StructDef {
@@ -2671,6 +2685,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			ast::Item::Struct {
 				pub_span,
+				attributes,
 				name,
 				fields,
 				..
@@ -2742,6 +2757,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					field_names: field_names.into_boxed_slice(),
 					field_pub_spans: field_pub_spans.into_boxed_slice(),
 					lookup,
+					order: if attributes.iter().any(|attribute| {
+						self.strings.resolve(attribute.name.inner)
+							== Some("fixed_order")
+					}) {
+						FieldOrder::Fixed
+					} else {
+						FieldOrder::Optimal
+					},
 				});
 				self.ast_nodes.push(AstEntry {
 					file_id,

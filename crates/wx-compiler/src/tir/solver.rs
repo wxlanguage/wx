@@ -22,6 +22,7 @@ use super::defs::{
 	AssocTypeIdx, DefinitionRegistry, MemberKind, TraitIdx, TraitImplIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
+use super::layout::Layouts;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::{
 	AssocTypeSignature, EnumSignature, InherentImplSignature, ParamBounds,
@@ -388,6 +389,8 @@ pub(super) struct Solver {
 	/// definition is `InProgress` exactly while its judgement's frame
 	/// (`SolverFrame::Judgement`, `SolverFrame::Requirements`) is on the stack.
 	pub(super) verdicts: FxHashMap<Definition, Verdict>,
+	/// Every aggregate layout asked for, by its concrete type.
+	pub(super) layouts: Layouts,
 }
 
 impl Solver {
@@ -403,6 +406,7 @@ impl Solver {
 			},
 			normalized: FxHashMap::default(),
 			verdicts: FxHashMap::default(),
+			layouts: Layouts::default(),
 		}
 	}
 
@@ -1345,6 +1349,7 @@ impl Solver {
 			| Type::Integer
 			| Type::Float
 			| Type::String
+			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1485,7 +1490,8 @@ impl Solver {
 			| Type::Infer
 			| Type::Integer
 			| Type::Float
-			| Type::String => {
+			| Type::String
+			| Type::ArrayLiteral => {
 				return Err(SolverError::Poisoned);
 			}
 			Type::Never
@@ -2225,7 +2231,7 @@ impl Solver {
 /// signature is being built: reducing by impl reads finished signatures, while
 /// assumption-only reduction reads declared bounds and may run mid-construction.
 impl TypeContext<'_, '_, '_> {
-	fn solver_and_view(&mut self) -> (&mut Solver, SolverView<'_>) {
+	pub(super) fn solver_and_view(&mut self) -> (&mut Solver, SolverView<'_>) {
 		(
 			&mut self.solver,
 			SolverView {

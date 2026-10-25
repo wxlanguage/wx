@@ -40,7 +40,7 @@ use super::defs::{
 	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier,
 	TraitIdx, TraitImplIdx, TypesetIdx,
 };
-use super::eval::ConstValueState;
+use super::eval::{Allocation, ConstValueState};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
 use super::members::{
@@ -632,6 +632,8 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) const_values: Vec<ConstValueState>,
 	/// The constants being evaluated, outermost first.
 	pub(super) const_stack: Vec<ConstIdx>,
+	/// The bytes constant values point into, by `AllocIdx` (`eval.rs`).
+	pub(super) allocations: Vec<Allocation>,
 	/// Each function's checked block, by `FunctionIdx`; `None` for one
 	/// without a block (a declaration, an import, a required trait method).
 	pub(super) function_bodies: Vec<Option<Body>>,
@@ -771,6 +773,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.map(|_| ConstValueState::Unevaluated)
 				.collect(),
 			const_stack: Vec::new(),
+			allocations: Vec::new(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
 			exports: FxHashMap::default(),
@@ -818,13 +821,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		for (index, param) in params.iter().enumerate() {
 			if let Some(colliding_param) = params[..index]
 				.iter()
-				.find(|p| p.name.inner == param.name.inner)
-				.map(|p| p.name)
+				.find(|p| p.name().inner == param.name().inner)
+				.map(|p| p.name())
 			{
 				self.diagnostics.push(report_duplicate_generic_param(
 					self.strings,
 					file_id,
-					param.name,
+					param.name(),
 					colliding_param,
 				));
 			}
@@ -834,7 +837,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&mut self.types,
 			owner,
 			parent,
-			params.iter().map(|p| p.name),
+			params.iter().map(|p| p.name()),
 		);
 		self.param_bounds
 			.push((0..params.len()).map(|_| ParamBounds::empty()).collect());
@@ -858,13 +861,35 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let mut occurrences_per_param = Vec::with_capacity(params.len());
 		for ast_param in params {
 			let mut occurrences = Vec::new();
-			if let Some(bound) = &ast_param.bounds {
-				self.collect_bound_occurrences(
+			match ast_param {
+				ast::TypeParam::Type {
+					bounds: Some(bound),
+					..
+				} => self.collect_bound_occurrences(
 					file_id,
 					namespace,
 					bound,
 					&mut occurrences,
-				);
+				),
+				ast::TypeParam::Type { bounds: None, .. } => {}
+				// Kept as a type parameter with no bounds, so the arguments
+				// still line up, until constants are checked.
+				ast::TypeParam::Const {
+					const_span, name, ..
+				} => self.diagnostics.push(
+					Diagnostic::bug()
+						.with_code(DiagnosticCode::UnsupportedExpression.code())
+						.with_message(
+							"constant parameters are not supported yet",
+						)
+						.with_label(
+							SourceSpan::new(
+								file_id,
+								TextSpan::new(const_span.start, name.span.end),
+							)
+							.primary_label(),
+						),
+				),
 			}
 			occurrences_per_param.push(occurrences);
 		}
@@ -908,7 +933,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					.declared_bounds,
 			);
 			let equalities =
-				self.equality_clauses(subject, &ids, ast_param.name.inner);
+				self.equality_clauses(subject, &ids, ast_param.name().inner);
 			let bounds = &mut self.param_bounds[usize::from(type_env)][index];
 			bounds.declared_bounds = ids;
 			bounds.clauses.equalities = Some(equalities);
@@ -996,7 +1021,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.with_labels(vec![
 				SourceSpan::new(
 					file_id,
-					TextSpan::new(first.span.start, last.span.end),
+					TextSpan::new(first.span().start, last.span().end),
 				)
 				.primary_label()
 				.with_message(format!(
@@ -1078,7 +1103,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.type_args
 			.iter()
 			.map(|arg| {
-				self.resolve_type(
+				self.resolve_type_argument(
 					obligations,
 					scope,
 					arg,
@@ -2749,6 +2774,98 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// policy; nominal types retain their structure. The type is stored as
 	/// written, with projections unreduced; the declaration check normalizes it once
 	/// to find cycles, and readers normalize under their own assumptions.
+	/// A written type argument as `resolve_type` lowers a type. A constant
+	/// argument is not supported yet: it is reported, and is `ERROR`.
+	pub(super) fn resolve_type_argument(
+		&mut self,
+		obligations: &mut Vec<Obligation>,
+		scope: LexicalScope,
+		arg: &ast::TypeArgument,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		match arg {
+			ast::TypeArgument::Type(ty) => {
+				self.resolve_type(obligations, scope, ty, infer_policy)
+			}
+			ast::TypeArgument::Const(constant) => {
+				self.report_const_argument(scope, constant.span)
+			}
+		}
+	}
+
+	/// A written type argument as `resolve_type_expression` lowers a type.
+	fn resolve_type_argument_expression(
+		&mut self,
+		obligations: &mut Vec<Obligation>,
+		scope: LexicalScope,
+		arg: &ast::TypeArgument,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		match arg {
+			ast::TypeArgument::Type(ty) => self.resolve_type_expression(
+				obligations,
+				scope,
+				ty,
+				infer_policy,
+			),
+			ast::TypeArgument::Const(constant) => {
+				self.report_const_argument(scope, constant.span)
+			}
+		}
+	}
+
+	/// The length an array type is written with. Only an integer literal
+	/// that fits a `u32` is checked yet; a constant's value is a later step.
+	fn array_length(
+		&mut self,
+		scope: LexicalScope,
+		length: &Spanned<ast::ConstArgument>,
+	) -> Option<u32> {
+		let site = SourceSpan::new(scope.file_id, length.span);
+		let diagnostic = match length.inner {
+			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
+				match u32::try_from(value) {
+					Ok(size) => return Some(size),
+					Err(_) => Diagnostic::bug()
+						.with_code(DiagnosticCode::UnsupportedExpression.code())
+						.with_message(
+							"array lengths above `u32::MAX` are not supported \
+							 yet",
+						)
+						.with_label(site.primary_label()),
+				}
+			}
+			ast::ConstArgument::Literal(_) => Diagnostic::error()
+				.with_code(DiagnosticCode::TypeMistmatch.code())
+				.with_message("an array's length is an integer")
+				.with_label(
+					site.primary_label().with_message("not an integer"),
+				),
+			ast::ConstArgument::Path(_) => Diagnostic::bug()
+				.with_code(DiagnosticCode::UnsupportedExpression.code())
+				.with_message("constant array lengths are not supported yet")
+				.with_label(site.primary_label()),
+		};
+		self.diagnostics.push(diagnostic);
+		None
+	}
+
+	fn report_const_argument(
+		&mut self,
+		scope: LexicalScope,
+		span: TextSpan,
+	) -> TypeIndex {
+		self.diagnostics.push(
+			Diagnostic::bug()
+				.with_code(DiagnosticCode::UnsupportedExpression.code())
+				.with_message("constant arguments are not supported yet")
+				.with_label(
+					SourceSpan::new(scope.file_id, span).primary_label(),
+				),
+		);
+		TypeIndex::ERROR
+	}
+
 	pub(super) fn resolve_type(
 		&mut self,
 		obligations: &mut Vec<Obligation>,
@@ -2854,7 +2971,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
 				for arg in &first.type_args {
-					self.resolve_type_expression(
+					self.resolve_type_argument_expression(
 						obligations,
 						scope,
 						arg,
@@ -2889,7 +3006,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
 				for arg in &first.type_args {
-					self.resolve_type_expression(
+					self.resolve_type_argument_expression(
 						obligations,
 						scope,
 						arg,
@@ -2974,7 +3091,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			{
 				// Resolved only to report what is wrong inside them.
 				for arg in &stopped.type_args {
-					self.resolve_type_expression(
+					self.resolve_type_argument_expression(
 						obligations,
 						scope,
 						arg,
@@ -3018,7 +3135,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							.type_args
 							.iter()
 							.map(|arg| {
-								self.resolve_type_expression(
+								self.resolve_type_argument_expression(
 									obligations,
 									scope,
 									arg,
@@ -3078,7 +3195,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					.type_args
 					.iter()
 					.map(|arg| {
-						self.resolve_type_expression(
+						self.resolve_type_argument_expression(
 							obligations,
 							scope,
 							arg,
@@ -3101,7 +3218,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				if !stopped.type_args.is_empty() {
 					// Resolved only to report what is wrong inside them.
 					for arg in &stopped.type_args {
-						self.resolve_type_expression(
+						self.resolve_type_argument_expression(
 							obligations,
 							scope,
 							arg,
@@ -3132,7 +3249,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				} else {
 					// Resolved only to report what is wrong inside them.
 					for arg in &stopped.type_args {
-						self.resolve_type_expression(
+						self.resolve_type_argument_expression(
 							obligations,
 							scope,
 							arg,
@@ -3187,7 +3304,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					.type_args
 					.iter()
 					.map(|arg| {
-						self.resolve_type_expression(
+						self.resolve_type_argument_expression(
 							obligations,
 							scope,
 							arg,
@@ -3214,7 +3331,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				} else {
 					// Resolved only to report what is wrong inside them.
 					for arg in &stopped.type_args {
-						self.resolve_type_expression(
+						self.resolve_type_argument_expression(
 							obligations,
 							scope,
 							arg,
@@ -3282,7 +3399,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.type_args
 			.iter()
 			.map(|arg| {
-				self.resolve_type_expression(
+				self.resolve_type_argument_expression(
 					obligations,
 					scope,
 					arg,
@@ -3313,7 +3430,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		infer_policy: InferPolicy,
 	) {
 		for arg in &segment.type_args {
-			self.resolve_type_expression(obligations, scope, arg, infer_policy);
+			self.resolve_type_argument_expression(
+				obligations,
+				scope,
+				arg,
+				infer_policy,
+			);
 		}
 		self.diagnostics.push(report_type_args_not_allowed(
 			self.strings,
@@ -3551,7 +3673,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				ownership,
 				memory,
 				inner,
-				size,
+				length,
 			} => {
 				let of = self.resolve_type_expression(
 					obligations,
@@ -3568,9 +3690,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				) else {
 					return TypeIndex::ERROR;
 				};
+				let Some(size) = self.array_length(scope, length) else {
+					return TypeIndex::ERROR;
+				};
 				self.types.intern(Type::Array {
 					of,
-					size: size.inner as u32,
+					size,
 					memory,
 					ownership: *ownership,
 				})
@@ -4320,7 +4445,7 @@ fn report_missing_enum_repr(
 		.with_label(
 			SourceSpan::new(file_id, span)
 				.primary_label()
-				.with_message("add `: <type>` here"),
+				.with_message("add `(<type>)` here"),
 		)
 }
 
@@ -5190,7 +5315,7 @@ pub(super) mod tests {
 		fn a_mismatched_initializer_has_no_value() {
 			test_case!(
 				case = &with_std(
-					"enum E: i32 { A = 1 }
+					"enum E(i32) { A = 1 }
 					const X: i32 = E::A;"
 				)
 			);
@@ -5203,7 +5328,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_variant_value_naming_its_enum_reports_only_the_mismatch() {
-			test_case!(case = &with_std("enum E: i32 { A = E::B, B }"));
+			test_case!(case = &with_std("enum E(i32) { A = E::B, B }"));
 			// `B` counts on from `A`, and `A` names `B`; the mismatch makes `A`
 			// an error before any loop is evaluated.
 			case.diagnostics()
@@ -5687,7 +5812,7 @@ pub(super) mod tests {
 			test_case!(
 				case = &with_std(
 					"const BASE: i16 = 10;
-					enum E: i16 { A = BASE * 2, B, C = -2, D, F }
+					enum E(i16) { A = BASE * 2, B, C = -2, D, F }
 					const X: E = E::B;"
 				)
 			);
@@ -5716,7 +5841,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn the_first_variant_needs_a_value_to_count_from() {
-			test_case!(case = &with_std("enum E: u8 { A, B, C = 1, D }"));
+			test_case!(case = &with_std("enum E(u8) { A, B, C = 1, D }"));
 			// Reported once, at `A`; `B` counts on from it and is silent.
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::EnumVariantRequiresExplicitValue,
@@ -5743,13 +5868,13 @@ pub(super) mod tests {
 
 		#[test]
 		fn counting_past_the_repr_is_reported_once_at_the_variant() {
-			test_case!(case = &with_std("enum E: u8 { A = 255, B, C }"));
+			test_case!(case = &with_std("enum E(u8) { A = 255, B, C }"));
 			// `B` owns the overflow; `C` reads a failed value and is silent.
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::ConstEvaluationFailed]);
 			let diagnostic = &case.context.diagnostics[0];
 			assert_eq!(diagnostic.message, "evaluation of constant `B` failed");
-			let source = &with_std("enum E: u8 { A = 255, B, C }");
+			let source = &with_std("enum E(u8) { A = 255, B, C }");
 			assert_eq!(&source[diagnostic.labels[0].range.clone()], "B");
 			assert_eq!(state(&case, "E::C"), &ConstValueState::Poisoned);
 		}
@@ -5757,7 +5882,7 @@ pub(super) mod tests {
 		#[test]
 		fn variants_sharing_a_value_are_reported_once_per_value() {
 			let source = with_std(
-				"enum E: i32 { F = 7, A = 1, B = 0, C, D = 1, G = 7, H = 2 }",
+				"enum E(i32) { F = 7, A = 1, B = 0, C, D = 1, G = 7, H = 2 }",
 			);
 			test_case!(case = &source);
 			case.diagnostics().assert_codes(&[
@@ -8616,7 +8741,7 @@ pub(super) mod tests {
 			const FIRST: Alias = colors::Color::Red;
 			struct Paint( color: Alias );
 			type Alias = colors::Color;
-			mod colors { pub enum Color: i32 { Red = 0, Green } }
+			mod colors { pub enum Color(i32) { Red = 0, Green } }
 		"}
 		);
 		assert!(
@@ -8685,8 +8810,8 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			type i32;
 			func f(x: Color<i32>, y: nested::Color<i32, i32>) {}
-			enum Color: i32 { Red = 0 }
-			mod nested { pub enum Color: i32 { Red = 0 } }
+			enum Color(i32) { Red = 0 }
+			mod nested { pub enum Color(i32) { Red = 0 } }
 		"};
 		test_case!(case = source);
 		case.diagnostics().assert_codes(&[
@@ -8737,7 +8862,7 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			type i32;
 			func f(x: Color) -> Color {}
-			enum Color: i32 { Red }
+			enum Color(i32) { Red }
 		"},
 			|builder| {
 				let function = DefId::Function(FunctionIdx::new(0));
@@ -8777,11 +8902,11 @@ pub(super) mod tests {
 		for (declaration, code) in [
 			("enum Color { Red }", DiagnosticCode::MissingEnumRepr),
 			(
-				"enum Color: Color { Red }",
+				"enum Color(Color) { Red }",
 				DiagnosticCode::EnumReprNotInteger,
 			),
 			(
-				"type Repr = Color; enum Color: Repr { Red }",
+				"type Repr = Color; enum Color(Repr) { Red }",
 				DiagnosticCode::EnumReprNotInteger,
 			),
 		] {
@@ -8820,7 +8945,7 @@ pub(super) mod tests {
 		test_case!(
 			case = indoc! {"
 			type i32;
-			enum Color: i32 { Red = 0, Green, Blue }
+			enum Color(i32) { Red = 0, Green, Blue }
 		"}
 		);
 
@@ -8839,7 +8964,7 @@ pub(super) mod tests {
 		test_case!(
 			mut case = indoc! {"
 			type i32;
-			enum Color: i32 { Red = 0, Green = 4 }
+			enum Color(i32) { Red = 0, Green = 4 }
 		"}
 		);
 		case.diagnostics().assert_none();
@@ -8885,7 +9010,7 @@ pub(super) mod tests {
 		test_case!(
 			case = indoc! {"
 			type bool;
-			enum Color: bool { Red, Green, Blue }
+			enum Color(bool) { Red, Green, Blue }
 		"}
 		);
 
@@ -15614,7 +15739,7 @@ pub(super) mod tests {
 				struct Meters(u32);
 				struct Tagged(u64, ());
 				struct Wrap<T>(T);
-				enum Small: u8 { A = 0 }
+				enum Small(u8) { A = 0 }
 				global int: u32 = 0;
 				global float: f64 = 0;
 				global newtype: Meters = Meters(0);
@@ -16628,7 +16753,7 @@ pub(super) mod tests {
             struct S();
             trait T {}
             type Alias = S;
-            enum E: i32 { A = 0 }
+            enum E(i32) { A = 0 }
             mod inner {}
             export { T, Alias, E, i32, inner }
         "#,

@@ -10,11 +10,12 @@
 //! (`&T as *T`), so a shared pointer stays read-only. A literal is untyped,
 //! so casting one gives it the target as its type: a number takes a scalar or
 //! a pointer's `Size`, a string a shared byte slice or byte array of its
-//! length. `as _` casts to the expected type.
+//! length, an array literal a shared slice or array of its length. `as _`
+//! casts to the expected type.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
-use super::{BodyContext, STRING_TARGETS_NOTE};
+use super::{ARRAY_TARGETS_NOTE, BodyContext, STRING_TARGETS_NOTE};
 use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind};
@@ -61,10 +62,13 @@ impl BodyContext<'_, '_, '_, '_> {
 		if source == TypeIndex::ERROR || target == TypeIndex::ERROR {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
-		// A string literal is cast to what it could be coerced to; checking
-		// it is coercing it.
-		if source == TypeIndex::STRING {
-			if !is_byte_slice_or_array(self, target) {
+		// A string or array literal is cast to the shared array or slice it
+		// could be coerced to; coercing it checks its elements and length.
+		if source == TypeIndex::STRING || source == TypeIndex::ARRAY_LITERAL {
+			let fits = self.static_target(target).is_some_and(|(of, ..)| {
+				source == TypeIndex::ARRAY_LITERAL || of == TypeIndex::U8
+			});
+			if !fits {
 				return self.report_invalid_cast(value, source, target, span);
 			}
 			self.coerce(value, target);
@@ -157,7 +161,7 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
 	/// when the stdlib declares no `Memory`.
-	fn memory_size(&mut self, memory: TypeIndex) -> TypeIndex {
+	pub(super) fn memory_size(&mut self, memory: TypeIndex) -> TypeIndex {
 		let Some(memory_trait) = self.cx.defs.intrinsics.memory else {
 			return TypeIndex::ERROR;
 		};
@@ -210,6 +214,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 		} else if value_ty == TypeIndex::STRING {
 			diagnostic = diagnostic.with_note(STRING_TARGETS_NOTE);
+		} else if value_ty == TypeIndex::ARRAY_LITERAL {
+			diagnostic = diagnostic.with_note(ARRAY_TARGETS_NOTE);
 		} else if self.cx.types.has_untyped(value_ty) {
 			diagnostic = diagnostic
 				.with_note("a literal is cast only to a number or a pointer");
@@ -217,23 +223,6 @@ impl BodyContext<'_, '_, '_, '_> {
 		self.cx.diagnostics.push(diagnostic);
 		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 	}
-}
-
-/// Whether `target` is a shared byte slice or byte array: what a string
-/// literal is cast to. Its length, for an array, is coercion's to check.
-fn is_byte_slice_or_array(cx: &BodyContext, target: TypeIndex) -> bool {
-	matches!(
-		*cx.cx.types.resolve(target),
-		Type::Slice {
-			of: TypeIndex::U8,
-			ownership: Ownership::Shared,
-			..
-		} | Type::Array {
-			of: TypeIndex::U8,
-			ownership: Ownership::Shared,
-			..
-		}
-	)
 }
 
 /// A Wasm value type: what a scalar is held in on the stack.

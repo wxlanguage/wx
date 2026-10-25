@@ -59,6 +59,7 @@ impl TypeIndex {
 		self == TypeIndex::INTEGER
 			|| self == TypeIndex::FLOAT
 			|| self == TypeIndex::STRING
+			|| self == TypeIndex::ARRAY_LITERAL
 	}
 
 	#[inline]
@@ -110,6 +111,7 @@ impl TypeIndex {
 	pub const BOOL: TypeIndex = TypeIndex(16);
 	pub const CHAR: TypeIndex = TypeIndex(17);
 	pub const STRING: TypeIndex = TypeIndex(18);
+	pub const ARRAY_LITERAL: TypeIndex = TypeIndex(19);
 }
 
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
@@ -183,6 +185,10 @@ pub enum Type {
 	/// byte array of the literal's length, in a memory its context gives
 	/// (`coerce`).
 	String,
+	/// An untyped array literal's type: a shared array of the literal's
+	/// length or a shared slice of its elements' type, in a memory its
+	/// context gives (`coerce`).
+	ArrayLiteral,
 	U8,
 	I8,
 	U16,
@@ -586,6 +592,7 @@ impl TypeInterner {
 			Type::Bool,
 			Type::Char,
 			Type::String,
+			Type::ArrayLiteral,
 		] {
 			types.intern(ty);
 		}
@@ -733,7 +740,7 @@ impl TypeInterner {
 		match ty {
 			Type::Infer => TypeFlags::HAS_INFER,
 			Type::Error => TypeFlags::HAS_ERROR,
-			Type::Integer | Type::Float | Type::String => {
+			Type::Integer | Type::Float | Type::String | Type::ArrayLiteral => {
 				TypeFlags::HAS_UNTYPED
 			}
 			Type::Tuple { elements: list }
@@ -1294,6 +1301,7 @@ impl TypeInterner {
 			| Type::Integer
 			| Type::Float
 			| Type::String
+			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
 			| Type::U16

@@ -1888,7 +1888,7 @@ fn test_export_enum_reports_cannot_export_not_undeclared() {
 	// export lookup only checked the value namespace, where enum names
 	// never live. It should report E1019 (CannotExportItem) instead.
 	let case = TestCase::new(indoc! {"
-        enum Status: u8 {
+        enum Status(u8) {
             Ok = 200,
         }
 
@@ -10839,7 +10839,7 @@ fn test_assoc_equality_binding_unconstrained_caller_is_not_disproved() {
 #[test]
 fn test_enum_variants_are_populated() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
@@ -10882,7 +10882,7 @@ fn test_enum_variants_after_anchor_auto_increment() {
 	// after it (`East`/`South`/`West`) may still omit one, auto-
 	// incrementing from `North`'s explicit `0`.
 	let case = TestCase::new(indoc! {"
-        enum Direction: u32 {
+        enum Direction(u32) {
             North = 0,
             East,
             South,
@@ -10923,7 +10923,7 @@ fn test_enum_variants_after_anchor_auto_increment() {
 #[test]
 fn test_enum_variant_access_resolves() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
@@ -10950,7 +10950,7 @@ fn test_enum_variant_access_resolves() {
 fn test_enum_comparison() {
 	// `==`/`!=` on an enum lower natively (every enum has an integer repr).
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
@@ -10978,7 +10978,7 @@ fn test_enum_ordering_requires_explicit_partial_ord_impl() {
 	// Unlike `==`, `<`/`>` on an enum is *not* implicit — it needs an
 	// `impl PartialOrd`, matching Rust (enums get nothing without `#[derive]`).
 	let case = TestCase::new(indoc! {"
-        enum Dir: i32 {
+        enum Dir(i32) {
             North = 0,
             South,
         }
@@ -11051,7 +11051,7 @@ fn test_enum_missing_repr_with_explicit_values_reports_once() {
 #[test]
 fn test_enum_duplicate_variant_is_error() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 0,
             Red,
         }
@@ -11070,7 +11070,7 @@ fn test_enum_duplicate_variant_is_error() {
 #[test]
 fn test_enum_repr_not_integer_is_error() {
 	let case = TestCase::new(indoc! {"
-        enum Color: bool {
+        enum Color(bool) {
             Red,
             Green,
         }
@@ -11092,7 +11092,7 @@ fn test_enum_constant_folds_arithmetic_for_auto_increment() {
 	// special-case a bare `Int` literal, so `B` got a stale value instead of the
 	// correctly-folded `1 + 1 = 2` from `A`.
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             A = 1 + 1,
             B,
         }
@@ -11121,7 +11121,7 @@ fn test_enum_constant_folds_arithmetic_for_auto_increment() {
 #[test]
 fn test_enum_negation_folds_for_signed_repr() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             A = -1,
         }
         export {}
@@ -11154,7 +11154,7 @@ fn test_enum_implicit_first_variant_no_longer_collides_silently() {
 	// has coverage via `test_enum_duplicate_value_groups_all_colliding_variants`
 	// (fully-explicit variants can still collide with each other).
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             A,
             B = 0,
         }
@@ -11177,7 +11177,7 @@ fn test_enum_implicit_first_variant_no_longer_collides_silently() {
 #[test]
 fn test_enum_first_variant_requires_explicit_value() {
 	let case = TestCase::new(indoc! {"
-        enum E: i32 {
+        enum E(i32) {
             A,
             B,
         }
@@ -11207,7 +11207,7 @@ fn test_enum_anchored_by_non_adjacent_earlier_variant_is_ok() {
 	// backward arbitrarily far; the numeric continuation is still always
 	// "previous variant's value + 1".
 	let case = TestCase::new(indoc! {"
-        enum E: i32 {
+        enum E(i32) {
             A = 0,
             B = 5,
             C,
@@ -11236,7 +11236,7 @@ fn test_enum_variant_with_broken_value_does_not_anchor_later_variants() {
 	// rather than tracking "has an anchor" and "next numeric value"
 	// separately.
 	let case = TestCase::new(indoc! {"
-        enum E: i32 {
+        enum E(i32) {
             A = some_undefined_const,
             B,
         }
@@ -11302,7 +11302,7 @@ fn test_enum_missing_value_does_not_cascade_when_repr_missing() {
 #[test]
 fn test_enum_duplicate_value_groups_all_colliding_variants() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             A = 1,
             B = 1,
             C = 1,
@@ -11330,7 +11330,7 @@ fn test_enum_duplicate_value_groups_all_colliding_variants() {
 #[test]
 fn test_enum_range_check_explicit_literal_is_error() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i8 {
+        enum Color(i8) {
             A = 300,
         }
         export {}
@@ -11349,7 +11349,7 @@ fn test_enum_range_check_explicit_literal_is_error() {
 #[test]
 fn test_enum_auto_increment_overflow_is_error() {
 	let case = TestCase::new(indoc! {"
-        enum Color: u8 {
+        enum Color(u8) {
             A = 255,
             B,
         }
@@ -11369,7 +11369,7 @@ fn test_enum_auto_increment_overflow_is_error() {
 #[test]
 fn test_enum_negative_value_on_unsigned_repr_is_error() {
 	let case = TestCase::new(indoc! {"
-        enum Color: u32 {
+        enum Color(u32) {
             A = -1,
         }
         export {}
@@ -11391,7 +11391,7 @@ fn test_enum_negative_value_on_unsigned_repr_is_error() {
 #[test]
 fn test_enum_type_mismatched_value_is_error() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             A = true,
         }
         export {}
@@ -11413,7 +11413,7 @@ fn test_enum_not_const_evaluatable_value_is_error() {
 	// doesn't fold — must not reuse `report_non_constant_global_initializer`'s
 	// "add `mut`" wording, since enum variants (like consts) can never be `mut`.
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             A = 32 % 0,
         }
         export {}
@@ -11485,7 +11485,7 @@ fn test_const_whose_value_failed_to_build_is_still_referenceable() {
 #[test]
 fn test_enum_unused_is_warned() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 0,
             Green,
         }
@@ -11563,7 +11563,7 @@ fn test_private_const_in_inherent_impl_is_warned_unused() {
 #[test]
 fn test_pub_enum_no_unused_warn() {
 	let case = TestCase::new(indoc! {"
-        pub enum Color: i32 {
+        pub enum Color(i32) {
             Red = 0,
             Green,
         }
@@ -11582,7 +11582,7 @@ fn test_enum_variant_unused_is_warned() {
 	// The enum itself is used (so it doesn't get the whole-enum warning),
 	// but `Green` is never referenced through `Color::Green`.
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 0,
             Green,
         }
@@ -11613,7 +11613,7 @@ fn test_enum_variant_unused_is_warned() {
 #[test]
 fn test_enum_all_variants_used_no_warn() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 0,
             Green,
         }
@@ -11637,7 +11637,7 @@ fn test_enum_all_variants_used_no_warn() {
 #[test]
 fn test_enum_two_unused_variants_grouped_without_oxford_comma() {
 	let case = TestCase::new(indoc! {"
-        enum Direction: i32 {
+        enum Direction(i32) {
             Right = 0,
             Down,
             Left,
@@ -11663,7 +11663,7 @@ fn test_enum_two_unused_variants_grouped_without_oxford_comma() {
 #[test]
 fn test_enum_five_unused_variants_grouped_with_oxford_comma() {
 	let case = TestCase::new(indoc! {"
-        enum Direction: i32 {
+        enum Direction(i32) {
             Right = 0,
             Down,
             Left,
@@ -11693,7 +11693,7 @@ fn test_enum_five_unused_variants_grouped_with_oxford_comma() {
 #[test]
 fn test_enum_six_unused_variants_collapses_to_generic_message() {
 	let case = TestCase::new(indoc! {"
-        enum Direction: i32 {
+        enum Direction(i32) {
             Right = 0,
             Down,
             Left,
@@ -11746,7 +11746,7 @@ fn test_tagged_items_registered_for_every_taggable_item_kind() {
         #[tag = \"tagged_global\"]
         global mut G: i32 = 0;
         #[tag = \"tagged_enum\"]
-        enum E: i32 { A = 1 }
+        enum E(i32) { A = 1 }
         #[tag = \"tagged_memory\"]
         memory M: Memory where { Size = u32 };
         #[tag = \"tagged_trait\"]
@@ -14314,8 +14314,8 @@ fn test_duplicate_enum_definition_is_error() {
 	// branch reporting a diagnostic at all — two same-named enums were
 	// silently accepted with the second one just dropped.
 	let case = TestCase::new(indoc! {"
-        enum Foo: i32 { A = 0 }
-        enum Foo: i32 { B = 0 }
+        enum Foo(i32) { A = 0 }
+        enum Foo(i32) { B = 0 }
         export { }
     "});
 	assert!(
@@ -15810,7 +15810,7 @@ fn test_match_int_exhaustive_with_wildcard() {
 #[test]
 fn test_match_enum_all_variants_covered_no_wildcard_ok() {
 	let case = TestCase::new(indoc! {"
-        enum FileDescriptor: u8 {
+        enum FileDescriptor(u8) {
             StdIn = 0,
             StdOut,
             StdErr,
@@ -15838,7 +15838,7 @@ fn test_match_enum_all_variants_covered_no_wildcard_ok() {
 #[test]
 fn test_match_enum_missing_variant_is_error() {
 	let case = TestCase::new(indoc! {"
-        enum FileDescriptor: u8 {
+        enum FileDescriptor(u8) {
             StdIn = 0,
             StdOut,
             StdErr,
@@ -15934,7 +15934,7 @@ fn test_match_arm_type_mismatch_reuses_type_mismatch_diagnostic() {
 #[test]
 fn test_match_enum_variant_marks_variant_used() {
 	let case = TestCase::new(indoc! {"
-        enum FileDescriptor: u8 {
+        enum FileDescriptor(u8) {
             StdIn = 0,
             StdOut,
             StdErr,

@@ -134,7 +134,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					.with_label(
 						Label::primary(
 							self.scope.file_id,
-							TextSpan::new(first.span.start, last.span.end),
+							TextSpan::new(first.span().start, last.span().end),
 						)
 						.with_message("a field takes no type arguments"),
 					),
