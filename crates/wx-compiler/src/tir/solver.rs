@@ -11,9 +11,11 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::ast::StringInterner;
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
+use super::body::ConstBody;
 use super::bounds::{
 	BindingRef, BoundClauses, BoundId, ClauseArena, ClauseTables, Readiness,
 	SelfSubstitution, known_distinct,
@@ -22,13 +24,14 @@ use super::defs::{
 	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
 	TraitImplIdx,
 };
-use super::eval::{ConstValueState, value_bits};
+use super::eval::{Allocation, ConstValueState, Unevaluable, value_bits};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::layout::Layouts;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::{
-	AssocTypeSignature, EnumSignature, InherentImplSignature, ParamBounds,
-	StructSignature, TraitImplSignature, TraitSignature, TypeContext,
+	AssocTypeSignature, ConstantSignature, EnumSignature,
+	InherentImplSignature, ParamBounds, StructSignature, TraitImplSignature,
+	TraitSignature, TypeContext,
 };
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
@@ -291,7 +294,7 @@ pub(super) enum Assumption {
 /// impl Tr for W { type A = <W as Tr>::A; }
 /// // W::A -> W::A through a definition only: a cycle, reported by its member
 /// ```
-enum SolverFrame {
+pub(super) enum SolverFrame {
 	/// A projection being normalized; its `ty` advances as the base reduces.
 	/// Evidence comparison and provider reduction differ in `facts`, so they
 	/// are distinct cycle keys.
@@ -325,6 +328,14 @@ enum SolverFrame {
 		bound: Option<BoundId>,
 		outer_budget: usize,
 	},
+	/// A constant being evaluated (`Solver::const_value`). Its state is
+	/// `InProgress` while this frame is on the stack; reading it again closes
+	/// a loop through constants. The budget is the evaluation's own, as for
+	/// a judgement.
+	Evaluation {
+		constant: ConstIdx,
+		outer_budget: usize,
+	},
 }
 
 /// The projections in flight on `frames`, outermost first.
@@ -335,7 +346,8 @@ fn projection_steps(frames: &[SolverFrame]) -> Vec<TypeIndex> {
 			SolverFrame::Projection(step) => Some(step.ty),
 			SolverFrame::Equality
 			| SolverFrame::Judgement { .. }
-			| SolverFrame::Requirements { .. } => None,
+			| SolverFrame::Requirements { .. }
+			| SolverFrame::Evaluation { .. } => None,
 		})
 		.collect()
 }
@@ -351,7 +363,9 @@ fn loop_owner(frames: &[SolverFrame]) -> Option<Definition> {
 			SolverFrame::Requirements { impl_kind, .. } => {
 				Some(Definition::Requirements(impl_kind))
 			}
-			SolverFrame::Projection(_) | SolverFrame::Equality => None,
+			SolverFrame::Projection(_)
+			| SolverFrame::Equality
+			| SolverFrame::Evaluation { .. } => None,
 		})
 		.min_by_key(|definition| definition.order())
 }
@@ -360,7 +374,7 @@ fn loop_owner(frames: &[SolverFrame]) -> Option<Definition> {
 /// signature queries and value judgements, not recreated per API call, so
 /// cycle detection sees every frame of a loop, whichever judgement it crosses.
 pub(super) struct SolverState {
-	frames: Vec<SolverFrame>,
+	pub(super) frames: Vec<SolverFrame>,
 	/// How many more levels the innermost judgement (or the request, outside
 	/// any judgement) may recurse. Equals `Solver::recursion_limit` when no frame is open.
 	pub(super) recursion_budget: usize,
@@ -370,7 +384,7 @@ pub(super) struct SolverState {
 	/// cycle, a re-entered judgement or a rollback), `usize::MAX` when none.
 	/// An answer that read no frame below its own request is a function of its
 	/// `Normalization` alone.
-	lowest_frame_read: usize,
+	pub(super) lowest_frame_read: usize,
 }
 
 /// The engine that normalizes types and selects impls, with everything it
@@ -379,7 +393,7 @@ pub(super) struct SolverState {
 pub(super) struct Solver {
 	/// The recursion budget each request and each judgement starts with. Fixed
 	/// configuration, not state; only tests change it.
-	recursion_limit: usize,
+	pub(super) recursion_limit: usize,
 	pub(super) state: SolverState,
 	/// Only `Ok` answers are stored. `Pending` means a fact is not final yet,
 	/// and `Poisoned` is not a permanent verdict (a budget overflow can be
@@ -393,10 +407,14 @@ pub(super) struct Solver {
 	pub(super) verdicts: FxHashMap<Definition, Verdict>,
 	/// Every aggregate layout asked for, by its concrete type.
 	pub(super) layouts: Layouts,
+	/// Each constant's value query state, by `ConstIdx` (`eval.rs`).
+	pub(super) const_values: Vec<ConstValueState>,
+	/// The bytes constant values point into, by `AllocIdx` (`eval.rs`).
+	pub(super) allocations: Vec<Allocation>,
 }
 
 impl Solver {
-	pub(super) fn new() -> Self {
+	pub(super) fn new(constant_count: usize) -> Self {
 		let recursion_limit = 128;
 		Self {
 			recursion_limit,
@@ -409,6 +427,8 @@ impl Solver {
 			normalized: FxHashMap::default(),
 			verdicts: FxHashMap::default(),
 			layouts: Layouts::default(),
+			const_values: vec![ConstValueState::Unevaluated; constant_count],
+			allocations: Vec::new(),
 		}
 	}
 
@@ -686,9 +706,10 @@ pub(super) struct ContextualEquality {
 
 /// What the solver may read, lent by `TypeContext::solver`. The interner is the
 /// only thing it extends; every other table is read-only and already final
-/// (an unfinished slot reads as `Pending`). Diagnostics, strings, the query
-/// engine and the per-kind signature tables a body or a declaration owns are
-/// deliberately not here: the solver can neither report nor construct.
+/// (an unfinished slot reads as `Pending`). Diagnostics, the query engine and
+/// the tables a body or a declaration is built into are deliberately not here:
+/// the solver can neither report nor construct. It reads built bodies to
+/// evaluate constants, and strings for a string literal's contents.
 pub(super) struct SolverView<'a> {
 	pub(super) types: &'a mut TypeInterner,
 	pub(super) defs: &'a DefinitionRegistry,
@@ -702,7 +723,11 @@ pub(super) struct SolverView<'a> {
 	pub(super) param_bounds: &'a [Box<[ParamBounds]>],
 	pub(super) clauses: &'a ClauseArena,
 	pub(super) type_envs: &'a TypeEnvArena,
-	pub(super) const_values: &'a [ConstValueState],
+	pub(super) constants: &'a [ConstantSignature],
+	/// Read by constant evaluation, which never builds a body.
+	pub(super) const_bodies: &'a [ConstBody],
+	/// Read for a string literal's contents.
+	pub(super) strings: &'a StringInterner,
 }
 
 impl<'a> SolverView<'a> {
@@ -957,9 +982,9 @@ impl Solver {
 		result
 	}
 
-	/// A constant in a type means its value once it is evaluated, and stays
-	/// as written until then (`Pending`). A constant with type arguments is
-	/// not evaluated yet, so it keeps its normalized arguments.
+	/// A constant in a type means its value, evaluated here on first use;
+	/// one whose body is not built yet is `Pending`. A constant with type
+	/// arguments is not evaluated yet, so it keeps its normalized arguments.
 	fn normalize_const(
 		&mut self,
 		view: &mut SolverView<'_>,
@@ -982,16 +1007,14 @@ impl Solver {
 			}
 			return Ok(view.types.intern_const(constant, &type_args));
 		}
-		match &view.const_values[usize::from(constant)] {
-			ConstValueState::Unevaluated | ConstValueState::InProgress => {
-				Err(SolverError::Pending)
-			}
-			ConstValueState::Evaluated(value) => match value_bits(value) {
+		match self.const_value(view, constant) {
+			Ok(value) => match value_bits(value) {
 				Some(bits) => Ok(view.types.intern(Type::Value { bits })),
 				None => Err(SolverError::Poisoned),
 			},
-			// Reported by the constant's own check.
-			_ => Err(SolverError::Poisoned),
+			Err(Unevaluable::Pending) => Err(SolverError::Pending),
+			// Reported by the constant's own check, or where it is named.
+			Err(_) => Err(SolverError::Poisoned),
 		}
 	}
 
@@ -2312,7 +2335,9 @@ impl TypeContext<'_, '_, '_> {
 				param_bounds: &self.param_bounds,
 				clauses: &self.clauses,
 				type_envs: &self.type_envs,
-				const_values: &self.const_values,
+				constants: &self.constants,
+				const_bodies: &self.const_bodies,
+				strings: self.strings,
 			},
 		)
 	}

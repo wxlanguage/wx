@@ -40,7 +40,7 @@ use super::defs::{
 	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier,
 	TraitIdx, TraitImplIdx, TypesetIdx,
 };
-use super::eval::{Allocation, ConstValueState};
+use super::eval::ConstValueState;
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
 use super::members::{
@@ -628,12 +628,6 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Each constant's checked initializer, by `ConstIdx`; built on demand
 	/// (`ensure_const_body`). A trait constant without a default has none.
 	pub(super) const_bodies: Vec<ConstBody>,
-	/// Each constant's value query state, by `ConstIdx` (`eval.rs`).
-	pub(super) const_values: Vec<ConstValueState>,
-	/// The constants being evaluated, outermost first.
-	pub(super) const_stack: Vec<ConstIdx>,
-	/// The bytes constant values point into, by `AllocIdx` (`eval.rs`).
-	pub(super) allocations: Vec<Allocation>,
 	/// Each function's checked block, by `FunctionIdx`; `None` for one
 	/// without a block (a declaration, an import, a required trait method).
 	pub(super) function_bodies: Vec<Option<Body>>,
@@ -696,7 +690,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			ast_nodes,
 			query_state,
 			query_stack: Vec::new(),
-			solver: Solver::new(),
+			solver: Solver::new(defs.constants.len()),
 			types: TypeInterner::new(),
 			bounds: BoundArena::default(),
 			clauses: ClauseArena::default(),
@@ -767,13 +761,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.collect(),
 			function_bodies: defs.functions.iter().map(|_| None).collect(),
 			global_bodies: defs.globals.iter().map(|_| None).collect(),
-			const_values: defs
-				.constants
-				.iter()
-				.map(|_| ConstValueState::Unevaluated)
-				.collect(),
-			const_stack: Vec::new(),
-			allocations: Vec::new(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
 			exports: FxHashMap::default(),
@@ -1527,7 +1514,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// On demand: evaluating one constant may need another's body first.
 	pub(super) fn ensure_const_body(&mut self, const_index: ConstIdx) {
 		match &self.const_bodies[usize::from(const_index)] {
-			ConstBody::Built(_) | ConstBody::Building => return,
+			ConstBody::Built(_) | ConstBody::Building | ConstBody::Missing => {
+				return;
+			}
 			ConstBody::NotBuilt => {}
 		}
 		let def_id = DefId::Const(const_index);
@@ -1547,6 +1536,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				};
 				// A required trait constant has no initializer.
 				let Some(value) = value else {
+					self.const_bodies[usize::from(const_index)] =
+						ConstBody::Missing;
 					return;
 				};
 				value
@@ -1610,7 +1601,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) fn const_body(&self, const_index: ConstIdx) -> Option<&Body> {
 		match &self.const_bodies[usize::from(const_index)] {
 			ConstBody::Built(body) => Some(body),
-			ConstBody::NotBuilt | ConstBody::Building => None,
+			ConstBody::NotBuilt | ConstBody::Building | ConstBody::Missing => {
+				None
+			}
 		}
 	}
 
@@ -2949,7 +2942,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		if matches!(
 			self.const_bodies[usize::from(constant)],
 			ConstBody::Building
-		) || self.const_values[usize::from(constant)]
+		) || self.solver.const_values[usize::from(constant)]
 			== ConstValueState::InProgress
 		{
 			let def = &self.defs.constants[usize::from(constant)];
@@ -5306,7 +5299,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected `{name}` to be a constant");
 			};
-			&case.context.const_values[usize::from(index)]
+			&case.context.solver.const_values[usize::from(index)]
 		}
 
 		fn value(case: &TestCase<'_>, name: &str) -> ConstValue {

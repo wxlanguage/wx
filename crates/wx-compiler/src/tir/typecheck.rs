@@ -4676,7 +4676,7 @@ mod tests {
 			panic!("expected a constant");
 		};
 		assert_eq!(
-			case.context.const_values[usize::from(index)],
+			case.context.solver.const_values[usize::from(index)],
 			ConstValueState::Evaluated(Box::new([ConstScalar::bool(false)]))
 		);
 	}
@@ -4697,7 +4697,7 @@ mod tests {
 				panic!("expected a constant");
 			};
 			assert_eq!(
-				case.context.const_values[usize::from(index)],
+				case.context.solver.const_values[usize::from(index)],
 				ConstValueState::Evaluated(Box::new([]))
 			);
 		}
@@ -4738,7 +4738,7 @@ mod tests {
 			panic!("expected a constant");
 		};
 		assert_eq!(
-			case.context.const_values[usize::from(index)],
+			case.context.solver.const_values[usize::from(index)],
 			ConstValueState::Evaluated(Box::new([]))
 		);
 		assert_eq!(
@@ -5058,7 +5058,7 @@ mod tests {
 			panic!("expected a constant");
 		};
 		assert!(matches!(
-			case.context.const_values[usize::from(index)],
+			case.context.solver.const_values[usize::from(index)],
 			ConstValueState::Evaluated(_)
 		));
 	}

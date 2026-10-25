@@ -67,6 +67,8 @@ pub(super) enum ConstBody {
 	Building,
 	/// Built.
 	Built(Body),
+	/// It has none: a required trait constant.
+	Missing,
 }
 
 /// A run of `Body::extra`: the arguments of a call or a construction, in the
@@ -513,6 +515,17 @@ pub(super) struct Body {
 }
 
 impl Body {
+	/// The constants the body names (a free one, a variant, an impl's, and
+	/// the variant a discriminant counts on), whose values evaluating it can
+	/// read.
+	pub(super) fn named_constants(&self) -> impl Iterator<Item = ConstIdx> {
+		self.kinds.iter().filter_map(|kind| match *kind {
+			ExprKind::Const { constant, .. }
+			| ExprKind::NextDiscriminant(constant) => Some(constant),
+			_ => None,
+		})
+	}
+
 	pub(super) fn root(&self) -> ExprIdx {
 		self.root
 	}
