@@ -205,7 +205,7 @@ impl TypeFormatter<'_> {
 			}
 			Type::Array {
 				of,
-				size,
+				length,
 				memory,
 				ownership,
 			} => {
@@ -214,7 +214,12 @@ impl TypeFormatter<'_> {
 				f.push(ownership_sigil(*ownership));
 				f.push('[');
 				self.write_type(f, *of);
-				let _ = write!(f, "; {}]", *size);
+				f.push_str("; ");
+				self.write_type(f, *length);
+				f.push(']');
+			}
+			Type::Value { bits } => {
+				let _ = write!(f, "{bits}");
 			}
 			Type::FunctionRef { param, result } => {
 				let (param, result) = (*param, *result);
@@ -566,9 +571,10 @@ mod tests {
 			memory,
 			ownership: Ownership::Exclusive,
 		});
+		let four = case.types.intern(Type::Value { bits: 4 });
 		let array = case.types.intern(Type::Array {
 			of: TypeIndex::I32,
-			size: 4,
+			length: four,
 			memory,
 			ownership: Ownership::Exclusive,
 		});

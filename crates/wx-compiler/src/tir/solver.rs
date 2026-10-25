@@ -1298,7 +1298,7 @@ impl Solver {
 			},
 			Type::Array {
 				of,
-				size,
+				length,
 				memory,
 				ownership,
 			} => Type::Array {
@@ -1309,7 +1309,13 @@ impl Solver {
 					depth,
 					facts,
 				)?,
-				size,
+				length: self.normalize(
+					view,
+					assumption_context,
+					length,
+					depth,
+					facts,
+				)?,
 				memory: self.normalize(
 					view,
 					assumption_context,
@@ -1365,7 +1371,8 @@ impl Solver {
 			| Type::Enum { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. }
-			| Type::TypeParam { .. } => return Ok(ty),
+			| Type::TypeParam { .. }
+			| Type::Value { .. } => return Ok(ty),
 		};
 		Ok(view.types.intern(rebuilt))
 	}
@@ -1486,12 +1493,15 @@ impl Solver {
 		}
 		let ty = self.normalize_head_query(view, assumption_context, ty)?;
 		let known = match *view.types.resolve(ty) {
+			// A constant is no value's type; lowering puts one only where a
+			// constant is expected.
 			Type::Error
 			| Type::Infer
 			| Type::Integer
 			| Type::Float
 			| Type::String
-			| Type::ArrayLiteral => {
+			| Type::ArrayLiteral
+			| Type::Value { .. } => {
 				return Err(SolverError::Poisoned);
 			}
 			Type::Never

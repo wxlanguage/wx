@@ -320,6 +320,7 @@ fn call_type_args(case: &TestCase, index: usize) -> Vec<String> {
 			TypeArgument::Type(_) => "type".to_string(),
 			TypeArgument::Const(constant) => match &constant.inner {
 				ConstArgument::Literal(_) => "literal".to_string(),
+				ConstArgument::Infer => "_".to_string(),
 				ConstArgument::Path(path) => path
 					.iter()
 					.map(|segment| case.name(segment.ident.inner))
@@ -2572,6 +2573,32 @@ fn an_array_length_is_a_literal_or_a_path() {
 	let case = TestCase::new("func f(a: heap::&[u8; N + 1]) {}");
 	case.diagnostics()
 		.assert_error(DiagnosticCode::UnexpectedToken);
+}
+
+#[test]
+fn an_array_length_can_be_left_to_its_context() {
+	let case = TestCase::new(
+		"func f() { local a: heap::&[u8; _] = [0; _]; local b = [0; const _]; }",
+	);
+	case.diagnostics()
+		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	let Statement::LocalDefinition { ty: Some(ty), .. } =
+		&case.function_block(0)[0].inner.inner
+	else {
+		panic!("expected a local with a type")
+	};
+	let TypeExpression::Array { length, .. } = &ty.inner else {
+		panic!("expected an array type")
+	};
+	assert!(matches!(length.inner, ConstArgument::Infer));
+	for at in [0, 1] {
+		let Expression::ArrayRepeat { count, .. } =
+			local_definition_value(case.function_block(0), at)
+		else {
+			panic!("expected an array repeat")
+		};
+		assert!(matches!(count.inner, ConstArgument::Infer));
+	}
 }
 
 #[test]

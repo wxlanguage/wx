@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use codespan_reporting::diagnostic::Diagnostic;
 
+use super::types::TypeIndex;
 use crate::{
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	vfs::FileId,
@@ -200,4 +201,78 @@ pub fn parse_char_literal(s: &str) -> Result<char, CharLiteralError> {
 	}
 
 	Ok(value)
+}
+
+/// An integer type, for the range of a literal or a constant of it.
+#[derive(Clone, Copy)]
+pub(super) enum Integer {
+	I8,
+	U8,
+	I16,
+	U16,
+	I32,
+	U32,
+	I64,
+	U64,
+}
+
+impl Integer {
+	pub(super) fn from_type(ty: TypeIndex) -> Option<Self> {
+		Some(match ty {
+			TypeIndex::U8 => Self::U8,
+			TypeIndex::I8 => Self::I8,
+			TypeIndex::U16 => Self::U16,
+			TypeIndex::I16 => Self::I16,
+			TypeIndex::U32 => Self::U32,
+			TypeIndex::I32 => Self::I32,
+			TypeIndex::U64 => Self::U64,
+			TypeIndex::I64 => Self::I64,
+			_ => return None,
+		})
+	}
+
+	/// Whether an integer literal `value`, optionally negated, is in range.
+	pub(super) fn in_range(self, value: u64, negated: bool) -> bool {
+		// A negated literal reaches one past the maximum: `-min`, e.g. `-128`
+		// is in range for `i8` although `128` is not.
+		let limit = if negated {
+			self.min().unsigned_abs()
+		} else {
+			self.max()
+		};
+		value <= limit
+	}
+
+	pub(super) fn is_signed(self) -> bool {
+		match self {
+			Self::I8 | Self::I16 | Self::I32 | Self::I64 => true,
+			Self::U8 | Self::U16 | Self::U32 | Self::U64 => false,
+		}
+	}
+
+	pub(super) fn max(self) -> u64 {
+		match self {
+			Self::I8 => i8::MAX as u64,
+			Self::U8 => u8::MAX as u64,
+			Self::I16 => i16::MAX as u64,
+			Self::U16 => u16::MAX as u64,
+			Self::I32 => i32::MAX as u64,
+			Self::U32 => u32::MAX as u64,
+			Self::I64 => i64::MAX as u64,
+			Self::U64 => u64::MAX,
+		}
+	}
+
+	fn min(self) -> i64 {
+		match self {
+			Self::I8 => i8::MIN as i64,
+			Self::U8 => 0,
+			Self::I16 => i16::MIN as i64,
+			Self::U16 => 0,
+			Self::I32 => i32::MIN as i64,
+			Self::U32 => 0,
+			Self::I64 => i64::MIN,
+			Self::U64 => 0,
+		}
+	}
 }

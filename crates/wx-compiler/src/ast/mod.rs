@@ -1442,12 +1442,14 @@ impl TypeArgument {
 	}
 }
 
-/// A constant argument: `5`, `-1`, `true`, or a path marked `const`.
+/// A constant argument: `5`, `-1`, `true`, or a path marked `const`. An
+/// array's length can also be `_`, left to its context.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum ConstArgument {
 	Literal(Literal),
 	Path(Box<[PathSegment]>),
+	Infer,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -3167,8 +3169,14 @@ impl<'ctx> Parser<'ctx> {
 		Ok(TypeArgument::Type(self.parse_type_expression()?))
 	}
 
-	/// A constant: a literal, or a path naming one.
+	/// A constant: a literal, `_`, or a path naming one.
 	fn parse_const_argument(&mut self) -> Result<Spanned<ConstArgument>, ()> {
+		if let Some(Keyword::Underscore) = self.peek_keyword() {
+			return Ok(Spanned {
+				inner: ConstArgument::Infer,
+				span: self.lexer.next().span,
+			});
+		}
 		if self.at_literal() {
 			let literal = self.parse_literal()?;
 			return Ok(Spanned {

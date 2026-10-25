@@ -2820,7 +2820,7 @@ impl<'a> Builder<'a> {
 				self.build_type_expression(&ty.inner)
 			}
 			ast::TypeArgument::Const(constant) => match &constant.inner {
-				ast::ConstArgument::Literal(_) => {
+				ast::ConstArgument::Literal(_) | ast::ConstArgument::Infer => {
 					self.build_const_argument(constant)
 				}
 				ast::ConstArgument::Path(_) => {
@@ -2839,7 +2839,9 @@ impl<'a> Builder<'a> {
 		constant: &ast::Spanned<ast::ConstArgument>,
 	) -> NodeId {
 		match &constant.inner {
-			ast::ConstArgument::Literal(_) => self.source_text(constant.span),
+			ast::ConstArgument::Literal(_) | ast::ConstArgument::Infer => {
+				self.source_text(constant.span)
+			}
 			ast::ConstArgument::Path(path) => self.build_value_path(path),
 		}
 	}

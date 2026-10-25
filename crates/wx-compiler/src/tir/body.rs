@@ -189,10 +189,11 @@ pub(super) enum ExprKind {
 		elements: ExprRange,
 	},
 	/// A repeat `[value; count]`, typed as an array literal is; `count` is
-	/// an integer literal or a constant.
+	/// an integer literal or a constant, or `None` for `_`, the length of the
+	/// array its context gives.
 	ArrayRepeat {
 		value: ExprIdx,
-		count: ExprIdx,
+		count: Option<ExprIdx>,
 	},
 	/// A known constant's value: a free one, a variant, or an impl's (an
 	/// inherent impl's, or the one a concrete trait impl defines), with its

@@ -238,9 +238,11 @@ pub enum Type {
 		memory: TypeIndex,
 		ownership: crate::ast::Ownership,
 	},
+	/// `M::&[T; N]`. The length is a type-level constant: a `Value`, or
+	/// `Infer` until its context gives one.
 	Array {
 		of: TypeIndex,
-		size: u32,
+		length: TypeIndex,
 		memory: TypeIndex,
 		ownership: crate::ast::Ownership,
 	},
@@ -275,6 +277,13 @@ pub enum Type {
 	TypeParam {
 		env: TypeEnvIdx,
 		param_index: u32,
+	},
+	/// A constant in a type, such as an array's length. It holds the bits
+	/// alone: its type is the one where it appears (an array's length is its
+	/// memory's `Size`), so the same number is the same type in every place,
+	/// as rustc's `ty::Const` has no type of its own.
+	Value {
+		bits: u64,
 	},
 	/// `<Base as Trait>::Item`, pending normalization. The base can be
 	/// concrete or abstract. `assoc_type_index` always names the trait's
@@ -494,18 +503,19 @@ impl TypeInterner {
 			(
 				Type::Array {
 					of: x,
-					size: xs,
+					length: xl,
 					memory: xm,
 					ownership: xo,
 				},
 				Type::Array {
 					of: y,
-					size: ys,
+					length: yl,
 					memory: ym,
 					ownership: yo,
 				},
-			) if xs == ys && xo == yo => {
+			) if xo == yo => {
 				self.match_pattern(*x, *y, envs, env, args)?;
+				self.match_pattern(*xl, *yl, envs, env, args)?;
 				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
@@ -757,8 +767,12 @@ impl TypeInterner {
 				flags
 			}
 			Type::Pointer { to: of, memory, .. }
-			| Type::Array { of, memory, .. }
 			| Type::Slice { of, memory, .. } => self.flags[usize::from(of)]
+				.union(self.flags[usize::from(memory)]),
+			Type::Array {
+				of, length, memory, ..
+			} => self.flags[usize::from(of)]
+				.union(self.flags[usize::from(length)])
 				.union(self.flags[usize::from(memory)]),
 			Type::FunctionRef { param, result } => self.flags
 				[usize::from(param)]
@@ -782,7 +796,8 @@ impl TypeInterner {
 			| Type::Char
 			| Type::Enum { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. } => TypeFlags::default(),
+			| Type::Global { .. }
+			| Type::Value { .. } => TypeFlags::default(),
 		}
 	}
 
@@ -937,22 +952,23 @@ impl TypeInterner {
 			(
 				Type::Array {
 					of,
-					size,
+					length,
 					memory,
 					ownership,
 				},
 				Type::Array {
 					of: other_of,
-					size: other_size,
+					length: other_length,
 					memory: other_memory,
 					ownership: other_ownership,
 				},
-			) if size == other_size && ownership == other_ownership => {
+			) if ownership == other_ownership => {
 				let of = self.meet(of, other_of)?;
+				let length = self.meet(length, other_length)?;
 				let memory = self.meet(memory, other_memory)?;
 				Some(self.intern(Type::Array {
 					of,
-					size,
+					length,
 					memory,
 					ownership,
 				}))
@@ -1102,18 +1118,19 @@ impl TypeInterner {
 			(
 				Type::Array {
 					of,
-					size,
+					length,
 					memory,
 					ownership,
 				},
 				Type::Array {
 					of: other_of,
-					size: other_size,
+					length: other_length,
 					memory: other_memory,
 					ownership: other_ownership,
 				},
-			) if size == other_size && ownership == other_ownership => {
+			) if ownership == other_ownership => {
 				self.learn(envs, env, slots, of, other_of);
+				self.learn(envs, env, slots, length, other_length);
 				self.learn(envs, env, slots, memory, other_memory);
 			}
 			// A projection's value is not its base: `<T as Tr>::X` being `u8`
@@ -1245,18 +1262,22 @@ impl TypeInterner {
 			}
 			Type::Array {
 				of,
-				size,
+				length,
 				memory,
 				ownership,
 			} => {
 				let next_of = self.substitute(of, substitution);
+				let next_length = self.substitute(length, substitution);
 				let next_memory = self.substitute(memory, substitution);
-				if next_of == of && next_memory == memory {
+				if next_of == of
+					&& next_length == length
+					&& next_memory == memory
+				{
 					ty
 				} else {
 					self.intern(Type::Array {
 						of: next_of,
-						size,
+						length: next_length,
 						memory: next_memory,
 						ownership,
 					})
@@ -1316,7 +1337,8 @@ impl TypeInterner {
 			| Type::Char
 			| Type::Enum { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. } => ty,
+			| Type::Global { .. }
+			| Type::Value { .. } => ty,
 		}
 	}
 
@@ -1909,9 +1931,10 @@ mod tests {
 			memory,
 			ownership: Ownership::Shared,
 		});
+		let seven = types.intern(Type::Value { bits: 7 });
 		let array = types.intern(Type::Array {
 			of: pointer,
-			size: 7,
+			length: seven,
 			memory,
 			ownership: Ownership::Exclusive,
 		});

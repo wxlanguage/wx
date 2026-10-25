@@ -171,7 +171,7 @@ pub struct EnumSignature {
 /// legal `impl` target) still gets a slot here, carrying `TypeIndex::ERROR`,
 /// same reasoning as a duplicate struct field still getting its own slot.
 pub struct TypeSetSignature {
-	members: Box<[Spanned<TypeIndex>]>,
+	pub(super) members: Box<[Spanned<TypeIndex>]>,
 }
 
 /// A `const`'s resolved type — covers both a free top-level `const` and a
@@ -621,7 +621,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) traits: Vec<TraitSignature>,
 	pub(super) structs: Vec<StructSignature>,
 	pub(super) enums: Vec<EnumSignature>,
-	typesets: Vec<TypeSetSignature>,
+	pub(super) typesets: Vec<TypeSetSignature>,
 	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub(super) functions: Vec<FunctionSignature>,
 	pub(super) constants: Vec<ConstantSignature>,
@@ -2816,25 +2816,37 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 	/// The length an array type is written with. Only an integer literal
 	/// that fits a `u32` is checked yet; a constant's value is a later step.
+	/// An array's length in `memory`: a `Value` of its `Size`, which the
+	/// value must fit (`CheckConstantFits`), or `Infer` for `_`.
 	fn array_length(
 		&mut self,
+		obligations: &mut Vec<Obligation>,
 		scope: LexicalScope,
+		memory: TypeIndex,
 		length: &Spanned<ast::ConstArgument>,
-	) -> Option<u32> {
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
 		let site = SourceSpan::new(scope.file_id, length.span);
 		let diagnostic = match length.inner {
-			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
-				match u32::try_from(value) {
-					Ok(size) => return Some(size),
-					Err(_) => Diagnostic::bug()
-						.with_code(DiagnosticCode::UnsupportedExpression.code())
-						.with_message(
-							"array lengths above `u32::MAX` are not supported \
-							 yet",
-						)
-						.with_label(site.primary_label()),
+			ast::ConstArgument::Literal(ast::Literal::Int(bits)) => {
+				// Without a `Memory` there is no `Size`, and its absence is
+				// reported where the memory is declared.
+				if let Some(size) = self.memory_size(memory) {
+					obligations.push(Obligation::CheckConstantFits {
+						assumption_context: scope.env,
+						ty: size,
+						bits,
+						reference: site,
+					});
 				}
+				return self.types.intern(Type::Value { bits });
 			}
+			ast::ConstArgument::Infer => match infer_policy {
+				InferPolicy::Allow => return TypeIndex::INFER,
+				InferPolicy::Reject(kind) => {
+					report_infer_in_signature(scope.file_id, length.span, kind)
+				}
+			},
 			ast::ConstArgument::Literal(_) => Diagnostic::error()
 				.with_code(DiagnosticCode::TypeMistmatch.code())
 				.with_message("an array's length is an integer")
@@ -2847,7 +2859,28 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.with_label(site.primary_label()),
 		};
 		self.diagnostics.push(diagnostic);
-		None
+		TypeIndex::ERROR
+	}
+
+	/// `memory`'s `Size`, `<memory as Memory>::Size`, as written; `None`
+	/// when the stdlib declares no `Memory`.
+	pub(super) fn memory_size(
+		&mut self,
+		memory: TypeIndex,
+	) -> Option<TypeIndex> {
+		let memory_trait = self.defs.intrinsics.memory?;
+		let size = self.strings.get("Size")?;
+		let Some(MemberKind::AssociatedType(assoc_type_index)) = self
+			.defs
+			.declared_trait_member(memory_trait, BindingKey::ty(size))
+		else {
+			return None;
+		};
+		Some(self.types.intern(Type::AssocTypeProjection {
+			trait_index: memory_trait,
+			assoc_type_index,
+			base: memory,
+		}))
 	}
 
 	fn report_const_argument(
@@ -3690,12 +3723,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				) else {
 					return TypeIndex::ERROR;
 				};
-				let Some(size) = self.array_length(scope, length) else {
+				let length = self.array_length(
+					obligations,
+					scope,
+					memory,
+					length,
+					infer_policy,
+				);
+				if length == TypeIndex::ERROR {
 					return TypeIndex::ERROR;
-				};
+				}
 				self.types.intern(Type::Array {
 					of,
-					size,
+					length,
 					memory,
 					ownership: *ownership,
 				})
@@ -10090,7 +10130,7 @@ pub(super) mod tests {
 		);
 		let Type::Array {
 			of,
-			size,
+			length,
 			memory,
 			ownership,
 		} = case.context.types.resolve(array_type)
@@ -10098,7 +10138,10 @@ pub(super) mod tests {
 			panic!("expected `a` to resolve to an array type");
 		};
 		assert_eq!(*of, TypeIndex::U32);
-		assert_eq!(*size, 4);
+		assert_eq!(
+			case.context.types.resolve(*length),
+			&Type::Value { bits: 4 }
+		);
 		assert_eq!(*ownership, ast::Ownership::Exclusive);
 		assert_eq!(
 			case.context.types.resolve(*memory),
@@ -10214,11 +10257,19 @@ pub(super) mod tests {
 				ownership: ast::Ownership::Shared
 			}
 		);
+		let Type::Array { length, .. } = *case.context.types.resolve(params[3])
+		else {
+			panic!("expected an array");
+		};
+		assert_eq!(
+			case.context.types.resolve(length),
+			&Type::Value { bits: 4 }
+		);
 		assert_eq!(
 			case.context.types.resolve(params[3]),
 			&Type::Array {
 				of: TypeIndex::U8,
-				size: 4,
+				length,
 				memory: params[0],
 				ownership: ast::Ownership::Exclusive
 			}
@@ -12918,6 +12969,7 @@ pub(super) mod tests {
 						trait_index: TraitIdx::new(0),
 						assoc_type_index: declaration,
 					});
+				let seven = builder.types.intern(Type::Value { bits: 7 });
 				let cases = [
 					(
 						builder
@@ -12971,13 +13023,13 @@ pub(super) mod tests {
 					(
 						builder.types.intern(Type::Array {
 							of: projection,
-							size: 7,
+							length: seven,
 							memory: projection,
 							ownership: Ownership::Exclusive,
 						}),
 						builder.types.intern(Type::Array {
 							of: TypeIndex::I32,
-							size: 7,
+							length: seven,
 							memory: TypeIndex::I32,
 							ownership: Ownership::Exclusive,
 						}),

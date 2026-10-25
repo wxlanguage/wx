@@ -408,15 +408,34 @@ impl TypeContext<'_, '_, '_> {
 				let count = u64::try_from(elements.len()).unwrap();
 				self.place_static(owner, ty, span, count, start, stack)?;
 			}
-			// One element's values, laid out `count` times.
+			// One element's values, laid out `count` times; `_` is the
+			// array's own length.
 			ExprKind::ArrayRepeat { value, count } => {
 				let start = stack.len();
 				self.eval(owner, value, stack)?;
-				self.eval(owner, count, stack)?;
-				let count = match stack.pop().expect("a count's value").val {
-					Val::I32(bits) => u64::from(bits),
-					Val::I64(bits) => bits,
-					_ => unreachable!("a count is of a memory's `Size`"),
+				let count = match count {
+					Some(count) => {
+						self.eval(owner, count, stack)?;
+						match stack.pop().expect("a count's value").val {
+							Val::I32(bits) => u64::from(bits),
+							Val::I64(bits) => bits,
+							_ => {
+								unreachable!("a count is of a memory's `Size`")
+							}
+						}
+					}
+					None => {
+						let Type::Array { length, .. } =
+							*self.types.resolve(ty)
+						else {
+							unreachable!("`_` is the length of an array")
+						};
+						let Type::Value { bits } = *self.types.resolve(length)
+						else {
+							unreachable!("a checked array has a length")
+						};
+						bits
+					}
 				};
 				self.place_static(owner, ty, span, count, start, stack)?;
 			}
@@ -2045,9 +2064,14 @@ mod tests {
 				const SIZE: u32 = 2;
 				const SEVENS: heap::&[u16; 3] = [7; 3];
 				const ZEROS: heap::&[u8] = [0; SIZE];
+				const NINES: heap::&[u8; 2] = [9; _];
 			"#}
 		);
 		case.diagnostics().assert_none();
+		let [address] = case.value("NINES") else {
+			panic!("expected an array's address");
+		};
+		assert_eq!(&*case.pointee(*address).0.bytes, [9, 9]);
 		let [address] = case.value("SEVENS") else {
 			panic!("expected an array's address");
 		};

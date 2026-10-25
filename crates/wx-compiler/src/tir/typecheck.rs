@@ -50,7 +50,7 @@ use super::defs::{
 };
 use super::imports::report_private_identifier;
 use super::literals::{
-	CharLiteralError, parse_char_literal, unescape_string_literal,
+	CharLiteralError, Integer, parse_char_literal, unescape_string_literal,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
@@ -475,9 +475,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let hint = self.array_element_hint(expected);
 		let value = self.build(value, hint);
 		let count = match &count.inner {
-			ast::ConstArgument::Literal(ast::Literal::Int(value)) => self
-				.body
-				.push(ExprKind::Int(*value), TypeIndex::INTEGER, count.span),
+			ast::ConstArgument::Infer => None,
+			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
+				Some(self.body.push(
+					ExprKind::Int(*value),
+					TypeIndex::INTEGER,
+					count.span,
+				))
+			}
 			ast::ConstArgument::Literal(_) => {
 				self.cx.diagnostics.push(
 					Diagnostic::error()
@@ -488,11 +493,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 								.with_message("not an integer"),
 						),
 				);
-				self.body
-					.push(ExprKind::Error, TypeIndex::ERROR, count.span)
+				Some(self.body.push(
+					ExprKind::Error,
+					TypeIndex::ERROR,
+					count.span,
+				))
 			}
 			ast::ConstArgument::Path(segments) => {
-				self.build_path(segments, TypeIndex::INFER, count.span)
+				Some(self.build_path(segments, TypeIndex::INFER, count.span))
 			}
 		};
 		let expr = self.body.push(
@@ -2091,15 +2099,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// count is a length in the memory, of its `Size`, and an integer literal
 	/// or a constant, since static data is laid out before the program runs.
 	fn coerce_static(&mut self, expr: ExprIdx, target: TypeIndex) {
-		if self.cx.types.has_infer(target) {
+		// Only an array's length can be left to the literal.
+		let parts = self.static_target(target);
+		let known = parts.is_some_and(|(of, memory, _)| {
+			!self.cx.types.has_infer(of) && !self.cx.types.has_infer(memory)
+		});
+		if self.cx.types.has_infer(target) && !known {
 			self.report_annotation_required(expr);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
 		let kind = self.body.kind(expr);
-		let fits = self.static_target(target).filter(|&(of, ..)| {
+		let fits = parts.filter(|&(of, ..)| {
 			!matches!(kind, ExprKind::String(_)) || of == TypeIndex::U8
 		});
-		let Some((of, memory, size)) = fits else {
+		let Some((of, memory, target_length)) = fits else {
 			let note = match kind {
 				ExprKind::String(_) => STRING_TARGETS_NOTE,
 				_ => ARRAY_TARGETS_NOTE,
@@ -2121,7 +2134,22 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				}
 				Some(u64::try_from(elements.len()).unwrap())
 			}
-			ExprKind::ArrayRepeat { value, count } => {
+			// `[value; _]` is as long as the array it becomes.
+			ExprKind::ArrayRepeat { value, count: None } => {
+				self.expect(value, of);
+				match target_length.map(|length| *self.cx.types.resolve(length))
+				{
+					Some(Type::Value { bits }) => Some(bits),
+					_ => {
+						self.report_annotation_required(expr);
+						return self.body.set_ty(expr, TypeIndex::ERROR);
+					}
+				}
+			}
+			ExprKind::ArrayRepeat {
+				value,
+				count: Some(count),
+			} => {
 				self.expect(value, of);
 				let length_type = self.memory_size(memory);
 				self.expect(count, length_type);
@@ -2156,23 +2184,38 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			_ => unreachable!("only static data is coerced as static data"),
 		};
-		if let (Some(size), Some(length)) = (size, length)
-			&& u64::from(size) != length
-		{
-			let target = self.cx.type_formatter().display_type(target);
-			let literal = match kind {
-				ExprKind::String(_) => {
-					format!("this string literal is {length} bytes long")
-				}
-				_ => format!("this array literal has {length} elements"),
-			};
-			return self.push_error(
-				DiagnosticCode::ArraySizeMismatch,
-				format!("{literal}, but `{target}` holds {size}"),
-				expr,
-			);
+		let (Some(target_length), Some(length)) = (target_length, length)
+		else {
+			return self.body.set_ty(expr, target);
+		};
+		match *self.cx.types.resolve(target_length) {
+			// A written `_` takes the literal's length.
+			Type::Infer => {
+				let length = self.cx.types.intern(Type::Value { bits: length });
+				let ty = self.cx.types.intern(Type::Array {
+					of,
+					length,
+					memory,
+					ownership: Ownership::Shared,
+				});
+				self.body.set_ty(expr, ty);
+			}
+			Type::Value { bits } if bits != length => {
+				let target = self.cx.type_formatter().display_type(target);
+				let literal = match kind {
+					ExprKind::String(_) => {
+						format!("this string literal is {length} bytes long")
+					}
+					_ => format!("this array literal has {length} elements"),
+				};
+				self.push_error(
+					DiagnosticCode::ArraySizeMismatch,
+					format!("{literal}, but `{target}` holds {bits}"),
+					expr,
+				);
+			}
+			_ => self.body.set_ty(expr, target),
 		}
-		self.body.set_ty(expr, target);
 	}
 
 	/// The element type, memory and length (`None` for a slice) of a shared
@@ -2180,14 +2223,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	pub(super) fn static_target(
 		&self,
 		target: TypeIndex,
-	) -> Option<(TypeIndex, TypeIndex, Option<u32>)> {
+	) -> Option<(TypeIndex, TypeIndex, Option<TypeIndex>)> {
 		match *self.cx.types.resolve(target) {
 			Type::Array {
 				of,
 				memory,
-				size,
+				length,
 				ownership: Ownership::Shared,
-			} => Some((of, memory, Some(size))),
+			} => Some((of, memory, Some(length))),
 			Type::Slice {
 				of,
 				memory,
@@ -2438,79 +2481,6 @@ impl Float {
 		value == 0
 			|| 64 - value.leading_zeros() - value.trailing_zeros()
 				<= self.mantissa_bits()
-	}
-}
-
-#[derive(Clone, Copy)]
-enum Integer {
-	I8,
-	U8,
-	I16,
-	U16,
-	I32,
-	U32,
-	I64,
-	U64,
-}
-
-impl Integer {
-	fn from_type(ty: TypeIndex) -> Option<Self> {
-		Some(match ty {
-			TypeIndex::U8 => Self::U8,
-			TypeIndex::I8 => Self::I8,
-			TypeIndex::U16 => Self::U16,
-			TypeIndex::I16 => Self::I16,
-			TypeIndex::U32 => Self::U32,
-			TypeIndex::I32 => Self::I32,
-			TypeIndex::U64 => Self::U64,
-			TypeIndex::I64 => Self::I64,
-			_ => return None,
-		})
-	}
-
-	/// Whether an integer literal `value`, optionally negated, is in range.
-	fn in_range(self, value: u64, negated: bool) -> bool {
-		// A negated literal reaches one past the maximum: `-min`, e.g. `-128`
-		// is in range for `i8` although `128` is not.
-		let limit = if negated {
-			self.min().unsigned_abs()
-		} else {
-			self.max()
-		};
-		value <= limit
-	}
-
-	fn is_signed(self) -> bool {
-		match self {
-			Self::I8 | Self::I16 | Self::I32 | Self::I64 => true,
-			Self::U8 | Self::U16 | Self::U32 | Self::U64 => false,
-		}
-	}
-
-	fn max(self) -> u64 {
-		match self {
-			Self::I8 => i8::MAX as u64,
-			Self::U8 => u8::MAX as u64,
-			Self::I16 => i16::MAX as u64,
-			Self::U16 => u16::MAX as u64,
-			Self::I32 => i32::MAX as u64,
-			Self::U32 => u32::MAX as u64,
-			Self::I64 => i64::MAX as u64,
-			Self::U64 => u64::MAX,
-		}
-	}
-
-	fn min(self) -> i64 {
-		match self {
-			Self::I8 => i8::MIN as i64,
-			Self::U8 => 0,
-			Self::I16 => i16::MIN as i64,
-			Self::U16 => 0,
-			Self::I32 => i32::MIN as i64,
-			Self::U32 => 0,
-			Self::I64 => i64::MIN,
-			Self::U64 => 0,
-		}
 	}
 }
 
@@ -2817,9 +2787,10 @@ mod tests {
 				ExprKind::Array { elements } => {
 					list("array", body.args(elements))
 				}
-				ExprKind::ArrayRepeat { value, count } => {
-					list("repeat", &[value, count])
-				}
+				ExprKind::ArrayRepeat { value, count } => match count {
+					Some(count) => list("repeat", &[value, count]),
+					None => list("repeat _", &[value]),
+				},
 				ExprKind::Const {
 					constant,
 					type_args,
@@ -4344,7 +4315,9 @@ mod tests {
 		assert_eq!(case.body_type("any_memory"), "Mem::&[u8; 2]");
 		// A repeat's count is a length in its memory, of its `Size`.
 		let body = case.body("repeat_wide");
-		let ExprKind::ArrayRepeat { count, .. } = body.kind(body.statics()[0])
+		let ExprKind::ArrayRepeat {
+			count: Some(count), ..
+		} = body.kind(body.statics()[0])
 		else {
 			panic!("expected a repeat");
 		};
@@ -4538,17 +4511,75 @@ mod tests {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
+				memory wide: u64;
 				const N: u32 = 2;
 				func literal(a: heap::&[u8; 2]) {}
 				func constant(a: heap::&[u8; N]) {}
 				func not_integer(a: heap::&[u8; true]) {}
 				func too_long(a: heap::&[u8; 5000000000]) {}
+				func long(a: wide::&[u8; 5000000000]) {}
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnsupportedExpression,
 			DiagnosticCode::TypeMistmatch,
-			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+	}
+
+	#[test]
+	fn an_array_length_in_an_abstract_memory_fits_every_size() {
+		test_case!(
+			case = indoc! {r#"
+				func short<M: Memory>(a: M::&[u8; 5]) {}
+				func long<M: Memory>(a: M::&[u8; 5000000000]) {}
+				func local<M: Memory>() {
+					local a: M::&[u8; 5000000000] = [0; _];
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypesetBoundViolation,
+			DiagnosticCode::TypesetBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn an_inferred_length_is_the_literals() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func f() {
+					local s: heap::&[u8; _] = "abc";
+					local t: heap::&[u8; 3] = s;
+					local a: heap::&[u16; _] = [1, 2];
+					local b: heap::&[u16; 2] = a;
+					local z: heap::&[u8; 4] = [0; _];
+				}
+				func mismatch() {
+					local s: heap::&[u8; _] = "abc";
+					local t: heap::&[u8; 4] = s;
+				}
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn an_inferred_length_needs_an_array_to_learn_from() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func signature(a: heap::&[u8; _]) {}
+				func slice() { local z: heap::&[u8] = [0; _]; }
+				func neither() { local z: heap::&[u8; _] = [0; _]; }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InferInSignature,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TypeAnnotationRequired,
 		]);
 	}
 

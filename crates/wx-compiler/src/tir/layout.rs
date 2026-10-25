@@ -300,7 +300,8 @@ impl Solver {
 			| Type::Integer
 			| Type::Float
 			| Type::String
-			| Type::ArrayLiteral => return Err(SolverError::Poisoned),
+			| Type::ArrayLiteral
+			| Type::Value { .. } => return Err(SolverError::Poisoned),
 			Type::Never
 			| Type::Function { .. }
 			| Type::Memory { .. }

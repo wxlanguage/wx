@@ -19,7 +19,6 @@ use super::{ARRAY_TARGETS_NOTE, BodyContext, STRING_TARGETS_NOTE};
 use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind};
-use crate::tir::defs::{BindingKey, MemberKind};
 use crate::tir::signatures::InferPolicy;
 use crate::tir::types::{Type, TypeIndex};
 
@@ -162,24 +161,9 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
 	/// when the stdlib declares no `Memory`.
 	pub(super) fn memory_size(&mut self, memory: TypeIndex) -> TypeIndex {
-		let Some(memory_trait) = self.cx.defs.intrinsics.memory else {
+		let Some(projection) = self.cx.memory_size(memory) else {
 			return TypeIndex::ERROR;
 		};
-		let Some(size) = self.cx.strings.get("Size") else {
-			return TypeIndex::ERROR;
-		};
-		let Some(MemberKind::AssociatedType(assoc_type_index)) = self
-			.cx
-			.defs
-			.declared_trait_member(memory_trait, BindingKey::ty(size))
-		else {
-			return TypeIndex::ERROR;
-		};
-		let projection = self.cx.types.intern(Type::AssocTypeProjection {
-			trait_index: memory_trait,
-			assoc_type_index,
-			base: memory,
-		});
 		self.normalized(projection, self.scope.env)
 	}
 

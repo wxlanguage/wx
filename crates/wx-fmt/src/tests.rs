@@ -457,7 +457,8 @@ fn a_constant_parameter_and_arguments_keep_only_the_meaningful_const() {
 #[test]
 fn an_array_length_is_formatted_without_a_marker() {
 	let case = TestCase::new(
-		"func f(a: heap::&[u8; const N]) { local b = [0; const T::SIZE]; }\n",
+		"func f(a: heap::&[u8; const N]) { local b = [0; const T::SIZE]; \
+		 local c: heap::&[u8; const _] = [0; _]; }\n",
 	);
 	let output = format(
 		&case.ast,
@@ -473,6 +474,7 @@ fn an_array_length_is_formatted_without_a_marker() {
 		indoc! {"
             func f(a: heap::&[u8; N]) {
                 local b = [0; T::SIZE];
+                local c: heap::&[u8; _] = [0; _];
             }
         "}
 	);

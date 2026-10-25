@@ -14,14 +14,15 @@
 //! discriminants) is not an obligation: it is a body, checked by the body
 //! phase that follows this pass (`TypeContext::check_bodies`).
 
-use codespan_reporting::diagnostic::Diagnostic;
+use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::bounds::BoundArena;
 use super::defs::{AssocTypeIdx, TraitIdx};
 use super::format::TypeFormatter;
+use super::literals::Integer;
 use super::members::report_type_does_not_implement_trait;
-use super::signatures::TypeContext;
+use super::signatures::{TypeContext, TypeSetSignature};
 use super::solver::{
 	Definition, ImplMember, Solver, SolverError, SolverView, Verdict,
 };
@@ -95,6 +96,16 @@ pub(super) enum Obligation {
 		impl_kind: ImplKind,
 		reference: SourceSpan,
 	},
+	/// A constant written in a type fits its type `ty`, as written: an
+	/// array's length fits its memory's `Size`. An abstract type is any
+	/// member of the typesets its bounds name, so the value must fit every
+	/// one of them, and the type works with each.
+	CheckConstantFits {
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		bits: u64,
+		reference: SourceSpan,
+	},
 	/// `Projection::name` was written, and the projection's declared bounds do
 	/// not name `name`. Whether its *value* has such a member depends on impls,
 	/// which construction cannot read, so the type was lowered to `ERROR` and
@@ -128,6 +139,7 @@ impl TypeContext<'_, '_, '_> {
 				type_envs: &self.type_envs,
 			},
 			bounds: &self.bounds,
+			typesets: &self.typesets,
 			strings: self.strings,
 			diagnostics: self.diagnostics,
 		}
@@ -211,6 +223,7 @@ pub(super) struct ObligationChecker<'a> {
 	pub(super) solver: &'a mut Solver,
 	pub(super) view: SolverView<'a>,
 	pub(super) bounds: &'a BoundArena,
+	pub(super) typesets: &'a [TypeSetSignature],
 	pub(super) strings: &'a StringInterner,
 	pub(super) diagnostics: &'a mut Vec<Diagnostic<FileId>>,
 }
@@ -237,6 +250,7 @@ impl ObligationChecker<'_> {
 			| Obligation::CheckWellFormed { reference, .. }
 			| Obligation::CheckAssocValue { reference, .. }
 			| Obligation::CheckImplRequirements { reference, .. }
+			| Obligation::CheckConstantFits { reference, .. }
 			| Obligation::CheckProjectionMember { reference, .. } => reference,
 		};
 		// The obligation is the owning site: a normalization that diverged inside
@@ -361,6 +375,17 @@ impl ObligationChecker<'_> {
 					}
 				}
 			}
+			Obligation::CheckConstantFits {
+				assumption_context,
+				ty,
+				bits,
+				reference,
+			} => self.check_constant_fits(
+				assumption_context,
+				ty,
+				bits,
+				reference,
+			),
 			Obligation::CheckProjectionMember {
 				assumption_context,
 				projection,
@@ -373,5 +398,84 @@ impl ObligationChecker<'_> {
 				reference,
 			),
 		}
+	}
+}
+
+impl ObligationChecker<'_> {
+	/// `bits` fits `ty`: an integer type's range, or, for an abstract type,
+	/// the range of every member of every typeset its bounds name.
+	fn check_constant_fits(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		bits: u64,
+		reference: SourceSpan,
+	) -> Result<(), SolverError> {
+		let ty = self.solver.normalize_type_query(
+			&mut self.view,
+			assumption_context,
+			ty,
+		)?;
+		if let Some(integer) = Integer::from_type(ty) {
+			if integer.in_range(bits, false) {
+				return Ok(());
+			}
+			let message = format!(
+				"`{bits}` is out of range for `{}`",
+				self.type_formatter().display_type(ty)
+			);
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::IntegerLiteralOutOfRange.code())
+					.with_message(message)
+					.with_label(reference.primary_label()),
+			);
+			return Err(SolverError::Poisoned);
+		}
+		let clause_tables = self.view.clause_tables();
+		let typesets = clause_tables
+			.declared_traits(
+				self.view.types,
+				ty,
+				self.solver.state.recursion_budget,
+			)
+			.filter_map(|trait_index| {
+				self.view.defs.traits[usize::from(trait_index)].typeset
+			})
+			.collect::<Vec<_>>();
+		for typeset in typesets {
+			let misfit = self.typesets[usize::from(typeset)]
+				.members
+				.iter()
+				.find(|member| {
+					!Integer::from_type(member.inner)
+						.is_some_and(|integer| integer.in_range(bits, false))
+				});
+			let Some(member) = misfit else {
+				continue;
+			};
+			let def = &self.view.defs.typesets[usize::from(typeset)];
+			let typeset_name = self.strings.resolve(def.name.inner).unwrap();
+			let member_name = self.type_formatter().display_type(member.inner);
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypesetBoundViolation.code())
+					.with_message(format!(
+						"`{bits}` is not representable by every member of \
+						 typeset `{typeset_name}`"
+					))
+					.with_label(reference.primary_label().with_message(
+						format!("cannot be represented by `{member_name}`"),
+					))
+					.with_label(
+						Label::secondary(def.file_id, member.span)
+							.with_message(format!(
+								"`{member_name}` is a member here"
+							)),
+					),
+			);
+			return Err(SolverError::Poisoned);
+		}
+		Ok(())
 	}
 }
