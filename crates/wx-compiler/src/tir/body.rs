@@ -22,7 +22,7 @@
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, StructIdx};
-use super::obligations::Obligation;
+use super::obligations::TypeObligation;
 use super::types::{TypeIndex, TypeList};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
@@ -65,15 +65,14 @@ pub(super) enum ConstBody {
 	Missing,
 }
 
-/// A check a constant's body could not decide while it was built, because it
-/// needs a constant's value and not every body exists yet. Recorded beside the
-/// body and decided once every constant is built and every declaration is
-/// checked (`TypeContext::check_constant_bodies`). A function's or a global's
-/// body records none: every value is known by then.
+/// What a body requires of one of its own expressions, which needs a
+/// constant's value to decide: the counterpart of `TypeObligation`, whose
+/// subject is a type and which the solver decides. Building a body never reads
+/// a value, so it records these beside the body; a function's or a global's are
+/// decided as the body is finished, a constant's once every constant it reads
+/// is checked (`TypeContext::check_constant_bodies`).
 #[derive(Clone, Copy)]
-pub(super) enum DeferredCheck {
-	/// A requirement a written type recorded (`check_now`).
-	Obligation(Obligation),
+pub(super) enum ExprObligation {
 	/// `expr`'s type is `expected`; one of them holds a constant not
 	/// evaluated yet, as rustc's `ConstEquate`.
 	Equal { expr: ExprIdx, expected: TypeIndex },
@@ -87,6 +86,22 @@ pub(super) enum DeferredCheck {
 	/// A `match`'s exhaustiveness and unreachable arms: a pattern compares
 	/// with a constant's value.
 	Match(ExprIdx),
+}
+
+/// What building a body left undecided, beside the body: a function's or a
+/// global's are decided as the body is finished, a constant's are kept
+/// (`TypeContext::const_obligations`) until it is checked.
+#[derive(Default)]
+pub(super) struct Obligations {
+	/// What lowering the body's written types required.
+	pub(super) types: Vec<TypeObligation>,
+	pub(super) exprs: Vec<ExprObligation>,
+}
+
+impl Obligations {
+	pub(super) fn is_empty(&self) -> bool {
+		self.types.is_empty() && self.exprs.is_empty()
+	}
 }
 
 /// A run of `Body::extra`: the arguments of a call or a construction, in the
@@ -508,6 +523,7 @@ pub(super) enum PlaceKind {
 }
 
 /// One definition's checked expression tree.
+#[derive(Default)]
 pub(super) struct Body {
 	kinds: Vec<ExprKind>,
 	types: Vec<TypeIndex>,
@@ -529,44 +545,12 @@ pub(super) struct Body {
 	/// The string and array literals, in arena order (an inner one before the one
 	/// holding it): the static data lowering evaluates.
 	statics: Vec<ExprIdx>,
-	/// What building it left undecided; empty but for a constant's body
-	/// before `check_constant_bodies`.
-	deferred: Vec<DeferredCheck>,
-	root: ExprIdx,
 }
 
 impl Body {
+	/// The last node pushed: every child comes before its parent.
 	pub(super) fn root(&self) -> ExprIdx {
-		self.root
-	}
-
-	pub(super) fn has_deferred(&self) -> bool {
-		!self.deferred.is_empty()
-	}
-
-	/// Back into a builder, to decide what building it left undecided:
-	/// the inverse of `BodyBuilder::finish`.
-	pub(super) fn resume(self) -> (BodyBuilder, ExprIdx) {
-		let builder = BodyBuilder {
-			kinds: self.kinds,
-			types: self.types,
-			spans: self.spans,
-			extra: self.extra,
-			arg_order: self.arg_order,
-			scopes: self.scopes,
-			labels: self.labels,
-			locals: self.locals,
-			params: self.params,
-			places: self.places,
-			pat_kinds: self.pat_kinds,
-			pat_types: self.pat_types,
-			pat_spans: self.pat_spans,
-			pat_lists: self.pat_lists,
-			arms: self.arms,
-			statics: self.statics,
-			deferred: self.deferred,
-		};
-		(builder, self.root)
+		ExprIdx::new(u32::try_from(self.kinds.len() - 1).unwrap())
 	}
 
 	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
@@ -651,38 +635,7 @@ impl Body {
 	}
 }
 
-/// Builds a `Body`. The checker owns one while it walks a definition, and may
-/// rewrite a node's kind or type after pushing it (literal coercion).
-#[derive(Default)]
-pub(super) struct BodyBuilder {
-	kinds: Vec<ExprKind>,
-	types: Vec<TypeIndex>,
-	spans: Vec<TextSpan>,
-	extra: Vec<ExprIdx>,
-	arg_order: Vec<ParamIdx>,
-	scopes: Vec<Scope>,
-	labels: Vec<Label>,
-	locals: Vec<Local>,
-	params: Vec<Option<LocalIdx>>,
-	places: Vec<Place>,
-	pat_kinds: Vec<PatternKind>,
-	pat_types: Vec<TypeIndex>,
-	pat_spans: Vec<TextSpan>,
-	pat_lists: Vec<PatIdx>,
-	arms: Vec<Arm>,
-	statics: Vec<ExprIdx>,
-	deferred: Vec<DeferredCheck>,
-}
-
-impl BodyBuilder {
-	pub(super) fn defer(&mut self, check: DeferredCheck) {
-		self.deferred.push(check);
-	}
-
-	pub(super) fn take_deferred(&mut self) -> Vec<DeferredCheck> {
-		std::mem::take(&mut self.deferred)
-	}
-
+impl Body {
 	pub(super) fn push(
 		&mut self,
 		kind: ExprKind,
@@ -694,25 +647,6 @@ impl BodyBuilder {
 		self.types.push(ty);
 		self.spans.push(span);
 		index
-	}
-
-	/// The arguments pushed as `range`.
-	pub(super) fn args(&self, range: ExprRange) -> &[ExprIdx] {
-		&self.extra[range.start as usize..(range.start + range.len) as usize]
-	}
-
-	/// The position the element at `at`, in written order, gives.
-	pub(super) fn declared_index(
-		&self,
-		order: ElementOrder,
-		at: usize,
-	) -> ParamIdx {
-		match order {
-			ElementOrder::InOrder => ParamIdx::new(at as u32),
-			ElementOrder::Permuted { start } => {
-				self.arg_order[start as usize + at]
-			}
-		}
 	}
 
 	pub(super) fn push_args(
@@ -799,55 +733,6 @@ impl BodyBuilder {
 		ArmRange { start, len }
 	}
 
-	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
-		self.kinds[usize::from(expr)]
-	}
-
-	pub(super) fn ty(&self, expr: ExprIdx) -> TypeIndex {
-		self.types[usize::from(expr)]
-	}
-
-	pub(super) fn span(&self, expr: ExprIdx) -> TextSpan {
-		self.spans[usize::from(expr)]
-	}
-
-	pub(super) fn scope(&self, scope: ScopeIdx) -> &Scope {
-		&self.scopes[usize::from(scope)]
-	}
-
-	pub(super) fn label(&self, label: LabelIdx) -> &Label {
-		&self.labels[usize::from(label)]
-	}
-
-	pub(super) fn local(&self, local: LocalIdx) -> &Local {
-		&self.locals[usize::from(local)]
-	}
-
-	pub(super) fn place(&self, place: PlaceIdx) -> &Place {
-		&self.places[usize::from(place)]
-	}
-
-	pub(super) fn pattern(&self, pattern: PatIdx) -> PatternKind {
-		self.pat_kinds[usize::from(pattern)]
-	}
-
-	pub(super) fn pattern_ty(&self, pattern: PatIdx) -> TypeIndex {
-		self.pat_types[usize::from(pattern)]
-	}
-
-	pub(super) fn pattern_span(&self, pattern: PatIdx) -> TextSpan {
-		self.pat_spans[usize::from(pattern)]
-	}
-
-	pub(super) fn patterns(&self, range: PatternRange) -> &[PatIdx] {
-		&self.pat_lists
-			[range.start as usize..(range.start + range.len) as usize]
-	}
-
-	pub(super) fn arms(&self, range: ArmRange) -> &[Arm] {
-		&self.arms[range.start as usize..(range.start + range.len) as usize]
-	}
-
 	pub(super) fn set_kind(&mut self, expr: ExprIdx, kind: ExprKind) {
 		self.kinds[usize::from(expr)] = kind;
 	}
@@ -859,30 +744,6 @@ impl BodyBuilder {
 
 	pub(super) fn set_ty(&mut self, expr: ExprIdx, ty: TypeIndex) {
 		self.types[usize::from(expr)] = ty;
-	}
-
-	pub(super) fn finish(self, root: ExprIdx) -> Body {
-		debug_assert_eq!(usize::from(root) + 1, self.kinds.len());
-		Body {
-			kinds: self.kinds,
-			types: self.types,
-			spans: self.spans,
-			extra: self.extra,
-			arg_order: self.arg_order,
-			scopes: self.scopes,
-			labels: self.labels,
-			locals: self.locals,
-			params: self.params,
-			places: self.places,
-			pat_kinds: self.pat_kinds,
-			pat_types: self.pat_types,
-			pat_spans: self.pat_spans,
-			pat_lists: self.pat_lists,
-			arms: self.arms,
-			statics: self.statics,
-			deferred: self.deferred,
-			root,
-		}
 	}
 }
 

@@ -27,6 +27,7 @@ use crate::tir::defs::{
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::signatures::TypeContext;
+use crate::tir::solver::SolverError;
 use crate::tir::types::{
 	Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
 };
@@ -1158,9 +1159,21 @@ impl BodyContext<'_, '_, '_, '_> {
 				return None;
 			}
 			Err(error) => {
-				let site =
+				let reference =
 					SourceSpan::new(self.scope.file_id, self.body.span(value));
-				let _ = self.cx.report_solver_error::<()>(Err(error), site);
+				match error {
+					SolverError::Overflow => {
+						self.cx
+							.diagnostics
+							.push(self.cx.overflow_diagnostic(reference));
+					}
+					SolverError::Cycle(cycle) => {
+						self.cx
+							.diagnostics
+							.push(self.cx.cycle_diagnostic(&cycle, reference));
+					}
+					_ => {}
+				}
 				return None;
 			}
 		};

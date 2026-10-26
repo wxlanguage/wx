@@ -22,15 +22,15 @@ use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, Keyword, Spanned, StringInterner};
-use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::tir::defs::TypeAliasIdx;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::{FileId, Files};
 
-use super::body::{Body, BodyOwner, ConstBody};
+use super::body::{Body, BodyOwner, ConstBody, Obligations};
 use super::bounds::{
 	BindingRequirement, BoundArena, BoundClauses, BoundId, ClauseArena,
-	ClauseRange, SourceAssocBinding, SourceTraitBound, TraitClause,
+	ClauseRange, Equalities, SourceAssocBinding, SourceTraitBound, TraitClause,
 	push_trait_clause, report_duplicate_assoc_type_binding,
 	report_not_a_trait_bound, report_not_an_associated_type,
 };
@@ -46,7 +46,7 @@ use super::members::{
 	ApplicableMember, AssocTypeProjectionTarget, MemberLookup,
 	TraitMemberSelection, report_ambiguous_type_member,
 };
-use super::obligations::{BoundRequirements, Obligation};
+use super::obligations::{BoundRequirements, TypeObligation};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
 use super::resolutions::{NameResolutions, Referent};
@@ -298,9 +298,12 @@ impl TypeContext<'_, '_, '_> {
 		for entry in self.ast_nodes {
 			let range =
 				self.query_state[&entry.node.def_id()].obligations.clone();
-			self.check_now(
-				&obligations[range.start as usize..range.end as usize],
-			);
+			for obligation in
+				&obligations[range.start as usize..range.end as usize]
+			{
+				self.check_obligation(obligation)
+					.expect("every signature and every constant body exists");
+			}
 		}
 		self.obligations = obligations;
 	}
@@ -319,17 +322,25 @@ impl TypeContext<'_, '_, '_> {
 				| AstNodeRef::TraitImplConstant { const_index, .. }
 				| AstNodeRef::InherentImplConst { const_index, .. }
 				| AstNodeRef::EnumVariant { const_index, .. } => {
+					let reported = self.diagnostics.len();
 					self.build_const_body(const_index);
+					// A body built with an error is never checked or evaluated:
+					// its constant has no value, and what it reported is all
+					// there is to say.
+					if self.diagnostics[reported..].has_errors() {
+						self.solver.const_values[usize::from(const_index)] =
+							super::eval::ConstValueState::Poisoned;
+					}
 				}
 				_ => {}
 			}
 		}
 	}
 
-	/// Checks every constant once every body exists and every declaration is
-	/// checked: what building its body left undecided, its evaluation, and
-	/// the report of what it owns; an enum's discriminants. In definition
-	/// order, which is the order their diagnostics come out in.
+	/// Checks and evaluates every constant not yet read, and reports what each
+	/// owns; an enum's discriminants. A constant is checked when its value is
+	/// first asked for (`check_constant`), so this only visits the rest, in
+	/// definition order, which is the order their diagnostics come out in.
 	fn check_constant_bodies(&mut self) {
 		for entry in self.ast_nodes {
 			match entry.node {
@@ -338,11 +349,11 @@ impl TypeContext<'_, '_, '_> {
 				| AstNodeRef::TraitImplConstant { const_index, .. }
 				| AstNodeRef::InherentImplConst { const_index, .. }
 				| AstNodeRef::EnumVariant { const_index, .. } => {
-					// Evaluated first, while its body is in place: a deferred
-					// check may read its value.
-					let _ = self.const_value(const_index);
-					self.decide_deferred(const_index);
 					self.evaluate_constant(const_index);
+					// A body built with an error has no value, but what else
+					// it recorded is still decided and reported. Any other
+					// was decided when its constant was checked.
+					self.decide_obligations(const_index);
 				}
 				AstNodeRef::Enum { enum_index, .. } => {
 					self.check_discriminants(enum_index);
@@ -353,22 +364,24 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// Decides what building a constant's body left undecided.
-	fn decide_deferred(&mut self, const_index: ConstIdx) {
-		let slot = &mut self.const_bodies[usize::from(const_index)];
-		if !matches!(slot, ConstBody::Built(body) if body.has_deferred()) {
-			return;
-		}
-		let ConstBody::Built(body) =
-			std::mem::replace(slot, ConstBody::NotBuilt)
+	pub(super) fn decide_obligations(&mut self, const_index: ConstIdx) {
+		let Some(obligations) = self.const_obligations.remove(&const_index)
 		else {
-			unreachable!()
+			return;
+		};
+		let ConstBody::Built(body) = std::mem::replace(
+			&mut self.const_bodies[usize::from(const_index)],
+			ConstBody::NotBuilt,
+		) else {
+			unreachable!("a constant with obligations has a built body")
 		};
 		let scope = self.const_scope(const_index);
-		let body = BodyContext::decide_deferred(
+		let body = BodyContext::decide_obligations(
 			self,
 			scope,
 			BodyOwner::Const(const_index),
 			body,
+			obligations,
 		);
 		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
 	}
@@ -436,12 +449,17 @@ impl TypeContext<'_, '_, '_> {
 						env: TypeEnvIdx::ROOT,
 					};
 					let ty = self.global_value_type(global_index);
-					let body = BodyContext::new(
+					let owner = BodyOwner::Global(global_index);
+					let (body, obligations) =
+						BodyContext::new(self, scope, owner)
+							.check_body(value, ty);
+					let body = BodyContext::decide_obligations(
 						self,
 						scope,
-						BodyOwner::Global(global_index),
-					)
-					.check_body(value, ty);
+						owner,
+						body,
+						obligations,
+					);
 					self.global_bodies[usize::from(global_index)] = Some(body);
 				}
 				_ => {}
@@ -466,9 +484,16 @@ impl TypeContext<'_, '_, '_> {
 			namespace: entry.namespace,
 			env: self.functions[usize::from(function_index)].type_params,
 		};
-		let body =
-			BodyContext::new(self, scope, BodyOwner::Function(function_index))
-				.check_function(function_index, signature, block);
+		let owner = BodyOwner::Function(function_index);
+		let (body, obligations) = BodyContext::new(self, scope, owner)
+			.check_function(function_index, signature, block);
+		let body = BodyContext::decide_obligations(
+			self,
+			scope,
+			owner,
+			body,
+			obligations,
+		);
 		self.function_bodies[usize::from(function_index)] = Some(body);
 	}
 
@@ -663,17 +688,24 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Every written name resolved so far; see `resolutions.rs`.
 	pub(super) resolutions: &'ctx mut NameResolutions,
 	pub(super) strings: &'ctx mut StringInterner,
+	/// Owned by the caller, like the diagnostics: the solver's state outlives
+	/// no context and is not part of one, and it is reached through the
+	/// context only so that a query can re-enter body checking.
+	pub(super) solver: &'ctx mut Solver,
+
 	/// Source text, for literals whose value is read from their span.
 	pub(super) files: &'ctx Files,
 	pub(super) defs: &'ctx DefinitionRegistry,
+	/// Built before the signature sweep and never mutated by its queries.
+	pub(super) impl_dispatch: &'dispatch ImplDispatch,
 	/// The trait and method each overloadable operator dispatches through.
 	pub(super) operators: OperatorTraits,
-	ast_nodes: &'ast [AstEntry<'ast>],
+	pub(super) ast_nodes: &'ast [AstEntry<'ast>],
+
 	// The resolved data below is read across the sibling TIR modules.
 	query_state: FxHashMap<DefId, QueryEntry>,
 	/// In-progress queries, in call order.
 	pub(super) query_stack: Vec<QueryInfo>,
-	pub(super) solver: Solver,
 	pub(super) types: TypeInterner,
 	pub(super) bounds: BoundArena,
 	/// What each parameter and associated declaration assumes, flat
@@ -691,7 +723,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// right after `push_param_frame` created it, so the two arrays can
 	/// never drift in length.
 	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
-	type_aliases: Vec<TypeAliasSignature>,
+	pub(super) type_aliases: Vec<TypeAliasSignature>,
 	pub(super) traits: Vec<TraitSignature>,
 	pub(super) structs: Vec<StructSignature>,
 	pub(super) enums: Vec<EnumSignature>,
@@ -703,6 +735,9 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// anything evaluates (`build_constant_bodies`). A trait constant without
 	/// a default has none.
 	pub(super) const_bodies: Vec<ConstBody>,
+	/// What building a constant's body left undecided, until it is checked
+	/// (`check_constant`). A constant with nothing pending has no entry.
+	pub(super) const_obligations: FxHashMap<ConstIdx, Obligations>,
 	/// Each function's checked block, by `FunctionIdx`; `None` for one
 	/// without a block (a declaration, an import, a required trait method).
 	pub(super) function_bodies: Vec<Option<Body>>,
@@ -712,12 +747,10 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
 	/// Resolved, exportable targets keyed by decoded external name; filled by `sweep`.
-	pub exports: FxHashMap<SymbolU32, ExportedItem>,
-	/// Built before the signature sweep and never mutated by its queries.
-	pub(super) impl_dispatch: &'dispatch ImplDispatch,
+	pub(super) exports: FxHashMap<SymbolU32, ExportedItem>,
 	/// Every declaration's obligations, one contiguous run per declaration
 	/// (`QueryEntry::obligations`).
-	obligations: Vec<Obligation>,
+	pub(super) obligations: Vec<TypeObligation>,
 }
 
 impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
@@ -725,6 +758,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		resolutions: &'ctx mut NameResolutions,
 		strings: &'ctx mut StringInterner,
+		solver: &'ctx mut Solver,
 		files: &'ctx Files,
 		defs: &'ctx DefinitionRegistry,
 		ast_nodes: &'ast [AstEntry<'ast>],
@@ -765,7 +799,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			ast_nodes,
 			query_state,
 			query_stack: Vec::new(),
-			solver: Solver::new(defs.constants.len()),
+			solver,
 			types: TypeInterner::new(),
 			bounds: BoundArena::default(),
 			clauses: ClauseArena::default(),
@@ -834,6 +868,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.iter()
 				.map(|_| ConstBody::NotBuilt)
 				.collect(),
+			const_obligations: FxHashMap::default(),
 			function_bodies: defs.functions.iter().map(|_| None).collect(),
 			global_bodies: defs.globals.iter().map(|_| None).collect(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
@@ -863,7 +898,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// `type_param_bounds` field).
 	pub(super) fn resolve_generic_params(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
 		owner: TypeEnvOwner,
@@ -966,7 +1001,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				declared_bounds: occurrences.iter().map(|o| o.id).collect(),
 				clauses: BoundClauses {
 					traits,
-					equalities: None,
+					equalities: Equalities::Pending,
 				},
 			};
 		}
@@ -998,7 +1033,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				self.equality_clauses(subject, &ids, ast_param.name().inner);
 			let bounds = &mut self.param_bounds[usize::from(type_env)][index];
 			bounds.declared_bounds = ids;
-			bounds.clauses.equalities = Some(equalities);
+			bounds.clauses.equalities = Equalities::Final(equalities);
 		}
 
 		type_env
@@ -1120,7 +1155,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// retained here so matching can use the full target later.
 	fn resolve_impl_target(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		path: &ast::Path,
 		head: Option<Spanned<ImplTarget>>,
@@ -1309,7 +1344,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// resolution itself that differs once that signature is in hand.
 	fn resolve_function_signature(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
 		function_index: FunctionIdx,
@@ -1392,7 +1427,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// rule), a method's `self` included.
 	fn resolve_function_impls(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		function_index: FunctionIdx,
 		type_env: TypeEnvIdx,
@@ -1446,7 +1481,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			else {
 				continue;
 			};
-			obligations.push(Obligation::CheckAssocValue {
+			obligations.push(TypeObligation::CheckAssocValue {
 				member: ImplMember {
 					impl_index: function_impls.call_impl_index,
 					declaration,
@@ -1486,7 +1521,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// validates receiver position.
 	fn resolve_member_function_signature(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
 		function_index: FunctionIdx,
@@ -1555,7 +1590,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Resolve a constant's required annotation in its declaration scope.
 	fn resolve_constant_signature(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
 		const_index: ConstIdx,
@@ -1640,22 +1675,36 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					self.defs.enums[usize::from(enum_index)].variants.start;
 				let previous = (const_index != first)
 					.then(|| ConstIdx::new(u32::from(const_index) - 1));
-				let body = BodyContext::new(
+				let (body, obligations) = BodyContext::new(
 					self,
 					scope,
 					BodyOwner::Const(const_index),
 				)
 				.check_variant_value(item, previous, repr);
-				self.const_bodies[usize::from(const_index)] =
-					ConstBody::Built(body);
+				self.keep_const_body(const_index, body, obligations);
 				return;
 			}
 			_ => unreachable!("a constant's entry is a constant"),
 		};
 		let ty = self.constants[usize::from(const_index)].ty;
-		let body = BodyContext::new(self, scope, BodyOwner::Const(const_index))
-			.check_body(value, ty);
+		let (body, obligations) =
+			BodyContext::new(self, scope, BodyOwner::Const(const_index))
+				.check_body(value, ty);
+		self.keep_const_body(const_index, body, obligations);
+	}
+
+	/// Keeps a constant's built body, and what it left to decide until the
+	/// constants it reads are checked (`decide_obligations`).
+	fn keep_const_body(
+		&mut self,
+		const_index: ConstIdx,
+		body: Body,
+		obligations: Obligations,
+	) {
 		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
+		if !obligations.is_empty() {
+			self.const_obligations.insert(const_index, obligations);
+		}
 	}
 
 	/// Resolves and validates a `memory` declaration's `Size` and fills in
@@ -1664,7 +1713,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// resolve identically once their `size` type expression is in hand.
 	fn resolve_memory_signature(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
 		memory_index: MemoryIdx,
@@ -1752,7 +1801,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// it, an imported one's type is mandatory in the grammar.
 	fn resolve_global_signature(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		global_index: GlobalIdx,
 		name: Spanned<SymbolU32>,
@@ -1829,7 +1878,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 	fn compute_signature(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
 		ast_node: AstNodeRef<'_>,
@@ -2450,7 +2499,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						},
 					});
 				if !self.type_envs.param_types(scope).is_empty() {
-					obligations.push(Obligation::CheckImplRequirements {
+					obligations.push(TypeObligation::CheckImplRequirements {
 						impl_kind: ImplKind::Inherent(block_index),
 						reference: SourceSpan::new(file_id, target.span()),
 					});
@@ -2556,7 +2605,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						},
 					});
 				if !self.type_envs.param_types(scope).is_empty() {
-					obligations.push(Obligation::CheckImplRequirements {
+					obligations.push(TypeObligation::CheckImplRequirements {
 						impl_kind: ImplKind::Trait(block_index),
 						reference: SourceSpan::new(file_id, target.span()),
 					});
@@ -2577,7 +2626,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							.defs
 							.select_trait_member(block_index, declaration)
 						{
-							obligations.push(Obligation::CheckAssocValue {
+							obligations.push(TypeObligation::CheckAssocValue {
 								member: ImplMember {
 									impl_index: block_index,
 									declaration: index,
@@ -2754,7 +2803,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// A tag is an ordinary type with an additional Memory requirement.
 	fn resolve_memory_tag(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		segments: &[ast::PathSegment],
 		infer_policy: InferPolicy,
@@ -2776,7 +2825,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				segments.last().unwrap().ident.span.end,
 			),
 		);
-		let obligation = Obligation::CheckTraitMembership {
+		let obligation = TypeObligation::CheckTraitMembership {
 			assumption_context: scope.env,
 			subject: ty,
 			required,
@@ -2793,7 +2842,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// which `Type` variant they intern.
 	fn resolve_pointer_memory(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		memory: &Option<Box<[ast::PathSegment]>>,
 		span: TextSpan,
@@ -2822,7 +2871,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// argument is not supported yet: it is reported, and is `ERROR`.
 	pub(super) fn resolve_type_argument(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		arg: &ast::TypeArgument,
 		infer_policy: InferPolicy,
@@ -2840,7 +2889,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// A written type argument as `resolve_type_expression` lowers a type.
 	fn resolve_type_argument_expression(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		arg: &ast::TypeArgument,
 		infer_policy: InferPolicy,
@@ -2864,7 +2913,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// value must fit (`CheckConstantFits`), or `Infer` for `_`.
 	fn array_length(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		memory: TypeIndex,
 		length: &Spanned<ast::ConstArgument>,
@@ -2876,7 +2925,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// Without a `Memory` there is no `Size`, and its absence is
 				// reported where the memory is declared.
 				if let Some(size) = self.memory_size(memory) {
-					obligations.push(Obligation::CheckConstantFits {
+					obligations.push(TypeObligation::CheckConstantFits {
 						assumption_context: scope.env,
 						ty: size,
 						bits,
@@ -2917,7 +2966,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// of a type (`T::SIZE`) has arguments evaluation cannot substitute yet.
 	fn constant_length(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		memory: TypeIndex,
 		segments: &[ast::PathSegment],
@@ -2989,7 +3038,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			return TypeIndex::ERROR;
 		};
 		if let Some(size) = self.memory_size(memory) {
-			obligations.push(Obligation::CheckConstantType {
+			obligations.push(TypeObligation::CheckConstantType {
 				assumption_context: scope.env,
 				constant,
 				expected: size,
@@ -3038,7 +3087,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 	pub(super) fn resolve_type(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		type_expr: &Spanned<ast::TypeExpression>,
 		infer_policy: InferPolicy,
@@ -3050,7 +3099,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			infer_policy,
 		);
 		if ty != TypeIndex::ERROR {
-			obligations.push(Obligation::CheckWellFormed {
+			obligations.push(TypeObligation::CheckWellFormed {
 				assumption_context: scope.env,
 				ty,
 				reference: SourceSpan::new(scope.file_id, type_expr.span),
@@ -3067,7 +3116,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// declare is never selected, so it only gets the generic check.
 	fn resolve_assoc_value(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		impl_index: TraitImplIdx,
 		provider: AssocTypeIdx,
@@ -3102,7 +3151,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		);
 		// Lowering that failed has already reported; nothing to judge.
 		if ty != TypeIndex::ERROR {
-			obligations.push(Obligation::CheckAssocValue {
+			obligations.push(TypeObligation::CheckAssocValue {
 				member: ImplMember {
 					impl_index,
 					declaration,
@@ -3116,7 +3165,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Resolve both ordinary type paths and explicit memory tags.
 	pub(super) fn resolve_type_path(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		segments: &[ast::PathSegment],
 		infer_policy: InferPolicy,
@@ -3242,7 +3291,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// global or function. Anything else is reported as not a type.
 	pub(super) fn resolve_named_type(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		def_key: DefKey,
 		stopped: &ast::PathSegment,
@@ -3538,7 +3587,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// takes none.
 	pub(super) fn member_function_type_args(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		function: FunctionIdx,
 		parent_args: &[TypeIndex],
@@ -3593,7 +3642,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// wrong inside them too.
 	pub(super) fn report_assoc_type_args(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		segment: &ast::PathSegment,
 		assoc_type_index: AssocTypeIdx,
@@ -3623,7 +3672,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// member, but stored equality expressions retain symbolic projections.
 	fn resolve_type_expression(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		type_expr: &Spanned<ast::TypeExpression>,
 		infer_policy: InferPolicy,
@@ -4155,7 +4204,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 	fn resolve_subject_bounds(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		bound: Option<&Spanned<ast::BoundExpression>>,
 		location: BoundSubject,
@@ -4191,7 +4240,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let traits = self.trait_clauses(subject, &occurrences);
 		let provisional = BoundClauses {
 			traits,
-			equalities: None,
+			equalities: Equalities::Pending,
 		};
 		match location {
 			BoundSubject::Param { env, index } => {
@@ -4214,7 +4263,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			ids,
 			BoundClauses {
 				traits,
-				equalities: Some(equalities),
+				equalities: Equalities::Final(equalities),
 			},
 		)
 	}
@@ -4396,7 +4445,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// they name.
 	fn fill_source_bounds(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		subject: TypeIndex,
 		occurrences: &[BoundOccurrence<'_>],
@@ -4755,7 +4804,7 @@ pub(super) mod tests {
 		DefinitionRegistry, MemberOwner, Namespace, Scope, UseItemKind,
 	};
 	use crate::tir::impls::ImplTarget;
-	use crate::tir::solver::{NormalizationDepth, RewriteFacts, Verdict};
+	use crate::tir::solver::{NormalizationDepth, RewriteFlags, Verdict};
 	use crate::vfs;
 
 	/// `test_case!(case = "source")` / `test_case!(mut case = ..)` /
@@ -5744,7 +5793,7 @@ pub(super) mod tests {
 				// A written argument is held to its parameter's bounds.
 				(
 					"const B: u32 = Bounded::<Unit>(Unit());",
-					&[TraitBoundViolation, TypeMistmatch],
+					&[TypeMistmatch, TraitBoundViolation],
 				),
 				// So is one taken from the expected type: the construction
 				// proves its own instantiation, as the annotation does.
@@ -6243,8 +6292,10 @@ pub(super) mod tests {
 					clause.trait_index
 				);
 			}
-			let equalities =
-				case.context.clauses.equalities(clauses.equalities.unwrap());
+			let equalities = case
+				.context
+				.clauses
+				.equalities(clauses.equalities.resolved());
 			assert_eq!(equalities.len(), 1);
 			assert_eq!(equalities[0].projection, value);
 			assert_eq!(equalities[0].value, TypeIndex::I32);
@@ -6299,7 +6350,7 @@ pub(super) mod tests {
 			);
 			let equalities = tables
 				.clauses
-				.equalities(source.clauses.equalities.unwrap());
+				.equalities(source.clauses.equalities.resolved());
 			assert_eq!(equalities.len(), 1);
 			assert!(source.names(
 				types,
@@ -6371,7 +6422,7 @@ pub(super) mod tests {
 				let equalities = case
 					.context
 					.clauses
-					.equalities(clauses.equalities.unwrap());
+					.equalities(clauses.equalities.resolved());
 				assert!(
 					equalities
 						.iter()
@@ -6404,7 +6455,7 @@ pub(super) mod tests {
 						builder.param_bounds[usize::from(scope)][1].clauses;
 					builder.param_bounds[usize::from(scope)][1]
 						.clauses
-						.equalities = None;
+						.equalities = Equalities::Pending;
 					let (readiness, facts) = memberships(builder, scope);
 					assert_eq!(readiness, Readiness::Pending);
 					assert_eq!(facts[0].1, TraitIdx::new(0));
@@ -6472,7 +6523,7 @@ pub(super) mod tests {
 						.as_mut()
 						.unwrap()
 						.clauses
-						.equalities = None;
+						.equalities = Equalities::Pending;
 					let tables = builder.clause_tables();
 					let traits =
 						tables.declared_traits(&builder.types, item, 128);
@@ -6566,10 +6617,12 @@ pub(super) mod tests {
 		);
 		DiagnosticView::new("prescan/dispatch", &diagnostics, &graph.files)
 			.assert_none();
+		let mut solver = Solver::new(defs.constants.len());
 		check(&mut TypeContext::new(
 			&mut diagnostics,
 			&mut resolutions,
 			&mut graph.strings,
+			&mut solver,
 			&graph.files,
 			&defs,
 			&ast_nodes,
@@ -6673,6 +6726,7 @@ pub(super) mod tests {
 		impl_dispatch: ImplDispatch,
 		diagnostics: Vec<Diagnostic<FileId>>,
 		resolutions: NameResolutions,
+		solver: Solver,
 	}
 
 	impl<'g> TestInputs<'g> {
@@ -6702,6 +6756,7 @@ pub(super) mod tests {
 				&defs,
 				&ast_nodes,
 			);
+			let solver = Solver::new(defs.constants.len());
 			Self {
 				files,
 				strings,
@@ -6710,6 +6765,7 @@ pub(super) mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			}
 		}
 	}
@@ -6731,11 +6787,13 @@ pub(super) mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			} = inputs;
 			let mut context = TypeContext::new(
 				diagnostics,
 				resolutions,
 				strings,
+				solver,
 				files,
 				defs,
 				ast_nodes,
@@ -7121,7 +7179,7 @@ pub(super) mod tests {
 					scope,
 					ty,
 					NormalizationDepth::Deep,
-					RewriteFacts::ALL,
+					RewriteFlags::ALL,
 				)
 				.unwrap_or_else(|error| {
 					panic!("expected {ty:?} to normalize, got {error:?}")
@@ -7149,7 +7207,7 @@ pub(super) mod tests {
 				scope,
 				ty,
 				NormalizationDepth::Deep,
-				RewriteFacts::ALL,
+				RewriteFlags::ALL,
 			)
 		}
 
@@ -9371,7 +9429,7 @@ pub(super) mod tests {
 					scope,
 					written,
 					NormalizationDepth::Deep,
-					RewriteFacts::ALL
+					RewriteFlags::ALL
 				),
 				Err(SolverError::Poisoned)
 			));
@@ -9448,7 +9506,9 @@ pub(super) mod tests {
 			.keys()
 			.filter(|normalization| normalization.ty == projection)
 			.count();
-		assert_eq!(entries, 1);
+		// One per set of facts, not per scope: building the bodies reads
+		// equalities and definitions, the checks read values as well.
+		assert_eq!(entries, 2);
 	}
 
 	#[test]
@@ -9795,7 +9855,7 @@ pub(super) mod tests {
 						scope,
 						written,
 						NormalizationDepth::Deep,
-						RewriteFacts::ALL
+						RewriteFlags::ALL
 					),
 					Err(SolverError::Poisoned)
 				);
@@ -13024,7 +13084,7 @@ pub(super) mod tests {
 						TypeEnvIdx::ROOT,
 						projection,
 						NormalizationDepth::Deep,
-						RewriteFacts::ALL
+						RewriteFlags::ALL
 					),
 					Err(SolverError::Cycle(_))
 				));
@@ -13038,7 +13098,7 @@ pub(super) mod tests {
 						TypeEnvIdx::ROOT,
 						TypeIndex::I32,
 						NormalizationDepth::Deep,
-						RewriteFacts::ALL
+						RewriteFlags::ALL
 					),
 					Ok(TypeIndex::I32)
 				);
@@ -13826,7 +13886,7 @@ pub(super) mod tests {
 				scope,
 				written,
 				NormalizationDepth::Deep,
-				RewriteFacts::ALL
+				RewriteFlags::ALL
 			),
 			Err(SolverError::Poisoned)
 		));
@@ -14252,8 +14312,10 @@ pub(super) mod tests {
 	) -> Vec<Vec<TypeIndex>> {
 		let clauses = case.context.param_bounds[usize::from(env)][0].clauses;
 		let mut groups: Vec<(TypeIndex, Vec<TypeIndex>)> = Vec::new();
-		for clause in
-			case.context.clauses.equalities(clauses.equalities.unwrap())
+		for clause in case
+			.context
+			.clauses
+			.equalities(clauses.equalities.resolved())
 		{
 			match groups
 				.iter_mut()
@@ -14650,13 +14712,13 @@ pub(super) mod tests {
 					});
 				let clauses = builder.param_bounds[usize::from(env)][0].clauses;
 				builder.param_bounds[usize::from(env)][0].clauses.equalities =
-					None;
+					Equalities::Pending;
 				assert_eq!(
 					builder.normalize(
 						env,
 						projection,
 						NormalizationDepth::Deep,
-						RewriteFacts::ALL
+						RewriteFlags::ALL
 					),
 					Err(SolverError::Pending)
 				);
@@ -14666,7 +14728,7 @@ pub(super) mod tests {
 						env,
 						projection,
 						NormalizationDepth::Deep,
-						RewriteFacts::ALL
+						RewriteFlags::ALL
 					),
 					Ok(TypeIndex::I32)
 				);
@@ -15083,8 +15145,10 @@ pub(super) mod tests {
 			let clauses = case.context.param_bounds
 				[usize::from(assumption_context)][0]
 				.clauses;
-			let equalities =
-				case.context.clauses.equalities(clauses.equalities.unwrap());
+			let equalities = case
+				.context
+				.clauses
+				.equalities(clauses.equalities.resolved());
 			assert_eq!(equalities.len(), 1);
 			assert_eq!(equalities[0].projection, projection);
 			assert_eq!(equalities[0].value, stored);
@@ -15127,8 +15191,10 @@ pub(super) mod tests {
 			let clauses = case.context.param_bounds
 				[usize::from(assumption_context)][0]
 				.clauses;
-			let clause =
-				case.context.clauses.equalities(clauses.equalities.unwrap())[0];
+			let clause = case
+				.context
+				.clauses
+				.equalities(clauses.equalities.resolved())[0];
 			let (raw, source) = (clause.value, clause.source);
 			let Type::Struct { type_args, .. } =
 				case.context.types.resolve(raw)
@@ -15279,7 +15345,7 @@ pub(super) mod tests {
 			for source in sources {
 				for clause in tables
 					.clauses
-					.equalities(source.clauses.equalities.unwrap())
+					.equalities(source.clauses.equalities.resolved())
 				{
 					equalities.push((clause.value, source.context.unwrap()));
 				}
@@ -15761,7 +15827,7 @@ pub(super) mod tests {
 							assumption_context,
 							ty,
 							NormalizationDepth::Deep,
-							RewriteFacts::ALL
+							RewriteFlags::ALL
 						),
 						Ok(TypeIndex::UNIT)
 					);
@@ -16238,7 +16304,7 @@ pub(super) mod tests {
 							env,
 							written,
 							NormalizationDepth::Deep,
-							RewriteFacts::ALL
+							RewriteFlags::ALL
 						),
 						Ok(u)
 					);
@@ -16425,7 +16491,7 @@ pub(super) mod tests {
 						builder.param_bounds[usize::from(env)][0].clauses;
 					builder.param_bounds[usize::from(env)][0]
 						.clauses
-						.equalities = None;
+						.equalities = Equalities::Pending;
 					assert_eq!(
 						builder
 							.find_trait_impl_query(env, ty, TraitIdx::new(0))
@@ -16563,8 +16629,10 @@ pub(super) mod tests {
 			let clauses = case.context.param_bounds
 				[usize::from(signature.type_params)][0]
 				.clauses;
-			let clause =
-				case.context.clauses.equalities(clauses.equalities.unwrap())[0];
+			let clause = case
+				.context
+				.clauses
+				.equalities(clauses.equalities.resolved())[0];
 			let Type::Struct { type_args, .. } =
 				case.context.types.resolve(clause.value)
 			else {

@@ -34,12 +34,10 @@ use super::defs::{ConstIdx, EnumIdx, MemoryIdx};
 use super::layout::Primitive;
 use super::operators::Scalar;
 use super::signatures::TypeContext;
-use super::solver::{
-	NormalizationDepth, RewriteFacts, Solver, SolverFrame, SolverView,
-};
+use super::solver::{NormalizationDepth, RewriteFlags, Solver, SolverFrame};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{BinaryOp, UnaryOp};
-use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::index::index_newtype;
 
 index_newtype!(AllocIdx);
@@ -125,8 +123,13 @@ pub(super) enum Operation {
 #[derive(Clone, PartialEq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum ConstValueState {
-	Unevaluated,
-	/// Being evaluated; asking for it again closes a loop.
+	/// Its body is built but not checked: what building it recorded is not
+	/// decided. Asking for its value checks it first (`check_constant`), and a
+	/// body that reported an error is never evaluated.
+	Unchecked,
+	/// Checked without an error, and not evaluated yet.
+	Checked,
+	/// Being checked or evaluated; asking for it again closes a loop.
 	InProgress,
 	Evaluated(ConstValue),
 	/// Not evaluated at all: the evaluator holds no values of its type
@@ -138,21 +141,16 @@ pub(super) enum ConstValueState {
 	Poisoned,
 	/// No value; this constant owns the error and its check reports it.
 	Failed(EvalError),
-	/// No value; this constant owns the loop (its first member) and its check
-	/// reports it.
-	Cyclic(Box<[ConstIdx]>),
 }
 
 impl ConstValueState {
 	/// What a reader of the constant learns, once the state is final.
 	fn answer(&self) -> Option<Result<&[ConstScalar], Unevaluable>> {
 		match self {
-			Self::Unevaluated | Self::InProgress => None,
+			Self::Unchecked | Self::Checked | Self::InProgress => None,
 			Self::Evaluated(value) => Some(Ok(value)),
 			Self::NoValue => Some(Err(Unevaluable::NoValue)),
-			Self::Poisoned | Self::Failed(_) | Self::Cyclic(_) => {
-				Some(Err(Unevaluable::Silent))
-			}
+			Self::Poisoned | Self::Failed(_) => Some(Err(Unevaluable::Silent)),
 		}
 	}
 }
@@ -179,8 +177,6 @@ pub(super) enum Unevaluable {
 	NoValue,
 	/// Reported, or to be reported, by whoever owns it; the caller is silent.
 	Silent,
-	/// A loop still unwinding towards its owner.
-	Cycle(Box<[ConstIdx]>),
 }
 
 /// Why evaluating a node gave no value.
@@ -189,20 +185,24 @@ enum Halt {
 	Own(EvalError),
 	/// Reported, or to be reported, by whoever owns it.
 	Silent,
-	/// A loop still unwinding towards its owner.
-	Cycle(Box<[ConstIdx]>),
 }
 
 /// The checked body of a constant, as built.
-fn body_of<'a>(view: &SolverView<'a>, const_index: ConstIdx) -> &'a Body {
+fn body_of<'a>(
+	view: &'a TypeContext<'_, '_, '_>,
+	const_index: ConstIdx,
+) -> &'a Body {
 	match &view.const_bodies[usize::from(const_index)] {
-		ConstBody::Built(body) => body,
+		ConstBody::Built(body) => &body,
 		_ => unreachable!("an evaluated constant's body is built"),
 	}
 }
 
 /// The type scope a constant's body is checked in.
-fn body_env(view: &SolverView<'_>, const_index: ConstIdx) -> TypeEnvIdx {
+fn body_env(
+	view: &TypeContext<'_, '_, '_>,
+	const_index: ConstIdx,
+) -> TypeEnvIdx {
 	view.constants[usize::from(const_index)].env
 }
 
@@ -215,12 +215,46 @@ impl TypeContext<'_, '_, '_> {
 				ConstValueState::Failed(error) => {
 					self.report_eval_failure(const_index, error)
 				}
-				ConstValueState::Cyclic(cycle) => {
-					self.report_const_cycle(const_index, cycle)
-				}
 				_ => return,
 			};
 		self.diagnostics.push(diagnostic);
+	}
+
+	/// Checks a constant's body: decides what building it recorded, reading
+	/// the values of the constants those name, which are checked on demand the
+	/// same way. A body that reported an error, building or here, is never
+	/// evaluated: its constant is `Poisoned`, and so is every reader. Reading
+	/// the constant while it is checked closes a loop (`const_cycle`).
+	pub(super) fn check_constant(&mut self, const_index: ConstIdx) {
+		let at = usize::from(const_index);
+		debug_assert!(matches!(
+			self.solver.const_values[at],
+			ConstValueState::Unchecked
+		));
+		debug_assert!(self.solver.state.blocked_at.is_none());
+		self.solver.const_values[at] = ConstValueState::InProgress;
+		self.solver.state.frames.push(SolverFrame::Evaluation {
+			constant: const_index,
+			outer_budget: std::mem::replace(
+				&mut self.solver.state.recursion_budget,
+				self.solver.recursion_limit,
+			),
+		});
+		let reported = self.diagnostics.len();
+		self.decide_obligations(const_index);
+		let clean = !self.diagnostics[reported..].has_errors();
+		let Some(SolverFrame::Evaluation { outer_budget, .. }) =
+			self.solver.state.frames.pop()
+		else {
+			unreachable!("the check is the innermost frame once it is done")
+		};
+		self.solver.state.recursion_budget = outer_budget;
+		let state = if clean {
+			ConstValueState::Checked
+		} else {
+			ConstValueState::Poisoned
+		};
+		self.solver.set_const_state(const_index, state);
 	}
 
 	/// A constant's value as a pattern compares with it: the bits of its one
@@ -231,15 +265,6 @@ impl TypeContext<'_, '_, '_> {
 		const_index: ConstIdx,
 	) -> Result<Option<u64>, Unevaluable> {
 		self.const_value(const_index).map(value_bits)
-	}
-
-	/// The memoized value of a constant, evaluated by the solver.
-	pub(super) fn const_value(
-		&mut self,
-		const_index: ConstIdx,
-	) -> Result<&[ConstScalar], Unevaluable> {
-		let (solver, mut view) = self.solver_and_view();
-		solver.const_value(&mut view, const_index)
 	}
 
 	/// Reports each set of an enum's variants that share a value, once, on the
@@ -323,10 +348,9 @@ impl TypeContext<'_, '_, '_> {
 
 	fn report_const_cycle(
 		&self,
-		const_index: ConstIdx,
 		cycle: &[ConstIdx],
 	) -> Diagnostic<crate::vfs::FileId> {
-		let def = &self.defs.constants[usize::from(const_index)];
+		let def = &self.defs.constants[usize::from(cycle[0])];
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CyclicConstant.code())
 			.with_message(format!(
@@ -354,95 +378,17 @@ impl TypeContext<'_, '_, '_> {
 }
 
 impl Solver {
-	/// The memoized value of a constant, evaluated on first use. The
-	/// evaluation is a frame on the solver's own stack, with a budget of its
-	/// own, as an impl member's judgement is: reaching the constant again
-	/// while it is evaluated closes a loop, read from that stack. Its body
-	/// must be built.
-	pub(super) fn const_value(
+	/// Records the final state of a constant, unless a loop through it
+	/// already poisoned it while it was checked or evaluated.
+	fn set_const_state(
 		&mut self,
-		view: &mut SolverView<'_>,
 		const_index: ConstIdx,
-	) -> Result<&[ConstScalar], Unevaluable> {
-		match self.const_values[usize::from(const_index)] {
-			ConstValueState::Unevaluated => {}
-			ConstValueState::InProgress => {
-				return Err(Unevaluable::Cycle(self.const_cycle(const_index)));
-			}
-			_ => {
-				return self.const_values[usize::from(const_index)]
-					.answer()
-					.expect("a state past evaluation is final");
-			}
+		state: ConstValueState,
+	) {
+		let slot = &mut self.const_values[usize::from(const_index)];
+		if !matches!(slot, ConstValueState::Poisoned) {
+			*slot = state;
 		}
-		let root = match &view.const_bodies[usize::from(const_index)] {
-			ConstBody::Built(body) => body.root(),
-			// A required trait constant, with no initializer at all.
-			ConstBody::Missing => {
-				return self
-					.settle_constant(const_index, ConstValueState::NoValue);
-			}
-			ConstBody::NotBuilt => {
-				unreachable!("every constant body is built before it evaluates")
-			}
-		};
-		// In progress before its declared type is read: the type may name
-		// the constant itself (`const A: heap::&[u8; A]`).
-		self.const_values[usize::from(const_index)] =
-			ConstValueState::InProgress;
-		self.state.frames.push(SolverFrame::Evaluation {
-			constant: const_index,
-			outer_budget: std::mem::replace(
-				&mut self.state.recursion_budget,
-				self.recursion_limit,
-			),
-		});
-		let scalars = self.constant_scalars(view, const_index);
-		let mut stack = Vec::new();
-		let evaluated = match &scalars {
-			Ok(_) => self.eval(view, const_index, root, &mut stack),
-			Err(_) => Ok(()),
-		};
-		let Some(SolverFrame::Evaluation { outer_budget, .. }) =
-			self.state.frames.pop()
-		else {
-			unreachable!(
-				"the evaluation is the innermost frame once it is done"
-			)
-		};
-		self.state.recursion_budget = outer_budget;
-		let scalars = match scalars {
-			Ok(scalars) => scalars,
-			Err(state) => return self.settle_constant(const_index, state),
-		};
-
-		let state = match evaluated {
-			Ok(())
-				if stack
-					.iter()
-					.map(|value| value.scalar)
-					.eq(scalars.iter().copied()) =>
-			{
-				ConstValueState::Evaluated(stack.into_boxed_slice())
-			}
-			// A root of another type is `ERROR` once the checker reports it, so
-			// this is a value the checker accepted in another scalar.
-			Ok(()) => ConstValueState::Poisoned,
-			Err(Halt::Own(error)) => ConstValueState::Failed(error),
-			Err(Halt::Silent) => ConstValueState::Poisoned,
-			// The owner keeps the loop; its readers further out derive from it.
-			Err(Halt::Cycle(cycle)) if cycle[0] == const_index => {
-				ConstValueState::Cyclic(cycle)
-			}
-			// Still unwinding: the one answer that is not a function of the
-			// state, since the loop it carries belongs to another constant.
-			Err(Halt::Cycle(cycle)) => {
-				self.const_values[usize::from(const_index)] =
-					ConstValueState::Poisoned;
-				return Err(Unevaluable::Cycle(cycle));
-			}
-		};
-		self.settle_constant(const_index, state)
 	}
 
 	/// Records the final state of a constant and answers its reader with it.
@@ -451,7 +397,7 @@ impl Solver {
 		const_index: ConstIdx,
 		state: ConstValueState,
 	) -> Result<&[ConstScalar], Unevaluable> {
-		self.const_values[usize::from(const_index)] = state;
+		self.set_const_state(const_index, state);
 		self.const_values[usize::from(const_index)]
 			.answer()
 			.expect("a settled state is final")
@@ -484,12 +430,114 @@ impl Solver {
 		members.rotate_left(owner);
 		members.into_boxed_slice()
 	}
+}
+
+impl TypeContext<'_, '_, '_> {
+	/// The memoized value of a constant, evaluated on first use. The
+	/// evaluation is a frame on the solver's own stack, with a budget of its
+	/// own, as an impl member's judgement is: reaching the constant again
+	/// while it is evaluated closes a loop, read from that stack. Its body
+	/// must be built.
+	pub(super) fn const_value(
+		&mut self,
+		const_index: ConstIdx,
+	) -> Result<&[ConstScalar], Unevaluable> {
+		if matches!(
+			self.solver.const_values[usize::from(const_index)],
+			ConstValueState::Unchecked
+		) {
+			self.check_constant(const_index);
+		}
+		match self.solver.const_values[usize::from(const_index)] {
+			ConstValueState::Unchecked => {
+				unreachable!("a constant is checked before it is read")
+			}
+			ConstValueState::Checked => {}
+			ConstValueState::InProgress => {
+				// The loop is reported here, once, against its first-defined
+				// member. Its members are poisoned, so every later reader, and
+				// the members' own checks and evaluations, fail silently.
+				let cycle = self.solver.const_cycle(const_index);
+				let diagnostic = self.report_const_cycle(&cycle);
+				self.diagnostics.push(diagnostic);
+				for &member in &*cycle {
+					self.solver.const_values[usize::from(member)] =
+						ConstValueState::Poisoned;
+				}
+				return Err(Unevaluable::Silent);
+			}
+			_ => {
+				return self.solver.const_values[usize::from(const_index)]
+					.answer()
+					.expect("a state past evaluation is final");
+			}
+		}
+		let root = match &self.const_bodies[usize::from(const_index)] {
+			ConstBody::Built(body) => body.root(),
+			// A required trait constant, with no initializer at all.
+			ConstBody::Missing => {
+				return self
+					.solver
+					.settle_constant(const_index, ConstValueState::NoValue);
+			}
+			ConstBody::NotBuilt => {
+				unreachable!("every constant body is built before it evaluates")
+			}
+		};
+		// In progress before its declared type is read: the type may name
+		// the constant itself (`const A: heap::&[u8; A]`).
+		self.solver.const_values[usize::from(const_index)] =
+			ConstValueState::InProgress;
+		self.solver.state.frames.push(SolverFrame::Evaluation {
+			constant: const_index,
+			outer_budget: std::mem::replace(
+				&mut self.solver.state.recursion_budget,
+				self.solver.recursion_limit,
+			),
+		});
+		let scalars = self.constant_scalars(const_index);
+		let mut stack = Vec::new();
+		let evaluated = match &scalars {
+			Ok(_) => self.eval(const_index, root, &mut stack),
+			Err(_) => Ok(()),
+		};
+		let Some(SolverFrame::Evaluation { outer_budget, .. }) =
+			self.solver.state.frames.pop()
+		else {
+			unreachable!(
+				"the evaluation is the innermost frame once it is done"
+			)
+		};
+		self.solver.state.recursion_budget = outer_budget;
+		let scalars = match scalars {
+			Ok(scalars) => scalars,
+			Err(state) => {
+				return self.solver.settle_constant(const_index, state);
+			}
+		};
+
+		let state = match evaluated {
+			Ok(())
+				if stack
+					.iter()
+					.map(|value| value.scalar)
+					.eq(scalars.iter().copied()) =>
+			{
+				ConstValueState::Evaluated(stack.into_boxed_slice())
+			}
+			// A root of another type is `ERROR` once the checker reports it, so
+			// this is a value the checker accepted in another scalar.
+			Ok(()) => ConstValueState::Poisoned,
+			Err(Halt::Own(error)) => ConstValueState::Failed(error),
+			Err(Halt::Silent) => ConstValueState::Poisoned,
+		};
+		self.solver.settle_constant(const_index, state)
+	}
 
 	/// The values of a tuple's `elements`, evaluated in written order and
 	/// held in the positions `order` gives them.
 	fn eval_ordered(
 		&mut self,
-		view: &mut SolverView<'_>,
 		owner: ConstIdx,
 		elements: ExprRange,
 		order: ElementOrder,
@@ -497,19 +545,19 @@ impl Solver {
 	) -> Result<(), Halt> {
 		let ElementOrder::Permuted { .. } = order else {
 			for at in 0..elements.len() {
-				let arg = body_of(view, owner).args(elements)[at];
-				self.eval(view, owner, arg, stack)?;
+				let arg = body_of(self, owner).args(elements)[at];
+				self.eval(owner, arg, stack)?;
 			}
 			return Ok(());
 		};
 		let start = stack.len();
 		let mut declared = Vec::with_capacity(elements.len());
 		for at in 0..elements.len() {
-			let body = body_of(view, owner);
+			let body = body_of(self, owner);
 			let (arg, index) =
 				(body.args(elements)[at], body.declared_index(order, at));
 			let arg_start = stack.len();
-			self.eval(view, owner, arg, stack)?;
+			self.eval(owner, arg, stack)?;
 			declared.push((
 				usize::from(index),
 				arg_start - start..stack.len() - start,
@@ -528,12 +576,11 @@ impl Solver {
 	/// held while a constant it names is evaluated.
 	fn eval(
 		&mut self,
-		view: &mut SolverView<'_>,
 		owner: ConstIdx,
 		expr: ExprIdx,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let body = body_of(view, owner);
+		let body = body_of(self, owner);
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
 		if ty == TypeIndex::ERROR {
@@ -588,27 +635,27 @@ impl Solver {
 			// says everything.
 			ExprKind::Function { .. } | ExprKind::Global(_) => {}
 			ExprKind::String(contents) => {
-				self.eval_string(view, owner, contents, ty, span, stack)?;
+				self.eval_string(owner, contents, ty, span, stack)?;
 			}
 			// Each element's values, one after another, laid out as static
 			// data.
 			ExprKind::Array { elements } => {
 				let start = stack.len();
 				for at in 0..elements.len() {
-					let element = body_of(view, owner).args(elements)[at];
-					self.eval(view, owner, element, stack)?;
+					let element = body_of(self, owner).args(elements)[at];
+					self.eval(owner, element, stack)?;
 				}
 				let count = u64::try_from(elements.len()).unwrap();
-				self.place_static(view, owner, ty, span, count, start, stack)?;
+				self.place_static(owner, ty, span, count, start, stack)?;
 			}
 			// One element's values, laid out `count` times; `_` is the
 			// array's own length.
 			ExprKind::ArrayRepeat { value, count } => {
 				let start = stack.len();
-				self.eval(view, owner, value, stack)?;
+				self.eval(owner, value, stack)?;
 				let count = match count {
 					Some(count) => {
-						self.eval(view, owner, count, stack)?;
+						self.eval(owner, count, stack)?;
 						match stack.pop().expect("a count's value").val {
 							Val::I32(bits) => u64::from(bits),
 							Val::I64(bits) => bits,
@@ -620,20 +667,18 @@ impl Solver {
 					// As long as its array, whose length may name a constant.
 					None => {
 						let Type::Array { length, .. } =
-							*view.types.resolve(ty)
+							*self.types.resolve(ty)
 						else {
 							unreachable!("`_` is the length of an array")
 						};
-						match *view.types.resolve(length) {
+						match *self.types.resolve(length) {
 							Type::Value { bits } => bits,
 							Type::Const {
 								constant,
 								type_args,
-							} if view.types.list(type_args).is_empty() => {
+							} if self.types.list(type_args).is_empty() => {
 								let start = stack.len();
-								self.read_constant(
-									view, constant, span, stack,
-								)?;
+								self.read_constant(constant, span, stack)?;
 								// One of another type was reported where the
 								// length names it.
 								let length = value_bits(&stack[start..]);
@@ -644,12 +689,12 @@ impl Solver {
 						}
 					}
 				};
-				self.place_static(view, owner, ty, span, count, start, stack)?;
+				self.place_static(owner, ty, span, count, start, stack)?;
 			}
 			// A cast to the value's own type changes nothing; a literal cast
 			// has the target as its type.
 			ExprKind::Cast { value } if body.ty(value) == ty => {
-				self.eval(view, owner, value, stack)?;
+				self.eval(owner, value, stack)?;
 			}
 			// Making an address from an integer, or reading the bits of one,
 			// is not evaluated (yet).
@@ -662,13 +707,13 @@ impl Solver {
 				constant,
 				type_args,
 			} if type_args.is_empty() => {
-				self.read_constant(view, constant, span, stack)?;
+				self.read_constant(constant, span, stack)?;
 			}
 			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
 				return Err(own(EvalErrorKind::NotConst));
 			}
 			ExprKind::NextDiscriminant(previous) => {
-				self.read_constant(view, previous, span, stack)?;
+				self.read_constant(previous, span, stack)?;
 				let previous = stack.pop().expect("a variant's value");
 				let one = literal(1, false, previous.scalar)
 					.expect("an enum's repr holds one");
@@ -689,22 +734,22 @@ impl Solver {
 				);
 			}
 			ExprKind::PrimitiveUnary { op, operand } => {
-				self.eval(view, owner, operand, stack)?;
+				self.eval(owner, operand, stack)?;
 				let operand = stack.pop().expect("an operand's value");
 				stack.push(unary(op, operand).map_err(own)?);
 			}
 			// Its values are its elements', in declared order, as its type's
 			// layout is.
 			ExprKind::Tuple { elements, order } => {
-				self.eval_ordered(view, owner, elements, order, stack)?;
+				self.eval_ordered(owner, elements, order, stack)?;
 			}
 			// Its fields' value; one missing was reported, which makes it
 			// `ERROR`.
 			ExprKind::StructConstructor { fields, .. } => {
-				self.eval(view, owner, fields, stack)?;
+				self.eval(owner, fields, stack)?;
 			}
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
-				self.eval(view, owner, lhs, stack)?;
+				self.eval(owner, lhs, stack)?;
 				// `&&` and `||` do not evaluate a right side they do not need;
 				// otherwise the right side is the answer.
 				if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -713,9 +758,9 @@ impl Solver {
 						return Ok(());
 					}
 					stack.pop();
-					return self.eval(view, owner, rhs, stack);
+					return self.eval(owner, rhs, stack);
 				}
-				self.eval(view, owner, rhs, stack)?;
+				self.eval(owner, rhs, stack)?;
 				let rhs = stack.pop().expect("an operand's value");
 				let lhs = stack.pop().expect("an operand's value");
 				stack.push(binary(op, lhs, rhs).map_err(own)?);
@@ -727,16 +772,15 @@ impl Solver {
 	/// A string literal's value: its contents, placed as static data.
 	fn eval_string(
 		&mut self,
-		view: &mut SolverView<'_>,
 		owner: ConstIdx,
 		contents: SymbolU32,
 		ty: TypeIndex,
 		span: TextSpan,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let (memory, width) = self.static_memory(view, owner, ty, span)?;
+		let (memory, width) = self.static_memory(owner, ty, span)?;
 		let bytes: Box<[u8]> =
-			view.strings.resolve(contents).unwrap().as_bytes().into();
+			self.strings.resolve(contents).unwrap().as_bytes().into();
 		let len = bytes.len() as u64;
 		let allocation = Allocation {
 			memory,
@@ -744,7 +788,7 @@ impl Solver {
 			bytes,
 			relocations: Box::default(),
 		};
-		self.push_static(view, allocation, width, ty, len, stack);
+		self.push_static(allocation, width, ty, len, stack);
 		Ok(())
 	}
 
@@ -756,7 +800,6 @@ impl Solver {
 	#[allow(clippy::too_many_arguments)]
 	fn place_static(
 		&mut self,
-		view: &mut SolverView<'_>,
 		owner: ConstIdx,
 		ty: TypeIndex,
 		span: TextSpan,
@@ -764,16 +807,16 @@ impl Solver {
 		start: usize,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let (memory, width) = self.static_memory(view, owner, ty, span)?;
+		let (memory, width) = self.static_memory(owner, ty, span)?;
 		let (Type::Slice { of, .. } | Type::Array { of, .. }) =
-			*view.types.resolve(ty)
+			*self.types.resolve(ty)
 		else {
 			unreachable!("static data is an array or a slice")
 		};
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
 		let (layout, places) =
-			match self.memory_values(view, body_env(view, owner), of) {
+			match self.memory_values(body_env(self, owner), of) {
 				Ok(Some(layout)) => layout,
 				Ok(None) => {
 					return Err(Halt::Own(EvalError {
@@ -818,7 +861,7 @@ impl Solver {
 			bytes: bytes.into_boxed_slice(),
 			relocations: relocations.into_boxed_slice(),
 		};
-		self.push_static(view, allocation, width, ty, count, stack);
+		self.push_static(allocation, width, ty, count, stack);
 		Ok(())
 	}
 
@@ -827,18 +870,17 @@ impl Solver {
 	/// known yet there is nowhere to place it.
 	fn static_memory(
 		&mut self,
-		view: &mut SolverView<'_>,
 		owner: ConstIdx,
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Scalar), Halt> {
-		let scope = body_env(view, owner);
+		let scope = body_env(self, owner);
 		let (Type::Slice { memory, .. } | Type::Array { memory, .. }) =
-			*view.types.resolve(ty)
+			*self.types.resolve(ty)
 		else {
 			unreachable!("static data is an array or a slice")
 		};
-		let Some(memory_index) = self.memory_of(view, scope, memory) else {
+		let Some(memory_index) = self.memory_of(scope, memory) else {
 			return Err(Halt::Own(EvalError {
 				span,
 				kind: EvalErrorKind::NotConst,
@@ -846,7 +888,7 @@ impl Solver {
 		};
 		// The memory is known, so its `Size` is: a failure was reported.
 		let width = self
-			.address_scalar(view, scope, memory)
+			.address_scalar(scope, memory)
 			.map_err(|_| Halt::Silent)?;
 		Ok((memory_index, width))
 	}
@@ -855,21 +897,21 @@ impl Solver {
 	/// slice (`ty`).
 	fn push_static(
 		&mut self,
-		view: &mut SolverView<'_>,
 		allocation: Allocation,
 		width: Scalar,
 		ty: TypeIndex,
 		len: u64,
 		stack: &mut Vec<ConstScalar>,
 	) {
-		let alloc =
-			AllocIdx::new(u32::try_from(self.allocations.len()).unwrap());
-		self.allocations.push(allocation);
+		let alloc = AllocIdx::new(
+			u32::try_from(self.solver.allocations.len()).unwrap(),
+		);
+		self.solver.allocations.push(allocation);
 		stack.push(ConstScalar {
 			val: Val::MemoryOffset { alloc, offset: 0 },
 			scalar: width,
 		});
-		if let Type::Slice { .. } = view.types.resolve(ty) {
+		if let Type::Slice { .. } = self.types.resolve(ty) {
 			stack.push(match width {
 				Scalar::U32 => ConstScalar::u32(u32::try_from(len).unwrap()),
 				Scalar::U64 => ConstScalar::u64(len),
@@ -883,12 +925,11 @@ impl Solver {
 	/// expression.
 	fn read_constant(
 		&mut self,
-		view: &mut SolverView<'_>,
 		const_index: ConstIdx,
 		span: TextSpan,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		match self.const_value(view, const_index) {
+		match self.const_value(const_index) {
 			Ok(value) => {
 				stack.extend_from_slice(value);
 				Ok(())
@@ -898,7 +939,6 @@ impl Solver {
 				kind: EvalErrorKind::NotConst,
 			})),
 			Err(Unevaluable::Silent) => Err(Halt::Silent),
-			Err(Unevaluable::Cycle(cycle)) => Err(Halt::Cycle(cycle)),
 		}
 	}
 
@@ -907,13 +947,12 @@ impl Solver {
 	/// holds no values of.
 	fn constant_scalars(
 		&mut self,
-		view: &mut SolverView<'_>,
 		const_index: ConstIdx,
 	) -> Result<Vec<Scalar>, ConstValueState> {
-		let signature = &view.constants[usize::from(const_index)];
+		let signature = &self.constants[usize::from(const_index)];
 		let (ty, scope) = (signature.ty, signature.env);
 		let mut scalars = Vec::new();
-		self.push_scalars(view, scope, ty, &mut scalars, &mut Vec::new())?;
+		self.push_scalars(scope, ty, &mut scalars, &mut Vec::new())?;
 		Ok(scalars)
 	}
 
@@ -929,20 +968,13 @@ impl Solver {
 	/// instantiated, contains itself, which is reported on the struct.
 	fn push_scalars(
 		&mut self,
-		view: &mut SolverView<'_>,
 		scope: TypeEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<Scalar>,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<(), ConstValueState> {
 		let ty = self
-			.normalize(
-				view,
-				scope,
-				ty,
-				NormalizationDepth::Deep,
-				RewriteFacts::ALL,
-			)
+			.normalize(scope, ty, NormalizationDepth::Deep, RewriteFlags::ALL)
 			.unwrap_or(ty);
 		if ty == TypeIndex::ERROR {
 			return Err(ConstValueState::Poisoned);
@@ -951,30 +983,30 @@ impl Solver {
 			out.push(scalar);
 			return Ok(());
 		}
-		match *view.types.resolve(ty) {
+		match *self.types.resolve(ty) {
 			Type::Function { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. } => Ok(()),
 			Type::Enum { enum_index } => {
-				let repr = view.enums[usize::from(enum_index)].repr;
-				self.push_scalars(view, scope, repr, out, visiting)
+				let repr = self.enums[usize::from(enum_index)].repr;
+				self.push_scalars(scope, repr, out, visiting)
 			}
 			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
-				out.push(self.address_scalar(view, scope, memory)?);
+				out.push(self.address_scalar(scope, memory)?);
 				Ok(())
 			}
 			Type::Slice { memory, .. } => {
-				let scalar = self.address_scalar(view, scope, memory)?;
+				let scalar = self.address_scalar(scope, memory)?;
 				out.extend([scalar, scalar]);
 				Ok(())
 			}
 			Type::Tuple { elements } => {
 				let mut held = Ok(());
-				for at in 0..view.types.list(elements).len() {
-					let element = view.types.list(elements)[at];
+				for at in 0..self.types.list(elements).len() {
+					let element = self.types.list(elements)[at];
 					held = merge(
 						held,
-						self.push_scalars(view, scope, element, out, visiting),
+						self.push_scalars(scope, element, out, visiting),
 					);
 					if held == Err(ConstValueState::Poisoned) {
 						break;
@@ -987,31 +1019,31 @@ impl Solver {
 				type_args,
 			} => {
 				if visiting.contains(&ty)
-					|| visiting.len() > self.state.recursion_budget
+					|| visiting.len() > self.solver.state.recursion_budget
 				{
 					return Err(ConstValueState::Poisoned);
 				}
-				let env = view.structs[usize::from(struct_index)].type_params;
+				let env = self.structs[usize::from(struct_index)].type_params;
 				visiting.push(ty);
-				let args: Box<[TypeIndex]> = view.types.list(type_args).into();
+				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 				let mut held = Ok(());
 				let count =
-					view.structs[usize::from(struct_index)].field_types.len();
+					self.structs[usize::from(struct_index)].field_types.len();
 				for at in 0..count {
 					let fields =
-						view.structs[usize::from(struct_index)].field_types;
-					let field = view.types.list(fields)[at];
-					let field = view.types.substitute(
+						self.structs[usize::from(struct_index)].field_types;
+					let field = self.types.list(fields)[at];
+					let field = self.types.substitute(
 						field,
 						Substitution {
-							envs: view.type_envs,
+							envs: &self.type_envs,
 							env,
 							args: &args,
 						},
 					);
 					held = merge(
 						held,
-						self.push_scalars(view, scope, field, out, visiting),
+						self.push_scalars(scope, field, out, visiting),
 					);
 					if held == Err(ConstValueState::Poisoned) {
 						break;
@@ -1028,27 +1060,20 @@ impl Solver {
 	/// for an address into a memory not known yet.
 	fn address_scalar(
 		&mut self,
-		view: &mut SolverView<'_>,
 		scope: TypeEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Scalar, ConstValueState> {
-		let Some(memory_index) = self.memory_of(view, scope, memory) else {
+		let Some(memory_index) = self.memory_of(scope, memory) else {
 			return Err(ConstValueState::NoValue);
 		};
 		let size =
-			view.defs.memories[usize::from(memory_index)].size_assoc_type_index;
-		let size = view.assoc_types[usize::from(size)]
+			self.defs.memories[usize::from(memory_index)].size_assoc_type_index;
+		let size = self.assoc_types[usize::from(size)]
 			.as_ref()
 			.and_then(|signature| signature.value)
 			.ok_or(ConstValueState::Poisoned)?;
 		let size = self
-			.normalize(
-				view,
-				scope,
-				size,
-				NormalizationDepth::Deep,
-				RewriteFacts::ALL,
-			)
+			.normalize(scope, size, NormalizationDepth::Deep, RewriteFlags::ALL)
 			.unwrap_or(size);
 		Scalar::from_type(size).ok_or(ConstValueState::Poisoned)
 	}
@@ -1056,20 +1081,18 @@ impl Solver {
 	/// The memory `memory` names in `scope`, if it is a known one.
 	fn memory_of(
 		&mut self,
-		view: &mut SolverView<'_>,
 		scope: TypeEnvIdx,
 		memory: TypeIndex,
 	) -> Option<MemoryIdx> {
 		let memory = self
 			.normalize(
-				view,
 				scope,
 				memory,
 				NormalizationDepth::Deep,
-				RewriteFacts::ALL,
+				RewriteFlags::ALL,
 			)
 			.unwrap_or(memory);
-		match *view.types.resolve(memory) {
+		match *self.types.resolve(memory) {
 			Type::Memory { memory_index } => Some(memory_index),
 			_ => None,
 		}
@@ -1787,6 +1810,7 @@ mod tests {
 		impl_dispatch: ImplDispatch,
 		diagnostics: Vec<Diagnostic<FileId>>,
 		resolutions: NameResolutions,
+		solver: Solver,
 	}
 
 	impl<'g> TestInputs<'g> {
@@ -1816,6 +1840,7 @@ mod tests {
 				&defs,
 				&ast_nodes,
 			);
+			let solver = Solver::new(defs.constants.len());
 			Self {
 				files,
 				strings,
@@ -1824,6 +1849,7 @@ mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			}
 		}
 	}
@@ -1844,11 +1870,13 @@ mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			} = inputs;
 			let mut context = TypeContext::new(
 				diagnostics,
 				resolutions,
 				strings,
+				solver,
 				files,
 				defs,
 				ast_nodes,

@@ -14,8 +14,8 @@ use super::{BodyContext, ScopeType};
 use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{
-	self, Body, ExprIdx, ExprKind, LabelIdx, LocalIdx, Scope, ScopeIdx,
-	ScopeKind,
+	self, Body, ExprIdx, ExprKind, ExprObligation, LabelIdx, LocalIdx,
+	Obligations, Scope, ScopeIdx, ScopeKind,
 };
 use crate::tir::defs::{FunctionIdx, Tier};
 use crate::tir::resolutions::Referent;
@@ -32,7 +32,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		function_index: FunctionIdx,
 		signature: &ast::FunctionSignature,
 		block: &Spanned<ast::Expression>,
-	) -> Body {
+	) -> (Body, Obligations) {
 		let env = self.scope.env;
 		let function = &self.cx.functions[usize::from(function_index)];
 		let (param_types, return_type) =
@@ -55,12 +55,12 @@ impl BodyContext<'_, '_, '_, '_> {
 			};
 			self.body.push_param(local);
 		}
-		let root = self.build_block_in(
+		self.build_block_in(
 			ScopeIdx::ROOT,
 			block.inner.as_block_statements(),
 			block.span,
 		);
-		self.body.finish(root)
+		(self.body, self.obligations)
 	}
 
 	/// Enters a new scope inside the current one; `leave_scope` returns to
@@ -255,14 +255,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let declared = ty.map(|ty| {
-			let mut obligations = Vec::new();
 			let ty = self.cx.resolve_type(
-				&mut obligations,
+				&mut self.obligations.types,
 				self.scope,
 				ty,
 				InferPolicy::Allow,
 			);
-			self.check_now(&obligations);
 			self.normalized(ty, self.scope.env)
 		});
 		let value = match declared {
@@ -349,7 +347,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		let expr =
 			self.body
 				.push(ExprKind::Match { scrutinee, arms }, ty, span);
-		self.check_match_usefulness(expr);
+		// An arm may compare with a constant, whose value is not known yet.
+		self.obligations.exprs.push(ExprObligation::Match(expr));
 		expr
 	}
 

@@ -353,6 +353,7 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
+	use crate::tir::solver::Solver;
 	use crate::tir::types::TypeEnvIdx;
 	use crate::vfs;
 
@@ -414,10 +415,12 @@ mod tests {
 				&defs,
 				&ast_nodes,
 			);
+			let mut solver = Solver::new(defs.constants.len());
 			let mut signatures = TypeContext::new(
 				&mut diagnostics,
 				&mut resolutions,
 				&mut graph.strings,
+				&mut solver,
 				&graph.files,
 				&defs,
 				&ast_nodes,

@@ -322,7 +322,7 @@ A flag on `BodyContext`; `BodyOwner::Const` already says which bodies it is.
   `InProgress`, so it is a cycle.
 - The constant owns it: `evaluate_constant` reports it in phase 4 (E2109).
 - The obligation that met it (a phase-3 `CheckWellFormed`) stays silent:
-  `report_solver_error` skips a cycle a constant owns.
+  a cycle a constant owns is reported where the constant is defined.
 - Evaluation normalizes body types through the solver, in place.
 
 ### 7. Watch items
@@ -369,7 +369,7 @@ Where the code differs from the plan above:
 
 - **A fact on `BodyContext`, not `Pending`.** (Revised later the same day; the
   first version let a failed read trigger deferral.) Normalization takes a
-  `RewriteFacts` flag set (`EQUALITIES`, `DEFINITIONS`, `VALUES`), part of a
+  `RewriteFlags` flag set (`EQUALITIES`, `DEFINITIONS`, `VALUES`), part of a
   request's cache key. A constant's body normalizes without `VALUES`, so a
   `Const` stays as written and the trigger is syntactic: a comparison or a
   literal's length that still holds a `Const` (`has_const`) is recorded, every
@@ -391,8 +391,7 @@ Where the code differs from the plan above:
   E2057: the block is not evaluated, so no loop is ever closed. It becomes
   E2109 once blocks with locals are evaluated.
 - A loop is reported by the constant (E2109) alone; the obligation that met it
-  sees `Poisoned` (`normalize_const` maps a cycle to it) and is silent, so
-  `report_solver_error` needed no change.
+  sees `Poisoned` (`normalize_const` maps a cycle to it) and is silent.
 
 Still open from the map: section 7's `layout.rs` handling of a `Const`
 length, and option 2 of section 3 if keeping whole written types gets bad.

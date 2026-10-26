@@ -1,6 +1,6 @@
 //! Requirements a declaration's signature states, and the contexts that solve
 //! them. Construction lowers written syntax and never checks a bound; a site
-//! that needs one registers an `Obligation` with the signature being built,
+//! that needs one registers an `TypeObligation` with the signature being built,
 //! and the declaration keeps them. Checking the declaration, once every
 //! signature exists, checks them. A check never changes a stored signature: a
 //! failure is diagnosed and nothing is rewritten.
@@ -19,17 +19,14 @@ use string_interner::symbol::SymbolU32;
 
 use super::bounds::BoundArena;
 use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx};
-use super::format::TypeFormatter;
 use super::literals::Integer;
 use super::members::report_type_does_not_implement_trait;
 use super::signatures::{ConstantSignature, TypeContext, TypeSetSignature};
 use super::solver::{
-	Definition, ImplMember, NormalizationDepth, RewriteFacts, Solver,
-	SolverError, SolverView, Verdict,
+	Definition, ImplMember, NormalizationDepth, ProjectionCycle, RewriteFlags,
+	Solver, SolverError, Verdict,
 };
-use super::types::{
-	ImplKind, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner, TypeList,
-};
+use super::types::{ImplKind, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList};
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
@@ -55,28 +52,8 @@ pub(super) enum BoundRequirements {
 	},
 }
 
-impl BoundRequirements {
-	fn reads_values(&self, types: &TypeInterner) -> bool {
-		match *self {
-			Self::Parameter { arguments, .. } => types
-				.list(arguments)
-				.iter()
-				.any(|&argument| may_reach_value(types, argument)),
-			Self::AssociatedType { receiver, .. } => {
-				may_reach_value(types, receiver)
-			}
-		}
-	}
-}
-
-/// Whether normalizing `ty` can read a constant's value: a constant is in
-/// it, or a projection that reduces to one.
-fn may_reach_value(types: &TypeInterner, ty: TypeIndex) -> bool {
-	types.has_const(ty) || types.has_projection(ty)
-}
-
 #[derive(Clone, Copy)]
-pub(super) enum Obligation {
+pub(super) enum TypeObligation {
 	CheckBounds {
 		assumption_context: TypeEnvIdx,
 		requirements: BoundRequirements,
@@ -153,337 +130,298 @@ pub(super) enum Obligation {
 	},
 }
 
-impl Obligation {
-	/// Whether checking this can read a constant's value, which a constant's
-	/// body, built before any value exists, leaves to be decided later.
-	pub(super) fn reads_values(&self, types: &TypeInterner) -> bool {
-		match *self {
-			Self::CheckBounds {
-				requirements,
-				argument,
-				..
-			} => {
-				may_reach_value(types, argument.inner)
-					|| requirements.reads_values(types)
-			}
-			Self::CheckTraitMembership { subject, .. } => {
-				may_reach_value(types, subject)
-			}
-			Self::CheckWellFormed { ty, .. }
-			| Self::CheckConstantFits { ty, .. } => may_reach_value(types, ty),
-			Self::CheckProjectionMember { projection, .. } => {
-				may_reach_value(types, projection)
-			}
-			// A constant's own type may name constants.
-			Self::CheckConstantType { .. } => true,
-			// Declarations' judgements, which no body records.
-			Self::CheckAssocValue { .. }
-			| Self::CheckImplRequirements { .. } => false,
+impl TypeContext<'_, '_, '_> {
+	/// The diagnostic for a normalization that ran out of its recursion budget,
+	/// reported at `site`, the construct that asked.
+	pub(super) fn overflow_diagnostic(
+		&self,
+		site: SourceSpan,
+	) -> Diagnostic<FileId> {
+		Diagnostic::error()
+			.with_code(DiagnosticCode::TypeNormalizationOverflow.code())
+			.with_message("type normalization exceeded its recursion limit")
+			.with_label(site.primary_label())
+	}
+
+	/// The diagnostic for a projection that requires itself, reported at
+	/// `site`, the construct that asked.
+	pub(super) fn cycle_diagnostic(
+		&self,
+		cycle: &ProjectionCycle,
+		site: SourceSpan,
+	) -> Diagnostic<FileId> {
+		let formatter = self.type_formatter();
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::CyclicAssociatedType.code())
+			.with_message(format!(
+				"cycle detected when normalizing `{}`",
+				formatter.display_type(cycle.projection)
+			))
+			.with_label(site.primary_label());
+		for step in cycle.steps.iter().copied() {
+			diagnostic = diagnostic.with_label(
+				site.secondary_label().with_message(format!(
+					"requires normalizing `{}`",
+					formatter.display_type(step)
+				)),
+			);
 		}
+		diagnostic
 	}
 }
 
 impl TypeContext<'_, '_, '_> {
-	/// The checker over this context's finished tables.
-	fn obligation_checker(&mut self) -> ObligationChecker<'_> {
-		ObligationChecker {
-			solver: &mut self.solver,
-			view: SolverView {
-				types: &mut self.types,
-				defs: self.defs,
-				impl_dispatch: self.impl_dispatch,
-				traits: &self.traits,
-				trait_impls: &self.trait_impls,
-				inherent_impls: &self.inherent_impls,
-				assoc_types: &self.assoc_types,
-				structs: &self.structs,
-				enums: &self.enums,
-				param_bounds: &self.param_bounds,
-				clauses: &self.clauses,
-				type_envs: &self.type_envs,
-				constants: &self.constants,
-				const_bodies: &self.const_bodies,
-				strings: self.strings,
-			},
-			bounds: &self.bounds,
-			typesets: &self.typesets,
-			constants: &self.constants,
-			strings: self.strings,
-			diagnostics: self.diagnostics,
-		}
-	}
-
-	/// Checks `obligations` once every signature exists: a declaration's
-	/// own, or what a body recorded while lowering a written type. A failure
-	/// reports itself. Every signature and every constant body exists by
-	/// now, so a check can read any value.
-	pub(super) fn check_now(&mut self, obligations: &[Obligation]) {
-		for obligation in obligations {
-			let result = self.obligation_checker().check(obligation);
-			debug_assert!(
-				!matches!(result, Err(SolverError::Pending)),
-				"every signature and every constant body exists"
-			);
-		}
-	}
-
-	/// A solver that cannot finish (budget or cycle) reports nothing; the
-	/// construct that wrote the requirement does, here, once, at its own span.
-	/// Any other result passes through for the caller to recover from.
-	pub(super) fn report_solver_error<T>(
+	pub(super) fn check_obligation(
 		&mut self,
-		result: Result<T, SolverError>,
-		site: SourceSpan,
-	) -> Result<T, SolverError> {
-		let Err(error) = &result else {
-			return result;
-		};
-		let Some(diagnostic) =
-			solver_error_diagnostic(&self.type_formatter(), error, site)
-		else {
-			return result;
-		};
-		self.diagnostics.push(diagnostic);
-		Err(SolverError::Poisoned)
-	}
-}
-
-/// The diagnostic for a solver that could not finish, reported at `site`;
-/// `None` for an answer that is not a divergence.
-fn solver_error_diagnostic(
-	formatter: &TypeFormatter<'_>,
-	error: &SolverError,
-	site: SourceSpan,
-) -> Option<Diagnostic<FileId>> {
-	Some(match error {
-		SolverError::Overflow => Diagnostic::error()
-			.with_code(DiagnosticCode::TypeNormalizationOverflow.code())
-			.with_message("type normalization exceeded its recursion limit")
-			.with_label(site.primary_label()),
-		SolverError::Cycle(cycle) => {
-			let mut diagnostic = Diagnostic::error()
-				.with_code(DiagnosticCode::CyclicAssociatedType.code())
-				.with_message(format!(
-					"cycle detected when normalizing `{}`",
-					formatter.display_type(cycle.projection)
-				))
-				.with_label(site.primary_label());
-			for step in cycle.steps.iter().copied() {
-				diagnostic = diagnostic.with_label(
-					site.secondary_label().with_message(format!(
-						"requires normalizing `{}`",
-						formatter.display_type(step)
-					)),
-				);
-			}
-			diagnostic
-		}
-		SolverError::Pending | SolverError::Poisoned => return None,
-	})
-}
-
-/// What checking an obligation may touch: the solver's memoized state, the
-/// interner it interns into, and the diagnostics it reports to. Every table it
-/// reads is final by then and shared. It holds no query state, so a check can
-/// neither force a signature nor register another obligation.
-pub(super) struct ObligationChecker<'a> {
-	pub(super) solver: &'a mut Solver,
-	pub(super) view: SolverView<'a>,
-	pub(super) bounds: &'a BoundArena,
-	pub(super) typesets: &'a [TypeSetSignature],
-	pub(super) constants: &'a [ConstantSignature],
-	pub(super) strings: &'a StringInterner,
-	pub(super) diagnostics: &'a mut Vec<Diagnostic<FileId>>,
-}
-
-impl ObligationChecker<'_> {
-	pub(super) fn type_formatter(&self) -> TypeFormatter<'_> {
-		TypeFormatter {
-			types: self.view.types,
-			defs: self.view.defs,
-			strings: self.strings,
-			type_envs: self.view.type_envs,
-		}
-	}
-
-	/// `Ok` means the obligation holds. A failure has been reported (or derives
-	/// from one that was), so callers only need to know that it did not.
-	pub(super) fn check(
-		&mut self,
-		obligation: &Obligation,
-	) -> Result<(), SolverError> {
-		let site = match *obligation {
-			Obligation::CheckBounds { reference, .. }
-			| Obligation::CheckTraitMembership { reference, .. }
-			| Obligation::CheckWellFormed { reference, .. }
-			| Obligation::CheckAssocValue { reference, .. }
-			| Obligation::CheckImplRequirements { reference, .. }
-			| Obligation::CheckConstantFits { reference, .. }
-			| Obligation::CheckConstantType { reference, .. }
-			| Obligation::CheckProjectionMember { reference, .. } => reference,
-		};
-		// The obligation is the owning site: a normalization that diverged inside
-		// it is reported here, once.
-		let result = self.run(obligation);
-		let Err(error) = &result else {
-			return result;
-		};
-		let Some(diagnostic) =
-			solver_error_diagnostic(&self.type_formatter(), error, site)
-		else {
-			return result;
-		};
-		self.diagnostics.push(diagnostic);
-		Err(SolverError::Poisoned)
-	}
-
-	fn run(&mut self, obligation: &Obligation) -> Result<(), SolverError> {
+		obligation: &TypeObligation,
+	) -> Result<(), ()> {
 		match *obligation {
-			Obligation::CheckBounds {
+			TypeObligation::CheckBounds {
 				assumption_context,
 				requirements,
 				argument,
 				reference,
 				owner,
-			} => self.check_requirements(
+			} => match self.check_bound_requirements(
 				assumption_context,
 				requirements,
 				argument,
 				reference,
 				owner,
-			),
-			Obligation::CheckTraitMembership {
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+			TypeObligation::CheckTraitMembership {
 				assumption_context,
 				subject,
 				required,
 				reference,
 			} => {
-				if self
-					.solver
-					.find_trait_impl_query(
-						&mut self.view,
-						assumption_context,
-						subject,
-						required,
-					)?
-					.is_some()
-				{
-					return Ok(());
-				}
-				let diagnostic = report_type_does_not_implement_trait(
-					&self.type_formatter(),
-					reference.file_id,
-					reference.span,
+				match self.find_trait_impl_query(
+					assumption_context,
 					subject,
 					required,
-				);
-				self.diagnostics.push(diagnostic);
-				Err(SolverError::Poisoned)
+				) {
+					Ok(Some(_)) => Ok(()),
+					Ok(None) => {
+						let diagnostic = report_type_does_not_implement_trait(
+							&self.type_formatter(),
+							reference.file_id,
+							reference.span,
+							subject,
+							required,
+						);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(&cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+				}
 			}
-			Obligation::CheckWellFormed {
+			TypeObligation::CheckWellFormed {
 				assumption_context,
 				ty,
-				..
+				reference,
 			} => {
-				self.solver.normalize(
-					&mut self.view,
+				match self.normalize(
 					assumption_context,
 					ty,
 					NormalizationDepth::Deep,
-					RewriteFacts::ALL,
-				)?;
-				Ok(())
+					RewriteFlags::ALL,
+				) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(&cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+				}
 			}
 			// A judgement the definition owns: its verdict holds the failure,
 			// whoever asked first.
-			Obligation::CheckAssocValue { member, .. } => {
-				if let Err(SolverError::Pending) =
-					self.solver.assoc_value(&mut self.view, member, None)
-				{
-					return Err(SolverError::Pending);
-				}
-				match self.solver.verdict(Definition::Member(member)) {
-					Verdict::Resolved => Ok(()),
-					Verdict::Overflowed => Err(SolverError::Overflow),
-					Verdict::Cyclic(cycle) => {
-						Err(SolverError::Cycle(cycle.clone()))
-					}
-					Verdict::Poisoned => Err(SolverError::Poisoned),
-					Verdict::Unchecked | Verdict::InProgress => {
-						unreachable!("a finished judgement has a verdict")
-					}
-				}
-			}
-			Obligation::CheckImplRequirements { impl_kind, .. } => {
-				if let Err(SolverError::Pending) =
-					self.solver.requirements_verdict(&mut self.view, impl_kind)
-				{
-					return Err(SolverError::Pending);
-				}
-				let definition = Definition::Requirements(impl_kind);
-				match self.solver.verdict(definition) {
-					Verdict::Resolved => Ok(()),
-					Verdict::Overflowed => Err(SolverError::Overflow),
-					// Reported at the bound the loop closed in, not at the impl:
-					// that is the requirement that names the impl again.
-					Verdict::Cyclic(cycle) => {
-						let bound = cycle.bound.expect(
-							"an impl's requirements own a loop in a bound",
-						);
-						let error = SolverError::Cycle(cycle.clone());
-						let diagnostic = solver_error_diagnostic(
-							&self.type_formatter(),
-							&error,
-							self.bounds.span(bound),
-						)
-						.expect("a cycle has a report");
-						self.diagnostics.push(diagnostic);
-						Err(SolverError::Poisoned)
-					}
-					Verdict::Poisoned => Err(SolverError::Poisoned),
-					Verdict::Unchecked | Verdict::InProgress => {
-						unreachable!("a finished judgement has a verdict")
+			TypeObligation::CheckAssocValue { member, reference } => {
+				// This check owns the judgement, so it asks once (which computes
+				// and memoizes the verdict) and reports the failure the verdict
+				// kept for it. A failure another definition owns was reported
+				// there and stays silent here. Only "not decided yet" is
+				// forwarded.
+				match self.assoc_value(member, None) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+					Err(_) => {
+						match self.solver.verdict(Definition::Member(member)) {
+							Verdict::Resolved => Ok(()),
+							Verdict::Overflowed => {
+								self.diagnostics
+									.push(self.overflow_diagnostic(reference));
+								Ok(())
+							}
+							Verdict::Cyclic(cycle) => {
+								let diagnostic =
+									self.cycle_diagnostic(cycle, reference);
+								self.diagnostics.push(diagnostic);
+								Ok(())
+							}
+							Verdict::Poisoned => Ok(()),
+							Verdict::Unchecked | Verdict::InProgress => {
+								unreachable!(
+									"a finished judgement has a verdict"
+								)
+							}
+						}
 					}
 				}
 			}
-			Obligation::CheckConstantFits {
+			TypeObligation::CheckImplRequirements {
+				impl_kind,
+				reference,
+			} => {
+				// Like `CheckAssocValue`: ask once, then report the failure the
+				// impl's own verdict holds. Every selection of a failed impl
+				// stays silent.
+				match self.requirements_verdict(impl_kind) {
+					Ok(()) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+					Err(_) => {
+						let definition = Definition::Requirements(impl_kind);
+						match self.solver.verdict(definition) {
+							Verdict::Resolved => Ok(()),
+							Verdict::Overflowed => {
+								self.diagnostics
+									.push(self.overflow_diagnostic(reference));
+								Ok(())
+							}
+							// Reported at the bound the loop closed in, not at the
+							// impl: that is the requirement that names the impl
+							// again.
+							Verdict::Cyclic(cycle) => {
+								let bound = cycle.bound.expect(
+									"an impl's requirements own a loop in a bound",
+								);
+								let diagnostic = self.cycle_diagnostic(
+									cycle,
+									self.bounds.span(bound),
+								);
+								self.diagnostics.push(diagnostic);
+								Ok(())
+							}
+							Verdict::Poisoned => Ok(()),
+							Verdict::Unchecked | Verdict::InProgress => {
+								unreachable!(
+									"a finished judgement has a verdict"
+								)
+							}
+						}
+					}
+				}
+			}
+			TypeObligation::CheckConstantFits {
 				assumption_context,
 				ty,
 				bits,
 				reference,
-			} => self.check_constant_fits(
+			} => match self.check_constant_fits(
 				assumption_context,
 				ty,
 				bits,
 				reference,
-			),
-			Obligation::CheckConstantType {
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+			TypeObligation::CheckConstantType {
 				assumption_context,
 				constant,
 				expected,
 				reference,
-			} => self.check_constant_type(
+			} => match self.check_constant_type(
 				assumption_context,
 				constant,
 				expected,
 				reference,
-			),
-			Obligation::CheckProjectionMember {
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+			TypeObligation::CheckProjectionMember {
 				assumption_context,
 				projection,
 				name,
 				reference,
-			} => self.check_projection_member(
+			} => match self.check_projection_member(
 				assumption_context,
 				projection,
 				name,
 				reference,
-			),
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
 		}
 	}
 }
 
-impl ObligationChecker<'_> {
+impl TypeContext<'_, '_, '_> {
 	/// `bits` fits `ty`: an integer type's range, or, for an abstract type,
 	/// the range of every member of every typeset its bounds name.
 	fn check_constant_fits(
@@ -493,12 +431,11 @@ impl ObligationChecker<'_> {
 		bits: u64,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		let ty = self.solver.normalize(
-			&mut self.view,
+		let ty = self.normalize(
 			assumption_context,
 			ty,
 			NormalizationDepth::Deep,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		)?;
 		if let Some(integer) = Integer::from_type(ty) {
 			if integer.in_range(bits, false) {
@@ -516,15 +453,15 @@ impl ObligationChecker<'_> {
 			);
 			return Err(SolverError::Poisoned);
 		}
-		let clause_tables = self.view.clause_tables();
+		let clause_tables = self.clause_tables();
 		let typesets = clause_tables
 			.declared_traits(
-				self.view.types,
+				&self.types,
 				ty,
 				self.solver.state.recursion_budget,
 			)
 			.filter_map(|trait_index| {
-				self.view.defs.traits[usize::from(trait_index)].typeset
+				self.defs.traits[usize::from(trait_index)].typeset
 			})
 			.collect::<Vec<_>>();
 		for typeset in typesets {
@@ -538,7 +475,7 @@ impl ObligationChecker<'_> {
 			let Some(member) = misfit else {
 				continue;
 			};
-			let def = &self.view.defs.typesets[usize::from(typeset)];
+			let def = &self.defs.typesets[usize::from(typeset)];
 			let typeset_name = self.strings.resolve(def.name.inner).unwrap();
 			let member_name = self.type_formatter().display_type(member.inner);
 			self.diagnostics.push(
@@ -574,19 +511,17 @@ impl ObligationChecker<'_> {
 	) -> Result<(), SolverError> {
 		let signature = &self.constants[usize::from(constant)];
 		let (ty, env) = (signature.ty, signature.env);
-		let found = self.solver.normalize(
-			&mut self.view,
+		let found = self.normalize(
 			env,
 			ty,
 			NormalizationDepth::Deep,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		)?;
-		let expected = self.solver.normalize(
-			&mut self.view,
+		let expected = self.normalize(
 			assumption_context,
 			expected,
 			NormalizationDepth::Deep,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		)?;
 		if found == expected
 			|| found == TypeIndex::ERROR
@@ -599,7 +534,7 @@ impl ObligationChecker<'_> {
 			formatter.display_type(expected),
 			formatter.display_type(found),
 		);
-		let name = self.view.defs.constants[usize::from(constant)].name.inner;
+		let name = self.defs.constants[usize::from(constant)].name.inner;
 		let name = self.strings.resolve(name).unwrap();
 		self.diagnostics.push(
 			Diagnostic::error()

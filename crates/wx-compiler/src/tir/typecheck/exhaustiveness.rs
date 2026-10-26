@@ -6,13 +6,13 @@
 //! `_`. One that `eval` cannot reduce to a number is opaque, and an enum whose
 //! variants have no value is unlisted. A constant's body is built before any
 //! value exists, so its matches are decided once they do
-//! (`DeferredCheck::Match`).
+//! (`ExprObligation::Match`).
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
-use crate::tir::body::{DeferredCheck, ExprIdx, ExprKind, PatIdx, PatternKind};
+use crate::tir::body::{ExprIdx, ExprKind, PatIdx, PatternKind};
 use crate::tir::defs::{ConstIdx, EnumIdx};
 use crate::tir::types::{Type, TypeIndex, TypeList};
 use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
@@ -23,8 +23,8 @@ const SHOWN_WITNESSES: usize = 3;
 impl BodyContext<'_, '_, '_, '_> {
 	/// Reports each arm of `expr`, a `match`, that the arms before it cover,
 	/// and the values no arm matches. A match with a pattern that failed to
-	/// check is left alone: what failed has said why. One in a constant's body
-	/// is deferred.
+	/// check is left alone: what failed has said why. Decided as an
+	/// `ExprObligation`, since an arm may compare with a constant's value.
 	pub(super) fn check_match_usefulness(&mut self, expr: ExprIdx) {
 		let ExprKind::Match { scrutinee, arms } = self.body.kind(expr) else {
 			unreachable!("usefulness is a match's")
@@ -33,10 +33,6 @@ impl BodyContext<'_, '_, '_, '_> {
 		let ty = self.body.ty(scrutinee);
 		if self.cx.types.has_error(ty) {
 			return;
-		}
-		// An arm may compare with a constant, whose value is not known yet.
-		if self.is_value_free() {
-			return self.defer(DeferredCheck::Match(expr));
 		}
 		let mut rows = Vec::with_capacity(arms.len());
 		for arm in &arms {

@@ -28,9 +28,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::defs::{FieldOrder, StructIdx};
 use super::signatures::TypeContext;
-use super::solver::{
-	NormalizationDepth, RewriteFacts, Solver, SolverError, SolverView,
-};
+use super::solver::{NormalizationDepth, RewriteFlags, Solver, SolverError};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
 use crate::index::index_newtype;
 
@@ -226,7 +224,7 @@ impl Layouts {
 	}
 }
 
-impl Solver {
+impl TypeContext<'_, '_, '_> {
 	/// The layout of a value of `ty` in linear memory. `None` when the
 	/// compiler does not know its bytes: some part of it is abstract (a
 	/// parameter, a projection that does not reduce, an address into a memory
@@ -236,13 +234,11 @@ impl Solver {
 	/// overflows.
 	pub(super) fn memory_layout(
 		&mut self,
-		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Layout>, SolverError> {
-		let piece =
-			self.piece(view, assumption_context, ty, &mut Vec::new())?;
-		Ok(piece.map(|piece| self.layouts.layout(piece)))
+		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
+		Ok(piece.map(|piece| self.solver.layouts.layout(piece)))
 	}
 
 	/// The layout of a value of `ty`, as `memory_layout` answers it, and
@@ -250,12 +246,10 @@ impl Solver {
 	/// declaration order (an aggregate's `values`).
 	pub(super) fn memory_values(
 		&mut self,
-		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<(Layout, Box<[(Primitive, u32)]>)>, SolverError> {
-		let piece =
-			self.piece(view, assumption_context, ty, &mut Vec::new())?;
+		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
 		Ok(piece.map(|piece| {
 			let values = match piece {
 				Piece::Empty => Box::default(),
@@ -263,10 +257,10 @@ impl Solver {
 					.map(|at| (primitive, at * primitive.size()))
 					.collect(),
 				Piece::Aggregate(index) => {
-					self.layouts.aggregate(index).values.clone()
+					self.solver.layouts.aggregate(index).values.clone()
 				}
 			};
-			(self.layouts.layout(piece), values)
+			(self.solver.layouts.layout(piece), values)
 		}))
 	}
 
@@ -274,12 +268,10 @@ impl Solver {
 	/// `None` for any other type, too.
 	pub(super) fn aggregate_layout(
 		&mut self,
-		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<AggregateIdx>, SolverError> {
-		let piece =
-			self.piece(view, assumption_context, ty, &mut Vec::new())?;
+		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
 		Ok(match piece {
 			Some(Piece::Aggregate(index)) => Some(index),
 			_ => None,
@@ -290,19 +282,17 @@ impl Solver {
 	/// one again is a struct containing itself.
 	fn piece(
 		&mut self,
-		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
 		let ty = self.normalize(
-			view,
 			assumption_context,
 			ty,
 			NormalizationDepth::Shallow,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		)?;
-		let piece = match *view.types.resolve(ty) {
+		let piece = match *self.types.resolve(ty) {
 			Type::Error
 			| Type::Infer
 			| Type::Integer
@@ -334,12 +324,12 @@ impl Solver {
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. } => return Ok(None),
 			Type::Enum { enum_index } => {
-				let repr = view.enums[usize::from(enum_index)].repr;
-				return self.piece(view, assumption_context, repr, visiting);
+				let repr = self.enums[usize::from(enum_index)].repr;
+				return self.piece(assumption_context, repr, visiting);
 			}
 			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
 				let Some(primitive) =
-					self.address_primitive(view, assumption_context, memory)?
+					self.address_primitive(assumption_context, memory)?
 				else {
 					return Ok(None);
 				};
@@ -350,7 +340,7 @@ impl Solver {
 			}
 			Type::Slice { memory, .. } => {
 				let Some(primitive) =
-					self.address_primitive(view, assumption_context, memory)?
+					self.address_primitive(assumption_context, memory)?
 				else {
 					return Ok(None);
 				};
@@ -360,12 +350,7 @@ impl Solver {
 				}
 			}
 			Type::Tuple { .. } | Type::Struct { .. } => {
-				return self.aggregate_piece(
-					view,
-					assumption_context,
-					ty,
-					visiting,
-				);
+				return self.aggregate_piece(assumption_context, ty, visiting);
 			}
 		};
 		Ok(Some(piece))
@@ -373,19 +358,17 @@ impl Solver {
 
 	fn aggregate_piece(
 		&mut self,
-		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
 		let ty = self.normalize(
-			view,
 			assumption_context,
 			ty,
 			NormalizationDepth::Deep,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		)?;
-		let key = match *view.types.resolve(ty) {
+		let key = match *self.types.resolve(ty) {
 			Type::Struct {
 				struct_index,
 				type_args,
@@ -394,46 +377,46 @@ impl Solver {
 			_ => unreachable!("normalizing deeper keeps a struct or a tuple"),
 		};
 		let concrete =
-			!view.types.has_param(ty) && !view.types.has_projection(ty);
-		if concrete && let Some(&index) = self.layouts.keys.get(&key) {
+			!self.types.has_param(ty) && !self.types.has_projection(ty);
+		if concrete && let Some(&index) = self.solver.layouts.keys.get(&key) {
 			return Ok(Some(Piece::Aggregate(index)));
 		}
 		if visiting.contains(&ty) {
 			return Err(SolverError::Poisoned);
 		}
-		if visiting.len() > self.state.recursion_budget {
+		if visiting.len() > self.solver.state.recursion_budget {
 			return Err(SolverError::Overflow);
 		}
 		let (order, fields) = match key {
 			AggregateKey::Struct(struct_index, type_args) => {
-				let signature = &view.structs[usize::from(struct_index)];
+				let signature = &self.structs[usize::from(struct_index)];
 				let (env, field_types) =
 					(signature.type_params, signature.field_types);
-				let args: Box<[TypeIndex]> = view.types.list(type_args).into();
+				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 				// Read one field at a time: substituting may store more lists.
 				let mut fields = Vec::with_capacity(field_types.len());
 				for at in 0..field_types.len() {
-					let field = view.types.list(field_types)[at];
-					fields.push(view.types.substitute(
+					let field = self.types.list(field_types)[at];
+					fields.push(self.types.substitute(
 						field,
 						Substitution {
-							envs: view.type_envs,
+							envs: &self.type_envs,
 							env,
 							args: &args,
 						},
 					));
 				}
-				(view.defs.structs[usize::from(struct_index)].order, fields)
+				(self.defs.structs[usize::from(struct_index)].order, fields)
 			}
 			AggregateKey::Tuple(elements) => {
-				(FieldOrder::Optimal, view.types.list(elements).to_vec())
+				(FieldOrder::Optimal, self.types.list(elements).to_vec())
 			}
 		};
 
 		visiting.push(ty);
 		let mut pieces = Vec::with_capacity(fields.len());
 		for field in fields {
-			match self.piece(view, assumption_context, field, visiting) {
+			match self.piece(assumption_context, field, visiting) {
 				Ok(Some(piece)) => pieces.push(piece),
 				unknown => {
 					visiting.pop();
@@ -443,10 +426,10 @@ impl Solver {
 		}
 		visiting.pop();
 
-		let layout = self.layouts.place(&pieces, order);
-		let index = self.layouts.intern(layout);
+		let layout = self.solver.layouts.place(&pieces, order);
+		let index = self.solver.layouts.intern(layout);
 		if concrete {
-			self.layouts.keys.insert(key, index);
+			self.solver.layouts.keys.insert(key, index);
 		}
 		Ok(Some(Piece::Aggregate(index)))
 	}
@@ -455,69 +438,37 @@ impl Solver {
 	/// memory not known yet.
 	fn address_primitive(
 		&mut self,
-		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Option<Primitive>, SolverError> {
 		let memory = self.normalize(
-			view,
 			assumption_context,
 			memory,
 			NormalizationDepth::Shallow,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		)?;
-		let Type::Memory { memory_index } = *view.types.resolve(memory) else {
+		let Type::Memory { memory_index } = *self.types.resolve(memory) else {
 			return Ok(None);
 		};
 		let size =
-			view.defs.memories[usize::from(memory_index)].size_assoc_type_index;
-		let Some(size) = view.assoc_types[usize::from(size)]
+			self.defs.memories[usize::from(memory_index)].size_assoc_type_index;
+		let Some(size) = self.assoc_types[usize::from(size)]
 			.as_ref()
 			.and_then(|signature| signature.value)
 		else {
 			return Err(SolverError::Pending);
 		};
 		let size = self.normalize(
-			view,
 			assumption_context,
 			size,
 			NormalizationDepth::Shallow,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		)?;
 		Primitive::of(size).map(Some).ok_or(SolverError::Poisoned)
 	}
 }
 
 impl TypeContext<'_, '_, '_> {
-	pub(super) fn memory_values(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<Option<(Layout, Box<[(Primitive, u32)]>)>, SolverError> {
-		let (solver, mut view) = self.solver_and_view();
-		solver.memory_values(&mut view, assumption_context, ty)
-	}
-
-	#[allow(dead_code)] // Constant evaluation is its first caller.
-	pub(super) fn memory_layout(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<Option<Layout>, SolverError> {
-		let (solver, mut view) = self.solver_and_view();
-		solver.memory_layout(&mut view, assumption_context, ty)
-	}
-
-	#[allow(dead_code)] // Constant evaluation is its first caller.
-	pub(super) fn aggregate_layout(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<Option<AggregateIdx>, SolverError> {
-		let (solver, mut view) = self.solver_and_view();
-		solver.aggregate_layout(&mut view, assumption_context, ty)
-	}
-
 	#[allow(dead_code)] // Constant evaluation is its first caller.
 	pub(super) fn aggregate(&self, index: AggregateIdx) -> &AggregateLayout {
 		self.solver.layouts.aggregate(index)
@@ -580,6 +531,7 @@ mod tests {
 		impl_dispatch: ImplDispatch,
 		diagnostics: Vec<Diagnostic<FileId>>,
 		resolutions: NameResolutions,
+		solver: Solver,
 	}
 
 	impl<'g> TestInputs<'g> {
@@ -609,6 +561,7 @@ mod tests {
 				&defs,
 				&ast_nodes,
 			);
+			let solver = Solver::new(defs.constants.len());
 			Self {
 				files,
 				strings,
@@ -617,6 +570,7 @@ mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			}
 		}
 	}
@@ -637,11 +591,13 @@ mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			} = inputs;
 			let mut context = TypeContext::new(
 				diagnostics,
 				resolutions,
 				strings,
+				solver,
 				files,
 				defs,
 				ast_nodes,

@@ -41,8 +41,8 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::body::{
-	Body, BodyBuilder, BodyOwner, DeferredCheck, ElementOrder, ExprIdx,
-	ExprKind, ExprRange, LocalIdx, Scope, ScopeIdx, ScopeKind,
+	Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
+	ExprRange, LocalIdx, Obligations, Scope, ScopeIdx, ScopeKind,
 };
 use super::defs::{
 	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
@@ -53,14 +53,14 @@ use super::literals::{
 	CharLiteralError, Integer, parse_char_literal, unescape_string_literal,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
-use super::obligations::{BoundRequirements, Obligation};
+use super::obligations::BoundRequirements;
 use super::operators::{
 	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
-use super::solver::{NormalizationDepth, RewriteFacts};
+use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
 };
@@ -73,7 +73,9 @@ use crate::vfs::FileId;
 /// Checks the expressions of one definition into a `Body`.
 pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
-	body: BodyBuilder,
+	body: Body,
+	/// What lowering the body's types and expressions left to decide.
+	obligations: Obligations,
 	/// Where the expressions are written. Its type scope is the root for a
 	/// free constant, the impl's or trait's `Self` scope for an associated one,
 	/// the function's own for a function's block.
@@ -88,11 +90,15 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// What each scope's value is checked against, index-aligned with the
 	/// body's scopes.
 	scope_types: Vec<ScopeType>,
-	/// What may rewrite a type this body compares or reveals. A constant's
-	/// body is built before any value exists, so it leaves a `Const` as
-	/// written and records what needs one (`DeferredCheck`); every other body,
-	/// and a recorded check once decided, reads values.
-	facts: RewriteFacts,
+}
+
+/// Whether two types are equal once some facts have rewritten them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeEquality {
+	Equal,
+	Diff,
+	/// A constant left as written decides it.
+	NeedsValues,
 }
 
 /// The type a scope's value is held to while its block is checked.
@@ -111,85 +117,57 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		scope: LexicalScope,
 		owner: BodyOwner,
 	) -> Self {
-		let facts = match owner {
-			BodyOwner::Const(_) => {
-				RewriteFacts::ALL.without(RewriteFacts::VALUES)
-			}
-			BodyOwner::Function(_) | BodyOwner::Global(_) => RewriteFacts::ALL,
-		};
 		Self {
 			cx,
-			body: BodyBuilder::default(),
+			body: Body::default(),
+			obligations: Obligations::default(),
 			scope,
 			owner,
 			current: ScopeIdx::ROOT,
 			lookup: FxHashMap::default(),
 			scope_types: Vec::new(),
-			facts,
 		}
 	}
 
-	/// Whether this body leaves constants unevaluated, recording the checks
-	/// that need a value.
-	fn is_value_free(&self) -> bool {
-		!self.facts.contains(RewriteFacts::VALUES)
-	}
-
-	/// Decides what building a constant's body left undecided
-	/// (`DeferredCheck`), once every constant body is built and every
-	/// declaration is checked, and reports what fails.
-	pub(super) fn decide_deferred(
+	/// Decides what building a body recorded, once every constant body is
+	/// built and every declaration is checked, and reports what fails.
+	pub(super) fn decide_obligations(
 		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 		scope: LexicalScope,
 		owner: BodyOwner,
 		body: Body,
+		obligations: Obligations,
 	) -> Body {
-		let (builder, root) = body.resume();
 		let mut this = Self::new(cx, scope, owner);
-		this.facts = RewriteFacts::ALL;
-		this.body = builder;
-		for check in this.body.take_deferred() {
+		this.body = body;
+		this.obligations = obligations;
+		this.decide();
+		this.body
+	}
+
+	/// Decides every recorded obligation, reading values.
+	fn decide(&mut self) {
+		let obligations = std::mem::take(&mut self.obligations);
+		for obligation in &obligations.types {
+			self.cx
+				.check_obligation(obligation)
+				.expect("every signature and every constant body exists");
+		}
+		for check in obligations.exprs {
 			match check {
-				DeferredCheck::Obligation(obligation) => {
-					this.check_now(&[obligation]);
+				ExprObligation::Equal { expr, expected } => {
+					self.decide_equal(expr, expected);
 				}
-				DeferredCheck::Equal { expr, expected } => {
-					this.expect(expr, expected);
-				}
-				DeferredCheck::StaticLength {
+				ExprObligation::StaticLength {
 					expr,
 					target,
 					length,
-				} => this.check_static_length(expr, target, length),
-				DeferredCheck::Match(expr) => this.check_match_usefulness(expr),
+				} => self.decide_static_length(expr, target, length),
+				ExprObligation::Match(expr) => {
+					self.check_match_usefulness(expr)
+				}
 			}
 		}
-		debug_assert!(
-			this.body.take_deferred().is_empty(),
-			"every constant body is built, so every value is known"
-		);
-		this.body.finish(root)
-	}
-
-	/// Checks what lowering a written type required. A constant's body
-	/// records what can read a constant's value.
-	fn check_now(&mut self, obligations: &[Obligation]) {
-		for obligation in obligations {
-			if self.is_value_free() && obligation.reads_values(&self.cx.types) {
-				self.defer(DeferredCheck::Obligation(*obligation));
-			} else {
-				self.cx.check_now(std::slice::from_ref(obligation));
-			}
-		}
-	}
-
-	/// Records a check to decide once every constant body is built.
-	fn defer(&mut self, check: DeferredCheck) {
-		debug_assert!(
-			self.is_value_free(),
-			"a body that reads values decides on the spot"
-		);
-		self.body.defer(check);
 	}
 
 	/// Checks `expr` as the whole body, against `expected`.
@@ -197,11 +175,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		mut self,
 		expr: &Spanned<ast::Expression>,
 		expected: TypeIndex,
-	) -> Body {
+	) -> (Body, Obligations) {
 		let expected = self.normalized(expected, self.scope.env);
 		self.enter_root(expr.span, expected);
-		let root = self.check(expr, expected);
-		self.body.finish(root)
+		self.check(expr, expected);
+		(self.body, self.obligations)
 	}
 
 	/// Pushes the root scope, which every body has.
@@ -227,16 +205,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		variant: &ast::EnumVariant,
 		previous: Option<ConstIdx>,
 		repr: TypeIndex,
-	) -> Body {
+	) -> (Body, Obligations) {
 		let span = variant.name.span;
 		self.enter_root(span, repr);
 		// A missing or non-integer repr was reported on the enum; checking each
 		// value against it would only repeat that.
 		if repr == TypeIndex::ERROR {
-			let root = self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
-			return self.body.finish(root);
+			self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			return (self.body, self.obligations);
 		}
-		let root = match (variant.value.as_deref(), previous) {
+		match (variant.value.as_deref(), previous) {
 			(Some(value), _) => self.check(value, repr),
 			(None, Some(previous)) => {
 				self.body
@@ -262,7 +240,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 		};
-		self.body.finish(root)
+		(self.body, self.obligations)
 	}
 
 	/// Builds `expr` and holds it to `expected`: an untyped literal takes that
@@ -288,45 +266,114 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&& actual != TypeIndex::NEVER
 			&& actual != expected
 		{
-			if self.cx.types.has_projection(expected)
-				|| self.cx.types.has_projection(actual)
-			{
-				let scope = self.scope.env;
-				let expected_now = self.cx.normalize(
-					scope,
-					expected,
-					NormalizationDepth::Deep,
-					self.facts,
-				);
-				let actual_now = self.cx.normalize(
-					scope,
-					actual,
-					NormalizationDepth::Deep,
-					self.facts,
-				);
-				if let (Ok(expected_now), Ok(actual_now)) =
-					(expected_now, actual_now)
-				{
-					if expected_now == actual_now {
-						return expr;
-					}
-					// A constant left as written is compared once it has a
-					// value.
-					if self.is_value_free()
-						&& (self.cx.types.has_const(expected_now)
-							|| self.cx.types.has_const(actual_now))
-					{
-						self.defer(DeferredCheck::Equal { expr, expected });
-						return expr;
-					}
+			let span = self.body.span(expr);
+			match self.equality(
+				expected,
+				actual,
+				RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+				span,
+			) {
+				Ok(TypeEquality::Equal) => return expr,
+				// A constant left as written is compared once it has a
+				// value.
+				Ok(TypeEquality::NeedsValues) => {
+					self.obligations
+						.exprs
+						.push(ExprObligation::Equal { expr, expected });
+					return expr;
 				}
+				Ok(TypeEquality::Diff) => self.report_mismatch(expr, expected),
+				// Explained: nothing reads a value from it, and no mismatch
+				// on top.
+				Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
 			}
-			let diagnostic = self.report_type_mismatch(expected, actual, expr);
-			self.cx.diagnostics.push(diagnostic);
-			// Reported: nothing reads a value from it, or reports it again.
-			self.body.set_ty(expr, TypeIndex::ERROR);
 		}
 		expr
+	}
+
+	/// Decides a recorded `Equal`, now that constants have values.
+	fn decide_equal(&mut self, expr: ExprIdx, expected: TypeIndex) {
+		let actual = self.body.ty(expr);
+		let span = self.body.span(expr);
+		match self.equality(expected, actual, RewriteFlags::ALL, span) {
+			Ok(TypeEquality::Equal) => {}
+			Ok(_) => self.report_mismatch(expr, expected),
+			Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
+		}
+	}
+
+	/// Whether two types are equal once `facts` have rewritten both. `Err`
+	/// means one does not normalize and that is explained: by its owner, or
+	/// here, at `site`.
+	fn equality(
+		&mut self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		facts: RewriteFlags,
+		site: TextSpan,
+	) -> Result<TypeEquality, ()> {
+		if expected == actual {
+			return Ok(TypeEquality::Equal);
+		}
+		if !self.cx.types.has_projection(expected)
+			&& !self.cx.types.has_projection(actual)
+		{
+			return Ok(TypeEquality::Diff);
+		}
+		let expected = self.normalize_at(expected, facts, site)?;
+		let actual = self.normalize_at(actual, facts, site)?;
+		Ok(if expected == actual {
+			TypeEquality::Equal
+		} else if !facts.contains(RewriteFlags::VALUES)
+			&& (self.cx.types.has_const(expected)
+				|| self.cx.types.has_const(actual))
+		{
+			TypeEquality::NeedsValues
+		} else {
+			TypeEquality::Diff
+		})
+	}
+
+	/// `ty` in this body's scope, rewritten by `facts`. A normalization that
+	/// diverges is reported here, at `site`, once; `Err` means the failure is
+	/// explained (here, or by its owner) and the caller only recovers.
+	fn normalize_at(
+		&mut self,
+		ty: TypeIndex,
+		facts: RewriteFlags,
+		site: TextSpan,
+	) -> Result<TypeIndex, ()> {
+		let site = SourceSpan::new(self.scope.file_id, site);
+		match self.cx.normalize(
+			self.scope.env,
+			ty,
+			NormalizationDepth::Deep,
+			facts,
+		) {
+			Ok(ty) => Ok(ty),
+			// Its owner reported it.
+			Err(SolverError::Poisoned) => Err(()),
+			Err(SolverError::Overflow) => {
+				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
+				Err(())
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
+				self.cx.diagnostics.push(diagnostic);
+				Err(())
+			}
+			Err(SolverError::Pending) => {
+				unreachable!("every signature is final when bodies are checked")
+			}
+		}
+	}
+
+	fn report_mismatch(&mut self, expr: ExprIdx, expected: TypeIndex) {
+		let actual = self.body.ty(expr);
+		let diagnostic = self.report_type_mismatch(expected, actual, expr);
+		self.cx.diagnostics.push(diagnostic);
+		// Reported: nothing reads a value from it, or reports it again.
+		self.body.set_ty(expr, TypeIndex::ERROR);
 	}
 
 	/// Lowers `expr`. `expected` is the type the context hints at this site:
@@ -780,14 +827,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&& (first == Keyword::SelfPascal.symbol()
 				|| self.cx.type_envs.resolve(self.scope.env, first).is_some())
 		{
-			let mut obligations = Vec::new();
 			let receiver = self.cx.resolve_type_path(
-				&mut obligations,
+				&mut self.obligations.types,
 				self.scope,
 				prefix,
 				InferPolicy::Allow,
 			);
-			self.check_now(&obligations);
 			return Ok(ValuePath::Member(MemberPath::new(receiver, member)));
 		}
 		let walk = PathResolver::new(
@@ -833,22 +878,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				)));
 			}
 		}
-		let mut obligations = Vec::new();
 		let head = self.cx.resolve_named_type(
-			&mut obligations,
+			&mut self.obligations.types,
 			self.scope,
 			key,
 			stopped,
 			InferPolicy::Allow,
 		);
 		let receiver = self.cx.resolve_type_member_path(
-			&mut obligations,
+			&mut self.obligations.types,
 			self.scope,
 			head,
 			&prefix[stop + 1..],
 			InferPolicy::Allow,
 		);
-		self.check_now(&obligations);
 		Ok(ValuePath::Member(MemberPath::new(receiver, member)))
 	}
 
@@ -1122,12 +1165,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let start = self.cx.type_envs.parent_count(params_env);
 		let len = self.cx.type_envs.param_names(params_env).len();
 		let slots = &mut type_args[start..start + len];
-		let mut obligations = Vec::new();
 		// Every written argument is resolved, extra ones too, for their own
 		// diagnostics.
 		for (at, arg) in segment.type_args.iter().enumerate() {
 			let ty = self.cx.resolve_type_argument(
-				&mut obligations,
+				&mut self.obligations.types,
 				self.scope,
 				arg,
 				InferPolicy::Allow,
@@ -1138,7 +1180,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				*slot = ty;
 			}
 		}
-		self.check_now(&obligations);
 		if !self
 			.cx
 			.check_type_arg_count(self.scope, segment, params_env, owner)
@@ -1174,7 +1215,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		} else {
 			&[]
 		};
-		let mut obligations = Vec::new();
 		for index in 0..own {
 			let argument = self.cx.types.list(arguments)[start + index];
 			let span = match written.get(index) {
@@ -1192,7 +1232,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				}
 			};
 			self.cx.record_bounds_check(
-				&mut obligations,
+				&mut self.obligations.types,
 				self.scope.env,
 				BoundRequirements::Parameter {
 					env: frame,
@@ -1207,7 +1247,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				owner,
 			);
 		}
-		self.check_now(&obligations);
 	}
 
 	/// Makes `ERROR` each argument in the flat `args` for `params_env`'s
@@ -1711,10 +1750,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				) {
 					Ok(found) => found.map(|lookup| (method, lookup)),
 					Err(error) => {
-						let _ = self.cx.report_solver_error::<()>(
-							Err(error),
-							SourceSpan::new(self.scope.file_id, op_span),
-						);
+						let site = SourceSpan::new(self.scope.file_id, op_span);
+						match error {
+							SolverError::Overflow => {
+								self.cx
+									.diagnostics
+									.push(self.cx.overflow_diagnostic(site));
+							}
+							SolverError::Cycle(cycle) => {
+								let diagnostic =
+									self.cx.cycle_diagnostic(&cycle, site);
+								self.cx.diagnostics.push(diagnostic);
+							}
+							_ => {}
+						}
 						return None;
 					}
 				}
@@ -1823,10 +1872,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// normalized types. A projection that does not normalize stays as written;
 	/// whoever wrote it has reported why.
 	fn normalized(&mut self, ty: TypeIndex, scope: TypeEnvIdx) -> TypeIndex {
-		match self
-			.cx
-			.normalize(scope, ty, NormalizationDepth::Deep, self.facts)
-		{
+		match self.cx.normalize(
+			scope,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+		) {
 			Ok(normalized) => normalized,
 			Err(_) => ty,
 		}
@@ -2338,28 +2389,41 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if target_length == length {
 			return;
 		}
-		if self.is_value_free()
-			&& (self.cx.types.has_const(target_length)
-				|| self.cx.types.has_const(length))
+		if self.cx.types.has_const(target_length)
+			|| self.cx.types.has_const(length)
 		{
-			return self.defer(DeferredCheck::StaticLength {
+			return self.obligations.exprs.push(ExprObligation::StaticLength {
 				expr,
 				target,
 				length,
 			});
 		}
+		self.decide_static_length(expr, target, length);
+	}
+
+	/// Decides a literal's length against its array's, reading values.
+	fn decide_static_length(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		length: TypeIndex,
+	) {
+		let Some((_, _, Some(target_length))) = self.static_target(target)
+		else {
+			unreachable!("a literal with a length becomes an array")
+		};
 		let scope = self.scope.env;
 		let target_now = self.cx.normalize(
 			scope,
 			target_length,
 			NormalizationDepth::Deep,
-			self.facts,
+			RewriteFlags::ALL,
 		);
 		let length_now = self.cx.normalize(
 			scope,
 			length,
 			NormalizationDepth::Deep,
-			self.facts,
+			RewriteFlags::ALL,
 		);
 		let (expected, actual) = match (target_now, length_now) {
 			(Ok(expected), Ok(actual)) => (expected, actual),
@@ -2672,7 +2736,7 @@ mod tests {
 	use super::super::paths::PathResolver;
 	use super::super::resolutions::{NameResolutions, Referent};
 	use super::super::signatures::TypeContext;
-	use super::super::solver::{NormalizationDepth, RewriteFacts};
+	use super::super::solver::{NormalizationDepth, RewriteFlags, Solver};
 	use super::super::types::{Type, TypeEnvIdx, TypeIndex};
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
@@ -2731,6 +2795,7 @@ mod tests {
 		impl_dispatch: ImplDispatch,
 		diagnostics: Vec<Diagnostic<FileId>>,
 		resolutions: NameResolutions,
+		solver: Solver,
 	}
 
 	impl<'g> TestInputs<'g> {
@@ -2760,6 +2825,7 @@ mod tests {
 				&defs,
 				&ast_nodes,
 			);
+			let solver = Solver::new(defs.constants.len());
 			Self {
 				files,
 				strings,
@@ -2768,6 +2834,7 @@ mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			}
 		}
 	}
@@ -2787,11 +2854,13 @@ mod tests {
 				impl_dispatch,
 				diagnostics,
 				resolutions,
+				solver,
 			} = inputs;
 			let mut context = TypeContext::new(
 				diagnostics,
 				resolutions,
 				strings,
+				solver,
 				files,
 				defs,
 				ast_nodes,
@@ -4757,7 +4826,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_constant_named_in_a_type_inside_its_own_value_waits_for_it() {
+	fn a_constant_named_in_a_type_inside_its_own_value_is_a_cycle() {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
@@ -4767,10 +4836,10 @@ mod tests {
 				};
 			"#}
 		);
-		// The local's type is checked once `C` is evaluated, and a block
-		// with locals is not evaluated (yet): that is all there is to say.
+		// The local's type is compared once `C` has a value, and `C` has none
+		// until its body is checked: rustc's `typeck(C)` to `eval(C)` and back.
 		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::NotConstEvaluatable]);
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
 	}
 
 	#[test]
@@ -4822,11 +4891,11 @@ mod tests {
 	}
 
 	#[test]
-	fn a_constant_body_records_a_length_check_that_a_function_decides_at_once()
-	{
-		// A constant's body is built before any value exists, so the length
-		// of `"ab"` is compared with `N` once it does, after what the body
-		// could decide itself; a function's block decides at once.
+	fn a_length_check_is_decided_after_the_body_is_built() {
+		// Building a body never reads a value, so the length of `"ab"` is
+		// compared with `N` after what the body could decide itself, in a
+		// constant's and in a function's alike; the constant waits for the
+		// other constants, the function does not.
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
@@ -4848,8 +4917,8 @@ mod tests {
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::ArraySizeMismatch,
 			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArraySizeMismatch,
 		]);
 	}
 
@@ -4878,7 +4947,7 @@ mod tests {
 		case.diagnostics().assert_none();
 		let (scope, named) = first_param(&case, "named");
 		let (_, written) = first_param(&case, "written");
-		let without_values = RewriteFacts::ALL.without(RewriteFacts::VALUES);
+		let without_values = RewriteFlags::ALL.without(RewriteFlags::VALUES);
 		let mut normalize = |ty, facts| {
 			case.context
 				.normalize(scope, ty, NormalizationDepth::Deep, facts)
@@ -4888,11 +4957,11 @@ mod tests {
 		// from the other's cache entry, whichever is asked first.
 		for _ in 0..2 {
 			assert_eq!(normalize(named, without_values), named);
-			assert_eq!(normalize(named, RewriteFacts::ALL), written);
+			assert_eq!(normalize(named, RewriteFlags::ALL), written);
 		}
 		// A type that cannot reach a constant means the same either way.
 		assert_eq!(normalize(written, without_values), written);
-		assert_eq!(normalize(written, RewriteFacts::ALL), written);
+		assert_eq!(normalize(written, RewriteFlags::ALL), written);
 		assert!(case.context.types.has_const(named));
 		assert!(!case.context.types.has_const(written));
 	}
@@ -5005,6 +5074,49 @@ mod tests {
 			case.context.solver.const_values[usize::from(index)],
 			ConstValueState::Evaluated(Box::new([ConstScalar::bool(false)]))
 		);
+	}
+
+	#[test]
+	fn a_constant_whose_body_failed_its_checks_is_not_evaluated() {
+		// `BAD` evaluates to a value of the wrong length; its check is what
+		// says so, and that has not happened by the time anything could read
+		// the value, so nothing does: `BAD` is poisoned, and `READ`, which
+		// names it, is silent.
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				const BAD: heap::&[u8; N] = "ab";
+				const READ: heap::&[u8; N] = BAD;
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ArraySizeMismatch]);
+		for name in ["BAD", "READ"] {
+			let DefKind::Const(index) = case.resolve(name) else {
+				panic!("expected a constant");
+			};
+			assert_eq!(
+				case.context.solver.const_values[usize::from(index)],
+				ConstValueState::Poisoned,
+				"{name}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_constant_is_checked_before_a_later_constant_reads_it() {
+		// `B` reads `A`'s value in its own check, before `A`'s turn: `A` is
+		// checked on demand, and a mismatch in it is reported once.
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const B: heap::&[u8; A] = [0; _];
+				const A: u32 = true;
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
 
 	#[test]
@@ -6011,11 +6123,11 @@ mod tests {
 	}
 
 	#[test]
-	fn constants_whose_initializers_name_each_other_do_not_loop() {
-		// Each initializer's pattern names the other, so building one body
-		// asks for the other's value, which builds the other's body, which
-		// asks for the first one's value again. The answer is "not known
-		// yet", not a rebuild.
+	fn constants_whose_initializers_name_each_other_are_one_cycle() {
+		// Each initializer's pattern compares with the other's value, so
+		// checking one asks for the other's value, which needs the other
+		// checked, which asks for the first one's value again. Only a checked
+		// body is evaluated, so that is a loop, reported once.
 		test_case!(
 			case = indoc! {"
 				const A: bool = match (true) { const B -> { true }, _ -> { false } };
@@ -6028,14 +6140,9 @@ mod tests {
 				}
 			"}
 		);
-		// Neither initializer is a constant expression: a `match` is not one.
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::NotConstEvaluatable,
-			DiagnosticCode::NotConstEvaluatable,
-		]);
-		// And each match is exhaustive: the `_` arm covers what the
-		// constant, whose value is not known, does not — so no
-		// "non-exhaustive" is among the codes above.
+		// The constants are poisoned, so the function that names them is silent.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
 	}
 
 	#[test]
@@ -6397,5 +6504,37 @@ mod tests {
 		test_case!(case = "func f(x: u8) { match x { const nope -> {} } }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+	}
+
+	#[test]
+	fn a_type_that_fails_to_normalize_is_not_reported_as_a_mismatch() {
+		// The constant, the loop and the member each own their report; what
+		// they poison is not compared with anything.
+		let cases = [
+			(
+				"memory heap: u32;
+				const BAD: u32 = 1 / 0;
+				func f(a: heap::&[u8; BAD]) { local b: heap::&[u8; 4] = a; }",
+				DiagnosticCode::ConstEvaluationFailed,
+			),
+			(
+				"memory heap: u32;
+				const A: u32 = B;
+				const B: u32 = A;
+				func f(a: heap::&[u8; A]) { local b: heap::&[u8; 4] = a; }",
+				DiagnosticCode::CyclicConstant,
+			),
+			(
+				"trait Tr { type Item; }
+				struct P();
+				impl Tr for P { type Item = <P as Tr>::Item; }
+				func f(a: <P as Tr>::Item) { local b: u8 = a; }",
+				DiagnosticCode::CyclicAssociatedType,
+			),
+		];
+		for (source, owner) in cases {
+			test_case!(case = source);
+			case.diagnostics().assert_codes(&[owner]);
+		}
 	}
 }

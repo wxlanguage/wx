@@ -30,14 +30,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let mut obligations = Vec::new();
 		let target = self.cx.resolve_type(
-			&mut obligations,
+			&mut self.obligations.types,
 			self.scope,
 			ty,
 			InferPolicy::Allow,
 		);
-		self.check_now(&obligations);
 		let mut target = self.normalized(target, self.scope.env);
 		if target == TypeIndex::INFER {
 			target = expected;

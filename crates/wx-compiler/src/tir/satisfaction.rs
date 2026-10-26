@@ -20,10 +20,10 @@ use string_interner::symbol::SymbolU32;
 use super::defs::{BindingKey, DefKind, DefinitionRegistry, TraitIdx};
 use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
-use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
+use super::obligations::{BoundRequirements, TypeObligation};
 use super::signatures::{LexicalScope, TypeContext};
 use super::solver::{
-	NormalizationDepth, RewriteFacts, SolverError, Unsatisfied,
+	NormalizationDepth, RewriteFlags, SolverError, UnsatisfiedClause,
 };
 use super::types::{Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
@@ -38,14 +38,14 @@ impl TypeContext<'_, '_, '_> {
 	/// written, and a failure is diagnosed later without rewriting it.
 	pub(super) fn record_bounds_check(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		assumption_context: TypeEnvIdx,
 		requirements: BoundRequirements,
 		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
 		owner: TypeEnvOwner,
 	) -> TypeIndex {
-		obligations.push(Obligation::CheckBounds {
+		obligations.push(TypeObligation::CheckBounds {
 			assumption_context,
 			requirements,
 			argument,
@@ -66,7 +66,7 @@ impl TypeContext<'_, '_, '_> {
 	/// frames around `params_env`, outer first, which a bound may name.
 	pub(super) fn resolve_type_args(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		segment: &ast::PathSegment,
 		params_env: TypeEnvIdx,
@@ -135,10 +135,10 @@ impl TypeContext<'_, '_, '_> {
 }
 
 /// The checks bound satisfaction owns, run by the declaration check.
-impl ObligationChecker<'_> {
+impl TypeContext<'_, '_, '_> {
 	/// Gather violations before emitting them: another requirement can still
 	/// be pending, and a retry must not duplicate a diagnostic.
-	pub(super) fn check_requirements(
+	pub(super) fn check_bound_requirements(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		requirements: BoundRequirements,
@@ -156,10 +156,10 @@ impl ObligationChecker<'_> {
 					index,
 					arguments,
 				} => (
-					self.view.param_bounds[usize::from(env)][index].clauses,
-					self.view.type_envs.param_types(env)[index],
+					self.param_bounds[usize::from(env)][index].clauses,
+					self.type_envs.param_types(env)[index],
 					env,
-					self.view.types.list(arguments).into(),
+					self.types.list(arguments).into(),
 				),
 				BoundRequirements::AssociatedType {
 					declaration,
@@ -167,23 +167,21 @@ impl ObligationChecker<'_> {
 					receiver,
 				} => {
 					let Some(signature) =
-						&self.view.assoc_types[usize::from(declaration)]
+						&self.assoc_types[usize::from(declaration)]
 					else {
 						return Err(SolverError::Pending);
 					};
-					let env = self.view.traits[usize::from(trait_index)].env;
-					let root =
-						self.view.types.intern(Type::AssocTypeProjection {
-							base: self.view.type_envs.param_types(env)[0],
-							trait_index,
-							assoc_type_index: declaration,
-						});
+					let env = self.traits[usize::from(trait_index)].env;
+					let root = self.types.intern(Type::AssocTypeProjection {
+						base: self.type_envs.param_types(env)[0],
+						trait_index,
+						assoc_type_index: declaration,
+					});
 					(signature.clauses, root, env, Box::new([receiver]))
 				}
 			};
 		let mut failures = Vec::new();
-		if self.solver.satisfies_clauses(
-			&mut self.view,
+		if self.satisfies_clauses(
 			assumption_context,
 			clauses,
 			(root, argument.inner),
@@ -195,7 +193,7 @@ impl ObligationChecker<'_> {
 		}
 		for failure in failures {
 			let diagnostic = match failure {
-				Unsatisfied::Trait {
+				UnsatisfiedClause::Trait {
 					subject,
 					trait_index,
 					source,
@@ -209,7 +207,7 @@ impl ObligationChecker<'_> {
 					source,
 					owner,
 				),
-				Unsatisfied::Equality {
+				UnsatisfiedClause::Equality {
 					projection,
 					found,
 					expected,
@@ -246,18 +244,16 @@ impl ObligationChecker<'_> {
 			inner: name,
 			span: reference.span,
 		};
-		let declared_anywhere = (0..self.view.defs.traits.len()).any(|index| {
-			self.view
-				.defs
+		let declared_anywhere = (0..self.defs.traits.len()).any(|index| {
+			self.defs
 				.declared_trait_member(TraitIdx::new(index as u32), key)
 				.is_some()
 		});
-		let normalized = match self.solver.normalize(
-			&mut self.view,
+		let normalized = match self.normalize(
 			assumption_context,
 			projection,
 			NormalizationDepth::Shallow,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		) {
 			Ok(normalized) => normalized,
 			// The projection has no value (an impl omits it, or its own
@@ -279,13 +275,12 @@ impl ObligationChecker<'_> {
 		// impl per trait per type constructor, and `declared_bound_member` skips
 		// a trait it has already collected.
 		let mut traits: Vec<TraitIdx> = Vec::new();
-		match ImplTarget::from_type(self.view.types.resolve(normalized)) {
+		match ImplTarget::from_type(self.types.resolve(normalized)) {
 			Some(target) => {
 				for &(trait_index, _) in
-					self.view.impl_dispatch.trait_candidates(target)
+					self.impl_dispatch.trait_candidates(target)
 				{
 					if self
-						.view
 						.defs
 						.declared_trait_member(trait_index, key)
 						.is_some()
@@ -296,19 +291,17 @@ impl ObligationChecker<'_> {
 			}
 			// Every signature exists, so the bounds are ready to read.
 			None if matches!(
-				self.view.types.resolve(normalized),
+				self.types.resolve(normalized),
 				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
 			) =>
 			{
-				let declared = self.view.clause_tables().declared_traits(
-					&*self.view.types,
+				let declared = self.clause_tables().declared_traits(
+					&self.types,
 					normalized,
 					self.solver.state.recursion_budget,
 				);
 				match TypeContext::select_declared_member(
-					self.view.defs,
-					declared,
-					key,
+					self.defs, declared, key,
 				) {
 					MemberLookup::Found(member) => {
 						traits.extend(
@@ -348,9 +341,7 @@ impl ObligationChecker<'_> {
 		for trait_index in traits {
 			let trait_name = self
 				.strings
-				.resolve(
-					self.view.defs.traits[usize::from(trait_index)].name.inner,
-				)
+				.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
 				.unwrap();
 			diagnostic = diagnostic.with_note(format!(
 				"qualify the trait: `<{receiver} as {trait_name}>::{name_str}`"
@@ -371,7 +362,7 @@ impl ObligationChecker<'_> {
 		let arg_name = self.type_formatter().display_type(argument.inner);
 		let trait_name = self
 			.strings
-			.resolve(self.view.defs.traits[usize::from(trait_index)].name.inner)
+			.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
 			.unwrap();
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TraitBoundViolation.code())
@@ -388,7 +379,7 @@ impl ObligationChecker<'_> {
 			.with_label(
 				self.bounds.span(bound_id).secondary_label().with_message(
 					// An impl has no name to point at; its bound is shown.
-					match owner.name(self.view.defs) {
+					match owner.name(self.defs) {
 						Some(name) => format!(
 							"required by a bound in `{}`",
 							self.strings.resolve(name.inner).unwrap()
@@ -434,7 +425,7 @@ impl ObligationChecker<'_> {
 				"expected `{expected}`, found `{found}`"
 			)))
 			.with_label(written.secondary_label().with_message(
-				match owner.name(self.view.defs) {
+				match owner.name(self.defs) {
 					Some(name) => format!(
 						"required by this equality in `{}`",
 						self.strings.resolve(name.inner).unwrap()
@@ -605,6 +596,7 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::paths::PathResolver;
 	use crate::tir::resolutions::NameResolutions;
+	use crate::tir::solver::Solver;
 	use crate::tir::types::Type;
 	use crate::vfs;
 
@@ -648,10 +640,12 @@ mod tests {
 			&defs,
 			&ast_nodes,
 		);
+		let mut solver = Solver::new(defs.constants.len());
 		let mut builder = TypeContext::new(
 			&mut diagnostics,
 			&mut resolutions,
 			&mut graph.strings,
+			&mut solver,
 			&graph.files,
 			&defs,
 			&ast_nodes,

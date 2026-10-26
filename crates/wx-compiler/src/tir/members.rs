@@ -22,14 +22,14 @@ use super::defs::{
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
-use super::obligations::{BoundRequirements, Obligation};
+use super::obligations::{BoundRequirements, TypeObligation};
 use super::resolutions::Referent;
 use super::signatures::{
 	InferPolicy, LexicalScope, QueryInfo, SignatureLocation, SignatureStatus,
 	TypeContext,
 };
 use super::solver::{
-	Assumption, NormalizationDepth, RewriteFacts, SolverError,
+	Assumption, NormalizationDepth, RewriteFlags, SolverError,
 };
 use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner};
 
@@ -250,7 +250,7 @@ impl TypeContext<'_, '_, '_> {
 			assumption_context,
 			receiver,
 			NormalizationDepth::Deep,
-			RewriteFacts::EQUALITIES,
+			RewriteFlags::EQUALITIES,
 		) {
 			Ok(receiver) => receiver,
 			Err(error) => return error.into(),
@@ -350,7 +350,7 @@ impl TypeContext<'_, '_, '_> {
 			assumption_context,
 			receiver,
 			NormalizationDepth::Shallow,
-			RewriteFacts::ALL,
+			RewriteFlags::ALL,
 		) {
 			Ok(receiver) => receiver,
 			Err(error) => return error.into(),
@@ -386,7 +386,7 @@ impl TypeContext<'_, '_, '_> {
 	/// qualified segment).
 	pub(super) fn resolve_type_member_path(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		mut current: TypeIndex,
 		segments: &[ast::PathSegment],
@@ -442,12 +442,29 @@ impl TypeContext<'_, '_, '_> {
 				}
 				MemberLookup::Error => return TypeIndex::ERROR,
 				MemberLookup::Stuck(error) => {
-					let _ = self.report_solver_error::<()>(
-						Err(error),
-						SourceSpan::new(scope.file_id, segment.ident.span),
-					);
+					match error {
+						SolverError::Overflow => {
+							self.diagnostics.push(self.overflow_diagnostic(
+								SourceSpan::new(
+									scope.file_id,
+									segment.ident.span,
+								),
+							));
+						}
+						SolverError::Cycle(cycle) => {
+							self.diagnostics.push(self.cycle_diagnostic(
+								&cycle,
+								SourceSpan::new(
+									scope.file_id,
+									segment.ident.span,
+								),
+							));
+						}
+						_ => {}
+					}
 					return TypeIndex::ERROR;
 				}
+
 				MemberLookup::Found(member) => {
 					let ApplicableMember::AbstractTraitMember {
 						trait_index,
@@ -460,7 +477,7 @@ impl TypeContext<'_, '_, '_> {
 					};
 					// Selection named the trait without matching an impl; that
 					// the receiver implements it is the declaration check's question.
-					obligations.push(Obligation::CheckTraitMembership {
+					obligations.push(TypeObligation::CheckTraitMembership {
 						assumption_context: scope.env,
 						subject: current,
 						required: trait_index,
@@ -525,15 +542,17 @@ impl TypeContext<'_, '_, '_> {
 						// A projection's declared bounds are only half of what
 						// it can have: its value may be a type that does. That
 						// takes impls, so the declaration check decides what to say.
-						obligations.push(Obligation::CheckProjectionMember {
-							assumption_context: scope.env,
-							projection: current,
-							name: segment.ident.inner,
-							reference: SourceSpan::new(
-								scope.file_id,
-								segment.ident.span,
-							),
-						});
+						obligations.push(
+							TypeObligation::CheckProjectionMember {
+								assumption_context: scope.env,
+								projection: current,
+								name: segment.ident.inner,
+								reference: SourceSpan::new(
+									scope.file_id,
+									segment.ident.span,
+								),
+							},
+						);
 					} else {
 						self.diagnostics.push(report_no_such_type_member(
 							scope.file_id,
@@ -564,7 +583,7 @@ impl TypeContext<'_, '_, '_> {
 	/// trait members.
 	fn select_inherent_function(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		receiver: TypeIndex,
 		segment: &ast::PathSegment,
@@ -579,7 +598,7 @@ impl TypeContext<'_, '_, '_> {
 				scope.env,
 				receiver,
 				NormalizationDepth::Deep,
-				RewriteFacts::EQUALITIES,
+				RewriteFlags::EQUALITIES,
 			)
 			.ok()?;
 		let target = ImplTarget::from_type(self.types.resolve(receiver))?;
@@ -663,7 +682,7 @@ impl TypeContext<'_, '_, '_> {
 	/// use ordinary type-member lookup.
 	pub(super) fn resolve_trait_qualified_type_member(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
@@ -685,7 +704,7 @@ impl TypeContext<'_, '_, '_> {
 		);
 		// Naming the member does not need an impl; whether `receiver`
 		// implements the trait is the declaration check's question.
-		obligations.push(Obligation::CheckTraitMembership {
+		obligations.push(TypeObligation::CheckTraitMembership {
 			assumption_context,
 			subject: receiver,
 			required: required_trait,
@@ -696,7 +715,7 @@ impl TypeContext<'_, '_, '_> {
 
 	pub(super) fn resolve_trait_qualified_value(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
@@ -779,7 +798,7 @@ impl TypeContext<'_, '_, '_> {
 	/// completeness is `check_trait_conformance`'s own, separate job.
 	pub(super) fn find_trait_impl(
 		&mut self,
-		obligations: &mut Vec<Obligation>,
+		obligations: &mut Vec<TypeObligation>,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
@@ -805,14 +824,19 @@ impl TypeContext<'_, '_, '_> {
 				Err(())
 			}
 			Err(SolverError::Poisoned) => Err(()),
-			Err(fatal @ (SolverError::Overflow | SolverError::Cycle(_))) => {
-				let _ = self.report_solver_error::<()>(Err(fatal), reference);
+			Err(SolverError::Overflow) => {
+				self.diagnostics.push(self.overflow_diagnostic(reference));
+				Err(())
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				self.diagnostics
+					.push(self.cycle_diagnostic(&cycle, reference));
 				Err(())
 			}
 			Err(SolverError::Pending) => {
 				// A qualified member already has a declaration identity.
 				// Membership is checked before the owning query completes.
-				obligations.push(Obligation::CheckTraitMembership {
+				obligations.push(TypeObligation::CheckTraitMembership {
 					assumption_context,
 					subject: receiver,
 					required: required_trait,

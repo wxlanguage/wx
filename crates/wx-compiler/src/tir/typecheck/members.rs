@@ -33,6 +33,7 @@ use crate::tir::satisfaction::{
 	TypeArgsNotAllowedOn, report_type_args_not_allowed,
 };
 use crate::tir::signatures::InferPolicy;
+use crate::tir::solver::SolverError;
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
 /// A member of a type a path names.
@@ -78,18 +79,17 @@ impl BodyContext<'_, '_, '_, '_> {
 		&mut self,
 		expr: &'s Spanned<ast::Expression>,
 	) -> Result<MemberPath<'s>, ExprIdx> {
-		let mut obligations = Vec::new();
 		let path = match &expr.inner {
 			ast::Expression::Grouped { inner, segments } => {
 				let (member, prefix) = segments.split_last().unwrap();
 				let root = self.cx.resolve_type(
-					&mut obligations,
+					&mut self.obligations.types,
 					self.scope,
 					inner,
 					InferPolicy::Allow,
 				);
 				let receiver = self.cx.resolve_type_member_path(
-					&mut obligations,
+					&mut self.obligations.types,
 					self.scope,
 					root,
 					prefix,
@@ -105,7 +105,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					));
 				};
 				let receiver = self.cx.resolve_type(
-					&mut obligations,
+					&mut self.obligations.types,
 					self.scope,
 					&root.self_type,
 					InferPolicy::Allow,
@@ -115,7 +115,6 @@ impl BodyContext<'_, '_, '_, '_> {
 					self.scope.namespace,
 					&root.trait_path,
 				);
-				self.check_now(&obligations);
 				let Some(qualified) = qualified else {
 					return Err(self.body.push(
 						ExprKind::Error,
@@ -131,7 +130,6 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			_ => unreachable!("only a bracketed root starts a rooted path"),
 		};
-		self.check_now(&obligations);
 		Ok(path)
 	}
 
@@ -359,16 +357,14 @@ impl BodyContext<'_, '_, '_, '_> {
 			// The named trait alone is searched; that the receiver implements
 			// it is checked, and reported, here.
 			Some(trait_index) => {
-				let mut obligations = Vec::new();
 				let found = self.cx.resolve_trait_qualified_value(
-					&mut obligations,
+					&mut self.obligations.types,
 					self.scope.env,
 					receiver,
 					trait_index,
 					member.ident,
 					self.scope.file_id,
 				);
-				self.check_now(&obligations);
 				match found {
 					Ok(found) => MemberLookup::Found(found),
 					Err(()) => MemberLookup::Error,
@@ -391,8 +387,19 @@ impl BodyContext<'_, '_, '_, '_> {
 			MemberLookup::Found(found) => found,
 			MemberLookup::Error => return None,
 			MemberLookup::Stuck(error) => {
-				let _ =
-					self.cx.report_solver_error::<()>(Err(error), reference);
+				match error {
+					SolverError::Overflow => {
+						self.cx
+							.diagnostics
+							.push(self.cx.overflow_diagnostic(reference));
+					}
+					SolverError::Cycle(cycle) => {
+						self.cx
+							.diagnostics
+							.push(self.cx.cycle_diagnostic(&cycle, reference));
+					}
+					_ => {}
+				}
 				return None;
 			}
 			MemberLookup::Pending => {
