@@ -60,7 +60,7 @@ use super::operators::{
 use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
-use super::solver::SolverError;
+use super::solver::{NormalizationDepth, RewriteFacts};
 use super::types::{
 	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
 };
@@ -88,10 +88,11 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// What each scope's value is checked against, index-aligned with the
 	/// body's scopes.
 	scope_types: Vec<ScopeType>,
-	/// A constant's value read by the check under way was not known yet (a
-	/// body it needs is not built), so the check is deferred
-	/// (`DeferredCheck::Match`) rather than reported.
-	value_pending: bool,
+	/// What may rewrite a type this body compares or reveals. A constant's
+	/// body is built before any value exists, so it leaves a `Const` as
+	/// written and records what needs one (`DeferredCheck`); every other body,
+	/// and a recorded check once decided, reads values.
+	facts: RewriteFacts,
 }
 
 /// The type a scope's value is held to while its block is checked.
@@ -110,6 +111,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		scope: LexicalScope,
 		owner: BodyOwner,
 	) -> Self {
+		let facts = match owner {
+			BodyOwner::Const(_) => {
+				RewriteFacts::ALL.without(RewriteFacts::VALUES)
+			}
+			BodyOwner::Function(_) | BodyOwner::Global(_) => RewriteFacts::ALL,
+		};
 		Self {
 			cx,
 			body: BodyBuilder::default(),
@@ -118,8 +125,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			current: ScopeIdx::ROOT,
 			lookup: FxHashMap::default(),
 			scope_types: Vec::new(),
-			value_pending: false,
+			facts,
 		}
+	}
+
+	/// Whether this body leaves constants unevaluated, recording the checks
+	/// that need a value.
+	fn is_value_free(&self) -> bool {
+		!self.facts.contains(RewriteFacts::VALUES)
 	}
 
 	/// Decides what building a constant's body left undecided
@@ -133,6 +146,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Body {
 		let (builder, root) = body.resume();
 		let mut this = Self::new(cx, scope, owner);
+		this.facts = RewriteFacts::ALL;
 		this.body = builder;
 		for check in this.body.take_deferred() {
 			match check {
@@ -157,20 +171,23 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		this.body.finish(root)
 	}
 
-	/// Checks what lowering a written type required. In a constant's body, a
-	/// check that needs a value not known yet is deferred.
+	/// Checks what lowering a written type required. A constant's body
+	/// records what can read a constant's value.
 	fn check_now(&mut self, obligations: &[Obligation]) {
-		for obligation in self.cx.check_now(obligations) {
-			self.defer(DeferredCheck::Obligation(obligation));
+		for obligation in obligations {
+			if self.is_value_free() && obligation.reads_values(&self.cx.types) {
+				self.defer(DeferredCheck::Obligation(*obligation));
+			} else {
+				self.cx.check_now(std::slice::from_ref(obligation));
+			}
 		}
 	}
 
-	/// Records a check to decide once every constant body is built. Only a
-	/// constant's body is built before then.
+	/// Records a check to decide once every constant body is built.
 	fn defer(&mut self, check: DeferredCheck) {
 		debug_assert!(
-			matches!(self.owner, BodyOwner::Const(_)),
-			"only a constant's body is built before every value is known"
+			self.is_value_free(),
+			"a body that reads values decides on the spot"
 		);
 		self.body.defer(check);
 	}
@@ -271,25 +288,37 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&& actual != TypeIndex::NEVER
 			&& actual != expected
 		{
-			// A type left as written when a constant in it had no value yet
-			// (`normalized`) is compared once it has one.
 			if self.cx.types.has_projection(expected)
 				|| self.cx.types.has_projection(actual)
 			{
 				let scope = self.scope.env;
-				let expected_now =
-					self.cx.normalize_type_query(scope, expected);
-				let actual_now = self.cx.normalize_type_query(scope, actual);
-				match (expected_now, actual_now) {
-					(Err(SolverError::Pending), _)
-					| (_, Err(SolverError::Pending)) => {
+				let expected_now = self.cx.normalize(
+					scope,
+					expected,
+					NormalizationDepth::Deep,
+					self.facts,
+				);
+				let actual_now = self.cx.normalize(
+					scope,
+					actual,
+					NormalizationDepth::Deep,
+					self.facts,
+				);
+				if let (Ok(expected_now), Ok(actual_now)) =
+					(expected_now, actual_now)
+				{
+					if expected_now == actual_now {
+						return expr;
+					}
+					// A constant left as written is compared once it has a
+					// value.
+					if self.is_value_free()
+						&& (self.cx.types.has_const(expected_now)
+							|| self.cx.types.has_const(actual_now))
+					{
 						self.defer(DeferredCheck::Equal { expr, expected });
 						return expr;
 					}
-					(Ok(expected), Ok(actual)) if expected == actual => {
-						return expr;
-					}
-					_ => {}
 				}
 			}
 			let diagnostic = self.report_type_mismatch(expected, actual, expr);
@@ -1794,7 +1823,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// normalized types. A projection that does not normalize stays as written;
 	/// whoever wrote it has reported why.
 	fn normalized(&mut self, ty: TypeIndex, scope: TypeEnvIdx) -> TypeIndex {
-		match self.cx.normalize_type_query(scope, ty) {
+		match self
+			.cx
+			.normalize(scope, ty, NormalizationDepth::Deep, self.facts)
+		{
 			Ok(normalized) => normalized,
 			Err(_) => ty,
 		}
@@ -2292,7 +2324,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 
 	/// Checks that a string or array literal `expr` of length `length` is as
 	/// long as `target`, the array it becomes. In a constant's body, a length
-	/// that names a constant not evaluated yet is compared once it is.
+	/// that names a constant is compared once it has a value.
 	fn check_static_length(
 		&mut self,
 		expr: ExprIdx,
@@ -2306,17 +2338,30 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if target_length == length {
 			return;
 		}
+		if self.is_value_free()
+			&& (self.cx.types.has_const(target_length)
+				|| self.cx.types.has_const(length))
+		{
+			return self.defer(DeferredCheck::StaticLength {
+				expr,
+				target,
+				length,
+			});
+		}
 		let scope = self.scope.env;
-		let target_now = self.cx.normalize_type_query(scope, target_length);
-		let length_now = self.cx.normalize_type_query(scope, length);
+		let target_now = self.cx.normalize(
+			scope,
+			target_length,
+			NormalizationDepth::Deep,
+			self.facts,
+		);
+		let length_now = self.cx.normalize(
+			scope,
+			length,
+			NormalizationDepth::Deep,
+			self.facts,
+		);
 		let (expected, actual) = match (target_now, length_now) {
-			(Err(SolverError::Pending), _) | (_, Err(SolverError::Pending)) => {
-				return self.defer(DeferredCheck::StaticLength {
-					expr,
-					target,
-					length,
-				});
-			}
 			(Ok(expected), Ok(actual)) => (expected, actual),
 			// Reported where the constant is.
 			_ => return,
@@ -2627,7 +2672,8 @@ mod tests {
 	use super::super::paths::PathResolver;
 	use super::super::resolutions::{NameResolutions, Referent};
 	use super::super::signatures::TypeContext;
-	use super::super::types::{Type, TypeIndex};
+	use super::super::solver::{NormalizationDepth, RewriteFacts};
+	use super::super::types::{Type, TypeEnvIdx, TypeIndex};
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
@@ -2644,6 +2690,11 @@ mod tests {
 			let mut graph = source_graph($source);
 			let mut inputs = TestInputs::new(&mut graph);
 			let $case = TestCase::new(&mut inputs);
+		};
+		(mut $case:ident = $source:expr $(,)?) => {
+			let mut graph = source_graph($source);
+			let mut inputs = TestInputs::new(&mut graph);
+			let mut $case = TestCase::new(&mut inputs);
 		};
 	}
 
@@ -4768,6 +4819,82 @@ mod tests {
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::ArraySizeMismatch,
 		]);
+	}
+
+	#[test]
+	fn a_constant_body_records_a_length_check_that_a_function_decides_at_once()
+	{
+		// A constant's body is built before any value exists, so the length
+		// of `"ab"` is compared with `N` once it does, after what the body
+		// could decide itself; a function's block decides at once.
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				const IN_CONSTANT: (heap::&[u8; N], u8) = ("ab", true);
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArraySizeMismatch,
+		]);
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				func in_function() {
+					local t: (heap::&[u8; N], u8) = ("ab", true);
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	/// The scope and type of the first parameter of the function `name`.
+	fn first_param(case: &TestCase<'_>, name: &str) -> (TypeEnvIdx, TypeIndex) {
+		let DefKind::Function(index) = case.resolve(name) else {
+			panic!("expected `{name}` to be a function");
+		};
+		let signature = &case.context.functions[usize::from(index)];
+		(
+			signature.type_params,
+			case.context.types.list(signature.param_types)[0],
+		)
+	}
+
+	#[test]
+	fn a_named_length_is_kept_unless_values_are_read() {
+		test_case!(
+			mut case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				func named(a: heap::&[u8; N]) {}
+				func written(a: heap::&[u8; 4]) {}
+			"#}
+		);
+		case.diagnostics().assert_none();
+		let (scope, named) = first_param(&case, "named");
+		let (_, written) = first_param(&case, "written");
+		let without_values = RewriteFacts::ALL.without(RewriteFacts::VALUES);
+		let mut normalize = |ty, facts| {
+			case.context
+				.normalize(scope, ty, NormalizationDepth::Deep, facts)
+				.unwrap()
+		};
+		// The two requests differ only in the facts, and neither is answered
+		// from the other's cache entry, whichever is asked first.
+		for _ in 0..2 {
+			assert_eq!(normalize(named, without_values), named);
+			assert_eq!(normalize(named, RewriteFacts::ALL), written);
+		}
+		// A type that cannot reach a constant means the same either way.
+		assert_eq!(normalize(written, without_values), written);
+		assert_eq!(normalize(written, RewriteFacts::ALL), written);
+		assert!(case.context.types.has_const(named));
+		assert!(!case.context.types.has_const(written));
 	}
 
 	#[test]

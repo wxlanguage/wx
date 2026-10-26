@@ -54,8 +54,8 @@ pub(super) enum BodyOwner {
 }
 
 /// A constant's checked initializer. Every one is built before anything
-/// evaluates (`TypeContext::build_constant_bodies`), so evaluation reads a
-/// `NotBuilt` body only while bodies are being built, as `Pending`.
+/// evaluates (`TypeContext::build_constant_bodies`), so evaluation never
+/// reads a `NotBuilt` one.
 pub(super) enum ConstBody {
 	/// Not built yet.
 	NotBuilt,

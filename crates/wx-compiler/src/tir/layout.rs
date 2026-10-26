@@ -28,7 +28,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::defs::{FieldOrder, StructIdx};
 use super::signatures::TypeContext;
-use super::solver::{Solver, SolverError, SolverView};
+use super::solver::{
+	NormalizationDepth, RewriteFacts, Solver, SolverError, SolverView,
+};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
 use crate::index::index_newtype;
 
@@ -293,7 +295,13 @@ impl Solver {
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
-		let ty = self.normalize_head_query(view, assumption_context, ty)?;
+		let ty = self.normalize(
+			view,
+			assumption_context,
+			ty,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		)?;
 		let piece = match *view.types.resolve(ty) {
 			Type::Error
 			| Type::Infer
@@ -370,7 +378,13 @@ impl Solver {
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
-		let ty = self.normalize_type_query(view, assumption_context, ty)?;
+		let ty = self.normalize(
+			view,
+			assumption_context,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFacts::ALL,
+		)?;
 		let key = match *view.types.resolve(ty) {
 			Type::Struct {
 				struct_index,
@@ -445,8 +459,13 @@ impl Solver {
 		assumption_context: TypeEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Option<Primitive>, SolverError> {
-		let memory =
-			self.normalize_head_query(view, assumption_context, memory)?;
+		let memory = self.normalize(
+			view,
+			assumption_context,
+			memory,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		)?;
 		let Type::Memory { memory_index } = *view.types.resolve(memory) else {
 			return Ok(None);
 		};
@@ -458,7 +477,13 @@ impl Solver {
 		else {
 			return Err(SolverError::Pending);
 		};
-		let size = self.normalize_head_query(view, assumption_context, size)?;
+		let size = self.normalize(
+			view,
+			assumption_context,
+			size,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		)?;
 		Primitive::of(size).map(Some).ok_or(SolverError::Poisoned)
 	}
 }

@@ -181,6 +181,29 @@ const TEXT: heap::&[u8; N] = "abcdefgh";
   `Definition` order. Nothing builds such a loop yet (constants cannot read
   types).
 
+## Direction (2026-10-25)
+
+Type checking never needs a value; evaluation is a pure on-demand query over
+checked bodies; recorded checks are decided once values exist. Each layer reads
+only the one before it, so no query suspends or retries:
+
+```
+signatures  <-  checking (every body, value-free)  <-  evaluation  <-  recorded checks
+```
+
+Planned, in order: pin the contract with tests (done: a constant's body keeps a
+named length and decides its length check late; `normalize` without `VALUES`
+keeps a `Const`); collapse the evaluator's overlapping outcome types
+(`Unevaluable`, `Halt`, the terminal `ConstValueState`s); check function and
+global bodies value-free too (needed once `const func` evaluates their typed
+bodies); extend the evaluator (locals, control flow, calls, generic instances
+keyed by `(function, type args)`); abstract instances stay rigid in TIR and are
+evaluated at monomorphization. A generic `Memo<V>` table was considered and
+dropped for now: only constant values need an `InProgress` state.
+
+Impl selection on a type with an unevaluated `Const` in its arguments cannot
+match yet; the plan is an ambiguous obligation decided with the recorded checks.
+
 ## Next steps
 
 1. List every place body building reads a value or compares a `Const`
@@ -228,7 +251,11 @@ constant bodies built on demand). Target:
 - `TypeContext::const_value` shrinks to lending the view and calling the
   solver.
 
-### 3. The solver before values exist (decided: option (a), variant 1)
+### 3. The solver before values exist (superseded)
+
+Superseded by the `VALUES` fact (see "Direction" and "Progress and
+deviations"): the solver no longer answers `Pending` for a constant. The
+text below is the original reasoning.
 
 Phase 2 normalizes types: `check_body` normalizes the declared type
 (`typecheck.rs:125`), and local annotations, casts and calls go through
@@ -340,12 +367,17 @@ value is known, a match on later constants and a later enum, the
 
 Where the code differs from the plan above:
 
-- **No flag on `BodyContext`.** Deferral is driven by `Pending` itself: a check
-  that meets `Pending` defers, and only a constant's body can meet it
-  (`BodyContext::defer` debug-asserts the owner). So `Unevaluable::Pending` and
-  `Halt::Pending` stay (the plan listed them for removal): they are how a
-  phase-2 read says "not yet". An evaluation in phase 2 whose bodies all exist
-  simply succeeds, and is final.
+- **A fact on `BodyContext`, not `Pending`.** (Revised later the same day; the
+  first version let a failed read trigger deferral.) Normalization takes a
+  `RewriteFacts` flag set (`EQUALITIES`, `DEFINITIONS`, `VALUES`), part of a
+  request's cache key. A constant's body normalizes without `VALUES`, so a
+  `Const` stays as written and the trigger is syntactic: a comparison or a
+  literal's length that still holds a `Const` (`has_const`) is recorded, every
+  `match` is, and so is any obligation that can reach a value
+  (`Obligation::reads_values`). A function's or global's body, and a recorded
+  check being decided, use every fact. So `Pending` no longer means "a constant
+  is not built": `Unevaluable::Pending`, `Halt::Pending` and the solver's
+  mapping are gone, and evaluating an unbuilt body is unreachable.
 - **Phase 4 order per constant:** evaluate first (while its body is in place, a
   deferred check may read its own value), then the deferred checks, then the
   report. Caveat: a constant may be evaluated (in phase 3 or here) before its
@@ -365,32 +397,19 @@ Where the code differs from the plan above:
 Still open from the map: section 7's `layout.rs` handling of a `Const`
 length, and option 2 of section 3 if keeping whole written types gets bad.
 
-### Open: don't evaluate a body with errors (as rustc does)
+### Evaluating a body whose recorded checks fail
 
-rustc finishes `typeck(C)` (obligations included) before `eval(C)` reads the
-body, and a body whose typeck reported an error is `tainted_by_errors`:
-const-eval answers `ErrorHandled::Reported` without evaluating, and readers are
-silent. The phase-4 caveat above is the gap. A sketch of closing it:
-
-1. **Taint.** `Body::tainted_by_errors`, set by `BodyContext` when the error
-   count rose while it built the body or decided its recorded checks (rustc's
-   older count-based taint). The solver reads a tainted body as `Poisoned`.
-2. **Ordering.** The taint only means something once the recorded checks are
-   decided, and our solver cannot decide them on demand. So the solver also
-   answers `Pending` for a body that still has recorded checks, and phase 4
-   becomes a fixpoint over those bodies: decide what can be, re-record what is
-   still `Pending`, repeat while there is progress (rustc's
-   `select_where_possible`). Then evaluate and report every constant.
-   `check_declarations` moves after the fixpoint, or it can meet a constant
-   whose checks are undecided.
-3. **What is left after the fixpoint is a loop**
-   (`const C: u32 = block { local a: heap::&[u8; C] = .. }`: rustc's
-   `typeck(C) -> eval(C) -> typeck(C)` cycle, E2109 instead of today's E2057).
-   Reporting it once per loop needs to know what each stuck body waited on:
-   (a) report every stuck constant (several reports per loop, and constants
-   that only wait on a loop report too), or (b) record the awaited constant
-   when an evaluation is `Pending` on an unfinished body (on the answer or on
-   the solver's frames), build the waits-for graph, and let the first-defined
-   constant of each loop own it, as impl-member loops are owned. (b) keeps the
-   one-diagnostic-per-loop rule, but `SolverError::Pending` has many origins
-   besides constants.
+A constant is evaluated before its own recorded checks are decided, so a body
+with a failing length check still gets a value (rustc refuses to evaluate a
+body tainted by errors). Checked in 2026-10-25: this produces no extra or
+duplicate diagnostic in any program tried (a short literal against a longer
+named length, a later constant mismatched in a type, a poisoned constant used
+as a length, a failing division used as a length, a failing constant read
+through another type). The reason is the rule the rest of the solver follows:
+a failure is reported once, by its owner, and everything derived from it is
+silent (`Poisoned`/`Failed`/`Cyclic`, `collapse_error`), so the evaluator
+never has to know whether a check failed. It could matter when evaluation
+reads a size (indexing, a length operation); a count-based taint on the
+constant (decide first, evaluate only if nothing was reported) would be the
+smallest fix then. Deciding on demand from the solver is not possible (the
+solver builds and decides nothing), so a fixpoint is not the answer either.

@@ -4,9 +4,9 @@
 //! A constant compares as its value when it is one number, else it is
 //! opaque: it covers nothing but itself, so a match naming it still needs
 //! `_`. One that `eval` cannot reduce to a number is opaque, and an enum whose
-//! variants have no value is unlisted. In a constant's body a value may not be
-//! known yet (not every body is built); the match is then decided once every
-//! body is (`DeferredCheck::Match`).
+//! variants have no value is unlisted. A constant's body is built before any
+//! value exists, so its matches are decided once they do
+//! (`DeferredCheck::Match`).
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
@@ -14,7 +14,6 @@ use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
 use crate::tir::body::{DeferredCheck, ExprIdx, ExprKind, PatIdx, PatternKind};
 use crate::tir::defs::{ConstIdx, EnumIdx};
-use crate::tir::eval::Unevaluable;
 use crate::tir::types::{Type, TypeIndex, TypeList};
 use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
 
@@ -24,8 +23,8 @@ const SHOWN_WITNESSES: usize = 3;
 impl BodyContext<'_, '_, '_, '_> {
 	/// Reports each arm of `expr`, a `match`, that the arms before it cover,
 	/// and the values no arm matches. A match with a pattern that failed to
-	/// check is left alone: what failed has said why. One that compares with
-	/// a value not known yet is deferred.
+	/// check is left alone: what failed has said why. One in a constant's body
+	/// is deferred.
 	pub(super) fn check_match_usefulness(&mut self, expr: ExprIdx) {
 		let ExprKind::Match { scrutinee, arms } = self.body.kind(expr) else {
 			unreachable!("usefulness is a match's")
@@ -35,7 +34,10 @@ impl BodyContext<'_, '_, '_, '_> {
 		if self.cx.types.has_error(ty) {
 			return;
 		}
-		self.value_pending = false;
+		// An arm may compare with a constant, whose value is not known yet.
+		if self.is_value_free() {
+			return self.defer(DeferredCheck::Match(expr));
+		}
 		let mut rows = Vec::with_capacity(arms.len());
 		for arm in &arms {
 			let Some(pattern) = self.lower_pattern(arm.pattern) else {
@@ -51,9 +53,6 @@ impl BodyContext<'_, '_, '_, '_> {
 			.collect();
 		let missing =
 			witnesses(self, &rows, &[Pat::Wild], &[ty], SHOWN_WITNESSES + 1);
-		if self.value_pending {
-			return self.defer(DeferredCheck::Match(expr));
-		}
 		for pattern in unreachable {
 			let span = self.body.pattern_span(pattern);
 			self.cx.diagnostics.push(
@@ -189,16 +188,9 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	/// A constant's value as a pattern compares with it; `None` when it has
-	/// none. One not known yet marks the check under way as deferred.
+	/// none (it is opaque to the match).
 	fn pattern_bits(&mut self, constant: ConstIdx) -> Option<u64> {
-		match self.cx.constant_bits(constant) {
-			Ok(bits) => bits,
-			Err(Unevaluable::Pending) => {
-				self.value_pending = true;
-				None
-			}
-			Err(_) => None,
-		}
+		self.cx.constant_bits(constant).ok().flatten()
 	}
 
 	/// The value of each of an enum's variants, in written order, each once;

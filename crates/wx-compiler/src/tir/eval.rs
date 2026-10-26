@@ -22,8 +22,7 @@
 //! and is owned by its first-defined member: it is reported once whichever
 //! constant is asked first. The solver reads bodies and builds none: every
 //! constant body is built before anything evaluates
-//! (`TypeContext::build_constant_bodies`), and while they are being built a
-//! value that reads one not built yet is `Pending`, never memoized.
+//! (`TypeContext::build_constant_bodies`).
 
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
@@ -35,7 +34,9 @@ use super::defs::{ConstIdx, EnumIdx, MemoryIdx};
 use super::layout::Primitive;
 use super::operators::Scalar;
 use super::signatures::TypeContext;
-use super::solver::{Solver, SolverFrame, SolverView};
+use super::solver::{
+	NormalizationDepth, RewriteFacts, Solver, SolverFrame, SolverView,
+};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
@@ -180,8 +181,6 @@ pub(super) enum Unevaluable {
 	Silent,
 	/// A loop still unwinding towards its owner.
 	Cycle(Box<[ConstIdx]>),
-	/// A body evaluation needs is not built yet; ask again once it is.
-	Pending,
 }
 
 /// Why evaluating a node gave no value.
@@ -192,8 +191,6 @@ enum Halt {
 	Silent,
 	/// A loop still unwinding towards its owner.
 	Cycle(Box<[ConstIdx]>),
-	/// A body evaluation needs is not built yet.
-	Pending,
 }
 
 /// The checked body of a constant, as built.
@@ -236,8 +233,7 @@ impl TypeContext<'_, '_, '_> {
 		self.const_value(const_index).map(value_bits)
 	}
 
-	/// The memoized value of a constant, evaluated by the solver. `Pending`
-	/// while a body it reads is not built (`build_constant_bodies`).
+	/// The memoized value of a constant, evaluated by the solver.
 	pub(super) fn const_value(
 		&mut self,
 		const_index: ConstIdx,
@@ -362,7 +358,7 @@ impl Solver {
 	/// evaluation is a frame on the solver's own stack, with a budget of its
 	/// own, as an impl member's judgement is: reaching the constant again
 	/// while it is evaluated closes a loop, read from that stack. Its body
-	/// must be built; one that is not yet is `Pending`.
+	/// must be built.
 	pub(super) fn const_value(
 		&mut self,
 		view: &mut SolverView<'_>,
@@ -386,7 +382,9 @@ impl Solver {
 				return self
 					.settle_constant(const_index, ConstValueState::NoValue);
 			}
-			ConstBody::NotBuilt => return Err(Unevaluable::Pending),
+			ConstBody::NotBuilt => {
+				unreachable!("every constant body is built before it evaluates")
+			}
 		};
 		// In progress before its declared type is read: the type may name
 		// the constant itself (`const A: heap::&[u8; A]`).
@@ -432,12 +430,6 @@ impl Solver {
 			Ok(()) => ConstValueState::Poisoned,
 			Err(Halt::Own(error)) => ConstValueState::Failed(error),
 			Err(Halt::Silent) => ConstValueState::Poisoned,
-			// Not evaluated yet: asked again once the body is built.
-			Err(Halt::Pending) => {
-				self.const_values[usize::from(const_index)] =
-					ConstValueState::Unevaluated;
-				return Err(Unevaluable::Pending);
-			}
 			// The owner keeps the loop; its readers further out derive from it.
 			Err(Halt::Cycle(cycle)) if cycle[0] == const_index => {
 				ConstValueState::Cyclic(cycle)
@@ -907,7 +899,6 @@ impl Solver {
 			})),
 			Err(Unevaluable::Silent) => Err(Halt::Silent),
 			Err(Unevaluable::Cycle(cycle)) => Err(Halt::Cycle(cycle)),
-			Err(Unevaluable::Pending) => Err(Halt::Pending),
 		}
 	}
 
@@ -944,7 +935,15 @@ impl Solver {
 		out: &mut Vec<Scalar>,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<(), ConstValueState> {
-		let ty = self.normalize_type_query(view, scope, ty).unwrap_or(ty);
+		let ty = self
+			.normalize(
+				view,
+				scope,
+				ty,
+				NormalizationDepth::Deep,
+				RewriteFacts::ALL,
+			)
+			.unwrap_or(ty);
 		if ty == TypeIndex::ERROR {
 			return Err(ConstValueState::Poisoned);
 		}
@@ -1042,7 +1041,15 @@ impl Solver {
 			.as_ref()
 			.and_then(|signature| signature.value)
 			.ok_or(ConstValueState::Poisoned)?;
-		let size = self.normalize_type_query(view, scope, size).unwrap_or(size);
+		let size = self
+			.normalize(
+				view,
+				scope,
+				size,
+				NormalizationDepth::Deep,
+				RewriteFacts::ALL,
+			)
+			.unwrap_or(size);
 		Scalar::from_type(size).ok_or(ConstValueState::Poisoned)
 	}
 
@@ -1054,7 +1061,13 @@ impl Solver {
 		memory: TypeIndex,
 	) -> Option<MemoryIdx> {
 		let memory = self
-			.normalize_type_query(view, scope, memory)
+			.normalize(
+				view,
+				scope,
+				memory,
+				NormalizationDepth::Deep,
+				RewriteFacts::ALL,
+			)
 			.unwrap_or(memory);
 		match *view.types.resolve(memory) {
 			Type::Memory { memory_index } => Some(memory_index),

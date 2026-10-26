@@ -298,12 +298,8 @@ impl TypeContext<'_, '_, '_> {
 		for entry in self.ast_nodes {
 			let range =
 				self.query_state[&entry.node.def_id()].obligations.clone();
-			let pending = self.check_now(
+			self.check_now(
 				&obligations[range.start as usize..range.end as usize],
-			);
-			debug_assert!(
-				pending.is_empty(),
-				"a declaration's check is never pending: every body exists"
 			);
 		}
 		self.obligations = obligations;
@@ -4759,7 +4755,7 @@ pub(super) mod tests {
 		DefinitionRegistry, MemberOwner, Namespace, Scope, UseItemKind,
 	};
 	use crate::tir::impls::ImplTarget;
-	use crate::tir::solver::Verdict;
+	use crate::tir::solver::{NormalizationDepth, RewriteFacts, Verdict};
 	use crate::vfs;
 
 	/// `test_case!(case = "source")` / `test_case!(mut case = ..)` /
@@ -7120,9 +7116,16 @@ pub(super) mod tests {
 			scope: TypeEnvIdx,
 			ty: TypeIndex,
 		) -> TypeIndex {
-			self.context.normalize_type_query(scope, ty).unwrap_or_else(
-				|error| panic!("expected {ty:?} to normalize, got {error:?}"),
-			)
+			self.context
+				.normalize(
+					scope,
+					ty,
+					NormalizationDepth::Deep,
+					RewriteFacts::ALL,
+				)
+				.unwrap_or_else(|error| {
+					panic!("expected {ty:?} to normalize, got {error:?}")
+				})
 		}
 
 		/// Parameter `index` of the function at `path`, normalized in that
@@ -7142,7 +7145,12 @@ pub(super) mod tests {
 		) -> Result<TypeIndex, SolverError> {
 			let scope = self.function_signature(path).type_params;
 			let ty = self.param_types(path)[index];
-			self.context.normalize_type_query(scope, ty)
+			self.context.normalize(
+				scope,
+				ty,
+				NormalizationDepth::Deep,
+				RewriteFacts::ALL,
+			)
 		}
 
 		/// The parameter exactly as written, with its projections unreduced.
@@ -9359,7 +9367,12 @@ pub(super) mod tests {
 				Type::AssocTypeProjection { .. }
 			));
 			assert!(matches!(
-				case.context.normalize_type_query(scope, written),
+				case.context.normalize(
+					scope,
+					written,
+					NormalizationDepth::Deep,
+					RewriteFacts::ALL
+				),
 				Err(SolverError::Poisoned)
 			));
 		}
@@ -9778,7 +9791,12 @@ pub(super) mod tests {
 					Type::AssocTypeProjection { .. }
 				));
 				assert_eq!(
-					case.context.normalize_type_query(scope, written),
+					case.context.normalize(
+						scope,
+						written,
+						NormalizationDepth::Deep,
+						RewriteFacts::ALL
+					),
 					Err(SolverError::Poisoned)
 				);
 			}
@@ -13002,7 +13020,12 @@ pub(super) mod tests {
 				// Deep normalization returns it and reports nothing; the site that
 				// asked owns the report.
 				assert!(matches!(
-					builder.normalize_type_query(TypeEnvIdx::ROOT, projection),
+					builder.normalize(
+						TypeEnvIdx::ROOT,
+						projection,
+						NormalizationDepth::Deep,
+						RewriteFacts::ALL
+					),
 					Err(SolverError::Cycle(_))
 				));
 				assert!(
@@ -13011,8 +13034,12 @@ pub(super) mod tests {
 					builder.diagnostics
 				);
 				assert_eq!(
-					builder
-						.normalize_type_query(TypeEnvIdx::ROOT, TypeIndex::I32),
+					builder.normalize(
+						TypeEnvIdx::ROOT,
+						TypeIndex::I32,
+						NormalizationDepth::Deep,
+						RewriteFacts::ALL
+					),
 					Ok(TypeIndex::I32)
 				);
 			},
@@ -13795,7 +13822,12 @@ pub(super) mod tests {
 			case.context.types.list(signature.param_types)[0],
 		);
 		assert!(matches!(
-			case.context.normalize_type_query(scope, written),
+			case.context.normalize(
+				scope,
+				written,
+				NormalizationDepth::Deep,
+				RewriteFacts::ALL
+			),
 			Err(SolverError::Poisoned)
 		));
 	}
@@ -14620,12 +14652,22 @@ pub(super) mod tests {
 				builder.param_bounds[usize::from(env)][0].clauses.equalities =
 					None;
 				assert_eq!(
-					builder.normalize_type_query(env, projection),
+					builder.normalize(
+						env,
+						projection,
+						NormalizationDepth::Deep,
+						RewriteFacts::ALL
+					),
 					Err(SolverError::Pending)
 				);
 				builder.param_bounds[usize::from(env)][0].clauses = clauses;
 				assert_eq!(
-					builder.normalize_type_query(env, projection),
+					builder.normalize(
+						env,
+						projection,
+						NormalizationDepth::Deep,
+						RewriteFacts::ALL
+					),
 					Ok(TypeIndex::I32)
 				);
 				assert!(
@@ -15715,7 +15757,12 @@ pub(super) mod tests {
 					assert_eq!(member.assoc_type_index, AssocTypeIdx::new(0));
 					let ty = builder.project_assoc_type(TypeIndex::I32, member);
 					assert_eq!(
-						builder.normalize_type_query(assumption_context, ty),
+						builder.normalize(
+							assumption_context,
+							ty,
+							NormalizationDepth::Deep,
+							RewriteFacts::ALL
+						),
 						Ok(TypeIndex::UNIT)
 					);
 					assert!(
@@ -16187,7 +16234,12 @@ pub(super) mod tests {
 						Type::AssocTypeProjection { .. }
 					));
 					assert_eq!(
-						builder.normalize_type_query(env, written),
+						builder.normalize(
+							env,
+							written,
+							NormalizationDepth::Deep,
+							RewriteFacts::ALL
+						),
 						Ok(u)
 					);
 					// ...and either spelling satisfies `Marker` there.

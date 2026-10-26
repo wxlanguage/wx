@@ -22,7 +22,9 @@ use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
 use super::obligations::{BoundRequirements, Obligation, ObligationChecker};
 use super::signatures::{LexicalScope, TypeContext};
-use super::solver::{SolverError, Unsatisfied};
+use super::solver::{
+	NormalizationDepth, RewriteFacts, SolverError, Unsatisfied,
+};
 use super::types::{Type, TypeEnvIdx, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
@@ -250,10 +252,12 @@ impl ObligationChecker<'_> {
 				.declared_trait_member(TraitIdx::new(index as u32), key)
 				.is_some()
 		});
-		let normalized = match self.solver.normalize_head_query(
+		let normalized = match self.solver.normalize(
 			&mut self.view,
 			assumption_context,
 			projection,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
 		) {
 			Ok(normalized) => normalized,
 			// The projection has no value (an impl omits it, or its own

@@ -24,7 +24,7 @@ use super::defs::{
 	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
 	TraitImplIdx,
 };
-use super::eval::{Allocation, ConstValueState, Unevaluable, value_bits};
+use super::eval::{Allocation, ConstValueState, value_bits};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::layout::Layouts;
 use super::members::{TraitImplLookup, TraitMemberSelection};
@@ -495,7 +495,7 @@ impl Solver {
 			scope,
 			value,
 			NormalizationDepth::Deep,
-			RewriteFacts::EqualitiesAndDefinitions,
+			RewriteFacts::ALL,
 		);
 		let Some(SolverFrame::Judgement { outer_budget, .. }) =
 			self.state.frames.pop()
@@ -661,6 +661,12 @@ impl Normalization {
 		} else {
 			TypeEnvIdx::ROOT
 		};
+		// Likewise, a type that cannot reach a constant reads no values.
+		let facts = if types.has_const(ty) || types.has_projection(ty) {
+			facts
+		} else {
+			facts.without(RewriteFacts::VALUES)
+		};
 		Self {
 			env,
 			ty,
@@ -672,21 +678,44 @@ impl Normalization {
 
 /// How far into a type a normalization reduces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum NormalizationDepth {
+pub(super) enum NormalizationDepth {
 	/// Only the outermost type: enough to select an impl.
 	Shallow,
 	/// The type and every type nested in it.
 	Deep,
 }
 
-/// The facts that may replace a projection with a value.
+/// The facts that may rewrite a type, each a source of answers of its own.
+/// They are part of a request's identity: the same type under other facts can
+/// mean something else.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum RewriteFacts {
-	/// Only equalities written in bounds. Comparing evidence for a trait must
-	/// not select the impl being proved.
-	Equalities,
-	/// Equalities, and the impl's definition when no equality applies.
-	EqualitiesAndDefinitions,
+pub(super) struct RewriteFacts(u8);
+
+impl RewriteFacts {
+	/// Equalities written in bounds. Comparing evidence for a trait reads only
+	/// these: it must not select the impl being proved.
+	pub(super) const EQUALITIES: Self = Self(1 << 0);
+	/// The impl's definition, when no equality applies.
+	pub(super) const DEFINITIONS: Self = Self(1 << 1);
+	/// The value of a constant named in a type. Without it a `Const` stays as
+	/// written, whether or not it can be evaluated.
+	pub(super) const VALUES: Self = Self(1 << 2);
+	/// Every source: what a request that is not comparing evidence reads.
+	pub(super) const ALL: Self = Self::EQUALITIES
+		.union(Self::DEFINITIONS)
+		.union(Self::VALUES);
+
+	pub(super) const fn union(self, other: Self) -> Self {
+		Self(self.0 | other.0)
+	}
+
+	pub(super) const fn without(self, other: Self) -> Self {
+		Self(self.0 & !other.0)
+	}
+
+	pub(super) fn contains(self, other: Self) -> bool {
+		self.0 & other.0 == other.0
+	}
 }
 
 /// What the assumptions in scope say a projection equals. Unfinished facts are
@@ -822,55 +851,6 @@ impl<'a> SolverView<'a> {
 }
 
 impl Solver {
-	/// A ready result can be an abstract projection. Pending is a dependency
-	/// state, never evidence that a concrete impl does not match.
-	pub(super) fn normalize_head_query(
-		&mut self,
-		view: &mut SolverView<'_>,
-		env: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<TypeIndex, SolverError> {
-		self.normalize(
-			view,
-			env,
-			ty,
-			NormalizationDepth::Shallow,
-			RewriteFacts::EqualitiesAndDefinitions,
-		)
-	}
-
-	pub(super) fn normalize_type_query(
-		&mut self,
-		view: &mut SolverView<'_>,
-		env: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<TypeIndex, SolverError> {
-		self.normalize(
-			view,
-			env,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFacts::EqualitiesAndDefinitions,
-		)
-	}
-
-	pub(super) fn normalize_assumed_type_query(
-		&mut self,
-		view: &mut SolverView<'_>,
-		env: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<TypeIndex, SolverError> {
-		self.normalize(
-			view,
-			env,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFacts::Equalities,
-		)
-	}
-}
-
-impl Solver {
 	/// The cache layer around `normalize_uncached`. An answer that read a frame
 	/// below its own request (cycle and rollback state, an open judgement)
 	/// holds only while that frame is open, so it is not stored. Only a request
@@ -885,7 +865,7 @@ impl Solver {
 	/// as rustc's search graph does. Worth it once body checking makes
 	/// normalization measurably hot; every frame-pushing path must then record
 	/// itself, or reads silently become order-dependent.
-	fn normalize(
+	pub(super) fn normalize(
 		&mut self,
 		view: &mut SolverView<'_>,
 		assumption_context: TypeEnvIdx,
@@ -982,9 +962,9 @@ impl Solver {
 		result
 	}
 
-	/// A constant in a type means its value, evaluated here on first use;
-	/// one whose body is not built yet is `Pending`. A constant with type
-	/// arguments is not evaluated yet, so it keeps its normalized arguments.
+	/// A constant in a type means its value, evaluated here on first use.
+	/// Without `VALUES`, or with type arguments (not evaluated yet), it keeps
+	/// its normalized arguments.
 	fn normalize_const(
 		&mut self,
 		view: &mut SolverView<'_>,
@@ -994,7 +974,7 @@ impl Solver {
 		depth: NormalizationDepth,
 		facts: RewriteFacts,
 	) -> Result<TypeIndex, SolverError> {
-		if !type_args.is_empty() {
+		if !type_args.is_empty() || !facts.contains(RewriteFacts::VALUES) {
 			let mut type_args = view.types.list(type_args).to_vec();
 			for item in type_args.iter_mut() {
 				*item = self.normalize(
@@ -1012,7 +992,6 @@ impl Solver {
 				Some(bits) => Ok(view.types.intern(Type::Value { bits })),
 				None => Err(SolverError::Poisoned),
 			},
-			Err(Unevaluable::Pending) => Err(SolverError::Pending),
 			// Reported by the constant's own check, or where it is named.
 			Err(_) => Err(SolverError::Poisoned),
 		}
@@ -1153,7 +1132,7 @@ impl Solver {
 		if matches!(view.types.resolve(next_base), Type::Infer) {
 			return Ok(projection);
 		}
-		if facts == RewriteFacts::Equalities {
+		if !facts.contains(RewriteFacts::DEFINITIONS) {
 			return Ok(projection);
 		}
 		// `None` is silent on purpose: normalization is a query and reports
@@ -1489,8 +1468,13 @@ impl Solver {
 				return Ok(Some(TraitImplLookup::Abstract));
 			}
 		}
-		let normalized =
-			self.normalize_head_query(view, assumption_context, receiver)?;
+		let normalized = self.normalize(
+			view,
+			assumption_context,
+			receiver,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		)?;
 		if normalized == TypeIndex::ERROR {
 			return Err(SolverError::Poisoned);
 		}
@@ -1568,7 +1552,13 @@ impl Solver {
 		if depth > self.state.recursion_budget {
 			return Err(SolverError::Overflow);
 		}
-		let ty = self.normalize_head_query(view, assumption_context, ty)?;
+		let ty = self.normalize(
+			view,
+			assumption_context,
+			ty,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		)?;
 		let known = match *view.types.resolve(ty) {
 			// A constant is no value's type; lowering puts one only where a
 			// constant is expected.
@@ -1732,8 +1722,13 @@ impl Solver {
 		out: &mut Vec<LayoutValue>,
 		depth: usize,
 	) -> Result<bool, SolverError> {
-		let memory =
-			self.normalize_head_query(view, assumption_context, memory)?;
+		let memory = self.normalize(
+			view,
+			assumption_context,
+			memory,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		)?;
 		let Type::Memory { memory_index } = *view.types.resolve(memory) else {
 			out.push(LayoutValue::Abstract(pointer));
 			return Ok(true);
@@ -1799,10 +1794,12 @@ impl Solver {
 				.assumed_subjects(assumption_context, required)
 				.peekable();
 			if subjects.peek().is_some() {
-				let meaning = match self.normalize_assumed_type_query(
+				let meaning = match self.normalize(
 					view,
 					assumption_context,
 					ty,
+					NormalizationDepth::Deep,
+					RewriteFacts::EQUALITIES,
 				) {
 					Ok(meaning) => meaning,
 					Err(SolverError::Pending) => {
@@ -1812,10 +1809,12 @@ impl Solver {
 				};
 				if view.types.is_abstract(meaning) {
 					for subject in subjects {
-						match self.normalize_assumed_type_query(
+						match self.normalize(
 							view,
 							assumption_context,
 							subject,
+							NormalizationDepth::Deep,
+							RewriteFacts::EQUALITIES,
 						) {
 							Ok(candidate) if candidate == meaning => {
 								return Ok(Assumption::Holds);
@@ -1886,8 +1885,13 @@ impl Solver {
 		// (`find_trait_impl`, `type_satisfies_trait`, generic-impl matching)
 		// converges here, so normalizing once, here, closes the gap for all
 		// of them instead of requiring each to remember it independently.
-		let receiver =
-			self.normalize_type_query(view, assumption_context, receiver)?;
+		let receiver = self.normalize(
+			view,
+			assumption_context,
+			receiver,
+			NormalizationDepth::Deep,
+			RewriteFacts::ALL,
+		)?;
 		let Some(args) = view.types.match_impl_target(
 			target,
 			receiver,
@@ -2131,10 +2135,12 @@ impl Solver {
 			let mut receiver =
 				rebase(view.types, clause.subject, root, subject);
 			if clause.subject != root {
-				receiver = self.normalize_type_query(
+				receiver = self.normalize(
 					view,
 					assumption_context,
 					receiver,
+					NormalizationDepth::Deep,
+					RewriteFacts::ALL,
 				)?;
 			}
 			if self
@@ -2180,13 +2186,20 @@ impl Solver {
 					args: arguments,
 				},
 			);
-			let found = self.normalize_type_query(
+			let found = self.normalize(
 				view,
 				assumption_context,
 				projection,
+				NormalizationDepth::Deep,
+				RewriteFacts::ALL,
 			)?;
-			let expected =
-				self.normalize_type_query(view, assumption_context, expected)?;
+			let expected = self.normalize(
+				view,
+				assumption_context,
+				expected,
+				NormalizationDepth::Deep,
+				RewriteFacts::ALL,
+			)?;
 			if found == expected
 				|| found == TypeIndex::ERROR
 				|| expected == TypeIndex::ERROR
@@ -2342,33 +2355,25 @@ impl TypeContext<'_, '_, '_> {
 		)
 	}
 
-	pub(super) fn normalize_head_query(
+	/// `ty` under `assumption_context`, reduced to `depth` by `facts`. A ready
+	/// result can be an abstract projection. Pending is a dependency state,
+	/// never evidence that a concrete impl does not match.
+	pub(super) fn normalize(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
+		depth: NormalizationDepth,
+		facts: RewriteFacts,
 	) -> Result<TypeIndex, SolverError> {
-		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
+		// Assumption-only reduction reads declared bounds and may run
+		// mid-construction; the impl definitions are what it must not read.
+		debug_assert!(
+			!facts.contains(RewriteFacts::DEFINITIONS)
+				|| self.query_stack.is_empty(),
+			"{IMPL_WHILE_BUILDING}"
+		);
 		let (solver, mut view) = self.solver_and_view();
-		solver.normalize_head_query(&mut view, assumption_context, ty)
-	}
-
-	pub(super) fn normalize_type_query(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<TypeIndex, SolverError> {
-		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
-		let (solver, mut view) = self.solver_and_view();
-		solver.normalize_type_query(&mut view, assumption_context, ty)
-	}
-
-	pub(super) fn normalize_assumed_type_query(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-	) -> Result<TypeIndex, SolverError> {
-		let (solver, mut view) = self.solver_and_view();
-		solver.normalize_assumed_type_query(&mut view, assumption_context, ty)
+		solver.normalize(&mut view, assumption_context, ty, depth, facts)
 	}
 
 	pub(super) fn find_trait_impl_query(
@@ -2437,7 +2442,12 @@ impl TypeContext<'_, '_, '_> {
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {
-		let result = self.normalize_head_query(assumption_context, ty);
+		let result = self.normalize(
+			assumption_context,
+			ty,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		);
 		self.settle(result, ty, site)
 	}
 
@@ -2448,7 +2458,12 @@ impl TypeContext<'_, '_, '_> {
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {
-		let result = self.normalize_type_query(assumption_context, ty);
+		let result = self.normalize(
+			assumption_context,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFacts::ALL,
+		);
 		self.settle(result, ty, site)
 	}
 

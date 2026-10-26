@@ -24,9 +24,12 @@ use super::literals::Integer;
 use super::members::report_type_does_not_implement_trait;
 use super::signatures::{ConstantSignature, TypeContext, TypeSetSignature};
 use super::solver::{
-	Definition, ImplMember, Solver, SolverError, SolverView, Verdict,
+	Definition, ImplMember, NormalizationDepth, RewriteFacts, Solver,
+	SolverError, SolverView, Verdict,
 };
-use super::types::{ImplKind, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList};
+use super::types::{
+	ImplKind, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner, TypeList,
+};
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
@@ -50,6 +53,26 @@ pub(super) enum BoundRequirements {
 		trait_index: TraitIdx,
 		receiver: TypeIndex,
 	},
+}
+
+impl BoundRequirements {
+	fn reads_values(&self, types: &TypeInterner) -> bool {
+		match *self {
+			Self::Parameter { arguments, .. } => types
+				.list(arguments)
+				.iter()
+				.any(|&argument| may_reach_value(types, argument)),
+			Self::AssociatedType { receiver, .. } => {
+				may_reach_value(types, receiver)
+			}
+		}
+	}
+}
+
+/// Whether normalizing `ty` can read a constant's value: a constant is in
+/// it, or a projection that reduces to one.
+fn may_reach_value(types: &TypeInterner, ty: TypeIndex) -> bool {
+	types.has_const(ty) || types.has_projection(ty)
 }
 
 #[derive(Clone, Copy)]
@@ -108,9 +131,9 @@ pub(super) enum Obligation {
 	},
 	/// A constant named in a type (an array's length) has exactly the type
 	/// its position needs, `expected` as written: a constant of another type
-	/// is a mismatch, even one whose value would fit. Checking it first
-	/// evaluates the constant (`TypeContext::check_now`), so the type it is
-	/// written in can be normalized to its value afterwards.
+	/// is a mismatch, even one whose value would fit. Both types are compared
+	/// normalized with every fact, so a constant either names is read; a
+	/// constant's body therefore records it for after the values exist.
 	CheckConstantType {
 		assumption_context: TypeEnvIdx,
 		constant: ConstIdx,
@@ -128,6 +151,36 @@ pub(super) enum Obligation {
 		name: SymbolU32,
 		reference: SourceSpan,
 	},
+}
+
+impl Obligation {
+	/// Whether checking this can read a constant's value, which a constant's
+	/// body, built before any value exists, leaves to be decided later.
+	pub(super) fn reads_values(&self, types: &TypeInterner) -> bool {
+		match *self {
+			Self::CheckBounds {
+				requirements,
+				argument,
+				..
+			} => {
+				may_reach_value(types, argument.inner)
+					|| requirements.reads_values(types)
+			}
+			Self::CheckTraitMembership { subject, .. } => {
+				may_reach_value(types, subject)
+			}
+			Self::CheckWellFormed { ty, .. }
+			| Self::CheckConstantFits { ty, .. } => may_reach_value(types, ty),
+			Self::CheckProjectionMember { projection, .. } => {
+				may_reach_value(types, projection)
+			}
+			// A constant's own type may name constants.
+			Self::CheckConstantType { .. } => true,
+			// Declarations' judgements, which no body records.
+			Self::CheckAssocValue { .. }
+			| Self::CheckImplRequirements { .. } => false,
+		}
+	}
 }
 
 impl TypeContext<'_, '_, '_> {
@@ -162,23 +215,16 @@ impl TypeContext<'_, '_, '_> {
 
 	/// Checks `obligations` once every signature exists: a declaration's
 	/// own, or what a body recorded while lowering a written type. A failure
-	/// reports itself. Returns the ones that are pending: they read a
-	/// constant's value while constant bodies are still being built, which
-	/// only a constant's body can, and it decides them once every body exists.
-	#[must_use]
-	pub(super) fn check_now(
-		&mut self,
-		obligations: &[Obligation],
-	) -> Vec<Obligation> {
-		let mut pending = Vec::new();
+	/// reports itself. Every signature and every constant body exists by
+	/// now, so a check can read any value.
+	pub(super) fn check_now(&mut self, obligations: &[Obligation]) {
 		for obligation in obligations {
-			if let Err(SolverError::Pending) =
-				self.obligation_checker().check(obligation)
-			{
-				pending.push(*obligation);
-			}
+			let result = self.obligation_checker().check(obligation);
+			debug_assert!(
+				!matches!(result, Err(SolverError::Pending)),
+				"every signature and every constant body exists"
+			);
 		}
-		pending
 	}
 
 	/// A solver that cannot finish (budget or cycle) reports nothing; the
@@ -339,10 +385,12 @@ impl ObligationChecker<'_> {
 				ty,
 				..
 			} => {
-				self.solver.normalize_type_query(
+				self.solver.normalize(
 					&mut self.view,
 					assumption_context,
 					ty,
+					NormalizationDepth::Deep,
+					RewriteFacts::ALL,
 				)?;
 				Ok(())
 			}
@@ -445,10 +493,12 @@ impl ObligationChecker<'_> {
 		bits: u64,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		let ty = self.solver.normalize_type_query(
+		let ty = self.solver.normalize(
 			&mut self.view,
 			assumption_context,
 			ty,
+			NormalizationDepth::Deep,
+			RewriteFacts::ALL,
 		)?;
 		if let Some(integer) = Integer::from_type(ty) {
 			if integer.in_range(bits, false) {
@@ -524,12 +574,19 @@ impl ObligationChecker<'_> {
 	) -> Result<(), SolverError> {
 		let signature = &self.constants[usize::from(constant)];
 		let (ty, env) = (signature.ty, signature.env);
-		let found =
-			self.solver.normalize_type_query(&mut self.view, env, ty)?;
-		let expected = self.solver.normalize_type_query(
+		let found = self.solver.normalize(
+			&mut self.view,
+			env,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFacts::ALL,
+		)?;
+		let expected = self.solver.normalize(
 			&mut self.view,
 			assumption_context,
 			expected,
+			NormalizationDepth::Deep,
+			RewriteFacts::ALL,
 		)?;
 		if found == expected
 			|| found == TypeIndex::ERROR

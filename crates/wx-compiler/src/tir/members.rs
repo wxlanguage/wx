@@ -28,7 +28,9 @@ use super::signatures::{
 	InferPolicy, LexicalScope, QueryInfo, SignatureLocation, SignatureStatus,
 	TypeContext,
 };
-use super::solver::{Assumption, SolverError};
+use super::solver::{
+	Assumption, NormalizationDepth, RewriteFacts, SolverError,
+};
 use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner};
 
 /// What type-relative member applicability found.
@@ -244,9 +246,12 @@ impl TypeContext<'_, '_, '_> {
 		}
 		// Only assumed equalities may rewrite the receiver here, so a concrete
 		// head can come from evidence in scope but never from selecting an impl.
-		let receiver = match self
-			.normalize_assumed_type_query(assumption_context, receiver)
-		{
+		let receiver = match self.normalize(
+			assumption_context,
+			receiver,
+			NormalizationDepth::Deep,
+			RewriteFacts::EQUALITIES,
+		) {
 			Ok(receiver) => receiver,
 			Err(error) => return error.into(),
 		};
@@ -341,11 +346,15 @@ impl TypeContext<'_, '_, '_> {
 				found => return found,
 			}
 		}
-		let receiver =
-			match self.normalize_head_query(assumption_context, receiver) {
-				Ok(receiver) => receiver,
-				Err(error) => return error.into(),
-			};
+		let receiver = match self.normalize(
+			assumption_context,
+			receiver,
+			NormalizationDepth::Shallow,
+			RewriteFacts::ALL,
+		) {
+			Ok(receiver) => receiver,
+			Err(error) => return error.into(),
+		};
 		if receiver == TypeIndex::ERROR {
 			return MemberLookup::Error;
 		}
@@ -566,7 +575,12 @@ impl TypeContext<'_, '_, '_> {
 		// Only assumed equalities may rewrite the receiver here, as for an
 		// associated type; a failure is the trait selection's to report.
 		let receiver = self
-			.normalize_assumed_type_query(scope.env, receiver)
+			.normalize(
+				scope.env,
+				receiver,
+				NormalizationDepth::Deep,
+				RewriteFacts::EQUALITIES,
+			)
 			.ok()?;
 		let target = ImplTarget::from_type(self.types.resolve(receiver))?;
 		let impl_dispatch = self.impl_dispatch;

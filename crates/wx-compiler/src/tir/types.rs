@@ -324,6 +324,8 @@ impl TypeFlags {
 	/// An `AssocTypeProjection` or a `Const` is in it: normalization can
 	/// change the type.
 	pub(super) const HAS_PROJECTION: Self = Self(1 << 4);
+	/// A `Const` is in it: its value can replace it, once evaluated.
+	pub(super) const HAS_CONST: Self = Self(1 << 5);
 
 	fn union(self, other: Self) -> Self {
 		Self(self.0 | other.0)
@@ -840,7 +842,8 @@ impl TypeInterner {
 				TypeFlags::HAS_PROJECTION.union(self.flags[usize::from(base)])
 			}
 			Type::Const { type_args, .. } => {
-				let mut flags = TypeFlags::HAS_PROJECTION;
+				let mut flags =
+					TypeFlags::HAS_PROJECTION.union(TypeFlags::HAS_CONST);
 				for &part in type_args.slice(&self.lists) {
 					flags = flags.union(self.flags[usize::from(part)]);
 				}
@@ -928,6 +931,12 @@ impl TypeInterner {
 	/// normal, in every assumption context.
 	pub(super) fn has_projection(&self, ty: TypeIndex) -> bool {
 		self.flags[usize::from(ty)].contains(TypeFlags::HAS_PROJECTION)
+	}
+
+	/// Whether something in `ty` is a constant named, not evaluated: without
+	/// one, no value changes it.
+	pub(super) fn has_const(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_CONST)
 	}
 
 	/// The type both `a` and `b` describe, where `Infer` is a part not known
