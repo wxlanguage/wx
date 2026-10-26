@@ -81,11 +81,14 @@ impl ImplTarget {
 			| Type::Integer
 			| Type::Float
 			| Type::String
+			| Type::ArrayLiteral
 			| Type::Tuple { .. }
 			| Type::FunctionRef { .. }
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
-			| Type::AssocTypeProjection { .. } => return None,
+			| Type::AssocTypeProjection { .. }
+			| Type::Value { .. }
+			| Type::Const { .. } => return None,
 		})
 	}
 }
@@ -659,7 +662,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	) -> Result<ImplTarget, ()> {
 		if params
 			.iter()
-			.any(|param| param.name.inner == path.segments[0].ident.inner)
+			.any(|param| param.name().inner == path.segments[0].ident.inner)
 		{
 			self.diagnostics.push(
 				Diagnostic::error()

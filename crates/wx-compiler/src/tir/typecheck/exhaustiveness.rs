@@ -1,18 +1,18 @@
 //! Exhaustiveness and unreachable arms: a match's patterns, lowered for the
 //! usefulness pass (`tir::usefulness`), and what it finds, reported.
 //!
-//! A constant compares as its value when it is one number this body can
-//! evaluate, else it is opaque: it covers nothing but itself, so a match
-//! naming it still needs `_`. A constant's value is known wherever a pattern
-//! may name it, a function's block or an initializer's alike; one that is
-//! still being built, or that `eval` cannot reduce to a number, is opaque,
-//! and an enum whose variants have no value is unlisted.
+//! A constant compares as its value when it is one number, else it is
+//! opaque: it covers nothing but itself, so a match naming it still needs
+//! `_`. One that `eval` cannot reduce to a number is opaque, and an enum whose
+//! variants have no value is unlisted. A constant's body is built before any
+//! value exists, so its matches are decided once they do
+//! (`ExprObligation::Match`).
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
-use crate::tir::body::{Arm, ExprIdx, PatIdx, PatternKind};
+use crate::tir::body::{ExprIdx, ExprKind, PatIdx, PatternKind};
 use crate::tir::defs::{ConstIdx, EnumIdx};
 use crate::tir::types::{Type, TypeIndex, TypeList};
 use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
@@ -21,44 +21,47 @@ use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
 const SHOWN_WITNESSES: usize = 3;
 
 impl BodyContext<'_, '_, '_, '_> {
-	/// Reports each arm the arms before it cover, and the values no arm
-	/// matches. A match with a pattern that failed to check is left alone:
-	/// what failed has said why.
-	pub(super) fn check_match_usefulness(
-		&mut self,
-		scrutinee: ExprIdx,
-		arms: &[Arm],
-	) {
+	/// Reports each arm of `expr`, a `match`, that the arms before it cover,
+	/// and the values no arm matches. A match with a pattern that failed to
+	/// check is left alone: what failed has said why. Decided as an
+	/// `ExprObligation`, since an arm may compare with a constant's value.
+	pub(super) fn check_match_usefulness(&mut self, expr: ExprIdx) {
+		let ExprKind::Match { scrutinee, arms } = self.body.kind(expr) else {
+			unreachable!("usefulness is a match's")
+		};
+		let arms = self.body.arms(arms).to_vec();
 		let ty = self.body.ty(scrutinee);
 		if self.cx.types.has_error(ty) {
 			return;
 		}
 		let mut rows = Vec::with_capacity(arms.len());
-		for arm in arms {
+		for arm in &arms {
 			let Some(pattern) = self.lower_pattern(arm.pattern) else {
 				return;
 			};
 			rows.push(vec![pattern]);
 		}
-		for (at, arm) in arms.iter().enumerate() {
-			if witnesses(self, &rows[..at], &rows[at], &[ty], 1).is_empty() {
-				let span = self.body.pattern_span(arm.pattern);
-				self.cx.diagnostics.push(
-					Diagnostic::warning()
-						.with_code(DiagnosticCode::UnreachableMatchArm.code())
-						.with_message("unreachable match arm")
-						.with_label(
-							Label::primary(self.scope.file_id, span)
-								.with_message(
-									"the arms before it match every value \
-									 this does",
-								),
-						),
-				);
-			}
-		}
+		let unreachable: Vec<PatIdx> = (0..arms.len())
+			.filter(|&at| {
+				witnesses(self, &rows[..at], &rows[at], &[ty], 1).is_empty()
+			})
+			.map(|at| arms[at].pattern)
+			.collect();
 		let missing =
 			witnesses(self, &rows, &[Pat::Wild], &[ty], SHOWN_WITNESSES + 1);
+		for pattern in unreachable {
+			let span = self.body.pattern_span(pattern);
+			self.cx.diagnostics.push(
+				Diagnostic::warning()
+					.with_code(DiagnosticCode::UnreachableMatchArm.code())
+					.with_message("unreachable match arm")
+					.with_label(
+						Label::primary(self.scope.file_id, span).with_message(
+							"the arms before it match every value this does",
+						),
+					),
+			);
+		}
 		if missing.is_empty() {
 			return;
 		}
@@ -167,7 +170,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if !self.cx.types.list(type_args).is_empty() {
 			return None;
 		}
-		let bits = self.cx.constant_bits(constant)?;
+		let bits = self.pattern_bits(constant)?;
 		match Integer::from_type(ty) {
 			Some(integer) => Some(bits & integer.mask()),
 			None => match *self.cx.types.resolve(ty) {
@@ -180,6 +183,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 	}
 
+	/// A constant's value as a pattern compares with it; `None` when it has
+	/// none (it is opaque to the match).
+	fn pattern_bits(&mut self, constant: ConstIdx) -> Option<u64> {
+		self.cx.constant_bits(constant).ok().flatten()
+	}
+
 	/// The value of each of an enum's variants, in written order, each once;
 	/// `None` when one has no value here.
 	fn variant_values(&mut self, enum_index: EnumIdx) -> Option<Vec<u64>> {
@@ -187,7 +196,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.cx.defs.enums[usize::from(enum_index)].variants.clone();
 		let mut values = Vec::new();
 		for at in u32::from(variants.start)..u32::from(variants.end) {
-			let bits = self.cx.constant_bits(ConstIdx::new(at))?;
+			let bits = self.pattern_bits(ConstIdx::new(at))?;
 			if !values.contains(&bits) {
 				values.push(bits);
 			}
@@ -236,7 +245,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			let (enum_name, variants) = (def.name.inner, def.variants.clone());
 			for at in u32::from(variants.start)..u32::from(variants.end) {
 				let constant = ConstIdx::new(at);
-				if self.cx.constant_bits(constant) == Some(bits) {
+				if self.pattern_bits(constant) == Some(bits) {
 					let variant =
 						self.cx.defs.constants[at as usize].name.inner;
 					return format!(

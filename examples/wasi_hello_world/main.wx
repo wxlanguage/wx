@@ -3,7 +3,7 @@
 // builds a WASI iovec in linear memory, and writes it to fd 1 (stdout).
 use std::*;
 
-enum FileDescriptor: u8 {
+enum FileDescriptor(u8) {
   StdIn = 0,
   StdOut,
   StdErr,

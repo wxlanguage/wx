@@ -22,6 +22,7 @@
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, StructIdx};
+use super::obligations::TypeObligation;
 use super::types::{TypeIndex, TypeList};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
@@ -52,21 +53,55 @@ pub(super) enum BodyOwner {
 	Global(GlobalIdx),
 }
 
-/// A constant's checked initializer, and how far along it is.
-///
-/// A body is built on demand (`ensure_const_body`), and building it may read
-/// another constant's value — a pattern that names it — which may build
-/// *this* constant's body in turn. The `Building` state is what stops that
-/// from repeating: a body that is already being built is not built again.
+/// A constant's checked initializer. Every one is built before anything
+/// evaluates (`TypeContext::build_constant_bodies`), so evaluation never
+/// reads a `NotBuilt` one.
 pub(super) enum ConstBody {
 	/// Not built yet.
 	NotBuilt,
-	/// Being built now. A read of this constant's value finds none: its
-	/// value cannot be known until its body is built, and its body cannot be
-	/// built while it is being built.
-	Building,
 	/// Built.
 	Built(Body),
+	/// It has none: a required trait constant.
+	Missing,
+}
+
+/// What a body requires of one of its own expressions, which needs a
+/// constant's value to decide: the counterpart of `TypeObligation`, whose
+/// subject is a type and which the solver decides. Building a body never reads
+/// a value, so it records these beside the body; a function's or a global's are
+/// decided as the body is finished, a constant's once every constant it reads
+/// is checked (`TypeContext::check_constant_bodies`).
+#[derive(Clone, Copy)]
+pub(super) enum ExprObligation {
+	/// `expr`'s type is `expected`; one of them holds a constant not
+	/// evaluated yet, as rustc's `ConstEquate`.
+	Equal { expr: ExprIdx, expected: TypeIndex },
+	/// A string or array literal `expr` of length `length` (a `Value`, or a
+	/// `Const` for a repeat's count) is as long as `target`, an array.
+	StaticLength {
+		expr: ExprIdx,
+		target: TypeIndex,
+		length: TypeIndex,
+	},
+	/// A `match`'s exhaustiveness and unreachable arms: a pattern compares
+	/// with a constant's value.
+	Match(ExprIdx),
+}
+
+/// What building a body left undecided, beside the body: a function's or a
+/// global's are decided as the body is finished, a constant's are kept
+/// (`TypeContext::const_obligations`) until it is checked.
+#[derive(Default)]
+pub(super) struct Obligations {
+	/// What lowering the body's written types required.
+	pub(super) types: Vec<TypeObligation>,
+	pub(super) exprs: Vec<ExprObligation>,
+}
+
+impl Obligations {
+	pub(super) fn is_empty(&self) -> bool {
+		self.types.is_empty() && self.exprs.is_empty()
+	}
 }
 
 /// A run of `Body::extra`: the arguments of a call or a construction, in the
@@ -182,6 +217,19 @@ pub(super) enum ExprKind {
 	/// A string literal's contents, unescaped. Its type is a shared byte
 	/// slice or byte array its context gives (`Type::String` until then).
 	String(SymbolU32),
+	/// An array literal `[a, b, c]`. Its type is a shared array of its length
+	/// or a shared slice its context gives (`Type::ArrayLiteral` until then),
+	/// and each element has that type's element type.
+	Array {
+		elements: ExprRange,
+	},
+	/// A repeat `[value; count]`, typed as an array literal is; `count` is
+	/// an integer literal or a constant, or `None` for `_`, the length of the
+	/// array its context gives.
+	ArrayRepeat {
+		value: ExprIdx,
+		count: Option<ExprIdx>,
+	},
 	/// A known constant's value: a free one, a variant, or an impl's (an
 	/// inherent impl's, or the one a concrete trait impl defines), with its
 	/// flat type arguments, the impl's; empty when it has none.
@@ -475,6 +523,7 @@ pub(super) enum PlaceKind {
 }
 
 /// One definition's checked expression tree.
+#[derive(Default)]
 pub(super) struct Body {
 	kinds: Vec<ExprKind>,
 	types: Vec<TypeIndex>,
@@ -493,12 +542,15 @@ pub(super) struct Body {
 	pat_spans: Vec<TextSpan>,
 	pat_lists: Vec<PatIdx>,
 	arms: Vec<Arm>,
-	root: ExprIdx,
+	/// The string and array literals, in arena order (an inner one before the one
+	/// holding it): the static data lowering evaluates.
+	statics: Vec<ExprIdx>,
 }
 
 impl Body {
+	/// The last node pushed: every child comes before its parent.
 	pub(super) fn root(&self) -> ExprIdx {
-		self.root
+		ExprIdx::new(u32::try_from(self.kinds.len() - 1).unwrap())
 	}
 
 	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
@@ -577,30 +629,13 @@ impl Body {
 	pub(super) fn arms(&self, range: ArmRange) -> &[Arm] {
 		&self.arms[range.start as usize..(range.start + range.len) as usize]
 	}
+
+	pub(super) fn statics(&self) -> &[ExprIdx] {
+		&self.statics
+	}
 }
 
-/// Builds a `Body`. The checker owns one while it walks a definition, and may
-/// rewrite a node's kind or type after pushing it (literal coercion).
-#[derive(Default)]
-pub(super) struct BodyBuilder {
-	kinds: Vec<ExprKind>,
-	types: Vec<TypeIndex>,
-	spans: Vec<TextSpan>,
-	extra: Vec<ExprIdx>,
-	arg_order: Vec<ParamIdx>,
-	scopes: Vec<Scope>,
-	labels: Vec<Label>,
-	locals: Vec<Local>,
-	params: Vec<Option<LocalIdx>>,
-	places: Vec<Place>,
-	pat_kinds: Vec<PatternKind>,
-	pat_types: Vec<TypeIndex>,
-	pat_spans: Vec<TextSpan>,
-	pat_lists: Vec<PatIdx>,
-	arms: Vec<Arm>,
-}
-
-impl BodyBuilder {
+impl Body {
 	pub(super) fn push(
 		&mut self,
 		kind: ExprKind,
@@ -612,25 +647,6 @@ impl BodyBuilder {
 		self.types.push(ty);
 		self.spans.push(span);
 		index
-	}
-
-	/// The arguments pushed as `range`.
-	pub(super) fn args(&self, range: ExprRange) -> &[ExprIdx] {
-		&self.extra[range.start as usize..(range.start + range.len) as usize]
-	}
-
-	/// The position the element at `at`, in written order, gives.
-	pub(super) fn declared_index(
-		&self,
-		order: ElementOrder,
-		at: usize,
-	) -> ParamIdx {
-		match order {
-			ElementOrder::InOrder => ParamIdx::new(at as u32),
-			ElementOrder::Permuted { start } => {
-				self.arg_order[start as usize + at]
-			}
-		}
 	}
 
 	pub(super) fn push_args(
@@ -717,83 +733,17 @@ impl BodyBuilder {
 		ArmRange { start, len }
 	}
 
-	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
-		self.kinds[usize::from(expr)]
-	}
-
-	pub(super) fn ty(&self, expr: ExprIdx) -> TypeIndex {
-		self.types[usize::from(expr)]
-	}
-
-	pub(super) fn span(&self, expr: ExprIdx) -> TextSpan {
-		self.spans[usize::from(expr)]
-	}
-
-	pub(super) fn scope(&self, scope: ScopeIdx) -> &Scope {
-		&self.scopes[usize::from(scope)]
-	}
-
-	pub(super) fn label(&self, label: LabelIdx) -> &Label {
-		&self.labels[usize::from(label)]
-	}
-
-	pub(super) fn local(&self, local: LocalIdx) -> &Local {
-		&self.locals[usize::from(local)]
-	}
-
-	pub(super) fn place(&self, place: PlaceIdx) -> &Place {
-		&self.places[usize::from(place)]
-	}
-
-	pub(super) fn pattern(&self, pattern: PatIdx) -> PatternKind {
-		self.pat_kinds[usize::from(pattern)]
-	}
-
-	pub(super) fn pattern_ty(&self, pattern: PatIdx) -> TypeIndex {
-		self.pat_types[usize::from(pattern)]
-	}
-
-	pub(super) fn pattern_span(&self, pattern: PatIdx) -> TextSpan {
-		self.pat_spans[usize::from(pattern)]
-	}
-
-	pub(super) fn patterns(&self, range: PatternRange) -> &[PatIdx] {
-		&self.pat_lists
-			[range.start as usize..(range.start + range.len) as usize]
-	}
-
-	pub(super) fn arms(&self, range: ArmRange) -> &[Arm] {
-		&self.arms[range.start as usize..(range.start + range.len) as usize]
-	}
-
 	pub(super) fn set_kind(&mut self, expr: ExprIdx, kind: ExprKind) {
 		self.kinds[usize::from(expr)] = kind;
 	}
 
-	pub(super) fn set_ty(&mut self, expr: ExprIdx, ty: TypeIndex) {
-		self.types[usize::from(expr)] = ty;
+	/// Records a literal as static data (`Body::statics`).
+	pub(super) fn push_static(&mut self, expr: ExprIdx) {
+		self.statics.push(expr);
 	}
 
-	pub(super) fn finish(self, root: ExprIdx) -> Body {
-		debug_assert_eq!(usize::from(root) + 1, self.kinds.len());
-		Body {
-			kinds: self.kinds,
-			types: self.types,
-			spans: self.spans,
-			extra: self.extra,
-			arg_order: self.arg_order,
-			scopes: self.scopes,
-			labels: self.labels,
-			locals: self.locals,
-			params: self.params,
-			places: self.places,
-			pat_kinds: self.pat_kinds,
-			pat_types: self.pat_types,
-			pat_spans: self.pat_spans,
-			pat_lists: self.pat_lists,
-			arms: self.arms,
-			root,
-		}
+	pub(super) fn set_ty(&mut self, expr: ExprIdx, ty: TypeIndex) {
+		self.types[usize::from(expr)] = ty;
 	}
 }
 

@@ -59,6 +59,7 @@ impl TypeIndex {
 		self == TypeIndex::INTEGER
 			|| self == TypeIndex::FLOAT
 			|| self == TypeIndex::STRING
+			|| self == TypeIndex::ARRAY_LITERAL
 	}
 
 	#[inline]
@@ -110,6 +111,7 @@ impl TypeIndex {
 	pub const BOOL: TypeIndex = TypeIndex(16);
 	pub const CHAR: TypeIndex = TypeIndex(17);
 	pub const STRING: TypeIndex = TypeIndex(18);
+	pub const ARRAY_LITERAL: TypeIndex = TypeIndex(19);
 }
 
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
@@ -183,6 +185,10 @@ pub enum Type {
 	/// byte array of the literal's length, in a memory its context gives
 	/// (`coerce`).
 	String,
+	/// An untyped array literal's type: a shared array of the literal's
+	/// length or a shared slice of its elements' type, in a memory its
+	/// context gives (`coerce`).
+	ArrayLiteral,
 	U8,
 	I8,
 	U16,
@@ -232,9 +238,11 @@ pub enum Type {
 		memory: TypeIndex,
 		ownership: crate::ast::Ownership,
 	},
+	/// `M::&[T; N]`. The length is a type-level constant: a `Value`, or
+	/// `Infer` until its context gives one.
 	Array {
 		of: TypeIndex,
-		size: u32,
+		length: TypeIndex,
 		memory: TypeIndex,
 		ownership: crate::ast::Ownership,
 	},
@@ -270,6 +278,22 @@ pub enum Type {
 		env: TypeEnvIdx,
 		param_index: u32,
 	},
+	/// A constant in a type, such as an array's length. It holds the bits
+	/// alone: its type is the one where it appears (an array's length is its
+	/// memory's `Size`), so the same number is the same type in every place,
+	/// as rustc's `ty::Const` has no type of its own.
+	Value {
+		bits: u64,
+	},
+	/// A constant named in a type (`[u8; SIZE]`), with its flat type
+	/// arguments as a `Function`'s: an impl's, then its own, or `[Self]`
+	/// for a trait's declaration. Like a projection, it is replaced by what
+	/// it means, its `Value`, once that is known: a free constant's once it
+	/// is evaluated.
+	Const {
+		constant: ConstIdx,
+		type_args: TypeList,
+	},
 	/// `<Base as Trait>::Item`, pending normalization. The base can be
 	/// concrete or abstract. `assoc_type_index` always names the trait's
 	/// declaration, never an impl's value provider; substitution preserves
@@ -297,8 +321,11 @@ impl TypeFlags {
 	pub(super) const HAS_UNTYPED: Self = Self(1 << 2);
 	/// A `TypeParam` is in it: substitution can change the type.
 	pub(super) const HAS_PARAM: Self = Self(1 << 3);
-	/// An `AssocTypeProjection` is in it: normalization can change the type.
+	/// An `AssocTypeProjection` or a `Const` is in it: normalization can
+	/// change the type.
 	pub(super) const HAS_PROJECTION: Self = Self(1 << 4);
+	/// A `Const` is in it: its value can replace it, once evaluated.
+	pub(super) const HAS_CONST: Self = Self(1 << 5);
 
 	fn union(self, other: Self) -> Self {
 		Self(self.0 | other.0)
@@ -355,6 +382,16 @@ impl Type {
 			} => (
 				Type::Function {
 					func_index,
+					type_args: TypeList::EMPTY,
+				},
+				type_args,
+			),
+			Type::Const {
+				constant,
+				type_args,
+			} => (
+				Type::Const {
+					constant,
 					type_args: TypeList::EMPTY,
 				},
 				type_args,
@@ -458,6 +495,22 @@ impl TypeInterner {
 				args,
 			),
 			(
+				Type::Const {
+					constant: a,
+					type_args: xs,
+				},
+				Type::Const {
+					constant: b,
+					type_args: ys,
+				},
+			) if a == b => self.match_patterns(
+				self.list(*xs),
+				self.list(*ys),
+				envs,
+				env,
+				args,
+			),
+			(
 				Type::FunctionRef {
 					param: xp,
 					result: xr,
@@ -488,18 +541,19 @@ impl TypeInterner {
 			(
 				Type::Array {
 					of: x,
-					size: xs,
+					length: xl,
 					memory: xm,
 					ownership: xo,
 				},
 				Type::Array {
 					of: y,
-					size: ys,
+					length: yl,
 					memory: ym,
 					ownership: yo,
 				},
-			) if xs == ys && xo == yo => {
+			) if xo == yo => {
 				self.match_pattern(*x, *y, envs, env, args)?;
+				self.match_pattern(*xl, *yl, envs, env, args)?;
 				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
@@ -586,6 +640,7 @@ impl TypeInterner {
 			Type::Bool,
 			Type::Char,
 			Type::String,
+			Type::ArrayLiteral,
 		] {
 			types.intern(ty);
 		}
@@ -671,6 +726,29 @@ impl TypeInterner {
 		)
 	}
 
+	pub(super) fn intern_const(
+		&mut self,
+		constant: ConstIdx,
+		type_args: &[TypeIndex],
+	) -> TypeIndex {
+		let shape = Type::Const {
+			constant,
+			type_args: TypeList::EMPTY,
+		};
+		let hash = self.hasher.hash_one((shape, type_args));
+		if let Some(index) = self.find(hash, shape, type_args) {
+			return index;
+		}
+		let list = self.push_list(type_args);
+		self.insert(
+			hash,
+			Type::Const {
+				constant,
+				type_args: list,
+			},
+		)
+	}
+
 	/// Stores `elements` as a list of their own, not shared with an equal one:
 	/// a type's list is shared through the type, which is interned.
 	pub(super) fn push_list<'e>(
@@ -733,7 +811,7 @@ impl TypeInterner {
 		match ty {
 			Type::Infer => TypeFlags::HAS_INFER,
 			Type::Error => TypeFlags::HAS_ERROR,
-			Type::Integer | Type::Float | Type::String => {
+			Type::Integer | Type::Float | Type::String | Type::ArrayLiteral => {
 				TypeFlags::HAS_UNTYPED
 			}
 			Type::Tuple { elements: list }
@@ -750,14 +828,26 @@ impl TypeInterner {
 				flags
 			}
 			Type::Pointer { to: of, memory, .. }
-			| Type::Array { of, memory, .. }
 			| Type::Slice { of, memory, .. } => self.flags[usize::from(of)]
+				.union(self.flags[usize::from(memory)]),
+			Type::Array {
+				of, length, memory, ..
+			} => self.flags[usize::from(of)]
+				.union(self.flags[usize::from(length)])
 				.union(self.flags[usize::from(memory)]),
 			Type::FunctionRef { param, result } => self.flags
 				[usize::from(param)]
 			.union(self.flags[usize::from(result)]),
 			Type::AssocTypeProjection { base, .. } => {
 				TypeFlags::HAS_PROJECTION.union(self.flags[usize::from(base)])
+			}
+			Type::Const { type_args, .. } => {
+				let mut flags =
+					TypeFlags::HAS_PROJECTION.union(TypeFlags::HAS_CONST);
+				for &part in type_args.slice(&self.lists) {
+					flags = flags.union(self.flags[usize::from(part)]);
+				}
+				flags
 			}
 			Type::TypeParam { .. } => TypeFlags::HAS_PARAM,
 			Type::Never
@@ -775,7 +865,8 @@ impl TypeInterner {
 			| Type::Char
 			| Type::Enum { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. } => TypeFlags::default(),
+			| Type::Global { .. }
+			| Type::Value { .. } => TypeFlags::default(),
 		}
 	}
 
@@ -842,6 +933,12 @@ impl TypeInterner {
 		self.flags[usize::from(ty)].contains(TypeFlags::HAS_PROJECTION)
 	}
 
+	/// Whether something in `ty` is a constant named, not evaluated: without
+	/// one, no value changes it.
+	pub(super) fn has_const(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_CONST)
+	}
+
 	/// The type both `a` and `b` describe, where `Infer` is a part not known
 	/// yet and gives way to the other side: `Pair<_, u8>` and `Pair<u16, _>`
 	/// meet in `Pair<u16, u8>`. Parts meet where the constructors match. An
@@ -897,6 +994,19 @@ impl TypeInterner {
 				Some(self.intern_function(func_index, &type_args))
 			}
 			(
+				Type::Const {
+					constant,
+					type_args: a,
+				},
+				Type::Const {
+					constant: other,
+					type_args: b,
+				},
+			) if constant == other => {
+				let type_args = self.meet_lists(a, b)?;
+				Some(self.intern_const(constant, &type_args))
+			}
+			(
 				Type::FunctionRef { param, result },
 				Type::FunctionRef {
 					param: other_param,
@@ -930,22 +1040,23 @@ impl TypeInterner {
 			(
 				Type::Array {
 					of,
-					size,
+					length,
 					memory,
 					ownership,
 				},
 				Type::Array {
 					of: other_of,
-					size: other_size,
+					length: other_length,
 					memory: other_memory,
 					ownership: other_ownership,
 				},
-			) if size == other_size && ownership == other_ownership => {
+			) if ownership == other_ownership => {
 				let of = self.meet(of, other_of)?;
+				let length = self.meet(length, other_length)?;
 				let memory = self.meet(memory, other_memory)?;
 				Some(self.intern(Type::Array {
 					of,
-					size,
+					length,
 					memory,
 					ownership,
 				}))
@@ -1056,6 +1167,18 @@ impl TypeInterner {
 				self.learn_lists(envs, env, slots, declared, actual)
 			}
 			(
+				Type::Const {
+					constant,
+					type_args: declared,
+				},
+				Type::Const {
+					constant: other,
+					type_args: actual,
+				},
+			) if constant == other => {
+				self.learn_lists(envs, env, slots, declared, actual)
+			}
+			(
 				Type::FunctionRef { param, result },
 				Type::FunctionRef {
 					param: other_param,
@@ -1095,18 +1218,19 @@ impl TypeInterner {
 			(
 				Type::Array {
 					of,
-					size,
+					length,
 					memory,
 					ownership,
 				},
 				Type::Array {
 					of: other_of,
-					size: other_size,
+					length: other_length,
 					memory: other_memory,
 					ownership: other_ownership,
 				},
-			) if size == other_size && ownership == other_ownership => {
+			) if ownership == other_ownership => {
 				self.learn(envs, env, slots, of, other_of);
+				self.learn(envs, env, slots, length, other_length);
 				self.learn(envs, env, slots, memory, other_memory);
 			}
 			// A projection's value is not its base: `<T as Tr>::X` being `u8`
@@ -1207,6 +1331,13 @@ impl TypeInterner {
 				Some(type_args) => self.intern_function(func_index, &type_args),
 				None => ty,
 			},
+			Type::Const {
+				constant,
+				type_args,
+			} => match self.substitute_list(type_args, substitution) {
+				Some(type_args) => self.intern_const(constant, &type_args),
+				None => ty,
+			},
 			Type::FunctionRef { param, result } => {
 				let next_param = self.substitute(param, substitution);
 				let next_result = self.substitute(result, substitution);
@@ -1238,18 +1369,22 @@ impl TypeInterner {
 			}
 			Type::Array {
 				of,
-				size,
+				length,
 				memory,
 				ownership,
 			} => {
 				let next_of = self.substitute(of, substitution);
+				let next_length = self.substitute(length, substitution);
 				let next_memory = self.substitute(memory, substitution);
-				if next_of == of && next_memory == memory {
+				if next_of == of
+					&& next_length == length
+					&& next_memory == memory
+				{
 					ty
 				} else {
 					self.intern(Type::Array {
 						of: next_of,
-						size,
+						length: next_length,
 						memory: next_memory,
 						ownership,
 					})
@@ -1294,6 +1429,7 @@ impl TypeInterner {
 			| Type::Integer
 			| Type::Float
 			| Type::String
+			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1308,7 +1444,8 @@ impl TypeInterner {
 			| Type::Char
 			| Type::Enum { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. } => ty,
+			| Type::Global { .. }
+			| Type::Value { .. } => ty,
 		}
 	}
 
@@ -1901,9 +2038,10 @@ mod tests {
 			memory,
 			ownership: Ownership::Shared,
 		});
+		let seven = types.intern(Type::Value { bits: 7 });
 		let array = types.intern(Type::Array {
 			of: pointer,
-			size: 7,
+			length: seven,
 			memory,
 			ownership: Ownership::Exclusive,
 		});

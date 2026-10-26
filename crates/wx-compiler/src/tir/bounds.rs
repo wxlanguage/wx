@@ -141,6 +141,34 @@ impl<T> ClauseRange<T> {
 	}
 }
 
+/// Whether a subject's equality pass has run: the second half of
+/// `BoundClauses`, published once its memberships are.
+#[derive(Clone, Copy)]
+pub(super) enum Equalities {
+	/// The memberships are published, the values are not resolved yet, so a
+	/// read may conclude neither a proof nor a failure. Not an answer
+	/// (`SolverError::Pending`); ask again once construction has advanced.
+	Pending,
+	/// The pass is done: every equality the bound states.
+	Final(ClauseRange<EqualityClause>),
+}
+
+impl Equalities {
+	/// The range once the pass has run; `None` while it is pending.
+	pub(super) fn final_range(self) -> Option<ClauseRange<EqualityClause>> {
+		match self {
+			Self::Pending => None,
+			Self::Final(range) => Some(range),
+		}
+	}
+
+	/// The range, for tests that build final clauses by hand.
+	#[cfg(test)]
+	pub(super) fn resolved(self) -> ClauseRange<EqualityClause> {
+		self.final_range().expect("the test's clauses are final")
+	}
+}
+
 /// The clauses one subject's bounds state: a parameter's (`T: Tr where { A =
 /// X, A: B }`), or an associated type declaration's (`type A: B`, about
 /// `<Self as Tr>::A`).
@@ -148,23 +176,23 @@ impl<T> ClauseRange<T> {
 /// clauses on projections and each trait's own clauses (its supertraits, and
 /// theirs) substituted for `Self`. The trait clauses are published before
 /// any equality's value is resolved, so a sibling's value can name members
-/// they supply; `equalities` is `None` until the values are resolved.
+/// they supply; the equalities stay `Pending` until the values are resolved.
 #[derive(Clone, Copy)]
 pub(super) struct BoundClauses {
 	pub(super) traits: ClauseRange<TraitClause>,
-	pub(super) equalities: Option<ClauseRange<EqualityClause>>,
+	pub(super) equalities: Equalities,
 }
 
 impl BoundClauses {
 	/// A subject whose bounds are not published yet.
 	pub(super) const PENDING: Self = Self {
 		traits: ClauseRange::EMPTY,
-		equalities: None,
+		equalities: Equalities::Pending,
 	};
 	/// A subject that assumes nothing.
 	pub(super) const NONE: Self = Self {
 		traits: ClauseRange::EMPTY,
-		equalities: Some(ClauseRange::EMPTY),
+		equalities: Equalities::Final(ClauseRange::EMPTY),
 	};
 }
 
@@ -484,7 +512,7 @@ impl EqualityClauseBuilder<'_> {
 		let env = self.traits[usize::from(bound.trait_index)].env;
 		let Some(range) = self.param_bounds[usize::from(env)]
 			.first()
-			.and_then(|bounds| bounds.clauses.equalities)
+			.and_then(|bounds| bounds.clauses.equalities.final_range())
 		else {
 			return;
 		};
@@ -646,12 +674,14 @@ impl<'a> ClauseTables<'a> {
 		&self,
 		assumption_context: TypeEnvIdx,
 	) -> Readiness {
-		let ready = self.type_envs.chain(assumption_context).all(|frame| {
-			self.param_bounds[usize::from(frame)]
-				.iter()
-				.all(|bounds| bounds.clauses.equalities.is_some())
-		});
-		Readiness::from_ready(ready)
+		let mut readiness = Readiness::Ready;
+		for frame in self.type_envs.chain(assumption_context) {
+			for bounds in &self.param_bounds[usize::from(frame)] {
+				readiness =
+					readiness.and(Readiness::from(bounds.clauses.equalities));
+			}
+		}
+		readiness
 	}
 
 	/// The subjects whose clauses can describe `receiver`: each associated
@@ -684,9 +714,8 @@ impl<'a> ClauseTables<'a> {
 		let mut readiness = Readiness::Ready;
 		let mut walk = DeclarationSources { ..sources };
 		while let Some(source) = walk.next() {
-			readiness = readiness.and(Readiness::from_ready(
-				source.clauses.equalities.is_some(),
-			));
+			readiness =
+				readiness.and(Readiness::from(source.clauses.equalities));
 		}
 		if walk.remaining == 0 {
 			readiness = readiness.and(Readiness::Overflowed);
@@ -893,12 +922,13 @@ impl Readiness {
 			(Readiness::Ready, Readiness::Ready) => Readiness::Ready,
 		}
 	}
+}
 
-	pub(super) fn from_ready(ready: bool) -> Readiness {
-		if ready {
-			Readiness::Ready
-		} else {
-			Readiness::Pending
+impl From<Equalities> for Readiness {
+	fn from(equalities: Equalities) -> Self {
+		match equalities {
+			Equalities::Pending => Readiness::Pending,
+			Equalities::Final(_) => Readiness::Ready,
 		}
 	}
 }
@@ -931,6 +961,7 @@ pub(super) fn known_distinct(
 			| Type::Integer
 			| Type::Float
 			| Type::String
+			| Type::ArrayLiteral
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. },
 			_,
@@ -942,6 +973,7 @@ pub(super) fn known_distinct(
 			| Type::Integer
 			| Type::Float
 			| Type::String
+			| Type::ArrayLiteral
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. },
 		) => false,

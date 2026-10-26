@@ -112,14 +112,14 @@ impl TestCase {
 				}
 				_ => format!("(const {})", self.path(path)),
 			},
-			Pattern::Literal(PatternLiteral::Int(value)) => value.to_string(),
-			Pattern::Literal(PatternLiteral::NegInt(value)) => {
+			Pattern::Literal(Literal::Int(value)) => value.to_string(),
+			Pattern::Literal(Literal::NegInt(value)) => {
 				format!("-{value}")
 			}
-			Pattern::Literal(PatternLiteral::Char) => "char".to_string(),
-			Pattern::Literal(PatternLiteral::Float) => "float".to_string(),
-			Pattern::Literal(PatternLiteral::String) => "string".to_string(),
-			Pattern::Literal(PatternLiteral::Bool(value)) => value.to_string(),
+			Pattern::Literal(Literal::Char) => "char".to_string(),
+			Pattern::Literal(Literal::Float) => "float".to_string(),
+			Pattern::Literal(Literal::String) => "string".to_string(),
+			Pattern::Literal(Literal::Bool(value)) => value.to_string(),
 			Pattern::Or(alternatives) => {
 				let alternatives = alternatives
 					.iter()
@@ -295,6 +295,42 @@ fn item_kind(item: &Item) -> &'static str {
 	}
 }
 
+fn bounds(param: &TypeParam) -> Option<&Spanned<BoundExpression>> {
+	match param {
+		TypeParam::Type { bounds, .. } => bounds.as_ref(),
+		TypeParam::Const { .. } => None,
+	}
+}
+
+/// The type arguments of the call that statement `index` of the first
+/// function is, rendered by kind: `type`, `literal` or the constant path.
+fn call_type_args(case: &TestCase, index: usize) -> Vec<String> {
+	let Expression::Call { callee, .. } =
+		statement_expression(case.function_block(0), index)
+	else {
+		panic!("expected a call")
+	};
+	let Expression::Path(segments) = &callee.inner else {
+		panic!("expected a path callee")
+	};
+	segments[0]
+		.type_args
+		.iter()
+		.map(|arg| match arg {
+			TypeArgument::Type(_) => "type".to_string(),
+			TypeArgument::Const(constant) => match &constant.inner {
+				ConstArgument::Literal(_) => "literal".to_string(),
+				ConstArgument::Infer => "_".to_string(),
+				ConstArgument::Path(path) => path
+					.iter()
+					.map(|segment| case.name(segment.ident.inner))
+					.collect::<Vec<_>>()
+					.join("::"),
+			},
+		})
+		.collect()
+}
+
 fn statement_expression(
 	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
@@ -366,7 +402,7 @@ fn test_top_level_items() {
 #[test]
 fn test_enum_repr_after_name() {
 	let case = TestCase::new(indoc! {"
-        enum Status: i32 {
+        enum Status(i32) {
             Foo,
             Bar,
         }
@@ -474,7 +510,10 @@ fn test_type_expression_forms() {
 	assert!(matches!(
 		Some(&fields[2].inner.inner.ty.inner),
 		Some(TypeExpression::Array {
-			size: Spanned { inner: 4, .. },
+			length: Spanned {
+				inner: ConstArgument::Literal(Literal::Int(4)),
+				..
+			},
 			..
 		})
 	));
@@ -920,7 +959,7 @@ fn test_match_int_literal_patterns() {
 #[test]
 fn test_match_enum_variant_patterns() {
 	let case = TestCase::new(indoc! {"
-        enum FileDescriptor: u8 {
+        enum FileDescriptor(u8) {
             StdIn,
             StdOut,
             StdErr,
@@ -1201,6 +1240,22 @@ fn a_plain_block_is_written_with_its_keyword() {
 		local_definition_value(case.function_block(0), 0),
 		Expression::Block { .. }
 	));
+}
+
+#[test]
+fn an_old_enum_repr_is_reported_and_read_as_the_new_one() {
+	let case = TestCase::new("enum Status: i32 { Foo }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::EnumReprNeedsParentheses]);
+	let Item::Enum { repr, variants, .. } = case.item(0) else {
+		panic!("expected enum item")
+	};
+	assert!(repr.is_some());
+	assert_eq!(variants.len(), 1);
+
+	let case = TestCase::new("enum Status(i32 { Foo }");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UnexpectedToken);
 }
 
 #[test]
@@ -1943,9 +1998,9 @@ fn test_pattern_redundant_const_is_dropped_and_warned() {
         }
     "});
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::RedundantPatternMarker]);
+		.assert_codes(&[DiagnosticCode::RedundantConstMarker]);
 	case.diagnostics()
-		.assert_warning(DiagnosticCode::RedundantPatternMarker);
+		.assert_warning(DiagnosticCode::RedundantConstMarker);
 	assert_eq!(
 		case.arm_patterns(0),
 		["(const Ordering::Less)", "(const MAX)"]
@@ -2392,18 +2447,158 @@ fn test_generic_signatures() {
 	let params: Vec<&str> = signature
 		.type_params
 		.iter()
-		.map(|param| case.name(param.name.inner))
+		.map(|param| case.name(param.name().inner))
 		.collect();
 	assert_eq!(params, ["T", "U", "V"]);
 	// only the bounded ones carry a bound expression
 	let bounded: Vec<bool> = signature
 		.type_params
 		.iter()
-		.map(|param| param.bounds.is_some())
+		.map(|param| bounds(param).is_some())
 		.collect();
 	assert_eq!(bounded, [false, true, true]);
 	assert_eq!(signature.params.len(), 3);
 	assert!(signature.result.is_some());
+}
+
+#[test]
+fn a_constant_parameter_is_marked_and_typed() {
+	let case = TestCase::new("func f<T: Add, const N: u32>() {}");
+	case.diagnostics().assert_none();
+	let [first, second] = &*case.function_signature(0).type_params else {
+		panic!("expected two parameters")
+	};
+	assert!(matches!(
+		first,
+		TypeParam::Type {
+			bounds: Some(_),
+			..
+		}
+	));
+	let TypeParam::Const { name, ty, .. } = second else {
+		panic!("expected a constant parameter")
+	};
+	assert_eq!(case.name(name.inner), "N");
+	assert!(matches!(ty.inner, TypeExpression::Path(_)));
+
+	// A constant's type is always written.
+	let case = TestCase::new("func f<const N>() {}");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UnexpectedToken);
+}
+
+#[test]
+fn a_type_argument_is_a_constant_when_it_is_a_literal_or_marked() {
+	let case = TestCase::new(indoc! {"
+        func f() {
+            g::<u32, 5, -1, true, 'a', const SIZE, const T::N, _>();
+        }
+    "});
+	case.diagnostics().assert_none();
+	assert_eq!(
+		call_type_args(&case, 0),
+		[
+			"type", "literal", "literal", "literal", "literal", "SIZE", "T::N",
+			"type"
+		]
+	);
+}
+
+#[test]
+fn a_const_marker_on_a_literal_or_an_inferred_argument_is_redundant() {
+	let case = TestCase::new("func f() { g::<const 5, const _>(); }");
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::RedundantConstMarker,
+		DiagnosticCode::RedundantConstMarker,
+	]);
+	case.diagnostics()
+		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	assert_eq!(call_type_args(&case, 0), ["literal", "type"]);
+}
+
+#[test]
+fn a_type_path_takes_constant_arguments() {
+	let case =
+		TestCase::new("func f<const N: u32>(b: Buffer<u8, const N, 4>) {}");
+	case.diagnostics().assert_none();
+	let TypeExpression::Path(segments) =
+		&case.function_signature(0).params[0].inner.inner.ty.inner
+	else {
+		panic!("expected a path")
+	};
+	assert!(matches!(
+		&*segments[0].type_args,
+		[
+			TypeArgument::Type(_),
+			TypeArgument::Const(path),
+			TypeArgument::Const(literal),
+		] if matches!(path.inner, ConstArgument::Path(_))
+			&& matches!(literal.inner, ConstArgument::Literal(Literal::Int(4)))
+	));
+}
+
+#[test]
+fn an_array_length_is_a_literal_or_a_path() {
+	let case = TestCase::new(indoc! {"
+        func f(a: heap::&[u8; N], b: heap::&[u8; T::SIZE]) {
+            local c = [0; SIZE];
+        }
+    "});
+	case.diagnostics().assert_none();
+	let params = &case.function_signature(0).params;
+	for (param, length) in params.iter().zip([1, 2]) {
+		let TypeExpression::Array {
+			length: written, ..
+		} = &param.inner.inner.ty.inner
+		else {
+			panic!("expected an array type")
+		};
+		assert!(matches!(
+			&written.inner,
+			ConstArgument::Path(path) if path.len() == length
+		));
+	}
+	let Expression::ArrayRepeat { count, .. } =
+		local_definition_value(case.function_block(0), 0)
+	else {
+		panic!("expected an array repeat")
+	};
+	assert!(matches!(count.inner, ConstArgument::Path(_)));
+
+	// Only a constant can be a length, so `const` says nothing; and a
+	// computation is not one.
+	let case = TestCase::new("func f(a: heap::&[u8; const N]) {}");
+	case.diagnostics()
+		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	let case = TestCase::new("func f(a: heap::&[u8; N + 1]) {}");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UnexpectedToken);
+}
+
+#[test]
+fn an_array_length_can_be_left_to_its_context() {
+	let case = TestCase::new(
+		"func f() { local a: heap::&[u8; _] = [0; _]; local b = [0; const _]; }",
+	);
+	case.diagnostics()
+		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	let Statement::LocalDefinition { ty: Some(ty), .. } =
+		&case.function_block(0)[0].inner.inner
+	else {
+		panic!("expected a local with a type")
+	};
+	let TypeExpression::Array { length, .. } = &ty.inner else {
+		panic!("expected an array type")
+	};
+	assert!(matches!(length.inner, ConstArgument::Infer));
+	for at in [0, 1] {
+		let Expression::ArrayRepeat { count, .. } =
+			local_definition_value(case.function_block(0), at)
+		else {
+			panic!("expected an array repeat")
+		};
+		assert!(matches!(count.inner, ConstArgument::Infer));
+	}
 }
 
 #[test]
@@ -2426,10 +2621,10 @@ fn test_generic_struct() {
 	};
 	assert_eq!(case.strings.resolve(name.inner), Some("Pair"));
 	assert_eq!(type_params.len(), 2);
-	assert_eq!(case.strings.resolve(type_params[0].name.inner), Some("T"));
-	assert!(type_params[0].bounds.is_none());
-	assert_eq!(case.strings.resolve(type_params[1].name.inner), Some("U"));
-	assert!(type_params[1].bounds.is_none());
+	assert_eq!(case.strings.resolve(type_params[0].name().inner), Some("T"));
+	assert!(bounds(&type_params[0]).is_none());
+	assert_eq!(case.strings.resolve(type_params[1].name().inner), Some("U"));
+	assert!(bounds(&type_params[1]).is_none());
 	assert_eq!(fields.len(), 2);
 }
 
@@ -2446,7 +2641,7 @@ fn test_generic_struct_with_bounds() {
 	};
 	assert_eq!(type_params.len(), 1);
 	assert!(matches!(
-		type_params[0].bounds.as_ref().map(|b| &b.inner),
+		bounds(&type_params[0]).map(|b| &b.inner),
 		Some(BoundExpression::BoundList(list)) if list.len() == 2
 	));
 }
@@ -2553,8 +2748,14 @@ fn test_generic_application_type_args() {
 	assert_eq!(segments.len(), 1);
 	let type_args = &segments[0].type_args;
 	assert_eq!(type_args.len(), 2);
-	assert!(matches!(type_args[0].inner, TypeExpression::Path(_)));
-	assert!(matches!(type_args[1].inner, TypeExpression::Path(_)));
+	assert!(matches!(
+		&type_args[0],
+		TypeArgument::Type(ty) if matches!(ty.inner, TypeExpression::Path(_))
+	));
+	assert!(matches!(
+		&type_args[1],
+		TypeArgument::Type(ty) if matches!(ty.inner, TypeExpression::Path(_))
+	));
 }
 
 #[test]
@@ -2599,10 +2800,7 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
-	let bounds = signature.type_params[0]
-		.bounds
-		.as_ref()
-		.expect("expected bounds");
+	let bounds = bounds(&signature.type_params[0]).expect("expected bounds");
 	let BoundExpression::WithBindings { path, bindings } = &bounds.inner else {
 		panic!("expected WithBindings")
 	};
@@ -2809,7 +3007,10 @@ fn test_index_and_array_literal_expressions() {
 		panic!("expected an array repeat")
 	};
 	assert_eq!(case.shape(&value.inner), "0");
-	assert_eq!(case.shape(&count.inner), "8");
+	assert!(matches!(
+		count.inner,
+		ConstArgument::Literal(Literal::Int(8))
+	));
 
 	// a single subscript is an `Index`, never a one-bound `SliceRange`
 	assert!(matches!(

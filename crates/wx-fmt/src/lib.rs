@@ -1549,8 +1549,9 @@ impl<'a> Builder<'a> {
 		nodes.push(self.text(Text::Enum));
 		nodes.push(self.symbol(name.inner));
 		if let Some(repr) = repr {
-			nodes.push(self.text(Text::ColonSp));
+			nodes.push(self.text(Text::LParen));
 			nodes.push(self.build_type_expression(&repr.inner));
+			nodes.push(self.text(Text::RParen));
 		}
 		nodes.push(self.text(Text::SpaceLBrace));
 
@@ -1908,10 +1909,20 @@ impl<'a> Builder<'a> {
 		let mut nodes: Vec<NodeId> = vec![self.text(Text::Lt)];
 		let mut inner: Vec<NodeId> = vec![self.line()];
 		for (index, param) in type_params.iter().enumerate() {
-			inner.push(self.symbol(param.name.inner));
-			if let Some(bounds) = &param.bounds {
-				inner.push(self.text(Text::ColonSp));
-				inner.push(self.build_bound_expression(&bounds.inner));
+			match param {
+				ast::TypeParam::Type { name, bounds } => {
+					inner.push(self.symbol(name.inner));
+					if let Some(bounds) = bounds {
+						inner.push(self.text(Text::ColonSp));
+						inner.push(self.build_bound_expression(&bounds.inner));
+					}
+				}
+				ast::TypeParam::Const { name, ty, .. } => {
+					inner.push(self.text(Text::Const));
+					inner.push(self.symbol(name.inner));
+					inner.push(self.text(Text::ColonSp));
+					inner.push(self.build_type_expression(&ty.inner));
+				}
 			}
 			if index + 1 < type_params.len() {
 				inner.push(self.text(Text::Comma));
@@ -2202,7 +2213,7 @@ impl<'a> Builder<'a> {
 		&mut self,
 		object: &ast::Spanned<ast::Expression>,
 		method: &ast::Spanned<SymbolU32>,
-		type_args: &[ast::Spanned<ast::TypeExpression>],
+		type_args: &[ast::TypeArgument],
 	) -> Vec<NodeId> {
 		let obj_id = self.build_expression(object);
 		let dot = self.text(Text::Dot);
@@ -2214,7 +2225,7 @@ impl<'a> Builder<'a> {
 				if i > 0 {
 					items.push(self.text(Text::CommaSp));
 				}
-				items.push(self.build_type_expression(&arg.inner));
+				items.push(self.build_type_argument(arg));
 			}
 			items.push(self.text(Text::Gt));
 		}
@@ -2557,7 +2568,7 @@ impl<'a> Builder<'a> {
 				let val = self.build_expression(value);
 				let semi_sp = self.text(Text::Semi);
 				let sp = self.text(Text::Space);
-				let cnt = self.build_expression(count);
+				let cnt = self.build_const_argument(count);
 				let close = self.text(Text::RBracket);
 				self.arena.concat(vec![open, val, semi_sp, sp, cnt, close])
 			}
@@ -2793,12 +2804,46 @@ impl<'a> Builder<'a> {
 					if j > 0 {
 						items.push(self.text(Text::CommaSp));
 					}
-					items.push(self.build_type_expression(&arg.inner));
+					items.push(self.build_type_argument(arg));
 				}
 				items.push(self.text(Text::Gt));
 			}
 		}
 		self.arena.concat(items)
+	}
+
+	/// One `<...>` argument. A literal is printed as written, without the
+	/// redundant `const` the parser dropped; a constant path keeps its own.
+	fn build_type_argument(&mut self, arg: &ast::TypeArgument) -> NodeId {
+		match arg {
+			ast::TypeArgument::Type(ty) => {
+				self.build_type_expression(&ty.inner)
+			}
+			ast::TypeArgument::Const(constant) => match &constant.inner {
+				ast::ConstArgument::Literal(_) | ast::ConstArgument::Infer => {
+					self.build_const_argument(constant)
+				}
+				ast::ConstArgument::Path(_) => {
+					let marker = self.text(Text::Const);
+					let path = self.build_const_argument(constant);
+					self.arena.concat2(marker, path)
+				}
+			},
+		}
+	}
+
+	/// A constant as written, without a marker: where only a constant can
+	/// be written (an array's length) one would be redundant.
+	fn build_const_argument(
+		&mut self,
+		constant: &ast::Spanned<ast::ConstArgument>,
+	) -> NodeId {
+		match &constant.inner {
+			ast::ConstArgument::Literal(_) | ast::ConstArgument::Infer => {
+				self.source_text(constant.span)
+			}
+			ast::ConstArgument::Path(path) => self.build_value_path(path),
+		}
 	}
 
 	/// A path in type position: generic arguments are bare, `Point<i32>`,
@@ -2816,7 +2861,7 @@ impl<'a> Builder<'a> {
 					if j > 0 {
 						items.push(self.text(Text::CommaSp));
 					}
-					items.push(self.build_type_expression(&arg.inner));
+					items.push(self.build_type_argument(arg));
 				}
 				items.push(self.text(Text::Gt));
 			}
@@ -3001,7 +3046,7 @@ impl<'a> Builder<'a> {
 				ownership,
 				memory,
 				inner,
-				size,
+				length,
 			} => {
 				let mut items: Vec<NodeId> = Vec::new();
 				self.build_memory_tag(&mut items, memory.as_deref());
@@ -3011,7 +3056,7 @@ impl<'a> Builder<'a> {
 					self.build_type_expression(&inner.inner),
 					self.text(Text::Semi),
 					self.text(Text::Space),
-					self.source_text(size.span),
+					self.build_const_argument(length),
 					self.text(Text::RBracket),
 				]);
 				self.arena.concat(items)

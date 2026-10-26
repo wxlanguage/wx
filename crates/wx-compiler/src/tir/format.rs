@@ -129,6 +129,7 @@ impl TypeFormatter<'_> {
 			Type::Integer => f.push_str("{integer}"),
 			Type::Float => f.push_str("{float}"),
 			Type::String => f.push_str("{string}"),
+			Type::ArrayLiteral => f.push_str("{array}"),
 			Type::U8 => f.push_str("u8"),
 			Type::I8 => f.push_str("i8"),
 			Type::U16 => f.push_str("u16"),
@@ -204,7 +205,7 @@ impl TypeFormatter<'_> {
 			}
 			Type::Array {
 				of,
-				size,
+				length,
 				memory,
 				ownership,
 			} => {
@@ -213,7 +214,21 @@ impl TypeFormatter<'_> {
 				f.push(ownership_sigil(*ownership));
 				f.push('[');
 				self.write_type(f, *of);
-				let _ = write!(f, "; {}]", *size);
+				f.push_str("; ");
+				self.write_type(f, *length);
+				f.push(']');
+			}
+			Type::Value { bits } => {
+				let _ = write!(f, "{bits}");
+			}
+			// Written as its name, with its own arguments when it has any.
+			Type::Const {
+				constant,
+				type_args,
+			} => {
+				let def = &self.defs.constants[usize::from(*constant)];
+				f.push_str(self.strings.resolve(def.name.inner).unwrap());
+				self.write_type_args(f, self.types.list(*type_args));
 			}
 			Type::FunctionRef { param, result } => {
 				let (param, result) = (*param, *result);
@@ -338,6 +353,7 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
+	use crate::tir::solver::Solver;
 	use crate::tir::types::TypeEnvIdx;
 	use crate::vfs;
 
@@ -399,10 +415,12 @@ mod tests {
 				&defs,
 				&ast_nodes,
 			);
+			let mut solver = Solver::new(defs.constants.len());
 			let mut signatures = TypeContext::new(
 				&mut diagnostics,
 				&mut resolutions,
 				&mut graph.strings,
+				&mut solver,
 				&graph.files,
 				&defs,
 				&ast_nodes,
@@ -565,9 +583,10 @@ mod tests {
 			memory,
 			ownership: Ownership::Exclusive,
 		});
+		let four = case.types.intern(Type::Value { bits: 4 });
 		let array = case.types.intern(Type::Array {
 			of: TypeIndex::I32,
-			size: 4,
+			length: four,
 			memory,
 			ownership: Ownership::Exclusive,
 		});

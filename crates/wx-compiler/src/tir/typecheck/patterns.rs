@@ -957,7 +957,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// as its bits in that type.
 	fn check_literal(
 		&mut self,
-		literal: &ast::PatternLiteral,
+		literal: &ast::Literal,
 		span: TextSpan,
 		expected: TypeIndex,
 	) -> PatIdx {
@@ -965,13 +965,13 @@ impl BodyContext<'_, '_, '_, '_> {
 			return self.error_pattern(span);
 		}
 		match *literal {
-			ast::PatternLiteral::Int(value) => {
+			ast::Literal::Int(value) => {
 				self.check_int(value, false, span, expected)
 			}
-			ast::PatternLiteral::NegInt(value) => {
+			ast::Literal::NegInt(value) => {
 				self.check_int(value, true, span, expected)
 			}
-			ast::PatternLiteral::Bool(value) => {
+			ast::Literal::Bool(value) => {
 				if expected != TypeIndex::BOOL {
 					self.report_pattern_mismatch(expected, "`bool`", span);
 					return self.error_pattern(span);
@@ -979,7 +979,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.body
 					.push_pattern(PatternKind::Bool(value), expected, span)
 			}
-			ast::PatternLiteral::Char => {
+			ast::Literal::Char => {
 				if expected != TypeIndex::CHAR {
 					self.report_pattern_mismatch(expected, "`char`", span);
 					return self.error_pattern(span);
@@ -1018,7 +1018,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					}
 				}
 			}
-			ast::PatternLiteral::Float => {
+			ast::Literal::Float => {
 				self.report_unmatchable_literal(
 					span,
 					"a float",
@@ -1027,7 +1027,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				);
 				self.error_pattern(span)
 			}
-			ast::PatternLiteral::String => {
+			ast::Literal::String => {
 				self.report_unmatchable_literal(
 					span,
 					"a string",

@@ -323,12 +323,26 @@ fn report_redundant_const(
 	span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::warning()
-		.with_code(DiagnosticCode::RedundantPatternMarker.code())
+		.with_code(DiagnosticCode::RedundantConstMarker.code())
 		.with_message("redundant `const`")
 		.with_label(
 			Label::primary(file_id, span)
 				.with_message("this path is a constant already"),
 		)
+		.with_note("drop the `const`")
+}
+
+/// `const` where nothing else could be written: before a literal or `_`
+/// argument, or an array's length.
+fn report_redundant_const_marker(
+	file_id: FileId,
+	span: TextSpan,
+	why: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::warning()
+		.with_code(DiagnosticCode::RedundantConstMarker.code())
+		.with_message("redundant `const`")
+		.with_label(Label::primary(file_id, span).with_message(why))
 		.with_note("drop the `const`")
 }
 
@@ -1244,10 +1258,10 @@ pub enum Expression {
 	ArrayList {
 		elements: Box<[Spanned<Expression>]>,
 	},
-	/// `[value; count]`
+	/// `[value; count]`; the count is a length, a literal or a constant.
 	ArrayRepeat {
 		value: Box<Spanned<Expression>>,
-		count: Box<Spanned<Expression>>,
+		count: Spanned<ConstArgument>,
 	},
 	/// `expr[index]`
 	Index {
@@ -1306,7 +1320,7 @@ pub struct MatchArm {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct PathSegment {
 	pub ident: Spanned<SymbolU32>,
-	pub type_args: Box<[Spanned<TypeExpression>]>,
+	pub type_args: Box<[TypeArgument]>,
 }
 
 /// A parsed, non-empty `::`-separated path — `i32`, `module::Type`,
@@ -1383,13 +1397,59 @@ impl Expression {
 	}
 }
 
-/// A generic type parameter declaration: `T` or `T: Bound1 + Bound2`.
+/// A generic parameter declaration: a type, `T` or `T: Bound1 + Bound2`, or
+/// a constant, `const N: Type`.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub struct TypeParam {
-	pub name: Spanned<SymbolU32>,
-	/// Trait bounds. `None` = unconstrained.
-	pub bounds: Option<Spanned<BoundExpression>>,
+pub enum TypeParam {
+	/// A type, with its trait bounds. `None` = unconstrained.
+	Type {
+		name: Spanned<SymbolU32>,
+		bounds: Option<Spanned<BoundExpression>>,
+	},
+	/// `const N: Type`, a constant of type `ty`.
+	Const {
+		const_span: TextSpan,
+		name: Spanned<SymbolU32>,
+		ty: Box<Spanned<TypeExpression>>,
+	},
+}
+
+impl TypeParam {
+	pub fn name(&self) -> Spanned<SymbolU32> {
+		match self {
+			Self::Type { name, .. } | Self::Const { name, .. } => *name,
+		}
+	}
+}
+
+/// One argument in a `<...>` list. What it is follows from its own shape: a
+/// literal is a constant, and anything else is a type unless `const` marks
+/// it as a constant (`const SIZE`).
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum TypeArgument {
+	Type(Spanned<TypeExpression>),
+	Const(Spanned<ConstArgument>),
+}
+
+impl TypeArgument {
+	pub fn span(&self) -> TextSpan {
+		match self {
+			Self::Type(ty) => ty.span,
+			Self::Const(constant) => constant.span,
+		}
+	}
+}
+
+/// A constant argument: `5`, `-1`, `true`, or a path marked `const`. An
+/// array's length can also be `_`, left to its context.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum ConstArgument {
+	Literal(Literal),
+	Path(Box<[PathSegment]>),
+	Infer,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1473,12 +1533,13 @@ pub enum TypeExpression {
 		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 	},
-	/// `*[u8; 5]` or `&[u8; 5]`; see `Pointer` for the optional `heap::` tag.
+	/// `*[u8; 5]` or `&[u8; N]`; see `Pointer` for the optional `heap::` tag.
 	Array {
 		ownership: Ownership,
 		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
-		size: Spanned<usize>,
+		/// A literal or a constant, as a constant argument is.
+		length: Spanned<ConstArgument>,
 	},
 	/// `<Type as Trait>::Item` — a qualified path that pins down exactly
 	/// which trait's item is meant, disambiguating a name that would
@@ -1524,7 +1585,7 @@ pub enum Pattern {
 		path: Box<[PathSegment]>,
 	},
 	/// `0`, `-1`, `'a'`, `true`
-	Literal(PatternLiteral),
+	Literal(Literal),
 	/// `A | B | C`; each separator is a `|`.
 	Or(Box<[Separated<Spanned<Pattern>>]>),
 	Destructure(Destructure),
@@ -1586,24 +1647,26 @@ pub struct PatternField {
 	pub pattern: Option<Spanned<Pattern>>,
 }
 
+/// A literal written where a value is compared or given as a type
+/// argument: a pattern's, or a constant argument's.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum PatternLiteral {
+pub enum Literal {
 	/// `1`; the value is the number itself.
 	Int(u64),
 	/// `-1`; the value is the magnitude, and the sign is the variant that
 	/// holds it — a negative literal is a literal of its own, not a
 	/// positive one with a sign attached.
 	NegInt(u64),
-	/// `'a'`, decoded from the pattern's span as a char expression is.
+	/// `'a'`, decoded from the literal's span as a char expression is.
 	Char,
 	Bool(bool),
 	/// `1.5` — the text is recovered from the span, as an expression's
-	/// float is. A float has no single value to compare with, so the
-	/// checker refuses it.
+	/// float is. A float has no single value to compare with, so a
+	/// pattern refuses it.
 	Float,
 	/// `"hi"` — the raw text is recovered from the span, as an
-	/// expression's string is. A string has no equality, so the checker
+	/// expression's string is. A string has no equality, so a pattern
 	/// refuses it.
 	String,
 }
@@ -2891,7 +2954,69 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// Parse `<T, U: Bound1 + Bound2>` — generic type parameter declarations.
+	/// Whether the next token starts a literal: a number, a char, a string,
+	/// `true`, `false`, or `-` before a number.
+	fn at_literal(&mut self) -> bool {
+		let token = self.lexer.peek();
+		match token.inner {
+			Token::Int
+			| Token::Char
+			| Token::Float
+			| Token::String
+			| Token::Minus => true,
+			Token::Identifier => matches!(
+				Keyword::try_from(token.span.extract_str(self.source)),
+				Ok(Keyword::True | Keyword::False)
+			),
+			_ => false,
+		}
+	}
+
+	/// A literal, as a pattern compares with it or a constant argument gives
+	/// it; the caller has checked `at_literal`.
+	fn parse_literal(&mut self) -> Result<Spanned<Literal>, ()> {
+		let token = self.lexer.next();
+		let literal = match token.inner {
+			Token::Int => Literal::Int(self.integer_literal(token.span)),
+			Token::Char => Literal::Char,
+			// A float has no single value to compare with and a string has
+			// no equality at all, so a pattern can match neither — but that
+			// is the checker's judgement, not the parser's: the literal is
+			// read, and the rest of the file still parses.
+			Token::Float => Literal::Float,
+			Token::String => Literal::String,
+			Token::Minus => {
+				let number = self.lexer.next();
+				let literal = match number.inner {
+					Token::Int => {
+						Literal::NegInt(self.integer_literal(number.span))
+					}
+					Token::Float => Literal::Float,
+					// `-` must be followed by the number it negates.
+					_ => {
+						self.ast.diagnostics.push(report_unexpected_token(
+							self.ast.file_id,
+							number,
+							Token::Int,
+						));
+						return Err(());
+					}
+				};
+				return Ok(Spanned {
+					inner: literal,
+					span: TextSpan::new(token.span.start, number.span.end),
+				});
+			}
+			_ => Literal::Bool(token.span.extract_str(self.source) == "true"),
+		};
+		Ok(Spanned {
+			inner: literal,
+			span: token.span,
+		})
+	}
+
+	/// Parse `<T, U: Bound1 + Bound2, const N: u32>` — generic parameter
+	/// declarations.
 	fn parse_type_params(&mut self) -> Result<Box<[TypeParam]>, ()> {
 		let open_span = self.next_expect(Token::LeftArrow)?.span;
 		let mut params: Vec<TypeParam> = Vec::new();
@@ -2914,6 +3039,10 @@ impl<'ctx> Parser<'ctx> {
 				break;
 			}
 
+			let const_span = match self.peek_keyword() {
+				Some(Keyword::Const) => Some(self.lexer.next().span),
+				_ => None,
+			};
 			let name_span = self.next_expect(Token::Identifier)?.span;
 			let name_symbol = self.intern_identifier(name_span);
 			let name = Spanned {
@@ -2921,14 +3050,26 @@ impl<'ctx> Parser<'ctx> {
 				span: name_span,
 			};
 
-			let bounds: Option<Spanned<BoundExpression>> =
-				if self.lexer.next_if(Token::Colon).is_some() {
-					Some(self.parse_bounds_expression()?)
-				} else {
-					None
-				};
-
-			params.push(TypeParam { name, bounds });
+			params.push(match const_span {
+				// A constant's type is always written: nothing else says
+				// what its values are.
+				Some(const_span) => {
+					self.next_expect(Token::Colon)?;
+					TypeParam::Const {
+						const_span,
+						name,
+						ty: Box::new(self.parse_type_expression()?),
+					}
+				}
+				None => TypeParam::Type {
+					name,
+					bounds: if self.lexer.next_if(Token::Colon).is_some() {
+						Some(self.parse_bounds_expression()?)
+					} else {
+						None
+					},
+				},
+			});
 
 			if self.lexer.peek().inner == Token::Comma {
 				self.lexer.next();
@@ -2962,14 +3103,13 @@ impl<'ctx> Parser<'ctx> {
 		peeked.span
 	}
 
-	/// Parse `::<Type1, Type2>` turbofish arguments (the `<...>` part after
-	/// `::` is already consumed by the caller). Returns the args and the
-	/// closing `>` span.
+	/// Parse `<Type1, 5, const SIZE>` arguments, after a type's name or a
+	/// turbofish's `::`. Returns the args and the closing `>` span.
 	fn parse_type_args(
 		&mut self,
-	) -> Result<(Box<[Spanned<TypeExpression>]>, TextSpan), ()> {
+	) -> Result<(Box<[TypeArgument]>, TextSpan), ()> {
 		let open_span = self.next_expect(Token::LeftArrow)?.span;
-		let mut args: Vec<Spanned<TypeExpression>> = Vec::new();
+		let mut args: Vec<TypeArgument> = Vec::new();
 
 		let close_span = loop {
 			let peeked = self.lexer.peek();
@@ -2993,7 +3133,7 @@ impl<'ctx> Parser<'ctx> {
 				break peeked.span;
 			}
 
-			args.push(self.parse_type_expression()?);
+			args.push(self.parse_type_argument()?);
 
 			if self.lexer.peek().inner == Token::Comma {
 				self.lexer.next();
@@ -3001,6 +3141,75 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		Ok((args.into_boxed_slice(), close_span))
+	}
+
+	/// One type argument: a literal is a constant; `const` marks a path as
+	/// one; anything else is a type. `const` before a literal or `_` says
+	/// nothing (`_` is inferred as whatever its parameter is), so it is
+	/// reported as redundant and dropped.
+	fn parse_type_argument(&mut self) -> Result<TypeArgument, ()> {
+		let const_span = match self.peek_keyword() {
+			Some(Keyword::Const) => Some(self.lexer.next().span),
+			_ => None,
+		};
+		let at_underscore =
+			matches!(self.peek_keyword(), Some(Keyword::Underscore));
+		if let Some(span) = const_span
+			&& (self.at_literal() || at_underscore)
+		{
+			self.ast.diagnostics.push(report_redundant_const_marker(
+				self.ast.file_id,
+				span,
+				"this argument is a constant already",
+			));
+		}
+		if self.at_literal() || (const_span.is_some() && !at_underscore) {
+			return Ok(TypeArgument::Const(self.parse_const_argument()?));
+		}
+		Ok(TypeArgument::Type(self.parse_type_expression()?))
+	}
+
+	/// A constant: a literal, `_`, or a path naming one.
+	fn parse_const_argument(&mut self) -> Result<Spanned<ConstArgument>, ()> {
+		if let Some(Keyword::Underscore) = self.peek_keyword() {
+			return Ok(Spanned {
+				inner: ConstArgument::Infer,
+				span: self.lexer.next().span,
+			});
+		}
+		if self.at_literal() {
+			let literal = self.parse_literal()?;
+			return Ok(Spanned {
+				inner: ConstArgument::Literal(literal.inner),
+				span: literal.span,
+			});
+		}
+		let path = match Parser::parse_path(self)? {
+			PathTerm::Path(path) => path,
+			PathTerm::Old(_) => return Err(()),
+		};
+		let span = TextSpan::new(
+			path[0].ident.span.start,
+			path.last().unwrap().ident.span.end,
+		);
+		Ok(Spanned {
+			inner: ConstArgument::Path(path),
+			span,
+		})
+	}
+
+	/// An array's length, in a type or a repeat: only a constant can be
+	/// written there, so `const` says nothing.
+	fn parse_length(&mut self) -> Result<Spanned<ConstArgument>, ()> {
+		if let Some(Keyword::Const) = self.peek_keyword() {
+			let span = self.lexer.next().span;
+			self.ast.diagnostics.push(report_redundant_const_marker(
+				self.ast.file_id,
+				span,
+				"a length is a constant already",
+			));
+		}
+		self.parse_const_argument()
 	}
 
 	/// Parse `where { Name = Type, Name: Bound, ... }` — the bindings block
@@ -3139,7 +3348,7 @@ impl<'ctx> Parser<'ctx> {
 		let mut ident = self.parse_path_ident()?;
 		let mut segments: Vec<PathSegment> = Vec::new();
 		loop {
-			let mut type_args: Box<[Spanned<TypeExpression>]> = Box::new([]);
+			let mut type_args: Box<[TypeArgument]> = Box::new([]);
 			if self.lexer.peek().inner == Token::LeftArrow {
 				let (args, _) = self.parse_type_args()?;
 				type_args = args;
@@ -3297,7 +3506,7 @@ impl<'ctx> Parser<'ctx> {
 		let mut ident = first;
 		let mut segments: Vec<PathSegment> = Vec::new();
 		let path_end = loop {
-			let mut type_args: Box<[Spanned<TypeExpression>]> = Box::new([]);
+			let mut type_args: Box<[TypeArgument]> = Box::new([]);
 			let mut end = ident.span.end;
 			if self.lexer.peek().inner == Token::LeftArrow {
 				let (args, close_span) = self.parse_type_args()?;
@@ -3433,23 +3642,7 @@ impl<'ctx> Parser<'ctx> {
 				})
 			}
 			Token::SemiColon => {
-				let size_token = self.lexer.next();
-				let size_value = size_token
-					.span
-					.extract_str(self.source)
-					.parse::<usize>()
-					.map_err(|_| {
-						self.ast.diagnostics.push(
-							report_invalid_integer_literal(
-								self.ast.file_id,
-								size_token.span,
-							),
-						);
-					})?;
-				let size = Spanned {
-					inner: size_value,
-					span: size_token.span,
-				};
+				let length = self.parse_length()?;
 				let close_span = self.next_expect(Token::CloseBracket)?.span;
 				let span = TextSpan::new(start, close_span.end);
 				Ok(Spanned {
@@ -3457,7 +3650,7 @@ impl<'ctx> Parser<'ctx> {
 						ownership,
 						memory,
 						inner: Box::new(inner),
-						size,
+						length,
 					},
 					span,
 				})
@@ -4761,13 +4954,13 @@ impl<'ctx> Parser<'ctx> {
 		let first = parser.parse_expression(BindingPower::Default)?;
 
 		if parser.lexer.next_if(Token::SemiColon).is_some() {
-			let count = parser.parse_expression(BindingPower::Default)?;
+			let count = parser.parse_length()?;
 			let close_span = parser.next_expect(Token::CloseBracket)?.span;
 			let span = TextSpan::new(open_span.start, close_span.end);
 			return Ok(Spanned {
 				inner: Expression::ArrayRepeat {
 					value: Box::new(first),
-					count: Box::new(count),
+					count,
 				},
 				span,
 			});
@@ -5138,68 +5331,16 @@ impl<'ctx> Parser<'ctx> {
 		let token = parser.lexer.peek();
 		match token.inner {
 			Token::OpenParen => Parser::parse_tuple_pattern(parser),
-			Token::Int => {
-				let token = parser.lexer.next();
-				let value = parser.integer_literal(token.span);
+			Token::Int
+			| Token::Char
+			| Token::Float
+			| Token::String
+			| Token::Minus => {
+				let literal = parser.parse_literal()?;
 				Ok(Spanned {
-					inner: Pattern::Literal(PatternLiteral::Int(value)),
-					span: token.span,
+					inner: Pattern::Literal(literal.inner),
+					span: literal.span,
 				})
-			}
-			Token::Char => {
-				let span = parser.lexer.next().span;
-				Ok(Spanned {
-					inner: Pattern::Literal(PatternLiteral::Char),
-					span,
-				})
-			}
-			Token::Float | Token::String => {
-				// A float has no single value to compare with and a string
-				// has no equality at all, so neither can be matched — but
-				// that is the checker's judgement, not the parser's: the
-				// pattern is read, and the rest of the file still parses.
-				let token = parser.lexer.next();
-				let literal = match token.inner {
-					Token::Float => PatternLiteral::Float,
-					_ => PatternLiteral::String,
-				};
-				Ok(Spanned {
-					inner: Pattern::Literal(literal),
-					span: token.span,
-				})
-			}
-			Token::Minus => {
-				let minus = parser.lexer.next().span;
-				match parser.lexer.peek().inner {
-					Token::Int => {
-						let token = parser.lexer.next();
-						let value = parser.integer_literal(token.span);
-						Ok(Spanned {
-							inner: Pattern::Literal(PatternLiteral::NegInt(
-								value,
-							)),
-							span: TextSpan::new(minus.start, token.span.end),
-						})
-					}
-					Token::Float => {
-						let token = parser.lexer.next();
-						let span = TextSpan::new(minus.start, token.span.end);
-						Ok(Spanned {
-							inner: Pattern::Literal(PatternLiteral::Float),
-							span,
-						})
-					}
-					_ => {
-						// `-` must be followed by the number it negates.
-						let token = parser.lexer.next();
-						parser.ast.diagnostics.push(report_unexpected_token(
-							parser.ast.file_id,
-							token,
-							Token::Int,
-						));
-						Err(())
-					}
-				}
 			}
 			Token::Identifier => {
 				let text = token.span.extract_str(parser.source);
@@ -5240,12 +5381,10 @@ impl<'ctx> Parser<'ctx> {
 						Err(())
 					}
 					Ok(Keyword::True) | Ok(Keyword::False) => {
-						let span = parser.lexer.next().span;
+						let literal = parser.parse_literal()?;
 						Ok(Spanned {
-							inner: Pattern::Literal(PatternLiteral::Bool(
-								matches!(text, "true"),
-							)),
-							span,
+							inner: Pattern::Literal(literal.inner),
+							span: literal.span,
 						})
 					}
 					_ => Parser::parse_path_pattern(parser),
@@ -5485,8 +5624,24 @@ impl<'ctx> Parser<'ctx> {
 		let name_span = parser.next_expect(Token::Identifier)?.span;
 		let name_symbol = parser.intern_identifier(name_span);
 
-		let repr = if parser.lexer.next_if(Token::Colon).is_some() {
+		// The repr is written like a struct's fields, `enum Ordering(i8)`.
+		// The old `enum Ordering: i8` is reported and read as the new form.
+		let repr = if let Some(colon) = parser.lexer.next_if(Token::Colon) {
+			parser.ast.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::EnumReprNeedsParentheses.code())
+					.with_message("an enum's repr is written in parentheses")
+					.with_label(
+						Label::primary(parser.ast.file_id, colon.span)
+							.with_message("expected `(`"),
+					)
+					.with_note("write `enum Name(Type) { ... }`"),
+			);
 			Some(Box::new(parser.parse_type_expression()?))
+		} else if parser.lexer.next_if(Token::OpenParen).is_some() {
+			let repr = parser.parse_type_expression()?;
+			parser.next_expect(Token::CloseParen)?;
+			Some(Box::new(repr))
 		} else {
 			None
 		};

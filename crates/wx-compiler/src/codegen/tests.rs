@@ -3666,7 +3666,7 @@ fn test_match_inside_loop_break_and_continue_commit_mutations() {
 #[test]
 fn test_match_enum_dispatch_runs_correctly() {
 	let case = TestCase::new(indoc! {"
-        enum FileDescriptor: u8 {
+        enum FileDescriptor(u8) {
             StdIn = 0,
             StdOut,
             StdErr,

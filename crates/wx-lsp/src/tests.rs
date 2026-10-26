@@ -949,7 +949,7 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 	// completion as if `StdIn` alone were a valid expression.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! { "
-		enum FileDescriptor: u8 {
+		enum FileDescriptor(u8) {
 		    StdIn,
 		    StdOut,
 		    StdErr,
@@ -1219,7 +1219,7 @@ fn completion_shows_sibling_module_items_via_wildcard_use() {
 fn path_completion_after_enum_lists_variants() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
-		enum FileDescriptor: u8 {
+		enum FileDescriptor(u8) {
 		    StdIn,
 		    StdOut,
 		    StdErr,
@@ -1535,7 +1535,7 @@ fn unused_enum_variants_get_one_squiggle_each() {
 	let (_, compiled) = compile_source(
 		&root,
 		indoc::indoc! {"
-			enum Direction: i32 {
+			enum Direction(i32) {
 			    Right,
 			    Down,
 			    Left,
@@ -1582,7 +1582,7 @@ fn enum_type_used_as_return_type_resolves_to_its_definition() {
 	// hover/go-to-definition on it silently failed.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
-		enum Status: u8 {
+		enum Status(u8) {
 		    Ok = 200,
 		}
 

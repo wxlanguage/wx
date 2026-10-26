@@ -57,7 +57,7 @@ fn test_enum_variant_lowered_to_repr_scalar() {
 	// Enums have no runtime representation — Color::Green erases to the repr
 	// scalar type (i32) at MIR/codegen time.
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
@@ -78,7 +78,7 @@ fn test_enum_folded_arithmetic_variant_lowered() {
 	// `1 + 1`, an arithmetic expression, not a bare literal — MIR lowering
 	// must still erase it to a concrete scalar.
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1 + 1,
         }
 
@@ -1575,7 +1575,7 @@ fn test_match_enum_lowers_discriminants_to_repr_values() {
 	// scalar), not a symbolic variant index — mirrors how `Color::Green`
 	// itself erases to a scalar (test_enum_variant_lowered_to_repr_scalar).
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
@@ -1597,7 +1597,7 @@ fn test_match_enum_lowers_discriminants_to_repr_values() {
 #[test]
 fn test_match_exhaustive_enum_no_wildcard_has_no_default() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,

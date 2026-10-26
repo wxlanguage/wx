@@ -24,7 +24,7 @@ import "host" as host {
   func get_time_ms() -> i64;
 }
 
-enum Direction: u32 {
+enum Direction(u32) {
   Right = 0,
   Down = 1,
   Left = 2,
