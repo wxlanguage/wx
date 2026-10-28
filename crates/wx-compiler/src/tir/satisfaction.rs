@@ -9,8 +9,8 @@
 //! equality by comparing the normalized projection with the written value, a
 //! nested bound on the projection. That proof is `Solver::satisfies_clauses`,
 //! shared with impl selection; this module reports its failures. Impl
-//! conformance (an impl's associated values against their declared bounds)
-//! is not validated.
+//! conformance (`conformance.rs`) proves an impl's associated values and its
+//! target's supertraits through the same check.
 
 use codespan_reporting::diagnostic::Diagnostic;
 

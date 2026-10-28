@@ -2610,6 +2610,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						reference: SourceSpan::new(file_id, target.span()),
 					});
 				}
+				obligations.push(TypeObligation::CheckConformance {
+					impl_index: block_index,
+				});
 				// A default this impl inherits means something here that it
 				// does not in the trait, so the impl owns its judgement; a
 				// member the impl writes is checked where it is written.
@@ -8481,7 +8484,7 @@ pub(super) mod tests {
 				true,
 			),
 			(
-				"type u8; trait Tr {} impl Tr for u8 { func f(x: Self<u8>) {} }",
+				"type u8; trait Tr { func f(x: Self); } impl Tr for u8 { func f(x: Self<u8>) {} }",
 				"u8 {",
 				"`Self` is `u8` in this impl",
 				false,
@@ -9796,7 +9799,15 @@ pub(super) mod tests {
 					),
 					MemberLookup::NotFound
 				));
-				assert!(builder.diagnostics.is_empty());
+				// Conformance reports it as no member of the trait.
+				assert_eq!(
+					builder
+						.diagnostics
+						.iter()
+						.map(|diagnostic| diagnostic.code.as_deref())
+						.collect::<Vec<_>>(),
+					[Some(DiagnosticCode::NotATraitMember.code())]
+				);
 				let missing = builder.strings.get("Extra").unwrap();
 				assert!(
 					builder
@@ -9822,8 +9833,8 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn a_missing_impl_value_is_a_projection_without_a_value_and_no_diagnostic()
-	{
+	fn a_missing_impl_value_is_a_projection_without_a_value_reported_only_as_missing()
+	 {
 		for path in ["<Wrapper as Container>::Item", "Wrapper::Item"] {
 			test_case!(
 				mut case = &format!(
@@ -9838,8 +9849,9 @@ pub(super) mod tests {
 				)
 			);
 			// The impl omits `Item`; reporting that belongs to impl conformance,
-			// so neither the signatures nor the normalizer say anything.
-			case.diagnostics().assert_none();
+			// so neither the signatures nor the normalizer say anything more.
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::IncompleteTraitImpl]);
 			for name in ["f", "g"] {
 				let signature = case.function_signature(name);
 				let (scope, written) = (
@@ -9876,8 +9888,11 @@ pub(super) mod tests {
 		);
 		// Selecting `Next` off the projection reads `Item`'s declared bounds,
 		// which name no `Next`; the projection is not reduced to find one.
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::NotATraitMember]);
+		// The impl leaving `Item` out is conformance's own report.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IncompleteTraitImpl,
+			DiagnosticCode::NotATraitMember,
+		]);
 		assert_eq!(case.param_types("f")[0], TypeIndex::ERROR);
 	}
 
@@ -11232,7 +11247,7 @@ pub(super) mod tests {
 			struct Need<T: Marker>();
 			trait Service {
 				type Item: Marker;
-				func get<U: Container where { Item: Marker }>(self: Self, x: Need<Self::Item>, y: Need<U::Item>);
+				func get<U: Container where { Item = i32 }>(self: Self, x: Need<Self::Item>, y: Need<U::Item>);
 			}
 			struct Wrap<T>();
 			impl<T: Marker> Service for Wrap<T> {
@@ -11321,19 +11336,15 @@ pub(super) mod tests {
 		"}
 		);
 		// Both annotations, and the construction, which proves its own
-		// instantiation as every use does.
-		assert_eq!(
-			case.context.diagnostics.len(),
-			3,
-			"{:?}",
-			case.context.diagnostics
-		);
-		for diagnostic in &*case.context.diagnostics {
-			assert_eq!(
-				diagnostic.code.as_deref(),
-				Some(DiagnosticCode::TraitBoundViolation.code())
-			);
-		}
+		// instantiation as every use does. The types are kept as written, so
+		// conformance reports that they are not the trait's.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitImplSignatureMismatch,
+			DiagnosticCode::TraitImplConstTypeMismatch,
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
 		let signature =
 			case.trait_impl_function_signature("S", "Service", "get");
 		let constant = case.trait_impl_const_signature("S", "Service", "VALUE");

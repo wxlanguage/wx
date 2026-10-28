@@ -789,7 +789,9 @@ impl TypeContext<'_, '_, '_> {
 			TraitMemberSelection::Impl(MemberKind::AssociatedType(
 				provider,
 			)) => self.assoc_type_value(provider),
-			TraitMemberSelection::Impl(_) => Err(SolverError::Poisoned),
+			TraitMemberSelection::Impl(_) => {
+				unreachable!("a selected member has its declaration's kind")
+			}
 			TraitMemberSelection::TraitDeclaration(_) => {
 				let default = self.assoc_type_default(member.declaration)?;
 				let trait_index = self

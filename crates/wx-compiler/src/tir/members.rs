@@ -189,6 +189,9 @@ impl DefinitionRegistry {
 	/// Selects an impl member or its trait declaration. The caller must pass a
 	/// declaration of the trait implemented by `impl_index`; member lookup and
 	/// projection resolution establish that relationship before calling here.
+	/// Only a member of the declaration's kind provides it: one of another
+	/// kind under its name is conformance's to report, and the declaration
+	/// is selected as if the impl had omitted it.
 	pub(super) fn select_trait_member(
 		&self,
 		impl_index: TraitImplIdx,
@@ -196,12 +199,17 @@ impl DefinitionRegistry {
 	) -> TraitMemberSelection {
 		let key = self.member_key(declaration);
 		let impl_def = &self.trait_impls[usize::from(impl_index)];
-		if let Some(index) = impl_def.bindings.get(&key).copied() {
-			TraitMemberSelection::Impl(
-				impl_def.members[usize::from(index)].kind,
-			)
-		} else {
-			TraitMemberSelection::TraitDeclaration(declaration)
+		match impl_def.bindings.get(&key) {
+			Some(&index)
+				if impl_def.members[usize::from(index)]
+					.kind
+					.same_kind(declaration) =>
+			{
+				TraitMemberSelection::Impl(
+					impl_def.members[usize::from(index)].kind,
+				)
+			}
+			_ => TraitMemberSelection::TraitDeclaration(declaration),
 		}
 	}
 }

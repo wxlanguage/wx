@@ -246,6 +246,7 @@ define_diagnostic_codes! {
 		DuplicateNamedArgument => "E2121",
 		MissingArguments => "E2122",
 		PositionalOnlyCall => "E2123",
+		ImplStricterThanTrait => "E2124",
 	}
 }
 

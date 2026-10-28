@@ -14,6 +14,7 @@
 
 mod body;
 mod bounds;
+mod conformance;
 mod defs;
 mod eval;
 mod format;

@@ -4333,8 +4333,9 @@ mod tests {
 		assert_eq!(case.shape("qualified"), "(block (call m t#0))");
 	}
 
-	/// Conformance is not checked, so a `call` of the wrong shape must not
-	/// decide what the call takes: `Args` and `Result` are read from the impl.
+	/// A `call` of the wrong shape breaks the trait's contract, and still does
+	/// not decide what the call takes: `Args` and `Result` are read from the
+	/// impl.
 	#[test]
 	fn a_value_call_reads_args_and_result_from_its_call_impl() {
 		test_case!(
@@ -4348,7 +4349,8 @@ mod tests {
 				func f(x: X) -> u32 { x(1) }
 			"}
 		);
-		case.diagnostics().assert_none();
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		assert_eq!(case.body_type("f"), "u32");
 	}
 
@@ -5644,6 +5646,24 @@ mod tests {
 		assert_eq!(case.shape("path"), "(block => (call pick 1=2 0=s#0 2=1))");
 	}
 
+	/// A member of another kind does not provide the declaration of its name:
+	/// a call selects the trait's declaration, as for a member the impl
+	/// leaves out, and conformance reports the member.
+	#[test]
+	fn a_call_skips_an_impl_member_of_another_kind() {
+		test_case!(
+			case = indoc! {"
+				trait Size { func size(self: Self) -> u32 { 0 } }
+				struct S();
+				impl Size for S { const size: u32 = 1; }
+				func f(s: S) -> u32 { s.size() }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitImplItemKindMismatch]);
+		assert_eq!(case.shape("f"), "(block => (abstract size<S> s#0))");
+	}
+
 	#[test]
 	fn a_trait_impl_function_is_called_by_its_traits_names() {
 		test_case!(
@@ -5658,7 +5678,10 @@ mod tests {
 				func impl_name(p: P, q: P) -> P { p.add({ other: q }) }
 			"}
 		);
+		// The impl's own name breaks the trait's contract, and calls still use
+		// the trait's.
 		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitImplSignatureMismatch,
 			DiagnosticCode::UnknownParameterName,
 			DiagnosticCode::MissingArguments,
 		]);
@@ -5732,8 +5755,12 @@ mod tests {
 				func positional(s: S) -> S { s.scale(2) }
 			"}
 		);
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::PositionalOnlyCall]);
+		// Naming the parameter breaks the trait's contract, and the call still
+		// follows the trait's declaration, which has no name to call it by.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitImplSignatureMismatch,
+			DiagnosticCode::PositionalOnlyCall,
+		]);
 		case.diagnostics().assert_error_saying(
 			"function `scale` has an unnamed parameter, so it is called by \
 			 position",

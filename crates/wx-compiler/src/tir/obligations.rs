@@ -18,7 +18,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::bounds::BoundArena;
-use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx};
+use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx, TraitImplIdx};
 use super::literals::Integer;
 use super::members::report_type_does_not_implement_trait;
 use super::signatures::{ConstantSignature, TypeContext, TypeSetSignature};
@@ -117,6 +117,8 @@ pub(super) enum TypeObligation {
 		expected: TypeIndex,
 		reference: SourceSpan,
 	},
+	/// A trait impl keeps its trait's contract (`conformance.rs`).
+	CheckConformance { impl_index: TraitImplIdx },
 	/// `Projection::name` was written, and the projection's declared bounds do
 	/// not name `name`. Whether its *value* has such a member depends on impls,
 	/// which construction cannot read, so the type was lowered to `ERROR` and
@@ -393,6 +395,10 @@ impl TypeContext<'_, '_, '_> {
 				Err(SolverError::Poisoned) => Ok(()),
 				Err(SolverError::Pending) => Err(()),
 			},
+			// Reports everything but "not decided yet" itself.
+			TypeObligation::CheckConformance { impl_index } => {
+				self.check_conformance(impl_index).map_err(|_| ())
+			}
 			TypeObligation::CheckProjectionMember {
 				assumption_context,
 				projection,

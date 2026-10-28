@@ -1705,6 +1705,20 @@ impl MemberKind {
 		}
 	}
 
+	/// Whether `other` is a member of the same kind: a function provides a
+	/// function or a method declaration alike, since what makes one a method
+	/// is its first parameter, which conformance compares.
+	pub(super) fn same_kind(self, other: Self) -> bool {
+		matches!(
+			(self, other),
+			(
+				Self::Function(_) | Self::Method(_),
+				Self::Function(_) | Self::Method(_)
+			) | (Self::Constant(_), Self::Constant(_))
+				| (Self::AssociatedType(_), Self::AssociatedType(_))
+		)
+	}
+
 	pub fn tier(self) -> Tier {
 		match self {
 			Self::AssociatedType(_) => Tier::Type,
