@@ -169,7 +169,6 @@ pub(super) enum PatternKind {
 	// Tests: match only some values, so only a match arm holds them.
 	/// The value's bits in the pattern's type: `-1` as an `i8` is `0xFF`.
 	Int(u64),
-	Bool(bool),
 	Char(char),
 	/// A known constant: a variant, a free one, or an impl's, with its flat
 	/// type arguments as `ExprKind::Const` holds them.
@@ -212,10 +211,9 @@ pub(super) enum ExprKind {
 	/// `Int(1)`.
 	Int(u64),
 	Float(f64),
-	Bool(bool),
 	Char(char),
 	/// A string literal's contents, unescaped. Its type is a shared byte
-	/// slice or byte array its context gives (`Type::String` until then).
+	/// slice or byte array its context gives (`Type::StringLiteral` until then).
 	String(SymbolU32),
 	/// An array literal `[a, b, c]`. Its type is a shared array of its length
 	/// or a shared slice its context gives (`Type::ArrayLiteral` until then),
@@ -270,8 +268,8 @@ pub(super) enum ExprKind {
 		op: UnaryOp,
 		operand: ExprIdx,
 	},
-	/// `lhs op rhs` where both are the same primitive scalar, or `bool` for
-	/// `&&`/`||`.
+	/// `lhs op rhs` where both are the same primitive scalar, enum or
+	/// pointer, or `Bool` for `&&`/`||`.
 	PrimitiveBinary {
 		op: BinaryOp,
 		lhs: ExprIdx,
@@ -333,10 +331,6 @@ pub(super) enum ExprKind {
 	StructConstructor {
 		struct_index: StructIdx,
 		fields: ExprIdx,
-	},
-	/// `value as T`; the node's type is `T`.
-	Cast {
-		value: ExprIdx,
 	},
 	/// `value.field` on a value that is not in linear memory (a local, a
 	/// global, a call's result). The field is its declared index.
@@ -475,12 +469,12 @@ pub(super) struct Scope {
 	pub(super) kind: ScopeKind,
 	/// `None` only for the root.
 	pub(super) parent: Option<ScopeIdx>,
-	/// `outer: loop { .. }`. Both branches of a labelled `if` share one.
+	/// `loop :outer { .. }` or `block :outer { .. }`.
 	pub(super) label: Option<LabelIdx>,
 	pub(super) span: TextSpan,
 }
 
-/// A label written on a block, a loop or an `if`.
+/// A label written on a block or a loop.
 #[derive(Clone, Copy)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) struct Label {

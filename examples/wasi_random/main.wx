@@ -31,15 +31,15 @@ impl Allocator for BumpAllocator {
   type Mem = heap;
 
   func reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
-    local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align());
+    local ptr = ptr::align_up::<Self::Mem>(transmute(bump), layout.align());
     local new_end = ptr + layout.size();
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
       local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
       if heap.grow(needed) == -1 { trap() }
     }
-    bump = new_end as *u8;
-    ptr as *u8
+    bump = transmute(new_end);
+    transmute(ptr)
   }
 }
 
@@ -54,7 +54,7 @@ func write_all(fd: FileDescriptor, bytes: &[u8]) {
 }
 
 func hex_digit(nibble: u8) -> u8 {
-  if nibble < 10 { '0' as u8 + nibble } else { 'a' as u8 + (nibble - 10) }
+  if nibble < 10 { '0' + nibble } else { 'a' + (nibble - 10) }
 }
 
 func main() {
@@ -72,9 +72,9 @@ func main() {
     text[i * 2 + 1] = hex_digit(byte % 16);
     i += 1;
   }
-  text[RANDOM_BYTES * 2] = '\n' as u8;
+  text[RANDOM_BYTES * 2] = '\n';
   
-  write_all(FileDescriptor::Stdout, text as _);
+  write_all(FileDescriptor::Stdout, transmute(text));
 }
 
 export {

@@ -42,8 +42,7 @@ pub(super) enum ImplTarget {
 	I64,
 	F32,
 	F64,
-	Bool,
-	Char,
+	Funcref,
 	Array,
 	Slice,
 	Struct(StructIdx),
@@ -66,8 +65,7 @@ impl ImplTarget {
 			Type::I64 => Self::I64,
 			Type::F32 => Self::F32,
 			Type::F64 => Self::F64,
-			Type::Bool => Self::Bool,
-			Type::Char => Self::Char,
+			Type::Funcref => Self::Funcref,
 			Type::Array { .. } => Self::Array,
 			Type::Slice { .. } => Self::Slice,
 			Type::Struct { struct_index, .. } => Self::Struct(*struct_index),
@@ -78,9 +76,10 @@ impl ImplTarget {
 			Type::Error
 			| Type::Infer
 			| Type::Never
-			| Type::Integer
-			| Type::Float
-			| Type::String
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::Tuple { .. }
 			| Type::FunctionRef { .. }
@@ -689,7 +688,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			DefKind::Enum(idx) => Some(ImplTarget::Enum(idx)),
 			// A user-written alias (`type Foo = Bar;`) has no identity of
 			// its own to dispatch on — only the closed set of std's own
-			// bodiless `#[intrinsic]` aliases (`u8`, `char`, ...) do, via
+			// bodiless `#[intrinsic]` aliases (`u8`, `funcref`, ...) do, via
 			// their pre-interned `TypeIndex`. `intrinsic_target` returns
 			// `None` for every other alias, same as any non-namespace kind.
 			DefKind::TypeAlias(idx) => self.intrinsic_target(idx),
@@ -754,8 +753,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			(intrinsics.i64, ImplTarget::I64),
 			(intrinsics.f32, ImplTarget::F32),
 			(intrinsics.f64, ImplTarget::F64),
-			(intrinsics.bool, ImplTarget::Bool),
-			(intrinsics.char, ImplTarget::Char),
+			(intrinsics.funcref, ImplTarget::Funcref),
 		]
 		.into_iter()
 		.find_map(|(slot, target)| (slot == Some(idx)).then_some(target))
@@ -775,8 +773,7 @@ impl TypeContext<'_, '_, '_> {
 			ImplTarget::I64 => TypeIndex::I64,
 			ImplTarget::F32 => TypeIndex::F32,
 			ImplTarget::F64 => TypeIndex::F64,
-			ImplTarget::Bool => TypeIndex::BOOL,
-			ImplTarget::Char => TypeIndex::CHAR,
+			ImplTarget::Funcref => TypeIndex::FUNCREF,
 			ImplTarget::Struct(struct_index) => {
 				self.types.intern_struct(struct_index, &[])
 			}

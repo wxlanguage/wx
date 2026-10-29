@@ -227,7 +227,7 @@ pub(super) enum TraitImplLookup {
 	/// on an equivalent subject. No concrete provider was selected; dispatch
 	/// remains symbolic until instantiation.
 	Abstract,
-	/// A trait the compiler answers from the receiver's structure: `ValueType`,
+	/// A trait the compiler answers from the receiver's structure: `StackValue`,
 	/// and `Call` for a function reference, whose `Args` and `Result` are its
 	/// parameter and result types. No impl provides it.
 	Builtin,

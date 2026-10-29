@@ -76,30 +76,6 @@ pub(super) enum UnsatisfiedClause {
 	},
 }
 
-/// One Wasm value type (`valtype`).
-#[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum ValType {
-	I32,
-	I64,
-	F32,
-	F64,
-	V128,
-	FuncRef,
-	ExternRef,
-}
-
-/// One value in a type's layout (`Solver::value_layout`).
-#[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum LayoutValue {
-	Known(ValType),
-	/// One value whose kind its instantiation decides: a type parameter or
-	/// a projection that does not reduce, assumed `ValueType`, or an address
-	/// into a memory not known yet.
-	Abstract(TypeIndex),
-}
-
 /// The value of `assoc_type_index` for `receiver`, whose trait the compiler
 /// answers from its structure: `func(A) -> R`'s `Call::Args` is `A` and its
 /// `Call::Result` is `R`.
@@ -120,6 +96,18 @@ fn builtin_assoc_value(
 	} else {
 		None
 	}
+}
+
+/// Whether `ty` is one Wasm value type, as wx spells it in a `Repr`.
+fn is_stack_scalar(ty: TypeIndex) -> bool {
+	matches!(
+		ty,
+		TypeIndex::I32
+			| TypeIndex::I64
+			| TypeIndex::F32
+			| TypeIndex::F64
+			| TypeIndex::FUNCREF
+	)
 }
 
 /// `ty`, a projection path over `root`, with `root` replaced by `onto`.
@@ -1219,8 +1207,20 @@ impl TypeContext<'_, '_, '_> {
 				(impl_index, args)
 			}
 			TraitImplLookup::Builtin => {
-				let Some(value) =
+				let value = if Some(assoc_type_index)
+					== self.defs.intrinsics.stack_value_repr
+				{
+					self.stack_repr(
+						assumption_context,
+						next_base,
+						trait_index,
+						assoc_type_index,
+					)?
+				} else {
 					builtin_assoc_value(self, next_base, assoc_type_index)
+				};
+				// A canonical `Repr` is its own answer.
+				let Some(value) = value.filter(|&value| value != projection)
 				else {
 					return Ok(projection);
 				};
@@ -1395,9 +1395,10 @@ impl TypeContext<'_, '_, '_> {
 			Type::Error
 			| Type::Infer
 			| Type::Never
-			| Type::Integer
-			| Type::Float
-			| Type::String
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
@@ -1409,8 +1410,7 @@ impl TypeContext<'_, '_, '_> {
 			| Type::I64
 			| Type::F32
 			| Type::F64
-			| Type::Bool
-			| Type::Char
+			| Type::Funcref
 			| Type::Enum { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. }
@@ -1430,12 +1430,10 @@ impl TypeContext<'_, '_, '_> {
 		if matches!(self.types.resolve(receiver), Type::Error | Type::Infer) {
 			return Err(SolverError::Poisoned);
 		}
-		// A value type is one Wasm value, whatever impls exist.
-		if Some(required_trait) == self.defs.intrinsics.value_type {
-			let layout = self.value_layout(assumption_context, receiver)?;
-			return Ok(layout
-				.is_some_and(|layout| layout.len() == 1)
-				.then_some(TraitImplLookup::Builtin));
+		// Every type is a stack value by its structure, whatever impls exist.
+		if Some(required_trait) == self.defs.intrinsics.stack_value {
+			let elements = self.stack_elements(assumption_context, receiver)?;
+			return Ok(elements.map(|_| TraitImplLookup::Builtin));
 		}
 		// Only an abstract type takes a trait from assumptions. Any other type
 		// has the trait exactly when its impl says so: there is one impl per
@@ -1506,26 +1504,120 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// The Wasm values a value of `ty` occupies, as `ValueType` judges it:
-	/// fields in declaration order. `None` when some part of it is abstract
-	/// and not assumed `ValueType`, so its values are unknown.
-	pub(super) fn value_layout(
+	/// How a value of `ty` sits on the Wasm stack, as `StackValue` judges it:
+	/// its parts in declaration order, flattened, zero-sized ones dropped.
+	/// Each element is a scalar (`is_stack_scalar`) or an abstract part
+	/// assumed `StackValue`, standing for its own `Repr`. `None` when `ty` is
+	/// no `StackValue`: it contains `!`, or an abstract part not assumed one.
+	pub(super) fn stack_elements(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-	) -> Result<Option<Box<[LayoutValue]>>, SolverError> {
-		let mut layout = Vec::new();
-		let known = self.push_layout(assumption_context, ty, &mut layout, 0)?;
-		Ok(known.then(|| layout.into_boxed_slice()))
+	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
+		let mut elements = Vec::new();
+		let is_stack_value =
+			self.push_stack_elements(assumption_context, ty, &mut elements, 0)?;
+		Ok(is_stack_value.then_some(elements))
 	}
 
-	/// Appends `ty`'s values to `out`; `false` when some part of it is
-	/// abstract and not assumed `ValueType`.
-	fn push_layout(
+	/// `<ty as StackValue>::Repr`, `ty` being a `StackValue` that is not
+	/// abstract itself. With no abstract part, the flat tuple of its
+	/// scalars; otherwise the projection again, over the canonical self type:
+	/// the flat tuple of its elements, which flattens as `ty` does. So
+	/// `Wrap<T>` gives `T::Repr`, and `Pair<T, u32>` and `(T, u32)` both give
+	/// `<(T, i32) as StackValue>::Repr`.
+	fn stack_repr(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
-		out: &mut Vec<LayoutValue>,
+		trait_index: TraitIdx,
+		assoc_type_index: AssocTypeIdx,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		let Some(parts) = self.stack_elements(assumption_context, ty)? else {
+			return Ok(None);
+		};
+		let mut elements = Vec::with_capacity(parts.len());
+		for part in parts {
+			if is_stack_scalar(part) {
+				elements.push(part);
+				continue;
+			}
+			// An equality in scope may say what the part is held as.
+			let repr = self.types.intern(Type::AssocTypeProjection {
+				base: part,
+				trait_index,
+				assoc_type_index,
+			});
+			let value = self.normalize(
+				assumption_context,
+				repr,
+				NormalizationDepth::Deep,
+				RewriteFlags::ALL,
+			)?;
+			let start = elements.len();
+			if !self.splice_repr(value, &mut elements) {
+				elements.truncate(start);
+				elements.push(part);
+			}
+		}
+		let base = self.types.intern_tuple(&elements);
+		if elements.iter().copied().all(is_stack_scalar) {
+			return Ok(Some(base));
+		}
+		Ok(Some(self.types.intern(Type::AssocTypeProjection {
+			base,
+			trait_index,
+			assoc_type_index,
+		})))
+	}
+
+	/// Appends the elements of `value`, a part's normalized `Repr`; `false`
+	/// when it is not one this can read (an equality gave it another kind of
+	/// type), and the part stays as it is.
+	fn splice_repr(&self, value: TypeIndex, out: &mut Vec<TypeIndex>) -> bool {
+		if is_stack_scalar(value) {
+			out.push(value);
+			return true;
+		}
+		match *self.types.resolve(value) {
+			Type::Tuple { elements } => {
+				let elements = self.types.list(elements);
+				elements
+					.iter()
+					.all(|&element| self.splice_repr(element, out))
+			}
+			Type::AssocTypeProjection {
+				base,
+				trait_index,
+				assoc_type_index,
+			} if Some(trait_index) == self.defs.intrinsics.stack_value
+				&& Some(assoc_type_index)
+					== self.defs.intrinsics.stack_value_repr =>
+			{
+				// A canonical self type is a flat tuple of elements or one
+				// abstract part; any other is left unreduced by a loop.
+				match *self.types.resolve(base) {
+					Type::Tuple { elements } => {
+						out.extend_from_slice(self.types.list(elements));
+						true
+					}
+					_ if self.types.is_param_or_projection(base) => {
+						out.push(base);
+						true
+					}
+					_ => false,
+				}
+			}
+			_ => false,
+		}
+	}
+
+	/// Appends `ty`'s elements to `out`; `false` when it is no `StackValue`.
+	fn push_stack_elements(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		out: &mut Vec<TypeIndex>,
 		depth: usize,
 	) -> Result<bool, SolverError> {
 		if depth > self.solver.state.recursion_budget {
@@ -1537,21 +1629,23 @@ impl TypeContext<'_, '_, '_> {
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
 		)?;
-		let known = match *self.types.resolve(ty) {
+		let is_stack_value = match *self.types.resolve(ty) {
 			// A constant is no value's type; lowering puts one only where a
 			// constant is expected.
 			Type::Error
 			| Type::Infer
-			| Type::Integer
-			| Type::Float
-			| Type::String
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::Value { .. }
 			| Type::Const { .. } => {
 				return Err(SolverError::Poisoned);
 			}
-			Type::Never
-			| Type::Function { .. }
+			// An uninhabited type has no representation.
+			Type::Never => false,
+			Type::Function { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. } => true,
 			Type::U8
@@ -1559,60 +1653,57 @@ impl TypeContext<'_, '_, '_> {
 			| Type::U16
 			| Type::I16
 			| Type::U32
-			| Type::I32
-			| Type::Bool
-			| Type::Char => {
-				out.push(LayoutValue::Known(ValType::I32));
+			| Type::I32 => {
+				out.push(TypeIndex::I32);
 				true
 			}
 			Type::U64 | Type::I64 => {
-				out.push(LayoutValue::Known(ValType::I64));
+				out.push(TypeIndex::I64);
 				true
 			}
-			Type::F32 => {
-				out.push(LayoutValue::Known(ValType::F32));
-				true
-			}
-			Type::F64 => {
-				out.push(LayoutValue::Known(ValType::F64));
+			Type::F32 | Type::F64 | Type::Funcref => {
+				out.push(ty);
 				true
 			}
 			Type::FunctionRef { .. } => {
-				out.push(LayoutValue::Known(ValType::FuncRef));
+				out.push(TypeIndex::FUNCREF);
 				true
 			}
 			Type::Enum { enum_index } => {
 				let repr = self.enums[usize::from(enum_index)].repr;
-				self.push_layout(assumption_context, repr, out, depth + 1)?
+				self.push_stack_elements(
+					assumption_context,
+					repr,
+					out,
+					depth + 1,
+				)?
 			}
 			// An address, as wide as its memory's `Size`.
 			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
-				self.push_address(assumption_context, ty, memory, out, depth)?
+				self.push_address(assumption_context, memory, out, depth)?
 			}
 			// An address and a length, both as wide as the memory's `Size`.
 			Type::Slice { memory, .. } => {
-				self.push_address(assumption_context, ty, memory, out, depth)?
-					&& self.push_address(
-						assumption_context,
-						ty,
-						memory,
-						out,
-						depth,
-					)?
+				let start = out.len();
+				let is_stack_value =
+					self.push_address(assumption_context, memory, out, depth)?;
+				out.extend_from_within(start..);
+				is_stack_value
 			}
 			Type::Tuple { elements } => {
-				let elements: Box<[TypeIndex]> =
-					self.types.list(elements).into();
-				let mut known = true;
-				for element in elements {
-					known &= self.push_layout(
+				// Read one element at a time: normalizing may store more lists.
+				for at in 0..elements.len() {
+					let element = self.types.list(elements)[at];
+					if !self.push_stack_elements(
 						assumption_context,
 						element,
 						out,
 						depth + 1,
-					)?;
+					)? {
+						return Ok(false);
+					}
 				}
-				known
+				true
 			}
 			Type::Struct {
 				struct_index,
@@ -1622,7 +1713,6 @@ impl TypeContext<'_, '_, '_> {
 				let (env, fields) =
 					(signature.type_params, signature.field_types);
 				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
-				let mut known = true;
 				// Read one field at a time: substituting may store more lists.
 				for at in 0..fields.len() {
 					let field = self.types.list(fields)[at];
@@ -1634,28 +1724,30 @@ impl TypeContext<'_, '_, '_> {
 							args: &args,
 						},
 					);
-					known &= self.push_layout(
+					if !self.push_stack_elements(
 						assumption_context,
 						field,
 						out,
 						depth + 1,
-					)?;
+					)? {
+						return Ok(false);
+					}
 				}
-				known
+				true
 			}
 			Type::TypeParam { .. } | Type::AssocTypeProjection { .. } => {
-				let value_type = self
+				let stack_value = self
 					.defs
 					.intrinsics
-					.value_type
-					.expect("only `ValueType` asks for a layout");
+					.stack_value
+					.expect("only `StackValue` asks for stack elements");
 				match self.check_assumed_trait(
 					assumption_context,
 					ty,
-					value_type,
+					stack_value,
 				)? {
 					Assumption::Holds => {
-						out.push(LayoutValue::Abstract(ty));
+						out.push(ty);
 						true
 					}
 					Assumption::Unproven => false,
@@ -1663,18 +1755,17 @@ impl TypeContext<'_, '_, '_> {
 				}
 			}
 		};
-		Ok(known)
+		Ok(is_stack_value)
 	}
 
-	/// Appends one address into `memory`, the layout of its `Size`. An
-	/// address into a memory not known yet is still one value: `pointer`,
-	/// abstract.
+	/// Appends one address into `memory`: its `Size`'s elements. An abstract
+	/// memory's is its abstract `Size`, the same element for every pointer
+	/// into it, so `M::*u8` and `M::Size` are held alike.
 	fn push_address(
 		&mut self,
 		assumption_context: TypeEnvIdx,
-		pointer: TypeIndex,
 		memory: TypeIndex,
-		out: &mut Vec<LayoutValue>,
+		out: &mut Vec<TypeIndex>,
 		depth: usize,
 	) -> Result<bool, SolverError> {
 		let memory = self.normalize(
@@ -1683,19 +1774,19 @@ impl TypeContext<'_, '_, '_> {
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
 		)?;
-		let Type::Memory { memory_index } = *self.types.resolve(memory) else {
-			out.push(LayoutValue::Abstract(pointer));
-			return Ok(true);
+		let size = match *self.types.resolve(memory) {
+			Type::Memory { memory_index } => {
+				let size = self.defs.memories[usize::from(memory_index)]
+					.size_assoc_type_index;
+				self.assoc_types[usize::from(size)]
+					.as_ref()
+					.and_then(|signature| signature.value)
+					.ok_or(SolverError::Pending)?
+			}
+			Type::Error | Type::Infer => return Err(SolverError::Poisoned),
+			_ => self.memory_size(memory).ok_or(SolverError::Poisoned)?,
 		};
-		let size =
-			self.defs.memories[usize::from(memory_index)].size_assoc_type_index;
-		let Some(size) = self.assoc_types[usize::from(size)]
-			.as_ref()
-			.and_then(|signature| signature.value)
-		else {
-			return Err(SolverError::Pending);
-		};
-		self.push_layout(assumption_context, size, out, depth + 1)
+		self.push_stack_elements(assumption_context, size, out, depth + 1)
 	}
 
 	/// Whether the facts in scope prove `ty: required`, from three sources:

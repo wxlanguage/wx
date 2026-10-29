@@ -76,18 +76,18 @@ export {
 func binary_search<
     M: Memory where { Size: Sub + Add + Div + Eq },
     T: Ord,
->(arr: M::&[T], target: T) -> (bool, M::Size) {
+>(arr: M::&[T], target: T) -> (Bool, M::Size) {
     local mut low: M::Size = 0;
     local mut high = arr.len();
 
     loop {
-        if low == high { return (false, 0) };
+        if low == high { return (False, 0) };
 
         local mid = low + (high - low) / 2;
         match arr[mid].cmp(target) {
             Ordering::Less -> { low = mid + 1 },
             Ordering::Greater -> { high = mid },
-            Ordering::Equal -> { return (true, mid) },
+            Ordering::Equal -> { return (True, mid) },
         }
     }
 }

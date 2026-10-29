@@ -585,7 +585,6 @@ fn report_type_arg_count_mismatch(
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashMap;
 
 	use indoc::indoc;
 
@@ -596,31 +595,19 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::paths::PathResolver;
 	use crate::tir::resolutions::NameResolutions;
+	use crate::tir::signatures::tests::source_graph;
 	use crate::tir::solver::Solver;
 	use crate::tir::types::Type;
-	use crate::vfs;
 
-	/// Parses `source` (playing the stdlib's own role, same reasoning as
-	/// `signatures::tests::source_graph`), sweeps every registered item's
-	/// signature, then hands the live `TypeContext` to `f`. Nothing borrowed
-	/// here (`graph`, `defs`, `ast_nodes`, `diagnostics`) may escape this
-	/// call; only `f`'s own, owned return value does.
+	/// Parses `source` over the embedded stdlib, sweeps every registered
+	/// item's signature, then hands the live `TypeContext` to `f`. Nothing
+	/// borrowed here (`graph`, `defs`, `ast_nodes`, `diagnostics`) may escape
+	/// this call; only `f`'s own, owned return value does.
 	fn with_resolved<R>(
 		source: &str,
 		f: impl FnOnce(&mut TypeContext) -> R,
 	) -> R {
-		let mut vfs_builder = vfs::CompilationUnitBuilder::new();
-		let root_id = vfs_builder
-			.load_binary(
-				vfs::AbsolutePath::new("/main.wx"),
-				&vfs::VirtualFileSource::from_relative(HashMap::from([(
-					"main.wx".to_string(),
-					source.to_string(),
-				)])),
-			)
-			.unwrap();
-		vfs_builder.set_stdlib(root_id);
-		let mut graph = vfs_builder.build(root_id);
+		let mut graph = source_graph(source);
 
 		let mut diagnostics = Vec::new();
 		let mut resolutions = NameResolutions::default();
@@ -845,7 +832,6 @@ mod tests {
 	fn a_generic_param_with_a_matching_bound_satisfies_the_trait() {
 		with_resolved(
 			indoc! {"
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Bound {}
 				func target<T: Bound>(x: T) {}
 			"},
@@ -866,7 +852,6 @@ mod tests {
 	fn a_generic_param_without_the_bound_does_not_satisfy_the_trait() {
 		with_resolved(
 			indoc! {"
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Bound {}
 				trait Other {}
 				func target<T: Bound>(x: T) {}
@@ -888,7 +873,6 @@ mod tests {
 	fn a_generic_param_satisfies_a_bounds_supertrait_transitively() {
 		with_resolved(
 			indoc! {"
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Super {}
 				trait Sub: Super {}
 				func target<T: Sub>(x: T) {}

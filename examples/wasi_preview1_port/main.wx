@@ -350,8 +350,8 @@ struct SubscriptionU(
 
 func subscription_u_as_fd_readwrite(u: *SubscriptionU) -> *SubscriptionFdReadwrite {
     local base: *SubscriptionU = ptr::null_mut();
-    local offset = (base.*.clock.& as heap::Size) - (base as heap::Size);
-    (u as heap::Size + offset) as *SubscriptionFdReadwrite
+    local offset = transmute::<_, heap::Size>(base.*.clock.&) - transmute::<_, heap::Size>(base);
+    transmute(transmute::<_, heap::Size>(u) + offset)
 }
 
 // ── `$subscription` ──────────────────────────────────────────────────────────
@@ -558,7 +558,7 @@ impl Allocator for BumpAllocator {
     type Mem = heap;
 
     func reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
-        local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align());
+        local ptr = ptr::align_up::<Self::Mem>(transmute(bump), layout.align());
         local new_end = ptr + layout.size();
         local cur_end = heap.size_bytes();
         if new_end > cur_end {
@@ -566,8 +566,8 @@ impl Allocator for BumpAllocator {
                 (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
             if heap.grow(needed) == -1 { trap() }
         }
-        bump = new_end as *u8;
-        ptr as *u8
+        bump = transmute(new_end);
+        transmute(ptr)
     }
 }
 
@@ -587,12 +587,12 @@ func write_decimal(fd: Fd, mut value: u32) {
     local mut i: u32 = 10;
     if value == 0 {
         i -= 1;
-        buf[i] = '0' as u8;
+        buf[i] = '0';
     } else {
         loop {
             if value == 0 { break };
             i -= 1;
-            buf[i] = '0' as u8 + (value % 10) as u8;
+            buf[i] = '0' + transmute::<_, u8>(value % 10);
             value /= 10;
         }
     }
@@ -622,7 +622,7 @@ func main() {
         trap()
     };
     write_all(Fd::Stdout, "fd_fdstat_get: fs_filetype=");
-    write_decimal(Fd::Stdout, stat_ptr.*.fs_filetype as u32);
+    write_decimal(Fd::Stdout, transmute(stat_ptr.*.fs_filetype));
     write_all(Fd::Stdout, "\n");
 
     // poll_oneoff: one clock subscription (relative 5ms timeout), read back
@@ -652,7 +652,7 @@ func main() {
     local nevents_ptr = alloc.alloc::<u32>(0);
     local poll_result = wasi::poll_oneoff(sub_ptr, event_ptr, 1, nevents_ptr);
     write_all(Fd::Stdout, "poll_oneoff: errno=");
-    write_decimal(Fd::Stdout, poll_result as u32);
+    write_decimal(Fd::Stdout, transmute(poll_result));
     write_all(Fd::Stdout, " nevents=");
     write_decimal(Fd::Stdout, nevents_ptr.*);
     write_all(Fd::Stdout, "\n");
@@ -671,7 +671,7 @@ func main() {
     }));
     local recovered = subscription_u_as_fd_readwrite(scratch).*.file_descriptor;
     write_all(Fd::Stdout, "union round-trip: file_descriptor=");
-    write_decimal(Fd::Stdout, recovered as u32);
+    write_decimal(Fd::Stdout, transmute(recovered));
     write_all(Fd::Stdout, "\n");
 }
 

@@ -55,16 +55,17 @@ impl TypeIndex {
 		}
 	}
 
-	pub fn is_untyped(self) -> bool {
-		self == TypeIndex::INTEGER
-			|| self == TypeIndex::FLOAT
-			|| self == TypeIndex::STRING
+	pub fn is_literal(self) -> bool {
+		self == TypeIndex::INTEGER_LITERAL
+			|| self == TypeIndex::FLOAT_LITERAL
+			|| self == TypeIndex::STRING_LITERAL
+			|| self == TypeIndex::CHAR_LITERAL
 			|| self == TypeIndex::ARRAY_LITERAL
 	}
 
 	#[inline]
-	pub fn is_comptime_number(self) -> bool {
-		self == TypeIndex::INTEGER || self == TypeIndex::FLOAT
+	pub fn is_number_literal(self) -> bool {
+		self == TypeIndex::INTEGER_LITERAL || self == TypeIndex::FLOAT_LITERAL
 	}
 
 	#[inline]
@@ -96,8 +97,8 @@ impl TypeIndex {
 	pub const ERROR: TypeIndex = TypeIndex(1);
 	pub const UNIT: TypeIndex = TypeIndex(2);
 	pub const NEVER: TypeIndex = TypeIndex(3);
-	pub const INTEGER: TypeIndex = TypeIndex(4);
-	pub const FLOAT: TypeIndex = TypeIndex(5);
+	pub const INTEGER_LITERAL: TypeIndex = TypeIndex(4);
+	pub const FLOAT_LITERAL: TypeIndex = TypeIndex(5);
 	pub const U8: TypeIndex = TypeIndex(6);
 	pub const I8: TypeIndex = TypeIndex(7);
 	pub const U16: TypeIndex = TypeIndex(8);
@@ -108,10 +109,14 @@ impl TypeIndex {
 	pub const I64: TypeIndex = TypeIndex(13);
 	pub const F32: TypeIndex = TypeIndex(14);
 	pub const F64: TypeIndex = TypeIndex(15);
+	/// std's `Bool`, an enum.
 	pub const BOOL: TypeIndex = TypeIndex(16);
+	/// std's `Char`, a struct.
 	pub const CHAR: TypeIndex = TypeIndex(17);
-	pub const STRING: TypeIndex = TypeIndex(18);
+	pub const STRING_LITERAL: TypeIndex = TypeIndex(18);
 	pub const ARRAY_LITERAL: TypeIndex = TypeIndex(19);
+	pub const FUNCREF: TypeIndex = TypeIndex(20);
+	pub const CHAR_LITERAL: TypeIndex = TypeIndex(21);
 }
 
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
@@ -179,15 +184,18 @@ pub enum Type {
 	/// whenever `Infer` survives past the call site that created it.
 	Infer,
 	Never,
-	Integer,
-	Float,
-	/// An untyped string literal's type: a shared byte slice or a shared
-	/// byte array of the literal's length, in a memory its context gives
-	/// (`coerce`).
-	String,
-	/// An untyped array literal's type: a shared array of the literal's
-	/// length or a shared slice of its elements' type, in a memory its
-	/// context gives (`coerce`).
+	IntegerLiteral,
+	FloatLiteral,
+	/// A character literal's type until its context gives it one: `Char`,
+	/// or an integer type its code point fits (`coerce`).
+	CharLiteral,
+	/// A string literal's type until its context gives it one: a shared byte
+	/// slice or a shared byte array of its length, in a memory the context
+	/// names (`coerce`).
+	StringLiteral,
+	/// An array literal's type until its context gives it one: a shared array
+	/// of its length or a shared slice of its elements' type, in a memory the
+	/// context names (`coerce`).
 	ArrayLiteral,
 	U8,
 	I8,
@@ -199,8 +207,9 @@ pub enum Type {
 	I64,
 	F32,
 	F64,
-	Bool,
-	Char,
+	/// A reference to a function of any signature, written `funcref`: the
+	/// untyped counterpart of `FunctionRef`.
+	Funcref,
 	/// `()` is the empty tuple, pre-interned as `TypeIndex::UNIT`.
 	Tuple {
 		elements: TypeList,
@@ -316,9 +325,9 @@ impl TypeFlags {
 	pub(super) const HAS_INFER: Self = Self(1 << 0);
 	/// An `Error` is in it: something about the type was reported.
 	pub(super) const HAS_ERROR: Self = Self(1 << 1);
-	/// An `Integer` or `Float` is in it: an untyped literal's type, which
-	/// context has not given it yet.
-	pub(super) const HAS_UNTYPED: Self = Self(1 << 2);
+	/// A literal's type (`IntegerLiteral`, `CharLiteral`, ..) is in it, which
+	/// context has not replaced yet.
+	pub(super) const HAS_LITERAL: Self = Self(1 << 2);
 	/// A `TypeParam` is in it: substitution can change the type.
 	pub(super) const HAS_PARAM: Self = Self(1 << 3);
 	/// An `AssocTypeProjection` or a `Const` is in it: normalization can
@@ -607,7 +616,9 @@ impl TypeInterner {
 		Some(())
 	}
 
-	pub fn new() -> Self {
+	/// `bool` and `char` are std's `Bool` and `Char`, which hold the
+	/// `BOOL` and `CHAR` slots, so interning their types finds them.
+	pub fn new(bool: EnumIdx, char: StructIdx) -> Self {
 		let mut types = Self {
 			entries: Vec::new(),
 			flags: Vec::new(),
@@ -625,8 +636,8 @@ impl TypeInterner {
 				elements: TypeList::EMPTY,
 			},
 			Type::Never,
-			Type::Integer,
-			Type::Float,
+			Type::IntegerLiteral,
+			Type::FloatLiteral,
 			Type::U8,
 			Type::I8,
 			Type::U16,
@@ -637,14 +648,26 @@ impl TypeInterner {
 			Type::I64,
 			Type::F32,
 			Type::F64,
-			Type::Bool,
-			Type::Char,
-			Type::String,
+			Type::Enum { enum_index: bool },
+			Type::Struct {
+				struct_index: char,
+				type_args: TypeList::EMPTY,
+			},
+			Type::StringLiteral,
 			Type::ArrayLiteral,
+			Type::Funcref,
+			Type::CharLiteral,
 		] {
 			types.intern(ty);
 		}
 		types
+	}
+
+	/// An interner whose `Bool` and `Char` are no declaration, for tests
+	/// that have none.
+	#[cfg(test)]
+	pub(super) fn for_tests() -> Self {
+		Self::new(EnumIdx::new(u32::MAX), StructIdx::new(u32::MAX))
 	}
 
 	/// Interns a type whose list, if it has one, is already stored.
@@ -811,9 +834,11 @@ impl TypeInterner {
 		match ty {
 			Type::Infer => TypeFlags::HAS_INFER,
 			Type::Error => TypeFlags::HAS_ERROR,
-			Type::Integer | Type::Float | Type::String | Type::ArrayLiteral => {
-				TypeFlags::HAS_UNTYPED
-			}
+			Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
+			| Type::ArrayLiteral => TypeFlags::HAS_LITERAL,
 			Type::Tuple { elements: list }
 			| Type::Struct {
 				type_args: list, ..
@@ -861,8 +886,7 @@ impl TypeInterner {
 			| Type::I64
 			| Type::F32
 			| Type::F64
-			| Type::Bool
-			| Type::Char
+			| Type::Funcref
 			| Type::Enum { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. }
@@ -891,10 +915,9 @@ impl TypeInterner {
 		}
 	}
 
-	/// Whether something in `ty` is an untyped literal's (an `Integer` or
-	/// `Float` anywhere in it).
-	pub(super) fn has_untyped(&self, ty: TypeIndex) -> bool {
-		self.flags[usize::from(ty)].contains(TypeFlags::HAS_UNTYPED)
+	/// Whether a literal's type is anywhere in `ty`.
+	pub(super) fn has_literal(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_LITERAL)
 	}
 
 	/// Whether `ty`'s head is a parameter or a projection: the types with
@@ -1120,7 +1143,7 @@ impl TypeInterner {
 		declared: TypeIndex,
 		actual: TypeIndex,
 	) {
-		if self.has_untyped(actual) {
+		if self.has_literal(actual) {
 			return;
 		}
 		match (*self.resolve(declared), *self.resolve(actual)) {
@@ -1426,9 +1449,10 @@ impl TypeInterner {
 			Type::Error
 			| Type::Infer
 			| Type::Never
-			| Type::Integer
-			| Type::Float
-			| Type::String
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
@@ -1440,8 +1464,7 @@ impl TypeInterner {
 			| Type::I64
 			| Type::F32
 			| Type::F64
-			| Type::Bool
-			| Type::Char
+			| Type::Funcref
 			| Type::Enum { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. }
@@ -1466,12 +1489,6 @@ impl TypeInterner {
 			}
 		}
 		substituted
-	}
-}
-
-impl Default for TypeInterner {
-	fn default() -> Self {
-		Self::new()
 	}
 }
 
@@ -1847,7 +1864,7 @@ impl TypeEnvArena {
 impl IntrinsicDefs {
 	/// `idx`'s real identity as a primitive type, if it has one. `None` for
 	/// the common case — an ordinary, non-primitive alias — and `Some` only
-	/// for the handful of reserved names (`u8`, `char`, `never`, ...) that
+	/// for the handful of reserved names (`u8`, `funcref`, ...) that
 	/// prescan recognized as one of std's own `#[intrinsic]` type aliases.
 	/// Those are bodiless by design, so this pre-interned `TypeIndex` *is*
 	/// their identity — nothing else names what they resolve to.
@@ -1863,8 +1880,7 @@ impl IntrinsicDefs {
 			(self.i64, TypeIndex::I64),
 			(self.f32, TypeIndex::F32),
 			(self.f64, TypeIndex::F64),
-			(self.bool, TypeIndex::BOOL),
-			(self.char, TypeIndex::CHAR),
+			(self.funcref, TypeIndex::FUNCREF),
 		]
 		.into_iter()
 		.find_map(|(slot, ty)| (slot == Some(idx)).then_some(ty))
@@ -1879,7 +1895,7 @@ mod tests {
 
 	#[test]
 	fn types_meet_where_the_unknown_parts_give_way() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let pair = |types: &mut TypeInterner, a, b| {
 			types.intern_struct(StructIdx::new(0), &[a, b])
 		};
@@ -1907,7 +1923,7 @@ mod tests {
 
 	#[test]
 	fn a_type_has_infer_or_error_when_one_is_anywhere_in_it() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let open = types.intern_tuple(&[TypeIndex::INFER, TypeIndex::U8]);
 		let nested = types.intern_tuple(&[open, TypeIndex::U16]);
 		let closed = types.intern_tuple(&[TypeIndex::U16, TypeIndex::U8]);
@@ -1928,7 +1944,7 @@ mod tests {
 	/// its own, only what its arguments have.
 	#[test]
 	fn a_type_has_a_param_or_projection_when_one_is_anywhere_in_it() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let t = parameter(&mut types, TypeEnvIdx::new(1), 0);
 		let wrapped = types.intern_struct(StructIdx::new(0), &[t]);
 		let projection = |types: &mut TypeInterner, base| {
@@ -1986,7 +2002,7 @@ mod tests {
 
 	#[test]
 	fn substitution_replaces_only_the_targeted_frames_parameters() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
@@ -2061,7 +2077,7 @@ mod tests {
 
 	#[test]
 	fn substitution_traverses_nested_types_without_normalizing_projections() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
@@ -2087,7 +2103,7 @@ mod tests {
 
 	#[test]
 	fn unchanged_substitution_preserves_indices_without_growing_the_interner() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
@@ -2122,7 +2138,7 @@ mod tests {
 
 	#[test]
 	fn substitution_preserves_unchanged_list_elements_around_late_changes() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
@@ -2156,7 +2172,7 @@ mod tests {
 	#[test]
 	fn substitution_handles_independent_function_parameter_and_result_changes()
 	{
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
@@ -2206,7 +2222,7 @@ mod tests {
 
 	#[test]
 	fn substitution_inserts_replacements_without_substituting_them_again() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
@@ -2231,7 +2247,7 @@ mod tests {
 
 	#[test]
 	fn substitution_preserves_a_projection_with_an_error_receiver() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let subject = parameter(&mut types, env, 0);
@@ -2260,21 +2276,21 @@ mod tests {
 
 	#[test]
 	fn unit_is_the_empty_tuple() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let unit = types.intern_tuple(&[]);
 		assert_eq!(unit, TypeIndex::UNIT);
 	}
 
 	#[test]
 	fn substitution_preserves_leaf_types() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let leaves = [
 			Type::Error,
 			Type::Infer,
 			Type::Never,
-			Type::Integer,
-			Type::Float,
+			Type::IntegerLiteral,
+			Type::FloatLiteral,
 			Type::U8,
 			Type::I8,
 			Type::U16,
@@ -2285,8 +2301,7 @@ mod tests {
 			Type::I64,
 			Type::F32,
 			Type::F64,
-			Type::Bool,
-			Type::Char,
+			Type::Funcref,
 			Type::Enum {
 				enum_index: EnumIdx::new(0),
 			},
@@ -2325,7 +2340,7 @@ mod tests {
 
 	#[test]
 	fn substitution_keeps_error_and_inference_arguments_as_supplied() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
@@ -2349,7 +2364,7 @@ mod tests {
 		expected = "substitution is missing an argument for its parameter chain"
 	)]
 	fn substitution_rejects_missing_arguments_for_the_targeted_frame() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let u = parameter(&mut types, env, 1);

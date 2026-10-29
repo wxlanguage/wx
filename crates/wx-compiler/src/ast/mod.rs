@@ -1131,14 +1131,9 @@ pub enum Expression {
 	},
 	/// `1.0` / `3.4e2`. Carries no payload — the text is recovered from the
 	/// span and parsed against the *resolved target type* in TIR
-	/// (`coerce_untyped_float_expr`), because the correct rounding (f32 vs f64)
+	/// (`coerce_float`), because the correct rounding (f32 vs f64)
 	/// isn't known until then. Same span-only treatment as `Char` / `String`.
 	Float,
-	/// `5 as i32`
-	Cast {
-		value: Box<Spanned<Expression>>,
-		ty: Box<Spanned<TypeExpression>>,
-	},
 	/// `-{expr}`
 	Unary {
 		operator: Spanned<UnaryOp>,
@@ -1185,14 +1180,11 @@ pub enum Expression {
 	Return {
 		value: Option<Box<Spanned<Expression>>>,
 	},
-	/// `{ ... }`
+	/// `block :label { ... }`, or a construct's own block (`if`, `loop`, a
+	/// match arm, a function body), which has no label.
 	Block {
+		label: Option<Spanned<SymbolU32>>,
 		statements: Box<[Separated<Spanned<Statement>>]>,
-	},
-	/// `{identifier}: { ... }`
-	Label {
-		label: Spanned<SymbolU32>,
-		block: Box<Spanned<Expression>>,
 	},
 	/// `break (:{label})? {expr}?`
 	Break {
@@ -1214,14 +1206,11 @@ pub enum Expression {
 	Continue {
 		label: Option<Spanned<SymbolU32>>,
 	},
-	/// `loop { ... }`
+	/// `loop :label { ... }`
 	Loop {
+		label: Option<Spanned<SymbolU32>>,
 		block: Box<Spanned<Expression>>,
 	},
-	/// `true`
-	True,
-	/// `false`
-	False,
 	/// `_` — discard in value position (e.g. `_ = expr;`)
 	Placeholder,
 	/// Raw quoted string text is recovered from the expression span.
@@ -1253,6 +1242,13 @@ pub enum Expression {
 	/// written. One element is that element, which TIR unwraps.
 	Tuple {
 		elements: Box<[Separated<Spanned<Expression>>]>,
+	},
+	/// `value: Type`, an element of a parenthesized list (`(5: i32)`,
+	/// `f(x: u8, y)`) checked against the type it is written with. It
+	/// converts nothing.
+	Ascription {
+		value: Box<Spanned<Expression>>,
+		ty: Box<Spanned<TypeExpression>>,
 	},
 	/// `[a, b, c]`
 	ArrayList {
@@ -1382,7 +1378,6 @@ impl Expression {
 			Expression::Block { .. }
 			| Expression::IfElse { .. }
 			| Expression::Loop { .. }
-			| Expression::Label { .. }
 			| Expression::Match { .. } => true,
 			_ => false,
 		}
@@ -1391,7 +1386,7 @@ impl Expression {
 	#[inline]
 	pub fn as_block_statements(&self) -> &[Separated<Spanned<Statement>>] {
 		match self {
-			Expression::Block { statements } => statements,
+			Expression::Block { statements, .. } => statements,
 			_ => unreachable!("expected a block expression"),
 		}
 	}
@@ -1442,7 +1437,7 @@ impl TypeArgument {
 	}
 }
 
-/// A constant argument: `5`, `-1`, `true`, or a path marked `const`. An
+/// A constant argument: `5`, `-1`, `'a'`, or a path marked `const`. An
 /// array's length can also be `_`, left to its context.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1584,7 +1579,7 @@ pub enum Pattern {
 	Constant {
 		path: Box<[PathSegment]>,
 	},
-	/// `0`, `-1`, `'a'`, `true`
+	/// `0`, `-1`, `'a'`
 	Literal(Literal),
 	/// `A | B | C`; each separator is a `|`.
 	Or(Box<[Separated<Spanned<Pattern>>]>),
@@ -1660,7 +1655,6 @@ pub enum Literal {
 	NegInt(u64),
 	/// `'a'`, decoded from the literal's span as a char expression is.
 	Char,
-	Bool(bool),
 	/// `1.5` — the text is recovered from the span, as an expression's
 	/// float is. A float has no single value to compare with, so a
 	/// pattern refuses it.
@@ -2160,7 +2154,6 @@ enum BindingPower {
 	Additive,
 	Multiplicative,
 	Unary,
-	Cast,
 	Postfix,
 	Member,
 	Primary,
@@ -2274,8 +2267,6 @@ define_keywords! {
 	If => "if",
 	Else => "else",
 	As => "as",
-	True => "true",
-	False => "false",
 	Impl => "impl",
 	SelfLower => "self",
 	SelfPascal => "Self",
@@ -2955,21 +2946,16 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// Whether the next token starts a literal: a number, a char, a string,
-	/// `true`, `false`, or `-` before a number.
+	/// or `-` before a number.
 	fn at_literal(&mut self) -> bool {
-		let token = self.lexer.peek();
-		match token.inner {
+		matches!(
+			self.lexer.peek().inner,
 			Token::Int
-			| Token::Char
-			| Token::Float
-			| Token::String
-			| Token::Minus => true,
-			Token::Identifier => matches!(
-				Keyword::try_from(token.span.extract_str(self.source)),
-				Ok(Keyword::True | Keyword::False)
-			),
-			_ => false,
-		}
+				| Token::Char
+				| Token::Float
+				| Token::String
+				| Token::Minus
+		)
 	}
 
 	/// A literal, as a pattern compares with it or a constant argument gives
@@ -3007,7 +2993,7 @@ impl<'ctx> Parser<'ctx> {
 					span: TextSpan::new(token.span.start, number.span.end),
 				});
 			}
-			_ => Literal::Bool(token.span.extract_str(self.source) == "true"),
+			_ => unreachable!("the caller checked `at_literal`"),
 		};
 		Ok(Spanned {
 			inner: literal,
@@ -3789,14 +3775,6 @@ impl<'ctx> Parser<'ctx> {
 						Parser::parse_continue_expression,
 						BindingPower::Primary,
 					)),
-					Ok(Keyword::True) => Some((
-						Parser::parse_true_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::False) => Some((
-						Parser::parse_false_expression,
-						BindingPower::Primary,
-					)),
 					Ok(Keyword::Underscore) => Some((
 						Parser::parse_placeholder_expression,
 						BindingPower::Primary,
@@ -3915,18 +3893,6 @@ impl<'ctx> Parser<'ctx> {
 				Parser::parse_type_application_expression,
 				BindingPower::Member,
 			)),
-			Token::Identifier => {
-				match Keyword::try_from(token.span.extract_str(self.source)) {
-					Ok(Keyword::As) => Some((
-						Parser::parse_cast_expression,
-						BindingPower::Cast,
-					)),
-					_ => None,
-				}
-			}
-			Token::Colon => {
-				Some((Parser::parse_labelled_expression, BindingPower::Primary))
-			}
 			Token::Dot => Some((
 				Parser::parse_object_access_expression,
 				BindingPower::Member,
@@ -3938,6 +3904,8 @@ impl<'ctx> Parser<'ctx> {
 		}
 	}
 
+	/// An expression. Like every parse function, it has reported whatever
+	/// made it fail.
 	fn parse_expression(
 		&mut self,
 		limit_bp: BindingPower,
@@ -3945,7 +3913,21 @@ impl<'ctx> Parser<'ctx> {
 		let token = self.lexer.peek();
 		let nud_handler = match self.nud_lookup(token) {
 			Some((nud_handler, _)) => nud_handler,
-			None => return Err(()),
+			None => {
+				self.ast.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::UnexpectedToken.code())
+						.with_message(format!(
+							"expected an expression, found `{}`",
+							token.inner
+						))
+						.with_label(
+							Label::primary(self.ast.file_id, token.span)
+								.with_message("expected an expression"),
+						),
+				);
+				return Err(());
+			}
 		};
 		let mut left = nud_handler(self)?;
 
@@ -4124,7 +4106,7 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		if parser.lexer.peek().inner != Token::OpenBrace {
-			return parser.parse_expression(BindingPower::Default);
+			return Parser::parse_element(parser);
 		}
 		let named = Parser::parse_named_arguments(parser)?;
 		parser
@@ -4271,18 +4253,18 @@ impl<'ctx> Parser<'ctx> {
 			Err(_) => unreachable!(),
 		};
 
-		let right = match parser.parse_expression(bp) {
-			Ok(expr) => expr,
-			Err(_) => {
-				parser.ast.diagnostics.push(
-					report_incomplete_binary_expression(
-						parser.ast.file_id,
-						operator_token.span,
-					),
-				);
-				return Err(());
-			}
-		};
+		let token = parser.lexer.peek();
+		if parser.nud_lookup(token).is_none() {
+			parser
+				.ast
+				.diagnostics
+				.push(report_incomplete_binary_expression(
+					parser.ast.file_id,
+					operator_token.span,
+				));
+			return Err(());
+		}
+		let right = parser.parse_expression(bp)?;
 
 		if bp == BindingPower::Comparison {
 			match &left.inner {
@@ -4397,7 +4379,7 @@ impl<'ctx> Parser<'ctx> {
 		// the identical grammar, so this rejects a malformed token (`1e`,
 		// `1e+`) without committing to a value. The literal's actual value is
 		// parsed against its resolved target type in TIR
-		// (`coerce_untyped_float_expr`), where f32-vs-f64 rounding is finally
+		// (`coerce_float`), where f32-vs-f64 rounding is finally
 		// known.
 		if token
 			.span
@@ -4421,21 +4403,21 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let return_span = parser.lexer.next().span;
-		match parser.parse_expression(BindingPower::Default) {
-			Ok(expr) => {
-				let span = TextSpan::new(return_span.start, expr.span.end);
-				Ok(Spanned {
-					inner: Expression::Return {
-						value: Some(Box::new(expr)),
-					},
-					span,
-				})
-			}
-			Err(_) => Ok(Spanned {
+		let token = parser.lexer.peek();
+		if parser.nud_lookup(token).is_none() {
+			return Ok(Spanned {
 				inner: Expression::Return { value: None },
 				span: return_span,
-			}),
+			});
 		}
+		let expr = parser.parse_expression(BindingPower::Default)?;
+		let span = TextSpan::new(return_span.start, expr.span.end);
+		Ok(Spanned {
+			inner: Expression::Return {
+				value: Some(Box::new(expr)),
+			},
+			span,
+		})
 	}
 
 	fn parse_break_expression(
@@ -4454,7 +4436,12 @@ impl<'ctx> Parser<'ctx> {
 			}
 			None => None,
 		};
-		let value = parser.parse_expression(BindingPower::Default).ok();
+		let token = parser.lexer.peek();
+		let value = if parser.nud_lookup(token).is_some() {
+			Some(parser.parse_expression(BindingPower::Default)?)
+		} else {
+			None
+		};
 
 		let span = match (label, &value) {
 			(_, Some(value)) => {
@@ -4510,9 +4497,7 @@ impl<'ctx> Parser<'ctx> {
 			open_token: Token::OpenParen,
 			close_token: Token::CloseParen,
 			separator_token: Token::Comma,
-			item_handler: |parser| {
-				parser.parse_expression(BindingPower::Default)
-			},
+			item_handler: Parser::parse_element,
 			should_warn_missing_separator: None,
 		}
 		.parse(parser)?;
@@ -4525,21 +4510,19 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_cast_expression(
-		parser: &mut Parser,
-		value: Spanned<Expression>,
-		_: BindingPower,
-	) -> Result<Spanned<Expression>, ()> {
-		_ = parser.lexer.next();
+	/// An element of a parenthesized list: an expression, or `value: Type`.
+	fn parse_element(parser: &mut Parser) -> Result<Spanned<Expression>, ()> {
+		let value = parser.parse_expression(BindingPower::Default)?;
+		if parser.lexer.next_if(Token::Colon).is_none() {
+			return Ok(value);
+		}
 		let ty = parser.parse_type_expression()?;
-
-		let span = TextSpan::new(value.span.start, ty.span.end);
 		Ok(Spanned {
-			inner: Expression::Cast {
+			span: TextSpan::new(value.span.start, ty.span.end),
+			inner: Expression::Ascription {
 				value: Box::new(value),
 				ty: Box::new(ty),
 			},
-			span,
 		})
 	}
 
@@ -4552,18 +4535,18 @@ impl<'ctx> Parser<'ctx> {
 			Err(_) => unreachable!(),
 		};
 
-		let operand = match parser.parse_expression(BindingPower::Unary) {
-			Ok(operand) => operand,
-			Err(_) => {
-				parser.ast.diagnostics.push(
-					report_incomplete_unary_expression(
-						parser.ast.file_id,
-						operator_token.span,
-					),
-				);
-				return Err(());
-			}
-		};
+		let token = parser.lexer.peek();
+		if parser.nud_lookup(token).is_none() {
+			parser
+				.ast
+				.diagnostics
+				.push(report_incomplete_unary_expression(
+					parser.ast.file_id,
+					operator_token.span,
+				));
+			return Err(());
+		}
+		let operand = parser.parse_expression(BindingPower::Unary)?;
 
 		let span = TextSpan::new(operator_token.span.start, operand.span.end);
 		Ok(Spanned {
@@ -4578,88 +4561,34 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_labelled_expression(
-		parser: &mut Parser,
-		label_expr: Spanned<Expression>,
-		_: BindingPower,
-	) -> Result<Spanned<Expression>, ()> {
-		let label = match label_expr.inner {
-			Expression::Path(segs)
-				if segs.len() == 1 && segs[0].type_args.is_empty() =>
-			{
-				segs[0].ident
-			}
-			_ => {
-				parser.ast.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::InvalidLabel.code())
-						.with_message("invalid label")
-						.with_label(
-							Label::primary(parser.ast.file_id, label_expr.span)
-								.with_message(
-									"a label must be a single identifier, not a path",
-								),
-						),
-				);
-				return Err(());
-			}
-		};
-		let colon_token = parser.next_expect(Token::Colon)?;
-
-		let block = parser.parse_expression(BindingPower::Default)?;
-		match block.inner {
-			Expression::Block { .. }
-			| Expression::IfElse { .. }
-			| Expression::Loop { .. } => {}
-			_ => {
-				let mut diag = Diagnostic::error()
-					.with_code(DiagnosticCode::IncompleteExpression.code())
-					.with_message(
-						"expected a block-like expression after a label",
-					)
-					.with_label(Label::primary(parser.ast.file_id, block.span));
-				match &block.inner {
-					Expression::Path(_)
-					| Expression::Call { .. }
-					| Expression::MethodCall(_) => {
-						diag = diag.with_label(
-							Label::secondary(
-								parser.ast.file_id,
-								colon_token.span,
-							)
-							.with_message("use `::` here for namespace access"),
-						);
-					}
-					_ => {}
-				}
-
-				parser.ast.diagnostics.push(diag);
-				return Err(());
-			}
-		}
-
-		let span = TextSpan::new(label.span.start, block.span.end);
-		Ok(Spanned {
-			inner: Expression::Label {
-				label,
-				block: Box::new(block),
-			},
-			span,
-		})
-	}
-
-	/// `block { ... }`: a plain block in expression position. Blocks that
-	/// belong to a construct (`if`, `loop`, a match arm, a function body) are
-	/// parsed by it directly and need no keyword.
+	/// `block :label { ... }`: a plain block in expression position. Blocks
+	/// that belong to a construct (`if`, `loop`, a match arm, a function body)
+	/// are parsed by it directly and need no keyword.
 	fn parse_keyword_block_expression(
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let keyword_span = parser.lexer.next().span;
+		let label = parser.parse_label()?;
 		let block = Parser::parse_block_expression(parser)?;
+		let Expression::Block { statements, .. } = block.inner else {
+			unreachable!("a block parses as a block")
+		};
 		Ok(Spanned {
 			span: TextSpan::new(keyword_span.start, block.span.end),
-			inner: block.inner,
+			inner: Expression::Block { label, statements },
 		})
+	}
+
+	/// `:label` after a `block` or a loop's keyword.
+	fn parse_label(&mut self) -> Result<Option<Spanned<SymbolU32>>, ()> {
+		if self.lexer.next_if(Token::Colon).is_none() {
+			return Ok(None);
+		}
+		let span = self.next_expect(Token::Identifier)?.span;
+		Ok(Some(Spanned {
+			inner: self.intern_identifier(span),
+			span,
+		}))
 	}
 
 	/// `{ ... }` where an expression starts: the plain block without its
@@ -4720,6 +4649,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Expression::Block {
+				label: None,
 				statements: statements.inner,
 			},
 			span: statements.span,
@@ -4730,11 +4660,13 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let loop_keyword = parser.lexer.next();
+		let label = parser.parse_label()?;
 		let block = Parser::parse_block_expression(parser)?;
 
 		let span = TextSpan::new(loop_keyword.span.start, block.span.end);
 		Ok(Spanned {
 			inner: Expression::Loop {
+				label,
 				block: Box::new(block),
 			},
 			span,
@@ -4745,40 +4677,56 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let if_keyword = parser.lexer.next();
+		let label = parser.parse_label()?;
 		let condition = parser.parse_expression(BindingPower::Default)?;
 		let then_block = Parser::parse_block_expression(parser)?;
-		let else_keyword = Keyword::try_from(
-			parser.lexer.peek().span.extract_str(parser.source),
-		);
-
-		match else_keyword {
-			Ok(Keyword::Else) => {
+		let else_block = match parser.peek_keyword() {
+			Some(Keyword::Else) => {
 				let _ = parser.lexer.next();
-				let else_block = Parser::parse_block_expression(parser)?;
-				let span =
-					TextSpan::new(if_keyword.span.start, else_block.span.end);
-				Ok(Spanned {
-					inner: Expression::IfElse {
-						condition: Box::new(condition),
-						then_block: Box::new(then_block),
-						else_block: Some(Box::new(else_block)),
-					},
-					span,
-				})
+				Some(Box::new(Parser::parse_block_expression(parser)?))
 			}
-			_ => {
-				let span =
-					TextSpan::new(if_keyword.span.start, then_block.span.end);
-				Ok(Spanned {
-					inner: Expression::IfElse {
-						condition: Box::new(condition),
-						then_block: Box::new(then_block),
-						else_block: None,
+			_ => None,
+		};
+		let end = else_block.as_ref().map_or(then_block.span, |b| b.span).end;
+		let if_else = Spanned {
+			inner: Expression::IfElse {
+				condition: Box::new(condition),
+				then_block: Box::new(then_block),
+				else_block,
+			},
+			span: TextSpan::new(if_keyword.span.start, end),
+		};
+		let Some(label) = label else {
+			return Ok(if_else);
+		};
+		// Read as the block it would be written in, so a `break` to the label
+		// still finds it.
+		parser.ast.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::LabelOnIf.code())
+				.with_message("an `if` cannot be labelled")
+				.with_label(
+					Label::primary(parser.ast.file_id, label.span)
+						.with_message("a label names a `block` or a `loop`"),
+				)
+				.with_note(
+					"write it on a block around the `if`: `block :label { if .. }`",
+				),
+		);
+		let span = if_else.span;
+		Ok(Spanned {
+			inner: Expression::Block {
+				label: Some(label),
+				statements: Box::new([Separated {
+					inner: Spanned {
+						inner: Statement::Expression(Box::new(if_else)),
+						span,
 					},
-					span,
-				})
-			}
-		}
+					separator: None,
+				}]),
+			},
+			span,
+		})
 	}
 
 	fn parse_match_expression(
@@ -5380,13 +5328,6 @@ impl<'ctx> Parser<'ctx> {
 						));
 						Err(())
 					}
-					Ok(Keyword::True) | Ok(Keyword::False) => {
-						let literal = parser.parse_literal()?;
-						Ok(Spanned {
-							inner: Pattern::Literal(literal.inner),
-							span: literal.span,
-						})
-					}
 					_ => Parser::parse_path_pattern(parser),
 				}
 			}
@@ -5414,21 +5355,19 @@ impl<'ctx> Parser<'ctx> {
 			None => None,
 		};
 
-		let value = parser
-			.lexer
-			.next_if(Token::Eq)
-			.ok_or(())
-			.and_then(|_| parser.parse_expression(BindingPower::Default))
-			.map_err(|_| {
-				let token = parser.lexer.peek();
-				parser
-					.ast
-					.diagnostics
-					.push(report_missing_local_initializer(
-						parser.ast.file_id,
-						token.span,
-					));
-			})?;
+		let assigned = parser.lexer.next_if(Token::Eq).is_some();
+		let token = parser.lexer.peek();
+		if !assigned || parser.nud_lookup(token).is_none() {
+			parser
+				.ast
+				.diagnostics
+				.push(report_missing_local_initializer(
+					parser.ast.file_id,
+					token.span,
+				));
+			return Err(());
+		}
+		let value = parser.parse_expression(BindingPower::Default)?;
 
 		let span = TextSpan::new(local_keyword.span.start, value.span.end);
 		Ok(Spanned {
@@ -5466,21 +5405,19 @@ impl<'ctx> Parser<'ctx> {
 			None => None,
 		};
 
-		let value = parser
-			.lexer
-			.next_if(Token::Eq)
-			.ok_or(())
-			.and_then(|_| parser.parse_expression(BindingPower::Default))
-			.map_err(|_| {
-				let token = parser.lexer.peek();
-				parser
-					.ast
-					.diagnostics
-					.push(report_missing_global_initializer(
-						parser.ast.file_id,
-						token.span,
-					));
-			})?;
+		let assigned = parser.lexer.next_if(Token::Eq).is_some();
+		let token = parser.lexer.peek();
+		if !assigned || parser.nud_lookup(token).is_none() {
+			parser
+				.ast
+				.diagnostics
+				.push(report_missing_global_initializer(
+					parser.ast.file_id,
+					token.span,
+				));
+			return Err(());
+		}
+		let value = parser.parse_expression(BindingPower::Default)?;
 
 		let span = TextSpan::new(global_keyword.span.start, value.span.end);
 		Ok(Spanned {
@@ -5523,26 +5460,6 @@ impl<'ctx> Parser<'ctx> {
 				attributes: Box::new([]),
 			},
 			span,
-		})
-	}
-
-	fn parse_true_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let true_keyword = parser.lexer.next();
-		Ok(Spanned {
-			inner: Expression::True,
-			span: true_keyword.span,
-		})
-	}
-
-	fn parse_false_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let false_keyword = parser.lexer.next();
-		Ok(Spanned {
-			inner: Expression::False,
-			span: false_keyword.span,
 		})
 	}
 

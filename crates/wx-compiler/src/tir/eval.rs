@@ -76,7 +76,7 @@ pub(super) struct Allocation {
 }
 
 /// One number of a constant's value: a Wasm number and the scalar it means.
-/// A `bool`, `char` or narrow integer is an `I32`; a signed one is held
+/// A narrow integer is an `I32`; a signed one is held
 /// sign-extended. Built and read only through one constructor and one
 /// `expect_*` reader per scalar, the one place each scalar's holding is
 /// written.
@@ -691,15 +691,6 @@ impl TypeContext<'_, '_, '_> {
 				};
 				self.place_static(owner, ty, span, count, start, stack)?;
 			}
-			// A cast to the value's own type changes nothing; a literal cast
-			// has the target as its type.
-			ExprKind::Cast { value } if body.ty(value) == ty => {
-				self.eval(owner, value, stack)?;
-			}
-			// Making an address from an integer, or reading the bits of one,
-			// is not evaluated (yet).
-			ExprKind::Cast { .. } => return Err(own(EvalErrorKind::NotConst)),
-			ExprKind::Bool(value) => stack.push(ConstScalar::bool(value)),
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
 			// An impl's constant may depend on the impl's arguments, which
 			// evaluation does not substitute (yet).
@@ -1196,18 +1187,14 @@ impl ConstScalar {
 		}
 	}
 
+	/// A `Bool`, held as its repr.
 	pub(super) fn bool(value: bool) -> Self {
-		Self {
-			val: Val::I32(u32::from(value)),
-			scalar: Scalar::Bool,
-		}
+		Self::u8(u8::from(value))
 	}
 
+	/// A `Char`, held as its field.
 	pub(super) fn char(value: char) -> Self {
-		Self {
-			val: Val::I32(u32::from(value)),
-			scalar: Scalar::Char,
-		}
+		Self::u32(u32::from(value))
 	}
 
 	pub(super) fn expect_u8(self) -> u8 {
@@ -1311,23 +1298,7 @@ impl ConstScalar {
 	}
 
 	pub(super) fn expect_bool(self) -> bool {
-		match self {
-			Self {
-				val: Val::I32(bits),
-				scalar: Scalar::Bool,
-			} => bits != 0,
-			_ => unreachable!("not a `bool`"),
-		}
-	}
-
-	pub(super) fn expect_char(self) -> char {
-		match self {
-			Self {
-				val: Val::I32(bits),
-				scalar: Scalar::Char,
-			} => char::from_u32(bits).expect("a `char` holds a scalar value"),
-			_ => unreachable!("not a `char`"),
-		}
+		self.expect_u8() != 0
 	}
 }
 
@@ -1344,8 +1315,6 @@ impl std::fmt::Display for ConstScalar {
 			Scalar::I64 => write!(f, "{}", self.expect_i64()),
 			Scalar::F32 => write!(f, "{}", self.expect_f32()),
 			Scalar::F64 => write!(f, "{}", self.expect_f64()),
-			Scalar::Bool => write!(f, "{}", self.expect_bool()),
-			Scalar::Char => write!(f, "{:?}", self.expect_char()),
 		}
 	}
 }
@@ -1450,7 +1419,7 @@ fn unary(
 		(UnaryOp::InvertSign, Scalar::F64) => {
 			Ok(ConstScalar::f64(-operand.expect_f64()))
 		}
-		(UnaryOp::Not, _) => Ok(ConstScalar::bool(!operand.expect_bool())),
+		(UnaryOp::Not, _) => unreachable!("`!` is a call of `Not::not`"),
 		(UnaryOp::InvertSign | UnaryOp::BitNot, _) => {
 			integer_unary(op, operand)
 				.ok_or(EvalErrorKind::Overflow(Operation::Negate))
@@ -1495,7 +1464,7 @@ fn integer_unary(op: UnaryOp, operand: ConstScalar) -> Option<ConstScalar> {
 			let a = operand.expect_i64();
 			ConstScalar::i64(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
+		Scalar::F32 | Scalar::F64 => {
 			unreachable!(
 				"the checker builds primitive operators on their scalars"
 			)
@@ -1531,15 +1500,6 @@ fn binary(
 				BinaryOp::Mul => a * b,
 				BinaryOp::Div => a / b,
 				BinaryOp::Rem => a % b,
-				_ => unreachable!(),
-			}))
-		}
-		Scalar::Bool => {
-			let (a, b) = (lhs.expect_bool(), rhs.expect_bool());
-			Ok(ConstScalar::bool(match op {
-				BinaryOp::BitAnd => a & b,
-				BinaryOp::BitOr => a | b,
-				BinaryOp::BitXor => a ^ b,
 				_ => unreachable!(),
 			}))
 		}
@@ -1706,7 +1666,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::F32 | Scalar::F64 | Scalar::Bool | Scalar::Char => {
+		Scalar::F32 | Scalar::F64 => {
 			unreachable!(
 				"the checker builds primitive operators on their scalars"
 			)
@@ -1729,8 +1689,6 @@ fn compare(op: BinaryOp, lhs: ConstScalar, rhs: ConstScalar) -> Option<bool> {
 		// IEEE: any comparison with NaN is false, except `!=`.
 		Scalar::F32 => lhs.expect_f32().partial_cmp(&rhs.expect_f32()),
 		Scalar::F64 => lhs.expect_f64().partial_cmp(&rhs.expect_f64()),
-		Scalar::Bool => lhs.expect_bool().partial_cmp(&rhs.expect_bool()),
-		Scalar::Char => lhs.expect_char().partial_cmp(&rhs.expect_char()),
 	};
 	Some(match op {
 		BinaryOp::Eq => ordering == Some(Ordering::Equal),
@@ -2101,7 +2059,7 @@ mod tests {
 				struct Mixed(a: u8, b: u32);
 				const WORDS: heap::&[u32] = [1, 2, 0x01020304];
 				const SIGNED: heap::&[i8] = [-1, 2];
-				const FLAGS: heap::&[bool] = [true, false];
+				const FLAGS: heap::&[Bool] = [True, False];
 				const STRUCTS: heap::&[Mixed; 2] = [Mixed(1, 2), Mixed(3, 4)];
 			"#}
 		);
@@ -2222,26 +2180,6 @@ mod tests {
 		);
 		case.diagnostics()
 			.assert_error(DiagnosticCode::NotConstEvaluatable);
-	}
-
-	#[test]
-	fn a_cast_to_its_own_type_is_its_value() {
-		test_case!(
-			case = indoc! {r#"
-				memory heap: u32;
-				const NUMBER: u8 = 7 as u8;
-				const TEXT: heap::&[u8] = "ab" as heap::&[u8];
-				const PAIR: heap::&[u8; 2] = [1, 2] as heap::&[u8; 2];
-			"#}
-		);
-		case.diagnostics().assert_none();
-		assert_eq!(case.value("NUMBER"), [ConstScalar::u8(7)]);
-		let (text, len) = slice(&case, "TEXT");
-		assert_eq!((&*text.bytes, len), (&b"ab"[..], 2));
-		let [address] = case.value("PAIR") else {
-			panic!("expected an array's address");
-		};
-		assert_eq!(&*case.pointee(*address).0.bytes, [1, 2]);
 	}
 
 	#[test]

@@ -971,27 +971,51 @@ impl BodyContext<'_, '_, '_, '_> {
 			ast::Literal::NegInt(value) => {
 				self.check_int(value, true, span, expected)
 			}
-			ast::Literal::Bool(value) => {
-				if expected != TypeIndex::BOOL {
-					self.report_pattern_mismatch(expected, "`bool`", span);
-					return self.error_pattern(span);
-				}
-				self.body
-					.push_pattern(PatternKind::Bool(value), expected, span)
-			}
 			ast::Literal::Char => {
-				if expected != TypeIndex::CHAR {
-					self.report_pattern_mismatch(expected, "`char`", span);
+				let integer = Integer::from_type(expected);
+				if expected != TypeIndex::CHAR && integer.is_none() {
+					self.report_pattern_mismatch(expected, "a character", span);
 					return self.error_pattern(span);
 				}
 				let source =
 					&self.cx.files.get(self.scope.file_id).unwrap().source;
 				match parse_char_literal(span.extract_str(source)) {
-					Ok(value) => self.body.push_pattern(
-						PatternKind::Char(value),
-						expected,
-						span,
-					),
+					Ok(value) => match integer {
+						None => self.body.push_pattern(
+							PatternKind::Char(value),
+							expected,
+							span,
+						),
+						Some(integer)
+							if integer.in_range(u64::from(value), false) =>
+						{
+							self.body.push_pattern(
+								PatternKind::Int(u64::from(value)),
+								expected,
+								span,
+							)
+						}
+						Some(_) => {
+							let ty =
+								self.cx.type_formatter().display_type(expected);
+							self.cx.diagnostics.push(
+								Diagnostic::error()
+									.with_code(
+										DiagnosticCode::IntegerLiteralOutOfRange
+											.code(),
+									)
+									.with_message(format!(
+										"character literal {value:?} out of \
+										 range for `{ty}`"
+									))
+									.with_label(Label::primary(
+										self.scope.file_id,
+										span,
+									)),
+							);
+							self.error_pattern(span)
+						}
+					},
 					Err(error) => {
 						let message = match error {
 							CharLiteralError::Empty => {

@@ -12,19 +12,19 @@ import "console" as console {
 global mut bump: heap::*u8 = heap::DATA_END;
 
 func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
-    local ptr = ptr::align_up::<heap>(bump as u32, align);
+    local ptr = ptr::align_up::<heap>(transmute(bump), align);
     local new_end = ptr + size;
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
         local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     }
-    bump = new_end as heap::*u8;
-    ptr as heap::*u8
+    bump = transmute(new_end);
+    transmute(ptr)
 }
 
 func alloc_array<T>(count: u32) -> heap::*T {
-    alloc_bytes(size_of::<T, heap>() * count, align_of::<T, heap>()) as _
+    transmute(alloc_bytes(size_of::<T, heap>() * count, align_of::<T, heap>()))
 }
 
 #[inline]
@@ -40,29 +40,29 @@ func itoa(value: i32) -> heap::&[u8] {
     local mut len: u32 = 0;
 
     local mut x: i64 = i64_extend_i32(value);
-    local mut neg: bool = false;
+    local mut neg: Bool = False;
     if x < 0 {
-        neg = true;
+        neg = True;
         x = -x;
     }
 
     loop {
         if x == 0 { break; }
         local digit: i32 = i32_wrap_i64(x % 10);
-        ptr.* = (digit as u8) + ('0' as u8);
+        ptr.* = transmute::<_, u8>(digit) + '0';
         ptr = ptr::add_mut(ptr, 1);
         len += 1;
         x = x / 10;
     };
 
     if len == 0 {
-        ptr.* = '0' as u8;
+        ptr.* = '0';
         ptr = ptr::add_mut(ptr, 1);
         len = 1;
     }
 
     if neg {
-        ptr.* = '-' as u8;
+        ptr.* = '-';
         ptr = ptr::add_mut(ptr, 1);
         len += 1;
     }

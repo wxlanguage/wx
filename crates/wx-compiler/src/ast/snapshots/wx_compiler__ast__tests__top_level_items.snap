@@ -12,7 +12,7 @@ items:
           attributes: []
           signature:
             name:
-              inner: 36
+              inner: 34
               span:
                 start: 5
                 end: 8
@@ -24,7 +24,7 @@ items:
                       Name:
                         mut_span: ~
                         name:
-                          inner: 37
+                          inner: 35
                           span:
                             start: 9
                             end: 10
@@ -32,7 +32,7 @@ items:
                       inner:
                         Path:
                           - ident:
-                              inner: 38
+                              inner: 36
                               span:
                                 start: 12
                                 end: 15
@@ -52,7 +52,7 @@ items:
                       Name:
                         mut_span: ~
                         name:
-                          inner: 39
+                          inner: 37
                           span:
                             start: 17
                             end: 18
@@ -60,7 +60,7 @@ items:
                       inner:
                         Path:
                           - ident:
-                              inner: 38
+                              inner: 36
                               span:
                                 start: 20
                                 end: 23
@@ -76,7 +76,7 @@ items:
               inner:
                 Path:
                   - ident:
-                      inner: 38
+                      inner: 36
                       span:
                         start: 28
                         end: 31
@@ -87,6 +87,7 @@ items:
           block:
             inner:
               Block:
+                label: ~
                 statements:
                   - inner:
                       inner:
@@ -97,7 +98,7 @@ items:
                                 inner:
                                   Path:
                                     - ident:
-                                        inner: 37
+                                        inner: 35
                                         span:
                                           start: 38
                                           end: 39
@@ -114,7 +115,7 @@ items:
                                 inner:
                                   Path:
                                     - ident:
-                                        inner: 39
+                                        inner: 37
                                         span:
                                           start: 42
                                           end: 43
@@ -142,7 +143,7 @@ items:
           pub_span: ~
           attributes: []
           name:
-            inner: 40
+            inner: 38
             span:
               start: 54
               end: 57
@@ -150,7 +151,7 @@ items:
             inner:
               Path:
                 - ident:
-                    inner: 41
+                    inner: 39
                     span:
                       start: 59
                       end: 62
@@ -172,7 +173,7 @@ items:
             start: 71
             end: 74
           name:
-            inner: 42
+            inner: 40
             span:
               start: 75
               end: 82
@@ -180,7 +181,7 @@ items:
             inner:
               Path:
                 - ident:
-                    inner: 38
+                    inner: 36
                     span:
                       start: 84
                       end: 87
@@ -207,7 +208,7 @@ items:
         Const:
           pub_span: ~
           name:
-            inner: 43
+            inner: 41
             span:
               start: 99
               end: 102
@@ -215,7 +216,7 @@ items:
             inner:
               Path:
                 - ident:
-                    inner: 38
+                    inner: 36
                     span:
                       start: 104
                       end: 107
@@ -243,7 +244,7 @@ items:
           pub_span: ~
           attributes: []
           name:
-            inner: 44
+            inner: 42
             span:
               start: 123
               end: 128
@@ -258,7 +259,7 @@ items:
                     Name:
                       mut_span: ~
                       name:
-                        inner: 45
+                        inner: 43
                         span:
                           start: 138
                           end: 139
@@ -266,7 +267,7 @@ items:
                     inner:
                       Path:
                         - ident:
-                            inner: 38
+                            inner: 36
                             span:
                               start: 141
                               end: 144
@@ -287,7 +288,7 @@ items:
                     Name:
                       mut_span: ~
                       name:
-                        inner: 46
+                        inner: 44
                         span:
                           start: 150
                           end: 151
@@ -295,7 +296,7 @@ items:
                     inner:
                       Path:
                         - ident:
-                            inner: 38
+                            inner: 36
                             span:
                               start: 153
                               end: 156
@@ -322,7 +323,7 @@ items:
             start: 169
             end: 174
           internal_name:
-            inner: 47
+            inner: 45
             span:
               start: 178
               end: 181
@@ -335,7 +336,7 @@ items:
                       Function:
                         signature:
                           name:
-                            inner: 48
+                            inner: 46
                             span:
                               start: 193
                               end: 196
@@ -347,7 +348,7 @@ items:
                                     Name:
                                       mut_span: ~
                                       name:
-                                        inner: 49
+                                        inner: 47
                                         span:
                                           start: 197
                                           end: 204
@@ -355,7 +356,7 @@ items:
                                     inner:
                                       Path:
                                         - ident:
-                                            inner: 50
+                                            inner: 48
                                             span:
                                               start: 206
                                               end: 212
@@ -385,7 +386,7 @@ items:
           pub_span: ~
           repr: ~
           name:
-            inner: 51
+            inner: 49
             span:
               start: 222
               end: 227
@@ -393,7 +394,7 @@ items:
             - inner:
                 inner:
                   name:
-                    inner: 52
+                    inner: 50
                     span:
                       start: 234
                       end: 237
@@ -407,7 +408,7 @@ items:
             - inner:
                 inner:
                   name:
-                    inner: 53
+                    inner: 51
                     span:
                       start: 243
                       end: 248
@@ -427,7 +428,7 @@ items:
             - inner:
                 inner:
                   name:
-                    inner: 54
+                    inner: 52
                     span:
                       start: 258
                       end: 262

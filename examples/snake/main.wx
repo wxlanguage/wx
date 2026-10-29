@@ -6,15 +6,15 @@ global mut bump: heap::*u8 = heap::DATA_END;
 
 pub func alloc<T>() -> heap::*T {
   local align = align_of::<T, heap>();
-  local ptr = ptr::align_up::<heap>(bump as u32, align);
+  local ptr = ptr::align_up::<heap>(transmute(bump), align);
   local new_end = ptr + size_of::<T, heap>();
   local cur_end = heap.size_bytes();
   if new_end > cur_end {
     local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
     _ = heap.grow(needed);
   }
-  bump = new_end as heap::*u8;
-  ptr as _
+  bump = transmute(new_end);
+  transmute(ptr)
 }
 
 import "host" as host {
@@ -71,7 +71,7 @@ pub func pop_back() {
     len = 0;
     return;
   }
-  local mut cur = head as *Node;
+  local mut cur: *Node = transmute(head);
   loop {
     local mut n = cur.*;
     if ptr::is_null(n.next.*.next) {
@@ -84,12 +84,12 @@ pub func pop_back() {
   }
 }
 
-pub func contains(x: i32, y: i32) -> bool {
+pub func contains(x: i32, y: i32) -> Bool {
   local mut cur: &Node = head;
   loop {
-    if ptr::is_null(cur) { break false }
+    if ptr::is_null(cur) { break False }
     local n = cur.*;
-    if n.x == x && n.y == y { break true }
+    if n.x == x && n.y == y { break True }
     cur = n.next;
   }
 }
@@ -172,7 +172,7 @@ pub func draw() {
   );
   
   local mut cur: heap::*Node = head;
-  local mut first: bool = true;
+  local mut first: Bool = True;
   loop {
     if ptr::is_null(cur) { break }
     if first {
@@ -183,7 +183,7 @@ pub func draw() {
         CELL_SIZE,
         0xFFFF0000,
       );
-      first = false;
+      first = False;
     } else {
       host::draw_rect(
         cur.*.x * CELL_SIZE,

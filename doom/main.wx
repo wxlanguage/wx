@@ -48,7 +48,7 @@ impl Allocator for BumpAllocator<heap> {
         self.*.bump = end;
         
         // 5. Cast and return the starting address
-        start as _
+        transmute(start)
     }
 }
 
@@ -61,7 +61,7 @@ func main() {
 global mut bump: heap::*u8 = heap::DATA_END;
 
 func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
-    local ptr = ptr::align_up::<heap>(bump as u32, align);
+    local ptr = ptr::align_up::<heap>(transmute(bump), align);
     local new_end = ptr + size;
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
@@ -69,12 +69,12 @@ func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
             (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     }
-    bump = new_end as heap::*u8;
-    ptr as heap::*u8
+    bump = transmute(new_end);
+    transmute(ptr)
 }
 
 func alloc_array<T>(count: u32) -> heap::*T {
-    alloc_bytes(size_of::<T, heap>() * count, align_of::<T, heap>()) as _
+    transmute(alloc_bytes(size_of::<T, heap>() * count, align_of::<T, heap>()))
 }
 
 pub func reset() {
@@ -102,8 +102,8 @@ impl<T> Vec<T> {
             if self.*.cap != 0 {
                 local bytes = self.*.len * size_of::<T, heap>();
                 memory_copy(
-                    new_buf as heap::*u8,
-                    self.*.buf as heap::&u8,
+                    transmute::<_, heap::*u8>(new_buf),
+                    transmute::<_, heap::&u8>(self.*.buf),
                     bytes,
                 );
             };
@@ -182,7 +182,7 @@ impl<T> Vec<T> {
     }
 
     #[inline]
-    pub func is_empty(self: heap::&Self) -> bool {
+    pub func is_empty(self: heap::&Self) -> Bool {
         self.*.len == 0
     }
 }

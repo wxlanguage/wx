@@ -746,7 +746,7 @@ fn test_format_struct_init() {
 fn test_format_struct_init_block_value() {
 	let case = TestCase::new(indoc! {"
         func main() -> i32 {
-            local p = Point({ x: g: block { break :g 5 }, y: 10 })
+            local p = Point({ x: block :g { break :g 5 }, y: 10 })
         }
     "});
 	let output = format(
@@ -763,7 +763,7 @@ fn test_format_struct_init_block_value() {
 		indoc! {"
             func main() -> i32 {
                 local p = Point({
-                    x: g: block { break :g 5 },
+                    x: block :g { break :g 5 },
                     y: 10,
                 });
             }
@@ -1029,14 +1029,14 @@ fn test_format_local_definition_wraps() {
 	// Using FB_WIDTH (a named constant) makes the expression exceed 80 cols.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory32; func set_pixel(x: u32, y: u32) { local base: heap::*u8 = (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8; }"
+			"memory heap: Memory32; func set_pixel(x: u32, y: u32) { local base: heap::*u8 = fb_ptr() + (y * FB_WIDTH + x) * BYTES_PER_PIXEL + HEADER_SIZE; }"
 		),
 		indoc! {"
             memory heap: Memory32;
 
             func set_pixel(x: u32, y: u32) {
                 local base: heap::*u8 =
-                    (fb_ptr() + (y * FB_WIDTH + x) * 3 + 12345) as heap::*u8;
+                    fb_ptr() + (y * FB_WIDTH + x) * BYTES_PER_PIXEL + HEADER_SIZE;
             }
         "},
 	);
@@ -1248,16 +1248,16 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 	// Long chain: exceeds 80 columns, each operand on its own line.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory32; func read(data: heap::&[u8], off: u32) -> i32 { (data[off] as i32) | ((data[off + 1] as i32) << 8) | ((data[off + 2] as i32) << 16) | ((data[off + 3] as i32) << 24) }"
+			"memory heap: Memory32; func read(data: heap::&[u8], off: u32) -> i32 { (data[off]: i32) | ((data[off + 1]: i32) << 8) | ((data[off + 2]: i32) << 16) | ((data[off + 3]: i32) << 24) }"
 		),
 		indoc! {"
             memory heap: Memory32;
 
             func read(data: heap::&[u8], off: u32) -> i32 {
-                (data[off] as i32)
-                    | ((data[off + 1] as i32) << 8)
-                    | ((data[off + 2] as i32) << 16)
-                    | ((data[off + 3] as i32) << 24)
+                (data[off]: i32)
+                    | ((data[off + 1]: i32) << 8)
+                    | ((data[off + 2]: i32) << 16)
+                    | ((data[off + 3]: i32) << 24)
             }
         "},
 	);
@@ -2371,7 +2371,7 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 	use ast::Expression as E;
 	assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
 	match (a, b) {
-		(E::Block { statements: a }, E::Block { statements: b }) => {
+		(E::Block { statements: a, .. }, E::Block { statements: b, .. }) => {
 			assert_eq!(a.len(), b.len());
 			let count = a.len();
 			for (i, (a, b)) in a.iter().zip(b).enumerate() {
@@ -2419,10 +2419,9 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 				preserve_roles(&a.inner, &b.inner);
 			}
 		}
-		(
-			E::Loop { block: a } | E::Label { block: a, .. },
-			E::Loop { block: b } | E::Label { block: b, .. },
-		) => preserve_roles(&a.inner, &b.inner),
+		(E::Loop { block: a, .. }, E::Loop { block: b, .. }) => {
+			preserve_roles(&a.inner, &b.inner)
+		}
 		(
 			E::Match {
 				scrutinee: a,
@@ -2602,11 +2601,11 @@ fn block_like_statement_separators() {
 			"block { foo() }",
 			"if true { foo() } else { bar() }",
 			"loop { break 1 }",
-			"label: block { break :label 1 }",
+			"block :label { break :label 1 }",
 			"if true {}",
 			"block {}",
 			"loop {}",
-			"label: block {}",
+			"block :label {}",
 			"match n {}",
 		] {
 			for separator in ["", ";"] {
@@ -2629,7 +2628,7 @@ fn block_like_statement_separators() {
 			"block { foo(); }",
 			"if true { foo(); } else { bar() }",
 			"loop { break 1; }",
-			"label: block { break :label 1; }",
+			"block :label { break :label 1; }",
 			"match n { _ -> { 1 } }",
 		] {
 			for separator in ["", ";"] {
@@ -2657,7 +2656,7 @@ fn block_like_statement_separators() {
 		for expression in [
 			"if true { foo() } else { bar() }",
 			"loop { break value }",
-			"label: block { break :label 1 }",
+			"block :label { break :label 1 }",
 		] {
 			let boundary = 4 + expression.len() + 1;
 			for width in [boundary - 1, boundary, boundary + 1] {
@@ -2693,7 +2692,7 @@ fn block_like_statement_separators() {
 			"match test(a) {}",
 			"loop {}",
 			"block {}",
-			"label: block {}",
+			"block :label {}",
 		] {
 			for separator in ["", ";"] {
 				let source =
@@ -3162,4 +3161,23 @@ fn test_format_one_element_tuple_as_its_element() {
             }
         "}
 	);
+}
+
+#[test]
+fn ascriptions_and_labels_are_printed_as_written() {
+	for (source, expected) in [
+		("(5 :i32)", "(5: i32)"),
+		("f(a:u8,b)", "f(a: u8, b)"),
+		("(a + b: u64, -1: i8)", "(a + b: u64, -1: i8)"),
+		(
+			"loop :outer { break :outer }",
+			"loop :outer { break :outer }",
+		),
+		("block :found { 1 }", "block :found { 1 }"),
+	] {
+		assert_eq!(
+			checked_format(&format!("func f() {{ {source} }}"), 80, 4),
+			format!("func f() {{\n    {expected}\n}}\n")
+		);
+	}
 }

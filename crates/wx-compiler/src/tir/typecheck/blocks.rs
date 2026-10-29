@@ -215,7 +215,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			ast::Statement::Expression(expr) => {
 				let value = self.build(expr, TypeIndex::INFER);
 				let ty = self.body.ty(value);
-				if self.cx.types.has_untyped(ty) {
+				if self.cx.types.has_literal(ty) {
 					self.report_annotation_required(value);
 				} else if ty != TypeIndex::UNIT
 					&& ty != TypeIndex::NEVER
@@ -242,6 +242,23 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.build_local(pattern, ty.as_deref(), value, statement.span)
 			}
 		}
+	}
+
+	/// `(value: ty)`: the value checked as a local of that type would be. The
+	/// ascription leaves no node of its own.
+	pub(super) fn build_ascription(
+		&mut self,
+		value: &Spanned<ast::Expression>,
+		ty: &Spanned<ast::TypeExpression>,
+	) -> ExprIdx {
+		let ty = self.cx.resolve_type(
+			&mut self.obligations.types,
+			self.scope,
+			ty,
+			InferPolicy::Allow,
+		);
+		let ty = self.normalized(ty, self.scope.env);
+		self.check(value, ty)
 	}
 
 	/// `local pattern [: ty] = value`. Without a written type the local
@@ -275,7 +292,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			None => value_ty,
 		};
-		if self.cx.types.has_untyped(local_ty)
+		if self.cx.types.has_literal(local_ty)
 			|| self.cx.types.has_infer(local_ty)
 		{
 			self.cx.diagnostics.push(
@@ -315,7 +332,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> ExprIdx {
 		let scrutinee = self.build(scrutinee, TypeIndex::INFER);
 		let mut scrutinee_ty = self.body.ty(scrutinee);
-		if self.cx.types.has_untyped(scrutinee_ty) {
+		if self.cx.types.has_literal(scrutinee_ty) {
 			self.report_annotation_required(scrutinee);
 			scrutinee_ty = TypeIndex::ERROR;
 		}
@@ -333,7 +350,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				scrutinee_ty,
 				&mut PatternContext::arm(),
 			);
-			let body = self.build_branch(&arm.inner.body, expected, None);
+			let body = self.build_branch(&arm.inner.body, expected);
 			self.leave_scope(scope);
 			built.push(body::Arm {
 				scope,
@@ -374,7 +391,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			// An untyped arm that gave way keeps the typed one as the one the
 			// rest join.
-			if !self.cx.types.has_untyped(self.body.ty(arm)) {
+			if !self.cx.types.has_literal(self.body.ty(arm)) {
 				joined = arm;
 			}
 		}
@@ -391,13 +408,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		then_block: &Spanned<ast::Expression>,
 		else_block: Option<&Spanned<ast::Expression>>,
 		expected: TypeIndex,
-		label: Option<LabelIdx>,
 		span: TextSpan,
 	) -> ExprIdx {
 		let condition = self.check(condition, TypeIndex::BOOL);
 		let Some(else_block) = else_block else {
-			let then_block =
-				self.build_branch(then_block, TypeIndex::INFER, label);
+			let then_block = self.build_branch(then_block, TypeIndex::INFER);
 			let then_ty = self.body.ty(then_block);
 			let mut ty = TypeIndex::UNIT;
 			if then_ty != TypeIndex::UNIT
@@ -430,8 +445,8 @@ impl BodyContext<'_, '_, '_, '_> {
 				span,
 			);
 		};
-		let then_block = self.build_branch(then_block, expected, label);
-		let else_block = self.build_branch(else_block, expected, label);
+		let then_block = self.build_branch(then_block, expected);
+		let else_block = self.build_branch(else_block, expected);
 		let ty = self.join_branches(then_block, else_block);
 		self.body.push(
 			ExprKind::IfElse {
@@ -444,17 +459,15 @@ impl BodyContext<'_, '_, '_, '_> {
 		)
 	}
 
-	/// An `if`'s branch: a block, which takes the `if`'s label, or the `if` of
-	/// an `else if`.
+	/// An `if`'s branch: a block, or the `if` of an `else if`.
 	fn build_branch(
 		&mut self,
 		branch: &Spanned<ast::Expression>,
 		expected: TypeIndex,
-		label: Option<LabelIdx>,
 	) -> ExprIdx {
 		match &branch.inner {
-			ast::Expression::Block { statements } => {
-				self.build_block(statements, expected, label, branch.span)
+			ast::Expression::Block { statements, .. } => {
+				self.build_block(statements, expected, None, branch.span)
 			}
 			_ => self.build(branch, expected),
 		}
@@ -473,8 +486,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			return TypeIndex::ERROR;
 		}
 		match (
-			self.cx.types.has_untyped(first_ty),
-			self.cx.types.has_untyped(second_ty),
+			self.cx.types.has_literal(first_ty),
+			self.cx.types.has_literal(second_ty),
 		) {
 			(true, false) => {
 				self.coerce(first, second_ty);
@@ -484,12 +497,21 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.coerce(second, first_ty);
 				first_ty
 			}
-			// Two numeric literals are a float if either is.
+			// A character literal with an integer one is a character, and two
+			// numeric literals are a float if either is.
 			(true, true)
-				if first_ty.is_comptime_number()
-					&& second_ty.is_comptime_number() =>
+				if first_ty == TypeIndex::CHAR_LITERAL
+					&& second_ty == TypeIndex::INTEGER_LITERAL
+					|| first_ty == TypeIndex::INTEGER_LITERAL
+						&& second_ty == TypeIndex::CHAR_LITERAL =>
 			{
-				TypeIndex::FLOAT
+				TypeIndex::CHAR_LITERAL
+			}
+			(true, true)
+				if first_ty.is_number_literal()
+					&& second_ty.is_number_literal() =>
+			{
+				TypeIndex::FLOAT_LITERAL
 			}
 			_ => {
 				let diagnostic =
@@ -517,39 +539,6 @@ impl BodyContext<'_, '_, '_, '_> {
 		let statements = self.body.push_args(built);
 		self.body
 			.push(ExprKind::Loop { scope, statements }, ty, span)
-	}
-
-	/// `label: block { .. }`, `label: loop { .. }` or `label: if ..`.
-	pub(super) fn build_labelled(
-		&mut self,
-		name: Spanned<SymbolU32>,
-		labelled: &Spanned<ast::Expression>,
-		expected: TypeIndex,
-		span: TextSpan,
-	) -> ExprIdx {
-		let label = self.body.push_label(body::Label { name });
-		match &labelled.inner {
-			ast::Expression::Block { statements } => {
-				self.build_block(statements, expected, Some(label), span)
-			}
-			ast::Expression::Loop { block } => {
-				self.build_loop(block, expected, Some(label), span)
-			}
-			ast::Expression::IfElse {
-				condition,
-				then_block,
-				else_block,
-			} => self.build_if_else(
-				condition,
-				then_block,
-				else_block.as_deref(),
-				expected,
-				Some(label),
-				span,
-			),
-			// The parser reports a label on anything else.
-			_ => self.build(labelled, expected),
-		}
 	}
 
 	/// `break`, leaving the nearest loop, or the scope `label` names, with
@@ -723,7 +712,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.expect(value, hint);
 			return;
 		}
-		if self.cx.types.has_untyped(ty) && !allow_untyped {
+		if self.cx.types.has_literal(ty) && !allow_untyped {
 			self.report_annotation_required(value);
 			self.scope_types[usize::from(scope)].ty = TypeIndex::ERROR;
 			return;

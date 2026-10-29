@@ -66,7 +66,7 @@ impl<T> Vec<T> {
                 self.*.buf.cast::<u8>().as_ref(),
                 self.*.len * size_of::<T, heap>(),
             );
-            self.*.buf = RawPtr::from_ptr(new_buf as heap::*T);
+            self.*.buf = RawPtr::from_ptr(transmute(new_buf));
             self.*.cap = new_cap;
         }
 
@@ -98,10 +98,10 @@ impl<T> Vec<T> {
 // Places a `BumpAllocator` at `DATA_END` and points it just past itself, so
 // every later allocation lands in the free region that follows.
 func bootstrap_allocator() -> heap::*BumpAllocator {
-    local self_ptr = heap::DATA_END as heap::*BumpAllocator;
+    local self_ptr: heap::*BumpAllocator = transmute(heap::DATA_END);
     self_ptr.*
         = BumpAllocator::from_addr(
-            heap::DATA_END as u32 + size_of::<BumpAllocator, heap>(),
+            transmute::<_, u32>(heap::DATA_END) + size_of::<BumpAllocator, heap>(),
         );
     self_ptr
 }

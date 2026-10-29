@@ -77,8 +77,7 @@ pub(super) struct Layouts {
 }
 
 /// One value as linear memory holds it: an integer of a width and a
-/// signedness, or a float. A `bool` is held as a `u8`, a `char` as a `u32`,
-/// and an address as its memory's `Size`.
+/// signedness, or a float. An address is held as its memory's `Size`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum Primitive {
@@ -98,11 +97,11 @@ impl Primitive {
 	/// The primitive a value of `ty` is held as, if `ty` is one.
 	fn of(ty: TypeIndex) -> Option<Self> {
 		Some(match ty {
-			TypeIndex::U8 | TypeIndex::BOOL => Self::U8,
+			TypeIndex::U8 => Self::U8,
 			TypeIndex::I8 => Self::I8,
 			TypeIndex::U16 => Self::U16,
 			TypeIndex::I16 => Self::I16,
-			TypeIndex::U32 | TypeIndex::CHAR => Self::U32,
+			TypeIndex::U32 => Self::U32,
 			TypeIndex::I32 => Self::I32,
 			TypeIndex::U64 => Self::U64,
 			TypeIndex::I64 => Self::I64,
@@ -295,9 +294,10 @@ impl TypeContext<'_, '_, '_> {
 		let piece = match *self.types.resolve(ty) {
 			Type::Error
 			| Type::Infer
-			| Type::Integer
-			| Type::Float
-			| Type::String
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::Value { .. }
 			| Type::Const { .. } => return Err(SolverError::Poisoned),
@@ -314,13 +314,12 @@ impl TypeContext<'_, '_, '_> {
 			| Type::U64
 			| Type::I64
 			| Type::F32
-			| Type::F64
-			| Type::Bool
-			| Type::Char => Piece::Primitives {
+			| Type::F64 => Piece::Primitives {
 				primitive: Primitive::of(ty).expect("a primitive type"),
 				count: 1,
 			},
-			Type::FunctionRef { .. }
+			Type::Funcref
+			| Type::FunctionRef { .. }
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. } => return Ok(None),
 			Type::Enum { enum_index } => {
@@ -491,35 +490,18 @@ mod tests {
 	use crate::tir::paths::PathResolver;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::FunctionSignature;
+	use crate::tir::signatures::tests::source_graph;
 	use crate::vfs::{self, FileId, Files};
 
 	/// `test_case!(mut case = "source")` declares the graph, the inputs and
 	/// the swept `TestCase` borrowing them as three locals of the calling
-	/// test. The source plays the stdlib's role, so it declares the
-	/// primitives and traits it uses.
+	/// test.
 	macro_rules! test_case {
 		(mut $case:ident = $source:expr $(,)?) => {
 			let mut graph = source_graph($source);
 			let mut inputs = TestInputs::new(&mut graph);
 			let mut $case = TestCase::new(&mut inputs);
 		};
-	}
-
-	fn source_graph(source: &str) -> vfs::CompilationUnit {
-		let mut builder = vfs::CompilationUnitBuilder::new();
-		let root_id = builder
-			.load_binary(
-				vfs::AbsolutePath::new("/main.wx"),
-				&vfs::VirtualFileSource::from_relative(
-					std::collections::HashMap::from([(
-						"main.wx".to_string(),
-						source.to_string(),
-					)]),
-				),
-			)
-			.unwrap();
-		builder.set_stdlib(root_id);
-		builder.build(root_id)
 	}
 
 	/// Everything a `TypeContext` borrows, kept on the test's stack.
@@ -666,10 +648,6 @@ mod tests {
 		format!(
 			"{}\n{source}",
 			indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u16; type u32; type u64; type f64; type bool; type char;
-			typeset PointerSize { u32, u64 }
-			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
 			memory wide: u64;
 		"}
@@ -734,7 +712,7 @@ mod tests {
 		let source = with_memories(indoc! {"
 			enum Small(u16) { A = 0 }
 			func f(
-				a: u8, b: u16, c: u32, d: u64, e: bool, g: f64,
+				a: u8, b: u16, c: u32, d: u64, e: Bool, g: f64,
 				h: heap::&u8, i: wide::*u64, j: heap::&[u8; 4],
 				k: heap::&[u8], l: wide::&[u8], m: (), n: Small,
 			) {}
@@ -910,7 +888,7 @@ mod tests {
 	#[test]
 	fn a_bool_is_held_as_a_u8_and_a_char_as_a_u32() {
 		let source = with_memories(indoc! {"
-			struct Letter(upper: bool, code: char);
+			struct Letter(upper: Bool, code: Char);
 			func f(a: Letter) {}
 		"});
 		test_case!(mut case = &source);

@@ -18,9 +18,18 @@ pub type f32;
 
 pub type f64;
 
-pub type bool;
+pub enum Bool(u8) {
+    False = 0,
+    True = 1,
+}
 
-pub type char;
+pub use Bool::*;
+
+/// A Unicode scalar value.
+pub struct Char(value: u32);
+
+/// A reference to a function of any signature: a Wasm `funcref`.
+pub type funcref;
 
 /// Aborts execution by trapping: normal control flow never continues past a
 /// call to `trap`, so it has the bottom type `!`.
@@ -79,10 +88,10 @@ pub trait Not {
 }
 
 pub trait PartialEq {
-    func eq(self: Self, other: Self) -> bool;
+    func eq(self: Self, other: Self) -> Bool;
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
+    func ne(self: Self, other: Self) -> Bool {
         !self.eq(other)
     }
 }
@@ -90,13 +99,13 @@ pub trait PartialEq {
 pub trait Eq: PartialEq {}
 
 pub trait PartialOrd: PartialEq {
-    func lt(self: Self, other: Self) -> bool;
+    func lt(self: Self, other: Self) -> Bool;
 
-    func le(self: Self, other: Self) -> bool;
+    func le(self: Self, other: Self) -> Bool;
 
-    func gt(self: Self, other: Self) -> bool;
+    func gt(self: Self, other: Self) -> Bool;
 
-    func ge(self: Self, other: Self) -> bool;
+    func ge(self: Self, other: Self) -> Bool;
 }
 
 pub enum Ordering(i8) {
@@ -108,36 +117,36 @@ pub enum Ordering(i8) {
 impl Ordering {
     #[inline]
     pub func of<T: PartialOrd>(a: T, b: T) -> Ordering {
-        ((a > b) as i8 - (a < b) as i8) as Ordering
+        transmute::<i8, Ordering>(transmute::<Bool, i8>(a > b) - transmute::<Bool, i8>(a < b))
     }
 
     #[inline]
-    pub func is_lt(self: Self) -> bool {
+    pub func is_lt(self: Self) -> Bool {
         self == Ordering::Less
     }
 
     #[inline]
-    pub func is_eq(self: Self) -> bool {
+    pub func is_eq(self: Self) -> Bool {
         self == Ordering::Equal
     }
 
     #[inline]
-    pub func is_gt(self: Self) -> bool {
+    pub func is_gt(self: Self) -> Bool {
         self == Ordering::Greater
     }
 
     #[inline]
-    pub func is_le(self: Self) -> bool {
+    pub func is_le(self: Self) -> Bool {
         self != Ordering::Greater
     }
 
     #[inline]
-    pub func is_ge(self: Self) -> bool {
+    pub func is_ge(self: Self) -> Bool {
         self != Ordering::Less
     }
 
     #[inline]
-    pub func is_ne(self: Self) -> bool {
+    pub func is_ne(self: Self) -> Bool {
         self != Ordering::Equal
     }
 
@@ -309,71 +318,71 @@ pub func i32_bitnot(value: i32) -> i32;
 
 pub func i64_bitnot(value: i64) -> i64;
 
-pub func i32_eqz(value: i32) -> bool;
+pub func i32_eqz(value: i32) -> Bool;
 
-pub func i32_eq(a: i32, b: i32) -> bool;
+pub func i32_eq(a: i32, b: i32) -> Bool;
 
-pub func i64_eq(a: i64, b: i64) -> bool;
+pub func i64_eq(a: i64, b: i64) -> Bool;
 
-pub func f32_eq(a: f32, b: f32) -> bool;
+pub func f32_eq(a: f32, b: f32) -> Bool;
 
-pub func f64_eq(a: f64, b: f64) -> bool;
+pub func f64_eq(a: f64, b: f64) -> Bool;
 
-pub func i32_ne(a: i32, b: i32) -> bool;
+pub func i32_ne(a: i32, b: i32) -> Bool;
 
-pub func i64_ne(a: i64, b: i64) -> bool;
+pub func i64_ne(a: i64, b: i64) -> Bool;
 
-pub func f32_ne(a: f32, b: f32) -> bool;
+pub func f32_ne(a: f32, b: f32) -> Bool;
 
-pub func f64_ne(a: f64, b: f64) -> bool;
+pub func f64_ne(a: f64, b: f64) -> Bool;
 
-pub func i32_lt(a: i32, b: i32) -> bool;
+pub func i32_lt(a: i32, b: i32) -> Bool;
 
-pub func u32_lt(a: u32, b: u32) -> bool;
+pub func u32_lt(a: u32, b: u32) -> Bool;
 
-pub func i64_lt(a: i64, b: i64) -> bool;
+pub func i64_lt(a: i64, b: i64) -> Bool;
 
-pub func u64_lt(a: u64, b: u64) -> bool;
+pub func u64_lt(a: u64, b: u64) -> Bool;
 
-pub func f32_lt(a: f32, b: f32) -> bool;
+pub func f32_lt(a: f32, b: f32) -> Bool;
 
-pub func f64_lt(a: f64, b: f64) -> bool;
+pub func f64_lt(a: f64, b: f64) -> Bool;
 
-pub func i32_le(a: i32, b: i32) -> bool;
+pub func i32_le(a: i32, b: i32) -> Bool;
 
-pub func u32_le(a: u32, b: u32) -> bool;
+pub func u32_le(a: u32, b: u32) -> Bool;
 
-pub func i64_le(a: i64, b: i64) -> bool;
+pub func i64_le(a: i64, b: i64) -> Bool;
 
-pub func u64_le(a: u64, b: u64) -> bool;
+pub func u64_le(a: u64, b: u64) -> Bool;
 
-pub func f32_le(a: f32, b: f32) -> bool;
+pub func f32_le(a: f32, b: f32) -> Bool;
 
-pub func f64_le(a: f64, b: f64) -> bool;
+pub func f64_le(a: f64, b: f64) -> Bool;
 
-pub func i32_gt(a: i32, b: i32) -> bool;
+pub func i32_gt(a: i32, b: i32) -> Bool;
 
-pub func u32_gt(a: u32, b: u32) -> bool;
+pub func u32_gt(a: u32, b: u32) -> Bool;
 
-pub func i64_gt(a: i64, b: i64) -> bool;
+pub func i64_gt(a: i64, b: i64) -> Bool;
 
-pub func u64_gt(a: u64, b: u64) -> bool;
+pub func u64_gt(a: u64, b: u64) -> Bool;
 
-pub func f32_gt(a: f32, b: f32) -> bool;
+pub func f32_gt(a: f32, b: f32) -> Bool;
 
-pub func f64_gt(a: f64, b: f64) -> bool;
+pub func f64_gt(a: f64, b: f64) -> Bool;
 
-pub func i32_ge(a: i32, b: i32) -> bool;
+pub func i32_ge(a: i32, b: i32) -> Bool;
 
-pub func u32_ge(a: u32, b: u32) -> bool;
+pub func u32_ge(a: u32, b: u32) -> Bool;
 
-pub func i64_ge(a: i64, b: i64) -> bool;
+pub func i64_ge(a: i64, b: i64) -> Bool;
 
-pub func u64_ge(a: u64, b: u64) -> bool;
+pub func u64_ge(a: u64, b: u64) -> Bool;
 
-pub func f32_ge(a: f32, b: f32) -> bool;
+pub func f32_ge(a: f32, b: f32) -> Bool;
 
-pub func f64_ge(a: f64, b: f64) -> bool;
+pub func f64_ge(a: f64, b: f64) -> Bool;
 
 pub func f32_convert_i32(value: i32) -> f32;
 
@@ -481,12 +490,12 @@ impl f32 {
 
     #[inline]
     pub func to_bits(self: Self) -> u32 {
-        i32_reinterpret_f32(self) as u32
+        transmute(i32_reinterpret_f32(self))
     }
 
     #[inline]
     pub func from_bits(bits: u32) -> Self {
-        f32_reinterpret_i32(bits as i32)
+        f32_reinterpret_i32(transmute(bits))
     }
 
     #[inline]
@@ -577,12 +586,12 @@ impl f64 {
 
     #[inline]
     pub func to_bits(self: Self) -> u64 {
-        i64_reinterpret_f64(self) as u64
+        transmute(i64_reinterpret_f64(self))
     }
 
     #[inline]
     pub func from_bits(bits: u64) -> Self {
-        f64_reinterpret_i64(bits as i64)
+        f64_reinterpret_i64(transmute(bits))
     }
 
     #[inline]
@@ -722,21 +731,21 @@ impl u32 {
 impl Add for u32 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        i32_add(self as i32, rhs as i32) as u32
+        transmute(i32_add(transmute(self), transmute(rhs)))
     }
 }
 
 impl Sub for u32 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        i32_sub(self as i32, rhs as i32) as u32
+        transmute(i32_sub(transmute(self), transmute(rhs)))
     }
 }
 
 impl Mul for u32 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        i32_mul(self as i32, rhs as i32) as u32
+        transmute(i32_mul(transmute(self), transmute(rhs)))
     }
 }
 
@@ -757,28 +766,28 @@ impl Rem for u32 {
 impl BitAnd for u32 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        i32_bitand(self as i32, rhs as i32) as u32
+        transmute(i32_bitand(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitOr for u32 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        i32_bitor(self as i32, rhs as i32) as u32
+        transmute(i32_bitor(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitXor for u32 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        i32_bitxor(self as i32, rhs as i32) as u32
+        transmute(i32_bitxor(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shl for u32 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        i32_shl(self as i32, rhs as i32) as u32
+        transmute(i32_shl(transmute(self), transmute(rhs)))
     }
 }
 
@@ -792,7 +801,7 @@ impl Shr for u32 {
 impl BitNot for u32 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        i32_bitnot(self as i32) as u32
+        transmute(i32_bitnot(transmute(self)))
     }
 }
 
@@ -907,21 +916,21 @@ impl u64 {
 impl Add for u64 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        i64_add(self as i64, rhs as i64) as u64
+        transmute(i64_add(transmute(self), transmute(rhs)))
     }
 }
 
 impl Sub for u64 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        i64_sub(self as i64, rhs as i64) as u64
+        transmute(i64_sub(transmute(self), transmute(rhs)))
     }
 }
 
 impl Mul for u64 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        i64_mul(self as i64, rhs as i64) as u64
+        transmute(i64_mul(transmute(self), transmute(rhs)))
     }
 }
 
@@ -942,28 +951,28 @@ impl Rem for u64 {
 impl BitAnd for u64 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        i64_bitand(self as i64, rhs as i64) as u64
+        transmute(i64_bitand(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitOr for u64 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        i64_bitor(self as i64, rhs as i64) as u64
+        transmute(i64_bitor(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitXor for u64 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        i64_bitxor(self as i64, rhs as i64) as u64
+        transmute(i64_bitxor(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shl for u64 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        i64_shl(self as i64, rhs as i64) as u64
+        transmute(i64_shl(transmute(self), transmute(rhs)))
     }
 }
 
@@ -977,7 +986,7 @@ impl Shr for u64 {
 impl BitNot for u64 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        i64_bitnot(self as i64) as u64
+        transmute(i64_bitnot(transmute(self)))
     }
 }
 
@@ -1068,758 +1077,758 @@ impl Rem for f64 {
 impl Add for i8 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        i32_add(self as i32, rhs as i32) as i8
+        transmute(i32_add(transmute(self), transmute(rhs)))
     }
 }
 
 impl Sub for i8 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        i32_sub(self as i32, rhs as i32) as i8
+        transmute(i32_sub(transmute(self), transmute(rhs)))
     }
 }
 
 impl Mul for i8 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        i32_mul(self as i32, rhs as i32) as i8
+        transmute(i32_mul(transmute(self), transmute(rhs)))
     }
 }
 
 impl Div for i8 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        i32_div(self as i32, rhs as i32) as i8
+        transmute(i32_div(transmute(self), transmute(rhs)))
     }
 }
 
 impl Rem for i8 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        i32_rem(self as i32, rhs as i32) as i8
+        transmute(i32_rem(transmute(self), transmute(rhs)))
     }
 }
 
 impl Neg for i8 {
     #[inline]
     func neg(self: Self) -> Self {
-        i32_neg(self as i32) as i8
+        transmute(i32_neg(transmute(self)))
     }
 }
 
 impl BitAnd for i8 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        i32_bitand(self as i32, rhs as i32) as i8
+        transmute(i32_bitand(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitOr for i8 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        i32_bitor(self as i32, rhs as i32) as i8
+        transmute(i32_bitor(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitXor for i8 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        i32_bitxor(self as i32, rhs as i32) as i8
+        transmute(i32_bitxor(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shl for i8 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        i32_shl(self as i32, rhs as i32) as i8
+        transmute(i32_shl(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shr for i8 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        i32_shr(self as i32, rhs as i32) as i8
+        transmute(i32_shr(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitNot for i8 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        i32_bitnot(self as i32) as i8
+        transmute(i32_bitnot(transmute(self)))
     }
 }
 
 impl Add for u8 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        i32_add(self as i32, rhs as i32) as u8
+        transmute(i32_add(transmute(self), transmute(rhs)))
     }
 }
 
 impl Sub for u8 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        i32_sub(self as i32, rhs as i32) as u8
+        transmute(i32_sub(transmute(self), transmute(rhs)))
     }
 }
 
 impl Mul for u8 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        i32_mul(self as i32, rhs as i32) as u8
+        transmute(i32_mul(transmute(self), transmute(rhs)))
     }
 }
 
 impl Div for u8 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        u32_div(self as u32, rhs as u32) as u8
+        transmute(u32_div(transmute(self), transmute(rhs)))
     }
 }
 
 impl Rem for u8 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        u32_rem(self as u32, rhs as u32) as u8
+        transmute(u32_rem(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitAnd for u8 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        i32_bitand(self as i32, rhs as i32) as u8
+        transmute(i32_bitand(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitOr for u8 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        i32_bitor(self as i32, rhs as i32) as u8
+        transmute(i32_bitor(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitXor for u8 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        i32_bitxor(self as i32, rhs as i32) as u8
+        transmute(i32_bitxor(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shl for u8 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        i32_shl(self as i32, rhs as i32) as u8
+        transmute(i32_shl(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shr for u8 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        u32_shr(self as u32, rhs as u32) as u8
+        transmute(u32_shr(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitNot for u8 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        i32_bitnot(self as i32) as u8
+        transmute(i32_bitnot(transmute(self)))
     }
 }
 
 impl Add for i16 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        i32_add(self as i32, rhs as i32) as i16
+        transmute(i32_add(transmute(self), transmute(rhs)))
     }
 }
 
 impl Sub for i16 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        i32_sub(self as i32, rhs as i32) as i16
+        transmute(i32_sub(transmute(self), transmute(rhs)))
     }
 }
 
 impl Mul for i16 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        i32_mul(self as i32, rhs as i32) as i16
+        transmute(i32_mul(transmute(self), transmute(rhs)))
     }
 }
 
 impl Div for i16 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        i32_div(self as i32, rhs as i32) as i16
+        transmute(i32_div(transmute(self), transmute(rhs)))
     }
 }
 
 impl Rem for i16 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        i32_rem(self as i32, rhs as i32) as i16
+        transmute(i32_rem(transmute(self), transmute(rhs)))
     }
 }
 
 impl Neg for i16 {
     #[inline]
     func neg(self: Self) -> Self {
-        i32_neg(self as i32) as i16
+        transmute(i32_neg(transmute(self)))
     }
 }
 
 impl BitAnd for i16 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        i32_bitand(self as i32, rhs as i32) as i16
+        transmute(i32_bitand(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitOr for i16 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        i32_bitor(self as i32, rhs as i32) as i16
+        transmute(i32_bitor(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitXor for i16 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        i32_bitxor(self as i32, rhs as i32) as i16
+        transmute(i32_bitxor(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shl for i16 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        i32_shl(self as i32, rhs as i32) as i16
+        transmute(i32_shl(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shr for i16 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        i32_shr(self as i32, rhs as i32) as i16
+        transmute(i32_shr(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitNot for i16 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        i32_bitnot(self as i32) as i16
+        transmute(i32_bitnot(transmute(self)))
     }
 }
 
 impl Add for u16 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        i32_add(self as i32, rhs as i32) as u16
+        transmute(i32_add(transmute(self), transmute(rhs)))
     }
 }
 
 impl Sub for u16 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        i32_sub(self as i32, rhs as i32) as u16
+        transmute(i32_sub(transmute(self), transmute(rhs)))
     }
 }
 
 impl Mul for u16 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        i32_mul(self as i32, rhs as i32) as u16
+        transmute(i32_mul(transmute(self), transmute(rhs)))
     }
 }
 
 impl Div for u16 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        u32_div(self as u32, rhs as u32) as u16
+        transmute(u32_div(transmute(self), transmute(rhs)))
     }
 }
 
 impl Rem for u16 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        u32_rem(self as u32, rhs as u32) as u16
+        transmute(u32_rem(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitAnd for u16 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        i32_bitand(self as i32, rhs as i32) as u16
+        transmute(i32_bitand(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitOr for u16 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        i32_bitor(self as i32, rhs as i32) as u16
+        transmute(i32_bitor(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitXor for u16 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        i32_bitxor(self as i32, rhs as i32) as u16
+        transmute(i32_bitxor(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shl for u16 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        i32_shl(self as i32, rhs as i32) as u16
+        transmute(i32_shl(transmute(self), transmute(rhs)))
     }
 }
 
 impl Shr for u16 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        u32_shr(self as u32, rhs as u32) as u16
+        transmute(u32_shr(transmute(self), transmute(rhs)))
     }
 }
 
 impl BitNot for u16 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        i32_bitnot(self as i32) as u16
+        transmute(i32_bitnot(transmute(self)))
     }
 }
 
-impl BitAnd for bool {
+impl BitAnd for Bool {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        i32_bitand(self as i32, rhs as i32) as bool
+        transmute(i32_bitand(transmute(self), transmute(rhs)))
     }
 }
 
-impl BitOr for bool {
+impl BitOr for Bool {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        i32_bitor(self as i32, rhs as i32) as bool
+        transmute(i32_bitor(transmute(self), transmute(rhs)))
     }
 }
 
-impl BitXor for bool {
+impl BitXor for Bool {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        i32_bitxor(self as i32, rhs as i32) as bool
+        transmute(i32_bitxor(transmute(self), transmute(rhs)))
     }
 }
 
-impl Not for bool {
+impl Not for Bool {
     #[inline]
     func not(self: Self) -> Self {
-        i32_eqz(self as i32)
+        i32_eqz(transmute(self))
     }
 }
 
 impl PartialEq for i32 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
+    func eq(self: Self, other: Self) -> Bool {
         i32_eq(self, other)
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
+    func ne(self: Self, other: Self) -> Bool {
         i32_ne(self, other)
     }
 }
 
 impl PartialEq for u32 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i32_eq(self as i32, other as i32)
+    func eq(self: Self, other: Self) -> Bool {
+        i32_eq(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i32_ne(self as i32, other as i32)
+    func ne(self: Self, other: Self) -> Bool {
+        i32_ne(transmute(self), transmute(other))
     }
 }
 
 impl PartialEq for i64 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
+    func eq(self: Self, other: Self) -> Bool {
         i64_eq(self, other)
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
+    func ne(self: Self, other: Self) -> Bool {
         i64_ne(self, other)
     }
 }
 
 impl PartialEq for u64 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i64_eq(self as i64, other as i64)
+    func eq(self: Self, other: Self) -> Bool {
+        i64_eq(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i64_ne(self as i64, other as i64)
+    func ne(self: Self, other: Self) -> Bool {
+        i64_ne(transmute(self), transmute(other))
     }
 }
 
 impl PartialEq for i8 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i32_eq(self as i32, other as i32)
+    func eq(self: Self, other: Self) -> Bool {
+        i32_eq(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i32_ne(self as i32, other as i32)
+    func ne(self: Self, other: Self) -> Bool {
+        i32_ne(transmute(self), transmute(other))
     }
 }
 
 impl PartialEq for u8 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i32_eq(self as i32, other as i32)
+    func eq(self: Self, other: Self) -> Bool {
+        i32_eq(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i32_ne(self as i32, other as i32)
+    func ne(self: Self, other: Self) -> Bool {
+        i32_ne(transmute(self), transmute(other))
     }
 }
 
 impl PartialEq for i16 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i32_eq(self as i32, other as i32)
+    func eq(self: Self, other: Self) -> Bool {
+        i32_eq(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i32_ne(self as i32, other as i32)
+    func ne(self: Self, other: Self) -> Bool {
+        i32_ne(transmute(self), transmute(other))
     }
 }
 
 impl PartialEq for u16 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i32_eq(self as i32, other as i32)
+    func eq(self: Self, other: Self) -> Bool {
+        i32_eq(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i32_ne(self as i32, other as i32)
+    func ne(self: Self, other: Self) -> Bool {
+        i32_ne(transmute(self), transmute(other))
     }
 }
 
 impl PartialEq for f32 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
+    func eq(self: Self, other: Self) -> Bool {
         f32_eq(self, other)
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
+    func ne(self: Self, other: Self) -> Bool {
         f32_ne(self, other)
     }
 }
 
 impl PartialEq for f64 {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
+    func eq(self: Self, other: Self) -> Bool {
         f64_eq(self, other)
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
+    func ne(self: Self, other: Self) -> Bool {
         f64_ne(self, other)
     }
 }
 
-impl PartialEq for bool {
+impl PartialEq for Bool {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i32_eq(self as i32, other as i32)
+    func eq(self: Self, other: Self) -> Bool {
+        i32_eq(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i32_ne(self as i32, other as i32)
+    func ne(self: Self, other: Self) -> Bool {
+        i32_ne(transmute(self), transmute(other))
     }
 }
 
-impl PartialEq for char {
+impl PartialEq for Char {
     #[inline]
-    func eq(self: Self, other: Self) -> bool {
-        i32_eq(self as i32, other as i32)
+    func eq(self: Self, other: Self) -> Bool {
+        self.value == other.value
     }
 
     #[inline]
-    func ne(self: Self, other: Self) -> bool {
-        i32_ne(self as i32, other as i32)
+    func ne(self: Self, other: Self) -> Bool {
+        self.value != other.value
     }
 }
 
 impl PartialOrd for i32 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
+    func lt(self: Self, other: Self) -> Bool {
         i32_lt(self, other)
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
+    func le(self: Self, other: Self) -> Bool {
         i32_le(self, other)
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
+    func gt(self: Self, other: Self) -> Bool {
         i32_gt(self, other)
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
+    func ge(self: Self, other: Self) -> Bool {
         i32_ge(self, other)
     }
 }
 
 impl PartialOrd for u32 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
+    func lt(self: Self, other: Self) -> Bool {
         u32_lt(self, other)
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
+    func le(self: Self, other: Self) -> Bool {
         u32_le(self, other)
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
+    func gt(self: Self, other: Self) -> Bool {
         u32_gt(self, other)
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
+    func ge(self: Self, other: Self) -> Bool {
         u32_ge(self, other)
     }
 }
 
 impl PartialOrd for i64 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
+    func lt(self: Self, other: Self) -> Bool {
         i64_lt(self, other)
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
+    func le(self: Self, other: Self) -> Bool {
         i64_le(self, other)
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
+    func gt(self: Self, other: Self) -> Bool {
         i64_gt(self, other)
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
+    func ge(self: Self, other: Self) -> Bool {
         i64_ge(self, other)
     }
 }
 
 impl PartialOrd for u64 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
+    func lt(self: Self, other: Self) -> Bool {
         u64_lt(self, other)
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
+    func le(self: Self, other: Self) -> Bool {
         u64_le(self, other)
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
+    func gt(self: Self, other: Self) -> Bool {
         u64_gt(self, other)
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
+    func ge(self: Self, other: Self) -> Bool {
         u64_ge(self, other)
     }
 }
 
 impl PartialOrd for i8 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
-        i32_lt(self as i32, other as i32)
+    func lt(self: Self, other: Self) -> Bool {
+        i32_lt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
-        i32_le(self as i32, other as i32)
+    func le(self: Self, other: Self) -> Bool {
+        i32_le(transmute(self), transmute(other))
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
-        i32_gt(self as i32, other as i32)
+    func gt(self: Self, other: Self) -> Bool {
+        i32_gt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
-        i32_ge(self as i32, other as i32)
+    func ge(self: Self, other: Self) -> Bool {
+        i32_ge(transmute(self), transmute(other))
     }
 }
 
 impl PartialOrd for u8 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
-        u32_lt(self as u32, other as u32)
+    func lt(self: Self, other: Self) -> Bool {
+        u32_lt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
-        u32_le(self as u32, other as u32)
+    func le(self: Self, other: Self) -> Bool {
+        u32_le(transmute(self), transmute(other))
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
-        u32_gt(self as u32, other as u32)
+    func gt(self: Self, other: Self) -> Bool {
+        u32_gt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
-        u32_ge(self as u32, other as u32)
+    func ge(self: Self, other: Self) -> Bool {
+        u32_ge(transmute(self), transmute(other))
     }
 }
 
 impl PartialOrd for i16 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
-        i32_lt(self as i32, other as i32)
+    func lt(self: Self, other: Self) -> Bool {
+        i32_lt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
-        i32_le(self as i32, other as i32)
+    func le(self: Self, other: Self) -> Bool {
+        i32_le(transmute(self), transmute(other))
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
-        i32_gt(self as i32, other as i32)
+    func gt(self: Self, other: Self) -> Bool {
+        i32_gt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
-        i32_ge(self as i32, other as i32)
+    func ge(self: Self, other: Self) -> Bool {
+        i32_ge(transmute(self), transmute(other))
     }
 }
 
 impl PartialOrd for u16 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
-        u32_lt(self as u32, other as u32)
+    func lt(self: Self, other: Self) -> Bool {
+        u32_lt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
-        u32_le(self as u32, other as u32)
+    func le(self: Self, other: Self) -> Bool {
+        u32_le(transmute(self), transmute(other))
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
-        u32_gt(self as u32, other as u32)
+    func gt(self: Self, other: Self) -> Bool {
+        u32_gt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
-        u32_ge(self as u32, other as u32)
+    func ge(self: Self, other: Self) -> Bool {
+        u32_ge(transmute(self), transmute(other))
     }
 }
 
 impl PartialOrd for f32 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
+    func lt(self: Self, other: Self) -> Bool {
         f32_lt(self, other)
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
+    func le(self: Self, other: Self) -> Bool {
         f32_le(self, other)
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
+    func gt(self: Self, other: Self) -> Bool {
         f32_gt(self, other)
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
+    func ge(self: Self, other: Self) -> Bool {
         f32_ge(self, other)
     }
 }
 
 impl PartialOrd for f64 {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
+    func lt(self: Self, other: Self) -> Bool {
         f64_lt(self, other)
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
+    func le(self: Self, other: Self) -> Bool {
         f64_le(self, other)
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
+    func gt(self: Self, other: Self) -> Bool {
         f64_gt(self, other)
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
+    func ge(self: Self, other: Self) -> Bool {
         f64_ge(self, other)
     }
 }
 
-impl PartialOrd for bool {
+impl PartialOrd for Bool {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
-        u32_lt(self as u32, other as u32)
+    func lt(self: Self, other: Self) -> Bool {
+        u32_lt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
-        u32_le(self as u32, other as u32)
+    func le(self: Self, other: Self) -> Bool {
+        u32_le(transmute(self), transmute(other))
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
-        u32_gt(self as u32, other as u32)
+    func gt(self: Self, other: Self) -> Bool {
+        u32_gt(transmute(self), transmute(other))
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
-        u32_ge(self as u32, other as u32)
+    func ge(self: Self, other: Self) -> Bool {
+        u32_ge(transmute(self), transmute(other))
     }
 }
 
-impl PartialOrd for char {
+impl PartialOrd for Char {
     #[inline]
-    func lt(self: Self, other: Self) -> bool {
-        u32_lt(self as u32, other as u32)
+    func lt(self: Self, other: Self) -> Bool {
+        self.value < other.value
     }
 
     #[inline]
-    func le(self: Self, other: Self) -> bool {
-        u32_le(self as u32, other as u32)
+    func le(self: Self, other: Self) -> Bool {
+        self.value <= other.value
     }
 
     #[inline]
-    func gt(self: Self, other: Self) -> bool {
-        u32_gt(self as u32, other as u32)
+    func gt(self: Self, other: Self) -> Bool {
+        self.value > other.value
     }
 
     #[inline]
-    func ge(self: Self, other: Self) -> bool {
-        u32_ge(self as u32, other as u32)
+    func ge(self: Self, other: Self) -> Bool {
+        self.value >= other.value
     }
 }
 
@@ -1839,9 +1848,9 @@ impl Eq for i32 {}
 
 impl Eq for i64 {}
 
-impl Eq for bool {}
+impl Eq for Bool {}
 
-impl Eq for char {}
+impl Eq for Char {}
 
 impl Ord for u8 {
     #[inline]
@@ -1899,14 +1908,14 @@ impl Ord for i64 {
     }
 }
 
-impl Ord for bool {
+impl Ord for Bool {
     #[inline]
     func cmp(self: Self, other: Self) -> Ordering {
         Ordering::of(self, other)
     }
 }
 
-impl Ord for char {
+impl Ord for Char {
     #[inline]
     func cmp(self: Self, other: Self) -> Ordering {
         Ordering::of(self, other)
@@ -1985,16 +1994,34 @@ pub func memory_copy<
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
-pub typeset PointerSize: Mul + PartialEq + UnsignedInt { u32, u64 }
+pub typeset PointerSize: Mul + PartialEq + UnsignedInt + StackValue { u32, u64 }
 
 func global_get<G: Global>(g: G) -> G::Value;
 
 func global_set<G: Global>(g: G, value: G::Value);
 
-pub trait ValueType {}
+/// How a value sits on the Wasm stack. Every type but `!` (and any type
+/// containing it) is one; the compiler answers it from the type's structure.
+/// `Repr` is the value's Wasm values as wx's own primitives: its parts in
+/// declaration order, flattened, zero-sized ones dropped. `Point(u32, u32)` and
+/// `(u8, u8)` are both `(i32, i32)`, `Meters(u32)` is `i32`, `()` is `()`.
+pub trait StackValue {
+    type Repr;
+}
+
+/// The types of a single Wasm value.
+pub typeset StackScalar { i32, i64, f32, f64, funcref }
+
+/// Reinterprets a value as another type held the same way on the stack. Changing
+/// a value's representation (`i32` to `i64`, an integer to a float) is an
+/// instruction's job.
+pub func transmute<
+    T: StackValue,
+    U: StackValue where { Repr = T::Repr },
+>(value: T) -> U;
 
 pub trait Global {
-    type Value: ValueType;
+    type Value: StackValue where { Repr: StackScalar };
 
     func get(self: Self) -> Self::Value {
         global_get(self)
@@ -2087,7 +2114,7 @@ pub trait Allocator {
 
     #[inline]
     func allocate_value<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
-        local ptr = self.allocate(Layout::of::<T>()) as Self::Mem::*T;
+        local ptr: Self::Mem::*T = transmute(self.allocate(Layout::of::<T>()));
         ptr.* = value;
         ptr
     }
@@ -2095,7 +2122,7 @@ pub trait Allocator {
     #[inline]
     func allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts(
-            self.allocate(Layout::array::<T>(len)) as Self::Mem::*T,
+            transmute::<_, Self::Mem::*T>(self.allocate(Layout::array::<T>(len))),
             len,
         )
     }
@@ -2118,12 +2145,12 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
 
     #[inline]
     pub func from_ref(ref: Mem::&T) -> Self {
-        Self({ addr: ref as _ })
+        Self({ addr: transmute(ref) })
     }
 
     #[inline]
     pub func from_ptr(ptr: Mem::*T) -> Self {
-        Self({ addr: ptr as _ })
+        Self({ addr: transmute(ptr) })
     }
 
     #[inline]
@@ -2133,22 +2160,22 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
 
     #[inline]
     pub func as_ref(self: Self) -> Mem::&T {
-        self.addr as _
+        transmute(self.addr)
     }
 
     #[inline]
     pub func as_ptr(self: Self) -> Mem::*T {
-        self.addr as _
+        transmute(self.addr)
     }
 
     #[inline]
-    pub func is_null(self: Self) -> bool {
+    pub func is_null(self: Self) -> Bool {
         self.addr == 0
     }
 
     #[inline]
     pub func cast<U>(self: Self) -> RawPtr<Mem, U> {
-        RawPtr({ addr: self.addr }) as _
+        RawPtr({ addr: self.addr })
     }
 }
 
@@ -2191,61 +2218,61 @@ impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> 
 //     }
 // }
 
-const ASCII_CASE_MASK: u8 = 0b0010_0000;
+const ASCII_CASE_MASK: u32 = 0b0010_0000;
 
-impl char {
+impl Char {
     #[inline]
-    pub func to_ascii_uppercase(self: Self) -> char {
+    pub func to_ascii_uppercase(self: Self) -> Char {
         if self.is_ascii_lowercase() {
-            ((self as u8) ^ ASCII_CASE_MASK) as char
+            Char(self.value ^ ASCII_CASE_MASK)
         } else {
             self
         }
     }
 
     #[inline]
-    pub func to_ascii_lowercase(self: Self) -> char {
+    pub func to_ascii_lowercase(self: Self) -> Char {
         if self.is_ascii_uppercase() {
-            ((self as u8) ^ ASCII_CASE_MASK) as char
+            Char(self.value ^ ASCII_CASE_MASK)
         } else {
             self
         }
     }
 
     #[inline]
-    pub func is_ascii(self: Self) -> bool {
-        (self as u32) <= 0x7F
+    pub func is_ascii(self: Self) -> Bool {
+        self.value <= 0x7F
     }
 
     #[inline]
-    pub func is_ascii_uppercase(self: Self) -> bool {
+    pub func is_ascii_uppercase(self: Self) -> Bool {
         self >= 'A' && self <= 'Z'
     }
 
     #[inline]
-    pub func is_ascii_lowercase(self: Self) -> bool {
+    pub func is_ascii_lowercase(self: Self) -> Bool {
         self >= 'a' && self <= 'z'
     }
 
     #[inline]
-    pub func is_ascii_alphabetic(self: Self) -> bool {
+    pub func is_ascii_alphabetic(self: Self) -> Bool {
         (self >= 'A' && self <= 'Z') | (self >= 'a' && self <= 'z')
     }
 
     #[inline]
-    pub func is_ascii_digit(self: Self) -> bool {
+    pub func is_ascii_digit(self: Self) -> Bool {
         self >= '0' && self <= '9'
     }
 
     #[inline]
-    pub func is_ascii_alphanumeric(self: Self) -> bool {
+    pub func is_ascii_alphanumeric(self: Self) -> Bool {
         (self >= 'A' && self <= 'Z')
             | (self >= 'a' && self <= 'z')
             | (self >= '0' && self <= '9')
     }
 
     #[inline]
-    pub func is_ascii_whitespace(self: Self) -> bool {
+    pub func is_ascii_whitespace(self: Self) -> Bool {
         self == '\t'
             || self == '\n'
             || self == '\x0C'
@@ -2254,19 +2281,19 @@ impl char {
     }
 
     #[inline]
-    pub func is_ascii_control(self: Self) -> bool {
-        (self as u32) <= 0x1F || self == '\x7F'
+    pub func is_ascii_control(self: Self) -> Bool {
+        self.value <= 0x1F || self == '\x7F'
     }
 
     #[inline]
-    pub func is_ascii_hexdigit(self: Self) -> bool {
+    pub func is_ascii_hexdigit(self: Self) -> Bool {
         (self >= '0' && self <= '9')
             | (self >= 'A' && self <= 'F')
             | (self >= 'a' && self <= 'f')
     }
 
     #[inline]
-    pub func is_ascii_punctuation(self: Self) -> bool {
+    pub func is_ascii_punctuation(self: Self) -> Bool {
         (self >= '!' && self <= '/')
             | (self >= ':' && self <= '@')
             | (self >= '[' && self <= '`')
@@ -2274,7 +2301,7 @@ impl char {
     }
 
     #[inline]
-    pub func is_ascii_graphic(self: Self) -> bool {
+    pub func is_ascii_graphic(self: Self) -> Bool {
         self >= '!' && self <= '~'
     }
 }

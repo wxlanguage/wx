@@ -423,7 +423,9 @@ builtin traits.
   and the real stdlib plus the suite resolve. The visible consequence is the
   decision already taken: a member of a concrete projection
   (`Wrapper::Item::Value`) is an error that says which trait to write, as in rustc. In type
-  position `<<` is split by the parser, so `<<A as B>::C as D>::E` is accepted.
+  position `<<` is split by the parser, so `<<A as B>::C as D>::E` is accepted (but
+  not after a generic argument list opens, `Is<<A as B>::C>`:
+  `parser-double-left-arrow.md`).
 - Derived errors that do *not* come through a silent query: a body that asks
   `S<u32>: Other` (impl bound `T: Trait`) after `u32: Trait` failed at a
   signature site reports its own error at its own site. Bodies assume their
@@ -471,6 +473,38 @@ builtin traits.
   monomorphization later). The cost: a use sees the trait's declared signature,
   so an impl whose signature disagrees is accepted until trait-impl conformance
   checks signature agreement.
+
+- **An equality that reduces back to itself through a definition.** A loop
+  through an `Equality` frame is a tautology (`projection_cycle` unwinds to
+  where it started and leaves that projection unreduced), which is right for
+  mutual equalities (`T: Tr where { A = U::A }, U: Tr where { A = T::A }`).
+  But when the loop also goes through a reduction, the answer depends on where
+  it was entered: with `impl<T: Tr> Tr for Wrap<T> { type A = T::A; }`,
+  `T: Tr where { A = <Wrap<T> as Tr>::A }` leaves `T::A` as `T::A` and
+  `<Wrap<T> as Tr>::A` as itself, so every use reports E2112 for the very
+  equality the bound states. `StackValue::Repr` behaves the same
+  (`notes/stack-value.md`). rustc's default solver rejects the bound with
+  E0275 (overflow); `-Znext-solver` accepts it (checked with rustc 1.96
+  nightly).
+
+  Planned: an error at the bound, as an obligation in `check_declarations`
+  (`CheckEquality`). Normalize the clause's value with definitions and values
+  but **without** `EQUALITIES`, then walk the result for the clause's
+  projection: equal to it is a redundant equality ("`<Wrap<T> as Tr>::A` is
+  already `T::A`"); containing it is an unsatisfiable one, an infinite type
+  (`T: StackValue where { Repr = <(T, u32) as StackValue>::Repr }`).
+  Leaving every equality out is what spares mutual equalities: "every clause
+  but this one" would flag both halves of a pair.
+
+  - It cannot run where clauses are built (definitions are unreadable
+    mid-construction, `IMPL_WHILE_BUILDING`), and a check never rewrites a
+    signature, so the clause cannot be dropped with a warning instead.
+  - Uses still read the clause and still report E2112. One diagnostic needs a
+    poisoned mark per equality clause that their readers fail silently on, as
+    for a failed `Verdict`; nothing records that today.
+  - Not caught: a loop that needs another equality besides a definition
+    (`T::A = <Wrap<U> as Tr>::A` with `U::A = T::A`). It stays a use-site
+    mismatch.
 
 ## Migration
 

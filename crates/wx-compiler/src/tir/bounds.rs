@@ -958,9 +958,10 @@ pub(super) fn known_distinct(
 		(
 			Type::Error
 			| Type::Infer
-			| Type::Integer
-			| Type::Float
-			| Type::String
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. },
@@ -970,9 +971,10 @@ pub(super) fn known_distinct(
 			_,
 			Type::Error
 			| Type::Infer
-			| Type::Integer
-			| Type::Float
-			| Type::String
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::TypeParam { .. }
 			| Type::AssocTypeProjection { .. },
@@ -1137,7 +1139,7 @@ mod tests {
 	/// Pushes each value as a clause on one projection, returning the values
 	/// kept and the conflicts found.
 	fn push(values: &[TypeIndex]) -> (Vec<EqualityClause>, usize) {
-		let types = TypeInterner::new();
+		let types = TypeInterner::for_tests();
 		let (mut out, mut conflicts) = (Vec::new(), Vec::new());
 		for (index, &value) in values.iter().enumerate() {
 			let written_since = out.len();
@@ -1187,7 +1189,7 @@ mod tests {
 	/// declaration reported them: inheriting them reports nothing.
 	#[test]
 	fn a_conflict_within_one_supertraits_clauses_is_not_reported_again() {
-		let types = TypeInterner::new();
+		let types = TypeInterner::for_tests();
 		let (mut out, mut conflicts) = (Vec::new(), Vec::new());
 		for (index, value) in
 			[TypeIndex::U32, TypeIndex::U64].into_iter().enumerate()
@@ -1206,7 +1208,7 @@ mod tests {
 
 	#[test]
 	fn distinct_declarations_of_one_kind_are_known_distinct() {
-		let mut types = TypeInterner::new();
+		let mut types = TypeInterner::for_tests();
 		let [a, b] = [0, 1].map(|index| {
 			types.intern(Type::Enum {
 				enum_index: EnumIdx::new(index),

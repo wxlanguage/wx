@@ -30,13 +30,11 @@ pub(super) enum Scalar {
 	I64,
 	F32,
 	F64,
-	Bool,
-	Char,
 }
 
 impl Scalar {
 	#[cfg(test)]
-	pub(super) const ALL: [Scalar; 12] = [
+	pub(super) const ALL: [Scalar; 10] = [
 		Self::U8,
 		Self::I8,
 		Self::U16,
@@ -47,8 +45,6 @@ impl Scalar {
 		Self::I64,
 		Self::F32,
 		Self::F64,
-		Self::Bool,
-		Self::Char,
 	];
 
 	pub(super) fn from_type(ty: TypeIndex) -> Option<Self> {
@@ -63,8 +59,6 @@ impl Scalar {
 			TypeIndex::I64 => Self::I64,
 			TypeIndex::F32 => Self::F32,
 			TypeIndex::F64 => Self::F64,
-			TypeIndex::BOOL => Self::Bool,
-			TypeIndex::CHAR => Self::Char,
 			_ => return None,
 		})
 	}
@@ -81,8 +75,6 @@ impl Scalar {
 			Self::I64 => TypeIndex::I64,
 			Self::F32 => TypeIndex::F32,
 			Self::F64 => TypeIndex::F64,
-			Self::Bool => TypeIndex::BOOL,
-			Self::Char => TypeIndex::CHAR,
 		}
 	}
 
@@ -110,9 +102,8 @@ impl Scalar {
 		match self {
 			Self::U8 | Self::I8 => 8,
 			Self::U16 | Self::I16 => 16,
-			Self::U32 | Self::I32 | Self::F32 | Self::Char => 32,
+			Self::U32 | Self::I32 | Self::F32 => 32,
 			Self::U64 | Self::I64 | Self::F64 => 64,
-			Self::Bool => 1,
 		}
 	}
 }
@@ -120,7 +111,7 @@ impl Scalar {
 /// Whether the compiler implements `op` natively on `ty`, a primitive
 /// scalar; `false` for any other type. Mirrors the stdlib's primitive impls of
 /// the operator traits exactly (`primitive_operators_match_the_stdlib_impls`);
-/// `&&`/`||` are not overloadable and exist only on `bool`.
+/// `&&`/`||` are not overloadable and are checked before this is asked.
 pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
 	let Some(scalar) = Scalar::from_type(ty) else {
 		return false;
@@ -132,18 +123,20 @@ pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
 		| BinaryOp::Mul
 		| BinaryOp::Div
 		| BinaryOp::Rem => numeric,
-		BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
-			scalar.is_integer() || scalar == Scalar::Bool
-		}
-		BinaryOp::LeftShift | BinaryOp::RightShift => scalar.is_integer(),
+		BinaryOp::BitAnd
+		| BinaryOp::BitOr
+		| BinaryOp::BitXor
+		| BinaryOp::LeftShift
+		| BinaryOp::RightShift => scalar.is_integer(),
 		BinaryOp::Eq
 		| BinaryOp::NotEq
 		| BinaryOp::Less
 		| BinaryOp::LessEq
 		| BinaryOp::Greater
 		| BinaryOp::GreaterEq => true,
-		BinaryOp::And | BinaryOp::Or => scalar == Scalar::Bool,
-		BinaryOp::Assign
+		BinaryOp::And
+		| BinaryOp::Or
+		| BinaryOp::Assign
 		| BinaryOp::AddAssign
 		| BinaryOp::SubAssign
 		| BinaryOp::MulAssign
@@ -165,11 +158,11 @@ pub(super) fn is_primitive_unary(op: UnaryOp, ty: TypeIndex) -> bool {
 	match op {
 		UnaryOp::InvertSign => scalar.is_float() || scalar.is_signed(),
 		UnaryOp::BitNot => scalar.is_integer(),
-		UnaryOp::Not => scalar == Scalar::Bool,
+		UnaryOp::Not => false,
 	}
 }
 
-/// Comparisons answer `bool`; every other operator answers its operand type.
+/// Comparisons answer `Bool`; every other operator answers its operand type.
 pub(super) fn is_comparison(op: BinaryOp) -> bool {
 	matches!(
 		op,

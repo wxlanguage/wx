@@ -1467,36 +1467,18 @@ mod tests {
 	use crate::tir::defs::{AstEntry, DefinitionRegistry};
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
+	use crate::tir::signatures::tests::source_graph;
 	use crate::tir::solver::Solver;
 	use crate::vfs::{self, FileId, Files};
 
 	/// `test_case!(case = "source")` declares the graph, the inputs and the
 	/// swept `TestCase` borrowing them as three locals of the calling test.
-	/// The source plays the stdlib's role, so it declares the primitives and
-	/// traits it uses.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut graph = source_graph($source);
 			let mut inputs = TestInputs::new(&mut graph);
 			let $case = TestCase::new(&mut inputs);
 		};
-	}
-
-	fn source_graph(source: &str) -> vfs::CompilationUnit {
-		let mut builder = vfs::CompilationUnitBuilder::new();
-		let root_id = builder
-			.load_binary(
-				vfs::AbsolutePath::new("/main.wx"),
-				&vfs::VirtualFileSource::from_relative(
-					std::collections::HashMap::from([(
-						"main.wx".to_string(),
-						source.to_string(),
-					)]),
-				),
-			)
-			.unwrap();
-		builder.set_stdlib(root_id);
-		builder.build(root_id)
 	}
 
 	/// Everything a `TypeContext` borrows, kept on the test's stack.
@@ -1596,8 +1578,6 @@ mod tests {
 	fn an_associated_type_value_satisfies_its_declared_bound() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait Size {}
 			impl Size for u32 {}
 			trait Container { type Item: Size; }
@@ -1612,8 +1592,6 @@ mod tests {
 	fn an_associated_type_value_violating_its_declared_bound_is_reported() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Size {}
 			trait Container { type Item: Size; }
 			struct Bag();
@@ -1630,8 +1608,6 @@ mod tests {
 	fn an_inherited_default_is_checked_against_the_bound_per_impl() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Size {}
 			trait Container { type Item: Size = u8; }
 			struct Bag();
@@ -1648,8 +1624,6 @@ mod tests {
 	fn an_impl_of_an_unresolved_target_still_checks_its_values() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Size {}
 			trait Container: Size { type Item: Size; func f(self: Self); }
 			impl Container for Missing { type Item = u8; func f(self: Self) {} }
@@ -1667,7 +1641,6 @@ mod tests {
 	fn a_value_naming_an_impl_parameter_needs_the_parameter_bounded() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Size {}
 			trait Container { type Item: Size; }
 			struct Bounded<T>();
@@ -1686,9 +1659,6 @@ mod tests {
 	fn a_nested_equality_on_an_associated_type_is_proved_for_the_value() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
-			type u32;
 			trait Inner { type Value; }
 			struct Good();
 			struct Bad();
@@ -1709,7 +1679,6 @@ mod tests {
 	fn an_impl_requires_its_traits_supertraits() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Base {}
 			trait Derived: Base {}
 			struct Both();
@@ -1730,7 +1699,6 @@ mod tests {
 	fn a_generic_impl_proves_its_supertraits_with_its_own_bounds() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Marker {}
 			trait Base {}
 			trait Derived: Base {}
@@ -1753,9 +1721,6 @@ mod tests {
 	fn a_supertraits_binding_is_proved_for_the_target() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
-			type u32;
 			trait Base { type Out; }
 			trait Derived: Base where { Out = u32 } {}
 			struct Good();
@@ -1780,8 +1745,6 @@ mod tests {
 	}
 
 	const PRELUDE: &str = "
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
-		type u8; type u16; type u32; type u64;
 		struct Box<T>();
 	";
 

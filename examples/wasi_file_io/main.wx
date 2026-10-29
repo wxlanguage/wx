@@ -63,15 +63,15 @@ impl Allocator for BumpAllocator {
   type Mem = heap;
 
   func reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
-    local ptr = ptr::align_up::<Self::Mem>(bump as u32, layout.align());
+    local ptr = ptr::align_up::<Self::Mem>(transmute(bump), layout.align());
     local new_end = ptr + layout.size();
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
       local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
       if heap.grow(needed) == -1 { trap() }
     }
-    bump = new_end as *u8;
-    ptr as *u8
+    bump = transmute(new_end);
+    transmute(ptr)
   }
 }
 
@@ -99,7 +99,7 @@ func main() {
   );
   if create_result != Errno::Success { trap() };
 
-  local created_fd = created_fd_ptr.* as FileDescriptor;
+  local created_fd: FileDescriptor = transmute(created_fd_ptr.*);
   write_all(created_fd, "Hello from wx, written straight to disk!\n");
   if wasi::fd_close(created_fd) != Errno::Success { trap() };
 
@@ -116,7 +116,7 @@ func main() {
   );
   if open_result != Errno::Success { trap() };
 
-  local read_fd = read_fd_ptr.* as FileDescriptor;
+  local read_fd: FileDescriptor = transmute(read_fd_ptr.*);
   local buf = alloc.alloc_slice::<u8>(256);
   local io_vecs = alloc.alloc_slice::<*[u8]>(1);
   io_vecs[0] = buf;

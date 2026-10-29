@@ -296,7 +296,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> ExprIdx {
 		let receiver = self.build(object, TypeIndex::INFER);
 		let receiver_ty = self.body.ty(receiver);
-		if self.cx.types.has_untyped(receiver_ty) {
+		if self.cx.types.has_literal(receiver_ty) {
 			self.report_annotation_required(receiver);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}

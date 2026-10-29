@@ -54,8 +54,8 @@ func medium(x: f64, ix: u64) -> (i32, f64, f64) {
 
     // Compare `x`'s exponent against the remainder's: a large drop means the subtraction
     // cancelled away most of the significand, and the next piece of pi/2 is needed.
-    local ex = (ix >> 20) as i64;
-    local ey = ((y0.to_bits() >> 52) & 0x7ff) as i64;
+    local ex = transmute::<_, i64>(ix >> 20);
+    local ey = transmute::<_, i64>((y0.to_bits() >> 52) & 0x7ff);
 
     if ex - ey > 16 {
         // 2nd round, good to 118 bits.
@@ -65,7 +65,7 @@ func medium(x: f64, ix: u64) -> (i32, f64, f64) {
         w = f_n * PIO2_2T - ((t - r) - w);
         y0 = r - w;
 
-        local ey = ((y0.to_bits() >> 52) & 0x7ff) as i64;
+        local ey = transmute::<_, i64>((y0.to_bits() >> 52) & 0x7ff);
         if ex - ey > 49 {
             // 3rd round, good to 151 bits — covers all cases.
             local t = r;

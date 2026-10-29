@@ -1124,7 +1124,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let Type::Function { .. } = self.cx.types.resolve(ty) {
 			return Some(ValueCallee::Call(over_self(self.cx)));
 		}
-		let found = if self.cx.types.has_untyped(ty) {
+		let found = if self.cx.types.has_literal(ty) {
 			Ok(None)
 		} else {
 			self.cx

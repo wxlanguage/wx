@@ -3,9 +3,9 @@
 //! constant's or global's initializer, or a function's block.
 //!
 //! Blocks, locals and control flow are in `blocks`, patterns in `patterns`,
-//! places and assignment in `places`, function calls in `calls`, casts in
-//! `casts`. A form the checker does not cover yet
-//! is reported once (`UnsupportedExpression`) and checked as an error node.
+//! places and assignment in `places`, function calls in `calls`. A form the
+//! checker does not cover yet is reported once (`UnsupportedExpression`) and
+//! checked as an error node.
 //!
 //! Operators are checked through their trait (`OperatorTraits`): the trait
 //! decides whether the operator applies to a type. The node built for it is a
@@ -26,7 +26,6 @@
 
 mod blocks;
 mod calls;
-mod casts;
 mod exhaustiveness;
 mod members;
 mod patterns;
@@ -260,7 +259,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return expr;
 		}
 		let actual = self.body.ty(expr);
-		if self.cx.types.has_untyped(actual) {
+		if self.cx.types.has_literal(actual) {
 			self.coerce(expr, expected);
 		} else if actual != TypeIndex::ERROR
 			&& actual != TypeIndex::NEVER
@@ -388,20 +387,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> ExprIdx {
 		let span = expr.span;
 		match &expr.inner {
-			ast::Expression::Int { value } => {
-				self.body
-					.push(ExprKind::Int(*value), TypeIndex::INTEGER, span)
-			}
+			ast::Expression::Int { value } => self.body.push(
+				ExprKind::Int(*value),
+				TypeIndex::INTEGER_LITERAL,
+				span,
+			),
 			// The value is read from the source once the width is known.
-			ast::Expression::Float => {
-				self.body.push(ExprKind::Float(0.0), TypeIndex::FLOAT, span)
-			}
-			ast::Expression::True => {
-				self.body.push(ExprKind::Bool(true), TypeIndex::BOOL, span)
-			}
-			ast::Expression::False => {
-				self.body.push(ExprKind::Bool(false), TypeIndex::BOOL, span)
-			}
+			ast::Expression::Float => self.body.push(
+				ExprKind::Float(0.0),
+				TypeIndex::FLOAT_LITERAL,
+				span,
+			),
 			ast::Expression::Char => self.build_char(span),
 			ast::Expression::Unary { operator, operand } => {
 				self.build_unary(*operator, operand, expected, span)
@@ -430,8 +426,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Tuple { elements } => {
 				self.build_tuple(elements, expected, span)
 			}
-			ast::Expression::Block { statements } => {
-				self.build_block(statements, expected, None, span)
+			ast::Expression::Block { label, statements } => {
+				let label = label.map(|name| {
+					self.body.push_label(super::body::Label { name })
+				});
+				self.build_block(statements, expected, label, span)
 			}
 			ast::Expression::IfElse {
 				condition,
@@ -442,14 +441,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				then_block,
 				else_block.as_deref(),
 				expected,
-				None,
 				span,
 			),
-			ast::Expression::Loop { block } => {
-				self.build_loop(block, expected, None, span)
-			}
-			ast::Expression::Label { label, block } => {
-				self.build_labelled(*label, block, expected, span)
+			ast::Expression::Loop { label, block } => {
+				let label = label.map(|name| {
+					self.body.push_label(super::body::Label { name })
+				});
+				self.build_loop(block, expected, label, span)
 			}
 			ast::Expression::Break { label, value } => {
 				self.build_break(*label, value.as_deref(), span)
@@ -481,8 +479,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Error => {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
-			ast::Expression::Cast { value, ty } => {
-				self.build_cast(value, ty, expected, span)
+			ast::Expression::Ascription { value, ty } => {
+				self.build_ascription(value, ty)
 			}
 			ast::Expression::MethodCall(call) => self.build_method_call(
 				&call.object,
@@ -635,7 +633,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
 				Some(self.body.push(
 					ExprKind::Int(*value),
-					TypeIndex::INTEGER,
+					TypeIndex::INTEGER_LITERAL,
 					count.span,
 				))
 			}
@@ -677,7 +675,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// A string literal stays untyped (`Type::String`) until its context
+	/// A string literal stays untyped (`Type::StringLiteral`) until its context
 	/// gives it a byte slice or a byte array (`coerce`).
 	fn build_string(&mut self, span: TextSpan) -> ExprIdx {
 		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
@@ -686,7 +684,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				let symbol = self.cx.strings.get_or_intern(contents);
 				let expr = self.body.push(
 					ExprKind::String(symbol),
-					TypeIndex::STRING,
+					TypeIndex::STRING_LITERAL,
 					span,
 				);
 				self.body.push_static(expr);
@@ -704,9 +702,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn build_char(&mut self, span: TextSpan) -> ExprIdx {
 		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
 		match parse_char_literal(span.extract_str(source)) {
-			Ok(value) => {
-				self.body.push(ExprKind::Char(value), TypeIndex::CHAR, span)
-			}
+			Ok(value) => self.body.push(
+				ExprKind::Char(value),
+				TypeIndex::CHAR_LITERAL,
+				span,
+			),
 			Err(error) => {
 				let message = match error {
 					CharLiteralError::Empty => "empty character literal",
@@ -1490,14 +1490,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// untyped until context coerces both.
 		let operand = self.build(operand, expected);
 		let ty = self.body.ty(operand);
-		if ty == TypeIndex::STRING || ty == TypeIndex::ARRAY_LITERAL {
+		if ty == TypeIndex::STRING_LITERAL || ty == TypeIndex::ARRAY_LITERAL {
 			return self.report_operator_on_literal(
 				op.inner.as_str(),
 				operand,
 				span,
 			);
 		}
-		if ty.is_untyped() {
+		if ty.is_literal() {
 			return self.body.push(
 				ExprKind::PrimitiveUnary {
 					op: op.inner,
@@ -1551,7 +1551,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			_ => {}
 		}
 		// An arithmetic or bitwise method returns `Self`, so its operands are
-		// expected to have the result's type; a comparison returns `bool`
+		// expected to have the result's type; a comparison returns `Bool`
 		// whatever they are.
 		let expected = if is_comparison(op.inner) {
 			TypeIndex::INFER
@@ -1563,20 +1563,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// be, and below, a typed side gives its type to an untyped one.
 		let lhs = self.build(left, expected);
 		let left_ty = self.body.ty(lhs);
-		let rhs = if self.cx.types.has_untyped(left_ty) {
+		let rhs = if self.cx.types.has_literal(left_ty) {
 			self.build(right, expected)
 		} else {
 			self.build(right, left_ty)
 		};
 		let right_ty = self.body.ty(rhs);
 		let operand_ty = match (
-			self.cx.types.has_untyped(left_ty),
-			self.cx.types.has_untyped(right_ty),
+			self.cx.types.has_literal(left_ty),
+			self.cx.types.has_literal(right_ty),
 		) {
 			(true, true) => {
 				// A string or array literal has no operators of its own.
 				for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
-					if ty == TypeIndex::STRING || ty == TypeIndex::ARRAY_LITERAL
+					if ty == TypeIndex::STRING_LITERAL
+						|| ty == TypeIndex::ARRAY_LITERAL
 					{
 						return self.report_operator_on_literal(
 							op.inner.as_str(),
@@ -1603,16 +1604,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						span,
 					);
 				}
-				// Two literals are a float if either is; anything else untyped
-				// (a tuple of literals) keeps the left side's shape.
-				let ty = if !left_ty.is_untyped() || !right_ty.is_untyped() {
+				// Two literals are a character if either is, else a float if
+				// either is; anything else untyped (a tuple of literals) keeps
+				// the left side's shape.
+				let ty = if !left_ty.is_literal() || !right_ty.is_literal() {
 					left_ty
-				} else if left_ty == TypeIndex::FLOAT
-					|| right_ty == TypeIndex::FLOAT
+				} else if left_ty == TypeIndex::CHAR_LITERAL
+					|| right_ty == TypeIndex::CHAR_LITERAL
 				{
-					TypeIndex::FLOAT
+					TypeIndex::CHAR_LITERAL
+				} else if left_ty == TypeIndex::FLOAT_LITERAL
+					|| right_ty == TypeIndex::FLOAT_LITERAL
+				{
+					TypeIndex::FLOAT_LITERAL
 				} else {
-					TypeIndex::INTEGER
+					TypeIndex::INTEGER_LITERAL
 				};
 				return self.body.push(
 					ExprKind::PrimitiveBinary {
@@ -1883,6 +1889,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
+	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
+	/// when the stdlib declares no `Memory`.
+	fn memory_size(&mut self, memory: TypeIndex) -> TypeIndex {
+		let Some(projection) = self.cx.memory_size(memory) else {
+			return TypeIndex::ERROR;
+		};
+		self.normalized(projection, self.scope.env)
+	}
+
 	/// Every member of every typeset an abstract `target` assumes, any of
 	/// which can be substituted for it. Empty when no literal can have type
 	/// `target`.
@@ -1938,7 +1953,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				..
 			} => {
 				for branch in [then_block, else_block] {
-					if self.cx.types.has_untyped(self.body.ty(branch)) {
+					if self.cx.types.has_literal(self.body.ty(branch)) {
 						self.coerce(branch, target);
 					}
 				}
@@ -1948,7 +1963,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				let bodies: Vec<ExprIdx> =
 					self.body.arms(arms).iter().map(|arm| arm.body).collect();
 				for arm in bodies {
-					if self.cx.types.has_untyped(self.body.ty(arm)) {
+					if self.cx.types.has_literal(self.body.ty(arm)) {
 						self.coerce(arm, target);
 					}
 				}
@@ -1956,9 +1971,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			_ => {}
 		}
-		// The common case: one concrete number, held on the stack.
+		// The common case: one concrete scalar, held on the stack.
 		if Integer::from_type(target).is_some()
 			|| Float::from_type(target).is_some()
+			|| target == TypeIndex::CHAR
 		{
 			let single = [LiteralTarget::Target(target)];
 			return self.coerce_against(expr, target, &single);
@@ -1986,6 +2002,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.coerce_int(expr, expr, target, targets, value, false);
 			}
 			ExprKind::Float(_) => self.coerce_float(expr, target, targets),
+			ExprKind::Char(value) => {
+				self.coerce_char(expr, target, targets, value)
+			}
 			ExprKind::PrimitiveUnary { op, operand } => {
 				for fit in targets {
 					if !fit.fits_unary(op) {
@@ -2132,6 +2151,43 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.set_ty(expr, target);
 	}
 
+	/// A character literal is a `Char`, or an integer its code point fits,
+	/// which it then is.
+	fn coerce_char(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		targets: &[LiteralTarget],
+		value: char,
+	) {
+		let code_point = u64::from(value);
+		for fit in targets {
+			if fit.ty() == TypeIndex::CHAR {
+				continue;
+			}
+			match Integer::from_type(fit.ty()) {
+				Some(integer) if integer.in_range(code_point, false) => {}
+				Some(_) if matches!(fit, LiteralTarget::Target(_)) => {
+					let message = format!(
+						"character literal {value:?} out of range for `{}`",
+						self.cx.type_formatter().display_type(target)
+					);
+					self.push_error(
+						DiagnosticCode::IntegerLiteralOutOfRange,
+						message,
+						expr,
+					);
+					return;
+				}
+				_ => return self.report_misfit(expr, target, fit),
+			}
+		}
+		if target != TypeIndex::CHAR {
+			self.body.set_kind(expr, ExprKind::Int(code_point));
+		}
+		self.body.set_ty(expr, target);
+	}
+
 	/// A float literal `fit` cannot hold: too large or too small for its width.
 	fn report_float(
 		&mut self,
@@ -2185,7 +2241,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				expr,
 			);
 		} else {
-			// A concrete type that is neither integer nor float (bool, char)
+			// A concrete type that is neither integer nor float (`Bool`, `Char`)
 			// has no integer proof, just as a typeset member has none.
 			self.report_misfit(expr, target, fit);
 		}
@@ -2483,7 +2539,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		operand: ExprIdx,
 		span: TextSpan,
 	) -> ExprIdx {
-		let (noun, note) = if self.body.ty(operand) == TypeIndex::STRING {
+		let (noun, note) = if self.body.ty(operand) == TypeIndex::STRING_LITERAL
+		{
 			("a string literal", STRING_TARGETS_NOTE)
 		} else {
 			("an array literal", ARRAY_TARGETS_NOTE)
@@ -3022,7 +3079,6 @@ mod tests {
 				ExprKind::Error => "error".to_string(),
 				ExprKind::Int(value) => value.to_string(),
 				ExprKind::Float(value) => format!("{value:?}"),
-				ExprKind::Bool(value) => value.to_string(),
 				ExprKind::Char(value) => format!("{value:?}"),
 				ExprKind::String(contents) => {
 					format!(
@@ -3148,10 +3204,6 @@ mod tests {
 						.field_types
 						.len();
 					self.render_arguments(body, name, count, fields)
-				}
-				ExprKind::Cast { value } => {
-					let ty = self.display(body.ty(expr));
-					format!("(as {} {ty})", self.render(body, value))
 				}
 				ExprKind::FieldAccess { object, field } => format!(
 					"(. {} {})",
@@ -3331,7 +3383,6 @@ mod tests {
 						bits.to_string()
 					}
 				}
-				PatternKind::Bool(value) => value.to_string(),
 				PatternKind::Char(value) => format!("{value:?}"),
 				PatternKind::Constant {
 					constant,
@@ -3566,6 +3617,71 @@ mod tests {
 	}
 
 	#[test]
+	fn a_character_literal_is_a_char_or_an_integer_it_fits() {
+		test_case!(
+			case = indoc! {"
+				func c() -> Char { 'a' }
+				func b() -> u8 { 'a' }
+				func w() -> u16 { '€' }
+				func digit(d: u8) -> u8 { d + '0' }
+				func next() -> u8 { 'a' + 1 }
+				func any<T: Integer>() -> T { 'a' }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("c"), "(block => 'a')");
+		assert_eq!(case.shape("b"), "(block => 97)");
+		assert_eq!(case.shape("w"), "(block => 8364)");
+		assert_eq!(case.shape("next"), "(block => (+ 97 1))");
+	}
+
+	#[test]
+	fn a_character_literal_must_fit_its_integer() {
+		test_case!(case = "func f() -> u8 { '€' }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+		case.diagnostics()
+			.assert_error_saying("character literal '€' out of range for `u8`");
+		test_case!(case = "func f<T: Integer>() -> T { '€' }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypesetBoundViolation]);
+	}
+
+	#[test]
+	fn a_character_literal_is_no_float_and_has_no_default() {
+		test_case!(case = "func f() -> f32 { 'a' }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
+		test_case!(case = "func f() { local c = 'a'; }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+		test_case!(case = "func f() -> Char { 'a' + 1 }");
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn a_character_pattern_compares_an_integer_by_code_point() {
+		test_case!(
+			case = indoc! {"
+				func f(b: u8) -> u32 { match b { 'a' -> { 1 }, _ -> { 0 } } }
+				func g(c: Char) -> u32 { match c { 'a' -> { 1 }, _ -> { 0 } } }
+			"}
+		);
+		case.diagnostics().assert_none();
+		test_case!(
+			case =
+				"func f(b: u8) -> u32 { match b { '€' -> { 1 }, _ -> { 0 } } }"
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+		case.diagnostics()
+			.assert_error_saying("character literal '€' out of range for `u8`");
+	}
+
+	#[test]
 	fn a_later_local_shadows_an_earlier_one_from_its_declaration_on() {
 		test_case!(
 			case = "func f() -> u32 { local x: u32 = 1; local x = x + 1; x }"
@@ -3630,11 +3746,11 @@ mod tests {
 	fn if_branches_share_a_type() {
 		test_case!(
 			case = indoc! {"
-				func pick(c: bool, a: u8) -> u8 { if c { a } else { 1 } }
-				func nested(c: bool) -> u16 { if c { 1 } else { if !c { 2 } else { 3 } } }
-				func diverging(c: bool, a: u8) -> u8 { if c { return a; } else { a } }
-				func statement(c: bool) { if c { pick(c, 1); } }
-				func untyped(c: bool) { local x: i64 = if c { 1 } else { 2 }; }
+				func pick(c: Bool, a: u8) -> u8 { if c { a } else { 1 } }
+				func nested(c: Bool) -> u16 { if c { 1 } else { if !c { 2 } else { 3 } } }
+				func diverging(c: Bool, a: u8) -> u8 { if c { return a; } else { a } }
+				func statement(c: Bool) { if c { pick(c, 1); } }
+				func untyped(c: Bool) { local x: i64 = if c { 1 } else { 2 }; }
 			"}
 		);
 		case.diagnostics()
@@ -3673,7 +3789,7 @@ mod tests {
 	fn an_untyped_branch_takes_the_other_branchs_type() {
 		test_case!(
 			case =
-				"func f(c: bool, a: u8) { local x = if c { 1 } else { a }; }"
+				"func f(c: Bool, a: u8) { local x = if c { 1 } else { a }; }"
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(case.locals("f")[2], ("x".into(), "u8".into()));
@@ -3684,8 +3800,8 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func condition(a: u8) { if a { } }
-				func mismatch(c: bool, a: u8, b: u16) { local x = if c { a } else { b }; }
-				func missing_else(c: bool, a: u8) -> u8 { if c { a } }
+				func mismatch(c: Bool, a: u8, b: u16) { local x = if c { a } else { b }; }
+				func missing_else(c: Bool, a: u8) -> u8 { if c { a } }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -3731,7 +3847,7 @@ mod tests {
 	fn break_values_must_agree() {
 		test_case!(
 			case = indoc! {"
-				func f(c: bool, a: u8, b: u16) {
+				func f(c: Bool, a: u8, b: u16) {
 					local x = loop { if c { break a; } break b; };
 				}
 				func untyped() { local x = loop { break 1; }; }
@@ -3747,22 +3863,19 @@ mod tests {
 	fn a_label_names_the_scope_a_jump_leaves() {
 		test_case!(
 			case = indoc! {"
-				func f(c: bool) -> u32 {
-					outer: loop {
+				func f(c: Bool) -> u32 {
+					loop :outer {
 						loop {
 							if c { break :outer 1; }
 							continue :outer;
 						}
 					}
 				}
-				func labelled_block(c: bool) -> u8 {
-					found: block {
+				func labelled_block(c: Bool) -> u8 {
+					block :found {
 						if c { break :found 1; }
 						2
 					}
-				}
-				func labelled_if(c: bool) -> u8 {
-					l: if c { break :l 1; } else { 2 }
 				}
 			"}
 		);
@@ -3777,29 +3890,41 @@ mod tests {
 			case.shape("labelled_block"),
 			"(block => (block (if c#0 (block (break found 1))) => 2))"
 		);
-		// Both branches of a labelled `if` share its label.
-		let body = case.body("labelled_if");
-		let ExprKind::Block {
-			result: Some(branching),
-			..
-		} = body.kind(body.root())
-		else {
-			unreachable!()
-		};
-		let ExprKind::IfElse {
-			then_block,
-			else_block: Some(else_block),
-			..
-		} = body.kind(branching)
-		else {
-			unreachable!()
-		};
-		let scope_of = |block| match body.kind(block) {
-			ExprKind::Block { scope, .. } => body.scope(scope).label,
-			_ => unreachable!(),
-		};
-		assert!(scope_of(then_block).is_some());
-		assert_eq!(scope_of(then_block), scope_of(else_block));
+	}
+
+	#[test]
+	fn an_ascription_checks_its_value_against_its_type() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(t: T) -> T { t }
+				func literal() -> u8 { (5: u8) }
+				func inferred() { local x = id(5: u16); }
+				func elements() { local t = (1: u8, 2: u16); }
+			"}
+		);
+		case.diagnostics().assert_none();
+		// It leaves no node of its own.
+		assert_eq!(case.shape("literal"), "(block => 5)");
+		assert_eq!(case.body_type("literal"), "u8");
+		assert_eq!(case.locals("inferred"), [("x".into(), "u16".into())]);
+		assert_eq!(case.locals("elements"), [("t".into(), "(u8, u16)".into())]);
+	}
+
+	#[test]
+	fn an_ascription_converts_nothing() {
+		test_case!(
+			case = indoc! {"
+				func takes(x: u16) {}
+				func widened(a: u8) -> u16 { (a: u16) }
+				func argument() { takes(1: u8); }
+				func out_of_range() { local x = (300: u8); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
 	}
 
 	#[test]
@@ -3809,7 +3934,7 @@ mod tests {
 				func outside() { break; }
 				func outside_continue() { continue; }
 				func unknown() { loop { break :nowhere; } }
-				func not_a_loop() { l: block { continue :l; } }
+				func not_a_loop() { block :l { continue :l; } }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -3822,7 +3947,7 @@ mod tests {
 
 	#[test]
 	fn a_labelled_jump_is_recorded_as_a_reference_to_its_label() {
-		const SOURCE: &str = "func f() { outer: loop { break :outer; } }";
+		const SOURCE: &str = "func f() { loop :outer { break :outer; } }";
 		test_case!(case = SOURCE);
 		case.diagnostics().assert_none();
 		let file_id = case
@@ -3830,7 +3955,7 @@ mod tests {
 			.namespaces
 			.file_id(Scope::Package(case.defs.root_package).into());
 		let start =
-			(STDLIB.len() + 1 + SOURCE.find(":outer").unwrap() + 1) as u32;
+			(STDLIB.len() + 1 + SOURCE.rfind(":outer").unwrap() + 1) as u32;
 		let site = (
 			crate::diagnostics::SourceSpan::new(
 				file_id,
@@ -3848,7 +3973,7 @@ mod tests {
 	fn return_gives_the_function_its_value() {
 		test_case!(
 			case = indoc! {"
-				func early(c: bool) -> u8 { if c { return 1; } 2 }
+				func early(c: Bool) -> u8 { if c { return 1; } 2 }
 				func bare() { return; }
 				func wrong() -> u8 { return; }
 				func mismatch(a: u16) -> u8 { return a; }
@@ -3940,7 +4065,7 @@ mod tests {
 				func scalar() { local mut a: u32 = 1; a += 2; a <<= 1; }
 				func overloaded(v: V) { local mut w = v; w += v; }
 				func generic<T: Add>(t: T) { local mut u = t; u += t; }
-				func missing(c: bool) { local mut d = c; d -= c; }
+				func missing(c: Bool) { local mut d = c; d -= c; }
 			"}
 		);
 		case.diagnostics()
@@ -4063,7 +4188,7 @@ mod tests {
 				func add(a: u32, b: u32) -> u32 { a + b }
 				func f() -> u32 { add(1, 2) }
 				func count() -> u32 { add(1) }
-				func mismatch(c: bool) -> u32 { add(c, 2) }
+				func mismatch(c: Bool) -> u32 { add(c, 2) }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -4087,7 +4212,7 @@ mod tests {
 				func from_turbofish() { local x = zero::<i64>(); }
 				func from_result() -> u32 { zero() }
 				func nothing() { _ = zero(); }
-				func unsatisfied() { local x = zero::<bool>(); }
+				func unsatisfied() { local x = zero::<Bool>(); }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -4400,7 +4525,7 @@ mod tests {
 			case = indoc! {"
 				func named(f: func(u32) -> u32) { _ = f({ x: 1 }); }
 				func too_many(f: func(u32, u8) -> u8) { _ = f(1, 2, 3); }
-				func wrong(f: func(u32) -> u32) { _ = f(true); }
+				func wrong(f: func(u32) -> u32) { _ = f(True); }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -4448,60 +4573,6 @@ mod tests {
 	}
 
 	#[test]
-	fn a_cast_reinterprets_a_value_of_the_same_wasm_type() {
-		test_case!(
-			case = indoc! {"
-				memory heap: u32;
-				func widen(a: u8) -> i32 { a as i32 }
-				func sign(a: i64) -> u64 { a as u64 }
-				func truth(b: bool) -> u8 { b as u8 }
-				func code(c: char) -> u32 { c as u32 }
-				func enum_value(o: Ordering) -> i8 { o as i8 }
-				func inferred(a: u16) -> u32 { a as _ }
-				func literal() -> u8 { 300 as u8 }
-				func give_up(p: heap::*u8) -> heap::&u8 { p as heap::&u8 }
-				func address(p: heap::&u8) -> u32 { p as u32 }
-				func signed_address(p: heap::&u8) -> i32 { p as i32 }
-				func from_int(a: u32) -> heap::*u8 { a as heap::*u8 }
-			"}
-		);
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
-		assert_eq!(case.shape("widen"), "(block => (as a#0 i32))");
-		assert_eq!(case.shape("inferred"), "(block => (as a#0 u32))");
-	}
-
-	#[test]
-	fn a_cast_never_changes_the_value() {
-		test_case!(
-			case = indoc! {"
-				memory heap: u32;
-				func wider(a: i32) -> i64 { a as i64 }
-				func narrower(a: u64) -> u32 { a as u32 }
-				func to_float(a: u8) -> f64 { a as f64 }
-				func to_int(f: f32) -> i32 { f as i32 }
-				func bits(f: f32) -> u32 { f as u32 }
-				func float_to_bool(f: f32) -> bool { f as bool }
-				func gain(p: heap::&u8) -> heap::*u8 { p as heap::*u8 }
-				func wide_address(p: heap::&u8) -> u64 { p as u64 }
-			"}
-		);
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-		]);
-		case.diagnostics().assert_error_saying(
-			"a cast reinterprets a value without changing it",
-		);
-	}
-
-	#[test]
 	fn a_string_literal_takes_a_byte_slice_or_array_from_its_context() {
 		test_case!(
 			case = indoc! {r#"
@@ -4510,7 +4581,7 @@ mod tests {
 				func array() -> heap::&[u8; 5] { "hello" }
 				func escaped() -> heap::&[u8; 2] { "a\n" }
 				func annotated() { local s: heap::&[u8; 3] = "abc"; }
-				func branches(c: bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
 				func tuple() -> (heap::&[u8], u8) { ("a", 1) }
 				func any_memory<Mem: Memory>() -> Mem::&[u8] { "abstract" }
 			"#}
@@ -4593,7 +4664,7 @@ mod tests {
 				func number() -> u32 { [1] }
 				func too_long() -> heap::&[u8; 2] { [1, 2, 3] }
 				func repeat_too_long() -> heap::&[u8; 2] { [0; 3] }
-				func element() -> heap::&[u8] { [true] }
+				func element() -> heap::&[u8] { [True] }
 				func count_type() -> heap::&[u8; 2] { [0; LONG] }
 				func computed(n: u32) -> heap::&[u8; 2] { [0; n] }
 				func computed_slice(n: u32) -> heap::&[u8] { [0; n] }
@@ -4620,7 +4691,7 @@ mod tests {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
-				func branches(c: bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
 				func none() -> u32 { 1 }
 			"#}
 		);
@@ -4663,8 +4734,8 @@ mod tests {
 				func untyped() { local s = "abc"; }
 				func operator() -> heap::&[u8] { "a" + "b" }
 				func negate() -> heap::&[u8] { -"a" }
-				func expected(c: bool) -> heap::&[u8] { if c { "a" } else { 1 } }
-				func joined(c: bool) { local x = if c { "a" } else { 1 }; }
+				func expected(c: Bool) -> heap::&[u8] { if c { "a" } else { 1 } }
+				func joined(c: Bool) { local x = if c { "a" } else { 1 }; }
 				func escape() -> heap::&[u8] { "\q" }
 			"#}
 		);
@@ -4685,55 +4756,49 @@ mod tests {
 	}
 
 	#[test]
-	fn a_string_literal_is_cast_to_what_it_can_become() {
+	fn a_string_literal_is_ascribed_what_it_can_become() {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
-				func array() -> heap::&[u8; 3] { "abc" as heap::&[u8; 3] }
-				func slice() -> heap::&[u8] { "abc" as heap::&[u8] }
-				func number() -> u32 { "abc" as u32 }
-				func exclusive() -> heap::*[u8] { "abc" as heap::*[u8] }
-				func length() -> heap::&[u8; 2] { "abc" as heap::&[u8; 2] }
+				func array() -> heap::&[u8; 3] { ("abc": heap::&[u8; 3]) }
+				func slice() -> heap::&[u8] { ("abc": heap::&[u8]) }
+				func number() -> u32 { ("abc": u32) }
+				func exclusive() -> heap::*[u8] { ("abc": heap::*[u8]) }
+				func length() -> heap::&[u8; 2] { ("abc": heap::&[u8; 2]) }
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::ArraySizeMismatch,
 		]);
-		assert_eq!(
-			case.shape("array"),
-			r#"(block => (as "abc" heap::&[u8; 3]))"#
-		);
+		assert_eq!(case.shape("array"), r#"(block => "abc")"#);
 	}
 
 	#[test]
-	fn an_array_literal_is_cast_to_what_it_can_become() {
+	fn an_array_literal_is_ascribed_what_it_can_become() {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
-				func array() -> heap::&[u8; 2] { [1, 2] as heap::&[u8; 2] }
-				func slice() -> heap::&[u32] { [1, 2] as heap::&[u32] }
-				func repeat() -> heap::&[u8; 3] { [0; 3] as heap::&[u8; 3] }
-				func inferred() { local a = [1] as heap::&[u16]; }
-				func number() -> u32 { [1] as u32 }
-				func pointer() -> heap::*u32 { [1] as heap::*u32 }
-				func exclusive() -> heap::*[u8] { [1] as heap::*[u8] }
-				func length() -> heap::&[u8; 2] { [1] as heap::&[u8; 2] }
-				func element() -> heap::&[u8] { [true] as heap::&[u8] }
+				func array() -> heap::&[u8; 2] { ([1, 2]: heap::&[u8; 2]) }
+				func slice() -> heap::&[u32] { ([1, 2]: heap::&[u32]) }
+				func repeat() -> heap::&[u8; 3] { ([0; 3]: heap::&[u8; 3]) }
+				func inferred() { local a = ([1]: heap::&[u16]); }
+				func number() -> u32 { ([1]: u32) }
+				func pointer() -> heap::*u32 { ([1]: heap::*u32) }
+				func exclusive() -> heap::*[u8] { ([1]: heap::*[u8]) }
+				func length() -> heap::&[u8; 2] { ([1]: heap::&[u8; 2]) }
+				func element() -> heap::&[u8] { ([True]: heap::&[u8]) }
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
-			DiagnosticCode::InvalidCast,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::ArraySizeMismatch,
 			DiagnosticCode::TypeMistmatch,
 		]);
-		assert_eq!(
-			case.shape("array"),
-			"(block => (as (array 1 2) heap::&[u8; 2]))"
-		);
+		assert_eq!(case.shape("array"), "(block => (array 1 2))");
 		assert_eq!(
 			case.locals("inferred"),
 			[("a".into(), "heap::&[u16]".into())]
@@ -4763,7 +4828,7 @@ mod tests {
 				const N: u32 = 2;
 				func literal(a: heap::&[u8; 2]) {}
 				func constant(a: heap::&[u8; N]) {}
-				func not_integer(a: heap::&[u8; true]) {}
+				func not_integer(a: heap::&[u8; True]) {}
 				func too_long(a: heap::&[u8; 5000000000]) {}
 				func long(a: wide::&[u8; 5000000000]) {}
 			"#}
@@ -4902,7 +4967,7 @@ mod tests {
 			case = indoc! {r#"
 				memory heap: u32;
 				const N: u32 = 4;
-				const IN_CONSTANT: (heap::&[u8; N], u8) = ("ab", true);
+				const IN_CONSTANT: (heap::&[u8; N], u8) = ("ab", True);
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
@@ -4914,7 +4979,7 @@ mod tests {
 				memory heap: u32;
 				const N: u32 = 4;
 				func in_function() {
-					local t: (heap::&[u8; N], u8) = ("ab", true);
+					local t: (heap::&[u8; N], u8) = ("ab", True);
 				}
 			"#}
 		);
@@ -4976,9 +5041,9 @@ mod tests {
 					const YES -> { 1 },
 					const NO -> { 0 },
 				};
-				const ON: bool = true;
-				const YES: bool = true;
-				const NO: bool = false;
+				const ON: Bool = True;
+				const YES: Bool = True;
+				const NO: Bool = False;
 				const SIDE: u8 = match Side::Left {
 					Side::Left -> { 1 },
 					Side::Right -> { 2 },
@@ -5055,8 +5120,8 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				memory heap: u32;
-				func less(o: Ordering) -> bool { o == Ordering::Less }
-				func same(a: heap::&u8, b: heap::&u8) -> bool { a != b }
+				func less(o: Ordering) -> Bool { o == Ordering::Less }
+				func same(a: heap::&u8, b: heap::&u8) -> Bool { a != b }
 			"}
 		);
 		case.diagnostics().assert_none();
@@ -5066,7 +5131,7 @@ mod tests {
 	#[test]
 	fn a_constant_comparing_variants_is_evaluated() {
 		test_case!(
-			case = "const SAME: bool = Ordering::Less == Ordering::Greater;"
+			case = "const SAME: Bool = Ordering::Less == Ordering::Greater;"
 		);
 		case.diagnostics().assert_none();
 		let DefKind::Const(index) = case.resolve("SAME") else {
@@ -5114,7 +5179,7 @@ mod tests {
 			case = indoc! {r#"
 				memory heap: u32;
 				const B: heap::&[u8; A] = [0; _];
-				const A: u32 = true;
+				const A: u32 = True;
 			"#}
 		);
 		case.diagnostics()
@@ -5150,7 +5215,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				global mut hits: u32 = 0;
-				global mut flag: bool = false;
+				global mut flag: Bool = False;
 				func bump<G: GlobalMut where { Value = u32 }>(g: G) {
 					g.set(g.get() + 1);
 				}
@@ -5209,7 +5274,7 @@ mod tests {
 				trait Make { func make() -> Self; }
 				struct P();
 				impl Make for P { func make() -> Self { P() } }
-				func inherent() -> E { E::pick(true) }
+				func inherent() -> E { E::pick(True) }
 				func generic_impl(w: W<u8>) -> u8 { W::<u8>::get(w) }
 				func constructed() -> W<u16> { W::<u16>::new(1) }
 				func trait_impl() -> P { P::make() }
@@ -5217,7 +5282,7 @@ mod tests {
 			"}
 		);
 		case.diagnostics().assert_none();
-		assert_eq!(case.shape("inherent"), "(block => (call pick<bool> true))");
+		assert_eq!(case.shape("inherent"), "(block => (call pick<Bool> True))");
 		assert_eq!(case.shape("generic_impl"), "(block => (call get<u8> w#0))");
 		assert_eq!(case.shape("constructed"), "(block => (call new<u16> 1))");
 		assert_eq!(case.member_shape("again"), "(block => (call new<T> x#0))");
@@ -5265,7 +5330,7 @@ mod tests {
 				func abstract_qualified<T: Make>() -> T { <T as Make>::make() }
 				func grouped() -> W<u8> { <W<u8>>::new(1) }
 				func ambiguous() -> P { P::make() }
-				func not_implemented() -> bool { <bool as Make>::make() }
+				func not_implemented() -> Bool { <Bool as Make>::make() }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -5319,7 +5384,7 @@ mod tests {
 				impl M<u32> { pub func only() -> M<u32> { loop {} } }
 				func from_argument(a: u8) -> W<u8> { W::new(a) }
 				func from_expected() -> W<u16> { W::empty() }
-				func with_own(a: u8) -> W<bool> { W::of::<u8>() }
+				func with_own(a: u8) -> W<Bool> { W::of::<u8>() }
 				func picked() -> M<u32> { M::only() }
 				func uninferred() { W::empty(); }
 				func other_impl() -> M<u8> { M::only() }
@@ -5336,7 +5401,7 @@ mod tests {
 			"(block => (call new<u8> a#0))"
 		);
 		assert_eq!(case.shape("from_expected"), "(block => (call empty<u16>))");
-		assert_eq!(case.shape("with_own"), "(block => (call of<bool, u8>))");
+		assert_eq!(case.shape("with_own"), "(block => (call of<Bool, u8>))");
 		assert_eq!(case.shape("picked"), "(block => (call only))");
 	}
 
@@ -5349,7 +5414,7 @@ mod tests {
 				struct B<T>(x: T);
 				impl<T: Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
 				func holds(a: u8) { local b = B::new(a); }
-				func violated() { local b = B::new(true); }
+				func violated() { local b = B::new(True); }
 			"}
 		);
 		case.diagnostics()
@@ -5400,7 +5465,7 @@ mod tests {
 				impl Small for u8 {}
 				func take<T: Small>(x: T) {}
 				func holds(a: u8) { local g = take::<u8>; g(a); }
-				func violated() { local g = take::<bool>; g(true); }
+				func violated() { local g = take::<Bool>; g(True); }
 			"}
 		);
 		case.diagnostics()
@@ -5517,7 +5582,7 @@ mod tests {
 				trait Twice { func twice(self: Self) -> Self; }
 				impl Twice for u8 { func twice(self: Self) -> Self { self } }
 				func inherent(w: W<u8>) -> u8 { w.get() }
-				func own_args(w: W<u8>) -> W<bool> { w.map(true) }
+				func own_args(w: W<u8>) -> W<Bool> { w.map(True) }
 				func turbofish(w: W<u8>) -> W<u16> { w.map::<u16>(1) }
 				func trait_impl(a: u8) -> u8 { a.twice() }
 				func abstract_receiver<T: Twice>(t: T) -> T { t.twice() }
@@ -5529,7 +5594,7 @@ mod tests {
 		assert_eq!(case.shape("inherent"), "(block => (call get<u8> w#0))");
 		assert_eq!(
 			case.shape("own_args"),
-			"(block => (call map<u8, bool> w#0 true))"
+			"(block => (call map<u8, Bool> w#0 True))"
 		);
 		assert_eq!(
 			case.shape("turbofish"),
@@ -5606,14 +5671,14 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(a: u32, b: i64) -> u32 { a }
-				func id<T>(value: T, flag: bool) -> T { value }
+				func id<T>(value: T, flag: Bool) -> T { value }
 				func by_name() -> u32 {
 					local a: u32 = 1;
 					f({ b: 2, a })
 				}
 				func in_order() -> u32 { f({ a: 1, b: 2 }) }
 				func positional() -> u32 { f(1, 2) }
-				func generic(x: u8) -> u8 { id({ flag: true, value: x }) }
+				func generic(x: u8) -> u8 { id({ flag: True, value: x }) }
 			"}
 		);
 		case.diagnostics().assert_none();
@@ -5625,7 +5690,7 @@ mod tests {
 		assert_eq!(case.shape("positional"), "(block => (call f 1 2))");
 		assert_eq!(
 			case.shape("generic"),
-			"(block => (call id<u8> 1=true 0=x#0))"
+			"(block => (call id<u8> 1=True 0=x#0))"
 		);
 	}
 
@@ -5715,13 +5780,13 @@ mod tests {
 				}
 				struct W<T>(x: T);
 				impl<T> W<T> {
-					pub func new(x: T, flag: bool) -> W<T> { W(x) }
+					pub func new(x: T, flag: Bool) -> W<T> { W(x) }
 				}
 				func qualified() -> S {
 					<S as Make>::make({ scale: 1, value: 2 })
 				}
 				func generic<T: Make>() -> T { T::make({ scale: 1, value: 2 }) }
-				func learned(a: u8) -> W<u8> { W::new({ flag: true, x: a }) }
+				func learned(a: u8) -> W<u8> { W::new({ flag: True, x: a }) }
 			"}
 		);
 		case.diagnostics().assert_none();
@@ -5736,7 +5801,7 @@ mod tests {
 		);
 		assert_eq!(
 			case.shape("learned"),
-			"(block => (call new<u8> 1=true 0=a#0))"
+			"(block => (call new<u8> 1=True 0=a#0))"
 		);
 	}
 
@@ -5846,17 +5911,17 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func pair<T>(a: T, b: T) -> T { a }
-				func none<T>(flag: bool) -> T { loop {} }
+				func none<T>(flag: Bool) -> T { loop {} }
 				func g<T>(T, b: u32) -> T { loop {} }
 				struct W<T>(x: T, y: T);
 				func missing() { pair(1); }
 				func missing_by_name() { pair({ a: 1 }); }
-				func extra() { none(true, 1); }
-				func unknown_name() { none({ flag: true, other: 1 }); }
+				func extra() { none(True, 1); }
+				func unknown_name() { none({ flag: True, other: 1 }); }
 				func positional_only() { g({ b: 1 }); }
 				func construction() { W(1); }
 				func construction_by_name() { W({ x: 1 }); }
-				func uninferred() { none(true); }
+				func uninferred() { none(True); }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -5912,7 +5977,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct Point(x: u32, y: i64);
-				struct W<T>(a: T, b: bool);
+				struct W<T>(a: T, b: Bool);
 				func f(p: Point, t: (u8, (u16, u32)), w: W<u8>) {
 					local Point(x, y) = p;
 					local Point({ y: py, .. }) = p;
@@ -5938,7 +6003,7 @@ mod tests {
 			.collect();
 		assert_eq!(
 			types,
-			["u32", "i64", "i64", "u8", "u32", "u16", "u8", "bool"]
+			["u32", "i64", "i64", "u8", "u32", "u16", "u8", "Bool"]
 		);
 	}
 
@@ -6157,12 +6222,12 @@ mod tests {
 		// body is evaluated, so that is a loop, reported once.
 		test_case!(
 			case = indoc! {"
-				const A: bool = match (true) { const B -> { true }, _ -> { false } };
-				const B: bool = match (true) { const A -> { true }, _ -> { false } };
-				func f() -> bool {
-					match (true) {
-						const A -> { match (true) { const B -> { true }, _ -> { false } } },
-						_ -> { false },
+				const A: Bool = match (True) { const B -> { True }, _ -> { False } };
+				const B: Bool = match (True) { const A -> { True }, _ -> { False } };
+				func f() -> Bool {
+					match (True) {
+						const A -> { match (True) { const B -> { True }, _ -> { False } } },
+						_ -> { False },
 					}
 				}
 			"}
@@ -6375,12 +6440,12 @@ mod tests {
 			case = indoc! {"
 				const C: u8 = 1;
 				func g() {}
-				func f(x: u8, b: bool) {
+				func f(x: u8, b: Bool) {
 					local y: u8 = 1;
 					match x { const y -> {}, _ -> {} }
 					match x { const g -> {}, _ -> {} }
 					match x { 300 -> {}, -1 -> {}, _ -> {} }
-					match x { true -> {}, _ -> {} }
+					match x { const True -> {}, _ -> {} }
 					match b { const C -> {}, _ -> {} }
 					match x { 1 | z -> {}, _ -> {} }
 				}
@@ -6410,7 +6475,7 @@ mod tests {
 				func g(x: u8) -> u8 {
 					match x { 0 -> { return 0 }, _ -> { x } }
 				}
-				func h(x: u8) { local v = match x { 0 -> { 1 }, _ -> { true } }; }
+				func h(x: u8) { local v = match x { 0 -> { 1 }, _ -> { True } }; }
 			"}
 		);
 		case.diagnostics()
@@ -6441,7 +6506,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				enum Dir(u8) { North = 0, East, South, West }
-				struct P(x: bool, y: bool);
+				struct P(x: Bool, y: Bool);
 				func a(d: Dir) -> u8 {
 					match d { Dir::North -> { 0 }, Dir::East -> { 1 } }
 				}
@@ -6451,12 +6516,12 @@ mod tests {
 						Dir::South | Dir::West -> { 1 },
 					}
 				}
-				func c(x: bool, d: Dir) {
-					match (x, d) { (true, _) -> {}, (_, Dir::North) -> {} }
+				func c(x: Bool, d: Dir) {
+					match (x, d) { (const True, _) -> {}, (_, Dir::North) -> {} }
 				}
 				func i(x: u8) -> u8 { match x { 0 -> { 0 }, 1 -> { 1 } } }
 				func s(p: P) {
-					match p { P(true, _) -> {}, P(false, true) -> {} }
+					match p { P(const True, _) -> {}, P(const False, const True) -> {} }
 				}
 			"}
 		);
@@ -6471,14 +6536,16 @@ mod tests {
 			 covered",
 		);
 		case.diagnostics().assert_error_saying(
-			"non-exhaustive match: patterns `(false, Dir::East)`, \
-			 `(false, Dir::South)` and `(false, Dir::West)` not covered",
+			"non-exhaustive match: patterns `(Bool::False, Dir::East)`, \
+			 `(Bool::False, Dir::South)` and `(Bool::False, Dir::West)` not \
+			 covered",
 		);
 		case.diagnostics().assert_error_saying(
 			"non-exhaustive match: pattern `2` not covered",
 		);
 		case.diagnostics().assert_error_saying(
-			"non-exhaustive match: pattern `P(false, false)` not covered",
+			"non-exhaustive match: pattern `P(Bool::False, Bool::False)` not \
+			 covered",
 		);
 	}
 
@@ -6488,8 +6555,8 @@ mod tests {
 			case = indoc! {"
 				const ZERO: u8 = 0;
 				func u(x: u8) { match x { _ -> {}, 0 -> {} } }
-				func v(b: bool) {
-					match b { true -> {}, false -> {}, _ -> {} }
+				func v(b: Bool) {
+					match b { const True -> {}, const False -> {}, _ -> {} }
 				}
 				func w(x: u8) { match x { 0 | 1 -> {}, 1 -> {}, _ -> {} } }
 				func z(x: u8) { match x { const ZERO -> {}, 0 -> {}, _ -> {} } }

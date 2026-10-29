@@ -98,7 +98,7 @@ index_newtype!(LabelIdx);
 struct Scope {
     kind: ScopeKind,
     parent: Option<ScopeIdx>,
-    /// `outer: loop { .. }`, `outer: block { .. }`, `outer: if .. { .. }`.
+    /// `loop :outer { .. }`, `block :outer { .. }`.
     label: Option<LabelIdx>,
     span: TextSpan,
 }
@@ -749,7 +749,9 @@ Each step ends with tests in `signatures.rs`'s suite style and with no
   ordinary bodiless functions here.
 - **`as` casts** between scalars, `char`, enums to their repr, and `as _`
   from the expected type. Write the validity table fresh rather than porting
-  `are_scalar_compatible`, and close the `&T as *T` hole while at it.
+  `are_scalar_compatible`, and close the `&T as *T` hole while at it. Done, then
+  removed (2026-10-29): ascription gives a value its type and std's `transmute`
+  reinterprets one.
 - **Function items as values** and their coercion to `func(A) -> R`.
 
 After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,

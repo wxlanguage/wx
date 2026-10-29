@@ -20,29 +20,29 @@ memory heap: Memory where { Size = u32 };
 // so `DATA_END` is 0, and address 0 is bit-identical to `ptr::null()`. A
 // real allocation landing there would get misread as null by any
 // `== ptr::null()` check, so `bump` starts one word past it instead.
-global mut bump: heap::*u8 = 4 as heap::*u8;
+global mut bump: heap::*u8 = transmute::<u32, _>(4);
 
 // ── core allocator ────────────────────────────────────────────────────────────
 // Allocates space for one T, respecting its alignment.
 pub func alloc<T>() -> heap::*T {
     local align = align_of::<T, heap>();
-    local ptr = ptr::align_up::<heap>(bump as u32, align);
+    local ptr = ptr::align_up::<heap>(transmute(bump), align);
     local new_end = ptr + size_of::<T, heap>();
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
         local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         local _grew = heap.grow(needed);
     }
-    bump = new_end as heap::*u8;
-    ptr as heap::*T
+    bump = transmute(new_end);
+    transmute(ptr)
 }
 
 pub func reset() {
-    bump = 4 as heap::*u8
+    bump = transmute::<u32, _>(4)
 }
 
 pub func bytes_used() -> u32 {
-    bump as u32
+    transmute(bump)
 }
 
 struct Node(

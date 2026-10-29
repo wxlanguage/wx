@@ -59,8 +59,6 @@ define_text! {
 		Break       => "break",
 		Continue    => "continue",
 		Return      => "return",
-		True        => "true",
-		False       => "false",
 		// punctuation
 		Semi             => ";",
 		Comma            => ",",
@@ -80,6 +78,7 @@ define_text! {
 		Star             => "*",
 		Underscore       => "_",
 		HashLBracket     => "#[",
+		Colon            => ":",
 		ColonColon       => "::",
 		ColonColonLt     => "::<",
 		ColonColonLBrace => "::{",
@@ -412,6 +411,22 @@ impl<'a> Builder<'a> {
 	fn symbol(&mut self, symbol: SymbolU32) -> NodeId {
 		let len = self.interner.resolve(symbol).unwrap().len() as u32;
 		self.arena.alloc(Node::Symbol { symbol, len })
+	}
+
+	/// `block ` or `loop `, followed by `:label ` when there is one.
+	fn labelled_keyword(
+		&mut self,
+		keyword: Text,
+		label: Option<ast::Spanned<SymbolU32>>,
+	) -> NodeId {
+		let keyword = self.text(keyword);
+		let Some(label) = label else {
+			return keyword;
+		};
+		let colon = self.text(Text::Colon);
+		let name = self.symbol(label.inner);
+		let space = self.text(Text::Space);
+		self.arena.concat4(keyword, colon, name, space)
 	}
 
 	#[inline]
@@ -2392,17 +2407,15 @@ impl<'a> Builder<'a> {
 				let concat = self.arena.concat(parts);
 				self.arena.group(concat)
 			}
-			ast::Expression::Block { statements } => {
+			ast::Expression::Block { label, statements } => {
 				// A plain block in expression position is spelled `block { .. }`;
 				// the blocks owned by a construct (`if`, `loop`, a match arm, a
 				// function body) go straight to `build_block_content`.
-				let keyword = self.text(Text::Block);
+				let keyword = self.labelled_keyword(Text::Block, *label);
 				let content =
 					self.build_block_content(statements, expression.span);
 				self.arena.concat2(keyword, content)
 			}
-			ast::Expression::True => self.text(Text::True),
-			ast::Expression::False => self.text(Text::False),
 			ast::Expression::Placeholder => self.text(Text::Underscore),
 			ast::Expression::IfElse {
 				condition,
@@ -2427,8 +2440,8 @@ impl<'a> Builder<'a> {
 				}
 				self.arena.concat(items)
 			}
-			ast::Expression::Loop { block } => {
-				let loop_kw = self.text(Text::Loop);
+			ast::Expression::Loop { label, block } => {
+				let loop_kw = self.labelled_keyword(Text::Loop, *label);
 				let block_id = self.build_block_content(
 					block.inner.as_block_statements(),
 					block.span,
@@ -2457,12 +2470,6 @@ impl<'a> Builder<'a> {
 					items.push(self.build_expression(value));
 				}
 				self.arena.concat(items)
-			}
-			ast::Expression::Cast { value, ty } => {
-				let val = self.build_expression(value);
-				let as_kw = self.text(Text::As);
-				let ty_id = self.build_type_expression(&ty.inner);
-				self.arena.concat3(val, as_kw, ty_id)
 			}
 			ast::Expression::Continue { label } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Continue)];
@@ -2519,11 +2526,11 @@ impl<'a> Builder<'a> {
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
 			}
-			ast::Expression::Label { label, block } => {
-				let sym = self.symbol(label.inner);
+			ast::Expression::Ascription { value, ty } => {
+				let val = self.build_expression(value);
 				let colon_sp = self.text(Text::ColonSp);
-				let block_id = self.build_expression_contents(block);
-				self.arena.concat3(sym, colon_sp, block_id)
+				let ty_id = self.build_type_expression(&ty.inner);
+				self.arena.concat3(val, colon_sp, ty_id)
 			}
 			ast::Expression::Error => unreachable!(),
 			ast::Expression::Unary { operator, operand } => {

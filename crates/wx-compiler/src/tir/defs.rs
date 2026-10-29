@@ -652,7 +652,7 @@ pub(super) struct DefinitionRegistry {
 	pub use_items: Vec<UseItemDef>,
 	pub use_paths: Vec<UsePathSegment>,
 	/// The `DefKey` of every language builtin recognized by name in the
-	/// stdlib package — primitive types (`u8`, `char`, ...) and
+	/// stdlib package — primitive types (`u8`, `funcref`, ...), `Bool`, `Char` and
 	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
 	/// prescan never found declared there. No `#[intrinsic]` marker is
 	/// involved: recognition is implicit — a reserved name, of the right
@@ -685,8 +685,11 @@ pub struct IntrinsicDefs {
 	pub i64: Option<TypeAliasIdx>,
 	pub f32: Option<TypeAliasIdx>,
 	pub f64: Option<TypeAliasIdx>,
-	pub bool: Option<TypeAliasIdx>,
-	pub char: Option<TypeAliasIdx>,
+	/// std's `Bool` and `Char`, which the compiler's conditions and literals
+	/// are typed with.
+	pub bool: Option<EnumIdx>,
+	pub char: Option<StructIdx>,
+	pub funcref: Option<TypeAliasIdx>,
 	pub add: Option<TraitIdx>,
 	pub sub: Option<TraitIdx>,
 	pub mul: Option<TraitIdx>,
@@ -703,6 +706,8 @@ pub struct IntrinsicDefs {
 	pub partial_eq: Option<TraitIdx>,
 	pub partial_ord: Option<TraitIdx>,
 	pub memory: Option<TraitIdx>,
+	/// `Memory`'s declaration of `Size`.
+	pub memory_size: Option<AssocTypeIdx>,
 	pub global: Option<TraitIdx>,
 	pub global_mut: Option<TraitIdx>,
 	pub call: Option<TraitIdx>,
@@ -711,7 +716,10 @@ pub struct IntrinsicDefs {
 	pub call_args: Option<AssocTypeIdx>,
 	pub call_result: Option<AssocTypeIdx>,
 	pub function: Option<TraitIdx>,
-	pub value_type: Option<TraitIdx>,
+	pub stack_value: Option<TraitIdx>,
+	/// `StackValue`'s declaration of `Repr`, which every type answers by a
+	/// compiler rule.
+	pub stack_value_repr: Option<AssocTypeIdx>,
 }
 
 impl IntrinsicDefs {
@@ -732,8 +740,7 @@ impl IntrinsicDefs {
 			"i64" => &mut self.i64,
 			"f32" => &mut self.f32,
 			"f64" => &mut self.f64,
-			"bool" => &mut self.bool,
-			"char" => &mut self.char,
+			"funcref" => &mut self.funcref,
 			_ => return None,
 		})
 	}
@@ -762,7 +769,7 @@ impl IntrinsicDefs {
 			"GlobalMut" => &mut self.global_mut,
 			"Call" => &mut self.call,
 			"Function" => &mut self.function,
-			"ValueType" => &mut self.value_type,
+			"StackValue" => &mut self.stack_value,
 			_ => return None,
 		})
 	}
@@ -2764,6 +2771,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					field_pub_spans.push(field.pub_span);
 				}
 
+				if self.namespaces.scope(namespace).package_id
+					== self.stdlib_package
+					&& self.strings.resolve(name.inner) == Some("Char")
+				{
+					self.intrinsics.char = Some(struct_index);
+				}
 				self.structs.push(StructDef {
 					file_id,
 					namespace,
@@ -2809,6 +2822,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}));
 				let end_variant =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
+				if self.namespaces.scope(namespace).package_id
+					== self.stdlib_package
+					&& self.strings.resolve(name.inner) == Some("Bool")
+				{
+					self.intrinsics.bool = Some(enum_index);
+				}
 				self.enums.push(EnumDef {
 					file_id,
 					parent_namespace: namespace,
@@ -3193,18 +3212,21 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					members.push(member);
 				}
 
-				if self.intrinsics.call == Some(trait_index) {
-					let mut declared = |name: &str| {
-						let key =
-							BindingKey::ty(self.strings.get_or_intern(name));
-						match members[usize::from(*bindings.get(&key)?)].kind {
-							MemberKind::AssociatedType(assoc) => Some(assoc),
-							_ => None,
-						}
-					};
-					let (args, result) = (declared("Args"), declared("Result"));
-					self.intrinsics.call_args = args;
-					self.intrinsics.call_result = result;
+				let mut declared = |name: &str| {
+					let key = BindingKey::ty(self.strings.get_or_intern(name));
+					match members[usize::from(*bindings.get(&key)?)].kind {
+						MemberKind::AssociatedType(assoc) => Some(assoc),
+						_ => None,
+					}
+				};
+				let this = Some(trait_index);
+				if self.intrinsics.call == this {
+					self.intrinsics.call_args = declared("Args");
+					self.intrinsics.call_result = declared("Result");
+				} else if self.intrinsics.stack_value == this {
+					self.intrinsics.stack_value_repr = declared("Repr");
+				} else if self.intrinsics.memory == this {
+					self.intrinsics.memory_size = declared("Size");
 				}
 				let actual_index = self.push_trait(TraitDef {
 					typeset: None,
@@ -4324,8 +4346,9 @@ mod tests {
 			type i64;
 			type f32;
 			type f64;
-			type bool;
-			type char;
+			type funcref;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"});
 		case.diagnostics().assert_none();
 
@@ -4341,8 +4364,7 @@ mod tests {
 			(intrinsics.i64, "i64"),
 			(intrinsics.f32, "f32"),
 			(intrinsics.f64, "f64"),
-			(intrinsics.bool, "bool"),
-			(intrinsics.char, "char"),
+			(intrinsics.funcref, "funcref"),
 		] {
 			let index = slot.unwrap_or_else(|| {
 				panic!("missing intrinsic `{expected_name}`")
@@ -4350,6 +4372,12 @@ mod tests {
 			let name = case.defs.type_aliases[usize::from(index)].name.inner;
 			assert_eq!(case.graph.strings.resolve(name), Some(expected_name));
 		}
+		let bool = intrinsics.bool.expect("`Bool` is recorded");
+		let name = case.defs.enums[usize::from(bool)].name.inner;
+		assert_eq!(case.graph.strings.resolve(name), Some("Bool"));
+		let char = intrinsics.char.expect("`Char` is recorded");
+		let name = case.defs.structs[usize::from(char)].name.inner;
+		assert_eq!(case.graph.strings.resolve(name), Some("Char"));
 	}
 
 	#[test]

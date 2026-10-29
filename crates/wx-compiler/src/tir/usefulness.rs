@@ -28,9 +28,8 @@ pub(super) enum Ctor {
 	/// The one constructor of a tuple or a struct, with one field per element
 	/// or field.
 	Single,
-	/// A value of a type with many: a `bool` (`0`, `1`), an integer (its bits),
-	/// a `char` (its code point), or an enum's variant (its discriminant's
-	/// bits).
+	/// A value of a type with many: an integer (its bits), a `Char` (its code
+	/// point), or an enum's variant (its discriminant's bits).
 	Value(u64),
 	/// A constant whose value is not known here (a trait's declaration, one
 	/// that is not a single number): it matches some value, never a known set,
@@ -54,10 +53,10 @@ pub(super) enum Pat {
 pub(super) enum CtorSet {
 	/// A tuple, a struct, `()`.
 	Single,
-	/// A finite set of values, all listed: `bool`'s, an enum's variants'.
+	/// A finite set of values, all listed: an enum's variants'.
 	Listed(Vec<u64>),
 	/// `count` values, in order from `0` up, too many to list: an integer's
-	/// (by their bits), `char`'s (valid scalar values, by their code point).
+	/// (by their bits), `Char`'s (valid scalar values, by their code point).
 	Counted { count: u128, valid: fn(u64) -> bool },
 	/// No values at all (`!`): no arm is needed.
 	Empty,

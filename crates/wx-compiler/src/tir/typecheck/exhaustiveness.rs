@@ -135,7 +135,6 @@ impl BodyContext<'_, '_, '_, '_> {
 				Pat::Ctor(Ctor::Single, lowered)
 			}
 			PatternKind::Int(bits) => value(bits),
-			PatternKind::Bool(bit) => value(u64::from(bit)),
 			PatternKind::Char(c) => value(u64::from(c)),
 			PatternKind::Constant {
 				constant,
@@ -175,9 +174,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			Some(integer) => Some(bits & integer.mask()),
 			None => match *self.cx.types.resolve(ty) {
 				Type::Enum { .. } => Some(bits),
-				_ if ty == TypeIndex::BOOL || ty == TypeIndex::CHAR => {
-					Some(bits)
-				}
+				_ if ty == TypeIndex::CHAR => Some(bits),
 				_ => None,
 			},
 		}
@@ -226,9 +223,6 @@ impl BodyContext<'_, '_, '_, '_> {
 				_ => format!("({})", fields.join(", ")),
 			};
 		};
-		if ty == TypeIndex::BOOL {
-			return (bits != 0).to_string();
-		}
 		if ty == TypeIndex::CHAR {
 			return char::from_u32(bits as u32)
 				.map_or_else(|| "_".to_string(), |c| format!("{c:?}"));
@@ -262,9 +256,6 @@ impl BodyContext<'_, '_, '_, '_> {
 
 impl Shapes for BodyContext<'_, '_, '_, '_> {
 	fn ctor_set(&mut self, ty: TypeIndex) -> CtorSet {
-		if ty == TypeIndex::BOOL {
-			return CtorSet::Listed(vec![0, 1]);
-		}
 		if ty == TypeIndex::CHAR {
 			return CtorSet::Counted {
 				// Every scalar value but the surrogates.

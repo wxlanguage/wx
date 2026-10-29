@@ -312,7 +312,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let ast::Expression::Placeholder = target.inner {
 			let value = self.build(value, TypeIndex::INFER);
 			let ty = self.body.ty(value);
-			if self.cx.types.has_untyped(ty) {
+			if self.cx.types.has_literal(ty) {
 				self.report_annotation_required(value);
 			}
 			return self.body.push(

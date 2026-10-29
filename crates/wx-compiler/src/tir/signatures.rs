@@ -800,7 +800,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			query_state,
 			query_stack: Vec::new(),
 			solver,
-			types: TypeInterner::new(),
+			types: TypeInterner::new(
+				defs.intrinsics.bool.expect("std declares `Bool`"),
+				defs.intrinsics.char.expect("std declares `Char`"),
+			),
 			bounds: BoundArena::default(),
 			clauses: ClauseArena::default(),
 			type_envs: TypeEnvArena::new(),
@@ -3057,14 +3060,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		&mut self,
 		memory: TypeIndex,
 	) -> Option<TypeIndex> {
-		let memory_trait = self.defs.intrinsics.memory?;
-		let size = self.strings.get("Size")?;
-		let Some(MemberKind::AssociatedType(assoc_type_index)) = self
-			.defs
-			.declared_trait_member(memory_trait, BindingKey::ty(size))
-		else {
-			return None;
-		};
+		let intrinsics = &self.defs.intrinsics;
+		let (memory_trait, assoc_type_index) =
+			(intrinsics.memory?, intrinsics.memory_size?);
 		Some(self.types.intern(Type::AssocTypeProjection {
 			trait_index: memory_trait,
 			assoc_type_index,
@@ -4813,12 +4811,19 @@ pub(super) mod tests {
 	/// `test_case!(case = "source")` / `test_case!(mut case = ..)` /
 	/// `test_case!(case from graph)` declare the graph, inputs and swept
 	/// `TestCase` borrowing them as three locals of the calling test.
+	/// `test_case!(std case = ..)` plays the stdlib itself.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			test_case!($case from source_graph($source));
 		};
 		(mut $case:ident = $source:expr $(,)?) => {
 			test_case!(mut $case from source_graph($source));
+		};
+		(std $case:ident = $source:expr $(,)?) => {
+			test_case!($case from std_source_graph($source));
+		};
+		(std mut $case:ident = $source:expr $(,)?) => {
+			test_case!(mut $case from std_source_graph($source));
 		};
 		($case:ident from $graph:expr) => {
 			let mut graph = $graph;
@@ -4832,11 +4837,50 @@ pub(super) mod tests {
 		};
 	}
 
+	/// `test_case!` that first asserts the source parses and links cleanly.
+	macro_rules! checked_case {
+		($case:ident = $source:expr $(,)?) => {
+			let graph = source_graph($source);
+			assert_graph_clean(&graph);
+			test_case!($case from graph);
+		};
+		(mut $case:ident = $source:expr $(,)?) => {
+			let graph = source_graph($source);
+			assert_graph_clean(&graph);
+			test_case!(mut $case from graph);
+		};
+		(std $case:ident = $source:expr $(,)?) => {
+			let graph = std_source_graph($source);
+			assert_graph_clean(&graph);
+			test_case!($case from graph);
+		};
+		(std mut $case:ident = $source:expr $(,)?) => {
+			let graph = std_source_graph($source);
+			assert_graph_clean(&graph);
+			test_case!(mut $case from graph);
+		};
+	}
+
+	fn assert_graph_clean(graph: &vfs::CompilationUnit) {
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_parser_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		DiagnosticView::new(
+			"link",
+			&graph.collect_linker_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+	}
+
 	/// The shipped `std/main.wx` is the largest real input the sweep sees; it
 	/// must stay free of diagnostics through every change to the solver.
 	#[test]
 	fn the_embedded_stdlib_sweeps_without_diagnostics() {
-		test_case!(case = include_str!("../../std/main.wx"));
+		test_case!(std case = include_str!("../../std/main.wx"));
 		case.diagnostics().assert_none();
 	}
 
@@ -4846,7 +4890,6 @@ pub(super) mod tests {
 	#[test]
 	fn every_resolved_name_is_recorded_where_it_is_written() {
 		const SOURCE: &str = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			mod m { pub struct S(); pub trait Tr { type A; } }
 			mod g { pub struct G(); }
 			use m::S;
@@ -4944,13 +4987,21 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_name_that_does_not_resolve_is_not_recorded() {
-		test_case!(
-			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f(x: Missing) {}"
-		);
+		test_case!(case = "func f(x: Missing) {}");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
-		// Only the supertrait `Call` resolves.
-		assert_eq!(case.context.resolutions.by_site.len(), 1);
+		let file_id = case
+			.defs
+			.namespaces
+			.file_id(Scope::Package(case.defs.root_package).into());
+		assert!(
+			!case
+				.context
+				.resolutions
+				.by_site
+				.keys()
+				.any(|(site, _)| site.file_id == file_id)
+		);
 	}
 
 	#[test]
@@ -4960,7 +5011,7 @@ pub(super) mod tests {
 		};
 		// The compiler builds `PrimitiveBinary`/`PrimitiveUnary` exactly where the stdlib has a
 		// primitive impl, so the two must name the same pairs.
-		test_case!(case = include_str!("../../std/main.wx"));
+		test_case!(std case = include_str!("../../std/main.wx"));
 		let implements = |trait_index: TraitIdx, scalar: Scalar| {
 			let target =
 				ImplTarget::from_type(case.context.types.resolve(scalar.ty()))
@@ -5023,12 +5074,6 @@ pub(super) mod tests {
 		use crate::tir::body::{Body, ElementOrder, ExprIdx, ExprKind};
 		use crate::tir::eval::{ConstScalar, ConstValue, ConstValueState};
 
-		/// Test items appended to the real stdlib, so operators are checked
-		/// against its actual traits and impls.
-		fn with_std(source: &str) -> String {
-			format!("{}\n{source}", include_str!("../../std/main.wx"))
-		}
-
 		fn body<'c>(case: &'c TestCase<'_>, name: &str) -> &'c Body {
 			let (DefKind::Const(index) | DefKind::EnumVariant(index)) =
 				case.resolve(Tier::Value, name)
@@ -5052,7 +5097,6 @@ pub(super) mod tests {
 					ExprKind::Error => "error".to_string(),
 					ExprKind::Int(value) => value.to_string(),
 					ExprKind::Float(value) => format!("{value:?}"),
-					ExprKind::Bool(value) => value.to_string(),
 					ExprKind::Char(value) => format!("{value:?}"),
 					ExprKind::Const {
 						constant: index, ..
@@ -5200,40 +5244,36 @@ pub(super) mod tests {
 		#[test]
 		fn untyped_literals_take_the_declared_type() {
 			test_case!(
-				case = &with_std(
-					"const A: u8 = 1 + 2 * 3;
+				case = "const A: u8 = 1 + 2 * 3;
 					const B: i8 = -128;
 					const C: f32 = 1.5;
 					const D: f64 = 2;
-					const E: char = 'a';
-					const F: bool = true;"
-				)
+					const E: Char = 'a';
+					const F: Bool = True;"
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(shape(&case, "A"), "(+ 1:u8 (* 2:u8 3:u8):u8):u8");
 			assert_eq!(shape(&case, "B"), "(- 128:i8):i8");
 			assert_eq!(shape(&case, "C"), "1.5:f32");
 			assert_eq!(shape(&case, "D"), "2.0:f64");
-			assert_eq!(shape(&case, "E"), "'a':char");
-			assert_eq!(shape(&case, "F"), "true:bool");
+			assert_eq!(shape(&case, "E"), "'a':Char");
+			assert_eq!(shape(&case, "F"), "True:Bool");
 		}
 
 		#[test]
 		fn a_typed_operand_types_an_untyped_one() {
 			test_case!(
-				case = &with_std(
-					"const A: i64 = 1;
+				case = "const A: i64 = 1;
 					const B: i64 = 2 * A;
-					const C: bool = A < 10;
-					const D: bool = A == 1 && true;"
-				)
+					const C: Bool = A < 10;
+					const D: Bool = A == 1 && True;"
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(shape(&case, "B"), "(* 2:i64 A:i64):i64");
-			assert_eq!(shape(&case, "C"), "(< A:i64 10:i64):bool");
+			assert_eq!(shape(&case, "C"), "(< A:i64 10:i64):Bool");
 			assert_eq!(
 				shape(&case, "D"),
-				"(&& (== A:i64 1:i64):bool true:bool):bool"
+				"(&& (== A:i64 1:i64):Bool True:Bool):Bool"
 			);
 		}
 
@@ -5266,15 +5306,15 @@ pub(super) mod tests {
 					"const A: f64 = 1e-400;",
 					DiagnosticCode::FloatLiteralUnderflow,
 				),
-				("const A: bool = 1;", DiagnosticCode::UnableToCoerce),
+				("const A: Bool = 1;", DiagnosticCode::UnableToCoerce),
 				("const A: i32 = 1.5;", DiagnosticCode::UnableToCoerce),
 				("const A: u8 = ^1.5;", DiagnosticCode::UnableToCoerce),
 				(
-					"const A: char = '';",
+					"const A: Char = '';",
 					DiagnosticCode::InvalidCharacterLiteral,
 				),
 			] {
-				test_case!(case = &with_std(initializer));
+				test_case!(case = initializer);
 				case.diagnostics().assert_codes(&[code]);
 			}
 		}
@@ -5287,28 +5327,28 @@ pub(super) mod tests {
 					DiagnosticCode::TypeMistmatch,
 				),
 				(
-					"const A: i32 = 1; const B: i32 = A + true;",
+					"const A: i32 = 1; const B: i32 = A + True;",
 					DiagnosticCode::TypeMistmatch,
 				),
 				(
-					"const A: bool = 1 < 2;",
+					"const A: Bool = 1 < 2;",
 					DiagnosticCode::ComparisonTypeAnnotationRequired,
 				),
 				(
-					"const A: bool = true + false;",
+					"const A: Bool = True + False;",
 					DiagnosticCode::TraitBoundViolation,
 				),
 				(
-					"const A: bool = -true;",
+					"const A: Bool = -True;",
 					DiagnosticCode::TraitBoundViolation,
 				),
 				(
 					"const A: u8 = 1; const B: u8 = -A;",
 					DiagnosticCode::TraitBoundViolation,
 				),
-				("const A: bool = true && 1;", DiagnosticCode::UnableToCoerce),
+				("const A: Bool = True && 1;", DiagnosticCode::UnableToCoerce),
 			] {
-				test_case!(case = &with_std(initializer));
+				test_case!(case = initializer);
 				case.diagnostics().assert_codes(&[code]);
 			}
 		}
@@ -5316,14 +5356,12 @@ pub(super) mod tests {
 		#[test]
 		fn an_operator_on_a_user_type_calls_its_impl() {
 			test_case!(
-				case = &with_std(
-					"struct V();
+				case = "struct V();
 					impl Add for V { func add(self: Self, rhs: Self) -> Self { self } }
-					impl PartialEq for V { func eq(self: Self, other: Self) -> bool { true } }
+					impl PartialEq for V { func eq(self: Self, other: Self) -> Bool { True } }
 					const X: V = V();
 					const Y: V = X + X;
-					const Z: bool = X != X;"
-				)
+					const Z: Bool = X != X;"
 			);
 			// `X` is a construction; `Y` and `Z` call methods, and a call is
 			// not a constant.
@@ -5334,20 +5372,18 @@ pub(super) mod tests {
 			assert_eq!(shape(&case, "X"), "(V):V");
 			assert_eq!(shape(&case, "Y"), "(call add X:V X:V):V");
 			// `ne` is the trait's default: dispatched through the declaration.
-			assert_eq!(shape(&case, "Z"), "(abstract ne X:V X:V):bool");
+			assert_eq!(shape(&case, "Z"), "(abstract ne X:V X:V):Bool");
 		}
 
 		#[test]
 		fn a_literal_of_abstract_type_fits_every_typeset_member() {
 			test_case!(
-				case = &with_std(
-					"typeset Small { u8, i8 }
+				case = "typeset Small { u8, i8 }
 					trait Holder {
 						type S: Small;
 						const FITS: Self::S = 100;
 						const TOO_BIG: Self::S = 200;
 					}"
-				)
 			);
 			// `200` fits `u8` but not `i8`.
 			case.diagnostics()
@@ -5357,11 +5393,9 @@ pub(super) mod tests {
 		#[test]
 		fn a_declared_projection_type_is_normalized_first() {
 			test_case!(
-				case = &with_std(
-					"trait Service { type Item; const VALUE: Self::Item; }
+				case = "trait Service { type Item; const VALUE: Self::Item; }
 					struct S();
 					impl Service for S { type Item = u16; const VALUE: Self::Item = 7; }"
-				)
 			);
 			case.diagnostics().assert_none();
 		}
@@ -5397,8 +5431,7 @@ pub(super) mod tests {
 		#[test]
 		fn arithmetic_follows_the_operand_type() {
 			test_case!(
-				case = &with_std(
-					"const A: u8 = 200 + 55;
+				case = "const A: u8 = 200 + 55;
 					const B: i8 = -128;
 					const C: i32 = 7 / -2;
 					const D: i32 = -7 % 2;
@@ -5409,7 +5442,6 @@ pub(super) mod tests {
 					const I: u64 = 18446744073709551615;
 					const J: i64 = -9223372036854775808;
 					const K: u32 = 6 & 3 | 8 ^ 1;"
-				)
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(scalar(&case, "A"), ConstScalar::u8(255));
@@ -5431,13 +5463,11 @@ pub(super) mod tests {
 		#[test]
 		fn floats_round_at_their_width_and_comparisons_answer_bool() {
 			test_case!(
-				case = &with_std(
-					"const A: f32 = 0.1 + 0.2;
+				case = "const A: f32 = 0.1 + 0.2;
 					const B: f64 = 0.1 + 0.2;
-					const C: bool = A < 1.0;
-					const D: bool = 'a' < 'b' && true != false;
+					const C: Bool = A < 1.0;
+					const D: Bool = (1: u8) < 2 && True != False;
 					const E: f64 = 1.0 / 0.0;"
-				)
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(scalar(&case, "A"), ConstScalar::f32(0.1 + 0.2));
@@ -5452,17 +5482,15 @@ pub(super) mod tests {
 		fn a_value_is_held_as_wasm_numbers() {
 			use crate::tir::eval::Val;
 			test_case!(
-				case = &with_std(
-					"const A: u8 = 255;
+				case = "const A: u8 = 255;
 					const B: i8 = -1;
 					const C: i64 = -2;
 					const D: f32 = 0.5;
-					const E: bool = true;
-					const F: char = 'a';"
-				)
+					const E: Bool = True;
+					const F: Char = 'a';"
 			);
 			case.diagnostics().assert_none();
-			// Narrow integers, `bool` and `char` are `I32`s; a signed one is
+			// Narrow integers, `Bool` and `Char` are `I32`s; a signed one is
 			// sign-extended; a float is its bits.
 			for (name, val) in [
 				("A", Val::I32(0xFF)),
@@ -5479,11 +5507,9 @@ pub(super) mod tests {
 		#[test]
 		fn constants_read_each_other_in_any_order() {
 			test_case!(
-				case = &with_std(
-					"const A: i32 = B * 2;
+				case = "const A: i32 = B * 2;
 					const B: i32 = C + 1;
 					const C: i32 = 20;"
-				)
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(scalar(&case, "A"), ConstScalar::i32(42));
@@ -5503,7 +5529,7 @@ pub(super) mod tests {
 				"const A: u8 = 1 << 8;",
 				"const A: i32 = 1 >> 32;",
 			] {
-				test_case!(case = &with_std(initializer));
+				test_case!(case = initializer);
 				case.diagnostics()
 					.assert_codes(&[DiagnosticCode::ConstEvaluationFailed]);
 			}
@@ -5512,11 +5538,9 @@ pub(super) mod tests {
 		#[test]
 		fn a_constant_reading_a_failed_one_is_silent() {
 			test_case!(
-				case = &with_std(
-					"const B: u8 = A;
+				case = "const B: u8 = A;
 					const A: u8 = 255 + 1;
-					const C: bool = false && A == 1;"
-				)
+					const C: Bool = False && A == 1;"
 			);
 			// `A` owns its overflow and `B` reads it silently. `C` names `A`
 			// only in a branch it does not take, so it never reads it.
@@ -5529,10 +5553,8 @@ pub(super) mod tests {
 		#[test]
 		fn a_branch_that_is_not_taken_is_not_a_dependency() {
 			test_case!(
-				case = &with_std(
-					"const A: bool = false && B;
-					const B: bool = A;"
-				)
+				case = "const A: Bool = False && B;
+					const B: Bool = A;"
 			);
 			// `A` is `false` without reading `B`, so there is no loop.
 			case.diagnostics().assert_none();
@@ -5543,10 +5565,8 @@ pub(super) mod tests {
 		#[test]
 		fn a_mismatched_initializer_has_no_value() {
 			test_case!(
-				case = &with_std(
-					"enum E(i32) { A = 1 }
+				case = "enum E(i32) { A = 1 }
 					const X: i32 = E::A;"
-				)
 			);
 			// `E::A` is held as an `i32`, but it is an `E`: reported once, and
 			// `X` gets no value from it.
@@ -5557,7 +5577,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_variant_value_naming_its_enum_reports_only_the_mismatch() {
-			test_case!(case = &with_std("enum E(i32) { A = E::B, B }"));
+			test_case!(case = "enum E(i32) { A = E::B, B }");
 			// `B` counts on from `A`, and `A` names `B`; the mismatch makes `A`
 			// an error before any loop is evaluated.
 			case.diagnostics()
@@ -5569,11 +5589,9 @@ pub(super) mod tests {
 		#[test]
 		fn and_and_or_do_not_evaluate_a_side_they_do_not_need() {
 			test_case!(
-				case = &with_std(
-					"const Z: i32 = 0;
-					const A: bool = false && 1 / Z == 0;
-					const B: bool = true || 1 / Z == 0;"
-				)
+				case = "const Z: i32 = 0;
+					const A: Bool = False && 1 / Z == 0;
+					const B: Bool = True || 1 / Z == 0;"
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(scalar(&case, "A"), ConstScalar::bool(false));
@@ -5587,7 +5605,7 @@ pub(super) mod tests {
 				"const C: i32 = A; const A: i32 = B; const B: i32 = C + 1;",
 				"const B: i32 = C + 1; const C: i32 = A; const A: i32 = B;",
 			] {
-				test_case!(case = &with_std(source));
+				test_case!(case = source);
 				case.diagnostics()
 					.assert_codes(&[DiagnosticCode::CyclicConstant]);
 				// Reported at the first-defined member, which starts the loop.
@@ -5610,12 +5628,10 @@ pub(super) mod tests {
 		#[test]
 		fn an_operator_call_is_not_a_constant() {
 			test_case!(
-				case = &with_std(
-					"struct V();
-					impl PartialEq for V { func eq(self: Self, other: Self) -> bool { true } }
+				case = "struct V();
+					impl PartialEq for V { func eq(self: Self, other: Self) -> Bool { True } }
 					const X: V = V();
-					const Y: bool = X == X;"
-				)
+					const Y: Bool = X == X;"
 			);
 			// `X` has a value; `Y` calls `eq`.
 			case.diagnostics()
@@ -5625,8 +5641,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_struct_is_constructed_by_calling_its_name() {
 			test_case!(
-				case = &with_std(
-					"struct Meters(u32);
+				case = "struct Meters(u32);
 					struct Point(x: i32, y: i32);
 					struct Line(from: Point, to: Point);
 					const M: Meters = Meters(5);
@@ -5634,7 +5649,6 @@ pub(super) mod tests {
 					const x: i32 = 3;
 					const Q: Point = Point({ x, y: -x });
 					const L: Line = Line(Point(0, 0), P);"
-				)
 			);
 			case.diagnostics().assert_none();
 			// Arguments keep their written order; the value is in declaration
@@ -5664,7 +5678,7 @@ pub(super) mod tests {
 			for (initializer, code) in [
 				("const P: Point = Point(1);", ArgumentCountMismatch),
 				("const P: Point = Point(1, 2, 3);", ArgumentCountMismatch),
-				("const P: Point = Point(1, true);", TypeMistmatch),
+				("const P: Point = Point(1, True);", TypeMistmatch),
 				("const P: Point = Point({ x: 1 });", MissingArguments),
 				(
 					"const P: Point = Point({ x: 1, y: 2, z: 3 });",
@@ -5682,11 +5696,11 @@ pub(super) mod tests {
 				("const P: Point = Point;", StructUsedAsValue),
 			] {
 				test_case!(
-					case = &with_std(&format!(
+					case = &format!(
 						"struct Point(x: i32, y: i32);
 						struct Pair(i32, i32);
 						{initializer}"
-					))
+					)
 				);
 				// Reported once: the value is poisoned, not evaluated again.
 				case.diagnostics().assert_codes(&[code]);
@@ -5696,13 +5710,11 @@ pub(super) mod tests {
 		#[test]
 		fn a_generic_struct_takes_its_arguments_from_the_expected_type() {
 			test_case!(
-				case = &with_std(
-					"struct Wrapper<T>(T);
+				case = "struct Wrapper<T>(T);
 					struct Pair<A, B>(first: A, second: B);
 					const W: Wrapper<u32> = Wrapper(5);
 					const P: Pair<u8, i64> = Pair({ second: -1, first: 2 });
 					const N: Pair<Wrapper<u8>, u8> = Pair(Wrapper(1), 2);"
-				)
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(shape(&case, "W"), "(Wrapper 5:u32):Wrapper<u32>");
@@ -5730,15 +5742,13 @@ pub(super) mod tests {
 		fn a_written_argument_is_used_and_a_written_placeholder_is_taken_from_the_expected_type()
 		 {
 			test_case!(
-				case = &with_std(
-					"struct Wrapper<T>(T);
+				case = "struct Wrapper<T>(T);
 					struct Pair<A, B>(first: A, second: B);
 					const W: Wrapper<u32> = Wrapper::<u32>(5);
 					const P: Pair<u8, u16> = Pair::<_, u16>(1, 2);
 					const N: Wrapper<Pair<u16, u8>> = Wrapper::<Pair<_, u8>>(Pair(1, 2));
 					const M: u8 = 7;
 					const L: Pair<u8, u8> = Pair::<_, _>(M, 1);"
-				)
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(shape(&case, "W"), "(Wrapper 5:u32):Wrapper<u32>");
@@ -5775,18 +5785,18 @@ pub(super) mod tests {
 				// has no type. The right side expects the left's, which is
 				// reported already.
 				(
-					"const C: bool = Wrapper(1) == Wrapper(2);",
+					"const C: Bool = Wrapper(1) == Wrapper(2);",
 					&[TypeAnnotationRequired],
 				),
 				// The right side takes the left's type, so `1` is a `u8`.
 				(
-					"const M: u8 = 1; const C: bool = Wrapper(M) == Wrapper(1);",
+					"const M: u8 = 1; const C: Bool = Wrapper(M) == Wrapper(1);",
 					&[TraitBoundViolation],
 				),
 				// Learned from `M` on both sides: what fails is the operator,
 				// which `Wrapper<u8>` does not implement, not the type.
 				(
-					"const M: u8 = 1; const C: bool = Wrapper(M) == Wrapper(M);",
+					"const M: u8 = 1; const C: Bool = Wrapper(M) == Wrapper(M);",
 					&[TraitBoundViolation],
 				),
 				(
@@ -5806,13 +5816,13 @@ pub(super) mod tests {
 				),
 			] {
 				test_case!(
-					case = &with_std(&format!(
+					case = &format!(
 						"struct Wrapper<T>(T);
 						struct Pair<A, B>(first: A, second: B);
 						struct Bounded<T: Add>(T);
 						struct Unit();
 						{initializer}"
-					))
+					)
 				);
 				case.diagnostics().assert_codes(codes);
 			}
@@ -5821,22 +5831,20 @@ pub(super) mod tests {
 		#[test]
 		fn a_tuple_is_its_elements_in_order() {
 			test_case!(
-				case = &with_std(
-					"struct Wrapper<T>(T);
+				case = "struct Wrapper<T>(T);
 					const T: (u8, u16) = (1, 2);
 					const U: () = ();
-					const O: (bool,) = (true,);
-					const N: ((u8, bool), u8) = ((1, true), 2);
-					const W: Wrapper<(u8, bool)> = Wrapper((1, true));"
-				)
+					const O: (Bool,) = (True,);
+					const N: ((u8, Bool), u8) = ((1, True), 2);
+					const W: Wrapper<(u8, Bool)> = Wrapper((1, True));"
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(shape(&case, "T"), "(1:u8, 2:u16):(u8, u16)");
 			assert_eq!(shape(&case, "U"), "():()");
-			assert_eq!(shape(&case, "O"), "true:bool");
+			assert_eq!(shape(&case, "O"), "True:Bool");
 			assert_eq!(
 				shape(&case, "W"),
-				"(Wrapper (1:u8, true:bool):(u8, bool)):Wrapper<(u8, bool)>"
+				"(Wrapper (1:u8, True:Bool):(u8, Bool)):Wrapper<(u8, Bool)>"
 			);
 			assert_eq!(
 				*value(&case, "T"),
@@ -5869,24 +5877,24 @@ pub(super) mod tests {
 					&[IntegerLiteralOutOfRange],
 				),
 				// Each element is held to its own position's type.
-				("const T: (u8, bool) = (1, 2);", &[UnableToCoerce]),
+				("const T: (u8, Bool) = (1, 2);", &[UnableToCoerce]),
 				(
-					"const C: bool = (1, 2) == (3, 4);",
+					"const C: Bool = (1, 2) == (3, 4);",
 					&[ComparisonTypeAnnotationRequired],
 				),
 				// `(1, 2)` waits for `(M, M)` to give `T`; what fails is the
 				// operator, which `Same<(u8, u8)>` does not implement.
 				(
 					"const M: u8 = 1;
-					const C: bool = Same((1, 2), (M, M)) == Same((M, M), (M, M));",
+					const C: Bool = Same((1, 2), (M, M)) == Same((M, M), (M, M));",
 					&[TraitBoundViolation],
 				),
 			] {
 				test_case!(
-					case = &with_std(&format!(
+					case = &format!(
 						"struct Same<T>(a: T, b: T);
 						{initializer}"
-					))
+					)
 				);
 				case.diagnostics().assert_codes(codes);
 			}
@@ -5895,8 +5903,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_struct_is_constructed_only_where_every_field_is_accessible() {
 			test_case!(
-				case = &with_std(
-					"mod shapes {
+				case = "mod shapes {
 						pub struct Pair(pub i32, i32);
 						pub struct Point(pub x: i32, y: i32);
 						pub struct Open(pub i32);
@@ -5905,7 +5912,6 @@ pub(super) mod tests {
 					const A: shapes::Pair = shapes::Pair(1, 2);
 					const B: shapes::Point = shapes::Point(1, 2);
 					const C: shapes::Open = shapes::Open(1);"
-				)
 			);
 			// Inside `shapes` every field is visible; outside, one report per
 			// construction, whatever number of fields is private.
@@ -5931,14 +5937,12 @@ pub(super) mod tests {
 		#[test]
 		fn a_use_imports_a_struct_whose_constructor_it_cannot() {
 			test_case!(
-				case = &with_std(
-					"mod shapes {
+				case = "mod shapes {
 						pub struct Point(pub x: i32, y: i32);
 					}
 					use shapes::Point;
 					pub use shapes::Point as Exported;
 					const P: Point = Point(1, 2);"
-				)
 			);
 			// The type is imported, the constructor installed inaccessible: the
 			// `use`s are fine, the construction is not.
@@ -5953,13 +5957,11 @@ pub(super) mod tests {
 		#[test]
 		fn a_use_of_nothing_accessible_is_reported_once() {
 			test_case!(
-				case = &with_std(
-					"mod hidden {
+				case = "mod hidden {
 						struct Secret();
 					}
 					use hidden::Secret;
 					const S: hidden::Secret = hidden::Secret();"
-				)
 			);
 			// Neither of `Secret`'s namespaces is visible: the `use` reports it
 			// once. The constant's path reports the type and the constructor,
@@ -5983,8 +5985,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_pub_memory_or_global_is_reachable_from_outside_its_module() {
 			test_case!(
-				case = &with_std(
-					"mod inner {
+				case = "mod inner {
 						pub memory heap: u32;
 						pub global G: u32 = 0;
 						pub global mut M: u32 = 0;
@@ -5992,7 +5993,6 @@ pub(super) mod tests {
 					use inner::heap;
 					use inner::G;
 					use inner::M;"
-				)
 			);
 			case.diagnostics().assert_none();
 		}
@@ -6000,14 +6000,12 @@ pub(super) mod tests {
 		#[test]
 		fn a_private_memory_or_global_is_hidden_outside_its_module() {
 			test_case!(
-				case = &with_std(
-					"mod inner {
+				case = "mod inner {
 						memory heap: u32;
 						global G: u32 = 0;
 					}
 					use inner::heap;
 					use inner::G;"
-				)
 			);
 			let messages: Vec<_> = case
 				.context
@@ -6024,10 +6022,8 @@ pub(super) mod tests {
 		#[test]
 		fn a_constant_of_a_struct_containing_itself_is_not_evaluated() {
 			test_case!(
-				case = &with_std(
-					"struct Selfish(s: Selfish);
+				case = "struct Selfish(s: Selfish);
 					const S: Selfish = Selfish(S);"
-				)
 			);
 			// Reported on the struct, and only there.
 			case.diagnostics().assert_codes(&[
@@ -6039,11 +6035,9 @@ pub(super) mod tests {
 		#[test]
 		fn a_variant_without_a_value_counts_on_from_the_one_before_it() {
 			test_case!(
-				case = &with_std(
-					"const BASE: i16 = 10;
+				case = "const BASE: i16 = 10;
 					enum E(i16) { A = BASE * 2, B, C = -2, D, F }
 					const X: E = E::B;"
-				)
 			);
 			case.diagnostics().assert_none();
 			assert_eq!(scalar(&case, "E::A"), ConstScalar::i16(20));
@@ -6061,7 +6055,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn the_stdlib_ordering_has_its_written_values() {
-			test_case!(case = &with_std(""));
+			test_case!(case = "");
 			case.diagnostics().assert_none();
 			assert_eq!(scalar(&case, "Ordering::Less"), ConstScalar::i8(-1));
 			assert_eq!(scalar(&case, "Ordering::Equal"), ConstScalar::i8(0));
@@ -6070,7 +6064,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn the_first_variant_needs_a_value_to_count_from() {
-			test_case!(case = &with_std("enum E(u8) { A, B, C = 1, D }"));
+			test_case!(case = "enum E(u8) { A, B, C = 1, D }");
 			// Reported once, at `A`; `B` counts on from it and is silent.
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::EnumVariantRequiresExplicitValue,
@@ -6083,10 +6077,8 @@ pub(super) mod tests {
 		#[test]
 		fn variants_of_an_enum_without_a_repr_are_not_checked_again() {
 			test_case!(
-				case = &with_std(
-					"enum E { A, B = 1, C = 1 }
+				case = "enum E { A, B = 1, C = 1 }
 					const X: E = E::B;"
-				)
 			);
 			// No repr: no anchor error, no duplicate, nothing on `X`.
 			case.diagnostics()
@@ -6097,23 +6089,22 @@ pub(super) mod tests {
 
 		#[test]
 		fn counting_past_the_repr_is_reported_once_at_the_variant() {
-			test_case!(case = &with_std("enum E(u8) { A = 255, B, C }"));
+			test_case!(case = "enum E(u8) { A = 255, B, C }");
 			// `B` owns the overflow; `C` reads a failed value and is silent.
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::ConstEvaluationFailed]);
 			let diagnostic = &case.context.diagnostics[0];
 			assert_eq!(diagnostic.message, "evaluation of constant `B` failed");
-			let source = &with_std("enum E(u8) { A = 255, B, C }");
+			let source = "enum E(u8) { A = 255, B, C }";
 			assert_eq!(&source[diagnostic.labels[0].range.clone()], "B");
 			assert_eq!(state(&case, "E::C"), &ConstValueState::Poisoned);
 		}
 
 		#[test]
 		fn variants_sharing_a_value_are_reported_once_per_value() {
-			let source = with_std(
-				"enum E(i32) { F = 7, A = 1, B = 0, C, D = 1, G = 7, H = 2 }",
-			);
-			test_case!(case = &source);
+			let source =
+				"enum E(i32) { F = 7, A = 1, B = 0, C, D = 1, G = 7, H = 2 }";
+			test_case!(case = source);
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::EnumDuplicateValue,
 				DiagnosticCode::EnumDuplicateValue,
@@ -6186,7 +6177,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn scopes_preserve_outer_parameters_and_exclude_siblings() {
-			test_case!(mut case = indoc! {"
+			test_case!(std mut case = indoc! {"
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Outer {}
 				trait Local {}
@@ -6198,6 +6189,10 @@ pub(super) mod tests {
 					func plain() {}
 				}
 				func unrelated<V: Other>() {}
+				type u8;
+				type u32;
+				enum Bool(u8) { False = 0, True = 1 }
+				struct Char(value: u32);
 			"});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -6252,8 +6247,6 @@ pub(super) mod tests {
 		#[test]
 		fn inherited_and_nested_clauses_keep_subjects_and_provenance() {
 			test_case!(mut case = indoc! {"
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
-				type i32;
 				trait Leaf {}
 				trait Inner: Leaf { type Value; }
 				trait Outer { type Item; type Other; }
@@ -6312,7 +6305,6 @@ pub(super) mod tests {
 		fn associated_declaration_clauses_read_self_through_nested_requirements()
 		 {
 			test_case!(mut case = indoc! {"
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Deep { type Output; }
 				trait Inner { type Value; }
 				trait Outer { type Item: Inner where { Value: Deep where { Output = Self } }; }
@@ -6397,8 +6389,6 @@ pub(super) mod tests {
 		#[test]
 		fn equality_alternatives_and_conflicts_both_keep_their_values() {
 			test_case!(mut case = indoc! {"
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
-				type i32; type u32;
 				trait Value { type Item; }
 				func ambiguous<T: Value where { Item = U } + Value where { Item = V }, U, V>() {}
 				func conflicting<T: Value where { Item = i32 } + Value where { Item = u32 }>() {}
@@ -6445,8 +6435,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn readiness_includes_unvisited_siblings_and_updates_on_publication() {
-			with_pending_signatures(
-				"trait A {} trait B {} func f<T: A, U: B>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			with_pending_std_signatures(
+				"trait A {} trait B {} func f<T: A, U: B>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|builder| {
 					let def_id = DefId::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(QueryInfo {
@@ -6474,8 +6464,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn declaration_reading_preserves_pending_without_forcing_queries() {
-			with_pending_signatures(
-				"trait Inner {} trait Outer { type Item: Inner; } func f<T: Outer>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			with_pending_std_signatures(
+				"trait Inner {} trait Outer { type Item: Inner; } func f<T: Outer>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|builder| {
 					let def_id = DefId::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(QueryInfo {
@@ -6544,8 +6534,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn recursive_declarations_are_read_along_finite_subject_paths() {
-			test_case!(mut case =
-				"trait Node { type Next: Node; } func f<T: Node>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			test_case!(std mut case =
+				"trait Node { type Next: Node; } func f<T: Node>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			);
 			assert!(case.context.diagnostics.is_empty());
 			let scope = case.function_signature("f").type_params;
@@ -6576,18 +6566,21 @@ pub(super) mod tests {
 		source: &str,
 		check: impl FnOnce(&mut TypeContext<'_, '_, '_>),
 	) {
-		let mut builder = vfs::CompilationUnitBuilder::new();
-		let root = builder
-			.load_binary(
-				vfs::AbsolutePath::new("/main.wx"),
-				&vfs::VirtualFileSource::from_relative(HashMap::from([(
-					"main.wx".to_string(),
-					source.to_string(),
-				)])),
-			)
-			.unwrap();
-		builder.set_stdlib(root);
-		let mut graph = builder.build(root);
+		pending_signatures(tests::source_graph(source), check);
+	}
+
+	/// `with_pending_signatures`, playing the stdlib itself.
+	pub(in crate::tir) fn with_pending_std_signatures(
+		source: &str,
+		check: impl FnOnce(&mut TypeContext<'_, '_, '_>),
+	) {
+		pending_signatures(tests::std_source_graph(source), check);
+	}
+
+	fn pending_signatures(
+		mut graph: vfs::CompilationUnit,
+		check: impl FnOnce(&mut TypeContext<'_, '_, '_>),
+	) {
 		DiagnosticView::new(
 			"parse",
 			&graph.collect_parser_diagnostics(),
@@ -6689,18 +6682,31 @@ pub(super) mod tests {
 		(declaration, provider, reference)
 	}
 
+	/// Parses `source` as a single-file binary over the embedded stdlib.
+	pub(in crate::tir) fn source_graph(source: &str) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
+		let root_id = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(
+					std::collections::HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)]),
+				),
+			)
+			.unwrap();
+		builder.build(root_id)
+	}
+
 	/// Parses `source` as a single-file binary playing the stdlib's own role
-	/// (`set_stdlib`, the same mechanism a real `"type": "std"` package
-	/// uses) instead of loading the real ~250-line embedded stdlib:
-	/// `sweep` isn't selective about which item kinds it drives, so any real
-	/// stdlib content — including item kinds and members whose signatures
-	/// are not implemented yet — would panic before a test even runs. A test
-	/// that needs a primitive declares its own bodiless `pub type i32;` — no
-	/// `#[intrinsic]` marker required, recognition is implicit for a
-	/// reserved name declared in whichever package is `stdlib_package`
-	/// (see `defs.rs`'s own doc comment on `intrinsics`) — so this still
-	/// works the same way it would for the real thing.
-	fn source_graph(source: &str) -> vfs::CompilationUnit {
+	/// (`set_stdlib`, as a `"type": "std"` package does), for a test about
+	/// what only the stdlib declares: it declares its own primitives
+	/// (`type u8;`), lang items (`Bool`, `Char`) and traits.
+	pub(in crate::tir) fn std_source_graph(
+		source: &str,
+	) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new();
 		let root_id = builder
 			.load_binary(
@@ -7312,10 +7318,8 @@ pub(super) mod tests {
 	fn function_type_ignores_parameter_names_for_identity() {
 		test_case!(
 			case = indoc! {"
-			type i32;
-			type bool;
-			type Named = func(x: i32, y: bool) -> i32;
-			type Unnamed = func(i32, bool) -> i32;
+			type Named = func(x: i32, y: Bool) -> i32;
+			type Unnamed = func(i32, Bool) -> i32;
 		"}
 		);
 
@@ -7342,10 +7346,8 @@ pub(super) mod tests {
 	fn a_function_type_takes_one_parameter_type() {
 		test_case!(
 			case = indoc! {"
-			type i32;
-			type bool;
-			type List = func(i32, bool) -> i32;
-			type Tupled = func((i32, bool)) -> i32;
+			type List = func(i32, Bool) -> i32;
+			type Tupled = func((i32, Bool)) -> i32;
 			type Single = func(i32);
 			type Grouped = func((i32));
 			type OneTuple = func((i32,));
@@ -7363,7 +7365,7 @@ pub(super) mod tests {
 
 		let formatter = case.context.type_formatter();
 		for (name, written) in [
-			("List", "func(i32, bool) -> i32"),
+			("List", "func(i32, Bool) -> i32"),
 			("Single", "func(i32) -> ()"),
 			("Empty", "func() -> ()"),
 		] {
@@ -7441,12 +7443,16 @@ pub(super) mod tests {
 	#[test]
 	fn user_aliases_are_rejected_as_impl_targets_without_dispatch() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			trait Tr {}
 			impl Tr for Alias {}
 			impl Alias {}
 			type Alias = S;
 			struct S();
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -7487,10 +7493,13 @@ pub(super) mod tests {
 	#[test]
 	fn intrinsic_primitive_can_be_an_impl_target() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
 			trait Tr {}
 			impl Tr for u32 {}
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 		assert!(
@@ -7506,9 +7515,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn never_and_unit_are_written_types() {
-		test_case!(
-			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f(a: !, b: ()) -> ! { loop {} }"
-		);
+		test_case!(case = "func f(a: !, b: ()) -> ! { loop {} }");
 		case.diagnostics().assert_none();
 		let signature = case.function_signature("f");
 		assert_eq!(
@@ -7521,10 +7528,14 @@ pub(super) mod tests {
 	#[test]
 	fn impl_type_parameter_does_not_resolve_to_a_same_named_struct() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			struct T();
 			trait Tr {}
 			impl<T> Tr for T {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 		assert!(case.context.impl_dispatch.is_empty());
@@ -7544,10 +7555,13 @@ pub(super) mod tests {
 	#[test]
 	fn typeset_member_alias_is_rejected_without_a_synthetic_impl() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
 			type Alias = u32;
 			typeset Int { Alias }
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 		assert_eq!(
@@ -7566,11 +7580,15 @@ pub(super) mod tests {
 	#[test]
 	fn impl_dispatch_rejects_duplicate_trait_for_same_constructor() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			trait Tr {}
 			struct S();
 			impl Tr for S {}
 			impl Tr for S {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 		let target = ImplTarget::from_type(case.context.types.resolve(
@@ -7596,9 +7614,13 @@ pub(super) mod tests {
 	#[test]
 	fn impl_dispatch_does_not_index_invalid_targets() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			impl<T> T {}
 			impl Missing {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 		assert!(case.context.impl_dispatch.is_empty());
@@ -7618,10 +7640,14 @@ pub(super) mod tests {
 	#[test]
 	fn impl_header_resolves_generic_bounds() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			trait Bound {}
 			struct S();
 			impl<T: Bound> S {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -7640,9 +7666,13 @@ pub(super) mod tests {
 	#[test]
 	fn trait_impl_header_keeps_target_when_trait_path_is_not_a_trait() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			struct S();
 			impl S for S {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -7672,7 +7702,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn function_parameter_placeholders_get_separate_diagnostics() {
-		let source = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f(x: (_, _)) { }";
+		let source = "func f(x: (_, _)) { }";
 		test_case!(case = source);
 
 		assert_eq!(
@@ -7705,7 +7735,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn return_type_placeholders_get_separate_diagnostics() {
-		let source = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f() -> (_, _) { }";
+		let source = "func f() -> (_, _) { }";
 		test_case!(case = source);
 
 		assert_eq!(
@@ -7814,7 +7844,6 @@ pub(super) mod tests {
 	fn a_bound_naming_a_non_trait_is_rejected() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			struct NotATrait( x: i32 );
 			type A<T: NotATrait> = T;
 		"}
@@ -7858,13 +7887,10 @@ pub(super) mod tests {
 	fn type_aliases_to_primitives_resolve_to_the_primitive() {
 		test_case!(
 			case = indoc! {"
-			type i32;
-			type bool;
-			type char;
 
 			type A = i32;
-			type B = bool;
-			type C = char;
+			type B = Bool;
+			type C = Char;
 		"}
 		);
 
@@ -8042,7 +8068,6 @@ pub(super) mod tests {
 	fn a_struct_with_primitive_fields_resolves() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			struct Point( x: i32, y: i32 );
 		"}
 		);
@@ -8062,7 +8087,6 @@ pub(super) mod tests {
 	fn a_tuple_struct_resolves() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			struct Pair(i32, i32);
 		"}
 		);
@@ -8329,8 +8353,6 @@ pub(super) mod tests {
 		// own parameter count; the written target is kept.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			type Byte = u8;
 			type Pair<T> = (T, T);
 			func f(a: Byte<u8>, b: u8<u8>, c: Pair) {}
@@ -8358,8 +8380,6 @@ pub(super) mod tests {
 	fn a_generic_alias_substitutes_its_arguments() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			type Pair<T> = (T, T);
 			func f(x: Pair<u8>) {}
 		"}
@@ -8379,8 +8399,6 @@ pub(super) mod tests {
 	fn a_generic_alias_checks_its_parameter_bounds() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Tr {}
 			type Same<T: Tr> = T;
 			func f(x: Same<u8>) {}
@@ -8396,8 +8414,6 @@ pub(super) mod tests {
 		// struct it shadows; the arguments are reported and dropped.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			struct T();
 			func f<T>(x: T<u8>) {}
 		"}
@@ -8423,7 +8439,7 @@ pub(super) mod tests {
 		for path in ["T::Item<u8>", "<T as Iterable>::Item<u8>"] {
 			test_case!(
 				case = &format!(
-					"type u8; trait Iterable {{ type Item; }} func f<T: Iterable>(x: {path}) {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+					"trait Iterable {{ type Item; }} func f<T: Iterable>(x: {path}) {{}} "
 				)
 			);
 			case.diagnostics()
@@ -8434,7 +8450,7 @@ pub(super) mod tests {
 			);
 		}
 		test_case!(
-			case = "trait Iterable { type Item; } func f<T: Iterable>(x: T::Item<Missing>) {} pub trait Call { type Args; type Result; } pub trait Function: Call {}"
+			case = "trait Iterable { type Item; } func f<T: Iterable>(x: T::Item<Missing>) {} "
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UndeclaredIdentifier,
@@ -8446,14 +8462,10 @@ pub(super) mod tests {
 	/// declaration: the parameter's name, the trait's for its `Self`.
 	#[test]
 	fn type_arguments_on_a_parameter_point_at_its_declaration() {
-		let call = "pub trait Call { type Args; type Result; } pub trait Function: Call {}";
+		let call = "";
 		for (source, declared, name) in [
-			("type u8; func f<T>(x: T<u8>) {}", "f<T", "T"),
-			(
-				"type u8; trait Tr { func g(x: Self<u8>); }",
-				"trait Tr",
-				"Tr",
-			),
+			("func f<T>(x: T<u8>) {}", "f<T", "T"),
+			("trait Tr { func g(x: Self<u8>); }", "trait Tr", "Tr"),
 		] {
 			let source = format!("{source} {call}");
 			test_case!(case = &source);
@@ -8475,16 +8487,16 @@ pub(super) mod tests {
 	/// for a struct suggests writing the struct's name instead.
 	#[test]
 	fn type_arguments_on_an_impls_self_are_their_own_error() {
-		let call = "pub trait Call { type Args; type Result; } pub trait Function: Call {}";
+		let call = "";
 		for (source, target, shown, note) in [
 			(
-				"type u8; struct X<T>(); impl<T> X<T> { func f(x: Self<u8, T>) {} }",
+				"struct X<T>(); impl<T> X<T> { func f(x: Self<u8, T>) {} }",
 				"X<T> {",
 				"`Self` is `X<T>` in this impl",
 				true,
 			),
 			(
-				"type u8; trait Tr { func f(x: Self); } impl Tr for u8 { func f(x: Self<u8>) {} }",
+				"trait Tr { func f(x: Self); } impl Tr for u8 { func f(x: Self<u8>) {} }",
 				"u8 {",
 				"`Self` is `u8` in this impl",
 				false,
@@ -8519,9 +8531,7 @@ pub(super) mod tests {
 	fn type_arguments_on_self_are_diagnosed() {
 		test_case!(
 			case = indoc! {"
-			type u8;
 			trait Tr { func g(x: Self<u8>); }
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		case.diagnostics()
@@ -8536,8 +8546,6 @@ pub(super) mod tests {
 	fn a_type_parameter_with_arguments_still_selects_its_members() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Tr { type A; }
 			func f<T: Tr>(x: T<u8>::A) {}
 		"}
@@ -8553,8 +8561,6 @@ pub(super) mod tests {
 		// path still resolves.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			mod m { pub struct S(); }
 			func f(x: m<u8>::S) {}
 		"}
@@ -8678,10 +8684,7 @@ pub(super) mod tests {
 	fn a_function_with_primitive_params_and_return_resolves() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
-			type bool;
-			func add(a: i32, b: i32) -> bool { true }
+			func add(a: i32, b: i32) -> Bool { True }
 		"}
 		);
 
@@ -8705,9 +8708,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_function_with_no_return_type_defaults_to_unit() {
-		test_case!(
-			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func f() { }"
-		);
+		test_case!(case = "func f() { }");
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -8719,9 +8720,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_generic_function_param_resolves_to_its_type_param() {
-		test_case!(
-			case = "pub trait Call { type Args; type Result; } pub trait Function: Call {} func identity<T>(x: T) -> T { x }"
-		);
+		test_case!(case = "func identity<T>(x: T) -> T { x }");
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -8740,8 +8739,6 @@ pub(super) mod tests {
 	fn duplicate_function_param_name_is_reported_but_both_entries_survive() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			func f(x: i32, x: i32) { }
 		"}
 		);
@@ -8763,8 +8760,6 @@ pub(super) mod tests {
 	fn a_bodiless_function_declaration_resolves_like_a_function() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			func imported(x: i32) -> i32;
 		"}
 		);
@@ -8804,10 +8799,7 @@ pub(super) mod tests {
 	/// resolved again.
 	#[test]
 	fn self_in_a_free_function_is_reported_once() {
-		for source in [
-			"func f(self: Self); pub trait Call { type Args; type Result; } pub trait Function: Call {}",
-			"func f(mut self: Self); pub trait Call { type Args; type Result; } pub trait Function: Call {}",
-		] {
+		for source in ["func f(self: Self); ", "func f(mut self: Self); "] {
 			test_case!(case = source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::SelfParamPosition]);
@@ -8819,10 +8811,10 @@ pub(super) mod tests {
 	#[test]
 	fn a_lone_identifier_parameter_is_its_type() {
 		for source in [
-			"func f(x) { } pub trait Call { type Args; type Result; } pub trait Function: Call {}",
-			"func f(x); pub trait Call { type Args; type Result; } pub trait Function: Call {}",
-			"trait Foo { func get(self: Self, x) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}",
-			"struct S(); impl S { func get(self: Self, x) -> Self { self } } pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			"func f(x) { } ",
+			"func f(x); ",
+			"trait Foo { func get(self: Self, x) -> Self; } ",
+			"struct S(); impl S { func get(self: Self, x) -> Self { self } } ",
 		] {
 			test_case!(case = source);
 			let diagnostics = case.diagnostics();
@@ -8836,8 +8828,6 @@ pub(super) mod tests {
 	fn an_unnamed_parameter_has_its_written_type() {
 		test_case!(
 			case = indoc! {"
-				pub type i32;
-				pub type u8;
 				func f(i32, _: u8, c: i32);
 				pub trait Call { type Args; type Result; }
 				pub trait Function: Call {}
@@ -8867,13 +8857,11 @@ pub(super) mod tests {
 	fn free_constants_resolve_forward_annotations_in_their_own_namespace() {
 		test_case!(
 			case = indoc! {"
-			type i32;
-			type bool;
 			const VALUE: Local = 0;
 			type Local = i32;
 			mod nested {
-				pub const VALUE: Local = false;
-				type Local = bool;
+				pub const VALUE: Local = False;
+				type Local = Bool;
 			}
 		"}
 		);
@@ -8926,7 +8914,6 @@ pub(super) mod tests {
 		test_case!(
 			mut case = indoc! {"
 			const VALUE: Need<S::Item> = Need();
-			type i32;
 			trait Marker {}
 			impl Marker for i32 {}
 			struct Need<T: Marker>();
@@ -8958,7 +8945,6 @@ pub(super) mod tests {
 	fn free_constant_annotations_recover_from_failed_generic_requirements() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			trait Marker {}
 			struct Need<T: Marker>();
 			const VALUE: Need<i32> = Need();
@@ -8985,8 +8971,6 @@ pub(super) mod tests {
 	fn enum_types_resolve_forward_paths_in_all_signature_positions() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			func f(x: colors::Color) -> Alias { loop {} }
 			const FIRST: Alias = colors::Color::Red;
 			struct Paint( color: Alias );
@@ -9024,9 +9008,6 @@ pub(super) mod tests {
 	fn builtin_and_memory_types_reject_type_arguments() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
-			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
@@ -9057,8 +9038,6 @@ pub(super) mod tests {
 	#[test]
 	fn enum_types_reject_generic_arguments() {
 		let source = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			func f(x: Color<i32>, y: nested::Color<i32, i32>) {}
 			enum Color(i32) { Red = 0 }
 			mod nested { pub enum Color(i32) { Red = 0 } }
@@ -9107,12 +9086,16 @@ pub(super) mod tests {
 
 	#[test]
 	fn enum_type_identity_does_not_force_its_representation_query() {
-		with_pending_signatures(
+		with_pending_std_signatures(
 			indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			type i32;
 			func f(x: Color) -> Color {}
 			enum Color(i32) { Red }
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"},
 			|builder| {
 				let function = DefId::Function(FunctionIdx::new(0));
@@ -9162,7 +9145,7 @@ pub(super) mod tests {
 		] {
 			test_case!(
 				case = &format!(
-					"func f(x: Color) -> Color {{ loop {{}} }} {declaration} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+					"func f(x: Color) -> Color {{ loop {{}} }} {declaration} "
 				)
 			);
 			assert_eq!(
@@ -9194,7 +9177,6 @@ pub(super) mod tests {
 	fn an_enum_repr_resolves_to_the_named_integer_type() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			enum Color(i32) { Red = 0, Green, Blue }
 		"}
 		);
@@ -9213,7 +9195,6 @@ pub(super) mod tests {
 	fn an_enum_variant_is_a_constant_of_its_enum() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
 			enum Color(i32) { Red = 0, Green = 4 }
 		"}
 		);
@@ -9259,8 +9240,7 @@ pub(super) mod tests {
 	fn an_enum_with_a_non_integer_repr_is_diagnosed() {
 		test_case!(
 			case = indoc! {"
-			type bool;
-			enum Color(bool) { Red, Green, Blue }
+			enum Color(Bool) { Red, Green, Blue }
 		"}
 		);
 
@@ -9297,9 +9277,6 @@ pub(super) mod tests {
 	fn associated_type_defaults_apply_without_hiding_impl_overrides() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
-			type u32;
 			trait Container { type Item = i32; }
 			struct Defaulted();
 			struct Overridden();
@@ -9323,8 +9300,6 @@ pub(super) mod tests {
 	fn associated_type_defaults_substitute_self_and_resolve_other_members() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container {
 				type SelfType = Self;
 				type Item = Self::Other;
@@ -9361,7 +9336,6 @@ pub(super) mod tests {
 	fn bounded_associated_type_default_resolves_forward_type() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Marker {}
 			trait Container { type Item: Marker = Later; }
 			struct Later();
@@ -9389,7 +9363,7 @@ pub(super) mod tests {
 		// The default means something only in an impl that inherits it, so the
 		// impl owns the loop: reported once, at the impl, whether or not any
 		// use reaches it. The use's type is kept as written and fails silently.
-		const IMPL: &str = "impl Container for Wrapper {} pub trait Call { type Args; type Result; } pub trait Function: Call {}";
+		const IMPL: &str = "impl Container for Wrapper {} ";
 		for uses in [
 			"",
 			"func f(x: Wrapper::Item) {}",
@@ -9446,7 +9420,6 @@ pub(super) mod tests {
 		// so it restates itself and the projection stays abstract: no error,
 		// although judging `V::B` reaches `V::B` again.
 		const DECLS: &str = "
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Tr { type A: Tr2 where { B = <V as Tr2>::B }; }
 			trait Tr2 { type B; }
 			struct W();
@@ -9483,7 +9456,6 @@ pub(super) mod tests {
 		// requests are one, under the root.
 		test_case!(
 			mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Container { type Item; }
                 struct Q();
                 struct P();
@@ -9521,8 +9493,6 @@ pub(super) mod tests {
 		// answer holds only while the loop is open. From the top it is `u32`.
 		test_case!(
 			mut case = "
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
-				pub type u32;
 				trait Tr { type A; }
 				trait Tr2 { type B; }
 				struct W();
@@ -9545,7 +9515,6 @@ pub(super) mod tests {
 		// reads none of it, so its answer is cached for later requests.
 		test_case!(
 			case = "
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Tr { type A: Tr; }
 				func f<T: Tr where { A = V }, V: Tr>(x: <<T as Tr>::A as Tr>::A) {}
 			"
@@ -9580,7 +9549,6 @@ pub(super) mod tests {
 			trait Pair {{ type First; type Second; }}
 			struct Example();
 			impl Example {{ }}
-			pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}
 			impl Pair for Example {{
 			    {method}
 			    type First = Self::Second;
@@ -9619,8 +9587,6 @@ pub(super) mod tests {
 		// that closes the loop reports it.
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Pair { type First = Self::Second; type Second; }
 			struct Fine();
 			struct Looping();
@@ -9638,7 +9604,6 @@ pub(super) mod tests {
 	fn trait_impl_assoc_type_resolves_to_its_provided_value() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			trait Container { type Item; }
 			struct Wrapper();
 			impl Container for Wrapper { type Item = i32; }
@@ -9689,12 +9654,16 @@ pub(super) mod tests {
 		use crate::tir::members::{
 			ApplicableMember, MemberLookup, TraitMemberSelection,
 		};
-		with_pending_signatures(
+		with_pending_std_signatures(
 			indoc! {"
 			trait Container { func overridden() {} func inherited() {} }
 			struct Wrapper();
 			impl Container for Wrapper { func overridden() {} type Extra = (); }
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
+		type u8;
+		type u32;
+		enum Bool(u8) { False = 0, True = 1 }
+		struct Char(value: u32);
 		"},
 			|builder| {
 				builder.sweep();
@@ -9839,7 +9808,6 @@ pub(super) mod tests {
 			test_case!(
 				mut case = &format!(
 					"
-				pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}
 				trait Container {{ type Item; }}
 				struct Wrapper();
 				impl Container for Wrapper {{}}
@@ -9879,7 +9847,6 @@ pub(super) mod tests {
 	fn a_member_of_a_projection_with_no_value_needs_its_own_declaration() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Container { type Item; }
 			struct Wrapper();
 			impl Container for Wrapper {}
@@ -9899,11 +9866,14 @@ pub(super) mod tests {
 	#[test]
 	fn memory_declaration_registers_a_synthetic_impl_with_a_checked_size() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -9937,12 +9907,15 @@ pub(super) mod tests {
 	#[test]
 	fn memory_size_violating_pointer_size_is_diagnosed() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
-			type bool;
+			
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
-			memory heap: bool;
+			memory heap: Bool;
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -9966,17 +9939,20 @@ pub(super) mod tests {
 			[usize::from(memory_def.size_assoc_type_index)]
 		.as_ref()
 		.expect("memory's Size value is resolved");
-		// The violation is diagnosed; the written `bool` is kept.
+		// The violation is diagnosed; the written `Bool` is kept.
 		assert_eq!(size_signature.value, Some(TypeIndex::BOOL));
 	}
 
 	#[test]
 	fn global_declaration_registers_a_synthetic_impl_with_its_value_type() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
 			trait Global { type Value; }
 			global counter: u32 = 0;
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -10012,11 +9988,14 @@ pub(super) mod tests {
 	#[test]
 	fn mutable_global_also_registers_a_global_mut_impl() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
 			trait Global { type Value; }
 			trait GlobalMut: Global {}
 			global mut counter: u32 = 0;
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -10078,13 +10057,16 @@ pub(super) mod tests {
 	#[test]
 	fn imported_memory_registers_a_synthetic_impl_with_a_checked_size() {
 		test_case!(
-			case = indoc! {r#"
+			std case = indoc! {r#"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			import "env" as host {
 				memory shared: u32;
 			}
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"#}
 		);
 		assert!(
@@ -10115,12 +10097,15 @@ pub(super) mod tests {
 	#[test]
 	fn imported_global_registers_a_synthetic_impl_with_its_value_type() {
 		test_case!(
-			case = indoc! {r#"
+			std case = indoc! {r#"
 			type u32;
 			trait Global { type Value; }
 			import "env" as host {
 				global counter: u32;
 			}
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"#}
 		);
 		assert!(
@@ -10152,13 +10137,16 @@ pub(super) mod tests {
 	#[test]
 	fn imported_mutable_global_also_registers_a_global_mut_impl() {
 		test_case!(
-			case = indoc! {r#"
+			std case = indoc! {r#"
 			type u32;
 			trait Global { type Value; }
 			trait GlobalMut: Global {}
 			import "env" as host {
 				global mut counter: u32;
 			}
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"#}
 		);
 		assert!(
@@ -10186,8 +10174,6 @@ pub(super) mod tests {
 	fn imported_function_resolves_its_parameter_and_return_types() {
 		test_case!(
 			case = indoc! {r#"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			import "env" as host {
 				func log(value: u32) -> u32;
 			}
@@ -10215,8 +10201,6 @@ pub(super) mod tests {
 	fn pointer_type_resolves_through_its_memory_tag() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
@@ -10261,8 +10245,6 @@ pub(super) mod tests {
 	fn pointer_type_without_a_memory_is_diagnosed_with_no_memory_declared() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			func f(x: *u32);
 		"}
 		);
@@ -10285,8 +10267,6 @@ pub(super) mod tests {
 		// always written.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
@@ -10304,8 +10284,6 @@ pub(super) mod tests {
 	fn pointer_type_without_a_memory_is_diagnosed_with_several_memories() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
@@ -10321,8 +10299,6 @@ pub(super) mod tests {
 	fn slice_and_array_types_resolve_through_their_memory_tag() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
@@ -10387,8 +10363,6 @@ pub(super) mod tests {
 	fn memory_tagged_pointer_resolves_the_explicit_memory_despite_ambiguity() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
@@ -10431,8 +10405,6 @@ pub(super) mod tests {
 	fn memory_tag_naming_a_non_memory_preserves_the_pointer() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u32;
             trait Memory {}
             struct Foo();
 
@@ -10457,7 +10429,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_generic_memory_for_pointers_slices_and_arrays() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             trait Memory {}
@@ -10468,6 +10440,9 @@ pub(super) mod tests {
                 slice: M::&[u8],
                 array: M::*[u8; 4],
             ) {}
+            type u32;
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -10513,7 +10488,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_requires_a_bound_and_accepts_a_memory_supertrait() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             trait Memory {}
@@ -10522,6 +10497,9 @@ pub(super) mod tests {
             func unbounded<M>(value: M, ptr: M::*u8) {}
 
             func inherited<M: SpecialMemory>(value: M, ptr: M::*u8) {}
+            type u32;
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -10560,7 +10538,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_a_generic_associated_type_bounded_by_memory() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             trait Memory {}
@@ -10570,6 +10548,9 @@ pub(super) mod tests {
             }
 
             func test<T: Container>(value: T::Mem, ptr: T::Mem::*u8) {}
+            type u32;
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -10594,7 +10575,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_self_with_a_memory_supertrait() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
             type u8;
             trait Memory {}
 
@@ -10602,6 +10583,9 @@ pub(super) mod tests {
                 func test(value: Self, ptr: Self::*u8);
             }
         pub trait Call { type Args; type Result; } pub trait Function: Call {}
+        type u32;
+        enum Bool(u8) { False = 0, True = 1 }
+        struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -10622,7 +10606,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_struct_impls_and_concrete_associated_types() {
 		test_case!(
-			mut case = indoc! {"
+			std mut case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             trait Memory {}
@@ -10643,6 +10627,9 @@ pub(super) mod tests {
             func direct(ptr: Heap::*u8) {}
 
             func associated(value: Holder::Mem, ptr: Holder::Mem::*u8) {}
+            type u32;
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -10666,7 +10653,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_resolves_generic_arguments_and_checks_impl_requirements() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             trait Memory {}
@@ -10677,6 +10664,9 @@ pub(super) mod tests {
             func bounded<M: Memory>(value: Heap<M>, ptr: Heap<M>::*u8) {}
 
             func unbounded<M>(ptr: Heap<M>::*u8) {}
+            type u32;
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -10712,9 +10702,6 @@ pub(super) mod tests {
 	fn memory_tag_accepts_an_alias_to_a_concrete_memory() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            type u32;
 
             typeset PointerSize {
                 u32,
@@ -10753,9 +10740,6 @@ pub(super) mod tests {
 	fn memory_tag_respects_generic_parameter_shadowing() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            type u32;
 
             typeset PointerSize {
                 u32,
@@ -10796,9 +10780,6 @@ pub(super) mod tests {
 	fn memory_tag_resolves_trailing_segments_after_a_concrete_memory() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            type u32;
 
             typeset PointerSize {
                 u32,
@@ -10833,8 +10814,6 @@ pub(super) mod tests {
 	fn memory_tag_failure_preserves_a_valid_projection_in_other_positions() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
             trait Memory {}
 
             trait Container {
@@ -10868,7 +10847,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_membership_waits_for_associated_equalities() {
 		test_case!(
-			mut case = indoc! {"
+			std mut case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             type u32;
@@ -10883,6 +10862,8 @@ pub(super) mod tests {
                 T: Container where { Item = U::Item::*u8 },
                 U: Container where { Item = u32 },
             >(ptr: T::Item) {}
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -10904,9 +10885,6 @@ pub(super) mod tests {
 	{
 		test_case!(
 			mut case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            type u32;
             trait Memory {}
 
             trait Container {
@@ -10938,7 +10916,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_with_a_failed_projection_preserves_the_pointer() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             trait Memory {}
@@ -10955,6 +10933,9 @@ pub(super) mod tests {
                 T: Container where { Item = <U as Project>::Output },
                 U,
             >(value: U, ptr: T::Item::*u8) {}
+            type u32;
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -10985,7 +10966,7 @@ pub(super) mod tests {
 	fn memory_tag_deferred_projection_failure_preserves_its_surrounding_pointer()
 	 {
 		test_case!(
-			mut case = indoc! {"
+			std mut case = indoc! {"
             pub trait Call { type Args; type Result; } pub trait Function: Call {}
             type u8;
             trait Memory {}
@@ -11003,6 +10984,9 @@ pub(super) mod tests {
                 V: Container where { Item = <U as Project>::Output },
                 U,
             >(value: U, ptr: T::Item) {}
+            type u32;
+            enum Bool(u8) { False = 0, True = 1 }
+            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11066,9 +11050,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_untyped_self_param_resolves_to_the_traits_own_self() {
-		test_case!(
-			case = "trait Foo { func get(self: Self) -> Self; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
-		);
+		test_case!(case = "trait Foo { func get(self: Self) -> Self; } ");
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -11091,7 +11073,6 @@ pub(super) mod tests {
 			case = indoc! {"
 			struct S();
 			impl S { func get(self: Self) -> Self { self } }
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -11124,7 +11105,6 @@ pub(super) mod tests {
 	fn an_inherent_impl_const_resolves_its_declared_type() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			struct S();
 			impl S { const X: i32 = 0; }
 		"}
@@ -11150,7 +11130,6 @@ pub(super) mod tests {
 				func get(self: Self) -> Self { self }
 				func make(x: Self) -> Self { x }
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -11178,7 +11157,6 @@ pub(super) mod tests {
 	fn trait_impl_member_generics_inherit_the_impl_scope_and_allow_shadowing() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			typeset Number { i32 }
 			trait Service {
 				type Item;
@@ -11193,7 +11171,6 @@ pub(super) mod tests {
 				func shadow<T>(self: Self, x: T) -> Self { self }
 				const VALUE: T = 0;
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -11240,7 +11217,6 @@ pub(super) mod tests {
 	fn trait_impl_member_checks_use_enclosing_and_local_assumptions() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
 			trait Marker {}
 			impl Marker for i32 {}
 			trait Container { type Item; }
@@ -11254,7 +11230,6 @@ pub(super) mod tests {
 				type Item = T;
 				func get<U: Container where { Item = i32 }>(self: Self, x: Need<T>, y: Need<U::Item>) {}
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -11284,7 +11259,6 @@ pub(super) mod tests {
 	fn trait_impl_methods_complete_checks_from_forward_associated_equalities() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
 			trait Marker {}
 			impl Marker for i32 {}
 			struct Need<T: Marker>();
@@ -11296,7 +11270,6 @@ pub(super) mod tests {
 			impl Service for S {
 				func get<U: Container where { A = Need<U::B>, B = i32 }>(self: Self, x: U::A) {}
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert!(
@@ -11323,7 +11296,6 @@ pub(super) mod tests {
 	fn trait_impl_member_signatures_recover_from_failed_generic_requirements() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			trait Marker {}
 			struct Need<T: Marker>();
 			trait Service { func get(self: Self, x: i32); const VALUE: i32; }
@@ -11332,7 +11304,6 @@ pub(super) mod tests {
 				func get(self: Self, x: Need<i32>) {}
 				const VALUE: Need<i32> = Need();
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		// Both annotations, and the construction, which proves its own
@@ -11365,7 +11336,6 @@ pub(super) mod tests {
 	fn trait_impl_constants_normalize_associated_types_declared_after_them() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
 			trait Service { type Item; const VALUE: Self::Item; }
 			struct S();
 			impl Service for S {
@@ -11389,7 +11359,6 @@ pub(super) mod tests {
 	fn impl_constants_require_explicit_type_annotations() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			trait Service { const VALUE: i32; }
 			struct S();
 			impl Service for S { const VALUE = 0; }
@@ -11422,14 +11391,12 @@ pub(super) mod tests {
 	fn invalid_trait_impl_member_annotations_are_diagnosed_without_panicking() {
 		test_case!(
 			case = indoc! {"
-			type i32;
 			trait Service { func get(self: Self, x: i32, y: i32) -> i32; const VALUE: i32; }
 			struct S();
 			impl Service for S {
 				func get(self: Self, x, y: _) -> _ {}
 				const VALUE: _ = 0;
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 		assert_eq!(
@@ -11473,13 +11440,17 @@ pub(super) mod tests {
 	#[test]
 	fn trait_impl_member_requests_force_the_parent_header() {
 		for method_first in [false, true] {
-			with_pending_signatures(
+			with_pending_std_signatures(
 				indoc! {"
 				type i32;
 				trait Service { func get(self: Self) -> Self; const VALUE: i32; }
 				struct S();
 				impl Service for S { func get(self: Self) -> Self { self } const VALUE: i32 = 0; }
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 			"},
 				|builder| {
 					let member = builder
@@ -11541,9 +11512,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_functions_own_generic_param_is_distinct_from_self() {
-		test_case!(
-			case = "trait Foo { func get<T>(self: Self, x: T) -> T; } pub trait Call { type Args; type Result; } pub trait Function: Call {}"
-		);
+		test_case!(case = "trait Foo { func get<T>(self: Self, x: T) -> T; } ");
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -11568,16 +11537,20 @@ pub(super) mod tests {
 	fn associated_type_signatures_keep_definition_indices_when_resolved_out_of_order()
 	 {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type i32;
-			type bool;
-			trait Result { type Value; const FLAG: bool; }
+			
+			trait Result { type Value; const FLAG: Bool; }
 			trait Source { type Value; }
 			trait Container {
 				type First: Result where { Value = Self::Second::Value };
 				type Second: Source;
 				const COUNT: i32;
 			}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 		assert!(
@@ -11626,7 +11599,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_const_resolves_its_declared_type() {
-		test_case!(case = "type i32; trait Foo { const X: i32; }");
+		test_case!(case = "trait Foo { const X: i32; }");
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -11644,7 +11617,6 @@ pub(super) mod tests {
 				const X: Self;
 				func get(self: Self) -> Self;
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -11691,8 +11663,6 @@ pub(super) mod tests {
 	fn a_where_binding_resolves_an_equals_assoc_type_to_a_concrete_type() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Memory { type Size; }
 			func f<Mem: Memory where { Size = i32 }>() {}
 		"}
@@ -11721,8 +11691,6 @@ pub(super) mod tests {
 	fn a_where_equality_satisfying_the_declared_bound_is_accepted() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Small {}
 			impl Small for u8 {}
 			trait Memory { type Size: Small; }
@@ -11739,8 +11707,6 @@ pub(super) mod tests {
 		// `Mem::Size = i32` do not make `i32: Small`, which only an impl can.
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Small {}
 			trait Memory { type Size: Small; }
 			func f<Mem: Memory where { Size = i32 }>(x: Mem::Size) {}
@@ -11770,7 +11736,6 @@ pub(super) mod tests {
 		// written, as in Rust, or the equality is reported.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Small {}
 			trait Memory { type Size: Small; }
 			func bounded<U: Small, Mem: Memory where { Size = U }>() {}
@@ -11788,8 +11753,6 @@ pub(super) mod tests {
 	fn a_nested_where_equality_is_checked_against_its_declared_bound() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Small {}
 			trait Memory { type Size: Small; }
 			trait Owner { type Mem; }
@@ -11811,8 +11774,6 @@ pub(super) mod tests {
 	fn a_binding_constrains_a_supertraits_associated_type() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait Base { type Item; }
 			trait Derived: Base {}
 			trait Further: Derived {}
@@ -11829,7 +11790,6 @@ pub(super) mod tests {
 	fn a_binding_on_a_supertraits_associated_type_takes_a_nested_bound() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Small {}
 			trait Base { type Item; }
 			trait Derived: Base {}
@@ -11844,8 +11804,6 @@ pub(super) mod tests {
 	fn a_traits_own_associated_type_wins_over_a_supertraits() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait Base { type Item; }
 			trait Derived: Base { type Item; }
 			func f<T: Derived where { Item = u32 }>(
@@ -11865,8 +11823,6 @@ pub(super) mod tests {
 	fn a_binding_passes_over_a_function_of_the_same_name() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait Base { type Item; }
 			trait Derived: Base { func Item(); }
 			func f<T: Derived where { Item = u32 }>(x: <T as Base>::Item) {}
@@ -11880,8 +11836,6 @@ pub(super) mod tests {
 	fn a_supertrait_reached_twice_supplies_one_binding_target() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait Base { type Item; }
 			trait Left: Base {}
 			trait Right: Base {}
@@ -11897,8 +11851,6 @@ pub(super) mod tests {
 	fn a_binding_two_supertraits_declare_is_ambiguous() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait Left { type Item; }
 			trait Right { type Item; }
 			trait Both: Left + Right {}
@@ -11917,9 +11869,6 @@ pub(super) mod tests {
 	fn a_supertrait_binding_conflicts_with_one_on_the_supertrait() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
-			type u64;
 			trait Base { type Item; }
 			trait Derived: Base {}
 			func f<T: Derived where { Item = u32 } + Base where { Item = u64 }>() {}
@@ -11936,8 +11885,6 @@ pub(super) mod tests {
 	fn a_binding_no_supertrait_declares_is_not_an_associated_type() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait Base { type Item; }
 			trait Derived: Base {}
 			func f<T: Derived where { Missing = u32 }>() {}
@@ -11953,8 +11900,6 @@ pub(super) mod tests {
 	fn a_binding_in_a_supertrait_cycle_reports_the_cycle_once() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			trait A: A where { Item = u32 } {}
 		"}
 		);
@@ -11971,8 +11916,6 @@ pub(super) mod tests {
 	{
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Small {}
 			trait Memory { type Size: Small; }
 			trait Owner { type Mem: Memory where { Size = i32 }; }
@@ -11990,7 +11933,6 @@ pub(super) mod tests {
 	fn a_where_equality_that_failed_to_resolve_is_not_checked() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Small {}
 			trait Memory { type Size: Small; }
 			func f<Mem: Memory where { Size = Missing }>() {}
@@ -12006,11 +11948,9 @@ pub(super) mod tests {
 	fn a_use_proves_the_equalities_its_bound_states() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; type bool;
 			trait HasItem { type Item; }
 			impl HasItem for u64 { type Item = u8; }
-			struct W<T: HasItem where { Item = bool }>();
+			struct W<T: HasItem where { Item = Bool }>();
 			struct V<T: HasItem where { Item = u8 }>();
 			func f(w: W<u64>, v: V<u64>) {}
 		"}
@@ -12019,7 +11959,7 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
-			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+			"type mismatch resolving `<u64 as HasItem>::Item == Bool`",
 		);
 	}
 
@@ -12027,20 +11967,18 @@ pub(super) mod tests {
 	fn an_equality_naming_a_sibling_parameter_takes_its_argument() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; type bool;
 			trait HasItem { type Item; }
 			impl HasItem for u64 { type Item = u8; }
 			struct W<T: HasItem where { Item = U }, U>();
 			func ok(w: W<u64, u8>) {}
-			func bad(w: W<u64, bool>) {}
+			func bad(w: W<u64, Bool>) {}
 		"}
 		);
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
-			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+			"type mismatch resolving `<u64 as HasItem>::Item == Bool`",
 		);
 	}
 
@@ -12048,11 +11986,9 @@ pub(super) mod tests {
 	fn a_generic_use_proves_an_equality_from_its_own_assumptions() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type bool;
 			trait HasItem { type Item; }
-			struct W<T: HasItem where { Item = bool }>();
-			func ok<T: HasItem where { Item = bool }>(w: W<T>) {}
+			struct W<T: HasItem where { Item = Bool }>();
+			func ok<T: HasItem where { Item = Bool }>(w: W<T>) {}
 			func bad<T: HasItem>(w: W<T>) {}
 		"}
 		);
@@ -12060,31 +11996,34 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
-			"type mismatch resolving `<T as HasItem>::Item == bool`",
+			"type mismatch resolving `<T as HasItem>::Item == Bool`",
 		);
 	}
 
 	#[test]
 	fn a_use_proves_a_nested_bound_on_the_projection() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; type bool;
+			type u8; type u64; 
 			trait HasItem { type Item; }
 			trait Outer { type Inner; }
 			impl HasItem for u64 { type Item = u8; }
 			impl Outer for u8 { type Inner = u64; }
-			impl Outer for bool { type Inner = bool; }
+			impl Outer for Bool { type Inner = Bool; }
 			struct W<T: Outer where { Inner: HasItem where { Item = u8 } }>();
 			func ok(w: W<u8>) {}
-			func bad(w: W<bool>) {}
+			func bad(w: W<Bool>) {}
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
-			"the trait bound `bool: HasItem` is not satisfied",
+			"the trait bound `Bool: HasItem` is not satisfied",
 		);
 	}
 
@@ -12092,21 +12031,19 @@ pub(super) mod tests {
 	fn a_member_function_bound_takes_its_impl_arguments() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; type bool;
 			trait HasItem { type Item; }
 			impl HasItem for u64 { type Item = u8; }
 			struct Host<T>();
 			impl<T> Host<T> { func f<U: HasItem where { Item = T }>() {} }
 			func ok(x: Host<u8>::f<u64>) {}
-			func bad(x: Host<bool>::f<u64>) {}
+			func bad(x: Host<Bool>::f<u64>) {}
 		"}
 		);
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
-			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+			"type mismatch resolving `<u64 as HasItem>::Item == Bool`",
 		);
 	}
 
@@ -12116,20 +12053,18 @@ pub(super) mod tests {
 		// `Self` as `T`, so `Item` must be `T::B`.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; type bool;
 			trait HasItem { type Item; }
 			impl HasItem for u64 { type Item = u8; }
 			trait Tr { type B; type A: HasItem where { Item = Self::B }; }
 			func ok<T: Tr where { A = u64, B = u8 }>() {}
-			func bad<T: Tr where { A = u64, B = bool }>() {}
+			func bad<T: Tr where { A = u64, B = Bool }>() {}
 		"}
 		);
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
-			"type mismatch resolving `<u64 as HasItem>::Item == bool`",
+			"type mismatch resolving `<u64 as HasItem>::Item == Bool`",
 		);
 	}
 
@@ -12137,7 +12072,6 @@ pub(super) mod tests {
 	fn a_where_binding_resolves_a_bound_assoc_type_to_a_trait() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Unsigned {}
 			trait Memory { type Size; }
 			func f<Mem: Memory where { Size: Unsigned }>() {}
@@ -12168,8 +12102,6 @@ pub(super) mod tests {
 	fn a_duplicate_where_binding_is_diagnosed_and_only_the_first_is_kept() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Memory { type Size; }
 			func f<Mem: Memory where { Size = i32, Size = i32 }>() {}
 		"}
@@ -12194,8 +12126,6 @@ pub(super) mod tests {
 	fn a_where_binding_naming_an_unknown_associated_type_is_diagnosed() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Memory { type Size; }
 			func f<Mem: Memory where { Nope = i32 }>() {}
 		"}
@@ -12220,7 +12150,6 @@ pub(super) mod tests {
 	fn a_where_binding_may_reference_a_sibling_param_declared_later() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait PointerSize {}
 			trait Memory { type Size; }
 			func copy<Src: Memory where { Size = S }, S: PointerSize>() {}
@@ -12247,9 +12176,6 @@ pub(super) mod tests {
 	fn a_typeset_bound_resolves_to_its_backing_trait() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
-			type i32;
 			typeset Int { u32, i32 }
 			func f<T: Int>() {}
 		"}
@@ -12288,9 +12214,12 @@ pub(super) mod tests {
 	#[test]
 	fn a_typeset_member_registers_a_synthetic_impl() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
 			typeset Int { u32 }
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -12314,11 +12243,14 @@ pub(super) mod tests {
 	#[test]
 	fn a_typeset_used_before_its_own_declaration_still_sees_its_members() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			func f<T: Int>() {}
 			type u32;
 			typeset Int { u32 }
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -12339,9 +12271,12 @@ pub(super) mod tests {
 	#[test]
 	fn duplicate_typeset_members_are_diagnosed() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			type u32;
 			typeset Int { u32, u32 }
+			type u8;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
@@ -12372,7 +12307,6 @@ pub(super) mod tests {
 				type Value;
 				func get(self: Self) -> Self::Value;
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -12408,7 +12342,6 @@ pub(super) mod tests {
 				type Value;
 				func get(self: Self) -> <Self>::Value;
 			}
-		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		"}
 		);
 
@@ -12437,7 +12370,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait A { type X; }
 			trait B { type X; }
 			func f<T: A + B>(x: <T as A>::X) { }
@@ -12462,7 +12394,6 @@ pub(super) mod tests {
 	fn qualified_path_continues_projecting_after_its_first_segment() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait B { type Y; }
 			trait A { type X: B; }
 			func f<T: A>(x: <T as A>::X::Y) { }
@@ -12488,7 +12419,6 @@ pub(super) mod tests {
 	{
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait A { type X; }
 			func f<T: A>(x: <T as A>::Y) { }
 		"}
@@ -12512,7 +12442,6 @@ pub(super) mod tests {
 	{
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait A { type X; }
 			trait B {}
 			func f<T: B>(x: <T as A>::X) { }
@@ -12541,8 +12470,6 @@ pub(super) mod tests {
 	fn concrete_projection_paths_normalize_forward_references_and_chains() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			func f(a: < <Wrapper as Container>::Item as Element>::Value,
 				b: <Inner as Element>::Value) {}
 			trait Container { type Item; }
@@ -12580,8 +12507,6 @@ pub(super) mod tests {
 	fn a_member_of_a_concrete_projection_needs_the_trait_qualified() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			trait Element { type Value; }
 			struct Wrapper();
@@ -12622,7 +12547,6 @@ pub(super) mod tests {
 		let suggestion = {
 			test_case!(
 				case = indoc! {"
-				type i32;
 				trait Container { type Item; }
 				trait Element { type Value; }
 				struct Wrapper();
@@ -12630,7 +12554,6 @@ pub(super) mod tests {
 				impl Container for Wrapper { type Item = Inner; }
 				impl Element for Inner { type Value = i32; }
 				func f(a: Wrapper::Item::Value) {}
-				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			"}
 			);
 			suggested_spelling(&case.context.diagnostics[0])
@@ -12639,7 +12562,6 @@ pub(super) mod tests {
 		test_case!(
 			mut case = &format!(
 				"
-			type i32;
 			trait Container {{ type Item; }}
 			trait Element {{ type Value; }}
 			struct Wrapper();
@@ -12647,7 +12569,6 @@ pub(super) mod tests {
 			impl Container for Wrapper {{ type Item = Inner; }}
 			impl Element for Inner {{ type Value = i32; }}
 			func f(a: {suggestion}) {{}}
-			pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}
 		"
 			)
 		);
@@ -12659,8 +12580,6 @@ pub(super) mod tests {
 	fn every_trait_that_could_supply_the_member_is_suggested() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			trait Element { type Value; }
 			trait Measure { type Value; }
@@ -12690,8 +12609,6 @@ pub(super) mod tests {
 	fn the_suggestion_also_resolves_through_an_abstract_value() {
 		// The projection's value is a type parameter, only by way of the impl.
 		const DECLARATIONS: &str = "
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			trait Element { type Value; }
 			struct Wrap<X>();
@@ -12722,7 +12639,6 @@ pub(super) mod tests {
 	fn a_name_no_trait_of_the_value_declares_is_not_suggested() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Container { type Item; }
 			trait Other { type Value; }
 			struct Wrapper();
@@ -12740,9 +12656,6 @@ pub(super) mod tests {
 	fn concrete_projections_normalize_in_compound_signatures() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
-			type u32;
 			trait Memory { type Size; }
 			memory heap: u32;
 			trait Container { type Item; }
@@ -12852,7 +12765,6 @@ pub(super) mod tests {
 				    type Second = Self::First;
 				}}
 				{after}
-				pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}
 			"
 				);
 				test_case!(case = &source);
@@ -12892,8 +12804,12 @@ pub(super) mod tests {
 			impl Project for i32 { type Out = <Wrap<Wrap<Wrap<Wrap<Leaf>>>> as Project>::Out; }
 			func first(x: <i32 as Project>::Out) {}
 			func second(x: <i32 as Project>::Out) {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"};
-		with_pending_signatures(SOURCE, |builder| {
+		with_pending_std_signatures(SOURCE, |builder| {
 			builder.solver.set_limit_for_test(3);
 			builder.sweep();
 			let readers = SOURCE.find("func first").unwrap();
@@ -12948,12 +12864,10 @@ pub(super) mod tests {
 			test_case!(
 				case = &format!(
 					"
-				type i32;
 				trait Pair {{ type First; type Second; }}
 				struct Example();
 				impl Pair for Example {{ {definitions} }}
 				func independent(x: i32) {{}}
-				pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}
 			"
 				)
 			);
@@ -12982,8 +12896,6 @@ pub(super) mod tests {
 	fn synthetic_values_normalize_and_synthetic_cycles_recover() {
 		test_case!(
 			mut case = indoc! {r#"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
 			trait Global { type Value; }
@@ -13047,12 +12959,16 @@ pub(super) mod tests {
 
 	#[test]
 	fn head_normalization_exposes_constructor_without_traversing_children() {
-		with_pending_signatures(
+		with_pending_std_signatures(
 			indoc! {"
 			type i32;
 			trait Container { type Item; }
 			struct Wrapper();
 			impl Container for Wrapper { type Item = i32; }
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"},
 			|builder| {
 				let receiver =
@@ -13119,8 +13035,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_preserves_abstract_and_inference_projections() {
-		with_pending_signatures(
-			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {}",
+		with_pending_std_signatures(
+			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|builder| {
 				let def_id = DefId::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(QueryInfo {
@@ -13187,7 +13103,7 @@ pub(super) mod tests {
 	#[test]
 	fn deep_normalization_visits_all_supported_children_and_preserves_metadata()
 	{
-		with_pending_signatures(
+		with_pending_std_signatures(
 			indoc! {"
 			type i32;
 			trait Container { type Item; }
@@ -13195,6 +13111,10 @@ pub(super) mod tests {
 			impl Container for Wrapper { type Item = i32; }
 			func marker() {}
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"},
 			|builder| {
 				use crate::ast::Ownership;
@@ -13323,8 +13243,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn repeated_sibling_projections_are_not_a_cycle() {
-		with_pending_signatures(
-			"type i32; trait Container { type Item; } struct Wrapper(); impl Container for Wrapper { type Item = i32; }",
+		with_pending_std_signatures(
+			"type i32; trait Container { type Item; } struct Wrapper(); impl Container for Wrapper { type Item = i32; } type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|builder| {
 				let receiver =
 					builder.types.intern_struct(StructIdx::new(0), &[]);
@@ -13394,8 +13314,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn distinct_projection_chain_hits_depth_limit_without_exact_repetition() {
-		with_pending_signatures(
-			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {}",
+		with_pending_std_signatures(
+			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|builder| {
 				let def_id = DefId::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(QueryInfo {
@@ -13453,7 +13373,6 @@ pub(super) mod tests {
 			test_case!(
 				case = &format!(
 					"
-				pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}
 				trait Container {{ type Item; }}
 				struct Wrapper();
 				impl Container for Wrapper {{ type Item = Missing; }}
@@ -13485,8 +13404,6 @@ pub(super) mod tests {
 	fn qualified_path_resolves_a_concrete_impls_associated_type() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			struct Wrapper();
 			impl Container for Wrapper { type Item = i32; }
@@ -13506,9 +13423,6 @@ pub(super) mod tests {
 	fn generic_impl_projection_substitutes_its_own_target_arguments() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
-			type u32;
 			trait Container { type Item; }
 			struct Wrapper<T>();
 			impl<T> Container for Wrapper<T> { type Item = T; }
@@ -13529,9 +13443,6 @@ pub(super) mod tests {
 	fn generic_impl_target_matches_nested_and_repeated_arguments() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
-			type u32;
 			trait Container { type Item; }
 			struct Inner<T>();
 			struct Pair<A, B>();
@@ -13563,8 +13474,6 @@ pub(super) mod tests {
 	fn generic_impl_requires_its_inferred_arguments_bounds() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Good {}
 			trait Container { type Item; }
 			struct Yes();
@@ -13599,8 +13508,6 @@ pub(super) mod tests {
 	fn generic_impl_bound_checks_descend_through_nested_targets() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Mark {}
 			trait Container { type Item; }
 			struct Leaf();
@@ -13636,8 +13543,6 @@ pub(super) mod tests {
 	fn generic_impl_with_undetermined_parameter_does_not_match() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			struct Wrapper<T>();
 			impl<T> Container for Wrapper<i32> { type Item = T; }
@@ -13662,11 +13567,9 @@ pub(super) mod tests {
 	fn an_impl_with_an_equality_requirement_gives_its_trait_where_it_holds() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u16; type u64; type bool;
 			trait HasItem { type Item; }
 			impl HasItem for u64 { type Item = u8; }
-			impl HasItem for u16 { type Item = bool; }
+			impl HasItem for u16 { type Item = Bool; }
 			trait Show {}
 			struct W<T>();
 			impl<T: HasItem where { Item = u8 }> Show for W<T> {}
@@ -13687,11 +13590,9 @@ pub(super) mod tests {
 	fn an_inherent_impl_with_an_equality_requirement_applies_where_it_holds() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u16; type u64; type bool;
 			trait HasItem { type Item; }
 			impl HasItem for u64 { type Item = u8; }
-			impl HasItem for u16 { type Item = bool; }
+			impl HasItem for u16 { type Item = Bool; }
 			struct W<T>();
 			impl<T: HasItem where { Item = u8 }> W<T> { func m() {} }
 			func ok(x: W<u64>::m) {}
@@ -13711,27 +13612,30 @@ pub(super) mod tests {
 	#[test]
 	fn an_impl_requirement_proves_a_nested_bound() {
 		test_case!(
-			case = indoc! {"
+			std case = indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; type bool;
+			type u8; type u64; 
 			trait HasItem { type Item; }
 			trait Outer { type Inner; }
 			impl HasItem for u64 { type Item = u8; }
 			impl Outer for u8 { type Inner = u64; }
-			impl Outer for bool { type Inner = bool; }
+			impl Outer for Bool { type Inner = Bool; }
 			trait Show {}
 			struct W<T>();
 			impl<T: Outer where { Inner: HasItem where { Item = u8 } }> Show for W<T> {}
 			struct Need<X: Show>();
 			func ok(x: Need<W<u8>>) {}
-			func bad(x: Need<W<bool>>) {}
+			func bad(x: Need<W<Bool>>) {}
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
-			"the trait bound `W<bool>: Show` is not satisfied",
+			"the trait bound `W<Bool>: Show` is not satisfied",
 		);
 	}
 
@@ -13741,8 +13645,6 @@ pub(super) mod tests {
 		// selects the same impl and asks the same question again.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Loop { type Out; }
 			impl Loop for u8 { type Out = u8; }
 			struct S<T>();
@@ -13767,8 +13669,6 @@ pub(super) mod tests {
 		// The use is checked first; the impl's verdict still owns the loop.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			func f(x: <S<u8> as Loop>::Out) {}
 			trait Loop { type Out; }
 			impl Loop for u8 { type Out = u8; }
@@ -13793,8 +13693,6 @@ pub(super) mod tests {
 		// it, so the impl reports it once.
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
 			trait Loop { type Out; }
 			impl Loop for u8 { type Out = u8; }
 			struct S<T>();
@@ -13813,8 +13711,6 @@ pub(super) mod tests {
 	fn an_impl_selected_again_for_other_arguments_is_not_a_loop() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64;
 			trait Tr { type X; }
 			impl Tr for u64 { type X = u8; }
 			struct W<T>();
@@ -13833,15 +13729,13 @@ pub(super) mod tests {
 		// `i32`, `Other::Item` is not.
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32; type bool;
 			trait Source { type Item; }
 			trait Container { type Item; }
 			struct Value();
 			struct Other();
 			struct Wrapper<T>();
 			impl Source for Value { type Item = i32; }
-			impl Source for Other { type Item = bool; }
+			impl Source for Other { type Item = Bool; }
 			impl<T: Source where { Item = i32 }> Container for Wrapper<T> {
 				type Item = i32;
 			}
@@ -13867,8 +13761,6 @@ pub(super) mod tests {
 	fn generic_projection_cycle_appears_only_after_substitution() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Project { type Out; }
 			struct Wrap<T>();
 			struct End();
@@ -13908,7 +13800,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Container { type Item; }
 			struct Wrapper();
 			func f(x: <Wrapper as Container>::Item) { }
@@ -13998,7 +13889,6 @@ pub(super) mod tests {
 	fn a_bound_generic_params_associated_type_projects_through_the_bound() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait HasSize { type Size; }
 			func f<T: HasSize>(x: T::Size) -> T::Size { x }
 		"}
@@ -14025,7 +13915,6 @@ pub(super) mod tests {
 	fn a_missing_associated_type_on_a_bound_is_diagnosed() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Empty {}
 			func f<T: Empty>(x: T::Missing) { }
 		"}
@@ -14048,7 +13937,6 @@ pub(super) mod tests {
 	fn two_bounds_both_declaring_the_same_associated_type_is_ambiguous() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait A { type X; }
 			trait B { type X; }
 			func f<T: A + B>(x: T::X) { }
@@ -14081,9 +13969,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
-			type u64;
 			trait A { type X; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
@@ -14130,9 +14015,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
-			type u64;
 			trait A { type X; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
@@ -14165,8 +14047,6 @@ pub(super) mod tests {
 	fn a_traits_own_supertrait_combination_with_conflicting_assoc_type_bindings_is_diagnosed_eagerly()
 	 {
 		let source = indoc! {"
-			type u32;
-			type u64;
 			trait A { type X; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
@@ -14194,8 +14074,6 @@ pub(super) mod tests {
 	#[test]
 	fn direct_supertrait_conflict_points_to_second_bound() {
 		let source = indoc! {"
-			type u32;
-			type u64;
 			trait A { type X; }
 			trait D: A where { X = u32 } + A where { X = u64 } {}
 		"};
@@ -14218,9 +14096,6 @@ pub(super) mod tests {
 	fn conflicting_binding_does_not_poison_another_associated_type() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
-			type u64;
 			trait A { type X; type Y; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
@@ -14240,8 +14115,6 @@ pub(super) mod tests {
 	#[test]
 	fn nested_bound_conflict_is_still_diagnosed() {
 		let source = indoc! {"
-			type u32;
-			type u64;
 			trait Inner { type X; }
 			trait Outer { type Item; }
 			trait D: Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } + Outer where { Item: Inner where { X = u64 } } {}
@@ -14262,8 +14135,6 @@ pub(super) mod tests {
 	#[test]
 	fn conflict_within_one_nested_bound_list_is_diagnosed() {
 		let source = indoc! {"
-			type u32;
-			type u64;
 			trait Inner { type X; }
 			trait Outer { type Item; }
 			trait D: Outer where { Item: Inner where { X = u32 } + Inner where { X = u64 } } {}
@@ -14284,8 +14155,6 @@ pub(super) mod tests {
 	#[test]
 	fn nested_supertrait_conflict_is_diagnosed_with_forward_references() {
 		let source = indoc! {"
-			type u32;
-			type u64;
 			trait Inner { type X; }
 			trait Outer { type Item; }
 			trait D: Outer where { Item: B + C } {}
@@ -14342,8 +14211,6 @@ pub(super) mod tests {
 	#[test]
 	fn nested_conflict_survives_outer_equality_in_either_order() {
 		let source = indoc! {"
-			type u32;
-			type u64;
 			trait Inner { type X; }
 			trait Outer { type Item; }
 			trait D: Outer where { Item: Inner where { X = u32 } } + Outer where { Item: Inner where { X = u64 } } + Outer where { Item = u32 } {}
@@ -14376,8 +14243,6 @@ pub(super) mod tests {
 	fn inherited_nested_conflict_is_not_reported_again() {
 		test_case!(
 			case = indoc! {"
-			type u32;
-			type u64;
 			trait Inner { type X; }
 			trait Outer { type Item; }
 			trait D: Outer where { Item: Inner where { X = u32 } + Inner where { X = u64 } } {}
@@ -14397,7 +14262,6 @@ pub(super) mod tests {
 	fn equality_wins_over_associated_type_bounds_in_either_order() {
 		test_case!(
 			case = indoc! {"
-			type u32;
 			trait Mark {}
 			trait A { type X; }
 			trait D: A where { X: Mark } + A where { X = u32 } {}
@@ -14430,8 +14294,6 @@ pub(super) mod tests {
 	fn normalization_uses_direct_and_chained_equality_facts() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			struct Wrapper();
 			impl Container for Wrapper { type Item = i32; }
@@ -14453,7 +14315,6 @@ pub(super) mod tests {
 	fn normalization_rebinds_self_through_multiple_supertraits() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Base { type Item; }
 			trait Middle: Base where { Item = Self } {}
 			trait Final: Middle {}
@@ -14479,8 +14340,6 @@ pub(super) mod tests {
 	fn normalization_reads_nested_constraints_and_deduplicates_memberships() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner; }
 			func f<T: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item::Value) {}
@@ -14501,8 +14360,6 @@ pub(super) mod tests {
 	fn normalization_reads_nested_constraints_without_a_declared_trait_bound() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			func f<T: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item::Value) {}
@@ -14520,7 +14377,6 @@ pub(super) mod tests {
 	fn normalization_rebinds_self_in_inherited_nested_facts() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			trait Middle: Outer where { Item: Inner where { Value = Self } } {}
@@ -14544,7 +14400,6 @@ pub(super) mod tests {
 	fn normalization_rebinds_self_in_associated_declaration_facts() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner where { Value = Self }; }
 			func f<T: Outer>(x: T::Item::Value) {}
@@ -14567,8 +14422,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			func f<T: Outer where { Item = U } + Outer where { Item: Inner where { Value = i32 } }, U>(x: T::Item::Value) {}
@@ -14590,8 +14443,6 @@ pub(super) mod tests {
 	fn normalization_resolves_sibling_projection_equalities_in_either_order() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			func f<T: Container where { Item = U::Item }, U: Container where { Item = i32 }>(x: T::Item) {}
 			func g<U: Container where { Item = i32 }, T: Container where { Item = U::Item }>(x: T::Item) {}
@@ -14612,9 +14463,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
-			type i8;
 			trait UnsignedInt { type Signed: SignedInt where { Unsigned = Self }; }
 			trait SignedInt { type Unsigned: UnsignedInt where { Signed = Self }; }
 			impl UnsignedInt for u8 { type Signed = i8; }
@@ -14644,7 +14492,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Pair { type First; type Second; }
 			func tautology<T: Pair where { First = T::First }>(x: T::First) {}
 			func mutual<T: Pair where { First = T::Second, Second = T::First }>(x: T::First, y: T::Second) {}
@@ -14674,8 +14521,6 @@ pub(super) mod tests {
 	fn normalization_leaves_competing_symbolic_equalities_unresolved() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			func f<T: Container where { Item = U } + Container where { Item = V }, U, V>(x: T::Item) {}
 			func equivalent<T: Container where { Item = U::Item } + Container where { Item = i32 }, U: Container where { Item = i32 }>(x: T::Item) {}
@@ -14700,8 +14545,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_does_not_cache_an_unfinished_assumption_set() {
-		with_pending_signatures(
-			"type i32; trait Container { type Item; } func f<T: Container where { Item = i32 }>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+		with_pending_std_signatures(
+			"type i32; trait Container { type Item; } func f<T: Container where { Item = i32 }>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|builder| {
 				let def_id = DefId::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(QueryInfo {
@@ -14755,7 +14600,6 @@ pub(super) mod tests {
 	fn contextual_equalities_agree_after_self_substitution() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner where { Value = Self }; }
 			func f<T: Outer where { Item: Inner where { Value = T } }>(x: T::Item::Value) {}
@@ -14777,8 +14621,6 @@ pub(super) mod tests {
 	fn equality_rhs_can_read_a_later_siblings_nested_memberships() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Inner { type Value; }
 			trait Outer { type Item; }
 			func f<T: Outer where { Item = U::Item::Value }, U: Outer where { Item: Inner where { Value = i32 } }>(x: T::Item) {}
@@ -14797,7 +14639,6 @@ pub(super) mod tests {
 	{
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Value { type Item; }
 			trait Pair {
 				type First: Value where { Item = Self::Second::Item };
@@ -14820,8 +14661,6 @@ pub(super) mod tests {
 	fn normalization_reads_facts_through_multiple_nested_projection_sources() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Leaf { type Value; }
 			trait Branch { type Item; }
 			trait Outer { type Branch; }
@@ -14843,7 +14682,6 @@ pub(super) mod tests {
 	fn nested_projection_sources_keep_the_declaring_self_context() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Leaf { type Value; }
 			trait Branch { type Item; }
 			trait Marked: Branch where { Item: Leaf where { Value = Self } } {}
@@ -14866,8 +14704,6 @@ pub(super) mod tests {
 	fn source_equalities_preserve_projections_inside_compound_types() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Container { type Item; }
 			struct Wrap<X>();
 			func f<U: Container where { Item = i32 }, T: Container where { Item = Wrap<(U::Item, i32)> }>(x: T::Item) {}
@@ -14930,8 +14766,6 @@ pub(super) mod tests {
 	fn bound_reservations_survive_invalid_occurrences_and_signature_demands() {
 		test_case!(
 			mut case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Leaf { type Value; }
 			trait Outer { type Item; }
 			func f<T: i32 + Outer where { Missing: Leaf, Item: i32 + Leaf where { Value = Later<U> }, Item: Leaf }, U: Outer>(x: T::Item::Value) {}
@@ -14986,8 +14820,6 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Marker {}
 			impl Marker for i32 {}
 			trait Value { type Item; }
@@ -15016,8 +14848,6 @@ pub(super) mod tests {
 	fn structural_match_normalizes_nested_receiver_type_arguments() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Value { type Item; }
 			trait Result { type Out; }
 			struct Wrap<T>();
@@ -15047,9 +14877,6 @@ pub(super) mod tests {
 	fn conflicting_equality_is_diagnosed_around_a_symbolic_middle_term() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
-			type u64;
 			trait A { type Item; }
 			trait Value { type Item; }
 
@@ -15068,9 +14895,6 @@ pub(super) mod tests {
 	fn conflicting_equality_is_diagnosed_with_symbolic_term_last() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u32;
-			type u64;
 			trait A { type Item; }
 			trait Value { type Item; }
 
@@ -15089,41 +14913,17 @@ pub(super) mod tests {
 		use super::*;
 		use crate::tir::bounds::Readiness;
 
-		fn assert_graph_clean(graph: &vfs::CompilationUnit) {
-			DiagnosticView::new(
-				"parse",
-				&graph.collect_parser_diagnostics(),
-				&graph.files,
-			)
-			.assert_no_errors();
-			DiagnosticView::new(
-				"link",
-				&graph.collect_linker_diagnostics(),
-				&graph.files,
-			)
-			.assert_no_errors();
-		}
-
-		macro_rules! checked_case {
-			($case:ident = $source:expr $(,)?) => {
-				let graph = source_graph($source);
-				assert_graph_clean(&graph);
-				test_case!($case from graph);
-			};
-			(mut $case:ident = $source:expr $(,)?) => {
-				let graph = source_graph($source);
-				assert_graph_clean(&graph);
-				test_case!(mut $case from graph);
-			};
-		}
-
 		#[test]
 		fn swept_context_preserves_evidence_for_a_normalized_parameter() {
-			checked_case!(mut case = indoc! {"
+			checked_case!(std mut case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
                 func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                type u8;
+                type u32;
+                enum Bool(u8) { False = 0, True = 1 }
+                struct Char(value: u32);
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15174,8 +14974,6 @@ pub(super) mod tests {
 		#[test]
 		fn successful_deferred_checks_keep_symbolic_source_evidence() {
 			checked_case!(mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<X: Marker>();
@@ -15240,7 +15038,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn method_context_keeps_local_evidence_about_an_outer_parameter() {
-			checked_case!(mut case = indoc! {"
+			checked_case!(std mut case = indoc! {"
                 trait Outer {}
                 trait Marker {}
                 trait Container { type Item; }
@@ -15251,6 +15049,10 @@ pub(super) mod tests {
                 }
                 func free() {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                type u8;
+                type u32;
+                enum Bool(u8) { False = 0, True = 1 }
+                struct Char(value: u32);
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15305,7 +15107,7 @@ pub(super) mod tests {
 		fn trait_body_context_and_instantiated_declaration_bounds_survive_the_sweep()
 		 {
 			use crate::tir::types::Substitution;
-			checked_case!(mut case = indoc! {"
+			checked_case!(std mut case = indoc! {"
                 trait Project { type Output; }
                 trait Parent {}
                 trait Child: Parent {
@@ -15314,6 +15116,10 @@ pub(super) mod tests {
                 }
                 func user<T: Child>(x: T::Item) {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                type u8;
+                type u32;
+                enum Bool(u8) { False = 0, True = 1 }
+                struct Char(value: u32);
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15383,10 +15189,10 @@ pub(super) mod tests {
 				" }".repeat(16)
 			);
 			let source = format!(
-				"trait Node {{ type Next: Node; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}",
+				"trait Node {{ type Next: Node; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);",
 				path = "::Next".repeat(16)
 			);
-			with_pending_signatures(&source, |builder| {
+			with_pending_std_signatures(&source, |builder| {
 				builder.sweep();
 				let env = builder.functions[0].type_params;
 				let ty =
@@ -15424,42 +15230,18 @@ pub(super) mod tests {
 			TraitMemberSelection,
 		};
 
-		fn assert_graph_clean(graph: &vfs::CompilationUnit) {
-			DiagnosticView::new(
-				"parse",
-				&graph.collect_parser_diagnostics(),
-				&graph.files,
-			)
-			.assert_no_errors();
-			DiagnosticView::new(
-				"link",
-				&graph.collect_linker_diagnostics(),
-				&graph.files,
-			)
-			.assert_no_errors();
-		}
-
-		macro_rules! checked_case {
-			($case:ident = $source:expr $(,)?) => {
-				let graph = source_graph($source);
-				assert_graph_clean(&graph);
-				test_case!($case from graph);
-			};
-			(mut $case:ident = $source:expr $(,)?) => {
-				let graph = source_graph($source);
-				assert_graph_clean(&graph);
-				test_case!(mut $case from graph);
-			};
-		}
-
 		#[test]
 		fn equivalent_subjects_support_unqualified_and_qualified_members() {
 			checked_case!(
-				case = indoc! {"
+				std case = indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item; }
                 func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output, y: <U as Project>::Output) {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                type u8;
+                type u32;
+                enum Bool(u8) { False = 0, True = 1 }
+                struct Char(value: u32);
             "}
 			);
 			assert!(
@@ -15496,12 +15278,16 @@ pub(super) mod tests {
 			// `Item: Project` belongs to `T::Item`; `Item = U` does not lend it
 			// to `U`, so `U::Output` needs `U: Project` written.
 			checked_case!(
-				case = indoc! {"
+				std case = indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item: Project; }
                 func f<T: Container where { Item = U }, U>(x: U::Output) {}
                 func g<T: Container where { Item = U }, U: Project>(x: U::Output) {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                type u8;
+                type u32;
+                enum Bool(u8) { False = 0, True = 1 }
+                struct Char(value: u32);
             "}
 			);
 			case.diagnostics().assert_codes(&[
@@ -15521,7 +15307,6 @@ pub(super) mod tests {
                 trait Project { type Output; }
                 trait Container { type Item: Project; }
                 func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			assert!(
@@ -15535,7 +15320,6 @@ pub(super) mod tests {
                 trait Right { type Output; }
                 trait Container { type Item; }
                 func f<T: Container where { Item = U } + Container where { Item: Left + Right }, U>(x: U::Output) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			assert_eq!(
@@ -15562,7 +15346,6 @@ pub(super) mod tests {
                     func scoped<U: Container where { Item = T } + Container where { Item: Project }>(x: T::Output) {}
                     func sibling(x: T::Output) {}
                 }
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			assert_eq!(
@@ -15600,8 +15383,6 @@ pub(super) mod tests {
 		 {
 			checked_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type A; type B; }
                 trait Project { type Output; }
@@ -15626,8 +15407,6 @@ pub(super) mod tests {
 		fn direct_member_identity_does_not_require_complete_binding_values() {
 			checked_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type A; type B; }
                 trait Project { type Output; }
@@ -15649,8 +15428,6 @@ pub(super) mod tests {
 		fn pending_unqualified_selection_explains_how_to_qualify() {
 			checked_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type A; type B; }
                 trait Project { type Output; }
@@ -15684,7 +15461,6 @@ pub(super) mod tests {
 		fn pending_member_discovery_is_not_reported_as_a_missing_member() {
 			checked_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Container { type A; type Item; }
                 trait Project { type Output; }
                 func f<T: Container where { A = U::Output, Item = U } + Container where { Item: Project }, U>(x: T::A) {}
@@ -15706,8 +15482,6 @@ pub(super) mod tests {
 		fn unqualified_selection_works_after_binding_facts_are_ready() {
 			checked_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 trait Project { type Output; }
@@ -15729,8 +15503,6 @@ pub(super) mod tests {
 		fn sibling_dependent_unqualified_lookup_reports_the_same_limitation() {
 			checked_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 trait Project { type Output; }
@@ -15757,8 +15529,6 @@ pub(super) mod tests {
 		fn a_failed_qualified_dependent_binding_reports_one_bound_error() {
 			checked_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Container { type A; type B; }
                 trait Project { type Output; }
                 struct Need<X>();
@@ -15790,7 +15560,7 @@ pub(super) mod tests {
 		#[test]
 		fn member_lookup_prefers_a_real_provider_for_a_concrete_equal_subject()
 		{
-			with_pending_signatures(
+			with_pending_std_signatures(
 				indoc! {"
                 type i32;
                 trait Project { type Output; }
@@ -15798,6 +15568,10 @@ pub(super) mod tests {
                 impl Project for i32 { type Output = (); }
                 func f<T: Container where { Item = i32 } + Container where { Item: Project }>() {}
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
+                type u8;
+                type u32;
+                enum Bool(u8) { False = 0, True = 1 }
+                struct Char(value: u32);
             "},
 				|builder| {
 					builder.sweep();
@@ -15857,8 +15631,6 @@ pub(super) mod tests {
 			// only an impl gives a concrete type a trait.
 			checked_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Project { type Output; }
                 trait Container { type Item; }
                 func f<T: Container where { Item = i32 } + Container where { Item: Project }>(x: i32::Output, y: <i32 as Project>::Output) {}
@@ -15881,10 +15653,10 @@ pub(super) mod tests {
 				" }".repeat(16)
 			);
 			let source = format!(
-				"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} trait Node {{ type Next: Node; }} trait Project {{ type Output; }} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}}",
+				"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} trait Node {{ type Next: Node; }} trait Project {{ type Output; }} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);",
 				path = "::Next".repeat(16)
 			);
-			with_pending_signatures(&source, |builder| {
+			with_pending_std_signatures(&source, |builder| {
 				let id = DefId::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(QueryInfo {
 					def_id: id,
@@ -15938,7 +15710,6 @@ pub(super) mod tests {
 		fn unrelated_inherent_requirements_do_not_hide_a_trait_member() {
 			with_pending_signatures(
 				indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 trait Project { func selected() {} }
                 struct Wrap<X>();
@@ -16001,58 +15772,106 @@ pub(super) mod tests {
 		}
 	}
 
-	mod value_types {
+	mod stack_values {
 		use super::*;
-		use crate::tir::solver::{LayoutValue, ValType};
 
-		/// The declarations a `ValueType` test builds on, as std writes them.
-		fn with_value_type(source: &str) -> String {
+		/// The declarations a `StackValue` test builds on, as std writes them,
+		/// with `Is<X, R>` stating `<X as StackValue>::Repr == R`.
+		fn with_stack_value(source: &str) -> String {
 			format!(
 				"{}\n{source}",
 				indoc! {"
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
-				type u8; type u32; type u64; type f32; type f64;
-				typeset PointerSize { u32 }
+				type u8; type i32; type u32; type i64; type u64; type f32; type f64;
+				type funcref;
+				enum Bool(u8) { False = 0, True = 1 }
+				struct Char(value: u32);
+				trait StackValue { type Repr; }
+				typeset StackScalar { i32, i64, f32, f64, funcref }
+				typeset PointerSize: StackValue { u32 }
 				trait Memory { type Size: PointerSize; }
-				trait ValueType {}
-				trait Global { type Value: ValueType; }
+				trait Global { type Value: StackValue where { Repr: StackScalar }; }
 				memory heap: u32;
+				func transmute<
+					T: StackValue,
+					U: StackValue where { Repr = T::Repr },
+				>(value: T) -> U;
+				struct Is<X: StackValue where { Repr = R }, R>();
+				struct Needs<X: StackValue>();
 			"}
 			)
 		}
 
-		/// The layout of the global `name`'s value type.
-		fn global_layout(
-			case: &mut TestCase<'_>,
-			name: &str,
-		) -> Option<Box<[LayoutValue]>> {
-			let DefKind::Global(global_index) = case.resolve(Tier::Value, name)
-			else {
-				panic!("expected `{name}` to be a global");
-			};
-			let declaration = case.defs.globals[usize::from(global_index)]
-				.value_assoc_type_index;
-			let value = case.context.assoc_types[usize::from(declaration)]
-				.as_ref()
-				.and_then(|signature| signature.value)
-				.expect("a global's value type is resolved");
-			case.context
-				.value_layout(TypeEnvIdx::ROOT, value)
-				.expect("a global's layout is final")
+		#[test]
+		fn a_repr_is_the_flattened_parts_in_declaration_order() {
+			let source = with_stack_value(indoc! {"
+				struct Point(x: u32, y: u32);
+				struct Meters(u32);
+				struct Unit();
+				struct Wrap<T>(T);
+				enum Small(u8) { A = 0 }
+				func f(
+					a: Is<u8, i32>,
+					b: Is<Point, (i32, i32)>,
+					c: Is<(u8, u8), (i32, i32)>,
+					d: Is<Meters, i32>,
+					e: Is<(), ()>,
+					f: Is<Unit, ()>,
+					g: Is<(u64, (), f32), (i64, f32)>,
+					h: Is<((u8, u64), u8), (i32, i64, i32)>,
+					i: Is<(u8, u64), (i32, i64)>,
+					j: Is<heap::&[u8], (i32, i32)>,
+					k: Is<heap::*u64, i32>,
+					l: Is<func(u32) -> u32, funcref>,
+					m: Is<funcref, funcref>,
+					n: Is<Small, i32>,
+					o: Is<Wrap<u64>, i64>,
+					p: Is<(<heap as Memory>::Size), i32>,
+				) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics().assert_none();
 		}
 
-		fn known(values: &[ValType]) -> Option<Box<[LayoutValue]>> {
-			Some(
-				values
-					.iter()
-					.map(|&value| LayoutValue::Known(value))
-					.collect(),
-			)
+		#[test]
+		fn a_repr_keeps_declaration_order_rather_than_layout_order() {
+			let source = with_stack_value(indoc! {"
+				func f(x: Is<(u8, u64), (i64, i32)>) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		}
+
+		#[test]
+		fn a_type_containing_never_is_no_stack_value() {
+			let source = with_stack_value(indoc! {"
+				struct S(x: !);
+				func f(a: Needs<!>, b: Needs<(u32, !)>, c: Needs<S>) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::TraitBoundViolation,
+			]);
+		}
+
+		#[test]
+		fn an_abstract_part_must_be_assumed_a_stack_value() {
+			let source = with_stack_value(indoc! {"
+				struct Wrap<T>(T);
+				func bounded<T: StackValue>(x: Needs<Wrap<T>>) {}
+				func unbounded<T>(x: Needs<Wrap<T>>) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		}
 
 		#[test]
 		fn a_global_of_one_wasm_value_is_accepted() {
-			let source = with_value_type(indoc! {"
+			let source = with_stack_value(indoc! {"
 				struct Meters(u32);
 				struct Tagged(u64, ());
 				struct Wrap<T>(T);
@@ -16064,35 +15883,18 @@ pub(super) mod tests {
 				global tuple: (f32, ()) = (0, ());
 				global generic: Wrap<u64> = Wrap(0);
 				global variant: Small = Small::A;
-				global pointer: heap::&u32 = 0 as heap::&u32;
+				global pointer: heap::&u32 = loop {};
 				global reference: func(u32) -> u32 = loop {};
+				global untyped: funcref = loop {};
 				global size: <heap as Memory>::Size = 0;
 			"});
-			test_case!(mut case = &source);
+			checked_case!(std case = &source);
 			case.diagnostics().assert_none();
-			for (name, layout) in [
-				("int", [ValType::I32]),
-				("float", [ValType::F64]),
-				("newtype", [ValType::I32]),
-				("with_empty", [ValType::I64]),
-				("tuple", [ValType::F32]),
-				("generic", [ValType::I64]),
-				("variant", [ValType::I32]),
-				("pointer", [ValType::I32]),
-				("reference", [ValType::FuncRef]),
-				("size", [ValType::I32]),
-			] {
-				assert_eq!(
-					global_layout(&mut case, name),
-					known(&layout),
-					"{name}"
-				);
-			}
 		}
 
 		#[test]
 		fn a_global_of_zero_or_several_wasm_values_is_rejected() {
-			let source = with_value_type(indoc! {"
+			let source = with_stack_value(indoc! {"
 				struct Pair(u32, f64);
 				struct Unit();
 				global pair: Pair = Pair(0, 0);
@@ -16100,61 +15902,85 @@ pub(super) mod tests {
 				global empty: () = ();
 				global slice: heap::&[u8] = loop {};
 			"});
-			test_case!(mut case = &source);
+			checked_case!(std case = &source);
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::TraitBoundViolation,
 				DiagnosticCode::TraitBoundViolation,
 				DiagnosticCode::TraitBoundViolation,
 				DiagnosticCode::TraitBoundViolation,
 			]);
-			assert_eq!(
-				global_layout(&mut case, "pair"),
-				known(&[ValType::I32, ValType::F64])
-			);
-			assert_eq!(global_layout(&mut case, "unit"), known(&[]));
-			assert_eq!(
-				global_layout(&mut case, "slice"),
-				known(&[ValType::I32, ValType::I32])
-			);
 		}
 
 		#[test]
-		fn an_abstract_field_is_one_value_when_assumed_a_value_type() {
-			let source = with_value_type(indoc! {"
-				struct Wrap<T>(T);
-				struct Pair<T>(T, T);
-				struct Needs<U: ValueType>();
-				func bounded<T: ValueType>(x: Needs<Wrap<T>>) {}
-				func unbounded<T>(x: Needs<Wrap<T>>) {}
-				func two<T: ValueType>(x: Needs<Pair<T>>) {}
-			"});
-			test_case!(mut case = &source);
-			case.diagnostics().assert_codes(&[
-				DiagnosticCode::TraitBoundViolation,
-				DiagnosticCode::TraitBoundViolation,
-			]);
-			let scope = case.function_signature("bounded").type_params;
-			let parameter = case.context.type_envs.param_types(scope)[0];
-			let struct_index = case.struct_index("Wrap");
-			let type_args = case.context.types.push_list([&parameter]);
-			let wrap = case.context.types.intern(Type::Struct {
-				struct_index,
-				type_args,
-			});
-			assert_eq!(
-				case.context.value_layout(scope, wrap),
-				Ok(Some(Box::from([LayoutValue::Abstract(parameter)])))
-			);
-		}
-
-		#[test]
-		fn an_equality_on_a_global_value_must_be_a_value_type() {
-			let source = with_value_type(indoc! {"
+		fn an_equality_on_a_global_value_must_be_one_wasm_value() {
+			let source = with_stack_value(indoc! {"
 				func f<G: Global where { Value = (u32, u32) }>() {}
 			"});
-			test_case!(case = &source);
+			checked_case!(std case = &source);
 			case.diagnostics()
 				.assert_error(DiagnosticCode::TraitBoundViolation);
+		}
+
+		#[test]
+		fn a_generic_repr_reduces_through_its_parts() {
+			let source = with_stack_value(indoc! {"
+				struct Wrap<T>(T);
+				struct Pair<A, B>(a: A, b: B);
+				struct Header<M: Memory>(len: u32, data: M::*u8);
+				func unwrap<T: StackValue>(w: Wrap<T>) -> T {
+					transmute(w)
+				}
+				func nested<T: StackValue>(w: Wrap<Wrap<(T, ())>>) -> T {
+					transmute(w)
+				}
+				func untuple<T: StackValue>(p: Pair<T, u32>) -> (T, u32) {
+					transmute(p)
+				}
+				func header<M: Memory>(h: Header<M>) -> (u32, M::Size) {
+					transmute(h)
+				}
+				func address<M: Memory>(p: M::*u8) -> M::*u64 {
+					transmute(p)
+				}
+				func assumed<T: StackValue where { Repr = i32 }>(p: (T, u8)) -> (u32, u32) {
+					transmute(p)
+				}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics().assert_none();
+		}
+
+		/// An untyped literal gives `T` no type: it must be named.
+		#[test]
+		fn a_transmuted_literal_needs_its_type_named() {
+			let source = with_stack_value(indoc! {"
+				func named() -> u32 { transmute::<i32, _>(5) }
+				func unnamed() -> u32 { transmute(5) }
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+		}
+
+		#[test]
+		fn a_transmute_needs_one_representation() {
+			let source = with_stack_value(indoc! {"
+				func swap(x: (u8, u64)) -> (u64, u8) {
+					transmute(x)
+				}
+				func widen(x: u32) -> u64 {
+					transmute(x)
+				}
+				func reorder<T: StackValue>(x: (T, u32)) -> (u32, T) {
+					transmute(x)
+				}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::AssocTypeEqualityMismatch,
+				DiagnosticCode::AssocTypeEqualityMismatch,
+				DiagnosticCode::AssocTypeEqualityMismatch,
+			]);
 		}
 	}
 
@@ -16170,7 +15996,7 @@ pub(super) mod tests {
 				"struct P(); func f<T: Container where { Item = P } + Container where { Item: Marker }>(x: Need<P>) {}",
 			] {
 				let source = format!(
-					"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type i32; trait Marker {{}} trait Container {{ type Item; }} struct Need<X: Marker>(); {source}"
+					"trait Marker {{}} trait Container {{ type Item; }} struct Need<X: Marker>(); {source}"
 				);
 				test_case!(case = &source);
 				case.diagnostics()
@@ -16184,8 +16010,6 @@ pub(super) mod tests {
 		fn an_equal_subject_that_means_a_concrete_type_lends_no_trait() {
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<X: Marker>();
@@ -16206,7 +16030,6 @@ pub(super) mod tests {
 			// subject equal to it; `Q` is not `Marker`.
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 trait Container { type Item; }
                 struct Q();
@@ -16227,7 +16050,6 @@ pub(super) mod tests {
 		{
 			test_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
@@ -16257,7 +16079,6 @@ pub(super) mod tests {
 		fn an_equal_subject_keeps_projection_evidence_after_normalization() {
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
@@ -16276,8 +16097,6 @@ pub(super) mod tests {
 		 {
 			test_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 trait Result { type Output; }
@@ -16296,8 +16115,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_stored_projection_is_checked_in_its_own_context() {
-			with_pending_signatures(
-				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			with_pending_std_signatures(
+				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|builder| {
 					builder.sweep();
 					let signature = &builder.functions[0];
@@ -16346,7 +16165,6 @@ pub(super) mod tests {
 			// `Item`'s declared bound, and `Need`'s.
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 trait Container { type Item: Marker; }
                 struct Need<X: Marker>();
@@ -16376,7 +16194,6 @@ pub(super) mod tests {
                 impl<T> Host<T> {
                     func scoped<U: Container where { Item = T } + Container where { Item: Marker }>(x: Need<T>) {}
                 }
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			case.diagnostics().assert_none();
@@ -16392,7 +16209,6 @@ pub(super) mod tests {
                     func scoped<U: Container where { Item = T } + Container where { Item: Marker }>(x: Need<T>) {}
                     func sibling(x: Need<T>) {}
                 }
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
             "}
 			);
 			case.diagnostics()
@@ -16416,7 +16232,6 @@ pub(super) mod tests {
 		fn an_impl_requirement_cannot_supply_its_own_proof() {
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 struct Need<X: Marker>();
                 struct Wrap<X>();
@@ -16440,7 +16255,6 @@ pub(super) mod tests {
 		fn ambiguous_equalities_do_not_transfer_membership() {
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<X: Marker>();
@@ -16465,7 +16279,6 @@ pub(super) mod tests {
 		 {
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<X: Marker>();
@@ -16486,8 +16299,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn equality_proofs_wait_for_facts_and_do_not_cache_a_pending_answer() {
-			with_pending_signatures(
-				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {}",
+			with_pending_std_signatures(
+				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|builder| {
 					let id = DefId::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(QueryInfo {
@@ -16533,9 +16346,9 @@ pub(super) mod tests {
 			let nested =
 				format!("{}U::Item{}", "Wrap<".repeat(16), ">".repeat(16));
 			let source = format!(
-				"trait Marker {{}} trait Container {{ type Item; }} struct Wrap<X>(); func f<T: Container where {{ Item = {nested} }} + Container where {{ Item: Marker }}, U: Container>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}}"
+				"trait Marker {{}} trait Container {{ type Item; }} struct Wrap<X>(); func f<T: Container where {{ Item = {nested} }} + Container where {{ Item: Marker }}, U: Container>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);"
 			);
-			with_pending_signatures(&source, |builder| {
+			with_pending_std_signatures(&source, |builder| {
 				builder.sweep();
 				let env = builder.functions[0].type_params;
 				let ty = builder.type_envs.param_types(env)[1];
@@ -16577,8 +16390,6 @@ pub(super) mod tests {
 		fn bounded_equality_rhs_waits_for_all_sibling_facts() {
 			test_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
@@ -16610,8 +16421,6 @@ pub(super) mod tests {
 		fn a_failed_check_keeps_the_written_argument_and_unrelated_types() {
 			test_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
@@ -16659,8 +16468,6 @@ pub(super) mod tests {
 		#[test]
 		fn a_failed_check_keeps_nested_tuple_and_function_shapes() {
 			test_case!(mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
@@ -16701,7 +16508,6 @@ pub(super) mod tests {
 		fn a_recursive_application_reads_its_eventual_parameter_requirements() {
 			test_case!(
 				case = indoc! {"
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 impl Marker for i32 {}
@@ -16720,7 +16526,6 @@ pub(super) mod tests {
 		fn eventual_requirements_cannot_be_accepted_from_an_incomplete_list() {
 			test_case!(
 				case = indoc! {"
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 impl Container for i32 { type Item = Node<i32>; }
@@ -16741,8 +16546,6 @@ pub(super) mod tests {
 		fn qualified_projection_defers_membership_without_losing_identity() {
 			test_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 trait Project { type Output; }
@@ -16764,8 +16567,6 @@ pub(super) mod tests {
 		fn reentrant_queries_complete_in_their_own_contexts() {
 			test_case!(
 				case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32;
                 trait Marker {}
                 trait Container { type Item; }
                 struct Need<T: Marker>();
@@ -16786,12 +16587,10 @@ pub(super) mod tests {
 		{
 			test_case!(
 				mut case = indoc! {"
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type i32; type bool;
                 trait Container { type Item; }
                 trait Project { type Output; }
                 struct Plain<T>();
-                impl Project for Plain<bool> { type Output = bool; }
+                impl Project for Plain<Bool> { type Output = Bool; }
                 func f<T: Container where { Item = <Plain<U::Item> as Project>::Output }, U: Container where { Item = i32 }>(x: T::Item) {}
             "}
 			);
@@ -16819,7 +16618,6 @@ pub(super) mod tests {
 	fn nested_exports_resolve_names_in_the_declaring_namespace() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
             func f<T>() {}
 
             mod left {
@@ -16854,8 +16652,6 @@ pub(super) mod tests {
 	fn exports_reject_ineligible_targets() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type i32;
             const C: i32 = 1;
             struct S();
             func generic<T>() {}
@@ -16918,8 +16714,6 @@ pub(super) mod tests {
 	fn exports_resolve_import_aliases_and_synthetic_values() {
 		test_case!(
 			case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u32;
 
             typeset PointerSize {
                 u32,
@@ -16987,6 +16781,10 @@ pub(super) mod tests {
                 pub func f() {}
                 export { missing as "run", f as "run" }
                 mod nested { export { missing } }
+                type u8;
+                type u32;
+                enum Bool(u8) { False = 0, True = 1 }
+                struct Char(value: u32);
             "#
 				.to_string(),
 			),
@@ -17042,7 +16840,7 @@ pub(super) mod tests {
 		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
 			(
 				"std.wx".to_string(),
-				"pub trait Call { type Args; type Result; } pub trait Function: Call {} pub type u32;"
+				"pub trait Call { type Args; type Result; } pub trait Function: Call {} pub type u32; type u8; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);"
 					.to_string(),
 			),
 			(
@@ -17073,7 +16871,6 @@ pub(super) mod tests {
 	fn export_names_resolve_only_in_the_value_namespace() {
 		test_case!(
 			case = r#"
-            type i32;
             struct S();
             trait T {}
             type Alias = S;
@@ -17106,8 +16903,6 @@ pub(super) mod tests {
 	fn functions_and_globals_are_their_own_types() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Global { type Value; }
 			global counter: i32 = 0;
 			func id<T>(x: T) -> T { loop {} }
@@ -17162,13 +16957,10 @@ pub(super) mod tests {
 	fn a_function_type_implements_call() {
 		test_case!(
 			mut case = indoc! {r#"
-			type i32;
-			type bool;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			func none() {}
-			func one(x: i32) -> bool { loop {} }
-			func many(x: i32, y: bool) {}
-			import "env" as host { func log(x: bool) -> i32; }
+			func one(x: i32) -> Bool { loop {} }
+			func many(x: i32, y: Bool) {}
+			import "env" as host { func log(x: Bool) -> i32; }
 			func nullary(x: <none as Call>::Args, y: none::Result) {}
 			func unary(x: <one as Call>::Args, y: one::Result) {}
 			func tuple(x: many::Args) {}
@@ -17195,8 +16987,6 @@ pub(super) mod tests {
 	fn a_generic_function_types_projections_substitute_its_arguments() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			func id<T>(x: T) -> T { loop {} }
 			func f(x: id<i32>::Args, y: <id<i32> as Call>::Result) {}
 		"}
@@ -17212,12 +17002,9 @@ pub(super) mod tests {
 	fn a_member_function_type_implements_call_with_self_in_its_args() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
-			type bool;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Point();
 			impl Point {
-				func at(self: Self, x: i32) -> bool { loop {} }
+				func at(self: Self, x: i32) -> Bool { loop {} }
 				func origin() -> Point { loop {} }
 			}
 			func f(a: Point::at::Args, b: Point::at::Result, c: Point::origin::Args) {}
@@ -17240,14 +17027,11 @@ pub(super) mod tests {
 	fn a_member_function_types_arguments_cover_its_parents_parameters() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
-			type bool;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Wrap<T>();
 			impl<T> Wrap<T> {
 				func get<U>(self: Self, u: U) -> T { loop {} }
 			}
-			func f(a: Wrap<i32>::get<bool>::Args, b: Wrap<i32>::get<bool>::Result) {}
+			func f(a: Wrap<i32>::get<Bool>::Args, b: Wrap<i32>::get<Bool>::Result) {}
 		"}
 		);
 		case.diagnostics().assert_none();
@@ -17268,8 +17052,6 @@ pub(super) mod tests {
 	fn a_trait_function_stays_its_declaration_over_self() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Make {
 				func make(x: i32) -> Self;
 				func fresh() -> Self { loop {} }
@@ -17335,9 +17117,6 @@ pub(super) mod tests {
 	fn member_functions_take_their_own_type_arguments_after_the_receivers() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
-			type u8;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Foo<T>();
 			impl<T> Foo<T> { func new<U>(x: U) -> T { loop {} } }
 			trait Make { func make<U>(x: U) -> Self; }
@@ -17368,8 +17147,6 @@ pub(super) mod tests {
 	fn an_inherent_function_takes_precedence_over_a_traits_in_a_type() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Make { func make() -> Self; }
 			struct Point();
 			impl Point { func make() -> i32 { loop {} } }
@@ -17395,7 +17172,7 @@ pub(super) mod tests {
 		for second in ["func get() {}", "const get: i32 = 0;"] {
 			test_case!(
 				case = &format!(
-					"type i32; type u8; pub trait Call {{ type Args; type Result; }} \
+					"pub trait Call {{ type Args; type Result; }} \
 					pub trait Function: Call {{}} struct Wrap<T>(); \
 					impl Wrap<i32> {{ func get() {{}} }} impl Wrap<u8> {{ {second} }}"
 				)
@@ -17411,8 +17188,6 @@ pub(super) mod tests {
 	fn an_inherent_impls_bounds_apply_to_its_members_type() {
 		test_case!(
 			case = indoc! {"
-			type i32;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Marker {}
 			struct Wrap<T>();
 			impl<T: Marker> Wrap<T> { func get() {} }
@@ -17429,7 +17204,6 @@ pub(super) mod tests {
 	fn a_function_and_an_associated_type_of_one_name_are_ambiguous() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait A { func f(); }
 			trait B { type f; }
 			func g<T: A + B>(x: T::f) {}
@@ -17445,8 +17219,6 @@ pub(super) mod tests {
 	fn only_function_types_satisfy_a_function_bound() {
 		test_case!(
 			case = indoc! {"
-			type i32;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			struct Callback<F: Function>();
 			func handler(x: i32) {}
 			func good(c: Callback<handler>) {}
@@ -17466,7 +17238,6 @@ pub(super) mod tests {
 	fn a_function_whose_result_is_its_own_result_is_one_cycle() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			func f() -> f::Result { loop {} }
 		"}
 		);
@@ -17480,7 +17251,6 @@ pub(super) mod tests {
 	fn an_impl_cannot_be_written_for_a_function() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Marker {}
 			func f() {}
 			impl Marker for f {}
@@ -17496,7 +17266,7 @@ pub(super) mod tests {
 	#[test]
 	fn a_struct_can_implement_call_but_only_functions_are_function() {
 		test_case!(
-			mut case = indoc! {"
+			std mut case = indoc! {"
 			type i32;
 			pub trait Call {
 				type Args;
@@ -17516,6 +17286,10 @@ pub(super) mod tests {
 			func callables(a: Callable<Adder>, b: Callable<handler>, c: Adder::Result) {}
 			func items(a: Item<handler>, b: Item<Adder>) {}
 			func generic<F: Function>(x: F::Args, y: F::Result) {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
 		"}
 		);
 		// `Adder: Call` holds, so only `Adder: Function` fails.
@@ -17533,7 +17307,6 @@ pub(super) mod tests {
 	#[test]
 	fn impl_self_names_the_target_through_the_impls_own_frame() {
 		const SOURCE: &str = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Service { func make() -> Self; }
 			struct Wrap<T>();
 			struct Plain();
@@ -17619,7 +17392,6 @@ pub(super) mod tests {
 	fn self_is_not_available_in_an_impl_header() {
 		test_case!(
 			case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Marker {}
 			struct Wrap<T>();
 			impl Marker for Wrap<Self> {}
@@ -17636,9 +17408,6 @@ pub(super) mod tests {
 	fn substitution_and_matching_cover_a_methods_whole_chain() {
 		test_case!(
 			mut case = indoc! {"
-			type i32;
-			type bool;
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			trait Number {}
 			impl Number for i32 {}
 			struct Wrap<T>();
