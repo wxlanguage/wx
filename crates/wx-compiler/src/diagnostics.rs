@@ -250,6 +250,8 @@ define_diagnostic_codes! {
 		NotALiteralKind => "E2126",
 		LiteralKindWithoutBraces => "E2127",
 		MisplacedLiteralKind => "E2128",
+		SliceByValue => "E2129",
+		SliceArgument => "E2130",
 	}
 }
 

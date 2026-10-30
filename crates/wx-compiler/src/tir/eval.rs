@@ -827,48 +827,20 @@ impl TypeContext<'_, '_, '_> {
 			// A function item and a global's handle are zero-sized: the type
 			// says everything.
 			ExprKind::Function { .. } | ExprKind::Global(_) => {}
-			ExprKind::String(contents) => {
-				self.eval_string(owner, contents, ty, span, stack)?;
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. } => {
+				self.eval_static(owner, expr, ty, stack)?;
 			}
-			// Each element's values, one after another, laid out as static
-			// data.
-			ExprKind::Array { elements } => {
-				let start = stack.len();
-				for at in 0..elements.len() {
-					let element =
-						body_of(self, owner.constant).args(elements)[at];
-					self.eval(owner, element, stack)?;
-				}
-				let count = u64::try_from(elements.len()).unwrap();
-				self.place_static(owner, ty, span, count, start, stack)?;
-			}
-			// One element's values, laid out `count` times; `_` is the
-			// array's own length.
-			ExprKind::ArrayRepeat { value, count } => {
-				let start = stack.len();
-				self.eval(owner, value, stack)?;
-				let count = match count {
-					Some(count) => {
-						self.eval(owner, count, stack)?;
-						match stack.pop().expect("a count's value").val {
-							Val::I32(bits) => u64::from(bits),
-							Val::I64(bits) => bits,
-							_ => {
-								unreachable!("a count is of a memory's `Size`")
-							}
-						}
-					}
-					// As long as its array.
-					None => {
-						let Type::Array { length, .. } =
-							*self.types.resolve(ty)
-						else {
-							unreachable!("`_` is the length of an array")
-						};
-						self.length_value(owner, length)?
-					}
-				};
-				self.place_static(owner, ty, span, count, start, stack)?;
+			// A constant holding data in no memory, placed here: a copy of
+			// its data in the memory `ty` names.
+			ExprKind::Const { constant, .. }
+				if matches!(self.types.resolve(ty), Type::Pointer { .. })
+					&& self.types.is_unplaced(
+						self.constants[usize::from(constant)].ty,
+					) =>
+			{
+				self.place_data(owner, expr, ty, stack)?;
 			}
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
 			ExprKind::Const {
@@ -987,6 +959,120 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
+	/// The data `expr` of `owner`'s body is (a string or array literal, or a
+	/// constant holding one) placed in the memory the pointer type `ty`
+	/// names: the pointer, pushed.
+	fn place_data(
+		&mut self,
+		owner: Owner<'_>,
+		expr: ExprIdx,
+		ty: TypeIndex,
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		let body = body_of(self, owner.constant);
+		let (kind, span) = (body.kind(expr), body.span(expr));
+		match kind {
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. } => self.eval_static(owner, expr, ty, stack),
+			ExprKind::Const { constant, .. } => {
+				let root = match &self.const_bodies[usize::from(constant)] {
+					ConstBody::Built(body) => body.root(),
+					// Reported where the constant is.
+					_ => return Err(Halt::Silent),
+				};
+				let owner = Owner {
+					constant,
+					args: &[],
+				};
+				self.place_data(owner, root, ty, stack)
+			}
+			_ => Err(Halt::Own(EvalError {
+				span,
+				kind: EvalErrorKind::NotConst,
+			})),
+		}
+	}
+
+	/// A string or array literal `expr` of `owner`'s body as type `ty`:
+	/// placed (`ty` a pointer), its data is allocated and its pointer pushed.
+	/// Not placed (`ty` an array, a constant's), its elements are evaluated,
+	/// which reports what fails in them, and it holds no number of its own.
+	fn eval_static(
+		&mut self,
+		owner: Owner<'_>,
+		expr: ExprIdx,
+		ty: TypeIndex,
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		let body = body_of(self, owner.constant);
+		let (kind, span) = (body.kind(expr), body.span(expr));
+		let placed = matches!(self.types.resolve(ty), Type::Pointer { .. });
+		let start = stack.len();
+		match kind {
+			ExprKind::String(contents) if placed => {
+				self.eval_string(owner, contents, ty, span, stack)
+			}
+			ExprKind::String(_) => Ok(()),
+			// Each element's values, one after another, laid out as static
+			// data.
+			ExprKind::Array { elements } => {
+				for at in 0..elements.len() {
+					let element =
+						body_of(self, owner.constant).args(elements)[at];
+					self.eval(owner, element, stack)?;
+				}
+				if !placed {
+					stack.truncate(start);
+					return Ok(());
+				}
+				let count = u64::try_from(elements.len()).unwrap();
+				self.place_static(owner, ty, span, count, start, stack)
+			}
+			// One element's values, laid out `count` times; `_` is the
+			// array's own length.
+			ExprKind::ArrayRepeat { value, count } => {
+				self.eval(owner, value, stack)?;
+				if !placed {
+					stack.truncate(start);
+					return Ok(());
+				}
+				let count = match count {
+					Some(count) => self.repeat_count(owner, count)?,
+					// As long as its array.
+					None => {
+						let Type::Array { length, .. } =
+							*self.types.resolve(self.static_pointee(ty))
+						else {
+							unreachable!("`_` is the length of an array")
+						};
+						self.length_value(owner, length)?
+					}
+				};
+				self.place_static(owner, ty, span, count, start, stack)
+			}
+			_ => unreachable!("only a literal is static data"),
+		}
+	}
+
+	/// A repeat's `count`, a node of `owner`'s body: an integer literal or a
+	/// free constant (`repeat_length`), a count whatever type it was given.
+	fn repeat_count(
+		&mut self,
+		owner: Owner<'_>,
+		count: ExprIdx,
+	) -> Result<u64, Halt> {
+		match body_of(self, owner.constant).kind(count) {
+			ExprKind::Int(bits) => Ok(bits),
+			ExprKind::Const { constant, .. } => {
+				let length = self.types.intern_const(constant, &[]);
+				self.length_value(owner, length)
+			}
+			// Reported where the count is written.
+			_ => Err(Halt::Silent),
+		}
+	}
+
 	/// A string literal's value: its contents, placed as static data.
 	fn eval_string(
 		&mut self,
@@ -1026,8 +1112,8 @@ impl TypeContext<'_, '_, '_> {
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
 		let (memory, width) = self.static_memory(owner, ty, span)?;
-		let (Type::Slice { of, .. } | Type::Array { of, .. }) =
-			*self.types.resolve(ty)
+		let (Type::Slice { of } | Type::Array { of, .. }) =
+			*self.types.resolve(self.static_pointee(ty))
 		else {
 			unreachable!("static data is an array or a slice")
 		};
@@ -1083,9 +1169,18 @@ impl TypeContext<'_, '_, '_> {
 		Ok(())
 	}
 
-	/// The memory static data of type `ty` (a shared array or slice) is
-	/// placed in, and the scalar its address is held as. In a memory not
-	/// known yet there is nowhere to place it.
+	/// The slice or array static data of type `ty`, a pointer to it, points
+	/// at.
+	fn static_pointee(&self, ty: TypeIndex) -> TypeIndex {
+		let Type::Pointer { to, .. } = *self.types.resolve(ty) else {
+			unreachable!("static data is behind a pointer")
+		};
+		to
+	}
+
+	/// The memory static data of type `ty` (a shared pointer to an array or
+	/// a slice) is placed in, and the scalar its address is held as. In a
+	/// memory not known yet there is nowhere to place it.
 	fn static_memory(
 		&mut self,
 		owner: Owner<'_>,
@@ -1093,10 +1188,8 @@ impl TypeContext<'_, '_, '_> {
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Scalar), Halt> {
 		let scope = body_env(self, owner.constant);
-		let (Type::Slice { memory, .. } | Type::Array { memory, .. }) =
-			*self.types.resolve(ty)
-		else {
-			unreachable!("static data is an array or a slice")
+		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
+			unreachable!("static data is behind a pointer")
 		};
 		let Some(memory_index) = self.memory_of(scope, memory) else {
 			return Err(Halt::Own(EvalError {
@@ -1129,7 +1222,8 @@ impl TypeContext<'_, '_, '_> {
 			val: Val::MemoryOffset { alloc, offset: 0 },
 			scalar: width,
 		});
-		if let Type::Slice { .. } = self.types.resolve(ty) {
+		if let Type::Slice { .. } = self.types.resolve(self.static_pointee(ty))
+		{
 			stack.push(match width {
 				Scalar::U32 => ConstScalar::u32(u32::try_from(len).unwrap()),
 				Scalar::U64 => ConstScalar::u64(len),
@@ -1198,7 +1292,7 @@ impl TypeContext<'_, '_, '_> {
 	/// What `constant` with `args` reads: itself, or, for a trait's
 	/// declaration, the member of the impl its `Self` selects, the trait's
 	/// default when the impl inherits it, or the compiler's answer for a
-	/// trait it implements (`Array::SIZE`).
+	/// trait it implements (`Array::LEN`).
 	pub(super) fn resolve_constant(
 		&mut self,
 		constant: ConstIdx,
@@ -1244,12 +1338,12 @@ impl TypeContext<'_, '_, '_> {
 						*self.types.resolve(receiver)
 					else {
 						unreachable!(
-							"the compiler implements only `Array::SIZE`"
+							"the compiler implements only `Array::LEN`"
 						)
 					};
 					debug_assert_eq!(
 						Some(constant),
-						self.defs.intrinsics.array_size
+						self.defs.intrinsics.array_len
 					);
 					ResolvedConstant::Length(length)
 				}
@@ -1389,13 +1483,18 @@ impl TypeContext<'_, '_, '_> {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				self.push_scalars(scope, repr, out, visiting)
 			}
-			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
-				out.push(self.address_scalar(scope, memory)?);
-				Ok(())
-			}
-			Type::Slice { memory, .. } => {
+			// An address, and for a slice its length.
+			Type::Pointer { to, memory, .. } => {
+				let fat = match self.is_fat_pointee(scope, to) {
+					Ok(Some(fat)) => fat,
+					Ok(None) => return Err(ConstValueState::NoValue),
+					Err(_) => return Err(ConstValueState::Poisoned),
+				};
 				let scalar = self.address_scalar(scope, memory)?;
-				out.extend([scalar, scalar]);
+				out.push(scalar);
+				if fat {
+					out.push(scalar);
+				}
 				Ok(())
 			}
 			Type::Tuple { elements } => {
@@ -2447,18 +2546,18 @@ mod tests {
 	}
 
 	#[test]
-	fn an_array_types_size_is_its_length() {
+	fn an_arrays_len_is_its_length() {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
-				memory wide: u64;
 				const N: u32 = 3;
-				type A = heap::&[u8; 4];
-				const QUALIFIED: u32 = <heap::&[u8; 4] as Array>::SIZE;
-				const ALIASED: u32 = A::SIZE;
-				const NAMED: u32 = <heap::*[u16; N] as Array>::SIZE + 1;
-				const WIDE: u64 = <wide::&[u8; 9] as Array>::SIZE;
-				const FILLED: heap::&[u8; A::SIZE] = [7; _];
+				type A = [u8; 4];
+				const QUALIFIED: u32 = <[u8; 4] as Array>::LEN;
+				const ALIASED: u32 = A::LEN;
+				const NAMED: u32 = <[u16; N] as Array>::LEN + 1;
+				const WIDE: u64 = <[u8; 9] as Array>::LEN;
+				const NARROW: u8 = <[u8; 9] as Array>::LEN;
+				const FILLED: heap::&[u8; A::LEN] = [7; _];
 			"#}
 		);
 		case.diagnostics().assert_none();
@@ -2476,6 +2575,7 @@ mod tests {
 		assert_eq!(case.value("ALIASED"), [ConstScalar::u32(4)]);
 		assert_eq!(case.value("NAMED"), [ConstScalar::u32(4)]);
 		assert_eq!(case.value("WIDE"), [ConstScalar::u64(9)]);
+		assert_eq!(case.value("NARROW"), [ConstScalar::u8(9)]);
 	}
 
 	#[test]
@@ -2512,6 +2612,54 @@ mod tests {
 			panic!("expected one value");
 		};
 		assert_eq!(&*case.pointee(*address).0.bytes, b"a\n");
+	}
+
+	#[test]
+	fn a_constant_of_data_is_placed_at_each_use() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				memory wide: u64;
+				const GREETING: [u8; 5] = "hello";
+				const NUMBERS: [u16; 3] = [1, 2, 3];
+				const FILLED: [u8; 4] = [7; 4];
+				const ALIAS: [u8; 5] = GREETING;
+				const HEAP: heap::&[u8] = GREETING;
+				const WIDE: wide::&[u8; 5] = ALIAS;
+				const AGAIN: heap::&[u8; 5] = GREETING;
+				const WORDS: heap::&[u16] = NUMBERS;
+				const SEVENS: heap::&[u8; 4] = FILLED;
+			"#}
+		);
+		case.diagnostics().assert_none();
+		// Data in no memory has no value of its own: each use places it.
+		assert!(matches!(case.state("GREETING"), ConstValueState::NoValue));
+		let [address, length] = case.value("HEAP") else {
+			panic!("expected two values");
+		};
+		assert_eq!(*length, ConstScalar::u32(5));
+		let (allocation, _) = case.pointee(*address);
+		assert_eq!(allocation.memory, case.memory("heap"));
+		assert_eq!(&*allocation.bytes, b"hello");
+		let [wide] = case.value("WIDE") else {
+			panic!("expected an address");
+		};
+		assert_eq!(wide.scalar, Scalar::U64);
+		assert_eq!(case.pointee(*wide).0.memory, case.memory("wide"));
+		assert_eq!(&*case.pointee(*wide).0.bytes, b"hello");
+		// Each use is a copy of its own.
+		let [again] = case.value("AGAIN") else {
+			panic!("expected an address");
+		};
+		assert_ne!(again.val, address.val);
+		let [words, _] = case.value("WORDS") else {
+			panic!("expected two values");
+		};
+		assert_eq!(&*case.pointee(*words).0.bytes, [1, 0, 2, 0, 3, 0]);
+		let [sevens] = case.value("SEVENS") else {
+			panic!("expected an address");
+		};
+		assert_eq!(&*case.pointee(*sevens).0.bytes, [7; 4]);
 	}
 
 	#[test]

@@ -58,9 +58,7 @@ impl TypeIndex {
 	pub fn is_literal(self) -> bool {
 		self == TypeIndex::INTEGER_LITERAL
 			|| self == TypeIndex::FLOAT_LITERAL
-			|| self == TypeIndex::STRING_LITERAL
 			|| self == TypeIndex::CHAR_LITERAL
-			|| self == TypeIndex::ARRAY_LITERAL
 	}
 
 	#[inline]
@@ -113,10 +111,8 @@ impl TypeIndex {
 	pub const BOOL: TypeIndex = TypeIndex(16);
 	/// std's `Char`, a struct.
 	pub const CHAR: TypeIndex = TypeIndex(17);
-	pub const STRING_LITERAL: TypeIndex = TypeIndex(18);
-	pub const ARRAY_LITERAL: TypeIndex = TypeIndex(19);
-	pub const FUNCREF: TypeIndex = TypeIndex(20);
-	pub const CHAR_LITERAL: TypeIndex = TypeIndex(21);
+	pub const FUNCREF: TypeIndex = TypeIndex(18);
+	pub const CHAR_LITERAL: TypeIndex = TypeIndex(19);
 }
 
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
@@ -189,14 +185,6 @@ pub enum Type {
 	/// A character literal's type until its context gives it one: `Char`,
 	/// or an integer type its code point fits (`coerce`).
 	CharLiteral,
-	/// A string literal's type until its context gives it one: a shared byte
-	/// slice or a shared byte array of its length, in a memory the context
-	/// names (`coerce`).
-	StringLiteral,
-	/// An array literal's type until its context gives it one: a shared array
-	/// of its length or a shared slice of its elements' type, in a memory the
-	/// context names (`coerce`).
-	ArrayLiteral,
 	U8,
 	I8,
 	U16,
@@ -248,18 +236,18 @@ pub enum Type {
 		memory: TypeIndex,
 		ownership: crate::ast::Ownership,
 	},
-	/// `M::&[T; N]`. The length is a type-level constant: a `Value`, or
-	/// `Infer` until its context gives one.
+	/// `[T; N]`: exactly `N` values of `T`, in no memory. Only a pointer or a
+	/// constant holds one (`M::&[T; N]` is a `Pointer` to it). The length is
+	/// a count: a `Value`, a `Const`, or `Infer` until its context gives one.
 	Array {
 		of: TypeIndex,
 		length: TypeIndex,
-		memory: TypeIndex,
-		ownership: crate::ast::Ownership,
 	},
+	/// `[T]`: values of `T` whose count is known only at runtime, in no
+	/// memory. Unsized: only a pointer holds one, and that pointer is fat
+	/// (its address and a length of its memory's `Size`).
 	Slice {
 		of: TypeIndex,
-		memory: TypeIndex,
-		ownership: crate::ast::Ownership,
 	},
 	Enum {
 		enum_index: EnumIdx,
@@ -549,37 +537,14 @@ impl TypeInterner {
 				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
-				Type::Array {
-					of: x,
-					length: xl,
-					memory: xm,
-					ownership: xo,
-				},
-				Type::Array {
-					of: y,
-					length: yl,
-					memory: ym,
-					ownership: yo,
-				},
-			) if xo == yo => {
+				Type::Array { of: x, length: xl },
+				Type::Array { of: y, length: yl },
+			) => {
 				self.match_pattern(*x, *y, envs, env, args)?;
-				self.match_pattern(*xl, *yl, envs, env, args)?;
-				self.match_pattern(*xm, *ym, envs, env, args)
+				self.match_pattern(*xl, *yl, envs, env, args)
 			}
-			(
-				Type::Slice {
-					of: x,
-					memory: xm,
-					ownership: xo,
-				},
-				Type::Slice {
-					of: y,
-					memory: ym,
-					ownership: yo,
-				},
-			) if xo == yo => {
-				self.match_pattern(*x, *y, envs, env, args)?;
-				self.match_pattern(*xm, *ym, envs, env, args)
+			(Type::Slice { of: x }, Type::Slice { of: y }) => {
+				self.match_pattern(*x, *y, envs, env, args)
 			}
 			(
 				Type::TypeProjection {
@@ -654,8 +619,6 @@ impl TypeInterner {
 				struct_index: char,
 				type_args: TypeList::EMPTY,
 			},
-			Type::StringLiteral,
-			Type::ArrayLiteral,
 			Type::Funcref,
 			Type::CharLiteral,
 		] {
@@ -835,11 +798,9 @@ impl TypeInterner {
 		match ty {
 			Type::Infer => TypeFlags::HAS_INFER,
 			Type::Error => TypeFlags::HAS_ERROR,
-			Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral => TypeFlags::HAS_LITERAL,
+			Type::IntegerLiteral | Type::FloatLiteral | Type::CharLiteral => {
+				TypeFlags::HAS_LITERAL
+			}
 			Type::Tuple { elements: list }
 			| Type::Struct {
 				type_args: list, ..
@@ -853,14 +814,11 @@ impl TypeInterner {
 				}
 				flags
 			}
-			Type::Pointer { to: of, memory, .. }
-			| Type::Slice { of, memory, .. } => self.flags[usize::from(of)]
+			Type::Pointer { to, memory, .. } => self.flags[usize::from(to)]
 				.union(self.flags[usize::from(memory)]),
-			Type::Array {
-				of, length, memory, ..
-			} => self.flags[usize::from(of)]
-				.union(self.flags[usize::from(length)])
-				.union(self.flags[usize::from(memory)]),
+			Type::Slice { of } => self.flags[usize::from(of)],
+			Type::Array { of, length } => self.flags[usize::from(of)]
+				.union(self.flags[usize::from(length)]),
 			Type::TypedFuncref { param, result } => self.flags
 				[usize::from(param)]
 			.union(self.flags[usize::from(result)]),
@@ -919,6 +877,28 @@ impl TypeInterner {
 	/// Whether a literal's type is anywhere in `ty`.
 	pub(super) fn has_literal(&self, ty: TypeIndex) -> bool {
 		self.flags[usize::from(ty)].contains(TypeFlags::HAS_LITERAL)
+	}
+
+	/// Whether `ty` is a slice or an array, `[T]` or `[T; N]`: as an
+	/// expression's type, data not placed in a memory yet (a string or array
+	/// literal, a constant holding one), which its context places.
+	pub(super) fn is_unplaced(&self, ty: TypeIndex) -> bool {
+		matches!(self.resolve(ty), Type::Slice { .. } | Type::Array { .. })
+	}
+
+	/// Whether an expression of type `ty` waits for its context: an untyped
+	/// literal is given a type, and unplaced data a memory, a tuple's
+	/// included.
+	pub(super) fn needs_context(&self, ty: TypeIndex) -> bool {
+		self.has_literal(ty)
+			|| self.is_unplaced(ty)
+			|| match *self.resolve(ty) {
+				Type::Tuple { elements } => elements
+					.slice(&self.lists)
+					.iter()
+					.any(|&element| self.needs_context(element)),
+				_ => false,
+			}
 	}
 
 	/// Whether `ty`'s head is a parameter or a projection: the types with
@@ -1062,48 +1042,19 @@ impl TypeInterner {
 				}))
 			}
 			(
-				Type::Array {
-					of,
-					length,
-					memory,
-					ownership,
-				},
+				Type::Array { of, length },
 				Type::Array {
 					of: other_of,
 					length: other_length,
-					memory: other_memory,
-					ownership: other_ownership,
 				},
-			) if ownership == other_ownership => {
+			) => {
 				let of = self.meet(of, other_of)?;
 				let length = self.meet(length, other_length)?;
-				let memory = self.meet(memory, other_memory)?;
-				Some(self.intern(Type::Array {
-					of,
-					length,
-					memory,
-					ownership,
-				}))
+				Some(self.intern(Type::Array { of, length }))
 			}
-			(
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				},
-				Type::Slice {
-					of: other_of,
-					memory: other_memory,
-					ownership: other_ownership,
-				},
-			) if ownership == other_ownership => {
+			(Type::Slice { of }, Type::Slice { of: other_of }) => {
 				let of = self.meet(of, other_of)?;
-				let memory = self.meet(memory, other_memory)?;
-				Some(self.intern(Type::Slice {
-					of,
-					memory,
-					ownership,
-				}))
+				Some(self.intern(Type::Slice { of }))
 			}
 			(
 				Type::TypeProjection {
@@ -1214,48 +1165,31 @@ impl TypeInterner {
 			}
 			(
 				Type::Pointer {
-					to: of,
+					to,
 					memory,
 					ownership,
 				},
 				Type::Pointer {
-					to: other_of,
-					memory: other_memory,
-					ownership: other_ownership,
-				},
-			)
-			| (
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				},
-				Type::Slice {
-					of: other_of,
+					to: other_to,
 					memory: other_memory,
 					ownership: other_ownership,
 				},
 			) if ownership == other_ownership => {
-				self.learn(envs, env, slots, of, other_of);
+				self.learn(envs, env, slots, to, other_to);
 				self.learn(envs, env, slots, memory, other_memory);
 			}
+			(Type::Slice { of }, Type::Slice { of: other_of }) => {
+				self.learn(envs, env, slots, of, other_of);
+			}
 			(
-				Type::Array {
-					of,
-					length,
-					memory,
-					ownership,
-				},
+				Type::Array { of, length },
 				Type::Array {
 					of: other_of,
 					length: other_length,
-					memory: other_memory,
-					ownership: other_ownership,
 				},
-			) if ownership == other_ownership => {
+			) => {
 				self.learn(envs, env, slots, of, other_of);
 				self.learn(envs, env, slots, length, other_length);
-				self.learn(envs, env, slots, memory, other_memory);
 			}
 			// A projection's value is not its base: `<T as Tr>::X` being `u8`
 			// says nothing of `T`.
@@ -1391,44 +1325,24 @@ impl TypeInterner {
 					})
 				}
 			}
-			Type::Array {
-				of,
-				length,
-				memory,
-				ownership,
-			} => {
+			Type::Array { of, length } => {
 				let next_of = self.substitute(of, substitution);
 				let next_length = self.substitute(length, substitution);
-				let next_memory = self.substitute(memory, substitution);
-				if next_of == of
-					&& next_length == length
-					&& next_memory == memory
-				{
+				if next_of == of && next_length == length {
 					ty
 				} else {
 					self.intern(Type::Array {
 						of: next_of,
 						length: next_length,
-						memory: next_memory,
-						ownership,
 					})
 				}
 			}
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => {
+			Type::Slice { of } => {
 				let next_of = self.substitute(of, substitution);
-				let next_memory = self.substitute(memory, substitution);
-				if next_of == of && next_memory == memory {
+				if next_of == of {
 					ty
 				} else {
-					self.intern(Type::Slice {
-						of: next_of,
-						memory: next_memory,
-						ownership,
-					})
+					self.intern(Type::Slice { of: next_of })
 				}
 			}
 			Type::TypeProjection {
@@ -1453,8 +1367,6 @@ impl TypeInterner {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -2061,11 +1973,15 @@ mod tests {
 		let array = types.intern(Type::Array {
 			of: pointer,
 			length: seven,
+		});
+		let array = types.intern(Type::Pointer {
+			to: array,
 			memory,
 			ownership: Ownership::Exclusive,
 		});
-		let slice = types.intern(Type::Slice {
-			of: element,
+		let slice = types.intern(Type::Slice { of: element });
+		let slice = types.intern(Type::Pointer {
+			to: slice,
 			memory,
 			ownership: Ownership::Shared,
 		});

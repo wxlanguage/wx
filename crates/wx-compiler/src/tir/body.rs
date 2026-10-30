@@ -215,18 +215,19 @@ pub(super) enum ExprKind {
 	Int(u64),
 	Float(f64),
 	Char(char),
-	/// A string literal's contents, unescaped. Its type is a shared byte
-	/// slice or byte array its context gives (`Type::StringLiteral` until then).
+	/// A string literal's contents, unescaped. Its type is the byte array of
+	/// its length (`[u8; 5]`), data in no memory until its context places it
+	/// (a shared pointer to it or to the slice of its bytes).
 	String(SymbolU32),
-	/// An array literal `[a, b, c]`. Its type is a shared array of its length
-	/// or a shared slice its context gives (`Type::ArrayLiteral` until then),
-	/// and each element has that type's element type.
+	/// An array literal `[a, b, c]`. Its type is the array of its elements and
+	/// its length (`[{integer}; 3]`), data in no memory until its context
+	/// places it, and each element has that type's element type.
 	Array {
 		elements: ExprRange,
 	},
-	/// A repeat `[value; count]`, typed as an array literal is; `count` is
-	/// an integer literal or a constant, or `None` for `_`, the length of the
-	/// array its context gives.
+	/// A repeat `[value; count]`, typed as an array literal is, its length
+	/// the count; `count` is an integer literal or a constant, or `None` for
+	/// `_`, the length of the array its context gives.
 	ArrayRepeat {
 		value: ExprIdx,
 		count: Option<ExprIdx>,
@@ -517,6 +518,10 @@ pub(super) enum PlaceKind {
 	/// `place.field`; in the same memory as `object`, and as writable. The
 	/// field is its declared index.
 	Field { object: PlaceIdx, field: FieldIdx },
+	/// `place[index]`, an element of the slice or array `object`; in its
+	/// memory, and as writable. The index is the memory's `Size`, checked
+	/// against the length when it is read.
+	Element { object: PlaceIdx, index: ExprIdx },
 }
 
 /// One definition's checked expression tree.

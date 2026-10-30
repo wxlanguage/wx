@@ -3060,36 +3060,23 @@ impl<'a> Builder<'a> {
 				items.push(self.build_type_expression(&inner.inner));
 				self.arena.concat(items)
 			}
-			ast::TypeExpression::Slice {
-				ownership,
-				memory,
-				inner,
-			} => {
-				let mut items: Vec<NodeId> = Vec::new();
-				self.build_memory_tag(&mut items, memory.as_deref());
-				items.push(self.text(ownership_sigil(*ownership)));
-				items.push(self.text(Text::LBracket));
-				items.push(self.build_type_expression(&inner.inner));
-				items.push(self.text(Text::RBracket));
+			ast::TypeExpression::Slice { inner } => {
+				let items = vec![
+					self.text(Text::LBracket),
+					self.build_type_expression(&inner.inner),
+					self.text(Text::RBracket),
+				];
 				self.arena.concat(items)
 			}
-			ast::TypeExpression::Array {
-				ownership,
-				memory,
-				inner,
-				length,
-			} => {
-				let mut items: Vec<NodeId> = Vec::new();
-				self.build_memory_tag(&mut items, memory.as_deref());
-				items.extend([
-					self.text(ownership_sigil(*ownership)),
+			ast::TypeExpression::Array { inner, length } => {
+				let items = vec![
 					self.text(Text::LBracket),
 					self.build_type_expression(&inner.inner),
 					self.text(Text::Semi),
 					self.text(Text::Space),
 					self.build_const_argument(length),
 					self.text(Text::RBracket),
-				]);
+				];
 				self.arena.concat(items)
 			}
 			// A tuple of one is its element.

@@ -78,8 +78,7 @@ pub(super) enum UnsatisfiedClause {
 
 /// The value of `assoc_type_index` for `receiver`, whose trait the compiler
 /// answers from its structure: `func(A) -> R`'s `Call::Args` is `A` and its
-/// `Call::Result` is `R`, and `M::&[T]`'s or `M::&[T; N]`'s `Slice::Value`
-/// is `T` and its `Slice::Mem` is `M`.
+/// `Call::Result` is `R`, and `[T]`'s or `[T; N]`'s `Slice::Value` is `T`.
 fn builtin_assoc_value(
 	view: &TypeContext<'_, '_, '_>,
 	receiver: TypeIndex,
@@ -88,14 +87,8 @@ fn builtin_assoc_value(
 	let intrinsics = &view.defs.intrinsics;
 	let this = Some(assoc_type_index);
 	match *view.types.resolve(receiver) {
-		Type::Slice { of, memory, .. } | Type::Array { of, memory, .. } => {
-			if this == intrinsics.slice_value {
-				Some(of)
-			} else if this == intrinsics.slice_mem {
-				Some(memory)
-			} else {
-				None
-			}
+		Type::Slice { of } | Type::Array { of, .. } => {
+			(this == intrinsics.slice_value).then_some(of)
 		}
 		Type::TypedFuncref { param, result } => {
 			if this == intrinsics.call_args {
@@ -1383,12 +1376,7 @@ impl TypeContext<'_, '_, '_> {
 				)?,
 				ownership,
 			},
-			Type::Array {
-				of,
-				length,
-				memory,
-				ownership,
-			} => Type::Array {
+			Type::Array { of, length } => Type::Array {
 				of: self.normalize(assumption_context, of, depth, facts)?,
 				length: self.normalize(
 					assumption_context,
@@ -1396,27 +1384,9 @@ impl TypeContext<'_, '_, '_> {
 					depth,
 					facts,
 				)?,
-				memory: self.normalize(
-					assumption_context,
-					memory,
-					depth,
-					facts,
-				)?,
-				ownership,
 			},
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => Type::Slice {
+			Type::Slice { of } => Type::Slice {
 				of: self.normalize(assumption_context, of, depth, facts)?,
-				memory: self.normalize(
-					assumption_context,
-					memory,
-					depth,
-					facts,
-				)?,
-				ownership,
 			},
 			Type::TypeProjection { .. } | Type::Const { .. } => {
 				unreachable!(
@@ -1429,8 +1399,6 @@ impl TypeContext<'_, '_, '_> {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1536,23 +1504,38 @@ impl TypeContext<'_, '_, '_> {
 	/// How a value of `ty` sits on the Wasm stack, as `StackValue` judges it:
 	/// its parts in declaration order, flattened, zero-sized ones dropped.
 	/// Each element is a scalar (`is_stack_scalar`) or an abstract part
-	/// assumed `StackValue`, standing for its own `Repr`. `None` when `ty` is
-	/// no `StackValue`: it contains `!`, or an abstract part not assumed one.
+	/// assumed `StackValue`, standing for its own `Repr`. A type containing
+	/// `!` is uninhabited and its one element is `!`: no Wasm value is ever
+	/// held for it, since the code that would hold one is unreachable. `None`
+	/// when `ty` is no `StackValue`: it contains an abstract part not assumed
+	/// one.
 	pub(super) fn stack_elements(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
 		let mut elements = Vec::new();
-		let is_stack_value =
-			self.push_stack_elements(assumption_context, ty, &mut elements, 0)?;
-		Ok(is_stack_value.then_some(elements))
+		if !self.push_stack_elements(
+			assumption_context,
+			ty,
+			&mut elements,
+			0,
+		)? {
+			return Ok(None);
+		}
+		if elements.contains(&TypeIndex::NEVER) {
+			elements.clear();
+			elements.push(TypeIndex::NEVER);
+		}
+		Ok(Some(elements))
 	}
 
 	/// `<ty as StackValue>::Repr`, `ty` being a `StackValue` that is not
-	/// abstract itself. With no abstract part, the flat tuple of its
-	/// scalars; otherwise the projection again, over the canonical self type:
-	/// the flat tuple of its elements, which flattens as `ty` does. So
+	/// abstract itself. `!` for an uninhabited type, so `transmute` makes no
+	/// `!` out of `()` and a global is never one. With no abstract part, the
+	/// flat tuple of its scalars; otherwise the projection again, over the
+	/// canonical self type: the flat tuple of its elements, which flattens as
+	/// `ty` does. So
 	/// `Wrap<T>` gives `T::Repr`, and `Pair<T, u32>` and `(T, u32)` both give
 	/// `<(T, i32) as StackValue>::Repr`.
 	fn stack_repr(
@@ -1565,6 +1548,9 @@ impl TypeContext<'_, '_, '_> {
 		let Some(parts) = self.stack_elements(assumption_context, ty)? else {
 			return Ok(None);
 		};
+		if parts == [TypeIndex::NEVER] {
+			return Ok(Some(TypeIndex::NEVER));
+		}
 		let mut elements = Vec::with_capacity(parts.len());
 		for part in parts {
 			if is_stack_scalar(part) {
@@ -1666,14 +1652,16 @@ impl TypeContext<'_, '_, '_> {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::Value { .. }
 			| Type::Const { .. } => {
 				return Err(SolverError::Poisoned);
 			}
-			// An uninhabited type has no representation.
-			Type::Never => false,
+			// Uninhabited: `stack_elements` makes it the whole type's one
+			// element.
+			Type::Never => {
+				out.push(TypeIndex::NEVER);
+				true
+			}
 			Type::Function { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. } => true,
@@ -1707,18 +1695,24 @@ impl TypeContext<'_, '_, '_> {
 					depth + 1,
 				)?
 			}
-			// An address, as wide as its memory's `Size`.
-			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
-				self.push_address(assumption_context, memory, out, depth)?
-			}
-			// An address and a length, both as wide as the memory's `Size`.
-			Type::Slice { memory, .. } => {
+			// An address, as wide as its memory's `Size`, and for a slice a
+			// length as wide again.
+			Type::Pointer { to, memory, .. } => {
+				// Either thin or fat: its representation is not known here.
+				let Some(fat) = self.is_fat_pointee(assumption_context, to)?
+				else {
+					return Ok(false);
+				};
 				let start = out.len();
 				let is_stack_value =
 					self.push_address(assumption_context, memory, out, depth)?;
-				out.extend_from_within(start..);
+				if fat {
+					out.extend_from_within(start..);
+				}
 				is_stack_value
 			}
+			// A slice or an array is never a value: only a pointer holds one.
+			Type::Slice { .. } | Type::Array { .. } => false,
 			Type::Tuple { elements } => {
 				// Read one element at a time: normalizing may store more lists.
 				for at in 0..elements.len() {
@@ -1770,21 +1764,80 @@ impl TypeContext<'_, '_, '_> {
 					.intrinsics
 					.stack_value
 					.expect("only `StackValue` asks for stack elements");
-				match self.check_assumed_trait(
-					assumption_context,
-					ty,
-					stack_value,
-				)? {
-					Assumption::Holds => {
-						out.push(ty);
-						true
-					}
-					Assumption::Unproven => false,
-					Assumption::Pending => return Err(SolverError::Pending),
+				let is_stack_value =
+					self.assumes(assumption_context, ty, stack_value)?;
+				if is_stack_value {
+					out.push(ty);
 				}
+				is_stack_value
 			}
 		};
 		Ok(is_stack_value)
+	}
+
+	/// Whether `ty` is a slice or an array, `[T]` or `[T; N]`, or a parameter
+	/// or a projection that may stand for one: one assumed `Slice`, since
+	/// only a parameter bounded by it may.
+	pub(super) fn may_be_slice(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+	) -> Result<bool, SolverError> {
+		// Deep, as the declaration's other checks read it, so they share one
+		// normalization.
+		let ty = self.normalize(
+			assumption_context,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)?;
+		match *self.types.resolve(ty) {
+			Type::Slice { .. } | Type::Array { .. } => Ok(true),
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				match self.defs.intrinsics.slice {
+					Some(slice) => self.assumes(assumption_context, ty, slice),
+					None => Ok(false),
+				}
+			}
+			_ => Ok(false),
+		}
+	}
+
+	/// Whether a pointer to `to` is fat, an address and a length: `Some(true)`
+	/// for a slice, `Some(false)` for an array or anything that is not a
+	/// slice, and `None` for an abstract pointee assumed `Slice` but not
+	/// `Array`, which may be either. An abstract pointee not assumed `Slice`
+	/// is no slice or array, since only a parameter bounded by it may be one.
+	pub(super) fn is_fat_pointee(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		to: TypeIndex,
+	) -> Result<Option<bool>, SolverError> {
+		let to = self.normalize(
+			assumption_context,
+			to,
+			NormalizationDepth::Shallow,
+			RewriteFlags::ALL,
+		)?;
+		match *self.types.resolve(to) {
+			Type::Slice { .. } => Ok(Some(true)),
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				let intrinsics = &self.defs.intrinsics;
+				let (Some(slice), Some(array)) =
+					(intrinsics.slice, intrinsics.array)
+				else {
+					return Ok(Some(false));
+				};
+				if self.assumes(assumption_context, to, array)?
+					|| !self.assumes(assumption_context, to, slice)?
+				{
+					Ok(Some(false))
+				} else {
+					Ok(None)
+				}
+			}
+			_ => Ok(Some(false)),
+		}
 	}
 
 	/// Appends one address into `memory`: its `Size`'s elements. An abstract
@@ -1816,6 +1869,21 @@ impl TypeContext<'_, '_, '_> {
 			_ => self.memory_size(memory).ok_or(SolverError::Poisoned)?,
 		};
 		self.push_stack_elements(assumption_context, size, out, depth + 1)
+	}
+
+	/// Whether the facts in scope prove `ty: required` (`check_assumed_trait`);
+	/// `Pending` while a table they come from is unfinished.
+	fn assumes(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		required: TraitIdx,
+	) -> Result<bool, SolverError> {
+		match self.check_assumed_trait(assumption_context, ty, required)? {
+			Assumption::Holds => Ok(true),
+			Assumption::Unproven => Ok(false),
+			Assumption::Pending => Err(SolverError::Pending),
+		}
 	}
 
 	/// Whether the facts in scope prove `ty: required`, from three sources:
