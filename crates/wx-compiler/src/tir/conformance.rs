@@ -1291,11 +1291,11 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					},
 				) if a == b => lists(a_args, b_args, TypePathStep::TypeArgument),
 				(
-					&Type::FunctionRef {
+					&Type::TypedFuncref {
 						param: a_param,
 						result: a_result,
 					},
-					&Type::FunctionRef {
+					&Type::TypedFuncref {
 						param: b_param,
 						result: b_result,
 					},
@@ -1352,12 +1352,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					(TypePathStep::Memory, a_memory, b_memory),
 				],
 				(
-					&Type::AssocTypeProjection {
+					&Type::TypeProjection {
 						trait_index: a_trait,
 						assoc_type_index: a,
 						base: a_base,
 					},
-					&Type::AssocTypeProjection {
+					&Type::TypeProjection {
 						trait_index: b_trait,
 						assoc_type_index: b,
 						base: b_base,

@@ -350,6 +350,8 @@ fn call_type_args(case: &TestCase, index: usize) -> Vec<String> {
 					.map(|segment| case.name(segment.ident.inner))
 					.collect::<Vec<_>>()
 					.join("::"),
+				ConstArgument::QualifiedPath { .. }
+				| ConstArgument::Grouped { .. } => "rooted".to_string(),
 			},
 		})
 		.collect()
@@ -2639,6 +2641,48 @@ fn an_array_length_is_a_literal_or_a_path() {
 	let case = TestCase::new("func f(a: heap::&[u8; N + 1]) {}");
 	case.diagnostics()
 		.assert_error(DiagnosticCode::UnexpectedToken);
+}
+
+#[test]
+fn a_constant_path_may_start_from_a_bracketed_type() {
+	let case = TestCase::new(indoc! {"
+        func f(
+            a: heap::&[u8; <T as Array>::SIZE],
+            b: heap::&[u8; <heap::&[u8; 4]>::SIZE],
+            c: Buffer<const <<T as Tr>::Item as Array>::SIZE>,
+        ) {
+            local d = [0; <T as Array>::SIZE];
+        }
+    "});
+	case.diagnostics().assert_none();
+	let params = &case.function_signature(0).params;
+	let length = |at: usize| {
+		let TypeExpression::Array { length, .. } =
+			&params[at].inner.inner.ty.inner
+		else {
+			panic!("expected an array type")
+		};
+		&length.inner
+	};
+	assert!(matches!(
+		length(0),
+		ConstArgument::QualifiedPath { segments, .. } if segments.len() == 1
+	));
+	assert!(matches!(length(1), ConstArgument::Grouped { .. }));
+	let TypeExpression::Path(segments) = &params[2].inner.inner.ty.inner else {
+		panic!("expected a path")
+	};
+	assert!(matches!(
+		&*segments[0].type_args,
+		[TypeArgument::Const(constant)]
+			if matches!(constant.inner, ConstArgument::QualifiedPath { .. })
+	));
+	let Expression::ArrayRepeat { count, .. } =
+		local_definition_value(case.function_block(0), 0)
+	else {
+		panic!("expected an array repeat")
+	};
+	assert!(matches!(count.inner, ConstArgument::QualifiedPath { .. }));
 }
 
 #[test]

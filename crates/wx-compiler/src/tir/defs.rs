@@ -720,6 +720,21 @@ pub struct IntrinsicDefs {
 	/// `StackValue`'s declaration of `Repr`, which every type answers by a
 	/// compiler rule.
 	pub stack_value_repr: Option<AssocTypeIdx>,
+	/// `Slice`, `SliceMut`, `Array` and `ArrayMut`, which the compiler
+	/// implements for slice and array types.
+	pub slice: Option<TraitIdx>,
+	pub slice_mut: Option<TraitIdx>,
+	pub array: Option<TraitIdx>,
+	pub array_mut: Option<TraitIdx>,
+	/// `Slice`'s declarations of `Value` and `Mem`: the element type and the
+	/// memory of a slice or array type.
+	pub slice_value: Option<AssocTypeIdx>,
+	pub slice_mem: Option<AssocTypeIdx>,
+	/// `Array`'s declaration of `SIZE`: an array type's length.
+	pub array_size: Option<ConstIdx>,
+	/// `Slice::index` and `SliceMut::index_mut`, which `x[i]` calls.
+	pub slice_index: Option<FunctionIdx>,
+	pub slice_index_mut: Option<FunctionIdx>,
 }
 
 impl IntrinsicDefs {
@@ -770,6 +785,10 @@ impl IntrinsicDefs {
 			"Call" => &mut self.call,
 			"Function" => &mut self.function,
 			"StackValue" => &mut self.stack_value,
+			"Slice" => &mut self.slice,
+			"SliceMut" => &mut self.slice_mut,
+			"Array" => &mut self.array,
+			"ArrayMut" => &mut self.array_mut,
 			_ => return None,
 		})
 	}
@@ -3212,12 +3231,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					members.push(member);
 				}
 
-				let mut declared = |name: &str| {
-					let key = BindingKey::ty(self.strings.get_or_intern(name));
-					match members[usize::from(*bindings.get(&key)?)].kind {
-						MemberKind::AssociatedType(assoc) => Some(assoc),
-						_ => None,
-					}
+				// A name never interned is no member's.
+				let member = |key: fn(SymbolU32) -> BindingKey, name: &str| {
+					let key = key(self.strings.get(name)?);
+					Some(members[usize::from(*bindings.get(&key)?)].kind)
+				};
+				let declared = |name: &str| match member(BindingKey::ty, name) {
+					Some(MemberKind::AssociatedType(assoc)) => Some(assoc),
+					_ => None,
+				};
+				let method = |name: &str| match member(BindingKey::value, name)
+				{
+					Some(MemberKind::Method(function)) => Some(function),
+					_ => None,
 				};
 				let this = Some(trait_index);
 				if self.intrinsics.call == this {
@@ -3227,6 +3253,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					self.intrinsics.stack_value_repr = declared("Repr");
 				} else if self.intrinsics.memory == this {
 					self.intrinsics.memory_size = declared("Size");
+				} else if self.intrinsics.slice == this {
+					self.intrinsics.slice_value = declared("Value");
+					self.intrinsics.slice_mem = declared("Mem");
+					self.intrinsics.slice_index = method("index");
+				} else if self.intrinsics.slice_mut == this {
+					self.intrinsics.slice_index_mut = method("index_mut");
+				} else if self.intrinsics.array == this {
+					self.intrinsics.array_size =
+						match member(BindingKey::value, "SIZE") {
+							Some(MemberKind::Constant(constant)) => {
+								Some(constant)
+							}
+							_ => None,
+						};
 				}
 				let actual_index = self.push_trait(TraitDef {
 					typeset: None,

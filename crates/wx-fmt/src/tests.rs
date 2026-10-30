@@ -481,6 +481,26 @@ fn an_array_length_is_formatted_without_a_marker() {
 }
 
 #[test]
+fn a_bracketed_constant_path_is_formatted_as_written() {
+	let source = indoc! {"
+        func f(a: heap::&[u8; <T as Array>::SIZE], b: Buffer<const <A>::SIZE>) {
+            local c = [0; <heap::&[u8; 4]>::SIZE];
+        }
+    "};
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(output, source);
+}
+
+#[test]
 fn test_format_struct_items() {
 	let case = TestCase::new(indoc! {"
         pub struct Point(pub x: i32, y: i32);

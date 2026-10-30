@@ -888,7 +888,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// `ty`, written with the parameters of `env`, with `args` for them. A
 	/// type argument not known yet leaves its parts `INFER`, which expect
 	/// nothing; one that failed makes the whole type `ERROR`.
-	fn instantiate(
+	pub(super) fn instantiate(
 		&mut self,
 		ty: TypeIndex,
 		env: TypeEnvIdx,
@@ -1065,7 +1065,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		else {
 			return TypeIndex::ERROR;
 		};
-		let projection = self.cx.types.intern(Type::AssocTypeProjection {
+		let projection = self.cx.types.intern(Type::TypeProjection {
 			trait_index,
 			assoc_type_index,
 			base: ty,
@@ -1145,7 +1145,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			Ok(Some(TraitImplLookup::Abstract)) => over_self(self.cx),
 			Ok(Some(TraitImplLookup::Builtin)) => {
-				let Type::FunctionRef { param, result } =
+				let Type::TypedFuncref { param, result } =
 					*self.cx.types.resolve(ty)
 				else {
 					unreachable!(

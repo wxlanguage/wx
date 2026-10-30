@@ -43,8 +43,8 @@ use super::defs::{
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
 use super::members::{
-	ApplicableMember, AssocTypeProjectionTarget, MemberLookup,
-	TraitMemberSelection, report_ambiguous_type_member,
+	ApplicableMember, MemberLookup, TraitMemberSelection, TypeProjectionTarget,
+	report_ambiguous_type_member,
 };
 use super::obligations::{BoundRequirements, TypeObligation};
 use super::operators::OperatorTraits;
@@ -100,7 +100,7 @@ struct BoundOccurrence<'expr> {
 }
 
 struct BindingOccurrence<'expr> {
-	target: AssocTypeProjectionTarget,
+	target: TypeProjectionTarget,
 	name: Spanned<SymbolU32>,
 	kind: BindingOccurrenceKind<'expr>,
 }
@@ -2114,7 +2114,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let self_scope = self.traits[usize::from(trait_index)].env;
 
 				let base = self.type_envs.param_types(self_scope)[0];
-				let subject = self.types.intern(Type::AssocTypeProjection {
+				let subject = self.types.intern(Type::TypeProjection {
 					base,
 					trait_index,
 					assoc_type_index,
@@ -2913,10 +2913,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// The length an array type is written with. Only an integer literal
-	/// that fits a `u32` is checked yet; a constant's value is a later step.
-	/// An array's length in `memory`: a `Value` of its `Size`, which the
-	/// value must fit (`CheckConstantFits`), or `Infer` for `_`.
+	/// An array's length in `memory`, as written: a `Value` of its `Size`,
+	/// which the value must fit (`CheckConstantFits`), a constant named by a
+	/// path (`Type::Const`), or `Infer` for `_`.
 	fn array_length(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
@@ -2959,8 +2958,86 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					memory,
 					segments,
 					site,
+					infer_policy,
 				);
 			}
+			ast::ConstArgument::Grouped {
+				ref inner,
+				ref segments,
+			} => {
+				let (member, prefix) =
+					segments.split_last().expect("a path has a segment");
+				let root = self.resolve_type_expression(
+					obligations,
+					scope,
+					inner,
+					infer_policy,
+				);
+				let receiver = self.resolve_type_member_path(
+					obligations,
+					scope,
+					root,
+					prefix,
+					infer_policy,
+				);
+				let selected = self.select_type_constant(
+					obligations,
+					scope,
+					receiver,
+					member,
+				);
+				return self.type_constant_length(
+					obligations,
+					scope,
+					memory,
+					selected,
+					member,
+					site,
+				);
+			}
+			ast::ConstArgument::QualifiedPath {
+				ref root,
+				ref segments,
+			} => match &segments[..] {
+				[member] => {
+					let receiver = self.resolve_type_expression(
+						obligations,
+						scope,
+						&root.self_type,
+						infer_policy,
+					);
+					let selected = self
+						.resolve_trait_bound_path(
+							scope.file_id,
+							scope.namespace,
+							&root.trait_path,
+						)
+						.and_then(|required_trait| {
+							self.select_qualified_constant(
+								obligations,
+								scope,
+								receiver,
+								required_trait,
+								member,
+							)
+						});
+					return self.type_constant_length(
+						obligations,
+						scope,
+						memory,
+						selected,
+						member,
+						site,
+					);
+				}
+				_ => Diagnostic::bug()
+					.with_code(DiagnosticCode::UnsupportedExpression.code())
+					.with_message(
+						"checking a path past a trait-qualified member is not \
+						 supported yet",
+					)
+					.with_label(site.primary_label()),
+			},
 		};
 		self.diagnostics.push(diagnostic);
 		TypeIndex::ERROR
@@ -2968,8 +3045,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 
 	/// A length named by a constant: the constant, whose type must be
 	/// `memory`'s `Size` (`CheckConstantType`), and whose value it means once
-	/// evaluated. Only a constant named through namespaces is supported; one
-	/// of a type (`T::SIZE`) has arguments evaluation cannot substitute yet.
+	/// evaluated. One named through a type (`T::SIZE`, `A::SIZE`) is that
+	/// type's constant.
 	fn constant_length(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
@@ -2977,6 +3054,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		memory: TypeIndex,
 		segments: &[ast::PathSegment],
 		site: SourceSpan,
+		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let first = segments[0].ident.inner;
 		let through_type = self.type_envs.resolve(scope.env, first).is_some()
@@ -3001,17 +3079,38 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			Some(walk) if walk.target.def_key().is_none() => {
 				return TypeIndex::ERROR;
 			}
+			// A constant of a type: `T::SIZE`, `Self::SIZE`, `A::SIZE`.
 			_ => {
-				self.diagnostics.push(
-					Diagnostic::bug()
-						.with_code(DiagnosticCode::UnsupportedExpression.code())
-						.with_message(
-							"a type's constant as an array length is not \
-							 supported yet",
-						)
-						.with_label(site.primary_label()),
+				let (member, prefix) =
+					segments.split_last().expect("a path has a segment");
+				if prefix.is_empty() {
+					self.report_length_not_constant(
+						"type",
+						member.ident.inner,
+						site,
+					);
+					return TypeIndex::ERROR;
+				}
+				let receiver = self.resolve_type_path(
+					obligations,
+					scope,
+					prefix,
+					infer_policy,
 				);
-				return TypeIndex::ERROR;
+				let selected = self.select_type_constant(
+					obligations,
+					scope,
+					receiver,
+					member,
+				);
+				return self.type_constant_length(
+					obligations,
+					scope,
+					memory,
+					selected,
+					member,
+					site,
+				);
 			}
 		};
 		let Some(key) = target.def_key() else {
@@ -3030,28 +3129,86 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let kind = key.symbol_kind(self.defs);
 		let (DefKind::Const(constant) | DefKind::EnumVariant(constant)) = kind
 		else {
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::ArrayRepeatCountNotConst.code())
-					.with_message(format!(
-						"expected a constant, found {} `{}`",
-						kind.noun(),
-						self.strings.resolve(name.inner).unwrap()
-					))
-					.with_label(site.primary_label())
-					.with_note("an array's length is a literal or a constant"),
-			);
+			self.report_length_not_constant(kind.noun(), name.inner, site);
 			return TypeIndex::ERROR;
 		};
+		self.length_constant(obligations, scope, memory, constant, &[], site)
+	}
+
+	/// A length named by a type's constant `member`, as its path `selected`
+	/// it (`None` once a failure is reported). A type's constant takes no
+	/// type arguments of its own.
+	fn type_constant_length(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		memory: TypeIndex,
+		selected: Option<(ConstIdx, Vec<TypeIndex>)>,
+		member: &ast::PathSegment,
+		site: SourceSpan,
+	) -> TypeIndex {
+		let Some((constant, type_args)) = selected else {
+			return TypeIndex::ERROR;
+		};
+		if !member.type_args.is_empty() {
+			self.diagnostics.push(report_type_args_not_allowed(
+				self.strings,
+				self.defs,
+				scope.file_id,
+				member,
+				TypeArgsNotAllowedOn::Declaration(DefKind::Const(constant)),
+			));
+		}
+		self.length_constant(
+			obligations,
+			scope,
+			memory,
+			constant,
+			&type_args,
+			site,
+		)
+	}
+
+	/// What a length names is not a constant: a `noun` called `name`.
+	pub(super) fn report_length_not_constant(
+		&mut self,
+		noun: &str,
+		name: SymbolU32,
+		site: SourceSpan,
+	) {
+		let name = self.strings.resolve(name).unwrap();
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::ArrayRepeatCountNotConst.code())
+				.with_message(format!(
+					"expected a constant, found {noun} `{name}`"
+				))
+				.with_label(site.primary_label())
+				.with_note("an array's length is a literal or a constant"),
+		);
+	}
+
+	/// `constant` with `type_args` as a length in `memory`, whose type it
+	/// must have.
+	fn length_constant(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		memory: TypeIndex,
+		constant: ConstIdx,
+		type_args: &[TypeIndex],
+		site: SourceSpan,
+	) -> TypeIndex {
+		let length = self.types.intern_const(constant, type_args);
 		if let Some(size) = self.memory_size(memory) {
 			obligations.push(TypeObligation::CheckConstantType {
 				assumption_context: scope.env,
-				constant,
+				length,
 				expected: size,
 				reference: site,
 			});
 		}
-		self.types.intern_const(constant, &[])
+		length
 	}
 
 	/// `memory`'s `Size`, `<memory as Memory>::Size`, as written; `None`
@@ -3063,7 +3220,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let intrinsics = &self.defs.intrinsics;
 		let (memory_trait, assoc_type_index) =
 			(intrinsics.memory?, intrinsics.memory_size?);
-		Some(self.types.intern(Type::AssocTypeProjection {
+		Some(self.types.intern(Type::TypeProjection {
 			trait_index: memory_trait,
 			assoc_type_index,
 			base: memory,
@@ -3747,6 +3904,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					scope.env,
 					base_ty,
 					required_trait,
+					BindingKey::ty(first.ident.inner),
 					first.ident,
 					scope.file_id,
 				) else {
@@ -3766,7 +3924,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						}
 						self.project_assoc_type(
 							base_ty,
-							AssocTypeProjectionTarget {
+							TypeProjectionTarget {
 								trait_index: required_trait,
 								assoc_type_index,
 							},
@@ -3832,7 +3990,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					),
 					None => TypeIndex::UNIT,
 				};
-				self.types.intern(Type::FunctionRef {
+				self.types.intern(Type::TypedFuncref {
 					param,
 					result: result_type,
 				})
@@ -4370,7 +4528,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				binding.name.inner,
 				span,
 			) {
-				MemberLookup::Found(member) => member.assoc_type_declaration(),
+				MemberLookup::Found(member) => member.type_declaration(),
 				MemberLookup::Ambiguous(candidates) => {
 					let diagnostic = report_ambiguous_type_member(
 						file_id,
@@ -6168,7 +6326,7 @@ pub(super) mod tests {
 					_ => None,
 				})
 				.unwrap();
-			case.context.types.intern(Type::AssocTypeProjection {
+			case.context.types.intern(Type::TypeProjection {
 				base,
 				trait_index,
 				assoc_type_index,
@@ -6479,12 +6637,11 @@ pub(super) mod tests {
 							MemberKind::AssociatedType(index) => index,
 							_ => unreachable!(),
 						};
-					let item =
-						builder.types.intern(Type::AssocTypeProjection {
-							base,
-							trait_index: TraitIdx::new(1),
-							assoc_type_index: declaration,
-						});
+					let item = builder.types.intern(Type::TypeProjection {
+						base,
+						trait_index: TraitIdx::new(1),
+						assoc_type_index: declaration,
+					});
 					assert!(
 						builder.assoc_types[usize::from(declaration)].is_none()
 					);
@@ -6652,7 +6809,7 @@ pub(super) mod tests {
 		) else {
 			panic!("expected one associated type");
 		};
-		let member = member.assoc_type_declaration().unwrap();
+		let member = member.type_declaration().unwrap();
 		let declaration = member.assoc_type_index;
 		let trait_index = member.trait_index;
 		let Some(TraitImplLookup::Concrete { impl_index, .. }) = builder
@@ -6663,7 +6820,7 @@ pub(super) mod tests {
 		};
 		let projection = builder.project_assoc_type(receiver, member);
 		assert!(
-			matches!(builder.types.resolve(projection), Type::AssocTypeProjection { assoc_type_index, .. } if *assoc_type_index == declaration)
+			matches!(builder.types.resolve(projection), Type::TypeProjection { assoc_type_index, .. } if *assoc_type_index == declaration)
 		);
 		let selection = builder.defs.select_trait_member(
 			impl_index,
@@ -7224,7 +7381,7 @@ pub(super) mod tests {
 		fn is_projection_param(&self, path: &str, index: usize) -> bool {
 			matches!(
 				self.context.types.resolve(self.param_types(path)[index]),
-				Type::AssocTypeProjection { .. }
+				Type::TypeProjection { .. }
 			)
 		}
 
@@ -7332,7 +7489,7 @@ pub(super) mod tests {
 		assert_eq!(named, case.type_alias("Unnamed").target);
 		assert!(matches!(
 			case.context.types.resolve(named),
-			Type::FunctionRef { param, result }
+			Type::TypedFuncref { param, result }
 				if *result == TypeIndex::I32
 					&& matches!(
 						case.context.types.resolve(*param),
@@ -7383,7 +7540,7 @@ pub(super) mod tests {
 			case.context.diagnostics
 		);
 		let alias = case.type_alias("Callback");
-		let Type::FunctionRef { param, result } =
+		let Type::TypedFuncref { param, result } =
 			case.context.types.resolve(alias.target)
 		else {
 			panic!("expected outer function type");
@@ -7397,7 +7554,7 @@ pub(super) mod tests {
 		);
 		assert!(matches!(
 			case.context.types.resolve(*result),
-			Type::FunctionRef { param, result }
+			Type::TypedFuncref { param, result }
 				if *param == TypeIndex::UNIT && *result == TypeIndex::UNIT
 		));
 	}
@@ -7425,7 +7582,7 @@ pub(super) mod tests {
 			assert!(range.start >= last_start);
 			last_start = range.end;
 		}
-		let Type::FunctionRef { param, result } = case
+		let Type::TypedFuncref { param, result } = case
 			.context
 			.types
 			.resolve(case.type_alias("Callback").target)
@@ -9328,7 +9485,7 @@ pub(super) mod tests {
 		let abstract_item = case.normalized_param("abstract_item", 0);
 		assert!(matches!(
 			case.context.types.resolve(abstract_item),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 	}
 
@@ -9399,7 +9556,7 @@ pub(super) mod tests {
 			);
 			assert!(matches!(
 				case.context.types.resolve(written),
-				Type::AssocTypeProjection { .. }
+				Type::TypeProjection { .. }
 			));
 			assert!(matches!(
 				case.context.normalize(
@@ -9521,7 +9678,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_none();
 		let written = case.param_types("f")[0];
-		let Type::AssocTypeProjection { base, .. } =
+		let Type::TypeProjection { base, .. } =
 			*case.context.types.resolve(written)
 		else {
 			panic!("the parameter is a projection");
@@ -9828,7 +9985,7 @@ pub(super) mod tests {
 				);
 				assert!(matches!(
 					case.context.types.resolve(written),
-					Type::AssocTypeProjection { .. }
+					Type::TypeProjection { .. }
 				));
 				assert_eq!(
 					case.context.normalize(
@@ -10560,7 +10717,7 @@ pub(super) mod tests {
 			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 		assert_eq!(
 			case.context.types.resolve(params[1]),
@@ -10831,7 +10988,7 @@ pub(super) mod tests {
 			.list(case.function_signature("test").param_types);
 		assert!(matches!(
 			case.context.types.resolve(params[0]),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 		// `T::Mem` is not a memory: diagnosed, and the written tag is kept.
 		assert_eq!(
@@ -10958,7 +11115,7 @@ pub(super) mod tests {
 		};
 		assert!(matches!(
 			case.context.types.resolve(*memory),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 	}
 
@@ -11005,7 +11162,7 @@ pub(super) mod tests {
 		// keeps its shape.
 		assert!(matches!(
 			case.context.types.resolve(params[1]),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 		let ptr = case.normalized_param("test", 1);
 		let Type::Pointer { to, memory, .. } = case.context.types.resolve(ptr)
@@ -11015,7 +11172,7 @@ pub(super) mod tests {
 		assert_eq!(*to, TypeIndex::U8);
 		assert!(matches!(
 			case.context.types.resolve(*memory),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 	}
 
@@ -12318,7 +12475,7 @@ pub(super) mod tests {
 		let sig = case.trait_function_signature("Global", "get");
 		let trait_index = case.trait_index("Global");
 		match case.context.types.resolve(sig.return_type) {
-			Type::AssocTypeProjection {
+			Type::TypeProjection {
 				trait_index: found_trait,
 				base,
 				..
@@ -12330,7 +12487,7 @@ pub(super) mod tests {
 					"base should be `self`'s own type — the trait's Self"
 				);
 			}
-			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+			other => panic!("expected an TypeProjection, got {other:?}"),
 		}
 	}
 
@@ -12353,7 +12510,7 @@ pub(super) mod tests {
 		let sig = case.trait_function_signature("Global", "get");
 		let trait_index = case.trait_index("Global");
 		match case.context.types.resolve(sig.return_type) {
-			Type::AssocTypeProjection {
+			Type::TypeProjection {
 				trait_index: found_trait,
 				base,
 				..
@@ -12361,7 +12518,7 @@ pub(super) mod tests {
 				assert_eq!(*found_trait, trait_index);
 				assert_eq!(*base, case.context.types.list(sig.param_types)[0]);
 			}
-			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+			other => panic!("expected an TypeProjection, got {other:?}"),
 		}
 	}
 
@@ -12383,10 +12540,10 @@ pub(super) mod tests {
 		);
 		let trait_a = case.trait_index("A");
 		match case.context.types.resolve(case.param_types("f")[0]) {
-			Type::AssocTypeProjection { trait_index, .. } => {
+			Type::TypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, trait_a);
 			}
-			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+			other => panic!("expected an TypeProjection, got {other:?}"),
 		}
 	}
 
@@ -12407,10 +12564,10 @@ pub(super) mod tests {
 		);
 		let trait_b = case.trait_index("B");
 		match case.context.types.resolve(case.param_types("f")[0]) {
-			Type::AssocTypeProjection { trait_index, .. } => {
+			Type::TypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, trait_b);
 			}
-			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+			other => panic!("expected an TypeProjection, got {other:?}"),
 		}
 	}
 
@@ -12462,7 +12619,7 @@ pub(super) mod tests {
 		// the type is kept as written.
 		assert!(matches!(
 			case.context.types.resolve(case.param_types("f")[0]),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 	}
 
@@ -12975,12 +13132,11 @@ pub(super) mod tests {
 					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let (declaration, provider, reference) =
 					selected_provider(builder, receiver, "Item");
-				let projection =
-					builder.types.intern(Type::AssocTypeProjection {
-						base: receiver,
-						trait_index: TraitIdx::new(0),
-						assoc_type_index: declaration,
-					});
+				let projection = builder.types.intern(Type::TypeProjection {
+					base: receiver,
+					trait_index: TraitIdx::new(0),
+					assoc_type_index: declaration,
+				});
 				let tuple =
 					builder.types.intern_tuple(&[projection, TypeIndex::I32]);
 				// A completed stored value can still contain an abstract projection
@@ -13060,7 +13216,7 @@ pub(super) mod tests {
 					TypeIndex::INFER,
 				] {
 					let projection =
-						builder.types.intern(Type::AssocTypeProjection {
+						builder.types.intern(Type::TypeProjection {
 							base,
 							trait_index: TraitIdx::new(0),
 							assoc_type_index: declaration,
@@ -13082,7 +13238,7 @@ pub(super) mod tests {
 						projection
 					);
 				}
-				let error = builder.types.intern(Type::AssocTypeProjection {
+				let error = builder.types.intern(Type::TypeProjection {
 					base: TypeIndex::ERROR,
 					trait_index: TraitIdx::new(0),
 					assoc_type_index: declaration,
@@ -13122,12 +13278,11 @@ pub(super) mod tests {
 					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let (declaration, _, reference) =
 					selected_provider(builder, receiver, "Item");
-				let projection =
-					builder.types.intern(Type::AssocTypeProjection {
-						base: receiver,
-						trait_index: TraitIdx::new(0),
-						assoc_type_index: declaration,
-					});
+				let projection = builder.types.intern(Type::TypeProjection {
+					base: receiver,
+					trait_index: TraitIdx::new(0),
+					assoc_type_index: declaration,
+				});
 				let seven = builder.types.intern(Type::Value { bits: 7 });
 				let cases = [
 					(
@@ -13158,11 +13313,11 @@ pub(super) mod tests {
 						),
 					),
 					(
-						builder.types.intern(Type::FunctionRef {
+						builder.types.intern(Type::TypedFuncref {
 							param: projection,
 							result: projection,
 						}),
-						builder.types.intern(Type::FunctionRef {
+						builder.types.intern(Type::TypedFuncref {
 							param: TypeIndex::I32,
 							result: TypeIndex::I32,
 						}),
@@ -13250,12 +13405,11 @@ pub(super) mod tests {
 					builder.types.intern_struct(StructIdx::new(0), &[]);
 				let (declaration, _, reference) =
 					selected_provider(builder, receiver, "Item");
-				let projection =
-					builder.types.intern(Type::AssocTypeProjection {
-						base: receiver,
-						trait_index: TraitIdx::new(0),
-						assoc_type_index: declaration,
-					});
+				let projection = builder.types.intern(Type::TypeProjection {
+					base: receiver,
+					trait_index: TraitIdx::new(0),
+					assoc_type_index: declaration,
+				});
 				let pair =
 					builder.types.intern_tuple(&[projection, projection]);
 				let expected = builder
@@ -13284,7 +13438,7 @@ pub(super) mod tests {
 			builder.solver.set_limit_for_test(4);
 			// A projection at the bottom: a type without one is already normal
 			// and spends no budget.
-			let mut nested = builder.types.intern(Type::AssocTypeProjection {
+			let mut nested = builder.types.intern(Type::TypeProjection {
 				base: TypeIndex::I32,
 				trait_index: TraitIdx::new(0),
 				assoc_type_index: AssocTypeIdx::new(0),
@@ -13337,7 +13491,7 @@ pub(super) mod tests {
 					param_index: 0,
 				});
 				for _ in 0..8 {
-					nested = builder.types.intern(Type::AssocTypeProjection {
+					nested = builder.types.intern(Type::TypeProjection {
 						base: nested,
 						trait_index: TraitIdx::new(0),
 						assoc_type_index: declaration,
@@ -13820,7 +13974,7 @@ pub(super) mod tests {
 		// the type is kept as written.
 		assert!(matches!(
 			case.context.types.resolve(case.param_types("f")[0]),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 	}
 
@@ -13858,7 +14012,7 @@ pub(super) mod tests {
 
 		let container_index = case.trait_index("Container");
 		match case.context.types.resolve(value.inner) {
-			Type::AssocTypeProjection {
+			Type::TypeProjection {
 				trait_index, base, ..
 			} => {
 				assert_eq!(*trait_index, container_index);
@@ -13881,7 +14035,7 @@ pub(super) mod tests {
 					}
 				}
 			}
-			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+			other => panic!("expected an TypeProjection, got {other:?}"),
 		}
 	}
 
@@ -13907,7 +14061,7 @@ pub(super) mod tests {
 		);
 		assert!(matches!(
 			case.context.types.resolve(sig.return_type),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 	}
 
@@ -13997,10 +14151,10 @@ pub(super) mod tests {
 		// existing bound-conflict diagnostic remains the only error.
 		let param_ty = case.param_types("f")[0];
 		match case.context.types.resolve(param_ty) {
-			Type::AssocTypeProjection { trait_index, .. } => {
+			Type::TypeProjection { trait_index, .. } => {
 				assert_eq!(*trait_index, case.trait_index("A"));
 			}
-			other => panic!("expected an AssocTypeProjection, got {other:?}"),
+			other => panic!("expected an TypeProjection, got {other:?}"),
 		}
 	}
 
@@ -14511,7 +14665,7 @@ pub(super) mod tests {
 			{
 				assert!(matches!(
 					case.context.types.resolve(ty),
-					Type::AssocTypeProjection { .. }
+					Type::TypeProjection { .. }
 				));
 			}
 		}
@@ -14538,7 +14692,7 @@ pub(super) mod tests {
 						.types
 						.list(case.function_signature(name).param_types)[0]
 				),
-				Type::AssocTypeProjection { .. }
+				Type::TypeProjection { .. }
 			));
 		}
 	}
@@ -14560,12 +14714,11 @@ pub(super) mod tests {
 						MemberKind::AssociatedType(index) => index,
 						_ => unreachable!(),
 					};
-				let projection =
-					builder.types.intern(Type::AssocTypeProjection {
-						base,
-						trait_index: TraitIdx::new(0),
-						assoc_type_index,
-					});
+				let projection = builder.types.intern(Type::TypeProjection {
+					base,
+					trait_index: TraitIdx::new(0),
+					assoc_type_index,
+				});
 				let clauses = builder.param_bounds[usize::from(env)][0].clauses;
 				builder.param_bounds[usize::from(env)][0].clauses.equalities =
 					Equalities::Pending;
@@ -14654,7 +14807,7 @@ pub(super) mod tests {
 		);
 		assert!(matches!(
 			case.context.types.resolve(case.param_types("f")[0]),
-			Type::AssocTypeProjection { .. }
+			Type::TypeProjection { .. }
 		));
 	}
 	#[test]
@@ -14732,7 +14885,7 @@ pub(super) mod tests {
 			else {
 				panic!("expected tuple");
 			};
-			let Type::AssocTypeProjection { base, .. } =
+			let Type::TypeProjection { base, .. } =
 				types.resolve(types.list(*elements)[0])
 			else {
 				panic!("source must retain U::Item");
@@ -14939,16 +15092,15 @@ pub(super) mod tests {
 			// about `T::Item` is kept as written.
 			assert!(matches!(
 				case.context.types.resolve(written),
-				Type::AssocTypeProjection { .. }
+				Type::TypeProjection { .. }
 			));
 			assert_eq!(case.normalized(assumption_context, written), u);
 			let stored = u;
-			let projection =
-				case.context.types.intern(Type::AssocTypeProjection {
-					base: t,
-					trait_index: TraitIdx::new(1),
-					assoc_type_index: AssocTypeIdx::new(0),
-				});
+			let projection = case.context.types.intern(Type::TypeProjection {
+				base: t,
+				trait_index: TraitIdx::new(1),
+				assoc_type_index: AssocTypeIdx::new(0),
+			});
 			assert!(
 				memberships(&case.context, assumption_context)
 					.contains(&(projection, TraitIdx::new(0)))
@@ -15014,7 +15166,7 @@ pub(super) mod tests {
 				case.context
 					.types
 					.resolve(case.context.types.list(*type_args)[0]),
-				Type::AssocTypeProjection { .. }
+				Type::TypeProjection { .. }
 			));
 			let BindingRequirement::Equals(value) =
 				case.context.bounds.binding(source).kind
@@ -15254,7 +15406,7 @@ pub(super) mod tests {
 				case.context.types.list(signature.param_types)[0],
 				case.context.types.list(signature.param_types)[1]
 			);
-			let Type::AssocTypeProjection {
+			let Type::TypeProjection {
 				trait_index,
 				assoc_type_index,
 				base,
@@ -15295,7 +15447,7 @@ pub(super) mod tests {
 				DiagnosticCode::TraitBoundViolation,
 			]);
 			assert!(
-				matches!(case.context.types.resolve(case.context.types.list(case.function_signature("g").param_types)[0]), Type::AssocTypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
+				matches!(case.context.types.resolve(case.context.types.list(case.function_signature("g").param_types)[0]), Type::TypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
 			);
 		}
 
@@ -15603,7 +15755,7 @@ pub(super) mod tests {
 					else {
 						panic!("provider member expected")
 					};
-					let member = member.assoc_type_declaration().unwrap();
+					let member = member.type_declaration().unwrap();
 					assert_eq!(member.trait_index, TraitIdx::new(0));
 					assert_eq!(member.assoc_type_index, AssocTypeIdx::new(0));
 					let ty = builder.project_assoc_type(TypeIndex::I32, member);
@@ -16127,7 +16279,7 @@ pub(super) mod tests {
 					// own context means `U`...
 					assert!(matches!(
 						builder.types.resolve(written),
-						Type::AssocTypeProjection { .. }
+						Type::TypeProjection { .. }
 					));
 					assert_eq!(
 						builder.normalize(
@@ -16462,7 +16614,7 @@ pub(super) mod tests {
 				case.context
 					.types
 					.resolve(case.context.types.list(*type_args)[0]),
-				Type::AssocTypeProjection { .. }
+				Type::TypeProjection { .. }
 			));
 		}
 		#[test]
@@ -16493,11 +16645,11 @@ pub(super) mod tests {
 			let need = types.intern_struct(struct_index, &[TypeIndex::I32]);
 			let expected = [
 				types.intern_tuple(&[need, TypeIndex::I32]),
-				types.intern(Type::FunctionRef {
+				types.intern(Type::TypedFuncref {
 					param: TypeIndex::I32,
 					result: need,
 				}),
-				types.intern(Type::FunctionRef {
+				types.intern(Type::TypedFuncref {
 					param: need,
 					result: TypeIndex::I32,
 				}),

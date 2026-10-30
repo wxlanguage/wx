@@ -319,9 +319,9 @@ impl TypeContext<'_, '_, '_> {
 				count: 1,
 			},
 			Type::Funcref
-			| Type::FunctionRef { .. }
+			| Type::TypedFuncref { .. }
 			| Type::TypeParam { .. }
-			| Type::AssocTypeProjection { .. } => return Ok(None),
+			| Type::TypeProjection { .. } => return Ok(None),
 			Type::Enum { enum_index } => {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				return self.piece(assumption_context, repr, visiting);

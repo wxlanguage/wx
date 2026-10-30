@@ -45,7 +45,7 @@ use crate::index::index_newtype;
 use crate::vfs::FileId;
 
 use super::defs::{DefId, DefKind, DefinitionRegistry, TraitIdx};
-use super::members::AssocTypeProjectionTarget;
+use super::members::TypeProjectionTarget;
 use super::signatures::{
 	AssocTypeSignature, ParamBounds, QueryInfo, SignatureStatus,
 	TraitSignature, TypeContext,
@@ -79,7 +79,7 @@ pub(super) struct SourceTraitBound {
 pub(super) struct SourceAssocBinding {
 	/// The associated type it constrains, under the trait that declares it:
 	/// the bound's own trait, or one of its supertraits.
-	pub(super) target: AssocTypeProjectionTarget,
+	pub(super) target: TypeProjectionTarget,
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) kind: BindingRequirement,
 }
@@ -436,7 +436,7 @@ impl TypeContext<'_, '_, '_> {
 		mut receiver: TypeIndex,
 		reference: SourceSpan,
 	) -> Result<(), ()> {
-		while let Type::AssocTypeProjection {
+		while let Type::TypeProjection {
 			base,
 			assoc_type_index,
 			..
@@ -773,12 +773,12 @@ impl DeclarationSource {
 			}
 			match (types.resolve(subject), types.resolve(receiver)) {
 				(
-					Type::AssocTypeProjection {
+					Type::TypeProjection {
 						base: subject_base,
 						trait_index: subject_trait,
 						assoc_type_index: subject_assoc,
 					},
-					Type::AssocTypeProjection {
+					Type::TypeProjection {
 						base: receiver_base,
 						trait_index: receiver_trait,
 						assoc_type_index: receiver_assoc,
@@ -822,7 +822,7 @@ impl Iterator for DeclarationSources<'_, '_> {
 					.clauses,
 				context: None,
 			}),
-			Type::AssocTypeProjection {
+			Type::TypeProjection {
 				base,
 				trait_index,
 				assoc_type_index,
@@ -964,7 +964,7 @@ pub(super) fn known_distinct(
 			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::TypeParam { .. }
-			| Type::AssocTypeProjection { .. },
+			| Type::TypeProjection { .. },
 			_,
 		)
 		| (
@@ -977,7 +977,7 @@ pub(super) fn known_distinct(
 			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::TypeParam { .. }
-			| Type::AssocTypeProjection { .. },
+			| Type::TypeProjection { .. },
 		) => false,
 		// A nominal type is its declaration: two declarations never meet,
 		// whatever their arguments.

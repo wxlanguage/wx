@@ -170,7 +170,7 @@ impl TypeList {
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-// `TypeParam`/`AssocTypeProjection` echo the enum's own
+// `TypeParam`/`TypeProjection` echo the enum's own
 // name because "type" is the domain term (a type parameter, an associated
 // type), not accidental repetition — renaming to `Param`/`Associated` would
 // read worse at every call site (`Type::Param` loses the "type" a reader
@@ -208,7 +208,7 @@ pub enum Type {
 	F32,
 	F64,
 	/// A reference to a function of any signature, written `funcref`: the
-	/// untyped counterpart of `FunctionRef`.
+	/// untyped counterpart of `TypedFuncref`.
 	Funcref,
 	/// `()` is the empty tuple, pre-interned as `TypeIndex::UNIT`.
 	Tuple {
@@ -219,11 +219,12 @@ pub enum Type {
 		/// One argument per type parameter of the struct.
 		type_args: TypeList,
 	},
-	/// A reference to a function, written `func(A) -> R`. It takes exactly
+	/// A reference to a function of a known signature, written
+	/// `func(A) -> R`: Wasm's typed function reference. It takes exactly
 	/// one parameter type; a written parameter list is sugar for it:
 	/// `func()` takes `()`, `func(A)` takes `A`, `func(A, B)` takes
 	/// `(A, B)`, so `func((A, B))` is the same type.
-	FunctionRef {
+	TypedFuncref {
 		param: TypeIndex,
 		/// `TypeIndex::UNIT` when the written function type omits its result.
 		result: TypeIndex,
@@ -307,7 +308,7 @@ pub enum Type {
 	/// concrete or abstract. `assoc_type_index` always names the trait's
 	/// declaration, never an impl's value provider; substitution preserves
 	/// this identity and only transforms the base.
-	AssocTypeProjection {
+	TypeProjection {
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
 		base: TypeIndex,
@@ -330,7 +331,7 @@ impl TypeFlags {
 	pub(super) const HAS_LITERAL: Self = Self(1 << 2);
 	/// A `TypeParam` is in it: substitution can change the type.
 	pub(super) const HAS_PARAM: Self = Self(1 << 3);
-	/// An `AssocTypeProjection` or a `Const` is in it: normalization can
+	/// An `TypeProjection` or a `Const` is in it: normalization can
 	/// change the type.
 	pub(super) const HAS_PROJECTION: Self = Self(1 << 4);
 	/// A `Const` is in it: its value can replace it, once evaluated.
@@ -520,11 +521,11 @@ impl TypeInterner {
 				args,
 			),
 			(
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: xp,
 					result: xr,
 				},
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: yp,
 					result: yr,
 				},
@@ -581,12 +582,12 @@ impl TypeInterner {
 				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
-				Type::AssocTypeProjection {
+				Type::TypeProjection {
 					trait_index: at,
 					assoc_type_index: aa,
 					base: x,
 				},
-				Type::AssocTypeProjection {
+				Type::TypeProjection {
 					trait_index: bt,
 					assoc_type_index: ba,
 					base: y,
@@ -860,10 +861,10 @@ impl TypeInterner {
 			} => self.flags[usize::from(of)]
 				.union(self.flags[usize::from(length)])
 				.union(self.flags[usize::from(memory)]),
-			Type::FunctionRef { param, result } => self.flags
+			Type::TypedFuncref { param, result } => self.flags
 				[usize::from(param)]
 			.union(self.flags[usize::from(result)]),
-			Type::AssocTypeProjection { base, .. } => {
+			Type::TypeProjection { base, .. } => {
 				TypeFlags::HAS_PROJECTION.union(self.flags[usize::from(base)])
 			}
 			Type::Const { type_args, .. } => {
@@ -926,7 +927,7 @@ impl TypeInterner {
 	pub(super) fn is_param_or_projection(&self, ty: TypeIndex) -> bool {
 		matches!(
 			self.resolve(ty),
-			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+			Type::TypeParam { .. } | Type::TypeProjection { .. }
 		)
 	}
 
@@ -939,7 +940,7 @@ impl TypeInterner {
 	pub(super) fn is_abstract(&self, ty: TypeIndex) -> bool {
 		match *self.resolve(ty) {
 			Type::TypeParam { .. } => true,
-			Type::AssocTypeProjection { base, .. } => self.is_abstract(base),
+			Type::TypeProjection { base, .. } => self.is_abstract(base),
 			_ => false,
 		}
 	}
@@ -1030,15 +1031,15 @@ impl TypeInterner {
 				Some(self.intern_const(constant, &type_args))
 			}
 			(
-				Type::FunctionRef { param, result },
-				Type::FunctionRef {
+				Type::TypedFuncref { param, result },
+				Type::TypedFuncref {
 					param: other_param,
 					result: other_result,
 				},
 			) => {
 				let param = self.meet(param, other_param)?;
 				let result = self.meet(result, other_result)?;
-				Some(self.intern(Type::FunctionRef { param, result }))
+				Some(self.intern(Type::TypedFuncref { param, result }))
 			}
 			(
 				Type::Pointer {
@@ -1105,12 +1106,12 @@ impl TypeInterner {
 				}))
 			}
 			(
-				Type::AssocTypeProjection {
+				Type::TypeProjection {
 					trait_index,
 					assoc_type_index,
 					base,
 				},
-				Type::AssocTypeProjection {
+				Type::TypeProjection {
 					trait_index: other_trait,
 					assoc_type_index: other_assoc_type,
 					base: other_base,
@@ -1119,7 +1120,7 @@ impl TypeInterner {
 				&& assoc_type_index == other_assoc_type =>
 			{
 				let base = self.meet(base, other_base)?;
-				Some(self.intern(Type::AssocTypeProjection {
+				Some(self.intern(Type::TypeProjection {
 					trait_index,
 					assoc_type_index,
 					base,
@@ -1202,8 +1203,8 @@ impl TypeInterner {
 				self.learn_lists(envs, env, slots, declared, actual)
 			}
 			(
-				Type::FunctionRef { param, result },
-				Type::FunctionRef {
+				Type::TypedFuncref { param, result },
+				Type::TypedFuncref {
 					param: other_param,
 					result: other_result,
 				},
@@ -1361,13 +1362,13 @@ impl TypeInterner {
 				Some(type_args) => self.intern_const(constant, &type_args),
 				None => ty,
 			},
-			Type::FunctionRef { param, result } => {
+			Type::TypedFuncref { param, result } => {
 				let next_param = self.substitute(param, substitution);
 				let next_result = self.substitute(result, substitution);
 				if next_param == param && next_result == result {
 					ty
 				} else {
-					self.intern(Type::FunctionRef {
+					self.intern(Type::TypedFuncref {
 						param: next_param,
 						result: next_result,
 					})
@@ -1430,7 +1431,7 @@ impl TypeInterner {
 					})
 				}
 			}
-			Type::AssocTypeProjection {
+			Type::TypeProjection {
 				base,
 				trait_index,
 				assoc_type_index,
@@ -1439,7 +1440,7 @@ impl TypeInterner {
 				if next_base == base {
 					ty
 				} else {
-					self.intern(Type::AssocTypeProjection {
+					self.intern(Type::TypeProjection {
 						base: next_base,
 						trait_index,
 						assoc_type_index,
@@ -1948,7 +1949,7 @@ mod tests {
 		let t = parameter(&mut types, TypeEnvIdx::new(1), 0);
 		let wrapped = types.intern_struct(StructIdx::new(0), &[t]);
 		let projection = |types: &mut TypeInterner, base| {
-			types.intern(Type::AssocTypeProjection {
+			types.intern(Type::TypeProjection {
 				trait_index: TraitIdx::new(0),
 				assoc_type_index: AssocTypeIdx::new(0),
 				base,
@@ -2039,12 +2040,12 @@ mod tests {
 		memory: TypeIndex,
 	) -> TypeIndex {
 		let wrapper = types.intern_struct(StructIdx::new(0), &[element]);
-		let item = types.intern(Type::AssocTypeProjection {
+		let item = types.intern(Type::TypeProjection {
 			trait_index: TraitIdx::new(0),
 			assoc_type_index: AssocTypeIdx::new(0),
 			base: wrapper,
 		});
-		let next = types.intern(Type::AssocTypeProjection {
+		let next = types.intern(Type::TypeProjection {
 			trait_index: TraitIdx::new(1),
 			assoc_type_index: AssocTypeIdx::new(1),
 			base: item,
@@ -2069,7 +2070,7 @@ mod tests {
 		let function_item =
 			types.intern_function(FunctionIdx::new(0), &[element, memory]);
 		let tuple = types.intern_tuple(&[array, slice, function_item]);
-		types.intern(Type::FunctionRef {
+		types.intern(Type::TypedFuncref {
 			param: tuple,
 			result: next,
 		})
@@ -2183,31 +2184,31 @@ mod tests {
 		};
 		let cases = [
 			(
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: TypeIndex::BOOL,
 					result: t,
 				},
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: TypeIndex::BOOL,
 					result: TypeIndex::I32,
 				},
 			),
 			(
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: t,
 					result: TypeIndex::CHAR,
 				},
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: TypeIndex::I32,
 					result: TypeIndex::CHAR,
 				},
 			),
 			(
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: TypeIndex::UNIT,
 					result: t,
 				},
-				Type::FunctionRef {
+				Type::TypedFuncref {
 					param: TypeIndex::UNIT,
 					result: TypeIndex::I32,
 				},
@@ -2251,7 +2252,7 @@ mod tests {
 		let envs = root_frames(&mut types);
 		let env = TypeEnvIdx::new(1);
 		let subject = parameter(&mut types, env, 0);
-		let projection = types.intern(Type::AssocTypeProjection {
+		let projection = types.intern(Type::TypeProjection {
 			base: subject,
 			trait_index: TraitIdx::new(0),
 			assoc_type_index: AssocTypeIdx::new(0),
@@ -2266,7 +2267,7 @@ mod tests {
 		);
 		assert_eq!(
 			types.resolve(result),
-			&Type::AssocTypeProjection {
+			&Type::TypeProjection {
 				base: TypeIndex::ERROR,
 				trait_index: TraitIdx::new(0),
 				assoc_type_index: AssocTypeIdx::new(0),

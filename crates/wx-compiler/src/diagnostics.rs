@@ -246,6 +246,7 @@ define_diagnostic_codes! {
 		MissingArguments => "E2122",
 		PositionalOnlyCall => "E2123",
 		ImplStricterThanTrait => "E2124",
+		CannotIndex => "E2125",
 	}
 }
 

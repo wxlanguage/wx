@@ -190,11 +190,89 @@ pub trait Ord: PartialOrd + Eq {
     }
 }
 
-pub func slice_len<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::Size;
+/// The slice of `len` values starting at `data`.
+#[inline]
+pub func slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T] {
+    transmute((data, len))
+}
 
-pub func slice_ptr<Mem: Memory, T>(slice: Mem::&[T]) -> Mem::&T;
+/// The exclusive slice of `len` values starting at `data`.
+#[inline]
+pub func slice_from_parts_mut<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::*[T] {
+    transmute((data, len))
+}
 
-pub func slice_from_parts<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::*[T];
+/// The array of the one value `data` points at.
+#[inline]
+pub func array_from_ref<Mem: Memory, T>(data: Mem::&T) -> Mem::&[T; 1] {
+    transmute(data)
+}
+
+/// The exclusive array of the one value `data` points at.
+#[inline]
+pub func array_from_mut<Mem: Memory, T>(data: Mem::*T) -> Mem::*[T; 1] {
+    transmute(data)
+}
+
+/// A run of values in one memory. The compiler implements it for every slice
+/// and array type, `&` and `*` alike.
+pub trait Slice {
+    type Value;
+    type Mem: Memory;
+
+    func len(self: Self) -> Self::Mem::Size;
+
+    func as_ref(self: Self) -> Self::Mem::&Self::Value;
+
+    /// The value at `index`; traps when it is out of bounds.
+    func index(self: Self, index: Self::Mem::Size) -> Self::Mem::&Self::Value;
+
+    #[inline]
+    func first(self: Self) -> Self::Mem::&Self::Value {
+        if self.len() == 0 { trap() };
+        self.index(0)
+    }
+
+    #[inline]
+    func last(self: Self) -> Self::Mem::&Self::Value {
+        if self.len() == 0 { trap() };
+        self.index(self.len() - 1)
+    }
+}
+
+/// A run of values that may be written: the compiler implements it for every
+/// exclusive slice and array type.
+pub trait SliceMut: Slice {
+    func as_ptr(self: Self) -> Self::Mem::*Self::Value;
+
+    /// The value at `index`; traps when it is out of bounds.
+    func index_mut(self: Self, index: Self::Mem::Size) -> Self::Mem::*Self::Value;
+
+    #[inline]
+    func first_mut(self: Self) -> Self::Mem::*Self::Value {
+        if self.len() == 0 { trap() };
+        self.index_mut(0)
+    }
+
+    #[inline]
+    func last_mut(self: Self) -> Self::Mem::*Self::Value {
+        if self.len() == 0 { trap() };
+        self.index_mut(self.len() - 1)
+    }
+}
+
+/// A run of values whose length is part of its type: the compiler implements
+/// it for every array type.
+pub trait Array: Slice {
+    const SIZE: Self::Mem::Size;
+
+    func as_slice(self: Self) -> Self::Mem::&[Self::Value];
+}
+
+/// The compiler implements it for every exclusive array type.
+pub trait ArrayMut: Array + SliceMut {
+    func as_slice_mut(self: Self) -> Self::Mem::*[Self::Value];
+}
 
 pub func i64_extend_i32(value: i32) -> i64;
 
@@ -1994,7 +2072,7 @@ pub func memory_copy<
     DstMem: Memory where { Size = Size },
 >(dst: DstMem::*u8, src: SrcMem::&u8, len: Size);
 
-pub typeset PointerSize: Mul + PartialEq + UnsignedInt + StackValue { u32, u64 }
+pub typeset PointerSize: Add + Sub + Mul + PartialEq + UnsignedInt + StackValue { u32, u64 }
 
 func global_get<G: Global>(g: G) -> G::Value;
 
@@ -2121,7 +2199,7 @@ pub trait Allocator {
 
     #[inline]
     func allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
-        slice_from_parts(
+        slice_from_parts_mut(
             transmute::<_, Self::Mem::*T>(self.allocate(Layout::array::<T>(len))),
             len,
         )
@@ -2193,7 +2271,7 @@ impl<Mem: Memory where { Size: Add }, T> RawPtr<Mem, T> {
     }
 }
 
-impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> {
+impl<Mem: Memory where { Size: BitAnd + BitNot }, T> RawPtr<Mem, T> {
     /// Rounds `addr` up to the next multiple of `align`.
     /// **`align` must be a power of two.**
     #[inline]
@@ -2201,22 +2279,6 @@ impl<Mem: Memory where { Size: Add + Sub + BitAnd + BitNot }, T> RawPtr<Mem, T> 
         Self({ addr: (self.addr + align - 1) & ^(align - 1) })
     }
 }
-
-// Slices are being reworked into a real nominal struct (`Slice<M, T>`) so
-// they can be an ordinary impl target; `Mem::&[T]` isn't a path, so it can't
-// be one under the current impl-target grammar. Re-add `len`/`ptr` once
-// that lands.
-// impl<Mem: Memory, T> Mem::&[T] {
-//     #[inline]
-//     pub func len(self: Self) -> Mem::Size {
-//         slice_len(self)
-//     }
-//
-//     #[inline]
-//     pub func ptr(self: Self) -> Mem::&T {
-//         slice_ptr(self)
-//     }
-// }
 
 const ASCII_CASE_MASK: u32 = 0b0010_0000;
 

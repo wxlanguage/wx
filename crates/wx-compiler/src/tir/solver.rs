@@ -24,7 +24,7 @@ use super::defs::{
 	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
 	TraitImplIdx,
 };
-use super::eval::{Allocation, ConstValueState, value_bits};
+use super::eval::{Allocation, ConstValueState, Instance, ResolvedConstant};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::layout::Layouts;
 use super::members::{TraitImplLookup, TraitMemberSelection};
@@ -78,23 +78,35 @@ pub(super) enum UnsatisfiedClause {
 
 /// The value of `assoc_type_index` for `receiver`, whose trait the compiler
 /// answers from its structure: `func(A) -> R`'s `Call::Args` is `A` and its
-/// `Call::Result` is `R`.
+/// `Call::Result` is `R`, and `M::&[T]`'s or `M::&[T; N]`'s `Slice::Value`
+/// is `T` and its `Slice::Mem` is `M`.
 fn builtin_assoc_value(
 	view: &TypeContext<'_, '_, '_>,
 	receiver: TypeIndex,
 	assoc_type_index: AssocTypeIdx,
 ) -> Option<TypeIndex> {
-	let Type::FunctionRef { param, result } = *view.types.resolve(receiver)
-	else {
-		return None;
-	};
 	let intrinsics = &view.defs.intrinsics;
-	if Some(assoc_type_index) == intrinsics.call_args {
-		Some(param)
-	} else if Some(assoc_type_index) == intrinsics.call_result {
-		Some(result)
-	} else {
-		None
+	let this = Some(assoc_type_index);
+	match *view.types.resolve(receiver) {
+		Type::Slice { of, memory, .. } | Type::Array { of, memory, .. } => {
+			if this == intrinsics.slice_value {
+				Some(of)
+			} else if this == intrinsics.slice_mem {
+				Some(memory)
+			} else {
+				None
+			}
+		}
+		Type::TypedFuncref { param, result } => {
+			if this == intrinsics.call_args {
+				Some(param)
+			} else if this == intrinsics.call_result {
+				Some(result)
+			} else {
+				None
+			}
+		}
+		_ => None,
 	}
 }
 
@@ -120,7 +132,7 @@ fn rebase(
 	if ty == root {
 		return onto;
 	}
-	let Type::AssocTypeProjection {
+	let Type::TypeProjection {
 		base,
 		trait_index,
 		assoc_type_index,
@@ -129,7 +141,7 @@ fn rebase(
 		unreachable!("a clause's subject is a projection path over its root")
 	};
 	let base = rebase(types, base, root, onto);
-	types.intern(Type::AssocTypeProjection {
+	types.intern(Type::TypeProjection {
 		base,
 		trait_index,
 		assoc_type_index,
@@ -142,7 +154,7 @@ fn through_failed(
 	mut ty: TypeIndex,
 	failed: &[(TypeIndex, TraitIdx)],
 ) -> bool {
-	while let Type::AssocTypeProjection {
+	while let Type::TypeProjection {
 		base, trait_index, ..
 	} = *types.resolve(ty)
 	{
@@ -316,12 +328,13 @@ pub(super) enum SolverFrame {
 		bound: Option<BoundId>,
 		outer_budget: usize,
 	},
-	/// A constant being evaluated (`Solver::const_value`). Its state is
-	/// `InProgress` while this frame is on the stack; reading it again closes
-	/// a loop through constants. The budget is the evaluation's own, as for
-	/// a judgement.
+	/// A constant being checked or evaluated (`TypeContext::const_value`),
+	/// with the arguments its body is read with. Its state is `InProgress`
+	/// while this frame is on the stack; reading it again closes a loop
+	/// through constants. The budget is the evaluation's own, as for a
+	/// judgement.
 	Evaluation {
-		constant: ConstIdx,
+		instance: Instance,
 		outer_budget: usize,
 	},
 }
@@ -395,8 +408,12 @@ pub(super) struct Solver {
 	pub(super) verdicts: FxHashMap<Definition, Verdict>,
 	/// Every aggregate layout asked for, by its concrete type.
 	pub(super) layouts: Layouts,
-	/// Each constant's value query state, by `ConstIdx` (`eval.rs`).
+	/// Each constant's value query state, by `ConstIdx` (`eval.rs`); for one
+	/// with parameters, its check's only.
 	pub(super) const_values: Vec<ConstValueState>,
+	/// The value query state of each instance of a constant with parameters
+	/// asked for; absent is `Checked`.
+	pub(super) instance_values: FxHashMap<Instance, ConstValueState>,
 	/// The bytes constant values point into, by `AllocIdx` (`eval.rs`).
 	pub(super) allocations: Vec<Allocation>,
 }
@@ -416,6 +433,7 @@ impl Solver {
 			verdicts: FxHashMap::default(),
 			layouts: Layouts::default(),
 			const_values: vec![ConstValueState::Unchecked; constant_count],
+			instance_values: FxHashMap::default(),
 			allocations: Vec::new(),
 		}
 	}
@@ -1002,7 +1020,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 		self.solver.state.recursion_budget -= 1;
 		let result = match *self.types.resolve(ty) {
-			Type::AssocTypeProjection { .. } => {
+			Type::TypeProjection { .. } => {
 				self.normalize_projection(assumption_context, ty, depth, facts)
 			}
 			Type::Const {
@@ -1029,9 +1047,10 @@ impl TypeContext<'_, '_, '_> {
 		result
 	}
 
-	/// A constant in a type means its value, evaluated here on first use.
-	/// Without `VALUES`, or with type arguments (not evaluated yet), it keeps
-	/// its normalized arguments.
+	/// A constant in a type means its value, evaluated here on first use;
+	/// a trait's declaration reads the one its `Self` selects
+	/// (`resolve_constant`). Without `VALUES`, or while `Self` is not known,
+	/// it keeps its normalized arguments.
 	fn normalize_const(
 		&mut self,
 		assumption_context: TypeEnvIdx,
@@ -1040,21 +1059,33 @@ impl TypeContext<'_, '_, '_> {
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
 	) -> Result<TypeIndex, SolverError> {
-		if !type_args.is_empty() || !facts.contains(RewriteFlags::VALUES) {
-			let mut type_args = self.types.list(type_args).to_vec();
-			for item in type_args.iter_mut() {
-				*item =
-					self.normalize(assumption_context, *item, depth, facts)?;
-			}
-			return Ok(self.types.intern_const(constant, &type_args));
+		let mut args = self.types.list(type_args).to_vec();
+		for item in args.iter_mut() {
+			*item = self.normalize(assumption_context, *item, depth, facts)?;
 		}
-		match self.const_value(constant) {
-			Ok(value) => match value_bits(value) {
-				Some(bits) => Ok(self.types.intern(Type::Value { bits })),
-				None => Err(SolverError::Poisoned),
-			},
+		if !facts.contains(RewriteFlags::VALUES) {
+			return Ok(self.types.intern_const(constant, &args));
+		}
+		let value = match self.resolve_constant(constant, &args)? {
+			ResolvedConstant::Instance(instance) => {
+				self.instance_bits(instance)
+			}
+			ResolvedConstant::Length(length) => {
+				return self.normalize(
+					assumption_context,
+					length,
+					depth,
+					facts,
+				);
+			}
+			ResolvedConstant::Abstract => {
+				return Ok(self.types.intern_const(constant, &args));
+			}
+		};
+		match value {
+			Some(bits) => Ok(self.types.intern(Type::Value { bits })),
 			// Reported by the constant's own check, or where it is named.
-			Err(_) => Err(SolverError::Poisoned),
+			None => Err(SolverError::Poisoned),
 		}
 	}
 
@@ -1105,7 +1136,7 @@ impl TypeContext<'_, '_, '_> {
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
 	) -> Result<TypeIndex, SolverError> {
-		let Type::AssocTypeProjection {
+		let Type::TypeProjection {
 			base,
 			trait_index,
 			assoc_type_index,
@@ -1143,7 +1174,7 @@ impl TypeContext<'_, '_, '_> {
 		let (projection, assumption_context) = if next_base == base {
 			(projection, assumption_context)
 		} else {
-			let next = self.types.intern(Type::AssocTypeProjection {
+			let next = self.types.intern(Type::TypeProjection {
 				base: next_base,
 				trait_index,
 				assoc_type_index,
@@ -1324,7 +1355,7 @@ impl TypeContext<'_, '_, '_> {
 				}
 				return Ok(self.types.intern_function(func_index, &type_args));
 			}
-			Type::FunctionRef { param, result } => Type::FunctionRef {
+			Type::TypedFuncref { param, result } => Type::TypedFuncref {
 				param: self.normalize(
 					assumption_context,
 					param,
@@ -1387,7 +1418,7 @@ impl TypeContext<'_, '_, '_> {
 				)?,
 				ownership,
 			},
-			Type::AssocTypeProjection { .. } | Type::Const { .. } => {
+			Type::TypeProjection { .. } | Type::Const { .. } => {
 				unreachable!(
 					"projections are handled before structural traversal"
 				)
@@ -1460,13 +1491,11 @@ impl TypeContext<'_, '_, '_> {
 		if normalized == TypeIndex::ERROR {
 			return Err(SolverError::Poisoned);
 		}
-		// A function reference is called by a compiler rule.
-		if Some(required_trait) == self.defs.intrinsics.call
-			&& matches!(
-				self.types.resolve(normalized),
-				Type::FunctionRef { .. }
-			) {
-			return Ok(Some(TraitImplLookup::Builtin));
+		if let Some(holds) = self.defs.intrinsics.implements_structurally(
+			self.types.resolve(normalized),
+			required_trait,
+		) {
+			return Ok(holds.then_some(TraitImplLookup::Builtin));
 		}
 		if let Some(target) =
 			ImplTarget::from_type(self.types.resolve(normalized))
@@ -1543,7 +1572,7 @@ impl TypeContext<'_, '_, '_> {
 				continue;
 			}
 			// An equality in scope may say what the part is held as.
-			let repr = self.types.intern(Type::AssocTypeProjection {
+			let repr = self.types.intern(Type::TypeProjection {
 				base: part,
 				trait_index,
 				assoc_type_index,
@@ -1564,7 +1593,7 @@ impl TypeContext<'_, '_, '_> {
 		if elements.iter().copied().all(is_stack_scalar) {
 			return Ok(Some(base));
 		}
-		Ok(Some(self.types.intern(Type::AssocTypeProjection {
+		Ok(Some(self.types.intern(Type::TypeProjection {
 			base,
 			trait_index,
 			assoc_type_index,
@@ -1586,7 +1615,7 @@ impl TypeContext<'_, '_, '_> {
 					.iter()
 					.all(|&element| self.splice_repr(element, out))
 			}
-			Type::AssocTypeProjection {
+			Type::TypeProjection {
 				base,
 				trait_index,
 				assoc_type_index,
@@ -1665,7 +1694,7 @@ impl TypeContext<'_, '_, '_> {
 				out.push(ty);
 				true
 			}
-			Type::FunctionRef { .. } => {
+			Type::TypedFuncref { .. } => {
 				out.push(TypeIndex::FUNCREF);
 				true
 			}
@@ -1735,7 +1764,7 @@ impl TypeContext<'_, '_, '_> {
 				}
 				true
 			}
-			Type::TypeParam { .. } | Type::AssocTypeProjection { .. } => {
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
 				let stack_value = self
 					.defs
 					.intrinsics
@@ -2246,7 +2275,7 @@ impl TypeContext<'_, '_, '_> {
 				.final_range()
 				.expect("a ready walk reached only final clauses");
 			for clause in tables.clauses.equalities(equalities) {
-				let Type::AssocTypeProjection {
+				let Type::TypeProjection {
 					base,
 					trait_index: clause_trait,
 					assoc_type_index: clause_assoc,

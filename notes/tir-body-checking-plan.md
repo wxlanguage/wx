@@ -312,7 +312,7 @@ selection (`match_impl_target`, `find_trait_impl`); the written `::<..>` and
 `learn` fill the method's own.
 
 `Type::Function` (a function item's zero-sized type) is what a bare path to a
-function evaluates to; it coerces to `Type::FunctionRef` where one is expected.
+function evaluates to; it coerces to `Type::TypedFuncref` where one is expected.
 Calling a value of a user type that implements `Call` is a `Call` of
 `Call::call`'s impl (Q3); a type itself is never called.
 
@@ -833,7 +833,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   accepts what coercion would. Constant evaluation gives `NotConst` until
   static data is designed. Open: `heap::&[u8; _]`, inferring the length.
 - **Calls through `Call`** for non-function values (Q3), and whether
-  `Callee::Indirect` is a separate path or `Call::call` on `FunctionRef`.
+  `Callee::Indirect` is a separate path or `Call::call` on `TypedFuncref`.
 - **Method-call privacy**, which the old checker never enforced (CLAUDE.md
   pitfall). New code can do it from the start since impl members carry
   visibility; decide the rule for trait default methods (fall back to the

@@ -2830,7 +2830,10 @@ impl<'a> Builder<'a> {
 				ast::ConstArgument::Literal(_) | ast::ConstArgument::Infer => {
 					self.build_const_argument(constant)
 				}
-				ast::ConstArgument::Path(_) => {
+				// Without its marker, a path is read as a type.
+				ast::ConstArgument::Path(_)
+				| ast::ConstArgument::QualifiedPath { .. }
+				| ast::ConstArgument::Grouped { .. } => {
 					let marker = self.text(Text::Const);
 					let path = self.build_const_argument(constant);
 					self.arena.concat2(marker, path)
@@ -2850,6 +2853,21 @@ impl<'a> Builder<'a> {
 				self.source_text(constant.span)
 			}
 			ast::ConstArgument::Path(path) => self.build_value_path(path),
+			ast::ConstArgument::QualifiedPath { root, segments } => {
+				let self_type =
+					self.build_type_expression(&root.self_type.inner);
+				let segments = self.build_value_path(segments);
+				self.build_qualified_path(
+					self_type,
+					Some(&root.trait_path),
+					segments,
+				)
+			}
+			ast::ConstArgument::Grouped { inner, segments } => {
+				let inner = self.build_type_expression(&inner.inner);
+				let segments = self.build_value_path(segments);
+				self.build_qualified_path(inner, None, segments)
+			}
 		}
 	}
 

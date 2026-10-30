@@ -23,6 +23,13 @@
 //! constant is asked first. The solver reads bodies and builds none: every
 //! constant body is built before anything evaluates
 //! (`TypeContext::build_constant_bodies`).
+//!
+//! A constant with parameters (a trait's, an impl's with arguments) has a
+//! value per instance, the constant with its arguments (`Instance`): its body
+//! is checked once and evaluated per instance with the arguments substituted,
+//! and a trait's declaration reads the member of the impl its `Self` selects,
+//! or the default the impl inherits (`resolve_constant`). No sweep reaches an
+//! instance, so its failure is reported by the reader that first asks for it.
 
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
@@ -30,12 +37,15 @@ use string_interner::symbol::SymbolU32;
 use super::body::{
 	Body, ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange,
 };
-use super::defs::{ConstIdx, EnumIdx, MemoryIdx};
+use super::defs::{ConstIdx, EnumIdx, MemberKind, MemberOwner, MemoryIdx};
 use super::layout::Primitive;
+use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::operators::Scalar;
 use super::signatures::TypeContext;
-use super::solver::{NormalizationDepth, RewriteFlags, Solver, SolverFrame};
-use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex};
+use super::solver::{
+	NormalizationDepth, RewriteFlags, Solver, SolverError, SolverFrame,
+};
+use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::index::index_newtype;
@@ -187,6 +197,43 @@ enum Halt {
 	Silent,
 }
 
+/// A constant with the type arguments its body is read with: its impl's, or
+/// `Self` for a trait's default. `args` is the list of the interned
+/// `Type::Const`, so equal instances are equal; empty for a constant with no
+/// parameters, which is its own one instance.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct Instance {
+	pub(super) constant: ConstIdx,
+	args: TypeList,
+}
+
+impl Instance {
+	pub(super) fn of(constant: ConstIdx) -> Self {
+		Self {
+			constant,
+			args: TypeList::EMPTY,
+		}
+	}
+}
+
+/// The constant whose body is evaluated, with its instance's arguments.
+#[derive(Clone, Copy)]
+struct Owner<'a> {
+	constant: ConstIdx,
+	args: &'a [TypeIndex],
+}
+
+/// What a constant named with arguments reads.
+pub(super) enum ResolvedConstant {
+	/// This instance's value.
+	Instance(Instance),
+	/// `Array::SIZE`: the array type's length.
+	Length(TypeIndex),
+	/// A trait's declaration whose `Self` is not known here.
+	Abstract,
+}
+
 /// The checked body of a constant, as built.
 fn body_of<'a>(
 	view: &'a TypeContext<'_, '_, '_>,
@@ -207,16 +254,28 @@ fn body_env(
 }
 
 impl TypeContext<'_, '_, '_> {
-	/// Evaluates a constant in the body phase, and reports what it owns.
+	/// Evaluates a constant in the body phase, and reports what it owns. One
+	/// with parameters is only checked: its instances are evaluated, and
+	/// reported, where they are read.
 	pub(super) fn evaluate_constant(&mut self, const_index: ConstIdx) {
+		let env = self.constants[usize::from(const_index)].env;
+		if self.type_envs.generic_count(env) > 0 {
+			if self.solver.const_values[usize::from(const_index)]
+				== ConstValueState::Unchecked
+			{
+				self.check_constant(const_index);
+			}
+			return;
+		}
 		let _ = self.const_value(const_index);
-		let diagnostic =
-			match &self.solver.const_values[usize::from(const_index)] {
-				ConstValueState::Failed(error) => {
-					self.report_eval_failure(const_index, error)
-				}
-				_ => return,
-			};
+		let diagnostic = match &self.solver.const_values
+			[usize::from(const_index)]
+		{
+			ConstValueState::Failed(error) => {
+				self.report_eval_failure(Instance::of(const_index), error, None)
+			}
+			_ => return,
+		};
 		self.diagnostics.push(diagnostic);
 	}
 
@@ -234,7 +293,7 @@ impl TypeContext<'_, '_, '_> {
 		debug_assert!(self.solver.state.blocked_at.is_none());
 		self.solver.const_values[at] = ConstValueState::InProgress;
 		self.solver.state.frames.push(SolverFrame::Evaluation {
-			constant: const_index,
+			instance: Instance::of(const_index),
 			outer_budget: std::mem::replace(
 				&mut self.solver.state.recursion_budget,
 				self.solver.recursion_limit,
@@ -254,7 +313,16 @@ impl TypeContext<'_, '_, '_> {
 		} else {
 			ConstValueState::Poisoned
 		};
-		self.solver.set_const_state(const_index, state);
+		self.solver
+			.set_const_state(Instance::of(const_index), state);
+	}
+
+	/// The bits of `instance`'s one number, as a type means it; `None` when
+	/// it has no such value, which its check or the site naming it reports.
+	pub(super) fn instance_bits(&mut self, instance: Instance) -> Option<u64> {
+		self.instance_value(instance, None)
+			.ok()
+			.and_then(value_bits)
 	}
 
 	/// A constant's value as a pattern compares with it: the bits of its one
@@ -323,53 +391,66 @@ impl TypeContext<'_, '_, '_> {
 		self.strings.resolve(def.name.inner).unwrap()
 	}
 
+	/// An instance as a path names it (`<P as Tr>::X`).
+	fn instance_name(&self, instance: Instance) -> String {
+		self.type_formatter()
+			.display_constant(instance.constant, self.types.list(instance.args))
+	}
+
+	/// A constant's failure, at the node that failed. An instance's is
+	/// reported by its first reader, `used_at`.
 	fn report_eval_failure(
 		&self,
-		const_index: ConstIdx,
+		instance: Instance,
 		error: &EvalError,
+		used_at: Option<SourceSpan>,
 	) -> Diagnostic<crate::vfs::FileId> {
-		let def = &self.defs.constants[usize::from(const_index)];
+		let def = &self.defs.constants[usize::from(instance.constant)];
 		let site = SourceSpan::new(def.file_id, error.span);
+		let name = self.instance_name(instance);
 		let message = match error.kind {
-			EvalErrorKind::NotConst => format!(
-				"`{}` cannot be evaluated at compile time",
-				self.const_name(const_index)
-			),
-			_ => format!(
-				"evaluation of constant `{}` failed",
-				self.const_name(const_index)
-			),
+			EvalErrorKind::NotConst => {
+				format!("`{name}` cannot be evaluated at compile time")
+			}
+			_ => format!("evaluation of constant `{name}` failed"),
 		};
-		Diagnostic::error()
+		let mut diagnostic = Diagnostic::error()
 			.with_code(error.kind.code().code())
 			.with_message(message)
-			.with_label(site.primary_label().with_message(error.kind.label()))
+			.with_label(site.primary_label().with_message(error.kind.label()));
+		if let Some(used_at) = used_at {
+			diagnostic =
+				diagnostic.with_label(used_at.secondary_label().with_message(
+					format!("`{name}` is evaluated for this use"),
+				));
+		}
+		diagnostic
 	}
 
 	fn report_const_cycle(
 		&self,
-		cycle: &[ConstIdx],
+		cycle: &[Instance],
 	) -> Diagnostic<crate::vfs::FileId> {
-		let def = &self.defs.constants[usize::from(cycle[0])];
+		let def = &self.defs.constants[usize::from(cycle[0].constant)];
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CyclicConstant.code())
 			.with_message(format!(
 				"cycle detected when evaluating constant `{}`",
-				self.const_name(cycle[0])
+				self.instance_name(cycle[0])
 			))
 			.with_label(
 				SourceSpan::new(def.file_id, def.name.span).primary_label(),
 			);
 		for (at, &member) in cycle.iter().enumerate() {
 			let next = cycle[(at + 1) % cycle.len()];
-			let member_def = &self.defs.constants[usize::from(member)];
+			let member_def = &self.defs.constants[usize::from(member.constant)];
 			diagnostic = diagnostic.with_label(
 				SourceSpan::new(member_def.file_id, member_def.name.span)
 					.secondary_label()
 					.with_message(format!(
 						"`{}` requires evaluating `{}`",
-						self.const_name(member),
-						self.const_name(next)
+						self.instance_name(member),
+						self.instance_name(next)
 					)),
 			);
 		}
@@ -378,54 +459,58 @@ impl TypeContext<'_, '_, '_> {
 }
 
 impl Solver {
+	fn const_state(&self, instance: Instance) -> &ConstValueState {
+		if instance.args.is_empty() {
+			&self.const_values[usize::from(instance.constant)]
+		} else {
+			self.instance_values
+				.get(&instance)
+				.unwrap_or(&ConstValueState::Checked)
+		}
+	}
+
+	fn const_state_mut(&mut self, instance: Instance) -> &mut ConstValueState {
+		if instance.args.is_empty() {
+			&mut self.const_values[usize::from(instance.constant)]
+		} else {
+			self.instance_values
+				.entry(instance)
+				.or_insert(ConstValueState::Checked)
+		}
+	}
+
 	/// Records the final state of a constant, unless a loop through it
 	/// already poisoned it while it was checked or evaluated.
-	fn set_const_state(
-		&mut self,
-		const_index: ConstIdx,
-		state: ConstValueState,
-	) {
-		let slot = &mut self.const_values[usize::from(const_index)];
+	fn set_const_state(&mut self, instance: Instance, state: ConstValueState) {
+		let slot = self.const_state_mut(instance);
 		if !matches!(slot, ConstValueState::Poisoned) {
 			*slot = state;
 		}
 	}
 
-	/// Records the final state of a constant and answers its reader with it.
-	fn settle_constant(
-		&mut self,
-		const_index: ConstIdx,
-		state: ConstValueState,
-	) -> Result<&[ConstScalar], Unevaluable> {
-		self.set_const_state(const_index, state);
-		self.const_values[usize::from(const_index)]
-			.answer()
-			.expect("a settled state is final")
-	}
-
-	/// `const_index` was asked for again while it is evaluated: the loop is
+	/// `instance` was asked for again while it is evaluated: the loop is
 	/// the constants evaluated on the stack from its own evaluation, read
 	/// from its first-defined member: each requires the next, and the last
 	/// requires the first.
-	fn const_cycle(&mut self, const_index: ConstIdx) -> Box<[ConstIdx]> {
+	fn const_cycle(&mut self, instance: Instance) -> Box<[Instance]> {
 		let start = self
 			.state
 			.frames
 			.iter()
 			.position(|frame| {
-				matches!(frame, SolverFrame::Evaluation { constant, .. } if *constant == const_index)
+				matches!(frame, SolverFrame::Evaluation { instance: on, .. } if *on == instance)
 			})
 			.expect("an in-progress constant is on the stack");
 		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
-		let mut members: Vec<ConstIdx> = self.state.frames[start..]
+		let mut members: Vec<Instance> = self.state.frames[start..]
 			.iter()
 			.filter_map(|frame| match *frame {
-				SolverFrame::Evaluation { constant, .. } => Some(constant),
+				SolverFrame::Evaluation { instance, .. } => Some(instance),
 				_ => None,
 			})
 			.collect();
 		let owner = (0..members.len())
-			.min_by_key(|&at| usize::from(members[at]))
+			.min_by_key(|&at| usize::from(members[at].constant))
 			.unwrap();
 		members.rotate_left(owner);
 		members.into_boxed_slice()
@@ -442,43 +527,64 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		const_index: ConstIdx,
 	) -> Result<&[ConstScalar], Unevaluable> {
-		if matches!(
-			self.solver.const_values[usize::from(const_index)],
-			ConstValueState::Unchecked
-		) {
+		self.instance_value(Instance::of(const_index), None)
+	}
+
+	/// The memoized value of `instance`, as `const_value`. An instance of a
+	/// constant with parameters is evaluated once its constant is checked,
+	/// with its arguments substituted, and its failure is reported by the
+	/// reader that first asks for it, `used_at`.
+	fn instance_value(
+		&mut self,
+		instance: Instance,
+		used_at: Option<SourceSpan>,
+	) -> Result<&[ConstScalar], Unevaluable> {
+		let const_index = instance.constant;
+		if self.solver.const_values[usize::from(const_index)]
+			== ConstValueState::Unchecked
+		{
 			self.check_constant(const_index);
 		}
-		match self.solver.const_values[usize::from(const_index)] {
+		if !instance.args.is_empty() {
+			match self.solver.const_values[usize::from(const_index)] {
+				ConstValueState::Poisoned => return Err(Unevaluable::Silent),
+				// Read while its constant is checked.
+				ConstValueState::InProgress => {
+					return Err(
+						self.close_const_loop(Instance::of(const_index))
+					);
+				}
+				_ => {}
+			}
+		}
+		match self.solver.const_state(instance) {
 			ConstValueState::Unchecked => {
 				unreachable!("a constant is checked before it is read")
 			}
 			ConstValueState::Checked => {}
 			ConstValueState::InProgress => {
-				// The loop is reported here, once, against its first-defined
-				// member. Its members are poisoned, so every later reader, and
-				// the members' own checks and evaluations, fail silently.
-				let cycle = self.solver.const_cycle(const_index);
-				let diagnostic = self.report_const_cycle(&cycle);
-				self.diagnostics.push(diagnostic);
-				for &member in &*cycle {
-					self.solver.const_values[usize::from(member)] =
-						ConstValueState::Poisoned;
-				}
-				return Err(Unevaluable::Silent);
+				return Err(self.close_const_loop(instance));
 			}
 			_ => {
-				return self.solver.const_values[usize::from(const_index)]
+				return self
+					.solver
+					.const_state(instance)
 					.answer()
 					.expect("a state past evaluation is final");
 			}
 		}
 		let root = match &self.const_bodies[usize::from(const_index)] {
 			ConstBody::Built(body) => body.root(),
-			// A required trait constant, with no initializer at all.
+			// A required trait constant, with no initializer at all. An
+			// instance reads one only for an impl missing it, which
+			// conformance reports.
 			ConstBody::Missing => {
-				return self
-					.solver
-					.settle_constant(const_index, ConstValueState::NoValue);
+				let state = if instance.args.is_empty() {
+					ConstValueState::NoValue
+				} else {
+					ConstValueState::Poisoned
+				};
+				return self.settle_constant(instance, state, used_at);
 			}
 			ConstBody::NotBuilt => {
 				unreachable!("every constant body is built before it evaluates")
@@ -486,19 +592,23 @@ impl TypeContext<'_, '_, '_> {
 		};
 		// In progress before its declared type is read: the type may name
 		// the constant itself (`const A: heap::&[u8; A]`).
-		self.solver.const_values[usize::from(const_index)] =
-			ConstValueState::InProgress;
+		*self.solver.const_state_mut(instance) = ConstValueState::InProgress;
 		self.solver.state.frames.push(SolverFrame::Evaluation {
-			constant: const_index,
+			instance,
 			outer_budget: std::mem::replace(
 				&mut self.solver.state.recursion_budget,
 				self.solver.recursion_limit,
 			),
 		});
-		let scalars = self.constant_scalars(const_index);
+		let args: Box<[TypeIndex]> = self.types.list(instance.args).into();
+		let owner = Owner {
+			constant: const_index,
+			args: &args,
+		};
+		let scalars = self.constant_scalars(owner);
 		let mut stack = Vec::new();
 		let evaluated = match &scalars {
-			Ok(_) => self.eval(const_index, root, &mut stack),
+			Ok(_) => self.eval(owner, root, &mut stack),
 			Err(_) => Ok(()),
 		};
 		let Some(SolverFrame::Evaluation { outer_budget, .. }) =
@@ -512,7 +622,7 @@ impl TypeContext<'_, '_, '_> {
 		let scalars = match scalars {
 			Ok(scalars) => scalars,
 			Err(state) => {
-				return self.solver.settle_constant(const_index, state);
+				return self.settle_constant(instance, state, used_at);
 			}
 		};
 
@@ -531,21 +641,58 @@ impl TypeContext<'_, '_, '_> {
 			Err(Halt::Own(error)) => ConstValueState::Failed(error),
 			Err(Halt::Silent) => ConstValueState::Poisoned,
 		};
-		self.solver.settle_constant(const_index, state)
+		self.settle_constant(instance, state, used_at)
+	}
+
+	/// Records the final state of `instance` and answers its reader with it.
+	/// The failure of an instance of a constant with parameters is reported
+	/// here, by its first reader: no sweep reaches it.
+	fn settle_constant(
+		&mut self,
+		instance: Instance,
+		state: ConstValueState,
+		used_at: Option<SourceSpan>,
+	) -> Result<&[ConstScalar], Unevaluable> {
+		self.solver.set_const_state(instance, state);
+		if !instance.args.is_empty()
+			&& let ConstValueState::Failed(error) =
+				self.solver.const_state(instance)
+		{
+			let diagnostic = self.report_eval_failure(instance, error, used_at);
+			self.diagnostics.push(diagnostic);
+		}
+		self.solver
+			.const_state(instance)
+			.answer()
+			.expect("a settled state is final")
+	}
+
+	/// Reports the loop `instance`, asked for again while it is checked or
+	/// evaluated, closes, once, against its first-defined member. Its members
+	/// are poisoned, so every later reader, and the members' own checks and
+	/// evaluations, fail silently.
+	fn close_const_loop(&mut self, instance: Instance) -> Unevaluable {
+		let cycle = self.solver.const_cycle(instance);
+		let diagnostic = self.report_const_cycle(&cycle);
+		self.diagnostics.push(diagnostic);
+		for &member in &*cycle {
+			*self.solver.const_state_mut(member) = ConstValueState::Poisoned;
+		}
+		Unevaluable::Silent
 	}
 
 	/// The values of a tuple's `elements`, evaluated in written order and
 	/// held in the positions `order` gives them.
 	fn eval_ordered(
 		&mut self,
-		owner: ConstIdx,
+		owner: Owner<'_>,
 		elements: ExprRange,
 		order: ElementOrder,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
 		let ElementOrder::Permuted { .. } = order else {
 			for at in 0..elements.len() {
-				let arg = body_of(self, owner).args(elements)[at];
+				let arg = body_of(self, owner.constant).args(elements)[at];
 				self.eval(owner, arg, stack)?;
 			}
 			return Ok(());
@@ -553,7 +700,7 @@ impl TypeContext<'_, '_, '_> {
 		let start = stack.len();
 		let mut declared = Vec::with_capacity(elements.len());
 		for at in 0..elements.len() {
-			let body = body_of(self, owner);
+			let body = body_of(self, owner.constant);
 			let (arg, index) =
 				(body.args(elements)[at], body.declared_index(order, at));
 			let arg_start = stack.len();
@@ -576,13 +723,14 @@ impl TypeContext<'_, '_, '_> {
 	/// held while a constant it names is evaluated.
 	fn eval(
 		&mut self,
-		owner: ConstIdx,
+		owner: Owner<'_>,
 		expr: ExprIdx,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let body = body_of(self, owner);
+		let body = body_of(self, owner.constant);
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
+		let ty = self.instance_type(owner, ty);
 		if ty == TypeIndex::ERROR {
 			return Err(Halt::Silent);
 		}
@@ -642,7 +790,8 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::Array { elements } => {
 				let start = stack.len();
 				for at in 0..elements.len() {
-					let element = body_of(self, owner).args(elements)[at];
+					let element =
+						body_of(self, owner.constant).args(elements)[at];
 					self.eval(owner, element, stack)?;
 				}
 				let count = u64::try_from(elements.len()).unwrap();
@@ -664,47 +813,37 @@ impl TypeContext<'_, '_, '_> {
 							}
 						}
 					}
-					// As long as its array, whose length may name a constant.
+					// As long as its array.
 					None => {
 						let Type::Array { length, .. } =
 							*self.types.resolve(ty)
 						else {
 							unreachable!("`_` is the length of an array")
 						};
-						match *self.types.resolve(length) {
-							Type::Value { bits } => bits,
-							Type::Const {
-								constant,
-								type_args,
-							} if self.types.list(type_args).is_empty() => {
-								let start = stack.len();
-								self.read_constant(constant, span, stack)?;
-								// One of another type was reported where the
-								// length names it.
-								let length = value_bits(&stack[start..]);
-								stack.truncate(start);
-								length.ok_or(Halt::Silent)?
-							}
-							_ => return Err(Halt::Silent),
-						}
+						self.length_value(owner, length)?
 					}
 				};
 				self.place_static(owner, ty, span, count, start, stack)?;
 			}
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
-			// An impl's constant may depend on the impl's arguments, which
-			// evaluation does not substitute (yet).
 			ExprKind::Const {
 				constant,
 				type_args,
-			} if type_args.is_empty() => {
-				self.read_constant(constant, span, stack)?;
 			}
-			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
-				return Err(own(EvalErrorKind::NotConst));
+			| ExprKind::AbstractConst {
+				constant,
+				type_args,
+			} => {
+				let args: Vec<TypeIndex> = (0..type_args.len())
+					.map(|at| {
+						let arg = self.types.list(type_args)[at];
+						self.instance_type(owner, arg)
+					})
+					.collect();
+				self.read_reference(owner, constant, &args, ty, span, stack)?;
 			}
 			ExprKind::NextDiscriminant(previous) => {
-				self.read_constant(previous, span, stack)?;
+				self.read_constant(Instance::of(previous), None, span, stack)?;
 				let previous = stack.pop().expect("a variant's value");
 				let one = literal(1, false, previous.scalar)
 					.expect("an enum's repr holds one");
@@ -715,7 +854,8 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::PrimitiveUnary {
 				op: UnaryOp::InvertSign,
 				operand,
-			} if let ExprKind::Int(value) = body.kind(operand)
+			} if let ExprKind::Int(value) =
+				body_of(self, owner.constant).kind(operand)
 				&& let Some(scalar) = Scalar::from_type(ty) =>
 			{
 				stack.push(
@@ -763,7 +903,7 @@ impl TypeContext<'_, '_, '_> {
 	/// A string literal's value: its contents, placed as static data.
 	fn eval_string(
 		&mut self,
-		owner: ConstIdx,
+		owner: Owner<'_>,
 		contents: SymbolU32,
 		ty: TypeIndex,
 		span: TextSpan,
@@ -791,7 +931,7 @@ impl TypeContext<'_, '_, '_> {
 	#[allow(clippy::too_many_arguments)]
 	fn place_static(
 		&mut self,
-		owner: ConstIdx,
+		owner: Owner<'_>,
 		ty: TypeIndex,
 		span: TextSpan,
 		count: u64,
@@ -807,7 +947,7 @@ impl TypeContext<'_, '_, '_> {
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
 		let (layout, places) =
-			match self.memory_values(body_env(self, owner), of) {
+			match self.memory_values(body_env(self, owner.constant), of) {
 				Ok(Some(layout)) => layout,
 				Ok(None) => {
 					return Err(Halt::Own(EvalError {
@@ -861,11 +1001,11 @@ impl TypeContext<'_, '_, '_> {
 	/// known yet there is nowhere to place it.
 	fn static_memory(
 		&mut self,
-		owner: ConstIdx,
+		owner: Owner<'_>,
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Scalar), Halt> {
-		let scope = body_env(self, owner);
+		let scope = body_env(self, owner.constant);
 		let (Type::Slice { memory, .. } | Type::Array { memory, .. }) =
 			*self.types.resolve(ty)
 		else {
@@ -911,16 +1051,176 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// The value of a constant a node names. One with no compile-time value
-	/// (its type is not a scalar) makes the naming node not a constant
-	/// expression.
-	fn read_constant(
+	/// An array type's `length`, read in `owner`'s body: a value, or a
+	/// constant it names, evaluated. A constant that fails reports itself.
+	fn length_value(
 		&mut self,
-		const_index: ConstIdx,
+		owner: Owner<'_>,
+		length: TypeIndex,
+	) -> Result<u64, Halt> {
+		let env = body_env(self, owner.constant);
+		match self.normalize(
+			env,
+			length,
+			NormalizationDepth::Shallow,
+			RewriteFlags::ALL,
+		) {
+			Ok(length) => match *self.types.resolve(length) {
+				Type::Value { bits } => Ok(bits),
+				_ => Err(Halt::Silent),
+			},
+			Err(_) => Err(Halt::Silent),
+		}
+	}
+
+	/// `ty`, written in `owner`'s body, with the instance's arguments.
+	fn instance_type(&mut self, owner: Owner<'_>, ty: TypeIndex) -> TypeIndex {
+		if owner.args.is_empty() {
+			return ty;
+		}
+		let env = body_env(self, owner.constant);
+		let ty = self.types.substitute(
+			ty,
+			Substitution {
+				envs: &self.type_envs,
+				env,
+				args: owner.args,
+			},
+		);
+		self.normalize(env, ty, NormalizationDepth::Deep, RewriteFlags::ALL)
+			.unwrap_or(TypeIndex::ERROR)
+	}
+
+	/// The instance of `constant` with `args`, keyed by its interned
+	/// `Type::Const`.
+	fn instance(&mut self, constant: ConstIdx, args: &[TypeIndex]) -> Instance {
+		if args.is_empty() {
+			return Instance::of(constant);
+		}
+		let interned = self.types.intern_const(constant, args);
+		let Type::Const { type_args, .. } = *self.types.resolve(interned)
+		else {
+			unreachable!("a constant interns as a `Type::Const`")
+		};
+		Instance {
+			constant,
+			args: type_args,
+		}
+	}
+
+	/// What `constant` with `args` reads: itself, or, for a trait's
+	/// declaration, the member of the impl its `Self` selects, the trait's
+	/// default when the impl inherits it, or the compiler's answer for a
+	/// trait it implements (`Array::SIZE`).
+	pub(super) fn resolve_constant(
+		&mut self,
+		constant: ConstIdx,
+		args: &[TypeIndex],
+	) -> Result<ResolvedConstant, SolverError> {
+		let MemberOwner::Trait(trait_index) =
+			self.defs.constants[usize::from(constant)].owner
+		else {
+			return Ok(ResolvedConstant::Instance(
+				self.instance(constant, args),
+			));
+		};
+		let receiver = args[0];
+		if self.types.has_param(receiver) {
+			return Ok(ResolvedConstant::Abstract);
+		}
+		Ok(
+			match self.find_trait_impl_query(
+				TypeEnvIdx::ROOT,
+				receiver,
+				trait_index,
+			)? {
+				Some(TraitImplLookup::Concrete {
+					impl_index,
+					args: impl_args,
+				}) => {
+					match self.defs.select_trait_member(
+						impl_index,
+						MemberKind::Constant(constant),
+					) {
+						TraitMemberSelection::Impl(MemberKind::Constant(
+							own,
+						)) => ResolvedConstant::Instance(
+							self.instance(own, &impl_args),
+						),
+						_ => ResolvedConstant::Instance(
+							self.instance(constant, args),
+						),
+					}
+				}
+				Some(TraitImplLookup::Builtin) => {
+					let Type::Array { length, .. } =
+						*self.types.resolve(receiver)
+					else {
+						unreachable!(
+							"the compiler implements only `Array::SIZE`"
+						)
+					};
+					debug_assert_eq!(
+						Some(constant),
+						self.defs.intrinsics.array_size
+					);
+					ResolvedConstant::Length(length)
+				}
+				Some(TraitImplLookup::Abstract) => ResolvedConstant::Abstract,
+				// The unmet bound was reported where the constant is named.
+				None => return Err(SolverError::Poisoned),
+			},
+		)
+	}
+
+	/// The value of the constant a node of `owner`'s body names with `args`,
+	/// of type `ty`.
+	#[allow(clippy::too_many_arguments)]
+	fn read_reference(
+		&mut self,
+		owner: Owner<'_>,
+		constant: ConstIdx,
+		args: &[TypeIndex],
+		ty: TypeIndex,
 		span: TextSpan,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		match self.const_value(const_index) {
+		match self.resolve_constant(constant, args) {
+			Ok(ResolvedConstant::Instance(instance)) => {
+				let file_id =
+					self.defs.constants[usize::from(owner.constant)].file_id;
+				let used_at = SourceSpan::new(file_id, span);
+				self.read_constant(instance, Some(used_at), span, stack)
+			}
+			Ok(ResolvedConstant::Length(length)) => {
+				let length = self.length_value(owner, length)?;
+				let scalar = Scalar::from_type(ty)
+					.expect("an array's length is of a memory's `Size`");
+				stack.push(
+					literal(length, false, scalar)
+						.expect("an array's length fits its memory's `Size`"),
+				);
+				Ok(())
+			}
+			Ok(ResolvedConstant::Abstract) => Err(Halt::Own(EvalError {
+				span,
+				kind: EvalErrorKind::NotConst,
+			})),
+			Err(_) => Err(Halt::Silent),
+		}
+	}
+
+	/// The value of `instance`, which a node names at `used_at` (for an
+	/// instance's first reader). One with no compile-time value (its type is
+	/// not a scalar) makes the naming node not a constant expression.
+	fn read_constant(
+		&mut self,
+		instance: Instance,
+		used_at: Option<SourceSpan>,
+		span: TextSpan,
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		match self.instance_value(instance, used_at) {
 			Ok(value) => {
 				stack.extend_from_slice(value);
 				Ok(())
@@ -938,10 +1238,11 @@ impl TypeContext<'_, '_, '_> {
 	/// holds no values of.
 	fn constant_scalars(
 		&mut self,
-		const_index: ConstIdx,
+		owner: Owner<'_>,
 	) -> Result<Vec<Scalar>, ConstValueState> {
-		let signature = &self.constants[usize::from(const_index)];
+		let signature = &self.constants[usize::from(owner.constant)];
 		let (ty, scope) = (signature.ty, signature.env);
+		let ty = self.instance_type(owner, ty);
 		let mut scalars = Vec::new();
 		self.push_scalars(scope, ty, &mut scalars, &mut Vec::new())?;
 		Ok(scalars)
@@ -1918,6 +2219,110 @@ mod tests {
 			};
 			(&self.context.solver.allocations[usize::from(alloc)], offset)
 		}
+	}
+
+	#[test]
+	fn a_trait_constant_is_its_impls_or_the_default_it_inherits() {
+		test_case!(
+			case = indoc! {r#"
+				trait Tr { const X: u32 = Self::Y + 1; const Y: u32; }
+				struct P();
+				struct Q();
+				impl Tr for P { const Y: u32 = 7; }
+				impl Tr for Q { const X: u32 = 2; const Y: u32 = 3; }
+				struct W<T>(T);
+				impl<T: Tr> Tr for W<T> { const Y: u32 = T::X * 10; }
+				const INHERITED: u32 = P::X;
+				const OVERRIDDEN: u32 = <Q as Tr>::X;
+				const OF_GENERIC_IMPL: u32 = <W<P> as Tr>::Y;
+				const INHERITED_BY_GENERIC_IMPL: u32 = W::<Q>::X;
+			"#}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.value("INHERITED"), [ConstScalar::u32(8)]);
+		assert_eq!(case.value("OVERRIDDEN"), [ConstScalar::u32(2)]);
+		assert_eq!(case.value("OF_GENERIC_IMPL"), [ConstScalar::u32(80)]);
+		assert_eq!(
+			case.value("INHERITED_BY_GENERIC_IMPL"),
+			[ConstScalar::u32(21)]
+		);
+	}
+
+	#[test]
+	fn a_loop_through_a_default_is_reported_once_for_its_instance() {
+		test_case!(
+			case = indoc! {r#"
+				trait Loop { const A: u32 = Self::A + 1; }
+				struct P();
+				impl Loop for P {}
+				const FIRST: u32 = P::A;
+				const SECOND: u32 = P::A;
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
+		case.diagnostics().assert_error_saying(
+			"cycle detected when evaluating constant `<P as Loop>::A`",
+		);
+	}
+
+	#[test]
+	fn an_instance_failure_is_reported_once_by_its_first_reader() {
+		test_case!(
+			case = indoc! {r#"
+				trait Fail { const F: u8 = Self::G + 200; const G: u8; }
+				struct P();
+				struct Q();
+				impl Fail for P { const G: u8 = 100; }
+				impl Fail for Q { const G: u8 = 1; }
+				const FIRST: u8 = P::F;
+				const SECOND: u8 = P::F;
+				const FITS: u8 = Q::F;
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ConstEvaluationFailed]);
+		case.diagnostics().assert_error_saying(
+			"evaluation of constant `<P as Fail>::F` failed",
+		);
+		// The first reader is the one the report points at.
+		let labels = &case.context.diagnostics[0].labels;
+		assert!(labels.iter().any(|label| {
+			label.message == "`<P as Fail>::F` is evaluated for this use"
+		}));
+		assert_eq!(case.value("FITS"), [ConstScalar::u8(201)]);
+	}
+
+	#[test]
+	fn an_array_types_size_is_its_length() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				memory wide: u64;
+				const N: u32 = 3;
+				type A = heap::&[u8; 4];
+				const QUALIFIED: u32 = <heap::&[u8; 4] as Array>::SIZE;
+				const ALIASED: u32 = A::SIZE;
+				const NAMED: u32 = <heap::*[u16; N] as Array>::SIZE + 1;
+				const WIDE: u64 = <wide::&[u8; 9] as Array>::SIZE;
+				const FILLED: heap::&[u8; A::SIZE] = [7; _];
+			"#}
+		);
+		case.diagnostics().assert_none();
+		let [address] = case.value("FILLED") else {
+			panic!("expected an address");
+		};
+		let Val::MemoryOffset { alloc, .. } = address.val else {
+			panic!("expected an address");
+		};
+		assert_eq!(
+			*case.context.solver.allocations[usize::from(alloc)].bytes,
+			[7; 4]
+		);
+		assert_eq!(case.value("QUALIFIED"), [ConstScalar::u32(4)]);
+		assert_eq!(case.value("ALIASED"), [ConstScalar::u32(4)]);
+		assert_eq!(case.value("NAMED"), [ConstScalar::u32(4)]);
+		assert_eq!(case.value("WIDE"), [ConstScalar::u64(9)]);
 	}
 
 	#[test]

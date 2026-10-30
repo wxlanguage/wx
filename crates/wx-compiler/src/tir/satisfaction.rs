@@ -172,7 +172,7 @@ impl TypeContext<'_, '_, '_> {
 						return Err(SolverError::Pending);
 					};
 					let env = self.traits[usize::from(trait_index)].env;
-					let root = self.types.intern(Type::AssocTypeProjection {
+					let root = self.types.intern(Type::TypeProjection {
 						base: self.type_envs.param_types(env)[0],
 						trait_index,
 						assoc_type_index: declaration,
@@ -265,6 +265,7 @@ impl TypeContext<'_, '_, '_> {
 						reference.file_id,
 						self.strings,
 						ident,
+						"associated type",
 					));
 				}
 				return Err(SolverError::Poisoned);
@@ -277,9 +278,7 @@ impl TypeContext<'_, '_, '_> {
 		let mut traits: Vec<TraitIdx> = Vec::new();
 		match ImplTarget::from_type(self.types.resolve(normalized)) {
 			Some(target) => {
-				for &(trait_index, _) in
-					self.impl_dispatch.trait_candidates(target)
-				{
+				for trait_index in self.trait_candidates(target) {
 					if self
 						.defs
 						.declared_trait_member(trait_index, key)
@@ -292,7 +291,7 @@ impl TypeContext<'_, '_, '_> {
 			// Every signature exists, so the bounds are ready to read.
 			None if matches!(
 				self.types.resolve(normalized),
-				Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+				Type::TypeParam { .. } | Type::TypeProjection { .. }
 			) =>
 			{
 				let declared = self.clause_tables().declared_traits(
@@ -305,16 +304,12 @@ impl TypeContext<'_, '_, '_> {
 				) {
 					MemberLookup::Found(member) => {
 						traits.extend(
-							member
-								.assoc_type_declaration()
-								.map(|d| d.trait_index),
+							member.type_declaration().map(|d| d.trait_index),
 						);
 					}
 					MemberLookup::Ambiguous(members) => {
 						traits.extend(members.iter().filter_map(|member| {
-							member
-								.assoc_type_declaration()
-								.map(|d| d.trait_index)
+							member.type_declaration().map(|d| d.trait_index)
 						}));
 					}
 					_ => {}
@@ -327,6 +322,7 @@ impl TypeContext<'_, '_, '_> {
 				reference.file_id,
 				self.strings,
 				ident,
+				"associated type",
 			));
 			return Err(SolverError::Poisoned);
 		}

@@ -58,6 +58,52 @@ impl<'s> MemberPath<'s> {
 	}
 }
 
+/// A path written from a bracketed root, as an expression or a constant
+/// argument writes one.
+#[derive(Clone, Copy)]
+pub(super) enum RootedPath<'s> {
+	/// `<T as Trait>::member`.
+	Qualified {
+		root: &'s ast::QualifiedPathRoot,
+		segments: &'s [ast::PathSegment],
+	},
+	/// `<T>::member`.
+	Grouped {
+		inner: &'s Spanned<ast::TypeExpression>,
+		segments: &'s [ast::PathSegment],
+	},
+}
+
+impl<'s> RootedPath<'s> {
+	/// `expr`'s, when it is one.
+	pub(super) fn of_expression(expr: &'s ast::Expression) -> Option<Self> {
+		Some(match expr {
+			ast::Expression::QualifiedPath { root, segments } => {
+				Self::Qualified { root, segments }
+			}
+			ast::Expression::Grouped { inner, segments } => {
+				Self::Grouped { inner, segments }
+			}
+			_ => return None,
+		})
+	}
+
+	/// `argument`'s, when it is one.
+	pub(super) fn of_constant(
+		argument: &'s ast::ConstArgument,
+	) -> Option<Self> {
+		Some(match argument {
+			ast::ConstArgument::QualifiedPath { root, segments } => {
+				Self::Qualified { root, segments }
+			}
+			ast::ConstArgument::Grouped { inner, segments } => {
+				Self::Grouped { inner, segments }
+			}
+			_ => return None,
+		})
+	}
+}
+
 /// What a member path selects.
 enum Member {
 	/// A function without `self`.
@@ -73,14 +119,16 @@ enum Member {
 }
 
 impl BodyContext<'_, '_, '_, '_> {
-	/// `<T as Trait>::member` or `<T>::member`: a member of the bracketed
-	/// type. Only one segment may follow a trait-qualified root.
+	/// `<T as Trait>::member` or `<T>::member`, written at `span`: a member
+	/// of the bracketed type. Only one segment may follow a trait-qualified
+	/// root.
 	pub(super) fn resolve_rooted_path<'s>(
 		&mut self,
-		expr: &'s Spanned<ast::Expression>,
+		path: RootedPath<'s>,
+		span: TextSpan,
 	) -> Result<MemberPath<'s>, ExprIdx> {
-		let path = match &expr.inner {
-			ast::Expression::Grouped { inner, segments } => {
+		let path = match path {
+			RootedPath::Grouped { inner, segments } => {
 				let (member, prefix) = segments.split_last().unwrap();
 				let root = self.cx.resolve_type(
 					&mut self.obligations.types,
@@ -97,10 +145,10 @@ impl BodyContext<'_, '_, '_, '_> {
 				);
 				MemberPath::new(receiver, member)
 			}
-			ast::Expression::QualifiedPath { root, segments } => {
-				let [member] = &**segments else {
+			RootedPath::Qualified { root, segments } => {
+				let [member] = segments else {
 					return Err(self.unsupported(
-						expr.span,
+						span,
 						"a path past a trait-qualified member",
 					));
 				};
@@ -119,7 +167,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					return Err(self.body.push(
 						ExprKind::Error,
 						TypeIndex::ERROR,
-						expr.span,
+						span,
 					));
 				};
 				return Ok(MemberPath {
@@ -128,7 +176,6 @@ impl BodyContext<'_, '_, '_, '_> {
 					qualified: Some(qualified),
 				});
 			}
-			_ => unreachable!("only a bracketed root starts a rooted path"),
 		};
 		Ok(path)
 	}

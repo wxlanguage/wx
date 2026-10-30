@@ -26,7 +26,7 @@ after that.
 - `Type::Array { of, length: TypeIndex, memory, ownership }`: the length is a
   `Value`, a `Const`, or `INFER` (a written `_`, filled by a literal).
 - `Type::Const { constant, type_args }`: a constant named in a type. It is the
-  constant counterpart of `AssocTypeProjection` (it carries `HAS_PROJECTION`):
+  constant counterpart of `TypeProjection` (it carries `HAS_PROJECTION`):
   normalization replaces it with its `Value`. `type_args` follows
   `Type::Function`'s layout (an impl's arguments, then its own; `[Self]` for a
   trait's declaration), so one variant covers free, impl, trait and generic
@@ -34,7 +34,7 @@ after that.
 
 | Kind of type | Concrete | Generic | Deferred |
 | --- | --- | --- | --- |
-| type | `u32`, `Struct { .. }` | `TypeParam` | `AssocTypeProjection` |
+| type | `u32`, `Struct { .. }` | `TypeParam` | `TypeProjection` |
 | constant | `Value` | `TypeParam` (const parameter, planned) | `Const` |
 
 Alternatives rejected for the deferred form:
@@ -211,9 +211,12 @@ match yet; the plan is an ambiguous obligation decided with the recorded checks.
    `coerce_static`, `expect`/`meet`, `check_now` in local annotations), to fix
    the scope of value-free building.
 2. Implement the phases on top of the solver-side evaluation; drop the walk.
-3. Substituted evaluation: lower `T::SIZE` / `Foo::SIZE`, normalize a trait's
-   `Const` through impl selection, evaluate an instance with its arguments
-   substituted, memoized per instance.
+3. ~~Substituted evaluation~~ (done 2026-10-30): `T::SIZE` / `Foo::SIZE` /
+   `<T as Tr>::SIZE` lower to `Type::Const` (a trait's declaration over
+   `[Self]`); `resolve_constant` selects the impl's member, the inherited
+   default, or the compiler's answer (`Array::SIZE`); an instance
+   (`eval::Instance`) is evaluated with its arguments substituted, memoized in
+   `Solver::instance_values`, and its failure is reported by its first reader.
 4. Generic constants, then const parameters (`TypeParam` with a declared type in
    its frame) and constant arguments.
 

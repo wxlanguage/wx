@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 use crate::ast::{Ownership, StringInterner};
 
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
-use super::defs::{DefinitionRegistry, MemberOwner};
+use super::defs::{ConstIdx, DefinitionRegistry, MemberOwner};
 use super::signatures::TypeContext;
 use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
 
@@ -226,11 +226,9 @@ impl TypeFormatter<'_> {
 				constant,
 				type_args,
 			} => {
-				let def = &self.defs.constants[usize::from(*constant)];
-				f.push_str(self.strings.resolve(def.name.inner).unwrap());
-				self.write_type_args(f, self.types.list(*type_args));
+				self.write_constant(f, *constant, self.types.list(*type_args));
 			}
-			Type::FunctionRef { param, result } => {
+			Type::TypedFuncref { param, result } => {
 				let (param, result) = (*param, *result);
 				f.push_str("func(");
 				// A parameter list is written back as one; a one-element
@@ -295,7 +293,7 @@ impl TypeFormatter<'_> {
 			// (walking every bound trait `base` carries, same as the legacy
 			// `assoc_type_bound_is_ambiguous`) has no second caller yet, so
 			// it isn't built. Always-qualified is longer but never wrong.
-			Type::AssocTypeProjection {
+			Type::TypeProjection {
 				trait_index,
 				assoc_type_index,
 				base,
@@ -312,6 +310,44 @@ impl TypeFormatter<'_> {
 				.name
 				.inner;
 				f.push_str(self.strings.resolve(assoc_symbol).unwrap());
+			}
+		}
+	}
+
+	/// `constant` with `args`: a trait's declaration over its `Self` as a
+	/// projection is (`<T as Array>::SIZE`), any other with its arguments.
+	pub(super) fn display_constant(
+		&self,
+		constant: ConstIdx,
+		args: &[TypeIndex],
+	) -> String {
+		let mut buffer = String::new();
+		self.write_constant(&mut buffer, constant, args);
+		buffer
+	}
+
+	fn write_constant(
+		&self,
+		f: &mut String,
+		constant: ConstIdx,
+		args: &[TypeIndex],
+	) {
+		let def = &self.defs.constants[usize::from(constant)];
+		let name = self.strings.resolve(def.name.inner).unwrap();
+		match def.owner {
+			MemberOwner::Trait(trait_index) => {
+				f.push('<');
+				self.write_type(f, args[0]);
+				f.push_str(" as ");
+				let symbol =
+					self.defs.traits[usize::from(trait_index)].name.inner;
+				f.push_str(self.strings.resolve(symbol).unwrap());
+				f.push_str(">::");
+				f.push_str(name);
+			}
+			_ => {
+				f.push_str(name);
+				self.write_type_args(f, args);
 			}
 		}
 	}
@@ -546,7 +582,7 @@ mod tests {
 		let tuple =
 			case.types.intern_tuple(&[TypeIndex::I32, TypeIndex::ERROR]);
 		let param = case.types.intern_tuple(&[tuple, TypeIndex::INFER]);
-		let function = case.types.intern(Type::FunctionRef {
+		let function = case.types.intern(Type::TypedFuncref {
 			param,
 			result: TypeIndex::NEVER,
 		});
@@ -595,7 +631,7 @@ mod tests {
 			panic!("expected Iterable to be a trait");
 		};
 		let assoc_type_index = case.assoc_type_index(trait_index, "Item");
-		let projection = case.types.intern(Type::AssocTypeProjection {
+		let projection = case.types.intern(Type::TypeProjection {
 			trait_index,
 			assoc_type_index,
 			base: param,

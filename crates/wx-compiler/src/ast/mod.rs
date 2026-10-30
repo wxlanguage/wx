@@ -1356,6 +1356,12 @@ pub struct QualifiedPathRoot {
 	pub span: TextSpan,
 }
 
+/// A parsed `<Type as Trait>::` or `<Type>::`, before what follows it.
+enum BracketedRoot {
+	Qualified(QualifiedPathRoot),
+	Grouped(Box<Spanned<TypeExpression>>),
+}
+
 /// A trait or typeset bound expression.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1444,6 +1450,16 @@ impl TypeArgument {
 pub enum ConstArgument {
 	Literal(Literal),
 	Path(Box<[PathSegment]>),
+	/// `<Type as Trait>::NAME`.
+	QualifiedPath {
+		root: QualifiedPathRoot,
+		segments: Box<[PathSegment]>,
+	},
+	/// `<Type>::NAME`, for a type no path names (`<heap::&[u8; 4]>::SIZE`).
+	Grouped {
+		inner: Box<Spanned<TypeExpression>>,
+		segments: Box<[PathSegment]>,
+	},
 	Infer,
 }
 
@@ -3155,12 +3171,37 @@ impl<'ctx> Parser<'ctx> {
 		Ok(TypeArgument::Type(self.parse_type_expression()?))
 	}
 
-	/// A constant: a literal, `_`, or a path naming one.
+	/// A constant: a literal, `_`, or a path naming one, written with a
+	/// bracketed root (`<T as Array>::SIZE`, `<heap::&[u8; 4]>::SIZE`) or
+	/// without.
 	fn parse_const_argument(&mut self) -> Result<Spanned<ConstArgument>, ()> {
 		if let Some(Keyword::Underscore) = self.peek_keyword() {
 			return Ok(Spanned {
 				inner: ConstArgument::Infer,
 				span: self.lexer.next().span,
+			});
+		}
+		if let Token::LeftArrow | Token::DoubleLeftArrow =
+			self.lexer.peek().inner
+		{
+			let open_span = match self.lexer.peek().inner {
+				Token::LeftArrow => self.lexer.next().span,
+				_ => self.lexer.split_double_left_arrow(),
+			};
+			let root = self.parse_bracketed_root(open_span)?;
+			let segments = self.parse_value_path()?;
+			let span = TextSpan::new(open_span.start, segments.span().end);
+			let segments = segments.segments;
+			return Ok(Spanned {
+				inner: match root {
+					BracketedRoot::Qualified(root) => {
+						ConstArgument::QualifiedPath { root, segments }
+					}
+					BracketedRoot::Grouped(inner) => {
+						ConstArgument::Grouped { inner, segments }
+					}
+				},
+				span,
 			});
 		}
 		if self.at_literal() {
@@ -3537,44 +3578,51 @@ impl<'ctx> Parser<'ctx> {
 
 	/// Parse `<Type as Trait>::Item` (a trait-qualified path) or `<Type>::Item`
 	/// (a bare bracketed self-type, no trait) — the opening `<` (whose span is
-	/// `open_span`) has already been consumed. Which one this becomes hinges
-	/// entirely on whether `as` follows `self_type`.
+	/// `open_span`) has already been consumed.
 	fn parse_qualified_path_type_expression(
 		&mut self,
 		open_span: TextSpan,
 	) -> Result<Spanned<TypeExpression>, ()> {
-		let self_type = self.parse_type_expression()?;
-		if matches!(self.peek_keyword(), Some(Keyword::As)) {
+		let root = self.parse_bracketed_root(open_span)?;
+		let segments = self.parse_type_path()?;
+		let span = TextSpan::new(open_span.start, segments.span().end);
+		let segments = segments.segments;
+		Ok(Spanned {
+			inner: match root {
+				BracketedRoot::Qualified(root) => {
+					TypeExpression::QualifiedPath { root, segments }
+				}
+				BracketedRoot::Grouped(inner) => {
+					TypeExpression::Grouped { inner, segments }
+				}
+			},
+			span,
+		})
+	}
+
+	/// `<Type as Trait>::` or `<Type>::`, after its opening `<`
+	/// (`open_span`), up to and including the `::`. Which one it is hinges
+	/// entirely on whether `as` follows the type.
+	fn parse_bracketed_root(
+		&mut self,
+		open_span: TextSpan,
+	) -> Result<BracketedRoot, ()> {
+		let self_type = Box::new(self.parse_type_expression()?);
+		let root = if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
 			let trait_path = self.parse_type_path()?;
 			let close_span = self.expect_close_angle(open_span);
-			self.next_expect(Token::ColonColon)?;
-			let segments = self.parse_type_path()?;
-			let span = TextSpan::new(open_span.start, segments.span().end);
-			Ok(Spanned {
-				inner: TypeExpression::QualifiedPath {
-					root: QualifiedPathRoot {
-						self_type: Box::new(self_type),
-						trait_path: trait_path.segments,
-						span: TextSpan::new(open_span.start, close_span.end),
-					},
-					segments: segments.segments,
-				},
-				span,
+			BracketedRoot::Qualified(QualifiedPathRoot {
+				self_type,
+				trait_path: trait_path.segments,
+				span: TextSpan::new(open_span.start, close_span.end),
 			})
 		} else {
 			self.expect_close_angle(open_span);
-			self.next_expect(Token::ColonColon)?;
-			let segments = self.parse_type_path()?;
-			let span = TextSpan::new(open_span.start, segments.span().end);
-			Ok(Spanned {
-				inner: TypeExpression::Grouped {
-					inner: Box::new(self_type),
-					segments: segments.segments,
-				},
-				span,
-			})
-		}
+			BracketedRoot::Grouped(self_type)
+		};
+		self.next_expect(Token::ColonColon)?;
+		Ok(root)
 	}
 
 	/// Parses a leading `*`/`&` sigil (not yet consumed — the caller only
@@ -3957,38 +4005,21 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
 		let open_span = parser.lexer.next().span; // consume `<`
-		let self_type = parser.parse_type_expression()?;
-		if matches!(parser.peek_keyword(), Some(Keyword::As)) {
-			parser.lexer.next(); // consume `as`
-			let trait_path = parser.parse_type_path()?;
-			let close_span = parser.expect_close_angle(open_span);
-			parser.next_expect(Token::ColonColon)?;
-			let segments = parser.parse_value_path()?;
-			let span = TextSpan::new(open_span.start, segments.span().end);
-			Ok(Spanned {
-				inner: Expression::QualifiedPath {
-					root: QualifiedPathRoot {
-						self_type: Box::new(self_type),
-						trait_path: trait_path.segments,
-						span: TextSpan::new(open_span.start, close_span.end),
-					},
-					segments: segments.segments,
-				},
-				span,
-			})
-		} else {
-			parser.expect_close_angle(open_span);
-			parser.next_expect(Token::ColonColon)?;
-			let segments = parser.parse_value_path()?;
-			let span = TextSpan::new(open_span.start, segments.span().end);
-			Ok(Spanned {
-				inner: Expression::Grouped {
-					inner: Box::new(self_type),
-					segments: segments.segments,
-				},
-				span,
-			})
-		}
+		let root = parser.parse_bracketed_root(open_span)?;
+		let segments = parser.parse_value_path()?;
+		let span = TextSpan::new(open_span.start, segments.span().end);
+		let segments = segments.segments;
+		Ok(Spanned {
+			inner: match root {
+				BracketedRoot::Qualified(root) => {
+					Expression::QualifiedPath { root, segments }
+				}
+				BracketedRoot::Grouped(inner) => {
+					Expression::Grouped { inner, segments }
+				}
+			},
+			span,
+		})
 	}
 
 	fn parse_path_expression(

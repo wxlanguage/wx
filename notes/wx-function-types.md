@@ -1,7 +1,7 @@
 # Function types, the `Function` trait and the one-parameter rule — design note
 
 **Status: partly implemented.** The one-parameter rule (§2) is in:
-`Type::FunctionRef` is the `func(A) -> R` type, and a declared function is
+`Type::TypedFuncref` is the `func(A) -> R` type, and a declared function is
 its own zero-sized type `Type::Function`, named like a struct (`foo<i32>`,
 always fully applied). There is no `Function` trait yet, and calls are not
 checked in bodies. Written 2026-10-16
@@ -31,7 +31,7 @@ tables), `wx-named-invocation-and-struct-constructors.md` (call syntax).
 ## 2. Every function takes one parameter
 
 ```
-Type::FunctionRef { param: TypeIndex, result: TypeIndex }
+Type::TypedFuncref { param: TypeIndex, result: TypeIndex }
 ```
 
 A function type has exactly **one** parameter type. A written parameter list

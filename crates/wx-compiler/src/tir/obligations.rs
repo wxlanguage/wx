@@ -26,7 +26,9 @@ use super::solver::{
 	Definition, ImplMember, NormalizationDepth, ProjectionCycle, RewriteFlags,
 	Solver, SolverError, Verdict,
 };
-use super::types::{ImplKind, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList};
+use super::types::{
+	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+};
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
@@ -113,7 +115,8 @@ pub(super) enum TypeObligation {
 	/// constant's body therefore records it for after the values exist.
 	CheckConstantType {
 		assumption_context: TypeEnvIdx,
-		constant: ConstIdx,
+		/// The `Type::Const` the length names.
+		length: TypeIndex,
 		expected: TypeIndex,
 		reference: SourceSpan,
 	},
@@ -373,12 +376,12 @@ impl TypeContext<'_, '_, '_> {
 			},
 			TypeObligation::CheckConstantType {
 				assumption_context,
-				constant,
+				length,
 				expected,
 				reference,
 			} => match self.check_constant_type(
 				assumption_context,
-				constant,
+				length,
 				expected,
 				reference,
 			) {
@@ -511,12 +514,32 @@ impl TypeContext<'_, '_, '_> {
 	fn check_constant_type(
 		&mut self,
 		assumption_context: TypeEnvIdx,
-		constant: ConstIdx,
+		length: TypeIndex,
 		expected: TypeIndex,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
+		let Type::Const {
+			constant,
+			type_args,
+		} = *self.types.resolve(length)
+		else {
+			unreachable!("a length checked for its type names a constant")
+		};
 		let signature = &self.constants[usize::from(constant)];
-		let (ty, env) = (signature.ty, signature.env);
+		let (mut ty, mut env) = (signature.ty, signature.env);
+		// With its arguments, the declared type is read where it is named.
+		if !type_args.is_empty() {
+			let args: Box<[TypeIndex]> = self.types.list(type_args).into();
+			ty = self.types.substitute(
+				ty,
+				Substitution {
+					envs: &self.type_envs,
+					env,
+					args: &args,
+				},
+			);
+			env = assumption_context;
+		}
 		let found = self.normalize(
 			env,
 			ty,

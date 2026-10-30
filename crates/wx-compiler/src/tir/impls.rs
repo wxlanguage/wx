@@ -18,8 +18,8 @@ use super::{
 	bounds::report_not_a_trait_bound,
 	defs::{
 		AstEntry, AstNodeRef, BindingKey, DefKind, DefinitionRegistry,
-		DuplicateDefinitionDiagnostic, InherentImplIdx, MemberIdx, Scope, Tier,
-		TraitIdx, TraitImplIdx, TypeAliasIdx,
+		DuplicateDefinitionDiagnostic, InherentImplIdx, IntrinsicDefs,
+		MemberIdx, Scope, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
 	resolutions::NameResolutions,
@@ -43,6 +43,7 @@ pub(super) enum ImplTarget {
 	F32,
 	F64,
 	Funcref,
+	TypedFuncref,
 	Array,
 	Slice,
 	Struct(StructIdx),
@@ -66,6 +67,7 @@ impl ImplTarget {
 			Type::F32 => Self::F32,
 			Type::F64 => Self::F64,
 			Type::Funcref => Self::Funcref,
+			Type::TypedFuncref { .. } => Self::TypedFuncref,
 			Type::Array { .. } => Self::Array,
 			Type::Slice { .. } => Self::Slice,
 			Type::Struct { struct_index, .. } => Self::Struct(*struct_index),
@@ -82,10 +84,9 @@ impl ImplTarget {
 			| Type::StringLiteral
 			| Type::ArrayLiteral
 			| Type::Tuple { .. }
-			| Type::FunctionRef { .. }
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
-			| Type::AssocTypeProjection { .. }
+			| Type::TypeProjection { .. }
 			| Type::Value { .. }
 			| Type::Const { .. } => return None,
 		})
@@ -115,6 +116,40 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
 	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
 	trait_headers: Vec<TraitImplHead>,
+}
+
+impl IntrinsicDefs {
+	/// Whether `ty` has `trait_index` by the compiler's rule: a typed
+	/// function reference is a `Call`; every slice and array is a `Slice`, an
+	/// exclusive one a `SliceMut`, an array an `Array` and an exclusive array
+	/// an `ArrayMut`. `None` when the rule says nothing about the pair.
+	pub(super) fn implements_structurally(
+		&self,
+		ty: &Type,
+		trait_index: TraitIdx,
+	) -> Option<bool> {
+		let this = Some(trait_index);
+		let (ownership, is_array) = match *ty {
+			Type::TypedFuncref { .. } => {
+				return (this == self.call).then_some(true);
+			}
+			Type::Slice { ownership, .. } => (ownership, false),
+			Type::Array { ownership, .. } => (ownership, true),
+			_ => return None,
+		};
+		let exclusive = ownership == ast::Ownership::Exclusive;
+		if this == self.slice {
+			Some(true)
+		} else if this == self.slice_mut {
+			Some(exclusive)
+		} else if this == self.array {
+			Some(is_array)
+		} else if this == self.array_mut {
+			Some(is_array && exclusive)
+		} else {
+			None
+		}
+	}
 }
 
 impl ImplDispatch {
@@ -780,9 +815,11 @@ impl TypeContext<'_, '_, '_> {
 			ImplTarget::Enum(enum_index) => {
 				self.types.intern(Type::Enum { enum_index })
 			}
-			ImplTarget::Array | ImplTarget::Slice => {
+			ImplTarget::TypedFuncref
+			| ImplTarget::Array
+			| ImplTarget::Slice => {
 				unreachable!(
-					"array and slice types cannot be path-only impl targets"
+					"function reference, array and slice types cannot be path-only impl targets"
 				)
 			}
 			ImplTarget::Memory(_)

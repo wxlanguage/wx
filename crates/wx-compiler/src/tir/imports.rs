@@ -566,8 +566,7 @@ impl<'r> ImportResolver<'r> {
 	/// cycle can't reach here" assumption actually true, instead of merely
 	/// hoped for.
 	fn compute_glob_import(&mut self, index: UseItemIndex, path: UsePathIndex) {
-		let item = &self.use_items[usize::from(index)];
-		let namespace = item.namespace;
+		let namespace = self.use_items[usize::from(index)].namespace;
 
 		let Ok(target) = self.ensure_import_path(namespace, path, index) else {
 			return;

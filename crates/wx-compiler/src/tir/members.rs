@@ -17,7 +17,7 @@ use crate::vfs::FileId;
 
 use super::bounds::{Readiness, report_not_an_associated_type};
 use super::defs::{
-	AssocTypeIdx, AstNodeRef, BindingKey, DefId, DefinitionRegistry,
+	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, DefId, DefinitionRegistry,
 	InherentImplIdx, MemberKind, Tier, TraitIdx, TraitImplIdx,
 };
 use super::format::TypeFormatter;
@@ -66,18 +66,18 @@ impl From<SolverError> for MemberLookup {
 /// A resolved trait-associated type, ready to form a projection on a base.
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub(super) struct AssocTypeProjectionTarget {
+pub(super) struct TypeProjectionTarget {
 	pub(super) trait_index: TraitIdx,
 	pub(super) assoc_type_index: AssocTypeIdx,
 }
 
-impl AssocTypeProjectionTarget {
+impl TypeProjectionTarget {
 	pub(super) fn project(
 		self,
 		types: &mut TypeInterner,
 		base: TypeIndex,
 	) -> TypeIndex {
-		types.intern(Type::AssocTypeProjection {
+		types.intern(Type::TypeProjection {
 			trait_index: self.trait_index,
 			assoc_type_index: self.assoc_type_index,
 			base,
@@ -108,9 +108,7 @@ pub(super) enum ApplicableMember {
 
 impl ApplicableMember {
 	/// Only a trait-associated type has a projection declaration.
-	pub(super) fn assoc_type_declaration(
-		self,
-	) -> Option<AssocTypeProjectionTarget> {
+	pub(super) fn type_declaration(self) -> Option<TypeProjectionTarget> {
 		match self {
 			Self::AbstractTraitMember {
 				trait_index,
@@ -120,7 +118,7 @@ impl ApplicableMember {
 				trait_index,
 				declaration: MemberKind::AssociatedType(assoc_type_index),
 				..
-			} => Some(AssocTypeProjectionTarget {
+			} => Some(TypeProjectionTarget {
 				trait_index,
 				assoc_type_index,
 			}),
@@ -234,6 +232,31 @@ pub(super) enum TraitImplLookup {
 }
 
 impl TypeContext<'_, '_, '_> {
+	/// The traits some type of `target`'s may have: those its impls
+	/// implement, and those the compiler implements for typed function
+	/// references, slices and arrays.
+	pub(super) fn trait_candidates(
+		&self,
+		target: ImplTarget,
+	) -> impl Iterator<Item = TraitIdx> + use<'_> {
+		let intrinsics = &self.defs.intrinsics;
+		let callable =
+			(target == ImplTarget::TypedFuncref).then_some(intrinsics.call);
+		let sequence = matches!(target, ImplTarget::Slice | ImplTarget::Array)
+			.then_some([
+				intrinsics.slice,
+				intrinsics.slice_mut,
+				intrinsics.array,
+				intrinsics.array_mut,
+			]);
+		self.impl_dispatch
+			.trait_candidates(target)
+			.iter()
+			.map(|&(trait_index, _)| trait_index)
+			.chain(callable.flatten())
+			.chain(sequence.into_iter().flatten().flatten())
+	}
+
 	/// Selects the trait that supplies an associated type named by `key` off
 	/// `receiver`, for a written type path. Selection reads declarations only:
 	/// a parameter's bounds, the assumptions in scope, and the traits that have
@@ -269,17 +292,20 @@ impl TypeContext<'_, '_, '_> {
 		let mut traits = Vec::new();
 		let mut readiness = Readiness::Ready;
 		if !self.types.is_abstract(receiver) {
-			// A concrete type takes its traits from impls only, never from
-			// assumptions (`Solver::find_trait_impl_query`); one no impl can
-			// target has none.
-			let candidates =
+			// A concrete type takes its traits from impls and the compiler's
+			// rules, never from assumptions (`Solver::find_trait_impl_query`);
+			// one no impl can target has none.
+			if let Some(target) =
 				ImplTarget::from_type(self.types.resolve(receiver))
-					.map_or(&[][..], |target| {
-						self.impl_dispatch.trait_candidates(target)
-					});
-			for &(trait_index, _) in candidates {
-				if self.defs.declared_trait_member(trait_index, key).is_some() {
-					traits.push(trait_index);
+			{
+				for trait_index in self.trait_candidates(target) {
+					if self
+						.defs
+						.declared_trait_member(trait_index, key)
+						.is_some()
+					{
+						traits.push(trait_index);
+					}
 				}
 			}
 		} else {
@@ -342,7 +368,7 @@ impl TypeContext<'_, '_, '_> {
 	) -> MemberLookup {
 		if matches!(
 			self.types.resolve(receiver),
-			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+			Type::TypeParam { .. } | Type::TypeProjection { .. }
 		) {
 			match self.resolve_bound_member(
 				assumption_context,
@@ -416,179 +442,277 @@ impl TypeContext<'_, '_, '_> {
 				continue;
 			}
 			let key = BindingKey::ty(segment.ident.inner);
-			match self.select_associated_type(
+			let lookup = self.select_associated_type(
 				scope.env,
 				current,
 				key,
 				SourceSpan::new(scope.file_id, segment.ident.span),
-			) {
-				MemberLookup::Pending => {
-					let receiver = self.type_formatter().display_type(current);
-					let name =
-						self.strings.resolve(segment.ident.inner).unwrap();
-					self.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::TypeMemberNeedsQualification
-									.code(),
-							)
-							.with_message(format!(
-								"selecting associated type `{name}` depends on unfinished bounds"
-							))
-							.with_label(
-								SourceSpan::new(
-									scope.file_id,
-									segment.ident.span,
-								)
-								.primary_label(),
-							)
-							.with_note(format!(
-								"qualify the declaring trait with `<{receiver} as Trait>::{name}`"
-							)),
-					);
-					return TypeIndex::ERROR;
-				}
-				MemberLookup::Error => return TypeIndex::ERROR,
-				MemberLookup::Stuck(error) => {
-					match error {
-						SolverError::Overflow => {
-							self.diagnostics.push(self.overflow_diagnostic(
-								SourceSpan::new(
-									scope.file_id,
-									segment.ident.span,
-								),
-							));
-						}
-						SolverError::Cycle(cycle) => {
-							self.diagnostics.push(self.cycle_diagnostic(
-								&cycle,
-								SourceSpan::new(
-									scope.file_id,
-									segment.ident.span,
-								),
-							));
-						}
-						_ => {}
-					}
-					return TypeIndex::ERROR;
-				}
-
-				MemberLookup::Found(member) => {
-					let ApplicableMember::AbstractTraitMember {
-						trait_index,
-						declaration,
-					} = member
-					else {
-						unreachable!(
-							"type-position selection reads trait declarations only"
-						)
-					};
-					// Selection named the trait without matching an impl; that
-					// the receiver implements it is the declaration check's question.
-					obligations.push(TypeObligation::CheckTraitMembership {
-						assumption_context: scope.env,
-						subject: current,
-						required: trait_index,
-						reference: SourceSpan::new(
-							scope.file_id,
-							segment.ident.span,
-						),
-					});
-					self.resolutions.by_site.insert(
-						(
-							SourceSpan::new(scope.file_id, segment.ident.span),
-							Tier::Type,
-						),
-						Referent::Member(declaration),
-					);
-					current = match declaration {
-						MemberKind::AssociatedType(assoc_type_index) => {
-							if !segment.type_args.is_empty() {
-								self.report_assoc_type_args(
-									obligations,
-									scope,
-									segment,
-									assoc_type_index,
-									infer_policy,
-								);
-								return TypeIndex::ERROR;
-							}
-							self.project_assoc_type(
-								current,
-								AssocTypeProjectionTarget {
-									trait_index,
-									assoc_type_index,
-								},
-							)
-						}
-						// `<current as Trait>::f`: the declaration over
-						// `current`, whatever impl `current` has.
-						MemberKind::Function(function)
-						| MemberKind::Method(function) => {
-							let own_args = self.member_function_type_args(
-								obligations,
-								scope,
-								function,
-								&[current],
-								segment,
-								infer_policy,
-							);
-							let mut type_args = vec![current];
-							type_args.extend_from_slice(&own_args);
-							self.types.intern_function(function, &type_args)
-						}
-						MemberKind::Constant(_) => {
-							unreachable!("a constant is a value member")
-						}
-					};
-				}
-				MemberLookup::NotFound => {
-					if matches!(
-						self.types.resolve(current),
-						Type::AssocTypeProjection { .. }
-					) {
-						// A projection's declared bounds are only half of what
-						// it can have: its value may be a type that does. That
-						// takes impls, so the declaration check decides what to say.
-						obligations.push(
-							TypeObligation::CheckProjectionMember {
-								assumption_context: scope.env,
-								projection: current,
-								name: segment.ident.inner,
-								reference: SourceSpan::new(
-									scope.file_id,
-									segment.ident.span,
-								),
-							},
+			);
+			let Some(member) = self.type_member_found(
+				obligations,
+				scope,
+				current,
+				segment,
+				key,
+				lookup,
+			) else {
+				return TypeIndex::ERROR;
+			};
+			let ApplicableMember::AbstractTraitMember {
+				trait_index,
+				declaration,
+			} = member
+			else {
+				unreachable!(
+					"type-position selection reads trait declarations only"
+				)
+			};
+			// Selection named the trait without matching an impl; that
+			// the receiver implements it is the declaration check's question.
+			obligations.push(TypeObligation::CheckTraitMembership {
+				assumption_context: scope.env,
+				subject: current,
+				required: trait_index,
+				reference: SourceSpan::new(scope.file_id, segment.ident.span),
+			});
+			self.resolutions.by_site.insert(
+				(
+					SourceSpan::new(scope.file_id, segment.ident.span),
+					Tier::Type,
+				),
+				Referent::Member(declaration),
+			);
+			current = match declaration {
+				MemberKind::AssociatedType(assoc_type_index) => {
+					if !segment.type_args.is_empty() {
+						self.report_assoc_type_args(
+							obligations,
+							scope,
+							segment,
+							assoc_type_index,
+							infer_policy,
 						);
-					} else {
-						self.diagnostics.push(report_no_such_type_member(
-							scope.file_id,
-							self.strings,
-							segment.ident,
-						));
+						return TypeIndex::ERROR;
 					}
-					return TypeIndex::ERROR;
+					self.project_assoc_type(
+						current,
+						TypeProjectionTarget {
+							trait_index,
+							assoc_type_index,
+						},
+					)
 				}
-				MemberLookup::Ambiguous(candidates) => {
-					self.diagnostics.push(report_ambiguous_type_member(
-						scope.file_id,
-						self.strings,
-						self.defs,
-						segment.ident,
-						&candidates,
-					));
-					return TypeIndex::ERROR;
+				// `<current as Trait>::f`: the declaration over
+				// `current`, whatever impl `current` has.
+				MemberKind::Function(function)
+				| MemberKind::Method(function) => {
+					let own_args = self.member_function_type_args(
+						obligations,
+						scope,
+						function,
+						&[current],
+						segment,
+						infer_policy,
+					);
+					let mut type_args = vec![current];
+					type_args.extend_from_slice(&own_args);
+					self.types.intern_function(function, &type_args)
 				}
-			}
+				MemberKind::Constant(_) => {
+					unreachable!("a constant is a value member")
+				}
+			};
 		}
 		current
 	}
 
-	/// The inherent function `segment` names off a concrete `receiver`: the
-	/// impl whose target matches it supplies the leading arguments, and its
-	/// bounds on them are recorded as checks. `None` leaves the name to the
-	/// trait members.
+	/// The member a type-position `lookup` of `segment` off `current` found,
+	/// or `None` once its failure is reported: an associated type for a type
+	/// tier `key`, a constant for a value one.
+	pub(super) fn type_member_found(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		current: TypeIndex,
+		segment: &ast::PathSegment,
+		key: BindingKey,
+		lookup: MemberLookup,
+	) -> Option<ApplicableMember> {
+		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
+		let noun = match key.tier {
+			Tier::Type => "associated type",
+			Tier::Value => "associated constant",
+		};
+		match lookup {
+			MemberLookup::Found(member) => return Some(member),
+			MemberLookup::Pending => {
+				let receiver = self.type_formatter().display_type(current);
+				let name = self.strings.resolve(segment.ident.inner).unwrap();
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::TypeMemberNeedsQualification.code(),
+						)
+						.with_message(format!(
+							"selecting {noun} `{name}` depends on unfinished bounds"
+						))
+						.with_label(reference.primary_label())
+						.with_note(format!(
+							"qualify the declaring trait with `<{receiver} as Trait>::{name}`"
+						)),
+				);
+			}
+			MemberLookup::Error => {}
+			MemberLookup::Stuck(SolverError::Overflow) => {
+				self.diagnostics.push(self.overflow_diagnostic(reference));
+			}
+			MemberLookup::Stuck(SolverError::Cycle(cycle)) => {
+				self.diagnostics
+					.push(self.cycle_diagnostic(&cycle, reference));
+			}
+			MemberLookup::Stuck(_) => {}
+			// A projection's declared bounds are only half of what it can
+			// have: its value may be a type that does. That takes impls, so
+			// the declaration check decides what to say.
+			MemberLookup::NotFound
+				if key.tier == Tier::Type
+					&& matches!(
+						self.types.resolve(current),
+						Type::TypeProjection { .. }
+					) =>
+			{
+				obligations.push(TypeObligation::CheckProjectionMember {
+					assumption_context: scope.env,
+					projection: current,
+					name: segment.ident.inner,
+					reference,
+				});
+			}
+			MemberLookup::NotFound => {
+				self.diagnostics.push(report_no_such_type_member(
+					scope.file_id,
+					self.strings,
+					segment.ident,
+					noun,
+				));
+			}
+			MemberLookup::Ambiguous(candidates) => {
+				self.diagnostics.push(report_ambiguous_type_member(
+					scope.file_id,
+					self.strings,
+					self.defs,
+					segment.ident,
+					&candidates,
+				));
+			}
+		}
+		None
+	}
+
+	/// The constant `segment` names off `receiver` in a type (`T::SIZE`,
+	/// `Self::SIZE`, `A::SIZE`), with its arguments: an inherent one with its
+	/// impl's, or a trait's declaration with the receiver as `Self`, as
+	/// `T::Item` is a projection, whose value is the impl's once `Self` is
+	/// known. Whether the receiver implements the trait is recorded as a
+	/// membership check. `None` once a failure is reported.
+	pub(super) fn select_type_constant(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		receiver: TypeIndex,
+		segment: &ast::PathSegment,
+	) -> Option<(ConstIdx, Vec<TypeIndex>)> {
+		if receiver == TypeIndex::ERROR {
+			return None;
+		}
+		let key = BindingKey::value(segment.ident.inner);
+		if let Some((kind, impl_args)) = self.select_inherent_member(
+			obligations,
+			scope,
+			receiver,
+			segment,
+			key,
+		) {
+			let MemberKind::Constant(constant) = kind else {
+				unreachable!("a value-tier inherent member here is a constant")
+			};
+			return Some((constant, impl_args));
+		}
+		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
+		let lookup =
+			self.select_associated_type(scope.env, receiver, key, reference);
+		let ApplicableMember::AbstractTraitMember {
+			trait_index,
+			declaration,
+		} = self.type_member_found(
+			obligations,
+			scope,
+			receiver,
+			segment,
+			key,
+			lookup,
+		)?
+		else {
+			unreachable!(
+				"type-position selection reads trait declarations only"
+			)
+		};
+		let MemberKind::Constant(constant) = declaration else {
+			self.report_length_not_constant(
+				"function",
+				segment.ident.inner,
+				reference,
+			);
+			return None;
+		};
+		obligations.push(TypeObligation::CheckTraitMembership {
+			assumption_context: scope.env,
+			subject: receiver,
+			required: trait_index,
+			reference,
+		});
+		self.resolutions
+			.by_site
+			.insert((reference, Tier::Value), Referent::Member(declaration));
+		Some((constant, vec![receiver]))
+	}
+
+	/// The constant `<receiver as required_trait>::segment` names in a type:
+	/// the trait's declaration with the receiver as `Self`, as
+	/// `select_type_constant` gives one.
+	pub(super) fn select_qualified_constant(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		receiver: TypeIndex,
+		required_trait: TraitIdx,
+		segment: &ast::PathSegment,
+	) -> Option<(ConstIdx, Vec<TypeIndex>)> {
+		let kind = self
+			.resolve_trait_qualified_type_member(
+				obligations,
+				scope.env,
+				receiver,
+				required_trait,
+				BindingKey::value(segment.ident.inner),
+				segment.ident,
+				scope.file_id,
+			)
+			.ok()?;
+		let MemberKind::Constant(constant) = kind else {
+			self.report_length_not_constant(
+				"function",
+				segment.ident.inner,
+				SourceSpan::new(scope.file_id, segment.ident.span),
+			);
+			return None;
+		};
+		Some((constant, vec![receiver]))
+	}
+
+	/// The inherent function `segment` names off a concrete `receiver`, as
+	/// its function type with the impl's arguments. `None` leaves the name to
+	/// the trait members.
 	fn select_inherent_function(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
@@ -597,7 +721,42 @@ impl TypeContext<'_, '_, '_> {
 		segment: &ast::PathSegment,
 		infer_policy: InferPolicy,
 	) -> Option<TypeIndex> {
-		let key = BindingKey::ty(segment.ident.inner);
+		let (kind, mut type_args) = self.select_inherent_member(
+			obligations,
+			scope,
+			receiver,
+			segment,
+			BindingKey::ty(segment.ident.inner),
+		)?;
+		let (MemberKind::Function(function) | MemberKind::Method(function)) =
+			kind
+		else {
+			unreachable!("a type-tier inherent member is a function")
+		};
+		let own_args = self.member_function_type_args(
+			obligations,
+			scope,
+			function,
+			&type_args,
+			segment,
+			infer_policy,
+		);
+		type_args.extend_from_slice(&own_args);
+		Some(self.types.intern_function(function, &type_args))
+	}
+
+	/// The inherent member `key` names off a concrete `receiver`, a function
+	/// for a type tier key and a constant for a value one, with the arguments
+	/// of the impl whose target matches the receiver; its bounds on them are
+	/// recorded as checks. `None` leaves the name to the trait members.
+	pub(super) fn select_inherent_member(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		receiver: TypeIndex,
+		segment: &ast::PathSegment,
+		key: BindingKey,
+	) -> Option<(MemberKind, Vec<TypeIndex>)> {
 		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
 		// Only assumed equalities may rewrite the receiver here, as for an
 		// associated type; a failure is the trait selection's to report.
@@ -617,11 +776,18 @@ impl TypeContext<'_, '_, '_> {
 				continue;
 			};
 			let kind = impl_def.members[usize::from(member_index)].kind;
-			let (MemberKind::Function(function) | MemberKind::Method(function)) =
-				kind
-			else {
-				continue;
+			let wanted = match key.tier {
+				Tier::Type => {
+					matches!(
+						kind,
+						MemberKind::Function(_) | MemberKind::Method(_)
+					)
+				}
+				Tier::Value => matches!(kind, MemberKind::Constant(_)),
 			};
+			if !wanted {
+				continue;
+			}
 			let _ = self.ensure_signature(QueryInfo {
 				def_id: DefId::InherentImpl(impl_index),
 				requested_at: Some(reference),
@@ -660,17 +826,8 @@ impl TypeContext<'_, '_, '_> {
 			}
 			self.resolutions
 				.by_site
-				.insert((reference, Tier::Type), Referent::Member(kind));
-			let own_args = self.member_function_type_args(
-				obligations,
-				scope,
-				function,
-				&type_args,
-				segment,
-				infer_policy,
-			);
-			type_args.extend_from_slice(&own_args);
-			return Some(self.types.intern_function(function, &type_args));
+				.insert((reference, key.tier), Referent::Member(kind));
+			return Some((kind, type_args));
 		}
 		None
 	}
@@ -680,7 +837,7 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn project_assoc_type(
 		&mut self,
 		base: TypeIndex,
-		member: AssocTypeProjectionTarget,
+		member: TypeProjectionTarget,
 	) -> TypeIndex {
 		member.project(&mut self.types, base)
 	}
@@ -688,12 +845,14 @@ impl TypeContext<'_, '_, '_> {
 	/// Resolve the trait declaration named by the first segment of a
 	/// qualified type path: an associated type or a function. Later segments
 	/// use ordinary type-member lookup.
+	#[allow(clippy::too_many_arguments)]
 	pub(super) fn resolve_trait_qualified_type_member(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		assumption_context: TypeEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
+		key: BindingKey,
 		name: Spanned<SymbolU32>,
 		file_id: FileId,
 	) -> Result<MemberKind, ()> {
@@ -702,12 +861,12 @@ impl TypeContext<'_, '_, '_> {
 		}
 		let kind = self.resolve_trait_member_declaration(
 			required_trait,
-			BindingKey::ty(name.inner),
+			key,
 			name,
 			file_id,
 		)?;
 		self.resolutions.by_site.insert(
-			(SourceSpan::new(file_id, name.span), Tier::Type),
+			(SourceSpan::new(file_id, name.span), key.tier),
 			Referent::Member(kind),
 		);
 		// Naming the member does not need an impl; whether `receiver`
@@ -884,10 +1043,11 @@ impl TypeContext<'_, '_, '_> {
 				Err(error) => return error.into(),
 			}
 		}
-		// Only impls give a concrete receiver a trait, so no assumption in
-		// scope can add a candidate (`Solver::find_trait_impl_query`).
+		// Only impls and the compiler's rules give a concrete receiver a
+		// trait, so no assumption in scope can add a candidate
+		// (`Solver::find_trait_impl_query`).
 		let mut traits = Vec::new();
-		for &(trait_index, _) in self.impl_dispatch.trait_candidates(target) {
+		for trait_index in self.trait_candidates(target) {
 			if self.defs.declared_trait_member(trait_index, key).is_some() {
 				traits.push(trait_index);
 			}
@@ -994,7 +1154,7 @@ impl TypeContext<'_, '_, '_> {
 	) -> MemberLookup {
 		if !matches!(
 			self.types.resolve(receiver),
-			Type::TypeParam { .. } | Type::AssocTypeProjection { .. }
+			Type::TypeParam { .. } | Type::TypeProjection { .. }
 		) {
 			return MemberLookup::NotFound;
 		}
@@ -1156,12 +1316,13 @@ pub(super) fn report_no_such_type_member(
 	file_id: FileId,
 	strings: &StringInterner,
 	name: Spanned<SymbolU32>,
+	noun: &str,
 ) -> Diagnostic<FileId> {
 	let name_str = strings.resolve(name.inner).unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::NotATraitMember.code())
 		.with_message(format!(
-			"no associated type named `{name_str}` found for this type"
+			"no {noun} named `{name_str}` found for this type"
 		))
 		.with_label(SourceSpan::new(file_id, name.span).primary_label())
 }

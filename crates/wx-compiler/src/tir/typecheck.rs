@@ -32,7 +32,7 @@ mod patterns;
 mod places;
 
 use calls::{CallTarget, Callee, GivenArgument};
-use members::MemberPath;
+use members::{MemberPath, RootedPath};
 
 use rustc_hash::FxHashMap;
 
@@ -459,7 +459,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.build_return(value.as_deref(), span)
 			}
 			ast::Expression::Deref { .. }
-			| ast::Expression::ObjectAccess { .. } => self.build_read(expr),
+			| ast::Expression::ObjectAccess { .. }
+			| ast::Expression::Index { .. } => self.build_read(expr),
 			ast::Expression::AddressOf { value } => {
 				self.build_address_of(value, span)
 			}
@@ -501,18 +502,22 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			ast::Expression::String => self.build_string(span),
 			ast::Expression::QualifiedPath { .. }
-			| ast::Expression::Grouped { .. } => match self.resolve_rooted_path(expr) {
-				Ok(path) => self.build_member_value(path, expected, span),
-				Err(error) => error,
-			},
+			| ast::Expression::Grouped { .. } => {
+				let rooted = RootedPath::of_expression(&expr.inner).unwrap();
+				match self.resolve_rooted_path(rooted, span) {
+					Ok(path) => self.build_member_value(path, expected, span),
+					Err(error) => error,
+				}
+			}
 			ast::Expression::ArrayList { elements } => {
 				self.build_array(elements, expected, span)
 			}
 			ast::Expression::ArrayRepeat { value, count } => {
 				self.build_array_repeat(value, count, expected, span)
 			}
-			ast::Expression::Index { .. }
-			| ast::Expression::SliceRange { .. } => self.unsupported(span, "indexing"),
+			ast::Expression::SliceRange { .. } => {
+				self.unsupported(span, "a slice range")
+			}
 		}
 	}
 
@@ -655,6 +660,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			ast::ConstArgument::Path(segments) => {
 				Some(self.build_path(segments, TypeIndex::INFER, count.span))
+			}
+			ast::ConstArgument::QualifiedPath { .. }
+			| ast::ConstArgument::Grouped { .. } => {
+				let rooted = RootedPath::of_constant(&count.inner).unwrap();
+				Some(match self.resolve_rooted_path(rooted, count.span) {
+					Ok(path) => self.build_member_value(
+						path,
+						TypeIndex::INFER,
+						count.span,
+					),
+					Err(error) => error,
+				})
 			}
 		};
 		let expr = self.body.push(
@@ -931,7 +948,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Path(segments) => segments,
 			ast::Expression::QualifiedPath { .. }
 			| ast::Expression::Grouped { .. } => {
-				return match self.resolve_rooted_path(callee) {
+				let rooted = RootedPath::of_expression(&callee.inner).unwrap();
+				return match self.resolve_rooted_path(rooted, callee.span) {
 					Ok(path) => self.build_member_call(
 						path,
 						callee.span,
@@ -4520,6 +4538,25 @@ mod tests {
 	}
 
 	#[test]
+	fn a_function_reference_has_call_as_a_method() {
+		test_case!(
+			case = indoc! {"
+				func one(f: func(u32) -> u8) -> u8 { f.call(1) }
+				func two(f: func(u32, u8) -> u8) -> u8 { f.call(1, 2) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("one"),
+			"(block => (abstract call<func(u32) -> u8> f#0 1))"
+		);
+		assert_eq!(
+			case.shape("two"),
+			"(block => (abstract call<func(u32, u8) -> u8> f#0 (tuple 1 2)))"
+		);
+	}
+
+	#[test]
 	fn a_function_reference_is_called_by_position_with_its_parameter() {
 		test_case!(
 			case = indoc! {"
@@ -4881,15 +4918,78 @@ mod tests {
 				trait Sized { const SIZE: u32; }
 				func f() {}
 				func function(a: heap::&[u8; f]) {}
-				func of_type<T: Sized>(a: heap::&[u8; T::SIZE]) {}
 				func missing(a: heap::&[u8; NOPE]) {}
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArrayRepeatCountNotConst,
-			DiagnosticCode::UnsupportedExpression,
 			DiagnosticCode::UndeclaredIdentifier,
 		]);
+	}
+
+	#[test]
+	fn a_length_names_a_constant_of_a_type() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				trait Sized { const SIZE: u32; }
+				struct P();
+				impl Sized for P { const SIZE: u32 = 3; }
+				impl P { const OWN: u32 = 2; }
+				type A = heap::&[u8; 4];
+				func of_param<T: Sized>(a: heap::&[u8; T::SIZE]) {
+					local b: heap::&[u8; T::SIZE] = a;
+				}
+				func of_impl(a: heap::&[u8; P::SIZE]) { local b: heap::&[u8; 3] = a; }
+				func inherent(a: heap::&[u8; P::OWN]) { local b: heap::&[u8; 2] = a; }
+				func of_array(a: heap::&[u8; A::SIZE]) { local b: heap::&[u8; 4] = a; }
+				func caller(a: heap::&[u8; 3]) { of_param::<P>(a); }
+				func in_memory<T: Array where { Mem = heap }>(a: heap::&[u8; T::SIZE]) {}
+				func call(x: heap::&[u8; 3]) { in_memory::<heap::&[u16; 3]>(x); }
+				func abstract<M: Memory, T: Array where { Mem = M }>(a: M::&[u8; T::SIZE]) {}
+				trait Takes { const K: u32; func f(self: Self, a: heap::&[u8; Self::K]); }
+				impl Takes for P { const K: u32 = 1; func f(self: Self, a: heap::&[u8; 1]) {} }
+				func qualified<T: Sized>(a: heap::&[u8; <T as Sized>::SIZE]) {}
+				func of_written(a: heap::&[u8; <heap::&[u8; 4]>::SIZE]) {
+					local b: heap::&[u8; 4] = a;
+				}
+				func counted() {
+					local a: heap::&[u8; 3] = [0; <P as Sized>::SIZE];
+				}
+				const C: heap::&[u8; <P as Sized>::SIZE] = [7; _];
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_length_through_a_type_is_checked_as_any_constant() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				trait Sized { const SIZE: u32; }
+				trait Wide { const N: u64; }
+				struct P();
+				impl Sized for P { const SIZE: u32 = 3; }
+				func of_param<T: Sized>(a: heap::&[u8; T::SIZE]) {}
+				func unbound<T>(a: heap::&[u8; T::SIZE]) {}
+				func no_such(a: heap::&[u8; P::NOPE]) {}
+				func wide<T: Wide>(a: heap::&[u8; T::N]) {}
+				func wrong(a: heap::&[u8; 2]) { of_param::<P>(a); }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotATraitMember,
+			DiagnosticCode::NotATraitMember,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"no associated constant named `SIZE` found for this type",
+		);
+		case.diagnostics().assert_error_saying(
+			"an array's length is a `u32`, but `N` is a `u64`",
+		);
 	}
 
 	#[test]
@@ -5962,8 +6062,9 @@ mod tests {
 	fn an_unsupported_form_is_reported_once_as_a_bug() {
 		test_case!(
 			case = indoc! {"
-				func f(o: Ordering) -> Ordering {
-					o[0]
+				memory heap: u32;
+				func f(s: heap::&[u8]) -> heap::&[u8] {
+					s[1..]
 				}
 			"}
 		);
@@ -6490,13 +6591,13 @@ mod tests {
 			case = indoc! {"
 				struct W(x: u32, y: u32);
 				impl W {
-					func first(self: Self) -> u32 { local Self(x, ..) = self; x }
+					func head(self: Self) -> u32 { local Self(x, ..) = self; x }
 				}
 			"}
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(
-			case.member_shape("first"),
+			case.member_shape("head"),
 			"(block (local (W x#1 _) self#0) => x#1)"
 		);
 	}
@@ -6630,5 +6731,185 @@ mod tests {
 			test_case!(case = source);
 			case.diagnostics().assert_codes(&[owner]);
 		}
+	}
+
+	#[test]
+	fn slices_and_arrays_have_the_slice_traits() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8], a: heap::*[u16; 4]) {
+					local n: u32 = s.len();
+					local p: heap::&u8 = s.index(n);
+					local q: heap::*u16 = a.index_mut(0);
+					local k: u32 = <heap::*[u16; 4]>::SIZE;
+					local t: heap::&[u16] = a.as_slice();
+					local v: <heap::&[u8] as Slice>::Value = 5;
+					local w: heap::&u8 = s.last();
+				}
+				func g<M: Memory, T>(s: M::&[T]) -> M::Size { s.len() - 1 }
+				func h<S: Slice>(s: S) -> S::Mem::&S::Value { s.first() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local n#2 (abstract len<heap::&[u8]> s#0)) \
+			 (local p#3 (abstract index<heap::&[u8]> s#0 n#2)) \
+			 (local q#4 (abstract index_mut<heap::*[u16; 4]> a#1 0)) \
+			 (local k#5 (abstract SIZE<heap::*[u16; 4]>)) \
+			 (local t#6 (abstract as_slice<heap::*[u16; 4]> a#1)) \
+			 (local v#7 5) \
+			 (local w#8 (abstract last<heap::&[u8]> s#0)))"
+		);
+	}
+
+	#[test]
+	fn only_an_exclusive_slice_is_a_slice_mut() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8], a: heap::&[u8; 2]) {
+					s.index_mut(0);
+					a.as_slice_mut();
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::MethodNotFound,
+		]);
+	}
+
+	#[test]
+	fn an_element_is_the_place_index_points_at() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8], a: heap::*[u16; 4], m: heap::&[heap::&[u8]]) {
+					local e: u8 = s[0];
+					a[1] = 5;
+					a[2] += 1;
+					local r: heap::&u8 = m[0][1].&;
+				}
+				func g<S: Slice>(s: S, i: S::Mem::Size) -> S::Value { s[i] }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local e#3 (load (* (abstract index<heap::&[u8]> s#0 0)))) \
+			 (store (* (abstract index_mut<heap::*[u16; 4]> a#1 1)) 5) \
+			 (store += (* (abstract index_mut<heap::*[u16; 4]> a#1 2)) 1) \
+			 (local r#4 (.& (* (abstract index<heap::&[u8]> \
+			 (load (* (abstract index<heap::&[heap::&[u8]]> m#2 0))) 1)))))"
+		);
+		assert_eq!(
+			case.shape("g"),
+			"(block => (load (* (abstract index<S> s#0 i#1))))"
+		);
+	}
+
+	#[test]
+	fn an_element_of_a_shared_slice_is_read_only() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8]) { s[0] = 1; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
+	}
+
+	#[test]
+	fn only_a_slice_or_an_array_is_indexed() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(ps: heap::&heap::&[u8], o: Ordering) {
+					local a: u8 = ps[0];
+					local b: u8 = o[0];
+					local c: u8 = 7[0];
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotIndex,
+			DiagnosticCode::CannotIndex,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+		case.diagnostics()
+			.assert_error_saying("index its pointee, as `x.*[i]`");
+	}
+
+	#[test]
+	fn a_field_is_reached_through_one_pointer() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct P(x: u32, next: heap::&P);
+				func f(p: heap::*P) {
+					local x: u32 = p.x;
+					p.x = 3;
+					local y: u32 = p.next.x;
+					local z: u32 = p.*.x;
+				}
+				func g(pp: heap::&heap::&P) -> u32 { pp.x }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnknownStructField]);
+		case.diagnostics().assert_error_saying("as `p.*.field`");
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local x#1 (load (. (* p#0) x))) \
+			 (store (. (* p#0) x) 3) \
+			 (local y#2 (load (. (* (load (. (* p#0) next))) x))) \
+			 (local z#3 (load (. (* p#0) x))))"
+		);
+	}
+
+	#[test]
+	fn a_field_through_a_pointer_is_a_place() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct P(x: u32, next: heap::&P);
+				func f(p: heap::*P, s: heap::&[heap::&P], v: heap::&[P]) {
+					p.x += 1;
+					local r: heap::&u32 = p.x.&;
+					local a: u32 = (p.*).x;
+					local b: u32 = s[0].x;
+					local c: u32 = v[0].x;
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (store += (. (* p#0) x) 1) \
+			 (local r#3 (.& (. (* p#0) x))) \
+			 (local a#4 (load (. (* p#0) x))) \
+			 (local b#5 (load (. (* (load (* (abstract index<heap::&[heap::&P]> s#1 0)))) x))) \
+			 (local c#6 (load (. (* (abstract index<heap::&[P]> v#2 0)) x))))"
+		);
+	}
+
+	#[test]
+	fn a_field_through_a_shared_pointer_is_read_only() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct P(x: u32);
+				func f(p: heap::&P) { p.x = 1; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
 	}
 }
