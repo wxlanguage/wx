@@ -1140,19 +1140,20 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					TypePathStep::TupleElement(index),
 				) => elements.get(index).map(|element| &element.inner),
 				(
-					ast::TypeExpression::Pointer { inner, .. }
-					| ast::TypeExpression::Slice { inner, .. }
+					ast::TypeExpression::Pointer { inner, .. },
+					TypePathStep::Pointee,
+				)
+				| (
+					ast::TypeExpression::Slice { inner }
 					| ast::TypeExpression::Array { inner, .. },
-					TypePathStep::Pointee | TypePathStep::Element,
+					TypePathStep::Element,
 				) => Some(&**inner),
 				(
 					ast::TypeExpression::Array { length, .. },
 					TypePathStep::Length,
 				) => return (length.span, taken + 1),
 				(
-					ast::TypeExpression::Pointer { memory, .. }
-					| ast::TypeExpression::Slice { memory, .. }
-					| ast::TypeExpression::Array { memory, .. },
+					ast::TypeExpression::Pointer { memory, .. },
 					TypePathStep::Memory,
 				) => {
 					if let Some([first, .., last] | [first @ last]) =
@@ -1322,35 +1323,18 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					&Type::Array {
 						of: a_of,
 						length: a_length,
-						memory: a_memory,
-						ownership: a,
 					},
 					&Type::Array {
 						of: b_of,
 						length: b_length,
-						memory: b_memory,
-						ownership: b,
 					},
-				) if a == b => vec![
+				) => vec![
 					(TypePathStep::Element, a_of, b_of),
 					(TypePathStep::Length, a_length, b_length),
-					(TypePathStep::Memory, a_memory, b_memory),
 				],
-				(
-					&Type::Slice {
-						of: a_of,
-						memory: a_memory,
-						ownership: a,
-					},
-					&Type::Slice {
-						of: b_of,
-						memory: b_memory,
-						ownership: b,
-					},
-				) if a == b => vec![
-					(TypePathStep::Element, a_of, b_of),
-					(TypePathStep::Memory, a_memory, b_memory),
-				],
+				(&Type::Slice { of: a_of }, &Type::Slice { of: b_of }) => {
+					vec![(TypePathStep::Element, a_of, b_of)]
+				}
 				(
 					&Type::TypeProjection {
 						trait_index: a_trait,

@@ -297,8 +297,6 @@ impl TypeContext<'_, '_, '_> {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::Value { .. }
 			| Type::Const { .. } => return Err(SolverError::Poisoned),
 			Type::Never
@@ -326,7 +324,13 @@ impl TypeContext<'_, '_, '_> {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				return self.piece(assumption_context, repr, visiting);
 			}
-			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
+			// An address, and for a slice its length, as wide as the memory's
+			// `Size`.
+			Type::Pointer { to, memory, .. } => {
+				let Some(fat) = self.is_fat_pointee(assumption_context, to)?
+				else {
+					return Ok(None);
+				};
 				let Some(primitive) =
 					self.address_primitive(assumption_context, memory)?
 				else {
@@ -334,20 +338,12 @@ impl TypeContext<'_, '_, '_> {
 				};
 				Piece::Primitives {
 					primitive,
-					count: 1,
+					count: if fat { 2 } else { 1 },
 				}
 			}
-			Type::Slice { memory, .. } => {
-				let Some(primitive) =
-					self.address_primitive(assumption_context, memory)?
-				else {
-					return Ok(None);
-				};
-				Piece::Primitives {
-					primitive,
-					count: 2,
-				}
-			}
+			// A slice or an array is no value's type: only a pointer holds
+			// one, and what it points at is laid out where it is placed.
+			Type::Slice { .. } | Type::Array { .. } => return Ok(None),
 			Type::Tuple { .. } | Type::Struct { .. } => {
 				return self.aggregate_piece(assumption_context, ty, visiting);
 			}

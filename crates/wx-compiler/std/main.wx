@@ -31,6 +31,13 @@ pub struct Char(value: u32);
 /// A reference to a function of any signature: a Wasm `funcref`.
 pub type funcref;
 
+/// The literal kinds, written `{integer}` and `{char}`: the type of a literal
+/// that has no type yet, and of an untyped constant
+/// (`const X: {integer} = 4;`), which takes its type where it is used.
+pub type integer;
+
+pub type char;
+
 /// Aborts execution by trapping: normal control flow never continues past a
 /// call to `trap`, so it has the bottom type `!`.
 pub func trap() -> !;
@@ -214,64 +221,38 @@ pub func array_from_mut<Mem: Memory, T>(data: Mem::*T) -> Mem::*[T; 1] {
     transmute(data)
 }
 
-/// A run of values in one memory. The compiler implements it for every slice
-/// and array type, `&` and `*` alike.
+/// A run of values in no memory, `[T]` or `[T; N]`, which only a pointer
+/// holds. The compiler implements it for every slice and array; a method
+/// takes the memory from its receiver, since one slice is what pointers into
+/// every memory point at.
 pub trait Slice {
     type Value;
-    type Mem: Memory;
 
-    func len(self: Self) -> Self::Mem::Size;
+    func len<M: Memory>(self: M::&Self) -> M::Size;
 
-    func as_ref(self: Self) -> Self::Mem::&Self::Value;
-
-    /// The value at `index`; traps when it is out of bounds.
-    func index(self: Self, index: Self::Mem::Size) -> Self::Mem::&Self::Value;
+    func as_ref<M: Memory>(self: M::&Self) -> M::&Self::Value;
 
     #[inline]
-    func first(self: Self) -> Self::Mem::&Self::Value {
+    func first<M: Memory>(self: M::&Self) -> M::&Self::Value {
         if self.len() == 0 { trap() };
-        self.index(0)
+        self[0].&
     }
 
     #[inline]
-    func last(self: Self) -> Self::Mem::&Self::Value {
+    func last<M: Memory>(self: M::&Self) -> M::&Self::Value {
         if self.len() == 0 { trap() };
-        self.index(self.len() - 1)
+        self[self.len() - 1].&
     }
 }
 
-/// A run of values that may be written: the compiler implements it for every
-/// exclusive slice and array type.
-pub trait SliceMut: Slice {
-    func as_ptr(self: Self) -> Self::Mem::*Self::Value;
-
-    /// The value at `index`; traps when it is out of bounds.
-    func index_mut(self: Self, index: Self::Mem::Size) -> Self::Mem::*Self::Value;
-
-    #[inline]
-    func first_mut(self: Self) -> Self::Mem::*Self::Value {
-        if self.len() == 0 { trap() };
-        self.index_mut(0)
-    }
-
-    #[inline]
-    func last_mut(self: Self) -> Self::Mem::*Self::Value {
-        if self.len() == 0 { trap() };
-        self.index_mut(self.len() - 1)
-    }
-}
-
-/// A run of values whose length is part of its type: the compiler implements
-/// it for every array type.
+/// A slice whose length is part of its type, `[T; N]`: the compiler
+/// implements it for every array.
 pub trait Array: Slice {
-    const SIZE: Self::Mem::Size;
+    const LEN: {integer};
 
-    func as_slice(self: Self) -> Self::Mem::&[Self::Value];
-}
+    func as_slice<M: Memory>(self: M::&Self) -> M::&[Self::Value];
 
-/// The compiler implements it for every exclusive array type.
-pub trait ArrayMut: Array + SliceMut {
-    func as_slice_mut(self: Self) -> Self::Mem::*[Self::Value];
+    func as_slice_mut<M: Memory>(self: M::*Self) -> M::*[Self::Value];
 }
 
 pub func i64_extend_i32(value: i32) -> i64;
@@ -2078,11 +2059,12 @@ func global_get<G: Global>(g: G) -> G::Value;
 
 func global_set<G: Global>(g: G, value: G::Value);
 
-/// How a value sits on the Wasm stack. Every type but `!` (and any type
-/// containing it) is one; the compiler answers it from the type's structure.
-/// `Repr` is the value's Wasm values as wx's own primitives: its parts in
-/// declaration order, flattened, zero-sized ones dropped. `Point(u32, u32)` and
-/// `(u8, u8)` are both `(i32, i32)`, `Meters(u32)` is `i32`, `()` is `()`.
+/// How a value sits on the Wasm stack; the compiler answers it from the type's
+/// structure. `Repr` is the value's Wasm values as wx's own primitives: its
+/// parts in declaration order, flattened, zero-sized ones dropped.
+/// `Point(u32, u32)` and `(u8, u8)` are both `(i32, i32)`, `Meters(u32)` is
+/// `i32`, `()` is `()`. A type containing `!` has no value and is held as `!`,
+/// which no other type is, so `transmute` never makes one.
 pub trait StackValue {
     type Repr;
 }

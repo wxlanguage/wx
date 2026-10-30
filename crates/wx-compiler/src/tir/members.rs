@@ -243,12 +243,7 @@ impl TypeContext<'_, '_, '_> {
 		let callable =
 			(target == ImplTarget::TypedFuncref).then_some(intrinsics.call);
 		let sequence = matches!(target, ImplTarget::Slice | ImplTarget::Array)
-			.then_some([
-				intrinsics.slice,
-				intrinsics.slice_mut,
-				intrinsics.array,
-				intrinsics.array_mut,
-			]);
+			.then_some([intrinsics.slice, intrinsics.array]);
 		self.impl_dispatch
 			.trait_candidates(target)
 			.iter()

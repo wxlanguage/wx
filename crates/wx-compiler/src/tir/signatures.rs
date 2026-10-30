@@ -1379,7 +1379,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				if receiver {
 					return TypeIndex::ERROR;
 				}
-				self.resolve_type(
+				self.resolve_value_type(
 					obligations,
 					LexicalScope {
 						file_id,
@@ -1393,7 +1393,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.collect();
 
 		let return_type = match &signature.result {
-			Some(result) => self.resolve_type(
+			Some(result) => self.resolve_value_type(
 				obligations,
 				LexicalScope {
 					file_id,
@@ -1545,7 +1545,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.params
 			.iter()
 			.map(|param| {
-				self.resolve_type(
+				self.resolve_value_type(
 					obligations,
 					LexicalScope {
 						file_id,
@@ -1559,7 +1559,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.collect();
 
 		let return_type = match &signature.result {
-			Some(result) => self.resolve_type(
+			Some(result) => self.resolve_value_type(
 				obligations,
 				LexicalScope {
 					file_id,
@@ -1601,17 +1601,46 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		name: Spanned<SymbolU32>,
 		ty: Option<&Spanned<ast::TypeExpression>>,
 	) -> SignatureLocation {
+		let lexical = LexicalScope {
+			file_id,
+			namespace,
+			env: scope,
+		};
+		let policy = InferPolicy::Reject(InferSignatureKind::Const);
 		let ty = match ty {
-			Some(ty) => self.resolve_type(
-				obligations,
-				LexicalScope {
-					file_id,
-					namespace,
-					env: scope,
-				},
-				ty,
-				InferPolicy::Reject(InferSignatureKind::Const),
-			),
+			// An untyped constant, `const X: {integer} = 4`. A free one only,
+			// for now: an impl's or a trait's would need its fit stated in
+			// bounds.
+			Some(Spanned {
+				inner: ast::TypeExpression::Literal { inner },
+				span,
+			}) => {
+				let kind = self.resolve_literal_kind(
+					obligations,
+					lexical,
+					inner,
+					policy,
+				);
+				if scope == TypeEnvIdx::ROOT || kind == TypeIndex::ERROR {
+					kind
+				} else {
+					self.diagnostics.push(
+						Diagnostic::bug()
+							.with_code(
+								DiagnosticCode::UnsupportedExpression.code(),
+							)
+							.with_message(
+								"an untyped constant in an impl is not \
+								 supported by the checker yet",
+							)
+							.with_label(
+								SourceSpan::new(file_id, *span).primary_label(),
+							),
+					);
+					TypeIndex::ERROR
+				}
+			}
+			Some(ty) => self.resolve_type(obligations, lexical, ty, policy),
 			None => {
 				self.diagnostics
 					.push(report_missing_constant_type(file_id, name));
@@ -2069,17 +2098,24 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					requested_at: None,
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
-
-				let resolved_ty = self.resolve_type(
-					obligations,
-					LexicalScope {
-						file_id,
-						namespace,
-						env: self_scope,
-					},
-					ty,
-					InferPolicy::Reject(InferSignatureKind::Const),
-				);
+				let lexical = LexicalScope {
+					file_id,
+					namespace,
+					env: self_scope,
+				};
+				let policy = InferPolicy::Reject(InferSignatureKind::Const);
+				// An untyped constant, `const LEN: {integer}`: each use gives
+				// it a type, as a free one's does.
+				let resolved_ty = match &ty.inner {
+					ast::TypeExpression::Literal { inner } => self
+						.resolve_literal_kind(
+							obligations,
+							lexical,
+							inner,
+							policy,
+						),
+					_ => self.resolve_type(obligations, lexical, ty, policy),
+				};
 
 				self.constants[usize::from(const_index)] = ConstantSignature {
 					ty: resolved_ty,
@@ -2410,7 +2446,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					Vec::with_capacity(fields.len());
 				for f in fields.iter() {
 					let ty_expr = &f.inner.inner.ty;
-					let ty = self.resolve_type(
+					let ty = self.resolve_value_type(
 						obligations,
 						LexicalScope {
 							file_id,
@@ -2913,30 +2949,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// An array's length in `memory`, as written: a `Value` of its `Size`,
-	/// which the value must fit (`CheckConstantFits`), a constant named by a
-	/// path (`Type::Const`), or `Infer` for `_`.
+	/// An array's length, as written: a count, which is a `Value`, a constant
+	/// named by a path (`Type::Const`), or `Infer` for `_`. It has no type
+	/// until a pointer holds the array (`length_fits`).
 	fn array_length(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		memory: TypeIndex,
 		length: &Spanned<ast::ConstArgument>,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let site = SourceSpan::new(scope.file_id, length.span);
 		let diagnostic = match length.inner {
 			ast::ConstArgument::Literal(ast::Literal::Int(bits)) => {
-				// Without a `Memory` there is no `Size`, and its absence is
-				// reported where the memory is declared.
-				if let Some(size) = self.memory_size(memory) {
-					obligations.push(TypeObligation::CheckConstantFits {
-						assumption_context: scope.env,
-						ty: size,
-						bits,
-						reference: site,
-					});
-				}
 				return self.types.intern(Type::Value { bits });
 			}
 			ast::ConstArgument::Infer => match infer_policy {
@@ -2955,7 +2980,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				return self.constant_length(
 					obligations,
 					scope,
-					memory,
 					segments,
 					site,
 					infer_policy,
@@ -2986,14 +3010,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					receiver,
 					member,
 				);
-				return self.type_constant_length(
-					obligations,
-					scope,
-					memory,
-					selected,
-					member,
-					site,
-				);
+				return self.type_constant_length(scope, selected, member);
 			}
 			ast::ConstArgument::QualifiedPath {
 				ref root,
@@ -3021,14 +3038,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								member,
 							)
 						});
-					return self.type_constant_length(
-						obligations,
-						scope,
-						memory,
-						selected,
-						member,
-						site,
-					);
+					return self.type_constant_length(scope, selected, member);
 				}
 				_ => Diagnostic::bug()
 					.with_code(DiagnosticCode::UnsupportedExpression.code())
@@ -3043,15 +3053,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		TypeIndex::ERROR
 	}
 
-	/// A length named by a constant: the constant, whose type must be
-	/// `memory`'s `Size` (`CheckConstantType`), and whose value it means once
-	/// evaluated. One named through a type (`T::SIZE`, `A::SIZE`) is that
+	/// A length named by a constant: the constant, whose value it means once
+	/// evaluated. One named through a type (`T::LEN`, `A::LEN`) is that
 	/// type's constant.
 	fn constant_length(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		memory: TypeIndex,
 		segments: &[ast::PathSegment],
 		site: SourceSpan,
 		infer_policy: InferPolicy,
@@ -3103,14 +3111,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					receiver,
 					member,
 				);
-				return self.type_constant_length(
-					obligations,
-					scope,
-					memory,
-					selected,
-					member,
-					site,
-				);
+				return self.type_constant_length(scope, selected, member);
 			}
 		};
 		let Some(key) = target.def_key() else {
@@ -3132,7 +3133,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			self.report_length_not_constant(kind.noun(), name.inner, site);
 			return TypeIndex::ERROR;
 		};
-		self.length_constant(obligations, scope, memory, constant, &[], site)
+		self.types.intern_const(constant, &[])
 	}
 
 	/// A length named by a type's constant `member`, as its path `selected`
@@ -3140,12 +3141,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// type arguments of its own.
 	fn type_constant_length(
 		&mut self,
-		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		memory: TypeIndex,
 		selected: Option<(ConstIdx, Vec<TypeIndex>)>,
 		member: &ast::PathSegment,
-		site: SourceSpan,
 	) -> TypeIndex {
 		let Some((constant, type_args)) = selected else {
 			return TypeIndex::ERROR;
@@ -3159,14 +3157,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				TypeArgsNotAllowedOn::Declaration(DefKind::Const(constant)),
 			));
 		}
-		self.length_constant(
-			obligations,
-			scope,
-			memory,
-			constant,
-			&type_args,
-			site,
-		)
+		self.types.intern_const(constant, &type_args)
 	}
 
 	/// What a length names is not a constant: a `noun` called `name`.
@@ -3188,27 +3179,42 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		);
 	}
 
-	/// `constant` with `type_args` as a length in `memory`, whose type it
-	/// must have.
-	fn length_constant(
+	/// A pointer into `memory` holds the array whose `length` is written at
+	/// `site`, so the length is held as the memory's `Size`: a value must fit
+	/// it (`CheckConstantFits`), and a constant must have it as its type or be
+	/// an untyped count that fits it (`CheckConstantType`).
+	fn length_fits(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		memory: TypeIndex,
-		constant: ConstIdx,
-		type_args: &[TypeIndex],
+		length: TypeIndex,
 		site: SourceSpan,
-	) -> TypeIndex {
-		let length = self.types.intern_const(constant, type_args);
-		if let Some(size) = self.memory_size(memory) {
-			obligations.push(TypeObligation::CheckConstantType {
-				assumption_context: scope.env,
-				length,
-				expected: size,
-				reference: site,
-			});
+	) {
+		// Without a `Memory` there is no `Size`, and its absence is reported
+		// where the memory is declared.
+		let Some(size) = self.memory_size(memory) else {
+			return;
+		};
+		match *self.types.resolve(length) {
+			Type::Value { bits } => {
+				obligations.push(TypeObligation::CheckConstantFits {
+					assumption_context: scope.env,
+					ty: size,
+					bits,
+					reference: site,
+				});
+			}
+			Type::Const { .. } => {
+				obligations.push(TypeObligation::CheckConstantType {
+					assumption_context: scope.env,
+					length,
+					expected: size,
+					reference: site,
+				});
+			}
+			_ => {}
 		}
-		length
 	}
 
 	/// `memory`'s `Size`, `<memory as Memory>::Size`, as written; `None`
@@ -3264,6 +3270,37 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			});
 		}
 		ty
+	}
+
+	/// `resolve_type` for a type held by value (a parameter's, a result's, a
+	/// field's, a local's), which must be no slice or array (`CheckValueType`).
+	pub(super) fn resolve_value_type(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		type_expr: &Spanned<ast::TypeExpression>,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		let ty = self.resolve_type(obligations, scope, type_expr, infer_policy);
+		self.record_value_type(obligations, scope, ty, type_expr.span);
+		ty
+	}
+
+	/// Records that `ty`, written at `span`, is held by value.
+	fn record_value_type(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		ty: TypeIndex,
+		span: TextSpan,
+	) {
+		if ty != TypeIndex::ERROR {
+			obligations.push(TypeObligation::CheckValueType {
+				assumption_context: scope.env,
+				ty,
+				reference: SourceSpan::new(scope.file_id, span),
+			});
+		}
 	}
 
 	/// Resolve the value an impl supplies for an associated type: a written
@@ -3850,12 +3887,63 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 			},
 			ast::TypeExpression::Never => TypeIndex::NEVER,
-			ast::TypeExpression::Path(segments) => self.resolve_type_path(
-				obligations,
-				scope,
-				segments,
-				infer_policy,
-			),
+			ast::TypeExpression::Path(segments) => {
+				let ty = self.resolve_type_path(
+					obligations,
+					scope,
+					segments,
+					infer_policy,
+				);
+				if !ty.is_literal() {
+					return ty;
+				}
+				let name = self.type_formatter().display_type(ty);
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::LiteralKindWithoutBraces.code(),
+						)
+						.with_message(format!(
+							"`{}` is a literal kind, written `{name}`",
+							&name[1..name.len() - 1]
+						))
+						.with_label(
+							SourceSpan::new(scope.file_id, type_expr.span)
+								.primary_label()
+								.with_message(format!("write `{name}`")),
+						),
+				);
+				TypeIndex::ERROR
+			}
+			ast::TypeExpression::Literal { inner } => {
+				if self.resolve_literal_kind(
+					obligations,
+					scope,
+					inner,
+					infer_policy,
+				) == TypeIndex::ERROR
+				{
+					return TypeIndex::ERROR;
+				}
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::MisplacedLiteralKind.code())
+						.with_message(
+							"a literal kind is only the type of a constant",
+						)
+						.with_label(
+							SourceSpan::new(scope.file_id, type_expr.span)
+								.primary_label()
+								.with_message(
+									"no value of this type exists at runtime",
+								),
+						)
+						.with_note(
+							"a literal kind types an untyped constant: `const X: {integer} = 4;`",
+						),
+				);
+				TypeIndex::ERROR
+			}
 			ast::TypeExpression::Grouped { inner, segments } => {
 				// `<T>::Item` — no scope.namespace prefix to consume first
 				// (unlike `Path`'s `T::Item`, where `T` might itself be a
@@ -3961,33 +4049,41 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 			ast::TypeExpression::Function { params, result } => {
 				// One parameter type: a single one is itself, any other count
-				// is its tuple (`()` for none).
-				let param = if let [param] = &params[..] {
-					self.resolve_type_expression(
+				// is its tuple (`()` for none). Each is held by value.
+				let mut elements = Vec::with_capacity(params.len());
+				for param in params.iter() {
+					let written = &param.inner.inner.ty;
+					let ty = self.resolve_type_expression(
 						obligations,
 						scope,
-						&param.inner.inner.ty,
+						written,
 						infer_policy,
-					)
-				} else {
-					let mut elements = Vec::with_capacity(params.len());
-					for param in params.iter() {
-						elements.push(self.resolve_type_expression(
+					);
+					self.record_value_type(
+						obligations,
+						scope,
+						ty,
+						written.span,
+					);
+					elements.push(ty);
+				}
+				let param = self.types.intern_tuple(&elements);
+				let result_type = match result {
+					Some(result) => {
+						let ty = self.resolve_type_expression(
 							obligations,
 							scope,
-							&param.inner.inner.ty,
+							result,
 							infer_policy,
-						));
+						);
+						self.record_value_type(
+							obligations,
+							scope,
+							ty,
+							result.span,
+						);
+						ty
 					}
-					self.types.intern_tuple(&elements)
-				};
-				let result_type = match result {
-					Some(result) => self.resolve_type_expression(
-						obligations,
-						scope,
-						result,
-						infer_policy,
-					),
 					None => TypeIndex::UNIT,
 				};
 				self.types.intern(Type::TypedFuncref {
@@ -4015,92 +4111,119 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				) else {
 					return TypeIndex::ERROR;
 				};
+				// The length of an array it points at is held as the memory's
+				// `Size`, which it must fit.
+				if let ast::TypeExpression::Array {
+					length: written, ..
+				} = &inner.inner && let Type::Array { length, .. } =
+					*self.types.resolve(to)
+				{
+					self.length_fits(
+						obligations,
+						scope,
+						memory,
+						length,
+						SourceSpan::new(scope.file_id, written.span),
+					);
+				}
 				self.types.intern(Type::Pointer {
 					to,
 					memory,
 					ownership: *ownership,
 				})
 			}
-			ast::TypeExpression::Slice {
-				ownership,
-				memory,
-				inner,
-			} => {
+			ast::TypeExpression::Slice { inner } => {
 				let of = self.resolve_type_expression(
 					obligations,
 					scope,
 					inner,
 					infer_policy,
 				);
-				let Ok(memory) = self.resolve_pointer_memory(
-					obligations,
-					scope,
-					memory,
-					type_expr.span,
-					infer_policy,
-				) else {
-					return TypeIndex::ERROR;
-				};
-				self.types.intern(Type::Slice {
-					of,
-					memory,
-					ownership: *ownership,
-				})
+				self.types.intern(Type::Slice { of })
 			}
-			ast::TypeExpression::Array {
-				ownership,
-				memory,
-				inner,
-				length,
-			} => {
+			ast::TypeExpression::Array { inner, length } => {
 				let of = self.resolve_type_expression(
 					obligations,
 					scope,
 					inner,
 					infer_policy,
 				);
-				let Ok(memory) = self.resolve_pointer_memory(
-					obligations,
-					scope,
-					memory,
-					type_expr.span,
-					infer_policy,
-				) else {
-					return TypeIndex::ERROR;
-				};
-				let length = self.array_length(
-					obligations,
-					scope,
-					memory,
-					length,
-					infer_policy,
-				);
+				let length =
+					self.array_length(obligations, scope, length, infer_policy);
 				if length == TypeIndex::ERROR {
 					return TypeIndex::ERROR;
 				}
-				self.types.intern(Type::Array {
-					of,
-					length,
-					memory,
-					ownership: *ownership,
-				})
+				self.types.intern(Type::Array { of, length })
 			}
 			ast::TypeExpression::Tuple { elements } => {
 				let mut elems: Vec<TypeIndex> =
 					Vec::with_capacity(elements.len());
 				for element in elements.iter() {
-					elems.push(self.resolve_type_expression(
+					let ty = self.resolve_type_expression(
 						obligations,
 						scope,
 						&element.inner,
 						infer_policy,
-					));
+					);
+					// A tuple's elements are held by value; a tuple of one is
+					// its element, which interning unwraps, and holds nothing.
+					if elements.len() != 1 {
+						self.record_value_type(
+							obligations,
+							scope,
+							ty,
+							element.inner.span,
+						);
+					}
+					elems.push(ty);
 				}
-				// A tuple of one is its element, which interning unwraps.
 				self.types.intern_tuple(&elems)
 			}
-			_ => todo!("this type-expression form isn't implemented yet"),
 		}
+	}
+
+	/// The literal kind `{inner}` names: `inner` resolves as any type, and
+	/// must be one of std's literal kinds (`integer`, `char`). `ERROR` when it
+	/// is not, which is reported.
+	fn resolve_literal_kind(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		inner: &Spanned<ast::TypeExpression>,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		// A path is resolved directly: inside the braces a literal kind is
+		// what it should name.
+		let ty = match &inner.inner {
+			ast::TypeExpression::Path(segments) => self.resolve_type_path(
+				obligations,
+				scope,
+				segments,
+				infer_policy,
+			),
+			_ => self.resolve_type_expression(
+				obligations,
+				scope,
+				inner,
+				infer_policy,
+			),
+		};
+		if ty == TypeIndex::ERROR || ty.is_literal() {
+			return ty;
+		}
+		let found = self.type_formatter().display_type(ty);
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::NotALiteralKind.code())
+				.with_message(format!("`{found}` is not a literal kind"))
+				.with_label(
+					SourceSpan::new(scope.file_id, inner.span)
+						.primary_label()
+						.with_message("expected a literal kind"),
+				)
+				.with_note("the literal kinds are `integer` and `char`"),
+		);
+		TypeIndex::ERROR
 	}
 
 	/// Builds the diagnostic for a cycle just detected while trying to
@@ -4930,6 +5053,9 @@ fn report_missing_constant_type(
 			SourceSpan::new(file_id, name.span)
 				.primary_label()
 				.with_message("expected `: Type` here"),
+		)
+		.with_note(
+			"an untyped constant names its literal kind: `const X: {integer} = 4;`",
 		)
 }
 
@@ -10481,37 +10607,42 @@ pub(super) mod tests {
 		else {
 			panic!("expected exactly two parameters");
 		};
-		let Type::Slice {
-			of,
+		let &Type::Pointer {
+			to,
 			memory,
 			ownership,
 		} = case.context.types.resolve(slice_type)
 		else {
-			panic!("expected `s` to resolve to a slice type");
+			panic!("expected `s` to resolve to a pointer");
 		};
-		assert_eq!(*of, TypeIndex::U32);
-		assert_eq!(*ownership, ast::Ownership::Shared);
 		assert_eq!(
-			case.context.types.resolve(*memory),
+			case.context.types.resolve(to),
+			&Type::Slice { of: TypeIndex::U32 }
+		);
+		assert_eq!(ownership, ast::Ownership::Shared);
+		assert_eq!(
+			case.context.types.resolve(memory),
 			&Type::Memory { memory_index }
 		);
-		let Type::Array {
-			of,
-			length,
+		let &Type::Pointer {
+			to,
 			memory,
 			ownership,
 		} = case.context.types.resolve(array_type)
 		else {
-			panic!("expected `a` to resolve to an array type");
+			panic!("expected `a` to resolve to a pointer");
 		};
-		assert_eq!(*of, TypeIndex::U32);
+		let Type::Array { of, length } = *case.context.types.resolve(to) else {
+			panic!("expected `a` to point at an array");
+		};
+		assert_eq!(of, TypeIndex::U32);
 		assert_eq!(
-			case.context.types.resolve(*length),
+			case.context.types.resolve(length),
 			&Type::Value { bits: 4 }
 		);
-		assert_eq!(*ownership, ast::Ownership::Exclusive);
+		assert_eq!(ownership, ast::Ownership::Exclusive);
 		assert_eq!(
-			case.context.types.resolve(*memory),
+			case.context.types.resolve(memory),
 			&Type::Memory { memory_index }
 		);
 	}
@@ -10615,15 +10746,29 @@ pub(super) mod tests {
 				ownership: ast::Ownership::Exclusive
 			}
 		);
+		let Type::Pointer { to: slice, .. } =
+			*case.context.types.resolve(params[2])
+		else {
+			panic!("expected a pointer");
+		};
+		assert_eq!(
+			case.context.types.resolve(slice),
+			&Type::Slice { of: TypeIndex::U8 }
+		);
 		assert_eq!(
 			case.context.types.resolve(params[2]),
-			&Type::Slice {
-				of: TypeIndex::U8,
+			&Type::Pointer {
+				to: slice,
 				memory: params[0],
 				ownership: ast::Ownership::Shared
 			}
 		);
-		let Type::Array { length, .. } = *case.context.types.resolve(params[3])
+		let Type::Pointer { to: array, .. } =
+			*case.context.types.resolve(params[3])
+		else {
+			panic!("expected a pointer");
+		};
+		let Type::Array { length, .. } = *case.context.types.resolve(array)
 		else {
 			panic!("expected an array");
 		};
@@ -10633,9 +10778,8 @@ pub(super) mod tests {
 		);
 		assert_eq!(
 			case.context.types.resolve(params[3]),
-			&Type::Array {
-				of: TypeIndex::U8,
-				length,
+			&Type::Pointer {
+				to: array,
 				memory: params[0],
 				ownership: ast::Ownership::Exclusive
 			}
@@ -13338,27 +13482,17 @@ pub(super) mod tests {
 						builder.types.intern(Type::Array {
 							of: projection,
 							length: seven,
-							memory: projection,
-							ownership: Ownership::Exclusive,
 						}),
 						builder.types.intern(Type::Array {
 							of: TypeIndex::I32,
 							length: seven,
-							memory: TypeIndex::I32,
-							ownership: Ownership::Exclusive,
 						}),
 					),
 					(
-						builder.types.intern(Type::Slice {
-							of: projection,
-							memory: projection,
-							ownership: Ownership::Shared,
-						}),
-						builder.types.intern(Type::Slice {
-							of: TypeIndex::I32,
-							memory: TypeIndex::I32,
-							ownership: Ownership::Shared,
-						}),
+						builder.types.intern(Type::Slice { of: projection }),
+						builder
+							.types
+							.intern(Type::Slice { of: TypeIndex::I32 }),
 					),
 				];
 				for (before, after) in cases {
@@ -15996,17 +16130,48 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn a_type_containing_never_is_no_stack_value() {
+		fn a_type_containing_never_is_held_as_never() {
 			let source = with_stack_value(indoc! {"
 				struct S(x: !);
-				func f(a: Needs<!>, b: Needs<(u32, !)>, c: Needs<S>) {}
+				struct Wrap<T>(T);
+				func f(
+					a: Is<!, !>,
+					b: Is<(u32, !), !>,
+					c: Is<S, !>,
+					d: Is<Wrap<(!, u64)>, !>,
+				) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics().assert_none();
+		}
+
+		/// `!` is held as itself, not as `()`, so no value of it can be made
+		/// from one of another type, nor one of another type from it.
+		#[test]
+		fn never_is_transmuted_only_into_never() {
+			let source = with_stack_value(indoc! {"
+				func make(x: ()) -> ! { transmute(x) }
+				func from(x: !) -> () { transmute(x) }
+				func into(x: !) -> u32 { transmute(x) }
+				func same(x: (!, u32)) -> ! { transmute(x) }
 			"});
 			checked_case!(std case = &source);
 			case.diagnostics().assert_codes(&[
-				DiagnosticCode::TraitBoundViolation,
-				DiagnosticCode::TraitBoundViolation,
-				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::AssocTypeEqualityMismatch,
+				DiagnosticCode::AssocTypeEqualityMismatch,
+				DiagnosticCode::AssocTypeEqualityMismatch,
 			]);
+		}
+
+		#[test]
+		fn a_global_value_is_never_uninhabited() {
+			let source = with_stack_value(indoc! {"
+				struct Scalar<V: StackValue where { Repr: StackScalar }>();
+				func f(a: Scalar<u32>, b: Scalar<!>) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		}
 
 		#[test]
@@ -17397,6 +17562,59 @@ pub(super) mod tests {
 			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
 	}
 
+	/// A literal kind is std's `integer` or `char`, named in braces: the
+	/// braces say a literal kind is meant, and a bare name is reported.
+	#[test]
+	fn a_literal_kind_is_written_in_braces() {
+		test_case!(
+			case = indoc! {"
+			const X: integer = 4;
+			const Y: {integer} = 4;
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::LiteralKindWithoutBraces]);
+		case.diagnostics().assert_error_saying(
+			"`integer` is a literal kind, written `{integer}`",
+		);
+	}
+
+	#[test]
+	fn only_a_literal_kind_goes_in_braces() {
+		test_case!(
+			case = indoc! {"
+			struct Point(x: i32);
+			const P: {Point} = 4;
+			const Q: {u32} = 4;
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotALiteralKind,
+			DiagnosticCode::NotALiteralKind,
+		]);
+		case.diagnostics()
+			.assert_error_saying("`Point` is not a literal kind");
+	}
+
+	/// No value of a literal kind exists at runtime, so it is only a
+	/// constant's type.
+	#[test]
+	fn a_literal_kind_is_only_a_constants_type() {
+		test_case!(
+			case = indoc! {"
+			struct S(x: {integer});
+			type I = {char};
+			func f(x: {integer}) -> {integer} { x }
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+		]);
+	}
+
 	/// The synthetic impl is the only one: a function is not a path an impl
 	/// can be written for.
 	#[test]
@@ -17406,6 +17624,23 @@ pub(super) mod tests {
 			trait Marker {}
 			func f() {}
 			impl Marker for f {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::InvalidImplTarget]);
+	}
+
+	/// An impl is written only for a nominal type: a slice (like an array, a
+	/// tuple, a pointer or a function reference) is not a path, and an alias
+	/// naming one has no identity to dispatch on.
+	#[test]
+	fn an_impl_cannot_be_written_for_an_alias_of_a_slice() {
+		test_case!(
+			case = indoc! {"
+			memory heap: u32;
+			trait Marker {}
+			type Bytes = heap::&[u8];
+			impl Marker for Bytes {}
 		"}
 		);
 		case.diagnostics()

@@ -17,9 +17,9 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::calls::{Callee, Dispatch};
 use super::{Arguments, BodyContext};
-use crate::ast::{self, Spanned};
+use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::body::{ExprIdx, ExprKind};
+use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::defs::{
 	BindingKey, ConstIdx, DefKind, MemberKind, Tier, TraitIdx, Visibility,
 };
@@ -330,9 +330,12 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	/// `receiver.method(a, b)` or `receiver.method({ b, a })`: a call of the
-	/// method the receiver's type has, the receiver its first argument. A pointer is not dereferenced: a
-	/// method of the pointee is found only when it takes `self` by pointer,
-	/// as `self: Mem::*Self` does, and the pointer itself is then `self`.
+	/// method the receiver's type has, the receiver its first argument. A
+	/// pointer is not dereferenced: a method of the pointee is found only when
+	/// it takes `self` by pointer, as `self: Mem::*Self` does, and the pointer
+	/// itself is then `self`. The one conversion is an exclusive pointer
+	/// given to a method that takes a shared one, `self: Mem::&Self`, which
+	/// is `receiver.*.&`.
 	pub(super) fn build_method_call(
 		&mut self,
 		object: &Spanned<ast::Expression>,
@@ -343,7 +346,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> ExprIdx {
 		let receiver = self.build(object, TypeIndex::INFER);
 		let receiver_ty = self.body.ty(receiver);
-		if self.cx.types.has_literal(receiver_ty) {
+		if self.cx.types.needs_context(receiver_ty) {
 			self.report_annotation_required(receiver);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
@@ -363,14 +366,37 @@ impl BodyContext<'_, '_, '_, '_> {
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 		};
-		if pointee.is_some() {
+		let mut receiver = receiver;
+		if let Type::Pointer {
+			to,
+			memory,
+			ownership,
+		} = *self.cx.types.resolve(receiver_ty)
+		{
 			let params =
 				self.cx.functions[usize::from(callee.function)].param_types;
 			let declared = self.cx.types.list(params)[0];
-			if !matches!(self.cx.types.resolve(declared), Type::Pointer { .. })
-			{
+			let Type::Pointer {
+				ownership: declared,
+				..
+			} = *self.cx.types.resolve(declared)
+			else {
 				self.report_by_value_through_pointer(receiver_ty, method);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			};
+			match (ownership, declared) {
+				(Ownership::Exclusive, Ownership::Shared) => {
+					receiver = self.shared_receiver(receiver, to, memory);
+				}
+				(Ownership::Shared, Ownership::Exclusive) => {
+					self.report_shared_receiver(receiver, method);
+					return self.body.push(
+						ExprKind::Error,
+						TypeIndex::ERROR,
+						span,
+					);
+				}
+				_ => {}
 			}
 		}
 		self.build_function_call(
@@ -714,6 +740,61 @@ impl BodyContext<'_, '_, '_, '_> {
 				))
 				.with_note(format!(
 					"call it through its type: `{receiver}::{name}(..)`"
+				)),
+		);
+	}
+
+	/// The exclusive pointer `receiver` to `to` in `memory`, as a shared one:
+	/// `receiver.*.&`.
+	fn shared_receiver(
+		&mut self,
+		receiver: ExprIdx,
+		to: TypeIndex,
+		memory: TypeIndex,
+	) -> ExprIdx {
+		let span = self.body.span(receiver);
+		let place = self.body.push_place(Place {
+			kind: PlaceKind::Deref { pointer: receiver },
+			ty: to,
+			memory,
+			mutable: true,
+			span,
+		});
+		let ty = self.cx.types.intern(Type::Pointer {
+			to,
+			memory,
+			ownership: Ownership::Shared,
+		});
+		self.body.push(ExprKind::AddressOf(place), ty, span)
+	}
+
+	/// A method that takes `self` by exclusive pointer, called on a shared
+	/// one.
+	fn report_shared_receiver(
+		&mut self,
+		receiver: ExprIdx,
+		method: &ast::PathSegment,
+	) {
+		let name = self.cx.strings.resolve(method.ident.inner).unwrap();
+		let found = self
+			.cx
+			.type_formatter()
+			.display_type(self.body.ty(receiver));
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypeMistmatch.code())
+				.with_message(format!(
+					"`{name}` takes `self` by exclusive pointer, but the \
+					 receiver is `{found}`"
+				))
+				.with_label(
+					self.source_span(receiver)
+						.primary_label()
+						.with_message("a shared pointer"),
+				)
+				.with_label(Label::secondary(
+					self.scope.file_id,
+					method.ident.span,
 				)),
 		);
 	}

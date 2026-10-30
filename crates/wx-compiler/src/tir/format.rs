@@ -129,8 +129,6 @@ impl TypeFormatter<'_> {
 			Type::IntegerLiteral => f.push_str("{integer}"),
 			Type::FloatLiteral => f.push_str("{float}"),
 			Type::CharLiteral => f.push_str("{char}"),
-			Type::StringLiteral => f.push_str("{string}"),
-			Type::ArrayLiteral => f.push_str("{array}"),
 			Type::U8 => f.push_str("u8"),
 			Type::I8 => f.push_str("i8"),
 			Type::U16 => f.push_str("u16"),
@@ -191,27 +189,12 @@ impl TypeFormatter<'_> {
 				f.push(ownership_sigil(*ownership));
 				self.write_type(f, *to);
 			}
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => {
-				self.write_type(f, *memory);
-				f.push_str("::");
-				f.push(ownership_sigil(*ownership));
+			Type::Slice { of } => {
 				f.push('[');
 				self.write_type(f, *of);
 				f.push(']');
 			}
-			Type::Array {
-				of,
-				length,
-				memory,
-				ownership,
-			} => {
-				self.write_type(f, *memory);
-				f.push_str("::");
-				f.push(ownership_sigil(*ownership));
+			Type::Array { of, length } => {
 				f.push('[');
 				self.write_type(f, *of);
 				f.push_str("; ");
@@ -315,7 +298,7 @@ impl TypeFormatter<'_> {
 	}
 
 	/// `constant` with `args`: a trait's declaration over its `Self` as a
-	/// projection is (`<T as Array>::SIZE`), any other with its arguments.
+	/// projection is (`<T as Array>::LEN`), any other with its arguments.
 	pub(super) fn display_constant(
 		&self,
 		constant: ConstIdx,
@@ -596,8 +579,9 @@ mod tests {
 	fn memory_qualified_types_preserve_ownership_and_shape() {
 		let mut case = TestCase::new("func allocate<M>() {}");
 		let memory = case.type_param("allocate", "M");
-		let slice = case.types.intern(Type::Slice {
-			of: TypeIndex::I32,
+		let slice = case.types.intern(Type::Slice { of: TypeIndex::I32 });
+		let slice = case.types.intern(Type::Pointer {
+			to: slice,
 			memory,
 			ownership: Ownership::Shared,
 		});
@@ -610,12 +594,16 @@ mod tests {
 		let array = case.types.intern(Type::Array {
 			of: TypeIndex::I32,
 			length: four,
+		});
+		let to_array = case.types.intern(Type::Pointer {
+			to: array,
 			memory,
 			ownership: Ownership::Exclusive,
 		});
 		let formatter = case.type_formatter();
 		assert_eq!(formatter.display_type(pointer), "M::*M::&[i32]");
-		assert_eq!(formatter.display_type(array), "M::*[i32; 4]");
+		assert_eq!(formatter.display_type(to_array), "M::*[i32; 4]");
+		assert_eq!(formatter.display_type(array), "[i32; 4]");
 	}
 
 	#[test]

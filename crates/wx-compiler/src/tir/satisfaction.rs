@@ -180,6 +180,36 @@ impl TypeContext<'_, '_, '_> {
 					(signature.clauses, root, env, Box::new([receiver]))
 				}
 			};
+		// Only a parameter bounded by `Slice` stands for a slice or an array.
+		if let BoundRequirements::Parameter { env, .. } = requirements
+			&& self.may_be_slice(assumption_context, argument.inner)?
+			&& !self.may_be_slice(env, root)?
+		{
+			let found = self.type_formatter().display_type(argument.inner);
+			let param = self.type_formatter().display_type(root);
+			let noun = match self.types.resolve(argument.inner) {
+				Type::Slice { .. } => "slice",
+				Type::Array { .. } => "array",
+				_ => "slice or array",
+			};
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::SliceArgument.code())
+					.with_message(format!(
+						"the {noun} `{found}` cannot stand for `{param}`"
+					))
+					.with_label(
+						SourceSpan::new(reference.file_id, argument.span)
+							.primary_label()
+							.with_message(noun),
+					)
+					.with_note(format!(
+						"only a parameter bounded by `Slice` stands for a \
+						 slice or an array, and `{param}` is not"
+					)),
+			);
+			return Err(SolverError::Poisoned);
+		}
 		let mut failures = Vec::new();
 		if self.satisfies_clauses(
 			assumption_context,

@@ -120,6 +120,14 @@ pub(super) enum TypeObligation {
 		expected: TypeIndex,
 		reference: SourceSpan,
 	},
+	/// A type held by value (a parameter's, a field's, a local's, a tuple's
+	/// element) is not a slice or an array, `[T]` or `[T; N]`, nor a
+	/// parameter that may be one: only a pointer holds a slice or an array.
+	CheckValueType {
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	},
 	/// A trait impl keeps its trait's contract (`conformance.rs`).
 	CheckConformance { impl_index: TraitImplIdx },
 	/// `Projection::name` was written, and the projection's declared bounds do
@@ -398,6 +406,28 @@ impl TypeContext<'_, '_, '_> {
 				Err(SolverError::Poisoned) => Ok(()),
 				Err(SolverError::Pending) => Err(()),
 			},
+			TypeObligation::CheckValueType {
+				assumption_context,
+				ty,
+				reference,
+			} => {
+				match self.check_value_type(assumption_context, ty, reference) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(&cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+				}
+			}
 			// Reports everything but "not decided yet" itself.
 			TypeObligation::CheckConformance { impl_index } => {
 				self.check_conformance(impl_index).map_err(|_| ())
@@ -509,6 +539,48 @@ impl TypeContext<'_, '_, '_> {
 		Ok(())
 	}
 
+	/// `ty` may be held by value: it is no slice or array, and no parameter
+	/// that may stand for one.
+	fn check_value_type(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	) -> Result<(), SolverError> {
+		if !self.may_be_slice(assumption_context, ty)? {
+			return Ok(());
+		}
+		let found = self.type_formatter().display_type(ty);
+		let (noun, note) = match self.types.resolve(ty) {
+			Type::Slice { .. } => (
+				"a slice",
+				format!("hold it through a pointer, as `M::&{found}`"),
+			),
+			Type::Array { .. } => (
+				"an array",
+				format!("hold it through a pointer, as `M::&{found}`"),
+			),
+			_ => (
+				"a slice or an array",
+				format!(
+					"`{found}` is bounded by `Slice`, so it stands for a \
+					 slice or an array"
+				),
+			),
+		};
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::SliceByValue.code())
+				.with_message(format!(
+					"`{found}` is held by value, but {noun} is held only by \
+					 a pointer"
+				))
+				.with_label(reference.primary_label().with_message(noun))
+				.with_note(note),
+		);
+		Err(SolverError::Poisoned)
+	}
+
 	/// The constant's type, in its own scope, is `expected`, in the scope
 	/// the constant is named in.
 	fn check_constant_type(
@@ -557,6 +629,42 @@ impl TypeContext<'_, '_, '_> {
 			|| expected == TypeIndex::ERROR
 		{
 			return Ok(());
+		}
+		// An untyped integer constant is a count: its value fits the length's
+		// type, as a literal length's does.
+		if found == TypeIndex::INTEGER_LITERAL {
+			let Ok(value) = self.exact_value(constant) else {
+				return Ok(());
+			};
+			return match u64::try_from(value) {
+				Ok(bits) => self.check_constant_fits(
+					assumption_context,
+					expected,
+					bits,
+					reference,
+				),
+				Err(_) => {
+					let message = format!(
+						"an array's length is a count, but `{}` is `{value}`",
+						self.strings
+							.resolve(
+								self.defs.constants[usize::from(constant)]
+									.name
+									.inner
+							)
+							.unwrap()
+					);
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::IntegerLiteralOutOfRange.code(),
+							)
+							.with_message(message)
+							.with_label(reference.primary_label()),
+					);
+					Err(SolverError::Poisoned)
+				}
+			};
 		}
 		let formatter = self.type_formatter();
 		let (expected, found) = (

@@ -501,6 +501,26 @@ fn a_bracketed_constant_path_is_formatted_as_written() {
 }
 
 #[test]
+fn a_literal_kind_is_formatted_in_braces() {
+	let source = indoc! {"
+        const X: {integer} = 4;
+
+        const U: {char} = 'u';
+    "};
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(output, source);
+}
+
+#[test]
 fn test_format_struct_items() {
 	let case = TestCase::new(indoc! {"
         pub struct Point(pub x: i32, y: i32);
