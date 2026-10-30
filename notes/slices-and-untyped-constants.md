@@ -256,8 +256,8 @@ type's equals it: `transmute` never makes one, and since `!` is no
 A slice's length is `M::Size`, which belongs to the pointer, not to the
 pointee: `[T]` knows no memory. So the length is not a type of `T`'s. A
 pointer computes its representation from its memory and its pointee: an
-address, then a length of `M::Size` for `[T]`, nothing for a sized pointee,
-a vtable index (probably `i32`, a table index, memory-free) for a later
+address, then the pointee's metadata with each count held as `M::Size` (one
+for `[T]`, none for a `Sized` pointee, see "Unsized fields"), a vtable index (probably `i32`, a table index, memory-free) for a later
 `dyn`. Over a pointee of unknown shape the representation stays a rigid
 projection, `<M::&T as StackValue>::Repr`, resolved after monomorphization,
 as an abstract part's `Repr` is today, instead of "no `StackValue`"; so
@@ -268,23 +268,130 @@ type of the pointee's, which does not fit a length whose type is the
 memory's. It is needed only if code must build or take apart fat pointers
 generically (`from_raw_parts`); std intrinsics
 (`from_raw_parts<M, T>(p, len: M::Size) -> M::&[T]`) cover that until then.
-If it comes, the length could be a count the pointer types with `M::Size`,
-as an untyped constant is typed by its use, or the trait could take the
-memory as a parameter.
+Metadata is made of counts the pointer types with `M::Size`, as an untyped
+constant is typed by its use, so the pointee never needs to know the memory.
+
+### Unsized fields
+
+Decided on 2026-10-31. A struct may hold any number of unsized fields, in
+any position, and a slice's element may itself be unsized. Nothing is
+checked where the struct is declared: such a struct is neither a
+`StackValue` nor `Sized`, so a construction (its result needs a
+`StackValue`) or a load is refused at the use, and the diagnostic names the
+field that makes it so.
+
+```wx
+struct Message(header: u32, payload: [u8], checksum: [u8]);
+// metadata (count, count): payload's length, checksum's length
+
+struct Image(pixels: [[u8]], palette: [u32]);
+// metadata ((count, count), count)
+
+struct Matrix(data: [[f32]]);
+// metadata (count, count): 3 rows, 4 columns
+```
+
+**Metadata** is an ordinary type the compiler computes from the pointee and
+the pointer's `Size`, so a count is typed by the pointer, never by the
+pointee:
+
+```rust
+/// The lengths a pointer to `pointee` carries beside its address, each a
+/// `size`: `Some(UNIT)` for a `Sized` pointee, `None` for one whose shape
+/// is not known in this scope.
+fn pointer_metadata(
+    &mut self,
+    assumption_context: TypeEnvIdx,
+    pointee: TypeIndex,
+    size: TypeIndex,
+) -> Result<Option<TypeIndex>, SolverError>
+```
+
+| Pointee | Metadata |
+|---|---|
+| a `Sized` type | `()` |
+| `[T]` | `(size, metadata(T))` |
+| a struct, a tuple | the tuple of its fields' metadata in declaration order, `()` skipped |
+| an abstract type not assumed `Sized`, or a type holding one (`Wrap<T>`) | `None` |
+
+Interning does the collapsing: an empty tuple is `UNIT` and a tuple of one
+is its element, so `[u8]` gives `(Size, ())`, which is `Size`. Skipping `()`
+fields inside a longer tuple is explicit. In `heap` (`Size = u32`):
+
+| Pointee | Metadata |
+|---|---|
+| `u32`, `[u8; 4]` | `()` |
+| `[u8]` | `u32` |
+| `[[f32]]` | `(u32, u32)`: rows, columns |
+| `Message(header: u32, payload: [u8], checksum: [u8])` | `(u32, u32)` |
+| `Image(pixels: [[u8]], palette: [u32])` | `((u32, u32), u32)` |
+
+and in an abstract memory each `u32` is `M::Size`. A slice of slices is
+rectangular: every element shares the one inner metadata.
+
+- A pointer's representation is its address, then
+  `push_stack_elements(metadata)`, which already flattens nested tuples;
+  `push_stack_elements`, `layout.rs`'s pointer piece and `eval.rs` read it
+  in place of `is_fat_pointee`'s yes/no.
+- A layout's `Count(i)` (see "Layouts are expressions") is the i-th element
+  of the flattened metadata, the order the representation uses.
+- `None` is not `UNIT`: in `struct Box<M: Memory, T>(p: M::*T)`, `T` may be
+  `u32`, `[u8]` or `[[u8]]`, so no type describes `M::*T`'s metadata, and
+  answering `()` would commit to a thin pointer. `ERROR` would silence
+  diagnostics wherever it spread, and a precondition on the caller would
+  make each caller repeat the walk.
+- **The `Option` is a stopgap, not the design.** The intended
+  `pointer_metadata` returns a plain `TypeIndex` for every pointee, and an
+  unknown shape is the projection `<T as Pointee<M::Size>>::Metadata`
+  (or `<T as Pointee>::Metadata<M::Size>`, if the size goes on the member
+  as a generic associated type instead of on the trait), rigid until `T` is
+  known, as `T::Item` is. `pointer_metadata(T, M::Size)` is then that
+  trait's structural answer (`TraitImplLookup::Builtin`, as `StackValue`'s),
+  and an abstract pointee's metadata goes through the solver like any other
+  projection, so a pointer to one has a representation instead of none
+  (`Box<M, T>` passes, its `Repr` reduced after monomorphization). It
+  needs a trait with a parameter, which wx does not have (the planned route
+  is a generic associated type, `notes/generic-associated-types.md`); until
+  then `None`
+  stands for that projection, and code reading `None` treats it as one
+  would be treated: unknown, never thin.
+
+**Layouts are expressions** over that metadata (see "Sized"). A field's
+offset is one too. Since wx orders fields itself, a struct places its sized
+fields first, alignment-sorted as today, and its unsized fields after them
+in declaration order: every sized field keeps a constant offset
+(`p.header` through a `heap::&Message` is as cheap as through a sized
+struct), and only an unsized field after the first one has a runtime offset.
+
+**Not exposed.** The metadata is the compiler's: no `Pointee` trait, no
+metadata type, no `from_raw_parts` over it. Naming it in the language
+takes a trait over the memory's size,
+
+```wx
+trait Pointee<Size: PointerSize> {
+    type Metadata: StackValue;
+}
+```
+
+and wx has no generic traits. Until then:
+
+- `len()` on a slice reads the first count, as it does now.
+- `s[i]` on a `heap::&[[u8]]` is a place of `[u8]`, not loadable, and
+  `s[i].&` is a `heap::&[u8]` carrying the inner count: one row. Its offset
+  is `i` times the element's size, a runtime value.
+- A pointer to an unsized struct is built only by `transmute` from its
+  representation, which is fixed and does not change when the trait comes.
+- Generic code sees only `Sized` elements, the one bound it can state; a
+  function over both `[u32]` and `[[u8]]` needs the trait (or a `?Sized`
+  opt-out).
+- Turning a size or an offset that reads a count into instructions is
+  MIR's. Until then a place step whose offset reads one is refused.
 
 ### Open
 
-- **Unsized fields.** `struct S(n: u32, tail: [u8])` is neither `Sized` nor
-  a `StackValue`, so the question is what a pointer to it is. Rust allows an
-  unsized type only as the last field (and a tuple's last element), and a
-  pointer's metadata is that tail's, recursively (`<S as Pointee>::Metadata`
-  is `<[u8] as Pointee>::Metadata`, the tail's element count, not a size in
-  bytes); a second unsized field is an error. Building one goes through an
-  unsizing coercion from a sized version or `from_raw_parts`. In wx the tail
-  would also have to be exempt from alignment-sorting. Undecided: Rust's
-  rule, or refusing a concrete field type that is neither (a generic field
-  stays unchecked), which can be relaxed later.
-- Pointer metadata as a type (`Pointee`), and `dyn`.
+- `Pointee<Size>`, so an abstract pointee's metadata is the projection
+  `<T as Pointee<M::Size>>::Metadata` instead of `None`; needs generic
+  traits. And `dyn`.
 - Implied bounds instead of written ones (see above).
 
 ## Lengths are counts
@@ -505,16 +612,16 @@ pub trait Sized {
 | `M::&T`, `M::*T` | always | `M::Size`'s width |
 | `M::&[T]`, `M::*[T]` | always | twice `M::Size`'s width |
 | `[T; N]` | iff `T` is | `N * T::SIZE` / `T::ALIGN` |
-| `[T]` | no | |
+| `[T]` | no | size `Count * T`'s size, at runtime / `T::ALIGN` |
 | `funcref`, `func(A) -> R` | no | (a reference has no bytes in linear memory) |
 | a type parameter, a projection | iff assumed | rigid |
 
 - A pointer is always `Sized`: its address is `M::Size`, always a
   `PointerSize` member. Over an abstract memory its `SIZE` is rigid until the
   memory is known, as `Array::LEN` is over an abstract `Self`.
-- The judgement is the walk `layout.rs`'s `piece` already does: it answers
-  `None` for exactly the references, parameters and projections, and the
-  solver's walk takes an abstract part as `Sized` when it is assumed so.
+- The judgement is `layout.rs`'s walk, which answers a layout or `None` (the
+  references, and parameters and projections not assumed `Sized`); see
+  "Layouts are expressions" below.
 - This is not the rule for by-value positions (see "Slices and arrays"):
   `[u8; 16]` is `Sized` and cannot be a local, a struct holding a `funcref` is
   not `Sized` and can. `Sized` says whether a type has bytes, and every
@@ -527,8 +634,41 @@ Where it is required:
   the whole pointee's layout, and a load or a store needs its bytes. So
   `func get<M: Memory, T>(p: M::&T) -> T { p.* }` needs `T: Sized`, which says
   that a `funcref` cannot be loaded from memory.
-- An element of a slice or array is `Sized` by its well-formedness, and
-  `Slice::Value: Sized` gives it to code bounded by `Slice`.
+- An element of an array is `Sized` by its well-formedness; an element of a
+  slice only needs a layout, so `[[u8]]` is well-formed. `Slice::Value`
+  carries no bound (`[[u8]]`'s is `[u8]`); generic code that loads elements
+  states `Value: Sized`.
+
+### Layouts are expressions
+
+`Sized` means a size known at compile time, unsized a size computed at
+runtime. `layout.rs`'s walk returns, instead of a number, an expression
+over the pointer's metadata, and an alignment, always a number (the largest
+of the parts'; metadata never changes it):
+
+```
+Size = Const(n) | Count(i) | Add(Size, Size) | Mul(Size, Size) | AlignUp(Size, align)
+```
+
+`Count(i)` is the i-th element of the flattened metadata type.
+
+| Type | Size | Align |
+|---|---|---|
+| `u32` | `4` | 4 |
+| `[u32; 3]` | `12` | 4 |
+| `[u32]` | `Count(0) * 4` | 4 |
+| `[[u8]]` | `Count(0) * Count(1)` | 1 |
+| `Image(pixels: [[u8]], palette: [u32])` | `AlignUp(Count(0) * Count(1), 4) + Count(2) * 4` | 4 |
+
+A type is `Sized` when its expression reads no `Count`, and `SIZE` is that
+expression folded. A leaf may also be a constant that is rigid in TIR (`N`
+in `[T; N]` over an abstract type): it is still known at compile time,
+resolved by monomorphization, so the type is `Sized`. The two kinds of leaf
+are the line: constants are compile time, counts are runtime. Field offsets
+are the same expressions (see "Unsized fields"), and MIR lowers the ones
+that read a count to arithmetic on the metadata the pointer carries. A type
+with no layout (a reference, an abstract type of unknown shape) is no
+expression at all.
 - Not on a pointer type: `M::&T` for a `T` not `Sized` is well-formed, as in
   Rust, or every trait with a `self: M::&Self` method (`Allocator`) would need
   `Sized` as a supertrait. If a useless `heap::&funcref` should be refused,
@@ -601,8 +741,11 @@ Each step ends with tests green.
 5. Values are `StackValue`s: value positions (parameters, results, function
    types' parts, locals, ascriptions) proved `StackValue` by declared bounds,
    with a suggestion to add the bound; fields, tuple elements and type
-   arguments free; E2130 and `may_be_slice` removed, E2129 reworded; a
-   pointer to a pointee of unknown shape held as a rigid `Repr`; std's
+   arguments free (see "Unsized fields"); a pointer's representation from
+   its pointee's metadata (`pointer_metadata` replacing `is_fat_pointee`),
+   first, since the positions read it; E2130 and `may_be_slice` removed,
+   E2129 reworded; a pointer to a pointee of unknown shape held as a rigid
+   `Repr`; std's
    generic functions given `T: StackValue`. Needs nothing new. Done ahead of
    it: `!` held as `!`.
 6. Fit clauses: the `where { const NAME: ty }` syntax, `FitClause`, the
@@ -611,8 +754,10 @@ Each step ends with tests green.
    trait constant (`Array::LEN`) and its use over a concrete type.
 7. `Sized`: the intrinsic trait, answered structurally by the solver on
    `layout.rs`'s walk; `SIZE`/`ALIGN` in `resolve_constant`; the requirement
-   on place steps through a pointer; `Slice::Value: Sized` and the
-   well-formedness of slices and arrays; arrays laid out in memory (so arrays
+   on place steps through a pointer; layouts as expressions over the
+   metadata, with sized fields placed before unsized ones; the
+   well-formedness of slices (an element with a layout) and arrays (a
+   `Sized` element); arrays laid out in memory (so arrays
    of arrays and fields holding arrays evaluate); a load or a store needing
    the pointee `Sized` and the value a `StackValue`;
    `size_of`/`align_of` removed, `Layout` and `RawPtr` rewritten on it. Needs
