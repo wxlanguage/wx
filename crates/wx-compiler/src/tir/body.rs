@@ -86,6 +86,9 @@ pub(super) enum ExprObligation {
 	/// A `match`'s exhaustiveness and unreachable arms: a pattern compares
 	/// with a constant's value.
 	Match(ExprIdx),
+	/// An untyped constant `expr` (`const X: {integer}`) was given the type
+	/// `target`: its value fits it, as a literal's would.
+	Fit { expr: ExprIdx, target: TypeIndex },
 }
 
 /// What building a body left undecided, beside the body: a function's or a

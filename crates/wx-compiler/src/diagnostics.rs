@@ -247,6 +247,9 @@ define_diagnostic_codes! {
 		PositionalOnlyCall => "E2123",
 		ImplStricterThanTrait => "E2124",
 		CannotIndex => "E2125",
+		NotALiteralKind => "E2126",
+		LiteralKindWithoutBraces => "E2127",
+		MisplacedLiteralKind => "E2128",
 	}
 }
 

@@ -1882,6 +1882,8 @@ impl IntrinsicDefs {
 			(self.f32, TypeIndex::F32),
 			(self.f64, TypeIndex::F64),
 			(self.funcref, TypeIndex::FUNCREF),
+			(self.integer_kind, TypeIndex::INTEGER_LITERAL),
+			(self.char_kind, TypeIndex::CHAR_LITERAL),
 		]
 		.into_iter()
 		.find_map(|(slot, ty)| (slot == Some(idx)).then_some(ty))

@@ -142,6 +142,10 @@ pub(super) enum ConstValueState {
 	/// Being checked or evaluated; asking for it again closes a loop.
 	InProgress,
 	Evaluated(ConstValue),
+	/// The value of an untyped constant (`const X: {integer}`): a number of
+	/// its kind, exact, with no type until a use gives it one
+	/// (`TypeContext::exact_value`).
+	Exact(i128),
 	/// Not evaluated at all: the evaluator holds no values of its type
 	/// (`check_value_type`), or it has no initializer. A constant that reads
 	/// it is not a constant expression.
@@ -159,7 +163,9 @@ impl ConstValueState {
 		match self {
 			Self::Unchecked | Self::Checked | Self::InProgress => None,
 			Self::Evaluated(value) => Some(Ok(value)),
-			Self::NoValue => Some(Err(Unevaluable::NoValue)),
+			// Read as a number of a type only through `exact_value`, by the
+			// use that gives it one.
+			Self::NoValue | Self::Exact(_) => Some(Err(Unevaluable::NoValue)),
 			Self::Poisoned | Self::Failed(_) => Some(Err(Unevaluable::Silent)),
 		}
 	}
@@ -320,9 +326,37 @@ impl TypeContext<'_, '_, '_> {
 	/// The bits of `instance`'s one number, as a type means it; `None` when
 	/// it has no such value, which its check or the site naming it reports.
 	pub(super) fn instance_bits(&mut self, instance: Instance) -> Option<u64> {
+		// An untyped constant is a count where a type reads it.
+		if self.constants[usize::from(instance.constant)]
+			.ty
+			.is_literal()
+		{
+			return self
+				.exact_value(instance.constant)
+				.ok()
+				.and_then(|value| u64::try_from(value).ok());
+		}
 		self.instance_value(instance, None)
 			.ok()
 			.and_then(value_bits)
+	}
+
+	/// The value of an untyped constant (`const X: {integer}`), memoized and
+	/// read on the solver's stack as any constant's is. `Err` as
+	/// `const_value`'s.
+	pub(super) fn exact_value(
+		&mut self,
+		const_index: ConstIdx,
+	) -> Result<i128, Unevaluable> {
+		let instance = Instance::of(const_index);
+		if let Err(Unevaluable::Silent) = self.instance_value(instance, None) {
+			return Err(Unevaluable::Silent);
+		}
+		match *self.solver.const_state(instance) {
+			ConstValueState::Exact(value) => Ok(value),
+			ConstValueState::NoValue => Err(Unevaluable::NoValue),
+			_ => Err(Unevaluable::Silent),
+		}
 	}
 
 	/// A constant's value as a pattern compares with it: the bits of its one
@@ -605,9 +639,19 @@ impl TypeContext<'_, '_, '_> {
 			constant: const_index,
 			args: &args,
 		};
-		let scalars = self.constant_scalars(owner);
+		// An untyped constant's value is one exact number of its kind.
+		let untyped = self.constants[usize::from(const_index)].ty.is_literal();
+		let scalars = if untyped {
+			Ok(Vec::new())
+		} else {
+			self.constant_scalars(owner)
+		};
 		let mut stack = Vec::new();
+		let mut exact = None;
 		let evaluated = match &scalars {
+			Ok(_) if untyped => self
+				.eval_exact(owner, root)
+				.map(|value| exact = Some(value)),
 			Ok(_) => self.eval(owner, root, &mut stack),
 			Err(_) => Ok(()),
 		};
@@ -627,6 +671,7 @@ impl TypeContext<'_, '_, '_> {
 		};
 
 		let state = match evaluated {
+			Ok(()) if let Some(value) = exact => ConstValueState::Exact(value),
 			Ok(())
 				if stack
 					.iter()
@@ -898,6 +943,48 @@ impl TypeContext<'_, '_, '_> {
 			}
 		}
 		Ok(())
+	}
+
+	/// The exact value of a node of an untyped constant's body: a literal of
+	/// its kind, another untyped constant, or `-` and a binary operator over
+	/// them, computed as mathematical integers (in `i128`), since the value
+	/// has no type yet; each use checks it fits the type it is given.
+	fn eval_exact(
+		&mut self,
+		owner: Owner<'_>,
+		expr: ExprIdx,
+	) -> Result<i128, Halt> {
+		let body = body_of(self, owner.constant);
+		let (kind, ty, span) =
+			(body.kind(expr), body.ty(expr), body.span(expr));
+		if ty == TypeIndex::ERROR {
+			return Err(Halt::Silent);
+		}
+		let own = |kind| Halt::Own(EvalError { span, kind });
+		match kind {
+			ExprKind::Int(value) => Ok(i128::from(value)),
+			ExprKind::Char(value) => Ok(i128::from(u32::from(value))),
+			ExprKind::Const { constant, .. } => {
+				self.exact_value(constant).map_err(|error| match error {
+					Unevaluable::NoValue => own(EvalErrorKind::NotConst),
+					Unevaluable::Silent => Halt::Silent,
+				})
+			}
+			ExprKind::PrimitiveUnary {
+				op: UnaryOp::InvertSign,
+				operand,
+			} => self
+				.eval_exact(owner, operand)?
+				.checked_neg()
+				.ok_or(own(EvalErrorKind::Overflow(Operation::Negate))),
+			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
+				let a = self.eval_exact(owner, lhs)?;
+				let b = self.eval_exact(owner, rhs)?;
+				exact_binary(op, a, b).map_err(own)
+			}
+			ExprKind::Error => Err(Halt::Silent),
+			_ => Err(own(EvalErrorKind::NotConst)),
+		}
 	}
 
 	/// A string literal's value: its contents, placed as static data.
@@ -1186,6 +1273,25 @@ impl TypeContext<'_, '_, '_> {
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
 		match self.resolve_constant(constant, args) {
+			Ok(ResolvedConstant::Instance(instance))
+				if self.constants[usize::from(instance.constant)]
+					.ty
+					.is_literal() =>
+			{
+				let value = match self.exact_value(instance.constant) {
+					Ok(value) => value,
+					Err(Unevaluable::NoValue) => {
+						return Err(Halt::Own(EvalError {
+							span,
+							kind: EvalErrorKind::NotConst,
+						}));
+					}
+					Err(Unevaluable::Silent) => return Err(Halt::Silent),
+				};
+				// Its use checked that the value fits.
+				stack.push(exact_scalar(value, ty).ok_or(Halt::Silent)?);
+				Ok(())
+			}
 			Ok(ResolvedConstant::Instance(instance)) => {
 				let file_id =
 					self.defs.constants[usize::from(owner.constant)].file_id;
@@ -1646,6 +1752,53 @@ fn write_value(
 		let size = primitive.size() as usize;
 		bytes[at as usize..][..size]
 			.copy_from_slice(&bits.to_le_bytes()[..size]);
+	}
+}
+
+/// An untyped constant's exact `value` as a value of `ty`, the type its use
+/// gave it: a `Char`, an integer or a float. `None` when it does not fit,
+/// which that use reports.
+fn exact_scalar(value: i128, ty: TypeIndex) -> Option<ConstScalar> {
+	if ty == TypeIndex::CHAR {
+		return char::from_u32(u32::try_from(value).ok()?)
+			.map(ConstScalar::char);
+	}
+	match Scalar::from_type(ty)? {
+		Scalar::F32 => Some(ConstScalar::f32(value as f32)),
+		Scalar::F64 => Some(ConstScalar::f64(value as f64)),
+		scalar => literal(
+			u64::try_from(value.unsigned_abs()).ok()?,
+			value < 0,
+			scalar,
+		),
+	}
+}
+
+/// `a op b` on two exact integers: `Err` when the result is outside `i128`,
+/// for a zero divisor, or a shift amount that is negative or past the
+/// width. Division truncates and a remainder has the dividend's sign, as
+/// wasm's `div_s`/`rem_s`; a right shift is arithmetic.
+fn exact_binary(op: BinaryOp, a: i128, b: i128) -> Result<i128, EvalErrorKind> {
+	let overflow = EvalErrorKind::Overflow(Operation::Binary(op));
+	let shift = || u32::try_from(b).ok().filter(|&shift| shift < i128::BITS);
+	match op {
+		BinaryOp::Add => a.checked_add(b).ok_or(overflow),
+		BinaryOp::Sub => a.checked_sub(b).ok_or(overflow),
+		BinaryOp::Mul => a.checked_mul(b).ok_or(overflow),
+		BinaryOp::Div if b == 0 => Err(EvalErrorKind::DivisionByZero),
+		BinaryOp::Rem if b == 0 => Err(EvalErrorKind::RemainderByZero),
+		BinaryOp::Div => a.checked_div(b).ok_or(overflow),
+		BinaryOp::Rem => a.checked_rem(b).ok_or(overflow),
+		BinaryOp::BitAnd => Ok(a & b),
+		BinaryOp::BitOr => Ok(a | b),
+		BinaryOp::BitXor => Ok(a ^ b),
+		// Exact: no bit is shifted out.
+		BinaryOp::LeftShift => shift()
+			.map(|shift| a << shift)
+			.filter(|&shifted| shifted >> shift().unwrap() == a)
+			.ok_or(overflow),
+		BinaryOp::RightShift => shift().map(|shift| a >> shift).ok_or(overflow),
+		_ => unreachable!("an untyped operator is arithmetic"),
 	}
 }
 
@@ -2611,5 +2764,147 @@ mod tests {
 		);
 		case.diagnostics()
 			.assert_error(DiagnosticCode::ConstEvaluationFailed);
+	}
+
+	fn exact(case: &TestCase<'_>, name: &str) -> i128 {
+		match case.state(name) {
+			ConstValueState::Exact(value) => *value,
+			state => panic!("expected `{name}` to be untyped: {state:?}"),
+		}
+	}
+
+	#[test]
+	fn an_untyped_constant_takes_the_type_of_each_use() {
+		test_case!(
+			case = indoc! {r#"
+				const X: {integer} = 200 + 55;
+				const A: u8 = X;
+				const B: i64 = -X;
+				const C: u32 = X * 2;
+				const F: f32 = X;
+				const U: {char} = 'u';
+				const CODE: u8 = U;
+				const LETTER: Char = U;
+			"#}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(exact(&case, "X"), 255);
+		assert_eq!(case.value("A"), [ConstScalar::u8(255)]);
+		assert_eq!(case.value("B"), [ConstScalar::i64(-255)]);
+		assert_eq!(case.value("C"), [ConstScalar::u32(510)]);
+		assert_eq!(case.value("F"), [ConstScalar::f32(255.0)]);
+		assert_eq!(exact(&case, "U"), 117);
+		assert_eq!(case.value("CODE"), [ConstScalar::u8(117)]);
+		assert_eq!(case.value("LETTER"), [ConstScalar::char('u')]);
+	}
+
+	/// The value has no type yet, so nothing in between is bounded by one.
+	/// A typed use types each operand, as it would literals: `BIG >> 66` in a
+	/// `u8` is `BIG` as a `u8`.
+	#[test]
+	fn an_untyped_constant_is_computed_exactly() {
+		test_case!(
+			case = indoc! {r#"
+				const BIG: {integer} = 1 << 70;
+				const SHIFTED: {integer} = BIG >> 66;
+				const SMALL: u8 = SHIFTED;
+				const TYPED_OPERAND: u8 = BIG >> 66;
+				const MINUS_ONE: {integer} = 0 - 1;
+				const SIGNED: i8 = MINUS_ONE;
+				const TOO_BIG: {integer} = 1 << 127;
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::ConstEvaluationFailed,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`BIG` is `1180591620717411303424`, out of range for `u8`",
+		);
+		case.diagnostics()
+			.assert_error_saying("evaluation of constant `TOO_BIG` failed");
+		assert_eq!(exact(&case, "BIG"), 1 << 70);
+		assert_eq!(case.value("SMALL"), [ConstScalar::u8(16)]);
+		assert_eq!(case.value("SIGNED"), [ConstScalar::i8(-1)]);
+	}
+
+	#[test]
+	fn an_untyped_constant_is_checked_where_it_is_used() {
+		test_case!(
+			case = indoc! {r#"
+				const X: {integer} = 300;
+				const MINUS: {integer} = -1;
+				const A: u8 = X;
+				const B: u16 = X;
+				func f() -> u32 { MINUS }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+		case.diagnostics()
+			.assert_error_saying("`X` is `300`, out of range for `u8`");
+		case.diagnostics()
+			.assert_error_saying("`MINUS` is `-1`, out of range for `u32`");
+		assert_eq!(case.value("B"), [ConstScalar::u16(300)]);
+	}
+
+	/// No default type: an untyped constant needs a use that gives one, as
+	/// a literal does.
+	#[test]
+	fn an_untyped_constant_has_no_default_type() {
+		test_case!(
+			case = indoc! {r#"
+				const X: {integer} = 4;
+				func f() { local x = X; }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+	}
+
+	#[test]
+	fn an_untyped_constant_holds_only_its_kind() {
+		test_case!(
+			case = indoc! {r#"
+				const LETTER: {integer} = 'a';
+				const TYPED: u32 = 4;
+				const NAMED: {integer} = TYPED;
+				const NUMBER: {char} = 'a' + 1;
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(exact(&case, "NUMBER"), 98);
+	}
+
+	/// A length is a count: an untyped constant fits it by value.
+	#[test]
+	fn an_untyped_constant_is_an_array_length() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: {integer} = 2 * 2;
+				const NEGATIVE: {integer} = -4;
+				const HUGE: {integer} = 1 << 40;
+				const S: heap::&[u8; N] = "abcd";
+				const T: heap::&[u8; NEGATIVE] = "abcd";
+				func g(p: heap::&[u8; HUGE]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+		case.diagnostics().assert_error_saying(
+			"an array's length is a count, but `NEGATIVE` is `-4`",
+		);
+		let [address, ..] = case.value("S") else {
+			panic!("expected an address");
+		};
+		assert_eq!(*case.pointee(*address).0.bytes, *b"abcd");
 	}
 }

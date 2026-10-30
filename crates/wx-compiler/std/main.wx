@@ -31,6 +31,13 @@ pub struct Char(value: u32);
 /// A reference to a function of any signature: a Wasm `funcref`.
 pub type funcref;
 
+/// The literal kinds, written `{integer}` and `{char}`: the type of a literal
+/// that has no type yet, and of an untyped constant
+/// (`const X: {integer} = 4;`), which takes its type where it is used.
+pub type integer;
+
+pub type char;
+
 /// Aborts execution by trapping: normal control flow never continues past a
 /// call to `trap`, so it has the bottom type `!`.
 pub func trap() -> !;

@@ -3005,6 +3005,12 @@ impl<'a> Builder<'a> {
 				let segments = self.build_type_path(segments);
 				self.build_qualified_path(inner_node, None, segments)
 			}
+			ast::TypeExpression::Literal { inner } => {
+				let open = self.text(Text::LBrace);
+				let inner = self.build_type_expression(&inner.inner);
+				let close = self.text(Text::RBrace);
+				self.arena.concat3(open, inner, close)
+			}
 			// The formatter never runs on a file that failed to parse.
 			ast::TypeExpression::Error => unreachable!(),
 			ast::TypeExpression::Infer => self.text(Text::Underscore),

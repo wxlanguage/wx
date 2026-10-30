@@ -1568,6 +1568,9 @@ pub enum TypeExpression {
 		inner: Box<Spanned<TypeExpression>>,
 		segments: Box<[PathSegment]>,
 	},
+	/// `{integer}`: a literal kind, the type of a literal that has none yet.
+	/// The braces hold any type; TIR checks that it names a literal kind.
+	Literal { inner: Box<Spanned<TypeExpression>> },
 }
 
 /// A pattern, as written. What each term *is* follows from its own shape:
@@ -3498,6 +3501,17 @@ impl<'ctx> Parser<'ctx> {
 				})
 			}
 			Token::OpenParen => self.parse_tuple_or_paren_type_expression(),
+			Token::OpenBrace => {
+				let open = self.lexer.next().span; // consume `{`
+				let inner = self.parse_type_expression()?;
+				let close = self.next_expect(Token::CloseBrace)?.span;
+				Ok(Spanned {
+					inner: TypeExpression::Literal {
+						inner: Box::new(inner),
+					},
+					span: TextSpan::new(open.start, close.end),
+				})
+			}
 			Token::LeftArrow => {
 				let open_span = self.lexer.next().span; // consume `<`
 				self.parse_qualified_path_type_expression(open_span)

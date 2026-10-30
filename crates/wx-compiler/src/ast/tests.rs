@@ -3317,6 +3317,20 @@ fn test_turbofish_on_any_other_expression_is_an_error() {
 // ── remaining type expressions ───────────────────────────────────────────────
 
 #[test]
+fn test_literal_kind_type() {
+	let case = TestCase::new("const X: {integer} = 4;");
+	case.diagnostics().assert_none();
+	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
+		panic!("expected a typed constant");
+	};
+	let TypeExpression::Literal { inner } = &ty.inner else {
+		panic!("expected a literal kind");
+	};
+	assert!(matches!(inner.inner, TypeExpression::Path(_)));
+	assert_eq!(ty.span, TextSpan::new(9, 18));
+}
+
+#[test]
 fn test_never_type() {
 	let case = TestCase::new("func f(a: !) -> ! {}");
 	case.diagnostics().assert_none();

@@ -690,6 +690,10 @@ pub struct IntrinsicDefs {
 	pub bool: Option<EnumIdx>,
 	pub char: Option<StructIdx>,
 	pub funcref: Option<TypeAliasIdx>,
+	/// The literal kinds `integer` and `char`, written `{integer}` and
+	/// `{char}`: the types of literals that have no type yet.
+	pub integer_kind: Option<TypeAliasIdx>,
+	pub char_kind: Option<TypeAliasIdx>,
 	pub add: Option<TraitIdx>,
 	pub sub: Option<TraitIdx>,
 	pub mul: Option<TraitIdx>,
@@ -756,6 +760,8 @@ impl IntrinsicDefs {
 			"f32" => &mut self.f32,
 			"f64" => &mut self.f64,
 			"funcref" => &mut self.funcref,
+			"integer" => &mut self.integer_kind,
+			"char" => &mut self.char_kind,
 			_ => return None,
 		})
 	}

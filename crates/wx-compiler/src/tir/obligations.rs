@@ -558,6 +558,42 @@ impl TypeContext<'_, '_, '_> {
 		{
 			return Ok(());
 		}
+		// An untyped integer constant is a count: its value fits the length's
+		// type, as a literal length's does.
+		if found == TypeIndex::INTEGER_LITERAL {
+			let Ok(value) = self.exact_value(constant) else {
+				return Ok(());
+			};
+			return match u64::try_from(value) {
+				Ok(bits) => self.check_constant_fits(
+					assumption_context,
+					expected,
+					bits,
+					reference,
+				),
+				Err(_) => {
+					let message = format!(
+						"an array's length is a count, but `{}` is `{value}`",
+						self.strings
+							.resolve(
+								self.defs.constants[usize::from(constant)]
+									.name
+									.inner
+							)
+							.unwrap()
+					);
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::IntegerLiteralOutOfRange.code(),
+							)
+							.with_message(message)
+							.with_label(reference.primary_label()),
+					);
+					Err(SolverError::Poisoned)
+				}
+			};
+		}
 		let formatter = self.type_formatter();
 		let (expected, found) = (
 			formatter.display_type(expected),

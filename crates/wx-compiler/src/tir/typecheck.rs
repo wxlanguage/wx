@@ -165,6 +165,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				ExprObligation::Match(expr) => {
 					self.check_match_usefulness(expr)
 				}
+				ExprObligation::Fit { expr, target } => {
+					self.decide_fit(expr, target)
+				}
 			}
 		}
 	}
@@ -1947,7 +1950,22 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.body.set_ty(expr, TypeIndex::ERROR);
 			return;
 		}
+		// An untyped constant's body is of its kind already, and stays
+		// untyped.
+		if target.is_literal() {
+			let actual = self.body.ty(expr);
+			if actual != target {
+				let diagnostic =
+					self.report_type_mismatch(target, actual, expr);
+				self.cx.diagnostics.push(diagnostic);
+				self.body.set_ty(expr, TypeIndex::ERROR);
+			}
+			return;
+		}
 		match self.body.kind(expr) {
+			ExprKind::Const { .. } => {
+				return self.coerce_constant(expr, target);
+			}
 			ExprKind::String(_)
 			| ExprKind::Array { .. }
 			| ExprKind::ArrayRepeat { .. } => {
@@ -1989,15 +2007,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			_ => {}
 		}
-		// The common case: one concrete scalar, held on the stack.
-		if Integer::from_type(target).is_some()
-			|| Float::from_type(target).is_some()
-			|| target == TypeIndex::CHAR
-		{
-			let single = [LiteralTarget::Target(target)];
-			return self.coerce_against(expr, target, &single);
-		}
-		let targets = self.typeset_targets(target);
+		let targets = self.literal_targets(target);
 		if targets.is_empty() {
 			self.cx
 				.diagnostics
@@ -2005,6 +2015,100 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
 		self.coerce_against(expr, target, &targets);
+	}
+
+	/// The scalars a literal of type `target` must fit: the one concrete
+	/// scalar, held on the stack (the common case), or every member of every
+	/// typeset an abstract `target` assumes. Empty when no literal can have
+	/// type `target`.
+	fn literal_targets(&self, target: TypeIndex) -> Vec<LiteralTarget> {
+		if Integer::from_type(target).is_some()
+			|| Float::from_type(target).is_some()
+			|| target == TypeIndex::CHAR
+		{
+			return vec![LiteralTarget::Target(target)];
+		}
+		self.typeset_targets(target)
+	}
+
+	/// Gives an untyped constant the type `target`. Whether its value fits is
+	/// decided once values exist (`decide_fit`), as a constant's body reads
+	/// none.
+	fn coerce_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
+		if self.literal_targets(target).is_empty() {
+			self.cx
+				.diagnostics
+				.push(self.report_unable_to_coerce(expr, target));
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		}
+		self.body.set_ty(expr, target);
+		self.obligations
+			.exprs
+			.push(ExprObligation::Fit { expr, target });
+	}
+
+	/// Decides a recorded `Fit`: the untyped constant `expr` names has a
+	/// value of its kind that fits `target`, as a literal of that value
+	/// would. A constant without a value reports itself.
+	fn decide_fit(&mut self, expr: ExprIdx, target: TypeIndex) {
+		let ExprKind::Const { constant, .. } = self.body.kind(expr) else {
+			unreachable!("only a constant's fit is decided")
+		};
+		let Ok(value) = self.cx.exact_value(constant) else {
+			return;
+		};
+		let kind = self.cx.constants[usize::from(constant)].ty;
+		let targets = self.literal_targets(target);
+		let name = self.cx.defs.constants[usize::from(constant)].name.inner;
+		let name = self.cx.strings.resolve(name).unwrap().to_owned();
+		let out_of_range = |this: &mut Self| {
+			let message = format!(
+				"`{name}` is `{value}`, out of range for `{}`",
+				this.cx.type_formatter().display_type(target)
+			);
+			this.push_error(
+				DiagnosticCode::IntegerLiteralOutOfRange,
+				message,
+				expr,
+			);
+		};
+		if kind == TypeIndex::CHAR_LITERAL {
+			// A character is a `Char`, or an integer its code point fits.
+			for fit in &targets {
+				if fit.ty() == TypeIndex::CHAR {
+					continue;
+				}
+				match Integer::from_type(fit.ty()) {
+					Some(integer)
+						if u64::try_from(value).is_ok_and(|code| {
+							integer.in_range(code, false)
+						}) => {}
+					Some(_) if matches!(fit, LiteralTarget::Target(_)) => {
+						return out_of_range(self);
+					}
+					_ => return self.report_misfit(expr, target, fit),
+				}
+			}
+			return;
+		}
+		let Ok(magnitude) = u64::try_from(value.unsigned_abs()) else {
+			return out_of_range(self);
+		};
+		let negated = value < 0;
+		for fit in &targets {
+			if fit.fits_int(magnitude, negated) {
+				continue;
+			}
+			return match fit {
+				LiteralTarget::Target(ty)
+					if Integer::from_type(*ty).is_some() =>
+				{
+					out_of_range(self)
+				}
+				_ => self
+					.report_int_misfit(expr, magnitude, negated, target, fit),
+			};
+		}
 	}
 
 	/// `coerce` against the scalars a literal must fit: `target`'s own, or

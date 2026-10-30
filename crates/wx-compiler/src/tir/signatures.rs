@@ -1601,17 +1601,46 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		name: Spanned<SymbolU32>,
 		ty: Option<&Spanned<ast::TypeExpression>>,
 	) -> SignatureLocation {
+		let lexical = LexicalScope {
+			file_id,
+			namespace,
+			env: scope,
+		};
+		let policy = InferPolicy::Reject(InferSignatureKind::Const);
 		let ty = match ty {
-			Some(ty) => self.resolve_type(
-				obligations,
-				LexicalScope {
-					file_id,
-					namespace,
-					env: scope,
-				},
-				ty,
-				InferPolicy::Reject(InferSignatureKind::Const),
-			),
+			// An untyped constant, `const X: {integer} = 4`. A free one only,
+			// for now: an impl's or a trait's would need its fit stated in
+			// bounds.
+			Some(Spanned {
+				inner: ast::TypeExpression::Literal { inner },
+				span,
+			}) => {
+				let kind = self.resolve_literal_kind(
+					obligations,
+					lexical,
+					inner,
+					policy,
+				);
+				if scope == TypeEnvIdx::ROOT || kind == TypeIndex::ERROR {
+					kind
+				} else {
+					self.diagnostics.push(
+						Diagnostic::bug()
+							.with_code(
+								DiagnosticCode::UnsupportedExpression.code(),
+							)
+							.with_message(
+								"an untyped constant in an impl is not \
+								 supported by the checker yet",
+							)
+							.with_label(
+								SourceSpan::new(file_id, *span).primary_label(),
+							),
+					);
+					TypeIndex::ERROR
+				}
+			}
+			Some(ty) => self.resolve_type(obligations, lexical, ty, policy),
 			None => {
 				self.diagnostics
 					.push(report_missing_constant_type(file_id, name));
@@ -3850,12 +3879,63 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 			},
 			ast::TypeExpression::Never => TypeIndex::NEVER,
-			ast::TypeExpression::Path(segments) => self.resolve_type_path(
-				obligations,
-				scope,
-				segments,
-				infer_policy,
-			),
+			ast::TypeExpression::Path(segments) => {
+				let ty = self.resolve_type_path(
+					obligations,
+					scope,
+					segments,
+					infer_policy,
+				);
+				if !ty.is_literal() {
+					return ty;
+				}
+				let name = self.type_formatter().display_type(ty);
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::LiteralKindWithoutBraces.code(),
+						)
+						.with_message(format!(
+							"`{}` is a literal kind, written `{name}`",
+							&name[1..name.len() - 1]
+						))
+						.with_label(
+							SourceSpan::new(scope.file_id, type_expr.span)
+								.primary_label()
+								.with_message(format!("write `{name}`")),
+						),
+				);
+				TypeIndex::ERROR
+			}
+			ast::TypeExpression::Literal { inner } => {
+				if self.resolve_literal_kind(
+					obligations,
+					scope,
+					inner,
+					infer_policy,
+				) == TypeIndex::ERROR
+				{
+					return TypeIndex::ERROR;
+				}
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::MisplacedLiteralKind.code())
+						.with_message(
+							"a literal kind is only the type of a constant",
+						)
+						.with_label(
+							SourceSpan::new(scope.file_id, type_expr.span)
+								.primary_label()
+								.with_message(
+									"no value of this type exists at runtime",
+								),
+						)
+						.with_note(
+							"a literal kind types an untyped constant: `const X: {integer} = 4;`",
+						),
+				);
+				TypeIndex::ERROR
+			}
 			ast::TypeExpression::Grouped { inner, segments } => {
 				// `<T>::Item` — no scope.namespace prefix to consume first
 				// (unlike `Path`'s `T::Item`, where `T` might itself be a
@@ -4099,8 +4179,51 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// A tuple of one is its element, which interning unwraps.
 				self.types.intern_tuple(&elems)
 			}
-			_ => todo!("this type-expression form isn't implemented yet"),
 		}
+	}
+
+	/// The literal kind `{inner}` names: `inner` resolves as any type, and
+	/// must be one of std's literal kinds (`integer`, `char`). `ERROR` when it
+	/// is not, which is reported.
+	fn resolve_literal_kind(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		inner: &Spanned<ast::TypeExpression>,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		// A path is resolved directly: inside the braces a literal kind is
+		// what it should name.
+		let ty = match &inner.inner {
+			ast::TypeExpression::Path(segments) => self.resolve_type_path(
+				obligations,
+				scope,
+				segments,
+				infer_policy,
+			),
+			_ => self.resolve_type_expression(
+				obligations,
+				scope,
+				inner,
+				infer_policy,
+			),
+		};
+		if ty == TypeIndex::ERROR || ty.is_literal() {
+			return ty;
+		}
+		let found = self.type_formatter().display_type(ty);
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::NotALiteralKind.code())
+				.with_message(format!("`{found}` is not a literal kind"))
+				.with_label(
+					SourceSpan::new(scope.file_id, inner.span)
+						.primary_label()
+						.with_message("expected a literal kind"),
+				)
+				.with_note("the literal kinds are `integer` and `char`"),
+		);
+		TypeIndex::ERROR
 	}
 
 	/// Builds the diagnostic for a cycle just detected while trying to
@@ -4930,6 +5053,9 @@ fn report_missing_constant_type(
 			SourceSpan::new(file_id, name.span)
 				.primary_label()
 				.with_message("expected `: Type` here"),
+		)
+		.with_note(
+			"an untyped constant names its literal kind: `const X: {integer} = 4;`",
 		)
 }
 
@@ -17397,6 +17523,59 @@ pub(super) mod tests {
 			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
 	}
 
+	/// A literal kind is std's `integer` or `char`, named in braces: the
+	/// braces say a literal kind is meant, and a bare name is reported.
+	#[test]
+	fn a_literal_kind_is_written_in_braces() {
+		test_case!(
+			case = indoc! {"
+			const X: integer = 4;
+			const Y: {integer} = 4;
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::LiteralKindWithoutBraces]);
+		case.diagnostics().assert_error_saying(
+			"`integer` is a literal kind, written `{integer}`",
+		);
+	}
+
+	#[test]
+	fn only_a_literal_kind_goes_in_braces() {
+		test_case!(
+			case = indoc! {"
+			struct Point(x: i32);
+			const P: {Point} = 4;
+			const Q: {u32} = 4;
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotALiteralKind,
+			DiagnosticCode::NotALiteralKind,
+		]);
+		case.diagnostics()
+			.assert_error_saying("`Point` is not a literal kind");
+	}
+
+	/// No value of a literal kind exists at runtime, so it is only a
+	/// constant's type.
+	#[test]
+	fn a_literal_kind_is_only_a_constants_type() {
+		test_case!(
+			case = indoc! {"
+			struct S(x: {integer});
+			type I = {char};
+			func f(x: {integer}) -> {integer} { x }
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+		]);
+	}
+
 	/// The synthetic impl is the only one: a function is not a path an impl
 	/// can be written for.
 	#[test]
@@ -17406,6 +17585,23 @@ pub(super) mod tests {
 			trait Marker {}
 			func f() {}
 			impl Marker for f {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::InvalidImplTarget]);
+	}
+
+	/// An impl is written only for a nominal type: a slice (like an array, a
+	/// tuple, a pointer or a function reference) is not a path, and an alias
+	/// naming one has no identity to dispatch on.
+	#[test]
+	fn an_impl_cannot_be_written_for_an_alias_of_a_slice() {
+		test_case!(
+			case = indoc! {"
+			memory heap: u32;
+			trait Marker {}
+			type Bytes = heap::&[u8];
+			impl Marker for Bytes {}
 		"}
 		);
 		case.diagnostics()
