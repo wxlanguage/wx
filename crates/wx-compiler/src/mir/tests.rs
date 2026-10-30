@@ -40,7 +40,7 @@ impl TestCase {
 fn test_char_lowered_to_u32() {
 	// char is a primitive; MIR should represent it as U32.
 	let case = TestCase::new(indoc! {"
-        fn identity(c: char) -> char {
+        func identity(c: char) -> char {
             c
         }
 
@@ -57,13 +57,13 @@ fn test_enum_variant_lowered_to_repr_scalar() {
 	// Enums have no runtime representation — Color::Green erases to the repr
 	// scalar type (i32) at MIR/codegen time.
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
         }
 
-        fn get_green() -> Color {
+        func get_green() -> Color {
             Color::Green
         }
 
@@ -78,11 +78,11 @@ fn test_enum_folded_arithmetic_variant_lowered() {
 	// `1 + 1`, an arithmetic expression, not a bare literal — MIR lowering
 	// must still erase it to a concrete scalar.
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1 + 1,
         }
 
-        fn get_red() -> Color {
+        func get_red() -> Color {
             Color::Red
         }
 
@@ -103,7 +103,7 @@ fn test_struct_field_access_lowered_to_local_tuple_get() {
             y: u32,
         }
 
-        fn get_x(p: Point) -> u32 {
+        func get_x(p: Point) -> u32 {
             p.x
         }
 
@@ -121,7 +121,7 @@ fn test_struct_init_lowered_to_struct_create() {
             y: u32,
         }
 
-        fn make_point(x: u32, y: u32) -> Point {
+        func make_point(x: u32, y: u32) -> Point {
             Point::{ x: x, y: y }
         }
 
@@ -139,7 +139,7 @@ fn test_global_struct_type() {
             y: u32,
         }
 
-        fn get_origin() -> Vec2 {
+        func get_origin() -> Vec2 {
             Vec2::{ x: 0, y: 0 }
         }
 
@@ -163,7 +163,7 @@ fn test_type_alias_to_struct_transparent_in_mir() {
 
         type Coord = Point;
 
-        fn get_x(p: Coord) -> u32 {
+        func get_x(p: Coord) -> u32 {
             p.x
         }
 
@@ -183,7 +183,7 @@ fn test_generic_type_alias_transparent_in_mir() {
 
         type Boxed<T> = Wrapper<T>;
 
-        fn get(b: Boxed<u32>) -> u32 {
+        func get(b: Boxed<u32>) -> u32 {
             b.value
         }
 
@@ -199,7 +199,7 @@ fn test_tuple_type_alias_transparent_in_mir() {
 	let case = TestCase::new(indoc! {"
         type Pair<T> = (T, T);
 
-        fn make() -> Pair<u32> {
+        func make() -> Pair<u32> {
             (1, 2)
         }
 
@@ -225,12 +225,12 @@ fn test_struct_method_call() {
         struct Letter { code: u8 }
 
         impl Letter {
-            pub fn to_uppercase(self) -> u8 {
+            pub func to_uppercase(self) -> u8 {
                 self.code ^ 0b0010_0000
             }
         }
 
-        fn to_upper(c: u8) -> u8 {
+        func to_upper(c: u8) -> u8 {
             Letter::{ code: c }.to_uppercase()
         }
 
@@ -256,12 +256,12 @@ fn test_inline_method_is_substituted() {
 
         impl Letter {
             #[inline]
-            pub fn is_lowercase(self) -> bool {
+            pub func is_lowercase(self) -> bool {
                 self.code >= 97 && self.code <= 122
             }
 
             #[inline]
-            pub fn to_uppercase(self) -> u8 {
+            pub func to_uppercase(self) -> u8 {
                 if self.is_lowercase() {
                     self.code ^ ASCII_CASE_MASK
                 } else {
@@ -270,13 +270,71 @@ fn test_inline_method_is_substituted() {
             }
         }
 
-        fn to_upper(c: u8) -> u8 {
+        func to_upper(c: u8) -> u8 {
             Letter::{ code: c }.to_uppercase()
         }
 
         export { to_upper }
     "});
 	assert_eq!(case.mir.functions.len(), 1, "only `to_upper` should remain");
+}
+
+#[test]
+fn test_inline_function_with_early_return_produces_break_into_block() {
+	// `mir::inlining::inline_call` always wraps an inlined callee's body in
+	// a `BlockKind::Block` scope and rewrites every `Return` inside it to a
+	// `Break` targeting that wrapper — this is what used to crash `opt`
+	// (a plain block had no representation there at all). This test only
+	// confirms MIR itself produces that shape correctly for a callee whose
+	// `return` is inside an `if` (not just the callee's own tail position);
+	// the end-to-end execution confirmation lives in
+	// `codegen::tests::test_inline_function_with_early_return_executes_correctly`.
+	let case = TestCase::new(indoc! {"
+        #[inline]
+        func classify(x: i32) -> i32 {
+            if x < 0 {
+                return -1;
+            }
+            1
+        }
+
+        pub func main(x: i32) -> i32 {
+            classify(x)
+        }
+
+        export { main }
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "only `main` should remain");
+
+	let main = &case.mir.functions[0];
+	fn contains_break(expr: &crate::mir::Expression) -> bool {
+		use crate::mir::ExprKind;
+		match &expr.kind {
+			ExprKind::Break { .. } => true,
+			ExprKind::Return { .. } => {
+				panic!("a Return should never survive inlining unrewritten")
+			}
+			ExprKind::Block { expressions, .. } => {
+				expressions.iter().any(contains_break)
+			}
+			ExprKind::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => {
+				contains_break(condition)
+					|| contains_break(then_block)
+					|| else_block.as_deref().is_some_and(contains_break)
+			}
+			ExprKind::LocalSet { value, .. } => contains_break(value),
+			_ => false,
+		}
+	}
+	assert!(
+		contains_break(&main.block),
+		"classify's early `return` must have been rewritten to a `Break` \
+		 targeting the inliner's wrapper block"
+	);
 }
 
 // ── memory instructions
@@ -288,7 +346,7 @@ fn test_memory_grow_lowers_to_memory_grow() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(delta: u32) -> i32 {
+        pub func f(delta: u32) -> i32 {
             heap.grow(delta)
         }
 
@@ -303,7 +361,7 @@ fn test_memory_size_lowers_to_memory_size() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f() -> u32 {
+        pub func f() -> u32 {
             heap.size_pages()
         }
 
@@ -318,7 +376,7 @@ fn test_memory_data_end_lowers_to_memory_offset() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f() -> heap::&u8 {
+        pub func f() -> heap::&u8 {
             heap::DATA_END
         }
 
@@ -333,7 +391,7 @@ fn test_memory_index_lowers_to_int() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f() -> u32 {
+        pub func f() -> u32 {
             heap::INDEX
         }
 
@@ -349,7 +407,7 @@ fn test_slice_len_lowers_to_aggregate_get() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(s: heap::&[u8]) -> u32 {
+        pub func f(s: heap::&[u8]) -> u32 {
             slice_len(s)
         }
 
@@ -366,7 +424,7 @@ fn test_slice_from_parts_lowers_to_aggregate() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn f(ptr: heap::&u8, len: u32) -> heap::&[u8] {
+        pub func f(ptr: heap::&u8, len: u32) -> heap::&[u8] {
             slice_from_parts(ptr, len)
         }
 
@@ -380,21 +438,21 @@ fn test_slice_from_parts_lowers_to_aggregate() {
 
 #[test]
 fn test_generic_over_memory_monomorphizes_size_type() {
-	// A generic fn<M: Memory> called with two concrete memories must produce
+	// A generic func<M: Memory> called with two concrete memories must produce
 	// two monomorphized instances with the right concrete Size types (u32 / u64).
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
         memory stack: Memory where { Size = u64 };
 
-        fn pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
+        func pass<M: Memory>(mem: M, n: M::Size) -> M::Size {
             n
         }
 
-        pub fn use_heap(n: u32) -> u32 {
+        pub func use_heap(n: u32) -> u32 {
             pass(heap, n)
         }
 
-        pub fn use_stack(n: u64) -> u64 {
+        pub func use_stack(n: u64) -> u64 {
             pass(stack, n)
         }
 
@@ -409,8 +467,8 @@ fn test_generic_over_memory_monomorphizes_size_type() {
 fn test_dead_function_removed_by_dce() {
 	// `unused` is never exported or called — DCE must eliminate it.
 	let case = TestCase::new(indoc! {"
-        fn used(x: u32) -> u32 { x + 1 }
-        fn unused(x: u32) -> u32 { x * 2 }
+        func used(x: u32) -> u32 { x + 1 }
+        func unused(x: u32) -> u32 { x * 2 }
 
         export { used }
     "});
@@ -426,8 +484,8 @@ fn test_non_inline_callee_survives_dce() {
 	// `helper` is called by `entry` but is not marked `#[inline]`, so it must
 	// remain in mir.functions as a call target rather than being folded away.
 	let case = TestCase::new(indoc! {"
-        fn helper(x: u32) -> u32 { x + 1 }
-        fn entry(x: u32) -> u32 { helper(x) }
+        func helper(x: u32) -> u32 { x + 1 }
+        func entry(x: u32) -> u32 { helper(x) }
 
         export { entry }
     "});
@@ -440,12 +498,12 @@ fn test_inline_chain_collapses_to_single_function() {
 	// and the inline helpers are removed by DCE. Only one function survives.
 	let case = TestCase::new(indoc! {"
         #[inline]
-        fn add_one(x: u32) -> u32 { x + 1 }
+        func add_one(x: u32) -> u32 { x + 1 }
 
         #[inline]
-        fn add_two(x: u32) -> u32 { add_one(add_one(x)) }
+        func add_two(x: u32) -> u32 { add_one(add_one(x)) }
 
-        fn main(x: u32) -> u32 { add_two(x) }
+        func main(x: u32) -> u32 { add_two(x) }
 
         export { main }
     "});
@@ -457,12 +515,12 @@ fn test_multiple_exports_protect_their_callees() {
 	// `f` calls `double`, `g` calls `triple`; `orphan` is called by nobody.
 	// Both export roots must protect their own callees; only `orphan` is DCE'd.
 	let case = TestCase::new(indoc! {"
-        fn double(x: u32) -> u32 { x * 2 }
-        fn triple(x: u32) -> u32 { x * 3 }
-        fn orphan(x: u32) -> u32 { x * 4 }
+        func double(x: u32) -> u32 { x * 2 }
+        func triple(x: u32) -> u32 { x * 3 }
+        func orphan(x: u32) -> u32 { x * 4 }
 
-        fn f(x: u32) -> u32 { double(x) }
-        fn g(x: u32) -> u32 { triple(x) }
+        func f(x: u32) -> u32 { double(x) }
+        func g(x: u32) -> u32 { triple(x) }
 
         export { f, g }
     "});
@@ -475,13 +533,13 @@ fn test_function_reference_value_survives_dce() {
 	// `target` is only referenced as a value passed to `apply` — never called
 	// directly from `run`. DCE must keep it because it is a live dependency.
 	let case = TestCase::new(indoc! {"
-        fn target(x: u32) -> u32 { x + 1 }
+        func target(x: u32) -> u32 { x + 1 }
 
-        fn apply(f: fn(u32) -> u32, x: u32) -> u32 {
+        func apply(f: func(u32) -> u32, x: u32) -> u32 {
             f(x)
         }
 
-        fn run() -> u32 {
+        func run() -> u32 {
             apply(target, 42)
         }
 
@@ -498,18 +556,18 @@ fn test_unused_trait_impl_eliminated_by_dce() {
 	// Num2::value has no incoming edge and must be eliminated by DCE.
 	let case = TestCase::new(indoc! {"
         trait Scalable {
-            fn value(self) -> i32;
-            fn doubled(self) -> i32 { self.value() * 2 }
+            func value(self) -> i32;
+            func doubled(self) -> i32 { self.value() * 2 }
         }
         struct Num1 { n: i32 }
         struct Num2 { n: i32 }
         impl Scalable for Num1 {
-            fn value(self) -> i32 { self.n }
+            func value(self) -> i32 { self.n }
         }
         impl Scalable for Num2 {
-            fn value(self) -> i32 { self.n * 10 }
+            func value(self) -> i32 { self.n * 10 }
         }
-        fn run() -> i32 {
+        func run() -> i32 {
             local n = Num1::{ n: 21 };
             n.doubled()
         }
@@ -531,14 +589,14 @@ fn test_unused_trait_impl_eliminated_by_dce() {
 fn test_generic_trait_impl_abstract_dispatch_monomorphizes() {
 	let case = TestCase::new(indoc! {"
         trait Scalable {
-            fn value(self) -> i32;
-            fn doubled(self) -> i32 { self.value() * 2 }
+            func value(self) -> i32;
+            func doubled(self) -> i32 { self.value() * 2 }
         }
         struct Box<T> { v: T }
         impl<T> Scalable for Box<T> {
-            fn value(self) -> i32 { 1 }
+            func value(self) -> i32 { 1 }
         }
-        fn run(b: Box<i32>) -> i32 {
+        func run(b: Box<i32>) -> i32 {
             b.doubled()
         }
         export { run }
@@ -564,28 +622,27 @@ fn test_generic_trait_impl_abstract_dispatch_monomorphizes() {
 /// `impl<T> Container for Box<T> { type Item = Wrapper<T>; ... }` — the
 /// associated type's value is a *composite* (`Wrapper<T>`, not a bare `T`),
 /// so resolving `C::Item` for a monomorphized `C = Box<i32>` must
-/// substitute the impl's own `T` inside `Wrapper<T>`'s structure (via a
-/// `current_substitutions` swap in `lower_type_index`'s
-/// `AssocTypeProjection` arm), not just a top-level `TypeParam` leaf.
+/// instantiate the impl's own `T` inside `Wrapper<T>` under an impl-owned
+/// type environment, not just replace a top-level `TypeParam` leaf.
 #[test]
 fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
 	let case = TestCase::new(indoc! {"
         trait Container {
             type Item;
-            fn wrap(self) -> Self::Item;
+            func wrap(self) -> Self::Item;
         }
         struct Box<T> { v: T }
         struct Wrapper<T> { inner: T }
         impl<T> Container for Box<T> {
             type Item = Wrapper<T>;
-            fn wrap(self) -> Self::Item {
+            func wrap(self) -> Self::Item {
                 Wrapper::{ inner: self.v }
             }
         }
-        fn use_container<C: Container>(c: C) -> C::Item {
+        func use_container<C: Container>(c: C) -> C::Item {
             c.wrap()
         }
-        fn run(b: Box<i32>) -> Wrapper<i32> {
+        func run(b: Box<i32>) -> Wrapper<i32> {
             use_container(b)
         }
         export { run }
@@ -606,7 +663,7 @@ fn test_generic_trait_impl_composite_associated_type_monomorphizes() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.values.len() == 1 && a.values[0] == Type::I32)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == ValueType::I32)
 		.expect("Wrapper<i32> aggregate with I32 field not found");
 	assert_eq!(agg.layout.size, 4);
 }
@@ -616,7 +673,7 @@ fn test_recursive_function_survives_dce() {
 	// A self-recursive exported function references itself as a callee.
 	// DCE must keep it alive (it is its own root).
 	let case = TestCase::new(indoc! {"
-        fn count_down(n: u32) -> u32 {
+        func count_down(n: u32) -> u32 {
             if n == 0 { 0 } else { count_down(n - 1) }
         }
         export { count_down }
@@ -636,9 +693,9 @@ fn test_inline_helper_in_dead_code_is_eliminated() {
 	// Only `live` (the export) must survive.
 	let case = TestCase::new(indoc! {"
         #[inline]
-        fn helper(x: u32) -> u32 { x + 1 }
-        fn dead_caller(x: u32) -> u32 { helper(x) }
-        fn live(x: u32) -> u32 { x * 2 }
+        func helper(x: u32) -> u32 { x + 1 }
+        func dead_caller(x: u32) -> u32 { helper(x) }
+        func live(x: u32) -> u32 { x * 2 }
         export { live }
     "});
 	assert_eq!(case.mir.functions.len(), 1);
@@ -653,11 +710,11 @@ fn test_deep_call_chain_survives_dce() {
 	// entry → step1 → step2 → step3 → leaf: the full depth-4 chain must survive.
 	// Verifies that BFS propagation is not cut short at depth 2.
 	let case = TestCase::new(indoc! {"
-        fn leaf(x: u32) -> u32 { x }
-        fn step3(x: u32) -> u32 { leaf(x) }
-        fn step2(x: u32) -> u32 { step3(x) }
-        fn step1(x: u32) -> u32 { step2(x) }
-        fn entry(x: u32) -> u32 { step1(x) }
+        func leaf(x: u32) -> u32 { x }
+        func step3(x: u32) -> u32 { leaf(x) }
+        func step2(x: u32) -> u32 { step3(x) }
+        func step1(x: u32) -> u32 { step2(x) }
+        func entry(x: u32) -> u32 { step1(x) }
         export { entry }
     "});
 	assert_eq!(case.mir.functions.len(), 5);
@@ -676,17 +733,19 @@ fn test_struct_layout_is_alignment_sorted() {
             d: f64,
         }
 
-        fn dummy(m: Mixed) -> Mixed { m }
+        func dummy(m: Mixed) -> Mixed { m }
         export { dummy }
     "});
 	assert!(case.tir.diagnostics.is_empty());
 
 	// The `dummy` function's first parameter is `Mixed`; its MIR type carries
 	// the aggregate index into `mir.aggregates`.
-	let sig_index = case.mir.functions[0].signature_index as usize;
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -695,8 +754,119 @@ fn test_struct_layout_is_alignment_sorted() {
 	assert_eq!(agg.layout.size, 24);
 	assert_eq!(agg.layout.align, 8);
 	// Physical order: b(i64)@0, d(f64)@8, c(u32)@16, a(bool)@20
-	assert_eq!(&*agg.offsets, &[0, 8, 16, 20]);
-	assert_eq!(&*agg.values, &[Type::I64, Type::F64, Type::U32, Type::Bool]);
+	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(offsets, [0, 8, 16, 20]);
+	assert_eq!(
+		types,
+		[
+			ValueType::I64,
+			ValueType::F64,
+			ValueType::U32,
+			ValueType::Bool
+		]
+	);
+}
+
+/// Three levels of nesting, each level alignment-sorted so that the nested
+/// field is reordered *ahead* of a scalar sibling. Pins two things that the
+/// opt/codegen layers both depend on and currently re-derive independently:
+///
+/// - a nested field is a single entry in `values`/`offsets`, so the physical
+///   field count says nothing about how many WASM values the aggregate needs;
+/// - `flatten_type_to_scalars` recurses through that nesting, so `Top` is
+///   *two* physical fields but *three* WASM scalars.
+///
+/// Anything caching a flattened view of an aggregate has to agree with
+/// `flatten_type_to_scalars` here, including the reordering.
+#[test]
+fn test_nested_struct_flattens_to_more_scalars_than_fields() {
+	let case = TestCase::new(indoc! {"
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        func dummy(t: Top) -> Top { t }
+        export { dummy }
+    "});
+	assert!(case.tir.diagnostics.is_empty());
+
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
+	let top_index = match case.mir.signatures[sig_index].params()[0] {
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
+		_ => panic!("expected Top to lower to an aggregate"),
+	};
+
+	// Top: `mid` (align 8) sorts ahead of `flag` (align 1); 17B padded to 24.
+	let top = &case.mir.aggregates[top_index];
+	assert_eq!(top.layout.size, 24);
+	assert_eq!(top.layout.align, 8);
+	assert_eq!(top.fields[0].offset, 0);
+	assert_eq!(top.fields[1].offset, 16);
+	assert_eq!(top.fields[1].ty, ValueType::U8);
+	let mid_index = match top.fields[0].ty {
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
+		_ => panic!("expected Top's first physical field to be Mid"),
+	};
+
+	// Mid: `deep` (align 8) sorts ahead of `tag` (align 1); 9B padded to 16.
+	let mid = &case.mir.aggregates[mid_index];
+	assert_eq!(mid.layout.size, 16);
+	assert_eq!(mid.layout.align, 8);
+	assert_eq!(mid.fields[0].offset, 0);
+	assert_eq!(mid.fields[1].offset, 8);
+	assert_eq!(mid.fields[1].ty, ValueType::U8);
+	let deep_index = match mid.fields[0].ty {
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
+		_ => panic!("expected Mid's first physical field to be Deep"),
+	};
+
+	let deep = &case.mir.aggregates[deep_index];
+	assert_eq!(deep.layout.size, 8);
+	assert_eq!(deep.layout.align, 8);
+	assert_eq!(deep.fields[0].offset, 0);
+	assert_eq!(deep.fields[0].ty, ValueType::U64);
+
+	// Two physical fields, three WASM scalars — the counts diverge, and the
+	// scalar order follows the alignment-sorted physical order, not the
+	// declaration order (`flag` is declared first but flattens last).
+	assert_eq!(top.field_count(), 2);
+	assert_eq!(top.scalars.len(), 3);
+
+	// Offsets are absolute within `Top`, with every enclosing field folded in.
+	let scalar_offsets: Vec<u32> =
+		top.scalars.iter().map(|s| s.offset).collect();
+	assert_eq!(scalar_offsets, [0, 8, 16]);
+
+	// Each physical field owns a contiguous run: `mid` owns 0..2, `flag` 2..3.
+	assert_eq!(top.scalars.field_range(PhysIndex::new(0)), 0..2);
+	assert_eq!(top.scalars.field_range(PhysIndex::new(1)), 2..3);
+	assert_eq!(top.scalars.owner(ScalarIndex::new(0)), PhysIndex::new(0));
+	assert_eq!(top.scalars.owner(ScalarIndex::new(1)), PhysIndex::new(0));
+	assert_eq!(top.scalars.owner(ScalarIndex::new(2)), PhysIndex::new(1));
+
+	// The precomputed table must agree with a fresh recursive flatten — this
+	// is the invariant every opt/codegen consumer now relies on.
+	let scalars = crate::wasm::flatten_type_to_scalars(
+		ValueType::Aggregate {
+			aggregate_index: AggregateIndex::new(top_index as u32),
+		},
+		&case.mir.aggregates,
+	);
+	assert_eq!(
+		scalars,
+		vec![
+			crate::wasm::ScalarType::I64, // mid.deep.id
+			crate::wasm::ScalarType::I32, // mid.tag
+			crate::wasm::ScalarType::I32, // flag
+		]
+	);
 }
 
 #[test]
@@ -710,15 +880,17 @@ fn test_fixed_order_struct_keeps_declaration_order() {
             d: f64,
         }
 
-        fn dummy(m: Mixed) -> Mixed { m }
+        func dummy(m: Mixed) -> Mixed { m }
         export { dummy }
     "});
 	assert!(case.tir.diagnostics.is_empty());
 
-	let sig_index = case.mir.functions[0].signature_index as usize;
+	let sig_index = usize::from(case.mir.functions[0].signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
 	let aggregate_index = match param_ty {
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Mixed to lower to an aggregate"),
 	};
 
@@ -727,20 +899,32 @@ fn test_fixed_order_struct_keeps_declaration_order() {
 	// d(f64)@24 (padded) — no alignment-descending reordering.
 	assert_eq!(agg.layout.size, 32);
 	assert_eq!(agg.layout.align, 8);
-	assert_eq!(&*agg.offsets, &[0, 8, 16, 24]);
-	assert_eq!(&*agg.values, &[Type::Bool, Type::I64, Type::U32, Type::F64]);
-	assert_eq!(&*agg.decl_to_phys, &[0, 1, 2, 3]);
+	let offsets: Vec<u32> = agg.fields.iter().map(|f| f.offset).collect();
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(offsets, [0, 8, 16, 24]);
+	assert_eq!(
+		types,
+		[
+			ValueType::Bool,
+			ValueType::I64,
+			ValueType::U32,
+			ValueType::F64
+		]
+	);
+	let phys: Vec<usize> =
+		(0..4).map(|d| usize::from(agg.physical(d))).collect();
+	assert_eq!(phys, [0, 1, 2, 3]);
 }
 
 #[test]
 fn test_unreachable_imported_function_is_dropped_from_mir_imports() {
 	let case = TestCase::new(indoc! {"
         import \"env\" as env {
-            fn used() -> i32;
-            fn unused() -> i32;
+            func used() -> i32;
+            func unused() -> i32;
         }
 
-        fn main() -> i32 {
+        func main() -> i32 {
             env::used()
         }
 
@@ -766,14 +950,14 @@ fn test_unreachable_imported_function_is_dropped_from_mir_imports() {
 fn test_import_module_with_no_reachable_functions_is_dropped_entirely() {
 	let case = TestCase::new(indoc! {"
         import \"dead\" as dead {
-            fn unused() -> i32;
+            func unused() -> i32;
         }
 
         import \"alive\" as alive {
-            fn used() -> i32;
+            func used() -> i32;
         }
 
-        fn main() -> i32 {
+        func main() -> i32 {
             alive::used()
         }
 
@@ -795,10 +979,10 @@ fn test_import_module_with_no_reachable_functions_is_dropped_entirely() {
 #[test]
 fn test_different_type_args_produce_separate_mono_instances() {
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T { t }
+        func identity<T>(t: T) -> T { t }
 
-        fn run_i32()  -> i32  { identity(42) }
-        fn run_bool() -> bool { identity(true) }
+        func run_i32()  -> i32  { identity(42) }
+        func run_bool() -> bool { identity(true) }
 
         export { run_i32, run_bool }
     "});
@@ -823,18 +1007,16 @@ fn test_different_type_args_produce_separate_mono_instances() {
 ///
 /// Root cause of the former stack overflow: type_args were forwarded raw to
 /// `MonoRegistry::get_or_insert`, so `wrap<TypeParam{0}>` was registered
-/// instead of `wrap<i32>`. When the worklist lowered it with
-/// `current_substitutions = [TypeParam{0}]`, `lower_type_index` entered
-/// infinite mutual recursion: TypeParam{0} → substitutions[0] → TypeParam{0}.
-/// Fix: substitute TypeParam entries in type_args through current_substitutions
-/// before calling get_or_insert (MIR GenericCall arm).
+/// instead of `wrap<i32>`, causing infinite recursion when that unresolved
+/// parameter was lowered. The MIR type context now instantiates every call
+/// argument to a concrete `TypeId` before registering the monomorphization.
 #[test]
 fn test_generic_calls_generic_multi_iteration_worklist() {
 	let case = TestCase::new(indoc! {"
-        fn wrap<T>(t: T) -> T { t }
-        fn call_wrap<T>(t: T) -> T { wrap(t) }
+        func wrap<T>(t: T) -> T { t }
+        func call_wrap<T>(t: T) -> T { wrap(t) }
 
-        fn run() -> i32 { call_wrap(42) }
+        func run() -> i32 { call_wrap(42) }
 
         export { run }
     "});
@@ -857,9 +1039,9 @@ fn test_generic_calls_generic_multi_iteration_worklist() {
 fn test_inline_attribute_on_generic_propagated_to_mono_instance() {
 	let case = TestCase::new(indoc! {"
         #[inline]
-        fn wrap<T>(t: T) -> T { t }
+        func wrap<T>(t: T) -> T { t }
 
-        fn run() -> i32 { wrap(42) }
+        func run() -> i32 { wrap(42) }
 
         export { run }
     "});
@@ -890,8 +1072,8 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
             y: T,
         }
 
-        fn get_x_i32(p: Point<i32>) -> i32 { p.x }
-        fn get_x_f32(p: Point<f32>) -> f32 { p.x }
+        func get_x_i32(p: Point<i32>) -> i32 { p.x }
+        func get_x_f32(p: Point<f32>) -> f32 { p.x }
 
         export { get_x_i32, get_x_f32 }
     "});
@@ -902,8 +1084,8 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.functions
 		.iter()
 		.find(|f| {
-			let sig = &case.mir.signatures[f.signature_index as usize];
-			sig.result() == Type::I32
+			let sig = &case.mir.signatures[usize::from(f.signature_index)];
+			sig.result() == ValueType::I32
 		})
 		.expect("get_x_i32 not found");
 	let sig_f32 = case
@@ -911,21 +1093,27 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		.functions
 		.iter()
 		.find(|f| {
-			let sig = &case.mir.signatures[f.signature_index as usize];
-			sig.result() == Type::F32
+			let sig = &case.mir.signatures[usize::from(f.signature_index)];
+			sig.result() == ValueType::F32
 		})
 		.expect("get_x_f32 not found");
 
-	let agg_i32 = match case.mir.signatures[sig_i32.signature_index as usize]
-		.params()[0]
+	let agg_i32 = match case.mir.signatures
+		[usize::from(sig_i32.signature_index)]
+	.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Point<i32> to be an aggregate"),
 	};
-	let agg_f32 = match case.mir.signatures[sig_f32.signature_index as usize]
-		.params()[0]
+	let agg_f32 = match case.mir.signatures
+		[usize::from(sig_f32.signature_index)]
+	.params()[0]
 	{
-		Type::Aggregate { aggregate_index } => aggregate_index as usize,
+		ValueType::Aggregate { aggregate_index } => {
+			usize::from(aggregate_index)
+		}
 		_ => panic!("expected Point<f32> to be an aggregate"),
 	};
 
@@ -933,19 +1121,16 @@ fn test_generic_struct_distinct_aggregates_per_type_arg() {
 		agg_i32, agg_f32,
 		"Point<i32> and Point<f32> must map to distinct aggregates"
 	);
-	assert_eq!(
-		&*case.mir.aggregates[agg_i32].values,
-		&[Type::I32, Type::I32]
-	);
-	assert_eq!(
-		&*case.mir.aggregates[agg_f32].values,
-		&[Type::F32, Type::F32]
-	);
+	let types = |i: usize| -> Vec<ValueType> {
+		case.mir.aggregates[i].fields.iter().map(|f| f.ty).collect()
+	};
+	assert_eq!(types(agg_i32), [ValueType::I32, ValueType::I32]);
+	assert_eq!(types(agg_f32), [ValueType::F32, ValueType::F32]);
 }
 
 /// Constructing and accessing a field on a concrete `Point<i32>` inside a
-/// non-generic function (no outer `current_substitutions`). Verifies that the
-/// struct's own type args are used as substitutions when lowering its fields.
+/// non-generic function. Verifies that the struct's own type environment is
+/// used when lowering its fields.
 #[test]
 fn test_generic_struct_init_and_field_access_concrete() {
 	let case = TestCase::new(indoc! {"
@@ -954,7 +1139,7 @@ fn test_generic_struct_init_and_field_access_concrete() {
             pub y: T,
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local p: Point<i32> = Point::<i32>::{ x: 3, y: 7 };
             p.x
         }
@@ -973,7 +1158,8 @@ fn test_generic_struct_init_and_field_access_concrete() {
 		.aggregates
 		.iter()
 		.position(|a| {
-			a.values.len() == 2 && a.values.iter().all(|&t| t == Type::I32)
+			a.fields.len() == 2
+				&& a.fields.iter().all(|f| f.ty == ValueType::I32)
 		})
 		.expect("Point<i32> aggregate not found");
 	assert_eq!(case.mir.aggregates[agg_idx].layout.size, 8);
@@ -989,9 +1175,9 @@ fn test_generic_struct_in_generic_function_monomorphizes_correctly() {
             value: T,
         }
 
-        fn get_value<T>(b: Box<T>) -> T { b.value }
+        func get_value<T>(b: Box<T>) -> T { b.value }
 
-        fn run() -> i64 {
+        func run() -> i64 {
             local b: Box<i64> = Box::<i64>::{ value: 42 };
             get_value(b)
         }
@@ -1008,7 +1194,7 @@ fn test_generic_struct_in_generic_function_monomorphizes_correctly() {
 		.mir
 		.aggregates
 		.iter()
-		.find(|a| a.values.len() == 1 && a.values[0] == Type::I64)
+		.find(|a| a.fields.len() == 1 && a.fields[0].ty == ValueType::I64)
 		.expect("Box<i64> aggregate with I64 field not found");
 	assert_eq!(agg.layout.size, 8);
 	assert_eq!(agg.layout.align, 8);
@@ -1031,15 +1217,15 @@ fn test_generic_struct_in_generic_function_monomorphizes_correctly() {
 fn test_mutually_recursive_inline_functions_kahn_stall() {
 	let case = TestCase::new(indoc! {"
         #[inline]
-        fn f(n: u32) -> u32 {
+        func f(n: u32) -> u32 {
             if n == 0 { 0 } else { g(n - 1) }
         }
         #[inline]
-        fn g(n: u32) -> u32 {
+        func g(n: u32) -> u32 {
             if n == 0 { 0 } else { f(n - 1) }
         }
 
-        fn entry(n: u32) -> u32 { f(n) }
+        func entry(n: u32) -> u32 { f(n) }
 
         export { entry }
     "});
@@ -1064,12 +1250,12 @@ fn test_mutually_recursive_inline_functions_kahn_stall() {
 #[test]
 fn test_inline_function_calling_generic_dce_preserves_mono_instance() {
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T { t }
+        func identity<T>(t: T) -> T { t }
 
         #[inline]
-        fn one_more(x: i32) -> i32 { identity(x + 1) }
+        func one_more(x: i32) -> i32 { identity(x + 1) }
 
-        fn run() -> i32 { one_more(41) }
+        func run() -> i32 { one_more(41) }
 
         export { run }
     "});
@@ -1095,11 +1281,11 @@ fn test_multiple_calls_to_generic_produce_single_mono_instance() {
 	//   1. `run` (the concrete caller)
 	//   2. one monomorphized copy of `identity` for i32
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T {
+        func identity<T>(t: T) -> T {
             t
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             identity(1) + identity(2)
         }
 
@@ -1133,7 +1319,7 @@ fn test_array_literal_bytes_are_little_endian() {
 	// [1, 2, 3] as heap::&[i32; 3] → 12 bytes encoding each value as 32-bit LE.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn get() -> heap::&[i32; 3] {
+        func get() -> heap::&[i32; 3] {
             local arr: heap::&[i32; 3] = [1, 2, 3];
             arr
         }
@@ -1156,7 +1342,7 @@ fn test_array_repeat_bytes_repeated() {
 	// [7; 4] as heap::&[u8; 4] → four bytes each equal to 7.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn get() -> heap::&[u8; 4] {
+        func get() -> heap::&[u8; 4] {
             local arr: heap::&[u8; 4] = [7; 4];
             arr
         }
@@ -1173,8 +1359,8 @@ fn test_array_dce_removes_static_data_ownership() {
 	// No live function should reference its static entry.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn live() -> i32 { 42 }
-        fn dead() -> heap::&[i32; 3] {
+        func live() -> i32 { 42 }
+        func dead() -> heap::&[i32; 3] {
             local arr: heap::&[i32; 3] = [1, 2, 3];
             arr
         }
@@ -1198,15 +1384,15 @@ fn test_static_entry_alignment_matches_element_type() {
 	// i32 elements → align 4; f64 elements → align 8; u8 elements → align 1.
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
-        fn ints() -> heap::&[i32; 2] {
+        func ints() -> heap::&[i32; 2] {
             local a: heap::&[i32; 2] = [10, 20];
             a
         }
-        fn doubles() -> heap::&[f64; 2] {
+        func doubles() -> heap::&[f64; 2] {
             local b: heap::&[f64; 2] = [1.0; 2];
             b
         }
-        fn bytes() -> heap::&[u8; 2] {
+        func bytes() -> heap::&[u8; 2] {
             local c: heap::&[u8; 2] = [1; 2];
             c
         }
@@ -1227,10 +1413,10 @@ fn test_size_of_lowers_to_const_int() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        fn size_u8() -> u32 { size_of::<u8, heap>() }
-        fn size_u32() -> u32 { size_of::<u32, heap>() }
-        fn size_u64() -> u32 { size_of::<u64, heap>() }
-        fn size_u16() -> u32 { size_of::<u16, heap>() }
+        func size_u8() -> u32 { size_of::<u8, heap>() }
+        func size_u32() -> u32 { size_of::<u32, heap>() }
+        func size_u64() -> u32 { size_of::<u64, heap>() }
+        func size_u16() -> u32 { size_of::<u16, heap>() }
 
         export { size_u8, size_u32, size_u64, size_u16 }
     "});
@@ -1243,9 +1429,9 @@ fn test_align_of_lowers_to_const_int() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        fn align_u8() -> u32 { align_of::<u8, heap>() }
-        fn align_u32() -> u32 { align_of::<u32, heap>() }
-        fn align_u64() -> u32 { align_of::<u64, heap>() }
+        func align_u8() -> u32 { align_of::<u8, heap>() }
+        func align_u32() -> u32 { align_of::<u32, heap>() }
+        func align_u64() -> u32 { align_of::<u64, heap>() }
 
         export { align_u8, align_u32, align_u64 }
     "});
@@ -1260,10 +1446,10 @@ fn test_size_of_generic_monomorphizes() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        fn typed_size<T, M: Memory>() -> M::Size { size_of::<T, M>() }
+        func typed_size<T, M: Memory>() -> M::Size { size_of::<T, M>() }
 
-        fn call_u8() -> u32 { typed_size::<u8, heap>() }
-        fn call_u32() -> u32 { typed_size::<u32, heap>() }
+        func call_u8() -> u32 { typed_size::<u8, heap>() }
+        func call_u32() -> u32 { typed_size::<u32, heap>() }
 
         export { call_u8, call_u32 }
     "});
@@ -1273,7 +1459,7 @@ fn test_size_of_generic_monomorphizes() {
 
 #[test]
 fn test_generic_slice_impl_method_lowers_correctly() {
-	// The stdlib's `impl<Mem: Memory, T> Mem::&[T] { #[inline] fn len(self) ->
+	// The stdlib's `impl<Mem: Memory, T> Mem::&[T] { #[inline] func len(self) ->
 	// Mem::Size }` at `Mem = heap, T = u8` — the only kind of inherent slice
 	// impl there can be, since nobody defines slices. Two things have to
 	// happen for `s.len()` to lower correctly: `Mem::Size` resolves to
@@ -1282,7 +1468,7 @@ fn test_generic_slice_impl_method_lowers_correctly() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        pub fn get_len(s: heap::&[u8]) -> u32 {
+        pub func get_len(s: heap::&[u8]) -> u32 {
             s.len()
         }
 
@@ -1295,11 +1481,15 @@ fn test_generic_slice_impl_method_lowers_correctly() {
 		result = expressions.last().expect("a block has a result expression");
 	}
 	assert!(
-		matches!(result.kind, ExprKind::AggregateGet { value_index: 1, .. }),
+		matches!(
+			result.kind,
+			ExprKind::AggregateGet { value_index, .. }
+				if usize::from(value_index) == 1
+		),
 		"`slice_len` should read the slice aggregate's length slot directly"
 	);
 	assert!(
-		matches!(result.ty, Type::U32),
+		matches!(result.ty, ValueType::U32),
 		"`Mem::Size` should have resolved to `heap`'s index type"
 	);
 }
@@ -1315,43 +1505,11 @@ fn test_compound_assign_through_ptr_deref_on_struct_field() {
             cap: u32,
         }
 
-        fn increment_len(p: heap::*Vec) {
+        func increment_len(p: heap::*Vec) {
             p.*.len += 1;
         }
 
         export { increment_len }
-    "});
-	assert!(
-		case.tir.diagnostics.is_empty(),
-		"unexpected TIR diagnostics: {:?}",
-		case.tir.diagnostics
-	);
-	insta::assert_yaml_snapshot!(case.mir);
-}
-
-#[test]
-#[ignore = "method lookup for pointer receivers not yet implemented"]
-fn test_generic_compound_assign_through_ptr_deref() {
-	let case = TestCase::new(indoc! {"
-        memory heap: Memory where { Size = u32 };
-
-        struct Vec<T> {
-            buf: u32,
-            len: u32,
-            cap: u32,
-        }
-
-        impl<T> Vec<T> {
-            pub fn increment_len(self: heap::*Self) {
-                self.*.len += 1;
-            }
-        }
-
-        fn call_it(p: heap::*Vec<u32>) {
-            p.increment_len();
-        }
-
-        export { call_it }
     "});
 	assert!(
 		case.tir.diagnostics.is_empty(),
@@ -1369,9 +1527,9 @@ fn test_string_literal_dedup_is_per_memory() {
         memory first: Memory where { Size = u32 };
         memory second: Memory where { Size = u32 };
 
-        fn a() -> first::&[u8] { \"hi\" }
-        fn b() -> second::&[u8] { \"hi\" }
-        fn c() -> first::&[u8] { \"hi\" }
+        func a() -> first::&[u8] { \"hi\" }
+        func b() -> second::&[u8] { \"hi\" }
+        func c() -> first::&[u8] { \"hi\" }
 
         export { a, b, c }
     "});
@@ -1398,7 +1556,7 @@ fn test_string_literal_dedup_is_per_memory() {
 #[test]
 fn test_match_int_lowers_to_switch() {
 	let case = TestCase::new(indoc! {"
-        fn sign(x: i32) -> i32 {
+        func sign(x: i32) -> i32 {
             match x {
                 0 -> { 0 },
                 1 -> { 1 },
@@ -1417,13 +1575,13 @@ fn test_match_enum_lowers_discriminants_to_repr_values() {
 	// scalar), not a symbolic variant index — mirrors how `Color::Green`
 	// itself erases to a scalar (test_enum_variant_lowered_to_repr_scalar).
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
         }
 
-        fn to_u8(c: Color) -> u8 {
+        func to_u8(c: Color) -> u8 {
             match c {
                 Color::Red -> { 0 },
                 Color::Green -> { 1 },
@@ -1439,13 +1597,13 @@ fn test_match_enum_lowers_discriminants_to_repr_values() {
 #[test]
 fn test_match_exhaustive_enum_no_wildcard_has_no_default() {
 	let case = TestCase::new(indoc! {"
-        enum Color: i32 {
+        enum Color(i32) {
             Red = 1,
             Green,
             Blue,
         }
 
-        fn to_u8(c: Color) -> u8 {
+        func to_u8(c: Color) -> u8 {
             match c {
                 Color::Red -> { 0 },
                 Color::Green -> { 1 },
@@ -1485,12 +1643,12 @@ fn test_struct_operator_overload_lowers_to_call() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Add for Vec2 {
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+        func add_vec2(a: Vec2, b: Vec2) -> Vec2 {
             a + b
         }
 
@@ -1509,12 +1667,12 @@ fn test_struct_operator_overload_inline_method_is_substituted() {
 
         impl Add for Vec2 {
             #[inline]
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        fn add_vec2(a: Vec2, b: Vec2) -> Vec2 {
+        func add_vec2(a: Vec2, b: Vec2) -> Vec2 {
             a + b
         }
 
@@ -1532,12 +1690,12 @@ fn test_struct_bitand_overload_lowers_to_call() {
         struct Flags { bits: i32 }
 
         impl BitAnd for Flags {
-            fn bitand(self: Self, rhs: Self) -> Self {
+            func bitand(self: Self, rhs: Self) -> Self {
                 Flags::{ bits: self.bits & rhs.bits }
             }
         }
 
-        fn and_flags(a: Flags, b: Flags) -> Flags {
+        func and_flags(a: Flags, b: Flags) -> Flags {
             a & b
         }
 
@@ -1553,12 +1711,12 @@ fn test_struct_bitand_overload_inline_method_is_substituted() {
 
         impl BitAnd for Flags {
             #[inline]
-            fn bitand(self: Self, rhs: Self) -> Self {
+            func bitand(self: Self, rhs: Self) -> Self {
                 Flags::{ bits: self.bits & rhs.bits }
             }
         }
 
-        fn and_flags(a: Flags, b: Flags) -> Flags {
+        func and_flags(a: Flags, b: Flags) -> Flags {
             a & b
         }
 
@@ -1576,12 +1734,12 @@ fn test_struct_bitnot_overload_lowers_to_call() {
         struct Flags { bits: i32 }
 
         impl BitNot for Flags {
-            fn bitnot(self: Self) -> Self {
+            func bitnot(self: Self) -> Self {
                 Flags::{ bits: ^self.bits }
             }
         }
 
-        fn not_flags(a: Flags) -> Flags {
+        func not_flags(a: Flags) -> Flags {
             ^a
         }
 
@@ -1597,12 +1755,12 @@ fn test_struct_bitnot_overload_inline_method_is_substituted() {
 
         impl BitNot for Flags {
             #[inline]
-            fn bitnot(self: Self) -> Self {
+            func bitnot(self: Self) -> Self {
                 Flags::{ bits: ^self.bits }
             }
         }
 
-        fn not_flags(a: Flags) -> Flags {
+        func not_flags(a: Flags) -> Flags {
             ^a
         }
 
@@ -1618,11 +1776,11 @@ fn test_generic_bitand_bound_resolves_to_primitive_impl() {
 	// (intrinsic-backed) impl — the generic-bound counterpart of the struct
 	// tests above, exercising primitives instead.
 	let case = TestCase::new(indoc! {"
-        fn and_it<T: BitAnd>(a: T, b: T) -> T {
+        func and_it<T: BitAnd>(a: T, b: T) -> T {
             a & b
         }
 
-        fn use_and(a: i32, b: i32) -> i32 {
+        func use_and(a: i32, b: i32) -> i32 {
             and_it(a, b)
         }
 
@@ -1634,17 +1792,17 @@ fn test_generic_bitand_bound_resolves_to_primitive_impl() {
 #[test]
 fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
 	// Unary counterpart of `test_generic_bitand_bound_resolves_to_primitive_impl`
-	// — `build_unary_operator_dispatch` previously had no `Type::TypeParam`
+	// — `build_unary_operator_dispatch` previously had no `ValueType::TypeParam`
 	// branch, so a bare type param bounded by `BitNot` failed to dispatch
 	// at all. Now it goes through `resolve_bounded_operator_method` and
 	// monomorphizes to `i32`'s own (intrinsic-backed) impl, same as the
 	// binary case.
 	let case = TestCase::new(indoc! {"
-        fn not_it<T: BitNot>(a: T) -> T {
+        func not_it<T: BitNot>(a: T) -> T {
             ^a
         }
 
-        fn use_not(a: i32) -> i32 {
+        func use_not(a: i32) -> i32 {
             not_it(a)
         }
 
@@ -1654,17 +1812,83 @@ fn test_generic_bitnot_bound_resolves_to_primitive_impl() {
 }
 
 #[test]
+fn test_not_operator_on_bool_lowers_to_eqz() {
+	// `!x` dispatches through `Not`; `bool`'s `#[inline] impl` is backed by
+	// the `i32_eqz` intrinsic, so after inlining + DCE only `negate` is left
+	// and its result expression is a bare `Eqz` node — the same shape `!`
+	// produced before it became trait-dispatched.
+	let case = TestCase::new(indoc! {"
+        func negate(a: bool) -> bool {
+            !a
+        }
+
+        export { negate }
+    "});
+	assert_eq!(case.mir.functions.len(), 1, "bool::not inlined away");
+	let mut result = &mir_function(&case, "negate").block;
+	while let ExprKind::Block { expressions, .. } = &result.kind {
+		result = expressions.last().expect("a block has a result expression");
+	}
+	assert!(
+		matches!(result.kind, ExprKind::Eqz { .. }),
+		"expected `!a` to lower to Eqz"
+	);
+}
+
+#[test]
+fn test_generic_partial_eq_bound_lowers_to_native_eq() {
+	// A `<T: PartialEq>` bound instantiated at `i32` monomorphizes to
+	// `impl PartialEq for i32`, whose `#[inline]` body is the `i32_eq`
+	// intrinsic — so after inlining the comparison is a bare `Eq` node, with
+	// no residual call to an `eq` method.
+	let case = TestCase::new(indoc! {"
+        func equal<T: PartialEq>(a: T, b: T) -> bool {
+            a == b
+        }
+
+        func use_equal(a: i32, b: i32) -> bool {
+            equal(a, b)
+        }
+
+        export { use_equal }
+    "});
+	// use_equal + equal<i32> — i32::eq is inlined away, no third function.
+	assert_eq!(case.mir.functions.len(), 2);
+
+	fn contains_eq(expr: &Expression) -> bool {
+		match &expr.kind {
+			ExprKind::Eq { .. } => true,
+			ExprKind::Block { expressions, .. } => {
+				expressions.iter().any(contains_eq)
+			}
+			ExprKind::Call { arguments, .. } => {
+				arguments.iter().any(contains_eq)
+			}
+			ExprKind::LocalSet { value, .. } => contains_eq(value),
+			ExprKind::And { left, right } => {
+				contains_eq(left) || contains_eq(right)
+			}
+			_ => false,
+		}
+	}
+	assert!(
+		case.mir.functions.iter().any(|f| contains_eq(&f.block)),
+		"expected `a == b` to lower to a native Eq node after inlining"
+	);
+}
+
+#[test]
 fn test_struct_compound_assignment_lowers_to_add_call() {
 	let case = TestCase::new(indoc! {"
         struct Vec2 { x: i32, y: i32 }
 
         impl Add for Vec2 {
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        fn add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
+        func add_assign_vec2(mut a: Vec2, b: Vec2) -> Vec2 {
             a += b;
             a
         }
@@ -1680,12 +1904,12 @@ fn test_struct_compound_assignment_lowers_to_bitand_call() {
         struct Flags { bits: i32 }
 
         impl BitAnd for Flags {
-            fn bitand(self: Self, rhs: Self) -> Self {
+            func bitand(self: Self, rhs: Self) -> Self {
                 Flags::{ bits: self.bits & rhs.bits }
             }
         }
 
-        fn and_assign_flags(mut a: Flags, b: Flags) -> Flags {
+        func and_assign_flags(mut a: Flags, b: Flags) -> Flags {
             a &= b;
             a
         }
@@ -1736,8 +1960,8 @@ fn function_body_statements<'a>(
 	}
 }
 
-/// `(scope, local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
-fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
+/// `(local, value_index)` of a `LocalSet` fed by an `AggregateGet`.
+fn destructured_store(expr: &Expression) -> (LocalIndex, PhysIndex) {
 	let ExprKind::LocalSet {
 		local_index, value, ..
 	} = &expr.kind
@@ -1745,7 +1969,6 @@ fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
 		panic!("expected a `LocalSet`")
 	};
 	let ExprKind::AggregateGet {
-		scope_index: from_scope,
 		local_index: from_local,
 		value_index,
 	} = &value.kind
@@ -1753,7 +1976,7 @@ fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
 		panic!("a destructured binding reads its value with `AggregateGet`")
 	};
 	let _ = local_index;
-	(*from_scope, *from_local, *value_index)
+	(*from_local, *value_index)
 }
 
 /// The whole point of `DestructureDeclaration`: the initializer runs once,
@@ -1761,8 +1984,8 @@ fn destructured_store(expr: &Expression) -> (ScopeIndex, LocalIndex, u32) {
 #[test]
 fn test_tuple_destructuring_evaluates_initializer_once() {
 	let case = TestCase::new(indoc! {"
-        fn make() -> (i32, i32) { (1, 2) }
-        fn f() -> i32 {
+        func make() -> (i32, i32) { (1, 2) }
+        func f() -> i32 {
             local (a, b) = make();
             a + b
         }
@@ -1773,23 +1996,21 @@ fn test_tuple_destructuring_evaluates_initializer_once() {
 
 	// [0] spills `make()` into a temp; [1] and [2] read fields out of it.
 	let ExprKind::LocalSet {
-		scope_index: temp_scope,
 		local_index: temp_local,
 		value,
 	} = &statements[0].kind
 	else {
 		panic!("the initializer is spilled into a local first")
 	};
-	assert_eq!(*temp_scope, 0, "temps live in the function root scope");
 	assert!(
 		matches!(value.kind, ExprKind::Call { .. }),
 		"the spilled value is the call itself, evaluated exactly once"
 	);
 
-	let (a_scope, a_local, _) = destructured_store(&statements[1]);
-	let (b_scope, b_local, _) = destructured_store(&statements[2]);
-	assert_eq!((a_scope, a_local), (0, *temp_local));
-	assert_eq!((b_scope, b_local), (0, *temp_local));
+	let (a_local, _) = destructured_store(&statements[1]);
+	let (b_local, _) = destructured_store(&statements[2]);
+	assert_eq!(a_local, *temp_local);
+	assert_eq!(b_local, *temp_local);
 
 	// And the call appears exactly once in the whole body.
 	let calls = statements
@@ -1803,7 +2024,7 @@ fn test_tuple_destructuring_evaluates_initializer_once() {
 #[test]
 fn test_destructuring_a_local_scrutinee_skips_the_spill() {
 	let case = TestCase::new(indoc! {"
-        fn f(pair: (i32, i32)) -> i32 {
+        func f(pair: (i32, i32)) -> i32 {
             local (a, b) = pair;
             a + b
         }
@@ -1812,12 +2033,12 @@ fn test_destructuring_a_local_scrutinee_skips_the_spill() {
 	assert!(case.tir.diagnostics.is_empty());
 	let statements = function_body_statements(&case, "f");
 
-	// `pair` is parameter 0 of scope 0, so both bindings read straight from
-	// it and there is no spilling `LocalSet` ahead of them.
-	let (a_scope, a_local, _) = destructured_store(&statements[0]);
-	let (b_scope, b_local, _) = destructured_store(&statements[1]);
-	assert_eq!((a_scope, a_local), (0, 0));
-	assert_eq!((b_scope, b_local), (0, 0));
+	// `pair` is flat local 0, so both bindings read straight from it and
+	// there is no spilling `LocalSet` ahead of them.
+	let (a_local, _) = destructured_store(&statements[0]);
+	let (b_local, _) = destructured_store(&statements[1]);
+	assert_eq!(a_local, LocalIndex::new(0));
+	assert_eq!(b_local, LocalIndex::new(0));
 }
 
 /// Tuple elements are alignment-sorted exactly like struct fields, so a
@@ -1826,7 +2047,7 @@ fn test_destructuring_a_local_scrutinee_skips_the_spill() {
 #[test]
 fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
 	let case = TestCase::new(indoc! {"
-        fn f(t: (bool, i64, u32)) -> i64 {
+        func f(t: (bool, i64, u32)) -> i64 {
             local (a, b, c) = t;
             b
         }
@@ -1834,20 +2055,23 @@ fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
     "});
 	assert_no_errors(&case);
 
-	let sig_index = mir_function(&case, "f").signature_index as usize;
+	let sig_index = usize::from(mir_function(&case, "f").signature_index);
 	let param_ty = case.mir.signatures[sig_index].params()[0];
-	let Type::Aggregate { aggregate_index } = param_ty else {
+	let ValueType::Aggregate { aggregate_index } = param_ty else {
 		panic!("a tuple parameter lowers to an aggregate")
 	};
-	let agg = &case.mir.aggregates[aggregate_index as usize];
+	let agg = case.mir.aggregate(aggregate_index);
 	// Sorted by alignment descending: i64, u32, bool.
-	assert_eq!(&*agg.values, &[Type::I64, Type::U32, Type::Bool]);
-	assert_eq!(&*agg.decl_to_phys, &[2, 0, 1]);
+	let types: Vec<ValueType> = agg.fields.iter().map(|f| f.ty).collect();
+	assert_eq!(types, [ValueType::I64, ValueType::U32, ValueType::Bool]);
+	let phys: Vec<usize> =
+		(0..3).map(|d| usize::from(agg.physical(d))).collect();
+	assert_eq!(phys, [2, 0, 1]);
 
 	let statements = function_body_statements(&case, "f");
-	let slots: Vec<u32> = statements[..3]
+	let slots: Vec<usize> = statements[..3]
 		.iter()
-		.map(|e| destructured_store(e).2)
+		.map(|e| usize::from(destructured_store(e).1))
 		.collect();
 	assert_eq!(
 		slots,
@@ -1860,7 +2084,7 @@ fn test_tuple_destructuring_maps_through_alignment_sorted_slots() {
 fn test_struct_destructuring_reads_declared_fields() {
 	let case = TestCase::new(indoc! {"
         struct Mixed { a: bool, b: i64 }
-        fn f(m: Mixed) -> i64 {
+        func f(m: Mixed) -> i64 {
             local Mixed::{ a, b } = m;
             b
         }
@@ -1869,8 +2093,8 @@ fn test_struct_destructuring_reads_declared_fields() {
 	assert_no_errors(&case);
 	let statements = function_body_statements(&case, "f");
 	// `b` (i64) sorts ahead of `a` (bool), so `a` is physical slot 1.
-	assert_eq!(destructured_store(&statements[0]).2, 1);
-	assert_eq!(destructured_store(&statements[1]).2, 0);
+	assert_eq!(usize::from(destructured_store(&statements[0]).1), 1);
+	assert_eq!(usize::from(destructured_store(&statements[1]).1), 0);
 }
 
 /// Nested patterns are flattened into projection paths, so an inner binding
@@ -1878,7 +2102,7 @@ fn test_struct_destructuring_reads_declared_fields() {
 #[test]
 fn test_nested_tuple_destructuring_projects_through_a_temp() {
 	let case = TestCase::new(indoc! {"
-        fn f(t: (i32, (i32, i32))) -> i32 {
+        func f(t: (i32, (i32, i32))) -> i32 {
             local (x, (y, z)) = t;
             x + y + z
         }
@@ -1890,11 +2114,45 @@ fn test_nested_tuple_destructuring_projects_through_a_temp() {
 	// `t` is already a local, so nothing spills for `x`. Each deeper binding
 	// spills the intermediate `t.1` just before its own store, giving
 	// [x, spill, y, spill, z].
-	let (x_scope, x_local, _) = destructured_store(&statements[0]);
-	assert_eq!((x_scope, x_local), (0, 0), "`x` reads `t` directly");
+	let (x_local, _) = destructured_store(&statements[0]);
+	assert_eq!(x_local, LocalIndex::new(0), "`x` reads `t` directly");
 
-	let (_, y_from, _) = destructured_store(&statements[2]);
-	let (_, z_from, _) = destructured_store(&statements[4]);
-	assert_ne!(y_from, 0, "`y` reads the spilled inner tuple, not `t`");
-	assert_ne!(z_from, 0, "`z` reads the spilled inner tuple, not `t`");
+	let (y_from, _) = destructured_store(&statements[2]);
+	let (z_from, _) = destructured_store(&statements[4]);
+	assert_ne!(
+		y_from,
+		LocalIndex::new(0),
+		"`y` reads the spilled inner tuple, not `t`"
+	);
+	assert_ne!(
+		z_from,
+		LocalIndex::new(0),
+		"`z` reads the spilled inner tuple, not `t`"
+	);
+}
+
+#[test]
+fn test_supertrait_member_dispatch_monomorphizes_declaring_trait() {
+	let case = TestCase::new(indoc! {"
+		trait Parent { func value(self) -> i32; }
+		trait Child: Parent {}
+		trait Grandchild: Child {}
+		struct S { n: i32 }
+		impl Parent for S { func value(self) -> i32 { self.n } }
+		impl Child for S {}
+		impl Grandchild for S {}
+		func read<T: Grandchild>(x: T) -> i32 { x.value() }
+		pub func run(n: i32) -> i32 { read(S::{ n: n }) }
+		export { run }
+	"});
+	crate::testing::DiagnosticView::new(
+		"check",
+		&case.tir.diagnostics,
+		&case.graph.files,
+	)
+	.assert_no_errors();
+	// MIR construction must dispatch the abstract call through Parent's impl,
+	// even though the generic function only declares the Grandchild bound.
+	assert_eq!(case.mir.exports.len(), 1);
+	assert!(case.mir.functions.iter().any(|f| matches!(case.mir.exports[0], ExportItem::Function { id, .. } if id == f.id)));
 }

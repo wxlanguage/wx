@@ -7,7 +7,7 @@ use codespan_reporting::files;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast;
-use crate::diagnostics::DiagnosticCode;
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 
 mod manifest;
 pub use manifest::{
@@ -149,7 +149,7 @@ impl File {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct FileId(u32);
 
 impl FileId {
@@ -302,7 +302,7 @@ pub struct ModuleDeclaration {
 	pub name: ast::Spanned<SymbolU32>,
 	/// Whether the declaration was `pub`. Independently optional — a
 	/// declaration that exists but isn't `pub` is a normal, valid state.
-	pub pub_span: Option<ast::TextSpan>,
+	pub pub_span: Option<TextSpan>,
 }
 
 pub struct SourceModule {
@@ -324,35 +324,26 @@ pub struct SourceModule {
 pub enum PackageKind {
 	/// Produces a WASM module and cannot be imported.
 	Binary,
-	/// Importable, and subject to the library restrictions (no `export`,
-	/// no `memory`, ...).
+	/// Importable, and subject to library restrictions (no `memory`, ...).
+	/// Export blocks describe compilation metadata only for the selected crate.
 	Library,
 }
 
-pub struct PackageGraph {
+pub struct Package {
 	pub id: PackageId,
 	pub root: ModuleId,
 	pub kind: PackageKind,
-	/// The other packages *this* package may refer to, keyed by the name it
-	/// refers to them by — its own `dependencies` keys, plus the implicit
-	/// `std`.
+	/// The packages this package's manifest declares, by the key it
+	/// declares them under. A key only *makes a package available*: nothing
+	/// is nameable in the source until a package instance,
+	/// `crate "<key>" as <alias>;`, instantiates it, which is also what lets
+	/// one package be instantiated under several aliases, in any module. The stdlib is registered here
+	/// first, as `std`, since every package depends on it.
 	///
-	/// A name lives here, on the edge, rather than on the target: the same
+	/// A key lives here, on the edge, rather than on the target: the same
 	/// package can legitimately be `foo` here and `bar` in another package's
-	/// map, and no package has a name of its own at all. Nothing outside
-	/// this map can name a package, which is what keeps a transitive
-	/// dependency invisible to anyone who didn't declare it.
-	///
-	/// Read these as an implicit `mod <key>;` at the top of the package's
-	/// entry file — that's exactly the meaning TIR gives them, and why a
-	/// local `mod foo;` colliding with a key here is an ordinary
-	/// duplicate definition rather than an ambiguity to arbitrate.
+	/// map, and no package has a name of its own at all.
 	pub dependencies: HashMap<SymbolU32, PackageId>,
-	/// Inverse of [`Self::dependencies`]. Well-defined only because
-	/// [`CompilationUnitBuilder::add_dependency`] keeps the mapping
-	/// injective: a package is declared under exactly one name here, which
-	/// is what makes that name its canonical one — it has none of its own.
-	pub dependency_names: HashMap<PackageId, SymbolU32>,
 	pub entry_path: AbsolutePath,
 	pub modules: Vec<SourceModule>,
 	pub diagnostics: Vec<Diagnostic<FileId>>,
@@ -361,7 +352,7 @@ pub struct PackageGraph {
 
 pub struct CompilationUnit {
 	pub files: Files,
-	pub packages: Vec<PackageGraph>,
+	pub packages: Vec<Package>,
 	pub root_package: PackageId,
 	/// The package providing the language's `#[tag = "..."]` items (the
 	/// twelve operator traits `resolve_operator_traits` looks up). Always
@@ -369,8 +360,7 @@ pub struct CompilationUnit {
 	/// `Option`. Equal to `root_package` when the root package *is* the
 	/// stdlib.
 	pub stdlib_package: PackageId,
-	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
+	pub strings: ast::StringInterner,
 }
 
 impl CompilationUnit {
@@ -407,9 +397,8 @@ impl CompilationUnit {
 
 pub struct CompilationUnitBuilder {
 	pub files: Files,
-	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
-	pub packages: Vec<PackageGraph>,
+	pub strings: ast::StringInterner,
+	pub packages: Vec<Package>,
 	/// Set once the stdlib exists, and seeded into every package loaded
 	/// afterwards as its implicit `std` dependency. `None` only while the
 	/// stdlib itself is being loaded — which is exactly what keeps it from
@@ -486,8 +475,7 @@ impl CompilationUnitBuilder {
 	pub fn new() -> Self {
 		Self {
 			files: Files::new(),
-			id_generator: ast::DefIdGenerator::new(),
-			interner: ast::StringInterner::new(),
+			strings: ast::Keyword::create_interner(),
 			packages: Vec::new(),
 			stdlib: None,
 		}
@@ -539,18 +527,14 @@ impl CompilationUnitBuilder {
 		self.load_package(PackageKind::Binary, entry_path, file_source)
 	}
 
-	/// Records that `owner` refers to `dependency` by `name`, diagnosing a
-	/// collision itself rather than handing one back.
+	/// Records that `owner`'s manifest declares `dependency` under `name`,
+	/// diagnosing a collision itself rather than handing one back.
 	///
-	/// A `dependencies` entry is a *declaration*, not an alias — it's what
-	/// introduces a package into the compilation, the way `mod foo;`
-	/// introduces a module. So the mapping is kept one-to-one in both
-	/// directions: declaring one package under two names is a duplicate
-	/// declaration, and a second name is spelled with an alias instead.
-	///
-	/// An existing binding always wins, which is what makes the seeded `std`
-	/// survive a manifest that tries to bind that name — the stdlib is
-	/// unreplaceable with no reserved-key check anywhere.
+	/// A key is a declaration of availability, not a binding, so the same
+	/// package may be declared under several keys. Two declarations of one
+	/// *name* are different: nothing says which of them a package instance means.
+	/// An existing entry always wins, which is what makes the `std` registered
+	/// first survive a manifest that tries to use that name.
 	pub fn add_dependency(
 		&mut self,
 		owner: PackageId,
@@ -558,34 +542,19 @@ impl CompilationUnitBuilder {
 		dependency: PackageId,
 	) {
 		let package = &mut self.packages[owner.as_usize()];
-		if let Some(existing) =
-			package.dependency_names.get(&dependency).copied()
-		{
-			let diagnostic = Diagnostic::error()
-				.with_code(DiagnosticCode::PackageDeclaredTwice.code())
-				.with_message(format!(
-					"this package is already declared as `{}`, so it cannot \
-			 also be declared as `{}`",
-					self.interner.resolve(existing).unwrap(),
-					self.interner.resolve(name).unwrap(),
-				));
-			package.diagnostics.push(diagnostic);
-			return;
-		}
 		if package.dependencies.contains_key(&name) {
 			let diagnostic = Diagnostic::error()
 				.with_code(DiagnosticCode::DuplicatePackageName.code())
 				.with_message(format!(
 					"the name `{}` is already used by another package this one \
-			 depends on",
-					self.interner.resolve(name).unwrap()
+					 depends on",
+					self.strings.resolve(name).unwrap()
 				));
 			package.diagnostics.push(diagnostic);
 			return;
 		}
 
 		package.dependencies.insert(name, dependency);
-		package.dependency_names.insert(dependency, name);
 	}
 
 	/// Loads a package starting from `entry_path`. Fails only if the entry
@@ -601,23 +570,19 @@ impl CompilationUnitBuilder {
 	) -> Result<PackageId, ()> {
 		let package_id = PackageId(self.packages.len() as u32);
 
-		// Every package can reach the stdlib under the name `std` without
-		// declaring it — seeded here rather than left to each caller so it
-		// cannot be forgotten, and seeded *before* any manifest key is
-		// inserted so that declaring `"std"` yourself collides with it
-		// instead of replacing it. `self.stdlib` is still `None` while the
-		// stdlib itself is being loaded, so it never depends on itself.
+		// Every package depends on the stdlib, so it is registered first,
+		// under the name `std`, before any manifest key: declaring `"std"`
+		// yourself then collides with it instead of replacing it.
+		// `self.stdlib` is still `None` while the stdlib itself is being
+		// loaded, so it never depends on itself.
 		//
 		// Computed before the loader takes its `&mut self`.
-		let (dependencies, dependency_names) = match self.stdlib {
+		let dependencies = match self.stdlib {
 			Some(stdlib) => {
-				let std = self.interner.get_or_intern("std");
-				(
-					HashMap::from([(std, stdlib)]),
-					HashMap::from([(stdlib, std)]),
-				)
+				let std = self.strings.get_or_intern("std");
+				HashMap::from([(std, stdlib)])
 			}
-			None => (HashMap::new(), HashMap::new()),
+			None => HashMap::new(),
 		};
 
 		let mut loader = Loader::new(self, package_id, file_source);
@@ -627,11 +592,10 @@ impl CompilationUnitBuilder {
 
 		// Built into a local first: moving the loader's fields out here is
 		// what ends its borrow of `self`, which the push then needs.
-		let package_graph = PackageGraph {
+		let package_graph = Package {
 			id: package_id,
 			kind,
 			dependencies,
-			dependency_names,
 			root,
 			entry_path,
 			modules: loader.modules,
@@ -647,10 +611,7 @@ impl CompilationUnitBuilder {
 	/// exactly one provider of the language's `#[tag = "..."]` items — the
 	/// embedded stdlib, or the root package itself when it declares
 	/// `"type": "std"` — so a `CompilationUnit` without one isn't a state
-	/// worth representing. The stdlib is taken from the builder rather than
-	/// passed in, so the value that gets recorded is necessarily the same
-	/// one that was seeded into every package's dependencies; passing it
-	/// separately would let the two disagree.
+	///worth representing.
 	pub fn build(self, root_package: PackageId) -> CompilationUnit {
 		let stdlib_package = self.stdlib.expect(
 			"a stdlib must be established (`load_stdlib` or `set_stdlib`) \
@@ -661,8 +622,7 @@ impl CompilationUnitBuilder {
 			packages: self.packages,
 			root_package,
 			stdlib_package,
-			id_generator: self.id_generator,
-			interner: self.interner,
+			strings: self.strings,
 		}
 	}
 }
@@ -720,29 +680,32 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			.expect(
 				"file count should never realistically approach FileId's limit",
 			);
-		let ast = ast::Parser::parse(
-			file_id,
-			&self.ctx.files,
-			&mut self.ctx.interner,
-			&mut self.ctx.id_generator,
-		);
-		let child_decls: Box<
-			[(ast::Spanned<SymbolU32>, Option<ast::TextSpan>)],
-		> = ast.items
+		let ast =
+			ast::Parser::parse(file_id, &self.ctx.files, &mut self.ctx.strings);
+
+		let module_id = ModuleId(self.modules.len() as u32);
+		let child_decls: Box<[ModuleDeclaration]> = ast
+			.items
 			.iter()
 			.filter_map(|item| match &item.inner.inner {
 				ast::Item::ModuleDeclaration { name, pub_span } => {
-					Some((*name, *pub_span))
+					Some(ModuleDeclaration {
+						parent: module_id,
+						name: *name,
+						pub_span: *pub_span,
+					})
 				}
 				ast::Item::Module { items, .. } => {
-					self.diagnose_nested_module_declarations(file_id, items);
+					self.check_nested_module_declarations(
+						file_id,
+						&items.inner,
+					);
 					None
 				}
 				_ => None,
 			})
 			.collect();
 
-		let module_id = ModuleId(self.modules.len() as u32);
 		self.path_to_module.insert(file_path.clone(), module_id);
 		self.modules.push(SourceModule {
 			package_id: self.package_id,
@@ -754,10 +717,12 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 		});
 
 		let mut children = Vec::with_capacity(child_decls.len());
-		for (child_name, child_pub_span) in child_decls {
-			let Some(child_path) =
-				self.resolve_child_module_path(&owned_dir, child_name, file_id)
-			else {
+		for module in child_decls.into_iter() {
+			let Some(child_path) = self.resolve_child_module_path(
+				&owned_dir,
+				module.name,
+				file_id,
+			) else {
 				continue; // already diagnosed as ambiguous
 			};
 			// A module's own children always live under a directory named
@@ -766,18 +731,15 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			// same `owned_dir` for its children (both `src/math/`), same as
 			// Rust's `foo.rs`/`foo/mod.rs` being interchangeable.
 			let child_name_str =
-				self.ctx.interner.resolve(child_name.inner).expect(
+				self.ctx.strings.resolve(module.name.inner).expect(
 					"module symbol should resolve while loading package",
 				);
 			let child_owned_dir =
 				owned_dir.join(&RelativePath::new(child_name_str.to_string()));
+			let name_span = SourceSpan::new(file_id, module.name.span);
 			match self.load_module(
 				child_path.clone(),
-				Some(ModuleDeclaration {
-					parent: module_id,
-					name: child_name,
-					pub_span: child_pub_span,
-				}),
+				Some(module),
 				child_owned_dir,
 			) {
 				Ok(child_id) => children.push(child_id),
@@ -788,13 +750,9 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 							"module file not found: `{}`",
 							child_path.as_str()
 						))
-						.with_label(
-							Label::primary(file_id, child_name.span)
-								.with_message(format!(
-									"no such file: `{}`",
-									child_path.as_str()
-								)),
-						);
+						.with_label(name_span.primary_label().with_message(
+							format!("no such file: `{}`", child_path.as_str()),
+						));
 					self.diagnostics.push(diagnostic);
 				}
 			}
@@ -810,7 +768,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	/// require walking up through however many inline wrappers enclose it
 	/// (unlike Rust, which resolves it by accumulating a directory segment
 	/// per inline level).
-	fn diagnose_nested_module_declarations(
+	fn check_nested_module_declarations(
 		&mut self,
 		file_id: FileId,
 		items: &[ast::Separated<ast::Spanned<ast::Item>>],
@@ -834,7 +792,10 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 					self.diagnostics.push(diagnostic);
 				}
 				ast::Item::Module { items, .. } => {
-					self.diagnose_nested_module_declarations(file_id, items);
+					self.check_nested_module_declarations(
+						file_id,
+						&items.inner,
+					);
 				}
 				_ => {}
 			}
@@ -858,7 +819,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	) -> Option<AbsolutePath> {
 		let module_name = self
 			.ctx
-			.interner
+			.strings
 			.resolve(child_module_name.inner)
 			.expect("module symbol should resolve while loading package");
 		let sibling_file =

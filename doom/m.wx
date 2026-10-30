@@ -10,11 +10,11 @@ struct Layout<M: Memory> {
 }
 
 impl<M: Memory> Layout<M> {
-    fn of<T>() -> Self {
+    func of<T>() -> Self {
         Self::{ size: size_of::<T>(), align: align_of::<T>() }
     }
 
-    fn array<T>(count: M::Size) -> Self {
+    func array<T>(count: M::Size) -> Self {
         Self::{ size: <size_of<T>>() * count, align: align_of::<T>() }
     }
 }
@@ -22,7 +22,7 @@ impl<M: Memory> Layout<M> {
 trait Allocator {
     type M: Memory;
 
-    fn alloc(self: Self::M::*Self, layout: Layout<Self::M>) -> *u8;
+    func alloc(self: Self::M::*Self, layout: Layout<Self::M>) -> *u8;
 }
 
 struct BumpAllocator<M: Memory> {
@@ -30,17 +30,17 @@ struct BumpAllocator<M: Memory> {
 }
 
 mod xor {
-    pub fn test() {}
+    pub func test() {}
 }
 
 impl<M: Memory> BumpAllocator<M> {
-    fn new() {}
+    func new() {}
 }
 
 impl Allocator for BumpAllocator<heap> {
     type M = heap;
 
-    fn alloc(self: Self::M::*Self, layout: Layout<Self::M>) -> *u8 {
+    func alloc(self: Self::M::*Self, layout: Layout<Self::M>) -> *u8 {
         local start = ptr::align_up::<Self::M>(self.*.bump, layout.align);
 
         // 2. Calculate the end address of this allocation
@@ -63,35 +63,35 @@ impl Allocator for BumpAllocator<heap> {
         self.*.bump = end;
         
         // 5. Cast and return the starting address
-        start as _
+        transmute(start)
     }
 }
 
-fn main() {
-    local bump: BumpAllocator<heap> = unreachable;
+func main() {
+    local bump: BumpAllocator<heap> = trap();
     local ptr = bump.alloc(Layout::{ size: 4, align: 1 });
 }
 
 // ── bump allocator ────────────────────────────────────────────────────────────
 global mut bump: heap::*u8 = heap::DATA_END;
 
-fn alloc_bytes(size: u32, align: u32) -> heap::*u8 {
-    local ptr = ptr::align_up::<heap>(bump as u32, align);
+func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
+    local ptr = ptr::align_up::<heap>(transmute(bump), align);
     local new_end = ptr + size;
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
         local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     }
-    bump = new_end as heap::*u8;
-    ptr as heap::*u8
+    bump = transmute(new_end);
+    transmute(ptr)
 }
 
-fn alloc_array<T>(count: u32) -> heap::*T {
-    alloc_bytes(size_of::<T, heap>() * count, align_of::<T, heap>()) as _
+func alloc_array<T>(count: u32) -> heap::*T {
+    transmute(alloc_bytes(size_of::<T, heap>() * count, align_of::<T, heap>()))
 }
 
-pub fn reset() {
+pub func reset() {
     bump = heap::DATA_END;
 }
 
@@ -104,20 +104,20 @@ struct Vec<T> {
 
 impl<T> Vec<T> {
     #[inline]
-    pub fn new() -> Vec<T> {
+    pub func new() -> Vec<T> {
         Vec::{ buf: ptr::null_mut(), len: 0, cap: 0 }
     }
 
     // Appends a value; grows the buffer if needed (doubles capacity each time).
-    pub fn push(self: heap::*Self, value: T) {
+    pub func push(self: heap::*Self, value: T) {
         if self.*.len == self.*.cap {
             local new_cap = if self.*.cap == 0 { 4 } else { self.*.cap * 2 };
             local new_buf = alloc_array::<T>(new_cap);
             if self.*.cap != 0 {
                 local bytes = self.*.len * size_of::<T, heap>();
                 memory_copy(
-                    new_buf as heap::*u8,
-                    self.*.buf as heap::&u8,
+                    transmute::<_, heap::*u8>(new_buf),
+                    transmute::<_, heap::&u8>(self.*.buf),
                     bytes,
                 );
             };
@@ -129,13 +129,13 @@ impl<T> Vec<T> {
     }
 
     // Removes and returns the last element. Caller must ensure len > 0.
-    pub fn pop(self: heap::*Self) -> T {
+    pub func pop(self: heap::*Self) -> T {
         self.*.len -= 1;
         ptr::add(self.*.buf, self.*.len).*
     }
 
     // Removes the element at index, shifting everything after it left. O(n).
-    pub fn remove(self: heap::*Self, index: u32) -> T {
+    pub func remove(self: heap::*Self, index: u32) -> T {
         local val = ptr::add(self.*.buf, index).*;
         local mut i: u32 = index;
         loop {
@@ -148,7 +148,7 @@ impl<T> Vec<T> {
     }
 
     // Removes the element at index by swapping it with the last. O(1), no order.
-    pub fn swap_remove(self: heap::*Self, index: u32) -> T {
+    pub func swap_remove(self: heap::*Self, index: u32) -> T {
         local val = ptr::add(self.*.buf, index).*;
         self.*.len -= 1;
         if index != self.*.len {
@@ -158,50 +158,50 @@ impl<T> Vec<T> {
         val
     }
 
-    pub fn get(self: heap::&Self, index: u32) -> T {
+    pub func get(self: heap::&Self, index: u32) -> T {
         ptr::add(self.*.buf, index).*
     }
 
-    pub fn set(self: heap::*Self, index: u32, value: T) {
+    pub func set(self: heap::*Self, index: u32, value: T) {
         ptr::add_mut(self.*.buf, index).* = value;
     }
 
-    pub fn swap(self: heap::*Self, a: u32, b: u32) {
+    pub func swap(self: heap::*Self, a: u32, b: u32) {
         local tmp = ptr::add(self.*.buf, a).*;
         ptr::add_mut(self.*.buf, a).* = ptr::add(self.*.buf, b).*;
         ptr::add_mut(self.*.buf, b).* = tmp;
     }
 
-    pub fn first(self: heap::&Self) -> T {
+    pub func first(self: heap::&Self) -> T {
         self.*.buf.*
     }
 
-    pub fn last(self: heap::&Self) -> T {
+    pub func last(self: heap::&Self) -> T {
         ptr::add(self.*.buf, self.*.len - 1).*
     }
 
-    pub fn clear(self: heap::*Self) {
+    pub func clear(self: heap::*Self) {
         self.*.len = 0;
     }
 
     #[inline]
-    pub fn len(self: heap::&Self) -> u32 {
+    pub func len(self: heap::&Self) -> u32 {
         self.*.len
     }
 
     #[inline]
-    pub fn cap(self: heap::&Self) -> u32 {
+    pub func cap(self: heap::&Self) -> u32 {
         self.*.cap
     }
 
     #[inline]
-    pub fn is_empty(self: heap::&Self) -> bool {
+    pub func is_empty(self: heap::&Self) -> Bool {
         self.*.len == 0
     }
 }
 
 // ── demo ─────────────────────────────────────────────────────────────────────
-pub fn demo() -> i32 {
+pub func demo() -> i32 {
     local vec = alloc_array::<Vec<i32>>(1);
     vec.* = Vec::new();
     

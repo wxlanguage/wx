@@ -1,10 +1,10 @@
 //! Diagnostic-code plumbing shared by every reporting stage.
 //!
 //! Diagnostic codes share one [`DiagnosticCode`] enum while retaining a
-//! stage-specific number range: `ast` uses E0xxx, `tir` uses E1xxx, and `vfs`
-//! uses E2xxx.
+//! stage-specific number range, ordered by which stage runs first: `vfs`
+//! uses E0xxx, `ast` uses E1xxx, and `tir` uses E2xxx.
 //!
-use codespan_reporting::diagnostic::{Diagnostic, Severity};
+use codespan_reporting::diagnostic::{Diagnostic, Label, Severity};
 
 use crate::vfs::FileId;
 
@@ -84,124 +84,216 @@ macro_rules! define_diagnostic_codes {
 define_diagnostic_codes! {
 	/// A diagnostic emitted by any compiler stage.
 	pub enum DiagnosticCode {
-		// AST diagnostics (E0xxx/W0xxx).
-		UnknownToken => "E0001",
-		UnexpectedToken => "E0002",
-		MissingSeparator => "E0003",
-		UnclosedDelimiter => "E0004",
-		InvalidNumericLiteral => "E0005",
-		IncompleteExpression => "E0006",
-		ChainedComparison => "E0007",
-		ReservedIdentifier => "E0008",
-		InvalidItem => "E0009",
-		MissingInitializer => "E0010",
-		InvalidAttribute => "E0012",
-		InvalidNamespace => "E0013",
-		InvalidLabel => "E0014",
-		InvalidBindingPattern => "E0015",
-		CrlfLineEndings => "W0001",
-		VisibilityNotPermitted => "W0002",
+		// VFS diagnostics (E0xxx).
+		ModuleFileNotFound => "E0000",
+		AmbiguousModuleFile => "E0001",
+		DuplicatePackageName => "E0002",
+		CircularDependency => "E0003",
+		StdPackageAsDependency => "E0004",
 
-		// TIR diagnostics (E1xxx/W1xxx).
-		DuplicateDefinition => "E1000",
-		TypeMistmatch => "E1001",
-		TypeAnnotationRequired => "E1002",
-		UnusedValue => "E1003",
-		IntegerLiteralOutOfRange => "E1004",
-		UnableToCoerce => "E1005",
-		LiteralTypeMismatch => "E1006",
-		UndeclaredIdentifier => "E1007",
-		BinaryOperatorCannotBeApplied => "E1008",
-		CannotCallExpression => "E1009",
-		UnaryOperatorCannotBeApplied => "E1010",
-		UndeclaredLabel => "E1011",
-		BreakOutsideOfLoop => "E1012",
-		InvalidAssignmentTarget => "E1013",
-		ComparisonTypeAnnotationRequired => "E1014",
-		NonConstantGlobalInitializer => "E1015",
-		ArgumentCountMismatch => "E1016",
-		InvalidCharacterLiteral => "E1017",
-		DuplicateExport => "E1018",
-		CannotExportItem => "E1019",
-		NotANamespace => "E1020",
-		UndeclaredType => "E1021",
-		DuplicateStructField => "E1022",
-		UnknownStructField => "E1025",
-		DuplicateStructFieldInit => "E1026",
-		MissingStructFields => "E1027",
-		CannotMutateImmutable => "W1000",
-		UnusedVariable => "W1001",
-		UnnecessaryMutability => "W1002",
-		UnreachableCode => "W1003",
-		UnusedItem => "W1004",
-		MissingImportParamName => "W1005",
-		UnusedTypeParam => "W1006",
-		UnusedStructField => "W1007",
-		UnusedLabel => "W1008",
-		MissingFunctionBody => "E1028",
-		InvalidMemoryKind => "E1029",
-		NamespaceUsedAsValue => "E1030",
-		ExpectedBound => "E1031",
-		CyclicTypeDependency => "E1032",
-		IncompleteTraitImpl => "E1033",
-		UnsatisfiedTraitBound => "E1034",
-		AssociatedTypeInInherentImpl => "E1035",
-		MissingEnumRepr => "E1036",
-		CannotDerefNonPointer => "E1037",
-		NoMemoryForPointer => "E1038",
-		AmbiguousPointerMemory => "E1039",
-		TypeArgCountMismatch => "E1040",
-		InvalidCast => "E1041",
-		IndexOnNonIndexable => "E1042",
-		ArraySizeMismatch => "E1043",
-		ArrayRepeatCountNotConst => "E1044",
-		ArrayElementNotConst => "E1045",
-		TypesetMemberNotInteger => "E1046",
-		TypesetBoundViolation => "E1047",
-		MultipleTypesetBounds => "E1048",
-		MethodNotFound => "E1049",
-		NotAMethod => "E1050",
-		InferInSignature => "E1051",
-		MissingElseBlock => "E1052",
-		InvalidSelfType => "E1053",
-		ContinueOutsideOfLoop => "E1054",
-		EnumReprNotInteger => "E1055",
-		EnumDuplicateValue => "E1056",
-		NotConstEvaluatable => "E1057",
-		UnusedEnumVariant => "W1009",
-		MissingImportAlias => "E1058",
-		AmbiguousTraitMember => "E1059",
-		NotAField => "E1060",
-		DuplicateTraitImpl => "E1061",
-		InvalidImplTarget => "E1062",
-		TraitBoundViolation => "E1063",
-		DuplicateAssocTypeBinding => "E1064",
-		PrivateItem => "E1065",
-		NonExhaustiveMatch => "E1066",
-		InvalidMatchScrutineeType => "E1067",
-		InvalidMatchPattern => "E1068",
-		InvalidMemoryLimitsAttribute => "E1069",
-		UnreachableMatchArm => "W1010",
-		MissingTypeAliasBody => "E1070",
-		EnumVariantRequiresExplicitValue => "E1071",
-		DuplicateExportBlock => "E1072",
-		ExportBlockNotAtRoot => "E1073",
-		LibraryCannotExport => "E1074",
-		AmbiguousWildcardImport => "E1075",
-		PrivateStructField => "E1076",
-		ForeignImplTarget => "E1077",
-		NotATraitMember => "E1078",
-		TraitImplItemKindMismatch => "E1079",
-		TraitImplSignatureMismatch => "E1080",
-		TraitImplConstTypeMismatch => "E1081",
+		NestedModuleDeclaration => "E0006",
 
-		// VFS diagnostics (E2xxx).
-		ModuleFileNotFound => "E2000",
-		AmbiguousModuleFile => "E2001",
-		DuplicatePackageName => "E2002",
-		CircularDependency => "E2003",
-		StdPackageAsDependency => "E2004",
-		PackageDeclaredTwice => "E2005",
-		NestedModuleDeclaration => "E2006",
+		// AST diagnostics (E1xxx/W1xxx).
+		UnknownToken => "E1001",
+		UnexpectedToken => "E1002",
+		MissingSeparator => "E1003",
+		UnclosedDelimiter => "E1004",
+		InvalidNumericLiteral => "E1005",
+		IncompleteExpression => "E1006",
+		ChainedComparison => "E1007",
+		ReservedIdentifier => "E1008",
+		InvalidItem => "E1009",
+		MissingInitializer => "E1010",
+		InvalidAttribute => "E1012",
+		InvalidNamespace => "E1013",
+		InvalidBindingPattern => "E1015",
+		MissingImportAlias => "E1016",
+		BlockNeedsKeyword => "E1017",
+		MixedCallArguments => "E1018",
+		StructFieldsNeedParentheses => "E1019",
+		StructLiteralIsACall => "E1020",
+		MissingPackageAlias => "E1021",
+		InvalidMutBinding => "E1022",
+		MissingTypeAnnotation => "E1023",
+		EnumReprNeedsParentheses => "E1024",
+		LabelOnIf => "E1025",
+		CrlfLineEndings => "W1001",
+		VisibilityNotPermitted => "W1002",
+		RedundantConstMarker => "W1003",
+
+		// TIR diagnostics (E2xxx/W2xxx).
+		DuplicateDefinition => "E2000",
+		TypeMistmatch => "E2001",
+		TypeAnnotationRequired => "E2002",
+		UnusedValue => "E2003",
+		IntegerLiteralOutOfRange => "E2004",
+		UnableToCoerce => "E2005",
+		IntegerLiteralNotRepresentable => "E2006",
+		UndeclaredIdentifier => "E2007",
+		CannotCallExpression => "E2009",
+		UndeclaredLabel => "E2011",
+		BreakOutsideOfLoop => "E2012",
+		InvalidAssignmentTarget => "E2013",
+		ComparisonTypeAnnotationRequired => "E2014",
+		NonConstantGlobalInitializer => "E2015",
+		ArgumentCountMismatch => "E2016",
+		InvalidCharacterLiteral => "E2017",
+		DuplicateExport => "E2018",
+		CannotExportItem => "E2019",
+		CannotUseAsNamespace => "E2020",
+		UndeclaredType => "E2021",
+		DuplicateStructField => "E2022",
+		UnknownStructField => "E2025",
+		DuplicateStructFieldInit => "E2026",
+		MissingStructFields => "E2027",
+		CannotMutateImmutable => "W2000",
+		UnusedVariable => "W2001",
+		UnnecessaryMutability => "W2002",
+		UnreachableCode => "W2003",
+		UnusedItem => "W2004",
+		MissingImportParamName => "W2005",
+		UnusedTypeParam => "W2006",
+		UnusedStructField => "W2007",
+		UnusedLabel => "W2008",
+		MissingFunctionBody => "E2028",
+		InvalidMemoryKind => "E2029",
+		NamespaceUsedAsValue => "E2030",
+		NotATraitBound => "E2031",
+		RecursiveTypeWithoutIndirection => "E2032",
+		IncompleteTraitImpl => "E2033",
+		UnsatisfiedTraitBound => "E2034",
+		AssociatedTypeInInherentImpl => "E2035",
+		MissingEnumRepr => "E2036",
+		CannotDerefNonPointer => "E2037",
+		PointerWithoutMemory => "E2038",
+		TypeArgumentCountMismatch => "E2040",
+		IndexOnNonIndexable => "E2042",
+		ArraySizeMismatch => "E2043",
+		ArrayRepeatCountNotConst => "E2044",
+		ArrayElementNotConst => "E2045",
+		TypesetMemberNotConcrete => "E2046",
+		TypesetBoundViolation => "E2047",
+		MethodNotFound => "E2049",
+		NotAMethod => "E2050",
+		InferInSignature => "E2051",
+		MissingElseBlock => "E2052",
+		InvalidSelfType => "E2053",
+		ContinueOutsideOfLoop => "E2054",
+		EnumReprNotInteger => "E2055",
+		EnumDuplicateValue => "E2056",
+		NotConstEvaluatable => "E2057",
+		UnusedEnumVariant => "W2009",
+		AmbiguousTraitMember => "E2059",
+		NotAField => "E2060",
+		DuplicateTraitImpl => "E2061",
+		InvalidImplTarget => "E2062",
+		TraitBoundViolation => "E2063",
+		DuplicateAssocTypeBinding => "E2064",
+		PrivateItem => "E2065",
+		NonExhaustiveMatch => "E2066",
+		InvalidMatchScrutineeType => "E2067",
+		InvalidMatchPattern => "E2068",
+		InvalidMemoryLimitsAttribute => "E2069",
+		UnreachableMatchArm => "W2010",
+		MissingTypeAliasBody => "E2070",
+		EnumVariantRequiresExplicitValue => "E2071",
+		DuplicateExportBlock => "E2072",
+		LibraryCannotExport => "E2074",
+		AmbiguousIdentifier => "E2075",
+		PrivateStructField => "E2076",
+		ForeignImplTarget => "E2077",
+		NotATraitMember => "E2078",
+		TraitImplItemKindMismatch => "E2079",
+		TraitImplSignatureMismatch => "E2080",
+		TraitImplConstTypeMismatch => "E2081",
+		CyclicTraitBounds => "E2082",
+		CannotImplementTypeset => "E2083",
+		FloatLiteralOverflow => "E2084",
+		FloatLiteralUnderflow => "E2085",
+		DuplicateRestPattern => "E2087",
+		TupleStructBracePattern => "E2088",
+		RecordStructPositionalPattern => "E2089",
+		PrivateTupleField => "E2090",
+		NotAType => "E2091",
+		DuplicateGenericParam => "E2092",
+		UnresolvedImport => "E2093",
+		CyclicImport => "E2094",
+		PrivateReexport => "E2095",
+		CyclicTypeAlias => "E2096",
+		DuplicateFunctionParameter => "E2097",
+		SelfParamPosition => "E2098",
+		MissingGlobalType => "E2100",
+		CyclicAssociatedType => "E2102",
+		TypeNormalizationOverflow => "E2103",
+		TypeMemberNeedsQualification => "E2104",
+		MissingConstantType => "E2105",
+		UnknownCharacterEscape => "E2106",
+		UnterminatedStringLiteral => "E2107",
+		ConstEvaluationFailed => "E2108",
+		CyclicConstant => "E2109",
+		StructUsedAsValue => "E2110",
+		TypeArgumentsNotAllowed => "E2111",
+		AssocTypeEqualityMismatch => "E2112",
+		UnknownPackage => "E2113",
+		UnsupportedExpression => "E2114",
+		RefutablePatternInLocal => "E2115",
+		DuplicatePatternBinding => "E2116",
+		UnmatchableLiteral => "E2117",
+		NotBoundInAllAlternatives => "E2118",
+		InconsistentPatternBinding => "E2119",
+		UnknownParameterName => "E2120",
+		DuplicateNamedArgument => "E2121",
+		MissingArguments => "E2122",
+		PositionalOnlyCall => "E2123",
+		ImplStricterThanTrait => "E2124",
+		CannotIndex => "E2125",
+	}
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct TextSpan {
+	pub start: u32,
+	pub end: u32,
+}
+
+impl TextSpan {
+	pub fn new(start: u32, end: u32) -> TextSpan {
+		debug_assert!(end >= start);
+		TextSpan { start, end }
+	}
+
+	#[inline]
+	pub fn extract_str<'a>(&self, source: &'a str) -> &'a str {
+		&source[self.start as usize..self.end as usize]
+	}
+}
+
+impl From<TextSpan> for core::ops::Range<usize> {
+	fn from(val: TextSpan) -> Self {
+		val.start as usize..val.end as usize
+	}
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SourceSpan {
+	pub file_id: FileId,
+	pub span: TextSpan,
+}
+
+impl SourceSpan {
+	pub fn new(file_id: FileId, span: TextSpan) -> Self {
+		Self { file_id, span }
+	}
+
+	pub fn primary_label(self) -> Label<FileId> {
+		Label::primary(self.file_id, self.span)
+	}
+
+	pub fn secondary_label(self) -> Label<FileId> {
+		Label::secondary(self.file_id, self.span)
 	}
 }

@@ -1,0 +1,6915 @@
+//! Expression checking: lowers written expressions into a `Body`, with every
+//! node typed. One checker for every expression, whatever owns it: a
+//! constant's or global's initializer, or a function's block.
+//!
+//! Blocks, locals and control flow are in `blocks`, patterns in `patterns`,
+//! places and assignment in `places`, function calls in `calls`. A form the
+//! checker does not cover yet is reported once (`UnsupportedExpression`) and
+//! checked as an error node.
+//!
+//! Operators are checked through their trait (`OperatorTraits`): the trait
+//! decides whether the operator applies to a type. The node built for it is a
+//! `PrimitiveBinary`/`PrimitiveUnary` on a primitive scalar, and a call of the
+//! impl's method (`Call`) or the trait's declaration (`AbstractCall`) otherwise.
+//!
+//! Untyped literals keep the pseudo-types `Integer`/`Float`/`String` until
+//! context gives them one (`coerce`), which rewrites the subtree in place. A
+//! string literal becomes a shared byte slice or a shared byte array of its
+//! length, in the memory its context names.
+//!
+//! A struct's name is a value only to be called: calling it constructs the
+//! struct (`StructConstructor`). It is not a function, and naming it without a call is
+//! an error. A generic struct's type arguments are learned within the call,
+//! from what is written on its name, the expected type and the fields' values
+//! (`TypeInterner::meet`/`learn`); what none of them gives needs an
+//! annotation.
+
+mod blocks;
+mod calls;
+mod exhaustiveness;
+mod members;
+mod patterns;
+mod places;
+
+use calls::{CallTarget, Callee, GivenArgument};
+use members::{MemberPath, RootedPath};
+
+use rustc_hash::FxHashMap;
+
+use codespan_reporting::diagnostic::{Diagnostic, Label};
+use string_interner::symbol::SymbolU32;
+
+use super::body::{
+	Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
+	ExprRange, LocalIdx, Obligations, Scope, ScopeIdx, ScopeKind,
+};
+use super::defs::{
+	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
+	StructIdx, Tier, TypesetIdx, Visibility,
+};
+use super::imports::report_private_identifier;
+use super::literals::{
+	CharLiteralError, Integer, parse_char_literal, unescape_string_literal,
+};
+use super::members::{TraitImplLookup, TraitMemberSelection};
+use super::obligations::BoundRequirements;
+use super::operators::{
+	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
+};
+use super::paths::{PathResolver, PathWalk};
+use super::resolutions::Referent;
+use super::signatures::{InferPolicy, LexicalScope, TypeContext};
+use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
+use super::types::{
+	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+};
+use crate::ast::{
+	self, BinaryOp, Keyword, Ownership, Separated, Spanned, UnaryOp,
+};
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::vfs::FileId;
+
+/// Checks the expressions of one definition into a `Body`.
+pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
+	cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
+	body: Body,
+	/// What lowering the body's types and expressions left to decide.
+	obligations: Obligations,
+	/// Where the expressions are written. Its type scope is the root for a
+	/// free constant, the impl's or trait's `Self` scope for an associated one,
+	/// the function's own for a function's block.
+	scope: LexicalScope,
+	owner: BodyOwner,
+	/// The block scope being checked.
+	current: ScopeIdx,
+	/// The locals each scope declares, by name. A name is looked up in the
+	/// current scope, then in each enclosing one; a later declaration of the
+	/// same name in one scope replaces the entry, which shadows the earlier.
+	lookup: FxHashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+	/// What each scope's value is checked against, index-aligned with the
+	/// body's scopes.
+	scope_types: Vec<ScopeType>,
+}
+
+/// Whether two types are equal once some facts have rewritten them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeEquality {
+	Equal,
+	Diff,
+	/// A constant left as written decides it.
+	NeedsValues,
+}
+
+/// The type a scope's value is held to while its block is checked.
+#[derive(Clone, Copy)]
+struct ScopeType {
+	/// What the context expects of the scope's value; `INFER` for nothing.
+	expected: TypeIndex,
+	/// The type the first value given to the scope settled on (its result,
+	/// a `break`, a `return`); `INFER` until one does.
+	ty: TypeIndex,
+}
+
+impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
+	pub(super) fn new(
+		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
+		scope: LexicalScope,
+		owner: BodyOwner,
+	) -> Self {
+		Self {
+			cx,
+			body: Body::default(),
+			obligations: Obligations::default(),
+			scope,
+			owner,
+			current: ScopeIdx::ROOT,
+			lookup: FxHashMap::default(),
+			scope_types: Vec::new(),
+		}
+	}
+
+	/// Decides what building a body recorded, once every constant body is
+	/// built and every declaration is checked, and reports what fails.
+	pub(super) fn decide_obligations(
+		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
+		scope: LexicalScope,
+		owner: BodyOwner,
+		body: Body,
+		obligations: Obligations,
+	) -> Body {
+		let mut this = Self::new(cx, scope, owner);
+		this.body = body;
+		this.obligations = obligations;
+		this.decide();
+		this.body
+	}
+
+	/// Decides every recorded obligation, reading values.
+	fn decide(&mut self) {
+		let obligations = std::mem::take(&mut self.obligations);
+		for obligation in &obligations.types {
+			self.cx
+				.check_obligation(obligation)
+				.expect("every signature and every constant body exists");
+		}
+		for check in obligations.exprs {
+			match check {
+				ExprObligation::Equal { expr, expected } => {
+					self.decide_equal(expr, expected);
+				}
+				ExprObligation::StaticLength {
+					expr,
+					target,
+					length,
+				} => self.decide_static_length(expr, target, length),
+				ExprObligation::Match(expr) => {
+					self.check_match_usefulness(expr)
+				}
+			}
+		}
+	}
+
+	/// Checks `expr` as the whole body, against `expected`.
+	pub(super) fn check_body(
+		mut self,
+		expr: &Spanned<ast::Expression>,
+		expected: TypeIndex,
+	) -> (Body, Obligations) {
+		let expected = self.normalized(expected, self.scope.env);
+		self.enter_root(expr.span, expected);
+		self.check(expr, expected);
+		(self.body, self.obligations)
+	}
+
+	/// Pushes the root scope, which every body has.
+	fn enter_root(&mut self, span: TextSpan, expected: TypeIndex) {
+		let root = self.body.push_scope(Scope {
+			kind: ScopeKind::Block,
+			parent: None,
+			label: None,
+			span,
+		});
+		debug_assert_eq!(root, ScopeIdx::ROOT);
+		self.scope_types.push(ScopeType {
+			expected,
+			ty: TypeIndex::INFER,
+		});
+	}
+
+	/// Checks an enum variant's value as a value of the enum's `repr`. A
+	/// variant written without one counts on from `previous`, the variant
+	/// before it; the first variant has nothing to count from.
+	pub(super) fn check_variant_value(
+		mut self,
+		variant: &ast::EnumVariant,
+		previous: Option<ConstIdx>,
+		repr: TypeIndex,
+	) -> (Body, Obligations) {
+		let span = variant.name.span;
+		self.enter_root(span, repr);
+		// A missing or non-integer repr was reported on the enum; checking each
+		// value against it would only repeat that.
+		if repr == TypeIndex::ERROR {
+			self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			return (self.body, self.obligations);
+		}
+		match (variant.value.as_deref(), previous) {
+			(Some(value), _) => self.check(value, repr),
+			(None, Some(previous)) => {
+				self.body
+					.push(ExprKind::NextDiscriminant(previous), repr, span)
+			}
+			(None, None) => {
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::EnumVariantRequiresExplicitValue
+								.code(),
+						)
+						.with_message("enum variant requires an explicit value")
+						.with_label(
+							Label::primary(self.scope.file_id, span)
+								.with_message("add `= <value>` here"),
+						)
+						.with_note(
+							"or add a value to an earlier variant to anchor \
+							 auto-increment",
+						),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+		};
+		(self.body, self.obligations)
+	}
+
+	/// Builds `expr` and holds it to `expected`: an untyped literal takes that
+	/// type, any other type must equal it, and `!` fits any type, since no
+	/// value ever arrives. `INFER` and `ERROR` expect nothing.
+	fn check(
+		&mut self,
+		expr: &Spanned<ast::Expression>,
+		expected: TypeIndex,
+	) -> ExprIdx {
+		let built = self.build(expr, expected);
+		self.expect(built, expected)
+	}
+
+	fn expect(&mut self, expr: ExprIdx, expected: TypeIndex) -> ExprIdx {
+		if expected == TypeIndex::INFER || expected == TypeIndex::ERROR {
+			return expr;
+		}
+		let actual = self.body.ty(expr);
+		if self.cx.types.has_literal(actual) {
+			self.coerce(expr, expected);
+		} else if actual != TypeIndex::ERROR
+			&& actual != TypeIndex::NEVER
+			&& actual != expected
+		{
+			let span = self.body.span(expr);
+			match self.equality(
+				expected,
+				actual,
+				RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+				span,
+			) {
+				Ok(TypeEquality::Equal) => return expr,
+				// A constant left as written is compared once it has a
+				// value.
+				Ok(TypeEquality::NeedsValues) => {
+					self.obligations
+						.exprs
+						.push(ExprObligation::Equal { expr, expected });
+					return expr;
+				}
+				Ok(TypeEquality::Diff) => self.report_mismatch(expr, expected),
+				// Explained: nothing reads a value from it, and no mismatch
+				// on top.
+				Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
+			}
+		}
+		expr
+	}
+
+	/// Decides a recorded `Equal`, now that constants have values.
+	fn decide_equal(&mut self, expr: ExprIdx, expected: TypeIndex) {
+		let actual = self.body.ty(expr);
+		let span = self.body.span(expr);
+		match self.equality(expected, actual, RewriteFlags::ALL, span) {
+			Ok(TypeEquality::Equal) => {}
+			Ok(_) => self.report_mismatch(expr, expected),
+			Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
+		}
+	}
+
+	/// Whether two types are equal once `facts` have rewritten both. `Err`
+	/// means one does not normalize and that is explained: by its owner, or
+	/// here, at `site`.
+	fn equality(
+		&mut self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		facts: RewriteFlags,
+		site: TextSpan,
+	) -> Result<TypeEquality, ()> {
+		if expected == actual {
+			return Ok(TypeEquality::Equal);
+		}
+		if !self.cx.types.has_projection(expected)
+			&& !self.cx.types.has_projection(actual)
+		{
+			return Ok(TypeEquality::Diff);
+		}
+		let expected = self.normalize_at(expected, facts, site)?;
+		let actual = self.normalize_at(actual, facts, site)?;
+		Ok(if expected == actual {
+			TypeEquality::Equal
+		} else if !facts.contains(RewriteFlags::VALUES)
+			&& (self.cx.types.has_const(expected)
+				|| self.cx.types.has_const(actual))
+		{
+			TypeEquality::NeedsValues
+		} else {
+			TypeEquality::Diff
+		})
+	}
+
+	/// `ty` in this body's scope, rewritten by `facts`. A normalization that
+	/// diverges is reported here, at `site`, once; `Err` means the failure is
+	/// explained (here, or by its owner) and the caller only recovers.
+	fn normalize_at(
+		&mut self,
+		ty: TypeIndex,
+		facts: RewriteFlags,
+		site: TextSpan,
+	) -> Result<TypeIndex, ()> {
+		let site = SourceSpan::new(self.scope.file_id, site);
+		match self.cx.normalize(
+			self.scope.env,
+			ty,
+			NormalizationDepth::Deep,
+			facts,
+		) {
+			Ok(ty) => Ok(ty),
+			// Its owner reported it.
+			Err(SolverError::Poisoned) => Err(()),
+			Err(SolverError::Overflow) => {
+				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
+				Err(())
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
+				self.cx.diagnostics.push(diagnostic);
+				Err(())
+			}
+			Err(SolverError::Pending) => {
+				unreachable!("every signature is final when bodies are checked")
+			}
+		}
+	}
+
+	fn report_mismatch(&mut self, expr: ExprIdx, expected: TypeIndex) {
+		let actual = self.body.ty(expr);
+		let diagnostic = self.report_type_mismatch(expected, actual, expr);
+		self.cx.diagnostics.push(diagnostic);
+		// Reported: nothing reads a value from it, or reports it again.
+		self.body.set_ty(expr, TypeIndex::ERROR);
+	}
+
+	/// Lowers `expr`. `expected` is the type the context hints at this site:
+	/// `INFER` is no constraint, and a type with `INFER` positions in it
+	/// (`Wrapper<_>`) constrains only the others. A construct whose meaning
+	/// depends on its type reads it; the node's type may still differ, which
+	/// is `expect`'s to report. An untyped literal stays untyped.
+	fn build(
+		&mut self,
+		expr: &Spanned<ast::Expression>,
+		expected: TypeIndex,
+	) -> ExprIdx {
+		let span = expr.span;
+		match &expr.inner {
+			ast::Expression::Int { value } => self.body.push(
+				ExprKind::Int(*value),
+				TypeIndex::INTEGER_LITERAL,
+				span,
+			),
+			// The value is read from the source once the width is known.
+			ast::Expression::Float => self.body.push(
+				ExprKind::Float(0.0),
+				TypeIndex::FLOAT_LITERAL,
+				span,
+			),
+			ast::Expression::Char => self.build_char(span),
+			ast::Expression::Unary { operator, operand } => {
+				self.build_unary(*operator, operand, expected, span)
+			}
+			ast::Expression::Binary {
+				left,
+				operator,
+				right,
+			} => self.build_binary(*operator, left, right, expected, span),
+			ast::Expression::Path(segments) => {
+				self.build_path(segments, expected, span)
+			}
+			ast::Expression::Call { callee, arguments } => self.build_call(
+				callee,
+				Arguments::Positional(arguments),
+				expected,
+				span,
+			),
+			ast::Expression::NamedCall { callee, arguments } => self
+				.build_call(
+					callee,
+					Arguments::Named(arguments),
+					expected,
+					span,
+				),
+			ast::Expression::Tuple { elements } => {
+				self.build_tuple(elements, expected, span)
+			}
+			ast::Expression::Block { label, statements } => {
+				let label = label.map(|name| {
+					self.body.push_label(super::body::Label { name })
+				});
+				self.build_block(statements, expected, label, span)
+			}
+			ast::Expression::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => self.build_if_else(
+				condition,
+				then_block,
+				else_block.as_deref(),
+				expected,
+				span,
+			),
+			ast::Expression::Loop { label, block } => {
+				let label = label.map(|name| {
+					self.body.push_label(super::body::Label { name })
+				});
+				self.build_loop(block, expected, label, span)
+			}
+			ast::Expression::Break { label, value } => {
+				self.build_break(*label, value.as_deref(), span)
+			}
+			ast::Expression::Continue { label } => {
+				self.build_continue(*label, span)
+			}
+			ast::Expression::Return { value } => {
+				self.build_return(value.as_deref(), span)
+			}
+			ast::Expression::Deref { .. }
+			| ast::Expression::ObjectAccess { .. }
+			| ast::Expression::Index { .. } => self.build_read(expr),
+			ast::Expression::AddressOf { value } => {
+				self.build_address_of(value, span)
+			}
+			ast::Expression::Placeholder => {
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::InvalidAssignmentTarget.code(),
+						)
+						.with_message(
+							"`_` can only be used on the left of an assignment",
+						)
+						.with_label(Label::primary(self.scope.file_id, span)),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+			ast::Expression::Error => {
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+			ast::Expression::Ascription { value, ty } => {
+				self.build_ascription(value, ty)
+			}
+			ast::Expression::MethodCall(call) => self.build_method_call(
+				&call.object,
+				&call.method,
+				Arguments::Positional(&call.arguments),
+				expected,
+				span,
+			),
+			ast::Expression::NamedMethodCall(call) => self.build_method_call(
+				&call.object,
+				&call.method,
+				Arguments::Named(&call.arguments),
+				expected,
+				span,
+			),
+			ast::Expression::Match { scrutinee, arms } => {
+				self.build_match(scrutinee, arms, expected, span)
+			}
+			ast::Expression::String => self.build_string(span),
+			ast::Expression::QualifiedPath { .. }
+			| ast::Expression::Grouped { .. } => {
+				let rooted = RootedPath::of_expression(&expr.inner).unwrap();
+				match self.resolve_rooted_path(rooted, span) {
+					Ok(path) => self.build_member_value(path, expected, span),
+					Err(error) => error,
+				}
+			}
+			ast::Expression::ArrayList { elements } => {
+				self.build_array(elements, expected, span)
+			}
+			ast::Expression::ArrayRepeat { value, count } => {
+				self.build_array_repeat(value, count, expected, span)
+			}
+			ast::Expression::SliceRange { .. } => {
+				self.unsupported(span, "a slice range")
+			}
+		}
+	}
+
+	/// Reports a form the checker does not cover yet and stands in an error
+	/// node for it, so nothing around it reports again. Nothing inside it is
+	/// checked.
+	fn unsupported(&mut self, span: TextSpan, what: &str) -> ExprIdx {
+		self.report_unsupported(span, what);
+		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+	}
+
+	/// Reports that `value`, untyped, needs a type from its context, and
+	/// leaves it at `ERROR`.
+	fn report_annotation_required(&mut self, value: ExprIdx) {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypeAnnotationRequired.code())
+				.with_message("type annotation required")
+				.with_label(
+					self.source_span(value)
+						.primary_label()
+						.with_message("the type of this value is not known"),
+				),
+		);
+		self.body.set_ty(value, TypeIndex::ERROR);
+	}
+
+	fn report_unsupported(&mut self, span: TextSpan, what: &str) {
+		self.cx.diagnostics.push(
+			Diagnostic::bug()
+				.with_code(DiagnosticCode::UnsupportedExpression.code())
+				.with_message(format!("checking {what} is not supported yet"))
+				.with_label(Label::primary(self.scope.file_id, span)),
+		);
+	}
+
+	/// A tuple, each element built with the expected type's element at its
+	/// position when the expected type is a tuple as long. Its type is its
+	/// elements': one with an untyped literal in it is untyped, and takes its
+	/// type from context later, as a literal does (`coerce`). A tuple of one
+	/// is its element: `(x,)` is `(x)`.
+	fn build_tuple(
+		&mut self,
+		elements: &[Separated<Spanned<ast::Expression>>],
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		if let [element] = elements {
+			return self.build(&element.inner, expected);
+		}
+		let hints = match *self.cx.types.resolve(expected) {
+			Type::Tuple { elements: hints }
+				if hints.len() == elements.len() =>
+			{
+				Some(hints)
+			}
+			_ => None,
+		};
+		let mut values = Vec::with_capacity(elements.len());
+		let mut types = Vec::with_capacity(elements.len());
+		for (at, element) in elements.iter().enumerate() {
+			let hint = match hints {
+				Some(hints) => self.cx.types.list(hints)[at],
+				None => TypeIndex::INFER,
+			};
+			let value = self.build(&element.inner, hint);
+			values.push(value);
+			types.push(self.body.ty(value));
+		}
+		let ty = self.cx.types.intern_tuple(&types);
+		let ty = self.cx.types.collapse_error(ty);
+		let elements = self.body.push_args(values);
+		let kind = ExprKind::Tuple {
+			elements,
+			order: ElementOrder::InOrder,
+		};
+		self.body.push(kind, ty, span)
+	}
+
+	/// An array literal stays untyped (`Type::ArrayLiteral`) until its
+	/// context gives it a shared array or slice (`coerce`). Its elements are
+	/// built with the expected element type as their hint.
+	fn build_array(
+		&mut self,
+		elements: &[Spanned<ast::Expression>],
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let hint = self.array_element_hint(expected);
+		let values: Vec<ExprIdx> = elements
+			.iter()
+			.map(|element| self.build(element, hint))
+			.collect();
+		let elements = self.body.push_args(values);
+		let expr = self.body.push(
+			ExprKind::Array { elements },
+			TypeIndex::ARRAY_LITERAL,
+			span,
+		);
+		self.body.push_static(expr);
+		expr
+	}
+
+	/// A repeat is untyped as an array literal is. Its count is a length in
+	/// the memory its context gives, of that memory's `Size`, so it is
+	/// checked when the repeat is coerced.
+	fn build_array_repeat(
+		&mut self,
+		value: &Spanned<ast::Expression>,
+		count: &Spanned<ast::ConstArgument>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let hint = self.array_element_hint(expected);
+		let value = self.build(value, hint);
+		let count = match &count.inner {
+			ast::ConstArgument::Infer => None,
+			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
+				Some(self.body.push(
+					ExprKind::Int(*value),
+					TypeIndex::INTEGER_LITERAL,
+					count.span,
+				))
+			}
+			ast::ConstArgument::Literal(_) => {
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::TypeMistmatch.code())
+						.with_message("an array's length is an integer")
+						.with_label(
+							Label::primary(self.scope.file_id, count.span)
+								.with_message("not an integer"),
+						),
+				);
+				Some(self.body.push(
+					ExprKind::Error,
+					TypeIndex::ERROR,
+					count.span,
+				))
+			}
+			ast::ConstArgument::Path(segments) => {
+				Some(self.build_path(segments, TypeIndex::INFER, count.span))
+			}
+			ast::ConstArgument::QualifiedPath { .. }
+			| ast::ConstArgument::Grouped { .. } => {
+				let rooted = RootedPath::of_constant(&count.inner).unwrap();
+				Some(match self.resolve_rooted_path(rooted, count.span) {
+					Ok(path) => self.build_member_value(
+						path,
+						TypeIndex::INFER,
+						count.span,
+					),
+					Err(error) => error,
+				})
+			}
+		};
+		let expr = self.body.push(
+			ExprKind::ArrayRepeat { value, count },
+			TypeIndex::ARRAY_LITERAL,
+			span,
+		);
+		self.body.push_static(expr);
+		expr
+	}
+
+	/// The element type an expected array or slice gives its literal's
+	/// elements; no constraint otherwise.
+	fn array_element_hint(&self, expected: TypeIndex) -> TypeIndex {
+		match *self.cx.types.resolve(expected) {
+			Type::Array { of, .. } | Type::Slice { of, .. } => of,
+			_ => TypeIndex::INFER,
+		}
+	}
+
+	/// A string literal stays untyped (`Type::StringLiteral`) until its context
+	/// gives it a byte slice or a byte array (`coerce`).
+	fn build_string(&mut self, span: TextSpan) -> ExprIdx {
+		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
+		match unescape_string_literal(span.extract_str(source)) {
+			Ok(contents) => {
+				let symbol = self.cx.strings.get_or_intern(contents);
+				let expr = self.body.push(
+					ExprKind::String(symbol),
+					TypeIndex::STRING_LITERAL,
+					span,
+				);
+				self.body.push_static(expr);
+				expr
+			}
+			Err(error) => {
+				self.cx.diagnostics.push(
+					error.diagnostic(SourceSpan::new(self.scope.file_id, span)),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+		}
+	}
+
+	fn build_char(&mut self, span: TextSpan) -> ExprIdx {
+		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
+		match parse_char_literal(span.extract_str(source)) {
+			Ok(value) => self.body.push(
+				ExprKind::Char(value),
+				TypeIndex::CHAR_LITERAL,
+				span,
+			),
+			Err(error) => {
+				let message = match error {
+					CharLiteralError::Empty => "empty character literal",
+					CharLiteralError::TooLong => {
+						"character literal may only contain one codepoint"
+					}
+				};
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::InvalidCharacterLiteral.code(),
+						)
+						.with_message(message)
+						.with_label(Label::primary(self.scope.file_id, span)),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+		}
+	}
+
+	/// A value path: a local, or an item in scope. Locals come first, so a
+	/// local shadows an item of the same name.
+	fn build_path(
+		&mut self,
+		segments: &[ast::PathSegment],
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		if let [segment] = segments
+			&& segment.type_args.is_empty()
+			&& let Some(local) = self.lookup_local(segment.ident.inner)
+		{
+			self.record_local(local, segment.ident.span);
+			let ty = self.body.local(local).ty;
+			return self.body.push(ExprKind::Local(local), ty, span);
+		}
+		if let [segment] = segments
+			&& segment.ident.inner == Keyword::SelfPascal.symbol()
+		{
+			if self.impl_self_struct(segment).is_some() {
+				self.report_struct_used_as_value(
+					Keyword::SelfPascal.symbol(),
+					span,
+				);
+			}
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		}
+		let walk = match self.resolve_value_path(segments, span) {
+			Ok(ValuePath::Item(walk)) => walk,
+			Ok(ValuePath::Member(path)) => {
+				return self.build_member_value(path, expected, span);
+			}
+			Err(error) => return error,
+		};
+		let Some(key) = walk.target.def_key() else {
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		};
+		let kind = key.symbol_kind(self.cx.defs);
+		// A bare struct name is an error of its own, whoever may construct it.
+		if let BindingTarget::Inaccessible(_) = walk.target
+			&& !matches!(kind, DefKind::Struct(_))
+		{
+			let segment = &segments[walk.stopped_at as usize];
+			self.cx.diagnostics.push(report_private_identifier(
+				&self.cx.defs.namespaces,
+				self.cx.strings,
+				segment.ident.inner,
+				SourceSpan::new(self.scope.file_id, segment.ident.span),
+				Some(key),
+			));
+		}
+		match kind {
+			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
+				let signature = &self.cx.constants[usize::from(const_index)];
+				let ty = self.normalized(signature.ty, signature.env);
+				let kind = ExprKind::Const {
+					constant: const_index,
+					type_args: TypeList::EMPTY,
+				};
+				self.body.push(kind, ty, span)
+			}
+			DefKind::Struct(struct_index) => {
+				let name = self.cx.defs.structs[usize::from(struct_index)].name;
+				self.report_struct_used_as_value(name.inner, span);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
+			DefKind::Function(function_index) => self.build_function_value(
+				Callee::new(self.cx, function_index, &[], 0),
+				segments.last().unwrap(),
+				expected,
+				span,
+			),
+			// A global's name is its handle, of its own nominal type: its value
+			// is read with `Global::get` and written with `GlobalMut::set`.
+			DefKind::Global(global_index) => {
+				let ty = self.cx.types.intern(Type::Global { global_index });
+				self.body.push(ExprKind::Global(global_index), ty, span)
+			}
+			_ => {
+				self.unsupported(span, &format!("a path to a {}", kind.noun()))
+			}
+		}
+	}
+
+	/// Resolves a value path: an item the namespace walk reaches, or a member
+	/// of the type the segments before the last name (`Ordering::of`,
+	/// `Self::f`, `T::f`, `W::<u8>::new`). A path starting at a type parameter
+	/// or `Self` names a type from its first segment; any other walks the
+	/// namespace graph, and continues past a type where the walk stops at one.
+	fn resolve_value_path<'s>(
+		&mut self,
+		segments: &'s [ast::PathSegment],
+		span: TextSpan,
+	) -> Result<ValuePath<'s>, ExprIdx> {
+		let (member, prefix) = segments.split_last().unwrap();
+		let first = segments[0].ident.inner;
+		if !prefix.is_empty()
+			&& (first == Keyword::SelfPascal.symbol()
+				|| self.cx.type_envs.resolve(self.scope.env, first).is_some())
+		{
+			let receiver = self.cx.resolve_type_path(
+				&mut self.obligations.types,
+				self.scope,
+				prefix,
+				InferPolicy::Allow,
+			);
+			return Ok(ValuePath::Member(MemberPath::new(receiver, member)));
+		}
+		let walk = PathResolver::new(
+			self.cx.diagnostics,
+			self.cx.resolutions,
+			self.cx.strings,
+			self.cx.defs,
+		)
+		.walk_path(
+			self.scope.file_id,
+			self.scope.namespace,
+			segments,
+			Tier::Value,
+		);
+		let Some(key) = walk.target.def_key() else {
+			return Ok(ValuePath::Item(walk));
+		};
+		if walk.is_complete(segments) {
+			return Ok(ValuePath::Item(walk));
+		}
+		let stop = walk.stopped_at as usize;
+		let stopped = &segments[stop];
+		// A generic struct named without its arguments leaves them to the
+		// call to learn, as its construction does (`Layout::of::<T>()`).
+		if stopped.type_args.is_empty()
+			&& let DefKind::Struct(struct_index) = key.symbol_kind(self.cx.defs)
+		{
+			let params = self.cx.structs[usize::from(struct_index)].type_params;
+			let count = self.cx.type_envs.param_names(params).len();
+			if count > 0 {
+				if stop + 1 != prefix.len() {
+					return Err(self.unsupported(
+						span,
+						"a path past a generic type without its type arguments",
+					));
+				}
+				let receiver = self.cx.types.intern_struct(
+					struct_index,
+					&vec![TypeIndex::INFER; count],
+				);
+				return Ok(ValuePath::Member(MemberPath::new(
+					receiver, member,
+				)));
+			}
+		}
+		let head = self.cx.resolve_named_type(
+			&mut self.obligations.types,
+			self.scope,
+			key,
+			stopped,
+			InferPolicy::Allow,
+		);
+		let receiver = self.cx.resolve_type_member_path(
+			&mut self.obligations.types,
+			self.scope,
+			head,
+			&prefix[stop + 1..],
+			InferPolicy::Allow,
+		);
+		Ok(ValuePath::Member(MemberPath::new(receiver, member)))
+	}
+
+	/// The local `name` refers to from the current scope: declared in it or in
+	/// a scope around it.
+	fn lookup_local(&self, name: SymbolU32) -> Option<LocalIdx> {
+		let mut scope = Some(self.current);
+		while let Some(at) = scope {
+			if let Some(&local) = self.lookup.get(&(at, name)) {
+				return Some(local);
+			}
+			scope = self.body.scope(at).parent;
+		}
+		None
+	}
+
+	fn record_local(&mut self, local: LocalIdx, span: TextSpan) {
+		self.cx.resolutions.by_site.insert(
+			(SourceSpan::new(self.scope.file_id, span), Tier::Value),
+			Referent::Local {
+				owner: self.owner,
+				local,
+			},
+		);
+	}
+
+	/// A call: of a function named by a path, the construction of a struct,
+	/// or of any other value whose type is callable (`build_value_call`).
+	fn build_call(
+		&mut self,
+		callee: &Spanned<ast::Expression>,
+		arguments: Arguments<'_>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let segments = match &callee.inner {
+			ast::Expression::Path(segments) => segments,
+			ast::Expression::QualifiedPath { .. }
+			| ast::Expression::Grouped { .. } => {
+				let rooted = RootedPath::of_expression(&callee.inner).unwrap();
+				return match self.resolve_rooted_path(rooted, callee.span) {
+					Ok(path) => self.build_member_call(
+						path,
+						callee.span,
+						arguments,
+						expected,
+						span,
+					),
+					Err(error) => error,
+				};
+			}
+			_ => {
+				let callee = self.build(callee, TypeIndex::INFER);
+				return self.build_value_call(callee, arguments, span);
+			}
+		};
+		if let [segment] = &**segments
+			&& segment.type_args.is_empty()
+			&& self.lookup_local(segment.ident.inner).is_some()
+		{
+			let callee =
+				self.build_path(segments, TypeIndex::INFER, callee.span);
+			return self.build_value_call(callee, arguments, span);
+		}
+		// `Self(..)` constructs the struct the impl around it is for, with
+		// that target's arguments.
+		if let [segment] = &**segments
+			&& segment.ident.inner == Keyword::SelfPascal.symbol()
+		{
+			let Some((struct_index, type_args)) =
+				self.impl_self_struct(segment)
+			else {
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			};
+			if !self.constructor_accessible(struct_index) {
+				let diagnostic = self.report_private_constructor(
+					struct_index,
+					None,
+					segment,
+				);
+				self.cx.diagnostics.push(diagnostic);
+			}
+			return self.build_construction(
+				struct_index,
+				type_args,
+				segment,
+				arguments,
+				expected,
+				span,
+			);
+		}
+		let walk = match self.resolve_value_path(segments, span) {
+			Ok(ValuePath::Item(walk)) => walk,
+			Ok(ValuePath::Member(path)) => {
+				return self.build_member_call(
+					path,
+					callee.span,
+					arguments,
+					expected,
+					span,
+				);
+			}
+			Err(error) => return error,
+		};
+		let Some(key) = walk.target.def_key() else {
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		};
+		let kind = key.symbol_kind(self.cx.defs);
+		// Any other item is called as the value it names.
+		if !matches!(kind, DefKind::Struct(_) | DefKind::Function(_)) {
+			let callee =
+				self.build_path(segments, TypeIndex::INFER, callee.span);
+			return self.build_value_call(callee, arguments, span);
+		}
+		let DefKind::Struct(struct_index) = kind else {
+			if let BindingTarget::Inaccessible(_) = walk.target {
+				let segment = &segments[walk.stopped_at as usize];
+				self.cx.diagnostics.push(report_private_identifier(
+					&self.cx.defs.namespaces,
+					self.cx.strings,
+					segment.ident.inner,
+					SourceSpan::new(self.scope.file_id, segment.ident.span),
+					Some(key),
+				));
+			}
+			let DefKind::Function(function_index) = kind else {
+				unreachable!("any other item is called as a value")
+			};
+			return self.build_function_call(
+				Callee::new(self.cx, function_index, &[], 0),
+				segments.last().unwrap(),
+				None,
+				arguments,
+				expected,
+				span,
+			);
+		};
+		let segment = segments.last().unwrap();
+		if let BindingTarget::Inaccessible(key) = walk.target {
+			let diagnostic = self.report_private_constructor(
+				struct_index,
+				Some(key),
+				segment,
+			);
+			self.cx.diagnostics.push(diagnostic);
+		}
+		// The struct's type arguments are learned within this call: from what
+		// is written on its name, the expected type, and then the fields.
+		let type_args = self.struct_type_args(struct_index, segment, expected);
+		self.build_construction(
+			struct_index,
+			type_args,
+			segment,
+			arguments,
+			expected,
+			span,
+		)
+	}
+
+	/// The construction of `struct_index` from `arguments`, its type
+	/// arguments as known before the fields are (`INFER` where unknown).
+	fn build_construction(
+		&mut self,
+		struct_index: StructIdx,
+		mut type_args: Box<[TypeIndex]>,
+		segment: &ast::PathSegment,
+		arguments: Arguments<'_>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let target = CallTarget::struct_constructor(self.cx, struct_index);
+		let mut given = Vec::new();
+		let reported = self.build_arguments(
+			&target,
+			&mut type_args,
+			arguments,
+			&mut given,
+			span,
+		);
+		// A reported argument list may be why a type argument stays unknown.
+		let already_reported = expected == TypeIndex::ERROR
+			|| reported
+			|| given.iter().any(|argument| {
+				self.cx.types.has_error(self.body.ty(argument.value))
+			});
+		self.settle_uninferred(
+			target.type_env,
+			segment.ident.span,
+			already_reported,
+			&mut type_args,
+		);
+		self.expect_arguments(&target, &type_args, &given);
+		let type_list = self.cx.types.push_list(&type_args);
+		self.check_frame_bounds(
+			&target,
+			target.type_env,
+			segment,
+			type_list,
+			&given,
+		);
+		let fields = self
+			.arguments_value(&target, &type_args, &given, 0, reported, span);
+		let ty = self.cx.types.intern_struct(struct_index, &type_args);
+		let ty = self.cx.types.collapse_error(ty);
+		self.body.push(
+			ExprKind::StructConstructor {
+				struct_index,
+				fields,
+			},
+			ty,
+			span,
+		)
+	}
+
+	/// What a constructed struct's type arguments are known to be before its
+	/// fields are: the ones written on its name (`Wrapper<u32>(..)`, a `_`
+	/// anywhere in one unknown), met with the expected type's when that is this
+	/// struct. `INFER` per parameter when none are written; `ERROR` per
+	/// parameter when the written count is wrong.
+	fn struct_type_args(
+		&mut self,
+		struct_index: StructIdx,
+		segment: &ast::PathSegment,
+		expected: TypeIndex,
+	) -> Box<[TypeIndex]> {
+		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
+		let count = self.cx.type_envs.param_names(params_env).len();
+		let mut type_args = vec![TypeIndex::INFER; count].into_boxed_slice();
+		self.write_type_args(
+			segment,
+			params_env,
+			TypeEnvOwner::Struct(struct_index),
+			&mut type_args,
+		);
+		if expected == TypeIndex::INFER {
+			return type_args;
+		}
+		// A disagreement teaches nothing: the construction's own type is held
+		// to the expected one where the call is checked.
+		let expected = self.normalized(expected, self.scope.env);
+		if let Type::Struct {
+			struct_index: hinted,
+			type_args: hints,
+		} = *self.cx.types.resolve(expected)
+			&& hinted == struct_index
+		{
+			for at in 0..count {
+				let hint = self.cx.types.list(hints)[at];
+				if let Some(met) = self.cx.types.meet(type_args[at], hint) {
+					type_args[at] = met;
+				}
+			}
+		}
+		type_args
+	}
+
+	/// Writes the type arguments written on `segment` for the parameters of
+	/// `params_env` into their slots of `type_args`, the flat list of its
+	/// chain. A `_` written as a whole argument leaves its slot as it is (`_`
+	/// inside one, `W<_>`, is written); a wrong count makes every slot of the
+	/// frame `ERROR`.
+	fn write_type_args(
+		&mut self,
+		segment: &ast::PathSegment,
+		params_env: TypeEnvIdx,
+		owner: TypeEnvOwner,
+		type_args: &mut [TypeIndex],
+	) {
+		if segment.type_args.is_empty() {
+			return;
+		}
+		let start = self.cx.type_envs.parent_count(params_env);
+		let len = self.cx.type_envs.param_names(params_env).len();
+		let slots = &mut type_args[start..start + len];
+		// Every written argument is resolved, extra ones too, for their own
+		// diagnostics.
+		for (at, arg) in segment.type_args.iter().enumerate() {
+			let ty = self.cx.resolve_type_argument(
+				&mut self.obligations.types,
+				self.scope,
+				arg,
+				InferPolicy::Allow,
+			);
+			if let Some(slot) = slots.get_mut(at)
+				&& ty != TypeIndex::INFER
+			{
+				*slot = ty;
+			}
+		}
+		if !self
+			.cx
+			.check_type_arg_count(self.scope, segment, params_env, owner)
+		{
+			slots.fill(TypeIndex::ERROR);
+		}
+	}
+
+	/// Records and checks the bounds of the parameters of `frame`, a frame on
+	/// `target`'s chain, for their final type arguments, at the call,
+	/// wherever they were learned from. `arguments` are flat, the stored list
+	/// the caller shares with whatever else reads it (the call's node). Each
+	/// is reported at its written argument (the target's own frame is the
+	/// one written on `segment`), else at the value given for a parameter of
+	/// `target` whose declared type is that type parameter, else at the name.
+	fn check_frame_bounds(
+		&mut self,
+		target: &CallTarget<'_>,
+		frame: TypeEnvIdx,
+		segment: &ast::PathSegment,
+		arguments: TypeList,
+		given: &[GivenArgument],
+	) {
+		let own = self.cx.type_envs.param_names(frame).len();
+		if own == 0 {
+			return;
+		}
+		let start = self.cx.type_envs.parent_count(frame);
+		let arguments = arguments.prefix(start + own);
+		let owner = self.cx.type_envs.owner(frame);
+		let written: &[_] = if owner == target.kind.owner() {
+			&segment.type_args
+		} else {
+			&[]
+		};
+		for index in 0..own {
+			let argument = self.cx.types.list(arguments)[start + index];
+			let span = match written.get(index) {
+				Some(written) => written.span(),
+				None => {
+					let param = self.cx.type_envs.param_types(frame)[index];
+					let mut span = segment.ident.span;
+					for argument in given {
+						if argument.declared == param {
+							span = self.body.span(argument.value);
+							break;
+						}
+					}
+					span
+				}
+			};
+			self.cx.record_bounds_check(
+				&mut self.obligations.types,
+				self.scope.env,
+				BoundRequirements::Parameter {
+					env: frame,
+					index,
+					arguments,
+				},
+				Spanned {
+					inner: argument,
+					span,
+				},
+				SourceSpan::new(self.scope.file_id, span),
+				owner,
+			);
+		}
+	}
+
+	/// Makes `ERROR` each argument in the flat `args` for `params_env`'s
+	/// chain that is still not fully known (an `INFER` anywhere in it), and
+	/// reports its parameter. Nothing is reported when `already_reported`
+	/// (an `ERROR` expectation, an argument that failed, a mismatched item):
+	/// whatever failed has said why, and may be why nothing was learned.
+	fn settle_uninferred(
+		&mut self,
+		params_env: TypeEnvIdx,
+		span: TextSpan,
+		already_reported: bool,
+		args: &mut [TypeIndex],
+	) {
+		for at in 0..args.len() {
+			if !self.cx.types.has_infer(args[at]) {
+				continue;
+			}
+			args[at] = TypeIndex::ERROR;
+			if already_reported {
+				continue;
+			}
+			let frame = self
+				.cx
+				.type_envs
+				.chain(params_env)
+				.find(|&frame| self.cx.type_envs.parent_count(frame) <= at)
+				.unwrap();
+			let index = at - self.cx.type_envs.parent_count(frame);
+			let name = self.cx.type_envs.param_names(frame)[index].inner;
+			let name = self.cx.strings.resolve(name).unwrap();
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
+					.with_message(format!(
+						"cannot infer type for type parameter `{name}`"
+					))
+					.with_label(
+						Label::primary(self.scope.file_id, span)
+							.with_message("type annotation required"),
+					),
+			);
+		}
+	}
+
+	/// A field's type, as expected of the value given for it: as declared,
+	/// with the struct's type arguments `args` for its parameters. An argument
+	/// not known yet leaves its parts `INFER`, which expect nothing.
+	fn field_type(
+		&mut self,
+		struct_index: StructIdx,
+		args: &[TypeIndex],
+		field: usize,
+	) -> TypeIndex {
+		let ty = self
+			.cx
+			.types
+			.list(self.cx.structs[usize::from(struct_index)].field_types)[field];
+		let ty = self.cx.types.substitute(
+			ty,
+			Substitution {
+				envs: &self.cx.type_envs,
+				env: self.cx.structs[usize::from(struct_index)].type_params,
+				args,
+			},
+		);
+		let ty = self.normalized(ty, self.scope.env);
+		self.cx.types.collapse_error(ty)
+	}
+
+	/// A struct's constructor is as visible as the struct and every one of
+	/// its fields. When the struct is visible, the private fields are why its
+	/// constructor is not, and the report says so.
+	/// The struct `Self` names here, the target of the impl around this
+	/// body, with that target's arguments; recorded as what `Self` refers to.
+	/// `None` when `Self` names no struct here (reported).
+	fn impl_self_struct(
+		&mut self,
+		segment: &ast::PathSegment,
+	) -> Option<(StructIdx, Box<[TypeIndex]>)> {
+		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
+		let Some((impl_kind, target)) =
+			self.cx.resolve_impl_self(self.scope.env)
+		else {
+			// A trait's `Self` is the type implementing it, which is not
+			// known to be a struct; elsewhere `Self` names nothing.
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::CannotCallExpression.code())
+					.with_message("`Self` names no struct here")
+					.with_label(site.primary_label())
+					.with_note(
+						"`Self` is constructed only inside an impl for a struct",
+					),
+			);
+			return None;
+		};
+		self.cx.resolutions.by_site.insert(
+			(site, Tier::Value),
+			match impl_kind {
+				ImplKind::Inherent(index) => Referent::InherentImplSelf(index),
+				ImplKind::Trait(index) => Referent::TraitImplSelf(index),
+			},
+		);
+		if !segment.type_args.is_empty() {
+			let diagnostic = self.cx.report_type_args_on_impl_self(
+				self.scope.file_id,
+				segment,
+				impl_kind,
+			);
+			self.cx.diagnostics.push(diagnostic);
+		}
+		let Type::Struct {
+			struct_index,
+			type_args,
+		} = *self.cx.types.resolve(target)
+		else {
+			if target != TypeIndex::ERROR {
+				let target = self.cx.type_formatter().display_type(target);
+				self.cx.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::CannotCallExpression.code())
+						.with_message(format!(
+							"`Self` is `{target}`, which is not a struct"
+						))
+						.with_label(site.primary_label())
+						.with_note(
+							"only a struct is constructed through `Self`",
+						),
+				);
+			}
+			return None;
+		};
+		Some((struct_index, self.cx.types.list(type_args).into()))
+	}
+
+	/// Whether every field of `struct_index` is visible here, which is where
+	/// its constructor is.
+	fn constructor_accessible(&self, struct_index: StructIdx) -> bool {
+		let def = &self.cx.defs.structs[usize::from(struct_index)];
+		def.field_pub_spans.iter().all(|&pub_span| {
+			self.cx.defs.namespaces.is_accessible_from(
+				self.scope.namespace,
+				def.namespace.into(),
+				Visibility::from(pub_span),
+			)
+		})
+	}
+
+	fn report_struct_used_as_value(&mut self, name: SymbolU32, span: TextSpan) {
+		let name = self.cx.strings.resolve(name).unwrap();
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::StructUsedAsValue.code())
+				.with_message(format!(
+					"expected a value, found struct `{name}`"
+				))
+				.with_label(Label::primary(self.scope.file_id, span))
+				.with_note(format!(
+					"a struct's name is only a value when it is called: \
+					 `{name}(...)`; to pass a constructor, pass a function \
+					 that calls it"
+				)),
+		);
+	}
+
+	fn report_private_constructor(
+		&self,
+		struct_index: StructIdx,
+		key: Option<DefKey>,
+		segment: &ast::PathSegment,
+	) -> Diagnostic<FileId> {
+		let def = &self.cx.defs.structs[usize::from(struct_index)];
+		let strings = &*self.cx.strings;
+		let name = strings.resolve(def.name.inner).unwrap();
+		let private: Vec<String> = def
+			.field_names
+			.iter()
+			.zip(&def.field_pub_spans)
+			.enumerate()
+			.filter(|(_, (_, pub_span))| pub_span.is_none())
+			.map(|(at, (name, _))| match name {
+				Some(name) => {
+					format!("`{}`", strings.resolve(name.inner).unwrap())
+				}
+				None => format!("field {at}"),
+			})
+			.collect();
+		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
+		if private.is_empty() {
+			return report_private_identifier(
+				&self.cx.defs.namespaces,
+				strings,
+				segment.ident.inner,
+				site,
+				key,
+			);
+		}
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::PrivateItem.code())
+			.with_message(format!(
+				"the constructor of struct `{name}` is private"
+			))
+			.with_label(
+				site.primary_label().with_message("private constructor"),
+			);
+		for (name, pub_span) in def.field_names.iter().zip(&def.field_pub_spans)
+		{
+			if pub_span.is_none()
+				&& let Some(field_name) = name
+			{
+				diagnostic = diagnostic.with_label(
+					SourceSpan::new(def.file_id, field_name.span)
+						.secondary_label()
+						.with_message("private field"),
+				);
+			}
+		}
+		let fields = private.join(", ");
+		diagnostic
+			.with_note(format!(
+				"a constructor is private if any field is: {fields} of `{name}` \
+				 {} private",
+				if private.len() == 1 { "is" } else { "are" }
+			))
+			.with_note(format!(
+				"make every field of `{name}` `pub`, or expose a `pub func` that \
+				 constructs it"
+			))
+	}
+
+	fn build_unary(
+		&mut self,
+		op: Spanned<UnaryOp>,
+		operand: &Spanned<ast::Expression>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		// Every unary operator's method returns `Self`: the operand is expected
+		// to have the result's type, and an untyped operand leaves the node
+		// untyped until context coerces both.
+		let operand = self.build(operand, expected);
+		let ty = self.body.ty(operand);
+		if ty == TypeIndex::STRING_LITERAL || ty == TypeIndex::ARRAY_LITERAL {
+			return self.report_operator_on_literal(
+				op.inner.as_str(),
+				operand,
+				span,
+			);
+		}
+		if ty.is_literal() {
+			return self.body.push(
+				ExprKind::PrimitiveUnary {
+					op: op.inner,
+					operand,
+				},
+				ty,
+				span,
+			);
+		}
+		let (kind, ty) = self.select_unary(op, operand);
+		self.body.push(kind, ty, span)
+	}
+
+	fn build_binary(
+		&mut self,
+		op: Spanned<BinaryOp>,
+		left: &Spanned<ast::Expression>,
+		right: &Spanned<ast::Expression>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		match op.inner {
+			BinaryOp::And | BinaryOp::Or => {
+				let lhs = self.check(left, TypeIndex::BOOL);
+				let rhs = self.check(right, TypeIndex::BOOL);
+				return self.body.push(
+					ExprKind::PrimitiveBinary {
+						op: op.inner,
+						lhs,
+						rhs,
+					},
+					TypeIndex::BOOL,
+					span,
+				);
+			}
+			BinaryOp::Assign => {
+				return self.build_assign(left, right, span);
+			}
+			BinaryOp::AddAssign
+			| BinaryOp::SubAssign
+			| BinaryOp::MulAssign
+			| BinaryOp::DivAssign
+			| BinaryOp::RemAssign
+			| BinaryOp::BitAndAssign
+			| BinaryOp::BitOrAssign
+			| BinaryOp::BitXorAssign
+			| BinaryOp::LeftShiftAssign
+			| BinaryOp::RightShiftAssign => {
+				return self.build_compound_assign(op, left, right, span);
+			}
+			_ => {}
+		}
+		// An arithmetic or bitwise method returns `Self`, so its operands are
+		// expected to have the result's type; a comparison returns `Bool`
+		// whatever they are.
+		let expected = if is_comparison(op.inner) {
+			TypeIndex::INFER
+		} else {
+			expected
+		};
+		// Both operands share one type (every operator trait takes
+		// `rhs: Self`): a typed left side is what the right one is expected to
+		// be, and below, a typed side gives its type to an untyped one.
+		let lhs = self.build(left, expected);
+		let left_ty = self.body.ty(lhs);
+		let rhs = if self.cx.types.has_literal(left_ty) {
+			self.build(right, expected)
+		} else {
+			self.build(right, left_ty)
+		};
+		let right_ty = self.body.ty(rhs);
+		let operand_ty = match (
+			self.cx.types.has_literal(left_ty),
+			self.cx.types.has_literal(right_ty),
+		) {
+			(true, true) => {
+				// A string or array literal has no operators of its own.
+				for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
+					if ty == TypeIndex::STRING_LITERAL
+						|| ty == TypeIndex::ARRAY_LITERAL
+					{
+						return self.report_operator_on_literal(
+							op.inner.as_str(),
+							operand,
+							span,
+						);
+					}
+				}
+				if is_comparison(op.inner) {
+					self.cx.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::ComparisonTypeAnnotationRequired
+									.code(),
+							)
+							.with_message(
+								"type annotation required to compare untyped literals",
+							)
+							.with_label(Label::primary(self.scope.file_id, span)),
+					);
+					return self.body.push(
+						ExprKind::Error,
+						TypeIndex::ERROR,
+						span,
+					);
+				}
+				// Two literals are a character if either is, else a float if
+				// either is; anything else untyped (a tuple of literals) keeps
+				// the left side's shape.
+				let ty = if !left_ty.is_literal() || !right_ty.is_literal() {
+					left_ty
+				} else if left_ty == TypeIndex::CHAR_LITERAL
+					|| right_ty == TypeIndex::CHAR_LITERAL
+				{
+					TypeIndex::CHAR_LITERAL
+				} else if left_ty == TypeIndex::FLOAT_LITERAL
+					|| right_ty == TypeIndex::FLOAT_LITERAL
+				{
+					TypeIndex::FLOAT_LITERAL
+				} else {
+					TypeIndex::INTEGER_LITERAL
+				};
+				return self.body.push(
+					ExprKind::PrimitiveBinary {
+						op: op.inner,
+						lhs,
+						rhs,
+					},
+					ty,
+					span,
+				);
+			}
+			(true, false) => {
+				self.coerce(lhs, right_ty);
+				right_ty
+			}
+			(false, true) => {
+				self.coerce(rhs, left_ty);
+				left_ty
+			}
+			(false, false) => {
+				if left_ty != right_ty
+					&& left_ty != TypeIndex::ERROR
+					&& right_ty != TypeIndex::ERROR
+				{
+					let diagnostic =
+						self.report_type_mismatch(left_ty, right_ty, rhs);
+					self.cx.diagnostics.push(diagnostic);
+					return self.body.push(
+						ExprKind::Error,
+						TypeIndex::ERROR,
+						span,
+					);
+				}
+				left_ty
+			}
+		};
+		let (kind, ty) = self.select_binary(op, lhs, rhs, operand_ty);
+		self.body.push(kind, ty, span)
+	}
+
+	/// The node for a unary operator on an operand of concrete type, and its
+	/// type. Pushes nothing but call arguments, so a caller can rewrite a node
+	/// in place with it.
+	fn select_unary(
+		&mut self,
+		op: Spanned<UnaryOp>,
+		operand: ExprIdx,
+	) -> (ExprKind, TypeIndex) {
+		let ty = self.body.ty(operand);
+		let Some(lookup) = self.operator_impl(
+			ty,
+			self.cx.operators.unary(op.inner),
+			self.body.span(operand),
+			op.span,
+			op.inner.as_str(),
+		) else {
+			return (ExprKind::Error, TypeIndex::ERROR);
+		};
+		if is_primitive_unary(op.inner, ty) {
+			let kind = ExprKind::PrimitiveUnary {
+				op: op.inner,
+				operand,
+			};
+			return (kind, ty);
+		}
+		(self.method_call(lookup, ty, operand, None), ty)
+	}
+
+	/// The node for a binary operator on operands of concrete type `ty`, and
+	/// its type. See `select_unary`.
+	fn select_binary(
+		&mut self,
+		op: Spanned<BinaryOp>,
+		lhs: ExprIdx,
+		rhs: ExprIdx,
+		ty: TypeIndex,
+	) -> (ExprKind, TypeIndex) {
+		// Enums and pointers compare natively, by discriminant and address.
+		if is_comparison(op.inner)
+			&& matches!(
+				self.cx.types.resolve(ty),
+				Type::Enum { .. } | Type::Pointer { .. }
+			) {
+			let kind = ExprKind::PrimitiveBinary {
+				op: op.inner,
+				lhs,
+				rhs,
+			};
+			return (kind, TypeIndex::BOOL);
+		}
+		let Some(lookup) = self.operator_impl(
+			ty,
+			self.cx.operators.binary(op.inner),
+			self.body.span(lhs),
+			op.span,
+			op.inner.as_str(),
+		) else {
+			return (ExprKind::Error, TypeIndex::ERROR);
+		};
+		let result = if is_comparison(op.inner) {
+			TypeIndex::BOOL
+		} else {
+			ty
+		};
+		if is_primitive_binary(op.inner, ty) {
+			let kind = ExprKind::PrimitiveBinary {
+				op: op.inner,
+				lhs,
+				rhs,
+			};
+			return (kind, result);
+		}
+		(self.method_call(lookup, ty, lhs, Some(rhs)), result)
+	}
+
+	/// Whether `ty` implements the operator's trait, and through what. `None`
+	/// when it does not (reported here) or `ty` is already an error.
+	fn operator_impl(
+		&mut self,
+		ty: TypeIndex,
+		method: Option<OperatorMethod>,
+		operand_span: TextSpan,
+		op_span: TextSpan,
+		op: &str,
+	) -> Option<(OperatorMethod, TraitImplLookup)> {
+		if ty == TypeIndex::ERROR {
+			return None;
+		}
+		let found = match method {
+			Some(method) => {
+				match self.cx.find_trait_impl_query(
+					self.scope.env,
+					ty,
+					method.trait_index,
+				) {
+					Ok(found) => found.map(|lookup| (method, lookup)),
+					Err(error) => {
+						let site = SourceSpan::new(self.scope.file_id, op_span);
+						match error {
+							SolverError::Overflow => {
+								self.cx
+									.diagnostics
+									.push(self.cx.overflow_diagnostic(site));
+							}
+							SolverError::Cycle(cycle) => {
+								let diagnostic =
+									self.cx.cycle_diagnostic(&cycle, site);
+								self.cx.diagnostics.push(diagnostic);
+							}
+							_ => {}
+						}
+						return None;
+					}
+				}
+			}
+			None => None,
+		};
+		if found.is_none() {
+			let ty = self.cx.type_formatter().display_type(ty).to_string();
+			let label = Label::primary(self.scope.file_id, operand_span);
+			let (message, label) = match method {
+				Some(method) => {
+					let name = self.cx.defs.traits
+						[usize::from(method.trait_index)]
+					.name
+					.inner;
+					let name = self.cx.strings.resolve(name).unwrap();
+					(
+						format!(
+							"the trait bound `{ty}: {name}` is not satisfied"
+						),
+						label.with_message(format!(
+							"the trait `{name}` is not implemented for `{ty}`"
+						)),
+					)
+				}
+				None => (format!("cannot apply `{op}` to `{ty}`"), label),
+			};
+			self.cx.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TraitBoundViolation.code())
+					.with_message(message)
+					.with_label(label)
+					.with_label(
+						Label::secondary(self.scope.file_id, op_span)
+							.with_message(format!("required by `{op}`")),
+					),
+			);
+		}
+		found
+	}
+
+	/// A call of the operator's method on operands of type `ty`, with the
+	/// first as the receiver and the other, if any, as its argument: the
+	/// selected impl's own, or the trait's declaration when the receiver is
+	/// abstract or the impl inherits a default.
+	fn method_call(
+		&mut self,
+		selected: (OperatorMethod, TraitImplLookup),
+		ty: TypeIndex,
+		receiver: ExprIdx,
+		operand: Option<ExprIdx>,
+	) -> ExprKind {
+		let args = operand.unwrap_or_else(|| {
+			let span = self.body.span(receiver);
+			self.pack([], ElementOrder::InOrder, TypeIndex::UNIT, span)
+		});
+		match self.select_operator_method(selected, ty) {
+			SelectedMethod::Concrete {
+				function,
+				type_args,
+			} => ExprKind::MethodCall {
+				function,
+				type_args,
+				receiver,
+				args,
+			},
+			SelectedMethod::Abstract { method, type_args } => {
+				ExprKind::AbstractMethodCall {
+					method,
+					type_args,
+					receiver,
+					args,
+				}
+			}
+		}
+	}
+
+	/// Which method an operator on operands of type `ty` calls, with its type
+	/// arguments: the selected impl's own, with the impl's arguments, or the
+	/// trait's declaration, with `ty` as `Self`, when the receiver is
+	/// abstract or the impl inherits a default.
+	fn select_operator_method(
+		&mut self,
+		(method, lookup): (OperatorMethod, TraitImplLookup),
+		ty: TypeIndex,
+	) -> SelectedMethod {
+		if let TraitImplLookup::Concrete { impl_index, args } = lookup
+			&& let TraitMemberSelection::Impl(
+				MemberKind::Method(function) | MemberKind::Function(function),
+			) = self.cx.defs.select_trait_member(
+				impl_index,
+				MemberKind::Method(method.method),
+			) {
+			return SelectedMethod::Concrete {
+				function,
+				type_args: self.cx.types.push_list(&args),
+			};
+		}
+		SelectedMethod::Abstract {
+			method: method.method,
+			type_args: self.cx.types.push_list(&[ty]),
+		}
+	}
+
+	/// What a type means in `scope`: comparisons and literal coercion work on
+	/// normalized types. A projection that does not normalize stays as written;
+	/// whoever wrote it has reported why.
+	fn normalized(&mut self, ty: TypeIndex, scope: TypeEnvIdx) -> TypeIndex {
+		match self.cx.normalize(
+			scope,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+		) {
+			Ok(normalized) => normalized,
+			Err(_) => ty,
+		}
+	}
+
+	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
+	/// when the stdlib declares no `Memory`.
+	fn memory_size(&mut self, memory: TypeIndex) -> TypeIndex {
+		let Some(projection) = self.cx.memory_size(memory) else {
+			return TypeIndex::ERROR;
+		};
+		self.normalized(projection, self.scope.env)
+	}
+
+	/// Every member of every typeset an abstract `target` assumes, any of
+	/// which can be substituted for it. Empty when no literal can have type
+	/// `target`.
+	fn typeset_targets(&self, target: TypeIndex) -> Vec<LiteralTarget> {
+		// An abstract target is constrained by its own bounds alone, so read
+		// the typesets those name rather than probing every typeset.
+		let mut targets = Vec::new();
+		for trait_index in self.cx.clause_tables().declared_traits(
+			&self.cx.types,
+			target,
+			self.cx.solver.state.recursion_budget,
+		) {
+			let Some(typeset) =
+				self.cx.defs.traits[usize::from(trait_index)].typeset
+			else {
+				continue;
+			};
+			for member in self.cx.typeset_members(typeset).iter().copied() {
+				targets.push(LiteralTarget::TypesetMember(typeset, member));
+			}
+		}
+		targets
+	}
+
+	/// Gives an untyped subtree the type `target`, checking each literal fits.
+	/// Reports and leaves the offending node at `ERROR` when one does not.
+	fn coerce(&mut self, expr: ExprIdx, target: TypeIndex) {
+		if target == TypeIndex::ERROR {
+			self.body.set_ty(expr, TypeIndex::ERROR);
+			return;
+		}
+		match self.body.kind(expr) {
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. } => {
+				return self.coerce_static(expr, target);
+			}
+			ExprKind::Tuple { elements, order } => {
+				return self.coerce_tuple(expr, elements, order, target);
+			}
+			// A block is untyped through its result, an `if` through its
+			// branches: each untyped one takes the type.
+			ExprKind::Block {
+				result: Some(result),
+				..
+			} => {
+				self.coerce(result, target);
+				return self.body.set_ty(expr, target);
+			}
+			ExprKind::IfElse {
+				then_block,
+				else_block: Some(else_block),
+				..
+			} => {
+				for branch in [then_block, else_block] {
+					if self.cx.types.has_literal(self.body.ty(branch)) {
+						self.coerce(branch, target);
+					}
+				}
+				return self.body.set_ty(expr, target);
+			}
+			ExprKind::Match { arms, .. } => {
+				let bodies: Vec<ExprIdx> =
+					self.body.arms(arms).iter().map(|arm| arm.body).collect();
+				for arm in bodies {
+					if self.cx.types.has_literal(self.body.ty(arm)) {
+						self.coerce(arm, target);
+					}
+				}
+				return self.body.set_ty(expr, target);
+			}
+			_ => {}
+		}
+		// The common case: one concrete scalar, held on the stack.
+		if Integer::from_type(target).is_some()
+			|| Float::from_type(target).is_some()
+			|| target == TypeIndex::CHAR
+		{
+			let single = [LiteralTarget::Target(target)];
+			return self.coerce_against(expr, target, &single);
+		}
+		let targets = self.typeset_targets(target);
+		if targets.is_empty() {
+			self.cx
+				.diagnostics
+				.push(self.report_unable_to_coerce(expr, target));
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		}
+		self.coerce_against(expr, target, &targets);
+	}
+
+	/// `coerce` against the scalars a literal must fit: `target`'s own, or
+	/// every member of every typeset it assumes.
+	fn coerce_against(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		targets: &[LiteralTarget],
+	) {
+		match self.body.kind(expr) {
+			ExprKind::Int(value) => {
+				self.coerce_int(expr, expr, target, targets, value, false);
+			}
+			ExprKind::Float(_) => self.coerce_float(expr, target, targets),
+			ExprKind::Char(value) => {
+				self.coerce_char(expr, target, targets, value)
+			}
+			ExprKind::PrimitiveUnary { op, operand } => {
+				for fit in targets {
+					if !fit.fits_unary(op) {
+						return self.report_misfit(expr, target, fit);
+					}
+				}
+				let coerced = match (op, self.body.kind(operand)) {
+					// `-128` is in range for `i8` though `128` is not: a
+					// negated literal is checked against the negative bound.
+					(UnaryOp::InvertSign, ExprKind::Int(value)) => self
+						.coerce_int(
+							expr, operand, target, targets, value, true,
+						),
+					_ => {
+						self.coerce(operand, target);
+						true
+					}
+				};
+				if coerced {
+					self.body.set_ty(expr, target);
+				}
+			}
+			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
+				debug_assert!(
+					!is_comparison(op),
+					"a comparison is never untyped"
+				);
+				self.coerce(lhs, target);
+				self.coerce(rhs, target);
+				// The operator could not be checked while its operands had no
+				// type; it is now, and the node is rewritten in place.
+				let op = Spanned {
+					inner: op,
+					span: self.body.span(expr),
+				};
+				let (kind, ty) = self.select_binary(op, lhs, rhs, target);
+				self.body.set_kind(expr, kind);
+				self.body.set_ty(expr, ty);
+			}
+			kind => unreachable!(
+				"only literals and operators over them are untyped: {kind:?}"
+			),
+		}
+	}
+
+	/// Checks an integer literal (`value`, optionally negated) against every
+	/// candidate, then gives `literal` the type `target` and returns `true`.
+	/// On a misfit it draws the report, leaves the node at `ERROR`, and
+	/// returns `false`. `report` is the node a diagnostic points at — the
+	/// unary itself, for a negated literal.
+	fn coerce_int(
+		&mut self,
+		report: ExprIdx,
+		literal: ExprIdx,
+		target: TypeIndex,
+		targets: &[LiteralTarget],
+		value: u64,
+		negated: bool,
+	) -> bool {
+		let mut all_float = true;
+		for fit in targets {
+			if !fit.fits_int(value, negated) {
+				self.report_int_misfit(report, value, negated, target, fit);
+				return false;
+			}
+			all_float &= fit.is_float();
+		}
+		// An integer literal of float type is a float.
+		if all_float {
+			self.body.set_kind(literal, ExprKind::Float(value as f64));
+		}
+		self.body.set_ty(literal, target);
+		true
+	}
+
+	/// Gives an untyped tuple the type `target`: each element is held to the
+	/// target's element at its position, which coerces the untyped ones. A
+	/// target that is not a tuple as long is a mismatch.
+	fn coerce_tuple(
+		&mut self,
+		expr: ExprIdx,
+		elements: ExprRange,
+		order: ElementOrder,
+		target: TypeIndex,
+	) {
+		let targets = match *self.cx.types.resolve(target) {
+			Type::Tuple { elements: targets }
+				if targets.len() == elements.len() =>
+			{
+				targets
+			}
+			_ => {
+				let actual = self.body.ty(expr);
+				let diagnostic =
+					self.report_type_mismatch(target, actual, expr);
+				self.cx.diagnostics.push(diagnostic);
+				return self.body.set_ty(expr, TypeIndex::ERROR);
+			}
+		};
+		let mut types = vec![TypeIndex::ERROR; elements.len()];
+		for at in 0..elements.len() {
+			let element = self.body.args(elements)[at];
+			let position = usize::from(self.body.declared_index(order, at));
+			let element_target = self.cx.types.list(targets)[position];
+			let element = self.expect(element, element_target);
+			types[position] = self.body.ty(element);
+		}
+		let ty = self.cx.types.intern_tuple(&types);
+		let ty = self.cx.types.collapse_error(ty);
+		self.body.set_ty(expr, ty);
+	}
+
+	/// Reads a float literal's value from its text at each target's width.
+	fn coerce_float(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		targets: &[LiteralTarget],
+	) {
+		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
+		let text = self.body.span(expr).extract_str(source);
+		let mut value = None;
+		for fit in targets {
+			match fit.fits_float(&text) {
+				FloatFit::Fits(parsed) => {
+					value.get_or_insert(parsed);
+				}
+				// Malformed syntax was reported by the parser.
+				FloatFit::Invalid => {
+					return self.body.set_ty(expr, TypeIndex::ERROR);
+				}
+				FloatFit::Overflow => {
+					return self.report_float(expr, fit, true);
+				}
+				FloatFit::Underflow => {
+					return self.report_float(expr, fit, false);
+				}
+				FloatFit::NotFloat => {
+					return self.report_misfit(expr, target, fit);
+				}
+			}
+		}
+		self.body.set_kind(expr, ExprKind::Float(value.unwrap()));
+		self.body.set_ty(expr, target);
+	}
+
+	/// A character literal is a `Char`, or an integer its code point fits,
+	/// which it then is.
+	fn coerce_char(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		targets: &[LiteralTarget],
+		value: char,
+	) {
+		let code_point = u64::from(value);
+		for fit in targets {
+			if fit.ty() == TypeIndex::CHAR {
+				continue;
+			}
+			match Integer::from_type(fit.ty()) {
+				Some(integer) if integer.in_range(code_point, false) => {}
+				Some(_) if matches!(fit, LiteralTarget::Target(_)) => {
+					let message = format!(
+						"character literal {value:?} out of range for `{}`",
+						self.cx.type_formatter().display_type(target)
+					);
+					self.push_error(
+						DiagnosticCode::IntegerLiteralOutOfRange,
+						message,
+						expr,
+					);
+					return;
+				}
+				_ => return self.report_misfit(expr, target, fit),
+			}
+		}
+		if target != TypeIndex::CHAR {
+			self.body.set_kind(expr, ExprKind::Int(code_point));
+		}
+		self.body.set_ty(expr, target);
+	}
+
+	/// A float literal `fit` cannot hold: too large or too small for its width.
+	fn report_float(
+		&mut self,
+		expr: ExprIdx,
+		fit: &LiteralTarget,
+		overflow: bool,
+	) {
+		let name = self.cx.type_formatter().display_type(fit.ty());
+		let (code, message) = if overflow {
+			(
+				DiagnosticCode::FloatLiteralOverflow,
+				format!("float literal is too large for `{name}`"),
+			)
+		} else {
+			(
+				DiagnosticCode::FloatLiteralUnderflow,
+				format!("float literal is too small to represent in `{name}`"),
+			)
+		};
+		self.push_error(code, message, expr);
+	}
+
+	/// An integer literal that does not fit `fit`: out of range for a plain
+	/// integer target, not representable for a float one.
+	fn report_int_misfit(
+		&mut self,
+		expr: ExprIdx,
+		value: u64,
+		negated: bool,
+		target: TypeIndex,
+		fit: &LiteralTarget,
+	) {
+		let LiteralTarget::Target(ty) = fit else {
+			return self.report_misfit(expr, target, fit);
+		};
+		if Integer::from_type(*ty).is_some() {
+			let value = if negated {
+				-(value as i128)
+			} else {
+				value as i128
+			};
+			self.report_out_of_range(expr, value, target);
+		} else if Float::from_type(*ty).is_some() {
+			let message = format!(
+				"integer literal cannot be represented exactly by `{}`",
+				self.cx.type_formatter().display_type(target)
+			);
+			self.push_error(
+				DiagnosticCode::IntegerLiteralNotRepresentable,
+				message,
+				expr,
+			);
+		} else {
+			// A concrete type that is neither integer nor float (`Bool`, `Char`)
+			// has no integer proof, just as a typeset member has none.
+			self.report_misfit(expr, target, fit);
+		}
+	}
+
+	/// A literal `fit` cannot hold: unable to coerce to a scalar target, or a
+	/// typeset member it does not fit for an abstract one.
+	fn report_misfit(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		fit: &LiteralTarget,
+	) {
+		let LiteralTarget::TypesetMember(typeset, member) = fit else {
+			self.cx
+				.diagnostics
+				.push(self.report_unable_to_coerce(expr, target));
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		};
+		let def = &self.cx.defs.typesets[usize::from(*typeset)];
+		let typeset_name = self
+			.cx
+			.strings
+			.resolve(
+				self.cx.defs.traits[usize::from(def.trait_index)].name.inner,
+			)
+			.unwrap();
+		let member_name = self.cx.type_formatter().display_type(member.inner);
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypesetBoundViolation.code())
+				.with_message(format!(
+					"literal is not representable by every member of typeset `{typeset_name}`"
+				))
+				.with_label(
+					Label::primary(self.scope.file_id, self.body.span(expr))
+						.with_message(format!(
+							"cannot be represented by `{member_name}`"
+						)),
+				)
+				.with_label(
+					SourceSpan::new(def.file_id, member.span)
+						.secondary_label()
+						.with_message(format!(
+							"`{member_name}` is a member here"
+						)),
+				),
+		);
+		self.body.set_ty(expr, TypeIndex::ERROR);
+	}
+
+	fn report_out_of_range(
+		&mut self,
+		expr: ExprIdx,
+		value: i128,
+		ty: TypeIndex,
+	) {
+		let message = format!(
+			"literal `{value}` out of range for `{}`",
+			self.cx.type_formatter().display_type(ty)
+		);
+		self.push_error(
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			message,
+			expr,
+		);
+	}
+
+	/// A string or array literal is static data: it becomes a shared array
+	/// of its length or a shared slice, in whatever memory `target` names,
+	/// abstract ones included. The data is read-only, so an exclusive pointer
+	/// is not one it can become. A string's elements are bytes; an array
+	/// literal's are checked against the target's element type. A repeat's
+	/// count is a length in the memory, of its `Size`, and an integer literal
+	/// or a constant, since static data is laid out before the program runs.
+	fn coerce_static(&mut self, expr: ExprIdx, target: TypeIndex) {
+		// Only an array's length can be left to the literal.
+		let parts = self.static_target(target);
+		let known = parts.is_some_and(|(of, memory, _)| {
+			!self.cx.types.has_infer(of) && !self.cx.types.has_infer(memory)
+		});
+		if self.cx.types.has_infer(target) && !known {
+			self.report_annotation_required(expr);
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		}
+		let kind = self.body.kind(expr);
+		let fits = parts.filter(|&(of, ..)| {
+			!matches!(kind, ExprKind::String(_)) || of == TypeIndex::U8
+		});
+		let Some((of, memory, target_length)) = fits else {
+			let note = match kind {
+				ExprKind::String(_) => STRING_TARGETS_NOTE,
+				_ => ARRAY_TARGETS_NOTE,
+			};
+			let diagnostic =
+				self.report_unable_to_coerce(expr, target).with_note(note);
+			self.cx.diagnostics.push(diagnostic);
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		};
+		// The literal's length as a type: a `Value`, or the `Const` a
+		// repeat's count names, compared with the target's once it has one.
+		let length = match kind {
+			ExprKind::String(contents) => {
+				let length = self.cx.strings.resolve(contents).unwrap().len();
+				let bits = u64::try_from(length).unwrap();
+				Some(self.cx.types.intern(Type::Value { bits }))
+			}
+			ExprKind::Array { elements } => {
+				for at in 0..elements.len() {
+					let element = self.body.args(elements)[at];
+					self.expect(element, of);
+				}
+				let bits = u64::try_from(elements.len()).unwrap();
+				Some(self.cx.types.intern(Type::Value { bits }))
+			}
+			// `[value; _]` is as long as the array it becomes.
+			ExprKind::ArrayRepeat { value, count: None } => {
+				self.expect(value, of);
+				match target_length {
+					Some(length) if length != TypeIndex::INFER => {
+						return self.body.set_ty(expr, target);
+					}
+					_ => {
+						self.report_annotation_required(expr);
+						return self.body.set_ty(expr, TypeIndex::ERROR);
+					}
+				}
+			}
+			ExprKind::ArrayRepeat {
+				value,
+				count: Some(count),
+			} => {
+				self.expect(value, of);
+				let length_type = self.memory_size(memory);
+				self.expect(count, length_type);
+				match self.body.kind(count) {
+					_ if self.body.ty(count) == TypeIndex::ERROR => None,
+					ExprKind::Int(bits) => {
+						Some(self.cx.types.intern(Type::Value { bits }))
+					}
+					ExprKind::Const {
+						constant,
+						type_args,
+					} if type_args.is_empty() => {
+						Some(self.cx.types.intern_const(constant, &[]))
+					}
+					// An impl's constant may depend on the impl's arguments,
+					// which evaluation does not substitute (yet).
+					ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
+						let span = self.body.span(count);
+						self.report_unsupported(
+							span,
+							"a repeat count of a generic constant",
+						);
+						return self.body.set_ty(expr, TypeIndex::ERROR);
+					}
+					_ => {
+						self.push_error(
+							DiagnosticCode::ArrayRepeatCountNotConst,
+							"an array's length is a literal or a constant"
+								.to_string(),
+							count,
+						);
+						return self.body.set_ty(expr, TypeIndex::ERROR);
+					}
+				}
+			}
+			_ => unreachable!("only static data is coerced as static data"),
+		};
+		let (Some(target_length), Some(length)) = (target_length, length)
+		else {
+			return self.body.set_ty(expr, target);
+		};
+		// A written `_` takes the literal's length.
+		if target_length == TypeIndex::INFER {
+			let ty = self.cx.types.intern(Type::Array {
+				of,
+				length,
+				memory,
+				ownership: Ownership::Shared,
+			});
+			return self.body.set_ty(expr, ty);
+		}
+		self.body.set_ty(expr, target);
+		self.check_static_length(expr, target, length);
+	}
+
+	/// Checks that a string or array literal `expr` of length `length` is as
+	/// long as `target`, the array it becomes. In a constant's body, a length
+	/// that names a constant is compared once it has a value.
+	fn check_static_length(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		length: TypeIndex,
+	) {
+		let Some((_, _, Some(target_length))) = self.static_target(target)
+		else {
+			unreachable!("a literal with a length becomes an array")
+		};
+		if target_length == length {
+			return;
+		}
+		if self.cx.types.has_const(target_length)
+			|| self.cx.types.has_const(length)
+		{
+			return self.obligations.exprs.push(ExprObligation::StaticLength {
+				expr,
+				target,
+				length,
+			});
+		}
+		self.decide_static_length(expr, target, length);
+	}
+
+	/// Decides a literal's length against its array's, reading values.
+	fn decide_static_length(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		length: TypeIndex,
+	) {
+		let Some((_, _, Some(target_length))) = self.static_target(target)
+		else {
+			unreachable!("a literal with a length becomes an array")
+		};
+		let scope = self.scope.env;
+		let target_now = self.cx.normalize(
+			scope,
+			target_length,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		);
+		let length_now = self.cx.normalize(
+			scope,
+			length,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		);
+		let (expected, actual) = match (target_now, length_now) {
+			(Ok(expected), Ok(actual)) => (expected, actual),
+			// Reported where the constant is.
+			_ => return,
+		};
+		let (Type::Value { bits }, Type::Value { bits: length }) = (
+			*self.cx.types.resolve(expected),
+			*self.cx.types.resolve(actual),
+		) else {
+			return;
+		};
+		if bits == length {
+			return;
+		}
+		let target = self.cx.type_formatter().display_type(target);
+		let literal = match self.body.kind(expr) {
+			ExprKind::String(_) => {
+				format!("this string literal is {length} bytes long")
+			}
+			_ => format!("this array literal has {length} elements"),
+		};
+		self.push_error(
+			DiagnosticCode::ArraySizeMismatch,
+			format!("{literal}, but `{target}` holds {bits}"),
+			expr,
+		);
+	}
+
+	/// The element type, memory and length (`None` for a slice) of a shared
+	/// array or slice: what a string or array literal can become.
+	pub(super) fn static_target(
+		&self,
+		target: TypeIndex,
+	) -> Option<(TypeIndex, TypeIndex, Option<TypeIndex>)> {
+		match *self.cx.types.resolve(target) {
+			Type::Array {
+				of,
+				memory,
+				length,
+				ownership: Ownership::Shared,
+			} => Some((of, memory, Some(length))),
+			Type::Slice {
+				of,
+				memory,
+				ownership: Ownership::Shared,
+			} => Some((of, memory, None)),
+			_ => None,
+		}
+	}
+
+	/// An operator applied to an untyped string or array literal, which has
+	/// no operators of its own; typed, it has its slice's or array's.
+	fn report_operator_on_literal(
+		&mut self,
+		op: &str,
+		operand: ExprIdx,
+		span: TextSpan,
+	) -> ExprIdx {
+		let (noun, note) = if self.body.ty(operand) == TypeIndex::STRING_LITERAL
+		{
+			("a string literal", STRING_TARGETS_NOTE)
+		} else {
+			("an array literal", ARRAY_TARGETS_NOTE)
+		};
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TraitBoundViolation.code())
+				.with_message(format!("cannot apply `{op}` to {noun}"))
+				.with_label(self.source_span(operand).primary_label())
+				.with_note(note),
+		);
+		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+	}
+
+	fn report_unable_to_coerce(
+		&self,
+		expr: ExprIdx,
+		target: TypeIndex,
+	) -> Diagnostic<FileId> {
+		Diagnostic::error()
+			.with_code(DiagnosticCode::UnableToCoerce.code())
+			.with_message(format!(
+				"unable to coerce to type `{}`",
+				self.cx.type_formatter().display_type(target)
+			))
+			.with_label(self.source_span(expr).primary_label())
+	}
+
+	/// Reports at `expr` and leaves it at `ERROR`, so nothing reports it again.
+	fn push_error(
+		&mut self,
+		code: DiagnosticCode,
+		message: String,
+		expr: ExprIdx,
+	) {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(code.code())
+				.with_message(message)
+				.with_label(self.source_span(expr).primary_label()),
+		);
+		self.body.set_ty(expr, TypeIndex::ERROR);
+	}
+
+	fn report_type_mismatch(
+		&self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		expr: ExprIdx,
+	) -> Diagnostic<FileId> {
+		self.mismatch_at(expected, actual, self.body.span(expr))
+	}
+
+	fn mismatch_at(
+		&self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		span: TextSpan,
+	) -> Diagnostic<FileId> {
+		let formatter = self.cx.type_formatter();
+		Diagnostic::error()
+			.with_code(DiagnosticCode::TypeMistmatch.code())
+			.with_message("type mismatch")
+			.with_label(Label::primary(self.scope.file_id, span).with_message(
+				format!(
+					"expected `{}`, found `{}`",
+					formatter.display_type(expected),
+					formatter.display_type(actual)
+				),
+			))
+	}
+
+	fn source_span(&self, expr: ExprIdx) -> SourceSpan {
+		SourceSpan::new(self.scope.file_id, self.body.span(expr))
+	}
+}
+
+/// What a string literal can become, for the notes that reject one.
+pub(super) const STRING_TARGETS_NOTE: &str = "a string literal is a shared \
+	byte slice or byte array in a memory: `heap::&[u8]` or `heap::&[u8; N]`";
+
+pub(super) const ARRAY_TARGETS_NOTE: &str = "an array literal is a shared \
+	array or slice in a memory: `heap::&[T; N]` or `heap::&[T]`";
+
+/// The method an operator dispatches to, with its type arguments.
+#[derive(Clone, Copy)]
+enum SelectedMethod {
+	/// The selected impl's own method, called directly.
+	Concrete {
+		function: FunctionIdx,
+		type_args: TypeList,
+	},
+	/// The trait's declaration, whose impl is selected once the receiver is
+	/// known.
+	Abstract {
+		method: FunctionIdx,
+		type_args: TypeList,
+	},
+}
+
+/// What a value path names.
+enum ValuePath<'s> {
+	/// What the namespace walk reached, all of the path or where it failed.
+	Item(PathWalk),
+	/// A member of the type the segments before the last name.
+	Member(MemberPath<'s>),
+}
+
+/// A call's arguments, by position or by name.
+#[derive(Clone, Copy)]
+enum Arguments<'e> {
+	Positional(&'e [ast::Separated<Spanned<ast::Expression>>]),
+	Named(&'e [ast::Separated<Spanned<ast::NamedArgument>>]),
+}
+
+/// A type a literal must fit, and where the requirement comes from.
+enum LiteralTarget {
+	/// The target type itself.
+	Target(TypeIndex),
+	/// A member of a typeset an abstract target assumes: the typeset, to name
+	/// it, and the member's written type, for its place in a diagnostic.
+	TypesetMember(TypesetIdx, Spanned<TypeIndex>),
+}
+
+impl LiteralTarget {
+	/// The candidate type. `Integer::from_type` or `Float::from_type` narrows
+	/// it when the check wants one; a typeset member need be neither.
+	fn ty(&self) -> TypeIndex {
+		match self {
+			LiteralTarget::Target(ty) => *ty,
+			LiteralTarget::TypesetMember(_, member) => member.inner,
+		}
+	}
+
+	/// Whether an integer literal (`value`, optionally negated) fits.
+	fn fits_int(&self, value: u64, negated: bool) -> bool {
+		let ty = self.ty();
+		if let Some(integer) = Integer::from_type(ty) {
+			integer.in_range(value, negated)
+		} else if let Some(float) = Float::from_type(ty) {
+			float.exact_precision_int(value)
+		} else {
+			false
+		}
+	}
+
+	/// Whether a float literal written `text` fits, and its value when it does.
+	fn fits_float(&self, text: &str) -> FloatFit {
+		let Some(float) = Float::from_type(self.ty()) else {
+			return FloatFit::NotFloat;
+		};
+		let result = match float {
+			Float::F32 => text
+				.parse::<f32>()
+				// f64::from is a lossless conversion
+				.map(f64::from),
+			Float::F64 => text.parse::<f64>(),
+		};
+		match result {
+			Ok(parsed) if parsed.is_infinite() => FloatFit::Overflow,
+			Ok(parsed)
+				if parsed == 0.0
+					&& text
+						.bytes()
+						.any(|b| b.is_ascii_digit() && b != b'0') =>
+			{
+				FloatFit::Underflow
+			}
+			Ok(parsed) => FloatFit::Fits(parsed),
+			Err(_) => FloatFit::Invalid,
+		}
+	}
+
+	/// Whether `op` means anything over a literal of this candidate's type.
+	fn fits_unary(&self, op: UnaryOp) -> bool {
+		let ty = self.ty();
+		match op {
+			UnaryOp::InvertSign => {
+				Integer::from_type(ty).is_some_and(Integer::is_signed)
+					|| Float::from_type(ty).is_some()
+			}
+			UnaryOp::BitNot => Integer::from_type(ty).is_some(),
+			UnaryOp::Not => false,
+		}
+	}
+
+	/// Whether a literal of this candidate's type is a float.
+	fn is_float(&self) -> bool {
+		Float::from_type(self.ty()).is_some()
+	}
+}
+
+/// How a float literal fares against one candidate.
+enum FloatFit {
+	/// It parses and is representable at the candidate's width, at this value.
+	Fits(f64),
+	/// The text is not a float; the parser has already reported it.
+	Invalid,
+	/// It parses to infinity at the candidate's width.
+	Overflow,
+	/// It is nonzero in text but rounds to zero at the candidate's width.
+	Underflow,
+	/// The candidate is not a float type.
+	NotFloat,
+}
+
+#[derive(Clone, Copy)]
+enum Float {
+	F32,
+	F64,
+}
+
+impl Float {
+	fn from_type(ty: TypeIndex) -> Option<Self> {
+		Some(match ty {
+			TypeIndex::F32 => Self::F32,
+			TypeIndex::F64 => Self::F64,
+			_ => return None,
+		})
+	}
+
+	fn mantissa_bits(self) -> u32 {
+		match self {
+			Self::F32 => 24,
+			Self::F64 => 53,
+		}
+	}
+
+	fn exact_precision_int(self, value: u64) -> bool {
+		value == 0
+			|| 64 - value.leading_zeros() - value.trailing_zeros()
+				<= self.mantissa_bits()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use codespan_reporting::diagnostic::Diagnostic;
+	use indoc::indoc;
+
+	use super::super::body::{
+		Body, ElementOrder, ExprIdx, ExprKind, ExprRange, PlaceIdx, PlaceKind,
+	};
+	use super::super::defs::{
+		AstEntry, DefKind, DefinitionRegistry, FunctionIdx, MemberOwner, Scope,
+		Tier,
+	};
+	use super::super::eval::{ConstScalar, ConstValueState};
+	use super::super::impls::ImplDispatch;
+	use super::super::paths::PathResolver;
+	use super::super::resolutions::{NameResolutions, Referent};
+	use super::super::signatures::TypeContext;
+	use super::super::solver::{NormalizationDepth, RewriteFlags, Solver};
+	use super::super::types::{Type, TypeEnvIdx, TypeIndex};
+	use crate::ast::{self, Spanned, StringInterner};
+	use crate::diagnostics::{DiagnosticCode, TextSpan};
+	use crate::testing::DiagnosticView;
+	use crate::vfs::{self, FileId, Files};
+
+	const STDLIB: &str = include_str!("../../std/main.wx");
+
+	/// `test_case!(case = "source")` declares the graph, the inputs and the
+	/// swept `TestCase` borrowing them as three locals of the calling test.
+	/// The test's items are appended to the real stdlib, so operators,
+	/// memories and globals are checked against its actual traits.
+	macro_rules! test_case {
+		($case:ident = $source:expr $(,)?) => {
+			let mut graph = source_graph($source);
+			let mut inputs = TestInputs::new(&mut graph);
+			let $case = TestCase::new(&mut inputs);
+		};
+		(mut $case:ident = $source:expr $(,)?) => {
+			let mut graph = source_graph($source);
+			let mut inputs = TestInputs::new(&mut graph);
+			let mut $case = TestCase::new(&mut inputs);
+		};
+	}
+
+	fn source_graph(source: &str) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		let root_id = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(
+					std::collections::HashMap::from([(
+						"main.wx".to_string(),
+						format!("{STDLIB}\n{source}"),
+					)]),
+				),
+			)
+			.unwrap();
+		builder.set_stdlib(root_id);
+		let graph = builder.build(root_id);
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_parser_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		graph
+	}
+
+	/// Everything a `TypeContext` borrows, kept on the test's stack.
+	struct TestInputs<'g> {
+		files: &'g Files,
+		strings: &'g mut StringInterner,
+		defs: DefinitionRegistry,
+		ast_nodes: Vec<AstEntry<'g>>,
+		impl_dispatch: ImplDispatch,
+		diagnostics: Vec<Diagnostic<FileId>>,
+		resolutions: NameResolutions,
+		solver: Solver,
+	}
+
+	impl<'g> TestInputs<'g> {
+		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+			let vfs::CompilationUnit {
+				files,
+				packages,
+				strings,
+				stdlib_package,
+				root_package,
+			} = graph;
+			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
+			let (defs, ast_nodes) = DefinitionRegistry::build(
+				packages,
+				files,
+				strings,
+				&mut diagnostics,
+				&mut resolutions,
+				*stdlib_package,
+				*root_package,
+			);
+			let impl_dispatch = ImplDispatch::build(
+				&mut diagnostics,
+				&mut resolutions,
+				strings,
+				&defs,
+				&ast_nodes,
+			);
+			let solver = Solver::new(defs.constants.len());
+			Self {
+				files,
+				strings,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+				diagnostics,
+				resolutions,
+				solver,
+			}
+		}
+	}
+
+	struct TestCase<'a> {
+		defs: &'a DefinitionRegistry,
+		context: TypeContext<'a, 'a, 'a>,
+	}
+
+	impl<'a> TestCase<'a> {
+		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
+			let TestInputs {
+				files,
+				strings,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+				diagnostics,
+				resolutions,
+				solver,
+			} = inputs;
+			let mut context = TypeContext::new(
+				diagnostics,
+				resolutions,
+				strings,
+				solver,
+				files,
+				defs,
+				ast_nodes,
+				impl_dispatch,
+			);
+			context.sweep();
+			// The stdlib's own bodies use forms the checker does not cover
+			// yet; those reports are not what this suite is about.
+			let stdlib_end = STDLIB.len() as u32;
+			context.diagnostics.retain(|diagnostic| {
+				let in_stdlib =
+					diagnostic.labels.first().is_some_and(|label| {
+						(label.range.start as u32) < stdlib_end
+					});
+				!(in_stdlib
+					&& diagnostic.code.as_deref()
+						== Some(DiagnosticCode::UnsupportedExpression.code()))
+			});
+			Self { defs, context }
+		}
+
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new(
+				"typecheck",
+				self.context.diagnostics,
+				&self.context.files,
+			)
+		}
+
+		fn resolve(&self, name: &str) -> DefKind {
+			let root = Scope::Package(self.defs.root_package);
+			let file_id = self.defs.namespaces.file_id(root.into());
+			let segments: Box<[ast::PathSegment]> = name
+				.split("::")
+				.map(|segment| ast::PathSegment {
+					ident: Spanned {
+						inner: self.context.strings.get(segment).unwrap(),
+						span: TextSpan::new(0, 0),
+					},
+					type_args: Box::new([]),
+				})
+				.collect();
+			let mut scratch = Vec::new();
+			let mut resolutions = NameResolutions::default();
+			PathResolver::new(
+				&mut scratch,
+				&mut resolutions,
+				self.context.strings,
+				self.defs,
+			)
+			.resolve_path(file_id, root, &segments, Tier::Value)
+			.def_key()
+			.unwrap_or_else(|| panic!("expected `{name}` to resolve"))
+			.symbol_kind(self.defs)
+		}
+
+		/// The checked block of the function `name`.
+		fn body(&self, name: &str) -> &Body {
+			let DefKind::Function(index) = self.resolve(name) else {
+				panic!("expected `{name}` to be a function");
+			};
+			self.context.function_bodies[usize::from(index)]
+				.as_ref()
+				.expect("a function with a block has a body")
+		}
+
+		/// The rendered block of the member `name`, which only one impl or
+		/// trait in the test defines with a block.
+		fn member_shape(&self, name: &str) -> String {
+			let symbol = self.context.strings.get(name).unwrap();
+			let mut found = self.defs.functions.iter().enumerate().filter(
+				|&(index, function)| {
+					function.name.inner == symbol
+						&& !matches!(function.owner, MemberOwner::Free)
+						&& self.context.function_bodies[index].is_some()
+				},
+			);
+			let (index, _) = found.next().unwrap();
+			assert!(found.next().is_none(), "`{name}` is declared twice");
+			let body = self.context.function_bodies[index].as_ref().unwrap();
+			self.render(body, body.root())
+		}
+
+		fn display(&self, ty: TypeIndex) -> String {
+			self.context.type_formatter().display_type(ty).to_string()
+		}
+
+		/// The type of `name`'s whole block.
+		fn body_type(&self, name: &str) -> String {
+			let body = self.body(name);
+			self.display(body.ty(body.root()))
+		}
+
+		/// The function `name`'s block as an S-expression; see `render`.
+		fn shape(&self, name: &str) -> String {
+			let body = self.body(name);
+			self.render(body, body.root())
+		}
+
+		/// A call's arguments in written order; when they are permuted, each
+		/// is prefixed with the parameter it gives: `(call f 1=2 0=1)`.
+		fn render_call(
+			&self,
+			body: &Body,
+			head: &str,
+			args: ExprRange,
+			order: ElementOrder,
+		) -> String {
+			let mut text = format!("({head}");
+			for (at, &arg) in body.args(args).iter().enumerate() {
+				text.push(' ');
+				if let ElementOrder::Permuted { .. } = order {
+					let param = body.declared_index(order, at);
+					text.push_str(&format!("{}=", usize::from(param)));
+				}
+				text.push_str(&self.render(body, arg));
+			}
+			text + ")"
+		}
+
+		/// A call's `head` and then its `args`, the value of `count`
+		/// parameters: a tuple of several is written as its elements, as the
+		/// call is; any other value, a lone parameter's, as itself.
+		fn render_arguments(
+			&self,
+			body: &Body,
+			head: &str,
+			count: usize,
+			args: ExprIdx,
+		) -> String {
+			match body.kind(args) {
+				ExprKind::Tuple { elements, order } if count != 1 => {
+					self.render_call(body, head, elements, order)
+				}
+				_ => format!("({head} {})", self.render(body, args)),
+			}
+		}
+
+		fn param_count(&self, function: FunctionIdx) -> usize {
+			self.context.functions[usize::from(function)]
+				.param_types
+				.len()
+		}
+
+		/// Renders a node without types: `(block (local x 1) => (+ x 2))`.
+		/// A local is its name and declaration index (`x#1`), so shadowing
+		/// shows; a jump names the label it leaves, or `loop`/`block`.
+		fn render(&self, body: &Body, expr: ExprIdx) -> String {
+			let list = |text: &str, items: &[ExprIdx]| {
+				let mut text = format!("({text}");
+				for &item in items {
+					text.push(' ');
+					text.push_str(&self.render(body, item));
+				}
+				text + ")"
+			};
+			let name = |symbol| self.context.strings.resolve(symbol).unwrap();
+			match body.kind(expr) {
+				ExprKind::Error => "error".to_string(),
+				ExprKind::Int(value) => value.to_string(),
+				ExprKind::Float(value) => format!("{value:?}"),
+				ExprKind::Char(value) => format!("{value:?}"),
+				ExprKind::String(contents) => {
+					format!(
+						"{:?}",
+						self.context.strings.resolve(contents).unwrap()
+					)
+				}
+				ExprKind::Array { elements } => {
+					list("array", body.args(elements))
+				}
+				ExprKind::ArrayRepeat { value, count } => match count {
+					Some(count) => list("repeat", &[value, count]),
+					None => list("repeat _", &[value]),
+				},
+				ExprKind::Const {
+					constant,
+					type_args,
+				} => self.constant_name(constant, type_args),
+				ExprKind::AbstractConst {
+					constant,
+					type_args,
+				} => format!(
+					"(abstract {})",
+					self.constant_name(constant, type_args)
+				),
+				ExprKind::NextDiscriminant(index) => {
+					name(self.defs.constants[usize::from(index)].name.inner)
+						.to_string()
+				}
+				ExprKind::Local(local) => self.local_name(body, local),
+				ExprKind::Global(index) => {
+					name(self.defs.globals[usize::from(index)].name.inner)
+						.to_string()
+				}
+				ExprKind::Function {
+					function,
+					type_args,
+				} => self.callee(function, type_args),
+				ExprKind::PrimitiveUnary { op, operand } => {
+					list(op.as_str(), &[operand])
+				}
+				ExprKind::PrimitiveBinary { op, lhs, rhs } => {
+					list(op.as_str(), &[lhs, rhs])
+				}
+				ExprKind::Call {
+					function,
+					type_args,
+					args,
+				} => {
+					let callee = self.callee(function, type_args);
+					self.render_arguments(
+						body,
+						&format!("call {callee}"),
+						self.param_count(function),
+						args,
+					)
+				}
+				ExprKind::AbstractCall {
+					method,
+					type_args,
+					args,
+				} => {
+					let callee = self.callee(method, type_args);
+					self.render_arguments(
+						body,
+						&format!("abstract {callee}"),
+						self.param_count(method),
+						args,
+					)
+				}
+				ExprKind::MethodCall {
+					function,
+					type_args,
+					receiver,
+					args,
+				} => {
+					let callee = self.callee(function, type_args);
+					let head = format!(
+						"call {callee} {}",
+						self.render(body, receiver)
+					);
+					self.render_arguments(
+						body,
+						&head,
+						self.param_count(function) - 1,
+						args,
+					)
+				}
+				ExprKind::AbstractMethodCall {
+					method,
+					type_args,
+					receiver,
+					args,
+				} => {
+					let callee = self.callee(method, type_args);
+					let head = format!(
+						"abstract {callee} {}",
+						self.render(body, receiver)
+					);
+					self.render_arguments(
+						body,
+						&head,
+						self.param_count(method) - 1,
+						args,
+					)
+				}
+				ExprKind::CallRef { callee, args } => {
+					let head =
+						format!("call_ref {}", self.render(body, callee));
+					self.render_arguments(body, &head, 0, args)
+				}
+				ExprKind::Tuple { elements, order } => {
+					self.render_call(body, "tuple", elements, order)
+				}
+				ExprKind::StructConstructor {
+					struct_index,
+					fields,
+				} => {
+					let name = name(
+						self.defs.structs[usize::from(struct_index)].name.inner,
+					);
+					let count = self.context.structs[usize::from(struct_index)]
+						.field_types
+						.len();
+					self.render_arguments(body, name, count, fields)
+				}
+				ExprKind::FieldAccess { object, field } => format!(
+					"(. {} {})",
+					self.render(body, object),
+					self.field_name(body.ty(object), field)
+				),
+				ExprKind::Load(place) => {
+					format!("(load {})", self.render_place(body, place))
+				}
+				ExprKind::AddressOf(place) => {
+					format!("(.& {})", self.render_place(body, place))
+				}
+				ExprKind::Block {
+					statements, result, ..
+				} => {
+					let mut text = list("block", body.args(statements));
+					if let Some(result) = result {
+						text.pop();
+						text.push_str(" => ");
+						text.push_str(&self.render(body, result));
+						text.push(')');
+					}
+					text
+				}
+				ExprKind::LocalDeclaration { pattern, value } => format!(
+					"(local {} {})",
+					self.render_pattern(body, pattern),
+					self.render(body, value)
+				),
+				ExprKind::Match { scrutinee, arms } => {
+					let mut text =
+						format!("(match {}", self.render(body, scrutinee));
+					for arm in body.arms(arms) {
+						text.push_str(&format!(
+							" ({} => {})",
+							self.render_pattern(body, arm.pattern),
+							self.render(body, arm.body)
+						));
+					}
+					text + ")"
+				}
+				ExprKind::IfElse {
+					condition,
+					then_block,
+					else_block,
+				} => {
+					let mut items = vec![condition, then_block];
+					items.extend(else_block);
+					list("if", &items)
+				}
+				ExprKind::Loop { statements, .. } => {
+					list("loop", body.args(statements))
+				}
+				ExprKind::Break { scope, value } => {
+					let target = self.scope_name(body, scope);
+					list(&format!("break {target}"), value.as_slice())
+				}
+				ExprKind::Continue { scope } => {
+					format!("(continue {})", self.scope_name(body, scope))
+				}
+				ExprKind::Return { value } => list("return", value.as_slice()),
+				ExprKind::Drop { value } => list("drop", &[value]),
+				ExprKind::Assign { target, value } => {
+					list("=", &[target, value])
+				}
+				ExprKind::Store { place, value } => format!(
+					"(store {} {})",
+					self.render_place(body, place),
+					self.render(body, value)
+				),
+				ExprKind::PrimitiveCompoundAssign { op, target, value } => {
+					list(&format!("{}=", op.as_str()), &[target, value])
+				}
+				ExprKind::ConcreteCompoundAssign {
+					method,
+					type_args,
+					target,
+					value,
+				} => list(
+					&format!("assign call {}", self.callee(method, type_args)),
+					&[target, value],
+				),
+				ExprKind::AbstractCompoundAssign {
+					method,
+					type_args,
+					target,
+					value,
+				} => list(
+					&format!(
+						"assign abstract {}",
+						self.callee(method, type_args)
+					),
+					&[target, value],
+				),
+				ExprKind::PrimitiveCompoundStore { op, place, value } => {
+					format!(
+						"(store {}= {} {})",
+						op.as_str(),
+						self.render_place(body, place),
+						self.render(body, value)
+					)
+				}
+				ExprKind::ConcreteCompoundStore {
+					method,
+					type_args,
+					place,
+					value,
+				} => format!(
+					"(store call {} {} {})",
+					self.callee(method, type_args),
+					self.render_place(body, place),
+					self.render(body, value)
+				),
+				ExprKind::AbstractCompoundStore {
+					method,
+					type_args,
+					place,
+					value,
+				} => format!(
+					"(store abstract {} {} {})",
+					self.callee(method, type_args),
+					self.render_place(body, place),
+					self.render(body, value)
+				),
+			}
+		}
+
+		/// Renders a pattern: a binding is its local (`x#1`), a destructuring
+		/// lists one child per element or field (`(tuple a#0 _)`,
+		/// `(Point a#0 _)`), an integer reads as its type's value.
+		fn render_pattern(
+			&self,
+			body: &Body,
+			pattern: super::super::body::PatIdx,
+		) -> String {
+			use super::super::body::PatternKind;
+			let list = |head: &str, children: &[super::super::body::PatIdx]| {
+				let mut text = format!("({head}");
+				for &child in children {
+					text.push(' ');
+					text.push_str(&self.render_pattern(body, child));
+				}
+				text + ")"
+			};
+			match body.pattern(pattern) {
+				PatternKind::Wildcard => "_".to_string(),
+				PatternKind::Bind(local) => self.local_name(body, local),
+				PatternKind::Tuple(elements) => {
+					list("tuple", body.patterns(elements))
+				}
+				PatternKind::Struct {
+					struct_index,
+					fields,
+				} => {
+					let name =
+						self.defs.structs[usize::from(struct_index)].name.inner;
+					let name = self.context.strings.resolve(name).unwrap();
+					let count = self.context.structs[usize::from(struct_index)]
+						.field_types
+						.len();
+					match body.pattern(fields) {
+						PatternKind::Tuple(children) if count != 1 => {
+							list(name, body.patterns(children))
+						}
+						_ => list(name, &[fields]),
+					}
+				}
+				PatternKind::Int(bits) => {
+					let integer =
+						super::Integer::from_type(body.pattern_ty(pattern))
+							.unwrap();
+					if integer.is_signed() {
+						let width = integer.mask().count_ones();
+						let shift = 64 - width;
+						(((bits << shift) as i64) >> shift).to_string()
+					} else {
+						bits.to_string()
+					}
+				}
+				PatternKind::Char(value) => format!("{value:?}"),
+				PatternKind::Constant {
+					constant,
+					type_args,
+				} => self.constant_name(constant, type_args),
+				PatternKind::AbstractConstant {
+					constant,
+					type_args,
+				} => format!(
+					"(abstract {})",
+					self.constant_name(constant, type_args)
+				),
+				PatternKind::Or(alternatives) => {
+					list("|", body.patterns(alternatives))
+				}
+				PatternKind::Error => "error".to_string(),
+			}
+		}
+
+		fn render_place(&self, body: &Body, place: PlaceIdx) -> String {
+			match body.place(place).kind {
+				PlaceKind::Deref { pointer } => {
+					format!("(* {})", self.render(body, pointer))
+				}
+				PlaceKind::Field { object, field } => format!(
+					"(. {} {})",
+					self.render_place(body, object),
+					self.field_name(body.place(object).ty, field)
+				),
+			}
+		}
+
+		fn function_name(&self, index: super::FunctionIdx) -> &str {
+			let name = self.defs.functions[usize::from(index)].name.inner;
+			self.context.strings.resolve(name).unwrap()
+		}
+
+		/// A constant's name, with its type arguments when it has any.
+		fn constant_name(
+			&self,
+			index: super::ConstIdx,
+			type_args: super::TypeList,
+		) -> String {
+			let name = self.defs.constants[usize::from(index)].name.inner;
+			self.with_type_args(
+				self.context.strings.resolve(name).unwrap(),
+				type_args,
+			)
+		}
+
+		/// A called function's name, with its type arguments when it has
+		/// any: `add`, `id<u8>`.
+		fn callee(
+			&self,
+			index: super::FunctionIdx,
+			type_args: super::TypeList,
+		) -> String {
+			self.with_type_args(self.function_name(index), type_args)
+		}
+
+		fn with_type_args(
+			&self,
+			name: &str,
+			type_args: super::TypeList,
+		) -> String {
+			let type_args = self.context.types.list(type_args);
+			if type_args.is_empty() {
+				return name.to_string();
+			}
+			let type_args: Vec<String> =
+				type_args.iter().map(|&ty| self.display(ty)).collect();
+			format!("{name}<{}>", type_args.join(", "))
+		}
+
+		fn local_name(&self, body: &Body, local: super::LocalIdx) -> String {
+			let name = body.local(local).name.inner;
+			format!(
+				"{}#{}",
+				self.context.strings.resolve(name).unwrap(),
+				u32::from(local)
+			)
+		}
+
+		fn field_name(
+			&self,
+			object: TypeIndex,
+			field: crate::tir::defs::FieldIdx,
+		) -> &str {
+			let Type::Struct { struct_index, .. } =
+				*self.context.types.resolve(object)
+			else {
+				panic!("a field of a non-struct");
+			};
+			let field = self.defs.structs[usize::from(struct_index)]
+				.field_names[usize::from(field)]
+			.unwrap();
+			self.context.strings.resolve(field.inner).unwrap()
+		}
+
+		/// A jump's target: its label, else the kind of scope it leaves.
+		fn scope_name(&self, body: &Body, scope: super::ScopeIdx) -> String {
+			let scope = body.scope(scope);
+			match scope.label {
+				Some(label) => self
+					.context
+					.strings
+					.resolve(body.label(label).name.inner)
+					.unwrap()
+					.to_string(),
+				None => format!("{:?}", scope.kind).to_lowercase(),
+			}
+		}
+
+		/// The `(name, type)` of every local of `function`, in declaration
+		/// order.
+		fn locals(&self, function: &str) -> Vec<(String, String)> {
+			self.body(function)
+				.locals()
+				.iter()
+				.map(|local| {
+					let name =
+						self.context.strings.resolve(local.name.inner).unwrap();
+					(name.to_string(), self.display(local.ty))
+				})
+				.collect()
+		}
+	}
+
+	#[test]
+	fn the_embedded_stdlib_reports_nothing_but_unsupported_forms() {
+		test_case!(case = "");
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn parameters_are_locals_of_the_root_scope() {
+		const SOURCE: &str = "func f(a: u32, mut b: u32) -> u32 { a + b }";
+		test_case!(case = SOURCE);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("f"), "(block => (+ a#0 b#1))");
+		assert_eq!(
+			case.locals("f"),
+			[("a".into(), "u32".into()), ("b".into(), "u32".into())]
+		);
+		let body = case.body("f");
+		assert!(body.scope(super::ScopeIdx::ROOT).parent.is_none());
+		// Each use of a parameter is recorded as a reference to it.
+		let file_id = case
+			.defs
+			.namespaces
+			.file_id(Scope::Package(case.defs.root_package).into());
+		let start = (STDLIB.len() + 1 + SOURCE.find("a + b").unwrap()) as u32;
+		let site = (
+			crate::diagnostics::SourceSpan::new(
+				file_id,
+				TextSpan::new(start, start + 1),
+			),
+			Tier::Value,
+		);
+		assert!(matches!(
+			case.context.resolutions.by_site.get(&site),
+			Some(Referent::Local { local, .. }) if u32::from(*local) == 0
+		));
+	}
+
+	/// An unnamed parameter is passed like any other, but binds no local.
+	#[test]
+	fn an_unnamed_parameter_binds_no_local() {
+		test_case!(case = "func f(u32, _: u8, c: u32) -> u32 { c }");
+		case.diagnostics().assert_none();
+		assert_eq!(case.locals("f"), [("c".into(), "u32".into())]);
+		let params: Vec<_> = case
+			.body("f")
+			.params()
+			.iter()
+			.map(|local| local.map(u32::from))
+			.collect();
+		assert_eq!(params, [None, None, Some(0)]);
+	}
+
+	#[test]
+	fn a_block_result_takes_the_return_type() {
+		test_case!(
+			case = indoc! {"
+				func literal() -> u8 { 200 + 50 }
+				func nothing() {}
+				func diverges() -> u32 { loop {} }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("literal"), "u8");
+		assert_eq!(case.body_type("nothing"), "()");
+		assert_eq!(case.body_type("diverges"), "!");
+	}
+
+	#[test]
+	fn a_block_without_a_result_does_not_give_a_value() {
+		test_case!(case = "func f() -> u32 { local x: u32 = 1; }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn a_local_takes_its_written_type_or_its_values() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u64) {
+					local x: u8 = 1;
+					local y = a;
+					local z = (x, y);
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.locals("f"),
+			[
+				("a".into(), "u64".into()),
+				("x".into(), "u8".into()),
+				("y".into(), "u64".into()),
+				("z".into(), "(u8, u64)".into()),
+			]
+		);
+	}
+
+	#[test]
+	fn a_local_of_an_untyped_literal_needs_a_type() {
+		test_case!(case = "func f() { local x = 1; }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+		assert_eq!(case.locals("f"), [("x".into(), "{unknown}".into())]);
+	}
+
+	#[test]
+	fn a_character_literal_is_a_char_or_an_integer_it_fits() {
+		test_case!(
+			case = indoc! {"
+				func c() -> Char { 'a' }
+				func b() -> u8 { 'a' }
+				func w() -> u16 { '€' }
+				func digit(d: u8) -> u8 { d + '0' }
+				func next() -> u8 { 'a' + 1 }
+				func any<T: Integer>() -> T { 'a' }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("c"), "(block => 'a')");
+		assert_eq!(case.shape("b"), "(block => 97)");
+		assert_eq!(case.shape("w"), "(block => 8364)");
+		assert_eq!(case.shape("next"), "(block => (+ 97 1))");
+	}
+
+	#[test]
+	fn a_character_literal_must_fit_its_integer() {
+		test_case!(case = "func f() -> u8 { '€' }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+		case.diagnostics()
+			.assert_error_saying("character literal '€' out of range for `u8`");
+		test_case!(case = "func f<T: Integer>() -> T { '€' }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypesetBoundViolation]);
+	}
+
+	#[test]
+	fn a_character_literal_is_no_float_and_has_no_default() {
+		test_case!(case = "func f() -> f32 { 'a' }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
+		test_case!(case = "func f() { local c = 'a'; }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+		test_case!(case = "func f() -> Char { 'a' + 1 }");
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn a_character_pattern_compares_an_integer_by_code_point() {
+		test_case!(
+			case = indoc! {"
+				func f(b: u8) -> u32 { match b { 'a' -> { 1 }, _ -> { 0 } } }
+				func g(c: Char) -> u32 { match c { 'a' -> { 1 }, _ -> { 0 } } }
+			"}
+		);
+		case.diagnostics().assert_none();
+		test_case!(
+			case =
+				"func f(b: u8) -> u32 { match b { '€' -> { 1 }, _ -> { 0 } } }"
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+		case.diagnostics()
+			.assert_error_saying("character literal '€' out of range for `u8`");
+	}
+
+	#[test]
+	fn a_later_local_shadows_an_earlier_one_from_its_declaration_on() {
+		test_case!(
+			case = "func f() -> u32 { local x: u32 = 1; local x = x + 1; x }"
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block (local x#0 1) (local x#1 (+ x#0 1)) => x#1)"
+		);
+	}
+
+	#[test]
+	fn a_local_is_visible_only_in_its_block() {
+		test_case!(
+			case = indoc! {"
+				func f() -> u32 {
+					block { local inner: u32 = 1; };
+					inner
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+	}
+
+	#[test]
+	fn a_local_shadows_an_item_of_the_same_name() {
+		test_case!(
+			case = "const x: u8 = 1; func f() -> u16 { local x: u16 = 2; x }"
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("f"), "(block (local x#0 2) => x#0)");
+	}
+
+	#[test]
+	fn a_statement_value_must_be_used_or_dropped() {
+		test_case!(
+			case = indoc! {"
+				func one() -> u32 { 1 }
+				func f() {
+					one();
+					_ = one();
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnusedValue]);
+		assert_eq!(case.shape("f"), "(block (call one) (drop (call one)))");
+	}
+
+	#[test]
+	fn code_after_a_diverging_statement_is_unreachable() {
+		test_case!(case = "func f() -> u32 { return 1; local x: u32 = 2; x }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnreachableCode]);
+		case.diagnostics()
+			.assert_warning(DiagnosticCode::UnreachableCode);
+		assert_eq!(case.body_type("f"), "u32");
+	}
+
+	#[test]
+	fn if_branches_share_a_type() {
+		test_case!(
+			case = indoc! {"
+				func pick(c: Bool, a: u8) -> u8 { if c { a } else { 1 } }
+				func nested(c: Bool) -> u16 { if c { 1 } else { if !c { 2 } else { 3 } } }
+				func diverging(c: Bool, a: u8) -> u8 { if c { return a; } else { a } }
+				func statement(c: Bool) { if c { pick(c, 1); } }
+				func untyped(c: Bool) { local x: i64 = if c { 1 } else { 2 }; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnusedValue]);
+		assert_eq!(
+			case.shape("pick"),
+			"(block => (if c#0 (block => a#1) (block => 1)))"
+		);
+		assert_eq!(case.body_type("diverging"), "u8");
+		assert_eq!(case.body_type("nested"), "u16");
+		// Context reaches literals through both branches.
+		let body = case.body("untyped");
+		let ExprKind::Block { statements, .. } = body.kind(body.root()) else {
+			unreachable!()
+		};
+		let ExprKind::LocalDeclaration { value, .. } =
+			body.kind(body.args(statements)[0])
+		else {
+			unreachable!()
+		};
+		assert_eq!(case.display(body.ty(value)), "i64");
+		let ExprKind::IfElse { then_block, .. } = body.kind(value) else {
+			unreachable!()
+		};
+		let ExprKind::Block {
+			result: Some(result),
+			..
+		} = body.kind(then_block)
+		else {
+			unreachable!()
+		};
+		assert_eq!(case.display(body.ty(result)), "i64");
+	}
+
+	#[test]
+	fn an_untyped_branch_takes_the_other_branchs_type() {
+		test_case!(
+			case =
+				"func f(c: Bool, a: u8) { local x = if c { 1 } else { a }; }"
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.locals("f")[2], ("x".into(), "u8".into()));
+	}
+
+	#[test]
+	fn if_errors_are_reported_where_they_are_written() {
+		test_case!(
+			case = indoc! {"
+				func condition(a: u8) { if a { } }
+				func mismatch(c: Bool, a: u8, b: u16) { local x = if c { a } else { b }; }
+				func missing_else(c: Bool, a: u8) -> u8 { if c { a } }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::MissingElseBlock,
+		]);
+	}
+
+	#[test]
+	fn a_loop_is_typed_by_its_breaks() {
+		test_case!(
+			case = indoc! {"
+				func first(n: u32) -> u32 {
+					local mut i: u32 = 0;
+					loop {
+						if i == n { break i; }
+						i += 1;
+					}
+				}
+				func endless() -> u8 { loop {} }
+				func unit() { loop { break; } }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("first"),
+			"(block (local i#1 0) => (loop (if (== i#1 n#0) (block (break loop i#1))) \
+			 (+= i#1 1)))"
+		);
+		assert_eq!(case.body_type("endless"), "!");
+		let body = case.body("unit");
+		let ExprKind::Block {
+			result: Some(lp), ..
+		} = body.kind(body.root())
+		else {
+			unreachable!()
+		};
+		assert_eq!(case.display(body.ty(lp)), "()");
+	}
+
+	#[test]
+	fn break_values_must_agree() {
+		test_case!(
+			case = indoc! {"
+				func f(c: Bool, a: u8, b: u16) {
+					local x = loop { if c { break a; } break b; };
+				}
+				func untyped() { local x = loop { break 1; }; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+	}
+
+	#[test]
+	fn a_label_names_the_scope_a_jump_leaves() {
+		test_case!(
+			case = indoc! {"
+				func f(c: Bool) -> u32 {
+					loop :outer {
+						loop {
+							if c { break :outer 1; }
+							continue :outer;
+						}
+					}
+				}
+				func labelled_block(c: Bool) -> u8 {
+					block :found {
+						if c { break :found 1; }
+						2
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block => (loop (loop (if c#0 (block (break outer 1))) \
+			 (continue outer))))"
+		);
+		assert_eq!(case.body_type("f"), "u32");
+		assert_eq!(
+			case.shape("labelled_block"),
+			"(block => (block (if c#0 (block (break found 1))) => 2))"
+		);
+	}
+
+	#[test]
+	fn an_ascription_checks_its_value_against_its_type() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(t: T) -> T { t }
+				func literal() -> u8 { (5: u8) }
+				func inferred() { local x = id(5: u16); }
+				func elements() { local t = (1: u8, 2: u16); }
+			"}
+		);
+		case.diagnostics().assert_none();
+		// It leaves no node of its own.
+		assert_eq!(case.shape("literal"), "(block => 5)");
+		assert_eq!(case.body_type("literal"), "u8");
+		assert_eq!(case.locals("inferred"), [("x".into(), "u16".into())]);
+		assert_eq!(case.locals("elements"), [("t".into(), "(u8, u16)".into())]);
+	}
+
+	#[test]
+	fn an_ascription_converts_nothing() {
+		test_case!(
+			case = indoc! {"
+				func takes(x: u16) {}
+				func widened(a: u8) -> u16 { (a: u16) }
+				func argument() { takes(1: u8); }
+				func out_of_range() { local x = (300: u8); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+	}
+
+	#[test]
+	fn jumps_need_a_target() {
+		test_case!(
+			case = indoc! {"
+				func outside() { break; }
+				func outside_continue() { continue; }
+				func unknown() { loop { break :nowhere; } }
+				func not_a_loop() { block :l { continue :l; } }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::BreakOutsideOfLoop,
+			DiagnosticCode::ContinueOutsideOfLoop,
+			DiagnosticCode::UndeclaredLabel,
+			DiagnosticCode::ContinueOutsideOfLoop,
+		]);
+	}
+
+	#[test]
+	fn a_labelled_jump_is_recorded_as_a_reference_to_its_label() {
+		const SOURCE: &str = "func f() { loop :outer { break :outer; } }";
+		test_case!(case = SOURCE);
+		case.diagnostics().assert_none();
+		let file_id = case
+			.defs
+			.namespaces
+			.file_id(Scope::Package(case.defs.root_package).into());
+		let start =
+			(STDLIB.len() + 1 + SOURCE.rfind(":outer").unwrap() + 1) as u32;
+		let site = (
+			crate::diagnostics::SourceSpan::new(
+				file_id,
+				TextSpan::new(start, start + "outer".len() as u32),
+			),
+			Tier::Value,
+		);
+		assert!(matches!(
+			case.context.resolutions.by_site.get(&site),
+			Some(Referent::Label { label, .. }) if u32::from(*label) == 0
+		));
+	}
+
+	#[test]
+	fn return_gives_the_function_its_value() {
+		test_case!(
+			case = indoc! {"
+				func early(c: Bool) -> u8 { if c { return 1; } 2 }
+				func bare() { return; }
+				func wrong() -> u8 { return; }
+				func mismatch(a: u16) -> u8 { return a; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(
+			case.shape("early"),
+			"(block (if c#0 (block (return 1))) => 2)"
+		);
+	}
+
+	#[test]
+	fn assignment_writes_a_mutable_local() {
+		test_case!(
+			case = indoc! {"
+				func f() {
+					local mut x: u8 = 1;
+					x = 2;
+				}
+				func errors() {
+					local x: u8 = 1;
+					x = 2;
+					errors() = ();
+					_ = 1;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::InvalidAssignmentTarget,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+		assert_eq!(case.shape("f"), "(block (local x#0 1) (= x#0 2))");
+	}
+
+	#[test]
+	fn a_global_is_a_handle_and_is_not_assigned() {
+		test_case!(
+			case = indoc! {"
+				global mut counter: u32 = 0;
+				func f() {
+					counter = 3;
+					counter += 1;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InvalidAssignmentTarget,
+			DiagnosticCode::InvalidAssignmentTarget,
+		]);
+		case.diagnostics().assert_error_saying(
+			"a `global mut` is written with `counter.set(value)`",
+		);
+	}
+
+	#[test]
+	fn an_operator_call_carries_its_type_arguments() {
+		test_case!(
+			case = indoc! {"
+				struct W<T>(x: T);
+				impl<T> Add for W<T> { func add(self: Self, rhs: Self) -> Self { rhs } }
+				func concrete(w: W<u8>) -> W<u8> { w + w }
+				func generic<T: Add>(t: T) -> T { t + t }
+				func assigned(w: W<u8>) { local mut v = w; v += w; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("concrete"), "(block => (call add<u8> w#0 w#0))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (abstract add<T> t#0 t#0))"
+		);
+		assert_eq!(
+			case.shape("assigned"),
+			"(block (local v#1 w#0) (assign call add<u8> v#1 w#0))"
+		);
+	}
+
+	#[test]
+	fn compound_assignment_dispatches_like_its_operator() {
+		test_case!(
+			case = indoc! {"
+				struct V(x: u32);
+				impl Add for V { func add(self: Self, rhs: Self) -> Self { rhs } }
+				func scalar() { local mut a: u32 = 1; a += 2; a <<= 1; }
+				func overloaded(v: V) { local mut w = v; w += v; }
+				func generic<T: Add>(t: T) { local mut u = t; u += t; }
+				func missing(c: Bool) { local mut d = c; d -= c; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		assert_eq!(
+			case.shape("scalar"),
+			"(block (local a#0 1) (+= a#0 2) (<<= a#0 1))"
+		);
+		assert_eq!(
+			case.shape("overloaded"),
+			"(block (local w#1 v#0) (assign call add w#1 v#0))"
+		);
+		assert_eq!(
+			case.shape("generic"),
+			"(block (local u#1 t#0) (assign abstract add<T> u#1 t#0))"
+		);
+	}
+
+	#[test]
+	fn a_field_of_a_value_is_read_and_written_through_its_root() {
+		test_case!(
+			case = indoc! {"
+				struct Inner(v: u8);
+				struct Outer(inner: Inner, n: u32);
+				struct Wrap<T>(value: T);
+				func read(o: Outer) -> u8 { o.inner.v }
+				func generic(w: Wrap<u16>) -> u16 { w.value }
+				func write(o: Outer) { local mut p = o; p.inner.v = 1; p.n += 1; }
+				func immutable(o: Outer) { o.n = 1; }
+				func temporary(o: Outer) { read(o).v = 1; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::UnknownStructField,
+		]);
+		assert_eq!(case.shape("read"), "(block => (. (. o#0 inner) v))");
+		assert_eq!(case.body_type("generic"), "u16");
+		assert_eq!(
+			case.shape("write"),
+			"(block (local p#1 o#0) (= (. (. p#1 inner) v) 1) (+= (. p#1 n) 1))"
+		);
+	}
+
+	#[test]
+	fn field_access_checks_the_field() {
+		test_case!(
+			case = indoc! {"
+				mod m { pub struct S(pub open: u8, closed: u8); }
+				func f(s: m::S) -> u8 { s.open + s.closed }
+				func g(s: m::S) -> u8 { s.missing }
+				func h(x: u8) -> u8 { x.field }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PrivateStructField,
+			DiagnosticCode::UnknownStructField,
+			DiagnosticCode::UnknownStructField,
+		]);
+	}
+
+	#[test]
+	fn a_field_takes_no_type_arguments() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8);
+				func f(p: P) -> u8 { p.x::<u8> }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
+	}
+
+	#[test]
+	fn a_place_in_memory_is_read_written_and_addressed() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Node(value: u32, next: heap::*Node);
+				func read(p: heap::&Node) -> u32 { p.*.value }
+				func write(p: heap::*Node) { p.* = Node(1, p); p.*.value += 2; }
+				func address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
+				func next(p: heap::*Node) -> u32 { p.*.next.*.value }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("read"), "(block => (load (. (* p#0) value)))");
+		assert_eq!(
+			case.shape("write"),
+			"(block (store (* p#0) (Node 1 p#0)) (store += (. (* p#0) value) 2))"
+		);
+		assert_eq!(case.shape("address"), "(block => (.& (. (* p#0) value)))");
+		assert_eq!(
+			case.shape("next"),
+			"(block => (load (. (* (load (. (* p#0) next))) value)))"
+		);
+	}
+
+	#[test]
+	fn a_place_is_written_only_through_an_exclusive_pointer() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func shared(p: heap::&u32) { p.* = 1; }
+				func not_a_pointer(x: u32) -> u32 { x.* }
+				func local_address(x: u32) -> heap::&u32 { x.& }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::CannotDerefNonPointer,
+			DiagnosticCode::InvalidAssignmentTarget,
+		]);
+	}
+
+	#[test]
+	fn a_call_checks_its_arguments_against_the_parameters() {
+		test_case!(
+			case = indoc! {"
+				func add(a: u32, b: u32) -> u32 { a + b }
+				func f() -> u32 { add(1, 2) }
+				func count() -> u32 { add(1) }
+				func mismatch(c: Bool) -> u32 { add(c, 2) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(case.shape("f"), "(block => (call add 1 2))");
+	}
+
+	#[test]
+	fn a_generic_call_learns_its_type_arguments() {
+		test_case!(
+			case = indoc! {"
+				trait Number {}
+				impl Number for u32 {}
+				impl Number for i64 {}
+				func id<T>(x: T) -> T { x }
+				func zero<T: Number>() -> T { loop {} }
+				func from_argument(a: u16) -> u16 { id(a) }
+				func from_expected() -> u8 { id(1) }
+				func from_turbofish() { local x = zero::<i64>(); }
+				func from_result() -> u32 { zero() }
+				func nothing() { _ = zero(); }
+				func unsatisfied() { local x = zero::<Bool>(); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		assert_eq!(case.body_type("from_argument"), "u16");
+		assert_eq!(case.body_type("from_expected"), "u8");
+		assert_eq!(case.locals("from_turbofish"), [("x".into(), "i64".into())]);
+		assert_eq!(case.shape("from_expected"), "(block => (call id<u8> 1))");
+	}
+
+	#[test]
+	fn a_function_is_a_value_of_its_own_type() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func f() { local g = id::<u8>; local h = id; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+		assert_eq!(case.locals("f")[0], ("g".into(), "id<u8>".into()));
+	}
+
+	#[test]
+	fn a_function_item_held_in_a_value_is_called_through_call() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func pair(a: u8, b: u16) {}
+				func positional() -> u8 { local g = id::<u8>; g(1) }
+				func named() { local g = pair; g({ b: 2, a: 1 }); }
+				func shadowed(id: pair) { id(1, 2); }
+				func counted() { local g = pair; g(1); }
+				struct V(x: u32);
+				impl V { func area(self: Self, k: u32) -> u32 { k } }
+				func method(v: V) -> u32 { local m = V::area; m({ k: 1, self: v }) }
+				trait Make { func make(n: u32) -> Self; }
+				func declared<T: Make>() -> T { local g = T::make; g(1) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ArgumentCountMismatch]);
+		assert_eq!(
+			case.shape("positional"),
+			"(block (local g#0 id<u8>) => (abstract call<id<u8>> g#0 1))"
+		);
+		assert_eq!(
+			case.shape("named"),
+			"(block (local g#0 pair) (abstract call<pair> g#0 (tuple 1=2 0=1)))"
+		);
+		assert_eq!(
+			case.shape("shadowed"),
+			"(block (abstract call<pair> id#0 (tuple 1 2)))"
+		);
+		assert_eq!(
+			case.shape("counted"),
+			"(block (local g#0 pair) (abstract call<pair> g#0 (tuple)))"
+		);
+		assert_eq!(
+			case.shape("method"),
+			"(block (local m#1 area) => (abstract call<area> m#1 (tuple 1=1 \
+			 0=v#0)))"
+		);
+		assert_eq!(case.body_type("declared"), "T");
+		assert_eq!(
+			case.shape("declared"),
+			"(block (local g#0 make<T>) => (abstract call<<T as \
+			 Make>::make> g#0 1))"
+		);
+	}
+
+	#[test]
+	fn a_tuple_of_one_is_its_element() {
+		test_case!(
+			case = indoc! {"
+				func f(x: (u8,)) -> u8 { local (y,) = x; local (z) = y; (z,) }
+				func g(p: (u8, u16)) { local (..) = p; }
+				func h(mut a: u8) { (a,) = 1; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.locals("f"),
+			[
+				("x".into(), "u8".into()),
+				("y".into(), "u8".into()),
+				("z".into(), "u8".into())
+			]
+		);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local y#1 x#0) (local z#2 y#1) => z#2)"
+		);
+		assert_eq!(case.shape("g"), "(block (local (tuple _ _) p#0))");
+	}
+
+	#[test]
+	fn a_value_is_called_through_its_call_impl() {
+		test_case!(
+			case = indoc! {"
+				struct Adder(n: u32);
+				impl Call for Adder {
+					type Args = (u32, u32);
+					type Result = u32;
+					func call(self: Self, args: (u32, u32)) -> u32 { 0 }
+				}
+				func spread(a: Adder) -> u32 { a(1, 2) }
+				func whole(a: Adder, p: (u32, u32)) -> u32 { a(p) }
+				func apply<F: Call>(f: F, x: F::Args) -> F::Result { f(x) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("spread"),
+			"(block => (call call a#0 (tuple 1 2)))"
+		);
+		assert_eq!(case.shape("whole"), "(block => (call call a#0 p#1))");
+		assert_eq!(
+			case.shape("apply"),
+			"(block => (abstract call<F> f#0 x#1))"
+		);
+	}
+
+	#[test]
+	fn a_value_without_a_call_impl_cannot_be_called() {
+		test_case!(
+			case = indoc! {"
+				struct Adder(n: u32);
+				impl Call for Adder {
+					type Args = (u32, u32);
+					type Result = u32;
+					func call(self: Self, args: (u32, u32)) -> u32 { 0 }
+				}
+				func number(x: u32) { x(1); }
+				func named(a: Adder) { a({ args: (1, 2) }); }
+				func too_many(a: Adder) { _ = a(1, 2, 3); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::ArgumentCountMismatch,
+		]);
+	}
+
+	/// The parentheses of a call only mark it: when the arguments fill one
+	/// parameter, the whole list is its value.
+	#[test]
+	fn the_argument_list_is_the_value_of_a_lone_parameter() {
+		test_case!(
+			case = indoc! {"
+				func g(p: (u8, u16)) {}
+				func id<T>(x: T) -> T { x }
+				func unit(x: ()) {}
+				struct W(x: (u8, u16));
+				struct V();
+				impl V { func m(self: Self, p: (u8, u16)) {} }
+				func spread(a: u8, b: u16) { g(a, b); }
+				func whole(a: u8, b: u16) { g((a, b)); }
+				func named(a: u8, b: u16) { g({ p: (a, b) }); }
+				func learned() -> (u8, u16) { id(1, 2) }
+				func empty() { unit(); }
+				func construct(a: u8, b: u16) -> W { W(a, b) }
+				func method(v: V, a: u8, b: u16) { v.m(a, b); }
+				func qualified(v: V, a: u8, b: u16) { V::m(v, (a, b)); }
+				func item(a: u8, b: u16) { local k = g; k(a, b); }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("spread"), "(block (call g (tuple a#0 b#1)))");
+		assert_eq!(case.shape("whole"), "(block (call g (tuple a#0 b#1)))");
+		assert_eq!(
+			case.shape("learned"),
+			"(block => (call id<(u8, u16)> (tuple 1 2)))"
+		);
+		assert_eq!(case.shape("empty"), "(block (call unit (tuple)))");
+		assert_eq!(
+			case.shape("method"),
+			"(block (call m v#0 (tuple a#1 b#2)))"
+		);
+	}
+
+	/// Nothing is regrouped: a list of another length, one value that is no
+	/// tuple for several parameters, or several for a lone parameter of a
+	/// known type that is no such tuple, is a wrong count.
+	#[test]
+	fn the_argument_list_fills_several_parameters_one_each() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u8, b: u16) {}
+				func h(x: u32) {}
+				struct V();
+				impl V { func m(self: Self, p: (u8, u16)) {} }
+				func missing(a: u8) { f(a); }
+				func none() { h(); }
+				func several() { h(1, 2); }
+				func qualified(v: V, a: u8, b: u16) { V::m(v, a, b); }
+			"}
+		);
+		// The arguments that do fall on a parameter are still held to it.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	/// One value written for several parameters is their value as one, as
+	/// the list they form would be: the call holds it whole.
+	#[test]
+	fn one_value_is_the_arguments_of_several_parameters() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u8, b: u16) -> u16 { b }
+				func none() {}
+				struct Point(x: u8, y: u16);
+				struct V();
+				impl V { func m(self: Self, a: u8, b: u16) {} }
+				func call(p: (u8, u16)) -> u16 { f(p) }
+				func literal() -> u16 { f((1, 2)) }
+				func unit() { none(()); }
+				func construct(p: (u8, u16)) -> Point { Point(p) }
+				func method(v: V, p: (u8, u16)) { v.m(p); }
+				func qualified(t: (V, u8, u16)) { V::m(t); }
+				func grouped(v: V, p: (u8, u16)) { V::m(v, p); }
+			"}
+		);
+		// `V::m(v, p)` is no regrouping: `p` falls on `a`.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(case.shape("call"), "(block => (call f p#0))");
+		// The same call as `f(1, 2)`.
+		assert_eq!(case.shape("literal"), "(block => (call f 1 2))");
+		assert_eq!(case.shape("unit"), "(block (call none))");
+		assert_eq!(case.shape("construct"), "(block => (Point p#0))");
+		assert_eq!(case.shape("method"), "(block (call m v#0 p#1))");
+		assert_eq!(case.shape("qualified"), "(block (call m t#0))");
+	}
+
+	/// A `call` of the wrong shape breaks the trait's contract, and still does
+	/// not decide what the call takes: `Args` and `Result` are read from the
+	/// impl.
+	#[test]
+	fn a_value_call_reads_args_and_result_from_its_call_impl() {
+		test_case!(
+			case = indoc! {"
+				struct X(n: u32);
+				impl Call for X {
+					type Args = u32;
+					type Result = u32;
+					func call(self: Self) -> u8 { 0 }
+				}
+				func f(x: X) -> u32 { x(1) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
+		assert_eq!(case.body_type("f"), "u32");
+	}
+
+	#[test]
+	fn a_function_item_is_not_a_function_reference() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func f() { local g: func(u8) -> u8 = id; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn a_function_reference_is_callable_by_a_compiler_rule() {
+		test_case!(
+			case = indoc! {"
+				func twice(f: func(u32) -> u32, x: u32) -> u32 { f(f(x)) }
+				func spread(f: func(u32, u8) -> u8) -> u8 { f(1, 2) }
+				func whole(f: func(u32, u8) -> u8, p: (u32, u8)) -> u8 { f(p) }
+				func nothing(f: func()) { f(); }
+				func apply<F: Call>(f: F, x: F::Args) -> F::Result { f(x) }
+				func through(f: func(u32) -> u8) -> u8 { apply(f, 1) }
+				func projected(x: <func(u32) -> u8 as Call>::Result) -> u8 { x }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("twice"),
+			"(block => (call_ref f#0 (call_ref f#0 x#1)))"
+		);
+		assert_eq!(case.shape("spread"), "(block => (call_ref f#0 1 2))");
+		assert_eq!(case.shape("whole"), "(block => (call_ref f#0 p#1))");
+		assert_eq!(case.shape("nothing"), "(block (call_ref f#0))");
+		assert_eq!(case.body_type("through"), "u8");
+		assert_eq!(
+			case.shape("through"),
+			"(block => (call apply<func(u32) -> u8> f#0 1))"
+		);
+	}
+
+	#[test]
+	fn a_function_reference_has_call_as_a_method() {
+		test_case!(
+			case = indoc! {"
+				func one(f: func(u32) -> u8) -> u8 { f.call(1) }
+				func two(f: func(u32, u8) -> u8) -> u8 { f.call(1, 2) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("one"),
+			"(block => (abstract call<func(u32) -> u8> f#0 1))"
+		);
+		assert_eq!(
+			case.shape("two"),
+			"(block => (abstract call<func(u32, u8) -> u8> f#0 (tuple 1 2)))"
+		);
+	}
+
+	#[test]
+	fn a_function_reference_is_called_by_position_with_its_parameter() {
+		test_case!(
+			case = indoc! {"
+				func named(f: func(u32) -> u32) { _ = f({ x: 1 }); }
+				func too_many(f: func(u32, u8) -> u8) { _ = f(1, 2, 3); }
+				func wrong(f: func(u32) -> u32) { _ = f(True); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	#[test]
+	fn a_computed_function_item_is_evaluated_as_the_receiver() {
+		test_case!(
+			case = indoc! {"
+				func pair(a: u8, b: u16) {}
+				func make() -> pair { pair }
+				func f() { make()({ b: 2, a: 1 }); }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block (abstract call<pair> (call make) (tuple 1=2 0=1)))"
+		);
+	}
+
+	#[test]
+	fn an_expected_item_type_gives_a_function_value_its_arguments() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func take(g: id<u8>) {}
+				func annotated() { local g: id<u8> = id; }
+				func argument() { take(id); }
+				func returned() -> id<u16> { id }
+				func generic<T>() { local g: id<T> = id; }
+				func other() { local g: id<u8> = take; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+		assert_eq!(case.locals("annotated"), [("g".into(), "id<u8>".into())]);
+		assert_eq!(case.shape("argument"), "(block (call take id<u8>))");
+		assert_eq!(case.shape("returned"), "(block => id<u16>)");
+		assert_eq!(case.locals("generic"), [("g".into(), "id<T>".into())]);
+	}
+
+	#[test]
+	fn a_string_literal_takes_a_byte_slice_or_array_from_its_context() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func slice() -> heap::&[u8] { "hello" }
+				func array() -> heap::&[u8; 5] { "hello" }
+				func escaped() -> heap::&[u8; 2] { "a\n" }
+				func annotated() { local s: heap::&[u8; 3] = "abc"; }
+				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func tuple() -> (heap::&[u8], u8) { ("a", 1) }
+				func any_memory<Mem: Memory>() -> Mem::&[u8] { "abstract" }
+			"#}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("slice"), r#"(block => "hello")"#);
+		assert_eq!(case.body_type("slice"), "heap::&[u8]");
+		assert_eq!(case.body_type("array"), "heap::&[u8; 5]");
+		assert_eq!(case.shape("escaped"), r#"(block => "a\n")"#);
+		assert_eq!(
+			case.locals("annotated"),
+			[("s".into(), "heap::&[u8; 3]".into())]
+		);
+		assert_eq!(case.body_type("branches"), "heap::&[u8]");
+		assert_eq!(case.body_type("tuple"), "(heap::&[u8], u8)");
+		assert_eq!(case.body_type("any_memory"), "Mem::&[u8]");
+	}
+
+	#[test]
+	fn an_array_literal_takes_a_shared_array_or_slice_from_its_context() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				memory wide: u64;
+				const SIZE: u32 = 3;
+				func slice() -> heap::&[u32] { [1, 2, 3] }
+				func array() -> heap::&[u8; 2] { [1, 2] }
+				func empty() -> heap::&[u8] { [] }
+				func annotated() { local a: heap::&[u8; 1] = [9]; }
+				func nested() -> heap::&[heap::&[u8]] { [[1], [2, 3]] }
+				func repeat() -> heap::&[u16; 4] { [0; 4] }
+				func repeat_constant() -> heap::&[u16; 3] { [7; SIZE] }
+				func repeat_wide() -> wide::&[u8; 5] { [1; 5] }
+				func any_memory<Mem: Memory>() -> Mem::&[u8; 2] { [1; 2] }
+			"#}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("slice"), "(block => (array 1 2 3))");
+		assert_eq!(case.body_type("slice"), "heap::&[u32]");
+		assert_eq!(case.body_type("array"), "heap::&[u8; 2]");
+		assert_eq!(case.body_type("empty"), "heap::&[u8]");
+		assert_eq!(
+			case.locals("annotated"),
+			[("a".into(), "heap::&[u8; 1]".into())]
+		);
+		assert_eq!(case.body_type("nested"), "heap::&[heap::&[u8]]");
+		assert_eq!(case.shape("repeat"), "(block => (repeat 0 4))");
+		assert_eq!(case.body_type("repeat_constant"), "heap::&[u16; 3]");
+		assert_eq!(case.body_type("repeat_wide"), "wide::&[u8; 5]");
+		assert_eq!(case.body_type("any_memory"), "Mem::&[u8; 2]");
+		// A repeat's count is a length in its memory, of its `Size`.
+		let body = case.body("repeat_wide");
+		let ExprKind::ArrayRepeat {
+			count: Some(count), ..
+		} = body.kind(body.statics()[0])
+		else {
+			panic!("expected a repeat");
+		};
+		assert_eq!(body.ty(count), TypeIndex::U64);
+		// Every literal is static data, an inner one before its outer one.
+		let body = case.body("nested");
+		let lengths: Vec<usize> = body
+			.statics()
+			.iter()
+			.map(|&expr| match body.kind(expr) {
+				ExprKind::Array { elements } => elements.len(),
+				_ => panic!("expected an array literal"),
+			})
+			.collect();
+		assert_eq!(lengths, [1, 2, 2]);
+	}
+
+	#[test]
+	fn an_array_literal_is_only_what_its_context_allows() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const LONG: u64 = 2;
+				func exclusive() -> heap::*[u8] { [1] }
+				func number() -> u32 { [1] }
+				func too_long() -> heap::&[u8; 2] { [1, 2, 3] }
+				func repeat_too_long() -> heap::&[u8; 2] { [0; 3] }
+				func element() -> heap::&[u8] { [True] }
+				func count_type() -> heap::&[u8; 2] { [0; LONG] }
+				func computed(n: u32) -> heap::&[u8; 2] { [0; n] }
+				func computed_slice(n: u32) -> heap::&[u8] { [0; n] }
+				func untyped() { local a = [1]; }
+				func operator() -> heap::&[u8] { [1] + [2] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArrayRepeatCountNotConst,
+			DiagnosticCode::ArrayRepeatCountNotConst,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn a_body_records_its_string_literals_as_static_data() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func none() -> u32 { 1 }
+			"#}
+		);
+		case.diagnostics().assert_none();
+		let body = case.body("branches");
+		let contents: Vec<&str> = body
+			.statics()
+			.iter()
+			.map(|&expr| {
+				let ExprKind::String(symbol) = body.kind(expr) else {
+					panic!("expected a string literal");
+				};
+				case.context.strings.resolve(symbol).unwrap()
+			})
+			.collect();
+		assert_eq!(contents, ["yes", "no"]);
+		assert!(case.body("none").statics().is_empty());
+	}
+
+	#[test]
+	fn a_string_literal_waits_for_a_generic_call_to_learn_its_memory() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func take<Mem: Memory>(s: Mem::&[u8], p: Mem::&u8) {}
+				func call(p: heap::&u8) { take("abc", p); }
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_string_literal_is_a_shared_byte_type_of_its_length() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func length() -> heap::&[u8; 4] { "abc" }
+				func exclusive() -> heap::*[u8] { "abc" }
+				func number() -> u32 { "abc" }
+				func untyped() { local s = "abc"; }
+				func operator() -> heap::&[u8] { "a" + "b" }
+				func negate() -> heap::&[u8] { -"a" }
+				func expected(c: Bool) -> heap::&[u8] { if c { "a" } else { 1 } }
+				func joined(c: Bool) { local x = if c { "a" } else { 1 }; }
+				func escape() -> heap::&[u8] { "\q" }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::UnknownCharacterEscape,
+		]);
+		case.diagnostics().assert_error_saying(
+			"this string literal is 3 bytes long, but `heap::&[u8; 4]` holds 4",
+		);
+	}
+
+	#[test]
+	fn a_string_literal_is_ascribed_what_it_can_become() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func array() -> heap::&[u8; 3] { ("abc": heap::&[u8; 3]) }
+				func slice() -> heap::&[u8] { ("abc": heap::&[u8]) }
+				func number() -> u32 { ("abc": u32) }
+				func exclusive() -> heap::*[u8] { ("abc": heap::*[u8]) }
+				func length() -> heap::&[u8; 2] { ("abc": heap::&[u8; 2]) }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::ArraySizeMismatch,
+		]);
+		assert_eq!(case.shape("array"), r#"(block => "abc")"#);
+	}
+
+	#[test]
+	fn an_array_literal_is_ascribed_what_it_can_become() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func array() -> heap::&[u8; 2] { ([1, 2]: heap::&[u8; 2]) }
+				func slice() -> heap::&[u32] { ([1, 2]: heap::&[u32]) }
+				func repeat() -> heap::&[u8; 3] { ([0; 3]: heap::&[u8; 3]) }
+				func inferred() { local a = ([1]: heap::&[u16]); }
+				func number() -> u32 { ([1]: u32) }
+				func pointer() -> heap::*u32 { ([1]: heap::*u32) }
+				func exclusive() -> heap::*[u8] { ([1]: heap::*[u8]) }
+				func length() -> heap::&[u8; 2] { ([1]: heap::&[u8; 2]) }
+				func element() -> heap::&[u8] { ([True]: heap::&[u8]) }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(case.shape("array"), "(block => (array 1 2))");
+		assert_eq!(
+			case.locals("inferred"),
+			[("a".into(), "heap::&[u16]".into())]
+		);
+	}
+
+	#[test]
+	fn constant_parameters_and_arguments_are_not_checked_yet() {
+		test_case!(
+			case = indoc! {r#"
+				struct Buffer<const N: u32>(u8);
+				func f(b: Buffer<4>) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::UnsupportedExpression,
+		]);
+	}
+
+	#[test]
+	fn an_array_type_length_is_an_integer_literal_or_a_constant() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				memory wide: u64;
+				const N: u32 = 2;
+				func literal(a: heap::&[u8; 2]) {}
+				func constant(a: heap::&[u8; N]) {}
+				func not_integer(a: heap::&[u8; True]) {}
+				func too_long(a: heap::&[u8; 5000000000]) {}
+				func long(a: wide::&[u8; 5000000000]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+	}
+
+	#[test]
+	fn a_constant_length_means_its_value() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				struct Buffer(data: heap::&[u8; TWO]);
+				const TWO: u32 = 1 + 1;
+				func same(a: heap::&[u8; TWO]) -> heap::&[u8; 2] { a }
+				func text() { local s: heap::&[u8; TWO] = "ab"; }
+				func repeat() { local z: heap::&[u8; TWO] = [0; _]; }
+				func long() { local s: heap::&[u8; TWO] = "abc"; }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ArraySizeMismatch]);
+	}
+
+	#[test]
+	fn a_constant_length_has_its_memorys_size_type() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const SHORT: u16 = 2;
+				const N: u32 = 2;
+				func narrow(a: heap::&[u8; SHORT]) {}
+				func abstract<M: Memory>(a: M::&[u8; N]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	#[test]
+	fn a_length_path_names_a_free_constant() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				trait Sized { const SIZE: u32; }
+				func f() {}
+				func function(a: heap::&[u8; f]) {}
+				func missing(a: heap::&[u8; NOPE]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArrayRepeatCountNotConst,
+			DiagnosticCode::UndeclaredIdentifier,
+		]);
+	}
+
+	#[test]
+	fn a_length_names_a_constant_of_a_type() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				trait Sized { const SIZE: u32; }
+				struct P();
+				impl Sized for P { const SIZE: u32 = 3; }
+				impl P { const OWN: u32 = 2; }
+				type A = heap::&[u8; 4];
+				func of_param<T: Sized>(a: heap::&[u8; T::SIZE]) {
+					local b: heap::&[u8; T::SIZE] = a;
+				}
+				func of_impl(a: heap::&[u8; P::SIZE]) { local b: heap::&[u8; 3] = a; }
+				func inherent(a: heap::&[u8; P::OWN]) { local b: heap::&[u8; 2] = a; }
+				func of_array(a: heap::&[u8; A::SIZE]) { local b: heap::&[u8; 4] = a; }
+				func caller(a: heap::&[u8; 3]) { of_param::<P>(a); }
+				func in_memory<T: Array where { Mem = heap }>(a: heap::&[u8; T::SIZE]) {}
+				func call(x: heap::&[u8; 3]) { in_memory::<heap::&[u16; 3]>(x); }
+				func abstract<M: Memory, T: Array where { Mem = M }>(a: M::&[u8; T::SIZE]) {}
+				trait Takes { const K: u32; func f(self: Self, a: heap::&[u8; Self::K]); }
+				impl Takes for P { const K: u32 = 1; func f(self: Self, a: heap::&[u8; 1]) {} }
+				func qualified<T: Sized>(a: heap::&[u8; <T as Sized>::SIZE]) {}
+				func of_written(a: heap::&[u8; <heap::&[u8; 4]>::SIZE]) {
+					local b: heap::&[u8; 4] = a;
+				}
+				func counted() {
+					local a: heap::&[u8; 3] = [0; <P as Sized>::SIZE];
+				}
+				const C: heap::&[u8; <P as Sized>::SIZE] = [7; _];
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_length_through_a_type_is_checked_as_any_constant() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				trait Sized { const SIZE: u32; }
+				trait Wide { const N: u64; }
+				struct P();
+				impl Sized for P { const SIZE: u32 = 3; }
+				func of_param<T: Sized>(a: heap::&[u8; T::SIZE]) {}
+				func unbound<T>(a: heap::&[u8; T::SIZE]) {}
+				func no_such(a: heap::&[u8; P::NOPE]) {}
+				func wide<T: Wide>(a: heap::&[u8; T::N]) {}
+				func wrong(a: heap::&[u8; 2]) { of_param::<P>(a); }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotATraitMember,
+			DiagnosticCode::NotATraitMember,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"no associated constant named `SIZE` found for this type",
+		);
+		case.diagnostics().assert_error_saying(
+			"an array's length is a `u32`, but `N` is a `u64`",
+		);
+	}
+
+	#[test]
+	fn a_constant_named_in_a_type_inside_its_own_value_is_a_cycle() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const C: u32 = block {
+					local a: heap::&[u8; C] = [0; _];
+					1
+				};
+			"#}
+		);
+		// The local's type is compared once `C` has a value, and `C` has none
+		// until its body is checked: rustc's `typeck(C)` to `eval(C)` and back.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
+	}
+
+	#[test]
+	fn a_constant_whose_value_needs_its_own_type_is_a_cycle() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const A: heap::&[u8; A] = [0; _];
+			"#}
+		);
+		// `[0; _]` is as long as `A`'s type says, which is `A`'s value. The
+		// constant owns the loop; the checks that met it are silent.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
+	}
+
+	#[test]
+	fn a_constant_body_may_name_a_later_constant_in_a_type() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				struct Buf(data: heap::&[u8; N]);
+				const N: u32 = M * 2;
+				const TEXT: heap::&[u8; N] = "abcdefgh";
+				const COPY: heap::&[u8; 8] = TEXT;
+				const ZEROS: heap::&[u8; 8] = [0; N];
+				const M: u32 = 4;
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_length_named_by_a_later_constant_is_checked_once_it_is_known() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const TEXT: heap::&[u8; N] = "abc";
+				const COPY: heap::&[u8; 2] = TEXT;
+				const ZEROS: heap::&[u8; 2] = [0; N];
+				const N: u32 = 4;
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArraySizeMismatch,
+		]);
+	}
+
+	#[test]
+	fn a_length_check_is_decided_after_the_body_is_built() {
+		// Building a body never reads a value, so the length of `"ab"` is
+		// compared with `N` after what the body could decide itself, in a
+		// constant's and in a function's alike; the constant waits for the
+		// other constants, the function does not.
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				const IN_CONSTANT: (heap::&[u8; N], u8) = ("ab", True);
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArraySizeMismatch,
+		]);
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				func in_function() {
+					local t: (heap::&[u8; N], u8) = ("ab", True);
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::ArraySizeMismatch,
+		]);
+	}
+
+	/// The scope and type of the first parameter of the function `name`.
+	fn first_param(case: &TestCase<'_>, name: &str) -> (TypeEnvIdx, TypeIndex) {
+		let DefKind::Function(index) = case.resolve(name) else {
+			panic!("expected `{name}` to be a function");
+		};
+		let signature = &case.context.functions[usize::from(index)];
+		(
+			signature.type_params,
+			case.context.types.list(signature.param_types)[0],
+		)
+	}
+
+	#[test]
+	fn a_named_length_is_kept_unless_values_are_read() {
+		test_case!(
+			mut case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				func named(a: heap::&[u8; N]) {}
+				func written(a: heap::&[u8; 4]) {}
+			"#}
+		);
+		case.diagnostics().assert_none();
+		let (scope, named) = first_param(&case, "named");
+		let (_, written) = first_param(&case, "written");
+		let without_values = RewriteFlags::ALL.without(RewriteFlags::VALUES);
+		let mut normalize = |ty, facts| {
+			case.context
+				.normalize(scope, ty, NormalizationDepth::Deep, facts)
+				.unwrap()
+		};
+		// The two requests differ only in the facts, and neither is answered
+		// from the other's cache entry, whichever is asked first.
+		for _ in 0..2 {
+			assert_eq!(normalize(named, without_values), named);
+			assert_eq!(normalize(named, RewriteFlags::ALL), written);
+		}
+		// A type that cannot reach a constant means the same either way.
+		assert_eq!(normalize(written, without_values), written);
+		assert_eq!(normalize(written, RewriteFlags::ALL), written);
+		assert!(case.context.types.has_const(named));
+		assert!(!case.context.types.has_const(written));
+	}
+
+	#[test]
+	fn a_match_in_a_constant_reads_later_constants() {
+		test_case!(
+			case = indoc! {r#"
+				const PICK: u8 = match ON {
+					const YES -> { 1 },
+					const NO -> { 0 },
+				};
+				const ON: Bool = True;
+				const YES: Bool = True;
+				const NO: Bool = False;
+				const SIDE: u8 = match Side::Left {
+					Side::Left -> { 1 },
+					Side::Right -> { 2 },
+				};
+				enum Side(u8) { Left = 0, Right = 1 }
+			"#}
+		);
+		// Both matches are exhaustive once the constants they read are known;
+		// a match is not evaluated (yet), which is all that is reported.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotConstEvaluatable,
+			DiagnosticCode::NotConstEvaluatable,
+		]);
+	}
+
+	#[test]
+	fn an_array_length_in_an_abstract_memory_fits_every_size() {
+		test_case!(
+			case = indoc! {r#"
+				func short<M: Memory>(a: M::&[u8; 5]) {}
+				func long<M: Memory>(a: M::&[u8; 5000000000]) {}
+				func local<M: Memory>() {
+					local a: M::&[u8; 5000000000] = [0; _];
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypesetBoundViolation,
+			DiagnosticCode::TypesetBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn an_inferred_length_is_the_literals() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func f() {
+					local s: heap::&[u8; _] = "abc";
+					local t: heap::&[u8; 3] = s;
+					local a: heap::&[u16; _] = [1, 2];
+					local b: heap::&[u16; 2] = a;
+					local z: heap::&[u8; 4] = [0; _];
+				}
+				func mismatch() {
+					local s: heap::&[u8; _] = "abc";
+					local t: heap::&[u8; 4] = s;
+				}
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn an_inferred_length_needs_an_array_to_learn_from() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func signature(a: heap::&[u8; _]) {}
+				func slice() { local z: heap::&[u8] = [0; _]; }
+				func neither() { local z: heap::&[u8; _] = [0; _]; }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InferInSignature,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+	}
+
+	#[test]
+	fn enums_and_pointers_compare_natively() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func less(o: Ordering) -> Bool { o == Ordering::Less }
+				func same(a: heap::&u8, b: heap::&u8) -> Bool { a != b }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("less"), "(block => (== o#0 Less))");
+	}
+
+	#[test]
+	fn a_constant_comparing_variants_is_evaluated() {
+		test_case!(
+			case = "const SAME: Bool = Ordering::Less == Ordering::Greater;"
+		);
+		case.diagnostics().assert_none();
+		let DefKind::Const(index) = case.resolve("SAME") else {
+			panic!("expected a constant");
+		};
+		assert_eq!(
+			case.context.solver.const_values[usize::from(index)],
+			ConstValueState::Evaluated(Box::new([ConstScalar::bool(false)]))
+		);
+	}
+
+	#[test]
+	fn a_constant_whose_body_failed_its_checks_is_not_evaluated() {
+		// `BAD` evaluates to a value of the wrong length; its check is what
+		// says so, and that has not happened by the time anything could read
+		// the value, so nothing does: `BAD` is poisoned, and `READ`, which
+		// names it, is silent.
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: u32 = 4;
+				const BAD: heap::&[u8; N] = "ab";
+				const READ: heap::&[u8; N] = BAD;
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ArraySizeMismatch]);
+		for name in ["BAD", "READ"] {
+			let DefKind::Const(index) = case.resolve(name) else {
+				panic!("expected a constant");
+			};
+			assert_eq!(
+				case.context.solver.const_values[usize::from(index)],
+				ConstValueState::Poisoned,
+				"{name}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_constant_is_checked_before_a_later_constant_reads_it() {
+		// `B` reads `A`'s value in its own check, before `A`'s turn: `A` is
+		// checked on demand, and a mismatch in it is reported once.
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const B: heap::&[u8; A] = [0; _];
+				const A: u32 = True;
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn a_function_item_is_a_zero_sized_constant() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				const ID: id<u8> = id;
+				const AGAIN: id<u8> = ID;
+				func f() -> u8 { ID(1) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		for name in ["ID", "AGAIN"] {
+			let DefKind::Const(index) = case.resolve(name) else {
+				panic!("expected a constant");
+			};
+			assert_eq!(
+				case.context.solver.const_values[usize::from(index)],
+				ConstValueState::Evaluated(Box::new([]))
+			);
+		}
+		assert_eq!(case.shape("f"), "(block => (abstract call<id<u8>> ID 1))");
+	}
+
+	/// `Value` is `Global`'s, bound through its subtrait `GlobalMut`.
+	#[test]
+	fn a_bound_on_a_supertraits_value_holds_for_each_global() {
+		test_case!(
+			case = indoc! {"
+				global mut hits: u32 = 0;
+				global mut flag: Bool = False;
+				func bump<G: GlobalMut where { Value = u32 }>(g: G) {
+					g.set(g.get() + 1);
+				}
+				func f() { bump(hits); bump(flag); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+		case.diagnostics().assert_error_saying(
+			"type mismatch resolving `<flag as Global>::Value == u32`",
+		);
+	}
+
+	#[test]
+	fn a_global_handle_is_a_zero_sized_constant() {
+		test_case!(
+			case = indoc! {"
+				global mut counter: u32 = 0;
+				const COUNTER: counter = counter;
+				func read() -> u32 { COUNTER.get() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		let DefKind::Const(index) = case.resolve("COUNTER") else {
+			panic!("expected a constant");
+		};
+		assert_eq!(
+			case.context.solver.const_values[usize::from(index)],
+			ConstValueState::Evaluated(Box::new([]))
+		);
+		assert_eq!(
+			case.shape("read"),
+			"(block => (abstract get<counter> COUNTER))"
+		);
+	}
+
+	#[test]
+	fn a_global_initializer_is_checked_against_its_type() {
+		test_case!(case = "global small: u8 = 300;");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+	}
+
+	#[test]
+	fn a_path_through_a_type_calls_its_member_directly() {
+		test_case!(
+			case = indoc! {"
+				enum E(u8) { A = 0 }
+				impl E { pub func pick<T>(t: T) -> E { E::A } }
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func new(x: T) -> W<T> { W(x) }
+					pub func get(self: Self) -> T { loop {} }
+					func again(x: T) -> W<T> { Self::new(x) }
+				}
+				trait Make { func make() -> Self; }
+				struct P();
+				impl Make for P { func make() -> Self { P() } }
+				func inherent() -> E { E::pick(True) }
+				func generic_impl(w: W<u8>) -> u8 { W::<u8>::get(w) }
+				func constructed() -> W<u16> { W::<u16>::new(1) }
+				func trait_impl() -> P { P::make() }
+				func value() { local f = W::<u8>::new; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("inherent"), "(block => (call pick<Bool> True))");
+		assert_eq!(case.shape("generic_impl"), "(block => (call get<u8> w#0))");
+		assert_eq!(case.shape("constructed"), "(block => (call new<u16> 1))");
+		assert_eq!(case.member_shape("again"), "(block => (call new<T> x#0))");
+		assert_eq!(case.shape("trait_impl"), "(block => (call make))");
+		assert_eq!(case.locals("value"), [("f".into(), "new<u8>".into())]);
+	}
+
+	#[test]
+	fn a_trait_declaration_is_called_with_its_receiver_as_self() {
+		test_case!(
+			case = indoc! {"
+				trait Make {
+					func make() -> Self;
+					func zero() -> u32 { 0 }
+				}
+				struct P();
+				impl Make for P { func make() -> Self { P() } }
+				func abstract_receiver<T: Make>() -> T { T::make() }
+				func inherited_default() -> u32 { P::zero() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("abstract_receiver"),
+			"(block => (abstract make<T>))"
+		);
+		assert_eq!(
+			case.shape("inherited_default"),
+			"(block => (abstract zero<P>))"
+		);
+	}
+
+	#[test]
+	fn a_bracketed_root_names_the_receiver_and_maybe_its_trait() {
+		test_case!(
+			case = indoc! {"
+				trait Make { func make() -> Self; }
+				trait Other { func make() -> Self; }
+				struct P();
+				impl Make for P { func make() -> Self { P() } }
+				impl Other for P { func make() -> Self { P() } }
+				struct W<T>(x: T);
+				impl<T> W<T> { pub func new(x: T) -> W<T> { W(x) } }
+				func qualified() -> P { <P as Make>::make() }
+				func abstract_qualified<T: Make>() -> T { <T as Make>::make() }
+				func grouped() -> W<u8> { <W<u8>>::new(1) }
+				func ambiguous() -> P { P::make() }
+				func not_implemented() -> Bool { <Bool as Make>::make() }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::AmbiguousTraitMember,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		assert_eq!(case.shape("qualified"), "(block => (call make))");
+		assert_eq!(
+			case.shape("abstract_qualified"),
+			"(block => (abstract make<T>))"
+		);
+		assert_eq!(case.shape("grouped"), "(block => (call new<u8> 1))");
+	}
+
+	#[test]
+	fn a_member_must_exist_and_be_visible() {
+		test_case!(
+			case = indoc! {"
+				mod inner {
+					pub struct S();
+					impl S { func hidden() {} pub func shown() {} }
+					trait Secret { func secret(); }
+					impl Secret for S { func secret() {} }
+				}
+				func missing() { inner::S::nothing(); }
+				func private() { inner::S::hidden(); inner::S::shown(); }
+				func private_trait() { inner::S::secret(); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::PrivateItem,
+			DiagnosticCode::PrivateItem,
+		]);
+		case.diagnostics()
+			.assert_error_saying("associated function `hidden` is private");
+	}
+
+	#[test]
+	fn a_type_named_without_its_arguments_leaves_them_to_the_call() {
+		test_case!(
+			case = indoc! {"
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func new(x: T) -> W<T> { W(x) }
+					pub func empty() -> W<T> { loop {} }
+					pub func of<U>() -> W<T> { loop {} }
+				}
+				struct M<T>(x: T);
+				impl M<u8> { pub func one() -> M<u8> { loop {} } }
+				impl M<u32> { pub func only() -> M<u32> { loop {} } }
+				func from_argument(a: u8) -> W<u8> { W::new(a) }
+				func from_expected() -> W<u16> { W::empty() }
+				func with_own(a: u8) -> W<Bool> { W::of::<u8>() }
+				func picked() -> M<u32> { M::only() }
+				func uninferred() { W::empty(); }
+				func other_impl() -> M<u8> { M::only() }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics()
+			.assert_error_saying("cannot infer type for type parameter `T`");
+		assert_eq!(
+			case.shape("from_argument"),
+			"(block => (call new<u8> a#0))"
+		);
+		assert_eq!(case.shape("from_expected"), "(block => (call empty<u16>))");
+		assert_eq!(case.shape("with_own"), "(block => (call of<Bool, u8>))");
+		assert_eq!(case.shape("picked"), "(block => (call only))");
+	}
+
+	#[test]
+	fn an_impl_selected_before_its_arguments_proves_its_bounds_at_the_call() {
+		test_case!(
+			case = indoc! {"
+				trait Small {}
+				impl Small for u8 {}
+				struct B<T>(x: T);
+				impl<T: Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
+				func holds(a: u8) { local b = B::new(a); }
+				func violated() { local b = B::new(True); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+	}
+
+	#[test]
+	fn a_wrong_type_argument_count_makes_that_frame_an_error() {
+		test_case!(
+			case = indoc! {"
+				func id<T>(x: T) -> T { x }
+				func pair<A, B>(a: A, b: B) {}
+				func plain() {}
+				struct W<T>(x: T);
+				impl<T> W<T> { func get(self: Self) -> T { local W(x) = self; x } }
+				func too_many() { _ = id::<u8, u16>(1); }
+				func too_few() { pair::<u8>(1, 2); }
+				func own_none() { plain::<u8>(); }
+				func method(w: W<u8>) -> u8 { w.get::<u8>() }
+				func construction() { _ = W::<u8, u16>(1); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+			DiagnosticCode::TypeArgumentCountMismatch,
+		]);
+		assert_eq!(
+			case.shape("too_many"),
+			"(block (drop (call id<{unknown}> 1)))"
+		);
+		assert_eq!(
+			case.shape("too_few"),
+			"(block (call pair<{unknown}, {unknown}> 1 2))"
+		);
+		assert_eq!(case.shape("own_none"), "(block (call plain))");
+		// The impl's argument, known from the receiver, is kept.
+		assert_eq!(case.shape("method"), "(block => (call get<u8> w#0))");
+	}
+
+	#[test]
+	fn a_function_value_proves_its_bounds_once_where_it_is_named() {
+		test_case!(
+			case = indoc! {"
+				trait Small {}
+				impl Small for u8 {}
+				func take<T: Small>(x: T) {}
+				func holds(a: u8) { local g = take::<u8>; g(a); }
+				func violated() { local g = take::<Bool>; g(True); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+	}
+
+	#[test]
+	fn self_constructs_the_struct_its_impl_is_for() {
+		test_case!(
+			case = indoc! {"
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					func positional(x: T) -> W<T> { Self(x) }
+					func named(x: T) -> Self { Self({ x }) }
+				}
+				struct P();
+				trait Make { func make() -> Self; }
+				impl Make for P { func make() -> Self { Self() } }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.member_shape("positional"), "(block => (W x#0))");
+		assert_eq!(case.member_shape("named"), "(block => (W x#0))");
+		assert_eq!(case.member_shape("make"), "(block => (P))");
+	}
+
+	#[test]
+	fn self_is_constructed_only_where_it_names_an_accessible_struct() {
+		test_case!(
+			case = indoc! {"
+				mod inner { pub struct P(x: u32); }
+				impl inner::P { func outside() -> inner::P { Self(1) } }
+				struct W(x: u32);
+				impl W {
+					func bare() { local w = Self; }
+					func written() -> W { Self::<u8>(1) }
+				}
+				enum E(u8) { A = 0 }
+				impl E { func variant() -> E { Self(0) } }
+				trait Tr { func make() -> Self { Self() } }
+				func free() { Self(); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PrivateItem,
+			DiagnosticCode::StructUsedAsValue,
+			DiagnosticCode::TypeArgumentsNotAllowed,
+			DiagnosticCode::CannotCallExpression,
+			DiagnosticCode::CannotCallExpression,
+			DiagnosticCode::CannotCallExpression,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the constructor of struct `P` is private");
+		case.diagnostics()
+			.assert_error_saying("`Self` is `E`, which is not a struct");
+		case.diagnostics()
+			.assert_error_saying("`Self` names no struct here");
+	}
+
+	#[test]
+	fn an_associated_constant_is_read_like_its_function_would_be_called() {
+		test_case!(
+			case = indoc! {"
+				trait Sized {
+					const SIZE: u32;
+					const ALIGN: u32 = 4;
+				}
+				struct P();
+				impl Sized for P { const SIZE: u32 = 8; }
+				impl P { const ORIGIN: u8 = 0; }
+				struct W<T>(x: T);
+				impl<T> W<T> { const ID: u32 = 1; }
+				func inherent() -> u8 { P::ORIGIN }
+				func generic_inherent() -> u32 { W::<u8>::ID }
+				func trait_impl() -> u32 { P::SIZE }
+				func inherited() -> u32 { P::ALIGN }
+				func abstract_receiver<T: Sized>() -> u32 { T::SIZE }
+				func qualified() -> u32 { <P as Sized>::SIZE }
+				const EVALUATED: u8 = P::ORIGIN;
+				func written() -> u8 { P::ORIGIN::<u8> }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
+		assert_eq!(case.shape("inherent"), "(block => ORIGIN)");
+		assert_eq!(case.shape("generic_inherent"), "(block => ID<u8>)");
+		assert_eq!(case.shape("trait_impl"), "(block => SIZE)");
+		assert_eq!(case.shape("inherited"), "(block => (abstract ALIGN<P>))");
+		assert_eq!(
+			case.shape("abstract_receiver"),
+			"(block => (abstract SIZE<T>))"
+		);
+		assert_eq!(case.shape("qualified"), "(block => SIZE)");
+		let DefKind::Const(index) = case.resolve("EVALUATED") else {
+			panic!("expected a constant");
+		};
+		assert!(matches!(
+			case.context.solver.const_values[usize::from(index)],
+			ConstValueState::Evaluated(_)
+		));
+	}
+
+	#[test]
+	fn a_method_call_passes_its_receiver_first() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func get(self: Self) -> T { loop {} }
+					pub func map<U>(self: Self, u: U) -> W<U> { W(u) }
+					pub func by_pointer(self: heap::*Self) -> T { loop {} }
+				}
+				trait Twice { func twice(self: Self) -> Self; }
+				impl Twice for u8 { func twice(self: Self) -> Self { self } }
+				func inherent(w: W<u8>) -> u8 { w.get() }
+				func own_args(w: W<u8>) -> W<Bool> { w.map(True) }
+				func turbofish(w: W<u8>) -> W<u16> { w.map::<u16>(1) }
+				func trait_impl(a: u8) -> u8 { a.twice() }
+				func abstract_receiver<T: Twice>(t: T) -> T { t.twice() }
+				func pointer(p: heap::*W<u8>) -> u8 { p.by_pointer() }
+				func reverse(o: Ordering) -> Ordering { o.reverse() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("inherent"), "(block => (call get<u8> w#0))");
+		assert_eq!(
+			case.shape("own_args"),
+			"(block => (call map<u8, Bool> w#0 True))"
+		);
+		assert_eq!(
+			case.shape("turbofish"),
+			"(block => (call map<u8, u16> w#0 1))"
+		);
+		assert_eq!(case.shape("trait_impl"), "(block => (call twice a#0))");
+		assert_eq!(
+			case.shape("abstract_receiver"),
+			"(block => (abstract twice<T> t#0))"
+		);
+		assert_eq!(
+			case.shape("pointer"),
+			"(block => (call by_pointer<u8> p#0))"
+		);
+		assert_eq!(case.shape("reverse"), "(block => (call reverse o#0))");
+	}
+
+	/// `Global::get` and `GlobalMut::set` are declarations a global's impls
+	/// inherit, so they are called with the global as `Self`.
+	#[test]
+	fn a_global_is_read_and_written_through_its_handle() {
+		test_case!(
+			case = indoc! {"
+				global mut counter: u32 = 0;
+				global limit: u32 = 10;
+				func bump() -> u32 {
+					counter.set(counter.get() + 1);
+					counter.get()
+				}
+				func fixed() { limit.set(1); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MethodNotFound]);
+		assert_eq!(
+			case.shape("bump"),
+			"(block (abstract set<counter> counter (+ (abstract get<counter> \
+			 counter) 1)) => (abstract get<counter> counter))"
+		);
+	}
+
+	#[test]
+	fn a_method_call_needs_a_method_of_the_receiver() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct S();
+				impl S {
+					pub func by_value(self: Self) {}
+					pub func associated() {}
+				}
+				func missing(s: S) { s.nothing(); }
+				func not_a_method(s: S) { s.associated(); }
+				func through_pointer(p: heap::*S) { p.by_value(); }
+				func loaded(p: heap::*S) { p.*.by_value(); }
+				func untyped() { (1).add(2); }
+				func arguments(s: S) { s.by_value(1); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::NotAMethod,
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::ArgumentCountMismatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"function `by_value` takes 0 arguments but 1 was supplied",
+		);
+	}
+
+	#[test]
+	fn a_call_by_name_binds_each_argument_to_its_parameter() {
+		test_case!(
+			case = indoc! {"
+				func f(a: u32, b: i64) -> u32 { a }
+				func id<T>(value: T, flag: Bool) -> T { value }
+				func by_name() -> u32 {
+					local a: u32 = 1;
+					f({ b: 2, a })
+				}
+				func in_order() -> u32 { f({ a: 1, b: 2 }) }
+				func positional() -> u32 { f(1, 2) }
+				func generic(x: u8) -> u8 { id({ flag: True, value: x }) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("by_name"),
+			"(block (local a#0 1) => (call f 1=2 0=a#0))"
+		);
+		assert_eq!(case.shape("in_order"), "(block => (call f 1 2))");
+		assert_eq!(case.shape("positional"), "(block => (call f 1 2))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (call id<u8> 1=True 0=x#0))"
+		);
+	}
+
+	#[test]
+	fn a_method_is_called_by_name_with_its_receiver_named_self() {
+		test_case!(
+			case = indoc! {"
+				struct S(n: u32);
+				impl S {
+					pub func pick(self: Self, n: u32, m: u32) -> u32 { n }
+				}
+				func method(s: S) -> u32 { s.pick({ m: 1, n: 2 }) }
+				func path(s: S) -> u32 { S::pick({ n: 2, self: s, m: 1 }) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("method"), "(block => (call pick s#0 1=1 0=2))");
+		assert_eq!(case.shape("path"), "(block => (call pick 1=2 0=s#0 2=1))");
+	}
+
+	/// A member of another kind does not provide the declaration of its name:
+	/// a call selects the trait's declaration, as for a member the impl
+	/// leaves out, and conformance reports the member.
+	#[test]
+	fn a_call_skips_an_impl_member_of_another_kind() {
+		test_case!(
+			case = indoc! {"
+				trait Size { func size(self: Self) -> u32 { 0 } }
+				struct S();
+				impl Size for S { const size: u32 = 1; }
+				func f(s: S) -> u32 { s.size() }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitImplItemKindMismatch]);
+		assert_eq!(case.shape("f"), "(block => (abstract size<S> s#0))");
+	}
+
+	#[test]
+	fn a_trait_impl_function_is_called_by_its_traits_names() {
+		test_case!(
+			case = indoc! {"
+				struct P(v: u32);
+				impl Add for P {
+					func add(self: Self, other: Self) -> Self { other }
+				}
+				func concrete(p: P, q: P) -> P { p.add({ rhs: q }) }
+				func path(p: P, q: P) -> P { P::add({ rhs: q, self: p }) }
+				func generic<T: Add>(a: T, b: T) -> T { a.add({ rhs: b }) }
+				func impl_name(p: P, q: P) -> P { p.add({ other: q }) }
+			"}
+		);
+		// The impl's own name breaks the trait's contract, and calls still use
+		// the trait's.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitImplSignatureMismatch,
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::MissingArguments,
+		]);
+		case.diagnostics().assert_error_saying(
+			"function `add` has no parameter named `other`",
+		);
+		assert_eq!(case.shape("concrete"), "(block => (call add p#0 q#1))");
+		assert_eq!(case.shape("path"), "(block => (call add 1=q#1 0=p#0))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (abstract add<T> a#0 b#1))"
+		);
+	}
+
+	#[test]
+	fn every_path_to_a_known_function_can_be_called_by_name() {
+		test_case!(
+			case = indoc! {"
+				trait Make {
+					func make(value: u32, scale: u32) -> Self;
+				}
+				struct S(n: u32);
+				impl Make for S {
+					func make(value: u32, _: u32) -> Self { S(value) }
+				}
+				impl S {
+					pub func twice(self: Self, by: u32) -> u32 { by }
+					pub func again(self: Self) -> u32 {
+						Self::twice({ by: 2, self })
+					}
+				}
+				struct W<T>(x: T);
+				impl<T> W<T> {
+					pub func new(x: T, flag: Bool) -> W<T> { W(x) }
+				}
+				func qualified() -> S {
+					<S as Make>::make({ scale: 1, value: 2 })
+				}
+				func generic<T: Make>() -> T { T::make({ scale: 1, value: 2 }) }
+				func learned(a: u8) -> W<u8> { W::new({ flag: True, x: a }) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.member_shape("again"),
+			"(block => (call twice 1=2 0=self#0))"
+		);
+		assert_eq!(case.shape("qualified"), "(block => (call make 1=1 0=2))");
+		assert_eq!(
+			case.shape("generic"),
+			"(block => (abstract make<T> 1=1 0=2))"
+		);
+		assert_eq!(
+			case.shape("learned"),
+			"(block => (call new<u8> 1=True 0=a#0))"
+		);
+	}
+
+	#[test]
+	fn a_call_by_name_follows_the_traits_names_even_where_it_leaves_one_out() {
+		test_case!(
+			case = indoc! {"
+				trait Scale {
+					func scale(self: Self, u32) -> Self;
+				}
+				struct S(n: u32);
+				impl Scale for S {
+					func scale(self: Self, by: u32) -> Self { self }
+				}
+				func named(s: S) -> S { s.scale({ by: 2 }) }
+				func positional(s: S) -> S { s.scale(2) }
+			"}
+		);
+		// Naming the parameter breaks the trait's contract, and the call still
+		// follows the trait's declaration, which has no name to call it by.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitImplSignatureMismatch,
+			DiagnosticCode::PositionalOnlyCall,
+		]);
+		case.diagnostics().assert_error_saying(
+			"function `scale` has an unnamed parameter, so it is called by \
+			 position",
+		);
+		assert_eq!(case.shape("positional"), "(block => (call scale s#0 2))");
+	}
+
+	#[test]
+	fn a_call_by_name_reaches_the_first_parameter_of_a_name_declared_twice() {
+		test_case!(
+			case = indoc! {"
+				func d(a: u32, a: u32) {}
+				func once() { d({ a: 1 }) }
+				func twice() { d({ a: 1, a: 2 }) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicateFunctionParameter,
+			DiagnosticCode::DuplicateNamedArgument,
+		]);
+		assert_eq!(case.shape("once"), "(block => (call d 1))");
+	}
+
+	#[test]
+	fn an_empty_call_by_name_gives_no_argument() {
+		test_case!(
+			case = indoc! {"
+				func none() {}
+				func some(a: u32) {}
+				func empty() { none({}) }
+				func missing() { some({}) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MissingArguments]);
+		assert_eq!(case.shape("empty"), "(block => (call none))");
+	}
+
+	#[test]
+	fn a_call_by_name_reports_what_does_not_match_its_parameters() {
+		test_case!(
+			case = indoc! {"
+				struct S();
+				impl S {
+					pub func m(self: Self, n: u32) {}
+				}
+				func f(a: u32, b: i64) {}
+				func g(u32, b: u32) {}
+				func unknown() { f({ a: 1, b: 2, c: 3 }) }
+				func twice() { f({ a: 1, a: 2, b: 3 }) }
+				func missing() { f({ b: 2 }) }
+				func unnamed() { g({ b: 1 }) }
+				func receiver(s: S) { s.m({ self: s, n: 1 }) }
+				func mismatch(x: i64) { f({ a: x, b: x }) }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::DuplicateNamedArgument,
+			DiagnosticCode::MissingArguments,
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics()
+			.assert_error_saying("function `f` has no parameter named `c`");
+		case.diagnostics()
+			.assert_error_saying("argument `a` given more than once");
+		case.diagnostics().assert_error_saying(
+			"missing argument `a` in call to function `f`",
+		);
+		case.diagnostics().assert_error_saying(
+			"function `g` has an unnamed parameter, so it is called by \
+			 position",
+		);
+		case.diagnostics()
+			.assert_error_saying("function `m` has no parameter named `self`");
+		assert_eq!(case.shape("missing"), "(block => (call f 1=2))");
+	}
+
+	#[test]
+	fn a_reported_argument_list_does_not_also_report_an_uninferred_type() {
+		test_case!(
+			case = indoc! {"
+				func pair<T>(a: T, b: T) -> T { a }
+				func none<T>(flag: Bool) -> T { loop {} }
+				func g<T>(T, b: u32) -> T { loop {} }
+				struct W<T>(x: T, y: T);
+				func missing() { pair(1); }
+				func missing_by_name() { pair({ a: 1 }); }
+				func extra() { none(True, 1); }
+				func unknown_name() { none({ flag: True, other: 1 }); }
+				func positional_only() { g({ b: 1 }); }
+				func construction() { W(1); }
+				func construction_by_name() { W({ x: 1 }); }
+				func uninferred() { none(True); }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::MissingArguments,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::PositionalOnlyCall,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::MissingArguments,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+		case.diagnostics().assert_error_saying(
+			"struct constructor `W` takes 2 arguments but 1 was supplied",
+		);
+		case.diagnostics().assert_error_saying(
+			"missing argument `y` in call to struct constructor `W`",
+		);
+	}
+
+	#[test]
+	fn an_argument_built_with_a_known_type_is_held_to_it() {
+		test_case!(
+			case = indoc! {"
+				func three<T>(a: T, b: T, c: T) -> T { a }
+				func f(x: u8, y: u16) { three(x, y, nothing); }
+			"}
+		);
+		// `T` is `u8` from `x` before `y` is built, so `y` is held to `u8`
+		// although the failed third argument leaves `T` an error.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	#[test]
+	fn an_unsupported_form_is_reported_once_as_a_bug() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8]) -> heap::&[u8] {
+					s[1..]
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
+		assert_eq!(case.shape("f"), "(block => error)");
+	}
+
+	#[test]
+	fn a_local_pattern_takes_its_value_apart() {
+		test_case!(
+			case = indoc! {"
+				struct Point(x: u32, y: i64);
+				struct W<T>(a: T, b: Bool);
+				func f(p: Point, t: (u8, (u16, u32)), w: W<u8>) {
+					local Point(x, y) = p;
+					local Point({ y: py, .. }) = p;
+					local (a, (_, c)) = t;
+					local (.., (d, ..)) = t;
+					local W(e, mut g) = w;
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local (Point x#3 y#4) p#0) \
+			 (local (Point _ py#5) p#0) \
+			 (local (tuple a#6 (tuple _ c#7)) t#1) \
+			 (local (tuple _ (tuple d#8 _)) t#1) \
+			 (local (W e#9 g#10) w#2))"
+		);
+		let types: Vec<String> = case.locals("f")[3..]
+			.iter()
+			.map(|(_, ty)| ty.clone())
+			.collect();
+		assert_eq!(
+			types,
+			["u32", "i64", "i64", "u8", "u32", "u16", "u8", "Bool"]
+		);
+	}
+
+	#[test]
+	fn a_local_pattern_must_fit_its_value() {
+		test_case!(
+			case = indoc! {"
+				struct Point(x: u32, y: u32);
+				struct Pair(u32, u32);
+				func f(p: Point, t: (u32, u32), q: Pair) {
+					local (a, b, c) = t;
+					local Point(x, .., ..) = p;
+					local Point({ x }) = p;
+					local Point({ z, .. }) = p;
+					local (n, n) = t;
+					local Pair({ .. }) = q;
+					local (m, k) = p;
+					local Pair(r, s) = p;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::DuplicateRestPattern,
+			DiagnosticCode::MissingStructFields,
+			DiagnosticCode::UnknownStructField,
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::TupleStructBracePattern,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"this pattern has 3 elements but the tuple has 2",
+		);
+		case.diagnostics()
+			.assert_error_saying("pattern does not mention field `y`");
+	}
+
+	#[test]
+	fn a_local_pattern_cannot_test_a_value() {
+		test_case!(
+			case = indoc! {"
+				func f(t: (u32, u32)) -> u32 {
+					local (a, 0) = t;
+					a
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::RefutablePatternInLocal]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local (tuple a#1 error) t#0) => a#1)"
+		);
+	}
+
+	#[test]
+	fn a_match_checks_each_arm_against_the_scrutinee() {
+		test_case!(
+			case = indoc! {"
+				func sign(x: i32) -> i32 {
+					match x {
+						0 -> { 0 },
+						-1 | -128 -> { 1 },
+						n -> { n },
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("sign"),
+			"(block => (match x#0 \
+			 (0 => (block => 0)) \
+			 ((| -1 -128) => (block => 1)) \
+			 (n#1 => (block => n#1))))"
+		);
+		assert_eq!(case.body_type("sign"), "i32");
+	}
+
+	#[test]
+	fn a_match_compares_with_constants_and_destructures() {
+		test_case!(
+			case = indoc! {"
+				enum Dir(u8) { North = 0, South = 1 }
+				const LIMIT: u8 = 10;
+				struct P(x: u8, d: Dir);
+				trait Lim { const MAX: u8; }
+				struct S();
+				impl S { const ZERO: u8 = 0; }
+				func f<T: Lim>(p: P) -> u8 {
+					match p {
+						P(0, Dir::North) -> { 1 },
+						P(const LIMIT, d) -> { 2 },
+						P(x, Dir::South) -> { x },
+						P(S::ZERO | T::MAX, _) -> { 3 },
+						_ -> { 4 },
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block => (match p#0 \
+			 ((P 0 North) => (block => 1)) \
+			 ((P LIMIT d#1) => (block => 2)) \
+			 ((P x#2 South) => (block => x#2)) \
+			 ((P (| ZERO (abstract MAX<T>)) _) => (block => 3)) \
+			 (_ => (block => 4))))"
+		);
+	}
+
+	/// A struct pattern's list is one value of its fields, as a construction
+	/// gives them: one pattern for several fields matches them all as a
+	/// tuple, several for a lone tuple field match that tuple.
+	#[test]
+	fn a_struct_pattern_matches_its_fields_as_one_value() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8, y: u16);
+				struct W(x: (u8, u16));
+				struct Unit();
+				func whole(p: P) -> (u8, u16) { local P(t) = p; t }
+				func grouped(p: P) -> u8 { local P((a, b)) = p; a }
+				func any(p: P) { local P(_) = p; }
+				func spread(w: W) -> u8 { local W(a, b) = w; a }
+				func lone_rest(w: W) -> u16 { local W(.., b) = w; b }
+				func field(w: W) -> (u8, u16) { local W(t) = w; t }
+				func unit(u: Unit) { local Unit(e) = u; }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.locals("whole")[1], ("t".into(), "(u8, u16)".into()));
+		assert_eq!(
+			case.locals("grouped")[1..],
+			[("a".into(), "u8".into()), ("b".into(), "u16".into())]
+		);
+		assert_eq!(
+			case.locals("spread")[1..],
+			[("a".into(), "u8".into()), ("b".into(), "u16".into())]
+		);
+		assert_eq!(case.locals("lone_rest")[1], ("b".into(), "u16".into()));
+		assert_eq!(case.locals("field")[1], ("t".into(), "(u8, u16)".into()));
+		assert_eq!(case.locals("unit")[1], ("e".into(), "()".into()));
+	}
+
+	#[test]
+	fn a_struct_pattern_of_its_fields_as_one_value_counts_for_exhaustiveness() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8, y: u16);
+				struct W(x: (u8, u16));
+				func covered(p: P) -> u8 {
+					match p { P(0, _) -> { 1 }, P(t) -> { 2 } }
+				}
+				func missing(p: P) -> u8 {
+					match p { P((0, _) | (1, _)) -> { 1 } }
+				}
+				func unreachable(w: W) -> u8 {
+					match w { W(0, _) -> { 1 }, W(_) -> { 2 }, W(a, b) -> { 3 } }
+				}
+				func count(p: P) { local P(a, b, c) = p; }
+				func lone(w: W) { local W(a, b, c) = w; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::ArgumentCountMismatch,
+			DiagnosticCode::ArgumentCountMismatch,
+		]);
+	}
+
+	#[test]
+	fn a_constant_has_its_value_wherever_a_pattern_may_name_it() {
+		// A constant's value is known wherever a pattern may name it: in a
+		// function's block, in a global's initializer, in a constant's own.
+		test_case!(
+			case = indoc! {"
+				enum Dir(u8) { North = 0, East = 1, South = 2 }
+				const N: Dir = Dir::North;
+				global g: Dir = match (N) {
+					const N -> { Dir::North },
+					Dir::North -> { Dir::South },
+					_ -> { Dir::East },
+				};
+				// The variants are known here too, so listing them all is
+				// enough: no `_` is needed.
+				global h: Dir = match (N) {
+					Dir::North -> { Dir::North },
+					Dir::East -> { Dir::East },
+					Dir::South -> { Dir::South },
+				};
+				func f(d: Dir) {
+					match d {
+						const N -> {},
+						Dir::North -> {},
+						_ -> {},
+					}
+				}
+			"}
+		);
+		// In both, the second arm is covered by the first.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+	}
+
+	#[test]
+	fn constants_whose_initializers_name_each_other_are_one_cycle() {
+		// Each initializer's pattern compares with the other's value, so
+		// checking one asks for the other's value, which needs the other
+		// checked, which asks for the first one's value again. Only a checked
+		// body is evaluated, so that is a loop, reported once.
+		test_case!(
+			case = indoc! {"
+				const A: Bool = match (True) { const B -> { True }, _ -> { False } };
+				const B: Bool = match (True) { const A -> { True }, _ -> { False } };
+				func f() -> Bool {
+					match (True) {
+						const A -> { match (True) { const B -> { True }, _ -> { False } } },
+						_ -> { False },
+					}
+				}
+			"}
+		);
+		// The constants are poisoned, so the function that names them is silent.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
+	}
+
+	#[test]
+	fn a_float_or_a_string_cannot_be_matched() {
+		// The parser reads them; a float has no single value to compare
+		// with, and a string has no equality at all.
+		test_case!(
+			case = indoc! {r#"
+				func f(x: f32, s: u8) {
+					match x { 1.5 -> {}, _ -> {} }
+					match s { "hi" -> {}, _ -> {} }
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnmatchableLiteral,
+			DiagnosticCode::UnmatchableLiteral,
+		]);
+		case.diagnostics()
+			.assert_error_saying("a float cannot be matched");
+		case.diagnostics()
+			.assert_error_saying("a string cannot be matched");
+	}
+
+	#[test]
+	fn every_test_in_a_local_pattern_poisons_the_pattern() {
+		// A `local` always matches: every test in it is a mistake, and each
+		// one poisons its own pattern, so the pattern takes the value apart
+		// and binds without testing. Only the first test is reported.
+		test_case!(
+			case = indoc! {"
+				const C: u8 = 1;
+				func f(x: (u8, u8)) {
+					local (a, 5) = x;
+					local (b, const C) = x;
+					local (c, 5) | (0, 10) = x;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::NotBoundInAllAlternatives,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local (tuple a#1 error) x#0) (local (tuple b#2 error) x#0) \
+			 (local (| (tuple c#3 error) (tuple error error)) x#0))"
+		);
+	}
+
+	#[test]
+	fn a_name_bound_twice_in_one_alternative_is_still_one_local() {
+		// The name is bound twice in the second alternative, which is a
+		// mistake, but it is still the one local the alternatives share: the
+		// two bindings are of different types, and that is said too.
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i32, i64)) {
+					match x { (a, 5, 6) | (a, b, a) -> { local _ = a; }, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block => (match x#0 ((| (tuple a#1 5 6) (tuple a#1 b#2 a#1)) => \
+			 (block (local _ a#1))) (_ => (block))))"
+		);
+	}
+
+	#[test]
+	fn the_same_name_in_two_alternatives_is_one_local() {
+		// The same name in two alternatives is one local, which the arm's
+		// body reads.
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					match x { (a, 5) | (a, 10) -> { local _ = a; }, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block => (match x#0 ((| (tuple a#1 5) (tuple a#1 10)) => (block \
+			 (local _ a#1))) (_ => (block))))"
+		);
+	}
+
+	#[test]
+	fn a_binding_bound_differently_in_two_alternatives_is_an_error() {
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					match x { (mut a, 5) | (a, 10) -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::InconsistentPatternBinding]);
+		case.diagnostics().assert_error_saying(
+			"variable `a` is bound inconsistently across alternatives separated \
+			 by `|`",
+		);
+	}
+
+	#[test]
+	fn a_binding_must_have_the_same_type_in_all_alternatives() {
+		// The two alternatives bind `a` and `b` at different types, so
+		// neither can be one local of one type.
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					match x { (a, b) | (b, a) -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"in the same arm, a binding must have the same type in all \
+			 alternatives",
+		);
+	}
+
+	#[test]
+	fn nested_alternatives_bind_the_same_names() {
+		// Each `|` is checked on its own: the inner one binds `a` in one
+		// alternative and `b` in the other, and the outer one sees both.
+		test_case!(
+			case = indoc! {"
+				func f(x: ((i32, i32), i32)) {
+					match x { ((a, 1) | (a, 2), 3) -> {}, _ -> {} }
+					match x { ((a, 1) | (b, 2), 3) -> {}, _ -> {} }
+					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::NotBoundInAllAlternatives,
+		]);
+	}
+
+	#[test]
+	fn a_name_bound_twice_in_one_pattern_is_an_error() {
+		// A name bound in the same product is bound twice: the alternatives
+		// of a `|` share a name, but two groups in one pattern do not.
+		test_case!(
+			case = indoc! {"
+				func f(x: ((i32, i32), (i32, i32))) {
+					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) -> {}, _ -> {} }
+				}
+				func g(x: ((i32, i32), i32)) {
+					match x { ((a, 1) | (a, 2), a) -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::DuplicatePatternBinding,
+			DiagnosticCode::DuplicatePatternBinding,
+		]);
+	}
+
+	#[test]
+	fn a_local_pattern_binds_the_same_names_in_its_alternatives() {
+		test_case!(
+			case = indoc! {"
+				func f(x: (i32, i64)) {
+					local (a, b) | (a, b) = x;
+				}
+				func g(x: (i32, i64)) {
+					local (a, 5) | (0, 10) = x;
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::NotBoundInAllAlternatives,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block (local (| (tuple a#1 b#2) (tuple a#1 b#2)) x#0))"
+		);
+	}
+
+	#[test]
+	fn a_value_in_a_pattern_is_a_constant_of_the_matched_type() {
+		test_case!(
+			case = indoc! {"
+				const C: u8 = 1;
+				func g() {}
+				func f(x: u8, b: Bool) {
+					local y: u8 = 1;
+					match x { const y -> {}, _ -> {} }
+					match x { const g -> {}, _ -> {} }
+					match x { 300 -> {}, -1 -> {}, _ -> {} }
+					match x { const True -> {}, _ -> {} }
+					match b { const C -> {}, _ -> {} }
+					match x { 1 | z -> {}, _ -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::InvalidMatchPattern,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`y` is a local; a pattern compares with constants, and `y` would \
+			 bind a new one",
+		);
+	}
+
+	#[test]
+	fn match_arms_share_a_type() {
+		test_case!(
+			case = indoc! {"
+				func f(x: u8) -> u64 { match x { 0 -> { 1 }, _ -> { 2 } } }
+				func g(x: u8) -> u8 {
+					match x { 0 -> { return 0 }, _ -> { x } }
+				}
+				func h(x: u8) { local v = match x { 0 -> { 1 }, _ -> { True } }; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
+		assert_eq!(case.body_type("f"), "u64");
+		assert_eq!(case.body_type("g"), "u8");
+	}
+
+	#[test]
+	fn self_destructures_the_struct_its_impl_is_for() {
+		test_case!(
+			case = indoc! {"
+				struct W(x: u32, y: u32);
+				impl W {
+					func head(self: Self) -> u32 { local Self(x, ..) = self; x }
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.member_shape("head"),
+			"(block (local (W x#1 _) self#0) => x#1)"
+		);
+	}
+
+	#[test]
+	fn a_match_must_cover_every_value() {
+		test_case!(
+			case = indoc! {"
+				enum Dir(u8) { North = 0, East, South, West }
+				struct P(x: Bool, y: Bool);
+				func a(d: Dir) -> u8 {
+					match d { Dir::North -> { 0 }, Dir::East -> { 1 } }
+				}
+				func b(d: Dir) -> u8 {
+					match d {
+						Dir::North | Dir::East -> { 0 },
+						Dir::South | Dir::West -> { 1 },
+					}
+				}
+				func c(x: Bool, d: Dir) {
+					match (x, d) { (const True, _) -> {}, (_, Dir::North) -> {} }
+				}
+				func i(x: u8) -> u8 { match x { 0 -> { 0 }, 1 -> { 1 } } }
+				func s(p: P) {
+					match p { P(const True, _) -> {}, P(const False, const True) -> {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::NonExhaustiveMatch,
+			DiagnosticCode::NonExhaustiveMatch,
+		]);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: patterns `Dir::South` and `Dir::West` not \
+			 covered",
+		);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: patterns `(Bool::False, Dir::East)`, \
+			 `(Bool::False, Dir::South)` and `(Bool::False, Dir::West)` not \
+			 covered",
+		);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: pattern `2` not covered",
+		);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: pattern `P(Bool::False, Bool::False)` not \
+			 covered",
+		);
+	}
+
+	#[test]
+	fn an_arm_the_arms_before_it_cover_is_unreachable() {
+		test_case!(
+			case = indoc! {"
+				const ZERO: u8 = 0;
+				func u(x: u8) { match x { _ -> {}, 0 -> {} } }
+				func v(b: Bool) {
+					match b { const True -> {}, const False -> {}, _ -> {} }
+				}
+				func w(x: u8) { match x { 0 | 1 -> {}, 1 -> {}, _ -> {} } }
+				func z(x: u8) { match x { const ZERO -> {}, 0 -> {}, _ -> {} } }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+		case.diagnostics()
+			.assert_warning(DiagnosticCode::UnreachableMatchArm);
+	}
+
+	#[test]
+	fn a_constant_counts_by_its_value_unless_it_is_abstract() {
+		test_case!(
+			case = indoc! {"
+				enum Dir(u8) { North = 0, East, South }
+				const N: Dir = Dir::North;
+				trait Lim { const MAX: u8; }
+				func k(d: Dir) {
+					match d { const N -> {}, Dir::East | Dir::South -> {} }
+				}
+				func l<T: Lim>(x: u8) { match x { T::MAX -> {} } }
+				func m<T: Lim>(x: u8) { match x { T::MAX -> {}, _ -> {} } }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::NonExhaustiveMatch]);
+		case.diagnostics().assert_error_saying(
+			"non-exhaustive match: pattern `_` not covered",
+		);
+	}
+
+	#[test]
+	fn a_match_with_a_failed_pattern_is_not_checked_for_coverage() {
+		test_case!(case = "func f(x: u8) { match x { const nope -> {} } }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+	}
+
+	#[test]
+	fn a_type_that_fails_to_normalize_is_not_reported_as_a_mismatch() {
+		// The constant, the loop and the member each own their report; what
+		// they poison is not compared with anything.
+		let cases = [
+			(
+				"memory heap: u32;
+				const BAD: u32 = 1 / 0;
+				func f(a: heap::&[u8; BAD]) { local b: heap::&[u8; 4] = a; }",
+				DiagnosticCode::ConstEvaluationFailed,
+			),
+			(
+				"memory heap: u32;
+				const A: u32 = B;
+				const B: u32 = A;
+				func f(a: heap::&[u8; A]) { local b: heap::&[u8; 4] = a; }",
+				DiagnosticCode::CyclicConstant,
+			),
+			(
+				"trait Tr { type Item; }
+				struct P();
+				impl Tr for P { type Item = <P as Tr>::Item; }
+				func f(a: <P as Tr>::Item) { local b: u8 = a; }",
+				DiagnosticCode::CyclicAssociatedType,
+			),
+		];
+		for (source, owner) in cases {
+			test_case!(case = source);
+			case.diagnostics().assert_codes(&[owner]);
+		}
+	}
+
+	#[test]
+	fn slices_and_arrays_have_the_slice_traits() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8], a: heap::*[u16; 4]) {
+					local n: u32 = s.len();
+					local p: heap::&u8 = s.index(n);
+					local q: heap::*u16 = a.index_mut(0);
+					local k: u32 = <heap::*[u16; 4]>::SIZE;
+					local t: heap::&[u16] = a.as_slice();
+					local v: <heap::&[u8] as Slice>::Value = 5;
+					local w: heap::&u8 = s.last();
+				}
+				func g<M: Memory, T>(s: M::&[T]) -> M::Size { s.len() - 1 }
+				func h<S: Slice>(s: S) -> S::Mem::&S::Value { s.first() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local n#2 (abstract len<heap::&[u8]> s#0)) \
+			 (local p#3 (abstract index<heap::&[u8]> s#0 n#2)) \
+			 (local q#4 (abstract index_mut<heap::*[u16; 4]> a#1 0)) \
+			 (local k#5 (abstract SIZE<heap::*[u16; 4]>)) \
+			 (local t#6 (abstract as_slice<heap::*[u16; 4]> a#1)) \
+			 (local v#7 5) \
+			 (local w#8 (abstract last<heap::&[u8]> s#0)))"
+		);
+	}
+
+	#[test]
+	fn only_an_exclusive_slice_is_a_slice_mut() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8], a: heap::&[u8; 2]) {
+					s.index_mut(0);
+					a.as_slice_mut();
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::MethodNotFound,
+		]);
+	}
+
+	#[test]
+	fn an_element_is_the_place_index_points_at() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8], a: heap::*[u16; 4], m: heap::&[heap::&[u8]]) {
+					local e: u8 = s[0];
+					a[1] = 5;
+					a[2] += 1;
+					local r: heap::&u8 = m[0][1].&;
+				}
+				func g<S: Slice>(s: S, i: S::Mem::Size) -> S::Value { s[i] }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local e#3 (load (* (abstract index<heap::&[u8]> s#0 0)))) \
+			 (store (* (abstract index_mut<heap::*[u16; 4]> a#1 1)) 5) \
+			 (store += (* (abstract index_mut<heap::*[u16; 4]> a#1 2)) 1) \
+			 (local r#4 (.& (* (abstract index<heap::&[u8]> \
+			 (load (* (abstract index<heap::&[heap::&[u8]]> m#2 0))) 1)))))"
+		);
+		assert_eq!(
+			case.shape("g"),
+			"(block => (load (* (abstract index<S> s#0 i#1))))"
+		);
+	}
+
+	#[test]
+	fn an_element_of_a_shared_slice_is_read_only() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(s: heap::&[u8]) { s[0] = 1; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
+	}
+
+	#[test]
+	fn only_a_slice_or_an_array_is_indexed() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(ps: heap::&heap::&[u8], o: Ordering) {
+					local a: u8 = ps[0];
+					local b: u8 = o[0];
+					local c: u8 = 7[0];
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotIndex,
+			DiagnosticCode::CannotIndex,
+			DiagnosticCode::TypeAnnotationRequired,
+		]);
+		case.diagnostics()
+			.assert_error_saying("index its pointee, as `x.*[i]`");
+	}
+
+	#[test]
+	fn a_field_is_reached_through_one_pointer() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct P(x: u32, next: heap::&P);
+				func f(p: heap::*P) {
+					local x: u32 = p.x;
+					p.x = 3;
+					local y: u32 = p.next.x;
+					local z: u32 = p.*.x;
+				}
+				func g(pp: heap::&heap::&P) -> u32 { pp.x }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnknownStructField]);
+		case.diagnostics().assert_error_saying("as `p.*.field`");
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local x#1 (load (. (* p#0) x))) \
+			 (store (. (* p#0) x) 3) \
+			 (local y#2 (load (. (* (load (. (* p#0) next))) x))) \
+			 (local z#3 (load (. (* p#0) x))))"
+		);
+	}
+
+	#[test]
+	fn a_field_through_a_pointer_is_a_place() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct P(x: u32, next: heap::&P);
+				func f(p: heap::*P, s: heap::&[heap::&P], v: heap::&[P]) {
+					p.x += 1;
+					local r: heap::&u32 = p.x.&;
+					local a: u32 = (p.*).x;
+					local b: u32 = s[0].x;
+					local c: u32 = v[0].x;
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (store += (. (* p#0) x) 1) \
+			 (local r#3 (.& (. (* p#0) x))) \
+			 (local a#4 (load (. (* p#0) x))) \
+			 (local b#5 (load (. (* (load (* (abstract index<heap::&[heap::&P]> s#1 0)))) x))) \
+			 (local c#6 (load (. (* (abstract index<heap::&[P]> v#2 0)) x))))"
+		);
+	}
+
+	#[test]
+	fn a_field_through_a_shared_pointer_is_read_only() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct P(x: u32);
+				func f(p: heap::&P) { p.x = 1; }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
+	}
+}

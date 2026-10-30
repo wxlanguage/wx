@@ -4,34 +4,34 @@ memory heap: Memory where { Size = u32 };
 
 global mut bump: heap::*u8 = heap::DATA_END;
 
-pub fn alloc<T>() -> heap::*T {
+pub func alloc<T>() -> heap::*T {
   local align = align_of::<T, heap>();
-  local ptr = ptr::align_up::<heap>(bump as u32, align);
+  local ptr = ptr::align_up::<heap>(transmute(bump), align);
   local new_end = ptr + size_of::<T, heap>();
   local cur_end = heap.size_bytes();
   if new_end > cur_end {
     local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
     _ = heap.grow(needed);
   }
-  bump = new_end as heap::*u8;
-  ptr as _
+  bump = transmute(new_end);
+  transmute(ptr)
 }
 
 import "host" as host {
-  fn draw_rect(x: i32, y: i32, w: i32, h: i32, color: u32);
-  fn clear(color: u32);
-  fn poll_key() -> i32;
-  fn get_time_ms() -> i64;
+  func draw_rect(x: i32, y: i32, w: i32, h: i32, color: u32);
+  func clear(color: u32);
+  func poll_key() -> i32;
+  func get_time_ms() -> i64;
 }
 
-enum Direction: u32 {
+enum Direction(u32) {
   Right = 0,
   Down = 1,
   Left = 2,
   Up = 3,
 }
 
-fn test() -> Direction {
+func test() -> Direction {
   Direction::Right
 }
 
@@ -40,11 +40,11 @@ const GRID_W: i32 = 32;
 const GRID_H: i32 = 24;
 const STEP_MS: i64 = 120;
 
-struct Node {
+struct Node(
   x: i32,
   y: i32,
   next: heap::*Node,
-}
+);
 
 global mut head: heap::*Node = ptr::null_mut();
 global mut len: i32 = 0;
@@ -53,25 +53,25 @@ global mut food_x: i32 = 16;
 global mut food_y: i32 = 12;
 global mut acc_ms: i64 = 0;
 
-pub fn node_new(value_x: i32, value_y: i32, next: heap::*Node) -> heap::*Node {
+pub func node_new(value_x: i32, value_y: i32, next: heap::*Node) -> heap::*Node {
   local n: heap::*Node = alloc::<Node>();
-  n.* = Node::{ x: value_x, y: value_y, next: next };
+  n.* = Node({ x: value_x, y: value_y, next: next });
   n
 }
 
-pub fn push_front(x: i32, y: i32) {
+pub func push_front(x: i32, y: i32) {
   head = node_new(x, y, head);
   len += 1;
 }
 
-pub fn pop_back() {
+pub func pop_back() {
   if ptr::is_null(head) { return; }
   if ptr::is_null(head.*.next) {
     head = ptr::null_mut();
     len = 0;
     return;
   }
-  local mut cur = head as *Node;
+  local mut cur: *Node = transmute(head);
   loop {
     local mut n = cur.*;
     if ptr::is_null(n.next.*.next) {
@@ -84,17 +84,17 @@ pub fn pop_back() {
   }
 }
 
-pub fn contains(x: i32, y: i32) -> bool {
+pub func contains(x: i32, y: i32) -> Bool {
   local mut cur: &Node = head;
   loop {
-    if ptr::is_null(cur) { break false }
+    if ptr::is_null(cur) { break False }
     local n = cur.*;
-    if n.x == x && n.y == y { break true }
+    if n.x == x && n.y == y { break True }
     cur = n.next;
   }
 }
 
-pub fn place_food() {
+pub func place_food() {
   local t = host::get_time_ms();
   local mut fx = (i32_wrap_i64(t) % GRID_W + GRID_W) % GRID_W;
   local fy = ((i32_wrap_i64(t) / 13) % GRID_H + GRID_H) % GRID_H;
@@ -103,7 +103,7 @@ pub fn place_food() {
   food_y = fy;
 }
 
-pub fn start() {
+pub func start() {
   reset();
   
   push_front(5, 5);
@@ -113,14 +113,14 @@ pub fn start() {
   place_food();
 }
 
-pub fn reset() {
+pub func reset() {
   bump = heap::DATA_END;
   head = ptr::null_mut();
   len = 0;
   acc_ms = 0;
 }
 
-pub fn step() {
+pub func step() {
   local key = host::poll_key();
   if key == 1 && dir != 0 { dir = 2 }
   if key == 2 && dir != 3 { dir = 1 }
@@ -151,7 +151,7 @@ pub fn step() {
   if hx == food_x && hy == food_y { place_food() } else { pop_back() }
 }
 
-pub fn update(dt: i64) {
+pub func update(dt: i64) {
   acc_ms = acc_ms + dt;
   loop {
     if acc_ms < STEP_MS { break }
@@ -160,7 +160,7 @@ pub fn update(dt: i64) {
   }
 }
 
-pub fn draw() {
+pub func draw() {
   host::clear(0xFF101010);
   
   host::draw_rect(
@@ -172,7 +172,7 @@ pub fn draw() {
   );
   
   local mut cur: heap::*Node = head;
-  local mut first: bool = true;
+  local mut first: Bool = True;
   loop {
     if ptr::is_null(cur) { break }
     if first {
@@ -183,7 +183,7 @@ pub fn draw() {
         CELL_SIZE,
         0xFFFF0000,
       );
-      first = false;
+      first = False;
     } else {
       host::draw_rect(
         cur.*.x * CELL_SIZE,

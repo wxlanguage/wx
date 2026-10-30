@@ -114,7 +114,7 @@ fn test_export_of_a_glob_imported_function_is_callable() {
 
             export { add as \"sum\" }
         "},
-		&[("src/math.wx", "pub fn add(a: i32, b: i32) -> i32 { a + b }")],
+		&[("src/math.wx", "pub func add(a: i32, b: i32) -> i32 { a + b }")],
 	);
 
 	let engine = wasmtime::Engine::default();
@@ -139,7 +139,7 @@ fn test_export_of_a_glob_imported_function_is_callable() {
 #[test]
 fn test_parse_simple_addition() {
 	let case = TestCase::new(indoc! {"
-        fn add(mut a: i32, b: i32) -> i32 { a += b; a }
+        func add(mut a: i32, b: i32) -> i32 { a += b; a }
 
         export { add }
     "});
@@ -177,12 +177,55 @@ fn test_parse_simple_addition() {
 }
 
 #[test]
+fn test_exact_int_literal_coerces_to_float_end_to_end() {
+	// An integer literal that fits a float exactly is rewritten to a `Float`
+	// node in TIR; check it survives MIR/codegen and produces the right value.
+	let case = TestCase::new(indoc! {"
+        func half_of(x: f32) -> f32 { x / 2.0 }
+        func f() -> f32 { half_of(9) }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), f32>(&mut store, "f").unwrap();
+	assert_eq!(f.call(&mut store, ()).unwrap(), 4.5);
+}
+
+#[test]
+fn test_generic_int_literal_monomorphized_to_float_member() {
+	// `5` keeps its `Int` node through TIR under a mixed typeset bound (the body
+	// of `five` never sees a concrete type); the `f32` instantiation must turn
+	// it into a float constant in MIR/codegen.
+	let case = TestCase::new(indoc! {"
+        typeset Num { i32, f32 }
+        func five<T: Num>() -> T { 5 }
+        func as_f32() -> f32 { five() }
+        func as_i32() -> i32 { five() }
+        export { as_f32, as_i32 }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let as_f32 = instance
+		.get_typed_func::<(), f32>(&mut store, "as_f32")
+		.unwrap();
+	let as_i32 = instance
+		.get_typed_func::<(), i32>(&mut store, "as_i32")
+		.unwrap();
+	assert_eq!(as_f32.call(&mut store, ()).unwrap(), 5.0);
+	assert_eq!(as_i32.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
 fn test_arithmetic_operations() {
 	let case = TestCase::new(indoc! {"
-        fn sub(a: i32, b: i32) -> i32 { a - b }
-        fn mul(a: i32, b: i32) -> i32 { a * b }
-        fn div(a: i32, b: i32) -> i32 { a / b }
-        fn rem(a: i32, b: i32) -> i32 { a % b }
+        func sub(a: i32, b: i32) -> i32 { a - b }
+        func mul(a: i32, b: i32) -> i32 { a * b }
+        func div(a: i32, b: i32) -> i32 { a / b }
+        func rem(a: i32, b: i32) -> i32 { a % b }
 
         export {
             sub,
@@ -231,7 +274,7 @@ fn test_arithmetic_operations() {
 #[test]
 fn test_compound_assignment_operators() {
 	let case = TestCase::new(indoc! {"
-        fn all(mut a: i32, b: i32) -> i32 {
+        func all(mut a: i32, b: i32) -> i32 {
             a += b;
             a -= b;
             a *= b;
@@ -257,16 +300,16 @@ fn test_compound_assignment_operators() {
 #[test]
 fn test_comparison_operations() {
 	let case = TestCase::new(indoc! {"
-        fn lt(a: i32, b: i32) -> i32 {
+        func lt(a: i32, b: i32) -> i32 {
             if a < b { 1 } else { 0 }
         }
-        fn gt(a: i32, b: i32) -> i32 {
+        func gt(a: i32, b: i32) -> i32 {
             if a > b { 1 } else { 0 }
         }
-        fn eq(a: i32, b: i32) -> i32 {
+        func eq(a: i32, b: i32) -> i32 {
             if a == b { 1 } else { 0 }
         }
-        fn ne(a: i32, b: i32) -> i32 {
+        func ne(a: i32, b: i32) -> i32 {
             if a != b { 1 } else { 0 }
         }
 
@@ -311,10 +354,10 @@ fn test_comparison_operations() {
 #[test]
 fn test_conditional_expression() {
 	let case = TestCase::new(indoc! {"
-        fn max(a: i32, b: i32) -> i32 {
+        func max(a: i32, b: i32) -> i32 {
             if a > b { a } else { b }
         }
-        fn abs(a: i32) -> i32 {
+        func abs(a: i32) -> i32 {
             if a < 0 { -a } else { a }
         }
 
@@ -347,7 +390,7 @@ fn test_conditional_expression() {
 #[test]
 fn test_loops() {
 	let case = TestCase::new(indoc! {"
-        fn factorial(n: i32) -> i32 {
+        func factorial(n: i32) -> i32 {
             local mut result: i32 = 1;
             local mut i: i32 = 1;
             loop {
@@ -356,7 +399,7 @@ fn test_loops() {
                 i += 1;
             }
         }
-        fn sum_to_n(n: i32) -> i32 {
+        func sum_to_n(n: i32) -> i32 {
             local mut sum: i32 = 0;
             local mut i: i32 = 1;
             loop {
@@ -412,7 +455,7 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
         struct BumpAllocator {}
         impl Allocator for BumpAllocator {
             type Mem = heap;
-            fn reserve(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
+            func allocate(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
                 local ptr = (bump as u32 + layout.align() - 1) / layout.align() * layout.align();
                 local new_end = ptr + layout.size();
                 bump = new_end as heap::*u8;
@@ -420,14 +463,14 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
             }
         }
 
-        fn copy4() {
-            local alloc: heap::*BumpAllocator = ptr::null_mut();
-            local arr = alloc.alloc_slice::<u32>(4);
+        func copy4() {
+            local alloc: heap::*BumpAllocator = 0 as heap::*BumpAllocator;
+            local arr = alloc.allocate_slice_uninit::<u32>(4);
             arr[0] = 10;
             arr[1] = 20;
             arr[2] = 30;
             arr[3] = 40;
-            local out = alloc.alloc_slice::<u32>(4);
+            local out = alloc.allocate_slice_uninit::<u32>(4);
 
             local mut i: u32 = 0;
             loop {
@@ -468,8 +511,8 @@ fn test_loop_copy_does_not_alias_locals_across_iterations() {
 #[test]
 fn test_i64_operations() {
 	let case = TestCase::new(indoc! {"
-        fn add64(a: i64, b: i64) -> i64 { a + b }
-        fn mul64(a: i64, b: i64) -> i64 { a * b }
+        func add64(a: i64, b: i64) -> i64 { a + b }
+        func mul64(a: i64, b: i64) -> i64 { a * b }
 
         export {
             add64,
@@ -503,9 +546,9 @@ fn test_i64_operations() {
 #[test]
 fn test_f32_operations() {
 	let case = TestCase::new(indoc! {"
-        fn add_f32(a: f32, b: f32) -> f32 { a + b }
-        fn mul_f32(a: f32, b: f32) -> f32 { a * b }
-        fn div_f32(a: f32, b: f32) -> f32 { a / b }
+        func add_f32(a: f32, b: f32) -> f32 { a + b }
+        func mul_f32(a: f32, b: f32) -> f32 { a * b }
+        func div_f32(a: f32, b: f32) -> f32 { a / b }
 
         export {
             add_f32,
@@ -544,8 +587,8 @@ fn test_f32_operations() {
 #[test]
 fn test_f64_operations() {
 	let case = TestCase::new(indoc! {"
-        fn add_f64(a: f64, b: f64) -> f64 { a + b }
-        fn sub_f64(a: f64, b: f64) -> f64 { a - b }
+        func add_f64(a: f64, b: f64) -> f64 { a + b }
+        func sub_f64(a: f64, b: f64) -> f64 { a - b }
 
         export {
             add_f64,
@@ -576,11 +619,11 @@ fn test_f64_operations() {
 #[test]
 fn test_bitwise_operations() {
 	let case = TestCase::new(indoc! {"
-        fn bit_and(a: i32, b: i32) -> i32 { a & b }
-        fn bit_or(a: i32, b: i32) -> i32 { a | b }
-        fn bit_xor(a: i32, b: i32) -> i32 { a ^ b }
-        fn left_shift(a: i32, b: i32) -> i32 { a << b }
-        fn right_shift(a: i32, b: i32) -> i32 { a >> b }
+        func bit_and(a: i32, b: i32) -> i32 { a & b }
+        func bit_or(a: i32, b: i32) -> i32 { a | b }
+        func bit_xor(a: i32, b: i32) -> i32 { a ^ b }
+        func left_shift(a: i32, b: i32) -> i32 { a << b }
+        func right_shift(a: i32, b: i32) -> i32 { a >> b }
 
         export {
             bit_and,
@@ -625,8 +668,8 @@ fn test_bitwise_operations() {
 #[test]
 fn test_logical_operations() {
 	let case = TestCase::new(indoc! {"
-        fn and(a: i32, b: i32) -> i32 { ((a != 0) && (b != 0)) as i32 }
-        fn or(a: i32, b: i32) -> i32 { ((a != 0) || (b != 0)) as i32 }
+        func and(a: i32, b: i32) -> i32 { ((a != 0) && (b != 0)) as i32 }
+        func or(a: i32, b: i32) -> i32 { ((a != 0) || (b != 0)) as i32 }
 
         export { and, or }
     "});
@@ -658,12 +701,12 @@ fn test_global_variables() {
 	let case = TestCase::new(indoc! {"
         global mut global_counter: i32 = 0
 
-        fn increment() -> i32 {
+        func increment() -> i32 {
             global_counter += 1;
             global_counter
         }
 
-        fn get_counter() -> i32 {
+        func get_counter() -> i32 {
             global_counter
         }
 
@@ -696,7 +739,7 @@ fn test_global_variables() {
 #[test]
 fn test_fibonacci() {
 	let case = TestCase::new(indoc! {"
-        fn fibonacci(n: i32) -> i32 {
+        func fibonacci(n: i32) -> i32 {
             if n <= 1 { return n };
             local mut a: i32 = 0;
             local mut b: i32 = 1;
@@ -737,10 +780,10 @@ fn test_imports() {
         memory heap: Memory where { Size = u32 };
 
         import \"console\" as console {
-            fn log(value: &[u8]) -> ();
+            func log(value: &[u8]) -> ();
         }
 
-        fn main() {
+        func main() {
             local y = \"Hello World!\";
             local x = \"Hello World!\";
             console::log(x);
@@ -794,14 +837,14 @@ fn test_dead_function_strings_excluded_from_data_section() {
         memory heap: Memory where { Size = u32 };
 
         import \"env\" as env {
-            fn log(message: &[u8]);
+            func log(message: &[u8]);
         }
 
-        fn live_fn() {
+        func live_fn() {
             env::log(\"this-string-must-appear\");
         }
 
-        fn dead_fn() {
+        func dead_fn() {
             env::log(\"this-string-must-not-appear\");
         }
 
@@ -832,7 +875,7 @@ fn test_global_init_constant_executes() {
 	// the declared value, not the WASM zero default.
 	let case = TestCase::new(indoc! {"
         global mut x: i32 = 42
-        fn get() -> i32 { x }
+        func get() -> i32 { x }
         export { get }
     "});
 	let engine = wasmtime::Engine::default();
@@ -849,7 +892,7 @@ fn test_global_init_constant_executes() {
 fn test_global_init_arithmetic_executes() {
 	let case = TestCase::new(indoc! {"
         global mut x: i32 = 2 + 3
-        fn get() -> i32 { x }
+        func get() -> i32 { x }
         export { get }
     "});
 	let engine = wasmtime::Engine::default();
@@ -865,9 +908,9 @@ fn test_global_init_arithmetic_executes() {
 #[test]
 fn test_global_init_function_call_executes() {
 	let case = TestCase::new(indoc! {"
-        fn compute() -> i32 { 7 as i32 }
+        func compute() -> i32 { 7 as i32 }
         global mut x: i32 = compute()
-        fn get() -> i32 { x }
+        func get() -> i32 { x }
         export { get }
     "});
 	let engine = wasmtime::Engine::default();
@@ -888,7 +931,7 @@ fn test_global_init_block_with_locals_executes() {
             local b = 4 as i32;
             a * b
         }
-        fn get() -> i32 { x }
+        func get() -> i32 { x }
         export { get }
     "});
 	let engine = wasmtime::Engine::default();
@@ -922,8 +965,8 @@ fn test_global_init_multiple_globals_with_own_locals_executes() {
             local d = 20 as i32;
             c + d
         }
-        fn get_x() -> i32 { x }
-        fn get_y() -> i32 { y }
+        func get_x() -> i32 { x }
+        func get_y() -> i32 { y }
         export { get_x, get_y }
     "});
 	let engine = wasmtime::Engine::default();
@@ -946,8 +989,8 @@ fn test_global_init_multiple_sequential_executes() {
 	let case = TestCase::new(indoc! {"
         global mut g1: i32 = 10
         global mut g2: i32 = g1 + 1
-        fn get_g1() -> i32 { g1 }
-        fn get_g2() -> i32 { g2 }
+        func get_g1() -> i32 { g1 }
+        func get_g2() -> i32 { g2 }
         export { get_g1, get_g2 }
     "});
 	let engine = wasmtime::Engine::default();
@@ -971,11 +1014,11 @@ fn test_global_init_reverse_order_sees_zero() {
 	// Both use non-literal initializers so both are emitted into the start function
 	// in declaration order.
 	let case = TestCase::new(indoc! {"
-        fn ten() -> i32 { 10 }
+        func ten() -> i32 { 10 }
         global mut g2: i32 = g1 + 1
         global mut g1: i32 = ten()
-        fn get_g1() -> i32 { g1 }
-        fn get_g2() -> i32 { g2 }
+        func get_g1() -> i32 { g1 }
+        func get_g2() -> i32 { g2 }
         export { get_g1, get_g2 }
     "});
 	let engine = wasmtime::Engine::default();
@@ -996,7 +1039,7 @@ fn test_global_init_reverse_order_sees_zero() {
 fn test_global_init_f64_executes() {
 	let case = TestCase::new(indoc! {"
         global mut f: f64 = 1.0 + 2.5
-        fn get() -> f64 { f }
+        func get() -> f64 { f }
         export { get }
     "});
 	let engine = wasmtime::Engine::default();
@@ -1012,9 +1055,9 @@ fn test_global_init_f64_executes() {
 #[test]
 fn test_global_init_if_expression_executes() {
 	let case = TestCase::new(indoc! {"
-        fn flag() -> bool { true }
+        func flag() -> bool { true }
         global mut x: i32 = if flag() { 100 as i32 } else { 200 as i32 }
-        fn get() -> i32 { x }
+        func get() -> i32 { x }
         export { get }
     "});
 	let engine = wasmtime::Engine::default();
@@ -1029,15 +1072,16 @@ fn test_global_init_if_expression_executes() {
 
 #[test]
 fn test_global_init_generic_null_pointer_executes() {
-	// global mut head: heap::&Node = ptr::null()
-	// null() is a generic function: null<M: Memory, T>() -> M::&T
-	// Type params must be inferred from the global's declared type.
+	// global mut head: heap::&Node = RawPtr::<heap, Node>::null().as_ref()
+	// A generic call (`RawPtr::null`, then `as_ref`) in global-initializer
+	// position must be lowered into the start function and execute, leaving
+	// the global at address 0.
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
-        global mut head: heap::&Node = ptr::null()
-        fn get_head() -> u32 { head as u32 }
+        global mut head: heap::&Node = RawPtr::<heap, Node>::null().as_ref()
+        func get_head() -> u32 { head as u32 }
         export { get_head }
     "});
 	let engine = wasmtime::Engine::default();
@@ -1061,7 +1105,7 @@ fn test_global_immutable_with_init_wat() {
 	//       immutable globals with non-const initialisers at compile time.
 	let case = TestCase::new(indoc! {"
         global x: i32 = 42
-        fn get() -> i32 { x }
+        func get() -> i32 { x }
         export { get }
     "});
 	insta::assert_snapshot!(wasmprinter::print_bytes(&case.bytecode).unwrap());
@@ -1076,7 +1120,7 @@ fn test_globals_wat() {
 	let case = TestCase::new(indoc! {"
         global mut counter: i32 = 0
 
-        fn increment() -> i32 {
+        func increment() -> i32 {
             counter += 1;
             counter
         }
@@ -1092,9 +1136,9 @@ fn test_inline_expansion_wat() {
 	// the WAT must contain exactly one `func` and no `call` instruction.
 	let case = TestCase::new(indoc! {"
         #[inline]
-        fn double(x: i32) -> i32 { x * 2 }
+        func double(x: i32) -> i32 { x * 2 }
 
-        fn quad(x: i32) -> i32 { double(double(x)) }
+        func quad(x: i32) -> i32 { double(double(x)) }
 
         export { quad }
     "});
@@ -1112,7 +1156,7 @@ fn test_struct_init_wat() {
             y: i32,
         }
 
-        fn make_point(x: i32, y: i32) -> Point {
+        func make_point(x: i32, y: i32) -> Point {
             Point::{ x: x, y: y }
         }
 
@@ -1131,7 +1175,7 @@ fn test_struct_field_access_wat() {
             y: i32,
         }
 
-        fn sum(p: Point) -> i32 {
+        func sum(p: Point) -> i32 {
             p.x + p.y
         }
 
@@ -1145,9 +1189,9 @@ fn test_non_inline_call_wat() {
 	// A non-inline callee must appear as a separate `func` in the binary and
 	// be referenced via a `call` instruction — not inlined.
 	let case = TestCase::new(indoc! {"
-        fn double(x: i32) -> i32 { x * 2 }
+        func double(x: i32) -> i32 { x * 2 }
 
-        fn apply_twice(x: i32) -> i32 { double(double(x)) }
+        func apply_twice(x: i32) -> i32 { double(double(x)) }
 
         export { apply_twice }
     "});
@@ -1157,11 +1201,11 @@ fn test_non_inline_call_wat() {
 #[test]
 fn test_lerp() {
 	let case = TestCase::new(indoc! {"
-        fn lerp(a: f32, b: f32, t: f32) -> f32 {
+        func lerp(a: f32, b: f32, t: f32) -> f32 {
             a + (b - a) * t
         }
 
-        fn main() -> f32 {
+        func main() -> f32 {
             local x: f32 = lerp(0.0, 100.0, 0.5);
             if x != 50.0 { unreachable } else { x }
         }
@@ -1191,7 +1235,7 @@ fn test_tuple_return_wat() {
 	// A function returning a tuple must produce a multi-value wasm signature
 	// `(result i32 i32)` and the body must push both values.
 	let case = TestCase::new(indoc! {"
-        fn make_pair(a: i32, b: i32) -> (i32, i32) {
+        func make_pair(a: i32, b: i32) -> (i32, i32) {
             (a, b)
         }
 
@@ -1205,7 +1249,7 @@ fn test_tuple_block_result_wat() {
 	// A block whose result is a tuple must use a multi-value block type
 	// referencing a type-section entry, not a single-value type.
 	let case = TestCase::new(indoc! {"
-        fn make_pair(x: i32) -> (i32, i32) {
+        func make_pair(x: i32) -> (i32, i32) {
             local t: (i32, i32) = {
                 (x, x + 1)
             };
@@ -1225,7 +1269,7 @@ fn test_trait_method_dispatch() {
 	// callable and produces the correct result.
 	let case = TestCase::new(indoc! {"
         trait Addable {
-            fn add_one(self) -> i32;
+            func add_one(self) -> i32;
         }
 
         struct Counter {
@@ -1233,12 +1277,12 @@ fn test_trait_method_dispatch() {
         }
 
         impl Addable for Counter {
-            fn add_one(self) -> i32 {
+            func add_one(self) -> i32 {
                 self.value + 1
             }
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local c = Counter::{ value: 41 };
             c.add_one()
         }
@@ -1263,8 +1307,8 @@ fn test_trait_multiple_methods() {
 	// produce the right results.
 	let case = TestCase::new(indoc! {"
         trait Ops {
-            fn double(self) -> i32;
-            fn triple(self) -> i32;
+            func double(self) -> i32;
+            func triple(self) -> i32;
         }
 
         struct Num {
@@ -1272,16 +1316,16 @@ fn test_trait_multiple_methods() {
         }
 
         impl Ops for Num {
-            fn double(self) -> i32 { self.n * 2 }
-            fn triple(self) -> i32 { self.n * 3 }
+            func double(self) -> i32 { self.n * 2 }
+            func triple(self) -> i32 { self.n * 3 }
         }
 
-        fn run_double(n: i32) -> i32 {
+        func run_double(n: i32) -> i32 {
             local x = Num::{ n: n };
             x.double()
         }
 
-        fn run_triple(n: i32) -> i32 {
+        func run_triple(n: i32) -> i32 {
             local x = Num::{ n: n };
             x.triple()
         }
@@ -1323,7 +1367,7 @@ fn test_trait_associated_const() {
             const SIZE: u32 = 8;
         }
 
-        fn run() -> u32 {
+        func run() -> u32 {
             Point::SIZE
         }
 
@@ -1342,6 +1386,48 @@ fn test_trait_associated_const() {
 }
 
 #[test]
+fn test_trait_members_dispatch_through_generic_type_param() {
+	// TIR intentionally leaves both references pointing at the trait
+	// declarations while `T` is abstract. Once `T = Subject`, MIR must select
+	// the impl members instead of trying to lower the bodyless declarations.
+	let case = TestCase::new(indoc! {"
+        trait Values {
+            const VALUE: i32;
+            func value() -> i32;
+        }
+
+        struct Subject {}
+
+        impl Values for Subject {
+            const VALUE: i32 = 41;
+            func value() -> i32 { 42 }
+        }
+
+        func read_const<T: Values>() -> i32 { T::VALUE }
+        func call_function<T: Values>() -> i32 { T::value() }
+
+        func const_value() -> i32 { read_const::<Subject>() }
+        func function_value() -> i32 { call_function::<Subject>() }
+
+        export { const_value, function_value }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+	let const_value = instance
+		.get_typed_func::<(), i32>(&mut store, "const_value")
+		.unwrap();
+	let function_value = instance
+		.get_typed_func::<(), i32>(&mut store, "function_value")
+		.unwrap();
+	assert_eq!(const_value.call(&mut store, ()).unwrap(), 41);
+	assert_eq!(function_value.call(&mut store, ()).unwrap(), 42);
+}
+
+#[test]
 fn test_trait_default_method() {
 	// A default method defined in the trait body calls another (abstract) method
 	// on Self.  The default body must compile with `self` having the trait type,
@@ -1349,8 +1435,8 @@ fn test_trait_default_method() {
 
 	let case = TestCase::new(indoc! {"
         trait Scalable {
-            fn value(self) -> i32;
-            fn doubled(self) -> i32 {
+            func value(self) -> i32;
+            func doubled(self) -> i32 {
                 self.value() * 2
             }
         }
@@ -1360,12 +1446,12 @@ fn test_trait_default_method() {
         }
 
         impl Scalable for Num {
-            fn value(self) -> i32 {
+            func value(self) -> i32 {
                 self.n
             }
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local x = Num::{ n: 21 };
             x.doubled()
         }
@@ -1402,7 +1488,7 @@ fn test_trait_method_with_own_type_param_called_through_generic_bound() {
 	// test only needs to build without panicking, not actually run.
 	let _case = TestCase::new(indoc! {"
         trait Writer {
-            fn write<Mem: Memory>(self: Mem::*Self, byte: u8);
+            func write<Mem: Memory>(self: Mem::*Self, byte: u8);
         }
 
         struct Counter {
@@ -1410,26 +1496,26 @@ fn test_trait_method_with_own_type_param_called_through_generic_bound() {
         }
 
         impl Writer for Counter {
-            fn write<Mem: Memory>(self: Mem::*Self, byte: u8) {
+            func write<Mem: Memory>(self: Mem::*Self, byte: u8) {
                 self.*.value = byte;
             }
         }
 
         trait Consumer {
-            fn consume<Mem: Memory, W: Writer>(self: Mem::&Self, w: Mem::*W);
+            func consume<Mem: Memory, W: Writer>(self: Mem::&Self, w: Mem::*W);
         }
 
         impl Consumer for i32 {
-            fn consume<Mem: Memory, W: Writer>(self: Mem::&Self, w: Mem::*W) {
+            func consume<Mem: Memory, W: Writer>(self: Mem::&Self, w: Mem::*W) {
                 w.write(1);
             }
         }
 
         memory heap: Memory where { Size = u32 };
 
-        fn run() {
-            local value_ptr: heap::&i32 = ptr::null();
-            local counter_ptr: heap::*Counter = ptr::null_mut();
+        func run() {
+            local value_ptr: heap::&i32 = 0 as heap::&i32;
+            local counter_ptr: heap::*Counter = 0 as heap::*Counter;
             value_ptr.consume::<heap, Counter>(counter_ptr);
         }
 
@@ -1444,7 +1530,7 @@ fn test_trait_method_with_own_type_param_called_through_generic_bound() {
 fn test_tuple_roundtrip() {
 	// Execution test: swap(3, 7) must return (7, 3).
 	let case = TestCase::new(indoc! {"
-        fn swap(a: i32, b: i32) -> (i32, i32) {
+        func swap(a: i32, b: i32) -> (i32, i32) {
             (b, a)
         }
 
@@ -1468,11 +1554,11 @@ fn test_generic_identity_monomorphized() {
 	// identity<T>(t: T) -> T called with i32; the mono pass must emit a concrete
 	// function and the export must return the passed value unchanged.
 	let case = TestCase::new(indoc! {"
-        fn identity<T>(t: T) -> T {
+        func identity<T>(t: T) -> T {
             t
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             identity(42)
         }
 
@@ -1504,11 +1590,11 @@ fn test_struct_returned_from_call() {
             y: i32,
         }
 
-        fn translate(p: Point, dx: i32, dy: i32) -> Point {
+        func translate(p: Point, dx: i32, dy: i32) -> Point {
             Point::{ x: p.x + dx, y: p.y + dy }
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local p = Point::{ x: 3, y: 7 };
             local q = translate(p, 10, 20);
             q.x + q.y
@@ -1538,11 +1624,11 @@ fn test_struct_chained_transforms() {
             y: i32,
         }
 
-        fn scale(v: Vec2, factor: i32) -> Vec2 {
+        func scale(v: Vec2, factor: i32) -> Vec2 {
             Vec2::{ x: v.x * factor, y: v.y * factor }
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local v = Vec2::{ x: 3, y: 4 };
             local v2 = scale(v, 2);
             local v3 = scale(v2, 3);
@@ -1573,7 +1659,7 @@ fn test_struct_in_conditional() {
             y: i32,
         }
 
-        fn run(flag: i32) -> i32 {
+        func run(flag: i32) -> i32 {
             local p = if flag > 0 {
                 Point::{ x: 10, y: 20 }
             } else {
@@ -1606,11 +1692,11 @@ fn test_struct_i64_fields() {
             y: i64,
         }
 
-        fn add_stats(a: Stats, b: Stats) -> Stats {
+        func add_stats(a: Stats, b: Stats) -> Stats {
             Stats::{ x: a.x + b.x, y: a.y + b.y }
         }
 
-        fn run() -> i64 {
+        func run() -> i64 {
             local a = Stats::{ x: 10, y: 20 };
             local b = Stats::{ x: 30, y: 40 };
             local c = add_stats(a, b);
@@ -1641,7 +1727,7 @@ fn test_struct_call_result_wat() {
             y: i32,
         }
 
-        fn translate(p: Point, dx: i32, dy: i32) -> Point {
+        func translate(p: Point, dx: i32, dy: i32) -> Point {
             Point::{ x: p.x + dx, y: p.y + dy }
         }
 
@@ -1658,11 +1744,11 @@ fn test_pointer_deref_load_and_store() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn read(ptr: heap::&i32) -> i32 {
+        func read(ptr: heap::&i32) -> i32 {
             ptr.*
         }
 
-        fn write(ptr: heap::*i32, val: i32) {
+        func write(ptr: heap::*i32, val: i32) {
             ptr.* = val
         }
 
@@ -1704,7 +1790,7 @@ fn test_pointer_deref_increment() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
 
-        fn increment(ptr: heap::*i32) {
+        func increment(ptr: heap::*i32) {
             ptr.* += 1
         }
 
@@ -1759,16 +1845,16 @@ fn test_struct_pointer_load_and_store() {
             y: i32,
         }
 
-        fn store_point(ptr: heap::*Point, x: i32, y: i32) {
+        func store_point(ptr: heap::*Point, x: i32, y: i32) {
             ptr.* = Point::{ x: x, y: y }
         }
 
-        fn load_x(ptr: heap::&Point) -> i32 {
+        func load_x(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.x
         }
 
-        fn load_y(ptr: heap::&Point) -> i32 {
+        func load_y(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.y
         }
@@ -1855,12 +1941,12 @@ fn test_nested_struct_field_access_on_local() {
         struct Mid { tag: u8, deep: Deep }
         struct Top { flag: u8, mid: Mid }
 
-        fn read_deep_id() -> u64 {
+        func read_deep_id() -> u64 {
             local t = Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
             t.mid.deep.id
         }
 
-        fn mutate_sibling_field_preserves_nested() -> u64 {
+        func mutate_sibling_field_preserves_nested() -> u64 {
             local mut t = Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
             t.flag = 9;
             t.mid.deep.id
@@ -1890,11 +1976,187 @@ fn test_nested_struct_field_access_on_local() {
 	assert_eq!(mutate.call(&mut store, ()).unwrap(), 77);
 }
 
+/// A second round of the same "aggregate field must be scalar" bug, in the
+/// places the first round did not reach: an aggregate that crosses a
+/// *control-flow join*.
+///
+/// A field is not a WASM value — a nested field is several, a zero-sized one
+/// is none — so anything that needs one slot per value has to flatten to
+/// `mir::ScalarTable` rather than walk `Aggregate::fields`. These four
+/// functions each hit a different consumer that used to get that wrong, and
+/// none of them is reachable from the by-value/pointer tests above:
+///
+/// - `across_loop` → `create_loop_params` + `patch_loop_binding`
+/// - `pick` → `merge_values`, via `merge_branches` (no loop involved)
+/// - `from_call` → `AggregateCallResult`, in the scheduler (no loop, no join)
+/// - `call_across_loop` → the intersection: a call result flattened *and*
+///   carried around a loop, which needs projections synthesized per value
+///
+/// Values are asserted, not just compilation: a wrong loop-param count still
+/// produces valid WASM, it just computes the wrong answer.
+#[test]
+fn test_nested_struct_across_control_flow_joins() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
+        struct Inner { addr: u32 }
+        struct Outer { buf: Inner, len: u32 }
+
+        func across_loop() -> u32 {
+            local o = Outer::{ buf: Inner::{ addr: 100 }, len: 3 };
+            local mut i: u32 = 0;
+            local mut sum: u32 = 0;
+            loop {
+                if i == o.len { break };
+                sum += o.buf.addr;
+                i += 1;
+            }
+            sum
+        }
+
+        func pick(c: bool) -> u32 {
+            local o = if c {
+                Outer::{ buf: Inner::{ addr: 10 }, len: 1 }
+            } else {
+                Outer::{ buf: Inner::{ addr: 20 }, len: 2 }
+            };
+            o.buf.addr + o.len
+        }
+
+        func make(n: u32) -> Outer {
+            Outer::{ buf: Inner::{ addr: n }, len: 1 }
+        }
+
+        func from_call() -> u32 {
+            local o = make(100);
+            o.buf.addr + o.len
+        }
+
+        func call_across_loop() -> u32 {
+            local o = make(7);
+            local mut i: u32 = 0;
+            local mut sum: u32 = 0;
+            loop {
+                if i == 3 { break };
+                sum += o.buf.addr;
+                i += 1;
+            }
+            sum
+        }
+
+        export { heap, across_loop, pick, from_call, call_across_loop }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+
+	let across_loop = instance
+		.get_typed_func::<(), u32>(&mut store, "across_loop")
+		.unwrap();
+	assert_eq!(across_loop.call(&mut store, ()).unwrap(), 300);
+
+	let pick = instance
+		.get_typed_func::<i32, u32>(&mut store, "pick")
+		.unwrap();
+	assert_eq!(pick.call(&mut store, 1).unwrap(), 11);
+	assert_eq!(pick.call(&mut store, 0).unwrap(), 22);
+
+	let from_call = instance
+		.get_typed_func::<(), u32>(&mut store, "from_call")
+		.unwrap();
+	assert_eq!(from_call.call(&mut store, ()).unwrap(), 101);
+
+	let call_across_loop = instance
+		.get_typed_func::<(), u32>(&mut store, "call_across_loop")
+		.unwrap();
+	assert_eq!(call_across_loop.call(&mut store, ()).unwrap(), 21);
+}
+
+/// Depth 3, mutated across a loop. Distinct from the depth-2 cases above:
+/// a non-recursive "handle one more level" patch passes at depth 2 and fails
+/// here, and alignment sorting puts the nested field *ahead* of its `u8`
+/// siblings at every level, so a scalar-order mistake corrupts the siblings
+/// rather than the value being read.
+#[test]
+fn test_deeply_nested_struct_carried_across_loop() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1)]
+        memory heap: Memory where { Size = u32 }
+        struct Deep { id: u64 }
+        struct Mid { tag: u8, deep: Deep }
+        struct Top { flag: u8, mid: Mid }
+
+        func sum_across_loop() -> u64 {
+            local mut t =
+                Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            local mut i: u32 = 0;
+            local mut sum: u64 = 0;
+            loop {
+                if i == 3 { break };
+                sum += t.mid.deep.id;
+                t = Top::{
+                    flag: t.flag,
+                    mid: Mid::{
+                        tag: t.mid.tag,
+                        deep: Deep::{ id: t.mid.deep.id + 1 },
+                    },
+                };
+                i += 1;
+            }
+            sum
+        }
+
+        func siblings_survive() -> u32 {
+            local mut t =
+                Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 77 } } };
+            local mut i: u32 = 0;
+            loop {
+                if i == 3 { break };
+                t = Top::{
+                    flag: t.flag,
+                    mid: Mid::{
+                        tag: t.mid.tag,
+                        deep: Deep::{ id: t.mid.deep.id + 1 },
+                    },
+                };
+                i += 1;
+            };
+            (t.flag as u32) * 10 + (t.mid.tag as u32)
+        }
+
+        export { heap, sum_across_loop, siblings_survive }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module =
+		wasmtime::Module::new(&engine, &case.bytecode).expect("invalid wasm");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("instantiation failed");
+
+	// 77 + 78 + 79
+	let sum = instance
+		.get_typed_func::<(), u64>(&mut store, "sum_across_loop")
+		.unwrap();
+	assert_eq!(sum.call(&mut store, ()).unwrap(), 234);
+
+	// `flag` and `mid.tag` are reordered *after* the nested field they are
+	// declared before, so they are where a scalar-order slip shows up.
+	let siblings = instance
+		.get_typed_func::<(), u32>(&mut store, "siblings_survive")
+		.unwrap();
+	assert_eq!(siblings.call(&mut store, ()).unwrap(), 12);
+}
+
 /// The pointer-store/load side of the same bug: a nested literal written
-/// through a pointer in one statement, read back through a pointer, and a
-/// leaf field mutated in place through a pointer-field chain — all at three
-/// levels of nesting, with an inner struct that has more than one field
-/// (the shape that used to corrupt the store sequence).
+/// through a pointer in one statement, read back through a pointer, and an
+/// innermost scalar field mutated in place through a pointer-field chain —
+/// all at three levels of nesting, with an inner struct that has more than
+/// one field (the shape that used to corrupt the store sequence).
 #[test]
 fn test_nested_struct_pointer_store_and_load() {
 	let case = TestCase::new(indoc! {"
@@ -1909,15 +2171,15 @@ fn test_nested_struct_pointer_store_and_load() {
         #[fixed_order]
         struct Top { flag: u8, mid: Mid }
 
-        fn store_nested_literal(p: heap::*Top) {
+        func store_nested_literal(p: heap::*Top) {
             p.* = Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 3 } } };
         }
 
-        fn read_deep_id(p: heap::&Top) -> u64 {
+        func read_deep_id(p: heap::&Top) -> u64 {
             p.*.mid.deep.id
         }
 
-        fn write_deep_id(p: heap::*Top, v: u64) {
+        func write_deep_id(p: heap::*Top, v: u64) {
             p.*.mid.deep.id = v;
         }
 
@@ -1979,11 +2241,11 @@ fn test_nested_struct_function_parameter() {
         struct Mid { tag: u8, deep: Deep }
         struct Top { flag: u8, mid: Mid }
 
-        fn get_deep_id(t: Top) -> u64 {
+        func get_deep_id(t: Top) -> u64 {
             t.mid.deep.id
         }
 
-        fn call_it() -> u64 {
+        func call_it() -> u64 {
             get_deep_id(Top::{ flag: 1, mid: Mid::{ tag: 2, deep: Deep::{ id: 99 } } })
         }
 
@@ -2010,10 +2272,10 @@ fn test_struct_field_write_through_pointer() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
-        fn set_x(ptr: heap::*Point, v: i32) { ptr.*.x = v }
-        fn set_y(ptr: heap::*Point, v: i32) { ptr.*.y = v }
-        fn get_x(ptr: heap::&Point) -> i32 { ptr.*.x }
-        fn get_y(ptr: heap::&Point) -> i32 { ptr.*.y }
+        func set_x(ptr: heap::*Point, v: i32) { ptr.*.x = v }
+        func set_y(ptr: heap::*Point, v: i32) { ptr.*.y = v }
+        func get_x(ptr: heap::&Point) -> i32 { ptr.*.x }
+        func get_y(ptr: heap::&Point) -> i32 { ptr.*.y }
         export { heap, set_x, set_y, get_x, get_y }
     "});
 	let engine = wasmtime::Engine::default();
@@ -2045,14 +2307,14 @@ fn test_local_struct_field_assignment() {
 	// `local mut s.field = val` — AggregateSet path: reconstruct struct with one field replaced.
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
-        fn make(x: i32, y: i32) -> Point {
+        func make(x: i32, y: i32) -> Point {
             local mut p = Point::{ x: 0, y: 0 };
             p.x = x;
             p.y = y;
             p
         }
-        fn get_x(p: Point) -> i32 { p.x }
-        fn get_y(p: Point) -> i32 { p.y }
+        func get_x(p: Point) -> i32 { p.x }
+        func get_y(p: Point) -> i32 { p.y }
         export { make, get_x, get_y }
     "});
 	assert!(case.tir.diagnostics.is_empty());
@@ -2086,11 +2348,11 @@ fn test_generic_struct_f32_fields() {
             y: T,
         }
 
-        fn sum_f32(p: Point<f32>) -> f32 {
+        func sum_f32(p: Point<f32>) -> f32 {
             p.x + p.y
         }
 
-        fn sum_i32(p: Point<i32>) -> i32 {
+        func sum_i32(p: Point<i32>) -> i32 {
             p.x + p.y
         }
 
@@ -2129,11 +2391,11 @@ fn test_generic_struct_two_type_params() {
             second: B,
         }
 
-        fn get_first(p: Pair<i32, f32>) -> i32 {
+        func get_first(p: Pair<i32, f32>) -> i32 {
             p.first
         }
 
-        fn get_second(p: Pair<i32, f32>) -> f32 {
+        func get_second(p: Pair<i32, f32>) -> f32 {
             p.second
         }
 
@@ -2167,16 +2429,16 @@ fn test_generic_struct_from_generic_function() {
             value: T,
         }
 
-        fn make_wrap<T>(v: T) -> Wrap<T> {
+        func make_wrap<T>(v: T) -> Wrap<T> {
             Wrap::{ value: v }
         }
 
-        fn run_i32() -> i32 {
+        func run_i32() -> i32 {
             local w: Wrap<i32> = make_wrap(99);
             w.value
         }
 
-        fn run_f32() -> f32 {
+        func run_f32() -> f32 {
             local w: Wrap<f32> = make_wrap(3.5);
             w.value
         }
@@ -2212,7 +2474,7 @@ fn test_generic_struct_in_conditional() {
             y: T,
         }
 
-        fn select_i32(flag: i32) -> i32 {
+        func select_i32(flag: i32) -> i32 {
             local v: Vec2<i32> = if flag > 0 {
                 Vec2::{ x: 10, y: 20 }
             } else {
@@ -2221,7 +2483,7 @@ fn test_generic_struct_in_conditional() {
             v.x + v.y
         }
 
-        fn select_f32(flag: i32) -> f32 {
+        func select_f32(flag: i32) -> f32 {
             local v: Vec2<f32> = if flag > 0 {
                 Vec2::{ x: 1.5, y: 2.5 }
             } else {
@@ -2265,11 +2527,11 @@ fn test_generic_struct_chained_calls() {
             y: T,
         }
 
-        fn scale(v: Vec2<i32>, factor: i32) -> Vec2<i32> {
+        func scale(v: Vec2<i32>, factor: i32) -> Vec2<i32> {
             Vec2::{ x: v.x * factor, y: v.y * factor }
         }
 
-        fn run() -> i32 {
+        func run() -> i32 {
             local v: Vec2<i32> = Vec2::{ x: 3, y: 4 };
             local v2 = scale(v, 2);
             local v3 = scale(v2, 3);
@@ -2303,16 +2565,16 @@ fn test_generic_struct_pointer_load_store() {
             y: T,
         }
 
-        fn store_pt(ptr: heap::*Point<i32>, x: i32, y: i32) {
+        func store_pt(ptr: heap::*Point<i32>, x: i32, y: i32) {
             ptr.* = Point::{ x, y }
         }
 
-        fn load_x(ptr: heap::&Point<i32>) -> i32 {
+        func load_x(ptr: heap::&Point<i32>) -> i32 {
             local p = ptr.*;
             p.x
         }
 
-        fn load_y(ptr: heap::&Point<i32>) -> i32 {
+        func load_y(ptr: heap::&Point<i32>) -> i32 {
             local p = ptr.*;
             p.y
         }
@@ -2370,11 +2632,11 @@ fn test_memory_grow_and_size() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn size_pages() -> u32 {
+        func size_pages() -> u32 {
             heap.size_pages()
         }
 
-        fn grow_by(delta: u32) -> i32 {
+        func grow_by(delta: u32) -> i32 {
             heap.grow(delta)
         }
 
@@ -2416,7 +2678,7 @@ fn test_memory_size_before_grow_ordering() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn capture_size_before_grow() -> u32 {
+        func capture_size_before_grow() -> u32 {
             local before = heap.size_pages();
             _ = heap.grow(1);
             before
@@ -2455,7 +2717,7 @@ fn test_array_literal_read_by_index() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn get(i: u32) -> i32 {
+        func get(i: u32) -> i32 {
             local arr: heap::&[i32; 4] = [10, 20, 30, 40];
             arr[i]
         }
@@ -2486,8 +2748,8 @@ fn test_array_write_and_read_back() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn write(arr: *[i32; 4], i: u32, v: i32) { arr[i] = v; }
-        fn read(arr: &[i32; 4], i: u32) -> i32 { arr[i] }
+        func write(arr: *[i32; 4], i: u32, v: i32) { arr[i] = v; }
+        func read(arr: &[i32; 4], i: u32) -> i32 { arr[i] }
 
         export { heap, write, read }
     "});
@@ -2534,9 +2796,9 @@ fn test_dead_array_excluded_from_data_section() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn live() -> i32 { 42 }
+        func live() -> i32 { 42 }
 
-        fn dead() -> i32 {
+        func dead() -> i32 {
             local arr: &[i32; 3] = [0xDE, 0xAD, 0xBE];
             arr[0]
         }
@@ -2560,7 +2822,7 @@ fn test_array_index_wat() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn get(i: u32) -> i32 {
+        func get(i: u32) -> i32 {
             local arr: &[i32; 4] = [10, 20, 30, 40];
             arr[i]
         }
@@ -2595,19 +2857,19 @@ fn test_slice_range_wat() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn full_copy(s: heap::&[i32]) -> heap::&[i32] {
+        func full_copy(s: heap::&[i32]) -> heap::&[i32] {
             s[..]
         }
 
-        fn to_limit(s: heap::&[i32], to: u32) -> heap::&[i32] {
+        func to_limit(s: heap::&[i32], to: u32) -> heap::&[i32] {
             s[..to]
         }
 
-        fn from_start(s: heap::&[i32], from: u32) -> heap::&[i32] {
+        func from_start(s: heap::&[i32], from: u32) -> heap::&[i32] {
             s[from..]
         }
 
-        fn bounded(s: heap::&[i32], from: u32, to: u32) -> heap::&[i32] {
+        func bounded(s: heap::&[i32], from: u32, to: u32) -> heap::&[i32] {
             s[from..to]
         }
 
@@ -2628,11 +2890,11 @@ fn test_slice_range_array_wat() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn full_array(arr: heap::&[i32; 4]) -> heap::&[i32] {
+        func full_array(arr: heap::&[i32; 4]) -> heap::&[i32] {
             arr[..]
         }
 
-        fn partial_array(arr: heap::&[i32; 4], i: u32, n: u32) -> heap::&[i32] {
+        func partial_array(arr: heap::&[i32; 4], i: u32, n: u32) -> heap::&[i32] {
             arr[i..n]
         }
 
@@ -2652,9 +2914,9 @@ fn test_narrow_pointer_deref_sign_extension_and_byte_isolation() {
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
-        fn read_u8(ptr: heap::&u8) -> u8 { ptr.* }
-        fn read_i8(ptr: heap::&i8) -> i8 { ptr.* }
-        fn write_u8(ptr: heap::*u8, val: u8) { ptr.* = val }
+        func read_u8(ptr: heap::&u8) -> u8 { ptr.* }
+        func read_i8(ptr: heap::&i8) -> i8 { ptr.* }
+        func write_u8(ptr: heap::*u8, val: u8) { ptr.* = val }
 
         export { heap, read_u8, read_i8, write_u8 }
     "});
@@ -2709,7 +2971,7 @@ fn test_global_read_before_write_returns_old_value() {
 
         global mut bump: heap::*u8 = heap::DATA_END;
 
-        fn alloc(size: u32) -> heap::*u8 {
+        func alloc(size: u32) -> heap::*u8 {
             local ptr: u32 = bump as u32;
             bump = (ptr + size) as heap::*u8;
             ptr as heap::*u8
@@ -2748,8 +3010,8 @@ fn test_global_initialized_to_data_end() {
 
         global mut bump: heap::*u8 = heap::DATA_END;
 
-        fn get_bump() -> u32 { bump as u32 }
-        fn advance(n: u32) { bump = (bump as u32 + n) as heap::*u8 }
+        func get_bump() -> u32 { bump as u32 }
+        func advance(n: u32) { bump = (bump as u32 + n) as heap::*u8 }
 
         export { heap, get_bump, advance }
     "});
@@ -2782,18 +3044,19 @@ fn test_global_initialized_to_data_end() {
 
 #[test]
 fn test_null_pointer_comparison() {
-	// null<M, T>() returns a zero pointer. Verify that:
-	//  1. null() compares equal to another null() (the `node.next == ptr::null()` pattern)
-	//  2. a non-zero pointer does NOT compare equal to null()
+	// `RawPtr::null()` has address 0. Verify that:
+	//  1. `RawPtr::from_ref(p).is_null()` is true for a null-address pointer
+	//     (the `node.next == ptr::null()` pattern, rephrased onto `RawPtr`)
+	//  2. it is false for a non-zero pointer
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
 
         struct Node { value: i32, next: &Node }
 
-        fn make_null() -> &Node { ptr::null() }
-        fn is_null_ptr(p: &Node) -> bool { p == ptr::null() }
-        fn ptr_from_addr() -> *Node { 4 as heap::*Node }
+        func make_null() -> &Node { RawPtr::<heap, Node>::null().as_ref() }
+        func is_null_ptr(p: &Node) -> bool { RawPtr::from_ref(p).is_null() }
+        func ptr_from_addr() -> *Node { 4 as heap::*Node }
 
         export { heap, make_null, is_null_ptr, ptr_from_addr }
     "});
@@ -2850,13 +3113,13 @@ fn test_size_of_and_align_of_intrinsics() {
 	let case = TestCase::new(indoc! {"
         memory heap: Memory where { Size = u32 };
 
-        fn size_u8() -> u32    { size_of::<u8, heap>() }
-        fn size_u16() -> u32   { size_of::<u16, heap>() }
-        fn size_u32() -> u32   { size_of::<u32, heap>() }
-        fn size_u64() -> u32   { size_of::<u64, heap>() }
-        fn align_u8() -> u32   { align_of::<u8, heap>() }
-        fn align_u16() -> u32  { align_of::<u16, heap>() }
-        fn align_u32() -> u32  { align_of::<u32, heap>() }
+        func size_u8() -> u32    { size_of::<u8, heap>() }
+        func size_u16() -> u32   { size_of::<u16, heap>() }
+        func size_u32() -> u32   { size_of::<u32, heap>() }
+        func size_u64() -> u32   { size_of::<u64, heap>() }
+        func align_u8() -> u32   { align_of::<u8, heap>() }
+        func align_u16() -> u32  { align_of::<u16, heap>() }
+        func align_u32() -> u32  { align_of::<u32, heap>() }
 
         export { size_u8, size_u16, size_u32, size_u64, align_u8, align_u16, align_u32 }
     "});
@@ -2897,7 +3160,7 @@ fn test_check_wad_magic_wat() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
-        pub fn check_wad_magic(data: heap::&[u8]) -> bool {
+        pub func check_wad_magic(data: heap::&[u8]) -> bool {
             data[0] == 0x49
                 && data[1] == 0x57
                 && data[2] == 0x41
@@ -2916,12 +3179,12 @@ fn test_constant_index_offset_folding_wat() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 };
-        fn get_arr() -> i32 {
+        func get_arr() -> i32 {
             local arr: &[i32; 4] = [10, 20, 30, 40];
             arr[2]
         }
 
-        fn get_slice(s: heap::&[i32]) -> i32 {
+        func get_slice(s: heap::&[i32]) -> i32 {
             s[3]
         }
 
@@ -2940,7 +3203,7 @@ fn test_address_of_array_element() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u32 }
-        fn elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 {
+        func elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 {
             arr[i].&
         }
 
@@ -2982,8 +3245,8 @@ fn test_address_of_struct_field() {
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
-        fn x_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
-        fn y_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.y.& }
+        func x_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
+        func y_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.y.& }
 
         export { heap, x_addr, y_addr }
     "});
@@ -3026,7 +3289,7 @@ fn test_narrow_field_cast_does_not_overread_adjacent_bytes() {
         memory heap: Memory where { Size = u32 }
         struct S { a: u8, b: u64, c: u16 }
 
-        fn read_c(p: heap::&S) -> u32 { p.*.c as u32 }
+        func read_c(p: heap::&S) -> u32 { p.*.c as u32 }
 
         export { heap, read_c }
     "});
@@ -3068,9 +3331,9 @@ fn test_address_of_wat() {
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
-        fn elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 { arr[i].& }
-        fn x_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
-        fn y_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.y.& }
+        func elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 { arr[i].& }
+        func x_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.x.& }
+        func y_addr(ptr: heap::&Point) -> heap::&i32 { ptr.*.y.& }
 
         export { heap, elem_ptr, x_addr, y_addr }
     "});
@@ -3088,7 +3351,7 @@ fn test_memory64_pointer_roundtrip() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u64 };
-        fn store_load(p: heap::*u64) -> u64 {
+        func store_load(p: heap::*u64) -> u64 {
             p.* = 7;
             p.*
         }
@@ -3118,10 +3381,10 @@ fn test_memory64_size_grow_and_static_data() {
 	let case = TestCase::new(indoc! {"
         #[memory_limits(min_pages = 1)]
         memory heap: Memory where { Size = u64 };
-        fn size_pages() -> u64 { heap.size_pages() }
-        fn grow_one() -> i64 { heap.grow(1) }
-        fn msg() -> heap::&[u8] { \"hello\" }
-        fn data_end() -> heap::&u8 { heap::DATA_END }
+        func size_pages() -> u64 { heap.size_pages() }
+        func grow_one() -> i64 { heap.grow(1) }
+        func msg() -> heap::&[u8] { \"hello\" }
+        func data_end() -> heap::&u8 { heap::DATA_END }
 
         export { size_pages, grow_one, msg, data_end }
     "});
@@ -3170,10 +3433,10 @@ fn test_multi_memory_static_data() {
         memory first: Memory where { Size = u32 };
         #[memory_limits(min_pages = 1)]
         memory second: Memory where { Size = u32 };
-        fn greet_first() -> first::&[u8] { \"hello\" }
-        fn greet_second() -> second::&[u8] { \"world!!\" }
-        fn end_first() -> first::&u8 { first::DATA_END }
-        fn end_second() -> second::&u8 { second::DATA_END }
+        func greet_first() -> first::&[u8] { \"hello\" }
+        func greet_second() -> second::&[u8] { \"world!!\" }
+        func end_first() -> first::&u8 { first::DATA_END }
+        func end_second() -> second::&u8 { second::DATA_END }
 
         export {
             first,
@@ -3230,10 +3493,10 @@ fn test_multi_memory_static_data() {
 #[test]
 fn test_u32_arithmetic_is_unsigned() {
 	let case = TestCase::new(indoc! {"
-        fn gt(a: u32, b: u32) -> bool { a > b }
-        fn div(a: u32, b: u32) -> u32 { a / b }
-        fn rem(a: u32, b: u32) -> u32 { a % b }
-        fn shr(a: u32, b: u32) -> u32 { a >> b }
+        func gt(a: u32, b: u32) -> bool { a > b }
+        func div(a: u32, b: u32) -> u32 { a / b }
+        func rem(a: u32, b: u32) -> u32 { a % b }
+        func shr(a: u32, b: u32) -> u32 { a >> b }
 
         export { gt, div, rem, shr }
     "});
@@ -3297,7 +3560,7 @@ fn test_break_commits_mutation_made_just_before_it() {
 	// Regression: this used to return 4 — the `acc += 1` that made `acc == 5`
 	// true was never committed to the loop's carried local before `break`.
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local mut acc: i32 = 0;
             loop {
                 acc += 1;
@@ -3324,7 +3587,7 @@ fn test_continue_commits_mutation_made_just_before_it() {
 	// was computed, and separately `continue` never committed either value
 	// at all before branching back, so `i` never advanced.
 	let case = TestCase::new(indoc! {"
-        fn sum_until(n: i32) -> i32 {
+        func sum_until(n: i32) -> i32 {
             local mut i: i32 = 0;
             local mut acc: i32 = 0;
             loop {
@@ -3366,7 +3629,7 @@ fn test_match_inside_loop_break_and_continue_commit_mutations() {
 	// mechanism for the same depth problem. This test covers the
 	// *value*-commit half of the underlying mechanism, shared by both paths.
 	let case = TestCase::new(indoc! {"
-        fn sum_until(n: i32) -> i32 {
+        func sum_until(n: i32) -> i32 {
             local mut i: i32 = 0;
             local mut acc: i32 = 0;
             loop {
@@ -3403,13 +3666,13 @@ fn test_match_inside_loop_break_and_continue_commit_mutations() {
 #[test]
 fn test_match_enum_dispatch_runs_correctly() {
 	let case = TestCase::new(indoc! {"
-        enum FileDescriptor: u8 {
+        enum FileDescriptor(u8) {
             StdIn = 0,
             StdOut,
             StdErr,
         }
 
-        fn fd_name_len(fd: FileDescriptor) -> u32 {
+        func fd_name_len(fd: FileDescriptor) -> u32 {
             match fd {
                 FileDescriptor::StdIn -> { 5 },
                 FileDescriptor::StdOut -> { 6 },
@@ -3445,7 +3708,7 @@ fn test_match_inside_loop_break_and_continue_dense_br_table() {
 	// at `Module::new` below or as a silently wrong `acc`), `break` from
 	// both a real case (2) and the default arm.
 	let case = TestCase::new(indoc! {"
-        fn f(n: i32) -> i32 {
+        func f(n: i32) -> i32 {
             local mut i: i32 = 0;
             local mut acc: i32 = 0;
             loop {
@@ -3504,7 +3767,7 @@ fn test_match_dense_struct_valued_arms() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
 
-        fn classify(x: i32) -> i32 {
+        func classify(x: i32) -> i32 {
             local p = match x {
                 0 -> { Point::{ x: 10, y: 1 } },
                 1 -> { Point::{ x: 20, y: 2 } },
@@ -3541,7 +3804,7 @@ fn test_match_dense_struct_valued_arms() {
 #[test]
 fn test_match_dense_early_return_with_divergent_binding() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             local mut acc: i32 = 0;
             match x {
                 0 -> { return 99; },
@@ -3595,7 +3858,7 @@ fn test_match_wide_sparse_if_chain_builds_iteratively() {
 		arms.push_str(&format!("{} -> {{ {} }},\n", i * 1000, i));
 	}
 	let source = format!(
-		"fn f(x: i32) -> i32 {{\n            match x {{\n{arms}                _ -> {{ -1 }},\n            }}\n        }}\n\n        export {{ f }}\n        "
+		"func f(x: i32) -> i32 {{\n            match x {{\n{arms}                _ -> {{ -1 }},\n            }}\n        }}\n\n        export {{ f }}\n        "
 	);
 	let case = TestCase::new(&source);
 
@@ -3621,7 +3884,7 @@ fn test_if_without_else_preserves_local_initializer() {
 	// never runs, leaving the phi's freshly allocated (zero-valued) local
 	// instead of INIT.
 	let case = TestCase::new(indoc! {"
-        fn f(cond: bool) -> f64 {
+        func f(cond: bool) -> f64 {
             local mut x: f64 = 1000000000000.0;
             if cond {
                 x = 5.0;
@@ -3658,7 +3921,7 @@ fn test_unrelated_if_else_phis_are_not_cse_aliased() {
 	// excluding it from CSE (`is_pure`), two unrelated joins with matching
 	// operands alias and one variable silently reads the other's value.
 	let case = TestCase::new(indoc! {"
-        fn f(cond_a: bool, cond_b: bool) -> i32 {
+        func f(cond_a: bool, cond_b: bool) -> i32 {
             local mut a: i32 = 0;
             local mut b: i32 = 0;
             if cond_a { a = -1; } else { a = 1; };
@@ -3696,7 +3959,7 @@ fn test_pure_value_shared_across_if_else_branches_is_materialized_before_branch(
 	// then reads a local nothing on that path ever wrote, silently reading
 	// WASM's zero-initialized default instead of the real value.
 	let case = TestCase::new(indoc! {"
-        fn f(oy: f64, dir_negative: bool) -> f64 {
+        func f(oy: f64, dir_negative: bool) -> f64 {
             local mut y: i32 = 1;
             local delta: f64 = 100.0;
             local yf = f64_convert_i32(y);
@@ -3738,7 +4001,7 @@ fn test_pure_value_shared_via_reassignment_across_if_else_branches() {
 	// not this one, since it never looked at `IfElse.outputs`' `Phi.left`/
 	// `Phi.right` as belonging to their respective branch blocks.
 	let case = TestCase::new(indoc! {"
-        fn f(dir_negative: bool, mag: i32) -> i32 {
+        func f(dir_negative: bool, mag: i32) -> i32 {
             local mut step: i32 = 0;
             local mut side_dist: i32 = 0;
             local m = mag * 2;
@@ -3788,12 +4051,12 @@ fn test_struct_operator_overload_add_wasmtime() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Add for Vec2 {
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        fn run(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+        func run(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
             local a = Vec2::{ x: ax, y: ay };
             local b = Vec2::{ x: bx, y: by };
             local c = a + b;
@@ -3827,36 +4090,36 @@ fn test_struct_operator_overload_arithmetic_ops_wasmtime() {
 
         impl Add for Vec2 {
             #[inline]
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
         impl Sub for Vec2 {
             #[inline]
-            fn sub(self: Self, rhs: Self) -> Self {
+            func sub(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x - rhs.x, y: self.y - rhs.y }
             }
         }
 
         impl Mul for Vec2 {
             #[inline]
-            fn mul(self: Self, rhs: Self) -> Self {
+            func mul(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x * rhs.x, y: self.y * rhs.y }
             }
         }
 
-        fn run_add(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+        func run_add(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
             local c = Vec2::{ x: ax, y: ay } + Vec2::{ x: bx, y: by };
             c.x + c.y
         }
 
-        fn run_sub(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+        func run_sub(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
             local c = Vec2::{ x: ax, y: ay } - Vec2::{ x: bx, y: by };
             c.x + c.y
         }
 
-        fn run_mul(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+        func run_mul(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
             local c = Vec2::{ x: ax, y: ay } * Vec2::{ x: bx, y: by };
             c.x + c.y
         }
@@ -3894,12 +4157,12 @@ fn test_struct_operator_overload_neg_wasmtime() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Neg for Vec2 {
-            fn neg(self: Self) -> Self {
+            func neg(self: Self) -> Self {
                 Vec2::{ x: -self.x, y: -self.y }
             }
         }
 
-        fn run(ax: i32, ay: i32) -> i32 {
+        func run(ax: i32, ay: i32) -> i32 {
             local a = Vec2::{ x: ax, y: ay };
             local b = -a;
             b.x + b.y
@@ -3929,12 +4192,12 @@ fn test_struct_operator_overload_compound_assignment_wasmtime() {
         struct Vec2 { x: i32, y: i32 }
 
         impl Add for Vec2 {
-            fn add(self: Self, rhs: Self) -> Self {
+            func add(self: Self, rhs: Self) -> Self {
                 Vec2::{ x: self.x + rhs.x, y: self.y + rhs.y }
             }
         }
 
-        fn run(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+        func run(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
             local mut a = Vec2::{ x: ax, y: ay };
             a += Vec2::{ x: bx, y: by };
             a.x + a.y
@@ -3958,10 +4221,10 @@ fn test_struct_operator_overload_compound_assignment_wasmtime() {
 #[test]
 fn test_float_to_from_bits_wasmtime() {
 	let case = TestCase::new(indoc! {"
-        fn f32_to_bits(x: f32) -> u32 { x.to_bits() }
-        fn f32_from_bits(bits: u32) -> f32 { f32::from_bits(bits) }
-        fn f64_to_bits(x: f64) -> u64 { x.to_bits() }
-        fn f64_from_bits(bits: u64) -> f64 { f64::from_bits(bits) }
+        func f32_to_bits(x: f32) -> u32 { x.to_bits() }
+        func f32_from_bits(bits: u32) -> f32 { f32::from_bits(bits) }
+        func f64_to_bits(x: f64) -> u64 { x.to_bits() }
+        func f64_from_bits(bits: u64) -> f64 { f64::from_bits(bits) }
 
         export { f32_to_bits, f32_from_bits, f64_to_bits, f64_from_bits }
     "});
@@ -4017,15 +4280,15 @@ fn test_float_boundary_consts_match_ieee754_exactly_wasmtime() {
 	// f32 constant) would silently round to a nearby-but-wrong bit
 	// pattern rather than fail to compile.
 	let case = TestCase::new(indoc! {"
-        fn f32_max() -> f32 { f32::MAX }
-        fn f32_min() -> f32 { f32::MIN }
-        fn f32_min_positive() -> f32 { f32::MIN_POSITIVE }
-        fn f32_epsilon() -> f32 { f32::EPSILON }
+        func f32_max() -> f32 { f32::MAX }
+        func f32_min() -> f32 { f32::MIN }
+        func f32_min_positive() -> f32 { f32::MIN_POSITIVE }
+        func f32_epsilon() -> f32 { f32::EPSILON }
 
-        fn f64_max() -> f64 { f64::MAX }
-        fn f64_min() -> f64 { f64::MIN }
-        fn f64_min_positive() -> f64 { f64::MIN_POSITIVE }
-        fn f64_epsilon() -> f64 { f64::EPSILON }
+        func f64_max() -> f64 { f64::MAX }
+        func f64_min() -> f64 { f64::MIN }
+        func f64_min_positive() -> f64 { f64::MIN_POSITIVE }
+        func f64_epsilon() -> f64 { f64::EPSILON }
 
         export {
             f32_max, f32_min, f32_min_positive, f32_epsilon,
@@ -4061,13 +4324,13 @@ fn test_float_boundary_consts_match_ieee754_exactly_wasmtime() {
 #[test]
 fn test_f32_abs_floor_min_max_wasmtime() {
 	let case = TestCase::new(indoc! {"
-        fn f_abs(x: f32) -> f32 { x.abs() }
-        fn f_floor(x: f32) -> f32 { x.floor() }
-        fn f_ceil(x: f32) -> f32 { x.ceil() }
-        fn f_nearest(x: f32) -> f32 { x.nearest() }
-        fn f_min(a: f32, b: f32) -> f32 { a.min(b) }
-        fn f_max(a: f32, b: f32) -> f32 { a.max(b) }
-        fn f_copysign(a: f32, b: f32) -> f32 { a.copysign(b) }
+        func f_abs(x: f32) -> f32 { x.abs() }
+        func f_floor(x: f32) -> f32 { x.floor() }
+        func f_ceil(x: f32) -> f32 { x.ceil() }
+        func f_nearest(x: f32) -> f32 { x.nearest() }
+        func f_min(a: f32, b: f32) -> f32 { a.min(b) }
+        func f_max(a: f32, b: f32) -> f32 { a.max(b) }
+        func f_copysign(a: f32, b: f32) -> f32 { a.copysign(b) }
 
         export { f_abs, f_floor, f_ceil, f_nearest, f_min, f_max, f_copysign }
     "});
@@ -4127,13 +4390,13 @@ fn test_f32_abs_floor_min_max_wasmtime() {
 #[test]
 fn test_f64_abs_floor_min_max_wasmtime() {
 	let case = TestCase::new(indoc! {"
-        fn f_abs(x: f64) -> f64 { x.abs() }
-        fn f_floor(x: f64) -> f64 { x.floor() }
-        fn f_ceil(x: f64) -> f64 { x.ceil() }
-        fn f_nearest(x: f64) -> f64 { x.nearest() }
-        fn f_min(a: f64, b: f64) -> f64 { a.min(b) }
-        fn f_max(a: f64, b: f64) -> f64 { a.max(b) }
-        fn f_copysign(a: f64, b: f64) -> f64 { a.copysign(b) }
+        func f_abs(x: f64) -> f64 { x.abs() }
+        func f_floor(x: f64) -> f64 { x.floor() }
+        func f_ceil(x: f64) -> f64 { x.ceil() }
+        func f_nearest(x: f64) -> f64 { x.nearest() }
+        func f_min(a: f64, b: f64) -> f64 { a.min(b) }
+        func f_max(a: f64, b: f64) -> f64 { a.max(b) }
+        func f_copysign(a: f64, b: f64) -> f64 { a.copysign(b) }
 
         export { f_abs, f_floor, f_ceil, f_nearest, f_min, f_max, f_copysign }
     "});
@@ -4188,4 +4451,423 @@ fn test_f64_abs_floor_min_max_wasmtime() {
 	assert_eq!(f_copysign.call(&mut store, (3.0, -1.0)).unwrap(), -3.0);
 	assert_eq!(f_copysign.call(&mut store, (-3.0, 1.0)).unwrap(), 3.0);
 	assert_eq!(f_copysign.call(&mut store, (3.0, 1.0)).unwrap(), 3.0);
+}
+
+/// A trait default method must dispatch to an impl's *override* of another
+/// trait method, not silently keep calling the trait's own default body.
+/// Regression for two manifestations of the same MIR bug (`GenericMethodCall`
+/// lowering keyed dispatch off `tir_func.body.is_some()` alone, so a
+/// defaulted-and-overridden method resolved to the default):
+///
+///   * `via_default_body_*` — `doubled`'s default body calls `self.base()`;
+///     `Over` overrides `base`. Plain (non-generic) method call. The bug
+///     returned `2` for `Over` instead of `200`.
+///   * `via_generic_*` — the overridden method reached through a generic
+///     bound (`func dispatch<T: Scalable>`). The bug returned `1` for `Over`
+///     instead of `100`.
+///
+/// The `Inh` cases (impl inherits the default) pin the other side: the fix
+/// must not break dispatch when there is genuinely no override.
+#[test]
+fn test_trait_default_method_dispatches_to_impl_override() {
+	let case = TestCase::new(indoc! {"
+        trait Scalable {
+            func base(self) -> i32 { 1 }
+            func doubled(self) -> i32 { self.base() * 2 }
+        }
+
+        struct Over {}
+        struct Inh {}
+
+        impl Scalable for Over { func base(self) -> i32 { 100 } }
+        impl Scalable for Inh {}
+
+        func dispatch<T: Scalable>(t: T) -> i32 { t.base() }
+
+        func via_default_body_over() -> i32 { local o = Over::{}; o.doubled() }
+        func via_default_body_inh() -> i32 { local i = Inh::{}; i.doubled() }
+        func via_generic_over() -> i32 { dispatch(Over::{}) }
+        func via_generic_inh() -> i32 { dispatch(Inh::{}) }
+
+        export {
+            via_default_body_over,
+            via_default_body_inh,
+            via_generic_over,
+            via_generic_inh,
+        }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode)
+		.expect("Failed to create module");
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("Failed to instantiate");
+
+	let get = |store: &mut wasmtime::Store<()>, name: &str| {
+		instance
+			.get_typed_func::<(), i32>(store, name)
+			.unwrap_or_else(|_| panic!("`{name}` should be exported"))
+	};
+
+	let f = get(&mut store, "via_default_body_over");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		200,
+		"default `doubled` must call `Over`'s override of `base` (100 * 2)"
+	);
+
+	let f = get(&mut store, "via_default_body_inh");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		2,
+		"default `doubled` on `Inh` uses the default `base` (1 * 2)"
+	);
+
+	let f = get(&mut store, "via_generic_over");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		100,
+		"`dispatch::<Over>` must call `Over`'s override of `base`"
+	);
+
+	let f = get(&mut store, "via_generic_inh");
+	assert_eq!(
+		f.call(&mut store, ()).unwrap(),
+		1,
+		"`dispatch::<Inh>` uses the default `base`"
+	);
+}
+
+// ── loop-break divergence union
+// ────────────────────────────────────────────
+//
+// `patch_loop_binding` (opt/builder.rs) decides whether a loop-carried
+// binding needs a real WASM output local by comparing the *fallthrough*
+// path's final value against the value on the way in. A `break`/`continue`
+// nested inside a diverging branch can commit a genuinely different value at
+// its own point, independently of what the fallthrough later does — if the
+// fallthrough happens to leave the binding looking unchanged (or never
+// touches it at all), the early exit's already-recorded commit ends up
+// referencing a local that was never allocated. `LoopData::divergent_params`
+// unions in what every break/continue already found, closing that gap.
+
+#[test]
+fn test_break_inside_diverging_if_commits_mutation() {
+	// `x` is reset to `0` on every normal (non-break) iteration — literally
+	// the same interned node as `x`'s pre-loop value — so the fallthrough
+	// path alone looks like `x` is never mutated. But the `break`, nested in
+	// the `if` with no `else`, sets `x = 5` immediately before firing; that
+	// commit must still survive to the local `x` reads after the loop.
+	let case = TestCase::new(indoc! {"
+        func f() -> i32 {
+            local mut x: i32 = 0;
+            local mut i: i32 = 0;
+            loop {
+                x = 5;
+                if i > 3 {
+                    break;
+                }
+                x = 0;
+                i = i + 1;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
+fn test_continue_inside_diverging_if_commits_mutation() {
+	// Same gap as `test_break_inside_diverging_if_commits_mutation`, but
+	// through `continue` instead of `break` — `loop_param_updates` is the
+	// single choke point both call through, so this confirms the fix covers
+	// both, not just `Break`. At `i == 2`, `x = 5` is committed and the loop
+	// restarts via `continue` *without* the `x = 0` reset that every other
+	// iteration takes; the very next iteration then breaks immediately (at
+	// `i == 3`), before `x` is ever reassigned again — so the continue's own
+	// commit must be exactly what's left when the loop exits.
+	let case = TestCase::new(indoc! {"
+        func f() -> i32 {
+            local mut x: i32 = 0;
+            local mut i: i32 = 0;
+            loop {
+                if i > 2 {
+                    break;
+                }
+                x = 5;
+                if i == 2 {
+                    i = i + 1;
+                    continue;
+                }
+                x = 0;
+                i = i + 1;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+// ── labeled-block `break` (opt::ControlNode::BlockJoin) ─────────────────────
+//
+// A plain `{}` block used to have zero representation in the opt IR —
+// `Builder::build_block_expr` never registered a real `Block`/`ControlNode`
+// for one, so a `break` targeting a labeled plain block (allowed by TIR, no
+// restriction to loop-kind scopes) panicked in `opt`. The compiler's own
+// inliner hits the identical shape internally (an inlined callee's `return`s
+// get rewritten to `break`s targeting a wrapper `BlockKind::Block` scope),
+// fixed by the same change with no inliner-side code touched at all.
+
+#[test]
+fn test_break_out_of_labeled_block_with_value() {
+	let case = TestCase::new(indoc! {"
+        func f() -> i32 {
+            local x: i32 = outer: {
+                break :outer 5;
+            };
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance.get_typed_func::<(), i32>(&mut store, "f").unwrap();
+
+	assert_eq!(f.call(&mut store, ()).unwrap(), 5);
+}
+
+#[test]
+fn test_clamp_shaped_multi_break_plus_fallthrough() {
+	// Three distinct value-contributing exits into the same join: two
+	// `break`s with different values, plus a differing fallthrough —
+	// exercises the `break_result_outputs` phi merge across all three.
+	let case = TestCase::new(indoc! {"
+        func clamp(x: i32) -> i32 {
+            outer: {
+                if x < 0 {
+                    break :outer 0;
+                }
+                if x > 100 {
+                    break :outer 100;
+                }
+                x
+            }
+        }
+
+        export { clamp }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let clamp = instance
+		.get_typed_func::<i32, i32>(&mut store, "clamp")
+		.unwrap();
+
+	assert_eq!(clamp.call(&mut store, -5).unwrap(), 0);
+	assert_eq!(clamp.call(&mut store, 50).unwrap(), 50);
+	assert_eq!(clamp.call(&mut store, 200).unwrap(), 100);
+}
+
+#[test]
+fn test_outer_local_mutation_across_divergent_block_exits() {
+	// Exercises `outputs`/`JoinParam` for an ordinary mutable local — not
+	// the block's own return value — on both the break-taken and
+	// break-not-taken paths.
+	let case = TestCase::new(indoc! {"
+        func f(take_break: bool) -> i32 {
+            local mut x: i32 = 1;
+            outer: {
+                if take_break {
+                    break :outer;
+                }
+                x = 2;
+            }
+            x
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(f.call(&mut store, 1).unwrap(), 1);
+	assert_eq!(f.call(&mut store, 0).unwrap(), 2);
+}
+
+#[test]
+fn test_break_nested_several_levels_deep_inside_labeled_block() {
+	// The break-target is a labeled block wrapping a loop; the actual
+	// `break :outer` fires from inside a further nested `if` within that
+	// loop's body — confirms the eager-placeholder mechanism (JoinParam
+	// minted before the body is built) works regardless of nesting depth.
+	let case = TestCase::new(indoc! {"
+        func f(n: i32) -> i32 {
+            outer: {
+                local mut i: i32 = 0;
+                loop {
+                    if i >= n {
+                        break;
+                    }
+                    if i == 3 {
+                        break :outer i * 10;
+                    }
+                    i = i + 1;
+                };
+                -1
+            }
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	// Loop exits normally (i never reaches 3 before hitting n) — falls
+	// through to the block's own trailing -1.
+	assert_eq!(f.call(&mut store, 3).unwrap(), -1);
+	// i reaches 3 before n — breaks the labeled block from inside the
+	// nested loop's inner if.
+	assert_eq!(f.call(&mut store, 10).unwrap(), 30);
+}
+
+#[test]
+fn test_break_out_of_labeled_block_with_struct_value() {
+	// Exercises the aggregate-decomposition path in both
+	// create_join_params/finalize_block_join_binding (bindings) and
+	// merge_values (the result phi).
+	let case = TestCase::new(indoc! {"
+        struct Point { x: i32, y: i32 }
+
+        func f(take_break: bool) -> i32 {
+            local p: Point = outer: {
+                if take_break {
+                    break :outer Point::{ x: 1, y: 2 };
+                }
+                Point::{ x: 3, y: 4 }
+            };
+            p.x + p.y
+        }
+
+        export { f }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+
+	assert_eq!(f.call(&mut store, 1).unwrap(), 3);
+	assert_eq!(f.call(&mut store, 0).unwrap(), 7);
+}
+
+#[test]
+fn test_inline_function_with_early_return_executes_correctly() {
+	// End-to-end confirmation that both originally-reported crashes (a
+	// standalone labeled block, and the compiler's own inliner producing
+	// the identical `Break`-into-`BlockKind::Block` shape internally) are
+	// fixed by the same opt-level change, with zero changes to
+	// `mir::inlining`. See `mir::tests::
+	// test_inline_function_with_early_return_produces_break_into_block` for
+	// the MIR-level confirmation of the shape this exercises.
+	let case = TestCase::new(indoc! {"
+        #[inline]
+        func classify(x: i32) -> i32 {
+            if x < 0 {
+                return -1;
+            }
+            1
+        }
+
+        pub func main(x: i32) -> i32 {
+            classify(x)
+        }
+
+        export { main }
+    "});
+
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let main = instance
+		.get_typed_func::<i32, i32>(&mut store, "main")
+		.unwrap();
+
+	// Early return taken (the branch containing the rewritten Break).
+	assert_eq!(main.call(&mut store, -5).unwrap(), -1);
+	// Fallthrough (no Break taken).
+	assert_eq!(main.call(&mut store, 5).unwrap(), 1);
+}
+
+/// Locals declared inside two sibling branches (not just the outer scope)
+/// get distinct flat indices under the flattened MIR locals model — no
+/// existing MIR snapshot exercises a non-root scope with its own locals, so
+/// this checks the offsets are actually computed correctly, not just that
+/// the outer-visible `outer` binding survives the merge.
+#[test]
+fn test_locals_declared_inside_sibling_branches_get_distinct_slots() {
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) -> i32 {
+            local mut outer: i32 = 100;
+            if x > 0 {
+                local a: i32 = 1;
+                local b: i32 = 2;
+                outer = outer + a + b;
+            } else {
+                local c: i32 = 10;
+                outer = outer + c;
+            }
+            outer
+        }
+        export { f }
+    "});
+	let engine = wasmtime::Engine::default();
+	let module = wasmtime::Module::new(&engine, &case.bytecode).unwrap();
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let f = instance
+		.get_typed_func::<i32, i32>(&mut store, "f")
+		.unwrap();
+	assert_eq!(f.call(&mut store, 5).unwrap(), 103);
+	assert_eq!(f.call(&mut store, -5).unwrap(), 110);
 }

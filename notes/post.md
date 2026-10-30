@@ -103,7 +103,7 @@ fn i32_div(a: i32, b: i32) [trap] -> i32;
 Or it can reference itself, effectively becoming the origin of a new effect:
 
 ```rust
-fn trap() [trap] -> never;
+fn trap() [trap] -> !;
 ```
 
 There is no separate `effect trap` declaration here. `trap` is just a function, and putting itself into its own effect set tells the compiler that this is where the `trap` effect originates.
@@ -153,10 +153,10 @@ Let's look at a real example.
 One of the most basic relevant WebAssembly instructions is `unreachable`, which unconditionally traps when executed. For clarity, WX exposes this operation as `trap`:
 
 ```rust
-fn trap() [trap] -> never;
+fn trap() [trap] -> !;
 ```
 
-The `never` return type tells us that normal control flow cannot continue after this call. Separately, `[trap]` tells us why this computation is effectful: executing it may terminate the current WebAssembly execution with a trap.
+The `!` return type tells us that normal control flow cannot continue after this call — the bottom type, borrowed from Rust rather than the `never` spelling TypeScript uses, since it reads as a structural/symbolic thing (an uninhabited type) rather than a named one. (A plain stdlib alias, `type never = !;`, could still exist for readability without changing what the type actually is.) Separately, `[trap]` tells us why this computation is effectful: executing it may terminate the current WebAssembly execution with a trap.
 
 When we call `trap` inside another function:
 
@@ -169,7 +169,7 @@ fn main() {
 the compiler can infer something equivalent to:
 
 ```rust
-fn main() [trap] -> never;
+fn main() [trap] -> !;
 ```
 
 Nothing special happened here specifically because this was a trap. We just applied the composition rule from above: `main` calls something with the `[trap]` effect, so `trap` becomes part of `main`'s effect set as well.
@@ -208,6 +208,50 @@ the compiler can follow that operation down to `i32_div`, which we already know 
 
 Assignment variants work the same way. Unlike Rust, WX doesn't have a separate `DivAssign` trait: `a /= b` is syntax sugar derived from `Div`, so it ultimately carries the same effects.
 
+## Tags
+
+Before getting into exceptions, it helps to see a `tag` for what it structurally is: a struct, plus one extra piece of information.
+
+An ordinary struct declares a named shape:
+
+```rust
+struct Status(code: i32, message: heap::&[u8]);
+```
+
+and can be constructed either positionally or by naming its fields — the same call resolves either way, since a struct's implicit constructor is just an ordinary function whose parameters happen to be its fields:
+
+```rust
+Status(404, message)
+Status({ code: 404, message: message })
+```
+
+(Whether the positional form is available to callers outside the struct's own module follows the same visibility rule as everything else: if a field isn't `pub`, it can't be named or positioned from outside, so an author who wants construction to always go through a real constructor function simply keeps the fields private.)
+
+A `tag` declaration uses the exact same field grammar:
+
+```rust
+tag ApplicationError(status: ErrorStatus) -> !;
+```
+
+The only difference from a plain struct is the trailing `-> !`. Instead of describing a return value the way it would on a function, it fixes an associated type: a `tag` automatically implements `Tag`,
+
+```rust
+trait Tag {
+    type Result;
+}
+```
+
+with `Result` set to whatever type follows `->` — here, `!`. This is the same derivation pattern used elsewhere in WX: a `memory heap: u32;` declaration derives `Memory::Size = u32` from a plain type instead of requiring `Memory where { Size = u32 }` spelled out by hand, and `tag ApplicationError(...) -> !;` derives `Tag::Result = !` from a plain return-type annotation the same way, rather than requiring a separate `impl Tag for ApplicationError { type Result = !; }`.
+
+Constructing a tag value works exactly like constructing a struct, because it *is* one:
+
+```rust
+ApplicationError(ErrorStatus::Internal)
+ApplicationError({ status: ErrorStatus::Internal })
+```
+
+None of this says anything about exceptions yet. A bare `tag` is just a typed, constructible value with a declared result type — nothing throws it and nothing can catch it. That's what `Exception` adds next.
+
 ## Exception handling
 
 So far our effect system isn't particularly exciting. We can track that an operation might trap, propagate that information through arbitrary layers of functions, and then... that's about it. A WebAssembly trap cannot be caught by ordinary module code, so once the `trap` effect appears there isn't much we can do with it.
@@ -218,25 +262,18 @@ The basic idea is similar to `trap`: somewhere in the program we perform an oper
 
 This also gives us our first example of a parameterized effect.
 
-WebAssembly exceptions are represented using tags. In WX, a tag declaration looks like this:
+WebAssembly exceptions are represented using tags — `ApplicationError` from before is a natural fit, since being throwable is exactly the kind of thing `Exception` should describe:
 
 ```rust
-tag ApplicationError(status: ErrorStatus) -> never;
+tag ApplicationError(status: ErrorStatus) -> !;
+impl Exception for ApplicationError;
 ```
 
-Tags automatically implement the `Tag` trait:
+`Exception` is not automatic, though — a tag is a more general mechanism than "throwable," so opting a tag into exception behavior is an explicit impl, same as opting into any other trait. An exception is simply a tag whose result is `!`:
 
 ```rust
-trait Tag {
-    type Result;
-}
-```
-
-An exception is a tag whose result is `never`:
-
-```rust
-trait Exception: Tag where { Result = never } {
-    fn throw(self) -> never {
+trait Exception: Tag where { Result = ! } {
+    fn throw(self) -> ! {
         throw(self)
     }
 }
@@ -245,13 +282,13 @@ trait Exception: Tag where { Result = never } {
 The underlying `throw` operation can then be represented as another bodyless intrinsic:
 
 ```rust
-fn throw<E: Exception>(exception: E) [throw<E>] -> never;
+fn throw<E: Exception>(exception: E) [throw<E>] -> !;
 ```
 
 This looks very similar to our earlier `trap`:
 
 ```rust
-fn trap() [trap] -> never;
+fn trap() [trap] -> !;
 ```
 
 but there is one important difference. `throw` is generic, and the instantiated generic argument becomes part of the effect.
@@ -365,7 +402,7 @@ Before we continue, I need to briefly explain how memory works in WX, since it's
 WebAssembly modules aren't required to have linear memory at all. A module can simply export functions that operate on values directly. When you do need memory, however, it has to be explicitly declared. In WX, that looks like this:
 
 ```wx
-memory heap: Memory where { Size = u32 };
+memory heap: u32;
 ```
 
 `heap` is the name of the memory and can be referenced elsewhere in the program. The `Memory` trait describes the memory itself, while `Size` tells us the size of its addresses. In this case, pointers into `heap` use 32-bit addresses.
@@ -373,8 +410,8 @@ memory heap: Memory where { Size = u32 };
 More importantly, every memory declaration creates its own unique type. If we declare two memories:
 
 ```wx
-memory heap: Memory where { Size = u32 };
-memory secondary: Memory where { Size = u64 };
+memory heap: u32;
+memory secondary: u64;
 ```
 
 `heap` and `secondary` aren't just two values referring to different memories — they also represent distinct types.
@@ -479,7 +516,7 @@ An implementation is allowed to use the effects listed in this bound:
 impl Validator for StrictValidator {
     fn validate(value: i32) -> bool {
         if value <= 0 {
-            ValidationError::{}.throw();
+            ValidationError().throw();
         }
 
         true
@@ -740,7 +777,7 @@ trait GlobalMut: Global {
 A global can then be declared like any other item:
 
 ```rs
-global x: GlobalMut where { Value = i32 } = 0;
+global x: i32 = 0;
 ```
 
 and accessed explicitly through `get` and `set`:
@@ -776,7 +813,7 @@ There is one more restriction: WebAssembly globals in WX can only contain primit
 If you need global aggregate state, you can instead place the value in memory and store a pointer to it:
 
 ```rs
-global state: GlobalMut where { Value = heap::&mut State } = ...;
+global state: heap::&mut State = ...;
 ```
 
 A pointer is itself a primitive value, so it can be stored in a global normally.
@@ -786,3 +823,16 @@ This restriction also keeps importing and exporting globals simple. If aggregate
 By keeping globals limited to values that WebAssembly itself can represent directly, imports and exports stay predictable and don't require any hidden transformations.
 
 I also quite like the explicit `get()` and `set()` syntax as a side effect of this design. Global state stands out visually from ordinary local computation, and the corresponding effects are equally explicit to the compiler. The exact API may still change, but I think the underlying model is useful.
+
+### On runtime-computed initial values
+
+A global's initializer has to be a genuine constant expression — there is deliberately no way to run arbitrary code to produce a global's *initial* value. This is worth calling out because it wasn't the obvious choice, and getting there took ruling out a couple of designs that looked reasonable at first.
+
+The tempting shape was something like a `#[start]`-attributed function — an ordinary `fn`, no new keyword, whose body runs once at module instantiation and sets whichever globals need runtime-computed values through the same `.set()` call every other mutation already goes through. That's appealing specifically because it needs no special integration with mutability at all: `counter.set(x)` inside such a function type-checks exactly the way `.set()` does anywhere else, so trying to do this to a non-`mut` global fails with the same ordinary error, not a special "lazy init requires mut" rule.
+
+It falls apart on two points, though:
+
+- **Combining more than one of them.** WASM allows exactly one start function per module. Several `#[start]` functions would need a deterministic order to run in, and "declaration order" stops meaning anything once they can live in different files, different modules, or different dependency packages — there's no local, visible rule left for a reader to point at.
+- **It undermines the one thing that would have made it worth having.** The appealing long-term property was checking that a start function is effect-free — but real startup work (e.g. initializing an allocator's bump pointer into `heap`) is inherently `write<heap>`-effectful. The effect model as designed only ever composes effects *upward* through the call graph; it has no notion of an initialization phase whose effects don't count the same way a steady-state effect does. Inventing one just to rescue this feature isn't worth the complexity it would add to a system that isn't even implemented yet.
+
+So for now: constant expressions only. If a global's value genuinely can't be known until runtime, that's a sign it probably belongs in memory behind a pointer instead — consistent with the aggregate restriction above.

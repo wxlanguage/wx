@@ -17,6 +17,7 @@ use crate::{
 	refresh_project_manifest, symbol_hover_text, symbol_kind_to_token_type,
 };
 use tower_lsp_server::LanguageServer as _;
+use wx_compiler::diagnostics::DiagnosticCode;
 use wx_compiler::tir::TypeParamOwner;
 
 /// Exercises `Backend` through its real `LanguageServer` trait methods
@@ -65,7 +66,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 				language_id: "wx".into(),
 				version: 1,
 				text:
-					"use std::*;\nfn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
+					"use std::*;\nfunc add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
 						.into(),
 			},
 		})
@@ -81,7 +82,7 @@ async fn hover_after_did_change_observes_latest_edit_through_backend() {
 				range: None,
 				range_length: None,
 				text:
-					"use std::*;\nfn add(x: i64, y: i64) -> i64 { x + y }\nexport { add }\n"
+					"use std::*;\nfunc add(x: i64, y: i64) -> i64 { x + y }\nexport { add }\n"
 						.into(),
 			}],
 		})
@@ -157,8 +158,8 @@ async fn hover_includes_leading_doc_comment() {
 					"use std::*;\n",
 					"/// Doubles `x`.\n",
 					"/// Second line.\n",
-					"fn double(x: i32) -> i32 { x + x }\n",
-					"fn use_it() -> i32 { double(1) }\n",
+					"func double(x: i32) -> i32 { x + x }\n",
+					"func use_it() -> i32 { double(1) }\n",
 					"export { use_it }\n",
 				)
 				.into(),
@@ -186,7 +187,7 @@ async fn hover_includes_leading_doc_comment() {
 	};
 	assert_eq!(
 		markup.value,
-		"```wx\nfn double(x: i32) -> i32\n```\n\n---\n\nDoubles `x`.\nSecond line.",
+		"```wx\nfunc double(x: i32) -> i32\n```\n\n---\n\nDoubles `x`.\nSecond line.",
 		"call-site hover should include the doc comment below the signature"
 	);
 }
@@ -233,7 +234,7 @@ async fn hover_doc_comment_tolerates_attribute_between_comment_and_item() {
 					"\n",
 					"/// Attached despite the attribute below it.\n",
 					"#[inline]\n",
-					"fn triple(x: i32) -> i32 { x + x + x }\n",
+					"func triple(x: i32) -> i32 { x + x + x }\n",
 					"export { triple }\n",
 				)
 				.into(),
@@ -241,7 +242,7 @@ async fn hover_doc_comment_tolerates_attribute_between_comment_and_item() {
 		})
 		.await;
 
-	// Definition site: `fn triple` on line 5, column 3 (inside "triple").
+	// Definition site: `func triple` on line 5, column 3 (inside "triple").
 	let result = backend
 		.hover(HoverParams {
 			text_document_position_params: TextDocumentPositionParams {
@@ -261,7 +262,7 @@ async fn hover_doc_comment_tolerates_attribute_between_comment_and_item() {
 	};
 	assert_eq!(
 		markup.value,
-		"```wx\nfn triple(x: i32) -> i32\n```\n\n---\n\nAttached despite the attribute below it.",
+		"```wx\nfunc triple(x: i32) -> i32\n```\n\n---\n\nAttached despite the attribute below it.",
 		"doc comment across an #[attribute] line should attach, and the \
 		 blank-line-separated comment above it should not: got {}",
 		markup.value
@@ -309,11 +310,11 @@ async fn hover_over_crate_keyword_does_not_panic() {
 				version: 1,
 				text: concat!(
 					"use std::*;\n",
-					"pub fn helper() -> i32 { 1 }\n",
+					"pub func helper() -> i32 { 1 }\n",
 					"mod a {\n",
-					"    pub fn use_it() -> i32 { crate::helper() }\n",
+					"    pub func use_it() -> i32 { crate::helper() }\n",
 					"}\n",
-					"fn main() -> i32 { a::use_it() }\n",
+					"func main() -> i32 { a::use_it() }\n",
 					"export { main }\n",
 				)
 				.into(),
@@ -378,7 +379,7 @@ async fn semantic_tokens_do_not_highlight_operators_as_functions() {
 		.await;
 
 	let uri: Uri = Uri::from_str("file:///tmp/probe2/main.wx").unwrap();
-	// Line 1: "fn add(a: i32, b: i32) -> i32 { a + b }" — `+` is at column 34.
+	// Line 1: "func add(a: i32, b: i32) -> i32 { a + b }" — `+` is at column 34.
 	backend
 		.did_open(DidOpenTextDocumentParams {
 			text_document: TextDocumentItem {
@@ -386,7 +387,7 @@ async fn semantic_tokens_do_not_highlight_operators_as_functions() {
 				language_id: "wx".into(),
 				version: 1,
 				text:
-					"use std::*;\nfn add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
+					"use std::*;\nfunc add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
 						.into(),
 			},
 		})
@@ -538,7 +539,7 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 	state.open_documents.insert(
 		hashing_main.clone(),
 		open_document(
-			"use std::*;\nfn test() -> i32 { pow::pow(2, 3) }\nexport { test }\n",
+			"use std::*;\nfunc test() -> i32 { pow::pow(2, 3) }\nexport { test }\n",
 		),
 	);
 	state.open_documents.insert(
@@ -548,7 +549,7 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 	state.open_documents.insert(
 		pow_main.clone(),
 		open_document(
-			"use std::*;\npub fn pow(base: i32, exp: i32) -> i32 { base }\n",
+			"use std::*;\npub func pow(base: i32, exp: i32) -> i32 { base }\n",
 		),
 	);
 
@@ -565,7 +566,7 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 	state.open_documents.insert(
 		pow_main.clone(),
 		open_document(
-			"use std::*; pub fn pow(base: i32, exp: i32) -> bool { true }",
+			"use std::*; pub func pow(base: i32, exp: i32) -> bool { true }",
 		),
 	);
 	let mut logs = Vec::new();
@@ -602,12 +603,12 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 	state.open_documents.insert(
 		root.clone(),
 		open_document(
-			"mod math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
+			"mod math;\n\nfunc compute() -> i32 {\n    math::add()\n}\n",
 		),
 	);
 	state.open_documents.insert(
 		child.clone(),
-		open_document("fn add() -> bool {\n    true\n}\n"),
+		open_document("func add() -> bool {\n    true\n}\n"),
 	);
 
 	let broken = analyze_root(&mut state, &root, &root, &mut Vec::new());
@@ -625,7 +626,7 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 
 	state.open_documents.insert(
 		child.clone(),
-		open_document("fn add() -> i32 {\n    1\n}\n"),
+		open_document("func add() -> i32 {\n    1\n}\n"),
 	);
 
 	let fixed = analyze_root(&mut state, &root, &root, &mut Vec::new());
@@ -657,12 +658,12 @@ fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics(
 	state.open_documents.insert(
 		root.clone(),
 		open_document(
-			"mod math;\n\nfn compute() -> i32 {\n    math::add()\n}\n",
+			"mod math;\n\nfunc compute() -> i32 {\n    math::add()\n}\n",
 		),
 	);
 	state.open_documents.insert(
 		child.clone(),
-		open_document("fn add() -> bool {\n    true\n}\n"),
+		open_document("func add() -> bool {\n    true\n}\n"),
 	);
 
 	let broken_publish = compute_refresh(&mut state, &child, &mut Vec::new());
@@ -681,7 +682,7 @@ fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics(
 
 	state.open_documents.insert(
 		child.clone(),
-		open_document("fn add() -> i32 {\n    1\n}\n"),
+		open_document("func add() -> i32 {\n    1\n}\n"),
 	);
 
 	let fixed_publish = compute_refresh(&mut state, &child, &mut Vec::new());
@@ -762,7 +763,7 @@ fn compile_multi_source(
 fn completion_inside_function_includes_params() {
 	let root = PathBuf::from("/test/main.wx");
 	// Cursor is on the blank line inside the function body (after the newline).
-	let source = "fn add(a: i32, b: i32) -> i32 {\n    \n}";
+	let source = "func add(a: i32, b: i32) -> i32 {\n    \n}";
 	// offset 37 lands in the "    " whitespace on the second line, inside the body.
 	let cursor = 37;
 
@@ -771,7 +772,7 @@ fn completion_inside_function_includes_params() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -794,7 +795,7 @@ fn completion_inside_function_includes_params() {
 fn completion_inside_function_includes_locals_declared_before_cursor() {
 	let root = PathBuf::from("/test/main.wx");
 	// "x" is declared before cursor; "y" is declared after.
-	let source = "fn f() -> i32 {\n    local x: i32 = 1;\n    \n    local y: i32 = 2;\n    x\n}";
+	let source = "func f() -> i32 {\n    local x: i32 = 1;\n    \n    local y: i32 = 2;\n    x\n}";
 	// Find the offset of the blank line (after "    local x: i32 = 1;\n    ").
 	let cursor = source.find("\n    local y").unwrap(); // just before "local y"
 
@@ -803,7 +804,7 @@ fn completion_inside_function_includes_locals_declared_before_cursor() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -838,11 +839,11 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 
 		const MAX: i32 = 10;
 
-		fn helper() -> i32 {
+		func helper() -> i32 {
 		    0
 		}
 
-		fn test() {
+		func test() {
 		    local p: i32 = 0;
 		}
 	"};
@@ -855,7 +856,7 @@ fn completion_in_type_annotation_position_excludes_functions_and_consts() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -888,28 +889,29 @@ fn completion_excludes_impl_methods_and_associated_functions() {
 		}
 
 		impl Point {
-		    fn new(x: i32, y: i32) -> Point {
+		    func new(x: i32, y: i32) -> Point {
 		        Point { x: x, y: y }
 		    }
 
-		    pub fn sum(self) -> i32 {
+		    pub func sum(self) -> i32 {
 		        self.x + self.y
 		    }
 		}
 
-		fn test() {
+		func test() {
 
 		}
 	" };
 	// Cursor on the blank line inside `test`'s body.
-	let cursor = source.find("fn test() {\n").unwrap() + "fn test() {\n".len();
+	let cursor =
+		source.find("func test() {\n").unwrap() + "func test() {\n".len();
 
 	let (_, compiled) = compile_source(&root, source);
 	let file_id = file_id_for(&compiled, &root);
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -947,24 +949,25 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 	// completion as if `StdIn` alone were a valid expression.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! { "
-		enum FileDescriptor: u8 {
+		enum FileDescriptor(u8) {
 		    StdIn,
 		    StdOut,
 		    StdErr,
 		}
 
-		fn test() {
+		func test() {
 
 		}
 	" };
-	let cursor = source.find("fn test() {\n").unwrap() + "fn test() {\n".len();
+	let cursor =
+		source.find("func test() {\n").unwrap() + "func test() {\n".len();
 
 	let (_, compiled) = compile_source(&root, source);
 	let file_id = file_id_for(&compiled, &root);
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -986,7 +989,7 @@ fn completion_excludes_enum_variants_from_bare_identifier_position() {
 #[test]
 fn completion_inside_function_shows_globals_too() {
 	let root = PathBuf::from("/test/main.wx");
-	let source = "fn helper() -> i32 { 0 }\nfn main() -> i32 {\n    \n}";
+	let source = "func helper() -> i32 { 0 }\nfunc main() -> i32 {\n    \n}";
 	// Cursor in the blank line inside main's body.
 	let cursor = source.find("\n    \n}").unwrap() + 5;
 
@@ -995,7 +998,7 @@ fn completion_inside_function_shows_globals_too() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1015,8 +1018,7 @@ fn completion_sorts_locals_before_globals() {
 	let root = PathBuf::from("/test/main.wx");
 	// "zeta" (local) would sort after "alpha" (global) alphabetically by
 	// label — locals should still come first via `sort_text`.
-	let source =
-		"fn alpha() -> i32 { 0 }\nfn main() -> i32 {\n    local zeta = 1;\n\n}";
+	let source = "func alpha() -> i32 { 0 }\nfunc main() -> i32 {\n    local zeta = 1;\n\n}";
 	let cursor = source.find("1;\n").unwrap() + "1;\n".len();
 
 	let (_, compiled) = compile_source(&root, source);
@@ -1024,7 +1026,7 @@ fn completion_sorts_locals_before_globals() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1052,7 +1054,7 @@ fn completion_sorts_locals_before_globals() {
 #[test]
 fn completion_prefix_filters_results() {
 	let root = PathBuf::from("/test/main.wx");
-	let source = "fn alpha() -> i32 { 0 }\nfn beta() -> i32 {\n    al\n}";
+	let source = "func alpha() -> i32 { 0 }\nfunc beta() -> i32 {\n    al\n}";
 	// Cursor right after "al" inside beta's body.
 	let cursor = source.find("al\n}").unwrap() + 2;
 
@@ -1061,7 +1063,7 @@ fn completion_prefix_filters_results() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1094,7 +1096,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 	// input: character offset 14 (UTF-16 units before "al") used as a byte
 	// offset lands inside the two-byte encoding of 'в'.
 	let source =
-		"fn alpha() -> i32 { 0 }\nfn beta() -> i32 {\n    // привет al\n}";
+		"func alpha() -> i32 { 0 }\nfunc beta() -> i32 {\n    // привет al\n}";
 	let al_byte_offset = source.rfind("al").unwrap();
 	let position = Position {
 		line: 2,
@@ -1133,7 +1135,7 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 	// after "al" should still see it as a two-character prefix.
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1151,19 +1153,19 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 fn completion_hides_sibling_module_items_without_use() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "mod math;\nfn main() -> i32 {\n    \n}";
+	let source = "mod math;\nfunc main() -> i32 {\n    \n}";
 	let cursor = source.find("\n    \n}").unwrap() + 5;
 
 	let (_, compiled) = compile_multi_source(
 		&root,
 		source,
-		&[(&math, "pub fn add() -> i32 { 1 }")],
+		&[(&math, "pub func add() -> i32 { 1 }")],
 	);
 	let file_id = file_id_for(&compiled, &root);
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1186,19 +1188,19 @@ fn completion_hides_sibling_module_items_without_use() {
 fn completion_shows_sibling_module_items_via_wildcard_use() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "mod math;\nuse math::*;\nfn main() -> i32 {\n    \n}";
+	let source = "mod math;\nuse math::*;\nfunc main() -> i32 {\n    \n}";
 	let cursor = source.find("\n    \n}").unwrap() + 5;
 
 	let (_, compiled) = compile_multi_source(
 		&root,
 		source,
-		&[(&math, "pub fn add() -> i32 { 1 }")],
+		&[(&math, "pub func add() -> i32 { 1 }")],
 	);
 	let file_id = file_id_for(&compiled, &root);
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1217,13 +1219,13 @@ fn completion_shows_sibling_module_items_via_wildcard_use() {
 fn path_completion_after_enum_lists_variants() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
-		enum FileDescriptor: u8 {
+		enum FileDescriptor(u8) {
 		    StdIn,
 		    StdOut,
 		    StdErr,
 		}
 
-		fn test() {
+		func test() {
 		    FileDescriptor::
 		}
 	"};
@@ -1235,7 +1237,7 @@ fn path_completion_after_enum_lists_variants() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1261,16 +1263,16 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 		}
 
 		impl Point {
-		    pub fn origin() -> Self {
+		    pub func origin() -> Self {
 		        Self::{ x: 0 }
 		    }
 
-		    fn private_helper() -> i32 {
+		    func private_helper() -> i32 {
 		        0
 		    }
 		}
 
-		fn test() {
+		func test() {
 		    Point::
 		}
 	"};
@@ -1281,7 +1283,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1292,7 +1294,7 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 
 	assert!(
 		labels.contains(&"origin"),
-		"expected `pub fn origin` after `Point::`; got: {labels:?}"
+		"expected `pub func origin` after `Point::`; got: {labels:?}"
 	);
 	assert!(
 		!labels.contains(&"private_helper"),
@@ -1304,19 +1306,19 @@ fn path_completion_after_struct_lists_only_pub_methods() {
 fn path_completion_after_namespace_lists_module_members() {
 	let root = PathBuf::from("/test/main.wx");
 	let math = PathBuf::from("/test/math.wx");
-	let source = "mod math;\nfn test() {\n    math::\n}";
+	let source = "mod math;\nfunc test() {\n    math::\n}";
 	let cursor = source.find("math::\n").unwrap() + "math::".len();
 
 	let (_, compiled) = compile_multi_source(
 		&root,
 		source,
-		&[(&math, "pub fn add() -> i32 { 1 }")],
+		&[(&math, "pub func add() -> i32 { 1 }")],
 	);
 	let file_id = file_id_for(&compiled, &root);
 
 	let items = completion_items(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		&compiled.symbol_index,
 		file_id,
@@ -1342,16 +1344,16 @@ fn resolve_source_and_offset_prefers_live_buffer_over_stale_compiled_source() {
 	// shared fix both `completion` and `signature_help` now go through —
 	// this exercises it directly against the exact reported scenario.
 	let root = PathBuf::from("/test/main.wx");
-	let stale_source = "fn test() {\n\n}";
+	let stale_source = "func test() {\n\n}";
 	let (mut state, compiled) = compile_source(&root, stale_source);
 	state.cached.insert(root.clone(), compiled);
 
-	let live_source = "mod test {\n    fn foo()\n}\n\nfn test() {\n\n}";
+	let live_source = "mod test {\n    func foo()\n}\n\nfunc test() {\n\n}";
 	state
 		.open_documents
 		.insert(root.clone(), open_document(live_source));
 
-	// Cursor right after "fn foo()" on line 1 — this line doesn't exist at
+	// Cursor right after "func foo()" on line 1 — this line doesn't exist at
 	// all in `stale_source`, which is only 14 bytes long.
 	let position = Position {
 		line: 1,
@@ -1371,7 +1373,7 @@ fn resolve_source_and_offset_prefers_live_buffer_over_stale_compiled_source() {
 	assert!(offset <= source.len());
 
 	let call = find_active_call(source, offset);
-	assert!(call.is_some(), "expected an active call for `fn foo(`");
+	assert!(call.is_some(), "expected an active call for `func foo(`");
 }
 
 #[test]
@@ -1382,7 +1384,7 @@ fn resolve_uri_finds_virtual_stdlib_module() {
 	// string-comparison fallback, or hover/goto-definition/semantic-tokens
 	// silently stop working inside the standard library file.
 	let root = PathBuf::from("/test/main.wx");
-	let (_, compiled) = compile_source(&root, "fn main() {}");
+	let (_, compiled) = compile_source(&root, "func main() {}");
 	let stdlib_file_id = compiled
 		.graph
 		.packages
@@ -1430,7 +1432,7 @@ fn cross_package_namespace_token_gets_a_reference() {
 		),
 		(
 			vfs::AbsolutePath::new("/app/main.wx"),
-			"use std::*;\nfn test() -> i32 { dep::helper() }\nexport { test }\n"
+			"use std::*;\nfunc test() -> i32 { dep::helper() }\nexport { test }\n"
 				.to_string(),
 		),
 		(
@@ -1439,7 +1441,7 @@ fn cross_package_namespace_token_gets_a_reference() {
 		),
 		(
 			vfs::AbsolutePath::new("/dep/main.wx"),
-			"use std::*;\npub fn helper() -> i32 { 42 }\n".to_string(),
+			"use std::*;\npub func helper() -> i32 { 42 }\n".to_string(),
 		),
 	]));
 
@@ -1460,9 +1462,9 @@ fn cross_package_namespace_token_gets_a_reference() {
 		.file_id;
 
 	// "dep" in `dep::helper()`, inside
-	// "use std::*;\nfn test() -> i32 { dep::helper() }\n..." — starts right
-	// after "use std::*;\nfn test() -> i32 { ".
-	let dep_token_start = "use std::*;\nfn test() -> i32 { ".len() as u32;
+	// "use std::*;\nfunc test() -> i32 { dep::helper() }\n..." — starts right
+	// after "use std::*;\nfunc test() -> i32 { ".
+	let dep_token_start = "use std::*;\nfunc test() -> i32 { ".len() as u32;
 	let has_dep_reference = compiled.symbol_index.references.iter().any(|r| {
 		r.source.file_id == app_file_id
 			&& r.source.span.start == dep_token_start
@@ -1485,15 +1487,12 @@ fn full_diagnostic_renders_and_handles_bad_index() {
 	let root = PathBuf::from("/test/main.wx");
 	let (_, compiled) = compile_source(
 		&root,
-		"use std::*;\nfn main() {\n    local x: i32 = 1;\n}\nexport { main }\n",
+		"use std::*;\nfunc main() {\n    local x: i32 = 1;\n}\nexport { main }\n",
 	);
 
 	assert!(
-		compiled
-			.tir
-			.diagnostics
-			.iter()
-			.any(|d| d.code.as_deref() == Some("W1001")),
+		compiled.tir.diagnostics.iter().any(|d| d.code.as_deref()
+			== Some(DiagnosticCode::UnusedVariable.code())),
 		"expected an unused-variable warning to drive this test's diagnostic"
 	);
 
@@ -1536,12 +1535,12 @@ fn unused_enum_variants_get_one_squiggle_each() {
 	let (_, compiled) = compile_source(
 		&root,
 		indoc::indoc! {"
-			enum Direction: i32 {
+			enum Direction(i32) {
 			    Right,
 			    Down,
 			    Left,
 			}
-			fn get_right() -> Direction {
+			func get_right() -> Direction {
 			    Direction::Right
 			}
 			export { get_right }
@@ -1557,9 +1556,10 @@ fn unused_enum_variants_get_one_squiggle_each() {
 	let unused: Vec<_> = diagnostics
 		.iter()
 		.filter(|d| {
-			d.code.as_ref().is_some_and(
-				|code| matches!(code, NumberOrString::String(s) if s == "W1009"),
-			)
+			d.code.as_ref().is_some_and(|code| {
+				matches!(code, NumberOrString::String(s)
+					if s == DiagnosticCode::UnusedEnumVariant.code())
+			})
 		})
 		.collect();
 
@@ -1582,11 +1582,11 @@ fn enum_type_used_as_return_type_resolves_to_its_definition() {
 	// hover/go-to-definition on it silently failed.
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
-		enum Status: u8 {
+		enum Status(u8) {
 		    Ok = 200,
 		}
 
-		fn test() -> Status {
+		func test() -> Status {
 		    Status::Ok
 		}
 	"};
@@ -1635,7 +1635,7 @@ fn type_alias_used_as_return_type_resolves_to_its_definition() {
 
 		type Id = u32;
 
-		fn test() -> Id {
+		func test() -> Id {
 		    0 as Id
 		}
 	"};
@@ -1677,13 +1677,126 @@ fn type_alias_used_as_return_type_resolves_to_its_definition() {
 
 	let hover = symbol_hover_text(
 		&compiled.tir,
-		&compiled.graph.interner,
+		&compiled.graph.strings,
 		&compiled.graph.packages,
 		compiled.graph.root_package,
 		&found.kind,
 	)
 	.expect("expected hover text for the type alias");
 	assert_eq!(hover, "type Id = u32");
+}
+
+#[test]
+fn trait_impl_type_params_have_hover_definitions_and_isolated_references() {
+	use wx_compiler::diagnostics::Diagnostics as _;
+
+	let root = PathBuf::from("/test/main.wx");
+	for implementation in [
+		"trait Marker {}\nimpl<Mem: Memory, T> Marker for RawPtr<Mem, T> {}",
+		indoc::indoc! {"
+			trait Identity { func identity(value: Self) -> Self; }
+			impl<Mem: Memory, T> Identity for RawPtr<Mem, T> {
+			    func identity(value: RawPtr<Mem, T>) -> RawPtr<Mem, T> { value }
+			}
+		"},
+	] {
+		let source = format!(
+			"struct RawPtr<Mem: Memory, T> {{ addr: Mem::Size, }}\n{implementation}"
+		);
+		let (_, compiled) = compile_source(&root, &source);
+		assert!(
+			!compiled.tir.diagnostics.has_errors(),
+			"unexpected diagnostics: {:?}",
+			compiled.tir.diagnostics
+		);
+		let file_id = file_id_for(&compiled, &root);
+		let index = &compiled.symbol_index;
+		let impl_start = source.find("impl<").unwrap();
+
+		for (param_index, name, hover, argument_offset) in
+			[(0, "Mem", "Mem: Memory", 0), (1, "T", "T", "Mem, ".len())]
+		{
+			let declaration = if param_index == 0 {
+				impl_start + "impl<".len()
+			} else {
+				impl_start + source[impl_start..].find(", T>").unwrap() + 2
+			};
+			let found = index
+				.find_at_position(file_id, declaration as u32)
+				.expect("impl parameter declaration should be indexed");
+			assert!(matches!(
+				found.kind,
+				SymbolKind::TypeParam {
+					owner: TypeParamOwner::TraitImpl(_),
+					param_index: actual,
+				} if actual == param_index
+			));
+			let expected_references: Vec<_> = source
+				.match_indices("RawPtr<Mem, T>")
+				.map(|(start, _)| {
+					(start + "RawPtr<".len() + argument_offset) as u32
+				})
+				.collect();
+			for position in std::iter::once(declaration as u32)
+				.chain(expected_references.iter().copied())
+			{
+				let symbol = index.find_at_position(file_id, position).unwrap();
+				assert_eq!(symbol.kind, found.kind);
+				assert_eq!(
+					index
+						.definition_for_kind(symbol.kind)
+						.unwrap()
+						.source
+						.span
+						.start,
+					declaration as u32
+				);
+				assert_eq!(
+					symbol_hover_text(
+						&compiled.tir,
+						&compiled.graph.strings,
+						&compiled.graph.packages,
+						compiled.graph.root_package,
+						&symbol.kind,
+					)
+					.as_deref(),
+					Some(hover)
+				);
+				assert!(matches!(
+					symbol_kind_to_token_type(symbol.kind),
+					Some(TokenType::TypeParameter)
+				));
+			}
+
+			let search_kinds =
+				reference_search_kinds(&compiled.tir, index, found.kind);
+			let references: Vec<_> = index
+				.references
+				.iter()
+				.filter(|entry| search_kinds.contains(&entry.kind))
+				.map(|entry| entry.source.span.start)
+				.collect();
+			assert_eq!(references, expected_references);
+
+			// Rename uses exact-kind matching across references and definitions.
+			// It must leave the struct's identically named parameters alone.
+			let mut rename_positions: Vec<_> = index
+				.references
+				.iter()
+				.chain(index.definitions.iter())
+				.filter(|entry| entry.kind == found.kind)
+				.map(|entry| {
+					assert_eq!(entry.source.file_id, file_id);
+					assert_eq!(entry.source.span.extract_str(&source), name);
+					entry.source.span.start
+				})
+				.collect();
+			rename_positions.sort_unstable();
+			let mut expected_rename = vec![declaration as u32];
+			expected_rename.extend(expected_references);
+			assert_eq!(rename_positions, expected_rename);
+		}
+	}
 }
 
 #[test]
@@ -1696,7 +1809,7 @@ fn self_type_in_trait_method_resolves_to_trait_definition() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
 		trait Cloneable {
-		    fn duplicate(self) -> Self;
+		    func duplicate(self) -> Self;
 		}
 	"};
 	let (_, compiled) = compile_source(&root, source);
@@ -1752,7 +1865,7 @@ fn trait_own_name_resolves_to_trait_not_self_type_param() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
 		trait Cloneable {
-		    fn duplicate(self) -> Self;
+		    func duplicate(self) -> Self;
 		}
 	"};
 	let (_, compiled) = compile_source(&root, source);
@@ -1801,7 +1914,7 @@ fn self_type_in_impl_block_resolves_to_struct_definition() {
 		}
 
 		impl Point {
-		    pub fn origin() -> Self {
+		    pub func origin() -> Self {
 		        Self::{ x: 0, y: 0 }
 		    }
 		}
@@ -1866,7 +1979,7 @@ fn self_receiver_param_resolves_to_self_param_not_plain_param() {
 		}
 
 		impl Point {
-		    pub fn x_value(self) -> i32 {
+		    pub func x_value(self) -> i32 {
 		        self.x
 		    }
 		}
@@ -1924,7 +2037,7 @@ fn impl_header_target_resolves_to_struct_not_self() {
 		}
 
 		impl Point {
-		    pub fn origin() -> Self {
+		    pub func origin() -> Self {
 		        Self::{ x: 0 }
 		    }
 		}
@@ -1973,7 +2086,7 @@ fn reference_search_kinds_merges_self_usages_targeting_the_struct() {
 		}
 
 		impl Point {
-		    pub fn origin() -> Self {
+		    pub func origin() -> Self {
 		        Self::{ x: 0 }
 		    }
 		}
@@ -2041,7 +2154,7 @@ fn implementation_locations_finds_inherent_and_trait_impls_of_a_struct() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
 		trait Drawable {
-		    fn draw(&self) -> i32;
+		    func draw(&self) -> i32;
 		}
 
 		struct Point {
@@ -2049,13 +2162,13 @@ fn implementation_locations_finds_inherent_and_trait_impls_of_a_struct() {
 		}
 
 		impl Point {
-		    pub fn origin() -> Self {
+		    pub func origin() -> Self {
 		        Self::{ x: 0 }
 		    }
 		}
 
 		impl Drawable for Point {
-		    fn draw(&self) -> i32 {
+		    func draw(&self) -> i32 {
 		        self.x
 		    }
 		}
@@ -2105,7 +2218,7 @@ fn implementation_locations_finds_impls_of_a_trait() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
 		trait Drawable {
-		    fn draw(&self) -> i32;
+		    func draw(&self) -> i32;
 		}
 
 		struct Point {
@@ -2113,7 +2226,7 @@ fn implementation_locations_finds_impls_of_a_trait() {
 		}
 
 		impl Drawable for Point {
-		    fn draw(&self) -> i32 {
+		    func draw(&self) -> i32 {
 		        self.x
 		    }
 		}
@@ -2164,7 +2277,7 @@ fn self_assoc_type_in_inherent_impl_resolves_to_trait_assoc_type() {
 		    type Elem = u32;
 		}
 		impl Heap {
-		    fn zero() -> Self::Elem {
+		    func zero() -> Self::Elem {
 		        0
 		    }
 		}
@@ -2198,6 +2311,15 @@ fn self_assoc_type_in_inherent_impl_resolves_to_trait_assoc_type() {
 		"Elem",
 		"go-to-definition for `Self::Elem` should land on the trait's `type Elem` declaration"
 	);
+	let hover = symbol_hover_text(
+		&compiled.tir,
+		&compiled.graph.strings,
+		&compiled.graph.packages,
+		compiled.graph.root_package,
+		&found.kind,
+	)
+	.expect("associated-type hover reads its arena-owned bounds");
+	assert_eq!(hover, "type Elem: Bound");
 }
 
 #[test]
@@ -2214,7 +2336,7 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 
 		#[memory_limits(min_pages = 1)]
 		memory heap: Memory where { Size = u32 };
-		fn heap_size() -> u32 {
+		func heap_size() -> u32 {
 		    heap.size_pages()
 		}
 
@@ -2319,7 +2441,7 @@ fn memory_associated_const_namespace_access_resolves() {
 		.name
 		.inner;
 	assert_eq!(
-		compiled.graph.interner.resolve(const_name),
+		compiled.graph.strings.resolve(const_name),
 		Some("DATA_END"),
 		"expected the resolved const to be named `DATA_END`"
 	);
@@ -2330,12 +2452,30 @@ fn memory_associated_const_namespace_access_resolves() {
 			.span,
 		"go-to-definition should land on the `Memory` trait's `const DATA_END` declaration"
 	);
+	let memory_trait = compiled
+		.tir
+		.items
+		.traits
+		.iter()
+		.find(|trait_def| {
+			compiled.graph.strings.resolve(trait_def.name.inner)
+				== Some("Memory")
+		})
+		.expect("stdlib Memory trait");
+	let wx_compiler::tir::TraitMemberKind::Constant(template_index) =
+		memory_trait.bindings[&const_name]
+	else {
+		panic!("Memory::DATA_END must be a constant");
+	};
+	let template = &compiled.tir.items.constants[usize::from(template_index)];
+	assert_eq!(definition.source.file_id, template.file_id);
+	assert_eq!(definition.source.span, template.name.span);
 }
 
 #[test]
 fn find_enclosing_function_returns_correct_function() {
 	let root = PathBuf::from("/test/main.wx");
-	let source = "fn first() -> i32 { 1 }\nfn second() -> i32 { 2 }";
+	let source = "func first() -> i32 { 1 }\nfunc second() -> i32 { 2 }";
 
 	let (_, compiled) = compile_source(&root, source);
 	let file_id = file_id_for(&compiled, &root);
@@ -2367,9 +2507,10 @@ fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
 	let outer = PathBuf::from("/watch-test");
 	let inner = outer.join("nested");
 	let file = inner.join("main.wx");
-	state
-		.open_documents
-		.insert(file.clone(), open_document("fn main() {} export { main }"));
+	state.open_documents.insert(
+		file.clone(),
+		open_document("func main() {} export { main }"),
+	);
 	state.open_documents.insert(
 		outer.join("wx.json"),
 		open_document(r#"{"type":"bin","entry":"nested/main.wx"}"#),
@@ -2428,7 +2569,7 @@ async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
 		.insert(manifest_path.clone(), open_document(&manifest(2)));
 	state.open_documents.insert(
 		source_path.clone(),
-		open_document("fn main() { local x = true; } export { main }"),
+		open_document("func main() { local x = true; } export { main }"),
 	);
 	state.open_documents.insert(
 		dep_path.clone(),
@@ -2436,7 +2577,7 @@ async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
 	);
 	state.open_documents.insert(
 		root.join("dep/main.wx"),
-		open_document("pub fn helper() {}"),
+		open_document("pub func helper() {}"),
 	);
 
 	async fn format(
@@ -2572,9 +2713,10 @@ async fn watched_file_events_skip_documents_the_editor_already_owns() {
 		root.join("wx.json"),
 		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
 	);
-	state
-		.open_documents
-		.insert(file.clone(), open_document("fn main() {} export { main }"));
+	state.open_documents.insert(
+		file.clone(),
+		open_document("func main() {} export { main }"),
+	);
 	compute_refresh(&mut state, &file, &mut Vec::new());
 	assert!(state.cached.contains_key(&root));
 
@@ -2656,7 +2798,7 @@ fn a_repeated_refresh_publishes_each_file_once() {
 	);
 	state.open_documents.insert(
 		main.clone(),
-		open_document("fn main() -> i32 { true }\nexport { main }"),
+		open_document("func main() -> i32 { true }\nexport { main }"),
 	);
 
 	// The first refresh establishes `published_files`; the second is the one

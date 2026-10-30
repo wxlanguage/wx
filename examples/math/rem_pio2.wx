@@ -39,7 +39,7 @@ const PIO2_3T: f64 = 8.47842766036889956997e-32;
 // The general reduction for `|x| < 2^20*(pi/2)`: compute `n = rint(x/(pi/2))` and subtract
 // `n*(pi/2)` in as many pieces of pi/2 as the cancellation demands. One round is good to 85
 // bits, two to 118, three to 151 — enough for every argument in range.
-fn medium(x: f64, ix: u64) -> (i32, f64, f64) {
+func medium(x: f64, ix: u64) -> (i32, f64, f64) {
     // Specialised rint(): adding then subtracting 1.5/EPSILON forces rounding to an integer
     // without a round-trip through an integer type. Assumes round-to-nearest, which is the
     // only mode wasm has.
@@ -54,8 +54,8 @@ fn medium(x: f64, ix: u64) -> (i32, f64, f64) {
 
     // Compare `x`'s exponent against the remainder's: a large drop means the subtraction
     // cancelled away most of the significand, and the next piece of pi/2 is needed.
-    local ex = (ix >> 20) as i64;
-    local ey = ((y0.to_bits() >> 52) & 0x7ff) as i64;
+    local ex = transmute::<_, i64>(ix >> 20);
+    local ey = transmute::<_, i64>((y0.to_bits() >> 52) & 0x7ff);
 
     if ex - ey > 16 {
         // 2nd round, good to 118 bits.
@@ -65,7 +65,7 @@ fn medium(x: f64, ix: u64) -> (i32, f64, f64) {
         w = f_n * PIO2_2T - ((t - r) - w);
         y0 = r - w;
 
-        local ey = ((y0.to_bits() >> 52) & 0x7ff) as i64;
+        local ey = transmute::<_, i64>((y0.to_bits() >> 52) & 0x7ff);
         if ex - ey > 49 {
             // 3rd round, good to 151 bits — covers all cases.
             local t = r;
@@ -79,7 +79,7 @@ fn medium(x: f64, ix: u64) -> (i32, f64, f64) {
     (n, y0, (r - y0) - w)
 }
 
-pub fn rem_pio2(x: f64) -> (i32, f64, f64) {
+pub func rem_pio2(x: f64) -> (i32, f64, f64) {
     // The top 32 bits of `x`: sign, exponent, and the high 20 bits of the significand. Kept as
     // a `u64` rather than narrowed to `u32` — every test below is against a literal, so the
     // extra width costs nothing and saves a `i32_wrap_i64` at each use.

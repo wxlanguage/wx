@@ -25,8 +25,8 @@ const STD: &str = indoc! {"
     trait Memory {
         type Size: PointerSize;
         const INDEX: u32;
-        fn grow(self, delta: Self::Size) -> Self::Size;
-        fn size(self) -> Self::Size;
+        func grow(self, delta: Self::Size) -> Self::Size;
+        func size(self) -> Self::Size;
     }
 "};
 
@@ -113,7 +113,7 @@ impl TestCase {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// `fn add(a: i32, b: i32) -> i32 { a + b }` should produce:
+/// `func add(a: i32, b: i32) -> i32 { a + b }` should produce:
 ///   - 2 Param nodes (indices 0 and 1)
 ///   - 1 Add node referencing them
 ///   - root block has 1 statement (Return)
@@ -124,26 +124,22 @@ impl TestCase {
 fn test_simple_add() {
 	let case = TestCase::new(indoc! {"
         #[tag = \"target\"]
-        fn add(a: i32, b: i32) -> i32 { a + b }
+        func add(a: i32, b: i32) -> i32 { a + b }
         export { add }
     "});
 	let func = case.get_tagged_func("target");
 	let opt = Builder::build(&case.mir, func);
 
-	// 4 data nodes: Param(0), Param(1), a dead Int(0), Add. The dead Int(0)
-	// is `i32::add`'s inlined `self`/`rhs` locals living in `add`'s own root
-	// scope (see `mir::inlining::inline_call`) — `build_function` seeds
-	// every root-scope local past the function's own declared parameters
-	// with a default value before the function body's own `LocalSet`s (here,
-	// forwarding `a`/`b` into those locals) get a chance to run, so one
-	// throwaway default node is unavoidable per inlined call whose site is
-	// the function root. Harmless: nothing uses it, and the same node gets
-	// reused (via `Builder::node`'s CSE) for any other `0`-valued i32 this
-	// function happens to need elsewhere.
+	// 3 data nodes: Param(0), Param(1), Add. `i32::add`'s inlined `self`/
+	// `rhs` locals (see `mir::inlining::inline_call`) never get a node of
+	// their own at all here — bindings start `None` ("not yet declared on
+	// this build path") until each local's own `LocalSet` actually runs, so
+	// `a`/`b` land straight in the inlined `self`/`rhs` slots with no
+	// throwaway default in between.
 	assert_eq!(
 		opt.data_nodes.len(),
-		4,
-		"expected Param(0), Param(1), a dead Int(0), Add — got {:#?}",
+		3,
+		"expected Param(0), Param(1), Add — got {:#?}",
 		opt.data_nodes.iter().map(|n| &n.kind).collect::<Vec<_>>()
 	);
 
@@ -162,7 +158,7 @@ fn test_simple_add() {
 		}
 	));
 	assert!(matches!(
-		opt.data_nodes[3].kind,
+		opt.data_nodes[2].kind,
 		DataNodeKind::Add {
 			left: 0,
 			right: 1,
@@ -174,12 +170,12 @@ fn test_simple_add() {
 	// a use-edge). Params are used by the Add.
 	assert_eq!(
 		opt.data_nodes[0].uses,
-		vec![3],
+		vec![2],
 		"Param(0) should be used by Add"
 	);
 	assert_eq!(
 		opt.data_nodes[1].uses,
-		vec![3],
+		vec![2],
 		"Param(1) should be used by Add"
 	);
 
@@ -189,17 +185,17 @@ fn test_simple_add() {
 	assert!(matches!(
 		root.statements[0],
 		crate::opt::ControlNode::Return {
-			value: StackResult::Value(3)
+			value: StackResult::Value(2)
 		}
 	));
 }
 
-/// `fn const_add() -> i32 { 3 + 4 }` — constant folding should eliminate the
+/// `func const_add() -> i32 { 3 + 4 }` — constant folding should eliminate the
 /// Add node and produce a single `Int { value: 7 }` node.
 #[test]
 fn test_constant_folding() {
 	let case = TestCase::new(indoc! {"
-        fn const_add() -> i32 { 3 + 4 }
+        func const_add() -> i32 { 3 + 4 }
         export { const_add }
     "});
 	let func = case.get_first_func();
@@ -238,7 +234,7 @@ fn test_constant_folding() {
 #[test]
 fn test_constant_folding_nested() {
 	let case = TestCase::new(indoc! {"
-        fn nested() -> i32 { (2 + 3) * (1 + 4) }
+        func nested() -> i32 { (2 + 3) * (1 + 4) }
         export { nested }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -255,7 +251,7 @@ fn test_constant_folding_nested() {
 	assert!(result_node.is_some(), "expected Int{{25}}");
 }
 
-/// `fn cse(x: i32) -> i32 { local a: i32 = x + 1; local b: i32 = x + 1; a + b
+/// `func cse(x: i32) -> i32 { local a: i32 = x + 1; local b: i32 = x + 1; a + b
 /// }`
 ///
 /// `x + 1` should be computed once (CSE deduplication). There should be exactly
@@ -263,7 +259,7 @@ fn test_constant_folding_nested() {
 #[test]
 fn test_cse_deduplication() {
 	let case = TestCase::new(indoc! {"
-        fn cse(x: i32) -> i32 {
+        func cse(x: i32) -> i32 {
             local a: i32 = x + 1;
             local b: i32 = x + 1;
             a + b
@@ -295,13 +291,13 @@ fn test_cse_deduplication() {
 	);
 }
 
-/// `fn max(a: i32, b: i32) -> i32 { if a > b { a } else { b } }`
+/// `func max(a: i32, b: i32) -> i32 { if a > b { a } else { b } }`
 ///
 /// The if-else should introduce exactly one Phi node merging the two params.
 #[test]
 fn test_if_else_phi() {
 	let case = TestCase::new(indoc! {"
-        fn max(a: i32, b: i32) -> i32 {
+        func max(a: i32, b: i32) -> i32 {
             if a > b { a } else { b }
         }
         export { max }
@@ -344,13 +340,13 @@ fn test_if_else_phi() {
 	);
 }
 
-/// `fn one_sided(x: i32) -> i32 { if x > 0 { x + 1 } else { x } }` — when only
+/// `func one_sided(x: i32) -> i32 { if x > 0 { x + 1 } else { x } }` — when only
 /// the then-branch modifies a binding, the phi should still be created
 /// correctly.
 #[test]
 fn test_if_no_else_phi() {
 	let case = TestCase::new(indoc! {"
-        fn one_sided(x: i32) -> i32 {
+        func one_sided(x: i32) -> i32 {
             if x > 0 { x + 1 } else { x }
         }
         export { one_sided }
@@ -365,7 +361,7 @@ fn test_if_no_else_phi() {
 	assert!(phi.is_some(), "expected a Phi node for the if-else result");
 }
 
-/// `fn loop_count() -> i32 { local mut i: i32 = 0; loop { if i >= 10 { break i
+/// `func loop_count() -> i32 { local mut i: i32 = 0; loop { if i >= 10 { break i
 /// } i = i + 1; } }`
 ///
 /// The loop should produce a LoopParam node for `i` that has `before = Int{0}`
@@ -373,7 +369,7 @@ fn test_if_no_else_phi() {
 #[test]
 fn test_loop_param() {
 	let case = TestCase::new(indoc! {"
-        fn loop_count() -> i32 {
+        func loop_count() -> i32 {
             local mut i: i32 = 0;
             loop {
                 if i >= 10 { break i }
@@ -429,7 +425,7 @@ fn test_loop_param() {
 fn test_aggregate_field_fold() {
 	let case = TestCase::new(indoc! {"
         struct Point { x: i32, y: i32 }
-        fn get_x(px: i32, py: i32) -> i32 {
+        func get_x(px: i32, py: i32) -> i32 {
             local p: Point = Point::{ x: px, y: py };
             p.x
         }
@@ -468,12 +464,12 @@ fn test_aggregate_field_fold() {
 }
 
 /// Dead nodes (zero uses, not a return value) should not pollute the graph.
-/// `fn dead(x: i32) -> i32 { local _unused: i32 = x * 2; x }` — `x * 2` has
+/// `func dead(x: i32) -> i32 { local _unused: i32 = x * 2; x }` — `x * 2` has
 /// zero uses so the Mul node should have an empty use list.
 #[test]
 fn test_dead_node_has_zero_uses() {
 	let case = TestCase::new(indoc! {"
-        fn dead(x: i32) -> i32 {
+        func dead(x: i32) -> i32 {
             local _unused: i32 = x * 3;
             x
         }
@@ -496,13 +492,13 @@ fn test_dead_node_has_zero_uses() {
 // ── Scheduler tests
 // ───────────────────────────────────────────────────────────
 
-/// `fn add(a: i32, b: i32) -> i32 { a + b }` — both params are inlined (never
+/// `func add(a: i32, b: i32) -> i32 { a + b }` — both params are inlined (never
 /// spilled), the Add has a single use, so it is also inlined. Expected: 4
 /// instructions.
 #[test]
 fn test_sched_simple_add() {
 	let case = TestCase::new(indoc! {"
-        fn add(a: i32, b: i32) -> i32 { a + b }
+        func add(a: i32, b: i32) -> i32 { a + b }
         export { add }
     "});
 	let body = case.schedule();
@@ -518,12 +514,12 @@ fn test_sched_simple_add() {
 	assert!(matches!(body[2], Instruction::I32Add));
 }
 
-/// `fn const_add() -> i32 { 3 + 4 }` — constant folded to `Int{7}`, inlined.
+/// `func const_add() -> i32 { 3 + 4 }` — constant folded to `Int{7}`, inlined.
 /// Expected: 2 instructions.
 #[test]
 fn test_sched_constant_folding() {
 	let case = TestCase::new(indoc! {"
-        fn const_add() -> i32 { 3 + 4 }
+        func const_add() -> i32 { 3 + 4 }
         export { const_add }
     "});
 	let body = case.schedule();
@@ -532,14 +528,14 @@ fn test_sched_constant_folding() {
 	assert!(matches!(body[0], Instruction::I32Const(7)));
 }
 
-/// `fn cse(x: i32) -> i32 { local a: i32 = x + 1; local b: i32 = x + 1; a + b
+/// `func cse(x: i32) -> i32 { local a: i32 = x + 1; local b: i32 = x + 1; a + b
 /// }` — `x + 1` has 2 uses so it is spilled to a WASM local (index 1, after the
 /// single param). Expected: LocalGet(0), I32Const(1), I32Add, LocalSet(1),
 /// LocalGet(1), LocalGet(1), I32Add, Return.
 #[test]
 fn test_sched_cse_spill() {
 	let case = TestCase::new(indoc! {"
-        fn cse(x: i32) -> i32 {
+        func cse(x: i32) -> i32 {
             local a: i32 = x + 1;
             local b: i32 = x + 1;
             a + b
@@ -564,7 +560,7 @@ fn test_sched_cse_spill() {
 	assert!(matches!(body[5], Instruction::I32Add));
 }
 
-/// `fn max(a: i32, b: i32) -> i32 { if a > b { a } else { b } }` — the if-else
+/// `func max(a: i32, b: i32) -> i32 { if a > b { a } else { b } }` — the if-else
 /// uses a phi-through-local pattern:
 ///   - condition inline (3 instrs)
 ///   - `if` with Empty block type
@@ -576,7 +572,7 @@ fn test_sched_cse_spill() {
 #[test]
 fn test_sched_if_else() {
 	let case = TestCase::new(indoc! {"
-        fn max(a: i32, b: i32) -> i32 {
+        func max(a: i32, b: i32) -> i32 {
             if a > b { a } else { b }
         }
         export { max }
@@ -645,7 +641,7 @@ fn test_sched_if_else() {
 	);
 }
 
-/// `fn loop_count() -> i32 { local mut i: i32 = 0; loop { if i >= 10 { break i
+/// `func loop_count() -> i32 { local mut i: i32 = 0; loop { if i >= 10 { break i
 /// } i = i + 1; } }`
 ///
 /// Structural check: Block, Loop, ... Br(0), End, End, Return.
@@ -654,7 +650,7 @@ fn test_sched_if_else() {
 #[test]
 fn test_sched_loop() {
 	let case = TestCase::new(indoc! {"
-        fn loop_count() -> i32 {
+        func loop_count() -> i32 {
             local mut i: i32 = 0;
             loop {
                 if i >= 10 { break i }
@@ -718,12 +714,12 @@ fn test_sched_loop() {
 // ── Edge case tests
 // ───────────────────────────────────────────────────────────
 
-/// `fn same(x: i32) -> i32 { if x > 0 { x } else { x } }` — both branches
+/// `func same(x: i32) -> i32 { if x > 0 { x } else { x } }` — both branches
 /// return the same node, so `Phi(x, x)` folds to `x`. No phi node should exist.
 #[test]
 fn test_phi_identity_fold() {
 	let case = TestCase::new(indoc! {"
-        fn same(x: i32) -> i32 { if x > 0 { x } else { x } }
+        func same(x: i32) -> i32 { if x > 0 { x } else { x } }
         export { same }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -740,7 +736,7 @@ fn test_phi_identity_fold() {
 	);
 }
 
-/// `fn f(a: i32, b: i32, c: i32) -> i32 { if a > 0 { if b > 0 { a } else { b }
+/// `func f(a: i32, b: i32, c: i32) -> i32 { if a > 0 { if b > 0 { a } else { b }
 /// } else { c } }`
 ///
 /// The inner if-else creates `Phi(a, b)`. The outer if-else creates
@@ -748,7 +744,7 @@ fn test_phi_identity_fold() {
 #[test]
 fn test_nested_if_else_phi_chain() {
 	let case = TestCase::new(indoc! {"
-        fn f(a: i32, b: i32, c: i32) -> i32 {
+        func f(a: i32, b: i32, c: i32) -> i32 {
             if a > 0 {
                 if b > 0 { a } else { b }
             } else {
@@ -800,7 +796,7 @@ fn test_nested_if_else_phi_chain() {
 #[test]
 fn test_loop_immutable_binding() {
 	let case = TestCase::new(indoc! {"
-        fn f(limit: i32) -> i32 {
+        func f(limit: i32) -> i32 {
             local mut i: i32 = 0;
             loop {
                 if i >= limit { break i }
@@ -856,7 +852,7 @@ fn test_loop_immutable_binding() {
 #[test]
 fn test_loop_two_mutated_bindings() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local mut i: i32 = 0;
             local mut sum: i32 = 0;
             loop {
@@ -899,7 +895,7 @@ fn test_loop_two_mutated_bindings() {
 #[test]
 fn test_no_fold_div_by_zero() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 { 1 / 0 }
+        func f() -> i32 { 1 / 0 }
         export { f }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -920,7 +916,7 @@ fn test_no_fold_div_by_zero() {
 #[test]
 fn test_constant_fold_bitwise() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 { 5 ^ 3 }
+        func f() -> i32 { 5 ^ 3 }
         export { f }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -953,7 +949,7 @@ fn test_constant_fold_bitwise() {
 #[test]
 fn test_explicit_mid_return() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             if x > 0 { return x } else { 0 }
         }
         export { f }
@@ -981,7 +977,7 @@ fn test_explicit_mid_return() {
 fn test_aggregate_phi_decomposition() {
 	let case = TestCase::new(indoc! {"
         struct Pair { x: i32, y: i32 }
-        fn f(a: i32, b: i32, cond: i32) -> i32 {
+        func f(a: i32, b: i32, cond: i32) -> i32 {
             local mut p: Pair = Pair::{ x: a, y: b };
             if cond > 0 { p = Pair::{ x: b, y: a } } else { p = Pair::{ x: a, y: b } }
             p.x
@@ -1025,7 +1021,7 @@ fn test_struct_pointer_load_expands_to_per_field_loads() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn load_point(ptr: heap::&Point) -> Point { ptr.* }
+        func load_point(ptr: heap::&Point) -> Point { ptr.* }
         export { load_point, heap }
     "}
 	);
@@ -1079,7 +1075,7 @@ fn test_struct_pointer_load_field_access_folds() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn get_x(ptr: heap::&Point) -> i32 {
+        func get_x(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.x
         }
@@ -1131,7 +1127,7 @@ fn test_struct_pointer_store_expands_to_per_field_stores() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn store_point(ptr: heap::*Point, x: i32, y: i32) {
+        func store_point(ptr: heap::*Point, x: i32, y: i32) {
             ptr.* = Point::{ x: x, y: y }
         }
         export { store_point, heap }
@@ -1162,7 +1158,7 @@ fn test_struct_pointer_store_expands_to_per_field_stores() {
 #[test]
 fn test_sched_phi_identity_no_local_set() {
 	let case = TestCase::new(indoc! {"
-        fn same(x: i32) -> i32 { if x > 0 { x } else { x } }
+        func same(x: i32) -> i32 { if x > 0 { x } else { x } }
         export { same }
     "});
 	let body = case.schedule();
@@ -1208,7 +1204,7 @@ fn test_sched_phi_identity_no_local_set() {
 #[test]
 fn test_sched_loop_two_vars_writebacks() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 {
+        func f() -> i32 {
             local mut i: i32 = 0;
             local mut sum: i32 = 0;
             loop {
@@ -1248,7 +1244,7 @@ fn test_sched_loop_two_vars_writebacks() {
 	);
 }
 
-/// `fn no_else(x: i32) -> i32 { local mut y: i32 = 0; if x > 0 { y = x + 1 }
+/// `func no_else(x: i32) -> i32 { local mut y: i32 = 0; if x > 0 { y = x + 1 }
 /// else { y = 0 }; y }`
 ///
 /// Because the then-branch and else-branch produce different values for `y`
@@ -1257,7 +1253,7 @@ fn test_sched_loop_two_vars_writebacks() {
 #[test]
 fn test_sched_if_else_phi_stores() {
 	let case = TestCase::new(indoc! {"
-        fn no_else(x: i32) -> i32 {
+        func no_else(x: i32) -> i32 {
             local mut y: i32 = 0;
             if x > 0 { y = x + 1 } else { y = 0 }
             y
@@ -1324,7 +1320,7 @@ fn test_sched_struct_pointer_store() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn store_point(ptr: heap::*Point, x: i32, y: i32) {
+        func store_point(ptr: heap::*Point, x: i32, y: i32) {
             ptr.* = Point::{ x: x, y: y }
         }
         export { store_point, heap }
@@ -1366,7 +1362,7 @@ fn test_sched_struct_pointer_load_field_access() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn get_x(ptr: heap::&Point) -> i32 {
+        func get_x(ptr: heap::&Point) -> i32 {
             local p: Point = ptr.*;
             p.x
         }
@@ -1407,7 +1403,7 @@ fn test_sched_struct_pointer_load_full_aggregate_keeps_all_loads() {
 		indoc! {"
         memory heap: Memory where { Size = u32 };
         struct Point { x: i32, y: i32 }
-        fn load_point(ptr: heap::&Point) -> Point { ptr.* }
+        func load_point(ptr: heap::&Point) -> Point { ptr.* }
         export { load_point, heap }
     "}
 	);
@@ -1430,7 +1426,7 @@ fn test_sched_struct_pointer_load_full_aggregate_keeps_all_loads() {
 
 /// Snapshot the full scheduled instruction sequence for the CSE example.
 ///
-/// `fn cse(x: i32) -> i32 { local a: i32 = x + 1; local b: i32 = x + 1; a + b
+/// `func cse(x: i32) -> i32 { local a: i32 = x + 1; local b: i32 = x + 1; a + b
 /// }`
 ///
 /// Expected shape: compute `x+1`, spill it to local 1, read it twice, add,
@@ -1439,7 +1435,7 @@ fn test_sched_struct_pointer_load_full_aggregate_keeps_all_loads() {
 #[test]
 fn test_snapshot_sched_cse() {
 	let case = TestCase::new(indoc! {"
-        fn cse(x: i32) -> i32 {
+        func cse(x: i32) -> i32 {
             local a: i32 = x + 1;
             local b: i32 = x + 1;
             a + b
@@ -1458,8 +1454,8 @@ fn test_snapshot_sched_cse() {
 #[test]
 fn test_call_creates_callresult_node() {
 	let case = TestCase::new(indoc! {"
-        fn caller(x: i32) -> i32 { callee(x) }
-        fn callee(x: i32) -> i32 { x + 1 }
+        func caller(x: i32) -> i32 { callee(x) }
+        func callee(x: i32) -> i32 { x + 1 }
         export { caller }
     "});
 	let opt = Builder::build(&case.mir, &case.mir.functions[0]);
@@ -1494,12 +1490,12 @@ fn test_call_creates_callresult_node() {
 #[test]
 fn test_call_no_cse() {
 	let case = TestCase::new(indoc! {"
-        fn caller(x: i32) -> i32 {
+        func caller(x: i32) -> i32 {
             local a: i32 = callee(x);
             local b: i32 = callee(x);
             a + b
         }
-        fn callee(x: i32) -> i32 { x + 1 }
+        func callee(x: i32) -> i32 { x + 1 }
         export { caller }
     "});
 	let opt = Builder::build(&case.mir, &case.mir.functions[0]);
@@ -1522,8 +1518,8 @@ fn test_call_no_cse() {
 #[test]
 fn test_call_arg_use_edges() {
 	let case = TestCase::new(indoc! {"
-        fn caller(x: i32) -> i32 { callee(x) }
-        fn callee(x: i32) -> i32 { x + 1 }
+        func caller(x: i32) -> i32 { callee(x) }
+        func callee(x: i32) -> i32 { x + 1 }
         export { caller }
     "});
 	let opt = Builder::build(&case.mir, &case.mir.functions[0]);
@@ -1565,8 +1561,8 @@ fn test_call_arg_use_edges() {
 #[test]
 fn test_sched_call_args_precede_opcode() {
 	let case = TestCase::new(indoc! {"
-        fn caller(a: i32, b: i32) -> i32 { add(a, b) }
-        fn add(x: i32, y: i32) -> i32 { x + y }
+        func caller(a: i32, b: i32) -> i32 { add(a, b) }
+        func add(x: i32, y: i32) -> i32 { x + y }
         export { caller }
     "});
 	let body = case.schedule();
@@ -1599,8 +1595,8 @@ fn test_sched_call_args_precede_opcode() {
 #[test]
 fn test_sched_call_result_spilled() {
 	let case = TestCase::new(indoc! {"
-        fn caller(x: i32) -> i32 { callee(x) }
-        fn callee(x: i32) -> i32 { x + 1 }
+        func caller(x: i32) -> i32 { callee(x) }
+        func callee(x: i32) -> i32 { x + 1 }
         export { caller }
     "});
 	let body = case.schedule();
@@ -1641,7 +1637,7 @@ fn test_sched_narrow_loads_emit_correct_opcodes() {
 		let src = format!(
 			"{STD}
 memory heap: Memory where {{ Size = u32 }};
-fn read(ptr: heap::{ptr_ty}) -> {ret_ty} {{ ptr.* }}
+func read(ptr: heap::{ptr_ty}) -> {ret_ty} {{ ptr.* }}
 export {{ read, heap }}"
 		);
 		let case = TestCase::new(&src);
@@ -1674,7 +1670,7 @@ fn test_sched_narrow_stores_emit_correct_opcodes() {
 		let src = format!(
 			"{STD}
 memory heap: Memory where {{ Size = u32 }};
-fn write(ptr: heap::{ptr_ty}, val: {val_ty}) {{ ptr.* = val }}
+func write(ptr: heap::{ptr_ty}, val: {val_ty}) {{ ptr.* = val }}
 export {{ write, heap }}"
 		);
 		let case = TestCase::new(&src);
@@ -1699,8 +1695,8 @@ export {{ write, heap }}"
 #[test]
 fn test_snapshot_sched_call_two_args() {
 	let case = TestCase::new(indoc! {"
-        fn caller(a: i32, b: i32) -> i32 { add(a, b) }
-        fn add(x: i32, y: i32) -> i32 { x + y }
+        func caller(a: i32, b: i32) -> i32 { add(a, b) }
+        func add(x: i32, y: i32) -> i32 { x + y }
         export { caller }
     "});
 	insta::assert_yaml_snapshot!(case.schedule_full());
@@ -1713,7 +1709,7 @@ fn test_snapshot_sched_call_two_args() {
 #[test]
 fn test_loop_two_breaks_different_values_creates_phi() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> bool {
+        func f(x: i32) -> bool {
             loop {
                 if x > 10 { break false }
                 break true
@@ -1744,7 +1740,7 @@ fn test_loop_two_breaks_different_values_creates_phi() {
 		.filter_map(|(i, b)| b.as_ref().map(|b| (i as u32, b)))
 		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
-	let break_result_outputs = &opt.loop_data(loop_idx).break_result_outputs;
+	let break_result_outputs = &opt.join_data(loop_idx).break_result_outputs;
 	assert_eq!(
 		break_result_outputs.len(),
 		1,
@@ -1768,7 +1764,7 @@ fn test_loop_two_breaks_different_values_creates_phi() {
 #[test]
 fn test_loop_single_break_no_phi() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 { loop { break 42 } }
+        func f() -> i32 { loop { break 42 } }
         export { f }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -1788,7 +1784,7 @@ fn test_loop_single_break_no_phi() {
 		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
 	assert!(
-		opt.loop_data(loop_idx).break_result_outputs.is_empty(),
+		opt.join_data(loop_idx).break_result_outputs.is_empty(),
 		"break_result_outputs must be empty for a single-break loop"
 	);
 }
@@ -1798,7 +1794,7 @@ fn test_loop_single_break_no_phi() {
 #[test]
 fn test_loop_two_breaks_same_value_phi_folds() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             loop {
                 if x > 0 { break 7 }
                 break 7
@@ -1823,7 +1819,7 @@ fn test_loop_two_breaks_same_value_phi_folds() {
 		.find(|(_, b)| b.is_loop())
 		.expect("expected a loop body block");
 	assert!(
-		opt.loop_data(loop_idx).break_result_outputs.is_empty(),
+		opt.join_data(loop_idx).break_result_outputs.is_empty(),
 		"break_result_outputs must be empty when phi folds"
 	);
 }
@@ -1834,7 +1830,7 @@ fn test_loop_two_breaks_same_value_phi_folds() {
 #[test]
 fn test_sched_loop_break_two_values_no_panic() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> bool {
+        func f(x: i32) -> bool {
             loop {
                 if x > 10 { break false }
                 break true
@@ -1874,7 +1870,7 @@ fn test_sched_loop_break_two_values_no_panic() {
 #[test]
 fn test_sched_loop_single_break_value() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 { loop { break 42 } }
+        func f() -> i32 { loop { break 42 } }
         export { f }
     "});
 	let body = case.schedule();
@@ -1908,7 +1904,7 @@ fn test_sched_loop_single_break_value() {
 #[test]
 fn test_sched_loop_three_breaks() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             loop {
                 if x < 0 { break 0 }
                 if x == 0 { break 1 }
@@ -1949,7 +1945,7 @@ fn test_sched_loop_three_breaks() {
 #[test]
 fn test_sched_loop_break_value_with_mutated_var() {
 	let case = TestCase::new(indoc! {"
-        fn f(start: i32) -> bool {
+        func f(start: i32) -> bool {
             local mut i: i32 = start;
             loop {
                 if i <= 0 { break false }
@@ -1991,7 +1987,7 @@ fn test_sched_loop_break_value_with_mutated_var() {
 #[test]
 fn test_strength_reduce_mul_power_of_two() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 { x * 8 }
+        func f(x: i32) -> i32 { x * 8 }
         export { f }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -2028,7 +2024,7 @@ fn test_strength_reduce_mul_power_of_two() {
 #[test]
 fn test_no_strength_reduce_non_power_of_two() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 { x * 7 }
+        func f(x: i32) -> i32 { x * 7 }
         export { f }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -2045,7 +2041,7 @@ fn test_no_strength_reduce_non_power_of_two() {
 #[test]
 fn test_const_mul_power_of_two_fully_folds() {
 	let case = TestCase::new(indoc! {"
-        fn f() -> i32 { 3 * 4 }
+        func f() -> i32 { 3 * 4 }
         export { f }
     "});
 	let opt = Builder::build(&case.mir, case.get_first_func());
@@ -2075,7 +2071,7 @@ fn test_const_mul_power_of_two_fully_folds() {
 #[test]
 fn test_u32_comparison_schedules_unsigned_instruction() {
 	let case = TestCase::new(indoc! {"
-        fn gt(a: u32, b: u32) -> bool { a > b }
+        func gt(a: u32, b: u32) -> bool { a > b }
         export { gt }
     "});
 	let body = case.schedule();
@@ -2090,7 +2086,7 @@ fn test_u32_comparison_schedules_unsigned_instruction() {
 #[test]
 fn test_u32_right_shift_schedules_logical_shift() {
 	let case = TestCase::new(indoc! {"
-        fn shr(a: u32, b: u32) -> u32 { a >> b }
+        func shr(a: u32, b: u32) -> u32 { a >> b }
         export { shr }
     "});
 	let body = case.schedule();
@@ -2102,12 +2098,12 @@ fn test_u32_right_shift_schedules_logical_shift() {
 
 /// A pointer into a `Size = u64` memory is a 64-bit scalar: params,
 /// locals, and address operands must lower to I64, not I32.
-/// `mir::Type::Pointer` carries its memory's width for exactly this.
+/// `mir::ValueType::Pointer` carries its memory's width for exactly this.
 #[test]
 fn test_memory64_pointer_param_is_i64() {
 	let case = TestCase::new(indoc! {"
         memory stack: Memory where { Size = u64 };
-        fn id(p: stack::&u8) -> stack::&u8 { p }
+        func id(p: stack::&u8) -> stack::&u8 { p }
         export { id }
     "});
 	let func = case.get_first_func();
@@ -2130,7 +2126,7 @@ fn test_memory64_pointer_param_is_i64() {
 #[test]
 fn test_u32_division_schedules_unsigned_div() {
 	let case = TestCase::new(indoc! {"
-        fn div(a: u32, b: u32) -> u32 { a / b }
+        func div(a: u32, b: u32) -> u32 { a / b }
         export { div }
     "});
 	let body = case.schedule();
@@ -2150,7 +2146,7 @@ fn test_u32_division_schedules_unsigned_div() {
 #[test]
 fn test_match_switch_no_divergent_bindings() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32, y: i32) -> i32 {
+        func f(x: i32, y: i32) -> i32 {
             match x {
                 0 -> { y },
                 1 -> { y },
@@ -2184,7 +2180,7 @@ fn test_match_switch_no_divergent_bindings() {
 #[test]
 fn test_match_switch_phi_per_divergent_binding() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             local mut acc: i32 = 0;
             match x {
                 0 -> { acc = 1; },
@@ -2241,7 +2237,7 @@ fn test_match_switch_phi_per_divergent_binding() {
 #[test]
 fn test_match_switch_result_value_join() {
 	let case = TestCase::new(indoc! {"
-        fn f(x: i32) -> i32 {
+        func f(x: i32) -> i32 {
             match x {
                 0 -> { 10 },
                 1 -> { 20 },
@@ -2284,12 +2280,12 @@ fn test_match_switch_result_value_join() {
 #[test]
 fn test_match_switch_exhaustive_enum_has_no_default() {
 	let case = TestCase::new(indoc! {"
-        enum Color: u8 {
+        enum Color(u8) {
             Red = 0,
             Green,
             Blue,
         }
-        fn to_u8(c: Color) -> u8 {
+        func to_u8(c: Color) -> u8 {
             match c {
                 Color::Red -> { 0 },
                 Color::Green -> { 1 },
@@ -2325,7 +2321,7 @@ fn test_match_switch_exhaustive_enum_has_no_default() {
 #[test]
 fn test_match_schedules_nested_if_else_chain() {
 	let case = TestCase::new(indoc! {"
-        fn sign(x: i32) -> i32 {
+        func sign(x: i32) -> i32 {
             match x {
                 0 -> { 0 },
                 1 -> { 1 },
@@ -2371,7 +2367,7 @@ fn test_match_schedules_nested_if_else_chain() {
 #[test]
 fn test_match_schedules_br_table_for_dense_cases() {
 	let case = TestCase::new(indoc! {"
-        fn classify(x: i32) -> i32 {
+        func classify(x: i32) -> i32 {
             match x {
                 0 -> { 10 },
                 1 -> { 20 },
@@ -2406,5 +2402,39 @@ fn test_match_schedules_br_table_for_dense_cases() {
 	assert!(
 		!body.iter().any(|i| matches!(i, Instruction::If { .. })),
 		"a dense match must not also emit an if/else chain; got: {body:?}"
+	);
+}
+
+#[test]
+fn test_untargeted_plain_block_registers_no_block_join() {
+	// A plain `{}` block that nothing ever `break`s to must stay exactly as
+	// cheap as it was before `ControlNode::BlockJoin` existed — no `Block`
+	// entry, no `JoinData`, no wasted WASM nesting. `break_targets`
+	// (computed once up front by `collect_break_targets`) is what lets
+	// `build_block_expr` recognize this and take the fully transparent path.
+	let case = TestCase::new(indoc! {"
+        func f() -> i32 {
+            local y: i32 = {
+                local a: i32 = 1;
+                a + 2
+            };
+            y
+        }
+        export { f }
+    "});
+	let func_mir = case.get_first_func();
+	let opt = Builder::build(&case.mir, func_mir);
+
+	assert!(
+		opt.joins.is_empty(),
+		"expected zero JoinData entries for a function with no break \
+		 anywhere (no loop, no block-join); got {} entries",
+		opt.joins.len()
+	);
+	assert!(
+		opt.blocks
+			.iter()
+			.all(|b| b.as_ref().is_none_or(|blk| !blk.is_block_join())),
+		"no registered Block should be marked as a block-join"
 	);
 }

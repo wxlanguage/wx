@@ -273,7 +273,7 @@ fn resolve_dependencies(
 			}
 		};
 
-		let name = builder.interner.get_or_intern(key.as_str());
+		let name = builder.strings.get_or_intern(key.as_str());
 		builder.add_dependency(owner, name, dependency_id);
 	}
 
@@ -293,7 +293,7 @@ fn report_std_package_as_dependency(key: &str) -> Diagnostic<FileId> {
 }
 
 /// No label: there's no specific span inside a `wx.json` to point at from
-/// here (see `DuplicatePackageName`'s own reasoning) — the message just
+/// here (see `report_std_package_as_dependency`'s own reasoning) — the message just
 /// names the dependency key whose edge closes the cycle.
 fn report_circular_dependency(key: &str) -> Diagnostic<FileId> {
 	Diagnostic::error()
@@ -318,7 +318,7 @@ mod tests {
 		owner: PackageId,
 		name: &str,
 	) -> Option<PackageId> {
-		let symbol = compilation.interner.get(name)?;
+		let symbol = compilation.strings.get(name)?;
 		compilation.packages[owner.as_usize()]
 			.dependencies
 			.get(&symbol)
@@ -351,8 +351,8 @@ mod tests {
 		}
 		let source = Source {
 			files: workspace(&[
-				("/app/main.wx", "fn main() {}"),
-				("/dep/main.wx", "pub fn helper() {}"),
+				("/app/main.wx", "func main() {}"),
+				("/dep/main.wx", "pub func helper() {}"),
 			]),
 			json_reads: std::cell::Cell::new(0),
 		};
@@ -379,7 +379,7 @@ mod tests {
 	fn manifested_binary_with_no_dependencies_gets_std() {
 		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -405,7 +405,7 @@ mod tests {
 				"/app/wx.json",
 				r#"{ "type": "bin", "entry": "src/start.wx" }"#,
 			),
-			("/app/src/start.wx", "fn add() {}"),
+			("/app/src/start.wx", "func add() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -416,7 +416,7 @@ mod tests {
 
 	#[test]
 	fn manifest_directory_without_a_wx_json_fails() {
-		let source = workspace(&[("/app/main.wx", "fn add() {}")]);
+		let source = workspace(&[("/app/main.wx", "func add() {}")]);
 		assert!(
 			open_manifest(AbsolutePath::new("/app"), &source).is_err(),
 			"a directory argument commits to the manifest-driven path — no \
@@ -428,7 +428,7 @@ mod tests {
 	fn std_root_package_does_not_get_a_second_std_loaded() {
 		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -448,8 +448,8 @@ mod tests {
 	}
 
 	/// The stdlib isn't replaceable, and this is how that's enforced: it's
-	/// loaded before anything else, so a dependency bound to `std` loses the
-	/// first-claim-wins race rather than needing a reserved-key check.
+	/// registered before anything else, so a dependency bound to `std` loses
+	/// the first-claim-wins race rather than needing a reserved-key check.
 	#[test]
 	fn dependency_bound_to_std_collides_with_the_stdlib() {
 		let source = workspace(&[
@@ -463,12 +463,12 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			(
 				"/alt_std/wx.json",
 				r#"{ "type": "lib", "entry": "main.wx" }"#,
 			),
-			("/alt_std/main.wx", "fn replacement() {}"),
+			("/alt_std/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -476,7 +476,7 @@ mod tests {
 		assert_eq!(
 			dependency_of(&compilation, compilation.root_package, "std"),
 			Some(compilation.stdlib_package),
-			"the seeded stdlib holds the name; the declared one can't take it"
+			"the stdlib holds the name; the declared one can't take it"
 		);
 
 		let diagnostics = compilation.collect_linker_diagnostics();
@@ -501,9 +501,9 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			("/mystd/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
-			("/mystd/main.wx", "fn replacement() {}"),
+			("/mystd/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -524,20 +524,12 @@ mod tests {
 			.assert_error(DiagnosticCode::StdPackageAsDependency);
 	}
 
-	/// Inverted deliberately. Under the old model a name was a property of
-	/// the package, so two packages reached under the same key collided
-	/// globally. A name is now a property of the edge, so `app` calling `/x`
-	/// "libx" and `y` calling `/z` "libx" are two independent bindings in
-	/// two different maps — the whole point of edge-scoped names, and not
-	/// something to diagnose.
+	/// A `dependencies` key only makes a package available; the names the
+	/// source uses come from package instances. So reaching one package under
+	/// two keys is no longer a duplicate declaration — both keys are
+	/// available, and either can be instantiated under any alias.
 	#[test]
-	fn one_package_declared_under_two_names_is_diagnosed() {
-		// The inverse of `two_packages_may_use_the_same_key_for_different_
-		// targets`: there, two owners each bind `libx` to a target of their
-		// own, which is fine. Here one owner reaches the *same* package twice
-		// under different keys, which is not — a `dependencies` entry is a
-		// declaration, so the mapping is kept one-to-one in both directions
-		// and a second name has to be spelled with an alias instead.
+	fn one_package_may_be_declared_under_two_keys() {
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -550,27 +542,28 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			(
 				"/shared/wx.json",
 				r#"{ "type": "lib", "entry": "main.wx" }"#,
 			),
-			("/shared/main.wx", "fn shared() {}"),
+			("/shared/main.wx", "func shared() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
 
-		let diagnostics = compilation.collect_linker_diagnostics();
-		DiagnosticView::new("link", &diagnostics, &compilation.files)
-			.assert_error(DiagnosticCode::PackageDeclaredTwice);
-
-		// The first key still binds — the package loaded, it just cannot be
-		// reached under both names.
-		assert!(
-			dependency_of(&compilation, compilation.root_package, "one")
-				.is_some(),
-			"the first declaration should still bind its name"
+		DiagnosticView::new(
+			"link",
+			&compilation.collect_linker_diagnostics(),
+			&compilation.files,
+		)
+		.assert_none();
+		let root = compilation.root_package;
+		assert_eq!(
+			dependency_of(&compilation, root, "one"),
+			dependency_of(&compilation, root, "two"),
 		);
+		assert!(dependency_of(&compilation, root, "one").is_some());
 	}
 
 	#[test]
@@ -587,9 +580,9 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			("/x/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
-			("/x/main.wx", "fn from_x() {}"),
+			("/x/main.wx", "func from_x() {}"),
 			(
 				"/y/wx.json",
 				r#"{
@@ -600,9 +593,9 @@ mod tests {
 					}
 				}"#,
 			),
-			("/y/main.wx", "fn from_y() {}"),
+			("/y/main.wx", "func from_y() {}"),
 			("/z/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
-			("/z/main.wx", "fn from_z() {}"),
+			("/z/main.wx", "func from_z() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -636,7 +629,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/app/main.wx", "fn add() {}"),
+			("/app/main.wx", "func add() {}"),
 			(
 				"/a/wx.json",
 				r#"{
@@ -647,7 +640,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/a/main.wx", "fn from_a() {}"),
+			("/a/main.wx", "func from_a() {}"),
 			(
 				"/b/wx.json",
 				r#"{
@@ -658,12 +651,12 @@ mod tests {
 					}
 				}"#,
 			),
-			("/b/main.wx", "fn from_b() {}"),
+			("/b/main.wx", "func from_b() {}"),
 			(
 				"/shared/wx.json",
 				r#"{ "type": "lib", "entry": "main.wx" }"#,
 			),
-			("/shared/main.wx", "fn from_shared() {}"),
+			("/shared/main.wx", "func from_shared() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
@@ -692,7 +685,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/a/main.wx", "fn from_a() {}"),
+			("/a/main.wx", "func from_a() {}"),
 			(
 				"/b/wx.json",
 				r#"{
@@ -703,7 +696,7 @@ mod tests {
 					}
 				}"#,
 			),
-			("/b/main.wx", "fn from_b() {}"),
+			("/b/main.wx", "func from_b() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/a"), &source).unwrap();
