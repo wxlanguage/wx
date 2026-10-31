@@ -1,32 +1,20 @@
 # Generic associated types
 
-Status as of 2026-10-31: planned, nothing implemented. Motivated by
-`Pointee` (see "Unsized fields" in `slices-and-untyped-constants.md`).
+Status as of 2026-10-31: **deferred**, nothing implemented. They were
+motivated by a pointee-side `Pointee` trait; pointer metadata is named on
+the pointer instead (`<M::&T as Pointer>::Metadata`, "The `Pointer` trait"
+in `slices-and-untyped-constants.md`), which needs no GAT. This note keeps
+the design for when something else needs one: a trait whose impls are
+written by users with a member that takes parameters (a collection family's
+`type Of<T>`, say). Nothing planned does yet.
 
-## Why
-
-A pointer's metadata is a type of its pointee's, made of lengths whose type
-is the pointer's memory's `Size`. The pointee does not know the memory, so
-the size has to be an argument. Two places can take it:
-
-```wx
-trait Pointee<Size: PointerSize> { type Metadata: StackValue; }   // a generic trait
-trait Pointee { type Metadata<Size: PointerSize>: StackValue; }   // a generic associated type
-```
-
-The size is a parameter of the metadata, not of the trait: every type has
-one answer, generic over the size. So the second form fits, and it keeps
-the model of `chatgpt-multiple-trait-implementations-per-target.md`: one
-impl per trait and type constructor, selected by the target alone. A trait
-reference never carries arguments, so bounds, `TraitClause`, supertraits,
-impl headers and impl selection do not change; only a projection does.
-
-With it, `pointer_metadata` returns a plain `TypeIndex` for every pointee,
-and a pointee of unknown shape is the rigid projection
-`<T as Pointee>::Metadata<M::Size>`, as `T::Item` is.
-
-A generic trait is the more general feature (`Add<Rhs>`, conversions), and
-the one that brings several impls per target. It is not needed here.
+When to revisit: after generic constants (`const N<S: PointerSize>`), which
+need the same pieces (a frame for a member's own parameters, flat
+arguments `[Self, own…]`, per-instance values) and make GATs cheap. A GAT
+would also let `<M::&T as Pointer>::Metadata` be redefined inside the
+compiler as `<T as Pointee>::Metadata<M::Size>`, which makes the rigid
+metadata of two memories with the same `Size` one type (the one cost of
+the pointer-side form); the `Pointer` API would not change.
 
 ## Why Rust took six years
 
@@ -44,75 +32,98 @@ RFC 1598 was accepted in 2016, GATs stabilized in Rust 1.65 (November
 - `dyn` compatibility: a trait with a GAT cannot be a `dyn Trait`.
 - Borrow-checker limits on lending iterators, after stabilization too.
 
-wx has no lifetimes, no `for<..>` bounds and no `dyn`. What remains is type
-parameters on an associated type, never the hard part of Rust's design.
+What carries over from rustc:
 
-## Stage 1: GATs in a compiler-answered trait
+- A projection is `AliasTy { def_id, args }`: the trait's arguments
+  (`Self` first), then the GAT's own. The GAT's `Generics` has the trait as
+  parent, with `parent_count`, as wx's `TypeEnv` frames do.
+- An impl's value is instantiated by rebasing: the trait's prefix of `args`
+  is replaced by the impl's (`GenericArgs::rebase_onto`), so the value is
+  read with `impl_args ++ own_args`.
+- Conformance (`compare_impl_ty`): parameter count and kinds; the impl's
+  bounds implied by the declaration's (E0276, wx's E2124); the value meets
+  the declared bounds for every argument, with the parameters as
+  placeholders (`check_type_bounds`).
+- No `for<T>` bounds over types in stable Rust (`non_lifetime_binders` is
+  unstable): only a GAT's declared bounds hold for every argument.
 
-Enough for `Pointee`, whose impl is never written.
+## Decisions
 
-1. Parser and AST: parameters on an associated type declaration
-   (`type Metadata<S: PointerSize>: StackValue;`), arguments on a
-   projection in type position (`<T as Pointee>::Metadata<M::Size>`,
-   `T::Metadata<u32>`).
-2. `Type::TypeProjection { trait_index, assoc_type_index, base }` gains
-   `args`, and every helper reads them: `flags_of` (a projection inherits
-   its arguments' flags, `HAS_PARAM` among them), `substitute`,
-   `match_pattern` (compares the arguments too), `is_abstract`, the
-   formatter. A projection out of a concrete base with abstract arguments is
-   not abstract: `<[u8] as Pointee>::Metadata<M::Size>` normalizes to
-   `M::Size`.
-3. Signatures: an associated type's own parameters are a scope of their
-   own, and its declared bounds are read with the arguments substituted
-   (`declarations_of`).
-4. Well-formedness: a written projection proves its arguments meet their
-   parameters' bounds (`M::Size: PointerSize`), recorded as an obligation as
-   any type's arguments are.
-5. `Pointee`'s structural answer (`TraitImplLookup::Builtin`), from
-   `pointer_metadata`; its `Option` goes away.
+1. **Representation: flat arguments.** `TypeProjection { assoc_type_index,
+   args }` with `args = [base, own…]`, as `Type::Const`'s `[Self]` and
+   `Function`'s `[Self, own…]`, and rustc's `AliasTy`. Measured: `Type` is
+   16 bytes today; an `args: TypeList` beside `base` makes it 24 (20 without
+   `trait_index`), for every interned type and hash key; the flat form
+   keeps 16. Costs: `base` is `list(args)[0]`, a projection without
+   arguments stores a one-element list (deduplicated by content), and the
+   trait comes from the declaration (`AssocTypeDef` gains its trait).
+   `Type::Const` takes the same layout for generic constants.
+2. **A frame per GAT** (`TypeEnvOwner::AssocType`). On the trait's
+   declaration its parent is the trait's `Self` frame, so its flat slots
+   are `[Self, own…]`, exactly the projection's `args`: reading the declared
+   bounds along a projection path is `Substitution { env: gat_env, args }`,
+   and `SelfSubstitution` (`bounds.rs`) becomes its special case. On an
+   impl's member its parent is the impl's frame, slots `[impl params…,
+   own…]`: `reduce_projection` substitutes `impl_args ++ args[1..]`,
+   rustc's rebase with no new mechanism.
+3. **Only the base selects.** Impl selection reads `base` alone, keeping
+   one impl per trait and constructor. Arguments are not normalized before
+   selection: they are substituted into the value and the result
+   normalized, or, for a rigid projection, normalized as children under a
+   `Deep` request only. The cache key needs nothing new
+   (`Normalization::new` keys on `has_param`, so `flags_of` must collect
+   from all of `args`).
+4. **Not injective.** No type argument is learned through a projection
+   (`learn` already ignores them): `func f<T, S>(m: T::Metadata<S>)` needs
+   explicit arguments, as in Rust and GHC (without its injectivity
+   annotations). `match_pattern`'s projection arm compares every argument.
+   `_` in a GAT's arguments is refused. `learn` does learn through
+   `Type::Const`'s `type_args`; harmless while no rigid constant can equal
+   another, but the same question, to decide once for both.
+5. **Equality bindings refused.** `Metadata<S> = (S, S)` needs a binder,
+   which Rust does not have for types either. `Metadata<u32> = u32` is
+   harder than it looks: `projection_equality` would match arguments modulo
+   normalization, but clauses are published before equality values are
+   resolved, and normalizing an argument may need those equalities.
+6. **Parameter bounds only.** No `where` on the GAT itself (where Rust's
+   required-bounds rules live); type parameters only. A GAT written
+   without its arguments is an error, never defaulted (rustc's E0107).
+7. **Well-formedness.** A written projection records its membership check
+   and the GAT's parameter bounds instantiated with `args`, as a struct's
+   arguments are checked. The hook is `report_assoc_type_args`
+   (`signatures.rs`), which already lowers and reports arguments written on
+   an associated type. A projection made by substitution is not checked
+   again (the caller proved the bounds), the open point `M::&[u8; T::LEN]`
+   has too.
+8. **Judgement and cycles unchanged.** A member is judged once, in its own
+   frame, its parameters abstract. Reaching it again with other arguments
+   through definitions alone is still a real loop: with no specialization a
+   definition cannot recurse on a smaller argument and stop. Legitimate
+   recursion goes through a rigid argument (`<P as Nat>::Add<N>`), abstract
+   during the judgement and unfolded per use outside its frame. Verdicts
+   stay per definition. Recursion with growing arguments never repeats a
+   `Normalization` and is stopped by the budget (type-level computation
+   with GATs is Turing-complete, as in rustc).
 
-A GAT in a written impl is refused until stage 2.
+## Efficiency
 
-## Stage 2: GATs in written traits and impls
+- The type's size: decision 1.
+- Not GAT-specific, but GATs make it easier to reach: nested
+  normalizations do not read the cache (the TODO above `normalize`), so a
+  value like `(<P as Nat>::D<N>, <P as Nat>::D<N>)` normalizes identical
+  children separately, exponential in depth although the interned result
+  is small. Normalizing identical children of one node once is a cheap
+  partial fix.
 
-6. Conformance (`conformance.rs`): an impl's member has the declaration's
-   parameters, by count and then bounds, and may require no more than the
-   declaration, E2124's rule for functions, read in `contract_frame`.
-7. Impl values: `Definition::Member` (keyed by `ImplMember`) is judged once
-   with its own parameters abstract and instantiated per use, as a constant
-   is per `eval::Instance`. Its verdict and cycle detection are unchanged:
-   it is one definition whatever its arguments.
-8. Defaults: a trait's default value for a GAT is inherited the same way.
+## Stages, if revived
 
-## Edge cases
-
-- **Equality bindings need a binder.** `T: Pointee where { Metadata<S> =
-  (S, S) }` means "for every `S`", Rust's higher-ranked case. Refused at
-  first. A binding with concrete arguments (`Metadata<u32> = u32`) is a
-  plain `EqualityClause` and can come later. `Pointee` needs neither.
-- **No quantified bounds written by users.** "`T::Metadata<S>` is `Copy`
-  for every `S`" cannot be stated; only a GAT's declared bounds hold for
-  every argument. Deliberate: it is what keeps the solver simple.
-- **Recursion through the structural answer.** `[[T]]`'s metadata is
-  `(S, <[T] as Pointee>::Metadata<S>)`, a projection inside the answer.
-  Ordinary normalization depth; pin it with a test so nesting does not
-  spend the budget unexpectedly.
-- **Cache keys.** A request for a type with no parameter is keyed under the
-  root scope; that must see the arguments' params, not only the base's.
-  Falls out of `flags_of` if step 2 is right, and silently breaks
-  memoization if not.
-- **`HAS_PROJECTION` over a concrete base.** `Solver::normalize` skips a
-  type without it, so a projection over a concrete base still carries it.
-- **Bounds naming `Self` and the GAT's parameters**
-  (`type Metadata<S>: Into<S>`). Substitution handles them; conformance
-  instantiates both sides with the same placeholder for `S` before
-  comparing, as for a function's own type parameters.
-
-## Cost
-
-Stage 1 is mostly mechanical: one variant change across the type helpers,
-the parser, one structural answer. The risk is step 2, where a helper that
-ignores `args` breaks matching or caching without an error. Stage 2 reuses
-`contract_frame`, per-instance memoization and `Definition::Member`. The
-edge cases that need design are the first two, both decided by refusing
-them.
+1. Parser and AST: parameters on an associated type declaration;
+   arguments on a projection already parse (`report_assoc_type_args`).
+2. The flat `TypeProjection` across every helper that builds or reads one
+   (`flags_of`, `substitute`, `match_pattern`, `meet`, `rebase`, the
+   formatter), the GAT frame, declared bounds read through it,
+   well-formedness. The risk: a helper that ignores `args` breaks caching
+   or matching without an error.
+3. Conformance in `contract_frame`: count, bounds no stronger than the
+   declaration's, the value meeting the declared bounds for every argument;
+   impl values and trait defaults instantiated by rebasing.

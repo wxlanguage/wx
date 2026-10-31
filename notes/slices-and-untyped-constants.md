@@ -52,8 +52,9 @@ After it:
 - A pointer is fat exactly when it points at `[T]`: the data pointer and a
   length of type `M::Size`. A pointer to `[T; N]` is thin; its length is in
   the type. `layout`, `Solver::stack_elements` and constant evaluation read
-  this off the pointee (`is_fat_pointee`); an abstract pointee assumed `Slice`
-  but not `Array` may be either, and has no known representation.
+  this as `<P as Pointer>::Metadata` (see "The `Pointer` trait"); over an
+  abstract pointee assumed `Slice` but not `Array` that stays rigid, a
+  `StackValue` with no layout yet.
 - A slice or an array is only ever behind a pointer, `[T; N]` included, and
   this is permanent: Wasm locals cannot be indexed at runtime (`local.get`
   takes an immediate), so an array in locals would be a tuple with constant
@@ -167,12 +168,10 @@ only way a parameter may stand for something not held by value.
   to be held only by a pointer.
 - A field may not hold an array (E2129), so a record laid out in memory with
   an inline buffer, `Header(len: u32, data: [u8; 16])`, cannot be written.
-- A pointer to an abstract pointee bounded by `Slice` is thin for an array and
-  fat for a slice, so `is_fat_pointee` answers `None` and the pointer is no
-  `StackValue` (`push_stack_elements`'s `None => false`): it can be neither a
-  global nor transmuted, though its representation is definite once the
-  pointee is known.
-- `may_be_slice` and `is_fat_pointee` match `Type::Slice`/`Type::Array` and
+- (Fixed 2026-10-31 by the `Pointer` trait.) A pointer to an abstract
+  pointee bounded by `Slice` was no `StackValue`; its metadata is now the
+  rigid `<M::&S as Pointer>::Metadata`, so it can be passed and transmuted.
+- `may_be_slice` and `pointer_metadata` match `Type::Slice`/`Type::Array` and
   the `Slice` bound by hand. A new kind of type held only by a pointer
   (`dyn Trait`, for dynamic dispatch) would need a case in each and another
   bound implying the same thing.
@@ -265,11 +264,10 @@ as an abstract part's `Repr` is today, instead of "no `StackValue`"; so
 
 Rust's `Pointee` trait (`type Metadata`) names a pointer's extra part as a
 type of the pointee's, which does not fit a length whose type is the
-memory's. It is needed only if code must build or take apart fat pointers
-generically (`from_raw_parts`); std intrinsics
-(`from_raw_parts<M, T>(p, len: M::Size) -> M::&[T]`) cover that until then.
-Metadata is made of counts the pointer types with `M::Size`, as an untyped
-constant is typed by its use, so the pointee never needs to know the memory.
+memory's. wx names it on the pointer instead (see "The `Pointer` trait"
+below). Metadata is made of counts the pointer types with `M::Size`, as an
+untyped constant is typed by its use, so the pointee never needs to know the
+memory.
 
 ### Unsized fields
 
@@ -332,7 +330,7 @@ rectangular: every element shares the one inner metadata.
 - A pointer's representation is its address, then
   `push_stack_elements(metadata)`, which already flattens nested tuples;
   `push_stack_elements`, `layout.rs`'s pointer piece and `eval.rs` read it
-  in place of `is_fat_pointee`'s yes/no.
+  (`pointer_metadata`; `is_fat_pointee` is gone).
 - A layout's `Count(i)` (see "Layouts are expressions") is the i-th element
   of the flattened metadata, the order the representation uses.
 - `None` is not `UNIT`: in `struct Box<M: Memory, T>(p: M::*T)`, `T` may be
@@ -340,21 +338,11 @@ rectangular: every element shares the one inner metadata.
   answering `()` would commit to a thin pointer. `ERROR` would silence
   diagnostics wherever it spread, and a precondition on the caller would
   make each caller repeat the walk.
-- **The `Option` is a stopgap, not the design.** The intended
-  `pointer_metadata` returns a plain `TypeIndex` for every pointee, and an
-  unknown shape is the projection `<T as Pointee<M::Size>>::Metadata`
-  (or `<T as Pointee>::Metadata<M::Size>`, if the size goes on the member
-  as a generic associated type instead of on the trait), rigid until `T` is
-  known, as `T::Item` is. `pointer_metadata(T, M::Size)` is then that
-  trait's structural answer (`TraitImplLookup::Builtin`, as `StackValue`'s),
-  and an abstract pointee's metadata goes through the solver like any other
-  projection, so a pointer to one has a representation instead of none
-  (`Box<M, T>` passes, its `Repr` reduced after monomorphization). It
-  needs a trait with a parameter, which wx does not have (the planned route
-  is a generic associated type, `notes/generic-associated-types.md`); until
-  then `None`
-  stands for that projection, and code reading `None` treats it as one
-  would be treated: unknown, never thin.
+- `pointer_metadata`'s `None` is that projection, `<M::&T as
+  Pointer>::Metadata`, rigid until `T` is known, as `T::Item` is (see "The
+  `Pointer` trait"). `pointer_metadata_value` builds it, over the shared
+  pointer, for the solver and the representation; a layout and an
+  evaluation read `None` as unknown, never thin.
 
 **Layouts are expressions** over that metadata (see "Sized"). A field's
 offset is one too. Since wx orders fields itself, a struct places its sized
@@ -363,17 +351,74 @@ in declaration order: every sized field keeps a constant offset
 (`p.header` through a `heap::&Message` is as cheap as through a sized
 struct), and only an unsized field after the first one has a runtime offset.
 
-**Not exposed.** The metadata is the compiler's: no `Pointee` trait, no
-metadata type, no `from_raw_parts` over it. Naming it in the language
-takes a trait over the memory's size,
+### The `Pointer` trait
+
+Decided and implemented on 2026-10-31. The metadata is named on the
+pointer type, not on the pointee:
 
 ```wx
-trait Pointee<Size: PointerSize> {
+/// Every pointer type, `M::&T` and `M::*T`; the compiler answers it from the
+/// pointer's structure.
+pub trait Pointer: StackValue where {
+    Repr = <(Self::Memory::Size, Self::Metadata) as StackValue>::Repr,
+} {
+    type Memory: Memory;
+    type Pointee;
     type Metadata: StackValue;
 }
 ```
 
-and wx has no generic traits. Until then:
+- The solver answers it from the pointer's structure
+  (`TraitImplLookup::Builtin`, as `StackValue`'s): `Memory` and `Pointee`
+  read off the type, `Metadata` is `pointer_metadata(pointee, size)`. Over
+  a pointee of unknown shape `Metadata` stays the rigid projection
+  `<M::&T as Pointer>::Metadata`; over a concrete pointee in an abstract
+  memory it reduces (`<M::&[u8] as Pointer>::Metadata` is `M::Size`).
+- The metadata depends on the pointee and the memory, and a pointer type is
+  exactly that pair, so this is a plain associated type: no generic trait,
+  no generic associated type. It is the pattern the rigid
+  `<M::&T as StackValue>::Repr` already follows.
+- `M::&T` and `M::*T` have one metadata; the answer goes through the shared
+  form, so the two are one cache entry (as `stack_repr` canonicalizes).
+- The supertrait equality states the representation: an address, then the
+  metadata. So std writes `from_raw_parts<P: Pointer>(address:
+  P::Memory::Size, metadata: P::Metadata) -> P`, `metadata(pointer: P) ->
+  P::Metadata` and `address(pointer: P) -> P::Memory::Size` as plain
+  `transmute`s, with no intrinsic. One function covers shared and exclusive
+  pointers; `P` is learned from the expected result or the argument, never
+  from a projection. Places through an abstract `P` would need rules of
+  their own.
+- Not done: refusing a written `impl Pointer` (or `StackValue`, `Slice`,
+  `Array`, `Call`); impls are only for nominal types, so none can be written
+  for a pointer today.
+- Thinness is a derived fact: `T: Sized` gives `Metadata = ()` once
+  `Sized` exists. No clause on a compound type is written.
+- The cost: a rigid form names the memory, not only its `Size`. In a
+  generic body with an abstract `T`, `<heap1::&T as Pointer>::Metadata` and
+  `<heap2::&T as Pointer>::Metadata` are different types even when both
+  memories' `Size` is `u32`, so a `transmute` between those two pointers is
+  refused there (every instantiation would agree). Over a concrete pointee
+  both reduce and the `transmute` is accepted. Accepted as rare.
+
+Why not Rust's `Pointee`. Rust names metadata on the pointee because many
+pointer types (`&`, `&mut`, `*const`, `*mut`, `NonNull`, `Box`, `Rc`, user
+smart pointers) share it, its one address space makes every length a
+`usize`, and unsizing (`CoerceUnsized`, `dyn`'s vtable) relates pointees.
+In wx the metadata depends on the memory, which the pointee does not know,
+so the pointee-side form needs a generic associated type
+(`type Metadata<S: PointerSize>`), and wx has only two pointer forms, both
+built in (a smart pointer holds one as a field and gets its representation
+through it). A later `dyn` has memory-free metadata either way.
+
+Generic associated types are deferred (`notes/generic-associated-types.md`):
+they would serve one compiler-answered trait, at the cost of a change to
+`Type::TypeProjection` that fails silently where a helper ignores its
+arguments. If they come, `<M::&T as Pointer>::Metadata` can be redefined
+inside the compiler as `<T as Pointee>::Metadata<M::Size>`, which also
+makes the two rigid forms above one type; the `Pointer` API does not
+change.
+
+What the trait does not change yet:
 
 - `len()` on a slice reads the first count, as it does now.
 - `s[i]` on a `heap::&[[u8]]` is a place of `[u8]`, not loadable, and
@@ -381,17 +426,14 @@ and wx has no generic traits. Until then:
   is `i` times the element's size, a runtime value.
 - A pointer to an unsized struct is built only by `transmute` from its
   representation, which is fixed and does not change when the trait comes.
-- Generic code sees only `Sized` elements, the one bound it can state; a
-  function over both `[u32]` and `[[u8]]` needs the trait (or a `?Sized`
-  opt-out).
+- A function over both `[u32]` and `[[u8]]` holds the pointer with its rigid
+  metadata, but cannot index it until layouts are expressions.
 - Turning a size or an offset that reads a count into instructions is
   MIR's. Until then a place step whose offset reads one is refused.
 
 ### Open
 
-- `Pointee<Size>`, so an abstract pointee's metadata is the projection
-  `<T as Pointee<M::Size>>::Metadata` instead of `None`; needs generic
-  traits. And `dyn`.
+- `dyn`, and its metadata (a table index) through `Pointer`.
 - Implied bounds instead of written ones (see above).
 
 ## Lengths are counts
@@ -556,8 +598,12 @@ func f<T: Array where { const LEN: u8 }>() -> u8 { T::LEN }  // fine
   `x + x` on an unbounded `T` is E2063. The body checks against the
   signature, never against instantiations.
 - The return type is `u8`. A constant is not a type: no singleton types.
-- A third clause kind, `FitClause { constant, ty }`, in `BoundClauses` beside
-  `TraitClause` and `EqualityClause`, published and read the same way.
+- A third clause kind, `FitClause { constant, ty }`, beside `TraitClause`
+  and `EqualityClause`, published and read the same way. A fit about a type
+  the function does not declare (`Array::as_slice`'s `const <Self as
+  Array>::LEN: M::Size`) is written in a `where { .. }` list and needs
+  clauses owned by a scope rather than a parameter: `tir-param-env-plan.md`,
+  whose last step this is.
   `Solver::satisfies_clauses` proves it at a use: a concrete argument by
   evaluating the constant and running the fit check; an abstract one from the
   caller's own fit clauses.
@@ -742,8 +788,11 @@ Each step ends with tests green.
    types' parts, locals, ascriptions) proved `StackValue` by declared bounds,
    with a suggestion to add the bound; fields, tuple elements and type
    arguments free (see "Unsized fields"); a pointer's representation from
-   its pointee's metadata (`pointer_metadata` replacing `is_fat_pointee`),
-   first, since the positions read it; E2130 and `may_be_slice` removed,
+   its pointee's metadata (done 2026-10-31: `pointer_metadata` replacing
+   `is_fat_pointee`, std's `Pointer` trait answered structurally, its rigid
+   `Metadata` making a pointer to an unknown shape a `StackValue`,
+   `from_raw_parts`/`metadata`/`address` in std); E2130 and
+   `may_be_slice` removed,
    E2129 reworded; a pointer to a pointee of unknown shape held as a rigid
    `Repr`; std's
    generic functions given `T: StackValue`. Needs nothing new. Done ahead of

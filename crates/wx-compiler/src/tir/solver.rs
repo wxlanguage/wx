@@ -11,7 +11,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::StringInterner;
+use crate::ast::{Ownership, StringInterner};
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
@@ -62,14 +62,20 @@ pub(super) enum SolverError {
 /// Why a bound does not hold, for the check that owns it to report.
 pub(super) enum UnsatisfiedClause {
 	/// `subject` lacks `trait_index`, which the bound `source` requires.
+	/// `subject` is the clause's subject as stated, with the use's arguments;
+	/// `reduced` is what it reduces to.
 	Trait {
 		subject: TypeIndex,
+		reduced: TypeIndex,
 		trait_index: TraitIdx,
 		source: BoundId,
 	},
 	/// The projection the equality `source` names has another value.
+	/// `projection` and `required` are the equality's sides as stated, with
+	/// the use's arguments; `found` and `expected` are what they reduce to.
 	Equality {
 		projection: TypeIndex,
+		required: TypeIndex,
 		found: TypeIndex,
 		expected: TypeIndex,
 		source: BindingRef,
@@ -78,7 +84,8 @@ pub(super) enum UnsatisfiedClause {
 
 /// The value of `assoc_type_index` for `receiver`, whose trait the compiler
 /// answers from its structure: `func(A) -> R`'s `Call::Args` is `A` and its
-/// `Call::Result` is `R`, and `[T]`'s or `[T; N]`'s `Slice::Value` is `T`.
+/// `Call::Result` is `R`, `[T]`'s or `[T; N]`'s `Slice::Value` is `T`, and
+/// `M::&T`'s `Pointer::Memory` is `M` and its `Pointer::Pointee` is `T`.
 fn builtin_assoc_value(
 	view: &TypeContext<'_, '_, '_>,
 	receiver: TypeIndex,
@@ -90,6 +97,15 @@ fn builtin_assoc_value(
 		Type::Slice { of } | Type::Array { of, .. } => {
 			(this == intrinsics.slice_value).then_some(of)
 		}
+		Type::Pointer { to, memory, .. } => {
+			if this == intrinsics.pointer_memory {
+				Some(memory)
+			} else if this == intrinsics.pointer_pointee {
+				Some(to)
+			} else {
+				None
+			}
+		}
 		Type::TypedFuncref { param, result } => {
 			if this == intrinsics.call_args {
 				Some(param)
@@ -100,6 +116,19 @@ fn builtin_assoc_value(
 			}
 		}
 		_ => None,
+	}
+}
+
+/// How many counts `metadata`, a `pointer_metadata` answer, holds: its
+/// tuples flattened.
+pub(super) fn metadata_len(types: &TypeInterner, metadata: TypeIndex) -> usize {
+	match *types.resolve(metadata) {
+		Type::Tuple { elements } => types
+			.list(elements)
+			.iter()
+			.map(|&element| metadata_len(types, element))
+			.sum(),
+		_ => 1,
 	}
 }
 
@@ -141,22 +170,37 @@ fn rebase(
 	})
 }
 
-/// Whether a step of `ty`'s projection path is a membership in `failed`.
-fn through_failed(
+/// Whether a projection anywhere in `ty` passes through a membership in
+/// `failed`, so whatever `ty` reduces to derives from that failure.
+fn reads_failed(
 	types: &TypeInterner,
-	mut ty: TypeIndex,
+	ty: TypeIndex,
 	failed: &[(TypeIndex, TraitIdx)],
 ) -> bool {
-	while let Type::TypeProjection {
-		base, trait_index, ..
-	} = *types.resolve(ty)
-	{
-		if failed.contains(&(base, trait_index)) {
-			return true;
-		}
-		ty = base;
+	if !types.has_projection(ty) {
+		return false;
 	}
-	false
+	let reads = |ty| reads_failed(types, ty, failed);
+	match *types.resolve(ty) {
+		Type::TypeProjection {
+			base, trait_index, ..
+		} => failed.contains(&(base, trait_index)) || reads(base),
+		Type::Tuple { elements: list }
+		| Type::Struct {
+			type_args: list, ..
+		}
+		| Type::Function {
+			type_args: list, ..
+		}
+		| Type::Const {
+			type_args: list, ..
+		} => types.list(list).iter().any(|&part| reads(part)),
+		Type::TypedFuncref { param, result } => reads(param) || reads(result),
+		Type::Pointer { to, memory, .. } => reads(to) || reads(memory),
+		Type::Array { of, length } => reads(of) || reads(length),
+		Type::Slice { of } => reads(of),
+		_ => false,
+	}
 }
 
 /// A projection that normalization reached again while normalizing it: the
@@ -1231,19 +1275,31 @@ impl TypeContext<'_, '_, '_> {
 				(impl_index, args)
 			}
 			TraitImplLookup::Builtin => {
-				let value = if Some(assoc_type_index)
-					== self.defs.intrinsics.stack_value_repr
-				{
+				let this = Some(assoc_type_index);
+				let value = if this == self.defs.intrinsics.stack_value_repr {
 					self.stack_repr(
 						assumption_context,
 						next_base,
 						trait_index,
 						assoc_type_index,
 					)?
+				} else if this == self.defs.intrinsics.pointer_metadata {
+					let Type::Pointer { to, memory, .. } =
+						*self.types.resolve(next_base)
+					else {
+						unreachable!("only a pointer is a `Pointer`")
+					};
+					let size = self.address_size(assumption_context, memory)?;
+					Some(self.pointer_metadata_value(
+						assumption_context,
+						to,
+						memory,
+						size,
+					)?)
 				} else {
 					builtin_assoc_value(self, next_base, assoc_type_index)
 				};
-				// A canonical `Repr` is its own answer.
+				// A canonical `Repr` or `Metadata` is its own answer.
 				let Some(value) = value.filter(|&value| value != projection)
 				else {
 					return Ok(projection);
@@ -1695,21 +1751,27 @@ impl TypeContext<'_, '_, '_> {
 					depth + 1,
 				)?
 			}
-			// An address, as wide as its memory's `Size`, and for a slice a
-			// length as wide again.
+			// An address, as wide as its memory's `Size`, then the pointee's
+			// counts, each as wide again (`Pointer::Metadata`).
 			Type::Pointer { to, memory, .. } => {
-				// Either thin or fat: its representation is not known here.
-				let Some(fat) = self.is_fat_pointee(assumption_context, to)?
-				else {
-					return Ok(false);
-				};
-				let start = out.len();
-				let is_stack_value =
-					self.push_address(assumption_context, memory, out, depth)?;
-				if fat {
-					out.extend_from_within(start..);
-				}
-				is_stack_value
+				let size = self.address_size(assumption_context, memory)?;
+				let metadata = self.pointer_metadata_value(
+					assumption_context,
+					to,
+					memory,
+					size,
+				)?;
+				self.push_stack_elements(
+					assumption_context,
+					size,
+					out,
+					depth + 1,
+				)? && self.push_stack_elements(
+					assumption_context,
+					metadata,
+					out,
+					depth + 1,
+				)?
 			}
 			// A slice or an array is never a value: only a pointer holds one.
 			Type::Slice { .. } | Type::Array { .. } => false,
@@ -1803,53 +1865,13 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// Whether a pointer to `to` is fat, an address and a length: `Some(true)`
-	/// for a slice, `Some(false)` for an array or anything that is not a
-	/// slice, and `None` for an abstract pointee assumed `Slice` but not
-	/// `Array`, which may be either. An abstract pointee not assumed `Slice`
-	/// is no slice or array, since only a parameter bounded by it may be one.
-	pub(super) fn is_fat_pointee(
-		&mut self,
-		assumption_context: TypeEnvIdx,
-		to: TypeIndex,
-	) -> Result<Option<bool>, SolverError> {
-		let to = self.normalize(
-			assumption_context,
-			to,
-			NormalizationDepth::Shallow,
-			RewriteFlags::ALL,
-		)?;
-		match *self.types.resolve(to) {
-			Type::Slice { .. } => Ok(Some(true)),
-			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-				let intrinsics = &self.defs.intrinsics;
-				let (Some(slice), Some(array)) =
-					(intrinsics.slice, intrinsics.array)
-				else {
-					return Ok(Some(false));
-				};
-				if self.assumes(assumption_context, to, array)?
-					|| !self.assumes(assumption_context, to, slice)?
-				{
-					Ok(Some(false))
-				} else {
-					Ok(None)
-				}
-			}
-			_ => Ok(Some(false)),
-		}
-	}
-
-	/// Appends one address into `memory`: its `Size`'s elements. An abstract
-	/// memory's is its abstract `Size`, the same element for every pointer
-	/// into it, so `M::*u8` and `M::Size` are held alike.
-	fn push_address(
+	/// The type of an address into `memory`: a declared memory's `Size`, or
+	/// `M::Size` for an abstract one.
+	pub(super) fn address_size(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		memory: TypeIndex,
-		out: &mut Vec<TypeIndex>,
-		depth: usize,
-	) -> Result<bool, SolverError> {
+	) -> Result<TypeIndex, SolverError> {
 		let memory = self.normalize(
 			assumption_context,
 			memory,
@@ -1868,7 +1890,92 @@ impl TypeContext<'_, '_, '_> {
 			Type::Error | Type::Infer => return Err(SolverError::Poisoned),
 			_ => self.memory_size(memory).ok_or(SolverError::Poisoned)?,
 		};
-		self.push_stack_elements(assumption_context, size, out, depth + 1)
+		Ok(size)
+	}
+
+	/// `<M::&T as Pointer>::Metadata` for `to` (`T`) and `memory` (`M`), whose
+	/// `Size` is `size`: `pointer_metadata`, or, for a pointee whose shape is
+	/// not known here, the projection over the shared pointer, so `M::*S` and
+	/// `M::&S` give one type.
+	pub(super) fn pointer_metadata_value(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		to: TypeIndex,
+		memory: TypeIndex,
+		size: TypeIndex,
+	) -> Result<TypeIndex, SolverError> {
+		if let Some(metadata) =
+			self.pointer_metadata(assumption_context, to, size)?
+		{
+			return Ok(metadata);
+		}
+		let intrinsics = &self.defs.intrinsics;
+		let (trait_index, assoc_type_index) = (
+			intrinsics.pointer.expect("std declares `Pointer`"),
+			intrinsics
+				.pointer_metadata
+				.expect("`Pointer` declares `Metadata`"),
+		);
+		let shared = self.types.intern(Type::Pointer {
+			to,
+			memory,
+			ownership: Ownership::Shared,
+		});
+		Ok(self.types.intern(Type::TypeProjection {
+			base: shared,
+			trait_index,
+			assoc_type_index,
+		}))
+	}
+
+	/// The counts a pointer to `pointee` carries beside its address, each a
+	/// `size`: a slice's length, then its element's own counts, so `[u8]`
+	/// gives `size` and `[[u8]]` `(size, size)`; `()` for anything else.
+	/// `None` when the pointee's shape is not known here: an abstract pointee
+	/// assumed `Slice` but not `Array` may be a slice or an array. One not
+	/// assumed `Slice` is neither, since only a parameter bounded by it may be.
+	pub(super) fn pointer_metadata(
+		&mut self,
+		assumption_context: TypeEnvIdx,
+		pointee: TypeIndex,
+		size: TypeIndex,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		let pointee = self.normalize(
+			assumption_context,
+			pointee,
+			NormalizationDepth::Shallow,
+			RewriteFlags::ALL,
+		)?;
+		match *self.types.resolve(pointee) {
+			Type::Slice { of } => {
+				let Some(element) =
+					self.pointer_metadata(assumption_context, of, size)?
+				else {
+					return Ok(None);
+				};
+				Ok(Some(if element == TypeIndex::UNIT {
+					size
+				} else {
+					self.types.intern_tuple(&[size, element])
+				}))
+			}
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				let intrinsics = &self.defs.intrinsics;
+				let (Some(slice), Some(array)) =
+					(intrinsics.slice, intrinsics.array)
+				else {
+					return Ok(Some(TypeIndex::UNIT));
+				};
+				if self.assumes(assumption_context, pointee, array)?
+					|| !self.assumes(assumption_context, pointee, slice)?
+				{
+					Ok(Some(TypeIndex::UNIT))
+				} else {
+					Ok(None)
+				}
+			}
+			_ => Ok(Some(TypeIndex::UNIT)),
+		}
 	}
 
 	/// Whether the facts in scope prove `ty: required` (`check_assumed_trait`);
@@ -2219,26 +2326,32 @@ impl TypeContext<'_, '_, '_> {
 		let Equalities::Final(equalities) = clauses.equalities else {
 			return Err(SolverError::Pending);
 		};
-		// Copied out: proving a clause normalizes through `self` again.
-		let trait_clauses = self.clauses.traits(clauses.traits).to_vec();
-		let equality_clauses = self.clauses.equalities(equalities).to_vec();
+		// A clause that reads a membership already failed derives from that
+		// failure, which is reported once. `failed` is empty, and no type is
+		// walked, unless a clause has failed.
 		let mut failed = Vec::new();
 		let mut satisfied = true;
-		for clause in trait_clauses {
-			if through_failed(&self.types, clause.subject, &failed) {
+		// Read one clause at a time: proving one normalizes through `self`
+		// again, and the arena only grows, so the ranges stay valid.
+		for at in 0..clauses.traits.len() {
+			let clause = self.clauses.traits(clauses.traits)[at];
+			if !failed.is_empty()
+				&& reads_failed(&self.types, clause.subject, &failed)
+			{
 				continue;
 			}
 			self.solver.record_proving(judgement, clause.origin);
-			let mut receiver =
-				rebase(&mut self.types, clause.subject, root, subject);
-			if clause.subject != root {
-				receiver = self.normalize(
+			let stated = rebase(&mut self.types, clause.subject, root, subject);
+			let receiver = if clause.subject == root {
+				stated
+			} else {
+				self.normalize(
 					assumption_context,
-					receiver,
+					stated,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
-				)?;
-			}
+				)?
+			};
 			if self
 				.find_trait_impl_query(
 					assumption_context,
@@ -2254,25 +2367,29 @@ impl TypeContext<'_, '_, '_> {
 				return Ok(false);
 			};
 			failures.push(UnsatisfiedClause::Trait {
-				subject: receiver,
+				subject: stated,
+				reduced: receiver,
 				trait_index: clause.trait_index,
 				source: clause.source,
 			});
 			satisfied = false;
 		}
-		for clause in &equality_clauses {
+		for at in 0..equalities.len() {
+			let clause = self.clauses.equalities(equalities)[at];
 			// A conflict is the declaration's own error.
-			if equality_clauses.iter().any(|other| {
+			if self.clauses.equalities(equalities).iter().any(|other| {
 				other.projection == clause.projection
 					&& known_distinct(&self.types, other.value, clause.value)
-			}) || through_failed(&self.types, clause.projection, &failed)
+			}) || !failed.is_empty()
+				&& (reads_failed(&self.types, clause.projection, &failed)
+					|| reads_failed(&self.types, clause.value, &failed))
 			{
 				continue;
 			}
 			self.solver.record_proving(judgement, clause.origin);
 			let projection =
 				rebase(&mut self.types, clause.projection, root, subject);
-			let expected = self.types.substitute(
+			let required = self.types.substitute(
 				clause.value,
 				Substitution {
 					envs: &self.type_envs,
@@ -2288,7 +2405,7 @@ impl TypeContext<'_, '_, '_> {
 			)?;
 			let expected = self.normalize(
 				assumption_context,
-				expected,
+				required,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
 			)?;
@@ -2303,6 +2420,7 @@ impl TypeContext<'_, '_, '_> {
 			};
 			failures.push(UnsatisfiedClause::Equality {
 				projection,
+				required,
 				found,
 				expected,
 				source: clause.source,

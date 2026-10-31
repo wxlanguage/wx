@@ -732,6 +732,12 @@ pub struct IntrinsicDefs {
 	pub slice_value: Option<AssocTypeIdx>,
 	/// `Array`'s declaration of `LEN`: an array's length.
 	pub array_len: Option<ConstIdx>,
+	/// `Pointer`, which the compiler implements for every pointer type, and
+	/// its declarations of `Memory`, `Pointee` and `Metadata`.
+	pub pointer: Option<TraitIdx>,
+	pub pointer_memory: Option<AssocTypeIdx>,
+	pub pointer_pointee: Option<AssocTypeIdx>,
+	pub pointer_metadata: Option<AssocTypeIdx>,
 }
 
 impl IntrinsicDefs {
@@ -786,6 +792,7 @@ impl IntrinsicDefs {
 			"StackValue" => &mut self.stack_value,
 			"Slice" => &mut self.slice,
 			"Array" => &mut self.array,
+			"Pointer" => &mut self.pointer,
 			_ => return None,
 		})
 	}
@@ -3247,6 +3254,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					self.intrinsics.memory_size = declared("Size");
 				} else if self.intrinsics.slice == this {
 					self.intrinsics.slice_value = declared("Value");
+				} else if self.intrinsics.pointer == this {
+					self.intrinsics.pointer_memory = declared("Memory");
+					self.intrinsics.pointer_pointee = declared("Pointee");
+					self.intrinsics.pointer_metadata = declared("Metadata");
 				} else if self.intrinsics.array == this {
 					self.intrinsics.array_len =
 						match member(BindingKey::value, "LEN") {

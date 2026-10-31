@@ -12301,6 +12301,33 @@ pub(super) mod tests {
 		);
 	}
 
+	/// A supertrait equality whose value reads the trait's own member derives
+	/// from the trait: without it, only the missing trait is reported.
+	#[test]
+	fn an_equality_reading_a_missing_trait_is_not_reported_again() {
+		test_case!(
+			case = indoc! {"
+			trait Base { type Item; }
+			trait Tr: Base where { Item = Self::Own } { type Own; }
+			impl Base for u8 { type Item = u8; }
+			impl Tr for u8 { type Own = u8; }
+			impl Base for u16 { type Item = u16; }
+			struct Needs<T: Tr>();
+			func ok(x: Needs<u8>) {}
+			func concrete(x: Needs<u16>) {}
+			func abstract<U: Base>(x: Needs<U>) {}
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `u16: Tr` is not satisfied");
+		case.diagnostics()
+			.assert_error_saying("the trait bound `U: Tr` is not satisfied");
+	}
+
 	#[test]
 	fn a_use_proves_a_nested_bound_on_the_projection() {
 		test_case!(
@@ -12324,7 +12351,13 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
-			"the trait bound `Bool: HasItem` is not satisfied",
+			"the trait bound `<Bool as Outer>::Inner: HasItem` is not satisfied",
+		);
+		let rendered = case.diagnostics().render();
+		assert!(
+			rendered
+				.contains("the trait `HasItem` is not implemented for `Bool`"),
+			"{rendered}"
 		);
 	}
 
@@ -12365,7 +12398,7 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
-			"type mismatch resolving `<u64 as HasItem>::Item == Bool`",
+			"type mismatch resolving `<u64 as HasItem>::Item == <T as Tr>::B`",
 		);
 	}
 

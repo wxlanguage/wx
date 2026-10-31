@@ -3080,12 +3080,10 @@ mod tests {
 	use crate::testing::DiagnosticView;
 	use crate::vfs::{self, FileId, Files};
 
-	const STDLIB: &str = include_str!("../../std/main.wx");
-
 	/// `test_case!(case = "source")` declares the graph, the inputs and the
 	/// swept `TestCase` borrowing them as three locals of the calling test.
-	/// The test's items are appended to the real stdlib, so operators,
-	/// memories and globals are checked against its actual traits.
+	/// The source is a binary over the real stdlib, so operators, memories
+	/// and globals are checked against its actual traits.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut graph = source_graph($source);
@@ -3101,18 +3099,18 @@ mod tests {
 
 	fn source_graph(source: &str) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
 						"main.wx".to_string(),
-						format!("{STDLIB}\n{source}"),
+						source.to_string(),
 					)]),
 				),
 			)
 			.unwrap();
-		builder.set_stdlib(root_id);
 		let graph = builder.build(root_id);
 		DiagnosticView::new(
 			"parse",
@@ -3206,12 +3204,14 @@ mod tests {
 			context.sweep();
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
-			let stdlib_end = STDLIB.len() as u32;
+			let root_file = defs
+				.namespaces
+				.file_id(Scope::Package(defs.root_package).into());
 			context.diagnostics.retain(|diagnostic| {
-				let in_stdlib =
-					diagnostic.labels.first().is_some_and(|label| {
-						(label.range.start as u32) < stdlib_end
-					});
+				let in_stdlib = diagnostic
+					.labels
+					.first()
+					.is_some_and(|label| label.file_id != root_file);
 				!(in_stdlib
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
@@ -3819,7 +3819,7 @@ mod tests {
 			.defs
 			.namespaces
 			.file_id(Scope::Package(case.defs.root_package).into());
-		let start = (STDLIB.len() + 1 + SOURCE.find("a + b").unwrap()) as u32;
+		let start = SOURCE.find("a + b").unwrap() as u32;
 		let site = (
 			crate::diagnostics::SourceSpan::new(
 				file_id,
@@ -4239,8 +4239,7 @@ mod tests {
 			.defs
 			.namespaces
 			.file_id(Scope::Package(case.defs.root_package).into());
-		let start =
-			(STDLIB.len() + 1 + SOURCE.rfind(":outer").unwrap() + 1) as u32;
+		let start = (SOURCE.rfind(":outer").unwrap() + 1) as u32;
 		let site = (
 			crate::diagnostics::SourceSpan::new(
 				file_id,
@@ -4432,7 +4431,7 @@ mod tests {
 				struct Node(value: u32, next: heap::*Node);
 				func read(p: heap::&Node) -> u32 { p.*.value }
 				func write(p: heap::*Node) { p.* = Node(1, p); p.*.value += 2; }
-				func address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
+				func value_address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
 				func next(p: heap::*Node) -> u32 { p.*.next.*.value }
 			"}
 		);
@@ -4442,7 +4441,10 @@ mod tests {
 			case.shape("write"),
 			"(block (store (* p#0) (Node 1 p#0)) (store += (. (* p#0) value) 2))"
 		);
-		assert_eq!(case.shape("address"), "(block => (.& (. (* p#0) value)))");
+		assert_eq!(
+			case.shape("value_address"),
+			"(block => (.& (. (* p#0) value)))"
+		);
 		assert_eq!(
 			case.shape("next"),
 			"(block => (load (. (* (load (. (* p#0) next))) value)))"
@@ -7028,6 +7030,154 @@ mod tests {
 			 (local w#6 (abstract last<[u8], heap> s#0)) \
 			 (local u#7 (abstract as_slice<[u16; 4], heap> (.& (* a#1)))))"
 		);
+	}
+
+	#[test]
+	fn pointers_have_the_pointer_trait() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Is<
+					P: Pointer where { Memory = M, Pointee = T },
+					M: Memory,
+					T,
+				>();
+				struct Needs<P: Pointer>();
+				func concrete(a: Is<heap::&u8, heap, u8>, b: Is<heap::*(u8, u64), heap, (u8, u64)>) {}
+				func generic<M: Memory, T>(p: Is<M::*T, M, T>) {}
+				func pointee<M: Memory, T>(x: <M::&T as Pointer>::Pointee) -> T { x }
+				func size<P: Pointer>(n: <P::Memory as Memory>::Size) {}
+				func element<M: Memory, S: Slice>(p: M::&<M::*S as Pointer>::Pointee) -> M::&S::Value { p[0].& }
+				func not_pointers(a: Needs<u32>, b: Needs<(heap::&u8, u8)>) {}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn a_pointer_carries_its_pointee_counts_as_metadata() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Is<P: Pointer where { Metadata = X }, X: StackValue>();
+				func concrete(
+					a: Is<heap::&u8, ()>,
+					b: Is<heap::&[u8], u32>,
+					c: Is<heap::*[u8; 4], ()>,
+					d: Is<heap::&[[u16]], (u32, u32)>,
+					e: Is<heap::&heap::&[u8], ()>,
+				) {}
+				func memory<M: Memory>(a: Is<M::&[u8], M::Size>, b: Is<M::*u8, ()>) {}
+				func thin<M: Memory, T, A: Array>(a: Is<M::&T, ()>, b: Is<M::*A, ()>) {}
+				func rigid<M: Memory, S: Slice>(
+					x: <M::*S as Pointer>::Metadata,
+				) -> <M::&S as Pointer>::Metadata {
+					x
+				}
+				func not_thin<M: Memory, S: Slice>(x: <M::&S as Pointer>::Metadata) -> () { x }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn a_pointer_is_held_as_its_address_and_metadata() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Needs<V: StackValue>();
+				func nested(p: heap::&[[u8]]) -> (u32, u32, u32) { transmute(p) }
+				func shared<M: Memory, S: Slice>(p: M::*S) -> M::&S { transmute(p) }
+				func held<M: Memory, S: Slice>(a: Needs<M::&S>, b: Needs<(M::*S, u8)>) {}
+				func not_thin<M: Memory, S: Slice>(p: M::&S) -> M::Size { transmute(p) }
+			"}
+		);
+		case.diagnostics().print();
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+	}
+
+	#[test]
+	fn a_pointer_is_built_from_and_taken_apart_into_its_parts() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func slice(address: u32, len: u32) -> heap::&[u8] {
+					from_raw_parts(address, len)
+				}
+				func value(address: u32) -> heap::*u64 { from_raw_parts(address, ()) }
+				func len(s: heap::&[u8]) -> u32 { metadata(s) }
+				func start(s: heap::&[u8]) -> u32 { address(s) }
+				func generic_address<M: Memory, T>(p: M::*T) -> M::Size { address(p) }
+				func thin(p: heap::*[u8; 4]) -> () { metadata(p) }
+				func generic_len<M: Memory, T>(s: M::&[T]) -> M::Size { metadata(s) }
+				func rebuild<P: Pointer>(p: P, at: <P::Memory as Memory>::Size) -> P {
+					from_raw_parts::<P>(at, metadata(p))
+				}
+				func round_trip<P: Pointer>(p: P) -> P { from_raw_parts(address(p), metadata(p)) }
+				func passed<P: Pointer>(p: P) -> P { transmute(p) }
+				func no_length(address: u32) -> heap::&[u8] { from_raw_parts(address, ()) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	/// The message states the equality with the use's arguments; the label
+	/// says what its sides reduce to.
+	#[test]
+	fn an_equality_mismatch_states_the_equality_and_shows_the_values() {
+		test_case!(
+			case = indoc! {"
+				trait Container { type Item; }
+				struct Bytes(); impl Container for Bytes { type Item = u8; }
+				struct Words(); impl Container for Words { type Item = u16; }
+				func same<A: Container, B: Container where { Item = A::Item }>() {}
+				func pair() { same::<Bytes, Words>(); }
+				func widen(x: u32) -> u64 { transmute(x) }
+			"}
+		);
+		let diagnostics = case.diagnostics();
+		diagnostics.assert_codes(&[
+			DiagnosticCode::AssocTypeEqualityMismatch,
+			DiagnosticCode::AssocTypeEqualityMismatch,
+		]);
+		diagnostics.assert_error_saying(
+			"type mismatch resolving \
+			 `<Words as Container>::Item == <Bytes as Container>::Item`",
+		);
+		diagnostics.assert_error_saying(
+			"type mismatch resolving \
+			 `<u64 as StackValue>::Repr == <u32 as StackValue>::Repr`",
+		);
+		let rendered = diagnostics.render();
+		assert!(
+			rendered.contains("expected `u8`, found `u16`"),
+			"{rendered}"
+		);
+		assert!(
+			rendered.contains("expected `i32`, found `i64`"),
+			"{rendered}"
+		);
+	}
+
+	/// std is the last place a name is looked up, so the program's own items
+	/// shadow its: `address(5)` calls the program's `address`, not std's.
+	#[test]
+	fn a_program_item_shadows_the_std_prelude() {
+		test_case!(
+			case = indoc! {"
+				struct Layout();
+				func trap() {}
+				func address(x: u32) -> u32 { x }
+				func f() -> u32 { address(5) }
+			"}
+		);
+		case.diagnostics().assert_none();
 	}
 
 	#[test]

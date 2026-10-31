@@ -2080,6 +2080,43 @@ pub func transmute<
     U: StackValue where { Repr = T::Repr },
 >(value: T) -> U;
 
+/// Every pointer type, `M::&T` and `M::*T`; the compiler answers it from the
+/// pointer's structure. `Metadata` is what the pointer carries beside its
+/// address, each count a `Memory::Size`: `()` for a pointer to a value or an
+/// array, the length for a pointer to a slice.
+pub trait Pointer: StackValue where {
+    Repr = <(Self::Memory::Size, Self::Metadata) as StackValue>::Repr,
+} {
+    type Memory: Memory;
+    type Pointee;
+    type Metadata: StackValue;
+}
+
+/// The pointer of type `P` at `address`, carrying `metadata` beside it.
+#[inline]
+pub func from_raw_parts<P: Pointer>(
+    address: P::Memory::Size,
+    metadata: P::Metadata,
+) -> P {
+    transmute(address, metadata)
+}
+
+/// What `pointer` carries beside its address: a slice's length, or `()`.
+#[inline]
+pub func metadata<P: Pointer>(pointer: P) -> P::Metadata {
+    local (_, metadata) =
+        transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+    metadata
+}
+
+/// Where `pointer` points: its address in its memory.
+#[inline]
+pub func address<P: Pointer>(pointer: P) -> P::Memory::Size {
+    local (address, _) =
+        transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+    address
+}
+
 pub trait Global {
     type Value: StackValue where { Repr: StackScalar };
 

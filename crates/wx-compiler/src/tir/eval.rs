@@ -44,6 +44,7 @@ use super::operators::Scalar;
 use super::signatures::TypeContext;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, Solver, SolverError, SolverFrame,
+	metadata_len,
 };
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
 use crate::ast::{BinaryOp, UnaryOp};
@@ -1483,18 +1484,18 @@ impl TypeContext<'_, '_, '_> {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				self.push_scalars(scope, repr, out, visiting)
 			}
-			// An address, and for a slice its length.
+			// An address, then the pointee's counts.
 			Type::Pointer { to, memory, .. } => {
-				let fat = match self.is_fat_pointee(scope, to) {
-					Ok(Some(fat)) => fat,
+				let scalar = self.address_scalar(scope, memory)?;
+				let metadata = self
+					.address_size(scope, memory)
+					.and_then(|size| self.pointer_metadata(scope, to, size));
+				let count = match metadata {
+					Ok(Some(metadata)) => metadata_len(&self.types, metadata),
 					Ok(None) => return Err(ConstValueState::NoValue),
 					Err(_) => return Err(ConstValueState::Poisoned),
 				};
-				let scalar = self.address_scalar(scope, memory)?;
-				out.push(scalar);
-				if fat {
-					out.push(scalar);
-				}
+				out.extend(std::iter::repeat_n(scalar, 1 + count));
 				Ok(())
 			}
 			Type::Tuple { elements } => {
@@ -2275,11 +2276,9 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 	use crate::vfs::{self, FileId, Files};
 
-	const STDLIB: &str = include_str!("../../std/main.wx");
-
 	/// `test_case!(case = "source")` declares the graph, the inputs and the
 	/// swept `TestCase` borrowing them as three locals of the calling test.
-	/// The test's items are appended to the real stdlib.
+	/// The source is a binary over the real stdlib.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut graph = source_graph($source);
@@ -2290,18 +2289,18 @@ mod tests {
 
 	fn source_graph(source: &str) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
 						"main.wx".to_string(),
-						format!("{STDLIB}\n{source}"),
+						source.to_string(),
 					)]),
 				),
 			)
 			.unwrap();
-		builder.set_stdlib(root_id);
 		let graph = builder.build(root_id);
 		DiagnosticView::new(
 			"parse",
@@ -2396,12 +2395,14 @@ mod tests {
 			context.sweep();
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
-			let stdlib_end = STDLIB.len() as u32;
+			let root_file = defs
+				.namespaces
+				.file_id(Scope::Package(defs.root_package).into());
 			context.diagnostics.retain(|diagnostic| {
-				let in_stdlib =
-					diagnostic.labels.first().is_some_and(|label| {
-						(label.range.start as u32) < stdlib_end
-					});
+				let in_stdlib = diagnostic
+					.labels
+					.first()
+					.is_some_and(|label| label.file_id != root_file);
 				!(in_stdlib
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))

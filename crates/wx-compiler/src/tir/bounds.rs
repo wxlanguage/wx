@@ -136,6 +136,10 @@ impl<T> ClauseRange<T> {
 		clauses: PhantomData,
 	};
 
+	pub(super) fn len(self) -> usize {
+		self.len as usize
+	}
+
 	fn slice(self, clauses: &[T]) -> &[T] {
 		&clauses[self.start as usize..][..self.len as usize]
 	}

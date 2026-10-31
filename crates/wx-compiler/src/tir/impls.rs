@@ -118,9 +118,9 @@ struct ImplDispatchBuilder<'a, 'ast> {
 
 impl IntrinsicDefs {
 	/// Whether `ty` has `trait_index` by the compiler's rule: a typed
-	/// function reference is a `Call`; every slice and array (`[T]`,
-	/// `[T; N]`) is a `Slice`, and an array an `Array`. `None` when the rule
-	/// says nothing about the pair.
+	/// function reference is a `Call`; every pointer is a `Pointer`; every
+	/// slice and array (`[T]`, `[T; N]`) is a `Slice`, and an array an
+	/// `Array`. `None` when the rule says nothing about the pair.
 	pub(super) fn implements_structurally(
 		&self,
 		ty: &Type,
@@ -130,6 +130,9 @@ impl IntrinsicDefs {
 		let is_array = match *ty {
 			Type::TypedFuncref { .. } => {
 				return (this == self.call).then_some(true);
+			}
+			Type::Pointer { .. } => {
+				return (this == self.pointer).then_some(true);
 			}
 			Type::Slice { .. } => false,
 			Type::Array { .. } => true,

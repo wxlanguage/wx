@@ -225,12 +225,13 @@ impl TypeContext<'_, '_, '_> {
 			let diagnostic = match failure {
 				UnsatisfiedClause::Trait {
 					subject,
+					reduced,
 					trait_index,
 					source,
 				} => self.report_trait_bound_violation(
 					reference.file_id,
 					Spanned {
-						inner: subject,
+						inner: (subject, reduced),
 						span: argument.span,
 					},
 					trait_index,
@@ -239,12 +240,13 @@ impl TypeContext<'_, '_, '_> {
 				),
 				UnsatisfiedClause::Equality {
 					projection,
+					required,
 					found,
 					expected,
 					source,
 				} => self.report_equality_mismatch(
 					SourceSpan::new(reference.file_id, argument.span),
-					projection,
+					(projection, required),
 					found,
 					expected,
 					source,
@@ -377,15 +379,22 @@ impl TypeContext<'_, '_, '_> {
 		Err(SolverError::Poisoned)
 	}
 
+	/// The message states the clause with the use's arguments; the label
+	/// names the type it reduces to, which lacks the trait.
 	fn report_trait_bound_violation(
 		&self,
 		file_id: FileId,
-		argument: Spanned<TypeIndex>,
+		argument: Spanned<(TypeIndex, TypeIndex)>,
 		trait_index: TraitIdx,
 		bound_id: BoundId,
 		owner: TypeEnvOwner,
 	) -> Diagnostic<FileId> {
-		let arg_name = self.type_formatter().display_type(argument.inner);
+		let formatter = self.type_formatter();
+		let (subject, reduced) = argument.inner;
+		let (subject, reduced) = (
+			formatter.display_type(subject),
+			formatter.display_type(reduced),
+		);
 		let trait_name = self
 			.strings
 			.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
@@ -393,13 +402,13 @@ impl TypeContext<'_, '_, '_> {
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TraitBoundViolation.code())
 			.with_message(format!(
-				"the trait bound `{arg_name}: {trait_name}` is not satisfied"
+				"the trait bound `{subject}: {trait_name}` is not satisfied"
 			))
 			.with_label(
 				SourceSpan::new(file_id, argument.span)
 					.primary_label()
 					.with_message(format!(
-						"the trait `{trait_name}` is not implemented for `{arg_name}`"
+						"the trait `{trait_name}` is not implemented for `{reduced}`"
 					)),
 			)
 			.with_label(
@@ -417,20 +426,22 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// rustc's E0271: the projection a bound's equality names has another
-	/// value. The written equality is shown, since that is what the value
-	/// failed.
+	/// value. The message states the equality with the use's arguments, the
+	/// label what its two sides reduce to, and the written equality is shown,
+	/// since that is what the value failed.
 	fn report_equality_mismatch(
 		&self,
 		reference: SourceSpan,
-		projection: TypeIndex,
+		(projection, required): (TypeIndex, TypeIndex),
 		found: TypeIndex,
 		expected: TypeIndex,
 		source: BindingRef,
 		owner: TypeEnvOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter();
-		let (projection, found, expected) = (
+		let (projection, required, found, expected) = (
 			formatter.display_type(projection),
+			formatter.display_type(required),
 			formatter.display_type(found),
 			formatter.display_type(expected),
 		);
@@ -445,7 +456,7 @@ impl TypeContext<'_, '_, '_> {
 		Diagnostic::error()
 			.with_code(DiagnosticCode::AssocTypeEqualityMismatch.code())
 			.with_message(format!(
-				"type mismatch resolving `{projection} == {expected}`"
+				"type mismatch resolving `{projection} == {required}`"
 			))
 			.with_label(reference.primary_label().with_message(format!(
 				"expected `{expected}`, found `{found}`"

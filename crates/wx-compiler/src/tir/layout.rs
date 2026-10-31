@@ -28,7 +28,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::defs::{FieldOrder, StructIdx};
 use super::signatures::TypeContext;
-use super::solver::{NormalizationDepth, RewriteFlags, Solver, SolverError};
+use super::solver::{
+	NormalizationDepth, RewriteFlags, Solver, SolverError, metadata_len,
+};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
 use crate::index::index_newtype;
 
@@ -324,21 +326,23 @@ impl TypeContext<'_, '_, '_> {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				return self.piece(assumption_context, repr, visiting);
 			}
-			// An address, and for a slice its length, as wide as the memory's
-			// `Size`.
+			// An address, then the pointee's counts, each as wide as the
+			// memory's `Size`.
 			Type::Pointer { to, memory, .. } => {
-				let Some(fat) = self.is_fat_pointee(assumption_context, to)?
-				else {
-					return Ok(None);
-				};
 				let Some(primitive) =
 					self.address_primitive(assumption_context, memory)?
 				else {
 					return Ok(None);
 				};
+				let size = self.address_size(assumption_context, memory)?;
+				let Some(metadata) =
+					self.pointer_metadata(assumption_context, to, size)?
+				else {
+					return Ok(None);
+				};
 				Piece::Primitives {
 					primitive,
-					count: if fat { 2 } else { 1 },
+					count: 1 + metadata_len(&self.types, metadata) as u32,
 				}
 			}
 			// A slice or an array is no value's type: only a pointer holds
@@ -926,6 +930,24 @@ mod tests {
 		let wrap = param_aggregate(&mut case, "f", 5);
 		assert!(wrap.is_some());
 		assert_eq!(param_aggregate(&mut case, "f", 4), wrap);
+	}
+
+	#[test]
+	fn a_pointer_holds_one_count_per_slice_level() {
+		let source = with_memories(indoc! {"
+			func f<S: Slice, A: Array>(
+				a: heap::&[[u8]], b: wide::*[[[u16]]], c: heap::&[[u8; 4]],
+				d: heap::&S, e: heap::&A,
+			) {}
+		"});
+		test_case!(mut case = &source);
+		case.diagnostics().assert_none();
+		assert_eq!(param_layout(&mut case, "f", 0), Ok(known(12, 4)));
+		assert_eq!(param_layout(&mut case, "f", 1), Ok(known(32, 8)));
+		assert_eq!(param_layout(&mut case, "f", 2), Ok(known(8, 4)));
+		// A slice or an array: its counts are not known until it is.
+		assert_eq!(param_layout(&mut case, "f", 3), Ok(None));
+		assert_eq!(param_layout(&mut case, "f", 4), Ok(known(4, 4)));
 	}
 
 	#[test]

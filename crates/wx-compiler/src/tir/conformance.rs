@@ -924,12 +924,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			}
 			UnsatisfiedClause::Equality {
 				projection,
-				expected,
+				required,
 				..
 			} => format!(
 				"{} == {}",
 				formatter.display_type(projection),
-				formatter.display_type(expected),
+				formatter.display_type(required),
 			),
 		};
 		let expected_def = &self.defs.functions[usize::from(declaration)];
