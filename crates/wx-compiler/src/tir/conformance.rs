@@ -81,15 +81,13 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		// must satisfy them where the impl is written, with its parameters'
 		// bounds assumed.
 		let trait_env = self.traits[usize::from(trait_index)].env;
-		let arguments = self.types.push_list(&[target.inner]);
+		let args = self.generic_args.push([(target.inner, target.span)]);
 		let result = self.check_bound_requirements(
 			self.assumption_envs.of_frame(scope),
-			BoundRequirements::Parameter {
+			BoundRequirements::Frame {
 				env: trait_env,
-				index: 0,
-				arguments,
+				args,
 			},
-			target,
 			at_target,
 			owner,
 		);
@@ -147,10 +145,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					declaration: declaration_index,
 					trait_index,
 					receiver: target.inner,
-				},
-				Spanned {
-					inner: value,
-					span: reference.span,
+					value,
 				},
 				reference,
 				owner,
@@ -494,7 +489,10 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		let declaration_env =
 			self.functions[usize::from(declaration)].type_params;
 		// A declaration that writes no bound adds nothing to the impl's env.
-		let Some(own) = self.own_env(declaration_env) else {
+		let Some(own) = self
+			.assumption_envs
+			.own(&self.generic_envs, declaration_env)
+		else {
 			return impl_env;
 		};
 		let arguments: Box<[TypeIndex]> = std::iter::once(target)
@@ -508,16 +506,6 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		let contract = self.assumption_envs.push(impl_env, None);
 		*self.assumption_envs.clauses_mut(contract) = clauses;
 		contract
-	}
-
-	/// The env `function_env`'s function states clauses in, when it has one
-	/// of its own rather than sharing its trait's or impl's.
-	fn own_env(&self, function_env: GenericEnvIdx) -> Option<AssumptionEnvIdx> {
-		let parent = self.generic_envs.parent(function_env).expect(
-			"a function's own frame has its trait's or impl's around it",
-		);
-		let own = self.assumption_envs.of_frame(function_env);
-		(own != self.assumption_envs.of_frame(parent)).then_some(own)
 	}
 
 	/// `clauses`, written in `env`'s chain, with that chain's parameters
@@ -584,7 +572,8 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		if self.own_params(env).is_empty() {
 			return Ok(true);
 		}
-		let Some(own) = self.own_env(env) else {
+		let Some(own) = self.assumption_envs.own(&self.generic_envs, env)
+		else {
 			return Ok(true);
 		};
 		let arguments: Box<[TypeIndex]> =

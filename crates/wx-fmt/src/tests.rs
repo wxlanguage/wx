@@ -313,6 +313,14 @@ fn test_format_where_clause_assoc_type_bound() {
 		),
 		"func f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}\n",
 	);
+
+	// A constant's entries keep their `const`; `Self` is printed as written.
+	assert_eq!(
+		fmt(
+			"func f<Self: A where { const N: u8 }, B: A where { const N = 4 }>() {}"
+		),
+		"func f<Self: A where { const N: u8 }, B: A where { const N = 4 }>() {}\n",
+	);
 }
 
 #[test]

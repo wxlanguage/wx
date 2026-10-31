@@ -29,6 +29,7 @@ use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
 
 use crate::ast::Spanned;
+use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
 use crate::tir::defs::{
 	DefinitionRegistry, FunctionIdx, IntrinsicDefs, TypeAliasIdx,
@@ -160,6 +161,77 @@ impl TypeList {
 	/// This list's elements, out of the interner's `lists`.
 	fn slice(self, lists: &[TypeIndex]) -> &[TypeIndex] {
 		&lists[self.start as usize..][..self.len as usize]
+	}
+}
+
+/// The generic arguments of one use of an item (a written type, a path, a
+/// call, a selected impl): a run of `GenericArgArena`, flat over the item's
+/// whole chain as `Substitution` reads them.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(Clone, Copy)]
+pub(super) struct GenericArgs {
+	start: u32,
+	len: u32,
+}
+
+impl GenericArgs {
+	pub(super) const EMPTY: GenericArgs = GenericArgs { start: 0, len: 0 };
+
+	pub(super) fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub(super) fn is_empty(self) -> bool {
+		self.len == 0
+	}
+
+	/// The first `len` arguments: those of a flat list's outer frames.
+	pub(super) fn prefix(self, len: usize) -> GenericArgs {
+		assert!(len <= self.len(), "a prefix longer than its arguments");
+		GenericArgs {
+			start: self.start,
+			len: len as u32,
+		}
+	}
+
+	fn range(self) -> std::ops::Range<usize> {
+		self.start as usize..(self.start + self.len) as usize
+	}
+}
+
+/// Every use's generic arguments, each with the span it is given at: the
+/// written argument, the value it was learned from, or the use. Uses are
+/// not interned, so this is apart from the interner's lists.
+#[derive(Default)]
+pub(super) struct GenericArgArena {
+	types: Vec<TypeIndex>,
+	spans: Vec<TextSpan>,
+}
+
+impl GenericArgArena {
+	pub(super) fn push(
+		&mut self,
+		args: impl IntoIterator<Item = (TypeIndex, TextSpan)>,
+	) -> GenericArgs {
+		let start = self.types.len();
+		for (ty, span) in args {
+			self.types.push(ty);
+			self.spans.push(span);
+		}
+		GenericArgs {
+			start: u32::try_from(start)
+				.expect("generic arguments exceeded u32"),
+			len: u32::try_from(self.types.len() - start)
+				.expect("generic arguments exceeded u32"),
+		}
+	}
+
+	pub(super) fn types(&self, args: GenericArgs) -> &[TypeIndex] {
+		&self.types[args.range()]
+	}
+
+	pub(super) fn spans(&self, args: GenericArgs) -> &[TextSpan] {
+		&self.spans[args.range()]
 	}
 }
 

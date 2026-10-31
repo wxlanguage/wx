@@ -56,8 +56,8 @@ use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 use super::solver::{ImplMember, Solver, SolverError};
 use super::typecheck::BodyContext;
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, ImplKind, Substitution, Type, TypeIndex,
-	TypeInterner, TypeList,
+	GenericArgArena, GenericEnvArena, GenericEnvIdx, ImplKind, Substitution,
+	Type, TypeIndex, TypeInterner, TypeList,
 };
 
 /// One accepted bound occurrence, decided once by
@@ -198,7 +198,7 @@ pub(super) enum InferSignatureKind {
 	Struct,
 	TypeAlias,
 	EnumRepr,
-	AssocTypeBinding,
+	AssocBinding,
 	Const,
 }
 
@@ -210,7 +210,7 @@ impl InferSignatureKind {
 			Self::Struct => "structs",
 			Self::TypeAlias => "type aliases",
 			Self::EnumRepr => "enum reprs",
-			Self::AssocTypeBinding => "associated type bindings",
+			Self::AssocBinding => "associated type bindings",
 			Self::Const => "consts",
 		}
 	}
@@ -701,6 +701,8 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// from the frames' identities in `generic_envs`. Grown once per frame,
 	/// right after `push_param_frame` created it.
 	pub(super) assumption_envs: AssumptionEnvArena,
+	/// Every use's generic arguments, with where each is given.
+	pub(super) generic_args: GenericArgArena,
 	pub(super) type_aliases: Vec<TypeAliasSignature>,
 	pub(super) traits: Vec<TraitSignature>,
 	pub(super) structs: Vec<StructSignature>,
@@ -729,6 +731,12 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Every declaration's obligations, one contiguous run per declaration
 	/// (`QueryEntry::obligations`).
 	pub(super) obligations: Vec<TypeObligation>,
+}
+
+/// Whether `param` is written `Self`: a bound on the trait's `Self`, never a
+/// parameter.
+fn is_self_entry(param: &ast::TypeParam) -> bool {
+	param.name().inner == ast::Keyword::SelfPascal.symbol()
 }
 
 impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
@@ -786,6 +794,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			clauses: ClauseArena::default(),
 			generic_envs: GenericEnvArena::new(),
 			assumption_envs: AssumptionEnvArena::new(),
+			generic_args: GenericArgArena::default(),
 			type_aliases: defs
 				.type_aliases
 				.iter()
@@ -879,19 +888,23 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		parent: GenericEnvIdx,
 		params: &[ast::TypeParam],
 	) -> GenericEnvIdx {
+		// `Self` is never a parameter: written first in a trait's function it
+		// bounds the trait's `Self`, and anywhere else it is reported.
+		let self_subject = self.self_entry(file_id, owner, parent, params);
+		let declared = || params.iter().filter(|param| !is_self_entry(param));
 		// An impl always owns a frame, even an empty one: it is where a `Self`
 		// written inside the impl finds the impl it means (`resolve_impl_self`).
 		let is_impl = matches!(
 			owner,
 			GenericEnvOwner::InherentImpl(_) | GenericEnvOwner::TraitImpl(_)
 		);
-		if params.is_empty() && !is_impl {
+		if declared().next().is_none() && !is_impl && self_subject.is_none() {
 			return parent;
 		}
 
-		for (index, param) in params.iter().enumerate() {
-			if let Some(colliding_param) = params[..index]
-				.iter()
+		for (index, param) in declared().enumerate() {
+			if let Some(colliding_param) = declared()
+				.take(index)
 				.find(|p| p.name().inner == param.name().inner)
 				.map(|p| p.name())
 			{
@@ -908,13 +921,16 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&mut self.types,
 			owner,
 			parent,
-			params.iter().map(|p| p.name()),
+			declared().map(|p| p.name()),
 		);
+		// What the bounds are written on: the trait's `Self` for a `Self`
+		// entry, else each parameter, in order.
+		let self_entry = self_subject.map(|_| &params[0]);
+		let written = || self_entry.into_iter().chain(declared());
 		// Only an item that writes a bound states clauses; any other shares
 		// its parent's env.
 		let parent_env = self.assumption_envs.of_frame(parent);
-		let own_env = params
-			.iter()
+		let own_env = written()
 			.any(|param| {
 				matches!(
 					param,
@@ -940,12 +956,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			_ => {}
 		}
 
-		// A single walk per param decides which bound occurrences exist;
-		// both the membership pass below and the source-bound pass after it
-		// consume that same decided tree, so they cannot disagree about what
-		// they saw. See `collect_bound_occurrences`.
-		let mut occurrences_per_param = Vec::with_capacity(params.len());
-		for ast_param in params {
+		// A single walk per written bound decides which bound occurrences
+		// exist; both the membership pass below and the source-bound pass
+		// after it consume that same decided tree, so they cannot disagree
+		// about what they saw. See `collect_bound_occurrences`.
+		let mut bounded = Vec::new();
+		for (at, ast_param) in written().enumerate() {
+			let subject = match self_subject {
+				Some(self_type) if at == 0 => self_type,
+				_ => {
+					let slot = at - usize::from(self_subject.is_some());
+					self.generic_envs.param_types(generic_env)[slot]
+				}
+			};
 			let mut occurrences = Vec::new();
 			match ast_param {
 				ast::TypeParam::Type {
@@ -977,16 +1000,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						),
 				),
 			}
-			occurrences_per_param.push(occurrences);
+			bounded.push((subject, ast_param.name().inner, occurrences));
 		}
 
 		// Publish every sibling's memberships first: an equality's value,
 		// resolved next, can name the members they supply. No value is
 		// resolved here.
 		let mut traits = Vec::new();
-		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
-			let subject = self.generic_envs.param_types(generic_env)[index];
-			self.collect_occurrence_clauses(&mut traits, subject, occurrences);
+		for (subject, _, occurrences) in &bounded {
+			self.collect_occurrence_clauses(&mut traits, *subject, occurrences);
 		}
 		if let Some(env) = own_env {
 			*self.assumption_envs.clauses_mut(env) = BoundClauses {
@@ -998,33 +1020,25 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		// Resolve source bounds now that every sibling has provisional
 		// memberships published, so an equality RHS can reference them.
 		// Bound IDs were published above; filling their sources preserves them.
-		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
-			let subject = self.generic_envs.param_types(generic_env)[index];
-			self.fill_source_bounds(
-				obligations,
-				LexicalScope {
-					file_id,
-					namespace,
-					generic_env,
-					assumption_env: self.assumption_envs.of_frame(generic_env),
-				},
-				subject,
-				occurrences,
-			);
+		let scope = LexicalScope {
+			file_id,
+			namespace,
+			generic_env,
+			assumption_env: self.assumption_envs.of_frame(generic_env),
+		};
+		for (subject, _, occurrences) in &bounded {
+			self.fill_source_bounds(obligations, scope, *subject, occurrences);
 		}
 
 		let mut equalities = Vec::new();
-		for (index, (ast_param, occurrences)) in
-			params.iter().zip(&occurrences_per_param).enumerate()
-		{
-			let subject = self.generic_envs.param_types(generic_env)[index];
+		for (subject, name, occurrences) in &bounded {
 			let ids: Box<[BoundId]> =
 				occurrences.iter().map(|o| o.id).collect();
 			self.collect_equality_clauses(
 				&mut equalities,
-				subject,
+				*subject,
 				&ids,
-				ast_param.name().inner,
+				*name,
 			);
 		}
 		if let Some(env) = own_env {
@@ -1033,6 +1047,66 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 
 		generic_env
+	}
+
+	/// What a `Self` written first in `params` stands for: in a trait's
+	/// function, the trait's `Self`, which its bounds describe. Every other
+	/// `Self` is reported; none declares a parameter.
+	fn self_entry(
+		&mut self,
+		file_id: FileId,
+		owner: GenericEnvOwner,
+		parent: GenericEnvIdx,
+		params: &[ast::TypeParam],
+	) -> Option<TypeIndex> {
+		let mut subject = None;
+		for (index, param) in params.iter().enumerate() {
+			if !is_self_entry(param) {
+				continue;
+			}
+			let label =
+				SourceSpan::new(file_id, param.name().span).primary_label();
+			let enclosing = (parent != GenericEnvIdx::ROOT)
+				.then(|| self.generic_envs.owner(parent));
+			let diagnostic = match (index, owner, enclosing, param) {
+				(
+					0,
+					GenericEnvOwner::Function(_),
+					Some(GenericEnvOwner::Trait(_)),
+					ast::TypeParam::Type { .. },
+				) => {
+					subject = Some(self.generic_envs.param_types(parent)[0]);
+					continue;
+				}
+				(
+					0,
+					GenericEnvOwner::Function(_),
+					Some(GenericEnvOwner::TraitImpl(_)),
+					ast::TypeParam::Type { .. },
+				) => Diagnostic::bug()
+					.with_code(DiagnosticCode::UnsupportedExpression.code())
+					.with_message(
+						"bounds on `Self` in a trait impl are not supported yet",
+					)
+					.with_label(label),
+				(0, ..) => Diagnostic::error()
+					.with_code(DiagnosticCode::MisplacedSelfBound.code())
+					.with_message("only a trait's function can bound `Self`")
+					.with_label(label.with_message("not a parameter here"))
+					.with_note(
+						"`Self` is a trait's parameter; a function written in \
+						 it can require more of it",
+					),
+				_ => Diagnostic::error()
+					.with_code(DiagnosticCode::MisplacedSelfBound.code())
+					.with_message("`Self` can be bounded only first")
+					.with_label(
+						label.with_message("write it before the parameters"),
+					),
+			};
+			self.diagnostics.push(diagnostic);
+		}
+		subject
 	}
 
 	/// What `Self` means inside an impl: the impl's target, found through the
@@ -1177,7 +1251,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					obligations,
 					scope,
 					arg,
-					InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
+					InferPolicy::Reject(InferSignatureKind::AssocBinding),
 				)
 			})
 			.collect();
@@ -1772,17 +1846,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			index
 		};
 		let memory_type = self.types.intern(Type::Memory { memory_index });
-		let checked_size = self.record_bounds_check(
+		self.record_bounds_check(
 			obligations,
 			AssumptionEnvIdx::ROOT,
 			BoundRequirements::AssociatedType {
 				declaration: declared_size_index,
 				trait_index: memory_trait,
 				receiver: memory_type,
-			},
-			Spanned {
-				inner: resolved_size,
-				span: size.span,
+				value: resolved_size,
 			},
 			SourceSpan::new(file_id, size.span),
 			GenericEnvOwner::Trait(memory_trait),
@@ -1792,7 +1863,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
 				clauses: BoundClauses::NONE,
-				value: Some(checked_size),
+				value: Some(resolved_size),
 			});
 		self.trait_impls[usize::from(trait_impl_index)] =
 			Some(TraitImplSignature {
@@ -1842,9 +1913,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		else {
 			panic!("the stdlib's `Global` trait must declare `type Value`")
 		};
-		let resolved_value = if value.inner == TypeIndex::ERROR {
-			value.inner
-		} else {
+		if value.inner != TypeIndex::ERROR {
 			self.record_bounds_check(
 				obligations,
 				AssumptionEnvIdx::ROOT,
@@ -1852,18 +1921,18 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					declaration: declared_value_index,
 					trait_index: global_trait,
 					receiver: global_type,
+					value: value.inner,
 				},
-				value,
 				SourceSpan::new(file_id, value.span),
 				GenericEnvOwner::Trait(global_trait),
-			)
-		};
+			);
+		}
 
 		self.assoc_types[usize::from(value_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
 				clauses: BoundClauses::NONE,
-				value: Some(resolved_value),
+				value: Some(value.inner),
 			});
 
 		self.trait_impls[usize::from(trait_impl_index)] =
@@ -2168,9 +2237,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								.of_frame(self_scope),
 						},
 						value,
-						InferPolicy::Reject(
-							InferSignatureKind::AssocTypeBinding,
-						),
+						InferPolicy::Reject(InferSignatureKind::AssocBinding),
 					)
 				});
 				self.assoc_types[usize::from(assoc_type_index)] =
@@ -3333,7 +3400,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		type_expr: &Spanned<ast::TypeExpression>,
 	) -> TypeIndex {
 		let infer_policy =
-			InferPolicy::Reject(InferSignatureKind::AssocTypeBinding);
+			InferPolicy::Reject(InferSignatureKind::AssocBinding);
 		let declaration = self
 			.impl_dispatch
 			.trait_header(impl_index)
@@ -4669,6 +4736,29 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let id = self.bounds.reserve(trait_index, span);
 		let mut occurrence_bindings = Vec::new();
 		for binding in bindings.iter() {
+			if let ast::AssocBindingKind::ConstFits { const_span, .. }
+			| ast::AssocBindingKind::ConstEquals { const_span, .. } = binding.kind
+			{
+				self.diagnostics.push(
+					Diagnostic::bug()
+						.with_code(DiagnosticCode::UnsupportedExpression.code())
+						.with_message(
+							"constraints on an associated constant are not \
+							 supported yet",
+						)
+						.with_label(
+							SourceSpan::new(
+								file_id,
+								TextSpan::new(
+									const_span.start,
+									binding.name.span.end,
+								),
+							)
+							.primary_label(),
+						),
+				);
+				continue;
+			}
 			let target = match self.binding_target(
 				trait_index,
 				binding.name.inner,
@@ -4714,10 +4804,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				continue;
 			}
 			let kind = match &binding.kind {
-				ast::AssocTypeBindingKind::Equals(ty) => {
+				ast::AssocBindingKind::Equals(ty) => {
 					BindingOccurrenceKind::Equals(ty)
 				}
-				ast::AssocTypeBindingKind::Bound(rhs) => {
+				ast::AssocBindingKind::Bound(rhs) => {
 					let mut nested = Vec::new();
 					self.collect_bound_occurrences(
 						file_id,
@@ -4726,6 +4816,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						&mut nested,
 					);
 					BindingOccurrenceKind::Bound(nested)
+				}
+				ast::AssocBindingKind::ConstFits { .. }
+				| ast::AssocBindingKind::ConstEquals { .. } => {
+					unreachable!("a constant's entry is reported above")
 				}
 			};
 			occurrence_bindings.push(BindingOccurrence {
@@ -4769,7 +4863,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							scope,
 							ty,
 							InferPolicy::Reject(
-								InferSignatureKind::AssocTypeBinding,
+								InferSignatureKind::AssocBinding,
 							),
 						);
 						let value = Spanned {
@@ -4789,8 +4883,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 										.assoc_type_index,
 									trait_index: binding.target.trait_index,
 									receiver: subject,
+									value: value.inner,
 								},
-								value,
 								SourceSpan::new(scope.file_id, ty.span),
 								GenericEnvOwner::Trait(
 									binding.target.trait_index,

@@ -669,9 +669,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		if is_primitive_binary(plain, ty) {
 			return Some(CompoundMethod::Primitive);
 		}
-		Some(CompoundMethod::Method(
-			self.select_operator_method(selected, ty),
-		))
+		Some(CompoundMethod::Method(self.select_operator_method(
+			selected,
+			ty,
+			target_span,
+		)))
 	}
 
 	/// Reports a write through a shared pointer.

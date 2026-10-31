@@ -2944,6 +2944,60 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 }
 
 #[test]
+fn a_constant_binding_is_marked_const() {
+	let case = TestCase::new(indoc! {"
+        func f<A: Array where { const LEN: u8 }, B: Array where { const LEN = 4 }>() {}
+    "});
+	case.diagnostics().assert_none();
+	let Item::Function { signature, .. } = case.item(0) else {
+		panic!("expected function")
+	};
+	let kinds: Vec<_> = signature
+		.type_params
+		.iter()
+		.map(|param| {
+			let bounds = bounds(param).expect("expected bounds");
+			let BoundExpression::WithBindings { bindings, .. } = &bounds.inner
+			else {
+				panic!("expected WithBindings")
+			};
+			&bindings[0].kind
+		})
+		.collect();
+	assert!(matches!(kinds[0], AssocBindingKind::ConstFits { .. }));
+	assert!(matches!(
+		kinds[1],
+		AssocBindingKind::ConstEquals {
+			value: Spanned {
+				inner: ConstArgument::Literal(_),
+				..
+			},
+			..
+		}
+	));
+}
+
+#[test]
+fn self_is_a_type_parameter_name() {
+	// Where it may stand is the signature's to check, as for `self`.
+	let case = TestCase::new(indoc! {"
+        trait Tr { func f<Self: Other, T>(); }
+    "});
+	case.diagnostics().assert_none();
+	let Item::Trait { items, .. } = case.item(0) else {
+		panic!("expected trait")
+	};
+	let TraitItem::Function { signature, .. } = &items[0].inner.inner else {
+		panic!("expected function")
+	};
+	assert_eq!(signature.type_params.len(), 2);
+	assert_eq!(
+		case.strings.resolve(signature.type_params[0].name().inner),
+		Some("Self")
+	);
+}
+
+#[test]
 fn test_impl_trait_multi_segment_trait_name() {
 	// `impl gfx::Drawable for Point` — trait_name must be two path segments.
 	let case = TestCase::new(indoc! {"

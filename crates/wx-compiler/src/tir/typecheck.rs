@@ -63,8 +63,8 @@ use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{
-	GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type, TypeIndex,
-	TypeList,
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
+	TypeIndex,
 };
 use crate::ast::{
 	self, BinaryOp, Keyword, Ownership, Separated, Spanned, UnaryOp,
@@ -863,7 +863,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				);
 				let kind = ExprKind::Const {
 					constant: const_index,
-					type_args: TypeList::EMPTY,
+					type_args: GenericArgs::EMPTY,
 				};
 				self.body.push(kind, ty, span)
 			}
@@ -1167,14 +1167,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&mut type_args,
 		);
 		self.expect_arguments(&target, &type_args, &given);
-		let type_list = self.cx.types.push_list(&type_args);
-		self.check_frame_bounds(
-			&target,
-			target.generic_env,
-			segment,
-			type_list,
-			&given,
-		);
+		let args = self.use_args(&target, segment, &type_args, &given);
+		self.check_use_bounds(&target, 0, segment, args);
 		let fields = self
 			.arguments_value(&target, &type_args, &given, 0, reported, span);
 		let ty = self.cx.types.intern_struct(struct_index, &type_args);
@@ -1272,64 +1266,72 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// Records and checks the bounds of the parameters of `frame`, a frame on
-	/// `target`'s chain, for their final type arguments, at the call,
-	/// wherever they were learned from. `arguments` are flat, the stored list
-	/// the caller shares with whatever else reads it (the call's node). Each
-	/// is reported at its written argument (the target's own frame is the
-	/// one written on `segment`), else at the value given for a parameter of
-	/// `target` whose declared type is that type parameter, else at the name.
-	fn check_frame_bounds(
+	/// The flat `type_args` of a use of `target` through `segment`, each
+	/// with where it is given: the argument written on `segment`, else the
+	/// value given for a parameter declared as that type parameter (a
+	/// receiver for `Self`), else the name.
+	fn use_args(
 		&mut self,
 		target: &CallTarget<'_>,
-		frame: GenericEnvIdx,
 		segment: &ast::PathSegment,
-		arguments: TypeList,
+		type_args: &[TypeIndex],
 		given: &[GivenArgument],
-	) {
-		let own = self.cx.generic_envs.param_names(frame).len();
-		if own == 0 {
-			return;
-		}
-		let start = self.cx.generic_envs.parent_count(frame);
-		let arguments = arguments.prefix(start + own);
-		let owner = self.cx.generic_envs.owner(frame);
-		let written: &[_] = if owner == target.kind.owner() {
-			&segment.type_args
-		} else {
-			&[]
+	) -> GenericArgs {
+		let env = target.generic_env;
+		let written_from = (env != GenericEnvIdx::ROOT
+			&& self.cx.generic_envs.owner(env) == target.kind.owner())
+		.then(|| self.cx.generic_envs.parent_count(env));
+		let identity = self.cx.generic_envs.identity_args(env);
+		let body = &self.body;
+		let span_of = |slot: usize| {
+			if let Some(written) = written_from
+				.and_then(|start| slot.checked_sub(start))
+				.and_then(|at| segment.type_args.get(at))
+			{
+				return written.span();
+			}
+			given
+				.iter()
+				.find(|argument| argument.declared == identity[slot])
+				.map_or(segment.ident.span, |argument| {
+					body.span(argument.value)
+				})
 		};
-		for index in 0..own {
-			let argument = self.cx.types.list(arguments)[start + index];
-			let span = match written.get(index) {
-				Some(written) => written.span(),
-				None => {
-					let param = self.cx.generic_envs.param_types(frame)[index];
-					let mut span = segment.ident.span;
-					for argument in given {
-						if argument.declared == param {
-							span = self.body.span(argument.value);
-							break;
-						}
-					}
-					span
-				}
-			};
-			self.cx.record_bounds_check(
-				&mut self.obligations.types,
-				self.scope.assumption_env,
-				BoundRequirements::Parameter {
-					env: frame,
-					index,
-					arguments,
-				},
-				Spanned {
-					inner: argument,
-					span,
-				},
-				SourceSpan::new(self.scope.file_id, span),
-				owner,
-			);
+		self.cx.generic_args.push(
+			type_args
+				.iter()
+				.enumerate()
+				.map(|(slot, &ty)| (ty, span_of(slot))),
+		)
+	}
+
+	/// Proves, for a use's final `args`, the bounds of each frame on
+	/// `target`'s chain after the first `proven` arguments: the selection
+	/// proved those.
+	fn check_use_bounds(
+		&mut self,
+		target: &CallTarget<'_>,
+		proven: usize,
+		segment: &ast::PathSegment,
+		args: GenericArgs,
+	) {
+		let mut frame = target.generic_env;
+		while frame != GenericEnvIdx::ROOT {
+			let start = self.cx.generic_envs.parent_count(frame);
+			if start >= proven {
+				let own = self.cx.generic_envs.param_names(frame).len();
+				self.cx.record_bounds_check(
+					&mut self.obligations.types,
+					self.scope.assumption_env,
+					BoundRequirements::Frame {
+						env: frame,
+						args: args.prefix(start + own),
+					},
+					SourceSpan::new(self.scope.file_id, segment.ident.span),
+					self.cx.generic_envs.owner(frame),
+				);
+			}
+			frame = self.cx.generic_envs.parent(frame).unwrap();
 		}
 	}
 
@@ -1908,7 +1910,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let span = self.body.span(receiver);
 			self.pack([], ElementOrder::InOrder, TypeIndex::UNIT, span)
 		});
-		match self.select_operator_method(selected, ty) {
+		let span = self.body.span(receiver);
+		match self.select_operator_method(selected, ty, span) {
 			SelectedMethod::Concrete {
 				function,
 				type_args,
@@ -1937,6 +1940,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		(method, lookup): (OperatorMethod, TraitImplLookup),
 		ty: TypeIndex,
+		span: TextSpan,
 	) -> SelectedMethod {
 		if let TraitImplLookup::Concrete { impl_index, args } = lookup
 			&& let TraitMemberSelection::Impl(
@@ -1947,12 +1951,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			) {
 			return SelectedMethod::Concrete {
 				function,
-				type_args: self.cx.types.push_list(&args),
+				type_args: self
+					.cx
+					.generic_args
+					.push(args.iter().map(|&arg| (arg, span))),
 			};
 		}
 		SelectedMethod::Abstract {
 			method: method.method,
-			type_args: self.cx.types.push_list(&[ty]),
+			type_args: self.cx.generic_args.push([(ty, span)]),
 		}
 	}
 
@@ -2137,7 +2144,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			} => (constant, type_args),
 			_ => unreachable!("only a constant's fit is decided"),
 		};
-		let args = self.cx.types.list(type_args).to_vec();
+		let args = self.cx.generic_args.types(type_args).to_vec();
 		match self.cx.resolve_constant(constant, &args).ok()? {
 			ResolvedConstant::Length(length) => {
 				let length = self.cx.normalize(
@@ -2925,13 +2932,13 @@ enum SelectedMethod {
 	/// The selected impl's own method, called directly.
 	Concrete {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// The trait's declaration, whose impl is selected once the receiver is
 	/// known.
 	Abstract {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 }
 
@@ -3723,7 +3730,7 @@ mod tests {
 		fn constant_name(
 			&self,
 			index: super::ConstIdx,
-			type_args: super::TypeList,
+			type_args: super::GenericArgs,
 		) -> String {
 			let name = self.defs.constants[usize::from(index)].name.inner;
 			self.with_type_args(
@@ -3737,7 +3744,7 @@ mod tests {
 		fn callee(
 			&self,
 			index: super::FunctionIdx,
-			type_args: super::TypeList,
+			type_args: super::GenericArgs,
 		) -> String {
 			self.with_type_args(self.function_name(index), type_args)
 		}
@@ -3745,9 +3752,9 @@ mod tests {
 		fn with_type_args(
 			&self,
 			name: &str,
-			type_args: super::TypeList,
+			type_args: super::GenericArgs,
 		) -> String {
-			let type_args = self.context.types.list(type_args);
+			let type_args = self.context.generic_args.types(type_args);
 			if type_args.is_empty() {
 				return name.to_string();
 			}
@@ -5135,6 +5142,119 @@ mod tests {
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::UnsupportedExpression,
+		]);
+	}
+
+	#[test]
+	fn constant_bindings_are_not_checked_yet() {
+		test_case!(
+			case = indoc! {r#"
+				func g<A: Array where { const LEN: u8 }, B: Array where { const LEN = 4 }>() {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::UnsupportedExpression,
+		]);
+	}
+
+	#[test]
+	fn a_trait_function_bounding_self_assumes_it_in_its_body() {
+		// `Self` written first is no parameter: `f` takes one argument.
+		test_case!(
+			case = indoc! {r#"
+				trait Show { func show(self: Self); }
+				trait Tr {
+					func f<Self: Show, T>(self: Self, t: T) { self.show() }
+					func g<Self: Show>(self: Self) { self.show() }
+				}
+				func call<X: Tr + Show>(x: X) { x.f::<u8>(1); x.g() }
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_call_proves_what_a_trait_function_requires_of_self() {
+		test_case!(
+			case = indoc! {r#"
+				trait Show { func show(self: Self); }
+				trait Tr {
+					func f<Self: Show>(self: Self) { self.show() }
+				}
+				struct A();
+				impl Tr for A {}
+				struct B();
+				impl Show for B { func show(self: Self) {} }
+				impl Tr for B {}
+				func concrete(a: A, b: B) { a.f(); b.f() }
+				func generic<X: Tr>(x: X) { x.f() }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `A: Show` is not satisfied");
+		case.diagnostics()
+			.assert_error_saying("the trait bound `X: Show` is not satisfied");
+	}
+
+	#[test]
+	fn a_bound_is_reported_where_its_argument_is_given() {
+		let source = indoc! {r#"
+			trait Show { func show(self: Self); }
+			trait Tr { func f<Self: Show>(self: Self) {} }
+			struct A();
+			impl Tr for A {}
+			func g<T: Show, U: Show>(t: T, u: U) {}
+			func h<T: Show>() {}
+			func calls(first: A, second: A, third: A) {
+				g(first, second);
+				h::<A>();
+				third.f()
+			}
+		"#};
+		test_case!(case = source);
+		case.diagnostics().print();
+		let at: Vec<&str> = case
+			.context
+			.diagnostics
+			.iter()
+			.filter(|diagnostic| {
+				diagnostic.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code())
+			})
+			.map(|diagnostic| &source[diagnostic.labels[0].range.clone()])
+			.collect();
+		assert_eq!(at, ["first", "second", "A", "third"]);
+	}
+
+	#[test]
+	fn self_is_bounded_only_first_in_a_trait_function() {
+		test_case!(
+			case = indoc! {r#"
+				trait Show {}
+				trait Tr {
+					func late<T, Self: Show>(t: T);
+					func f(self: Self);
+				}
+				struct S<Self>(u8);
+				func free<Self: Show>() {}
+				impl S { func inherent<Self: Show>() {} }
+				impl Tr for S {
+					func late<T>(t: T) {}
+					func f<Self: Show>(self: Self) {}
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedSelfBound,
+			DiagnosticCode::MisplacedSelfBound,
+			DiagnosticCode::MisplacedSelfBound,
+			DiagnosticCode::MisplacedSelfBound,
 			DiagnosticCode::UnsupportedExpression,
 		]);
 	}

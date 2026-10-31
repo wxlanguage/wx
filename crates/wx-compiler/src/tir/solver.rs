@@ -100,12 +100,14 @@ impl Subjects {
 	}
 }
 
-/// Why a bound does not hold, for the check that owns it to report.
+/// Why a bound does not hold, for the check that owns it to report. `written`
+/// is the clause's subject as the declaration writes it.
 pub(super) enum UnsatisfiedClause {
 	/// `subject` lacks `trait_index`, which the bound `source` requires.
 	/// `subject` is the clause's subject as stated, with the use's arguments;
 	/// `reduced` is what it reduces to.
 	Trait {
+		written: TypeIndex,
 		subject: TypeIndex,
 		reduced: TypeIndex,
 		trait_index: TraitIdx,
@@ -115,12 +117,22 @@ pub(super) enum UnsatisfiedClause {
 	/// `projection` and `required` are the equality's sides as stated, with
 	/// the use's arguments; `found` and `expected` are what they reduce to.
 	Equality {
+		written: TypeIndex,
 		projection: TypeIndex,
 		required: TypeIndex,
 		found: TypeIndex,
 		expected: TypeIndex,
 		source: BindingRef,
 	},
+}
+
+impl UnsatisfiedClause {
+	pub(super) fn written(&self) -> TypeIndex {
+		match *self {
+			UnsatisfiedClause::Trait { written, .. }
+			| UnsatisfiedClause::Equality { written, .. } => written,
+		}
+	}
 }
 
 /// The value of `assoc_type_index` for `receiver`, whose trait the compiler
@@ -2435,6 +2447,7 @@ impl TypeContext<'_, '_, '_> {
 				return Ok(false);
 			};
 			failures.push(UnsatisfiedClause::Trait {
+				written: clause.subject,
 				subject: stated,
 				reduced: receiver,
 				trait_index: clause.trait_index,
@@ -2495,6 +2508,7 @@ impl TypeContext<'_, '_, '_> {
 				return Ok(false);
 			};
 			failures.push(UnsatisfiedClause::Equality {
+				written: clause.projection,
 				projection,
 				required,
 				found,

@@ -14,7 +14,7 @@ use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
 use crate::tir::body::{ExprIdx, ExprKind, PatIdx, PatternKind};
 use crate::tir::defs::{ConstIdx, EnumIdx};
-use crate::tir::types::{Type, TypeIndex, TypeList};
+use crate::tir::types::{GenericArgs, Type, TypeIndex};
 use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
 
 /// How many missing patterns a non-exhaustive match names.
@@ -163,10 +163,10 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn pattern_constant_value(
 		&mut self,
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		ty: TypeIndex,
 	) -> Option<u64> {
-		if !self.cx.types.list(type_args).is_empty() {
+		if !type_args.is_empty() {
 			return None;
 		}
 		let bits = self.pattern_bits(constant)?;

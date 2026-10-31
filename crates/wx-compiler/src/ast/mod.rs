@@ -1372,7 +1372,7 @@ pub enum BoundExpression {
 	/// associated-type bindings.
 	WithBindings {
 		path: Box<BoundExpression>,
-		bindings: Box<[AssocTypeBinding]>,
+		bindings: Box<[AssocBinding]>,
 	},
 	/// `Bound1 + Bound2 + Bound3` — multiple bounds joined by `+`.
 	BoundList(Box<[Spanned<BoundExpression>]>),
@@ -1470,23 +1470,35 @@ pub struct FunctionTypeParam {
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
-/// `Size = u32` (equality) or `Size: UnsignedInt` (bound) inside a `where {
-/// }` block — constrains an associated type.
+/// One entry of a `where { .. }` block, constraining a member of the bound's
+/// trait: an associated type (`Size = u32`, `Size: UnsignedInt`) or, marked
+/// `const`, an associated constant (`const LEN: u32`, `const LEN = 4`).
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub struct AssocTypeBinding {
+pub struct AssocBinding {
 	pub name: Spanned<SymbolU32>,
-	pub kind: AssocTypeBindingKind,
+	pub kind: AssocBindingKind,
 }
 
-/// The right-hand side of an [`AssocTypeBinding`].
+/// What an [`AssocBinding`] states. The `const` keyword alone tells a
+/// constant's entry from a type's.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum AssocTypeBindingKind {
+pub enum AssocBindingKind {
 	/// `Size = u32` — the associated type must equal exactly this type.
 	Equals(Spanned<TypeExpression>),
 	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
 	Bound(Spanned<BoundExpression>),
+	/// `const LEN: u32` — the constant's value must fit this type.
+	ConstFits {
+		const_span: TextSpan,
+		ty: Spanned<TypeExpression>,
+	},
+	/// `const LEN = 4` — the constant must have this value.
+	ConstEquals {
+		const_span: TextSpan,
+		value: Spanned<ConstArgument>,
+	},
 }
 
 /// `*T` = exclusive pointer/slice/array, `&T` = shared, always read-only.
@@ -3042,8 +3054,17 @@ impl<'ctx> Parser<'ctx> {
 				Some(Keyword::Const) => Some(self.lexer.next().span),
 				_ => None,
 			};
+			// `Self` is a name here, as `self` is among a function's
+			// parameters; where it may stand is the signature's to check.
+			let self_type =
+				matches!(self.peek_keyword(), Some(Keyword::SelfPascal));
 			let name_span = self.next_expect(Token::Identifier)?.span;
-			let name_symbol = self.intern_identifier(name_span);
+			let name_symbol = if self_type {
+				self.strings
+					.get_or_intern(name_span.extract_str(self.source))
+			} else {
+				self.intern_identifier(name_span)
+			};
 			let name = Spanned {
 				inner: name_symbol,
 				span: name_span,
@@ -3236,16 +3257,17 @@ impl<'ctx> Parser<'ctx> {
 		self.parse_const_argument()
 	}
 
-	/// Parse `where { Name = Type, Name: Bound, ... }` — the bindings block
+	/// Parse `where { Name = Type, Name: Bound, const N: Type, const N = 4 }`,
+	/// the bindings block
 	/// following a type. Returns a `Spanned` whose span covers from `{`
 	/// through `}`. The `where` keyword must already be confirmed as the next
 	/// token by the caller.
 	fn parse_where_bindings(
 		&mut self,
-	) -> Result<Spanned<Box<[AssocTypeBinding]>>, ()> {
+	) -> Result<Spanned<Box<[AssocBinding]>>, ()> {
 		self.lexer.next(); // consume `where`
 		let open_span = self.next_expect(Token::OpenBrace)?.span;
-		let mut bindings: Vec<AssocTypeBinding> = Vec::new();
+		let mut bindings: Vec<AssocBinding> = Vec::new();
 
 		let close_span = loop {
 			let peeked = self.lexer.peek();
@@ -3264,19 +3286,37 @@ impl<'ctx> Parser<'ctx> {
 				break peeked.span;
 			}
 
+			let const_span = match self.peek_keyword() {
+				Some(Keyword::Const) => Some(self.lexer.next().span),
+				_ => None,
+			};
 			let name_span = self.next_expect(Token::Identifier)?.span;
 			let name = Spanned {
 				inner: self.intern_identifier(name_span),
 				span: name_span,
 			};
-			let kind = if self.lexer.next_if(Token::Colon).is_some() {
-				AssocTypeBindingKind::Bound(self.parse_bounds_expression()?)
-			} else {
+			let colon = self.lexer.next_if(Token::Colon).is_some();
+			if !colon {
 				self.next_expect(Token::Eq)?;
-				AssocTypeBindingKind::Equals(self.parse_type_expression()?)
+			}
+			let kind = match (const_span, colon) {
+				(None, true) => {
+					AssocBindingKind::Bound(self.parse_bounds_expression()?)
+				}
+				(None, false) => {
+					AssocBindingKind::Equals(self.parse_type_expression()?)
+				}
+				(Some(const_span), true) => AssocBindingKind::ConstFits {
+					const_span,
+					ty: self.parse_type_expression()?,
+				},
+				(Some(const_span), false) => AssocBindingKind::ConstEquals {
+					const_span,
+					value: self.parse_const_argument()?,
+				},
 			};
 			self.lexer.next_if(Token::Comma);
-			bindings.push(AssocTypeBinding { name, kind });
+			bindings.push(AssocBinding { name, kind });
 		};
 
 		Ok(Spanned {

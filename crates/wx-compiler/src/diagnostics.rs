@@ -252,6 +252,7 @@ define_diagnostic_codes! {
 		MisplacedLiteralKind => "E2128",
 		SliceByValue => "E2129",
 		SliceArgument => "E2130",
+		MisplacedSelfBound => "E2131",
 	}
 }
 

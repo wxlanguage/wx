@@ -23,7 +23,7 @@ use string_interner::symbol::SymbolU32;
 
 use super::defs::{ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, StructIdx};
 use super::obligations::TypeObligation;
-use super::types::{TypeIndex, TypeList};
+use super::types::{GenericArgs, TypeIndex};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
@@ -177,12 +177,12 @@ pub(super) enum PatternKind {
 	/// type arguments as `ExprKind::Const` holds them.
 	Constant {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// A trait's declaration of a constant; `type_args` is `[Self]`.
 	AbstractConstant {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// Alternatives, which bind the same names: the same name in two of
 	/// them is one local.
@@ -237,13 +237,13 @@ pub(super) enum ExprKind {
 	/// flat type arguments, the impl's; empty when it has none.
 	Const {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// A trait's declaration of a constant, whose impl is selected once
 	/// `Self` is known; `type_args` is `[Self]`.
 	AbstractConst {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// An enum variant written without a value: the value of the variant
 	/// before it, plus one, in the enum's repr.
@@ -256,7 +256,7 @@ pub(super) enum ExprKind {
 	/// with its type arguments, flat as a call's.
 	Function {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	// Operators, calls and compound assignment. What defines the operation:
 	// a primitive scalar's operator (`Primitive*`, holding the `op`); a known
@@ -286,7 +286,7 @@ pub(super) enum ExprKind {
 	/// (`f(p)`).
 	Call {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		args: ExprIdx,
 	},
 	/// A call of a trait's declaration, whose impl is selected once `Self`
@@ -294,7 +294,7 @@ pub(super) enum ExprKind {
 	/// inherits the trait's default. `args` as for `Call`.
 	AbstractCall {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		args: ExprIdx,
 	},
 	/// `receiver.m(..)` of a known function: an impl method, the impl method
@@ -303,7 +303,7 @@ pub(super) enum ExprKind {
 	/// `args` is the value of the parameters after it, as for `Call`.
 	MethodCall {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		receiver: ExprIdx,
 		args: ExprIdx,
 	},
@@ -312,7 +312,7 @@ pub(super) enum ExprKind {
 	/// inherits, or `Call::call` of a function item or an abstract `F: Call`.
 	AbstractMethodCall {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		receiver: ExprIdx,
 		args: ExprIdx,
 	},
@@ -419,7 +419,7 @@ pub(super) enum ExprKind {
 	/// method.
 	ConcreteCompoundAssign {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		target: ExprIdx,
 		value: ExprIdx,
 	},
@@ -427,7 +427,7 @@ pub(super) enum ExprKind {
 	/// declaration of the method.
 	AbstractCompoundAssign {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		target: ExprIdx,
 		value: ExprIdx,
 	},
@@ -442,7 +442,7 @@ pub(super) enum ExprKind {
 	/// method.
 	ConcreteCompoundStore {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		place: PlaceIdx,
 		value: ExprIdx,
 	},
@@ -450,7 +450,7 @@ pub(super) enum ExprKind {
 	/// declaration of the method.
 	AbstractCompoundStore {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		place: PlaceIdx,
 		value: ExprIdx,
 	},

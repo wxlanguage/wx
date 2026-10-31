@@ -278,7 +278,10 @@ impl BodyContext<'_, '_, '_, '_> {
 		let ty = self.normalized(ty, self.scope.assumption_env);
 		let ty = self.cx.types.collapse_error(ty);
 		let owner = self.cx.defs.constants[usize::from(constant)].owner;
-		let type_args = self.cx.types.push_list(type_args);
+		let type_args = self
+			.cx
+			.generic_args
+			.push(type_args.iter().map(|&arg| (arg, member.ident.span)));
 		let kind = match Dispatch::of(owner) {
 			Dispatch::Direct => ExprKind::Const {
 				constant,

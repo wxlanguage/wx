@@ -27,8 +27,8 @@ use super::solver::{
 	Solver, SolverError, Verdict,
 };
 use super::types::{
-	GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type, TypeIndex,
-	TypeList,
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
+	TypeIndex,
 };
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
@@ -38,13 +38,13 @@ use crate::vfs::FileId;
 /// cannot lose inherited requirements that have not been published yet.
 #[derive(Clone, Copy)]
 pub(super) enum BoundRequirements {
-	/// Parameter `index` of `env`. `arguments` is the use's flat argument list
-	/// for `env`'s whole chain, outer frames first: a binding's value is
-	/// written in the declaration, so it may name any of them.
-	Parameter {
+	/// What `env`'s item states in its own assumption env, for a use that
+	/// gives `args`, flat over `env`'s whole chain: a binding's value is
+	/// written in the declaration, so it may name any of them. A failure is
+	/// reported where the argument its clause is about is given.
+	Frame {
 		env: GenericEnvIdx,
-		index: usize,
-		arguments: TypeList,
+		args: GenericArgs,
 	},
 	/// The declared bounds of `declaration`, a member of `trait_index`, whose
 	/// `Self` is `receiver`.
@@ -52,6 +52,8 @@ pub(super) enum BoundRequirements {
 		declaration: AssocTypeIdx,
 		trait_index: TraitIdx,
 		receiver: TypeIndex,
+		/// The value checked against them.
+		value: TypeIndex,
 	},
 }
 
@@ -60,7 +62,6 @@ pub(super) enum TypeObligation {
 	CheckBounds {
 		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
-		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
 		owner: GenericEnvOwner,
 	},
@@ -193,13 +194,11 @@ impl TypeContext<'_, '_, '_> {
 			TypeObligation::CheckBounds {
 				assumption_context,
 				requirements,
-				argument,
 				reference,
 				owner,
 			} => match self.check_bound_requirements(
 				assumption_context,
 				requirements,
-				argument,
 				reference,
 				owner,
 			) {

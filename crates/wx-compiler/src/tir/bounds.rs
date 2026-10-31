@@ -337,6 +337,18 @@ impl AssumptionEnvArena {
 		&mut self.envs[usize::from(env)].clauses
 	}
 
+	/// The env `frame`'s item states clauses in, when it has one of its own
+	/// rather than sharing the enclosing item's.
+	pub(super) fn own(
+		&self,
+		generic_envs: &GenericEnvArena,
+		frame: GenericEnvIdx,
+	) -> Option<AssumptionEnvIdx> {
+		let env = self.of_frame(frame);
+		let parent = generic_envs.parent(frame)?;
+		(env != self.of_frame(parent)).then_some(env)
+	}
+
 	/// The own clauses `frame`'s item states.
 	pub(super) fn frame_clauses(&self, frame: GenericEnvIdx) -> BoundClauses {
 		self.clauses(self.of_frame(frame))

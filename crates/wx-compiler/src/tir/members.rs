@@ -813,29 +813,20 @@ impl TypeContext<'_, '_, '_> {
 			) else {
 				continue;
 			};
-			let mut type_args = Vec::with_capacity(impl_args.len());
-			let arguments = self.types.push_list(&impl_args);
-			for (index, &argument) in impl_args.iter().enumerate() {
-				type_args.push(self.record_bounds_check(
-					obligations,
-					scope.assumption_env,
-					BoundRequirements::Parameter {
-						env,
-						index,
-						arguments,
-					},
-					Spanned {
-						inner: argument,
-						span: segment.ident.span,
-					},
-					reference,
-					GenericEnvOwner::InherentImpl(impl_index),
-				));
-			}
+			let args = self
+				.generic_args
+				.push(impl_args.iter().map(|&ty| (ty, segment.ident.span)));
+			self.record_bounds_check(
+				obligations,
+				scope.assumption_env,
+				BoundRequirements::Frame { env, args },
+				reference,
+				GenericEnvOwner::InherentImpl(impl_index),
+			);
 			self.resolutions
 				.by_site
 				.insert((reference, key.tier), Referent::Member(kind));
-			return Some((kind, type_args));
+			return Some((kind, impl_args.into_vec()));
 		}
 		None
 	}

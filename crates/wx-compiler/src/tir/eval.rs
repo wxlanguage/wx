@@ -855,7 +855,7 @@ impl TypeContext<'_, '_, '_> {
 			} => {
 				let args: Vec<TypeIndex> = (0..type_args.len())
 					.map(|at| {
-						let arg = self.types.list(type_args)[at];
+						let arg = self.generic_args.types(type_args)[at];
 						self.instance_type(owner, arg)
 					})
 					.collect();

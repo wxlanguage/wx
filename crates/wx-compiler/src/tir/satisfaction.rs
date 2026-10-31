@@ -25,7 +25,7 @@ use super::signatures::{LexicalScope, TypeContext};
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, Subjects, UnsatisfiedClause,
 };
-use super::types::{GenericEnvIdx, Type, TypeIndex};
+use super::types::{GenericArgs, GenericEnvIdx, Type, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::bounds::{BindingRef, BindingRequirement};
@@ -33,37 +33,36 @@ use crate::tir::types::GenericEnvOwner;
 use crate::vfs::FileId;
 
 impl TypeContext<'_, '_, '_> {
-	/// Records the check of `argument` against `requirements` in
-	/// `obligations`, for whoever lowers it to check. Construction never decides a bound: the argument is kept as
-	/// written, and a failure is diagnosed later without rewriting it.
+	/// Records the check of `requirements` in `obligations`, for whoever
+	/// lowers it to check. Construction never decides a bound: the argument
+	/// is kept as written, and a failure is diagnosed later without
+	/// rewriting it.
 	pub(super) fn record_bounds_check(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
-		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
 		owner: GenericEnvOwner,
-	) -> TypeIndex {
+	) {
 		obligations.push(TypeObligation::CheckBounds {
 			assumption_context,
 			requirements,
-			argument,
 			reference,
 			owner,
 		});
-		argument.inner
 	}
 
 	/// Resolves a written type-argument list against `params_env`, `owner`'s
 	/// own frame (`ROOT` when it declares no parameters). Always returns as
-	/// many arguments as the frame declares. A wrong count is reported and
-	/// makes every one `ERROR`: there is no sensible pairing to salvage, and
-	/// the caller still sees a `Wrapper`, not a second "not a struct" error.
-	/// Otherwise the arguments are kept as written, and each one's bounds are
-	/// recorded at the argument, so `T: A + B` is two reports when an
-	/// argument satisfies neither. `parent_args` are the arguments of the
-	/// frames around `params_env`, outer first, which a bound may name.
+	/// many arguments as the frame declares. A wrong count is reported and makes every one `ERROR`:
+	/// there is no sensible pairing to salvage, and the caller still sees a
+	/// `Wrapper`, not a second "not a struct" error. Otherwise the arguments
+	/// are kept as written, and the frame's bounds are recorded, each failure
+	/// reported at the argument it is about, so `T: A + B` is two reports
+	/// when an argument satisfies neither. `parent_args` are the arguments of
+	/// the frames around `params_env`, outer first, which a bound may name;
+	/// a failure about one is reported at the segment.
 	pub(super) fn resolve_type_args(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
@@ -78,7 +77,7 @@ impl TypeContext<'_, '_, '_> {
 			let expected = self.generic_envs.param_names(params_env).len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
-		if args.is_empty() {
+		if params_env == GenericEnvIdx::ROOT {
 			return Box::new([]);
 		}
 		debug_assert_eq!(
@@ -86,26 +85,21 @@ impl TypeContext<'_, '_, '_> {
 			self.generic_envs.parent_count(params_env),
 			"a bound is substituted over the frame's whole chain"
 		);
-		let arguments = self.types.push_list(parent_args.iter().chain(args));
-		for (index, (&argument, written)) in
-			args.iter().zip(&segment.type_args).enumerate()
-		{
-			self.record_bounds_check(
-				obligations,
-				scope.assumption_env,
-				BoundRequirements::Parameter {
-					env: params_env,
-					index,
-					arguments,
-				},
-				Spanned {
-					inner: argument,
-					span: written.span(),
-				},
-				SourceSpan::new(scope.file_id, written.span()),
-				owner,
-			);
-		}
+		let parents = parent_args.iter().map(|&ty| (ty, segment.ident.span));
+		let written = segment.type_args.iter().map(|written| written.span());
+		let generic_args = self
+			.generic_args
+			.push(parents.chain(args.iter().copied().zip(written)));
+		self.record_bounds_check(
+			obligations,
+			scope.assumption_env,
+			BoundRequirements::Frame {
+				env: params_env,
+				args: generic_args,
+			},
+			SourceSpan::new(scope.file_id, segment.ident.span),
+			owner,
+		);
 		args.into()
 	}
 
@@ -142,29 +136,38 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
-		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
 		owner: GenericEnvOwner,
 	) -> Result<(), SolverError> {
 		// The clauses are written in the declaration's frame, about its own
 		// subject; the use supplies that frame's arguments and the subject.
 		// The arguments are owned: the proof interns while it reads them.
-		let (clauses, root, frame, arguments): (_, _, _, Box<[TypeIndex]>) =
+		let (clauses, subjects, frame, arguments): (_, _, _, Box<[TypeIndex]>) =
 			match requirements {
-				BoundRequirements::Parameter {
-					env,
-					index,
-					arguments,
-				} => (
-					self.assumption_envs.frame_clauses(env),
-					self.generic_envs.param_types(env)[index],
-					env,
-					self.types.list(arguments).into(),
-				),
+				BoundRequirements::Frame { env, args } => {
+					self.check_slice_arguments(
+						assumption_context,
+						env,
+						args,
+						reference.file_id,
+					)?;
+					let Some(own) =
+						self.assumption_envs.own(&self.generic_envs, env)
+					else {
+						return Ok(());
+					};
+					(
+						self.assumption_envs.clauses(own),
+						Subjects::All,
+						env,
+						self.generic_args.types(args).into(),
+					)
+				}
 				BoundRequirements::AssociatedType {
 					declaration,
 					trait_index,
 					receiver,
+					value,
 				} => {
 					let Some(signature) =
 						&self.assoc_types[usize::from(declaration)]
@@ -177,47 +180,22 @@ impl TypeContext<'_, '_, '_> {
 						trait_index,
 						assoc_type_index: declaration,
 					});
-					(signature.clauses, root, env, Box::new([receiver]))
+					(
+						signature.clauses,
+						Subjects::Rooted {
+							root,
+							subject: value,
+						},
+						env,
+						Box::new([receiver]),
+					)
 				}
 			};
-		// Only a parameter bounded by `Slice` stands for a slice or an array.
-		if let BoundRequirements::Parameter { env, .. } = requirements
-			&& self.may_be_slice(assumption_context, argument.inner)?
-			&& !self.may_be_slice(self.assumption_envs.of_frame(env), root)?
-		{
-			let found = self.type_formatter().display_type(argument.inner);
-			let param = self.type_formatter().display_type(root);
-			let noun = match self.types.resolve(argument.inner) {
-				Type::Slice { .. } => "slice",
-				Type::Array { .. } => "array",
-				_ => "slice or array",
-			};
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::SliceArgument.code())
-					.with_message(format!(
-						"the {noun} `{found}` cannot stand for `{param}`"
-					))
-					.with_label(
-						SourceSpan::new(reference.file_id, argument.span)
-							.primary_label()
-							.with_message(noun),
-					)
-					.with_note(format!(
-						"only a parameter bounded by `Slice` stands for a \
-						 slice or an array, and `{param}` is not"
-					)),
-			);
-			return Err(SolverError::Poisoned);
-		}
 		let mut failures = Vec::new();
 		if self.satisfies_clauses(
 			assumption_context,
 			clauses,
-			Subjects::Rooted {
-				root,
-				subject: argument.inner,
-			},
+			subjects,
 			(frame, &arguments),
 			Some(&mut failures),
 			None,
@@ -225,17 +203,25 @@ impl TypeContext<'_, '_, '_> {
 			return Ok(());
 		}
 		for failure in failures {
+			let at = match requirements {
+				BoundRequirements::Frame { args, .. } => {
+					self.argument_span(args, failure.written())
+				}
+				BoundRequirements::AssociatedType { .. } => None,
+			}
+			.unwrap_or(reference.span);
 			let diagnostic = match failure {
 				UnsatisfiedClause::Trait {
 					subject,
 					reduced,
 					trait_index,
 					source,
+					..
 				} => self.report_trait_bound_violation(
 					reference.file_id,
 					Spanned {
 						inner: (subject, reduced),
-						span: argument.span,
+						span: at,
 					},
 					trait_index,
 					source,
@@ -247,8 +233,9 @@ impl TypeContext<'_, '_, '_> {
 					found,
 					expected,
 					source,
+					..
 				} => self.report_equality_mismatch(
-					SourceSpan::new(reference.file_id, argument.span),
+					SourceSpan::new(reference.file_id, at),
 					(projection, required),
 					found,
 					expected,
@@ -259,6 +246,81 @@ impl TypeContext<'_, '_, '_> {
 			self.diagnostics.push(diagnostic);
 		}
 		Err(SolverError::Poisoned)
+	}
+
+	/// Where `args` gives the parameter `written`, a clause's subject, is
+	/// rooted at (`T` for `<T as Tr>::A`); `None` for a path out of a
+	/// concrete type.
+	fn argument_span(
+		&self,
+		args: GenericArgs,
+		mut written: TypeIndex,
+	) -> Option<TextSpan> {
+		let (env, param_index) = loop {
+			match *self.types.resolve(written) {
+				Type::TypeParam { env, param_index } => {
+					break (env, param_index);
+				}
+				Type::TypeProjection { base, .. } => written = base,
+				_ => return None,
+			}
+		};
+		let slot = self.generic_envs.parent_count(env) + param_index as usize;
+		Some(self.generic_args.spans(args)[slot])
+	}
+
+	/// Reports each of `env`'s own parameters that `args` gives a slice or
+	/// an array for, which only a parameter bounded by `Slice` stands for.
+	fn check_slice_arguments(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		env: GenericEnvIdx,
+		args: GenericArgs,
+		file_id: FileId,
+	) -> Result<(), SolverError> {
+		let start = self.generic_envs.parent_count(env);
+		let mut reported = false;
+		for index in 0..self.generic_envs.param_names(env).len() {
+			let argument = self.generic_args.types(args)[start + index];
+			let param = self.generic_envs.param_types(env)[index];
+			if !self.may_be_slice(assumption_context, argument)?
+				|| self
+					.may_be_slice(self.assumption_envs.of_frame(env), param)?
+			{
+				continue;
+			}
+			let found = self.type_formatter().display_type(argument);
+			let param = self.type_formatter().display_type(param);
+			let noun = match self.types.resolve(argument) {
+				Type::Slice { .. } => "slice",
+				Type::Array { .. } => "array",
+				_ => "slice or array",
+			};
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::SliceArgument.code())
+					.with_message(format!(
+						"the {noun} `{found}` cannot stand for `{param}`"
+					))
+					.with_label(
+						SourceSpan::new(
+							file_id,
+							self.generic_args.spans(args)[start + index],
+						)
+						.primary_label()
+						.with_message(noun),
+					)
+					.with_note(format!(
+						"only a parameter bounded by `Slice` stands for a \
+						 slice or an array, and `{param}` is not"
+					)),
+			);
+			reported = true;
+		}
+		if reported {
+			return Err(SolverError::Poisoned);
+		}
+		Ok(())
 	}
 
 	/// `projection::name` could not be selected from the projection's declared

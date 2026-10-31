@@ -324,20 +324,33 @@ Each leaves the suite green.
    The function's signature is compared and its own env proved there,
    with its own parameters used directly: the second generic env, the
    `found` substitution and `own_params`' check-only case are gone.
-6. **Clauses on `Self`.** Parser and AST (`Self` accepted as a trait
-   function's or trait impl function's first type parameter; a binding
-   block's `const N: Ty` and `const N = value` entries, the second reported
-   unsupported until constant equalities exist), lowering
-   into the function's env (outer-rooted clauses beside its own), the
-   argument count and turbofish skipping it, wx-fmt. A use proves the
-   item's env once (`Subjects::All`) instead of once per argument, and
-   reports each failure at the argument its clause's root parameter takes,
-   or at the path segment for a parameter of an outer frame (the
-   per-argument audit item below). The obligation carries the use's
-   argument spans; `Subjects::Rooted` then has no parameter left to serve.
-   A trait impl function's `Self` entry: its clauses normalized into its
-   env (a concrete subject proved there), proved to follow from the
-   declaration's by conformance like its own parameters' clauses.
+6. **Clauses on `Self`.** 6a done: the parser reads `Self` as an ordinary
+   type parameter name (as `self` among a function's parameters); where it
+   may stand is the signature's to check, and until 6b a leading `Self` is
+   reported unsupported and declares no parameter. A binding block's
+   `const N: Ty` (`AssocBindingKind::ConstFits`) and `const N = value`
+   (`ConstEquals`) entries parse, format, and are reported unsupported
+   (`AssocTypeBinding` is now `AssocBinding`). 6b/6c done: a leading
+   `Self` in a trait's function lowers as clauses about the trait's
+   `Self` into the function's env (`self_entry`; such a function
+   gets a frame even with no parameter of its own, so it has an env); a
+   `Self` anywhere else is E2131 (`MisplacedSelfBound`), in a trait impl's
+   function still unsupported (6d). A use proves its item's own env whole,
+   one `BoundRequirements::Frame { env, args }` per frame on the chain
+   (`Subjects::All`), so clauses about an enclosing frame's parameter (the
+   trait's `Self`) need nothing apart. `args` is a run of the
+   `GenericArgArena` on `TypeContext`: a use's flat arguments, each with
+   the span it is given at (the written argument, the value it was learned
+   from, a receiver for `Self`, or the name; `BodyContext::use_args`), so
+   a failure is reported where the argument its clause is rooted at is
+   given (`UnsatisfiedClause::written`, `argument_span`). Body nodes hold
+   their arguments in the same arena (`GenericArgs`), not in the
+   interner's lists, which back interned types only. A frame whose
+   arguments selection proved (`check_use_bounds`' `proven`) is skipped.
+   6d: a trait impl function's `Self` entry, its clauses normalized into
+   its env (a concrete subject proved there), proved to follow from the
+   declaration's by conformance like its own parameters' clauses, and
+   proved at direct calls by the same `Frame`.
 7. **Associated-type bounds by substitution** (rustc's
    `check_type_bounds`; whenever convenient, nothing waits on it). A value
    for `<R as Tr>::A` is checked against `type A: ..` by proving the
@@ -346,8 +359,8 @@ Each leaves the suite green.
    selects the definition being checked. Covers all four sites
    (conformance, a binding in a bound, a memory's `Size`, a global's
    `Value`), which today re-root the clauses onto the value
-   (`Subjects::Rooted`, `rebase`). Both go, and `satisfies_clauses` loses
-   its mode.
+   (`Subjects::Rooted` over a projection root, `rebase`). `rebase` and
+   `Subjects` go: every proof is then of a whole env.
 8. **Fit clauses** (slices step 6): a third range in `AssumptionEnv`, the
    `const N: Ty` entry in a binding block, `satisfies_clauses`' arm, the body's lookup in
    `untyped_value`. Then `Array::as_slice`/`as_slice_mut` get bodies in std.
@@ -361,13 +374,10 @@ Each leaves the suite green.
   should name the judgement explicitly (its solver frame) rather than
   compare contexts.
 - ~~**`declarations_of` callers** (step 3)~~: done, see step 3.
-- **Per-argument checks read one root** (step 6). `check_bound_requirements`
-  proves, for each argument, the clauses rooted at its parameter in its
-  frame's env. A clause a trait function states about `Self` (an outer
-  parameter) is rooted at neither
-  the function's parameters nor in the trait's env, so no per-argument check
-  reads it. Step 6 needs a use of the item to prove its own env's clauses
-  rooted outside its frame, reported at the path segment.
+- ~~**Per-argument checks read one root**~~ (step 6): answered by proving
+  each frame's env whole, see 6b/6c. A clause a trait function states
+  about `Self` (an outer parameter) was rooted at none of the function's
+  own parameters, so no per-argument check read it.
 - ~~**The conformance env's subjects**~~ (step 5): they are the impl
   function's own parameters, whose frame is on no chain the env knows
   about. Nothing reads a subject's frame from the context: assumptions are

@@ -27,7 +27,7 @@ use crate::tir::body::{ExprKind, LocalIdx, PatIdx, PatternKind};
 use crate::tir::defs::{BindingTarget, DefKind, StructIdx};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
-use crate::tir::types::{GenericEnvOwner, Type, TypeIndex, TypeList};
+use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
 use crate::vfs::FileId;
 
 /// The state of checking one pattern: where it is written, and the names it
@@ -1142,7 +1142,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						);
 						let kind = PatternKind::Constant {
 							constant,
-							type_args: TypeList::EMPTY,
+							type_args: GenericArgs::EMPTY,
 						};
 						Some((kind, ty))
 					}

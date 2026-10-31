@@ -29,7 +29,8 @@ use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::signatures::TypeContext;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
-	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex, TypeList,
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
+	TypeList,
 };
 use crate::vfs::FileId;
 
@@ -300,14 +301,14 @@ impl BodyContext<'_, '_, '_, '_> {
 			mismatched,
 			&mut type_args,
 		);
-		let type_list = self.cx.types.push_list(&type_args);
 		let target = CallTarget::function(self.cx, function);
-		self.check_callee_bounds(&target, proven, segment, type_list, &[]);
+		let args = self.use_args(&target, segment, &type_args, &[]);
+		self.check_use_bounds(&target, proven, segment, args);
 		let ty = self.cx.types.intern_function(function, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
 		let kind = ExprKind::Function {
 			function,
-			type_args: type_list,
+			type_args: args,
 		};
 		self.body.push(kind, ty, span)
 	}
@@ -384,15 +385,15 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 		self.expect_arguments(&target, &type_args, &given);
 		// One stored list for the bound checks and the node.
-		let type_list = self.cx.types.push_list(&type_args);
-		self.check_callee_bounds(&target, proven, segment, type_list, &given);
+		let use_args = self.use_args(&target, segment, &type_args, &given);
+		self.check_use_bounds(&target, proven, segment, use_args);
 		let skipped = usize::from(receiver.is_some());
 		let args = self.arguments_value(
 			&target, &type_args, &given, skipped, reported, span,
 		);
 		let ty = self.instantiate(return_type, env, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
-		let kind = self.call_node(function, type_list, receiver, args);
+		let kind = self.call_node(function, use_args, receiver, args);
 		self.body.push(kind, ty, span)
 	}
 
@@ -402,7 +403,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn call_node(
 		&self,
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		receiver: Option<ExprIdx>,
 		args: ExprIdx,
 	) -> ExprKind {
@@ -869,28 +870,6 @@ impl BodyContext<'_, '_, '_, '_> {
 		(env, own)
 	}
 
-	/// Proves, for the final flat `type_args`, the bounds of each frame on
-	/// `target`'s chain after the first `proven` arguments: the selection
-	/// proved those.
-	fn check_callee_bounds(
-		&mut self,
-		target: &CallTarget<'_>,
-		proven: usize,
-		segment: &ast::PathSegment,
-		type_args: TypeList,
-		given: &[GivenArgument],
-	) {
-		let mut frame = target.generic_env;
-		while frame != GenericEnvIdx::ROOT {
-			if self.cx.generic_envs.parent_count(frame) >= proven {
-				self.check_frame_bounds(
-					target, frame, segment, type_args, given,
-				);
-			}
-			frame = self.cx.generic_envs.parent(frame).unwrap();
-		}
-	}
-
 	/// `ty`, written with the parameters of `env`, with `args` for them. A
 	/// type argument not known yet leaves its parts `INFER`, which expect
 	/// nothing; one that failed makes the whole type `ERROR`.
@@ -1023,7 +1002,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			(None, Arguments::Named(_)) => unreachable!("reported above"),
 		};
-		let type_args = self.cx.types.push_list(&callee.type_args);
+		let value_span = self.body.span(value);
+		let type_args = self
+			.cx
+			.generic_args
+			.push(callee.type_args.iter().map(|&arg| (arg, value_span)));
 		let kind =
 			self.call_node(callee.function, type_args, Some(value), packed);
 		self.body.push(kind, result, span)

@@ -2934,18 +2934,36 @@ impl<'a> Builder<'a> {
 					if i > 0 {
 						binding_parts.push(self.text(Text::CommaSp));
 					}
-					let key = self.symbol(binding.name.inner);
+					let mut key = self.symbol(binding.name.inner);
+					if let ast::AssocBindingKind::ConstFits { .. }
+					| ast::AssocBindingKind::ConstEquals { .. } = binding.kind
+					{
+						let marker = self.text(Text::Const);
+						key = self.arena.concat2(marker, key);
+					}
 					let rhs = match &binding.kind {
-						ast::AssocTypeBindingKind::Equals(ty) => {
+						ast::AssocBindingKind::Equals(ty) => {
 							let eq = self.text(Text::EqSp);
 							let ty = self.build_type_expression(&ty.inner);
 							self.arena.concat2(eq, ty)
 						}
-						ast::AssocTypeBindingKind::Bound(bound) => {
+						ast::AssocBindingKind::Bound(bound) => {
 							let colon = self.text(Text::ColonSp);
 							let bound =
 								self.build_bound_expression(&bound.inner);
 							self.arena.concat2(colon, bound)
+						}
+						ast::AssocBindingKind::ConstFits { ty, .. } => {
+							let colon = self.text(Text::ColonSp);
+							let ty = self.build_type_expression(&ty.inner);
+							self.arena.concat2(colon, ty)
+						}
+						ast::AssocBindingKind::ConstEquals {
+							value, ..
+						} => {
+							let eq = self.text(Text::EqSp);
+							let value = self.build_const_argument(value);
+							self.arena.concat2(eq, value)
 						}
 					};
 					binding_parts.push(self.arena.concat2(key, rhs));
