@@ -14,7 +14,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::BoundId;
+use super::bounds::{AssumptionEnvIdx, BoundId};
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{BindingKey, DefKind, DefinitionRegistry, TraitIdx};
@@ -23,13 +23,13 @@ use super::members::{MemberLookup, report_no_such_type_member};
 use super::obligations::{BoundRequirements, TypeObligation};
 use super::signatures::{LexicalScope, TypeContext};
 use super::solver::{
-	NormalizationDepth, RewriteFlags, SolverError, UnsatisfiedClause,
+	NormalizationDepth, RewriteFlags, SolverError, Subjects, UnsatisfiedClause,
 };
-use super::types::{Type, TypeEnvIdx, TypeIndex};
+use super::types::{GenericEnvIdx, Type, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::bounds::{BindingRef, BindingRequirement};
-use crate::tir::types::TypeEnvOwner;
+use crate::tir::types::GenericEnvOwner;
 use crate::vfs::FileId;
 
 impl TypeContext<'_, '_, '_> {
@@ -39,11 +39,11 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn record_bounds_check(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
 		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
-		owner: TypeEnvOwner,
+		owner: GenericEnvOwner,
 	) -> TypeIndex {
 		obligations.push(TypeObligation::CheckBounds {
 			assumption_context,
@@ -69,13 +69,13 @@ impl TypeContext<'_, '_, '_> {
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		segment: &ast::PathSegment,
-		params_env: TypeEnvIdx,
+		params_env: GenericEnvIdx,
 		parent_args: &[TypeIndex],
 		args: &[TypeIndex],
-		owner: TypeEnvOwner,
+		owner: GenericEnvOwner,
 	) -> Box<[TypeIndex]> {
 		if !self.check_type_arg_count(scope, segment, params_env, owner) {
-			let expected = self.param_bounds[usize::from(params_env)].len();
+			let expected = self.generic_envs.param_names(params_env).len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
 		if args.is_empty() {
@@ -83,7 +83,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 		debug_assert_eq!(
 			parent_args.len(),
-			self.type_envs.parent_count(params_env),
+			self.generic_envs.parent_count(params_env),
 			"a bound is substituted over the frame's whole chain"
 		);
 		let arguments = self.types.push_list(parent_args.iter().chain(args));
@@ -92,7 +92,7 @@ impl TypeContext<'_, '_, '_> {
 		{
 			self.record_bounds_check(
 				obligations,
-				scope.env,
+				scope.assumption_env,
 				BoundRequirements::Parameter {
 					env: params_env,
 					index,
@@ -115,10 +115,10 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		scope: LexicalScope,
 		segment: &ast::PathSegment,
-		params_env: TypeEnvIdx,
-		owner: TypeEnvOwner,
+		params_env: GenericEnvIdx,
+		owner: GenericEnvOwner,
 	) -> bool {
-		let expected = self.param_bounds[usize::from(params_env)].len();
+		let expected = self.generic_envs.param_names(params_env).len();
 		if segment.type_args.len() == expected {
 			return true;
 		}
@@ -128,7 +128,7 @@ impl TypeContext<'_, '_, '_> {
 			scope.file_id,
 			segment,
 			owner,
-			self.type_envs.param_names(params_env),
+			self.generic_envs.param_names(params_env),
 		));
 		false
 	}
@@ -140,11 +140,11 @@ impl TypeContext<'_, '_, '_> {
 	/// be pending, and a retry must not duplicate a diagnostic.
 	pub(super) fn check_bound_requirements(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
 		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
-		owner: TypeEnvOwner,
+		owner: GenericEnvOwner,
 	) -> Result<(), SolverError> {
 		// The clauses are written in the declaration's frame, about its own
 		// subject; the use supplies that frame's arguments and the subject.
@@ -156,8 +156,8 @@ impl TypeContext<'_, '_, '_> {
 					index,
 					arguments,
 				} => (
-					self.param_bounds[usize::from(env)][index].clauses,
-					self.type_envs.param_types(env)[index],
+					self.assumption_envs.frame_clauses(env),
+					self.generic_envs.param_types(env)[index],
 					env,
 					self.types.list(arguments).into(),
 				),
@@ -173,7 +173,7 @@ impl TypeContext<'_, '_, '_> {
 					};
 					let env = self.traits[usize::from(trait_index)].env;
 					let root = self.types.intern(Type::TypeProjection {
-						base: self.type_envs.param_types(env)[0],
+						base: self.generic_envs.param_types(env)[0],
 						trait_index,
 						assoc_type_index: declaration,
 					});
@@ -183,7 +183,7 @@ impl TypeContext<'_, '_, '_> {
 		// Only a parameter bounded by `Slice` stands for a slice or an array.
 		if let BoundRequirements::Parameter { env, .. } = requirements
 			&& self.may_be_slice(assumption_context, argument.inner)?
-			&& !self.may_be_slice(env, root)?
+			&& !self.may_be_slice(self.assumption_envs.of_frame(env), root)?
 		{
 			let found = self.type_formatter().display_type(argument.inner);
 			let param = self.type_formatter().display_type(root);
@@ -214,7 +214,10 @@ impl TypeContext<'_, '_, '_> {
 		if self.satisfies_clauses(
 			assumption_context,
 			clauses,
-			(root, argument.inner),
+			Subjects::Rooted {
+				root,
+				subject: argument.inner,
+			},
 			(frame, &arguments),
 			Some(&mut failures),
 			None,
@@ -266,7 +269,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Always fails: the lowered type was `ERROR`.
 	pub(super) fn check_projection_member(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		name: SymbolU32,
 		reference: SourceSpan,
@@ -328,6 +331,7 @@ impl TypeContext<'_, '_, '_> {
 			{
 				let declared = self.clause_tables().declared_traits(
 					&self.types,
+					assumption_context,
 					normalized,
 					self.solver.state.recursion_budget,
 				);
@@ -387,7 +391,7 @@ impl TypeContext<'_, '_, '_> {
 		argument: Spanned<(TypeIndex, TypeIndex)>,
 		trait_index: TraitIdx,
 		bound_id: BoundId,
-		owner: TypeEnvOwner,
+		owner: GenericEnvOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter();
 		let (subject, reduced) = argument.inner;
@@ -436,7 +440,7 @@ impl TypeContext<'_, '_, '_> {
 		found: TypeIndex,
 		expected: TypeIndex,
 		source: BindingRef,
-		owner: TypeEnvOwner,
+		owner: GenericEnvOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter();
 		let (projection, required, found, expected) = (
@@ -483,7 +487,7 @@ pub(super) enum TypeArgsNotAllowedOn<'a> {
 	/// A generic parameter or a trait's `Self`, and the declaration whose
 	/// frame declares it.
 	TypeParam {
-		owner: TypeEnvOwner,
+		owner: GenericEnvOwner,
 		name: &'a Spanned<SymbolU32>,
 	},
 }
@@ -558,7 +562,7 @@ fn report_type_arg_count_mismatch(
 	defs: &DefinitionRegistry,
 	file_id: FileId,
 	segment: &ast::PathSegment,
-	owner: TypeEnvOwner,
+	owner: GenericEnvOwner,
 	params: &[Spanned<SymbolU32>],
 ) -> Diagnostic<FileId> {
 	let (noun, name) = (owner.noun(), segment.ident.inner);
@@ -756,6 +760,17 @@ mod tests {
 	/// `FunctionSignature` (private to `signatures.rs` — nothing outside it
 	/// needs a function's own resolved types yet), is what lets this same
 	/// harness reach a `TypeParam` receiver without a wider accessor.
+	/// Where `param` is declared: the assumptions of its own declaration.
+	fn param_scope(
+		builder: &TypeContext,
+		param: TypeIndex,
+	) -> AssumptionEnvIdx {
+		let Type::TypeParam { env, .. } = *builder.types.resolve(param) else {
+			panic!("expected a type parameter");
+		};
+		builder.assumption_envs.of_frame(env)
+	}
+
 	fn generic_param_type(
 		builder: &mut TypeContext,
 		function_path: &str,
@@ -781,7 +796,7 @@ mod tests {
 				assert!(
 					(builder
 						.find_trait_impl_query(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							TypeIndex::ERROR,
 							foo
 						)
@@ -791,7 +806,7 @@ mod tests {
 				assert!(
 					(builder
 						.find_trait_impl_query(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							TypeIndex::INFER,
 							foo
 						)
@@ -815,7 +830,7 @@ mod tests {
 				let s = struct_type(builder, "S");
 				assert!(
 					(builder
-						.find_trait_impl_query(TypeEnvIdx::ROOT, s, foo)
+						.find_trait_impl_query(AssumptionEnvIdx::ROOT, s, foo)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);
@@ -837,7 +852,7 @@ mod tests {
 				let s = struct_type(builder, "S");
 				assert!(
 					!(builder
-						.find_trait_impl_query(TypeEnvIdx::ROOT, s, bar)
+						.find_trait_impl_query(AssumptionEnvIdx::ROOT, s, bar)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);
@@ -857,7 +872,7 @@ mod tests {
 				let s = struct_type(builder, "S");
 				assert!(
 					(builder
-						.find_trait_impl_query(TypeEnvIdx::ROOT, s, nums)
+						.find_trait_impl_query(AssumptionEnvIdx::ROOT, s, nums)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);
@@ -877,9 +892,20 @@ mod tests {
 				let t = generic_param_type(builder, "target", 0);
 				assert!(
 					(builder
-						.find_trait_impl_query(TypeEnvIdx::ROOT, t, bound)
+						.find_trait_impl_query(
+							param_scope(builder, t),
+							t,
+							bound
+						)
 						.map(|found| found.is_some())
 						== Ok(true))
+				);
+				// Outside `target` its bounds are not assumed.
+				assert_eq!(
+					builder
+						.find_trait_impl_query(AssumptionEnvIdx::ROOT, t, bound)
+						.map(|found| found.is_some()),
+					Ok(false)
 				);
 			},
 		);
@@ -898,7 +924,11 @@ mod tests {
 				let t = generic_param_type(builder, "target", 0);
 				assert!(
 					!(builder
-						.find_trait_impl_query(TypeEnvIdx::ROOT, t, other)
+						.find_trait_impl_query(
+							param_scope(builder, t),
+							t,
+							other
+						)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);
@@ -919,7 +949,11 @@ mod tests {
 				let t = generic_param_type(builder, "target", 0);
 				assert!(
 					(builder
-						.find_trait_impl_query(TypeEnvIdx::ROOT, t, super_trait)
+						.find_trait_impl_query(
+							param_scope(builder, t),
+							t,
+							super_trait
+						)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);

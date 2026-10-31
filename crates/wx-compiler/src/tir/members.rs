@@ -15,7 +15,9 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::small_vec::SmallVec;
 use crate::vfs::FileId;
 
-use super::bounds::{Readiness, report_not_an_associated_type};
+use super::bounds::{
+	AssumptionEnvIdx, Readiness, report_not_an_associated_type,
+};
 use super::defs::{
 	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, DefId, DefinitionRegistry,
 	InherentImplIdx, MemberKind, Tier, TraitIdx, TraitImplIdx,
@@ -31,7 +33,9 @@ use super::signatures::{
 use super::solver::{
 	Assumption, NormalizationDepth, RewriteFlags, SolverError,
 };
-use super::types::{Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeInterner};
+use super::types::{
+	GenericEnvIdx, GenericEnvOwner, Type, TypeIndex, TypeInterner,
+};
 
 /// What type-relative member applicability found.
 pub(super) enum MemberLookup {
@@ -261,12 +265,17 @@ impl TypeContext<'_, '_, '_> {
 	/// really implements the selected trait is recorded as a membership check.
 	pub(super) fn select_associated_type(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
 	) -> MemberLookup {
-		match self.declared_bound_member(receiver, key, reference) {
+		match self.declared_bound_member(
+			assumption_context,
+			receiver,
+			key,
+			reference,
+		) {
 			MemberLookup::NotFound => {}
 			found => return found,
 		}
@@ -356,7 +365,7 @@ impl TypeContext<'_, '_, '_> {
 	/// implementation selection happen after this search completes.
 	pub(super) fn resolve_applicable_member(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
@@ -438,7 +447,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 			let key = BindingKey::ty(segment.ident.inner);
 			let lookup = self.select_associated_type(
-				scope.env,
+				scope.assumption_env,
 				current,
 				key,
 				SourceSpan::new(scope.file_id, segment.ident.span),
@@ -465,7 +474,7 @@ impl TypeContext<'_, '_, '_> {
 			// Selection named the trait without matching an impl; that
 			// the receiver implements it is the declaration check's question.
 			obligations.push(TypeObligation::CheckTraitMembership {
-				assumption_context: scope.env,
+				assumption_context: scope.assumption_env,
 				subject: current,
 				required: trait_index,
 				reference: SourceSpan::new(scope.file_id, segment.ident.span),
@@ -577,7 +586,7 @@ impl TypeContext<'_, '_, '_> {
 					) =>
 			{
 				obligations.push(TypeObligation::CheckProjectionMember {
-					assumption_context: scope.env,
+					assumption_context: scope.assumption_env,
 					projection: current,
 					name: segment.ident.inner,
 					reference,
@@ -634,8 +643,12 @@ impl TypeContext<'_, '_, '_> {
 			return Some((constant, impl_args));
 		}
 		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
-		let lookup =
-			self.select_associated_type(scope.env, receiver, key, reference);
+		let lookup = self.select_associated_type(
+			scope.assumption_env,
+			receiver,
+			key,
+			reference,
+		);
 		let ApplicableMember::AbstractTraitMember {
 			trait_index,
 			declaration,
@@ -661,7 +674,7 @@ impl TypeContext<'_, '_, '_> {
 			return None;
 		};
 		obligations.push(TypeObligation::CheckTraitMembership {
-			assumption_context: scope.env,
+			assumption_context: scope.assumption_env,
 			subject: receiver,
 			required: trait_index,
 			reference,
@@ -686,7 +699,7 @@ impl TypeContext<'_, '_, '_> {
 		let kind = self
 			.resolve_trait_qualified_type_member(
 				obligations,
-				scope.env,
+				scope.assumption_env,
 				receiver,
 				required_trait,
 				BindingKey::value(segment.ident.inner),
@@ -757,7 +770,7 @@ impl TypeContext<'_, '_, '_> {
 		// associated type; a failure is the trait selection's to report.
 		let receiver = self
 			.normalize(
-				scope.env,
+				scope.assumption_env,
 				receiver,
 				NormalizationDepth::Deep,
 				RewriteFlags::EQUALITIES,
@@ -795,7 +808,7 @@ impl TypeContext<'_, '_, '_> {
 			let Some(impl_args) = self.types.match_impl_target(
 				header.target.inner,
 				receiver,
-				&self.type_envs,
+				&self.generic_envs,
 				env,
 			) else {
 				continue;
@@ -805,7 +818,7 @@ impl TypeContext<'_, '_, '_> {
 			for (index, &argument) in impl_args.iter().enumerate() {
 				type_args.push(self.record_bounds_check(
 					obligations,
-					scope.env,
+					scope.assumption_env,
 					BoundRequirements::Parameter {
 						env,
 						index,
@@ -816,7 +829,7 @@ impl TypeContext<'_, '_, '_> {
 						span: segment.ident.span,
 					},
 					reference,
-					TypeEnvOwner::InherentImpl(impl_index),
+					GenericEnvOwner::InherentImpl(impl_index),
 				));
 			}
 			self.resolutions
@@ -844,7 +857,7 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn resolve_trait_qualified_type_member(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		key: BindingKey,
@@ -878,7 +891,7 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn resolve_trait_qualified_value(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		name: Spanned<SymbolU32>,
@@ -961,7 +974,7 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn find_trait_impl(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		file_id: FileId,
@@ -1011,7 +1024,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn resolve_concrete_member(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		target: ImplTarget,
 		key: BindingKey,
@@ -1060,7 +1073,7 @@ impl TypeContext<'_, '_, '_> {
 	/// scanning every trait in the program. Applicability uses the shared proof.
 	fn assumed_member_traits(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		key: BindingKey,
 	) -> Result<(Vec<TraitIdx>, Readiness), MemberLookup> {
 		let tables = self.clause_tables();
@@ -1083,7 +1096,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn resolve_trait_member_candidates(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
 		traits: Vec<TraitIdx>,
@@ -1143,6 +1156,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Traits supplied by the receiver's own declared bounds, by name only.
 	pub(super) fn declared_bound_member(
 		&mut self,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
@@ -1160,6 +1174,7 @@ impl TypeContext<'_, '_, '_> {
 			self.defs,
 			self.clause_tables().declared_traits(
 				&self.types,
+				assumption_context,
 				receiver,
 				self.solver.state.recursion_budget,
 			),
@@ -1201,7 +1216,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn resolve_bound_member(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
@@ -1209,7 +1224,12 @@ impl TypeContext<'_, '_, '_> {
 		// Preserve direct declaration lookup, including known provisional
 		// memberships. Equality-based discovery is a fallback when these bounds
 		// do not identify the requested name.
-		match self.declared_bound_member(receiver, key, reference) {
+		match self.declared_bound_member(
+			assumption_context,
+			receiver,
+			key,
+			reference,
+		) {
 			MemberLookup::NotFound => {}
 			found => return found,
 		}

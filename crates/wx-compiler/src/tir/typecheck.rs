@@ -43,6 +43,7 @@ use super::body::{
 	Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
 	ExprRange, LocalIdx, Obligations, Scope, ScopeIdx, ScopeKind,
 };
+use super::bounds::AssumptionEnvIdx;
 use super::defs::{
 	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
 	StructIdx, Tier, TypesetIdx, Visibility,
@@ -62,7 +63,8 @@ use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{
-	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+	GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type, TypeIndex,
+	TypeList,
 };
 use crate::ast::{
 	self, BinaryOp, Keyword, Ownership, Separated, Spanned, UnaryOp,
@@ -179,7 +181,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expr: &Spanned<ast::Expression>,
 		expected: TypeIndex,
 	) -> (Body, Obligations) {
-		let expected = self.normalized(expected, self.scope.env);
+		let expected = self.normalized(expected, self.scope.assumption_env);
 		self.enter_root(expr.span, expected);
 		self.check(expr, expected);
 		(self.body, self.obligations)
@@ -348,7 +350,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Result<TypeIndex, ()> {
 		let site = SourceSpan::new(self.scope.file_id, site);
 		match self.cx.normalize(
-			self.scope.env,
+			self.scope.assumption_env,
 			ty,
 			NormalizationDepth::Deep,
 			facts,
@@ -855,7 +857,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		match kind {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
 				let signature = &self.cx.constants[usize::from(const_index)];
-				let ty = self.normalized(signature.ty, signature.env);
+				let ty = self.normalized(
+					signature.ty,
+					self.cx.assumption_envs.of_frame(signature.env),
+				);
 				let kind = ExprKind::Const {
 					constant: const_index,
 					type_args: TypeList::EMPTY,
@@ -899,7 +904,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let first = segments[0].ident.inner;
 		if !prefix.is_empty()
 			&& (first == Keyword::SelfPascal.symbol()
-				|| self.cx.type_envs.resolve(self.scope.env, first).is_some())
+				|| self
+					.cx
+					.generic_envs
+					.resolve(self.scope.generic_env, first)
+					.is_some())
 		{
 			let receiver = self.cx.resolve_type_path(
 				&mut self.obligations.types,
@@ -935,7 +944,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&& let DefKind::Struct(struct_index) = key.symbol_kind(self.cx.defs)
 		{
 			let params = self.cx.structs[usize::from(struct_index)].type_params;
-			let count = self.cx.type_envs.param_names(params).len();
+			let count = self.cx.generic_envs.param_names(params).len();
 			if count > 0 {
 				if stop + 1 != prefix.len() {
 					return Err(self.unsupported(
@@ -1152,7 +1161,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.cx.types.has_error(self.body.ty(argument.value))
 			});
 		self.settle_uninferred(
-			target.type_env,
+			target.generic_env,
 			segment.ident.span,
 			already_reported,
 			&mut type_args,
@@ -1161,7 +1170,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let type_list = self.cx.types.push_list(&type_args);
 		self.check_frame_bounds(
 			&target,
-			target.type_env,
+			target.generic_env,
 			segment,
 			type_list,
 			&given,
@@ -1192,12 +1201,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expected: TypeIndex,
 	) -> Box<[TypeIndex]> {
 		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
-		let count = self.cx.type_envs.param_names(params_env).len();
+		let count = self.cx.generic_envs.param_names(params_env).len();
 		let mut type_args = vec![TypeIndex::INFER; count].into_boxed_slice();
 		self.write_type_args(
 			segment,
 			params_env,
-			TypeEnvOwner::Struct(struct_index),
+			GenericEnvOwner::Struct(struct_index),
 			&mut type_args,
 		);
 		if expected == TypeIndex::INFER {
@@ -1205,7 +1214,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		// A disagreement teaches nothing: the construction's own type is held
 		// to the expected one where the call is checked.
-		let expected = self.normalized(expected, self.scope.env);
+		let expected = self.normalized(expected, self.scope.assumption_env);
 		if let Type::Struct {
 			struct_index: hinted,
 			type_args: hints,
@@ -1230,15 +1239,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn write_type_args(
 		&mut self,
 		segment: &ast::PathSegment,
-		params_env: TypeEnvIdx,
-		owner: TypeEnvOwner,
+		params_env: GenericEnvIdx,
+		owner: GenericEnvOwner,
 		type_args: &mut [TypeIndex],
 	) {
 		if segment.type_args.is_empty() {
 			return;
 		}
-		let start = self.cx.type_envs.parent_count(params_env);
-		let len = self.cx.type_envs.param_names(params_env).len();
+		let start = self.cx.generic_envs.parent_count(params_env);
+		let len = self.cx.generic_envs.param_names(params_env).len();
 		let slots = &mut type_args[start..start + len];
 		// Every written argument is resolved, extra ones too, for their own
 		// diagnostics.
@@ -1273,18 +1282,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn check_frame_bounds(
 		&mut self,
 		target: &CallTarget<'_>,
-		frame: TypeEnvIdx,
+		frame: GenericEnvIdx,
 		segment: &ast::PathSegment,
 		arguments: TypeList,
 		given: &[GivenArgument],
 	) {
-		let own = self.cx.type_envs.param_names(frame).len();
+		let own = self.cx.generic_envs.param_names(frame).len();
 		if own == 0 {
 			return;
 		}
-		let start = self.cx.type_envs.parent_count(frame);
+		let start = self.cx.generic_envs.parent_count(frame);
 		let arguments = arguments.prefix(start + own);
-		let owner = self.cx.type_envs.owner(frame);
+		let owner = self.cx.generic_envs.owner(frame);
 		let written: &[_] = if owner == target.kind.owner() {
 			&segment.type_args
 		} else {
@@ -1295,7 +1304,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let span = match written.get(index) {
 				Some(written) => written.span(),
 				None => {
-					let param = self.cx.type_envs.param_types(frame)[index];
+					let param = self.cx.generic_envs.param_types(frame)[index];
 					let mut span = segment.ident.span;
 					for argument in given {
 						if argument.declared == param {
@@ -1308,7 +1317,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			};
 			self.cx.record_bounds_check(
 				&mut self.obligations.types,
-				self.scope.env,
+				self.scope.assumption_env,
 				BoundRequirements::Parameter {
 					env: frame,
 					index,
@@ -1331,7 +1340,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// whatever failed has said why, and may be why nothing was learned.
 	fn settle_uninferred(
 		&mut self,
-		params_env: TypeEnvIdx,
+		params_env: GenericEnvIdx,
 		span: TextSpan,
 		already_reported: bool,
 		args: &mut [TypeIndex],
@@ -1346,12 +1355,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			let frame = self
 				.cx
-				.type_envs
+				.generic_envs
 				.chain(params_env)
-				.find(|&frame| self.cx.type_envs.parent_count(frame) <= at)
+				.find(|&frame| self.cx.generic_envs.parent_count(frame) <= at)
 				.unwrap();
-			let index = at - self.cx.type_envs.parent_count(frame);
-			let name = self.cx.type_envs.param_names(frame)[index].inner;
+			let index = at - self.cx.generic_envs.parent_count(frame);
+			let name = self.cx.generic_envs.param_names(frame)[index].inner;
 			let name = self.cx.strings.resolve(name).unwrap();
 			self.cx.diagnostics.push(
 				Diagnostic::error()
@@ -1383,12 +1392,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.cx.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.cx.type_envs,
+				envs: &self.cx.generic_envs,
 				env: self.cx.structs[usize::from(struct_index)].type_params,
 				args,
 			},
 		);
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		self.cx.types.collapse_error(ty)
 	}
 
@@ -1404,7 +1413,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Option<(StructIdx, Box<[TypeIndex]>)> {
 		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
 		let Some((impl_kind, target)) =
-			self.cx.resolve_impl_self(self.scope.env)
+			self.cx.resolve_impl_self(self.scope.generic_env)
 		else {
 			// A trait's `Self` is the type implementing it, which is not
 			// known to be a struct; elsewhere `Self` names nothing.
@@ -1823,7 +1832,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let found = match method {
 			Some(method) => {
 				match self.cx.find_trait_impl_query(
-					self.scope.env,
+					self.scope.assumption_env,
 					ty,
 					method.trait_index,
 				) {
@@ -1950,7 +1959,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// What a type means in `scope`: comparisons and literal coercion work on
 	/// normalized types. A projection that does not normalize stays as written;
 	/// whoever wrote it has reported why.
-	fn normalized(&mut self, ty: TypeIndex, scope: TypeEnvIdx) -> TypeIndex {
+	fn normalized(
+		&mut self,
+		ty: TypeIndex,
+		scope: AssumptionEnvIdx,
+	) -> TypeIndex {
 		match self.cx.normalize(
 			scope,
 			ty,
@@ -1968,7 +1981,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let Some(projection) = self.cx.memory_size(memory) else {
 			return TypeIndex::ERROR;
 		};
-		self.normalized(projection, self.scope.env)
+		self.normalized(projection, self.scope.assumption_env)
 	}
 
 	/// Every member of every typeset an abstract `target` assumes, any of
@@ -1980,6 +1993,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let mut targets = Vec::new();
 		for trait_index in self.cx.clause_tables().declared_traits(
 			&self.cx.types,
+			self.scope.assumption_env,
 			target,
 			self.cx.solver.state.recursion_budget,
 		) {
@@ -2127,7 +2141,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		match self.cx.resolve_constant(constant, &args).ok()? {
 			ResolvedConstant::Length(length) => {
 				let length = self.cx.normalize(
-					self.scope.env,
+					self.scope.assumption_env,
 					length,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
@@ -2726,7 +2740,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		else {
 			unreachable!("a literal with a length becomes an array")
 		};
-		let scope = self.scope.env;
+		let scope = self.scope.assumption_env;
 		let target_now = self.cx.normalize(
 			scope,
 			target_length,
@@ -3074,7 +3088,7 @@ mod tests {
 	use super::super::resolutions::{NameResolutions, Referent};
 	use super::super::signatures::TypeContext;
 	use super::super::solver::{NormalizationDepth, RewriteFlags, Solver};
-	use super::super::types::{Type, TypeEnvIdx, TypeIndex};
+	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
@@ -5359,7 +5373,10 @@ mod tests {
 	}
 
 	/// The scope and type of the first parameter of the function `name`.
-	fn first_param(case: &TestCase<'_>, name: &str) -> (TypeEnvIdx, TypeIndex) {
+	fn first_param(
+		case: &TestCase<'_>,
+		name: &str,
+	) -> (GenericEnvIdx, TypeIndex) {
 		let DefKind::Function(index) = case.resolve(name) else {
 			panic!("expected `{name}` to be a function");
 		};
@@ -5386,7 +5403,12 @@ mod tests {
 		let without_values = RewriteFlags::ALL.without(RewriteFlags::VALUES);
 		let mut normalize = |ty, facts| {
 			case.context
-				.normalize(scope, ty, NormalizationDepth::Deep, facts)
+				.normalize(
+					case.context.assumption_envs.of_frame(scope),
+					ty,
+					NormalizationDepth::Deep,
+					facts,
+				)
 				.unwrap()
 		};
 		// The two requests differ only in the facts, and neither is answered

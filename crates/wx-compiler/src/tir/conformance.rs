@@ -21,13 +21,15 @@
 //!
 //! An impl function's own type parameters may assume no more than the
 //! declaration's do (rustc's E0276): a caller through the trait proves only
-//! the trait's bounds. The function is read in the frame such a caller sees
-//! (`contract_frame`): the impl's own frame around it, and its own parameters
-//! assuming the declaration's clauses. Its own clauses are proved there, and
-//! its signature is compared there.
+//! the trait's bounds. The function is read in the env such a caller sees
+//! (`contract_env`, rustc's hybrid `ParamEnv` in `compare_impl_method`): the
+//! impl's env around it, and the declaration's clauses about its own
+//! parameters. Its own clauses are proved there, and its signature is
+//! compared there.
 
 use super::bounds::{
-	BoundClauses, BoundId, Equalities, EqualityClause, TraitClause,
+	AssumptionEnvIdx, BoundClauses, BoundId, Equalities, EqualityClause,
+	TraitClause,
 };
 use super::defs::{
 	AstNodeRef, BindingKey, ConstIdx, DefId, DefKind, FunctionIdx, MemberIdx,
@@ -36,12 +38,14 @@ use super::defs::{
 use super::members::TraitMemberSelection;
 use super::obligations::BoundRequirements;
 use super::resolutions::Referent;
-use super::signatures::{ParamBounds, TypeContext};
+use super::signatures::TypeContext;
 use super::solver::{
-	ImplMember, NormalizationDepth, RewriteFlags, SolverError,
+	ImplMember, NormalizationDepth, RewriteFlags, SolverError, Subjects,
 	UnsatisfiedClause,
 };
-use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
+use super::types::{
+	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
+};
 use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -69,7 +73,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		let (scope, target) = (header.type_params, header.target);
 		let file_id = self.defs.trait_impls[usize::from(impl_index)].file_id;
 		let at_target = SourceSpan::new(file_id, target.span);
-		let owner = TypeEnvOwner::Trait(trait_index);
+		let owner = GenericEnvOwner::Trait(trait_index);
 
 		self.check_members(impl_index, trait_index, target.inner, at_target)?;
 
@@ -79,7 +83,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		let trait_env = self.traits[usize::from(trait_index)].env;
 		let arguments = self.types.push_list(&[target.inner]);
 		let result = self.check_bound_requirements(
-			scope,
+			self.assumption_envs.of_frame(scope),
 			BoundRequirements::Parameter {
 				env: trait_env,
 				index: 0,
@@ -138,7 +142,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					_ => at_target,
 				};
 			let result = self.check_bound_requirements(
-				scope,
+				self.assumption_envs.of_frame(scope),
 				BoundRequirements::AssociatedType {
 					declaration: declaration_index,
 					trait_index,
@@ -300,7 +304,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	}
 
 	/// The impl's `function` against the trait's `declaration`, read in the
-	/// frame a caller through the trait sees (`contract_frame`): `Self` is
+	/// env a caller through the trait sees (`contract_env`): `Self` is
 	/// `target`, and the declaration's own type parameters are the
 	/// function's, by position, assuming what the declaration's do. Reports
 	/// the first difference: the number of own type parameters, a bound the
@@ -331,11 +335,11 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			);
 			return Ok(());
 		}
-		let frame = self.contract_frame(declaration, function, target);
+		let contract = self.contract_env(declaration, function, target);
 		if !self.check_own_bounds(
 			trait_index,
 			(declaration, function),
-			frame,
+			contract,
 		)? {
 			return Ok(());
 		}
@@ -362,7 +366,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			return Ok(());
 		}
 		let arguments: Box<[TypeIndex]> = std::iter::once(target)
-			.chain(self.own_params(frame).iter().copied())
+			.chain(self.own_params(env).iter().copied())
 			.collect();
 		// The result is compared as one more position, after the parameters.
 		for position in 0..=params {
@@ -405,27 +409,19 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			let expected = self.types.substitute(
 				expected,
 				Substitution {
-					envs: &self.type_envs,
+					envs: &self.generic_envs,
 					env: declaration_env,
 					args: &arguments,
 				},
 			);
-			let found = self.types.substitute(
-				found,
-				Substitution {
-					envs: &self.type_envs,
-					env,
-					args: self.type_envs.identity_args(frame),
-				},
-			);
 			let expected = self.normalize(
-				frame,
+				contract,
 				expected,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
 			)?;
 			let found = self.normalize(
-				frame,
+				contract,
 				found,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
@@ -473,60 +469,55 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		Ok(())
 	}
 
-	/// The frame a caller through the trait sees `function` in: the impl's
-	/// own frame around it, and the function's own type parameters (their
-	/// names, for display) assuming the clauses the declaration's state, with
-	/// `Self` as `target` and the declaration's parameters as these, by
-	/// position. It exists for the check alone. A function without its own
-	/// parameters has nothing to read differently, and is read in its own
-	/// frame.
-	///
-	/// A second frame is needed only because assumptions are keyed by
-	/// parameter identity; `notes/tir-param-env-plan.md` proposes making the
-	/// assumption context a value, which would reduce this to building one.
-	fn contract_frame(
+	/// The env a caller through the trait sees `function` in: the impl's
+	/// env around it, and the clauses the declaration's own env states, with
+	/// `Self` as `target` and the declaration's parameters as the function's,
+	/// by position. It exists for the check alone; its index is new, so its
+	/// cache entries alias no declaration's. A function without its own
+	/// parameters is read in its own env, and one whose declaration writes no
+	/// bound in its impl's.
+	fn contract_env(
 		&mut self,
 		declaration: FunctionIdx,
 		function: FunctionIdx,
 		target: TypeIndex,
-	) -> TypeEnvIdx {
+	) -> AssumptionEnvIdx {
 		let env = self.functions[usize::from(function)].type_params;
 		if self.own_params(env).is_empty() {
-			return env;
+			return self.assumption_envs.of_frame(env);
 		}
-		let parent = self
-			.type_envs
-			.parent(env)
-			.expect("a function's own frame has its impl's around it");
-		let names = self.type_envs.param_names(env).to_vec();
-		let frame = self.type_envs.push_param_frame(
-			&mut self.types,
-			TypeEnvOwner::Function(function),
-			parent,
-			names,
+		let impl_env = self.assumption_envs.of_frame(
+			self.generic_envs
+				.parent(env)
+				.expect("a function's own frame has its impl's around it"),
 		);
 		let declaration_env =
 			self.functions[usize::from(declaration)].type_params;
-		let own = self.type_envs.param_types(frame);
-		let count = own.len();
-		let arguments: Box<[TypeIndex]> =
-			std::iter::once(target).chain(own.iter().copied()).collect();
-		// Only the clauses are read; the bounds as written are the
-		// declaration's, for display.
-		let bounds = (0..count)
-			.map(|index| ParamBounds {
-				declared_bounds: Box::new([]),
-				clauses: self.instantiate_clauses(
-					self.param_bounds[usize::from(declaration_env)][index]
-						.clauses,
-					declaration_env,
-					&arguments,
-				),
-			})
+		// A declaration that writes no bound adds nothing to the impl's env.
+		let Some(own) = self.own_env(declaration_env) else {
+			return impl_env;
+		};
+		let arguments: Box<[TypeIndex]> = std::iter::once(target)
+			.chain(self.generic_envs.param_types(env).iter().copied())
 			.collect();
-		// Indexed by frame; building the clauses pushed none.
-		self.param_bounds.push(bounds);
-		frame
+		let clauses = self.instantiate_clauses(
+			self.assumption_envs.clauses(own),
+			declaration_env,
+			&arguments,
+		);
+		let contract = self.assumption_envs.push(impl_env, None);
+		*self.assumption_envs.clauses_mut(contract) = clauses;
+		contract
+	}
+
+	/// The env `function_env`'s function states clauses in, when it has one
+	/// of its own rather than sharing its trait's or impl's.
+	fn own_env(&self, function_env: GenericEnvIdx) -> Option<AssumptionEnvIdx> {
+		let parent = self.generic_envs.parent(function_env).expect(
+			"a function's own frame has its trait's or impl's around it",
+		);
+		let own = self.assumption_envs.of_frame(function_env);
+		(own != self.assumption_envs.of_frame(parent)).then_some(own)
 	}
 
 	/// `clauses`, written in `env`'s chain, with that chain's parameters
@@ -535,14 +526,14 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	fn instantiate_clauses(
 		&mut self,
 		clauses: BoundClauses,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		arguments: &[TypeIndex],
 	) -> BoundClauses {
 		let Equalities::Final(equalities) = clauses.equalities else {
 			unreachable!("every signature exists when declarations are checked")
 		};
 		let substitution = Substitution {
-			envs: &self.type_envs,
+			envs: &self.generic_envs,
 			env,
 			args: arguments,
 		};
@@ -575,7 +566,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		}
 	}
 
-	/// Proves the clauses of `function`'s own type parameters in `frame`, where
+	/// Proves the clauses `function`'s own env states in `contract`, where
 	/// they assume only the declaration's: an impl may require less than its
 	/// trait, never more. Each written bound that does not follow is reported
 	/// once, by the first of its clauses that fails (`T: Ord` over a trait's
@@ -585,35 +576,34 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		&mut self,
 		trait_index: TraitIdx,
 		(declaration, function): (FunctionIdx, FunctionIdx),
-		frame: TypeEnvIdx,
+		contract: AssumptionEnvIdx,
 	) -> Result<bool, SolverError> {
 		let env = self.functions[usize::from(function)].type_params;
-		if frame == env {
+		// A function that writes no bound shares its impl's env, which the
+		// contract's parent is.
+		if self.own_params(env).is_empty() {
 			return Ok(true);
 		}
+		let Some(own) = self.own_env(env) else {
+			return Ok(true);
+		};
 		let arguments: Box<[TypeIndex]> =
-			self.type_envs.identity_args(frame).into();
-		let mut holds = true;
-		for index in 0..self.type_envs.param_types(env).len() {
-			let clauses = self.param_bounds[usize::from(env)][index].clauses;
-			let root = self.type_envs.param_types(env)[index];
-			let subject = self.type_envs.param_types(frame)[index];
-			let mut failures = Vec::new();
-			if self.satisfies_clauses(
-				frame,
-				clauses,
-				(root, subject),
-				(env, &arguments),
-				Some(&mut failures),
-				None,
-			)? {
-				continue;
-			}
-			holds = false;
+			self.generic_envs.identity_args(env).into();
+		let clauses = self.assumption_envs.clauses(own);
+		let mut failures = Vec::new();
+		let holds = self.satisfies_clauses(
+			contract,
+			clauses,
+			Subjects::All,
+			(env, &arguments),
+			Some(&mut failures),
+			None,
+		)?;
+		if !holds {
 			let Equalities::Final(equalities) = clauses.equalities else {
 				unreachable!("proved clauses are final")
 			};
-			// The bound written on this parameter each failure came from.
+			// The written bound each failure came from.
 			let mut reported = Vec::new();
 			for failure in failures {
 				let origin = match failure {
@@ -670,19 +660,19 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		let expected = self.types.substitute(
 			expected,
 			Substitution {
-				envs: &self.type_envs,
+				envs: &self.generic_envs,
 				env: declaration_env,
 				args: &[target],
 			},
 		);
 		let expected = self.normalize(
-			env,
+			self.assumption_envs.of_frame(env),
 			expected,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let found = self.normalize(
-			env,
+			self.assumption_envs.of_frame(env),
 			found,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -734,13 +724,14 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		Ok(())
 	}
 
-	/// A function's own type parameters, given the frame it is read in (its
-	/// own, or the one its check builds): none when that frame is the
-	/// trait's or impl's around it, which a function without its own
+	/// A function's own type parameters, given its frame: none when that is
+	/// the trait's or impl's around it, which a function without its own
 	/// parameters is read in.
-	fn own_params(&self, frame: TypeEnvIdx) -> &[TypeIndex] {
-		match self.type_envs.owner(frame) {
-			TypeEnvOwner::Function(_) => self.type_envs.param_types(frame),
+	fn own_params(&self, frame: GenericEnvIdx) -> &[TypeIndex] {
+		match self.generic_envs.owner(frame) {
+			GenericEnvOwner::Function(_) => {
+				self.generic_envs.param_types(frame)
+			}
 			_ => &[],
 		}
 	}

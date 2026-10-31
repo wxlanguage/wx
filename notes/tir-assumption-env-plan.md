@@ -1,0 +1,398 @@
+# TIR assumptions as their own arena (`AssumptionEnv`)
+
+Status: steps 1–5 done (2026-10-31, branch
+`slices-and-untyped-constants`); the rest planned. Supersedes the 2026-10-28 proposal in this file
+(`ClauseSource` over frames). Companions: `tir-assumption-context-plan.md`
+(how the current assumption context came to be), `tir-type-context.md`,
+`tir-check-pass.md`, and "Fit clauses" in `slices-and-untyped-constants.md`,
+which builds on this.
+
+## Problem
+
+A type environment frame (`GenericEnvIdx`) does two jobs:
+
+1. **Identity.** Which parameters exist, their names, their flat positions
+   for substitution (`parent_count + param_index`), how they print.
+2. **Assumptions.** `param_bounds: Vec<Box<[ParamBounds]>>` is indexed by
+   frame and then by parameter, and an assumption context *is* a frame,
+   read by walking its chain (`ClauseTables::assumed_traits`,
+   `assumptions_readiness`).
+
+A clause is owned by the parameter it is about. Everything below follows
+from that:
+
+- **A clause can only be about its own frame's parameter.** A method cannot
+  state a fact about its trait's `Self` or its impl's `T`: `Self`'s run is
+  shared by every method. `Array::as_slice` needs exactly that
+  (`<Self as Array>::LEN` fits `M::Size`).
+- **The same parameters cannot assume different things in different
+  checks.** `conformance.rs::contract_frame` copies the impl function's
+  parameter names into a second frame only so the copies can carry the
+  trait declaration's clauses, and every comparison substitutes the impl's
+  types onto them.
+- **A parameter's own clauses are read without a context.**
+  `declarations_of`'s root case reads `param_bounds[env][param_index]`
+  whatever scope asks, so a narrower scope cannot add to them.
+- **The cache key is the frame.** `Normalization` is keyed by the
+  `GenericEnvIdx`, so every generic function is its own key: `<T as Tr>::A`
+  over an impl's `T` is cached once per method, even for methods that
+  assume nothing more than the impl.
+- **Boxing.** One `Box<[ParamBounds]>` per frame, and one `Box<[BoundId]>`
+  per parameter inside it.
+
+## History
+
+`tir-assumption-context-plan.md` introduced `AssumptionContext` as a handle
+over the frame chain, keeping parameter identity and the frame
+representation. It shrank to a newtype and was removed: queries take a
+`GenericEnvIdx` named `assumption_context`. Its constraints still apply:
+
+- impl requirements are proved in the caller's context and never become its
+  assumptions;
+- an inner declaration's facts about an outer parameter stay local to it;
+- cycle detection accounts for context when it changes a query's meaning.
+
+The 2026-10-28 version of this note kept clauses per parameter and added a
+`AssumptionEnv` of sources over frames (`Frame(GenericEnvIdx)` read live, plus
+`Clauses { subject, .. }` runs). It fixed where a context points, not how
+clauses are owned. Attaching clause lists to frames instead was also
+considered and rejected: an item with clauses but no parameters would need
+an empty frame, and every empty frame would be another cache key to strip.
+
+## rustc, for comparison
+
+- A parameter is `ParamTy { index, name }`, a position in an item's flat
+  generics (`generics_of`, with `parent` and `parent_count`).
+- Written predicates are `predicates_of(def_id)`: `GenericPredicates {
+  parent: Option<DefId>, predicates }`, the item's own, chained to its
+  parent's and instantiated by walking the chain.
+- What a query assumes is a `ParamEnv`: `param_env(def_id)` collects the
+  chain, elaborates it (supertraits) and interns one flat `&List<Clause>`;
+  the solver scans it linearly, and equal lists share caches.
+- `compare_impl_method` builds a hybrid `ParamEnv` (the impl's predicates
+  plus the trait method's, instantiated with `trait_to_impl_args`) and
+  proves the impl method's predicates in it. It creates no parameters.
+
+Identity and assumptions are separate tables in rustc, both keyed by the
+item. wx keeps `TypeParam { env, param_index }` (owner-ful parameters, see
+Non-goals) and separates the same two things.
+
+## Design
+
+Naming: a declaration's parameters live in a *generic env* (`GenericEnv`,
+formerly `TypeEnv`), what it assumes in an *assumption env*
+(`AssumptionEnv`). Both are environments rather than frames: inherited from
+the parent unless the item adds something. Assumption envs are created
+lazily (only an item that writes a bound gets one); generic envs are not
+quite yet (every impl gets one, empty or not, because `Self` inside the
+impl finds its impl through it), which can be revisited separately.
+
+Identity stays in `GenericEnvArena`, unchanged: envs only for items that
+declare parameters, and impls. Assumptions get their own arena:
+
+```rust
+index_newtype!(AssumptionEnvIdx);
+
+/// The clauses in force in a scope: its own, then its parent's.
+#[derive(Clone, Copy)]
+struct AssumptionEnv {
+    parent: Option<AssumptionEnvIdx>,
+    /// Any subject in scope: a parameter of any enclosing frame, or a
+    /// projection out of one.
+    traits: ClauseRange<TraitClause>,
+    equalities: Equalities,
+    // with fit clauses: fits: ClauseRange<FitClause>,
+}
+
+struct AssumptionEnvArena {
+    /// Slot 0 is `AssumptionEnvIdx::ROOT`: no clauses, no parent.
+    envs: Vec<AssumptionEnv>,
+}
+```
+
+- **Two fields per signature, set once.** Each signature keeps its
+  `GenericEnvIdx` (identity) and gains a `assumption_env: AssumptionEnvIdx`. Neither is
+  derived from the other, so there is nothing to keep in sync:
+  - an item that states clauses gets a new env whose parent is the
+    enclosing item's env;
+  - an item that states none reuses its enclosing item's env (the root at
+    the top);
+  - an item with clauses and no own parameters (a function bounding only
+    `Self`) gets an env and no frame of its own;
+  - a generic item with no bounds gets a frame and no env of its own.
+- **A parent chain, not flattened copies.** Chains are at most two levels
+  (an impl or trait, then a function), so a walk is short, and a parent's
+  equalities are read live, so a child never holds a stale `Pending` copy.
+  Flattening (rustc's interned list) can come later where a measurement
+  shows it is better; it would need clause provenance (`source`, `origin`)
+  moved beside the clause, so equal facts compare equal.
+- **Flat storage.** `AssumptionEnv` is `Copy` in a `Vec`; clauses stay in the
+  `ClauseArena`, each env's own contiguous; written bounds stay in the
+  `BoundArena`. `param_bounds` and both boxes go away. A parameter's
+  written bounds (`ParamBounds::declared_bounds`) are only read during
+  construction (the equality pass takes them) and by tests, so they stay
+  local to construction; tests read the clauses.
+- **A clause's subject is any type in scope.** Inline bounds are the short
+  form: `T: Iterator where { Item: Hash }` appends `T: Iterator` and
+  `<T as Iterator>::Item: Hash` to the item's env, elaborated as today
+  (supertraits with `Self` substituted, nested bounds as clauses on
+  projections). A trait function's `Self` entry appends to the same env.
+- **Associated type declarations keep their own clauses** (`type A: B`,
+  about `<Self as Tr>::A`, on `AssocTypeSignature`): they describe a
+  projection path, not a scope, and are read along it as today.
+- **A trait's own clauses** (its supertraits, about `Self`) are its env's.
+  `inherit_trait_clauses` reads `traits[i].assumption_env` instead of
+  `param_bounds[env][0]`.
+- **Construction order is unchanged.** Today a frame publishes every
+  parameter's memberships, then resolves every value, then builds every
+  equality (`signatures.rs`, the parameter-bounds pass). An env publishes
+  its trait range with `Equalities::Pending`, then sets
+  `Equalities::Final`: one readiness per env, the order construction
+  already follows.
+
+### Reading
+
+- **What a scope assumes** (`assumed_traits(env)`,
+  `assumed_subjects`, `assumptions_readiness(env)`): walk the env's parent
+  chain instead of the frame chain. A trait's reflexive `Self: Trait` comes
+  from the frame owner of the subject, which is identity, and is unchanged.
+- **What states something about a receiver** (`declarations_of(env,
+  receiver)`): the root case yields each env on the chain as a source with
+  `context: None`. The filter every reader already applies
+  (`DeclarationSource::names`: the clause's subject is the receiver) picks
+  the clauses about it. A clause written on `as_slice` about `Self` is then
+  seen inside `as_slice` and nowhere else. The associated-declaration case
+  is unchanged.
+- **Proving a use** (`satisfies_clauses`, `prove_requirements`): each env
+  on the callee's chain is proved with the use's flat arguments,
+  substituted through the callee's frame (the signature has both). The
+  per-parameter `(param, arg)` pairing goes away; the substitution covers
+  every parameter. `reads_failed` works on an env's clauses as on a run.
+- **Body checking.** `LexicalScope` gains `assumption_env` beside `env`: `env`
+  resolves names, `assumption_env` is what queries assume
+  (`members.rs`'s `assumption_context: scope.env` and the like).
+
+### Caching
+
+`Normalization` is keyed by `AssumptionEnvIdx`. A type with no parameter is
+keyed under `ROOT`, as under `GenericEnvIdx::ROOT` today. Every item that
+adds no clauses shares its parent's env and so its cache entries; no empty
+frame or env is ever made, so nothing needs stripping from a key. A
+normalization's answer depends only on the clauses and the definitions:
+a type carries its own identity (`TypeParam { env, .. }`), so the frame is
+not part of the key.
+
+### Conformance
+
+`contract_frame` becomes building one env:
+
+```text
+AssumptionEnv {
+    parent: impl block's env,
+    traits/equalities: the trait function's own clauses, instantiated with
+                       [target, impl function's own parameters],
+}
+```
+
+The impl function's signature and own clauses are checked in that env, with
+its own parameters used directly. Gone: the second frame and its names, its
+`param_bounds` slot, the `found` substitution in `compare_function`, and
+`own_params`' need to recognize a check-only frame. The trait side is still
+instantiated (`instantiate_clauses`), as in rustc. The env's index is new,
+so its cache entries never alias a real declaration's.
+
+### Clauses on `Self`: written as a trait function's first parameter
+
+There is no `where` list. A trait function that needs more of `Self` than
+the trait does names `Self` as its first type parameter, bounded as any
+parameter is; `Self` is the trait frame's parameter, hidden by default:
+
+```wx
+pub trait Array: Slice {
+    const LEN: {integer};
+    func as_slice<
+        Self: Array where { const LEN: M::Size },
+        M: Memory,
+    >(self: M::&Self) -> M::&[Self::Value];
+}
+```
+
+- It lowers into the function's env: clauses about `Self` (an outer
+  parameter) beside the function's own, exactly what a `where` list would
+  have produced. Nested binding blocks reach any path from `Self`, and
+  `Self: Other` requires another trait (Rust's `where Self: Sized`).
+- It is not an argument: the turbofish starts at the next parameter
+  (`x.as_slice::<heap>()`), and conformance's own-parameter count skips it.
+- Only first, in a trait's functions and a trait impl's (below), where
+  `Self` is the target.
+- A binding block's entry for a constant starts with `const`, required, so
+  the parser tells it from a type's entry by the keyword alone:
+  `const N: u32` is a fit clause (step 8), `const N = 10` a constant
+  equality (rustc's `ConstEquate`), parsed and formatted but reported
+  unsupported (E2114) until something needs it. `Size: Sub` and
+  `Size = u32` stay a type's.
+- Why nothing more general: per-method clauses are needed only where a
+  method cannot move. An inherent impl's method that needs more of `T` goes
+  in another block bounded so (std's `RawPtr` blocks); a trait impl's may
+  require no more than its declaration (E2124); a method's own parameters
+  take bounds where they are declared. What is left is a trait's function
+  about `Self`.
+- A `where` list on a trait or impl header would collide with the bound's
+  bindings (`trait Pointer: StackValue where { .. }`); nothing needs one.
+
+### An impl function assumes what it writes (refinement)
+
+An impl function's clauses are exactly the ones it writes, `Self` included,
+as for its own parameters today (rustc's `#[refine]`, RFC 3245): a call
+through the trait proves the declaration's clauses, a direct call proves
+the impl's, and conformance proves the impl's follow from the
+declaration's (E2124). Nothing is inherited from the declaration.
+
+```wx
+trait Container {
+    type Item;
+    func show<Self: Container where { Item: Display }>(self: Self);
+}
+struct Wrap<T>(inner: T);
+impl<T> Container for Wrap<T> {
+    type Item = T;
+    func show<Self: Container where { Item: Display }>(self: Self) {
+        display(self.inner)          // T: Display, as written
+    }
+}
+```
+
+- Without the `Self` entry, the body cannot use `T: Display` (an unmet
+  bound), and `show` is callable for every `T`. `impl<T: Display>` would be
+  wrong: `Wrap<NoDisplay>` is still a `Container`, only `show` needs it.
+- In an impl `Self` is the target, so a `Self` entry's clauses are about a
+  type (`<Wrap<T> as Container>::Item: Display`). The env normalizes them
+  where it is built (`T: Display`), the form lookup by root parameter finds
+  (rustc normalizes its param env for the same reason).
+- A clause that normalizes to a concrete type (`type Item = Bytes`:
+  `Bytes: Display`) assumes nothing abstract; it is proved where the env is
+  built and reported if it never holds. A concrete target rarely needs a
+  `Self` entry: its facts are decided directly.
+- Allowed in trait functions and trait impl functions. An inherent impl
+  splits into blocks instead (std's `RawPtr`); allowing it there too is a
+  later uniformity question, nothing needs it.
+
+## Steps
+
+Each leaves the suite green.
+
+1. Done. **The arena, no behaviour change.** `AssumptionEnvArena`; a
+   generic env's clauses contiguous (one push per pass instead of one per
+   parameter); `param_bounds` and `ParamBounds` gone; written bounds local
+   to construction; tests read clauses (`written_bounds`), and the
+   formatter's test reads bounds by span.
+2. Done. **Queries take `AssumptionEnvIdx`.** Every `assumption_context`,
+   `Normalization`'s key (`AssumptionEnvIdx::ROOT` for a type with no
+   parameter), `LexicalScope::assumption_env` beside `generic_env`; an
+   env's `parent` and `reflexive` (a trait's `Self: Trait`, which walking
+   assumption envs no longer reads off the generic env's owner); items
+   without a bound share their parent's env, decided from syntax when the
+   generic env is pushed. Kept: the map from a generic env to the
+   assumption env its item states clauses in (`AssumptionEnvArena::of_frame`),
+   used to build a scope and to prove an item's own clauses. A signature
+   field replaces it once an item can have an assumption env without a
+   generic env (step 6).
+3. Done. **Scoped root lookup.** `declarations_of`/`declared_traits` take
+   the context; for a parameter at the root they read each assumption env
+   on the context's chain (the root env, which assumes nothing, skipped),
+   and `projection_equality`/`declared_bound_member` pass theirs. Audit:
+   every production caller already asked from the declaration's own scope
+   or one inside it; only two tests asked about a parameter's bounds from
+   the root context, and now ask from its declaration (a third test pins
+   that outside it the bounds are not assumed).
+4. Done. **Proving by env.** `satisfies_clauses` takes `Subjects`: `All`
+   (every clause, its subject substituted over the frame's chain like its
+   other types) or `Rooted` (the clauses over one root, rebased onto the
+   use's type). Impl selection (`prove_requirements`) proves each env on
+   the impl's assumption chain whole, and conformance's `check_own_bounds`
+   the impl function's own env whole (none when it shares the impl's).
+   `Rooted` stays where a failure is reported at one argument
+   (`check_bound_requirements`, per parameter) and for an associated
+   declaration's clauses, whose root is a projection. Within an env,
+   memberships are now proved before equalities across all parameters, not
+   per parameter; the order is still the arena's, so deterministic.
+5. Done. **Conformance by env.** `contract_env` pushes one assumption
+   env, parented on the impl's and bound to no generic env, holding the
+   declaration's own clauses instantiated with `[target, the function's
+   own parameters]`; when the declaration writes no bound (it shares its
+   trait's env) the impl's env is used as it is.
+   The function's signature is compared and its own env proved there,
+   with its own parameters used directly: the second generic env, the
+   `found` substitution and `own_params`' check-only case are gone.
+6. **Clauses on `Self`.** Parser and AST (`Self` accepted as a trait
+   function's or trait impl function's first type parameter; a binding
+   block's `const N: Ty` and `const N = value` entries, the second reported
+   unsupported until constant equalities exist), lowering
+   into the function's env (outer-rooted clauses beside its own), the
+   argument count and turbofish skipping it, wx-fmt. A use proves the
+   item's env once (`Subjects::All`) instead of once per argument, and
+   reports each failure at the argument its clause's root parameter takes,
+   or at the path segment for a parameter of an outer frame (the
+   per-argument audit item below). The obligation carries the use's
+   argument spans; `Subjects::Rooted` then has no parameter left to serve.
+   A trait impl function's `Self` entry: its clauses normalized into its
+   env (a concrete subject proved there), proved to follow from the
+   declaration's by conformance like its own parameters' clauses.
+7. **Associated-type bounds by substitution** (rustc's
+   `check_type_bounds`; whenever convenient, nothing waits on it). A value
+   for `<R as Tr>::A` is checked against `type A: ..` by proving the
+   declaration's clauses with `Self` substituted by `R`, normalized in an
+   env that holds `<R as Tr>::A == value`, so the normalization never
+   selects the definition being checked. Covers all four sites
+   (conformance, a binding in a bound, a memory's `Size`, a global's
+   `Value`), which today re-root the clauses onto the value
+   (`Subjects::Rooted`, `rebase`). Both go, and `satisfies_clauses` loses
+   its mode.
+8. **Fit clauses** (slices step 6): a third range in `AssumptionEnv`, the
+   `const N: Ty` entry in a binding block, `satisfies_clauses`' arm, the body's lookup in
+   `untyped_value`. Then `Array::as_slice`/`as_slice_mut` get bodies in std.
+
+## To audit
+
+- **Requirement re-entry** (`solver.rs`, `match_impl_target_and_bounds`):
+  `assumption_context == impl_env` with identity arguments marks the impl's
+  own judgement. Once envs are shared, an impl's env and a caller's (a
+  method of the impl that adds no clauses) can be the same index. The check
+  should name the judgement explicitly (its solver frame) rather than
+  compare contexts.
+- ~~**`declarations_of` callers** (step 3)~~: done, see step 3.
+- **Per-argument checks read one root** (step 6). `check_bound_requirements`
+  proves, for each argument, the clauses rooted at its parameter in its
+  frame's env. A clause a trait function states about `Self` (an outer
+  parameter) is rooted at neither
+  the function's parameters nor in the trait's env, so no per-argument check
+  reads it. Step 6 needs a use of the item to prove its own env's clauses
+  rooted outside its frame, reported at the path segment.
+- ~~**The conformance env's subjects**~~ (step 5): they are the impl
+  function's own parameters, whose frame is on no chain the env knows
+  about. Nothing reads a subject's frame from the context: assumptions are
+  matched by subject, substitution and `is_abstract` read identity from
+  the types. The E2124 suite passes unchanged.
+- **Lookup cost.** Lookup by subject scans an env's clauses instead of
+  indexing a parameter's run. The lists are small; measure on the std
+  sweep before adding an index.
+
+## Open
+
+- **Interning envs** (rustc's flat list): equal assumptions sharing caches
+  across unrelated items. Needs provenance out of the clause; measure first.
+- **Body-local facts** (a fact one branch learns): an env per branch fits,
+  but nothing produces one.
+- **Clauses on other items** (structs, impls, traits): no syntax; a header
+  `where` list collides with bound bindings. Added when something needs it.
+
+## Non-goals
+
+- **Owner-free type parameters** (`TypeParam { index }` as in rustc). Every
+  type would mean something only relative to an item: `T` from two
+  unrelated functions would be one `TypeIndex`, display would need the item,
+  and substitution would change shape. Independent of this plan.
+- **A syntactic subset check for E2124** (E0276). Comparing clause lists
+  rejects impls Rust accepts (a bound that follows from an equality, from
+  the impl block's own assumptions, or after normalization). Conformance
+  proves clauses, and keeps doing so.

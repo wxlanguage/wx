@@ -261,7 +261,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.report_annotation_required(pointer);
 			return None;
 		}
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		let span = self.body.span(pointer);
 		let found = match *self.cx.types.resolve(ty) {
 			Type::Pointer {
@@ -286,7 +286,8 @@ impl BodyContext<'_, '_, '_, '_> {
 								assoc_type_index: value,
 								base: to,
 							});
-						let element = self.normalized(element, self.scope.env);
+						let element =
+							self.normalized(element, self.scope.assumption_env);
 						return Some((to, element, memory, ownership));
 					}
 					Some(to)
@@ -328,10 +329,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		trait_index: TraitIdx,
 		span: TextSpan,
 	) -> Option<bool> {
-		match self
-			.cx
-			.find_trait_impl_query(self.scope.env, ty, trait_index)
-		{
+		match self.cx.find_trait_impl_query(
+			self.scope.assumption_env,
+			ty,
+			trait_index,
+		) {
 			Ok(found) => Some(found.is_some()),
 			Err(error) => {
 				let site = SourceSpan::new(self.scope.file_id, span);
@@ -433,12 +435,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		let ty = self.cx.types.substitute(
 			declared,
 			Substitution {
-				envs: &self.cx.type_envs,
+				envs: &self.cx.generic_envs,
 				env: self.cx.structs[usize::from(struct_index)].type_params,
 				args: &args,
 			},
 		);
-		Some((field, self.normalized(ty, self.scope.env)))
+		Some((field, self.normalized(ty, self.scope.assumption_env)))
 	}
 
 	/// `place.&`: a shared pointer to a place, in its memory. Only a place

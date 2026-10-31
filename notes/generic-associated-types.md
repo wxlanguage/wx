@@ -124,6 +124,6 @@ What carries over from rustc:
    formatter), the GAT frame, declared bounds read through it,
    well-formedness. The risk: a helper that ignores `args` breaks caching
    or matching without an error.
-3. Conformance in `contract_frame`: count, bounds no stronger than the
+3. Conformance in `contract_env`: count, bounds no stronger than the
    declaration's, the value meeting the declared bounds for every argument;
    impl values and trait defaults instantiated by rebasing.

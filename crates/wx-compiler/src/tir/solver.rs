@@ -17,8 +17,9 @@ use crate::diagnostics::SourceSpan;
 
 use super::body::ConstBody;
 use super::bounds::{
-	BindingRef, BoundClauses, BoundId, ClauseArena, ClauseTables, Equalities,
-	Readiness, SelfSubstitution, known_distinct,
+	AssumptionEnv, AssumptionEnvIdx, BindingRef, BoundClauses, BoundId,
+	ClauseArena, ClauseTables, Equalities, Readiness, SelfSubstitution,
+	known_distinct,
 };
 use super::defs::{
 	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
@@ -30,11 +31,11 @@ use super::layout::Layouts;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::{
 	AssocTypeSignature, ConstantSignature, EnumSignature,
-	InherentImplSignature, ParamBounds, StructSignature, TraitImplSignature,
-	TraitSignature, TypeContext,
+	InherentImplSignature, StructSignature, TraitImplSignature, TraitSignature,
+	TypeContext,
 };
 use super::types::{
-	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
+	GenericEnvArena, GenericEnvIdx, ImplKind, Substitution, Type, TypeIndex,
 	TypeInterner, TypeList,
 };
 
@@ -57,6 +58,46 @@ pub(super) enum SolverError {
 	Overflow,
 	/// A projection requires itself. The asking site reports it.
 	Cycle(Box<ProjectionCycle>),
+}
+
+/// Which of a run's clauses a proof reads, and how their subjects meet the
+/// use.
+#[derive(Clone, Copy)]
+pub(super) enum Subjects {
+	/// Every clause, its subject substituted like its other types: an env's
+	/// clauses proved for a use's arguments.
+	All,
+	/// The clauses about paths over `root`, each read over `subject`: one
+	/// argument's share of an env, or an associated declaration's clauses,
+	/// whose root is a projection.
+	Rooted { root: TypeIndex, subject: TypeIndex },
+}
+
+impl Subjects {
+	/// Whether a clause about `ty` is read.
+	fn reads(self, types: &TypeInterner, ty: TypeIndex) -> bool {
+		match self {
+			Subjects::All => true,
+			Subjects::Rooted { root, .. } => is_path_over(types, ty, root),
+		}
+	}
+
+	/// `ty`, a clause's subject, as the use states it.
+	fn stated(
+		self,
+		types: &mut TypeInterner,
+		(envs, env, args): (&GenericEnvArena, GenericEnvIdx, &[TypeIndex]),
+		ty: TypeIndex,
+	) -> TypeIndex {
+		match self {
+			Subjects::All => {
+				types.substitute(ty, Substitution { envs, env, args })
+			}
+			Subjects::Rooted { root, subject } => {
+				rebase(types, ty, root, subject)
+			}
+		}
+	}
 }
 
 /// Why a bound does not hold, for the check that owns it to report.
@@ -142,6 +183,23 @@ fn is_stack_scalar(ty: TypeIndex) -> bool {
 			| TypeIndex::F64
 			| TypeIndex::FUNCREF
 	)
+}
+
+/// Whether `ty` is `root` or a projection path over it.
+fn is_path_over(
+	types: &TypeInterner,
+	mut ty: TypeIndex,
+	root: TypeIndex,
+) -> bool {
+	loop {
+		if ty == root {
+			return true;
+		}
+		match *types.resolve(ty) {
+			Type::TypeProjection { base, .. } => ty = base,
+			_ => return false,
+		}
+	}
 }
 
 /// `ty`, a projection path over `root`, with `root` replaced by `onto`.
@@ -544,7 +602,7 @@ impl TypeContext<'_, '_, '_> {
 			),
 		});
 		let result = self.normalize(
-			scope,
+			self.assumption_envs.of_frame(scope),
 			value,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -691,7 +749,7 @@ impl TypeContext<'_, '_, '_> {
 /// both cycle detection and the cache.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Normalization {
-	env: TypeEnvIdx,
+	env: AssumptionEnvIdx,
 	pub(super) ty: TypeIndex,
 	depth: NormalizationDepth,
 	facts: RewriteFlags,
@@ -704,7 +762,7 @@ impl Normalization {
 	/// its request is the root's, computed and cached once for all of them.
 	fn new(
 		types: &TypeInterner,
-		env: TypeEnvIdx,
+		env: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -712,7 +770,7 @@ impl Normalization {
 		let env = if types.has_param(ty) {
 			env
 		} else {
-			TypeEnvIdx::ROOT
+			AssumptionEnvIdx::ROOT
 		};
 		debug_assert!(
 			types.has_projection(ty),
@@ -847,7 +905,7 @@ impl TypeContext<'_, '_, '_> {
 				Ok(self.types.substitute(
 					default,
 					Substitution {
-						envs: &self.type_envs,
+						envs: &self.generic_envs,
 						env,
 						args: &[target],
 					},
@@ -987,7 +1045,7 @@ impl TypeContext<'_, '_, '_> {
 	/// itself, or reads silently become order-dependent.
 	pub(super) fn normalize(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1039,7 +1097,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn normalize_uncached(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1090,7 +1148,7 @@ impl TypeContext<'_, '_, '_> {
 	/// it keeps its normalized arguments.
 	fn normalize_const(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		constant: ConstIdx,
 		type_args: TypeList,
 		depth: NormalizationDepth,
@@ -1128,7 +1186,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn normalize_projection(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1168,7 +1226,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn reduce_projection(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1185,6 +1243,7 @@ impl TypeContext<'_, '_, '_> {
 		// receiver to a value that no longer carries their provenance.
 		if self.types.is_param_or_projection(base) {
 			match self.projection_equality(
+				assumption_context,
 				base,
 				trait_index,
 				assoc_type_index,
@@ -1236,6 +1295,7 @@ impl TypeContext<'_, '_, '_> {
 		};
 		if self.types.is_param_or_projection(next_base) {
 			return match self.projection_equality(
+				assumption_context,
 				next_base,
 				trait_index,
 				assoc_type_index,
@@ -1320,11 +1380,11 @@ impl TypeContext<'_, '_, '_> {
 				.as_ref()
 				.expect("a generic selected impl has a resolved header")
 				.type_params;
-			debug_assert_ne!(env, TypeEnvIdx::ROOT);
+			debug_assert_ne!(env, GenericEnvIdx::ROOT);
 			self.types.substitute(
 				value,
 				Substitution {
-					envs: &self.type_envs,
+					envs: &self.generic_envs,
 					env,
 					args: &args,
 				},
@@ -1337,7 +1397,7 @@ impl TypeContext<'_, '_, '_> {
 	/// restates the projection (`A = T::A` for `T::A`) leaves it abstract.
 	fn reduce_by_equality(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		value: TypeIndex,
 		depth: NormalizationDepth,
@@ -1356,7 +1416,7 @@ impl TypeContext<'_, '_, '_> {
 	/// returns the original index when nothing changed.
 	fn normalize_children(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1477,7 +1537,7 @@ impl TypeContext<'_, '_, '_> {
 
 	pub(super) fn find_trait_impl_query(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 	) -> Result<Option<TraitImplLookup>, SolverError> {
@@ -1567,7 +1627,7 @@ impl TypeContext<'_, '_, '_> {
 	/// one.
 	pub(super) fn stack_elements(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
 		let mut elements = Vec::new();
@@ -1596,7 +1656,7 @@ impl TypeContext<'_, '_, '_> {
 	/// `<(T, i32) as StackValue>::Repr`.
 	fn stack_repr(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
@@ -1686,7 +1746,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Appends `ty`'s elements to `out`; `false` when it is no `StackValue`.
 	fn push_stack_elements(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<TypeIndex>,
 		depth: usize,
@@ -1804,7 +1864,7 @@ impl TypeContext<'_, '_, '_> {
 					let field = self.types.substitute(
 						field,
 						Substitution {
-							envs: &self.type_envs,
+							envs: &self.generic_envs,
 							env,
 							args: &args,
 						},
@@ -1842,7 +1902,7 @@ impl TypeContext<'_, '_, '_> {
 	/// only a parameter bounded by it may.
 	pub(super) fn may_be_slice(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<bool, SolverError> {
 		// Deep, as the declaration's other checks read it, so they share one
@@ -1869,7 +1929,7 @@ impl TypeContext<'_, '_, '_> {
 	/// `M::Size` for an abstract one.
 	pub(super) fn address_size(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<TypeIndex, SolverError> {
 		let memory = self.normalize(
@@ -1899,7 +1959,7 @@ impl TypeContext<'_, '_, '_> {
 	/// `M::&S` give one type.
 	pub(super) fn pointer_metadata_value(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		to: TypeIndex,
 		memory: TypeIndex,
 		size: TypeIndex,
@@ -1936,7 +1996,7 @@ impl TypeContext<'_, '_, '_> {
 	/// assumed `Slice` is neither, since only a parameter bounded by it may be.
 	pub(super) fn pointer_metadata(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		pointee: TypeIndex,
 		size: TypeIndex,
 	) -> Result<Option<TypeIndex>, SolverError> {
@@ -1982,7 +2042,7 @@ impl TypeContext<'_, '_, '_> {
 	/// `Pending` while a table they come from is unfinished.
 	fn assumes(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<bool, SolverError> {
@@ -2015,7 +2075,7 @@ impl TypeContext<'_, '_, '_> {
 	/// an unfinished table is `Assumption::Pending`, never an error.
 	pub(super) fn check_assumed_trait(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<Assumption, SolverError> {
@@ -2023,6 +2083,7 @@ impl TypeContext<'_, '_, '_> {
 		// 1. Declared on `ty`'s own path.
 		let mut declared = tables.declared_traits(
 			&self.types,
+			assumption_context,
 			ty,
 			self.solver.state.recursion_budget,
 		);
@@ -2091,7 +2152,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Reads the finished header: one still missing is `Pending`.
 	pub(super) fn match_trait_impl_candidate_query(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		impl_index: TraitImplIdx,
 		receiver: TypeIndex,
 	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
@@ -2114,9 +2175,9 @@ impl TypeContext<'_, '_, '_> {
 	/// candidate's.
 	pub(super) fn match_impl_target_and_bounds(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		impl_kind: ImplKind,
-		impl_env: TypeEnvIdx,
+		impl_env: GenericEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
 	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
@@ -2141,7 +2202,7 @@ impl TypeContext<'_, '_, '_> {
 		let Some(args) = self.types.match_impl_target(
 			target,
 			receiver,
-			&self.type_envs,
+			&self.generic_envs,
 			impl_env,
 		) else {
 			return Ok(None);
@@ -2152,8 +2213,8 @@ impl TypeContext<'_, '_, '_> {
 		if *self.solver.verdict(Definition::Requirements(impl_kind))
 			== Verdict::InProgress
 		{
-			if assumption_context == impl_env
-				&& *args == *self.type_envs.identity_args(impl_env)
+			if assumption_context == self.assumption_envs.of_frame(impl_env)
+				&& *args == *self.generic_envs.identity_args(impl_env)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
 				return Ok(Some(args));
@@ -2204,7 +2265,7 @@ impl TypeContext<'_, '_, '_> {
 			.map(|header| header.type_params),
 		}
 		.ok_or(SolverError::Pending)?;
-		let args = self.type_envs.identity_args(impl_env).to_vec();
+		let args = self.generic_envs.identity_args(impl_env).to_vec();
 		self.solver.verdicts.insert(definition, Verdict::InProgress);
 		let index = self.solver.state.frames.len();
 		self.solver.state.frames.push(SolverFrame::Requirements {
@@ -2215,8 +2276,12 @@ impl TypeContext<'_, '_, '_> {
 				self.solver.recursion_limit,
 			),
 		});
-		let result =
-			self.prove_requirements(impl_env, impl_env, &args, Some(index));
+		let result = self.prove_requirements(
+			self.assumption_envs.of_frame(impl_env),
+			impl_env,
+			&args,
+			Some(index),
+		);
 		let Some(SolverFrame::Requirements {
 			bound,
 			outer_budget,
@@ -2267,59 +2332,54 @@ impl TypeContext<'_, '_, '_> {
 		answer
 	}
 
-	/// Whether every bound on `impl_env`'s chain holds for `args` (its flat
-	/// arguments) under `assumption_context`. A judgement passes its frame,
+	/// Whether every clause `impl_env`'s item assumes holds for `args` (the
+	/// flat arguments of its chain) under `assumption_context`: each env on
+	/// its assumption chain, proved whole. A judgement passes its frame,
 	/// which records the bound being proved.
 	fn prove_requirements(
 		&mut self,
-		assumption_context: TypeEnvIdx,
-		impl_env: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
+		impl_env: GenericEnvIdx,
 		args: &[TypeIndex],
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		// Every parameter on the impl's chain is an argument of the match,
-		// at its flat slot; its bounds stay in its own frame.
-		let chain: Vec<TypeEnvIdx> = self.type_envs.chain(impl_env).collect();
-		for frame in chain {
-			let start = self.type_envs.parent_count(frame);
-			for index in 0..self.param_bounds[usize::from(frame)].len() {
-				let clauses =
-					self.param_bounds[usize::from(frame)][index].clauses;
-				if !self.satisfies_clauses(
-					assumption_context,
-					clauses,
-					(
-						self.type_envs.param_types(frame)[index],
-						args[start + index],
-					),
-					(impl_env, args),
-					None,
-					judgement,
-				)? {
-					return Ok(false);
-				}
+		let mut env = self.assumption_envs.of_frame(impl_env);
+		while env != AssumptionEnvIdx::ROOT {
+			let AssumptionEnv {
+				parent, clauses, ..
+			} = *self.assumption_envs.get(env);
+			if !self.satisfies_clauses(
+				assumption_context,
+				clauses,
+				Subjects::All,
+				(impl_env, args),
+				None,
+				judgement,
+			)? {
+				return Ok(false);
 			}
+			env = parent.expect("only the root env has no parent");
 		}
 		Ok(true)
 	}
 
-	/// Whether `subject` satisfies `clauses`, which a declaration states
-	/// about `root`: each membership, then each equality, as Rust proves `T:
-	/// Tr<A = X, A: Other>`. A clause's subject is a path over `root`, read
-	/// over `subject` and named by its value; its other types are substituted
-	/// over `substitution` (the frame the clauses are written in and the
-	/// arguments for its whole chain). A clause reached through a membership
-	/// that does not hold is not proved: that membership is the failure. With
-	/// `failures`, every failure is collected for the caller to report;
-	/// without, the first one answers. A judgement passes its frame, which
-	/// records the bound being proved. A subject whose equality pass has not
-	/// run yet has no answer (`SolverError::Pending`), not a failure.
+	/// Whether `clauses`, which a declaration states, hold for a use: each
+	/// membership, then each equality, as Rust proves `T: Tr<A = X, A:
+	/// Other>`. `subjects` says which clauses are read and how a subject
+	/// meets the use; every other type is substituted over `substitution`
+	/// (the frame the clauses are written in and the arguments for its whole
+	/// chain). A clause reached through a membership that does not hold is
+	/// not proved: that membership is the failure. With `failures`, every
+	/// failure is collected for the caller to report; without, the first one
+	/// answers. A judgement passes its frame, which records the bound being
+	/// proved. Clauses whose equality pass has not run yet have no answer
+	/// (`SolverError::Pending`), not a failure.
 	pub(super) fn satisfies_clauses(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		clauses: BoundClauses,
-		(root, subject): (TypeIndex, TypeIndex),
-		(frame, arguments): (TypeEnvIdx, &[TypeIndex]),
+		subjects: Subjects,
+		(frame, arguments): (GenericEnvIdx, &[TypeIndex]),
 		mut failures: Option<&mut Vec<UnsatisfiedClause>>,
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
@@ -2335,22 +2395,30 @@ impl TypeContext<'_, '_, '_> {
 		// again, and the arena only grows, so the ranges stay valid.
 		for at in 0..clauses.traits.len() {
 			let clause = self.clauses.traits(clauses.traits)[at];
-			if !failed.is_empty()
-				&& reads_failed(&self.types, clause.subject, &failed)
+			if !subjects.reads(&self.types, clause.subject)
+				|| !failed.is_empty()
+					&& reads_failed(&self.types, clause.subject, &failed)
 			{
 				continue;
 			}
 			self.solver.record_proving(judgement, clause.origin);
-			let stated = rebase(&mut self.types, clause.subject, root, subject);
-			let receiver = if clause.subject == root {
-				stated
-			} else {
+			let stated = subjects.stated(
+				&mut self.types,
+				(&self.generic_envs, frame, arguments),
+				clause.subject,
+			);
+			let receiver = if matches!(
+				self.types.resolve(clause.subject),
+				Type::TypeProjection { .. }
+			) {
 				self.normalize(
 					assumption_context,
 					stated,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
 				)?
+			} else {
+				stated
 			};
 			if self
 				.find_trait_impl_query(
@@ -2377,22 +2445,30 @@ impl TypeContext<'_, '_, '_> {
 		for at in 0..equalities.len() {
 			let clause = self.clauses.equalities(equalities)[at];
 			// A conflict is the declaration's own error.
-			if self.clauses.equalities(equalities).iter().any(|other| {
-				other.projection == clause.projection
-					&& known_distinct(&self.types, other.value, clause.value)
-			}) || !failed.is_empty()
+			if !subjects.reads(&self.types, clause.projection)
+				|| self.clauses.equalities(equalities).iter().any(|other| {
+					other.projection == clause.projection
+						&& known_distinct(
+							&self.types,
+							other.value,
+							clause.value,
+						)
+				}) || !failed.is_empty()
 				&& (reads_failed(&self.types, clause.projection, &failed)
 					|| reads_failed(&self.types, clause.value, &failed))
 			{
 				continue;
 			}
 			self.solver.record_proving(judgement, clause.origin);
-			let projection =
-				rebase(&mut self.types, clause.projection, root, subject);
+			let projection = subjects.stated(
+				&mut self.types,
+				(&self.generic_envs, frame, arguments),
+				clause.projection,
+			);
 			let required = self.types.substitute(
 				clause.value,
 				Substitution {
-					envs: &self.type_envs,
+					envs: &self.generic_envs,
 					env: frame,
 					args: arguments,
 				},
@@ -2432,6 +2508,7 @@ impl TypeContext<'_, '_, '_> {
 
 	pub(super) fn projection_equality(
 		&mut self,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
@@ -2446,6 +2523,7 @@ impl TypeContext<'_, '_, '_> {
 		let types = &self.types;
 		let sources = tables.declarations_of(
 			types,
+			assumption_context,
 			receiver,
 			self.solver.state.recursion_budget,
 		);
@@ -2471,7 +2549,7 @@ impl TypeContext<'_, '_, '_> {
 				};
 				if clause_trait != trait_index
 					|| clause_assoc != assoc_type_index
-					|| !source.names(types, tables.type_envs, base, receiver)
+					|| !source.names(types, tables.generic_envs, base, receiver)
 				{
 					continue;
 				}
@@ -2509,7 +2587,7 @@ impl TypeContext<'_, '_, '_> {
 			Some(context) => self.types.substitute(
 				fact.value,
 				Substitution {
-					envs: &self.type_envs,
+					envs: &self.generic_envs,
 					env: context.env,
 					args: &[context.receiver],
 				},
@@ -2526,7 +2604,7 @@ impl TypeContext<'_, '_, '_> {
 	#[cfg(test)]
 	pub(super) fn normalize_head(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {
@@ -2542,7 +2620,7 @@ impl TypeContext<'_, '_, '_> {
 	#[cfg(test)]
 	pub(super) fn normalize_type(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {

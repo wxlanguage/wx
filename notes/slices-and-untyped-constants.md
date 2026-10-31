@@ -600,10 +600,11 @@ func f<T: Array where { const LEN: u8 }>() -> u8 { T::LEN }  // fine
 - The return type is `u8`. A constant is not a type: no singleton types.
 - A third clause kind, `FitClause { constant, ty }`, beside `TraitClause`
   and `EqualityClause`, published and read the same way. A fit about a type
-  the function does not declare (`Array::as_slice`'s `const <Self as
-  Array>::LEN: M::Size`) is written in a `where { .. }` list and needs
-  clauses owned by a scope rather than a parameter: `tir-param-env-plan.md`,
-  whose last step this is.
+  the function does not declare (`Array::as_slice`'s `LEN` against
+  `M::Size`) is written on `Self` as the function's first parameter
+  (`Self: Array where { const LEN: M::Size }`) and needs clauses owned by a
+  scope rather than a parameter: `tir-assumption-env-plan.md`, whose last
+  step this is.
   `Solver::satisfies_clauses` proves it at a use: a concrete argument by
   evaluating the constant and running the fit check; an abstract one from the
   caller's own fit clauses.
@@ -617,8 +618,9 @@ func f<T: Array where { const LEN: u8 }>() -> u8 { T::LEN }  // fine
 - An abstract constant coerces to a type its fit clause covers and nowhere
   else, and it stays untyped under the clause: the clause does not decide the
   type of every use.
-- The same grammar leaves room for constant equalities
-  (`where { LEN = 4 }`, rustc's `ConstEquate`); not needed yet.
+- A constant's entry always starts with `const`, so it parses apart from a
+  type's: `const LEN: u8` is a fit, `const LEN = 4` a constant equality
+  (rustc's `ConstEquate`), parsed but reported unsupported until needed.
 - Open: a pointer to an abstract count, `M::&[u8; T::LEN]`, needs
   `T::LEN` to fit `M::Size` for well-formedness. Either the signature writes
   the fit clause, or the obligation is proved where the signature is

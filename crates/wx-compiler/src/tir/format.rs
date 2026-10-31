@@ -10,7 +10,7 @@
 //! `self` right after — the same reason the legacy one existed as its own
 //! type rather than living on the (bigger, `&mut`-heavy) `Builder`.
 //!
-//! Borrows `types`/`defs`/`strings` plus `type_envs` for generic parameter
+//! Borrows `types`/`defs`/`strings` plus `generic_envs` for generic parameter
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
 //! The formatter currently wraps `TypeContext`'s pieces.
@@ -22,13 +22,13 @@ use crate::ast::{Ownership, StringInterner};
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
 use super::defs::{ConstIdx, DefinitionRegistry, MemberOwner};
 use super::signatures::TypeContext;
-use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
+use super::types::{GenericEnvArena, Type, TypeIndex, TypeInterner};
 
 pub(super) struct TypeFormatter<'a> {
 	pub(super) types: &'a TypeInterner,
 	pub(super) defs: &'a DefinitionRegistry,
 	pub(super) strings: &'a StringInterner,
-	pub(super) type_envs: &'a TypeEnvArena,
+	pub(super) generic_envs: &'a GenericEnvArena,
 }
 
 /// Formats declared source bounds, preserving their order and bindings.
@@ -45,7 +45,7 @@ impl TypeContext<'_, '_, '_> {
 			types: &self.types,
 			defs: self.defs,
 			strings: self.strings,
-			type_envs: &self.type_envs,
+			generic_envs: &self.generic_envs,
 		}
 	}
 
@@ -265,7 +265,7 @@ impl TypeFormatter<'_> {
 			Type::TypeParam {
 				env, param_index, ..
 			} => {
-				let symbol = self.type_envs.param_names(*env)
+				let symbol = self.generic_envs.param_names(*env)
 					[*param_index as usize]
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
@@ -371,18 +371,17 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
+	use crate::tir::signatures::{FunctionSignature, QueryInfo};
 	use crate::tir::solver::Solver;
-	use crate::tir::types::TypeEnvIdx;
+	use crate::tir::types::GenericEnvIdx;
 	use crate::vfs;
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,
 		defs: DefinitionRegistry,
 		types: TypeInterner,
-		type_envs: TypeEnvArena,
+		generic_envs: GenericEnvArena,
 		bounds: BoundArena,
-		param_bounds: Vec<Box<[ParamBounds]>>,
 		functions: Vec<FunctionSignature>,
 	}
 
@@ -449,9 +448,8 @@ mod tests {
 
 			Self {
 				types: signatures.types,
-				type_envs: signatures.type_envs,
+				generic_envs: signatures.generic_envs,
 				bounds: signatures.bounds,
-				param_bounds: signatures.param_bounds,
 				functions: signatures.functions,
 				graph,
 				defs,
@@ -483,11 +481,15 @@ mod tests {
 			index
 		}
 
-		fn parameter(&self, function: &str, name: &str) -> (TypeEnvIdx, usize) {
+		fn parameter(
+			&self,
+			function: &str,
+			name: &str,
+		) -> (GenericEnvIdx, usize) {
 			let env = self.functions[usize::from(self.function(function))]
 				.type_params;
 			let index = self
-				.type_envs
+				.generic_envs
 				.param_names(env)
 				.iter()
 				.position(|param| {
@@ -506,18 +508,47 @@ mod tests {
 				types: &self.types,
 				defs: &self.defs,
 				strings: &self.graph.strings,
-				type_envs: &self.type_envs,
+				generic_envs: &self.generic_envs,
 			}
 		}
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.type_envs.param_types(env)[index]
+			self.generic_envs.param_types(env)[index]
 		}
 
-		fn declared_bounds(&self, function: &str, param: &str) -> &[BoundId] {
+		/// The bounds written on `param`, as written: every top-level bound
+		/// between its name and the next parameter's.
+		fn declared_bounds(&self, function: &str, param: &str) -> Vec<BoundId> {
 			let (env, index) = self.parameter(function, param);
-			&self.param_bounds[usize::from(env)][index].declared_bounds
+			let names = self.generic_envs.param_names(env);
+			let after = names[index].span.end;
+			let before =
+				names.get(index + 1).map_or(u32::MAX, |n| n.span.start);
+			let file_id = self.defs.functions
+				[usize::from(self.function(function))]
+			.file_id;
+			let written: Vec<BoundId> = self
+				.bounds
+				.ids()
+				.filter(|&id| {
+					let span = self.bounds.span(id);
+					span.file_id == file_id
+						&& (after..before).contains(&span.span.start)
+				})
+				.collect();
+			let nested: Vec<BoundId> = written
+				.iter()
+				.flat_map(|&id| self.bounds.get(id).bindings.iter())
+				.flat_map(|binding| match &binding.kind {
+					BindingRequirement::Bound(nested) => nested.to_vec(),
+					BindingRequirement::Equals(_) => Vec::new(),
+				})
+				.collect();
+			written
+				.into_iter()
+				.filter(|id| !nested.contains(id))
+				.collect()
 		}
 
 		/// `name` is looked up directly against the trait's own member
@@ -644,7 +675,7 @@ mod tests {
 		for (param, expected) in [("T", ""), ("U", "A"), ("V", "B + A + B")] {
 			assert_eq!(
 				formatter
-					.display_bounds(case.declared_bounds("subject", param)),
+					.display_bounds(&case.declared_bounds("subject", param)),
 				expected
 			);
 		}
@@ -679,7 +710,7 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bounds(case.declared_bounds("subject", "S")),
+				.display_bounds(&case.declared_bounds("subject", "S")),
 			"Outer where { Item: Inner where { Value = Wrapper<T> } + Leaf, Count = u32 } + Plain"
 		);
 	}

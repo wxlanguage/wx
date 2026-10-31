@@ -17,7 +17,7 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
-use super::bounds::BoundArena;
+use super::bounds::{AssumptionEnvIdx, BoundArena};
 use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx, TraitImplIdx};
 use super::literals::Integer;
 use super::members::report_type_does_not_implement_trait;
@@ -27,7 +27,8 @@ use super::solver::{
 	Solver, SolverError, Verdict,
 };
 use super::types::{
-	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+	GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type, TypeIndex,
+	TypeList,
 };
 use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
@@ -41,7 +42,7 @@ pub(super) enum BoundRequirements {
 	/// for `env`'s whole chain, outer frames first: a binding's value is
 	/// written in the declaration, so it may name any of them.
 	Parameter {
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		index: usize,
 		arguments: TypeList,
 	},
@@ -57,14 +58,14 @@ pub(super) enum BoundRequirements {
 #[derive(Clone, Copy)]
 pub(super) enum TypeObligation {
 	CheckBounds {
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
 		argument: Spanned<TypeIndex>,
 		reference: SourceSpan,
-		owner: TypeEnvOwner,
+		owner: GenericEnvOwner,
 	},
 	CheckTraitMembership {
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		subject: TypeIndex,
 		required: TraitIdx,
 		reference: SourceSpan,
@@ -73,7 +74,7 @@ pub(super) enum TypeObligation {
 	/// inside it is found even if nothing ever reads the type. The result is
 	/// discarded: the stored type stays as written.
 	CheckWellFormed {
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
@@ -103,7 +104,7 @@ pub(super) enum TypeObligation {
 	/// member of the typesets its bounds name, so the value must fit every
 	/// one of them, and the type works with each.
 	CheckConstantFits {
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		bits: u64,
 		reference: SourceSpan,
@@ -114,7 +115,7 @@ pub(super) enum TypeObligation {
 	/// normalized with every fact, so a constant either names is read; a
 	/// constant's body therefore records it for after the values exist.
 	CheckConstantType {
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		/// The `Type::Const` the length names.
 		length: TypeIndex,
 		expected: TypeIndex,
@@ -124,7 +125,7 @@ pub(super) enum TypeObligation {
 	/// element) is not a slice or an array, `[T]` or `[T; N]`, nor a
 	/// parameter that may be one: only a pointer holds a slice or an array.
 	CheckValueType {
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
@@ -136,7 +137,7 @@ pub(super) enum TypeObligation {
 	/// this decides what to say: a plain "no such member", or, when the value
 	/// does have one, that the trait must be named (with the spelling).
 	CheckProjectionMember {
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		name: SymbolU32,
 		reference: SourceSpan,
@@ -465,7 +466,7 @@ impl TypeContext<'_, '_, '_> {
 	/// the range of every member of every typeset its bounds name.
 	fn check_constant_fits(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		bits: u64,
 		reference: SourceSpan,
@@ -496,6 +497,7 @@ impl TypeContext<'_, '_, '_> {
 		let typesets = clause_tables
 			.declared_traits(
 				&self.types,
+				assumption_context,
 				ty,
 				self.solver.state.recursion_budget,
 			)
@@ -543,7 +545,7 @@ impl TypeContext<'_, '_, '_> {
 	/// that may stand for one.
 	fn check_value_type(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
@@ -585,7 +587,7 @@ impl TypeContext<'_, '_, '_> {
 	/// the constant is named in.
 	fn check_constant_type(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		length: TypeIndex,
 		expected: TypeIndex,
 		reference: SourceSpan,
@@ -598,15 +600,16 @@ impl TypeContext<'_, '_, '_> {
 			unreachable!("a length checked for its type names a constant")
 		};
 		let signature = &self.constants[usize::from(constant)];
-		let (mut ty, mut env) = (signature.ty, signature.env);
+		let (mut ty, frame) = (signature.ty, signature.env);
+		let mut env = self.assumption_envs.of_frame(frame);
 		// With its arguments, the declared type is read where it is named.
 		if !type_args.is_empty() {
 			let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 			ty = self.types.substitute(
 				ty,
 				Substitution {
-					envs: &self.type_envs,
-					env,
+					envs: &self.generic_envs,
+					env: frame,
 					args: &args,
 				},
 			);

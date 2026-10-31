@@ -264,18 +264,18 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let signature = &self.cx.constants[usize::from(constant)];
 		debug_assert_eq!(
-			self.cx.type_envs.generic_count(signature.env),
+			self.cx.generic_envs.generic_count(signature.env),
 			type_args.len()
 		);
 		let ty = self.cx.types.substitute(
 			signature.ty,
 			Substitution {
-				envs: &self.cx.type_envs,
+				envs: &self.cx.generic_envs,
 				env: signature.env,
 				args: type_args,
 			},
 		);
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		let ty = self.cx.types.collapse_error(ty);
 		let owner = self.cx.defs.constants[usize::from(constant)].owner;
 		let type_args = self.cx.types.push_list(type_args);
@@ -350,7 +350,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.report_annotation_required(receiver);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
-		let receiver_ty = self.normalized(receiver_ty, self.scope.env);
+		let receiver_ty =
+			self.normalized(receiver_ty, self.scope.assumption_env);
 		let pointee = match *self.cx.types.resolve(receiver_ty) {
 			Type::Pointer { to, .. } => Some(to),
 			_ => None,
@@ -432,7 +433,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			Some(trait_index) => {
 				let found = self.cx.resolve_trait_qualified_value(
 					&mut self.obligations.types,
-					self.scope.env,
+					self.scope.assumption_env,
 					receiver,
 					trait_index,
 					member.ident,
@@ -450,7 +451,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				MemberLookup::Found(found)
 			}
 			None => self.cx.resolve_applicable_member(
-				self.scope.env,
+				self.scope.assumption_env,
 				receiver,
 				key,
 				reference,
@@ -498,7 +499,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			Referent::Member(found.selected_kind(self.cx.defs)),
 		);
 		self.check_member_access(found, key, member);
-		let receiver = self.normalized(receiver, self.scope.env);
+		let receiver = self.normalized(receiver, self.scope.assumption_env);
 		// The impl's arguments, and whether the selection proved them; a
 		// trait's declaration is selected over `[Self]` instead.
 		let (kind, impl_args, proven) = match found {
@@ -518,7 +519,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					.match_impl_target(
 						header.target.inner,
 						receiver,
-						&self.cx.type_envs,
+						&self.cx.generic_envs,
 						header.type_params,
 					)
 					.expect("the selected impl's target matches the receiver");
@@ -533,7 +534,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				TraitMemberSelection::Impl(kind) => {
 					let Ok(Some(TraitImplLookup::Concrete { args, .. })) =
 						self.cx.find_trait_impl_query(
-							self.scope.env,
+							self.scope.assumption_env,
 							receiver,
 							trait_index,
 						)
@@ -603,11 +604,11 @@ impl BodyContext<'_, '_, '_, '_> {
 				continue;
 			};
 			let (env, pattern) = (header.type_params, header.target.inner);
-			let count = self.cx.type_envs.generic_count(env);
+			let count = self.cx.generic_envs.generic_count(env);
 			let mut impl_args =
 				vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.cx.types.learn(
-				&self.cx.type_envs,
+				&self.cx.generic_envs,
 				env,
 				&mut impl_args,
 				pattern,
@@ -616,7 +617,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			let instantiated = self.cx.types.substitute(
 				pattern,
 				Substitution {
-					envs: &self.cx.type_envs,
+					envs: &self.cx.generic_envs,
 					env,
 					args: &impl_args,
 				},

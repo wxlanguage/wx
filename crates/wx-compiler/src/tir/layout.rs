@@ -26,12 +26,13 @@ use std::hash::BuildHasher;
 use hashbrown::HashTable;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
+use super::bounds::AssumptionEnvIdx;
 use super::defs::{FieldOrder, StructIdx};
 use super::signatures::TypeContext;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, Solver, SolverError, metadata_len,
 };
-use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
+use super::types::{GenericEnvIdx, Substitution, Type, TypeIndex, TypeList};
 use crate::index::index_newtype;
 
 index_newtype!(AggregateIdx);
@@ -235,7 +236,7 @@ impl TypeContext<'_, '_, '_> {
 	/// overflows.
 	pub(super) fn memory_layout(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Layout>, SolverError> {
 		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
@@ -247,7 +248,7 @@ impl TypeContext<'_, '_, '_> {
 	/// declaration order (an aggregate's `values`).
 	pub(super) fn memory_values(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<(Layout, Box<[(Primitive, u32)]>)>, SolverError> {
 		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
@@ -269,7 +270,7 @@ impl TypeContext<'_, '_, '_> {
 	/// `None` for any other type, too.
 	pub(super) fn aggregate_layout(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<AggregateIdx>, SolverError> {
 		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
@@ -283,7 +284,7 @@ impl TypeContext<'_, '_, '_> {
 	/// one again is a struct containing itself.
 	fn piece(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
@@ -357,7 +358,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn aggregate_piece(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
@@ -399,7 +400,7 @@ impl TypeContext<'_, '_, '_> {
 					fields.push(self.types.substitute(
 						field,
 						Substitution {
-							envs: &self.type_envs,
+							envs: &self.generic_envs,
 							env,
 							args: &args,
 						},
@@ -437,7 +438,7 @@ impl TypeContext<'_, '_, '_> {
 	/// memory not known yet.
 	fn address_primitive(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Option<Primitive>, SolverError> {
 		let memory = self.normalize(
@@ -663,7 +664,8 @@ mod tests {
 	) -> Result<Option<Layout>, SolverError> {
 		let scope = case.function_signature(path).type_params;
 		let ty = case.param_types(path)[index];
-		case.context.memory_layout(scope, ty)
+		case.context
+			.memory_layout(case.context.assumption_envs.of_frame(scope), ty)
 	}
 
 	/// The aggregate layout of parameter `index` of function `path`.
@@ -675,7 +677,7 @@ mod tests {
 		let scope = case.function_signature(path).type_params;
 		let ty = case.param_types(path)[index];
 		case.context
-			.aggregate_layout(scope, ty)
+			.aggregate_layout(case.context.assumption_envs.of_frame(scope), ty)
 			.expect("a parameter's layout is final")
 	}
 

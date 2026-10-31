@@ -33,18 +33,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		signature: &ast::FunctionSignature,
 		block: &Spanned<ast::Expression>,
 	) -> (Body, Obligations) {
-		let env = self.scope.env;
+		let env = self.scope.generic_env;
 		let function = &self.cx.functions[usize::from(function_index)];
 		let (param_types, return_type) =
 			(function.param_types, function.return_type);
 		// A type with a reported part in it expects nothing more.
-		let return_type = self.normalized(return_type, env);
+		let return_type =
+			self.normalized(return_type, self.cx.assumption_envs.of_frame(env));
 		let return_type = self.cx.types.collapse_error(return_type);
 		self.enter_root(block.span, return_type);
 		for (at, param) in signature.params.iter().enumerate() {
 			let param = &param.inner.inner;
 			let ty = self.cx.types.list(param_types)[at];
-			let ty = self.normalized(ty, env);
+			let ty = self.normalized(ty, self.cx.assumption_envs.of_frame(env));
 			let ty = self.cx.types.collapse_error(ty);
 			// An unnamed parameter binds nothing, so it has no local.
 			let local = match param.binding {
@@ -257,7 +258,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			ty,
 			InferPolicy::Allow,
 		);
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		self.check(value, ty)
 	}
 
@@ -278,7 +279,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				ty,
 				InferPolicy::Allow,
 			);
-			self.normalized(ty, self.scope.env)
+			self.normalized(ty, self.scope.assumption_env)
 		});
 		let value = match declared {
 			Some(declared) => self.check(value, declared),

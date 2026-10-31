@@ -37,6 +37,7 @@ use string_interner::symbol::SymbolU32;
 use super::body::{
 	Body, ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange,
 };
+use super::bounds::AssumptionEnvIdx;
 use super::defs::{ConstIdx, EnumIdx, MemberKind, MemberOwner, MemoryIdx};
 use super::layout::Primitive;
 use super::members::{TraitImplLookup, TraitMemberSelection};
@@ -46,7 +47,7 @@ use super::solver::{
 	NormalizationDepth, RewriteFlags, Solver, SolverError, SolverFrame,
 	metadata_len,
 };
-use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
+use super::types::{GenericEnvIdx, Substitution, Type, TypeIndex, TypeList};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::index::index_newtype;
@@ -256,7 +257,7 @@ fn body_of<'a>(
 fn body_env(
 	view: &TypeContext<'_, '_, '_>,
 	const_index: ConstIdx,
-) -> TypeEnvIdx {
+) -> GenericEnvIdx {
 	view.constants[usize::from(const_index)].env
 }
 
@@ -266,7 +267,7 @@ impl TypeContext<'_, '_, '_> {
 	/// reported, where they are read.
 	pub(super) fn evaluate_constant(&mut self, const_index: ConstIdx) {
 		let env = self.constants[usize::from(const_index)].env;
-		if self.type_envs.generic_count(env) > 0 {
+		if self.generic_envs.generic_count(env) > 0 {
 			if self.solver.const_values[usize::from(const_index)]
 				== ConstValueState::Unchecked
 			{
@@ -1120,17 +1121,20 @@ impl TypeContext<'_, '_, '_> {
 		};
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
-		let (layout, places) =
-			match self.memory_values(body_env(self, owner.constant), of) {
-				Ok(Some(layout)) => layout,
-				Ok(None) => {
-					return Err(Halt::Own(EvalError {
-						span,
-						kind: EvalErrorKind::NotConst,
-					}));
-				}
-				Err(_) => return Err(Halt::Silent),
-			};
+		let (layout, places) = match self.memory_values(
+			self.assumption_envs
+				.of_frame(body_env(self, owner.constant)),
+			of,
+		) {
+			Ok(Some(layout)) => layout,
+			Ok(None) => {
+				return Err(Halt::Own(EvalError {
+					span,
+					kind: EvalErrorKind::NotConst,
+				}));
+			}
+			Err(_) => return Err(Halt::Silent),
+		};
 		// An offset into an allocation is a `u32`.
 		let Some(size) = count
 			.checked_mul(u64::from(layout.size))
@@ -1188,7 +1192,9 @@ impl TypeContext<'_, '_, '_> {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Scalar), Halt> {
-		let scope = body_env(self, owner.constant);
+		let scope = self
+			.assumption_envs
+			.of_frame(body_env(self, owner.constant));
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
 		};
@@ -1242,7 +1248,7 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<u64, Halt> {
 		let env = body_env(self, owner.constant);
 		match self.normalize(
-			env,
+			self.assumption_envs.of_frame(env),
 			length,
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
@@ -1264,13 +1270,18 @@ impl TypeContext<'_, '_, '_> {
 		let ty = self.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.type_envs,
+				envs: &self.generic_envs,
 				env,
 				args: owner.args,
 			},
 		);
-		self.normalize(env, ty, NormalizationDepth::Deep, RewriteFlags::ALL)
-			.unwrap_or(TypeIndex::ERROR)
+		self.normalize(
+			self.assumption_envs.of_frame(env),
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)
+		.unwrap_or(TypeIndex::ERROR)
 	}
 
 	/// The instance of `constant` with `args`, keyed by its interned
@@ -1312,7 +1323,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 		Ok(
 			match self.find_trait_impl_query(
-				TypeEnvIdx::ROOT,
+				AssumptionEnvIdx::ROOT,
 				receiver,
 				trait_index,
 			)? {
@@ -1445,7 +1456,12 @@ impl TypeContext<'_, '_, '_> {
 		let (ty, scope) = (signature.ty, signature.env);
 		let ty = self.instance_type(owner, ty);
 		let mut scalars = Vec::new();
-		self.push_scalars(scope, ty, &mut scalars, &mut Vec::new())?;
+		self.push_scalars(
+			self.assumption_envs.of_frame(scope),
+			ty,
+			&mut scalars,
+			&mut Vec::new(),
+		)?;
 		Ok(scalars)
 	}
 
@@ -1461,7 +1477,7 @@ impl TypeContext<'_, '_, '_> {
 	/// instantiated, contains itself, which is reported on the struct.
 	fn push_scalars(
 		&mut self,
-		scope: TypeEnvIdx,
+		scope: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<Scalar>,
 		visiting: &mut Vec<TypeIndex>,
@@ -1534,7 +1550,7 @@ impl TypeContext<'_, '_, '_> {
 					let field = self.types.substitute(
 						field,
 						Substitution {
-							envs: &self.type_envs,
+							envs: &self.generic_envs,
 							env,
 							args: &args,
 						},
@@ -1558,7 +1574,7 @@ impl TypeContext<'_, '_, '_> {
 	/// for an address into a memory not known yet.
 	fn address_scalar(
 		&mut self,
-		scope: TypeEnvIdx,
+		scope: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Scalar, ConstValueState> {
 		let Some(memory_index) = self.memory_of(scope, memory) else {
@@ -1579,7 +1595,7 @@ impl TypeContext<'_, '_, '_> {
 	/// The memory `memory` names in `scope`, if it is a known one.
 	fn memory_of(
 		&mut self,
-		scope: TypeEnvIdx,
+		scope: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Option<MemoryIdx> {
 		let memory = self

@@ -27,7 +27,7 @@ use crate::tir::body::{ExprKind, LocalIdx, PatIdx, PatternKind};
 use crate::tir::defs::{BindingTarget, DefKind, StructIdx};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
-use crate::tir::types::{Type, TypeEnvOwner, TypeIndex, TypeList};
+use crate::tir::types::{GenericEnvOwner, Type, TypeIndex, TypeList};
 use crate::vfs::FileId;
 
 /// The state of checking one pattern: where it is written, and the names it
@@ -916,12 +916,12 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.cx.diagnostics.push(diagnostic);
 			}
 			let params = self.cx.structs[usize::from(struct_index)].type_params;
-			let count = self.cx.type_envs.param_names(params).len();
+			let count = self.cx.generic_envs.param_names(params).len();
 			let mut written = vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.write_type_args(
 				segment,
 				params,
-				TypeEnvOwner::Struct(struct_index),
+				GenericEnvOwner::Struct(struct_index),
 				&mut written,
 			);
 			(struct_index, written)
@@ -1136,7 +1136,10 @@ impl BodyContext<'_, '_, '_, '_> {
 					| DefKind::EnumVariant(constant) => {
 						let signature =
 							&self.cx.constants[usize::from(constant)];
-						let ty = self.normalized(signature.ty, signature.env);
+						let ty = self.normalized(
+							signature.ty,
+							self.cx.assumption_envs.of_frame(signature.env),
+						);
 						let kind = PatternKind::Constant {
 							constant,
 							type_args: TypeList::EMPTY,
