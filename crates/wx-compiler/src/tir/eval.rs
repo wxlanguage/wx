@@ -115,8 +115,8 @@ pub(super) struct EvalError {
 pub(super) enum EvalErrorKind {
 	/// The node is not a constant expression.
 	NotConst,
-	/// The result does not fit the operand type, or a shift amount is outside
-	/// its width.
+	/// The result is not representable as the operand type, or a shift amount
+	/// is outside its width.
 	Overflow(Operation),
 	DivisionByZero,
 	RemainderByZero,
@@ -868,8 +868,8 @@ impl TypeContext<'_, '_, '_> {
 					.expect("an enum's repr holds one");
 				stack.push(binary(BinaryOp::Add, previous, one).map_err(own)?);
 			}
-			// A negated literal is one literal, so `-128` fits an `i8` although
-			// `128` does not.
+			// A negated literal is one literal, so `-128` is representable as
+			// an `i8` although `128` does not.
 			ExprKind::PrimitiveUnary {
 				op: UnaryOp::InvertSign,
 				operand,
@@ -921,8 +921,9 @@ impl TypeContext<'_, '_, '_> {
 
 	/// The exact value of a node of an untyped constant's body: a literal of
 	/// its kind, another untyped constant, or `-` and a binary operator over
-	/// them, computed as mathematical integers (in `i128`), since the value
-	/// has no type yet; each use checks it fits the type it is given.
+	/// them, computed as mathematical integers (in `i128`), since the value has
+	/// no type yet; each use checks it is representable as the type it is
+	/// given.
 	fn eval_exact(
 		&mut self,
 		owner: Owner<'_>,
@@ -1394,7 +1395,7 @@ impl TypeContext<'_, '_, '_> {
 					}
 					Err(Unevaluable::Silent) => return Err(Halt::Silent),
 				};
-				// Its use checked that the value fits.
+				// Its use checked that the value is representable.
 				stack.push(exact_scalar(value, ty).ok_or(Halt::Silent)?);
 				Ok(())
 			}
@@ -1408,10 +1409,9 @@ impl TypeContext<'_, '_, '_> {
 				let length = self.length_value(owner, length)?;
 				let scalar = Scalar::from_type(ty)
 					.expect("an array's length is of a memory's `Size`");
-				stack.push(
-					literal(length, false, scalar)
-						.expect("an array's length fits its memory's `Size`"),
-				);
+				stack.push(literal(length, false, scalar).expect(
+					"an array's length is representable as its memory's `Size`",
+				));
 				Ok(())
 			}
 			Ok(ResolvedConstant::Abstract) => Err(Halt::Own(EvalError {
@@ -1503,9 +1503,7 @@ impl TypeContext<'_, '_, '_> {
 			// An address, then the pointee's counts.
 			Type::Pointer { to, memory, .. } => {
 				let scalar = self.address_scalar(scope, memory)?;
-				let metadata = self
-					.address_size(scope, memory)
-					.and_then(|size| self.pointer_metadata(scope, to, size));
+				let metadata = self.pointer_metadata(scope, to, memory);
 				let count = match metadata {
 					Ok(Some(metadata)) => metadata_len(&self.types, metadata),
 					Ok(None) => return Err(ConstValueState::NoValue),
@@ -1872,8 +1870,8 @@ fn write_value(
 }
 
 /// An untyped constant's exact `value` as a value of `ty`, the type its use
-/// gave it: a `Char`, an integer or a float. `None` when it does not fit,
-/// which that use reports.
+/// gave it: a `Char`, an integer or a float. `None` when it is not
+/// representable, which that use reports.
 fn exact_scalar(value: i128, ty: TypeIndex) -> Option<ConstScalar> {
 	if ty == TypeIndex::CHAR {
 		return char::from_u32(u32::try_from(value).ok()?)
@@ -1919,7 +1917,7 @@ fn exact_binary(op: BinaryOp, a: i128, b: i128) -> Result<i128, EvalErrorKind> {
 }
 
 /// The integer literal `value` as `scalar`, negated when it is written
-/// `-value`; `None` when it does not fit.
+/// `-value`; `None` when it is not representable.
 fn literal(value: u64, negated: bool, scalar: Scalar) -> Option<ConstScalar> {
 	if !scalar.is_signed() {
 		if negated && value != 0 {
@@ -2984,7 +2982,7 @@ mod tests {
 			DiagnosticCode::ConstEvaluationFailed,
 		]);
 		case.diagnostics().assert_error_saying(
-			"`BIG` is `1180591620717411303424`, out of range for `u8`",
+			"constant `BIG` cannot be represented as `u8`",
 		);
 		case.diagnostics()
 			.assert_error_saying("evaluation of constant `TOO_BIG` failed");
@@ -3009,9 +3007,10 @@ mod tests {
 			DiagnosticCode::IntegerLiteralOutOfRange,
 		]);
 		case.diagnostics()
-			.assert_error_saying("`X` is `300`, out of range for `u8`");
-		case.diagnostics()
-			.assert_error_saying("`MINUS` is `-1`, out of range for `u32`");
+			.assert_error_saying("constant `X` cannot be represented as `u8`");
+		case.diagnostics().assert_error_saying(
+			"constant `MINUS` cannot be represented as `u32`",
+		);
 		assert_eq!(case.value("B"), [ConstScalar::u16(300)]);
 	}
 
@@ -3046,7 +3045,8 @@ mod tests {
 		assert_eq!(exact(&case, "NUMBER"), 98);
 	}
 
-	/// A length is a count: an untyped constant fits it by value.
+	/// A length is a count: an untyped constant is representable as it by
+	/// value.
 	#[test]
 	fn an_untyped_constant_is_an_array_length() {
 		test_case!(

@@ -1489,8 +1489,9 @@ pub enum AssocBindingKind {
 	Equals(Spanned<TypeExpression>),
 	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
 	Bound(Spanned<BoundExpression>),
-	/// `const LEN: u32` — the constant's value must fit this type.
-	ConstFits {
+	/// `const LEN: u32` — the constant's value must be representable as this
+	/// type.
+	ConstRepresentable {
 		const_span: TextSpan,
 		ty: Spanned<TypeExpression>,
 	},
@@ -3306,10 +3307,12 @@ impl<'ctx> Parser<'ctx> {
 				(None, false) => {
 					AssocBindingKind::Equals(self.parse_type_expression()?)
 				}
-				(Some(const_span), true) => AssocBindingKind::ConstFits {
-					const_span,
-					ty: self.parse_type_expression()?,
-				},
+				(Some(const_span), true) => {
+					AssocBindingKind::ConstRepresentable {
+						const_span,
+						ty: self.parse_type_expression()?,
+					}
+				}
 				(Some(const_span), false) => AssocBindingKind::ConstEquals {
 					const_span,
 					value: self.parse_const_argument()?,

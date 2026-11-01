@@ -17,9 +17,8 @@ use crate::diagnostics::SourceSpan;
 
 use super::body::ConstBody;
 use super::bounds::{
-	AssumptionEnv, AssumptionEnvIdx, BindingRef, BoundClauses, BoundId,
-	ClauseArena, ClauseTables, Equalities, Readiness, SelfSubstitution,
-	known_distinct,
+	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, ClauseArena,
+	ClauseTables, Readiness, SelfSubstitution, known_distinct,
 };
 use super::defs::{
 	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
@@ -28,6 +27,7 @@ use super::defs::{
 use super::eval::{Allocation, ConstValueState, Instance, ResolvedConstant};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::layout::Layouts;
+use super::literals::UntypedValue;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::{
 	AssocTypeSignature, ConstantSignature, EnumSignature,
@@ -113,6 +113,18 @@ pub(super) enum UnsatisfiedClause {
 		trait_index: TraitIdx,
 		source: BoundId,
 	},
+	/// `subject`'s value of the trait constant `constant` is not representable
+	/// as `ty`, which the entry `source` requires: `value` is it, or `None`
+	/// when `subject` is abstract and no representability clause in scope says
+	/// so.
+	Representable {
+		written: TypeIndex,
+		subject: TypeIndex,
+		constant: ConstIdx,
+		ty: TypeIndex,
+		value: Option<i128>,
+		source: BindingRef,
+	},
 	/// The projection the equality `source` names has another value.
 	/// `projection` and `required` are the equality's sides as stated, with
 	/// the use's arguments; `found` and `expected` are what they reduce to.
@@ -130,7 +142,8 @@ impl UnsatisfiedClause {
 	pub(super) fn written(&self) -> TypeIndex {
 		match *self {
 			UnsatisfiedClause::Trait { written, .. }
-			| UnsatisfiedClause::Equality { written, .. } => written,
+			| UnsatisfiedClause::Equality { written, .. }
+			| UnsatisfiedClause::Representable { written, .. } => written,
 		}
 	}
 }
@@ -1362,12 +1375,16 @@ impl TypeContext<'_, '_, '_> {
 						unreachable!("only a pointer is a `Pointer`")
 					};
 					let size = self.address_size(assumption_context, memory)?;
-					Some(self.pointer_metadata_value(
+					let metadata = self.compute_pointer_metadata(
 						assumption_context,
 						to,
 						memory,
 						size,
-					)?)
+						facts,
+					)?;
+					Some(metadata.unwrap_or_else(|| {
+						self.pointer_metadata_projection(to, memory)
+					}))
 				} else {
 					builtin_assoc_value(self, next_base, assoc_type_index)
 				};
@@ -1635,20 +1652,24 @@ impl TypeContext<'_, '_, '_> {
 	/// assumed `StackValue`, standing for its own `Repr`. A type containing
 	/// `!` is uninhabited and its one element is `!`: no Wasm value is ever
 	/// held for it, since the code that would hold one is unreachable. `None`
-	/// when `ty` is no `StackValue`: it contains an abstract part not assumed
-	/// one.
+	/// when `ty` is no `StackValue`: it holds a slice or an array, or an
+	/// abstract part not assumed one.
 	pub(super) fn stack_elements(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
 		let mut elements = Vec::new();
-		if !self.push_stack_elements(
-			assumption_context,
-			ty,
-			&mut elements,
-			0,
-		)? {
+		if self
+			.push_stack_elements(
+				assumption_context,
+				ty,
+				&mut elements,
+				&mut Vec::new(),
+				0,
+			)?
+			.is_some()
+		{
 			return Ok(None);
 		}
 		if elements.contains(&TypeIndex::NEVER) {
@@ -1656,6 +1677,22 @@ impl TypeContext<'_, '_, '_> {
 			elements.push(TypeIndex::NEVER);
 		}
 		Ok(Some(elements))
+	}
+
+	/// The part of `ty` that makes it no `StackValue`: a slice, an array, or
+	/// an abstract part not assumed one. `None` when `ty` is one.
+	pub(super) fn non_stack_part(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		self.push_stack_elements(
+			assumption_context,
+			ty,
+			&mut Vec::new(),
+			&mut Vec::new(),
+			0,
+		)
 	}
 
 	/// `<ty as StackValue>::Repr`, `ty` being a `StackValue` that is not
@@ -1755,24 +1792,29 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// Appends `ty`'s elements to `out`; `false` when it is no `StackValue`.
+	/// Appends `ty`'s elements to `out`. `Some(part)` when `ty` is no
+	/// `StackValue`: `part` is what makes it so, a slice, an array, or an
+	/// abstract part not assumed one.
 	fn push_stack_elements(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<TypeIndex>,
+		visiting: &mut Vec<TypeIndex>,
 		depth: usize,
-	) -> Result<bool, SolverError> {
+	) -> Result<Option<TypeIndex>, SolverError> {
 		if depth > self.solver.state.recursion_budget {
 			return Err(SolverError::Overflow);
 		}
+		// Deep, as a declaration's other checks read it: a loop through an
+		// equality stays the projection it is, not unfolded a step at a time.
 		let ty = self.normalize(
 			assumption_context,
 			ty,
-			NormalizationDepth::Shallow,
+			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
-		let is_stack_value = match *self.types.resolve(ty) {
+		match *self.types.resolve(ty) {
 			// A constant is no value's type; lowering puts one only where a
 			// constant is expected.
 			Type::Error
@@ -1781,18 +1823,16 @@ impl TypeContext<'_, '_, '_> {
 			| Type::FloatLiteral
 			| Type::CharLiteral
 			| Type::Value { .. }
-			| Type::Const { .. } => {
-				return Err(SolverError::Poisoned);
-			}
+			| Type::Const { .. } => Err(SolverError::Poisoned),
 			// Uninhabited: `stack_elements` makes it the whole type's one
 			// element.
 			Type::Never => {
 				out.push(TypeIndex::NEVER);
-				true
+				Ok(None)
 			}
 			Type::Function { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. } => true,
+			| Type::Global { .. } => Ok(None),
 			Type::U8
 			| Type::I8
 			| Type::U16
@@ -1800,19 +1840,19 @@ impl TypeContext<'_, '_, '_> {
 			| Type::U32
 			| Type::I32 => {
 				out.push(TypeIndex::I32);
-				true
+				Ok(None)
 			}
 			Type::U64 | Type::I64 => {
 				out.push(TypeIndex::I64);
-				true
+				Ok(None)
 			}
 			Type::F32 | Type::F64 | Type::Funcref => {
 				out.push(ty);
-				true
+				Ok(None)
 			}
 			Type::TypedFuncref { .. } => {
 				out.push(TypeIndex::FUNCREF);
-				true
+				Ok(None)
 			}
 			Type::Enum { enum_index } => {
 				let repr = self.enums[usize::from(enum_index)].repr;
@@ -1820,8 +1860,9 @@ impl TypeContext<'_, '_, '_> {
 					assumption_context,
 					repr,
 					out,
+					visiting,
 					depth + 1,
-				)?
+				)
 			}
 			// An address, as wide as its memory's `Size`, then the pointee's
 			// counts, each as wide again (`Pointer::Metadata`).
@@ -1831,41 +1872,51 @@ impl TypeContext<'_, '_, '_> {
 					assumption_context,
 					to,
 					memory,
-					size,
 				)?;
-				self.push_stack_elements(
+				if let Some(part) = self.push_stack_elements(
 					assumption_context,
 					size,
 					out,
+					visiting,
 					depth + 1,
-				)? && self.push_stack_elements(
+				)? {
+					return Ok(Some(part));
+				}
+				self.push_stack_elements(
 					assumption_context,
 					metadata,
 					out,
+					visiting,
 					depth + 1,
-				)?
+				)
 			}
 			// A slice or an array is never a value: only a pointer holds one.
-			Type::Slice { .. } | Type::Array { .. } => false,
+			Type::Slice { .. } | Type::Array { .. } => Ok(Some(ty)),
 			Type::Tuple { elements } => {
 				// Read one element at a time: normalizing may store more lists.
 				for at in 0..elements.len() {
 					let element = self.types.list(elements)[at];
-					if !self.push_stack_elements(
+					if let Some(part) = self.push_stack_elements(
 						assumption_context,
 						element,
 						out,
+						visiting,
 						depth + 1,
 					)? {
-						return Ok(false);
+						return Ok(Some(part));
 					}
 				}
-				true
+				Ok(None)
 			}
 			Type::Struct {
 				struct_index,
 				type_args,
 			} => {
+				// A struct containing itself is reported where it is declared.
+				if visiting.contains(&ty) {
+					return Err(SolverError::Poisoned);
+				}
+				visiting.push(ty);
 				let signature = &self.structs[usize::from(struct_index)];
 				let (env, fields) =
 					(signature.type_params, signature.field_types);
@@ -1881,59 +1932,33 @@ impl TypeContext<'_, '_, '_> {
 							args: &args,
 						},
 					);
-					if !self.push_stack_elements(
+					if let Some(part) = self.push_stack_elements(
 						assumption_context,
 						field,
 						out,
+						visiting,
 						depth + 1,
 					)? {
-						return Ok(false);
+						visiting.pop();
+						return Ok(Some(part));
 					}
 				}
-				true
+				visiting.pop();
+				Ok(None)
 			}
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-				let stack_value = self
-					.defs
-					.intrinsics
-					.stack_value
-					.expect("only `StackValue` asks for stack elements");
-				let is_stack_value =
-					self.assumes(assumption_context, ty, stack_value)?;
-				if is_stack_value {
+				// A std that declares no `StackValue` asks nothing of a value.
+				let Some(stack_value) = self.defs.intrinsics.stack_value else {
 					out.push(ty);
-				}
-				is_stack_value
-			}
-		};
-		Ok(is_stack_value)
-	}
-
-	/// Whether `ty` is a slice or an array, `[T]` or `[T; N]`, or a parameter
-	/// or a projection that may stand for one: one assumed `Slice`, since
-	/// only a parameter bounded by it may.
-	pub(super) fn may_be_slice(
-		&mut self,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
-	) -> Result<bool, SolverError> {
-		// Deep, as the declaration's other checks read it, so they share one
-		// normalization.
-		let ty = self.normalize(
-			assumption_context,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		)?;
-		match *self.types.resolve(ty) {
-			Type::Slice { .. } | Type::Array { .. } => Ok(true),
-			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-				match self.defs.intrinsics.slice {
-					Some(slice) => self.assumes(assumption_context, ty, slice),
-					None => Ok(false),
+					return Ok(None);
+				};
+				if self.assumes(assumption_context, ty, stack_value)? {
+					out.push(ty);
+					Ok(None)
+				} else {
+					Ok(Some(ty))
 				}
 			}
-			_ => Ok(false),
 		}
 	}
 
@@ -1965,22 +1990,31 @@ impl TypeContext<'_, '_, '_> {
 		Ok(size)
 	}
 
-	/// `<M::&T as Pointer>::Metadata` for `to` (`T`) and `memory` (`M`), whose
-	/// `Size` is `size`: `pointer_metadata`, or, for a pointee whose shape is
-	/// not known here, the projection over the shared pointer, so `M::*S` and
-	/// `M::&S` give one type.
+	/// `<M::&T as Pointer>::Metadata`, reduced by the ordinary normalization
+	/// query. Its projection supplies the cache key, active frame, recursion
+	/// budget and equality rollback; recursive element metadata goes through
+	/// that same query. Shared and exclusive pointers give one metadata type.
 	pub(super) fn pointer_metadata_value(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		to: TypeIndex,
 		memory: TypeIndex,
-		size: TypeIndex,
 	) -> Result<TypeIndex, SolverError> {
-		if let Some(metadata) =
-			self.pointer_metadata(assumption_context, to, size)?
-		{
-			return Ok(metadata);
-		}
+		let projection = self.pointer_metadata_projection(to, memory);
+		self.normalize(
+			assumption_context,
+			projection,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)
+	}
+
+	/// The canonical query identity, also the answer when the shape is unknown.
+	fn pointer_metadata_projection(
+		&mut self,
+		to: TypeIndex,
+		memory: TypeIndex,
+	) -> TypeIndex {
 		let intrinsics = &self.defs.intrinsics;
 		let (trait_index, assoc_type_index) = (
 			intrinsics.pointer.expect("std declares `Pointer`"),
@@ -1993,35 +2027,72 @@ impl TypeContext<'_, '_, '_> {
 			memory,
 			ownership: Ownership::Shared,
 		});
-		Ok(self.types.intern(Type::TypeProjection {
+		self.types.intern(Type::TypeProjection {
 			base: shared,
 			trait_index,
 			assoc_type_index,
-		}))
+		})
 	}
 
-	/// The counts a pointer to `pointee` carries beside its address, each a
-	/// `size`: a slice's length, then its element's own counts, so `[u8]`
-	/// gives `size` and `[[u8]]` `(size, size)`; `()` for anything else.
-	/// `None` when the pointee's shape is not known here: an abstract pointee
-	/// assumed `Slice` but not `Array` may be a slice or an array. One not
-	/// assumed `Slice` is neither, since only a parameter bounded by it may be.
+	/// The query's known shape, for layout and constant evaluation: `None`
+	/// when metadata remains a rigid `Pointer::Metadata` projection.
 	pub(super) fn pointer_metadata(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		pointee: TypeIndex,
-		size: TypeIndex,
+		memory: TypeIndex,
 	) -> Result<Option<TypeIndex>, SolverError> {
+		let metadata =
+			self.pointer_metadata_value(assumption_context, pointee, memory)?;
+		Ok(self.known_pointer_metadata(metadata))
+	}
+
+	fn known_pointer_metadata(&self, metadata: TypeIndex) -> Option<TypeIndex> {
+		match *self.types.resolve(metadata) {
+			Type::TypeProjection {
+				assoc_type_index, ..
+			} if assoc_type_index
+				== self
+					.defs
+					.intrinsics
+					.pointer_metadata
+					.expect("`Pointer` declares `Metadata`") =>
+			{
+				None
+			}
+			_ => Some(metadata),
+		}
+	}
+
+	/// The builtin reduction, called with a metadata projection on the solver
+	/// stack. A slice adds its length to its element's metadata; an abstract
+	/// pointee is thin only when assumed `StackValue` or `Array`.
+	fn compute_pointer_metadata(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		pointee: TypeIndex,
+		memory: TypeIndex,
+		size: TypeIndex,
+		facts: RewriteFlags,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		// Keep looping equalities rigid. Shallow reduction would unfold
+		// `T::Item = [T::Item]` once per element and start the loop afresh.
 		let pointee = self.normalize(
 			assumption_context,
 			pointee,
-			NormalizationDepth::Shallow,
-			RewriteFlags::ALL,
+			NormalizationDepth::Deep,
+			facts,
 		)?;
 		match *self.types.resolve(pointee) {
 			Type::Slice { of } => {
-				let Some(element) =
-					self.pointer_metadata(assumption_context, of, size)?
+				let projection = self.pointer_metadata_projection(of, memory);
+				let metadata = self.normalize(
+					assumption_context,
+					projection,
+					NormalizationDepth::Deep,
+					facts,
+				)?;
+				let Some(element) = self.known_pointer_metadata(metadata)
 				else {
 					return Ok(None);
 				};
@@ -2033,13 +2104,13 @@ impl TypeContext<'_, '_, '_> {
 			}
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
 				let intrinsics = &self.defs.intrinsics;
-				let (Some(slice), Some(array)) =
-					(intrinsics.slice, intrinsics.array)
+				let (Some(stack_value), Some(array)) =
+					(intrinsics.stack_value, intrinsics.array)
 				else {
 					return Ok(Some(TypeIndex::UNIT));
 				};
-				if self.assumes(assumption_context, pointee, array)?
-					|| !self.assumes(assumption_context, pointee, slice)?
+				if self.assumes(assumption_context, pointee, stack_value)?
+					|| self.assumes(assumption_context, pointee, array)?
 				{
 					Ok(Some(TypeIndex::UNIT))
 				} else {
@@ -2344,10 +2415,10 @@ impl TypeContext<'_, '_, '_> {
 		answer
 	}
 
-	/// Whether every clause `impl_env`'s item assumes holds for `args` (the
-	/// flat arguments of its chain) under `assumption_context`: each env on
-	/// its assumption chain, proved whole. A judgement passes its frame,
-	/// which records the bound being proved.
+	/// Whether every clause `impl_env`'s item and the items around it state
+	/// holds for `args` (the flat arguments of its chain) under
+	/// `assumption_context`: each frame's requirements, proved whole. A
+	/// judgement passes its frame, which records the bound being proved.
 	fn prove_requirements(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
@@ -2355,14 +2426,11 @@ impl TypeContext<'_, '_, '_> {
 		args: &[TypeIndex],
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		let mut env = self.assumption_envs.of_frame(impl_env);
-		while env != AssumptionEnvIdx::ROOT {
-			let AssumptionEnv {
-				parent, clauses, ..
-			} = *self.assumption_envs.get(env);
+		let mut frame = Some(impl_env);
+		while let Some(current) = frame {
 			if !self.satisfies_clauses(
 				assumption_context,
-				clauses,
+				self.assumption_envs.requirements(current),
 				Subjects::All,
 				(impl_env, args),
 				None,
@@ -2370,7 +2438,7 @@ impl TypeContext<'_, '_, '_> {
 			)? {
 				return Ok(false);
 			}
-			env = parent.expect("only the root env has no parent");
+			frame = self.generic_envs.parent(current);
 		}
 		Ok(true)
 	}
@@ -2395,7 +2463,7 @@ impl TypeContext<'_, '_, '_> {
 		mut failures: Option<&mut Vec<UnsatisfiedClause>>,
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		let Equalities::Final(equalities) = clauses.equalities else {
+		let Some(range) = clauses.final_range() else {
 			return Err(SolverError::Pending);
 		};
 		// A clause that reads a membership already failed derives from that
@@ -2404,9 +2472,12 @@ impl TypeContext<'_, '_, '_> {
 		let mut failed = Vec::new();
 		let mut satisfied = true;
 		// Read one clause at a time: proving one normalizes through `self`
-		// again, and the arena only grows, so the ranges stay valid.
-		for at in 0..clauses.traits.len() {
-			let clause = self.clauses.traits(clauses.traits)[at];
+		// again, and the arena only grows, so the range stays valid. Every
+		// membership is proved first.
+		for at in 0..range.len() {
+			let Clause::Trait(clause) = self.clauses.get(range)[at] else {
+				continue;
+			};
 			if !subjects.reads(&self.types, clause.subject)
 				|| !failed.is_empty()
 					&& reads_failed(&self.types, clause.subject, &failed)
@@ -2455,67 +2526,168 @@ impl TypeContext<'_, '_, '_> {
 			});
 			satisfied = false;
 		}
-		for at in 0..equalities.len() {
-			let clause = self.clauses.equalities(equalities)[at];
-			// A conflict is the declaration's own error.
-			if !subjects.reads(&self.types, clause.projection)
-				|| self.clauses.equalities(equalities).iter().any(|other| {
-					other.projection == clause.projection
-						&& known_distinct(
+		// Then what is stated through the memberships, each skipped when one
+		// it reads failed.
+		for at in 0..range.len() {
+			match self.clauses.get(range)[at] {
+				Clause::Trait(_) => {}
+				Clause::Equality(clause) => {
+					// A conflict is the declaration's own error.
+					if !subjects.reads(&self.types, clause.projection)
+						|| self.clauses.equalities(range).any(|other| {
+							other.projection == clause.projection
+								&& known_distinct(
+									&self.types,
+									other.value,
+									clause.value,
+								)
+						}) || !failed.is_empty()
+						&& (reads_failed(
 							&self.types,
-							other.value,
+							clause.projection,
+							&failed,
+						) || reads_failed(
+							&self.types,
 							clause.value,
-						)
-				}) || !failed.is_empty()
-				&& (reads_failed(&self.types, clause.projection, &failed)
-					|| reads_failed(&self.types, clause.value, &failed))
-			{
-				continue;
+							&failed,
+						)) {
+						continue;
+					}
+					self.solver.record_proving(judgement, clause.origin);
+					let projection = subjects.stated(
+						&mut self.types,
+						(&self.generic_envs, frame, arguments),
+						clause.projection,
+					);
+					let required = self.types.substitute(
+						clause.value,
+						Substitution {
+							envs: &self.generic_envs,
+							env: frame,
+							args: arguments,
+						},
+					);
+					let found = self.normalize(
+						assumption_context,
+						projection,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					let expected = self.normalize(
+						assumption_context,
+						required,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					if found == expected
+						|| found == TypeIndex::ERROR
+						|| expected == TypeIndex::ERROR
+					{
+						continue;
+					}
+					let Some(failures) = failures.as_deref_mut() else {
+						return Ok(false);
+					};
+					failures.push(UnsatisfiedClause::Equality {
+						written: clause.projection,
+						projection,
+						required,
+						found,
+						expected,
+						source: clause.source,
+					});
+					satisfied = false;
+				}
+				Clause::Representable(clause) => {
+					if !subjects.reads(&self.types, clause.subject)
+						|| !failed.is_empty()
+							&& (failed.contains(&(
+								clause.subject,
+								clause.target.trait_index,
+							)) || reads_failed(
+								&self.types,
+								clause.subject,
+								&failed,
+							) || reads_failed(
+								&self.types,
+								clause.ty,
+								&failed,
+							)) {
+						continue;
+					}
+					self.solver.record_proving(judgement, clause.origin);
+					let stated = subjects.stated(
+						&mut self.types,
+						(&self.generic_envs, frame, arguments),
+						clause.subject,
+					);
+					let subject = self.normalize(
+						assumption_context,
+						stated,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					let ty = self.types.substitute(
+						clause.ty,
+						Substitution {
+							envs: &self.generic_envs,
+							env: frame,
+							args: arguments,
+						},
+					);
+					let ty = self.normalize(
+						assumption_context,
+						ty,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					if subject == TypeIndex::ERROR || ty == TypeIndex::ERROR {
+						continue;
+					}
+					let constant = clause.target.constant;
+					let value = match self.untyped_value(
+						assumption_context,
+						constant,
+						&[subject],
+					)? {
+						UntypedValue::Known(value) => {
+							if self.value_representable(
+								assumption_context,
+								ty,
+								value,
+							) {
+								continue;
+							}
+							Some(value)
+						}
+						UntypedValue::Abstract => {
+							if self.assumed_representable(
+								assumption_context,
+								subject,
+								constant,
+								ty,
+							)? {
+								continue;
+							}
+							None
+						}
+						// Reported where the constant fails.
+						UntypedValue::Failed => continue,
+					};
+					let Some(failures) = failures.as_deref_mut() else {
+						return Ok(false);
+					};
+					failures.push(UnsatisfiedClause::Representable {
+						written: clause.subject,
+						subject,
+						constant,
+						ty,
+						value,
+						source: clause.source,
+					});
+					satisfied = false;
+				}
 			}
-			self.solver.record_proving(judgement, clause.origin);
-			let projection = subjects.stated(
-				&mut self.types,
-				(&self.generic_envs, frame, arguments),
-				clause.projection,
-			);
-			let required = self.types.substitute(
-				clause.value,
-				Substitution {
-					envs: &self.generic_envs,
-					env: frame,
-					args: arguments,
-				},
-			);
-			let found = self.normalize(
-				assumption_context,
-				projection,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			let expected = self.normalize(
-				assumption_context,
-				required,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			if found == expected
-				|| found == TypeIndex::ERROR
-				|| expected == TypeIndex::ERROR
-			{
-				continue;
-			}
-			let Some(failures) = failures.as_deref_mut() else {
-				return Ok(false);
-			};
-			failures.push(UnsatisfiedClause::Equality {
-				written: clause.projection,
-				projection,
-				required,
-				found,
-				expected,
-				source: clause.source,
-			});
-			satisfied = false;
 		}
 		Ok(satisfied)
 	}
@@ -2549,7 +2721,6 @@ impl TypeContext<'_, '_, '_> {
 		for source in sources {
 			let equalities = source
 				.clauses
-				.equalities
 				.final_range()
 				.expect("a ready walk reached only final clauses");
 			for clause in tables.clauses.equalities(equalities) {

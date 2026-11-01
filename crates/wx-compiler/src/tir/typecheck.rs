@@ -46,12 +46,12 @@ use super::body::{
 use super::bounds::AssumptionEnvIdx;
 use super::defs::{
 	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
-	StructIdx, Tier, TypesetIdx, Visibility,
+	StructIdx, Tier, Visibility,
 };
-use super::eval::ResolvedConstant;
 use super::imports::report_private_identifier;
 use super::literals::{
-	CharLiteralError, Integer, parse_char_literal, unescape_string_literal,
+	CharLiteralError, CharMiss, ConcreteType, FloatMiss, Integer, IntegerMiss,
+	UntypedValue, parse_char_literal, unescape_string_literal,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
@@ -168,8 +168,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				ExprObligation::Match(expr) => {
 					self.check_match_usefulness(expr)
 				}
-				ExprObligation::Fit { expr, target } => {
-					self.decide_fit(expr, target)
+				ExprObligation::Representable { expr, target } => {
+					self.decide_representable(expr, target)
 				}
 			}
 		}
@@ -1173,6 +1173,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			.arguments_value(&target, &type_args, &given, 0, reported, span);
 		let ty = self.cx.types.intern_struct(struct_index, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
+		// Fields need nothing; the value made of them does.
+		let ty = self.held_by_value(ty, span);
 		self.body.push(
 			ExprKind::StructConstructor {
 				struct_index,
@@ -1322,7 +1324,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				let own = self.cx.generic_envs.param_names(frame).len();
 				self.cx.record_bounds_check(
 					&mut self.obligations.types,
-					self.scope.assumption_env,
+					self.scope.generic_env,
 					BoundRequirements::Frame {
 						env: frame,
 						args: args.prefix(start + own),
@@ -1991,33 +1993,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.normalized(projection, self.scope.assumption_env)
 	}
 
-	/// Every member of every typeset an abstract `target` assumes, any of
-	/// which can be substituted for it. Empty when no literal can have type
-	/// `target`.
-	fn typeset_targets(&self, target: TypeIndex) -> Vec<LiteralTarget> {
-		// An abstract target is constrained by its own bounds alone, so read
-		// the typesets those name rather than probing every typeset.
-		let mut targets = Vec::new();
-		for trait_index in self.cx.clause_tables().declared_traits(
-			&self.cx.types,
-			self.scope.assumption_env,
-			target,
-			self.cx.solver.state.recursion_budget,
-		) {
-			let Some(typeset) =
-				self.cx.defs.traits[usize::from(trait_index)].typeset
-			else {
-				continue;
-			};
-			for member in self.cx.typeset_members(typeset).iter().copied() {
-				targets.push(LiteralTarget::TypesetMember(typeset, member));
-			}
-		}
-		targets
-	}
-
-	/// Gives an untyped subtree the type `target`, checking each literal fits.
-	/// Reports and leaves the offending node at `ERROR` when one does not.
+	/// Gives an untyped subtree the type `target`, checking each literal is
+	/// representable as it. Reports and leaves the offending node at `ERROR`
+	/// when one does not.
 	fn coerce(&mut self, expr: ExprIdx, target: TypeIndex) {
 		if target == TypeIndex::ERROR {
 			self.body.set_ty(expr, TypeIndex::ERROR);
@@ -2085,35 +2063,26 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			_ => {}
 		}
-		let targets = self.literal_targets(target);
-		if targets.is_empty() {
+		let concrete_types =
+			self.cx.concrete_types(self.scope.assumption_env, target);
+		if concrete_types.is_empty() {
 			self.cx
 				.diagnostics
 				.push(self.report_unable_to_coerce(expr, target));
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
-		self.coerce_against(expr, target, &targets);
+		self.coerce_against(expr, target, &concrete_types);
 	}
 
-	/// The scalars a literal of type `target` must fit: the one concrete
-	/// scalar, held on the stack (the common case), or every member of every
-	/// typeset an abstract `target` assumes. Empty when no literal can have
-	/// type `target`.
-	fn literal_targets(&self, target: TypeIndex) -> Vec<LiteralTarget> {
-		if Integer::from_type(target).is_some()
-			|| Float::from_type(target).is_some()
-			|| target == TypeIndex::CHAR
-		{
-			return vec![LiteralTarget::Target(target)];
-		}
-		self.typeset_targets(target)
-	}
-
-	/// Gives an untyped constant the type `target`. Whether its value fits is
-	/// decided once values exist (`decide_fit`), as a constant's body reads
-	/// none.
+	/// Gives an untyped constant the type `target`. Whether its value is
+	/// representable is decided once values exist (`decide_representable`), as
+	/// a constant's body reads none.
 	fn coerce_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
-		if self.literal_targets(target).is_empty() {
+		if self
+			.cx
+			.concrete_types(self.scope.assumption_env, target)
+			.is_empty()
+		{
 			self.cx
 				.diagnostics
 				.push(self.report_unable_to_coerce(expr, target));
@@ -2122,153 +2091,185 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.set_ty(expr, target);
 		self.obligations
 			.exprs
-			.push(ExprObligation::Fit { expr, target });
+			.push(ExprObligation::Representable { expr, target });
 	}
 
-	/// The constant an untyped `expr` names, and its value. `None` when it
-	/// has none here: it failed (reported where it is), or it is a trait's
-	/// constant over a type not known here, whose fit only a bound could
-	/// state (reported).
+	/// The constant an untyped `expr` names, and its value. `None` when it has
+	/// none here: it failed (reported where it is), or it is a trait's constant
+	/// over a type not known here and no representability clause in scope says
+	/// it is representable as `target` (reported); `Some` with no value when
+	/// one does.
 	fn untyped_value(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-	) -> Option<(ConstIdx, i128)> {
-		let (constant, type_args) = match self.body.kind(expr) {
-			ExprKind::Const { constant, .. } => {
-				return Some((constant, self.cx.exact_value(constant).ok()?));
-			}
+	) -> Option<(ConstIdx, Option<i128>)> {
+		let (constant, args) = match self.body.kind(expr) {
+			ExprKind::Const { constant, .. } => (constant, Vec::new()),
 			ExprKind::AbstractConst {
 				constant,
 				type_args,
-			} => (constant, type_args),
-			_ => unreachable!("only a constant's fit is decided"),
+			} => (constant, self.cx.generic_args.types(type_args).to_vec()),
+			_ => unreachable!("only a constant's representability is decided"),
 		};
-		let args = self.cx.generic_args.types(type_args).to_vec();
-		match self.cx.resolve_constant(constant, &args).ok()? {
-			ResolvedConstant::Length(length) => {
-				let length = self.cx.normalize(
-					self.scope.assumption_env,
-					length,
-					NormalizationDepth::Deep,
-					RewriteFlags::ALL,
-				);
-				match *self.cx.types.resolve(length.ok()?) {
-					Type::Value { bits } => Some((constant, i128::from(bits))),
-					_ => None,
+		let env = self.scope.assumption_env;
+		match self.cx.untyped_value(env, constant, &args).ok()? {
+			UntypedValue::Known(value) => Some((constant, Some(value))),
+			UntypedValue::Failed => None,
+			UntypedValue::Abstract => {
+				let subject = self.normalized(args[0], env);
+				if self
+					.cx
+					.assumed_representable(env, subject, constant, target)
+					.ok()?
+				{
+					return Some((constant, None));
 				}
-			}
-			ResolvedConstant::Instance(instance) => {
-				Some((constant, self.cx.exact_value(instance.constant).ok()?))
-			}
-			ResolvedConstant::Abstract => {
-				let name = self.cx.defs.constants[usize::from(constant)].name;
-				let message = format!(
-					"whether `{}` fits `{}` here is stated by a fit clause, \
-					 which is not supported yet",
-					self.cx.strings.resolve(name.inner).unwrap(),
-					self.cx.type_formatter().display_type(target)
+				let diagnostic = self.cx.report_unrepresentable_constant(
+					self.source_span(expr),
+					(subject, constant),
+					target,
+					None,
+					None,
 				);
-				self.cx.diagnostics.push(
-					Diagnostic::bug()
-						.with_code(DiagnosticCode::UnsupportedExpression.code())
-						.with_message(message)
-						.with_label(self.source_span(expr).primary_label()),
-				);
+				self.cx.diagnostics.push(diagnostic);
 				None
 			}
 		}
 	}
 
-	/// Decides a recorded `Fit`: the untyped constant `expr` names has a
-	/// value of its kind that fits `target`, as a literal of that value
-	/// would. A constant without a value reports itself.
-	fn decide_fit(&mut self, expr: ExprIdx, target: TypeIndex) {
-		let Some((constant, value)) = self.untyped_value(expr, target) else {
+	/// Decides a recorded `Representable`: the untyped constant `expr` names
+	/// has a value of its kind representable as `target`, as a literal of that
+	/// value would. A constant without a value reports itself.
+	fn decide_representable(&mut self, expr: ExprIdx, target: TypeIndex) {
+		// Without a value, a representability clause in scope said it is.
+		let Some((constant, Some(value))) = self.untyped_value(expr, target)
+		else {
 			return;
 		};
 		let kind = self.cx.constants[usize::from(constant)].ty;
-		let targets = self.literal_targets(target);
 		let name = self.cx.defs.constants[usize::from(constant)].name.inner;
 		let name = self.cx.strings.resolve(name).unwrap().to_owned();
-		let out_of_range = |this: &mut Self| {
-			let message = format!(
-				"`{name}` is `{value}`, out of range for `{}`",
-				this.cx.type_formatter().display_type(target)
-			);
-			this.push_error(
-				DiagnosticCode::IntegerLiteralOutOfRange,
-				message,
-				expr,
-			);
-		};
-		if kind == TypeIndex::CHAR_LITERAL {
-			// A character is a `Char`, or an integer its code point fits.
-			for fit in &targets {
-				if fit.ty() == TypeIndex::CHAR {
-					continue;
-				}
-				match Integer::from_type(fit.ty()) {
-					Some(integer)
-						if u64::try_from(value).is_ok_and(|code| {
-							integer.in_range(code, false)
-						}) => {}
-					Some(_) if matches!(fit, LiteralTarget::Target(_)) => {
-						return out_of_range(self);
-					}
-					_ => return self.report_misfit(expr, target, fit),
-				}
-			}
-			return;
-		}
-		let Ok(magnitude) = u64::try_from(value.unsigned_abs()) else {
-			return out_of_range(self);
-		};
-		let negated = value < 0;
-		for fit in &targets {
-			if fit.fits_int(magnitude, negated) {
-				continue;
-			}
-			return match fit {
-				LiteralTarget::Target(ty)
-					if Integer::from_type(*ty).is_some() =>
-				{
-					out_of_range(self)
-				}
-				_ => self
-					.report_int_misfit(expr, magnitude, negated, target, fit),
+		let at = self.source_span(expr);
+		for concrete in
+			self.cx.concrete_types(self.scope.assumption_env, target)
+		{
+			let held = if kind == TypeIndex::CHAR_LITERAL {
+				u32::try_from(value)
+					.map_err(|_| CharMiss::OutOfRange)
+					.and_then(|code_point| concrete.holds_char(code_point))
+					.map_err(|miss| match miss {
+						CharMiss::OutOfRange => IntegerMiss::OutOfRange,
+						CharMiss::WrongKind => IntegerMiss::WrongKind,
+					})
+			} else {
+				concrete.holds_integer(value)
 			};
+			let Err(miss) = held else {
+				continue;
+			};
+			let ty = self.cx.type_formatter().display_type(target);
+			let diagnostic = match (concrete, miss) {
+				(ConcreteType::Member(typeset, member), _) => {
+					self.cx.report_typeset_member(
+						format_args!("constant `{name}`"),
+						typeset,
+						member,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), IntegerMiss::OutOfRange) => {
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::IntegerLiteralOutOfRange.code(),
+						)
+						.with_message(format!(
+							"constant `{name}` cannot be represented as `{ty}`"
+						))
+						.with_label(at.primary_label().with_message(format!(
+							"its value `{value}` is out of range for `{ty}`"
+						)))
+				}
+				(ConcreteType::Target(_), IntegerMiss::Inexact) => {
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::IntegerLiteralNotRepresentable
+								.code(),
+						)
+						.with_message(format!(
+							"constant `{name}` cannot be represented exactly \
+							 as `{ty}`"
+						))
+						.with_label(
+							at.primary_label().with_message(format!(
+								"its value is `{value}`"
+							)),
+						)
+				}
+				(ConcreteType::Target(_), IntegerMiss::WrongKind) => {
+					self.report_unable_to_coerce(expr, target)
+				}
+			};
+			return self.reject(expr, diagnostic);
 		}
 	}
 
-	/// `coerce` against the scalars a literal must fit: `target`'s own, or
-	/// every member of every typeset it assumes.
+	/// `coerce` against the scalars a literal must be representable as:
+	/// `target`'s own, or every member of every typeset it assumes.
 	fn coerce_against(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
+		concrete_types: &[ConcreteType],
 	) {
 		match self.body.kind(expr) {
 			ExprKind::Int(value) => {
-				self.coerce_int(expr, expr, target, targets, value, false);
+				self.coerce_int(
+					expr,
+					expr,
+					target,
+					concrete_types,
+					value,
+					false,
+				);
 			}
-			ExprKind::Float(_) => self.coerce_float(expr, target, targets),
+			ExprKind::Float(_) => {
+				self.coerce_float(expr, target, concrete_types)
+			}
 			ExprKind::Char(value) => {
-				self.coerce_char(expr, target, targets, value)
+				self.coerce_char(expr, target, concrete_types, value)
 			}
 			ExprKind::PrimitiveUnary { op, operand } => {
-				for fit in targets {
-					if !fit.fits_unary(op) {
-						return self.report_misfit(expr, target, fit);
+				for &concrete in concrete_types {
+					if concrete.allows_unary(op) {
+						continue;
 					}
+					let diagnostic = match concrete {
+						ConcreteType::Member(typeset, member) => {
+							self.cx.report_typeset_member(
+								"literal",
+								typeset,
+								member,
+								self.source_span(expr),
+							)
+						}
+						ConcreteType::Target(_) => {
+							self.report_unable_to_coerce(expr, target)
+						}
+					};
+					return self.reject(expr, diagnostic);
 				}
 				let coerced = match (op, self.body.kind(operand)) {
 					// `-128` is in range for `i8` though `128` is not: a
-					// negated literal is checked against the negative bound.
+					// negated literal is checked as the negative value.
 					(UnaryOp::InvertSign, ExprKind::Int(value)) => self
 						.coerce_int(
-							expr, operand, target, targets, value, true,
+							expr,
+							operand,
+							target,
+							concrete_types,
+							value,
+							true,
 						),
 					_ => {
 						self.coerce(operand, target);
@@ -2296,37 +2297,78 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.set_kind(expr, kind);
 				self.body.set_ty(expr, ty);
 			}
-			kind => unreachable!(
-				"only literals and operators over them are untyped: {kind:?}"
+			_ => unreachable!(
+				"only literals and operators over them are untyped"
 			),
 		}
 	}
 
 	/// Checks an integer literal (`value`, optionally negated) against every
-	/// candidate, then gives `literal` the type `target` and returns `true`.
-	/// On a misfit it draws the report, leaves the node at `ERROR`, and
-	/// returns `false`. `report` is the node a diagnostic points at — the
-	/// unary itself, for a negated literal.
+	/// concrete type of `target`, then gives `literal` the type `target` and
+	/// returns `true`. When one cannot represent it, it draws the report,
+	/// leaves the node at `ERROR`, and returns `false`. `report` is the node a
+	/// diagnostic points at — the unary itself, for a negated literal.
 	fn coerce_int(
 		&mut self,
 		report: ExprIdx,
 		literal: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
-		value: u64,
+		concrete_types: &[ConcreteType],
+		magnitude: u64,
 		negated: bool,
 	) -> bool {
+		let value = if negated {
+			-i128::from(magnitude)
+		} else {
+			i128::from(magnitude)
+		};
+		let at = self.source_span(report);
 		let mut all_float = true;
-		for fit in targets {
-			if !fit.fits_int(value, negated) {
-				self.report_int_misfit(report, value, negated, target, fit);
-				return false;
-			}
-			all_float &= fit.is_float();
+		for &concrete in concrete_types {
+			let Err(miss) = concrete.holds_integer(value) else {
+				all_float &= concrete.is_float();
+				continue;
+			};
+			let diagnostic = match (concrete, miss) {
+				(ConcreteType::Member(typeset, member), _) => {
+					self.cx.report_typeset_member(
+						format_args!("literal `{value}`"),
+						typeset,
+						member,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), IntegerMiss::OutOfRange) => {
+					self.cx.report_out_of_range(
+						format_args!("literal `{value}`"),
+						target,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), IntegerMiss::Inexact) => {
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::IntegerLiteralNotRepresentable
+								.code(),
+						)
+						.with_message(format!(
+							"literal `{value}` cannot be represented exactly \
+							 as `{}`",
+							self.cx.type_formatter().display_type(target)
+						))
+						.with_label(at.primary_label())
+				}
+				(ConcreteType::Target(_), IntegerMiss::WrongKind) => {
+					self.report_unable_to_coerce(report, target)
+				}
+			};
+			self.reject(report, diagnostic);
+			return false;
 		}
 		// An integer literal of float type is a float.
 		if all_float {
-			self.body.set_kind(literal, ExprKind::Float(value as f64));
+			self.body
+				.set_kind(literal, ExprKind::Float(magnitude as f64));
 		}
 		self.body.set_ty(literal, target);
 		true
@@ -2369,33 +2411,60 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.set_ty(expr, ty);
 	}
 
-	/// Reads a float literal's value from its text at each target's width.
+	/// Reads a float literal's value from its text at each concrete type's
+	/// width.
 	fn coerce_float(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
+		concrete_types: &[ConcreteType],
 	) {
 		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
 		let text = self.body.span(expr).extract_str(source);
 		let mut value = None;
-		for fit in targets {
-			match fit.fits_float(&text) {
-				FloatFit::Fits(parsed) => {
-					value.get_or_insert(parsed);
+		for &concrete in concrete_types {
+			match concrete.read_float(&text) {
+				Ok(Some(read)) => {
+					value.get_or_insert(read);
 				}
 				// Malformed syntax was reported by the parser.
-				FloatFit::Invalid => {
-					return self.body.set_ty(expr, TypeIndex::ERROR);
-				}
-				FloatFit::Overflow => {
-					return self.report_float(expr, fit, true);
-				}
-				FloatFit::Underflow => {
-					return self.report_float(expr, fit, false);
-				}
-				FloatFit::NotFloat => {
-					return self.report_misfit(expr, target, fit);
+				Ok(None) => return self.body.set_ty(expr, TypeIndex::ERROR),
+				Err(miss) => {
+					let at = self.source_span(expr);
+					let ty =
+						self.cx.type_formatter().display_type(concrete.ty());
+					let diagnostic = match (concrete, miss) {
+						(_, FloatMiss::TooLarge) => Diagnostic::error()
+							.with_code(
+								DiagnosticCode::FloatLiteralOverflow.code(),
+							)
+							.with_message(format!(
+								"float literal is too large for `{ty}`"
+							))
+							.with_label(at.primary_label()),
+						(_, FloatMiss::TooSmall) => Diagnostic::error()
+							.with_code(
+								DiagnosticCode::FloatLiteralUnderflow.code(),
+							)
+							.with_message(format!(
+								"float literal is too small to represent in \
+								 `{ty}`"
+							))
+							.with_label(at.primary_label()),
+						(
+							ConcreteType::Member(typeset, member),
+							FloatMiss::WrongKind,
+						) => self.cx.report_typeset_member(
+							"float literal",
+							typeset,
+							member,
+							at,
+						),
+						(ConcreteType::Target(_), FloatMiss::WrongKind) => {
+							self.report_unable_to_coerce(expr, target)
+						}
+					};
+					return self.reject(expr, diagnostic);
 				}
 			}
 		}
@@ -2403,163 +2472,53 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.set_ty(expr, target);
 	}
 
-	/// A character literal is a `Char`, or an integer its code point fits,
-	/// which it then is.
+	/// A character literal is a `Char`, or an integer that can represent its
+	/// code point, which it then is.
 	fn coerce_char(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
+		concrete_types: &[ConcreteType],
 		value: char,
 	) {
-		let code_point = u64::from(value);
-		for fit in targets {
-			if fit.ty() == TypeIndex::CHAR {
+		let at = self.source_span(expr);
+		for &concrete in concrete_types {
+			let Err(miss) = concrete.holds_char(u32::from(value)) else {
 				continue;
-			}
-			match Integer::from_type(fit.ty()) {
-				Some(integer) if integer.in_range(code_point, false) => {}
-				Some(_) if matches!(fit, LiteralTarget::Target(_)) => {
-					let message = format!(
-						"character literal {value:?} out of range for `{}`",
-						self.cx.type_formatter().display_type(target)
-					);
-					self.push_error(
-						DiagnosticCode::IntegerLiteralOutOfRange,
-						message,
-						expr,
-					);
-					return;
+			};
+			let diagnostic = match (concrete, miss) {
+				(ConcreteType::Member(typeset, member), _) => {
+					self.cx.report_typeset_member(
+						format_args!("literal {value:?}"),
+						typeset,
+						member,
+						at,
+					)
 				}
-				_ => return self.report_misfit(expr, target, fit),
-			}
+				(ConcreteType::Target(_), CharMiss::OutOfRange) => {
+					self.cx.report_out_of_range(
+						format_args!("literal {value:?}"),
+						target,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), CharMiss::WrongKind) => {
+					self.report_unable_to_coerce(expr, target)
+				}
+			};
+			return self.reject(expr, diagnostic);
 		}
 		if target != TypeIndex::CHAR {
-			self.body.set_kind(expr, ExprKind::Int(code_point));
+			self.body.set_kind(expr, ExprKind::Int(u64::from(value)));
 		}
 		self.body.set_ty(expr, target);
 	}
 
-	/// A float literal `fit` cannot hold: too large or too small for its width.
-	fn report_float(
-		&mut self,
-		expr: ExprIdx,
-		fit: &LiteralTarget,
-		overflow: bool,
-	) {
-		let name = self.cx.type_formatter().display_type(fit.ty());
-		let (code, message) = if overflow {
-			(
-				DiagnosticCode::FloatLiteralOverflow,
-				format!("float literal is too large for `{name}`"),
-			)
-		} else {
-			(
-				DiagnosticCode::FloatLiteralUnderflow,
-				format!("float literal is too small to represent in `{name}`"),
-			)
-		};
-		self.push_error(code, message, expr);
-	}
-
-	/// An integer literal that does not fit `fit`: out of range for a plain
-	/// integer target, not representable for a float one.
-	fn report_int_misfit(
-		&mut self,
-		expr: ExprIdx,
-		value: u64,
-		negated: bool,
-		target: TypeIndex,
-		fit: &LiteralTarget,
-	) {
-		let LiteralTarget::Target(ty) = fit else {
-			return self.report_misfit(expr, target, fit);
-		};
-		if Integer::from_type(*ty).is_some() {
-			let value = if negated {
-				-(value as i128)
-			} else {
-				value as i128
-			};
-			self.report_out_of_range(expr, value, target);
-		} else if Float::from_type(*ty).is_some() {
-			let message = format!(
-				"integer literal cannot be represented exactly by `{}`",
-				self.cx.type_formatter().display_type(target)
-			);
-			self.push_error(
-				DiagnosticCode::IntegerLiteralNotRepresentable,
-				message,
-				expr,
-			);
-		} else {
-			// A concrete type that is neither integer nor float (`Bool`, `Char`)
-			// has no integer proof, just as a typeset member has none.
-			self.report_misfit(expr, target, fit);
-		}
-	}
-
-	/// A literal `fit` cannot hold: unable to coerce to a scalar target, or a
-	/// typeset member it does not fit for an abstract one.
-	fn report_misfit(
-		&mut self,
-		expr: ExprIdx,
-		target: TypeIndex,
-		fit: &LiteralTarget,
-	) {
-		let LiteralTarget::TypesetMember(typeset, member) = fit else {
-			self.cx
-				.diagnostics
-				.push(self.report_unable_to_coerce(expr, target));
-			return self.body.set_ty(expr, TypeIndex::ERROR);
-		};
-		let def = &self.cx.defs.typesets[usize::from(*typeset)];
-		let typeset_name = self
-			.cx
-			.strings
-			.resolve(
-				self.cx.defs.traits[usize::from(def.trait_index)].name.inner,
-			)
-			.unwrap();
-		let member_name = self.cx.type_formatter().display_type(member.inner);
-		self.cx.diagnostics.push(
-			Diagnostic::error()
-				.with_code(DiagnosticCode::TypesetBoundViolation.code())
-				.with_message(format!(
-					"literal is not representable by every member of typeset `{typeset_name}`"
-				))
-				.with_label(
-					Label::primary(self.scope.file_id, self.body.span(expr))
-						.with_message(format!(
-							"cannot be represented by `{member_name}`"
-						)),
-				)
-				.with_label(
-					SourceSpan::new(def.file_id, member.span)
-						.secondary_label()
-						.with_message(format!(
-							"`{member_name}` is a member here"
-						)),
-				),
-		);
+	/// Reports `diagnostic` about `expr` and leaves `expr` at `ERROR`, so
+	/// nothing reports it again.
+	fn reject(&mut self, expr: ExprIdx, diagnostic: Diagnostic<FileId>) {
+		self.cx.diagnostics.push(diagnostic);
 		self.body.set_ty(expr, TypeIndex::ERROR);
-	}
-
-	fn report_out_of_range(
-		&mut self,
-		expr: ExprIdx,
-		value: i128,
-		ty: TypeIndex,
-	) {
-		let message = format!(
-			"literal `{value}` out of range for `{}`",
-			self.cx.type_formatter().display_type(ty)
-		);
-		self.push_error(
-			DiagnosticCode::IntegerLiteralOutOfRange,
-			message,
-			expr,
-		);
 	}
 
 	/// Places a string or array literal, data in no memory: it becomes a
@@ -2955,126 +2914,6 @@ enum ValuePath<'s> {
 enum Arguments<'e> {
 	Positional(&'e [ast::Separated<Spanned<ast::Expression>>]),
 	Named(&'e [ast::Separated<Spanned<ast::NamedArgument>>]),
-}
-
-/// A type a literal must fit, and where the requirement comes from.
-enum LiteralTarget {
-	/// The target type itself.
-	Target(TypeIndex),
-	/// A member of a typeset an abstract target assumes: the typeset, to name
-	/// it, and the member's written type, for its place in a diagnostic.
-	TypesetMember(TypesetIdx, Spanned<TypeIndex>),
-}
-
-impl LiteralTarget {
-	/// The candidate type. `Integer::from_type` or `Float::from_type` narrows
-	/// it when the check wants one; a typeset member need be neither.
-	fn ty(&self) -> TypeIndex {
-		match self {
-			LiteralTarget::Target(ty) => *ty,
-			LiteralTarget::TypesetMember(_, member) => member.inner,
-		}
-	}
-
-	/// Whether an integer literal (`value`, optionally negated) fits.
-	fn fits_int(&self, value: u64, negated: bool) -> bool {
-		let ty = self.ty();
-		if let Some(integer) = Integer::from_type(ty) {
-			integer.in_range(value, negated)
-		} else if let Some(float) = Float::from_type(ty) {
-			float.exact_precision_int(value)
-		} else {
-			false
-		}
-	}
-
-	/// Whether a float literal written `text` fits, and its value when it does.
-	fn fits_float(&self, text: &str) -> FloatFit {
-		let Some(float) = Float::from_type(self.ty()) else {
-			return FloatFit::NotFloat;
-		};
-		let result = match float {
-			Float::F32 => text
-				.parse::<f32>()
-				// f64::from is a lossless conversion
-				.map(f64::from),
-			Float::F64 => text.parse::<f64>(),
-		};
-		match result {
-			Ok(parsed) if parsed.is_infinite() => FloatFit::Overflow,
-			Ok(parsed)
-				if parsed == 0.0
-					&& text
-						.bytes()
-						.any(|b| b.is_ascii_digit() && b != b'0') =>
-			{
-				FloatFit::Underflow
-			}
-			Ok(parsed) => FloatFit::Fits(parsed),
-			Err(_) => FloatFit::Invalid,
-		}
-	}
-
-	/// Whether `op` means anything over a literal of this candidate's type.
-	fn fits_unary(&self, op: UnaryOp) -> bool {
-		let ty = self.ty();
-		match op {
-			UnaryOp::InvertSign => {
-				Integer::from_type(ty).is_some_and(Integer::is_signed)
-					|| Float::from_type(ty).is_some()
-			}
-			UnaryOp::BitNot => Integer::from_type(ty).is_some(),
-			UnaryOp::Not => false,
-		}
-	}
-
-	/// Whether a literal of this candidate's type is a float.
-	fn is_float(&self) -> bool {
-		Float::from_type(self.ty()).is_some()
-	}
-}
-
-/// How a float literal fares against one candidate.
-enum FloatFit {
-	/// It parses and is representable at the candidate's width, at this value.
-	Fits(f64),
-	/// The text is not a float; the parser has already reported it.
-	Invalid,
-	/// It parses to infinity at the candidate's width.
-	Overflow,
-	/// It is nonzero in text but rounds to zero at the candidate's width.
-	Underflow,
-	/// The candidate is not a float type.
-	NotFloat,
-}
-
-#[derive(Clone, Copy)]
-enum Float {
-	F32,
-	F64,
-}
-
-impl Float {
-	fn from_type(ty: TypeIndex) -> Option<Self> {
-		Some(match ty {
-			TypeIndex::F32 => Self::F32,
-			TypeIndex::F64 => Self::F64,
-			_ => return None,
-		})
-	}
-
-	fn mantissa_bits(self) -> u32 {
-		match self {
-			Self::F32 => 24,
-			Self::F64 => 53,
-		}
-	}
-
-	fn exact_precision_int(self, value: u64) -> bool {
-		value == 0
-			|| 64 - value.leading_zeros() - value.trailing_zeros()
-				<= self.mantissa_bits()
-	}
 }
 
 #[cfg(test)]
@@ -3923,7 +3762,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_character_literal_is_a_char_or_an_integer_it_fits() {
+	fn a_character_literal_is_a_char_or_an_integer_that_represents_it() {
 		test_case!(
 			case = indoc! {"
 				func c() -> Char { 'a' }
@@ -3942,12 +3781,12 @@ mod tests {
 	}
 
 	#[test]
-	fn a_character_literal_must_fit_its_integer() {
+	fn a_character_literal_must_be_representable_as_its_integer() {
 		test_case!(case = "func f() -> u8 { '€' }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 		case.diagnostics()
-			.assert_error_saying("character literal '€' out of range for `u8`");
+			.assert_error_saying("literal '€' cannot be represented as `u8`");
 		test_case!(case = "func f<T: Integer>() -> T { '€' }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypesetBoundViolation]);
@@ -3984,7 +3823,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 		case.diagnostics()
-			.assert_error_saying("character literal '€' out of range for `u8`");
+			.assert_error_saying("literal '€' cannot be represented as `u8`");
 	}
 
 	#[test]
@@ -4202,7 +4041,7 @@ mod tests {
 	fn an_ascription_checks_its_value_against_its_type() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(t: T) -> T { t }
+				func id<T: StackValue>(t: T) -> T { t }
 				func literal() -> u8 { (5: u8) }
 				func inferred() { local x = id(5: u16); }
 				func elements() { local t = (1: u8, 2: u16); }
@@ -4343,7 +4182,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct W<T>(x: T);
-				impl<T> Add for W<T> { func add(self: Self, rhs: Self) -> Self { rhs } }
+				impl<T: StackValue> Add for W<T> { func add(self: Self, rhs: Self) -> Self { rhs } }
 				func concrete(w: W<u8>) -> W<u8> { w + w }
 				func generic<T: Add>(t: T) -> T { t + t }
 				func assigned(w: W<u8>) { local mut v = w; v += w; }
@@ -4513,8 +4352,8 @@ mod tests {
 				trait Number {}
 				impl Number for u32 {}
 				impl Number for i64 {}
-				func id<T>(x: T) -> T { x }
-				func zero<T: Number>() -> T { loop {} }
+				func id<T: StackValue>(x: T) -> T { x }
+				func zero<T: StackValue + Number>() -> T { loop {} }
 				func from_argument(a: u16) -> u16 { id(a) }
 				func from_expected() -> u8 { id(1) }
 				func from_turbofish() { local x = zero::<i64>(); }
@@ -4537,7 +4376,7 @@ mod tests {
 	fn a_function_is_a_value_of_its_own_type() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func f() { local g = id::<u8>; local h = id; }
 			"}
 		);
@@ -4550,7 +4389,7 @@ mod tests {
 	fn a_function_item_held_in_a_value_is_called_through_call() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func pair(a: u8, b: u16) {}
 				func positional() -> u8 { local g = id::<u8>; g(1) }
 				func named() { local g = pair; g({ b: 2, a: 1 }); }
@@ -4559,8 +4398,8 @@ mod tests {
 				struct V(x: u32);
 				impl V { func area(self: Self, k: u32) -> u32 { k } }
 				func method(v: V) -> u32 { local m = V::area; m({ k: 1, self: v }) }
-				trait Make { func make(n: u32) -> Self; }
-				func declared<T: Make>() -> T { local g = T::make; g(1) }
+				trait Make: StackValue { func make(n: u32) -> Self; }
+				func declared<T: StackValue + Make>() -> T { local g = T::make; g(1) }
 			"}
 		);
 		case.diagnostics()
@@ -4675,7 +4514,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func g(p: (u8, u16)) {}
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func unit(x: ()) {}
 				struct W(x: (u8, u16));
 				struct V();
@@ -4791,7 +4630,7 @@ mod tests {
 	fn a_function_item_is_not_a_function_reference() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func f() { local g: func(u8) -> u8 = id; }
 			"}
 		);
@@ -4882,12 +4721,12 @@ mod tests {
 	fn an_expected_item_type_gives_a_function_value_its_arguments() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func take(g: id<u8>) {}
 				func annotated() { local g: id<u8> = id; }
 				func argument() { take(id); }
 				func returned() -> id<u16> { id }
-				func generic<T>() { local g: id<T> = id; }
+				func generic<T: StackValue>() { local g: id<T> = id; }
 				func other() { local g: id<u8> = take; }
 			"}
 		);
@@ -5147,16 +4986,113 @@ mod tests {
 	}
 
 	#[test]
-	fn constant_bindings_are_not_checked_yet() {
+	fn a_constant_value_in_a_bound_is_not_checked_yet() {
+		// Representability (`const LEN: u8`) is a clause; a value (`const LEN =
+		// 4`) is not supported yet.
 		test_case!(
 			case = indoc! {r#"
 				func g<A: Array where { const LEN: u8 }, B: Array where { const LEN = 4 }>() {}
 			"#}
 		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
+	}
+
+	#[test]
+	fn an_abstract_constant_is_representable_as_what_a_bound_says() {
+		// `u8` gives `u16`, not `i8`.
+		test_case!(
+			case = indoc! {r#"
+				func f<A: Array where { const LEN: u8 }>() -> u8 { A::LEN }
+				func wider<A: Array where { const LEN: u8 }>() -> u16 { A::LEN }
+				func signed<A: Array where { const LEN: u8 }>() -> i8 { A::LEN }
+				func none<A: Array>() -> u8 { A::LEN }
+			"#}
+		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::UnsupportedExpression,
-			DiagnosticCode::UnsupportedExpression,
+			DiagnosticCode::UnrepresentableConstant,
+			DiagnosticCode::UnrepresentableConstant,
 		]);
+		case.diagnostics().assert_error_saying(
+			"constant `<A as Array>::LEN` cannot be represented as `i8`",
+		);
+		case.diagnostics().assert_error_saying(
+			"constant `<A as Array>::LEN` cannot be represented as `u8`",
+		);
+	}
+
+	#[test]
+	fn representability_is_proved_at_a_call() {
+		test_case!(
+			case = indoc! {r#"
+				func f<A: Array where { const LEN: u8 }>() {}
+				func representable() { f::<[u16; 255]>() }
+				func overflows() { f::<[u16; 256]>() }
+				func implied<B: Array where { const LEN: u8 }>() { f::<B>() }
+				func wider<B: Array where { const LEN: u16 }>() { f::<B>() }
+				func unstated<B: Array>() { f::<B>() }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnrepresentableConstant,
+			DiagnosticCode::UnrepresentableConstant,
+			DiagnosticCode::UnrepresentableConstant,
+		]);
+		case.diagnostics().assert_error_saying(
+			"constant `<[u16; 256] as Array>::LEN` cannot be represented as `u8`",
+		);
+	}
+
+	#[test]
+	fn representability_as_a_memory_size_is_read_through_its_typesets() {
+		// `M::Size` is `u32` or `u64`: it gives `u32`, not `u16`, and `u8`
+		// gives it.
+		test_case!(
+			case = indoc! {r#"
+				func f<M: Memory, A: Array where { const LEN: M::Size }>() -> M::Size { A::LEN }
+				func narrow<M: Memory, A: Array where { const LEN: M::Size }>() -> u32 { A::LEN }
+				func narrower<M: Memory, A: Array where { const LEN: M::Size }>() -> u16 { A::LEN }
+				func small<M: Memory, A: Array where { const LEN: u8 }>() -> M::Size { A::LEN }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnrepresentableConstant]);
+		case.diagnostics().assert_error_saying(
+			"constant `<A as Array>::LEN` cannot be represented as `u16`",
+		);
+	}
+
+	#[test]
+	fn representability_is_inherited_from_a_supertraits_bound() {
+		test_case!(
+			case = indoc! {r#"
+				trait Small: Array where { const LEN: u8 } {}
+				func f<A: Small>() -> u8 { A::LEN }
+				func g<A: Small>() -> i8 { A::LEN }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnrepresentableConstant]);
+	}
+
+	#[test]
+	fn a_bound_states_representability_of_an_untyped_constant_only() {
+		test_case!(
+			case = indoc! {r#"
+				trait Sized { const SIZE: u32; type Item; const FIRST: Self::Item; }
+				func typed<T: Sized where { const SIZE: u8 }>() {}
+				func projected<T: Sized where { const FIRST: u8 }>() {}
+				func untyped<A: Array where { const LEN: u8 }>() {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypedConstantBound,
+			DiagnosticCode::TypedConstantBound,
+		]);
+		case.diagnostics().assert_error_saying(
+			"constant `SIZE` has a type, so a bound cannot state what it is \
+			 representable as",
+		);
 	}
 
 	#[test]
@@ -5164,12 +5100,12 @@ mod tests {
 		// `Self` written first is no parameter: `f` takes one argument.
 		test_case!(
 			case = indoc! {r#"
-				trait Show { func show(self: Self); }
-				trait Tr {
-					func f<Self: Show, T>(self: Self, t: T) { self.show() }
+				trait Show: StackValue { func show(self: Self); }
+				trait Tr: StackValue {
+					func f<Self: Show, T: StackValue>(self: Self, t: T) { self.show() }
 					func g<Self: Show>(self: Self) { self.show() }
 				}
-				func call<X: Tr + Show>(x: X) { x.f::<u8>(1); x.g() }
+				func call<X: StackValue + Tr + Show>(x: X) { x.f::<u8>(1); x.g() }
 			"#}
 		);
 		case.diagnostics().assert_none();
@@ -5179,8 +5115,8 @@ mod tests {
 	fn a_call_proves_what_a_trait_function_requires_of_self() {
 		test_case!(
 			case = indoc! {r#"
-				trait Show { func show(self: Self); }
-				trait Tr {
+				trait Show: StackValue { func show(self: Self); }
+				trait Tr: StackValue {
 					func f<Self: Show>(self: Self) { self.show() }
 				}
 				struct A();
@@ -5189,7 +5125,7 @@ mod tests {
 				impl Show for B { func show(self: Self) {} }
 				impl Tr for B {}
 				func concrete(a: A, b: B) { a.f(); b.f() }
-				func generic<X: Tr>(x: X) { x.f() }
+				func generic<X: StackValue + Tr>(x: X) { x.f() }
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
@@ -5237,16 +5173,16 @@ mod tests {
 		test_case!(
 			case = indoc! {r#"
 				trait Show {}
-				trait Tr {
-					func late<T, Self: Show>(t: T);
+				trait Tr: StackValue {
+					func late<T: StackValue, Self: Show>(t: T);
 					func f(self: Self);
 				}
 				struct S<Self>(u8);
 				func free<Self: Show>() {}
 				impl S { func inherent<Self: Show>() {} }
 				impl Tr for S {
-					func late<T>(t: T) {}
-					func f<Self: Show>(self: Self) {}
+					func late<T: StackValue>(t: T) {}
+					func f(self: Self) {}
 				}
 			"#}
 		);
@@ -5255,8 +5191,274 @@ mod tests {
 			DiagnosticCode::MisplacedSelfBound,
 			DiagnosticCode::MisplacedSelfBound,
 			DiagnosticCode::MisplacedSelfBound,
-			DiagnosticCode::UnsupportedExpression,
 		]);
+	}
+
+	/// What the trait impls below share: `Container::show_all` requires its
+	/// items to be shown, `Wrap<T>`'s items are `T`.
+	const SHOWN_ITEMS: &str = indoc! {r#"
+		trait Show: StackValue { func show(self: Self); }
+		trait Container: StackValue {
+			type Item;
+			func show_all<Self: Container where { Item: Show }>(self: Self);
+		}
+		struct Wrap<T>(inner: T);
+	"#};
+
+	#[test]
+	fn a_trait_impl_function_assumes_what_its_self_entry_means() {
+		// `<Wrap<T> as Container>::Item: Show` means `T: Show` in the impl.
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					impl<T: StackValue> Container for Wrap<T> {
+						type Item = T;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {
+							self.inner.show()
+						}
+					}
+				"#}
+			)
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn without_its_self_entry_a_trait_impl_function_assumes_nothing() {
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					impl<T: StackValue> Container for Wrap<T> {
+						type Item = T;
+						func show_all(self: Self) { self.inner.show() }
+					}
+				"#}
+			)
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MethodNotFound]);
+	}
+
+	#[test]
+	fn a_self_entry_reads_in_its_function_signature_checks() {
+		// `Shown<Self::Item>` needs `Item: Show`, which only the entry gives.
+		test_case!(
+			case = indoc! {r#"
+				trait Show: StackValue { func show(self: Self); }
+				struct Shown<X: Show>(x: X);
+				trait Container {
+					type Item;
+					func shown<Self: Container where { Item: Show }>(
+						item: Shown<Self::Item>,
+					);
+				}
+				struct Wrap<T>(inner: T);
+				impl<T> Container for Wrap<T> {
+					type Item = T;
+					func shown<Self: Container where { Item: Show }>(
+						item: Shown<Self::Item>,
+					) {}
+				}
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_self_entry_about_a_concrete_item_is_proved_where_it_is_written() {
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					struct Bytes();
+					struct Text();
+					impl Show for Text { func show(self: Self) {} }
+					struct Bag();
+					impl Container for Bag {
+						type Item = Bytes;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+					struct Page();
+					impl Container for Page {
+						type Item = Text;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+				"#}
+			)
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `<Bag as Container>::Item: Show` is not satisfied",
+		);
+	}
+
+	#[test]
+	fn a_call_of_a_trait_impl_function_proves_its_self_entry() {
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					impl<T: StackValue> Container for Wrap<T> {
+						type Item = T;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {
+							self.inner.show()
+						}
+					}
+					struct No();
+					struct Yes();
+					impl Show for Yes { func show(self: Self) {} }
+					func calls(no: Wrap<No>, yes: Wrap<Yes>) {
+						no.show_all();
+						yes.show_all()
+					}
+				"#}
+			)
+		);
+		// Reported at the method for now; at the receiver, which gives
+		// `Self`, is 6d-3.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `<Wrap<No> as Container>::Item: Show` is not \
+			 satisfied",
+		);
+	}
+
+	#[test]
+	fn a_self_entry_assumes_only_about_an_abstract_type() {
+		// `Wrap2<T>: Show` would hold only if `T: Show`, which nothing reads
+		// from an assumption about `Wrap2<T>`; `Always<T>: Show` holds anyway.
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					struct Wrap2<T>(x: T);
+					impl<T: StackValue + Show> Show for Wrap2<T> { func show(self: Self) {} }
+					struct Always<T>(x: T);
+					impl<T: StackValue> Show for Always<T> { func show(self: Self) {} }
+					struct Nest<T>(inner: T);
+					impl<T: StackValue> Container for Nest<T> {
+						type Item = Wrap2<T>;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+					struct Keep<T>(inner: T);
+					impl<T: StackValue> Container for Keep<T> {
+						type Item = Always<T>;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+				"#}
+			)
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
+		case.diagnostics().assert_error_saying(
+			"assuming `Wrap2<T>: Show` is not supported yet",
+		);
+	}
+
+	#[test]
+	fn a_self_entry_is_compared_with_its_declarations_meaning() {
+		// The declaration's entry, read with `Self` as `Wrap<T>`, means
+		// `T: Show`, which the impl's own entry asks no more than; asking
+		// for `Item: Eq` beside it is more than the trait does.
+		test_case!(
+			case = indoc! {r#"
+				trait Show: StackValue { func show(self: Self); }
+				trait Eq: StackValue { func eq(self: Self, other: Self); }
+				trait Container: StackValue {
+					type Item;
+					func pair<Self: Container where { Item: Show }, U: StackValue>(
+						self: Self,
+						u: U,
+					);
+					func single<Self: Container where { Item: Show }>(
+						self: Self,
+					);
+				}
+				struct Wrap<T>(inner: T);
+				impl<T: StackValue> Container for Wrap<T> {
+					type Item = T;
+					func pair<Self: Container where { Item: Show }, U: StackValue>(
+						self: Self,
+						u: U,
+					) {
+						self.inner.show()
+					}
+					func single<
+						Self: Container where { Item: Show + Eq },
+					>(self: Self) {}
+				}
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
+	}
+
+	#[test]
+	fn a_self_entry_equality_is_assumed_or_proved() {
+		let source = indoc! {r#"
+				trait Container: StackValue {
+					type Item;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					);
+				}
+				struct Bytes();
+				impl Container for Bytes {
+					type Item = u8;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					) {}
+				}
+				struct Words();
+				impl Container for Words {
+					type Item = u16;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					) {}
+				}
+				struct Any<T>(x: T);
+				impl<T: StackValue> Container for Any<T> {
+					type Item = T;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					) {}
+				}
+			"#};
+		test_case!(case = source);
+		// `u8 == u8` holds, `u16 == u8` never does, and `T == u8` would be
+		// an assumption about a parameter's value. Each is reported at the
+		// equality itself.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::AssocTypeEqualityMismatch,
+			DiagnosticCode::UnassumableEquality,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`<Any<T> as Container>::Item` is `T`, which a bound cannot \
+			 require to be `u8`",
+		);
+		let at: Vec<&str> = case
+			.context
+			.diagnostics
+			.iter()
+			.map(|diagnostic| &source[diagnostic.labels[0].range.clone()])
+			.collect();
+		assert_eq!(at, ["Item = u8", "Item = u8"]);
 	}
 
 	#[test]
@@ -5350,7 +5552,7 @@ mod tests {
 				func of_array_len<T: Array>(a: heap::&[u8; T::LEN]) {}
 				func call(x: heap::&[u8; 3]) { of_array_len::<[u16; 3]>(x); }
 				func abstract<M: Memory, T: Array>(a: M::&[u8; T::LEN]) {}
-				trait Takes { const K: u32; func f(self: Self, a: heap::&[u8; Self::K]); }
+				trait Takes: StackValue { const K: u32; func f(self: Self, a: heap::&[u8; Self::K]); }
 				impl Takes for P { const K: u32 = 1; func f(self: Self, a: heap::&[u8; 1]) {} }
 				func qualified<T: Sized>(a: heap::&[u8; <T as Sized>::SIZE]) {}
 				func of_written(a: heap::&[u8; <[u8; 4]>::LEN]) {
@@ -5571,7 +5773,7 @@ mod tests {
 	}
 
 	#[test]
-	fn an_array_length_in_an_abstract_memory_fits_every_size() {
+	fn an_array_length_in_an_abstract_memory_is_representable_as_every_size() {
 		test_case!(
 			case = indoc! {r#"
 				func short<M: Memory>(a: M::&[u8; 5]) {}
@@ -5701,7 +5903,7 @@ mod tests {
 	fn a_function_item_is_a_zero_sized_constant() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				const ID: id<u8> = id;
 				const AGAIN: id<u8> = ID;
 				func f() -> u8 { ID(1) }
@@ -5775,14 +5977,14 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				enum E(u8) { A = 0 }
-				impl E { pub func pick<T>(t: T) -> E { E::A } }
+				impl E { pub func pick<T: StackValue>(t: T) -> E { E::A } }
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func new(x: T) -> W<T> { W(x) }
 					pub func get(self: Self) -> T { loop {} }
 					func again(x: T) -> W<T> { Self::new(x) }
 				}
-				trait Make { func make() -> Self; }
+				trait Make: StackValue { func make() -> Self; }
 				struct P();
 				impl Make for P { func make() -> Self { P() } }
 				func inherent() -> E { E::pick(True) }
@@ -5805,13 +6007,13 @@ mod tests {
 	fn a_trait_declaration_is_called_with_its_receiver_as_self() {
 		test_case!(
 			case = indoc! {"
-				trait Make {
+				trait Make: StackValue {
 					func make() -> Self;
 					func zero() -> u32 { 0 }
 				}
 				struct P();
 				impl Make for P { func make() -> Self { P() } }
-				func abstract_receiver<T: Make>() -> T { T::make() }
+				func abstract_receiver<T: StackValue + Make>() -> T { T::make() }
 				func inherited_default() -> u32 { P::zero() }
 			"}
 		);
@@ -5830,15 +6032,15 @@ mod tests {
 	fn a_bracketed_root_names_the_receiver_and_maybe_its_trait() {
 		test_case!(
 			case = indoc! {"
-				trait Make { func make() -> Self; }
-				trait Other { func make() -> Self; }
+				trait Make: StackValue { func make() -> Self; }
+				trait Other: StackValue { func make() -> Self; }
 				struct P();
 				impl Make for P { func make() -> Self { P() } }
 				impl Other for P { func make() -> Self { P() } }
 				struct W<T>(x: T);
-				impl<T> W<T> { pub func new(x: T) -> W<T> { W(x) } }
+				impl<T: StackValue> W<T> { pub func new(x: T) -> W<T> { W(x) } }
 				func qualified() -> P { <P as Make>::make() }
-				func abstract_qualified<T: Make>() -> T { <T as Make>::make() }
+				func abstract_qualified<T: StackValue + Make>() -> T { <T as Make>::make() }
 				func grouped() -> W<u8> { <W<u8>>::new(1) }
 				func ambiguous() -> P { P::make() }
 				func not_implemented() -> Bool { <Bool as Make>::make() }
@@ -5885,7 +6087,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func new(x: T) -> W<T> { W(x) }
 					pub func empty() -> W<T> { loop {} }
 					pub func of<U>() -> W<T> { loop {} }
@@ -5923,7 +6125,7 @@ mod tests {
 				trait Small {}
 				impl Small for u8 {}
 				struct B<T>(x: T);
-				impl<T: Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
+				impl<T: StackValue + Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
 				func holds(a: u8) { local b = B::new(a); }
 				func violated() { local b = B::new(True); }
 			"}
@@ -5936,11 +6138,11 @@ mod tests {
 	fn a_wrong_type_argument_count_makes_that_frame_an_error() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
-				func pair<A, B>(a: A, b: B) {}
+				func id<T: StackValue>(x: T) -> T { x }
+				func pair<A: StackValue, B: StackValue>(a: A, b: B) {}
 				func plain() {}
 				struct W<T>(x: T);
-				impl<T> W<T> { func get(self: Self) -> T { local W(x) = self; x } }
+				impl<T: StackValue> W<T> { func get(self: Self) -> T { local W(x) = self; x } }
 				func too_many() { _ = id::<u8, u16>(1); }
 				func too_few() { pair::<u8>(1, 2); }
 				func own_none() { plain::<u8>(); }
@@ -5974,7 +6176,7 @@ mod tests {
 			case = indoc! {"
 				trait Small {}
 				impl Small for u8 {}
-				func take<T: Small>(x: T) {}
+				func take<T: StackValue + Small>(x: T) {}
 				func holds(a: u8) { local g = take::<u8>; g(a); }
 				func violated() { local g = take::<Bool>; g(True); }
 			"}
@@ -5988,12 +6190,12 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					func positional(x: T) -> W<T> { Self(x) }
 					func named(x: T) -> Self { Self({ x }) }
 				}
 				struct P();
-				trait Make { func make() -> Self; }
+				trait Make: StackValue { func make() -> Self; }
 				impl Make for P { func make() -> Self { Self() } }
 			"}
 		);
@@ -6016,7 +6218,7 @@ mod tests {
 				}
 				enum E(u8) { A = 0 }
 				impl E { func variant() -> E { Self(0) } }
-				trait Tr { func make() -> Self { Self() } }
+				trait Tr: StackValue { func make() -> Self { Self() } }
 				func free() { Self(); }
 			"}
 		);
@@ -6085,18 +6287,18 @@ mod tests {
 			case = indoc! {"
 				memory heap: u32;
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func get(self: Self) -> T { loop {} }
-					pub func map<U>(self: Self, u: U) -> W<U> { W(u) }
+					pub func map<U: StackValue>(self: Self, u: U) -> W<U> { W(u) }
 					pub func by_pointer(self: heap::*Self) -> T { loop {} }
 				}
-				trait Twice { func twice(self: Self) -> Self; }
+				trait Twice: StackValue { func twice(self: Self) -> Self; }
 				impl Twice for u8 { func twice(self: Self) -> Self { self } }
 				func inherent(w: W<u8>) -> u8 { w.get() }
 				func own_args(w: W<u8>) -> W<Bool> { w.map(True) }
 				func turbofish(w: W<u8>) -> W<u16> { w.map::<u16>(1) }
 				func trait_impl(a: u8) -> u8 { a.twice() }
-				func abstract_receiver<T: Twice>(t: T) -> T { t.twice() }
+				func abstract_receiver<T: StackValue + Twice>(t: T) -> T { t.twice() }
 				func pointer(p: heap::*W<u8>) -> u8 { p.by_pointer() }
 				func reverse(o: Ordering) -> Ordering { o.reverse() }
 			"}
@@ -6182,7 +6384,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(a: u32, b: i64) -> u32 { a }
-				func id<T>(value: T, flag: Bool) -> T { value }
+				func id<T: StackValue>(value: T, flag: Bool) -> T { value }
 				func by_name() -> u32 {
 					local a: u32 = 1;
 					f({ b: 2, a })
@@ -6229,7 +6431,7 @@ mod tests {
 	fn a_call_skips_an_impl_member_of_another_kind() {
 		test_case!(
 			case = indoc! {"
-				trait Size { func size(self: Self) -> u32 { 0 } }
+				trait Size: StackValue { func size(self: Self) -> u32 { 0 } }
 				struct S();
 				impl Size for S { const size: u32 = 1; }
 				func f(s: S) -> u32 { s.size() }
@@ -6276,7 +6478,7 @@ mod tests {
 	fn every_path_to_a_known_function_can_be_called_by_name() {
 		test_case!(
 			case = indoc! {"
-				trait Make {
+				trait Make: StackValue {
 					func make(value: u32, scale: u32) -> Self;
 				}
 				struct S(n: u32);
@@ -6290,13 +6492,13 @@ mod tests {
 					}
 				}
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func new(x: T, flag: Bool) -> W<T> { W(x) }
 				}
 				func qualified() -> S {
 					<S as Make>::make({ scale: 1, value: 2 })
 				}
-				func generic<T: Make>() -> T { T::make({ scale: 1, value: 2 }) }
+				func generic<T: StackValue + Make>() -> T { T::make({ scale: 1, value: 2 }) }
 				func learned(a: u8) -> W<u8> { W::new({ flag: True, x: a }) }
 			"}
 		);
@@ -6320,7 +6522,7 @@ mod tests {
 	fn a_call_by_name_follows_the_traits_names_even_where_it_leaves_one_out() {
 		test_case!(
 			case = indoc! {"
-				trait Scale {
+				trait Scale: StackValue {
 					func scale(self: Self, u32) -> Self;
 				}
 				struct S(n: u32);
@@ -6421,9 +6623,9 @@ mod tests {
 	fn a_reported_argument_list_does_not_also_report_an_uninferred_type() {
 		test_case!(
 			case = indoc! {"
-				func pair<T>(a: T, b: T) -> T { a }
-				func none<T>(flag: Bool) -> T { loop {} }
-				func g<T>(T, b: u32) -> T { loop {} }
+				func pair<T: StackValue>(a: T, b: T) -> T { a }
+				func none<T: StackValue>(flag: Bool) -> T { loop {} }
+				func g<T: StackValue>(T, b: u32) -> T { loop {} }
 				struct W<T>(x: T, y: T);
 				func missing() { pair(1); }
 				func missing_by_name() { pair({ a: 1 }); }
@@ -6457,7 +6659,7 @@ mod tests {
 	fn an_argument_built_with_a_known_type_is_held_to_it() {
 		test_case!(
 			case = indoc! {"
-				func three<T>(a: T, b: T, c: T) -> T { a }
+				func three<T: StackValue>(a: T, b: T, c: T) -> T { a }
 				func f(x: u8, y: u16) { three(x, y, nothing); }
 			"}
 		);
@@ -7187,7 +7389,7 @@ mod tests {
 				struct Needs<P: Pointer>();
 				func concrete(a: Is<heap::&u8, heap, u8>, b: Is<heap::*(u8, u64), heap, (u8, u64)>) {}
 				func generic<M: Memory, T>(p: Is<M::*T, M, T>) {}
-				func pointee<M: Memory, T>(x: <M::&T as Pointer>::Pointee) -> T { x }
+				func pointee<M: Memory, T: StackValue>(x: <M::&T as Pointer>::Pointee) -> T { x }
 				func size<P: Pointer>(n: <P::Memory as Memory>::Size) {}
 				func element<M: Memory, S: Slice>(p: M::&<M::*S as Pointer>::Pointee) -> M::&S::Value { p[0].& }
 				func not_pointers(a: Needs<u32>, b: Needs<(heap::&u8, u8)>) {}
@@ -7197,6 +7399,35 @@ mod tests {
 			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::TraitBoundViolation,
 		]);
+	}
+
+	#[test]
+	fn pointer_metadata_keeps_recursive_slice_equalities_rigid() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				trait Tr { type Item; }
+				func direct<T: Tr where { Item = [T::Item] }>(
+					p: heap::&T::Item,
+				) -> <heap::&T::Item as Pointer>::Metadata {
+					metadata(p)
+				}
+				func mutual<
+					T: Tr where { Item = [U::Item] },
+					U: Tr where { Item = [T::Item] },
+				>(p: heap::*T::Item) -> heap::&T::Item { transmute(p) }
+				func nested<T: Tr where { Item = [[T::Item]] }>(
+					p: heap::&[T::Item],
+				) -> <heap::&[T::Item] as Pointer>::Metadata {
+					metadata(p)
+				}
+				func not_thin<T: Tr where { Item = [T::Item] }>(
+					p: heap::&T::Item,
+				) -> u32 { transmute(p) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 	}
 
 	#[test]
@@ -7213,7 +7444,11 @@ mod tests {
 					e: Is<heap::&heap::&[u8], ()>,
 				) {}
 				func memory<M: Memory>(a: Is<M::&[u8], M::Size>, b: Is<M::*u8, ()>) {}
-				func thin<M: Memory, T, A: Array>(a: Is<M::&T, ()>, b: Is<M::*A, ()>) {}
+				func thin<M: Memory, T: StackValue, A: Array>(
+					a: Is<M::&T, ()>,
+					b: Is<M::*A, ()>,
+				) {}
+				func unknown<M: Memory, T>(x: <M::&T as Pointer>::Metadata) -> () { x }
 				func rigid<M: Memory, S: Slice>(
 					x: <M::*S as Pointer>::Metadata,
 				) -> <M::&S as Pointer>::Metadata {
@@ -7222,8 +7457,12 @@ mod tests {
 				func not_thin<M: Memory, S: Slice>(x: <M::&S as Pointer>::Metadata) -> () { x }
 			"}
 		);
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+		// Neither an unbounded `T` nor a `Slice` that may not be an array is
+		// known to be thin.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
 	}
 
 	#[test]
@@ -7256,7 +7495,9 @@ mod tests {
 				func start(s: heap::&[u8]) -> u32 { address(s) }
 				func generic_address<M: Memory, T>(p: M::*T) -> M::Size { address(p) }
 				func thin(p: heap::*[u8; 4]) -> () { metadata(p) }
-				func generic_len<M: Memory, T>(s: M::&[T]) -> M::Size { metadata(s) }
+				func generic_len<M: Memory, T: StackValue>(s: M::&[T]) -> M::Size {
+					metadata(s)
+				}
 				func rebuild<P: Pointer>(p: P, at: <P::Memory as Memory>::Size) -> P {
 					from_raw_parts::<P>(at, metadata(p))
 				}
@@ -7323,7 +7564,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_slice_is_held_only_by_a_pointer() {
+	fn a_value_is_a_stack_value() {
 		test_case!(
 			case = indoc! {"
 				memory heap: u32;
@@ -7335,51 +7576,92 @@ mod tests {
 				func k<M: Memory, T: Slice>(t: T, ok: M::&T) {}
 				func l(p: heap::&[u8]) { local v: [u8; 2] = trap(); }
 				func m<M: Memory, T>(t: T, p: M::&[T], q: M::*[T; 3], r: ([u8])) {}
+				func n() -> S { trap() }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::SliceByValue,
-			DiagnosticCode::SliceByValue,
-			DiagnosticCode::SliceByValue,
-			DiagnosticCode::SliceByValue,
-			DiagnosticCode::SliceByValue,
-			DiagnosticCode::SliceByValue,
-			DiagnosticCode::SliceByValue,
-			DiagnosticCode::SliceByValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
 		]);
-		case.diagnostics()
-			.assert_error_saying("hold it through a pointer, as `M::&[u8]`");
 		case.diagnostics().assert_error_saying(
-			"`T` is bounded by `Slice`, so it stands for a slice or an array",
+			"`[u8]` is a slice, which only a pointer holds, as `M::&[u8]`",
+		);
+		case.diagnostics().assert_error_saying(
+			"`T` is not known to be a `StackValue`: require `T: StackValue`",
+		);
+		case.diagnostics().assert_error_saying(
+			"`S` cannot be held by value, since it holds `[u8; 4]`",
 		);
 	}
 
+	/// A field, a tuple's element and a type argument need nothing: what holds
+	/// them by value states what it needs.
 	#[test]
-	fn only_a_parameter_bounded_by_slice_stands_for_a_slice() {
+	fn a_type_argument_may_be_a_slice() {
 		test_case!(
 			case = indoc! {"
 				memory heap: u32;
 				struct Box<T>(p: heap::*T);
+				struct Header(len: u32, data: [u8; 16]);
 				func id<M: Memory, T>(p: M::&T) -> M::&T { p }
 				func len<M: Memory, S: Slice>(p: M::&S) -> M::Size { p.len() }
 				func of_array<A: Array>() {}
-				func f(s: heap::&[u8], b: Box<[u8]>) {
+				func value<T: StackValue>() {}
+				func f(s: heap::&[u8], b: Box<[u8]>, h: heap::&Header) {
 					local p = id(s);
 					local n = len(s);
+					local b: Box<[u8]> = Box(b.p);
 					of_array::<[u8; 2]>();
 					of_array::<[u8]>();
+					value::<[u8]>();
 					local z = size_of::<[u8], heap>();
 				}
 			"}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::SliceArgument,
-			DiagnosticCode::SliceArgument,
 			DiagnosticCode::TraitBoundViolation,
-			DiagnosticCode::SliceArgument,
+			DiagnosticCode::TraitBoundViolation,
 		]);
+	}
+
+	#[test]
+	fn a_load_reads_a_stack_value() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f<M: Memory, T>(p: M::&T) { local x = p.*; }
+				func g<M: Memory, T: StackValue>(p: M::&T) -> T { p.* }
+				func h(p: heap::&[u8; 2]) { local x = p.*; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+		]);
+	}
+
+	/// An abstract pointee is thin when it is a `StackValue`, which holds no
+	/// slice; otherwise its pointer's metadata is unknown.
+	#[test]
+	fn a_pointer_to_an_unbounded_parameter_may_be_fat() {
+		test_case!(
+			case = indoc! {"
+				func thin<M: Memory, T: StackValue>(p: M::&T) -> M::Size {
+					transmute(p)
+				}
+				func fat<M: Memory, T>(p: M::&T) -> M::Size { transmute(p) }
+				func any<M: Memory, T>(p: M::&T) -> M::&T { p }
+			"}
+		);
 		case.diagnostics()
-			.assert_error_saying("the slice `[u8]` cannot stand for `T`");
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 	}
 
 	#[test]
@@ -7447,7 +7729,12 @@ mod tests {
 					a[2] += 1;
 					local r: heap::&u8 = m[0][1].&;
 				}
-				func g<M: Memory, S: Slice>(s: M::&S, i: M::Size) -> S::Value { s[i] }
+				func g<M: Memory, S: Slice where { Value: StackValue }>(
+					s: M::&S,
+					i: M::Size,
+				) -> S::Value {
+					s[i]
+				}
 			"}
 		);
 		case.diagnostics().assert_none();

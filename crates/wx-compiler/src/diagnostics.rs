@@ -250,9 +250,11 @@ define_diagnostic_codes! {
 		NotALiteralKind => "E2126",
 		LiteralKindWithoutBraces => "E2127",
 		MisplacedLiteralKind => "E2128",
-		SliceByValue => "E2129",
-		SliceArgument => "E2130",
+		NotStackValue => "E2129",
 		MisplacedSelfBound => "E2131",
+		UnassumableEquality => "E2132",
+		UnrepresentableConstant => "E2133",
+		TypedConstantBound => "E2134",
 	}
 }
 

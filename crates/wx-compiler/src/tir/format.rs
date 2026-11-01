@@ -94,19 +94,35 @@ impl BoundFormatter<'_> {
 			if i > 0 {
 				f.push_str(", ");
 			}
-			let symbol = self.type_formatter.defs.assoc_types
-				[usize::from(binding.target.assoc_type_index)]
-			.name
-			.inner;
-			f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
+			let defs = self.type_formatter.defs;
+			let name =
+				|symbol| self.type_formatter.strings.resolve(symbol).unwrap();
 			match &binding.kind {
-				BindingRequirement::Equals(ty) => {
+				BindingRequirement::Equals(target, ty) => {
+					f.push_str(name(
+						defs.assoc_types[usize::from(target.assoc_type_index)]
+							.name
+							.inner,
+					));
 					f.push_str(" = ");
 					self.type_formatter.write_type(f, ty.inner);
 				}
-				BindingRequirement::Bound(bounds) => {
+				BindingRequirement::Bound(target, bounds) => {
+					f.push_str(name(
+						defs.assoc_types[usize::from(target.assoc_type_index)]
+							.name
+							.inner,
+					));
 					f.push_str(": ");
 					self.write_bounds(f, bounds);
+				}
+				BindingRequirement::Representable(target, ty) => {
+					f.push_str("const ");
+					f.push_str(name(
+						defs.constants[usize::from(target.constant)].name.inner,
+					));
+					f.push_str(": ");
+					self.type_formatter.write_type(f, ty.inner);
 				}
 			}
 		}
@@ -541,8 +557,9 @@ mod tests {
 				.iter()
 				.flat_map(|&id| self.bounds.get(id).bindings.iter())
 				.flat_map(|binding| match &binding.kind {
-					BindingRequirement::Bound(nested) => nested.to_vec(),
-					BindingRequirement::Equals(_) => Vec::new(),
+					BindingRequirement::Bound(_, nested) => nested.to_vec(),
+					BindingRequirement::Equals(..)
+					| BindingRequirement::Representable(..) => Vec::new(),
 				})
 				.collect();
 			written

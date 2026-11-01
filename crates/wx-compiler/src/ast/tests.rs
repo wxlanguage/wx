@@ -2964,7 +2964,10 @@ fn a_constant_binding_is_marked_const() {
 			&bindings[0].kind
 		})
 		.collect();
-	assert!(matches!(kinds[0], AssocBindingKind::ConstFits { .. }));
+	assert!(matches!(
+		kinds[0],
+		AssocBindingKind::ConstRepresentable { .. }
+	));
 	assert!(matches!(
 		kinds[1],
 		AssocBindingKind::ConstEquals {

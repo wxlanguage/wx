@@ -1,16 +1,15 @@
-# Slices, untyped constants and fit clauses
+# Slices, untyped constants and representability clauses
 
-Status as of 2026-10-30, branch `tir-refactor`: steps 1–4 done, step 6 (fit
-clauses) in part (see "Order of work"), the rest designed, not implemented.
-Settled in discussion on 2026-10-30; "Values are `StackValue`s" replaces the
-`Slice`-bound rule (planned, outline decided, its "Open" points not). Linked
-changes:
+Status as of 2026-11-01: steps 1–6 done (see "Order of work"), the rest
+designed, not implemented. Settled in discussion on 2026-10-30; "Values are
+`StackValue`s" (implemented 2026-11-01) replaced the `Slice`-bound rule.
+Linked changes:
 
 1. `[T]` and `[T; N]` become types of their own, a slice and an array: what a
    pointer points at, with no memory.
 2. A length is a count: it has no machine type until it meets a memory.
 3. A constant may be untyped, `const X: {integer} = 4;`, used like a literal.
-4. An abstract constant's fit is stated in a bound,
+4. An abstract constant's representability is stated in a bound,
    `T: Array where { const LEN: u8 }`.
 5. Array and string literals are arrays (`[{integer}; 3]`, `[u8; 5]`),
    placed in a memory when coerced to a pointer; `{array}` and `{string}` go.
@@ -61,25 +60,13 @@ After it:
   indices or an O(N) dispatch per access. Native compilers keep "stack" arrays
   in a shadow stack in linear memory; wx has no ambient memory, so that is an
   `M::*[T; N]` from an allocator.
-- A type held by value (a parameter, a result, a field, a local or an
-  ascription, a tuple's element, a function type's parameter or result) is
-  neither, nor a parameter that may stand for one: E2129 (`SliceByValue`),
-  recorded as `TypeObligation::CheckValueType` where the type is lowered. A
-  constant's declared type, a type alias, a qualified path's root
-  (`<[u8; 4] as Array>::LEN`) and a type argument are not by-value positions.
-- Only a parameter bounded by `Slice` stands for a slice or an array: an
-  argument that is one, for any other parameter, is E2130 (`SliceArgument`),
-  checked with the parameter's other bounds (`check_bound_requirements`). So
-  `Box<[u8]>`, `id::<[u8]>` and `size_of::<[u8], heap>()` are refused where
-  they are written, never after monomorphization. Since every slice and array
-  is a `Slice` and nothing else is, `S: Slice` narrows `S` as any bound
-  narrows: an unbounded `T` ranges over everything else, with no implicit
-  bound and no relaxing `?Sized`. The cost: no one parameter ranges over both
-  (`Box<M, T>` and a `SliceBox<M, S: Slice>` are two types). Rust needs
-  `?Sized` mostly for `dyn Trait` and `str`, which wx does not have. When
-  `Sized` exists, a parameter bounded by it may stand for an array too
-  (`Layout::of::<[u8; 16]>()`). This rule is what is implemented; it is to
-  be replaced, see "Values are `StackValue`s".
+- A type held by value (a parameter, a result, a function type's parameter
+  or result, a local, an ascription) is a `StackValue`, which no slice or
+  array is, nor anything holding one: E2129 (`NotStackValue`), recorded as
+  `TypeObligation::CheckValueType` where the type is lowered. A field, a
+  tuple's element, a type argument, a constant's declared type, a type alias
+  and a qualified path's root (`<[u8; 4] as Array>::LEN`) need nothing. See
+  "Values are `StackValue`s".
 - `[T]` and `[T; N]` will be well-formed only when `T: Sized` (see "Sized").
 - One place rule covers fields and elements: each place step goes through at
   most one pointer, so `p.field` is `p.*.field` and `s[i]` is `s.*[i]`.
@@ -150,12 +137,15 @@ free (see "Values are `StackValue`s"); the literal half stays.
 Inside a constant's declared type neither half applies: a constant may be
 `{integer}`, `[u8; 5]` or (later) `[{integer}; 3]`.
 
-## Values are `StackValue`s (planned, replaces the `Slice`-bound rule)
+## Values are `StackValue`s (implemented)
 
-Decided on 2026-10-30 in outline; not implemented, except `!` (below). It
-replaces E2129's slice check and E2130, which are what the code does today.
+Decided on 2026-10-30, implemented on 2026-11-01. It replaced E2129's slice
+check and E2130 (`SliceArgument`, removed), the `Slice`-bound rule below.
 
-### What is weak in the current rule
+### What was weak in the `Slice`-bound rule
+
+Only a parameter bounded by `Slice` stood for a slice or an array (E2130),
+and a slice or an array held by value was E2129.
 
 The `Slice` bound does two jobs: it says a type has elements, and it is the
 only way a parameter may stand for something not held by value.
@@ -234,10 +224,45 @@ struct Box<M: Memory, T>(p: M::*T);       // holds u32, [u8], later dyn alike
   and left out: for `x: Wrap<T>` they need `T: StackValue` derived backwards
   from `Wrap<T>: StackValue`, which the solver does not do. Adding them later
   only relaxes the rule.
-- E2129 becomes "this position needs a `StackValue`", answered by the
-  solver; E2130 and `may_be_slice` go, `id::<[u8]>` being an unmet bound of
+- E2129 is "this position needs a `StackValue`", answered by the solver;
+  E2130 and `may_be_slice` are gone, `id::<[u8]>` being an unmet bound of
   `id`'s own. `Slice` means only "has elements".
 - `dyn Tr` would be one more type that is neither, plus its pointer's shape.
+
+### As implemented
+
+- `Solver::non_stack_part` is the judgement: `push_stack_elements`, the walk
+  `StackValue` is answered by, returns the part that makes a type no
+  `StackValue` (a slice, an array, or an abstract part not assumed one), and
+  E2129 names it: "`Header` cannot be held by value, since it holds
+  `[u8; 16]`", with the suggestion `require T: StackValue` for an abstract
+  part. The walk normalizes `Deep`, as a declaration's other checks do, so a
+  loop through an equality (`First = (T::First, T::First)`) stays the rigid
+  projection instead of unfolding a step at a time, and keeps the structs on
+  its path, so a struct containing itself is poisoned (E2032 reports it)
+  rather than overflowing.
+- Signatures record `CheckValueType` for parameters, results, a function
+  type's parts, and a local's or an ascription's written type. Two values
+  are made with no written type, and are checked on the spot in the body
+  (`held_by_value`), the value typed `ERROR` when it fails, so nothing
+  downstream reports again: a construction (its fields need nothing, the
+  struct made of them does) and a load (`p.*`, `s[i]`, `p.field` read as a
+  value).
+- Thinness without `Sized`: an abstract pointee is thin when it is assumed a
+  `StackValue` (nothing that is one holds a slice by value) or an `Array`;
+  otherwise its metadata is the rigid `<M::&T as Pointer>::Metadata`. So an
+  unbounded `T` gives a pointer of unknown shape, and generic code that
+  treats `M::*T` as an address bounds `T: StackValue` until `Sized` comes
+  (step 7), which will add "assumed `Sized`" to the same rule.
+- std: a trait whose functions take `Self` by value has `StackValue` as a
+  supertrait (the operator traits, `UnsignedInt`/`SignedInt`, `Global`,
+  `Memory`, `Call`, whose `Args` and `Result` are bounded too); the address
+  helpers (`slice_from_parts`, `array_from_ref`, `allocate_value`,
+  `RawPtr::from_ref`, …) bound their element `T: StackValue`, `Array::as_slice`
+  its `Value`. Those element bounds are `Sized`'s job and move to it.
+- A typeset implies `StackValue` only when it says so
+  (`typeset PointerSize: … + StackValue`): the solver does not derive a
+  trait from every member of the set having it.
 
 ### `!` (implemented)
 
@@ -299,9 +324,9 @@ pointee:
 /// is not known in this scope.
 fn pointer_metadata(
     &mut self,
-    assumption_context: TypeEnvIdx,
+    assumption_context: AssumptionEnvIdx,
     pointee: TypeIndex,
-    size: TypeIndex,
+    memory: TypeIndex,
 ) -> Result<Option<TypeIndex>, SolverError>
 ```
 
@@ -340,9 +365,9 @@ rectangular: every element shares the one inner metadata.
   make each caller repeat the walk.
 - `pointer_metadata`'s `None` is that projection, `<M::&T as
   Pointer>::Metadata`, rigid until `T` is known, as `T::Item` is (see "The
-  `Pointer` trait"). `pointer_metadata_value` builds it, over the shared
-  pointer, for the solver and the representation; a layout and an
-  evaluation read `None` as unknown, never thin.
+  `Pointer` trait"). `pointer_metadata_value` normalizes that projection,
+  over the shared pointer, for the solver and the representation; a layout
+  and an evaluation read `None` as unknown, never thin.
 
 **Layouts are expressions** over that metadata (see "Sized"). A field's
 offset is one too. Since wx orders fields itself, a struct places its sized
@@ -370,10 +395,18 @@ pub trait Pointer: StackValue where {
 
 - The solver answers it from the pointer's structure
   (`TraitImplLookup::Builtin`, as `StackValue`'s): `Memory` and `Pointee`
-  read off the type, `Metadata` is `pointer_metadata(pointee, size)`. Over
+  read off the type, `Metadata` is `pointer_metadata(pointee, memory)`. Over
   a pointee of unknown shape `Metadata` stays the rigid projection
   `<M::&T as Pointer>::Metadata`; over a concrete pointee in an abstract
   memory it reduces (`<M::&[u8] as Pointer>::Metadata` is `M::Size`).
+- Metadata requests use the ordinary projection-normalization pipeline:
+  `pointer_metadata_value` forms `<M::&T as Pointer>::Metadata` and calls
+  `normalize`; its builtin reduction calls `compute_pointer_metadata`.
+  A slice's element metadata is another projection query, so the existing
+  solver frames, recursion budget, equality rollback and cache cover the
+  whole computation. The pointee is normalized deeply: a looping equality
+  such as `T::Item = [T::Item]` stays rigid instead of unfolding afresh at
+  each slice element. `Pointer::Metadata` must be present when this query runs.
 - The metadata depends on the pointee and the memory, and a pointer type is
   exactly that pair, so this is a plain associated type: no generic trait,
   no generic associated type. It is the pattern the rigid
@@ -442,13 +475,13 @@ A length (`Type::Value { bits }`) is a natural number. It has no type of its
 own:
 
 - `[T; N]` is well-formed for any `N`.
-- `M::&[T; N]` is well-formed only when `N` fits `M::Size`: `CheckConstantFits`
-  is recorded by the pointer, not the array (`length_fits`), a concrete
+- `M::&[T; N]` is well-formed only when `N` fits `M::Size`: `CheckConstantRepresentable`
+  is recorded by the pointer, not the array (`length_representable`), a concrete
   `Size`'s range (E2004), or every member of the typesets an abstract `Size`
   is bounded by (`PointerSize`, so `u32`; E2047). It may later tighten to
   `<[T; N] as Sized>::SIZE`, the real addressing limit. A pointer type made by
   substitution (`M::&S` with `S = [u8; N]`) is not checked again: see the
-  open point under "Fit clauses".
+  open point under "Representability clauses".
 - At runtime a count is only ever read through a pointer, where it has the
   type `M::Size`: `len<M>(self: M::&Self) -> M::Size` returns the fat
   pointer's length or `N`.
@@ -576,57 +609,67 @@ const P: ({integer}, {integer}) = (1, 2);
   fits" relaxation declined on 2026-10-25.
 - A trait constant may be untyped. Done for the compiler's `Array::LEN`: over
   a concrete array its use reads the length (`untyped_value`, through
-  `resolve_constant`); over an abstract one it needs a fit clause, reported as
-  not supported yet (E2114) until step 6. Not done: an impl's member of an
+  `resolve_constant`); over an abstract one it needs a representability clause
+  (E2133 without one). Not done: an impl's member of an
   untyped trait constant (conformance: it has the declaration's kind).
 
-## Fit clauses
+## Representability clauses (done)
+
+Named after Go's spec ("a constant x is representable by a value of type
+T"): an untyped constant is *representable as* a type when the type's range
+holds its value, so a use can give it that type. This was called "fit" until
+2026-11-01, literals' checks included (`CheckConstantRepresentable`,
+`ExprObligation::Representable`).
 
 An abstract constant (`<T as Array>::LEN` with `T` abstract) has no value in
-a generic body, so its fit cannot be checked there. Checking it after
-monomorphization would be the first check in the language deferred that far;
-instead the fit is stated in the signature, next to trait and equality
-clauses:
+a generic body. Checking it after monomorphization would be the first check
+in the language deferred that far; instead the signature states it, next to
+trait and equality clauses:
 
 ```wx
 func f<T: Array>() -> u8 { T::LEN }                          // error
 func f<T: Array where { const LEN: u8 }>() -> u8 { T::LEN }  // fine
 ```
 
-- The first is reported in the body, at the coercion, as an unmet bound is
-  ("`T::LEN` may not fit in `u8`", with the clause as the suggestion), like
-  `x + x` on an unbounded `T` is E2063. The body checks against the
-  signature, never against instantiations.
-- The return type is `u8`. A constant is not a type: no singleton types.
-- A third clause kind, `FitClause { constant, ty }`, beside `TraitClause`
-  and `EqualityClause`, published and read the same way. A fit about a type
-  the function does not declare (`Array::as_slice`'s `LEN` against
-  `M::Size`) is written on `Self` as the function's first parameter
-  (`Self: Array where { const LEN: M::Size }`) and needs clauses owned by a
-  scope rather than a parameter: `tir-assumption-env-plan.md`, whose last
-  step this is.
+- It is a bound, not a type: the clause states a fact about the value (its
+  range), and each use still gives the constant its type, as a literal's
+  context does. A failure is an unmet bound, not a type mismatch: E2133,
+  "constant `<T as Array>::LEN` cannot be represented as `u8`", at the use in
+  a body or at the argument of a call, with the clause to write as a note. A
+  known value says it in the label ("its value `256` is out of range").
+  Literals say the same ("literal `300` cannot be represented as `u8`",
+  E2004).
+- `Clause::Representable(RepresentableClause)`, beside `Trait` and
+  `Equality`, published in the final stage (its type may name siblings,
+  `const LEN: Mem::Size`), inherited from a supertrait's bound. A clause about
+  a type the function does not declare (`Array::as_slice`'s `LEN` against
+  `Mem::Size`) is written on `Self` as the function's first parameter.
   `Solver::satisfies_clauses` proves it at a use: a concrete argument by
-  evaluating the constant and running the fit check; an abstract one from the
-  caller's own fit clauses.
-- One fit implies another: fitting `u8` gives `u16`, `u32`, `u64`, `i16`,
-  `i32`, `i64`, but not `i8`. This is the solver's first judgement that is not
-  an equality.
-- `where { const LEN: M::Size }` means fitting every member of the typesets
-  bounding `Size`, as `CheckConstantFits` reads an abstract memory.
+  evaluating the constant, an abstract one from the caller's own clauses
+  (`assumed_representable`).
+- One implies another by range containment: `u8` gives `u16`, `i32`,
+  `M::Size`, not `i8`; `M::Size` (every member of the typesets bounding it,
+  `u32` and `u64`) gives `u32`, not `u16`. The solver's first judgement that
+  is not an equality.
 - Clauses are written, never implied by the types in a signature (the
   2026-10-17 rule: no implied bounds).
-- An abstract constant coerces to a type its fit clause covers and nowhere
-  else, and it stays untyped under the clause: the clause does not decide the
-  type of every use.
-- A constant's entry always starts with `const`, so it parses apart from a
-  type's: `const LEN: u8` is a fit, `const LEN = 4` a constant equality
-  (rustc's `ConstEquate`), parsed but reported unsupported until needed.
-- Open: a pointer to an abstract count, `M::&[u8; T::LEN]`, needs
-  `T::LEN` to fit `M::Size` for well-formedness. Either the signature writes
-  the fit clause, or the obligation is proved where the signature is
-  instantiated (the substituted pointer type must be well-formed at the
-  call). The second is how `M::&S` with `S: Array` already has to work: a
-  caller cannot name `heap::&[u8; 2^40]` because that type is ill-formed.
+- A bound never states a constant's type. A constant's type is its
+  declaration's (and the associated types it names); the one thing a bound
+  says about a constant is representability, which means something only for
+  an untyped one, the one kind whose type is open. A type fact about a
+  constant is an equality on an associated type (`type F: Call; const FN:
+  Self::F;` with `where { F = func() -> i32 }`). A generic constant (`const
+  N<S: PointerSize>: S`) is typed per instance, and its value is checked
+  against every member once, at the definition.
+- A representability clause on a *typed* constant is E2134
+  (`TypedConstantBound`), reported where the entry is lowered, pointing at
+  the declared type; no clause is built.
+- `const LEN = 4` (a value, rustc's `ConstEquate`) is parsed and reported
+  unsupported (E2114).
+- Open: a pointer to an abstract count, `M::&[u8; T::LEN]`, needs `T::LEN`
+  representable as `M::Size` for well-formedness. Either the signature writes
+  the clause, or the obligation is proved where the signature is
+  instantiated, as `M::&S` with `S: Array` already has to work.
 
 ## Sized
 
@@ -750,7 +793,7 @@ Mem::Size }`. At a call:
 - `Layout::<heap>::of::<[u8]>()` and `Layout::<heap>::of::<func(u32) ->
   u32>()` are an unmet bound (E2063).
 - `Layout::<heap32>::of::<[u8; 1 << 33]>()` names a well-formed, `Sized` type
-  whose `SIZE` does not fit `u32`: the fit clause fails at the call, where
+  whose `SIZE` does not fit `u32`: the representability clause fails at the call, where
   allocating it in a 32-bit memory is what is wrong.
 
 ## Generic constants (later, separate)
@@ -786,20 +829,19 @@ Each step ends with tests green.
    pseudo-types deleted.
 4. Done (2026-10-30), with step 3, which needed it: indexing as a built-in
    place, with std's `index`/`index_mut`/`first_mut`/`last_mut` removed.
-5. Values are `StackValue`s: value positions (parameters, results, function
-   types' parts, locals, ascriptions) proved `StackValue` by declared bounds,
+5. Done (2026-11-01). Values are `StackValue`s: value positions
+   (parameters, results, function types' parts, locals, ascriptions, and a
+   construction's or a load's value) proved `StackValue` by declared bounds,
    with a suggestion to add the bound; fields, tuple elements and type
    arguments free (see "Unsized fields"); a pointer's representation from
    its pointee's metadata (done 2026-10-31: `pointer_metadata` replacing
    `is_fat_pointee`, std's `Pointer` trait answered structurally, its rigid
    `Metadata` making a pointer to an unknown shape a `StackValue`,
-   `from_raw_parts`/`metadata`/`address` in std); E2130 and
-   `may_be_slice` removed,
-   E2129 reworded; a pointer to a pointee of unknown shape held as a rigid
-   `Repr`; std's
-   generic functions given `T: StackValue`. Needs nothing new. Done ahead of
-   it: `!` held as `!`.
-6. Fit clauses: the `where { const NAME: ty }` syntax, `FitClause`, the
+   `from_raw_parts`/`metadata`/`address` in std); E2130 and `may_be_slice`
+   removed, E2129 reworded; an abstract pointee thin only when assumed a
+   `StackValue` or an `Array`; std's traits and generic functions given
+   `StackValue` bounds. Done ahead of it: `!` held as `!`.
+6. Representability clauses (done): the `where { const NAME: ty }` syntax, `RepresentableClause`, the
    solver's case and implication between fits, coercion of abstract
    constants, untyped trait constants in impls. Done ahead of it: an untyped
    trait constant (`Array::LEN`) and its use over a concrete type.

@@ -14,7 +14,10 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::{AssumptionEnvIdx, BoundId};
+use super::bounds::{
+	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
+	RepresentableClause, TraitClause,
+};
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{BindingKey, DefKind, DefinitionRegistry, TraitIdx};
@@ -40,13 +43,13 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn record_bounds_check(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
-		assumption_context: AssumptionEnvIdx,
+		frame: GenericEnvIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
 		owner: GenericEnvOwner,
 	) {
 		obligations.push(TypeObligation::CheckBounds {
-			assumption_context,
+			frame,
 			requirements,
 			reference,
 			owner,
@@ -92,7 +95,7 @@ impl TypeContext<'_, '_, '_> {
 			.push(parents.chain(args.iter().copied().zip(written)));
 		self.record_bounds_check(
 			obligations,
-			scope.assumption_env,
+			scope.generic_env,
 			BoundRequirements::Frame {
 				env: params_env,
 				args: generic_args,
@@ -130,6 +133,275 @@ impl TypeContext<'_, '_, '_> {
 
 /// The checks bound satisfaction owns, run by the declaration check.
 impl TypeContext<'_, '_, '_> {
+	/// Completes `frame`'s env with what its `Self` entry, `clauses` about a
+	/// trait impl's target, means (`normalize_clauses`). What is not about an
+	/// abstract type is proved there and dropped. One that does not hold is
+	/// reported at its bound: an error without a parameter (`Bytes: Show`
+	/// never holds), and unsupported with one (`Wrap<T>: Show` would be an
+	/// assumption about a type that is not abstract, which lookup never
+	/// reads).
+	pub(super) fn normalize_self_entry(
+		&mut self,
+		frame: GenericEnvIdx,
+		clauses: BoundClauses,
+	) -> Result<(), SolverError> {
+		let env = self.assumption_envs.of_frame(frame);
+		let (assumed, proved) = self.normalize_clauses(env, clauses)?;
+		let arguments: Box<[TypeIndex]> =
+			self.generic_envs.identity_args(frame).into();
+		let mut failures = Vec::new();
+		self.satisfies_clauses(
+			env,
+			proved,
+			Subjects::All,
+			(frame, &arguments),
+			Some(&mut failures),
+			None,
+		)?;
+		let owner = self.generic_envs.owner(frame);
+		for failure in failures {
+			let diagnostic = match failure {
+				UnsatisfiedClause::Trait {
+					subject,
+					reduced,
+					trait_index,
+					source,
+					..
+				} => {
+					let at = self.bounds.span(source);
+					if self.types.has_param(reduced) {
+						let trait_name = self.defs.traits
+							[usize::from(trait_index)]
+						.name
+						.inner;
+						let clause = format!(
+							"{}: {}",
+							self.type_formatter().display_type(reduced),
+							self.strings.resolve(trait_name).unwrap()
+						);
+						report_unassumable_clause(at, &clause)
+					} else {
+						self.report_trait_bound_violation(
+							at.file_id,
+							Spanned {
+								inner: (subject, reduced),
+								span: at.span,
+							},
+							trait_index,
+							source,
+							owner,
+						)
+					}
+				}
+				UnsatisfiedClause::Equality {
+					projection,
+					required,
+					found,
+					expected,
+					source,
+					..
+				} => {
+					let at = self.binding_span(source);
+					if self.types.has_param(found)
+						|| self.types.has_param(expected)
+					{
+						self.report_unassumable_equality(
+							at, projection, found, expected,
+						)
+					} else {
+						self.report_equality_mismatch(
+							at,
+							(projection, required),
+							found,
+							expected,
+							source,
+							owner,
+						)
+					}
+				}
+				UnsatisfiedClause::Representable {
+					subject,
+					constant,
+					ty,
+					value,
+					source,
+					..
+				} => {
+					let at = self.binding_span(source);
+					match value {
+						Some(_) => self.report_unrepresentable_constant(
+							at,
+							(subject, constant),
+							ty,
+							value,
+							None,
+						),
+						None => {
+							let read =
+								self.types.intern_const(constant, &[subject]);
+							let formatter = self.type_formatter();
+							let clause = format!(
+								"{} is representable as {}",
+								formatter.display_type(read),
+								formatter.display_type(ty)
+							);
+							report_unassumable_clause(at, &clause)
+						}
+					}
+				}
+			};
+			self.diagnostics.push(diagnostic);
+		}
+
+		if !assumed.is_empty() {
+			let completed = self.assumption_envs.push(env, None);
+			*self.assumption_envs.clauses_mut(completed) = assumed;
+			self.assumption_envs.complete_frame(frame, completed);
+		}
+		Ok(())
+	}
+
+	/// An equality a `Self` entry states that holds only for some of the
+	/// impl's arguments (`Item = u8` where `Item` is `T`): assuming it would
+	/// make a parameter equal a type, which no assumption can state.
+	fn report_unassumable_equality(
+		&self,
+		at: SourceSpan,
+		projection: TypeIndex,
+		found: TypeIndex,
+		expected: TypeIndex,
+	) -> Diagnostic<FileId> {
+		let formatter = self.type_formatter();
+		let (projection, found, expected) = (
+			formatter.display_type(projection),
+			formatter.display_type(found),
+			formatter.display_type(expected),
+		);
+		Diagnostic::error()
+			.with_code(DiagnosticCode::UnassumableEquality.code())
+			.with_message(format!(
+				"`{projection}` is `{found}`, which a bound cannot require to \
+				 be `{expected}`"
+			))
+			.with_label(
+				at.primary_label().with_message(format!(
+					"would require `{found} == {expected}`"
+				)),
+			)
+			.with_note(
+				"an equality is assumed only about an associated type of a \
+				 parameter (`T::Item = u8`), never about a parameter itself",
+			)
+	}
+
+	/// Where the equality or representability clause `source` is written: from
+	/// its name to its value or type (`Item = u8`, `LEN: u8`).
+	pub(super) fn binding_span(&self, source: BindingRef) -> SourceSpan {
+		let binding = self.bounds.binding(source);
+		let (BindingRequirement::Equals(_, value)
+		| BindingRequirement::Representable(_, value)) = &binding.kind
+		else {
+			unreachable!(
+				"an equality's or a representability clause's binding states a type"
+			)
+		};
+		SourceSpan::new(
+			self.bounds.span(source.bound).file_id,
+			TextSpan::new(binding.name.span.start, value.span.end),
+		)
+	}
+
+	/// `clauses`, about types (a `Self` entry's, read in a trait impl),
+	/// normalized in `env`: those that now read about an abstract type, as
+	/// they read, which is what assuming them means; then the rest, as
+	/// written, which holds or not of its own and assumes nothing.
+	pub(super) fn normalize_clauses(
+		&mut self,
+		env: AssumptionEnvIdx,
+		clauses: BoundClauses,
+	) -> Result<(BoundClauses, BoundClauses), SolverError> {
+		let Some(range) = clauses.final_range() else {
+			unreachable!("normalized clauses are final")
+		};
+		let (mut assumed, mut other) = (Vec::new(), Vec::new());
+		// Read one clause at a time: normalizing interns, and the arena only
+		// grows, so the range stays valid.
+		for at in 0..range.len() {
+			let clause = self.clauses.get(range)[at];
+			let normalized = match clause {
+				Clause::Trait(clause) => {
+					let subject = self.normalize(
+						env,
+						clause.subject,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					self.types.is_abstract(subject).then_some(Clause::Trait(
+						TraitClause { subject, ..clause },
+					))
+				}
+				Clause::Equality(clause) => {
+					let projection = self.normalize(
+						env,
+						clause.projection,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					if matches!(
+						self.types.resolve(projection),
+						Type::TypeProjection { .. }
+					) && self.types.is_abstract(projection)
+					{
+						let value = self.normalize(
+							env,
+							clause.value,
+							NormalizationDepth::Deep,
+							RewriteFlags::ALL,
+						)?;
+						Some(Clause::Equality(EqualityClause {
+							projection,
+							value,
+							..clause
+						}))
+					} else {
+						None
+					}
+				}
+				Clause::Representable(clause) => {
+					let subject = self.normalize(
+						env,
+						clause.subject,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					if self.types.is_abstract(subject) {
+						let ty = self.normalize(
+							env,
+							clause.ty,
+							NormalizationDepth::Deep,
+							RewriteFlags::ALL,
+						)?;
+						Some(Clause::Representable(RepresentableClause {
+							subject,
+							ty,
+							..clause
+						}))
+					} else {
+						None
+					}
+				}
+			};
+			match normalized {
+				Some(normalized) => assumed.push(normalized),
+				None => other.push(clause),
+			}
+		}
+		Ok((
+			BoundClauses::Final(self.clauses.push(&assumed)),
+			BoundClauses::Final(self.clauses.push(&other)),
+		))
+	}
+
 	/// Gather violations before emitting them: another requirement can still
 	/// be pending, and a retry must not duplicate a diagnostic.
 	pub(super) fn check_bound_requirements(
@@ -144,25 +416,12 @@ impl TypeContext<'_, '_, '_> {
 		// The arguments are owned: the proof interns while it reads them.
 		let (clauses, subjects, frame, arguments): (_, _, _, Box<[TypeIndex]>) =
 			match requirements {
-				BoundRequirements::Frame { env, args } => {
-					self.check_slice_arguments(
-						assumption_context,
-						env,
-						args,
-						reference.file_id,
-					)?;
-					let Some(own) =
-						self.assumption_envs.own(&self.generic_envs, env)
-					else {
-						return Ok(());
-					};
-					(
-						self.assumption_envs.clauses(own),
-						Subjects::All,
-						env,
-						self.generic_args.types(args).into(),
-					)
-				}
+				BoundRequirements::Frame { env, args } => (
+					self.assumption_envs.requirements(env),
+					Subjects::All,
+					env,
+					self.generic_args.types(args).into(),
+				),
 				BoundRequirements::AssociatedType {
 					declaration,
 					trait_index,
@@ -242,6 +501,20 @@ impl TypeContext<'_, '_, '_> {
 					source,
 					owner,
 				),
+				UnsatisfiedClause::Representable {
+					subject,
+					constant,
+					ty,
+					value,
+					source,
+					..
+				} => self.report_unrepresentable_constant(
+					SourceSpan::new(reference.file_id, at),
+					(subject, constant),
+					ty,
+					value,
+					Some((source, owner)),
+				),
 			};
 			self.diagnostics.push(diagnostic);
 		}
@@ -267,60 +540,6 @@ impl TypeContext<'_, '_, '_> {
 		};
 		let slot = self.generic_envs.parent_count(env) + param_index as usize;
 		Some(self.generic_args.spans(args)[slot])
-	}
-
-	/// Reports each of `env`'s own parameters that `args` gives a slice or
-	/// an array for, which only a parameter bounded by `Slice` stands for.
-	fn check_slice_arguments(
-		&mut self,
-		assumption_context: AssumptionEnvIdx,
-		env: GenericEnvIdx,
-		args: GenericArgs,
-		file_id: FileId,
-	) -> Result<(), SolverError> {
-		let start = self.generic_envs.parent_count(env);
-		let mut reported = false;
-		for index in 0..self.generic_envs.param_names(env).len() {
-			let argument = self.generic_args.types(args)[start + index];
-			let param = self.generic_envs.param_types(env)[index];
-			if !self.may_be_slice(assumption_context, argument)?
-				|| self
-					.may_be_slice(self.assumption_envs.of_frame(env), param)?
-			{
-				continue;
-			}
-			let found = self.type_formatter().display_type(argument);
-			let param = self.type_formatter().display_type(param);
-			let noun = match self.types.resolve(argument) {
-				Type::Slice { .. } => "slice",
-				Type::Array { .. } => "array",
-				_ => "slice or array",
-			};
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::SliceArgument.code())
-					.with_message(format!(
-						"the {noun} `{found}` cannot stand for `{param}`"
-					))
-					.with_label(
-						SourceSpan::new(
-							file_id,
-							self.generic_args.spans(args)[start + index],
-						)
-						.primary_label()
-						.with_message(noun),
-					)
-					.with_note(format!(
-						"only a parameter bounded by `Slice` stands for a \
-						 slice or an array, and `{param}` is not"
-					)),
-			);
-			reported = true;
-		}
-		if reported {
-			return Err(SolverError::Poisoned);
-		}
-		Ok(())
 	}
 
 	/// `projection::name` could not be selected from the projection's declared
@@ -512,8 +731,9 @@ impl TypeContext<'_, '_, '_> {
 			formatter.display_type(expected),
 		);
 		let ast::Spanned { span, .. } = match self.bounds.binding(source).kind {
-			BindingRequirement::Equals(value) => value,
-			BindingRequirement::Bound(_) => {
+			BindingRequirement::Equals(_, value) => value,
+			BindingRequirement::Bound(..)
+			| BindingRequirement::Representable(..) => {
 				unreachable!("an equality clause comes from a written equality")
 			}
 		};
@@ -947,7 +1167,7 @@ mod tests {
 		with_resolved(
 			indoc! {"
 				trait Bound {}
-				func target<T: Bound>(x: T) {}
+				func target<T: Bound + StackValue>(x: T) {}
 			"},
 			|builder| {
 				let bound = trait_index(builder, "Bound");
@@ -979,7 +1199,7 @@ mod tests {
 			indoc! {"
 				trait Bound {}
 				trait Other {}
-				func target<T: Bound>(x: T) {}
+				func target<T: Bound + StackValue>(x: T) {}
 			"},
 			|builder| {
 				let other = trait_index(builder, "Other");
@@ -1004,7 +1224,7 @@ mod tests {
 			indoc! {"
 				trait Super {}
 				trait Sub: Super {}
-				func target<T: Sub>(x: T) {}
+				func target<T: Sub + StackValue>(x: T) {}
 			"},
 			|builder| {
 				let super_trait = trait_index(builder, "Super");
@@ -1022,4 +1242,19 @@ mod tests {
 			},
 		);
 	}
+}
+
+/// A `Self` entry's clause that normalizes to a statement about a type with a
+/// parameter that is not abstract, which no lookup would read.
+fn report_unassumable_clause(
+	at: SourceSpan,
+	clause: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::bug()
+		.with_code(DiagnosticCode::UnsupportedExpression.code())
+		.with_message(format!("assuming `{clause}` is not supported yet"))
+		.with_label(at.primary_label().with_message(
+			"a bound on `Self` here is assumed only about a parameter or a \
+			 projection out of one",
+		))
 }

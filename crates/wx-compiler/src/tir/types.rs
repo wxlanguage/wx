@@ -255,7 +255,7 @@ pub enum Type {
 	IntegerLiteral,
 	FloatLiteral,
 	/// A character literal's type until its context gives it one: `Char`,
-	/// or an integer type its code point fits (`coerce`).
+	/// or an integer type that can represent its code point (`coerce`).
 	CharLiteral,
 	U8,
 	I8,

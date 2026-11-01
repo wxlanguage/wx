@@ -14,12 +14,12 @@
 //! discriminants) is not an obligation: it is a body, checked by the body
 //! phase that follows this pass (`TypeContext::check_bodies`).
 
-use codespan_reporting::diagnostic::{Diagnostic, Label};
+use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
-use super::bounds::{AssumptionEnvIdx, BoundArena};
+use super::bounds::{AssumptionEnvIdx, BoundArena, BoundClauses};
 use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx, TraitImplIdx};
-use super::literals::Integer;
+use super::literals::ConcreteType;
 use super::members::report_type_does_not_implement_trait;
 use super::signatures::{ConstantSignature, TypeContext, TypeSetSignature};
 use super::solver::{
@@ -60,13 +60,13 @@ pub(super) enum BoundRequirements {
 #[derive(Clone, Copy)]
 pub(super) enum TypeObligation {
 	CheckBounds {
-		assumption_context: AssumptionEnvIdx,
+		frame: GenericEnvIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
 		owner: GenericEnvOwner,
 	},
 	CheckTraitMembership {
-		assumption_context: AssumptionEnvIdx,
+		frame: GenericEnvIdx,
 		subject: TypeIndex,
 		required: TraitIdx,
 		reference: SourceSpan,
@@ -75,7 +75,7 @@ pub(super) enum TypeObligation {
 	/// inside it is found even if nothing ever reads the type. The result is
 	/// discarded: the stored type stays as written.
 	CheckWellFormed {
-		assumption_context: AssumptionEnvIdx,
+		frame: GenericEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
@@ -100,33 +100,33 @@ pub(super) enum TypeObligation {
 		impl_kind: ImplKind,
 		reference: SourceSpan,
 	},
-	/// A constant written in a type fits its type `ty`, as written: an
-	/// array's length fits its memory's `Size`. An abstract type is any
-	/// member of the typesets its bounds name, so the value must fit every
-	/// one of them, and the type works with each.
-	CheckConstantFits {
-		assumption_context: AssumptionEnvIdx,
+	/// A constant written in a type is representable as its type `ty`, as
+	/// written: an array's length as its memory's `Size`. An abstract type is
+	/// any member of the typesets its bounds name, so the value must be
+	/// representable as every one of them, and the type works with each.
+	CheckConstantRepresentable {
+		frame: GenericEnvIdx,
 		ty: TypeIndex,
 		bits: u64,
 		reference: SourceSpan,
 	},
-	/// A constant named in a type (an array's length) has exactly the type
-	/// its position needs, `expected` as written: a constant of another type
-	/// is a mismatch, even one whose value would fit. Both types are compared
-	/// normalized with every fact, so a constant either names is read; a
-	/// constant's body therefore records it for after the values exist.
+	/// A constant named in a type (an array's length) has exactly the type its
+	/// position needs, `expected` as written: a constant of another type is a
+	/// mismatch, even one whose value would be representable. Both types are
+	/// compared normalized with every fact, so a constant either names is read;
+	/// a constant's body therefore records it for after the values exist.
 	CheckConstantType {
-		assumption_context: AssumptionEnvIdx,
+		frame: GenericEnvIdx,
 		/// The `Type::Const` the length names.
 		length: TypeIndex,
 		expected: TypeIndex,
 		reference: SourceSpan,
 	},
-	/// A type held by value (a parameter's, a field's, a local's, a tuple's
-	/// element) is not a slice or an array, `[T]` or `[T; N]`, nor a
-	/// parameter that may be one: only a pointer holds a slice or an array.
+	/// A type held by value (a parameter's, a result's, a function type's
+	/// part, a local's) is a `StackValue`. A field, a tuple's element and a
+	/// type argument need nothing: their container states what it needs.
 	CheckValueType {
-		assumption_context: AssumptionEnvIdx,
+		frame: GenericEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
@@ -138,9 +138,18 @@ pub(super) enum TypeObligation {
 	/// this decides what to say: a plain "no such member", or, when the value
 	/// does have one, that the trait must be named (with the spelling).
 	CheckProjectionMember {
-		assumption_context: AssumptionEnvIdx,
+		frame: GenericEnvIdx,
 		projection: TypeIndex,
 		name: SymbolU32,
+		reference: SourceSpan,
+	},
+	/// A trait impl function's `Self` entry, `clauses` about the impl's
+	/// target, is normalized into what the function assumes
+	/// (`normalize_self_entry`). First in the function's run, so its other
+	/// checks read the completed env; `reference` is the entry's `Self`.
+	NormalizeSelfEntry {
+		frame: GenericEnvIdx,
+		clauses: BoundClauses,
 		reference: SourceSpan,
 	},
 }
@@ -192,12 +201,12 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<(), ()> {
 		match *obligation {
 			TypeObligation::CheckBounds {
-				assumption_context,
+				frame,
 				requirements,
 				reference,
 				owner,
 			} => match self.check_bound_requirements(
-				assumption_context,
+				self.assumption_envs.of_frame(frame),
 				requirements,
 				reference,
 				owner,
@@ -216,13 +225,13 @@ impl TypeContext<'_, '_, '_> {
 				Err(SolverError::Pending) => Err(()),
 			},
 			TypeObligation::CheckTraitMembership {
-				assumption_context,
+				frame,
 				subject,
 				required,
 				reference,
 			} => {
 				match self.find_trait_impl_query(
-					assumption_context,
+					self.assumption_envs.of_frame(frame),
 					subject,
 					required,
 				) {
@@ -254,12 +263,12 @@ impl TypeContext<'_, '_, '_> {
 				}
 			}
 			TypeObligation::CheckWellFormed {
-				assumption_context,
+				frame,
 				ty,
 				reference,
 			} => {
 				match self.normalize(
-					assumption_context,
+					self.assumption_envs.of_frame(frame),
 					ty,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
@@ -358,13 +367,13 @@ impl TypeContext<'_, '_, '_> {
 					}
 				}
 			}
-			TypeObligation::CheckConstantFits {
-				assumption_context,
+			TypeObligation::CheckConstantRepresentable {
+				frame,
 				ty,
 				bits,
 				reference,
-			} => match self.check_constant_fits(
-				assumption_context,
+			} => match self.check_constant_representable(
+				self.assumption_envs.of_frame(frame),
 				ty,
 				bits,
 				reference,
@@ -383,12 +392,12 @@ impl TypeContext<'_, '_, '_> {
 				Err(SolverError::Pending) => Err(()),
 			},
 			TypeObligation::CheckConstantType {
-				assumption_context,
+				frame,
 				length,
 				expected,
 				reference,
 			} => match self.check_constant_type(
-				assumption_context,
+				self.assumption_envs.of_frame(frame),
 				length,
 				expected,
 				reference,
@@ -407,11 +416,15 @@ impl TypeContext<'_, '_, '_> {
 				Err(SolverError::Pending) => Err(()),
 			},
 			TypeObligation::CheckValueType {
-				assumption_context,
+				frame,
 				ty,
 				reference,
 			} => {
-				match self.check_value_type(assumption_context, ty, reference) {
+				match self.check_value_type(
+					self.assumption_envs.of_frame(frame),
+					ty,
+					reference,
+				) {
 					Ok(_) => Ok(()),
 					Err(SolverError::Cycle(cycle)) => {
 						let diagnostic =
@@ -432,13 +445,31 @@ impl TypeContext<'_, '_, '_> {
 			TypeObligation::CheckConformance { impl_index } => {
 				self.check_conformance(impl_index).map_err(|_| ())
 			}
+			TypeObligation::NormalizeSelfEntry {
+				frame,
+				clauses,
+				reference,
+			} => match self.normalize_self_entry(frame, clauses) {
+				Ok(()) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
 			TypeObligation::CheckProjectionMember {
-				assumption_context,
+				frame,
 				projection,
 				name,
 				reference,
 			} => match self.check_projection_member(
-				assumption_context,
+				self.assumption_envs.of_frame(frame),
 				projection,
 				name,
 				reference,
@@ -461,9 +492,9 @@ impl TypeContext<'_, '_, '_> {
 }
 
 impl TypeContext<'_, '_, '_> {
-	/// `bits` fits `ty`: an integer type's range, or, for an abstract type,
-	/// the range of every member of every typeset its bounds name.
-	fn check_constant_fits(
+	/// `bits` is representable as `ty`: an integer type, or every member of
+	/// every typeset an abstract one is bounded by.
+	fn check_constant_representable(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
@@ -476,110 +507,94 @@ impl TypeContext<'_, '_, '_> {
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
-		if let Some(integer) = Integer::from_type(ty) {
-			if integer.in_range(bits, false) {
-				return Ok(());
-			}
-			let message = format!(
-				"`{bits}` is out of range for `{}`",
-				self.type_formatter().display_type(ty)
-			);
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::IntegerLiteralOutOfRange.code())
-					.with_message(message)
-					.with_label(reference.primary_label()),
-			);
-			return Err(SolverError::Poisoned);
-		}
-		let clause_tables = self.clause_tables();
-		let typesets = clause_tables
-			.declared_traits(
-				&self.types,
-				assumption_context,
-				ty,
-				self.solver.state.recursion_budget,
-			)
-			.filter_map(|trait_index| {
-				self.defs.traits[usize::from(trait_index)].typeset
-			})
-			.collect::<Vec<_>>();
-		for typeset in typesets {
-			let misfit = self.typesets[usize::from(typeset)]
-				.members
-				.iter()
-				.find(|member| {
-					!Integer::from_type(member.inner)
-						.is_some_and(|integer| integer.in_range(bits, false))
-				});
-			let Some(member) = misfit else {
+		for concrete in self.concrete_types(assumption_context, ty) {
+			if concrete.holds_integer(i128::from(bits)).is_ok() {
 				continue;
-			};
-			let def = &self.defs.typesets[usize::from(typeset)];
-			let typeset_name = self.strings.resolve(def.name.inner).unwrap();
-			let member_name = self.type_formatter().display_type(member.inner);
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::TypesetBoundViolation.code())
-					.with_message(format!(
-						"`{bits}` is not representable by every member of \
-						 typeset `{typeset_name}`"
-					))
-					.with_label(reference.primary_label().with_message(
-						format!("cannot be represented by `{member_name}`"),
-					))
-					.with_label(
-						Label::secondary(def.file_id, member.span)
-							.with_message(format!(
-								"`{member_name}` is a member here"
-							)),
+			}
+			// A length's type is a memory's `Size`: an integer type, or the
+			// members of `PointerSize`.
+			let diagnostic = match concrete {
+				ConcreteType::Member(typeset, member) => self
+					.report_typeset_member(
+						format_args!("`{bits}`"),
+						typeset,
+						member,
+						reference,
 					),
-			);
+				ConcreteType::Target(_) => self.report_out_of_range(
+					format_args!("`{bits}`"),
+					ty,
+					reference,
+				),
+			};
+			self.diagnostics.push(diagnostic);
 			return Err(SolverError::Poisoned);
 		}
 		Ok(())
 	}
 
-	/// `ty` may be held by value: it is no slice or array, and no parameter
-	/// that may stand for one.
+	/// `ty` may be held by value: it is a `StackValue`.
 	fn check_value_type(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		if !self.may_be_slice(assumption_context, ty)? {
+		let Some(part) = self.non_stack_part(assumption_context, ty)? else {
 			return Ok(());
-		}
-		let found = self.type_formatter().display_type(ty);
-		let (noun, note) = match self.types.resolve(ty) {
+		};
+		self.diagnostics
+			.push(self.not_stack_value_diagnostic(ty, part, reference));
+		Err(SolverError::Poisoned)
+	}
+
+	/// `ty`, held by value at `reference`, is no `StackValue` because of
+	/// `part` (`non_stack_part`).
+	pub(super) fn not_stack_value_diagnostic(
+		&self,
+		ty: TypeIndex,
+		part: TypeIndex,
+		reference: SourceSpan,
+	) -> Diagnostic<FileId> {
+		let formatter = self.type_formatter();
+		let (found, part_name) =
+			(formatter.display_type(ty), formatter.display_type(part));
+		let (label, note) = match self.types.resolve(part) {
 			Type::Slice { .. } => (
 				"a slice",
-				format!("hold it through a pointer, as `M::&{found}`"),
+				format!(
+					"`{part_name}` is a slice, which only a pointer holds, as \
+					 `M::&{part_name}`"
+				),
 			),
 			Type::Array { .. } => (
 				"an array",
-				format!("hold it through a pointer, as `M::&{found}`"),
+				format!(
+					"`{part_name}` is an array, which only a pointer holds, \
+					 as `M::&{part_name}`"
+				),
 			),
 			_ => (
-				"a slice or an array",
+				"not a `StackValue`",
 				format!(
-					"`{found}` is bounded by `Slice`, so it stands for a \
-					 slice or an array"
+					"`{part_name}` is not known to be a `StackValue`: \
+					 require `{part_name}: StackValue`"
 				),
 			),
 		};
-		self.diagnostics.push(
-			Diagnostic::error()
-				.with_code(DiagnosticCode::SliceByValue.code())
-				.with_message(format!(
-					"`{found}` is held by value, but {noun} is held only by \
-					 a pointer"
-				))
-				.with_label(reference.primary_label().with_message(noun))
-				.with_note(note),
-		);
-		Err(SolverError::Poisoned)
+		let message = if part == ty {
+			format!("`{found}` cannot be held by value")
+		} else {
+			format!(
+				"`{found}` cannot be held by value, since it holds \
+				 `{part_name}`"
+			)
+		};
+		Diagnostic::error()
+			.with_code(DiagnosticCode::NotStackValue.code())
+			.with_message(message)
+			.with_label(reference.primary_label().with_message(label))
+			.with_note(note)
 	}
 
 	/// The constant's type, in its own scope, is `expected`, in the scope
@@ -632,14 +647,14 @@ impl TypeContext<'_, '_, '_> {
 		{
 			return Ok(());
 		}
-		// An untyped integer constant is a count: its value fits the length's
-		// type, as a literal length's does.
+		// An untyped integer constant is a count: its value is representable as
+		// the length's type, as a literal length's does.
 		if found == TypeIndex::INTEGER_LITERAL {
 			let Ok(value) = self.exact_value(constant) else {
 				return Ok(());
 			};
 			return match u64::try_from(value) {
-				Ok(bits) => self.check_constant_fits(
+				Ok(bits) => self.check_constant_representable(
 					assumption_context,
 					expected,
 					bits,

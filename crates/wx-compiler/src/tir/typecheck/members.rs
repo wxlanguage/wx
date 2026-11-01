@@ -436,7 +436,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			Some(trait_index) => {
 				let found = self.cx.resolve_trait_qualified_value(
 					&mut self.obligations.types,
-					self.scope.assumption_env,
+					self.scope.generic_env,
 					receiver,
 					trait_index,
 					member.ident,

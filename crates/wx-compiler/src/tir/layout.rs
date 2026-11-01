@@ -335,9 +335,8 @@ impl TypeContext<'_, '_, '_> {
 				else {
 					return Ok(None);
 				};
-				let size = self.address_size(assumption_context, memory)?;
 				let Some(metadata) =
-					self.pointer_metadata(assumption_context, to, size)?
+					self.pointer_metadata(assumption_context, to, memory)?
 				else {
 					return Ok(None);
 				};
@@ -914,7 +913,7 @@ mod tests {
 			#[fixed_order]
 			struct Swapped(u8, u32);
 			struct Wrap<T>(T);
-			func f<T>(
+			func f<T: StackValue>(
 				a: Pair<u32, u8>, b: (u32, u8), c: Named, d: Swapped,
 				e: Wrap<heap::&T>, g: Wrap<heap::&u8>,
 			) {}
@@ -956,7 +955,7 @@ mod tests {
 	fn an_abstract_part_or_a_reference_has_no_layout() {
 		let source = with_memories(indoc! {"
 			struct Wrap<T>(T);
-			func f<T, Mem: Memory>(
+			func f<T: StackValue, Mem: Memory>(
 				a: T, b: Wrap<T>, c: heap::&T, d: Mem::&u8,
 				e: func(u32) -> u32, g: (u8, func(u32) -> u32),
 			) {}

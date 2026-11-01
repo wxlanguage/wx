@@ -2935,7 +2935,9 @@ impl<'a> Builder<'a> {
 						binding_parts.push(self.text(Text::CommaSp));
 					}
 					let mut key = self.symbol(binding.name.inner);
-					if let ast::AssocBindingKind::ConstFits { .. }
+					if let ast::AssocBindingKind::ConstRepresentable {
+						..
+					}
 					| ast::AssocBindingKind::ConstEquals { .. } = binding.kind
 					{
 						let marker = self.text(Text::Const);
@@ -2953,7 +2955,10 @@ impl<'a> Builder<'a> {
 								self.build_bound_expression(&bound.inner);
 							self.arena.concat2(colon, bound)
 						}
-						ast::AssocBindingKind::ConstFits { ty, .. } => {
+						ast::AssocBindingKind::ConstRepresentable {
+							ty,
+							..
+						} => {
 							let colon = self.text(Text::ColonSp);
 							let ty = self.build_type_expression(&ty.inner);
 							self.arena.concat2(colon, ty)

@@ -53,6 +53,7 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	fn load(&mut self, place: PlaceIdx) -> ExprIdx {
 		let Place { ty, span, .. } = *self.body.place(place);
+		let ty = self.held_by_value(ty, span);
 		self.body.push(ExprKind::Load(place), ty, span)
 	}
 
@@ -356,6 +357,40 @@ impl BodyContext<'_, '_, '_, '_> {
 				None
 			}
 		}
+	}
+
+	/// `ty`, made at `span` as a value: itself when it is a `StackValue`, else
+	/// `ERROR`, reported.
+	pub(super) fn held_by_value(
+		&mut self,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> TypeIndex {
+		if ty == TypeIndex::ERROR {
+			return ty;
+		}
+		let site = SourceSpan::new(self.scope.file_id, span);
+		match self.cx.non_stack_part(self.scope.assumption_env, ty) {
+			Ok(None) => return ty,
+			Ok(Some(part)) => {
+				let diagnostic =
+					self.cx.not_stack_value_diagnostic(ty, part, site);
+				self.cx.diagnostics.push(diagnostic);
+			}
+			Err(SolverError::Overflow) => {
+				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
+				self.cx.diagnostics.push(diagnostic);
+			}
+			// Its owner reported it.
+			Err(SolverError::Poisoned) => {}
+			Err(SolverError::Pending) => {
+				unreachable!("every signature is final when bodies are checked")
+			}
+		}
+		TypeIndex::ERROR
 	}
 
 	/// The field `member` of a value of type `object_ty`, and its type with

@@ -38,8 +38,6 @@
 //! and `impl_env` the candidate impl's generic env: requirements are proved
 //! in the caller's context.
 
-use std::marker::PhantomData;
-
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
@@ -49,7 +47,7 @@ use crate::index::index_newtype;
 use crate::vfs::FileId;
 
 use super::defs::{DefId, DefKind, DefinitionRegistry, TraitIdx};
-use super::members::TypeProjectionTarget;
+use super::members::{ConstantTarget, TypeProjectionTarget};
 use super::signatures::{
 	AssocTypeSignature, QueryInfo, SignatureStatus, TraitSignature, TypeContext,
 };
@@ -78,20 +76,24 @@ pub(super) struct SourceTraitBound {
 	pub(super) bindings: Box<[SourceAssocBinding]>,
 }
 
-/// One `Assoc = Type` or `Assoc: Bounds` clause inside a written bound.
+/// One entry of a written bound's binding block: `Assoc = Type`, `Assoc:
+/// Bounds` or `const NAME: Type`.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct SourceAssocBinding {
-	/// The associated type it constrains, under the trait that declares it:
-	/// the bound's own trait, or one of its supertraits.
-	pub(super) target: TypeProjectionTarget,
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) kind: BindingRequirement,
 }
 
+/// What an entry states, about the member it names under the trait that
+/// declares it: the bound's own trait, or one of its supertraits.
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) enum BindingRequirement {
-	Equals(Spanned<TypeIndex>),
-	Bound(Box<[BoundId]>),
+	/// `Assoc = Type`.
+	Equals(TypeProjectionTarget, Spanned<TypeIndex>),
+	/// `Assoc: Bounds`.
+	Bound(TypeProjectionTarget, Box<[BoundId]>),
+	/// `const NAME: Type`: the constant's value is representable as the type.
+	Representable(ConstantTarget, Spanned<TypeIndex>),
 }
 
 /// The clause `subject: trait_index`, stated by a bound.
@@ -107,6 +109,20 @@ pub(super) struct TraitClause {
 	pub(super) origin: BoundId,
 }
 
+/// The clause that `subject`'s value of the trait constant `constant` is `ty`
+/// (`const LEN: u8` on `T: Array` is `<T as Array>::LEN` representable as
+/// `u8`), stated by a bound. `source` is the written entry; `origin` as for
+/// `TraitClause`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct RepresentableClause {
+	pub(super) subject: TypeIndex,
+	pub(super) target: ConstantTarget,
+	pub(super) ty: TypeIndex,
+	pub(super) source: BindingRef,
+	pub(super) origin: BoundId,
+}
+
 /// The clause `projection == value`, stated by a bound.
 /// `source` is the written equality; `origin` as for `TraitClause`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,62 +134,42 @@ pub(super) struct EqualityClause {
 	pub(super) origin: BoundId,
 }
 
+/// One fact a bound states. Every kind lives in the one `ClauseArena`, and a
+/// subject's clauses are one run of them; a reader of one kind filters
+/// (`ClauseArena::traits`, `ClauseArena::equalities`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum Clause {
+	Trait(TraitClause),
+	Equality(EqualityClause),
+	Representable(RepresentableClause),
+}
+
 /// A run of clauses in the `ClauseArena`, owned by one subject.
-pub(super) struct ClauseRange<T> {
+#[derive(Clone, Copy)]
+pub(super) struct ClauseRange {
 	start: u32,
 	len: u32,
-	clauses: PhantomData<fn() -> T>,
 }
 
-impl<T> Clone for ClauseRange<T> {
-	fn clone(&self) -> Self {
-		*self
-	}
-}
-
-impl<T> Copy for ClauseRange<T> {}
-
-impl<T> ClauseRange<T> {
-	pub(super) const EMPTY: Self = Self {
-		start: 0,
-		len: 0,
-		clauses: PhantomData,
-	};
+impl ClauseRange {
+	pub(super) const EMPTY: Self = Self { start: 0, len: 0 };
 
 	pub(super) fn len(self) -> usize {
 		self.len as usize
 	}
 
-	fn slice(self, clauses: &[T]) -> &[T] {
-		&clauses[self.start as usize..][..self.len as usize]
-	}
-}
-
-/// Whether a subject's equality pass has run: the second half of
-/// `BoundClauses`, published once its memberships are.
-#[derive(Clone, Copy)]
-pub(super) enum Equalities {
-	/// The memberships are published, the values are not resolved yet, so a
-	/// read may conclude neither a proof nor a failure. Not an answer
-	/// (`SolverError::Pending`); ask again once construction has advanced.
-	Pending,
-	/// The pass is done: every equality the bound states.
-	Final(ClauseRange<EqualityClause>),
-}
-
-impl Equalities {
-	/// The range once the pass has run; `None` while it is pending.
-	pub(super) fn final_range(self) -> Option<ClauseRange<EqualityClause>> {
-		match self {
-			Self::Pending => None,
-			Self::Final(range) => Some(range),
-		}
-	}
-
-	/// The range, for tests that build final clauses by hand.
-	#[cfg(test)]
-	pub(super) fn resolved(self) -> ClauseRange<EqualityClause> {
-		self.final_range().expect("the test's clauses are final")
+	/// The first `mid` clauses, then the rest.
+	pub(super) fn split_at(self, mid: usize) -> (Self, Self) {
+		let mid = u32::try_from(mid).unwrap();
+		debug_assert!(mid <= self.len);
+		(
+			Self { len: mid, ..self },
+			Self {
+				start: self.start + mid,
+				len: self.len - mid,
+			},
+		)
 	}
 }
 
@@ -182,73 +178,134 @@ impl Equalities {
 /// `<Self as Tr>::A`).
 /// Each written bound becomes a flat run of clauses, its nested bounds as
 /// clauses on projections and each trait's own clauses (its supertraits, and
-/// theirs) substituted for `Self`. The trait clauses are published before
-/// any equality's value is resolved, so a sibling's value can name members
-/// they supply; the equalities stay `Pending` until the values are resolved.
+/// theirs) substituted for `Self`. They are published in two stages: the
+/// memberships before any value is resolved, so a sibling's value can name
+/// members they supply, then the whole run once the values are.
 #[derive(Clone, Copy)]
-pub(super) struct BoundClauses {
-	pub(super) traits: ClauseRange<TraitClause>,
-	pub(super) equalities: Equalities,
+pub(super) enum BoundClauses {
+	/// The memberships only: a read may conclude neither a proof nor a
+	/// failure from what the values will decide. Not an answer
+	/// (`SolverError::Pending`); ask again once construction has advanced.
+	Provisional(ClauseRange),
+	/// Every clause. A proof reads memberships before equalities whatever
+	/// their order in the run.
+	Final(ClauseRange),
 }
 
 impl BoundClauses {
 	/// A subject whose bounds are not published yet.
-	pub(super) const PENDING: Self = Self {
-		traits: ClauseRange::EMPTY,
-		equalities: Equalities::Pending,
-	};
+	pub(super) const PENDING: Self = Self::Provisional(ClauseRange::EMPTY);
 	/// A subject that assumes nothing.
-	pub(super) const NONE: Self = Self {
-		traits: ClauseRange::EMPTY,
-		equalities: Equalities::Final(ClauseRange::EMPTY),
-	};
+	pub(super) const NONE: Self = Self::Final(ClauseRange::EMPTY);
+
+	/// What is published: the memberships, or the whole run.
+	pub(super) fn range(self) -> ClauseRange {
+		match self {
+			Self::Provisional(range) | Self::Final(range) => range,
+		}
+	}
+
+	/// The whole run once it is published; `None` while it is provisional.
+	pub(super) fn final_range(self) -> Option<ClauseRange> {
+		match self {
+			Self::Provisional(_) => None,
+			Self::Final(range) => Some(range),
+		}
+	}
+
+	/// The whole run, for tests that read finished clauses.
+	#[cfg(test)]
+	pub(super) fn resolved(self) -> ClauseRange {
+		self.final_range().expect("the test's clauses are final")
+	}
+
+	/// Whether the clauses are final and state nothing.
+	pub(super) fn is_empty(self) -> bool {
+		self.final_range().is_some_and(|range| range.len() == 0)
+	}
 }
 
 /// Every subject's clauses, append-only, addressed by `ClauseRange`.
 #[derive(Default)]
 pub(super) struct ClauseArena {
-	traits: Vec<TraitClause>,
-	equalities: Vec<EqualityClause>,
+	clauses: Vec<Clause>,
 }
 
 impl ClauseArena {
+	pub(super) fn get(&self, range: ClauseRange) -> &[Clause] {
+		&self.clauses[range.start as usize..][..range.len as usize]
+	}
+
+	/// The memberships in `range`.
 	pub(super) fn traits(
 		&self,
-		range: ClauseRange<TraitClause>,
-	) -> &[TraitClause] {
-		range.slice(&self.traits)
+		range: ClauseRange,
+	) -> impl Iterator<Item = &TraitClause> + '_ {
+		self.get(range).iter().filter_map(|clause| match clause {
+			Clause::Trait(clause) => Some(clause),
+			_ => None,
+		})
 	}
 
+	/// The equalities in `range`.
 	pub(super) fn equalities(
 		&self,
-		range: ClauseRange<EqualityClause>,
-	) -> &[EqualityClause] {
-		range.slice(&self.equalities)
+		range: ClauseRange,
+	) -> impl Iterator<Item = &EqualityClause> + '_ {
+		self.get(range).iter().filter_map(|clause| match clause {
+			Clause::Equality(clause) => Some(clause),
+			_ => None,
+		})
 	}
 
+	/// The representability clauses in `range`.
+	pub(super) fn representable(
+		&self,
+		range: ClauseRange,
+	) -> impl Iterator<Item = &RepresentableClause> + '_ {
+		self.get(range).iter().filter_map(|clause| match clause {
+			Clause::Representable(clause) => Some(clause),
+			_ => None,
+		})
+	}
+
+	pub(super) fn push(&mut self, clauses: &[Clause]) -> ClauseRange {
+		let start = u32::try_from(self.clauses.len())
+			.expect("clause arena exceeded u32 index capacity");
+		self.clauses.extend_from_slice(clauses);
+		ClauseRange {
+			start,
+			len: u32::try_from(clauses.len()).unwrap(),
+		}
+	}
+
+	/// The provisional run of `traits`.
 	pub(super) fn push_traits(
 		&mut self,
-		clauses: &[TraitClause],
-	) -> ClauseRange<TraitClause> {
-		push_range(&mut self.traits, clauses)
+		traits: &[TraitClause],
+	) -> ClauseRange {
+		let start = u32::try_from(self.clauses.len())
+			.expect("clause arena exceeded u32 index capacity");
+		self.clauses
+			.extend(traits.iter().copied().map(Clause::Trait));
+		ClauseRange {
+			start,
+			len: u32::try_from(traits.len()).unwrap(),
+		}
 	}
 
-	pub(super) fn push_equalities(
+	/// The final run of `traits`, then the clauses the values decide.
+	pub(super) fn push_final(
 		&mut self,
-		clauses: &[EqualityClause],
-	) -> ClauseRange<EqualityClause> {
-		push_range(&mut self.equalities, clauses)
-	}
-}
-
-fn push_range<T: Copy>(arena: &mut Vec<T>, clauses: &[T]) -> ClauseRange<T> {
-	let start = u32::try_from(arena.len())
-		.expect("clause arena exceeded u32 index capacity");
-	arena.extend_from_slice(clauses);
-	ClauseRange {
-		start,
-		len: u32::try_from(clauses.len()).unwrap(),
-		clauses: PhantomData,
+		traits: &[TraitClause],
+		values: &[Clause],
+	) -> ClauseRange {
+		let range = self.push_traits(traits);
+		self.clauses.extend_from_slice(values);
+		ClauseRange {
+			len: range.len + u32::try_from(values.len()).unwrap(),
+			..range
+		}
 	}
 }
 
@@ -262,13 +319,24 @@ pub(super) struct AssumptionEnv {
 	pub(super) reflexive: Option<(TypeIndex, TraitIdx)>,
 }
 
+/// What a frame's item states (rustc's `predicates_of` and `param_env`,
+/// keyed by the item's frame): `requirements` are its own clauses as
+/// written, which a use proves, and `env` the scope it is read in. The two
+/// runs are the same but for a trait impl function's `Self` entry, whose
+/// clauses are about the impl's target: they are only in `requirements`
+/// until they are normalized, and `env` is then completed with them
+/// (`complete_frame`).
+#[derive(Clone, Copy)]
+struct FrameClauses {
+	env: AssumptionEnvIdx,
+	requirements: BoundClauses,
+}
+
 /// Every scope's clauses. An item that writes no bound has no env of its
 /// own and shares its parent's; `AssumptionEnvIdx::ROOT` assumes nothing.
-/// `frames` names the env each frame's item states its clauses in, until
-/// a declaration's own clauses are read through its context.
 pub(super) struct AssumptionEnvArena {
 	envs: Vec<AssumptionEnv>,
-	frames: Vec<AssumptionEnvIdx>,
+	frames: Vec<FrameClauses>,
 }
 
 impl AssumptionEnvIdx {
@@ -283,7 +351,10 @@ impl AssumptionEnvArena {
 				clauses: BoundClauses::NONE,
 				reflexive: None,
 			}],
-			frames: vec![AssumptionEnvIdx::ROOT],
+			frames: vec![FrameClauses {
+				env: AssumptionEnvIdx::ROOT,
+				requirements: BoundClauses::NONE,
+			}],
 		}
 	}
 
@@ -305,20 +376,78 @@ impl AssumptionEnvArena {
 		env
 	}
 
-	/// Records that `frame`, just pushed, states its clauses in `env`.
+	/// Records that `frame`, just pushed, is read in `env`: its own, whose
+	/// clauses it publishes next (`publish`), or one it shares, which leaves
+	/// it requiring nothing.
 	pub(super) fn bind_frame(
 		&mut self,
 		frame: GenericEnvIdx,
 		env: AssumptionEnvIdx,
+		own: bool,
 	) {
 		debug_assert_eq!(usize::from(frame), self.frames.len());
-		self.frames.push(env);
+		self.frames.push(FrameClauses {
+			env,
+			requirements: if own {
+				BoundClauses::PENDING
+			} else {
+				BoundClauses::NONE
+			},
+		});
 	}
 
-	/// The env `frame`'s item states its clauses in: its own, or the one it
-	/// shares.
+	/// The env `frame`'s item is read in: its own, or the one it shares.
 	pub(super) fn of_frame(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
-		self.frames[usize::from(frame)]
+		self.frames[usize::from(frame)].env
+	}
+
+	/// Reads `frame`'s item in `env` from now on: an env inside its current
+	/// one, holding what construction could not state.
+	pub(super) fn complete_frame(
+		&mut self,
+		frame: GenericEnvIdx,
+		env: AssumptionEnvIdx,
+	) {
+		let entry = &mut self.frames[usize::from(frame)];
+		debug_assert_eq!(
+			self.envs[usize::from(env)].parent,
+			Some(entry.env),
+			"a frame is completed by an env inside its own"
+		);
+		entry.env = env;
+	}
+
+	/// The clauses `frame`'s item states, as written: what a use of it
+	/// proves. `BoundClauses::NONE` for an item that writes no bound.
+	pub(super) fn requirements(&self, frame: GenericEnvIdx) -> BoundClauses {
+		self.frames[usize::from(frame)].requirements
+	}
+
+	/// Publishes `clauses` as what `frame`'s item states and what its own
+	/// env assumes.
+	pub(super) fn publish(
+		&mut self,
+		frame: GenericEnvIdx,
+		clauses: BoundClauses,
+	) {
+		self.set_requirements(frame, clauses);
+		let env = self.of_frame(frame);
+		self.envs[usize::from(env)].clauses = clauses;
+	}
+
+	/// Publishes `clauses` as what `frame`'s item states, apart from what
+	/// its env assumes.
+	pub(super) fn set_requirements(
+		&mut self,
+		frame: GenericEnvIdx,
+		clauses: BoundClauses,
+	) {
+		let entry = &mut self.frames[usize::from(frame)];
+		debug_assert!(
+			matches!(entry.requirements, BoundClauses::Provisional(_)),
+			"only an item with clauses of its own publishes them"
+		);
+		entry.requirements = clauses;
 	}
 
 	pub(super) fn get(&self, env: AssumptionEnvIdx) -> &AssumptionEnv {
@@ -335,37 +464,6 @@ impl AssumptionEnvArena {
 		env: AssumptionEnvIdx,
 	) -> &mut BoundClauses {
 		&mut self.envs[usize::from(env)].clauses
-	}
-
-	/// The env `frame`'s item states clauses in, when it has one of its own
-	/// rather than sharing the enclosing item's.
-	pub(super) fn own(
-		&self,
-		generic_envs: &GenericEnvArena,
-		frame: GenericEnvIdx,
-	) -> Option<AssumptionEnvIdx> {
-		let env = self.of_frame(frame);
-		let parent = generic_envs.parent(frame)?;
-		(env != self.of_frame(parent)).then_some(env)
-	}
-
-	/// The own clauses `frame`'s item states.
-	pub(super) fn frame_clauses(&self, frame: GenericEnvIdx) -> BoundClauses {
-		self.clauses(self.of_frame(frame))
-	}
-
-	/// The own clauses of `frame`'s item, which has an env of its own.
-	pub(super) fn frame_clauses_mut(
-		&mut self,
-		frame: GenericEnvIdx,
-	) -> &mut BoundClauses {
-		let env = self.of_frame(frame);
-		debug_assert_ne!(
-			env,
-			AssumptionEnvIdx::ROOT,
-			"a frame with clauses has an env"
-		);
-		self.clauses_mut(env)
 	}
 
 	/// `env`, then each env around it.
@@ -437,8 +535,8 @@ impl BoundArena {
 		let BoundEntry::Reserved { trait_index, span } = slot else {
 			panic!("source bounds are immutable after publication")
 		};
-		assert_eq!(*trait_index, bound.trait_index);
-		assert_eq!(*span, bound.span);
+		debug_assert_eq!(*trait_index, bound.trait_index);
+		debug_assert!(*span == bound.span);
 		*slot = BoundEntry::Resolved(bound);
 	}
 
@@ -511,7 +609,7 @@ impl TypeContext<'_, '_, '_> {
 		let Some(env) = self.trait_clause_env(bound) else {
 			return;
 		};
-		let range = self.assumption_envs.frame_clauses(env).traits;
+		let range = self.assumption_envs.requirements(env).range();
 		for clause in self.clauses.traits(range) {
 			let subject = self.types.substitute(
 				clause.subject,
@@ -532,43 +630,34 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// The equality clauses the written bounds `ids` state about `subject`
-	/// (named `name`), each trait's own equalities included. Two values an
-	/// outer constructor tells apart are a conflict, reported here.
-	pub(super) fn equality_clauses(
+	/// The clauses the values in the written bounds `ids` decide about
+	/// `subject` (named `name`), equalities then representability, each trait's
+	/// own included, appended to `out`, which may hold other subjects'. Two
+	/// values an outer constructor tells apart are a conflict, reported here.
+	pub(super) fn collect_value_clauses(
 		&mut self,
-		subject: TypeIndex,
-		ids: &[BoundId],
-		name: SymbolU32,
-	) -> ClauseRange<EqualityClause> {
-		let mut out = Vec::new();
-		self.collect_equality_clauses(&mut out, subject, ids, name);
-		self.clauses.push_equalities(&out)
-	}
-
-	/// `equality_clauses`, appended to `out`, which may hold other subjects'.
-	pub(super) fn collect_equality_clauses(
-		&mut self,
-		out: &mut Vec<EqualityClause>,
+		out: &mut Vec<Clause>,
 		subject: TypeIndex,
 		ids: &[BoundId],
 		name: SymbolU32,
 	) {
-		let mut builder = EqualityClauseBuilder {
+		let mut builder = ValueClauseBuilder {
 			bounds: &self.bounds,
 			clauses: &self.clauses,
 			assumption_envs: &self.assumption_envs,
 			traits: &self.traits,
 			generic_envs: &self.generic_envs,
 			types: &mut self.types,
-			out: Vec::new(),
+			equalities: Vec::new(),
+			representable: Vec::new(),
 			conflicts: Vec::new(),
 		};
 		for &id in ids {
 			builder.collect(subject, id, id);
 		}
-		let EqualityClauseBuilder {
-			out: collected,
+		let ValueClauseBuilder {
+			equalities,
+			representable,
 			conflicts,
 			..
 		} = builder;
@@ -581,7 +670,8 @@ impl TypeContext<'_, '_, '_> {
 				conflict,
 			));
 		}
-		out.extend(collected);
+		out.extend(equalities.into_iter().map(Clause::Equality));
+		out.extend(representable.into_iter().map(Clause::Representable));
 	}
 
 	/// Demand the associated declarations along `receiver`'s projection path,
@@ -615,25 +705,27 @@ struct AssocBindingConflict {
 	merge_point: BoundId,
 }
 
-/// The equality pass over written bounds. It walks the same bounds as the
-/// membership pass, which already demanded every trait they name, so it
-/// forces nothing: it reads finished tables and borrows what it walks. A
-/// trait still being built has no `Self` equalities yet, and lends none.
-struct EqualityClauseBuilder<'a> {
+/// The value pass over written bounds: the clauses resolved values decide,
+/// equalities and representability. It walks the same bounds as the membership
+/// pass, which already demanded every trait they name, so it forces nothing: it
+/// reads finished tables and borrows what it walks. A trait still being built
+/// has no final `Self` clauses yet, and lends none.
+struct ValueClauseBuilder<'a> {
 	bounds: &'a BoundArena,
 	clauses: &'a ClauseArena,
 	assumption_envs: &'a AssumptionEnvArena,
 	traits: &'a [TraitSignature],
 	generic_envs: &'a GenericEnvArena,
 	types: &'a mut TypeInterner,
-	out: Vec<EqualityClause>,
+	equalities: Vec<EqualityClause>,
+	representable: Vec<RepresentableClause>,
 	conflicts: Vec<AssocBindingConflict>,
 }
 
-impl EqualityClauseBuilder<'_> {
-	/// The equalities the written bound `id` states about `subject`, its
-	/// nested bounds' included, then its trait's own, as brought in by
-	/// `origin`.
+impl ValueClauseBuilder<'_> {
+	/// The equalities and representability clauses the written bound `id`
+	/// states about `subject`, its nested bounds' included, then its trait's
+	/// own, as brought in by `origin`.
 	fn collect(&mut self, subject: TypeIndex, id: BoundId, origin: BoundId) {
 		let bound = self.bounds.get(id);
 		for (index, binding) in bound.bindings.iter().enumerate() {
@@ -642,13 +734,13 @@ impl EqualityClauseBuilder<'_> {
 				index: u32::try_from(index)
 					.expect("bound binding count exceeded u32 capacity"),
 			};
-			let projection = binding.target.project(self.types, subject);
 			match &binding.kind {
-				BindingRequirement::Equals(value) => {
-					let written_since = self.out.len();
+				BindingRequirement::Equals(target, value) => {
+					let written_since = self.equalities.len();
+					let projection = target.project(self.types, subject);
 					push_equality_clause(
 						self.types,
-						&mut self.out,
+						&mut self.equalities,
 						EqualityClause {
 							projection,
 							value: value.inner,
@@ -659,44 +751,66 @@ impl EqualityClauseBuilder<'_> {
 						&mut self.conflicts,
 					);
 				}
-				BindingRequirement::Bound(nested) => {
+				BindingRequirement::Bound(target, nested) => {
+					let projection = target.project(self.types, subject);
 					for &nested in nested {
 						self.collect(projection, nested, origin);
 					}
 				}
+				BindingRequirement::Representable(target, ty) => {
+					self.representable.push(RepresentableClause {
+						subject,
+						target: *target,
+						ty: ty.inner,
+						source,
+						origin,
+					});
+				}
 			}
 		}
 		let env = self.traits[usize::from(bound.trait_index)].env;
-		let Some(range) = self
-			.assumption_envs
-			.frame_clauses(env)
-			.equalities
-			.final_range()
+		let Some(range) = self.assumption_envs.requirements(env).final_range()
 		else {
 			return;
 		};
-		let inherited_since = self.out.len();
-		for clause in self.clauses.equalities(range) {
-			let substitution = Substitution {
-				envs: self.generic_envs,
-				env,
-				args: &[subject],
-			};
-			let projection =
-				self.types.substitute(clause.projection, substitution);
-			let value = self.types.substitute(clause.value, substitution);
-			push_equality_clause(
-				self.types,
-				&mut self.out,
-				EqualityClause {
-					projection,
-					value,
-					origin,
-					..*clause
-				},
-				inherited_since,
-				&mut self.conflicts,
-			);
+		let inherited_since = self.equalities.len();
+		let substitution = Substitution {
+			envs: self.generic_envs,
+			env,
+			args: &[subject],
+		};
+		for clause in self.clauses.get(range) {
+			match *clause {
+				Clause::Trait(_) => {}
+				Clause::Equality(clause) => {
+					let projection =
+						self.types.substitute(clause.projection, substitution);
+					let value =
+						self.types.substitute(clause.value, substitution);
+					push_equality_clause(
+						self.types,
+						&mut self.equalities,
+						EqualityClause {
+							projection,
+							value,
+							origin,
+							..clause
+						},
+						inherited_since,
+						&mut self.conflicts,
+					);
+				}
+				Clause::Representable(clause) => {
+					self.representable.push(RepresentableClause {
+						subject: self
+							.types
+							.substitute(clause.subject, substitution),
+						ty: self.types.substitute(clause.ty, substitution),
+						origin,
+						..clause
+					});
+				}
+			}
 		}
 	}
 }
@@ -800,8 +914,7 @@ impl<'a> ClauseTables<'a> {
 			.flat_map(move |env| {
 				env.reflexive.into_iter().chain(
 					clauses
-						.traits(env.clauses.traits)
-						.iter()
+						.traits(env.clauses.range())
 						.map(|clause| (clause.subject, clause.trait_index)),
 				)
 			})
@@ -824,12 +937,11 @@ impl<'a> ClauseTables<'a> {
 		&self,
 		assumption_context: AssumptionEnvIdx,
 	) -> Readiness {
-		self.assumption_envs.chain(assumption_context).fold(
-			Readiness::Ready,
-			|readiness, env| {
-				readiness.and(Readiness::from(env.clauses.equalities))
-			},
-		)
+		self.assumption_envs
+			.chain(assumption_context)
+			.fold(Readiness::Ready, |readiness, env| {
+				readiness.and(Readiness::from(env.clauses))
+			})
 	}
 
 	/// The subjects whose clauses can describe `receiver` in
@@ -866,8 +978,7 @@ impl<'a> ClauseTables<'a> {
 		let mut readiness = Readiness::Ready;
 		let mut walk = DeclarationSources { ..sources };
 		while let Some(source) = walk.next() {
-			readiness =
-				readiness.and(Readiness::from(source.clauses.equalities));
+			readiness = readiness.and(Readiness::from(source.clauses));
 		}
 		if walk.remaining == 0 {
 			readiness = readiness.and(Readiness::Overflowed);
@@ -1024,7 +1135,7 @@ pub(super) struct DeclaredTraits<'a, 't> {
 	pub(super) readiness: Readiness,
 	reflexive: Option<TraitIdx>,
 	sources: DeclarationSources<'a, 't>,
-	current: Option<(DeclarationSource, std::slice::Iter<'a, TraitClause>)>,
+	current: Option<(DeclarationSource, std::slice::Iter<'a, Clause>)>,
 }
 
 impl Iterator for DeclaredTraits<'_, '_> {
@@ -1038,20 +1149,25 @@ impl Iterator for DeclaredTraits<'_, '_> {
 			if let Some((source, clauses)) = &mut self.current {
 				let (tables, types) = (self.sources.tables, self.sources.types);
 				let receiver = self.sources.receiver;
-				if let Some(clause) = clauses.find(|clause| {
-					source.names(
-						types,
-						tables.generic_envs,
-						clause.subject,
-						receiver,
-					)
+				if let Some(clause) = clauses.find_map(|clause| match clause {
+					Clause::Trait(clause)
+						if source.names(
+							types,
+							tables.generic_envs,
+							clause.subject,
+							receiver,
+						) =>
+					{
+						Some(clause)
+					}
+					_ => None,
 				}) {
 					return Some(clause.trait_index);
 				}
 			}
 			let source = self.sources.next()?;
 			let clauses =
-				self.sources.tables.clauses.traits(source.clauses.traits);
+				self.sources.tables.clauses.get(source.clauses.range());
 			self.current = Some((source, clauses.iter()));
 		}
 	}
@@ -1096,11 +1212,11 @@ impl Readiness {
 	}
 }
 
-impl From<Equalities> for Readiness {
-	fn from(equalities: Equalities) -> Self {
-		match equalities {
-			Equalities::Pending => Readiness::Pending,
-			Equalities::Final(_) => Readiness::Ready,
+impl From<BoundClauses> for Readiness {
+	fn from(clauses: BoundClauses) -> Self {
+		match clauses {
+			BoundClauses::Provisional(_) => Readiness::Pending,
+			BoundClauses::Final(_) => Readiness::Ready,
 		}
 	}
 }
@@ -1229,16 +1345,14 @@ fn report_conflicting_assoc_type_binding(
 ) -> Diagnostic<FileId> {
 	let first = arena.binding(conflict.first);
 	let second = arena.binding(conflict.second);
-	let BindingRequirement::Equals(first_value) = &first.kind else {
+	let BindingRequirement::Equals(target, first_value) = &first.kind else {
 		unreachable!("conflict points to a source equality")
 	};
-	let BindingRequirement::Equals(second_value) = &second.kind else {
+	let BindingRequirement::Equals(_, second_value) = &second.kind else {
 		unreachable!("conflict points to a source equality")
 	};
 	let subject_str = strings.resolve(subject).unwrap();
-	let trait_name = defs.traits[usize::from(first.target.trait_index)]
-		.name
-		.inner;
+	let trait_name = defs.traits[usize::from(target.trait_index)].name.inner;
 	let trait_str = strings.resolve(trait_name).unwrap();
 	let assoc_str = strings.resolve(first.name.inner).unwrap();
 	Diagnostic::error()
@@ -1271,18 +1385,22 @@ fn report_conflicting_assoc_type_binding(
 		)
 }
 
-pub(super) fn report_not_an_associated_type(
+/// A binding names no member of the kind its entry needs: `noun` is
+/// "an associated type" for `Name = ..`/`Name: ..`, "a constant" for `const
+/// NAME: ..`.
+pub(super) fn report_not_a_binding_member(
 	file_id: FileId,
 	strings: &StringInterner,
 	name: Spanned<SymbolU32>,
 	trait_name: SymbolU32,
+	noun: &str,
 ) -> Diagnostic<FileId> {
 	let name_str = strings.resolve(name.inner).unwrap();
 	let trait_str = strings.resolve(trait_name).unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::NotATraitMember.code())
 		.with_message(format!(
-			"`{name_str}` is not an associated type of trait `{trait_str}`"
+			"`{name_str}` is not {noun} of trait `{trait_str}`"
 		))
 		.with_label(SourceSpan::new(file_id, name.span).primary_label())
 }

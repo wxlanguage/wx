@@ -4,7 +4,7 @@ Status: steps 1–5 done (2026-10-31, branch
 `slices-and-untyped-constants`); the rest planned. Supersedes the 2026-10-28 proposal in this file
 (`ClauseSource` over frames). Companions: `tir-assumption-context-plan.md`
 (how the current assumption context came to be), `tir-type-context.md`,
-`tir-check-pass.md`, and "Fit clauses" in `slices-and-untyped-constants.md`,
+`tir-check-pass.md`, and "Representability clauses" in `slices-and-untyped-constants.md`,
 which builds on this.
 
 ## Problem
@@ -24,7 +24,7 @@ from that:
 - **A clause can only be about its own frame's parameter.** A method cannot
   state a fact about its trait's `Self` or its impl's `T`: `Self`'s run is
   shared by every method. `Array::as_slice` needs exactly that
-  (`<Self as Array>::LEN` fits `M::Size`).
+  (`<Self as Array>::LEN` representable as `M::Size`).
 - **The same parameters cannot assume different things in different
   checks.** `conformance.rs::contract_frame` copies the impl function's
   parameter names into a second frame only so the copies can carry the
@@ -98,10 +98,10 @@ index_newtype!(AssumptionEnvIdx);
 struct AssumptionEnv {
     parent: Option<AssumptionEnvIdx>,
     /// Any subject in scope: a parameter of any enclosing frame, or a
-    /// projection out of one.
-    traits: ClauseRange<TraitClause>,
-    equalities: Equalities,
-    // with fit clauses: fits: ClauseRange<FitClause>,
+    /// projection out of one. One run of `Clause`s (every kind) in the
+    /// `ClauseArena`, `Provisional` (memberships only) until the values
+    /// are resolved, then `Final`.
+    clauses: BoundClauses,
 }
 
 struct AssumptionEnvArena {
@@ -146,9 +146,8 @@ struct AssumptionEnvArena {
 - **Construction order is unchanged.** Today a frame publishes every
   parameter's memberships, then resolves every value, then builds every
   equality (`signatures.rs`, the parameter-bounds pass). An env publishes
-  its trait range with `Equalities::Pending`, then sets
-  `Equalities::Final`: one readiness per env, the order construction
-  already follows.
+  its memberships as `BoundClauses::Provisional`, then the whole run as
+  `Final`: one readiness per env, the order construction already follows.
 
 ### Reading
 
@@ -227,7 +226,7 @@ pub trait Array: Slice {
   `Self` is the target.
 - A binding block's entry for a constant starts with `const`, required, so
   the parser tells it from a type's entry by the keyword alone:
-  `const N: u32` is a fit clause (step 8), `const N = 10` a constant
+  `const N: u32` is a representability clause (step 8), `const N = 10` a constant
   equality (rustc's `ConstEquate`), parsed and formatted but reported
   unsupported (E2114) until something needs it. `Size: Sub` and
   `Size = u32` stay a type's.
@@ -328,7 +327,7 @@ Each leaves the suite green.
    type parameter name (as `self` among a function's parameters); where it
    may stand is the signature's to check, and until 6b a leading `Self` is
    reported unsupported and declares no parameter. A binding block's
-   `const N: Ty` (`AssocBindingKind::ConstFits`) and `const N = value`
+   `const N: Ty` (`AssocBindingKind::ConstRepresentable`) and `const N = value`
    (`ConstEquals`) entries parse, format, and are reported unsupported
    (`AssocTypeBinding` is now `AssocBinding`). 6b/6c done: a leading
    `Self` in a trait's function lowers as clauses about the trait's
@@ -347,6 +346,23 @@ Each leaves the suite green.
    their arguments in the same arena (`GenericArgs`), not in the
    interner's lists, which back interned types only. A frame whose
    arguments selection proved (`check_use_bounds`' `proven`) is skipped.
+   Requirements apart from assumptions (done, no behaviour change): what
+   an item states as written is its *requirements*, kept per frame beside
+   the env it is read in (`AssumptionEnvArena::requirements`, rustc's
+   `predicates_of` beside `param_env`), published with its env's clauses
+   (`publish`). A use, impl selection and conformance prove requirements;
+   lookup reads the env. The two runs are the same range until 6d
+   normalizes an env. `own()` and `frame_clauses` are gone; `of_frame`
+   stays as the item's env (rustc's `param_env(def_id)`).
+   Obligations name the item's frame, not an env (done, no behaviour
+   change): each reads `of_frame` when it is checked, so an item's env can
+   be completed after construction (`complete_frame`).
+   6d-1/6d-2 done (`env-normalization.md`): a trait impl function's `Self`
+   entry lowers about the impl's target into its requirements only;
+   `NormalizeSelfEntry`, first in its run, normalizes it into a completed
+   env (an abstract subject assumed, the rest proved and dropped or
+   reported); conformance normalizes the contract env and compares only
+   what the impl assumes. 6d-3 (a call's failure at the receiver) open.
    6d: a trait impl function's `Self` entry, its clauses normalized into
    its env (a concrete subject proved there), proved to follow from the
    declaration's by conformance like its own parameters' clauses, and
@@ -361,18 +377,37 @@ Each leaves the suite green.
    `Value`), which today re-root the clauses onto the value
    (`Subjects::Rooted` over a projection root, `rebase`). `rebase` and
    `Subjects` go: every proof is then of a whole env.
-8. **Fit clauses** (slices step 6): a third range in `AssumptionEnv`, the
-   `const N: Ty` entry in a binding block, `satisfies_clauses`' arm, the body's lookup in
-   `untyped_value`. Then `Array::as_slice`/`as_slice_mut` get bodies in std.
+   One clause arena (done, no behaviour change): every kind is a variant
+   of `bounds::Clause` in one `ClauseArena`, and a subject's clauses are
+   one `ClauseRange`. What was two runs per subject (traits, equalities)
+   was publication order, not kind: `BoundClauses` is `Provisional`
+   (memberships, published before any value is resolved, so a sibling's
+   value can name what they supply) or `Final` (the whole run, pushed
+   again as one range: nested queries push other items' clauses between
+   the two stages, so the second cannot extend the first). A reader of
+   one kind filters (`ClauseArena::traits`, `equalities`); a pass over all
+   kinds is one loop with a `match`, and a new kind is a new variant
+   (rustc's `ClauseKind`). A clause is about 24 bytes; runs are a few
+   clauses, so filtering costs nothing measurable.
+8. **Representability clauses** (slices step 6, done; "fit clauses" until
+   the rename): a `Clause::Representable` variant, published in the final
+   stage (its type names siblings, `const LEN: Mem::Size`), the `const N: Ty`
+   entry in a binding block, `satisfies_clauses`' arm, the body's lookup
+   (`assumed_representable`, `tir/representable.rs`); E2133 when unmet.
+   `Array::as_slice`/`as_slice_mut` have bodies in std.
 
 ## To audit
 
 - **Requirement re-entry** (`solver.rs`, `match_impl_target_and_bounds`):
-  `assumption_context == impl_env` with identity arguments marks the impl's
-  own judgement. Once envs are shared, an impl's env and a caller's (a
-  method of the impl that adds no clauses) can be the same index. The check
-  should name the judgement explicitly (its solver frame) rather than
-  compare contexts.
+  brittle, not wrong. While an impl's requirements are judged, selecting
+  the impl with its identity arguments in its own env is the judgement
+  re-entering. Since envs are shared, a method that writes no bound checks
+  its body in the impl's env, so both conditions hold for a selection in
+  that body too; it is safe only because a judgement runs to completion
+  inside one `requirements_verdict` call and no body check interleaves
+  with it (the identity arguments alone already name the impl). The check
+  should name the judgement explicitly, the open `SolverFrame::Requirements`
+  for the impl, rather than compare contexts.
 - ~~**`declarations_of` callers** (step 3)~~: done, see step 3.
 - ~~**Per-argument checks read one root**~~ (step 6): answered by proving
   each frame's env whole, see 6b/6c. A clause a trait function states

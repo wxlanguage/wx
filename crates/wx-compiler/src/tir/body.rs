@@ -87,8 +87,8 @@ pub(super) enum ExprObligation {
 	/// with a constant's value.
 	Match(ExprIdx),
 	/// An untyped constant `expr` (`const X: {integer}`) was given the type
-	/// `target`: its value fits it, as a literal's would.
-	Fit { expr: ExprIdx, target: TypeIndex },
+	/// `target`: its value is representable as it, as a literal's would be.
+	Representable { expr: ExprIdx, target: TypeIndex },
 }
 
 /// What building a body left undecided, beside the body: a function's or a

@@ -28,8 +28,8 @@
 //! compared there.
 
 use super::bounds::{
-	AssumptionEnvIdx, BoundClauses, BoundId, Equalities, EqualityClause,
-	TraitClause,
+	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
+	RepresentableClause, TraitClause,
 };
 use super::defs::{
 	AstNodeRef, BindingKey, ConstIdx, DefId, DefKind, FunctionIdx, MemberIdx,
@@ -330,7 +330,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			);
 			return Ok(());
 		}
-		let contract = self.contract_env(declaration, function, target);
+		let contract = self.contract_env(declaration, function, target)?;
 		if !self.check_own_bounds(
 			trait_index,
 			(declaration, function),
@@ -465,47 +465,35 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	}
 
 	/// The env a caller through the trait sees `function` in: the impl's
-	/// env around it, and the clauses the declaration's own env states, with
-	/// `Self` as `target` and the declaration's parameters as the function's,
-	/// by position. It exists for the check alone; its index is new, so its
-	/// cache entries alias no declaration's. A function without its own
-	/// parameters is read in its own env, and one whose declaration writes no
-	/// bound in its impl's.
+	/// env around it, and what the clauses the declaration itself states
+	/// mean with `Self` as `target` and the declaration's parameters as the
+	/// function's, by position (`normalize_clauses`, as the function's own
+	/// `Self` entry is read). It exists for the check alone; its index is
+	/// new, so its cache entries alias no declaration's. A function whose
+	/// declaration states nothing is read in its impl's.
 	fn contract_env(
 		&mut self,
 		declaration: FunctionIdx,
 		function: FunctionIdx,
 		target: TypeIndex,
-	) -> AssumptionEnvIdx {
+	) -> Result<AssumptionEnvIdx, SolverError> {
 		let env = self.functions[usize::from(function)].type_params;
-		if self.own_params(env).is_empty() {
-			return self.assumption_envs.of_frame(env);
-		}
-		let impl_env = self.assumption_envs.of_frame(
-			self.generic_envs
-				.parent(env)
-				.expect("a function's own frame has its impl's around it"),
-		);
+		let impl_env = self.impl_env(function);
 		let declaration_env =
 			self.functions[usize::from(declaration)].type_params;
-		// A declaration that writes no bound adds nothing to the impl's env.
-		let Some(own) = self
-			.assumption_envs
-			.own(&self.generic_envs, declaration_env)
-		else {
-			return impl_env;
-		};
+		let requirements = self.own_requirements(declaration_env);
+		if requirements.is_empty() {
+			return Ok(impl_env);
+		}
 		let arguments: Box<[TypeIndex]> = std::iter::once(target)
-			.chain(self.generic_envs.param_types(env).iter().copied())
+			.chain(self.own_params(env).iter().copied())
 			.collect();
-		let clauses = self.instantiate_clauses(
-			self.assumption_envs.clauses(own),
-			declaration_env,
-			&arguments,
-		);
+		let clauses =
+			self.instantiate_clauses(requirements, declaration_env, &arguments);
+		let (assumed, _) = self.normalize_clauses(impl_env, clauses)?;
 		let contract = self.assumption_envs.push(impl_env, None);
-		*self.assumption_envs.clauses_mut(contract) = clauses;
-		contract
+		*self.assumption_envs.clauses_mut(contract) = assumed;
+		Ok(contract)
 	}
 
 	/// `clauses`, written in `env`'s chain, with that chain's parameters
@@ -517,7 +505,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		env: GenericEnvIdx,
 		arguments: &[TypeIndex],
 	) -> BoundClauses {
-		let Equalities::Final(equalities) = clauses.equalities else {
+		let Some(range) = clauses.final_range() else {
 			unreachable!("every signature exists when declarations are checked")
 		};
 		let substitution = Substitution {
@@ -525,33 +513,36 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			env,
 			args: arguments,
 		};
-		let traits: Vec<TraitClause> = self
+		let instantiated: Vec<Clause> = self
 			.clauses
-			.traits(clauses.traits)
+			.get(range)
 			.iter()
-			.map(|clause| TraitClause {
-				subject: self.types.substitute(clause.subject, substitution),
-				..*clause
+			.map(|clause| match *clause {
+				Clause::Trait(clause) => Clause::Trait(TraitClause {
+					subject: self
+						.types
+						.substitute(clause.subject, substitution),
+					..clause
+				}),
+				Clause::Equality(clause) => Clause::Equality(EqualityClause {
+					projection: self
+						.types
+						.substitute(clause.projection, substitution),
+					value: self.types.substitute(clause.value, substitution),
+					..clause
+				}),
+				Clause::Representable(clause) => {
+					Clause::Representable(RepresentableClause {
+						subject: self
+							.types
+							.substitute(clause.subject, substitution),
+						ty: self.types.substitute(clause.ty, substitution),
+						..clause
+					})
+				}
 			})
 			.collect();
-		let equalities: Vec<EqualityClause> = self
-			.clauses
-			.equalities(equalities)
-			.iter()
-			.map(|clause| EqualityClause {
-				projection: self
-					.types
-					.substitute(clause.projection, substitution),
-				value: self.types.substitute(clause.value, substitution),
-				..*clause
-			})
-			.collect();
-		BoundClauses {
-			traits: self.clauses.push_traits(&traits),
-			equalities: Equalities::Final(
-				self.clauses.push_equalities(&equalities),
-			),
-		}
+		BoundClauses::Final(self.clauses.push(&instantiated))
 	}
 
 	/// Proves the clauses `function`'s own env states in `contract`, where
@@ -567,18 +558,18 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		contract: AssumptionEnvIdx,
 	) -> Result<bool, SolverError> {
 		let env = self.functions[usize::from(function)].type_params;
-		// A function that writes no bound shares its impl's env, which the
-		// contract's parent is.
-		if self.own_params(env).is_empty() {
+		let requirements = self.own_requirements(env);
+		if requirements.is_empty() {
 			return Ok(true);
 		}
-		let Some(own) = self.assumption_envs.own(&self.generic_envs, env)
-		else {
-			return Ok(true);
-		};
+		// Only what the function assumes is compared: a clause about a type
+		// that is not abstract holds or not of its own, and is checked where
+		// it is written (`normalize_self_entry`). Each is read where the
+		// function is written, not under the contract's assumptions.
+		let impl_env = self.impl_env(function);
+		let (clauses, _) = self.normalize_clauses(impl_env, requirements)?;
 		let arguments: Box<[TypeIndex]> =
 			self.generic_envs.identity_args(env).into();
-		let clauses = self.assumption_envs.clauses(own);
 		let mut failures = Vec::new();
 		let holds = self.satisfies_clauses(
 			contract,
@@ -589,9 +580,6 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			None,
 		)?;
 		if !holds {
-			let Equalities::Final(equalities) = clauses.equalities else {
-				unreachable!("proved clauses are final")
-			};
 			// The written bound each failure came from.
 			let mut reported = Vec::new();
 			for failure in failures {
@@ -602,8 +590,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 						..
 					} => self
 						.clauses
-						.traits(clauses.traits)
-						.iter()
+						.traits(clauses.range())
 						.find(|clause| {
 							clause.trait_index == trait_index
 								&& clause.source == source
@@ -611,8 +598,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 						.map(|clause| clause.origin),
 					UnsatisfiedClause::Equality { source, .. } => self
 						.clauses
-						.equalities(equalities)
-						.iter()
+						.equalities(clauses.range())
+						.find(|clause| clause.source == source)
+						.map(|clause| clause.origin),
+					UnsatisfiedClause::Representable { source, .. } => self
+						.clauses
+						.representable(clauses.range())
 						.find(|clause| clause.source == source)
 						.map(|clause| clause.origin),
 				}
@@ -716,6 +707,30 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	/// A function's own type parameters, given its frame: none when that is
 	/// the trait's or impl's around it, which a function without its own
 	/// parameters is read in.
+	/// The env of the impl `function` is written in.
+	fn impl_env(&self, function: FunctionIdx) -> AssumptionEnvIdx {
+		let env = self.functions[usize::from(function)].type_params;
+		let impl_frame = match self.generic_envs.owner(env) {
+			GenericEnvOwner::Function(_) => self
+				.generic_envs
+				.parent(env)
+				.expect("a function's own frame has its impl's around it"),
+			_ => env,
+		};
+		self.assumption_envs.of_frame(impl_frame)
+	}
+
+	/// What `frame`'s function itself states: nothing when it has no frame
+	/// of its own and `frame` is its impl's or its trait's.
+	fn own_requirements(&self, frame: GenericEnvIdx) -> BoundClauses {
+		match self.generic_envs.owner(frame) {
+			GenericEnvOwner::Function(_) => {
+				self.assumption_envs.requirements(frame)
+			}
+			_ => BoundClauses::NONE,
+		}
+	}
+
 	fn own_params(&self, frame: GenericEnvIdx) -> &[TypeIndex] {
 		match self.generic_envs.owner(frame) {
 			GenericEnvOwner::Function(_) => {
@@ -887,6 +902,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		origin: BoundId,
 		failure: &UnsatisfiedClause,
 	) {
+		let read = match *failure {
+			UnsatisfiedClause::Representable {
+				subject, constant, ..
+			} => Some(self.types.intern_const(constant, &[subject])),
+			_ => None,
+		};
 		let formatter = self.type_formatter();
 		let requirement = match *failure {
 			UnsatisfiedClause::Trait {
@@ -910,6 +931,13 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 				"{} == {}",
 				formatter.display_type(projection),
 				formatter.display_type(required),
+			),
+			UnsatisfiedClause::Representable { ty, .. } => format!(
+				"{} is representable as {}",
+				formatter.display_type(
+					read.expect("a representability clause reads its constant")
+				),
+				formatter.display_type(ty),
 			),
 		};
 		let expected_def = &self.defs.functions[usize::from(declaration)];
@@ -1589,7 +1617,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 			trait Size {}
-			trait Container: Size { type Item: Size; func f(self: Self); }
+			trait Container: Size + StackValue { type Item: Size; func f(self: Self); }
 			impl Container for Missing { type Item = u8; func f(self: Self) {} }
 		"}
 		);
@@ -1717,20 +1745,20 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store {
-				type Item;
+			trait Store: StackValue {
+				type Item: StackValue;
 				func get(self: Self) -> Box<Self::Item>;
 				func put(self: Self, item: Self::Item, at: u32);
-				func swap<A, B>(a: A, b: B) -> (B, A);
+				func swap<A: StackValue, B: StackValue>(a: A, b: B) -> (B, A);
 				func kept(self: Self) -> u32 { 0 }
 				const ZERO: Self;
 			}
 			struct Bag<T>();
-			impl<T> Store for Bag<T> {
+			impl<T: StackValue> Store for Bag<T> {
 				type Item = T;
 				func get(self: Self) -> Box<T> { Box() }
 				func put(self: Self, mut item: T, at: u32) {}
-				func swap<X, Y>(a: X, b: Y) -> (Y, X) { (b, a) }
+				func swap<X: StackValue, Y: StackValue>(a: X, b: Y) -> (Y, X) { (b, a) }
 				const ZERO: Bag<T> = Bag();
 			}
 		"}
@@ -1745,7 +1773,7 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{}",
 				indoc! {"
-				trait Store {
+				trait Store: StackValue {
 					type Item;
 					type Kept = u8;
 					func get(self: Self) -> u32;
@@ -1837,7 +1865,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store {
+			trait Store: StackValue {
 				func renamed(self: Self, rhs: u32);
 				func unnamed(self: Self, u32);
 				func named(self: Self, at: u32);
@@ -1883,13 +1911,13 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{}",
 				indoc! {"
-				trait Store {
-					func generic<T>(x: T);
+				trait Store: StackValue {
+					func generic<T: StackValue>(x: T);
 					func arity(self: Self, a: u32);
 				}
 				struct Bag();
 				impl Store for Bag {
-					func generic<T, U>(x: T) {}
+					func generic<T: StackValue, U>(x: T) {}
 					func arity(self: Self) {}
 				}
 			"}
@@ -1915,9 +1943,9 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{}",
 				indoc! {"
-				trait Store { func pair<A, B>(a: A, b: B); }
+				trait Store { func pair<A: StackValue, B: StackValue>(a: A, b: B); }
 				struct Bag();
-				impl Store for Bag { func pair<A, B>(a: B, b: A) {} }
+				impl Store for Bag { func pair<A: StackValue, B: StackValue>(a: B, b: A) {} }
 			"}
 			)
 		);
@@ -1934,7 +1962,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store { func put(self: Self, slot: Box<(u8, u32)>); }
+			trait Store: StackValue { func put(self: Self, slot: Box<(u8, u32)>); }
 			struct Bag();
 			impl Store for Bag { func put(self: Self, slot: Box<(u8, u64)>) {} }
 		"}
@@ -1955,7 +1983,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store { type Item; func get(self: Self) -> Box<Self::Item>; }
+			trait Store: StackValue { type Item; func get(self: Self) -> Box<Self::Item>; }
 			struct Bag();
 			impl Store for Bag { type Item = u8; func get(self: Self) -> Box<u16> { Box() } }
 		"}
@@ -1975,7 +2003,7 @@ mod tests {
 			"{PRELUDE}{}",
 			indoc! {"
 			type Alias = Box<(u8, u64)>;
-			trait Store { func put(self: Self, slot: Box<(u8, u32)>); }
+			trait Store: StackValue { func put(self: Self, slot: Box<(u8, u32)>); }
 			struct Bag();
 			impl Store for Bag { func put(self: Self, slot: Alias) {} }
 		"}
@@ -1999,7 +2027,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store { func count(self: Self) -> u32; }
+			trait Store: StackValue { func count(self: Self) -> u32; }
 			struct Bag();
 			impl Store for Bag { func count(self: Self) {} }
 		"}
@@ -2036,7 +2064,7 @@ mod tests {
 		trait PartialOrd: PartialEq {}
 		trait Eq: PartialEq {}
 		trait Ord: PartialOrd + Eq {}
-		trait Container { type Item; }
+		trait Container { type Item: StackValue; }
 		struct Bag();
 	";
 
@@ -2047,14 +2075,14 @@ mod tests {
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
 				trait Sorter {
-					func fewer<T: PartialEq>(x: T);
-					func same<T: PartialOrd>(x: T);
-					func implied<T: Ord>(x: T);
+					func fewer<T: StackValue + PartialEq>(x: T);
+					func same<T: StackValue + PartialOrd>(x: T);
+					func implied<T: StackValue + Ord>(x: T);
 				}
 				impl Sorter for Bag {
-					func fewer<T>(x: T) {}
-					func same<T: PartialOrd>(x: T) {}
-					func implied<T: PartialEq>(x: T) {}
+					func fewer<T: StackValue>(x: T) {}
+					func same<T: StackValue + PartialOrd>(x: T) {}
+					func implied<T: StackValue + PartialEq>(x: T) {}
 				}
 			"}
 			)
@@ -2067,8 +2095,8 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{ORDERING}{}",
 			indoc! {"
-			trait Sorter { func sort<T: PartialEq>(x: T); }
-			impl Sorter for Bag { func sort<T: Ord>(x: T) {} }
+			trait Sorter { func sort<T: StackValue + PartialEq>(x: T); }
+			impl Sorter for Bag { func sort<T: StackValue + Ord>(x: T) {} }
 		"}
 		);
 		test_case!(case = &source);
@@ -2094,9 +2122,9 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
-				trait Store { func take<U: Container>(x: U); }
+				trait Store { func take<U: StackValue + Container>(x: U); }
 				impl Store for Bag {
-					func take<U: Container where { Item = u32 }>(x: U) {}
+					func take<U: StackValue + Container where { Item = u32 }>(x: U) {}
 				}
 			"}
 			)
@@ -2115,9 +2143,9 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
-				trait Store { func take<U: Container where { Item = u8 }>(x: U); }
+				trait Store { func take<U: StackValue + Container where { Item = u8 }>(x: U); }
 				impl Store for Bag {
-					func take<U: Container where { Item = u16 }>(x: U) {}
+					func take<U: StackValue + Container where { Item = u16 }>(x: U) {}
 				}
 			"}
 			)
@@ -2140,12 +2168,12 @@ mod tests {
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
 				trait Store {
-					func strict<U: Container>(x: U);
-					func loose<U: Container where { Item: Ord }>(x: U);
+					func strict<U: StackValue + Container>(x: U);
+					func loose<U: StackValue + Container where { Item: Ord }>(x: U);
 				}
 				impl Store for Bag {
-					func strict<U: Container where { Item: Ord }>(x: U) {}
-					func loose<U: Container where { Item: PartialEq }>(x: U) {}
+					func strict<U: StackValue + Container where { Item: Ord }>(x: U) {}
+					func loose<U: StackValue + Container where { Item: PartialEq }>(x: U) {}
 				}
 			"}
 			)
@@ -2165,9 +2193,9 @@ mod tests {
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
 				trait Into { type Out; }
-				trait Convert { func from<T: Into where { Out = Self }>(x: T); }
+				trait Convert { func from<T: StackValue + Into where { Out = Self }>(x: T); }
 				impl Convert for Bag {
-					func from<T: Into where { Out = Bag }>(x: T) {}
+					func from<T: StackValue + Into where { Out = Bag }>(x: T) {}
 				}
 			"}
 			)
