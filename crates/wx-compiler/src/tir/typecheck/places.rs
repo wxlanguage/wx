@@ -53,7 +53,7 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	fn load(&mut self, place: PlaceIdx) -> ExprIdx {
 		let Place { ty, span, .. } = *self.body.place(place);
-		let ty = self.held_by_value(ty, span);
+		let ty = self.require_stack_value(ty, span);
 		self.body.push(ExprKind::Load(place), ty, span)
 	}
 
@@ -361,7 +361,7 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// `ty`, made at `span` as a value: itself when it is a `StackValue`, else
 	/// `ERROR`, reported.
-	pub(super) fn held_by_value(
+	pub(super) fn require_stack_value(
 		&mut self,
 		ty: TypeIndex,
 		span: TextSpan,
@@ -370,13 +370,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			return ty;
 		}
 		let site = SourceSpan::new(self.scope.file_id, span);
-		match self.cx.non_stack_part(self.scope.assumption_env, ty) {
-			Ok(None) => return ty,
-			Ok(Some(part)) => {
-				let diagnostic =
-					self.cx.not_stack_value_diagnostic(ty, part, site);
-				self.cx.diagnostics.push(diagnostic);
-			}
+		match self
+			.cx
+			.check_value_type(self.scope.assumption_env, ty, site)
+		{
+			Ok(()) => return ty,
 			Err(SolverError::Overflow) => {
 				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
 			}

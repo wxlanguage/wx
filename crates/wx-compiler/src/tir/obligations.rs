@@ -534,14 +534,21 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// `ty` may be held by value: it is a `StackValue`.
-	fn check_value_type(
+	pub(super) fn check_value_type(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		let Some(part) = self.non_stack_part(assumption_context, ty)? else {
-			return Ok(());
+		match self.stack_value_repr(assumption_context, ty) {
+			Ok(_) => return Ok(()),
+			Err(SolverError::Poisoned) => {}
+			Err(error) => return Err(error),
+		}
+		let Some(part) =
+			self.explain_non_stack_value(assumption_context, ty)?
+		else {
+			return Err(SolverError::Poisoned);
 		};
 		self.diagnostics
 			.push(self.not_stack_value_diagnostic(ty, part, reference));
@@ -549,7 +556,7 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// `ty`, held by value at `reference`, is no `StackValue` because of
-	/// `part` (`non_stack_part`).
+	/// `part` (`explain_non_stack_value`).
 	pub(super) fn not_stack_value_diagnostic(
 		&self,
 		ty: TypeIndex,

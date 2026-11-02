@@ -1174,7 +1174,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.cx.types.intern_struct(struct_index, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
 		// Fields need nothing; the value made of them does.
-		let ty = self.held_by_value(ty, span);
+		let ty = self.require_stack_value(ty, span);
 		self.body.push(
 			ExprKind::StructConstructor {
 				struct_index,

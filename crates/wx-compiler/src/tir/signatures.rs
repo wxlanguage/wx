@@ -9718,20 +9718,31 @@ pub(super) mod tests {
 
 	#[test]
 	fn enum_type_identity_does_not_force_its_representation_query() {
-		with_pending_std_signatures(
+		with_pending_signatures(
 			indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			func f(x: Color) -> Color {}
 			enum Color(i32) { Red }
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"},
 			|builder| {
-				let function = DefId::Function(FunctionIdx::new(0));
-				let enumeration = DefId::Enum(EnumIdx::new(0));
+				let function_index = builder
+					.defs
+					.functions
+					.iter()
+					.position(|def| {
+						builder.strings.resolve(def.name.inner) == Some("f")
+					})
+					.unwrap();
+				let enum_index = builder
+					.defs
+					.enums
+					.iter()
+					.position(|def| {
+						builder.strings.resolve(def.name.inner) == Some("Color")
+					})
+					.unwrap();
+				let function =
+					DefId::Function(FunctionIdx::new(function_index as u32));
+				let enumeration = DefId::Enum(EnumIdx::new(enum_index as u32));
 				let _ = builder.ensure_signature(QueryInfo {
 					def_id: function,
 					requested_at: None,
@@ -9742,7 +9753,9 @@ pub(super) mod tests {
 				));
 				assert!(matches!(
 					builder.types.resolve(
-						builder.types.list(builder.functions[0].param_types)[0]
+						builder.types.list(
+							builder.functions[function_index].param_types
+						)[0]
 					),
 					Type::Enum { .. }
 				));
@@ -9750,7 +9763,7 @@ pub(super) mod tests {
 					def_id: enumeration,
 					requested_at: None,
 				});
-				assert_eq!(builder.enums[0].repr, TypeIndex::I32);
+				assert_eq!(builder.enums[enum_index].repr, TypeIndex::I32);
 				assert!(
 					builder.diagnostics.is_empty(),
 					"{:?}",
@@ -11066,20 +11079,13 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_generic_memory_for_pointers_slices_and_arrays() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             func test<M: Memory>(
                 value: M,
                 ptr: M::*u8,
                 slice: M::&[u8],
                 array: M::*[u8; 4],
             ) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11138,18 +11144,12 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_requires_a_bound_and_accepts_a_memory_supertrait() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
+			case = indoc! {"
             trait SpecialMemory: Memory {}
 
-            func unbounded<M>(value: M, ptr: M::*u8) {}
+            func unbounded<M: StackValue>(value: M, ptr: M::*u8) {}
 
             func inherited<M: SpecialMemory>(value: M, ptr: M::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11188,19 +11188,12 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_a_generic_associated_type_bounded_by_memory() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             trait Container {
                 type Mem: Memory;
             }
 
             func test<T: Container>(value: T::Mem, ptr: T::Mem::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11225,17 +11218,10 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_self_with_a_memory_supertrait() {
 		test_case!(
-			std case = indoc! {"
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             trait Tagged: Memory {
                 func test(value: Self, ptr: Self::*u8);
             }
-        pub trait Call { type Args; type Result; } pub trait Function: Call {}
-        type u32;
-        enum Bool(u8) { False = 0, True = 1 }
-        struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11256,13 +11242,9 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_struct_impls_and_concrete_associated_types() {
 		test_case!(
-			std mut case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			mut case = indoc! {"
             struct Heap();
-            impl Memory for Heap {}
+            impl Memory for Heap { type Size = u32; const DATA_END: Self::*u8 = transmute::<u32, Self::*u8>(0); }
 
             trait Container {
                 type Mem: Memory;
@@ -11277,9 +11259,6 @@ pub(super) mod tests {
             func direct(ptr: Heap::*u8) {}
 
             func associated(value: Holder::Mem, ptr: Holder::Mem::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11303,20 +11282,13 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_resolves_generic_arguments_and_checks_impl_requirements() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             struct Heap<M>();
-            impl<M: Memory> Memory for Heap<M> {}
+            impl<M: Memory> Memory for Heap<M> { type Size = u32; const DATA_END: Self::*u8 = transmute::<u32, Self::*u8>(0); }
 
             func bounded<M: Memory>(value: Heap<M>, ptr: Heap<M>::*u8) {}
 
             func unbounded<M>(ptr: Heap<M>::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11497,12 +11469,8 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_membership_waits_for_associated_equalities() {
 		test_case!(
-			std mut case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            type u32;
-            trait Memory {}
-            impl Memory for u32 {}
+			mut case = indoc! {"
+            impl Memory for u32 { type Size = u32; const DATA_END: Self::*u8 = transmute::<u32, Self::*u8>(0); }
 
             trait Container {
                 type Item;
@@ -11512,8 +11480,6 @@ pub(super) mod tests {
                 T: Container where { Item = U::Item::*u8 },
                 U: Container where { Item = u32 },
             >(ptr: T::Item) {}
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11566,11 +11532,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_with_a_failed_projection_preserves_the_pointer() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             trait Container {
                 type Item;
             }
@@ -11581,11 +11543,8 @@ pub(super) mod tests {
 
             func test<
                 T: Container where { Item = <U as Project>::Output },
-                U,
+                U: StackValue,
             >(value: U, ptr: T::Item::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11616,11 +11575,7 @@ pub(super) mod tests {
 	fn memory_tag_deferred_projection_failure_preserves_its_surrounding_pointer()
 	 {
 		test_case!(
-			std mut case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			mut case = indoc! {"
             trait Container {
                 type Item;
             }
@@ -11632,11 +11587,8 @@ pub(super) mod tests {
             func test<
                 T: Container where { Item = V::Item::*u8 },
                 V: Container where { Item = <U as Project>::Output },
-                U,
+                U: StackValue,
             >(value: U, ptr: T::Item) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -12102,23 +12054,29 @@ pub(super) mod tests {
 	#[test]
 	fn trait_impl_member_requests_force_the_parent_header() {
 		for method_first in [false, true] {
-			with_pending_std_signatures(
+			with_pending_signatures(
 				indoc! {"
-				type i32;
-				trait Service { func get(self: Self) -> Self; const VALUE: i32; }
+				trait Service: StackValue { func get(self: Self) -> Self; const VALUE: i32; }
 				struct S();
 				impl Service for S { func get(self: Self) -> Self { self } const VALUE: i32 = 0; }
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 			"},
 				|builder| {
+					let file_id = builder
+						.defs
+						.structs
+						.iter()
+						.find(|def| {
+							builder.strings.resolve(def.name.inner) == Some("S")
+						})
+						.unwrap()
+						.file_id;
 					let member = builder
 						.ast_nodes
 						.iter()
 						.find(|entry| {
+							if entry.file_id != file_id {
+								return false;
+							}
 							if method_first {
 								matches!(
 									entry.node,
@@ -12137,6 +12095,7 @@ pub(super) mod tests {
 						builder
 							.ast_nodes
 							.iter()
+							.filter(|entry| entry.file_id == file_id)
 							.find_map(|entry| match entry.node {
 								AstNodeRef::TraitImplBlock {
 									block_index,
@@ -12700,9 +12659,7 @@ pub(super) mod tests {
 	#[test]
 	fn a_use_proves_a_nested_bound_on_the_projection() {
 		test_case!(
-			std case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; 
+			case = indoc! {"
 			trait HasItem { type Item; }
 			trait Outer { type Inner; }
 			impl HasItem for u64 { type Item = u8; }
@@ -12711,9 +12668,6 @@ pub(super) mod tests {
 			struct W<T: Outer where { Inner: HasItem where { Item = u8 } }>();
 			func ok(w: W<u8>) {}
 			func bad(w: W<Bool>) {}
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"}
 		);
 
@@ -13499,25 +13453,29 @@ pub(super) mod tests {
 		// verdict on the definition: reported at the definition, and the readers
 		// stay silent.
 		const SOURCE: &str = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Project { type Out; }
 			struct Wrap<T>();
 			impl<T: Project> Project for Wrap<T> { type Out = T::Out; }
 			struct Leaf();
 			impl Project for Leaf { type Out = i32; }
 			impl Project for i32 { type Out = <Wrap<Wrap<Wrap<Wrap<Leaf>>>> as Project>::Out; }
-			func first(x: <i32 as Project>::Out) {}
-			func second(x: <i32 as Project>::Out) {}
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
+			func overflow_reader_first(x: <i32 as Project>::Out) {}
+			func overflow_reader_second(x: <i32 as Project>::Out) {}
 		"};
-		with_pending_std_signatures(SOURCE, |builder| {
+		with_pending_signatures(SOURCE, |builder| {
 			builder.solver.set_limit_for_test(3);
 			builder.sweep();
-			let readers = SOURCE.find("func first").unwrap();
+			let file_id = builder
+				.defs
+				.functions
+				.iter()
+				.find(|def| {
+					builder.strings.resolve(def.name.inner)
+						== Some("overflow_reader_first")
+				})
+				.unwrap()
+				.file_id;
+			let readers = SOURCE.find("func overflow_reader_first").unwrap();
 			let value_start = SOURCE.find("<Wrap<Wrap<").unwrap();
 			let value_end = value_start
 				+ SOURCE[value_start..].find("::Out;").unwrap()
@@ -13526,10 +13484,12 @@ pub(super) mod tests {
 				.diagnostics
 				.iter()
 				.filter(|diagnostic| {
-					diagnostic.code.as_deref()
-						== Some(
-							DiagnosticCode::TypeNormalizationOverflow.code(),
-						)
+					diagnostic.labels[0].file_id == file_id
+						&& diagnostic.code.as_deref()
+							== Some(
+								DiagnosticCode::TypeNormalizationOverflow
+									.code(),
+							)
 				})
 				.collect();
 			// The value itself reports once (its path's own membership check is
@@ -14378,9 +14338,7 @@ pub(super) mod tests {
 	#[test]
 	fn an_impl_requirement_proves_a_nested_bound() {
 		test_case!(
-			std case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; 
+			case = indoc! {"
 			trait HasItem { type Item; }
 			trait Outer { type Inner; }
 			impl HasItem for u64 { type Item = u8; }
@@ -14392,9 +14350,6 @@ pub(super) mod tests {
 			struct Need<X: Show>();
 			func ok(x: Need<W<u8>>) {}
 			func bad(x: Need<W<Bool>>) {}
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"}
 		);
 
@@ -15692,15 +15647,10 @@ pub(super) mod tests {
 
 		#[test]
 		fn swept_context_preserves_evidence_for_a_normalized_parameter() {
-			checked_case!(std mut case = indoc! {"
+			checked_case!(mut case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
-                func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
+                func f<T: Container where { Item = U } + Container where { Item: Marker }, U: StackValue>(x: T::Item) {}
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15723,15 +15673,22 @@ pub(super) mod tests {
 			let stored = u;
 			let projection = case.context.types.intern(Type::TypeProjection {
 				base: t,
-				trait_index: TraitIdx::new(1),
-				assoc_type_index: AssocTypeIdx::new(0),
+				trait_index: case.trait_index("Container"),
+				assoc_type_index: match case.defs.traits
+					[usize::from(case.trait_index("Container"))]
+				.members[0]
+					.kind
+				{
+					MemberKind::AssociatedType(index) => index,
+					_ => unreachable!(),
+				},
 			});
 			assert!(
 				memberships(
 					&case.context,
 					case.context.assumption_envs.of_frame(assumption_context)
 				)
-				.contains(&(projection, TraitIdx::new(0)))
+				.contains(&(projection, case.trait_index("Marker")))
 			);
 			let clauses = case
 				.context
@@ -15822,8 +15779,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn method_context_keeps_local_evidence_about_an_outer_parameter() {
-			checked_case!(std mut case = indoc! {"
-                trait Outer {}
+			checked_case!(mut case = indoc! {"
+                trait Outer: StackValue {}
                 trait Marker {}
                 trait Container { type Item; }
                 struct Host<T>();
@@ -15832,11 +15789,6 @@ pub(super) mod tests {
                     func plain(self: Self, x: T) {}
                 }
                 func free() {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15856,8 +15808,11 @@ pub(super) mod tests {
 			let scoped = function("scoped");
 			let plain = function("plain");
 			let free = function("free");
-			let outer_env =
-				case.context.inherent_impls[0].as_ref().unwrap().type_params;
+			let outer_env = case.context.inherent_impls
+				[usize::from(case.inherent_impl_index("Host"))]
+			.as_ref()
+			.unwrap()
+			.type_params;
 			let outer = case.context.generic_envs.param_types(outer_env)[0];
 			let assumption_context = case.context.functions[scoped].type_params;
 			assert_ne!(
@@ -15873,7 +15828,11 @@ pub(super) mod tests {
 			let plain_cx = case.context.functions[plain].type_params;
 			assert_eq!(
 				plain_cx,
-				case.context.inherent_impls[0].as_ref().unwrap().type_params
+				case.context.inherent_impls
+					[usize::from(case.inherent_impl_index("Host"))]
+				.as_ref()
+				.unwrap()
+				.type_params
 			);
 			let free_cx = case.context.functions[free].type_params;
 			assert_eq!(free_cx, GenericEnvIdx::ROOT);
@@ -15881,14 +15840,21 @@ pub(super) mod tests {
 				&case.context,
 				case.context.assumption_envs.of_frame(assumption_context),
 			);
-			assert!(local.contains(&(outer, TraitIdx::new(0))));
-			assert!(local.iter().any(|&(_, index)| index == TraitIdx::new(1)));
+			assert!(local.contains(&(outer, case.trait_index("Outer"))));
+			assert!(
+				local
+					.iter()
+					.any(|&(_, index)| index == case.trait_index("Marker"))
+			);
 			assert_eq!(
 				memberships(
 					&case.context,
 					case.context.assumption_envs.of_frame(plain_cx)
 				),
-				vec![(outer, TraitIdx::new(0))]
+				vec![
+					(outer, case.trait_index("Outer")),
+					(outer, case.context.defs.intrinsics.stack_value.unwrap())
+				]
 			);
 			assert!(
 				memberships(
@@ -15903,19 +15869,14 @@ pub(super) mod tests {
 		fn trait_body_context_and_instantiated_declaration_bounds_survive_the_sweep()
 		 {
 			use crate::tir::types::Substitution;
-			checked_case!(std mut case = indoc! {"
+			checked_case!(mut case = indoc! {"
                 trait Project { type Output; }
-                trait Parent {}
+                trait Parent: StackValue {}
                 trait Child: Parent {
-                    type Item: Project where { Output = Self };
+					type Item: StackValue + Project where { Output = Self };
                     func provided(self: Self, x: Self::Item) {}
                 }
                 func user<T: Child>(x: T::Item) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15932,7 +15893,8 @@ pub(super) mod tests {
 				})
 				.unwrap();
 			let assumption_context = case.context.functions[index].type_params;
-			let self_env = case.context.traits[2].env;
+			let self_env =
+				case.context.traits[usize::from(case.trait_index("Child"))].env;
 			let trait_self = case.context.generic_envs.param_types(self_env)[0];
 			assert_eq!(assumption_context, self_env);
 			assert_eq!(
@@ -15945,8 +15907,8 @@ pub(super) mod tests {
 				&case.context,
 				case.context.assumption_envs.of_frame(assumption_context),
 			);
-			assert!(facts.contains(&(trait_self, TraitIdx::new(2))));
-			assert!(facts.contains(&(trait_self, TraitIdx::new(1))));
+			assert!(facts.contains(&(trait_self, case.trait_index("Child"))));
+			assert!(facts.contains(&(trait_self, case.trait_index("Parent"))));
 			let signature = case.function_signature("user");
 			let subject = case.context.types.list(signature.param_types)[0];
 			let receiver =
@@ -15993,14 +15955,34 @@ pub(super) mod tests {
 				" }".repeat(16)
 			);
 			let source = format!(
-				"trait Node {{ type Next: Node; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);",
+				"trait Node {{ type Next: Node + StackValue; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U: Node + StackValue>(x: T{path}) {{}}",
 				path = "::Next".repeat(16)
 			);
-			with_pending_std_signatures(&source, |builder| {
+			with_pending_signatures(&source, |builder| {
 				builder.sweep();
-				let env = builder.functions[0].type_params;
-				let ty =
-					builder.types.list(builder.functions[0].param_types)[0];
+				let function = builder
+					.defs
+					.functions
+					.iter()
+					.position(|def| {
+						builder.strings.resolve(def.name.inner) == Some("f")
+					})
+					.unwrap();
+				let marker = TraitIdx::new(
+					builder
+						.defs
+						.traits
+						.iter()
+						.position(|def| {
+							builder.strings.resolve(def.name.inner)
+								== Some("Marker")
+						})
+						.unwrap() as u32,
+				);
+				let env = builder.functions[function].type_params;
+				let ty = builder
+					.types
+					.list(builder.functions[function].param_types)[0];
 				builder.solver.set_limit_for_test(8);
 				// Overflow is returned as such, never folded into "not a member" or
 				// an error type; the site that asked owns the report.
@@ -16009,7 +15991,7 @@ pub(super) mod tests {
 						.find_trait_impl_query(
 							builder.assumption_envs.of_frame(env),
 							ty,
-							TraitIdx::new(1)
+							marker
 						)
 						.map(|found| found.is_some()),
 					Err(SolverError::Overflow)
@@ -16025,7 +16007,7 @@ pub(super) mod tests {
 						.find_trait_impl_query(
 							builder.assumption_envs.of_frame(env),
 							ty,
-							TraitIdx::new(1)
+							marker
 						)
 						.map(|found| found.is_some()),
 					Ok(false)
@@ -16045,15 +16027,10 @@ pub(super) mod tests {
 		#[test]
 		fn equivalent_subjects_support_unqualified_and_qualified_members() {
 			checked_case!(
-				std case = indoc! {"
-                trait Project { type Output; }
+				case = indoc! {"
+                trait Project { type Output: StackValue; }
                 trait Container { type Item; }
                 func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output, y: <U as Project>::Output) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "}
 			);
 			assert!(
@@ -16077,8 +16054,10 @@ pub(super) mod tests {
 			else {
 				panic!("ordinary projection expected")
 			};
-			assert_eq!(*trait_index, TraitIdx::new(0));
-			assert_eq!(*assoc_type_index, AssocTypeIdx::new(0));
+			assert_eq!(*trait_index, case.trait_index("Project"));
+			assert!(
+				matches!(case.defs.traits[usize::from(case.trait_index("Project"))].members[0].kind, MemberKind::AssociatedType(index) if index == *assoc_type_index)
+			);
 			assert_eq!(
 				*base,
 				case.context.generic_envs.param_types(signature.type_params)[1]
@@ -16090,16 +16069,11 @@ pub(super) mod tests {
 			// `Item: Project` belongs to `T::Item`; `Item = U` does not lend it
 			// to `U`, so `U::Output` needs `U: Project` written.
 			checked_case!(
-				std case = indoc! {"
-                trait Project { type Output; }
+				case = indoc! {"
+                trait Project { type Output: StackValue; }
                 trait Container { type Item: Project; }
                 func f<T: Container where { Item = U }, U>(x: U::Output) {}
                 func g<T: Container where { Item = U }, U: Project>(x: U::Output) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "}
 			);
 			case.diagnostics().assert_codes(&[
@@ -16107,7 +16081,7 @@ pub(super) mod tests {
 				DiagnosticCode::TraitBoundViolation,
 			]);
 			assert!(
-				matches!(case.context.types.resolve(case.context.types.list(case.function_signature("g").param_types)[0]), Type::TypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
+				matches!(case.context.types.resolve(case.context.types.list(case.function_signature("g").param_types)[0]), Type::TypeProjection { trait_index, .. } if *trait_index == case.trait_index("Project"))
 			);
 		}
 
@@ -16595,6 +16569,134 @@ pub(super) mod tests {
 	mod stack_values {
 		use super::*;
 
+		#[test]
+		fn repr_queries_share_the_normalization_cache_and_retry_overflow() {
+			checked_case!(mut case = "");
+			case.diagnostics().assert_none();
+			let mut ty = TypeIndex::F64;
+			for _ in 0..8 {
+				ty = case.context.types.intern_tuple(&[TypeIndex::U8, ty]);
+			}
+			let env = AssumptionEnvIdx::ROOT;
+			let entries = case.context.solver.normalized.len();
+			case.context.solver.set_limit_for_test(3);
+			assert_eq!(
+				case.context.stack_value_repr(env, ty),
+				Err(SolverError::Overflow)
+			);
+			assert_eq!(case.context.solver.normalized.len(), entries);
+			assert!(case.context.solver.state.frames.is_empty());
+			assert!(case.context.solver.state.blocked_at.is_none());
+			assert_eq!(case.context.solver.state.recursion_budget, 3);
+
+			case.context.solver.set_limit_for_test(128);
+			let repr = case.context.stack_value_repr(env, ty).unwrap();
+			let projection = case.context.types.intern(Type::TypeProjection {
+				base: ty,
+				trait_index: case.context.defs.intrinsics.stack_value.unwrap(),
+				assoc_type_index: case
+					.context
+					.defs
+					.intrinsics
+					.stack_value_repr
+					.unwrap(),
+			});
+			case.context.solver.set_limit_for_test(0);
+			assert_eq!(
+				case.context.normalize(
+					env,
+					projection,
+					NormalizationDepth::Deep,
+					RewriteFlags::ALL
+				),
+				Ok(repr)
+			);
+			assert_eq!(case.context.stack_value_repr(env, ty), Ok(repr));
+			assert!(
+				case.context
+					.find_trait_impl_query(
+						env,
+						ty,
+						case.context.defs.intrinsics.stack_value.unwrap()
+					)
+					.unwrap()
+					.is_some()
+			);
+		}
+
+		#[test]
+		fn symbolic_repr_answers_require_evidence_and_stay_in_their_environment()
+		 {
+			let source = with_stack_value(indoc! {"
+				func unknown<T>() {}
+				func bounded<T: StackValue>() {}
+				func fixed<T: StackValue where { Repr = i32 }>() {}
+			"});
+			checked_case!(std mut case = &source);
+			case.diagnostics().assert_none();
+			let trait_index = case.context.defs.intrinsics.stack_value.unwrap();
+			let assoc_type_index =
+				case.context.defs.intrinsics.stack_value_repr.unwrap();
+			for name in ["unknown", "bounded", "fixed"] {
+				let frame = case.function_signature(name).type_params;
+				let env = case.context.assumption_envs.of_frame(frame);
+				let ty = case.context.generic_envs.param_types(frame)[0];
+				let projection =
+					case.context.types.intern(Type::TypeProjection {
+						base: ty,
+						trait_index,
+						assoc_type_index,
+					});
+				// Equality-only normalization can leave even an unproven Repr
+				// rigid. That cache entry is not evidence of membership.
+				if name == "unknown" {
+					assert_eq!(
+						case.context.normalize(
+							env,
+							projection,
+							NormalizationDepth::Deep,
+							RewriteFlags::EQUALITIES
+						),
+						Ok(projection)
+					);
+					let entries = case.context.solver.normalized.len();
+					assert_eq!(
+						case.context.stack_value_repr(env, ty),
+						Err(SolverError::Poisoned)
+					);
+					assert_eq!(case.context.solver.normalized.len(), entries);
+					assert_eq!(
+						case.context.normalize(
+							env,
+							projection,
+							NormalizationDepth::Deep,
+							RewriteFlags::ALL
+						),
+						Err(SolverError::Poisoned)
+					);
+					continue;
+				}
+				let repr = case.context.stack_value_repr(env, ty).unwrap();
+				if name == "bounded" {
+					assert_eq!(repr, projection);
+					assert!(case.context.types.has_param(repr));
+					assert!(case.context.types.has_projection(repr));
+				} else {
+					assert_eq!(repr, TypeIndex::I32);
+				}
+				case.context.solver.set_limit_for_test(0);
+				assert_eq!(case.context.stack_value_repr(env, ty), Ok(repr));
+				case.context.solver.set_limit_for_test(128);
+				// Even a concrete output was derived from this environment's
+				// bound. Input flags, not output flags, govern the cache key.
+				assert_eq!(
+					case.context.stack_value_repr(AssumptionEnvIdx::ROOT, ty),
+					Err(SolverError::Poisoned)
+				);
+			}
+			case.diagnostics().assert_none();
+		}
+
 		/// The declarations a `StackValue` test builds on, as std writes them,
 		/// with `Is<X, R>` stating `<X as StackValue>::Repr == R`.
 		fn with_stack_value(source: &str) -> String {
@@ -16971,11 +17073,30 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_stored_projection_is_checked_in_its_own_context() {
-			with_pending_std_signatures(
-				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+			with_pending_signatures(
+				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U: StackValue>(x: T::Item) {}     ",
 				|builder| {
 					builder.sweep();
-					let signature = &builder.functions[0];
+					let function = builder
+						.defs
+						.functions
+						.iter()
+						.position(|def| {
+							builder.strings.resolve(def.name.inner) == Some("f")
+						})
+						.unwrap();
+					let marker = TraitIdx::new(
+						builder
+							.defs
+							.traits
+							.iter()
+							.position(|def| {
+								builder.strings.resolve(def.name.inner)
+									== Some("Marker")
+							})
+							.unwrap() as u32,
+					);
+					let signature = &builder.functions[function];
 					let env = signature.type_params;
 					let written = builder.types.list(signature.param_types)[0];
 					let u = builder.generic_envs.param_types(env)[1];
@@ -17001,7 +17122,7 @@ pub(super) mod tests {
 								.find_trait_impl_query(
 									builder.assumption_envs.of_frame(env),
 									ty,
-									TraitIdx::new(0)
+									marker
 								)
 								.map(|found| found.is_some()),
 							Ok(true)
@@ -17712,25 +17833,12 @@ pub(super) mod tests {
 	#[test]
 	fn an_imported_declaration_resolves_its_types_in_the_enclosing_scope() {
 		let mut builder = vfs::CompilationUnitBuilder::new();
-		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
-			(
-				"std.wx".to_string(),
-				"pub trait Call { type Args; type Result; } pub trait Function: Call {} pub type u32; type u8; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);"
-					.to_string(),
-			),
-			(
+		builder.load_stdlib();
+		let workspace =
+			vfs::VirtualFileSource::from_relative(HashMap::from([(
 				"main.wx".to_string(),
 				r#"struct S(); import "env" { func f(s: S); }"#.to_string(),
-			),
-		]));
-		let std = builder
-			.load_package(
-				vfs::PackageKind::Library,
-				vfs::AbsolutePath::new("/std.wx"),
-				&workspace,
-			)
-			.unwrap();
-		builder.set_stdlib(std);
+			)]));
 		let root = builder
 			.load_package(
 				vfs::PackageKind::Library,
@@ -18211,14 +18319,7 @@ pub(super) mod tests {
 	#[test]
 	fn a_struct_can_implement_call_but_only_functions_are_function() {
 		test_case!(
-			std mut case = indoc! {"
-			type i32;
-			pub trait Call {
-				type Args;
-				type Result;
-				func call(self: Self, args: Self::Args) -> Self::Result;
-			}
-			pub trait Function: Call {}
+			mut case = indoc! {"
 			struct Adder(value: i32);
 			impl Call for Adder {
 				type Args = i32;
@@ -18231,10 +18332,6 @@ pub(super) mod tests {
 			func callables(a: Callable<Adder>, b: Callable<handler>, c: Adder::Result) {}
 			func items(a: Item<handler>, b: Item<Adder>) {}
 			func generic<F: Function>(x: F::Args, y: F::Result) {}
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"}
 		);
 		// `Adder: Call` holds, so only `Adder: Function` fails.

@@ -231,12 +231,22 @@ struct Box<M: Memory, T>(p: M::*T);       // holds u32, [u8], later dyn alike
 
 ### As implemented
 
-- `Solver::non_stack_part` is the judgement: `push_stack_elements`, the walk
-  `StackValue` is answered by, returns the part that makes a type no
-  `StackValue` (a slice, an array, or an abstract part not assumed one), and
-  E2129 names it: "`Header` cannot be held by value, since it holds
-  `[u8; 16]`", with the suggestion `require T: StackValue` for an abstract
-  part. The walk normalizes `Deep`, as a declaration's other checks do, so a
+- `TypeContext::stack_value_repr` asks for `<T as StackValue>::Repr` through
+  ordinary normalization. Value checks and trait membership reuse its
+  successful answers in the existing normalization cache; no separate cache
+  or negative entries are needed. Projection rewriting handles equalities and
+  receiver normalization, then `project_value` computes builtin associated
+  values directly or falls back to `declared_projection_value` for impl selection.
+  The StackValue computation owns both its bound check and representation.
+  An abstract answer is accepted only with
+  evidence of the bound, and remains keyed by the input's assumption env
+  even when an equality makes its output concrete. A cold reduction collects
+  the representation once, rather than first collecting it for membership.
+  After a failed query, `explain_non_stack_value` locates an offending part
+  separately from representation collection. E2129 names it: "`Header` cannot
+  be held by value, since it holds `[u8; 16]`", with the suggestion
+  `require T: StackValue` for an abstract part. The walk normalizes `Deep`, as
+  a declaration's other checks do, so a
   loop through an equality (`First = (T::First, T::First)`) stays the rigid
   projection instead of unfolding a step at a time, and keeps the structs on
   its path, so a struct containing itself is poisoned (E2032 reports it)
@@ -244,7 +254,7 @@ struct Box<M: Memory, T>(p: M::*T);       // holds u32, [u8], later dyn alike
 - Signatures record `CheckValueType` for parameters, results, a function
   type's parts, and a local's or an ascription's written type. Two values
   are made with no written type, and are checked on the spot in the body
-  (`held_by_value`), the value typed `ERROR` when it fails, so nothing
+  (`require_stack_value`), the value typed `ERROR` when it fails, so nothing
   downstream reports again: a construction (its fields need nothing, the
   struct made of them does) and a load (`p.*`, `s[i]`, `p.field` read as a
   value).
@@ -267,7 +277,7 @@ struct Box<M: Memory, T>(p: M::*T);       // holds u32, [u8], later dyn alike
 ### `!` (implemented)
 
 `!` and any type containing it are `StackValue`s held as `!`
-(`stack_elements` collapses them to the one element `!`, `stack_repr` gives
+(`stack_elements` collapses them to the one element `!`, `compute_stack_value_repr` gives
 `Repr = !`). It must be one, since `func trap() -> !` and `local x: ! = trap();`
 hold it by value; codegen holds no Wasm value for it (a function returning it
 has the Wasm result `[]`, a local of it takes no Wasm local), since the code
@@ -412,7 +422,7 @@ pub trait Pointer: StackValue where {
   no generic associated type. It is the pattern the rigid
   `<M::&T as StackValue>::Repr` already follows.
 - `M::&T` and `M::*T` have one metadata; the answer goes through the shared
-  form, so the two are one cache entry (as `stack_repr` canonicalizes).
+  form, so the two are one cache entry (as `compute_stack_value_repr` canonicalizes).
 - The supertrait equality states the representation: an address, then the
   metadata. So std writes `from_raw_parts<P: Pointer>(address:
   P::Memory::Size, metadata: P::Metadata) -> P`, `metadata(pointer: P) ->
