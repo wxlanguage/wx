@@ -69,6 +69,28 @@ fn test_format_simple_function() {
 	);
 }
 
+#[test]
+fn test_format_crate_contract_items() {
+	let source = indoc! {"
+        pub crate type Word;
+        crate const LIMIT: Word;
+        pub crate func choose<T>(value: T) -> T;
+        crate \"math\" as math;
+    "};
+	let case = TestCase::new(source);
+	assert!(case.ast.diagnostics.is_empty());
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(output, source);
+}
+
 /// `use` trees round-trip through the formatter unchanged, groups included.
 /// They stay on one line even at a narrow `max_line_width`: a `use` names
 /// things living elsewhere, so its length tracks the path being imported

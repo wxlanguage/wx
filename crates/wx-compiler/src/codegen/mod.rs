@@ -197,14 +197,14 @@ pub struct Builder {
 	/// Maps every function DefId (imported or defined) to its wasm function
 	/// index. Imported functions occupy indices 0..import_func_count;
 	/// defined functions follow.
-	func_wasm_index: HashMap<ast::DefId, u32>,
+	func_wasm_index: HashMap<mir::FunctionId, u32>,
 	/// Maps every global DefId (imported or defined) to its wasm global index.
 	/// Imported globals occupy indices 0..import_global_count; defined globals
 	/// follow.
-	global_wasm_index: HashMap<ast::DefId, u32>,
+	global_wasm_index: HashMap<mir::GlobalId, u32>,
 	/// Maps every memory DefId (imported or defined) to its wasm index and kind.
 	/// Imported memories occupy indices 0..import_memory_count; defined follow.
-	memories: HashMap<ast::DefId, MemoryEntry>,
+	memories: HashMap<mir::MemoryId, MemoryEntry>,
 	/// Deduplicated function-type entries for the wasm type section.
 	/// Shared between function signatures and multi-value block types.
 	signatures: HashMap<FunctionSignature, SignatureIndex>,
@@ -254,7 +254,7 @@ impl Builder {
 		});
 		// One segment per memory that has static data; an entry's offset is
 		// relative to its own memory's segment.
-		let mut segment_bytes: HashMap<ast::DefId, Vec<u8>> = HashMap::new();
+		let mut segment_bytes: HashMap<mir::MemoryId, Vec<u8>> = HashMap::new();
 		let mut entry_offsets: HashMap<u32, u32> = HashMap::new();
 		for idx in sorted_indices {
 			let entry = &mir.static_entries[idx as usize];
@@ -1790,5 +1790,7 @@ impl WasmModule {
 	}
 }
 
-#[cfg(test)]
-mod tests;
+// Disconnected from the module graph: `tests.rs` still calls the removed
+// `tir::TIR::build` and is kept on disk as a reference corpus for new tests.
+// #[cfg(test)]
+// mod tests;

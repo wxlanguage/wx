@@ -1643,12 +1643,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&self.ast_nodes[self.query_state[&def_id].ast_index as usize];
 		let scope = self.const_scope(const_index);
 		let value = match entry.node {
-			AstNodeRef::Constant { item, .. } => {
-				let ast::Item::Const { value, .. } = item else {
-					unreachable!()
-				};
-				value
-			}
+			AstNodeRef::Constant { item, .. } => match item {
+				ast::Item::Const { value, .. } => value,
+				ast::Item::CrateConst { .. } => {
+					self.const_bodies[usize::from(const_index)] =
+						ConstBody::Missing;
+					return;
+				}
+				_ => unreachable!(),
+			},
 			AstNodeRef::TraitConst { item, .. } => {
 				let ast::TraitItem::Const { value, .. } = item else {
 					unreachable!()
@@ -1891,14 +1894,17 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				item,
 				type_alias_index,
 			} => {
-				let ast::Item::TypeAlias {
-					name,
-					type_params,
-					body,
-					..
-				} = item
-				else {
-					unreachable!()
+				let (name, type_params, body, crate_member) = match item {
+					ast::Item::TypeAlias {
+						name,
+						type_params,
+						body,
+						..
+					} => (name, type_params, body.as_deref(), false),
+					ast::Item::CrateType {
+						name, type_params, ..
+					} => (name, type_params, None, true),
+					_ => unreachable!(),
 				};
 
 				// A `#[intrinsic]` primitive (`type u8;`) is bodiless by
@@ -1935,11 +1941,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 									),
 								),
 								None => {
-									self.diagnostics.push(
-										report_missing_type_alias_body(
-											file_id, name.span,
-										),
-									);
+									if !crate_member {
+										self.diagnostics.push(
+											report_missing_type_alias_body(
+												file_id, name.span,
+											),
+										);
+									}
 									TypeIndex::ERROR
 								}
 							};
@@ -1954,8 +1962,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				SignatureLocation::TypeAlias(type_alias_index)
 			}
 			AstNodeRef::Constant { const_index, item } => {
-				let ast::Item::Const { name, ty, .. } = item else {
-					unreachable!()
+				let (name, ty) = match item {
+					ast::Item::Const { name, ty, .. } => (*name, ty.as_deref()),
+					ast::Item::CrateConst { name, ty, .. } => {
+						(*name, Some(ty.as_ref()))
+					}
+					_ => unreachable!(),
 				};
 				self.resolve_constant_signature(
 					obligations,
@@ -1963,8 +1975,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					namespace,
 					const_index,
 					TypeEnvIdx::ROOT,
-					*name,
-					ty.as_deref(),
+					name,
+					ty,
 				)
 			}
 			AstNodeRef::Trait { trait_index, item } => {
@@ -2437,7 +2449,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				func_index: function_index,
 			} => {
 				let (ast::Item::Function { signature, .. }
-				| ast::Item::FunctionDeclaration { signature, .. }) = item
+				| ast::Item::FunctionDeclaration { signature, .. }
+				| ast::Item::CrateFunction { signature, .. }) = item
 				else {
 					unreachable!()
 				};
@@ -8932,6 +8945,33 @@ pub(super) mod tests {
 			TypeIndex::I32
 		);
 		assert_eq!(signature.return_type, TypeIndex::I32);
+	}
+
+	#[test]
+	fn crate_contract_declarations_keep_signatures_without_bodies() {
+		test_case!(
+			case = indoc! {"
+			crate func supplied(x: i32) -> i32;
+			crate const LIMIT: i32;
+			crate type Native;
+		"}
+		);
+		case.diagnostics().assert_no_errors();
+		let signature = case.function_signature("supplied");
+		assert_eq!(
+			case.context.types.list(signature.param_types)[0],
+			TypeIndex::I32
+		);
+		assert_eq!(signature.return_type, TypeIndex::I32);
+		let DefKind::Const(index) = case.resolve(Tier::Value, "LIMIT") else {
+			panic!("LIMIT should resolve as a constant")
+		};
+		assert_eq!(
+			case.context.constants[usize::from(index)].ty,
+			TypeIndex::I32
+		);
+		assert!(case.context.const_body(index).is_none());
+		assert_eq!(case.type_alias("Native").target, TypeIndex::ERROR);
 	}
 
 	#[test]

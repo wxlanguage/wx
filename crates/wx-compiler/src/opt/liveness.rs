@@ -271,8 +271,10 @@ fn mark_node_inputs_live(
 			mark_node_live(*operand, live, worklist);
 		}
 		DataNodeKind::Aggregate { fields, .. } => {
-			for &field in fields.iter() {
-				mark_node_live(field, live, worklist);
+			for field in fields.iter() {
+				if let StackResult::Value(field) = field {
+					mark_node_live(*field, live, worklist);
+				}
 			}
 		}
 		DataNodeKind::LoopParam { before, after, .. } => {

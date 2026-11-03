@@ -717,6 +717,61 @@ impl<'a> Builder<'a> {
 				items.push(self.text(Text::Semi));
 				self.arena.concat(items)
 			}
+			ast::Item::CrateFunction {
+				pub_span,
+				attributes,
+				signature,
+				..
+			} => {
+				let mut items = Vec::new();
+				self.build_attributes(&mut items, attributes);
+				if pub_span.is_some() {
+					items.push(self.text(Text::Pub));
+				}
+				items.push(self.text(Text::Crate));
+				self.build_function_signature(&mut items, signature);
+				items.push(self.text(Text::Semi));
+				self.arena.concat(items)
+			}
+			ast::Item::CrateConst {
+				pub_span,
+				attributes,
+				name,
+				ty,
+				..
+			} => {
+				let mut items = Vec::new();
+				self.build_attributes(&mut items, attributes);
+				if pub_span.is_some() {
+					items.push(self.text(Text::Pub));
+				}
+				items.push(self.text(Text::Crate));
+				items.push(self.text(Text::Const));
+				items.push(self.symbol(name.inner));
+				items.push(self.text(Text::ColonSp));
+				items.push(self.build_type_expression(&ty.inner));
+				items.push(self.text(Text::Semi));
+				self.arena.concat(items)
+			}
+			ast::Item::CrateType {
+				pub_span,
+				attributes,
+				name,
+				type_params,
+				..
+			} => {
+				let mut items = Vec::new();
+				self.build_attributes(&mut items, attributes);
+				if pub_span.is_some() {
+					items.push(self.text(Text::Pub));
+				}
+				items.push(self.text(Text::Crate));
+				items.push(self.text(Text::TypeKw));
+				items.push(self.symbol(name.inner));
+				self.build_type_params(&mut items, type_params);
+				items.push(self.text(Text::Semi));
+				self.arena.concat(items)
+			}
 			ast::Item::Global {
 				pub_span,
 				mut_span,

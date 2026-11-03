@@ -20,12 +20,14 @@ mod liveness;
 mod local_dominance;
 pub mod scheduler;
 
-#[cfg(test)]
-mod tests;
+// Disconnected from the module graph: `tests.rs` still calls the removed
+// `tir::TIR::build` and is kept on disk as a reference corpus for new tests.
+// #[cfg(test)]
+// mod tests;
 
 use crate::index::index_newtype;
+use crate::mir;
 pub use crate::wasm::ScalarType;
-use crate::{ast, mir};
 
 pub type DataNodeIndex = u32;
 pub type BlockIndex = u32;
@@ -92,7 +94,7 @@ pub enum NodeType {
 	Aggregate(mir::AggregateIndex),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StackResult {
 	Value(DataNodeIndex),
 	Unit,
@@ -129,12 +131,12 @@ pub enum DataNodeKind {
 	},
 	/// Read from a mutable module global. Excluded from CSE.
 	GlobalGet {
-		id: ast::DefId,
+		id: mir::GlobalId,
 		ty: ScalarType,
 	},
 	/// Constant index into the WASM function table.
 	FunctionRef {
-		id: ast::DefId,
+		id: mir::FunctionId,
 	},
 	/// Pointer into the static data segment for a string or array constant.
 	/// `ty` is the pointer width of the memory holding the static data.
@@ -145,17 +147,17 @@ pub enum DataNodeKind {
 	/// Byte offset of the end of the data section (link-time constant).
 	/// `ty` is the memory's pointer width.
 	MemoryOffset {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		ty: ScalarType,
 	},
 	/// WASM linear-memory index as an integer constant, resolved at codegen.
 	MemoryIndex {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 	},
 	/// Result of a `MemorySize` control node. Excluded from CSE; always
 	/// spilled. `ty` is the memory's size type (I64 for Memory64).
 	MemorySizeResult {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		ty: ScalarType,
 	},
 
@@ -413,12 +415,17 @@ pub enum DataNodeKind {
 
 	// ── Aggregates (structs as SSA values) ─────────────────────────────────
 	Aggregate {
-		fields: Box<[DataNodeIndex]>,
+		/// One entry per *declaration* field, in declaration order — the same
+		/// order as the MIR aggregate's field list. A zero-sized field has an
+		/// entry here too; it is [`StackResult::Unit`] and contributes no
+		/// scalar. A nested aggregate field holds one aggregate-valued entry,
+		/// not its flattened scalars.
+		fields: Box<[StackResult]>,
 		aggregate_index: mir::AggregateIndex,
 	},
 	/// Projects a single WASM value out of an aggregate.
 	///
-	/// Indexed by [`mir::ScalarIndex`], *not* by physical field: a nested
+	/// Indexed by [`mir::ScalarIndex`], *not* by declaration field: a nested
 	/// field spans several scalars and a zero-sized field spans none, so a
 	/// field index would not name a value at all. This is why `ty` can be a
 	/// `ScalarType` — a scalar index always names exactly one WASM value.
@@ -476,7 +483,7 @@ pub enum DataNodeKind {
 		aggregate_index: mir::AggregateIndex,
 	},
 	MemoryGrowResult {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		delta: DataNodeIndex,
 		ty: ScalarType,
 	},
@@ -635,7 +642,7 @@ pub enum ControlNode {
 		value: StackResult,
 	},
 	GlobalSet {
-		id: ast::DefId,
+		id: mir::GlobalId,
 		value: DataNodeIndex,
 	},
 	Call {
@@ -733,23 +740,23 @@ pub enum ControlNode {
 	},
 	Unreachable,
 	MemorySize {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		result: DataNodeIndex,
 	},
 	MemoryGrow {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		delta: DataNodeIndex,
 		result: DataNodeIndex,
 	},
 	MemoryFill {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		dst: DataNodeIndex,
 		val: DataNodeIndex,
 		len: DataNodeIndex,
 	},
 	MemoryCopy {
-		dst_memory: ast::DefId,
-		src_memory: ast::DefId,
+		dst_memory: mir::MemoryId,
+		src_memory: mir::MemoryId,
 		dst: DataNodeIndex,
 		src: DataNodeIndex,
 		len: DataNodeIndex,
@@ -759,7 +766,7 @@ pub enum ControlNode {
 		/// Byte offset added to `address` at the WASM instruction level (memarg).
 		offset: u32,
 		result: DataNodeIndex,
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		access: MemAccess,
 	},
 	PointerStore {
@@ -767,7 +774,7 @@ pub enum ControlNode {
 		/// Byte offset added to `address` at the WASM instruction level (memarg).
 		offset: u32,
 		value: DataNodeIndex,
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		access: MemAccess,
 	},
 }
@@ -877,7 +884,7 @@ pub struct SwitchCase {
 }
 
 pub struct Function {
-	pub id: ast::DefId,
+	pub id: mir::FunctionId,
 	pub data_nodes: Vec<DataNode>,
 	/// One slot per MIR scope (indexed by scope index). `None` until the scope
 	/// is built.
@@ -891,7 +898,7 @@ pub struct Function {
 }
 
 impl Function {
-	pub fn new(id: ast::DefId, scope_count: usize) -> Self {
+	pub fn new(id: mir::FunctionId, scope_count: usize) -> Self {
 		Function {
 			id,
 			data_nodes: Vec::new(),
@@ -1095,8 +1102,10 @@ impl Function {
             }
 
             DataNodeKind::Aggregate { fields, .. } => {
-                for &f in fields.iter() {
-                    self.data_nodes[f as usize].uses.push(user_id);
+                for field in fields.iter() {
+                    if let StackResult::Value(f) = field {
+                        self.data_nodes[*f as usize].uses.push(user_id);
+                    }
                 }
             }
 

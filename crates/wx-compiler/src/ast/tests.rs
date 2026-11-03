@@ -299,6 +299,9 @@ fn item_kind(item: &Item) -> &'static str {
 	match item {
 		Item::Function { .. } => "a function",
 		Item::FunctionDeclaration { .. } => "a function declaration",
+		Item::CrateFunction { .. } => "a crate function",
+		Item::CrateConst { .. } => "a crate constant",
+		Item::CrateType { .. } => "a crate type",
 		Item::Global { .. } => "a global",
 		Item::Export { .. } => "an export",
 		Item::ExportBlock { .. } => "an export block",
@@ -3436,6 +3439,51 @@ fn test_bodyless_function_is_a_declaration() {
 
 	// the one with a body still parses as a plain function
 	assert!(matches!(case.item(1), Item::Function { .. }));
+}
+
+#[test]
+fn test_crate_contract_items_parse_and_keep_visibility() {
+	let case = TestCase::new(indoc! {"
+        pub crate type Word;
+        crate const LIMIT: Word;
+        pub crate func choose<T>(value: T) -> T;
+        crate \"math\" as math;
+    "});
+	case.diagnostics().assert_none();
+	assert!(matches!(
+		case.item(0),
+		Item::CrateType { pub_span: Some(_), name, .. }
+			if case.name(name.inner) == "Word"
+	));
+	assert!(matches!(
+		case.item(1),
+		Item::CrateConst { pub_span: None, name, .. }
+			if case.name(name.inner) == "LIMIT"
+	));
+	assert!(matches!(
+		case.item(2),
+		Item::CrateFunction { pub_span: Some(_), signature, .. }
+			if case.name(signature.name.inner) == "choose"
+	));
+	assert!(matches!(case.item(3), Item::PackageInstance { .. }));
+}
+
+#[test]
+fn test_crate_contract_items_reject_bodies() {
+	for source in [
+		"crate func f() {}",
+		"crate const N: i32 = 1;",
+		"crate type T = i32;",
+	] {
+		let case = TestCase::new(source);
+		assert!(
+			case.ast.diagnostics.iter().any(|diagnostic| {
+				diagnostic.code.as_deref()
+					== Some(DiagnosticCode::CrateMemberHasBody.code())
+			}),
+			"{source}"
+		);
+	}
 }
 
 #[test]

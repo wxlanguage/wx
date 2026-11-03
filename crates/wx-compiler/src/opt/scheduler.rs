@@ -1328,8 +1328,10 @@ impl<'f> Scheduler<'f> {
 				f(*operand);
 			}
 			DataNodeKind::Aggregate { fields, .. } => {
-				for &field in fields.iter() {
-					f(field);
+				for field in fields.iter() {
+					if let StackResult::Value(field) = field {
+						f(*field);
+					}
 				}
 			}
 			// Impure — unreachable here; see this function's doc comment.
@@ -2110,19 +2112,20 @@ impl<'f> Scheduler<'f> {
 		let mir = self.mir;
 		let agg = mir.aggregate(aggregate_index);
 		let mut locals = Vec::with_capacity(agg.scalars.len());
-		for (field, &field_node) in agg.fields.iter().zip(fields.iter()) {
+		for (field, &field_value) in agg.fields.iter().zip(fields.iter()) {
 			match field.ty {
 				mir::ValueType::Unit | mir::ValueType::Never => {}
 				mir::ValueType::Aggregate { .. } => {
-					self.ensure_aggregate_locals(field_node);
+					self.ensure_aggregate_locals(field_value.unwrap_value());
 					locals.extend_from_slice(
-						&self.node_to_aggregate_locals[&field_node],
+						&self.node_to_aggregate_locals
+							[&field_value.unwrap_value()],
 					);
 				}
 				ty => {
 					let scalar_ty = ScalarType::try_from(ty)
 						.expect("non-aggregate field must be scalar");
-					self.emit_value(field_node);
+					self.emit_value(field_value.unwrap_value());
 					let local = self.alloc_local(scalar_ty);
 					self.body.push(Instruction::LocalSet(local));
 					locals.push(local);

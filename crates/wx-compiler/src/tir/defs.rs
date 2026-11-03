@@ -46,6 +46,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	imports: Vec<ImportDef>,
 	ast_nodes: Vec<AstEntry<'ast>>,
 	exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	crate_contracts: Vec<CrateContract>,
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
@@ -625,6 +626,28 @@ pub(super) struct ExportEntrySource {
 	pub external_span: SourceSpan,
 }
 
+/// One package's externally supplied declarations, independent of the
+/// modules in which their names are visible. A free function claims both
+/// tiers, as it does in its module's ordinary symbol table.
+#[derive(Default)]
+pub(super) struct CrateContract {
+	pub(super) members: FxHashMap<BindingKey, CrateMember>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CrateMember {
+	pub(super) item: CrateMemberItem,
+	pub(super) namespace: Scope,
+	pub(super) source: SourceSpan,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CrateMemberItem {
+	Function(FunctionIdx),
+	Constant(ConstIdx),
+	Type(TypeAliasIdx),
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct DefinitionRegistry {
 	pub stdlib_package: PackageId,
@@ -637,6 +660,9 @@ pub(super) struct DefinitionRegistry {
 	pub imports: Vec<ImportDef>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
 	pub exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	/// Package-level contract keys, indexed by `PackageId`.
+	#[cfg_attr(test, serde(skip))]
+	pub(super) crate_contracts: Vec<CrateContract>,
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
@@ -1964,6 +1990,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_paths: Vec::new(),
 			ast_nodes: Vec::new(),
 			exports: FxHashMap::default(),
+			crate_contracts: packages
+				.iter()
+				.map(|_| CrateContract::default())
+				.collect(),
 			intrinsics: IntrinsicDefs::default(),
 			pending_named_imports: FxHashMap::default(),
 			pending_glob_targets: FxHashMap::default(),
@@ -2003,6 +2033,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			modules: builder.modules,
 			imports: builder.imports,
 			exports: builder.exports,
+			crate_contracts: builder.crate_contracts,
 			traits: builder.traits,
 			trait_impls: builder.trait_impls,
 			inherent_impls: builder.inherent_impls,
@@ -2398,6 +2429,52 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		);
 	}
 
+	fn record_crate_member(
+		&mut self,
+		file_id: FileId,
+		namespace: Scope,
+		name: Spanned<SymbolU32>,
+		item: CrateMemberItem,
+		keys: &[BindingKey],
+	) {
+		let package = self.namespaces.scope(namespace).package_id;
+		let source = SourceSpan::new(file_id, name.span);
+		let member = CrateMember {
+			item,
+			namespace,
+			source,
+		};
+		let mut reported = Vec::new();
+		for &key in keys {
+			let previous = self.crate_contracts[package.as_usize()]
+				.members
+				.get(&key)
+				.copied();
+			if let Some(previous) = previous {
+				// The ordinary namespace already reports same-module collisions.
+				// A function claims two keys, but one conflicting declaration
+				// should receive only one package-level diagnostic.
+				if previous.namespace != namespace
+					&& !reported.contains(&previous.source)
+				{
+					self.diagnostics.push(
+						DuplicateDefinitionDiagnostic {
+							strings: self.strings,
+							key,
+							definitions: (previous.source, source),
+						}
+						.report(),
+					);
+					reported.push(previous.source);
+				}
+			} else {
+				self.crate_contracts[package.as_usize()]
+					.members
+					.insert(key, member);
+			}
+		}
+	}
+
 	/// Records a package instance, `crate "key" as alias;`, and binds `alias` in its scope
 	/// to the package the manifest declares under `key`. The binding is as
 	/// visible as the item: private to the scope and everything inside it,
@@ -2632,6 +2709,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				signature,
 				pub_span,
 				..
+			}
+			| ast::Item::CrateFunction {
+				signature,
+				pub_span,
+				..
 			} => {
 				let func_index = FunctionIdx::new(
 					u32::try_from(self.functions.len()).unwrap(),
@@ -2670,6 +2752,18 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					params,
 					function_impls,
 				});
+				if matches!(item, ast::Item::CrateFunction { .. }) {
+					self.record_crate_member(
+						file_id,
+						namespace,
+						signature.name,
+						CrateMemberItem::Function(func_index),
+						&[
+							BindingKey::ty(signature.name.inner),
+							BindingKey::value(signature.name.inner),
+						],
+					);
+				}
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
@@ -2902,12 +2996,13 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					});
 				}
 			}
-			ast::Item::TypeAlias {
-				pub_span,
-				name,
-				body,
-				..
-			} => {
+			ast::Item::TypeAlias { pub_span, name, .. }
+			| ast::Item::CrateType { pub_span, name, .. } => {
+				let bodyless = match item {
+					ast::Item::TypeAlias { body, .. } => body.is_none(),
+					ast::Item::CrateType { .. } => true,
+					_ => unreachable!(),
+				};
 				let type_alias_index = TypeAliasIdx::new(
 					u32::try_from(self.type_aliases.len()).unwrap(),
 				);
@@ -2924,7 +3019,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
-				if body.is_none()
+				if bodyless
 					&& self.namespaces.scope(namespace).package_id
 						== self.stdlib_package
 				{
@@ -2941,6 +3036,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					namespace,
 					name: *name,
 				});
+				if matches!(item, ast::Item::CrateType { .. }) {
+					self.record_crate_member(
+						file_id,
+						namespace,
+						*name,
+						CrateMemberItem::Type(type_alias_index),
+						&[BindingKey::ty(name.inner)],
+					);
+				}
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
@@ -2981,7 +3085,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					node: AstNodeRef::Memory { memory_index, item },
 				});
 			}
-			ast::Item::Const { pub_span, name, .. } => {
+			ast::Item::Const { pub_span, name, .. }
+			| ast::Item::CrateConst { pub_span, name, .. } => {
 				let const_index =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				self.constants.push(ConstDef {
@@ -3000,6 +3105,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+				if matches!(item, ast::Item::CrateConst { .. }) {
+					self.record_crate_member(
+						file_id,
+						namespace,
+						*name,
+						CrateMemberItem::Constant(const_index),
+						&[BindingKey::value(name.inner)],
+					);
+				}
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
@@ -4086,6 +4200,54 @@ mod tests {
 	use super::*;
 	use crate::testing::DiagnosticView;
 	use crate::vfs;
+
+	#[test]
+	fn crate_contract_records_binding_tiers_across_modules() {
+		let case = TestCase::new(indoc! {"
+			mod first {
+				pub crate type Shared;
+				pub crate func compute(x: i32) -> i32;
+			}
+			mod second {
+				crate const Shared: i32;
+			}
+		"});
+		case.diagnostics().assert_none();
+		let contract =
+			&case.defs.crate_contracts[case.graph.root_package.as_usize()];
+		let shared = case.graph.strings.get("Shared").unwrap();
+		let compute = case.graph.strings.get("compute").unwrap();
+		assert!(matches!(
+			contract.members[&BindingKey::ty(shared)].item,
+			CrateMemberItem::Type(_)
+		));
+		assert!(matches!(
+			contract.members[&BindingKey::value(shared)].item,
+			CrateMemberItem::Constant(_)
+		));
+		let ty = contract.members[&BindingKey::ty(compute)];
+		let value = contract.members[&BindingKey::value(compute)];
+		assert!(matches!(ty.item, CrateMemberItem::Function(_)));
+		assert_eq!(ty.source, value.source);
+	}
+
+	#[test]
+	fn crate_contract_rejects_duplicate_keys_in_different_modules() {
+		let case = TestCase::new(indoc! {"
+			mod first { crate type Shared; }
+			mod second { crate type Shared; }
+		"});
+		let duplicates: Vec<_> = case
+			.diagnostics
+			.iter()
+			.filter(|diagnostic| {
+				diagnostic.code.as_deref()
+					== Some(DiagnosticCode::DuplicateDefinition.code())
+			})
+			.collect();
+		assert_eq!(duplicates.len(), 1);
+		assert_eq!(duplicates[0].labels.len(), 2);
+	}
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,

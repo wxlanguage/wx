@@ -117,6 +117,7 @@ define_diagnostic_codes! {
 		MissingTypeAnnotation => "E1023",
 		EnumReprNeedsParentheses => "E1024",
 		LabelOnIf => "E1025",
+		CrateMemberHasBody => "E1026",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
 		RedundantConstMarker => "W1003",

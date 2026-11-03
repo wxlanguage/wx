@@ -77,7 +77,7 @@ pub struct MemArg {
 	pub align: u32,
 	/// Static byte offset added to the runtime address.
 	pub offset: u32,
-	pub memory: crate::ast::DefId,
+	pub memory: mir::MemoryId,
 }
 
 /// A WASM local variable declaration.
@@ -117,8 +117,8 @@ pub enum Instruction {
 	LocalSet(u32),
 	LocalTee(u32),
 	// Globals
-	GlobalGet(crate::ast::DefId),
-	GlobalSet(crate::ast::DefId),
+	GlobalGet(mir::GlobalId),
+	GlobalSet(mir::GlobalId),
 	// Arithmetic — i32
 	I32Add,
 	I32Sub,
@@ -239,23 +239,23 @@ pub enum Instruction {
 	// Calls
 	/// Direct call; the encoder resolves the WASM function index from
 	/// `func_wasm_index`, covering both internal and imported functions.
-	Call(crate::ast::DefId),
+	Call(mir::FunctionId),
 	/// Indirect call via the function table; the encoder resolves `type_index`
 	/// from the referenced MIR signature.
 	CallIndirectSym {
 		mir_sig_index: mir::SignatureIndex,
 	},
 	// Memory
-	MemorySize(crate::ast::DefId),
-	MemoryGrow(crate::ast::DefId),
-	MemoryFill(crate::ast::DefId),
+	MemorySize(mir::MemoryId),
+	MemoryGrow(mir::MemoryId),
+	MemoryFill(mir::MemoryId),
 	MemoryCopy {
-		dst: crate::ast::DefId,
-		src: crate::ast::DefId,
+		dst: mir::MemoryId,
+		src: mir::MemoryId,
 	},
 	/// Wasm linear-memory index as an `i32.const`, resolved at codegen.
 	MemoryIndex {
-		memory: crate::ast::DefId,
+		memory: mir::MemoryId,
 	},
 	// Pointer load/store
 	I32Load8S(MemArg),
@@ -304,11 +304,11 @@ pub enum Instruction {
 	// codegen encoder, which has access to the string pool and function table.
 	/// A function referenced as a value; the encoder pushes it into the
 	/// function table and emits `i32.const <table_index>`.
-	FunctionPointer(crate::ast::DefId),
+	FunctionPointer(mir::FunctionId),
 	/// End of the static data section for a given memory (base of writable
 	/// heap); the encoder emits `i32.const <data_section_end>`.
 	DataSectionEnd {
-		memory: crate::ast::DefId,
+		memory: mir::MemoryId,
 	},
 	/// A static array; the encoder resolves the index to a byte offset in the
 	/// data segment and emits `i32.const <byte_offset>`.

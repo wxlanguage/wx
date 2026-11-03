@@ -1958,6 +1958,27 @@ pub enum Item {
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 	},
+	/// A package contract member whose implementation is supplied externally.
+	CrateFunction {
+		pub_span: Option<TextSpan>,
+		crate_span: TextSpan,
+		attributes: Box<[Attribute]>,
+		signature: FunctionSignature,
+	},
+	CrateConst {
+		pub_span: Option<TextSpan>,
+		crate_span: TextSpan,
+		attributes: Box<[Attribute]>,
+		name: Spanned<SymbolU32>,
+		ty: Box<Spanned<TypeExpression>>,
+	},
+	CrateType {
+		pub_span: Option<TextSpan>,
+		crate_span: TextSpan,
+		attributes: Box<[Attribute]>,
+		name: Spanned<SymbolU32>,
+		type_params: Box<[TypeParam]>,
+	},
 	Global {
 		pub_span: Option<TextSpan>,
 		mut_span: Option<TextSpan>,
@@ -2108,6 +2129,9 @@ impl Item {
 			Item::Global { .. }
 			| Item::Export { .. }
 			| Item::Const { .. }
+			| Item::CrateFunction { .. }
+			| Item::CrateConst { .. }
+			| Item::CrateType { .. }
 			| Item::Memory { .. }
 			| Item::FunctionDeclaration { .. }
 			| Item::ModuleDeclaration { .. }
@@ -2124,6 +2148,9 @@ impl Item {
 		match self {
 			Item::Function { attributes, .. }
 			| Item::FunctionDeclaration { attributes, .. }
+			| Item::CrateFunction { attributes, .. }
+			| Item::CrateConst { attributes, .. }
+			| Item::CrateType { attributes, .. }
 			| Item::Trait { attributes, .. }
 			| Item::TypeSet { attributes, .. }
 			| Item::Const { attributes, .. }
@@ -2615,7 +2642,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Const) => Ok(Parser::parse_const_item),
 			Some(Keyword::Mod) => Ok(Parser::parse_module_item),
 			Some(Keyword::Use) => Ok(Parser::parse_use_item),
-			Some(Keyword::Crate) => Ok(Parser::parse_package_instance),
+			Some(Keyword::Crate) => Ok(Parser::parse_crate_item),
 			Some(Keyword::Pub) => Ok(Parser::parse_pub_item),
 			Some(Keyword::Trait) => Ok(Parser::parse_trait_item),
 			Some(Keyword::Typeset) => Ok(Parser::parse_typeset_item),
@@ -6246,6 +6273,9 @@ impl<'ctx> Parser<'ctx> {
 		match &mut item.inner {
 			Item::Function { pub_span: span, .. }
 			| Item::FunctionDeclaration { pub_span: span, .. }
+			| Item::CrateFunction { pub_span: span, .. }
+			| Item::CrateConst { pub_span: span, .. }
+			| Item::CrateType { pub_span: span, .. }
 			| Item::Global { pub_span: span, .. }
 			| Item::Enum { pub_span: span, .. }
 			| Item::Struct { pub_span: span, .. }
@@ -6589,13 +6619,124 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
+	/// `crate func`, `crate const`, `crate type`, or a package instance.
+	fn parse_crate_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
+		let crate_span = parser.lexer.next().span;
+		if parser.lexer.peek().inner == Token::String {
+			return Parser::parse_package_instance(parser, crate_span);
+		}
+		let (item, end) = match parser.peek_keyword() {
+			Some(Keyword::Func) => {
+				let signature = parser.parse_function_signature()?;
+				let end = if parser.lexer.peek().inner == Token::OpenBrace {
+					let body = Parser::parse_block_expression(parser)?;
+					parser.report_crate_member_body(body.span);
+					body.span.end
+				} else {
+					signature.span.end
+				};
+				(
+					Item::CrateFunction {
+						pub_span: None,
+						crate_span,
+						attributes: Box::new([]),
+						signature: signature.inner,
+					},
+					end,
+				)
+			}
+			Some(Keyword::Const) => {
+				parser.lexer.next();
+				let name_span = parser.next_expect(Token::Identifier)?.span;
+				let name = Spanned {
+					inner: parser.intern_identifier(name_span),
+					span: name_span,
+				};
+				parser.next_expect(Token::Colon)?;
+				let ty = parser.parse_type_expression()?;
+				let end = if parser.lexer.next_if(Token::Eq).is_some() {
+					let value =
+						parser.parse_expression(BindingPower::Default)?;
+					parser.report_crate_member_body(value.span);
+					value.span.end
+				} else {
+					ty.span.end
+				};
+				(
+					Item::CrateConst {
+						pub_span: None,
+						crate_span,
+						attributes: Box::new([]),
+						name,
+						ty: Box::new(ty),
+					},
+					end,
+				)
+			}
+			Some(Keyword::Type) => {
+				parser.lexer.next();
+				let name_span = parser.next_expect(Token::Identifier)?.span;
+				let name = Spanned {
+					inner: parser.intern_identifier(name_span),
+					span: name_span,
+				};
+				let type_params =
+					if parser.lexer.peek().inner == Token::LeftArrow {
+						parser.parse_type_params()?
+					} else {
+						Box::new([])
+					};
+				let end = if parser.lexer.next_if(Token::Eq).is_some() {
+					let body = parser.parse_type_expression()?;
+					parser.report_crate_member_body(body.span);
+					body.span.end
+				} else {
+					name_span.end
+				};
+				(
+					Item::CrateType {
+						pub_span: None,
+						crate_span,
+						attributes: Box::new([]),
+						name,
+						type_params,
+					},
+					end,
+				)
+			}
+			_ => {
+				let token = parser.lexer.peek();
+				parser
+					.ast
+					.diagnostics
+					.push(report_invalid_item(parser.ast.file_id, token.span));
+				return Err(());
+			}
+		};
+		Ok(Spanned {
+			inner: item,
+			span: TextSpan::new(crate_span.start, end),
+		})
+	}
+
+	fn report_crate_member_body(&mut self, span: TextSpan) {
+		self.ast.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::CrateMemberHasBody.code())
+				.with_message("a crate member cannot have a body")
+				.with_label(
+					Label::primary(self.ast.file_id, span)
+						.with_message("remove this body"),
+				),
+		);
+	}
+
 	/// `crate "name" as alias;`. The trailing `;` is left for the caller, like
 	/// every other item's.
 	fn parse_package_instance(
 		parser: &mut Parser,
+		crate_span: TextSpan,
 	) -> Result<Spanned<Item>, ()> {
-		let crate_span = parser.lexer.next().span; // consume `crate`
-
 		let package = parser.next_expect(Token::String)?.span;
 
 		let token = parser.lexer.peek();
