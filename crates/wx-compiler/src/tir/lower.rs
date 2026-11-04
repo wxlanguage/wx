@@ -1369,17 +1369,23 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				Ok(state.push(mir::ExprKind::Return { value }, ty))
 			}
 
-			// Checked forms the first checkpoint does not lower yet. Listed
-			// exhaustively so a new TIR variant forces a decision here.
-			ExprKind::Error
-			| ExprKind::NextDiscriminant(_)
-			| ExprKind::CallRef { .. } => {
+			// A call of a function value lowers to `call_ref`, which needs a
+			// function reference type MIR does not have yet.
+			ExprKind::CallRef { .. } => {
 				self.unsupported(
 					state.file_id,
 					body.span(expr),
-					"this expression",
+					"a call of a function reference (`call_ref`)",
 				)?;
 				unreachable!()
+			}
+			// The checker reported it, and lowering runs only on a program
+			// with no errors.
+			ExprKind::Error => unreachable!("lowering an erroneous body"),
+			// Only a variant's body is one, and a constant's body is
+			// evaluated, never lowered: a use of the variant is a `Const`.
+			ExprKind::NextDiscriminant(_) => {
+				unreachable!("lowering a constant's body")
 			}
 		}
 	}
