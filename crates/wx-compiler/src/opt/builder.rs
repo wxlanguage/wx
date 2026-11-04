@@ -4,7 +4,7 @@ use crate::mir::{
 use crate::opt::{
 	Block, BlockIndex, BlockKind, ControlNode, DataNodeIndex, DataNodeKind,
 	Function, JoinData, MemAccess, NodeType, ScalarType, StackResult,
-	SwitchCase,
+	SwitchCase, TrappingOp,
 };
 
 /// The opt block of the function's own body. A MIR label `l` is block
@@ -190,9 +190,7 @@ impl<'mir> Builder<'mir> {
 					ty != mir::ValueType::Bool || matches!(value, 0 | 1),
 					"a Bool-typed Int must be 0 or 1"
 				);
-				StackResult::Value(
-					self.node(DataNodeKind::Int { value, ty: scalar }),
-				)
+				StackResult::Value(self.int(value, scalar))
 			}
 			ExprKind::Float { value } => {
 				let scalar =
@@ -227,10 +225,14 @@ impl<'mir> Builder<'mir> {
 			// ── Module-level state ────────────────────────────────────────
 			ExprKind::Global { id } => {
 				let scalar =
-					ScalarType::try_from(ty).unwrap_or(ScalarType::I32);
-				let node =
-					self.node(DataNodeKind::GlobalGet { id, ty: scalar });
-				StackResult::Value(node)
+					ScalarType::try_from(ty).expect("a global read is scalar");
+				let result =
+					self.node(DataNodeKind::GlobalGetResult { ty: scalar });
+				self.push_stmt(
+					block_idx,
+					ControlNode::GlobalGet { id, result },
+				);
+				StackResult::Value(result)
 			}
 			ExprKind::GlobalSet { id, value } => {
 				let Some(value) = self.build_value(block_idx, bindings, value)
@@ -337,7 +339,9 @@ impl<'mir> Builder<'mir> {
 				else {
 					return StackResult::Never;
 				};
-				StackResult::Value(self.node(conversion(from, ty, operand)))
+				StackResult::Value(
+					self.build_conversion(block_idx, from, ty, operand),
+				)
 			}
 			ExprKind::Reinterpret { value } => {
 				let Some(operand) =
@@ -586,10 +590,9 @@ impl<'mir> Builder<'mir> {
 				// of its break value. See `carried_binding_updates`.
 				let carried_binding_updates =
 					self.carried_binding_updates(target, bindings);
-				// The merged value is unused here: at a break site,
-				// merge_exit_value only updates the target's accumulated
-				// result and break_result_outputs.
-				self.merge_exit_value(target, val);
+				// Establish the target's result identities; this exit keeps its
+				// own raw value for the stores before committing carried locals.
+				self.record_exit_value(target, val);
 				self.push_stmt(
 					block_idx,
 					ControlNode::Break {
@@ -874,14 +877,11 @@ impl<'mir> Builder<'mir> {
 		let fallthrough_result =
 			self.build_statements(scope_u32, &mut child, statements);
 
-		// "Once more, for the fallthrough" — the same fold every break
-		// already goes through (via merge_exit_value, inside the
-		// ExprKind::Break arm), applied one final time for falling off the
-		// end of the body.
+		// Falling through contributes to the same result slots as a break.
 		let merged_result =
-			self.merge_exit_value(scope_u32, fallthrough_result);
+			self.record_exit_value(scope_u32, fallthrough_result);
 
-		// `merge_exit_value` stored the merged result on the block itself.
+		// `record_exit_value` stored the joined result on the block itself.
 		// That is the *join's* value (carried by `BlockJoin::result` below),
 		// not a value the body reads at its tail: the body's own tail is
 		// just its ordinary fallthrough value. Restore it, mirroring
@@ -1225,10 +1225,7 @@ impl<'mir> Builder<'mir> {
 		StackResult,
 		Vec<Option<StackResult>>,
 	) {
-		let const_node = self.node(DataNodeKind::Int {
-			value: discriminant,
-			ty: selector_ty,
-		});
+		let const_node = self.int(discriminant, selector_ty);
 		let condition = self.node(DataNodeKind::Eq {
 			left: selector,
 			right: const_node,
@@ -2100,18 +2097,11 @@ impl<'mir> Builder<'mir> {
 		}
 	}
 
-	/// Merges a `break`'s own value (or, for a block-join, the fallthrough's
-	/// own tail value) into whatever `target`'s accumulated trailing value is
-	/// so far, exactly like `Loop`'s own trailing-value merge — this is the
-	/// loop-vs-block-join-agnostic core the `ExprKind::Break` arm and
-	/// `build_block_expr`'s fallthrough step both call into. When two
-	/// distinct values are merged, phi nodes are created and stored in
-	/// `break_result_outputs` (on whichever side table `target` actually
-	/// has) so the scheduler can pre-allocate WASM locals for them — the
-	/// outputs vec is replaced (not appended) each call so it always
-	/// reflects the current phi set: every exit writes directly to the
-	/// final phi's local at runtime.
-	fn merge_exit_value(
+	/// The first value-producing exit gives the target stable result slots;
+	/// every break/fallthrough writes its own value into those same slots.
+	/// Even a single exit cannot return its raw expression: committing carried
+	/// locals can change the operands before an outside consumer evaluates it.
+	fn record_exit_value(
 		&mut self,
 		target: BlockIndex,
 		val: StackResult,
@@ -2119,13 +2109,47 @@ impl<'mir> Builder<'mir> {
 		let existing =
 			self.func.blocks[target as usize].as_ref().unwrap().result;
 		let merged = match (existing, val) {
+			(StackResult::Never, StackResult::Value(value)) => {
+				let node_type =
+					self.func.data_nodes[value as usize].kind.node_type();
+				let outputs = match node_type {
+					NodeType::Scalar(ty) => {
+						vec![self.func.push_join_param(target, ty)]
+					}
+					NodeType::Aggregate(aggregate_index) => self
+						.mir
+						.aggregate(aggregate_index)
+						.scalars
+						.iter()
+						.map(|&ty| {
+							let ty = ScalarType::try_from(ty)
+								.expect("a pack slot is scalar");
+							self.func.push_join_param(target, ty)
+						})
+						.collect(),
+				};
+				let result = match node_type {
+					NodeType::Scalar(_) => outputs[0],
+					NodeType::Aggregate(aggregate_index) => {
+						// The pack and join table each own their scalar list.
+						self.aggregate_from_scalars(
+							aggregate_index,
+							outputs.clone(),
+						)
+					}
+				};
+				self.func.join_data_mut(target).break_result_outputs = outputs;
+				StackResult::Value(result)
+			}
 			(StackResult::Never, other) | (other, StackResult::Never) => other,
 			(StackResult::Unit, StackResult::Unit) => StackResult::Unit,
 			(StackResult::Value(l), StackResult::Value(r)) => {
-				let mut outputs = Vec::new();
-				let node = self.merge_values(l, r, &mut outputs);
-				self.func.join_data_mut(target).break_result_outputs = outputs;
-				StackResult::Value(node)
+				debug_assert_eq!(
+					self.func.data_nodes[l as usize].kind.node_type(),
+					self.func.data_nodes[r as usize].kind.node_type(),
+					"all exits have the target's checked result type"
+				);
+				StackResult::Value(l)
 			}
 			_ => {
 				panic!("cannot merge exit results {:?} and {:?}", existing, val)
@@ -2428,8 +2452,9 @@ impl<'mir> Builder<'mir> {
 	/// and unsigned instructions for division, remainder, and right shift;
 	/// `ScalarType` can't tell them apart (`u32` and `i32` are both `I32`
 	/// there), so the node kind is chosen from the MIR type. Unsigned
-	/// integers and pointers take the `_u` variants; floats keep the `S`
-	/// kinds, which the scheduler maps to the sign-free float instructions.
+	/// integers and pointers take the `_u` variants. Potentially trapping
+	/// integer division/remainder are control operations; float division stays
+	/// in the freely movable data graph.
 	fn build_binary(
 		&mut self,
 		block_idx: BlockIndex,
@@ -2451,14 +2476,29 @@ impl<'mir> Builder<'mir> {
 			return StackResult::Never;
 		};
 
+		if matches!(ty, ScalarType::I32 | ScalarType::I64) {
+			let trapping = match op {
+				BinaryOp::Div if unsigned => {
+					Some(TrappingOp::DivU { left, right, ty })
+				}
+				BinaryOp::Div => Some(TrappingOp::DivS { left, right, ty }),
+				BinaryOp::Rem if unsigned => {
+					Some(TrappingOp::RemU { left, right, ty })
+				}
+				BinaryOp::Rem => Some(TrappingOp::RemS { left, right, ty }),
+				_ => None,
+			};
+			if let Some(op) = trapping {
+				return StackResult::Value(self.build_trapping(block_idx, op));
+			}
+		}
+
 		let kind = match op {
 			BinaryOp::Add => N::Add { left, right, ty },
 			BinaryOp::Sub => N::Sub { left, right, ty },
 			BinaryOp::Mul => N::Mul { left, right, ty },
-			BinaryOp::Div if unsigned => N::DivU { left, right, ty },
-			BinaryOp::Div => N::DivS { left, right, ty },
-			BinaryOp::Rem if unsigned => N::RemU { left, right, ty },
-			BinaryOp::Rem => N::RemS { left, right, ty },
+			BinaryOp::Div => N::Div { left, right, ty },
+			BinaryOp::Rem => unreachable!("remainder has integer operands"),
 			BinaryOp::BitAnd => N::BitAnd { left, right, ty },
 			BinaryOp::BitOr => N::BitOr { left, right, ty },
 			BinaryOp::BitXor => N::BitXor { left, right, ty },
@@ -2470,6 +2510,116 @@ impl<'mir> Builder<'mir> {
 			BinaryOp::Copysign => N::Copysign { left, right, ty },
 		};
 		StackResult::Value(self.node(kind))
+	}
+
+	/// Constant-fold only when the operation is proved not to trap. Otherwise
+	/// its control producer survives even if every consumer discards the value.
+	fn build_trapping(
+		&mut self,
+		block_idx: BlockIndex,
+		op: TrappingOp,
+	) -> DataNodeIndex {
+		if let TrappingOp::DivS { left, right, .. }
+		| TrappingOp::DivU { left, right, .. } = op
+			&& self.unwrap_int(right) == Some(1)
+		{
+			return left;
+		}
+		if let Some(value) = self.fold_trapping_int(op) {
+			return self.int(value, op.result_type());
+		}
+		let result = self.node(DataNodeKind::TrappingResult {
+			ty: op.result_type(),
+		});
+		self.push_stmt(block_idx, ControlNode::Trapping { op, result });
+		result
+	}
+
+	fn fold_trapping_int(&self, op: TrappingOp) -> Option<i64> {
+		let (left, right, ty) = match op {
+			TrappingOp::DivS { left, right, ty }
+			| TrappingOp::DivU { left, right, ty }
+			| TrappingOp::RemS { left, right, ty }
+			| TrappingOp::RemU { left, right, ty } => (left, right, ty),
+			_ => return None,
+		};
+		let l = self.unwrap_int(left)?;
+		let r = self.unwrap_int(right)?;
+		use ScalarType::{I32, I64};
+		Some(match (op, ty) {
+			(TrappingOp::DivS { .. }, I32) => {
+				(l as i32).checked_div(r as i32)? as i64
+			}
+			(TrappingOp::DivS { .. }, I64) => l.checked_div(r)?,
+			(TrappingOp::DivU { .. }, I32) => {
+				(l as u32).checked_div(r as u32)? as i32 as i64
+			}
+			(TrappingOp::DivU { .. }, I64) => {
+				(l as u64).checked_div(r as u64)? as i64
+			}
+			// Wasm rem_s(INT_MIN, -1) is zero, not an overflow trap.
+			(TrappingOp::RemS { .. }, I32) if r as i32 != 0 => {
+				(l as i32).wrapping_rem(r as i32) as i64
+			}
+			(TrappingOp::RemS { .. }, I64) if r != 0 => l.wrapping_rem(r),
+			(TrappingOp::RemU { .. }, I32) => {
+				(l as u32).checked_rem(r as u32)? as i32 as i64
+			}
+			(TrappingOp::RemU { .. }, I64) => {
+				(l as u64).checked_rem(r as u64)? as i64
+			}
+			_ => return None,
+		})
+	}
+
+	/// Signedness comes from the source for integer extension/float conversion,
+	/// and from the target for trapping float-to-integer truncation.
+	fn build_conversion(
+		&mut self,
+		block_idx: BlockIndex,
+		from: mir::ValueType,
+		to: mir::ValueType,
+		operand: DataNodeIndex,
+	) -> DataNodeIndex {
+		use DataNodeKind as N;
+		use ScalarType::{F32, F64, I32, I64};
+		use TrappingOp as T;
+		let source =
+			ScalarType::try_from(from).expect("a conversion is scalar");
+		let target = ScalarType::try_from(to).expect("a conversion is scalar");
+		let trapping = match (source, target) {
+			(F32, I32) if to.is_unsigned() => Some(T::U32TruncF32 { operand }),
+			(F32, I32) => Some(T::I32TruncF32 { operand }),
+			(F64, I32) if to.is_unsigned() => Some(T::U32TruncF64 { operand }),
+			(F64, I32) => Some(T::I32TruncF64 { operand }),
+			(F32, I64) if to.is_unsigned() => Some(T::U64TruncF32 { operand }),
+			(F32, I64) => Some(T::I64TruncF32 { operand }),
+			(F64, I64) if to.is_unsigned() => Some(T::U64TruncF64 { operand }),
+			(F64, I64) => Some(T::I64TruncF64 { operand }),
+			_ => None,
+		};
+		if let Some(op) = trapping {
+			return self.build_trapping(block_idx, op);
+		}
+		let kind = match (source, target) {
+			(I32, I64) if from.is_unsigned() => N::I64ExtendI32U { operand },
+			(I32, I64) => N::I64ExtendI32S { operand },
+			(I64, I32) => N::I32WrapI64 { operand },
+			(I32, F32) if from.is_unsigned() => N::F32ConvertU32 { operand },
+			(I32, F32) => N::F32ConvertI32 { operand },
+			(I64, F32) if from.is_unsigned() => N::F32ConvertU64 { operand },
+			(I64, F32) => N::F32ConvertI64 { operand },
+			(I32, F64) if from.is_unsigned() => N::F64ConvertU32 { operand },
+			(I32, F64) => N::F64ConvertI32 { operand },
+			(I64, F64) if from.is_unsigned() => N::F64ConvertU64 { operand },
+			(I64, F64) => N::F64ConvertI64 { operand },
+			(F32, F64) => N::F64PromoteF32 { operand },
+			(F64, F32) => N::F32DemoteF64 { operand },
+			(source, target) => {
+				unreachable!("no conversion from {source:?} to {target:?}")
+			}
+		};
+		self.node(kind)
 	}
 
 	/// Comparison operators. Like `build_binary`, the signed/unsigned
@@ -2558,10 +2708,7 @@ impl<'mir> Builder<'mir> {
 						bits: 0,
 						ty: ScalarType::F64,
 					}),
-					_ => self.node(DataNodeKind::Int {
-						value: 0,
-						ty: scalar_ty,
-					}),
+					_ => self.int(0, scalar_ty),
 				};
 				StackResult::Value(node)
 			}
@@ -2587,7 +2734,8 @@ impl<'mir> Builder<'mir> {
 
 	/// The primary way to create a node. Applies algebraic simplifications
 	/// then interns via CSE. Call `func.intern_node` directly only when the
-	/// kind is already canonical (e.g. a freshly computed `Int` constant).
+	/// kind is already canonical (e.g. through `int` for a freshly computed
+	/// integer constant).
 	fn node(&mut self, kind: DataNodeKind) -> DataNodeIndex {
 		// AggregateGet of a known Aggregate returns the holding node directly.
 		if let DataNodeKind::AggregateGet {
@@ -2627,6 +2775,20 @@ impl<'mir> Builder<'mir> {
 		self.func.intern_node(kind)
 	}
 
+	/// Create an integer constant in the canonical form its Wasm width stores:
+	/// an `I32` value is sign-extended to its 32-bit pattern, while an `I64`
+	/// value is already full-width. Every `Int` node is built through this, so
+	/// folds may compare the stored value directly; emission truncates it back
+	/// with `I32Const(value as i32)`.
+	fn int(&mut self, value: i64, ty: ScalarType) -> DataNodeIndex {
+		let value = match ty {
+			ScalarType::I32 => value as i32 as i64,
+			ScalarType::I64 => value,
+			_ => unreachable!("Int node with float type"),
+		};
+		self.func.intern_node(DataNodeKind::Int { value, ty })
+	}
+
 	fn unwrap_int(&self, node: DataNodeIndex) -> Option<i64> {
 		match self.func.data_nodes[node as usize].kind {
 			DataNodeKind::Int { value, .. } => Some(value),
@@ -2643,10 +2805,7 @@ impl<'mir> Builder<'mir> {
 					ScalarType::I64 => v.wrapping_neg(),
 					_ => return None,
 				};
-				return Some(self.func.intern_node(DataNodeKind::Int {
-					value: result,
-					ty: *ty,
-				}));
+				return Some(self.int(result, *ty));
 			}
 			DataNodeKind::BitNot { operand, ty } => {
 				let v = self.unwrap_int(*operand)?;
@@ -2655,38 +2814,23 @@ impl<'mir> Builder<'mir> {
 					ScalarType::I64 => !v,
 					_ => return None,
 				};
-				return Some(self.func.intern_node(DataNodeKind::Int {
-					value: result,
-					ty: *ty,
-				}));
+				return Some(self.int(result, *ty));
 			}
 			DataNodeKind::Eqz { operand } => {
 				let v = self.unwrap_int(*operand)?;
-				return Some(self.func.intern_node(DataNodeKind::Int {
-					value: (v == 0) as i64,
-					ty: ScalarType::I32,
-				}));
+				return Some(self.int((v == 0) as i64, ScalarType::I32));
 			}
 			DataNodeKind::I32WrapI64 { operand } => {
 				let v = self.unwrap_int(*operand)?;
-				return Some(self.func.intern_node(DataNodeKind::Int {
-					value: v as i32 as i64,
-					ty: ScalarType::I32,
-				}));
+				return Some(self.int(v as i32 as i64, ScalarType::I32));
 			}
 			DataNodeKind::I64ExtendI32S { operand } => {
 				let v = self.unwrap_int(*operand)?;
-				return Some(self.func.intern_node(DataNodeKind::Int {
-					value: v as i32 as i64,
-					ty: ScalarType::I64,
-				}));
+				return Some(self.int(v as i32 as i64, ScalarType::I64));
 			}
 			DataNodeKind::I64ExtendI32U { operand } => {
 				let v = self.unwrap_int(*operand)?;
-				return Some(self.func.intern_node(DataNodeKind::Int {
-					value: v as u32 as i64,
-					ty: ScalarType::I64,
-				}));
+				return Some(self.int(v as u32 as i64, ScalarType::I64));
 			}
 			DataNodeKind::Eq { left, right, ty }
 			| DataNodeKind::NotEq { left, right, ty }
@@ -2739,10 +2883,7 @@ impl<'mir> Builder<'mir> {
 					},
 					_ => unreachable!(),
 				};
-				return Some(self.func.intern_node(DataNodeKind::Int {
-					value: result,
-					ty: ScalarType::I32,
-				}));
+				return Some(self.int(result, ScalarType::I32));
 			}
 			_ => {}
 		}
@@ -2752,10 +2893,6 @@ impl<'mir> Builder<'mir> {
 			DataNodeKind::Add { left, right, ty } => (left, right, ty),
 			DataNodeKind::Sub { left, right, ty } => (left, right, ty),
 			DataNodeKind::Mul { left, right, ty } => (left, right, ty),
-			DataNodeKind::DivS { left, right, ty } => (left, right, ty),
-			DataNodeKind::DivU { left, right, ty } => (left, right, ty),
-			DataNodeKind::RemS { left, right, ty } => (left, right, ty),
-			DataNodeKind::RemU { left, right, ty } => (left, right, ty),
 			DataNodeKind::BitAnd { left, right, ty } => (left, right, ty),
 			DataNodeKind::BitOr { left, right, ty } => (left, right, ty),
 			DataNodeKind::BitXor { left, right, ty } => (left, right, ty),
@@ -2772,34 +2909,6 @@ impl<'mir> Builder<'mir> {
 			DataNodeKind::Add { .. } => l.wrapping_add(r),
 			DataNodeKind::Sub { .. } => l.wrapping_sub(r),
 			DataNodeKind::Mul { .. } => l.wrapping_mul(r),
-			DataNodeKind::DivS { .. } | DataNodeKind::RemS { .. } if r == 0 => {
-				return None;
-			}
-			DataNodeKind::DivU { .. } | DataNodeKind::RemU { .. } if r == 0 => {
-				return None;
-			}
-			// Signed div can trap (INT_MIN / -1); leave that to runtime.
-			DataNodeKind::DivS { .. } => match ty {
-				ScalarType::I32 => (l as i32).checked_div(r as i32)? as i64,
-				ScalarType::I64 => l.checked_div(r)?,
-				_ => return None,
-			},
-			DataNodeKind::DivU { .. } => match ty {
-				ScalarType::I32 => ((l as u32) / (r as u32)) as i32 as i64,
-				ScalarType::I64 => ((l as u64) / (r as u64)) as i64,
-				_ => return None,
-			},
-			// WASM rem_s(INT_MIN, -1) is defined as 0, matching wrapping_rem.
-			DataNodeKind::RemS { .. } => match ty {
-				ScalarType::I32 => (l as i32).wrapping_rem(r as i32) as i64,
-				ScalarType::I64 => l.wrapping_rem(r),
-				_ => return None,
-			},
-			DataNodeKind::RemU { .. } => match ty {
-				ScalarType::I32 => ((l as u32) % (r as u32)) as i32 as i64,
-				ScalarType::I64 => ((l as u64) % (r as u64)) as i64,
-				_ => return None,
-			},
 			DataNodeKind::BitAnd { .. } => l & r,
 			DataNodeKind::BitOr { .. } => l | r,
 			DataNodeKind::BitXor { .. } => l ^ r,
@@ -2825,10 +2934,7 @@ impl<'mir> Builder<'mir> {
 			_ => unreachable!(),
 		};
 
-		Some(
-			self.func
-				.intern_node(DataNodeKind::Int { value: result, ty }),
-		)
+		Some(self.int(result, ty))
 	}
 
 	fn try_simplify_identity(
@@ -2863,12 +2969,6 @@ impl<'mir> Builder<'mir> {
 				if one(left) {
 					return Some(right);
 				}
-			}
-			DataNodeKind::DivS { left, right, .. }
-			| DataNodeKind::DivU { left, right, .. }
-				if one(right) =>
-			{
-				return Some(left);
 			}
 			DataNodeKind::BitAnd { left, right, .. } => {
 				if zero(right) {
@@ -2922,9 +3022,7 @@ impl<'mir> Builder<'mir> {
 			// c > 1: c == 1 is already handled by identity rules.
 			if c > 1 && c & (c - 1) == 0 {
 				let shift = c.trailing_zeros() as i64;
-				let shift_node = self
-					.func
-					.intern_node(DataNodeKind::Int { value: shift, ty });
+				let shift_node = self.int(shift, ty);
 				return Some(self.func.intern_node(DataNodeKind::Shl {
 					left: x,
 					right: shift_node,
@@ -2941,46 +3039,5 @@ impl<'mir> Builder<'mir> {
 			.unwrap()
 			.statements
 			.push(stmt);
-	}
-}
-
-/// The instruction converting a value of type `from` to `to`, applied to
-/// `operand`. An integer's signedness is the source's for an extension or a
-/// conversion to a float, the target's for a truncation of a float.
-fn conversion(
-	from: mir::ValueType,
-	to: mir::ValueType,
-	operand: DataNodeIndex,
-) -> DataNodeKind {
-	use DataNodeKind as N;
-	use ScalarType::{F32, F64, I32, I64};
-
-	let source = ScalarType::try_from(from).expect("a conversion is scalar");
-	let target = ScalarType::try_from(to).expect("a conversion is scalar");
-	match (source, target) {
-		(I32, I64) if from.is_unsigned() => N::I64ExtendI32U { operand },
-		(I32, I64) => N::I64ExtendI32S { operand },
-		(I64, I32) => N::I32WrapI64 { operand },
-		(I32, F32) if from.is_unsigned() => N::F32ConvertU32 { operand },
-		(I32, F32) => N::F32ConvertI32 { operand },
-		(I64, F32) if from.is_unsigned() => N::F32ConvertU64 { operand },
-		(I64, F32) => N::F32ConvertI64 { operand },
-		(I32, F64) if from.is_unsigned() => N::F64ConvertU32 { operand },
-		(I32, F64) => N::F64ConvertI32 { operand },
-		(I64, F64) if from.is_unsigned() => N::F64ConvertU64 { operand },
-		(I64, F64) => N::F64ConvertI64 { operand },
-		(F32, I32) if to.is_unsigned() => N::U32TruncF32 { operand },
-		(F32, I32) => N::I32TruncF32 { operand },
-		(F64, I32) if to.is_unsigned() => N::U32TruncF64 { operand },
-		(F64, I32) => N::I32TruncF64 { operand },
-		(F32, I64) if to.is_unsigned() => N::U64TruncF32 { operand },
-		(F32, I64) => N::I64TruncF32 { operand },
-		(F64, I64) if to.is_unsigned() => N::U64TruncF64 { operand },
-		(F64, I64) => N::I64TruncF64 { operand },
-		(F32, F64) => N::F64PromoteF32 { operand },
-		(F64, F32) => N::F32DemoteF64 { operand },
-		(source, target) => {
-			unreachable!("no conversion from {source:?} to {target:?}")
-		}
 	}
 }

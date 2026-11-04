@@ -118,11 +118,13 @@ pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
 	};
 	let numeric = scalar.is_integer() || scalar.is_float();
 	match op {
-		BinaryOp::Add
-		| BinaryOp::Sub
-		| BinaryOp::Mul
-		| BinaryOp::Div
-		| BinaryOp::Rem => numeric,
+		// Floats have no WASM remainder instruction, and the stdlib no longer
+		// provides a `Rem` impl for them; a floating `%` is diagnosed rather
+		// than lowered.
+		BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+			numeric
+		}
+		BinaryOp::Rem => scalar.is_integer(),
 		BinaryOp::BitAnd
 		| BinaryOp::BitOr
 		| BinaryOp::BitXor

@@ -917,7 +917,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					UnaryOp::Not => mir::UnaryOp::Eqz,
 					UnaryOp::BitNot => mir::UnaryOp::BitNot,
 				};
-				Ok(state.push(mir::ExprKind::Unary { op, value }, ty))
+				let value = state.push(mir::ExprKind::Unary { op, value }, ty);
+				Ok(canonical_narrow(state, value, ty))
 			}
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -942,7 +943,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					)?;
 					unreachable!()
 				};
-				Ok(state.push(kind, ty))
+				let value = state.push(kind, ty);
+				Ok(canonical_narrow(state, value, ty))
 			}
 			ExprKind::Call {
 				function,
@@ -984,10 +986,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				Ok(state.push(mir::ExprKind::Noop, ty))
 			}
 			ExprKind::Tuple { elements, order } => {
-				if ty == mir::ValueType::Unit {
-					// `()` is the empty tuple; its only value is Unit.
-					return Ok(state.push(mir::ExprKind::Noop, ty));
-				}
+				// A zero-slot tuple need not be empty. Evaluate its elements;
+				// `build_aggregate` erases their values, not their effects.
 				let mut prefix = Vec::new();
 				let values = self.lower_element_list(
 					body,
@@ -1483,8 +1483,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			));
 			match value_ty {
 				mir::ValueType::Aggregate { aggregate_index } => {
-					let scalars =
-						self.aggregates.get(aggregate_index).scalars.clone();
+					let scalars = &self.aggregates.get(aggregate_index).scalars;
 					for (at, ty) in scalars.iter().copied().enumerate() {
 						slots.push(state.push(
 							mir::ExprKind::AggregateGet {
@@ -2096,6 +2095,67 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 
 /// The MIR node for the primitive operator `op`, or `None` for an
 /// assignment operator, which has no value.
+/// Restore the canonical in-slot representation of a narrow integer after a
+/// safe primitive operator: unsigned values are zero-extended, signed values
+/// sign-extended. `transmute` deliberately does not do this; only the result
+/// of a safe operator is normalized.
+fn canonical_narrow(
+	state: &mut FunctionState,
+	value: mir::ExprId,
+	ty: mir::ValueType,
+) -> mir::ExprId {
+	fn mask(
+		state: &mut FunctionState,
+		value: mir::ExprId,
+		bits: i64,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		let mask = state.push(mir::ExprKind::Int { value: bits }, ty);
+		state.push(
+			mir::ExprKind::Binary {
+				op: mir::BinaryOp::BitAnd,
+				lhs: value,
+				rhs: mask,
+			},
+			ty,
+		)
+	}
+
+	fn sign_extend(
+		state: &mut FunctionState,
+		value: mir::ExprId,
+		shift: i64,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		let left_shift = state.push(mir::ExprKind::Int { value: shift }, ty);
+		let shifted = state.push(
+			mir::ExprKind::Binary {
+				op: mir::BinaryOp::Shl,
+				lhs: value,
+				rhs: left_shift,
+			},
+			ty,
+		);
+		let right_shift = state.push(mir::ExprKind::Int { value: shift }, ty);
+		state.push(
+			mir::ExprKind::Binary {
+				op: mir::BinaryOp::Shr,
+				lhs: shifted,
+				rhs: right_shift,
+			},
+			ty,
+		)
+	}
+
+	match ty {
+		mir::ValueType::U8 => mask(state, value, 0xFF, ty),
+		mir::ValueType::U16 => mask(state, value, 0xFFFF, ty),
+		mir::ValueType::I8 => sign_extend(state, value, 24, ty),
+		mir::ValueType::I16 => sign_extend(state, value, 16, ty),
+		_ => value,
+	}
+}
+
 fn binary_kind(
 	op: BinaryOp,
 	lhs: mir::ExprId,
@@ -2152,9 +2212,17 @@ mod tests {
 	}
 
 	/// Check, lower, inline, encode, and instantiate `source`, returning the
-	/// live store and instance for calling exports. Every program run here
-	/// goes through the inliner, as a built one does.
+	/// live store and instance for calling exports.
 	fn instantiate(source: &str) -> (wasmtime::Store<()>, wasmtime::Instance) {
+		instantiate_with_policy(source, Some(mir::inline::Policy::DEFAULT))
+	}
+
+	/// Run with or without inlining to distinguish lowering regressions from
+	/// transformations that expose them. The CLI currently skips inlining.
+	fn instantiate_with_policy(
+		source: &str,
+		policy: Option<mir::inline::Policy>,
+	) -> (wasmtime::Store<()>, wasmtime::Instance) {
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
 		let (diagnostics, mir) = crate::tir::build(&mut graph);
 		let Some(mut mir) = mir else {
@@ -2163,7 +2231,9 @@ mod tests {
 				diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
 			)
 		};
-		crate::mir::inline::run(&mut mir, crate::mir::inline::Policy::DEFAULT);
+		if let Some(policy) = policy {
+			mir::inline::run(&mut mir, policy);
+		}
 		let module = crate::codegen::Builder::build(&mir, &graph.strings)
 			.expect("lowered MIR must encode");
 		let bytes = module.encode();
@@ -2418,6 +2488,303 @@ mod tests {
 	}
 
 	#[test]
+	fn trapping_integer_operations_execute_when_discarded() {
+		for ty in ["i32", "u32", "i64", "u64"] {
+			for op in ["/", "%"] {
+				let source = format!(
+					r#"
+					func run(x: {ty}) -> i32 {{ local _ = 1 {op} x; 42 }}
+					export {{ run }}
+					"#
+				);
+				for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+					let (mut store, instance) =
+						instantiate_with_policy(&source, policy);
+					let run = instance.get_func(&mut store, "run").unwrap();
+					let input = if ty.ends_with("64") {
+						wasmtime::Val::I64(0)
+					} else {
+						wasmtime::Val::I32(0)
+					};
+					let mut output = [wasmtime::Val::I32(0)];
+					assert!(
+						run.call(&mut store, &[input], &mut output).is_err(),
+						"discarding {ty} {op} must not discard its trap"
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn trapping_integer_operations_precede_later_writes() {
+		let source = r#"
+			global mut trace: i32 = 0;
+			func divide(x: i32) -> i32 {
+				local result = 1 / x;
+				trace.set(9);
+				result
+			}
+			func remainder(x: i32) -> i32 {
+				local result = 1 % x;
+				trace.set(9);
+				result
+			}
+			func read() -> i32 { trace.get() }
+			export { divide, remainder, read }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			for name in ["divide", "remainder"] {
+				let run = instance
+					.get_typed_func::<i32, i32>(&mut store, name)
+					.unwrap();
+				assert!(run.call(&mut store, 0).is_err());
+				let read = instance
+					.get_typed_func::<(), i32>(&mut store, "read")
+					.unwrap();
+				assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+			}
+		}
+	}
+
+	#[test]
+	fn trapping_conversions_execute_when_discarded_and_before_writes() {
+		for from in ["f32", "f64"] {
+			for to in ["i32", "u32", "i64", "u64"] {
+				let source = format!(
+					r#"
+					global mut trace: i32 = 0;
+					func discarded(x: {from}) -> i32 {{
+						local _ = std::{to}_trunc_{from}(x);
+						42
+					}}
+					func ordered(x: {from}) -> i32 {{
+						local result = std::{to}_trunc_{from}(x);
+						trace.set(9);
+						if result == 0 {{ 0 }} else {{ 1 }}
+					}}
+					func converted(x: {from}) -> {to} {{ std::{to}_trunc_{from}(x) }}
+					func read() -> i32 {{ trace.get() }}
+					export {{ discarded, ordered, converted, read }}
+					"#
+				);
+				for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+					let (mut store, instance) =
+						instantiate_with_policy(&source, policy);
+					for invalid in [f64::NAN, f64::INFINITY, 1e30] {
+						for name in ["discarded", "ordered"] {
+							let input = if from == "f32" {
+								wasmtime::Val::F32((invalid as f32).to_bits())
+							} else {
+								wasmtime::Val::F64(invalid.to_bits())
+							};
+							let run =
+								instance.get_func(&mut store, name).unwrap();
+							let mut output = [wasmtime::Val::I32(0)];
+							assert!(
+								run.call(&mut store, &[input], &mut output)
+									.is_err(),
+								"{name}: {from} -> {to} must trap for {invalid}"
+							);
+							let read = instance
+								.get_typed_func::<(), i32>(&mut store, "read")
+								.unwrap();
+							assert_eq!(read.call(&mut store, ()).unwrap(), 0);
+						}
+					}
+					let converted =
+						instance.get_func(&mut store, "converted").unwrap();
+					for value in [7.75f64, -7.75] {
+						let input = if from == "f32" {
+							wasmtime::Val::F32((value as f32).to_bits())
+						} else {
+							wasmtime::Val::F64(value.to_bits())
+						};
+						let mut output = [if to.ends_with("64") {
+							wasmtime::Val::I64(0)
+						} else {
+							wasmtime::Val::I32(0)
+						}];
+						let result =
+							converted.call(&mut store, &[input], &mut output);
+						if value < 0.0 && to.starts_with('u') {
+							assert!(
+								result.is_err(),
+								"negative value does not fit {to}"
+							);
+						} else {
+							result.unwrap();
+							let actual = match output[0] {
+								wasmtime::Val::I32(n) => i64::from(n),
+								wasmtime::Val::I64(n) => n,
+								_ => unreachable!(),
+							};
+							assert_eq!(actual, value as i64);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn trapping_integer_operations_survive_absorbing_simplification() {
+		let source = r#"
+			func run(x: i32) -> i32 { (10 / x) * 0 }
+			export { run }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<i32, i32>(&mut store, "run")
+				.unwrap();
+			assert!(run.call(&mut store, 0).is_err());
+			assert_eq!(run.call(&mut store, 2).unwrap(), 0);
+		}
+	}
+
+	#[test]
+	fn trapping_integer_operations_stay_in_their_branch_and_loop_iteration() {
+		let source = r#"
+			func branch(x: i32) -> i32 {
+				if x == 0 { return 7; }
+				local _ = 10 / x;
+				42
+			}
+			func repeat(stop: i32) -> i32 {
+				local mut divisor: i32 = 2;
+				loop {
+					local _ = 10 / divisor;
+					if divisor == stop { break 42; }
+					divisor -= 1;
+				}
+			}
+			export { branch, repeat }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let branch = instance
+				.get_typed_func::<i32, i32>(&mut store, "branch")
+				.unwrap();
+			assert_eq!(branch.call(&mut store, 0).unwrap(), 7);
+			assert_eq!(branch.call(&mut store, 2).unwrap(), 42);
+			let repeat = instance
+				.get_typed_func::<i32, i32>(&mut store, "repeat")
+				.unwrap();
+			assert_eq!(repeat.call(&mut store, 1).unwrap(), 42);
+			assert!(repeat.call(&mut store, 0).is_err());
+		}
+	}
+
+	#[test]
+	fn trapping_integer_operations_preserve_overflow_and_safe_constant_folding()
+	{
+		let source = r#"
+			func divide32(a: i32, b: i32) -> i32 { a / b }
+			func divide64(a: i64, b: i64) -> i64 { a / b }
+			func remainder32(a: i32, b: i32) -> i32 { a % b }
+			func remainder64(a: i64, b: i64) -> i64 { a % b }
+			func overflow32() -> i32 { -2147483648 / -1 }
+			func overflow64() -> i64 { -9223372036854775808 / -1 }
+			func folded() -> (i32, u32, i64, u64, i32, i64) {
+				((7: i32) / 2, (4294967295: u32) / 2,
+				 (7: i64) % 2, (18446744073709551615: u64) % 2,
+				 (-2147483648: i32) % -1, (-9223372036854775808: i64) % -1)
+			}
+			export { divide32, divide64, remainder32, remainder64, overflow32, overflow64, folded }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let lowered = crate::tir::build(&mut graph)
+			.1
+			.expect("integer operations lower");
+		let folded_id = lowered
+			.exports
+			.iter()
+			.find_map(|export| {
+				if graph.strings.resolve(export.name) == Some("folded") {
+					let mir::Item::Function(id) = export.item else {
+						unreachable!()
+					};
+					Some(id)
+				} else {
+					None
+				}
+			})
+			.unwrap();
+		let optimized =
+			crate::opt::builder::Builder::build(&lowered, folded_id);
+		assert!(optimized.blocks.iter().flatten().all(|block| {
+			block.statements.iter().all(|stmt| {
+				!matches!(stmt, crate::opt::ControlNode::Trapping { .. })
+			})
+		}));
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			assert!(
+				instance
+					.get_typed_func::<(i32, i32), i32>(&mut store, "divide32")
+					.unwrap()
+					.call(&mut store, (i32::MIN, -1))
+					.is_err()
+			);
+			assert!(
+				instance
+					.get_typed_func::<(i64, i64), i64>(&mut store, "divide64")
+					.unwrap()
+					.call(&mut store, (i64::MIN, -1))
+					.is_err()
+			);
+			assert_eq!(
+				instance
+					.get_typed_func::<(i32, i32), i32>(
+						&mut store,
+						"remainder32"
+					)
+					.unwrap()
+					.call(&mut store, (i32::MIN, -1))
+					.unwrap(),
+				0
+			);
+			assert_eq!(
+				instance
+					.get_typed_func::<(i64, i64), i64>(
+						&mut store,
+						"remainder64"
+					)
+					.unwrap()
+					.call(&mut store, (i64::MIN, -1))
+					.unwrap(),
+				0
+			);
+			assert!(
+				instance
+					.get_typed_func::<(), i32>(&mut store, "overflow32")
+					.unwrap()
+					.call(&mut store, ())
+					.is_err()
+			);
+			assert!(
+				instance
+					.get_typed_func::<(), i64>(&mut store, "overflow64")
+					.unwrap()
+					.call(&mut store, ())
+					.is_err()
+			);
+			assert_eq!(
+				instance
+					.get_typed_func::<(), (i32, u32, i64, u64, i32, i64)>(
+						&mut store, "folded"
+					)
+					.unwrap()
+					.call(&mut store, ())
+					.unwrap(),
+				(3, 2147483647, 1, 1, 0, 0)
+			);
+		}
+	}
+
+	#[test]
 	fn transmute_keeps_the_operands_signedness_and_gives_its_own() {
 		// `a / b` stays an unsigned division although its result is read as
 		// an `i32`; the transmuted operand of `/ 2` and `>> 1` divides and
@@ -2516,6 +2883,101 @@ mod tests {
 			.get_typed_func::<(i32, i32), i32>(&mut store, "narrow")
 			.unwrap();
 		assert_eq!(narrow.call(&mut store, (-6, 2)).unwrap(), -3);
+	}
+
+	#[test]
+	fn narrow_native_operators_restore_their_width() {
+		// Concrete primitive operators lower as PrimitiveUnary/PrimitiveBinary;
+		// their results must be canonical at the narrow type's width.
+		let source = r#"
+			func u8_ops(a: u8) -> (u8, u8, u8, Bool) {
+				(a + 1, a << 1, ^a, a + 1 == 0)
+			}
+			func i8_ops(a: i8) -> (i8, i8, i8, Bool) {
+				(a + 1, a << 1, ^a, a + 1 == (-128: i8))
+			}
+			func u16_ops(a: u16) -> (u16, u16, u16, Bool) {
+				(a + 1, a << 1, ^a, a + 1 == 0)
+			}
+			func i16_ops(a: i16) -> (i16, i16, i16, Bool) {
+				(a + 1, a << 1, ^a, a + 1 == (-32768: i16))
+			}
+			export { u8_ops, i8_ops, u16_ops, i16_ops }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let u8_ops = instance
+				.get_typed_func::<i32, (i32, i32, i32, i32)>(
+					&mut store, "u8_ops",
+				)
+				.unwrap();
+			assert_eq!(u8_ops.call(&mut store, 255).unwrap(), (0, 254, 0, 1));
+			assert_eq!(u8_ops.call(&mut store, 0).unwrap(), (1, 0, 255, 0));
+			let i8_ops = instance
+				.get_typed_func::<i32, (i32, i32, i32, i32)>(
+					&mut store, "i8_ops",
+				)
+				.unwrap();
+			assert_eq!(
+				i8_ops.call(&mut store, 127).unwrap(),
+				(-128, -2, -128, 1)
+			);
+			assert_eq!(i8_ops.call(&mut store, 0).unwrap(), (1, 0, -1, 0));
+			let u16_ops = instance
+				.get_typed_func::<i32, (i32, i32, i32, i32)>(
+					&mut store, "u16_ops",
+				)
+				.unwrap();
+			assert_eq!(
+				u16_ops.call(&mut store, 65535).unwrap(),
+				(0, 65534, 0, 1)
+			);
+			assert_eq!(u16_ops.call(&mut store, 0).unwrap(), (1, 0, 65535, 0));
+			let i16_ops = instance
+				.get_typed_func::<i32, (i32, i32, i32, i32)>(
+					&mut store, "i16_ops",
+				)
+				.unwrap();
+			assert_eq!(
+				i16_ops.call(&mut store, 32767).unwrap(),
+				(-32768, -2, -32768, 1)
+			);
+			assert_eq!(i16_ops.call(&mut store, 0).unwrap(), (1, 0, -1, 0));
+		}
+	}
+
+	#[test]
+	fn narrow_std_operator_methods_restore_their_width() {
+		// Explicit trait method calls and generic instantiations go through
+		// std's bodies instead of the primitive operator path.
+		let source = r#"
+			func generic<T: Add>(a: T, b: T) -> T { a + b }
+			func u8_ops(a: u8, b: u8) -> (u8, u8, u8) {
+				(a.add(b), a.bitnot(), generic(a, b))
+			}
+			func i8_ops(a: i8, b: i8) -> (i8, i8, i8) {
+				(a.add(b), a.bitnot(), generic(a, b))
+			}
+			export { u8_ops, i8_ops }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let u8_ops = instance
+				.get_typed_func::<(i32, i32), (i32, i32, i32)>(
+					&mut store, "u8_ops",
+				)
+				.unwrap();
+			assert_eq!(u8_ops.call(&mut store, (250, 10)).unwrap(), (4, 5, 4));
+			let i8_ops = instance
+				.get_typed_func::<(i32, i32), (i32, i32, i32)>(
+					&mut store, "i8_ops",
+				)
+				.unwrap();
+			assert_eq!(
+				i8_ops.call(&mut store, (-120, -20)).unwrap(),
+				(116, 119, 116)
+			);
+		}
 	}
 
 	#[test]
@@ -2644,6 +3106,98 @@ mod tests {
 			.call(&mut store, ())
 			.unwrap();
 		assert_eq!(store.data(), &[1, -2, 3]);
+	}
+
+	#[test]
+	fn saved_global_reads_precede_later_writes() {
+		let source = r#"
+			global mut counter: i32 = 0;
+			func run() -> i32 {
+				counter.set(1);
+				local before = counter.get();
+				counter.set(2);
+				before * 10 + counter.get()
+			}
+			export { run }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(), i32>(&mut store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut store, ()).unwrap(), 12);
+		}
+	}
+
+	#[test]
+	fn saved_global_reads_precede_mutating_calls_and_aggregate_elements() {
+		let source = r#"
+			global mut counter: i32 = 0;
+			func mutate() -> i32 { counter.set(2); 3 }
+			func called() -> i32 {
+				counter.set(1);
+				local before = counter.get();
+				local other = mutate();
+				before * 10 + counter.get() + other
+			}
+			func aggregate() -> i32 {
+				counter.set(1);
+				local (before, after) = (
+					counter.get(),
+					block { counter.set(2); counter.get() },
+				);
+				before * 10 + after
+			}
+			export { called, aggregate }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			for (name, expected) in [("called", 15), ("aggregate", 12)] {
+				let run = instance
+					.get_typed_func::<(), i32>(&mut store, name)
+					.unwrap();
+				assert_eq!(run.call(&mut store, ()).unwrap(), expected);
+			}
+		}
+	}
+
+	#[test]
+	fn saved_global_reads_keep_their_branch_and_loop_values() {
+		let source = r#"
+			global mut counter: i32 = 0;
+			func branch(flag: Bool) -> i32 {
+				counter.set(1);
+				local before = counter.get();
+				if flag { counter.set(2); } else { counter.set(3); }
+				before * 10 + counter.get()
+			}
+			func repeat() -> i32 {
+				local mut i: i32 = 1;
+				local mut sum: i32 = 0;
+				loop {
+					counter.set(i);
+					local before = counter.get();
+					counter.set(9);
+					sum += before;
+					if i == 3 { break; }
+					i += 1;
+				};
+				sum
+			}
+			export { branch, repeat }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let branch = instance
+				.get_typed_func::<i32, i32>(&mut store, "branch")
+				.unwrap();
+			assert_eq!(branch.call(&mut store, 1).unwrap(), 12);
+			assert_eq!(branch.call(&mut store, 0).unwrap(), 13);
+			let repeat = instance
+				.get_typed_func::<(), i32>(&mut store, "repeat")
+				.unwrap();
+			assert_eq!(repeat.call(&mut store, ()).unwrap(), 6);
+		}
 	}
 
 	#[test]
@@ -3043,6 +3597,87 @@ mod tests {
 			.get_typed_func::<(), i32>(&mut store, "run")
 			.unwrap();
 		assert_eq!(run.call(&mut store, ()).unwrap(), 22);
+	}
+
+	#[test]
+	fn zero_sized_tuple_elements_execute_once_in_written_order() {
+		let source = r#"
+			func identity(value: ((), ())) -> ((), ()) { value }
+			func run() -> i32 {
+				local mut trace: i32 = 0;
+				local _ = (
+					block { trace = trace * 10 + 1; () },
+					block { trace = trace * 10 + 2; () },
+				);
+				trace
+			}
+			export { run, identity }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(), i32>(&mut store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut store, ()).unwrap(), 12);
+			// Source fields keep their meaning but contribute no Wasm slots.
+			instance
+				.get_typed_func::<(), ()>(&mut store, "identity")
+				.unwrap()
+				.call(&mut store, ())
+				.unwrap();
+		}
+	}
+
+	#[test]
+	fn zero_sized_tuple_elements_preserve_nested_effects() {
+		let source = r#"
+			struct Zero();
+			func run() -> i32 {
+				local mut trace: i32 = 0;
+				local _ = (
+					(
+						block { trace = trace * 10 + 1; () },
+						block { trace = trace * 10 + 2; Zero() },
+					),
+					block { trace = trace * 10 + 3; () },
+				);
+				trace
+			}
+			export { run }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(), i32>(&mut store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut store, ()).unwrap(), 123);
+		}
+	}
+
+	#[test]
+	fn zero_sized_tuple_elements_preserve_traps_and_stop_later_effects() {
+		let source = r#"
+			global mut trace: i32 = 0;
+			func mark(digit: i32) { trace.set(trace.get() * 10 + digit); }
+			func fail() { std::trap() }
+			func read() -> i32 { trace.get() }
+			func run() -> i32 {
+				local _ = (mark(1), fail(), mark(2));
+				7
+			}
+			export { run, read }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(), i32>(&mut store, "run")
+				.unwrap();
+			assert!(run.call(&mut store, ()).is_err());
+			let read = instance
+				.get_typed_func::<(), i32>(&mut store, "read")
+				.unwrap();
+			assert_eq!(read.call(&mut store, ()).unwrap(), 1);
+		}
 	}
 
 	#[test]
@@ -4065,6 +4700,132 @@ mod tests {
 	}
 
 	// ── loops, breaks, continues and labelled blocks ──────────────────────
+
+	#[test]
+	fn exit_results_capture_a_computed_break_before_carried_updates() {
+		let source = r#"
+			func sum() -> i32 {
+				local mut i: i32 = 1;
+				local mut total: i32 = 0;
+				loop {
+					total += i;
+					if i == 3 { break total; }
+					i += 1;
+				}
+			}
+			func later() -> i32 {
+				local mut x: i32 = 1;
+				local result = loop { x += 1; break x * 10; };
+				x = 100;
+				result + x
+			}
+			export { sum, later }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			for (name, expected) in [("sum", 6), ("later", 120)] {
+				let run = instance
+					.get_typed_func::<(), i32>(&mut store, name)
+					.unwrap();
+				assert_eq!(run.call(&mut store, ()).unwrap(), expected);
+			}
+		}
+	}
+
+	#[test]
+	fn exit_results_do_not_recompute_identical_values_from_multiple_exits() {
+		let source = r#"
+			func sum(stop: i32) -> i32 {
+				local mut i: i32 = 1;
+				local mut total: i32 = 0;
+				loop {
+					total += i;
+					if i == stop { break total; }
+					if i == 3 { break total; }
+					i += 1;
+				}
+			}
+			export { sum }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let sum = instance
+				.get_typed_func::<i32, i32>(&mut store, "sum")
+				.unwrap();
+			for (stop, expected) in [(1, 1), (2, 3), (3, 6), (4, 6)] {
+				assert_eq!(sum.call(&mut store, stop).unwrap(), expected);
+			}
+		}
+	}
+
+	#[test]
+	fn exit_results_capture_aggregate_slots_and_block_fallthrough() {
+		let source = r#"
+			struct Result(total: i32, marker: (), tail: (i32, i32));
+			func aggregate(stop: i32) -> Result {
+				local mut i: i32 = 1;
+				local mut total: i32 = 0;
+				loop {
+					total += i;
+					if i == stop { break Result(total, (), (i, total + 1)); }
+					if i == 3 { break Result(total + 10, (), (i, total + 11)); }
+					i += 1;
+				}
+			}
+			func block_result(flag: Bool) -> (i32, i32) {
+				local mut total: i32 = 1;
+				local result = block :done {
+					total += 1;
+					if flag { break :done total * 10; }
+					total += 1;
+					total * 10
+				};
+				(result, total)
+			}
+			export { aggregate, block_result }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let aggregate = instance
+				.get_typed_func::<i32, (i32, i32, i32)>(&mut store, "aggregate")
+				.unwrap();
+			assert_eq!(aggregate.call(&mut store, 2).unwrap(), (3, 2, 4));
+			assert_eq!(aggregate.call(&mut store, 4).unwrap(), (16, 3, 17));
+			let block = instance
+				.get_typed_func::<i32, (i32, i32)>(&mut store, "block_result")
+				.unwrap();
+			assert_eq!(block.call(&mut store, 1).unwrap(), (20, 2));
+			assert_eq!(block.call(&mut store, 0).unwrap(), (30, 3));
+		}
+	}
+
+	#[test]
+	fn exit_results_capture_aggregate_block_breaks_and_fallthrough() {
+		let source = r#"
+			global mut counter: i32 = 0;
+			func run(flag: Bool) -> (i32, (), (i32, i32)) {
+				counter.set(1);
+				local result: (i32, (), (i32, i32)) = block :done {
+					local before = counter.get();
+					counter.set(2);
+					if flag { break :done (before, (), (counter.get(), 3)); }
+					counter.set(4);
+					(before, (), (counter.get(), 5))
+				};
+				counter.set(9);
+				result
+			}
+			export { run }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<i32, (i32, i32, i32)>(&mut store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut store, 1).unwrap(), (1, 2, 3));
+			assert_eq!(run.call(&mut store, 0).unwrap(), (1, 4, 5));
+		}
+	}
 
 	/// A loop leaves through its `break`, carrying the value it gives.
 	#[test]
@@ -6109,5 +6870,527 @@ mod tests {
 			label, outer,
 			"`continue :outer` must restart the outer loop"
 		);
+	}
+
+	#[test]
+	fn edge_wrapped_constants_agree_with_runtime_arithmetic() {
+		let source = r#"
+		func folded() -> (Bool, Bool, Bool, Bool) {
+			((2147483647: i32) + 1 == (-2147483647 - 1),
+			 (4294967295: u32) + 1 == 0,
+			 (2147483647: i32) * 2 == -2,
+			 (0: u32) - 1 == 4294967295)
+		}
+		func runtime(a: i32, b: u32) -> (Bool, Bool, Bool, Bool) {
+			(a + 1 == (-2147483647 - 1), b + 1 == 0,
+			 a * 2 == -2, (0: u32) - (1: u32) == b)
+		}
+		export { folded, runtime }
+	"#;
+		let mut results = Vec::new();
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let runtime = instance
+				.get_typed_func::<(i32, u32), (i32, i32, i32, i32)>(
+					&mut store, "runtime",
+				)
+				.unwrap();
+			assert_eq!(
+				runtime.call(&mut store, (i32::MAX, u32::MAX)).unwrap(),
+				(1, 1, 1, 1)
+			);
+			let folded = instance
+				.get_typed_func::<(), (i32, i32, i32, i32)>(
+					&mut store, "folded",
+				)
+				.unwrap();
+			results.push(folded.call(&mut store, ()).unwrap());
+		}
+		assert_eq!(results, vec![(1, 1, 1, 1); 2]);
+	}
+	#[test]
+	fn edge_integer_intrinsics_match_host_reference() {
+		let source = r#"
+		func signed(a: i32, b: i32) -> (i32, i32, i32, i32, i32, i32) {
+			(a + b, a - b, a * b, a << b, a >> b, a % b)
+		}
+		func unsigned(a: u64, b: u64) -> (u64, u64, u64, u64, u64, u64) {
+			(a + b, a - b, a * b, a << b, a >> b, a % b)
+		}
+		export { signed, unsigned }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let signed = instance
+				.get_typed_func::<(i32, i32), (i32, i32, i32, i32, i32, i32)>(
+					&mut store, "signed",
+				)
+				.unwrap();
+			let unsigned = instance
+				.get_typed_func::<(u64, u64), (u64, u64, u64, u64, u64, u64)>(
+					&mut store, "unsigned",
+				)
+				.unwrap();
+			let mut seed = 0x1234_5678_9abc_def0_u64;
+			for _ in 0..1024 {
+				seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+				let a = seed;
+				seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+				let b = seed | 1;
+				let (x, y) = (a as i32, b as i32);
+				assert_eq!(
+					signed.call(&mut store, (x, y)).unwrap(),
+					(
+						x.wrapping_add(y),
+						x.wrapping_sub(y),
+						x.wrapping_mul(y),
+						x.wrapping_shl(y as u32),
+						x.wrapping_shr(y as u32),
+						x.wrapping_rem(y)
+					)
+				);
+				assert_eq!(
+					unsigned.call(&mut store, (a, b)).unwrap(),
+					(
+						a.wrapping_add(b),
+						a.wrapping_sub(b),
+						a.wrapping_mul(b),
+						a.wrapping_shl(b as u32),
+						a.wrapping_shr(b as u32),
+						a % b
+					)
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn edge_float_special_values_preserve_ieee_behavior() {
+		let source = r#"
+		func run(x: f64) -> (f64, f64, f64, Bool, Bool) {
+			(x + 0.0, x * 0.0, x / x, x == x, x != x)
+		}
+		func bits(x: f64) -> i64 { std::i64_reinterpret_f64(-x) }
+		export { run, bits }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<f64, (f64, f64, f64, i32, i32)>(
+					&mut store, "run",
+				)
+				.unwrap();
+			let bits = instance
+				.get_typed_func::<f64, i64>(&mut store, "bits")
+				.unwrap();
+			for x in [
+				0.0,
+				-0.0,
+				1.0,
+				-1.0,
+				f64::INFINITY,
+				f64::NEG_INFINITY,
+				f64::NAN,
+				f64::MIN_POSITIVE,
+				f64::from_bits(1),
+			] {
+				let (add, mul, div, eq, ne) = run.call(&mut store, x).unwrap();
+				for (actual, expected) in
+					[(add, x + 0.0), (mul, x * 0.0), (div, x / x)]
+				{
+					assert!(
+						if expected.is_nan() {
+							actual.is_nan()
+						} else {
+							actual.to_bits() == expected.to_bits()
+						},
+						"x={x:?}: {actual:?} != {expected:?}"
+					);
+				}
+				assert_eq!((eq, ne), ((!x.is_nan()) as i32, x.is_nan() as i32));
+				assert_eq!(
+					bits.call(&mut store, x).unwrap() as u64,
+					(-x).to_bits()
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn edge_loop_rotations_and_continues_preserve_parallel_updates() {
+		let source = r#"
+		func run(n: i32) -> (i32, i32, i32) {
+			local mut p: (i32, i32, i32) = (1, 2, 3);
+			local mut i: i32 = 0;
+			loop :outer {
+				if i >= n { break p; }
+				local (a, b, c) = p;
+				p = (b, c, a);
+				i += 1;
+				if i % 2 == 0 {
+					loop { continue :outer; }
+				}
+			}
+		}
+		export { run }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<i32, (i32, i32, i32)>(&mut store, "run")
+				.unwrap();
+			for n in 0..40 {
+				let expected = match n % 3 {
+					0 => (1, 2, 3),
+					1 => (2, 3, 1),
+					_ => (3, 1, 2),
+				};
+				assert_eq!(run.call(&mut store, n).unwrap(), expected, "n={n}");
+			}
+		}
+	}
+
+	#[test]
+	fn edge_dense_and_sparse_matches_preserve_exit_depths_and_state() {
+		let source = r#"
+		func run(n: i32) -> (i32, i32) {
+			local mut i: i32 = 0;
+			local mut sum: i32 = 0;
+			loop {
+				if i >= n { break (i, sum); }
+				i += 1;
+				match i % 7 {
+					4 => { sum += 40; },
+					0 => continue,
+					2 => { sum += 20; },
+					1 => { sum += 10; },
+					3 => { sum += 30; },
+					_ => { sum += 1; },
+				};
+				match i {
+					11 => break (i, sum),
+					1000 => { sum += 100; },
+					_ => {},
+				};
+			}
+		}
+		export { run }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<i32, (i32, i32)>(&mut store, "run")
+				.unwrap();
+			for n in 0..25 {
+				let mut sum = 0;
+				let end = n.min(11);
+				for i in 1..=end {
+					sum += match i % 7 {
+						0 => 0,
+						1 => 10,
+						2 => 20,
+						3 => 30,
+						4 => 40,
+						_ => 1,
+					};
+				}
+				assert_eq!(
+					run.call(&mut store, n).unwrap(),
+					(end, sum),
+					"n={n}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn edge_recursive_generic_aggregate_results_cross_calls_and_joins() {
+		let source = r#"
+		struct Pair<T>(a: T, empty: (), b: T);
+		impl<T> Pair<T> {
+			pub func swap(self: Self) -> Self { Pair(self.b, (), self.a) }
+		}
+		func rotate<T>(p: Pair<T>, n: i32) -> Pair<T> {
+			if n == 0 { p } else { rotate(p.swap(), n - 1) }
+		}
+		func run(a: i32, b: i32, n: i32) -> (i32, (), i32) {
+			local Pair(x, (), y) = rotate(Pair(a, (), b), n);
+			(x, (), y)
+		}
+		export { run }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(i32, i32, i32), (i32, i32)>(
+					&mut store, "run",
+				)
+				.unwrap();
+			for n in 0..20 {
+				assert_eq!(
+					run.call(&mut store, (17, -23, n)).unwrap(),
+					if n % 2 == 0 { (17, -23) } else { (-23, 17) }
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn edge_named_construction_and_method_calls_preserve_effect_order() {
+		let source = r#"
+		global mut log: i32 = 0;
+		func mark(x: i32) -> i32 { log.set(log.get() * 10 + x); x }
+		func unit(x: i32) { local _ = mark(x); }
+		struct P(a: i32, empty: (), b: i32);
+		impl P {
+			pub func combine(self: Self, x: i32, empty: (), y: i32) -> i32 {
+				self.a * 1000 + self.b * 100 + x * 10 + y
+			}
+		}
+		func run() -> (i32, i32) {
+			log.set(0);
+			local value = P({ b: mark(1), empty: unit(2), a: mark(3) })
+				.combine({ y: mark(4), empty: unit(5), x: mark(6) });
+			(value, log.get())
+		}
+		export { run }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(), (i32, i32)>(&mut store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut store, ()).unwrap(), (3164, 123456));
+		}
+	}
+
+	#[test]
+	#[ignore = "C10: floating `%` is unsupported until a math library provides fmod"]
+	fn edge_float_remainder_agrees_with_constant_evaluation() {
+		let source = r#"
+		const EXPECTED: f64 = 5.0 % (1.0 / 0.0);
+		func run(x: f64, y: f64) -> (f64, f64) { (x % y, EXPECTED) }
+		export { run }
+	"#;
+		let mut results = Vec::new();
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(f64, f64), (f64, f64)>(&mut store, "run")
+				.unwrap();
+			results.push(run.call(&mut store, (5.0, f64::INFINITY)).unwrap());
+		}
+		assert_eq!(results, vec![(5.0, 5.0); 2]);
+	}
+
+	#[test]
+	#[ignore = "C10: floating `rem` is unsupported until a math library provides fmod"]
+	fn edge_float_remainder_methods_agree_with_constant_evaluation() {
+		let source = r#"
+		const EXPECTED: f64 = 5.0 % (1.0 / 0.0);
+		func run(x: f64, y: f64, a: f32, b: f32) -> (f64, f32, f64) {
+			(x.rem(y), a.rem(b), EXPECTED)
+		}
+		export { run }
+	"#;
+		let mut results = Vec::new();
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(f64, f64, f32, f32), (f64, f32, f64)>(
+					&mut store, "run",
+				)
+				.unwrap();
+			results.push(
+				run.call(&mut store, (5.0, f64::INFINITY, 5.0, f32::INFINITY))
+					.unwrap(),
+			);
+		}
+		assert_eq!(results, vec![(5.0, 5.0, 5.0); 2]);
+	}
+
+	#[test]
+	fn edge_named_arguments_stop_at_a_diverging_zero_sized_field() {
+		let source = r#"
+		global mut log: i32 = 0;
+		func mark(x: i32) -> i32 { log.set(log.get() * 10 + x); x }
+		func fail() { local _ = mark(2); std::trap(); }
+		func combine(a: i32, empty: (), b: i32) -> i32 { mark(9) }
+		func run() -> i32 {
+			log.set(0);
+			combine({ b: mark(1), empty: fail(), a: mark(3) })
+		}
+		func read() -> i32 { log.get() }
+		export { run, read }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<(), i32>(&mut store, "run")
+				.unwrap();
+			let read = instance
+				.get_typed_func::<(), i32>(&mut store, "read")
+				.unwrap();
+			assert!(run.call(&mut store, ()).is_err());
+			assert_eq!(read.call(&mut store, ()).unwrap(), 12);
+		}
+	}
+
+	#[test]
+	fn edge_inlined_early_returns_keep_aggregate_values_and_effects() {
+		let source = r#"
+		global mut log: i32 = 0;
+		#[inline]
+		func choose(x: i32) -> (i32, (), i32) {
+			log.set(log.get() + 1);
+			if x < 0 { return (x - 1, (), x + 1); }
+			local p: (i32, (), i32) = block :done {
+				if x == 0 { break :done (7, (), 8); };
+				(x * 2, (), x * 3)
+			};
+			log.set(log.get() + 10);
+			p
+		}
+		func run(x: i32) -> (i32, i32, i32, i32, i32) {
+			log.set(0);
+			local (a, (), b) = choose(x);
+			local (c, (), d) = choose(-x);
+			(a, b, c, d, log.get())
+		}
+		export { run }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<i32, (i32, i32, i32, i32, i32)>(
+					&mut store, "run",
+				)
+				.unwrap();
+			for x in -10..=10 {
+				let choose = |v| {
+					if v < 0 {
+						(v - 1, v + 1, 1)
+					} else if v == 0 {
+						(7, 8, 11)
+					} else {
+						(v * 2, v * 3, 11)
+					}
+				};
+				let (a, b, left) = choose(x);
+				let (c, d, right) = choose(-x);
+				assert_eq!(
+					run.call(&mut store, x).unwrap(),
+					(a, b, c, d, left + right)
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn edge_euclid_and_bitwise_crc_match_reference_algorithms() {
+		let source = r#"
+		func gcd(a: u32, b: u32) -> u32 {
+			local mut x = a;
+			local mut y = b;
+			loop {
+				if y == 0 { break x; }
+				local remainder = x % y;
+				x = y;
+				y = remainder;
+			}
+		}
+		func crc(word: u32) -> u32 {
+			local mut value = word;
+			local mut result: u32 = 4294967295;
+			local mut i: i32 = 0;
+			loop {
+				if i == 32 { break ^result; }
+				local low: u32 = (result ^ value) & 1;
+				result = result >> 1;
+				if low != 0 { result = result ^ 3988292384; }
+				value = value >> 1;
+				i += 1;
+			}
+		}
+		export { gcd, crc }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let gcd = instance
+				.get_typed_func::<(u32, u32), u32>(&mut store, "gcd")
+				.unwrap();
+			let crc = instance
+				.get_typed_func::<u32, u32>(&mut store, "crc")
+				.unwrap();
+			for word in [0, 1, 0x12345678, 0x80000000, u32::MAX] {
+				let mut expected = u32::MAX;
+				let mut bits = word;
+				for _ in 0..32 {
+					let low = (expected ^ bits) & 1;
+					expected >>= 1;
+					if low != 0 {
+						expected ^= 0xedb88320;
+					}
+					bits >>= 1;
+				}
+				assert_eq!(crc.call(&mut store, word).unwrap(), !expected);
+				for b in [0, 1, 12, 255, 65535, u32::MAX] {
+					let (mut x, mut y) = (word, b);
+					while y != 0 {
+						(x, y) = (y, x % y);
+					}
+					assert_eq!(gcd.call(&mut store, (word, b)).unwrap(), x);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn edge_imported_multivalue_calls_erase_only_zero_sized_slots() {
+		let source = r#"
+		import "host" as host {
+			func exchange(p: (i32, (), i64), token: ()) -> (i64, (), i32);
+		}
+		func run(a: i32, b: i64) -> (i64, i32) {
+			local (x, (), y) = host::exchange((a, (), b), ());
+			(x + 1, y + 2)
+		}
+		export { run }
+	"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let mut graph = crate::tir::signatures::tests::source_graph(source);
+			let mut mir =
+				crate::tir::build(&mut graph).1.expect("import must lower");
+			if let Some(policy) = policy {
+				mir::inline::run(&mut mir, policy);
+			}
+			let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+				.unwrap()
+				.encode();
+			let engine = wasmtime::Engine::default();
+			let module = wasmtime::Module::new(&engine, bytes).unwrap();
+			let mut store = wasmtime::Store::new(&engine, 0);
+			let host = wasmtime::Func::wrap(
+				&mut store,
+				|mut caller: wasmtime::Caller<'_, i32>,
+				 a: i32,
+				 b: i64|
+				 -> (i64, i32) {
+					*caller.data_mut() += 1;
+					(b * 2, a * 3)
+				},
+			);
+			let instance =
+				wasmtime::Instance::new(&mut store, &module, &[host.into()])
+					.unwrap();
+			let run = instance
+				.get_typed_func::<(i32, i64), (i64, i32)>(&mut store, "run")
+				.unwrap();
+			assert_eq!(
+				run.call(&mut store, (7, 1_i64 << 40)).unwrap(),
+				((1_i64 << 41) + 1, 23)
+			);
+			assert_eq!(*store.data(), 1);
+		}
 	}
 }

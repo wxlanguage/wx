@@ -1103,13 +1103,6 @@ impl Neg for f32 {
     }
 }
 
-impl Rem for f32 {
-    #[inline]
-    func rem(self: Self, rhs: Self) -> Self {
-        self - rhs * (self / rhs).trunc()
-    }
-}
-
 impl Add for f64 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
@@ -1145,332 +1138,463 @@ impl Neg for f64 {
     }
 }
 
-impl Rem for f64 {
-    #[inline]
-    func rem(self: Self, rhs: Self) -> Self {
-        self - rhs * (self / rhs).trunc()
-    }
-}
-
 impl Add for i8 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_add(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Sub for i8 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_sub(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Mul for i8 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_mul(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Div for i8 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(i32_div(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_div(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Rem for i8 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(i32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_rem(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Neg for i8 {
     #[inline]
     func neg(self: Self) -> Self {
-        transmute(i32_neg(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_neg(transmute(self)), 24),
+            24,
+        ))
     }
 }
 
 impl BitAnd for i8 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitand(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl BitOr for i8 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitor(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl BitXor for i8 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitxor(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Shl for i8 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shl(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Shr for i8 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(i32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shr(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl BitNot for i8 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_bitnot(transmute(self)), 24),
+            24,
+        ))
     }
 }
 
 impl Add for u8 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_add(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Sub for u8 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_sub(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Mul for u8 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_mul(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Div for u8 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(u32_div(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_div(transmute(self), transmute(rhs))),
+            0xFF,
+        ))
     }
 }
 
 impl Rem for u8 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(u32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_rem(transmute(self), transmute(rhs))),
+            0xFF,
+        ))
     }
 }
 
 impl BitAnd for u8 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitand(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl BitOr for u8 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitor(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl BitXor for u8 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitxor(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Shl for u8 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_shl(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Shr for u8 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(u32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_shr(transmute(self), transmute(rhs))),
+            0xFF,
+        ))
     }
 }
 
 impl BitNot for u8 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_bitand(
+            i32_bitnot(transmute(self)),
+            0xFF,
+        ))
     }
 }
 
 impl Add for i16 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_add(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Sub for i16 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_sub(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Mul for i16 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_mul(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Div for i16 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(i32_div(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_div(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Rem for i16 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(i32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_rem(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Neg for i16 {
     #[inline]
     func neg(self: Self) -> Self {
-        transmute(i32_neg(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_neg(transmute(self)), 16),
+            16,
+        ))
     }
 }
 
 impl BitAnd for i16 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitand(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl BitOr for i16 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitor(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl BitXor for i16 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitxor(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Shl for i16 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shl(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Shr for i16 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(i32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shr(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl BitNot for i16 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_bitnot(transmute(self)), 16),
+            16,
+        ))
     }
 }
 
 impl Add for u16 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_add(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Sub for u16 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_sub(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Mul for u16 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_mul(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Div for u16 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(u32_div(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_div(transmute(self), transmute(rhs))),
+            0xFFFF,
+        ))
     }
 }
 
 impl Rem for u16 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(u32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_rem(transmute(self), transmute(rhs))),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitAnd for u16 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitand(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitOr for u16 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitor(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitXor for u16 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitxor(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Shl for u16 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_shl(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Shr for u16 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(u32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_shr(transmute(self), transmute(rhs))),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitNot for u16 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_bitand(
+            i32_bitnot(transmute(self)),
+            0xFFFF,
+        ))
     }
 }
 

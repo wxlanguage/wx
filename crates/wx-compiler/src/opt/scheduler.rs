@@ -131,6 +131,53 @@ impl<'f> Scheduler<'f> {
 
 	fn emit_control(&mut self, block_idx: BlockIndex, stmt: &ControlNode) {
 		match stmt {
+			ControlNode::Trapping { op, result } => {
+				use super::TrappingOp as T;
+				for operand in op.operands() {
+					self.emit_value(operand);
+				}
+				let instruction = match *op {
+					T::DivS { ty, .. } => match ty {
+						ScalarType::I32 => Instruction::I32DivS,
+						ScalarType::I64 => Instruction::I64DivS,
+						_ => unreachable!(
+							"integer division has integer operands"
+						),
+					},
+					T::DivU { ty, .. } => match ty {
+						ScalarType::I32 => Instruction::I32DivU,
+						ScalarType::I64 => Instruction::I64DivU,
+						_ => unreachable!(
+							"integer division has integer operands"
+						),
+					},
+					T::RemS { ty, .. } => match ty {
+						ScalarType::I32 => Instruction::I32RemS,
+						ScalarType::I64 => Instruction::I64RemS,
+						_ => unreachable!("remainder has integer operands"),
+					},
+					T::RemU { ty, .. } => match ty {
+						ScalarType::I32 => Instruction::I32RemU,
+						ScalarType::I64 => Instruction::I64RemU,
+						_ => unreachable!("remainder has integer operands"),
+					},
+					T::I32TruncF32 { .. } => Instruction::I32TruncF32S,
+					T::U32TruncF32 { .. } => Instruction::I32TruncF32U,
+					T::I32TruncF64 { .. } => Instruction::I32TruncF64S,
+					T::U32TruncF64 { .. } => Instruction::I32TruncF64U,
+					T::I64TruncF32 { .. } => Instruction::I64TruncF32S,
+					T::U64TruncF32 { .. } => Instruction::I64TruncF32U,
+					T::I64TruncF64 { .. } => Instruction::I64TruncF64S,
+					T::U64TruncF64 { .. } => Instruction::I64TruncF64U,
+				};
+				self.body.push(instruction);
+				if self.live_data.is_live(*result) {
+					self.capture_scalar_result(*result);
+				} else {
+					// Discard only the value, never the possible trap.
+					self.body.push(Instruction::Drop);
+				}
+			}
 			ControlNode::Return { value } => {
 				if let StackResult::Value(node) = value {
 					self.emit_value(*node);
@@ -138,6 +185,13 @@ impl<'f> Scheduler<'f> {
 				self.body.push(Instruction::Return);
 			}
 
+			ControlNode::GlobalGet { id, result } => {
+				// A dead global read cannot trap and has no observable effects.
+				if self.live_data.is_live(*result) {
+					self.body.push(Instruction::GlobalGet(*id));
+					self.capture_scalar_result(*result);
+				}
+			}
 			ControlNode::GlobalSet { id, value } => {
 				self.emit_value(*value);
 				self.body.push(Instruction::GlobalSet(*id));
@@ -167,20 +221,15 @@ impl<'f> Scheduler<'f> {
 							//
 							// Always spill: result may be referenced via control-node
 							// args (return, call) not tracked in DataNode::uses.
-							let scalar_types: Vec<ScalarType> = self
-								.mir
-								.aggregate(aggregate_index)
-								.scalars
-								.iter()
-								.map(|&ty| {
-									ScalarType::try_from(ty).expect(
-										"a ScalarTable entry is scalar by construction",
-									)
-								})
-								.collect();
+							let mir = self.mir;
+							let scalar_types =
+								&mir.aggregate(aggregate_index).scalars;
 							let mut locals =
 								Vec::with_capacity(scalar_types.len());
-							for ty in scalar_types.into_iter().rev() {
+							for &ty in scalar_types.iter().rev() {
+								let ty = ScalarType::try_from(ty).expect(
+									"a ScalarTable entry is scalar by construction",
+								);
 								let local = self.alloc_local(ty);
 								self.body.push(Instruction::LocalSet(local));
 								locals.push(local);
@@ -194,13 +243,7 @@ impl<'f> Scheduler<'f> {
 						_ => {
 							// Scalar result: spill to a local if used, drop otherwise.
 							if self.should_spill(*result_node) {
-								let ty = self.func.data_nodes
-									[*result_node as usize]
-									.kind
-									.unwrap_scalar();
-								let local = self.alloc_local(ty);
-								self.node_to_local.insert(*result_node, local);
-								self.body.push(Instruction::LocalSet(local));
+								self.capture_scalar_result(*result_node);
 							} else {
 								self.body.push(Instruction::Drop);
 							}
@@ -217,7 +260,7 @@ impl<'f> Scheduler<'f> {
 				result,
 			} => {
 				// Pre-allocate WASM locals for phi outputs.
-				self.pre_alloc_phi_outputs(outputs);
+				self.pre_alloc_join_outputs(outputs);
 
 				// A phi's "else" (unchanged) input is normally stored by the
 				// `emit_phi_stores_for_branch(.., false)` call below, but that
@@ -299,7 +342,7 @@ impl<'f> Scheduler<'f> {
 				outputs,
 				result,
 			} => {
-				self.pre_alloc_phi_outputs(outputs);
+				self.pre_alloc_join_outputs(outputs);
 
 				// Compared against every case constant below — always spill to
 				// its own local (regardless of the generic multi-use spill
@@ -358,26 +401,15 @@ impl<'f> Scheduler<'f> {
 					}
 				}
 
-				// Pre-allocate WASM locals for break-result phi nodes so that
+				// Pre-allocate separate exit-result locals so that
 				// Break handlers inside the body can write to them before `br`.
-				for phi in self
-					.func
-					.join_data(*body)
-					.break_result_outputs
-					.iter()
-					.copied()
-				{
-					if self.node_to_local.contains_key(&phi) {
-						continue;
-					}
-					let ty =
-						self.func.data_nodes[phi as usize].kind.unwrap_scalar();
-					let local = self.alloc_local(ty);
-					self.node_to_local.insert(phi, local);
-				}
+				let func = self.func;
+				self.pre_alloc_join_outputs(
+					&func.join_data(*body).break_result_outputs,
+				);
 
 				// The outer block has an empty result type: break values are held
-				// in phi locals, not passed via WASM block result.
+				// in exit-result locals, not passed via WASM block result.
 				self.body.push(Instruction::Block {
 					ty: BlockType::Empty,
 				});
@@ -428,42 +460,28 @@ impl<'f> Scheduler<'f> {
 				// JoinParam has no `before` value to initialize with — it's
 				// only ever a write target, never read during construction
 				// (see `DataNodeKind::JoinParam`'s doc comment) — so a plain
-				// `pre_alloc_phi_outputs` (no init store) is exactly right.
-				self.pre_alloc_phi_outputs(outputs);
+				// `pre_alloc_join_outputs` (no init store) is exactly right.
+				self.pre_alloc_join_outputs(outputs);
 
-				// Also pre-allocate locals for the block's own *value* phis
-				// (break_result_outputs — the merged result of every
-				// `break <value>` plus the fallthrough's own tail value),
-				// mirroring Loop's identical separate pre-allocation step
-				// above. Cloned out first to avoid borrowing `self.func`
-				// and `self` mutably at once.
-				let break_result_outputs: Vec<DataNodeIndex> =
-					self.func.join_data(*body).break_result_outputs.clone();
-				self.pre_alloc_phi_outputs(&break_result_outputs);
+				// The block's result slots are separate from carried bindings,
+				// exactly as for a loop, even when there is only one exit.
+				let func = self.func;
+				self.pre_alloc_join_outputs(
+					&func.join_data(*body).break_result_outputs,
+				);
 
 				self.body.push(Instruction::Block {
 					ty: BlockType::Empty,
 				});
 				self.emit_block(*body);
 
-				// The fallthrough's own contribution to the block's *value*
-				// phis — mirrors exactly what `Break`'s handler does with its
+				// The fallthrough's own contribution to the block's result
+				// slots — mirrors exactly what `Break`'s handler does with its
 				// own `value` field, just at the tail of the body instead of
 				// before a `br` (falling off the end has no `ControlNode` of
 				// its own to carry this, hence `fallthrough_value` living on
 				// `BlockJoin` itself).
-				if let StackResult::Value(v) = fallthrough_value {
-					if !break_result_outputs.is_empty() {
-						self.emit_value(*v);
-						for phi in break_result_outputs.iter().copied().rev() {
-							let phi_local =
-								*self.node_to_local.get(&phi).expect(
-									"break result phi local must be pre-allocated by the Loop/BlockJoin handler",
-								);
-							self.body.push(Instruction::LocalSet(phi_local));
-						}
-					}
-				}
+				self.emit_exit_result(*body, *fallthrough_value);
 
 				// The fallthrough path's own commit — same role as a
 				// break/continue's carried_binding_updates, but unconditional
@@ -478,27 +496,7 @@ impl<'f> Scheduler<'f> {
 				value,
 				carried_binding_updates,
 			} => {
-				if let StackResult::Value(v) = value {
-					// Store break value into phi locals; LocalSet in reverse
-					// because emit_value pushes fields lowest-first.
-					let n_phis =
-						self.func.join_data(*target).break_result_outputs.len();
-					if n_phis > 0 {
-						self.emit_value(*v);
-						let phis: Vec<DataNodeIndex> = self
-							.func
-							.join_data(*target)
-							.break_result_outputs
-							.clone();
-						for phi in phis.into_iter().rev() {
-							let phi_local =
-								*self.node_to_local.get(&phi).expect(
-									"break result phi local must be pre-allocated by the Loop/BlockJoin handler",
-								);
-							self.body.push(Instruction::LocalSet(phi_local));
-						}
-					}
-				}
+				self.emit_exit_result(*target, *value);
 				// This break's own current values for the target's carried
 				// bindings — committed here because the target's normal
 				// "commit, then branch back/fall through" tail code only
@@ -524,11 +522,7 @@ impl<'f> Scheduler<'f> {
 
 			ControlNode::MemorySize { memory, result } => {
 				self.body.push(Instruction::MemorySize(*memory));
-				let ty =
-					self.func.data_nodes[*result as usize].kind.unwrap_scalar();
-				let local = self.alloc_local(ty);
-				self.node_to_local.insert(*result, local);
-				self.body.push(Instruction::LocalSet(local));
+				self.capture_scalar_result(*result);
 			}
 
 			ControlNode::MemoryGrow {
@@ -539,12 +533,7 @@ impl<'f> Scheduler<'f> {
 				self.emit_value(*delta);
 				self.body.push(Instruction::MemoryGrow(*memory));
 				if self.should_spill(*result) {
-					let ty = self.func.data_nodes[*result as usize]
-						.kind
-						.unwrap_scalar();
-					let local = self.alloc_local(ty);
-					self.node_to_local.insert(*result, local);
-					self.body.push(Instruction::LocalSet(local));
+					self.capture_scalar_result(*result);
 				}
 			}
 
@@ -576,10 +565,7 @@ impl<'f> Scheduler<'f> {
 				};
 				self.body.push(load_instr);
 				// PointerLoadResult always spills (no_cse + always_spill).
-				let scalar_ty = access.scalar_type();
-				let local = self.alloc_local(scalar_ty);
-				self.node_to_local.insert(*result, local);
-				self.body.push(Instruction::LocalSet(local));
+				self.capture_scalar_result(*result);
 			}
 
 			ControlNode::MemoryFill {
@@ -811,7 +797,7 @@ impl<'f> Scheduler<'f> {
 
 		// Propagate downward: a pure node's readers are also, transitively,
 		// readers of its own operands, at the same statement position.
-		// Impure nodes (CallResult, GlobalGet, LoopParam, Phi, ...) never
+		// Impure nodes (control results, LoopParam, JoinParam, Phi) never
 		// propagate past themselves — their own operands (a call's args, a
 		// phi's per-branch inputs, ...) are always consumed at the single
 		// fixed control-node site that produces the impure value (e.g. a
@@ -966,7 +952,7 @@ impl<'f> Scheduler<'f> {
 	/// for `Switch`). `block_idx` (the block containing the `if`/`switch`)
 	/// only ever reads the phi's *merged* result, a value in its own right
 	/// that's already correctly materialized by the existing
-	/// `pre_alloc_phi_outputs`/`emit_phi_stores_for_branch` machinery — not
+	/// `pre_alloc_join_outputs`/`emit_phi_stores_for_branch` machinery — not
 	/// the branch-local values feeding into it. Recording those against
 	/// `block_idx` instead of their true origin block is exactly the bug
 	/// this function exists to avoid: it would misidentify a value that's
@@ -1008,6 +994,15 @@ impl<'f> Scheduler<'f> {
 		for (i, stmt) in block.statements.iter().enumerate() {
 			let i = i as u32;
 			match stmt {
+				ControlNode::Trapping { op, .. } => {
+					for operand in op.operands() {
+						record_read(
+							&mut consuming_blocks[operand as usize],
+							block_idx,
+							i,
+						);
+					}
+				}
 				ControlNode::Return { value } => {
 					if let StackResult::Value(n) = value {
 						record_read(
@@ -1199,7 +1194,8 @@ impl<'f> Scheduler<'f> {
 				// `result`/`delta` etc. that *produce* a value (rather than
 				// read one) are deliberately not recorded here — see the
 				// impure-node skip in `compute_value_placement`.
-				ControlNode::MemorySize { .. } => {}
+				ControlNode::MemorySize { .. }
+				| ControlNode::GlobalGet { .. } => {}
 				ControlNode::MemoryGrow { delta, .. } => {
 					record_read(
 						&mut consuming_blocks[*delta as usize],
@@ -1268,10 +1264,7 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::Add { left, right, .. }
 			| DataNodeKind::Sub { left, right, .. }
 			| DataNodeKind::Mul { left, right, .. }
-			| DataNodeKind::DivS { left, right, .. }
-			| DataNodeKind::DivU { left, right, .. }
-			| DataNodeKind::RemS { left, right, .. }
-			| DataNodeKind::RemU { left, right, .. }
+			| DataNodeKind::Div { left, right, .. }
 			| DataNodeKind::Min { left, right, .. }
 			| DataNodeKind::Max { left, right, .. }
 			| DataNodeKind::Copysign { left, right, .. }
@@ -1314,14 +1307,6 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::F64ConvertU32 { operand }
 			| DataNodeKind::F64ConvertI64 { operand }
 			| DataNodeKind::F64ConvertU64 { operand }
-			| DataNodeKind::I32TruncF32 { operand }
-			| DataNodeKind::U32TruncF32 { operand }
-			| DataNodeKind::I32TruncF64 { operand }
-			| DataNodeKind::U32TruncF64 { operand }
-			| DataNodeKind::I64TruncF32 { operand }
-			| DataNodeKind::U64TruncF32 { operand }
-			| DataNodeKind::I64TruncF64 { operand }
-			| DataNodeKind::U64TruncF64 { operand }
 			| DataNodeKind::F64PromoteF32 { operand }
 			| DataNodeKind::F32DemoteF64 { operand }
 			| DataNodeKind::I32ReinterpretF32 { operand }
@@ -1348,7 +1333,8 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::Int { .. }
 			| DataNodeKind::Float { .. }
 			| DataNodeKind::Param { .. }
-			| DataNodeKind::GlobalGet { .. }
+			| DataNodeKind::GlobalGetResult { .. }
+			| DataNodeKind::TrappingResult { .. }
 			| DataNodeKind::FunctionRef { .. }
 			| DataNodeKind::StaticDataRef { .. }
 			| DataNodeKind::MemoryOffset { .. }
@@ -1496,9 +1482,6 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::Param { index, .. } => {
 				self.body.push(Instruction::LocalGet(index));
 			}
-			DataNodeKind::GlobalGet { id, .. } => {
-				self.body.push(Instruction::GlobalGet(id));
-			}
 			DataNodeKind::FunctionRef { id } => {
 				self.body.push(Instruction::FunctionPointer(id));
 			}
@@ -1516,6 +1499,10 @@ impl<'f> Scheduler<'f> {
 				unreachable!(
 					"MemorySizeResult must be read from a local, not emitted inline"
 				)
+			}
+			DataNodeKind::TrappingResult { .. }
+			| DataNodeKind::GlobalGetResult { .. } => {
+				unreachable!("a control result is captured at its producer")
 			}
 
 			// Arithmetic / bitwise — push left, push right, emit opcode.
@@ -1549,41 +1536,15 @@ impl<'f> Scheduler<'f> {
 					ScalarType::F64 => Instruction::F64Mul,
 				});
 			}
-			DataNodeKind::DivS { left, right, ty } => {
+			DataNodeKind::Div { left, right, ty } => {
 				self.emit_value(left);
 				self.emit_value(right);
 				self.body.push(match ty {
-					ScalarType::I32 => Instruction::I32DivS,
-					ScalarType::I64 => Instruction::I64DivS,
 					ScalarType::F32 => Instruction::F32Div,
 					ScalarType::F64 => Instruction::F64Div,
-				});
-			}
-			DataNodeKind::DivU { left, right, ty } => {
-				self.emit_value(left);
-				self.emit_value(right);
-				self.body.push(match ty {
-					ScalarType::I32 => Instruction::I32DivU,
-					ScalarType::I64 => Instruction::I64DivU,
-					_ => unreachable!("float division is always DivS"),
-				});
-			}
-			DataNodeKind::RemS { left, right, ty } => {
-				self.emit_value(left);
-				self.emit_value(right);
-				self.body.push(match ty {
-					ScalarType::I32 => Instruction::I32RemS,
-					ScalarType::I64 => Instruction::I64RemS,
-					_ => unimplemented!("float remainder"),
-				});
-			}
-			DataNodeKind::RemU { left, right, ty } => {
-				self.emit_value(left);
-				self.emit_value(right);
-				self.body.push(match ty {
-					ScalarType::I32 => Instruction::I32RemU,
-					ScalarType::I64 => Instruction::I64RemU,
-					_ => unimplemented!("float remainder"),
+					_ => {
+						unreachable!("integer division has a control producer")
+					}
 				});
 			}
 			DataNodeKind::Min { left, right, ty } => {
@@ -1798,38 +1759,6 @@ impl<'f> Scheduler<'f> {
 				self.emit_value(operand);
 				self.body.push(Instruction::F64ConvertI64U);
 			}
-			DataNodeKind::I32TruncF32 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I32TruncF32S);
-			}
-			DataNodeKind::U32TruncF32 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I32TruncF32U);
-			}
-			DataNodeKind::I32TruncF64 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I32TruncF64S);
-			}
-			DataNodeKind::U32TruncF64 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I32TruncF64U);
-			}
-			DataNodeKind::I64TruncF32 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I64TruncF32S);
-			}
-			DataNodeKind::U64TruncF32 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I64TruncF32U);
-			}
-			DataNodeKind::I64TruncF64 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I64TruncF64S);
-			}
-			DataNodeKind::U64TruncF64 { operand } => {
-				self.emit_value(operand);
-				self.body.push(Instruction::I64TruncF64U);
-			}
 			DataNodeKind::F64PromoteF32 { operand } => {
 				self.emit_value(operand);
 				self.body.push(Instruction::F64PromoteF32);
@@ -1967,7 +1896,7 @@ impl<'f> Scheduler<'f> {
 			}
 
 			DataNodeKind::Phi { .. } => {
-				// A phi's local was pre-allocated by `pre_alloc_phi_outputs`.
+				// A phi's local was pre-allocated by `pre_alloc_join_outputs`.
 				// The scheduler reads it here; the branches write it via LocalSet.
 				let local = self.node_to_local[&node];
 				self.body.push(Instruction::LocalGet(local));
@@ -1980,15 +1909,9 @@ impl<'f> Scheduler<'f> {
 			}
 
 			DataNodeKind::JoinParam { .. } => {
-				// Unlike LoopParam, a JoinParam has no "before" value to fall
-				// back to — it's never read during construction (see its own
-				// doc comment), only ever committed to by an exit. By
-				// construction, `should_spill` (above) is exact for this
-				// kind: a JoinParam only ever reaches `emit_value` when it's
-				// genuinely divergent, and a genuinely divergent one always
-				// has a pre-allocated local, so `should_spill` returns true
-				// and this arm is never actually reached — if it ever is,
-				// that's a real bug upstream, not something to paper over.
+				// Exit results and divergent block bindings must have a local
+				// allocated before entering their body. Unlike LoopParam,
+				// JoinParam has no entry value to recompute as a fallback.
 				unreachable!(
 					"JoinParam reached emit_value_inline: should_spill should always be true for a JoinParam actually referenced"
 				)
@@ -2041,14 +1964,9 @@ impl<'f> Scheduler<'f> {
 				self.node_to_local.contains_key(&idx)
 			}
 
-			// A join param needs a local exactly when it was found genuinely
-			// divergent and pushed into `ControlNode::BlockJoin::outputs` —
-			// same reasoning as `LoopParam`, above. Deliberately *not* left
-			// to the `uses.len() > 1` catch-all below: `register_uses` never
-			// populates a `JoinParam`'s `.uses` at all (it has no operand
-			// fields — see `Function::register_uses`), so the catch-all
-			// would always read `uses.len() == 0` and wrongly return `false`
-			// even for a genuinely divergent, pre-allocated one.
+			// Join results and divergent block-carried bindings are allocated
+			// before entering their target's body. Their values only come from
+			// exit stores; use counts cannot decide whether they need locals.
 			DataNodeKind::JoinParam { .. } => {
 				self.node_to_local.contains_key(&idx)
 			}
@@ -2058,22 +1976,12 @@ impl<'f> Scheduler<'f> {
 
 			// Control-node results always produce a result that must be captured.
 			DataNodeKind::CallResult { .. }
+			| DataNodeKind::TrappingResult { .. }
+			| DataNodeKind::GlobalGetResult { .. }
 			| DataNodeKind::AggregateCallResult { .. }
 			| DataNodeKind::MemorySizeResult { .. }
 			| DataNodeKind::MemoryGrowResult { .. }
 			| DataNodeKind::PointerLoadResult { .. } => true,
-
-			// GlobalGet reads mutable state. Control nodes (Return, Break,
-			// GlobalSet) use data-node values but never call register_uses, so
-			// a GlobalGet whose only non-control use is a single data node still
-			// has uses.len()==1 and would not be spilled by the catch-all below.
-			// If a GlobalSet to the same global is emitted between the read and
-			// a late emit_value_inline call, the inline re-read returns the
-			// post-write value instead of the original. Always spilling ensures
-			// the value is captured in a local on the first use (which is always
-			// scheduled before any write to the same global that depends on the
-			// read's descendants), and subsequent uses read the saved local.
-			DataNodeKind::GlobalGet { .. } => true,
 
 			// Aggregates live in per-scalar locals, not on the stack.
 			DataNodeKind::Aggregate { .. } => true,
@@ -2095,21 +2003,21 @@ impl<'f> Scheduler<'f> {
 		if self.node_to_aggregate_locals.contains_key(&node) {
 			return;
 		}
-		let (values, aggregate_index) =
-			match self.func.data_nodes[node as usize].kind.clone() {
-				DataNodeKind::Aggregate {
-					values,
-					aggregate_index,
-				} => (values, aggregate_index),
-				DataNodeKind::AggregateCallResult { .. } => {
-					unreachable!(
-						"AggregateCallResult locals must be populated by emit_control before use"
-					)
-				}
-				_ => panic!(
-					"ensure_aggregate_locals called on non-aggregate node"
-				),
-			};
+		let func = self.func;
+		let (values, aggregate_index) = match &func.data_nodes[node as usize]
+			.kind
+		{
+			DataNodeKind::Aggregate {
+				values,
+				aggregate_index,
+			} => (values, *aggregate_index),
+			DataNodeKind::AggregateCallResult { .. } => {
+				unreachable!(
+					"AggregateCallResult locals must be populated by emit_control before use"
+				)
+			}
+			_ => panic!("ensure_aggregate_locals called on non-aggregate node"),
+		};
 		let mir = self.mir;
 		let agg = mir.aggregate(aggregate_index);
 		let mut locals = Vec::with_capacity(agg.scalars.len());
@@ -2132,6 +2040,12 @@ impl<'f> Scheduler<'f> {
 			return l;
 		}
 		self.emit_value_inline(node);
+		self.capture_scalar_result(node)
+	}
+
+	/// Capture an already-emitted scalar value. This does not evaluate the
+	/// node: control producers must run at their own execution point.
+	fn capture_scalar_result(&mut self, node: DataNodeIndex) -> u32 {
 		let ty = self.func.data_nodes[node as usize].kind.unwrap_scalar();
 		let local = self.alloc_local(ty);
 		self.body.push(Instruction::LocalSet(local));
@@ -2145,17 +2059,16 @@ impl<'f> Scheduler<'f> {
 		idx
 	}
 
-	/// Pre-allocate WASM locals for phi nodes produced by an if-else join.
-	/// Both branches will write to these locals; the code after the if-else
-	/// reads them.
-	fn pre_alloc_phi_outputs(&mut self, outputs: &[DataNodeIndex]) {
-		for &phi in outputs {
-			if self.node_to_local.contains_key(&phi) {
+	/// Pre-allocate locals for scalar join outputs (Phi or JoinParam).
+	/// Predecessors write them; consumers past the join read them.
+	fn pre_alloc_join_outputs(&mut self, outputs: &[DataNodeIndex]) {
+		for &output in outputs {
+			if self.node_to_local.contains_key(&output) {
 				continue;
 			}
-			let ty = self.func.data_nodes[phi as usize].kind.unwrap_scalar();
+			let ty = self.func.data_nodes[output as usize].kind.unwrap_scalar();
 			let local = self.alloc_local(ty);
-			self.node_to_local.insert(phi, local);
+			self.node_to_local.insert(output, local);
 		}
 	}
 
@@ -2178,6 +2091,26 @@ impl<'f> Scheduler<'f> {
 				_ => continue,
 			};
 			self.emit_value(input);
+			self.body.push(Instruction::LocalSet(local));
+		}
+	}
+
+	/// Store a break/fallthrough value before committing carried bindings.
+	/// Push every scalar first, then store in reverse stack order.
+	fn emit_exit_result(&mut self, target: BlockIndex, value: StackResult) {
+		let StackResult::Value(value) = value else {
+			return;
+		};
+		let func = self.func;
+		let outputs = &func.join_data(target).break_result_outputs;
+		if outputs.is_empty() {
+			return;
+		}
+		self.emit_value(value);
+		for output in outputs.iter().rev() {
+			let local = *self.node_to_local.get(output).expect(
+				"exit-result local must be pre-allocated by the Loop/BlockJoin handler",
+			);
 			self.body.push(Instruction::LocalSet(local));
 		}
 	}
