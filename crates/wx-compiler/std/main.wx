@@ -33,7 +33,7 @@ pub type funcref;
 
 /// Aborts execution by trapping: normal control flow never continues past a
 /// call to `trap`, so it has the bottom type `!`.
-pub func trap() -> !;
+pub crate func trap() -> !;
 
 pub trait Add {
     func add(self: Self, rhs: Self) -> Self;
@@ -153,17 +153,17 @@ impl Ordering {
     #[inline]
     pub func reverse(self: Self) -> Ordering {
         match self {
-            Ordering::Less -> { Ordering::Greater },
-            Ordering::Equal -> { Ordering::Equal },
-            Ordering::Greater -> { Ordering::Less }
+            Ordering::Less => Ordering::Greater,
+            Ordering::Equal => Ordering::Equal,
+            Ordering::Greater => Ordering::Less,
         }
     }
 
     #[inline]
     pub func then(self: Self, other: Ordering) -> Ordering {
         match self {
-            Ordering::Equal -> { other },
-            _ -> { self }
+            Ordering::Equal => other,
+            _ => self,
         }
     }
 }
@@ -274,237 +274,237 @@ pub trait ArrayMut: Array + SliceMut {
     func as_slice_mut(self: Self) -> Self::Mem::*[Self::Value];
 }
 
-pub func i64_extend_i32(value: i32) -> i64;
+pub crate func i64_extend_i32(value: i32) -> i64;
 
-pub func u64_extend_u32(value: u32) -> u64;
+pub crate func u64_extend_u32(value: u32) -> u64;
 
-pub func i32_wrap_i64(value: i64) -> i32;
+pub crate func i32_wrap_i64(value: i64) -> i32;
 
-pub func f32_sqrt(value: f32) -> f32;
+pub crate func f32_sqrt(value: f32) -> f32;
 
-pub func f64_sqrt(value: f64) -> f64;
+pub crate func f64_sqrt(value: f64) -> f64;
 
-pub func f32_abs(value: f32) -> f32;
+pub crate func f32_abs(value: f32) -> f32;
 
-pub func f64_abs(value: f64) -> f64;
+pub crate func f64_abs(value: f64) -> f64;
 
-pub func f32_floor(value: f32) -> f32;
+pub crate func f32_floor(value: f32) -> f32;
 
-pub func f64_floor(value: f64) -> f64;
+pub crate func f64_floor(value: f64) -> f64;
 
-pub func f32_ceil(value: f32) -> f32;
+pub crate func f32_ceil(value: f32) -> f32;
 
-pub func f64_ceil(value: f64) -> f64;
+pub crate func f64_ceil(value: f64) -> f64;
 
-pub func f32_trunc(value: f32) -> f32;
+pub crate func f32_trunc(value: f32) -> f32;
 
-pub func f64_trunc(value: f64) -> f64;
+pub crate func f64_trunc(value: f64) -> f64;
 
-pub func f32_nearest(value: f32) -> f32;
+pub crate func f32_nearest(value: f32) -> f32;
 
-pub func f64_nearest(value: f64) -> f64;
+pub crate func f64_nearest(value: f64) -> f64;
 
-pub func f32_min(a: f32, b: f32) -> f32;
+pub crate func f32_min(a: f32, b: f32) -> f32;
 
-pub func f64_min(a: f64, b: f64) -> f64;
+pub crate func f64_min(a: f64, b: f64) -> f64;
 
-pub func f32_max(a: f32, b: f32) -> f32;
+pub crate func f32_max(a: f32, b: f32) -> f32;
 
-pub func f64_max(a: f64, b: f64) -> f64;
+pub crate func f64_max(a: f64, b: f64) -> f64;
 
-pub func f32_copysign(a: f32, b: f32) -> f32;
+pub crate func f32_copysign(a: f32, b: f32) -> f32;
 
-pub func f64_copysign(a: f64, b: f64) -> f64;
+pub crate func f64_copysign(a: f64, b: f64) -> f64;
 
-pub func i32_neg(value: i32) -> i32;
+pub crate func i32_neg(value: i32) -> i32;
 
-pub func i64_neg(value: i64) -> i64;
+pub crate func i64_neg(value: i64) -> i64;
 
-pub func f32_neg(value: f32) -> f32;
+pub crate func f32_neg(value: f32) -> f32;
 
-pub func f64_neg(value: f64) -> f64;
+pub crate func f64_neg(value: f64) -> f64;
 
-pub func i32_add(a: i32, b: i32) -> i32;
+pub crate func i32_add(a: i32, b: i32) -> i32;
 
-pub func i64_add(a: i64, b: i64) -> i64;
+pub crate func i64_add(a: i64, b: i64) -> i64;
 
-pub func f32_add(a: f32, b: f32) -> f32;
+pub crate func f32_add(a: f32, b: f32) -> f32;
 
-pub func f64_add(a: f64, b: f64) -> f64;
+pub crate func f64_add(a: f64, b: f64) -> f64;
 
-pub func i32_sub(a: i32, b: i32) -> i32;
+pub crate func i32_sub(a: i32, b: i32) -> i32;
 
-pub func i64_sub(a: i64, b: i64) -> i64;
+pub crate func i64_sub(a: i64, b: i64) -> i64;
 
-pub func f32_sub(a: f32, b: f32) -> f32;
+pub crate func f32_sub(a: f32, b: f32) -> f32;
 
-pub func f64_sub(a: f64, b: f64) -> f64;
+pub crate func f64_sub(a: f64, b: f64) -> f64;
 
-pub func i32_mul(a: i32, b: i32) -> i32;
+pub crate func i32_mul(a: i32, b: i32) -> i32;
 
-pub func i64_mul(a: i64, b: i64) -> i64;
+pub crate func i64_mul(a: i64, b: i64) -> i64;
 
-pub func f32_mul(a: f32, b: f32) -> f32;
+pub crate func f32_mul(a: f32, b: f32) -> f32;
 
-pub func f64_mul(a: f64, b: f64) -> f64;
+pub crate func f64_mul(a: f64, b: f64) -> f64;
 
-pub func i32_div(a: i32, b: i32) -> i32;
+pub crate func i32_div(a: i32, b: i32) -> i32;
 
-pub func u32_div(a: u32, b: u32) -> u32;
+pub crate func u32_div(a: u32, b: u32) -> u32;
 
-pub func i64_div(a: i64, b: i64) -> i64;
+pub crate func i64_div(a: i64, b: i64) -> i64;
 
-pub func u64_div(a: u64, b: u64) -> u64;
+pub crate func u64_div(a: u64, b: u64) -> u64;
 
-pub func f32_div(a: f32, b: f32) -> f32;
+pub crate func f32_div(a: f32, b: f32) -> f32;
 
-pub func f64_div(a: f64, b: f64) -> f64;
+pub crate func f64_div(a: f64, b: f64) -> f64;
 
-pub func i32_rem(a: i32, b: i32) -> i32;
+pub crate func i32_rem(a: i32, b: i32) -> i32;
 
-pub func u32_rem(a: u32, b: u32) -> u32;
+pub crate func u32_rem(a: u32, b: u32) -> u32;
 
-pub func i64_rem(a: i64, b: i64) -> i64;
+pub crate func i64_rem(a: i64, b: i64) -> i64;
 
-pub func u64_rem(a: u64, b: u64) -> u64;
+pub crate func u64_rem(a: u64, b: u64) -> u64;
 
-pub func i32_bitand(a: i32, b: i32) -> i32;
+pub crate func i32_bitand(a: i32, b: i32) -> i32;
 
-pub func i64_bitand(a: i64, b: i64) -> i64;
+pub crate func i64_bitand(a: i64, b: i64) -> i64;
 
-pub func i32_bitor(a: i32, b: i32) -> i32;
+pub crate func i32_bitor(a: i32, b: i32) -> i32;
 
-pub func i64_bitor(a: i64, b: i64) -> i64;
+pub crate func i64_bitor(a: i64, b: i64) -> i64;
 
-pub func i32_bitxor(a: i32, b: i32) -> i32;
+pub crate func i32_bitxor(a: i32, b: i32) -> i32;
 
-pub func i64_bitxor(a: i64, b: i64) -> i64;
+pub crate func i64_bitxor(a: i64, b: i64) -> i64;
 
-pub func i32_shl(a: i32, b: i32) -> i32;
+pub crate func i32_shl(a: i32, b: i32) -> i32;
 
-pub func i64_shl(a: i64, b: i64) -> i64;
+pub crate func i64_shl(a: i64, b: i64) -> i64;
 
-pub func i32_shr(a: i32, b: i32) -> i32;
+pub crate func i32_shr(a: i32, b: i32) -> i32;
 
-pub func u32_shr(a: u32, b: u32) -> u32;
+pub crate func u32_shr(a: u32, b: u32) -> u32;
 
-pub func i64_shr(a: i64, b: i64) -> i64;
+pub crate func i64_shr(a: i64, b: i64) -> i64;
 
-pub func u64_shr(a: u64, b: u64) -> u64;
+pub crate func u64_shr(a: u64, b: u64) -> u64;
 
-pub func i32_bitnot(value: i32) -> i32;
+pub crate func i32_bitnot(value: i32) -> i32;
 
-pub func i64_bitnot(value: i64) -> i64;
+pub crate func i64_bitnot(value: i64) -> i64;
 
-pub func i32_eqz(value: i32) -> Bool;
+pub crate func i32_eqz(value: i32) -> Bool;
 
-pub func i32_eq(a: i32, b: i32) -> Bool;
+pub crate func i32_eq(a: i32, b: i32) -> Bool;
 
-pub func i64_eq(a: i64, b: i64) -> Bool;
+pub crate func i64_eq(a: i64, b: i64) -> Bool;
 
-pub func f32_eq(a: f32, b: f32) -> Bool;
+pub crate func f32_eq(a: f32, b: f32) -> Bool;
 
-pub func f64_eq(a: f64, b: f64) -> Bool;
+pub crate func f64_eq(a: f64, b: f64) -> Bool;
 
-pub func i32_ne(a: i32, b: i32) -> Bool;
+pub crate func i32_ne(a: i32, b: i32) -> Bool;
 
-pub func i64_ne(a: i64, b: i64) -> Bool;
+pub crate func i64_ne(a: i64, b: i64) -> Bool;
 
-pub func f32_ne(a: f32, b: f32) -> Bool;
+pub crate func f32_ne(a: f32, b: f32) -> Bool;
 
-pub func f64_ne(a: f64, b: f64) -> Bool;
+pub crate func f64_ne(a: f64, b: f64) -> Bool;
 
-pub func i32_lt(a: i32, b: i32) -> Bool;
+pub crate func i32_lt(a: i32, b: i32) -> Bool;
 
-pub func u32_lt(a: u32, b: u32) -> Bool;
+pub crate func u32_lt(a: u32, b: u32) -> Bool;
 
-pub func i64_lt(a: i64, b: i64) -> Bool;
+pub crate func i64_lt(a: i64, b: i64) -> Bool;
 
-pub func u64_lt(a: u64, b: u64) -> Bool;
+pub crate func u64_lt(a: u64, b: u64) -> Bool;
 
-pub func f32_lt(a: f32, b: f32) -> Bool;
+pub crate func f32_lt(a: f32, b: f32) -> Bool;
 
-pub func f64_lt(a: f64, b: f64) -> Bool;
+pub crate func f64_lt(a: f64, b: f64) -> Bool;
 
-pub func i32_le(a: i32, b: i32) -> Bool;
+pub crate func i32_le(a: i32, b: i32) -> Bool;
 
-pub func u32_le(a: u32, b: u32) -> Bool;
+pub crate func u32_le(a: u32, b: u32) -> Bool;
 
-pub func i64_le(a: i64, b: i64) -> Bool;
+pub crate func i64_le(a: i64, b: i64) -> Bool;
 
-pub func u64_le(a: u64, b: u64) -> Bool;
+pub crate func u64_le(a: u64, b: u64) -> Bool;
 
-pub func f32_le(a: f32, b: f32) -> Bool;
+pub crate func f32_le(a: f32, b: f32) -> Bool;
 
-pub func f64_le(a: f64, b: f64) -> Bool;
+pub crate func f64_le(a: f64, b: f64) -> Bool;
 
-pub func i32_gt(a: i32, b: i32) -> Bool;
+pub crate func i32_gt(a: i32, b: i32) -> Bool;
 
-pub func u32_gt(a: u32, b: u32) -> Bool;
+pub crate func u32_gt(a: u32, b: u32) -> Bool;
 
-pub func i64_gt(a: i64, b: i64) -> Bool;
+pub crate func i64_gt(a: i64, b: i64) -> Bool;
 
-pub func u64_gt(a: u64, b: u64) -> Bool;
+pub crate func u64_gt(a: u64, b: u64) -> Bool;
 
-pub func f32_gt(a: f32, b: f32) -> Bool;
+pub crate func f32_gt(a: f32, b: f32) -> Bool;
 
-pub func f64_gt(a: f64, b: f64) -> Bool;
+pub crate func f64_gt(a: f64, b: f64) -> Bool;
 
-pub func i32_ge(a: i32, b: i32) -> Bool;
+pub crate func i32_ge(a: i32, b: i32) -> Bool;
 
-pub func u32_ge(a: u32, b: u32) -> Bool;
+pub crate func u32_ge(a: u32, b: u32) -> Bool;
 
-pub func i64_ge(a: i64, b: i64) -> Bool;
+pub crate func i64_ge(a: i64, b: i64) -> Bool;
 
-pub func u64_ge(a: u64, b: u64) -> Bool;
+pub crate func u64_ge(a: u64, b: u64) -> Bool;
 
-pub func f32_ge(a: f32, b: f32) -> Bool;
+pub crate func f32_ge(a: f32, b: f32) -> Bool;
 
-pub func f64_ge(a: f64, b: f64) -> Bool;
+pub crate func f64_ge(a: f64, b: f64) -> Bool;
 
-pub func f32_convert_i32(value: i32) -> f32;
+pub crate func f32_convert_i32(value: i32) -> f32;
 
-pub func f32_convert_u32(value: u32) -> f32;
+pub crate func f32_convert_u32(value: u32) -> f32;
 
-pub func f32_convert_i64(value: i64) -> f32;
+pub crate func f32_convert_i64(value: i64) -> f32;
 
-pub func f32_convert_u64(value: u64) -> f32;
+pub crate func f32_convert_u64(value: u64) -> f32;
 
-pub func f64_convert_i32(value: i32) -> f64;
+pub crate func f64_convert_i32(value: i32) -> f64;
 
-pub func f64_convert_u32(value: u32) -> f64;
+pub crate func f64_convert_u32(value: u32) -> f64;
 
-pub func f64_convert_i64(value: i64) -> f64;
+pub crate func f64_convert_i64(value: i64) -> f64;
 
-pub func f64_convert_u64(value: u64) -> f64;
+pub crate func f64_convert_u64(value: u64) -> f64;
 
-pub func i32_trunc_f32(value: f32) -> i32;
+pub crate func i32_trunc_f32(value: f32) -> i32;
 
-pub func u32_trunc_f32(value: f32) -> u32;
+pub crate func u32_trunc_f32(value: f32) -> u32;
 
-pub func i32_trunc_f64(value: f64) -> i32;
+pub crate func i32_trunc_f64(value: f64) -> i32;
 
-pub func u32_trunc_f64(value: f64) -> u32;
+pub crate func u32_trunc_f64(value: f64) -> u32;
 
-pub func i64_trunc_f32(value: f32) -> i64;
+pub crate func i64_trunc_f32(value: f32) -> i64;
 
-pub func u64_trunc_f32(value: f32) -> u64;
+pub crate func u64_trunc_f32(value: f32) -> u64;
 
-pub func i64_trunc_f64(value: f64) -> i64;
+pub crate func i64_trunc_f64(value: f64) -> i64;
 
-pub func u64_trunc_f64(value: f64) -> u64;
+pub crate func u64_trunc_f64(value: f64) -> u64;
 
-pub func f64_promote_f32(value: f32) -> f64;
+pub crate func f64_promote_f32(value: f32) -> f64;
 
-pub func f32_demote_f64(value: f64) -> f32;
+pub crate func f32_demote_f64(value: f64) -> f32;
 
-pub func i32_reinterpret_f32(value: f32) -> i32;
+pub crate func i32_reinterpret_f32(value: f32) -> i32;
 
-pub func f32_reinterpret_i32(value: i32) -> f32;
+pub crate func f32_reinterpret_i32(value: i32) -> f32;
 
-pub func i64_reinterpret_f64(value: f64) -> i64;
+pub crate func i64_reinterpret_f64(value: f64) -> i64;
 
-pub func f64_reinterpret_i64(value: i64) -> f64;
+pub crate func f64_reinterpret_i64(value: i64) -> f64;
 
 impl f32 {
     pub const NAN: f32 = 0.0 / 0.0;
@@ -2053,20 +2053,20 @@ impl SignedInt for i64 {
 
 /// Grows `mem` by `delta` pages; returns the previous size in pages, or `-1` on failure. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/grow
-pub func memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
+pub crate func memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
 
 /// Returns the current size of `mem` in pages. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/size
-pub func memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
+pub crate func memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 
 /// This is analogous to `memset` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/fill
-pub func memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
+pub crate func memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
 
 /// Can copy across two different memories as long as they have the same pointer size.
 /// This is analogous to `memmove` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/copy
-pub func memory_copy<
+pub crate func memory_copy<
     Size: PointerSize,
     SrcMem: Memory where { Size = Size },
     DstMem: Memory where { Size = Size },
@@ -2074,9 +2074,9 @@ pub func memory_copy<
 
 pub typeset PointerSize: Add + Sub + Mul + PartialEq + UnsignedInt + StackValue { u32, u64 }
 
-func global_get<G: Global>(g: G) -> G::Value;
+crate func global_get<G: Global>(g: G) -> G::Value;
 
-func global_set<G: Global>(g: G, value: G::Value);
+crate func global_set<G: Global>(g: G, value: G::Value);
 
 /// How a value sits on the Wasm stack. Every type but `!` (and any type
 /// containing it) is one; the compiler answers it from the type's structure.
@@ -2093,7 +2093,7 @@ pub typeset StackScalar { i32, i64, f32, f64, funcref }
 /// Reinterprets a value as another type held the same way on the stack. Changing
 /// a value's representation (`i32` to `i64`, an integer to a float) is an
 /// instruction's job.
-pub func transmute<
+pub crate func transmute<
     T: StackValue,
     U: StackValue where { Repr = T::Repr },
 >(value: T) -> U;
@@ -2154,9 +2154,9 @@ pub trait Call {
 
 pub trait Function: Call {}
 
-pub func size_of<T, Mem: Memory>() -> Mem::Size;
+pub crate func size_of<T, Mem: Memory>() -> Mem::Size;
 
-pub func align_of<T, Mem: Memory>() -> Mem::Size;
+pub crate func align_of<T, Mem: Memory>() -> Mem::Size;
 
 pub struct Layout<Mem: Memory>(
     size: Mem::Size,

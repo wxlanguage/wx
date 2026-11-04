@@ -1,9 +1,10 @@
 # New TIR to MIR transition specification
 
 Status: **design specification; syntax and contract collection implemented;
-scalar and aggregate TIR→MIR checkpoints implemented**.
-Std migration and compiler fulfillment remain future stages. Decisions below
-are settled for the current compiler transition.
+scalar and aggregate TIR→MIR checkpoints and typed std function binding implemented**.
+Std's provided functions now use `crate func`; primitive aliases retain their
+existing type-context resolution. General package fulfillment remains deferred.
+Decisions below are settled for the current compiler transition.
 This describes the active `tir-refactor` implementation, not the commented-out
 TIR or the older architecture notes. Source inspection: 2026-11-03.
 
@@ -31,6 +32,8 @@ the missing backend feature. `ExprKind::Error` must not become a successful
 | First executable checkpoint | Exported scalar functions, direct calls, locals, blocks, and returns. Add aggregates and memory as later checkpoints. | Decided |
 | Second executable checkpoint | Tuples and structs (including generics and zero-sized fields) lower as declaration-order aggregates; TIR owns byte offsets and size. Arrays, slices, pointers, and function references stay diagnostic-only until the memory checkpoint. | Implemented |
 | Compiler-provided std items | Use `crate func ...;`, `crate const ...;`, and `crate type ...;` declarations collected in a package-wide contract map. The compiler fulfills std's contract; general package instantiation/fulfillment is deferred. | Decided |
+| Std/compiler agreement | Std is maintained with the compiler. Its provided signatures and semantic types are compiler invariants, not a user-facing validation subsystem. Unknown std function parameters assert. | Decided; latest owner clarification |
+| Function implementations | One `FunctionImplementation` per source function: checked body, typed compiler intrinsic, host import, or declaration without an attached implementation. Calls retain source IDs until lowering selects the implementation. | Implemented |
 | Global initialization | Every global, mutable or immutable, requires a compile-time constant initializer. Emit no dynamic initializer/start function. | Decided |
 | Contract-name collisions | One package-wide map keyed by `BindingKey { tier, symbol }`; duplicate keys are errors across modules. Preserve ordinary module-scoped collision rules. | Decided |
 | `crate` and `pub` | Provider status and module visibility are independent. Use `pub crate func` / `pub crate const` / `pub crate type` when downstream code must see the item. | Decided; latest owner clarification |
@@ -55,7 +58,8 @@ by the compiler. This differs from `import`, which names a Wasm host import,
 and from a trait method declaration, which is an abstract member implemented
 through trait dispatch. A compiler-provided function has a source signature
 and a known operation; a compiler-provided type has a source name and a known
-semantic type. The mapping must validate both at the std/compiler boundary.
+semantic type. Std/compiler agreement is an invariant maintained by compiler
+authors; no separate signature-validation pass is required.
 
 Wasm globals have a restricted initializer expression. The chosen rule is
 stricter and simpler: every WX global must be evaluated to a compile-time
@@ -85,14 +89,14 @@ source item indices into MIR or Wasm indices.
   module/name information is in `ImportDef` and the corresponding AST entry.
 - The current `IntrinsicDefs` recognizes a fixed list of type and trait names
   in std, including bodiless primitive aliases, without a package contract
-  marker. Std also declares bodiless free functions such as `trap` and raw
-  numeric operations. The parser has `FunctionDeclaration` and bodiless
-  `TypeAlias` nodes. The parser and registry now also carry explicit
-  `crate func`, `crate const`, and `crate type` declarations; std itself has
-  not yet been converted to those forms.
+  marker. Std's compiler-provided free functions, such as `trap` and raw
+  numeric operations, now use `crate func` and bind through its package
+  contract. Ordinary `FunctionDeclaration` and bodiless `TypeAlias` nodes
+  remain distinct from the explicit `crate func`, `crate const`, and
+  `crate type` declarations collected by the parser and registry.
 - [`TypeContext`](../crates/wx-compiler/src/tir/signatures.rs) owns resolved
-  function signatures, `function_bodies`, `global_bodies`, constant bodies,
-  export targets, type environments, and queries. A `FunctionSignature` has
+  function signatures, `function_implementations`, `global_bodies`, constant
+  bodies, export targets, type environments, and queries. A `FunctionSignature` has
   declared parameter types and a return type; it is not a Wasm signature.
 - [`Body`](../crates/wx-compiler/src/tir/body.rs) is an indexed arena per
   function or initializer. Expression children precede their parent, but
@@ -199,8 +203,9 @@ in its module's ordinary type/value namespace. A bodiless ordinary free
 function or type alias does not become compiler-provided merely by lacking a
 body. Trait signatures remain trait requirements, not package parameters.
 Generic `crate func` declarations are allowed because std already declares
-generic compiler operations such as `transmute` and memory functions; validate
-their parameter constraints and instantiated signatures before lowering.
+generic compiler operations such as `transmute` and memory functions. Ordinary
+type checking checks their uses; the correctness of std's own signatures and
+constraints is a compiler invariant.
 The parser records generic `crate type` parameters, but this transition needs
 only non-generic provided types for std's primitives. A generic provided type
 needs a separately specified provider mapping before it can be fulfilled.
@@ -221,24 +226,33 @@ existing namespace rules. This record is analogous to
 package export metadata: it describes what the package declares, while the
 currently selected compilation decides what actually gets emitted.
 
-At compilation setup, the compiler supplies exactly one implementation table
-for the automatically available std package. It matches std contract members
-by name and kind, checks that required members exist and have expected
-signatures or semantic types, then stores resolved source IDs in a typed
-compiler-builtin table. Type recognition must happen early enough for TIR's
-primitive interning and trait setup; function recognition must be available
-when MIR lowers calls. An unknown std contract member, missing required
-member, wrong kind, or incompatible signature is a diagnostic against std's
-declaration (or package root if the required declaration is absent), not a
-fallback to an import or `Noop`. The compiler may keep its
-current `IntrinsicDefs` as the resolved typed table, but the package contract
-map becomes the source of eligibility for compiler-provided types and
-functions. Its recognition of std-defined `Bool`, `Char`, and language traits
-is a separate concern: those have bodies/declarations in std, rather than
-provider-filled holes. Mark all compiler-provided std types and free functions
-in `std/main.wx`; leave ordinary trait method declarations as trait
-requirements. The old `#[intrinsic]` spelling must not bypass the package
-contract rule.
+At compilation setup, the compiler binds function members of the automatically
+available std package's contract. It interprets names once, attaching
+`FunctionImplementation::Intrinsic(Intrinsic)` to each source `FunctionIdx`.
+There is no second authoritative function-to-intrinsic table. Unknown provided
+std function names assert: std is compiler-maintained, and its signatures are
+assumed correct rather than compared against a separate schema. Ordinary
+bodiless functions, host imports, and other packages' parameters are not
+eligible merely because their names match. Prelude lookup, qualified paths,
+and aliases all reach the same source identity and implementation.
+
+`FunctionImplementation::Defined(Body)` owns a checked source block;
+`Imported(ImportIdx)` names a host import; `Declaration` has no attached
+implementation. This classification is not signature-query readiness. Calls
+remain ordinary checked TIR calls; the lowerer expands typed intrinsics into
+MIR operations without giving them function bodies or direct-call edges.
+Direct scalar intrinsics are implemented; generic memory/global/layout and
+transmute operations remain explicit backend limitations. Exporting an
+intrinsic requires a callable wrapper and is currently diagnosed.
+
+Primitive identities are already preinterned. The existing `IntrinsicDefs`
+and type-alias signature path supply their semantic targets; they need no
+function-implementation representation. Contract-gating and migrating the
+remaining provided type declarations is separate work. Recognition of
+std-defined `Bool`, `Char`, and language traits is also separate: those are
+ordinary definitions rather than provider-filled holes. Trait method
+declarations remain trait requirements. The old `#[intrinsic]` spelling must
+not bypass the package contract rule.
 
 Other packages may parse and collect the same declarations. This phase does
 not implement general contract fulfillment, instance-specific values, or
@@ -378,7 +392,7 @@ requires it; every helper must document that order.
 | `Block`, `IfElse`, `Loop`, `Break`, `Continue`, `Return`, `Drop` | Map TIR scope IDs to MIR scopes; obtain result types from typed expressions (new `Scope` does not store the old inferred result). Preserve break values and divergence. |
 | `LocalDeclaration`, `Assign`, compound assign | Destructure checked patterns; bind only after evaluating the initializer. Compute an assignment target once, including nested field updates, and preserve RHS timing. |
 | `Load`, `AddressOf`, `Store`, compound store | Lower `PlaceIdx` to `(base address, static offset, memory ID, value type)`. `Deref` evaluates its pointer once; `Field` adds TIR's declaration-indexed byte offset. Emit the correct memory index and access width. |
-| `Match` | The new checked pattern arena supports nested products and `Or`, while old MIR `Switch` handles a narrower scalar-case shape. First lower eligible scalar cases to `Switch`; design a general ordered decision tree with bindings and fallthrough for the rest. Do not silently treat all patterns as switch discriminants. |
+| `Match` | The new checked pattern arena supports nested products and `Or`, while old MIR `Switch` handles a narrower scalar-case shape. First lower eligible scalar cases to `Switch`; design a general ordered decision tree with bindings and fallthrough for the rest. Do not silently treat all patterns as switch discriminants. Pattern tests require `Eq`: a scalar constant compares natively, while an aggregate constant calls the concrete `PartialEq::eq` impl selected by its `Eq` bound, so the type's own equality wins over structural comparison. Floats remain unsupported (they have no total equality) but can still be bound. |
 | `String`, `Array`, `ArrayRepeat` | Materialize static allocations and their relocations in the selected memory. Use TIR's layout and constant-evaluation semantics; do not reimplement layout or silently drop unreachable-but-observable initializer effects. |
 | `Error` | Reachable only after a failed analysis; compilation stops before lowering. |
 
@@ -435,8 +449,8 @@ ordered, and typed memory handles never become integer indices in WX code.
   check. An imported immutable global read is still a runtime input and
   cannot appear in a defined global's initializer.
 - The package contract identifies compiler-provided std functions by their
-  recorded `FunctionIdx`. For each such function, validate its declaration,
-  map it to a typed MIR operation, and keep it out of emitted function bodies
+  recorded `FunctionIdx`. Bind each to a typed intrinsic implementation,
+  expand it to a MIR operation, and keep it out of emitted function bodies
   and direct-call edges. `trap`, `transmute`, arithmetic/conversion, memory,
   and global operations each need an explicit entry or an
   explicit unsupported status. The current reserved-name `IntrinsicDefs`
@@ -457,9 +471,10 @@ ordered, and typed memory handles never become integer indices in WX code.
 2. **Fulfill std's package contract.** The parser and registry already collect
    `crate func`, `crate const`, and `crate type` declarations and diagnose
    duplicate package keys. Convert the relevant std declarations and resolve
-   the compiler's implementation table against them. Exit: source IDs for
-   provided std types, constants, and functions come from the contract, and a
-   missing/wrong declaration is diagnosed before lowering.
+   the compiler's implementations against them. Function binding is implemented;
+   primitive aliases retain their existing resolution. Exit: source IDs for
+   provided std types, constants, and functions come from the contract. Std's
+   agreement with the compiler is an invariant, not a signature-validation pass.
 3. **Re-enable backend types without the legacy TIR builder.** Separate MIR
    data structures from old lowering; migrate obsolete AST IDs through MIR,
    optimizer, scheduler, Wasm instruction types, and codegen. Keep backend

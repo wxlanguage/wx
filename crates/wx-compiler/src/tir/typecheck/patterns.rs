@@ -14,6 +14,12 @@
 //! The alternatives of a `|` bind the same names. The same name in two
 //! alternatives is one local, bound the same way and of the same type in
 //! both, so the body of the arm reads one value.
+//!
+//! A pattern test compares the matched value with a constant, so its type
+//! must satisfy `Eq`. Enums answer it structurally because their repr is an
+//! `Integer` typeset member. Floats and aggregate values without an `Eq` impl
+//! are reported; an aggregate that has one still needs aggregate matching,
+//! which is a later checkpoint. Such values can always be bound instead.
 
 use std::ops::Range;
 
@@ -24,9 +30,10 @@ use super::{BodyContext, Integer, ValuePath};
 use crate::ast::{self, Keyword, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprKind, LocalIdx, PatIdx, PatternKind};
-use crate::tir::defs::{BindingTarget, DefKind, StructIdx};
+use crate::tir::defs::{BindingTarget, DefKind, StructIdx, TraitIdx};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
+use crate::tir::solver::SolverError;
 use crate::tir::types::{Type, TypeEnvOwner, TypeIndex, TypeList};
 use crate::vfs::FileId;
 
@@ -228,7 +235,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		expected: TypeIndex,
 	) -> TypeIndex {
 		if context.refutable {
-			return expected;
+			return self.check_pattern_equality(expected, span);
 		}
 		if !context.reported_refutable {
 			context.reported_refutable = true;
@@ -246,6 +253,97 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 		}
 		TypeIndex::ERROR
+	}
+
+	/// A constant or literal pattern compares the matched value with a known
+	/// value, so the matched type must implement `Eq`. The solver answers for
+	/// enums structurally: their repr is an `Integer` typeset member, so every
+	/// enum has `Eq` without an explicit impl. Floats only have partial
+	/// equality, and an aggregate needs its own `Eq` impl; bind those values
+	/// with `_` or a name instead.
+	fn check_pattern_equality(
+		&mut self,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> TypeIndex {
+		if ty == TypeIndex::ERROR {
+			return ty;
+		}
+		let normalized = self.normalized(ty, self.scope.env);
+		match *self.cx.types.resolve(normalized) {
+			// A literal or inference placeholder has its own diagnostic.
+			Type::Error
+			| Type::Infer
+			| Type::IntegerLiteral
+			| Type::FloatLiteral
+			| Type::CharLiteral
+			| Type::StringLiteral
+			| Type::ArrayLiteral => return ty,
+			_ => {}
+		}
+		let trait_index = self
+			.cx
+			.defs
+			.intrinsics
+			.eq
+			.expect("the stdlib must declare the `Eq` trait");
+		match self.cx.find_trait_impl_query(
+			self.scope.env,
+			normalized,
+			trait_index,
+		) {
+			Ok(Some(_)) => ty,
+			Ok(None) => {
+				self.report_pattern_eq_violation(ty, trait_index, span);
+				TypeIndex::ERROR
+			}
+			Err(SolverError::Overflow) => {
+				let site = SourceSpan::new(self.scope.file_id, span);
+				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
+				TypeIndex::ERROR
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				let site = SourceSpan::new(self.scope.file_id, span);
+				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
+				self.cx.diagnostics.push(diagnostic);
+				TypeIndex::ERROR
+			}
+			// Another construct owns the error or the answer is not final.
+			Err(SolverError::Pending | SolverError::Poisoned) => ty,
+		}
+	}
+
+	/// Reports that a pattern test's type does not implement `Eq`.
+	fn report_pattern_eq_violation(
+		&mut self,
+		ty: TypeIndex,
+		trait_index: TraitIdx,
+		span: TextSpan,
+	) {
+		let name = self.cx.type_formatter().display_type(ty).to_string();
+		let trait_name = self
+			.cx
+			.strings
+			.resolve(self.cx.defs.traits[usize::from(trait_index)].name.inner)
+			.unwrap()
+			.to_string();
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TraitBoundViolation.code())
+				.with_message(format!(
+					"the trait bound `{name}: {trait_name}` is not satisfied"
+				))
+				.with_label(
+					Label::primary(self.scope.file_id, span).with_message(
+						format!(
+							"the trait `{trait_name}` is not implemented for `{name}`"
+						),
+					),
+				)
+				.with_note(
+					"a `match` value pattern requires type to implement `Eq`",
+				),
+		);
 	}
 
 	/// A binding: a local of the matched part's type.

@@ -21,7 +21,10 @@
 
 use string_interner::symbol::SymbolU32;
 
-use super::defs::{ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, StructIdx};
+use super::defs::{
+	ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, ImportIdx, StructIdx,
+};
+use super::intrinsics::Intrinsic;
 use super::obligations::TypeObligation;
 use super::types::{TypeIndex, TypeList};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
@@ -51,6 +54,27 @@ pub(super) enum BodyOwner {
 	Const(ConstIdx),
 	Function(FunctionIdx),
 	Global(GlobalIdx),
+}
+
+/// What implements a function, indexed by `FunctionIdx` in `TypeContext`.
+/// This is independent of signature-query readiness. A declaration may be a
+/// trait requirement, an unfulfilled package parameter, or an ordinary
+/// bodiless function; its source definition retains that distinction.
+pub(super) enum FunctionImplementation {
+	/// Keep the checked arena out of the compact intrinsic/import slots.
+	Defined(Box<Body>),
+	Intrinsic(Intrinsic),
+	Imported(ImportIdx),
+	Declaration,
+}
+
+impl FunctionImplementation {
+	pub(super) fn body(&self) -> Option<&Body> {
+		match self {
+			Self::Defined(body) => Some(body),
+			Self::Intrinsic(_) | Self::Imported(_) | Self::Declaration => None,
+		}
+	}
 }
 
 /// A constant's checked initializer. Every one is built before anything

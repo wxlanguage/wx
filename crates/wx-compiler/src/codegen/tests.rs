@@ -3634,8 +3634,8 @@ fn test_match_inside_loop_break_and_continue_commit_mutations() {
             local mut acc: i32 = 0;
             loop {
                 match i {
-                    5 -> { break; },
-                    _ -> {
+                    5 => { break; },
+                    _ => {
                         if i == n {
                             break;
                         }
@@ -3674,9 +3674,9 @@ fn test_match_enum_dispatch_runs_correctly() {
 
         func fd_name_len(fd: FileDescriptor) -> u32 {
             match fd {
-                FileDescriptor::StdIn -> { 5 },
-                FileDescriptor::StdOut -> { 6 },
-                FileDescriptor::StdErr -> { 6 },
+                FileDescriptor::StdIn => { 5 },
+                FileDescriptor::StdOut => { 6 },
+                FileDescriptor::StdErr => { 6 },
             }
         }
         export { fd_name_len }
@@ -3713,17 +3713,17 @@ fn test_match_inside_loop_break_and_continue_dense_br_table() {
             local mut acc: i32 = 0;
             loop {
                 match i {
-                    0 -> {
+                    0 => {
                         acc += 100;
                         i += 1;
                         continue;
                     },
-                    1 -> {
+                    1 => {
                         acc += 10;
                         i += 1;
                         continue;
                     },
-                    2 -> {
+                    2 => {
                         if i == n {
                             break;
                         }
@@ -3731,7 +3731,7 @@ fn test_match_inside_loop_break_and_continue_dense_br_table() {
                         i += 1;
                         continue;
                     },
-                    _ -> {
+                    _ => {
                         break;
                     },
                 }
@@ -3769,10 +3769,10 @@ fn test_match_dense_struct_valued_arms() {
 
         func classify(x: i32) -> i32 {
             local p = match x {
-                0 -> { Point::{ x: 10, y: 1 } },
-                1 -> { Point::{ x: 20, y: 2 } },
-                2 -> { Point::{ x: 30, y: 3 } },
-                _ -> { Point::{ x: 40, y: 4 } },
+                0 => { Point::{ x: 10, y: 1 } },
+                1 => { Point::{ x: 20, y: 2 } },
+                2 => { Point::{ x: 30, y: 3 } },
+                _ => { Point::{ x: 40, y: 4 } },
             };
             p.x + p.y
         }
@@ -3807,10 +3807,10 @@ fn test_match_dense_early_return_with_divergent_binding() {
         func f(x: i32) -> i32 {
             local mut acc: i32 = 0;
             match x {
-                0 -> { return 99; },
-                1 -> { acc = 1; },
-                2 -> { acc = 2; },
-                _ -> { acc = 3; },
+                0 => { return 99; },
+                1 => { acc = 1; },
+                2 => { acc = 2; },
+                _ => { acc = 3; },
             }
             acc
         }
@@ -3855,10 +3855,10 @@ fn test_match_wide_sparse_if_chain_builds_iteratively() {
 	const ARMS: i32 = 500;
 	let mut arms = String::new();
 	for i in 0..ARMS {
-		arms.push_str(&format!("{} -> {{ {} }},\n", i * 1000, i));
+		arms.push_str(&format!("{} => {{ {} }},\n", i * 1000, i));
 	}
 	let source = format!(
-		"func f(x: i32) -> i32 {{\n            match x {{\n{arms}                _ -> {{ -1 }},\n            }}\n        }}\n\n        export {{ f }}\n        "
+		"func f(x: i32) -> i32 {{\n            match x {{\n{arms}                _ => {{ -1 }},\n            }}\n        }}\n\n        export {{ f }}\n        "
 	);
 	let case = TestCase::new(&source);
 

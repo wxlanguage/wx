@@ -1508,6 +1508,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// untyped until context coerces both.
 		let operand = self.build(operand, expected);
 		let ty = self.body.ty(operand);
+		if ty == TypeIndex::NEVER {
+			// The operand never produces a value, so no operator is applied
+			// and the unary expression itself diverges.
+			return self.body.push(
+				ExprKind::PrimitiveUnary {
+					op: op.inner,
+					operand,
+				},
+				TypeIndex::NEVER,
+				span,
+			);
+		}
 		if ty == TypeIndex::STRING_LITERAL || ty == TypeIndex::ARRAY_LITERAL {
 			return self.report_operator_on_literal(
 				op.inner.as_str(),
@@ -1581,12 +1593,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// be, and below, a typed side gives its type to an untyped one.
 		let lhs = self.build(left, expected);
 		let left_ty = self.body.ty(lhs);
-		let rhs = if self.cx.types.has_literal(left_ty) {
+		// A diverging left operand has no type to lend the right one, so it
+		// must not become the right side's expectation.
+		let rhs = if self.cx.types.has_literal(left_ty)
+			|| left_ty == TypeIndex::NEVER
+		{
 			self.build(right, expected)
 		} else {
 			self.build(right, left_ty)
 		};
 		let right_ty = self.body.ty(rhs);
+		if left_ty == TypeIndex::NEVER || right_ty == TypeIndex::NEVER {
+			return self
+				.build_diverging_binary(op, lhs, rhs, left_ty, right_ty, span);
+		}
 		let operand_ty = match (
 			self.cx.types.has_literal(left_ty),
 			self.cx.types.has_literal(right_ty),
@@ -1605,22 +1625,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					}
 				}
 				if is_comparison(op.inner) {
-					self.cx.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::ComparisonTypeAnnotationRequired
-									.code(),
-							)
-							.with_message(
-								"type annotation required to compare untyped literals",
-							)
-							.with_label(Label::primary(self.scope.file_id, span)),
-					);
-					return self.body.push(
-						ExprKind::Error,
-						TypeIndex::ERROR,
-						span,
-					);
+					return self.report_untyped_comparison(span);
 				}
 				// Two literals are a character if either is, else a float if
 				// either is; anything else untyped (a tuple of literals) keeps
@@ -1675,6 +1680,85 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		};
 		let (kind, ty) = self.select_binary(op, lhs, rhs, operand_ty);
 		self.body.push(kind, ty, span)
+	}
+
+	/// A binary with at least one `Never` operand. Since `!` fits every type,
+	/// a lone diverging side lets the other side choose the operator; when
+	/// that side is an untyped literal the node stays untyped for its context,
+	/// exactly as two literals do. Two diverging operands apply no operator
+	/// at all and are themselves `Never`.
+	fn build_diverging_binary(
+		&mut self,
+		op: Spanned<BinaryOp>,
+		lhs: ExprIdx,
+		rhs: ExprIdx,
+		left_ty: TypeIndex,
+		right_ty: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		if left_ty == TypeIndex::NEVER && right_ty == TypeIndex::NEVER {
+			return self.body.push(
+				ExprKind::PrimitiveBinary {
+					op: op.inner,
+					lhs,
+					rhs,
+				},
+				TypeIndex::NEVER,
+				span,
+			);
+		}
+		let live_ty = if left_ty == TypeIndex::NEVER {
+			right_ty
+		} else {
+			left_ty
+		};
+		if self.cx.types.has_literal(live_ty) {
+			if live_ty == TypeIndex::STRING_LITERAL
+				|| live_ty == TypeIndex::ARRAY_LITERAL
+			{
+				let live = if left_ty == TypeIndex::NEVER {
+					rhs
+				} else {
+					lhs
+				};
+				return self.report_operator_on_literal(
+					op.inner.as_str(),
+					live,
+					span,
+				);
+			}
+			if is_comparison(op.inner) {
+				return self.report_untyped_comparison(span);
+			}
+			return self.body.push(
+				ExprKind::PrimitiveBinary {
+					op: op.inner,
+					lhs,
+					rhs,
+				},
+				live_ty,
+				span,
+			);
+		}
+		let (kind, ty) = self.select_binary(op, lhs, rhs, live_ty);
+		self.body.push(kind, ty, span)
+	}
+
+	/// A comparison between untyped literals — or between one and a
+	/// diverging operand — has no concrete type from which to choose its
+	/// instruction.
+	fn report_untyped_comparison(&mut self, span: TextSpan) -> ExprIdx {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(
+					DiagnosticCode::ComparisonTypeAnnotationRequired.code(),
+				)
+				.with_message(
+					"type annotation required to compare untyped literals",
+				)
+				.with_label(Label::primary(self.scope.file_id, span)),
+		);
+		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 	}
 
 	/// The node for a unary operator on an operand of concrete type, and its
@@ -1943,6 +2027,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// Gives an untyped subtree the type `target`, checking each literal fits.
 	/// Reports and leaves the offending node at `ERROR` when one does not.
 	fn coerce(&mut self, expr: ExprIdx, target: TypeIndex) {
+		// `!` fits every type and never produces a value, so there is nothing
+		// to convert. Treating it as an untyped literal here would try to
+		// select an operator for it or fail the literal-only coercion path.
+		if self.body.ty(expr) == TypeIndex::NEVER {
+			return;
+		}
 		if target == TypeIndex::ERROR {
 			self.body.set_ty(expr, TypeIndex::ERROR);
 			return;
@@ -2997,8 +3087,8 @@ mod tests {
 			let DefKind::Function(index) = self.resolve(name) else {
 				panic!("expected `{name}` to be a function");
 			};
-			self.context.function_bodies[usize::from(index)]
-				.as_ref()
+			self.context.function_implementations[usize::from(index)]
+				.body()
 				.expect("a function with a block has a body")
 		}
 
@@ -3010,12 +3100,15 @@ mod tests {
 				|&(index, function)| {
 					function.name.inner == symbol
 						&& !matches!(function.owner, MemberOwner::Free)
-						&& self.context.function_bodies[index].is_some()
+						&& self.context.function_implementations[index]
+							.body()
+							.is_some()
 				},
 			);
 			let (index, _) = found.next().unwrap();
 			assert!(found.next().is_none(), "`{name}` is declared twice");
-			let body = self.context.function_bodies[index].as_ref().unwrap();
+			let body =
+				self.context.function_implementations[index].body().unwrap();
 			self.render(body, body.root())
 		}
 
@@ -3684,14 +3777,14 @@ mod tests {
 	fn a_character_pattern_compares_an_integer_by_code_point() {
 		test_case!(
 			case = indoc! {"
-				func f(b: u8) -> u32 { match b { 'a' -> { 1 }, _ -> { 0 } } }
-				func g(c: Char) -> u32 { match c { 'a' -> { 1 }, _ -> { 0 } } }
+				func f(b: u8) -> u32 { match b { 'a' => { 1 }, _ => { 0 } } }
+				func g(c: Char) -> u32 { match c { 'a' => { 1 }, _ => { 0 } } }
 			"}
 		);
 		case.diagnostics().assert_none();
 		test_case!(
 			case =
-				"func f(b: u8) -> u32 { match b { '€' -> { 1 }, _ -> { 0 } } }"
+				"func f(b: u8) -> u32 { match b { '€' => { 1 }, _ => { 0 } } }"
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
@@ -4049,6 +4142,77 @@ mod tests {
 		case.diagnostics().assert_error_saying(
 			"a `global mut` is written with `counter.set(value)`",
 		);
+	}
+
+	#[test]
+	fn a_diverging_operand_takes_the_other_operands_type() {
+		test_case!(
+			case = indoc! {"
+				func stop() -> ! { loop {} }
+				func left(x: i32) -> i32 { stop() + x }
+				func right(x: i32) -> i32 { x + stop() }
+				func compare(x: i32) -> Bool { x == stop() }
+				func typed(x: u8) -> u8 { stop() + x }
+				func literal() -> i32 { stop() + 1 }
+				func nested() -> i32 { (stop() + 1) * 2 }
+				func both() -> i32 { stop() + stop() }
+				func takes(x: u8) -> u8 { x }
+				func argument() -> u8 { takes(stop() + 1) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("left"), "i32");
+		assert_eq!(case.body_type("right"), "i32");
+		assert_eq!(case.body_type("compare"), "Bool");
+		assert_eq!(case.body_type("typed"), "u8");
+		assert_eq!(case.body_type("literal"), "i32");
+		assert_eq!(case.body_type("nested"), "i32");
+		assert_eq!(case.body_type("argument"), "u8");
+	}
+
+	#[test]
+	fn an_untyped_comparison_against_a_diverging_operand_needs_an_annotation() {
+		test_case!(
+			case = indoc! {"
+				func stop() -> ! { loop {} }
+				func left() -> Bool { stop() == 1 }
+				func right() -> Bool { 1 == stop() }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ComparisonTypeAnnotationRequired,
+			DiagnosticCode::ComparisonTypeAnnotationRequired,
+		]);
+	}
+
+	#[test]
+	fn a_diverging_operand_does_not_skip_literal_coercion() {
+		test_case!(case = "func stop() -> ! { loop {} } func f() -> u8 { stop() + 256 }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+	}
+
+	#[test]
+	fn a_diverging_operand_does_not_make_a_literal_operable() {
+		test_case!(case = r#"func stop() -> ! { loop {} } func f() -> Bool { stop() == "x" }"#);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics()
+			.assert_error_saying("cannot apply `==` to a string literal");
+	}
+
+	#[test]
+	fn a_diverging_operand_makes_a_unary_expression_diverge() {
+		test_case!(
+			case = indoc! {"
+				func stop() -> ! { loop {} }
+				func negate() -> i32 { -stop() }
+				func logical() -> Bool { !stop() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("negate"), "!");
+		assert_eq!(case.body_type("logical"), "!");
 	}
 
 	#[test]
@@ -5138,15 +5302,15 @@ mod tests {
 		test_case!(
 			case = indoc! {r#"
 				const PICK: u8 = match ON {
-					const YES -> { 1 },
-					const NO -> { 0 },
+					const YES => { 1 },
+					const NO => { 0 },
 				};
 				const ON: Bool = True;
 				const YES: Bool = True;
 				const NO: Bool = False;
 				const SIDE: u8 = match Side::Left {
-					Side::Left -> { 1 },
-					Side::Right -> { 2 },
+					Side::Left => { 1 },
+					Side::Right => { 2 },
 				};
 				enum Side(u8) { Left = 0, Right = 1 }
 			"#}
@@ -6167,9 +6331,9 @@ mod tests {
 			case = indoc! {"
 				func sign(x: i32) -> i32 {
 					match x {
-						0 -> { 0 },
-						-1 | -128 -> { 1 },
-						n -> { n },
+						0 => { 0 },
+						-1 | -128 => { 1 },
+						n => { n },
 					}
 				}
 			"}
@@ -6197,11 +6361,11 @@ mod tests {
 				impl S { const ZERO: u8 = 0; }
 				func f<T: Lim>(p: P) -> u8 {
 					match p {
-						P(0, Dir::North) -> { 1 },
-						P(const LIMIT, d) -> { 2 },
-						P(x, Dir::South) -> { x },
-						P(S::ZERO | T::MAX, _) -> { 3 },
-						_ -> { 4 },
+						P(0, Dir::North) => { 1 },
+						P(const LIMIT, d) => { 2 },
+						P(x, Dir::South) => { x },
+						P(S::ZERO | T::MAX, _) => { 3 },
+						_ => { 4 },
 					}
 				}
 			"}
@@ -6259,13 +6423,13 @@ mod tests {
 				struct P(x: u8, y: u16);
 				struct W(x: (u8, u16));
 				func covered(p: P) -> u8 {
-					match p { P(0, _) -> { 1 }, P(t) -> { 2 } }
+					match p { P(0, _) => { 1 }, P(t) => { 2 } }
 				}
 				func missing(p: P) -> u8 {
-					match p { P((0, _) | (1, _)) -> { 1 } }
+					match p { P((0, _) | (1, _)) => { 1 } }
 				}
 				func unreachable(w: W) -> u8 {
-					match w { W(0, _) -> { 1 }, W(_) -> { 2 }, W(a, b) -> { 3 } }
+					match w { W(0, _) => { 1 }, W(_) => { 2 }, W(a, b) => { 3 } }
 				}
 				func count(p: P) { local P(a, b, c) = p; }
 				func lone(w: W) { local W(a, b, c) = w; }
@@ -6288,22 +6452,22 @@ mod tests {
 				enum Dir(u8) { North = 0, East = 1, South = 2 }
 				const N: Dir = Dir::North;
 				global g: Dir = match (N) {
-					const N -> { Dir::North },
-					Dir::North -> { Dir::South },
-					_ -> { Dir::East },
+					const N => { Dir::North },
+					Dir::North => { Dir::South },
+					_ => { Dir::East },
 				};
 				// The variants are known here too, so listing them all is
 				// enough: no `_` is needed.
 				global h: Dir = match (N) {
-					Dir::North -> { Dir::North },
-					Dir::East -> { Dir::East },
-					Dir::South -> { Dir::South },
+					Dir::North => { Dir::North },
+					Dir::East => { Dir::East },
+					Dir::South => { Dir::South },
 				};
 				func f(d: Dir) {
 					match d {
-						const N -> {},
-						Dir::North -> {},
-						_ -> {},
+						const N => {},
+						Dir::North => {},
+						_ => {},
 					}
 				}
 			"}
@@ -6323,12 +6487,12 @@ mod tests {
 		// body is evaluated, so that is a loop, reported once.
 		test_case!(
 			case = indoc! {"
-				const A: Bool = match (True) { const B -> { True }, _ -> { False } };
-				const B: Bool = match (True) { const A -> { True }, _ -> { False } };
+				const A: Bool = match (True) { const B => { True }, _ => { False } };
+				const B: Bool = match (True) { const A => { True }, _ => { False } };
 				func f() -> Bool {
 					match (True) {
-						const A -> { match (True) { const B -> { True }, _ -> { False } } },
-						_ -> { False },
+						const A => { match (True) { const B => { True }, _ => { False } } },
+						_ => { False },
 					}
 				}
 			"}
@@ -6339,25 +6503,82 @@ mod tests {
 	}
 
 	#[test]
-	fn a_float_or_a_string_cannot_be_matched() {
-		// The parser reads them; a float has no single value to compare
-		// with, and a string has no equality at all.
+	fn a_float_literal_needs_eq_and_a_string_cannot_be_matched() {
+		// The parser reads them; a float has only partial equality, and a
+		// string has no equality at all.
 		test_case!(
 			case = indoc! {r#"
 				func f(x: f32, s: u8) {
-					match x { 1.5 -> {}, _ -> {} }
-					match s { "hi" -> {}, _ -> {} }
+					match x { 1.5 => {}, _ => {} }
+					match s { "hi" => {}, _ => {} }
 				}
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::UnmatchableLiteral,
+			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::UnmatchableLiteral,
 		]);
 		case.diagnostics()
-			.assert_error_saying("a float cannot be matched");
+			.assert_error_saying("the trait bound `f32: Eq` is not satisfied");
 		case.diagnostics()
 			.assert_error_saying("a string cannot be matched");
+	}
+
+	#[test]
+	fn a_match_constant_needs_eq() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8);
+				const F: f32 = 1.0;
+				const ORIGIN: P = P(0);
+				func floats(x: f32) {
+					match x { const F => {}, _ => {} }
+				}
+				func points(p: P) {
+					match p { const ORIGIN => {}, _ => {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `f32: Eq` is not satisfied");
+		case.diagnostics()
+			.assert_error_saying("the trait bound `P: Eq` is not satisfied");
+	}
+
+	#[test]
+	fn an_enum_satisfies_eq_and_partial_eq_structurally() {
+		test_case!(
+			case = indoc! {"
+				enum Color(u8) { Red = 0, Green }
+				func needs_eq<T: Eq>(value: T) {}
+				func needs_partial<T: PartialEq>(value: T) {}
+				func f(color: Color) {
+					needs_eq(color);
+					needs_partial(color);
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_float_or_an_aggregate_can_still_be_bound() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8);
+				func floats(x: f32) -> f32 {
+					match x { whole => { whole + 1.0 } }
+				}
+				func points(p: P) -> P {
+					match p { whole => { whole }, }
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
 	}
 
 	#[test]
@@ -6396,7 +6617,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i32, i64)) {
-					match x { (a, 5, 6) | (a, b, a) -> { local _ = a; }, _ -> {} }
+					match x { (a, 5, 6) | (a, b, a) => { local _ = a; }, _ => {} }
 				}
 			"}
 		);
@@ -6420,7 +6641,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (a, 5) | (a, 10) -> { local _ = a; }, _ -> {} }
+					match x { (a, 5) | (a, 10) => { local _ = a; }, _ => {} }
 				}
 			"}
 		);
@@ -6437,7 +6658,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (mut a, 5) | (a, 10) -> {}, _ -> {} }
+					match x { (mut a, 5) | (a, 10) => {}, _ => {} }
 				}
 			"}
 		);
@@ -6456,7 +6677,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (a, b) | (b, a) -> {} }
+					match x { (a, b) | (b, a) => {} }
 				}
 			"}
 		);
@@ -6477,9 +6698,9 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: ((i32, i32), i32)) {
-					match x { ((a, 1) | (a, 2), 3) -> {}, _ -> {} }
-					match x { ((a, 1) | (b, 2), 3) -> {}, _ -> {} }
-					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) -> {}, _ -> {} }
+					match x { ((a, 1) | (a, 2), 3) => {}, _ => {} }
+					match x { ((a, 1) | (b, 2), 3) => {}, _ => {} }
+					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) => {}, _ => {} }
 				}
 			"}
 		);
@@ -6499,10 +6720,10 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: ((i32, i32), (i32, i32))) {
-					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) -> {}, _ -> {} }
+					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) => {}, _ => {} }
 				}
 				func g(x: ((i32, i32), i32)) {
-					match x { ((a, 1) | (a, 2), a) -> {}, _ -> {} }
+					match x { ((a, 1) | (a, 2), a) => {}, _ => {} }
 				}
 			"}
 		);
@@ -6543,12 +6764,12 @@ mod tests {
 				func g() {}
 				func f(x: u8, b: Bool) {
 					local y: u8 = 1;
-					match x { const y -> {}, _ -> {} }
-					match x { const g -> {}, _ -> {} }
-					match x { 300 -> {}, -1 -> {}, _ -> {} }
-					match x { const True -> {}, _ -> {} }
-					match b { const C -> {}, _ -> {} }
-					match x { 1 | z -> {}, _ -> {} }
+					match x { const y => {}, _ => {} }
+					match x { const g => {}, _ => {} }
+					match x { 300 => {}, -1 => {}, _ => {} }
+					match x { const True => {}, _ => {} }
+					match b { const C => {}, _ => {} }
+					match x { 1 | z => {}, _ => {} }
 				}
 			"}
 		);
@@ -6572,17 +6793,33 @@ mod tests {
 	fn match_arms_share_a_type() {
 		test_case!(
 			case = indoc! {"
-				func f(x: u8) -> u64 { match x { 0 -> { 1 }, _ -> { 2 } } }
+				func f(x: u8) -> u64 { match x { 0 => { 1 }, _ => { 2 } } }
 				func g(x: u8) -> u8 {
-					match x { 0 -> { return 0 }, _ -> { x } }
+					match x { 0 => { return 0 }, _ => { x } }
 				}
-				func h(x: u8) { local v = match x { 0 -> { 1 }, _ -> { True } }; }
+				func h(x: u8) { local v = match x { 0 => { 1 }, _ => { True } }; }
 			"}
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
 		assert_eq!(case.body_type("f"), "u64");
 		assert_eq!(case.body_type("g"), "u8");
+	}
+
+	#[test]
+	fn match_arm_bodies_may_be_expressions() {
+		test_case!(
+			case = indoc! {"
+				func f(x: u8) -> u8 {
+					match x {
+						0 => 1,
+						n => n + 1,
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("f"), "u8");
 	}
 
 	#[test]
@@ -6609,20 +6846,20 @@ mod tests {
 				enum Dir(u8) { North = 0, East, South, West }
 				struct P(x: Bool, y: Bool);
 				func a(d: Dir) -> u8 {
-					match d { Dir::North -> { 0 }, Dir::East -> { 1 } }
+					match d { Dir::North => { 0 }, Dir::East => { 1 } }
 				}
 				func b(d: Dir) -> u8 {
 					match d {
-						Dir::North | Dir::East -> { 0 },
-						Dir::South | Dir::West -> { 1 },
+						Dir::North | Dir::East => { 0 },
+						Dir::South | Dir::West => { 1 },
 					}
 				}
 				func c(x: Bool, d: Dir) {
-					match (x, d) { (const True, _) -> {}, (_, Dir::North) -> {} }
+					match (x, d) { (const True, _) => {}, (_, Dir::North) => {} }
 				}
-				func i(x: u8) -> u8 { match x { 0 -> { 0 }, 1 -> { 1 } } }
+				func i(x: u8) -> u8 { match x { 0 => { 0 }, 1 => { 1 } } }
 				func s(p: P) {
-					match p { P(const True, _) -> {}, P(const False, const True) -> {} }
+					match p { P(const True, _) => {}, P(const False, const True) => {} }
 				}
 			"}
 		);
@@ -6655,12 +6892,12 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				const ZERO: u8 = 0;
-				func u(x: u8) { match x { _ -> {}, 0 -> {} } }
+				func u(x: u8) { match x { _ => {}, 0 => {} } }
 				func v(b: Bool) {
-					match b { const True -> {}, const False -> {}, _ -> {} }
+					match b { const True => {}, const False => {}, _ => {} }
 				}
-				func w(x: u8) { match x { 0 | 1 -> {}, 1 -> {}, _ -> {} } }
-				func z(x: u8) { match x { const ZERO -> {}, 0 -> {}, _ -> {} } }
+				func w(x: u8) { match x { 0 | 1 => {}, 1 => {}, _ => {} } }
+				func z(x: u8) { match x { const ZERO => {}, 0 => {}, _ => {} } }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -6681,10 +6918,10 @@ mod tests {
 				const N: Dir = Dir::North;
 				trait Lim { const MAX: u8; }
 				func k(d: Dir) {
-					match d { const N -> {}, Dir::East | Dir::South -> {} }
+					match d { const N => {}, Dir::East | Dir::South => {} }
 				}
-				func l<T: Lim>(x: u8) { match x { T::MAX -> {} } }
-				func m<T: Lim>(x: u8) { match x { T::MAX -> {}, _ -> {} } }
+				func l<T: Lim>(x: u8) { match x { T::MAX => {} } }
+				func m<T: Lim>(x: u8) { match x { T::MAX => {}, _ => {} } }
 			"}
 		);
 		case.diagnostics()
@@ -6696,7 +6933,7 @@ mod tests {
 
 	#[test]
 	fn a_match_with_a_failed_pattern_is_not_checked_for_coverage() {
-		test_case!(case = "func f(x: u8) { match x { const nope -> {} } }");
+		test_case!(case = "func f(x: u8) { match x { const nope => {} } }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}

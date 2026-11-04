@@ -691,9 +691,10 @@ pub(super) struct DefinitionRegistry {
 }
 
 /// One struct rather than one per kind — the recognized-name list only
-/// needs to be written once — but [`IntrinsicDefs::type_slot_mut`] and
-/// [`IntrinsicDefs::trait_slot_mut`] are kept as two separate lookups
-/// (rather than one covering all fields) so a type alias and a trait can
+/// needs to be written once — but [`IntrinsicDefs::type_slot_mut`],
+/// [`IntrinsicDefs::trait_slot_mut`] and
+/// [`IntrinsicDefs::typeset_slot_mut`] are kept as separate lookups (rather
+/// than one covering all fields) so a type alias, a trait and a typeset can
 /// never contend for the same slot just because they happen to share a
 /// name — e.g. a stray `type Add;` in std can't clobber the `Add` trait's
 /// entry, since only `trait_slot_mut` ever resolves `"Add"`.
@@ -716,6 +717,9 @@ pub struct IntrinsicDefs {
 	pub bool: Option<EnumIdx>,
 	pub char: Option<StructIdx>,
 	pub funcref: Option<TypeAliasIdx>,
+	/// std's `Integer` typeset, whose members are the integer primitives.
+	/// Enum representations are checked against it.
+	pub integer: Option<TypesetIdx>,
 	pub add: Option<TraitIdx>,
 	pub sub: Option<TraitIdx>,
 	pub mul: Option<TraitIdx>,
@@ -731,6 +735,8 @@ pub struct IntrinsicDefs {
 	pub not: Option<TraitIdx>,
 	pub partial_eq: Option<TraitIdx>,
 	pub partial_ord: Option<TraitIdx>,
+	/// std's `Eq`, the total-equality marker used by pattern tests.
+	pub eq: Option<TraitIdx>,
 	pub memory: Option<TraitIdx>,
 	/// `Memory`'s declaration of `Size`.
 	pub memory_size: Option<AssocTypeIdx>,
@@ -786,6 +792,18 @@ impl IntrinsicDefs {
 		})
 	}
 
+	/// The mutable slot for `name` if it's one of the recognized builtin
+	/// typeset names — the one place that list is written.
+	fn typeset_slot_mut(
+		&mut self,
+		name: &str,
+	) -> Option<&mut Option<TypesetIdx>> {
+		Some(match name {
+			"Integer" => &mut self.integer,
+			_ => return None,
+		})
+	}
+
 	/// The mutable slot for `name` if it's one of the recognized operator
 	/// trait names — the one place that list is written.
 	fn trait_slot_mut(&mut self, name: &str) -> Option<&mut Option<TraitIdx>> {
@@ -805,6 +823,7 @@ impl IntrinsicDefs {
 			"Not" => &mut self.not,
 			"PartialEq" => &mut self.partial_eq,
 			"PartialOrd" => &mut self.partial_ord,
+			"Eq" => &mut self.eq,
 			"Memory" => &mut self.memory,
 			"Global" => &mut self.global,
 			"GlobalMut" => &mut self.global_mut,
@@ -3770,6 +3789,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let typeset_index = TypesetIdx::new(
 					u32::try_from(self.typesets.len()).unwrap(),
 				);
+				if self.namespaces.scope(namespace).package_id
+					== self.stdlib_package
+				{
+					if let Some(name_str) = self.strings.resolve(name.inner) {
+						if let Some(slot) =
+							self.intrinsics.typeset_slot_mut(name_str)
+						{
+							*slot = Some(typeset_index);
+						}
+					}
+				}
 				let def_key = self.push_def(
 					Namespace::from(namespace),
 					ItemDef::new(DefKind::TypeSet(typeset_index), name.span),
@@ -4600,6 +4630,7 @@ mod tests {
 			trait Not {}
 			trait PartialEq {}
 			trait PartialOrd {}
+			trait Eq {}
 		"});
 		case.diagnostics().assert_none();
 
@@ -4620,6 +4651,7 @@ mod tests {
 			(intrinsics.not, "Not"),
 			(intrinsics.partial_eq, "PartialEq"),
 			(intrinsics.partial_ord, "PartialOrd"),
+			(intrinsics.eq, "Eq"),
 		] {
 			let index = slot.unwrap_or_else(|| {
 				panic!("missing intrinsic `{expected_name}`")
@@ -4627,6 +4659,19 @@ mod tests {
 			let name = case.defs.traits[usize::from(index)].name.inner;
 			assert_eq!(case.graph.strings.resolve(name), Some(expected_name));
 		}
+	}
+
+	#[test]
+	fn stdlib_integer_typeset_is_recorded() {
+		let case = TestCase::new_stdlib(indoc! {"
+			type u8;
+			typeset Integer { u8 }
+		"});
+		case.diagnostics().assert_none();
+		let integer =
+			case.defs.intrinsics.integer.expect("`Integer` is recorded");
+		let name = case.defs.typesets[usize::from(integer)].name.inner;
+		assert_eq!(case.graph.strings.resolve(name), Some("Integer"));
 	}
 
 	#[test]
@@ -4638,6 +4683,8 @@ mod tests {
 		assert!(case.defs.intrinsics.u8.is_some());
 		assert!(case.defs.intrinsics.char.is_none());
 		assert!(case.defs.intrinsics.add.is_none());
+		assert!(case.defs.intrinsics.eq.is_none());
+		assert!(case.defs.intrinsics.integer.is_none());
 	}
 
 	#[test]

@@ -1637,7 +1637,7 @@ fn test_sched_narrow_loads_emit_correct_opcodes() {
 		let src = format!(
 			"{STD}
 memory heap: Memory where {{ Size = u32 }};
-func read(ptr: heap::{ptr_ty}) -> {ret_ty} {{ ptr.* }}
+func read(ptr: heap::{ptr_ty}) => {ret_ty} {{ ptr.* }}
 export {{ read, heap }}"
 		);
 		let case = TestCase::new(&src);
@@ -2148,10 +2148,10 @@ fn test_match_switch_no_divergent_bindings() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32, y: i32) -> i32 {
             match x {
-                0 -> { y },
-                1 -> { y },
-                2 -> { y },
-                _ -> { y },
+                0 => { y },
+                1 => { y },
+                2 => { y },
+                _ => { y },
             }
         }
         export { f }
@@ -2183,10 +2183,10 @@ fn test_match_switch_phi_per_divergent_binding() {
         func f(x: i32) -> i32 {
             local mut acc: i32 = 0;
             match x {
-                0 -> { acc = 1; },
-                1 -> { acc = 2; },
-                2 -> { acc = 3; },
-                _ -> { acc = 4; },
+                0 => { acc = 1; },
+                1 => { acc = 2; },
+                2 => { acc = 3; },
+                _ => { acc = 4; },
             }
             acc
         }
@@ -2239,10 +2239,10 @@ fn test_match_switch_result_value_join() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
             match x {
-                0 -> { 10 },
-                1 -> { 20 },
-                2 -> { 25 },
-                _ -> { 30 },
+                0 => { 10 },
+                1 => { 20 },
+                2 => { 25 },
+                _ => { 30 },
             }
         }
         export { f }
@@ -2287,9 +2287,9 @@ fn test_match_switch_exhaustive_enum_has_no_default() {
         }
         func to_u8(c: Color) -> u8 {
             match c {
-                Color::Red -> { 0 },
-                Color::Green -> { 1 },
-                Color::Blue -> { 2 },
+                Color::Red => { 0 },
+                Color::Green => { 1 },
+                Color::Blue => { 2 },
             }
         }
         export { to_u8 }
@@ -2323,9 +2323,9 @@ fn test_match_schedules_nested_if_else_chain() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 -> { 1 },
-                _ -> { -1 },
+                0 => { 0 },
+                1 => { 1 },
+                _ => { -1 },
             }
         }
         export { sign }
@@ -2369,10 +2369,10 @@ fn test_match_schedules_br_table_for_dense_cases() {
 	let case = TestCase::new(indoc! {"
         func classify(x: i32) -> i32 {
             match x {
-                0 -> { 10 },
-                1 -> { 20 },
-                2 -> { 30 },
-                _ -> { -1 },
+                0 => { 10 },
+                1 => { 20 },
+                2 => { 30 },
+                _ => { -1 },
             }
         }
         export { classify }

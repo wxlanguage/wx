@@ -958,8 +958,40 @@ fn test_if_else() {
 	};
 	assert!(matches!(condition.inner, Expression::Binary { .. }));
 	assert!(matches!(then_block.inner, Expression::Block { .. }));
+	// `else if` nests an `if` in the else position; the checker and lowering
+	// both expect either a block or a nested `if` there.
 	let else_block = else_block.as_ref().expect("`else` should be recorded");
 	assert!(matches!(else_block.inner, Expression::Block { .. }));
+}
+
+#[test]
+fn test_else_if_nests_an_if_in_the_else_position() {
+	let case = TestCase::new(indoc! {"
+        func sign(x: i32) -> i32 {
+            if x > 0 { 1 }
+            else if x < 0 { -1 }
+            else { 0 }
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	let statements = case.function_block(0);
+	let Expression::IfElse { else_block, .. } =
+		statement_expression(statements, 0)
+	else {
+		panic!("expected an if/else")
+	};
+	let else_block = else_block.as_ref().expect("`else` should be recorded");
+	let Expression::IfElse { else_block, .. } = &else_block.inner else {
+		panic!("expected the else position to hold a nested if")
+	};
+	assert!(
+		matches!(
+			else_block.as_deref().map(|block| &block.inner),
+			Some(Expression::Block { .. })
+		),
+		"the nested if's own else must still be a block"
+	);
 }
 
 #[test]
@@ -967,9 +999,9 @@ fn test_match_int_literal_patterns() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 | 2 -> { 1 },
-                _ -> { -1 },
+                0 => { 0 },
+                1 | 2 => { 1 },
+                _ => { -1 },
             }
         }
     "});
@@ -986,6 +1018,52 @@ fn test_match_int_literal_patterns() {
 }
 
 #[test]
+fn test_match_arm_bodies_may_be_expressions_or_blocks() {
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) -> i32 {
+            match x {
+                0 => 10,
+                1 => { local y: i32 = 20; y },
+                _ => x + 1,
+            }
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	let Expression::Match { arms, .. } =
+		statement_expression(case.function_block(0), 0)
+	else {
+		panic!("expected a match")
+	};
+	assert!(matches!(
+		arms[0].inner.inner.body.inner,
+		Expression::Int { .. }
+	));
+	assert!(matches!(
+		arms[1].inner.inner.body.inner,
+		Expression::Block { .. }
+	));
+	assert!(matches!(
+		arms[2].inner.inner.body.inner,
+		Expression::Binary { .. }
+	));
+}
+
+#[test]
+fn test_a_match_arm_expression_body_needs_a_separator() {
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) -> i32 {
+            match x {
+                0 => 10
+                _ => 20,
+            }
+        }
+    "});
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingSeparator]);
+}
+
+#[test]
 fn test_match_enum_variant_patterns() {
 	let case = TestCase::new(indoc! {"
         enum FileDescriptor(u8) {
@@ -996,9 +1074,9 @@ fn test_match_enum_variant_patterns() {
 
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                FileDescriptor::StdOut -> { 1 },
-                FileDescriptor::StdErr -> { 2 },
+                FileDescriptor::StdIn => { 0 },
+                FileDescriptor::StdOut => { 1 },
+                FileDescriptor::StdErr => { 2 },
             }
         }
     "});
@@ -1027,7 +1105,7 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
         func f(x: i32) -> i32 {
             match x {
                 0 { 1 },
-                _ -> { 0 },
+                _ => { 0 },
             }
         }
     "});
@@ -2012,13 +2090,13 @@ fn test_pattern_terms_say_what_they_are() {
 	let case = TestCase::new(indoc! {"
         func f(p: Point) {
             match p {
-                Point(0, 0) -> {},
-                Point(x, const MAX) -> {},
-                Point(x, 0) -> {},
-                Point(-1, 'a' | true) -> {},
-                (mut x, _) -> {},
-                Point({ x, y: const MAX }) -> {},
-                x -> {},
+                Point(0, 0) => {},
+                Point(x, const MAX) => {},
+                Point(x, 0) => {},
+                Point(-1, 'a' | true) => {},
+                (mut x, _) => {},
+                Point({ x, y: const MAX }) => {},
+                x => {},
             }
         }
     "});
@@ -2044,8 +2122,8 @@ fn test_pattern_const_marks_a_name_as_a_constant() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match x {
-                const MAX -> {},
-                const MAX | const MIN -> {},
+                const MAX => {},
+                const MAX | const MIN => {},
             }
         }
     "});
@@ -2063,8 +2141,8 @@ fn test_pattern_redundant_const_is_dropped_and_warned() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match x {
-                const Ordering::Less -> {},
-                const MAX -> {},
+                const Ordering::Less => {},
+                const MAX => {},
             }
         }
     "});
@@ -2084,7 +2162,7 @@ fn test_pattern_a_literal_is_a_test() {
 	// is needed to say what it means.
 	for pattern in ["0", "-1", "'a'", "true"] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} -> {{}} }} }}"
+			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_none();
 	}
@@ -2101,7 +2179,7 @@ fn test_pattern_const_takes_a_path_and_nothing_else() {
 		("const mut y", DiagnosticCode::ReservedIdentifier),
 	] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} -> {{}} }} }}"
+			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_error(code);
 	}
@@ -2123,7 +2201,7 @@ fn test_pattern_a_float_or_string_is_read() {
 	// judgement, so the rest of the file still parses.
 	for pattern in ["1.5", "-1.5", "\"hi\""] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} -> {{}} }} }}"
+			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_none();
 	}

@@ -20,6 +20,7 @@ mod eval;
 mod format;
 mod impls;
 mod imports;
+mod intrinsics;
 mod layout;
 mod literals;
 mod lower;

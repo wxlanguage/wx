@@ -84,6 +84,7 @@ define_text! {
 		ColonColonLBrace => "::{",
 		// spaced punctuation / keywords
 		Arrow            => " -> ",
+		FatArrow         => " => ",
 		As               => " as ",
 		ColonSp          => ": ",
 		CommaSp          => ", ",
@@ -1569,12 +1570,14 @@ impl<'a> Builder<'a> {
 				let mut an: Vec<NodeId> = Vec::new();
 				let pattern = &arm.inner.inner.pattern;
 				self.build_pattern(&mut an, &pattern.inner, pattern.span);
-				an.push(self.text(Text::Arrow));
+				an.push(self.text(Text::FatArrow));
 				let body = &arm.inner.inner.body;
-				let body = self.build_block_content(
-					body.inner.as_block_statements(),
-					body.span,
-				);
+				let body = match &body.inner {
+					ast::Expression::Block { statements, .. } => {
+						self.build_block_content(statements, body.span)
+					}
+					_ => self.build_expression(body),
+				};
 				an.push(self.arena.group(body));
 				if index + 1 < arms.len() {
 					an.push(self.text(Text::Comma));
@@ -2482,16 +2485,21 @@ impl<'a> Builder<'a> {
 				let sp = self.text(Text::Space);
 
 				let then_statements = then_block.inner.as_block_statements();
-				let else_data = else_block
-					.as_deref()
-					.map(|b| (b.inner.as_block_statements(), b.span));
+				let else_data = else_block.as_deref().map(|b| match &b.inner {
+					ast::Expression::Block { statements, .. } => {
+						self.build_block_content(statements, b.span)
+					}
+					// `else if`: the nested `if` starts with its own keyword,
+					// and `Text::Else` already carries the separating space.
+					_ => self.build_expression(b),
+				});
 
 				let then_id =
 					self.build_block_content(then_statements, then_block.span);
 				let mut items: Vec<NodeId> = vec![if_kw, cond, sp, then_id];
-				if let Some((statements, span)) = else_data {
+				if let Some(else_id) = else_data {
 					items.push(self.text(Text::Else));
-					items.push(self.build_block_content(statements, span));
+					items.push(else_id);
 				}
 				self.arena.concat(items)
 			}

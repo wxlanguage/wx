@@ -122,7 +122,9 @@ impl IntrinsicDefs {
 	/// Whether `ty` has `trait_index` by the compiler's rule: a typed
 	/// function reference is a `Call`; every slice and array is a `Slice`, an
 	/// exclusive one a `SliceMut`, an array an `Array` and an exclusive array
-	/// an `ArrayMut`. `None` when the rule says nothing about the pair.
+	/// an `ArrayMut`; every enum is `Eq` and `PartialEq` because its repr is
+	/// an `Integer` typeset member. `None` when the rule says nothing about
+	/// the pair.
 	pub(super) fn implements_structurally(
 		&self,
 		ty: &Type,
@@ -132,6 +134,10 @@ impl IntrinsicDefs {
 		let (ownership, is_array) = match *ty {
 			Type::TypedFuncref { .. } => {
 				return (this == self.call).then_some(true);
+			}
+			Type::Enum { .. } => {
+				return (this == self.eq || this == self.partial_eq)
+					.then_some(true);
 			}
 			Type::Slice { ownership, .. } => (ownership, false),
 			Type::Array { ownership, .. } => (ownership, true),

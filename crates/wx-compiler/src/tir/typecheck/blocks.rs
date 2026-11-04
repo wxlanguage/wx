@@ -319,9 +319,9 @@ impl BodyContext<'_, '_, '_, '_> {
 			.push(ExprKind::LocalDeclaration { pattern, value }, ty, span)
 	}
 
-	/// `match scrutinee { pattern -> { .. }, .. }`. Each arm's bindings are
-	/// declared in a scope of its own, around its body. The arms share a type
-	/// as an `if`'s branches do. The arms must cover every value, and each
+	/// `match scrutinee { pattern => expr | { .. }, .. }`. Each arm's bindings
+	/// are declared in a scope of its own, around its body. The arms share a
+	/// type as an `if`'s branches do. The arms must cover every value, and each
 	/// must match one the arms before it do not (`exhaustiveness`).
 	pub(super) fn build_match(
 		&mut self,

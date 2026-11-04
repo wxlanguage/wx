@@ -46,9 +46,8 @@ impl TryFrom<mir::ValueType> for ScalarType {
 }
 
 /// Flatten a MIR type into its constituent WASM scalar types.
-/// Unit/Never produce zero slots; an aggregate yields its precomputed
-/// `ScalarTable`, which `mir::MIR::ensure_aggregate` already built in this
-/// same order. The one place this conversion happens; every producer of a
+/// Unit/Never produce zero slots; a pack already stores flat scalar types.
+/// The one place this conversion happens; every producer of a
 /// `Function` should call this rather than repeating the match itself.
 pub fn flatten_type_to_scalars(
 	ty: mir::ValueType,
@@ -60,8 +59,8 @@ pub fn flatten_type_to_scalars(
 			[usize::from(aggregate_index)]
 		.scalars
 		.iter()
-		.map(|scalar| {
-			ScalarType::try_from(scalar.ty)
+		.map(|&ty| {
+			ScalarType::try_from(ty)
 				.expect("a ScalarTable entry is scalar by construction")
 		})
 		.collect(),

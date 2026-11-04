@@ -249,7 +249,6 @@ impl Rebaser {
 				}
 			}
 			ExprKind::Noop
-			| ExprKind::Bool { .. }
 			| ExprKind::Function { .. }
 			| ExprKind::Int { .. }
 			| ExprKind::Float { .. }
@@ -668,7 +667,6 @@ fn inline_expr(
 		}
 		// Leaf variants — nothing to recurse into.
 		ExprKind::Noop
-		| ExprKind::Bool { .. }
 		| ExprKind::Function { .. }
 		| ExprKind::Int { .. }
 		| ExprKind::Float { .. }

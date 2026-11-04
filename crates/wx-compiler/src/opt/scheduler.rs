@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use crate::mir;
 use crate::opt::liveness::DataLiveness;
 use crate::opt::{
-	BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function, MemAccess,
+	BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function, MemAccess, NodeType,
 	ScalarType, StackResult, SwitchCase,
 };
 use crate::wasm::{self, BlockType, Instruction, Local, MemArg};
@@ -180,8 +180,8 @@ impl<'f> Scheduler<'f> {
 								.aggregate(aggregate_index)
 								.scalars
 								.iter()
-								.map(|scalar| {
-									ScalarType::try_from(scalar.ty).expect(
+								.map(|&ty| {
+									ScalarType::try_from(ty).expect(
 										"a ScalarTable entry is scalar by construction",
 									)
 								})
@@ -272,7 +272,7 @@ impl<'f> Scheduler<'f> {
 						.unwrap()
 						.result;
 					if let StackResult::Value(n) = then_block_result {
-						self.emit_value(n);
+						self.emit_branch_result(n);
 					}
 				}
 				self.emit_phi_stores_for_branch(*then_block, outputs, true);
@@ -285,7 +285,7 @@ impl<'f> Scheduler<'f> {
 							.unwrap()
 							.result;
 						if let StackResult::Value(n) = else_block_result {
-							self.emit_value(n);
+							self.emit_branch_result(n);
 						}
 					}
 					self.emit_phi_stores_for_branch(*eb, outputs, false);
@@ -295,23 +295,7 @@ impl<'f> Scheduler<'f> {
 				// Value-type block: the if-End leaves the result on the WASM stack.
 				// Capture it into a local so the parent's emit_value(result_node) can
 				// read from the local rather than pushing a second copy.
-				if outputs.is_empty() {
-					if let StackResult::Value(result_node) = *result {
-						let local = if let Some(&l) =
-							self.node_to_local.get(&result_node)
-						{
-							l
-						} else {
-							let ty = self.func.data_nodes[result_node as usize]
-								.kind
-								.unwrap_scalar();
-							let l = self.alloc_local(ty);
-							self.node_to_local.insert(result_node, l);
-							l
-						};
-						self.body.push(Instruction::LocalSet(local));
-					}
-				}
+				if outputs.is_empty() { self.capture_branch_result(*result); }
 			}
 
 			ControlNode::Switch {
@@ -355,23 +339,7 @@ impl<'f> Scheduler<'f> {
 				// `IfElse` does — lets the parent's `emit_value(result_node)`
 				// read from a local uniformly rather than assuming a value is
 				// still sitting on the WASM stack.
-				if outputs.is_empty() {
-					if let StackResult::Value(result_node) = *result {
-						let local = if let Some(&l) =
-							self.node_to_local.get(&result_node)
-						{
-							l
-						} else {
-							let ty = self.func.data_nodes[result_node as usize]
-								.kind
-								.unwrap_scalar();
-							let l = self.alloc_local(ty);
-							self.node_to_local.insert(result_node, l);
-							l
-						};
-						self.body.push(Instruction::LocalSet(local));
-					}
-				}
+				if outputs.is_empty() { self.capture_branch_result(*result); }
 			}
 
 			ControlNode::Loop {
@@ -703,7 +671,11 @@ impl<'f> Scheduler<'f> {
 			.statements;
 		for (i, stmt) in statements.iter().enumerate() {
 			while pending.peek().is_some_and(|&(idx, _)| idx as usize <= i) {
-				self.ensure_local(pending.next().unwrap().1);
+				let node = pending.next().unwrap().1;
+				match self.func.data_nodes[node as usize].kind.node_type() {
+					NodeType::Aggregate(_) => self.ensure_aggregate_locals(node),
+					NodeType::Scalar(_) => { self.ensure_local(node); }
+				}
 			}
 			self.emit_control(block_idx, stmt);
 		}
@@ -714,6 +686,40 @@ impl<'f> Scheduler<'f> {
 			 from `owning_statement_index`, which only ever returns a real \
 			 statement position"
 		);
+
+		// A nested block whose result is `Never` never falls through. Wasm
+		// still treats the point after a nested `if`/`loop`/`block` as
+		// reachable unless the emitted sequence ends in a control terminator,
+		// so make the divergence explicit. An already-terminating sequence
+		// (`return`, `br`, `br_table`, or `unreachable`) needs nothing more.
+		//
+		// Block 0 is the function's own body, whose `result` accumulates the
+		// declared return value from explicit `return`s rather than being its
+		// fallthrough; `Builder::build_function` closes that case from the
+		// body expression's own result.
+		if block_idx != 0
+			&& self.func.blocks[block_idx as usize]
+				.as_ref()
+				.expect("block scope should be built")
+				.result == StackResult::Never
+			&& !self.ends_in_terminator()
+		{
+			self.body.push(Instruction::Unreachable);
+		}
+	}
+
+	/// Whether the instructions emitted so far end in a control transfer, so
+	/// appending `unreachable` would be redundant.
+	fn ends_in_terminator(&self) -> bool {
+		matches!(
+			self.body.last(),
+			Some(
+				Instruction::Return
+					| Instruction::Unreachable
+					| Instruction::Br(_)
+					| Instruction::BrTable { .. }
+			)
+		)
 	}
 
 	// ── Cross-branch value placement ────────────────────────────────────────
@@ -1327,11 +1333,9 @@ impl<'f> Scheduler<'f> {
 			} => {
 				f(*operand);
 			}
-			DataNodeKind::Aggregate { fields, .. } => {
-				for field in fields.iter() {
-					if let StackResult::Value(field) = field {
-						f(*field);
-					}
+			DataNodeKind::Aggregate { values, .. } => {
+				for &value in values.iter() {
+					f(value);
 				}
 			}
 			// Impure — unreachable here; see this function's doc comment.
@@ -2080,12 +2084,9 @@ impl<'f> Scheduler<'f> {
 	}
 
 	/// Ensure per-*scalar* WASM locals exist for an `Aggregate` node.
-	/// Emits each scalar field expression and spills it to a fresh local; a
-	/// field that is itself an aggregate has no local of its own — it's
-	/// walked into recursively and its own (already- or newly-computed)
-	/// locals are spliced in directly, and a zero-sized field contributes
-	/// none. So `node_to_aggregate_locals` always ends up holding one entry
-	/// per scalar, in the same order as the aggregate's `mir::ScalarTable`,
+	/// Emits each scalar expression and spills it to a fresh local. There is
+	/// no recursive source field structure. The map holds one entry per slot,
+	/// in the same order as the aggregate's flat scalar types,
 	/// which is what lets `AggregateGet`'s `ScalarIndex` index it directly.
 	///
 	/// For `AggregateCallResult` nodes this must never be called — their locals
@@ -2094,12 +2095,12 @@ impl<'f> Scheduler<'f> {
 		if self.node_to_aggregate_locals.contains_key(&node) {
 			return;
 		}
-		let (fields, aggregate_index) =
+		let (values, aggregate_index) =
 			match self.func.data_nodes[node as usize].kind.clone() {
 				DataNodeKind::Aggregate {
-					fields,
+					values,
 					aggregate_index,
-				} => (fields, aggregate_index),
+				} => (values, aggregate_index),
 				DataNodeKind::AggregateCallResult { .. } => {
 					unreachable!(
 						"AggregateCallResult locals must be populated by emit_control before use"
@@ -2112,25 +2113,12 @@ impl<'f> Scheduler<'f> {
 		let mir = self.mir;
 		let agg = mir.aggregate(aggregate_index);
 		let mut locals = Vec::with_capacity(agg.scalars.len());
-		for (field, &field_value) in agg.fields.iter().zip(fields.iter()) {
-			match field.ty {
-				mir::ValueType::Unit | mir::ValueType::Never => {}
-				mir::ValueType::Aggregate { .. } => {
-					self.ensure_aggregate_locals(field_value.unwrap_value());
-					locals.extend_from_slice(
-						&self.node_to_aggregate_locals
-							[&field_value.unwrap_value()],
-					);
-				}
-				ty => {
-					let scalar_ty = ScalarType::try_from(ty)
-						.expect("non-aggregate field must be scalar");
-					self.emit_value(field_value.unwrap_value());
-					let local = self.alloc_local(scalar_ty);
-					self.body.push(Instruction::LocalSet(local));
-					locals.push(local);
-				}
-			}
+		for (&ty, &value) in agg.scalars.iter().zip(values.iter()) {
+			let scalar_ty = ScalarType::try_from(ty).expect("pack slot must be scalar");
+			self.emit_value(value);
+			let local = self.alloc_local(scalar_ty);
+			self.body.push(Instruction::LocalSet(local));
+			locals.push(local);
 		}
 		self.node_to_aggregate_locals
 			.insert(node, locals.into_boxed_slice());
@@ -2345,7 +2333,7 @@ impl<'f> Scheduler<'f> {
 				.unwrap()
 				.result;
 			if let StackResult::Value(n) = block_result {
-				self.emit_value(n);
+				self.emit_branch_result(n);
 			}
 		} else {
 			// Two-phase, same reasoning as `emit_loop_param_updates`: push
@@ -2423,12 +2411,36 @@ impl<'f> Scheduler<'f> {
 	fn stack_result_block_type(&self, result: StackResult) -> BlockType {
 		match result {
 			StackResult::Value(node) => {
-				let ty =
-					self.func.data_nodes[node as usize].kind.unwrap_scalar();
-				BlockType::Value(ty)
+				match self.func.data_nodes[node as usize].kind.node_type() {
+					NodeType::Scalar(ty) => BlockType::Value(ty),
+					// Pack slots live in locals, including when all live arms
+					// agree and there are no scalar phi outputs.
+					NodeType::Aggregate(_) => BlockType::Empty,
+				}
 			}
 			_ => BlockType::Empty,
 		}
+	}
+
+	fn emit_branch_result(&mut self, node: DataNodeIndex) {
+		match self.func.data_nodes[node as usize].kind.node_type() {
+			NodeType::Scalar(_) => self.emit_value(node),
+			NodeType::Aggregate(_) => self.ensure_aggregate_locals(node),
+		}
+	}
+
+	fn capture_branch_result(&mut self, result: StackResult) {
+		let StackResult::Value(node) = result else { return; };
+		let NodeType::Scalar(ty) = self.func.data_nodes[node as usize].kind.node_type() else { return; };
+		let local = match self.node_to_local.get(&node) {
+			Some(&local) => local,
+			None => {
+				let local = self.alloc_local(ty);
+				self.node_to_local.insert(node, local);
+				local
+			}
+		};
+		self.body.push(Instruction::LocalSet(local));
 	}
 }
 

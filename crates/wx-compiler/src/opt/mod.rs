@@ -415,12 +415,8 @@ pub enum DataNodeKind {
 
 	// ── Aggregates (structs as SSA values) ─────────────────────────────────
 	Aggregate {
-		/// One entry per *declaration* field, in declaration order — the same
-		/// order as the MIR aggregate's field list. A zero-sized field has an
-		/// entry here too; it is [`StackResult::Unit`] and contributes no
-		/// scalar. A nested aggregate field holds one aggregate-valued entry,
-		/// not its flattened scalars.
-		fields: Box<[StackResult]>,
+		/// One scalar node per slot. No nested packs or zero-sized markers.
+		values: Box<[DataNodeIndex]>,
 		aggregate_index: mir::AggregateIndex,
 	},
 	/// Projects a single WASM value out of an aggregate.
@@ -1101,11 +1097,9 @@ impl Function {
                 self.data_nodes[*operand as usize].uses.push(user_id);
             }
 
-            DataNodeKind::Aggregate { fields, .. } => {
-                for field in fields.iter() {
-                    if let StackResult::Value(f) = field {
-                        self.data_nodes[*f as usize].uses.push(user_id);
-                    }
+            DataNodeKind::Aggregate { values, .. } => {
+                for &value in values.iter() {
+                    self.data_nodes[value as usize].uses.push(user_id);
                 }
             }
 

@@ -60,9 +60,6 @@ index_newtype!(
 #[derive(Clone)]
 pub enum ExprKind {
 	Noop,
-	Bool {
-		value: bool,
-	},
 	Function {
 		id: FunctionId,
 	},
@@ -79,26 +76,22 @@ pub enum ExprKind {
 		local_index: LocalIndex,
 		value: Box<Expression>,
 	},
-	/// An aggregate literal.
-	///
-	/// `values` is in **declaration order** and has exactly
-	/// `Aggregate::field_count()` entries — one per field, not one per Wasm
-	/// scalar. A zero-sized field still has an entry here; its expression is
-	/// `Unit` and it contributes no Wasm slot. The matching accessors
-	/// ([`ExprKind::AggregateGet`]/[`ExprKind::AggregateSet`]) index the same
-	/// declaration space.
+	/// A flat value pack. Every entry produces exactly one scalar, in
+	/// declaration pre-order. Nested source fields have already been erased;
+	/// zero-sized initializer effects are sequenced outside this expression.
 	Aggregate {
 		values: Box<[Expression]>,
 	},
 	AggregateGet {
 		local_index: LocalIndex,
-		/// Declaration field index — see [`FieldIndex`].
-		value_index: FieldIndex,
+		/// A scalar or flat subpack, selected by slot range, not source field.
+		range: ScalarRange,
 	},
 	AggregateSet {
 		local_index: LocalIndex,
-		/// Declaration field index — see [`FieldIndex`].
-		value_index: FieldIndex,
+		/// Replace these slots with `value`, evaluated once. An empty range
+		/// still evaluates `value` and replaces no slots.
+		range: ScalarRange,
 		value: Box<Expression>,
 	},
 	Global {
@@ -448,149 +441,67 @@ pub struct Expression {
 	pub ty: ValueType,
 }
 
-index_newtype!(
-	/// A field's position in its aggregate's **declaration** order.
-	///
-	/// This is the index a field access or a place projection carries: it is
-	/// the index the source declaration gives, independent of the aggregate's
-	/// memory layout. Byte offsets are a separate attribute ([`Field::offset`]);
-	/// there is no "physical field order" in the MIR value model.
-	FieldIndex
-);
+impl Expression {
+	/// A boolean literal. Wasm has no boolean type, so MIR holds it in an
+	/// integer node restricted to `0`/`1`; [`ValueType::Bool`] carries that
+	/// invariant instead of a separate node variant.
+	pub fn boolean(value: bool) -> Self {
+		Self {
+			kind: ExprKind::Int {
+				value: if value { 1 } else { 0 },
+			},
+			ty: ValueType::Bool,
+		}
+	}
+}
 
 index_newtype!(
 	/// Index into an aggregate's flattened scalar (Wasm-value) list, in
 	/// **declaration pre-order**.
 	///
 	/// One scalar is one WebAssembly value: one signature slot, one local, one
-	/// stack entry. Deliberately a different type from [`FieldIndex`], because
-	/// one field contributes *many* scalars when it is itself an aggregate and
-	/// *none* when it is zero-sized — the two index spaces coincide only for a
-	/// flat, ZST-free aggregate, and confusing them silently emits wrong code.
+	/// stack entry. Source fields exist only in TIR; lowering translates
+	/// their projections into scalar ranges.
 	ScalarIndex
 );
 
-/// One field of an aggregate, in declaration order. Value type and byte offset
-/// live in one struct because both are always reached by the same
-/// [`FieldIndex`].
-#[derive(Clone, Copy)]
+/// A contiguous selection in a flat value pack, including an empty selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct Field {
-	pub ty: ValueType,
-	/// Byte offset from the aggregate's base, chosen by layout. This is the
-	/// only place memory order appears; it never orders values.
-	pub offset: u32,
+pub struct ScalarRange {
+	pub start: ScalarIndex,
+	pub len: u32,
 }
 
-/// One WebAssembly value inside an aggregate.
-#[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct Scalar {
-	/// Always convertible to a `wasm::ScalarType`, by construction.
-	pub ty: ValueType,
-	/// Byte offset from the *aggregate's* base, with every enclosing field's
-	/// offset already folded in. Carrying it here is what lets an aggregate
-	/// store or load walk the scalar list flat instead of recursing the field
-	/// tree — it is the one place the memory view and the value view meet.
-	pub offset: u32,
-}
-
-/// An aggregate seen as a flat run of WebAssembly values, in declaration
-/// pre-order — the same order `wasm::flatten_type_to_scalars` produces and the
-/// WASM signature uses. Each entry's [`Scalar::offset`] is its memory byte
-/// offset, so the list order and the memory order are independent.
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ScalarTable {
-	entries: Box<[Scalar]>,
-	/// Declaration field `i` owns `entries[field_starts[i]..field_starts[i + 1]]`.
-	/// Monotone, length is `fields + 1`, and the last entry is `entries.len()`.
-	/// A zero-sized field owns an empty range.
-	field_starts: Box<[u32]>,
-}
-
-impl ScalarTable {
-	/// Total number of WebAssembly values this aggregate occupies.
-	#[inline]
-	pub fn len(&self) -> usize {
-		self.entries.len()
+impl ScalarRange {
+	pub fn new(start: u32, len: u32) -> Self {
+		Self { start: ScalarIndex::new(start), len }
 	}
 
-	#[inline]
-	pub fn is_empty(&self) -> bool {
-		self.entries.is_empty()
-	}
-
-	#[inline]
-	pub fn get(&self, index: ScalarIndex) -> Scalar {
-		self.entries[usize::from(index)]
-	}
-
-	#[inline]
-	pub fn iter(&self) -> impl ExactSizeIterator<Item = &Scalar> {
-		self.entries.iter()
-	}
-
-	/// The scalars declaration field `field` contributes — empty for a ZST
-	/// field, more than one for a field that is itself an aggregate.
-	#[inline]
-	pub fn of_field(&self, field: FieldIndex) -> &[Scalar] {
-		let i = usize::from(field);
-		let (start, end) = (
-			self.field_starts[i] as usize,
-			self.field_starts[i + 1] as usize,
-		);
-		&self.entries[start..end]
-	}
-
-	/// Half-open scalar range owned by declaration field `field`.
-	#[inline]
-	pub fn field_range(&self, field: FieldIndex) -> std::ops::Range<u32> {
-		let i = usize::from(field);
-		self.field_starts[i]..self.field_starts[i + 1]
-	}
-
-	/// Which declaration field owns `scalar`. Used to fold an `AggregateGet` of
-	/// a literal aggregate back down to the sub-node holding that scalar.
-	pub fn owner(&self, scalar: ScalarIndex) -> FieldIndex {
-		let raw = u32::from(scalar);
-		// `field_starts` is monotone with a terminator, so the owning field is
-		// the last start not exceeding `raw`.
-		let field = self
-			.field_starts
-			.partition_point(|&start| start <= raw)
-			.saturating_sub(1);
-		FieldIndex::new(field as u32)
+	pub fn indices(self) -> std::ops::Range<usize> {
+		let start = usize::from(self.start);
+		start..start + self.len as usize
 	}
 }
 
+/// An owned, nonempty flat value representation. No entry may be another
+/// aggregate, `Unit`, or `Never`. Source structure belongs to TIR only.
 #[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Aggregate {
-	/// Fields in declaration order. A zero-sized field is present here and
-	/// occupies no scalar.
-	pub fields: Box<[Field]>,
-	/// Size and alignment of the aggregate as a whole.
-	pub layout: Layout,
-	/// The same aggregate, seen as a flat run of WebAssembly values.
-	pub scalars: ScalarTable,
+	pub scalars: Box<[ValueType]>,
+	/// Some stack values have no linear-memory representation. This is
+	/// copied from TIR when available, never inferred from the slot types.
+	pub memory: Option<AggregateMemory>,
 }
 
-impl Aggregate {
-	#[inline]
-	pub fn field(&self, index: FieldIndex) -> Field {
-		self.fields[usize::from(index)]
-	}
-
-	/// Number of declaration fields. Note this is *not* the number of scalars —
-	/// see [`ScalarTable::len`].
-	#[inline]
-	pub fn field_count(&self) -> usize {
-		self.fields.len()
-	}
+/// Memory attributes paired with a flat pack's slots, in the same order.
+#[derive(Clone)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct AggregateMemory {
+	pub layout: Layout,
+	pub offsets: Box<[u32]>,
 }
 
 /// Whether a memory is locally defined or provided by the WASM host.

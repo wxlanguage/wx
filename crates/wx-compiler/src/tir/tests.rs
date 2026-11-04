@@ -15788,9 +15788,9 @@ fn test_match_int_exhaustive_with_wildcard() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 -> { 1 },
-                _ -> { -1 },
+                0 => { 0 },
+                1 => { 1 },
+                _ => { -1 },
             }
         }
         export { sign }
@@ -15817,9 +15817,9 @@ fn test_match_enum_all_variants_covered_no_wildcard_ok() {
         }
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                FileDescriptor::StdOut -> { 1 },
-                FileDescriptor::StdErr -> { 2 },
+                FileDescriptor::StdIn => { 0 },
+                FileDescriptor::StdOut => { 1 },
+                FileDescriptor::StdErr => { 2 },
             }
         }
         export { name }
@@ -15845,8 +15845,8 @@ fn test_match_enum_missing_variant_is_error() {
         }
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                FileDescriptor::StdOut -> { 1 },
+                FileDescriptor::StdIn => { 0 },
+                FileDescriptor::StdOut => { 1 },
             }
         }
         export { name }
@@ -15867,8 +15867,8 @@ fn test_match_int_without_wildcard_is_error() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 -> { 1 },
+                0 => { 0 },
+                1 => { 1 },
             }
         }
         export { sign }
@@ -15892,8 +15892,8 @@ fn test_match_invalid_pattern_shape_is_error() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32, y: i32) -> i32 {
             match x {
-                y -> { 1 },
-                _ -> { 2 },
+                y => { 1 },
+                _ => { 2 },
             }
         }
         export { f }
@@ -15914,8 +15914,8 @@ fn test_match_arm_type_mismatch_reuses_type_mismatch_diagnostic() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             local y = match x {
-                0 -> { x > 0 },
-                _ -> { x },
+                0 => { x > 0 },
+                _ => { x },
             };
         }
         export { f }
@@ -15941,8 +15941,8 @@ fn test_match_enum_variant_marks_variant_used() {
         }
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                _ -> { 1 },
+                FileDescriptor::StdIn => { 0 },
+                _ => { 1 },
             }
         }
         export { name }
@@ -15979,9 +15979,9 @@ fn test_match_duplicate_pattern_warns_unreachable() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
             match x {
-                0 -> { 1 },
-                0 -> { 2 },
-                _ -> { 3 },
+                0 => { 1 },
+                0 => { 2 },
+                _ => { 3 },
             }
         }
         export { f }

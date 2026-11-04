@@ -862,9 +862,9 @@ fn test_format_pattern_constants() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match x {
-                const MAX -> {},
-                Ordering::Less -> {},
-                _ -> {},
+                const MAX => {},
+                Ordering::Less => {},
+                _ => {},
             }
         }
     "});
@@ -882,9 +882,9 @@ fn test_format_pattern_constants() {
 		indoc! {"
             func f(x: i32) {
                 match x {
-                    const MAX -> {},
-                    Ordering::Less -> {},
-                    _ -> {},
+                    const MAX => {},
+                    Ordering::Less => {},
+                    _ => {},
                 }
             }
         "}
@@ -1847,9 +1847,9 @@ fn test_format_trailing_comments_keep_their_line() {
             // own-line, documents b
             local b = 2;
             match v {
-                0 -> { a }, // trailing on arm
+                0 => { a }, // trailing on arm
                 // own-line before arm
-                _ -> { b },
+                _ => { b },
             }
             // own-line before closing brace
         }
@@ -2017,7 +2017,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
 
         func g(v: u32) -> u32 { // opens a block
             match v { // opens a `match`
-                _ -> { v },
+                _ => { v },
             }
         }
 
@@ -2062,7 +2062,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             // opens a block
             match v {
                 // opens a `match`
-                _ -> { v },
+                _ => { v },
             }
         }
 
@@ -2642,6 +2642,7 @@ fn block_like_statement_separators() {
 		for expression in [
 			"block { foo() }",
 			"if true { foo() } else { bar() }",
+			"if true { foo() } else if false { bar() } else { baz() }",
 			"loop { break 1 }",
 			"block :label { break :label 1 }",
 			"if true {}",
@@ -2671,7 +2672,7 @@ fn block_like_statement_separators() {
 			"if true { foo(); } else { bar() }",
 			"loop { break 1; }",
 			"block :label { break :label 1; }",
-			"match n { _ -> { 1 } }",
+			"match n { _ => { 1 } }",
 		] {
 			for separator in ["", ";"] {
 				let output = checked_format(
@@ -2971,7 +2972,7 @@ fn a_block_value_breaks_a_call_by_name() {
                 func f() {
                     g({ a: block { y(); }, b: 2 });
                     x.m({ a: if c { 1 } else { 2 } });
-                    g({ a: match v { _ -> { 1 } } });
+                    g({ a: match v { _ => { 1 } } });
                 }
             "},
 			80,
@@ -2990,7 +2991,7 @@ fn a_block_value_breaks_a_call_by_name() {
                 });
                 g({
                     a: match v {
-                        _ -> { 1 },
+                        _ => { 1 },
                     },
                 });
             }
@@ -3171,7 +3172,7 @@ fn test_format_one_element_tuple_as_its_element() {
 	let case = TestCase::new(indoc! {"
         func f(x: (u8,), w: (u16)) -> u8 { local (y,) = (x,); local (z) = y; z }
         func g(a: u8, b: u8, c: u8) -> u8 { (a + b,) * c }
-        func h(v: u8) { match v { (1 | 2,) -> {}, _ -> {} } }
+        func h(v: u8) { match v { (1 | 2,) => {}, _ => {} } }
     "});
 	let output = format(
 		&case.ast,
@@ -3197,8 +3198,40 @@ fn test_format_one_element_tuple_as_its_element() {
 
             func h(v: u8) {
                 match v {
-                    (1 | 2) -> {},
-                    _ -> {},
+                    (1 | 2) => {},
+                    _ => {},
+                }
+            }
+        "}
+	);
+}
+
+/// A match arm's body may be a bare expression or a braced block.
+#[test]
+fn test_format_match_arm_bodies() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f(x: i32) -> i32 {
+                    match x {
+                        0 => 10,
+                        1 => { local y: i32 = 20; y },
+                        _ => if x > 0 { 1 } else { 2 },
+                    }
+                }
+            "},
+			80,
+			4,
+		),
+		indoc! {"
+            func f(x: i32) -> i32 {
+                match x {
+                    0 => 10,
+                    1 => {
+                        local y: i32 = 20;
+                        y
+                    },
+                    _ => if x > 0 { 1 } else { 2 },
                 }
             }
         "}

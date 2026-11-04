@@ -27,7 +27,9 @@ use crate::tir::defs::TypeAliasIdx;
 use crate::tir::types::TypeEnvOwner;
 use crate::vfs::{FileId, Files};
 
-use super::body::{Body, BodyOwner, ConstBody, Obligations};
+use super::body::{
+	Body, BodyOwner, ConstBody, FunctionImplementation, Obligations,
+};
 use super::bounds::{
 	BindingRequirement, BoundArena, BoundClauses, BoundId, ClauseArena,
 	ClauseRange, Equalities, SourceAssocBinding, SourceTraitBound, TraitClause,
@@ -36,12 +38,13 @@ use super::bounds::{
 };
 use super::defs::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingTarget, ConstIdx,
-	DefId, DefKey, DefKind, DefinitionRegistry, EnumIdx, FunctionIdx,
-	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier,
-	TraitIdx, TraitImplIdx, TypesetIdx,
+	CrateMemberItem, DefId, DefKey, DefKind, DefinitionRegistry, EnumIdx,
+	FunctionIdx, GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope,
+	StructIdx, Tier, TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
+use super::intrinsics::Intrinsic;
 use super::members::{
 	ApplicableMember, MemberLookup, TraitMemberSelection, TypeProjectionTarget,
 	report_ambiguous_type_member,
@@ -467,7 +470,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// Checks a function's block into its `Body` (`function_bodies`), in the
+	/// Checks a function's block into its implementation, in the
 	/// function's own type scope: its parameters, and an enclosing impl's or
 	/// trait's.
 	fn check_function_body(
@@ -494,7 +497,8 @@ impl TypeContext<'_, '_, '_> {
 			body,
 			obligations,
 		);
-		self.function_bodies[usize::from(function_index)] = Some(body);
+		self.function_implementations[usize::from(function_index)] =
+			FunctionImplementation::Defined(Box::new(body));
 	}
 
 	#[cfg(test)]
@@ -738,9 +742,10 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// What building a constant's body left undecided, until it is checked
 	/// (`check_constant`). A constant with nothing pending has no entry.
 	pub(super) const_obligations: FxHashMap<ConstIdx, Obligations>,
-	/// Each function's checked block, by `FunctionIdx`; `None` for one
-	/// without a block (a declaration, an import, a required trait method).
-	pub(super) function_bodies: Vec<Option<Body>>,
+	/// Each function's implementation, by `FunctionIdx`. Source blocks are
+	/// checked during the body phase; imports and compiler-provided std
+	/// operations are bound at construction, independently of query readiness.
+	pub(super) function_implementations: Vec<FunctionImplementation>,
 	/// Each global's checked initializer, by `GlobalIdx`; `None` for an
 	/// imported one.
 	pub(super) global_bodies: Vec<Option<Body>>,
@@ -789,6 +794,40 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.collect();
 
 		let operators = OperatorTraits::new(defs, strings);
+		let mut function_implementations: Vec<_> = defs
+			.functions
+			.iter()
+			.map(|_| FunctionImplementation::Declaration)
+			.collect();
+		for entry in ast_nodes {
+			if let AstNodeRef::ImportedFunction {
+				function_index,
+				import_index,
+				..
+			} = entry.node
+			{
+				function_implementations[usize::from(function_index)] =
+					FunctionImplementation::Imported(import_index);
+			}
+		}
+		// Only the compiler-created std package is fulfilled. Other package
+		// contracts remain declarations; general instantiation is not modeled.
+		for (key, member) in
+			&defs.crate_contracts[defs.stdlib_package.as_usize()].members
+		{
+			// A function claims both tiers; bind its value-tier entry only.
+			if key.tier == Tier::Value
+				&& let CrateMemberItem::Function(function) = member.item
+			{
+				let name = strings.resolve(key.symbol).unwrap();
+				let intrinsic =
+					Intrinsic::from_std_name(name).unwrap_or_else(|| {
+						panic!("unknown std function parameter `{name}`")
+					});
+				function_implementations[usize::from(function)] =
+					FunctionImplementation::Intrinsic(intrinsic);
+			}
+		}
 		Self {
 			diagnostics,
 			resolutions,
@@ -872,7 +911,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.map(|_| ConstBody::NotBuilt)
 				.collect(),
 			const_obligations: FxHashMap::default(),
-			function_bodies: defs.functions.iter().map(|_| None).collect(),
+			function_implementations,
 			global_bodies: defs.globals.iter().map(|_| None).collect(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
@@ -2680,12 +2719,24 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						if resolved != TypeIndex::ERROR
 							&& !resolved.is_integer()
 						{
-							self.diagnostics.push(
-								report_enum_repr_not_integer(
-									file_id,
-									repr_expr.span,
-								),
+							let integer = self.defs.intrinsics.integer.expect(
+								"the stdlib must declare the `Integer` \
+									 typeset",
 							);
+							let typeset =
+								&self.defs.typesets[usize::from(integer)];
+							let name = self
+								.strings
+								.resolve(typeset.name.inner)
+								.unwrap();
+							let diagnostic = report_enum_repr_not_integer(
+								file_id,
+								repr_expr.span,
+								name,
+								typeset.file_id,
+								typeset.name.span,
+							);
+							self.diagnostics.push(diagnostic);
 							TypeIndex::ERROR
 						} else {
 							resolved
@@ -4864,14 +4915,24 @@ fn report_missing_type_alias_body(
 fn report_enum_repr_not_integer(
 	file_id: FileId,
 	span: TextSpan,
+	typeset_name: &str,
+	typeset_file_id: FileId,
+	typeset_span: TextSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::EnumReprNotInteger.code())
-		.with_message("enum repr type must be an integer type")
+		.with_message(format!(
+			"enum repr type must satisfy the stdlib `{typeset_name}` typeset"
+		))
 		.with_label(
 			SourceSpan::new(file_id, span)
 				.primary_label()
-				.with_message("not an integer type"),
+				.with_message(format!("not a member of `{typeset_name}`")),
+		)
+		.with_label(
+			SourceSpan::new(typeset_file_id, typeset_span)
+				.secondary_label()
+				.with_message(format!("`{typeset_name}` is declared here")),
 		)
 }
 
@@ -6355,7 +6416,7 @@ pub(super) mod tests {
 				trait Other {}
 				struct Host<T>();
 				impl<T: Outer> Host<T> {
-					func local<T: Local>() {}
+					func own<T: Local>() {}
 					func sibling<U: Other>() {}
 					func plain() {}
 				}
@@ -6378,7 +6439,7 @@ pub(super) mod tests {
 			let outer_param =
 				case.context.type_envs.param_types(outer_scope)[0];
 			for (name, own_trait) in [
-				("local", Some(local)),
+				("own", Some(local)),
 				("sibling", Some(other)),
 				("plain", None),
 				("unrelated", Some(other)),
@@ -6405,7 +6466,7 @@ pub(super) mod tests {
 					expected.push((outer_param, outer));
 				}
 				assert_eq!(actual, expected, "{name}");
-				if name == "local" {
+				if name == "own" {
 					assert_ne!(own_param.unwrap(), outer_param);
 				}
 			}
@@ -6867,7 +6928,17 @@ pub(super) mod tests {
 				),
 			)
 			.unwrap();
-		builder.build(root_id)
+		let graph = builder.build(root_id);
+		// Lowering and signature checks only see their own diagnostics;
+		// parser and linker errors stay on the graph for the caller. A test
+		// source must never hide one behind recovery, so check here.
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		graph
 	}
 
 	/// Parses `source` as a single-file binary playing the stdlib's own role
@@ -6890,7 +6961,15 @@ pub(super) mod tests {
 			)
 			.unwrap();
 		builder.set_stdlib(root_id);
-		builder.build(root_id)
+		let graph = builder.build(root_id);
+		// Same parser/linker guard as `source_graph`.
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		graph
 	}
 
 	/// Everything a `TypeContext` borrows. The context cannot own these —
@@ -8948,6 +9027,124 @@ pub(super) mod tests {
 	}
 
 	#[test]
+	fn function_implementations_keep_distinct_sources() {
+		test_case!(
+			case = indoc! {r#"
+			use std::trap as stop;
+			func trap() -> i32 { 42 }
+			crate func i32_add(a: i32, b: i32) -> i32;
+			func missing();
+			import "env" as host { func trap() -> i32; }
+			trait Requirement {
+				func required(self: Self);
+				func provided(self: Self) {}
+			}
+		"#}
+		);
+		case.diagnostics().assert_none();
+		let implementation = |name| {
+			let DefKind::Function(index) = case.resolve(Tier::Value, name)
+			else {
+				panic!("expected a function")
+			};
+			&case.context.function_implementations[usize::from(index)]
+		};
+		assert!(matches!(
+			implementation("trap"),
+			FunctionImplementation::Defined(_)
+		));
+		assert!(matches!(
+			implementation("std::trap"),
+			FunctionImplementation::Intrinsic(Intrinsic::Trap)
+		));
+		assert!(std::ptr::eq(
+			implementation("stop"),
+			implementation("std::trap")
+		));
+		assert!(matches!(
+			implementation("i32_add"),
+			FunctionImplementation::Declaration
+		));
+		assert!(matches!(
+			implementation("missing"),
+			FunctionImplementation::Declaration
+		));
+		let FunctionImplementation::Imported(import) =
+			implementation("host::trap")
+		else {
+			panic!("the host function must stay an import")
+		};
+		assert_eq!(
+			case.context.strings.resolve(
+				case.defs.imports[usize::from(*import)].external_name.inner
+			),
+			Some("env")
+		);
+		for (index, function) in case.defs.functions.iter().enumerate() {
+			match case.context.strings.resolve(function.name.inner).unwrap() {
+				"required" => assert!(matches!(
+					case.context.function_implementations[index],
+					FunctionImplementation::Declaration
+				)),
+				"provided" => assert!(matches!(
+					case.context.function_implementations[index],
+					FunctionImplementation::Defined(_)
+				)),
+				_ => {}
+			}
+		}
+	}
+
+	#[test]
+	fn std_contract_binding_ignores_ordinary_function_names() {
+		test_case!(std case = indoc! {"
+			pub trait Call { type Args; type Result; }
+			pub trait Function: Call {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
+			mod operations { pub crate func trap() -> !; }
+			func f32_sqrt();
+		"});
+		case.diagnostics().assert_none();
+		let DefKind::Function(trap) =
+			case.resolve(Tier::Value, "operations::trap")
+		else {
+			panic!("expected the provided function")
+		};
+		assert!(matches!(
+			case.context.function_implementations[usize::from(trap)],
+			FunctionImplementation::Intrinsic(Intrinsic::Trap)
+		));
+		let DefKind::Function(ordinary) = case.resolve(Tier::Value, "f32_sqrt")
+		else {
+			panic!("expected the ordinary declaration")
+		};
+		assert!(matches!(
+			case.context.function_implementations[usize::from(ordinary)],
+			FunctionImplementation::Declaration
+		));
+	}
+
+	#[test]
+	#[should_panic(
+		expected = "unknown std function parameter `unknown_operation`"
+	)]
+	fn an_unknown_std_intrinsic_is_a_compiler_invariant_failure() {
+		test_case!(std case = indoc! {"
+			pub trait Call { type Args; type Result; }
+			pub trait Function: Call {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
+			crate func unknown_operation();
+		"});
+		let _ = case;
+	}
+
+	#[test]
 	fn crate_contract_declarations_keep_signatures_without_bodies() {
 		test_case!(
 			case = indoc! {"
@@ -9450,6 +9647,29 @@ pub(super) mod tests {
 		assert_eq!(
 			case.context.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::EnumReprNotInteger.code())
+		);
+		let diagnostic = &case.context.diagnostics[0];
+		assert!(
+			diagnostic.message.contains("`Integer` typeset"),
+			"the repr error should name the stdlib `Integer` typeset: {diagnostic:#?}"
+		);
+		let integer =
+			case.defs.intrinsics.integer.expect("`Integer` is recorded");
+		let definition = &case.defs.typesets[usize::from(integer)];
+		let declaration = diagnostic
+			.labels
+			.iter()
+			.find(|label| label.message.contains("declared here"))
+			.unwrap_or_else(|| {
+				panic!(
+					"expected a label at the `Integer` definition: {diagnostic:#?}"
+				)
+			});
+		assert_eq!(declaration.file_id, definition.file_id);
+		assert_eq!(
+			declaration.range,
+			definition.name.span.start as usize
+				..definition.name.span.end as usize
 		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
 	}

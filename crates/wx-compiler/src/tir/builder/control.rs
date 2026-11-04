@@ -1777,7 +1777,7 @@ fn report_non_exhaustive_match(
 		.with_code(DiagnosticCode::NonExhaustiveMatch.code())
 		.with_message(message)
 		.with_label(span.primary_label())
-		.with_note("add a wildcard arm `_ -> { ... }` or cover every variant")
+		.with_note("add a wildcard arm `_ => { ... }` or cover every variant")
 }
 
 fn report_non_exhaustive_match_no_wildcard(
@@ -1790,7 +1790,7 @@ fn report_non_exhaustive_match_no_wildcard(
 		)
 		.with_label(span.primary_label())
 		.with_note(
-			"add a wildcard arm `_ -> { ... }` to handle any other value",
+			"add a wildcard arm `_ => { ... }` to handle any other value",
 		)
 }
 

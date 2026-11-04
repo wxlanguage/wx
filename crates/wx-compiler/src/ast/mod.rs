@@ -92,6 +92,7 @@ pub enum Token {
 	CaretEq,
 	Hash,
 	MinusRightArrow,
+	FatArrow,
 	// Special
 	Comment,
 	DocComment,
@@ -152,6 +153,7 @@ impl std::fmt::Display for Token {
 			CaretEq => "^=",
 			Hash => "#",
 			MinusRightArrow => "->",
+			FatArrow => "=>",
 			Comment => "comment",
 			DocComment => "doc comment",
 			Unknown => "unknown token",
@@ -630,7 +632,7 @@ impl<'src> Lexer<'src> {
 			')' => Token::CloseParen,
 			';' => Token::SemiColon,
 			',' => Token::Comma,
-			'=' => self.consume_and_check('=', Token::EqEq, Token::Eq),
+			'=' => self.consume_equals(),
 			'{' => Token::OpenBrace,
 			'}' => Token::CloseBrace,
 			'#' => Token::Hash,
@@ -663,6 +665,22 @@ impl<'src> Lexer<'src> {
 		let span = TextSpan::new(start, self.offset() as u32);
 
 		Spanned { inner: token, span }
+	}
+
+	/// `=`, `==`, or `=>`.
+	#[inline]
+	fn consume_equals(&mut self) -> Token {
+		match self.chars.clone().next().unwrap_or(EOF) {
+			'=' => {
+				_ = self.chars.next();
+				Token::EqEq
+			}
+			'>' => {
+				_ = self.chars.next();
+				Token::FatArrow
+			}
+			_ => Token::Eq,
+		}
 	}
 
 	#[inline]
@@ -1197,7 +1215,7 @@ pub enum Expression {
 		then_block: Box<Spanned<Expression>>,
 		else_block: Option<Box<Spanned<Expression>>>,
 	},
-	/// `match {expr} { {pattern} -> { ... }, ... }`
+	/// `match {expr} { {pattern} => { ... }, ... }`
 	Match {
 		scrutinee: Box<Spanned<Expression>>,
 		arms: Box<[Separated<Spanned<MatchArm>>]>,
@@ -1296,7 +1314,8 @@ pub struct NamedArgument {
 	pub value: Option<Box<Spanned<Expression>>>,
 }
 
-/// One arm of a `match` expression: `{pattern} -> { ... }`. The pattern
+/// One arm of a `match` expression: `{pattern} => { ... }` or
+/// `{pattern} => expr`. The pattern
 /// says what each of its terms is on its own: a name binds, a literal
 /// compares with that value, a qualified path with that constant.
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -4741,7 +4760,14 @@ impl<'ctx> Parser<'ctx> {
 		let else_block = match parser.peek_keyword() {
 			Some(Keyword::Else) => {
 				let _ = parser.lexer.next();
-				Some(Box::new(Parser::parse_block_expression(parser)?))
+				// `else if` nests an `if` in the else position; `else { .. }`
+				// stays a plain block. TIR's `IfElse` branch and the checker's
+				// `build_branch` already describe both shapes.
+				if matches!(parser.peek_keyword(), Some(Keyword::If)) {
+					Some(Box::new(Parser::parse_if_else_expression(parser)?))
+				} else {
+					Some(Box::new(Parser::parse_block_expression(parser)?))
+				}
 			}
 			_ => None,
 		};
@@ -4800,8 +4826,15 @@ impl<'ctx> Parser<'ctx> {
 			item_handler:
 				|parser: &mut Parser| -> Result<Spanned<MatchArm>, ()> {
 					let pattern = Parser::parse_pattern(parser)?;
-					parser.next_expect(Token::MinusRightArrow)?;
-					let body = Parser::parse_block_expression(parser)?;
+					parser.next_expect(Token::FatArrow)?;
+					// A braced body is a block; a bare expression must be
+					// separated by a comma like a statement.
+					let body = if parser.lexer.peek().inner == Token::OpenBrace
+					{
+						Parser::parse_block_expression(parser)?
+					} else {
+						parser.parse_expression(BindingPower::Default)?
+					};
 					let span = TextSpan::new(pattern.span.start, body.span.end);
 					Ok(Spanned {
 						inner: MatchArm {
@@ -4811,10 +4844,12 @@ impl<'ctx> Parser<'ctx> {
 						span,
 					})
 				},
-			// Arm bodies are always `{ }` blocks, so — like `parse_enum_item`
-			// — a missing trailing comma before the next arm is never
-			// ambiguous with statement continuation; no warning needed.
-			should_warn_missing_separator: None,
+			// A block body is self-delimiting, so its trailing comma stays
+			// optional, exactly as a block-like statement's separator does.
+			// Any other body needs a comma before the next arm.
+			should_warn_missing_separator: Some(|arm| {
+				!arm.body.inner.is_block_like()
+			}),
 		}
 		.parse(parser)?;
 
