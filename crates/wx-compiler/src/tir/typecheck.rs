@@ -4187,14 +4187,19 @@ mod tests {
 
 	#[test]
 	fn a_diverging_operand_does_not_skip_literal_coercion() {
-		test_case!(case = "func stop() -> ! { loop {} } func f() -> u8 { stop() + 256 }");
+		test_case!(
+			case =
+				"func stop() -> ! { loop {} } func f() -> u8 { stop() + 256 }"
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 	}
 
 	#[test]
 	fn a_diverging_operand_does_not_make_a_literal_operable() {
-		test_case!(case = r#"func stop() -> ! { loop {} } func f() -> Bool { stop() == "x" }"#);
+		test_case!(
+			case = r#"func stop() -> ! { loop {} } func f() -> Bool { stop() == "x" }"#
+		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics()
@@ -6472,9 +6477,13 @@ mod tests {
 				}
 			"}
 		);
-		// In both, the second arm is covered by the first.
+		// In both, the second arm is covered by the first. Each global's
+		// `match` is a constant in principle, but the evaluator folds no
+		// control flow yet, so its initializer is not evaluated (E2015).
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::NonConstantGlobalInitializer,
+			DiagnosticCode::NonConstantGlobalInitializer,
 			DiagnosticCode::UnreachableMatchArm,
 		]);
 	}

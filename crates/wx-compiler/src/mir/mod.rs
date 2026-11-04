@@ -1,7 +1,6 @@
-/// the role of MIR is to desugar the syntax like x += 1 into x = x + 1 and
-/// lower the concepts like enums into primitive constants, convert labels from
-/// symbols in interner into numeric indices
-use std::collections::HashSet;
+//! Backend form of a checked program: monomorphic functions over Wasm-shaped
+//! values, each function's expressions stored as an arena (`body.rs`,
+//! `notes/mir-arena.md`).
 
 use string_interner::symbol::SymbolU32;
 
@@ -9,16 +8,24 @@ use crate::index::index_newtype;
 
 // Only the pieces MIR still owns are in the module graph. The pre-transition
 // lowering pass (`legacy_lowering.rs`) and its helpers (`builder/`,
-// `types.rs`, `mono.rs`, `inlining.rs`, `static_data.rs`, `tests.rs`) stay on
+// `types.rs`, `mono.rs`, `static_data.rs`, `tests.rs`) stay on
 // disk as reference but are deliberately not compiled: they target the
 // removed `tir::TIR` API.
+pub mod body;
+pub mod inline;
 #[allow(dead_code)]
 pub(crate) mod layout;
 #[allow(dead_code)]
 mod signatures;
 
+pub use body::{
+	BinaryOp, Body, Case, CaseList, CompareOp, ExprId, ExprKind, ExprList,
+	LabelId, UnaryOp,
+};
+
 index_newtype!(
-	/// Backend identity of one MIR function *instance*.
+	/// Backend identity of one MIR function *instance*: its index in
+	/// [`MIR::functions`] and [`MIR::function_flags`].
 	///
 	/// This is neither a source `FunctionIdx` nor a Wasm function index. A
 	/// monomorphized generic gets its own `FunctionId`, and codegen assigns
@@ -43,8 +50,8 @@ index_newtype!(
 	LocalIndex
 );
 index_newtype!(
-	/// Index into `Function::scopes`, distinct from `tir::ScopeIndex`.
-	ScopeIndex
+	/// Index into [`MIR::imports`].
+	ImportIdx
 );
 index_newtype!(
 	/// Index into `MIR::signatures`.
@@ -55,342 +62,6 @@ index_newtype!(
 	/// [`MIR::aggregate`] rather than indexing the table by hand.
 	AggregateIndex
 );
-
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone)]
-pub enum ExprKind {
-	Noop,
-	Function {
-		id: FunctionId,
-	},
-	Int {
-		value: i64,
-	},
-	Float {
-		value: f64,
-	},
-	LocalGet {
-		local_index: LocalIndex,
-	},
-	LocalSet {
-		local_index: LocalIndex,
-		value: Box<Expression>,
-	},
-	/// A flat value pack. Every entry produces exactly one scalar, in
-	/// declaration pre-order. Nested source fields have already been erased;
-	/// zero-sized initializer effects are sequenced outside this expression.
-	Aggregate {
-		values: Box<[Expression]>,
-	},
-	AggregateGet {
-		local_index: LocalIndex,
-		/// A scalar or flat subpack, selected by slot range, not source field.
-		range: ScalarRange,
-	},
-	AggregateSet {
-		local_index: LocalIndex,
-		/// Replace these slots with `value`, evaluated once. An empty range
-		/// still evaluates `value` and replaces no slots.
-		range: ScalarRange,
-		value: Box<Expression>,
-	},
-	Global {
-		id: GlobalId,
-	},
-	GlobalSet {
-		id: GlobalId,
-		value: Box<Expression>,
-	},
-	Add {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Sub {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Mul {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Div {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Rem {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	And {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Or {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Return {
-		value: Option<Box<Expression>>,
-	},
-	Drop {
-		value: Box<Expression>,
-	},
-	Call {
-		callee: Box<Expression>,
-		arguments: Box<[Expression]>,
-	},
-	Eq {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Eqz {
-		value: Box<Expression>,
-	},
-	NotEq {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Block {
-		scope_index: ScopeIndex,
-		expressions: Box<[Expression]>,
-	},
-	Break {
-		scope_index: ScopeIndex,
-		value: Option<Box<Expression>>,
-	},
-	Continue {
-		scope_index: ScopeIndex,
-	},
-	Unreachable,
-	IfElse {
-		condition: Box<Expression>,
-		then_block: Box<Expression>,
-		else_block: Option<Box<Expression>>,
-	},
-	/// A `match`, kept as a genuine N-way construct rather than desugared to
-	/// nested `IfElse` — Opt/codegen choose between a WASM `br_table` (dense
-	/// case values) and a `br_if` chain (sparse) based on the case set, and
-	/// both need the full case list rather than a binary tree of ifs.
-	Switch {
-		selector: Box<Expression>,
-		/// `(case discriminant, case body)` pairs in source order. The
-		/// discriminant is always a canonical `i64` by this stage: the raw
-		/// value for ints, 0/1 for bool, the codepoint for char, or the
-		/// enum variant's folded `const_value` (enum variants already fold
-		/// to constants — see the `tir::ExprKind::EnumVariant` lowering
-		/// below).
-		cases: Box<[(i64, Expression)]>,
-		/// The wildcard arm's body. `None` only when TIR proved
-		/// exhaustiveness without an explicit `_` (every enum variant
-		/// covered) — codegen synthesizes `unreachable` for that case.
-		default: Option<Box<Expression>>,
-	},
-	BitAnd {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	BitOr {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	BitXor {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	BitNot {
-		value: Box<Expression>,
-	},
-	LeftShift {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	RightShift {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Less {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	LessEq {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Greater {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	GreaterEq {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Loop {
-		scope_index: ScopeIndex,
-		block: Box<Expression>,
-	},
-	Neg {
-		value: Box<Expression>,
-	},
-	Sqrt {
-		value: Box<Expression>,
-	},
-	Abs {
-		value: Box<Expression>,
-	},
-	Floor {
-		value: Box<Expression>,
-	},
-	Ceil {
-		value: Box<Expression>,
-	},
-	Trunc {
-		value: Box<Expression>,
-	},
-	Nearest {
-		value: Box<Expression>,
-	},
-	Min {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Max {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	Copysign {
-		left: Box<Expression>,
-		right: Box<Expression>,
-	},
-	I64ExtendI32S {
-		value: Box<Expression>,
-	},
-	I64ExtendI32U {
-		value: Box<Expression>,
-	},
-	I32WrapI64 {
-		value: Box<Expression>,
-	},
-	F32ConvertI32 {
-		value: Box<Expression>,
-	},
-	F32ConvertU32 {
-		value: Box<Expression>,
-	},
-	F32ConvertI64 {
-		value: Box<Expression>,
-	},
-	F32ConvertU64 {
-		value: Box<Expression>,
-	},
-	F64ConvertI32 {
-		value: Box<Expression>,
-	},
-	F64ConvertU32 {
-		value: Box<Expression>,
-	},
-	F64ConvertI64 {
-		value: Box<Expression>,
-	},
-	F64ConvertU64 {
-		value: Box<Expression>,
-	},
-	I32TruncF32 {
-		value: Box<Expression>,
-	},
-	U32TruncF32 {
-		value: Box<Expression>,
-	},
-	I32TruncF64 {
-		value: Box<Expression>,
-	},
-	U32TruncF64 {
-		value: Box<Expression>,
-	},
-	I64TruncF32 {
-		value: Box<Expression>,
-	},
-	U64TruncF32 {
-		value: Box<Expression>,
-	},
-	I64TruncF64 {
-		value: Box<Expression>,
-	},
-	U64TruncF64 {
-		value: Box<Expression>,
-	},
-	F64PromoteF32 {
-		value: Box<Expression>,
-	},
-	F32DemoteF64 {
-		value: Box<Expression>,
-	},
-	I32ReinterpretF32 {
-		value: Box<Expression>,
-	},
-	F32ReinterpretI32 {
-		value: Box<Expression>,
-	},
-	I64ReinterpretF64 {
-		value: Box<Expression>,
-	},
-	F64ReinterpretI64 {
-		value: Box<Expression>,
-	},
-	/// `i32.const <data_section_end>` — byte offset of the first writable
-	/// memory region.
-	MemoryOffset {
-		memory: MemoryId,
-	},
-	/// `i32.const <wasm_memory_index>` — the wasm linear-memory index of this
-	/// memory, resolved at codegen time.
-	MemoryIndex {
-		memory: MemoryId,
-	},
-	/// `memory.size` — current size of a linear memory in pages.
-	MemorySize {
-		memory: MemoryId,
-	},
-	/// `memory.grow` — grow linear memory by N pages; pushes old size or -1.
-	MemoryGrow {
-		memory: MemoryId,
-		delta: Box<Expression>,
-	},
-	/// `memory.fill` — fill a region of linear memory with a byte value.
-	MemoryFill {
-		memory: MemoryId,
-		dst: Box<Expression>,
-		val: Box<Expression>,
-		len: Box<Expression>,
-	},
-	/// `memory.copy` — copy a region between (possibly different) linear memories.
-	MemoryCopy {
-		dst_memory: MemoryId,
-		src_memory: MemoryId,
-		dst: Box<Expression>,
-		src: Box<Expression>,
-		len: Box<Expression>,
-	},
-	/// Load a value from the address held in `pointer`.
-	PointerLoad {
-		pointer: Box<Expression>,
-		/// Static byte offset added to the address (WASM memarg immediate).
-		offset: u32,
-		memory: MemoryId,
-	},
-	/// Store `value` to the address held in `pointer`.
-	PointerStore {
-		pointer: Box<Expression>,
-		value: Box<Expression>,
-		/// Static byte offset added to the address (WASM memarg immediate).
-		offset: u32,
-		memory: MemoryId,
-	},
-	/// Pointer to a static data entry (index into `MIR.static_data`).
-	/// Resolves to an `i32.const <byte_offset>` at codegen time.
-	StaticPointer {
-		data_index: u32,
-	},
-}
 
 // `Debug` is gated on `debug_assertions` rather than `test` so that panics in
 // a debug build can name the offending type. It must *not* also appear in the
@@ -434,27 +105,6 @@ impl ValueType {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone)]
-pub struct Expression {
-	pub kind: ExprKind,
-	pub ty: ValueType,
-}
-
-impl Expression {
-	/// A boolean literal. Wasm has no boolean type, so MIR holds it in an
-	/// integer node restricted to `0`/`1`; [`ValueType::Bool`] carries that
-	/// invariant instead of a separate node variant.
-	pub fn boolean(value: bool) -> Self {
-		Self {
-			kind: ExprKind::Int {
-				value: if value { 1 } else { 0 },
-			},
-			ty: ValueType::Bool,
-		}
-	}
-}
-
 index_newtype!(
 	/// Index into an aggregate's flattened scalar (Wasm-value) list, in
 	/// **declaration pre-order**.
@@ -476,7 +126,10 @@ pub struct ScalarRange {
 
 impl ScalarRange {
 	pub fn new(start: u32, len: u32) -> Self {
-		Self { start: ScalarIndex::new(start), len }
+		Self {
+			start: ScalarIndex::new(start),
+			len,
+		}
 	}
 
 	pub fn indices(self) -> std::ops::Range<usize> {
@@ -502,16 +155,6 @@ pub struct Aggregate {
 pub struct AggregateMemory {
 	pub layout: Layout,
 	pub offsets: Box<[u32]>,
-}
-
-/// Whether a memory is locally defined or provided by the WASM host.
-/// `External < Internal` so a stable sort puts imported memories first,
-/// matching the WASM binary format requirement.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum MemorySource {
-	External,
-	Internal,
 }
 
 /// A memory's index type, lowered from TIR's `TypeIndex::U32`/`U64` (see
@@ -542,10 +185,12 @@ impl MemoryKind {
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct MemoryInfo {
 	pub id: MemoryId,
-	pub source: MemorySource,
 	pub kind: MemoryKind,
 	pub min_pages: Option<u32>,
 	pub max_pages: Option<u32>,
+	/// An imported memory has nothing a defined one lacks: its kind and
+	/// limits are both.
+	pub origin: Origin<()>,
 }
 
 /// One entry in the static data segment — either a string literal or an array
@@ -567,56 +212,104 @@ pub struct StaticEntry {
 /// IDs, and the monomorphization worklist that mints them, belong to the
 /// lowerer — MIR only ever stores the result. Codegen re-derives Wasm indices
 /// from these IDs, imports first.
-#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MIR {
+	/// Indexed by [`FunctionId`].
 	pub functions: Vec<Function>,
-	#[cfg_attr(test, serde(skip))]
-	pub inline_functions: HashSet<FunctionId>,
+	/// What callers and the backend may do with each function, beside its
+	/// body; indexed by [`FunctionId`], as `functions` is.
+	pub function_flags: Vec<FunctionFlags>,
 	pub signatures: Vec<FunctionSignature>,
 	pub globals: Vec<Global>,
-	pub exports: Vec<ExportItem>,
-	pub imports: Vec<ImportModule>,
+	pub exports: Vec<Export>,
+	/// What the host provides, one entry per imported item; indexed by
+	/// [`ImportIdx`].
+	pub imports: Vec<Import>,
 	pub memories: Vec<MemoryInfo>,
 	pub aggregates: Box<[Aggregate]>,
 	pub static_entries: Vec<StaticEntry>,
-	/// Direct call edges collected during lowering: (caller_mir_id,
-	/// callee_mir_id). Consumed by `run_inlining_pass` to build the call
-	/// graph.
-	#[cfg_attr(test, serde(skip))]
-	pub call_edges: Vec<(FunctionId, FunctionId)>,
 	/// The synthetic start function that assigns all user-defined globals at
 	/// module instantiation time, if any globals are declared.
 	pub start_function: Option<FunctionId>,
 }
 
+/// Attributes of a function that its callers and the backend read, a byte
+/// per function in [`MIR::function_flags`].
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct FunctionFlags(u8);
+
+impl FunctionFlags {
+	/// `#[inline]`: callers take its body in place of a call.
+	pub const INLINE: Self = Self(1 << 0);
+
+	pub const fn empty() -> Self {
+		Self(0)
+	}
+
+	pub const fn contains(self, other: Self) -> bool {
+		self.0 & other.0 == other.0
+	}
+
+	pub fn insert(&mut self, other: Self) {
+		self.0 |= other.0;
+	}
+}
+
+/// A module-level item an import or an export names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct ImportModule {
-	pub name: String,
-	pub items: Vec<ImportModuleItem>,
+pub enum Item {
+	Function(FunctionId),
+	Global(GlobalId),
+	Memory(MemoryId),
+}
+
+/// One item the host provides, under `module`.`name`.
+///
+/// Wasm does not require import names to be unique, and neither does MIR:
+/// two imports may share both names, and even their external type. Each is
+/// its own item here; codegen gives entries with the same names and external
+/// type one Wasm import.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct Import {
+	pub module: SymbolU32,
+	pub name: SymbolU32,
+	/// The item this entry provides, whose `origin` is `Imported` of this
+	/// entry.
+	pub item: Item,
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
-pub enum ImportModuleItem {
-	Function {
-		name: SymbolU32,
-		id: FunctionId,
-		signature_index: SignatureIndex,
-	},
-	Global {
-		name: SymbolU32,
-		id: GlobalId,
-	},
-	Memory {
-		name: SymbolU32,
-		id: MemoryId,
-	},
+pub struct Export {
+	pub name: SymbolU32,
+	pub item: Item,
 }
 
+/// Whether an item is provided by the host or defined by the module, and what
+/// a definition has that an import does not.
+#[derive(Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub enum ExportItem {
-	Function { id: FunctionId, name: SymbolU32 },
-	Global { id: GlobalId, name: SymbolU32 },
-	Memory { id: MemoryId, name: SymbolU32 },
+pub enum Origin<D> {
+	/// Its entry in [`MIR::imports`], which names the item back.
+	Imported(ImportIdx),
+	Defined(D),
+}
+
+impl<D> Origin<D> {
+	pub fn import(&self) -> Option<ImportIdx> {
+		match self {
+			Self::Imported(import) => Some(*import),
+			Self::Defined(_) => None,
+		}
+	}
+
+	pub fn defined(&self) -> Option<&D> {
+		match self {
+			Self::Defined(definition) => Some(definition),
+			Self::Imported(_) => None,
+		}
+	}
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -631,29 +324,6 @@ pub enum Mutability {
 pub struct Local {
 	pub ty: ValueType,
 	pub mutability: Mutability,
-}
-
-/// A scope's shape, mirroring the `Block`/`Loop` distinction the checker keeps
-/// per scope.
-///
-/// MIR carries its own enum rather than reusing `opt::BlockKind`: opt's version
-/// also describes synthetic blocks that have no MIR scope at all. The two are
-/// intentionally separate index spaces with separate meanings.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub enum BlockKind {
-	/// A plain block: `break` leaves it and gives it a value.
-	Block,
-	/// A loop: `continue` restarts it, `break` leaves it.
-	Loop,
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Clone)]
-pub struct BlockScope {
-	pub kind: BlockKind,
-	pub result: ValueType,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -673,22 +343,54 @@ impl FunctionSignature {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone)]
 pub struct Function {
-	pub id: FunctionId,
 	pub signature_index: SignatureIndex,
-	pub scopes: Vec<BlockScope>,
-	/// Every local the function owns, in one flat, function-wide space —
-	/// scope 0's locals first, then each subsequent scope's own locals in
-	/// scope order, including MIR-synthesized temporaries (which are just
-	/// appended here directly, not routed through any particular scope).
+	pub origin: Origin<Code>,
+}
+
+impl Function {
+	/// The function's code, if the module defines it.
+	pub fn code(&self) -> Option<&Code> {
+		self.origin.defined()
+	}
+
+	pub fn code_mut(&mut self) -> Option<&mut Code> {
+		match &mut self.origin {
+			Origin::Defined(code) => Some(code),
+			Origin::Imported(_) => None,
+		}
+	}
+}
+
+/// What a defined function has that an imported one does not.
+#[derive(Clone)]
+pub struct Code {
+	/// Every local the function owns, in one flat, function-wide space, its
+	/// parameters first; temporaries are appended like any other local.
 	pub locals: Vec<Local>,
-	pub block: Expression,
-	/// Indices into `MIR.static_pool.entries` owned by this function.
-	/// Codegen unions these across all live functions to determine which
-	/// entries to include in the WASM data segment.
-	pub static_data: Vec<u32>,
+	/// How many labels the body uses; every [`LabelId`] is below it.
+	pub label_count: u32,
+	pub body: Body,
+	pub root: ExprId,
+}
+
+impl Code {
+	/// The static data entries (`MIR::static_entries`) the body points at.
+	pub fn static_data(&self) -> impl Iterator<Item = u32> + '_ {
+		self.body.kinds().iter().filter_map(|kind| match *kind {
+			ExprKind::StaticPointer { data_index } => Some(data_index),
+			_ => None,
+		})
+	}
+
+	/// The functions the body calls directly, once per call.
+	pub fn callees(&self) -> impl Iterator<Item = FunctionId> + '_ {
+		self.body.kinds().iter().filter_map(|kind| match *kind {
+			ExprKind::Call { function, .. } => Some(function),
+			_ => None,
+		})
+	}
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -703,10 +405,10 @@ pub struct Global {
 	pub id: GlobalId,
 	pub ty: ValueType,
 	pub mutability: Mutability,
-	/// WASM global section init expression. Mutable globals use zero here
-	/// and are assigned at runtime by the start function. Immutable globals
-	/// carry their literal value directly.
-	pub const_init: ConstInit,
+	/// A defined global's init expression. Mutable globals use zero here and
+	/// are assigned at runtime by the start function. Immutable globals carry
+	/// their literal value directly.
+	pub origin: Origin<ConstInit>,
 }
 
 /// Memory layout of a type: size in bytes and required alignment in bytes.
@@ -718,6 +420,81 @@ pub struct Layout {
 }
 
 impl MIR {
+	pub fn function(&self, id: FunctionId) -> &Function {
+		&self.functions[usize::from(id)]
+	}
+
+	/// `id`'s code. Panics on an imported function: only a pass that already
+	/// knows it reads a definition asks this way.
+	pub fn code(&self, id: FunctionId) -> &Code {
+		self.function(id)
+			.code()
+			.expect("an imported function has no code")
+	}
+
+	pub fn global(&self, id: GlobalId) -> &Global {
+		let global = &self.globals[usize::from(id)];
+		debug_assert!(global.id == id, "a global's id is its index");
+		global
+	}
+
+	pub fn memory(&self, id: MemoryId) -> &MemoryInfo {
+		let memory = &self.memories[usize::from(id)];
+		debug_assert!(memory.id == id, "a memory's id is its index");
+		memory
+	}
+
+	/// The import entry providing `item`, if the host provides it.
+	pub fn import_of(&self, item: Item) -> Option<ImportIdx> {
+		match item {
+			Item::Function(id) => self.function(id).origin.import(),
+			Item::Global(id) => self.global(id).origin.import(),
+			Item::Memory(id) => self.memory(id).origin.import(),
+		}
+	}
+
+	/// Check that the import table and the items agree: every entry's item
+	/// is `Imported` of that entry, and every `Imported` item's entry names
+	/// it. Returns the first entry that does not.
+	pub fn verify_imports(&self) -> Result<(), ImportIdx> {
+		for (index, import) in self.imports.iter().enumerate() {
+			let index = ImportIdx::new(index as u32);
+			if self.import_of(import.item) != Some(index) {
+				return Err(index);
+			}
+		}
+		let items = (self
+			.functions_with_ids()
+			.map(|(id, _)| Item::Function(id)))
+		.chain(self.globals.iter().map(|global| Item::Global(global.id)))
+		.chain(self.memories.iter().map(|memory| Item::Memory(memory.id)));
+		for item in items {
+			if let Some(import) = self.import_of(item)
+				&& self
+					.imports
+					.get(usize::from(import))
+					.is_none_or(|entry| entry.item != item)
+			{
+				return Err(import);
+			}
+		}
+		Ok(())
+	}
+
+	pub fn flags(&self, id: FunctionId) -> FunctionFlags {
+		self.function_flags[usize::from(id)]
+	}
+
+	/// The functions with their ids, in id order.
+	pub fn functions_with_ids(
+		&self,
+	) -> impl Iterator<Item = (FunctionId, &Function)> {
+		self.functions
+			.iter()
+			.enumerate()
+			.map(|(index, function)| (FunctionId::new(index as u32), function))
+	}
+
 	/// The aggregate `index` refers to.
 	#[inline]
 	pub fn aggregate(&self, index: AggregateIndex) -> &Aggregate {

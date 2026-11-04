@@ -260,6 +260,189 @@ pub enum FieldOrder {
 	Optimal,
 }
 
+/// The attributes written on a declaration that the compiler acts on. The
+/// prescan admits only those that apply to the item they are written on,
+/// so a function's never holds `FIXED_ORDER`. An attribute is a hint to the
+/// compiler: none of them changes a type or an identity.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct Attributes(u8);
+
+impl Attributes {
+	/// `#[inline]`: every call of the function is to be replaced by its
+	/// body.
+	pub const INLINE: Self = Self(1 << 0);
+	/// `#[fixed_order]`: a struct's fields keep declaration order.
+	pub const FIXED_ORDER: Self = Self(1 << 1);
+
+	pub const fn empty() -> Self {
+		Self(0)
+	}
+
+	pub const fn contains(self, other: Self) -> bool {
+		self.0 & other.0 == other.0
+	}
+
+	fn insert(&mut self, other: Self) {
+		self.0 |= other.0;
+	}
+}
+
+/// An attribute the compiler knows. `#[memory_limits]` has arguments and
+/// is read where a memory is lowered, so it has no flag.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KnownAttribute {
+	Inline,
+	FixedOrder,
+	MemoryLimits,
+}
+
+impl KnownAttribute {
+	const ALL: [Self; 3] = [Self::Inline, Self::FixedOrder, Self::MemoryLimits];
+
+	fn from_name(name: &str) -> Option<Self> {
+		Self::ALL.into_iter().find(|known| known.name() == name)
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::Inline => "inline",
+			Self::FixedOrder => "fixed_order",
+			Self::MemoryLimits => "memory_limits",
+		}
+	}
+
+	/// The one kind of item it can be written on.
+	fn target(self) -> AttributeTarget {
+		match self {
+			Self::Inline => AttributeTarget::Function,
+			Self::FixedOrder => AttributeTarget::Struct,
+			Self::MemoryLimits => AttributeTarget::Memory,
+		}
+	}
+
+	/// Whether it is written with a parenthesized argument list, rather
+	/// than as its name alone.
+	fn takes_arguments(self) -> bool {
+		matches!(self, Self::MemoryLimits)
+	}
+
+	fn flag(self) -> Attributes {
+		match self {
+			Self::Inline => Attributes::INLINE,
+			Self::FixedOrder => Attributes::FIXED_ORDER,
+			Self::MemoryLimits => Attributes::empty(),
+		}
+	}
+}
+
+/// What an attribute is written on, as far as which attributes apply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttributeTarget {
+	/// A function with a body: free, an impl's, or a trait's default.
+	Function,
+	/// A function declared without one: a trait's required function, a
+	/// bodiless declaration, a package contract's.
+	BodilessFunction,
+	Struct,
+	Memory,
+	Enum,
+	Constant,
+	Global,
+	TypeAlias,
+	Trait,
+	Typeset,
+	AssociatedType,
+}
+
+impl AttributeTarget {
+	fn description(self) -> &'static str {
+		match self {
+			Self::Function => "a function with a body",
+			Self::BodilessFunction => "a function without a body",
+			Self::Struct => "a struct",
+			Self::Memory => "a memory",
+			Self::Enum => "an enum",
+			Self::Constant => "a constant",
+			Self::Global => "a global",
+			Self::TypeAlias => "a type alias",
+			Self::Trait => "a trait",
+			Self::Typeset => "a typeset",
+			Self::AssociatedType => "an associated type",
+		}
+	}
+
+	/// The attributes written on an item, and what they are written on.
+	fn of_item(item: &ast::Item) -> Option<(Self, &[ast::Attribute])> {
+		Some(match item {
+			ast::Item::Function { attributes, .. } => {
+				(Self::Function, attributes)
+			}
+			ast::Item::FunctionDeclaration { attributes, .. }
+			| ast::Item::CrateFunction { attributes, .. } => {
+				(Self::BodilessFunction, attributes)
+			}
+			ast::Item::Struct { attributes, .. } => (Self::Struct, attributes),
+			ast::Item::Memory { attributes, .. } => (Self::Memory, attributes),
+			ast::Item::Enum { attributes, .. } => (Self::Enum, attributes),
+			ast::Item::Const { attributes, .. }
+			| ast::Item::CrateConst { attributes, .. } => (Self::Constant, attributes),
+			ast::Item::Global { attributes, .. } => (Self::Global, attributes),
+			ast::Item::TypeAlias { attributes, .. }
+			| ast::Item::CrateType { attributes, .. } => (Self::TypeAlias, attributes),
+			ast::Item::Trait { attributes, .. } => (Self::Trait, attributes),
+			ast::Item::TypeSet { attributes, .. } => {
+				(Self::Typeset, attributes)
+			}
+			ast::Item::Export { .. }
+			| ast::Item::ExportBlock { .. }
+			| ast::Item::Import { .. }
+			| ast::Item::InherentImpl { .. }
+			| ast::Item::TraitImpl { .. }
+			| ast::Item::Module { .. }
+			| ast::Item::ModuleDeclaration { .. }
+			| ast::Item::PackageInstance { .. }
+			| ast::Item::Use { .. } => return None,
+		})
+	}
+
+	fn of_trait_item(item: &ast::TraitItem) -> (Self, &[ast::Attribute]) {
+		match item {
+			ast::TraitItem::Function {
+				attributes,
+				body: Some(_),
+				..
+			} => (Self::Function, attributes),
+			ast::TraitItem::Function {
+				attributes,
+				body: None,
+				..
+			} => (Self::BodilessFunction, attributes),
+			ast::TraitItem::Const { attributes, .. } => {
+				(Self::Constant, attributes)
+			}
+			ast::TraitItem::AssociatedType { attributes, .. } => {
+				(Self::AssociatedType, attributes)
+			}
+		}
+	}
+
+	fn of_impl_item(item: &ast::ImplItem) -> (Self, &[ast::Attribute]) {
+		match item {
+			ast::ImplItem::Function { attributes, .. } => {
+				(Self::Function, attributes)
+			}
+			ast::ImplItem::Constant { attributes, .. } => {
+				(Self::Constant, attributes)
+			}
+			ast::ImplItem::AssocType { attributes, .. } => {
+				(Self::AssociatedType, attributes)
+			}
+		}
+	}
+}
+
 impl StructDef {
 	/// Whether every field has a name: only then can the struct be
 	/// constructed (`P({ x: 1, y: 2 })`) or destructured by name.
@@ -324,6 +507,8 @@ pub struct FunctionDef {
 	/// Each parameter's name, `None` for an unnamed one.
 	pub params: Box<[Option<Spanned<SymbolU32>>]>,
 	pub function_impls: FunctionImpls,
+	/// Only ever `INLINE`, and only on a function with a body.
+	pub attributes: Attributes,
 }
 
 /// Where a function or a constant is declared: directly in a scope (a free
@@ -2326,6 +2511,65 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		index
 	}
 
+	/// Reads the attributes written on one item. An unknown name is ignored
+	/// with a warning, since no attribute changes what a program means; a
+	/// known one on the wrong item, or in the wrong form, is an error.
+	fn scan_attributes(
+		&mut self,
+		file_id: FileId,
+		target: AttributeTarget,
+		attributes: &[ast::Attribute],
+	) -> Attributes {
+		let mut flags = Attributes::empty();
+		let mut first: [Option<TextSpan>; KnownAttribute::ALL.len()] =
+			[None; KnownAttribute::ALL.len()];
+		for attribute in attributes {
+			let name = self.strings.resolve(attribute.name.inner).unwrap();
+			let Some(known) = KnownAttribute::from_name(name) else {
+				self.diagnostics.push(report_unknown_attribute(
+					file_id,
+					attribute.name,
+					name,
+				));
+				continue;
+			};
+			if known.target() != target {
+				self.diagnostics.push(report_misplaced_attribute(
+					file_id,
+					attribute.name.span,
+					known,
+					target,
+				));
+				continue;
+			}
+			let has_arguments =
+				matches!(attribute.value, ast::AttributeValue::Args(_));
+			if known.takes_arguments() != has_arguments
+				|| matches!(attribute.value, ast::AttributeValue::NameValue(_))
+			{
+				self.diagnostics.push(report_malformed_attribute(
+					file_id,
+					attribute.name.span,
+					known,
+				));
+				continue;
+			}
+			let slot = &mut first[known as usize];
+			if let Some(first_span) = *slot {
+				self.diagnostics.push(report_duplicate_attribute(
+					file_id,
+					attribute.name.span,
+					first_span,
+					known,
+				));
+				continue;
+			}
+			*slot = Some(attribute.name.span);
+			flags.insert(known.flag());
+		}
+		flags
+	}
+
 	#[inline]
 	fn push_function(&mut self, item: FunctionDef) -> FunctionIdx {
 		let index =
@@ -2718,6 +2962,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		namespace: Scope,
 		item: &'ast ast::Item,
 	) {
+		let attributes = match AttributeTarget::of_item(item) {
+			Some((target, attributes)) => {
+				self.scan_attributes(file_id, target, attributes)
+			}
+			None => Attributes::empty(),
+		};
 		match item {
 			ast::Item::Function {
 				signature,
@@ -2770,6 +3020,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name: signature.name,
 					params,
 					function_impls,
+					attributes,
 				});
 				if matches!(item, ast::Item::CrateFunction { .. }) {
 					self.record_crate_member(
@@ -2838,7 +3089,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			ast::Item::Struct {
 				pub_span,
-				attributes,
 				name,
 				fields,
 				..
@@ -2916,10 +3166,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					field_names: field_names.into_boxed_slice(),
 					field_pub_spans: field_pub_spans.into_boxed_slice(),
 					lookup,
-					order: if attributes.iter().any(|attribute| {
-						self.strings.resolve(attribute.name.inner)
-							== Some("fixed_order")
-					}) {
+					order: if attributes.contains(Attributes::FIXED_ORDER) {
 						FieldOrder::Fixed
 					} else {
 						FieldOrder::Optimal
@@ -3224,6 +3471,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				for item in items.iter() {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
+					let (target, attributes) =
+						AttributeTarget::of_trait_item(&item.inner.inner);
+					let attributes =
+						self.scan_attributes(file_id, target, attributes);
 					let (member, key) = match &item.inner.inner {
 						ast::TraitItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
@@ -3249,6 +3500,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3427,6 +3679,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				for impl_item in items.iter() {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
+					let (target, attributes) =
+						AttributeTarget::of_impl_item(&impl_item.inner.inner);
+					let attributes =
+						self.scan_attributes(file_id, target, attributes);
 					let (member, key, binding) = match &impl_item.inner.inner {
 						ast::ImplItem::Function {
 							signature,
@@ -3458,6 +3714,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3670,6 +3927,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes: Attributes::empty(),
 								});
 							let def_key = self.push_def(
 								own_namespace,
@@ -3866,6 +4124,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				for item in items.iter() {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
+					let (target, attributes) =
+						AttributeTarget::of_impl_item(&item.inner.inner);
+					let attributes =
+						self.scan_attributes(file_id, target, attributes);
 					let (member, key) = match &item.inner.inner {
 						ast::ImplItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
@@ -3891,6 +4153,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -4211,6 +4474,83 @@ fn report_self_param_position(
 			"`self` parameter is only allowed as the first parameter of an associated function",
 		)
 		.with_label(SourceSpan::new(file_id, span).primary_label())
+}
+
+fn report_unknown_attribute(
+	file_id: FileId,
+	name: Spanned<SymbolU32>,
+	text: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::warning()
+		.with_code(DiagnosticCode::UnknownAttribute.code())
+		.with_message(format!("unknown attribute `{text}`"))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("ignored"),
+		)
+}
+
+fn report_misplaced_attribute(
+	file_id: FileId,
+	span: TextSpan,
+	attribute: KnownAttribute,
+	target: AttributeTarget,
+) -> Diagnostic<FileId> {
+	let name = attribute.name();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MisplacedAttribute.code())
+		.with_message(format!(
+			"`#[{name}]` cannot be written on {}",
+			target.description()
+		))
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+		.with_note(format!(
+			"`#[{name}]` applies only to {}",
+			attribute.target().description()
+		))
+}
+
+fn report_malformed_attribute(
+	file_id: FileId,
+	span: TextSpan,
+	attribute: KnownAttribute,
+) -> Diagnostic<FileId> {
+	let name = attribute.name();
+	let (message, form) = if attribute.takes_arguments() {
+		(
+			format!("`#[{name}]` takes an argument list"),
+			format!("#[{name}(..)]"),
+		)
+	} else {
+		(format!("`#[{name}]` takes no value"), format!("#[{name}]"))
+	};
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MalformedAttribute.code())
+		.with_message(message)
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+		.with_note(format!("write it as `{form}`"))
+}
+
+fn report_duplicate_attribute(
+	file_id: FileId,
+	span: TextSpan,
+	first: TextSpan,
+	attribute: KnownAttribute,
+) -> Diagnostic<FileId> {
+	Diagnostic::warning()
+		.with_code(DiagnosticCode::DuplicateAttribute.code())
+		.with_message(format!("`#[{}]` is written twice", attribute.name()))
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("redundant"),
+		)
+		.with_label(
+			SourceSpan::new(file_id, first)
+				.secondary_label()
+				.with_message("first written here"),
+		)
 }
 
 fn report_self_field(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
@@ -6248,5 +6588,136 @@ mod tests {
 			case.resolve(Tier::Type, "std::Memory").expect_success(),
 			DefKind::Trait(_)
 		));
+	}
+
+	/// The attributes prescan recorded on the function named `name`.
+	fn function_attributes(case: &TestCase, name: &str) -> Attributes {
+		let symbol = case.graph.strings.get(name).unwrap();
+		let mut found = case
+			.defs
+			.functions
+			.iter()
+			.filter(|function| function.name.inner == symbol);
+		let function = found.next().expect("the function is declared");
+		assert!(found.next().is_none(), "`{name}` names one function");
+		function.attributes
+	}
+
+	#[test]
+	fn inline_is_recorded_on_every_kind_of_function_with_a_body() {
+		let case = TestCase::new(indoc! {"
+			struct S();
+			trait T {
+				#[inline]
+				func defaulted(self: Self) {}
+				func required(self: Self);
+			}
+			impl S {
+				#[inline]
+				func inherent(self: Self) {}
+			}
+			impl T for S {
+				#[inline]
+				func required(self: Self) {}
+			}
+			#[inline]
+			func free() {}
+			func plain() {}
+		"});
+		case.diagnostics().assert_none();
+		for name in ["defaulted", "inherent", "free"] {
+			assert!(
+				function_attributes(&case, name).contains(Attributes::INLINE),
+				"`{name}` is inline"
+			);
+		}
+		assert_eq!(function_attributes(&case, "plain"), Attributes::empty());
+		// The trait's declaration and the impl's function are two functions
+		// with the attribute only on the impl's.
+		let required = case.graph.strings.get("required").unwrap();
+		let inline: Vec<bool> = case
+			.defs
+			.functions
+			.iter()
+			.filter(|function| function.name.inner == required)
+			.map(|function| function.attributes.contains(Attributes::INLINE))
+			.collect();
+		assert_eq!(inline, [false, true]);
+	}
+
+	#[test]
+	fn an_unknown_attribute_is_ignored_with_a_warning() {
+		let case = TestCase::new(indoc! {"
+			#[inlin]
+			func f() {}
+			#[tag = \"memory\"]
+			struct S();
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnknownAttribute,
+			DiagnosticCode::UnknownAttribute,
+		]);
+		case.diagnostics().assert_no_errors();
+		assert_eq!(function_attributes(&case, "f"), Attributes::empty());
+	}
+
+	#[test]
+	fn a_known_attribute_on_the_wrong_item_is_an_error() {
+		let case = TestCase::new(indoc! {"
+			#[inline]
+			struct S();
+			#[fixed_order]
+			func f() {}
+			trait T {
+				#[inline]
+				func required(self: Self);
+			}
+			#[inline]
+			const C: u32 = 0;
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedAttribute,
+			DiagnosticCode::MisplacedAttribute,
+			DiagnosticCode::MisplacedAttribute,
+			DiagnosticCode::MisplacedAttribute,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`#[inline]` cannot be written on a function without a body",
+		);
+		case.diagnostics()
+			.assert_error_saying("`#[fixed_order]` applies only to a struct");
+		assert_eq!(function_attributes(&case, "f"), Attributes::empty());
+		assert_eq!(function_attributes(&case, "required"), Attributes::empty());
+	}
+
+	#[test]
+	fn a_known_attribute_in_the_wrong_form_is_an_error() {
+		let case = TestCase::new(indoc! {"
+			#[inline = \"always\"]
+			func f() {}
+			#[inline(always = 1)]
+			func g() {}
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MalformedAttribute,
+			DiagnosticCode::MalformedAttribute,
+		]);
+		case.diagnostics()
+			.assert_error_saying("`#[inline]` takes no value");
+		assert_eq!(function_attributes(&case, "f"), Attributes::empty());
+		assert_eq!(function_attributes(&case, "g"), Attributes::empty());
+	}
+
+	#[test]
+	fn a_repeated_attribute_is_a_warning_and_still_applies() {
+		let case = TestCase::new(indoc! {"
+			#[inline]
+			#[inline]
+			func f() {}
+		"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateAttribute]);
+		case.diagnostics().assert_no_errors();
+		assert_eq!(function_attributes(&case, "f"), Attributes::INLINE);
 	}
 }

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use string_interner::symbol::SymbolU32;
+
 use leb128fmt;
 
 use crate::wasm::{self, ScalarType};
@@ -34,7 +36,17 @@ pub struct TypeSection {
 	signatures: Box<[FunctionSignature]>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, serde::Serialize)]
+#[derive(
+	Debug,
+	Clone,
+	Copy,
+	PartialEq,
+	PartialOrd,
+	Eq,
+	Ord,
+	Hash,
+	serde::Serialize
+)]
 pub struct SignatureIndex(pub u32);
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -119,7 +131,7 @@ pub struct GlobalSection {
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Mutability {
 	Immutable,
 	Mutable,
@@ -134,7 +146,7 @@ struct Global {
 	value: wasm::Instruction,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum ImportDesc {
 	Function {
@@ -244,7 +256,8 @@ impl Builder {
 		let live_indices: std::collections::HashSet<u32> = mir
 			.functions
 			.iter()
-			.flat_map(|f| f.static_data.iter().copied())
+			.filter_map(|f| f.code())
+			.flat_map(|code| code.static_data())
 			.collect();
 		let mut sorted_indices: Vec<u32> = live_indices.into_iter().collect();
 		sorted_indices.sort_by(|&a, &b| {
@@ -275,91 +288,103 @@ impl Builder {
 			signatures: HashMap::new(),
 		};
 
-		// Assign wasm memory indices: imported memories first, then defined.
-		// tir::ItemSource::External < Internal so a stable sort puts imports first.
-		{
-			let mut mems: Vec<&mir::MemoryInfo> = mir.memories.iter().collect();
-			mems.sort_by_key(|m| m.source);
-			for (idx, m) in mems.iter().enumerate() {
-				builder.memories.insert(
-					m.id,
-					MemoryEntry {
-						wasm_index: idx as u32,
-						kind: m.kind,
-						static_size: segment_bytes
-							.get(&m.id)
-							.map_or(0, |b| b.len() as u32),
-					},
-				);
-			}
-		}
-
-		// Process imports: build the wasm Import list and assign wasm indices.
-		// Imports come first in the wasm binary, so their indices are assigned here.
+		// Every index space numbers its imports first. One pass over the
+		// import table gives each entry the next index of its kind, or the
+		// index of an earlier entry with the same names and external type:
+		// the host provides both from the same names, so they are one import
+		// to it. Defined items follow, in id order.
 		let mut imports = Vec::<Import>::new();
+		let mut merged: HashMap<(SymbolU32, SymbolU32, ImportDesc), u32> =
+			HashMap::new();
 		let mut next_func_idx: u32 = 0;
 		let mut next_global_idx: u32 = 0;
-		for import_module in &mir.imports {
-			for item in &import_module.items {
-				match item {
-					mir::ImportModuleItem::Function {
-						name,
+		let mut next_memory_idx: u32 = 0;
+		for import in &mir.imports {
+			let desc = match import.item {
+				mir::Item::Function(id) => ImportDesc::Function {
+					signature_index: builder.register_signature(
+						&mir.signatures
+							[usize::from(mir.function(id).signature_index)],
+						&mir.aggregates,
+					),
+				},
+				mir::Item::Global(id) => {
+					let global = mir.global(id);
+					ImportDesc::Global {
+						ty: ScalarType::try_from(global.ty).unwrap(),
+						mutability: match global.mutability {
+							mir::Mutability::Mutable => Mutability::Mutable,
+							mir::Mutability::Immutable => Mutability::Immutable,
+						},
+					}
+				}
+				mir::Item::Memory(id) => ImportDesc::Memory {
+					memory: memory_type(mir.memory(id), 0),
+				},
+			};
+			let next = match import.item {
+				mir::Item::Function(_) => &mut next_func_idx,
+				mir::Item::Global(_) => &mut next_global_idx,
+				mir::Item::Memory(_) => &mut next_memory_idx,
+			};
+			let index = *merged
+				.entry((import.module, import.name, desc.clone()))
+				.or_insert_with(|| {
+					imports.push(Import {
+						module: interner.resolve(import.module).unwrap().into(),
+						name: interner.resolve(import.name).unwrap().into(),
+						desc,
+					});
+					*next += 1;
+					*next - 1
+				});
+			match import.item {
+				mir::Item::Function(id) => {
+					builder.func_wasm_index.insert(id, index);
+				}
+				mir::Item::Global(id) => {
+					builder.global_wasm_index.insert(id, index);
+				}
+				mir::Item::Memory(id) => {
+					builder.memories.insert(
 						id,
-						signature_index,
-					} => {
-						let sig_index = builder.register_signature(
-							&mir.signatures[usize::from(*signature_index)],
-							&mir.aggregates,
-						);
-						imports.push(Import {
-							module: import_module.name.clone(),
-							name: interner.resolve(*name).unwrap().to_string(),
-							desc: ImportDesc::Function {
-								signature_index: sig_index,
-							},
-						});
-						builder.func_wasm_index.insert(*id, next_func_idx);
-						next_func_idx += 1;
-					}
-					mir::ImportModuleItem::Global { name, id } => {
-						// TODO: get actual type from the MIR once global types are tracked
-						imports.push(Import {
-							module: import_module.name.clone(),
-							name: interner.resolve(*name).unwrap().to_string(),
-							desc: ImportDesc::Global {
-								ty: ScalarType::I32,
-								mutability: Mutability::Immutable,
-							},
-						});
-						builder.global_wasm_index.insert(*id, next_global_idx);
-						next_global_idx += 1;
-					}
-					mir::ImportModuleItem::Memory { name, id } => {
-						imports.push(Import {
-							module: import_module.name.clone(),
-							name: interner.resolve(*name).unwrap().to_string(),
-							desc: ImportDesc::Memory {
-								memory: Memory {
-									limits: MemoryLimits::Unbounded {
-										initial_pages: 0,
-									},
-									kind: builder.memories[id].kind,
-								},
-							},
-						});
-					}
+						MemoryEntry {
+							wasm_index: index,
+							kind: mir.memory(id).kind,
+							static_size: segment_bytes
+								.get(&id)
+								.map_or(0, |b| b.len() as u32),
+						},
+					);
 				}
 			}
 		}
-		// Defined functions follow all imports; defined globals follow all imported
-		// globals.
-		for func in &mir.functions {
-			builder.func_wasm_index.insert(func.id, next_func_idx);
-			next_func_idx += 1;
+		for (id, function) in mir.functions_with_ids() {
+			if function.code().is_some() {
+				builder.func_wasm_index.insert(id, next_func_idx);
+				next_func_idx += 1;
+			}
 		}
 		for global in &mir.globals {
-			builder.global_wasm_index.insert(global.id, next_global_idx);
-			next_global_idx += 1;
+			if global.origin.defined().is_some() {
+				builder.global_wasm_index.insert(global.id, next_global_idx);
+				next_global_idx += 1;
+			}
+		}
+		for memory in &mir.memories {
+			if memory.origin.defined().is_some() {
+				builder.memories.insert(
+					memory.id,
+					MemoryEntry {
+						wasm_index: next_memory_idx,
+						kind: memory.kind,
+						static_size: segment_bytes
+							.get(&memory.id)
+							.map_or(0, |b| b.len() as u32),
+					},
+				);
+				next_memory_idx += 1;
+			}
 		}
 
 		let mut function_signatures =
@@ -367,34 +392,40 @@ impl Builder {
 		let exports: Box<_> = mir
 			.exports
 			.iter()
-			.map(|item| match item {
-				mir::ExportItem::Global { id, name } => ExportItem::Global {
-					name: interner.resolve(*name).unwrap().to_string(),
-					global_index: GlobalIndex(builder.global_wasm_index[id]),
-				},
-				mir::ExportItem::Function { id, name } => {
-					ExportItem::Function {
-						name: interner.resolve(*name).unwrap().to_string(),
-						func_index: FuncIndex(builder.func_wasm_index[id]),
-					}
+			.map(|export| {
+				let name = interner.resolve(export.name).unwrap().to_string();
+				match export.item {
+					mir::Item::Global(id) => ExportItem::Global {
+						name,
+						global_index: GlobalIndex(
+							builder.global_wasm_index[&id],
+						),
+					},
+					mir::Item::Function(id) => ExportItem::Function {
+						name,
+						func_index: FuncIndex(builder.func_wasm_index[&id]),
+					},
+					mir::Item::Memory(id) => ExportItem::Memory {
+						name,
+						memory_index: builder.memories[&id].wasm_index,
+					},
 				}
-				mir::ExportItem::Memory { id, name } => ExportItem::Memory {
-					memory_index: builder.memories[id].wasm_index,
-					name: interner.resolve(*name).unwrap().to_string(),
-				},
 			})
 			.collect();
 
 		let mut functions =
 			Vec::<FunctionBody>::with_capacity(mir.functions.len());
-		for func in mir.functions.iter() {
+		for (id, func) in mir.functions_with_ids() {
+			if func.code().is_none() {
+				continue;
+			}
 			let signature_index = builder.register_signature(
 				&mir.signatures[usize::from(func.signature_index)],
 				&mir.aggregates,
 			);
 			function_signatures.push(signature_index);
 
-			let opt_func = crate::opt::builder::Builder::build(mir, func);
+			let opt_func = crate::opt::builder::Builder::build(mir, id);
 			let scheduled =
 				crate::opt::scheduler::Scheduler::schedule(&opt_func, mir);
 			let body = builder.encode_scheduled(&scheduled, mir);
@@ -406,9 +437,10 @@ impl Builder {
 			globals: mir
 				.globals
 				.iter()
-				.map(|global| {
+				.filter_map(|global| {
+					let &const_init = global.origin.defined()?;
 					let init_value = match (
-						global.const_init,
+						const_init,
 						ScalarType::try_from(global.ty).unwrap(),
 					) {
 						(mir::ConstInit::Int(v), ScalarType::I32) => {
@@ -425,14 +457,14 @@ impl Builder {
 						}
 						_ => unreachable!(),
 					};
-					Global {
+					Some(Global {
 						ty: ScalarType::try_from(global.ty).unwrap(),
 						mutability: match global.mutability {
 							mir::Mutability::Mutable => Mutability::Mutable,
 							mir::Mutability::Immutable => Mutability::Immutable,
 						},
 						value: init_value,
-					}
+					})
 				})
 				.collect::<Box<_>>(),
 		};
@@ -441,36 +473,17 @@ impl Builder {
 			func_index: builder.func_wasm_index[&id],
 		});
 
+		// A defined memory must be large enough for its own static data; an
+		// imported memory's size is the host's business.
 		let memories = mir
 			.memories
 			.iter()
+			.filter(|info| info.origin.defined().is_some())
 			.map(|info| {
-				// A defined memory must be large enough for its own static
-				// data; an imported memory's size is the host's business.
-				let required_pages = match info.source {
-					mir::MemorySource::External => 0,
-					mir::MemorySource::Internal => {
-						builder.memories[&info.id].static_size.div_ceil(65536)
-					}
-				};
-				let initial = info.min_pages.unwrap_or(0).max(required_pages);
-				// `min_pages`/`max_pages` are hints, not obligations: just
-				// like `initial` gets bumped above a too-small `min_pages`,
-				// `max_pages` gets bumped above `initial` when it would
-				// otherwise be violated, rather than emitting an
-				// `initial > max` module (invalid per spec).
-				Memory {
-					limits: match info.max_pages {
-						Some(max) => MemoryLimits::Bounded {
-							initial_pages: initial,
-							max_pages: max.max(initial),
-						},
-						None => MemoryLimits::Unbounded {
-							initial_pages: initial,
-						},
-					},
-					kind: info.kind,
-				}
+				memory_type(
+					info,
+					builder.memories[&info.id].static_size.div_ceil(65536),
+				)
 			})
 			.collect();
 
@@ -1687,18 +1700,40 @@ pub struct MemorySection {
 	pub memories: Box<[Memory]>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub struct Memory {
 	pub limits: MemoryLimits,
 	pub kind: mir::MemoryKind,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum MemoryLimits {
 	Unbounded { initial_pages: u32 },
 	Bounded { initial_pages: u32, max_pages: u32 },
+}
+
+/// `info`'s Wasm memory type, at least `required_pages` large.
+///
+/// `min_pages`/`max_pages` are hints, not obligations: just like `initial`
+/// gets bumped above a too-small `min_pages`, `max_pages` gets bumped above
+/// `initial` when it would otherwise be violated, rather than emitting an
+/// `initial > max` module (invalid per spec).
+fn memory_type(info: &mir::MemoryInfo, required_pages: u32) -> Memory {
+	let initial = info.min_pages.unwrap_or(0).max(required_pages);
+	Memory {
+		limits: match info.max_pages {
+			Some(max) => MemoryLimits::Bounded {
+				initial_pages: initial,
+				max_pages: max.max(initial),
+			},
+			None => MemoryLimits::Unbounded {
+				initial_pages: initial,
+			},
+		},
+		kind: info.kind,
+	}
 }
 
 impl Encode for MemorySection {

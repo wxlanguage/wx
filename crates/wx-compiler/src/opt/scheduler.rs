@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use crate::mir;
 use crate::opt::liveness::DataLiveness;
 use crate::opt::{
-	BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function, MemAccess, NodeType,
-	ScalarType, StackResult, SwitchCase,
+	BlockIndex, ControlNode, DataNodeIndex, DataNodeKind, Function, MemAccess,
+	NodeType, ScalarType, StackResult, SwitchCase,
 };
 use crate::wasm::{self, BlockType, Instruction, Local, MemArg};
 
@@ -75,16 +75,8 @@ pub struct Scheduler<'f> {
 
 impl<'f> Scheduler<'f> {
 	pub fn schedule(func: &'f Function, mir: &'f mir::MIR) -> wasm::Function {
-		let sig = &mir.signatures[{
-			// Find the function's signature via its DefId.
-			usize::from(
-				mir.functions
-					.iter()
-					.find(|f| f.id == func.id)
-					.expect("function not found")
-					.signature_index,
-			)
-		}];
+		let sig =
+			&mir.signatures[usize::from(mir.function(func.id).signature_index)];
 
 		// Aggregate params are flattened to one local per scalar.
 		let locals: Vec<Local> = sig
@@ -295,7 +287,9 @@ impl<'f> Scheduler<'f> {
 				// Value-type block: the if-End leaves the result on the WASM stack.
 				// Capture it into a local so the parent's emit_value(result_node) can
 				// read from the local rather than pushing a second copy.
-				if outputs.is_empty() { self.capture_branch_result(*result); }
+				if outputs.is_empty() {
+					self.capture_branch_result(*result);
+				}
 			}
 
 			ControlNode::Switch {
@@ -339,7 +333,9 @@ impl<'f> Scheduler<'f> {
 				// `IfElse` does — lets the parent's `emit_value(result_node)`
 				// read from a local uniformly rather than assuming a value is
 				// still sitting on the WASM stack.
-				if outputs.is_empty() { self.capture_branch_result(*result); }
+				if outputs.is_empty() {
+					self.capture_branch_result(*result);
+				}
 			}
 
 			ControlNode::Loop {
@@ -673,8 +669,12 @@ impl<'f> Scheduler<'f> {
 			while pending.peek().is_some_and(|&(idx, _)| idx as usize <= i) {
 				let node = pending.next().unwrap().1;
 				match self.func.data_nodes[node as usize].kind.node_type() {
-					NodeType::Aggregate(_) => self.ensure_aggregate_locals(node),
-					NodeType::Scalar(_) => { self.ensure_local(node); }
+					NodeType::Aggregate(_) => {
+						self.ensure_aggregate_locals(node)
+					}
+					NodeType::Scalar(_) => {
+						self.ensure_local(node);
+					}
 				}
 			}
 			self.emit_control(block_idx, stmt);
@@ -2114,7 +2114,8 @@ impl<'f> Scheduler<'f> {
 		let agg = mir.aggregate(aggregate_index);
 		let mut locals = Vec::with_capacity(agg.scalars.len());
 		for (&ty, &value) in agg.scalars.iter().zip(values.iter()) {
-			let scalar_ty = ScalarType::try_from(ty).expect("pack slot must be scalar");
+			let scalar_ty =
+				ScalarType::try_from(ty).expect("pack slot must be scalar");
 			self.emit_value(value);
 			let local = self.alloc_local(scalar_ty);
 			self.body.push(Instruction::LocalSet(local));
@@ -2430,8 +2431,14 @@ impl<'f> Scheduler<'f> {
 	}
 
 	fn capture_branch_result(&mut self, result: StackResult) {
-		let StackResult::Value(node) = result else { return; };
-		let NodeType::Scalar(ty) = self.func.data_nodes[node as usize].kind.node_type() else { return; };
+		let StackResult::Value(node) = result else {
+			return;
+		};
+		let NodeType::Scalar(ty) =
+			self.func.data_nodes[node as usize].kind.node_type()
+		else {
+			return;
+		};
 		let local = match self.node_to_local.get(&node) {
 			Some(&local) => local,
 			None => {

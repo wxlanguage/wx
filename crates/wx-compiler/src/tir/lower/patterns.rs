@@ -28,7 +28,7 @@ use crate::tir::body::{
 };
 use crate::tir::defs::{ConstIdx, FieldIdx, MemberKind};
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::types::{TypeIndex, TypeList};
+use crate::tir::types::{TypeEnvIdx, TypeIndex, TypeList};
 
 /// A value of the match scrutinee at some field path, read from one root
 /// local. `range` is a flat scalar range in that local and `tir_ty` says what
@@ -36,9 +36,10 @@ use crate::tir::types::{TypeIndex, TypeList};
 /// separate type stack).
 #[derive(Clone, Copy)]
 struct Projection {
-	local_index: mir::LocalIndex,
+	local: mir::LocalIndex,
 	range: mir::ScalarRange,
 	ty: mir::ValueType,
+	/// Concrete: substituted with the instance's arguments where it was read.
 	tir_ty: TypeIndex,
 }
 
@@ -57,30 +58,28 @@ impl Lowerer<'_, '_, '_, '_> {
 		value: ExprIdx,
 		pattern: PatIdx,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		// A diverging initializer means no binding runs; keep its `Never`.
 		if ty == mir::ValueType::Never {
 			let value = self.lower_expr(body, state, value)?;
-			debug_assert_eq!(value.ty, mir::ValueType::Never);
+			debug_assert_eq!(state.ty(value), mir::ValueType::Never);
 			return Ok(value);
 		}
 		match body.pattern(pattern) {
 			PatternKind::Wildcard => {
-				let value = Box::new(self.lower_expr(body, state, value)?);
-				return Ok(mir::Expression {
-					kind: mir::ExprKind::Drop { value },
-					ty: mir::ValueType::Unit,
-				});
+				let value = self.lower_expr(body, state, value)?;
+				return Ok(state.push(
+					mir::ExprKind::Drop { value },
+					mir::ValueType::Unit,
+				));
 			}
 			PatternKind::Bind(local) => {
-				let value = Box::new(self.lower_expr(body, state, value)?);
-				return Ok(mir::Expression {
-					kind: mir::ExprKind::LocalSet {
-						local_index: state.local_map[usize::from(local)],
-						value,
-					},
-					ty: mir::ValueType::Unit,
-				});
+				let value = self.lower_expr(body, state, value)?;
+				let local = state.local_map[usize::from(local)];
+				return Ok(state.push(
+					mir::ExprKind::LocalSet { local, value },
+					mir::ValueType::Unit,
+				));
 			}
 			_ => {}
 		}
@@ -89,12 +88,9 @@ impl Lowerer<'_, '_, '_, '_> {
 			self.pattern_irrefutable(body, pattern),
 			"a local pattern always matches"
 		);
-		let value_ty = self.lower_type(
-			body.ty(value),
-			state.env,
-			state.file_id,
-			body.span(value),
-		)?;
+		let value_ty = self.expr_ty(body, state, value);
+		let value_ty =
+			self.lower_type(value_ty, state.file_id, body.span(value))?;
 		let (subject, prefix) =
 			self.lower_subject(body, state, value, value_ty)?;
 		let mut bindings = Vec::new();
@@ -111,19 +107,16 @@ impl Lowerer<'_, '_, '_, '_> {
 		scrutinee: ExprIdx,
 		arms: ArmRange,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
-		let scrutinee_ty = self.lower_type(
-			body.ty(scrutinee),
-			state.env,
-			state.file_id,
-			body.span(scrutinee),
-		)?;
+	) -> Result<mir::ExprId, ()> {
+		let scrutinee_ty = self.expr_ty(body, state, scrutinee);
+		let scrutinee_ty =
+			self.lower_type(scrutinee_ty, state.file_id, body.span(scrutinee))?;
 		// A diverging scrutinee means no arm runs. Keeping the scrutinee's
 		// `Never` value makes the match diverge too; the arms' checked result
 		// types are irrelevant on that path.
 		if scrutinee_ty == mir::ValueType::Never {
 			let value = self.lower_expr(body, state, scrutinee)?;
-			debug_assert_eq!(value.ty, mir::ValueType::Never);
+			debug_assert_eq!(state.ty(value), mir::ValueType::Never);
 			return Ok(value);
 		}
 
@@ -242,7 +235,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		discriminants: &[Option<i64>],
 		scrutinee_ty: mir::ValueType,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		let default_binding = match arms.last() {
 			Some(arm) => match body.pattern(arm.pattern) {
 				PatternKind::Wildcard => Some(None),
@@ -259,12 +252,12 @@ impl Lowerer<'_, '_, '_, '_> {
 				self.lower_subject(body, state, scrutinee, scrutinee_ty)?;
 			prefix = spill;
 			(
-				mir::Expression {
-					kind: mir::ExprKind::LocalGet {
-						local_index: subject.local_index,
+				state.push(
+					mir::ExprKind::LocalGet {
+						local: subject.local,
 					},
-					ty: scrutinee_ty,
-				},
+					scrutinee_ty,
+				),
 				Some(subject),
 			)
 		} else {
@@ -283,9 +276,11 @@ impl Lowerer<'_, '_, '_, '_> {
 					if !seen.insert(*discriminant) {
 						continue;
 					}
-					let value = self.lower_expr(body, state, arm.body)?;
-					let value = self.block_for_branch(state, value);
-					cases.push((*discriminant, value));
+					let body = self.lower_expr(body, state, arm.body)?;
+					cases.push(mir::Case {
+						value: *discriminant,
+						body,
+					});
 				}
 				None => default = Some(arm),
 			}
@@ -299,31 +294,29 @@ impl Lowerer<'_, '_, '_, '_> {
 						let subject = subject
 							.expect("a binding default has a stored scrutinee");
 						let bind = self.projection_value(state, subject);
-						let set = mir::Expression {
-							kind: mir::ExprKind::LocalSet {
-								local_index: state.local_map
-									[usize::from(local)],
-								value: Box::new(bind),
-							},
-							ty: mir::ValueType::Unit,
-						};
+						let local = state.local_map[usize::from(local)];
+						let set = state.push(
+							mir::ExprKind::LocalSet { local, value: bind },
+							mir::ValueType::Unit,
+						);
 						self.sequence(state, vec![set], value)
 					}
 					_ => value,
 				};
-				Some(Box::new(self.block_for_branch(state, value)))
+				Some(value)
 			}
 			None => None,
 		};
 
-		let switch = mir::Expression {
-			kind: mir::ExprKind::Switch {
-				selector: Box::new(selector),
-				cases: cases.into_boxed_slice(),
+		let cases = state.mir_body.push_cases(cases);
+		let switch = state.push(
+			mir::ExprKind::Switch {
+				selector,
+				cases,
 				default,
 			},
 			ty,
-		};
+		);
 		Ok(self.sequence(state, prefix, switch))
 	}
 
@@ -338,10 +331,13 @@ impl Lowerer<'_, '_, '_, '_> {
 		arms: &[Arm],
 		scrutinee_ty: mir::ValueType,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		let (subject, prefix) =
 			self.lower_subject(body, state, scrutinee, scrutinee_ty)?;
-		let mut result = unreachable();
+		// What runs when no arm matched so far: nothing yet. A trailing
+		// refutable arm makes it an `unreachable`, built only then, so no node
+		// is left out of the tree.
+		let mut result: Option<mir::ExprId> = None;
 		// Built from the last arm back, so no recursion depth depends on the
 		// number of arms.
 		for arm in arms.iter().rev() {
@@ -361,24 +357,33 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			let value = self.lower_expr(body, state, arm.body)?;
 			let value = self.sequence(state, bindings, value);
-			result = match condition {
+			result = Some(match (condition, result) {
 				// An irrefutable arm's body is the tree's base; earlier
 				// arms still wrap it.
-				None => value,
-				Some(condition) => {
-					let then_block = self.block_for_branch(state, value);
-					let else_block = self.block_for_branch(state, result);
-					mir::Expression {
-						kind: mir::ExprKind::IfElse {
-							condition: Box::new(condition),
-							then_block: Box::new(then_block),
-							else_block: Some(Box::new(else_block)),
+				(None, None) => value,
+				(condition, otherwise) => {
+					let condition =
+						condition.unwrap_or_else(|| state.boolean(true));
+					let otherwise = otherwise.unwrap_or_else(|| {
+						state.push(
+							mir::ExprKind::Unreachable,
+							mir::ValueType::Never,
+						)
+					});
+					state.push(
+						mir::ExprKind::IfElse {
+							condition,
+							then: value,
+							otherwise: Some(otherwise),
 						},
 						ty,
-					}
+					)
 				}
-			};
+			});
 		}
+		let result = result.unwrap_or_else(|| {
+			state.push(mir::ExprKind::Unreachable, mir::ValueType::Never)
+		});
 		Ok(self.sequence(state, prefix, result))
 	}
 
@@ -391,29 +396,26 @@ impl Lowerer<'_, '_, '_, '_> {
 		state: &mut FunctionState,
 		scrutinee: ExprIdx,
 		ty: mir::ValueType,
-	) -> Result<(Projection, Vec<mir::Expression>), ()> {
-		let tir_ty = body.ty(scrutinee);
-		let (local_index, prefix) = match body.kind(scrutinee) {
+	) -> Result<(Projection, Vec<mir::ExprId>), ()> {
+		let tir_ty = self.expr_ty(body, state, scrutinee);
+		let (local, prefix) = match body.kind(scrutinee) {
 			ExprKind::Local(local) => {
 				(state.local_map[usize::from(local)], Vec::new())
 			}
 			_ => {
 				let value = self.lower_expr(body, state, scrutinee)?;
-				let local_index = self.push_temp_local(state, ty);
-				let prefix = vec![mir::Expression {
-					kind: mir::ExprKind::LocalSet {
-						local_index,
-						value: Box::new(value),
-					},
-					ty: mir::ValueType::Unit,
-				}];
-				(local_index, prefix)
+				let local = self.push_temp_local(state, ty);
+				let prefix = vec![state.push(
+					mir::ExprKind::LocalSet { local, value },
+					mir::ValueType::Unit,
+				)];
+				(local, prefix)
 			}
 		};
 		let len = self.slot_count(ty) as u32;
 		Ok((
 			Projection {
-				local_index,
+				local,
 				range: mir::ScalarRange::new(0, len),
 				ty,
 				tir_ty,
@@ -430,13 +432,13 @@ impl Lowerer<'_, '_, '_, '_> {
 		state: &mut FunctionState,
 		pattern: PatIdx,
 		subject: Projection,
-	) -> Result<Option<mir::Expression>, ()> {
+	) -> Result<Option<mir::ExprId>, ()> {
 		match body.pattern(pattern) {
 			PatternKind::Wildcard | PatternKind::Bind(_) => Ok(None),
 			PatternKind::Tuple(children) => {
 				let mut condition = None;
 				for (at, &child) in body.patterns(children).iter().enumerate() {
-					let child_ty = body.pattern_ty(child);
+					let child_ty = self.pattern_ty(body, state, child);
 					let span = body.pattern_span(child);
 					let child_subject = self.project_field(
 						state,
@@ -451,12 +453,13 @@ impl Lowerer<'_, '_, '_, '_> {
 						child,
 						child_subject,
 					)?;
-					condition = and_conditions(condition, child_condition);
+					condition =
+						and_conditions(state, condition, child_condition);
 				}
 				Ok(condition)
 			}
 			PatternKind::Struct { fields, .. } => {
-				let fields_ty = body.pattern_ty(fields);
+				let fields_ty = self.pattern_ty(body, state, fields);
 				let subject = self.retype(
 					state,
 					subject,
@@ -482,7 +485,6 @@ impl Lowerer<'_, '_, '_, '_> {
 				let span = body.pattern_span(pattern);
 				let field_types = self.aggregate_field_types(
 					subject.tir_ty,
-					state.env,
 					state.file_id,
 					span,
 				)?;
@@ -537,22 +539,28 @@ impl Lowerer<'_, '_, '_, '_> {
 					)?;
 					unreachable!()
 				}
+				// One alternative always matches, so the whole arm does.
+				// Earlier alternatives still matter to the binding selector,
+				// but not to this condition, which is then never built.
+				if alternatives.iter().any(|&alternative| {
+					self.pattern_irrefutable(body, alternative)
+				}) {
+					return Ok(None);
+				}
 				let mut condition = None;
 				for &alternative in alternatives {
-					match self.lower_pattern_condition(
+					// A test that turns out to always hold is `true`, so the
+					// alternatives already built stay in the tree.
+					let next = match self.lower_pattern_condition(
 						body,
 						state,
 						alternative,
 						subject,
 					)? {
-						// One alternative always matches, so the whole arm
-						// does. Earlier alternatives still matter to the
-						// binding selector, but not to this condition.
-						None => return Ok(None),
-						Some(next) => {
-							condition = or_conditions(condition, Some(next));
-						}
-					}
+						Some(next) => next,
+						None => state.boolean(true),
+					};
+					condition = or_conditions(state, condition, Some(next));
 				}
 				Ok(condition)
 			}
@@ -578,7 +586,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		subject: Projection,
 		constant: ConstIdx,
 		type_args: TypeList,
-	) -> Result<Option<mir::Expression>, ()> {
+	) -> Result<Option<mir::ExprId>, ()> {
 		let span = body.pattern_span(pattern);
 		if !type_args.is_empty() {
 			self.unsupported(
@@ -619,11 +627,9 @@ impl Lowerer<'_, '_, '_, '_> {
 			unreachable!()
 		}
 		if matches!(subject.ty, mir::ValueType::Aggregate { .. }) {
+			let file_id = state.file_id;
 			let value = self.materialize_constant(
-				state.file_id,
-				span,
-				subject.ty,
-				&value,
+				state, file_id, span, subject.ty, &value,
 			)?;
 			return Ok(Some(self.equality_test(state, subject, value, span)?));
 		}
@@ -635,16 +641,18 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			unreachable!()
 		};
+		let file_id = state.file_id;
 		let constant =
-			self.constant_scalar(state.file_id, span, subject.ty, *scalar)?;
+			self.constant_scalar(state, file_id, span, subject.ty, *scalar)?;
 		let left = self.projection_value(state, subject);
-		Ok(Some(mir::Expression {
-			kind: mir::ExprKind::Eq {
-				left: Box::new(left),
-				right: Box::new(constant),
+		Ok(Some(state.push(
+			mir::ExprKind::Compare {
+				op: mir::CompareOp::Eq,
+				lhs: left,
+				rhs: constant,
 			},
-			ty: mir::ValueType::Bool,
-		}))
+			mir::ValueType::Bool,
+		)))
 	}
 
 	/// `subject == value` through the concrete `PartialEq::eq` impl that the
@@ -655,9 +663,9 @@ impl Lowerer<'_, '_, '_, '_> {
 		&mut self,
 		state: &mut FunctionState,
 		subject: Projection,
-		value: mir::Expression,
+		value: mir::ExprId,
 		span: TextSpan,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		let Some(method) = self.context.operators.binary(BinaryOp::Eq) else {
 			self.unsupported(
 				state.file_id,
@@ -666,8 +674,9 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			unreachable!()
 		};
+		// The subject's type is concrete, so no assumption can apply.
 		let lookup = match self.context.find_trait_impl_query(
-			state.env,
+			TypeEnvIdx::ROOT,
 			subject.tir_ty,
 			method.trait_index,
 		) {
@@ -697,13 +706,6 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			unreachable!()
 		};
-		if !args.is_empty() {
-			self.unsupported(
-				state.file_id,
-				span,
-				"an equality impl with type arguments",
-			)?;
-		}
 		let TraitMemberSelection::Impl(
 			MemberKind::Method(function) | MemberKind::Function(function),
 		) = self
@@ -718,9 +720,11 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			unreachable!()
 		};
-		let callee_id = self.enqueue(function);
-		let (callee_signature, callee_params, ..) =
-			self.lower_signature(function)?;
+		// `eq` has no parameters of its own, so the impl's arguments, concrete
+		// because the subject is, are the method's.
+		let callee = self.instance(function, &args);
+		let callee_id = self.enqueue_from(state, callee, span)?;
+		let (_, callee_params, ..) = self.lower_signature(callee)?;
 		if callee_params.len() != 2 {
 			self.unsupported(
 				state.file_id,
@@ -733,7 +737,6 @@ impl Lowerer<'_, '_, '_, '_> {
 		Ok(self.build_call(
 			state,
 			callee_id,
-			callee_signature,
 			vec![left, value],
 			mir::ValueType::Bool,
 		))
@@ -748,7 +751,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		state: &mut FunctionState,
 		pattern: PatIdx,
 		subject: Projection,
-		out: &mut Vec<mir::Expression>,
+		out: &mut Vec<mir::ExprId>,
 	) -> Result<(), ()> {
 		match body.pattern(pattern) {
 			PatternKind::Wildcard
@@ -759,18 +762,16 @@ impl Lowerer<'_, '_, '_, '_> {
 			| PatternKind::Error => Ok(()),
 			PatternKind::Bind(local) => {
 				let value = self.projection_value(state, subject);
-				out.push(mir::Expression {
-					kind: mir::ExprKind::LocalSet {
-						local_index: state.local_map[usize::from(local)],
-						value: Box::new(value),
-					},
-					ty: mir::ValueType::Unit,
-				});
+				let local = state.local_map[usize::from(local)];
+				out.push(state.push(
+					mir::ExprKind::LocalSet { local, value },
+					mir::ValueType::Unit,
+				));
 				Ok(())
 			}
 			PatternKind::Tuple(children) => {
 				for (at, &child) in body.patterns(children).iter().enumerate() {
-					let child_ty = body.pattern_ty(child);
+					let child_ty = self.pattern_ty(body, state, child);
 					let span = body.pattern_span(child);
 					let child_subject = self.project_field(
 						state,
@@ -790,7 +791,7 @@ impl Lowerer<'_, '_, '_, '_> {
 				Ok(())
 			}
 			PatternKind::Struct { fields, .. } => {
-				let fields_ty = body.pattern_ty(fields);
+				let fields_ty = self.pattern_ty(body, state, fields);
 				let subject = self.retype(
 					state,
 					subject,
@@ -819,7 +820,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		state: &mut FunctionState,
 		alternatives: PatternRange,
 		subject: Projection,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		let alternatives = body.patterns(alternatives);
 		let effective = alternatives
 			.iter()
@@ -853,21 +854,17 @@ impl Lowerer<'_, '_, '_, '_> {
 				alternatives[at],
 				subject,
 			)?;
-			result = match condition {
-				None => action,
-				Some(condition) => {
-					let then_block = self.block_for_branch(state, action);
-					let else_block = self.block_for_branch(state, result);
-					mir::Expression {
-						kind: mir::ExprKind::IfElse {
-							condition: Box::new(condition),
-							then_block: Box::new(then_block),
-							else_block: Some(Box::new(else_block)),
-						},
-						ty: mir::ValueType::Unit,
-					}
-				}
-			};
+			// A test that always holds is `true`, so the later alternatives,
+			// already built, stay in the tree.
+			let condition = condition.unwrap_or_else(|| state.boolean(true));
+			result = state.push(
+				mir::ExprKind::IfElse {
+					condition,
+					then: action,
+					otherwise: Some(result),
+				},
+				mir::ValueType::Unit,
+			);
 		}
 		Ok(result)
 	}
@@ -877,24 +874,17 @@ impl Lowerer<'_, '_, '_, '_> {
 	fn bindings_value(
 		&mut self,
 		state: &mut FunctionState,
-		mut bindings: Vec<mir::Expression>,
-	) -> mir::Expression {
+		mut bindings: Vec<mir::ExprId>,
+	) -> mir::ExprId {
 		match bindings.len() {
-			0 => mir::Expression {
-				kind: mir::ExprKind::Noop,
-				ty: mir::ValueType::Unit,
-			},
+			0 => state.push(mir::ExprKind::Noop, mir::ValueType::Unit),
 			1 => bindings.pop().unwrap(),
 			_ => {
-				let scope_index =
-					self.push_synthetic_scope(state, mir::ValueType::Unit);
-				mir::Expression {
-					kind: mir::ExprKind::Block {
-						scope_index,
-						expressions: bindings.into_boxed_slice(),
-					},
-					ty: mir::ValueType::Unit,
-				}
+				let statements = state.list(bindings);
+				state.push(
+					mir::ExprKind::Sequence { statements },
+					mir::ValueType::Unit,
+				)
 			}
 		}
 	}
@@ -910,7 +900,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		span: TextSpan,
 	) -> Result<Projection, ()> {
 		let range = self.field_range(subject.tir_ty, state, field, span)?;
-		let ty = self.lower_type(child_ty, state.env, state.file_id, span)?;
+		let ty = self.lower_type(child_ty, state.file_id, span)?;
 		debug_assert_eq!(
 			range.len as usize,
 			self.slot_count(ty),
@@ -918,7 +908,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		);
 		let start = u32::from(subject.range.start) + u32::from(range.start);
 		Ok(Projection {
-			local_index: subject.local_index,
+			local: subject.local,
 			range: mir::ScalarRange::new(start, range.len),
 			ty,
 			tir_ty: child_ty,
@@ -936,7 +926,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		tir_ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<Projection, ()> {
-		let ty = self.lower_type(tir_ty, state.env, state.file_id, span)?;
+		let ty = self.lower_type(tir_ty, state.file_id, span)?;
 		debug_assert_eq!(
 			subject.range.len as usize,
 			self.slot_count(ty),
@@ -953,55 +943,50 @@ impl Lowerer<'_, '_, '_, '_> {
 	/// a field path is an `AggregateGet` over the root local's flat slots.
 	fn projection_value(
 		&self,
-		state: &FunctionState,
+		state: &mut FunctionState,
 		subject: Projection,
-	) -> mir::Expression {
+	) -> mir::ExprId {
 		if subject.ty == mir::ValueType::Unit {
-			return mir::Expression {
-				kind: mir::ExprKind::Noop,
-				ty: mir::ValueType::Unit,
-			};
+			return state.push(mir::ExprKind::Noop, mir::ValueType::Unit);
 		}
-		let root_ty = state.locals[usize::from(subject.local_index)].ty;
+		let root_ty = state.locals[usize::from(subject.local)].ty;
 		let whole = u32::from(subject.range.start) == 0
 			&& subject.range.len as usize == self.slot_count(root_ty);
 		if whole && subject.ty == root_ty {
-			mir::Expression {
-				kind: mir::ExprKind::LocalGet {
-					local_index: subject.local_index,
+			state.push(
+				mir::ExprKind::LocalGet {
+					local: subject.local,
 				},
-				ty: subject.ty,
-			}
+				subject.ty,
+			)
 		} else {
-			mir::Expression {
-				kind: mir::ExprKind::AggregateGet {
-					local_index: subject.local_index,
+			state.push(
+				mir::ExprKind::AggregateGet {
+					local: subject.local,
 					range: subject.range,
 				},
-				ty: subject.ty,
-			}
+				subject.ty,
+			)
 		}
 	}
 
 	/// `subject == constant`, as a boolean.
 	fn scalar_test(
 		&self,
-		state: &FunctionState,
+		state: &mut FunctionState,
 		subject: Projection,
 		value: i64,
-	) -> mir::Expression {
-		let left = self.projection_value(state, subject);
-		let right = mir::Expression {
-			kind: mir::ExprKind::Int { value },
-			ty: subject.ty,
-		};
-		mir::Expression {
-			kind: mir::ExprKind::Eq {
-				left: Box::new(left),
-				right: Box::new(right),
+	) -> mir::ExprId {
+		let lhs = self.projection_value(state, subject);
+		let rhs = state.push(mir::ExprKind::Int { value }, subject.ty);
+		state.push(
+			mir::ExprKind::Compare {
+				op: mir::CompareOp::Eq,
+				lhs,
+				rhs,
 			},
-			ty: mir::ValueType::Bool,
-		}
+			mir::ValueType::Bool,
+		)
 	}
 }
 
@@ -1041,42 +1026,36 @@ fn constant_int_discriminant(bits: u64, ty: mir::ValueType) -> Option<i64> {
 }
 
 fn and_conditions(
-	left: Option<mir::Expression>,
-	right: Option<mir::Expression>,
-) -> Option<mir::Expression> {
-	match (left, right) {
-		(None, right) => right,
-		(left, None) => left,
-		(Some(left), Some(right)) => Some(mir::Expression {
-			kind: mir::ExprKind::And {
-				left: Box::new(left),
-				right: Box::new(right),
-			},
-			ty: mir::ValueType::Bool,
-		}),
-	}
+	state: &mut FunctionState,
+	left: Option<mir::ExprId>,
+	right: Option<mir::ExprId>,
+) -> Option<mir::ExprId> {
+	combine(state, mir::BinaryOp::BitAnd, left, right)
 }
 
 fn or_conditions(
-	left: Option<mir::Expression>,
-	right: Option<mir::Expression>,
-) -> Option<mir::Expression> {
+	state: &mut FunctionState,
+	left: Option<mir::ExprId>,
+	right: Option<mir::ExprId>,
+) -> Option<mir::ExprId> {
+	combine(state, mir::BinaryOp::BitOr, left, right)
+}
+
+/// Two `Bool` conditions joined by `op`, either of which may be absent (one
+/// that always holds). Both sides are pure tests, so neither needs to
+/// short-circuit.
+fn combine(
+	state: &mut FunctionState,
+	op: mir::BinaryOp,
+	left: Option<mir::ExprId>,
+	right: Option<mir::ExprId>,
+) -> Option<mir::ExprId> {
 	match (left, right) {
 		(None, right) => right,
 		(left, None) => left,
-		(Some(left), Some(right)) => Some(mir::Expression {
-			kind: mir::ExprKind::Or {
-				left: Box::new(left),
-				right: Box::new(right),
-			},
-			ty: mir::ValueType::Bool,
-		}),
-	}
-}
-
-fn unreachable() -> mir::Expression {
-	mir::Expression {
-		kind: mir::ExprKind::Unreachable,
-		ty: mir::ValueType::Never,
+		(Some(lhs), Some(rhs)) => Some(state.push(
+			mir::ExprKind::Binary { op, lhs, rhs },
+			mir::ValueType::Bool,
+		)),
 	}
 }

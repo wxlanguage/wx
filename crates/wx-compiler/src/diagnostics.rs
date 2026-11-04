@@ -196,6 +196,8 @@ define_diagnostic_codes! {
 		InvalidMatchPattern => "E2068",
 		InvalidMemoryLimitsAttribute => "E2069",
 		UnreachableMatchArm => "W2010",
+		UnknownAttribute => "W2011",
+		DuplicateAttribute => "W2012",
 		MissingTypeAliasBody => "E2070",
 		EnumVariantRequiresExplicitValue => "E2071",
 		DuplicateExportBlock => "E2072",
@@ -248,6 +250,10 @@ define_diagnostic_codes! {
 		PositionalOnlyCall => "E2123",
 		ImplStricterThanTrait => "E2124",
 		CannotIndex => "E2125",
+		RecursionLimit => "E2126",
+		SlotLimit => "E2127",
+		MisplacedAttribute => "E2128",
+		MalformedAttribute => "E2129",
 	}
 }
 

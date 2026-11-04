@@ -13,73 +13,191 @@ use crate::ast::StringInterner;
 use crate::mir;
 use crate::wasm;
 
-/// `func add(a: i32, b: i32) -> i32 { a + b }`, written directly as MIR.
+/// A function under construction: its arena, locals and labels.
+struct Fixture {
+	body: mir::Body,
+	locals: Vec<mir::Local>,
+	label_count: u32,
+}
+
+impl Fixture {
+	fn new(locals: &[mir::ValueType]) -> Self {
+		Self {
+			body: mir::Body::default(),
+			locals: locals
+				.iter()
+				.map(|&ty| mir::Local {
+					ty,
+					mutability: mir::Mutability::Mutable,
+				})
+				.collect(),
+			label_count: 0,
+		}
+	}
+
+	fn push(&mut self, kind: mir::ExprKind, ty: mir::ValueType) -> mir::ExprId {
+		self.body.push(kind, ty)
+	}
+
+	fn local(&mut self, index: u32, ty: mir::ValueType) -> mir::ExprId {
+		self.push(
+			mir::ExprKind::LocalGet {
+				local: mir::LocalIndex::new(index),
+			},
+			ty,
+		)
+	}
+
+	fn int(&mut self, value: i64, ty: mir::ValueType) -> mir::ExprId {
+		self.push(mir::ExprKind::Int { value }, ty)
+	}
+
+	fn unreachable(&mut self) -> mir::ExprId {
+		self.push(mir::ExprKind::Unreachable, mir::ValueType::Never)
+	}
+
+	fn binary(
+		&mut self,
+		op: mir::BinaryOp,
+		lhs: mir::ExprId,
+		rhs: mir::ExprId,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		self.push(mir::ExprKind::Binary { op, lhs, rhs }, ty)
+	}
+
+	fn sequence(
+		&mut self,
+		statements: impl IntoIterator<Item = mir::ExprId>,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		let statements = self.body.push_list(statements);
+		self.push(mir::ExprKind::Sequence { statements }, ty)
+	}
+
+	fn if_else(
+		&mut self,
+		condition: mir::ExprId,
+		then: mir::ExprId,
+		otherwise: Option<mir::ExprId>,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		self.push(
+			mir::ExprKind::IfElse {
+				condition,
+				then,
+				otherwise,
+			},
+			ty,
+		)
+	}
+
+	fn ret(&mut self, value: mir::ExprId) -> mir::ExprId {
+		self.push(
+			mir::ExprKind::Return { value: Some(value) },
+			mir::ValueType::Never,
+		)
+	}
+
+	fn label(&mut self) -> mir::LabelId {
+		let label = mir::LabelId::new(self.label_count);
+		self.label_count += 1;
+		label
+	}
+
+	/// The finished function, whose body is `root`. Its arena must satisfy
+	/// MIR's invariants, as lowering's does.
+	fn finish(
+		self,
+		signature_index: mir::SignatureIndex,
+		root: mir::ExprId,
+	) -> mir::Function {
+		mir::body::verify(&self.body, root, &self.locals, self.label_count)
+			.expect("a fixture is a valid MIR arena");
+		mir::Function {
+			signature_index,
+			origin: mir::Origin::Defined(mir::Code {
+				locals: self.locals,
+				label_count: self.label_count,
+				body: self.body,
+				root,
+			}),
+		}
+	}
+}
+
+/// A module of `functions`, which export `exports` and use `signatures`,
+/// `aggregates` and `memories`.
+fn module(
+	functions: Vec<mir::Function>,
+	signatures: Vec<mir::FunctionSignature>,
+	exports: Vec<mir::Export>,
+	aggregates: Box<[mir::Aggregate]>,
+	memories: Vec<mir::MemoryInfo>,
+) -> mir::MIR {
+	let function_flags = vec![mir::FunctionFlags::empty(); functions.len()];
+	mir::MIR {
+		functions,
+		function_flags,
+		signatures,
+		globals: Vec::new(),
+		exports,
+		imports: Vec::new(),
+		memories,
+		aggregates,
+		static_entries: Vec::new(),
+		start_function: None,
+	}
+}
+
+fn export(name: SymbolU32) -> Vec<mir::Export> {
+	vec![mir::Export {
+		name,
+		item: mir::Item::Function(mir::FunctionId::new(0)),
+	}]
+}
+
+fn signature(
+	items: impl Into<Box<[mir::ValueType]>>,
+	params_count: usize,
+) -> mir::FunctionSignature {
+	mir::FunctionSignature {
+		items: items.into(),
+		params_count,
+	}
+}
+
+/// `func add(a: i32, b: i32) -> i32 { a + b }`, written directly as MIR, with
+/// the body built by `body` over the two `i32` parameters.
 ///
 /// Contract this fixture depends on:
 /// - parameters are the first `params_count` entries of `Function::locals`,
-/// - the body is an `ExprKind::Block` whose value is its last expression,
-/// - the block's value is returned implicitly,
+/// - the root's value is returned implicitly,
 /// - `MIR::signatures[signature_index]` is the sole source of the Wasm
 ///   signature.
-fn scalar_add(name: SymbolU32) -> mir::MIR {
+fn scalar_function(
+	name: SymbolU32,
+	body: impl FnOnce(&mut Fixture) -> mir::ExprId,
+) -> mir::MIR {
 	let i32_ty = mir::ValueType::I32;
-	let local = |index: u32| mir::Expression {
-		kind: mir::ExprKind::LocalGet {
-			local_index: mir::LocalIndex::new(index),
-		},
-		ty: i32_ty,
-	};
+	let mut fixture = Fixture::new(&[i32_ty, i32_ty]);
+	let root = body(&mut fixture);
+	module(
+		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
+		vec![signature([i32_ty, i32_ty, i32_ty], 2)],
+		export(name),
+		Box::new([]),
+		Vec::new(),
+	)
+}
 
-	mir::MIR {
-		functions: vec![mir::Function {
-			id: mir::FunctionId::new(0),
-			signature_index: mir::SignatureIndex::new(0),
-			scopes: vec![mir::BlockScope {
-				kind: mir::BlockKind::Block,
-				result: i32_ty,
-			}],
-			locals: vec![
-				mir::Local {
-					ty: i32_ty,
-					mutability: mir::Mutability::Immutable,
-				},
-				mir::Local {
-					ty: i32_ty,
-					mutability: mir::Mutability::Immutable,
-				},
-			],
-			block: mir::Expression {
-				kind: mir::ExprKind::Block {
-					scope_index: mir::ScopeIndex::new(0),
-					expressions: Box::new([mir::Expression {
-						kind: mir::ExprKind::Add {
-							left: Box::new(local(0)),
-							right: Box::new(local(1)),
-						},
-						ty: i32_ty,
-					}]),
-				},
-				ty: i32_ty,
-			},
-			static_data: Vec::new(),
-		}],
-		inline_functions: Default::default(),
-		signatures: vec![mir::FunctionSignature {
-			items: Box::new([i32_ty, i32_ty, i32_ty]),
-			params_count: 2,
-		}],
-		globals: Vec::new(),
-		exports: vec![mir::ExportItem::Function {
-			id: mir::FunctionId::new(0),
-			name,
-		}],
-		imports: Vec::new(),
-		memories: Vec::new(),
-		aggregates: Box::new([]),
-		static_entries: Vec::new(),
-		call_edges: Vec::new(),
-		start_function: None,
-	}
+fn scalar_add(name: SymbolU32) -> mir::MIR {
+	scalar_function(name, |f| {
+		let i32_ty = mir::ValueType::I32;
+		let a = f.local(0, i32_ty);
+		let b = f.local(1, i32_ty);
+		f.binary(mir::BinaryOp::Add, a, b, i32_ty)
+	})
 }
 
 fn instantiate(bytes: &[u8]) -> (wasmtime::Engine, wasmtime::Module) {
@@ -89,20 +207,26 @@ fn instantiate(bytes: &[u8]) -> (wasmtime::Engine, wasmtime::Module) {
 	(engine, module)
 }
 
+/// Encode `mir` and instantiate it with no imports.
+fn run(
+	mir: &mir::MIR,
+	interner: &StringInterner,
+) -> (wasmtime::Store<()>, wasmtime::Instance) {
+	let module = crate::codegen::Builder::build(mir, interner)
+		.expect("a fixture module must lower");
+	let bytes = module.encode();
+	let (engine, module) = instantiate(&bytes);
+	let mut store = wasmtime::Store::new(&engine, ());
+	let instance = wasmtime::Instance::new(&mut store, &module, &[])
+		.expect("a backend module with no imports must instantiate");
+	(store, instance)
+}
+
 #[test]
 fn hand_built_scalar_add_runs_under_wasmtime() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("add");
-	let mir = scalar_add(name);
-
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a scalar MIR module must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[])
-		.expect("a backend module with no imports must instantiate");
+	let (mut store, instance) = run(&scalar_add(name), &interner);
 	let add = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "add")
 		.expect("`add` must be exported under its external name");
@@ -118,15 +242,7 @@ fn hand_built_scalar_add_runs_under_wasmtime() {
 fn hand_built_scalar_add_exports_only_the_requested_name() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("sum");
-	let mir = scalar_add(name);
-
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a scalar MIR module must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(&scalar_add(name), &interner);
 	let sum = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "sum")
 		.expect("exported under the MIR export name");
@@ -147,122 +263,60 @@ fn unit_result_flattens_to_no_wasm_slots() {
 	);
 }
 
-/// Two functions whose backend IDs deliberately disagree with their positions
-/// in `MIR::functions` and with their Wasm indices.
-///
-/// `triple` (id 7, wasm index 0) calls `add` (id 3, wasm index 1). An encoder
-/// that confused an ID with a table position would emit `call 3` and fail
-/// validation, so this is the test that keeps the identity contract honest.
+/// `triple` (id 1) calls `add` (id 0) and is the only export. A call names its
+/// callee by `FunctionId`, which codegen maps to a Wasm index through its own
+/// table, so the export's index and the callee's are both looked up.
 #[test]
-fn direct_call_resolves_backend_ids_not_table_positions() {
+fn direct_call_resolves_its_callee_by_id() {
 	let mut interner = StringInterner::new();
 	let triple_name = interner.get_or_intern("triple");
 
 	let i32_ty = mir::ValueType::I32;
-	let add_id = mir::FunctionId::new(3);
-	let triple_id = mir::FunctionId::new(7);
+	let add_id = mir::FunctionId::new(0);
+	let triple_id = mir::FunctionId::new(1);
 	let add_sig = mir::SignatureIndex::new(0);
 	let triple_sig = mir::SignatureIndex::new(1);
 
-	let scalar_local = mir::Local {
-		ty: i32_ty,
-		mutability: mir::Mutability::Immutable,
-	};
-	let local = |index: u32| mir::Expression {
-		kind: mir::ExprKind::LocalGet {
-			local_index: mir::LocalIndex::new(index),
-		},
-		ty: i32_ty,
-	};
-	let body = |expressions: Box<[mir::Expression]>| mir::Expression {
-		kind: mir::ExprKind::Block {
-			scope_index: mir::ScopeIndex::new(0),
-			expressions,
-		},
-		ty: i32_ty,
-	};
-	let call_add = |arguments: [mir::Expression; 2]| mir::Expression {
-		kind: mir::ExprKind::Call {
-			callee: Box::new(mir::Expression {
-				kind: mir::ExprKind::Function { id: add_id },
-				ty: mir::ValueType::Function {
-					signature_index: add_sig,
-				},
-			}),
-			arguments: Box::new(arguments),
-		},
-		ty: i32_ty,
-	};
-
-	let add = mir::Function {
-		id: add_id,
-		signature_index: add_sig,
-		scopes: vec![mir::BlockScope {
-			kind: mir::BlockKind::Block,
-			result: i32_ty,
-		}],
-		locals: vec![scalar_local.clone(), scalar_local.clone()],
-		block: body(Box::new([mir::Expression {
-			kind: mir::ExprKind::Add {
-				left: Box::new(local(0)),
-				right: Box::new(local(1)),
-			},
-			ty: i32_ty,
-		}])),
-		static_data: Vec::new(),
-	};
+	let mut add = Fixture::new(&[i32_ty, i32_ty]);
+	let a = add.local(0, i32_ty);
+	let b = add.local(1, i32_ty);
+	let sum = add.binary(mir::BinaryOp::Add, a, b, i32_ty);
+	let add = add.finish(add_sig, sum);
 
 	// `triple(a) = add(add(a, a), a)`
-	let triple = mir::Function {
-		id: triple_id,
-		signature_index: triple_sig,
-		scopes: vec![mir::BlockScope {
-			kind: mir::BlockKind::Block,
-			result: i32_ty,
-		}],
-		locals: vec![scalar_local],
-		block: body(Box::new([call_add([
-			call_add([local(0), local(0)]),
-			local(0),
-		])])),
-		static_data: Vec::new(),
+	let mut triple = Fixture::new(&[i32_ty]);
+	let call_add = |f: &mut Fixture, lhs, rhs| {
+		let args = f.body.push_list([lhs, rhs]);
+		f.push(
+			mir::ExprKind::Call {
+				function: add_id,
+				args,
+			},
+			i32_ty,
+		)
 	};
+	let first = triple.local(0, i32_ty);
+	let second = triple.local(0, i32_ty);
+	let inner = call_add(&mut triple, first, second);
+	let third = triple.local(0, i32_ty);
+	let outer = call_add(&mut triple, inner, third);
+	let triple = triple.finish(triple_sig, outer);
 
-	let mir = mir::MIR {
-		// Definition order is `triple`, `add`; Wasm indices follow this order,
-		// so they are 0 and 1 while the IDs are 7 and 3.
-		functions: vec![triple, add],
-		inline_functions: Default::default(),
-		signatures: vec![
-			mir::FunctionSignature {
-				items: Box::new([i32_ty, i32_ty, i32_ty]),
-				params_count: 2,
-			},
-			mir::FunctionSignature {
-				items: Box::new([i32_ty, i32_ty]),
-				params_count: 1,
-			},
+	let mir = module(
+		vec![add, triple],
+		vec![
+			signature([i32_ty, i32_ty, i32_ty], 2),
+			signature([i32_ty, i32_ty], 1),
 		],
-		globals: Vec::new(),
-		exports: vec![mir::ExportItem::Function {
-			id: triple_id,
+		vec![mir::Export {
 			name: triple_name,
+			item: mir::Item::Function(triple_id),
 		}],
-		imports: Vec::new(),
-		memories: Vec::new(),
-		aggregates: Box::new([]),
-		static_entries: Vec::new(),
-		call_edges: Vec::new(),
-		start_function: None,
-	};
+		Box::new([]),
+		Vec::new(),
+	);
 
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a two-function scalar MIR module must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(&mir, &interner);
 	let triple = instance
 		.get_typed_func::<i32, i32>(&mut store, "triple")
 		.expect("`triple` must be exported");
@@ -277,67 +331,27 @@ use crate::wasm::ScalarType;
 
 /// MIR for `identity(s: T) -> T`, where `T` is the aggregate at
 /// `aggregate_index`. The Wasm signature is entirely derived from
-/// `FunctionSignature::items` + the aggregate's `ScalarTable`, so this pins
-/// the parameter/result flattening without involving TIR.
+/// `FunctionSignature::items` + the aggregate's scalars, so this pins the
+/// parameter/result flattening without involving TIR.
 fn aggregate_identity_mir(
 	name: SymbolU32,
 	aggregate_index: mir::AggregateIndex,
 	aggregates: Box<[mir::Aggregate]>,
 ) -> mir::MIR {
 	let ty = mir::ValueType::Aggregate { aggregate_index };
-	mir::MIR {
-		functions: vec![mir::Function {
-			id: mir::FunctionId::new(0),
-			signature_index: mir::SignatureIndex::new(0),
-			scopes: vec![mir::BlockScope {
-				kind: mir::BlockKind::Block,
-				result: ty,
-			}],
-			locals: vec![mir::Local {
-				ty,
-				mutability: mir::Mutability::Immutable,
-			}],
-			block: mir::Expression {
-				kind: mir::ExprKind::Block {
-					scope_index: mir::ScopeIndex::new(0),
-					expressions: Box::new([mir::Expression {
-						kind: mir::ExprKind::LocalGet {
-							local_index: mir::LocalIndex::new(0),
-						},
-						ty,
-					}]),
-				},
-				ty,
-			},
-			static_data: Vec::new(),
-		}],
-		inline_functions: Default::default(),
-		signatures: vec![mir::FunctionSignature {
-			items: Box::new([ty, ty]),
-			params_count: 1,
-		}],
-		globals: Vec::new(),
-		exports: vec![mir::ExportItem::Function {
-			id: mir::FunctionId::new(0),
-			name,
-		}],
-		imports: Vec::new(),
-		memories: Vec::new(),
+	let mut fixture = Fixture::new(&[ty]);
+	let root = fixture.local(0, ty);
+	module(
+		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
+		vec![signature([ty, ty], 1)],
+		export(name),
 		aggregates,
-		static_entries: Vec::new(),
-		call_edges: Vec::new(),
-		start_function: None,
-	}
+		Vec::new(),
+	)
 }
 
 fn run_aggregate_identity(mir: &mir::MIR, interner: &StringInterner) {
-	let module = crate::codegen::Builder::build(mir, interner)
-		.expect("an aggregate identity module must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(mir, interner);
 	let identity = instance
 		.get_typed_func::<(i32, i64, i32), (i32, i64, i32)>(
 			&mut store, "identity",
@@ -462,57 +476,23 @@ fn projection_indexes_flat_slots_not_source_fields() {
 	);
 
 	// `last(s: S) -> u8 { s.c }` — field 2, past the zero-sized field.
-	let mir = mir::MIR {
-		functions: vec![mir::Function {
-			id: mir::FunctionId::new(0),
-			signature_index: mir::SignatureIndex::new(0),
-			scopes: vec![mir::BlockScope {
-				kind: mir::BlockKind::Block,
-				result: mir::ValueType::U8,
-			}],
-			locals: vec![mir::Local {
-				ty: aggregate_ty,
-				mutability: mir::Mutability::Immutable,
-			}],
-			block: mir::Expression {
-				kind: mir::ExprKind::Block {
-					scope_index: mir::ScopeIndex::new(0),
-					expressions: Box::new([mir::Expression {
-						kind: mir::ExprKind::AggregateGet {
-							local_index: mir::LocalIndex::new(0),
-							range: mir::ScalarRange::new(1, 1),
-						},
-						ty: mir::ValueType::U8,
-					}]),
-				},
-				ty: mir::ValueType::U8,
-			},
-			static_data: Vec::new(),
-		}],
-		inline_functions: Default::default(),
-		signatures: vec![mir::FunctionSignature {
-			items: Box::new([aggregate_ty, mir::ValueType::U8]),
-			params_count: 1,
-		}],
-		globals: Vec::new(),
-		exports: vec![mir::ExportItem::Function {
-			id: mir::FunctionId::new(0),
-			name,
-		}],
-		imports: Vec::new(),
-		memories: Vec::new(),
+	let mut fixture = Fixture::new(&[aggregate_ty]);
+	let root = fixture.push(
+		mir::ExprKind::AggregateGet {
+			local: mir::LocalIndex::new(0),
+			range: mir::ScalarRange::new(1, 1),
+		},
+		mir::ValueType::U8,
+	);
+	let mir = module(
+		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
+		vec![signature([aggregate_ty, mir::ValueType::U8], 1)],
+		export(name),
 		aggregates,
-		static_entries: Vec::new(),
-		call_edges: Vec::new(),
-		start_function: None,
-	};
+		Vec::new(),
+	);
 
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a ZST-bearing aggregate module must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(&mir, &interner);
 	let last = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "last")
 		.expect("two scalar params, one scalar result");
@@ -539,81 +519,43 @@ fn aggregate_memory_roundtrip_pairs_slots_with_their_offsets() {
 	);
 	let aggregates = table.finish();
 	let aggregate_ty = mir::ValueType::Aggregate { aggregate_index };
-
 	let memory = mir::MemoryId::new(0);
-	let address = || mir::Expression {
-		kind: mir::ExprKind::Int { value: 0 },
-		ty: mir::ValueType::I32,
-	};
-	let param = mir::Expression {
-		kind: mir::ExprKind::LocalGet {
-			local_index: mir::LocalIndex::new(0),
-		},
-		ty: aggregate_ty,
-	};
 
-	let mir = mir::MIR {
-		functions: vec![mir::Function {
-			id: mir::FunctionId::new(0),
-			signature_index: mir::SignatureIndex::new(0),
-			scopes: vec![mir::BlockScope {
-				kind: mir::BlockKind::Block,
-				result: aggregate_ty,
-			}],
-			locals: vec![mir::Local {
-				ty: aggregate_ty,
-				mutability: mir::Mutability::Immutable,
-			}],
-			block: mir::Expression {
-				kind: mir::ExprKind::Block {
-					scope_index: mir::ScopeIndex::new(0),
-					expressions: Box::new([
-						mir::Expression {
-							kind: mir::ExprKind::PointerStore {
-								pointer: Box::new(address()),
-								value: Box::new(param),
-								offset: 0,
-								memory,
-							},
-							ty: mir::ValueType::Unit,
-						},
-						mir::Expression {
-							kind: mir::ExprKind::PointerLoad {
-								pointer: Box::new(address()),
-								offset: 0,
-								memory,
-							},
-							ty: aggregate_ty,
-						},
-					]),
-				},
-				ty: aggregate_ty,
-			},
-			static_data: Vec::new(),
-		}],
-		inline_functions: Default::default(),
-		signatures: vec![mir::FunctionSignature {
-			items: Box::new([aggregate_ty, aggregate_ty]),
-			params_count: 1,
-		}],
-		globals: Vec::new(),
-		exports: vec![mir::ExportItem::Function {
-			id: mir::FunctionId::new(0),
-			name,
-		}],
-		imports: Vec::new(),
-		memories: vec![mir::MemoryInfo {
+	let mut fixture = Fixture::new(&[aggregate_ty]);
+	let store_address = fixture.int(0, mir::ValueType::I32);
+	let param = fixture.local(0, aggregate_ty);
+	let store = fixture.push(
+		mir::ExprKind::PointerStore {
+			pointer: store_address,
+			value: param,
+			offset: 0,
+			memory,
+		},
+		mir::ValueType::Unit,
+	);
+	let load_address = fixture.int(0, mir::ValueType::I32);
+	let load = fixture.push(
+		mir::ExprKind::PointerLoad {
+			pointer: load_address,
+			offset: 0,
+			memory,
+		},
+		aggregate_ty,
+	);
+	let root = fixture.sequence([store, load], aggregate_ty);
+	let mir = module(
+		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
+		vec![signature([aggregate_ty, aggregate_ty], 1)],
+		export(name),
+		aggregates,
+		vec![mir::MemoryInfo {
 			id: memory,
-			source: mir::MemorySource::Internal,
 			kind: mir::MemoryKind::Memory32,
 			min_pages: Some(1),
 			max_pages: None,
+			origin: mir::Origin::Defined(()),
 		}],
-		aggregates,
-		static_entries: Vec::new(),
-		call_edges: Vec::new(),
-		start_function: None,
-	};
+	);
 
 	run_aggregate_identity(&mir, &interner);
 }
@@ -643,67 +585,15 @@ fn flat_stack_values_do_not_require_a_memory_layout() {
 /// flattened, local-per-scalar path instead of a memory round trip.
 const PACK_INPUT: (i32, i64, i32) = (7, 1 << 40, 9);
 
-fn local(index: u32, ty: mir::ValueType) -> mir::Expression {
-	mir::Expression {
-		kind: mir::ExprKind::LocalGet {
-			local_index: mir::LocalIndex::new(index),
-		},
-		ty,
-	}
-}
-
-fn int(value: i64, ty: mir::ValueType) -> mir::Expression {
-	mir::Expression {
-		kind: mir::ExprKind::Int { value },
-		ty,
-	}
-}
-
-fn block(
-	scope_index: u32,
-	ty: mir::ValueType,
-	expressions: Box<[mir::Expression]>,
-) -> mir::Expression {
-	mir::Expression {
-		kind: mir::ExprKind::Block {
-			scope_index: mir::ScopeIndex::new(scope_index),
-			expressions,
-		},
-		ty,
-	}
-}
-
-/// Register a new block scope on `function` and return its index.
-fn push_scope(
-	function: &mut mir::Function,
-	kind: mir::BlockKind,
-	result: mir::ValueType,
-) -> mir::ScopeIndex {
-	let scope_index = mir::ScopeIndex::new(function.scopes.len() as u32);
-	function.scopes.push(mir::BlockScope { kind, result });
-	scope_index
-}
-
-/// Wrap `value` in a fresh `Block` scope: the shape MIR uses for a branch
-/// body.
-fn arm(
-	function: &mut mir::Function,
-	value: mir::Expression,
-) -> mir::Expression {
-	let ty = value.ty;
-	let scope_index = push_scope(function, mir::BlockKind::Block, ty);
-	block(u32::from(scope_index), ty, Box::new([value]))
-}
-
-/// Base MIR shared by the control-flow fixtures:
+/// The pack type and its aggregate table, for
 ///
 /// ```text
 /// fn run(pack: (i32, i64, i32), n: i32) -> (i32, i64, i32)
 /// ```
 ///
-/// Each test replaces the function body with one control-flow construct and
-/// checks that the pack still crosses its join unchanged.
-fn pack_join_mir(name: SymbolU32) -> (mir::MIR, mir::ValueType) {
+/// Each test builds the body as one control-flow construct and checks that
+/// the pack still crosses its join unchanged.
+fn pack_type() -> (mir::ValueType, Box<[mir::Aggregate]>) {
 	let mut table = AggregateTable::default();
 	let aggregate_index = table.push(
 		Box::new([
@@ -713,36 +603,40 @@ fn pack_join_mir(name: SymbolU32) -> (mir::MIR, mir::ValueType) {
 		]),
 		None,
 	);
-	let pack = mir::ValueType::Aggregate { aggregate_index };
-	let mut mir = aggregate_identity_mir(name, aggregate_index, table.finish());
-	mir.signatures[0] = mir::FunctionSignature {
-		items: Box::new([pack, mir::ValueType::I32, pack]),
-		params_count: 2,
-	};
-	// Parameter 0 is the pack, parameter 1 is `n`. The loop fixture mutates
-	// both; marking them mutable here keeps the fixtures otherwise identical.
-	mir.functions[0].locals.push(mir::Local {
-		ty: mir::ValueType::I32,
-		mutability: mir::Mutability::Mutable,
-	});
-	mir.functions[0].locals[0].mutability = mir::Mutability::Mutable;
-	(mir, pack)
+	(
+		mir::ValueType::Aggregate { aggregate_index },
+		table.finish(),
+	)
+}
+
+/// The `run` module whose body `body` builds over the pack (local 0) and `n`
+/// (local 1).
+fn pack_join_mir(
+	name: SymbolU32,
+	body: impl FnOnce(&mut Fixture, mir::ValueType) -> mir::ExprId,
+) -> mir::MIR {
+	let (pack, aggregates) = pack_type();
+	let mut fixture = Fixture::new(&[pack, mir::ValueType::I32]);
+	let root = body(&mut fixture, pack);
+	module(
+		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
+		vec![signature([pack, mir::ValueType::I32, pack], 2)],
+		export(name),
+		aggregates,
+		Vec::new(),
+	)
 }
 
 fn pack_literal(
+	f: &mut Fixture,
 	pack: mir::ValueType,
 	values: (i32, i64, i32),
-) -> mir::Expression {
-	mir::Expression {
-		kind: mir::ExprKind::Aggregate {
-			values: Box::new([
-				int(i64::from(values.0), mir::ValueType::I32),
-				int(values.1, mir::ValueType::I64),
-				int(i64::from(values.2), mir::ValueType::I32),
-			]),
-		},
-		ty: pack,
-	}
+) -> mir::ExprId {
+	let first = f.int(i64::from(values.0), mir::ValueType::I32);
+	let second = f.int(values.1, mir::ValueType::I64);
+	let third = f.int(i64::from(values.2), mir::ValueType::I32);
+	let values = f.body.push_list([first, second, third]);
+	f.push(mir::ExprKind::Aggregate { values }, pack)
 }
 
 /// Run `mir`'s exported `run` for a few values of `n` and compare the pack
@@ -753,12 +647,7 @@ fn assert_pack_join(
 	interner: &StringInterner,
 	expected: impl Fn(i32) -> (i32, i64, i32),
 ) {
-	let module = crate::codegen::Builder::build(mir, interner)
-		.expect("a flat-pack control-flow module must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(mir, interner);
 	let run = instance
 		.get_typed_func::<(i32, i64, i32, i32), (i32, i64, i32)>(
 			&mut store, "run",
@@ -780,19 +669,12 @@ fn assert_pack_join(
 fn flat_pack_crosses_an_if_join() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let (mut mir, pack) = pack_join_mir(name);
-
-	let then_block = arm(&mut mir.functions[0], local(0, pack));
-	let else_block = arm(&mut mir.functions[0], pack_literal(pack, (1, 2, 3)));
-	let value = mir::Expression {
-		kind: mir::ExprKind::IfElse {
-			condition: Box::new(local(1, mir::ValueType::I32)),
-			then_block: Box::new(then_block),
-			else_block: Some(Box::new(else_block)),
-		},
-		ty: pack,
-	};
-	mir.functions[0].block = block(0, pack, Box::new([value]));
+	let mir = pack_join_mir(name, |f, pack| {
+		let condition = f.local(1, mir::ValueType::I32);
+		let then = f.local(0, pack);
+		let otherwise = pack_literal(f, pack, (1, 2, 3));
+		f.if_else(condition, then, Some(otherwise), pack)
+	});
 
 	assert_pack_join(&mir, &interner, |n| {
 		if n == 0 { (1, 2, 3) } else { PACK_INPUT }
@@ -817,21 +699,35 @@ fn flat_pack_crosses_an_if_join() {
 fn flat_pack_crosses_a_switch_join() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let (mut mir, pack) = pack_join_mir(name);
-
-	let case_zero = arm(&mut mir.functions[0], pack_literal(pack, (1, 2, 3)));
-	let case_one = arm(&mut mir.functions[0], local(0, pack));
-	let case_two = arm(&mut mir.functions[0], pack_literal(pack, (4, 5, 6)));
-	let default = arm(&mut mir.functions[0], local(0, pack));
-	let value = mir::Expression {
-		kind: mir::ExprKind::Switch {
-			selector: Box::new(local(1, mir::ValueType::I32)),
-			cases: Box::new([(0, case_zero), (1, case_one), (2, case_two)]),
-			default: Some(Box::new(default)),
-		},
-		ty: pack,
-	};
-	mir.functions[0].block = block(0, pack, Box::new([value]));
+	let mir = pack_join_mir(name, |f, pack| {
+		let selector = f.local(1, mir::ValueType::I32);
+		let case_zero = pack_literal(f, pack, (1, 2, 3));
+		let case_one = f.local(0, pack);
+		let case_two = pack_literal(f, pack, (4, 5, 6));
+		let default = f.local(0, pack);
+		let cases = f.body.push_cases([
+			mir::Case {
+				value: 0,
+				body: case_zero,
+			},
+			mir::Case {
+				value: 1,
+				body: case_one,
+			},
+			mir::Case {
+				value: 2,
+				body: case_two,
+			},
+		]);
+		f.push(
+			mir::ExprKind::Switch {
+				selector,
+				cases,
+				default: Some(default),
+			},
+			pack,
+		)
+	});
 
 	assert_pack_join(&mir, &interner, |n| match n {
 		0 => (1, 2, 3),
@@ -851,87 +747,63 @@ fn flat_pack_crosses_a_switch_join() {
 fn flat_pack_crosses_a_loop_join() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let (mut mir, pack) = pack_join_mir(name);
-	let unit = mir::ValueType::Unit;
-	let function = &mut mir.functions[0];
+	let mir = pack_join_mir(name, |f, pack| {
+		let unit = mir::ValueType::Unit;
+		let i32_ty = mir::ValueType::I32;
+		let label = f.label();
 
-	let loop_scope = push_scope(function, mir::BlockKind::Loop, unit);
+		// `if n == 0 { break }`
+		let n = f.local(1, i32_ty);
+		let is_zero = f.push(
+			mir::ExprKind::Unary {
+				op: mir::UnaryOp::Eqz,
+				value: n,
+			},
+			mir::ValueType::Bool,
+		);
+		let leave = f.push(
+			mir::ExprKind::Break { label, value: None },
+			mir::ValueType::Never,
+		);
+		let break_when_zero = f.if_else(is_zero, leave, None, unit);
 
-	// `if n == 0 { break }`
-	let break_when_zero = mir::Expression {
-		kind: mir::ExprKind::IfElse {
-			condition: Box::new(mir::Expression {
-				kind: mir::ExprKind::Eqz {
-					value: Box::new(local(1, mir::ValueType::I32)),
-				},
-				ty: mir::ValueType::Bool,
-			}),
-			then_block: Box::new(arm(
-				function,
-				mir::Expression {
-					kind: mir::ExprKind::Break {
-						scope_index: loop_scope,
-						value: None,
-					},
-					ty: mir::ValueType::Never,
-				},
-			)),
-			else_block: None,
-		},
-		ty: unit,
-	};
+		// `pack.0 += 1`
+		let first = f.push(
+			mir::ExprKind::AggregateGet {
+				local: mir::LocalIndex::new(0),
+				range: mir::ScalarRange::new(0, 1),
+			},
+			i32_ty,
+		);
+		let one = f.int(1, i32_ty);
+		let bumped = f.binary(mir::BinaryOp::Add, first, one, i32_ty);
+		let bump_first_scalar = f.push(
+			mir::ExprKind::AggregateSet {
+				local: mir::LocalIndex::new(0),
+				range: mir::ScalarRange::new(0, 1),
+				value: bumped,
+			},
+			unit,
+		);
 
-	// `pack.0 += 1`
-	let bump_first_scalar = mir::Expression {
-		kind: mir::ExprKind::AggregateSet {
-			local_index: mir::LocalIndex::new(0),
-			range: mir::ScalarRange::new(0, 1),
-			value: Box::new(mir::Expression {
-				kind: mir::ExprKind::Add {
-					left: Box::new(mir::Expression {
-						kind: mir::ExprKind::AggregateGet {
-							local_index: mir::LocalIndex::new(0),
-							range: mir::ScalarRange::new(0, 1),
-						},
-						ty: mir::ValueType::I32,
-					}),
-					right: Box::new(int(1, mir::ValueType::I32)),
-				},
-				ty: mir::ValueType::I32,
-			}),
-		},
-		ty: unit,
-	};
+		// `n -= 1`
+		let n = f.local(1, i32_ty);
+		let one = f.int(1, i32_ty);
+		let decremented = f.binary(mir::BinaryOp::Sub, n, one, i32_ty);
+		let decrement_n = f.push(
+			mir::ExprKind::LocalSet {
+				local: mir::LocalIndex::new(1),
+				value: decremented,
+			},
+			unit,
+		);
 
-	// `n -= 1`
-	let decrement_n = mir::Expression {
-		kind: mir::ExprKind::LocalSet {
-			local_index: mir::LocalIndex::new(1),
-			value: Box::new(mir::Expression {
-				kind: mir::ExprKind::Sub {
-					left: Box::new(local(1, mir::ValueType::I32)),
-					right: Box::new(int(1, mir::ValueType::I32)),
-				},
-				ty: mir::ValueType::I32,
-			}),
-		},
-		ty: unit,
-	};
-
-	let body = block(
-		u32::from(loop_scope),
-		unit,
-		Box::new([break_when_zero, bump_first_scalar, decrement_n]),
-	);
-	let loop_expression = mir::Expression {
-		kind: mir::ExprKind::Loop {
-			scope_index: loop_scope,
-			block: Box::new(body),
-		},
-		ty: unit,
-	};
-	mir.functions[0].block =
-		block(0, pack, Box::new([loop_expression, local(0, pack)]));
+		let body =
+			f.sequence([break_when_zero, bump_first_scalar, decrement_n], unit);
+		let looped = f.push(mir::ExprKind::Loop { label, body }, unit);
+		let result = f.local(0, pack);
+		f.sequence([looped, result], pack)
+	});
 
 	assert_pack_join(&mir, &interner, |n| {
 		(PACK_INPUT.0 + n, PACK_INPUT.1, PACK_INPUT.2)
@@ -939,8 +811,8 @@ fn flat_pack_crosses_a_loop_join() {
 }
 
 /// ```text
-/// {
-///     if n != 0 { break pack; }
+/// block :l {
+///     if n != 0 { break :l pack; }
 ///     (1, 2, 3)
 /// }
 /// ```
@@ -951,34 +823,23 @@ fn flat_pack_crosses_a_loop_join() {
 fn flat_pack_crosses_a_block_join() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let (mut mir, pack) = pack_join_mir(name);
-	let function = &mut mir.functions[0];
-
-	let block_scope = push_scope(function, mir::BlockKind::Block, pack);
-	let break_value = arm(
-		function,
-		mir::Expression {
-			kind: mir::ExprKind::Break {
-				scope_index: block_scope,
-				value: Some(Box::new(local(0, pack))),
+	let mir = pack_join_mir(name, |f, pack| {
+		let label = f.label();
+		let condition = f.local(1, mir::ValueType::I32);
+		let value = f.local(0, pack);
+		let leave = f.push(
+			mir::ExprKind::Break {
+				label,
+				value: Some(value),
 			},
-			ty: mir::ValueType::Never,
-		},
-	);
-	let break_if_nonzero = mir::Expression {
-		kind: mir::ExprKind::IfElse {
-			condition: Box::new(local(1, mir::ValueType::I32)),
-			then_block: Box::new(break_value),
-			else_block: None,
-		},
-		ty: mir::ValueType::Unit,
-	};
-	let value = block(
-		u32::from(block_scope),
-		pack,
-		Box::new([break_if_nonzero, pack_literal(pack, (1, 2, 3))]),
-	);
-	mir.functions[0].block = block(0, pack, Box::new([value]));
+			mir::ValueType::Never,
+		);
+		let break_if_nonzero =
+			f.if_else(condition, leave, None, mir::ValueType::Unit);
+		let fallthrough = pack_literal(f, pack, (1, 2, 3));
+		let statements = f.body.push_list([break_if_nonzero, fallthrough]);
+		f.push(mir::ExprKind::Block { label, statements }, pack)
+	});
 
 	assert_pack_join(&mir, &interner, |n| {
 		if n == 0 { (1, 2, 3) } else { PACK_INPUT }
@@ -993,41 +854,16 @@ fn flat_pack_crosses_a_block_join() {
 fn a_diverging_function_body_is_terminated_for_wasm() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let mut mir = scalar_add(name);
-	let i32_ty = mir::ValueType::I32;
-	let then_block = arm(
-		&mut mir.functions[0],
-		mir::Expression {
-			kind: mir::ExprKind::Return {
-				value: Some(Box::new(int(1, i32_ty))),
-			},
-			ty: mir::ValueType::Never,
-		},
-	);
-	let else_block = arm(
-		&mut mir.functions[0],
-		mir::Expression {
-			kind: mir::ExprKind::Return {
-				value: Some(Box::new(int(2, i32_ty))),
-			},
-			ty: mir::ValueType::Never,
-		},
-	);
-	let body = mir::Expression {
-		kind: mir::ExprKind::IfElse {
-			condition: Box::new(int(1, mir::ValueType::Bool)),
-			then_block: Box::new(then_block),
-			else_block: Some(Box::new(else_block)),
-		},
-		ty: mir::ValueType::Never,
-	};
-	mir.functions[0].block = block(0, mir::ValueType::Never, Box::new([body]));
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a body that returns from every branch must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let mir = scalar_function(name, |f| {
+		let i32_ty = mir::ValueType::I32;
+		let condition = f.int(1, mir::ValueType::Bool);
+		let one = f.int(1, i32_ty);
+		let then = f.ret(one);
+		let two = f.int(2, i32_ty);
+		let otherwise = f.ret(two);
+		f.if_else(condition, then, Some(otherwise), mir::ValueType::Never)
+	});
+	let (mut store, instance) = run(&mir, &interner);
 	let run = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
 		.unwrap();
@@ -1041,54 +877,25 @@ fn a_diverging_function_body_is_terminated_for_wasm() {
 fn a_never_branch_in_a_value_if_is_terminated_for_wasm() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let mut mir = scalar_add(name);
-	let i32_ty = mir::ValueType::I32;
+	let mir = scalar_function(name, |f| {
+		let i32_ty = mir::ValueType::I32;
+		let inner_condition = f.local(0, i32_ty);
+		let one = f.int(1, i32_ty);
+		let inner_then = f.ret(one);
+		let two = f.int(2, i32_ty);
+		let inner_else = f.ret(two);
+		let inner = f.if_else(
+			inner_condition,
+			inner_then,
+			Some(inner_else),
+			mir::ValueType::Never,
+		);
+		let condition = f.local(0, i32_ty);
+		let three = f.int(3, i32_ty);
+		f.if_else(condition, inner, Some(three), i32_ty)
+	});
 
-	let inner_then = arm(
-		&mut mir.functions[0],
-		mir::Expression {
-			kind: mir::ExprKind::Return {
-				value: Some(Box::new(int(1, i32_ty))),
-			},
-			ty: mir::ValueType::Never,
-		},
-	);
-	let inner_else = arm(
-		&mut mir.functions[0],
-		mir::Expression {
-			kind: mir::ExprKind::Return {
-				value: Some(Box::new(int(2, i32_ty))),
-			},
-			ty: mir::ValueType::Never,
-		},
-	);
-	let inner = mir::Expression {
-		kind: mir::ExprKind::IfElse {
-			condition: Box::new(local(0, i32_ty)),
-			then_block: Box::new(inner_then),
-			else_block: Some(Box::new(inner_else)),
-		},
-		ty: mir::ValueType::Never,
-	};
-
-	let then_block = arm(&mut mir.functions[0], inner);
-	let else_block = arm(&mut mir.functions[0], int(3, i32_ty));
-	let body = mir::Expression {
-		kind: mir::ExprKind::IfElse {
-			condition: Box::new(local(0, i32_ty)),
-			then_block: Box::new(then_block),
-			else_block: Some(Box::new(else_block)),
-		},
-		ty: i32_ty,
-	};
-	mir.functions[0].block = block(0, i32_ty, Box::new([body]));
-
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a never branch in a value if must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(&mir, &interner);
 	let run = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
 		.unwrap();
@@ -1104,43 +911,22 @@ fn a_never_branch_in_a_value_if_is_terminated_for_wasm() {
 fn a_diverging_operand_makes_a_binary_unreachable() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let i32_ty = mir::ValueType::I32;
-	let unreachable = || mir::Expression {
-		kind: mir::ExprKind::Unreachable,
-		ty: mir::ValueType::Never,
-	};
 
 	for left_diverges in [true, false] {
-		let mut mir = scalar_add(name);
-		let left = if left_diverges {
-			unreachable()
-		} else {
-			int(1, i32_ty)
-		};
-		let right = if left_diverges {
-			int(1, i32_ty)
-		} else {
-			unreachable()
-		};
-		mir.functions[0].block = block(
-			0,
-			mir::ValueType::Never,
-			Box::new([mir::Expression {
-				kind: mir::ExprKind::Add {
-					left: Box::new(left),
-					right: Box::new(right),
-				},
-				ty: i32_ty,
-			}]),
-		);
+		let mir = scalar_function(name, |f| {
+			let i32_ty = mir::ValueType::I32;
+			let (lhs, rhs) = if left_diverges {
+				let lhs = f.unreachable();
+				(lhs, f.int(1, i32_ty))
+			} else {
+				let lhs = f.int(1, i32_ty);
+				(lhs, f.unreachable())
+			};
+			let sum = f.binary(mir::BinaryOp::Add, lhs, rhs, i32_ty);
+			f.sequence([sum], mir::ValueType::Never)
+		});
 
-		let module = crate::codegen::Builder::build(&mir, &interner)
-			.expect("a diverging binary operand must lower");
-		let bytes = module.encode();
-		let (engine, module) = instantiate(&bytes);
-		let mut store = wasmtime::Store::new(&engine, ());
-		let instance =
-			wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+		let (mut store, instance) = run(&mir, &interner);
 		let run = instance
 			.get_typed_func::<(i32, i32), i32>(&mut store, "run")
 			.unwrap();
@@ -1157,30 +943,15 @@ fn a_diverging_operand_makes_a_binary_unreachable() {
 fn a_diverging_if_condition_never_enters_a_branch() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let mut mir = scalar_add(name);
-	let i32_ty = mir::ValueType::I32;
+	let mir = scalar_function(name, |f| {
+		let i32_ty = mir::ValueType::I32;
+		let condition = f.unreachable();
+		let then = f.int(1, i32_ty);
+		let otherwise = f.int(2, i32_ty);
+		f.if_else(condition, then, Some(otherwise), i32_ty)
+	});
 
-	let then_block = arm(&mut mir.functions[0], int(1, i32_ty));
-	let else_block = arm(&mut mir.functions[0], int(2, i32_ty));
-	let body = mir::Expression {
-		kind: mir::ExprKind::IfElse {
-			condition: Box::new(mir::Expression {
-				kind: mir::ExprKind::Unreachable,
-				ty: mir::ValueType::Never,
-			}),
-			then_block: Box::new(then_block),
-			else_block: Some(Box::new(else_block)),
-		},
-		ty: i32_ty,
-	};
-	mir.functions[0].block = block(0, i32_ty, Box::new([body]));
-
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a diverging condition must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(&mir, &interner);
 	let run = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
 		.unwrap();
@@ -1193,41 +964,21 @@ fn a_diverging_if_condition_never_enters_a_branch() {
 fn a_diverging_break_value_does_not_break() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
-	let mut mir = scalar_add(name);
-	let unit = mir::ValueType::Unit;
-	let function = &mut mir.functions[0];
-
-	let loop_scope = push_scope(function, mir::BlockKind::Loop, unit);
-	let body = block(
-		u32::from(loop_scope),
-		mir::ValueType::Never,
-		Box::new([mir::Expression {
-			kind: mir::ExprKind::Break {
-				scope_index: loop_scope,
-				value: Some(Box::new(mir::Expression {
-					kind: mir::ExprKind::Unreachable,
-					ty: mir::ValueType::Never,
-				})),
+	let mir = scalar_function(name, |f| {
+		let label = f.label();
+		let value = f.unreachable();
+		let leave = f.push(
+			mir::ExprKind::Break {
+				label,
+				value: Some(value),
 			},
-			ty: mir::ValueType::Never,
-		}]),
-	);
-	let loop_expression = mir::Expression {
-		kind: mir::ExprKind::Loop {
-			scope_index: loop_scope,
-			block: Box::new(body),
-		},
-		ty: mir::ValueType::Never,
-	};
-	mir.functions[0].block =
-		block(0, mir::ValueType::Never, Box::new([loop_expression]));
+			mir::ValueType::Never,
+		);
+		let body = f.sequence([leave], mir::ValueType::Never);
+		f.push(mir::ExprKind::Loop { label, body }, mir::ValueType::Never)
+	});
 
-	let module = crate::codegen::Builder::build(&mir, &interner)
-		.expect("a diverging break value must lower");
-	let bytes = module.encode();
-	let (engine, module) = instantiate(&bytes);
-	let mut store = wasmtime::Store::new(&engine, ());
-	let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+	let (mut store, instance) = run(&mir, &interner);
 	let run = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
 		.unwrap();

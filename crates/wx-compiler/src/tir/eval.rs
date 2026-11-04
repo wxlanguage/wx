@@ -37,7 +37,9 @@ use string_interner::symbol::SymbolU32;
 use super::body::{
 	Body, ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange,
 };
-use super::defs::{ConstIdx, EnumIdx, MemberKind, MemberOwner, MemoryIdx};
+use super::defs::{
+	ConstIdx, EnumIdx, GlobalIdx, MemberKind, MemberOwner, MemoryIdx,
+};
 use super::layout::Primitive;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::operators::Scalar;
@@ -217,11 +219,19 @@ impl Instance {
 	}
 }
 
-/// The constant whose body is evaluated, with its instance's arguments.
+/// The body evaluated, with its instance's arguments.
 #[derive(Clone, Copy)]
 struct Owner<'a> {
-	constant: ConstIdx,
+	body: Evaluated,
 	args: &'a [TypeIndex],
+}
+
+/// Whose body is evaluated: a constant's, or a global's initializer, which
+/// must be a constant expression and has no parameters.
+#[derive(Clone, Copy)]
+enum Evaluated {
+	Constant(ConstIdx),
+	Global(GlobalIdx),
 }
 
 /// What a constant named with arguments reads.
@@ -234,23 +244,48 @@ pub(super) enum ResolvedConstant {
 	Abstract,
 }
 
-/// The checked body of a constant, as built.
+/// The checked body `owner` evaluates, as built.
 fn body_of<'a>(
 	view: &'a TypeContext<'_, '_, '_>,
-	const_index: ConstIdx,
+	owner: Owner<'_>,
 ) -> &'a Body {
-	match &view.const_bodies[usize::from(const_index)] {
-		ConstBody::Built(body) => &body,
-		_ => unreachable!("an evaluated constant's body is built"),
+	match owner.body {
+		Evaluated::Constant(const_index) => {
+			match &view.const_bodies[usize::from(const_index)] {
+				ConstBody::Built(body) => body,
+				_ => unreachable!("an evaluated constant's body is built"),
+			}
+		}
+		Evaluated::Global(global_index) => view.global_bodies
+			[usize::from(global_index)]
+		.as_ref()
+		.expect("an evaluated global's body is built"),
 	}
 }
 
-/// The type scope a constant's body is checked in.
-fn body_env(
+/// The type scope `owner`'s body is checked in: a global's is the root.
+fn body_env(view: &TypeContext<'_, '_, '_>, owner: Owner<'_>) -> TypeEnvIdx {
+	match owner.body {
+		Evaluated::Constant(const_index) => {
+			view.constants[usize::from(const_index)].env
+		}
+		Evaluated::Global(_) => TypeEnvIdx::ROOT,
+	}
+}
+
+/// The file `owner`'s body is written in.
+fn body_file(
 	view: &TypeContext<'_, '_, '_>,
-	const_index: ConstIdx,
-) -> TypeEnvIdx {
-	view.constants[usize::from(const_index)].env
+	owner: Owner<'_>,
+) -> crate::vfs::FileId {
+	match owner.body {
+		Evaluated::Constant(const_index) => {
+			view.defs.constants[usize::from(const_index)].file_id
+		}
+		Evaluated::Global(global_index) => {
+			view.defs.globals[usize::from(global_index)].file_id
+		}
+	}
 }
 
 impl TypeContext<'_, '_, '_> {
@@ -277,6 +312,73 @@ impl TypeContext<'_, '_, '_> {
 			_ => return,
 		};
 		self.diagnostics.push(diagnostic);
+	}
+
+	/// Evaluates a global's initializer, which must be a constant
+	/// expression, into `global_values`, and reports a failure. Called once
+	/// its body is checked without an error. A global reads no other global
+	/// (reading one is a call of `Global::get`, which is not constant), so
+	/// no loop can pass through it and it needs no frame of its own.
+	pub(super) fn evaluate_global(&mut self, global_index: GlobalIdx) {
+		let owner = Owner {
+			body: Evaluated::Global(global_index),
+			args: &[],
+		};
+		let root = body_of(self, owner).root();
+		let ty = self.global_value_type(global_index);
+		let mut scalars = Vec::new();
+		// A value type of other than one Wasm value is reported by the type's
+		// check (`Global::Value`'s bounds).
+		if self
+			.push_scalars(TypeEnvIdx::ROOT, ty, &mut scalars, &mut Vec::new())
+			.is_err() || scalars.len() != 1
+		{
+			return;
+		}
+		let mut stack = Vec::new();
+		match self.eval(owner, root, &mut stack) {
+			Ok(()) if stack.iter().map(|value| value.scalar).eq(scalars) => {
+				self.global_values[usize::from(global_index)] =
+					Some(stack.into_boxed_slice());
+			}
+			Ok(()) | Err(Halt::Silent) => {}
+			Err(Halt::Own(error)) => {
+				let diagnostic =
+					self.report_global_failure(global_index, &error);
+				self.diagnostics.push(diagnostic);
+			}
+		}
+	}
+
+	fn report_global_failure(
+		&self,
+		global_index: GlobalIdx,
+		error: &EvalError,
+	) -> Diagnostic<crate::vfs::FileId> {
+		let def = &self.defs.globals[usize::from(global_index)];
+		let name = self.strings.resolve(def.name.inner).unwrap_or("?");
+		let site = SourceSpan::new(def.file_id, error.span);
+		let (code, message) = match error.kind {
+			EvalErrorKind::NotConst => (
+				DiagnosticCode::NonConstantGlobalInitializer,
+				format!(
+					"the initializer of global `{name}` cannot be evaluated \
+					 at compile time"
+				),
+			),
+			_ => (
+				error.kind.code(),
+				format!("evaluation of global `{name}` failed"),
+			),
+		};
+		Diagnostic::error()
+			.with_code(code.code())
+			.with_message(message)
+			.with_label(site.primary_label().with_message(error.kind.label()))
+			.with_note(
+				"a global's initializer is evaluated at compile time; the \
+				 module holds its value",
+			)
 	}
 
 	/// Checks a constant's body: decides what building it recorded, reading
@@ -534,7 +636,7 @@ impl TypeContext<'_, '_, '_> {
 	/// constant with parameters is evaluated once its constant is checked,
 	/// with its arguments substituted, and its failure is reported by the
 	/// reader that first asks for it, `used_at`.
-	fn instance_value(
+	pub(super) fn instance_value(
 		&mut self,
 		instance: Instance,
 		used_at: Option<SourceSpan>,
@@ -602,10 +704,10 @@ impl TypeContext<'_, '_, '_> {
 		});
 		let args: Box<[TypeIndex]> = self.types.list(instance.args).into();
 		let owner = Owner {
-			constant: const_index,
+			body: Evaluated::Constant(const_index),
 			args: &args,
 		};
-		let scalars = self.constant_scalars(owner);
+		let scalars = self.constant_scalars(const_index, owner);
 		let mut stack = Vec::new();
 		let evaluated = match &scalars {
 			Ok(_) => self.eval(owner, root, &mut stack),
@@ -692,7 +794,7 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<(), Halt> {
 		let ElementOrder::Permuted { .. } = order else {
 			for at in 0..elements.len() {
-				let arg = body_of(self, owner.constant).args(elements)[at];
+				let arg = body_of(self, owner).args(elements)[at];
 				self.eval(owner, arg, stack)?;
 			}
 			return Ok(());
@@ -700,7 +802,7 @@ impl TypeContext<'_, '_, '_> {
 		let start = stack.len();
 		let mut declared = Vec::with_capacity(elements.len());
 		for at in 0..elements.len() {
-			let body = body_of(self, owner.constant);
+			let body = body_of(self, owner);
 			let (arg, index) =
 				(body.args(elements)[at], body.declared_index(order, at));
 			let arg_start = stack.len();
@@ -727,7 +829,7 @@ impl TypeContext<'_, '_, '_> {
 		expr: ExprIdx,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let body = body_of(self, owner.constant);
+		let body = body_of(self, owner);
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
 		let ty = self.instance_type(owner, ty);
@@ -790,8 +892,7 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::Array { elements } => {
 				let start = stack.len();
 				for at in 0..elements.len() {
-					let element =
-						body_of(self, owner.constant).args(elements)[at];
+					let element = body_of(self, owner).args(elements)[at];
 					self.eval(owner, element, stack)?;
 				}
 				let count = u64::try_from(elements.len()).unwrap();
@@ -855,7 +956,7 @@ impl TypeContext<'_, '_, '_> {
 				op: UnaryOp::InvertSign,
 				operand,
 			} if let ExprKind::Int(value) =
-				body_of(self, owner.constant).kind(operand)
+				body_of(self, owner).kind(operand)
 				&& let Some(scalar) = Scalar::from_type(ty) =>
 			{
 				stack.push(
@@ -947,7 +1048,7 @@ impl TypeContext<'_, '_, '_> {
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
 		let (layout, places) =
-			match self.memory_values(body_env(self, owner.constant), of) {
+			match self.memory_values(body_env(self, owner), of) {
 				Ok(Some(layout)) => layout,
 				Ok(None) => {
 					return Err(Halt::Own(EvalError {
@@ -1005,7 +1106,7 @@ impl TypeContext<'_, '_, '_> {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Scalar), Halt> {
-		let scope = body_env(self, owner.constant);
+		let scope = body_env(self, owner);
 		let (Type::Slice { memory, .. } | Type::Array { memory, .. }) =
 			*self.types.resolve(ty)
 		else {
@@ -1058,7 +1159,7 @@ impl TypeContext<'_, '_, '_> {
 		owner: Owner<'_>,
 		length: TypeIndex,
 	) -> Result<u64, Halt> {
-		let env = body_env(self, owner.constant);
+		let env = body_env(self, owner);
 		match self.normalize(
 			env,
 			length,
@@ -1078,7 +1179,7 @@ impl TypeContext<'_, '_, '_> {
 		if owner.args.is_empty() {
 			return ty;
 		}
-		let env = body_env(self, owner.constant);
+		let env = body_env(self, owner);
 		let ty = self.types.substitute(
 			ty,
 			Substitution {
@@ -1187,9 +1288,7 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<(), Halt> {
 		match self.resolve_constant(constant, args) {
 			Ok(ResolvedConstant::Instance(instance)) => {
-				let file_id =
-					self.defs.constants[usize::from(owner.constant)].file_id;
-				let used_at = SourceSpan::new(file_id, span);
+				let used_at = SourceSpan::new(body_file(self, owner), span);
 				self.read_constant(instance, Some(used_at), span, stack)
 			}
 			Ok(ResolvedConstant::Length(length)) => {
@@ -1238,9 +1337,10 @@ impl TypeContext<'_, '_, '_> {
 	/// holds no values of.
 	fn constant_scalars(
 		&mut self,
+		const_index: ConstIdx,
 		owner: Owner<'_>,
 	) -> Result<Vec<Scalar>, ConstValueState> {
-		let signature = &self.constants[usize::from(owner.constant)];
+		let signature = &self.constants[usize::from(const_index)];
 		let (ty, scope) = (signature.ty, signature.env);
 		let ty = self.instance_type(owner, ty);
 		let mut scalars = Vec::new();

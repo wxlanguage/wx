@@ -1,28 +1,25 @@
-use crate::mir::{self, ExprKind};
+use crate::mir::{
+	self, BinaryOp, CompareOp, ExprId, ExprKind, ExprList, UnaryOp,
+};
 use crate::opt::{
 	Block, BlockIndex, BlockKind, ControlNode, DataNodeIndex, DataNodeKind,
 	Function, JoinData, MemAccess, NodeType, ScalarType, StackResult,
 	SwitchCase,
 };
 
+/// The opt block of the function's own body. A MIR label `l` is block
+/// `l + 1`; blocks past the labels are synthetic.
+const BODY_BLOCK: BlockIndex = 0;
+
 pub struct Builder<'mir> {
 	mir: &'mir mir::MIR,
-	/// The specific MIR function being lowered (stored to avoid indexing into
-	/// `mir.functions` by index, which would be wrong for non-first functions).
-	mir_func: &'mir mir::Function,
+	/// The MIR function being lowered, and its code.
+	id: mir::FunctionId,
+	mir_func: &'mir mir::Code,
 	func: Function,
-	/// For each MIR scope index, whether some `Break` anywhere in the
-	/// function targets it — computed once, up front, by
-	/// `collect_break_targets`. Lets `build_block_expr` skip registering a
-	/// real `Block`/`JoinData` for the overwhelming majority of plain
-	/// `{}` blocks that are never a break target, keeping that case exactly
-	/// as cheap as it is today. A loop scope is always its own real `Block`
-	/// regardless of this (see `build_loop`), so this only matters for
-	/// plain blocks.
-	break_targets: Box<[bool]>,
 }
 
-/// One `match` arm as built so far: its own scope/bindings plus what it
+/// One `match` arm as built so far: its own block/bindings plus what it
 /// contributed to (parent-binding index, or the arm's own result if
 /// `slot == parent_len` — see `Builder::build_switch`).
 struct SwitchArmBuild {
@@ -40,30 +37,44 @@ enum PerArmSlot {
 	NoValue(StackResult),
 }
 
+/// The opt block a MIR label names.
+fn label_block(label: mir::LabelId) -> BlockIndex {
+	u32::from(label) + 1
+}
+
 impl<'mir> Builder<'mir> {
-	/// Lower one MIR function into a sea-of-nodes `Function`.
-	pub fn build(
-		mir: &'mir mir::MIR,
-		mir_func: &'mir mir::Function,
-	) -> Function {
-		let mut break_targets = vec![false; mir_func.scopes.len()];
-		collect_break_targets(&mir_func.block, &mut break_targets);
+	/// Lower MIR function `id` into a sea-of-nodes `Function`.
+	pub fn build(mir: &'mir mir::MIR, id: mir::FunctionId) -> Function {
+		let mir_func = mir.code(id);
 		let mut b = Builder {
 			mir,
+			id,
 			mir_func,
-			func: Function::new(mir_func.id, mir_func.scopes.len()),
-			break_targets: break_targets.into_boxed_slice(),
+			func: Function::new(id, mir_func.label_count as usize + 1),
 		};
 		b.build_function();
 		b.func
 	}
 
+	fn body(&self) -> &'mir mir::Body {
+		&self.mir_func.body
+	}
+
+	fn kind(&self, expr: ExprId) -> ExprKind {
+		self.mir_func.body.kind(expr)
+	}
+
+	fn ty(&self, expr: ExprId) -> mir::ValueType {
+		self.mir_func.body.ty(expr)
+	}
+
 	fn build_function(&mut self) {
 		let mir_func = self.mir_func;
-		let sig = &self.mir.signatures[usize::from(mir_func.signature_index)];
+		let sig = &self.mir.signatures
+			[usize::from(self.mir.function(self.id).signature_index)];
 
 		// Seed data_bindings for the whole function at once — locals are
-		// flat and function-wide (`mir::Function::locals`), so every local's
+		// flat and function-wide (`mir::Code::locals`), so every local's
 		// index is already its final position here. Params are genuinely
 		// available from function entry, so they're seeded `Some`; every
 		// other local starts `None` ("not yet declared on this build path")
@@ -72,23 +83,19 @@ impl<'mir> Builder<'mir> {
 		let mut data_bindings: Vec<Option<StackResult>> =
 			vec![None; mir_func.locals.len()];
 
-		let params_count = sig.params_count;
 		// `wasm_idx` tracks the flattened WASM local index: an aggregate param
-		// occupies one slot per *scalar* it contains (see `mir::ScalarTable`,
-		// which counts through nested aggregates and skips zero-sized fields),
-		// a scalar param one slot each. Params are always the first
-		// `params_count` entries of `mir_func.locals` — scope 0 (the root) is
-		// always flattened first by construction, and TIR itself lists a
-		// scope's params before its other locals.
+		// occupies one slot per *scalar* it contains, a scalar param one slot
+		// each. Params are always the first `params_count` locals.
 		let mut wasm_idx = 0u32;
-		for (i, local) in mir_func.locals[..params_count].iter().enumerate() {
+		for (i, local) in mir_func.locals[..sig.params_count].iter().enumerate()
+		{
 			// A zero-sized param (e.g. a `Memory`-typed handle) occupies no
 			// WASM param slot — see the matching case in `build_call`.
 			data_bindings[i] =
 				Some(self.build_param_value(local.ty, &mut wasm_idx));
 		}
 
-		self.func.blocks[0] = Some(Block {
+		self.func.blocks[BODY_BLOCK as usize] = Some(Block {
 			parent: None,
 			statements: Vec::new(),
 			result: StackResult::Never,
@@ -96,45 +103,35 @@ impl<'mir> Builder<'mir> {
 			join: None,
 		});
 
-		let body_exprs = match &mir_func.block.kind {
-			ExprKind::Block { expressions, .. } => expressions,
-			_ => unreachable!("function body must be a Block"),
-		};
-
-		// MIR uses an implicit return: the last expression's value is returned
-		// without an explicit `return` keyword. Capture it and emit a Return node.
-		let mut last = StackResult::Unit;
-		for expr in body_exprs.iter() {
-			last = self.build_expr(0, &mut data_bindings, expr);
-			if last == StackResult::Never {
-				break;
-			}
-		}
-
+		// The body's value is returned implicitly.
+		let last = self.build_in(BODY_BLOCK, &mut data_bindings, mir_func.root);
 		if last != StackResult::Never {
-			let fn_result = self.func.blocks[0].as_ref().unwrap().result;
+			let fn_result = self.func.blocks[BODY_BLOCK as usize]
+				.as_ref()
+				.unwrap()
+				.result;
 			let merged = self.merge_stack_results(fn_result, last);
-			self.func.blocks[0].as_mut().unwrap().result = merged;
-			self.push_stmt(0, ControlNode::Return { value: last });
+			self.func.blocks[BODY_BLOCK as usize]
+				.as_mut()
+				.unwrap()
+				.result = merged;
+			self.push_stmt(BODY_BLOCK, ControlNode::Return { value: last });
 		} else {
 			// The body never falls through, but Wasm does not treat the end
 			// of a nested `if` or a call to a `!` function as terminating the
 			// enclosing function. Close the body with an explicit
 			// `unreachable`; it is dead code when the last statement already
 			// returned or branched.
-			self.push_stmt(0, ControlNode::Unreachable);
+			self.push_stmt(BODY_BLOCK, ControlNode::Unreachable);
 		}
 	}
 
 	/// Build the value node for a function parameter of type `ty`, consuming
 	/// one flattened WASM param slot per *scalar* it contains (`*wasm_idx`
 	/// tracks the next free slot across the whole call). A scalar parameter is
-	/// just one `Param` node; an aggregate parameter — possibly nested — is
-	/// passed as a flattened run of scalar WASM params (mirroring how
-	/// `wasm::flatten_type_to_scalars`/signature flattening lays out a call
-	/// site's arguments), so this recurses to rebuild the matching (possibly
-	/// nested) `Aggregate` literal from them, in the same declaration
-	/// pre-order `mir::ScalarTable` uses. A zero-sized parameter consumes no
+	/// just one `Param` node; an aggregate parameter is passed as a flattened
+	/// run of scalar WASM params, in the same declaration pre-order the
+	/// aggregate's scalars are listed in. A zero-sized parameter consumes no
 	/// slot and comes back as [`StackResult::Unit`].
 	fn build_param_value(
 		&mut self,
@@ -151,7 +148,9 @@ impl<'mir> Builder<'mir> {
 				let values: Box<[_]> = agg
 					.scalars
 					.iter()
-					.map(|&ty| self.build_param_value(ty, wasm_idx).unwrap_value())
+					.map(|&ty| {
+						self.build_param_value(ty, wasm_idx).unwrap_value()
+					})
 					.collect();
 				StackResult::Value(self.node(DataNodeKind::Aggregate {
 					values,
@@ -177,553 +176,307 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		expr: &mir::Expression,
+		expr: ExprId,
 	) -> StackResult {
-		match &expr.kind {
+		let ty = self.ty(expr);
+		match self.kind(expr) {
 			// ── Literals ──────────────────────────────────────────────────
 			ExprKind::Int { value } => {
-				let ty =
-					ScalarType::try_from(expr.ty).expect("Int must be scalar");
+				let scalar =
+					ScalarType::try_from(ty).expect("Int must be scalar");
 				// A boolean is an integer `0`/`1`; the type, not a separate
 				// node, carries that invariant.
 				debug_assert!(
-					expr.ty != mir::ValueType::Bool || matches!(*value, 0 | 1),
+					ty != mir::ValueType::Bool || matches!(value, 0 | 1),
 					"a Bool-typed Int must be 0 or 1"
 				);
 				StackResult::Value(
-					self.node(DataNodeKind::Int { value: *value, ty }),
+					self.node(DataNodeKind::Int { value, ty: scalar }),
 				)
 			}
 			ExprKind::Float { value } => {
-				let ty = ScalarType::try_from(expr.ty)
-					.expect("Float must be scalar");
-				let bits = match ty {
-					ScalarType::F32 => (*value as f32).to_bits() as u64,
+				let scalar =
+					ScalarType::try_from(ty).expect("Float must be scalar");
+				let bits = match scalar {
+					ScalarType::F32 => (value as f32).to_bits() as u64,
 					_ => value.to_bits(),
 				};
-				StackResult::Value(self.node(DataNodeKind::Float { bits, ty }))
+				StackResult::Value(
+					self.node(DataNodeKind::Float { bits, ty: scalar }),
+				)
 			}
 			ExprKind::Noop => StackResult::Unit,
+			ExprKind::Unreachable => {
+				self.push_stmt(block_idx, ControlNode::Unreachable);
+				StackResult::Never
+			}
 
 			// ── Locals ───────────────────────────────────────────────────
-			ExprKind::LocalGet { local_index } => {
-				self.read_binding(bindings, usize::from(*local_index))
+			ExprKind::LocalGet { local } => {
+				self.read_binding(bindings, usize::from(local))
 			}
-			ExprKind::LocalSet { local_index, value } => {
+			ExprKind::LocalSet { local, value } => {
 				let new_val = self.build_expr(block_idx, bindings, value);
 				if new_val == StackResult::Never {
 					return StackResult::Never;
 				}
-				bindings[usize::from(*local_index)] = Some(new_val);
+				bindings[usize::from(local)] = Some(new_val);
 				StackResult::Unit
 			}
 
 			// ── Module-level state ────────────────────────────────────────
 			ExprKind::Global { id } => {
-				let ty =
-					ScalarType::try_from(expr.ty).unwrap_or(ScalarType::I32);
-				let node = self.node(DataNodeKind::GlobalGet { id: *id, ty });
+				let scalar =
+					ScalarType::try_from(ty).unwrap_or(ScalarType::I32);
+				let node =
+					self.node(DataNodeKind::GlobalGet { id, ty: scalar });
 				StackResult::Value(node)
 			}
 			ExprKind::GlobalSet { id, value } => {
-				let Some(val) = self.build_value(block_idx, bindings, value)
+				let Some(value) = self.build_value(block_idx, bindings, value)
 				else {
 					return StackResult::Never;
 				};
-				self.push_stmt(
-					block_idx,
-					ControlNode::GlobalSet {
-						id: *id,
-						value: val,
-					},
-				);
+				self.push_stmt(block_idx, ControlNode::GlobalSet { id, value });
 				StackResult::Unit
 			}
 
 			// ── Constants / refs ─────────────────────────────────────────
-			ExprKind::Function { id } => {
-				let node = self.node(DataNodeKind::FunctionRef { id: *id });
-				StackResult::Value(node)
-			}
 			ExprKind::StaticPointer { data_index } => {
 				let node = self.node(DataNodeKind::StaticDataRef {
-					data_index: *data_index,
-					ty: ScalarType::try_from(expr.ty)
+					data_index,
+					ty: ScalarType::try_from(ty)
 						.expect("static pointer must be scalar"),
 				});
 				StackResult::Value(node)
 			}
 			ExprKind::MemoryOffset { memory } => {
 				let node = self.node(DataNodeKind::MemoryOffset {
-					memory: *memory,
-					ty: ScalarType::try_from(expr.ty)
+					memory,
+					ty: ScalarType::try_from(ty)
 						.expect("memory offset must be scalar"),
 				});
 				StackResult::Value(node)
 			}
 			ExprKind::MemoryIndex { memory } => {
-				let node =
-					self.node(DataNodeKind::MemoryIndex { memory: *memory });
+				let node = self.node(DataNodeKind::MemoryIndex { memory });
 				StackResult::Value(node)
 			}
 			ExprKind::MemorySize { memory } => {
 				let result_node = self.node(DataNodeKind::MemorySizeResult {
-					memory: *memory,
-					ty: ScalarType::try_from(expr.ty)
+					memory,
+					ty: ScalarType::try_from(ty)
 						.expect("memory.size result must be scalar"),
 				});
 				self.push_stmt(
 					block_idx,
 					ControlNode::MemorySize {
-						memory: *memory,
+						memory,
 						result: result_node,
 					},
 				);
 				StackResult::Value(result_node)
 			}
 
-			// ── Binary operators ──────────────────────────────────────────
-			ExprKind::Add { left, right }
-			| ExprKind::Sub { left, right }
-			| ExprKind::Mul { left, right }
-			| ExprKind::Div { left, right }
-			| ExprKind::Rem { left, right }
-			| ExprKind::And { left, right }
-			| ExprKind::Or { left, right }
-			| ExprKind::BitAnd { left, right }
-			| ExprKind::BitOr { left, right }
-			| ExprKind::BitXor { left, right }
-			| ExprKind::LeftShift { left, right }
-			| ExprKind::RightShift { left, right }
-			| ExprKind::Min { left, right }
-			| ExprKind::Max { left, right }
-			| ExprKind::Copysign { left, right } => {
-				self.build_binary(block_idx, bindings, expr, left, right)
-			}
-
-			// ── Comparisons ───────────────────────────────────────────────
-			ExprKind::Eq { left, right }
-			| ExprKind::NotEq { left, right }
-			| ExprKind::Less { left, right }
-			| ExprKind::LessEq { left, right }
-			| ExprKind::Greater { left, right }
-			| ExprKind::GreaterEq { left, right } => {
-				self.build_cmp(block_idx, bindings, expr, left, right)
-			}
-
-			// ── Unary ─────────────────────────────────────────────────────
-			ExprKind::Neg { value } => {
-				let ty =
-					ScalarType::try_from(expr.ty).expect("Neg must be scalar");
+			// ── Operators ─────────────────────────────────────────────────
+			ExprKind::Unary { op, value } => {
 				let Some(operand) =
 					self.build_value(block_idx, bindings, value)
 				else {
 					return StackResult::Never;
 				};
-				StackResult::Value(self.node(DataNodeKind::Neg { operand, ty }))
+				let scalar = ScalarType::try_from(ty)
+					.expect("a unary operator's type is scalar");
+				let kind = match op {
+					UnaryOp::Neg => DataNodeKind::Neg {
+						operand,
+						ty: scalar,
+					},
+					UnaryOp::BitNot => DataNodeKind::BitNot {
+						operand,
+						ty: scalar,
+					},
+					UnaryOp::Eqz => DataNodeKind::Eqz { operand },
+					UnaryOp::Sqrt => DataNodeKind::Sqrt {
+						operand,
+						ty: scalar,
+					},
+					UnaryOp::Abs => DataNodeKind::Abs {
+						operand,
+						ty: scalar,
+					},
+					UnaryOp::Floor => DataNodeKind::Floor {
+						operand,
+						ty: scalar,
+					},
+					UnaryOp::Ceil => DataNodeKind::Ceil {
+						operand,
+						ty: scalar,
+					},
+					UnaryOp::Trunc => DataNodeKind::Trunc {
+						operand,
+						ty: scalar,
+					},
+					UnaryOp::Nearest => DataNodeKind::Nearest {
+						operand,
+						ty: scalar,
+					},
+				};
+				StackResult::Value(self.node(kind))
 			}
-			ExprKind::Sqrt { value } => {
-				let ty =
-					ScalarType::try_from(expr.ty).expect("Sqrt must be scalar");
+			ExprKind::Binary { op, lhs, rhs } => {
+				self.build_binary(block_idx, bindings, ty, op, lhs, rhs)
+			}
+			ExprKind::Compare { op, lhs, rhs } => {
+				self.build_cmp(block_idx, bindings, op, lhs, rhs)
+			}
+			ExprKind::Convert { value } => {
+				let from = self.ty(value);
 				let Some(operand) =
 					self.build_value(block_idx, bindings, value)
 				else {
 					return StackResult::Never;
 				};
-				StackResult::Value(
-					self.node(DataNodeKind::Sqrt { operand, ty }),
-				)
+				StackResult::Value(self.node(conversion(from, ty, operand)))
 			}
-			ExprKind::Abs { value } => {
-				let ty =
-					ScalarType::try_from(expr.ty).expect("Abs must be scalar");
+			ExprKind::Reinterpret { value } => {
 				let Some(operand) =
 					self.build_value(block_idx, bindings, value)
 				else {
 					return StackResult::Never;
 				};
-				StackResult::Value(self.node(DataNodeKind::Abs { operand, ty }))
-			}
-			ExprKind::Floor { value } => {
-				let ty = ScalarType::try_from(expr.ty)
-					.expect("Floor must be scalar");
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
+				let kind = match ScalarType::try_from(ty)
+					.expect("a reinterpretation is scalar")
+				{
+					ScalarType::I32 => {
+						DataNodeKind::I32ReinterpretF32 { operand }
+					}
+					ScalarType::F32 => {
+						DataNodeKind::F32ReinterpretI32 { operand }
+					}
+					ScalarType::I64 => {
+						DataNodeKind::I64ReinterpretF64 { operand }
+					}
+					ScalarType::F64 => {
+						DataNodeKind::F64ReinterpretI64 { operand }
+					}
 				};
-				StackResult::Value(
-					self.node(DataNodeKind::Floor { operand, ty }),
-				)
+				StackResult::Value(self.node(kind))
 			}
-			ExprKind::Ceil { value } => {
-				let ty =
-					ScalarType::try_from(expr.ty).expect("Ceil must be scalar");
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
+			// The same Wasm values under another type. A scalar passes
+			// through, and consumers read signedness from the node's type; an
+			// aggregate on either side is taken apart into its slots and
+			// regrouped, since a one-slot aggregate (`Char`) is still a pack
+			// node while the scalar it holds is not.
+			ExprKind::Transmute { value } => {
+				let source = match self.build_expr(block_idx, bindings, value) {
+					StackResult::Value(source) => source,
+					StackResult::Unit => {
+						debug_assert_eq!(ty, mir::ValueType::Unit);
+						return StackResult::Unit;
+					}
+					StackResult::Never => return StackResult::Never,
 				};
-				StackResult::Value(
-					self.node(DataNodeKind::Ceil { operand, ty }),
-				)
-			}
-			ExprKind::Trunc { value } => {
-				let ty = ScalarType::try_from(expr.ty)
-					.expect("Trunc must be scalar");
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
+				let slots = match self.ty(value) {
+					mir::ValueType::Aggregate { aggregate_index } => {
+						let count =
+							self.mir.aggregate(aggregate_index).scalars.len();
+						(0..count as u32)
+							.map(|i| {
+								self.project_scalar(
+									source,
+									mir::ScalarIndex::new(i),
+								)
+							})
+							.collect()
+					}
+					_ => vec![source],
 				};
-				StackResult::Value(
-					self.node(DataNodeKind::Trunc { operand, ty }),
-				)
-			}
-			ExprKind::Nearest { value } => {
-				let ty = ScalarType::try_from(expr.ty)
-					.expect("Nearest must be scalar");
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::Nearest { operand, ty }),
-				)
-			}
-			ExprKind::BitNot { value } => {
-				let ty = ScalarType::try_from(expr.ty)
-					.expect("BitNot must be scalar");
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::BitNot { operand, ty }),
-				)
-			}
-			ExprKind::Eqz { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(self.node(DataNodeKind::Eqz { operand }))
-			}
-			ExprKind::I64ExtendI32S { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I64ExtendI32S { operand }),
-				)
-			}
-			ExprKind::I64ExtendI32U { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I64ExtendI32U { operand }),
-				)
-			}
-			ExprKind::I32WrapI64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I32WrapI64 { operand }),
-				)
-			}
-			ExprKind::F32ConvertI32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F32ConvertI32 { operand }),
-				)
-			}
-			ExprKind::F32ConvertU32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F32ConvertU32 { operand }),
-				)
-			}
-			ExprKind::F32ConvertI64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F32ConvertI64 { operand }),
-				)
-			}
-			ExprKind::F32ConvertU64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F32ConvertU64 { operand }),
-				)
-			}
-			ExprKind::F64ConvertI32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F64ConvertI32 { operand }),
-				)
-			}
-			ExprKind::F64ConvertU32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F64ConvertU32 { operand }),
-				)
-			}
-			ExprKind::F64ConvertI64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F64ConvertI64 { operand }),
-				)
-			}
-			ExprKind::F64ConvertU64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F64ConvertU64 { operand }),
-				)
-			}
-			ExprKind::I32TruncF32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I32TruncF32 { operand }),
-				)
-			}
-			ExprKind::U32TruncF32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::U32TruncF32 { operand }),
-				)
-			}
-			ExprKind::I32TruncF64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I32TruncF64 { operand }),
-				)
-			}
-			ExprKind::U32TruncF64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::U32TruncF64 { operand }),
-				)
-			}
-			ExprKind::I64TruncF32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I64TruncF32 { operand }),
-				)
-			}
-			ExprKind::U64TruncF32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::U64TruncF32 { operand }),
-				)
-			}
-			ExprKind::I64TruncF64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I64TruncF64 { operand }),
-				)
-			}
-			ExprKind::U64TruncF64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::U64TruncF64 { operand }),
-				)
-			}
-			ExprKind::F64PromoteF32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F64PromoteF32 { operand }),
-				)
-			}
-			ExprKind::F32DemoteF64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F32DemoteF64 { operand }),
-				)
-			}
-			ExprKind::I32ReinterpretF32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I32ReinterpretF32 { operand }),
-				)
-			}
-			ExprKind::F32ReinterpretI32 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F32ReinterpretI32 { operand }),
-				)
-			}
-			ExprKind::I64ReinterpretF64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::I64ReinterpretF64 { operand }),
-				)
-			}
-			ExprKind::F64ReinterpretI64 { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				StackResult::Value(
-					self.node(DataNodeKind::F64ReinterpretI64 { operand }),
-				)
+				match ty {
+					mir::ValueType::Aggregate { aggregate_index } => {
+						StackResult::Value(
+							self.aggregate_from_scalars(aggregate_index, slots),
+						)
+					}
+					_ => {
+						assert_eq!(slots.len(), 1, "a scalar is one slot");
+						StackResult::Value(slots[0])
+					}
+				}
 			}
 
 			// ── Aggregates ────────────────────────────────────────────────
 			ExprKind::Aggregate { values } => {
-				let aggregate_index = match expr.ty {
-					mir::ValueType::Aggregate { aggregate_index } => {
-						aggregate_index
-					}
-					_ => {
-						panic!("Aggregate expression must have Aggregate type")
-					}
+				let mir::ValueType::Aggregate { aggregate_index } = ty else {
+					panic!("Aggregate expression must have Aggregate type")
 				};
 				let mut slots = Vec::with_capacity(values.len());
-				for value in values.iter() {
+				for &value in self.body().list(values) {
 					match self.build_expr(block_idx, bindings, value) {
 						StackResult::Value(node) => slots.push(node),
 						StackResult::Never => return StackResult::Never,
-						StackResult::Unit => panic!("a flat pack operand must be scalar"),
+						StackResult::Unit => {
+							panic!("a flat pack operand must be scalar")
+						}
 					}
 				}
-				assert_eq!(slots.len(), self.mir.aggregate(aggregate_index).scalars.len());
+				assert_eq!(
+					slots.len(),
+					self.mir.aggregate(aggregate_index).scalars.len()
+				);
 				let node = self.node(DataNodeKind::Aggregate {
 					values: slots.into_boxed_slice(),
 					aggregate_index,
 				});
 				StackResult::Value(node)
 			}
-			ExprKind::AggregateGet {
-				local_index,
-				range,
-			} => {
-				let idx = usize::from(*local_index);
-				let value = self.read_binding(bindings, idx);
-				if value == StackResult::Never { return value; }
+			ExprKind::AggregateGet { local, range } => {
+				let value = self.read_binding(bindings, usize::from(local));
+				if value == StackResult::Never {
+					return value;
+				}
 				if range.len == 0 {
-					assert_eq!(expr.ty, mir::ValueType::Unit);
+					assert_eq!(ty, mir::ValueType::Unit);
 					return StackResult::Unit;
 				}
 				let aggregate = value.unwrap_value();
-				match expr.ty {
+				match ty {
 					mir::ValueType::Aggregate { aggregate_index } => {
-						let slots = range.indices().map(|i| self.project_scalar(aggregate, mir::ScalarIndex::new(i as u32))).collect();
-						StackResult::Value(self.aggregate_from_scalars(aggregate_index, slots))
+						let slots = range
+							.indices()
+							.map(|i| {
+								self.project_scalar(
+									aggregate,
+									mir::ScalarIndex::new(i as u32),
+								)
+							})
+							.collect();
+						StackResult::Value(
+							self.aggregate_from_scalars(aggregate_index, slots),
+						)
 					}
 					_ => {
 						assert_eq!(range.len, 1);
-						StackResult::Value(self.project_scalar(aggregate, range.start))
+						StackResult::Value(
+							self.project_scalar(aggregate, range.start),
+						)
 					}
 				}
 			}
-
 			ExprKind::AggregateSet {
-				local_index,
+				local,
 				range,
 				value,
 			} => {
 				let new_val = self.build_expr(block_idx, bindings, value);
-				if new_val == StackResult::Never { return new_val; }
+				if new_val == StackResult::Never {
+					return new_val;
+				}
 				if range.len == 0 {
 					assert_eq!(new_val, StackResult::Unit);
 					return StackResult::Unit;
 				}
-				let idx = usize::from(*local_index);
+				let idx = usize::from(local);
 				let old_aggregate = match self.read_binding(bindings, idx) {
 					StackResult::Value(value) => value,
 					StackResult::Never => return StackResult::Never,
@@ -731,17 +484,12 @@ impl<'mir> Builder<'mir> {
 						panic!("AggregateSet on a zero-sized binding")
 					}
 				};
-				let aggregate_index = match self.func.data_nodes
-					[old_aggregate as usize]
-					.kind
-					.node_type()
-				{
-					NodeType::Aggregate(i) => i,
-					_ => panic!("AggregateSet on non-aggregate binding"),
-				};
+				let aggregate_index = self.aggregate_index_of(old_aggregate);
 				let mut slots = self.scalars_of(old_aggregate);
-				let replacement = match value.ty {
-					mir::ValueType::Aggregate { .. } => self.scalars_of(new_val.unwrap_value()),
+				let replacement = match self.ty(value) {
+					mir::ValueType::Aggregate { .. } => {
+						self.scalars_of(new_val.unwrap_value())
+					}
 					_ => vec![new_val.unwrap_value()],
 				};
 				assert_eq!(replacement.len(), range.len as usize);
@@ -758,17 +506,22 @@ impl<'mir> Builder<'mir> {
 			// ── Control flow ──────────────────────────────────────────────
 			ExprKind::Return { value } => {
 				let result = match value {
-					Some(v) => self.build_expr(block_idx, bindings, v),
+					Some(value) => self.build_expr(block_idx, bindings, value),
 					None => StackResult::Unit,
 				};
 				// A diverging return value means this `return` never runs.
 				if result == StackResult::Never {
 					return StackResult::Never;
 				}
-				// Merge return value into function block result.
-				let fn_result = self.func.blocks[0].as_ref().unwrap().result;
+				let fn_result = self.func.blocks[BODY_BLOCK as usize]
+					.as_ref()
+					.unwrap()
+					.result;
 				let merged = self.merge_stack_results(fn_result, result);
-				self.func.blocks[0].as_mut().unwrap().result = merged;
+				self.func.blocks[BODY_BLOCK as usize]
+					.as_mut()
+					.unwrap()
+					.result = merged;
 				self.push_stmt(
 					block_idx,
 					ControlNode::Return { value: result },
@@ -781,60 +534,43 @@ impl<'mir> Builder<'mir> {
 					_ => StackResult::Unit,
 				}
 			}
-			ExprKind::Unreachable => {
-				self.push_stmt(block_idx, ControlNode::Unreachable);
-				StackResult::Never
+			ExprKind::Sequence { statements } => {
+				self.build_statements(block_idx, bindings, statements)
 			}
-
-			ExprKind::Block {
-				scope_index,
-				expressions,
-			} => self.build_block_expr(
+			ExprKind::Block { label, statements } => self.build_block_expr(
 				block_idx,
 				bindings,
-				*scope_index,
-				expressions,
+				label_block(label),
+				statements,
 			),
 			ExprKind::IfElse {
 				condition,
-				then_block,
-				else_block,
-			} => self.build_if_else(
-				block_idx,
-				bindings,
-				condition,
-				then_block,
-				else_block.as_deref(),
-			),
+				then,
+				otherwise,
+			} => self
+				.build_if_else(block_idx, bindings, condition, then, otherwise),
 			ExprKind::Switch {
 				selector,
 				cases,
 				default,
 			} => {
-				if Self::should_use_br_table(selector.ty, cases) {
+				let cases = self.body().cases(cases);
+				if Self::should_use_br_table(self.ty(selector), cases) {
 					self.build_switch(
-						block_idx,
-						bindings,
-						selector,
-						cases,
-						default.as_deref(),
+						block_idx, bindings, selector, cases, default,
 					)
 				} else {
 					self.build_switch_as_if_chain(
-						block_idx,
-						bindings,
-						selector,
-						cases,
-						default.as_deref(),
+						block_idx, bindings, selector, cases, default,
 					)
 				}
 			}
-			ExprKind::Loop { scope_index, block } => {
-				self.build_loop(block_idx, bindings, *scope_index, block)
+			ExprKind::Loop { label, body } => {
+				self.build_loop(block_idx, bindings, label_block(label), body)
 			}
-			ExprKind::Break { scope_index, value } => {
+			ExprKind::Break { label, value } => {
 				let val = match value {
-					Some(v) => self.build_expr(block_idx, bindings, v),
+					Some(value) => self.build_expr(block_idx, bindings, value),
 					None => StackResult::Unit,
 				};
 				// `break trap()` evaluates the value, which diverges, so the
@@ -843,17 +579,16 @@ impl<'mir> Builder<'mir> {
 				if val == StackResult::Never {
 					return StackResult::Never;
 				}
-				let target = u32::from(*scope_index);
+				let target = label_block(label);
 				// Captured *before* the merge below (which only concerns the
 				// target's own trailing value) — this break's own current
 				// contribution to the target's carried bindings, independent
 				// of its break value. See `carried_binding_updates`.
 				let carried_binding_updates =
 					self.carried_binding_updates(target, bindings);
-				// Return value unused here — merge_exit_value's only job at
-				// a break site is its side effect (updating the target's
-				// accumulated result and break_result_outputs); nothing
-				// downstream of a Break needs its own merged value back.
+				// The merged value is unused here: at a break site,
+				// merge_exit_value only updates the target's accumulated
+				// result and break_result_outputs.
 				self.merge_exit_value(target, val);
 				self.push_stmt(
 					block_idx,
@@ -865,8 +600,8 @@ impl<'mir> Builder<'mir> {
 				);
 				StackResult::Never
 			}
-			ExprKind::Continue { scope_index } => {
-				let target = u32::from(*scope_index);
+			ExprKind::Continue { label } => {
+				let target = label_block(label);
 				let carried_binding_updates =
 					self.carried_binding_updates(target, bindings);
 				self.push_stmt(
@@ -880,14 +615,14 @@ impl<'mir> Builder<'mir> {
 			}
 
 			// ── Calls ─────────────────────────────────────────────────────
-			ExprKind::Call { callee, arguments } => {
-				self.build_call(block_idx, bindings, callee, arguments, expr.ty)
+			ExprKind::Call { function, args } => {
+				self.build_call(block_idx, bindings, function, args, ty)
 			}
 
 			// ── Memory ────────────────────────────────────────────────────
 			ExprKind::PointerLoad {
 				pointer,
-				offset: base_offset,
+				offset,
 				memory,
 			} => {
 				let Some(address) =
@@ -895,18 +630,18 @@ impl<'mir> Builder<'mir> {
 				else {
 					return StackResult::Never;
 				};
-				match expr.ty {
+				match ty {
 					mir::ValueType::Aggregate { aggregate_index } => {
 						StackResult::Value(self.build_aggregate_load(
 							block_idx,
 							address,
-							*base_offset,
+							offset,
 							aggregate_index,
-							*memory,
+							memory,
 						))
 					}
 					_ => {
-						let access = MemAccess::from_mir(expr.ty);
+						let access = MemAccess::from_mir(ty);
 						let result =
 							self.node(DataNodeKind::PointerLoadResult {
 								address,
@@ -916,9 +651,9 @@ impl<'mir> Builder<'mir> {
 							block_idx,
 							ControlNode::PointerLoad {
 								address,
-								offset: *base_offset,
+								offset,
 								result,
-								memory: *memory,
+								memory,
 								access,
 							},
 						);
@@ -926,11 +661,10 @@ impl<'mir> Builder<'mir> {
 					}
 				}
 			}
-
 			ExprKind::PointerStore {
 				pointer,
 				value,
-				offset: base_offset,
+				offset,
 				memory,
 			} => {
 				let Some(address) =
@@ -938,31 +672,32 @@ impl<'mir> Builder<'mir> {
 				else {
 					return StackResult::Never;
 				};
+				let value_ty = self.ty(value);
 				let Some(value_node) =
 					self.build_value(block_idx, bindings, value)
 				else {
 					return StackResult::Never;
 				};
-				match value.ty {
+				match value_ty {
 					mir::ValueType::Aggregate { aggregate_index } => {
 						self.emit_aggregate_store(
 							block_idx,
 							address,
-							*base_offset,
+							offset,
 							value_node,
 							aggregate_index,
-							*memory,
+							memory,
 						);
 					}
 					_ => {
-						let access = MemAccess::from_mir(value.ty);
+						let access = MemAccess::from_mir(value_ty);
 						self.push_stmt(
 							block_idx,
 							ControlNode::PointerStore {
 								address,
-								offset: *base_offset,
+								offset,
 								value: value_node,
-								memory: *memory,
+								memory,
 								access,
 							},
 						);
@@ -970,40 +705,38 @@ impl<'mir> Builder<'mir> {
 				}
 				StackResult::Unit
 			}
-
 			ExprKind::MemoryGrow { memory, delta } => {
-				let Some(delta_node) =
-					self.build_value(block_idx, bindings, delta)
+				let Some(delta) = self.build_value(block_idx, bindings, delta)
 				else {
 					return StackResult::Never;
 				};
-				let result_node = self.node(DataNodeKind::MemoryGrowResult {
-					memory: *memory,
-					delta: delta_node,
-					ty: ScalarType::try_from(expr.ty)
+				let result = self.node(DataNodeKind::MemoryGrowResult {
+					memory,
+					delta,
+					ty: ScalarType::try_from(ty)
 						.expect("memory.grow result must be scalar"),
 				});
 				self.push_stmt(
 					block_idx,
 					ControlNode::MemoryGrow {
-						memory: *memory,
-						delta: delta_node,
-						result: result_node,
+						memory,
+						delta,
+						result,
 					},
 				);
-				StackResult::Value(result_node)
+				StackResult::Value(result)
 			}
 			ExprKind::MemoryFill {
 				memory,
 				dst,
-				val,
+				value,
 				len,
 			} => {
 				let Some(dst) = self.build_value(block_idx, bindings, dst)
 				else {
 					return StackResult::Never;
 				};
-				let Some(val) = self.build_value(block_idx, bindings, val)
+				let Some(val) = self.build_value(block_idx, bindings, value)
 				else {
 					return StackResult::Never;
 				};
@@ -1014,7 +747,7 @@ impl<'mir> Builder<'mir> {
 				self.push_stmt(
 					block_idx,
 					ControlNode::MemoryFill {
-						memory: *memory,
+						memory,
 						dst,
 						val,
 						len,
@@ -1044,8 +777,8 @@ impl<'mir> Builder<'mir> {
 				self.push_stmt(
 					block_idx,
 					ControlNode::MemoryCopy {
-						dst_memory: *dst_memory,
-						src_memory: *src_memory,
+						dst_memory,
+						src_memory,
 						dst,
 						src,
 						len,
@@ -1066,7 +799,7 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		expr: &mir::Expression,
+		expr: ExprId,
 	) -> Option<DataNodeIndex> {
 		match self.build_expr(block_idx, bindings, expr) {
 			StackResult::Value(value) => Some(value),
@@ -1075,52 +808,50 @@ impl<'mir> Builder<'mir> {
 		}
 	}
 
+	/// Build `expr` as the content of `block_idx`: a `Sequence`'s statements
+	/// directly, anything else as the block's one expression.
+	fn build_in(
+		&mut self,
+		block_idx: BlockIndex,
+		bindings: &mut Vec<Option<StackResult>>,
+		expr: ExprId,
+	) -> StackResult {
+		match self.kind(expr) {
+			ExprKind::Sequence { statements } => {
+				self.build_statements(block_idx, bindings, statements)
+			}
+			_ => self.build_expr(block_idx, bindings, expr),
+		}
+	}
+
+	/// Build a run of statements in order; the value is the last one's.
+	fn build_statements(
+		&mut self,
+		block_idx: BlockIndex,
+		bindings: &mut Vec<Option<StackResult>>,
+		statements: ExprList,
+	) -> StackResult {
+		let mut result = StackResult::Unit;
+		for &statement in self.body().list(statements) {
+			result = self.build_expr(block_idx, bindings, statement);
+			if result == StackResult::Never {
+				break;
+			}
+		}
+		result
+	}
+
 	// ── Control-flow builders ─────────────────────────────────────────────────
 
+	/// A labelled block: a break target with a join, whose value is a
+	/// `break`'s or the fallthrough's.
 	fn build_block_expr(
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut [Option<StackResult>],
-		scope_index: mir::ScopeIndex,
-		expressions: &[mir::Expression],
+		scope_u32: BlockIndex,
+		statements: ExprList,
 	) -> StackResult {
-		let scope_u32 = u32::from(scope_index);
-
-		// Two reasons to take the transparent fast path, checked together:
-		//
-		// 1. No `break` anywhere in the function ever targets this scope, so
-		//    registering a real `Block`/`JoinData` for it would be pure
-		//    overhead — the overwhelming majority of plain `{}` blocks.
-		//
-		// 2. `scope_u32` is already registered as *something else*. This
-		//    happens because `mir::inlining::Rebaser` redirects an inlined
-		//    callee's own root scope to the call site's scope (see its doc
-		//    comment: a reference to the callee's scope `0` is rewritten to
-		//    `root_scope`, i.e. wherever the call itself lived) — so an
-		//    inlined call's dissolved wrapper can carry the *same*
-		//    `scope_index` as an already-built ancestor (e.g. an enclosing
-		//    loop's own body scope, if the call happens directly in a loop
-		//    body). That's not a genuine second occurrence of a nested
-		//    scope needing its own registration; it's fully dissolved into
-		//    whatever it aliases, so it must be built exactly like an
-		//    ordinary untargeted block — spliced into the *current*
-		//    enclosing block (`block_idx`), never re-registered at
-		//    `scope_u32`, which would silently clobber the real owner's
-		//    entry (confirmed via `test_loop_param`: an inlined `i + 1`
-		//    dissolving into the loop's own body scope otherwise overwrote
-		//    the loop's `Block` with a fresh, non-loop one).
-		if self.func.blocks[scope_u32 as usize].is_some()
-			|| !self.break_targets[usize::from(scope_index)]
-		{
-			let mut child = bindings.to_vec();
-			let result =
-				self.build_block_exprs(block_idx, &mut child, expressions);
-			// Write back mutations to parent locals.
-			let parent_len = bindings.len();
-			bindings[..parent_len].copy_from_slice(&child[..parent_len]);
-			return result;
-		}
-
 		// Genuine break target — register a real Block + JoinData before
 		// building the body, mirroring build_loop's own setup: any break
 		// discovered while building the body needs somewhere to commit
@@ -1141,7 +872,7 @@ impl<'mir> Builder<'mir> {
 
 		let mut child = bindings.to_vec();
 		let fallthrough_result =
-			self.build_block_exprs(scope_u32, &mut child, expressions);
+			self.build_statements(scope_u32, &mut child, statements);
 
 		// "Once more, for the fallthrough" — the same fold every break
 		// already goes through (via merge_exit_value, inside the
@@ -1204,9 +935,9 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		condition_expr: &mir::Expression,
-		then_expr: &mir::Expression,
-		else_expr: Option<&mir::Expression>,
+		condition_expr: ExprId,
+		then_expr: ExprId,
+		else_expr: Option<ExprId>,
 	) -> StackResult {
 		// A diverging condition means neither branch is ever entered.
 		let Some(condition) =
@@ -1215,43 +946,13 @@ impl<'mir> Builder<'mir> {
 			return StackResult::Never;
 		};
 
-		let (then_scope, then_exprs) = Self::unwrap_block(then_expr);
-		let mut then_bindings = bindings.clone();
-		self.func.blocks[usize::from(then_scope)] = Some(Block {
-			parent: Some(block_idx),
-			statements: Vec::new(),
-			result: StackResult::Never,
-			kind: BlockKind::Block,
-			join: None,
-		});
-		let then_result = self.build_block_exprs(
-			u32::from(then_scope),
-			&mut then_bindings,
-			then_exprs,
-		);
-		self.func.blocks[usize::from(then_scope)]
-			.as_mut()
-			.unwrap()
-			.result = then_result;
-
+		let (then_scope, then_result, then_bindings) =
+			self.build_branch(block_idx, bindings, then_expr);
 		let (else_result, else_bindings, else_scope) = match else_expr {
-			Some(e) => {
-				let (scope, exprs) = Self::unwrap_block(e);
-				let mut eb = bindings.clone();
-				self.func.blocks[usize::from(scope)] = Some(Block {
-					parent: Some(block_idx),
-					statements: Vec::new(),
-					result: StackResult::Never,
-					kind: BlockKind::Block,
-					join: None,
-				});
-				let r =
-					self.build_block_exprs(u32::from(scope), &mut eb, exprs);
-				self.func.blocks[usize::from(scope)]
-					.as_mut()
-					.unwrap()
-					.result = r;
-				(r, eb, Some(u32::from(scope)))
+			Some(else_expr) => {
+				let (scope, result, else_bindings) =
+					self.build_branch(block_idx, bindings, else_expr);
+				(result, else_bindings, Some(scope))
 			}
 			None => (StackResult::Unit, bindings.clone(), None),
 		};
@@ -1272,7 +973,7 @@ impl<'mir> Builder<'mir> {
 			block_idx,
 			ControlNode::IfElse {
 				condition,
-				then_block: u32::from(then_scope),
+				then_block: then_scope,
 				else_block: else_scope,
 				outputs: outputs.into_boxed_slice(),
 				result,
@@ -1302,7 +1003,7 @@ impl<'mir> Builder<'mir> {
 	/// correctly, just always via the if-chain.
 	fn should_use_br_table(
 		selector_ty: mir::ValueType,
-		cases: &[(i64, mir::Expression)],
+		cases: &[mir::Case],
 	) -> bool {
 		if ScalarType::try_from(selector_ty) != Ok(ScalarType::I32) {
 			return false;
@@ -1310,8 +1011,8 @@ impl<'mir> Builder<'mir> {
 		if cases.len() < 3 {
 			return false;
 		}
-		let min = cases.iter().map(|(d, _)| *d).min().unwrap();
-		let max = cases.iter().map(|(d, _)| *d).max().unwrap();
+		let min = cases.iter().map(|case| case.value).min().unwrap();
+		let max = cases.iter().map(|case| case.value).max().unwrap();
 		let range = max as i128 - min as i128 + 1;
 		if range > 512 {
 			return false;
@@ -1365,9 +1066,9 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		selector_expr: &mir::Expression,
-		cases: &[(i64, mir::Expression)],
-		default_expr: Option<&mir::Expression>,
+		selector_expr: ExprId,
+		cases: &[mir::Case],
+		default_expr: Option<ExprId>,
 	) -> StackResult {
 		// A match that's just `_ => body` lowers to `Switch { cases: [],
 		// default: Some(body) }` in MIR — there's no comparison to make at
@@ -1417,25 +1118,9 @@ impl<'mir> Builder<'mir> {
 		let (mut else_block, mut else_result, mut else_bindings) =
 			match default_expr {
 				Some(body) => {
-					let (scope, exprs) = Self::unwrap_block(body);
-					let mut scope_bindings = bindings.clone();
-					self.func.blocks[usize::from(scope)] = Some(Block {
-						parent: Some(last_container),
-						statements: Vec::new(),
-						result: StackResult::Never,
-						kind: BlockKind::Block,
-						join: None,
-					});
-					let result = self.build_block_exprs(
-						u32::from(scope),
-						&mut scope_bindings,
-						exprs,
-					);
-					self.func.blocks[usize::from(scope)]
-						.as_mut()
-						.unwrap()
-						.result = result;
-					(u32::from(scope), result, scope_bindings)
+					let (scope, result, scope_bindings) =
+						self.build_branch(last_container, bindings, body);
+					(scope, result, scope_bindings)
 				}
 				None => {
 					let unreachable_block =
@@ -1447,7 +1132,10 @@ impl<'mir> Builder<'mir> {
 
 		let parent_len = bindings.len();
 		for i in (0..cases.len()).rev() {
-			let (discriminant, case_body) = &cases[i];
+			let mir::Case {
+				value: discriminant,
+				body: case_body,
+			} = cases[i];
 			let container = containers[i];
 			let (condition, then_scope, then_result, then_bindings) = self
 				.build_if_chain_then_branch(
@@ -1455,7 +1143,7 @@ impl<'mir> Builder<'mir> {
 					bindings,
 					selector,
 					selector_ty,
-					*discriminant,
+					discriminant,
 					case_body,
 				);
 
@@ -1530,7 +1218,7 @@ impl<'mir> Builder<'mir> {
 		selector: DataNodeIndex,
 		selector_ty: ScalarType,
 		discriminant: i64,
-		case_body: &mir::Expression,
+		case_body: ExprId,
 	) -> (
 		DataNodeIndex,
 		BlockIndex,
@@ -1547,35 +1235,18 @@ impl<'mir> Builder<'mir> {
 			ty: selector_ty,
 		});
 
-		let (then_scope, then_exprs) = Self::unwrap_block(case_body);
-		let mut then_bindings = bindings.to_vec();
-		self.func.blocks[usize::from(then_scope)] = Some(Block {
-			parent: Some(container),
-			statements: Vec::new(),
-			result: StackResult::Never,
-			kind: BlockKind::Block,
-			join: None,
-		});
-		let then_result = self.build_block_exprs(
-			u32::from(then_scope),
-			&mut then_bindings,
-			then_exprs,
-		);
-		self.func.blocks[usize::from(then_scope)]
-			.as_mut()
-			.unwrap()
-			.result = then_result;
-
-		(condition, u32::from(then_scope), then_result, then_bindings)
+		let (then_scope, then_result, then_bindings) =
+			self.build_branch(container, bindings, case_body);
+		(condition, then_scope, then_result, then_bindings)
 	}
 
 	fn build_switch(
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		selector_expr: &mir::Expression,
-		mir_cases: &[(i64, mir::Expression)],
-		default_expr: Option<&mir::Expression>,
+		selector_expr: ExprId,
+		mir_cases: &[mir::Case],
+		default_expr: Option<ExprId>,
 	) -> StackResult {
 		let Some(selector) =
 			self.build_value(block_idx, bindings, selector_expr)
@@ -1630,12 +1301,12 @@ impl<'mir> Builder<'mir> {
 
 		let mut arms: Vec<SwitchArmBuild> =
 			Vec::with_capacity(case_count + default_expr.is_some() as usize);
-		for (i, (discriminant, body)) in mir_cases.iter().enumerate() {
+		for (i, case) in mir_cases.iter().enumerate() {
 			arms.push(self.build_switch_arm(
 				case_wasm_parent[i],
 				bindings,
-				Some(*discriminant),
-				body,
+				Some(case.value),
+				case.body,
 			));
 		}
 		if let Some(body) = default_expr {
@@ -1828,7 +1499,9 @@ impl<'mir> Builder<'mir> {
 							.iter()
 							.map(|slot| {
 								Some(match slot {
-									PerArmSlot::Scalars(values) => StackResult::Value(values[field]),
+									PerArmSlot::Scalars(values) => {
+										StackResult::Value(values[field])
+									}
 									PerArmSlot::NoValue(v) => *v,
 								})
 							})
@@ -1858,41 +1531,41 @@ impl<'mir> Builder<'mir> {
 		parent_block: BlockIndex,
 		parent_bindings: &[Option<StackResult>],
 		discriminant: Option<i64>,
-		body: &mir::Expression,
+		body: ExprId,
 	) -> SwitchArmBuild {
-		let (scope, exprs) = Self::unwrap_block(body);
-		let mut arm_bindings = parent_bindings.to_vec();
-		self.func.blocks[usize::from(scope)] = Some(Block {
-			parent: Some(parent_block),
-			statements: Vec::new(),
-			result: StackResult::Never,
-			kind: BlockKind::Block,
-			join: None,
-		});
-		let result =
-			self.build_block_exprs(u32::from(scope), &mut arm_bindings, exprs);
-		self.func.blocks[usize::from(scope)]
-			.as_mut()
-			.unwrap()
-			.result = result;
+		let (scope, result, bindings) =
+			self.build_branch(parent_block, parent_bindings, body);
 		SwitchArmBuild {
 			discriminant,
-			scope: u32::from(scope),
+			scope,
 			result,
-			bindings: arm_bindings,
+			bindings,
 		}
+	}
+
+	/// A branch of an `if` or a `match`: `body` built in a block of its own
+	/// under `parent`, from a copy of `bindings`. Returns the block, the
+	/// branch's value and its bindings at its end.
+	fn build_branch(
+		&mut self,
+		parent: BlockIndex,
+		bindings: &[Option<StackResult>],
+		body: ExprId,
+	) -> (BlockIndex, StackResult, Vec<Option<StackResult>>) {
+		let block = self.push_synthetic_block(parent);
+		let mut branch_bindings = bindings.to_vec();
+		let result = self.build_in(block, &mut branch_bindings, body);
+		self.func.blocks[block as usize].as_mut().unwrap().result = result;
+		(block, result, branch_bindings)
 	}
 
 	fn build_loop(
 		&mut self,
 		parent_block: BlockIndex,
 		bindings: &mut [Option<StackResult>],
-		_scope_index: mir::ScopeIndex,
-		body_expr: &mir::Expression,
+		body_block: BlockIndex,
+		body_expr: ExprId,
 	) -> StackResult {
-		let (body_scope, body_exprs) = Self::unwrap_block(body_expr);
-		let body_block = u32::from(body_scope);
-
 		// Create loop-param placeholders for all parent bindings — one per
 		// entry, so this is already the full function-wide length; no
 		// further growth needed for the body scope's own locals (every
@@ -1914,7 +1587,7 @@ impl<'mir> Builder<'mir> {
 			join: Some(join_index),
 		});
 		let body_fallthrough =
-			self.build_block_exprs(body_block, &mut loop_bindings, body_exprs);
+			self.build_in(body_block, &mut loop_bindings, body_expr);
 		// blocks[body_block].result accumulates the result type from all `break`
 		// statements. Save it before overwriting with the body's fallthrough
 		// result (which is always Unit/Never since loops exit via break, not
@@ -1961,18 +1634,12 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		callee_expr: &mir::Expression,
-		arguments: &[mir::Expression],
+		function: mir::FunctionId,
+		arguments: ExprList,
 		result_ty: mir::ValueType,
 	) -> StackResult {
-		let callee_sig = match callee_expr.ty {
-			mir::ValueType::Function { signature_index } => signature_index,
-			_ => unreachable!(),
-		};
-		let Some(callee) = self.build_value(block_idx, bindings, callee_expr)
-		else {
-			return StackResult::Never;
-		};
+		let callee_sig = self.mir.function(function).signature_index;
+		let callee = self.node(DataNodeKind::FunctionRef { id: function });
 		// Zero-sized arguments (e.g. a `Memory`-typed handle) carry no
 		// runtime bits and occupy no WASM param slot (see
 		// `wasm::flatten_type_to_scalars`'s `Unit`/`Never` case) — drop them
@@ -1980,7 +1647,7 @@ impl<'mir> Builder<'mir> {
 		// A diverging argument stops the call: it never reaches the callee,
 		// so later arguments are not evaluated either.
 		let mut args = Vec::with_capacity(arguments.len());
-		for argument in arguments {
+		for &argument in self.body().list(arguments) {
 			match self.build_expr(block_idx, bindings, argument) {
 				StackResult::Value(idx) => args.push(idx),
 				StackResult::Unit => {}
@@ -2621,9 +2288,11 @@ impl<'mir> Builder<'mir> {
 			// so each one has to be named by an explicit projection.
 			DataNodeKind::AggregateCallResult { aggregate_index } => {
 				let count = mir.aggregate(aggregate_index).scalars.len();
-				(0..count as u32).map(|i| {
-					self.project_scalar(node, mir::ScalarIndex::new(i))
-				}).collect()
+				(0..count as u32)
+					.map(|i| {
+						self.project_scalar(node, mir::ScalarIndex::new(i))
+					})
+					.collect()
 			}
 			_ => panic!("expected aggregate node"),
 		}
@@ -2642,7 +2311,10 @@ impl<'mir> Builder<'mir> {
 			agg.scalars.len(),
 			"value count must match the aggregate's scalar count"
 		);
-		debug_assert!(values.iter().all(|&node| matches!(self.func.data_nodes[node as usize].kind.node_type(), NodeType::Scalar(_))));
+		debug_assert!(values.iter().all(|&node| matches!(
+			self.func.data_nodes[node as usize].kind.node_type(),
+			NodeType::Scalar(_)
+		)));
 		self.node(DataNodeKind::Aggregate {
 			values: values.into_boxed_slice(),
 			aggregate_index,
@@ -2669,8 +2341,15 @@ impl<'mir> Builder<'mir> {
 		let mir = self.mir;
 		let scalars = &mir.aggregate(aggregate_index).scalars;
 		debug_assert_eq!(values.len(), scalars.len());
-		let offsets = &mir.aggregate(aggregate_index).memory.as_ref().expect("a memory store requires a memory representation").offsets;
-		for ((&value, &ty), &offset) in values.iter().zip(scalars.iter()).zip(offsets.iter()) {
+		let offsets = &mir
+			.aggregate(aggregate_index)
+			.memory
+			.as_ref()
+			.expect("a memory store requires a memory representation")
+			.offsets;
+		for ((&value, &ty), &offset) in
+			values.iter().zip(scalars.iter()).zip(offsets.iter())
+		{
 			self.push_stmt(
 				block_idx,
 				ControlNode::PointerStore {
@@ -2696,9 +2375,15 @@ impl<'mir> Builder<'mir> {
 	) -> DataNodeIndex {
 		let mir = self.mir;
 		let scalars = &mir.aggregate(aggregate_index).scalars;
-		let offsets = &mir.aggregate(aggregate_index).memory.as_ref().expect("a memory load requires a memory representation").offsets;
+		let offsets = &mir
+			.aggregate(aggregate_index)
+			.memory
+			.as_ref()
+			.expect("a memory load requires a memory representation")
+			.offsets;
 		let values: Vec<DataNodeIndex> = scalars
-			.iter().zip(offsets.iter())
+			.iter()
+			.zip(offsets.iter())
 			.map(|(&ty, &offset)| {
 				let access = MemAccess::from_mir(ty);
 				let result = self
@@ -2739,22 +2424,6 @@ impl<'mir> Builder<'mir> {
 
 	// ── Small helpers ─────────────────────────────────────────────────────────
 
-	fn build_block_exprs(
-		&mut self,
-		block_idx: BlockIndex,
-		bindings: &mut Vec<Option<StackResult>>,
-		expressions: &[mir::Expression],
-	) -> StackResult {
-		let mut result = StackResult::Unit;
-		for expr in expressions {
-			result = self.build_expr(block_idx, bindings, expr);
-			if result == StackResult::Never {
-				break;
-			}
-		}
-		result
-	}
-
 	/// Arithmetic, bitwise, and shift operators. WASM has separate signed
 	/// and unsigned instructions for division, remainder, and right shift;
 	/// `ScalarType` can't tell them apart (`u32` and `i32` are both `I32`
@@ -2765,16 +2434,16 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		expr: &mir::Expression,
-		lhs: &mir::Expression,
-		rhs: &mir::Expression,
+		node_ty: mir::ValueType,
+		op: BinaryOp,
+		lhs: ExprId,
+		rhs: ExprId,
 	) -> StackResult {
 		use DataNodeKind as N;
-		use mir::ExprKind as E;
 
 		let ty =
-			ScalarType::try_from(expr.ty).expect("binary op must be scalar");
-		let unsigned = expr.ty.is_unsigned();
+			ScalarType::try_from(node_ty).expect("binary op must be scalar");
+		let unsigned = node_ty.is_unsigned();
 		let Some(left) = self.build_value(block_idx, bindings, lhs) else {
 			return StackResult::Never;
 		};
@@ -2782,24 +2451,23 @@ impl<'mir> Builder<'mir> {
 			return StackResult::Never;
 		};
 
-		let kind = match &expr.kind {
-			E::Add { .. } => N::Add { left, right, ty },
-			E::Sub { .. } => N::Sub { left, right, ty },
-			E::Mul { .. } => N::Mul { left, right, ty },
-			E::Div { .. } if unsigned => N::DivU { left, right, ty },
-			E::Div { .. } => N::DivS { left, right, ty },
-			E::Rem { .. } if unsigned => N::RemU { left, right, ty },
-			E::Rem { .. } => N::RemS { left, right, ty },
-			E::And { .. } | E::BitAnd { .. } => N::BitAnd { left, right, ty },
-			E::Or { .. } | E::BitOr { .. } => N::BitOr { left, right, ty },
-			E::BitXor { .. } => N::BitXor { left, right, ty },
-			E::LeftShift { .. } => N::Shl { left, right, ty },
-			E::RightShift { .. } if unsigned => N::ShrU { left, right, ty },
-			E::RightShift { .. } => N::ShrS { left, right, ty },
-			E::Min { .. } => N::Min { left, right, ty },
-			E::Max { .. } => N::Max { left, right, ty },
-			E::Copysign { .. } => N::Copysign { left, right, ty },
-			_ => unreachable!("build_binary called on a non-binary ExprKind"),
+		let kind = match op {
+			BinaryOp::Add => N::Add { left, right, ty },
+			BinaryOp::Sub => N::Sub { left, right, ty },
+			BinaryOp::Mul => N::Mul { left, right, ty },
+			BinaryOp::Div if unsigned => N::DivU { left, right, ty },
+			BinaryOp::Div => N::DivS { left, right, ty },
+			BinaryOp::Rem if unsigned => N::RemU { left, right, ty },
+			BinaryOp::Rem => N::RemS { left, right, ty },
+			BinaryOp::BitAnd => N::BitAnd { left, right, ty },
+			BinaryOp::BitOr => N::BitOr { left, right, ty },
+			BinaryOp::BitXor => N::BitXor { left, right, ty },
+			BinaryOp::Shl => N::Shl { left, right, ty },
+			BinaryOp::Shr if unsigned => N::ShrU { left, right, ty },
+			BinaryOp::Shr => N::ShrS { left, right, ty },
+			BinaryOp::Min => N::Min { left, right, ty },
+			BinaryOp::Max => N::Max { left, right, ty },
+			BinaryOp::Copysign => N::Copysign { left, right, ty },
 		};
 		StackResult::Value(self.node(kind))
 	}
@@ -2812,14 +2480,13 @@ impl<'mir> Builder<'mir> {
 		&mut self,
 		block_idx: BlockIndex,
 		bindings: &mut Vec<Option<StackResult>>,
-		expr: &mir::Expression,
-		lhs: &mir::Expression,
-		rhs: &mir::Expression,
+		op: CompareOp,
+		lhs: ExprId,
+		rhs: ExprId,
 	) -> StackResult {
 		use DataNodeKind as N;
-		use mir::ExprKind as E;
 
-		let unsigned = lhs.ty.is_unsigned();
+		let unsigned = self.ty(lhs).is_unsigned();
 		let Some(left) = self.build_value(block_idx, bindings, lhs) else {
 			return StackResult::Never;
 		};
@@ -2828,18 +2495,17 @@ impl<'mir> Builder<'mir> {
 		};
 		let ty = self.func.data_nodes[left as usize].kind.unwrap_scalar();
 
-		let kind = match &expr.kind {
-			E::Eq { .. } => N::Eq { left, right, ty },
-			E::NotEq { .. } => N::NotEq { left, right, ty },
-			E::Less { .. } if unsigned => N::LtU { left, right, ty },
-			E::Less { .. } => N::LtS { left, right, ty },
-			E::LessEq { .. } if unsigned => N::LtEqU { left, right, ty },
-			E::LessEq { .. } => N::LtEqS { left, right, ty },
-			E::Greater { .. } if unsigned => N::GtU { left, right, ty },
-			E::Greater { .. } => N::GtS { left, right, ty },
-			E::GreaterEq { .. } if unsigned => N::GtEqU { left, right, ty },
-			E::GreaterEq { .. } => N::GtEqS { left, right, ty },
-			_ => unreachable!("build_cmp called on a non-comparison ExprKind"),
+		let kind = match op {
+			CompareOp::Eq => N::Eq { left, right, ty },
+			CompareOp::Ne => N::NotEq { left, right, ty },
+			CompareOp::Lt if unsigned => N::LtU { left, right, ty },
+			CompareOp::Lt => N::LtS { left, right, ty },
+			CompareOp::Le if unsigned => N::LtEqU { left, right, ty },
+			CompareOp::Le => N::LtEqS { left, right, ty },
+			CompareOp::Gt if unsigned => N::GtU { left, right, ty },
+			CompareOp::Gt => N::GtS { left, right, ty },
+			CompareOp::Ge if unsigned => N::GtEqU { left, right, ty },
+			CompareOp::Ge => N::GtEqS { left, right, ty },
 		};
 		StackResult::Value(self.node(kind))
 	}
@@ -2909,9 +2575,8 @@ impl<'mir> Builder<'mir> {
 		aggregate: DataNodeIndex,
 		scalar: mir::ScalarIndex,
 	) -> Option<DataNodeIndex> {
-		let DataNodeKind::Aggregate {
-			values, ..
-		} = &self.func.data_nodes[aggregate as usize].kind
+		let DataNodeKind::Aggregate { values, .. } =
+			&self.func.data_nodes[aggregate as usize].kind
 		else {
 			return None;
 		};
@@ -3277,181 +2942,45 @@ impl<'mir> Builder<'mir> {
 			.statements
 			.push(stmt);
 	}
-
-	/// Expect a `Block` expression and return its scope index + expressions.
-	fn unwrap_block(
-		expr: &mir::Expression,
-	) -> (mir::ScopeIndex, &[mir::Expression]) {
-		match &expr.kind {
-			ExprKind::Block {
-				scope_index,
-				expressions,
-			} => (*scope_index, expressions),
-			_ => panic!("expected Block expression"),
-		}
-	}
 }
 
-/// Marks `out[scope_index] = true` for every `ExprKind::Break { scope_index,
-/// .. }` reachable from `expr`. Walked exhaustively over every `ExprKind`
-/// variant that can hold a nested `Expression` — mirrors
-/// `mir::inlining::Rebaser::rebase`'s identical full recursive-descent shape
-/// (same file's `inline_expr` is the same shape again), just read-only and
-/// recording instead of rewriting.
-///
-/// `Continue` is deliberately not collected here: TIR guarantees every
-/// `Continue` always targets a loop scope (see
-/// `tir::builder::control::build_continue_expression`), so its target is
-/// never a block-join candidate — only `Break` can reach a plain block.
-fn collect_break_targets(expr: &mir::Expression, out: &mut [bool]) {
-	match &expr.kind {
-		ExprKind::Break { scope_index, value } => {
-			out[usize::from(*scope_index)] = true;
-			if let Some(v) = value {
-				collect_break_targets(v, out);
-			}
+/// The instruction converting a value of type `from` to `to`, applied to
+/// `operand`. An integer's signedness is the source's for an extension or a
+/// conversion to a float, the target's for a truncation of a float.
+fn conversion(
+	from: mir::ValueType,
+	to: mir::ValueType,
+	operand: DataNodeIndex,
+) -> DataNodeKind {
+	use DataNodeKind as N;
+	use ScalarType::{F32, F64, I32, I64};
+
+	let source = ScalarType::try_from(from).expect("a conversion is scalar");
+	let target = ScalarType::try_from(to).expect("a conversion is scalar");
+	match (source, target) {
+		(I32, I64) if from.is_unsigned() => N::I64ExtendI32U { operand },
+		(I32, I64) => N::I64ExtendI32S { operand },
+		(I64, I32) => N::I32WrapI64 { operand },
+		(I32, F32) if from.is_unsigned() => N::F32ConvertU32 { operand },
+		(I32, F32) => N::F32ConvertI32 { operand },
+		(I64, F32) if from.is_unsigned() => N::F32ConvertU64 { operand },
+		(I64, F32) => N::F32ConvertI64 { operand },
+		(I32, F64) if from.is_unsigned() => N::F64ConvertU32 { operand },
+		(I32, F64) => N::F64ConvertI32 { operand },
+		(I64, F64) if from.is_unsigned() => N::F64ConvertU64 { operand },
+		(I64, F64) => N::F64ConvertI64 { operand },
+		(F32, I32) if to.is_unsigned() => N::U32TruncF32 { operand },
+		(F32, I32) => N::I32TruncF32 { operand },
+		(F64, I32) if to.is_unsigned() => N::U32TruncF64 { operand },
+		(F64, I32) => N::I32TruncF64 { operand },
+		(F32, I64) if to.is_unsigned() => N::U64TruncF32 { operand },
+		(F32, I64) => N::I64TruncF32 { operand },
+		(F64, I64) if to.is_unsigned() => N::U64TruncF64 { operand },
+		(F64, I64) => N::I64TruncF64 { operand },
+		(F32, F64) => N::F64PromoteF32 { operand },
+		(F64, F32) => N::F32DemoteF64 { operand },
+		(source, target) => {
+			unreachable!("no conversion from {source:?} to {target:?}")
 		}
-		ExprKind::LocalSet { value, .. }
-		| ExprKind::AggregateSet { value, .. }
-		| ExprKind::Drop { value }
-		| ExprKind::GlobalSet { value, .. }
-		| ExprKind::Neg { value }
-		| ExprKind::Sqrt { value }
-		| ExprKind::Abs { value }
-		| ExprKind::Floor { value }
-		| ExprKind::Ceil { value }
-		| ExprKind::Trunc { value }
-		| ExprKind::Nearest { value }
-		| ExprKind::BitNot { value }
-		| ExprKind::Eqz { value }
-		| ExprKind::I64ExtendI32S { value }
-		| ExprKind::I64ExtendI32U { value }
-		| ExprKind::I32WrapI64 { value }
-		| ExprKind::F32ConvertI32 { value }
-		| ExprKind::F32ConvertU32 { value }
-		| ExprKind::F32ConvertI64 { value }
-		| ExprKind::F32ConvertU64 { value }
-		| ExprKind::F64ConvertI32 { value }
-		| ExprKind::F64ConvertU32 { value }
-		| ExprKind::F64ConvertI64 { value }
-		| ExprKind::F64ConvertU64 { value }
-		| ExprKind::I32TruncF32 { value }
-		| ExprKind::U32TruncF32 { value }
-		| ExprKind::I32TruncF64 { value }
-		| ExprKind::U32TruncF64 { value }
-		| ExprKind::I64TruncF32 { value }
-		| ExprKind::U64TruncF32 { value }
-		| ExprKind::I64TruncF64 { value }
-		| ExprKind::U64TruncF64 { value }
-		| ExprKind::F64PromoteF32 { value }
-		| ExprKind::F32DemoteF64 { value }
-		| ExprKind::I32ReinterpretF32 { value }
-		| ExprKind::F32ReinterpretI32 { value }
-		| ExprKind::I64ReinterpretF64 { value }
-		| ExprKind::F64ReinterpretI64 { value }
-		| ExprKind::PointerLoad { pointer: value, .. }
-		| ExprKind::MemoryGrow { delta: value, .. } => {
-			collect_break_targets(value, out)
-		}
-		ExprKind::Loop { block: value, .. } => {
-			collect_break_targets(value, out)
-		}
-		ExprKind::Block { expressions, .. } => {
-			for e in expressions.iter() {
-				collect_break_targets(e, out);
-			}
-		}
-		ExprKind::Return { value } => {
-			if let Some(v) = value {
-				collect_break_targets(v, out);
-			}
-		}
-		ExprKind::Add { left, right }
-		| ExprKind::Sub { left, right }
-		| ExprKind::Mul { left, right }
-		| ExprKind::Div { left, right }
-		| ExprKind::Rem { left, right }
-		| ExprKind::And { left, right }
-		| ExprKind::Or { left, right }
-		| ExprKind::Eq { left, right }
-		| ExprKind::NotEq { left, right }
-		| ExprKind::Less { left, right }
-		| ExprKind::LessEq { left, right }
-		| ExprKind::Greater { left, right }
-		| ExprKind::GreaterEq { left, right }
-		| ExprKind::BitAnd { left, right }
-		| ExprKind::BitOr { left, right }
-		| ExprKind::BitXor { left, right }
-		| ExprKind::LeftShift { left, right }
-		| ExprKind::RightShift { left, right }
-		| ExprKind::Min { left, right }
-		| ExprKind::Max { left, right }
-		| ExprKind::Copysign { left, right }
-		| ExprKind::PointerStore {
-			pointer: left,
-			value: right,
-			..
-		} => {
-			collect_break_targets(left, out);
-			collect_break_targets(right, out);
-		}
-		ExprKind::MemoryFill { dst, val, len, .. } => {
-			collect_break_targets(dst, out);
-			collect_break_targets(val, out);
-			collect_break_targets(len, out);
-		}
-		ExprKind::MemoryCopy { dst, src, len, .. } => {
-			collect_break_targets(dst, out);
-			collect_break_targets(src, out);
-			collect_break_targets(len, out);
-		}
-		ExprKind::Aggregate { values } => {
-			for e in values.iter() {
-				collect_break_targets(e, out);
-			}
-		}
-		ExprKind::Call { callee, arguments } => {
-			collect_break_targets(callee, out);
-			for a in arguments.iter() {
-				collect_break_targets(a, out);
-			}
-		}
-		ExprKind::IfElse {
-			condition,
-			then_block,
-			else_block,
-		} => {
-			collect_break_targets(condition, out);
-			collect_break_targets(then_block, out);
-			if let Some(e) = else_block {
-				collect_break_targets(e, out);
-			}
-		}
-		ExprKind::Switch {
-			selector,
-			cases,
-			default,
-		} => {
-			collect_break_targets(selector, out);
-			for (_, body) in cases.iter() {
-				collect_break_targets(body, out);
-			}
-			if let Some(d) = default {
-				collect_break_targets(d, out);
-			}
-		}
-		ExprKind::Noop
-		| ExprKind::Function { .. }
-		| ExprKind::Int { .. }
-		| ExprKind::Float { .. }
-		| ExprKind::Global { .. }
-		| ExprKind::Unreachable
-		| ExprKind::MemoryOffset { .. }
-		| ExprKind::MemoryIndex { .. }
-		| ExprKind::MemorySize { .. }
-		| ExprKind::StaticPointer { .. }
-		| ExprKind::LocalGet { .. }
-		| ExprKind::AggregateGet { .. }
-		| ExprKind::Continue { .. } => {}
 	}
 }

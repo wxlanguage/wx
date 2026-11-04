@@ -96,12 +96,13 @@ pub fn check(compilation: &mut CompilationUnit) -> Vec<Diagnostic<FileId>> {
 ///
 /// This is deliberately separate from [`check`], which is left untouched: it
 /// repeats the setup, keeps the [`TypeContext`] alive instead of dropping it,
-/// and hands it to the lowering entry point. On any error or bug diagnostic
-/// from checking, or on a lowering failure, the diagnostics are returned and
-/// no MIR is produced.
+/// and hands it to the lowering entry point. The diagnostics are returned
+/// either way, so a successful build still reports its warnings; on any error
+/// or bug diagnostic from checking, or on a lowering failure, no MIR is
+/// produced.
 pub fn build(
 	compilation: &mut CompilationUnit,
-) -> Result<MIR, Vec<Diagnostic<FileId>>> {
+) -> (Vec<Diagnostic<FileId>>, Option<MIR>) {
 	let CompilationUnit {
 		files,
 		packages,
@@ -141,11 +142,11 @@ pub fn build(
 	context.sweep();
 	if context.diagnostics.has_errors() {
 		drop(context);
-		return Err(diagnostics);
+		return (diagnostics, None);
 	}
 	let lowered = lower::build(&mut context);
 	drop(context);
-	lowered.map_err(|()| diagnostics)
+	(diagnostics, lowered.ok())
 }
 
 // use crate::index::index_newtype;

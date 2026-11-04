@@ -453,6 +453,7 @@ impl TypeContext<'_, '_, '_> {
 					};
 					let ty = self.global_value_type(global_index);
 					let owner = BodyOwner::Global(global_index);
+					let reported = self.diagnostics.len();
 					let (body, obligations) =
 						BodyContext::new(self, scope, owner)
 							.check_body(value, ty);
@@ -464,6 +465,9 @@ impl TypeContext<'_, '_, '_> {
 						obligations,
 					);
 					self.global_bodies[usize::from(global_index)] = Some(body);
+					if !self.diagnostics[reported..].has_errors() {
+						self.evaluate_global(global_index);
+					}
 				}
 				_ => {}
 			}
@@ -749,6 +753,10 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Each global's checked initializer, by `GlobalIdx`; `None` for an
 	/// imported one.
 	pub(super) global_bodies: Vec<Option<Body>>,
+	/// Each global's initial value, evaluated at compile time; `None` until
+	/// its body is checked and evaluated, and for an imported global or one
+	/// whose evaluation failed (reported).
+	pub(super) global_values: Vec<Option<super::eval::ConstValue>>,
 	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
 	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
 	/// Resolved, exportable targets keyed by decoded external name; filled by `sweep`.
@@ -913,6 +921,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			const_obligations: FxHashMap::default(),
 			function_implementations,
 			global_bodies: defs.globals.iter().map(|_| None).collect(),
+			global_values: defs.globals.iter().map(|_| None).collect(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
 			exports: FxHashMap::default(),
@@ -16295,10 +16304,14 @@ pub(super) mod tests {
 				global tuple: (f32, ()) = (0, ());
 				global generic: Wrap<u64> = Wrap(0);
 				global variant: Small = Small::A;
-				global pointer: heap::&u32 = loop {};
-				global reference: func(u32) -> u32 = loop {};
-				global untyped: funcref = loop {};
 				global size: <heap as Memory>::Size = 0;
+				// No constant of these exists yet, so they are imported: the
+				// host gives the value, and the type is checked the same way.
+				import \"env\" as env {
+					global pointer: heap::&u32;
+					global reference: func(u32) -> u32;
+					global untyped: funcref;
+				}
 			"});
 			checked_case!(std case = &source);
 			case.diagnostics().assert_none();

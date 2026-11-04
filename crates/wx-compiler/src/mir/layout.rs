@@ -19,9 +19,15 @@ impl AggregateTable {
 		memory: Option<AggregateMemory>,
 	) -> AggregateIndex {
 		assert!(!scalars.is_empty(), "zero-sized values use Unit");
-		assert!(scalars.iter().all(|ty| !matches!(ty,
-			ValueType::Aggregate { .. } | ValueType::Unit | ValueType::Never
-		)), "a flat pack contains scalar types only");
+		assert!(
+			scalars.iter().all(|ty| !matches!(
+				ty,
+				ValueType::Aggregate { .. }
+					| ValueType::Unit
+					| ValueType::Never
+			)),
+			"a flat pack contains scalar types only"
+		);
 		if let Some(memory) = &memory {
 			assert_eq!(scalars.len(), memory.offsets.len());
 		}

@@ -1,7 +1,8 @@
 //! Expand compiler-provided function implementations, never source names.
 
-use super::{Body, ExprIdx, FunctionState, Lowerer, mir};
+use super::{Body, ExprIdx, FunctionInstance, FunctionState, Lowerer, mir};
 use crate::tir::intrinsics::Intrinsic;
+use crate::tir::types::Type;
 
 impl Lowerer<'_, '_, '_, '_> {
 	pub(super) fn lower_intrinsic(
@@ -9,10 +10,11 @@ impl Lowerer<'_, '_, '_, '_> {
 		body: &Body,
 		state: &mut FunctionState,
 		expr: ExprIdx,
+		callee: FunctionInstance,
 		intrinsic: Intrinsic,
 		args: ExprIdx,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		// Generic memory/global operations are recognized implementations,
 		// not ordinary functions awaiting a body or monomorphization. Keep
 		// their checkpoint boundary explicit until those features can lower.
@@ -21,9 +23,6 @@ impl Lowerer<'_, '_, '_, '_> {
 			| Intrinsic::MemorySize
 			| Intrinsic::MemoryFill
 			| Intrinsic::MemoryCopy
-			| Intrinsic::GlobalGet
-			| Intrinsic::GlobalSet
-			| Intrinsic::Transmute
 			| Intrinsic::SizeOf
 			| Intrinsic::AlignOf => {
 				self.unsupported(
@@ -37,44 +36,69 @@ impl Lowerer<'_, '_, '_, '_> {
 		}
 
 		let mut prefix = Vec::new();
-		let mut arguments =
-			self.lower_arguments(body, state, args, &mut prefix)?;
+		// A lone argument is its parameter's value, so it must not be
+		// unpacked even when that value is itself a tuple (`transmute((a, b))`).
+		let params =
+			self.context.functions[usize::from(callee.function)].param_types;
+		let arguments = if params.len() == 1 {
+			vec![self.lower_expr(body, state, args)?]
+		} else {
+			self.lower_arguments(body, state, args, &mut prefix)?
+		};
 		if let Some(at) = arguments
 			.iter()
-			.position(|arg| arg.ty == mir::ValueType::Never)
+			.position(|&arg| state.ty(arg) == mir::ValueType::Never)
 		{
 			// A diverging argument prevents the operation from executing. Do
 			// not feed `Never` to a scalar instruction expecting a real value.
-			let divergent = arguments.remove(at);
-			prefix.extend(arguments.into_iter().take(at).map(|value| {
-				mir::Expression {
-					kind: mir::ExprKind::Drop {
-						value: Box::new(value),
-					},
-					ty: mir::ValueType::Unit,
-				}
-			}));
-			return Ok(self.sequence(state, prefix, divergent));
+			// The arguments after it are kept in the tree, after it, where
+			// they never run.
+			let mut statements = prefix;
+			for (position, &value) in arguments.iter().enumerate() {
+				statements.push(if position == at {
+					value
+				} else {
+					state.push(
+						mir::ExprKind::Drop { value },
+						mir::ValueType::Unit,
+					)
+				});
+			}
+			let statements = state.list(statements);
+			return Ok(state.push(
+				mir::ExprKind::Sequence { statements },
+				mir::ValueType::Never,
+			));
 		}
 		let mut arguments = arguments.into_iter();
+		macro_rules! operand {
+			() => {
+				arguments.next().expect("std intrinsic operand")
+			};
+		}
 		macro_rules! unary {
-			($kind:ident) => {
-				mir::ExprKind::$kind {
-					value: Box::new(
-						arguments.next().expect("std intrinsic operand"),
-					),
+			($op:ident) => {
+				mir::ExprKind::Unary {
+					op: mir::UnaryOp::$op,
+					value: operand!(),
 				}
 			};
 		}
 		macro_rules! binary {
-			($kind:ident) => {
-				mir::ExprKind::$kind {
-					left: Box::new(
-						arguments.next().expect("std intrinsic left operand"),
-					),
-					right: Box::new(
-						arguments.next().expect("std intrinsic right operand"),
-					),
+			($op:ident) => {
+				mir::ExprKind::Binary {
+					op: mir::BinaryOp::$op,
+					lhs: operand!(),
+					rhs: operand!(),
+				}
+			};
+		}
+		macro_rules! compare {
+			($op:ident) => {
+				mir::ExprKind::Compare {
+					op: mir::CompareOp::$op,
+					lhs: operand!(),
+					rhs: operand!(),
 				}
 			};
 		}
@@ -127,86 +151,184 @@ impl Lowerer<'_, '_, '_, '_> {
 			Intrinsic::I64BitOr => binary!(BitOr),
 			Intrinsic::I32BitXor => binary!(BitXor),
 			Intrinsic::I64BitXor => binary!(BitXor),
-			Intrinsic::I32Shl => binary!(LeftShift),
-			Intrinsic::I64Shl => binary!(LeftShift),
-			Intrinsic::I32ShrS => binary!(RightShift),
-			Intrinsic::I32ShrU => binary!(RightShift),
-			Intrinsic::I64ShrS => binary!(RightShift),
-			Intrinsic::I64ShrU => binary!(RightShift),
-			Intrinsic::I32Eq => binary!(Eq),
-			Intrinsic::I64Eq => binary!(Eq),
-			Intrinsic::F32Eq => binary!(Eq),
-			Intrinsic::F64Eq => binary!(Eq),
-			Intrinsic::I32Ne => binary!(NotEq),
-			Intrinsic::I64Ne => binary!(NotEq),
-			Intrinsic::F32Ne => binary!(NotEq),
-			Intrinsic::F64Ne => binary!(NotEq),
-			Intrinsic::I32LtS => binary!(Less),
-			Intrinsic::I32LtU => binary!(Less),
-			Intrinsic::I64LtS => binary!(Less),
-			Intrinsic::I64LtU => binary!(Less),
-			Intrinsic::F32Lt => binary!(Less),
-			Intrinsic::F64Lt => binary!(Less),
-			Intrinsic::I32LeS => binary!(LessEq),
-			Intrinsic::I32LeU => binary!(LessEq),
-			Intrinsic::I64LeS => binary!(LessEq),
-			Intrinsic::I64LeU => binary!(LessEq),
-			Intrinsic::F32Le => binary!(LessEq),
-			Intrinsic::F64Le => binary!(LessEq),
-			Intrinsic::I32GtS => binary!(Greater),
-			Intrinsic::I32GtU => binary!(Greater),
-			Intrinsic::I64GtS => binary!(Greater),
-			Intrinsic::I64GtU => binary!(Greater),
-			Intrinsic::F32Gt => binary!(Greater),
-			Intrinsic::F64Gt => binary!(Greater),
-			Intrinsic::I32GeS => binary!(GreaterEq),
-			Intrinsic::I32GeU => binary!(GreaterEq),
-			Intrinsic::I64GeS => binary!(GreaterEq),
-			Intrinsic::I64GeU => binary!(GreaterEq),
-			Intrinsic::F32Ge => binary!(GreaterEq),
-			Intrinsic::F64Ge => binary!(GreaterEq),
+			Intrinsic::I32Shl => binary!(Shl),
+			Intrinsic::I64Shl => binary!(Shl),
+			Intrinsic::I32ShrS => binary!(Shr),
+			Intrinsic::I32ShrU => binary!(Shr),
+			Intrinsic::I64ShrS => binary!(Shr),
+			Intrinsic::I64ShrU => binary!(Shr),
+			Intrinsic::I32Eq => compare!(Eq),
+			Intrinsic::I64Eq => compare!(Eq),
+			Intrinsic::F32Eq => compare!(Eq),
+			Intrinsic::F64Eq => compare!(Eq),
+			Intrinsic::I32Ne => compare!(Ne),
+			Intrinsic::I64Ne => compare!(Ne),
+			Intrinsic::F32Ne => compare!(Ne),
+			Intrinsic::F64Ne => compare!(Ne),
+			Intrinsic::I32LtS => compare!(Lt),
+			Intrinsic::I32LtU => compare!(Lt),
+			Intrinsic::I64LtS => compare!(Lt),
+			Intrinsic::I64LtU => compare!(Lt),
+			Intrinsic::F32Lt => compare!(Lt),
+			Intrinsic::F64Lt => compare!(Lt),
+			Intrinsic::I32LeS => compare!(Le),
+			Intrinsic::I32LeU => compare!(Le),
+			Intrinsic::I64LeS => compare!(Le),
+			Intrinsic::I64LeU => compare!(Le),
+			Intrinsic::F32Le => compare!(Le),
+			Intrinsic::F64Le => compare!(Le),
+			Intrinsic::I32GtS => compare!(Gt),
+			Intrinsic::I32GtU => compare!(Gt),
+			Intrinsic::I64GtS => compare!(Gt),
+			Intrinsic::I64GtU => compare!(Gt),
+			Intrinsic::F32Gt => compare!(Gt),
+			Intrinsic::F64Gt => compare!(Gt),
+			Intrinsic::I32GeS => compare!(Ge),
+			Intrinsic::I32GeU => compare!(Ge),
+			Intrinsic::I64GeS => compare!(Ge),
+			Intrinsic::I64GeU => compare!(Ge),
+			Intrinsic::F32Ge => compare!(Ge),
+			Intrinsic::F64Ge => compare!(Ge),
 			Intrinsic::F32Min => binary!(Min),
 			Intrinsic::F64Min => binary!(Min),
 			Intrinsic::F32Max => binary!(Max),
 			Intrinsic::F64Max => binary!(Max),
 			Intrinsic::F32Copysign => binary!(Copysign),
 			Intrinsic::F64Copysign => binary!(Copysign),
-			Intrinsic::I64ExtendI32S => unary!(I64ExtendI32S),
-			Intrinsic::I64ExtendI32U => unary!(I64ExtendI32U),
-			Intrinsic::I32WrapI64 => unary!(I32WrapI64),
-			Intrinsic::F32ConvertI32 => unary!(F32ConvertI32),
-			Intrinsic::F32ConvertU32 => unary!(F32ConvertU32),
-			Intrinsic::F32ConvertI64 => unary!(F32ConvertI64),
-			Intrinsic::F32ConvertU64 => unary!(F32ConvertU64),
-			Intrinsic::F64ConvertI32 => unary!(F64ConvertI32),
-			Intrinsic::F64ConvertU32 => unary!(F64ConvertU32),
-			Intrinsic::F64ConvertI64 => unary!(F64ConvertI64),
-			Intrinsic::F64ConvertU64 => unary!(F64ConvertU64),
-			Intrinsic::I32TruncF32 => unary!(I32TruncF32),
-			Intrinsic::U32TruncF32 => unary!(U32TruncF32),
-			Intrinsic::I32TruncF64 => unary!(I32TruncF64),
-			Intrinsic::U32TruncF64 => unary!(U32TruncF64),
-			Intrinsic::I64TruncF32 => unary!(I64TruncF32),
-			Intrinsic::U64TruncF32 => unary!(U64TruncF32),
-			Intrinsic::I64TruncF64 => unary!(I64TruncF64),
-			Intrinsic::U64TruncF64 => unary!(U64TruncF64),
-			Intrinsic::F64PromoteF32 => unary!(F64PromoteF32),
-			Intrinsic::F32DemoteF64 => unary!(F32DemoteF64),
-			Intrinsic::I32ReinterpretF32 => unary!(I32ReinterpretF32),
-			Intrinsic::F32ReinterpretI32 => unary!(F32ReinterpretI32),
-			Intrinsic::I64ReinterpretF64 => unary!(I64ReinterpretF64),
-			Intrinsic::F64ReinterpretI64 => unary!(F64ReinterpretI64),
+			Intrinsic::I64ExtendI32S => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::I64ExtendI32U => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::I32WrapI64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F32ConvertI32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F32ConvertU32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F32ConvertI64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F32ConvertU64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F64ConvertI32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F64ConvertU32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F64ConvertI64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F64ConvertU64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::I32TruncF32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::U32TruncF32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::I32TruncF64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::U32TruncF64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::I64TruncF32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::U64TruncF32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::I64TruncF64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::U64TruncF64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F64PromoteF32 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::F32DemoteF64 => {
+				mir::ExprKind::Convert { value: operand!() }
+			}
+			Intrinsic::I32ReinterpretF32 => {
+				mir::ExprKind::Reinterpret { value: operand!() }
+			}
+			Intrinsic::F32ReinterpretI32 => {
+				mir::ExprKind::Reinterpret { value: operand!() }
+			}
+			Intrinsic::I64ReinterpretF64 => {
+				mir::ExprKind::Reinterpret { value: operand!() }
+			}
+			Intrinsic::F64ReinterpretI64 => {
+				mir::ExprKind::Reinterpret { value: operand!() }
+			}
+			// Its bounds make both types flatten to the same Wasm values, so
+			// it needs no type arguments: the operand's type and `ty` say it.
+			Intrinsic::Transmute => {
+				mir::ExprKind::Transmute { value: operand!() }
+			}
+			// `global_get<G>(g)`/`global_set<G>(g, value)`: the handle `g` is
+			// zero-sized and runs for its effects; `G` names the global. The
+			// module holds the value as its one scalar, which a one-value
+			// pack (`Meters(u32)`) is read as and written from.
+			Intrinsic::GlobalGet | Intrinsic::GlobalSet => {
+				let id = self.global_of(callee)?;
+				let scalar = self.globals[usize::from(id)].ty;
+				prefix.push(operand!());
+				let value = if intrinsic == Intrinsic::GlobalGet {
+					let get = state.push(mir::ExprKind::Global { id }, scalar);
+					if ty == scalar {
+						get
+					} else {
+						state.push(mir::ExprKind::Transmute { value: get }, ty)
+					}
+				} else {
+					let mut value = operand!();
+					if state.ty(value) != scalar {
+						value = state
+							.push(mir::ExprKind::Transmute { value }, scalar);
+					}
+					state.push(mir::ExprKind::GlobalSet { id, value }, ty)
+				};
+				assert!(
+					arguments.next().is_none(),
+					"std intrinsic operand count"
+				);
+				return Ok(self.sequence(state, prefix, value));
+			}
 			Intrinsic::MemoryGrow
 			| Intrinsic::MemorySize
 			| Intrinsic::MemoryFill
 			| Intrinsic::MemoryCopy
-			| Intrinsic::GlobalGet
-			| Intrinsic::GlobalSet
-			| Intrinsic::Transmute
 			| Intrinsic::SizeOf
 			| Intrinsic::AlignOf => unreachable!("diagnosed before argument lowering"),
 		};
 		assert!(arguments.next().is_none(), "std intrinsic operand count");
-		Ok(self.sequence(state, prefix, mir::Expression { kind, ty }))
+		let value = state.push(kind, ty);
+		Ok(self.sequence(state, prefix, value))
+	}
+
+	/// The global a `global_get<G>`/`global_set<G>` instance names: its one
+	/// type argument, a global's handle type.
+	fn global_of(
+		&mut self,
+		callee: FunctionInstance,
+	) -> Result<mir::GlobalId, ()> {
+		let [handle] = *self.context.types.list(callee.args) else {
+			unreachable!("`global_get` and `global_set` take one type argument")
+		};
+		let Type::Global { global_index } = *self.context.types.resolve(handle)
+		else {
+			unreachable!("an instance's `G: Global` is a global's handle type")
+		};
+		self.global(global_index)
 	}
 }

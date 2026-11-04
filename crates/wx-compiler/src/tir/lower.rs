@@ -6,34 +6,38 @@
 //! layout need `&mut TypeContext`, which is why the entry point is mutable.
 //!
 //! The current checkpoints cover exported functions, direct calls, method
-//! calls, locals, blocks, returns, scalar operators (including
-//! short-circuiting `&&`/`||`) and intrinsics, loops, breaks and continues
+//! calls (a trait's declaration through the impl its `Self` selects, or the
+//! default the impl inherits, and a function item's `Call::call` as a call
+//! of the item), locals, blocks, returns, scalar operators (including
+//! short-circuiting `&&`/`||`) and intrinsics (`transmute` as a MIR
+//! `Transmute`, which only retypes), loops, breaks and continues
 //! (including labelled blocks and loops), `if`/`else`, `match` (including
 //! destructuring, `|` alternatives and char patterns), destructuring `local`
-//! declarations, primitive and concrete compound assignments, concrete
-//! constants (`True`/`False`, enum variants and free `const` items), `Char`
+//! declarations, compound assignments, constants (`True`/`False`, enum
+//! variants, free `const` items, and associated ones per instance), `Char`
 //! literals, type aliases, and tuples and structs (including generic and
 //! zero-sized fields).
 //! Aggregates keep their values in declaration order while TIR supplies the
 //! byte offsets and size. A constant pattern compares an aggregate through
 //! the concrete `PartialEq::eq` impl its checked `Eq` bound selects, so a
 //! type's own equality is honoured. Memory types (arrays, slices, pointers),
-//! abstract dispatch (`AbstractCall`/`AbstractMethodCall`), function
-//! references, and float equality tests (floats have no total equality) are
+//! calls the compiler implements, function references, and float equality tests (floats have no total equality) are
 //! not lowered yet. Every other checked form is reported as
 //! `UnsupportedExpression`; no unsupported form becomes `Noop` and no
 //! unsupported form disappears from the output.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::{Symbol, SymbolU32};
 
 use super::body::{
-	Body, ElementOrder, ExprIdx, ExprKind, FunctionImplementation, ScopeIdx,
-	ScopeKind,
+	Body, ElementOrder, ExprIdx, ExprKind, FunctionImplementation, PatIdx,
+	ScopeIdx,
 };
-use super::defs::{FieldIdx, FunctionIdx};
+use super::defs::{Attributes, FieldIdx, FunctionIdx, GlobalIdx};
+use super::eval::Val;
+use super::members::ResolvedFunction;
 use super::signatures::TypeContext;
 use super::solver::{NormalizationDepth, RewriteFlags};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
@@ -47,19 +51,118 @@ mod constants;
 mod intrinsics;
 mod patterns;
 
+/// How a call's written arguments meet what it runs.
+#[derive(Clone, Copy)]
+enum Dispatch {
+	/// The receiver, if any, is the first parameter and `args` the rest.
+	Direct,
+	/// `Call::call` of a function item: the receiver is the item, which is
+	/// no parameter, and `args` fills the item's function.
+	Item,
+}
+
+/// A function with the type arguments its body is lowered with, flat as
+/// TIR's call nodes hold them (an impl's, then its own; `[Self, own...]` for
+/// a trait's default). `args` is the list of the interned item type
+/// (`Type::Function`), so equal instances are equal; empty for a function with
+/// no parameters, which is its own one instance. The counterpart of
+/// `eval::Instance`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FunctionInstance {
+	function: FunctionIdx,
+	args: TypeList,
+}
+
+impl FunctionInstance {
+	fn of(function: FunctionIdx) -> Self {
+		Self {
+			function,
+			args: TypeList::EMPTY,
+		}
+	}
+}
+
 /// What one function's lowering keeps outside the shared [`Lowerer`].
 struct FunctionState {
 	file_id: FileId,
-	/// The function's type environment; every body type is normalized there.
+	/// The function's type environment, which its body's types are written
+	/// in, and the instance's arguments for its parameters. A body type is
+	/// made concrete with both where it is read (`Lowerer::expr_ty`); every
+	/// type past that point has no parameter.
 	env: TypeEnvIdx,
-	function_id: mir::FunctionId,
+	args: Box<[TypeIndex]>,
+	/// The instance being lowered, which a call in its body records as the
+	/// callee's caller.
+	instance: FunctionInstance,
 	/// `body.locals()[i]` in the MIR local it was assigned.
 	local_map: Vec<mir::LocalIndex>,
 	/// MIR locals: the declared parameters first (including discard slots for
 	/// unnamed ones), then every remaining source local.
 	locals: Vec<mir::Local>,
-	scopes: Vec<mir::BlockScope>,
-	scope_map: HashMap<ScopeIdx, mir::ScopeIndex>,
+	/// The function's MIR nodes.
+	mir_body: mir::Body,
+	/// The label of each of the body's scopes (indexed by `ScopeIdx`) that a
+	/// `break` or `continue` names, or a loop owns, given on first use. A
+	/// block whose scope has none is a `Sequence`.
+	labels: Vec<Option<mir::LabelId>>,
+	label_count: u32,
+	/// The body's root, once it is lowered.
+	root: Option<mir::ExprId>,
+}
+
+impl FunctionState {
+	fn push(&mut self, kind: mir::ExprKind, ty: mir::ValueType) -> mir::ExprId {
+		self.mir_body.push(kind, ty)
+	}
+
+	fn ty(&self, expr: mir::ExprId) -> mir::ValueType {
+		self.mir_body.ty(expr)
+	}
+
+	fn list(
+		&mut self,
+		items: impl IntoIterator<Item = mir::ExprId>,
+	) -> mir::ExprList {
+		self.mir_body.push_list(items)
+	}
+
+	/// A boolean literal: Wasm has none, so MIR holds it as an integer
+	/// `0`/`1` of type `Bool`.
+	fn boolean(&mut self, value: bool) -> mir::ExprId {
+		self.push(
+			mir::ExprKind::Int {
+				value: i64::from(value),
+			},
+			mir::ValueType::Bool,
+		)
+	}
+
+	/// `scope`'s label, given on first use.
+	fn label(&mut self, scope: ScopeIdx) -> mir::LabelId {
+		let slot = &mut self.labels[usize::from(scope)];
+		*slot.get_or_insert_with(|| {
+			let label = mir::LabelId::new(self.label_count);
+			self.label_count += 1;
+			label
+		})
+	}
+
+	/// `statements` as a block of `scope`: a `Block` with its label when
+	/// something inside jumps out of it, a `Sequence` otherwise.
+	fn block(
+		&mut self,
+		scope: ScopeIdx,
+		statements: Vec<mir::ExprId>,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		let statements = self.list(statements);
+		match self.labels[usize::from(scope)] {
+			Some(label) => {
+				self.push(mir::ExprKind::Block { label, statements }, ty)
+			}
+			None => self.push(mir::ExprKind::Sequence { statements }, ty),
+		}
+	}
 }
 
 /// Source field selections are lowering metadata, never MIR type structure.
@@ -72,31 +175,59 @@ struct AggregateLowering {
 struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	context: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 	functions: Vec<mir::Function>,
+	/// Index-aligned with `functions`.
+	function_flags: Vec<mir::FunctionFlags>,
+	/// One entry per imported item lowered, in the order lowering met them.
+	imports: Vec<mir::Import>,
+	/// Indexed by `GlobalId`.
+	globals: Vec<mir::Global>,
+	/// Each source global's backend identity, given the first time something
+	/// names it; indexed by `GlobalIdx`.
+	global_ids: Vec<Option<mir::GlobalId>>,
 	signatures: Vec<mir::FunctionSignature>,
-	call_edges: Vec<(mir::FunctionId, mir::FunctionId)>,
-	/// Backend identity, minted here. Never a source or Wasm index.
-	ids: HashMap<FunctionIdx, mir::FunctionId>,
+	/// Backend identity, minted here per instance. Never a source or Wasm
+	/// index.
+	ids: HashMap<FunctionInstance, mir::FunctionId>,
 	/// Concrete source types already translated into flat representations.
 	aggregate_types: HashMap<TypeIndex, AggregateLowering>,
 	aggregates: AggregateTable,
-	pending: VecDeque<FunctionIdx>,
+	pending: VecDeque<FunctionInstance>,
+	/// The instance whose body first named each instance; the roots (the
+	/// exports) have none. Read by the recursion limit.
+	callers: HashMap<FunctionInstance, FunctionInstance>,
 	next_id: u32,
 }
+
+/// How many instances of one function may nest along a chain of callers,
+/// rustc's default `recursion_limit`.
+const RECURSION_LIMIT: u32 = 128;
+
+/// How many Wasm values one type may flatten to. A resource limit, not a
+/// language rule: interned types share their parts, so a doubling chain
+/// (`f((x, x))` in `f<T>`) is a handful of types that flatten to
+/// exponentially many values, long before the recursion limit stops it.
+/// Far above what a program writes by hand.
+const SLOT_LIMIT: usize = 1 << 16;
 
 /// The separate build entry point. `check` is untouched; this repeats its
 /// setup and then lowers the same live context instead of dropping it.
 pub(super) fn build(
 	context: &mut TypeContext<'_, '_, '_>,
 ) -> Result<mir::MIR, ()> {
+	let global_count = context.defs.globals.len();
 	Lowerer {
 		context,
 		functions: Vec::new(),
+		function_flags: Vec::new(),
+		imports: Vec::new(),
+		globals: Vec::new(),
+		global_ids: vec![None; global_count],
 		signatures: Vec::new(),
-		call_edges: Vec::new(),
 		ids: HashMap::new(),
 		aggregate_types: HashMap::new(),
 		aggregates: AggregateTable::default(),
 		pending: VecDeque::new(),
+		callers: HashMap::new(),
 		next_id: 0,
 	}
 	.run()
@@ -117,11 +248,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		for (name, item) in exports {
 			match item {
 				super::signatures::ExportedItem::Function(function) => {
-					let id = self.enqueue(function);
-					mir_exports.push(mir::ExportItem::Function { id, name });
+					let id = self.enqueue(FunctionInstance::of(function));
+					mir_exports.push(mir::Export {
+						name,
+						item: mir::Item::Function(id),
+					});
 				}
-				super::signatures::ExportedItem::Global(_)
-				| super::signatures::ExportedItem::Memory(_) => {
+				super::signatures::ExportedItem::Global(global) => {
+					let id = self.global(global)?;
+					mir_exports.push(mir::Export {
+						name,
+						item: mir::Item::Global(id),
+					});
+				}
+				super::signatures::ExportedItem::Memory(_) => {
 					let source = self
 						.context
 						.defs
@@ -131,44 +271,196 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					self.unsupported(
 						source.external_span.file_id,
 						source.external_span.span,
-						"exporting a global or a memory",
+						"exporting a memory",
 					)?;
 				}
 			}
 		}
 
-		while let Some(function) = self.pending.pop_front() {
-			self.lower_function(function)?;
+		while let Some(instance) = self.pending.pop_front() {
+			self.lower_function(instance)?;
 		}
 
-		Ok(mir::MIR {
+		let mir = mir::MIR {
 			functions: self.functions,
-			inline_functions: HashSet::new(),
+			function_flags: self.function_flags,
 			signatures: self.signatures,
-			globals: Vec::new(),
+			globals: self.globals,
 			exports: mir_exports,
-			imports: Vec::new(),
+			imports: self.imports,
 			memories: Vec::new(),
 			aggregates: self.aggregates.finish(),
 			static_entries: Vec::new(),
-			call_edges: self.call_edges,
 			start_function: None,
-		})
+		};
+		if cfg!(debug_assertions)
+			&& let Err(import) = mir.verify_imports()
+		{
+			panic!("import entry {import:?} and its item disagree");
+		}
+		Ok(mir)
 	}
 
-	fn enqueue(&mut self, function: FunctionIdx) -> mir::FunctionId {
-		if let Some(&id) = self.ids.get(&function) {
+	/// The instance of `function` with the concrete `args`.
+	fn instance(
+		&mut self,
+		function: FunctionIdx,
+		args: &[TypeIndex],
+	) -> FunctionInstance {
+		if args.is_empty() {
+			return FunctionInstance::of(function);
+		}
+		debug_assert!(
+			args.iter().all(|&arg| !self.context.types.has_param(arg)),
+			"an instance's arguments are concrete"
+		);
+		let item = self.context.types.intern_function(function, args);
+		let Type::Function { type_args, .. } =
+			*self.context.types.resolve(item)
+		else {
+			unreachable!("a function interns as a `Type::Function`")
+		};
+		FunctionInstance {
+			function,
+			args: type_args,
+		}
+	}
+
+	/// What a call in `state`'s body runs: `function` with the call's
+	/// `type_args`, made concrete with the caller's own, and, for a trait's
+	/// declaration, the member the impl its `Self` selects provides.
+	fn resolve_call(
+		&mut self,
+		state: &FunctionState,
+		function: FunctionIdx,
+		type_args: TypeList,
+		span: TextSpan,
+	) -> Result<(FunctionInstance, Dispatch), ()> {
+		let written: Vec<TypeIndex> =
+			self.context.types.list(type_args).to_vec();
+		let args: Vec<TypeIndex> = written
+			.into_iter()
+			.map(|arg| self.substitute(arg, state.env, &state.args))
+			.collect();
+		let (function, args, dispatch) =
+			match self.context.resolve_function(function, &args) {
+				Ok(ResolvedFunction::Instance { function, args }) => {
+					(function, args, Dispatch::Direct)
+				}
+				Ok(ResolvedFunction::Item { function, args }) => {
+					(function, args, Dispatch::Item)
+				}
+				Ok(ResolvedFunction::Builtin) => {
+					self.unsupported(
+						state.file_id,
+						span,
+						"a call the compiler implements (a function \
+						 reference's or a slice's)",
+					)?;
+					unreachable!()
+				}
+				Ok(ResolvedFunction::Abstract) => {
+					unreachable!("an instance's arguments are concrete")
+				}
+				// The checker proved the bound, so only a reported failure
+				// reaches here.
+				Err(_) => return Err(()),
+			};
+		Ok((self.instance(function, &args), dispatch))
+	}
+
+	/// The instance a call in `state`'s body runs, queued, for an operator
+	/// trait's method, which is never a function item's `Call::call`.
+	fn callee(
+		&mut self,
+		state: &FunctionState,
+		function: FunctionIdx,
+		type_args: TypeList,
+		span: TextSpan,
+	) -> Result<(FunctionInstance, mir::FunctionId), ()> {
+		let (instance, dispatch) =
+			self.resolve_call(state, function, type_args, span)?;
+		debug_assert!(matches!(dispatch, Dispatch::Direct));
+		let id = self.enqueue_from(state, instance, span)?;
+		Ok((instance, id))
+	}
+
+	/// `instance`'s backend identity, named at `span` in `state`'s body.
+	///
+	/// A new instance remembers its caller, which bounds polymorphic
+	/// recursion as rustc's recursion limit does: an instance nested inside
+	/// more than [`RECURSION_LIMIT`] instances of its own function, along the
+	/// chain of callers that first named each, is an error. Only a generic
+	/// function can get there, since a recursive call with the same
+	/// arguments is the same instance.
+	fn enqueue_from(
+		&mut self,
+		state: &FunctionState,
+		instance: FunctionInstance,
+		span: TextSpan,
+	) -> Result<mir::FunctionId, ()> {
+		if let Some(&id) = self.ids.get(&instance) {
+			return Ok(id);
+		}
+		let mut depth = 1;
+		let mut at = Some(state.instance);
+		while let Some(caller) = at {
+			if caller.function == instance.function {
+				depth += 1;
+			}
+			at = self.callers.get(&caller).copied();
+		}
+		if depth > RECURSION_LIMIT {
+			let function =
+				&self.context.defs.functions[usize::from(instance.function)];
+			let (definition_file, definition_span) =
+				(function.file_id, function.name.span);
+			let item = self.context.types.intern_function(
+				instance.function,
+				self.context.types.list(instance.args).to_vec().as_slice(),
+			);
+			let name = self.context.type_formatter().display_type(item);
+			self.context.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::RecursionLimit.code())
+					.with_message(format!(
+						"reached the recursion limit while instantiating `{name}`"
+					))
+					.with_label(
+						Label::primary(state.file_id, span)
+							.with_message("this call instantiates it"),
+					)
+					.with_label(
+						Label::secondary(definition_file, definition_span)
+							.with_message("the function is defined here"),
+					)
+					.with_note(format!(
+						"each instance is called with new type arguments, so \
+						 instantiating it never ends; the limit is \
+						 {RECURSION_LIMIT} nested instances of one function"
+					)),
+			);
+			return Err(());
+		}
+		self.callers.insert(instance, state.instance);
+		Ok(self.enqueue(instance))
+	}
+
+	/// `instance`'s backend identity, queueing its body the first time.
+	fn enqueue(&mut self, instance: FunctionInstance) -> mir::FunctionId {
+		if let Some(&id) = self.ids.get(&instance) {
 			return id;
 		}
 		let id = mir::FunctionId::new(self.next_id);
 		self.next_id += 1;
-		self.ids.insert(function, id);
-		self.pending.push_back(function);
+		self.ids.insert(instance, id);
+		self.pending.push_back(instance);
 		id
 	}
 
-	fn lower_function(&mut self, function: FunctionIdx) -> Result<(), ()> {
-		let id = self.ids[&function];
+	fn lower_function(&mut self, instance: FunctionInstance) -> Result<(), ()> {
+		let function = instance.function;
+		let id = self.ids[&instance];
 		let file_id =
 			self.context.defs.functions[usize::from(function)].file_id;
 		let name_span =
@@ -182,16 +474,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					"exporting an intrinsic function (requires a wrapper)",
 				)?;
 			}
-			FunctionImplementation::Imported(import) => {
-				let name = self.context.defs.imports[usize::from(*import)]
-					.external_name
-					.inner;
-				let name = self.context.strings.resolve(name).unwrap();
-				self.unsupported(
-					file_id,
-					name_span,
-					&format!("an imported function from `{name}`"),
-				)?;
+			&FunctionImplementation::Imported(import) => {
+				return self.lower_imported_function(instance, import);
 			}
 			FunctionImplementation::Declaration => {
 				let provided = matches!(
@@ -213,18 +497,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				)?;
 			}
 		}
-		let (signature_index, param_types, result_type, env) =
-			self.lower_signature(function)?;
+		let (signature_index, param_types, result_type) =
+			self.lower_signature(instance)?;
+		let env = self.context.functions[usize::from(function)].type_params;
+		let args: Box<[TypeIndex]> =
+			self.context.types.list(instance.args).into();
 
 		let implementation = std::mem::replace(
 			&mut self.context.function_implementations[usize::from(function)],
 			FunctionImplementation::Declaration,
 		);
 		let lowered = self.lower_body(
-			function,
-			id,
+			instance,
 			file_id,
 			env,
+			args,
 			implementation
 				.body()
 				.expect("only a defined function enters body lowering"),
@@ -234,31 +521,167 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		// Put the checked body back: lowering borrows it, it does not consume it.
 		self.context.function_implementations[usize::from(function)] =
 			implementation;
-		let (scopes, locals, block) = lowered?;
-
+		let state = lowered?;
+		let root = state.root.expect("a lowered body has a root");
+		if cfg!(debug_assertions)
+			&& let Err(error) = mir::body::verify(
+				&state.mir_body,
+				root,
+				&state.locals,
+				state.label_count,
+			) {
+			panic!("lowering broke the MIR arena's invariants: {error:?}");
+		}
+		// Instances are lowered in the order their ids were given, so a
+		// function's id is its index.
+		debug_assert_eq!(usize::from(id), self.functions.len());
 		self.functions.push(mir::Function {
-			id,
 			signature_index,
-			scopes,
-			locals,
-			block,
-			static_data: Vec::new(),
+			origin: mir::Origin::Defined(mir::Code {
+				locals: state.locals,
+				label_count: state.label_count,
+				body: state.mir_body,
+				root,
+			}),
 		});
+		// Every instance of an `#[inline]` function is inline: the attribute
+		// is on the declaration, and an instance only fills its parameters.
+		let mut flags = mir::FunctionFlags::empty();
+		if self.context.defs.functions[usize::from(function)]
+			.attributes
+			.contains(Attributes::INLINE)
+		{
+			flags.insert(mir::FunctionFlags::INLINE);
+		}
+		self.function_flags.push(flags);
 		Ok(())
 	}
 
+	/// An imported function: its signature, and the import entry naming it.
+	/// The host provides it as `module`.`name`, with `name` its written name.
+	fn lower_imported_function(
+		&mut self,
+		instance: FunctionInstance,
+		import: super::defs::ImportIdx,
+	) -> Result<(), ()> {
+		let id = self.ids[&instance];
+		let (signature_index, _, _) = self.lower_signature(instance)?;
+		let entry =
+			mir::ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
+		self.imports.push(mir::Import {
+			module: self.context.defs.imports[usize::from(import)]
+				.external_name
+				.inner,
+			name: self.context.defs.functions[usize::from(instance.function)]
+				.name
+				.inner,
+			item: mir::Item::Function(id),
+		});
+		debug_assert_eq!(usize::from(id), self.functions.len());
+		self.functions.push(mir::Function {
+			signature_index,
+			origin: mir::Origin::Imported(entry),
+		});
+		self.function_flags.push(mir::FunctionFlags::empty());
+		Ok(())
+	}
+
+	/// `global`'s backend identity, lowering it the first time: its one Wasm
+	/// value's type, and an import entry or its compile-time value.
+	pub(super) fn global(
+		&mut self,
+		global: GlobalIdx,
+	) -> Result<mir::GlobalId, ()> {
+		if let Some(id) = self.global_ids[usize::from(global)] {
+			return Ok(id);
+		}
+		let def = &self.context.defs.globals[usize::from(global)];
+		let (file_id, name, mutable) =
+			(def.file_id, def.name, def.mut_trait_impl_index.is_some());
+		let value_type = self.context.global_value_type(global);
+		let ty = self.lower_type(value_type, file_id, name.span)?;
+		// The checker proved it one Wasm value: a scalar, or a pack of one
+		// (`Meters(u32)`), which the module holds as that scalar.
+		let ty = match ty {
+			mir::ValueType::Aggregate { aggregate_index } => {
+				let [scalar] = *self.aggregates.get(aggregate_index).scalars
+				else {
+					unreachable!("a global's value is one Wasm value")
+				};
+				scalar
+			}
+			ty => ty,
+		};
+		let id = mir::GlobalId::new(u32::try_from(self.globals.len()).unwrap());
+		let origin =
+			match self.context.ast_node(super::defs::DefId::Global(global)) {
+				&super::defs::AstNodeRef::ImportedGlobal {
+					import_index,
+					..
+				} => {
+					let entry = mir::ImportIdx::new(
+						u32::try_from(self.imports.len()).unwrap(),
+					);
+					self.imports.push(mir::Import {
+						module: self.context.defs.imports
+							[usize::from(import_index)]
+						.external_name
+						.inner,
+						name: name.inner,
+						item: mir::Item::Global(id),
+					});
+					mir::Origin::Imported(entry)
+				}
+				_ => {
+					let value = self.context.global_values[usize::from(global)]
+						.as_deref()
+						.expect("a checked global without errors has a value");
+					let [scalar] = value else {
+						unreachable!("a global's value is one Wasm value")
+					};
+					mir::Origin::Defined(match scalar.val {
+						Val::I32(bits) => {
+							mir::ConstInit::Int(i64::from(bits as i32))
+						}
+						Val::I64(bits) => mir::ConstInit::Int(bits as i64),
+						Val::F32(bits) => mir::ConstInit::Float(f64::from(
+							f32::from_bits(bits),
+						)),
+						Val::F64(bits) => {
+							mir::ConstInit::Float(f64::from_bits(bits))
+						}
+						Val::MemoryOffset { .. } | Val::V128(_) => {
+							self.unsupported(
+								file_id,
+								name.span,
+								"a global holding an address (the memory checkpoint)",
+							)?;
+							unreachable!()
+						}
+					})
+				}
+			};
+		self.globals.push(mir::Global {
+			id,
+			ty,
+			mutability: if mutable {
+				mir::Mutability::Mutable
+			} else {
+				mir::Mutability::Immutable
+			},
+			origin,
+		});
+		self.global_ids[usize::from(global)] = Some(id);
+		Ok(id)
+	}
+
+	/// `instance`'s MIR signature, and its parameter and result types.
 	fn lower_signature(
 		&mut self,
-		function: FunctionIdx,
-	) -> Result<
-		(
-			mir::SignatureIndex,
-			Vec<mir::ValueType>,
-			mir::ValueType,
-			TypeEnvIdx,
-		),
-		(),
-	> {
+		instance: FunctionInstance,
+	) -> Result<(mir::SignatureIndex, Vec<mir::ValueType>, mir::ValueType), ()>
+	{
+		let function = instance.function;
 		let (type_params, param_list, return_type) = {
 			let signature = &self.context.functions[usize::from(function)];
 			(
@@ -271,35 +694,77 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			self.context.defs.functions[usize::from(function)].file_id;
 		let name_span =
 			self.context.defs.functions[usize::from(function)].name.span;
-		if !self.context.type_envs.param_names(type_params).is_empty() {
-			self.unsupported(
-				file_id,
-				name_span,
-				"generic functions (monomorphization is not implemented)",
-			)?;
-			unreachable!()
-		}
+		// The flat arguments cover the whole parameter chain: an enclosing
+		// impl's, then the function's own. Every instance comes from a
+		// checked call, and the checker refuses to export a generic function
+		// (E2019), so a missing argument is a broken invariant.
+		assert_eq!(
+			self.context.type_envs.identity_args(type_params).len(),
+			instance.args.len(),
+			"an instance has an argument for every parameter in its chain"
+		);
 
-		// Copy the list out so lowering a type may borrow the context mutably.
+		// Copy the lists out so lowering a type may borrow the context mutably.
+		let args: Box<[TypeIndex]> =
+			self.context.types.list(instance.args).into();
 		let params: Vec<TypeIndex> =
 			self.context.types.list(param_list).to_vec();
 		let mut param_types = Vec::with_capacity(params.len());
 		for ty in params {
-			param_types.push(self.lower_type(
-				ty,
-				type_params,
-				file_id,
-				name_span,
-			)?);
+			let ty = self.substitute(ty, type_params, &args);
+			param_types.push(self.lower_type(ty, file_id, name_span)?);
 		}
-		let result_type =
-			self.lower_type(return_type, type_params, file_id, name_span)?;
+		let return_type = self.substitute(return_type, type_params, &args);
+		let result_type = self.lower_type(return_type, file_id, name_span)?;
 
 		let mut items = param_types.clone();
 		items.push(result_type);
 		let index =
 			self.intern_signature(items.into_boxed_slice(), param_types.len());
-		Ok((index, param_types, result_type, type_params))
+		Ok((index, param_types, result_type))
+	}
+
+	/// `ty`, written where `env`'s parameters are in scope, with `args` for
+	/// them. Not normalized: `lower_type` normalizes what it lowers.
+	fn substitute(
+		&mut self,
+		ty: TypeIndex,
+		env: TypeEnvIdx,
+		args: &[TypeIndex],
+	) -> TypeIndex {
+		let ty = self.context.types.substitute(
+			ty,
+			Substitution {
+				envs: &self.context.type_envs,
+				env,
+				args,
+			},
+		);
+		debug_assert!(
+			!self.context.types.has_param(ty),
+			"an instance's types are concrete"
+		);
+		ty
+	}
+
+	/// The concrete type of `pattern` in this instance.
+	fn pattern_ty(
+		&mut self,
+		body: &Body,
+		state: &FunctionState,
+		pattern: PatIdx,
+	) -> TypeIndex {
+		self.substitute(body.pattern_ty(pattern), state.env, &state.args)
+	}
+
+	/// The concrete type of `expr` in this instance.
+	fn expr_ty(
+		&mut self,
+		body: &Body,
+		state: &FunctionState,
+		expr: ExprIdx,
+	) -> TypeIndex {
+		self.substitute(body.ty(expr), state.env, &state.args)
 	}
 
 	fn intern_signature(
@@ -324,18 +789,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 
 	fn lower_body(
 		&mut self,
-		function: FunctionIdx,
-		function_id: mir::FunctionId,
+		instance: FunctionInstance,
 		file_id: FileId,
 		env: TypeEnvIdx,
+		args: Box<[TypeIndex]>,
 		body: &Body,
 		param_types: &[mir::ValueType],
 		result_type: mir::ValueType,
-	) -> Result<(Vec<mir::BlockScope>, Vec<mir::Local>, mir::Expression), ()> {
+	) -> Result<FunctionState, ()> {
 		if body.params().len() != param_types.len() {
 			self.unsupported(
 				file_id,
-				self.context.defs.functions[usize::from(function)].name.span,
+				self.context.defs.functions[usize::from(instance.function)]
+					.name
+					.span,
 				"a parameter list that does not match its checked signature",
 			)?;
 		}
@@ -343,11 +810,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let mut state = FunctionState {
 			file_id,
 			env,
-			function_id,
+			args,
+			instance,
 			local_map: vec![mir::LocalIndex::new(0); body.locals().len()],
 			locals: Vec::new(),
-			scopes: Vec::new(),
-			scope_map: HashMap::new(),
+			mir_body: mir::Body::default(),
+			labels: vec![None; body.scope_count()],
+			label_count: 0,
+			root: None,
 		};
 
 		// Parameters occupy the first `params_count` MIR locals, in order —
@@ -373,8 +843,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			{
 				continue;
 			}
-			let ty =
-				self.lower_type(local.ty, env, file_id, local.name.span)?;
+			let ty = self.substitute(local.ty, env, &state.args);
+			let ty = self.lower_type(ty, file_id, local.name.span)?;
 			let index = mir::LocalIndex::new(state.locals.len() as u32);
 			state.locals.push(mir::Local {
 				ty,
@@ -387,10 +857,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			state.local_map[tir_index] = index;
 		}
 
-		let block = self.lower_expr(body, &mut state, body.root())?;
-		if block.ty != result_type
-			&& block.ty != mir::ValueType::Never
-			&& block.ty != mir::ValueType::Unit
+		let root = self.lower_expr(body, &mut state, body.root())?;
+		let root_ty = state.ty(root);
+		state.root = Some(root);
+		if root_ty != result_type
+			&& root_ty != mir::ValueType::Never
+			&& root_ty != mir::ValueType::Unit
 		{
 			self.unsupported(
 				file_id,
@@ -399,7 +871,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			)?;
 		}
 
-		Ok((state.scopes, state.locals, block))
+		Ok(state)
 	}
 
 	fn lower_expr(
@@ -407,37 +879,27 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		body: &Body,
 		state: &mut FunctionState,
 		expr: ExprIdx,
-	) -> Result<mir::Expression, ()> {
-		let ty = self.lower_type(
-			body.ty(expr),
-			state.env,
-			state.file_id,
-			body.span(expr),
-		)?;
+	) -> Result<mir::ExprId, ()> {
+		let ty = self.expr_ty(body, state, expr);
+		let ty = self.lower_type(ty, state.file_id, body.span(expr))?;
 		let kind = body.kind(expr);
 		match kind {
 			ExprKind::Int(bits) => {
 				let kind = match ty {
-					mir::ValueType::F32 => {
-						mir::ExprKind::Float { value: bits as f64 }
-					}
-					mir::ValueType::F64 => {
+					mir::ValueType::F32 | mir::ValueType::F64 => {
 						mir::ExprKind::Float { value: bits as f64 }
 					}
 					_ => mir::ExprKind::Int { value: bits as i64 },
 				};
-				Ok(mir::Expression { kind, ty })
+				Ok(state.push(kind, ty))
 			}
-			ExprKind::Float(value) => Ok(mir::Expression {
-				kind: mir::ExprKind::Float { value },
-				ty,
-			}),
-			ExprKind::Local(local) => Ok(mir::Expression {
-				kind: mir::ExprKind::LocalGet {
-					local_index: state.local_map[usize::from(local)],
-				},
-				ty,
-			}),
+			ExprKind::Float(value) => {
+				Ok(state.push(mir::ExprKind::Float { value }, ty))
+			}
+			ExprKind::Local(local) => {
+				let local = state.local_map[usize::from(local)];
+				Ok(state.push(mir::ExprKind::LocalGet { local }, ty))
+			}
 			ExprKind::PrimitiveUnary { op, operand } => {
 				if ty == mir::ValueType::Never {
 					// The operand diverges, so the operator never runs. Do
@@ -446,18 +908,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					// divergence and the effects that preceded it.
 					debug_assert_eq!(body.ty(operand), TypeIndex::NEVER);
 					let operand = self.lower_expr(body, state, operand)?;
-					debug_assert_eq!(operand.ty, mir::ValueType::Never);
+					debug_assert_eq!(state.ty(operand), mir::ValueType::Never);
 					return Ok(operand);
 				}
-				let operand = Box::new(self.lower_expr(body, state, operand)?);
-				let kind = match op {
-					UnaryOp::InvertSign => {
-						mir::ExprKind::Neg { value: operand }
-					}
-					UnaryOp::Not => mir::ExprKind::Eqz { value: operand },
-					UnaryOp::BitNot => mir::ExprKind::BitNot { value: operand },
+				let value = self.lower_expr(body, state, operand)?;
+				let op = match op {
+					UnaryOp::InvertSign => mir::UnaryOp::Neg,
+					UnaryOp::Not => mir::UnaryOp::Eqz,
+					UnaryOp::BitNot => mir::UnaryOp::BitNot,
 				};
-				Ok(mir::Expression { kind, ty })
+				Ok(state.push(mir::ExprKind::Unary { op, value }, ty))
 			}
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -469,146 +929,76 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					// never evaluated.
 					debug_assert_eq!(body.ty(rhs), TypeIndex::NEVER);
 					let left = self.lower_expr(body, state, lhs)?;
-					debug_assert_eq!(left.ty, mir::ValueType::Never);
+					debug_assert_eq!(state.ty(left), mir::ValueType::Never);
 					return Ok(left);
 				}
-				let left = Box::new(self.lower_expr(body, state, lhs)?);
-				let right = Box::new(self.lower_expr(body, state, rhs)?);
-				let kind = match self.binary_kind(op, left, right) {
-					Some(kind) => kind,
-					None => {
-						self.unsupported(
-							state.file_id,
-							body.span(expr),
-							"an assignment operator in a value position",
-						)?;
-						unreachable!()
-					}
+				let lhs = self.lower_expr(body, state, lhs)?;
+				let rhs = self.lower_expr(body, state, rhs)?;
+				let Some(kind) = binary_kind(op, lhs, rhs) else {
+					self.unsupported(
+						state.file_id,
+						body.span(expr),
+						"an assignment operator in a value position",
+					)?;
+					unreachable!()
 				};
-				Ok(mir::Expression { kind, ty })
+				Ok(state.push(kind, ty))
 			}
 			ExprKind::Call {
 				function,
 				type_args,
 				args,
-			} => {
-				if let FunctionImplementation::Intrinsic(intrinsic) =
-					self.context.function_implementations[usize::from(function)]
-				{
-					return self.lower_intrinsic(
-						body, state, expr, intrinsic, args, ty,
-					);
-				}
-				if !type_args.is_empty() {
-					self.unsupported(
-						state.file_id,
-						body.span(expr),
-						"a call with type arguments",
-					)?;
-				}
-				let callee_id = self.enqueue(function);
-				let (callee_signature, callee_params, ..) =
-					self.lower_signature(function)?;
-				// A lone argument is its parameter's value, so it must not be
-				// unpacked even when that value is itself a tuple.
-				let mut prefix = Vec::new();
-				let arguments = if callee_params.len() == 1 {
-					vec![self.lower_expr(body, state, args)?]
-				} else {
-					self.lower_arguments(body, state, args, &mut prefix)?
-				};
-				let call = self.build_call(
-					state,
-					callee_id,
-					callee_signature,
-					arguments,
-					ty,
-				);
-				Ok(self.sequence(state, prefix, call))
 			}
+			| ExprKind::AbstractCall {
+				method: function,
+				type_args,
+				args,
+			} => self.lower_call(
+				body, state, expr, function, type_args, None, args, ty,
+			),
 			ExprKind::MethodCall {
 				function,
 				type_args,
 				receiver,
 				args,
-			} => {
-				if !type_args.is_empty() {
-					self.unsupported(
-						state.file_id,
-						body.span(expr),
-						"a method call with type arguments",
-					)?;
-				}
-				let callee_id = self.enqueue(function);
-				// The receiver is the first parameter and runs before the
-				// remaining arguments.
-				let receiver = self.lower_expr(body, state, receiver)?;
-				let (callee_signature, callee_params, ..) =
-					self.lower_signature(function)?;
-				let mut prefix = Vec::new();
-				let arguments = if callee_params.len() == 2 {
-					// A lone remaining parameter is its value, not a tuple of
-					// one.
-					vec![self.lower_expr(body, state, args)?]
-				} else {
-					self.lower_arguments(body, state, args, &mut prefix)?
-				};
-				// Reordering or spilling the remaining arguments puts them in
-				// `prefix`, which runs before the call's own arguments. Carry
-				// the receiver through a temporary so it still runs first.
-				let receiver = if prefix.is_empty() {
-					receiver
-				} else {
-					let ty = receiver.ty;
-					let local_index = self.push_temp_local(state, ty);
-					prefix.insert(
-						0,
-						mir::Expression {
-							kind: mir::ExprKind::LocalSet {
-								local_index,
-								value: Box::new(receiver),
-							},
-							ty: mir::ValueType::Unit,
-						},
-					);
-					mir::Expression {
-						kind: mir::ExprKind::LocalGet { local_index },
-						ty,
-					}
-				};
-				let mut call_arguments =
-					Vec::with_capacity(arguments.len() + 1);
-				call_arguments.push(receiver);
-				call_arguments.extend(arguments);
-				let call = self.build_call(
-					state,
-					callee_id,
-					callee_signature,
-					call_arguments,
-					ty,
-				);
-				Ok(self.sequence(state, prefix, call))
+			}
+			| ExprKind::AbstractMethodCall {
+				method: function,
+				type_args,
+				receiver,
+				args,
+			} => self.lower_call(
+				body,
+				state,
+				expr,
+				function,
+				type_args,
+				Some(receiver),
+				args,
+				ty,
+			),
+			// A function item's value is zero-sized; a call of it names its
+			// function by its type. A global's handle is too: `Global::get`
+			// names the global by its type argument.
+			ExprKind::Function { .. } | ExprKind::Global(_) => {
+				Ok(state.push(mir::ExprKind::Noop, ty))
 			}
 			ExprKind::Tuple { elements, order } => {
 				if ty == mir::ValueType::Unit {
 					// `()` is the empty tuple; its only value is Unit.
-					Ok(mir::Expression {
-						kind: mir::ExprKind::Noop,
-						ty,
-					})
-				} else {
-					let mut prefix = Vec::new();
-					let values = self.lower_element_list(
-						body,
-						state,
-						elements,
-						order,
-						&mut prefix,
-					)?;
-					let value =
-						self.build_aggregate(body, state, expr, values, ty)?;
-					Ok(self.sequence(state, prefix, value))
+					return Ok(state.push(mir::ExprKind::Noop, ty));
 				}
+				let mut prefix = Vec::new();
+				let values = self.lower_element_list(
+					body,
+					state,
+					elements,
+					order,
+					&mut prefix,
+				)?;
+				let value =
+					self.build_aggregate(body, state, expr, values, ty)?;
+				Ok(self.sequence(state, prefix, value))
 			}
 			ExprKind::StructConstructor {
 				struct_index: _,
@@ -634,92 +1024,73 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				statements,
 				result,
 			} => {
-				let scope_index = self.scope_for(body, state, scope, ty)?;
-				let mut expressions = Vec::new();
-				for statement in body.args(statements) {
-					expressions.push(self.lower_expr(body, state, *statement)?);
+				let mut lowered = Vec::new();
+				for &statement in body.args(statements) {
+					lowered.push(self.lower_expr(body, state, statement)?);
 				}
 				if let Some(result) = result {
-					expressions.push(self.lower_expr(body, state, result)?);
+					lowered.push(self.lower_expr(body, state, result)?);
 				}
-				Ok(mir::Expression {
-					kind: mir::ExprKind::Block {
-						scope_index,
-						expressions: expressions.into_boxed_slice(),
-					},
-					ty,
-				})
+				// Lowered first, so a `break` inside has already given the
+				// scope its label if it needs one.
+				Ok(state.block(scope, lowered, ty))
 			}
 			ExprKind::Loop { scope, statements } => {
-				// A loop shares its scope with its body: `break` and
-				// `continue` name it, so the body block is what `opt` builds
-				// as the loop. Register the scope before its statements so
-				// jumps inside already see it.
-				let scope_index = self.scope_for(body, state, scope, ty)?;
-				let mut expressions = Vec::new();
-				for statement in body.args(statements) {
-					expressions.push(self.lower_expr(body, state, *statement)?);
+				// A loop always owns a label: `opt` builds it as a loop
+				// block, which `break` leaves and `continue` restarts.
+				let label = state.label(scope);
+				let mut lowered = Vec::new();
+				for &statement in body.args(statements) {
+					lowered.push(self.lower_expr(body, state, statement)?);
 				}
 				// A body runs repeatedly and yields nothing; only a `break`
 				// leaves the loop with a value.
-				let block = mir::Expression {
-					kind: mir::ExprKind::Block {
-						scope_index,
-						expressions: expressions.into_boxed_slice(),
-					},
-					ty: mir::ValueType::Unit,
-				};
-				Ok(mir::Expression {
-					kind: mir::ExprKind::Loop {
-						scope_index,
-						block: Box::new(block),
+				let statements = state.list(lowered);
+				let loop_body = state.push(
+					mir::ExprKind::Sequence { statements },
+					mir::ValueType::Unit,
+				);
+				Ok(state.push(
+					mir::ExprKind::Loop {
+						label,
+						body: loop_body,
 					},
 					ty,
-				})
+				))
 			}
 			ExprKind::Break { scope, value } => {
-				let scope_index = self.jump_scope(body, state, scope)?;
 				let value = match value {
-					Some(value) => {
-						Some(Box::new(self.lower_expr(body, state, value)?))
-					}
+					Some(value) => Some(self.lower_expr(body, state, value)?),
 					None => None,
 				};
-				Ok(mir::Expression {
-					kind: mir::ExprKind::Break { scope_index, value },
-					ty,
-				})
+				let label = state.label(scope);
+				Ok(state.push(mir::ExprKind::Break { label, value }, ty))
 			}
 			ExprKind::Continue { scope } => {
-				let scope_index = self.jump_scope(body, state, scope)?;
-				Ok(mir::Expression {
-					kind: mir::ExprKind::Continue { scope_index },
-					ty,
-				})
+				let label = state.label(scope);
+				Ok(state.push(mir::ExprKind::Continue { label }, ty))
 			}
 			ExprKind::IfElse {
 				condition,
 				then_block,
 				else_block,
 			} => {
-				let condition =
-					Box::new(self.lower_expr(body, state, condition)?);
-				let then_block =
-					Box::new(self.lower_branch(body, state, then_block)?);
-				let else_block = match else_block {
-					Some(else_block) => Some(Box::new(
-						self.lower_branch(body, state, else_block)?,
-					)),
+				let condition = self.lower_expr(body, state, condition)?;
+				let then = self.lower_expr(body, state, then_block)?;
+				let otherwise = match else_block {
+					Some(else_block) => {
+						Some(self.lower_expr(body, state, else_block)?)
+					}
 					None => None,
 				};
-				Ok(mir::Expression {
-					kind: mir::ExprKind::IfElse {
+				Ok(state.push(
+					mir::ExprKind::IfElse {
 						condition,
-						then_block,
-						else_block,
+						then,
+						otherwise,
 					},
 					ty,
-				})
+				))
 			}
 			ExprKind::Char(value) => {
 				let codepoint = i64::from(u32::from(value));
@@ -734,17 +1105,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 							[mir::ValueType::U32],
 							"`Char` is one `u32` codepoint"
 						);
-						Ok(mir::Expression {
-							kind: mir::ExprKind::Aggregate {
-								values: Box::new([mir::Expression {
-									kind: mir::ExprKind::Int {
-										value: codepoint,
-									},
-									ty: mir::ValueType::U32,
-								}]),
-							},
-							ty,
-						})
+						let value = state.push(
+							mir::ExprKind::Int { value: codepoint },
+							mir::ValueType::U32,
+						);
+						let values = state.list([value]);
+						Ok(state.push(mir::ExprKind::Aggregate { values }, ty))
 					}
 					// `coerce_char` turns a character literal into that
 					// integer's value when its context is an integer type.
@@ -760,10 +1126,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 							),
 							"a character literal's non-`Char` type is an integer"
 						);
-						Ok(mir::Expression {
-							kind: mir::ExprKind::Int { value: codepoint },
-							ty,
-						})
+						Ok(state
+							.push(mir::ExprKind::Int { value: codepoint }, ty))
 					}
 				}
 			}
@@ -773,12 +1137,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			ExprKind::Const {
 				constant,
 				type_args,
+			}
+			| ExprKind::AbstractConst {
+				constant,
+				type_args,
 			} => self.lower_constant(body, state, expr, constant, type_args, ty),
 			ExprKind::LocalDeclaration { pattern, value } => {
 				self.lower_local_declaration(body, state, value, pattern, ty)
 			}
 			ExprKind::Assign { target, value } => {
-				let value = Box::new(self.lower_expr(body, state, value)?);
+				let value = self.lower_expr(body, state, value)?;
 				self.write_target(body, state, target, value)
 			}
 			ExprKind::PrimitiveCompoundAssign { op, target, value } => self
@@ -795,7 +1163,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				type_args,
 				target,
 				value,
-			} => self.lower_concrete_compound_assign(
+			}
+			| ExprKind::AbstractCompoundAssign {
+				method,
+				type_args,
+				target,
+				value,
+			} => self.lower_compound_assign_call(
 				body,
 				state,
 				target,
@@ -805,23 +1179,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				body.span(expr),
 			),
 			ExprKind::Drop { value } => {
-				let value = Box::new(self.lower_expr(body, state, value)?);
-				Ok(mir::Expression {
-					kind: mir::ExprKind::Drop { value },
-					ty,
-				})
+				let value = self.lower_expr(body, state, value)?;
+				Ok(state.push(mir::ExprKind::Drop { value }, ty))
 			}
 			ExprKind::Return { value } => {
 				let value = match value {
-					Some(value) => {
-						Some(Box::new(self.lower_expr(body, state, value)?))
-					}
+					Some(value) => Some(self.lower_expr(body, state, value)?),
 					None => None,
 				};
-				Ok(mir::Expression {
-					kind: mir::ExprKind::Return { value },
-					ty,
-				})
+				Ok(state.push(mir::ExprKind::Return { value }, ty))
 			}
 
 			// Checked forms the first checkpoint does not lower yet. Listed
@@ -830,17 +1196,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			| ExprKind::String(_)
 			| ExprKind::Array { .. }
 			| ExprKind::ArrayRepeat { .. }
-			| ExprKind::AbstractConst { .. }
 			| ExprKind::NextDiscriminant(_)
-			| ExprKind::Global(_)
-			| ExprKind::Function { .. }
-			| ExprKind::AbstractCall { .. }
-			| ExprKind::AbstractMethodCall { .. }
 			| ExprKind::CallRef { .. }
 			| ExprKind::Load(_)
 			| ExprKind::AddressOf(_)
 			| ExprKind::Store { .. }
-			| ExprKind::AbstractCompoundAssign { .. }
 			| ExprKind::PrimitiveCompoundStore { .. }
 			| ExprKind::ConcreteCompoundStore { .. }
 			| ExprKind::AbstractCompoundStore { .. } => {
@@ -854,28 +1214,112 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// The MIR node for a direct call to `callee_id`, recording the edge.
-	/// `arguments` are already lowered in evaluation order and the callee's
-	/// signature is already interned.
+	/// The MIR node for a direct call to `callee`. `arguments` are already
+	/// lowered in evaluation order.
 	fn build_call(
 		&mut self,
 		state: &mut FunctionState,
-		callee_id: mir::FunctionId,
-		signature_index: mir::SignatureIndex,
-		arguments: Vec<mir::Expression>,
+		callee: mir::FunctionId,
+		arguments: Vec<mir::ExprId>,
 		ty: mir::ValueType,
-	) -> mir::Expression {
-		self.call_edges.push((state.function_id, callee_id));
-		mir::Expression {
-			kind: mir::ExprKind::Call {
-				callee: Box::new(mir::Expression {
-					kind: mir::ExprKind::Function { id: callee_id },
-					ty: mir::ValueType::Function { signature_index },
-				}),
-				arguments: arguments.into_boxed_slice(),
+	) -> mir::ExprId {
+		let args = state.list(arguments);
+		state.push(
+			mir::ExprKind::Call {
+				function: callee,
+				args,
 			},
 			ty,
+		)
+	}
+
+	/// A call of `function` with `type_args`, as `Call`/`AbstractCall` hold
+	/// it, or, with a `receiver`, as `MethodCall`/`AbstractMethodCall` do.
+	/// `args` is the value of the parameters after the receiver.
+	#[allow(clippy::too_many_arguments)]
+	fn lower_call(
+		&mut self,
+		body: &Body,
+		state: &mut FunctionState,
+		expr: ExprIdx,
+		function: FunctionIdx,
+		type_args: TypeList,
+		receiver: Option<ExprIdx>,
+		args: ExprIdx,
+		ty: mir::ValueType,
+	) -> Result<mir::ExprId, ()> {
+		let span = body.span(expr);
+		let (callee, dispatch) =
+			self.resolve_call(state, function, type_args, span)?;
+		let mut prefix = Vec::new();
+		let receiver = match (receiver, dispatch) {
+			(Some(receiver), Dispatch::Direct) => {
+				Some(self.lower_expr(body, state, receiver)?)
+			}
+			// A function item is zero-sized: it runs for its effects, before
+			// the arguments, and is no parameter of the item's function.
+			(Some(receiver), Dispatch::Item) => {
+				let receiver = self.lower_expr(body, state, receiver)?;
+				if state.ty(receiver) == mir::ValueType::Never {
+					return Ok(receiver);
+				}
+				prefix.push(receiver);
+				None
+			}
+			(None, _) => None,
+		};
+		if let FunctionImplementation::Intrinsic(intrinsic) =
+			self.context.function_implementations[usize::from(callee.function)]
+		{
+			debug_assert!(receiver.is_none(), "an intrinsic is no method");
+			let call = self.lower_intrinsic(
+				body, state, expr, callee, intrinsic, args, ty,
+			)?;
+			return Ok(self.sequence(state, prefix, call));
 		}
+		let callee_id = self.enqueue_from(state, callee, span)?;
+		let (_, callee_params, ..) = self.lower_signature(callee)?;
+		// A lone remaining parameter is its value, so it must not be
+		// unpacked even when that value is itself a tuple.
+		let remaining = callee_params.len() - usize::from(receiver.is_some());
+		let arguments = if remaining == 1 {
+			vec![self.lower_expr(body, state, args)?]
+		} else {
+			self.lower_arguments(body, state, args, &mut prefix)?
+		};
+		let mut call_arguments = Vec::with_capacity(arguments.len() + 1);
+		if let Some(receiver) = receiver {
+			// Reordering or spilling the remaining arguments puts them in
+			// `prefix`, which runs before the call's own arguments. Carry the
+			// receiver through a temporary so it still runs first.
+			let receiver = if prefix.is_empty() {
+				receiver
+			} else {
+				let (set, get) = self.spill(state, receiver);
+				prefix.insert(0, set);
+				get
+			};
+			call_arguments.push(receiver);
+		}
+		call_arguments.extend(arguments);
+		let call = self.build_call(state, callee_id, call_arguments, ty);
+		Ok(self.sequence(state, prefix, call))
+	}
+
+	/// `value` stored in a fresh temporary: the store, and a read of it.
+	fn spill(
+		&mut self,
+		state: &mut FunctionState,
+		value: mir::ExprId,
+	) -> (mir::ExprId, mir::ExprId) {
+		let ty = state.ty(value);
+		let local = self.push_temp_local(state, ty);
+		let set = state.push(
+			mir::ExprKind::LocalSet { local, value },
+			mir::ValueType::Unit,
+		);
+		let get = state.push(mir::ExprKind::LocalGet { local }, ty);
+		(set, get)
 	}
 
 	/// Lower a call's argument value into one MIR argument per parameter, in
@@ -886,24 +1330,46 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		body: &Body,
 		state: &mut FunctionState,
 		args: ExprIdx,
-		prefix: &mut Vec<mir::Expression>,
-	) -> Result<Vec<mir::Expression>, ()> {
+		prefix: &mut Vec<mir::ExprId>,
+	) -> Result<Vec<mir::ExprId>, ()> {
 		let ExprKind::Tuple { elements, order } = body.kind(args) else {
 			let value = self.lower_expr(body, state, args)?;
-			let source_ty = self.normalize_type(body.ty(args), state.env, state.file_id, body.span(args))?;
-			if !matches!(self.context.types.resolve(source_ty), Type::Tuple { .. }) {
+			let source_ty = self.expr_ty(body, state, args);
+			let source_ty =
+				self.normalize_type(source_ty, state.file_id, body.span(args))?;
+			if !matches!(
+				self.context.types.resolve(source_ty),
+				Type::Tuple { .. }
+			) {
 				return Ok(vec![value]);
 			}
 			// A computed argument tuple is evaluated once. Its source fields
 			// may each be a subpack or Unit, not necessarily a single slot.
-			let local_index = self.push_temp_local(state, value.ty);
-			prefix.push(mir::Expression { kind: mir::ExprKind::LocalSet { local_index, value: Box::new(value) }, ty: mir::ValueType::Unit });
-			let field_types = self.aggregate_field_types(source_ty, state.env, state.file_id, body.span(args))?;
+			let value_ty = state.ty(value);
+			let local = self.push_temp_local(state, value_ty);
+			prefix.push(state.push(
+				mir::ExprKind::LocalSet { local, value },
+				mir::ValueType::Unit,
+			));
+			let field_types = self.aggregate_field_types(
+				source_ty,
+				state.file_id,
+				body.span(args),
+			)?;
 			let mut result = Vec::with_capacity(field_types.len());
 			for (at, field_ty) in field_types.into_iter().enumerate() {
-				let ty = self.lower_type(field_ty, state.env, state.file_id, body.span(args))?;
-				let range = self.field_range(source_ty, state, FieldIdx::new(at as u32), body.span(args))?;
-				result.push(mir::Expression { kind: mir::ExprKind::AggregateGet { local_index, range }, ty });
+				let ty =
+					self.lower_type(field_ty, state.file_id, body.span(args))?;
+				let range = self.field_range(
+					source_ty,
+					state,
+					FieldIdx::new(at as u32),
+					body.span(args),
+				)?;
+				result.push(
+					state
+						.push(mir::ExprKind::AggregateGet { local, range }, ty),
+				);
 			}
 			return Ok(result);
 		};
@@ -921,33 +1387,23 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		state: &mut FunctionState,
 		elements: super::body::ExprRange,
 		order: ElementOrder,
-		prefix: &mut Vec<mir::Expression>,
-	) -> Result<Vec<mir::Expression>, ()> {
+		prefix: &mut Vec<mir::ExprId>,
+	) -> Result<Vec<mir::ExprId>, ()> {
 		let written = body.args(elements);
 		let mut lowered = Vec::with_capacity(written.len());
-		for element in written {
-			lowered.push(self.lower_expr(body, state, *element)?);
+		for &element in written {
+			lowered.push(self.lower_expr(body, state, element)?);
 		}
 		match order {
 			ElementOrder::InOrder => Ok(lowered),
 			ElementOrder::Permuted { .. } => {
-				let mut slots: Vec<Option<mir::Expression>> =
-					(0..lowered.len()).map(|_| None).collect();
+				let mut slots: Vec<Option<mir::ExprId>> =
+					vec![None; lowered.len()];
 				for (at, value) in lowered.into_iter().enumerate() {
 					let declared = body.declared_index(order, at);
-					let ty = value.ty;
-					let local_index = self.push_temp_local(state, ty);
-					prefix.push(mir::Expression {
-						kind: mir::ExprKind::LocalSet {
-							local_index,
-							value: Box::new(value),
-						},
-						ty: mir::ValueType::Unit,
-					});
-					slots[usize::from(declared)] = Some(mir::Expression {
-						kind: mir::ExprKind::LocalGet { local_index },
-						ty,
-					});
+					let (set, get) = self.spill(state, value);
+					prefix.push(set);
+					slots[usize::from(declared)] = Some(get);
 				}
 				Ok(slots
 					.into_iter()
@@ -970,9 +1426,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		state: &mut FunctionState,
 		expr: ExprIdx,
 		fields: ExprIdx,
-		prefix: &mut Vec<mir::Expression>,
-	) -> Result<Vec<mir::Expression>, ()> {
-		let expected = self.aggregate_field_types(body.ty(expr), state.env, state.file_id, body.span(expr))?.len();
+		prefix: &mut Vec<mir::ExprId>,
+	) -> Result<Vec<mir::ExprId>, ()> {
+		let expr_ty = self.expr_ty(body, state, expr);
+		let expected = self
+			.aggregate_field_types(expr_ty, state.file_id, body.span(expr))?
+			.len();
 		match expected {
 			0 => Ok(Vec::new()),
 			1 => Ok(vec![self.lower_expr(body, state, fields)?]),
@@ -987,10 +1446,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		body: &Body,
 		state: &mut FunctionState,
 		expr: ExprIdx,
-		values: Vec<mir::Expression>,
+		values: Vec<mir::ExprId>,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
-		let expected = self.aggregate_field_types(body.ty(expr), state.env, state.file_id, body.span(expr))?.len();
+	) -> Result<mir::ExprId, ()> {
+		let expr_ty = self.expr_ty(body, state, expr);
+		let expected = self
+			.aggregate_field_types(expr_ty, state.file_id, body.span(expr))?
+			.len();
 		if values.len() != expected {
 			self.unsupported(
 				state.file_id,
@@ -1001,40 +1463,56 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let mut prefix = Vec::with_capacity(values.len());
 		let mut slots = Vec::with_capacity(self.slot_count(ty));
 		for value in values {
-			if value.ty == mir::ValueType::Never {
+			let value_ty = state.ty(value);
+			if value_ty == mir::ValueType::Never {
 				return Ok(self.sequence(state, prefix, value));
 			}
-			if value.ty == mir::ValueType::Unit {
-				prefix.push(mir::Expression { kind: mir::ExprKind::Drop { value: Box::new(value) }, ty: mir::ValueType::Unit });
+			if value_ty == mir::ValueType::Unit {
+				prefix.push(
+					state.push(
+						mir::ExprKind::Drop { value },
+						mir::ValueType::Unit,
+					),
+				);
 				continue;
 			}
-			let value_ty = value.ty;
-			let local_index = self.push_temp_local(state, value_ty);
-			prefix.push(mir::Expression { kind: mir::ExprKind::LocalSet { local_index, value: Box::new(value) }, ty: mir::ValueType::Unit });
+			let local = self.push_temp_local(state, value_ty);
+			prefix.push(state.push(
+				mir::ExprKind::LocalSet { local, value },
+				mir::ValueType::Unit,
+			));
 			match value_ty {
 				mir::ValueType::Aggregate { aggregate_index } => {
-					for (at, &ty) in self.aggregates.get(aggregate_index).scalars.iter().enumerate() {
-						slots.push(mir::Expression { kind: mir::ExprKind::AggregateGet { local_index, range: mir::ScalarRange::new(at as u32, 1) }, ty });
+					let scalars =
+						self.aggregates.get(aggregate_index).scalars.clone();
+					for (at, ty) in scalars.iter().copied().enumerate() {
+						slots.push(state.push(
+							mir::ExprKind::AggregateGet {
+								local,
+								range: mir::ScalarRange::new(at as u32, 1),
+							},
+							ty,
+						));
 					}
 				}
-				_ => slots.push(mir::Expression { kind: mir::ExprKind::LocalGet { local_index }, ty: value_ty }),
+				_ => slots.push(
+					state.push(mir::ExprKind::LocalGet { local }, value_ty),
+				),
 			}
 		}
 		let value = if ty == mir::ValueType::Unit {
 			assert!(slots.is_empty());
-			mir::Expression { kind: mir::ExprKind::Noop, ty }
-		} else { mir::Expression {
-			kind: mir::ExprKind::Aggregate {
-				values: slots.into_boxed_slice(),
-			},
-			ty,
-		} };
+			state.push(mir::ExprKind::Noop, ty)
+		} else {
+			let values = state.list(slots);
+			state.push(mir::ExprKind::Aggregate { values }, ty)
+		};
 		Ok(self.sequence(state, prefix, value))
 	}
 
 	/// `object.field`. `AggregateGet` addresses a local, so an object that is
-	/// not already one is parked in a fresh temporary inside a small block,
-	/// which keeps the object's evaluation exactly once.
+	/// not already one is parked in a fresh temporary, which keeps the
+	/// object's evaluation exactly once.
 	fn lower_field_access(
 		&mut self,
 		body: &Body,
@@ -1043,7 +1521,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		object: ExprIdx,
 		field: FieldIdx,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		// A chain rooted in a local needs just one absolute slot selection,
 		// rather than a temporary subpack for every source field on the path.
 		let mut root = object;
@@ -1051,44 +1529,38 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			root = object;
 		}
 		if matches!(body.kind(root), ExprKind::Local(_)) {
-			let (local_index, range) = self.local_projection(body, state, expr)?;
-			return Ok(mir::Expression { kind: mir::ExprKind::AggregateGet { local_index, range }, ty });
+			let (local, range) = self.local_projection(body, state, expr)?;
+			return Ok(
+				state.push(mir::ExprKind::AggregateGet { local, range }, ty)
+			);
 		}
 		let object_value = self.lower_expr(body, state, object)?;
-		let range = self.field_range(body.ty(object), state, field, body.span(expr))?;
-		if let mir::ExprKind::LocalGet { local_index } = &object_value.kind {
-			return Ok(mir::Expression {
-				kind: mir::ExprKind::AggregateGet {
-					local_index: *local_index,
-					range,
-				},
-				ty,
-			});
+		let object_ty = self.expr_ty(body, state, object);
+		let range =
+			self.field_range(object_ty, state, field, body.span(expr))?;
+		if let mir::ExprKind::LocalGet { local } =
+			state.mir_body.kind(object_value)
+		{
+			// The read is replaced by the projection, so its node is left
+			// out of the tree; rewrite it into the projection itself.
+			state.mir_body.set_kind(
+				object_value,
+				mir::ExprKind::AggregateGet { local, range },
+			);
+			state.mir_body.set_ty(object_value, ty);
+			return Ok(object_value);
 		}
-		let temp = self.push_temp_local(state, object_value.ty);
-		let scope = self.push_synthetic_scope(state, ty);
-		Ok(mir::Expression {
-			kind: mir::ExprKind::Block {
-				scope_index: scope,
-				expressions: Box::new([
-					mir::Expression {
-						kind: mir::ExprKind::LocalSet {
-							local_index: temp,
-							value: Box::new(object_value),
-						},
-						ty: mir::ValueType::Unit,
-					},
-					mir::Expression {
-						kind: mir::ExprKind::AggregateGet {
-							local_index: temp,
-							range,
-						},
-						ty,
-					},
-				]),
+		let object_ty = state.ty(object_value);
+		let local = self.push_temp_local(state, object_ty);
+		let set = state.push(
+			mir::ExprKind::LocalSet {
+				local,
+				value: object_value,
 			},
-			ty,
-		})
+			mir::ValueType::Unit,
+		);
+		let get = state.push(mir::ExprKind::AggregateGet { local, range }, ty);
+		Ok(self.sequence(state, vec![set], get))
 	}
 
 	fn push_temp_local(
@@ -1104,7 +1576,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		index
 	}
 
-	/// Translate one source declaration field into slots. This map is local
+	/// Translate one source declaration field of the concrete `ty` into
+	/// slots. This map is local
 	/// to lowering; the owned MIR contains neither field IDs nor field types.
 	fn field_range(
 		&mut self,
@@ -1113,8 +1586,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		field: FieldIdx,
 		span: TextSpan,
 	) -> Result<mir::ScalarRange, ()> {
-		let ty = self.normalize_type(ty, state.env, state.file_id, span)?;
-		self.lower_type(ty, state.env, state.file_id, span)?;
+		let ty = self.normalize_type(ty, state.file_id, span)?;
+		self.lower_type(ty, state.file_id, span)?;
 		Ok(self.aggregate_types[&ty].fields[usize::from(field)])
 	}
 
@@ -1133,13 +1606,30 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				Ok((index, mir::ScalarRange::new(0, len as u32)))
 			}
 			ExprKind::FieldAccess { object, field } => {
-				let (local, parent) = self.local_projection(body, state, object)?;
-				let child = self.field_range(body.ty(object), state, field, body.span(target))?;
+				let (local, parent) =
+					self.local_projection(body, state, object)?;
+				let object_ty = self.expr_ty(body, state, object);
+				let child = self.field_range(
+					object_ty,
+					state,
+					field,
+					body.span(target),
+				)?;
 				assert!(child.indices().end <= parent.len as usize);
-				Ok((local, mir::ScalarRange::new(u32::from(parent.start) + u32::from(child.start), child.len)))
+				Ok((
+					local,
+					mir::ScalarRange::new(
+						u32::from(parent.start) + u32::from(child.start),
+						child.len,
+					),
+				))
 			}
 			_ => {
-				self.unsupported(state.file_id, body.span(target), "a non-local assignment target")?;
+				self.unsupported(
+					state.file_id,
+					body.span(target),
+					"a non-local assignment target",
+				)?;
 				unreachable!()
 			}
 		}
@@ -1151,18 +1641,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn read_target(
 		&mut self,
 		body: &Body,
-		state: &FunctionState,
+		state: &mut FunctionState,
 		target: ExprIdx,
 		ty: mir::ValueType,
-	) -> Result<mir::Expression, ()> {
-		let (local_index, range) =
-			self.local_projection(body, state, target)?;
+	) -> Result<mir::ExprId, ()> {
+		let (local, range) = self.local_projection(body, state, target)?;
 		let kind = if matches!(body.kind(target), ExprKind::Local(_)) {
-			mir::ExprKind::LocalGet { local_index }
+			mir::ExprKind::LocalGet { local }
 		} else {
-			mir::ExprKind::AggregateGet { local_index, range }
+			mir::ExprKind::AggregateGet { local, range }
 		};
-		Ok(mir::Expression { kind, ty })
+		Ok(state.push(kind, ty))
 	}
 
 	/// Store `value`, already evaluated, into an assignment target. The
@@ -1170,25 +1659,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn write_target(
 		&mut self,
 		body: &Body,
-		state: &FunctionState,
+		state: &mut FunctionState,
 		target: ExprIdx,
-		value: Box<mir::Expression>,
-	) -> Result<mir::Expression, ()> {
-		let (local_index, range) =
-			self.local_projection(body, state, target)?;
+		value: mir::ExprId,
+	) -> Result<mir::ExprId, ()> {
+		let (local, range) = self.local_projection(body, state, target)?;
 		let kind = if matches!(body.kind(target), ExprKind::Local(_)) {
-			mir::ExprKind::LocalSet { local_index, value }
+			mir::ExprKind::LocalSet { local, value }
 		} else {
 			mir::ExprKind::AggregateSet {
-				local_index,
+				local,
 				range,
 				value,
 			}
 		};
-		Ok(mir::Expression {
-			kind,
-			ty: mir::ValueType::Unit,
-		})
+		Ok(state.push(kind, mir::ValueType::Unit))
 	}
 
 	/// `target op= value` on a primitive scalar. The operand runs first, as
@@ -1203,36 +1688,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		value: ExprIdx,
 		op: BinaryOp,
 		span: TextSpan,
-	) -> Result<mir::Expression, ()> {
-		let target_ty = self.lower_type(
-			body.ty(target),
-			state.env,
-			state.file_id,
-			body.span(target),
-		)?;
+	) -> Result<mir::ExprId, ()> {
+		let target_ty = self.expr_ty(body, state, target);
+		let target_ty =
+			self.lower_type(target_ty, state.file_id, body.span(target))?;
 		let value = self.lower_expr(body, state, value)?;
-		if value.ty == mir::ValueType::Never {
+		if state.ty(value) == mir::ValueType::Never {
 			return Ok(value);
 		}
-		let value_ty = value.ty;
-		let value_local = self.push_temp_local(state, value_ty);
-		let prefix = vec![mir::Expression {
-			kind: mir::ExprKind::LocalSet {
-				local_index: value_local,
-				value: Box::new(value),
-			},
-			ty: mir::ValueType::Unit,
-		}];
+		let (set, operand) = self.spill(state, value);
 		let read = self.read_target(body, state, target, target_ty)?;
-		let operand = mir::Expression {
-			kind: mir::ExprKind::LocalGet {
-				local_index: value_local,
-			},
-			ty: value_ty,
-		};
-		let Some(kind) =
-			self.binary_kind(op, Box::new(read), Box::new(operand))
-		else {
+		let Some(kind) = binary_kind(op, read, operand) else {
 			self.unsupported(
 				state.file_id,
 				span,
@@ -1240,18 +1706,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			)?;
 			unreachable!()
 		};
-		let result = mir::Expression {
-			kind,
-			ty: target_ty,
-		};
-		let store = self.write_target(body, state, target, Box::new(result))?;
-		Ok(self.sequence(state, prefix, store))
+		let result = state.push(kind, target_ty);
+		let store = self.write_target(body, state, target, result)?;
+		Ok(self.sequence(state, vec![set], store))
 	}
 
-	/// `target op= value` through a concrete impl's method. The operand runs
+	/// `target op= value` through an operator trait's method, the impl's
+	/// or, for an abstract target, the one its type selects. The operand runs
 	/// first and is read back from a temporary; then the target is read as
 	/// the receiver, the method runs, and its result is stored.
-	fn lower_concrete_compound_assign(
+	#[allow(clippy::too_many_arguments)]
+	fn lower_compound_assign_call(
 		&mut self,
 		body: &Body,
 		state: &mut FunctionState,
@@ -1260,43 +1725,19 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		method: FunctionIdx,
 		type_args: TypeList,
 		span: TextSpan,
-	) -> Result<mir::Expression, ()> {
-		if !type_args.is_empty() {
-			self.unsupported(
-				state.file_id,
-				span,
-				"a compound assignment with type arguments",
-			)?;
-		}
-		let target_ty = self.lower_type(
-			body.ty(target),
-			state.env,
-			state.file_id,
-			body.span(target),
-		)?;
+	) -> Result<mir::ExprId, ()> {
+		let target_ty = self.expr_ty(body, state, target);
+		let target_ty =
+			self.lower_type(target_ty, state.file_id, body.span(target))?;
 		let value = self.lower_expr(body, state, value)?;
-		if value.ty == mir::ValueType::Never {
+		if state.ty(value) == mir::ValueType::Never {
 			return Ok(value);
 		}
-		let value_ty = value.ty;
-		let value_local = self.push_temp_local(state, value_ty);
-		let prefix = vec![mir::Expression {
-			kind: mir::ExprKind::LocalSet {
-				local_index: value_local,
-				value: Box::new(value),
-			},
-			ty: mir::ValueType::Unit,
-		}];
+		let (set, operand) = self.spill(state, value);
 		let read = self.read_target(body, state, target, target_ty)?;
-		let operand = mir::Expression {
-			kind: mir::ExprKind::LocalGet {
-				local_index: value_local,
-			},
-			ty: value_ty,
-		};
-		let callee_id = self.enqueue(method);
-		let (callee_signature, callee_params, ..) =
-			self.lower_signature(method)?;
+		let (callee, callee_id) =
+			self.callee(state, method, type_args, span)?;
+		let (_, callee_params, ..) = self.lower_signature(callee)?;
 		if callee_params.len() != 2 {
 			self.unsupported(
 				state.file_id,
@@ -1305,22 +1746,19 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			)?;
 			unreachable!()
 		}
-		let call = self.build_call(
-			state,
-			callee_id,
-			callee_signature,
-			vec![read, operand],
-			target_ty,
-		);
-		let store = self.write_target(body, state, target, Box::new(call))?;
-		Ok(self.sequence(state, prefix, store))
+		let call =
+			self.build_call(state, callee_id, vec![read, operand], target_ty);
+		let store = self.write_target(body, state, target, call)?;
+		Ok(self.sequence(state, vec![set], store))
 	}
 
 	fn slot_count(&self, ty: mir::ValueType) -> usize {
 		match ty {
 			mir::ValueType::Unit => 0,
 			mir::ValueType::Never => panic!("divergence is not an empty value"),
-			mir::ValueType::Aggregate { aggregate_index } => self.aggregates.get(aggregate_index).scalars.len(),
+			mir::ValueType::Aggregate { aggregate_index } => {
+				self.aggregates.get(aggregate_index).scalars.len()
+			}
 			_ => 1,
 		}
 	}
@@ -1330,102 +1768,22 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn sequence(
 		&mut self,
 		state: &mut FunctionState,
-		mut prefix: Vec<mir::Expression>,
-		value: mir::Expression,
-	) -> mir::Expression {
+		mut prefix: Vec<mir::ExprId>,
+		value: mir::ExprId,
+	) -> mir::ExprId {
 		if prefix.is_empty() {
 			return value;
 		}
-		let ty = value.ty;
-		let scope_index = self.push_synthetic_scope(state, ty);
+		let ty = state.ty(value);
 		prefix.push(value);
-		mir::Expression {
-			kind: mir::ExprKind::Block {
-				scope_index,
-				expressions: prefix.into_boxed_slice(),
-			},
-			ty,
-		}
-	}
-
-	/// A compiler-made scope, used only to sequence a temporary. No source
-	/// `break` targets it, so `opt` builds it transparently.
-	fn push_synthetic_scope(
-		&mut self,
-		state: &mut FunctionState,
-		result: mir::ValueType,
-	) -> mir::ScopeIndex {
-		let index = mir::ScopeIndex::new(state.scopes.len() as u32);
-		state.scopes.push(mir::BlockScope {
-			kind: mir::BlockKind::Block,
-			result,
-		});
-		index
-	}
-
-	fn scope_for(
-		&mut self,
-		body: &Body,
-		state: &mut FunctionState,
-		scope: ScopeIdx,
-		result: mir::ValueType,
-	) -> Result<mir::ScopeIndex, ()> {
-		if let Some(&index) = state.scope_map.get(&scope) {
-			return Ok(index);
-		}
-		let kind = match body.scope(scope).kind {
-			ScopeKind::Block => mir::BlockKind::Block,
-			ScopeKind::Loop => mir::BlockKind::Loop,
-		};
-		let index = mir::ScopeIndex::new(state.scopes.len() as u32);
-		state.scopes.push(mir::BlockScope { kind, result });
-		state.scope_map.insert(scope, index);
-		Ok(index)
-	}
-
-	/// An `if`'s branch. A source branch is a block, but `else if` puts an
-	/// `if` where the else branch goes; MIR requires every branch to be a
-	/// `Block`, so a non-block branch gets a transparent wrapper.
-	fn lower_branch(
-		&mut self,
-		body: &Body,
-		state: &mut FunctionState,
-		branch: ExprIdx,
-	) -> Result<mir::Expression, ()> {
-		let value = self.lower_expr(body, state, branch)?;
-		Ok(self.block_for_branch(state, value))
-	}
-
-	/// A branch value as the `Block` MIR requires. A source block already is
-	/// one; a value synthesized by lowering (an `else if`'s nested `if`, or
-	/// a short-circuit's constant) is wrapped in a block with its own
-	/// synthetic scope, which has no source label and is transparent to
-	/// `opt`.
-	fn block_for_branch(
-		&mut self,
-		state: &mut FunctionState,
-		value: mir::Expression,
-	) -> mir::Expression {
-		if matches!(value.kind, mir::ExprKind::Block { .. }) {
-			return value;
-		}
-		let ty = value.ty;
-		let scope_index = self.push_synthetic_scope(state, ty);
-		mir::Expression {
-			kind: mir::ExprKind::Block {
-				scope_index,
-				expressions: Box::new([value]),
-			},
-			ty,
-		}
+		let statements = state.list(prefix);
+		state.push(mir::ExprKind::Sequence { statements }, ty)
 	}
 
 	/// `&&` and `||` branch on the left operand, so the right one runs only
-	/// when it decides the result. MIR's `And`/`Or` are bitwise on both
-	/// operands, so the low-level form is an `IfElse`:
-	/// `a && b` is `if a { b } else { false }`, and `a || b` is
-	/// `if a { true } else { b }`. The left operand is evaluated exactly
-	/// once, before either branch.
+	/// when it decides the result: `a && b` is `if a { b } else { false }`,
+	/// and `a || b` is `if a { true } else { b }`. The left operand is
+	/// evaluated exactly once, before either branch.
 	fn lower_short_circuit(
 		&mut self,
 		body: &Body,
@@ -1433,96 +1791,28 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		op: BinaryOp,
 		lhs: ExprIdx,
 		rhs: ExprIdx,
-	) -> Result<mir::Expression, ()> {
+	) -> Result<mir::ExprId, ()> {
 		// A diverging operand is `!`, which fits the `Bool` expectation, so
 		// it never produces a value for the branch.
 		debug_assert!(matches!(
 			body.ty(lhs),
 			TypeIndex::BOOL | TypeIndex::NEVER
 		));
-		let condition = Box::new(self.lower_expr(body, state, lhs)?);
+		let condition = self.lower_expr(body, state, lhs)?;
 		let right = self.lower_expr(body, state, rhs)?;
-		let literal = |value| mir::Expression::boolean(value);
-		let (then_value, else_value) = match op {
-			BinaryOp::And => (right, literal(false)),
-			BinaryOp::Or => (literal(true), right),
+		let (then, otherwise) = match op {
+			BinaryOp::And => (right, state.boolean(false)),
+			BinaryOp::Or => (state.boolean(true), right),
 			_ => unreachable!("only logical operators short-circuit"),
 		};
-		let then_block = Box::new(self.block_for_branch(state, then_value));
-		let else_block = Box::new(self.block_for_branch(state, else_value));
-		Ok(mir::Expression {
-			kind: mir::ExprKind::IfElse {
+		Ok(state.push(
+			mir::ExprKind::IfElse {
 				condition,
-				then_block,
-				else_block: Some(else_block),
+				then,
+				otherwise: Some(otherwise),
 			},
-			ty: mir::ValueType::Bool,
-		})
-	}
-
-	/// The MIR scope a `break` or `continue` targets. A jump only names a
-	/// scope that encloses it, and lowering registers a scope before its
-	/// body, so the target is already known; a miss would mean the checked
-	/// tables disagree and is diagnosed rather than indexed blindly.
-	fn jump_scope(
-		&mut self,
-		body: &Body,
-		state: &FunctionState,
-		scope: ScopeIdx,
-	) -> Result<mir::ScopeIndex, ()> {
-		match state.scope_map.get(&scope) {
-			Some(&index) => Ok(index),
-			None => {
-				self.unsupported(
-					state.file_id,
-					body.scope(scope).span,
-					"a jump to a scope that was not lowered",
-				)?;
-				unreachable!()
-			}
-		}
-	}
-
-	fn binary_kind(
-		&self,
-		op: BinaryOp,
-		left: Box<mir::Expression>,
-		right: Box<mir::Expression>,
-	) -> Option<mir::ExprKind> {
-		Some(match op {
-			BinaryOp::Add => mir::ExprKind::Add { left, right },
-			BinaryOp::Sub => mir::ExprKind::Sub { left, right },
-			BinaryOp::Mul => mir::ExprKind::Mul { left, right },
-			BinaryOp::Div => mir::ExprKind::Div { left, right },
-			BinaryOp::Rem => mir::ExprKind::Rem { left, right },
-			BinaryOp::Eq => mir::ExprKind::Eq { left, right },
-			BinaryOp::NotEq => mir::ExprKind::NotEq { left, right },
-			BinaryOp::Less => mir::ExprKind::Less { left, right },
-			BinaryOp::LessEq => mir::ExprKind::LessEq { left, right },
-			BinaryOp::Greater => mir::ExprKind::Greater { left, right },
-			BinaryOp::GreaterEq => mir::ExprKind::GreaterEq { left, right },
-			// Unreachable from `lower_expr`: `&&`/`||` are lowered as
-			// `IfElse` branches (see `lower_short_circuit`). The mapping
-			// remains for the exhaustive operator table and hand-built MIR.
-			BinaryOp::And => mir::ExprKind::And { left, right },
-			BinaryOp::Or => mir::ExprKind::Or { left, right },
-			BinaryOp::BitAnd => mir::ExprKind::BitAnd { left, right },
-			BinaryOp::BitOr => mir::ExprKind::BitOr { left, right },
-			BinaryOp::BitXor => mir::ExprKind::BitXor { left, right },
-			BinaryOp::LeftShift => mir::ExprKind::LeftShift { left, right },
-			BinaryOp::RightShift => mir::ExprKind::RightShift { left, right },
-			BinaryOp::Assign
-			| BinaryOp::AddAssign
-			| BinaryOp::SubAssign
-			| BinaryOp::MulAssign
-			| BinaryOp::DivAssign
-			| BinaryOp::RemAssign
-			| BinaryOp::BitAndAssign
-			| BinaryOp::BitOrAssign
-			| BinaryOp::BitXorAssign
-			| BinaryOp::LeftShiftAssign
-			| BinaryOp::RightShiftAssign => return None,
-		})
+			mir::ValueType::Bool,
+		))
 	}
 
 	/// The one type funnel: checked TIR type → MIR value type. Anything not
@@ -1537,11 +1827,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn lower_type(
 		&mut self,
 		ty: TypeIndex,
-		env: TypeEnvIdx,
 		file_id: FileId,
 		span: TextSpan,
 	) -> Result<mir::ValueType, ()> {
-		let ty = self.normalize_type(ty, env, file_id, span)?;
+		let ty = self.normalize_type(ty, file_id, span)?;
 		if ty == TypeIndex::UNIT {
 			return Ok(mir::ValueType::Unit);
 		}
@@ -1567,10 +1856,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			Type::Enum { enum_index } => {
 				let repr = self.context.enums[usize::from(enum_index)].repr;
-				self.lower_type(repr, env, file_id, span)?
+				self.lower_type(repr, file_id, span)?
 			}
 			Type::Tuple { .. } | Type::Struct { .. } => {
-				return self.lower_aggregate_type(ty, env, file_id, span);
+				return self.lower_aggregate_type(ty, file_id, span);
 			}
 			Type::Pointer { .. } | Type::Array { .. } | Type::Slice { .. } => {
 				self.unsupported(
@@ -1580,9 +1869,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				)?;
 				unreachable!()
 			}
-			Type::Funcref
-			| Type::TypedFuncref { .. }
-			| Type::Function { .. } => {
+			// A function item is its own zero-sized type: calling it names
+			// its function, so the value carries nothing.
+			Type::Function { .. } => mir::ValueType::Unit,
+			// A global's handle names it in its type; the value is nothing.
+			Type::Global { .. } => mir::ValueType::Unit,
+			Type::Funcref | Type::TypedFuncref { .. } => {
 				self.unsupported(file_id, span, "a function reference type")?;
 				unreachable!()
 			}
@@ -1598,10 +1890,34 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		Ok(lowered)
 	}
 
-	fn normalize_type(&mut self, ty: TypeIndex, env: TypeEnvIdx, file_id: FileId, span: TextSpan) -> Result<TypeIndex, ()> {
-		match self.context.normalize(env, ty, NormalizationDepth::Deep, RewriteFlags::ALL) {
+	/// `ty`, which has no parameter, with every projection and constant in
+	/// it reduced. A parameter-free type means the same in every scope, so
+	/// this asks the root scope, as the solver itself keys such a request.
+	fn normalize_type(
+		&mut self,
+		ty: TypeIndex,
+		file_id: FileId,
+		span: TextSpan,
+	) -> Result<TypeIndex, ()> {
+		debug_assert!(
+			!self.context.types.has_param(ty),
+			"lowering normalizes concrete types only"
+		);
+		match self.context.normalize(
+			TypeEnvIdx::ROOT,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		) {
 			Ok(ty) => Ok(ty),
-			Err(_) => { self.unsupported(file_id, span, "a type that does not normalize")?; unreachable!() }
+			Err(_) => {
+				self.unsupported(
+					file_id,
+					span,
+					"a type that does not normalize",
+				)?;
+				unreachable!()
+			}
 		}
 	}
 
@@ -1610,7 +1926,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn lower_aggregate_type(
 		&mut self,
 		ty: TypeIndex,
-		env: TypeEnvIdx,
 		file_id: FileId,
 		span: TextSpan,
 	) -> Result<mir::ValueType, ()> {
@@ -1618,39 +1933,99 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			return Ok(representation.ty);
 		}
 
-		let field_types = self.aggregate_field_types(ty, env, file_id, span)?;
+		let field_types = self.aggregate_field_types(ty, file_id, span)?;
 		let mut scalars = Vec::new();
 		let mut fields = Vec::with_capacity(field_types.len());
 		for field in field_types {
-			let field = self.lower_type(field, env, file_id, span)?;
+			let field = self.lower_type(field, file_id, span)?;
 			let start = scalars.len();
 			match field {
 				mir::ValueType::Unit => {}
-				mir::ValueType::Never => { self.unsupported(file_id, span, "an uninhabited aggregate value")?; }
-				mir::ValueType::Aggregate { aggregate_index } => scalars.extend_from_slice(&self.aggregates.get(aggregate_index).scalars),
+				mir::ValueType::Never => {
+					self.unsupported(
+						file_id,
+						span,
+						"an uninhabited aggregate value",
+					)?;
+				}
+				mir::ValueType::Aggregate { aggregate_index } => scalars
+					.extend_from_slice(
+						&self.aggregates.get(aggregate_index).scalars,
+					),
 				scalar => scalars.push(scalar),
 			}
-			fields.push(mir::ScalarRange::new(start.try_into().unwrap(), (scalars.len() - start).try_into().unwrap()));
+			// Every field passed this check when it was lowered, so this
+			// stops a doubling chain after one step past the limit, before
+			// `memory_values` flattens the type a second time.
+			if scalars.len() > SLOT_LIMIT {
+				let name = self.context.type_formatter().display_type(ty);
+				self.context.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::SlotLimit.code())
+						.with_message(format!(
+							"the type `{name}` is too large to lower"
+						))
+						.with_label(
+							Label::primary(file_id, span).with_message(
+								"a value of this type is used here",
+							),
+						)
+						.with_note(format!(
+							"a value is held as one Wasm value per scalar it \
+							 contains, and the limit is {SLOT_LIMIT} for one type"
+						)),
+				);
+				return Err(());
+			}
+			fields.push(mir::ScalarRange::new(
+				start.try_into().unwrap(),
+				(scalars.len() - start).try_into().unwrap(),
+			));
 		}
 
 		let lowered = if scalars.is_empty() {
 			mir::ValueType::Unit
 		} else {
-			let memory = match self.context.memory_values(env, ty) {
+			let memory = match self.context.memory_values(TypeEnvIdx::ROOT, ty)
+			{
 				Ok(Some((layout, values))) => {
-					assert_eq!(values.len(), scalars.len(), "TIR stack and memory slot counts agree");
+					assert_eq!(
+						values.len(),
+						scalars.len(),
+						"TIR stack and memory slot counts agree"
+					);
 					Some(mir::AggregateMemory {
-						layout: mir::Layout { size: layout.size, align: layout.align },
-						offsets: values.iter().map(|&(_, offset)| offset).collect(),
+						layout: mir::Layout {
+							size: layout.size,
+							align: layout.align,
+						},
+						offsets: values
+							.iter()
+							.map(|&(_, offset)| offset)
+							.collect(),
 					})
 				}
 				Ok(None) => None,
-				Err(_) => { self.unsupported(file_id, span, "an aggregate whose memory layout failed")?; unreachable!() }
+				Err(_) => {
+					self.unsupported(
+						file_id,
+						span,
+						"an aggregate whose memory layout failed",
+					)?;
+					unreachable!()
+				}
 			};
-			let aggregate_index = self.aggregates.push(scalars.into_boxed_slice(), memory);
+			let aggregate_index =
+				self.aggregates.push(scalars.into_boxed_slice(), memory);
 			mir::ValueType::Aggregate { aggregate_index }
 		};
-		self.aggregate_types.insert(ty, AggregateLowering { ty: lowered, fields: fields.into_boxed_slice() });
+		self.aggregate_types.insert(
+			ty,
+			AggregateLowering {
+				ty: lowered,
+				fields: fields.into_boxed_slice(),
+			},
+		);
 		Ok(lowered)
 	}
 
@@ -1659,11 +2034,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn aggregate_field_types(
 		&mut self,
 		ty: TypeIndex,
-		env: TypeEnvIdx,
 		file_id: FileId,
 		span: TextSpan,
 	) -> Result<Vec<TypeIndex>, ()> {
-		let ty = self.normalize_type(ty, env, file_id, span)?;
+		let ty = self.normalize_type(ty, file_id, span)?;
 		match *self.context.types.resolve(ty) {
 			Type::Tuple { elements } => {
 				Ok(self.context.types.list(elements).to_vec())
@@ -1720,16 +2094,76 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	}
 }
 
+/// The MIR node for the primitive operator `op`, or `None` for an
+/// assignment operator, which has no value.
+fn binary_kind(
+	op: BinaryOp,
+	lhs: mir::ExprId,
+	rhs: mir::ExprId,
+) -> Option<mir::ExprKind> {
+	let binary = |op| mir::ExprKind::Binary { op, lhs, rhs };
+	let compare = |op| mir::ExprKind::Compare { op, lhs, rhs };
+	Some(match op {
+		BinaryOp::Add => binary(mir::BinaryOp::Add),
+		BinaryOp::Sub => binary(mir::BinaryOp::Sub),
+		BinaryOp::Mul => binary(mir::BinaryOp::Mul),
+		BinaryOp::Div => binary(mir::BinaryOp::Div),
+		BinaryOp::Rem => binary(mir::BinaryOp::Rem),
+		BinaryOp::BitAnd => binary(mir::BinaryOp::BitAnd),
+		BinaryOp::BitOr => binary(mir::BinaryOp::BitOr),
+		BinaryOp::BitXor => binary(mir::BinaryOp::BitXor),
+		BinaryOp::LeftShift => binary(mir::BinaryOp::Shl),
+		BinaryOp::RightShift => binary(mir::BinaryOp::Shr),
+		BinaryOp::Eq => compare(mir::CompareOp::Eq),
+		BinaryOp::NotEq => compare(mir::CompareOp::Ne),
+		BinaryOp::Less => compare(mir::CompareOp::Lt),
+		BinaryOp::LessEq => compare(mir::CompareOp::Le),
+		BinaryOp::Greater => compare(mir::CompareOp::Gt),
+		BinaryOp::GreaterEq => compare(mir::CompareOp::Ge),
+		// `&&`/`||` are lowered as `IfElse` branches (`lower_short_circuit`).
+		BinaryOp::And | BinaryOp::Or => {
+			unreachable!("a logical operator short-circuits")
+		}
+		BinaryOp::Assign
+		| BinaryOp::AddAssign
+		| BinaryOp::SubAssign
+		| BinaryOp::MulAssign
+		| BinaryOp::DivAssign
+		| BinaryOp::RemAssign
+		| BinaryOp::BitAndAssign
+		| BinaryOp::BitOrAssign
+		| BinaryOp::BitXorAssign
+		| BinaryOp::LeftShiftAssign
+		| BinaryOp::RightShiftAssign => return None,
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	/// Check, lower, encode, and instantiate `source`, returning the live
-	/// store and instance for calling exports.
+	/// Every direct call in `mir`, across its functions.
+	fn call_count(mir: &mir::MIR) -> usize {
+		mir.functions
+			.iter()
+			.filter_map(|f| f.code())
+			.map(|code| code.callees().count())
+			.sum()
+	}
+
+	/// Check, lower, inline, encode, and instantiate `source`, returning the
+	/// live store and instance for calling exports. Every program run here
+	/// goes through the inliner, as a built one does.
 	fn instantiate(source: &str) -> (wasmtime::Store<()>, wasmtime::Instance) {
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir =
-			crate::tir::build(&mut graph).expect("the checkpoint must lower");
+		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		let Some(mut mir) = mir else {
+			panic!(
+				"the checkpoint must lower: {:?}",
+				diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+			)
+		};
+		crate::mir::inline::run(&mut mir, crate::mir::inline::Policy::DEFAULT);
 		let module = crate::codegen::Builder::build(&mir, &graph.strings)
 			.expect("lowered MIR must encode");
 		let bytes = module.encode();
@@ -1750,17 +2184,19 @@ mod tests {
 			export { fail as "fail" }
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).expect("trap must expand");
+		let mir = crate::tir::build(&mut graph).1.expect("trap must expand");
 		assert_eq!(mir.functions.len(), 1);
-		assert!(mir.call_edges.is_empty());
+		let function = mir.code(mir::FunctionId::new(0));
+		assert_eq!(function.callees().count(), 0);
 		assert!(mir.imports.is_empty());
-		let mir::ExprKind::Block { expressions, .. } =
-			&mir.functions[0].block.kind
+		let mir::ExprKind::Sequence { statements } =
+			function.body.kind(function.root)
 		else {
-			panic!("expected a block")
+			panic!("expected a sequence")
 		};
+		let last = *function.body.list(statements).last().unwrap();
 		assert!(matches!(
-			expressions.last().unwrap().kind,
+			function.body.kind(last),
 			mir::ExprKind::Unreachable
 		));
 		let (mut store, instance) = instantiate(source);
@@ -1784,13 +2220,14 @@ mod tests {
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
 		let mir = crate::tir::build(&mut graph)
+			.1
 			.expect("scalar intrinsics must expand");
 		assert_eq!(
 			mir.functions.len(),
 			6,
 			"only the ordinary callee gets a body"
 		);
-		assert_eq!(mir.call_edges.len(), 1);
+		assert_eq!(call_count(&mir), 1);
 		assert!(mir.imports.is_empty());
 		let (mut store, instance) = instantiate(source);
 		assert_eq!(
@@ -1981,6 +2418,107 @@ mod tests {
 	}
 
 	#[test]
+	fn transmute_keeps_the_operands_signedness_and_gives_its_own() {
+		// `a / b` stays an unsigned division although its result is read as
+		// an `i32`; the transmuted operand of `/ 2` and `>> 1` divides and
+		// shifts as the target type.
+		let source = r#"
+			func quotient(a: u32, b: u32) -> i32 { transmute::<u32, i32>(a / b) }
+			func signed_half(a: u32) -> i32 { transmute::<u32, i32>(a) / 2 }
+			func unsigned_shift(x: i32) -> u32 { transmute::<i32, u32>(x) >> 1 }
+			export {
+				quotient as "quotient",
+				signed_half as "signed_half",
+				unsigned_shift as "unsigned_shift",
+			}
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let quotient = instance
+			.get_typed_func::<(u32, u32), i32>(&mut store, "quotient")
+			.unwrap();
+		assert_eq!(
+			quotient.call(&mut store, (u32::MAX - 1, 2)).unwrap(),
+			i32::MAX
+		);
+		let signed_half = instance
+			.get_typed_func::<u32, i32>(&mut store, "signed_half")
+			.unwrap();
+		assert_eq!(signed_half.call(&mut store, u32::MAX - 1).unwrap(), -1);
+		let unsigned_shift = instance
+			.get_typed_func::<i32, u32>(&mut store, "unsigned_shift")
+			.unwrap();
+		assert_eq!(unsigned_shift.call(&mut store, -2).unwrap(), u32::MAX >> 1);
+	}
+
+	#[test]
+	fn transmute_converts_between_a_scalar_and_a_one_slot_aggregate() {
+		let source = r#"
+			func round_trip(c: u32) -> u32 {
+				local ch: Char = transmute(c);
+				transmute(ch)
+			}
+			func codepoint() -> u32 { transmute::<Char, u32>('a') }
+			export { round_trip as "round_trip", codepoint as "codepoint" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let round_trip = instance
+			.get_typed_func::<u32, u32>(&mut store, "round_trip")
+			.unwrap();
+		assert_eq!(round_trip.call(&mut store, 0x20AC).unwrap(), 0x20AC);
+		let codepoint = instance
+			.get_typed_func::<(), u32>(&mut store, "codepoint")
+			.unwrap();
+		assert_eq!(codepoint.call(&mut store, ()).unwrap(), 97);
+	}
+
+	#[test]
+	fn transmute_regroups_aggregates_with_the_same_slots() {
+		// Declaration order, with zero-sized parts dropped, is both the
+		// `StackValue::Repr` order and MIR's slot order.
+		let source = r#"
+			struct Meters(m: u32);
+			struct Pair(a: Meters, unit: (), b: u32);
+			func regroup(x: u32, y: u32) -> u32 {
+				local Pair({ a: Meters(a), b, .. }) = transmute::<(u32, u32), Pair>((x, y));
+				a * 10 + b
+			}
+			func flatten(p: Pair) -> (u32, u32) { transmute(p) }
+			func make() -> (u32, u32) { flatten(Pair(Meters(5), (), 6)) }
+			export { regroup as "regroup", make as "make" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let regroup = instance
+			.get_typed_func::<(u32, u32), u32>(&mut store, "regroup")
+			.unwrap();
+		assert_eq!(regroup.call(&mut store, (3, 4)).unwrap(), 34);
+		let make = instance
+			.get_typed_func::<(), (u32, u32)>(&mut store, "make")
+			.unwrap();
+		assert_eq!(make.call(&mut store, ()).unwrap(), (5, 6));
+	}
+
+	#[test]
+	fn std_impls_built_on_transmute_run() {
+		// `Bool`'s `!` and the narrow-integer operators are std impls over
+		// `transmute`d `i32` instructions.
+		let source = r#"
+			func not(b: u32) -> u32 { if !(b == 0) { 1 } else { 2 } }
+			func narrow(a: i8, b: i8) -> i8 { a.div(b) }
+			export { not as "not", narrow as "narrow" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let not = instance
+			.get_typed_func::<u32, u32>(&mut store, "not")
+			.unwrap();
+		assert_eq!(not.call(&mut store, 0).unwrap(), 2);
+		assert_eq!(not.call(&mut store, 7).unwrap(), 1);
+		let narrow = instance
+			.get_typed_func::<(i32, i32), i32>(&mut store, "narrow")
+			.unwrap();
+		assert_eq!(narrow.call(&mut store, (-6, 2)).unwrap(), -3);
+	}
+
+	#[test]
 	fn unavailable_function_implementations_are_explicit_diagnostics() {
 		for (source, message) in [
 			(
@@ -1992,10 +2530,6 @@ mod tests {
 				"without an implementation",
 			),
 			(
-				r#"import "env" as host { func trap() -> !; } func run() -> ! { host::trap() } export { run as "run" }"#,
-				"imported function",
-			),
-			(
 				r#"use std::trap as provided; export { provided as "trap" }"#,
 				"requires a wrapper",
 			),
@@ -2005,10 +2539,11 @@ mod tests {
 			),
 		] {
 			let mut graph = crate::tir::signatures::tests::source_graph(source);
-			let diagnostics = match crate::tir::build(&mut graph) {
-				Ok(_) => panic!("unsupported implementation must not emit MIR"),
-				Err(diagnostics) => diagnostics,
-			};
+			let (diagnostics, mir) = crate::tir::build(&mut graph);
+			assert!(
+				mir.is_none(),
+				"unsupported implementation must not emit MIR"
+			);
 			assert!(
 				diagnostics.iter().any(|d| d.message.contains(message)
 					&& d.code.as_deref()
@@ -2019,6 +2554,257 @@ mod tests {
 		}
 	}
 
+	/// Three imports under one Wasm name: two with the same Wasm type, one
+	/// with another. Each is its own wx function.
+	const OVERLOADED_IMPORTS: &str = r#"
+		import "host" as host { func log(value: i32); }
+		import "host" as host_2 { func log(value: i64); }
+		import "host" as host_3 { func log(value: u32); }
+		func run() {
+			host::log(1);
+			host_2::log(2);
+			host_3::log(3);
+		}
+		export { run as "run" }
+	"#;
+
+	#[test]
+	fn each_imported_function_is_its_own_item_with_its_own_import_entry() {
+		let mut graph =
+			crate::tir::signatures::tests::source_graph(OVERLOADED_IMPORTS);
+		let mir = crate::tir::build(&mut graph).1.expect("imports lower");
+		assert_eq!(mir.imports.len(), 3, "never merged by name in MIR");
+		mir.verify_imports().unwrap();
+		for import in &mir.imports {
+			assert_eq!(graph.strings.resolve(import.module), Some("host"));
+			assert_eq!(graph.strings.resolve(import.name), Some("log"));
+			let mir::Item::Function(id) = import.item else {
+				panic!("only functions are imported")
+			};
+			assert!(mir.function(id).code().is_none());
+		}
+		let distinct: std::collections::HashSet<_> = mir
+			.imports
+			.iter()
+			.map(|import| match import.item {
+				mir::Item::Function(id) => id,
+				_ => unreachable!(),
+			})
+			.collect();
+		assert_eq!(distinct.len(), 3);
+		assert_eq!(call_count(&mir), 3);
+	}
+
+	#[test]
+	fn codegen_gives_imports_with_the_same_names_and_wasm_type_one_entry() {
+		let mut graph =
+			crate::tir::signatures::tests::source_graph(OVERLOADED_IMPORTS);
+		let mir = crate::tir::build(&mut graph).1.expect("imports lower");
+		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+			.expect("lowered MIR must encode")
+			.encode();
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, &bytes)
+			.expect("lowered MIR must be valid Wasm");
+		// `log(i32)` and `log(u32)` are both `(param i32)` to the host.
+		let imports: Vec<String> = module
+			.imports()
+			.map(|import| {
+				format!(
+					"{}.{}: {:?}",
+					import.module(),
+					import.name(),
+					import.ty()
+				)
+			})
+			.collect();
+		assert_eq!(imports.len(), 2, "{imports:#?}");
+		let mut store = wasmtime::Store::new(&engine, Vec::<i64>::new());
+		let narrow = wasmtime::Func::wrap(
+			&mut store,
+			|mut caller: wasmtime::Caller<'_, Vec<i64>>, value: i32| {
+				caller.data_mut().push(i64::from(value));
+			},
+		);
+		let wide = wasmtime::Func::wrap(
+			&mut store,
+			|mut caller: wasmtime::Caller<'_, Vec<i64>>, value: i64| {
+				caller.data_mut().push(-value);
+			},
+		);
+		let instance = wasmtime::Instance::new(
+			&mut store,
+			&module,
+			&[narrow.into(), wide.into()],
+		)
+		.expect("one host function per import entry");
+		instance
+			.get_typed_func::<(), ()>(&mut store, "run")
+			.unwrap()
+			.call(&mut store, ())
+			.unwrap();
+		assert_eq!(store.data(), &[1, -2, 3]);
+	}
+
+	#[test]
+	fn a_mutable_global_is_read_and_written_through_its_traits() {
+		let source = r#"
+			global mut counter: u32 = 5;
+			func bump() -> u32 {
+				counter.set(counter.get() + 1);
+				counter.get()
+			}
+			export { bump as "bump" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		let [global] = mir.globals.as_slice() else {
+			panic!("one global")
+		};
+		assert!(matches!(global.mutability, mir::Mutability::Mutable));
+		assert!(matches!(
+			global.origin,
+			mir::Origin::Defined(mir::ConstInit::Int(5))
+		));
+		let (mut store, instance) = instantiate(source);
+		let bump = instance
+			.get_typed_func::<(), u32>(&mut store, "bump")
+			.unwrap();
+		assert_eq!(bump.call(&mut store, ()).unwrap(), 6);
+		assert_eq!(bump.call(&mut store, ()).unwrap(), 7);
+	}
+
+	#[test]
+	fn a_one_value_newtype_global_is_held_as_its_scalar() {
+		let source = r#"
+			struct Meters(u32);
+			global mut length: Meters = Meters(3);
+			func double() -> u32 {
+				local Meters(x) = length.get();
+				length.set(Meters(x * 2));
+				local Meters(y) = length.get();
+				y
+			}
+			export { double as "double" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		assert_eq!(mir.globals[0].ty, mir::ValueType::U32);
+		let (mut store, instance) = instantiate(source);
+		let double = instance
+			.get_typed_func::<(), u32>(&mut store, "double")
+			.unwrap();
+		assert_eq!(double.call(&mut store, ()).unwrap(), 6);
+		assert_eq!(double.call(&mut store, ()).unwrap(), 12);
+	}
+
+	#[test]
+	fn an_exported_global_holds_its_compile_time_value() {
+		let source = r#"
+			const BASE: i32 = 40;
+			global answer: i32 = BASE + 2;
+			global ratio: f64 = 0.5;
+			global unused: u32 = 1;
+			export { answer as "answer", ratio as "ratio" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		assert_eq!(
+			mir.globals.len(),
+			2,
+			"a global nothing names is not emitted"
+		);
+		let (mut store, instance) = instantiate(source);
+		let answer = instance.get_global(&mut store, "answer").unwrap();
+		assert_eq!(answer.get(&mut store).i32(), Some(42));
+		assert_eq!(answer.ty(&store).mutability(), wasmtime::Mutability::Const);
+		let ratio = instance.get_global(&mut store, "ratio").unwrap();
+		assert_eq!(ratio.get(&mut store).f64(), Some(0.5));
+	}
+
+	#[test]
+	fn an_imported_global_is_an_import_entry_the_host_fills() {
+		let source = r#"
+			import "env" as env { global base: i32; }
+			func read() -> i32 { env::base.get() + 1 }
+			export { read as "read" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mut mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		let [import] = mir.imports.as_slice() else {
+			panic!("one import entry")
+		};
+		assert_eq!(graph.strings.resolve(import.module), Some("env"));
+		assert_eq!(graph.strings.resolve(import.name), Some("base"));
+		assert_eq!(import.item, mir::Item::Global(mir::GlobalId::new(0)));
+		mir.verify_imports().unwrap();
+		crate::mir::inline::run(&mut mir, crate::mir::inline::Policy::DEFAULT);
+		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+			.expect("lowered MIR must encode")
+			.encode();
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let base = wasmtime::Global::new(
+			&mut store,
+			wasmtime::GlobalType::new(
+				wasmtime::ValType::I32,
+				wasmtime::Mutability::Const,
+			),
+			wasmtime::Val::I32(41),
+		)
+		.unwrap();
+		let instance =
+			wasmtime::Instance::new(&mut store, &module, &[base.into()])
+				.unwrap();
+		let read = instance
+			.get_typed_func::<(), i32>(&mut store, "read")
+			.unwrap();
+		assert_eq!(read.call(&mut store, ()).unwrap(), 42);
+	}
+
+	#[test]
+	fn a_generic_function_reads_the_global_its_argument_names() {
+		let source = r#"
+			global small: i8 = -3;
+			global flag: Bool = True;
+			global mut total: i32 = 10;
+			func read<G: Global>(g: G) -> G::Value { g.get() }
+			func run() -> i32 {
+				total.set(read(total) + widen(read(small)));
+				if read(flag) { read(total) } else { 0 }
+			}
+			// A narrow signed value is held sign-extended in its `i32`.
+			func widen(x: i8) -> i32 { transmute(x) }
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(), i32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, ()).unwrap(), 7);
+		assert_eq!(run.call(&mut store, ()).unwrap(), 4);
+	}
+
+	#[test]
+	fn a_global_initializer_must_be_a_constant_expression() {
+		let source = r#"
+			func one() -> u32 { 1 }
+			global g: u32 = one();
+			func read() -> u32 { g.get() }
+			export { read as "read" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		assert!(mir.is_none());
+		crate::testing::DiagnosticView::new(
+			"build",
+			&diagnostics,
+			&graph.files,
+		)
+		.assert_error(DiagnosticCode::NonConstantGlobalInitializer);
+	}
+
 	#[test]
 	fn lowers_an_exported_scalar_add_to_runnable_mir() {
 		let source = r#"
@@ -2026,8 +2812,9 @@ mod tests {
             export { add as "add" }
         "#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir =
-			crate::tir::build(&mut graph).expect("a scalar add must lower");
+		let mir = crate::tir::build(&mut graph)
+			.1
+			.expect("a scalar add must lower");
 		assert_eq!(mir.functions.len(), 1);
 		assert_eq!(mir.signatures.len(), 1);
 		assert_eq!(mir.exports.len(), 1);
@@ -2086,10 +2873,11 @@ mod tests {
             export { pick as "pick" }
         "#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let diagnostics = match crate::tir::build(&mut graph) {
-			Ok(_) => panic!("an aggregate constant pattern has no equality"),
-			Err(diagnostics) => diagnostics,
-		};
+		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		assert!(
+			mir.is_none(),
+			"an aggregate constant pattern has no equality"
+		);
 		assert!(
 			diagnostics.iter().any(|d| {
 				d.message.contains("`Pair: Eq` is not satisfied")
@@ -2108,10 +2896,8 @@ mod tests {
             export { peek as "peek" }
         "#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let diagnostics = match crate::tir::build(&mut graph) {
-			Ok(_) => panic!("memory types have no lowering yet"),
-			Err(diagnostics) => diagnostics,
-		};
+		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		assert!(mir.is_none(), "memory types have no lowering yet");
 		assert!(
 			diagnostics.iter().any(|d| {
 				d.message.contains("memory checkpoint")
@@ -2162,10 +2948,21 @@ mod tests {
 			export { run as "run" }
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).expect("nested updates must lower");
-		assert!(mir.aggregates.iter().all(|pack| pack.scalars.iter().all(|ty| !matches!(ty, mir::ValueType::Aggregate { .. } | mir::ValueType::Unit | mir::ValueType::Never))));
+		let mir = crate::tir::build(&mut graph)
+			.1
+			.expect("nested updates must lower");
+		assert!(mir.aggregates.iter().all(|pack| pack.scalars.iter().all(
+			|ty| !matches!(
+				ty,
+				mir::ValueType::Aggregate { .. }
+					| mir::ValueType::Unit
+					| mir::ValueType::Never
+			)
+		)));
 		let (mut store, instance) = instantiate(source);
-		let run = instance.get_typed_func::<(), (i32, i64, i32)>(&mut store, "run").unwrap();
+		let run = instance
+			.get_typed_func::<(), (i32, i64, i32)>(&mut store, "run")
+			.unwrap();
 		assert_eq!(run.call(&mut store, ()).unwrap(), (5, 99, 3));
 	}
 
@@ -2181,7 +2978,9 @@ mod tests {
 			export { run as "run" }
 		"#;
 		let (mut store, instance) = instantiate(source);
-		let run = instance.get_typed_func::<(), (i32, i32)>(&mut store, "run").unwrap();
+		let run = instance
+			.get_typed_func::<(), (i32, i32)>(&mut store, "run")
+			.unwrap();
 		assert_eq!(run.call(&mut store, ()).unwrap(), (7, 11));
 	}
 
@@ -2196,17 +2995,35 @@ mod tests {
 			export { sorted as "sorted", fixed as "fixed" }
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).unwrap();
-		let layouts: Vec<_> = mir.aggregates.iter().map(|pack| {
-			assert_eq!(pack.scalars.as_ref(), [mir::ValueType::U8, mir::ValueType::I64, mir::ValueType::U8]);
-			pack.memory.as_ref().unwrap().offsets.to_vec()
-		}).collect();
+		let mir = crate::tir::build(&mut graph).1.unwrap();
+		let layouts: Vec<_> = mir
+			.aggregates
+			.iter()
+			.map(|pack| {
+				assert_eq!(
+					pack.scalars.as_ref(),
+					[
+						mir::ValueType::U8,
+						mir::ValueType::I64,
+						mir::ValueType::U8
+					]
+				);
+				pack.memory.as_ref().unwrap().offsets.to_vec()
+			})
+			.collect();
 		assert!(layouts.contains(&vec![8, 0, 9]));
 		assert!(layouts.contains(&vec![0, 8, 16]));
 		let (mut store, instance) = instantiate(source);
 		for name in ["sorted", "fixed"] {
-			let identity = instance.get_typed_func::<(i32, i64, i32), (i32, i64, i32)>(&mut store, name).unwrap();
-			assert_eq!(identity.call(&mut store, (7, 1 << 40, 9)).unwrap(), (7, 1 << 40, 9));
+			let identity = instance
+				.get_typed_func::<(i32, i64, i32), (i32, i64, i32)>(
+					&mut store, name,
+				)
+				.unwrap();
+			assert_eq!(
+				identity.call(&mut store, (7, 1 << 40, 9)).unwrap(),
+				(7, 1 << 40, 9)
+			);
 		}
 	}
 
@@ -2222,7 +3039,9 @@ mod tests {
 			export { run as "run" }
 		"#;
 		let (mut store, instance) = instantiate(source);
-		let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+		let run = instance
+			.get_typed_func::<(), i32>(&mut store, "run")
+			.unwrap();
 		assert_eq!(run.call(&mut store, ()).unwrap(), 22);
 	}
 
@@ -2234,7 +3053,9 @@ mod tests {
 			r#"struct Zero(); func make() -> Zero { std::trap() } func run() -> i32 { _ = make(); 7 } export { run as "run" }"#,
 		] {
 			let (mut store, instance) = instantiate(source);
-			let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+			let run = instance
+				.get_typed_func::<(), i32>(&mut store, "run")
+				.unwrap();
 			assert!(run.call(&mut store, ()).is_err());
 		}
 	}
@@ -2264,8 +3085,9 @@ mod tests {
             export { run as "run" }
         "#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir =
-			crate::tir::build(&mut graph).expect("the aggregate must lower");
+		let mir = crate::tir::build(&mut graph)
+			.1
+			.expect("the aggregate must lower");
 
 		let aggregate = mir
 			.aggregates
@@ -2311,6 +3133,38 @@ mod tests {
 	}
 
 	#[test]
+	fn every_instance_of_an_inline_function_is_flagged_inline() {
+		let source = r#"
+			#[inline]
+			func twice<T: Add>(x: T) -> T { x + x }
+			func small(a: u32) -> u32 { twice(a) }
+			func big(b: u64) -> u64 { twice(b) }
+			export { small as "small", big as "big" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("the source lowers");
+		// `small`, `big`, `twice` for `u32` and `u64`, and std's `#[inline]`
+		// `add` for each.
+		assert_eq!(mir.functions.len(), 6);
+		assert_eq!(mir.function_flags.len(), mir.functions.len());
+		let exported: Vec<mir::FunctionId> = mir
+			.exports
+			.iter()
+			.map(|export| match export.item {
+				mir::Item::Function(id) => id,
+				_ => unreachable!("only functions are exported"),
+			})
+			.collect();
+		for (id, _) in mir.functions_with_ids() {
+			assert_eq!(
+				mir.flags(id).contains(mir::FunctionFlags::INLINE),
+				!exported.contains(&id),
+				"{id:?}"
+			);
+		}
+	}
+
+	#[test]
 	fn instantiates_a_generic_struct_field_type() {
 		let source = r#"
             struct Pair<T>(first: T, second: T);
@@ -2323,6 +3177,393 @@ mod tests {
 			.get_typed_func::<(), i32>(&mut store, "run")
 			.expect("`run` must be exported");
 		assert_eq!(run.call(&mut store, ()).unwrap(), 7);
+	}
+
+	#[test]
+	fn a_generic_function_has_one_instance_per_argument_list() {
+		// Inferred and written arguments name the same instance.
+		let source = r#"
+			func id<T>(x: T) -> T { x }
+			func run(a: i32, b: i64) -> (i32, i64) {
+				(id(a) + id::<i32>(a), id(b))
+			}
+			export { run as "run" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("`id` must lower");
+		assert_eq!(mir.functions.len(), 3, "`run`, `id<i32>` and `id<i64>`");
+		drop(graph);
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(i32, i64), (i32, i64)>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, (4, 9)).unwrap(), (8, 9));
+	}
+
+	#[test]
+	fn a_generic_callee_receives_its_callers_arguments() {
+		// `pair`'s call of `id` names `id<T>`, which is `id<u8>` and
+		// `id<Wrap<u32>>` in the two instances of `pair`.
+		let source = r#"
+			struct Wrap<T>(value: T);
+			func id<T>(x: T) -> T { x }
+			func pair<T>(x: T) -> (T, T) { (id(x), id::<T>(x)) }
+			func run(a: u8, b: u32) -> u32 {
+				local (c, d) = pair(a);
+				local (Wrap(e), Wrap(f)) = pair(Wrap(b));
+				transmute::<u8, u32>(c) + transmute::<u8, u32>(d) + e * f
+			}
+			export { run as "run" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("`pair` must lower");
+		assert_eq!(mir.functions.len(), 5, "`run`, two `pair`s, two `id`s");
+		drop(graph);
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(i32, u32), u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, (2, 3)).unwrap(), 13);
+	}
+
+	#[test]
+	fn a_generic_impl_method_runs_on_a_concrete_type() {
+		let source = r#"
+			struct Pair<T>(a: T, b: T);
+			impl<T> Pair<T> {
+				pub func new(a: T, b: T) -> Pair<T> { Pair(a, b) }
+				pub func swap(self: Self) -> Pair<T> { Pair(self.b, self.a) }
+			}
+			func run(x: u32, y: u32) -> u32 {
+				local Pair(a, b) = Pair::new(x, y).swap();
+				a * 10 + b
+			}
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(u32, u32), u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, (1, 2)).unwrap(), 21);
+	}
+
+	#[test]
+	fn a_recursive_generic_call_with_the_same_arguments_is_one_instance() {
+		let source = r#"
+			func count<T>(x: T, n: u32) -> u32 {
+				if n == 0 { 0 } else { count(x, n - 1) + 1 }
+			}
+			func run(n: u32) -> u32 { count((1: u8), n) }
+			export { run as "run" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("`count` must lower");
+		assert_eq!(mir.functions.len(), 2);
+		drop(graph);
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<u32, u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, 5).unwrap(), 5);
+	}
+
+	#[test]
+	fn an_operator_on_a_type_parameter_runs_each_instances_impl() {
+		let source = r#"
+			func sum<T: Add>(a: T, b: T) -> T { a + b }
+			func small(x: u32) -> u32 { sum(x, 1) }
+			func large(x: u64) -> u64 { sum(x, 2) }
+			func float(x: f32) -> f32 { sum(x, 0.5) }
+			export { small as "small", large as "large", float as "float" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let small = instance
+			.get_typed_func::<u32, u32>(&mut store, "small")
+			.unwrap();
+		let large = instance
+			.get_typed_func::<u64, u64>(&mut store, "large")
+			.unwrap();
+		let float = instance
+			.get_typed_func::<f32, f32>(&mut store, "float")
+			.unwrap();
+		assert_eq!(small.call(&mut store, 4).unwrap(), 5);
+		assert_eq!(large.call(&mut store, 1 << 40).unwrap(), (1 << 40) + 2);
+		assert_eq!(float.call(&mut store, 1.0).unwrap(), 1.5);
+	}
+
+	#[test]
+	fn a_trait_method_on_a_type_parameter_runs_the_impl_its_type_selects() {
+		let source = r#"
+			trait Shape { func area(self: Self) -> u32; }
+			struct Square(side: u32);
+			struct Rect(w: u32, h: u32);
+			impl Shape for Square {
+				func area(self: Self) -> u32 {
+					local Square(s) = self;
+					s * s
+				}
+			}
+			impl Shape for Rect {
+				func area(self: Self) -> u32 {
+					local Rect(w, h) = self;
+					w * h
+				}
+			}
+			func twice<S: Shape>(s: S) -> u32 { s.area() + S::area(s) }
+			func run(a: u32, b: u32) -> u32 {
+				twice(Square(a)) * 1000 + twice(Rect(a, b))
+			}
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(u32, u32), u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, (3, 4)).unwrap(), 18 * 1000 + 24);
+	}
+
+	#[test]
+	fn an_inherited_default_runs_for_a_concrete_and_an_abstract_self() {
+		let source = r#"
+			trait Counter {
+				func base(self: Self) -> u32;
+				func next(self: Self) -> u32 { self.base() + 1 }
+			}
+			struct A(v: u32);
+			struct B(v: u32);
+			impl Counter for A {
+				func base(self: Self) -> u32 { local A(v) = self; v }
+			}
+			impl Counter for B {
+				func base(self: Self) -> u32 { local B(v) = self; v }
+				func next(self: Self) -> u32 { self.base() + 100 }
+			}
+			func through<C: Counter>(c: C) -> u32 { c.next() }
+			func direct(x: u32) -> u32 { A(x).next() }
+			func generic(x: u32) -> u32 { through(A(x)) * 1000 + through(B(x)) }
+			export { direct as "direct", generic as "generic" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let direct = instance
+			.get_typed_func::<u32, u32>(&mut store, "direct")
+			.unwrap();
+		let generic = instance
+			.get_typed_func::<u32, u32>(&mut store, "generic")
+			.unwrap();
+		assert_eq!(direct.call(&mut store, 1).unwrap(), 2);
+		assert_eq!(generic.call(&mut store, 1).unwrap(), 2 * 1000 + 101);
+	}
+
+	#[test]
+	fn std_s_inherited_ne_runs_on_a_type_parameter() {
+		let source = r#"
+			func differ<T: PartialEq>(a: T, b: T) -> Bool { a != b }
+			func run(a: u32, b: u32) -> u32 {
+				if differ(a, b) { 1 } else { 0 }
+			}
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(u32, u32), u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, (1, 1)).unwrap(), 0);
+		assert_eq!(run.call(&mut store, (1, 2)).unwrap(), 1);
+	}
+
+	#[test]
+	fn an_associated_constant_is_read_per_instance() {
+		let source = r#"
+			trait Sized { const SIZE: u32; }
+			struct Small();
+			struct Big();
+			impl Sized for Small { const SIZE: u32 = 4; }
+			impl Sized for Big { const SIZE: u32 = 64; }
+			func size<T: Sized>() -> u32 { T::SIZE }
+			func run() -> u32 { size::<Small>() + size::<Big>() * 100 + Big::SIZE }
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(), u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, ()).unwrap(), 4 + 6400 + 64);
+	}
+
+	#[test]
+	fn a_compound_assignment_on_a_type_parameter_runs_its_impl() {
+		let source = r#"
+			func triple<T: Add>(x: T) -> T {
+				local mut acc = x;
+				acc += x;
+				acc += x;
+				acc
+			}
+			func run(x: i64) -> i64 { triple(x) }
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<i64, i64>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, -7).unwrap(), -21);
+	}
+
+	#[test]
+	fn a_generic_impl_method_dispatches_on_its_impl_s_parameter() {
+		let source = r#"
+			struct Pair<T>(a: T, b: T);
+			impl<T: Add> Pair<T> {
+				pub func total(self: Self) -> T {
+					local Pair(a, b) = self;
+					a + b
+				}
+			}
+			func run(x: u32, y: u32) -> u32 { Pair(x, y).total() }
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(u32, u32), u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, (2, 5)).unwrap(), 7);
+	}
+
+	#[test]
+	fn a_function_item_value_is_called_as_its_function() {
+		let source = r#"
+			func double(x: u32) -> u32 { x * 2 }
+			func add(a: u32, b: u32) -> u32 { a + b }
+			func apply<F: Call where { Args = u32, Result = u32 }>(f: F, x: u32) -> u32 {
+				f(x)
+			}
+			func run(x: u32) -> u32 {
+				local g = add;
+				apply(double, x) + g(x, 1)
+			}
+			export { run as "run" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<u32, u32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, 5).unwrap(), 10 + 6);
+	}
+
+	/// The diagnostics with `code` that building `source` reports, which must
+	/// emit no MIR.
+	fn build_reports(
+		source: &str,
+		code: DiagnosticCode,
+	) -> Vec<Diagnostic<FileId>> {
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		assert!(mir.is_none(), "a failed instantiation emits no MIR");
+		diagnostics
+			.into_iter()
+			.filter(|d| d.code.as_deref() == Some(code.code()))
+			.collect()
+	}
+
+	#[test]
+	fn a_doubling_type_reaches_the_slot_limit_first() {
+		// Each level is one interned type and twice the values of the last,
+		// so the slot limit stops it at about sixteen levels, long before the
+		// recursion limit would.
+		let source = r#"
+			func grow<T>(x: T, n: u32) -> u32 {
+				if n == 0 { 0 } else { grow((x, x), n - 1) }
+			}
+			func run(n: u32) -> u32 { grow((1: u8), n) }
+			export { run as "run" }
+		"#;
+		let reports = build_reports(source, DiagnosticCode::SlotLimit);
+		assert_eq!(reports.len(), 1, "{reports:#?}");
+		assert_eq!(
+			reports[0].severity,
+			codespan_reporting::diagnostic::Severity::Error
+		);
+		assert!(
+			reports[0].message.starts_with("the type `((((")
+				&& reports[0].message.ends_with(")` is too large to lower")
+				&& reports[0].message.contains("...)"),
+			"{}",
+			reports[0].message
+		);
+		assert!(
+			build_reports(source, DiagnosticCode::RecursionLimit).is_empty()
+		);
+	}
+
+	#[test]
+	fn a_doubling_zero_sized_type_reaches_the_recursion_limit() {
+		// No slots, so only the recursion limit stops it, and its message
+		// names a type of 2^128 leaves by printing only the start of it.
+		let source = r#"
+			func grow<T>(x: T, n: u32) -> u32 {
+				if n == 0 { 0 } else { grow((x, x), n - 1) }
+			}
+			func run(n: u32) -> u32 { grow((), n) }
+			export { run as "run" }
+		"#;
+		let reports = build_reports(source, DiagnosticCode::RecursionLimit);
+		assert_eq!(reports.len(), 1, "{reports:#?}");
+		assert!(reports[0].message.len() < 200, "{}", reports[0].message);
+		assert!(
+			reports[0].message.contains("...)"),
+			"{}",
+			reports[0].message
+		);
+	}
+
+	#[test]
+	fn unbounded_polymorphic_recursion_reaches_the_recursion_limit() {
+		// Directly, and through a second function, every call wraps its
+		// argument once more, so no instance repeats.
+		for source in [
+			r#"
+				struct Wrap<T>(value: T);
+				func grow<T>(x: T, n: u32) -> u32 {
+					if n == 0 { 0 } else { grow(Wrap(x), n - 1) }
+				}
+				func run(n: u32) -> u32 { grow((1: u8), n) }
+				export { run as "run" }
+			"#,
+			r#"
+				struct Wrap<T>(value: T);
+				func ping<T>(x: T, n: u32) -> u32 {
+					if n == 0 { 0 } else { pong(Wrap(x), n - 1) }
+				}
+				func pong<T>(x: T, n: u32) -> u32 { ping(x, n) }
+				func run(n: u32) -> u32 { ping((1: u8), n) }
+				export { run as "run" }
+			"#,
+		] {
+			let mut graph = crate::tir::signatures::tests::source_graph(source);
+			let (diagnostics, mir) = crate::tir::build(&mut graph);
+			assert!(mir.is_none(), "an unbounded instantiation emits no MIR");
+			let reports: Vec<_> = diagnostics
+				.iter()
+				.filter(|d| {
+					d.code.as_deref()
+						== Some(DiagnosticCode::RecursionLimit.code())
+				})
+				.collect();
+			assert_eq!(reports.len(), 1, "{diagnostics:#?}");
+			let report = reports[0];
+			assert_eq!(
+				report.severity,
+				codespan_reporting::diagnostic::Severity::Error
+			);
+			assert!(
+				report.message.starts_with(
+					"reached the recursion limit while instantiating `"
+				) && report.message.contains("Wrap<Wrap<"),
+				"{}",
+				report.message
+			);
+			assert_eq!(report.labels.len(), 2);
+		}
 	}
 
 	#[test]
@@ -4235,10 +5476,8 @@ mod tests {
             export { run as "run" }
         "#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let diagnostics = match crate::tir::build(&mut graph) {
-			Ok(_) => panic!("a float constant pattern has no equality"),
-			Err(diagnostics) => diagnostics,
-		};
+		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		assert!(mir.is_none(), "a float constant pattern has no equality");
 		assert!(
 			diagnostics.iter().any(|d| {
 				d.message.contains("`f64: Eq` is not satisfied")
@@ -4828,50 +6067,46 @@ mod tests {
             export { run as "run" }
         "#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).expect("`continue` must lower");
-		let function = &mir.functions[0];
-
-		let mir::ExprKind::Block { expressions, .. } = &function.block.kind
-		else {
-			panic!("the body must be a block")
-		};
+		let mir = crate::tir::build(&mut graph)
+			.1
+			.expect("`continue` must lower");
+		let function = mir.code(mir::FunctionId::new(0));
+		let body = &function.body;
+		let only = |list: mir::ExprList| -> mir::ExprId { body.list(list)[0] };
+		let mut at = function.root;
+		if let mir::ExprKind::Sequence { statements } = body.kind(at) {
+			at = only(statements);
+		}
 		let mir::ExprKind::Loop {
-			scope_index: outer,
-			block: outer_body,
-		} = &expressions[0].kind
+			label: outer,
+			body: outer_body,
+		} = body.kind(at)
 		else {
 			panic!("the body must contain the outer loop")
 		};
-		let mir::ExprKind::Block {
-			expressions: outer_expressions,
-			..
-		} = &outer_body.kind
+		let mir::ExprKind::Sequence { statements } = body.kind(outer_body)
 		else {
-			panic!("a loop must contain a block")
+			panic!("a loop's body is a sequence")
 		};
 		let mir::ExprKind::Loop {
-			scope_index: inner,
-			block: inner_body,
-		} = &outer_expressions[0].kind
+			label: inner,
+			body: inner_body,
+		} = body.kind(only(statements))
 		else {
 			panic!("the outer loop must contain the inner loop")
 		};
-		let mir::ExprKind::Block {
-			expressions: inner_expressions,
-			..
-		} = &inner_body.kind
+		let mir::ExprKind::Sequence { statements } = body.kind(inner_body)
 		else {
-			panic!("a loop must contain a block")
+			panic!("a loop's body is a sequence")
 		};
-		let mir::ExprKind::Continue { scope_index } =
-			&inner_expressions[0].kind
+		let mir::ExprKind::Continue { label } = body.kind(only(statements))
 		else {
 			panic!("the inner loop must contain the continue")
 		};
 
 		assert_ne!(outer, inner, "each loop needs its own scope");
 		assert_eq!(
-			scope_index, outer,
+			label, outer,
 			"`continue :outer` must restart the outer loop"
 		);
 	}

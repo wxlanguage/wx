@@ -605,6 +605,11 @@ impl Body {
 		&self.scopes[usize::from(scope)]
 	}
 
+	/// How many scopes there are; every `ScopeIdx` is below it.
+	pub(super) fn scope_count(&self) -> usize {
+		self.scopes.len()
+	}
+
 	pub(super) fn label(&self, label: LabelIdx) -> &Label {
 		&self.labels[usize::from(label)]
 	}

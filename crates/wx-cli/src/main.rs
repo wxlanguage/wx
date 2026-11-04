@@ -304,15 +304,62 @@ fn abort_if_errors(count: usize) {
 	std::process::exit(1);
 }
 
-fn cmd_build(
-	_project_path: &str,
-	_output: Option<&str>,
-	_format: MessageFormat,
-) {
-	eprintln!(
-		"error: WebAssembly code generation is not connected to the new type checker yet; use `wx check`"
-	);
-	std::process::exit(1);
+fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
+	let mut compilation = load_compilation(project_path);
+
+	if compilation.packages[compilation.root_package.as_usize()].kind
+		== vfs::PackageKind::Library
+	{
+		eprintln!(
+			"error: '{project_path}' is a library package and has no WASM \
+			 output to emit; use `wx check` instead"
+		);
+		std::process::exit(1);
+	}
+
+	let diagnostics = compilation.collect_diagnostics();
+	emit_diagnostics(&compilation, &diagnostics, format.clone());
+	abort_if_errors(diagnostics.error_count());
+
+	let (diagnostics, mir) = tir::build(&mut compilation);
+	emit_diagnostics(&compilation, &diagnostics, format.clone());
+	abort_if_errors(diagnostics.error_count());
+	let mir = mir.expect("lowering without an error diagnostic produces MIR");
+
+	let Ok(module) = codegen::Builder::build(&mir, &compilation.strings) else {
+		eprintln!("error: WebAssembly code generation failed");
+		std::process::exit(1);
+	};
+	let bytecode = module.encode();
+
+	if output == Some("-") {
+		std::io::stdout().write_all(&bytecode).unwrap();
+		return;
+	}
+
+	let out_path = match output {
+		Some(path) => path.to_string(),
+		None => format!("{}.wasm", output_stem(project_path)),
+	};
+	if let Err(error) = fs::write(&out_path, &bytecode) {
+		eprintln!("error: could not write '{out_path}': {error}");
+		std::process::exit(1);
+	}
+	eprintln!("Wrote {} bytes to {out_path}", bytecode.len());
+}
+
+/// Derives a default output filename from the project's own directory
+/// name — `path` is always a directory, so there's no file extension to
+/// strip. Resolved to an absolute path first so `.`/`./` name the real
+/// directory rather than becoming a literal `.`.
+fn output_stem(path: &str) -> String {
+	let absolute = resolve_cli_path(path);
+	absolute
+		.as_str()
+		.rsplit('/')
+		.find(|segment| !segment.is_empty())
+		.unwrap_or("out")
+		.to_string()
 }
 
 fn cmd_check(project_path: &str, format: MessageFormat) {

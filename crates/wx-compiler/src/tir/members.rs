@@ -18,7 +18,8 @@ use crate::vfs::FileId;
 use super::bounds::{Readiness, report_not_an_associated_type};
 use super::defs::{
 	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, DefId, DefinitionRegistry,
-	InherentImplIdx, MemberKind, Tier, TraitIdx, TraitImplIdx,
+	FunctionIdx, InherentImplIdx, MemberKind, MemberOwner, Tier, TraitIdx,
+	TraitImplIdx,
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
@@ -231,7 +232,102 @@ pub(super) enum TraitImplLookup {
 	Builtin,
 }
 
+/// What a call of a function with concrete arguments runs, per
+/// `resolve_function`.
+pub(super) enum ResolvedFunction {
+	/// `function` with `args`, flat: the function itself; the member of the
+	/// impl a trait declaration's `Self` selects, with the impl's arguments
+	/// and then the call's own; or the trait's default the impl inherits,
+	/// with `[Self, own...]`.
+	Instance {
+		function: FunctionIdx,
+		args: Box<[TypeIndex]>,
+	},
+	/// `Call::call` of a function item: the item's function with its own
+	/// arguments, called with the `Args` value as its parameters.
+	Item {
+		function: FunctionIdx,
+		args: Box<[TypeIndex]>,
+	},
+	/// A trait the compiler implements for `Self` (`Call` of a function
+	/// reference, a slice's or array's methods). No function provides it.
+	Builtin,
+	/// A trait's declaration whose `Self` is not known here.
+	Abstract,
+}
+
 impl TypeContext<'_, '_, '_> {
+	/// What `function` with `args` runs, as `resolve_constant` is for a
+	/// constant: itself, or, for a trait's declaration (`args` is `[Self,
+	/// own...]`), what the impl its `Self` selects provides.
+	pub(super) fn resolve_function(
+		&mut self,
+		function: FunctionIdx,
+		args: &[TypeIndex],
+	) -> Result<ResolvedFunction, SolverError> {
+		let MemberOwner::Trait(trait_index) =
+			self.defs.functions[usize::from(function)].owner
+		else {
+			return Ok(ResolvedFunction::Instance {
+				function,
+				args: args.into(),
+			});
+		};
+		let receiver = args[0];
+		if self.types.has_param(receiver) {
+			return Ok(ResolvedFunction::Abstract);
+		}
+		Ok(
+			match self.find_trait_impl_query(
+				TypeEnvIdx::ROOT,
+				receiver,
+				trait_index,
+			)? {
+				Some(TraitImplLookup::Concrete {
+					impl_index,
+					args: impl_args,
+				}) => {
+					// A function item's `impl Call` is the compiler's: it
+					// declares `Args` and `Result`, and the call runs the item.
+					if let Type::Function {
+						func_index: item,
+						type_args,
+					} = *self.types.resolve(receiver)
+						&& Some(trait_index) == self.defs.intrinsics.call
+					{
+						return Ok(ResolvedFunction::Item {
+							function: item,
+							args: self.types.list(type_args).into(),
+						});
+					}
+					match self.defs.select_trait_member(
+						impl_index,
+						MemberKind::Method(function),
+					) {
+						TraitMemberSelection::Impl(
+							MemberKind::Function(own) | MemberKind::Method(own),
+						) => ResolvedFunction::Instance {
+							function: own,
+							args: impl_args
+								.iter()
+								.chain(&args[1..])
+								.copied()
+								.collect(),
+						},
+						_ => ResolvedFunction::Instance {
+							function,
+							args: args.into(),
+						},
+					}
+				}
+				Some(TraitImplLookup::Builtin) => ResolvedFunction::Builtin,
+				Some(TraitImplLookup::Abstract) => ResolvedFunction::Abstract,
+				// The unmet bound was reported where the function is named.
+				None => return Err(SolverError::Poisoned),
+			},
+		)
+	}
+
 	/// The traits some type of `target`'s may have: those its impls
 	/// implement, and those the compiler implements for typed function
 	/// references, slices and arrays.
