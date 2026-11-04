@@ -376,6 +376,7 @@ impl<'mir> Builder<'mir> {
 				let source = match self.build_expr(block_idx, bindings, value) {
 					StackResult::Value(source) => source,
 					StackResult::Unit => {
+						#[cfg(debug_assertions)]
 						debug_assert_eq!(ty, mir::ValueType::Unit);
 						return StackResult::Unit;
 					}
@@ -440,7 +441,10 @@ impl<'mir> Builder<'mir> {
 					return value;
 				}
 				if range.len == 0 {
-					assert_eq!(ty, mir::ValueType::Unit);
+					assert!(
+						ty == mir::ValueType::Unit,
+						"an empty range is unit"
+					);
 					return StackResult::Unit;
 				}
 				let aggregate = value.unwrap_value();

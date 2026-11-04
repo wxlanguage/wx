@@ -22,7 +22,7 @@
 use string_interner::symbol::SymbolU32;
 
 use super::defs::{
-	ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, ImportIdx, StructIdx,
+	ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, ImportIdx, MemoryIdx, StructIdx,
 };
 use super::intrinsics::Intrinsic;
 use super::obligations::TypeObligation;
@@ -272,6 +272,9 @@ pub(super) enum ExprKind {
 	Local(LocalIdx),
 	/// A global's handle, of its own nominal type (`Type::Global`).
 	Global(GlobalIdx),
+	/// A memory's handle, of its own nominal type (`Type::Memory`): the
+	/// receiver of `Memory`'s methods (`heap.grow(1)`).
+	Memory(MemoryIdx),
 	/// A function as a value, of its own zero-sized type (`Type::Function`),
 	/// with its type arguments, flat as a call's.
 	Function {

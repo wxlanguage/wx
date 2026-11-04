@@ -118,6 +118,7 @@ define_diagnostic_codes! {
 		EnumReprNeedsParentheses => "E1024",
 		LabelOnIf => "E1025",
 		CrateMemberHasBody => "E1026",
+		AttributeArgumentsAreNamed => "E1027",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
 		RedundantConstMarker => "W1003",
@@ -254,6 +255,7 @@ define_diagnostic_codes! {
 		SlotLimit => "E2127",
 		MisplacedAttribute => "E2128",
 		MalformedAttribute => "E2129",
+		InvalidMemoryLimits => "E2130",
 	}
 }
 

@@ -2334,7 +2334,7 @@ fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
 	let source = indoc::indoc! {"
 		use std::*;
 
-		#[memory_limits(min_pages = 1)]
+		#[memory_limits({ min_pages: 1 })]
 		memory heap: Memory where { Size = u32 };
 		func heap_size() -> u32 {
 		    heap.size_pages()
@@ -2402,7 +2402,7 @@ fn memory_associated_const_namespace_access_resolves() {
 	let source = indoc::indoc! {"
 		use std::*;
 
-		#[memory_limits(min_pages = 1)]
+		#[memory_limits({ min_pages: 1 })]
 		memory heap: Memory where { Size = u32 };
 		global mut bump: *u8 = heap::DATA_END;
 	"};

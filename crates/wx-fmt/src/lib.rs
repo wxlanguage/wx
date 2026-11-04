@@ -1941,29 +1941,13 @@ impl<'a> Builder<'a> {
 			out.push(self.symbol(attr.name.inner));
 			match &attr.value {
 				ast::AttributeValue::Word => {}
-				ast::AttributeValue::NameValue(value) => {
-					out.push(self.text(Text::EqSp));
-					out.push(self.source_text(*value));
-				}
-				ast::AttributeValue::Args(args) => {
-					out.push(self.text(Text::LParen));
-					for (index, arg) in args.iter().enumerate() {
-						let arg = &arg.inner.inner;
-						out.push(self.symbol(arg.name.inner));
-						out.push(self.text(Text::EqSp));
-						match &arg.value {
-							ast::AttributeArgValue::Int(value) => {
-								out.push(self.source_text(value.span));
-							}
-							ast::AttributeArgValue::String(value) => {
-								out.push(self.source_text(*value));
-							}
-						}
-						if index + 1 < args.len() {
-							out.push(self.text(Text::CommaSp));
-						}
-					}
-					out.push(self.text(Text::RParen));
+				// Grouped as a call by name is, so it stays on the
+				// attribute's line while it fits.
+				ast::AttributeValue::Named(arguments) => {
+					let mut items = Vec::new();
+					self.build_named_call_args(&mut items, arguments);
+					let concat = self.arena.concat(items);
+					out.push(self.arena.group(concat));
 				}
 			}
 			out.push(self.text(Text::RBracket));

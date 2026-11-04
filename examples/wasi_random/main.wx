@@ -2,7 +2,7 @@
 // to stdout as a hex string.
 use std::*;
 
-#[memory_limits(min_pages = 1)]
+#[memory_limits({ min_pages: 1 })]
 memory heap: Memory where { Size = u32 };
 
 enum FileDescriptor(u32) {

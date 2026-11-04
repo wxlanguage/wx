@@ -203,7 +203,8 @@ lowering or settling unspecified pattern evaluation semantics.
 
 ### C05 — A short-circuit numerical loop trips the dominance verifier
 
-Status: **open; root cause not established**.
+Status: **fixed** (2026-11-04). Placement was wrong, not the verifier: a
+miscompile without the verifier, too.
 
 ```wx
 func escape(real: f64, imag: f64, limit: i32) -> i32 {
@@ -231,6 +232,42 @@ first determine whether placement or the verifier is incorrect.
 Splitting the condition into two `if` statements compiles and matched a JavaScript
 reference over 4,800 points. This is diagnostic evidence, not an accepted fix.
 Keep the verifier enabled and retain the original expression in the regression.
+
+**Cause.** `zr * zr` and `zi * zi` are each one interned node, read by the
+`||` operand and by the loop's update. `compute_value_placement` hoists a
+shared pure node to the common ancestor of its readers, but
+`record_block_own_nodes` never recorded the back edge's reads: each
+`LoopParam`'s `after` is emitted at the loop body's tail (`emit_control`,
+`Loop`), and the `Loop` arm recorded only `outputs`. With one recorded reader
+(the `else` arm), the node was emitted lazily inside that arm and the back
+edge read its local on the path that skipped the operand. Here that path
+always breaks, so only the verifier saw it. When the path continues, the
+result is wrong. With the verifier off, this returned f(2) = 4 and f(3) = 16
+instead of 16 and 256:
+
+```wx
+loop {
+    if i >= n { break x; }
+    if i == 1 || x * x > 1000 { hits += 1; }
+    x = x * x;
+    i += 1;
+}
+```
+
+**Fix.** The `Loop` arm records each output's `after` as read at
+`(body, block_tail(body))`, as `BlockJoin` records `fallthrough_updates`.
+`x * x` now has two reading blocks and is computed in the loop body before
+the `||`. Moving it ahead of the short circuit is sound because only pure,
+non-trapping nodes are placed this way (trapping operations are control,
+C02).
+
+**Regressions** (`tir/lower.rs`, inlining off and on, both failing before the
+fix): `a_back_edge_value_shared_with_a_skipped_operand_is_computed_every_iteration`
+(the program above, n = 1..4) and
+`an_escape_time_loop_with_a_short_circuit_condition_runs` (the original
+expression, 725 points against a Rust reference). `cargo test -p wx-compiler`
+— **1,216 passed, 0 failed, 4 ignored**. The CLI build of both programs ran
+under Node with the expected results.
 
 ### C06 — CLI and execution tests must use the same backend pipeline
 

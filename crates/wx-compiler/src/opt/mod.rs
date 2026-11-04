@@ -51,7 +51,9 @@ impl MemAccess {
 	pub fn from_mir(ty: mir::ValueType) -> Self {
 		match ty {
 			mir::ValueType::I8 => Self::I8S,
-			mir::ValueType::U8 => Self::I8U,
+			// `Bool` is std's `enum Bool(u8)`: one byte in memory, as TIR
+			// lays it out, though it is a whole `i32` on the stack.
+			mir::ValueType::U8 | mir::ValueType::Bool => Self::I8U,
 			mir::ValueType::I16 => Self::I16S,
 			mir::ValueType::U16 => Self::I16U,
 			mir::ValueType::I64 | mir::ValueType::U64 => Self::I64,

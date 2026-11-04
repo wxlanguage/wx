@@ -2,7 +2,7 @@ use std::*;
 
 mod boo;
 
-#[memory_limits(min_pages = 1)]
+#[memory_limits({ min_pages: 1 })]
 memory heap: Memory where { Size = u32 };
 struct Layout<M: Memory> {
     size: M::Size,

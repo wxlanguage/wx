@@ -1757,45 +1757,25 @@ pub struct FunctionParam {
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
-/// The payload of an attribute, following the meta item grammar.
+/// The payload of an attribute.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum AttributeValue {
 	/// `#[inline]` — name only, no payload.
 	Word,
-	/// `#[tag = "memory"]` — the span of the raw quoted string.
-	NameValue(TextSpan),
-	/// `#[memory_limits(min_pages = 1, max_pages = 10)]` — name plus a
-	/// parenthesized, comma-separated list of `name = value` arguments.
-	Args(Box<[Separated<Spanned<AttributeArg>>]>),
+	/// `#[memory_limits({ min_pages: 1, max_pages: 10 })]` — arguments by
+	/// name, written as a call's (`f({ x: 1 })`). What each value may be is
+	/// the attribute's to say, where it is resolved.
+	Named(Box<[Separated<Spanned<NamedArgument>>]>),
 }
 
-/// A single attribute on an item, e.g. `#[inline]`, `#[tag = "memory"]`, or
-/// `#[memory_limits(min_pages = 1)]`.
+/// A single attribute on an item, e.g. `#[inline]` or
+/// `#[memory_limits({ min_pages: 1 })]`.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct Attribute {
 	pub name: Spanned<SymbolU32>,
 	pub value: AttributeValue,
-}
-
-/// One `name = value` argument inside a parenthesized attribute, e.g.
-/// `min_pages = 1` in `#[memory_limits(min_pages = 1)]`.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct AttributeArg {
-	pub name: Spanned<SymbolU32>,
-	pub value: AttributeArgValue,
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub enum AttributeArgValue {
-	/// Range/sign validity for a given attribute is a semantic question,
-	/// checked where the attribute is resolved (TIR), not here.
-	Int(Spanned<i64>),
-	/// The span of the raw quoted string.
-	String(TextSpan),
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -2731,19 +2711,10 @@ impl<'ctx> Parser<'ctx> {
 				.strings
 				.get_or_intern(name_span.extract_str(parser.source));
 
-			let value = if parser.lexer.next_if(Token::Eq).is_some() {
-				let str_token = parser.next_expect(Token::String)?;
-				AttributeValue::NameValue(str_token.span)
-			} else if parser.lexer.peek().inner == Token::OpenParen {
-				let args = SeparatedGroup {
-					open_token: Token::OpenParen,
-					close_token: Token::CloseParen,
-					separator_token: Token::Comma,
-					should_warn_missing_separator: None,
-					item_handler: Parser::parse_attribute_arg,
-				}
-				.parse(parser)?;
-				AttributeValue::Args(args.inner)
+			let value = if parser.lexer.peek().inner == Token::OpenParen {
+				AttributeValue::Named(Parser::parse_attribute_arguments(
+					parser,
+				)?)
 			} else {
 				AttributeValue::Word
 			};
@@ -2772,47 +2743,71 @@ impl<'ctx> Parser<'ctx> {
 		Ok(attrs.into_boxed_slice())
 	}
 
-	fn parse_attribute_arg(
+	/// `({ name: value, .. })`, as a call by name writes its arguments. The
+	/// old `(name = value, ..)` is reported and read as the named list it
+	/// stands for.
+	fn parse_attribute_arguments(
 		parser: &mut Parser,
-	) -> Result<Spanned<AttributeArg>, ()> {
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
-		};
-		parser.next_expect(Token::Eq)?;
-		let value_token = parser.lexer.next();
-		let value = match value_token.inner {
-			Token::Int => {
-				let raw = value_token
-					.span
-					.extract_str(parser.source)
-					.parse::<i64>()
-					.unwrap_or(0);
-				AttributeArgValue::Int(Spanned {
-					inner: raw,
-					span: value_token.span,
-				})
+	) -> Result<Box<[Separated<Spanned<NamedArgument>>]>, ()> {
+		let open = parser.next_expect(Token::OpenParen)?.span;
+		match parser.lexer.peek().inner {
+			Token::OpenBrace => {
+				Ok(Parser::parse_named_call_arguments(parser)?.0)
 			}
-			Token::String => AttributeArgValue::String(value_token.span),
+			Token::CloseParen => {
+				parser.lexer.next();
+				Ok(Box::default())
+			}
 			_ => {
-				parser.ast.diagnostics.push(report_unexpected_token(
-					parser.ast.file_id,
-					value_token,
-					Token::Int,
-				));
-				return Err(());
+				let mut arguments = Vec::new();
+				loop {
+					let name_span = parser.next_expect(Token::Identifier)?.span;
+					let name = Spanned {
+						inner: parser.intern_identifier(name_span),
+						span: name_span,
+					};
+					parser.next_expect(Token::Eq)?;
+					let value =
+						parser.parse_expression(BindingPower::Default)?;
+					let span = TextSpan::new(name_span.start, value.span.end);
+					let separator = parser
+						.lexer
+						.next_if(Token::Comma)
+						.map(|comma| comma.span);
+					arguments.push(Separated {
+						inner: Spanned {
+							inner: NamedArgument {
+								name,
+								value: Some(Box::new(value)),
+							},
+							span,
+						},
+						separator,
+					});
+					if separator.is_none()
+						|| parser.lexer.peek().inner == Token::CloseParen
+					{
+						break;
+					}
+				}
+				let close = parser.next_expect(Token::CloseParen)?.span;
+				parser.ast.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::AttributeArgumentsAreNamed.code(),
+						)
+						.with_message(
+							"an attribute's arguments are named as a call's",
+						)
+						.with_label(Label::primary(
+							parser.ast.file_id,
+							TextSpan::new(open.start, close.end),
+						))
+						.with_note("write `#[name({ argument: value, .. })]`"),
+				);
+				Ok(arguments.into_boxed_slice())
 			}
-		};
-		let value_span = match &value {
-			AttributeArgValue::Int(v) => v.span,
-			AttributeArgValue::String(v) => *v,
-		};
-		let span = TextSpan::new(name_span.start, value_span.end);
-		Ok(Spanned {
-			inner: AttributeArg { name, value },
-			span,
-		})
+		}
 	}
 
 	fn parse_function_param_item(

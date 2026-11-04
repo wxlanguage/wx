@@ -585,7 +585,7 @@ fn test_format_parameter_and_field_slots() {
 #[test]
 fn test_format_typeset_items() {
 	let case = TestCase::new(indoc! {"
-        #[tag = \"pointer_size\"]
+        #[example]
         pub typeset PointerSize { u32, u64 }
     "});
 	let output = format(
@@ -600,7 +600,7 @@ fn test_format_typeset_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            #[tag = \"pointer_size\"]
+            #[example]
             pub typeset PointerSize { u32, u64 }
         "}
 	);
@@ -633,23 +633,23 @@ fn test_format_typeset_with_bound_clause() {
 /// `attributes` away via `..` and never passed it to their respective
 /// `build_*_definition` functions — silently dropping any `#[...]` on those
 /// four item kinds (unlike `func`/`struct`/`typeset`/`type`, which were never
-/// affected). Caught by round-tripping `std/main.wx`'s `#[tag = "add"]`-style
+/// affected). Caught by round-tripping `std/main.wx`'s `#[example]`-style
 /// operator traits through `wx format`.
 #[test]
 fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 	let case = TestCase::new(indoc! {r#"
-        #[tag = "add"]
+        #[example]
         pub trait Add {
             func add(self: Self, rhs: Self) -> Self;
         }
 
-        #[tag = "example"]
+        #[example]
         enum Color { Red, Green, Blue }
 
-        #[tag = "example"]
+        #[example]
         pub const LIMIT: i32 = 10;
 
-        #[tag = "example"]
+        #[example]
         global mut counter: i32 = 0;
     "#});
 	let output = format(
@@ -664,22 +664,22 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 	assert_eq!(
 		output,
 		indoc! {r#"
-            #[tag = "add"]
+            #[example]
             pub trait Add {
                 func add(self: Self, rhs: Self) -> Self;
             }
 
-            #[tag = "example"]
+            #[example]
             enum Color {
                 Red,
                 Green,
                 Blue,
             }
 
-            #[tag = "example"]
+            #[example]
             pub const LIMIT: i32 = 10;
 
-            #[tag = "example"]
+            #[example]
             global mut counter: i32 = 0;
         "#}
 	);
@@ -1214,8 +1214,8 @@ fn test_format_keeps_pub_on_memory_and_global() {
 		"pub memory heap: Memory32;\n"
 	);
 	assert_eq!(
-		fmt("#[memory_limits(min_pages = 4)] pub memory heap: Memory32;"),
-		"#[memory_limits(min_pages = 4)]\npub memory heap: Memory32;\n",
+		fmt("#[memory_limits({ min_pages: 4 })] pub memory heap: Memory32;"),
+		"#[memory_limits({ min_pages: 4 })]\npub memory heap: Memory32;\n",
 	);
 	assert_eq!(
 		fmt("pub global mut g: u32 = 0;"),
@@ -1243,22 +1243,22 @@ fn test_format_memory_config() {
 
 	// min_pages only
 	assert_eq!(
-		fmt("#[memory_limits(min_pages = 4)] memory heap: Memory32;"),
-		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory32;\n",
+		fmt("#[memory_limits({ min_pages: 4 })] memory heap: Memory32;"),
+		"#[memory_limits({ min_pages: 4 })]\nmemory heap: Memory32;\n",
 	);
 
 	// max_pages only
 	assert_eq!(
-		fmt("#[memory_limits(max_pages = 10)] memory heap: Memory32;"),
-		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory32;\n",
+		fmt("#[memory_limits({ max_pages: 10 })] memory heap: Memory32;"),
+		"#[memory_limits({ max_pages: 10 })]\nmemory heap: Memory32;\n",
 	);
 
 	// both fields
 	assert_eq!(
 		fmt(
-			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory32;"
+			"#[memory_limits({ min_pages: 1, max_pages: 10 })] memory heap: Memory32;"
 		),
-		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory32;\n",
+		"#[memory_limits({ min_pages: 1, max_pages: 10 })]\nmemory heap: Memory32;\n",
 	);
 }
 
@@ -2348,8 +2348,7 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 		)
 	};
 	let source = indoc! {"
-        #[tag = \"line\\nslash\\\\n\"]
-        #[other(value = \"line\\nslash\\\\n\")]
+        #[other({ value: \"line\\nslash\\\\n\" })]
         func f() {
             local text = \"line\\nslash\\\\n\";
         }
@@ -2363,7 +2362,7 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
         }
     "};
 	let formatted = fmt(source);
-	assert_eq!(formatted.matches(r#""line\nslash\\n""#).count(), 5);
+	assert_eq!(formatted.matches(r#""line\nslash\\n""#).count(), 4);
 	assert_eq!(fmt(&formatted), formatted);
 }
 

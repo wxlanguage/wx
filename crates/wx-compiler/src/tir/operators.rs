@@ -185,8 +185,8 @@ pub(super) struct OperatorMethod {
 	pub(super) method: FunctionIdx,
 }
 
-/// Every overloadable operator's method, resolved once from the `#[tag]`ged
-/// traits phase 1 recorded (`IntrinsicDefs`). A slot is `None` when the stdlib
+/// Every overloadable operator's method, resolved once from the operator
+/// traits phase 1 recorded by name (`IntrinsicDefs`). A slot is `None` when the stdlib
 /// in use does not define the trait (or the method), in which case the
 /// operator applies to nothing.
 pub(super) struct OperatorTraits {

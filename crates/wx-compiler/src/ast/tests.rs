@@ -3021,7 +3021,7 @@ fn test_impl_trait_multi_segment_trait_name() {
 #[test]
 fn test_typeset_attributes_parsed() {
 	let case = TestCase::new(indoc! {"
-        #[tag = \"my_typeset\"]
+        #[example]
         typeset Foo { u32, u64 }
     "});
 	case.diagnostics().assert_none();
@@ -3585,10 +3585,10 @@ fn test_impl_associated_const() {
 
 #[test]
 fn test_attribute_with_arguments() {
-	// `#[word]` and `#[name = value]` are covered elsewhere; this is the
-	// third shape, `#[name(arg = value, ...)]`.
+	// `#[word]` is covered elsewhere; this is the other shape, arguments
+	// named as a call's, `#[name({ arg: value, .. })]`.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1, max_pages = 4)]
+        #[memory_limits({ min_pages: 1, max_pages: 4 })]
         memory m: u32;
     "});
 	case.diagnostics().assert_none();
@@ -3597,8 +3597,39 @@ fn test_attribute_with_arguments() {
 		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
 	};
 	assert_eq!(case.name(attributes[0].name.inner), "memory_limits");
-	let AttributeValue::Args(args) = &attributes[0].value else {
-		panic!("expected parenthesised attribute arguments")
+	let AttributeValue::Named(args) = &attributes[0].value else {
+		panic!("expected named attribute arguments")
+	};
+	let arguments: Vec<(&str, u64)> = args
+		.iter()
+		.map(|arg| {
+			let arg = &arg.inner.inner;
+			let Some(Expression::Int { value }) =
+				arg.value.as_deref().map(|value| &value.inner)
+			else {
+				panic!("expected an integer value")
+			};
+			(case.name(arg.name.inner), *value)
+		})
+		.collect();
+	assert_eq!(arguments, [("min_pages", 1), ("max_pages", 4)]);
+}
+
+#[test]
+fn old_attribute_arguments_are_reported_and_read_as_named() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1, max_pages = 4)]
+        memory m: u32;
+    "});
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::AttributeArgumentsAreNamed]);
+	case.diagnostics()
+		.assert_error_saying("an attribute's arguments are named as a call's");
+	let Item::Memory { attributes, .. } = case.item(0) else {
+		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
+	};
+	let AttributeValue::Named(args) = &attributes[0].value else {
+		panic!("expected named attribute arguments")
 	};
 	let names: Vec<&str> = args
 		.iter()
@@ -3685,8 +3716,7 @@ fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
 #[test]
 fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let source = indoc! {"
-        #[tag = \"line\\nslash\\\\n\"]
-        #[other(value = \"line\\nslash\\\\n\")]
+        #[other({ value: \"line\\nslash\\\\n\" })]
         func f() {
             local text = \"line\\nslash\\\\n\";
         }
@@ -3706,15 +3736,14 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let Item::Function { attributes, .. } = case.item(0) else {
 		panic!("expected function");
 	};
-	let AttributeValue::NameValue(tag) = &attributes[0].value else {
-		panic!("expected name/value attribute");
-	};
-	let AttributeValue::Args(args) = &attributes[1].value else {
+	let AttributeValue::Named(args) = &attributes[0].value else {
 		panic!("expected attribute args");
 	};
-	let AttributeArgValue::String(arg) = &args[0].inner.inner.value else {
-		panic!("expected string argument");
+	let Some(value) = &args[0].inner.inner.value else {
+		panic!("expected a written value");
 	};
+	assert!(matches!(value.inner, Expression::String));
+	let arg = &value.span;
 	let Item::Import { external_name, .. } = case.item(1) else {
 		panic!("expected import");
 	};
@@ -3722,7 +3751,6 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 		panic!("expected export");
 	};
 	for span in [
-		tag,
 		arg,
 		external_name,
 		entries[0].inner.inner.alias.as_ref().unwrap(),
@@ -3738,8 +3766,7 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 #[test]
 fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
 	let source = indoc! {"
-        #[tag = \"\\o\"]
-        #[other(value = \"\\o\")]
+        #[other({ value: \"\\o\" })]
         func f() {
             local bad = \"\\o\";
             local good = \"ok\";

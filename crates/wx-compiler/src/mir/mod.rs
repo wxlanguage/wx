@@ -84,9 +84,18 @@ pub enum ValueType {
 	Unit,
 	Never,
 	Bool,
-	Pointer { memory: MemoryId, kind: MemoryKind },
-	Aggregate { aggregate_index: AggregateIndex },
-	Function { signature_index: SignatureIndex },
+	/// An address. Which memory it points into is checked in TIR and named
+	/// by every node that reads or writes through it, so the type holds only
+	/// the address width: no module item id lives in a type.
+	Pointer {
+		kind: MemoryKind,
+	},
+	Aggregate {
+		aggregate_index: AggregateIndex,
+	},
+	Function {
+		signature_index: SignatureIndex,
+	},
 }
 
 impl ValueType {
@@ -186,8 +195,11 @@ impl MemoryKind {
 pub struct MemoryInfo {
 	pub id: MemoryId,
 	pub kind: MemoryKind,
-	pub min_pages: Option<u32>,
-	pub max_pages: Option<u32>,
+	/// Counts of 64 KiB pages, as `#[memory_limits]` writes them (checked);
+	/// `None` for a bound left out, and both for an imported memory.
+	/// Codegen raises the minimum to the pages the static data takes.
+	pub min_pages: Option<u64>,
+	pub max_pages: Option<u64>,
 	/// An imported memory has nothing a defined one lacks: its kind and
 	/// limits are both.
 	pub origin: Origin<()>,

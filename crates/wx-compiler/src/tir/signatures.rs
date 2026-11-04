@@ -1836,6 +1836,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				clauses: BoundClauses::NONE,
 				value: Some(checked_size),
 			});
+		self.check_memory_limits(file_id, memory_index, resolved_size);
 		self.trait_impls[usize::from(trait_impl_index)] =
 			Some(TraitImplSignature {
 				type_params: TypeEnvIdx::ROOT,
@@ -1845,6 +1846,77 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				},
 			});
 		SignatureLocation::Memory(memory_index)
+	}
+
+	/// Checks the page limits a memory's `#[memory_limits]` records
+	/// (`MemoryDef::limits`) against what its `Size` can address: each a
+	/// count of 64 KiB pages up to 65536 for `u32` and 2^48 for `u64`, and
+	/// the minimum no greater than the maximum. Each failure is E2130.
+	///
+	/// What a left-out bound means is codegen's rule: no maximum, and a
+	/// minimum of the pages the memory's static data takes.
+	fn check_memory_limits(
+		&mut self,
+		file_id: FileId,
+		memory_index: MemoryIdx,
+		size: TypeIndex,
+	) {
+		let limits = self.defs.memories[usize::from(memory_index)].limits;
+		// A `Size` that is neither is reported against `PointerSize`.
+		let (page_bound, memory): (u64, &str) = match size {
+			TypeIndex::U32 => (1 << 16, "a 32-bit memory"),
+			TypeIndex::U64 => (1 << 48, "a 64-bit memory"),
+			_ => return,
+		};
+		let mut fits = true;
+		for (name, bound) in [
+			("min_pages", limits.min_pages),
+			("max_pages", limits.max_pages),
+		] {
+			let Some(pages) = bound else { continue };
+			if pages.inner <= page_bound {
+				continue;
+			}
+			fits = false;
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::InvalidMemoryLimits.code())
+					.with_message(format!("`{name}` must be a number of pages"))
+					.with_label(
+						SourceSpan::new(file_id, pages.span)
+							.primary_label()
+							.with_message(format!(
+								"expected an integer from 0 to {page_bound}"
+							)),
+					)
+					.with_note(format!(
+						"a page is 64 KiB, and {memory} has at most \
+						 {page_bound} of them"
+					)),
+			);
+		}
+		if fits
+			&& let (Some(min), Some(max)) = (limits.min_pages, limits.max_pages)
+			&& min.inner > max.inner
+		{
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::InvalidMemoryLimits.code())
+					.with_message(format!(
+						"the memory's minimum ({} pages) is above its maximum \
+						 ({} pages)",
+						min.inner, max.inner
+					))
+					.with_label(
+						SourceSpan::new(file_id, min.span).primary_label(),
+					)
+					.with_label(
+						SourceSpan::new(file_id, max.span)
+							.secondary_label()
+							.with_message("the maximum"),
+					),
+			);
+		}
 	}
 
 	/// Fills in a `global` declaration's synthetic `Global` impl (and, for
@@ -17955,5 +18027,43 @@ pub(super) mod tests {
 			),
 			Ok(None)
 		);
+	}
+
+	#[test]
+	fn memory_limits_within_the_memorys_size_are_accepted() {
+		test_case!(
+			case = indoc! {"
+				#[memory_limits({ min_pages: 2, max_pages: 65536 })]
+				memory full: u32;
+				#[memory_limits({ min_pages: 70000 })]
+				memory wide: u64;
+				#[memory_limits({ min_pages: 4, max_pages: 4 })]
+				memory fixed: u32;
+			"}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn memory_limits_beyond_the_memorys_size_or_crossed_are_reported() {
+		for (source, message) in [
+			(
+				"#[memory_limits({ max_pages: 65537 })] memory heap: u32;",
+				"`max_pages` must be a number of pages",
+			),
+			(
+				"#[memory_limits({ min_pages: 281474976710657 })] memory heap: u64;",
+				"`min_pages` must be a number of pages",
+			),
+			(
+				"#[memory_limits({ min_pages: 3, max_pages: 2 })] memory heap: u32;",
+				"the memory's minimum (3 pages) is above its maximum (2 pages)",
+			),
+		] {
+			test_case!(case = source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::InvalidMemoryLimits]);
+			case.diagnostics().assert_error_saying(message);
+		}
 	}
 }

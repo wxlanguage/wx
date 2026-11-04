@@ -822,6 +822,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				let ty = self.cx.types.intern(Type::Global { global_index });
 				self.body.push(ExprKind::Global(global_index), ty, span)
 			}
+			// A memory's name is its handle, as a global's is.
+			DefKind::Memory(memory_index) => {
+				let ty = self.cx.types.intern(Type::Memory { memory_index });
+				self.body.push(ExprKind::Memory(memory_index), ty, span)
+			}
 			_ => {
 				self.unsupported(span, &format!("a path to a {}", kind.noun()))
 			}
@@ -2152,8 +2157,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.set_kind(expr, kind);
 				self.body.set_ty(expr, ty);
 			}
-			kind => unreachable!(
-				"only literals and operators over them are untyped: {kind:?}"
+			_ => unreachable!(
+				"only literals and operators over them are untyped"
 			),
 		}
 	}
@@ -3222,6 +3227,10 @@ mod tests {
 				ExprKind::Local(local) => self.local_name(body, local),
 				ExprKind::Global(index) => {
 					name(self.defs.globals[usize::from(index)].name.inner)
+						.to_string()
+				}
+				ExprKind::Memory(index) => {
+					name(self.defs.memories[usize::from(index)].name.inner)
 						.to_string()
 				}
 				ExprKind::Function {

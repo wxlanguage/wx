@@ -881,9 +881,11 @@ impl TypeContext<'_, '_, '_> {
 				Some(Scalar::F64) => stack.push(ConstScalar::f64(value)),
 				_ => return Err(own(EvalErrorKind::NotConst)),
 			},
-			// A function item and a global's handle are zero-sized: the type
-			// says everything.
-			ExprKind::Function { .. } | ExprKind::Global(_) => {}
+			// A function item and a global's or a memory's handle are
+			// zero-sized: the type says everything.
+			ExprKind::Function { .. }
+			| ExprKind::Global(_)
+			| ExprKind::Memory(_) => {}
 			ExprKind::String(contents) => {
 				self.eval_string(owner, contents, ty, span, stack)?;
 			}

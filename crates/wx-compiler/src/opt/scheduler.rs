@@ -1117,15 +1117,31 @@ impl<'f> Scheduler<'f> {
 						}
 					}
 				}
-				ControlNode::Loop { outputs, .. } => {
-					// LoopParam nodes themselves are impure (excluded from
-					// placement entirely); nothing pure to record here.
+				ControlNode::Loop { body, outputs, .. } => {
 					for &o in outputs.iter() {
 						record_read(
 							&mut consuming_blocks[o as usize],
 							block_idx,
 							i,
 						);
+					}
+					// The back edge reads each param's `after` value at the
+					// body's own tail (`emit_control`'s `Loop` arm), as
+					// BlockJoin's fallthrough_updates below. Unrecorded, a
+					// value the body also computes on one branch (the right
+					// operand of `||`) is placed in that branch only, and
+					// the back edge reads its local on paths that skipped it.
+					let body_tail = self.block_tail(*body);
+					for &o in outputs.iter() {
+						if let DataNodeKind::LoopParam { after, .. } =
+							self.func.data_nodes[o as usize].kind
+						{
+							record_read(
+								&mut consuming_blocks[after as usize],
+								*body,
+								body_tail,
+							);
+						}
 					}
 				}
 				ControlNode::BlockJoin {

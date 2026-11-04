@@ -187,9 +187,9 @@ fn open_manifest_package(
 	// `"type": "std"` has exactly one effect — suppressing the embedded
 	// stdlib — and that decision belongs to the root, so here it could only
 	// ever be inert. Inert-but-accepted is the dangerous outcome: the
-	// package would load as an ordinary library while its `#[tag = "..."]`
-	// items still landed in the one compilation-wide `tagged_items` map,
-	// silently competing for `add`/`sub`/... against the real stdlib's.
+	// package would load as an ordinary library while still declaring the
+	// items the language requires, silently competing for `Add`/`Sub`/...
+	// against the real stdlib's.
 	if matches!(manifest.kind, PackageManifestKind::Std) {
 		builder.packages[id.as_usize()]
 			.diagnostics
@@ -486,8 +486,9 @@ mod tests {
 
 	/// `"type": "std"` says "suppress the embedded stdlib for this
 	/// compilation" — a decision only the root can make. A dependency
-	/// declaring it would be inert, while its `#[tag]` items still competed
-	/// with the real stdlib's, so it's rejected rather than ignored.
+	/// declaring it would be inert, while the language items it declares
+	/// still competed with the real stdlib's, so it's rejected rather than
+	/// ignored.
 	#[test]
 	fn std_package_as_a_dependency_is_diagnosed() {
 		let source = workspace(&[

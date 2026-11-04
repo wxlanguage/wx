@@ -16,13 +16,20 @@
 //! declarations, compound assignments, constants (`True`/`False`, enum
 //! variants, free `const` items, and associated ones per instance), `Char`
 //! literals, type aliases, and tuples and structs (including generic and
-//! zero-sized fields).
+//! zero-sized fields), and memories: a memory is lowered the first time
+//! something names it (defined, imported or exported, with its checked
+//! `#[memory_limits]`), a pointer is an address as wide as its memory's
+//! `Size`, and a place in memory is read, written, compound-written and
+//! addressed through `places.rs`; the memory intrinsics (`memory_size`,
+//! `memory_grow`, `memory_fill`, `memory_copy`, `size_of`, `align_of`) are
+//! MIR's memory nodes and constants.
 //! Aggregates keep their values in declaration order while TIR supplies the
 //! byte offsets and size. A constant pattern compares an aggregate through
 //! the concrete `PartialEq::eq` impl its checked `Eq` bound selects, so a
-//! type's own equality is honoured. Memory types (arrays, slices, pointers),
-//! calls the compiler implements, function references, and float equality tests (floats have no total equality) are
-//! not lowered yet. Every other checked form is reported as
+//! type's own equality is honoured. Arrays, slices and string literals (the
+//! static-data checkpoint, with `Memory::DATA_END` and `Memory::INDEX`),
+//! calls the compiler implements, function references, and float equality
+//! tests (floats have no total equality) are not lowered yet. Every other checked form is reported as
 //! `UnsupportedExpression`; no unsupported form becomes `Noop` and no
 //! unsupported form disappears from the output.
 
@@ -35,13 +42,14 @@ use super::body::{
 	Body, ElementOrder, ExprIdx, ExprKind, FunctionImplementation, PatIdx,
 	ScopeIdx,
 };
-use super::defs::{Attributes, FieldIdx, FunctionIdx, GlobalIdx};
+use super::defs::{Attributes, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx};
 use super::eval::Val;
+use super::layout::Primitive;
 use super::members::ResolvedFunction;
 use super::signatures::TypeContext;
 use super::solver::{NormalizationDepth, RewriteFlags};
 use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
-use crate::ast::{BinaryOp, UnaryOp};
+use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::mir;
 use crate::mir::layout::AggregateTable;
@@ -50,6 +58,7 @@ use crate::vfs::FileId;
 mod constants;
 mod intrinsics;
 mod patterns;
+mod places;
 
 /// How a call's written arguments meet what it runs.
 #[derive(Clone, Copy)]
@@ -184,6 +193,12 @@ struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	/// Each source global's backend identity, given the first time something
 	/// names it; indexed by `GlobalIdx`.
 	global_ids: Vec<Option<mir::GlobalId>>,
+	/// Indexed by `MemoryId`.
+	memories: Vec<mir::MemoryInfo>,
+	/// Each source memory's backend identity, given the first time something
+	/// names it (a pointer into it, an access, an export); indexed by
+	/// `MemoryIdx`.
+	memory_ids: Vec<Option<mir::MemoryId>>,
 	signatures: Vec<mir::FunctionSignature>,
 	/// Backend identity, minted here per instance. Never a source or Wasm
 	/// index.
@@ -215,6 +230,7 @@ pub(super) fn build(
 	context: &mut TypeContext<'_, '_, '_>,
 ) -> Result<mir::MIR, ()> {
 	let global_count = context.defs.globals.len();
+	let memory_count = context.defs.memories.len();
 	Lowerer {
 		context,
 		functions: Vec::new(),
@@ -222,6 +238,8 @@ pub(super) fn build(
 		imports: Vec::new(),
 		globals: Vec::new(),
 		global_ids: vec![None; global_count],
+		memories: Vec::new(),
+		memory_ids: vec![None; memory_count],
 		signatures: Vec::new(),
 		ids: HashMap::new(),
 		aggregate_types: HashMap::new(),
@@ -261,18 +279,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 						item: mir::Item::Global(id),
 					});
 				}
-				super::signatures::ExportedItem::Memory(_) => {
-					let source = self
-						.context
-						.defs
-						.exports
-						.get(&name)
-						.expect("every checked export has a source entry");
-					self.unsupported(
-						source.external_span.file_id,
-						source.external_span.span,
-						"exporting a memory",
-					)?;
+				super::signatures::ExportedItem::Memory(memory) => {
+					let id = self.memory(memory);
+					mir_exports.push(mir::Export {
+						name,
+						item: mir::Item::Memory(id),
+					});
 				}
 			}
 		}
@@ -288,7 +300,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			globals: self.globals,
 			exports: mir_exports,
 			imports: self.imports,
-			memories: Vec::new(),
+			memories: self.memories,
 			aggregates: self.aggregates.finish(),
 			static_entries: Vec::new(),
 			start_function: None,
@@ -675,6 +687,84 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		Ok(id)
 	}
 
+	/// `memory`'s backend identity, lowered the first time something names
+	/// it. Its kind is its `Size`, and its limits are what the checker read
+	/// from its `#[memory_limits]`.
+	pub(super) fn memory(&mut self, memory: MemoryIdx) -> mir::MemoryId {
+		if let Some(id) = self.memory_ids[usize::from(memory)] {
+			return id;
+		}
+		let memory_type = self.context.types.intern(Type::Memory {
+			memory_index: memory,
+		});
+		let kind = match self
+			.context
+			.address_primitive(TypeEnvIdx::ROOT, memory_type)
+		{
+			Ok(Some(Primitive::U32)) => mir::MemoryKind::Memory32,
+			Ok(Some(Primitive::U64)) => mir::MemoryKind::Memory64,
+			_ => unreachable!("a checked memory's `Size` is `u32` or `u64`"),
+		};
+		let id =
+			mir::MemoryId::new(u32::try_from(self.memories.len()).unwrap());
+		// Checked against the memory's `Size`: a count of pages it holds.
+		let limits = self.context.defs.memories[usize::from(memory)].limits;
+		let pages =
+			|bound: Option<Spanned<u64>>| bound.map(|pages| pages.inner);
+		let origin =
+			match *self.context.ast_node(super::defs::DefId::Memory(memory)) {
+				super::defs::AstNodeRef::ImportedMemory {
+					import_index,
+					..
+				} => {
+					let entry = mir::ImportIdx::new(
+						u32::try_from(self.imports.len()).unwrap(),
+					);
+					self.imports.push(mir::Import {
+						module: self.context.defs.imports
+							[usize::from(import_index)]
+						.external_name
+						.inner,
+						name: self.context.defs.memories[usize::from(memory)]
+							.name
+							.inner,
+						item: mir::Item::Memory(id),
+					});
+					mir::Origin::Imported(entry)
+				}
+				_ => mir::Origin::Defined(()),
+			};
+		self.memories.push(mir::MemoryInfo {
+			id,
+			kind,
+			min_pages: pages(limits.min_pages),
+			max_pages: pages(limits.max_pages),
+			origin,
+		});
+		self.memory_ids[usize::from(memory)] = Some(id);
+		id
+	}
+
+	/// The memory a concrete `Type::Memory` names.
+	pub(super) fn memory_of_type(
+		&mut self,
+		memory: TypeIndex,
+	) -> mir::MemoryId {
+		let Ok(memory) = self.context.normalize(
+			TypeEnvIdx::ROOT,
+			memory,
+			NormalizationDepth::Shallow,
+			RewriteFlags::ALL,
+		) else {
+			unreachable!("a concrete memory type normalizes")
+		};
+		let Type::Memory { memory_index } = *self.context.types.resolve(memory)
+		else {
+			unreachable!("a checked place or pointer is in a declared memory")
+		};
+		self.memory(memory_index)
+	}
+
 	/// `instance`'s MIR signature, and its parameter and result types.
 	fn lower_signature(
 		&mut self,
@@ -908,6 +998,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					// divergence and the effects that preceded it.
 					debug_assert_eq!(body.ty(operand), TypeIndex::NEVER);
 					let operand = self.lower_expr(body, state, operand)?;
+					#[cfg(debug_assertions)]
 					debug_assert_eq!(state.ty(operand), mir::ValueType::Never);
 					return Ok(operand);
 				}
@@ -930,6 +1021,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					// never evaluated.
 					debug_assert_eq!(body.ty(rhs), TypeIndex::NEVER);
 					let left = self.lower_expr(body, state, lhs)?;
+					#[cfg(debug_assertions)]
 					debug_assert_eq!(state.ty(left), mir::ValueType::Never);
 					return Ok(left);
 				}
@@ -981,10 +1073,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			),
 			// A function item's value is zero-sized; a call of it names its
 			// function by its type. A global's handle is too: `Global::get`
-			// names the global by its type argument.
-			ExprKind::Function { .. } | ExprKind::Global(_) => {
-				Ok(state.push(mir::ExprKind::Noop, ty))
-			}
+			// names the global by its type argument, and a memory intrinsic
+			// its memory.
+			ExprKind::Function { .. }
+			| ExprKind::Global(_)
+			| ExprKind::Memory(_) => Ok(state.push(mir::ExprKind::Noop, ty)),
 			ExprKind::Tuple { elements, order } => {
 				// A zero-slot tuple need not be empty. Evaluate its elements;
 				// `build_aggregate` erases their values, not their effects.
@@ -1097,6 +1190,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				match ty {
 					// The `Char` struct itself: one `u32` codepoint.
 					mir::ValueType::Aggregate { aggregate_index } => {
+						#[cfg(debug_assertions)]
 						debug_assert_eq!(
 							self.aggregates
 								.get(aggregate_index)
@@ -1182,6 +1276,41 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				let value = self.lower_expr(body, state, value)?;
 				Ok(state.push(mir::ExprKind::Drop { value }, ty))
 			}
+			ExprKind::Load(place) => self.lower_load(body, state, place, ty),
+			ExprKind::AddressOf(place) => {
+				self.lower_address_of(body, state, place, ty)
+			}
+			ExprKind::Store { place, value } => {
+				self.lower_store(body, state, place, value)
+			}
+			ExprKind::PrimitiveCompoundStore { op, place, value } => self
+				.lower_compound_store(
+					body,
+					state,
+					place,
+					value,
+					places::Operation::Primitive(op),
+					body.span(expr),
+				),
+			ExprKind::ConcreteCompoundStore {
+				method,
+				type_args,
+				place,
+				value,
+			}
+			| ExprKind::AbstractCompoundStore {
+				method,
+				type_args,
+				place,
+				value,
+			} => self.lower_compound_store(
+				body,
+				state,
+				place,
+				value,
+				places::Operation::Method { method, type_args },
+				body.span(expr),
+			),
 			ExprKind::Return { value } => {
 				let value = match value {
 					Some(value) => Some(self.lower_expr(body, state, value)?),
@@ -1197,13 +1326,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			| ExprKind::Array { .. }
 			| ExprKind::ArrayRepeat { .. }
 			| ExprKind::NextDiscriminant(_)
-			| ExprKind::CallRef { .. }
-			| ExprKind::Load(_)
-			| ExprKind::AddressOf(_)
-			| ExprKind::Store { .. }
-			| ExprKind::PrimitiveCompoundStore { .. }
-			| ExprKind::ConcreteCompoundStore { .. }
-			| ExprKind::AbstractCompoundStore { .. } => {
+			| ExprKind::CallRef { .. } => {
 				self.unsupported(
 					state.file_id,
 					body.span(expr),
@@ -1860,14 +1983,24 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			Type::Tuple { .. } | Type::Struct { .. } => {
 				return self.lower_aggregate_type(ty, file_id, span);
 			}
-			Type::Pointer { .. } | Type::Array { .. } | Type::Slice { .. } => {
+			// An address, as wide as its memory's `Size`. The memory itself
+			// is named by each access, not by the type.
+			Type::Pointer { memory, .. } => {
+				let id = self.memory_of_type(memory);
+				mir::ValueType::Pointer {
+					kind: self.memories[usize::from(id)].kind,
+				}
+			}
+			Type::Array { .. } | Type::Slice { .. } => {
 				self.unsupported(
 					file_id,
 					span,
-					"a memory-backed type (the memory checkpoint)",
+					"an array or a slice (the static-data checkpoint)",
 				)?;
 				unreachable!()
 			}
+			// A memory's handle names it in its type; the value is nothing.
+			Type::Memory { .. } => mir::ValueType::Unit,
 			// A function item is its own zero-sized type: calling it names
 			// its function, so the value carries nothing.
 			Type::Function { .. } => mir::ValueType::Unit,
@@ -2217,6 +2350,14 @@ mod tests {
 		instantiate_with_policy(source, Some(mir::inline::Policy::DEFAULT))
 	}
 
+	/// An engine with the proposals lowering emits: a memory with a `u64`
+	/// `Size` is a 64-bit memory.
+	fn engine() -> wasmtime::Engine {
+		let mut config = wasmtime::Config::new();
+		config.wasm_memory64(true);
+		wasmtime::Engine::new(&config).unwrap()
+	}
+
 	/// Run with or without inlining to distinguish lowering regressions from
 	/// transformations that expose them. The CLI currently skips inlining.
 	fn instantiate_with_policy(
@@ -2237,7 +2378,7 @@ mod tests {
 		let module = crate::codegen::Builder::build(&mir, &graph.strings)
 			.expect("lowered MIR must encode");
 		let bytes = module.encode();
-		let engine = wasmtime::Engine::default();
+		let engine = engine();
 		let module = wasmtime::Module::new(&engine, &bytes)
 			.expect("lowered MIR must be valid Wasm");
 		let mut store = wasmtime::Store::new(&engine, ());
@@ -2995,10 +3136,6 @@ mod tests {
 				r#"use std::trap as provided; export { provided as "trap" }"#,
 				"requires a wrapper",
 			),
-			(
-				r#"memory heap: u32; func run() -> u32 { std::size_of::<i32, heap>() } export { run as "run" }"#,
-				"compiler intrinsic SizeOf",
-			),
 		] {
 			let mut graph = crate::tir::signatures::tests::source_graph(source);
 			let (diagnostics, mir) = crate::tir::build(&mut graph);
@@ -3443,22 +3580,22 @@ mod tests {
 	}
 
 	#[test]
-	fn reports_a_memory_type_as_unsupported() {
+	fn reports_a_slice_type_as_unsupported() {
 		let source = r#"
             memory heap: u32;
-            func peek(p: heap::*i32) -> i32 { p.* }
-            export { peek as "peek" }
+            func first(s: heap::&[u8]) -> u8 { s[0] }
+            export { first as "first" }
         "#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
 		let (diagnostics, mir) = crate::tir::build(&mut graph);
-		assert!(mir.is_none(), "memory types have no lowering yet");
+		assert!(mir.is_none(), "slices have no lowering yet");
 		assert!(
 			diagnostics.iter().any(|d| {
-				d.message.contains("memory checkpoint")
+				d.message.contains("static-data checkpoint")
 					&& d.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code())
 			}),
-			"expected the memory-checkpoint diagnostic, got {diagnostics:#?}"
+			"expected the static-data diagnostic, got {diagnostics:#?}"
 		);
 	}
 
@@ -4843,6 +4980,94 @@ mod tests {
 				.unwrap(),
 			42
 		);
+	}
+
+	/// C05: `x * x` is one node for the `||` operand and the update, so the
+	/// back edge reads it after the iteration where `i == 1` skipped the
+	/// operand. Placed in the operand's branch only, that iteration read the
+	/// previous one's square (f(2) was 4, f(3) 16).
+	#[test]
+	fn a_back_edge_value_shared_with_a_skipped_operand_is_computed_every_iteration()
+	 {
+		let source = r#"
+            func run(n: i32) -> f64 {
+                local mut x: f64 = 2;
+                local mut i: i32 = 0;
+                local mut hits: i32 = 0;
+                loop {
+                    if i >= n { break x; }
+                    if i == 1 || x * x > 1000 { hits += 1; }
+                    x = x * x;
+                    i += 1;
+                }
+            }
+            export { run as "run" }
+        "#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let run = instance
+				.get_typed_func::<i32, f64>(&mut store, "run")
+				.expect("`run` must be exported");
+			for (n, expected) in [(1, 4.0), (2, 16.0), (3, 256.0), (4, 65536.0)]
+			{
+				assert_eq!(
+					run.call(&mut store, n).unwrap(),
+					expected,
+					"n = {n}"
+				);
+			}
+		}
+	}
+
+	/// C05's original reproducer: the escape-time loop shares `zr * zr` and
+	/// `zi * zi` between the `||` operand and the next iteration's values.
+	#[test]
+	fn an_escape_time_loop_with_a_short_circuit_condition_runs() {
+		let source = r#"
+            func escape(real: f64, imag: f64, limit: i32) -> i32 {
+                local mut zr: f64 = 0;
+                local mut zi: f64 = 0;
+                local mut iterations: i32 = 0;
+                loop {
+                    if iterations >= limit || zr * zr + zi * zi > 4 {
+                        break iterations;
+                    }
+                    local next_real = zr * zr - zi * zi + real;
+                    zi = 2 * zr * zi + imag;
+                    zr = next_real;
+                    iterations += 1;
+                }
+            }
+            export { escape as "escape" }
+        "#;
+		fn reference(real: f64, imag: f64, limit: i32) -> i32 {
+			let (mut zr, mut zi, mut iterations) = (0.0f64, 0.0f64, 0);
+			loop {
+				if iterations >= limit || zr * zr + zi * zi > 4.0 {
+					break iterations;
+				}
+				let next_real = zr * zr - zi * zi + real;
+				zi = 2.0 * zr * zi + imag;
+				zr = next_real;
+				iterations += 1;
+			}
+		}
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let escape = instance
+				.get_typed_func::<(f64, f64, i32), i32>(&mut store, "escape")
+				.expect("`escape` must be exported");
+			for y in -12..=12 {
+				for x in -20..=8 {
+					let (real, imag) = (x as f64 / 8.0, y as f64 / 8.0);
+					assert_eq!(
+						escape.call(&mut store, (real, imag, 50)).unwrap(),
+						reference(real, imag, 50),
+						"({real}, {imag})"
+					);
+				}
+			}
+		}
 	}
 
 	/// A bare `break` gives the loop the unit value.
@@ -7392,5 +7617,313 @@ mod tests {
 			);
 			assert_eq!(*store.data(), 1);
 		}
+	}
+
+	/// Both inlining modes, each with the exported memory `heap` alongside
+	/// the instance.
+	fn each_policy(
+		source: &str,
+		check: impl Fn(
+			&mut wasmtime::Store<()>,
+			&wasmtime::Instance,
+			wasmtime::Memory,
+		),
+	) {
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let memory = instance.get_memory(&mut store, "heap").unwrap();
+			check(&mut store, &instance, memory);
+		}
+	}
+
+	#[test]
+	fn a_value_stored_through_a_pointer_is_read_back() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			func run(address: u32, value: i32) -> i32 {
+				local p: heap::*i32 = transmute(address);
+				p.* = value;
+				p.*
+			}
+			export { run as "run", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, memory| {
+			let run = instance
+				.get_typed_func::<(u32, i32), i32>(&mut *store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut *store, (12, -7)).unwrap(), -7);
+			assert_eq!(&memory.data(&*store)[12..16], (-7i32).to_le_bytes());
+		});
+	}
+
+	#[test]
+	fn a_struct_in_memory_sits_at_tirs_offsets_and_a_bool_is_one_byte() {
+		// Sorted by alignment: `value` at 0, `flag` at 4, `tag` at 5,
+		// padding to 8.
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			struct Pixel(flag: Bool, value: u32, tag: u8);
+			func write(address: u32) {
+				local p: heap::*Pixel = transmute(address);
+				p.* = Pixel(True, 0x01020304, 7);
+			}
+			func clear(address: u32) {
+				local p: heap::*Pixel = transmute(address);
+				p.flag = False;
+			}
+			func read(address: u32) -> u32 {
+				local p: heap::*Pixel = transmute(address);
+				local Pixel({ value, tag, flag }) = p.*;
+				if flag { value + transmute::<_, u32>(tag) } else { 0 }
+			}
+			export {
+				write as "write",
+				clear as "clear",
+				read as "read",
+				heap as "heap",
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			memory.data_mut(&mut *store)[..16].fill(0xFF);
+			let call = |store: &mut wasmtime::Store<()>, name: &str| {
+				instance
+					.get_typed_func::<u32, ()>(&mut *store, name)
+					.unwrap()
+					.call(&mut *store, 8)
+					.unwrap()
+			};
+			call(store, "write");
+			assert_eq!(
+				memory.data(&*store)[8..16],
+				[4, 3, 2, 1, 1, 7, 0xFF, 0xFF],
+				"each field at its offset, the padding untouched"
+			);
+			let read = instance
+				.get_typed_func::<u32, u32>(&mut *store, "read")
+				.unwrap();
+			assert_eq!(read.call(&mut *store, 8).unwrap(), 0x0102030B);
+			call(store, "clear");
+			assert_eq!(
+				memory.data(&*store)[8..16],
+				[4, 3, 2, 1, 0, 7, 0xFF, 0xFF],
+				"a `Bool` field is written as its one byte"
+			);
+			assert_eq!(read.call(&mut *store, 8).unwrap(), 0);
+		});
+	}
+
+	#[test]
+	fn a_compound_store_and_a_fields_address_go_through_the_place() {
+		// `Pair` is laid out `b` at 0, `a` at 8.
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			struct Pair(a: u32, b: u64);
+			func bump(address: u32, by: u32) -> u32 {
+				local p: heap::*Pair = transmute(address);
+				p.a += by;
+				p.a *= 2;
+				p.a
+			}
+			func offset_of_a(address: u32) -> u32 {
+				local p: heap::*Pair = transmute(address);
+				transmute::<_, u32>(p.a.&) - address
+			}
+			export {
+				bump as "bump",
+				offset_of_a as "offset_of_a",
+				heap as "heap",
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			memory.data_mut(&mut *store)[24..28]
+				.copy_from_slice(&5u32.to_le_bytes());
+			let bump = instance
+				.get_typed_func::<(u32, u32), u32>(&mut *store, "bump")
+				.unwrap();
+			assert_eq!(bump.call(&mut *store, (16, 2)).unwrap(), 14);
+			assert_eq!(memory.data(&*store)[24..28], 14u32.to_le_bytes());
+			let offset = instance
+				.get_typed_func::<u32, u32>(&mut *store, "offset_of_a")
+				.unwrap();
+			assert_eq!(offset.call(&mut *store, 16).unwrap(), 8);
+		});
+	}
+
+	#[test]
+	fn a_store_evaluates_its_value_before_its_address() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			global mut trace: u32 = 0;
+			func address(at: u32) -> heap::*u32 {
+				trace.set(trace.get() * 10 + 1);
+				transmute(at)
+			}
+			func value() -> u32 {
+				trace.set(trace.get() * 10 + 2);
+				5
+			}
+			func store() -> u32 {
+				address(4).* = value();
+				trace.get()
+			}
+			func compound() -> u32 {
+				trace.set(0);
+				address(4).* += value();
+				trace.get() * 100 + address(4).*
+			}
+			export { store as "store", compound as "compound", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, _| {
+			let run = |store: &mut wasmtime::Store<()>, name: &str| {
+				instance
+					.get_typed_func::<(), u32>(&mut *store, name)
+					.unwrap()
+					.call(&mut *store, ())
+					.unwrap()
+			};
+			assert_eq!(run(store, "store"), 21);
+			// The value, then the address once; the result reads the trace
+			// before `address` runs again.
+			assert_eq!(run(store, "compound"), 21 * 100 + 10);
+		});
+	}
+
+	#[test]
+	fn memory_intrinsics_and_limits_reach_the_module() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1, max_pages: 3 })]
+			memory heap: u32;
+			struct Pair(a: u32, b: u64);
+			func grow() -> i32 { heap.grow(1) }
+			func pages() -> u32 { heap.size_pages() }
+			func fill_and_copy() -> u32 {
+				memory_fill(transmute::<u32, heap::*u8>(0), 7, 4);
+				memory_copy(
+					transmute::<u32, heap::*u8>(16),
+					transmute::<u32, heap::&u8>(0),
+					4: u32,
+				);
+				local p: heap::&u32 = transmute(16: u32);
+				p.*
+			}
+			func sizes() -> u32 {
+				size_of::<Pair, heap>() * 100 + align_of::<Pair, heap>()
+			}
+			export {
+				grow as "grow",
+				pages as "pages",
+				fill_and_copy as "fill_and_copy",
+				sizes as "sizes",
+				heap as "heap",
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			assert_eq!(memory.ty(&*store).minimum(), 1);
+			assert_eq!(memory.ty(&*store).maximum(), Some(3));
+			let call = |store: &mut wasmtime::Store<()>, name: &str| {
+				instance.get_func(&mut *store, name).unwrap()
+			};
+			let grow = call(store, "grow").typed::<(), i32>(&*store).unwrap();
+			let pages = call(store, "pages").typed::<(), u32>(&*store).unwrap();
+			assert_eq!(grow.call(&mut *store, ()).unwrap(), 1);
+			assert_eq!(grow.call(&mut *store, ()).unwrap(), 2);
+			assert_eq!(
+				grow.call(&mut *store, ()).unwrap(),
+				-1,
+				"past the maximum"
+			);
+			assert_eq!(pages.call(&mut *store, ()).unwrap(), 3);
+			let fill = call(store, "fill_and_copy")
+				.typed::<(), u32>(&*store)
+				.unwrap();
+			assert_eq!(fill.call(&mut *store, ()).unwrap(), 0x07070707);
+			let sizes = call(store, "sizes").typed::<(), u32>(&*store).unwrap();
+			assert_eq!(sizes.call(&mut *store, ()).unwrap(), 16 * 100 + 8);
+		});
+	}
+
+	#[test]
+	fn a_memory_without_limits_starts_empty_and_is_unbounded() {
+		let source = r#"
+			memory heap: u32;
+			func grow() -> i32 { heap.grow(2) }
+			export { grow as "grow", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, memory| {
+			assert_eq!(memory.ty(&*store).minimum(), 0);
+			assert_eq!(memory.ty(&*store).maximum(), None);
+			let grow = instance
+				.get_typed_func::<(), i32>(&mut *store, "grow")
+				.unwrap();
+			assert_eq!(grow.call(&mut *store, ()).unwrap(), 0);
+			assert_eq!(memory.size(&*store), 2);
+		});
+	}
+
+	#[test]
+	fn a_pointer_into_a_64_bit_memory_is_an_i64() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u64;
+			struct Pair(a: u32, b: u64);
+			func run(address: u64, value: u64) -> u64 {
+				local p: heap::*Pair = transmute(address);
+				p.* = Pair(1, value);
+				p.b += 1;
+				p.b + transmute::<_, u64>(p.a.&) - address
+			}
+			export { run as "run", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, memory| {
+			assert!(memory.ty(&*store).is_64());
+			let run = instance
+				.get_typed_func::<(u64, u64), u64>(&mut *store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut *store, (32, 41)).unwrap(), 42 + 8);
+		});
+	}
+
+	#[test]
+	fn an_imported_memory_is_an_import_entry_the_host_fills() {
+		let source = r#"
+			import "env" as env { memory mem: u32; }
+			func read(address: u32) -> u8 {
+				local p: env::mem::&u8 = transmute(address);
+				p.*
+			}
+			export { read as "read" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("memories lower");
+		let [import] = mir.imports.as_slice() else {
+			panic!("one import entry")
+		};
+		assert_eq!(graph.strings.resolve(import.module), Some("env"));
+		assert_eq!(graph.strings.resolve(import.name), Some("mem"));
+		assert_eq!(import.item, mir::Item::Memory(mir::MemoryId::new(0)));
+		mir.verify_imports().unwrap();
+		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+			.expect("lowered MIR must encode")
+			.encode();
+		let engine = engine();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let memory = wasmtime::Memory::new(
+			&mut store,
+			wasmtime::MemoryType::new(1, None),
+		)
+		.unwrap();
+		memory.data_mut(&mut store)[3] = 42;
+		let instance =
+			wasmtime::Instance::new(&mut store, &module, &[memory.into()])
+				.unwrap();
+		let read = instance
+			.get_typed_func::<u32, u32>(&mut store, "read")
+			.unwrap();
+		assert_eq!(read.call(&mut store, 3).unwrap(), 42);
 	}
 }

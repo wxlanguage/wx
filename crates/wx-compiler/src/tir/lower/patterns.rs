@@ -62,6 +62,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		// A diverging initializer means no binding runs; keep its `Never`.
 		if ty == mir::ValueType::Never {
 			let value = self.lower_expr(body, state, value)?;
+			#[cfg(debug_assertions)]
 			debug_assert_eq!(state.ty(value), mir::ValueType::Never);
 			return Ok(value);
 		}
@@ -116,6 +117,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		// types are irrelevant on that path.
 		if scrutinee_ty == mir::ValueType::Never {
 			let value = self.lower_expr(body, state, scrutinee)?;
+			#[cfg(debug_assertions)]
 			debug_assert_eq!(state.ty(value), mir::ValueType::Never);
 			return Ok(value);
 		}

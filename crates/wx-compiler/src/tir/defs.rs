@@ -556,6 +556,22 @@ pub struct MemoryDef {
 	pub name: Spanned<SymbolU32>,
 	pub trait_impl_index: TraitImplIdx,
 	pub size_assoc_type_index: AssocTypeIdx,
+	/// What its `#[memory_limits]` says; both bounds `None` without one, and
+	/// for an imported memory, which takes the host's memory of any size.
+	pub limits: MemoryLimits,
+}
+
+/// A memory's page limits, as `#[memory_limits({ min_pages: .., max_pages:
+/// .. })]` writes them: counts of 64 KiB pages, `None` for a bound left out.
+/// Recorded as written; whether a count fits the memory is the checker's
+/// (`TypeContext::check_memory_limits`), since it depends on the memory's
+/// `Size`.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct MemoryLimits {
+	pub min_pages: Option<Spanned<u64>>,
+	pub max_pages: Option<Spanned<u64>>,
 }
 
 /// Identity shared by local and imported globals. The written value type
@@ -2543,10 +2559,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				continue;
 			}
 			let has_arguments =
-				matches!(attribute.value, ast::AttributeValue::Args(_));
-			if known.takes_arguments() != has_arguments
-				|| matches!(attribute.value, ast::AttributeValue::NameValue(_))
-			{
+				matches!(attribute.value, ast::AttributeValue::Named(_));
+			if known.takes_arguments() != has_arguments {
 				self.diagnostics.push(report_malformed_attribute(
 					file_id,
 					attribute.name.span,
@@ -2568,6 +2582,108 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			flags.insert(known.flag());
 		}
 		flags
+	}
+
+	/// What a memory's `#[memory_limits]` says: the first one with an
+	/// argument list (`scan_attributes` reports any other). An argument
+	/// that says nothing (an unknown name, a name written twice, a value
+	/// that is not a number) is reported (E2130) and left out.
+	fn resolve_memory_limits(
+		&mut self,
+		file_id: FileId,
+		attributes: &[ast::Attribute],
+	) -> MemoryLimits {
+		let mut limits = MemoryLimits::default();
+		let Some(arguments) =
+			attributes
+				.iter()
+				.find_map(|attribute| match &attribute.value {
+					ast::AttributeValue::Named(arguments)
+						if KnownAttribute::from_name(
+							self.strings.resolve(attribute.name.inner).unwrap(),
+						) == Some(KnownAttribute::MemoryLimits) =>
+					{
+						Some(arguments)
+					}
+					_ => None,
+				})
+		else {
+			return limits;
+		};
+		let mut written = [None::<TextSpan>; 2];
+		for argument in arguments.iter() {
+			let argument = &argument.inner.inner;
+			let name = self.strings.resolve(argument.name.inner).unwrap();
+			let (slot, bound) = match name {
+				"min_pages" => (0, &mut limits.min_pages),
+				"max_pages" => (1, &mut limits.max_pages),
+				_ => {
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::InvalidMemoryLimits.code(),
+							)
+							.with_message(format!(
+								"`#[memory_limits]` has no argument `{name}`"
+							))
+							.with_label(
+								SourceSpan::new(file_id, argument.name.span)
+									.primary_label(),
+							)
+							.with_note(
+								"its arguments are `min_pages` and `max_pages`",
+							),
+					);
+					continue;
+				}
+			};
+			if let Some(first) = written[slot] {
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::InvalidMemoryLimits.code())
+						.with_message(format!("`{name}` is written twice"))
+						.with_label(
+							SourceSpan::new(file_id, argument.name.span)
+								.primary_label(),
+						)
+						.with_label(
+							SourceSpan::new(file_id, first)
+								.secondary_label()
+								.with_message("first written here"),
+						),
+				);
+				continue;
+			}
+			written[slot] = Some(argument.name.span);
+			// A count of pages is an integer literal; the shorthand
+			// `{ min_pages }` names nothing an attribute can read.
+			match argument.value.as_deref() {
+				Some(&Spanned {
+					inner: ast::Expression::Int { value },
+					span,
+				}) => *bound = Some(Spanned { inner: value, span }),
+				value => {
+					let span = value.map_or(argument.name.span, |v| v.span);
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::InvalidMemoryLimits.code(),
+							)
+							.with_message(format!(
+								"`{name}` must be a number of pages"
+							))
+							.with_label(
+								SourceSpan::new(file_id, span)
+									.primary_label()
+									.with_message(
+										"expected an integer literal",
+									),
+							),
+					);
+				}
+			}
+		}
+		limits
 	}
 
 	#[inline]
@@ -3320,17 +3436,24 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					},
 				});
 			}
-			ast::Item::Memory { pub_span, name, .. } => {
+			ast::Item::Memory {
+				pub_span,
+				name,
+				attributes: written,
+				..
+			} => {
 				let memory_index =
 					MemoryIdx::new(u32::try_from(self.memories.len()).unwrap());
 				let (trait_impl_index, size_assoc_type_index) =
 					self.synthesize_memory_impl(file_id, namespace, name.span);
+				let limits = self.resolve_memory_limits(file_id, written);
 				self.memories.push(MemoryDef {
 					file_id,
 					namespace,
 					name: *name,
 					trait_impl_index,
 					size_assoc_type_index,
+					limits,
 				});
 				let def_key = self.push_def(
 					Namespace::from(namespace),
@@ -3877,6 +4000,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								name: *name,
 								trait_impl_index,
 								size_assoc_type_index,
+								limits: MemoryLimits::default(),
 							});
 							let def_key = self.push_def(
 								own_namespace,
@@ -4519,11 +4643,14 @@ fn report_malformed_attribute(
 	let name = attribute.name();
 	let (message, form) = if attribute.takes_arguments() {
 		(
-			format!("`#[{name}]` takes an argument list"),
-			format!("#[{name}(..)]"),
+			format!("`#[{name}]` takes arguments"),
+			format!("#[{name}({{ .. }})]"),
 		)
 	} else {
-		(format!("`#[{name}]` takes no value"), format!("#[{name}]"))
+		(
+			format!("`#[{name}]` takes no arguments"),
+			format!("#[{name}]"),
+		)
 	};
 	Diagnostic::error()
 		.with_code(DiagnosticCode::MalformedAttribute.code())
@@ -6282,7 +6409,7 @@ mod tests {
 				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
 					indoc! {"
-            #[tag = \"\\o\"
+            #[other({ value: \"\\o\" })
         "}
 					.to_string(),
 				)])),
@@ -6645,12 +6772,78 @@ mod tests {
 		assert_eq!(inline, [false, true]);
 	}
 
+	/// What `name`'s `#[memory_limits]` records, as `(min, max)`.
+	fn memory_limits(
+		case: &TestCase,
+		name: &str,
+	) -> (Option<u64>, Option<u64>) {
+		let symbol = case.graph.strings.get(name).unwrap();
+		let memory = case
+			.defs
+			.memories
+			.iter()
+			.find(|memory| memory.name.inner == symbol)
+			.expect("the memory is declared");
+		(
+			memory.limits.min_pages.map(|pages| pages.inner),
+			memory.limits.max_pages.map(|pages| pages.inner),
+		)
+	}
+
+	#[test]
+	fn memory_limits_are_recorded_as_written() {
+		let case = TestCase::new(indoc! {"
+			#[memory_limits({ min_pages: 2, max_pages: 9 })]
+			memory both: u32;
+			#[memory_limits({ max_pages: 4 })]
+			memory capped: u32;
+			memory free: u32;
+			// Too many for a 32-bit memory: that is the checker's to say.
+			#[memory_limits({ min_pages: 70000 })]
+			memory big: u32;
+			import \"env\" as env { memory host: u32; }
+		"});
+		case.diagnostics().assert_none();
+		assert_eq!(memory_limits(&case, "both"), (Some(2), Some(9)));
+		assert_eq!(memory_limits(&case, "capped"), (None, Some(4)));
+		assert_eq!(memory_limits(&case, "free"), (None, None));
+		assert_eq!(memory_limits(&case, "big"), (Some(70000), None));
+		assert_eq!(memory_limits(&case, "host"), (None, None));
+	}
+
+	#[test]
+	fn a_memory_limits_argument_that_says_nothing_is_reported_and_left_out() {
+		for (source, message, recorded) in [
+			(
+				"#[memory_limits({ pages: 1 })] memory heap: u32;",
+				"`#[memory_limits]` has no argument `pages`",
+				(None, None),
+			),
+			(
+				"#[memory_limits({ min_pages: 1, min_pages: 2 })] memory heap: u32;",
+				"`min_pages` is written twice",
+				(Some(1), None),
+			),
+			(
+				"#[memory_limits({ max_pages: \"4\" })] memory heap: u32;",
+				"`max_pages` must be a number of pages",
+				(None, None),
+			),
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::InvalidMemoryLimits]);
+			case.diagnostics().assert_error_saying(message);
+			assert_eq!(memory_limits(&case, "heap"), recorded, "{source}");
+		}
+	}
+
 	#[test]
 	fn an_unknown_attribute_is_ignored_with_a_warning() {
 		let case = TestCase::new(indoc! {"
 			#[inlin]
 			func f() {}
-			#[tag = \"memory\"]
+			#[packed]
 			struct S();
 		"});
 		case.diagnostics().assert_codes(&[
@@ -6693,19 +6886,20 @@ mod tests {
 	#[test]
 	fn a_known_attribute_in_the_wrong_form_is_an_error() {
 		let case = TestCase::new(indoc! {"
-			#[inline = \"always\"]
+			#[inline({ always: 1 })]
 			func f() {}
-			#[inline(always = 1)]
-			func g() {}
+			#[memory_limits]
+			memory heap: u32;
 		"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::MalformedAttribute,
 			DiagnosticCode::MalformedAttribute,
 		]);
 		case.diagnostics()
-			.assert_error_saying("`#[inline]` takes no value");
+			.assert_error_saying("`#[inline]` takes no arguments");
+		case.diagnostics()
+			.assert_error_saying("`#[memory_limits]` takes arguments");
 		assert_eq!(function_attributes(&case, "f"), Attributes::empty());
-		assert_eq!(function_attributes(&case, "g"), Attributes::empty());
 	}
 
 	#[test]

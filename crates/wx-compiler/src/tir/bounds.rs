@@ -298,7 +298,7 @@ impl BoundArena {
 			panic!("source bounds are immutable after publication")
 		};
 		assert_eq!(*trait_index, bound.trait_index);
-		assert_eq!(*span, bound.span);
+		assert!(*span == bound.span, "a bound resolves at its reserved span");
 		*slot = BoundEntry::Resolved(bound);
 	}
 

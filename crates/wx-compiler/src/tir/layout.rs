@@ -435,7 +435,7 @@ impl TypeContext<'_, '_, '_> {
 
 	/// The primitive of an address into `memory`, its `Size`. `None` for a
 	/// memory not known yet.
-	fn address_primitive(
+	pub(super) fn address_primitive(
 		&mut self,
 		assumption_context: TypeEnvIdx,
 		memory: TypeIndex,

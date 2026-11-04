@@ -1280,6 +1280,13 @@ impl Encode for u32 {
 	}
 }
 
+impl Encode for u64 {
+	fn encode(&self, sink: &mut Vec<u8>) {
+		let (value, pos) = leb128fmt::encode_u64(*self).unwrap();
+		sink.extend_from_slice(&value[..pos]);
+	}
+}
+
 impl Encode for ScalarType {
 	fn encode(&self, sink: &mut Vec<u8>) {
 		let opcode = match self {
@@ -1710,8 +1717,8 @@ pub struct Memory {
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub enum MemoryLimits {
-	Unbounded { initial_pages: u32 },
-	Bounded { initial_pages: u32, max_pages: u32 },
+	Unbounded { initial_pages: u64 },
+	Bounded { initial_pages: u64, max_pages: u64 },
 }
 
 /// `info`'s Wasm memory type, at least `required_pages` large.
@@ -1721,7 +1728,7 @@ pub enum MemoryLimits {
 /// `initial` when it would otherwise be violated, rather than emitting an
 /// `initial > max` module (invalid per spec).
 fn memory_type(info: &mir::MemoryInfo, required_pages: u32) -> Memory {
-	let initial = info.min_pages.unwrap_or(0).max(required_pages);
+	let initial = info.min_pages.unwrap_or(0).max(u64::from(required_pages));
 	Memory {
 		limits: match info.max_pages {
 			Some(max) => MemoryLimits::Bounded {

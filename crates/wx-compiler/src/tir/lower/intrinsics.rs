@@ -2,7 +2,7 @@
 
 use super::{Body, ExprIdx, FunctionInstance, FunctionState, Lowerer, mir};
 use crate::tir::intrinsics::Intrinsic;
-use crate::tir::types::Type;
+use crate::tir::types::{Type, TypeEnvIdx};
 
 impl Lowerer<'_, '_, '_, '_> {
 	pub(super) fn lower_intrinsic(
@@ -15,24 +15,35 @@ impl Lowerer<'_, '_, '_, '_> {
 		args: ExprIdx,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
-		// Generic memory/global operations are recognized implementations,
-		// not ordinary functions awaiting a body or monomorphization. Keep
-		// their checkpoint boundary explicit until those features can lower.
-		match intrinsic {
-			Intrinsic::MemoryGrow
-			| Intrinsic::MemorySize
-			| Intrinsic::MemoryFill
-			| Intrinsic::MemoryCopy
-			| Intrinsic::SizeOf
-			| Intrinsic::AlignOf => {
+		// `size_of<T, Mem>()`/`align_of<T, Mem>()` are `T`'s layout, a
+		// constant of `Mem::Size`; they take no arguments.
+		if let Intrinsic::SizeOf | Intrinsic::AlignOf = intrinsic {
+			let [value_type, _] = *self.context.types.list(callee.args) else {
+				unreachable!("`size_of` and `align_of` take `T` and `Mem`")
+			};
+			let Ok(Some(layout)) =
+				self.context.memory_layout(TypeEnvIdx::ROOT, value_type)
+			else {
 				self.unsupported(
 					state.file_id,
 					body.span(expr),
-					&format!("the compiler intrinsic {intrinsic:?}"),
+					"the layout of a type with no linear-memory layout",
 				)?;
 				unreachable!()
-			}
-			_ => {}
+			};
+			let value = match intrinsic {
+				Intrinsic::SizeOf => layout.size,
+				_ => layout.align,
+			};
+			let value = state.push(
+				mir::ExprKind::Int {
+					value: i64::from(value),
+				},
+				ty,
+			);
+			// The arguments are `()`; they still run.
+			let args = self.lower_expr(body, state, args)?;
+			return Ok(self.sequence(state, vec![args], value));
 		}
 
 		let mut prefix = Vec::new();
@@ -304,16 +315,55 @@ impl Lowerer<'_, '_, '_, '_> {
 				);
 				return Ok(self.sequence(state, prefix, value));
 			}
-			Intrinsic::MemoryGrow
-			| Intrinsic::MemorySize
-			| Intrinsic::MemoryFill
-			| Intrinsic::MemoryCopy
-			| Intrinsic::SizeOf
-			| Intrinsic::AlignOf => unreachable!("diagnosed before argument lowering"),
+			// `memory_size<Mem>(mem)`, `memory_grow<Mem>(mem, delta)`: the
+			// handle `mem` is zero-sized and runs for its effects; `Mem`
+			// names the memory.
+			Intrinsic::MemorySize => {
+				let memory = self.memory_argument(callee, 0);
+				prefix.push(operand!());
+				mir::ExprKind::MemorySize { memory }
+			}
+			Intrinsic::MemoryGrow => {
+				let memory = self.memory_argument(callee, 0);
+				prefix.push(operand!());
+				mir::ExprKind::MemoryGrow {
+					memory,
+					delta: operand!(),
+				}
+			}
+			// `memory_fill<Mem>(dst, val, len)`.
+			Intrinsic::MemoryFill => mir::ExprKind::MemoryFill {
+				memory: self.memory_argument(callee, 0),
+				dst: operand!(),
+				value: operand!(),
+				len: operand!(),
+			},
+			// `memory_copy<Size, SrcMem, DstMem>(dst, src, len)`.
+			Intrinsic::MemoryCopy => mir::ExprKind::MemoryCopy {
+				src_memory: self.memory_argument(callee, 1),
+				dst_memory: self.memory_argument(callee, 2),
+				dst: operand!(),
+				src: operand!(),
+				len: operand!(),
+			},
+			Intrinsic::SizeOf | Intrinsic::AlignOf => {
+				unreachable!("lowered before its arguments")
+			}
 		};
 		assert!(arguments.next().is_none(), "std intrinsic operand count");
 		let value = state.push(kind, ty);
 		Ok(self.sequence(state, prefix, value))
+	}
+
+	/// The memory an instance of a memory intrinsic names as its type
+	/// argument at `position`.
+	fn memory_argument(
+		&mut self,
+		callee: FunctionInstance,
+		position: usize,
+	) -> mir::MemoryId {
+		let memory = self.context.types.list(callee.args)[position];
+		self.memory_of_type(memory)
 	}
 
 	/// The global a `global_get<G>`/`global_set<G>` instance names: its one
