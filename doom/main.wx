@@ -1,6 +1,6 @@
 use std::*;
 
-#[memory_limits(min_pages = 1)]
+#[memory_limits({ min_pages: 1 })]
 memory heap: Memory where { Size = u32 };
 
 trait Allocator {

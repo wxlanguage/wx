@@ -69,6 +69,28 @@ fn test_format_simple_function() {
 	);
 }
 
+#[test]
+fn test_format_crate_contract_items() {
+	let source = indoc! {"
+        pub crate type Word;
+        crate const LIMIT: Word;
+        pub crate func choose<T>(value: T) -> T;
+        crate \"math\" as math;
+    "};
+	let case = TestCase::new(source);
+	assert!(case.ast.diagnostics.is_empty());
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(output, source);
+}
+
 /// `use` trees round-trip through the formatter unchanged, groups included.
 /// They stay on one line even at a narrow `max_line_width`: a `use` names
 /// things living elsewhere, so its length tracks the path being imported
@@ -313,6 +335,14 @@ fn test_format_where_clause_assoc_type_bound() {
 		),
 		"func f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}\n",
 	);
+
+	// A constant's entries keep their `const`; `Self` is printed as written.
+	assert_eq!(
+		fmt(
+			"func f<Self: A where { const N: u8 }, B: A where { const N = 4 }>() {}"
+		),
+		"func f<Self: A where { const N: u8 }, B: A where { const N = 4 }>() {}\n",
+	);
 }
 
 #[test]
@@ -501,6 +531,26 @@ fn a_bracketed_constant_path_is_formatted_as_written() {
 }
 
 #[test]
+fn a_literal_kind_is_formatted_in_braces() {
+	let source = indoc! {"
+        const X: {integer} = 4;
+
+        const U: {char} = 'u';
+    "};
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(output, source);
+}
+
+#[test]
 fn test_format_struct_items() {
 	let case = TestCase::new(indoc! {"
         pub struct Point(pub x: i32, y: i32);
@@ -563,7 +613,7 @@ fn test_format_parameter_and_field_slots() {
 #[test]
 fn test_format_typeset_items() {
 	let case = TestCase::new(indoc! {"
-        #[tag = \"pointer_size\"]
+        #[example]
         pub typeset PointerSize { u32, u64 }
     "});
 	let output = format(
@@ -578,7 +628,7 @@ fn test_format_typeset_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            #[tag = \"pointer_size\"]
+            #[example]
             pub typeset PointerSize { u32, u64 }
         "}
 	);
@@ -611,23 +661,23 @@ fn test_format_typeset_with_bound_clause() {
 /// `attributes` away via `..` and never passed it to their respective
 /// `build_*_definition` functions — silently dropping any `#[...]` on those
 /// four item kinds (unlike `func`/`struct`/`typeset`/`type`, which were never
-/// affected). Caught by round-tripping `std/main.wx`'s `#[tag = "add"]`-style
+/// affected). Caught by round-tripping `std/main.wx`'s `#[example]`-style
 /// operator traits through `wx format`.
 #[test]
 fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 	let case = TestCase::new(indoc! {r#"
-        #[tag = "add"]
+        #[example]
         pub trait Add {
             func add(self: Self, rhs: Self) -> Self;
         }
 
-        #[tag = "example"]
+        #[example]
         enum Color { Red, Green, Blue }
 
-        #[tag = "example"]
+        #[example]
         pub const LIMIT: i32 = 10;
 
-        #[tag = "example"]
+        #[example]
         global mut counter: i32 = 0;
     "#});
 	let output = format(
@@ -642,22 +692,22 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 	assert_eq!(
 		output,
 		indoc! {r#"
-            #[tag = "add"]
+            #[example]
             pub trait Add {
                 func add(self: Self, rhs: Self) -> Self;
             }
 
-            #[tag = "example"]
+            #[example]
             enum Color {
                 Red,
                 Green,
                 Blue,
             }
 
-            #[tag = "example"]
+            #[example]
             pub const LIMIT: i32 = 10;
 
-            #[tag = "example"]
+            #[example]
             global mut counter: i32 = 0;
         "#}
 	);
@@ -840,9 +890,9 @@ fn test_format_pattern_constants() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match x {
-                const MAX -> {},
-                Ordering::Less -> {},
-                _ -> {},
+                const MAX => {},
+                Ordering::Less => {},
+                _ => {},
             }
         }
     "});
@@ -860,9 +910,9 @@ fn test_format_pattern_constants() {
 		indoc! {"
             func f(x: i32) {
                 match x {
-                    const MAX -> {},
-                    Ordering::Less -> {},
-                    _ -> {},
+                    const MAX => {},
+                    Ordering::Less => {},
+                    _ => {},
                 }
             }
         "}
@@ -1192,8 +1242,8 @@ fn test_format_keeps_pub_on_memory_and_global() {
 		"pub memory heap: Memory32;\n"
 	);
 	assert_eq!(
-		fmt("#[memory_limits(min_pages = 4)] pub memory heap: Memory32;"),
-		"#[memory_limits(min_pages = 4)]\npub memory heap: Memory32;\n",
+		fmt("#[memory_limits({ min_pages: 4 })] pub memory heap: Memory32;"),
+		"#[memory_limits({ min_pages: 4 })]\npub memory heap: Memory32;\n",
 	);
 	assert_eq!(
 		fmt("pub global mut g: u32 = 0;"),
@@ -1221,22 +1271,22 @@ fn test_format_memory_config() {
 
 	// min_pages only
 	assert_eq!(
-		fmt("#[memory_limits(min_pages = 4)] memory heap: Memory32;"),
-		"#[memory_limits(min_pages = 4)]\nmemory heap: Memory32;\n",
+		fmt("#[memory_limits({ min_pages: 4 })] memory heap: Memory32;"),
+		"#[memory_limits({ min_pages: 4 })]\nmemory heap: Memory32;\n",
 	);
 
 	// max_pages only
 	assert_eq!(
-		fmt("#[memory_limits(max_pages = 10)] memory heap: Memory32;"),
-		"#[memory_limits(max_pages = 10)]\nmemory heap: Memory32;\n",
+		fmt("#[memory_limits({ max_pages: 10 })] memory heap: Memory32;"),
+		"#[memory_limits({ max_pages: 10 })]\nmemory heap: Memory32;\n",
 	);
 
 	// both fields
 	assert_eq!(
 		fmt(
-			"#[memory_limits(min_pages = 1, max_pages = 10)] memory heap: Memory32;"
+			"#[memory_limits({ min_pages: 1, max_pages: 10 })] memory heap: Memory32;"
 		),
-		"#[memory_limits(min_pages = 1, max_pages = 10)]\nmemory heap: Memory32;\n",
+		"#[memory_limits({ min_pages: 1, max_pages: 10 })]\nmemory heap: Memory32;\n",
 	);
 }
 
@@ -1825,9 +1875,9 @@ fn test_format_trailing_comments_keep_their_line() {
             // own-line, documents b
             local b = 2;
             match v {
-                0 -> { a }, // trailing on arm
+                0 => { a }, // trailing on arm
                 // own-line before arm
-                _ -> { b },
+                _ => { b },
             }
             // own-line before closing brace
         }
@@ -1995,7 +2045,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
 
         func g(v: u32) -> u32 { // opens a block
             match v { // opens a `match`
-                _ -> { v },
+                _ => { v },
             }
         }
 
@@ -2040,7 +2090,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             // opens a block
             match v {
                 // opens a `match`
-                _ -> { v },
+                _ => { v },
             }
         }
 
@@ -2326,8 +2376,7 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 		)
 	};
 	let source = indoc! {"
-        #[tag = \"line\\nslash\\\\n\"]
-        #[other(value = \"line\\nslash\\\\n\")]
+        #[other({ value: \"line\\nslash\\\\n\" })]
         func f() {
             local text = \"line\\nslash\\\\n\";
         }
@@ -2341,7 +2390,7 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
         }
     "};
 	let formatted = fmt(source);
-	assert_eq!(formatted.matches(r#""line\nslash\\n""#).count(), 5);
+	assert_eq!(formatted.matches(r#""line\nslash\\n""#).count(), 4);
 	assert_eq!(fmt(&formatted), formatted);
 }
 
@@ -2620,6 +2669,7 @@ fn block_like_statement_separators() {
 		for expression in [
 			"block { foo() }",
 			"if true { foo() } else { bar() }",
+			"if true { foo() } else if false { bar() } else { baz() }",
 			"loop { break 1 }",
 			"block :label { break :label 1 }",
 			"if true {}",
@@ -2649,7 +2699,7 @@ fn block_like_statement_separators() {
 			"if true { foo(); } else { bar() }",
 			"loop { break 1; }",
 			"block :label { break :label 1; }",
-			"match n { _ -> { 1 } }",
+			"match n { _ => { 1 } }",
 		] {
 			for separator in ["", ";"] {
 				let output = checked_format(
@@ -2949,7 +2999,7 @@ fn a_block_value_breaks_a_call_by_name() {
                 func f() {
                     g({ a: block { y(); }, b: 2 });
                     x.m({ a: if c { 1 } else { 2 } });
-                    g({ a: match v { _ -> { 1 } } });
+                    g({ a: match v { _ => { 1 } } });
                 }
             "},
 			80,
@@ -2968,7 +3018,7 @@ fn a_block_value_breaks_a_call_by_name() {
                 });
                 g({
                     a: match v {
-                        _ -> { 1 },
+                        _ => { 1 },
                     },
                 });
             }
@@ -3149,7 +3199,7 @@ fn test_format_one_element_tuple_as_its_element() {
 	let case = TestCase::new(indoc! {"
         func f(x: (u8,), w: (u16)) -> u8 { local (y,) = (x,); local (z) = y; z }
         func g(a: u8, b: u8, c: u8) -> u8 { (a + b,) * c }
-        func h(v: u8) { match v { (1 | 2,) -> {}, _ -> {} } }
+        func h(v: u8) { match v { (1 | 2,) => {}, _ => {} } }
     "});
 	let output = format(
 		&case.ast,
@@ -3175,8 +3225,40 @@ fn test_format_one_element_tuple_as_its_element() {
 
             func h(v: u8) {
                 match v {
-                    (1 | 2) -> {},
-                    _ -> {},
+                    (1 | 2) => {},
+                    _ => {},
+                }
+            }
+        "}
+	);
+}
+
+/// A match arm's body may be a bare expression or a braced block.
+#[test]
+fn test_format_match_arm_bodies() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+                func f(x: i32) -> i32 {
+                    match x {
+                        0 => 10,
+                        1 => { local y: i32 = 20; y },
+                        _ => if x > 0 { 1 } else { 2 },
+                    }
+                }
+            "},
+			80,
+			4,
+		),
+		indoc! {"
+            func f(x: i32) -> i32 {
+                match x {
+                    0 => 10,
+                    1 => {
+                        local y: i32 = 20;
+                        y
+                    },
+                    _ => if x > 0 { 1 } else { 2 },
                 }
             }
         "}

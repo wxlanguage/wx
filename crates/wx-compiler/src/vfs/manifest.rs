@@ -112,8 +112,8 @@ impl PackageManifest {
 pub enum PackageManifestKind {
 	Lib,
 	Bin,
-	/// This package *is* the stdlib: it defines the `#[tag = "..."]` items
-	/// the language itself needs (the twelve operator traits), so the
+	/// This package *is* the stdlib: it defines the items the language
+	/// itself needs (its primitives, operator traits and intrinsics), so the
 	/// embedded stdlib must not also be loaded alongside it.
 	///
 	/// Not "no stdlib" — wx has no freestanding mode, since those tagged

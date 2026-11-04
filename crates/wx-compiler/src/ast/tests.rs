@@ -299,6 +299,9 @@ fn item_kind(item: &Item) -> &'static str {
 	match item {
 		Item::Function { .. } => "a function",
 		Item::FunctionDeclaration { .. } => "a function declaration",
+		Item::CrateFunction { .. } => "a crate function",
+		Item::CrateConst { .. } => "a crate constant",
+		Item::CrateType { .. } => "a crate type",
 		Item::Global { .. } => "a global",
 		Item::Export { .. } => "an export",
 		Item::ExportBlock { .. } => "an export block",
@@ -508,6 +511,31 @@ fn test_fn_pointer_param() {
 	assert!(result.is_some(), "`-> i32` should be recorded");
 }
 
+/// What the pointer type `ty` points at.
+fn pointee(ty: &TypeExpression) -> &TypeExpression {
+	let TypeExpression::Pointer { inner, .. } = ty else {
+		panic!("expected a pointer type, got {ty:?}")
+	};
+	&inner.inner
+}
+
+#[test]
+fn a_slice_is_a_type_of_its_own() {
+	let case = TestCase::new("const S: [u8; 5] = \"hello\"; type T = [u32];");
+	case.diagnostics().assert_none();
+	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
+		panic!("expected a constant")
+	};
+	assert!(matches!(ty.inner, TypeExpression::Array { .. }));
+	let Item::TypeAlias {
+		body: Some(body), ..
+	} = case.item(1)
+	else {
+		panic!("expected a type alias")
+	};
+	assert!(matches!(body.inner, TypeExpression::Slice { .. }));
+}
+
 #[test]
 fn test_type_expression_forms() {
 	let case = TestCase::new(indoc! {"
@@ -530,11 +558,11 @@ fn test_type_expression_forms() {
 		Some(TypeExpression::Pointer { .. })
 	));
 	assert!(matches!(
-		Some(&fields[1].inner.inner.ty.inner),
-		Some(TypeExpression::Slice { .. })
+		pointee(&fields[1].inner.inner.ty.inner),
+		TypeExpression::Slice { .. }
 	));
 	assert!(matches!(
-		Some(&fields[2].inner.inner.ty.inner),
+		Some(pointee(&fields[2].inner.inner.ty.inner)),
 		Some(TypeExpression::Array {
 			length: Spanned {
 				inner: ConstArgument::Literal(Literal::Int(4)),
@@ -955,8 +983,40 @@ fn test_if_else() {
 	};
 	assert!(matches!(condition.inner, Expression::Binary { .. }));
 	assert!(matches!(then_block.inner, Expression::Block { .. }));
+	// `else if` nests an `if` in the else position; the checker and lowering
+	// both expect either a block or a nested `if` there.
 	let else_block = else_block.as_ref().expect("`else` should be recorded");
 	assert!(matches!(else_block.inner, Expression::Block { .. }));
+}
+
+#[test]
+fn test_else_if_nests_an_if_in_the_else_position() {
+	let case = TestCase::new(indoc! {"
+        func sign(x: i32) -> i32 {
+            if x > 0 { 1 }
+            else if x < 0 { -1 }
+            else { 0 }
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	let statements = case.function_block(0);
+	let Expression::IfElse { else_block, .. } =
+		statement_expression(statements, 0)
+	else {
+		panic!("expected an if/else")
+	};
+	let else_block = else_block.as_ref().expect("`else` should be recorded");
+	let Expression::IfElse { else_block, .. } = &else_block.inner else {
+		panic!("expected the else position to hold a nested if")
+	};
+	assert!(
+		matches!(
+			else_block.as_deref().map(|block| &block.inner),
+			Some(Expression::Block { .. })
+		),
+		"the nested if's own else must still be a block"
+	);
 }
 
 #[test]
@@ -964,9 +1024,9 @@ fn test_match_int_literal_patterns() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 | 2 -> { 1 },
-                _ -> { -1 },
+                0 => { 0 },
+                1 | 2 => { 1 },
+                _ => { -1 },
             }
         }
     "});
@@ -983,6 +1043,52 @@ fn test_match_int_literal_patterns() {
 }
 
 #[test]
+fn test_match_arm_bodies_may_be_expressions_or_blocks() {
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) -> i32 {
+            match x {
+                0 => 10,
+                1 => { local y: i32 = 20; y },
+                _ => x + 1,
+            }
+        }
+    "});
+	case.diagnostics().assert_none();
+
+	let Expression::Match { arms, .. } =
+		statement_expression(case.function_block(0), 0)
+	else {
+		panic!("expected a match")
+	};
+	assert!(matches!(
+		arms[0].inner.inner.body.inner,
+		Expression::Int { .. }
+	));
+	assert!(matches!(
+		arms[1].inner.inner.body.inner,
+		Expression::Block { .. }
+	));
+	assert!(matches!(
+		arms[2].inner.inner.body.inner,
+		Expression::Binary { .. }
+	));
+}
+
+#[test]
+fn test_a_match_arm_expression_body_needs_a_separator() {
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) -> i32 {
+            match x {
+                0 => 10
+                _ => 20,
+            }
+        }
+    "});
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingSeparator]);
+}
+
+#[test]
 fn test_match_enum_variant_patterns() {
 	let case = TestCase::new(indoc! {"
         enum FileDescriptor(u8) {
@@ -993,9 +1099,9 @@ fn test_match_enum_variant_patterns() {
 
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                FileDescriptor::StdOut -> { 1 },
-                FileDescriptor::StdErr -> { 2 },
+                FileDescriptor::StdIn => { 0 },
+                FileDescriptor::StdOut => { 1 },
+                FileDescriptor::StdErr => { 2 },
             }
         }
     "});
@@ -1024,7 +1130,7 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
         func f(x: i32) -> i32 {
             match x {
                 0 { 1 },
-                _ -> { 0 },
+                _ => { 0 },
             }
         }
     "});
@@ -2009,13 +2115,13 @@ fn test_pattern_terms_say_what_they_are() {
 	let case = TestCase::new(indoc! {"
         func f(p: Point) {
             match p {
-                Point(0, 0) -> {},
-                Point(x, const MAX) -> {},
-                Point(x, 0) -> {},
-                Point(-1, 'a' | true) -> {},
-                (mut x, _) -> {},
-                Point({ x, y: const MAX }) -> {},
-                x -> {},
+                Point(0, 0) => {},
+                Point(x, const MAX) => {},
+                Point(x, 0) => {},
+                Point(-1, 'a' | true) => {},
+                (mut x, _) => {},
+                Point({ x, y: const MAX }) => {},
+                x => {},
             }
         }
     "});
@@ -2041,8 +2147,8 @@ fn test_pattern_const_marks_a_name_as_a_constant() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match x {
-                const MAX -> {},
-                const MAX | const MIN -> {},
+                const MAX => {},
+                const MAX | const MIN => {},
             }
         }
     "});
@@ -2060,8 +2166,8 @@ fn test_pattern_redundant_const_is_dropped_and_warned() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match x {
-                const Ordering::Less -> {},
-                const MAX -> {},
+                const Ordering::Less => {},
+                const MAX => {},
             }
         }
     "});
@@ -2081,7 +2187,7 @@ fn test_pattern_a_literal_is_a_test() {
 	// is needed to say what it means.
 	for pattern in ["0", "-1", "'a'", "true"] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} -> {{}} }} }}"
+			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_none();
 	}
@@ -2098,7 +2204,7 @@ fn test_pattern_const_takes_a_path_and_nothing_else() {
 		("const mut y", DiagnosticCode::ReservedIdentifier),
 	] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} -> {{}} }} }}"
+			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_error(code);
 	}
@@ -2120,7 +2226,7 @@ fn test_pattern_a_float_or_string_is_read() {
 	// judgement, so the rest of the file still parses.
 	for pattern in ["1.5", "-1.5", "\"hi\""] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} -> {{}} }} }}"
+			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_none();
 	}
@@ -2617,7 +2723,7 @@ fn an_array_length_is_a_literal_or_a_path() {
 	for (param, length) in params.iter().zip([1, 2]) {
 		let TypeExpression::Array {
 			length: written, ..
-		} = &param.inner.inner.ty.inner
+		} = pointee(&param.inner.inner.ty.inner)
 		else {
 			panic!("expected an array type")
 		};
@@ -2658,7 +2764,7 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
 	let params = &case.function_signature(0).params;
 	let length = |at: usize| {
 		let TypeExpression::Array { length, .. } =
-			&params[at].inner.inner.ty.inner
+			pointee(&params[at].inner.inner.ty.inner)
 		else {
 			panic!("expected an array type")
 		};
@@ -2697,7 +2803,7 @@ fn an_array_length_can_be_left_to_its_context() {
 	else {
 		panic!("expected a local with a type")
 	};
-	let TypeExpression::Array { length, .. } = &ty.inner else {
+	let TypeExpression::Array { length, .. } = pointee(&ty.inner) else {
 		panic!("expected an array type")
 	};
 	assert!(matches!(length.inner, ConstArgument::Infer));
@@ -2919,6 +3025,63 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 }
 
 #[test]
+fn a_constant_binding_is_marked_const() {
+	let case = TestCase::new(indoc! {"
+        func f<A: Array where { const LEN: u8 }, B: Array where { const LEN = 4 }>() {}
+    "});
+	case.diagnostics().assert_none();
+	let Item::Function { signature, .. } = case.item(0) else {
+		panic!("expected function")
+	};
+	let kinds: Vec<_> = signature
+		.type_params
+		.iter()
+		.map(|param| {
+			let bounds = bounds(param).expect("expected bounds");
+			let BoundExpression::WithBindings { bindings, .. } = &bounds.inner
+			else {
+				panic!("expected WithBindings")
+			};
+			&bindings[0].kind
+		})
+		.collect();
+	assert!(matches!(
+		kinds[0],
+		AssocBindingKind::ConstRepresentable { .. }
+	));
+	assert!(matches!(
+		kinds[1],
+		AssocBindingKind::ConstEquals {
+			value: Spanned {
+				inner: ConstArgument::Literal(_),
+				..
+			},
+			..
+		}
+	));
+}
+
+#[test]
+fn self_is_a_type_parameter_name() {
+	// Where it may stand is the signature's to check, as for `self`.
+	let case = TestCase::new(indoc! {"
+        trait Tr { func f<Self: Other, T>(); }
+    "});
+	case.diagnostics().assert_none();
+	let Item::Trait { items, .. } = case.item(0) else {
+		panic!("expected trait")
+	};
+	let TraitItem::Function { signature, .. } = &items[0].inner.inner else {
+		panic!("expected function")
+	};
+	assert_eq!(signature.type_params.len(), 2);
+	assert_eq!(
+		case.strings.resolve(signature.type_params[0].name().inner),
+		Some("Self")
+	);
+}
+
+#[test]
 fn test_impl_trait_multi_segment_trait_name() {
 	// `impl gfx::Drawable for Point` — trait_name must be two path segments.
 	let case = TestCase::new(indoc! {"
@@ -2940,7 +3103,7 @@ fn test_impl_trait_multi_segment_trait_name() {
 #[test]
 fn test_typeset_attributes_parsed() {
 	let case = TestCase::new(indoc! {"
-        #[tag = \"my_typeset\"]
+        #[example]
         typeset Foo { u32, u64 }
     "});
 	case.diagnostics().assert_none();
@@ -3317,6 +3480,20 @@ fn test_turbofish_on_any_other_expression_is_an_error() {
 // ── remaining type expressions ───────────────────────────────────────────────
 
 #[test]
+fn test_literal_kind_type() {
+	let case = TestCase::new("const X: {integer} = 4;");
+	case.diagnostics().assert_none();
+	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
+		panic!("expected a typed constant");
+	};
+	let TypeExpression::Literal { inner } = &ty.inner else {
+		panic!("expected a literal kind");
+	};
+	assert!(matches!(inner.inner, TypeExpression::Path(_)));
+	assert_eq!(ty.span, TextSpan::new(9, 18));
+}
+
+#[test]
 fn test_never_type() {
 	let case = TestCase::new("func f(a: !) -> ! {}");
 	case.diagnostics().assert_none();
@@ -3336,19 +3513,22 @@ fn test_infer_and_memory_tagged_types() {
     "});
 	case.diagnostics().assert_none();
 
-	// a memory-tagged type names the memory its pointer or slice belongs to
+	// a memory-tagged type names the memory its pointer belongs to, a
+	// pointer to a slice included
 	let params = &case.function_signature(0).params;
 	for index in [0, 1] {
 		let ty = &params[index].inner.inner.ty.inner;
-		let memory = match ty {
-			TypeExpression::Pointer { memory, .. }
-			| TypeExpression::Slice { memory, .. } => {
-				memory.as_ref().expect("tagged with an explicit memory")
-			}
-			_ => panic!("expected a pointer or slice type"),
+		let TypeExpression::Pointer { memory, .. } = ty else {
+			panic!("expected a pointer type");
 		};
+		let memory = memory.as_ref().expect("tagged with an explicit memory");
 		assert_eq!(case.name(memory[0].ident.inner), "heap");
 	}
+	let TypeExpression::Pointer { inner, .. } = &params[1].inner.inner.ty.inner
+	else {
+		unreachable!()
+	};
+	assert!(matches!(inner.inner, TypeExpression::Slice { .. }));
 
 	let Statement::LocalDefinition { ty, .. } =
 		&case.function_block(0)[0].inner.inner
@@ -3439,6 +3619,51 @@ fn test_bodyless_function_is_a_declaration() {
 }
 
 #[test]
+fn test_crate_contract_items_parse_and_keep_visibility() {
+	let case = TestCase::new(indoc! {"
+        pub crate type Word;
+        crate const LIMIT: Word;
+        pub crate func choose<T>(value: T) -> T;
+        crate \"math\" as math;
+    "});
+	case.diagnostics().assert_none();
+	assert!(matches!(
+		case.item(0),
+		Item::CrateType { pub_span: Some(_), name, .. }
+			if case.name(name.inner) == "Word"
+	));
+	assert!(matches!(
+		case.item(1),
+		Item::CrateConst { pub_span: None, name, .. }
+			if case.name(name.inner) == "LIMIT"
+	));
+	assert!(matches!(
+		case.item(2),
+		Item::CrateFunction { pub_span: Some(_), signature, .. }
+			if case.name(signature.name.inner) == "choose"
+	));
+	assert!(matches!(case.item(3), Item::PackageInstance { .. }));
+}
+
+#[test]
+fn test_crate_contract_items_reject_bodies() {
+	for source in [
+		"crate func f() {}",
+		"crate const N: i32 = 1;",
+		"crate type T = i32;",
+	] {
+		let case = TestCase::new(source);
+		assert!(
+			case.ast.diagnostics.iter().any(|diagnostic| {
+				diagnostic.code.as_deref()
+					== Some(DiagnosticCode::CrateMemberHasBody.code())
+			}),
+			"{source}"
+		);
+	}
+}
+
+#[test]
 fn test_impl_associated_const() {
 	let case = TestCase::new(indoc! {"
         impl i32 {
@@ -3459,10 +3684,10 @@ fn test_impl_associated_const() {
 
 #[test]
 fn test_attribute_with_arguments() {
-	// `#[word]` and `#[name = value]` are covered elsewhere; this is the
-	// third shape, `#[name(arg = value, ...)]`.
+	// `#[word]` is covered elsewhere; this is the other shape, arguments
+	// named as a call's, `#[name({ arg: value, .. })]`.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1, max_pages = 4)]
+        #[memory_limits({ min_pages: 1, max_pages: 4 })]
         memory m: u32;
     "});
 	case.diagnostics().assert_none();
@@ -3471,8 +3696,39 @@ fn test_attribute_with_arguments() {
 		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
 	};
 	assert_eq!(case.name(attributes[0].name.inner), "memory_limits");
-	let AttributeValue::Args(args) = &attributes[0].value else {
-		panic!("expected parenthesised attribute arguments")
+	let AttributeValue::Named(args) = &attributes[0].value else {
+		panic!("expected named attribute arguments")
+	};
+	let arguments: Vec<(&str, u64)> = args
+		.iter()
+		.map(|arg| {
+			let arg = &arg.inner.inner;
+			let Some(Expression::Int { value }) =
+				arg.value.as_deref().map(|value| &value.inner)
+			else {
+				panic!("expected an integer value")
+			};
+			(case.name(arg.name.inner), *value)
+		})
+		.collect();
+	assert_eq!(arguments, [("min_pages", 1), ("max_pages", 4)]);
+}
+
+#[test]
+fn old_attribute_arguments_are_reported_and_read_as_named() {
+	let case = TestCase::new(indoc! {"
+        #[memory_limits(min_pages = 1, max_pages = 4)]
+        memory m: u32;
+    "});
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::AttributeArgumentsAreNamed]);
+	case.diagnostics()
+		.assert_error_saying("an attribute's arguments are named as a call's");
+	let Item::Memory { attributes, .. } = case.item(0) else {
+		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
+	};
+	let AttributeValue::Named(args) = &attributes[0].value else {
+		panic!("expected named attribute arguments")
 	};
 	let names: Vec<&str> = args
 		.iter()
@@ -3559,8 +3815,7 @@ fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
 #[test]
 fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let source = indoc! {"
-        #[tag = \"line\\nslash\\\\n\"]
-        #[other(value = \"line\\nslash\\\\n\")]
+        #[other({ value: \"line\\nslash\\\\n\" })]
         func f() {
             local text = \"line\\nslash\\\\n\";
         }
@@ -3580,15 +3835,14 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let Item::Function { attributes, .. } = case.item(0) else {
 		panic!("expected function");
 	};
-	let AttributeValue::NameValue(tag) = &attributes[0].value else {
-		panic!("expected name/value attribute");
-	};
-	let AttributeValue::Args(args) = &attributes[1].value else {
+	let AttributeValue::Named(args) = &attributes[0].value else {
 		panic!("expected attribute args");
 	};
-	let AttributeArgValue::String(arg) = &args[0].inner.inner.value else {
-		panic!("expected string argument");
+	let Some(value) = &args[0].inner.inner.value else {
+		panic!("expected a written value");
 	};
+	assert!(matches!(value.inner, Expression::String));
+	let arg = &value.span;
 	let Item::Import { external_name, .. } = case.item(1) else {
 		panic!("expected import");
 	};
@@ -3596,7 +3850,6 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 		panic!("expected export");
 	};
 	for span in [
-		tag,
 		arg,
 		external_name,
 		entries[0].inner.inner.alias.as_ref().unwrap(),
@@ -3612,8 +3865,7 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 #[test]
 fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
 	let source = indoc! {"
-        #[tag = \"\\o\"]
-        #[other(value = \"\\o\")]
+        #[other({ value: \"\\o\" })]
         func f() {
             local bad = \"\\o\";
             local good = \"ok\";

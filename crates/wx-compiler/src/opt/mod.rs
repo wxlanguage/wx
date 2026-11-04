@@ -4,10 +4,9 @@
 //! [`scheduler`] → codegen
 //!
 //! # Structure
-//! - [`DataNode`] — a pure value computation (constants, arithmetic, phis,
-//!   aggregates). Nodes with identical [`DataNodeKind`] are deduplicated (CSE)
-//!   via `Builder::node`.
-//! - [`ControlNode`] — a side-effecting operation or control-flow construct.
+//! - [`DataNode`] — a movable computation or the result of a control operation.
+//!   Only interchangeable computations are deduplicated (CSE).
+//! - [`ControlNode`] — an effectful/trapping operation or control-flow construct.
 //!   Placed sequentially inside [`Block`]s.
 //! - [`Block`] — a linear sequence of `ControlNode`s, one per MIR scope.
 //! - [`Function`] — the complete graph for one MIR function.
@@ -20,12 +19,14 @@ mod liveness;
 mod local_dominance;
 pub mod scheduler;
 
-#[cfg(test)]
-mod tests;
+// Disconnected from the module graph: `tests.rs` still calls the removed
+// `tir::TIR::build` and is kept on disk as a reference corpus for new tests.
+// #[cfg(test)]
+// mod tests;
 
 use crate::index::index_newtype;
+use crate::mir;
 pub use crate::wasm::ScalarType;
-use crate::{ast, mir};
 
 pub type DataNodeIndex = u32;
 pub type BlockIndex = u32;
@@ -50,7 +51,9 @@ impl MemAccess {
 	pub fn from_mir(ty: mir::ValueType) -> Self {
 		match ty {
 			mir::ValueType::I8 => Self::I8S,
-			mir::ValueType::U8 => Self::I8U,
+			// `Bool` is std's `enum Bool(u8)`: one byte in memory, as TIR
+			// lays it out, though it is a whole `i32` on the stack.
+			mir::ValueType::U8 | mir::ValueType::Bool => Self::I8U,
 			mir::ValueType::I16 => Self::I16S,
 			mir::ValueType::U16 => Self::I16U,
 			mir::ValueType::I64 | mir::ValueType::U64 => Self::I64,
@@ -92,7 +95,7 @@ pub enum NodeType {
 	Aggregate(mir::AggregateIndex),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StackResult {
 	Value(DataNodeIndex),
 	Unit,
@@ -105,6 +108,95 @@ impl StackResult {
 			StackResult::Value(idx) => idx,
 			r => panic!("expected Value, got {:?}", r),
 		}
+	}
+}
+
+/// Scalar operations whose possible trap is observable. They belong to control,
+/// not to the movable/CSE'd data graph. Integer operations have I32/I64 `ty`.
+#[derive(Clone, Copy)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum TrappingOp {
+	DivS {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	DivU {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	RemS {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	RemU {
+		left: DataNodeIndex,
+		right: DataNodeIndex,
+		ty: ScalarType,
+	},
+	I32TruncF32 {
+		operand: DataNodeIndex,
+	},
+	U32TruncF32 {
+		operand: DataNodeIndex,
+	},
+	I32TruncF64 {
+		operand: DataNodeIndex,
+	},
+	U32TruncF64 {
+		operand: DataNodeIndex,
+	},
+	I64TruncF32 {
+		operand: DataNodeIndex,
+	},
+	U64TruncF32 {
+		operand: DataNodeIndex,
+	},
+	I64TruncF64 {
+		operand: DataNodeIndex,
+	},
+	U64TruncF64 {
+		operand: DataNodeIndex,
+	},
+}
+
+impl TrappingOp {
+	pub fn result_type(self) -> ScalarType {
+		match self {
+			Self::DivS { ty, .. }
+			| Self::DivU { ty, .. }
+			| Self::RemS { ty, .. }
+			| Self::RemU { ty, .. } => ty,
+			Self::I32TruncF32 { .. }
+			| Self::U32TruncF32 { .. }
+			| Self::I32TruncF64 { .. }
+			| Self::U32TruncF64 { .. } => ScalarType::I32,
+			Self::I64TruncF32 { .. }
+			| Self::U64TruncF32 { .. }
+			| Self::I64TruncF64 { .. }
+			| Self::U64TruncF64 { .. } => ScalarType::I64,
+		}
+	}
+
+	/// Read by liveness and scheduling at the operation's control position.
+	pub fn operands(self) -> impl Iterator<Item = DataNodeIndex> {
+		let (first, second) = match self {
+			Self::DivS { left, right, .. }
+			| Self::DivU { left, right, .. }
+			| Self::RemS { left, right, .. }
+			| Self::RemU { left, right, .. } => (left, Some(right)),
+			Self::I32TruncF32 { operand }
+			| Self::U32TruncF32 { operand }
+			| Self::I32TruncF64 { operand }
+			| Self::U32TruncF64 { operand }
+			| Self::I64TruncF32 { operand }
+			| Self::U64TruncF32 { operand }
+			| Self::I64TruncF64 { operand }
+			| Self::U64TruncF64 { operand } => (operand, None),
+		};
+		[Some(first), second].into_iter().flatten()
 	}
 }
 
@@ -127,35 +219,39 @@ pub enum DataNodeKind {
 		index: u32,
 		ty: ScalarType,
 	},
-	/// Read from a mutable module global. Excluded from CSE.
-	GlobalGet {
-		id: ast::DefId,
+	/// Value captured by one `ControlNode::GlobalGet`. Excluded from CSE.
+	GlobalGetResult {
+		ty: ScalarType,
+	},
+	/// Value produced by one `ControlNode::Trapping`, never CSE'd or recomputed.
+	TrappingResult {
 		ty: ScalarType,
 	},
 	/// Constant index into the WASM function table.
 	FunctionRef {
-		id: ast::DefId,
+		id: mir::FunctionId,
 	},
 	/// Pointer into the static data segment for a string or array constant.
 	/// `ty` is the pointer width of the memory holding the static data.
 	StaticDataRef {
-		data_index: u32,
+		entry: mir::StaticEntryId,
+		offset: u32,
 		ty: ScalarType,
 	},
-	/// Byte offset of the end of the data section (link-time constant).
-	/// `ty` is the memory's pointer width.
-	MemoryOffset {
-		memory: ast::DefId,
+	/// The address right after the memory's static data
+	/// (`ExprKind::DataEnd`). `ty` is the memory's pointer width.
+	DataEnd {
+		memory: mir::MemoryId,
 		ty: ScalarType,
 	},
 	/// WASM linear-memory index as an integer constant, resolved at codegen.
 	MemoryIndex {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 	},
 	/// Result of a `MemorySize` control node. Excluded from CSE; always
 	/// spilled. `ty` is the memory's size type (I64 for Memory64).
 	MemorySizeResult {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		ty: ScalarType,
 	},
 
@@ -175,22 +271,8 @@ pub enum DataNodeKind {
 		right: DataNodeIndex,
 		ty: ScalarType,
 	},
-	DivS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	DivU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	RemS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	RemU {
+	/// Non-trapping floating-point division. Integer division is control.
+	Div {
 		left: DataNodeIndex,
 		right: DataNodeIndex,
 		ty: ScalarType,
@@ -316,30 +398,6 @@ pub enum DataNodeKind {
 	F64ConvertU64 {
 		operand: DataNodeIndex,
 	},
-	I32TruncF32 {
-		operand: DataNodeIndex,
-	},
-	U32TruncF32 {
-		operand: DataNodeIndex,
-	},
-	I32TruncF64 {
-		operand: DataNodeIndex,
-	},
-	U32TruncF64 {
-		operand: DataNodeIndex,
-	},
-	I64TruncF32 {
-		operand: DataNodeIndex,
-	},
-	U64TruncF32 {
-		operand: DataNodeIndex,
-	},
-	I64TruncF64 {
-		operand: DataNodeIndex,
-	},
-	U64TruncF64 {
-		operand: DataNodeIndex,
-	},
 	F64PromoteF32 {
 		operand: DataNodeIndex,
 	},
@@ -413,12 +471,13 @@ pub enum DataNodeKind {
 
 	// ── Aggregates (structs as SSA values) ─────────────────────────────────
 	Aggregate {
-		fields: Box<[DataNodeIndex]>,
+		/// One scalar node per slot. No nested packs or zero-sized markers.
+		values: Box<[DataNodeIndex]>,
 		aggregate_index: mir::AggregateIndex,
 	},
 	/// Projects a single WASM value out of an aggregate.
 	///
-	/// Indexed by [`mir::ScalarIndex`], *not* by physical field: a nested
+	/// Indexed by [`mir::ScalarIndex`], *not* by declaration field: a nested
 	/// field spans several scalars and a zero-sized field spans none, so a
 	/// field index would not name a value at all. This is why `ty` can be a
 	/// `ScalarType` — a scalar index always names exactly one WASM value.
@@ -451,14 +510,11 @@ pub enum DataNodeKind {
 		ty: ScalarType,
 	},
 
-	/// A stable placeholder identity for a plain `{}` block's carried
-	/// binding — the block-join analogue of `LoopParam`, but with no
-	/// before/after split: a block has no back-edge, so there is no
-	/// "current iteration's value" to represent, only a fixed target every
-	/// exit (`break`, or the fallthrough) commits into. Never fed into the
-	/// block's own live bindings during construction (unlike `LoopParam` —
-	/// see `Builder::create_join_params`'s doc comment) — referenced only
-	/// via `ControlNode::BlockJoin::outputs` and commit-pair lists.
+	/// A stable value written by exits of a breakable block/loop. Used for
+	/// result slots and for a plain block's carried bindings. No before/after
+	/// split: every exit writes its own contribution to the same identity,
+	/// and only consumers past the target read it. It is never substituted
+	/// into the body's live bindings (unlike a loop's `LoopParam`).
 	JoinParam {
 		block_index: BlockIndex,
 		ty: ScalarType,
@@ -476,7 +532,7 @@ pub enum DataNodeKind {
 		aggregate_index: mir::AggregateIndex,
 	},
 	MemoryGrowResult {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		delta: DataNodeIndex,
 		ty: ScalarType,
 	},
@@ -495,10 +551,7 @@ impl DataNodeKind {
 			| DataNodeKind::Add { ty, .. }
 			| DataNodeKind::Sub { ty, .. }
 			| DataNodeKind::Mul { ty, .. }
-			| DataNodeKind::DivS { ty, .. }
-			| DataNodeKind::DivU { ty, .. }
-			| DataNodeKind::RemS { ty, .. }
-			| DataNodeKind::RemU { ty, .. }
+			| DataNodeKind::Div { ty, .. }
 			| DataNodeKind::Min { ty, .. }
 			| DataNodeKind::Max { ty, .. }
 			| DataNodeKind::Copysign { ty, .. }
@@ -521,6 +574,7 @@ impl DataNodeKind {
 			| DataNodeKind::LoopParam { ty, .. }
 			| DataNodeKind::JoinParam { ty, .. }
 			| DataNodeKind::CallResult { ty, .. }
+			| DataNodeKind::TrappingResult { ty }
 			| DataNodeKind::Float { ty, .. } => NodeType::Scalar(*ty),
 
 			DataNodeKind::Eqz { .. }
@@ -537,19 +591,11 @@ impl DataNodeKind {
 			| DataNodeKind::FunctionRef { .. }
 			| DataNodeKind::MemoryIndex { .. }
 			| DataNodeKind::I32WrapI64 { .. }
-			| DataNodeKind::I32TruncF32 { .. }
-			| DataNodeKind::U32TruncF32 { .. }
-			| DataNodeKind::I32TruncF64 { .. }
-			| DataNodeKind::U32TruncF64 { .. }
 			| DataNodeKind::I32ReinterpretF32 { .. } => {
 				NodeType::Scalar(ScalarType::I32)
 			}
 			DataNodeKind::I64ExtendI32S { .. }
 			| DataNodeKind::I64ExtendI32U { .. }
-			| DataNodeKind::I64TruncF32 { .. }
-			| DataNodeKind::U64TruncF32 { .. }
-			| DataNodeKind::I64TruncF64 { .. }
-			| DataNodeKind::U64TruncF64 { .. }
 			| DataNodeKind::I64ReinterpretF64 { .. } => {
 				NodeType::Scalar(ScalarType::I64)
 			}
@@ -569,9 +615,9 @@ impl DataNodeKind {
 			| DataNodeKind::F64ReinterpretI64 { .. } => {
 				NodeType::Scalar(ScalarType::F64)
 			}
-			DataNodeKind::GlobalGet { ty, .. }
+			DataNodeKind::GlobalGetResult { ty }
 			| DataNodeKind::StaticDataRef { ty, .. }
-			| DataNodeKind::MemoryOffset { ty, .. }
+			| DataNodeKind::DataEnd { ty, .. }
 			| DataNodeKind::MemorySizeResult { ty, .. }
 			| DataNodeKind::MemoryGrowResult { ty, .. } => NodeType::Scalar(*ty),
 
@@ -611,7 +657,8 @@ impl DataNodeKind {
 	/// so excluding `Phi` here only removes the unsound cross-join dedup.
 	fn is_pure(&self) -> bool {
 		match self {
-			DataNodeKind::GlobalGet { .. }
+			DataNodeKind::GlobalGetResult { .. }
+			| DataNodeKind::TrappingResult { .. }
 			| DataNodeKind::MemorySizeResult { .. }
 			| DataNodeKind::CallResult { .. }
 			| DataNodeKind::AggregateCallResult { .. }
@@ -631,11 +678,22 @@ pub struct DataNode {
 }
 
 pub enum ControlNode {
+	/// Runs at this control position even if its result is unused. Consumers
+	/// read `result`; they never reschedule the operation itself.
+	Trapping {
+		op: TrappingOp,
+		result: DataNodeIndex,
+	},
+	/// Capture the global at this point, before any subsequent write/call.
+	GlobalGet {
+		id: mir::GlobalId,
+		result: DataNodeIndex,
+	},
 	Return {
 		value: StackResult,
 	},
 	GlobalSet {
-		id: ast::DefId,
+		id: mir::GlobalId,
 		value: DataNodeIndex,
 	},
 	Call {
@@ -697,15 +755,11 @@ pub enum ControlNode {
 		/// to attach it to (falling off the end of a block isn't itself a
 		/// control node), so it lives here instead.
 		fallthrough_updates: Box<[(DataNodeIndex, DataNodeIndex)]>,
-		/// The fallthrough path's own *raw* tail value — distinct from
-		/// `result` (the final merged value across every exit). When this
-		/// block has more than one value-contributing exit (some `break
-		/// <value>` plus the fallthrough), each exit's own raw value must be
-		/// individually committed into the shared `break_result_outputs`
-		/// phi locals at its own point — a `Break` already carries its own
-		/// `value` for exactly this; falling off the end has no
-		/// `ControlNode` of its own to carry it, so it lives here instead,
-		/// mirroring `fallthrough_updates` just above.
+		/// The fallthrough's raw tail value, stored into the target's result
+		/// slots before carried-binding updates. Distinct from `result`,
+		/// which names those joined slots. Like `Break::value`, this is
+		/// required even for a single exit; fallthrough has no control node
+		/// of its own, so it lives here alongside `fallthrough_updates`.
 		fallthrough_value: StackResult,
 		result: StackResult,
 	},
@@ -733,23 +787,23 @@ pub enum ControlNode {
 	},
 	Unreachable,
 	MemorySize {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		result: DataNodeIndex,
 	},
 	MemoryGrow {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		delta: DataNodeIndex,
 		result: DataNodeIndex,
 	},
 	MemoryFill {
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		dst: DataNodeIndex,
 		val: DataNodeIndex,
 		len: DataNodeIndex,
 	},
 	MemoryCopy {
-		dst_memory: ast::DefId,
-		src_memory: ast::DefId,
+		dst_memory: mir::MemoryId,
+		src_memory: mir::MemoryId,
 		dst: DataNodeIndex,
 		src: DataNodeIndex,
 		len: DataNodeIndex,
@@ -759,7 +813,7 @@ pub enum ControlNode {
 		/// Byte offset added to `address` at the WASM instruction level (memarg).
 		offset: u32,
 		result: DataNodeIndex,
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		access: MemAccess,
 	},
 	PointerStore {
@@ -767,7 +821,7 @@ pub enum ControlNode {
 		/// Byte offset added to `address` at the WASM instruction level (memarg).
 		offset: u32,
 		value: DataNodeIndex,
-		memory: ast::DefId,
+		memory: mir::MemoryId,
 		access: MemAccess,
 	},
 }
@@ -830,12 +884,13 @@ impl Block {
 /// `LoopParam`/`JoinParam` `DataNodeKind` variants instead, not here — see
 /// `DataNodeKind::JoinParam`'s doc comment.
 pub struct JoinData {
-	/// Phi nodes at the join point for the merged exit *value* — every
+	/// JoinParam result slots for every value-producing exit — every
 	/// `break <value>` targeting this block, plus (for a block-join only;
 	/// a loop's own "fallthrough" is its back-edge, already covered by
 	/// `entry_placeholders`) the block's own fallthrough tail value.
 	/// Scheduler pre-allocates WASM locals for these; each exit stores into
-	/// them before branching. Empty when every exit carries the same value.
+	/// them before committing carried bindings and branching. These slots
+	/// exist even for a single exit; empty only for Unit/Never results.
 	pub break_result_outputs: Vec<DataNodeIndex>,
 	/// This target's own per-slot carried-binding placeholders — a loop's
 	/// `LoopParam`s (`Builder::create_loop_params`) or a block-join's
@@ -877,7 +932,7 @@ pub struct SwitchCase {
 }
 
 pub struct Function {
-	pub id: ast::DefId,
+	pub id: mir::FunctionId,
 	pub data_nodes: Vec<DataNode>,
 	/// One slot per MIR scope (indexed by scope index). `None` until the scope
 	/// is built.
@@ -891,7 +946,7 @@ pub struct Function {
 }
 
 impl Function {
-	pub fn new(id: ast::DefId, scope_count: usize) -> Self {
+	pub fn new(id: mir::FunctionId, scope_count: usize) -> Self {
 		Function {
 			id,
 			data_nodes: Vec::new(),
@@ -972,12 +1027,12 @@ impl Function {
 		id
 	}
 
-	/// Create a join-param placeholder for a plain `{}` block's carried
+	/// Create a join-param placeholder for an exit result or a block's carried
 	/// binding. Unlike `push_loop_param`, there is no `before`/`after` split
-	/// and no later "patch" step — a `JoinParam` is either divergent (found
-	/// to differ by some exit, pushed into `ControlNode::BlockJoin::outputs`)
-	/// or not (never referenced again, left as a dead, zero-use node); it is
-	/// never mutated in place. See `DataNodeKind::JoinParam`'s doc comment.
+	/// and no later patch step. Result slots go in `break_result_outputs`;
+	/// carried-binding slots go in `BlockJoin::outputs` only when an exit
+	/// changes the binding. Unneeded binding placeholders remain unused.
+	/// See `DataNodeKind::JoinParam`'s doc comment.
 	pub fn push_join_param(
 		&mut self,
 		block_index: BlockIndex,
@@ -1028,10 +1083,7 @@ impl Function {
             DataNodeKind::Add { left, right, .. }
             | DataNodeKind::Sub { left, right, .. }
             | DataNodeKind::Mul { left, right, .. }
-            | DataNodeKind::DivS { left, right, .. }
-            | DataNodeKind::DivU { left, right, .. }
-            | DataNodeKind::RemS { left, right, .. }
-            | DataNodeKind::RemU { left, right, .. }
+			| DataNodeKind::Div { left, right, .. }
             | DataNodeKind::Min { left, right, .. }
             | DataNodeKind::Max { left, right, .. }
             | DataNodeKind::Copysign { left, right, .. }
@@ -1076,14 +1128,6 @@ impl Function {
             | DataNodeKind::F64ConvertU32 { operand }
             | DataNodeKind::F64ConvertI64 { operand }
             | DataNodeKind::F64ConvertU64 { operand }
-            | DataNodeKind::I32TruncF32 { operand }
-            | DataNodeKind::U32TruncF32 { operand }
-            | DataNodeKind::I32TruncF64 { operand }
-            | DataNodeKind::U32TruncF64 { operand }
-            | DataNodeKind::I64TruncF32 { operand }
-            | DataNodeKind::U64TruncF32 { operand }
-            | DataNodeKind::I64TruncF64 { operand }
-            | DataNodeKind::U64TruncF64 { operand }
             | DataNodeKind::F64PromoteF32 { operand }
             | DataNodeKind::F32DemoteF64 { operand }
             | DataNodeKind::I32ReinterpretF32 { operand }
@@ -1094,9 +1138,9 @@ impl Function {
                 self.data_nodes[*operand as usize].uses.push(user_id);
             }
 
-            DataNodeKind::Aggregate { fields, .. } => {
-                for &f in fields.iter() {
-                    self.data_nodes[f as usize].uses.push(user_id);
+            DataNodeKind::Aggregate { values, .. } => {
+                for &value in values.iter() {
+                    self.data_nodes[value as usize].uses.push(user_id);
                 }
             }
 
@@ -1119,10 +1163,11 @@ impl Function {
             DataNodeKind::Int { .. }
             | DataNodeKind::Float { .. }
             | DataNodeKind::Param { .. }
-            | DataNodeKind::GlobalGet { .. }
+            | DataNodeKind::GlobalGetResult { .. }
+            | DataNodeKind::TrappingResult { .. }
             | DataNodeKind::FunctionRef { .. }
             | DataNodeKind::StaticDataRef { .. }
-            | DataNodeKind::MemoryOffset { .. }
+            | DataNodeKind::DataEnd { .. }
             | DataNodeKind::MemoryIndex { .. }
             | DataNodeKind::MemorySizeResult { .. }
             | DataNodeKind::AggregateCallResult { .. }

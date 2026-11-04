@@ -1,4 +1,4 @@
-//! Data liveness analysis for scheduler dead-pointer-load elimination.
+//! Data liveness for scheduler result capture and dead-pointer-load elimination.
 //!
 //! Computes the set of data nodes reachable from control-node sinks.
 
@@ -37,6 +37,13 @@ fn mark_block_roots(
 		.expect("block must exist");
 	for stmt in &block.statements {
 		match stmt {
+			ControlNode::Trapping { op, .. } => {
+				// Its operands are live even when its result is discarded: the
+				// operation still executes and may trap.
+				for operand in op.operands() {
+					mark_node_live(operand, live, worklist);
+				}
+			}
 			ControlNode::Return { value } => {
 				mark_stack_result_live(*value, live, worklist);
 			}
@@ -104,22 +111,14 @@ fn mark_block_roots(
 				outputs,
 				fallthrough_updates,
 				fallthrough_value,
-				result,
+				..
 			} => {
 				for &output in outputs.iter() {
 					mark_node_live(output, live, worklist);
 				}
-				// Unlike Loop (whose fallthrough is always Unit/Never by
-				// construction), a block-join's fallthrough can be a real
-				// value even when no phi was needed — mirrors IfElse's
-				// identical pattern above.
-				if outputs.is_empty() {
-					mark_stack_result_live(*result, live, worklist);
-				}
-				// The fallthrough's own raw contribution to the block's
-				// value phis — mirrors Break's own `value` field, marked
-				// unconditionally below regardless of whether a phi was
-				// actually needed for it.
+				// JoinParam results have no input edges. Root the raw value
+				// written by this exit, just as for Break below, rather than
+				// trying to find it through the joined result.
 				mark_stack_result_live(*fallthrough_value, live, worklist);
 				// fallthrough_updates' `current` values have no other path
 				// to liveness: a JoinParam carries no back-reference to
@@ -151,7 +150,7 @@ fn mark_block_roots(
 			ControlNode::MemoryGrow { delta, .. } => {
 				mark_node_live(*delta, live, worklist);
 			}
-			ControlNode::MemorySize { .. } => {}
+			ControlNode::MemorySize { .. } | ControlNode::GlobalGet { .. } => {}
 			ControlNode::PointerLoad { .. } => {}
 			ControlNode::PointerStore { address, value, .. } => {
 				mark_node_live(*address, live, worklist);
@@ -204,10 +203,7 @@ fn mark_node_inputs_live(
 		DataNodeKind::Add { left, right, .. }
 		| DataNodeKind::Sub { left, right, .. }
 		| DataNodeKind::Mul { left, right, .. }
-		| DataNodeKind::DivS { left, right, .. }
-		| DataNodeKind::DivU { left, right, .. }
-		| DataNodeKind::RemS { left, right, .. }
-		| DataNodeKind::RemU { left, right, .. }
+		| DataNodeKind::Div { left, right, .. }
 		| DataNodeKind::Min { left, right, .. }
 		| DataNodeKind::Max { left, right, .. }
 		| DataNodeKind::Copysign { left, right, .. }
@@ -251,14 +247,6 @@ fn mark_node_inputs_live(
 		| DataNodeKind::F64ConvertU32 { operand }
 		| DataNodeKind::F64ConvertI64 { operand }
 		| DataNodeKind::F64ConvertU64 { operand }
-		| DataNodeKind::I32TruncF32 { operand }
-		| DataNodeKind::U32TruncF32 { operand }
-		| DataNodeKind::I32TruncF64 { operand }
-		| DataNodeKind::U32TruncF64 { operand }
-		| DataNodeKind::I64TruncF32 { operand }
-		| DataNodeKind::U64TruncF32 { operand }
-		| DataNodeKind::I64TruncF64 { operand }
-		| DataNodeKind::U64TruncF64 { operand }
 		| DataNodeKind::F64PromoteF32 { operand }
 		| DataNodeKind::F32DemoteF64 { operand }
 		| DataNodeKind::I32ReinterpretF32 { operand }
@@ -270,9 +258,9 @@ fn mark_node_inputs_live(
 		} => {
 			mark_node_live(*operand, live, worklist);
 		}
-		DataNodeKind::Aggregate { fields, .. } => {
-			for &field in fields.iter() {
-				mark_node_live(field, live, worklist);
+		DataNodeKind::Aggregate { values, .. } => {
+			for &value in values.iter() {
+				mark_node_live(value, live, worklist);
 			}
 		}
 		DataNodeKind::LoopParam { before, after, .. } => {
@@ -294,10 +282,11 @@ fn mark_node_inputs_live(
 		DataNodeKind::Int { .. }
 		| DataNodeKind::Float { .. }
 		| DataNodeKind::Param { .. }
-		| DataNodeKind::GlobalGet { .. }
+		| DataNodeKind::GlobalGetResult { .. }
+		| DataNodeKind::TrappingResult { .. }
 		| DataNodeKind::FunctionRef { .. }
 		| DataNodeKind::StaticDataRef { .. }
-		| DataNodeKind::MemoryOffset { .. }
+		| DataNodeKind::DataEnd { .. }
 		| DataNodeKind::MemoryIndex { .. }
 		| DataNodeKind::MemorySizeResult { .. }
 		| DataNodeKind::AggregateCallResult { .. }

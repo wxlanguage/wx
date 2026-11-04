@@ -43,13 +43,15 @@ use super::body::{
 	Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
 	ExprRange, LocalIdx, Obligations, Scope, ScopeIdx, ScopeKind,
 };
+use super::bounds::AssumptionEnvIdx;
 use super::defs::{
 	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
-	StructIdx, Tier, TypesetIdx, Visibility,
+	StructIdx, Tier, Visibility,
 };
 use super::imports::report_private_identifier;
 use super::literals::{
-	CharLiteralError, Integer, parse_char_literal, unescape_string_literal,
+	CharLiteralError, CharMiss, ConcreteType, FloatMiss, Integer, IntegerMiss,
+	UntypedValue, parse_char_literal, unescape_string_literal,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
@@ -61,7 +63,8 @@ use super::resolutions::Referent;
 use super::signatures::{InferPolicy, LexicalScope, TypeContext};
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{
-	ImplKind, Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
+	TypeIndex,
 };
 use crate::ast::{
 	self, BinaryOp, Keyword, Ownership, Separated, Spanned, UnaryOp,
@@ -89,6 +92,14 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// What each scope's value is checked against, index-aligned with the
 	/// body's scopes.
 	scope_types: Vec<ScopeType>,
+}
+
+/// Whether a local a name finds can be used where the name is written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalReach {
+	Visible,
+	/// Declared outside the static data the name is written in.
+	BehindStatic,
 }
 
 /// Whether two types are equal once some facts have rewritten them.
@@ -128,6 +139,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
+	/// Builds the parts of a literal (its elements, a repeat's value) in a
+	/// scope of their own, which keeps the locals around it out
+	/// of reach.
+	fn static_scope<R>(
+		&mut self,
+		span: TextSpan,
+		build: impl FnOnce(&mut Self) -> R,
+	) -> R {
+		let scope =
+			self.enter_scope(ScopeKind::Static, None, span, TypeIndex::INFER);
+		let built = build(self);
+		self.leave_scope(scope);
+		built
+	}
+
 	/// Decides what building a body recorded, once every constant body is
 	/// built and every declaration is checked, and reports what fails.
 	pub(super) fn decide_obligations(
@@ -165,6 +191,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				ExprObligation::Match(expr) => {
 					self.check_match_usefulness(expr)
 				}
+				ExprObligation::Representable { expr, target } => {
+					self.decide_representable(expr, target)
+				}
 			}
 		}
 	}
@@ -175,7 +204,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expr: &Spanned<ast::Expression>,
 		expected: TypeIndex,
 	) -> (Body, Obligations) {
-		let expected = self.normalized(expected, self.scope.env);
+		let expected = self.normalized(expected, self.scope.assumption_env);
 		self.enter_root(expr.span, expected);
 		self.check(expr, expected);
 		(self.body, self.obligations)
@@ -259,7 +288,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return expr;
 		}
 		let actual = self.body.ty(expr);
-		if self.cx.types.has_literal(actual) {
+		if self.cx.types.needs_context(actual) {
 			self.coerce(expr, expected);
 		} else if actual != TypeIndex::ERROR
 			&& actual != TypeIndex::NEVER
@@ -344,7 +373,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Result<TypeIndex, ()> {
 		let site = SourceSpan::new(self.scope.file_id, site);
 		match self.cx.normalize(
-			self.scope.env,
+			self.scope.assumption_env,
 			ty,
 			NormalizationDepth::Deep,
 			facts,
@@ -597,9 +626,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.push(kind, ty, span)
 	}
 
-	/// An array literal stays untyped (`Type::ArrayLiteral`) until its
-	/// context gives it a shared array or slice (`coerce`). Its elements are
-	/// built with the expected element type as their hint.
+	/// An array literal is an array, data in no memory until its context
+	/// places it (`coerce_static`). Its elements are built with the expected
+	/// element type as their hint; its element type is the first typed
+	/// element's, or the first one's (`[{integer}; 3]`), which placing checks
+	/// each element against.
 	fn build_array(
 		&mut self,
 		elements: &[Spanned<ast::Expression>],
@@ -607,23 +638,30 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let hint = self.array_element_hint(expected);
-		let values: Vec<ExprIdx> = elements
+		let values: Vec<ExprIdx> = self.static_scope(span, |this| {
+			(elements.iter())
+				.map(|element| this.build(element, hint))
+				.collect()
+		});
+		let of = values
 			.iter()
-			.map(|element| self.build(element, hint))
-			.collect();
+			.map(|&value| self.body.ty(value))
+			.find(|&ty| !self.cx.types.has_literal(ty))
+			.or_else(|| values.first().map(|&value| self.body.ty(value)))
+			.unwrap_or(hint);
+		let bits = u64::try_from(values.len()).unwrap();
+		let length = self.cx.types.intern(Type::Value { bits });
+		let ty = self.cx.types.intern(Type::Array { of, length });
 		let elements = self.body.push_args(values);
-		let expr = self.body.push(
-			ExprKind::Array { elements },
-			TypeIndex::ARRAY_LITERAL,
-			span,
-		);
+		let expr = self.body.push(ExprKind::Array { elements }, ty, span);
 		self.body.push_static(expr);
 		expr
 	}
 
-	/// A repeat is untyped as an array literal is. Its count is a length in
-	/// the memory its context gives, of that memory's `Size`, so it is
-	/// checked when the repeat is coerced.
+	/// A repeat is an array as an array literal is, its length the count:
+	/// an integer literal, a constant, or `_` for the length of the array its
+	/// context gives. Placed in a memory, the count is checked against the
+	/// memory's `Size`.
 	fn build_array_repeat(
 		&mut self,
 		value: &Spanned<ast::Expression>,
@@ -632,8 +670,34 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let hint = self.array_element_hint(expected);
-		let value = self.build(value, hint);
-		let count = match &count.inner {
+		let value = self.static_scope(span, |this| this.build(value, hint));
+		// The count is a length, which `repeat_length` holds to a literal or
+		// a constant.
+		let count = self.build_repeat_count(count);
+		let of = self.body.ty(value);
+		let length = match count {
+			None => TypeIndex::INFER,
+			Some(count) => self.repeat_length(count),
+		};
+		let ty = if length == TypeIndex::ERROR {
+			TypeIndex::ERROR
+		} else {
+			self.cx.types.intern(Type::Array { of, length })
+		};
+		let expr =
+			self.body
+				.push(ExprKind::ArrayRepeat { value, count }, ty, span);
+		self.body.push_static(expr);
+		expr
+	}
+
+	/// A repeat's count as written: an integer literal or a constant's path,
+	/// `None` for `_`.
+	fn build_repeat_count(
+		&mut self,
+		count: &Spanned<ast::ConstArgument>,
+	) -> Option<ExprIdx> {
+		match &count.inner {
 			ast::ConstArgument::Infer => None,
 			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
 				Some(self.body.push(
@@ -673,37 +737,67 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Err(error) => error,
 				})
 			}
-		};
-		let expr = self.body.push(
-			ExprKind::ArrayRepeat { value, count },
-			TypeIndex::ARRAY_LITERAL,
-			span,
-		);
-		self.body.push_static(expr);
-		expr
+		}
 	}
 
-	/// The element type an expected array or slice gives its literal's
-	/// elements; no constraint otherwise.
+	/// A repeat's `count` as a length: a `Value`, or the `Const` it names.
+	/// `ERROR` when it is neither (reported).
+	fn repeat_length(&mut self, count: ExprIdx) -> TypeIndex {
+		match self.body.kind(count) {
+			_ if self.body.ty(count) == TypeIndex::ERROR => TypeIndex::ERROR,
+			ExprKind::Int(bits) => self.cx.types.intern(Type::Value { bits }),
+			ExprKind::Const {
+				constant,
+				type_args,
+			} if type_args.is_empty() => self.cx.types.intern_const(constant, &[]),
+			// An impl's constant may depend on the impl's arguments, which
+			// evaluation does not substitute (yet).
+			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
+				let span = self.body.span(count);
+				self.report_unsupported(
+					span,
+					"a repeat count of a generic constant",
+				);
+				TypeIndex::ERROR
+			}
+			_ => {
+				self.push_error(
+					DiagnosticCode::ArrayRepeatCountNotConst,
+					"an array's length is a literal or a constant".to_string(),
+					count,
+				);
+				TypeIndex::ERROR
+			}
+		}
+	}
+
+	/// The element type an expected array or slice, or a pointer to one,
+	/// gives its literal's elements; no constraint otherwise.
 	fn array_element_hint(&self, expected: TypeIndex) -> TypeIndex {
+		let expected = match *self.cx.types.resolve(expected) {
+			Type::Pointer { to, .. } => to,
+			_ => expected,
+		};
 		match *self.cx.types.resolve(expected) {
-			Type::Array { of, .. } | Type::Slice { of, .. } => of,
+			Type::Array { of, .. } | Type::Slice { of } => of,
 			_ => TypeIndex::INFER,
 		}
 	}
 
-	/// A string literal stays untyped (`Type::StringLiteral`) until its context
-	/// gives it a byte slice or a byte array (`coerce`).
+	/// A string literal is the byte array of its length (`[u8; 5]`), data in
+	/// no memory until its context places it (`coerce_static`).
 	fn build_string(&mut self, span: TextSpan) -> ExprIdx {
 		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
 		match unescape_string_literal(span.extract_str(source)) {
 			Ok(contents) => {
+				let bits = u64::try_from(contents.len()).unwrap();
 				let symbol = self.cx.strings.get_or_intern(contents);
-				let expr = self.body.push(
-					ExprKind::String(symbol),
-					TypeIndex::STRING_LITERAL,
-					span,
-				);
+				let length = self.cx.types.intern(Type::Value { bits });
+				let ty = self.cx.types.intern(Type::Array {
+					of: TypeIndex::U8,
+					length,
+				});
+				let expr = self.body.push(ExprKind::String(symbol), ty, span);
 				self.body.push_static(expr);
 				expr
 			}
@@ -754,9 +848,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> ExprIdx {
 		if let [segment] = segments
 			&& segment.type_args.is_empty()
-			&& let Some(local) = self.lookup_local(segment.ident.inner)
+			&& let Some((local, reach)) = self.lookup_local(segment.ident.inner)
 		{
 			self.record_local(local, segment.ident.span);
+			if reach == LocalReach::BehindStatic {
+				self.report_local_in_static_data(span);
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
 			let ty = self.body.local(local).ty;
 			return self.body.push(ExprKind::Local(local), ty, span);
 		}
@@ -798,10 +896,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		match kind {
 			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
 				let signature = &self.cx.constants[usize::from(const_index)];
-				let ty = self.normalized(signature.ty, signature.env);
+				let ty = self.normalized(
+					signature.ty,
+					self.cx.assumption_envs.of_frame(signature.env),
+				);
 				let kind = ExprKind::Const {
 					constant: const_index,
-					type_args: TypeList::EMPTY,
+					type_args: GenericArgs::EMPTY,
 				};
 				self.body.push(kind, ty, span)
 			}
@@ -821,6 +922,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			DefKind::Global(global_index) => {
 				let ty = self.cx.types.intern(Type::Global { global_index });
 				self.body.push(ExprKind::Global(global_index), ty, span)
+			}
+			// A memory's name is its handle, as a global's is.
+			DefKind::Memory(memory_index) => {
+				let ty = self.cx.types.intern(Type::Memory { memory_index });
+				self.body.push(ExprKind::Memory(memory_index), ty, span)
 			}
 			_ => {
 				self.unsupported(span, &format!("a path to a {}", kind.noun()))
@@ -842,7 +948,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let first = segments[0].ident.inner;
 		if !prefix.is_empty()
 			&& (first == Keyword::SelfPascal.symbol()
-				|| self.cx.type_envs.resolve(self.scope.env, first).is_some())
+				|| self
+					.cx
+					.generic_envs
+					.resolve(self.scope.generic_env, first)
+					.is_some())
 		{
 			let receiver = self.cx.resolve_type_path(
 				&mut self.obligations.types,
@@ -878,7 +988,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			&& let DefKind::Struct(struct_index) = key.symbol_kind(self.cx.defs)
 		{
 			let params = self.cx.structs[usize::from(struct_index)].type_params;
-			let count = self.cx.type_envs.param_names(params).len();
+			let count = self.cx.generic_envs.param_names(params).len();
 			if count > 0 {
 				if stop + 1 != prefix.len() {
 					return Err(self.unsupported(
@@ -913,14 +1023,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	/// The local `name` refers to from the current scope: declared in it or in
-	/// a scope around it.
-	fn lookup_local(&self, name: SymbolU32) -> Option<LocalIdx> {
+	/// a scope around it, and whether it lies past static data the name is
+	/// written in.
+	fn lookup_local(&self, name: SymbolU32) -> Option<(LocalIdx, LocalReach)> {
+		let mut reach = LocalReach::Visible;
 		let mut scope = Some(self.current);
 		while let Some(at) = scope {
 			if let Some(&local) = self.lookup.get(&(at, name)) {
-				return Some(local);
+				return Some((local, reach));
 			}
-			scope = self.body.scope(at).parent;
+			let scope_data = self.body.scope(at);
+			if scope_data.kind == ScopeKind::Static {
+				reach = LocalReach::BehindStatic;
+			}
+			scope = scope_data.parent;
 		}
 		None
 	}
@@ -1095,24 +1211,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.cx.types.has_error(self.body.ty(argument.value))
 			});
 		self.settle_uninferred(
-			target.type_env,
+			target.generic_env,
 			segment.ident.span,
 			already_reported,
 			&mut type_args,
 		);
 		self.expect_arguments(&target, &type_args, &given);
-		let type_list = self.cx.types.push_list(&type_args);
-		self.check_frame_bounds(
-			&target,
-			target.type_env,
-			segment,
-			type_list,
-			&given,
-		);
+		let args = self.use_args(&target, segment, &type_args, &given);
+		self.check_use_bounds(&target, 0, segment, args);
 		let fields = self
 			.arguments_value(&target, &type_args, &given, 0, reported, span);
 		let ty = self.cx.types.intern_struct(struct_index, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
+		// Fields need nothing; the value made of them does.
+		let ty = self.require_stack_value(ty, span);
 		self.body.push(
 			ExprKind::StructConstructor {
 				struct_index,
@@ -1135,12 +1247,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expected: TypeIndex,
 	) -> Box<[TypeIndex]> {
 		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
-		let count = self.cx.type_envs.param_names(params_env).len();
+		let count = self.cx.generic_envs.param_names(params_env).len();
 		let mut type_args = vec![TypeIndex::INFER; count].into_boxed_slice();
 		self.write_type_args(
 			segment,
 			params_env,
-			TypeEnvOwner::Struct(struct_index),
+			GenericEnvOwner::Struct(struct_index),
 			&mut type_args,
 		);
 		if expected == TypeIndex::INFER {
@@ -1148,7 +1260,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		// A disagreement teaches nothing: the construction's own type is held
 		// to the expected one where the call is checked.
-		let expected = self.normalized(expected, self.scope.env);
+		let expected = self.normalized(expected, self.scope.assumption_env);
 		if let Type::Struct {
 			struct_index: hinted,
 			type_args: hints,
@@ -1173,15 +1285,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn write_type_args(
 		&mut self,
 		segment: &ast::PathSegment,
-		params_env: TypeEnvIdx,
-		owner: TypeEnvOwner,
+		params_env: GenericEnvIdx,
+		owner: GenericEnvOwner,
 		type_args: &mut [TypeIndex],
 	) {
 		if segment.type_args.is_empty() {
 			return;
 		}
-		let start = self.cx.type_envs.parent_count(params_env);
-		let len = self.cx.type_envs.param_names(params_env).len();
+		let start = self.cx.generic_envs.parent_count(params_env);
+		let len = self.cx.generic_envs.param_names(params_env).len();
 		let slots = &mut type_args[start..start + len];
 		// Every written argument is resolved, extra ones too, for their own
 		// diagnostics.
@@ -1206,64 +1318,72 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// Records and checks the bounds of the parameters of `frame`, a frame on
-	/// `target`'s chain, for their final type arguments, at the call,
-	/// wherever they were learned from. `arguments` are flat, the stored list
-	/// the caller shares with whatever else reads it (the call's node). Each
-	/// is reported at its written argument (the target's own frame is the
-	/// one written on `segment`), else at the value given for a parameter of
-	/// `target` whose declared type is that type parameter, else at the name.
-	fn check_frame_bounds(
+	/// The flat `type_args` of a use of `target` through `segment`, each
+	/// with where it is given: the argument written on `segment`, else the
+	/// value given for a parameter declared as that type parameter (a
+	/// receiver for `Self`), else the name.
+	fn use_args(
 		&mut self,
 		target: &CallTarget<'_>,
-		frame: TypeEnvIdx,
 		segment: &ast::PathSegment,
-		arguments: TypeList,
+		type_args: &[TypeIndex],
 		given: &[GivenArgument],
-	) {
-		let own = self.cx.type_envs.param_names(frame).len();
-		if own == 0 {
-			return;
-		}
-		let start = self.cx.type_envs.parent_count(frame);
-		let arguments = arguments.prefix(start + own);
-		let owner = self.cx.type_envs.owner(frame);
-		let written: &[_] = if owner == target.kind.owner() {
-			&segment.type_args
-		} else {
-			&[]
+	) -> GenericArgs {
+		let env = target.generic_env;
+		let written_from = (env != GenericEnvIdx::ROOT
+			&& self.cx.generic_envs.owner(env) == target.kind.owner())
+		.then(|| self.cx.generic_envs.parent_count(env));
+		let identity = self.cx.generic_envs.identity_args(env);
+		let body = &self.body;
+		let span_of = |slot: usize| {
+			if let Some(written) = written_from
+				.and_then(|start| slot.checked_sub(start))
+				.and_then(|at| segment.type_args.get(at))
+			{
+				return written.span();
+			}
+			given
+				.iter()
+				.find(|argument| argument.declared == identity[slot])
+				.map_or(segment.ident.span, |argument| {
+					body.span(argument.value)
+				})
 		};
-		for index in 0..own {
-			let argument = self.cx.types.list(arguments)[start + index];
-			let span = match written.get(index) {
-				Some(written) => written.span(),
-				None => {
-					let param = self.cx.type_envs.param_types(frame)[index];
-					let mut span = segment.ident.span;
-					for argument in given {
-						if argument.declared == param {
-							span = self.body.span(argument.value);
-							break;
-						}
-					}
-					span
-				}
-			};
-			self.cx.record_bounds_check(
-				&mut self.obligations.types,
-				self.scope.env,
-				BoundRequirements::Parameter {
-					env: frame,
-					index,
-					arguments,
-				},
-				Spanned {
-					inner: argument,
-					span,
-				},
-				SourceSpan::new(self.scope.file_id, span),
-				owner,
-			);
+		self.cx.generic_args.push(
+			type_args
+				.iter()
+				.enumerate()
+				.map(|(slot, &ty)| (ty, span_of(slot))),
+		)
+	}
+
+	/// Proves, for a use's final `args`, the bounds of each frame on
+	/// `target`'s chain after the first `proven` arguments: the selection
+	/// proved those.
+	fn check_use_bounds(
+		&mut self,
+		target: &CallTarget<'_>,
+		proven: usize,
+		segment: &ast::PathSegment,
+		args: GenericArgs,
+	) {
+		let mut frame = target.generic_env;
+		while frame != GenericEnvIdx::ROOT {
+			let start = self.cx.generic_envs.parent_count(frame);
+			if start >= proven {
+				let own = self.cx.generic_envs.param_names(frame).len();
+				self.cx.record_bounds_check(
+					&mut self.obligations.types,
+					self.scope.generic_env,
+					BoundRequirements::Frame {
+						env: frame,
+						args: args.prefix(start + own),
+					},
+					SourceSpan::new(self.scope.file_id, segment.ident.span),
+					self.cx.generic_envs.owner(frame),
+				);
+			}
+			frame = self.cx.generic_envs.parent(frame).unwrap();
 		}
 	}
 
@@ -1274,7 +1394,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// whatever failed has said why, and may be why nothing was learned.
 	fn settle_uninferred(
 		&mut self,
-		params_env: TypeEnvIdx,
+		params_env: GenericEnvIdx,
 		span: TextSpan,
 		already_reported: bool,
 		args: &mut [TypeIndex],
@@ -1289,12 +1409,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			let frame = self
 				.cx
-				.type_envs
+				.generic_envs
 				.chain(params_env)
-				.find(|&frame| self.cx.type_envs.parent_count(frame) <= at)
+				.find(|&frame| self.cx.generic_envs.parent_count(frame) <= at)
 				.unwrap();
-			let index = at - self.cx.type_envs.parent_count(frame);
-			let name = self.cx.type_envs.param_names(frame)[index].inner;
+			let index = at - self.cx.generic_envs.parent_count(frame);
+			let name = self.cx.generic_envs.param_names(frame)[index].inner;
 			let name = self.cx.strings.resolve(name).unwrap();
 			self.cx.diagnostics.push(
 				Diagnostic::error()
@@ -1326,12 +1446,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.cx.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.cx.type_envs,
+				envs: &self.cx.generic_envs,
 				env: self.cx.structs[usize::from(struct_index)].type_params,
 				args,
 			},
 		);
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		self.cx.types.collapse_error(ty)
 	}
 
@@ -1347,7 +1467,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Option<(StructIdx, Box<[TypeIndex]>)> {
 		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
 		let Some((impl_kind, target)) =
-			self.cx.resolve_impl_self(self.scope.env)
+			self.cx.resolve_impl_self(self.scope.generic_env)
 		else {
 			// A trait's `Self` is the type implementing it, which is not
 			// known to be a struct; elsewhere `Self` names nothing.
@@ -1412,6 +1532,22 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				Visibility::from(pub_span),
 			)
 		})
+	}
+
+	fn report_local_in_static_data(&mut self, span: TextSpan) {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::LocalInStaticData.code())
+				.with_message("a local variable cannot be used in static data")
+				.with_label(
+					Label::primary(self.scope.file_id, span)
+						.with_message("a runtime value"),
+				)
+				.with_note(
+					"a string or array literal is placed as data before the \
+					 program runs, so its elements are constant expressions",
+				),
+		);
 	}
 
 	fn report_struct_used_as_value(&mut self, name: SymbolU32, span: TextSpan) {
@@ -1508,7 +1644,19 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// untyped until context coerces both.
 		let operand = self.build(operand, expected);
 		let ty = self.body.ty(operand);
-		if ty == TypeIndex::STRING_LITERAL || ty == TypeIndex::ARRAY_LITERAL {
+		if ty == TypeIndex::NEVER {
+			// The operand never produces a value, so no operator is applied
+			// and the unary expression itself diverges.
+			return self.body.push(
+				ExprKind::PrimitiveUnary {
+					op: op.inner,
+					operand,
+				},
+				TypeIndex::NEVER,
+				span,
+			);
+		}
+		if self.cx.types.is_unplaced(ty) {
 			return self.report_operator_on_literal(
 				op.inner.as_str(),
 				operand,
@@ -1581,46 +1729,37 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// be, and below, a typed side gives its type to an untyped one.
 		let lhs = self.build(left, expected);
 		let left_ty = self.body.ty(lhs);
-		let rhs = if self.cx.types.has_literal(left_ty) {
+		// A diverging left operand has no type to lend the right one, so it
+		// must not become the right side's expectation.
+		let rhs = if self.cx.types.needs_context(left_ty)
+			|| left_ty == TypeIndex::NEVER
+		{
 			self.build(right, expected)
 		} else {
 			self.build(right, left_ty)
 		};
 		let right_ty = self.body.ty(rhs);
+		if left_ty == TypeIndex::NEVER || right_ty == TypeIndex::NEVER {
+			return self
+				.build_diverging_binary(op, lhs, rhs, left_ty, right_ty, span);
+		}
+		// Data not placed in a memory has no operators of its own.
+		for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
+			if self.cx.types.is_unplaced(ty) {
+				return self.report_operator_on_literal(
+					op.inner.as_str(),
+					operand,
+					span,
+				);
+			}
+		}
 		let operand_ty = match (
 			self.cx.types.has_literal(left_ty),
 			self.cx.types.has_literal(right_ty),
 		) {
 			(true, true) => {
-				// A string or array literal has no operators of its own.
-				for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
-					if ty == TypeIndex::STRING_LITERAL
-						|| ty == TypeIndex::ARRAY_LITERAL
-					{
-						return self.report_operator_on_literal(
-							op.inner.as_str(),
-							operand,
-							span,
-						);
-					}
-				}
 				if is_comparison(op.inner) {
-					self.cx.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::ComparisonTypeAnnotationRequired
-									.code(),
-							)
-							.with_message(
-								"type annotation required to compare untyped literals",
-							)
-							.with_label(Label::primary(self.scope.file_id, span)),
-					);
-					return self.body.push(
-						ExprKind::Error,
-						TypeIndex::ERROR,
-						span,
-					);
+					return self.report_untyped_comparison(span);
 				}
 				// Two literals are a character if either is, else a float if
 				// either is; anything else untyped (a tuple of literals) keeps
@@ -1675,6 +1814,84 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		};
 		let (kind, ty) = self.select_binary(op, lhs, rhs, operand_ty);
 		self.body.push(kind, ty, span)
+	}
+
+	/// A binary with at least one `Never` operand. Since `!` fits every type,
+	/// a lone diverging side lets the other side choose the operator; when
+	/// that side is an untyped literal the node stays untyped for its context,
+	/// exactly as two literals do. Two diverging operands apply no operator
+	/// at all and are themselves `Never`.
+	fn build_diverging_binary(
+		&mut self,
+		op: Spanned<BinaryOp>,
+		lhs: ExprIdx,
+		rhs: ExprIdx,
+		left_ty: TypeIndex,
+		right_ty: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		if left_ty == TypeIndex::NEVER && right_ty == TypeIndex::NEVER {
+			return self.body.push(
+				ExprKind::PrimitiveBinary {
+					op: op.inner,
+					lhs,
+					rhs,
+				},
+				TypeIndex::NEVER,
+				span,
+			);
+		}
+		let live_ty = if left_ty == TypeIndex::NEVER {
+			right_ty
+		} else {
+			left_ty
+		};
+		// Data not placed in a memory has no operators of its own.
+		if self.cx.types.is_unplaced(live_ty) {
+			let live = if left_ty == TypeIndex::NEVER {
+				rhs
+			} else {
+				lhs
+			};
+			return self.report_operator_on_literal(
+				op.inner.as_str(),
+				live,
+				span,
+			);
+		}
+		if self.cx.types.has_literal(live_ty) {
+			if is_comparison(op.inner) {
+				return self.report_untyped_comparison(span);
+			}
+			return self.body.push(
+				ExprKind::PrimitiveBinary {
+					op: op.inner,
+					lhs,
+					rhs,
+				},
+				live_ty,
+				span,
+			);
+		}
+		let (kind, ty) = self.select_binary(op, lhs, rhs, live_ty);
+		self.body.push(kind, ty, span)
+	}
+
+	/// A comparison between untyped literals — or between one and a
+	/// diverging operand — has no concrete type from which to choose its
+	/// instruction.
+	fn report_untyped_comparison(&mut self, span: TextSpan) -> ExprIdx {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(
+					DiagnosticCode::ComparisonTypeAnnotationRequired.code(),
+				)
+				.with_message(
+					"type annotation required to compare untyped literals",
+				)
+				.with_label(Label::primary(self.scope.file_id, span)),
+		);
+		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 	}
 
 	/// The node for a unary operator on an operand of concrete type, and its
@@ -1768,7 +1985,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let found = match method {
 			Some(method) => {
 				match self.cx.find_trait_impl_query(
-					self.scope.env,
+					self.scope.assumption_env,
 					ty,
 					method.trait_index,
 				) {
@@ -1844,7 +2061,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let span = self.body.span(receiver);
 			self.pack([], ElementOrder::InOrder, TypeIndex::UNIT, span)
 		});
-		match self.select_operator_method(selected, ty) {
+		let span = self.body.span(receiver);
+		match self.select_operator_method(selected, ty, span) {
 			SelectedMethod::Concrete {
 				function,
 				type_args,
@@ -1873,6 +2091,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		(method, lookup): (OperatorMethod, TraitImplLookup),
 		ty: TypeIndex,
+		span: TextSpan,
 	) -> SelectedMethod {
 		if let TraitImplLookup::Concrete { impl_index, args } = lookup
 			&& let TraitMemberSelection::Impl(
@@ -1883,19 +2102,26 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			) {
 			return SelectedMethod::Concrete {
 				function,
-				type_args: self.cx.types.push_list(&args),
+				type_args: self
+					.cx
+					.generic_args
+					.push(args.iter().map(|&arg| (arg, span))),
 			};
 		}
 		SelectedMethod::Abstract {
 			method: method.method,
-			type_args: self.cx.types.push_list(&[ty]),
+			type_args: self.cx.generic_args.push([(ty, span)]),
 		}
 	}
 
 	/// What a type means in `scope`: comparisons and literal coercion work on
 	/// normalized types. A projection that does not normalize stays as written;
 	/// whoever wrote it has reported why.
-	fn normalized(&mut self, ty: TypeIndex, scope: TypeEnvIdx) -> TypeIndex {
+	fn normalized(
+		&mut self,
+		ty: TypeIndex,
+		scope: AssumptionEnvIdx,
+	) -> TypeIndex {
 		match self.cx.normalize(
 			scope,
 			ty,
@@ -1913,41 +2139,44 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let Some(projection) = self.cx.memory_size(memory) else {
 			return TypeIndex::ERROR;
 		};
-		self.normalized(projection, self.scope.env)
+		self.normalized(projection, self.scope.assumption_env)
 	}
 
-	/// Every member of every typeset an abstract `target` assumes, any of
-	/// which can be substituted for it. Empty when no literal can have type
-	/// `target`.
-	fn typeset_targets(&self, target: TypeIndex) -> Vec<LiteralTarget> {
-		// An abstract target is constrained by its own bounds alone, so read
-		// the typesets those name rather than probing every typeset.
-		let mut targets = Vec::new();
-		for trait_index in self.cx.clause_tables().declared_traits(
-			&self.cx.types,
-			target,
-			self.cx.solver.state.recursion_budget,
-		) {
-			let Some(typeset) =
-				self.cx.defs.traits[usize::from(trait_index)].typeset
-			else {
-				continue;
-			};
-			for member in self.cx.typeset_members(typeset).iter().copied() {
-				targets.push(LiteralTarget::TypesetMember(typeset, member));
-			}
-		}
-		targets
-	}
-
-	/// Gives an untyped subtree the type `target`, checking each literal fits.
-	/// Reports and leaves the offending node at `ERROR` when one does not.
+	/// Gives an untyped subtree the type `target`, checking each literal is
+	/// representable as it. Reports and leaves the offending node at `ERROR`
+	/// when one does not.
 	fn coerce(&mut self, expr: ExprIdx, target: TypeIndex) {
+		// `!` fits every type and never produces a value, so there is nothing
+		// to convert. Treating it as an untyped literal here would try to
+		// select an operator for it or fail the literal-only coercion path.
+		if self.body.ty(expr) == TypeIndex::NEVER {
+			return;
+		}
 		if target == TypeIndex::ERROR {
 			self.body.set_ty(expr, TypeIndex::ERROR);
 			return;
 		}
+		// An untyped constant's body is of its kind already, and stays
+		// untyped.
+		if target.is_literal() {
+			let actual = self.body.ty(expr);
+			if actual != target {
+				let diagnostic =
+					self.report_type_mismatch(target, actual, expr);
+				self.cx.diagnostics.push(diagnostic);
+				self.body.set_ty(expr, TypeIndex::ERROR);
+			}
+			return;
+		}
 		match self.body.kind(expr) {
+			ExprKind::Const { .. }
+				if self.cx.types.is_unplaced(self.body.ty(expr)) =>
+			{
+				return self.place_constant(expr, target);
+			}
+			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
+				return self.coerce_constant(expr, target);
+			}
 			ExprKind::String(_)
 			| ExprKind::Array { .. }
 			| ExprKind::ArrayRepeat { .. } => {
@@ -1971,7 +2200,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				..
 			} => {
 				for branch in [then_block, else_block] {
-					if self.cx.types.has_literal(self.body.ty(branch)) {
+					if self.cx.types.needs_context(self.body.ty(branch)) {
 						self.coerce(branch, target);
 					}
 				}
@@ -1981,7 +2210,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				let bodies: Vec<ExprIdx> =
 					self.body.arms(arms).iter().map(|arm| arm.body).collect();
 				for arm in bodies {
-					if self.cx.types.has_literal(self.body.ty(arm)) {
+					if self.cx.types.needs_context(self.body.ty(arm)) {
 						self.coerce(arm, target);
 					}
 				}
@@ -1989,52 +2218,213 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			_ => {}
 		}
-		// The common case: one concrete scalar, held on the stack.
-		if Integer::from_type(target).is_some()
-			|| Float::from_type(target).is_some()
-			|| target == TypeIndex::CHAR
-		{
-			let single = [LiteralTarget::Target(target)];
-			return self.coerce_against(expr, target, &single);
-		}
-		let targets = self.typeset_targets(target);
-		if targets.is_empty() {
+		let concrete_types =
+			self.cx.concrete_types(self.scope.assumption_env, target);
+		if concrete_types.is_empty() {
 			self.cx
 				.diagnostics
 				.push(self.report_unable_to_coerce(expr, target));
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
-		self.coerce_against(expr, target, &targets);
+		self.coerce_against(expr, target, &concrete_types);
 	}
 
-	/// `coerce` against the scalars a literal must fit: `target`'s own, or
-	/// every member of every typeset it assumes.
+	/// Gives an untyped constant the type `target`. Whether its value is
+	/// representable is decided once values exist (`decide_representable`), as
+	/// a constant's body reads none.
+	fn coerce_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
+		if self
+			.cx
+			.concrete_types(self.scope.assumption_env, target)
+			.is_empty()
+		{
+			self.cx
+				.diagnostics
+				.push(self.report_unable_to_coerce(expr, target));
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		}
+		self.body.set_ty(expr, target);
+		self.obligations
+			.exprs
+			.push(ExprObligation::Representable { expr, target });
+	}
+
+	/// The constant an untyped `expr` names, and its value. `None` when it has
+	/// none here: it failed (reported where it is), or it is a trait's constant
+	/// over a type not known here and no representability clause in scope says
+	/// it is representable as `target` (reported); `Some` with no value when
+	/// one does.
+	fn untyped_value(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+	) -> Option<(ConstIdx, Option<i128>)> {
+		let (constant, args) = match self.body.kind(expr) {
+			ExprKind::Const { constant, .. } => (constant, Vec::new()),
+			ExprKind::AbstractConst {
+				constant,
+				type_args,
+			} => (constant, self.cx.generic_args.types(type_args).to_vec()),
+			_ => unreachable!("only a constant's representability is decided"),
+		};
+		let env = self.scope.assumption_env;
+		match self.cx.untyped_value(env, constant, &args).ok()? {
+			UntypedValue::Known(value) => Some((constant, Some(value))),
+			UntypedValue::Failed => None,
+			UntypedValue::Abstract => {
+				let subject = self.normalized(args[0], env);
+				if self
+					.cx
+					.assumed_representable(env, subject, constant, target)
+					.ok()?
+				{
+					return Some((constant, None));
+				}
+				let diagnostic = self.cx.report_unrepresentable_constant(
+					self.source_span(expr),
+					(subject, constant),
+					target,
+					None,
+					None,
+				);
+				self.cx.diagnostics.push(diagnostic);
+				None
+			}
+		}
+	}
+
+	/// Decides a recorded `Representable`: the untyped constant `expr` names
+	/// has a value of its kind representable as `target`, as a literal of that
+	/// value would. A constant without a value reports itself.
+	fn decide_representable(&mut self, expr: ExprIdx, target: TypeIndex) {
+		// Without a value, a representability clause in scope said it is.
+		let Some((constant, Some(value))) = self.untyped_value(expr, target)
+		else {
+			return;
+		};
+		let kind = self.cx.constants[usize::from(constant)].ty;
+		let name = self.cx.defs.constants[usize::from(constant)].name.inner;
+		let name = self.cx.strings.resolve(name).unwrap().to_owned();
+		let at = self.source_span(expr);
+		for concrete in
+			self.cx.concrete_types(self.scope.assumption_env, target)
+		{
+			let held = if kind == TypeIndex::CHAR_LITERAL {
+				u32::try_from(value)
+					.map_err(|_| CharMiss::OutOfRange)
+					.and_then(|code_point| concrete.holds_char(code_point))
+					.map_err(|miss| match miss {
+						CharMiss::OutOfRange => IntegerMiss::OutOfRange,
+						CharMiss::WrongKind => IntegerMiss::WrongKind,
+					})
+			} else {
+				concrete.holds_integer(value)
+			};
+			let Err(miss) = held else {
+				continue;
+			};
+			let ty = self.cx.type_formatter().display_type(target);
+			let diagnostic = match (concrete, miss) {
+				(ConcreteType::Member(typeset, member), _) => {
+					self.cx.report_typeset_member(
+						format_args!("constant `{name}`"),
+						typeset,
+						member,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), IntegerMiss::OutOfRange) => {
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::IntegerLiteralOutOfRange.code(),
+						)
+						.with_message(format!(
+							"constant `{name}` cannot be represented as `{ty}`"
+						))
+						.with_label(at.primary_label().with_message(format!(
+							"its value `{value}` is out of range for `{ty}`"
+						)))
+				}
+				(ConcreteType::Target(_), IntegerMiss::Inexact) => {
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::IntegerLiteralNotRepresentable
+								.code(),
+						)
+						.with_message(format!(
+							"constant `{name}` cannot be represented exactly \
+							 as `{ty}`"
+						))
+						.with_label(
+							at.primary_label().with_message(format!(
+								"its value is `{value}`"
+							)),
+						)
+				}
+				(ConcreteType::Target(_), IntegerMiss::WrongKind) => {
+					self.report_unable_to_coerce(expr, target)
+				}
+			};
+			return self.reject(expr, diagnostic);
+		}
+	}
+
+	/// `coerce` against the scalars a literal must be representable as:
+	/// `target`'s own, or every member of every typeset it assumes.
 	fn coerce_against(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
+		concrete_types: &[ConcreteType],
 	) {
 		match self.body.kind(expr) {
 			ExprKind::Int(value) => {
-				self.coerce_int(expr, expr, target, targets, value, false);
+				self.coerce_int(
+					expr,
+					expr,
+					target,
+					concrete_types,
+					value,
+					false,
+				);
 			}
-			ExprKind::Float(_) => self.coerce_float(expr, target, targets),
+			ExprKind::Float(_) => {
+				self.coerce_float(expr, target, concrete_types)
+			}
 			ExprKind::Char(value) => {
-				self.coerce_char(expr, target, targets, value)
+				self.coerce_char(expr, target, concrete_types, value)
 			}
 			ExprKind::PrimitiveUnary { op, operand } => {
-				for fit in targets {
-					if !fit.fits_unary(op) {
-						return self.report_misfit(expr, target, fit);
+				for &concrete in concrete_types {
+					if concrete.allows_unary(op) {
+						continue;
 					}
+					let diagnostic = match concrete {
+						ConcreteType::Member(typeset, member) => {
+							self.cx.report_typeset_member(
+								"literal",
+								typeset,
+								member,
+								self.source_span(expr),
+							)
+						}
+						ConcreteType::Target(_) => {
+							self.report_unable_to_coerce(expr, target)
+						}
+					};
+					return self.reject(expr, diagnostic);
 				}
 				let coerced = match (op, self.body.kind(operand)) {
 					// `-128` is in range for `i8` though `128` is not: a
-					// negated literal is checked against the negative bound.
+					// negated literal is checked as the negative value.
 					(UnaryOp::InvertSign, ExprKind::Int(value)) => self
 						.coerce_int(
-							expr, operand, target, targets, value, true,
+							expr,
+							operand,
+							target,
+							concrete_types,
+							value,
+							true,
 						),
 					_ => {
 						self.coerce(operand, target);
@@ -2062,37 +2452,78 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.body.set_kind(expr, kind);
 				self.body.set_ty(expr, ty);
 			}
-			kind => unreachable!(
-				"only literals and operators over them are untyped: {kind:?}"
+			_ => unreachable!(
+				"only literals and operators over them are untyped"
 			),
 		}
 	}
 
 	/// Checks an integer literal (`value`, optionally negated) against every
-	/// candidate, then gives `literal` the type `target` and returns `true`.
-	/// On a misfit it draws the report, leaves the node at `ERROR`, and
-	/// returns `false`. `report` is the node a diagnostic points at — the
-	/// unary itself, for a negated literal.
+	/// concrete type of `target`, then gives `literal` the type `target` and
+	/// returns `true`. When one cannot represent it, it draws the report,
+	/// leaves the node at `ERROR`, and returns `false`. `report` is the node a
+	/// diagnostic points at — the unary itself, for a negated literal.
 	fn coerce_int(
 		&mut self,
 		report: ExprIdx,
 		literal: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
-		value: u64,
+		concrete_types: &[ConcreteType],
+		magnitude: u64,
 		negated: bool,
 	) -> bool {
+		let value = if negated {
+			-i128::from(magnitude)
+		} else {
+			i128::from(magnitude)
+		};
+		let at = self.source_span(report);
 		let mut all_float = true;
-		for fit in targets {
-			if !fit.fits_int(value, negated) {
-				self.report_int_misfit(report, value, negated, target, fit);
-				return false;
-			}
-			all_float &= fit.is_float();
+		for &concrete in concrete_types {
+			let Err(miss) = concrete.holds_integer(value) else {
+				all_float &= concrete.is_float();
+				continue;
+			};
+			let diagnostic = match (concrete, miss) {
+				(ConcreteType::Member(typeset, member), _) => {
+					self.cx.report_typeset_member(
+						format_args!("literal `{value}`"),
+						typeset,
+						member,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), IntegerMiss::OutOfRange) => {
+					self.cx.report_out_of_range(
+						format_args!("literal `{value}`"),
+						target,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), IntegerMiss::Inexact) => {
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::IntegerLiteralNotRepresentable
+								.code(),
+						)
+						.with_message(format!(
+							"literal `{value}` cannot be represented exactly \
+							 as `{}`",
+							self.cx.type_formatter().display_type(target)
+						))
+						.with_label(at.primary_label())
+				}
+				(ConcreteType::Target(_), IntegerMiss::WrongKind) => {
+					self.report_unable_to_coerce(report, target)
+				}
+			};
+			self.reject(report, diagnostic);
+			return false;
 		}
 		// An integer literal of float type is a float.
 		if all_float {
-			self.body.set_kind(literal, ExprKind::Float(value as f64));
+			self.body
+				.set_kind(literal, ExprKind::Float(magnitude as f64));
 		}
 		self.body.set_ty(literal, target);
 		true
@@ -2135,33 +2566,60 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.set_ty(expr, ty);
 	}
 
-	/// Reads a float literal's value from its text at each target's width.
+	/// Reads a float literal's value from its text at each concrete type's
+	/// width.
 	fn coerce_float(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
+		concrete_types: &[ConcreteType],
 	) {
 		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
 		let text = self.body.span(expr).extract_str(source);
 		let mut value = None;
-		for fit in targets {
-			match fit.fits_float(&text) {
-				FloatFit::Fits(parsed) => {
-					value.get_or_insert(parsed);
+		for &concrete in concrete_types {
+			match concrete.read_float(&text) {
+				Ok(Some(read)) => {
+					value.get_or_insert(read);
 				}
 				// Malformed syntax was reported by the parser.
-				FloatFit::Invalid => {
-					return self.body.set_ty(expr, TypeIndex::ERROR);
-				}
-				FloatFit::Overflow => {
-					return self.report_float(expr, fit, true);
-				}
-				FloatFit::Underflow => {
-					return self.report_float(expr, fit, false);
-				}
-				FloatFit::NotFloat => {
-					return self.report_misfit(expr, target, fit);
+				Ok(None) => return self.body.set_ty(expr, TypeIndex::ERROR),
+				Err(miss) => {
+					let at = self.source_span(expr);
+					let ty =
+						self.cx.type_formatter().display_type(concrete.ty());
+					let diagnostic = match (concrete, miss) {
+						(_, FloatMiss::TooLarge) => Diagnostic::error()
+							.with_code(
+								DiagnosticCode::FloatLiteralOverflow.code(),
+							)
+							.with_message(format!(
+								"float literal is too large for `{ty}`"
+							))
+							.with_label(at.primary_label()),
+						(_, FloatMiss::TooSmall) => Diagnostic::error()
+							.with_code(
+								DiagnosticCode::FloatLiteralUnderflow.code(),
+							)
+							.with_message(format!(
+								"float literal is too small to represent in \
+								 `{ty}`"
+							))
+							.with_label(at.primary_label()),
+						(
+							ConcreteType::Member(typeset, member),
+							FloatMiss::WrongKind,
+						) => self.cx.report_typeset_member(
+							"float literal",
+							typeset,
+							member,
+							at,
+						),
+						(ConcreteType::Target(_), FloatMiss::WrongKind) => {
+							self.report_unable_to_coerce(expr, target)
+						}
+					};
+					return self.reject(expr, diagnostic);
 				}
 			}
 		}
@@ -2169,187 +2627,86 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.body.set_ty(expr, target);
 	}
 
-	/// A character literal is a `Char`, or an integer its code point fits,
-	/// which it then is.
+	/// A character literal is a `Char`, or an integer that can represent its
+	/// code point, which it then is.
 	fn coerce_char(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-		targets: &[LiteralTarget],
+		concrete_types: &[ConcreteType],
 		value: char,
 	) {
-		let code_point = u64::from(value);
-		for fit in targets {
-			if fit.ty() == TypeIndex::CHAR {
+		let at = self.source_span(expr);
+		for &concrete in concrete_types {
+			let Err(miss) = concrete.holds_char(u32::from(value)) else {
 				continue;
-			}
-			match Integer::from_type(fit.ty()) {
-				Some(integer) if integer.in_range(code_point, false) => {}
-				Some(_) if matches!(fit, LiteralTarget::Target(_)) => {
-					let message = format!(
-						"character literal {value:?} out of range for `{}`",
-						self.cx.type_formatter().display_type(target)
-					);
-					self.push_error(
-						DiagnosticCode::IntegerLiteralOutOfRange,
-						message,
-						expr,
-					);
-					return;
+			};
+			let diagnostic = match (concrete, miss) {
+				(ConcreteType::Member(typeset, member), _) => {
+					self.cx.report_typeset_member(
+						format_args!("literal {value:?}"),
+						typeset,
+						member,
+						at,
+					)
 				}
-				_ => return self.report_misfit(expr, target, fit),
-			}
+				(ConcreteType::Target(_), CharMiss::OutOfRange) => {
+					self.cx.report_out_of_range(
+						format_args!("literal {value:?}"),
+						target,
+						at,
+					)
+				}
+				(ConcreteType::Target(_), CharMiss::WrongKind) => {
+					self.report_unable_to_coerce(expr, target)
+				}
+			};
+			return self.reject(expr, diagnostic);
 		}
 		if target != TypeIndex::CHAR {
-			self.body.set_kind(expr, ExprKind::Int(code_point));
+			self.body.set_kind(expr, ExprKind::Int(u64::from(value)));
 		}
 		self.body.set_ty(expr, target);
 	}
 
-	/// A float literal `fit` cannot hold: too large or too small for its width.
-	fn report_float(
-		&mut self,
-		expr: ExprIdx,
-		fit: &LiteralTarget,
-		overflow: bool,
-	) {
-		let name = self.cx.type_formatter().display_type(fit.ty());
-		let (code, message) = if overflow {
-			(
-				DiagnosticCode::FloatLiteralOverflow,
-				format!("float literal is too large for `{name}`"),
-			)
-		} else {
-			(
-				DiagnosticCode::FloatLiteralUnderflow,
-				format!("float literal is too small to represent in `{name}`"),
-			)
-		};
-		self.push_error(code, message, expr);
-	}
-
-	/// An integer literal that does not fit `fit`: out of range for a plain
-	/// integer target, not representable for a float one.
-	fn report_int_misfit(
-		&mut self,
-		expr: ExprIdx,
-		value: u64,
-		negated: bool,
-		target: TypeIndex,
-		fit: &LiteralTarget,
-	) {
-		let LiteralTarget::Target(ty) = fit else {
-			return self.report_misfit(expr, target, fit);
-		};
-		if Integer::from_type(*ty).is_some() {
-			let value = if negated {
-				-(value as i128)
-			} else {
-				value as i128
-			};
-			self.report_out_of_range(expr, value, target);
-		} else if Float::from_type(*ty).is_some() {
-			let message = format!(
-				"integer literal cannot be represented exactly by `{}`",
-				self.cx.type_formatter().display_type(target)
-			);
-			self.push_error(
-				DiagnosticCode::IntegerLiteralNotRepresentable,
-				message,
-				expr,
-			);
-		} else {
-			// A concrete type that is neither integer nor float (`Bool`, `Char`)
-			// has no integer proof, just as a typeset member has none.
-			self.report_misfit(expr, target, fit);
-		}
-	}
-
-	/// A literal `fit` cannot hold: unable to coerce to a scalar target, or a
-	/// typeset member it does not fit for an abstract one.
-	fn report_misfit(
-		&mut self,
-		expr: ExprIdx,
-		target: TypeIndex,
-		fit: &LiteralTarget,
-	) {
-		let LiteralTarget::TypesetMember(typeset, member) = fit else {
-			self.cx
-				.diagnostics
-				.push(self.report_unable_to_coerce(expr, target));
-			return self.body.set_ty(expr, TypeIndex::ERROR);
-		};
-		let def = &self.cx.defs.typesets[usize::from(*typeset)];
-		let typeset_name = self
-			.cx
-			.strings
-			.resolve(
-				self.cx.defs.traits[usize::from(def.trait_index)].name.inner,
-			)
-			.unwrap();
-		let member_name = self.cx.type_formatter().display_type(member.inner);
-		self.cx.diagnostics.push(
-			Diagnostic::error()
-				.with_code(DiagnosticCode::TypesetBoundViolation.code())
-				.with_message(format!(
-					"literal is not representable by every member of typeset `{typeset_name}`"
-				))
-				.with_label(
-					Label::primary(self.scope.file_id, self.body.span(expr))
-						.with_message(format!(
-							"cannot be represented by `{member_name}`"
-						)),
-				)
-				.with_label(
-					SourceSpan::new(def.file_id, member.span)
-						.secondary_label()
-						.with_message(format!(
-							"`{member_name}` is a member here"
-						)),
-				),
-		);
+	/// Reports `diagnostic` about `expr` and leaves `expr` at `ERROR`, so
+	/// nothing reports it again.
+	fn reject(&mut self, expr: ExprIdx, diagnostic: Diagnostic<FileId>) {
+		self.cx.diagnostics.push(diagnostic);
 		self.body.set_ty(expr, TypeIndex::ERROR);
 	}
 
-	fn report_out_of_range(
-		&mut self,
-		expr: ExprIdx,
-		value: i128,
-		ty: TypeIndex,
-	) {
-		let message = format!(
-			"literal `{value}` out of range for `{}`",
-			self.cx.type_formatter().display_type(ty)
-		);
-		self.push_error(
-			DiagnosticCode::IntegerLiteralOutOfRange,
-			message,
-			expr,
-		);
-	}
-
-	/// A string or array literal is static data: it becomes a shared array
-	/// of its length or a shared slice, in whatever memory `target` names,
-	/// abstract ones included. The data is read-only, so an exclusive pointer
-	/// is not one it can become. A string's elements are bytes; an array
-	/// literal's are checked against the target's element type. A repeat's
-	/// count is a length in the memory, of its `Size`, and an integer literal
-	/// or a constant, since static data is laid out before the program runs.
+	/// Places a string or array literal, data in no memory: it becomes a
+	/// shared pointer to an array of its length or to a slice, in whatever
+	/// memory `target` names, abstract ones included. The data is read-only,
+	/// so an exclusive pointer is not one it can become. In a constant's
+	/// type it stays in no memory, as the array `target` is. A string's
+	/// elements are bytes; an array literal's are checked against the
+	/// target's element type. Placed, a repeat's count is a length in the
+	/// memory, of its `Size`.
 	fn coerce_static(&mut self, expr: ExprIdx, target: TypeIndex) {
+		let Type::Array { length, .. } =
+			*self.cx.types.resolve(self.body.ty(expr))
+		else {
+			unreachable!("a literal is an array")
+		};
 		// Only an array's length can be left to the literal.
 		let parts = self.static_target(target);
-		let known = parts.is_some_and(|(of, memory, _)| {
-			!self.cx.types.has_infer(of) && !self.cx.types.has_infer(memory)
+		let known = parts.is_some_and(|parts| {
+			!self.cx.types.has_infer(parts.of)
+				&& parts
+					.memory
+					.is_none_or(|memory| !self.cx.types.has_infer(memory))
 		});
 		if self.cx.types.has_infer(target) && !known {
 			self.report_annotation_required(expr);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
 		let kind = self.body.kind(expr);
-		let fits = parts.filter(|&(of, ..)| {
-			!matches!(kind, ExprKind::String(_)) || of == TypeIndex::U8
+		let fits = parts.filter(|parts| {
+			!matches!(kind, ExprKind::String(_)) || parts.of == TypeIndex::U8
 		});
-		let Some((of, memory, target_length)) = fits else {
+		let Some(parts) = fits else {
 			let note = match kind {
 				ExprKind::String(_) => STRING_TARGETS_NOTE,
 				_ => ARRAY_TARGETS_NOTE,
@@ -2359,88 +2716,100 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			self.cx.diagnostics.push(diagnostic);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		};
-		// The literal's length as a type: a `Value`, or the `Const` a
-		// repeat's count names, compared with the target's once it has one.
-		let length = match kind {
-			ExprKind::String(contents) => {
-				let length = self.cx.strings.resolve(contents).unwrap().len();
-				let bits = u64::try_from(length).unwrap();
-				Some(self.cx.types.intern(Type::Value { bits }))
-			}
+		match kind {
+			ExprKind::String(_) => {}
 			ExprKind::Array { elements } => {
 				for at in 0..elements.len() {
 					let element = self.body.args(elements)[at];
-					self.expect(element, of);
-				}
-				let bits = u64::try_from(elements.len()).unwrap();
-				Some(self.cx.types.intern(Type::Value { bits }))
-			}
-			// `[value; _]` is as long as the array it becomes.
-			ExprKind::ArrayRepeat { value, count: None } => {
-				self.expect(value, of);
-				match target_length {
-					Some(length) if length != TypeIndex::INFER => {
-						return self.body.set_ty(expr, target);
-					}
-					_ => {
-						self.report_annotation_required(expr);
-						return self.body.set_ty(expr, TypeIndex::ERROR);
-					}
+					self.expect(element, parts.of);
 				}
 			}
-			ExprKind::ArrayRepeat {
-				value,
-				count: Some(count),
-			} => {
-				self.expect(value, of);
-				let length_type = self.memory_size(memory);
-				self.expect(count, length_type);
-				match self.body.kind(count) {
-					_ if self.body.ty(count) == TypeIndex::ERROR => None,
-					ExprKind::Int(bits) => {
-						Some(self.cx.types.intern(Type::Value { bits }))
-					}
-					ExprKind::Const {
-						constant,
-						type_args,
-					} if type_args.is_empty() => {
-						Some(self.cx.types.intern_const(constant, &[]))
-					}
-					// An impl's constant may depend on the impl's arguments,
-					// which evaluation does not substitute (yet).
-					ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
-						let span = self.body.span(count);
-						self.report_unsupported(
-							span,
-							"a repeat count of a generic constant",
-						);
-						return self.body.set_ty(expr, TypeIndex::ERROR);
-					}
-					_ => {
-						self.push_error(
-							DiagnosticCode::ArrayRepeatCountNotConst,
-							"an array's length is a literal or a constant"
-								.to_string(),
-							count,
-						);
-						return self.body.set_ty(expr, TypeIndex::ERROR);
-					}
+			ExprKind::ArrayRepeat { value, count } => {
+				self.expect(value, parts.of);
+				if let (Some(count), Some(memory)) = (count, parts.memory) {
+					let length_type = self.memory_size(memory);
+					self.expect(count, length_type);
+				}
+				// `[value; _]` is as long as the array it becomes.
+				if count.is_none() {
+					return match parts.length {
+						Some(length) if length != TypeIndex::INFER => {
+							self.body.set_ty(expr, target)
+						}
+						_ => {
+							self.report_annotation_required(expr);
+							self.body.set_ty(expr, TypeIndex::ERROR)
+						}
+					};
 				}
 			}
 			_ => unreachable!("only static data is coerced as static data"),
-		};
-		let (Some(target_length), Some(length)) = (target_length, length)
+		}
+		self.set_static_type(expr, target, parts, length);
+	}
+
+	/// Places the constant `expr` names, which holds data in no memory (an
+	/// array): each use is its own copy, in the memory `target` names, as a
+	/// literal is. Its element type is the target's. An array `target` (a
+	/// constant's type) keeps it in no memory.
+	fn place_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
+		let Type::Array { of: actual, length } =
+			*self.cx.types.resolve(self.body.ty(expr))
 		else {
+			self.cx
+				.diagnostics
+				.push(self.report_unable_to_coerce(expr, target));
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		};
+		let Some(parts) = self.static_target(target) else {
+			let diagnostic = self
+				.report_unable_to_coerce(expr, target)
+				.with_note(ARRAY_TARGETS_NOTE);
+			self.cx.diagnostics.push(diagnostic);
+			return self.body.set_ty(expr, TypeIndex::ERROR);
+		};
+		let span = self.body.span(expr);
+		match self.equality(
+			parts.of,
+			actual,
+			RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+			span,
+		) {
+			Ok(TypeEquality::Equal | TypeEquality::NeedsValues) => {}
+			Ok(TypeEquality::Diff) => {
+				return self.report_mismatch(expr, target);
+			}
+			Err(()) => return self.body.set_ty(expr, TypeIndex::ERROR),
+		}
+		self.set_static_type(expr, target, parts, length);
+		if parts.memory.is_some() {
+			self.body.push_static(expr);
+		}
+	}
+
+	/// Gives static data `expr` of length `length` the type `target`, whose
+	/// `parts` are as `static_target` reads them: a written `_` takes the
+	/// data's length, and any other length must be the data's.
+	fn set_static_type(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		parts: StaticTarget,
+		length: TypeIndex,
+	) {
+		let Some(target_length) = parts.length else {
 			return self.body.set_ty(expr, target);
 		};
-		// A written `_` takes the literal's length.
 		if target_length == TypeIndex::INFER {
-			let ty = self.cx.types.intern(Type::Array {
-				of,
-				length,
-				memory,
-				ownership: Ownership::Shared,
-			});
+			let of = parts.of;
+			let mut ty = self.cx.types.intern(Type::Array { of, length });
+			if let Some(memory) = parts.memory {
+				ty = self.cx.types.intern(Type::Pointer {
+					to: ty,
+					memory,
+					ownership: Ownership::Shared,
+				});
+			}
 			return self.body.set_ty(expr, ty);
 		}
 		self.body.set_ty(expr, target);
@@ -2456,7 +2825,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		target: TypeIndex,
 		length: TypeIndex,
 	) {
-		let Some((_, _, Some(target_length))) = self.static_target(target)
+		let Some(StaticTarget {
+			length: Some(target_length),
+			..
+		}) = self.static_target(target)
 		else {
 			unreachable!("a literal with a length becomes an array")
 		};
@@ -2482,11 +2854,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		target: TypeIndex,
 		length: TypeIndex,
 	) {
-		let Some((_, _, Some(target_length))) = self.static_target(target)
+		let Some(StaticTarget {
+			length: Some(target_length),
+			..
+		}) = self.static_target(target)
 		else {
 			unreachable!("a literal with a length becomes an array")
 		};
-		let scope = self.scope.env;
+		let scope = self.scope.assumption_env;
 		let target_now = self.cx.normalize(
 			scope,
 			target_length,
@@ -2518,6 +2893,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ExprKind::String(_) => {
 				format!("this string literal is {length} bytes long")
 			}
+			ExprKind::Const { .. } => {
+				format!("this constant holds {length} elements")
+			}
 			_ => format!("this array literal has {length} elements"),
 		};
 		self.push_error(
@@ -2527,41 +2905,48 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		);
 	}
 
-	/// The element type, memory and length (`None` for a slice) of a shared
-	/// array or slice: what a string or array literal can become.
-	pub(super) fn static_target(
-		&self,
-		target: TypeIndex,
-	) -> Option<(TypeIndex, TypeIndex, Option<TypeIndex>)> {
-		match *self.cx.types.resolve(target) {
-			Type::Array {
-				of,
-				memory,
-				length,
-				ownership: Ownership::Shared,
-			} => Some((of, memory, Some(length))),
-			Type::Slice {
-				of,
+	/// What a string or array literal can become, read off `target`: a
+	/// shared pointer to an array or a slice, or an array in no memory (a
+	/// constant's type).
+	fn static_target(&self, target: TypeIndex) -> Option<StaticTarget> {
+		let (to, memory) = match *self.cx.types.resolve(target) {
+			Type::Pointer {
+				to,
 				memory,
 				ownership: Ownership::Shared,
-			} => Some((of, memory, None)),
+			} => (to, Some(memory)),
+			_ => (target, None),
+		};
+		match *self.cx.types.resolve(to) {
+			Type::Array { of, length } => Some(StaticTarget {
+				of,
+				memory,
+				length: Some(length),
+			}),
+			Type::Slice { of } if memory.is_some() => Some(StaticTarget {
+				of,
+				memory,
+				length: None,
+			}),
 			_ => None,
 		}
 	}
 
 	/// An operator applied to an untyped string or array literal, which has
-	/// no operators of its own; typed, it has its slice's or array's.
+	/// no operators of its own; placed, a pointer to it has its slice's or
+	/// array's methods.
 	fn report_operator_on_literal(
 		&mut self,
 		op: &str,
 		operand: ExprIdx,
 		span: TextSpan,
 	) -> ExprIdx {
-		let (noun, note) = if self.body.ty(operand) == TypeIndex::STRING_LITERAL
-		{
-			("a string literal", STRING_TARGETS_NOTE)
-		} else {
-			("an array literal", ARRAY_TARGETS_NOTE)
+		let (noun, note) = match self.body.kind(operand) {
+			ExprKind::String(_) => ("a string literal", STRING_TARGETS_NOTE),
+			ExprKind::Array { .. } | ExprKind::ArrayRepeat { .. } => {
+				("an array literal", ARRAY_TARGETS_NOTE)
+			}
+			_ => ("data in no memory", ARRAY_TARGETS_NOTE),
 		};
 		self.cx.diagnostics.push(
 			Diagnostic::error()
@@ -2636,12 +3021,24 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 }
 
-/// What a string literal can become, for the notes that reject one.
-pub(super) const STRING_TARGETS_NOTE: &str = "a string literal is a shared \
-	byte slice or byte array in a memory: `heap::&[u8]` or `heap::&[u8; N]`";
+/// What a string or array literal can become (`static_target`).
+#[derive(Clone, Copy)]
+struct StaticTarget {
+	/// The element type.
+	of: TypeIndex,
+	/// The memory it is placed in; `None` for an array in no memory.
+	memory: Option<TypeIndex>,
+	/// The length; `None` for a slice.
+	length: Option<TypeIndex>,
+}
 
-pub(super) const ARRAY_TARGETS_NOTE: &str = "an array literal is a shared \
-	array or slice in a memory: `heap::&[T; N]` or `heap::&[T]`";
+/// What a string literal can become, for the notes that reject one.
+pub(super) const STRING_TARGETS_NOTE: &str = "a string literal is placed in \
+	a memory as a shared byte slice or byte array: `heap::&[u8]` or \
+	`heap::&[u8; N]`";
+
+pub(super) const ARRAY_TARGETS_NOTE: &str = "an array literal is placed in a \
+	memory as a shared array or slice: `heap::&[T; N]` or `heap::&[T]`";
 
 /// The method an operator dispatches to, with its type arguments.
 #[derive(Clone, Copy)]
@@ -2649,13 +3046,13 @@ enum SelectedMethod {
 	/// The selected impl's own method, called directly.
 	Concrete {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// The trait's declaration, whose impl is selected once the receiver is
 	/// known.
 	Abstract {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 }
 
@@ -2672,126 +3069,6 @@ enum ValuePath<'s> {
 enum Arguments<'e> {
 	Positional(&'e [ast::Separated<Spanned<ast::Expression>>]),
 	Named(&'e [ast::Separated<Spanned<ast::NamedArgument>>]),
-}
-
-/// A type a literal must fit, and where the requirement comes from.
-enum LiteralTarget {
-	/// The target type itself.
-	Target(TypeIndex),
-	/// A member of a typeset an abstract target assumes: the typeset, to name
-	/// it, and the member's written type, for its place in a diagnostic.
-	TypesetMember(TypesetIdx, Spanned<TypeIndex>),
-}
-
-impl LiteralTarget {
-	/// The candidate type. `Integer::from_type` or `Float::from_type` narrows
-	/// it when the check wants one; a typeset member need be neither.
-	fn ty(&self) -> TypeIndex {
-		match self {
-			LiteralTarget::Target(ty) => *ty,
-			LiteralTarget::TypesetMember(_, member) => member.inner,
-		}
-	}
-
-	/// Whether an integer literal (`value`, optionally negated) fits.
-	fn fits_int(&self, value: u64, negated: bool) -> bool {
-		let ty = self.ty();
-		if let Some(integer) = Integer::from_type(ty) {
-			integer.in_range(value, negated)
-		} else if let Some(float) = Float::from_type(ty) {
-			float.exact_precision_int(value)
-		} else {
-			false
-		}
-	}
-
-	/// Whether a float literal written `text` fits, and its value when it does.
-	fn fits_float(&self, text: &str) -> FloatFit {
-		let Some(float) = Float::from_type(self.ty()) else {
-			return FloatFit::NotFloat;
-		};
-		let result = match float {
-			Float::F32 => text
-				.parse::<f32>()
-				// f64::from is a lossless conversion
-				.map(f64::from),
-			Float::F64 => text.parse::<f64>(),
-		};
-		match result {
-			Ok(parsed) if parsed.is_infinite() => FloatFit::Overflow,
-			Ok(parsed)
-				if parsed == 0.0
-					&& text
-						.bytes()
-						.any(|b| b.is_ascii_digit() && b != b'0') =>
-			{
-				FloatFit::Underflow
-			}
-			Ok(parsed) => FloatFit::Fits(parsed),
-			Err(_) => FloatFit::Invalid,
-		}
-	}
-
-	/// Whether `op` means anything over a literal of this candidate's type.
-	fn fits_unary(&self, op: UnaryOp) -> bool {
-		let ty = self.ty();
-		match op {
-			UnaryOp::InvertSign => {
-				Integer::from_type(ty).is_some_and(Integer::is_signed)
-					|| Float::from_type(ty).is_some()
-			}
-			UnaryOp::BitNot => Integer::from_type(ty).is_some(),
-			UnaryOp::Not => false,
-		}
-	}
-
-	/// Whether a literal of this candidate's type is a float.
-	fn is_float(&self) -> bool {
-		Float::from_type(self.ty()).is_some()
-	}
-}
-
-/// How a float literal fares against one candidate.
-enum FloatFit {
-	/// It parses and is representable at the candidate's width, at this value.
-	Fits(f64),
-	/// The text is not a float; the parser has already reported it.
-	Invalid,
-	/// It parses to infinity at the candidate's width.
-	Overflow,
-	/// It is nonzero in text but rounds to zero at the candidate's width.
-	Underflow,
-	/// The candidate is not a float type.
-	NotFloat,
-}
-
-#[derive(Clone, Copy)]
-enum Float {
-	F32,
-	F64,
-}
-
-impl Float {
-	fn from_type(ty: TypeIndex) -> Option<Self> {
-		Some(match ty {
-			TypeIndex::F32 => Self::F32,
-			TypeIndex::F64 => Self::F64,
-			_ => return None,
-		})
-	}
-
-	fn mantissa_bits(self) -> u32 {
-		match self {
-			Self::F32 => 24,
-			Self::F64 => 53,
-		}
-	}
-
-	fn exact_precision_int(self, value: u64) -> bool {
-		value == 0
-			|| 64 - value.leading_zeros() - value.trailing_zeros()
-				<= self.mantissa_bits()
-	}
 }
 
 #[cfg(test)]
@@ -2812,18 +3089,16 @@ mod tests {
 	use super::super::resolutions::{NameResolutions, Referent};
 	use super::super::signatures::TypeContext;
 	use super::super::solver::{NormalizationDepth, RewriteFlags, Solver};
-	use super::super::types::{Type, TypeEnvIdx, TypeIndex};
+	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
 	use crate::vfs::{self, FileId, Files};
 
-	const STDLIB: &str = include_str!("../../std/main.wx");
-
 	/// `test_case!(case = "source")` declares the graph, the inputs and the
 	/// swept `TestCase` borrowing them as three locals of the calling test.
-	/// The test's items are appended to the real stdlib, so operators,
-	/// memories and globals are checked against its actual traits.
+	/// The source is a binary over the real stdlib, so operators, memories
+	/// and globals are checked against its actual traits.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut graph = source_graph($source);
@@ -2839,18 +3114,18 @@ mod tests {
 
 	fn source_graph(source: &str) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
 						"main.wx".to_string(),
-						format!("{STDLIB}\n{source}"),
+						source.to_string(),
 					)]),
 				),
 			)
 			.unwrap();
-		builder.set_stdlib(root_id);
 		let graph = builder.build(root_id);
 		DiagnosticView::new(
 			"parse",
@@ -2944,12 +3219,14 @@ mod tests {
 			context.sweep();
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
-			let stdlib_end = STDLIB.len() as u32;
+			let root_file = defs
+				.namespaces
+				.file_id(Scope::Package(defs.root_package).into());
 			context.diagnostics.retain(|diagnostic| {
-				let in_stdlib =
-					diagnostic.labels.first().is_some_and(|label| {
-						(label.range.start as u32) < stdlib_end
-					});
+				let in_stdlib = diagnostic
+					.labels
+					.first()
+					.is_some_and(|label| label.file_id != root_file);
 				!(in_stdlib
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
@@ -2997,8 +3274,8 @@ mod tests {
 			let DefKind::Function(index) = self.resolve(name) else {
 				panic!("expected `{name}` to be a function");
 			};
-			self.context.function_bodies[usize::from(index)]
-				.as_ref()
+			self.context.function_implementations[usize::from(index)]
+				.body()
 				.expect("a function with a block has a body")
 		}
 
@@ -3010,12 +3287,15 @@ mod tests {
 				|&(index, function)| {
 					function.name.inner == symbol
 						&& !matches!(function.owner, MemberOwner::Free)
-						&& self.context.function_bodies[index].is_some()
+						&& self.context.function_implementations[index]
+							.body()
+							.is_some()
 				},
 			);
 			let (index, _) = found.next().unwrap();
 			assert!(found.next().is_none(), "`{name}` is declared twice");
-			let body = self.context.function_bodies[index].as_ref().unwrap();
+			let body =
+				self.context.function_implementations[index].body().unwrap();
 			self.render(body, body.root())
 		}
 
@@ -3129,6 +3409,10 @@ mod tests {
 				ExprKind::Local(local) => self.local_name(body, local),
 				ExprKind::Global(index) => {
 					name(self.defs.globals[usize::from(index)].name.inner)
+						.to_string()
+				}
+				ExprKind::Memory(index) => {
+					name(self.defs.memories[usize::from(index)].name.inner)
 						.to_string()
 				}
 				ExprKind::Function {
@@ -3430,6 +3714,11 @@ mod tests {
 					self.render_place(body, object),
 					self.field_name(body.place(object).ty, field)
 				),
+				PlaceKind::Element { object, index } => format!(
+					"([] {} {})",
+					self.render_place(body, object),
+					self.render(body, index)
+				),
 			}
 		}
 
@@ -3442,7 +3731,7 @@ mod tests {
 		fn constant_name(
 			&self,
 			index: super::ConstIdx,
-			type_args: super::TypeList,
+			type_args: super::GenericArgs,
 		) -> String {
 			let name = self.defs.constants[usize::from(index)].name.inner;
 			self.with_type_args(
@@ -3456,7 +3745,7 @@ mod tests {
 		fn callee(
 			&self,
 			index: super::FunctionIdx,
-			type_args: super::TypeList,
+			type_args: super::GenericArgs,
 		) -> String {
 			self.with_type_args(self.function_name(index), type_args)
 		}
@@ -3464,9 +3753,9 @@ mod tests {
 		fn with_type_args(
 			&self,
 			name: &str,
-			type_args: super::TypeList,
+			type_args: super::GenericArgs,
 		) -> String {
-			let type_args = self.context.types.list(type_args);
+			let type_args = self.context.generic_args.types(type_args);
 			if type_args.is_empty() {
 				return name.to_string();
 			}
@@ -3552,7 +3841,7 @@ mod tests {
 			.defs
 			.namespaces
 			.file_id(Scope::Package(case.defs.root_package).into());
-		let start = (STDLIB.len() + 1 + SOURCE.find("a + b").unwrap()) as u32;
+		let start = SOURCE.find("a + b").unwrap() as u32;
 		let site = (
 			crate::diagnostics::SourceSpan::new(
 				file_id,
@@ -3635,7 +3924,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_character_literal_is_a_char_or_an_integer_it_fits() {
+	fn a_character_literal_is_a_char_or_an_integer_that_represents_it() {
 		test_case!(
 			case = indoc! {"
 				func c() -> Char { 'a' }
@@ -3654,12 +3943,12 @@ mod tests {
 	}
 
 	#[test]
-	fn a_character_literal_must_fit_its_integer() {
+	fn a_character_literal_must_be_representable_as_its_integer() {
 		test_case!(case = "func f() -> u8 { '€' }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 		case.diagnostics()
-			.assert_error_saying("character literal '€' out of range for `u8`");
+			.assert_error_saying("literal '€' cannot be represented as `u8`");
 		test_case!(case = "func f<T: Integer>() -> T { '€' }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypesetBoundViolation]);
@@ -3684,19 +3973,19 @@ mod tests {
 	fn a_character_pattern_compares_an_integer_by_code_point() {
 		test_case!(
 			case = indoc! {"
-				func f(b: u8) -> u32 { match b { 'a' -> { 1 }, _ -> { 0 } } }
-				func g(c: Char) -> u32 { match c { 'a' -> { 1 }, _ -> { 0 } } }
+				func f(b: u8) -> u32 { match b { 'a' => { 1 }, _ => { 0 } } }
+				func g(c: Char) -> u32 { match c { 'a' => { 1 }, _ => { 0 } } }
 			"}
 		);
 		case.diagnostics().assert_none();
 		test_case!(
 			case =
-				"func f(b: u8) -> u32 { match b { '€' -> { 1 }, _ -> { 0 } } }"
+				"func f(b: u8) -> u32 { match b { '€' => { 1 }, _ => { 0 } } }"
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 		case.diagnostics()
-			.assert_error_saying("character literal '€' out of range for `u8`");
+			.assert_error_saying("literal '€' cannot be represented as `u8`");
 	}
 
 	#[test]
@@ -3914,7 +4203,7 @@ mod tests {
 	fn an_ascription_checks_its_value_against_its_type() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(t: T) -> T { t }
+				func id<T: StackValue>(t: T) -> T { t }
 				func literal() -> u8 { (5: u8) }
 				func inferred() { local x = id(5: u16); }
 				func elements() { local t = (1: u8, 2: u16); }
@@ -3972,8 +4261,7 @@ mod tests {
 			.defs
 			.namespaces
 			.file_id(Scope::Package(case.defs.root_package).into());
-		let start =
-			(STDLIB.len() + 1 + SOURCE.rfind(":outer").unwrap() + 1) as u32;
+		let start = (SOURCE.rfind(":outer").unwrap() + 1) as u32;
 		let site = (
 			crate::diagnostics::SourceSpan::new(
 				file_id,
@@ -4052,11 +4340,87 @@ mod tests {
 	}
 
 	#[test]
+	fn a_diverging_operand_takes_the_other_operands_type() {
+		test_case!(
+			case = indoc! {"
+				func stop() -> ! { loop {} }
+				func left(x: i32) -> i32 { stop() + x }
+				func right(x: i32) -> i32 { x + stop() }
+				func compare(x: i32) -> Bool { x == stop() }
+				func typed(x: u8) -> u8 { stop() + x }
+				func literal() -> i32 { stop() + 1 }
+				func nested() -> i32 { (stop() + 1) * 2 }
+				func both() -> i32 { stop() + stop() }
+				func takes(x: u8) -> u8 { x }
+				func argument() -> u8 { takes(stop() + 1) }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("left"), "i32");
+		assert_eq!(case.body_type("right"), "i32");
+		assert_eq!(case.body_type("compare"), "Bool");
+		assert_eq!(case.body_type("typed"), "u8");
+		assert_eq!(case.body_type("literal"), "i32");
+		assert_eq!(case.body_type("nested"), "i32");
+		assert_eq!(case.body_type("argument"), "u8");
+	}
+
+	#[test]
+	fn an_untyped_comparison_against_a_diverging_operand_needs_an_annotation() {
+		test_case!(
+			case = indoc! {"
+				func stop() -> ! { loop {} }
+				func left() -> Bool { stop() == 1 }
+				func right() -> Bool { 1 == stop() }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ComparisonTypeAnnotationRequired,
+			DiagnosticCode::ComparisonTypeAnnotationRequired,
+		]);
+	}
+
+	#[test]
+	fn a_diverging_operand_does_not_skip_literal_coercion() {
+		test_case!(
+			case =
+				"func stop() -> ! { loop {} } func f() -> u8 { stop() + 256 }"
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+	}
+
+	#[test]
+	fn a_diverging_operand_does_not_make_a_literal_operable() {
+		test_case!(
+			case = r#"func stop() -> ! { loop {} } func f() -> Bool { stop() == "x" }"#
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics()
+			.assert_error_saying("cannot apply `==` to a string literal");
+	}
+
+	#[test]
+	fn a_diverging_operand_makes_a_unary_expression_diverge() {
+		test_case!(
+			case = indoc! {"
+				func stop() -> ! { loop {} }
+				func negate() -> i32 { -stop() }
+				func logical() -> Bool { !stop() }
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("negate"), "!");
+		assert_eq!(case.body_type("logical"), "!");
+	}
+
+	#[test]
 	fn an_operator_call_carries_its_type_arguments() {
 		test_case!(
 			case = indoc! {"
 				struct W<T>(x: T);
-				impl<T> Add for W<T> { func add(self: Self, rhs: Self) -> Self { rhs } }
+				impl<T: StackValue> Add for W<T> { func add(self: Self, rhs: Self) -> Self { rhs } }
 				func concrete(w: W<u8>) -> W<u8> { w + w }
 				func generic<T: Add>(t: T) -> T { t + t }
 				func assigned(w: W<u8>) { local mut v = w; v += w; }
@@ -4165,7 +4529,7 @@ mod tests {
 				struct Node(value: u32, next: heap::*Node);
 				func read(p: heap::&Node) -> u32 { p.*.value }
 				func write(p: heap::*Node) { p.* = Node(1, p); p.*.value += 2; }
-				func address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
+				func value_address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
 				func next(p: heap::*Node) -> u32 { p.*.next.*.value }
 			"}
 		);
@@ -4175,7 +4539,10 @@ mod tests {
 			case.shape("write"),
 			"(block (store (* p#0) (Node 1 p#0)) (store += (. (* p#0) value) 2))"
 		);
-		assert_eq!(case.shape("address"), "(block => (.& (. (* p#0) value)))");
+		assert_eq!(
+			case.shape("value_address"),
+			"(block => (.& (. (* p#0) value)))"
+		);
 		assert_eq!(
 			case.shape("next"),
 			"(block => (load (. (* (load (. (* p#0) next))) value)))"
@@ -4223,8 +4590,8 @@ mod tests {
 				trait Number {}
 				impl Number for u32 {}
 				impl Number for i64 {}
-				func id<T>(x: T) -> T { x }
-				func zero<T: Number>() -> T { loop {} }
+				func id<T: StackValue>(x: T) -> T { x }
+				func zero<T: StackValue + Number>() -> T { loop {} }
 				func from_argument(a: u16) -> u16 { id(a) }
 				func from_expected() -> u8 { id(1) }
 				func from_turbofish() { local x = zero::<i64>(); }
@@ -4247,7 +4614,7 @@ mod tests {
 	fn a_function_is_a_value_of_its_own_type() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func f() { local g = id::<u8>; local h = id; }
 			"}
 		);
@@ -4260,7 +4627,7 @@ mod tests {
 	fn a_function_item_held_in_a_value_is_called_through_call() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func pair(a: u8, b: u16) {}
 				func positional() -> u8 { local g = id::<u8>; g(1) }
 				func named() { local g = pair; g({ b: 2, a: 1 }); }
@@ -4269,8 +4636,8 @@ mod tests {
 				struct V(x: u32);
 				impl V { func area(self: Self, k: u32) -> u32 { k } }
 				func method(v: V) -> u32 { local m = V::area; m({ k: 1, self: v }) }
-				trait Make { func make(n: u32) -> Self; }
-				func declared<T: Make>() -> T { local g = T::make; g(1) }
+				trait Make: StackValue { func make(n: u32) -> Self; }
+				func declared<T: StackValue + Make>() -> T { local g = T::make; g(1) }
 			"}
 		);
 		case.diagnostics()
@@ -4385,7 +4752,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func g(p: (u8, u16)) {}
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func unit(x: ()) {}
 				struct W(x: (u8, u16));
 				struct V();
@@ -4501,7 +4868,7 @@ mod tests {
 	fn a_function_item_is_not_a_function_reference() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func f() { local g: func(u8) -> u8 = id; }
 			"}
 		);
@@ -4592,12 +4959,12 @@ mod tests {
 	fn an_expected_item_type_gives_a_function_value_its_arguments() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				func take(g: id<u8>) {}
 				func annotated() { local g: id<u8> = id; }
 				func argument() { take(id); }
 				func returned() -> id<u16> { id }
-				func generic<T>() { local g: id<T> = id; }
+				func generic<T: StackValue>() { local g: id<T> = id; }
 				func other() { local g: id<u8> = take; }
 			"}
 		);
@@ -4720,6 +5087,52 @@ mod tests {
 			DiagnosticCode::ArrayRepeatCountNotConst,
 			DiagnosticCode::TypeAnnotationRequired,
 			DiagnosticCode::TraitBoundViolation,
+		]);
+	}
+
+	/// A literal's elements are constant expressions: a local of the function
+	/// is found (it still shadows an item) and reported, and a local declared
+	/// inside the literal is the evaluator's to reject, with the block holding
+	/// it.
+	#[test]
+	fn a_local_cannot_be_used_in_static_data() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const x: u8 = 5;
+				func param(x: u8) -> heap::&[u8] { [x, 1] }
+				func declared() -> heap::&[u8] { local y: u8 = 1; [y] }
+				func inner() -> heap::&[u8] { [block { local z: u8 = 1; z }] }
+				func outside(x: u8) -> heap::&[u8; 2] { [0; 2] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::LocalInStaticData,
+			DiagnosticCode::LocalInStaticData,
+			DiagnosticCode::NotConstEvaluatable,
+		]);
+	}
+
+	/// A function's static data is evaluated when the function is checked, so
+	/// what fails in it is reported by `wx check`; a generic function's is
+	/// evaluated per instance, where it is lowered.
+	#[test]
+	fn static_data_is_evaluated_when_its_function_is_checked() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func one() -> u8 { 1 }
+				func call() -> heap::&[u8] { [one(), 1] }
+				func overflow() -> heap::&[u8] { [200 + 100] }
+				func nested() -> heap::&[heap::&[u8]] { [[one()]] }
+				func generic<T>() -> heap::&[u8] { [one()] }
+				func fine() -> heap::&[u16] { [1, 2 + 3, 4] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotConstEvaluatable,
+			DiagnosticCode::ConstEvaluationFailed,
+			DiagnosticCode::NotConstEvaluatable,
 		]);
 	}
 
@@ -4857,6 +5270,482 @@ mod tests {
 	}
 
 	#[test]
+	fn a_constant_value_in_a_bound_is_not_checked_yet() {
+		// Representability (`const LEN: u8`) is a clause; a value (`const LEN =
+		// 4`) is not supported yet.
+		test_case!(
+			case = indoc! {r#"
+				func g<A: Array where { const LEN: u8 }, B: Array where { const LEN = 4 }>() {}
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
+	}
+
+	#[test]
+	fn an_abstract_constant_is_representable_as_what_a_bound_says() {
+		// `u8` gives `u16`, not `i8`.
+		test_case!(
+			case = indoc! {r#"
+				func f<A: Array where { const LEN: u8 }>() -> u8 { A::LEN }
+				func wider<A: Array where { const LEN: u8 }>() -> u16 { A::LEN }
+				func signed<A: Array where { const LEN: u8 }>() -> i8 { A::LEN }
+				func none<A: Array>() -> u8 { A::LEN }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnrepresentableConstant,
+			DiagnosticCode::UnrepresentableConstant,
+		]);
+		case.diagnostics().assert_error_saying(
+			"constant `<A as Array>::LEN` cannot be represented as `i8`",
+		);
+		case.diagnostics().assert_error_saying(
+			"constant `<A as Array>::LEN` cannot be represented as `u8`",
+		);
+	}
+
+	#[test]
+	fn representability_is_proved_at_a_call() {
+		test_case!(
+			case = indoc! {r#"
+				func f<A: Array where { const LEN: u8 }>() {}
+				func representable() { f::<[u16; 255]>() }
+				func overflows() { f::<[u16; 256]>() }
+				func implied<B: Array where { const LEN: u8 }>() { f::<B>() }
+				func wider<B: Array where { const LEN: u16 }>() { f::<B>() }
+				func unstated<B: Array>() { f::<B>() }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnrepresentableConstant,
+			DiagnosticCode::UnrepresentableConstant,
+			DiagnosticCode::UnrepresentableConstant,
+		]);
+		case.diagnostics().assert_error_saying(
+			"constant `<[u16; 256] as Array>::LEN` cannot be represented as `u8`",
+		);
+	}
+
+	#[test]
+	fn representability_as_a_memory_size_is_read_through_its_typesets() {
+		// `M::Size` is `u32` or `u64`: it gives `u32`, not `u16`, and `u8`
+		// gives it.
+		test_case!(
+			case = indoc! {r#"
+				func f<M: Memory, A: Array where { const LEN: M::Size }>() -> M::Size { A::LEN }
+				func narrow<M: Memory, A: Array where { const LEN: M::Size }>() -> u32 { A::LEN }
+				func narrower<M: Memory, A: Array where { const LEN: M::Size }>() -> u16 { A::LEN }
+				func small<M: Memory, A: Array where { const LEN: u8 }>() -> M::Size { A::LEN }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnrepresentableConstant]);
+		case.diagnostics().assert_error_saying(
+			"constant `<A as Array>::LEN` cannot be represented as `u16`",
+		);
+	}
+
+	#[test]
+	fn representability_is_inherited_from_a_supertraits_bound() {
+		test_case!(
+			case = indoc! {r#"
+				trait Small: Array where { const LEN: u8 } {}
+				func f<A: Small>() -> u8 { A::LEN }
+				func g<A: Small>() -> i8 { A::LEN }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnrepresentableConstant]);
+	}
+
+	#[test]
+	fn a_bound_states_representability_of_an_untyped_constant_only() {
+		test_case!(
+			case = indoc! {r#"
+				trait Sized { const SIZE: u32; type Item; const FIRST: Self::Item; }
+				func typed<T: Sized where { const SIZE: u8 }>() {}
+				func projected<T: Sized where { const FIRST: u8 }>() {}
+				func untyped<A: Array where { const LEN: u8 }>() {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypedConstantBound,
+			DiagnosticCode::TypedConstantBound,
+		]);
+		case.diagnostics().assert_error_saying(
+			"constant `SIZE` has a type, so a bound cannot state what it is \
+			 representable as",
+		);
+	}
+
+	#[test]
+	fn a_trait_function_bounding_self_assumes_it_in_its_body() {
+		// `Self` written first is no parameter: `f` takes one argument.
+		test_case!(
+			case = indoc! {r#"
+				trait Show: StackValue { func show(self: Self); }
+				trait Tr: StackValue {
+					func f<Self: Show, T: StackValue>(self: Self, t: T) { self.show() }
+					func g<Self: Show>(self: Self) { self.show() }
+				}
+				func call<X: StackValue + Tr + Show>(x: X) { x.f::<u8>(1); x.g() }
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_call_proves_what_a_trait_function_requires_of_self() {
+		test_case!(
+			case = indoc! {r#"
+				trait Show: StackValue { func show(self: Self); }
+				trait Tr: StackValue {
+					func f<Self: Show>(self: Self) { self.show() }
+				}
+				struct A();
+				impl Tr for A {}
+				struct B();
+				impl Show for B { func show(self: Self) {} }
+				impl Tr for B {}
+				func concrete(a: A, b: B) { a.f(); b.f() }
+				func generic<X: StackValue + Tr>(x: X) { x.f() }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `A: Show` is not satisfied");
+		case.diagnostics()
+			.assert_error_saying("the trait bound `X: Show` is not satisfied");
+	}
+
+	#[test]
+	fn a_bound_is_reported_where_its_argument_is_given() {
+		let source = indoc! {r#"
+			trait Show { func show(self: Self); }
+			trait Tr { func f<Self: Show>(self: Self) {} }
+			struct A();
+			impl Tr for A {}
+			func g<T: Show, U: Show>(t: T, u: U) {}
+			func h<T: Show>() {}
+			func calls(first: A, second: A, third: A) {
+				g(first, second);
+				h::<A>();
+				third.f()
+			}
+		"#};
+		test_case!(case = source);
+		case.diagnostics().print();
+		let at: Vec<&str> = case
+			.context
+			.diagnostics
+			.iter()
+			.filter(|diagnostic| {
+				diagnostic.code.as_deref()
+					== Some(DiagnosticCode::TraitBoundViolation.code())
+			})
+			.map(|diagnostic| &source[diagnostic.labels[0].range.clone()])
+			.collect();
+		assert_eq!(at, ["first", "second", "A", "third"]);
+	}
+
+	#[test]
+	fn self_is_bounded_only_first_in_a_trait_function() {
+		test_case!(
+			case = indoc! {r#"
+				trait Show {}
+				trait Tr: StackValue {
+					func late<T: StackValue, Self: Show>(t: T);
+					func f(self: Self);
+				}
+				struct S<Self>(u8);
+				func free<Self: Show>() {}
+				impl S { func inherent<Self: Show>() {} }
+				impl Tr for S {
+					func late<T: StackValue>(t: T) {}
+					func f(self: Self) {}
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedSelfBound,
+			DiagnosticCode::MisplacedSelfBound,
+			DiagnosticCode::MisplacedSelfBound,
+			DiagnosticCode::MisplacedSelfBound,
+		]);
+	}
+
+	/// What the trait impls below share: `Container::show_all` requires its
+	/// items to be shown, `Wrap<T>`'s items are `T`.
+	const SHOWN_ITEMS: &str = indoc! {r#"
+		trait Show: StackValue { func show(self: Self); }
+		trait Container: StackValue {
+			type Item;
+			func show_all<Self: Container where { Item: Show }>(self: Self);
+		}
+		struct Wrap<T>(inner: T);
+	"#};
+
+	#[test]
+	fn a_trait_impl_function_assumes_what_its_self_entry_means() {
+		// `<Wrap<T> as Container>::Item: Show` means `T: Show` in the impl.
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					impl<T: StackValue> Container for Wrap<T> {
+						type Item = T;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {
+							self.inner.show()
+						}
+					}
+				"#}
+			)
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn without_its_self_entry_a_trait_impl_function_assumes_nothing() {
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					impl<T: StackValue> Container for Wrap<T> {
+						type Item = T;
+						func show_all(self: Self) { self.inner.show() }
+					}
+				"#}
+			)
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MethodNotFound]);
+	}
+
+	#[test]
+	fn a_self_entry_reads_in_its_function_signature_checks() {
+		// `Shown<Self::Item>` needs `Item: Show`, which only the entry gives.
+		test_case!(
+			case = indoc! {r#"
+				trait Show: StackValue { func show(self: Self); }
+				struct Shown<X: Show>(x: X);
+				trait Container {
+					type Item;
+					func shown<Self: Container where { Item: Show }>(
+						item: Shown<Self::Item>,
+					);
+				}
+				struct Wrap<T>(inner: T);
+				impl<T> Container for Wrap<T> {
+					type Item = T;
+					func shown<Self: Container where { Item: Show }>(
+						item: Shown<Self::Item>,
+					) {}
+				}
+			"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_self_entry_about_a_concrete_item_is_proved_where_it_is_written() {
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					struct Bytes();
+					struct Text();
+					impl Show for Text { func show(self: Self) {} }
+					struct Bag();
+					impl Container for Bag {
+						type Item = Bytes;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+					struct Page();
+					impl Container for Page {
+						type Item = Text;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+				"#}
+			)
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `<Bag as Container>::Item: Show` is not satisfied",
+		);
+	}
+
+	#[test]
+	fn a_call_of_a_trait_impl_function_proves_its_self_entry() {
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					impl<T: StackValue> Container for Wrap<T> {
+						type Item = T;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {
+							self.inner.show()
+						}
+					}
+					struct No();
+					struct Yes();
+					impl Show for Yes { func show(self: Self) {} }
+					func calls(no: Wrap<No>, yes: Wrap<Yes>) {
+						no.show_all();
+						yes.show_all()
+					}
+				"#}
+			)
+		);
+		// Reported at the method for now; at the receiver, which gives
+		// `Self`, is 6d-3.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `<Wrap<No> as Container>::Item: Show` is not \
+			 satisfied",
+		);
+	}
+
+	#[test]
+	fn a_self_entry_assumes_only_about_an_abstract_type() {
+		// `Wrap2<T>: Show` would hold only if `T: Show`, which nothing reads
+		// from an assumption about `Wrap2<T>`; `Always<T>: Show` holds anyway.
+		test_case!(
+			case = &format!(
+				"{SHOWN_ITEMS}{}",
+				indoc! {r#"
+					struct Wrap2<T>(x: T);
+					impl<T: StackValue + Show> Show for Wrap2<T> { func show(self: Self) {} }
+					struct Always<T>(x: T);
+					impl<T: StackValue> Show for Always<T> { func show(self: Self) {} }
+					struct Nest<T>(inner: T);
+					impl<T: StackValue> Container for Nest<T> {
+						type Item = Wrap2<T>;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+					struct Keep<T>(inner: T);
+					impl<T: StackValue> Container for Keep<T> {
+						type Item = Always<T>;
+						func show_all<Self: Container where { Item: Show }>(
+							self: Self,
+						) {}
+					}
+				"#}
+			)
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
+		case.diagnostics().assert_error_saying(
+			"assuming `Wrap2<T>: Show` is not supported yet",
+		);
+	}
+
+	#[test]
+	fn a_self_entry_is_compared_with_its_declarations_meaning() {
+		// The declaration's entry, read with `Self` as `Wrap<T>`, means
+		// `T: Show`, which the impl's own entry asks no more than; asking
+		// for `Item: Eq` beside it is more than the trait does.
+		test_case!(
+			case = indoc! {r#"
+				trait Show: StackValue { func show(self: Self); }
+				trait Eq: StackValue { func eq(self: Self, other: Self); }
+				trait Container: StackValue {
+					type Item;
+					func pair<Self: Container where { Item: Show }, U: StackValue>(
+						self: Self,
+						u: U,
+					);
+					func single<Self: Container where { Item: Show }>(
+						self: Self,
+					);
+				}
+				struct Wrap<T>(inner: T);
+				impl<T: StackValue> Container for Wrap<T> {
+					type Item = T;
+					func pair<Self: Container where { Item: Show }, U: StackValue>(
+						self: Self,
+						u: U,
+					) {
+						self.inner.show()
+					}
+					func single<
+						Self: Container where { Item: Show + Eq },
+					>(self: Self) {}
+				}
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
+	}
+
+	#[test]
+	fn a_self_entry_equality_is_assumed_or_proved() {
+		let source = indoc! {r#"
+				trait Container: StackValue {
+					type Item;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					);
+				}
+				struct Bytes();
+				impl Container for Bytes {
+					type Item = u8;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					) {}
+				}
+				struct Words();
+				impl Container for Words {
+					type Item = u16;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					) {}
+				}
+				struct Any<T>(x: T);
+				impl<T: StackValue> Container for Any<T> {
+					type Item = T;
+					func of_bytes<Self: Container where { Item = u8 }>(
+						self: Self,
+					) {}
+				}
+			"#};
+		test_case!(case = source);
+		// `u8 == u8` holds, `u16 == u8` never does, and `T == u8` would be
+		// an assumption about a parameter's value. Each is reported at the
+		// equality itself.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::AssocTypeEqualityMismatch,
+			DiagnosticCode::UnassumableEquality,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`<Any<T> as Container>::Item` is `T`, which a bound cannot \
+			 require to be `u8`",
+		);
+		let at: Vec<&str> = case
+			.context
+			.diagnostics
+			.iter()
+			.map(|diagnostic| &source[diagnostic.labels[0].range.clone()])
+			.collect();
+		assert_eq!(at, ["Item = u8", "Item = u8"]);
+	}
+
+	#[test]
 	fn an_array_type_length_is_an_integer_literal_or_a_constant() {
 		test_case!(
 			case = indoc! {r#"
@@ -4936,21 +5825,21 @@ mod tests {
 				struct P();
 				impl Sized for P { const SIZE: u32 = 3; }
 				impl P { const OWN: u32 = 2; }
-				type A = heap::&[u8; 4];
+				type A = [u8; 4];
 				func of_param<T: Sized>(a: heap::&[u8; T::SIZE]) {
 					local b: heap::&[u8; T::SIZE] = a;
 				}
 				func of_impl(a: heap::&[u8; P::SIZE]) { local b: heap::&[u8; 3] = a; }
 				func inherent(a: heap::&[u8; P::OWN]) { local b: heap::&[u8; 2] = a; }
-				func of_array(a: heap::&[u8; A::SIZE]) { local b: heap::&[u8; 4] = a; }
+				func of_array(a: heap::&[u8; A::LEN]) { local b: heap::&[u8; 4] = a; }
 				func caller(a: heap::&[u8; 3]) { of_param::<P>(a); }
-				func in_memory<T: Array where { Mem = heap }>(a: heap::&[u8; T::SIZE]) {}
-				func call(x: heap::&[u8; 3]) { in_memory::<heap::&[u16; 3]>(x); }
-				func abstract<M: Memory, T: Array where { Mem = M }>(a: M::&[u8; T::SIZE]) {}
-				trait Takes { const K: u32; func f(self: Self, a: heap::&[u8; Self::K]); }
+				func of_array_len<T: Array>(a: heap::&[u8; T::LEN]) {}
+				func call(x: heap::&[u8; 3]) { of_array_len::<[u16; 3]>(x); }
+				func abstract<M: Memory, T: Array>(a: M::&[u8; T::LEN]) {}
+				trait Takes: StackValue { const K: u32; func f(self: Self, a: heap::&[u8; Self::K]); }
 				impl Takes for P { const K: u32 = 1; func f(self: Self, a: heap::&[u8; 1]) {} }
 				func qualified<T: Sized>(a: heap::&[u8; <T as Sized>::SIZE]) {}
-				func of_written(a: heap::&[u8; <heap::&[u8; 4]>::SIZE]) {
+				func of_written(a: heap::&[u8; <[u8; 4]>::LEN]) {
 					local b: heap::&[u8; 4] = a;
 				}
 				func counted() {
@@ -5090,7 +5979,10 @@ mod tests {
 	}
 
 	/// The scope and type of the first parameter of the function `name`.
-	fn first_param(case: &TestCase<'_>, name: &str) -> (TypeEnvIdx, TypeIndex) {
+	fn first_param(
+		case: &TestCase<'_>,
+		name: &str,
+	) -> (GenericEnvIdx, TypeIndex) {
 		let DefKind::Function(index) = case.resolve(name) else {
 			panic!("expected `{name}` to be a function");
 		};
@@ -5117,7 +6009,12 @@ mod tests {
 		let without_values = RewriteFlags::ALL.without(RewriteFlags::VALUES);
 		let mut normalize = |ty, facts| {
 			case.context
-				.normalize(scope, ty, NormalizationDepth::Deep, facts)
+				.normalize(
+					case.context.assumption_envs.of_frame(scope),
+					ty,
+					NormalizationDepth::Deep,
+					facts,
+				)
 				.unwrap()
 		};
 		// The two requests differ only in the facts, and neither is answered
@@ -5138,15 +6035,15 @@ mod tests {
 		test_case!(
 			case = indoc! {r#"
 				const PICK: u8 = match ON {
-					const YES -> { 1 },
-					const NO -> { 0 },
+					const YES => { 1 },
+					const NO => { 0 },
 				};
 				const ON: Bool = True;
 				const YES: Bool = True;
 				const NO: Bool = False;
 				const SIDE: u8 = match Side::Left {
-					Side::Left -> { 1 },
-					Side::Right -> { 2 },
+					Side::Left => { 1 },
+					Side::Right => { 2 },
 				};
 				enum Side(u8) { Left = 0, Right = 1 }
 			"#}
@@ -5160,7 +6057,7 @@ mod tests {
 	}
 
 	#[test]
-	fn an_array_length_in_an_abstract_memory_fits_every_size() {
+	fn an_array_length_in_an_abstract_memory_is_representable_as_every_size() {
 		test_case!(
 			case = indoc! {r#"
 				func short<M: Memory>(a: M::&[u8; 5]) {}
@@ -5290,7 +6187,7 @@ mod tests {
 	fn a_function_item_is_a_zero_sized_constant() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
+				func id<T: StackValue>(x: T) -> T { x }
 				const ID: id<u8> = id;
 				const AGAIN: id<u8> = ID;
 				func f() -> u8 { ID(1) }
@@ -5364,14 +6261,14 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				enum E(u8) { A = 0 }
-				impl E { pub func pick<T>(t: T) -> E { E::A } }
+				impl E { pub func pick<T: StackValue>(t: T) -> E { E::A } }
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func new(x: T) -> W<T> { W(x) }
 					pub func get(self: Self) -> T { loop {} }
 					func again(x: T) -> W<T> { Self::new(x) }
 				}
-				trait Make { func make() -> Self; }
+				trait Make: StackValue { func make() -> Self; }
 				struct P();
 				impl Make for P { func make() -> Self { P() } }
 				func inherent() -> E { E::pick(True) }
@@ -5394,13 +6291,13 @@ mod tests {
 	fn a_trait_declaration_is_called_with_its_receiver_as_self() {
 		test_case!(
 			case = indoc! {"
-				trait Make {
+				trait Make: StackValue {
 					func make() -> Self;
 					func zero() -> u32 { 0 }
 				}
 				struct P();
 				impl Make for P { func make() -> Self { P() } }
-				func abstract_receiver<T: Make>() -> T { T::make() }
+				func abstract_receiver<T: StackValue + Make>() -> T { T::make() }
 				func inherited_default() -> u32 { P::zero() }
 			"}
 		);
@@ -5419,15 +6316,15 @@ mod tests {
 	fn a_bracketed_root_names_the_receiver_and_maybe_its_trait() {
 		test_case!(
 			case = indoc! {"
-				trait Make { func make() -> Self; }
-				trait Other { func make() -> Self; }
+				trait Make: StackValue { func make() -> Self; }
+				trait Other: StackValue { func make() -> Self; }
 				struct P();
 				impl Make for P { func make() -> Self { P() } }
 				impl Other for P { func make() -> Self { P() } }
 				struct W<T>(x: T);
-				impl<T> W<T> { pub func new(x: T) -> W<T> { W(x) } }
+				impl<T: StackValue> W<T> { pub func new(x: T) -> W<T> { W(x) } }
 				func qualified() -> P { <P as Make>::make() }
-				func abstract_qualified<T: Make>() -> T { <T as Make>::make() }
+				func abstract_qualified<T: StackValue + Make>() -> T { <T as Make>::make() }
 				func grouped() -> W<u8> { <W<u8>>::new(1) }
 				func ambiguous() -> P { P::make() }
 				func not_implemented() -> Bool { <Bool as Make>::make() }
@@ -5474,7 +6371,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func new(x: T) -> W<T> { W(x) }
 					pub func empty() -> W<T> { loop {} }
 					pub func of<U>() -> W<T> { loop {} }
@@ -5512,7 +6409,7 @@ mod tests {
 				trait Small {}
 				impl Small for u8 {}
 				struct B<T>(x: T);
-				impl<T: Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
+				impl<T: StackValue + Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
 				func holds(a: u8) { local b = B::new(a); }
 				func violated() { local b = B::new(True); }
 			"}
@@ -5525,11 +6422,11 @@ mod tests {
 	fn a_wrong_type_argument_count_makes_that_frame_an_error() {
 		test_case!(
 			case = indoc! {"
-				func id<T>(x: T) -> T { x }
-				func pair<A, B>(a: A, b: B) {}
+				func id<T: StackValue>(x: T) -> T { x }
+				func pair<A: StackValue, B: StackValue>(a: A, b: B) {}
 				func plain() {}
 				struct W<T>(x: T);
-				impl<T> W<T> { func get(self: Self) -> T { local W(x) = self; x } }
+				impl<T: StackValue> W<T> { func get(self: Self) -> T { local W(x) = self; x } }
 				func too_many() { _ = id::<u8, u16>(1); }
 				func too_few() { pair::<u8>(1, 2); }
 				func own_none() { plain::<u8>(); }
@@ -5563,7 +6460,7 @@ mod tests {
 			case = indoc! {"
 				trait Small {}
 				impl Small for u8 {}
-				func take<T: Small>(x: T) {}
+				func take<T: StackValue + Small>(x: T) {}
 				func holds(a: u8) { local g = take::<u8>; g(a); }
 				func violated() { local g = take::<Bool>; g(True); }
 			"}
@@ -5577,12 +6474,12 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					func positional(x: T) -> W<T> { Self(x) }
 					func named(x: T) -> Self { Self({ x }) }
 				}
 				struct P();
-				trait Make { func make() -> Self; }
+				trait Make: StackValue { func make() -> Self; }
 				impl Make for P { func make() -> Self { Self() } }
 			"}
 		);
@@ -5605,7 +6502,7 @@ mod tests {
 				}
 				enum E(u8) { A = 0 }
 				impl E { func variant() -> E { Self(0) } }
-				trait Tr { func make() -> Self { Self() } }
+				trait Tr: StackValue { func make() -> Self { Self() } }
 				func free() { Self(); }
 			"}
 		);
@@ -5674,18 +6571,18 @@ mod tests {
 			case = indoc! {"
 				memory heap: u32;
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func get(self: Self) -> T { loop {} }
-					pub func map<U>(self: Self, u: U) -> W<U> { W(u) }
+					pub func map<U: StackValue>(self: Self, u: U) -> W<U> { W(u) }
 					pub func by_pointer(self: heap::*Self) -> T { loop {} }
 				}
-				trait Twice { func twice(self: Self) -> Self; }
+				trait Twice: StackValue { func twice(self: Self) -> Self; }
 				impl Twice for u8 { func twice(self: Self) -> Self { self } }
 				func inherent(w: W<u8>) -> u8 { w.get() }
 				func own_args(w: W<u8>) -> W<Bool> { w.map(True) }
 				func turbofish(w: W<u8>) -> W<u16> { w.map::<u16>(1) }
 				func trait_impl(a: u8) -> u8 { a.twice() }
-				func abstract_receiver<T: Twice>(t: T) -> T { t.twice() }
+				func abstract_receiver<T: StackValue + Twice>(t: T) -> T { t.twice() }
 				func pointer(p: heap::*W<u8>) -> u8 { p.by_pointer() }
 				func reverse(o: Ordering) -> Ordering { o.reverse() }
 			"}
@@ -5771,7 +6668,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(a: u32, b: i64) -> u32 { a }
-				func id<T>(value: T, flag: Bool) -> T { value }
+				func id<T: StackValue>(value: T, flag: Bool) -> T { value }
 				func by_name() -> u32 {
 					local a: u32 = 1;
 					f({ b: 2, a })
@@ -5818,7 +6715,7 @@ mod tests {
 	fn a_call_skips_an_impl_member_of_another_kind() {
 		test_case!(
 			case = indoc! {"
-				trait Size { func size(self: Self) -> u32 { 0 } }
+				trait Size: StackValue { func size(self: Self) -> u32 { 0 } }
 				struct S();
 				impl Size for S { const size: u32 = 1; }
 				func f(s: S) -> u32 { s.size() }
@@ -5865,7 +6762,7 @@ mod tests {
 	fn every_path_to_a_known_function_can_be_called_by_name() {
 		test_case!(
 			case = indoc! {"
-				trait Make {
+				trait Make: StackValue {
 					func make(value: u32, scale: u32) -> Self;
 				}
 				struct S(n: u32);
@@ -5879,13 +6776,13 @@ mod tests {
 					}
 				}
 				struct W<T>(x: T);
-				impl<T> W<T> {
+				impl<T: StackValue> W<T> {
 					pub func new(x: T, flag: Bool) -> W<T> { W(x) }
 				}
 				func qualified() -> S {
 					<S as Make>::make({ scale: 1, value: 2 })
 				}
-				func generic<T: Make>() -> T { T::make({ scale: 1, value: 2 }) }
+				func generic<T: StackValue + Make>() -> T { T::make({ scale: 1, value: 2 }) }
 				func learned(a: u8) -> W<u8> { W::new({ flag: True, x: a }) }
 			"}
 		);
@@ -5909,7 +6806,7 @@ mod tests {
 	fn a_call_by_name_follows_the_traits_names_even_where_it_leaves_one_out() {
 		test_case!(
 			case = indoc! {"
-				trait Scale {
+				trait Scale: StackValue {
 					func scale(self: Self, u32) -> Self;
 				}
 				struct S(n: u32);
@@ -6010,9 +6907,9 @@ mod tests {
 	fn a_reported_argument_list_does_not_also_report_an_uninferred_type() {
 		test_case!(
 			case = indoc! {"
-				func pair<T>(a: T, b: T) -> T { a }
-				func none<T>(flag: Bool) -> T { loop {} }
-				func g<T>(T, b: u32) -> T { loop {} }
+				func pair<T: StackValue>(a: T, b: T) -> T { a }
+				func none<T: StackValue>(flag: Bool) -> T { loop {} }
+				func g<T: StackValue>(T, b: u32) -> T { loop {} }
 				struct W<T>(x: T, y: T);
 				func missing() { pair(1); }
 				func missing_by_name() { pair({ a: 1 }); }
@@ -6046,7 +6943,7 @@ mod tests {
 	fn an_argument_built_with_a_known_type_is_held_to_it() {
 		test_case!(
 			case = indoc! {"
-				func three<T>(a: T, b: T, c: T) -> T { a }
+				func three<T: StackValue>(a: T, b: T, c: T) -> T { a }
 				func f(x: u8, y: u16) { three(x, y, nothing); }
 			"}
 		);
@@ -6167,9 +7064,9 @@ mod tests {
 			case = indoc! {"
 				func sign(x: i32) -> i32 {
 					match x {
-						0 -> { 0 },
-						-1 | -128 -> { 1 },
-						n -> { n },
+						0 => { 0 },
+						-1 | -128 => { 1 },
+						n => { n },
 					}
 				}
 			"}
@@ -6197,11 +7094,11 @@ mod tests {
 				impl S { const ZERO: u8 = 0; }
 				func f<T: Lim>(p: P) -> u8 {
 					match p {
-						P(0, Dir::North) -> { 1 },
-						P(const LIMIT, d) -> { 2 },
-						P(x, Dir::South) -> { x },
-						P(S::ZERO | T::MAX, _) -> { 3 },
-						_ -> { 4 },
+						P(0, Dir::North) => { 1 },
+						P(const LIMIT, d) => { 2 },
+						P(x, Dir::South) => { x },
+						P(S::ZERO | T::MAX, _) => { 3 },
+						_ => { 4 },
 					}
 				}
 			"}
@@ -6259,13 +7156,13 @@ mod tests {
 				struct P(x: u8, y: u16);
 				struct W(x: (u8, u16));
 				func covered(p: P) -> u8 {
-					match p { P(0, _) -> { 1 }, P(t) -> { 2 } }
+					match p { P(0, _) => { 1 }, P(t) => { 2 } }
 				}
 				func missing(p: P) -> u8 {
-					match p { P((0, _) | (1, _)) -> { 1 } }
+					match p { P((0, _) | (1, _)) => { 1 } }
 				}
 				func unreachable(w: W) -> u8 {
-					match w { W(0, _) -> { 1 }, W(_) -> { 2 }, W(a, b) -> { 3 } }
+					match w { W(0, _) => { 1 }, W(_) => { 2 }, W(a, b) => { 3 } }
 				}
 				func count(p: P) { local P(a, b, c) = p; }
 				func lone(w: W) { local W(a, b, c) = w; }
@@ -6288,29 +7185,33 @@ mod tests {
 				enum Dir(u8) { North = 0, East = 1, South = 2 }
 				const N: Dir = Dir::North;
 				global g: Dir = match (N) {
-					const N -> { Dir::North },
-					Dir::North -> { Dir::South },
-					_ -> { Dir::East },
+					const N => { Dir::North },
+					Dir::North => { Dir::South },
+					_ => { Dir::East },
 				};
 				// The variants are known here too, so listing them all is
 				// enough: no `_` is needed.
 				global h: Dir = match (N) {
-					Dir::North -> { Dir::North },
-					Dir::East -> { Dir::East },
-					Dir::South -> { Dir::South },
+					Dir::North => { Dir::North },
+					Dir::East => { Dir::East },
+					Dir::South => { Dir::South },
 				};
 				func f(d: Dir) {
 					match d {
-						const N -> {},
-						Dir::North -> {},
-						_ -> {},
+						const N => {},
+						Dir::North => {},
+						_ => {},
 					}
 				}
 			"}
 		);
-		// In both, the second arm is covered by the first.
+		// In both, the second arm is covered by the first. Each global's
+		// `match` is a constant in principle, but the evaluator folds no
+		// control flow yet, so its initializer is not evaluated (E2015).
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::NonConstantGlobalInitializer,
+			DiagnosticCode::NonConstantGlobalInitializer,
 			DiagnosticCode::UnreachableMatchArm,
 		]);
 	}
@@ -6323,12 +7224,12 @@ mod tests {
 		// body is evaluated, so that is a loop, reported once.
 		test_case!(
 			case = indoc! {"
-				const A: Bool = match (True) { const B -> { True }, _ -> { False } };
-				const B: Bool = match (True) { const A -> { True }, _ -> { False } };
+				const A: Bool = match (True) { const B => { True }, _ => { False } };
+				const B: Bool = match (True) { const A => { True }, _ => { False } };
 				func f() -> Bool {
 					match (True) {
-						const A -> { match (True) { const B -> { True }, _ -> { False } } },
-						_ -> { False },
+						const A => { match (True) { const B => { True }, _ => { False } } },
+						_ => { False },
 					}
 				}
 			"}
@@ -6339,25 +7240,82 @@ mod tests {
 	}
 
 	#[test]
-	fn a_float_or_a_string_cannot_be_matched() {
-		// The parser reads them; a float has no single value to compare
-		// with, and a string has no equality at all.
+	fn a_float_literal_needs_eq_and_a_string_cannot_be_matched() {
+		// The parser reads them; a float has only partial equality, and a
+		// string has no equality at all.
 		test_case!(
 			case = indoc! {r#"
 				func f(x: f32, s: u8) {
-					match x { 1.5 -> {}, _ -> {} }
-					match s { "hi" -> {}, _ -> {} }
+					match x { 1.5 => {}, _ => {} }
+					match s { "hi" => {}, _ => {} }
 				}
 			"#}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::UnmatchableLiteral,
+			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::UnmatchableLiteral,
 		]);
 		case.diagnostics()
-			.assert_error_saying("a float cannot be matched");
+			.assert_error_saying("the trait bound `f32: Eq` is not satisfied");
 		case.diagnostics()
 			.assert_error_saying("a string cannot be matched");
+	}
+
+	#[test]
+	fn a_match_constant_needs_eq() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8);
+				const F: f32 = 1.0;
+				const ORIGIN: P = P(0);
+				func floats(x: f32) {
+					match x { const F => {}, _ => {} }
+				}
+				func points(p: P) {
+					match p { const ORIGIN => {}, _ => {} }
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `f32: Eq` is not satisfied");
+		case.diagnostics()
+			.assert_error_saying("the trait bound `P: Eq` is not satisfied");
+	}
+
+	#[test]
+	fn an_enum_satisfies_eq_and_partial_eq_structurally() {
+		test_case!(
+			case = indoc! {"
+				enum Color(u8) { Red = 0, Green }
+				func needs_eq<T: Eq>(value: T) {}
+				func needs_partial<T: PartialEq>(value: T) {}
+				func f(color: Color) {
+					needs_eq(color);
+					needs_partial(color);
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_float_or_an_aggregate_can_still_be_bound() {
+		test_case!(
+			case = indoc! {"
+				struct P(x: u8);
+				func floats(x: f32) -> f32 {
+					match x { whole => { whole + 1.0 } }
+				}
+				func points(p: P) -> P {
+					match p { whole => { whole }, }
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
 	}
 
 	#[test]
@@ -6396,7 +7354,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i32, i64)) {
-					match x { (a, 5, 6) | (a, b, a) -> { local _ = a; }, _ -> {} }
+					match x { (a, 5, 6) | (a, b, a) => { local _ = a; }, _ => {} }
 				}
 			"}
 		);
@@ -6420,7 +7378,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (a, 5) | (a, 10) -> { local _ = a; }, _ -> {} }
+					match x { (a, 5) | (a, 10) => { local _ = a; }, _ => {} }
 				}
 			"}
 		);
@@ -6437,7 +7395,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (mut a, 5) | (a, 10) -> {}, _ -> {} }
+					match x { (mut a, 5) | (a, 10) => {}, _ => {} }
 				}
 			"}
 		);
@@ -6456,7 +7414,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (a, b) | (b, a) -> {} }
+					match x { (a, b) | (b, a) => {} }
 				}
 			"}
 		);
@@ -6477,9 +7435,9 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: ((i32, i32), i32)) {
-					match x { ((a, 1) | (a, 2), 3) -> {}, _ -> {} }
-					match x { ((a, 1) | (b, 2), 3) -> {}, _ -> {} }
-					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) -> {}, _ -> {} }
+					match x { ((a, 1) | (a, 2), 3) => {}, _ => {} }
+					match x { ((a, 1) | (b, 2), 3) => {}, _ => {} }
+					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) => {}, _ => {} }
 				}
 			"}
 		);
@@ -6499,10 +7457,10 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				func f(x: ((i32, i32), (i32, i32))) {
-					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) -> {}, _ -> {} }
+					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) => {}, _ => {} }
 				}
 				func g(x: ((i32, i32), i32)) {
-					match x { ((a, 1) | (a, 2), a) -> {}, _ -> {} }
+					match x { ((a, 1) | (a, 2), a) => {}, _ => {} }
 				}
 			"}
 		);
@@ -6543,12 +7501,12 @@ mod tests {
 				func g() {}
 				func f(x: u8, b: Bool) {
 					local y: u8 = 1;
-					match x { const y -> {}, _ -> {} }
-					match x { const g -> {}, _ -> {} }
-					match x { 300 -> {}, -1 -> {}, _ -> {} }
-					match x { const True -> {}, _ -> {} }
-					match b { const C -> {}, _ -> {} }
-					match x { 1 | z -> {}, _ -> {} }
+					match x { const y => {}, _ => {} }
+					match x { const g => {}, _ => {} }
+					match x { 300 => {}, -1 => {}, _ => {} }
+					match x { const True => {}, _ => {} }
+					match b { const C => {}, _ => {} }
+					match x { 1 | z => {}, _ => {} }
 				}
 			"}
 		);
@@ -6572,17 +7530,33 @@ mod tests {
 	fn match_arms_share_a_type() {
 		test_case!(
 			case = indoc! {"
-				func f(x: u8) -> u64 { match x { 0 -> { 1 }, _ -> { 2 } } }
+				func f(x: u8) -> u64 { match x { 0 => { 1 }, _ => { 2 } } }
 				func g(x: u8) -> u8 {
-					match x { 0 -> { return 0 }, _ -> { x } }
+					match x { 0 => { return 0 }, _ => { x } }
 				}
-				func h(x: u8) { local v = match x { 0 -> { 1 }, _ -> { True } }; }
+				func h(x: u8) { local v = match x { 0 => { 1 }, _ => { True } }; }
 			"}
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
 		assert_eq!(case.body_type("f"), "u64");
 		assert_eq!(case.body_type("g"), "u8");
+	}
+
+	#[test]
+	fn match_arm_bodies_may_be_expressions() {
+		test_case!(
+			case = indoc! {"
+				func f(x: u8) -> u8 {
+					match x {
+						0 => 1,
+						n => n + 1,
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(case.body_type("f"), "u8");
 	}
 
 	#[test]
@@ -6609,20 +7583,20 @@ mod tests {
 				enum Dir(u8) { North = 0, East, South, West }
 				struct P(x: Bool, y: Bool);
 				func a(d: Dir) -> u8 {
-					match d { Dir::North -> { 0 }, Dir::East -> { 1 } }
+					match d { Dir::North => { 0 }, Dir::East => { 1 } }
 				}
 				func b(d: Dir) -> u8 {
 					match d {
-						Dir::North | Dir::East -> { 0 },
-						Dir::South | Dir::West -> { 1 },
+						Dir::North | Dir::East => { 0 },
+						Dir::South | Dir::West => { 1 },
 					}
 				}
 				func c(x: Bool, d: Dir) {
-					match (x, d) { (const True, _) -> {}, (_, Dir::North) -> {} }
+					match (x, d) { (const True, _) => {}, (_, Dir::North) => {} }
 				}
-				func i(x: u8) -> u8 { match x { 0 -> { 0 }, 1 -> { 1 } } }
+				func i(x: u8) -> u8 { match x { 0 => { 0 }, 1 => { 1 } } }
 				func s(p: P) {
-					match p { P(const True, _) -> {}, P(const False, const True) -> {} }
+					match p { P(const True, _) => {}, P(const False, const True) => {} }
 				}
 			"}
 		);
@@ -6655,12 +7629,12 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 				const ZERO: u8 = 0;
-				func u(x: u8) { match x { _ -> {}, 0 -> {} } }
+				func u(x: u8) { match x { _ => {}, 0 => {} } }
 				func v(b: Bool) {
-					match b { const True -> {}, const False -> {}, _ -> {} }
+					match b { const True => {}, const False => {}, _ => {} }
 				}
-				func w(x: u8) { match x { 0 | 1 -> {}, 1 -> {}, _ -> {} } }
-				func z(x: u8) { match x { const ZERO -> {}, 0 -> {}, _ -> {} } }
+				func w(x: u8) { match x { 0 | 1 => {}, 1 => {}, _ => {} } }
+				func z(x: u8) { match x { const ZERO => {}, 0 => {}, _ => {} } }
 			"}
 		);
 		case.diagnostics().assert_codes(&[
@@ -6681,10 +7655,10 @@ mod tests {
 				const N: Dir = Dir::North;
 				trait Lim { const MAX: u8; }
 				func k(d: Dir) {
-					match d { const N -> {}, Dir::East | Dir::South -> {} }
+					match d { const N => {}, Dir::East | Dir::South => {} }
 				}
-				func l<T: Lim>(x: u8) { match x { T::MAX -> {} } }
-				func m<T: Lim>(x: u8) { match x { T::MAX -> {}, _ -> {} } }
+				func l<T: Lim>(x: u8) { match x { T::MAX => {} } }
+				func m<T: Lim>(x: u8) { match x { T::MAX => {}, _ => {} } }
 			"}
 		);
 		case.diagnostics()
@@ -6696,7 +7670,7 @@ mod tests {
 
 	#[test]
 	fn a_match_with_a_failed_pattern_is_not_checked_for_coverage() {
-		test_case!(case = "func f(x: u8) { match x { const nope -> {} } }");
+		test_case!(case = "func f(x: u8) { match x { const nope => {} } }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}
@@ -6740,50 +7714,373 @@ mod tests {
 				memory heap: u32;
 				func f(s: heap::&[u8], a: heap::*[u16; 4]) {
 					local n: u32 = s.len();
-					local p: heap::&u8 = s.index(n);
-					local q: heap::*u16 = a.index_mut(0);
-					local k: u32 = <heap::*[u16; 4]>::SIZE;
-					local t: heap::&[u16] = a.as_slice();
-					local v: <heap::&[u8] as Slice>::Value = 5;
+					local k: u32 = <[u16; 4] as Array>::LEN;
+					local t: heap::*[u16] = a.as_slice_mut();
+					local v: <[u8] as Slice>::Value = 5;
 					local w: heap::&u8 = s.last();
+					local u: heap::&[u16] = a.as_slice();
 				}
 				func g<M: Memory, T>(s: M::&[T]) -> M::Size { s.len() - 1 }
-				func h<S: Slice>(s: S) -> S::Mem::&S::Value { s.first() }
+				func h<M: Memory, S: Slice>(s: M::&S) -> M::&S::Value { s.first() }
 			"}
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
 			"(block \
-			 (local n#2 (abstract len<heap::&[u8]> s#0)) \
-			 (local p#3 (abstract index<heap::&[u8]> s#0 n#2)) \
-			 (local q#4 (abstract index_mut<heap::*[u16; 4]> a#1 0)) \
-			 (local k#5 (abstract SIZE<heap::*[u16; 4]>)) \
-			 (local t#6 (abstract as_slice<heap::*[u16; 4]> a#1)) \
-			 (local v#7 5) \
-			 (local w#8 (abstract last<heap::&[u8]> s#0)))"
+			 (local n#2 (abstract len<[u8], heap> s#0)) \
+			 (local k#3 (abstract LEN<[u16; 4]>)) \
+			 (local t#4 (abstract as_slice_mut<[u16; 4], heap> a#1)) \
+			 (local v#5 5) \
+			 (local w#6 (abstract last<[u8], heap> s#0)) \
+			 (local u#7 (abstract as_slice<[u16; 4], heap> (.& (* a#1)))))"
 		);
 	}
 
 	#[test]
-	fn only_an_exclusive_slice_is_a_slice_mut() {
+	fn pointers_have_the_pointer_trait() {
 		test_case!(
 			case = indoc! {"
 				memory heap: u32;
-				func f(s: heap::&[u8], a: heap::&[u8; 2]) {
-					s.index_mut(0);
-					a.as_slice_mut();
-				}
+				struct Is<
+					P: Pointer where { Memory = M, Pointee = T },
+					M: Memory,
+					T,
+				>();
+				struct Needs<P: Pointer>();
+				func concrete(a: Is<heap::&u8, heap, u8>, b: Is<heap::*(u8, u64), heap, (u8, u64)>) {}
+				func generic<M: Memory, T>(p: Is<M::*T, M, T>) {}
+				func pointee<M: Memory, T: StackValue>(x: <M::&T as Pointer>::Pointee) -> T { x }
+				func size<P: Pointer>(n: <P::Memory as Memory>::Size) {}
+				func element<M: Memory, S: Slice>(p: M::&<M::*S as Pointer>::Pointee) -> M::&S::Value { p[0].& }
+				func not_pointers(a: Needs<u32>, b: Needs<(heap::&u8, u8)>) {}
 			"}
 		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::MethodNotFound,
-			DiagnosticCode::MethodNotFound,
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
 		]);
 	}
 
 	#[test]
-	fn an_element_is_the_place_index_points_at() {
+	fn pointer_metadata_keeps_recursive_slice_equalities_rigid() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				trait Tr { type Item; }
+				func direct<T: Tr where { Item = [T::Item] }>(
+					p: heap::&T::Item,
+				) -> <heap::&T::Item as Pointer>::Metadata {
+					metadata(p)
+				}
+				func mutual<
+					T: Tr where { Item = [U::Item] },
+					U: Tr where { Item = [T::Item] },
+				>(p: heap::*T::Item) -> heap::&T::Item { transmute(p) }
+				func nested<T: Tr where { Item = [[T::Item]] }>(
+					p: heap::&[T::Item],
+				) -> <heap::&[T::Item] as Pointer>::Metadata {
+					metadata(p)
+				}
+				func not_thin<T: Tr where { Item = [T::Item] }>(
+					p: heap::&T::Item,
+				) -> u32 { transmute(p) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+	}
+
+	#[test]
+	fn a_pointer_carries_its_pointee_counts_as_metadata() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Is<P: Pointer where { Metadata = X }, X: StackValue>();
+				func concrete(
+					a: Is<heap::&u8, ()>,
+					b: Is<heap::&[u8], u32>,
+					c: Is<heap::*[u8; 4], ()>,
+					d: Is<heap::&[[u16]], (u32, u32)>,
+					e: Is<heap::&heap::&[u8], ()>,
+				) {}
+				func memory<M: Memory>(a: Is<M::&[u8], M::Size>, b: Is<M::*u8, ()>) {}
+				func thin<M: Memory, T: StackValue, A: Array>(
+					a: Is<M::&T, ()>,
+					b: Is<M::*A, ()>,
+				) {}
+				func unknown<M: Memory, T>(x: <M::&T as Pointer>::Metadata) -> () { x }
+				func rigid<M: Memory, S: Slice>(
+					x: <M::*S as Pointer>::Metadata,
+				) -> <M::&S as Pointer>::Metadata {
+					x
+				}
+				func not_thin<M: Memory, S: Slice>(x: <M::&S as Pointer>::Metadata) -> () { x }
+			"}
+		);
+		// Neither an unbounded `T` nor a `Slice` that may not be an array is
+		// known to be thin.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+	}
+
+	#[test]
+	fn a_pointer_is_held_as_its_address_and_metadata() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Needs<V: StackValue>();
+				func nested(p: heap::&[[u8]]) -> (u32, u32, u32) { transmute(p) }
+				func shared<M: Memory, S: Slice>(p: M::*S) -> M::&S { transmute(p) }
+				func held<M: Memory, S: Slice>(a: Needs<M::&S>, b: Needs<(M::*S, u8)>) {}
+				func not_thin<M: Memory, S: Slice>(p: M::&S) -> M::Size { transmute(p) }
+			"}
+		);
+		case.diagnostics().print();
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+	}
+
+	#[test]
+	fn a_pointer_is_built_from_and_taken_apart_into_its_parts() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func slice(address: u32, len: u32) -> heap::&[u8] {
+					from_raw_parts(address, len)
+				}
+				func value(address: u32) -> heap::*u64 { from_raw_parts(address, ()) }
+				func len(s: heap::&[u8]) -> u32 { metadata(s) }
+				func start(s: heap::&[u8]) -> u32 { address(s) }
+				func generic_address<M: Memory, T>(p: M::*T) -> M::Size { address(p) }
+				func thin(p: heap::*[u8; 4]) -> () { metadata(p) }
+				func generic_len<M: Memory, T: StackValue>(s: M::&[T]) -> M::Size {
+					metadata(s)
+				}
+				func rebuild<P: Pointer>(p: P, at: <P::Memory as Memory>::Size) -> P {
+					from_raw_parts::<P>(at, metadata(p))
+				}
+				func round_trip<P: Pointer>(p: P) -> P { from_raw_parts(address(p), metadata(p)) }
+				func passed<P: Pointer>(p: P) -> P { transmute(p) }
+				func no_length(address: u32) -> heap::&[u8] { from_raw_parts(address, ()) }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	/// The message states the equality with the use's arguments; the label
+	/// says what its sides reduce to.
+	#[test]
+	fn an_equality_mismatch_states_the_equality_and_shows_the_values() {
+		test_case!(
+			case = indoc! {"
+				trait Container { type Item; }
+				struct Bytes(); impl Container for Bytes { type Item = u8; }
+				struct Words(); impl Container for Words { type Item = u16; }
+				func same<A: Container, B: Container where { Item = A::Item }>() {}
+				func pair() { same::<Bytes, Words>(); }
+				func widen(x: u32) -> u64 { transmute(x) }
+			"}
+		);
+		let diagnostics = case.diagnostics();
+		diagnostics.assert_codes(&[
+			DiagnosticCode::AssocTypeEqualityMismatch,
+			DiagnosticCode::AssocTypeEqualityMismatch,
+		]);
+		diagnostics.assert_error_saying(
+			"type mismatch resolving \
+			 `<Words as Container>::Item == <Bytes as Container>::Item`",
+		);
+		diagnostics.assert_error_saying(
+			"type mismatch resolving \
+			 `<u64 as StackValue>::Repr == <u32 as StackValue>::Repr`",
+		);
+		let rendered = diagnostics.render();
+		assert!(
+			rendered.contains("expected `u8`, found `u16`"),
+			"{rendered}"
+		);
+		assert!(
+			rendered.contains("expected `i32`, found `i64`"),
+			"{rendered}"
+		);
+	}
+
+	/// std is the last place a name is looked up, so the program's own items
+	/// shadow its: `address(5)` calls the program's `address`, not std's.
+	#[test]
+	fn a_program_item_shadows_the_std_prelude() {
+		test_case!(
+			case = indoc! {"
+				struct Layout();
+				func trap() {}
+				func address(x: u32) -> u32 { x }
+				func f() -> u32 { address(5) }
+			"}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_value_is_a_stack_value() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				type R = [u8];
+				struct S(x: [u8; 4]);
+				func f(x: [u8]) {}
+				func g() -> R { trap() }
+				func h(t: ([u8], u8), c: func([u16; 2]) -> u8) {}
+				func k<M: Memory, T: Slice>(t: T, ok: M::&T) {}
+				func l(p: heap::&[u8]) { local v: [u8; 2] = trap(); }
+				func m<M: Memory, T>(t: T, p: M::&[T], q: M::*[T; 3], r: ([u8])) {}
+				func n() -> S { trap() }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`[u8]` is a slice, which only a pointer holds, as `M::&[u8]`",
+		);
+		case.diagnostics().assert_error_saying(
+			"`T` is not known to be a `StackValue`: require `T: StackValue`",
+		);
+		case.diagnostics().assert_error_saying(
+			"`S` cannot be held by value, since it holds `[u8; 4]`",
+		);
+	}
+
+	/// A field, a tuple's element and a type argument need nothing: what holds
+	/// them by value states what it needs.
+	#[test]
+	fn a_type_argument_may_be_a_slice() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Box<T>(p: heap::*T);
+				struct Header(len: u32, data: [u8; 16]);
+				func id<M: Memory, T>(p: M::&T) -> M::&T { p }
+				func len<M: Memory, S: Slice>(p: M::&S) -> M::Size { p.len() }
+				func of_array<A: Array>() {}
+				func value<T: StackValue>() {}
+				func f(s: heap::&[u8], b: Box<[u8]>, h: heap::&Header) {
+					local p = id(s);
+					local n = len(s);
+					local b: Box<[u8]> = Box(b.p);
+					of_array::<[u8; 2]>();
+					of_array::<[u8]>();
+					value::<[u8]>();
+					local z = size_of::<[u8], heap>();
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+	}
+
+	#[test]
+	fn a_load_reads_a_stack_value() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f<M: Memory, T>(p: M::&T) { local x = p.*; }
+				func g<M: Memory, T: StackValue>(p: M::&T) -> T { p.* }
+				func h(p: heap::&[u8; 2]) { local x = p.*; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotStackValue,
+			DiagnosticCode::NotStackValue,
+		]);
+	}
+
+	/// An abstract pointee is thin when it is a `StackValue`, which holds no
+	/// slice; otherwise its pointer's metadata is unknown.
+	#[test]
+	fn a_pointer_to_an_unbounded_parameter_may_be_fat() {
+		test_case!(
+			case = indoc! {"
+				func thin<M: Memory, T: StackValue>(p: M::&T) -> M::Size {
+					transmute(p)
+				}
+				func fat<M: Memory, T>(p: M::&T) -> M::Size { transmute(p) }
+				func any<M: Memory, T>(p: M::&T) -> M::&T { p }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
+	}
+
+	#[test]
+	fn a_literal_is_data_its_context_places() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const GREETING: [u8; 5] = "hello";
+				const SHORT: heap::&[u8; 4] = GREETING;
+				const WORDS: heap::&[u16] = GREETING;
+				const MUTABLE: heap::*[u8] = GREETING;
+				func f() {
+					local s: heap::&[u8] = GREETING;
+					local t: heap::&[u8; _] = "abc";
+					local u = "abc";
+					local v = GREETING;
+					local w = "a" + "b";
+				}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ArraySizeMismatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::UnableToCoerce,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics().assert_error_saying(
+			"this constant holds 5 elements, but `heap::&[u8; 4]` holds 4",
+		);
+		case.diagnostics()
+			.assert_error_saying("cannot apply `+` to a string literal");
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (local s#0 GREETING) \
+			 (local t#1 \"abc\") \
+			 (local u#2 \"abc\") \
+			 (local v#3 GREETING) \
+			 (local w#4 error))"
+		);
+	}
+
+	#[test]
+	fn a_method_of_a_slice_takes_its_ownership_from_the_receiver() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				func f(a: heap::&[u8; 2]) { a.as_slice_mut(); }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	#[test]
+	fn an_element_is_a_place_in_the_slice() {
 		test_case!(
 			case = indoc! {"
 				memory heap: u32;
@@ -6793,22 +8090,54 @@ mod tests {
 					a[2] += 1;
 					local r: heap::&u8 = m[0][1].&;
 				}
-				func g<S: Slice>(s: S, i: S::Mem::Size) -> S::Value { s[i] }
+				func g<M: Memory, S: Slice where { Value: StackValue }>(
+					s: M::&S,
+					i: M::Size,
+				) -> S::Value {
+					s[i]
+				}
 			"}
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
 			"(block \
-			 (local e#3 (load (* (abstract index<heap::&[u8]> s#0 0)))) \
-			 (store (* (abstract index_mut<heap::*[u16; 4]> a#1 1)) 5) \
-			 (store += (* (abstract index_mut<heap::*[u16; 4]> a#1 2)) 1) \
-			 (local r#4 (.& (* (abstract index<heap::&[u8]> \
-			 (load (* (abstract index<heap::&[heap::&[u8]]> m#2 0))) 1)))))"
+			 (local e#3 (load ([] (* s#0) 0))) \
+			 (store ([] (* a#1) 1) 5) \
+			 (store += ([] (* a#1) 2) 1) \
+			 (local r#4 (.& ([] (* (load ([] (* m#2) 0))) 1))))"
 		);
+		assert_eq!(case.shape("g"), "(block => (load ([] (* s#0) i#1)))");
+	}
+
+	/// An array place is indexed where it is, as a struct place's field is
+	/// read: `h.data[i]` through the pointer `h`, writable when `h` is
+	/// exclusive. `s.*[i]` is the same element as `s[i]`.
+	#[test]
+	fn an_array_place_is_indexed_in_place() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Header(len: u32, data: [u8; 4]);
+				func f(h: heap::*Header, s: heap::&[u8], m: heap::&[[u8; 2]]) {
+					h.data[1] = 5;
+					local a: u8 = s.*[0];
+					local b: u8 = m[1][0];
+				}
+				func g(h: heap::&Header) { h.data[0] = 1; }
+				func k(h: heap::&Header) { local x = h.len[0]; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::CannotIndex,
+		]);
 		assert_eq!(
-			case.shape("g"),
-			"(block => (load (* (abstract index<S> s#0 i#1))))"
+			case.shape("f"),
+			"(block \
+			 (store ([] (. (* h#0) data) 1) 5) \
+			 (local a#3 (load ([] (* s#1) 0))) \
+			 (local b#4 (load ([] ([] (* m#2) 1) 0))))"
 		);
 	}
 
@@ -6841,8 +8170,9 @@ mod tests {
 			DiagnosticCode::CannotIndex,
 			DiagnosticCode::TypeAnnotationRequired,
 		]);
-		case.diagnostics()
-			.assert_error_saying("index its pointee, as `x.*[i]`");
+		case.diagnostics().assert_error_saying(
+			"dereference the outer one first, as `x.*[i]`",
+		);
 	}
 
 	#[test]
@@ -6895,8 +8225,8 @@ mod tests {
 			 (store += (. (* p#0) x) 1) \
 			 (local r#3 (.& (. (* p#0) x))) \
 			 (local a#4 (load (. (* p#0) x))) \
-			 (local b#5 (load (. (* (load (* (abstract index<heap::&[heap::&P]> s#1 0)))) x))) \
-			 (local c#6 (load (. (* (abstract index<heap::&[P]> v#2 0)) x))))"
+			 (local b#5 (load (. (* (load ([] (* s#1) 0))) x))) \
+			 (local c#6 (load (. ([] (* v#2) 0) x))))"
 		);
 	}
 

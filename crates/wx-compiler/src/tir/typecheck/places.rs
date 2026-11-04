@@ -4,12 +4,13 @@
 //! A place is a location in linear memory, reached through a pointer: `p.*`,
 //! a field of a place, and an element, `x[i]`. Each step of a place goes
 //! through at most one pointer: `p.field` is `p.*.field` for a pointer `p`,
-//! and `x[i]` is the element `Slice::index` points at. Everything else is a
-//! value, even when it names a location (a local, or a field of one), and is
-//! assigned through `Assign`; a place is written through `Store`. A global's name is a handle, written
-//! through `GlobalMut::set`, so it is never the target of `=`. Reading a place
-//! is a `Load`, pushed only where its value is used, so `.&` and the left of
-//! `=` take the place itself.
+//! and `s[i]` is `s.*[i]` for a pointer `s` to a slice or an array.
+//! Everything else is a value, even when it names a location (a local, or a
+//! field of one), and is assigned through `Assign`; a place is written through
+//! `Store`. A global's name is a handle, written through `GlobalMut::set`, so
+//! it is never the target of `=`. Reading a place is a `Load`, pushed only
+//! where its value is used, so `.&` and the left of `=` take the place
+//! itself.
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
@@ -18,7 +19,7 @@ use super::{BodyContext, SelectedMethod};
 use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
-use crate::tir::defs::{FunctionIdx, TraitIdx, Visibility};
+use crate::tir::defs::{TraitIdx, Visibility};
 use crate::tir::operators::is_primitive_binary;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{Substitution, Type, TypeIndex};
@@ -28,14 +29,6 @@ use crate::tir::types::{Substitution, Type, TypeIndex};
 enum Operand {
 	Place(PlaceIdx),
 	Value(ExprIdx),
-}
-
-/// Whether a place is read (or has its address taken) or written: a written
-/// element is reached through `SliceMut::index_mut`.
-#[derive(Clone, Copy, PartialEq)]
-enum Access {
-	Read,
-	Write,
 }
 
 /// What defines an `op=`.
@@ -52,7 +45,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		&mut self,
 		expr: &Spanned<ast::Expression>,
 	) -> ExprIdx {
-		match self.build_operand(expr, Access::Read) {
+		match self.build_operand(expr) {
 			Operand::Place(place) => self.load(place),
 			Operand::Value(value) => value,
 		}
@@ -60,29 +53,26 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	fn load(&mut self, place: PlaceIdx) -> ExprIdx {
 		let Place { ty, span, .. } = *self.body.place(place);
+		let ty = self.require_stack_value(ty, span);
 		self.body.push(ExprKind::Load(place), ty, span)
 	}
 
 	/// `expr` as a place when it is one, else as a value.
-	fn build_operand(
-		&mut self,
-		expr: &Spanned<ast::Expression>,
-		access: Access,
-	) -> Operand {
+	fn build_operand(&mut self, expr: &Spanned<ast::Expression>) -> Operand {
 		match &expr.inner {
 			// `(p.*).x`: parentheses are a tuple of one, kept a place
 			// rather than loaded as a value.
 			ast::Expression::Tuple { elements } if elements.len() == 1 => {
-				self.build_operand(&elements[0].inner, access)
+				self.build_operand(&elements[0].inner)
 			}
 			ast::Expression::Deref { pointer } => {
 				self.build_deref(pointer, expr.span)
 			}
 			ast::Expression::ObjectAccess { object, member } => {
-				self.build_field(object, member, access, expr.span)
+				self.build_field(object, member, expr.span)
 			}
 			ast::Expression::Index { object, index } => {
-				self.build_index(object, index, access, expr.span)
+				self.build_index(object, index, expr.span)
 			}
 			_ => Operand::Value(self.build(expr, TypeIndex::INFER)),
 		}
@@ -144,7 +134,6 @@ impl BodyContext<'_, '_, '_, '_> {
 		&mut self,
 		object: &Spanned<ast::Expression>,
 		segment: &ast::PathSegment,
-		access: Access,
 		span: TextSpan,
 	) -> Operand {
 		let member = segment.ident;
@@ -164,7 +153,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					),
 			);
 		}
-		let mut object = self.build_operand(object, access);
+		let mut object = self.build_operand(object);
 		let mut object_ty = match object {
 			Operand::Place(place) => self.body.place(place).ty,
 			Operand::Value(value) => self.body.ty(value),
@@ -216,20 +205,43 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 	}
 
-	/// `object[index]`: the element `object.index(index)` points at, or, for a
-	/// written element of an exclusive slice or array,
-	/// `object.index_mut(index)`. The object is a slice, an array, or of a
-	/// type assumed `Slice`; a pointer to one is not gone through, since the
-	/// element is already one pointer away (`x.*[i]`).
+	/// `object[index]`: an element of a slice or an array, as `object.field`
+	/// is a field of a struct. A place of a slice or an array is indexed where
+	/// it is (`h.data[i]`); an object that is a pointer to one is gone
+	/// through once (`s[i]` is `s.*[i]`), and a pointer to that pointer is
+	/// not. The element is in its sequence's memory, writable when the
+	/// sequence is, and the index is that memory's `Size`.
 	fn build_index(
 		&mut self,
 		object: &Spanned<ast::Expression>,
 		index: &Spanned<ast::Expression>,
-		access: Access,
 		span: TextSpan,
 	) -> Operand {
-		let receiver = self.build(object, TypeIndex::INFER);
-		let Some(method) = self.index_method(receiver, access, span) else {
+		let object_span = object.span;
+		let object = match self.build_operand(object) {
+			Operand::Place(place) => {
+				let ty = self.body.place(place).ty;
+				let ty = self.normalized(ty, self.scope.assumption_env);
+				match *self.cx.types.resolve(ty) {
+					Type::Pointer { .. } => Some(self.load(place)),
+					_ => match self.sequence_element(ty, object_span) {
+						Ok(Some(element)) => {
+							return self
+								.build_element(place, element, index, span);
+						}
+						Ok(None) => {
+							self.report_cannot_index(ty, object_span, None);
+							None
+						}
+						Err(()) => None,
+					},
+				}
+			}
+			Operand::Value(value) => Some(value),
+		};
+		let Some((pointer, (to, element, memory, ownership))) = object
+			.and_then(|pointer| Some((pointer, self.indexed_slice(pointer)?)))
+		else {
 			self.build(index, TypeIndex::ERROR);
 			return Operand::Value(self.body.push(
 				ExprKind::Error,
@@ -237,97 +249,137 @@ impl BodyContext<'_, '_, '_, '_> {
 				span,
 			));
 		};
-		let type_args =
-			[self.normalized(self.body.ty(receiver), self.scope.env)];
-		let function = &self.cx.functions[usize::from(method)];
-		let (env, return_type) = (function.type_params, function.return_type);
-		let declared = self.cx.types.list(function.param_types)[1];
-		let index_ty = self.instantiate(declared, env, &type_args);
-		let index = self.check(index, index_ty);
-		let pointer_ty = self.instantiate(return_type, env, &type_args);
-		let type_args = self.cx.types.push_list(&type_args);
-		let pointer = self.body.push(
-			ExprKind::AbstractMethodCall {
-				method,
-				type_args,
-				receiver,
-				args: index,
-			},
-			pointer_ty,
-			span,
-		);
-		match *self.cx.types.resolve(pointer_ty) {
-			Type::Pointer {
-				to,
-				memory,
-				ownership,
-			} => Operand::Place(self.body.push_place(Place {
-				kind: PlaceKind::Deref { pointer },
-				ty: to,
-				memory,
-				mutable: ownership == Ownership::Exclusive,
-				span,
-			})),
-			// The receiver's type failed.
-			Type::Error => Operand::Value(self.body.push(
-				ExprKind::Error,
-				TypeIndex::ERROR,
-				span,
-			)),
-			_ => unreachable!("`index` and `index_mut` return a pointer"),
-		}
+		let sequence = self.body.push_place(Place {
+			kind: PlaceKind::Deref { pointer },
+			ty: to,
+			memory,
+			mutable: ownership == Ownership::Exclusive,
+			span: self.body.span(pointer),
+		});
+		self.build_element(sequence, element, index, span)
 	}
 
-	/// The method `receiver[..]` calls: `SliceMut::index_mut` for a written
-	/// element when the receiver has it, else `Slice::index` (a write through
-	/// it is refused as one through any shared pointer). `None` when the
-	/// receiver has neither (reported) or is already an error.
-	fn index_method(
+	/// `sequence[index]`, `element` the sequence's element type.
+	fn build_element(
 		&mut self,
-		receiver: ExprIdx,
-		access: Access,
+		sequence: PlaceIdx,
+		element: TypeIndex,
+		index: &Spanned<ast::Expression>,
 		span: TextSpan,
-	) -> Option<FunctionIdx> {
-		let ty = self.body.ty(receiver);
+	) -> Operand {
+		let Place {
+			memory, mutable, ..
+		} = *self.body.place(sequence);
+		let size = self.memory_size(memory);
+		let index = self.check(index, size);
+		Operand::Place(self.body.push_place(Place {
+			kind: PlaceKind::Element {
+				object: sequence,
+				index,
+			},
+			ty: element,
+			memory,
+			mutable,
+			span,
+		}))
+	}
+
+	/// The slice or array `pointer` points at, its element type, and the
+	/// pointer's memory and ownership. `None` when it is no pointer to one
+	/// (reported) or is already an error.
+	fn indexed_slice(
+		&mut self,
+		pointer: ExprIdx,
+	) -> Option<(TypeIndex, TypeIndex, TypeIndex, Ownership)> {
+		let ty = self.body.ty(pointer);
 		if ty == TypeIndex::ERROR {
 			return None;
 		}
-		if self.cx.types.has_literal(ty) {
-			self.report_annotation_required(receiver);
+		if self.cx.types.needs_context(ty) {
+			self.report_annotation_required(pointer);
 			return None;
 		}
-		let intrinsics = &self.cx.defs.intrinsics;
-		let slice = intrinsics.slice.expect("std declares `Slice`");
-		let slice_mut = intrinsics.slice_mut.expect("std declares `SliceMut`");
-		let index = intrinsics.slice_index.expect("`Slice` declares `index`");
-		let index_mut = intrinsics
-			.slice_index_mut
-			.expect("`SliceMut` declares `index_mut`");
-		if access == Access::Write && self.implements(ty, slice_mut, span)? {
-			return Some(index_mut);
+		let ty = self.normalized(ty, self.scope.assumption_env);
+		let span = self.body.span(pointer);
+		let Type::Pointer {
+			to,
+			memory,
+			ownership,
+		} = *self.cx.types.resolve(ty)
+		else {
+			self.report_cannot_index(ty, span, None);
+			return None;
+		};
+		match self.sequence_element(to, span) {
+			Ok(Some(element)) => Some((to, element, memory, ownership)),
+			Ok(None) => {
+				self.report_cannot_index(ty, span, Some(to));
+				None
+			}
+			Err(()) => None,
 		}
-		if self.implements(ty, slice, span)? {
-			return Some(index);
+	}
+
+	/// The element type of `ty` (normalized) when it is a slice, an array,
+	/// or a type assumed `Slice`; `Ok(None)` when it is none of them, and
+	/// `Err` when it is an error or the solver could not say (reported).
+	fn sequence_element(
+		&mut self,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> Result<Option<TypeIndex>, ()> {
+		match *self.cx.types.resolve(ty) {
+			Type::Slice { of } | Type::Array { of, .. } => Ok(Some(of)),
+			Type::Error => Err(()),
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				let intrinsics = &self.cx.defs.intrinsics;
+				let slice = intrinsics.slice.expect("std declares `Slice`");
+				let value =
+					intrinsics.slice_value.expect("`Slice` declares `Value`");
+				if !self.implements(ty, slice, span).ok_or(())? {
+					return Ok(None);
+				}
+				let element = self.cx.types.intern(Type::TypeProjection {
+					trait_index: slice,
+					assoc_type_index: value,
+					base: ty,
+				});
+				Ok(Some(self.normalized(element, self.scope.assumption_env)))
+			}
+			_ => Ok(None),
 		}
-		let found = self.cx.type_formatter().display_type(ty);
+	}
+
+	/// E2125 for an object of type `ty` at `span`; `pointee` is what a
+	/// pointer object points at, to say when it is one pointer too many.
+	fn report_cannot_index(
+		&mut self,
+		ty: TypeIndex,
+		span: TextSpan,
+		pointee: Option<TypeIndex>,
+	) {
+		let found_ty = self.cx.type_formatter().display_type(ty);
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CannotIndex.code())
-			.with_message(format!("type `{found}` cannot be indexed"))
+			.with_message(format!("type `{found_ty}` cannot be indexed"))
 			.with_label(
-				self.source_span(receiver)
-					.primary_label()
-					.with_message("not a slice or an array"),
+				Label::primary(self.scope.file_id, span).with_message(
+					"not a slice or an array, or a pointer to one",
+				),
 			);
-		if let Type::Pointer { to, .. } = *self.cx.types.resolve(ty)
-			&& self.implements(to, slice, span) == Some(true)
-		{
+		// A pointer to a pointer to a slice: one step too far.
+		if let Some(to) = pointee
+			&& let Type::Pointer { to, .. } = *self.cx.types.resolve(to)
+			&& matches!(
+				self.cx.types.resolve(to),
+				Type::Slice { .. } | Type::Array { .. }
+			) {
 			diagnostic = diagnostic.with_note(
-				"a pointer to a slice is not gone through: index its \
-				 pointee, as `x.*[i]`",
+				"an element is reached through one pointer, not two: \
+				 dereference the outer one first, as `x.*[i]`",
 			);
 		}
 		self.cx.diagnostics.push(diagnostic);
-		None
 	}
 
 	/// Whether `ty` has `trait_index` here. `None` when the solver cannot
@@ -338,10 +390,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		trait_index: TraitIdx,
 		span: TextSpan,
 	) -> Option<bool> {
-		match self
-			.cx
-			.find_trait_impl_query(self.scope.env, ty, trait_index)
-		{
+		match self.cx.find_trait_impl_query(
+			self.scope.assumption_env,
+			ty,
+			trait_index,
+		) {
 			Ok(found) => Some(found.is_some()),
 			Err(error) => {
 				let site = SourceSpan::new(self.scope.file_id, span);
@@ -364,6 +417,38 @@ impl BodyContext<'_, '_, '_, '_> {
 				None
 			}
 		}
+	}
+
+	/// `ty`, made at `span` as a value: itself when it is a `StackValue`, else
+	/// `ERROR`, reported.
+	pub(super) fn require_stack_value(
+		&mut self,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> TypeIndex {
+		if ty == TypeIndex::ERROR {
+			return ty;
+		}
+		let site = SourceSpan::new(self.scope.file_id, span);
+		match self
+			.cx
+			.check_value_type(self.scope.assumption_env, ty, site)
+		{
+			Ok(()) => return ty,
+			Err(SolverError::Overflow) => {
+				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
+				self.cx.diagnostics.push(diagnostic);
+			}
+			// Its owner reported it.
+			Err(SolverError::Poisoned) => {}
+			Err(SolverError::Pending) => {
+				unreachable!("every signature is final when bodies are checked")
+			}
+		}
+		TypeIndex::ERROR
 	}
 
 	/// The field `member` of a value of type `object_ty`, and its type with
@@ -443,12 +528,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		let ty = self.cx.types.substitute(
 			declared,
 			Substitution {
-				envs: &self.cx.type_envs,
+				envs: &self.cx.generic_envs,
 				env: self.cx.structs[usize::from(struct_index)].type_params,
 				args: &args,
 			},
 		);
-		Some((field, self.normalized(ty, self.scope.env)))
+		Some((field, self.normalized(ty, self.scope.assumption_env)))
 	}
 
 	/// `place.&`: a shared pointer to a place, in its memory. Only a place
@@ -458,7 +543,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		value: &Spanned<ast::Expression>,
 		span: TextSpan,
 	) -> ExprIdx {
-		match self.build_operand(value, Access::Read) {
+		match self.build_operand(value) {
 			Operand::Place(place) => {
 				let Place { ty: to, memory, .. } = *self.body.place(place);
 				let ty = self.cx.types.intern(Type::Pointer {
@@ -507,7 +592,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let ast::Expression::Placeholder = target.inner {
 			let value = self.build(value, TypeIndex::INFER);
 			let ty = self.body.ty(value);
-			if self.cx.types.has_literal(ty) {
+			if self.cx.types.needs_context(ty) {
 				self.report_annotation_required(value);
 			}
 			return self.body.push(
@@ -516,7 +601,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				span,
 			);
 		}
-		match self.build_operand(target, Access::Write) {
+		match self.build_operand(target) {
 			Operand::Place(place) => {
 				self.check_place_writable(place);
 				let ty = self.body.place(place).ty;
@@ -558,7 +643,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let plain = plain_operator(op.inner);
-		match self.build_operand(target, Access::Write) {
+		match self.build_operand(target) {
 			Operand::Place(place) => {
 				self.check_place_writable(place);
 				let Place {
@@ -677,9 +762,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		if is_primitive_binary(plain, ty) {
 			return Some(CompoundMethod::Primitive);
 		}
-		Some(CompoundMethod::Method(
-			self.select_operator_method(selected, ty),
-		))
+		Some(CompoundMethod::Method(self.select_operator_method(
+			selected,
+			ty,
+			target_span,
+		)))
 	}
 
 	/// Reports a write through a shared pointer.

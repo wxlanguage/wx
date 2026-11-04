@@ -31,63 +31,70 @@ pub struct Char(value: u32);
 /// A reference to a function of any signature: a Wasm `funcref`.
 pub type funcref;
 
+/// The literal kinds, written `{integer}` and `{char}`: the type of a literal
+/// that has no type yet, and of an untyped constant
+/// (`const X: {integer} = 4;`), which takes its type where it is used.
+pub type integer;
+
+pub type char;
+
 /// Aborts execution by trapping: normal control flow never continues past a
 /// call to `trap`, so it has the bottom type `!`.
-pub func trap() -> !;
+pub crate func trap() -> !;
 
-pub trait Add {
+pub trait Add: StackValue {
     func add(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Sub {
+pub trait Sub: StackValue {
     func sub(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Mul {
+pub trait Mul: StackValue {
     func mul(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Div {
+pub trait Div: StackValue {
     func div(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Rem {
+pub trait Rem: StackValue {
     func rem(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Neg {
+pub trait Neg: StackValue {
     func neg(self: Self) -> Self;
 }
 
-pub trait BitAnd {
+pub trait BitAnd: StackValue {
     func bitand(self: Self, rhs: Self) -> Self;
 }
 
-pub trait BitOr {
+pub trait BitOr: StackValue {
     func bitor(self: Self, rhs: Self) -> Self;
 }
 
-pub trait BitXor {
+pub trait BitXor: StackValue {
     func bitxor(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Shl {
+pub trait Shl: StackValue {
     func shl(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Shr {
+pub trait Shr: StackValue {
     func shr(self: Self, rhs: Self) -> Self;
 }
 
-pub trait BitNot {
+pub trait BitNot: StackValue {
     func bitnot(self: Self) -> Self;
 }
 
-pub trait Not {
+pub trait Not: StackValue {
     func not(self: Self) -> Self;
 }
 
-pub trait PartialEq {
+pub trait PartialEq: StackValue {
     func eq(self: Self, other: Self) -> Bool;
 
     #[inline]
@@ -153,17 +160,17 @@ impl Ordering {
     #[inline]
     pub func reverse(self: Self) -> Ordering {
         match self {
-            Ordering::Less -> { Ordering::Greater },
-            Ordering::Equal -> { Ordering::Equal },
-            Ordering::Greater -> { Ordering::Less }
+            Ordering::Less => Ordering::Greater,
+            Ordering::Equal => Ordering::Equal,
+            Ordering::Greater => Ordering::Less,
         }
     }
 
     #[inline]
     pub func then(self: Self, other: Ordering) -> Ordering {
         match self {
-            Ordering::Equal -> { other },
-            _ -> { self }
+            Ordering::Equal => other,
+            _ => self,
         }
     }
 }
@@ -192,319 +199,303 @@ pub trait Ord: PartialOrd + Eq {
 
 /// The slice of `len` values starting at `data`.
 #[inline]
-pub func slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T] {
+pub func slice_from_parts<Mem: Memory, T: StackValue>(data: Mem::&T, len: Mem::Size) -> Mem::&[T] {
     transmute((data, len))
 }
 
 /// The exclusive slice of `len` values starting at `data`.
 #[inline]
-pub func slice_from_parts_mut<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::*[T] {
+pub func slice_from_parts_mut<Mem: Memory, T: StackValue>(data: Mem::*T, len: Mem::Size) -> Mem::*[T] {
     transmute((data, len))
 }
 
 /// The array of the one value `data` points at.
 #[inline]
-pub func array_from_ref<Mem: Memory, T>(data: Mem::&T) -> Mem::&[T; 1] {
+pub func array_from_ref<Mem: Memory, T: StackValue>(data: Mem::&T) -> Mem::&[T; 1] {
     transmute(data)
 }
 
 /// The exclusive array of the one value `data` points at.
 #[inline]
-pub func array_from_mut<Mem: Memory, T>(data: Mem::*T) -> Mem::*[T; 1] {
+pub func array_from_mut<Mem: Memory, T: StackValue>(data: Mem::*T) -> Mem::*[T; 1] {
     transmute(data)
 }
 
-/// A run of values in one memory. The compiler implements it for every slice
-/// and array type, `&` and `*` alike.
+/// A run of values in no memory, `[T]` or `[T; N]`, which only a pointer
+/// holds. The compiler implements it for every slice and array; a method
+/// takes the memory from its receiver, since one slice is what pointers into
+/// every memory point at.
 pub trait Slice {
     type Value;
-    type Mem: Memory;
 
-    func len(self: Self) -> Self::Mem::Size;
+    func len<M: Memory>(self: M::&Self) -> M::Size;
 
-    func as_ref(self: Self) -> Self::Mem::&Self::Value;
-
-    /// The value at `index`; traps when it is out of bounds.
-    func index(self: Self, index: Self::Mem::Size) -> Self::Mem::&Self::Value;
+    func as_ref<M: Memory>(self: M::&Self) -> M::&Self::Value;
 
     #[inline]
-    func first(self: Self) -> Self::Mem::&Self::Value {
+    func first<M: Memory>(self: M::&Self) -> M::&Self::Value {
         if self.len() == 0 { trap() };
-        self.index(0)
+        self[0].&
     }
 
     #[inline]
-    func last(self: Self) -> Self::Mem::&Self::Value {
+    func last<M: Memory>(self: M::&Self) -> M::&Self::Value {
         if self.len() == 0 { trap() };
-        self.index(self.len() - 1)
+        self[self.len() - 1].&
     }
 }
 
-/// A run of values that may be written: the compiler implements it for every
-/// exclusive slice and array type.
-pub trait SliceMut: Slice {
-    func as_ptr(self: Self) -> Self::Mem::*Self::Value;
-
-    /// The value at `index`; traps when it is out of bounds.
-    func index_mut(self: Self, index: Self::Mem::Size) -> Self::Mem::*Self::Value;
-
-    #[inline]
-    func first_mut(self: Self) -> Self::Mem::*Self::Value {
-        if self.len() == 0 { trap() };
-        self.index_mut(0)
-    }
-
-    #[inline]
-    func last_mut(self: Self) -> Self::Mem::*Self::Value {
-        if self.len() == 0 { trap() };
-        self.index_mut(self.len() - 1)
-    }
-}
-
-/// A run of values whose length is part of its type: the compiler implements
-/// it for every array type.
+/// A slice whose length is part of its type, `[T; N]`: the compiler
+/// implements it for every array.
 pub trait Array: Slice {
-    const SIZE: Self::Mem::Size;
+    const LEN: {integer};
 
-    func as_slice(self: Self) -> Self::Mem::&[Self::Value];
+    func as_slice<
+        Self: Array where { const LEN: Mem::Size, Value: StackValue },
+        Mem: Memory
+    >(self: Mem::&Self) -> Mem::&[Self::Value] {
+        slice_from_parts(transmute(self), Self::LEN)
+    }
+
+    func as_slice_mut<
+        Self: Array where { const LEN: Mem::Size, Value: StackValue },
+        Mem: Memory,
+    >(self: Mem::*Self) -> Mem::*[Self::Value] {
+        slice_from_parts_mut(transmute(self), Self::LEN)
+    }
 }
 
-/// The compiler implements it for every exclusive array type.
-pub trait ArrayMut: Array + SliceMut {
-    func as_slice_mut(self: Self) -> Self::Mem::*[Self::Value];
-}
+pub crate func i64_extend_i32(value: i32) -> i64;
 
-pub func i64_extend_i32(value: i32) -> i64;
+pub crate func u64_extend_u32(value: u32) -> u64;
 
-pub func u64_extend_u32(value: u32) -> u64;
+pub crate func i32_wrap_i64(value: i64) -> i32;
 
-pub func i32_wrap_i64(value: i64) -> i32;
+pub crate func f32_sqrt(value: f32) -> f32;
 
-pub func f32_sqrt(value: f32) -> f32;
+pub crate func f64_sqrt(value: f64) -> f64;
 
-pub func f64_sqrt(value: f64) -> f64;
+pub crate func f32_abs(value: f32) -> f32;
 
-pub func f32_abs(value: f32) -> f32;
+pub crate func f64_abs(value: f64) -> f64;
 
-pub func f64_abs(value: f64) -> f64;
+pub crate func f32_floor(value: f32) -> f32;
 
-pub func f32_floor(value: f32) -> f32;
+pub crate func f64_floor(value: f64) -> f64;
 
-pub func f64_floor(value: f64) -> f64;
+pub crate func f32_ceil(value: f32) -> f32;
 
-pub func f32_ceil(value: f32) -> f32;
+pub crate func f64_ceil(value: f64) -> f64;
 
-pub func f64_ceil(value: f64) -> f64;
+pub crate func f32_trunc(value: f32) -> f32;
 
-pub func f32_trunc(value: f32) -> f32;
+pub crate func f64_trunc(value: f64) -> f64;
 
-pub func f64_trunc(value: f64) -> f64;
+pub crate func f32_nearest(value: f32) -> f32;
 
-pub func f32_nearest(value: f32) -> f32;
+pub crate func f64_nearest(value: f64) -> f64;
 
-pub func f64_nearest(value: f64) -> f64;
+pub crate func f32_min(a: f32, b: f32) -> f32;
 
-pub func f32_min(a: f32, b: f32) -> f32;
+pub crate func f64_min(a: f64, b: f64) -> f64;
 
-pub func f64_min(a: f64, b: f64) -> f64;
+pub crate func f32_max(a: f32, b: f32) -> f32;
 
-pub func f32_max(a: f32, b: f32) -> f32;
+pub crate func f64_max(a: f64, b: f64) -> f64;
 
-pub func f64_max(a: f64, b: f64) -> f64;
+pub crate func f32_copysign(a: f32, b: f32) -> f32;
 
-pub func f32_copysign(a: f32, b: f32) -> f32;
+pub crate func f64_copysign(a: f64, b: f64) -> f64;
 
-pub func f64_copysign(a: f64, b: f64) -> f64;
+pub crate func i32_neg(value: i32) -> i32;
 
-pub func i32_neg(value: i32) -> i32;
+pub crate func i64_neg(value: i64) -> i64;
 
-pub func i64_neg(value: i64) -> i64;
+pub crate func f32_neg(value: f32) -> f32;
 
-pub func f32_neg(value: f32) -> f32;
+pub crate func f64_neg(value: f64) -> f64;
 
-pub func f64_neg(value: f64) -> f64;
+pub crate func i32_add(a: i32, b: i32) -> i32;
 
-pub func i32_add(a: i32, b: i32) -> i32;
+pub crate func i64_add(a: i64, b: i64) -> i64;
 
-pub func i64_add(a: i64, b: i64) -> i64;
+pub crate func f32_add(a: f32, b: f32) -> f32;
 
-pub func f32_add(a: f32, b: f32) -> f32;
+pub crate func f64_add(a: f64, b: f64) -> f64;
 
-pub func f64_add(a: f64, b: f64) -> f64;
+pub crate func i32_sub(a: i32, b: i32) -> i32;
 
-pub func i32_sub(a: i32, b: i32) -> i32;
+pub crate func i64_sub(a: i64, b: i64) -> i64;
 
-pub func i64_sub(a: i64, b: i64) -> i64;
+pub crate func f32_sub(a: f32, b: f32) -> f32;
 
-pub func f32_sub(a: f32, b: f32) -> f32;
+pub crate func f64_sub(a: f64, b: f64) -> f64;
 
-pub func f64_sub(a: f64, b: f64) -> f64;
+pub crate func i32_mul(a: i32, b: i32) -> i32;
 
-pub func i32_mul(a: i32, b: i32) -> i32;
+pub crate func i64_mul(a: i64, b: i64) -> i64;
 
-pub func i64_mul(a: i64, b: i64) -> i64;
+pub crate func f32_mul(a: f32, b: f32) -> f32;
 
-pub func f32_mul(a: f32, b: f32) -> f32;
+pub crate func f64_mul(a: f64, b: f64) -> f64;
 
-pub func f64_mul(a: f64, b: f64) -> f64;
+pub crate func i32_div(a: i32, b: i32) -> i32;
 
-pub func i32_div(a: i32, b: i32) -> i32;
+pub crate func u32_div(a: u32, b: u32) -> u32;
 
-pub func u32_div(a: u32, b: u32) -> u32;
+pub crate func i64_div(a: i64, b: i64) -> i64;
 
-pub func i64_div(a: i64, b: i64) -> i64;
+pub crate func u64_div(a: u64, b: u64) -> u64;
 
-pub func u64_div(a: u64, b: u64) -> u64;
+pub crate func f32_div(a: f32, b: f32) -> f32;
 
-pub func f32_div(a: f32, b: f32) -> f32;
+pub crate func f64_div(a: f64, b: f64) -> f64;
 
-pub func f64_div(a: f64, b: f64) -> f64;
+pub crate func i32_rem(a: i32, b: i32) -> i32;
 
-pub func i32_rem(a: i32, b: i32) -> i32;
+pub crate func u32_rem(a: u32, b: u32) -> u32;
 
-pub func u32_rem(a: u32, b: u32) -> u32;
+pub crate func i64_rem(a: i64, b: i64) -> i64;
 
-pub func i64_rem(a: i64, b: i64) -> i64;
+pub crate func u64_rem(a: u64, b: u64) -> u64;
 
-pub func u64_rem(a: u64, b: u64) -> u64;
+pub crate func i32_bitand(a: i32, b: i32) -> i32;
 
-pub func i32_bitand(a: i32, b: i32) -> i32;
+pub crate func i64_bitand(a: i64, b: i64) -> i64;
 
-pub func i64_bitand(a: i64, b: i64) -> i64;
+pub crate func i32_bitor(a: i32, b: i32) -> i32;
 
-pub func i32_bitor(a: i32, b: i32) -> i32;
+pub crate func i64_bitor(a: i64, b: i64) -> i64;
 
-pub func i64_bitor(a: i64, b: i64) -> i64;
+pub crate func i32_bitxor(a: i32, b: i32) -> i32;
 
-pub func i32_bitxor(a: i32, b: i32) -> i32;
+pub crate func i64_bitxor(a: i64, b: i64) -> i64;
 
-pub func i64_bitxor(a: i64, b: i64) -> i64;
+pub crate func i32_shl(a: i32, b: i32) -> i32;
 
-pub func i32_shl(a: i32, b: i32) -> i32;
+pub crate func i64_shl(a: i64, b: i64) -> i64;
 
-pub func i64_shl(a: i64, b: i64) -> i64;
+pub crate func i32_shr(a: i32, b: i32) -> i32;
 
-pub func i32_shr(a: i32, b: i32) -> i32;
+pub crate func u32_shr(a: u32, b: u32) -> u32;
 
-pub func u32_shr(a: u32, b: u32) -> u32;
+pub crate func i64_shr(a: i64, b: i64) -> i64;
 
-pub func i64_shr(a: i64, b: i64) -> i64;
+pub crate func u64_shr(a: u64, b: u64) -> u64;
 
-pub func u64_shr(a: u64, b: u64) -> u64;
+pub crate func i32_bitnot(value: i32) -> i32;
 
-pub func i32_bitnot(value: i32) -> i32;
+pub crate func i64_bitnot(value: i64) -> i64;
 
-pub func i64_bitnot(value: i64) -> i64;
+pub crate func i32_eqz(value: i32) -> Bool;
 
-pub func i32_eqz(value: i32) -> Bool;
+pub crate func i32_eq(a: i32, b: i32) -> Bool;
 
-pub func i32_eq(a: i32, b: i32) -> Bool;
+pub crate func i64_eq(a: i64, b: i64) -> Bool;
 
-pub func i64_eq(a: i64, b: i64) -> Bool;
+pub crate func f32_eq(a: f32, b: f32) -> Bool;
 
-pub func f32_eq(a: f32, b: f32) -> Bool;
+pub crate func f64_eq(a: f64, b: f64) -> Bool;
 
-pub func f64_eq(a: f64, b: f64) -> Bool;
+pub crate func i32_ne(a: i32, b: i32) -> Bool;
 
-pub func i32_ne(a: i32, b: i32) -> Bool;
+pub crate func i64_ne(a: i64, b: i64) -> Bool;
 
-pub func i64_ne(a: i64, b: i64) -> Bool;
+pub crate func f32_ne(a: f32, b: f32) -> Bool;
 
-pub func f32_ne(a: f32, b: f32) -> Bool;
+pub crate func f64_ne(a: f64, b: f64) -> Bool;
 
-pub func f64_ne(a: f64, b: f64) -> Bool;
+pub crate func i32_lt(a: i32, b: i32) -> Bool;
 
-pub func i32_lt(a: i32, b: i32) -> Bool;
+pub crate func u32_lt(a: u32, b: u32) -> Bool;
 
-pub func u32_lt(a: u32, b: u32) -> Bool;
+pub crate func i64_lt(a: i64, b: i64) -> Bool;
 
-pub func i64_lt(a: i64, b: i64) -> Bool;
+pub crate func u64_lt(a: u64, b: u64) -> Bool;
 
-pub func u64_lt(a: u64, b: u64) -> Bool;
+pub crate func f32_lt(a: f32, b: f32) -> Bool;
 
-pub func f32_lt(a: f32, b: f32) -> Bool;
+pub crate func f64_lt(a: f64, b: f64) -> Bool;
 
-pub func f64_lt(a: f64, b: f64) -> Bool;
+pub crate func i32_le(a: i32, b: i32) -> Bool;
 
-pub func i32_le(a: i32, b: i32) -> Bool;
+pub crate func u32_le(a: u32, b: u32) -> Bool;
 
-pub func u32_le(a: u32, b: u32) -> Bool;
+pub crate func i64_le(a: i64, b: i64) -> Bool;
 
-pub func i64_le(a: i64, b: i64) -> Bool;
+pub crate func u64_le(a: u64, b: u64) -> Bool;
 
-pub func u64_le(a: u64, b: u64) -> Bool;
+pub crate func f32_le(a: f32, b: f32) -> Bool;
 
-pub func f32_le(a: f32, b: f32) -> Bool;
+pub crate func f64_le(a: f64, b: f64) -> Bool;
 
-pub func f64_le(a: f64, b: f64) -> Bool;
+pub crate func i32_gt(a: i32, b: i32) -> Bool;
 
-pub func i32_gt(a: i32, b: i32) -> Bool;
+pub crate func u32_gt(a: u32, b: u32) -> Bool;
 
-pub func u32_gt(a: u32, b: u32) -> Bool;
+pub crate func i64_gt(a: i64, b: i64) -> Bool;
 
-pub func i64_gt(a: i64, b: i64) -> Bool;
+pub crate func u64_gt(a: u64, b: u64) -> Bool;
 
-pub func u64_gt(a: u64, b: u64) -> Bool;
+pub crate func f32_gt(a: f32, b: f32) -> Bool;
 
-pub func f32_gt(a: f32, b: f32) -> Bool;
+pub crate func f64_gt(a: f64, b: f64) -> Bool;
 
-pub func f64_gt(a: f64, b: f64) -> Bool;
+pub crate func i32_ge(a: i32, b: i32) -> Bool;
 
-pub func i32_ge(a: i32, b: i32) -> Bool;
+pub crate func u32_ge(a: u32, b: u32) -> Bool;
 
-pub func u32_ge(a: u32, b: u32) -> Bool;
+pub crate func i64_ge(a: i64, b: i64) -> Bool;
 
-pub func i64_ge(a: i64, b: i64) -> Bool;
+pub crate func u64_ge(a: u64, b: u64) -> Bool;
 
-pub func u64_ge(a: u64, b: u64) -> Bool;
+pub crate func f32_ge(a: f32, b: f32) -> Bool;
 
-pub func f32_ge(a: f32, b: f32) -> Bool;
+pub crate func f64_ge(a: f64, b: f64) -> Bool;
 
-pub func f64_ge(a: f64, b: f64) -> Bool;
+pub crate func f32_convert_i32(value: i32) -> f32;
 
-pub func f32_convert_i32(value: i32) -> f32;
+pub crate func f32_convert_u32(value: u32) -> f32;
 
-pub func f32_convert_u32(value: u32) -> f32;
+pub crate func f32_convert_i64(value: i64) -> f32;
 
-pub func f32_convert_i64(value: i64) -> f32;
+pub crate func f32_convert_u64(value: u64) -> f32;
 
-pub func f32_convert_u64(value: u64) -> f32;
+pub crate func f64_convert_i32(value: i32) -> f64;
 
-pub func f64_convert_i32(value: i32) -> f64;
+pub crate func f64_convert_u32(value: u32) -> f64;
 
-pub func f64_convert_u32(value: u32) -> f64;
+pub crate func f64_convert_i64(value: i64) -> f64;
 
-pub func f64_convert_i64(value: i64) -> f64;
+pub crate func f64_convert_u64(value: u64) -> f64;
 
-pub func f64_convert_u64(value: u64) -> f64;
+pub crate func i32_trunc_f32(value: f32) -> i32;
 
-pub func i32_trunc_f32(value: f32) -> i32;
+pub crate func u32_trunc_f32(value: f32) -> u32;
 
-pub func u32_trunc_f32(value: f32) -> u32;
+pub crate func i32_trunc_f64(value: f64) -> i32;
 
-pub func i32_trunc_f64(value: f64) -> i32;
+pub crate func u32_trunc_f64(value: f64) -> u32;
 
-pub func u32_trunc_f64(value: f64) -> u32;
+pub crate func i64_trunc_f32(value: f32) -> i64;
 
-pub func i64_trunc_f32(value: f32) -> i64;
+pub crate func u64_trunc_f32(value: f32) -> u64;
 
-pub func u64_trunc_f32(value: f32) -> u64;
+pub crate func i64_trunc_f64(value: f64) -> i64;
 
-pub func i64_trunc_f64(value: f64) -> i64;
+pub crate func u64_trunc_f64(value: f64) -> u64;
 
-pub func u64_trunc_f64(value: f64) -> u64;
+pub crate func f64_promote_f32(value: f32) -> f64;
 
-pub func f64_promote_f32(value: f32) -> f64;
+pub crate func f32_demote_f64(value: f64) -> f32;
 
-pub func f32_demote_f64(value: f64) -> f32;
+pub crate func i32_reinterpret_f32(value: f32) -> i32;
 
-pub func i32_reinterpret_f32(value: f32) -> i32;
+pub crate func f32_reinterpret_i32(value: i32) -> f32;
 
-pub func f32_reinterpret_i32(value: i32) -> f32;
+pub crate func i64_reinterpret_f64(value: f64) -> i64;
 
-pub func i64_reinterpret_f64(value: f64) -> i64;
-
-pub func f64_reinterpret_i64(value: i64) -> f64;
+pub crate func f64_reinterpret_i64(value: i64) -> f64;
 
 impl f32 {
     pub const NAN: f32 = 0.0 / 0.0;
@@ -1103,13 +1094,6 @@ impl Neg for f32 {
     }
 }
 
-impl Rem for f32 {
-    #[inline]
-    func rem(self: Self, rhs: Self) -> Self {
-        self - rhs * (self / rhs).trunc()
-    }
-}
-
 impl Add for f64 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
@@ -1145,332 +1129,463 @@ impl Neg for f64 {
     }
 }
 
-impl Rem for f64 {
-    #[inline]
-    func rem(self: Self, rhs: Self) -> Self {
-        self - rhs * (self / rhs).trunc()
-    }
-}
-
 impl Add for i8 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_add(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Sub for i8 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_sub(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Mul for i8 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_mul(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Div for i8 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(i32_div(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_div(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Rem for i8 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(i32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_rem(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Neg for i8 {
     #[inline]
     func neg(self: Self) -> Self {
-        transmute(i32_neg(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_neg(transmute(self)), 24),
+            24,
+        ))
     }
 }
 
 impl BitAnd for i8 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitand(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl BitOr for i8 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitor(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl BitXor for i8 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitxor(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Shl for i8 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shl(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl Shr for i8 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(i32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shr(transmute(self), transmute(rhs)), 24),
+            24,
+        ))
     }
 }
 
 impl BitNot for i8 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_bitnot(transmute(self)), 24),
+            24,
+        ))
     }
 }
 
 impl Add for u8 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_add(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Sub for u8 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_sub(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Mul for u8 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_mul(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Div for u8 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(u32_div(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_div(transmute(self), transmute(rhs))),
+            0xFF,
+        ))
     }
 }
 
 impl Rem for u8 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(u32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_rem(transmute(self), transmute(rhs))),
+            0xFF,
+        ))
     }
 }
 
 impl BitAnd for u8 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitand(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl BitOr for u8 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitor(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl BitXor for u8 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitxor(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Shl for u8 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_shl(transmute(self), transmute(rhs)),
+            0xFF,
+        ))
     }
 }
 
 impl Shr for u8 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(u32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_shr(transmute(self), transmute(rhs))),
+            0xFF,
+        ))
     }
 }
 
 impl BitNot for u8 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_bitand(
+            i32_bitnot(transmute(self)),
+            0xFF,
+        ))
     }
 }
 
 impl Add for i16 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_add(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Sub for i16 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_sub(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Mul for i16 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_mul(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Div for i16 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(i32_div(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_div(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Rem for i16 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(i32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_rem(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Neg for i16 {
     #[inline]
     func neg(self: Self) -> Self {
-        transmute(i32_neg(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_neg(transmute(self)), 16),
+            16,
+        ))
     }
 }
 
 impl BitAnd for i16 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitand(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl BitOr for i16 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitor(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl BitXor for i16 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_bitxor(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Shl for i16 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shl(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl Shr for i16 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(i32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_shr(
+            i32_shl(i32_shr(transmute(self), transmute(rhs)), 16),
+            16,
+        ))
     }
 }
 
 impl BitNot for i16 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_shr(
+            i32_shl(i32_bitnot(transmute(self)), 16),
+            16,
+        ))
     }
 }
 
 impl Add for u16 {
     #[inline]
     func add(self: Self, rhs: Self) -> Self {
-        transmute(i32_add(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_add(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Sub for u16 {
     #[inline]
     func sub(self: Self, rhs: Self) -> Self {
-        transmute(i32_sub(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_sub(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Mul for u16 {
     #[inline]
     func mul(self: Self, rhs: Self) -> Self {
-        transmute(i32_mul(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_mul(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Div for u16 {
     #[inline]
     func div(self: Self, rhs: Self) -> Self {
-        transmute(u32_div(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_div(transmute(self), transmute(rhs))),
+            0xFFFF,
+        ))
     }
 }
 
 impl Rem for u16 {
     #[inline]
     func rem(self: Self, rhs: Self) -> Self {
-        transmute(u32_rem(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_rem(transmute(self), transmute(rhs))),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitAnd for u16 {
     #[inline]
     func bitand(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitand(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitand(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitOr for u16 {
     #[inline]
     func bitor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitor(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitXor for u16 {
     #[inline]
     func bitxor(self: Self, rhs: Self) -> Self {
-        transmute(i32_bitxor(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_bitxor(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Shl for u16 {
     #[inline]
     func shl(self: Self, rhs: Self) -> Self {
-        transmute(i32_shl(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            i32_shl(transmute(self), transmute(rhs)),
+            0xFFFF,
+        ))
     }
 }
 
 impl Shr for u16 {
     #[inline]
     func shr(self: Self, rhs: Self) -> Self {
-        transmute(u32_shr(transmute(self), transmute(rhs)))
+        transmute(i32_bitand(
+            transmute(u32_shr(transmute(self), transmute(rhs))),
+            0xFFFF,
+        ))
     }
 }
 
 impl BitNot for u16 {
     #[inline]
     func bitnot(self: Self) -> Self {
-        transmute(i32_bitnot(transmute(self)))
+        transmute(i32_bitand(
+            i32_bitnot(transmute(self)),
+            0xFFFF,
+        ))
     }
 }
 
@@ -2011,11 +2126,11 @@ pub typeset Integer: Add + Sub + Mul + Div + Rem + BitAnd + BitOr + BitXor + Shl
     i64,
 }
 
-pub trait UnsignedInt {
+pub trait UnsignedInt: StackValue {
     type Signed: SignedInt where { Unsigned = Self };
 }
 
-pub trait SignedInt {
+pub trait SignedInt: StackValue {
     type Unsigned: UnsignedInt where { Signed = Self };
 }
 
@@ -2053,20 +2168,20 @@ impl SignedInt for i64 {
 
 /// Grows `mem` by `delta` pages; returns the previous size in pages, or `-1` on failure. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/grow
-pub func memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
+pub crate func memory_grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;
 
 /// Returns the current size of `mem` in pages. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/size
-pub func memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
+pub crate func memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 
 /// This is analogous to `memset` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/fill
-pub func memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
+pub crate func memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
 
 /// Can copy across two different memories as long as they have the same pointer size.
 /// This is analogous to `memmove` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/copy
-pub func memory_copy<
+pub crate func memory_copy<
     Size: PointerSize,
     SrcMem: Memory where { Size = Size },
     DstMem: Memory where { Size = Size },
@@ -2074,15 +2189,16 @@ pub func memory_copy<
 
 pub typeset PointerSize: Add + Sub + Mul + PartialEq + UnsignedInt + StackValue { u32, u64 }
 
-func global_get<G: Global>(g: G) -> G::Value;
+crate func global_get<G: Global>(g: G) -> G::Value;
 
-func global_set<G: Global>(g: G, value: G::Value);
+crate func global_set<G: Global>(g: G, value: G::Value);
 
-/// How a value sits on the Wasm stack. Every type but `!` (and any type
-/// containing it) is one; the compiler answers it from the type's structure.
-/// `Repr` is the value's Wasm values as wx's own primitives: its parts in
-/// declaration order, flattened, zero-sized ones dropped. `Point(u32, u32)` and
-/// `(u8, u8)` are both `(i32, i32)`, `Meters(u32)` is `i32`, `()` is `()`.
+/// How a value sits on the Wasm stack; the compiler answers it from the type's
+/// structure. `Repr` is the value's Wasm values as wx's own primitives: its
+/// parts in declaration order, flattened, zero-sized ones dropped.
+/// `Point(u32, u32)` and `(u8, u8)` are both `(i32, i32)`, `Meters(u32)` is
+/// `i32`, `()` is `()`. A type containing `!` has no value and is held as `!`,
+/// which no other type is, so `transmute` never makes one.
 pub trait StackValue {
     type Repr;
 }
@@ -2093,12 +2209,56 @@ pub typeset StackScalar { i32, i64, f32, f64, funcref }
 /// Reinterprets a value as another type held the same way on the stack. Changing
 /// a value's representation (`i32` to `i64`, an integer to a float) is an
 /// instruction's job.
-pub func transmute<
+pub crate func transmute<
     T: StackValue,
     U: StackValue where { Repr = T::Repr },
 >(value: T) -> U;
 
-pub trait Global {
+/// Every pointer type, `M::&T` and `M::*T`; the compiler answers it from the
+/// pointer's structure. `Metadata` is what the pointer carries beside its
+/// address, each count a `Memory::Size`: `()` for a pointer to a value or an
+/// array, the length for a pointer to a slice.
+pub trait Pointer: StackValue where {
+    Repr = <(Self::Memory::Size, Self::Metadata) as StackValue>::Repr,
+} {
+    type Memory: Memory;
+    type Pointee;
+    type Metadata: StackValue;
+}
+
+/// The pointer of type `P` at `address`, carrying `metadata` beside it.
+#[inline]
+pub func from_raw_parts<P: Pointer>(
+    address: P::Memory::Size,
+    metadata: P::Metadata,
+) -> P {
+    transmute(address, metadata)
+}
+
+#[inline]
+pub func into_raw_parts<P: Pointer>(
+    pointer: P
+) -> (P::Memory::Size, P::Metadata) {
+    transmute(pointer)
+}
+
+/// What `pointer` carries beside its address: a slice's length, or `()`.
+#[inline]
+pub func metadata<P: Pointer>(pointer: P) -> P::Metadata {
+    local (_, metadata) =
+        transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+    metadata
+}
+
+/// Where `pointer` points: its address in its memory.
+#[inline]
+pub func address<P: Pointer>(pointer: P) -> P::Memory::Size {
+    local (address, _) =
+        transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+    address
+}
+
+pub trait Global: StackValue {
     type Value: StackValue where { Repr: StackScalar };
 
     func get(self: Self) -> Self::Value {
@@ -2112,11 +2272,8 @@ pub trait GlobalMut: Global {
     }
 }
 
-pub trait Memory {
+pub trait Memory: StackValue {
     type Size: PointerSize;
-
-    /// This constant exposes internal information about which index this memory will use in the generated wasm module.
-    const INDEX: u32;
 
     /// The address right after the compiler's statically-placed data (string and array literals) in this memory.
     /// This can be used as a safe starting point for making dynamic allocations.
@@ -2145,18 +2302,18 @@ pub trait Memory {
     }
 }
 
-pub trait Call {
-    type Args;
-    type Result;
+pub trait Call: StackValue {
+    type Args: StackValue;
+    type Result: StackValue;
 
     func call(self: Self, args: Self::Args) -> Self::Result;
 }
 
 pub trait Function: Call {}
 
-pub func size_of<T, Mem: Memory>() -> Mem::Size;
+pub crate func size_of<T, Mem: Memory>() -> Mem::Size;
 
-pub func align_of<T, Mem: Memory>() -> Mem::Size;
+pub crate func align_of<T, Mem: Memory>() -> Mem::Size;
 
 pub struct Layout<Mem: Memory>(
     size: Mem::Size,
@@ -2191,14 +2348,14 @@ pub trait Allocator {
     func allocate(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
 
     #[inline]
-    func allocate_value<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
+    func allocate_value<T: StackValue>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
         local ptr: Self::Mem::*T = transmute(self.allocate(Layout::of::<T>()));
         ptr.* = value;
         ptr
     }
 
     #[inline]
-    func allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
+    func allocate_slice_uninit<T: StackValue>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts_mut(
             transmute::<_, Self::Mem::*T>(self.allocate(Layout::array::<T>(len))),
             len,
@@ -2222,28 +2379,8 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
     }
 
     #[inline]
-    pub func from_ref(ref: Mem::&T) -> Self {
-        Self({ addr: transmute(ref) })
-    }
-
-    #[inline]
-    pub func from_ptr(ptr: Mem::*T) -> Self {
-        Self({ addr: transmute(ptr) })
-    }
-
-    #[inline]
     pub func from_addr(addr: Mem::Size) -> Self {
         Self({ addr })
-    }
-
-    #[inline]
-    pub func as_ref(self: Self) -> Mem::&T {
-        transmute(self.addr)
-    }
-
-    #[inline]
-    pub func as_ptr(self: Self) -> Mem::*T {
-        transmute(self.addr)
     }
 
     #[inline]
@@ -2254,6 +2391,29 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
     #[inline]
     pub func cast<U>(self: Self) -> RawPtr<Mem, U> {
         RawPtr({ addr: self.addr })
+    }
+}
+
+/// What needs `T`'s pointers thin: an address and nothing else.
+impl<Mem: Memory, T: StackValue> RawPtr<Mem, T> {
+    #[inline]
+    pub func from_ref(ref: Mem::&T) -> Self {
+        Self({ addr: transmute(ref) })
+    }
+
+    #[inline]
+    pub func from_ptr(ptr: Mem::*T) -> Self {
+        Self({ addr: transmute(ptr) })
+    }
+
+    #[inline]
+    pub func as_ref(self: Self) -> Mem::&T {
+        transmute(self.addr)
+    }
+
+    #[inline]
+    pub func as_ptr(self: Self) -> Mem::*T {
+        transmute(self.addr)
     }
 }
 

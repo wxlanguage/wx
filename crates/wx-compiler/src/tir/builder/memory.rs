@@ -280,7 +280,7 @@ impl<'ast> Builder<'ast, '_> {
 		}
 	}
 
-	/// Reads and validates a `#[memory_limits(min_pages = .., max_pages = ..)]`
+	/// Reads and validates a `#[memory_limits({ min_pages: .., max_pages: .. })]`
 	/// attribute off a memory declaration. These are hints, not obligations —
 	/// codegen may still bump the emitted initial page count above
 	/// `min_pages` when static data requires it — so this only validates the
@@ -329,7 +329,7 @@ impl<'ast> Builder<'ast, '_> {
 								"`#[memory_limits(...)]` requires parenthesized arguments",
 							)
 							.with_note(
-								"example: #[memory_limits(min_pages = 1, max_pages = 10)]",
+								"example: #[memory_limits({ min_pages: 1, max_pages: 10 })]",
 							)
 							.with_label(
 								SourceSpan::new(file_id, attr.name.span)

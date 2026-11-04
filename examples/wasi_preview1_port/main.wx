@@ -46,7 +46,7 @@
 // through a pointer lines up with the fields wx code reads back.
 use std::*;
 
-#[memory_limits(min_pages = 1)]
+#[memory_limits({ min_pages: 1 })]
 memory heap: Memory where { Size = u32 };
 // ── Plain scalar typedefs ───────────────────────────────────────────────────
 type Size = u32;

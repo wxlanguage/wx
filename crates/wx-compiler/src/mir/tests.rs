@@ -1558,9 +1558,9 @@ fn test_match_int_lowers_to_switch() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 -> { 1 },
-                _ -> { -1 },
+                0 => { 0 },
+                1 => { 1 },
+                _ => { -1 },
             }
         }
 
@@ -1583,9 +1583,9 @@ fn test_match_enum_lowers_discriminants_to_repr_values() {
 
         func to_u8(c: Color) -> u8 {
             match c {
-                Color::Red -> { 0 },
-                Color::Green -> { 1 },
-                Color::Blue -> { 2 },
+                Color::Red => { 0 },
+                Color::Green => { 1 },
+                Color::Blue => { 2 },
             }
         }
 
@@ -1605,9 +1605,9 @@ fn test_match_exhaustive_enum_no_wildcard_has_no_default() {
 
         func to_u8(c: Color) -> u8 {
             match c {
-                Color::Red -> { 0 },
-                Color::Green -> { 1 },
-                Color::Blue -> { 2 },
+                Color::Red => { 0 },
+                Color::Green => { 1 },
+                Color::Blue => { 2 },
             }
         }
 

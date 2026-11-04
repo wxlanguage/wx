@@ -92,6 +92,7 @@ pub enum Token {
 	CaretEq,
 	Hash,
 	MinusRightArrow,
+	FatArrow,
 	// Special
 	Comment,
 	DocComment,
@@ -152,6 +153,7 @@ impl std::fmt::Display for Token {
 			CaretEq => "^=",
 			Hash => "#",
 			MinusRightArrow => "->",
+			FatArrow => "=>",
 			Comment => "comment",
 			DocComment => "doc comment",
 			Unknown => "unknown token",
@@ -630,7 +632,7 @@ impl<'src> Lexer<'src> {
 			')' => Token::CloseParen,
 			';' => Token::SemiColon,
 			',' => Token::Comma,
-			'=' => self.consume_and_check('=', Token::EqEq, Token::Eq),
+			'=' => self.consume_equals(),
 			'{' => Token::OpenBrace,
 			'}' => Token::CloseBrace,
 			'#' => Token::Hash,
@@ -663,6 +665,22 @@ impl<'src> Lexer<'src> {
 		let span = TextSpan::new(start, self.offset() as u32);
 
 		Spanned { inner: token, span }
+	}
+
+	/// `=`, `==`, or `=>`.
+	#[inline]
+	fn consume_equals(&mut self) -> Token {
+		match self.chars.clone().next().unwrap_or(EOF) {
+			'=' => {
+				_ = self.chars.next();
+				Token::EqEq
+			}
+			'>' => {
+				_ = self.chars.next();
+				Token::FatArrow
+			}
+			_ => Token::Eq,
+		}
 	}
 
 	#[inline]
@@ -1197,7 +1215,7 @@ pub enum Expression {
 		then_block: Box<Spanned<Expression>>,
 		else_block: Option<Box<Spanned<Expression>>>,
 	},
-	/// `match {expr} { {pattern} -> { ... }, ... }`
+	/// `match {expr} { {pattern} => { ... }, ... }`
 	Match {
 		scrutinee: Box<Spanned<Expression>>,
 		arms: Box<[Separated<Spanned<MatchArm>>]>,
@@ -1296,7 +1314,8 @@ pub struct NamedArgument {
 	pub value: Option<Box<Spanned<Expression>>>,
 }
 
-/// One arm of a `match` expression: `{pattern} -> { ... }`. The pattern
+/// One arm of a `match` expression: `{pattern} => { ... }` or
+/// `{pattern} => expr`. The pattern
 /// says what each of its terms is on its own: a name binds, a literal
 /// compares with that value, a qualified path with that constant.
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1372,7 +1391,7 @@ pub enum BoundExpression {
 	/// associated-type bindings.
 	WithBindings {
 		path: Box<BoundExpression>,
-		bindings: Box<[AssocTypeBinding]>,
+		bindings: Box<[AssocBinding]>,
 	},
 	/// `Bound1 + Bound2 + Bound3` — multiple bounds joined by `+`.
 	BoundList(Box<[Spanned<BoundExpression>]>),
@@ -1470,23 +1489,36 @@ pub struct FunctionTypeParam {
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
-/// `Size = u32` (equality) or `Size: UnsignedInt` (bound) inside a `where {
-/// }` block — constrains an associated type.
+/// One entry of a `where { .. }` block, constraining a member of the bound's
+/// trait: an associated type (`Size = u32`, `Size: UnsignedInt`) or, marked
+/// `const`, an associated constant (`const LEN: u32`, `const LEN = 4`).
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub struct AssocTypeBinding {
+pub struct AssocBinding {
 	pub name: Spanned<SymbolU32>,
-	pub kind: AssocTypeBindingKind,
+	pub kind: AssocBindingKind,
 }
 
-/// The right-hand side of an [`AssocTypeBinding`].
+/// What an [`AssocBinding`] states. The `const` keyword alone tells a
+/// constant's entry from a type's.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum AssocTypeBindingKind {
+pub enum AssocBindingKind {
 	/// `Size = u32` — the associated type must equal exactly this type.
 	Equals(Spanned<TypeExpression>),
 	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
 	Bound(Spanned<BoundExpression>),
+	/// `const LEN: u32` — the constant's value must be representable as this
+	/// type.
+	ConstRepresentable {
+		const_span: TextSpan,
+		ty: Spanned<TypeExpression>,
+	},
+	/// `const LEN = 4` — the constant must have this value.
+	ConstEquals {
+		const_span: TextSpan,
+		value: Spanned<ConstArgument>,
+	},
 }
 
 /// `*T` = exclusive pointer/slice/array, `&T` = shared, always read-only.
@@ -1526,28 +1558,22 @@ pub enum TypeExpression {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
 		result: Option<Box<Spanned<TypeExpression>>>,
 	},
-	/// `*u8` or `&u8`; `heap::*u8` names the memory it points into. The
-	/// parser accepts an untagged pointer and the type checker reports it,
-	/// since a pointer always needs its memory. The tag is carried on the
-	/// pointer itself
-	/// (rather than as a separate wrapper node) so only a pointer/slice/
-	/// array can ever be tagged, a constraint the parser otherwise has to
-	/// enforce by hand against an arbitrary inner type expression.
+	/// `*u8` or `&u8`; `heap::*u8` names the memory it points into, and
+	/// `heap::&[u8]` is a pointer to the slice `[u8]`. The parser accepts
+	/// an untagged pointer and the type checker reports it, since a pointer
+	/// always needs its memory. The tag is carried on the pointer itself
+	/// (rather than as a separate wrapper node) so only a pointer can ever
+	/// be tagged, a constraint the parser otherwise has to enforce by hand
+	/// against an arbitrary inner type expression.
 	Pointer {
 		ownership: Ownership,
 		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 	},
-	/// `*[u8]` or `&[u8]`; see `Pointer` for the optional `heap::` tag.
-	Slice {
-		ownership: Ownership,
-		memory: Option<Box<[PathSegment]>>,
-		inner: Box<Spanned<TypeExpression>>,
-	},
-	/// `*[u8; 5]` or `&[u8; N]`; see `Pointer` for the optional `heap::` tag.
+	/// `[u8]`, a slice: a run of values in no memory, held by a pointer.
+	Slice { inner: Box<Spanned<TypeExpression>> },
+	/// `[u8; 5]` or `[u8; N]`, an array: a slice of a known length.
 	Array {
-		ownership: Ownership,
-		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 		/// A literal or a constant, as a constant argument is.
 		length: Spanned<ConstArgument>,
@@ -1568,6 +1594,9 @@ pub enum TypeExpression {
 		inner: Box<Spanned<TypeExpression>>,
 		segments: Box<[PathSegment]>,
 	},
+	/// `{integer}`: a literal kind, the type of a literal that has none yet.
+	/// The braces hold any type; TIR checks that it names a literal kind.
+	Literal { inner: Box<Spanned<TypeExpression>> },
 }
 
 /// A pattern, as written. What each term *is* follows from its own shape:
@@ -1738,45 +1767,25 @@ pub struct FunctionParam {
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
-/// The payload of an attribute, following the meta item grammar.
+/// The payload of an attribute.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum AttributeValue {
 	/// `#[inline]` — name only, no payload.
 	Word,
-	/// `#[tag = "memory"]` — the span of the raw quoted string.
-	NameValue(TextSpan),
-	/// `#[memory_limits(min_pages = 1, max_pages = 10)]` — name plus a
-	/// parenthesized, comma-separated list of `name = value` arguments.
-	Args(Box<[Separated<Spanned<AttributeArg>>]>),
+	/// `#[memory_limits({ min_pages: 1, max_pages: 10 })]` — arguments by
+	/// name, written as a call's (`f({ x: 1 })`). What each value may be is
+	/// the attribute's to say, where it is resolved.
+	Named(Box<[Separated<Spanned<NamedArgument>>]>),
 }
 
-/// A single attribute on an item, e.g. `#[inline]`, `#[tag = "memory"]`, or
-/// `#[memory_limits(min_pages = 1)]`.
+/// A single attribute on an item, e.g. `#[inline]` or
+/// `#[memory_limits({ min_pages: 1 })]`.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct Attribute {
 	pub name: Spanned<SymbolU32>,
 	pub value: AttributeValue,
-}
-
-/// One `name = value` argument inside a parenthesized attribute, e.g.
-/// `min_pages = 1` in `#[memory_limits(min_pages = 1)]`.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct AttributeArg {
-	pub name: Spanned<SymbolU32>,
-	pub value: AttributeArgValue,
-}
-
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub enum AttributeArgValue {
-	/// Range/sign validity for a given attribute is a semantic question,
-	/// checked where the attribute is resolved (TIR), not here.
-	Int(Spanned<i64>),
-	/// The span of the raw quoted string.
-	String(TextSpan),
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1958,6 +1967,27 @@ pub enum Item {
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 	},
+	/// A package contract member whose implementation is supplied externally.
+	CrateFunction {
+		pub_span: Option<TextSpan>,
+		crate_span: TextSpan,
+		attributes: Box<[Attribute]>,
+		signature: FunctionSignature,
+	},
+	CrateConst {
+		pub_span: Option<TextSpan>,
+		crate_span: TextSpan,
+		attributes: Box<[Attribute]>,
+		name: Spanned<SymbolU32>,
+		ty: Box<Spanned<TypeExpression>>,
+	},
+	CrateType {
+		pub_span: Option<TextSpan>,
+		crate_span: TextSpan,
+		attributes: Box<[Attribute]>,
+		name: Spanned<SymbolU32>,
+		type_params: Box<[TypeParam]>,
+	},
 	Global {
 		pub_span: Option<TextSpan>,
 		mut_span: Option<TextSpan>,
@@ -2108,6 +2138,9 @@ impl Item {
 			Item::Global { .. }
 			| Item::Export { .. }
 			| Item::Const { .. }
+			| Item::CrateFunction { .. }
+			| Item::CrateConst { .. }
+			| Item::CrateType { .. }
 			| Item::Memory { .. }
 			| Item::FunctionDeclaration { .. }
 			| Item::ModuleDeclaration { .. }
@@ -2124,6 +2157,9 @@ impl Item {
 		match self {
 			Item::Function { attributes, .. }
 			| Item::FunctionDeclaration { attributes, .. }
+			| Item::CrateFunction { attributes, .. }
+			| Item::CrateConst { attributes, .. }
+			| Item::CrateType { attributes, .. }
 			| Item::Trait { attributes, .. }
 			| Item::TypeSet { attributes, .. }
 			| Item::Const { attributes, .. }
@@ -2615,7 +2651,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Const) => Ok(Parser::parse_const_item),
 			Some(Keyword::Mod) => Ok(Parser::parse_module_item),
 			Some(Keyword::Use) => Ok(Parser::parse_use_item),
-			Some(Keyword::Crate) => Ok(Parser::parse_package_instance),
+			Some(Keyword::Crate) => Ok(Parser::parse_crate_item),
 			Some(Keyword::Pub) => Ok(Parser::parse_pub_item),
 			Some(Keyword::Trait) => Ok(Parser::parse_trait_item),
 			Some(Keyword::Typeset) => Ok(Parser::parse_typeset_item),
@@ -2685,19 +2721,10 @@ impl<'ctx> Parser<'ctx> {
 				.strings
 				.get_or_intern(name_span.extract_str(parser.source));
 
-			let value = if parser.lexer.next_if(Token::Eq).is_some() {
-				let str_token = parser.next_expect(Token::String)?;
-				AttributeValue::NameValue(str_token.span)
-			} else if parser.lexer.peek().inner == Token::OpenParen {
-				let args = SeparatedGroup {
-					open_token: Token::OpenParen,
-					close_token: Token::CloseParen,
-					separator_token: Token::Comma,
-					should_warn_missing_separator: None,
-					item_handler: Parser::parse_attribute_arg,
-				}
-				.parse(parser)?;
-				AttributeValue::Args(args.inner)
+			let value = if parser.lexer.peek().inner == Token::OpenParen {
+				AttributeValue::Named(Parser::parse_attribute_arguments(
+					parser,
+				)?)
 			} else {
 				AttributeValue::Word
 			};
@@ -2726,47 +2753,71 @@ impl<'ctx> Parser<'ctx> {
 		Ok(attrs.into_boxed_slice())
 	}
 
-	fn parse_attribute_arg(
+	/// `({ name: value, .. })`, as a call by name writes its arguments. The
+	/// old `(name = value, ..)` is reported and read as the named list it
+	/// stands for.
+	fn parse_attribute_arguments(
 		parser: &mut Parser,
-	) -> Result<Spanned<AttributeArg>, ()> {
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
-		};
-		parser.next_expect(Token::Eq)?;
-		let value_token = parser.lexer.next();
-		let value = match value_token.inner {
-			Token::Int => {
-				let raw = value_token
-					.span
-					.extract_str(parser.source)
-					.parse::<i64>()
-					.unwrap_or(0);
-				AttributeArgValue::Int(Spanned {
-					inner: raw,
-					span: value_token.span,
-				})
+	) -> Result<Box<[Separated<Spanned<NamedArgument>>]>, ()> {
+		let open = parser.next_expect(Token::OpenParen)?.span;
+		match parser.lexer.peek().inner {
+			Token::OpenBrace => {
+				Ok(Parser::parse_named_call_arguments(parser)?.0)
 			}
-			Token::String => AttributeArgValue::String(value_token.span),
+			Token::CloseParen => {
+				parser.lexer.next();
+				Ok(Box::default())
+			}
 			_ => {
-				parser.ast.diagnostics.push(report_unexpected_token(
-					parser.ast.file_id,
-					value_token,
-					Token::Int,
-				));
-				return Err(());
+				let mut arguments = Vec::new();
+				loop {
+					let name_span = parser.next_expect(Token::Identifier)?.span;
+					let name = Spanned {
+						inner: parser.intern_identifier(name_span),
+						span: name_span,
+					};
+					parser.next_expect(Token::Eq)?;
+					let value =
+						parser.parse_expression(BindingPower::Default)?;
+					let span = TextSpan::new(name_span.start, value.span.end);
+					let separator = parser
+						.lexer
+						.next_if(Token::Comma)
+						.map(|comma| comma.span);
+					arguments.push(Separated {
+						inner: Spanned {
+							inner: NamedArgument {
+								name,
+								value: Some(Box::new(value)),
+							},
+							span,
+						},
+						separator,
+					});
+					if separator.is_none()
+						|| parser.lexer.peek().inner == Token::CloseParen
+					{
+						break;
+					}
+				}
+				let close = parser.next_expect(Token::CloseParen)?.span;
+				parser.ast.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::AttributeArgumentsAreNamed.code(),
+						)
+						.with_message(
+							"an attribute's arguments are named as a call's",
+						)
+						.with_label(Label::primary(
+							parser.ast.file_id,
+							TextSpan::new(open.start, close.end),
+						))
+						.with_note("write `#[name({ argument: value, .. })]`"),
+				);
+				Ok(arguments.into_boxed_slice())
 			}
-		};
-		let value_span = match &value {
-			AttributeArgValue::Int(v) => v.span,
-			AttributeArgValue::String(v) => *v,
-		};
-		let span = TextSpan::new(name_span.start, value_span.end);
-		Ok(Spanned {
-			inner: AttributeArg { name, value },
-			span,
-		})
+		}
 	}
 
 	fn parse_function_param_item(
@@ -3045,8 +3096,17 @@ impl<'ctx> Parser<'ctx> {
 				Some(Keyword::Const) => Some(self.lexer.next().span),
 				_ => None,
 			};
+			// `Self` is a name here, as `self` is among a function's
+			// parameters; where it may stand is the signature's to check.
+			let self_type =
+				matches!(self.peek_keyword(), Some(Keyword::SelfPascal));
 			let name_span = self.next_expect(Token::Identifier)?.span;
-			let name_symbol = self.intern_identifier(name_span);
+			let name_symbol = if self_type {
+				self.strings
+					.get_or_intern(name_span.extract_str(self.source))
+			} else {
+				self.intern_identifier(name_span)
+			};
 			let name = Spanned {
 				inner: name_symbol,
 				span: name_span,
@@ -3172,7 +3232,7 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// A constant: a literal, `_`, or a path naming one, written with a
-	/// bracketed root (`<T as Array>::SIZE`, `<heap::&[u8; 4]>::SIZE`) or
+	/// bracketed root (`<T as Array>::LEN`, `<[u8; 4]>::LEN`) or
 	/// without.
 	fn parse_const_argument(&mut self) -> Result<Spanned<ConstArgument>, ()> {
 		if let Some(Keyword::Underscore) = self.peek_keyword() {
@@ -3239,16 +3299,17 @@ impl<'ctx> Parser<'ctx> {
 		self.parse_const_argument()
 	}
 
-	/// Parse `where { Name = Type, Name: Bound, ... }` — the bindings block
+	/// Parse `where { Name = Type, Name: Bound, const N: Type, const N = 4 }`,
+	/// the bindings block
 	/// following a type. Returns a `Spanned` whose span covers from `{`
 	/// through `}`. The `where` keyword must already be confirmed as the next
 	/// token by the caller.
 	fn parse_where_bindings(
 		&mut self,
-	) -> Result<Spanned<Box<[AssocTypeBinding]>>, ()> {
+	) -> Result<Spanned<Box<[AssocBinding]>>, ()> {
 		self.lexer.next(); // consume `where`
 		let open_span = self.next_expect(Token::OpenBrace)?.span;
-		let mut bindings: Vec<AssocTypeBinding> = Vec::new();
+		let mut bindings: Vec<AssocBinding> = Vec::new();
 
 		let close_span = loop {
 			let peeked = self.lexer.peek();
@@ -3267,19 +3328,39 @@ impl<'ctx> Parser<'ctx> {
 				break peeked.span;
 			}
 
+			let const_span = match self.peek_keyword() {
+				Some(Keyword::Const) => Some(self.lexer.next().span),
+				_ => None,
+			};
 			let name_span = self.next_expect(Token::Identifier)?.span;
 			let name = Spanned {
 				inner: self.intern_identifier(name_span),
 				span: name_span,
 			};
-			let kind = if self.lexer.next_if(Token::Colon).is_some() {
-				AssocTypeBindingKind::Bound(self.parse_bounds_expression()?)
-			} else {
+			let colon = self.lexer.next_if(Token::Colon).is_some();
+			if !colon {
 				self.next_expect(Token::Eq)?;
-				AssocTypeBindingKind::Equals(self.parse_type_expression()?)
+			}
+			let kind = match (const_span, colon) {
+				(None, true) => {
+					AssocBindingKind::Bound(self.parse_bounds_expression()?)
+				}
+				(None, false) => {
+					AssocBindingKind::Equals(self.parse_type_expression()?)
+				}
+				(Some(const_span), true) => {
+					AssocBindingKind::ConstRepresentable {
+						const_span,
+						ty: self.parse_type_expression()?,
+					}
+				}
+				(Some(const_span), false) => AssocBindingKind::ConstEquals {
+					const_span,
+					value: self.parse_const_argument()?,
+				},
 			};
 			self.lexer.next_if(Token::Comma);
-			bindings.push(AssocTypeBinding { name, kind });
+			bindings.push(AssocBinding { name, kind });
 		};
 
 		Ok(Spanned {
@@ -3498,6 +3579,18 @@ impl<'ctx> Parser<'ctx> {
 				})
 			}
 			Token::OpenParen => self.parse_tuple_or_paren_type_expression(),
+			Token::OpenBracket => self.parse_slice_type_expression(),
+			Token::OpenBrace => {
+				let open = self.lexer.next().span; // consume `{`
+				let inner = self.parse_type_expression()?;
+				let close = self.next_expect(Token::CloseBrace)?.span;
+				Ok(Spanned {
+					inner: TypeExpression::Literal {
+						inner: Box::new(inner),
+					},
+					span: TextSpan::new(open.start, close.end),
+				})
+			}
 			Token::LeftArrow => {
 				let open_span = self.lexer.next().span; // consume `<`
 				self.parse_qualified_path_type_expression(open_span)
@@ -3626,12 +3719,11 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// Parses a leading `*`/`&` sigil (not yet consumed — the caller only
-	/// peeks to route here) and everything after it: a bare type (`*T`,
-	/// `&T` → `Pointer`), or a bracketed one (`*[T]`/`&[T]` → `Slice`,
-	/// `*[T; N]`/`&[T; N]` → `Array`). `memory` is the path already parsed
-	/// before an explicit `heap::` tag, if any — its first segment's start
-	/// becomes the whole expression's span start instead of the sigil's
-	/// own, since the tag is written before it.
+	/// peeks to route here) and the type it points at, a slice included
+	/// (`*[T]`, `&[T; N]`). `memory` is the path already parsed before an
+	/// explicit `heap::` tag, if any — its first segment's start becomes the
+	/// whole expression's span start instead of the sigil's own, since the
+	/// tag is written before it.
 	fn parse_pointer_type_expression(
 		&mut self,
 		memory: Option<Box<[PathSegment]>>,
@@ -3647,46 +3739,37 @@ impl<'ctx> Parser<'ctx> {
 			.and_then(|segments| segments.first())
 			.map_or(sigil.span.start, |segment| segment.ident.span.start);
 
-		if self.lexer.peek().inner != Token::OpenBracket {
-			let inner = self.parse_type_expression()?;
-			let span = TextSpan::new(start, inner.span.end);
-			return Ok(Spanned {
-				inner: TypeExpression::Pointer {
-					ownership,
-					memory,
-					inner: Box::new(inner),
-				},
-				span,
-			});
-		}
-
-		self.lexer.next(); // consume `[`
 		let inner = self.parse_type_expression()?;
+		let span = TextSpan::new(start, inner.span.end);
+		Ok(Spanned {
+			inner: TypeExpression::Pointer {
+				ownership,
+				memory,
+				inner: Box::new(inner),
+			},
+			span,
+		})
+	}
+
+	/// Parses a slice or an array, `[T]` or `[T; N]`, from its `[` (not yet
+	/// consumed).
+	fn parse_slice_type_expression(
+		&mut self,
+	) -> Result<Spanned<TypeExpression>, ()> {
+		let open = self.lexer.next().span; // consume `[`
+		let inner = Box::new(self.parse_type_expression()?);
 		let next = self.lexer.next();
 		match next.inner {
-			Token::CloseBracket => {
-				let span = TextSpan::new(start, next.span.end);
-				Ok(Spanned {
-					inner: TypeExpression::Slice {
-						ownership,
-						memory,
-						inner: Box::new(inner),
-					},
-					span,
-				})
-			}
+			Token::CloseBracket => Ok(Spanned {
+				inner: TypeExpression::Slice { inner },
+				span: TextSpan::new(open.start, next.span.end),
+			}),
 			Token::SemiColon => {
 				let length = self.parse_length()?;
 				let close_span = self.next_expect(Token::CloseBracket)?.span;
-				let span = TextSpan::new(start, close_span.end);
 				Ok(Spanned {
-					inner: TypeExpression::Array {
-						ownership,
-						memory,
-						inner: Box::new(inner),
-						length,
-					},
-					span,
+					inner: TypeExpression::Array { inner, length },
+					span: TextSpan::new(open.start, close_span.end),
 				})
 			}
 			_ => {
@@ -4714,7 +4797,14 @@ impl<'ctx> Parser<'ctx> {
 		let else_block = match parser.peek_keyword() {
 			Some(Keyword::Else) => {
 				let _ = parser.lexer.next();
-				Some(Box::new(Parser::parse_block_expression(parser)?))
+				// `else if` nests an `if` in the else position; `else { .. }`
+				// stays a plain block. TIR's `IfElse` branch and the checker's
+				// `build_branch` already describe both shapes.
+				if matches!(parser.peek_keyword(), Some(Keyword::If)) {
+					Some(Box::new(Parser::parse_if_else_expression(parser)?))
+				} else {
+					Some(Box::new(Parser::parse_block_expression(parser)?))
+				}
 			}
 			_ => None,
 		};
@@ -4773,8 +4863,15 @@ impl<'ctx> Parser<'ctx> {
 			item_handler:
 				|parser: &mut Parser| -> Result<Spanned<MatchArm>, ()> {
 					let pattern = Parser::parse_pattern(parser)?;
-					parser.next_expect(Token::MinusRightArrow)?;
-					let body = Parser::parse_block_expression(parser)?;
+					parser.next_expect(Token::FatArrow)?;
+					// A braced body is a block; a bare expression must be
+					// separated by a comma like a statement.
+					let body = if parser.lexer.peek().inner == Token::OpenBrace
+					{
+						Parser::parse_block_expression(parser)?
+					} else {
+						parser.parse_expression(BindingPower::Default)?
+					};
 					let span = TextSpan::new(pattern.span.start, body.span.end);
 					Ok(Spanned {
 						inner: MatchArm {
@@ -4784,10 +4881,12 @@ impl<'ctx> Parser<'ctx> {
 						span,
 					})
 				},
-			// Arm bodies are always `{ }` blocks, so — like `parse_enum_item`
-			// — a missing trailing comma before the next arm is never
-			// ambiguous with statement continuation; no warning needed.
-			should_warn_missing_separator: None,
+			// A block body is self-delimiting, so its trailing comma stays
+			// optional, exactly as a block-like statement's separator does.
+			// Any other body needs a comma before the next arm.
+			should_warn_missing_separator: Some(|arm| {
+				!arm.body.inner.is_block_like()
+			}),
 		}
 		.parse(parser)?;
 
@@ -6246,6 +6345,9 @@ impl<'ctx> Parser<'ctx> {
 		match &mut item.inner {
 			Item::Function { pub_span: span, .. }
 			| Item::FunctionDeclaration { pub_span: span, .. }
+			| Item::CrateFunction { pub_span: span, .. }
+			| Item::CrateConst { pub_span: span, .. }
+			| Item::CrateType { pub_span: span, .. }
 			| Item::Global { pub_span: span, .. }
 			| Item::Enum { pub_span: span, .. }
 			| Item::Struct { pub_span: span, .. }
@@ -6589,13 +6691,124 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
+	/// `crate func`, `crate const`, `crate type`, or a package instance.
+	fn parse_crate_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
+		let crate_span = parser.lexer.next().span;
+		if parser.lexer.peek().inner == Token::String {
+			return Parser::parse_package_instance(parser, crate_span);
+		}
+		let (item, end) = match parser.peek_keyword() {
+			Some(Keyword::Func) => {
+				let signature = parser.parse_function_signature()?;
+				let end = if parser.lexer.peek().inner == Token::OpenBrace {
+					let body = Parser::parse_block_expression(parser)?;
+					parser.report_crate_member_body(body.span);
+					body.span.end
+				} else {
+					signature.span.end
+				};
+				(
+					Item::CrateFunction {
+						pub_span: None,
+						crate_span,
+						attributes: Box::new([]),
+						signature: signature.inner,
+					},
+					end,
+				)
+			}
+			Some(Keyword::Const) => {
+				parser.lexer.next();
+				let name_span = parser.next_expect(Token::Identifier)?.span;
+				let name = Spanned {
+					inner: parser.intern_identifier(name_span),
+					span: name_span,
+				};
+				parser.next_expect(Token::Colon)?;
+				let ty = parser.parse_type_expression()?;
+				let end = if parser.lexer.next_if(Token::Eq).is_some() {
+					let value =
+						parser.parse_expression(BindingPower::Default)?;
+					parser.report_crate_member_body(value.span);
+					value.span.end
+				} else {
+					ty.span.end
+				};
+				(
+					Item::CrateConst {
+						pub_span: None,
+						crate_span,
+						attributes: Box::new([]),
+						name,
+						ty: Box::new(ty),
+					},
+					end,
+				)
+			}
+			Some(Keyword::Type) => {
+				parser.lexer.next();
+				let name_span = parser.next_expect(Token::Identifier)?.span;
+				let name = Spanned {
+					inner: parser.intern_identifier(name_span),
+					span: name_span,
+				};
+				let type_params =
+					if parser.lexer.peek().inner == Token::LeftArrow {
+						parser.parse_type_params()?
+					} else {
+						Box::new([])
+					};
+				let end = if parser.lexer.next_if(Token::Eq).is_some() {
+					let body = parser.parse_type_expression()?;
+					parser.report_crate_member_body(body.span);
+					body.span.end
+				} else {
+					name_span.end
+				};
+				(
+					Item::CrateType {
+						pub_span: None,
+						crate_span,
+						attributes: Box::new([]),
+						name,
+						type_params,
+					},
+					end,
+				)
+			}
+			_ => {
+				let token = parser.lexer.peek();
+				parser
+					.ast
+					.diagnostics
+					.push(report_invalid_item(parser.ast.file_id, token.span));
+				return Err(());
+			}
+		};
+		Ok(Spanned {
+			inner: item,
+			span: TextSpan::new(crate_span.start, end),
+		})
+	}
+
+	fn report_crate_member_body(&mut self, span: TextSpan) {
+		self.ast.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::CrateMemberHasBody.code())
+				.with_message("a crate member cannot have a body")
+				.with_label(
+					Label::primary(self.ast.file_id, span)
+						.with_message("remove this body"),
+				),
+		);
+	}
+
 	/// `crate "name" as alias;`. The trailing `;` is left for the caller, like
 	/// every other item's.
 	fn parse_package_instance(
 		parser: &mut Parser,
+		crate_span: TextSpan,
 	) -> Result<Spanned<Item>, ()> {
-		let crate_span = parser.lexer.next().span; // consume `crate`
-
 		let package = parser.next_expect(Token::String)?.span;
 
 		let token = parser.lexer.peek();

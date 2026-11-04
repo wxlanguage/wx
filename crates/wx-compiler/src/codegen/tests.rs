@@ -448,7 +448,7 @@ fn test_loops() {
 #[test]
 fn test_loop_copy_does_not_alias_locals_across_iterations() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
         global mut bump: heap::*u8 = heap::DATA_END;
 
@@ -1077,7 +1077,7 @@ fn test_global_init_generic_null_pointer_executes() {
 	// position must be lowered into the start function and execute, leaving
 	// the global at address 0.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         global mut head: heap::&Node = RawPtr::<heap, Node>::null().as_ref()
@@ -1741,7 +1741,7 @@ fn test_struct_call_result_wat() {
 #[test]
 fn test_pointer_deref_load_and_store() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func read(ptr: heap::&i32) -> i32 {
@@ -1787,7 +1787,7 @@ fn test_pointer_deref_load_and_store() {
 #[test]
 fn test_pointer_deref_increment() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
 
         func increment(ptr: heap::*i32) {
@@ -1837,7 +1837,7 @@ fn test_struct_pointer_load_and_store() {
 	// and that individual field loads return the correct values.
 	// The WAT snapshot pins the emitted instruction shape.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
 
         struct Point {
@@ -1935,7 +1935,7 @@ fn test_struct_pointer_load_and_store() {
 #[test]
 fn test_nested_struct_field_access_on_local() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Deep { id: u64 }
         struct Mid { tag: u8, deep: Deep }
@@ -1997,7 +1997,7 @@ fn test_nested_struct_field_access_on_local() {
 #[test]
 fn test_nested_struct_across_control_flow_joins() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Inner { addr: u32 }
         struct Outer { buf: Inner, len: u32 }
@@ -2084,7 +2084,7 @@ fn test_nested_struct_across_control_flow_joins() {
 #[test]
 fn test_deeply_nested_struct_carried_across_loop() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Deep { id: u64 }
         struct Mid { tag: u8, deep: Deep }
@@ -2160,7 +2160,7 @@ fn test_deeply_nested_struct_carried_across_loop() {
 #[test]
 fn test_nested_struct_pointer_store_and_load() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         // #[fixed_order] so the byte offsets asserted below (declaration
         // order, not alignment-sorted) are pinned rather than incidental.
@@ -2235,7 +2235,7 @@ fn test_nested_struct_pointer_store_and_load() {
 #[test]
 fn test_nested_struct_function_parameter() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Deep { id: u64 }
         struct Mid { tag: u8, deep: Deep }
@@ -2269,7 +2269,7 @@ fn test_struct_field_write_through_pointer() {
 	// `ptr.*.field = val` — field write through a mutable pointer.
 	// Uses the byte-offset PointerStore path, not whole-struct assignment.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
         func set_x(ptr: heap::*Point, v: i32) { ptr.*.x = v }
@@ -2557,7 +2557,7 @@ fn test_generic_struct_pointer_load_store() {
 	// Codegen must emit the correct field offsets for the monomorphized aggregate
 	// (x@0, y@4), going through the same path as the non-generic pointer tests.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
 
         struct Point<T> {
@@ -2629,7 +2629,7 @@ fn test_memory_grow_and_size() {
 	// @memory_size / @memory_grow intrinsics via the Memory trait default
 	// methods.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func size_pages() -> u32 {
@@ -2675,7 +2675,7 @@ fn test_memory_size_before_grow_ordering() {
 	// scheduler may emit memory.size after memory.grow, returning 2 instead
 	// of 1.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func capture_size_before_grow() -> u32 {
@@ -2714,7 +2714,7 @@ fn test_array_literal_read_by_index() {
 	// address 0; indexing it must return the right element via i32.load at
 	// base + i * elem_size.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func get(i: u32) -> i32 {
@@ -2745,7 +2745,7 @@ fn test_array_write_and_read_back() {
 	// initialises a 4-element block at address 0, then the wx functions do
 	// a round-trip write+read to verify PointerStore/PointerLoad addressing.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func write(arr: *[i32; 4], i: u32, v: i32) { arr[i] = v; }
@@ -2793,7 +2793,7 @@ fn test_dead_array_excluded_from_data_section() {
 	// DCE removes functions that are not reachable from exports.  The static
 	// array owned by a dead function must not appear in the WASM data segment.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func live() -> i32 { 42 }
@@ -2819,7 +2819,7 @@ fn test_array_index_wat() {
 	// WAT snapshot: pins the data segment placement and the load/store
 	// instruction shape (i32.add + i32.mul offset arithmetic).
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func get(i: u32) -> i32 {
@@ -2854,7 +2854,7 @@ fn test_slice_range_wat() {
 	//   • bounds checking (out-of-range access is UB at runtime)
 	//   • from > to produces a nonsensical negative length
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func full_copy(s: heap::&[i32]) -> heap::&[i32] {
@@ -2887,7 +2887,7 @@ fn test_slice_range_array_wat() {
 	// arr[..]    — ptr = array base, len = const 4 (array size)
 	// arr[i..n]  — ptr = base + i*4, len = n − i
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func full_array(arr: heap::&[i32; 4]) -> heap::&[i32] {
@@ -2911,7 +2911,7 @@ fn test_narrow_pointer_deref_sign_extension_and_byte_isolation() {
 	// 2. Sign-extension: reading 0xFF through *i8 must yield -1.
 	// 3. Byte isolation: writing through *u8 must not touch adjacent bytes.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         func read_u8(ptr: heap::&u8) -> u8 { ptr.* }
@@ -2966,7 +2966,7 @@ fn test_global_read_before_write_returns_old_value() {
 	// re-emits `global.get` after the `global.set`, yielding new_end instead
 	// of the original ptr.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         global mut bump: heap::*u8 = heap::DATA_END;
@@ -3005,7 +3005,7 @@ fn test_global_initialized_to_data_end() {
 	// compile-time static-segment-end offset as its WASM init expression,
 	// and reading it back at runtime must return that same value.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         global mut bump: heap::*u8 = heap::DATA_END;
@@ -3049,7 +3049,7 @@ fn test_null_pointer_comparison() {
 	//     (the `node.next == ptr::null()` pattern, rephrased onto `RawPtr`)
 	//  2. it is false for a non-zero pointer
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
 
         struct Node { value: i32, next: &Node }
@@ -3158,7 +3158,7 @@ fn test_check_wad_magic_wat() {
 	// Constant slice indices 0-3 must all fold into `i32.load8_u offset=N`
 	// with no runtime Add/Mul — the four loads become offset=0,1,2,3.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
         pub func check_wad_magic(data: heap::&[u8]) -> bool {
             data[0] == 0x49
@@ -3177,7 +3177,7 @@ fn test_constant_index_offset_folding_wat() {
 	// Constant array and slice indices must be folded directly into the WASM
 	// memarg immediate (e.g. `i32.load offset=8`) with no runtime Add/Mul.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
         func get_arr() -> i32 {
             local arr: &[i32; 4] = [10, 20, 30, 40];
@@ -3201,7 +3201,7 @@ fn test_address_of_array_element() {
 	// `arr[i].&` on a heap array returns a shared reference to element i.
 	// The byte address must equal base + i * elem_size.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         func elem_ptr(arr: heap::&[i32; 4], i: u32) -> heap::&i32 {
             arr[i].&
@@ -3241,7 +3241,7 @@ fn test_address_of_struct_field() {
 	// `x` is at offset 0; `y` is at offset 4 (both are i32 fields with alignment 4,
 	// sorted in declaration order since alignment is equal).
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
@@ -3285,7 +3285,7 @@ fn test_address_of_struct_field() {
 #[test]
 fn test_narrow_field_cast_does_not_overread_adjacent_bytes() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct S { a: u8, b: u64, c: u16 }
 
@@ -3327,7 +3327,7 @@ fn test_address_of_wat() {
 	// x_addr   — field at static offset 0: the address IS the pointer.
 	//   Expected: local.get 0  (no arithmetic needed)
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Point { x: i32, y: i32 }
 
@@ -3349,7 +3349,7 @@ fn test_address_of_wat() {
 #[test]
 fn test_memory64_pointer_roundtrip() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u64 };
         func store_load(p: heap::*u64) -> u64 {
             p.* = 7;
@@ -3379,7 +3379,7 @@ fn test_memory64_pointer_roundtrip() {
 #[test]
 fn test_memory64_size_grow_and_static_data() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u64 };
         func size_pages() -> u64 { heap.size_pages() }
         func grow_one() -> i64 { heap.grow(1) }
@@ -3429,9 +3429,9 @@ fn test_memory64_size_grow_and_static_data() {
 #[test]
 fn test_multi_memory_static_data() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory first: Memory where { Size = u32 };
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory second: Memory where { Size = u32 };
         func greet_first() -> first::&[u8] { \"hello\" }
         func greet_second() -> second::&[u8] { \"world!!\" }
@@ -3634,8 +3634,8 @@ fn test_match_inside_loop_break_and_continue_commit_mutations() {
             local mut acc: i32 = 0;
             loop {
                 match i {
-                    5 -> { break; },
-                    _ -> {
+                    5 => { break; },
+                    _ => {
                         if i == n {
                             break;
                         }
@@ -3674,9 +3674,9 @@ fn test_match_enum_dispatch_runs_correctly() {
 
         func fd_name_len(fd: FileDescriptor) -> u32 {
             match fd {
-                FileDescriptor::StdIn -> { 5 },
-                FileDescriptor::StdOut -> { 6 },
-                FileDescriptor::StdErr -> { 6 },
+                FileDescriptor::StdIn => { 5 },
+                FileDescriptor::StdOut => { 6 },
+                FileDescriptor::StdErr => { 6 },
             }
         }
         export { fd_name_len }
@@ -3713,17 +3713,17 @@ fn test_match_inside_loop_break_and_continue_dense_br_table() {
             local mut acc: i32 = 0;
             loop {
                 match i {
-                    0 -> {
+                    0 => {
                         acc += 100;
                         i += 1;
                         continue;
                     },
-                    1 -> {
+                    1 => {
                         acc += 10;
                         i += 1;
                         continue;
                     },
-                    2 -> {
+                    2 => {
                         if i == n {
                             break;
                         }
@@ -3731,7 +3731,7 @@ fn test_match_inside_loop_break_and_continue_dense_br_table() {
                         i += 1;
                         continue;
                     },
-                    _ -> {
+                    _ => {
                         break;
                     },
                 }
@@ -3769,10 +3769,10 @@ fn test_match_dense_struct_valued_arms() {
 
         func classify(x: i32) -> i32 {
             local p = match x {
-                0 -> { Point::{ x: 10, y: 1 } },
-                1 -> { Point::{ x: 20, y: 2 } },
-                2 -> { Point::{ x: 30, y: 3 } },
-                _ -> { Point::{ x: 40, y: 4 } },
+                0 => { Point::{ x: 10, y: 1 } },
+                1 => { Point::{ x: 20, y: 2 } },
+                2 => { Point::{ x: 30, y: 3 } },
+                _ => { Point::{ x: 40, y: 4 } },
             };
             p.x + p.y
         }
@@ -3807,10 +3807,10 @@ fn test_match_dense_early_return_with_divergent_binding() {
         func f(x: i32) -> i32 {
             local mut acc: i32 = 0;
             match x {
-                0 -> { return 99; },
-                1 -> { acc = 1; },
-                2 -> { acc = 2; },
-                _ -> { acc = 3; },
+                0 => { return 99; },
+                1 => { acc = 1; },
+                2 => { acc = 2; },
+                _ => { acc = 3; },
             }
             acc
         }
@@ -3855,10 +3855,10 @@ fn test_match_wide_sparse_if_chain_builds_iteratively() {
 	const ARMS: i32 = 500;
 	let mut arms = String::new();
 	for i in 0..ARMS {
-		arms.push_str(&format!("{} -> {{ {} }},\n", i * 1000, i));
+		arms.push_str(&format!("{} => {{ {} }},\n", i * 1000, i));
 	}
 	let source = format!(
-		"func f(x: i32) -> i32 {{\n            match x {{\n{arms}                _ -> {{ -1 }},\n            }}\n        }}\n\n        export {{ f }}\n        "
+		"func f(x: i32) -> i32 {{\n            match x {{\n{arms}                _ => {{ -1 }},\n            }}\n        }}\n\n        export {{ f }}\n        "
 	);
 	let case = TestCase::new(&source);
 

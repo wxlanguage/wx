@@ -46,6 +46,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	imports: Vec<ImportDef>,
 	ast_nodes: Vec<AstEntry<'ast>>,
 	exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	crate_contracts: Vec<CrateContract>,
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
@@ -259,6 +260,189 @@ pub enum FieldOrder {
 	Optimal,
 }
 
+/// The attributes written on a declaration that the compiler acts on. The
+/// prescan admits only those that apply to the item they are written on,
+/// so a function's never holds `FIXED_ORDER`. An attribute is a hint to the
+/// compiler: none of them changes a type or an identity.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct Attributes(u8);
+
+impl Attributes {
+	/// `#[inline]`: every call of the function is to be replaced by its
+	/// body.
+	pub const INLINE: Self = Self(1 << 0);
+	/// `#[fixed_order]`: a struct's fields keep declaration order.
+	pub const FIXED_ORDER: Self = Self(1 << 1);
+
+	pub const fn empty() -> Self {
+		Self(0)
+	}
+
+	pub const fn contains(self, other: Self) -> bool {
+		self.0 & other.0 == other.0
+	}
+
+	fn insert(&mut self, other: Self) {
+		self.0 |= other.0;
+	}
+}
+
+/// An attribute the compiler knows. `#[memory_limits]` has arguments and
+/// is read where a memory is lowered, so it has no flag.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KnownAttribute {
+	Inline,
+	FixedOrder,
+	MemoryLimits,
+}
+
+impl KnownAttribute {
+	const ALL: [Self; 3] = [Self::Inline, Self::FixedOrder, Self::MemoryLimits];
+
+	fn from_name(name: &str) -> Option<Self> {
+		Self::ALL.into_iter().find(|known| known.name() == name)
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::Inline => "inline",
+			Self::FixedOrder => "fixed_order",
+			Self::MemoryLimits => "memory_limits",
+		}
+	}
+
+	/// The one kind of item it can be written on.
+	fn target(self) -> AttributeTarget {
+		match self {
+			Self::Inline => AttributeTarget::Function,
+			Self::FixedOrder => AttributeTarget::Struct,
+			Self::MemoryLimits => AttributeTarget::Memory,
+		}
+	}
+
+	/// Whether it is written with a parenthesized argument list, rather
+	/// than as its name alone.
+	fn takes_arguments(self) -> bool {
+		matches!(self, Self::MemoryLimits)
+	}
+
+	fn flag(self) -> Attributes {
+		match self {
+			Self::Inline => Attributes::INLINE,
+			Self::FixedOrder => Attributes::FIXED_ORDER,
+			Self::MemoryLimits => Attributes::empty(),
+		}
+	}
+}
+
+/// What an attribute is written on, as far as which attributes apply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttributeTarget {
+	/// A function with a body: free, an impl's, or a trait's default.
+	Function,
+	/// A function declared without one: a trait's required function, a
+	/// bodiless declaration, a package contract's.
+	BodilessFunction,
+	Struct,
+	Memory,
+	Enum,
+	Constant,
+	Global,
+	TypeAlias,
+	Trait,
+	Typeset,
+	AssociatedType,
+}
+
+impl AttributeTarget {
+	fn description(self) -> &'static str {
+		match self {
+			Self::Function => "a function with a body",
+			Self::BodilessFunction => "a function without a body",
+			Self::Struct => "a struct",
+			Self::Memory => "a memory",
+			Self::Enum => "an enum",
+			Self::Constant => "a constant",
+			Self::Global => "a global",
+			Self::TypeAlias => "a type alias",
+			Self::Trait => "a trait",
+			Self::Typeset => "a typeset",
+			Self::AssociatedType => "an associated type",
+		}
+	}
+
+	/// The attributes written on an item, and what they are written on.
+	fn of_item(item: &ast::Item) -> Option<(Self, &[ast::Attribute])> {
+		Some(match item {
+			ast::Item::Function { attributes, .. } => {
+				(Self::Function, attributes)
+			}
+			ast::Item::FunctionDeclaration { attributes, .. }
+			| ast::Item::CrateFunction { attributes, .. } => {
+				(Self::BodilessFunction, attributes)
+			}
+			ast::Item::Struct { attributes, .. } => (Self::Struct, attributes),
+			ast::Item::Memory { attributes, .. } => (Self::Memory, attributes),
+			ast::Item::Enum { attributes, .. } => (Self::Enum, attributes),
+			ast::Item::Const { attributes, .. }
+			| ast::Item::CrateConst { attributes, .. } => (Self::Constant, attributes),
+			ast::Item::Global { attributes, .. } => (Self::Global, attributes),
+			ast::Item::TypeAlias { attributes, .. }
+			| ast::Item::CrateType { attributes, .. } => (Self::TypeAlias, attributes),
+			ast::Item::Trait { attributes, .. } => (Self::Trait, attributes),
+			ast::Item::TypeSet { attributes, .. } => {
+				(Self::Typeset, attributes)
+			}
+			ast::Item::Export { .. }
+			| ast::Item::ExportBlock { .. }
+			| ast::Item::Import { .. }
+			| ast::Item::InherentImpl { .. }
+			| ast::Item::TraitImpl { .. }
+			| ast::Item::Module { .. }
+			| ast::Item::ModuleDeclaration { .. }
+			| ast::Item::PackageInstance { .. }
+			| ast::Item::Use { .. } => return None,
+		})
+	}
+
+	fn of_trait_item(item: &ast::TraitItem) -> (Self, &[ast::Attribute]) {
+		match item {
+			ast::TraitItem::Function {
+				attributes,
+				body: Some(_),
+				..
+			} => (Self::Function, attributes),
+			ast::TraitItem::Function {
+				attributes,
+				body: None,
+				..
+			} => (Self::BodilessFunction, attributes),
+			ast::TraitItem::Const { attributes, .. } => {
+				(Self::Constant, attributes)
+			}
+			ast::TraitItem::AssociatedType { attributes, .. } => {
+				(Self::AssociatedType, attributes)
+			}
+		}
+	}
+
+	fn of_impl_item(item: &ast::ImplItem) -> (Self, &[ast::Attribute]) {
+		match item {
+			ast::ImplItem::Function { attributes, .. } => {
+				(Self::Function, attributes)
+			}
+			ast::ImplItem::Constant { attributes, .. } => {
+				(Self::Constant, attributes)
+			}
+			ast::ImplItem::AssocType { attributes, .. } => {
+				(Self::AssociatedType, attributes)
+			}
+		}
+	}
+}
+
 impl StructDef {
 	/// Whether every field has a name: only then can the struct be
 	/// constructed (`P({ x: 1, y: 2 })`) or destructured by name.
@@ -323,6 +507,8 @@ pub struct FunctionDef {
 	/// Each parameter's name, `None` for an unnamed one.
 	pub params: Box<[Option<Spanned<SymbolU32>>]>,
 	pub function_impls: FunctionImpls,
+	/// Only ever `INLINE`, and only on a function with a body.
+	pub attributes: Attributes,
 }
 
 /// Where a function or a constant is declared: directly in a scope (a free
@@ -370,6 +556,22 @@ pub struct MemoryDef {
 	pub name: Spanned<SymbolU32>,
 	pub trait_impl_index: TraitImplIdx,
 	pub size_assoc_type_index: AssocTypeIdx,
+	/// What its `#[memory_limits]` says; both bounds `None` without one, and
+	/// for an imported memory, which takes the host's memory of any size.
+	pub limits: MemoryLimits,
+}
+
+/// A memory's page limits, as `#[memory_limits({ min_pages: .., max_pages:
+/// .. })]` writes them: counts of 64 KiB pages, `None` for a bound left out.
+/// Recorded as written; whether a count fits the memory is the checker's
+/// (`TypeContext::check_memory_limits`), since it depends on the memory's
+/// `Size`.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct MemoryLimits {
+	pub min_pages: Option<Spanned<u64>>,
+	pub max_pages: Option<Spanned<u64>>,
 }
 
 /// Identity shared by local and imported globals. The written value type
@@ -625,6 +827,28 @@ pub(super) struct ExportEntrySource {
 	pub external_span: SourceSpan,
 }
 
+/// One package's externally supplied declarations, independent of the
+/// modules in which their names are visible. A free function claims both
+/// tiers, as it does in its module's ordinary symbol table.
+#[derive(Default)]
+pub(super) struct CrateContract {
+	pub(super) members: FxHashMap<BindingKey, CrateMember>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CrateMember {
+	pub(super) item: CrateMemberItem,
+	pub(super) namespace: Scope,
+	pub(super) source: SourceSpan,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CrateMemberItem {
+	Function(FunctionIdx),
+	Constant(ConstIdx),
+	Type(TypeAliasIdx),
+}
+
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(super) struct DefinitionRegistry {
 	pub stdlib_package: PackageId,
@@ -637,6 +861,9 @@ pub(super) struct DefinitionRegistry {
 	pub imports: Vec<ImportDef>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
 	pub exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	/// Package-level contract keys, indexed by `PackageId`.
+	#[cfg_attr(test, serde(skip))]
+	pub(super) crate_contracts: Vec<CrateContract>,
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
@@ -665,9 +892,10 @@ pub(super) struct DefinitionRegistry {
 }
 
 /// One struct rather than one per kind — the recognized-name list only
-/// needs to be written once — but [`IntrinsicDefs::type_slot_mut`] and
-/// [`IntrinsicDefs::trait_slot_mut`] are kept as two separate lookups
-/// (rather than one covering all fields) so a type alias and a trait can
+/// needs to be written once — but [`IntrinsicDefs::type_slot_mut`],
+/// [`IntrinsicDefs::trait_slot_mut`] and
+/// [`IntrinsicDefs::typeset_slot_mut`] are kept as separate lookups (rather
+/// than one covering all fields) so a type alias, a trait and a typeset can
 /// never contend for the same slot just because they happen to share a
 /// name — e.g. a stray `type Add;` in std can't clobber the `Add` trait's
 /// entry, since only `trait_slot_mut` ever resolves `"Add"`.
@@ -690,6 +918,13 @@ pub struct IntrinsicDefs {
 	pub bool: Option<EnumIdx>,
 	pub char: Option<StructIdx>,
 	pub funcref: Option<TypeAliasIdx>,
+	/// std's `Integer` typeset, whose members are the integer primitives.
+	/// Enum representations are checked against it.
+	pub integer: Option<TypesetIdx>,
+	/// The literal kinds `integer` and `char`, written `{integer}` and
+	/// `{char}`: the types of literals that have no type yet.
+	pub integer_kind: Option<TypeAliasIdx>,
+	pub char_kind: Option<TypeAliasIdx>,
 	pub add: Option<TraitIdx>,
 	pub sub: Option<TraitIdx>,
 	pub mul: Option<TraitIdx>,
@@ -705,6 +940,8 @@ pub struct IntrinsicDefs {
 	pub not: Option<TraitIdx>,
 	pub partial_eq: Option<TraitIdx>,
 	pub partial_ord: Option<TraitIdx>,
+	/// std's `Eq`, the total-equality marker used by pattern tests.
+	pub eq: Option<TraitIdx>,
 	pub memory: Option<TraitIdx>,
 	/// `Memory`'s declaration of `Size`.
 	pub memory_size: Option<AssocTypeIdx>,
@@ -720,24 +957,43 @@ pub struct IntrinsicDefs {
 	/// `StackValue`'s declaration of `Repr`, which every type answers by a
 	/// compiler rule.
 	pub stack_value_repr: Option<AssocTypeIdx>,
-	/// `Slice`, `SliceMut`, `Array` and `ArrayMut`, which the compiler
-	/// implements for slice and array types.
+	/// `Slice` and `Array`, which the compiler implements for the slices and
+	/// arrays `[T]` and `[T; N]`.
 	pub slice: Option<TraitIdx>,
-	pub slice_mut: Option<TraitIdx>,
 	pub array: Option<TraitIdx>,
-	pub array_mut: Option<TraitIdx>,
-	/// `Slice`'s declarations of `Value` and `Mem`: the element type and the
-	/// memory of a slice or array type.
+	/// `Slice`'s declaration of `Value`: a slice's or an array's element.
 	pub slice_value: Option<AssocTypeIdx>,
-	pub slice_mem: Option<AssocTypeIdx>,
-	/// `Array`'s declaration of `SIZE`: an array type's length.
-	pub array_size: Option<ConstIdx>,
-	/// `Slice::index` and `SliceMut::index_mut`, which `x[i]` calls.
-	pub slice_index: Option<FunctionIdx>,
-	pub slice_index_mut: Option<FunctionIdx>,
+	/// `Slice`'s bodiless `len` and `as_ref`, which lowering supplies from
+	/// the receiver's type. Its other functions, and `Array`'s, have bodies.
+	pub slice_len: Option<FunctionIdx>,
+	pub slice_as_ref: Option<FunctionIdx>,
+	/// `Array`'s declaration of `LEN`: an array's length.
+	pub array_len: Option<ConstIdx>,
+	/// `Memory`'s declaration of `DATA_END`: where a memory's static data
+	/// ends, known once the program's data is laid out.
+	pub memory_data_end: Option<ConstIdx>,
+	/// `Pointer`, which the compiler implements for every pointer type, and
+	/// its declarations of `Memory`, `Pointee` and `Metadata`.
+	pub pointer: Option<TraitIdx>,
+	pub pointer_memory: Option<AssocTypeIdx>,
+	pub pointer_pointee: Option<AssocTypeIdx>,
+	pub pointer_metadata: Option<AssocTypeIdx>,
 }
 
 impl IntrinsicDefs {
+	/// Whether the compiler supplies `function`, a member of `trait_index`
+	/// for a type that trait is implemented for structurally: `Call` of a
+	/// function reference, and `Slice`'s bodiless `len` and `as_ref`. Any
+	/// other member of such a trait is its default body.
+	pub fn supplies(
+		&self,
+		trait_index: TraitIdx,
+		function: FunctionIdx,
+	) -> bool {
+		self.call == Some(trait_index)
+			|| [self.slice_len, self.slice_as_ref].contains(&Some(function))
+	}
+
 	/// The mutable slot for `name` if it's one of the recognized primitive
 	/// type names — the one place that list is written.
 	fn type_slot_mut(
@@ -756,6 +1012,20 @@ impl IntrinsicDefs {
 			"f32" => &mut self.f32,
 			"f64" => &mut self.f64,
 			"funcref" => &mut self.funcref,
+			"integer" => &mut self.integer_kind,
+			"char" => &mut self.char_kind,
+			_ => return None,
+		})
+	}
+
+	/// The mutable slot for `name` if it's one of the recognized builtin
+	/// typeset names — the one place that list is written.
+	fn typeset_slot_mut(
+		&mut self,
+		name: &str,
+	) -> Option<&mut Option<TypesetIdx>> {
+		Some(match name {
+			"Integer" => &mut self.integer,
 			_ => return None,
 		})
 	}
@@ -779,6 +1049,7 @@ impl IntrinsicDefs {
 			"Not" => &mut self.not,
 			"PartialEq" => &mut self.partial_eq,
 			"PartialOrd" => &mut self.partial_ord,
+			"Eq" => &mut self.eq,
 			"Memory" => &mut self.memory,
 			"Global" => &mut self.global,
 			"GlobalMut" => &mut self.global_mut,
@@ -786,9 +1057,8 @@ impl IntrinsicDefs {
 			"Function" => &mut self.function,
 			"StackValue" => &mut self.stack_value,
 			"Slice" => &mut self.slice,
-			"SliceMut" => &mut self.slice_mut,
 			"Array" => &mut self.array,
-			"ArrayMut" => &mut self.array_mut,
+			"Pointer" => &mut self.pointer,
 			_ => return None,
 		})
 	}
@@ -1964,6 +2234,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_paths: Vec::new(),
 			ast_nodes: Vec::new(),
 			exports: FxHashMap::default(),
+			crate_contracts: packages
+				.iter()
+				.map(|_| CrateContract::default())
+				.collect(),
 			intrinsics: IntrinsicDefs::default(),
 			pending_named_imports: FxHashMap::default(),
 			pending_glob_targets: FxHashMap::default(),
@@ -2003,6 +2277,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			modules: builder.modules,
 			imports: builder.imports,
 			exports: builder.exports,
+			crate_contracts: builder.crate_contracts,
 			traits: builder.traits,
 			trait_impls: builder.trait_impls,
 			inherent_impls: builder.inherent_impls,
@@ -2276,6 +2551,165 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		index
 	}
 
+	/// Reads the attributes written on one item. An unknown name is ignored
+	/// with a warning, since no attribute changes what a program means; a
+	/// known one on the wrong item, or in the wrong form, is an error.
+	fn scan_attributes(
+		&mut self,
+		file_id: FileId,
+		target: AttributeTarget,
+		attributes: &[ast::Attribute],
+	) -> Attributes {
+		let mut flags = Attributes::empty();
+		let mut first: [Option<TextSpan>; KnownAttribute::ALL.len()] =
+			[None; KnownAttribute::ALL.len()];
+		for attribute in attributes {
+			let name = self.strings.resolve(attribute.name.inner).unwrap();
+			let Some(known) = KnownAttribute::from_name(name) else {
+				self.diagnostics.push(report_unknown_attribute(
+					file_id,
+					attribute.name,
+					name,
+				));
+				continue;
+			};
+			if known.target() != target {
+				self.diagnostics.push(report_misplaced_attribute(
+					file_id,
+					attribute.name.span,
+					known,
+					target,
+				));
+				continue;
+			}
+			let has_arguments =
+				matches!(attribute.value, ast::AttributeValue::Named(_));
+			if known.takes_arguments() != has_arguments {
+				self.diagnostics.push(report_malformed_attribute(
+					file_id,
+					attribute.name.span,
+					known,
+				));
+				continue;
+			}
+			let slot = &mut first[known as usize];
+			if let Some(first_span) = *slot {
+				self.diagnostics.push(report_duplicate_attribute(
+					file_id,
+					attribute.name.span,
+					first_span,
+					known,
+				));
+				continue;
+			}
+			*slot = Some(attribute.name.span);
+			flags.insert(known.flag());
+		}
+		flags
+	}
+
+	/// What a memory's `#[memory_limits]` says: the first one with an
+	/// argument list (`scan_attributes` reports any other). An argument
+	/// that says nothing (an unknown name, a name written twice, a value
+	/// that is not a number) is reported (E2130) and left out.
+	fn resolve_memory_limits(
+		&mut self,
+		file_id: FileId,
+		attributes: &[ast::Attribute],
+	) -> MemoryLimits {
+		let mut limits = MemoryLimits::default();
+		let Some(arguments) =
+			attributes
+				.iter()
+				.find_map(|attribute| match &attribute.value {
+					ast::AttributeValue::Named(arguments)
+						if KnownAttribute::from_name(
+							self.strings.resolve(attribute.name.inner).unwrap(),
+						) == Some(KnownAttribute::MemoryLimits) =>
+					{
+						Some(arguments)
+					}
+					_ => None,
+				})
+		else {
+			return limits;
+		};
+		let mut written = [None::<TextSpan>; 2];
+		for argument in arguments.iter() {
+			let argument = &argument.inner.inner;
+			let name = self.strings.resolve(argument.name.inner).unwrap();
+			let (slot, bound) = match name {
+				"min_pages" => (0, &mut limits.min_pages),
+				"max_pages" => (1, &mut limits.max_pages),
+				_ => {
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::InvalidMemoryLimits.code(),
+							)
+							.with_message(format!(
+								"`#[memory_limits]` has no argument `{name}`"
+							))
+							.with_label(
+								SourceSpan::new(file_id, argument.name.span)
+									.primary_label(),
+							)
+							.with_note(
+								"its arguments are `min_pages` and `max_pages`",
+							),
+					);
+					continue;
+				}
+			};
+			if let Some(first) = written[slot] {
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::InvalidMemoryLimits.code())
+						.with_message(format!("`{name}` is written twice"))
+						.with_label(
+							SourceSpan::new(file_id, argument.name.span)
+								.primary_label(),
+						)
+						.with_label(
+							SourceSpan::new(file_id, first)
+								.secondary_label()
+								.with_message("first written here"),
+						),
+				);
+				continue;
+			}
+			written[slot] = Some(argument.name.span);
+			// A count of pages is an integer literal; the shorthand
+			// `{ min_pages }` names nothing an attribute can read.
+			match argument.value.as_deref() {
+				Some(&Spanned {
+					inner: ast::Expression::Int { value },
+					span,
+				}) => *bound = Some(Spanned { inner: value, span }),
+				value => {
+					let span = value.map_or(argument.name.span, |v| v.span);
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::InvalidMemoryLimits.code(),
+							)
+							.with_message(format!(
+								"`{name}` must be a number of pages"
+							))
+							.with_label(
+								SourceSpan::new(file_id, span)
+									.primary_label()
+									.with_message(
+										"expected an integer literal",
+									),
+							),
+					);
+				}
+			}
+		}
+		limits
+	}
+
 	#[inline]
 	fn push_function(&mut self, item: FunctionDef) -> FunctionIdx {
 		let index =
@@ -2396,6 +2830,52 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			.report(),
 		);
+	}
+
+	fn record_crate_member(
+		&mut self,
+		file_id: FileId,
+		namespace: Scope,
+		name: Spanned<SymbolU32>,
+		item: CrateMemberItem,
+		keys: &[BindingKey],
+	) {
+		let package = self.namespaces.scope(namespace).package_id;
+		let source = SourceSpan::new(file_id, name.span);
+		let member = CrateMember {
+			item,
+			namespace,
+			source,
+		};
+		let mut reported = Vec::new();
+		for &key in keys {
+			let previous = self.crate_contracts[package.as_usize()]
+				.members
+				.get(&key)
+				.copied();
+			if let Some(previous) = previous {
+				// The ordinary namespace already reports same-module collisions.
+				// A function claims two keys, but one conflicting declaration
+				// should receive only one package-level diagnostic.
+				if previous.namespace != namespace
+					&& !reported.contains(&previous.source)
+				{
+					self.diagnostics.push(
+						DuplicateDefinitionDiagnostic {
+							strings: self.strings,
+							key,
+							definitions: (previous.source, source),
+						}
+						.report(),
+					);
+					reported.push(previous.source);
+				}
+			} else {
+				self.crate_contracts[package.as_usize()]
+					.members
+					.insert(key, member);
+			}
+		}
 	}
 
 	/// Records a package instance, `crate "key" as alias;`, and binds `alias` in its scope
@@ -2622,6 +3102,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		namespace: Scope,
 		item: &'ast ast::Item,
 	) {
+		let attributes = match AttributeTarget::of_item(item) {
+			Some((target, attributes)) => {
+				self.scan_attributes(file_id, target, attributes)
+			}
+			None => Attributes::empty(),
+		};
 		match item {
 			ast::Item::Function {
 				signature,
@@ -2629,6 +3115,11 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				..
 			}
 			| ast::Item::FunctionDeclaration {
+				signature,
+				pub_span,
+				..
+			}
+			| ast::Item::CrateFunction {
 				signature,
 				pub_span,
 				..
@@ -2669,7 +3160,20 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					name: signature.name,
 					params,
 					function_impls,
+					attributes,
 				});
+				if matches!(item, ast::Item::CrateFunction { .. }) {
+					self.record_crate_member(
+						file_id,
+						namespace,
+						signature.name,
+						CrateMemberItem::Function(func_index),
+						&[
+							BindingKey::ty(signature.name.inner),
+							BindingKey::value(signature.name.inner),
+						],
+					);
+				}
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
@@ -2725,7 +3229,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			}
 			ast::Item::Struct {
 				pub_span,
-				attributes,
 				name,
 				fields,
 				..
@@ -2803,10 +3306,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					field_names: field_names.into_boxed_slice(),
 					field_pub_spans: field_pub_spans.into_boxed_slice(),
 					lookup,
-					order: if attributes.iter().any(|attribute| {
-						self.strings.resolve(attribute.name.inner)
-							== Some("fixed_order")
-					}) {
+					order: if attributes.contains(Attributes::FIXED_ORDER) {
 						FieldOrder::Fixed
 					} else {
 						FieldOrder::Optimal
@@ -2902,12 +3402,13 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					});
 				}
 			}
-			ast::Item::TypeAlias {
-				pub_span,
-				name,
-				body,
-				..
-			} => {
+			ast::Item::TypeAlias { pub_span, name, .. }
+			| ast::Item::CrateType { pub_span, name, .. } => {
+				let bodyless = match item {
+					ast::Item::TypeAlias { body, .. } => body.is_none(),
+					ast::Item::CrateType { .. } => true,
+					_ => unreachable!(),
+				};
 				let type_alias_index = TypeAliasIdx::new(
 					u32::try_from(self.type_aliases.len()).unwrap(),
 				);
@@ -2924,7 +3425,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
-				if body.is_none()
+				if bodyless
 					&& self.namespaces.scope(namespace).package_id
 						== self.stdlib_package
 				{
@@ -2941,6 +3442,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					namespace,
 					name: *name,
 				});
+				if matches!(item, ast::Item::CrateType { .. }) {
+					self.record_crate_member(
+						file_id,
+						namespace,
+						*name,
+						CrateMemberItem::Type(type_alias_index),
+						&[BindingKey::ty(name.inner)],
+					);
+				}
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
@@ -2950,17 +3460,24 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					},
 				});
 			}
-			ast::Item::Memory { pub_span, name, .. } => {
+			ast::Item::Memory {
+				pub_span,
+				name,
+				attributes: written,
+				..
+			} => {
 				let memory_index =
 					MemoryIdx::new(u32::try_from(self.memories.len()).unwrap());
 				let (trait_impl_index, size_assoc_type_index) =
 					self.synthesize_memory_impl(file_id, namespace, name.span);
+				let limits = self.resolve_memory_limits(file_id, written);
 				self.memories.push(MemoryDef {
 					file_id,
 					namespace,
 					name: *name,
 					trait_impl_index,
 					size_assoc_type_index,
+					limits,
 				});
 				let def_key = self.push_def(
 					Namespace::from(namespace),
@@ -2981,7 +3498,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					node: AstNodeRef::Memory { memory_index, item },
 				});
 			}
-			ast::Item::Const { pub_span, name, .. } => {
+			ast::Item::Const { pub_span, name, .. }
+			| ast::Item::CrateConst { pub_span, name, .. } => {
 				let const_index =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				self.constants.push(ConstDef {
@@ -3000,6 +3518,15 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
+				if matches!(item, ast::Item::CrateConst { .. }) {
+					self.record_crate_member(
+						file_id,
+						namespace,
+						*name,
+						CrateMemberItem::Constant(const_index),
+						&[BindingKey::value(name.inner)],
+					);
+				}
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
@@ -3091,6 +3618,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				for item in items.iter() {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
+					let (target, attributes) =
+						AttributeTarget::of_trait_item(&item.inner.inner);
+					let attributes =
+						self.scan_attributes(file_id, target, attributes);
 					let (member, key) = match &item.inner.inner {
 						ast::TraitItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
@@ -3116,6 +3647,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3240,11 +3772,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Some(MemberKind::AssociatedType(assoc)) => Some(assoc),
 					_ => None,
 				};
-				let method = |name: &str| match member(BindingKey::value, name)
-				{
-					Some(MemberKind::Method(function)) => Some(function),
-					_ => None,
-				};
 				let this = Some(trait_index);
 				if self.intrinsics.call == this {
 					self.intrinsics.call_args = declared("Args");
@@ -3253,15 +3780,32 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					self.intrinsics.stack_value_repr = declared("Repr");
 				} else if self.intrinsics.memory == this {
 					self.intrinsics.memory_size = declared("Size");
+					self.intrinsics.memory_data_end =
+						match member(BindingKey::value, "DATA_END") {
+							Some(MemberKind::Constant(constant)) => {
+								Some(constant)
+							}
+							_ => None,
+						};
 				} else if self.intrinsics.slice == this {
 					self.intrinsics.slice_value = declared("Value");
-					self.intrinsics.slice_mem = declared("Mem");
-					self.intrinsics.slice_index = method("index");
-				} else if self.intrinsics.slice_mut == this {
-					self.intrinsics.slice_index_mut = method("index_mut");
+					let function =
+						|name: &str| match member(BindingKey::value, name) {
+							Some(
+								MemberKind::Function(function)
+								| MemberKind::Method(function),
+							) => Some(function),
+							_ => None,
+						};
+					self.intrinsics.slice_len = function("len");
+					self.intrinsics.slice_as_ref = function("as_ref");
+				} else if self.intrinsics.pointer == this {
+					self.intrinsics.pointer_memory = declared("Memory");
+					self.intrinsics.pointer_pointee = declared("Pointee");
+					self.intrinsics.pointer_metadata = declared("Metadata");
 				} else if self.intrinsics.array == this {
-					self.intrinsics.array_size =
-						match member(BindingKey::value, "SIZE") {
+					self.intrinsics.array_len =
+						match member(BindingKey::value, "LEN") {
 							Some(MemberKind::Constant(constant)) => {
 								Some(constant)
 							}
@@ -3294,6 +3838,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				for impl_item in items.iter() {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
+					let (target, attributes) =
+						AttributeTarget::of_impl_item(&impl_item.inner.inner);
+					let attributes =
+						self.scan_attributes(file_id, target, attributes);
 					let (member, key, binding) = match &impl_item.inner.inner {
 						ast::ImplItem::Function {
 							signature,
@@ -3325,6 +3873,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3487,6 +4036,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								name: *name,
 								trait_impl_index,
 								size_assoc_type_index,
+								limits: MemoryLimits::default(),
 							});
 							let def_key = self.push_def(
 								own_namespace,
@@ -3537,6 +4087,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes: Attributes::empty(),
 								});
 							let def_key = self.push_def(
 								own_namespace,
@@ -3656,6 +4207,17 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				let typeset_index = TypesetIdx::new(
 					u32::try_from(self.typesets.len()).unwrap(),
 				);
+				if self.namespaces.scope(namespace).package_id
+					== self.stdlib_package
+				{
+					if let Some(name_str) = self.strings.resolve(name.inner) {
+						if let Some(slot) =
+							self.intrinsics.typeset_slot_mut(name_str)
+						{
+							*slot = Some(typeset_index);
+						}
+					}
+				}
 				let def_key = self.push_def(
 					Namespace::from(namespace),
 					ItemDef::new(DefKind::TypeSet(typeset_index), name.span),
@@ -3722,6 +4284,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				for item in items.iter() {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
+					let (target, attributes) =
+						AttributeTarget::of_impl_item(&item.inner.inner);
+					let attributes =
+						self.scan_attributes(file_id, target, attributes);
 					let (member, key) = match &item.inner.inner {
 						ast::ImplItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
@@ -3747,6 +4313,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 									name: signature.name,
 									params,
 									function_impls,
+									attributes,
 								});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -4069,6 +4636,86 @@ fn report_self_param_position(
 		.with_label(SourceSpan::new(file_id, span).primary_label())
 }
 
+fn report_unknown_attribute(
+	file_id: FileId,
+	name: Spanned<SymbolU32>,
+	text: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::warning()
+		.with_code(DiagnosticCode::UnknownAttribute.code())
+		.with_message(format!("unknown attribute `{text}`"))
+		.with_label(
+			SourceSpan::new(file_id, name.span)
+				.primary_label()
+				.with_message("ignored"),
+		)
+}
+
+fn report_misplaced_attribute(
+	file_id: FileId,
+	span: TextSpan,
+	attribute: KnownAttribute,
+	target: AttributeTarget,
+) -> Diagnostic<FileId> {
+	let name = attribute.name();
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MisplacedAttribute.code())
+		.with_message(format!(
+			"`#[{name}]` cannot be written on {}",
+			target.description()
+		))
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+		.with_note(format!(
+			"`#[{name}]` applies only to {}",
+			attribute.target().description()
+		))
+}
+
+fn report_malformed_attribute(
+	file_id: FileId,
+	span: TextSpan,
+	attribute: KnownAttribute,
+) -> Diagnostic<FileId> {
+	let name = attribute.name();
+	let (message, form) = if attribute.takes_arguments() {
+		(
+			format!("`#[{name}]` takes arguments"),
+			format!("#[{name}({{ .. }})]"),
+		)
+	} else {
+		(
+			format!("`#[{name}]` takes no arguments"),
+			format!("#[{name}]"),
+		)
+	};
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MalformedAttribute.code())
+		.with_message(message)
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+		.with_note(format!("write it as `{form}`"))
+}
+
+fn report_duplicate_attribute(
+	file_id: FileId,
+	span: TextSpan,
+	first: TextSpan,
+	attribute: KnownAttribute,
+) -> Diagnostic<FileId> {
+	Diagnostic::warning()
+		.with_code(DiagnosticCode::DuplicateAttribute.code())
+		.with_message(format!("`#[{}]` is written twice", attribute.name()))
+		.with_label(
+			SourceSpan::new(file_id, span)
+				.primary_label()
+				.with_message("redundant"),
+		)
+		.with_label(
+			SourceSpan::new(file_id, first)
+				.secondary_label()
+				.with_message("first written here"),
+		)
+}
+
 fn report_self_field(file_id: FileId, span: TextSpan) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::ReservedIdentifier.code())
@@ -4086,6 +4733,54 @@ mod tests {
 	use super::*;
 	use crate::testing::DiagnosticView;
 	use crate::vfs;
+
+	#[test]
+	fn crate_contract_records_binding_tiers_across_modules() {
+		let case = TestCase::new(indoc! {"
+			mod first {
+				pub crate type Shared;
+				pub crate func compute(x: i32) -> i32;
+			}
+			mod second {
+				crate const Shared: i32;
+			}
+		"});
+		case.diagnostics().assert_none();
+		let contract =
+			&case.defs.crate_contracts[case.graph.root_package.as_usize()];
+		let shared = case.graph.strings.get("Shared").unwrap();
+		let compute = case.graph.strings.get("compute").unwrap();
+		assert!(matches!(
+			contract.members[&BindingKey::ty(shared)].item,
+			CrateMemberItem::Type(_)
+		));
+		assert!(matches!(
+			contract.members[&BindingKey::value(shared)].item,
+			CrateMemberItem::Constant(_)
+		));
+		let ty = contract.members[&BindingKey::ty(compute)];
+		let value = contract.members[&BindingKey::value(compute)];
+		assert!(matches!(ty.item, CrateMemberItem::Function(_)));
+		assert_eq!(ty.source, value.source);
+	}
+
+	#[test]
+	fn crate_contract_rejects_duplicate_keys_in_different_modules() {
+		let case = TestCase::new(indoc! {"
+			mod first { crate type Shared; }
+			mod second { crate type Shared; }
+		"});
+		let duplicates: Vec<_> = case
+			.diagnostics
+			.iter()
+			.filter(|diagnostic| {
+				diagnostic.code.as_deref()
+					== Some(DiagnosticCode::DuplicateDefinition.code())
+			})
+			.collect();
+		assert_eq!(duplicates.len(), 1);
+		assert_eq!(duplicates[0].labels.len(), 2);
+	}
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,
@@ -4438,6 +5133,7 @@ mod tests {
 			trait Not {}
 			trait PartialEq {}
 			trait PartialOrd {}
+			trait Eq {}
 		"});
 		case.diagnostics().assert_none();
 
@@ -4458,6 +5154,7 @@ mod tests {
 			(intrinsics.not, "Not"),
 			(intrinsics.partial_eq, "PartialEq"),
 			(intrinsics.partial_ord, "PartialOrd"),
+			(intrinsics.eq, "Eq"),
 		] {
 			let index = slot.unwrap_or_else(|| {
 				panic!("missing intrinsic `{expected_name}`")
@@ -4465,6 +5162,19 @@ mod tests {
 			let name = case.defs.traits[usize::from(index)].name.inner;
 			assert_eq!(case.graph.strings.resolve(name), Some(expected_name));
 		}
+	}
+
+	#[test]
+	fn stdlib_integer_typeset_is_recorded() {
+		let case = TestCase::new_stdlib(indoc! {"
+			type u8;
+			typeset Integer { u8 }
+		"});
+		case.diagnostics().assert_none();
+		let integer =
+			case.defs.intrinsics.integer.expect("`Integer` is recorded");
+		let name = case.defs.typesets[usize::from(integer)].name.inner;
+		assert_eq!(case.graph.strings.resolve(name), Some("Integer"));
 	}
 
 	#[test]
@@ -4476,6 +5186,8 @@ mod tests {
 		assert!(case.defs.intrinsics.u8.is_some());
 		assert!(case.defs.intrinsics.char.is_none());
 		assert!(case.defs.intrinsics.add.is_none());
+		assert!(case.defs.intrinsics.eq.is_none());
+		assert!(case.defs.intrinsics.integer.is_none());
 	}
 
 	#[test]
@@ -5733,7 +6445,7 @@ mod tests {
 				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
 					indoc! {"
-            #[tag = \"\\o\"
+            #[other({ value: \"\\o\" })
         "}
 					.to_string(),
 				)])),
@@ -6039,5 +6751,203 @@ mod tests {
 			case.resolve(Tier::Type, "std::Memory").expect_success(),
 			DefKind::Trait(_)
 		));
+	}
+
+	/// The attributes prescan recorded on the function named `name`.
+	fn function_attributes(case: &TestCase, name: &str) -> Attributes {
+		let symbol = case.graph.strings.get(name).unwrap();
+		let mut found = case
+			.defs
+			.functions
+			.iter()
+			.filter(|function| function.name.inner == symbol);
+		let function = found.next().expect("the function is declared");
+		assert!(found.next().is_none(), "`{name}` names one function");
+		function.attributes
+	}
+
+	#[test]
+	fn inline_is_recorded_on_every_kind_of_function_with_a_body() {
+		let case = TestCase::new(indoc! {"
+			struct S();
+			trait T {
+				#[inline]
+				func defaulted(self: Self) {}
+				func required(self: Self);
+			}
+			impl S {
+				#[inline]
+				func inherent(self: Self) {}
+			}
+			impl T for S {
+				#[inline]
+				func required(self: Self) {}
+			}
+			#[inline]
+			func free() {}
+			func plain() {}
+		"});
+		case.diagnostics().assert_none();
+		for name in ["defaulted", "inherent", "free"] {
+			assert!(
+				function_attributes(&case, name).contains(Attributes::INLINE),
+				"`{name}` is inline"
+			);
+		}
+		assert_eq!(function_attributes(&case, "plain"), Attributes::empty());
+		// The trait's declaration and the impl's function are two functions
+		// with the attribute only on the impl's.
+		let required = case.graph.strings.get("required").unwrap();
+		let inline: Vec<bool> = case
+			.defs
+			.functions
+			.iter()
+			.filter(|function| function.name.inner == required)
+			.map(|function| function.attributes.contains(Attributes::INLINE))
+			.collect();
+		assert_eq!(inline, [false, true]);
+	}
+
+	/// What `name`'s `#[memory_limits]` records, as `(min, max)`.
+	fn memory_limits(
+		case: &TestCase,
+		name: &str,
+	) -> (Option<u64>, Option<u64>) {
+		let symbol = case.graph.strings.get(name).unwrap();
+		let memory = case
+			.defs
+			.memories
+			.iter()
+			.find(|memory| memory.name.inner == symbol)
+			.expect("the memory is declared");
+		(
+			memory.limits.min_pages.map(|pages| pages.inner),
+			memory.limits.max_pages.map(|pages| pages.inner),
+		)
+	}
+
+	#[test]
+	fn memory_limits_are_recorded_as_written() {
+		let case = TestCase::new(indoc! {"
+			#[memory_limits({ min_pages: 2, max_pages: 9 })]
+			memory both: u32;
+			#[memory_limits({ max_pages: 4 })]
+			memory capped: u32;
+			memory free: u32;
+			// Too many for a 32-bit memory: that is the checker's to say.
+			#[memory_limits({ min_pages: 70000 })]
+			memory big: u32;
+			import \"env\" as env { memory host: u32; }
+		"});
+		case.diagnostics().assert_none();
+		assert_eq!(memory_limits(&case, "both"), (Some(2), Some(9)));
+		assert_eq!(memory_limits(&case, "capped"), (None, Some(4)));
+		assert_eq!(memory_limits(&case, "free"), (None, None));
+		assert_eq!(memory_limits(&case, "big"), (Some(70000), None));
+		assert_eq!(memory_limits(&case, "host"), (None, None));
+	}
+
+	#[test]
+	fn a_memory_limits_argument_that_says_nothing_is_reported_and_left_out() {
+		for (source, message, recorded) in [
+			(
+				"#[memory_limits({ pages: 1 })] memory heap: u32;",
+				"`#[memory_limits]` has no argument `pages`",
+				(None, None),
+			),
+			(
+				"#[memory_limits({ min_pages: 1, min_pages: 2 })] memory heap: u32;",
+				"`min_pages` is written twice",
+				(Some(1), None),
+			),
+			(
+				"#[memory_limits({ max_pages: \"4\" })] memory heap: u32;",
+				"`max_pages` must be a number of pages",
+				(None, None),
+			),
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::InvalidMemoryLimits]);
+			case.diagnostics().assert_error_saying(message);
+			assert_eq!(memory_limits(&case, "heap"), recorded, "{source}");
+		}
+	}
+
+	#[test]
+	fn an_unknown_attribute_is_ignored_with_a_warning() {
+		let case = TestCase::new(indoc! {"
+			#[inlin]
+			func f() {}
+			#[packed]
+			struct S();
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnknownAttribute,
+			DiagnosticCode::UnknownAttribute,
+		]);
+		case.diagnostics().assert_no_errors();
+		assert_eq!(function_attributes(&case, "f"), Attributes::empty());
+	}
+
+	#[test]
+	fn a_known_attribute_on_the_wrong_item_is_an_error() {
+		let case = TestCase::new(indoc! {"
+			#[inline]
+			struct S();
+			#[fixed_order]
+			func f() {}
+			trait T {
+				#[inline]
+				func required(self: Self);
+			}
+			#[inline]
+			const C: u32 = 0;
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedAttribute,
+			DiagnosticCode::MisplacedAttribute,
+			DiagnosticCode::MisplacedAttribute,
+			DiagnosticCode::MisplacedAttribute,
+		]);
+		case.diagnostics().assert_error_saying(
+			"`#[inline]` cannot be written on a function without a body",
+		);
+		case.diagnostics()
+			.assert_error_saying("`#[fixed_order]` applies only to a struct");
+		assert_eq!(function_attributes(&case, "f"), Attributes::empty());
+		assert_eq!(function_attributes(&case, "required"), Attributes::empty());
+	}
+
+	#[test]
+	fn a_known_attribute_in_the_wrong_form_is_an_error() {
+		let case = TestCase::new(indoc! {"
+			#[inline({ always: 1 })]
+			func f() {}
+			#[memory_limits]
+			memory heap: u32;
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MalformedAttribute,
+			DiagnosticCode::MalformedAttribute,
+		]);
+		case.diagnostics()
+			.assert_error_saying("`#[inline]` takes no arguments");
+		case.diagnostics()
+			.assert_error_saying("`#[memory_limits]` takes arguments");
+		assert_eq!(function_attributes(&case, "f"), Attributes::empty());
+	}
+
+	#[test]
+	fn a_repeated_attribute_is_a_warning_and_still_applies() {
+		let case = TestCase::new(indoc! {"
+			#[inline]
+			#[inline]
+			func f() {}
+		"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::DuplicateAttribute]);
+		case.diagnostics().assert_no_errors();
+		assert_eq!(function_attributes(&case, "f"), Attributes::INLINE);
 	}
 }

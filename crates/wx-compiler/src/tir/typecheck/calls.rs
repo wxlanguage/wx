@@ -29,7 +29,8 @@ use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::signatures::TypeContext;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
-	Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex, TypeList,
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
+	TypeList,
 };
 use crate::vfs::FileId;
 
@@ -66,7 +67,7 @@ impl Callee {
 	) -> Self {
 		let env = cx.functions[usize::from(function)].type_params;
 		let mut type_args =
-			vec![TypeIndex::INFER; cx.type_envs.generic_count(env)]
+			vec![TypeIndex::INFER; cx.generic_envs.generic_count(env)]
 				.into_boxed_slice();
 		type_args[..leading.len()].copy_from_slice(leading);
 		Self {
@@ -108,7 +109,7 @@ pub(super) struct CallTarget<'ctx> {
 	pub(super) kind: CallTargetKind,
 	/// The frames the parameter types are written with: the whole chain the
 	/// call's flat type arguments instantiate.
-	pub(super) type_env: TypeEnvIdx,
+	pub(super) generic_env: GenericEnvIdx,
 	/// Each parameter's type as declared, `self` included.
 	pub(super) param_types: TypeList,
 	/// Each parameter's name as a call by name spells it, `None` when it is
@@ -124,7 +125,7 @@ impl<'ctx> CallTarget<'ctx> {
 		let signature = &cx.functions[usize::from(function)];
 		Self {
 			kind: CallTargetKind::Function(function),
-			type_env: signature.type_params,
+			generic_env: signature.type_params,
 			param_types: signature.param_types,
 			param_names: &cx.defs.functions
 				[usize::from(naming_declaration(cx, function))]
@@ -139,7 +140,7 @@ impl<'ctx> CallTarget<'ctx> {
 		let signature = &cx.structs[usize::from(struct_index)];
 		Self {
 			kind: CallTargetKind::StructConstructor(struct_index),
-			type_env: signature.type_params,
+			generic_env: signature.type_params,
 			param_types: signature.field_types,
 			param_names: &cx.defs.structs[usize::from(struct_index)]
 				.field_names,
@@ -167,11 +168,11 @@ pub(super) enum CallTargetKind {
 }
 
 impl CallTargetKind {
-	pub(super) fn owner(self) -> TypeEnvOwner {
+	pub(super) fn owner(self) -> GenericEnvOwner {
 		match self {
-			Self::Function(function) => TypeEnvOwner::Function(function),
+			Self::Function(function) => GenericEnvOwner::Function(function),
 			Self::StructConstructor(struct_index) => {
-				TypeEnvOwner::Struct(struct_index)
+				GenericEnvOwner::Struct(struct_index)
 			}
 		}
 	}
@@ -262,18 +263,18 @@ impl BodyContext<'_, '_, '_, '_> {
 		self.write_type_args(
 			segment,
 			own,
-			TypeEnvOwner::Function(function),
+			GenericEnvOwner::Function(function),
 			&mut type_args,
 		);
 		let mut mismatched = false;
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
-			let expected = self.normalized(expected, self.scope.env);
+			let expected = self.normalized(expected, self.scope.assumption_env);
 			let declared = self.cx.types.intern_function(
 				function,
-				self.cx.type_envs.identity_args(env),
+				self.cx.generic_envs.identity_args(env),
 			);
 			self.cx.types.learn(
-				&self.cx.type_envs,
+				&self.cx.generic_envs,
 				env,
 				&mut type_args,
 				declared,
@@ -300,14 +301,14 @@ impl BodyContext<'_, '_, '_, '_> {
 			mismatched,
 			&mut type_args,
 		);
-		let type_list = self.cx.types.push_list(&type_args);
 		let target = CallTarget::function(self.cx, function);
-		self.check_callee_bounds(&target, proven, segment, type_list, &[]);
+		let args = self.use_args(&target, segment, &type_args, &[]);
+		self.check_use_bounds(&target, proven, segment, args);
 		let ty = self.cx.types.intern_function(function, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
 		let kind = ExprKind::Function {
 			function,
-			type_args: type_list,
+			type_args: args,
 		};
 		self.body.push(kind, ty, span)
 	}
@@ -335,15 +336,15 @@ impl BodyContext<'_, '_, '_, '_> {
 		self.write_type_args(
 			segment,
 			own,
-			TypeEnvOwner::Function(function),
+			GenericEnvOwner::Function(function),
 			&mut type_args,
 		);
 		// The result is learned from first: a disagreement teaches nothing,
 		// and the call's own type is held to the expected one by the caller.
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
-			let expected = self.normalized(expected, self.scope.env);
+			let expected = self.normalized(expected, self.scope.assumption_env);
 			self.cx.types.learn(
-				&self.cx.type_envs,
+				&self.cx.generic_envs,
 				env,
 				&mut type_args,
 				return_type,
@@ -384,15 +385,15 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 		self.expect_arguments(&target, &type_args, &given);
 		// One stored list for the bound checks and the node.
-		let type_list = self.cx.types.push_list(&type_args);
-		self.check_callee_bounds(&target, proven, segment, type_list, &given);
+		let use_args = self.use_args(&target, segment, &type_args, &given);
+		self.check_use_bounds(&target, proven, segment, use_args);
 		let skipped = usize::from(receiver.is_some());
 		let args = self.arguments_value(
 			&target, &type_args, &given, skipped, reported, span,
 		);
 		let ty = self.instantiate(return_type, env, &type_args);
 		let ty = self.cx.types.collapse_error(ty);
-		let kind = self.call_node(function, type_list, receiver, args);
+		let kind = self.call_node(function, use_args, receiver, args);
 		self.body.push(kind, ty, span)
 	}
 
@@ -402,7 +403,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn call_node(
 		&self,
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		receiver: Option<ExprIdx>,
 		args: ExprIdx,
 	) -> ExprKind {
@@ -472,7 +473,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			TypeIndex::ERROR
 		} else {
 			let declared = self.declared_after(target, skipped);
-			self.instantiate(declared, target.type_env, type_args)
+			self.instantiate(declared, target.generic_env, type_args)
 		};
 		self.pack(given.iter().map(|argument| argument.value), order, ty, span)
 	}
@@ -525,7 +526,11 @@ impl BodyContext<'_, '_, '_, '_> {
 	) {
 		for argument in given {
 			let ty = if self.cx.types.has_infer(argument.expected) {
-				self.instantiate(argument.declared, target.type_env, type_args)
+				self.instantiate(
+					argument.declared,
+					target.generic_env,
+					type_args,
+				)
 			} else {
 				argument.expected
 			};
@@ -544,8 +549,8 @@ impl BodyContext<'_, '_, '_, '_> {
 	) {
 		let actual = self.body.ty(value);
 		self.cx.types.learn(
-			&self.cx.type_envs,
-			target.type_env,
+			&self.cx.generic_envs,
+			target.generic_env,
 			type_args,
 			declared,
 			actual,
@@ -592,7 +597,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			let param = ParamIdx::new((skipped + at) as u32);
 			let declared =
 				self.cx.types.list(target.param_types)[usize::from(param)];
-			let hint = self.instantiate(declared, target.type_env, type_args);
+			let hint =
+				self.instantiate(declared, target.generic_env, type_args);
 			let value = self.build(&argument.inner, hint);
 			self.learn_argument(target, type_args, declared, value);
 			given.push(GivenArgument {
@@ -620,7 +626,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let skipped = given.len();
 		let open = target.param_types.len() - skipped;
 		let declared = self.declared_after(target, skipped);
-		let hint = self.instantiate(declared, target.type_env, type_args);
+		let hint = self.instantiate(declared, target.generic_env, type_args);
 		let value = self.build(&argument.inner, hint);
 		let actual = self.body.ty(value);
 		let is_tuple =
@@ -655,7 +661,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let param = ParamIdx::new(given.len() as u32);
 		let declared =
 			self.cx.types.list(target.param_types)[usize::from(param)];
-		let hint = self.instantiate(declared, target.type_env, type_args);
+		let hint = self.instantiate(declared, target.generic_env, type_args);
 		let fits = match *self.cx.types.resolve(hint) {
 			Type::Tuple { elements } => elements.len() == arguments.len(),
 			_ => self.cx.types.has_infer(hint),
@@ -736,7 +742,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				Some(param) => {
 					let declared = self.cx.types.list(target.param_types)
 						[usize::from(param)];
-					self.instantiate(declared, target.type_env, type_args)
+					self.instantiate(declared, target.generic_env, type_args)
 				}
 				None => TypeIndex::INFER,
 			};
@@ -851,38 +857,17 @@ impl BodyContext<'_, '_, '_, '_> {
 	fn function_frames(
 		&self,
 		function: FunctionIdx,
-	) -> (TypeEnvIdx, TypeEnvIdx) {
+	) -> (GenericEnvIdx, GenericEnvIdx) {
 		let env = self.cx.functions[usize::from(function)].type_params;
-		let own = if env != TypeEnvIdx::ROOT
-			&& self.cx.type_envs.owner(env) == TypeEnvOwner::Function(function)
+		let own = if env != GenericEnvIdx::ROOT
+			&& self.cx.generic_envs.owner(env)
+				== GenericEnvOwner::Function(function)
 		{
 			env
 		} else {
-			TypeEnvIdx::ROOT
+			GenericEnvIdx::ROOT
 		};
 		(env, own)
-	}
-
-	/// Proves, for the final flat `type_args`, the bounds of each frame on
-	/// `target`'s chain after the first `proven` arguments: the selection
-	/// proved those.
-	fn check_callee_bounds(
-		&mut self,
-		target: &CallTarget<'_>,
-		proven: usize,
-		segment: &ast::PathSegment,
-		type_args: TypeList,
-		given: &[GivenArgument],
-	) {
-		let mut frame = target.type_env;
-		while frame != TypeEnvIdx::ROOT {
-			if self.cx.type_envs.parent_count(frame) >= proven {
-				self.check_frame_bounds(
-					target, frame, segment, type_args, given,
-				);
-			}
-			frame = self.cx.type_envs.parent(frame).unwrap();
-		}
 	}
 
 	/// `ty`, written with the parameters of `env`, with `args` for them. A
@@ -891,18 +876,18 @@ impl BodyContext<'_, '_, '_, '_> {
 	pub(super) fn instantiate(
 		&mut self,
 		ty: TypeIndex,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		args: &[TypeIndex],
 	) -> TypeIndex {
 		let ty = self.cx.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.cx.type_envs,
+				envs: &self.cx.generic_envs,
 				env,
 				args,
 			},
 		);
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		self.cx.types.collapse_error(ty)
 	}
 
@@ -962,7 +947,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		arguments: Arguments<'_>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let ty = self.normalized(self.body.ty(value), self.scope.env);
+		let ty =
+			self.normalized(self.body.ty(value), self.scope.assumption_env);
 		let callee = self.value_callee(value, ty);
 		let item = match *self.cx.types.resolve(ty) {
 			Type::Function {
@@ -1016,7 +1002,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			(None, Arguments::Named(_)) => unreachable!("reported above"),
 		};
-		let type_args = self.cx.types.push_list(&callee.type_args);
+		let value_span = self.body.span(value);
+		let type_args = self
+			.cx
+			.generic_args
+			.push(callee.type_args.iter().map(|&arg| (arg, value_span)));
 		let kind =
 			self.call_node(callee.function, type_args, Some(value), packed);
 		self.body.push(kind, result, span)
@@ -1047,7 +1037,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 		self.expect_arguments(&target, &type_args, &given);
 		let return_type = self.cx.functions[usize::from(function)].return_type;
-		let result = self.instantiate(return_type, target.type_env, &type_args);
+		let result =
+			self.instantiate(return_type, target.generic_env, &type_args);
 		let args = self
 			.arguments_value(&target, &type_args, &given, 0, reported, span);
 		(args, result)
@@ -1070,7 +1061,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			assoc_type_index,
 			base: ty,
 		});
-		let projection = self.normalized(projection, self.scope.env);
+		let projection = self.normalized(projection, self.scope.assumption_env);
 		self.cx.types.collapse_error(projection)
 	}
 
@@ -1124,11 +1115,14 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let Type::Function { .. } = self.cx.types.resolve(ty) {
 			return Some(ValueCallee::Call(over_self(self.cx)));
 		}
-		let found = if self.cx.types.has_literal(ty) {
+		let found = if self.cx.types.needs_context(ty) {
 			Ok(None)
 		} else {
-			self.cx
-				.find_trait_impl_query(self.scope.env, ty, call_trait)
+			self.cx.find_trait_impl_query(
+				self.scope.assumption_env,
+				ty,
+				call_trait,
+			)
 		};
 		let callee = match found {
 			Ok(Some(TraitImplLookup::Concrete { impl_index, args })) => {

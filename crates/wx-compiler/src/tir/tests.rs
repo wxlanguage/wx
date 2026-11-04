@@ -2186,7 +2186,7 @@ fn test_generic_call_arg_mismatch_preserves_function_body() {
 	// diagnostic but returns a usable `type_args` (sanitizing any leftover
 	// `INFER` to `ERROR`), so callers keep building a real expression tree.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
         func make_ptr() -> heap::&u16 { unreachable }
         func f(count: heap::Size) -> heap::&[u8] {
@@ -2250,7 +2250,7 @@ fn test_local_with_pointer_type_annotation_dereference_recovers() {
 	// When the RHS errors (e.g. `alloc` is undeclared), the local must still carry
 	// the declared pointer type so that `n.*` doesn't cascade into a "not a pointer" error.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 }
         struct Node { x: i32 }
         func write(x: i32) {
@@ -12034,7 +12034,7 @@ fn test_global_init_if_expression_resolves() {
 #[test]
 fn test_global_initialized_to_data_end_tir() {
 	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1)]
+        #[memory_limits({ min_pages: 1 })]
         memory heap: Memory where { Size = u32 };
         global mut bump: heap::*u8 = heap::DATA_END;
         export { heap }
@@ -15788,9 +15788,9 @@ fn test_match_int_exhaustive_with_wildcard() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 -> { 1 },
-                _ -> { -1 },
+                0 => { 0 },
+                1 => { 1 },
+                _ => { -1 },
             }
         }
         export { sign }
@@ -15817,9 +15817,9 @@ fn test_match_enum_all_variants_covered_no_wildcard_ok() {
         }
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                FileDescriptor::StdOut -> { 1 },
-                FileDescriptor::StdErr -> { 2 },
+                FileDescriptor::StdIn => { 0 },
+                FileDescriptor::StdOut => { 1 },
+                FileDescriptor::StdErr => { 2 },
             }
         }
         export { name }
@@ -15845,8 +15845,8 @@ fn test_match_enum_missing_variant_is_error() {
         }
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                FileDescriptor::StdOut -> { 1 },
+                FileDescriptor::StdIn => { 0 },
+                FileDescriptor::StdOut => { 1 },
             }
         }
         export { name }
@@ -15867,8 +15867,8 @@ fn test_match_int_without_wildcard_is_error() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
             match x {
-                0 -> { 0 },
-                1 -> { 1 },
+                0 => { 0 },
+                1 => { 1 },
             }
         }
         export { sign }
@@ -15892,8 +15892,8 @@ fn test_match_invalid_pattern_shape_is_error() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32, y: i32) -> i32 {
             match x {
-                y -> { 1 },
-                _ -> { 2 },
+                y => { 1 },
+                _ => { 2 },
             }
         }
         export { f }
@@ -15914,8 +15914,8 @@ fn test_match_arm_type_mismatch_reuses_type_mismatch_diagnostic() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             local y = match x {
-                0 -> { x > 0 },
-                _ -> { x },
+                0 => { x > 0 },
+                _ => { x },
             };
         }
         export { f }
@@ -15941,8 +15941,8 @@ fn test_match_enum_variant_marks_variant_used() {
         }
         func name(fd: FileDescriptor) -> u8 {
             match fd {
-                FileDescriptor::StdIn -> { 0 },
-                _ -> { 1 },
+                FileDescriptor::StdIn => { 0 },
+                _ => { 1 },
             }
         }
         export { name }
@@ -15979,9 +15979,9 @@ fn test_match_duplicate_pattern_warns_unreachable() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
             match x {
-                0 -> { 1 },
-                0 -> { 2 },
-                _ -> { 3 },
+                0 => { 1 },
+                0 => { 2 },
+                _ => { 3 },
             }
         }
         export { f }

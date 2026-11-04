@@ -118,11 +118,13 @@ pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
 	};
 	let numeric = scalar.is_integer() || scalar.is_float();
 	match op {
-		BinaryOp::Add
-		| BinaryOp::Sub
-		| BinaryOp::Mul
-		| BinaryOp::Div
-		| BinaryOp::Rem => numeric,
+		// Floats have no WASM remainder instruction, and the stdlib no longer
+		// provides a `Rem` impl for them; a floating `%` is diagnosed rather
+		// than lowered.
+		BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+			numeric
+		}
+		BinaryOp::Rem => scalar.is_integer(),
 		BinaryOp::BitAnd
 		| BinaryOp::BitOr
 		| BinaryOp::BitXor
@@ -183,8 +185,8 @@ pub(super) struct OperatorMethod {
 	pub(super) method: FunctionIdx,
 }
 
-/// Every overloadable operator's method, resolved once from the `#[tag]`ged
-/// traits phase 1 recorded (`IntrinsicDefs`). A slot is `None` when the stdlib
+/// Every overloadable operator's method, resolved once from the operator
+/// traits phase 1 recorded by name (`IntrinsicDefs`). A slot is `None` when the stdlib
 /// in use does not define the trait (or the method), in which case the
 /// operator applies to nothing.
 pub(super) struct OperatorTraits {

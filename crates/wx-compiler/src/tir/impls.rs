@@ -81,8 +81,6 @@ impl ImplTarget {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::Tuple { .. }
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
@@ -120,32 +118,36 @@ struct ImplDispatchBuilder<'a, 'ast> {
 
 impl IntrinsicDefs {
 	/// Whether `ty` has `trait_index` by the compiler's rule: a typed
-	/// function reference is a `Call`; every slice and array is a `Slice`, an
-	/// exclusive one a `SliceMut`, an array an `Array` and an exclusive array
-	/// an `ArrayMut`. `None` when the rule says nothing about the pair.
+	/// function reference is a `Call`; every pointer is a `Pointer`; every
+	/// slice and array (`[T]`, `[T; N]`) is a `Slice`, and an array an
+	/// `Array`; every enum is `Eq` and `PartialEq` because its repr is an
+	/// `Integer` typeset member. `None` when the rule says nothing about the
+	/// pair.
 	pub(super) fn implements_structurally(
 		&self,
 		ty: &Type,
 		trait_index: TraitIdx,
 	) -> Option<bool> {
 		let this = Some(trait_index);
-		let (ownership, is_array) = match *ty {
+		let is_array = match *ty {
 			Type::TypedFuncref { .. } => {
 				return (this == self.call).then_some(true);
 			}
-			Type::Slice { ownership, .. } => (ownership, false),
-			Type::Array { ownership, .. } => (ownership, true),
+			Type::Enum { .. } => {
+				return (this == self.eq || this == self.partial_eq)
+					.then_some(true);
+			}
+			Type::Pointer { .. } => {
+				return (this == self.pointer).then_some(true);
+			}
+			Type::Slice { .. } => false,
+			Type::Array { .. } => true,
 			_ => return None,
 		};
-		let exclusive = ownership == ast::Ownership::Exclusive;
 		if this == self.slice {
 			Some(true)
-		} else if this == self.slice_mut {
-			Some(exclusive)
 		} else if this == self.array {
 			Some(is_array)
-		} else if this == self.array_mut {
-			Some(is_array && exclusive)
 		} else {
 			None
 		}

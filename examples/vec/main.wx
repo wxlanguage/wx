@@ -10,7 +10,7 @@
 //   └──────────────┴───────────┴─────────────┴─────────────────┴──── ·· ─┘
 //   0          DATA_END                                     next    heap end
 
-#[memory_limits(min_pages = 1)]
+#[memory_limits({ min_pages: 1 })]
 memory heap: Memory where { Size = u32 };
 
 // A monotonic bump allocator over `heap`: it only ever moves `next` forward,

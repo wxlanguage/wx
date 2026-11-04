@@ -46,9 +46,8 @@ impl TryFrom<mir::ValueType> for ScalarType {
 }
 
 /// Flatten a MIR type into its constituent WASM scalar types.
-/// Unit/Never produce zero slots; an aggregate yields its precomputed
-/// `ScalarTable`, which `mir::MIR::ensure_aggregate` already built in this
-/// same order. The one place this conversion happens; every producer of a
+/// Unit/Never produce zero slots; a pack already stores flat scalar types.
+/// The one place this conversion happens; every producer of a
 /// `Function` should call this rather than repeating the match itself.
 pub fn flatten_type_to_scalars(
 	ty: mir::ValueType,
@@ -60,8 +59,8 @@ pub fn flatten_type_to_scalars(
 			[usize::from(aggregate_index)]
 		.scalars
 		.iter()
-		.map(|scalar| {
-			ScalarType::try_from(scalar.ty)
+		.map(|&ty| {
+			ScalarType::try_from(ty)
 				.expect("a ScalarTable entry is scalar by construction")
 		})
 		.collect(),
@@ -77,7 +76,7 @@ pub struct MemArg {
 	pub align: u32,
 	/// Static byte offset added to the runtime address.
 	pub offset: u32,
-	pub memory: crate::ast::DefId,
+	pub memory: mir::MemoryId,
 }
 
 /// A WASM local variable declaration.
@@ -117,8 +116,8 @@ pub enum Instruction {
 	LocalSet(u32),
 	LocalTee(u32),
 	// Globals
-	GlobalGet(crate::ast::DefId),
-	GlobalSet(crate::ast::DefId),
+	GlobalGet(mir::GlobalId),
+	GlobalSet(mir::GlobalId),
 	// Arithmetic — i32
 	I32Add,
 	I32Sub,
@@ -239,23 +238,23 @@ pub enum Instruction {
 	// Calls
 	/// Direct call; the encoder resolves the WASM function index from
 	/// `func_wasm_index`, covering both internal and imported functions.
-	Call(crate::ast::DefId),
+	Call(mir::FunctionId),
 	/// Indirect call via the function table; the encoder resolves `type_index`
 	/// from the referenced MIR signature.
 	CallIndirectSym {
 		mir_sig_index: mir::SignatureIndex,
 	},
 	// Memory
-	MemorySize(crate::ast::DefId),
-	MemoryGrow(crate::ast::DefId),
-	MemoryFill(crate::ast::DefId),
+	MemorySize(mir::MemoryId),
+	MemoryGrow(mir::MemoryId),
+	MemoryFill(mir::MemoryId),
 	MemoryCopy {
-		dst: crate::ast::DefId,
-		src: crate::ast::DefId,
+		dst: mir::MemoryId,
+		src: mir::MemoryId,
 	},
 	/// Wasm linear-memory index as an `i32.const`, resolved at codegen.
 	MemoryIndex {
-		memory: crate::ast::DefId,
+		memory: mir::MemoryId,
 	},
 	// Pointer load/store
 	I32Load8S(MemArg),
@@ -304,16 +303,17 @@ pub enum Instruction {
 	// codegen encoder, which has access to the string pool and function table.
 	/// A function referenced as a value; the encoder pushes it into the
 	/// function table and emits `i32.const <table_index>`.
-	FunctionPointer(crate::ast::DefId),
-	/// End of the static data section for a given memory (base of writable
-	/// heap); the encoder emits `i32.const <data_section_end>`.
-	DataSectionEnd {
-		memory: crate::ast::DefId,
+	FunctionPointer(mir::FunctionId),
+	/// The address right after a memory's static data; the encoder emits a
+	/// constant as wide as the memory's addresses.
+	DataEnd {
+		memory: mir::MemoryId,
 	},
-	/// A static array; the encoder resolves the index to a byte offset in the
-	/// data segment and emits `i32.const <byte_offset>`.
+	/// The address `offset` bytes into a static entry; the encoder adds the
+	/// entry's address and emits a constant of `ty`.
 	StaticDataPointer {
-		data_index: u32,
+		entry: mir::StaticEntryId,
+		offset: u32,
 		ty: ScalarType,
 	},
 }

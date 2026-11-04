@@ -84,6 +84,7 @@ define_text! {
 		ColonColonLBrace => "::{",
 		// spaced punctuation / keywords
 		Arrow            => " -> ",
+		FatArrow         => " => ",
 		As               => " as ",
 		ColonSp          => ": ",
 		CommaSp          => ", ",
@@ -714,6 +715,61 @@ impl<'a> Builder<'a> {
 					items.push(self.text(Text::Pub));
 				}
 				self.build_function_signature(&mut items, signature);
+				items.push(self.text(Text::Semi));
+				self.arena.concat(items)
+			}
+			ast::Item::CrateFunction {
+				pub_span,
+				attributes,
+				signature,
+				..
+			} => {
+				let mut items = Vec::new();
+				self.build_attributes(&mut items, attributes);
+				if pub_span.is_some() {
+					items.push(self.text(Text::Pub));
+				}
+				items.push(self.text(Text::Crate));
+				self.build_function_signature(&mut items, signature);
+				items.push(self.text(Text::Semi));
+				self.arena.concat(items)
+			}
+			ast::Item::CrateConst {
+				pub_span,
+				attributes,
+				name,
+				ty,
+				..
+			} => {
+				let mut items = Vec::new();
+				self.build_attributes(&mut items, attributes);
+				if pub_span.is_some() {
+					items.push(self.text(Text::Pub));
+				}
+				items.push(self.text(Text::Crate));
+				items.push(self.text(Text::Const));
+				items.push(self.symbol(name.inner));
+				items.push(self.text(Text::ColonSp));
+				items.push(self.build_type_expression(&ty.inner));
+				items.push(self.text(Text::Semi));
+				self.arena.concat(items)
+			}
+			ast::Item::CrateType {
+				pub_span,
+				attributes,
+				name,
+				type_params,
+				..
+			} => {
+				let mut items = Vec::new();
+				self.build_attributes(&mut items, attributes);
+				if pub_span.is_some() {
+					items.push(self.text(Text::Pub));
+				}
+				items.push(self.text(Text::Crate));
+				items.push(self.text(Text::TypeKw));
+				items.push(self.symbol(name.inner));
+				self.build_type_params(&mut items, type_params);
 				items.push(self.text(Text::Semi));
 				self.arena.concat(items)
 			}
@@ -1514,12 +1570,14 @@ impl<'a> Builder<'a> {
 				let mut an: Vec<NodeId> = Vec::new();
 				let pattern = &arm.inner.inner.pattern;
 				self.build_pattern(&mut an, &pattern.inner, pattern.span);
-				an.push(self.text(Text::Arrow));
+				an.push(self.text(Text::FatArrow));
 				let body = &arm.inner.inner.body;
-				let body = self.build_block_content(
-					body.inner.as_block_statements(),
-					body.span,
-				);
+				let body = match &body.inner {
+					ast::Expression::Block { statements, .. } => {
+						self.build_block_content(statements, body.span)
+					}
+					_ => self.build_expression(body),
+				};
 				an.push(self.arena.group(body));
 				if index + 1 < arms.len() {
 					an.push(self.text(Text::Comma));
@@ -1883,29 +1941,13 @@ impl<'a> Builder<'a> {
 			out.push(self.symbol(attr.name.inner));
 			match &attr.value {
 				ast::AttributeValue::Word => {}
-				ast::AttributeValue::NameValue(value) => {
-					out.push(self.text(Text::EqSp));
-					out.push(self.source_text(*value));
-				}
-				ast::AttributeValue::Args(args) => {
-					out.push(self.text(Text::LParen));
-					for (index, arg) in args.iter().enumerate() {
-						let arg = &arg.inner.inner;
-						out.push(self.symbol(arg.name.inner));
-						out.push(self.text(Text::EqSp));
-						match &arg.value {
-							ast::AttributeArgValue::Int(value) => {
-								out.push(self.source_text(value.span));
-							}
-							ast::AttributeArgValue::String(value) => {
-								out.push(self.source_text(*value));
-							}
-						}
-						if index + 1 < args.len() {
-							out.push(self.text(Text::CommaSp));
-						}
-					}
-					out.push(self.text(Text::RParen));
+				// Grouped as a call by name is, so it stays on the
+				// attribute's line while it fits.
+				ast::AttributeValue::Named(arguments) => {
+					let mut items = Vec::new();
+					self.build_named_call_args(&mut items, arguments);
+					let concat = self.arena.concat(items);
+					out.push(self.arena.group(concat));
 				}
 			}
 			out.push(self.text(Text::RBracket));
@@ -2427,16 +2469,21 @@ impl<'a> Builder<'a> {
 				let sp = self.text(Text::Space);
 
 				let then_statements = then_block.inner.as_block_statements();
-				let else_data = else_block
-					.as_deref()
-					.map(|b| (b.inner.as_block_statements(), b.span));
+				let else_data = else_block.as_deref().map(|b| match &b.inner {
+					ast::Expression::Block { statements, .. } => {
+						self.build_block_content(statements, b.span)
+					}
+					// `else if`: the nested `if` starts with its own keyword,
+					// and `Text::Else` already carries the separating space.
+					_ => self.build_expression(b),
+				});
 
 				let then_id =
 					self.build_block_content(then_statements, then_block.span);
 				let mut items: Vec<NodeId> = vec![if_kw, cond, sp, then_id];
-				if let Some((statements, span)) = else_data {
+				if let Some(else_id) = else_data {
 					items.push(self.text(Text::Else));
-					items.push(self.build_block_content(statements, span));
+					items.push(else_id);
 				}
 				self.arena.concat(items)
 			}
@@ -2934,18 +2981,41 @@ impl<'a> Builder<'a> {
 					if i > 0 {
 						binding_parts.push(self.text(Text::CommaSp));
 					}
-					let key = self.symbol(binding.name.inner);
+					let mut key = self.symbol(binding.name.inner);
+					if let ast::AssocBindingKind::ConstRepresentable {
+						..
+					}
+					| ast::AssocBindingKind::ConstEquals { .. } = binding.kind
+					{
+						let marker = self.text(Text::Const);
+						key = self.arena.concat2(marker, key);
+					}
 					let rhs = match &binding.kind {
-						ast::AssocTypeBindingKind::Equals(ty) => {
+						ast::AssocBindingKind::Equals(ty) => {
 							let eq = self.text(Text::EqSp);
 							let ty = self.build_type_expression(&ty.inner);
 							self.arena.concat2(eq, ty)
 						}
-						ast::AssocTypeBindingKind::Bound(bound) => {
+						ast::AssocBindingKind::Bound(bound) => {
 							let colon = self.text(Text::ColonSp);
 							let bound =
 								self.build_bound_expression(&bound.inner);
 							self.arena.concat2(colon, bound)
+						}
+						ast::AssocBindingKind::ConstRepresentable {
+							ty,
+							..
+						} => {
+							let colon = self.text(Text::ColonSp);
+							let ty = self.build_type_expression(&ty.inner);
+							self.arena.concat2(colon, ty)
+						}
+						ast::AssocBindingKind::ConstEquals {
+							value, ..
+						} => {
+							let eq = self.text(Text::EqSp);
+							let value = self.build_const_argument(value);
+							self.arena.concat2(eq, value)
 						}
 					};
 					binding_parts.push(self.arena.concat2(key, rhs));
@@ -3005,6 +3075,12 @@ impl<'a> Builder<'a> {
 				let segments = self.build_type_path(segments);
 				self.build_qualified_path(inner_node, None, segments)
 			}
+			ast::TypeExpression::Literal { inner } => {
+				let open = self.text(Text::LBrace);
+				let inner = self.build_type_expression(&inner.inner);
+				let close = self.text(Text::RBrace);
+				self.arena.concat3(open, inner, close)
+			}
 			// The formatter never runs on a file that failed to parse.
 			ast::TypeExpression::Error => unreachable!(),
 			ast::TypeExpression::Infer => self.text(Text::Underscore),
@@ -3054,36 +3130,23 @@ impl<'a> Builder<'a> {
 				items.push(self.build_type_expression(&inner.inner));
 				self.arena.concat(items)
 			}
-			ast::TypeExpression::Slice {
-				ownership,
-				memory,
-				inner,
-			} => {
-				let mut items: Vec<NodeId> = Vec::new();
-				self.build_memory_tag(&mut items, memory.as_deref());
-				items.push(self.text(ownership_sigil(*ownership)));
-				items.push(self.text(Text::LBracket));
-				items.push(self.build_type_expression(&inner.inner));
-				items.push(self.text(Text::RBracket));
+			ast::TypeExpression::Slice { inner } => {
+				let items = vec![
+					self.text(Text::LBracket),
+					self.build_type_expression(&inner.inner),
+					self.text(Text::RBracket),
+				];
 				self.arena.concat(items)
 			}
-			ast::TypeExpression::Array {
-				ownership,
-				memory,
-				inner,
-				length,
-			} => {
-				let mut items: Vec<NodeId> = Vec::new();
-				self.build_memory_tag(&mut items, memory.as_deref());
-				items.extend([
-					self.text(ownership_sigil(*ownership)),
+			ast::TypeExpression::Array { inner, length } => {
+				let items = vec![
 					self.text(Text::LBracket),
 					self.build_type_expression(&inner.inner),
 					self.text(Text::Semi),
 					self.text(Text::Space),
 					self.build_const_argument(length),
 					self.text(Text::RBracket),
-				]);
+				];
 				self.arena.concat(items)
 			}
 			// A tuple of one is its element.

@@ -20,8 +20,10 @@ mod eval;
 mod format;
 mod impls;
 mod imports;
+mod intrinsics;
 mod layout;
 mod literals;
+mod lower;
 mod members;
 mod obligations;
 mod operators;
@@ -33,6 +35,119 @@ mod solver;
 mod typecheck;
 mod types;
 mod usefulness;
+
+use codespan_reporting::diagnostic::Diagnostic;
+
+use crate::diagnostics::Diagnostics;
+use crate::mir::MIR;
+use crate::vfs::{CompilationUnit, FileId};
+
+use self::defs::DefinitionRegistry;
+use self::impls::ImplDispatch;
+use self::resolutions::NameResolutions;
+use self::signatures::TypeContext;
+use self::solver::Solver;
+
+/// Checks declarations and bodies and returns their diagnostics.
+/// Parser and package diagnostics remain available on `compilation`.
+pub fn check(compilation: &mut CompilationUnit) -> Vec<Diagnostic<FileId>> {
+	let CompilationUnit {
+		files,
+		packages,
+		strings,
+		stdlib_package,
+		root_package,
+	} = compilation;
+	let mut diagnostics = Vec::new();
+	let mut resolutions = NameResolutions::default();
+	let (defs, ast_nodes) = DefinitionRegistry::build(
+		packages,
+		files,
+		strings,
+		&mut diagnostics,
+		&mut resolutions,
+		*stdlib_package,
+		*root_package,
+	);
+	let impl_dispatch = ImplDispatch::build(
+		&mut diagnostics,
+		&mut resolutions,
+		strings,
+		&defs,
+		&ast_nodes,
+	);
+	let mut solver = Solver::new(defs.constants.len());
+	let mut context = TypeContext::new(
+		&mut diagnostics,
+		&mut resolutions,
+		strings,
+		&mut solver,
+		files,
+		&defs,
+		&ast_nodes,
+		&impl_dispatch,
+	);
+	context.sweep();
+	drop(context);
+	diagnostics
+}
+
+/// Checks and then lowers the same live context into [`MIR`].
+///
+/// This is deliberately separate from [`check`], which is left untouched: it
+/// repeats the setup, keeps the [`TypeContext`] alive instead of dropping it,
+/// and hands it to the lowering entry point. The diagnostics are returned
+/// either way, so a successful build still reports its warnings; on any error
+/// or bug diagnostic from checking, or on a lowering failure, no MIR is
+/// produced.
+pub fn build(
+	compilation: &mut CompilationUnit,
+) -> (Vec<Diagnostic<FileId>>, Option<MIR>) {
+	let CompilationUnit {
+		files,
+		packages,
+		strings,
+		stdlib_package,
+		root_package,
+	} = compilation;
+	let mut diagnostics = Vec::new();
+	let mut resolutions = NameResolutions::default();
+	let (defs, ast_nodes) = DefinitionRegistry::build(
+		packages,
+		files,
+		strings,
+		&mut diagnostics,
+		&mut resolutions,
+		*stdlib_package,
+		*root_package,
+	);
+	let impl_dispatch = ImplDispatch::build(
+		&mut diagnostics,
+		&mut resolutions,
+		strings,
+		&defs,
+		&ast_nodes,
+	);
+	let mut solver = Solver::new(defs.constants.len());
+	let mut context = TypeContext::new(
+		&mut diagnostics,
+		&mut resolutions,
+		strings,
+		&mut solver,
+		files,
+		&defs,
+		&ast_nodes,
+		&impl_dispatch,
+	);
+	context.sweep();
+	if context.diagnostics.has_errors() {
+		drop(context);
+		return (diagnostics, None);
+	}
+	let lowered = lower::build(&mut context);
+	drop(context);
+	(diagnostics, lowered.ok())
+}
 
 // use crate::index::index_newtype;
 

@@ -354,8 +354,8 @@ pub struct CompilationUnit {
 	pub files: Files,
 	pub packages: Vec<Package>,
 	pub root_package: PackageId,
-	/// The package providing the language's `#[tag = "..."]` items (the
-	/// twelve operator traits `resolve_operator_traits` looks up). Always
+	/// The package providing the items the language requires (its
+	/// primitives, operator traits and intrinsics, found by name). Always
 	/// present — see [`CompilationUnitBuilder::build`] for why this is not an
 	/// `Option`. Equal to `root_package` when the root package *is* the
 	/// stdlib.
@@ -608,7 +608,7 @@ impl CompilationUnitBuilder {
 	}
 
 	/// Panics if no stdlib was ever established. Every compilation has
-	/// exactly one provider of the language's `#[tag = "..."]` items — the
+	/// exactly one provider of the items the language requires — the
 	/// embedded stdlib, or the root package itself when it declares
 	/// `"type": "std"` — so a `CompilationUnit` without one isn't a state
 	///worth representing.

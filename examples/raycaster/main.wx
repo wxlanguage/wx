@@ -1,4 +1,4 @@
-#[memory_limits(min_pages = 4)]
+#[memory_limits({ min_pages: 4 })]
 memory heap: Memory where { Size = u32 };
 
 import "host" as host {

@@ -1,8 +1,15 @@
 use std::borrow::Cow;
+use std::fmt;
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::types::TypeIndex;
+use super::bounds::{AssumptionEnvIdx, BindingRef, Readiness};
+use super::defs::{ConstIdx, TypesetIdx};
+use super::eval::ResolvedConstant;
+use super::signatures::TypeContext;
+use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
+use super::types::{GenericEnvOwner, Substitution, Type, TypeIndex};
+use crate::ast::{Spanned, UnaryOp};
 use crate::{
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	vfs::FileId,
@@ -231,16 +238,9 @@ impl Integer {
 		})
 	}
 
-	/// Whether an integer literal `value`, optionally negated, is in range.
-	pub(super) fn in_range(self, value: u64, negated: bool) -> bool {
-		// A negated literal reaches one past the maximum: `-min`, e.g. `-128`
-		// is in range for `i8` although `128` is not.
-		let limit = if negated {
-			self.min().unsigned_abs()
-		} else {
-			self.max()
-		};
-		value <= limit
+	/// Whether `value` is in the type's range.
+	pub(super) fn contains(self, value: i128) -> bool {
+		i128::from(self.min()) <= value && value <= i128::from(self.max())
 	}
 
 	pub(super) fn is_signed(self) -> bool {
@@ -274,5 +274,493 @@ impl Integer {
 			Self::I64 => i64::MIN,
 			Self::U64 => 0,
 		}
+	}
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Float {
+	F32,
+	F64,
+}
+
+impl Float {
+	pub(super) fn from_type(ty: TypeIndex) -> Option<Self> {
+		Some(match ty {
+			TypeIndex::F32 => Self::F32,
+			TypeIndex::F64 => Self::F64,
+			_ => return None,
+		})
+	}
+
+	fn mantissa_bits(self) -> u32 {
+		match self {
+			Self::F32 => 24,
+			Self::F64 => 53,
+		}
+	}
+
+	/// Whether the integer `value` is a value of the type, exactly.
+	fn holds_exactly(self, value: i128) -> bool {
+		let value = value.unsigned_abs();
+		value == 0
+			|| 128 - value.leading_zeros() - value.trailing_zeros()
+				<= self.mantissa_bits()
+	}
+}
+
+/// A concrete type a target may be: the target itself, or, for an abstract
+/// target, a member of a typeset it is bounded by, as written. An untyped
+/// value given the target must be representable as every one.
+#[derive(Clone, Copy)]
+pub(super) enum ConcreteType {
+	Target(TypeIndex),
+	Member(TypesetIdx, Spanned<TypeIndex>),
+}
+
+/// Why a concrete type does not hold an integer.
+#[derive(Clone, Copy)]
+pub(super) enum IntegerMiss {
+	/// Outside an integer type's range.
+	OutOfRange,
+	/// Not exactly a value of a float type.
+	Inexact,
+	/// Neither an integer nor a float type.
+	WrongKind,
+}
+
+/// Why a concrete type does not hold a character.
+#[derive(Clone, Copy)]
+pub(super) enum CharMiss {
+	/// A code point outside an integer type's range.
+	OutOfRange,
+	/// Neither `Char` nor an integer type.
+	WrongKind,
+}
+
+/// Why a concrete type does not hold a float literal.
+#[derive(Clone, Copy)]
+pub(super) enum FloatMiss {
+	/// It reads as infinity at the concrete type's width.
+	TooLarge,
+	/// It is nonzero in text but reads as zero at the concrete type's width.
+	TooSmall,
+	/// It is no float type.
+	WrongKind,
+}
+
+impl ConcreteType {
+	pub(super) fn ty(&self) -> TypeIndex {
+		match *self {
+			ConcreteType::Target(ty) => ty,
+			ConcreteType::Member(_, member) => member.inner,
+		}
+	}
+
+	/// An integer: an integer type's value, or a float type's exactly.
+	pub(super) fn holds_integer(&self, value: i128) -> Result<(), IntegerMiss> {
+		if let Some(integer) = Integer::from_type(self.ty()) {
+			integer
+				.contains(value)
+				.then_some(())
+				.ok_or(IntegerMiss::OutOfRange)
+		} else if let Some(float) = Float::from_type(self.ty()) {
+			float
+				.holds_exactly(value)
+				.then_some(())
+				.ok_or(IntegerMiss::Inexact)
+		} else {
+			Err(IntegerMiss::WrongKind)
+		}
+	}
+
+	/// A character: a `Char`, or an integer type its code point is a value
+	/// of.
+	pub(super) fn holds_char(&self, code_point: u32) -> Result<(), CharMiss> {
+		if self.ty() == TypeIndex::CHAR {
+			return Ok(());
+		}
+		match Integer::from_type(self.ty()) {
+			Some(integer) if integer.contains(i128::from(code_point)) => Ok(()),
+			Some(_) => Err(CharMiss::OutOfRange),
+			None => Err(CharMiss::WrongKind),
+		}
+	}
+
+	/// A float literal written `text`, read at the concrete type's width.
+	/// `None` when the text is no float, which the parser has reported.
+	pub(super) fn read_float(
+		&self,
+		text: &str,
+	) -> Result<Option<f64>, FloatMiss> {
+		let Some(float) = Float::from_type(self.ty()) else {
+			return Err(FloatMiss::WrongKind);
+		};
+		let read = match float {
+			// f64::from is a lossless conversion
+			Float::F32 => text.parse::<f32>().map(f64::from),
+			Float::F64 => text.parse::<f64>(),
+		};
+		match read {
+			Ok(value) if value.is_infinite() => Err(FloatMiss::TooLarge),
+			Ok(value)
+				if value == 0.0
+					&& text
+						.bytes()
+						.any(|b| b.is_ascii_digit() && b != b'0') =>
+			{
+				Err(FloatMiss::TooSmall)
+			}
+			Ok(value) => Ok(Some(value)),
+			Err(_) => Ok(None),
+		}
+	}
+
+	/// Whether `op` means anything over a value of the concrete type.
+	pub(super) fn allows_unary(&self, op: UnaryOp) -> bool {
+		let ty = self.ty();
+		match op {
+			UnaryOp::InvertSign => {
+				Integer::from_type(ty).is_some_and(Integer::is_signed)
+					|| Float::from_type(ty).is_some()
+			}
+			UnaryOp::BitNot => Integer::from_type(ty).is_some(),
+			UnaryOp::Not => false,
+		}
+	}
+
+	pub(super) fn is_float(&self) -> bool {
+		Float::from_type(self.ty()).is_some()
+	}
+}
+
+/// What an untyped constant reads as.
+pub(super) enum UntypedValue {
+	Known(i128),
+	/// A trait's constant over a `Self` not known here: only a representability
+	/// clause says what it is representable as.
+	Abstract,
+	/// It has no value; why was reported where it is.
+	Failed,
+}
+
+impl TypeContext<'_, '_, '_> {
+	/// The value of `constant` read with `args` (a trait constant's are
+	/// `[Self]`), in `env`.
+	pub(super) fn untyped_value(
+		&mut self,
+		env: AssumptionEnvIdx,
+		constant: ConstIdx,
+		args: &[TypeIndex],
+	) -> Result<UntypedValue, SolverError> {
+		let resolved = match self.resolve_constant(constant, args) {
+			Ok(resolved) => resolved,
+			Err(SolverError::Pending) => return Err(SolverError::Pending),
+			Err(_) => return Ok(UntypedValue::Failed),
+		};
+		Ok(match resolved {
+			ResolvedConstant::Length(length) => {
+				let length = match self.normalize(
+					env,
+					length,
+					NormalizationDepth::Deep,
+					RewriteFlags::ALL,
+				) {
+					Ok(length) => length,
+					Err(SolverError::Pending) => {
+						return Err(SolverError::Pending);
+					}
+					Err(_) => return Ok(UntypedValue::Failed),
+				};
+				match *self.types.resolve(length) {
+					Type::Value { bits } => {
+						UntypedValue::Known(i128::from(bits))
+					}
+					_ => UntypedValue::Abstract,
+				}
+			}
+			ResolvedConstant::Instance(instance) => self
+				.exact_value(instance.constant)
+				.map_or(UntypedValue::Failed, UntypedValue::Known),
+			ResolvedConstant::Abstract => UntypedValue::Abstract,
+			ResolvedConstant::DataEnd(_) => {
+				unreachable!("`Memory::DATA_END` is a pointer, not untyped")
+			}
+		})
+	}
+
+	/// The types an untyped value given `ty` must be representable as: `ty`
+	/// itself when it is a scalar or `Char`, or every member of every typeset
+	/// an abstract `ty` is bounded by. Empty when no untyped value can be
+	/// given `ty`.
+	pub(super) fn concrete_types(
+		&self,
+		env: AssumptionEnvIdx,
+		ty: TypeIndex,
+	) -> Vec<ConcreteType> {
+		if Integer::from_type(ty).is_some()
+			|| Float::from_type(ty).is_some()
+			|| ty == TypeIndex::CHAR
+		{
+			return vec![ConcreteType::Target(ty)];
+		}
+		// An abstract type is constrained by its own bounds alone, so read
+		// the typesets those name rather than probing every typeset.
+		let mut concrete_types = Vec::new();
+		for trait_index in self.clause_tables().declared_traits(
+			&self.types,
+			env,
+			ty,
+			self.solver.state.recursion_budget,
+		) {
+			let Some(typeset) =
+				self.defs.traits[usize::from(trait_index)].typeset
+			else {
+				continue;
+			};
+			for &member in self.typeset_members(typeset) {
+				concrete_types.push(ConcreteType::Member(typeset, member));
+			}
+		}
+		concrete_types
+	}
+
+	/// The integers every concrete type of `ty` holds, as an inclusive range.
+	/// `None` when a concrete type is no integer type, or there is none.
+	fn integer_range(
+		&self,
+		env: AssumptionEnvIdx,
+		ty: TypeIndex,
+	) -> Option<(i128, i128)> {
+		let mut range: Option<(i128, i128)> = None;
+		for concrete in self.concrete_types(env, ty) {
+			let integer = Integer::from_type(concrete.ty())?;
+			let (low, high) =
+				(i128::from(integer.min()), i128::from(integer.max()));
+			let (lowest, highest) = range.unwrap_or((low, high));
+			range = Some((lowest.max(low), highest.min(high)));
+		}
+		range
+	}
+
+	/// Whether `value` is representable as `ty`.
+	pub(super) fn value_representable(
+		&self,
+		env: AssumptionEnvIdx,
+		ty: TypeIndex,
+		value: i128,
+	) -> bool {
+		self.integer_range(env, ty)
+			.is_some_and(|(low, high)| low <= value && value <= high)
+	}
+
+	/// Whether being representable as `assumed` implies being representable as
+	/// `target`.
+	fn representable_implies(
+		&self,
+		env: AssumptionEnvIdx,
+		assumed: TypeIndex,
+		target: TypeIndex,
+	) -> bool {
+		if assumed == target {
+			return true;
+		}
+		match (
+			self.integer_range(env, assumed),
+			self.integer_range(env, target),
+		) {
+			(Some((low, high)), Some((lowest, highest))) => {
+				lowest <= low && high <= highest
+			}
+			_ => false,
+		}
+	}
+
+	/// Whether a representability clause in `env`, or on a declaration along
+	/// `subject`'s projection path, says `subject`'s `constant` is
+	/// representable as `ty` (normalized).
+	pub(super) fn assumed_representable(
+		&mut self,
+		env: AssumptionEnvIdx,
+		subject: TypeIndex,
+		constant: ConstIdx,
+		ty: TypeIndex,
+	) -> Result<bool, SolverError> {
+		let tables = self.clause_tables();
+		let sources = tables.declarations_of(
+			&self.types,
+			env,
+			subject,
+			self.solver.state.recursion_budget,
+		);
+		match sources.readiness {
+			Readiness::Ready => {}
+			Readiness::Pending => return Err(SolverError::Pending),
+			Readiness::Overflowed => return Err(SolverError::Overflow),
+		}
+		let mut stated = Vec::new();
+		for source in sources {
+			for clause in tables.clauses.representable(source.clauses.range()) {
+				if clause.target.constant == constant
+					&& source.names(
+						&self.types,
+						&self.generic_envs,
+						clause.subject,
+						subject,
+					) {
+					stated.push((clause.ty, source.context));
+				}
+			}
+		}
+		for (assumed, context) in stated {
+			// A declaration's clause names its trait's `Self`, which is the
+			// projection's base here.
+			let assumed = match context {
+				Some(context) => self.types.substitute(
+					assumed,
+					Substitution {
+						envs: &self.generic_envs,
+						env: context.env,
+						args: &[context.receiver],
+					},
+				),
+				None => assumed,
+			};
+			let assumed = self.normalize(
+				env,
+				assumed,
+				NormalizationDepth::Deep,
+				RewriteFlags::ALL,
+			)?;
+			if self.representable_implies(env, assumed, ty) {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	/// E2004: `what` ("literal `300`") is outside the range of the integer
+	/// type `ty`.
+	pub(super) fn report_out_of_range(
+		&self,
+		what: impl fmt::Display,
+		ty: TypeIndex,
+		at: SourceSpan,
+	) -> Diagnostic<FileId> {
+		Diagnostic::error()
+			.with_code(DiagnosticCode::IntegerLiteralOutOfRange.code())
+			.with_message(format!(
+				"{what} cannot be represented as `{}`",
+				self.type_formatter().display_type(ty)
+			))
+			.with_label(at.primary_label())
+	}
+
+	/// E2047: `what` is not representable as `member`, one of the members of
+	/// `typeset` an abstract target may be.
+	pub(super) fn report_typeset_member(
+		&self,
+		what: impl fmt::Display,
+		typeset: TypesetIdx,
+		member: Spanned<TypeIndex>,
+		at: SourceSpan,
+	) -> Diagnostic<FileId> {
+		let def = &self.defs.typesets[usize::from(typeset)];
+		let name = self.strings.resolve(def.name.inner).unwrap();
+		let member_name = self.type_formatter().display_type(member.inner);
+		Diagnostic::error()
+			.with_code(DiagnosticCode::TypesetBoundViolation.code())
+			.with_message(format!(
+				"{what} is not representable by every member of typeset \
+				 `{name}`"
+			))
+			.with_label(at.primary_label().with_message(format!(
+				"cannot be represented as `{member_name}`"
+			)))
+			.with_label(
+				SourceSpan::new(def.file_id, member.span)
+					.secondary_label()
+					.with_message(format!("`{member_name}` is a member here")),
+			)
+	}
+
+	/// E2134: a bound states what `constant` is representable as, but the
+	/// constant has a type, `declared`.
+	pub(super) fn report_typed_constant_bound(
+		&self,
+		at: SourceSpan,
+		constant: ConstIdx,
+		declared: TypeIndex,
+	) -> Diagnostic<FileId> {
+		let def = &self.defs.constants[usize::from(constant)];
+		let name = self.strings.resolve(def.name.inner).unwrap();
+		let declared = self.type_formatter().display_type(declared);
+		Diagnostic::error()
+			.with_code(DiagnosticCode::TypedConstantBound.code())
+			.with_message(format!(
+				"constant `{name}` has a type, so a bound cannot state what it \
+				 is representable as"
+			))
+			.with_label(at.primary_label())
+			.with_label(
+				SourceSpan::new(def.file_id, def.name.span)
+					.secondary_label()
+					.with_message(format!(
+						"`{name}` is declared `{declared}` here"
+					)),
+			)
+			.with_note(
+				"only an untyped constant (`{integer}`, `{char}`) takes its type \
+				 from where it is used",
+			)
+	}
+
+	/// `subject`'s `constant` is not representable as `ty`, which the entry
+	/// `source` requires: `value` is its value, or `None` when it has none
+	/// here and no representability clause in scope says it is.
+	pub(super) fn report_unrepresentable_constant(
+		&mut self,
+		reference: SourceSpan,
+		(subject, constant): (TypeIndex, ConstIdx),
+		ty: TypeIndex,
+		value: Option<i128>,
+		source: Option<(BindingRef, GenericEnvOwner)>,
+	) -> Diagnostic<FileId> {
+		let read = self.types.intern_const(constant, &[subject]);
+		let formatter = self.type_formatter();
+		let (read, ty) =
+			(formatter.display_type(read), formatter.display_type(ty));
+		let name = self.defs.constants[usize::from(constant)].name.inner;
+		let name = self.strings.resolve(name).unwrap();
+		let label = match value {
+			Some(value) => {
+				format!("its value `{value}` is out of range for `{ty}`")
+			}
+			None => "its value is not known here".to_owned(),
+		};
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::UnrepresentableConstant.code())
+			.with_message(format!(
+				"constant `{read}` cannot be represented as `{ty}`"
+			))
+			.with_label(reference.primary_label().with_message(label));
+		if let Some((source, owner)) = source {
+			diagnostic = diagnostic.with_label(
+				self.binding_span(source).secondary_label().with_message(
+					match owner.name(self.defs) {
+						Some(owner) => format!(
+							"required by this bound in `{}`",
+							self.strings.resolve(owner.inner).unwrap()
+						),
+						None => "required by this bound".to_owned(),
+					},
+				),
+			);
+		}
+		if value.is_none() {
+			diagnostic = diagnostic.with_note(format!(
+				"state it in a bound: `where {{ const {name}: {ty} }}`"
+			));
+		}
+		diagnostic
 	}
 }

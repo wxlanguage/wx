@@ -21,13 +21,15 @@
 //!
 //! An impl function's own type parameters may assume no more than the
 //! declaration's do (rustc's E0276): a caller through the trait proves only
-//! the trait's bounds. The function is read in the frame such a caller sees
-//! (`contract_frame`): the impl's own frame around it, and its own parameters
-//! assuming the declaration's clauses. Its own clauses are proved there, and
-//! its signature is compared there.
+//! the trait's bounds. The function is read in the env such a caller sees
+//! (`contract_env`, rustc's hybrid `ParamEnv` in `compare_impl_method`): the
+//! impl's env around it, and the declaration's clauses about its own
+//! parameters. Its own clauses are proved there, and its signature is
+//! compared there.
 
 use super::bounds::{
-	BoundClauses, BoundId, Equalities, EqualityClause, TraitClause,
+	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
+	RepresentableClause, TraitClause,
 };
 use super::defs::{
 	AstNodeRef, BindingKey, ConstIdx, DefId, DefKind, FunctionIdx, MemberIdx,
@@ -36,12 +38,14 @@ use super::defs::{
 use super::members::TraitMemberSelection;
 use super::obligations::BoundRequirements;
 use super::resolutions::Referent;
-use super::signatures::{ParamBounds, TypeContext};
+use super::signatures::TypeContext;
 use super::solver::{
-	ImplMember, NormalizationDepth, RewriteFlags, SolverError,
+	ImplMember, NormalizationDepth, RewriteFlags, SolverError, Subjects,
 	UnsatisfiedClause,
 };
-use super::types::{Substitution, Type, TypeEnvIdx, TypeEnvOwner, TypeIndex};
+use super::types::{
+	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
+};
 use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -69,7 +73,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		let (scope, target) = (header.type_params, header.target);
 		let file_id = self.defs.trait_impls[usize::from(impl_index)].file_id;
 		let at_target = SourceSpan::new(file_id, target.span);
-		let owner = TypeEnvOwner::Trait(trait_index);
+		let owner = GenericEnvOwner::Trait(trait_index);
 
 		self.check_members(impl_index, trait_index, target.inner, at_target)?;
 
@@ -77,15 +81,13 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		// must satisfy them where the impl is written, with its parameters'
 		// bounds assumed.
 		let trait_env = self.traits[usize::from(trait_index)].env;
-		let arguments = self.types.push_list(&[target.inner]);
+		let args = self.generic_args.push([(target.inner, target.span)]);
 		let result = self.check_bound_requirements(
-			scope,
-			BoundRequirements::Parameter {
+			self.assumption_envs.of_frame(scope),
+			BoundRequirements::Frame {
 				env: trait_env,
-				index: 0,
-				arguments,
+				args,
 			},
-			target,
 			at_target,
 			owner,
 		);
@@ -138,15 +140,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					_ => at_target,
 				};
 			let result = self.check_bound_requirements(
-				scope,
+				self.assumption_envs.of_frame(scope),
 				BoundRequirements::AssociatedType {
 					declaration: declaration_index,
 					trait_index,
 					receiver: target.inner,
-				},
-				Spanned {
-					inner: value,
-					span: reference.span,
+					value,
 				},
 				reference,
 				owner,
@@ -300,7 +299,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	}
 
 	/// The impl's `function` against the trait's `declaration`, read in the
-	/// frame a caller through the trait sees (`contract_frame`): `Self` is
+	/// env a caller through the trait sees (`contract_env`): `Self` is
 	/// `target`, and the declaration's own type parameters are the
 	/// function's, by position, assuming what the declaration's do. Reports
 	/// the first difference: the number of own type parameters, a bound the
@@ -331,11 +330,11 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			);
 			return Ok(());
 		}
-		let frame = self.contract_frame(declaration, function, target);
+		let contract = self.contract_env(declaration, function, target)?;
 		if !self.check_own_bounds(
 			trait_index,
 			(declaration, function),
-			frame,
+			contract,
 		)? {
 			return Ok(());
 		}
@@ -362,7 +361,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			return Ok(());
 		}
 		let arguments: Box<[TypeIndex]> = std::iter::once(target)
-			.chain(self.own_params(frame).iter().copied())
+			.chain(self.own_params(env).iter().copied())
 			.collect();
 		// The result is compared as one more position, after the parameters.
 		for position in 0..=params {
@@ -405,27 +404,19 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			let expected = self.types.substitute(
 				expected,
 				Substitution {
-					envs: &self.type_envs,
+					envs: &self.generic_envs,
 					env: declaration_env,
 					args: &arguments,
 				},
 			);
-			let found = self.types.substitute(
-				found,
-				Substitution {
-					envs: &self.type_envs,
-					env,
-					args: self.type_envs.identity_args(frame),
-				},
-			);
 			let expected = self.normalize(
-				frame,
+				contract,
 				expected,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
 			)?;
 			let found = self.normalize(
-				frame,
+				contract,
 				found,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
@@ -473,60 +464,36 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		Ok(())
 	}
 
-	/// The frame a caller through the trait sees `function` in: the impl's
-	/// own frame around it, and the function's own type parameters (their
-	/// names, for display) assuming the clauses the declaration's state, with
-	/// `Self` as `target` and the declaration's parameters as these, by
-	/// position. It exists for the check alone. A function without its own
-	/// parameters has nothing to read differently, and is read in its own
-	/// frame.
-	///
-	/// A second frame is needed only because assumptions are keyed by
-	/// parameter identity; `notes/tir-param-env-plan.md` proposes making the
-	/// assumption context a value, which would reduce this to building one.
-	fn contract_frame(
+	/// The env a caller through the trait sees `function` in: the impl's
+	/// env around it, and what the clauses the declaration itself states
+	/// mean with `Self` as `target` and the declaration's parameters as the
+	/// function's, by position (`normalize_clauses`, as the function's own
+	/// `Self` entry is read). It exists for the check alone; its index is
+	/// new, so its cache entries alias no declaration's. A function whose
+	/// declaration states nothing is read in its impl's.
+	fn contract_env(
 		&mut self,
 		declaration: FunctionIdx,
 		function: FunctionIdx,
 		target: TypeIndex,
-	) -> TypeEnvIdx {
+	) -> Result<AssumptionEnvIdx, SolverError> {
 		let env = self.functions[usize::from(function)].type_params;
-		if self.own_params(env).is_empty() {
-			return env;
-		}
-		let parent = self
-			.type_envs
-			.parent(env)
-			.expect("a function's own frame has its impl's around it");
-		let names = self.type_envs.param_names(env).to_vec();
-		let frame = self.type_envs.push_param_frame(
-			&mut self.types,
-			TypeEnvOwner::Function(function),
-			parent,
-			names,
-		);
+		let impl_env = self.impl_env(function);
 		let declaration_env =
 			self.functions[usize::from(declaration)].type_params;
-		let own = self.type_envs.param_types(frame);
-		let count = own.len();
-		let arguments: Box<[TypeIndex]> =
-			std::iter::once(target).chain(own.iter().copied()).collect();
-		// Only the clauses are read; the bounds as written are the
-		// declaration's, for display.
-		let bounds = (0..count)
-			.map(|index| ParamBounds {
-				declared_bounds: Box::new([]),
-				clauses: self.instantiate_clauses(
-					self.param_bounds[usize::from(declaration_env)][index]
-						.clauses,
-					declaration_env,
-					&arguments,
-				),
-			})
+		let requirements = self.own_requirements(declaration_env);
+		if requirements.is_empty() {
+			return Ok(impl_env);
+		}
+		let arguments: Box<[TypeIndex]> = std::iter::once(target)
+			.chain(self.own_params(env).iter().copied())
 			.collect();
-		// Indexed by frame; building the clauses pushed none.
-		self.param_bounds.push(bounds);
-		frame
+		let clauses =
+			self.instantiate_clauses(requirements, declaration_env, &arguments);
+		let (assumed, _) = self.normalize_clauses(impl_env, clauses)?;
+		let contract = self.assumption_envs.push(impl_env, None);
+		*self.assumption_envs.clauses_mut(contract) = assumed;
+		Ok(contract)
 	}
 
 	/// `clauses`, written in `env`'s chain, with that chain's parameters
@@ -535,47 +502,50 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	fn instantiate_clauses(
 		&mut self,
 		clauses: BoundClauses,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		arguments: &[TypeIndex],
 	) -> BoundClauses {
-		let Equalities::Final(equalities) = clauses.equalities else {
+		let Some(range) = clauses.final_range() else {
 			unreachable!("every signature exists when declarations are checked")
 		};
 		let substitution = Substitution {
-			envs: &self.type_envs,
+			envs: &self.generic_envs,
 			env,
 			args: arguments,
 		};
-		let traits: Vec<TraitClause> = self
+		let instantiated: Vec<Clause> = self
 			.clauses
-			.traits(clauses.traits)
+			.get(range)
 			.iter()
-			.map(|clause| TraitClause {
-				subject: self.types.substitute(clause.subject, substitution),
-				..*clause
+			.map(|clause| match *clause {
+				Clause::Trait(clause) => Clause::Trait(TraitClause {
+					subject: self
+						.types
+						.substitute(clause.subject, substitution),
+					..clause
+				}),
+				Clause::Equality(clause) => Clause::Equality(EqualityClause {
+					projection: self
+						.types
+						.substitute(clause.projection, substitution),
+					value: self.types.substitute(clause.value, substitution),
+					..clause
+				}),
+				Clause::Representable(clause) => {
+					Clause::Representable(RepresentableClause {
+						subject: self
+							.types
+							.substitute(clause.subject, substitution),
+						ty: self.types.substitute(clause.ty, substitution),
+						..clause
+					})
+				}
 			})
 			.collect();
-		let equalities: Vec<EqualityClause> = self
-			.clauses
-			.equalities(equalities)
-			.iter()
-			.map(|clause| EqualityClause {
-				projection: self
-					.types
-					.substitute(clause.projection, substitution),
-				value: self.types.substitute(clause.value, substitution),
-				..*clause
-			})
-			.collect();
-		BoundClauses {
-			traits: self.clauses.push_traits(&traits),
-			equalities: Equalities::Final(
-				self.clauses.push_equalities(&equalities),
-			),
-		}
+		BoundClauses::Final(self.clauses.push(&instantiated))
 	}
 
-	/// Proves the clauses of `function`'s own type parameters in `frame`, where
+	/// Proves the clauses `function`'s own env states in `contract`, where
 	/// they assume only the declaration's: an impl may require less than its
 	/// trait, never more. Each written bound that does not follow is reported
 	/// once, by the first of its clauses that fails (`T: Ord` over a trait's
@@ -585,35 +555,32 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		&mut self,
 		trait_index: TraitIdx,
 		(declaration, function): (FunctionIdx, FunctionIdx),
-		frame: TypeEnvIdx,
+		contract: AssumptionEnvIdx,
 	) -> Result<bool, SolverError> {
 		let env = self.functions[usize::from(function)].type_params;
-		if frame == env {
+		let requirements = self.own_requirements(env);
+		if requirements.is_empty() {
 			return Ok(true);
 		}
+		// Only what the function assumes is compared: a clause about a type
+		// that is not abstract holds or not of its own, and is checked where
+		// it is written (`normalize_self_entry`). Each is read where the
+		// function is written, not under the contract's assumptions.
+		let impl_env = self.impl_env(function);
+		let (clauses, _) = self.normalize_clauses(impl_env, requirements)?;
 		let arguments: Box<[TypeIndex]> =
-			self.type_envs.identity_args(frame).into();
-		let mut holds = true;
-		for index in 0..self.type_envs.param_types(env).len() {
-			let clauses = self.param_bounds[usize::from(env)][index].clauses;
-			let root = self.type_envs.param_types(env)[index];
-			let subject = self.type_envs.param_types(frame)[index];
-			let mut failures = Vec::new();
-			if self.satisfies_clauses(
-				frame,
-				clauses,
-				(root, subject),
-				(env, &arguments),
-				Some(&mut failures),
-				None,
-			)? {
-				continue;
-			}
-			holds = false;
-			let Equalities::Final(equalities) = clauses.equalities else {
-				unreachable!("proved clauses are final")
-			};
-			// The bound written on this parameter each failure came from.
+			self.generic_envs.identity_args(env).into();
+		let mut failures = Vec::new();
+		let holds = self.satisfies_clauses(
+			contract,
+			clauses,
+			Subjects::All,
+			(env, &arguments),
+			Some(&mut failures),
+			None,
+		)?;
+		if !holds {
+			// The written bound each failure came from.
 			let mut reported = Vec::new();
 			for failure in failures {
 				let origin = match failure {
@@ -623,8 +590,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 						..
 					} => self
 						.clauses
-						.traits(clauses.traits)
-						.iter()
+						.traits(clauses.range())
 						.find(|clause| {
 							clause.trait_index == trait_index
 								&& clause.source == source
@@ -632,8 +598,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 						.map(|clause| clause.origin),
 					UnsatisfiedClause::Equality { source, .. } => self
 						.clauses
-						.equalities(equalities)
-						.iter()
+						.equalities(clauses.range())
+						.find(|clause| clause.source == source)
+						.map(|clause| clause.origin),
+					UnsatisfiedClause::Representable { source, .. } => self
+						.clauses
+						.representable(clauses.range())
 						.find(|clause| clause.source == source)
 						.map(|clause| clause.origin),
 				}
@@ -670,19 +640,19 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		let expected = self.types.substitute(
 			expected,
 			Substitution {
-				envs: &self.type_envs,
+				envs: &self.generic_envs,
 				env: declaration_env,
 				args: &[target],
 			},
 		);
 		let expected = self.normalize(
-			env,
+			self.assumption_envs.of_frame(env),
 			expected,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let found = self.normalize(
-			env,
+			self.assumption_envs.of_frame(env),
 			found,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -734,13 +704,38 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		Ok(())
 	}
 
-	/// A function's own type parameters, given the frame it is read in (its
-	/// own, or the one its check builds): none when that frame is the
-	/// trait's or impl's around it, which a function without its own
+	/// A function's own type parameters, given its frame: none when that is
+	/// the trait's or impl's around it, which a function without its own
 	/// parameters is read in.
-	fn own_params(&self, frame: TypeEnvIdx) -> &[TypeIndex] {
-		match self.type_envs.owner(frame) {
-			TypeEnvOwner::Function(_) => self.type_envs.param_types(frame),
+	/// The env of the impl `function` is written in.
+	fn impl_env(&self, function: FunctionIdx) -> AssumptionEnvIdx {
+		let env = self.functions[usize::from(function)].type_params;
+		let impl_frame = match self.generic_envs.owner(env) {
+			GenericEnvOwner::Function(_) => self
+				.generic_envs
+				.parent(env)
+				.expect("a function's own frame has its impl's around it"),
+			_ => env,
+		};
+		self.assumption_envs.of_frame(impl_frame)
+	}
+
+	/// What `frame`'s function itself states: nothing when it has no frame
+	/// of its own and `frame` is its impl's or its trait's.
+	fn own_requirements(&self, frame: GenericEnvIdx) -> BoundClauses {
+		match self.generic_envs.owner(frame) {
+			GenericEnvOwner::Function(_) => {
+				self.assumption_envs.requirements(frame)
+			}
+			_ => BoundClauses::NONE,
+		}
+	}
+
+	fn own_params(&self, frame: GenericEnvIdx) -> &[TypeIndex] {
+		match self.generic_envs.owner(frame) {
+			GenericEnvOwner::Function(_) => {
+				self.generic_envs.param_types(frame)
+			}
 			_ => &[],
 		}
 	}
@@ -907,6 +902,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		origin: BoundId,
 		failure: &UnsatisfiedClause,
 	) {
+		let read = match *failure {
+			UnsatisfiedClause::Representable {
+				subject, constant, ..
+			} => Some(self.types.intern_const(constant, &[subject])),
+			_ => None,
+		};
 		let formatter = self.type_formatter();
 		let requirement = match *failure {
 			UnsatisfiedClause::Trait {
@@ -924,12 +925,19 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			}
 			UnsatisfiedClause::Equality {
 				projection,
-				expected,
+				required,
 				..
 			} => format!(
 				"{} == {}",
 				formatter.display_type(projection),
-				formatter.display_type(expected),
+				formatter.display_type(required),
+			),
+			UnsatisfiedClause::Representable { ty, .. } => format!(
+				"{} is representable as {}",
+				formatter.display_type(
+					read.expect("a representability clause reads its constant")
+				),
+				formatter.display_type(ty),
 			),
 		};
 		let expected_def = &self.defs.functions[usize::from(declaration)];
@@ -1140,19 +1148,20 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					TypePathStep::TupleElement(index),
 				) => elements.get(index).map(|element| &element.inner),
 				(
-					ast::TypeExpression::Pointer { inner, .. }
-					| ast::TypeExpression::Slice { inner, .. }
+					ast::TypeExpression::Pointer { inner, .. },
+					TypePathStep::Pointee,
+				)
+				| (
+					ast::TypeExpression::Slice { inner }
 					| ast::TypeExpression::Array { inner, .. },
-					TypePathStep::Pointee | TypePathStep::Element,
+					TypePathStep::Element,
 				) => Some(&**inner),
 				(
 					ast::TypeExpression::Array { length, .. },
 					TypePathStep::Length,
 				) => return (length.span, taken + 1),
 				(
-					ast::TypeExpression::Pointer { memory, .. }
-					| ast::TypeExpression::Slice { memory, .. }
-					| ast::TypeExpression::Array { memory, .. },
+					ast::TypeExpression::Pointer { memory, .. },
 					TypePathStep::Memory,
 				) => {
 					if let Some([first, .., last] | [first @ last]) =
@@ -1322,35 +1331,18 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					&Type::Array {
 						of: a_of,
 						length: a_length,
-						memory: a_memory,
-						ownership: a,
 					},
 					&Type::Array {
 						of: b_of,
 						length: b_length,
-						memory: b_memory,
-						ownership: b,
 					},
-				) if a == b => vec![
+				) => vec![
 					(TypePathStep::Element, a_of, b_of),
 					(TypePathStep::Length, a_length, b_length),
-					(TypePathStep::Memory, a_memory, b_memory),
 				],
-				(
-					&Type::Slice {
-						of: a_of,
-						memory: a_memory,
-						ownership: a,
-					},
-					&Type::Slice {
-						of: b_of,
-						memory: b_memory,
-						ownership: b,
-					},
-				) if a == b => vec![
-					(TypePathStep::Element, a_of, b_of),
-					(TypePathStep::Memory, a_memory, b_memory),
-				],
+				(&Type::Slice { of: a_of }, &Type::Slice { of: b_of }) => {
+					vec![(TypePathStep::Element, a_of, b_of)]
+				}
 				(
 					&Type::TypeProjection {
 						trait_index: a_trait,
@@ -1625,7 +1617,7 @@ mod tests {
 		test_case!(
 			case = indoc! {"
 			trait Size {}
-			trait Container: Size { type Item: Size; func f(self: Self); }
+			trait Container: Size + StackValue { type Item: Size; func f(self: Self); }
 			impl Container for Missing { type Item = u8; func f(self: Self) {} }
 		"}
 		);
@@ -1753,20 +1745,20 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store {
-				type Item;
+			trait Store: StackValue {
+				type Item: StackValue;
 				func get(self: Self) -> Box<Self::Item>;
 				func put(self: Self, item: Self::Item, at: u32);
-				func swap<A, B>(a: A, b: B) -> (B, A);
+				func swap<A: StackValue, B: StackValue>(a: A, b: B) -> (B, A);
 				func kept(self: Self) -> u32 { 0 }
 				const ZERO: Self;
 			}
 			struct Bag<T>();
-			impl<T> Store for Bag<T> {
+			impl<T: StackValue> Store for Bag<T> {
 				type Item = T;
 				func get(self: Self) -> Box<T> { Box() }
 				func put(self: Self, mut item: T, at: u32) {}
-				func swap<X, Y>(a: X, b: Y) -> (Y, X) { (b, a) }
+				func swap<X: StackValue, Y: StackValue>(a: X, b: Y) -> (Y, X) { (b, a) }
 				const ZERO: Bag<T> = Bag();
 			}
 		"}
@@ -1781,7 +1773,7 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{}",
 				indoc! {"
-				trait Store {
+				trait Store: StackValue {
 					type Item;
 					type Kept = u8;
 					func get(self: Self) -> u32;
@@ -1873,7 +1865,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store {
+			trait Store: StackValue {
 				func renamed(self: Self, rhs: u32);
 				func unnamed(self: Self, u32);
 				func named(self: Self, at: u32);
@@ -1919,13 +1911,13 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{}",
 				indoc! {"
-				trait Store {
-					func generic<T>(x: T);
+				trait Store: StackValue {
+					func generic<T: StackValue>(x: T);
 					func arity(self: Self, a: u32);
 				}
 				struct Bag();
 				impl Store for Bag {
-					func generic<T, U>(x: T) {}
+					func generic<T: StackValue, U>(x: T) {}
 					func arity(self: Self) {}
 				}
 			"}
@@ -1951,9 +1943,9 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{}",
 				indoc! {"
-				trait Store { func pair<A, B>(a: A, b: B); }
+				trait Store { func pair<A: StackValue, B: StackValue>(a: A, b: B); }
 				struct Bag();
-				impl Store for Bag { func pair<A, B>(a: B, b: A) {} }
+				impl Store for Bag { func pair<A: StackValue, B: StackValue>(a: B, b: A) {} }
 			"}
 			)
 		);
@@ -1970,7 +1962,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store { func put(self: Self, slot: Box<(u8, u32)>); }
+			trait Store: StackValue { func put(self: Self, slot: Box<(u8, u32)>); }
 			struct Bag();
 			impl Store for Bag { func put(self: Self, slot: Box<(u8, u64)>) {} }
 		"}
@@ -1991,7 +1983,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store { type Item; func get(self: Self) -> Box<Self::Item>; }
+			trait Store: StackValue { type Item; func get(self: Self) -> Box<Self::Item>; }
 			struct Bag();
 			impl Store for Bag { type Item = u8; func get(self: Self) -> Box<u16> { Box() } }
 		"}
@@ -2011,7 +2003,7 @@ mod tests {
 			"{PRELUDE}{}",
 			indoc! {"
 			type Alias = Box<(u8, u64)>;
-			trait Store { func put(self: Self, slot: Box<(u8, u32)>); }
+			trait Store: StackValue { func put(self: Self, slot: Box<(u8, u32)>); }
 			struct Bag();
 			impl Store for Bag { func put(self: Self, slot: Alias) {} }
 		"}
@@ -2035,7 +2027,7 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{}",
 			indoc! {"
-			trait Store { func count(self: Self) -> u32; }
+			trait Store: StackValue { func count(self: Self) -> u32; }
 			struct Bag();
 			impl Store for Bag { func count(self: Self) {} }
 		"}
@@ -2072,7 +2064,7 @@ mod tests {
 		trait PartialOrd: PartialEq {}
 		trait Eq: PartialEq {}
 		trait Ord: PartialOrd + Eq {}
-		trait Container { type Item; }
+		trait Container { type Item: StackValue; }
 		struct Bag();
 	";
 
@@ -2083,14 +2075,14 @@ mod tests {
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
 				trait Sorter {
-					func fewer<T: PartialEq>(x: T);
-					func same<T: PartialOrd>(x: T);
-					func implied<T: Ord>(x: T);
+					func fewer<T: StackValue + PartialEq>(x: T);
+					func same<T: StackValue + PartialOrd>(x: T);
+					func implied<T: StackValue + Ord>(x: T);
 				}
 				impl Sorter for Bag {
-					func fewer<T>(x: T) {}
-					func same<T: PartialOrd>(x: T) {}
-					func implied<T: PartialEq>(x: T) {}
+					func fewer<T: StackValue>(x: T) {}
+					func same<T: StackValue + PartialOrd>(x: T) {}
+					func implied<T: StackValue + PartialEq>(x: T) {}
 				}
 			"}
 			)
@@ -2103,8 +2095,8 @@ mod tests {
 		let source = format!(
 			"{PRELUDE}{ORDERING}{}",
 			indoc! {"
-			trait Sorter { func sort<T: PartialEq>(x: T); }
-			impl Sorter for Bag { func sort<T: Ord>(x: T) {} }
+			trait Sorter { func sort<T: StackValue + PartialEq>(x: T); }
+			impl Sorter for Bag { func sort<T: StackValue + Ord>(x: T) {} }
 		"}
 		);
 		test_case!(case = &source);
@@ -2130,9 +2122,9 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
-				trait Store { func take<U: Container>(x: U); }
+				trait Store { func take<U: StackValue + Container>(x: U); }
 				impl Store for Bag {
-					func take<U: Container where { Item = u32 }>(x: U) {}
+					func take<U: StackValue + Container where { Item = u32 }>(x: U) {}
 				}
 			"}
 			)
@@ -2151,9 +2143,9 @@ mod tests {
 			case = &format!(
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
-				trait Store { func take<U: Container where { Item = u8 }>(x: U); }
+				trait Store { func take<U: StackValue + Container where { Item = u8 }>(x: U); }
 				impl Store for Bag {
-					func take<U: Container where { Item = u16 }>(x: U) {}
+					func take<U: StackValue + Container where { Item = u16 }>(x: U) {}
 				}
 			"}
 			)
@@ -2176,12 +2168,12 @@ mod tests {
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
 				trait Store {
-					func strict<U: Container>(x: U);
-					func loose<U: Container where { Item: Ord }>(x: U);
+					func strict<U: StackValue + Container>(x: U);
+					func loose<U: StackValue + Container where { Item: Ord }>(x: U);
 				}
 				impl Store for Bag {
-					func strict<U: Container where { Item: Ord }>(x: U) {}
-					func loose<U: Container where { Item: PartialEq }>(x: U) {}
+					func strict<U: StackValue + Container where { Item: Ord }>(x: U) {}
+					func loose<U: StackValue + Container where { Item: PartialEq }>(x: U) {}
 				}
 			"}
 			)
@@ -2201,9 +2193,9 @@ mod tests {
 				"{PRELUDE}{ORDERING}{}",
 				indoc! {"
 				trait Into { type Out; }
-				trait Convert { func from<T: Into where { Out = Self }>(x: T); }
+				trait Convert { func from<T: StackValue + Into where { Out = Self }>(x: T); }
 				impl Convert for Bag {
-					func from<T: Into where { Out = Bag }>(x: T) {}
+					func from<T: StackValue + Into where { Out = Bag }>(x: T) {}
 				}
 			"}
 			)

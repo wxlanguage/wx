@@ -10,7 +10,7 @@
 //! `self` right after — the same reason the legacy one existed as its own
 //! type rather than living on the (bigger, `&mut`-heavy) `Builder`.
 //!
-//! Borrows `types`/`defs`/`strings` plus `type_envs` for generic parameter
+//! Borrows `types`/`defs`/`strings` plus `generic_envs` for generic parameter
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
 //! The formatter currently wraps `TypeContext`'s pieces.
@@ -22,13 +22,21 @@ use crate::ast::{Ownership, StringInterner};
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
 use super::defs::{ConstIdx, DefinitionRegistry, MemberOwner};
 use super::signatures::TypeContext;
-use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
+use super::types::{GenericEnvArena, Type, TypeIndex, TypeInterner};
+
+/// The bytes a type may take in a message, as rustc shortens a long type.
+const TYPE_DISPLAY_BUDGET: usize = 64;
 
 pub(super) struct TypeFormatter<'a> {
 	pub(super) types: &'a TypeInterner,
 	pub(super) defs: &'a DefinitionRegistry,
 	pub(super) strings: &'a StringInterner,
-	pub(super) type_envs: &'a TypeEnvArena,
+	pub(super) generic_envs: &'a GenericEnvArena,
+	/// How many bytes a type may take before the rest of it is written as
+	/// `...`. A type can be far larger than its interned form (a doubling
+	/// chain of shared parts is a handful of types and 2^n leaves), so this
+	/// bounds both what a message shows and what printing it costs.
+	pub(super) budget: usize,
 }
 
 /// Formats declared source bounds, preserving their order and bindings.
@@ -45,7 +53,8 @@ impl TypeContext<'_, '_, '_> {
 			types: &self.types,
 			defs: self.defs,
 			strings: self.strings,
-			type_envs: &self.type_envs,
+			generic_envs: &self.generic_envs,
+			budget: TYPE_DISPLAY_BUDGET,
 		}
 	}
 
@@ -94,19 +103,35 @@ impl BoundFormatter<'_> {
 			if i > 0 {
 				f.push_str(", ");
 			}
-			let symbol = self.type_formatter.defs.assoc_types
-				[usize::from(binding.target.assoc_type_index)]
-			.name
-			.inner;
-			f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
+			let defs = self.type_formatter.defs;
+			let name =
+				|symbol| self.type_formatter.strings.resolve(symbol).unwrap();
 			match &binding.kind {
-				BindingRequirement::Equals(ty) => {
+				BindingRequirement::Equals(target, ty) => {
+					f.push_str(name(
+						defs.assoc_types[usize::from(target.assoc_type_index)]
+							.name
+							.inner,
+					));
 					f.push_str(" = ");
 					self.type_formatter.write_type(f, ty.inner);
 				}
-				BindingRequirement::Bound(bounds) => {
+				BindingRequirement::Bound(target, bounds) => {
+					f.push_str(name(
+						defs.assoc_types[usize::from(target.assoc_type_index)]
+							.name
+							.inner,
+					));
 					f.push_str(": ");
 					self.write_bounds(f, bounds);
+				}
+				BindingRequirement::Representable(target, ty) => {
+					f.push_str("const ");
+					f.push_str(name(
+						defs.constants[usize::from(target.constant)].name.inner,
+					));
+					f.push_str(": ");
+					self.type_formatter.write_type(f, ty.inner);
 				}
 			}
 		}
@@ -121,7 +146,27 @@ impl TypeFormatter<'_> {
 		buffer
 	}
 
-	fn write_type(&self, f: &mut String, ty: TypeIndex) {
+	/// Writes `ty` at the end of `f`, within `budget` bytes of where it
+	/// starts.
+	pub(super) fn write_type(&self, f: &mut String, ty: TypeIndex) {
+		let limit = f.len().saturating_add(self.budget);
+		self.write_part(f, limit, ty);
+	}
+
+	/// Writes `ty`, a part of a type that must end by byte `limit` of `f`.
+	///
+	/// Past `limit`, a part is `...`, which stands for the rest of the
+	/// type up to the next text its parent writes itself: parts that follow
+	/// one another share one `...`, and the parts already open still close
+	/// their brackets on the way out, so what is written stays a well-formed
+	/// type (`((u32, ...))`, `func(u32, ...) -> ...`).
+	fn write_part(&self, f: &mut String, limit: usize, ty: TypeIndex) {
+		if f.len() >= limit {
+			if !f.ends_with("...") {
+				f.push_str("...");
+			}
+			return;
+		}
 		match self.types.resolve(ty) {
 			Type::Error => f.push_str("{unknown}"),
 			Type::Infer => f.push('_'),
@@ -129,8 +174,6 @@ impl TypeFormatter<'_> {
 			Type::IntegerLiteral => f.push_str("{integer}"),
 			Type::FloatLiteral => f.push_str("{float}"),
 			Type::CharLiteral => f.push_str("{char}"),
-			Type::StringLiteral => f.push_str("{string}"),
-			Type::ArrayLiteral => f.push_str("{array}"),
 			Type::U8 => f.push_str("u8"),
 			Type::I8 => f.push_str("i8"),
 			Type::U16 => f.push_str("u16"),
@@ -144,14 +187,7 @@ impl TypeFormatter<'_> {
 			Type::Funcref => f.push_str("funcref"),
 			Type::Tuple { elements } => {
 				f.push('(');
-				for (i, element) in
-					self.types.list(*elements).iter().copied().enumerate()
-				{
-					if i > 0 {
-						f.push_str(", ");
-					}
-					self.write_type(f, element);
-				}
+				self.write_list(f, limit, self.types.list(*elements));
 				if elements.len() == 1 {
 					f.push(',');
 				}
@@ -164,7 +200,7 @@ impl TypeFormatter<'_> {
 				let symbol =
 					self.defs.structs[usize::from(*struct_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
-				self.write_type_args(f, self.types.list(*type_args));
+				self.write_type_args(f, limit, self.types.list(*type_args));
 			}
 			Type::Enum { enum_index } => {
 				let symbol =
@@ -186,36 +222,21 @@ impl TypeFormatter<'_> {
 				memory,
 				ownership,
 			} => {
-				self.write_type(f, *memory);
+				self.write_part(f, limit, *memory);
 				f.push_str("::");
 				f.push(ownership_sigil(*ownership));
-				self.write_type(f, *to);
+				self.write_part(f, limit, *to);
 			}
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => {
-				self.write_type(f, *memory);
-				f.push_str("::");
-				f.push(ownership_sigil(*ownership));
+			Type::Slice { of } => {
 				f.push('[');
-				self.write_type(f, *of);
+				self.write_part(f, limit, *of);
 				f.push(']');
 			}
-			Type::Array {
-				of,
-				length,
-				memory,
-				ownership,
-			} => {
-				self.write_type(f, *memory);
-				f.push_str("::");
-				f.push(ownership_sigil(*ownership));
+			Type::Array { of, length } => {
 				f.push('[');
-				self.write_type(f, *of);
+				self.write_part(f, limit, *of);
 				f.push_str("; ");
-				self.write_type(f, *length);
+				self.write_part(f, limit, *length);
 				f.push(']');
 			}
 			Type::Value { bits } => {
@@ -226,7 +247,12 @@ impl TypeFormatter<'_> {
 				constant,
 				type_args,
 			} => {
-				self.write_constant(f, *constant, self.types.list(*type_args));
+				self.write_constant(
+					f,
+					limit,
+					*constant,
+					self.types.list(*type_args),
+				);
 			}
 			Type::TypedFuncref { param, result } => {
 				let (param, result) = (*param, *result);
@@ -235,23 +261,12 @@ impl TypeFormatter<'_> {
 				// tuple is not a list, so it keeps its own parentheses.
 				match self.types.resolve(param) {
 					Type::Tuple { elements } if elements.len() != 1 => {
-						for (i, element) in self
-							.types
-							.list(*elements)
-							.iter()
-							.copied()
-							.enumerate()
-						{
-							if i > 0 {
-								f.push_str(", ");
-							}
-							self.write_type(f, element);
-						}
+						self.write_list(f, limit, self.types.list(*elements));
 					}
-					_ => self.write_type(f, param),
+					_ => self.write_part(f, limit, param),
 				}
 				f.push_str(") -> ");
-				self.write_type(f, result);
+				self.write_part(f, limit, result);
 			}
 			Type::Function {
 				func_index: function_index,
@@ -268,7 +283,7 @@ impl TypeFormatter<'_> {
 						.split_first()
 						.expect("a trait's function takes `Self` first");
 					f.push('<');
-					self.write_type(f, receiver);
+					self.write_part(f, limit, receiver);
 					f.push_str(" as ");
 					let symbol =
 						self.defs.traits[usize::from(trait_index)].name.inner;
@@ -277,12 +292,12 @@ impl TypeFormatter<'_> {
 					type_args = own;
 				}
 				f.push_str(self.strings.resolve(function.name.inner).unwrap());
-				self.write_type_args(f, type_args);
+				self.write_type_args(f, limit, type_args);
 			}
 			Type::TypeParam {
 				env, param_index, ..
 			} => {
-				let symbol = self.type_envs.param_names(*env)
+				let symbol = self.generic_envs.param_names(*env)
 					[*param_index as usize]
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
@@ -299,7 +314,7 @@ impl TypeFormatter<'_> {
 				base,
 			} => {
 				f.push('<');
-				self.write_type(f, *base);
+				self.write_part(f, limit, *base);
 				f.push_str(" as ");
 				let symbol =
 					self.defs.traits[usize::from(*trait_index)].name.inner;
@@ -315,20 +330,21 @@ impl TypeFormatter<'_> {
 	}
 
 	/// `constant` with `args`: a trait's declaration over its `Self` as a
-	/// projection is (`<T as Array>::SIZE`), any other with its arguments.
+	/// projection is (`<T as Array>::LEN`), any other with its arguments.
 	pub(super) fn display_constant(
 		&self,
 		constant: ConstIdx,
 		args: &[TypeIndex],
 	) -> String {
 		let mut buffer = String::new();
-		self.write_constant(&mut buffer, constant, args);
+		self.write_constant(&mut buffer, self.budget, constant, args);
 		buffer
 	}
 
 	fn write_constant(
 		&self,
 		f: &mut String,
+		limit: usize,
 		constant: ConstIdx,
 		args: &[TypeIndex],
 	) {
@@ -337,7 +353,7 @@ impl TypeFormatter<'_> {
 		match def.owner {
 			MemberOwner::Trait(trait_index) => {
 				f.push('<');
-				self.write_type(f, args[0]);
+				self.write_part(f, limit, args[0]);
 				f.push_str(" as ");
 				let symbol =
 					self.defs.traits[usize::from(trait_index)].name.inner;
@@ -347,23 +363,43 @@ impl TypeFormatter<'_> {
 			}
 			_ => {
 				f.push_str(name);
-				self.write_type_args(f, args);
+				self.write_type_args(f, limit, args);
 			}
 		}
 	}
 
-	fn write_type_args(&self, f: &mut String, args: &[TypeIndex]) {
+	fn write_type_args(
+		&self,
+		f: &mut String,
+		limit: usize,
+		args: &[TypeIndex],
+	) {
 		if args.is_empty() {
 			return;
 		}
 		f.push('<');
-		for (i, arg) in args.iter().copied().enumerate() {
+		self.write_list(f, limit, args);
+		f.push('>');
+	}
+
+	/// `items` separated by `, `. Past `limit` the rest of the list is
+	/// `, ...`, unless the type already holds one: the `...` written inside
+	/// an element stands for this list's rest too (`((x, ...))`, not
+	/// `((x, ...), ...)`), which keeps a deeply nested type short.
+	fn write_list(&self, f: &mut String, limit: usize, items: &[TypeIndex]) {
+		for (i, &item) in items.iter().enumerate() {
 			if i > 0 {
+				if f.len() >= limit {
+					let start = limit.saturating_sub(self.budget);
+					if !f[start..].contains("...") {
+						f.push_str(", ...");
+					}
+					return;
+				}
 				f.push_str(", ");
 			}
-			self.write_type(f, arg);
+			self.write_part(f, limit, item);
 		}
-		f.push('>');
 	}
 }
 
@@ -388,18 +424,17 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
+	use crate::tir::signatures::{FunctionSignature, QueryInfo};
 	use crate::tir::solver::Solver;
-	use crate::tir::types::TypeEnvIdx;
+	use crate::tir::types::GenericEnvIdx;
 	use crate::vfs;
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,
 		defs: DefinitionRegistry,
 		types: TypeInterner,
-		type_envs: TypeEnvArena,
+		generic_envs: GenericEnvArena,
 		bounds: BoundArena,
-		param_bounds: Vec<Box<[ParamBounds]>>,
 		functions: Vec<FunctionSignature>,
 	}
 
@@ -466,9 +501,8 @@ mod tests {
 
 			Self {
 				types: signatures.types,
-				type_envs: signatures.type_envs,
+				generic_envs: signatures.generic_envs,
 				bounds: signatures.bounds,
-				param_bounds: signatures.param_bounds,
 				functions: signatures.functions,
 				graph,
 				defs,
@@ -500,11 +534,15 @@ mod tests {
 			index
 		}
 
-		fn parameter(&self, function: &str, name: &str) -> (TypeEnvIdx, usize) {
+		fn parameter(
+			&self,
+			function: &str,
+			name: &str,
+		) -> (GenericEnvIdx, usize) {
 			let env = self.functions[usize::from(self.function(function))]
 				.type_params;
 			let index = self
-				.type_envs
+				.generic_envs
 				.param_names(env)
 				.iter()
 				.position(|param| {
@@ -523,18 +561,49 @@ mod tests {
 				types: &self.types,
 				defs: &self.defs,
 				strings: &self.graph.strings,
-				type_envs: &self.type_envs,
+				generic_envs: &self.generic_envs,
+				budget: TYPE_DISPLAY_BUDGET,
 			}
 		}
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.type_envs.param_types(env)[index]
+			self.generic_envs.param_types(env)[index]
 		}
 
-		fn declared_bounds(&self, function: &str, param: &str) -> &[BoundId] {
+		/// The bounds written on `param`, as written: every top-level bound
+		/// between its name and the next parameter's.
+		fn declared_bounds(&self, function: &str, param: &str) -> Vec<BoundId> {
 			let (env, index) = self.parameter(function, param);
-			&self.param_bounds[usize::from(env)][index].declared_bounds
+			let names = self.generic_envs.param_names(env);
+			let after = names[index].span.end;
+			let before =
+				names.get(index + 1).map_or(u32::MAX, |n| n.span.start);
+			let file_id = self.defs.functions
+				[usize::from(self.function(function))]
+			.file_id;
+			let written: Vec<BoundId> = self
+				.bounds
+				.ids()
+				.filter(|&id| {
+					let span = self.bounds.span(id);
+					span.file_id == file_id
+						&& (after..before).contains(&span.span.start)
+				})
+				.collect();
+			let nested: Vec<BoundId> = written
+				.iter()
+				.flat_map(|&id| self.bounds.get(id).bindings.iter())
+				.flat_map(|binding| match &binding.kind {
+					BindingRequirement::Bound(_, nested) => nested.to_vec(),
+					BindingRequirement::Equals(..)
+					| BindingRequirement::Representable(..) => Vec::new(),
+				})
+				.collect();
+			written
+				.into_iter()
+				.filter(|id| !nested.contains(id))
+				.collect()
 		}
 
 		/// `name` is looked up directly against the trait's own member
@@ -596,8 +665,9 @@ mod tests {
 	fn memory_qualified_types_preserve_ownership_and_shape() {
 		let mut case = TestCase::new("func allocate<M>() {}");
 		let memory = case.type_param("allocate", "M");
-		let slice = case.types.intern(Type::Slice {
-			of: TypeIndex::I32,
+		let slice = case.types.intern(Type::Slice { of: TypeIndex::I32 });
+		let slice = case.types.intern(Type::Pointer {
+			to: slice,
 			memory,
 			ownership: Ownership::Shared,
 		});
@@ -610,12 +680,16 @@ mod tests {
 		let array = case.types.intern(Type::Array {
 			of: TypeIndex::I32,
 			length: four,
+		});
+		let to_array = case.types.intern(Type::Pointer {
+			to: array,
 			memory,
 			ownership: Ownership::Exclusive,
 		});
 		let formatter = case.type_formatter();
 		assert_eq!(formatter.display_type(pointer), "M::*M::&[i32]");
-		assert_eq!(formatter.display_type(array), "M::*[i32; 4]");
+		assert_eq!(formatter.display_type(to_array), "M::*[i32; 4]");
+		assert_eq!(formatter.display_type(array), "[i32; 4]");
 	}
 
 	#[test]
@@ -656,7 +730,7 @@ mod tests {
 		for (param, expected) in [("T", ""), ("U", "A"), ("V", "B + A + B")] {
 			assert_eq!(
 				formatter
-					.display_bounds(case.declared_bounds("subject", param)),
+					.display_bounds(&case.declared_bounds("subject", param)),
 				expected
 			);
 		}
@@ -691,8 +765,90 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bounds(case.declared_bounds("subject", "S")),
+				.display_bounds(&case.declared_bounds("subject", "S")),
 			"Outer where { Item: Inner where { Value = Wrapper<T> } + Leaf, Count = u32 } + Plain"
 		);
+	}
+	/// `(u32, u32, ..., ...)`, the first `fit` elements of a long tuple of
+	/// `u32` and the rest elided.
+	fn elided_u32s(fit: usize) -> String {
+		format!("({}, ...)", vec!["u32"; fit].join(", "))
+	}
+
+	#[test]
+	fn a_type_within_the_budget_is_written_whole() {
+		let mut case = TestCase::new("");
+		let tuple = case.types.intern_tuple(&[TypeIndex::U32; 4]);
+		assert_eq!(
+			case.type_formatter().display_type(tuple),
+			"(u32, u32, u32, u32)"
+		);
+	}
+
+	#[test]
+	fn a_long_list_ends_in_an_ellipsis_once_the_budget_is_spent() {
+		let mut case = TestCase::new("");
+		let tuple = case.types.intern_tuple(&[TypeIndex::U32; 30]);
+		assert_eq!(case.type_formatter().display_type(tuple), elided_u32s(13));
+	}
+
+	#[test]
+	fn an_ellipsis_stands_for_the_rest_of_the_enclosing_lists() {
+		// The `u8` after the long tuple is part of the elided rest, so the
+		// outer list adds no `, ...` of its own.
+		let mut case = TestCase::new("");
+		let inner = case.types.intern_tuple(&[TypeIndex::U32; 30]);
+		let outer = case.types.intern_tuple(&[inner, TypeIndex::U8]);
+		assert_eq!(
+			case.type_formatter().display_type(outer),
+			format!("({})", elided_u32s(13))
+		);
+	}
+
+	#[test]
+	fn a_part_after_its_parents_own_text_is_elided_on_its_own() {
+		let mut case = TestCase::new("");
+		let param = case.types.intern_tuple(&[TypeIndex::U32; 30]);
+		let function = case.types.intern(Type::TypedFuncref {
+			param,
+			result: TypeIndex::U8,
+		});
+		assert_eq!(
+			case.type_formatter().display_type(function),
+			// `func` spends four bytes of the budget, one element's worth.
+			format!("func{} -> ...", elided_u32s(12))
+		);
+	}
+
+	#[test]
+	fn a_type_far_larger_than_its_interned_form_prints_in_bounded_length() {
+		// 300 interned tuples, 2^300 leaves: only the start is ever visited,
+		// and every bracket it opened is closed.
+		let mut case = TestCase::new("");
+		let mut doubled = TypeIndex::U8;
+		for _ in 0..300 {
+			doubled = case.types.intern_tuple(&[doubled, doubled]);
+		}
+		let depth = TYPE_DISPLAY_BUDGET;
+		assert_eq!(
+			case.type_formatter().display_type(doubled),
+			format!("{}...{}", "(".repeat(depth), ")".repeat(depth))
+		);
+	}
+
+	#[test]
+	fn the_budget_counts_from_where_the_type_starts() {
+		// A message written before the type does not spend its budget.
+		let mut case = TestCase::new("");
+		let short = case.types.intern_tuple(&[TypeIndex::U32; 4]);
+		let long = case.types.intern_tuple(&[TypeIndex::U32; 30]);
+		let formatter = case.type_formatter();
+		let prefix = "x".repeat(2 * TYPE_DISPLAY_BUDGET);
+		let mut buffer = prefix.clone();
+		formatter.write_type(&mut buffer, short);
+		assert_eq!(&buffer[prefix.len()..], "(u32, u32, u32, u32)");
+		let mut buffer = prefix.clone();
+		formatter.write_type(&mut buffer, long);
+		assert_eq!(&buffer[prefix.len()..], elided_u32s(13));
 	}
 }
