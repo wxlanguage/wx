@@ -491,6 +491,11 @@ pub(super) enum ScopeKind {
 	Block,
 	/// A loop's block, which `continue` restarts.
 	Loop,
+	/// A string or array literal's elements, or a repeat's value:
+	/// constant expressions, so the locals of the scopes around it are out
+	/// of reach. A name still finds them, so a local shadows an item here as
+	/// anywhere, and using one is an error (E2140).
+	Static,
 }
 
 /// One lexical block.
@@ -787,7 +792,7 @@ mod tests {
 
 	#[test]
 	fn an_expression_node_stays_small() {
-		assert!(std::mem::size_of::<ExprKind>() <= 32);
+		assert!(std::mem::size_of::<ExprKind>() <= 24);
 	}
 
 	#[test]

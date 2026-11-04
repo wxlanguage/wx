@@ -482,6 +482,9 @@ impl TypeContext<'_, '_, '_> {
 				.exact_value(instance.constant)
 				.map_or(UntypedValue::Failed, UntypedValue::Known),
 			ResolvedConstant::Abstract => UntypedValue::Abstract,
+			ResolvedConstant::DataEnd(_) => {
+				unreachable!("`Memory::DATA_END` is a pointer, not untyped")
+			}
 		})
 	}
 

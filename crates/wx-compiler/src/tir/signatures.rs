@@ -490,6 +490,7 @@ impl TypeContext<'_, '_, '_> {
 			),
 		};
 		let owner = BodyOwner::Function(function_index);
+		let reported = self.diagnostics.len();
 		let (body, obligations) = BodyContext::new(self, scope, owner)
 			.check_function(function_index, signature, block);
 		let body = BodyContext::decide_obligations(
@@ -499,8 +500,20 @@ impl TypeContext<'_, '_, '_> {
 			body,
 			obligations,
 		);
+		let statics = body.statics().to_vec();
 		self.function_implementations[usize::from(function_index)] =
 			FunctionImplementation::Defined(Box::new(body));
+		// Static data is evaluated at compile time, so what fails in it is
+		// reported here, for a function with no parameters. A generic one's
+		// may depend on its arguments: each instance is evaluated, and
+		// reported, where it is lowered.
+		if !self.diagnostics[reported..].has_errors()
+			&& self.generic_envs.generic_count(scope.generic_env) == 0
+		{
+			for expr in statics {
+				let _ = self.static_value(function_index, &[], expr);
+			}
+		}
 	}
 
 	#[cfg(test)]

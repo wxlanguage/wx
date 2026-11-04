@@ -264,6 +264,7 @@ define_diagnostic_codes! {
 		MisplacedAttribute => "E2137",
 		MalformedAttribute => "E2138",
 		InvalidMemoryLimits => "E2139",
+		LocalInStaticData => "E2140",
 	}
 }
 

@@ -54,7 +54,8 @@ pub(super) struct AggregateLayout {
 	pub(super) fields: Box<[u32]>,
 	/// The aggregate as Wasm values, nested aggregates flattened, in
 	/// declaration order: each value's primitive and its byte offset from the
-	/// aggregate's start.
+	/// aggregate's start. An array field holds none: an aggregate holding
+	/// one is no `StackValue`, so it is never one value.
 	pub(super) values: Box<[(Primitive, u32)]>,
 	/// Field `i` owns `values[field_values[i]..field_values[i + 1]]`; the last
 	/// entry is `values.len()`.
@@ -137,6 +138,9 @@ enum Piece {
 		count: u32,
 	},
 	Aggregate(AggregateIdx),
+	/// An array of a known length: its elements' bytes, one after another,
+	/// and no values (`memory_values` repeats its element's).
+	Array(Layout),
 }
 
 impl Layouts {
@@ -152,6 +156,7 @@ impl Layouts {
 				align: primitive.size(),
 			},
 			Piece::Aggregate(index) => self.aggregate(index).layout,
+			Piece::Array(layout) => layout,
 		}
 	}
 
@@ -177,7 +182,7 @@ impl Layouts {
 		for (&field, &base) in fields.iter().zip(&offsets) {
 			field_values.push(u32::try_from(values.len()).unwrap());
 			match field {
-				Piece::Empty => {}
+				Piece::Empty | Piece::Array(_) => {}
 				Piece::Primitives { primitive, count } => values.extend(
 					(0..count)
 						.map(|at| (primitive, base + at * primitive.size())),
@@ -245,25 +250,57 @@ impl TypeContext<'_, '_, '_> {
 
 	/// The layout of a value of `ty`, as `memory_layout` answers it, and
 	/// the values it holds: each one's primitive and its byte offset, in
-	/// declaration order (an aggregate's `values`).
+	/// declaration order (an aggregate's `values`; an array's element's,
+	/// once per element, as static data writes it).
 	pub(super) fn memory_values(
 		&mut self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<(Layout, Box<[(Primitive, u32)]>)>, SolverError> {
-		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
-		Ok(piece.map(|piece| {
-			let values = match piece {
-				Piece::Empty => Box::default(),
-				Piece::Primitives { primitive, count } => (0..count)
-					.map(|at| (primitive, at * primitive.size()))
-					.collect(),
-				Piece::Aggregate(index) => {
-					self.solver.layouts.aggregate(index).values.clone()
-				}
-			};
-			(self.solver.layouts.layout(piece), values)
-		}))
+		let Some(piece) =
+			self.piece(assumption_context, ty, &mut Vec::new())?
+		else {
+			return Ok(None);
+		};
+		let values = match piece {
+			Piece::Empty => Box::default(),
+			Piece::Primitives { primitive, count } => (0..count)
+				.map(|at| (primitive, at * primitive.size()))
+				.collect(),
+			Piece::Aggregate(index) => {
+				self.solver.layouts.aggregate(index).values.clone()
+			}
+			Piece::Array(_) => {
+				let ty = self.normalize(
+					assumption_context,
+					ty,
+					NormalizationDepth::Shallow,
+					RewriteFlags::ALL,
+				)?;
+				let Type::Array { of, .. } = *self.types.resolve(ty) else {
+					unreachable!("an array's piece is an array's")
+				};
+				let Some((element, values)) =
+					self.memory_values(assumption_context, of)?
+				else {
+					unreachable!(
+						"an array with a layout has an element with one"
+					)
+				};
+				let count = match element.size {
+					0 => 0,
+					size => self.solver.layouts.layout(piece).size / size,
+				};
+				(0..count)
+					.flat_map(|at| {
+						values.iter().map(move |&(primitive, offset)| {
+							(primitive, at * element.size + offset)
+						})
+					})
+					.collect()
+			}
+		};
+		Ok(Some((self.solver.layouts.layout(piece), values)))
 	}
 
 	/// The layout of a struct or a tuple, as `memory_layout` answers it.
@@ -345,9 +382,34 @@ impl TypeContext<'_, '_, '_> {
 					count: 1 + metadata_len(&self.types, metadata) as u32,
 				}
 			}
-			// A slice or an array is no value's type: only a pointer holds
-			// one, and what it points at is laid out where it is placed.
-			Type::Slice { .. } | Type::Array { .. } => return Ok(None),
+			// An array of a known length is its elements, one after another.
+			// A slice has no size, nor does an array of an abstract length.
+			Type::Array { of, length } => {
+				let length = self.normalize(
+					assumption_context,
+					length,
+					NormalizationDepth::Shallow,
+					RewriteFlags::ALL,
+				)?;
+				let Type::Value { bits } = *self.types.resolve(length) else {
+					return Ok(None);
+				};
+				let Some(element) =
+					self.piece(assumption_context, of, visiting)?
+				else {
+					return Ok(None);
+				};
+				let element = self.solver.layouts.layout(element);
+				let size = u32::try_from(bits)
+					.ok()
+					.and_then(|count| element.size.checked_mul(count))
+					.ok_or(SolverError::Overflow)?;
+				Piece::Array(Layout {
+					size,
+					align: element.align,
+				})
+			}
+			Type::Slice { .. } => return Ok(None),
 			Type::Tuple { .. } | Type::Struct { .. } => {
 				return self.aggregate_piece(assumption_context, ty, visiting);
 			}
@@ -969,6 +1031,61 @@ mod tests {
 		assert_eq!(param_layout(&mut case, "f", 3), Ok(None));
 		assert_eq!(param_layout(&mut case, "f", 4), Ok(None));
 		assert_eq!(param_layout(&mut case, "f", 5), Ok(None));
+	}
+
+	/// A sized array is its elements, one after another, aligned as one; an
+	/// aggregate holding it gets its bytes but no values, since it is never
+	/// one value. A slice or an abstract length has no size.
+	#[test]
+	fn an_array_field_takes_its_elements_bytes() {
+		let source = with_memories(indoc! {"
+			#[fixed_order]
+			struct Header(len: u8, data: [u16; 3], tail: u32);
+			struct Holder<A>(a: A);
+			func f(
+				a: heap::&Header, b: heap::&[[u8; 2]; 3],
+				c: heap::&Holder<[u8]>, d: heap::&Holder<[[u32; 2]; 0]>,
+			) {}
+		"});
+		test_case!(mut case = &source);
+		case.diagnostics().assert_none();
+		let pointees: Vec<TypeIndex> = (case.param_types("f").to_vec())
+			.into_iter()
+			.map(|ty| match *case.context.types.resolve(ty) {
+				Type::Pointer { to, .. } => to,
+				_ => panic!("a pointer"),
+			})
+			.collect();
+		let index = case
+			.context
+			.aggregate_layout(AssumptionEnvIdx::ROOT, pointees[0])
+			.unwrap()
+			.expect("a laid-out struct");
+		// `len` at 0, `data` at 2 (six bytes), `tail` at 8.
+		assert_eq!(
+			case.context.aggregate(index).clone(),
+			aggregate(
+				(12, 4),
+				&[0, 2, 8],
+				&[(Primitive::U8, 0), (Primitive::U32, 8)],
+				&[0, 1, 1, 2],
+			)
+		);
+		// An array's values are its element's, once per element.
+		let (layout, values) = case
+			.context
+			.memory_values(AssumptionEnvIdx::ROOT, pointees[1])
+			.unwrap()
+			.expect("a laid-out array");
+		assert_eq!(layout, Layout { size: 6, align: 1 });
+		assert_eq!(
+			&*values,
+			(0..6).map(|at| (Primitive::U8, at)).collect::<Vec<_>>()
+		);
+		let mut layout =
+			|ty| case.context.memory_layout(AssumptionEnvIdx::ROOT, ty);
+		assert_eq!(layout(pointees[2]), Ok(None));
+		assert_eq!(layout(pointees[3]), Ok(known(0, 4)));
 	}
 
 	#[test]

@@ -1353,7 +1353,7 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::TrappingResult { .. }
 			| DataNodeKind::FunctionRef { .. }
 			| DataNodeKind::StaticDataRef { .. }
-			| DataNodeKind::MemoryOffset { .. }
+			| DataNodeKind::DataEnd { .. }
 			| DataNodeKind::MemoryIndex { .. }
 			| DataNodeKind::MemorySizeResult { .. }
 			| DataNodeKind::AggregateCallResult { .. }
@@ -1501,12 +1501,15 @@ impl<'f> Scheduler<'f> {
 			DataNodeKind::FunctionRef { id } => {
 				self.body.push(Instruction::FunctionPointer(id));
 			}
-			DataNodeKind::StaticDataRef { data_index, ty } => {
-				self.body
-					.push(Instruction::StaticDataPointer { data_index, ty });
+			DataNodeKind::StaticDataRef { entry, offset, ty } => {
+				self.body.push(Instruction::StaticDataPointer {
+					entry,
+					offset,
+					ty,
+				});
 			}
-			DataNodeKind::MemoryOffset { memory, .. } => {
-				self.body.push(Instruction::DataSectionEnd { memory });
+			DataNodeKind::DataEnd { memory, .. } => {
+				self.body.push(Instruction::DataEnd { memory });
 			}
 			DataNodeKind::MemoryIndex { memory } => {
 				self.body.push(Instruction::MemoryIndex { memory });
@@ -1961,7 +1964,7 @@ impl<'f> Scheduler<'f> {
 			| DataNodeKind::Param { .. }
 			| DataNodeKind::FunctionRef { .. }
 			| DataNodeKind::StaticDataRef { .. }
-			| DataNodeKind::MemoryOffset { .. } => false,
+			| DataNodeKind::DataEnd { .. } => false,
 
 			// A loop param needs a local exactly when `patch_loop_binding`
 			// (opt/builder.rs) decided it was loop-carried and pushed it into

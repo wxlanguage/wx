@@ -94,6 +94,14 @@ pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	scope_types: Vec<ScopeType>,
 }
 
+/// Whether a local a name finds can be used where the name is written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalReach {
+	Visible,
+	/// Declared outside the static data the name is written in.
+	BehindStatic,
+}
+
 /// Whether two types are equal once some facts have rewritten them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypeEquality {
@@ -129,6 +137,21 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			lookup: FxHashMap::default(),
 			scope_types: Vec::new(),
 		}
+	}
+
+	/// Builds the parts of a literal (its elements, a repeat's value) in a
+	/// scope of their own, which keeps the locals around it out
+	/// of reach.
+	fn static_scope<R>(
+		&mut self,
+		span: TextSpan,
+		build: impl FnOnce(&mut Self) -> R,
+	) -> R {
+		let scope =
+			self.enter_scope(ScopeKind::Static, None, span, TypeIndex::INFER);
+		let built = build(self);
+		self.leave_scope(scope);
+		built
 	}
 
 	/// Decides what building a body recorded, once every constant body is
@@ -615,10 +638,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let hint = self.array_element_hint(expected);
-		let values: Vec<ExprIdx> = elements
-			.iter()
-			.map(|element| self.build(element, hint))
-			.collect();
+		let values: Vec<ExprIdx> = self.static_scope(span, |this| {
+			(elements.iter())
+				.map(|element| this.build(element, hint))
+				.collect()
+		});
 		let of = values
 			.iter()
 			.map(|&value| self.body.ty(value))
@@ -646,8 +670,34 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let hint = self.array_element_hint(expected);
-		let value = self.build(value, hint);
-		let count = match &count.inner {
+		let value = self.static_scope(span, |this| this.build(value, hint));
+		// The count is a length, which `repeat_length` holds to a literal or
+		// a constant.
+		let count = self.build_repeat_count(count);
+		let of = self.body.ty(value);
+		let length = match count {
+			None => TypeIndex::INFER,
+			Some(count) => self.repeat_length(count),
+		};
+		let ty = if length == TypeIndex::ERROR {
+			TypeIndex::ERROR
+		} else {
+			self.cx.types.intern(Type::Array { of, length })
+		};
+		let expr =
+			self.body
+				.push(ExprKind::ArrayRepeat { value, count }, ty, span);
+		self.body.push_static(expr);
+		expr
+	}
+
+	/// A repeat's count as written: an integer literal or a constant's path,
+	/// `None` for `_`.
+	fn build_repeat_count(
+		&mut self,
+		count: &Spanned<ast::ConstArgument>,
+	) -> Option<ExprIdx> {
+		match &count.inner {
 			ast::ConstArgument::Infer => None,
 			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
 				Some(self.body.push(
@@ -687,22 +737,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					Err(error) => error,
 				})
 			}
-		};
-		let of = self.body.ty(value);
-		let length = match count {
-			None => TypeIndex::INFER,
-			Some(count) => self.repeat_length(count),
-		};
-		let ty = if length == TypeIndex::ERROR {
-			TypeIndex::ERROR
-		} else {
-			self.cx.types.intern(Type::Array { of, length })
-		};
-		let expr =
-			self.body
-				.push(ExprKind::ArrayRepeat { value, count }, ty, span);
-		self.body.push_static(expr);
-		expr
+		}
 	}
 
 	/// A repeat's `count` as a length: a `Value`, or the `Const` it names.
@@ -813,9 +848,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> ExprIdx {
 		if let [segment] = segments
 			&& segment.type_args.is_empty()
-			&& let Some(local) = self.lookup_local(segment.ident.inner)
+			&& let Some((local, reach)) = self.lookup_local(segment.ident.inner)
 		{
 			self.record_local(local, segment.ident.span);
+			if reach == LocalReach::BehindStatic {
+				self.report_local_in_static_data(span);
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			}
 			let ty = self.body.local(local).ty;
 			return self.body.push(ExprKind::Local(local), ty, span);
 		}
@@ -984,14 +1023,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	/// The local `name` refers to from the current scope: declared in it or in
-	/// a scope around it.
-	fn lookup_local(&self, name: SymbolU32) -> Option<LocalIdx> {
+	/// a scope around it, and whether it lies past static data the name is
+	/// written in.
+	fn lookup_local(&self, name: SymbolU32) -> Option<(LocalIdx, LocalReach)> {
+		let mut reach = LocalReach::Visible;
 		let mut scope = Some(self.current);
 		while let Some(at) = scope {
 			if let Some(&local) = self.lookup.get(&(at, name)) {
-				return Some(local);
+				return Some((local, reach));
 			}
-			scope = self.body.scope(at).parent;
+			let scope_data = self.body.scope(at);
+			if scope_data.kind == ScopeKind::Static {
+				reach = LocalReach::BehindStatic;
+			}
+			scope = scope_data.parent;
 		}
 		None
 	}
@@ -1489,6 +1534,22 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		})
 	}
 
+	fn report_local_in_static_data(&mut self, span: TextSpan) {
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::LocalInStaticData.code())
+				.with_message("a local variable cannot be used in static data")
+				.with_label(
+					Label::primary(self.scope.file_id, span)
+						.with_message("a runtime value"),
+				)
+				.with_note(
+					"a string or array literal is placed as data before the \
+					 program runs, so its elements are constant expressions",
+				),
+		);
+	}
+
 	fn report_struct_used_as_value(&mut self, name: SymbolU32, span: TextSpan) {
 		let name = self.cx.strings.resolve(name).unwrap();
 		self.cx.diagnostics.push(
@@ -1787,7 +1848,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		};
 		// Data not placed in a memory has no operators of its own.
 		if self.cx.types.is_unplaced(live_ty) {
-			let live = if left_ty == TypeIndex::NEVER { rhs } else { lhs };
+			let live = if left_ty == TypeIndex::NEVER {
+				rhs
+			} else {
+				lhs
+			};
 			return self.report_operator_on_literal(
 				op.inner.as_str(),
 				live,
@@ -5025,6 +5090,52 @@ mod tests {
 		]);
 	}
 
+	/// A literal's elements are constant expressions: a local of the function
+	/// is found (it still shadows an item) and reported, and a local declared
+	/// inside the literal is the evaluator's to reject, with the block holding
+	/// it.
+	#[test]
+	fn a_local_cannot_be_used_in_static_data() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const x: u8 = 5;
+				func param(x: u8) -> heap::&[u8] { [x, 1] }
+				func declared() -> heap::&[u8] { local y: u8 = 1; [y] }
+				func inner() -> heap::&[u8] { [block { local z: u8 = 1; z }] }
+				func outside(x: u8) -> heap::&[u8; 2] { [0; 2] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::LocalInStaticData,
+			DiagnosticCode::LocalInStaticData,
+			DiagnosticCode::NotConstEvaluatable,
+		]);
+	}
+
+	/// A function's static data is evaluated when the function is checked, so
+	/// what fails in it is reported by `wx check`; a generic function's is
+	/// evaluated per instance, where it is lowered.
+	#[test]
+	fn static_data_is_evaluated_when_its_function_is_checked() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				func one() -> u8 { 1 }
+				func call() -> heap::&[u8] { [one(), 1] }
+				func overflow() -> heap::&[u8] { [200 + 100] }
+				func nested() -> heap::&[heap::&[u8]] { [[one()]] }
+				func generic<T>() -> heap::&[u8] { [one()] }
+				func fine() -> heap::&[u16] { [1, 2 + 3, 4] }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotConstEvaluatable,
+			DiagnosticCode::ConstEvaluationFailed,
+			DiagnosticCode::NotConstEvaluatable,
+		]);
+	}
+
 	#[test]
 	fn a_body_records_its_string_literals_as_static_data() {
 		test_case!(
@@ -7997,6 +8108,37 @@ mod tests {
 			 (local r#4 (.& ([] (* (load ([] (* m#2) 0))) 1))))"
 		);
 		assert_eq!(case.shape("g"), "(block => (load ([] (* s#0) i#1)))");
+	}
+
+	/// An array place is indexed where it is, as a struct place's field is
+	/// read: `h.data[i]` through the pointer `h`, writable when `h` is
+	/// exclusive. `s.*[i]` is the same element as `s[i]`.
+	#[test]
+	fn an_array_place_is_indexed_in_place() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct Header(len: u32, data: [u8; 4]);
+				func f(h: heap::*Header, s: heap::&[u8], m: heap::&[[u8; 2]]) {
+					h.data[1] = 5;
+					local a: u8 = s.*[0];
+					local b: u8 = m[1][0];
+				}
+				func g(h: heap::&Header) { h.data[0] = 1; }
+				func k(h: heap::&Header) { local x = h.len[0]; }
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::CannotIndex,
+		]);
+		assert_eq!(
+			case.shape("f"),
+			"(block \
+			 (store ([] (. (* h#0) data) 1) 5) \
+			 (local a#3 (load ([] (* s#1) 0))) \
+			 (local b#4 (load ([] ([] (* m#2) 1) 0))))"
+		);
 	}
 
 	#[test]

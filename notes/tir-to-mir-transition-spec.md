@@ -422,17 +422,11 @@ ordered, and typed memory handles never become integer indices in WX code.
 
 ### Constants, globals, data, and intrinsics
 
-- The new constant evaluator stores declaration-order `ConstValue` scalars
-  and `Allocation`s with byte relocations. MIR/static-data output must carry
-  enough relocation information to resolve allocation addresses after final
-  per-memory data placement. The old `StaticEntry` contains only bytes and
-  alignment, so it cannot represent every new evaluator allocation.
-- `Memory::INDEX` and `Memory::DATA_END` are trait associated constants, not
-  free `crate` parameters. Their values depend on final Wasm memory numbering
-  and static-data placement. They need explicit late-bound MIR constants or
-  relocations. The current checker test for `DATA_END` establishes resolution
-  and typing, not a finalized emitted value. This must be specified before
-  the static-data/global-initializer slice.
+- Static data and `Memory::DATA_END`: implemented (2026-11-04), see
+  `notes/static-data.md`. Evaluator allocations become MIR static entries
+  with relocations (to an entry or a memory's data end), laid out and
+  patched by codegen; `DATA_END` is a late-bound address resolved there.
+  `Memory::INDEX` is not declared by std and is not planned.
 - `global_bodies` are checked expression bodies, including general
   expressions. Evaluate every defined global initializer at compile time,
   whether the global is mutable or immutable. Reuse the constant evaluator's

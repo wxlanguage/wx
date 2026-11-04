@@ -244,16 +244,17 @@ impl<'mir> Builder<'mir> {
 			}
 
 			// ── Constants / refs ─────────────────────────────────────────
-			ExprKind::StaticPointer { data_index } => {
+			ExprKind::StaticPointer { entry, offset } => {
 				let node = self.node(DataNodeKind::StaticDataRef {
-					data_index,
+					entry,
+					offset,
 					ty: ScalarType::try_from(ty)
 						.expect("static pointer must be scalar"),
 				});
 				StackResult::Value(node)
 			}
-			ExprKind::MemoryOffset { memory } => {
-				let node = self.node(DataNodeKind::MemoryOffset {
+			ExprKind::DataEnd { memory } => {
+				let node = self.node(DataNodeKind::DataEnd {
 					memory,
 					ty: ScalarType::try_from(ty)
 						.expect("memory offset must be scalar"),

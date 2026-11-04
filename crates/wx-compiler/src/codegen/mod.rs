@@ -197,15 +197,125 @@ pub struct WasmModule {
 struct MemoryEntry {
 	wasm_index: u32,
 	kind: mir::MemoryKind,
-	/// Total size (bytes) of this memory's static data segment.
-	static_size: u32,
+}
+
+/// The static data codegen lays out: each memory's segment bytes, each live
+/// entry's address in its memory, and where each memory's data ends.
+struct StaticLayout {
+	segments: HashMap<mir::MemoryId, Vec<u8>>,
+	addresses: HashMap<mir::StaticEntryId, u32>,
+}
+
+/// How `Memory::DATA_END` is aligned: past the static data, at an address
+/// any value's alignment divides, so an allocator can start there.
+const DATA_END_ALIGN: u32 = 16;
+
+impl StaticLayout {
+	/// The address right after `memory`'s static data (`Memory::DATA_END`).
+	fn data_end(&self, memory: mir::MemoryId) -> u32 {
+		let size = self.segments.get(&memory).map_or(0, Vec::len);
+		u32::try_from(size)
+			.unwrap()
+			.next_multiple_of(DATA_END_ALIGN)
+	}
+
+	fn address(&self, target: mir::AddressTarget) -> u32 {
+		match target {
+			mir::AddressTarget::Entry(entry) => self.addresses[&entry],
+			mir::AddressTarget::DataEnd(memory) => self.data_end(memory),
+		}
+	}
+}
+
+/// The memory an address into `target` belongs to.
+fn target_memory(mir: &mir::MIR, target: mir::AddressTarget) -> mir::MemoryId {
+	match target {
+		mir::AddressTarget::Entry(entry) => {
+			mir.static_entries[usize::from(entry)].memory
+		}
+		mir::AddressTarget::DataEnd(memory) => memory,
+	}
+}
+
+/// Lays out the static entries something reaches, each memory's from
+/// address 0: the entries function bodies and global initializers point at,
+/// and every entry their relocations point at. Entries are placed largest
+/// alignment first (by id among equals, so the output is deterministic),
+/// then each relocation is patched with its target's address.
+fn lay_out_static_data(mir: &mir::MIR) -> StaticLayout {
+	let mut live = std::collections::HashSet::new();
+	let mut pending: Vec<mir::StaticEntryId> = (mir.functions.iter())
+		.filter_map(|function| function.code())
+		.flat_map(|code| code.static_data())
+		.chain(mir.globals.iter().filter_map(|global| {
+			match global.origin.defined()? {
+				mir::ConstInit::Static { entry, .. } => Some(*entry),
+				_ => None,
+			}
+		}))
+		.collect();
+	while let Some(entry) = pending.pop() {
+		if live.insert(entry) {
+			pending.extend(
+				(mir.static_entries[usize::from(entry)].relocations.iter())
+					.filter_map(|relocation| match relocation.target {
+						mir::AddressTarget::Entry(target) => Some(target),
+						mir::AddressTarget::DataEnd(_) => None,
+					}),
+			);
+		}
+	}
+	let mut order: Vec<mir::StaticEntryId> = live.into_iter().collect();
+	order.sort_by_key(|&entry| {
+		(
+			std::cmp::Reverse(mir.static_entries[usize::from(entry)].align),
+			usize::from(entry),
+		)
+	});
+
+	let mut layout = StaticLayout {
+		segments: HashMap::new(),
+		addresses: HashMap::new(),
+	};
+	for &entry in &order {
+		let data = &mir.static_entries[usize::from(entry)];
+		let bytes = layout.segments.entry(data.memory).or_default();
+		bytes.resize(bytes.len().next_multiple_of(data.align as usize), 0);
+		layout
+			.addresses
+			.insert(entry, u32::try_from(bytes.len()).unwrap());
+		bytes.extend_from_slice(&data.bytes);
+	}
+	let mut patches = Vec::new();
+	for &entry in &order {
+		let data = &mir.static_entries[usize::from(entry)];
+		let base = layout.addresses[&entry] as usize;
+		for relocation in &data.relocations {
+			let memory = target_memory(mir, relocation.target);
+			let width = mir.memory(memory).kind.pointer_size() as usize;
+			patches.push((
+				data.memory,
+				base + relocation.offset as usize,
+				width,
+				layout.address(relocation.target),
+			));
+		}
+	}
+	for (memory, at, width, address) in patches {
+		let bytes = layout.segments.get_mut(&memory).unwrap();
+		let at = &mut bytes[at..][..width];
+		let mut number = [0; 8];
+		number[..width].copy_from_slice(at);
+		let patched = u64::from_le_bytes(number) + u64::from(address);
+		at.copy_from_slice(&patched.to_le_bytes()[..width]);
+	}
+	layout
 }
 
 pub struct Builder {
 	table: Vec<FuncIndex>,
-	/// Byte offset of each live static entry in the assembled data segment.
-	/// Keyed by `MIR.static_entries` index.
-	entry_offsets: HashMap<u32, u32>,
+	/// The address of each live static entry in its memory.
+	statics: StaticLayout,
 	/// Maps every function DefId (imported or defined) to its wasm function
 	/// index. Imported functions occupy indices 0..import_func_count;
 	/// defined functions follow.
@@ -251,37 +361,11 @@ impl Builder {
 		mir: &mir::MIR,
 		interner: &ast::StringInterner,
 	) -> Result<WasmModule, ()> {
-		// Layout static data segment: collect live entries from all functions,
-		// sort largest-align-first for minimal padding, then lay out bytes.
-		let live_indices: std::collections::HashSet<u32> = mir
-			.functions
-			.iter()
-			.filter_map(|f| f.code())
-			.flat_map(|code| code.static_data())
-			.collect();
-		let mut sorted_indices: Vec<u32> = live_indices.into_iter().collect();
-		sorted_indices.sort_by(|&a, &b| {
-			mir.static_entries[b as usize]
-				.align
-				.cmp(&mir.static_entries[a as usize].align)
-		});
-		// One segment per memory that has static data; an entry's offset is
-		// relative to its own memory's segment.
-		let mut segment_bytes: HashMap<mir::MemoryId, Vec<u8>> = HashMap::new();
-		let mut entry_offsets: HashMap<u32, u32> = HashMap::new();
-		for idx in sorted_indices {
-			let entry = &mir.static_entries[idx as usize];
-			let bytes = segment_bytes.entry(entry.memory).or_default();
-			let current = bytes.len() as u32;
-			let aligned = current.next_multiple_of(entry.align);
-			bytes.extend(std::iter::repeat_n(0, (aligned - current) as usize));
-			entry_offsets.insert(idx, bytes.len() as u32);
-			bytes.extend_from_slice(&entry.bytes);
-		}
+		let statics = lay_out_static_data(mir);
 
 		let mut builder = Builder {
 			table: Vec::new(),
-			entry_offsets,
+			statics,
 			func_wasm_index: HashMap::new(),
 			global_wasm_index: HashMap::new(),
 			memories: HashMap::new(),
@@ -351,9 +435,6 @@ impl Builder {
 						MemoryEntry {
 							wasm_index: index,
 							kind: mir.memory(id).kind,
-							static_size: segment_bytes
-								.get(&id)
-								.map_or(0, |b| b.len() as u32),
 						},
 					);
 				}
@@ -378,9 +459,6 @@ impl Builder {
 					MemoryEntry {
 						wasm_index: next_memory_idx,
 						kind: memory.kind,
-						static_size: segment_bytes
-							.get(&memory.id)
-							.map_or(0, |b| b.len() as u32),
 					},
 				);
 				next_memory_idx += 1;
@@ -455,6 +533,30 @@ impl Builder {
 						(mir::ConstInit::Float(v), ScalarType::F64) => {
 							wasm::Instruction::F64Const(v)
 						}
+						(
+							mir::ConstInit::Static { entry, offset },
+							ScalarType::I32,
+						) => wasm::Instruction::I32Const(
+							(builder.statics.addresses[&entry] + offset) as i32,
+						),
+						(
+							mir::ConstInit::Static { entry, offset },
+							ScalarType::I64,
+						) => wasm::Instruction::I64Const(i64::from(
+							builder.statics.addresses[&entry] + offset,
+						)),
+						(
+							mir::ConstInit::DataEnd { memory },
+							ScalarType::I32,
+						) => wasm::Instruction::I32Const(
+							builder.statics.data_end(memory) as i32,
+						),
+						(
+							mir::ConstInit::DataEnd { memory },
+							ScalarType::I64,
+						) => wasm::Instruction::I64Const(i64::from(
+							builder.statics.data_end(memory),
+						)),
 						_ => unreachable!(),
 					};
 					Some(Global {
@@ -482,7 +584,7 @@ impl Builder {
 			.map(|info| {
 				memory_type(
 					info,
-					builder.memories[&info.id].static_size.div_ceil(65536),
+					builder.statics.data_end(info.id).div_ceil(65536),
 				)
 			})
 			.collect();
@@ -504,16 +606,17 @@ impl Builder {
 			},
 			data: DataSection {
 				segments: {
-					let mut segments: Vec<DataSegment> = segment_bytes
-						.into_iter()
-						.filter(|(_, bytes)| !bytes.is_empty())
-						.map(|(id, bytes)| DataSegment {
-							memory_index: builder.memories[&id].wasm_index,
-							offset: 0,
-							memory_kind: builder.memories[&id].kind,
-							bytes: bytes.into_boxed_slice(),
-						})
-						.collect();
+					let mut segments: Vec<DataSegment> =
+						std::mem::take(&mut builder.statics.segments)
+							.into_iter()
+							.filter(|(_, bytes)| !bytes.is_empty())
+							.map(|(id, bytes)| DataSegment {
+								memory_index: builder.memories[&id].wasm_index,
+								offset: 0,
+								memory_kind: builder.memories[&id].kind,
+								bytes: bytes.into_boxed_slice(),
+							})
+							.collect();
 					segments.sort_by_key(|s| s.memory_index);
 					segments.into_boxed_slice()
 				},
@@ -946,8 +1049,8 @@ impl Builder {
 				sink.push(Instruction::I32Const as u8);
 				table_idx.encode(sink);
 			}
-			SI::StaticDataPointer { data_index, ty } => {
-				let offset = self.entry_offsets[&data_index];
+			SI::StaticDataPointer { entry, offset, ty } => {
+				let offset = self.statics.addresses[&entry] + offset;
 				match ty {
 					crate::opt::ScalarType::I64 => {
 						sink.push(Instruction::I64Const as u8);
@@ -959,16 +1062,16 @@ impl Builder {
 					}
 				}
 			}
-			SI::DataSectionEnd { memory } => {
+			SI::DataEnd { memory } => {
 				let entry = &self.memories[&memory];
 				match entry.kind {
 					mir::MemoryKind::Memory32 => {
 						sink.push(Instruction::I32Const as u8);
-						(entry.static_size as i32).encode(sink);
+						(self.statics.data_end(memory) as i32).encode(sink);
 					}
 					mir::MemoryKind::Memory64 => {
 						sink.push(Instruction::I64Const as u8);
-						(entry.static_size as i64).encode(sink);
+						(i64::from(self.statics.data_end(memory))).encode(sink);
 					}
 				}
 			}
@@ -1217,6 +1320,24 @@ trait Encode {
 	fn encode(&self, sink: &mut Vec<u8>);
 }
 
+/// A `memarg`: the alignment, then the offset. Memory 0 is implied; any
+/// other is written between them, flagged by bit 6 of the alignment
+/// (multi-memory).
+fn encode_memarg(
+	align: u32,
+	offset: u32,
+	memory_index: u32,
+	sink: &mut Vec<u8>,
+) {
+	if memory_index == 0 {
+		align.encode(sink);
+	} else {
+		(align | 0x40).encode(sink);
+		memory_index.encode(sink);
+	}
+	offset.encode(sink);
+}
+
 fn encode_load(
 	opcode: Instruction,
 	align: u32,
@@ -1225,11 +1346,7 @@ fn encode_load(
 	sink: &mut Vec<u8>,
 ) {
 	sink.push(opcode as u8);
-	align.encode(sink);
-	offset.encode(sink);
-	if memory_index > 0 {
-		memory_index.encode(sink);
-	}
+	encode_memarg(align, offset, memory_index, sink);
 }
 
 fn encode_store(
@@ -1240,11 +1357,7 @@ fn encode_store(
 	sink: &mut Vec<u8>,
 ) {
 	sink.push(opcode as u8);
-	align.encode(sink);
-	offset.encode(sink);
-	if memory_index > 0 {
-		memory_index.encode(sink);
-	}
+	encode_memarg(align, offset, memory_index, sink);
 }
 
 impl Encode for i32 {

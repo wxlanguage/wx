@@ -286,7 +286,7 @@ fn mark_node_inputs_live(
 		| DataNodeKind::TrappingResult { .. }
 		| DataNodeKind::FunctionRef { .. }
 		| DataNodeKind::StaticDataRef { .. }
-		| DataNodeKind::MemoryOffset { .. }
+		| DataNodeKind::DataEnd { .. }
 		| DataNodeKind::MemoryIndex { .. }
 		| DataNodeKind::MemorySizeResult { .. }
 		| DataNodeKind::AggregateCallResult { .. }

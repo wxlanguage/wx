@@ -304,15 +304,16 @@ pub enum Instruction {
 	/// A function referenced as a value; the encoder pushes it into the
 	/// function table and emits `i32.const <table_index>`.
 	FunctionPointer(mir::FunctionId),
-	/// End of the static data section for a given memory (base of writable
-	/// heap); the encoder emits `i32.const <data_section_end>`.
-	DataSectionEnd {
+	/// The address right after a memory's static data; the encoder emits a
+	/// constant as wide as the memory's addresses.
+	DataEnd {
 		memory: mir::MemoryId,
 	},
-	/// A static array; the encoder resolves the index to a byte offset in the
-	/// data segment and emits `i32.const <byte_offset>`.
+	/// The address `offset` bytes into a static entry; the encoder adds the
+	/// entry's address and emits a constant of `ty`.
 	StaticDataPointer {
-		data_index: u32,
+		entry: mir::StaticEntryId,
+		offset: u32,
 		ty: ScalarType,
 	},
 }

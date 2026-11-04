@@ -205,21 +205,42 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 	}
 
-	/// `object[index]`: an element of the slice or array `object` points at, so
-	/// `object.*[index]`, in the pointer's memory and writable when it is
-	/// exclusive. The index is the memory's `Size`. The object is a pointer
-	/// to a slice, an array, or a type assumed `Slice`; a pointer to that
-	/// pointer is not gone through, since the element is already one pointer
-	/// away (`x.*[i]`).
+	/// `object[index]`: an element of a slice or an array, as `object.field`
+	/// is a field of a struct. A place of a slice or an array is indexed where
+	/// it is (`h.data[i]`); an object that is a pointer to one is gone
+	/// through once (`s[i]` is `s.*[i]`), and a pointer to that pointer is
+	/// not. The element is in its sequence's memory, writable when the
+	/// sequence is, and the index is that memory's `Size`.
 	fn build_index(
 		&mut self,
 		object: &Spanned<ast::Expression>,
 		index: &Spanned<ast::Expression>,
 		span: TextSpan,
 	) -> Operand {
-		let pointer = self.build(object, TypeIndex::INFER);
-		let Some((sequence, element, memory, ownership)) =
-			self.indexed_slice(pointer)
+		let object_span = object.span;
+		let object = match self.build_operand(object) {
+			Operand::Place(place) => {
+				let ty = self.body.place(place).ty;
+				let ty = self.normalized(ty, self.scope.assumption_env);
+				match *self.cx.types.resolve(ty) {
+					Type::Pointer { .. } => Some(self.load(place)),
+					_ => match self.sequence_element(ty, object_span) {
+						Ok(Some(element)) => {
+							return self
+								.build_element(place, element, index, span);
+						}
+						Ok(None) => {
+							self.report_cannot_index(ty, object_span, None);
+							None
+						}
+						Err(()) => None,
+					},
+				}
+			}
+			Operand::Value(value) => Some(value),
+		};
+		let Some((pointer, (to, element, memory, ownership))) = object
+			.and_then(|pointer| Some((pointer, self.indexed_slice(pointer)?)))
 		else {
 			self.build(index, TypeIndex::ERROR);
 			return Operand::Value(self.body.push(
@@ -228,18 +249,34 @@ impl BodyContext<'_, '_, '_, '_> {
 				span,
 			));
 		};
-		let size = self.memory_size(memory);
-		let index = self.check(index, size);
-		let mutable = ownership == Ownership::Exclusive;
-		let object = self.body.push_place(Place {
+		let sequence = self.body.push_place(Place {
 			kind: PlaceKind::Deref { pointer },
-			ty: sequence,
+			ty: to,
 			memory,
-			mutable,
+			mutable: ownership == Ownership::Exclusive,
 			span: self.body.span(pointer),
 		});
+		self.build_element(sequence, element, index, span)
+	}
+
+	/// `sequence[index]`, `element` the sequence's element type.
+	fn build_element(
+		&mut self,
+		sequence: PlaceIdx,
+		element: TypeIndex,
+		index: &Spanned<ast::Expression>,
+		span: TextSpan,
+	) -> Operand {
+		let Place {
+			memory, mutable, ..
+		} = *self.body.place(sequence);
+		let size = self.memory_size(memory);
+		let index = self.check(index, size);
 		Operand::Place(self.body.push_place(Place {
-			kind: PlaceKind::Element { object, index },
+			kind: PlaceKind::Element {
+				object: sequence,
+				index,
+			},
 			ty: element,
 			memory,
 			mutable,
@@ -264,50 +301,74 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let ty = self.normalized(ty, self.scope.assumption_env);
 		let span = self.body.span(pointer);
-		let found = match *self.cx.types.resolve(ty) {
-			Type::Pointer {
-				to,
-				memory,
-				ownership,
-			} => match *self.cx.types.resolve(to) {
-				Type::Slice { of } | Type::Array { of, .. } => {
-					return Some((to, of, memory, ownership));
-				}
-				Type::Error => return None,
-				Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-					let intrinsics = &self.cx.defs.intrinsics;
-					let slice = intrinsics.slice.expect("std declares `Slice`");
-					let value = intrinsics
-						.slice_value
-						.expect("`Slice` declares `Value`");
-					if self.implements(to, slice, span)? {
-						let element =
-							self.cx.types.intern(Type::TypeProjection {
-								trait_index: slice,
-								assoc_type_index: value,
-								base: to,
-							});
-						let element =
-							self.normalized(element, self.scope.assumption_env);
-						return Some((to, element, memory, ownership));
-					}
-					Some(to)
-				}
-				_ => Some(to),
-			},
-			_ => None,
+		let Type::Pointer {
+			to,
+			memory,
+			ownership,
+		} = *self.cx.types.resolve(ty)
+		else {
+			self.report_cannot_index(ty, span, None);
+			return None;
 		};
+		match self.sequence_element(to, span) {
+			Ok(Some(element)) => Some((to, element, memory, ownership)),
+			Ok(None) => {
+				self.report_cannot_index(ty, span, Some(to));
+				None
+			}
+			Err(()) => None,
+		}
+	}
+
+	/// The element type of `ty` (normalized) when it is a slice, an array,
+	/// or a type assumed `Slice`; `Ok(None)` when it is none of them, and
+	/// `Err` when it is an error or the solver could not say (reported).
+	fn sequence_element(
+		&mut self,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> Result<Option<TypeIndex>, ()> {
+		match *self.cx.types.resolve(ty) {
+			Type::Slice { of } | Type::Array { of, .. } => Ok(Some(of)),
+			Type::Error => Err(()),
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				let intrinsics = &self.cx.defs.intrinsics;
+				let slice = intrinsics.slice.expect("std declares `Slice`");
+				let value =
+					intrinsics.slice_value.expect("`Slice` declares `Value`");
+				if !self.implements(ty, slice, span).ok_or(())? {
+					return Ok(None);
+				}
+				let element = self.cx.types.intern(Type::TypeProjection {
+					trait_index: slice,
+					assoc_type_index: value,
+					base: ty,
+				});
+				Ok(Some(self.normalized(element, self.scope.assumption_env)))
+			}
+			_ => Ok(None),
+		}
+	}
+
+	/// E2125 for an object of type `ty` at `span`; `pointee` is what a
+	/// pointer object points at, to say when it is one pointer too many.
+	fn report_cannot_index(
+		&mut self,
+		ty: TypeIndex,
+		span: TextSpan,
+		pointee: Option<TypeIndex>,
+	) {
 		let found_ty = self.cx.type_formatter().display_type(ty);
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CannotIndex.code())
 			.with_message(format!("type `{found_ty}` cannot be indexed"))
 			.with_label(
-				self.source_span(pointer)
-					.primary_label()
-					.with_message("not a pointer to a slice or an array"),
+				Label::primary(self.scope.file_id, span).with_message(
+					"not a slice or an array, or a pointer to one",
+				),
 			);
 		// A pointer to a pointer to a slice: one step too far.
-		if let Some(to) = found
+		if let Some(to) = pointee
 			&& let Type::Pointer { to, .. } = *self.cx.types.resolve(to)
 			&& matches!(
 				self.cx.types.resolve(to),
@@ -319,7 +380,6 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 		}
 		self.cx.diagnostics.push(diagnostic);
-		None
 	}
 
 	/// Whether `ty` has `trait_index` here. `None` when the solver cannot

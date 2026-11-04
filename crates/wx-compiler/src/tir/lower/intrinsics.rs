@@ -1,8 +1,8 @@
 //! Expand compiler-provided function implementations, never source names.
 
 use super::{Body, ExprIdx, FunctionInstance, FunctionState, Lowerer, mir};
-use crate::tir::intrinsics::Intrinsic;
 use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::intrinsics::Intrinsic;
 use crate::tir::types::Type;
 
 impl Lowerer<'_, '_, '_, '_> {
@@ -22,8 +22,9 @@ impl Lowerer<'_, '_, '_, '_> {
 			let [value_type, _] = *self.context.types.list(callee.args) else {
 				unreachable!("`size_of` and `align_of` take `T` and `Mem`")
 			};
-			let Ok(Some(layout)) =
-				self.context.memory_layout(AssumptionEnvIdx::ROOT, value_type)
+			let Ok(Some(layout)) = self
+				.context
+				.memory_layout(AssumptionEnvIdx::ROOT, value_type)
 			else {
 				self.unsupported(
 					state.file_id,

@@ -36,10 +36,12 @@ use string_interner::symbol::SymbolU32;
 
 use super::body::{
 	Body, ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange,
+	FunctionImplementation,
 };
 use super::bounds::AssumptionEnvIdx;
 use super::defs::{
-	ConstIdx, EnumIdx, GlobalIdx, MemberKind, MemberOwner, MemoryIdx,
+	ConstIdx, EnumIdx, FunctionIdx, GlobalIdx, MemberKind, MemberOwner,
+	MemoryIdx,
 };
 use super::layout::Primitive;
 use super::members::{TraitImplLookup, TraitMemberSelection};
@@ -72,6 +74,22 @@ pub(super) enum Val {
 		alloc: AllocIdx,
 		offset: u64,
 	},
+	/// `Memory::DATA_END`: the address right after `memory`'s static data,
+	/// known once the program's data is laid out. As wide as the memory's
+	/// `Size`.
+	DataEnd {
+		memory: MemoryIdx,
+	},
+}
+
+/// What an address written in an allocation's bytes points at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum AddressTarget {
+	/// The bytes hold the offset into the allocation.
+	Allocation(AllocIdx),
+	/// The memory's data end; the bytes hold zero.
+	DataEnd(MemoryIdx),
 }
 
 /// Bytes a constant's value points into, placed in `memory`'s data when
@@ -83,10 +101,9 @@ pub(super) struct Allocation {
 	pub(super) memory: MemoryIdx,
 	pub(super) align: u32,
 	pub(super) bytes: Box<[u8]>,
-	/// The addresses written in `bytes`, sorted by offset: the address at
-	/// each offset points into that allocation, and the bytes there hold the
-	/// offset into it.
-	pub(super) relocations: Box<[(u32, AllocIdx)]>,
+	/// The addresses written in `bytes`, sorted by offset, with what each
+	/// points at.
+	pub(super) relocations: Box<[(u32, AddressTarget)]>,
 }
 
 /// One number of a constant's value: a Wasm number and the scalar it means.
@@ -184,7 +201,8 @@ pub(super) fn value_bits(value: &[ConstScalar]) -> Option<u64> {
 			Val::F32(_)
 			| Val::F64(_)
 			| Val::V128(_)
-			| Val::MemoryOffset { .. } => None,
+			| Val::MemoryOffset { .. }
+			| Val::DataEnd { .. } => None,
 		},
 		_ => None,
 	}
@@ -227,6 +245,18 @@ impl Instance {
 	}
 }
 
+/// One piece of a function body's static data (a string or array literal,
+/// or a constant holding data in no memory, placed) for one instance of the
+/// function: its arguments are interned as the function's item type's, so
+/// equal instances are equal.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) struct StaticInstance {
+	function: FunctionIdx,
+	args: TypeList,
+	expr: ExprIdx,
+}
+
 /// The body evaluated, with its instance's arguments.
 #[derive(Clone, Copy)]
 struct Owner<'a> {
@@ -234,12 +264,14 @@ struct Owner<'a> {
 	args: &'a [TypeIndex],
 }
 
-/// Whose body is evaluated: a constant's, or a global's initializer, which
-/// must be a constant expression and has no parameters.
+/// Whose body is evaluated: a constant's, a global's initializer, which
+/// must be a constant expression and has no parameters, or a function's,
+/// of which only static data is.
 #[derive(Clone, Copy)]
 enum Evaluated {
 	Constant(ConstIdx),
 	Global(GlobalIdx),
+	Function(FunctionIdx),
 }
 
 /// What a constant named with arguments reads.
@@ -248,6 +280,9 @@ pub(super) enum ResolvedConstant {
 	Instance(Instance),
 	/// `Array::SIZE`: the array type's length.
 	Length(TypeIndex),
+	/// `Memory::DATA_END` of a declared memory, which its synthetic impl
+	/// does not hold: it is known once the program's data is laid out.
+	DataEnd(MemoryIdx),
 	/// A trait's declaration whose `Self` is not known here.
 	Abstract,
 }
@@ -268,6 +303,12 @@ fn body_of<'a>(
 			[usize::from(global_index)]
 		.as_ref()
 		.expect("an evaluated global's body is built"),
+		Evaluated::Function(function_index) => {
+			match &view.function_implementations[usize::from(function_index)] {
+				FunctionImplementation::Defined(body) => body,
+				_ => unreachable!("an evaluated function's body is checked"),
+			}
+		}
 	}
 }
 
@@ -278,6 +319,9 @@ fn body_env(view: &TypeContext<'_, '_, '_>, owner: Owner<'_>) -> GenericEnvIdx {
 			view.constants[usize::from(const_index)].env
 		}
 		Evaluated::Global(_) => GenericEnvIdx::ROOT,
+		Evaluated::Function(function_index) => {
+			view.functions[usize::from(function_index)].type_params
+		}
 	}
 }
 
@@ -292,6 +336,9 @@ fn body_file(
 		}
 		Evaluated::Global(global_index) => {
 			view.defs.globals[usize::from(global_index)].file_id
+		}
+		Evaluated::Function(function_index) => {
+			view.defs.functions[usize::from(function_index)].file_id
 		}
 	}
 }
@@ -359,6 +406,90 @@ impl TypeContext<'_, '_, '_> {
 				let diagnostic =
 					self.report_global_failure(global_index, &error);
 				self.diagnostics.push(diagnostic);
+			}
+		}
+	}
+
+	/// The value of the static data `expr` of `function`'s body (one of
+	/// `Body::statics`) for the instance with the concrete `args`: placed, a
+	/// pointer to its data. Memoized per instance; a failure is reported by
+	/// the first reader and is `None` to every reader after it. The check
+	/// pass reads a function with no parameters, and lowering every instance,
+	/// so a failure that depends on the arguments is reported where the
+	/// instance is lowered.
+	pub(super) fn static_value(
+		&mut self,
+		function: FunctionIdx,
+		args: &[TypeIndex],
+		expr: ExprIdx,
+	) -> Option<&[ConstScalar]> {
+		let args = if args.is_empty() {
+			TypeList::EMPTY
+		} else {
+			let item = self.types.intern_function(function, args);
+			let Type::Function { type_args, .. } = *self.types.resolve(item)
+			else {
+				unreachable!("a function interns as a `Type::Function`")
+			};
+			type_args
+		};
+		let key = StaticInstance {
+			function,
+			args,
+			expr,
+		};
+		if !self.solver.static_values.contains_key(&key) {
+			let value = self.evaluate_static(key);
+			self.solver.static_values.insert(key, value);
+		}
+		self.solver.static_values[&key].as_deref()
+	}
+
+	/// Pushes the value of a function's static data `expr`; its failure is
+	/// its query's to report.
+	fn push_static_value(
+		&mut self,
+		function: FunctionIdx,
+		args: &[TypeIndex],
+		expr: ExprIdx,
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		let value = self
+			.static_value(function, args, expr)
+			.ok_or(Halt::Silent)?;
+		stack.extend_from_slice(value);
+		Ok(())
+	}
+
+	/// Evaluates `key`'s static data, reporting what fails in it.
+	fn evaluate_static(&mut self, key: StaticInstance) -> Option<ConstValue> {
+		let args: Box<[TypeIndex]> = self.types.list(key.args).into();
+		let owner = Owner {
+			body: Evaluated::Function(key.function),
+			args: &args,
+		};
+		let ty = self.instance_type(owner, body_of(self, owner).ty(key.expr));
+		let mut stack = Vec::new();
+		// Placed: a literal, or a constant holding one (`place_data`); not
+		// placed (an element of an enclosing array), only its elements.
+		let placed = match self.types.resolve(ty) {
+			Type::Error => return None,
+			Type::Pointer { .. } => true,
+			_ => false,
+		};
+		let result = if placed {
+			self.place_data(owner, key.expr, ty, &mut stack)
+		} else {
+			self.eval_static(owner, key.expr, ty, &mut stack)
+		};
+		match result {
+			Ok(()) => Some(stack.into_boxed_slice()),
+			Err(Halt::Silent) => None,
+			Err(Halt::Own(error)) => {
+				let file_id = body_file(self, owner);
+				let diagnostic = report_static_failure(file_id, &error);
+				self.diagnostics.push(diagnostic);
+				None
 			}
 		}
 	}
@@ -938,6 +1069,15 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::Function { .. }
 			| ExprKind::Global(_)
 			| ExprKind::Memory(_) => {}
+			// A function's static data is evaluated once per instance, by
+			// its query.
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. }
+				if let Evaluated::Function(function) = owner.body =>
+			{
+				self.push_static_value(function, owner.args, expr, stack)?;
+			}
 			ExprKind::String(_)
 			| ExprKind::Array { .. }
 			| ExprKind::ArrayRepeat { .. } => {
@@ -951,7 +1091,30 @@ impl TypeContext<'_, '_, '_> {
 						self.constants[usize::from(constant)].ty,
 					) =>
 			{
-				self.place_data(owner, expr, ty, stack)?;
+				if let Evaluated::Function(function) = owner.body {
+					self.push_static_value(function, owner.args, expr, stack)?;
+				} else {
+					self.place_data(owner, expr, ty, stack)?;
+				}
+			}
+			// Data in no memory has no value of its own; as an element of
+			// other data it is its elements, read from its body as each
+			// placed use reads it.
+			ExprKind::Const { constant, .. }
+				if self
+					.types
+					.is_unplaced(self.constants[usize::from(constant)].ty) =>
+			{
+				let root = match &self.const_bodies[usize::from(constant)] {
+					ConstBody::Built(body) => body.root(),
+					// Reported where the constant is.
+					_ => return Err(Halt::Silent),
+				};
+				let owner = Owner {
+					body: Evaluated::Constant(constant),
+					args: &[],
+				};
+				self.eval(owner, root, stack)?;
 			}
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
 			ExprKind::Const {
@@ -1108,8 +1271,9 @@ impl TypeContext<'_, '_, '_> {
 
 	/// A string or array literal `expr` of `owner`'s body as type `ty`:
 	/// placed (`ty` a pointer), its data is allocated and its pointer pushed.
-	/// Not placed (`ty` an array, a constant's), its elements are evaluated,
-	/// which reports what fails in them, and it holds no number of its own.
+	/// Not placed (`ty` an array: an element of other data, or a constant's
+	/// value), its elements' values are pushed, one element after another,
+	/// as the data holding it writes them in place.
 	fn eval_static(
 		&mut self,
 		owner: Owner<'_>,
@@ -1125,7 +1289,11 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::String(contents) if placed => {
 				self.eval_string(owner, contents, ty, span, stack)
 			}
-			ExprKind::String(_) => Ok(()),
+			ExprKind::String(contents) => {
+				let bytes = self.strings.resolve(contents).unwrap().as_bytes();
+				stack.extend(bytes.iter().map(|&byte| ConstScalar::u8(byte)));
+				Ok(())
+			}
 			// Each element's values, one after another, laid out as static
 			// data.
 			ExprKind::Array { elements } => {
@@ -1134,7 +1302,6 @@ impl TypeContext<'_, '_, '_> {
 					self.eval(owner, element, stack)?;
 				}
 				if !placed {
-					stack.truncate(start);
 					return Ok(());
 				}
 				let count = u64::try_from(elements.len()).unwrap();
@@ -1144,23 +1311,35 @@ impl TypeContext<'_, '_, '_> {
 			// array's own length.
 			ExprKind::ArrayRepeat { value, count } => {
 				self.eval(owner, value, stack)?;
-				if !placed {
-					stack.truncate(start);
-					return Ok(());
-				}
+				let array = if placed { self.static_pointee(ty) } else { ty };
 				let count = match count {
 					Some(count) => self.repeat_count(owner, count)?,
 					// As long as its array.
 					None => {
 						let Type::Array { length, .. } =
-							*self.types.resolve(self.static_pointee(ty))
+							*self.types.resolve(array)
 						else {
 							unreachable!("`_` is the length of an array")
 						};
 						self.length_value(owner, length)?
 					}
 				};
-				self.place_static(owner, ty, span, count, start, stack)
+				if placed {
+					return self
+						.place_static(owner, ty, span, count, start, stack);
+				}
+				// The one element's values, once per element.
+				let element = stack.split_off(start);
+				let count = usize::try_from(count).map_err(|_| {
+					Halt::Own(EvalError {
+						span,
+						kind: EvalErrorKind::TooLarge,
+					})
+				})?;
+				for _ in 0..count {
+					stack.extend_from_slice(&element);
+				}
+				Ok(())
 			}
 			_ => unreachable!("only a literal is static data"),
 		}
@@ -1231,8 +1410,7 @@ impl TypeContext<'_, '_, '_> {
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
 		let (layout, places) = match self.memory_values(
-			self.assumption_envs
-				.of_frame(body_env(self, owner)),
+			self.assumption_envs.of_frame(body_env(self, owner)),
 			of,
 		) {
 			Ok(Some(layout)) => layout,
@@ -1301,9 +1479,7 @@ impl TypeContext<'_, '_, '_> {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Scalar), Halt> {
-		let scope = self
-			.assumption_envs
-			.of_frame(body_env(self, owner));
+		let scope = self.assumption_envs.of_frame(body_env(self, owner));
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
 		};
@@ -1449,6 +1625,13 @@ impl TypeContext<'_, '_, '_> {
 						)) => ResolvedConstant::Instance(
 							self.instance(own, &impl_args),
 						),
+						_ if Some(constant)
+							== self.defs.intrinsics.memory_data_end
+							&& let Type::Memory { memory_index } =
+								*self.types.resolve(receiver) =>
+						{
+							ResolvedConstant::DataEnd(memory_index)
+						}
 						_ => ResolvedConstant::Instance(
 							self.instance(constant, args),
 						),
@@ -1518,6 +1701,19 @@ impl TypeContext<'_, '_, '_> {
 				stack.push(literal(length, false, scalar).expect(
 					"an array's length is representable as its memory's `Size`",
 				));
+				Ok(())
+			}
+			Ok(ResolvedConstant::DataEnd(memory)) => {
+				let memory_type = self.types.intern(Type::Memory {
+					memory_index: memory,
+				});
+				let scalar = self
+					.address_scalar(AssumptionEnvIdx::ROOT, memory_type)
+					.map_err(|_| Halt::Silent)?;
+				stack.push(ConstScalar {
+					val: Val::DataEnd { memory },
+					scalar,
+				});
 				Ok(())
 			}
 			Ok(ResolvedConstant::Abstract) => Err(Halt::Own(EvalError {
@@ -1744,6 +1940,31 @@ impl EvalErrorKind {
 	}
 }
 
+/// What fails in a function's static data, at the node that fails.
+fn report_static_failure(
+	file_id: crate::vfs::FileId,
+	error: &EvalError,
+) -> Diagnostic<crate::vfs::FileId> {
+	let message = match error.kind {
+		EvalErrorKind::NotConst => {
+			"static data cannot be evaluated at compile time"
+		}
+		_ => "evaluation of static data failed",
+	};
+	Diagnostic::error()
+		.with_code(error.kind.code().code())
+		.with_message(message)
+		.with_label(
+			SourceSpan::new(file_id, error.span)
+				.primary_label()
+				.with_message(error.kind.label()),
+		)
+		.with_note(
+			"a string or array literal is placed as data before the program \
+			 runs, so its elements are constant expressions",
+		)
+}
+
 impl ConstScalar {
 	pub(super) fn u8(value: u8) -> Self {
 		Self {
@@ -1953,7 +2174,7 @@ impl std::fmt::Display for ConstScalar {
 /// recorded as a relocation to its allocation.
 fn write_value(
 	bytes: &mut [u8],
-	relocations: &mut Vec<(u32, AllocIdx)>,
+	relocations: &mut Vec<(u32, AddressTarget)>,
 	base: u32,
 	value: &[ConstScalar],
 	places: &[(Primitive, u32)],
@@ -1966,8 +2187,12 @@ fn write_value(
 			Val::I64(bits) | Val::F64(bits) => u128::from(bits),
 			Val::V128(bits) => bits,
 			Val::MemoryOffset { alloc, offset } => {
-				relocations.push((at, alloc));
+				relocations.push((at, AddressTarget::Allocation(alloc)));
 				u128::from(offset)
+			}
+			Val::DataEnd { memory } => {
+				relocations.push((at, AddressTarget::DataEnd(memory)));
+				0
 			}
 		};
 		let size = primitive.size() as usize;
@@ -2802,6 +3027,29 @@ mod tests {
 		assert_eq!(case.pointee(*address).0.memory, case.memory("wide"));
 	}
 
+	/// `Memory::DATA_END` is known once the program's data is laid out: its
+	/// value is the memory's data end, as wide as the memory's addresses.
+	#[test]
+	fn data_end_is_a_late_bound_address() {
+		test_case!(
+			case = indoc! {r#"
+				memory wide: u64;
+				const END: wide::*u8 = wide::DATA_END;
+			"#}
+		);
+		case.diagnostics().assert_none();
+		let [end] = case.value("END") else {
+			panic!("expected one value");
+		};
+		assert_eq!(
+			end.val,
+			Val::DataEnd {
+				memory: case.memory("wide")
+			}
+		);
+		assert_eq!(end.scalar, Scalar::U64);
+	}
+
 	#[test]
 	fn a_constant_naming_another_shares_its_allocation() {
 		test_case!(
@@ -2943,7 +3191,11 @@ mod tests {
 				.map(|&(offset, _)| offset)
 				.collect();
 			assert_eq!(offsets, [0, 8], "{name}");
-			for (&(_, alloc), contents) in outer.relocations.iter().zip(inner) {
+			for (&(_, target), contents) in outer.relocations.iter().zip(inner)
+			{
+				let AddressTarget::Allocation(alloc) = target else {
+					panic!("expected an address into an allocation");
+				};
 				assert_eq!(
 					&*case.context.solver.allocations[usize::from(alloc)].bytes,
 					contents,

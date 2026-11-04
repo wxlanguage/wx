@@ -24,7 +24,10 @@ use super::defs::{
 	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
 	TraitImplIdx,
 };
-use super::eval::{Allocation, ConstValueState, Instance, ResolvedConstant};
+use super::eval::{
+	Allocation, ConstValue, ConstValueState, Instance, ResolvedConstant,
+	StaticInstance,
+};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::layout::Layouts;
 use super::literals::UntypedValue;
@@ -499,6 +502,9 @@ pub(super) struct Solver {
 	pub(super) instance_values: FxHashMap<Instance, ConstValueState>,
 	/// The bytes constant values point into, by `AllocIdx` (`eval.rs`).
 	pub(super) allocations: Vec<Allocation>,
+	/// The value of each piece of a function's static data evaluated, per
+	/// instance; `None` once its failure is reported (`static_value`).
+	pub(super) static_values: FxHashMap<StaticInstance, Option<ConstValue>>,
 }
 
 impl Solver {
@@ -518,6 +524,7 @@ impl Solver {
 			const_values: vec![ConstValueState::Unchecked; constant_count],
 			instance_values: FxHashMap::default(),
 			allocations: Vec::new(),
+			static_values: FxHashMap::default(),
 		}
 	}
 
@@ -1164,6 +1171,9 @@ impl TypeContext<'_, '_, '_> {
 			ResolvedConstant::Abstract => {
 				return Ok(self.types.intern_const(constant, &args));
 			}
+			// An address, never a count: a length of its type is reported
+			// where it is written (`CheckConstantType`).
+			ResolvedConstant::DataEnd(_) => None,
 		};
 		match value {
 			Some(bits) => Ok(self.types.intern(Type::Value { bits })),

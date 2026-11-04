@@ -26,10 +26,14 @@
 //! Aggregates keep their values in declaration order while TIR supplies the
 //! byte offsets and size. A constant pattern compares an aggregate through
 //! the concrete `PartialEq::eq` impl its checked `Eq` bound selects, so a
-//! type's own equality is honoured. Arrays, slices and string literals (the
-//! static-data checkpoint, with `Memory::DATA_END` and `Memory::INDEX`),
-//! calls the compiler implements, function references, and float equality
-//! tests (floats have no total equality) are not lowered yet. Every other checked form is reported as
+//! type's own equality is honoured. Static data (string and array literals,
+//! constants holding data, addresses in constants and globals) is the
+//! evaluator's value, its allocations MIR's static entries (`statics.rs`);
+//! a pointer to a slice is its address and its count; `Memory::DATA_END` is
+//! resolved by codegen once the data is laid out. Indexing, calls the
+//! compiler implements (`notes/static-data.md`),
+//! function references, and float equality tests (floats have no total
+//! equality) are not lowered yet. Every other checked form is reported as
 //! `UnsupportedExpression`; no unsupported form becomes `Noop` and no
 //! unsupported form disappears from the output.
 
@@ -42,13 +46,13 @@ use super::body::{
 	Body, ElementOrder, ExprIdx, ExprKind, FunctionImplementation, PatIdx,
 	ScopeIdx,
 };
+use super::bounds::AssumptionEnvIdx;
 use super::defs::{Attributes, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx};
 use super::eval::Val;
 use super::layout::Primitive;
 use super::members::ResolvedFunction;
 use super::signatures::TypeContext;
 use super::solver::{NormalizationDepth, RewriteFlags};
-use super::bounds::AssumptionEnvIdx;
 use super::types::{
 	GenericArgs, GenericEnvIdx, Substitution, Type, TypeIndex, TypeList,
 };
@@ -62,6 +66,7 @@ mod constants;
 mod intrinsics;
 mod patterns;
 mod places;
+mod statics;
 
 /// How a call's written arguments meet what it runs.
 #[derive(Clone, Copy)]
@@ -71,6 +76,9 @@ enum Dispatch {
 	/// `Call::call` of a function item: the receiver is the item, which is
 	/// no parameter, and `args` fills the item's function.
 	Item,
+	/// A function the compiler supplies (`IntrinsicDefs::supplies`): the
+	/// instance is the declaration's, expanded in place, never called.
+	Supplied,
 }
 
 /// A function with the type arguments its body is lowered with, flat as
@@ -179,6 +187,13 @@ impl FunctionState {
 
 /// Source field selections are lowering metadata, never MIR type structure.
 /// Keep them once per normalized concrete type for constant-time projection.
+/// One field of an aggregate being lowered: a source type, or a value with
+/// no source type of its own (a fat pointer's address).
+enum AggregateField {
+	Type(TypeIndex),
+	Lowered(mir::ValueType),
+}
+
 struct AggregateLowering {
 	ty: mir::ValueType,
 	fields: Box<[mir::ScalarRange]>,
@@ -209,6 +224,7 @@ struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	/// Concrete source types already translated into flat representations.
 	aggregate_types: HashMap<TypeIndex, AggregateLowering>,
 	aggregates: AggregateTable,
+	statics: statics::StaticData,
 	pending: VecDeque<FunctionInstance>,
 	/// The instance whose body first named each instance; the roots (the
 	/// exports) have none. Read by the recursion limit.
@@ -247,6 +263,7 @@ pub(super) fn build(
 		ids: HashMap::new(),
 		aggregate_types: HashMap::new(),
 		aggregates: AggregateTable::default(),
+		statics: statics::StaticData::default(),
 		pending: VecDeque::new(),
 		callers: HashMap::new(),
 		next_id: 0,
@@ -305,7 +322,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			imports: self.imports,
 			memories: self.memories,
 			aggregates: self.aggregates.finish(),
-			static_entries: Vec::new(),
+			static_entries: self.statics.finish(),
 			start_function: None,
 		};
 		if cfg!(debug_assertions)
@@ -353,10 +370,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Result<(FunctionInstance, Dispatch), ()> {
 		let written: Vec<TypeIndex> =
 			self.context.generic_args.types(type_args).to_vec();
-		let args: Vec<TypeIndex> = written
+		// Normalized, so a projection the instance's arguments reduce
+		// (`M::Size`, an operator's `Self`) selects its impl.
+		let args = written
 			.into_iter()
-			.map(|arg| self.substitute(arg, state.env, &state.args))
-			.collect();
+			.map(|arg| {
+				let arg = self.substitute(arg, state.env, &state.args);
+				self.normalize_type(arg, state.file_id, span)
+			})
+			.collect::<Result<Vec<TypeIndex>, ()>>()?;
 		let (function, args, dispatch) =
 			match self.context.resolve_function(function, &args) {
 				Ok(ResolvedFunction::Instance { function, args }) => {
@@ -366,13 +388,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					(function, args, Dispatch::Item)
 				}
 				Ok(ResolvedFunction::Builtin) => {
-					self.unsupported(
-						state.file_id,
-						span,
-						"a call the compiler implements (a function \
-						 reference's or a slice's)",
-					)?;
-					unreachable!()
+					(function, args.into(), Dispatch::Supplied)
 				}
 				Ok(ResolvedFunction::Abstract) => {
 					unreachable!("an instance's arguments are concrete")
@@ -518,6 +534,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let args: Box<[TypeIndex]> =
 			self.context.types.list(instance.args).into();
 
+		// The evaluator reads the body, which lowering holds: the instance's
+		// static data is evaluated first, and lowering reads the values.
+		let statics = match &self.context.function_implementations
+			[usize::from(function)]
+		{
+			FunctionImplementation::Defined(body) => body.statics().to_vec(),
+			_ => Vec::new(),
+		};
+		for expr in statics {
+			let _ = self.context.static_value(function, &args, expr);
+		}
 		let implementation = std::mem::replace(
 			&mut self.context.function_implementations[usize::from(function)],
 			FunctionImplementation::Declaration,
@@ -665,11 +692,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 						Val::F64(bits) => {
 							mir::ConstInit::Float(f64::from_bits(bits))
 						}
-						Val::MemoryOffset { .. } | Val::V128(_) => {
+						Val::MemoryOffset { alloc, offset } => {
+							mir::ConstInit::Static {
+								entry: self.static_entry(alloc),
+								offset: u32::try_from(offset).unwrap(),
+							}
+						}
+						Val::DataEnd { memory } => mir::ConstInit::DataEnd {
+							memory: self.memory(memory),
+						},
+						Val::V128(_) => {
 							self.unsupported(
 								file_id,
 								name.span,
-								"a global holding an address (the memory checkpoint)",
+								"a global holding a vector",
 							)?;
 							unreachable!()
 						}
@@ -1231,6 +1267,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			ExprKind::Match { scrutinee, arms } => {
 				self.lower_match(body, state, scrutinee, arms, ty)
 			}
+			// A constant holding data in no memory, placed here.
+			ExprKind::Const { constant, .. }
+				if self.context.types.is_unplaced(
+					self.context.constants[usize::from(constant)].ty,
+				) =>
+			{
+				self.lower_static(body, state, expr, ty)
+			}
 			ExprKind::Const {
 				constant,
 				type_args,
@@ -1239,6 +1283,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				constant,
 				type_args,
 			} => self.lower_constant(body, state, expr, constant, type_args, ty),
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. } => self.lower_static(body, state, expr, ty),
 			ExprKind::LocalDeclaration { pattern, value } => {
 				self.lower_local_declaration(body, state, value, pattern, ty)
 			}
@@ -1325,9 +1372,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			// Checked forms the first checkpoint does not lower yet. Listed
 			// exhaustively so a new TIR variant forces a decision here.
 			ExprKind::Error
-			| ExprKind::String(_)
-			| ExprKind::Array { .. }
-			| ExprKind::ArrayRepeat { .. }
 			| ExprKind::NextDiscriminant(_)
 			| ExprKind::CallRef { .. } => {
 				self.unsupported(
@@ -1384,6 +1428,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			// A function item is zero-sized: it runs for its effects, before
 			// the arguments, and is no parameter of the item's function.
+			(Some(receiver), Dispatch::Supplied) => {
+				return self
+					.lower_supplied(body, state, expr, callee, receiver, ty);
+			}
 			(Some(receiver), Dispatch::Item) => {
 				let receiver = self.lower_expr(body, state, receiver)?;
 				if state.ty(receiver) == mir::ValueType::Never {
@@ -1391,6 +1439,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				}
 				prefix.push(receiver);
 				None
+			}
+			// Named by path (`Slice::len(s)`): its one parameter, `self`, is
+			// the receiver.
+			(None, Dispatch::Supplied) => {
+				return self
+					.lower_supplied(body, state, expr, callee, args, ty);
 			}
 			(None, _) => None,
 		};
@@ -1988,7 +2042,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			// An address, as wide as its memory's `Size`. The memory itself
 			// is named by each access, not by the type.
-			Type::Pointer { memory, .. } => {
+			// A pointer with metadata (to a slice) is the address and then
+			// its metadata, as its `StackValue::Repr` is.
+			Type::Pointer { to, memory, .. } => {
+				if self.pointer_metadata(to, memory, file_id, span)?
+					!= TypeIndex::UNIT
+				{
+					return self.lower_aggregate_type(ty, file_id, span);
+				}
 				let id = self.memory_of_type(memory);
 				mir::ValueType::Pointer {
 					kind: self.memories[usize::from(id)].kind,
@@ -2068,11 +2129,36 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			return Ok(representation.ty);
 		}
 
-		let field_types = self.aggregate_field_types(ty, file_id, span)?;
+		let field_types = match *self.context.types.resolve(ty) {
+			// The address has no TIR type of its own (`Pointer::address`
+			// reads it as the memory's `Size`); MIR keeps it a pointer.
+			Type::Pointer { to, memory, .. } => {
+				let metadata =
+					self.pointer_metadata(to, memory, file_id, span)?;
+				let id = self.memory_of_type(memory);
+				let address = mir::ValueType::Pointer {
+					kind: self.memories[usize::from(id)].kind,
+				};
+				vec![
+					AggregateField::Lowered(address),
+					AggregateField::Type(metadata),
+				]
+			}
+			_ => self
+				.aggregate_field_types(ty, file_id, span)?
+				.into_iter()
+				.map(AggregateField::Type)
+				.collect(),
+		};
 		let mut scalars = Vec::new();
 		let mut fields = Vec::with_capacity(field_types.len());
 		for field in field_types {
-			let field = self.lower_type(field, file_id, span)?;
+			let field = match field {
+				AggregateField::Type(field) => {
+					self.lower_type(field, file_id, span)?
+				}
+				AggregateField::Lowered(field) => field,
+			};
 			let start = scalars.len();
 			match field {
 				mir::ValueType::Unit => {}
@@ -2121,35 +2207,35 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let lowered = if scalars.is_empty() {
 			mir::ValueType::Unit
 		} else {
-			let memory = match self.context.memory_values(AssumptionEnvIdx::ROOT, ty)
-			{
-				Ok(Some((layout, values))) => {
-					assert_eq!(
-						values.len(),
-						scalars.len(),
-						"TIR stack and memory slot counts agree"
-					);
-					Some(mir::AggregateMemory {
-						layout: mir::Layout {
-							size: layout.size,
-							align: layout.align,
-						},
-						offsets: values
-							.iter()
-							.map(|&(_, offset)| offset)
-							.collect(),
-					})
-				}
-				Ok(None) => None,
-				Err(_) => {
-					self.unsupported(
-						file_id,
-						span,
-						"an aggregate whose memory layout failed",
-					)?;
-					unreachable!()
-				}
-			};
+			let memory =
+				match self.context.memory_values(AssumptionEnvIdx::ROOT, ty) {
+					Ok(Some((layout, values))) => {
+						assert_eq!(
+							values.len(),
+							scalars.len(),
+							"TIR stack and memory slot counts agree"
+						);
+						Some(mir::AggregateMemory {
+							layout: mir::Layout {
+								size: layout.size,
+								align: layout.align,
+							},
+							offsets: values
+								.iter()
+								.map(|&(_, offset)| offset)
+								.collect(),
+						})
+					}
+					Ok(None) => None,
+					Err(_) => {
+						self.unsupported(
+							file_id,
+							span,
+							"an aggregate whose memory layout failed",
+						)?;
+						unreachable!()
+					}
+				};
 			let aggregate_index =
 				self.aggregates.push(scalars.into_boxed_slice(), memory);
 			mir::ValueType::Aggregate { aggregate_index }
@@ -2210,6 +2296,28 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				)?;
 				unreachable!()
 			}
+		}
+	}
+
+	/// The metadata of a pointer to `to` in `memory`, both concrete: `()`
+	/// for a thin pointer, the count for a slice.
+	fn pointer_metadata(
+		&mut self,
+		to: TypeIndex,
+		memory: TypeIndex,
+		file_id: FileId,
+		span: TextSpan,
+	) -> Result<TypeIndex, ()> {
+		match self
+			.context
+			.pointer_metadata(AssumptionEnvIdx::ROOT, to, memory)
+		{
+			Ok(Some(metadata)) => Ok(metadata),
+			Ok(None) => {
+				unreachable!("a concrete pointee has known metadata")
+			}
+			// Checking reported a failure on this type.
+			Err(_) => Err(()),
 		}
 	}
 
@@ -2362,7 +2470,8 @@ mod tests {
 	}
 
 	/// Run with or without inlining to distinguish lowering regressions from
-	/// transformations that expose them. The CLI currently skips inlining.
+	/// transformations that expose them. `Some(Policy::DEFAULT)` is the
+	/// sequence `wx build` runs (`backend::emit`).
 	fn instantiate_with_policy(
 		source: &str,
 		policy: Option<mir::inline::Policy>,
@@ -2375,10 +2484,7 @@ mod tests {
 				diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
 			)
 		};
-		if let Some(policy) = policy {
-			mir::inline::run(&mut mir, policy);
-		}
-		let module = crate::codegen::Builder::build(&mir, &graph.strings)
+		let module = crate::backend::emit(&mut mir, &graph.strings, policy)
 			.expect("lowered MIR must encode");
 		let bytes = module.encode();
 		let engine = engine();
@@ -3432,10 +3538,13 @@ mod tests {
 		assert_eq!(graph.strings.resolve(import.name), Some("base"));
 		assert_eq!(import.item, mir::Item::Global(mir::GlobalId::new(0)));
 		mir.verify_imports().unwrap();
-		crate::mir::inline::run(&mut mir, crate::mir::inline::Policy::DEFAULT);
-		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
-			.expect("lowered MIR must encode")
-			.encode();
+		let bytes = crate::backend::emit(
+			&mut mir,
+			&graph.strings,
+			Some(crate::mir::inline::Policy::DEFAULT),
+		)
+		.expect("lowered MIR must encode")
+		.encode();
 		let engine = wasmtime::Engine::default();
 		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
 		let mut store = wasmtime::Store::new(&engine, ());
@@ -3582,24 +3691,27 @@ mod tests {
 		);
 	}
 
+	/// A slice parameter is its address and its length, as the host passes
+	/// them; an element is read against that length.
 	#[test]
-	fn reports_a_slice_type_as_unsupported() {
+	fn a_slice_parameter_is_indexed_against_its_length() {
 		let source = r#"
-            memory heap: u32;
-            func first(s: heap::&[u8]) -> u8 { s[0] }
-            export { first as "first" }
-        "#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
-		assert!(mir.is_none(), "slices have no lowering yet");
-		assert!(
-			diagnostics.iter().any(|d| {
-				d.message.contains("static-data checkpoint")
-					&& d.code.as_deref()
-						== Some(DiagnosticCode::UnsupportedExpression.code())
-			}),
-			"expected the static-data diagnostic, got {diagnostics:#?}"
-		);
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			func at(s: heap::&[u8], i: u32) -> u8 { s[i] }
+			export { at as "at", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, memory| {
+			memory.write(&mut *store, 100, b"wasm").unwrap();
+			let at = instance
+				.get_typed_func::<(u32, u32, u32), u32>(&mut *store, "at")
+				.unwrap();
+			assert_eq!(
+				at.call(&mut *store, (100, 4, 3)).unwrap(),
+				u32::from(b'm')
+			);
+			assert!(at.call(&mut *store, (100, 3, 3)).is_err());
+		});
 	}
 
 	#[test]
@@ -7928,5 +8040,738 @@ mod tests {
 			.get_typed_func::<u32, u32>(&mut store, "read")
 			.unwrap();
 		assert_eq!(read.call(&mut store, 3).unwrap(), 42);
+	}
+
+	/// `len` bytes of `memory` at `address`.
+	fn read_bytes(
+		store: &wasmtime::Store<()>,
+		memory: wasmtime::Memory,
+		address: u64,
+		len: u64,
+	) -> Vec<u8> {
+		memory.data(store)[address as usize..][..len as usize].to_vec()
+	}
+
+	#[test]
+	fn a_constant_slice_is_static_data_the_host_reads() {
+		let source = r#"
+			memory heap: u32;
+			const GREETING: heap::&[u8] = "hello";
+			func greeting() -> heap::&[u8] { GREETING }
+			export { greeting as "greeting", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, memory| {
+			let greeting = instance
+				.get_typed_func::<(), (u32, u32)>(&mut *store, "greeting")
+				.unwrap();
+			let (address, len) = greeting.call(&mut *store, ()).unwrap();
+			assert_eq!(len, 5);
+			assert_eq!(
+				read_bytes(store, memory, address.into(), len.into()),
+				b"hello"
+			);
+		});
+	}
+
+	#[test]
+	fn a_global_holds_the_address_of_static_data() {
+		let source = r#"
+			memory heap: u32;
+			global name: heap::&[u8; 2] = "wx";
+			func name_address() -> heap::&[u8; 2] { name.get() }
+			export { name_address as "name", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, memory| {
+			let name = instance
+				.get_typed_func::<(), u32>(&mut *store, "name")
+				.unwrap();
+			let address = name.call(&mut *store, ()).unwrap();
+			assert_eq!(read_bytes(store, memory, address.into(), 2), b"wx");
+		});
+	}
+
+	/// Data that points at data: the outer slice's elements are relocated
+	/// to wherever their strings are placed, at the width of the memory.
+	#[test]
+	fn a_slice_of_slices_points_at_its_relocated_elements() {
+		for (size, width) in [("u32", 4), ("u64", 8)] {
+			let source = format!(
+				r#"
+				memory heap: {size};
+				const WORDS: heap::&[heap::&[u8]] = ["ab", "cde"];
+				func words() -> heap::&[heap::&[u8]] {{ WORDS }}
+				export {{ words as "words", heap as "heap" }}
+				"#
+			);
+			each_policy(&source, |store, instance, memory| {
+				let words = instance.get_func(&mut *store, "words").unwrap();
+				let mut results =
+					[wasmtime::Val::I32(0), wasmtime::Val::I32(0)];
+				words.call(&mut *store, &[], &mut results).unwrap();
+				let number = |value: &wasmtime::Val| match value {
+					wasmtime::Val::I32(n) => *n as u32 as u64,
+					wasmtime::Val::I64(n) => *n as u64,
+					_ => panic!("an address or a count"),
+				};
+				let (address, len) = (number(&results[0]), number(&results[1]));
+				assert_eq!(len, 2);
+				let element = |at: u64| {
+					let bytes = read_bytes(store, memory, address + at, width);
+					let mut number = [0; 8];
+					number[..width as usize].copy_from_slice(&bytes);
+					u64::from_le_bytes(number)
+				};
+				for (at, expected) in [(0, &b"ab"[..]), (1, &b"cde"[..])] {
+					let pointer = element(at * 2 * width);
+					let len = element(at * 2 * width + width);
+					assert_eq!(
+						read_bytes(store, memory, pointer, len),
+						expected
+					);
+				}
+			});
+		}
+	}
+
+	#[test]
+	fn identical_static_data_is_one_entry() {
+		let source = r#"
+			memory heap: u32;
+			const A: heap::&[u8] = "same";
+			const B: heap::&[u8] = "same";
+			func both() -> (heap::&[u8], heap::&[u8]) { (A, B) }
+			export { both as "both", heap as "heap" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph).1.expect("static data lowers");
+		assert_eq!(mir.static_entries.len(), 1);
+		each_policy(source, |store, instance, _| {
+			let both = instance
+				.get_typed_func::<(), (u32, u32, u32, u32)>(&mut *store, "both")
+				.unwrap();
+			let (a, _, b, _) = both.call(&mut *store, ()).unwrap();
+			assert_eq!(a, b);
+		});
+	}
+
+	/// `(address, len)` of a slice `name` returns, in a 32-bit memory.
+	fn slice_result(
+		store: &mut wasmtime::Store<()>,
+		instance: &wasmtime::Instance,
+		name: &str,
+	) -> (u64, u64) {
+		let (address, len) = instance
+			.get_typed_func::<(), (u32, u32)>(&mut *store, name)
+			.unwrap()
+			.call(&mut *store, ())
+			.unwrap();
+		(address.into(), len.into())
+	}
+
+	#[test]
+	fn literals_in_a_function_are_placed_as_static_data() {
+		let source = r#"
+			memory heap: u32;
+			const WORD: [u8; 3] = "xyz";
+			func string() -> heap::&[u8] { "hi" }
+			func array() -> heap::&[u16; 3] { [1, 2, 3] }
+			func repeat() -> heap::&[u8] { [7; 4] }
+			func placed() -> heap::&[u8] { WORD }
+			func words() -> heap::&[heap::&[u8]] { ["ab", WORD] }
+			export {
+				string as "string", array as "array", repeat as "repeat",
+				placed as "placed", words as "words", heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			let (address, len) = slice_result(store, instance, "string");
+			assert_eq!(read_bytes(store, memory, address, len), b"hi");
+			let address = instance
+				.get_typed_func::<(), u32>(&mut *store, "array")
+				.unwrap()
+				.call(&mut *store, ())
+				.unwrap();
+			assert_eq!(
+				read_bytes(store, memory, address.into(), 6),
+				[1, 0, 2, 0, 3, 0]
+			);
+			let (address, len) = slice_result(store, instance, "repeat");
+			assert_eq!(read_bytes(store, memory, address, len), [7; 4]);
+			let (placed, len) = slice_result(store, instance, "placed");
+			assert_eq!(read_bytes(store, memory, placed, len), b"xyz");
+			// The constant placed inside the slice is the same data.
+			let (address, len) = slice_result(store, instance, "words");
+			assert_eq!(len, 2);
+			let second = read_bytes(store, memory, address + 8, 4);
+			assert_eq!(
+				u32::from_le_bytes(second.try_into().unwrap()),
+				placed as u32
+			);
+		});
+	}
+
+	/// A memory parameter is known per instance: each instance places its own
+	/// copy, as wide as its memory's addresses.
+	#[test]
+	fn a_generic_memory_places_a_copy_per_instance() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			#[memory_limits({ min_pages: 1 })]
+			memory wide: u64;
+			func hello<M: Memory>() -> M::&[u8] { "hello" }
+			func narrow() -> heap::&[u8] { hello::<heap>() }
+			func broad() -> wide::&[u8] { hello::<wide>() }
+			export { narrow as "narrow", broad as "broad", heap as "heap", wide as "wide" }
+		"#;
+		each_policy(source, |store, instance, memory| {
+			let (address, len) = slice_result(store, instance, "narrow");
+			assert_eq!(read_bytes(store, memory, address, len), b"hello");
+			let wide = instance.get_memory(&mut *store, "wide").unwrap();
+			let (address, len) = instance
+				.get_typed_func::<(), (u64, u64)>(&mut *store, "broad")
+				.unwrap()
+				.call(&mut *store, ())
+				.unwrap();
+			assert_eq!(read_bytes(store, wide, address, len), b"hello");
+		});
+	}
+
+	/// A generic function's static data is evaluated per instance, so what
+	/// fails in it is reported where the instance is lowered.
+	#[test]
+	fn a_generic_instance_reports_its_static_data_when_lowered() {
+		let source = r#"
+			memory heap: u32;
+			func one() -> u8 { 1 }
+			func data<T>() -> heap::&[u8] { [one()] }
+			func run() -> heap::&[u8] { data::<u8>() }
+			export { run as "run" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		assert!(mir.is_none());
+		crate::testing::DiagnosticView::new(
+			"lower",
+			&diagnostics,
+			&graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::NotConstEvaluatable]);
+	}
+
+	/// `Memory::DATA_END` is the address right after the memory's static
+	/// data, aligned to 16, wherever it is read: in a function, as a global's
+	/// initializer, and written in data.
+	#[test]
+	fn data_end_is_the_address_after_the_static_data() {
+		for (size, number) in [("u32", "i32"), ("u64", "i64")] {
+			let source = format!(
+				r#"
+				memory heap: {size};
+				memory empty: {size};
+				global mut bump: heap::*u8 = heap::DATA_END;
+				const TEXT: heap::&[u8] = "hello";
+				const ENDS: heap::&[heap::*u8; 1] = [heap::DATA_END];
+				func end() -> heap::*u8 {{ heap::DATA_END }}
+				func next() -> heap::*u8 {{ bump.get() }}
+				func text() -> heap::&[u8] {{ TEXT }}
+				func ends() -> heap::&[heap::*u8; 1] {{ ENDS }}
+				func nothing() -> empty::*u8 {{ empty::DATA_END }}
+				export {{
+					end as "end", next as "next", text as "text",
+					ends as "ends", nothing as "nothing", heap as "heap"
+				}}
+				"#
+			);
+			each_policy(&source, |store, instance, memory| {
+				let mut call = |name: &str, results: &mut [wasmtime::Val]| {
+					let function =
+						instance.get_func(&mut *store, name).unwrap();
+					function.call(&mut *store, &[], results).unwrap();
+				};
+				let number_of = |value: &wasmtime::Val| match value {
+					wasmtime::Val::I32(n) => *n as u32 as u64,
+					wasmtime::Val::I64(n) => *n as u64,
+					_ => panic!("an address or a count, as `{number}`"),
+				};
+				let zero = || wasmtime::Val::I32(0);
+				let mut end = [zero()];
+				call("end", &mut end);
+				let end = number_of(&end[0]);
+				// The data is `ENDS`'s one address and `"hello"`.
+				let width = if size == "u32" { 4 } else { 8 };
+				assert_eq!(end, (width + 5u64).next_multiple_of(16));
+				let mut next = [zero()];
+				call("next", &mut next);
+				assert_eq!(number_of(&next[0]), end);
+				let mut ends = [zero()];
+				call("ends", &mut ends);
+				let stored =
+					read_bytes(store, memory, number_of(&ends[0]), width);
+				let mut bytes = [0; 8];
+				bytes[..width as usize].copy_from_slice(&stored);
+				assert_eq!(u64::from_le_bytes(bytes), end);
+				let mut text = [zero(), zero()];
+				let function = instance.get_func(&mut *store, "text").unwrap();
+				function.call(&mut *store, &[], &mut text).unwrap();
+				let (address, len) = (number_of(&text[0]), number_of(&text[1]));
+				assert!(address + len <= end);
+				assert_eq!(read_bytes(store, memory, address, len), b"hello");
+				// A memory with no static data ends at 0.
+				let mut nothing = [zero()];
+				let function =
+					instance.get_func(&mut *store, "nothing").unwrap();
+				function.call(&mut *store, &[], &mut nothing).unwrap();
+				assert_eq!(number_of(&nothing[0]), 0);
+			});
+		}
+	}
+
+	/// An element is read through a slice, whose length is its metadata, or
+	/// an array, whose length is its type's; an index past it traps. A field
+	/// after the element is a constant offset past it, and `.&` is its
+	/// address.
+	#[test]
+	fn an_element_is_read_within_its_length() {
+		let source = r#"
+			memory heap: u32;
+			struct P(a: u8, b: u32);
+			func slice(i: u32) -> u16 {
+				local s: heap::&[u16] = [10, 20, 30];
+				s[i]
+			}
+			func array(i: u32) -> u8 {
+				local a: heap::&[u8; 3] = "abc";
+				a[i]
+			}
+			func field(i: u32) -> u32 {
+				local ps: heap::&[P] = [P(1, 2), P(3, 4)];
+				ps[i].b
+			}
+			func base() -> heap::&[u16] { [10, 20, 30] }
+			func address(i: u32) -> heap::&u16 {
+				local s: heap::&[u16] = [10, 20, 30];
+				s[i].&
+			}
+			export {
+				slice as "slice", array as "array", field as "field",
+				base as "base", address as "address", heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, _| {
+			let call = |store: &mut wasmtime::Store<()>, name, i: u32| {
+				instance
+					.get_typed_func::<u32, u32>(&mut *store, name)
+					.unwrap()
+					.call(&mut *store, i)
+			};
+			for (i, value) in [10, 20, 30].into_iter().enumerate() {
+				assert_eq!(call(store, "slice", i as u32).unwrap(), value);
+			}
+			for (i, value) in b"abc".iter().enumerate() {
+				assert_eq!(
+					call(store, "array", i as u32).unwrap(),
+					*value as u32
+				);
+			}
+			assert_eq!(call(store, "field", 0).unwrap(), 2);
+			assert_eq!(call(store, "field", 1).unwrap(), 4);
+			let (base, _) = slice_result(store, instance, "base");
+			assert_eq!(call(store, "address", 2).unwrap() as u64, base + 4);
+			assert!(call(store, "slice", 3).is_err());
+			assert!(call(store, "array", 3).is_err());
+			assert!(call(store, "field", 2).is_err());
+			assert!(call(store, "address", u32::MAX).is_err());
+		});
+	}
+
+	/// An element is written, and read, combined and written back, through
+	/// an exclusive pointer; the pointer and the index each run once, in
+	/// order, before the bounds check.
+	#[test]
+	fn an_element_is_written_through_an_exclusive_pointer() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			global mut calls: u32 = 0;
+			func words() -> heap::*[u32; 4] {
+				calls.set(calls.get() * 10 + 1);
+				transmute(heap::DATA_END)
+			}
+			func at(i: u32) -> u32 {
+				calls.set(calls.get() * 10 + 2);
+				i
+			}
+			func write(i: u32, v: u32) {
+				words()[at(i)] = v;
+				words()[at(i)] += 1;
+			}
+			func read(i: u32) -> u32 { words()[i] }
+			func trace() -> u32 { calls.get() }
+			func slice(n: u32) -> heap::*[u32] {
+				transmute((transmute::<_, u32>(heap::DATA_END), n))
+			}
+			func write_slice(n: u32, i: u32, v: u32) { slice(n)[i] = v; }
+			export {
+				write as "write", read as "read", trace as "trace",
+				write_slice as "write_slice", heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, _| {
+			let write = instance
+				.get_typed_func::<(u32, u32), ()>(&mut *store, "write")
+				.unwrap();
+			let read = instance
+				.get_typed_func::<u32, u32>(&mut *store, "read")
+				.unwrap();
+			let trace = instance
+				.get_typed_func::<(), u32>(&mut *store, "trace")
+				.unwrap();
+			write.call(&mut *store, (2, 41)).unwrap();
+			assert_eq!(trace.call(&mut *store, ()).unwrap(), 1212);
+			assert_eq!(read.call(&mut *store, 2).unwrap(), 42);
+			assert!(write.call(&mut *store, (4, 0)).is_err());
+			let write_slice = instance
+				.get_typed_func::<(u32, u32, u32), ()>(
+					&mut *store,
+					"write_slice",
+				)
+				.unwrap();
+			write_slice.call(&mut *store, (3, 1, 7)).unwrap();
+			assert_eq!(read.call(&mut *store, 1).unwrap(), 7);
+			assert!(write_slice.call(&mut *store, (1, 1, 7)).is_err());
+		});
+	}
+
+	/// In a 64-bit memory the index, the length and the address are 64
+	/// bits wide.
+	#[test]
+	fn an_element_of_a_wide_memory_is_indexed_in_64_bits() {
+		let source = r#"
+			memory heap: u32;
+			memory wide: u64;
+			func at(i: u64) -> u8 {
+				local s: wide::&[u8] = "xyz";
+				s[i]
+			}
+			func array(i: u64) -> u8 {
+				local a: wide::&[u8; 3] = "xyz";
+				a[i]
+			}
+			export { at as "at", array as "array", heap as "heap" }
+		"#;
+		each_policy(source, |store, instance, _| {
+			for name in ["at", "array"] {
+				let f = instance
+					.get_typed_func::<u64, u32>(&mut *store, name)
+					.unwrap();
+				assert_eq!(f.call(&mut *store, 1).unwrap(), u32::from(b'y'));
+				assert!(f.call(&mut *store, 3).is_err());
+				assert!(f.call(&mut *store, 1 << 32).is_err());
+			}
+		});
+	}
+
+	/// `len` and `as_ref` are supplied from the receiver's type: a slice's
+	/// length and address are its two halves, an array's length is its
+	/// type's. The methods with bodies (`first`, `last`, `as_slice`,
+	/// `as_slice_mut`) are their defaults, instantiated with the slice or
+	/// array as `Self`.
+	#[test]
+	fn slice_and_array_methods_lower() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			func slice_len(s: heap::&[u32]) -> u32 { s.len() }
+			func slice_ref(s: heap::&[u32]) -> u32 { s.as_ref().* }
+			func by_path(s: heap::&[u32]) -> u32 { <[u32] as Slice>::len(s) }
+			func array_len() -> u32 {
+				local a: heap::&[u16; 3] = [1, 2, 3];
+				a.len()
+			}
+			func array_ref() -> u16 {
+				local a: heap::&[u16; 3] = [7, 8, 9];
+				a.as_ref().*
+			}
+			func first(s: heap::&[u32]) -> u32 { s.first().* }
+			func last(s: heap::&[u32]) -> u32 { s.last().* }
+			func second() -> u16 {
+				local a: heap::&[u16; 3] = [4, 5, 6];
+				a.as_slice()[1]
+			}
+			func slice_of_array_len() -> u32 {
+				local a: heap::&[u16; 3] = [4, 5, 6];
+				a.as_slice().len()
+			}
+			func overwrite(address: u32, v: u8) {
+				local a: heap::*[u8; 2] = transmute(address);
+				a.as_slice_mut()[1] = v;
+			}
+			export {
+				slice_len as "slice_len", slice_ref as "slice_ref",
+				by_path as "by_path", array_len as "array_len",
+				array_ref as "array_ref", first as "first", last as "last",
+				second as "second", slice_of_array_len as "slice_of_array_len",
+				overwrite as "overwrite", heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			memory
+				.write(&mut *store, 64, &[5, 0, 0, 0, 6, 0, 0, 0, 7, 0, 0, 0])
+				.unwrap();
+			let slice = |store: &mut wasmtime::Store<()>, name, len: u32| {
+				instance
+					.get_typed_func::<(u32, u32), u32>(&mut *store, name)
+					.unwrap()
+					.call(&mut *store, (64, len))
+			};
+			let nullary = |store: &mut wasmtime::Store<()>, name| {
+				instance
+					.get_typed_func::<(), u32>(&mut *store, name)
+					.unwrap()
+					.call(&mut *store, ())
+					.unwrap()
+			};
+			assert_eq!(slice(store, "slice_len", 3).unwrap(), 3);
+			assert_eq!(slice(store, "by_path", 3).unwrap(), 3);
+			assert_eq!(slice(store, "slice_ref", 3).unwrap(), 5);
+			assert_eq!(slice(store, "first", 3).unwrap(), 5);
+			assert_eq!(slice(store, "last", 3).unwrap(), 7);
+			assert_eq!(slice(store, "last", 2).unwrap(), 6);
+			assert!(slice(store, "first", 0).is_err());
+			assert!(slice(store, "last", 0).is_err());
+			assert_eq!(nullary(store, "array_len"), 3);
+			assert_eq!(nullary(store, "array_ref"), 7);
+			assert_eq!(nullary(store, "second"), 5);
+			assert_eq!(nullary(store, "slice_of_array_len"), 3);
+			instance
+				.get_typed_func::<(u32, u32), ()>(&mut *store, "overwrite")
+				.unwrap()
+				.call(&mut *store, (64, 9))
+				.unwrap();
+			assert_eq!(read_bytes(store, memory, 64, 2), [5, 9]);
+		});
+	}
+
+	/// In a 64-bit memory a length is a `u64`, and so is an address.
+	#[test]
+	fn a_wide_slice_has_a_64_bit_length() {
+		let source = r#"
+			memory heap: u32;
+			memory wide: u64;
+			func len(s: wide::&[u8]) -> u64 { s.len() }
+			func array_len() -> u64 {
+				local a: wide::&[u8; 5] = "hello";
+				a.len()
+			}
+			func first() -> u8 {
+				local a: wide::&[u8; 5] = "hello";
+				a.as_slice().first().*
+			}
+			export {
+				len as "len", array_len as "array_len", first as "first",
+				heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, _| {
+			let len = instance
+				.get_typed_func::<(u64, u64), u64>(&mut *store, "len")
+				.unwrap();
+			assert_eq!(len.call(&mut *store, (0, 1 << 40)).unwrap(), 1 << 40);
+			let array_len = instance
+				.get_typed_func::<(), u64>(&mut *store, "array_len")
+				.unwrap();
+			assert_eq!(array_len.call(&mut *store, ()).unwrap(), 5);
+			let first = instance
+				.get_typed_func::<(), u32>(&mut *store, "first")
+				.unwrap();
+			assert_eq!(first.call(&mut *store, ()).unwrap(), u32::from(b'h'));
+		});
+	}
+
+	/// A field of a pointer goes through it (`p.f` is `p.*.f`), so a path
+	/// through several stored pointers is the same loads written either
+	/// way: each pointer is loaded at its field's offset, and the fields
+	/// after it are the next load's offset. A write, a compound write and
+	/// `.&` go through the last pointer, whose ownership decides the write.
+	#[test]
+	fn nested_loads_through_pointers_match_their_explicit_form() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			#[fixed_order]
+			struct C(pad: u32, z: u32);
+			#[fixed_order]
+			struct B(w: u32, c: C, next: heap::&C);
+			#[fixed_order]
+			struct A(tag: u32, y: heap::&B);
+			#[fixed_order]
+			struct D(pad: u32, e: heap::*C);
+			func explicit(x: heap::&A) -> u32 { x.*.y.*.next.*.z }
+			func implicit(x: heap::&A) -> u32 { x.y.next.z }
+			func inner_explicit(x: heap::&A) -> u32 { x.*.y.*.c.z }
+			func inner(x: heap::&A) -> u32 { x.y.c.z }
+			func address(x: heap::&A) -> heap::&u32 { x.y.next.z.& }
+			func write(d: heap::&D, v: u32) { d.e.z = v; }
+			func bump(d: heap::&D) { d.e.z += 1; }
+			export {
+				explicit as "explicit", implicit as "implicit",
+				inner_explicit as "inner_explicit", inner as "inner",
+				address as "address", write as "write", bump as "bump",
+				heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			let word = |store: &mut wasmtime::Store<()>, at: usize, v: u32| {
+				memory.write(&mut *store, at, &v.to_le_bytes()).unwrap();
+			};
+			// A at 0, its `y` at 4; B at 16, its `c.z` at 24 and `next` at
+			// 28; C at 48, its `z` at 52; D at 64, its `e` at 68.
+			word(store, 4, 16);
+			word(store, 24, 111);
+			word(store, 28, 48);
+			word(store, 52, 222);
+			word(store, 68, 48);
+			let read = |store: &mut wasmtime::Store<()>, name| {
+				instance
+					.get_typed_func::<u32, u32>(&mut *store, name)
+					.unwrap()
+					.call(&mut *store, 0)
+					.unwrap()
+			};
+			assert_eq!(read(store, "explicit"), 222);
+			assert_eq!(read(store, "implicit"), 222);
+			assert_eq!(read(store, "inner_explicit"), 111);
+			assert_eq!(read(store, "inner"), 111);
+			assert_eq!(read(store, "address"), 52);
+			let write = instance
+				.get_typed_func::<(u32, u32), ()>(&mut *store, "write")
+				.unwrap();
+			write.call(&mut *store, (64, 7)).unwrap();
+			assert_eq!(read(store, "implicit"), 7);
+			let bump = instance
+				.get_typed_func::<u32, ()>(&mut *store, "bump")
+				.unwrap();
+			bump.call(&mut *store, 64).unwrap();
+			assert_eq!(read(store, "explicit"), 8);
+		});
+	}
+
+	/// An array field is indexed in place: its address is the field's,
+	/// past the pointer it is reached through, and an element is checked
+	/// against the array's length. A field after the array is past its
+	/// bytes, and an array of structs holding arrays strides by the
+	/// struct's size.
+	#[test]
+	fn an_array_field_is_indexed_in_place() {
+		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
+			#[fixed_order]
+			struct Header(len: u8, data: [u16; 3], tail: u32);
+			func get(h: heap::&Header, i: u32) -> u16 { h.data[i] }
+			func tail(h: heap::&Header) -> u32 { h.tail }
+			func set(h: heap::*Header, i: u32, v: u16) { h.data[i] = v; }
+			func bump(h: heap::*Header, i: u32) { h.data[i] += 1; }
+			func count(h: heap::&Header) -> u32 { h.data.&.len() }
+			func address(h: heap::&Header) -> heap::&[u16; 3] { h.data.& }
+			func nth(hs: heap::&[Header], i: u32, j: u32) -> u16 {
+				hs[i].data[j]
+			}
+			export {
+				get as "get", tail as "tail", set as "set", bump as "bump",
+				count as "count", address as "address", nth as "nth",
+				heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			// A Header at 16: `len` at 16, `data` at 18, `tail` at 24; a
+			// second one at 28.
+			memory.write(&mut *store, 24, &9u32.to_le_bytes()).unwrap();
+			let set = instance
+				.get_typed_func::<(u32, u32, u32), ()>(&mut *store, "set")
+				.unwrap();
+			let get = instance
+				.get_typed_func::<(u32, u32), u32>(&mut *store, "get")
+				.unwrap();
+			for i in 0..3 {
+				set.call(&mut *store, (16, i, 100 + i)).unwrap();
+			}
+			assert_eq!(
+				read_bytes(store, memory, 18, 6),
+				[100, 0, 101, 0, 102, 0]
+			);
+			assert_eq!(get.call(&mut *store, (16, 2)).unwrap(), 102);
+			assert!(get.call(&mut *store, (16, 3)).is_err());
+			assert!(set.call(&mut *store, (16, 3, 0)).is_err());
+			let tail = instance
+				.get_typed_func::<u32, u32>(&mut *store, "tail")
+				.unwrap();
+			assert_eq!(tail.call(&mut *store, 16).unwrap(), 9);
+			instance
+				.get_typed_func::<(u32, u32), ()>(&mut *store, "bump")
+				.unwrap()
+				.call(&mut *store, (16, 1))
+				.unwrap();
+			assert_eq!(get.call(&mut *store, (16, 1)).unwrap(), 102);
+			let unary = |store: &mut wasmtime::Store<()>, name| {
+				instance
+					.get_typed_func::<u32, u32>(&mut *store, name)
+					.unwrap()
+					.call(&mut *store, 16)
+					.unwrap()
+			};
+			assert_eq!(unary(store, "count"), 3);
+			assert_eq!(unary(store, "address"), 18);
+			// The second Header's `data[2]`, at 28 + 2 + 4.
+			memory.write(&mut *store, 34, &[7, 0]).unwrap();
+			let nth = instance
+				.get_typed_func::<(u32, u32, u32, u32), u32>(&mut *store, "nth")
+				.unwrap();
+			assert_eq!(nth.call(&mut *store, (16, 2, 1, 2)).unwrap(), 7);
+			assert!(nth.call(&mut *store, (16, 2, 1, 3)).is_err());
+			assert!(nth.call(&mut *store, (16, 2, 2, 0)).is_err());
+		});
+	}
+
+	/// An array inside static data is written inline: a nested literal, a
+	/// string, a repeat of an array and a constant holding data each give
+	/// their elements' bytes in place, and are indexed in place.
+	#[test]
+	fn nested_arrays_are_static_data_written_inline() {
+		let source = r#"
+			memory heap: u32;
+			const ROW: [u16; 2] = [7, 8];
+			func grid() -> heap::&[[u16; 2]] { [[1, 2], [3, 4], ROW] }
+			func at(i: u32, j: u32) -> u16 { grid()[i][j] }
+			func words() -> heap::&[[u8; 3]; 2] { ["abc", "xyz"] }
+			func fives() -> heap::&[[u8; 2]] { [[5; 2]; 3] }
+			export {
+				grid as "grid", at as "at", words as "words", fives as "fives",
+				heap as "heap"
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			let (address, len) = slice_result(store, instance, "grid");
+			assert_eq!(len, 3);
+			assert_eq!(
+				read_bytes(store, memory, address, 12),
+				[1, 0, 2, 0, 3, 0, 4, 0, 7, 0, 8, 0]
+			);
+			let at = instance
+				.get_typed_func::<(u32, u32), u32>(&mut *store, "at")
+				.unwrap();
+			assert_eq!(at.call(&mut *store, (2, 1)).unwrap(), 8);
+			assert!(at.call(&mut *store, (1, 2)).is_err());
+			let words = instance
+				.get_typed_func::<(), u32>(&mut *store, "words")
+				.unwrap()
+				.call(&mut *store, ())
+				.unwrap();
+			assert_eq!(read_bytes(store, memory, words.into(), 6), b"abcxyz");
+			let (address, len) = slice_result(store, instance, "fives");
+			assert_eq!(len, 3);
+			assert_eq!(read_bytes(store, memory, address, 6), [5; 6]);
+		});
 	}
 }

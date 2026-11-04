@@ -45,6 +45,10 @@ index_newtype!(
 	MemoryId
 );
 index_newtype!(
+	/// Index into [`MIR::static_entries`].
+	StaticEntryId
+);
+index_newtype!(
 	/// Flat, function-wide index into `Function::locals`, distinct from
 	/// `tir::LocalIndex` (which is per-scope).
 	LocalIndex
@@ -205,15 +209,38 @@ pub struct MemoryInfo {
 	pub origin: Origin<()>,
 }
 
-/// One entry in the static data segment — either a string literal or an array
-/// constant. Bytes are pre-encoded; the layout (byte offset) is computed by
-/// codegen after DCE.
+/// Read-only bytes placed in a memory's data segment: a literal's, or data
+/// a constant or a global points into. Codegen lays out the entries
+/// something reaches and gives each its address.
 #[cfg_attr(test, derive(serde::Serialize))]
+#[derive(PartialEq, Eq, Hash)]
 pub struct StaticEntry {
 	pub bytes: Box<[u8]>,
 	pub align: u32,
 	/// The memory whose data segment this entry is placed in.
 	pub memory: MemoryId,
+	/// The addresses written in `bytes`, sorted by offset.
+	pub relocations: Box<[Relocation]>,
+}
+
+/// An address inside a static entry's bytes. The bytes at `offset`, as
+/// wide as the addresses of the memory `target` is in, hold an offset from
+/// it; codegen adds `target`'s address to them.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Relocation {
+	pub offset: u32,
+	pub target: AddressTarget,
+}
+
+/// What an address codegen resolves points at.
+#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AddressTarget {
+	/// A static entry, in its memory.
+	Entry(StaticEntryId),
+	/// The address right after a memory's static data (`Memory::DATA_END`).
+	DataEnd(MemoryId),
 }
 
 /// A checked program lowered to backend form.
@@ -389,9 +416,9 @@ pub struct Code {
 
 impl Code {
 	/// The static data entries (`MIR::static_entries`) the body points at.
-	pub fn static_data(&self) -> impl Iterator<Item = u32> + '_ {
+	pub fn static_data(&self) -> impl Iterator<Item = StaticEntryId> + '_ {
 		self.body.kinds().iter().filter_map(|kind| match *kind {
-			ExprKind::StaticPointer { data_index } => Some(data_index),
+			ExprKind::StaticPointer { entry, .. } => Some(entry),
 			_ => None,
 		})
 	}
@@ -410,6 +437,15 @@ impl Code {
 pub enum ConstInit {
 	Int(i64),
 	Float(f64),
+	/// The address `offset` bytes into a static entry.
+	Static {
+		entry: StaticEntryId,
+		offset: u32,
+	},
+	/// The address right after a memory's static data.
+	DataEnd {
+		memory: MemoryId,
+	},
 }
 
 #[cfg_attr(test, derive(serde::Serialize))]

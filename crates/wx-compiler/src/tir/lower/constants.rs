@@ -4,8 +4,9 @@
 //!
 //! A constant with arguments is read per instance: its arguments are made
 //! concrete with the function instance's, and a trait's declaration reads
-//! what the impl its `Self` selects provides (`resolve_constant`). Memory-backed and vector values likewise wait for the
-//! static-data checkpoint, so they are reported rather than approximated.
+//! what the impl its `Self` selects provides (`resolve_constant`). An address
+//! into evaluated data is a pointer to its static entry (`statics.rs`); a
+//! vector value is reported rather than approximated.
 
 use super::{Body, ExprIdx, FunctionState, Lowerer, mir};
 use crate::diagnostics::{SourceSpan, TextSpan};
@@ -28,10 +29,13 @@ impl Lowerer<'_, '_, '_, '_> {
 		let file_id = state.file_id;
 		let written: Vec<TypeIndex> =
 			self.context.generic_args.types(type_args).to_vec();
-		let args: Vec<TypeIndex> = written
+		let args = written
 			.into_iter()
-			.map(|arg| self.substitute(arg, state.env, &state.args))
-			.collect();
+			.map(|arg| {
+				let arg = self.substitute(arg, state.env, &state.args);
+				self.normalize_type(arg, file_id, span)
+			})
+			.collect::<Result<Vec<TypeIndex>, ()>>()?;
 		let instance = match self.context.resolve_constant(constant, &args) {
 			Ok(ResolvedConstant::Instance(instance)) => instance,
 			Ok(ResolvedConstant::Length(length)) => {
@@ -43,6 +47,10 @@ impl Lowerer<'_, '_, '_, '_> {
 				return Ok(
 					state.push(mir::ExprKind::Int { value: bits as i64 }, ty)
 				);
+			}
+			Ok(ResolvedConstant::DataEnd(memory)) => {
+				let memory = self.memory(memory);
+				return Ok(state.push(mir::ExprKind::DataEnd { memory }, ty));
 			}
 			Ok(ResolvedConstant::Abstract) => {
 				unreachable!("an instance's arguments are concrete")
@@ -156,11 +164,23 @@ impl Lowerer<'_, '_, '_, '_> {
 			(mir::ValueType::F64, Val::F64(bits)) => mir::ExprKind::Float {
 				value: f64::from_bits(bits),
 			},
+			(mir::ValueType::Pointer { .. }, Val::DataEnd { memory }) => {
+				mir::ExprKind::DataEnd {
+					memory: self.memory(memory),
+				}
+			}
+			(
+				mir::ValueType::Pointer { .. },
+				Val::MemoryOffset { alloc, offset },
+			) => mir::ExprKind::StaticPointer {
+				entry: self.static_entry(alloc),
+				offset: u32::try_from(offset).unwrap(),
+			},
 			_ => {
 				self.unsupported(
 					file_id,
 					span,
-					"a constant of a memory-backed, function or vector type",
+					"a constant of a function or vector type",
 				)?;
 				unreachable!()
 			}

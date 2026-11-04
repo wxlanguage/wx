@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod backend;
 #[cfg(test)]
 mod backend_tests;
 pub mod codegen;

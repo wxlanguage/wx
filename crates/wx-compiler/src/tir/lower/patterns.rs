@@ -26,9 +26,9 @@ use crate::diagnostics::TextSpan;
 use crate::tir::body::{
 	Arm, ArmRange, ExprKind, PatIdx, PatternKind, PatternRange,
 };
+use crate::tir::bounds::AssumptionEnvIdx;
 use crate::tir::defs::{ConstIdx, FieldIdx, MemberKind};
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::bounds::AssumptionEnvIdx;
 use crate::tir::types::{GenericArgs, TypeIndex};
 
 /// A value of the match scrutinee at some field path, read from one root

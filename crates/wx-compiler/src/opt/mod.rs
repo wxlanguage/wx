@@ -234,12 +234,13 @@ pub enum DataNodeKind {
 	/// Pointer into the static data segment for a string or array constant.
 	/// `ty` is the pointer width of the memory holding the static data.
 	StaticDataRef {
-		data_index: u32,
+		entry: mir::StaticEntryId,
+		offset: u32,
 		ty: ScalarType,
 	},
-	/// Byte offset of the end of the data section (link-time constant).
-	/// `ty` is the memory's pointer width.
-	MemoryOffset {
+	/// The address right after the memory's static data
+	/// (`ExprKind::DataEnd`). `ty` is the memory's pointer width.
+	DataEnd {
 		memory: mir::MemoryId,
 		ty: ScalarType,
 	},
@@ -616,7 +617,7 @@ impl DataNodeKind {
 			}
 			DataNodeKind::GlobalGetResult { ty }
 			| DataNodeKind::StaticDataRef { ty, .. }
-			| DataNodeKind::MemoryOffset { ty, .. }
+			| DataNodeKind::DataEnd { ty, .. }
 			| DataNodeKind::MemorySizeResult { ty, .. }
 			| DataNodeKind::MemoryGrowResult { ty, .. } => NodeType::Scalar(*ty),
 
@@ -1166,7 +1167,7 @@ impl Function {
             | DataNodeKind::TrappingResult { .. }
             | DataNodeKind::FunctionRef { .. }
             | DataNodeKind::StaticDataRef { .. }
-            | DataNodeKind::MemoryOffset { .. }
+            | DataNodeKind::DataEnd { .. }
             | DataNodeKind::MemoryIndex { .. }
             | DataNodeKind::MemorySizeResult { .. }
             | DataNodeKind::AggregateCallResult { .. }

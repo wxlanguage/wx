@@ -281,8 +281,9 @@ pub(super) enum ResolvedFunction {
 		function: FunctionIdx,
 		args: Box<[TypeIndex]>,
 	},
-	/// A trait the compiler implements for `Self` (`Call` of a function
-	/// reference, a slice's or array's methods). No function provides it.
+	/// A function the compiler supplies for `Self` (`Call` of a function
+	/// reference, a slice's or an array's `len` and `as_ref`;
+	/// `IntrinsicDefs::supplies`). No function provides it.
 	Builtin,
 	/// A trait's declaration whose `Self` is not known here.
 	Abstract,
@@ -352,7 +353,18 @@ impl TypeContext<'_, '_, '_> {
 						},
 					}
 				}
-				Some(TraitImplLookup::Builtin) => ResolvedFunction::Builtin,
+				// What the compiler supplies has no function; a default is
+				// instantiated with the structural `Self`, as an impl that
+				// inherits it would.
+				Some(TraitImplLookup::Builtin)
+					if self.defs.intrinsics.supplies(trait_index, function) =>
+				{
+					ResolvedFunction::Builtin
+				}
+				Some(TraitImplLookup::Builtin) => ResolvedFunction::Instance {
+					function,
+					args: args.into(),
+				},
 				Some(TraitImplLookup::Abstract) => ResolvedFunction::Abstract,
 				// The unmet bound was reported where the function is named.
 				None => return Err(SolverError::Poisoned),

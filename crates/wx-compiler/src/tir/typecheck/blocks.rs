@@ -66,7 +66,7 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// Enters a new scope inside the current one; `leave_scope` returns to
 	/// its parent.
-	fn enter_scope(
+	pub(super) fn enter_scope(
 		&mut self,
 		kind: ScopeKind,
 		label: Option<LabelIdx>,
@@ -87,7 +87,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		scope
 	}
 
-	fn leave_scope(&mut self, scope: ScopeIdx) {
+	pub(super) fn leave_scope(&mut self, scope: ScopeIdx) {
 		self.current = self.body.scope(scope).parent.unwrap();
 	}
 

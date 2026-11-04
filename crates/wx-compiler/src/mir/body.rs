@@ -12,7 +12,8 @@
 //! parent, since rewriting a node in place (inlining) breaks that.
 
 use super::{
-	FunctionId, GlobalId, Local, LocalIndex, MemoryId, ScalarRange, ValueType,
+	FunctionId, GlobalId, Local, LocalIndex, MemoryId, ScalarRange,
+	StaticEntryId, ValueType,
 };
 use crate::index::index_newtype;
 
@@ -246,8 +247,9 @@ pub enum ExprKind {
 		value: ExprId,
 	},
 
-	/// `i32.const <data_section_end>`: the first byte past the static data.
-	MemoryOffset {
+	/// `Memory::DATA_END`: the address right after the memory's static
+	/// data, known once codegen has laid it out.
+	DataEnd {
 		memory: MemoryId,
 	},
 	/// `i32.const <wasm_memory_index>`, resolved at codegen.
@@ -291,10 +293,12 @@ pub enum ExprKind {
 		offset: u32,
 		memory: MemoryId,
 	},
-	/// The address of a static data entry (`MIR::static_entries`). The
-	/// entries a function uses are read off these nodes.
+	/// The address `offset` bytes into a static data entry
+	/// (`MIR::static_entries`). The entries a function uses are read off
+	/// these nodes.
 	StaticPointer {
-		data_index: u32,
+		entry: StaticEntryId,
+		offset: u32,
 	},
 }
 
@@ -322,7 +326,7 @@ impl ExprKind {
 			| Self::Int { .. }
 			| Self::Float { .. }
 			| Self::Global { .. }
-			| Self::MemoryOffset { .. }
+			| Self::DataEnd { .. }
 			| Self::MemoryIndex { .. }
 			| Self::MemorySize { .. }
 			| Self::StaticPointer { .. } => {}
@@ -445,7 +449,7 @@ impl ExprKind {
 			| Self::Break { .. }
 			| Self::Continue { .. }
 			| Self::Call { .. }
-			| Self::MemoryOffset { .. }
+			| Self::DataEnd { .. }
 			| Self::MemoryIndex { .. }
 			| Self::MemorySize { .. }
 			| Self::MemoryGrow { .. }

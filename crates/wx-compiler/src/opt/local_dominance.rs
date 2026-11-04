@@ -378,7 +378,7 @@ pub fn verify_local_dominance(
 			| Instruction::I64ReinterpretF64 | Instruction::F64ReinterpretI64
 			| Instruction::Nop
 			| Instruction::FunctionPointer(_)
-			| Instruction::DataSectionEnd { .. }
+			| Instruction::DataEnd { .. }
 			| Instruction::StaticDataPointer { .. } => {}
 		}
 	}

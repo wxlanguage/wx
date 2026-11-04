@@ -324,9 +324,14 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	let (diagnostics, mir) = tir::build(&mut compilation);
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
-	let mir = mir.expect("lowering without an error diagnostic produces MIR");
+	let mut mir =
+		mir.expect("lowering without an error diagnostic produces MIR");
 
-	let Ok(module) = codegen::Builder::build(&mir, &compilation.strings) else {
+	let Ok(module) = backend::emit(
+		&mut mir,
+		&compilation.strings,
+		Some(mir::inline::Policy::DEFAULT),
+	) else {
 		eprintln!("error: WebAssembly code generation failed");
 		std::process::exit(1);
 	};

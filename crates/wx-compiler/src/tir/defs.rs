@@ -963,8 +963,15 @@ pub struct IntrinsicDefs {
 	pub array: Option<TraitIdx>,
 	/// `Slice`'s declaration of `Value`: a slice's or an array's element.
 	pub slice_value: Option<AssocTypeIdx>,
+	/// `Slice`'s bodiless `len` and `as_ref`, which lowering supplies from
+	/// the receiver's type. Its other functions, and `Array`'s, have bodies.
+	pub slice_len: Option<FunctionIdx>,
+	pub slice_as_ref: Option<FunctionIdx>,
 	/// `Array`'s declaration of `LEN`: an array's length.
 	pub array_len: Option<ConstIdx>,
+	/// `Memory`'s declaration of `DATA_END`: where a memory's static data
+	/// ends, known once the program's data is laid out.
+	pub memory_data_end: Option<ConstIdx>,
 	/// `Pointer`, which the compiler implements for every pointer type, and
 	/// its declarations of `Memory`, `Pointee` and `Metadata`.
 	pub pointer: Option<TraitIdx>,
@@ -974,6 +981,19 @@ pub struct IntrinsicDefs {
 }
 
 impl IntrinsicDefs {
+	/// Whether the compiler supplies `function`, a member of `trait_index`
+	/// for a type that trait is implemented for structurally: `Call` of a
+	/// function reference, and `Slice`'s bodiless `len` and `as_ref`. Any
+	/// other member of such a trait is its default body.
+	pub fn supplies(
+		&self,
+		trait_index: TraitIdx,
+		function: FunctionIdx,
+	) -> bool {
+		self.call == Some(trait_index)
+			|| [self.slice_len, self.slice_as_ref].contains(&Some(function))
+	}
+
 	/// The mutable slot for `name` if it's one of the recognized primitive
 	/// type names — the one place that list is written.
 	fn type_slot_mut(
@@ -3760,8 +3780,25 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					self.intrinsics.stack_value_repr = declared("Repr");
 				} else if self.intrinsics.memory == this {
 					self.intrinsics.memory_size = declared("Size");
+					self.intrinsics.memory_data_end =
+						match member(BindingKey::value, "DATA_END") {
+							Some(MemberKind::Constant(constant)) => {
+								Some(constant)
+							}
+							_ => None,
+						};
 				} else if self.intrinsics.slice == this {
 					self.intrinsics.slice_value = declared("Value");
+					let function =
+						|name: &str| match member(BindingKey::value, name) {
+							Some(
+								MemberKind::Function(function)
+								| MemberKind::Method(function),
+							) => Some(function),
+							_ => None,
+						};
+					self.intrinsics.slice_len = function("len");
+					self.intrinsics.slice_as_ref = function("as_ref");
 				} else if self.intrinsics.pointer == this {
 					self.intrinsics.pointer_memory = declared("Memory");
 					self.intrinsics.pointer_pointee = declared("Pointee");

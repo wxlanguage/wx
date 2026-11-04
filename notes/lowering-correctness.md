@@ -271,7 +271,12 @@ under Node with the expected results.
 
 ### C06 — CLI and execution tests must use the same backend pipeline
 
-Status: **open; after C02/C03 and other inlining-sensitive correctness fixes**.
+Status: **fixed** (2026-11-04). `backend::emit(mir, strings, inline)` is the
+one sequence after `tir::build`: inlining under the given policy, then codegen.
+`wx build` calls it with `Policy::DEFAULT`, and the execution harnesses call it
+with the policy they test (`None` for lowering alone).
+`backend::tests::a_build_inlines_an_inline_callee` covers it, and so does a
+native CLI build that emitted one function and ran under Node.
 
 The CLI calls `tir::build` and codegen directly; the lowering execution harness
 also runs `mir::inline::run`. Consequently `#[inline]` has no effect on CLI
