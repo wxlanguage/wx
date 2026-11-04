@@ -2,7 +2,8 @@
 
 use super::{Body, ExprIdx, FunctionInstance, FunctionState, Lowerer, mir};
 use crate::tir::intrinsics::Intrinsic;
-use crate::tir::types::{Type, TypeEnvIdx};
+use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::types::Type;
 
 impl Lowerer<'_, '_, '_, '_> {
 	pub(super) fn lower_intrinsic(
@@ -22,7 +23,7 @@ impl Lowerer<'_, '_, '_, '_> {
 				unreachable!("`size_of` and `align_of` take `T` and `Mem`")
 			};
 			let Ok(Some(layout)) =
-				self.context.memory_layout(TypeEnvIdx::ROOT, value_type)
+				self.context.memory_layout(AssumptionEnvIdx::ROOT, value_type)
 			else {
 				self.unsupported(
 					state.file_id,

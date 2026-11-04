@@ -2981,18 +2981,41 @@ impl<'a> Builder<'a> {
 					if i > 0 {
 						binding_parts.push(self.text(Text::CommaSp));
 					}
-					let key = self.symbol(binding.name.inner);
+					let mut key = self.symbol(binding.name.inner);
+					if let ast::AssocBindingKind::ConstRepresentable {
+						..
+					}
+					| ast::AssocBindingKind::ConstEquals { .. } = binding.kind
+					{
+						let marker = self.text(Text::Const);
+						key = self.arena.concat2(marker, key);
+					}
 					let rhs = match &binding.kind {
-						ast::AssocTypeBindingKind::Equals(ty) => {
+						ast::AssocBindingKind::Equals(ty) => {
 							let eq = self.text(Text::EqSp);
 							let ty = self.build_type_expression(&ty.inner);
 							self.arena.concat2(eq, ty)
 						}
-						ast::AssocTypeBindingKind::Bound(bound) => {
+						ast::AssocBindingKind::Bound(bound) => {
 							let colon = self.text(Text::ColonSp);
 							let bound =
 								self.build_bound_expression(&bound.inner);
 							self.arena.concat2(colon, bound)
+						}
+						ast::AssocBindingKind::ConstRepresentable {
+							ty,
+							..
+						} => {
+							let colon = self.text(Text::ColonSp);
+							let ty = self.build_type_expression(&ty.inner);
+							self.arena.concat2(colon, ty)
+						}
+						ast::AssocBindingKind::ConstEquals {
+							value, ..
+						} => {
+							let eq = self.text(Text::EqSp);
+							let value = self.build_const_argument(value);
+							self.arena.concat2(eq, value)
 						}
 					};
 					binding_parts.push(self.arena.concat2(key, rhs));
@@ -3052,6 +3075,12 @@ impl<'a> Builder<'a> {
 				let segments = self.build_type_path(segments);
 				self.build_qualified_path(inner_node, None, segments)
 			}
+			ast::TypeExpression::Literal { inner } => {
+				let open = self.text(Text::LBrace);
+				let inner = self.build_type_expression(&inner.inner);
+				let close = self.text(Text::RBrace);
+				self.arena.concat3(open, inner, close)
+			}
 			// The formatter never runs on a file that failed to parse.
 			ast::TypeExpression::Error => unreachable!(),
 			ast::TypeExpression::Infer => self.text(Text::Underscore),
@@ -3101,36 +3130,23 @@ impl<'a> Builder<'a> {
 				items.push(self.build_type_expression(&inner.inner));
 				self.arena.concat(items)
 			}
-			ast::TypeExpression::Slice {
-				ownership,
-				memory,
-				inner,
-			} => {
-				let mut items: Vec<NodeId> = Vec::new();
-				self.build_memory_tag(&mut items, memory.as_deref());
-				items.push(self.text(ownership_sigil(*ownership)));
-				items.push(self.text(Text::LBracket));
-				items.push(self.build_type_expression(&inner.inner));
-				items.push(self.text(Text::RBracket));
+			ast::TypeExpression::Slice { inner } => {
+				let items = vec![
+					self.text(Text::LBracket),
+					self.build_type_expression(&inner.inner),
+					self.text(Text::RBracket),
+				];
 				self.arena.concat(items)
 			}
-			ast::TypeExpression::Array {
-				ownership,
-				memory,
-				inner,
-				length,
-			} => {
-				let mut items: Vec<NodeId> = Vec::new();
-				self.build_memory_tag(&mut items, memory.as_deref());
-				items.extend([
-					self.text(ownership_sigil(*ownership)),
+			ast::TypeExpression::Array { inner, length } => {
+				let items = vec![
 					self.text(Text::LBracket),
 					self.build_type_expression(&inner.inner),
 					self.text(Text::Semi),
 					self.text(Text::Space),
 					self.build_const_argument(length),
 					self.text(Text::RBracket),
-				]);
+				];
 				self.arena.concat(items)
 			}
 			// A tuple of one is its element.

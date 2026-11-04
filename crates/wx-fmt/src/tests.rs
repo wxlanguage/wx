@@ -335,6 +335,14 @@ fn test_format_where_clause_assoc_type_bound() {
 		),
 		"func f<Mem: Memory where { Size = u32, Size: Unsigned }>(mem: Mem) -> Mem {}\n",
 	);
+
+	// A constant's entries keep their `const`; `Self` is printed as written.
+	assert_eq!(
+		fmt(
+			"func f<Self: A where { const N: u8 }, B: A where { const N = 4 }>() {}"
+		),
+		"func f<Self: A where { const N: u8 }, B: A where { const N = 4 }>() {}\n",
+	);
 }
 
 #[test]
@@ -508,6 +516,26 @@ fn a_bracketed_constant_path_is_formatted_as_written() {
         func f(a: heap::&[u8; <T as Array>::SIZE], b: Buffer<const <A>::SIZE>) {
             local c = [0; <heap::&[u8; 4]>::SIZE];
         }
+    "};
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(output, source);
+}
+
+#[test]
+fn a_literal_kind_is_formatted_in_braces() {
+	let source = indoc! {"
+        const X: {integer} = 4;
+
+        const U: {char} = 'u';
     "};
 	let case = TestCase::new(source);
 	let output = format(

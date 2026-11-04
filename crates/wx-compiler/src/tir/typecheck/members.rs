@@ -17,9 +17,9 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::calls::{Callee, Dispatch};
 use super::{Arguments, BodyContext};
-use crate::ast::{self, Spanned};
+use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::body::{ExprIdx, ExprKind};
+use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::defs::{
 	BindingKey, ConstIdx, DefKind, MemberKind, Tier, TraitIdx, Visibility,
 };
@@ -264,21 +264,24 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let signature = &self.cx.constants[usize::from(constant)];
 		debug_assert_eq!(
-			self.cx.type_envs.generic_count(signature.env),
+			self.cx.generic_envs.generic_count(signature.env),
 			type_args.len()
 		);
 		let ty = self.cx.types.substitute(
 			signature.ty,
 			Substitution {
-				envs: &self.cx.type_envs,
+				envs: &self.cx.generic_envs,
 				env: signature.env,
 				args: type_args,
 			},
 		);
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		let ty = self.cx.types.collapse_error(ty);
 		let owner = self.cx.defs.constants[usize::from(constant)].owner;
-		let type_args = self.cx.types.push_list(type_args);
+		let type_args = self
+			.cx
+			.generic_args
+			.push(type_args.iter().map(|&arg| (arg, member.ident.span)));
 		let kind = match Dispatch::of(owner) {
 			Dispatch::Direct => ExprKind::Const {
 				constant,
@@ -330,9 +333,12 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	/// `receiver.method(a, b)` or `receiver.method({ b, a })`: a call of the
-	/// method the receiver's type has, the receiver its first argument. A pointer is not dereferenced: a
-	/// method of the pointee is found only when it takes `self` by pointer,
-	/// as `self: Mem::*Self` does, and the pointer itself is then `self`.
+	/// method the receiver's type has, the receiver its first argument. A
+	/// pointer is not dereferenced: a method of the pointee is found only when
+	/// it takes `self` by pointer, as `self: Mem::*Self` does, and the pointer
+	/// itself is then `self`. The one conversion is an exclusive pointer
+	/// given to a method that takes a shared one, `self: Mem::&Self`, which
+	/// is `receiver.*.&`.
 	pub(super) fn build_method_call(
 		&mut self,
 		object: &Spanned<ast::Expression>,
@@ -343,11 +349,12 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> ExprIdx {
 		let receiver = self.build(object, TypeIndex::INFER);
 		let receiver_ty = self.body.ty(receiver);
-		if self.cx.types.has_literal(receiver_ty) {
+		if self.cx.types.needs_context(receiver_ty) {
 			self.report_annotation_required(receiver);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
-		let receiver_ty = self.normalized(receiver_ty, self.scope.env);
+		let receiver_ty =
+			self.normalized(receiver_ty, self.scope.assumption_env);
 		let pointee = match *self.cx.types.resolve(receiver_ty) {
 			Type::Pointer { to, .. } => Some(to),
 			_ => None,
@@ -363,14 +370,37 @@ impl BodyContext<'_, '_, '_, '_> {
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 		};
-		if pointee.is_some() {
+		let mut receiver = receiver;
+		if let Type::Pointer {
+			to,
+			memory,
+			ownership,
+		} = *self.cx.types.resolve(receiver_ty)
+		{
 			let params =
 				self.cx.functions[usize::from(callee.function)].param_types;
 			let declared = self.cx.types.list(params)[0];
-			if !matches!(self.cx.types.resolve(declared), Type::Pointer { .. })
-			{
+			let Type::Pointer {
+				ownership: declared,
+				..
+			} = *self.cx.types.resolve(declared)
+			else {
 				self.report_by_value_through_pointer(receiver_ty, method);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+			};
+			match (ownership, declared) {
+				(Ownership::Exclusive, Ownership::Shared) => {
+					receiver = self.shared_receiver(receiver, to, memory);
+				}
+				(Ownership::Shared, Ownership::Exclusive) => {
+					self.report_shared_receiver(receiver, method);
+					return self.body.push(
+						ExprKind::Error,
+						TypeIndex::ERROR,
+						span,
+					);
+				}
+				_ => {}
 			}
 		}
 		self.build_function_call(
@@ -406,7 +436,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			Some(trait_index) => {
 				let found = self.cx.resolve_trait_qualified_value(
 					&mut self.obligations.types,
-					self.scope.env,
+					self.scope.generic_env,
 					receiver,
 					trait_index,
 					member.ident,
@@ -424,7 +454,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				MemberLookup::Found(found)
 			}
 			None => self.cx.resolve_applicable_member(
-				self.scope.env,
+				self.scope.assumption_env,
 				receiver,
 				key,
 				reference,
@@ -472,7 +502,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			Referent::Member(found.selected_kind(self.cx.defs)),
 		);
 		self.check_member_access(found, key, member);
-		let receiver = self.normalized(receiver, self.scope.env);
+		let receiver = self.normalized(receiver, self.scope.assumption_env);
 		// The impl's arguments, and whether the selection proved them; a
 		// trait's declaration is selected over `[Self]` instead.
 		let (kind, impl_args, proven) = match found {
@@ -492,7 +522,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					.match_impl_target(
 						header.target.inner,
 						receiver,
-						&self.cx.type_envs,
+						&self.cx.generic_envs,
 						header.type_params,
 					)
 					.expect("the selected impl's target matches the receiver");
@@ -507,7 +537,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				TraitMemberSelection::Impl(kind) => {
 					let Ok(Some(TraitImplLookup::Concrete { args, .. })) =
 						self.cx.find_trait_impl_query(
-							self.scope.env,
+							self.scope.assumption_env,
 							receiver,
 							trait_index,
 						)
@@ -577,11 +607,11 @@ impl BodyContext<'_, '_, '_, '_> {
 				continue;
 			};
 			let (env, pattern) = (header.type_params, header.target.inner);
-			let count = self.cx.type_envs.generic_count(env);
+			let count = self.cx.generic_envs.generic_count(env);
 			let mut impl_args =
 				vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.cx.types.learn(
-				&self.cx.type_envs,
+				&self.cx.generic_envs,
 				env,
 				&mut impl_args,
 				pattern,
@@ -590,7 +620,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			let instantiated = self.cx.types.substitute(
 				pattern,
 				Substitution {
-					envs: &self.cx.type_envs,
+					envs: &self.cx.generic_envs,
 					env,
 					args: &impl_args,
 				},
@@ -714,6 +744,61 @@ impl BodyContext<'_, '_, '_, '_> {
 				))
 				.with_note(format!(
 					"call it through its type: `{receiver}::{name}(..)`"
+				)),
+		);
+	}
+
+	/// The exclusive pointer `receiver` to `to` in `memory`, as a shared one:
+	/// `receiver.*.&`.
+	fn shared_receiver(
+		&mut self,
+		receiver: ExprIdx,
+		to: TypeIndex,
+		memory: TypeIndex,
+	) -> ExprIdx {
+		let span = self.body.span(receiver);
+		let place = self.body.push_place(Place {
+			kind: PlaceKind::Deref { pointer: receiver },
+			ty: to,
+			memory,
+			mutable: true,
+			span,
+		});
+		let ty = self.cx.types.intern(Type::Pointer {
+			to,
+			memory,
+			ownership: Ownership::Shared,
+		});
+		self.body.push(ExprKind::AddressOf(place), ty, span)
+	}
+
+	/// A method that takes `self` by exclusive pointer, called on a shared
+	/// one.
+	fn report_shared_receiver(
+		&mut self,
+		receiver: ExprIdx,
+		method: &ast::PathSegment,
+	) {
+		let name = self.cx.strings.resolve(method.ident.inner).unwrap();
+		let found = self
+			.cx
+			.type_formatter()
+			.display_type(self.body.ty(receiver));
+		self.cx.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypeMistmatch.code())
+				.with_message(format!(
+					"`{name}` takes `self` by exclusive pointer, but the \
+					 receiver is `{found}`"
+				))
+				.with_label(
+					self.source_span(receiver)
+						.primary_label()
+						.with_message("a shared pointer"),
+				)
+				.with_label(Label::secondary(
+					self.scope.file_id,
+					method.ident.span,
 				)),
 		);
 	}

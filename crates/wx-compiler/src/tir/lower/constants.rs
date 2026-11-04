@@ -11,7 +11,7 @@ use super::{Body, ExprIdx, FunctionState, Lowerer, mir};
 use crate::diagnostics::{SourceSpan, TextSpan};
 use crate::tir::defs::ConstIdx;
 use crate::tir::eval::{ConstScalar, ResolvedConstant, Unevaluable, Val};
-use crate::tir::types::{Type, TypeIndex, TypeList};
+use crate::tir::types::{GenericArgs, Type, TypeIndex};
 use crate::vfs::FileId;
 
 impl Lowerer<'_, '_, '_, '_> {
@@ -21,13 +21,13 @@ impl Lowerer<'_, '_, '_, '_> {
 		state: &mut FunctionState,
 		expr: ExprIdx,
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
 		let span = body.span(expr);
 		let file_id = state.file_id;
 		let written: Vec<TypeIndex> =
-			self.context.types.list(type_args).to_vec();
+			self.context.generic_args.types(type_args).to_vec();
 		let args: Vec<TypeIndex> = written
 			.into_iter()
 			.map(|arg| self.substitute(arg, state.env, &state.args))

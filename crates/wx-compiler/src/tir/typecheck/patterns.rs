@@ -34,7 +34,7 @@ use crate::tir::defs::{BindingTarget, DefKind, StructIdx, TraitIdx};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
 use crate::tir::solver::SolverError;
-use crate::tir::types::{Type, TypeEnvOwner, TypeIndex, TypeList};
+use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
 use crate::vfs::FileId;
 
 /// The state of checking one pattern: where it is written, and the names it
@@ -269,16 +269,16 @@ impl BodyContext<'_, '_, '_, '_> {
 		if ty == TypeIndex::ERROR {
 			return ty;
 		}
-		let normalized = self.normalized(ty, self.scope.env);
+		let normalized = self.normalized(ty, self.scope.assumption_env);
 		match *self.cx.types.resolve(normalized) {
 			// A literal or inference placeholder has its own diagnostic.
 			Type::Error
 			| Type::Infer
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
-			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral => return ty,
+			| Type::CharLiteral => return ty,
+			// Unplaced data has its own diagnostic too.
+			Type::Slice { .. } | Type::Array { .. } => return ty,
 			_ => {}
 		}
 		let trait_index = self
@@ -288,7 +288,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			.eq
 			.expect("the stdlib must declare the `Eq` trait");
 		match self.cx.find_trait_impl_query(
-			self.scope.env,
+			self.scope.assumption_env,
 			normalized,
 			trait_index,
 		) {
@@ -1014,12 +1014,12 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.cx.diagnostics.push(diagnostic);
 			}
 			let params = self.cx.structs[usize::from(struct_index)].type_params;
-			let count = self.cx.type_envs.param_names(params).len();
+			let count = self.cx.generic_envs.param_names(params).len();
 			let mut written = vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.write_type_args(
 				segment,
 				params,
-				TypeEnvOwner::Struct(struct_index),
+				GenericEnvOwner::Struct(struct_index),
 				&mut written,
 			);
 			(struct_index, written)
@@ -1085,7 +1085,8 @@ impl BodyContext<'_, '_, '_, '_> {
 							span,
 						),
 						Some(integer)
-							if integer.in_range(u64::from(value), false) =>
+							if integer
+								.contains(i128::from(u32::from(value))) =>
 						{
 							self.body.push_pattern(
 								PatternKind::Int(u64::from(value)),
@@ -1094,23 +1095,12 @@ impl BodyContext<'_, '_, '_, '_> {
 							)
 						}
 						Some(_) => {
-							let ty =
-								self.cx.type_formatter().display_type(expected);
-							self.cx.diagnostics.push(
-								Diagnostic::error()
-									.with_code(
-										DiagnosticCode::IntegerLiteralOutOfRange
-											.code(),
-									)
-									.with_message(format!(
-										"character literal {value:?} out of \
-										 range for `{ty}`"
-									))
-									.with_label(Label::primary(
-										self.scope.file_id,
-										span,
-									)),
+							let diagnostic = self.cx.report_out_of_range(
+								format_args!("literal {value:?}"),
+								expected,
+								SourceSpan::new(self.scope.file_id, span),
 							);
+							self.cx.diagnostics.push(diagnostic);
 							self.error_pattern(span)
 						}
 					},
@@ -1175,21 +1165,18 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.report_pattern_mismatch(expected, "an integer", span);
 			return self.error_pattern(span);
 		};
-		if !integer.in_range(magnitude, negated) {
-			let shown = if negated {
-				format!("-{magnitude}")
-			} else {
-				magnitude.to_string()
-			};
-			let ty = self.cx.type_formatter().display_type(expected);
-			self.cx.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::IntegerLiteralOutOfRange.code())
-					.with_message(format!(
-						"literal `{shown}` out of range for `{ty}`"
-					))
-					.with_label(Label::primary(self.scope.file_id, span)),
+		let value = if negated {
+			-i128::from(magnitude)
+		} else {
+			i128::from(magnitude)
+		};
+		if !integer.contains(value) {
+			let diagnostic = self.cx.report_out_of_range(
+				format_args!("literal `{value}`"),
+				expected,
+				SourceSpan::new(self.scope.file_id, span),
 			);
+			self.cx.diagnostics.push(diagnostic);
 			return self.error_pattern(span);
 		}
 		let bits = if negated {
@@ -1234,10 +1221,13 @@ impl BodyContext<'_, '_, '_, '_> {
 					| DefKind::EnumVariant(constant) => {
 						let signature =
 							&self.cx.constants[usize::from(constant)];
-						let ty = self.normalized(signature.ty, signature.env);
+						let ty = self.normalized(
+							signature.ty,
+							self.cx.assumption_envs.of_frame(signature.env),
+						);
 						let kind = PatternKind::Constant {
 							constant,
-							type_args: TypeList::EMPTY,
+							type_args: GenericArgs::EMPTY,
 						};
 						Some((kind, ty))
 					}

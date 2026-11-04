@@ -49,9 +49,14 @@ types are left for later.
 
 ## What implements it
 
-Every type except `!` and any type that contains `!` (`(u32, !)`,
-`struct S(x: !)`). An uninhabited type has no representation: with
-`Repr = ()`, `transmute::<(), !>` would make a value of it.
+Every type, `!` included. A type that contains `!` (`!`, `(u32, !)`,
+`struct S(x: !)`) is uninhabited and held as `!`: `Repr = !`, and no Wasm
+value at all, since the code that would hold one is unreachable (a function
+returning `!` has the Wasm result `[]`, a local of it takes no Wasm local). It
+must still be a `StackValue`, since `func trap() -> !` and `local x: ! =
+trap();` hold one by value. Its `Repr` is `!` rather than `()` so that no other
+type's equals it: `transmute::<(), !>` would otherwise make a value of it.
+`!` is no `StackScalar`, so no global is one.
 
 | Type | `Repr` |
 | --- | --- |
@@ -125,7 +130,7 @@ flattening of the parts' `Repr`s. The compiler does not build such impls. It
 answers both questions directly:
 
 - **`X: StackValue`** holds when every part of `X` does (an abstract part by
-  its assumptions), and no part is `!`. `Wrap<T>` holds under `T: StackValue`.
+  its assumptions). `Wrap<T>` holds under `T: StackValue`.
 - **`<X as StackValue>::Repr`** normalizes by canonicalizing its self type,
   described next.
 
@@ -187,8 +192,8 @@ equally under every instantiation. **Incomplete** only as a trait system is:
   found as `Call`'s `Args`/`Result` are.
 - `Solver::stack_elements` (was `value_layout`) yields `TypeIndex` elements: a
   scalar (`is_stack_scalar`: `i32`, `i64`, `f32`, `f64`, `funcref`) or an
-  abstract part assumed `StackValue`, standing for its `Repr`. `!` makes it
-  `None`. A pointer into an abstract memory contributes `<M as Memory>::Size`
+  abstract part assumed `StackValue`, standing for its `Repr`; a type
+  containing `!` is the one element `!`, and `stack_repr` makes it `!`. A pointer into an abstract memory contributes `<M as Memory>::Size`
   (`push_address`), so `M::*u8`, `M::*u64` and `M::Size` are held alike.
 - `find_trait_impl_query`: `X: StackValue` holds when `stack_layout` is
   known, as `TraitImplLookup::Builtin`.

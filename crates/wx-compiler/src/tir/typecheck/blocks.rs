@@ -33,18 +33,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		signature: &ast::FunctionSignature,
 		block: &Spanned<ast::Expression>,
 	) -> (Body, Obligations) {
-		let env = self.scope.env;
+		let env = self.scope.generic_env;
 		let function = &self.cx.functions[usize::from(function_index)];
 		let (param_types, return_type) =
 			(function.param_types, function.return_type);
 		// A type with a reported part in it expects nothing more.
-		let return_type = self.normalized(return_type, env);
+		let return_type =
+			self.normalized(return_type, self.cx.assumption_envs.of_frame(env));
 		let return_type = self.cx.types.collapse_error(return_type);
 		self.enter_root(block.span, return_type);
 		for (at, param) in signature.params.iter().enumerate() {
 			let param = &param.inner.inner;
 			let ty = self.cx.types.list(param_types)[at];
-			let ty = self.normalized(ty, env);
+			let ty = self.normalized(ty, self.cx.assumption_envs.of_frame(env));
 			let ty = self.cx.types.collapse_error(ty);
 			// An unnamed parameter binds nothing, so it has no local.
 			let local = match param.binding {
@@ -215,7 +216,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			ast::Statement::Expression(expr) => {
 				let value = self.build(expr, TypeIndex::INFER);
 				let ty = self.body.ty(value);
-				if self.cx.types.has_literal(ty) {
+				if self.cx.types.needs_context(ty) {
 					self.report_annotation_required(value);
 				} else if ty != TypeIndex::UNIT
 					&& ty != TypeIndex::NEVER
@@ -251,13 +252,13 @@ impl BodyContext<'_, '_, '_, '_> {
 		value: &Spanned<ast::Expression>,
 		ty: &Spanned<ast::TypeExpression>,
 	) -> ExprIdx {
-		let ty = self.cx.resolve_type(
+		let ty = self.cx.resolve_value_type(
 			&mut self.obligations.types,
 			self.scope,
 			ty,
 			InferPolicy::Allow,
 		);
-		let ty = self.normalized(ty, self.scope.env);
+		let ty = self.normalized(ty, self.scope.assumption_env);
 		self.check(value, ty)
 	}
 
@@ -272,13 +273,13 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let declared = ty.map(|ty| {
-			let ty = self.cx.resolve_type(
+			let ty = self.cx.resolve_value_type(
 				&mut self.obligations.types,
 				self.scope,
 				ty,
 				InferPolicy::Allow,
 			);
-			self.normalized(ty, self.scope.env)
+			self.normalized(ty, self.scope.assumption_env)
 		});
 		let value = match declared {
 			Some(declared) => self.check(value, declared),
@@ -292,7 +293,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			None => value_ty,
 		};
-		if self.cx.types.has_literal(local_ty)
+		// A written slice or array is reported as held by value.
+		let unplaced =
+			declared.is_none() && self.cx.types.needs_context(local_ty);
+		if unplaced
+			|| self.cx.types.has_literal(local_ty)
 			|| self.cx.types.has_infer(local_ty)
 		{
 			self.cx.diagnostics.push(
@@ -332,7 +337,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> ExprIdx {
 		let scrutinee = self.build(scrutinee, TypeIndex::INFER);
 		let mut scrutinee_ty = self.body.ty(scrutinee);
-		if self.cx.types.has_literal(scrutinee_ty) {
+		if self.cx.types.needs_context(scrutinee_ty) {
 			self.report_annotation_required(scrutinee);
 			scrutinee_ty = TypeIndex::ERROR;
 		}
@@ -391,7 +396,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			// An untyped arm that gave way keeps the typed one as the one the
 			// rest join.
-			if !self.cx.types.has_literal(self.body.ty(arm)) {
+			if !self.cx.types.needs_context(self.body.ty(arm)) {
 				joined = arm;
 			}
 		}
@@ -486,8 +491,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			return TypeIndex::ERROR;
 		}
 		match (
-			self.cx.types.has_literal(first_ty),
-			self.cx.types.has_literal(second_ty),
+			self.cx.types.needs_context(first_ty),
+			self.cx.types.needs_context(second_ty),
 		) {
 			(true, false) => {
 				self.coerce(first, second_ty);
@@ -712,7 +717,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.expect(value, hint);
 			return;
 		}
-		if self.cx.types.has_literal(ty) && !allow_untyped {
+		if self.cx.types.needs_context(ty) && !allow_untyped {
 			self.report_annotation_required(value);
 			self.scope_types[usize::from(scope)].ty = TypeIndex::ERROR;
 			return;

@@ -37,6 +37,7 @@ use string_interner::symbol::SymbolU32;
 use super::body::{
 	Body, ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange,
 };
+use super::bounds::AssumptionEnvIdx;
 use super::defs::{
 	ConstIdx, EnumIdx, GlobalIdx, MemberKind, MemberOwner, MemoryIdx,
 };
@@ -46,8 +47,9 @@ use super::operators::Scalar;
 use super::signatures::TypeContext;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, Solver, SolverError, SolverFrame,
+	metadata_len,
 };
-use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
+use super::types::{GenericEnvIdx, Substitution, Type, TypeIndex, TypeList};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::index::index_newtype;
@@ -115,8 +117,8 @@ pub(super) struct EvalError {
 pub(super) enum EvalErrorKind {
 	/// The node is not a constant expression.
 	NotConst,
-	/// The result does not fit the operand type, or a shift amount is outside
-	/// its width.
+	/// The result is not representable as the operand type, or a shift amount
+	/// is outside its width.
 	Overflow(Operation),
 	DivisionByZero,
 	RemainderByZero,
@@ -144,6 +146,10 @@ pub(super) enum ConstValueState {
 	/// Being checked or evaluated; asking for it again closes a loop.
 	InProgress,
 	Evaluated(ConstValue),
+	/// The value of an untyped constant (`const X: {integer}`): a number of
+	/// its kind, exact, with no type until a use gives it one
+	/// (`TypeContext::exact_value`).
+	Exact(i128),
 	/// Not evaluated at all: the evaluator holds no values of its type
 	/// (`check_value_type`), or it has no initializer. A constant that reads
 	/// it is not a constant expression.
@@ -161,7 +167,9 @@ impl ConstValueState {
 		match self {
 			Self::Unchecked | Self::Checked | Self::InProgress => None,
 			Self::Evaluated(value) => Some(Ok(value)),
-			Self::NoValue => Some(Err(Unevaluable::NoValue)),
+			// Read as a number of a type only through `exact_value`, by the
+			// use that gives it one.
+			Self::NoValue | Self::Exact(_) => Some(Err(Unevaluable::NoValue)),
 			Self::Poisoned | Self::Failed(_) => Some(Err(Unevaluable::Silent)),
 		}
 	}
@@ -264,12 +272,12 @@ fn body_of<'a>(
 }
 
 /// The type scope `owner`'s body is checked in: a global's is the root.
-fn body_env(view: &TypeContext<'_, '_, '_>, owner: Owner<'_>) -> TypeEnvIdx {
+fn body_env(view: &TypeContext<'_, '_, '_>, owner: Owner<'_>) -> GenericEnvIdx {
 	match owner.body {
 		Evaluated::Constant(const_index) => {
 			view.constants[usize::from(const_index)].env
 		}
-		Evaluated::Global(_) => TypeEnvIdx::ROOT,
+		Evaluated::Global(_) => GenericEnvIdx::ROOT,
 	}
 }
 
@@ -294,7 +302,7 @@ impl TypeContext<'_, '_, '_> {
 	/// reported, where they are read.
 	pub(super) fn evaluate_constant(&mut self, const_index: ConstIdx) {
 		let env = self.constants[usize::from(const_index)].env;
-		if self.type_envs.generic_count(env) > 0 {
+		if self.generic_envs.generic_count(env) > 0 {
 			if self.solver.const_values[usize::from(const_index)]
 				== ConstValueState::Unchecked
 			{
@@ -330,7 +338,12 @@ impl TypeContext<'_, '_, '_> {
 		// A value type of other than one Wasm value is reported by the type's
 		// check (`Global::Value`'s bounds).
 		if self
-			.push_scalars(TypeEnvIdx::ROOT, ty, &mut scalars, &mut Vec::new())
+			.push_scalars(
+				AssumptionEnvIdx::ROOT,
+				ty,
+				&mut scalars,
+				&mut Vec::new(),
+			)
 			.is_err() || scalars.len() != 1
 		{
 			return;
@@ -422,9 +435,37 @@ impl TypeContext<'_, '_, '_> {
 	/// The bits of `instance`'s one number, as a type means it; `None` when
 	/// it has no such value, which its check or the site naming it reports.
 	pub(super) fn instance_bits(&mut self, instance: Instance) -> Option<u64> {
+		// An untyped constant is a count where a type reads it.
+		if self.constants[usize::from(instance.constant)]
+			.ty
+			.is_literal()
+		{
+			return self
+				.exact_value(instance.constant)
+				.ok()
+				.and_then(|value| u64::try_from(value).ok());
+		}
 		self.instance_value(instance, None)
 			.ok()
 			.and_then(value_bits)
+	}
+
+	/// The value of an untyped constant (`const X: {integer}`), memoized and
+	/// read on the solver's stack as any constant's is. `Err` as
+	/// `const_value`'s.
+	pub(super) fn exact_value(
+		&mut self,
+		const_index: ConstIdx,
+	) -> Result<i128, Unevaluable> {
+		let instance = Instance::of(const_index);
+		if let Err(Unevaluable::Silent) = self.instance_value(instance, None) {
+			return Err(Unevaluable::Silent);
+		}
+		match *self.solver.const_state(instance) {
+			ConstValueState::Exact(value) => Ok(value),
+			ConstValueState::NoValue => Err(Unevaluable::NoValue),
+			_ => Err(Unevaluable::Silent),
+		}
 	}
 
 	/// A constant's value as a pattern compares with it: the bits of its one
@@ -707,9 +748,19 @@ impl TypeContext<'_, '_, '_> {
 			body: Evaluated::Constant(const_index),
 			args: &args,
 		};
-		let scalars = self.constant_scalars(const_index, owner);
+		// An untyped constant's value is one exact number of its kind.
+		let untyped = self.constants[usize::from(const_index)].ty.is_literal();
+		let scalars = if untyped {
+			Ok(Vec::new())
+		} else {
+			self.constant_scalars(const_index, owner)
+		};
 		let mut stack = Vec::new();
+		let mut exact = None;
 		let evaluated = match &scalars {
+			Ok(_) if untyped => self
+				.eval_exact(owner, root)
+				.map(|value| exact = Some(value)),
 			Ok(_) => self.eval(owner, root, &mut stack),
 			Err(_) => Ok(()),
 		};
@@ -729,6 +780,7 @@ impl TypeContext<'_, '_, '_> {
 		};
 
 		let state = match evaluated {
+			Ok(()) if let Some(value) = exact => ConstValueState::Exact(value),
 			Ok(())
 				if stack
 					.iter()
@@ -886,47 +938,20 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::Function { .. }
 			| ExprKind::Global(_)
 			| ExprKind::Memory(_) => {}
-			ExprKind::String(contents) => {
-				self.eval_string(owner, contents, ty, span, stack)?;
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. } => {
+				self.eval_static(owner, expr, ty, stack)?;
 			}
-			// Each element's values, one after another, laid out as static
-			// data.
-			ExprKind::Array { elements } => {
-				let start = stack.len();
-				for at in 0..elements.len() {
-					let element = body_of(self, owner).args(elements)[at];
-					self.eval(owner, element, stack)?;
-				}
-				let count = u64::try_from(elements.len()).unwrap();
-				self.place_static(owner, ty, span, count, start, stack)?;
-			}
-			// One element's values, laid out `count` times; `_` is the
-			// array's own length.
-			ExprKind::ArrayRepeat { value, count } => {
-				let start = stack.len();
-				self.eval(owner, value, stack)?;
-				let count = match count {
-					Some(count) => {
-						self.eval(owner, count, stack)?;
-						match stack.pop().expect("a count's value").val {
-							Val::I32(bits) => u64::from(bits),
-							Val::I64(bits) => bits,
-							_ => {
-								unreachable!("a count is of a memory's `Size`")
-							}
-						}
-					}
-					// As long as its array.
-					None => {
-						let Type::Array { length, .. } =
-							*self.types.resolve(ty)
-						else {
-							unreachable!("`_` is the length of an array")
-						};
-						self.length_value(owner, length)?
-					}
-				};
-				self.place_static(owner, ty, span, count, start, stack)?;
+			// A constant holding data in no memory, placed here: a copy of
+			// its data in the memory `ty` names.
+			ExprKind::Const { constant, .. }
+				if matches!(self.types.resolve(ty), Type::Pointer { .. })
+					&& self.types.is_unplaced(
+						self.constants[usize::from(constant)].ty,
+					) =>
+			{
+				self.place_data(owner, expr, ty, stack)?;
 			}
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
 			ExprKind::Const {
@@ -939,7 +964,7 @@ impl TypeContext<'_, '_, '_> {
 			} => {
 				let args: Vec<TypeIndex> = (0..type_args.len())
 					.map(|at| {
-						let arg = self.types.list(type_args)[at];
+						let arg = self.generic_args.types(type_args)[at];
 						self.instance_type(owner, arg)
 					})
 					.collect();
@@ -952,8 +977,8 @@ impl TypeContext<'_, '_, '_> {
 					.expect("an enum's repr holds one");
 				stack.push(binary(BinaryOp::Add, previous, one).map_err(own)?);
 			}
-			// A negated literal is one literal, so `-128` fits an `i8` although
-			// `128` does not.
+			// A negated literal is one literal, so `-128` is representable as
+			// an `i8` although `128` does not.
 			ExprKind::PrimitiveUnary {
 				op: UnaryOp::InvertSign,
 				operand,
@@ -1003,6 +1028,162 @@ impl TypeContext<'_, '_, '_> {
 		Ok(())
 	}
 
+	/// The exact value of a node of an untyped constant's body: a literal of
+	/// its kind, another untyped constant, or `-` and a binary operator over
+	/// them, computed as mathematical integers (in `i128`), since the value has
+	/// no type yet; each use checks it is representable as the type it is
+	/// given.
+	fn eval_exact(
+		&mut self,
+		owner: Owner<'_>,
+		expr: ExprIdx,
+	) -> Result<i128, Halt> {
+		let body = body_of(self, owner);
+		let (kind, ty, span) =
+			(body.kind(expr), body.ty(expr), body.span(expr));
+		if ty == TypeIndex::ERROR {
+			return Err(Halt::Silent);
+		}
+		let own = |kind| Halt::Own(EvalError { span, kind });
+		match kind {
+			ExprKind::Int(value) => Ok(i128::from(value)),
+			ExprKind::Char(value) => Ok(i128::from(u32::from(value))),
+			ExprKind::Const { constant, .. } => {
+				self.exact_value(constant).map_err(|error| match error {
+					Unevaluable::NoValue => own(EvalErrorKind::NotConst),
+					Unevaluable::Silent => Halt::Silent,
+				})
+			}
+			ExprKind::PrimitiveUnary {
+				op: UnaryOp::InvertSign,
+				operand,
+			} => self
+				.eval_exact(owner, operand)?
+				.checked_neg()
+				.ok_or(own(EvalErrorKind::Overflow(Operation::Negate))),
+			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
+				let a = self.eval_exact(owner, lhs)?;
+				let b = self.eval_exact(owner, rhs)?;
+				exact_binary(op, a, b).map_err(own)
+			}
+			ExprKind::Error => Err(Halt::Silent),
+			_ => Err(own(EvalErrorKind::NotConst)),
+		}
+	}
+
+	/// The data `expr` of `owner`'s body is (a string or array literal, or a
+	/// constant holding one) placed in the memory the pointer type `ty`
+	/// names: the pointer, pushed.
+	fn place_data(
+		&mut self,
+		owner: Owner<'_>,
+		expr: ExprIdx,
+		ty: TypeIndex,
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		let body = body_of(self, owner);
+		let (kind, span) = (body.kind(expr), body.span(expr));
+		match kind {
+			ExprKind::String(_)
+			| ExprKind::Array { .. }
+			| ExprKind::ArrayRepeat { .. } => self.eval_static(owner, expr, ty, stack),
+			ExprKind::Const { constant, .. } => {
+				let root = match &self.const_bodies[usize::from(constant)] {
+					ConstBody::Built(body) => body.root(),
+					// Reported where the constant is.
+					_ => return Err(Halt::Silent),
+				};
+				let owner = Owner {
+					body: Evaluated::Constant(constant),
+					args: &[],
+				};
+				self.place_data(owner, root, ty, stack)
+			}
+			_ => Err(Halt::Own(EvalError {
+				span,
+				kind: EvalErrorKind::NotConst,
+			})),
+		}
+	}
+
+	/// A string or array literal `expr` of `owner`'s body as type `ty`:
+	/// placed (`ty` a pointer), its data is allocated and its pointer pushed.
+	/// Not placed (`ty` an array, a constant's), its elements are evaluated,
+	/// which reports what fails in them, and it holds no number of its own.
+	fn eval_static(
+		&mut self,
+		owner: Owner<'_>,
+		expr: ExprIdx,
+		ty: TypeIndex,
+		stack: &mut Vec<ConstScalar>,
+	) -> Result<(), Halt> {
+		let body = body_of(self, owner);
+		let (kind, span) = (body.kind(expr), body.span(expr));
+		let placed = matches!(self.types.resolve(ty), Type::Pointer { .. });
+		let start = stack.len();
+		match kind {
+			ExprKind::String(contents) if placed => {
+				self.eval_string(owner, contents, ty, span, stack)
+			}
+			ExprKind::String(_) => Ok(()),
+			// Each element's values, one after another, laid out as static
+			// data.
+			ExprKind::Array { elements } => {
+				for at in 0..elements.len() {
+					let element = body_of(self, owner).args(elements)[at];
+					self.eval(owner, element, stack)?;
+				}
+				if !placed {
+					stack.truncate(start);
+					return Ok(());
+				}
+				let count = u64::try_from(elements.len()).unwrap();
+				self.place_static(owner, ty, span, count, start, stack)
+			}
+			// One element's values, laid out `count` times; `_` is the
+			// array's own length.
+			ExprKind::ArrayRepeat { value, count } => {
+				self.eval(owner, value, stack)?;
+				if !placed {
+					stack.truncate(start);
+					return Ok(());
+				}
+				let count = match count {
+					Some(count) => self.repeat_count(owner, count)?,
+					// As long as its array.
+					None => {
+						let Type::Array { length, .. } =
+							*self.types.resolve(self.static_pointee(ty))
+						else {
+							unreachable!("`_` is the length of an array")
+						};
+						self.length_value(owner, length)?
+					}
+				};
+				self.place_static(owner, ty, span, count, start, stack)
+			}
+			_ => unreachable!("only a literal is static data"),
+		}
+	}
+
+	/// A repeat's `count`, a node of `owner`'s body: an integer literal or a
+	/// free constant (`repeat_length`), a count whatever type it was given.
+	fn repeat_count(
+		&mut self,
+		owner: Owner<'_>,
+		count: ExprIdx,
+	) -> Result<u64, Halt> {
+		match body_of(self, owner).kind(count) {
+			ExprKind::Int(bits) => Ok(bits),
+			ExprKind::Const { constant, .. } => {
+				let length = self.types.intern_const(constant, &[]);
+				self.length_value(owner, length)
+			}
+			// Reported where the count is written.
+			_ => Err(Halt::Silent),
+		}
+	}
+
 	/// A string literal's value: its contents, placed as static data.
 	fn eval_string(
 		&mut self,
@@ -1042,24 +1223,27 @@ impl TypeContext<'_, '_, '_> {
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
 		let (memory, width) = self.static_memory(owner, ty, span)?;
-		let (Type::Slice { of, .. } | Type::Array { of, .. }) =
-			*self.types.resolve(ty)
+		let (Type::Slice { of } | Type::Array { of, .. }) =
+			*self.types.resolve(self.static_pointee(ty))
 		else {
 			unreachable!("static data is an array or a slice")
 		};
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
-		let (layout, places) =
-			match self.memory_values(body_env(self, owner), of) {
-				Ok(Some(layout)) => layout,
-				Ok(None) => {
-					return Err(Halt::Own(EvalError {
-						span,
-						kind: EvalErrorKind::NotConst,
-					}));
-				}
-				Err(_) => return Err(Halt::Silent),
-			};
+		let (layout, places) = match self.memory_values(
+			self.assumption_envs
+				.of_frame(body_env(self, owner)),
+			of,
+		) {
+			Ok(Some(layout)) => layout,
+			Ok(None) => {
+				return Err(Halt::Own(EvalError {
+					span,
+					kind: EvalErrorKind::NotConst,
+				}));
+			}
+			Err(_) => return Err(Halt::Silent),
+		};
 		// An offset into an allocation is a `u32`.
 		let Some(size) = count
 			.checked_mul(u64::from(layout.size))
@@ -1099,20 +1283,29 @@ impl TypeContext<'_, '_, '_> {
 		Ok(())
 	}
 
-	/// The memory static data of type `ty` (a shared array or slice) is
-	/// placed in, and the scalar its address is held as. In a memory not
-	/// known yet there is nowhere to place it.
+	/// The slice or array static data of type `ty`, a pointer to it, points
+	/// at.
+	fn static_pointee(&self, ty: TypeIndex) -> TypeIndex {
+		let Type::Pointer { to, .. } = *self.types.resolve(ty) else {
+			unreachable!("static data is behind a pointer")
+		};
+		to
+	}
+
+	/// The memory static data of type `ty` (a shared pointer to an array or
+	/// a slice) is placed in, and the scalar its address is held as. In a
+	/// memory not known yet there is nowhere to place it.
 	fn static_memory(
 		&mut self,
 		owner: Owner<'_>,
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Scalar), Halt> {
-		let scope = body_env(self, owner);
-		let (Type::Slice { memory, .. } | Type::Array { memory, .. }) =
-			*self.types.resolve(ty)
-		else {
-			unreachable!("static data is an array or a slice")
+		let scope = self
+			.assumption_envs
+			.of_frame(body_env(self, owner));
+		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
+			unreachable!("static data is behind a pointer")
 		};
 		let Some(memory_index) = self.memory_of(scope, memory) else {
 			return Err(Halt::Own(EvalError {
@@ -1145,7 +1338,8 @@ impl TypeContext<'_, '_, '_> {
 			val: Val::MemoryOffset { alloc, offset: 0 },
 			scalar: width,
 		});
-		if let Type::Slice { .. } = self.types.resolve(ty) {
+		if let Type::Slice { .. } = self.types.resolve(self.static_pointee(ty))
+		{
 			stack.push(match width {
 				Scalar::U32 => ConstScalar::u32(u32::try_from(len).unwrap()),
 				Scalar::U64 => ConstScalar::u64(len),
@@ -1163,7 +1357,7 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<u64, Halt> {
 		let env = body_env(self, owner);
 		match self.normalize(
-			env,
+			self.assumption_envs.of_frame(env),
 			length,
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
@@ -1185,13 +1379,18 @@ impl TypeContext<'_, '_, '_> {
 		let ty = self.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.type_envs,
+				envs: &self.generic_envs,
 				env,
 				args: owner.args,
 			},
 		);
-		self.normalize(env, ty, NormalizationDepth::Deep, RewriteFlags::ALL)
-			.unwrap_or(TypeIndex::ERROR)
+		self.normalize(
+			self.assumption_envs.of_frame(env),
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)
+		.unwrap_or(TypeIndex::ERROR)
 	}
 
 	/// The instance of `constant` with `args`, keyed by its interned
@@ -1214,7 +1413,7 @@ impl TypeContext<'_, '_, '_> {
 	/// What `constant` with `args` reads: itself, or, for a trait's
 	/// declaration, the member of the impl its `Self` selects, the trait's
 	/// default when the impl inherits it, or the compiler's answer for a
-	/// trait it implements (`Array::SIZE`).
+	/// trait it implements (`Array::LEN`).
 	pub(super) fn resolve_constant(
 		&mut self,
 		constant: ConstIdx,
@@ -1233,7 +1432,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 		Ok(
 			match self.find_trait_impl_query(
-				TypeEnvIdx::ROOT,
+				AssumptionEnvIdx::ROOT,
 				receiver,
 				trait_index,
 			)? {
@@ -1260,12 +1459,12 @@ impl TypeContext<'_, '_, '_> {
 						*self.types.resolve(receiver)
 					else {
 						unreachable!(
-							"the compiler implements only `Array::SIZE`"
+							"the compiler implements only `Array::LEN`"
 						)
 					};
 					debug_assert_eq!(
 						Some(constant),
-						self.defs.intrinsics.array_size
+						self.defs.intrinsics.array_len
 					);
 					ResolvedConstant::Length(length)
 				}
@@ -1289,6 +1488,25 @@ impl TypeContext<'_, '_, '_> {
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
 		match self.resolve_constant(constant, args) {
+			Ok(ResolvedConstant::Instance(instance))
+				if self.constants[usize::from(instance.constant)]
+					.ty
+					.is_literal() =>
+			{
+				let value = match self.exact_value(instance.constant) {
+					Ok(value) => value,
+					Err(Unevaluable::NoValue) => {
+						return Err(Halt::Own(EvalError {
+							span,
+							kind: EvalErrorKind::NotConst,
+						}));
+					}
+					Err(Unevaluable::Silent) => return Err(Halt::Silent),
+				};
+				// Its use checked that the value is representable.
+				stack.push(exact_scalar(value, ty).ok_or(Halt::Silent)?);
+				Ok(())
+			}
 			Ok(ResolvedConstant::Instance(instance)) => {
 				let used_at = SourceSpan::new(body_file(self, owner), span);
 				self.read_constant(instance, Some(used_at), span, stack)
@@ -1297,10 +1515,9 @@ impl TypeContext<'_, '_, '_> {
 				let length = self.length_value(owner, length)?;
 				let scalar = Scalar::from_type(ty)
 					.expect("an array's length is of a memory's `Size`");
-				stack.push(
-					literal(length, false, scalar)
-						.expect("an array's length fits its memory's `Size`"),
-				);
+				stack.push(literal(length, false, scalar).expect(
+					"an array's length is representable as its memory's `Size`",
+				));
 				Ok(())
 			}
 			Ok(ResolvedConstant::Abstract) => Err(Halt::Own(EvalError {
@@ -1346,7 +1563,12 @@ impl TypeContext<'_, '_, '_> {
 		let (ty, scope) = (signature.ty, signature.env);
 		let ty = self.instance_type(owner, ty);
 		let mut scalars = Vec::new();
-		self.push_scalars(scope, ty, &mut scalars, &mut Vec::new())?;
+		self.push_scalars(
+			self.assumption_envs.of_frame(scope),
+			ty,
+			&mut scalars,
+			&mut Vec::new(),
+		)?;
 		Ok(scalars)
 	}
 
@@ -1362,7 +1584,7 @@ impl TypeContext<'_, '_, '_> {
 	/// instantiated, contains itself, which is reported on the struct.
 	fn push_scalars(
 		&mut self,
-		scope: TypeEnvIdx,
+		scope: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<Scalar>,
 		visiting: &mut Vec<TypeIndex>,
@@ -1385,13 +1607,16 @@ impl TypeContext<'_, '_, '_> {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				self.push_scalars(scope, repr, out, visiting)
 			}
-			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
-				out.push(self.address_scalar(scope, memory)?);
-				Ok(())
-			}
-			Type::Slice { memory, .. } => {
+			// An address, then the pointee's counts.
+			Type::Pointer { to, memory, .. } => {
 				let scalar = self.address_scalar(scope, memory)?;
-				out.extend([scalar, scalar]);
+				let metadata = self.pointer_metadata(scope, to, memory);
+				let count = match metadata {
+					Ok(Some(metadata)) => metadata_len(&self.types, metadata),
+					Ok(None) => return Err(ConstValueState::NoValue),
+					Err(_) => return Err(ConstValueState::Poisoned),
+				};
+				out.extend(std::iter::repeat_n(scalar, 1 + count));
 				Ok(())
 			}
 			Type::Tuple { elements } => {
@@ -1430,7 +1655,7 @@ impl TypeContext<'_, '_, '_> {
 					let field = self.types.substitute(
 						field,
 						Substitution {
-							envs: &self.type_envs,
+							envs: &self.generic_envs,
 							env,
 							args: &args,
 						},
@@ -1454,7 +1679,7 @@ impl TypeContext<'_, '_, '_> {
 	/// for an address into a memory not known yet.
 	fn address_scalar(
 		&mut self,
-		scope: TypeEnvIdx,
+		scope: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Scalar, ConstValueState> {
 		let Some(memory_index) = self.memory_of(scope, memory) else {
@@ -1475,7 +1700,7 @@ impl TypeContext<'_, '_, '_> {
 	/// The memory `memory` names in `scope`, if it is a known one.
 	fn memory_of(
 		&mut self,
-		scope: TypeEnvIdx,
+		scope: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Option<MemoryIdx> {
 		let memory = self
@@ -1751,8 +1976,55 @@ fn write_value(
 	}
 }
 
+/// An untyped constant's exact `value` as a value of `ty`, the type its use
+/// gave it: a `Char`, an integer or a float. `None` when it is not
+/// representable, which that use reports.
+fn exact_scalar(value: i128, ty: TypeIndex) -> Option<ConstScalar> {
+	if ty == TypeIndex::CHAR {
+		return char::from_u32(u32::try_from(value).ok()?)
+			.map(ConstScalar::char);
+	}
+	match Scalar::from_type(ty)? {
+		Scalar::F32 => Some(ConstScalar::f32(value as f32)),
+		Scalar::F64 => Some(ConstScalar::f64(value as f64)),
+		scalar => literal(
+			u64::try_from(value.unsigned_abs()).ok()?,
+			value < 0,
+			scalar,
+		),
+	}
+}
+
+/// `a op b` on two exact integers: `Err` when the result is outside `i128`,
+/// for a zero divisor, or a shift amount that is negative or past the
+/// width. Division truncates and a remainder has the dividend's sign, as
+/// wasm's `div_s`/`rem_s`; a right shift is arithmetic.
+fn exact_binary(op: BinaryOp, a: i128, b: i128) -> Result<i128, EvalErrorKind> {
+	let overflow = EvalErrorKind::Overflow(Operation::Binary(op));
+	let shift = || u32::try_from(b).ok().filter(|&shift| shift < i128::BITS);
+	match op {
+		BinaryOp::Add => a.checked_add(b).ok_or(overflow),
+		BinaryOp::Sub => a.checked_sub(b).ok_or(overflow),
+		BinaryOp::Mul => a.checked_mul(b).ok_or(overflow),
+		BinaryOp::Div if b == 0 => Err(EvalErrorKind::DivisionByZero),
+		BinaryOp::Rem if b == 0 => Err(EvalErrorKind::RemainderByZero),
+		BinaryOp::Div => a.checked_div(b).ok_or(overflow),
+		BinaryOp::Rem => a.checked_rem(b).ok_or(overflow),
+		BinaryOp::BitAnd => Ok(a & b),
+		BinaryOp::BitOr => Ok(a | b),
+		BinaryOp::BitXor => Ok(a ^ b),
+		// Exact: no bit is shifted out.
+		BinaryOp::LeftShift => shift()
+			.map(|shift| a << shift)
+			.filter(|&shifted| shifted >> shift().unwrap() == a)
+			.ok_or(overflow),
+		BinaryOp::RightShift => shift().map(|shift| a >> shift).ok_or(overflow),
+		_ => unreachable!("an untyped operator is arithmetic"),
+	}
+}
+
 /// The integer literal `value` as `scalar`, negated when it is written
-/// `-value`; `None` when it does not fit.
+/// `-value`; `None` when it is not representable.
 fn literal(value: u64, negated: bool, scalar: Scalar) -> Option<ConstScalar> {
 	if !scalar.is_signed() {
 		if negated && value != 0 {
@@ -2125,11 +2397,9 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 	use crate::vfs::{self, FileId, Files};
 
-	const STDLIB: &str = include_str!("../../std/main.wx");
-
 	/// `test_case!(case = "source")` declares the graph, the inputs and the
 	/// swept `TestCase` borrowing them as three locals of the calling test.
-	/// The test's items are appended to the real stdlib.
+	/// The source is a binary over the real stdlib.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut graph = source_graph($source);
@@ -2140,18 +2410,18 @@ mod tests {
 
 	fn source_graph(source: &str) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
 						"main.wx".to_string(),
-						format!("{STDLIB}\n{source}"),
+						source.to_string(),
 					)]),
 				),
 			)
 			.unwrap();
-		builder.set_stdlib(root_id);
 		let graph = builder.build(root_id);
 		DiagnosticView::new(
 			"parse",
@@ -2246,12 +2516,14 @@ mod tests {
 			context.sweep();
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
-			let stdlib_end = STDLIB.len() as u32;
+			let root_file = defs
+				.namespaces
+				.file_id(Scope::Package(defs.root_package).into());
 			context.diagnostics.retain(|diagnostic| {
-				let in_stdlib =
-					diagnostic.labels.first().is_some_and(|label| {
-						(label.range.start as u32) < stdlib_end
-					});
+				let in_stdlib = diagnostic
+					.labels
+					.first()
+					.is_some_and(|label| label.file_id != root_file);
 				!(in_stdlib
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
@@ -2396,18 +2668,18 @@ mod tests {
 	}
 
 	#[test]
-	fn an_array_types_size_is_its_length() {
+	fn an_arrays_len_is_its_length() {
 		test_case!(
 			case = indoc! {r#"
 				memory heap: u32;
-				memory wide: u64;
 				const N: u32 = 3;
-				type A = heap::&[u8; 4];
-				const QUALIFIED: u32 = <heap::&[u8; 4] as Array>::SIZE;
-				const ALIASED: u32 = A::SIZE;
-				const NAMED: u32 = <heap::*[u16; N] as Array>::SIZE + 1;
-				const WIDE: u64 = <wide::&[u8; 9] as Array>::SIZE;
-				const FILLED: heap::&[u8; A::SIZE] = [7; _];
+				type A = [u8; 4];
+				const QUALIFIED: u32 = <[u8; 4] as Array>::LEN;
+				const ALIASED: u32 = A::LEN;
+				const NAMED: u32 = <[u16; N] as Array>::LEN + 1;
+				const WIDE: u64 = <[u8; 9] as Array>::LEN;
+				const NARROW: u8 = <[u8; 9] as Array>::LEN;
+				const FILLED: heap::&[u8; A::LEN] = [7; _];
 			"#}
 		);
 		case.diagnostics().assert_none();
@@ -2425,6 +2697,7 @@ mod tests {
 		assert_eq!(case.value("ALIASED"), [ConstScalar::u32(4)]);
 		assert_eq!(case.value("NAMED"), [ConstScalar::u32(4)]);
 		assert_eq!(case.value("WIDE"), [ConstScalar::u64(9)]);
+		assert_eq!(case.value("NARROW"), [ConstScalar::u8(9)]);
 	}
 
 	#[test]
@@ -2461,6 +2734,54 @@ mod tests {
 			panic!("expected one value");
 		};
 		assert_eq!(&*case.pointee(*address).0.bytes, b"a\n");
+	}
+
+	#[test]
+	fn a_constant_of_data_is_placed_at_each_use() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				memory wide: u64;
+				const GREETING: [u8; 5] = "hello";
+				const NUMBERS: [u16; 3] = [1, 2, 3];
+				const FILLED: [u8; 4] = [7; 4];
+				const ALIAS: [u8; 5] = GREETING;
+				const HEAP: heap::&[u8] = GREETING;
+				const WIDE: wide::&[u8; 5] = ALIAS;
+				const AGAIN: heap::&[u8; 5] = GREETING;
+				const WORDS: heap::&[u16] = NUMBERS;
+				const SEVENS: heap::&[u8; 4] = FILLED;
+			"#}
+		);
+		case.diagnostics().assert_none();
+		// Data in no memory has no value of its own: each use places it.
+		assert!(matches!(case.state("GREETING"), ConstValueState::NoValue));
+		let [address, length] = case.value("HEAP") else {
+			panic!("expected two values");
+		};
+		assert_eq!(*length, ConstScalar::u32(5));
+		let (allocation, _) = case.pointee(*address);
+		assert_eq!(allocation.memory, case.memory("heap"));
+		assert_eq!(&*allocation.bytes, b"hello");
+		let [wide] = case.value("WIDE") else {
+			panic!("expected an address");
+		};
+		assert_eq!(wide.scalar, Scalar::U64);
+		assert_eq!(case.pointee(*wide).0.memory, case.memory("wide"));
+		assert_eq!(&*case.pointee(*wide).0.bytes, b"hello");
+		// Each use is a copy of its own.
+		let [again] = case.value("AGAIN") else {
+			panic!("expected an address");
+		};
+		assert_ne!(again.val, address.val);
+		let [words, _] = case.value("WORDS") else {
+			panic!("expected two values");
+		};
+		assert_eq!(&*case.pointee(*words).0.bytes, [1, 0, 2, 0, 3, 0]);
+		let [sevens] = case.value("SEVENS") else {
+			panic!("expected an address");
+		};
+		assert_eq!(&*case.pointee(*sevens).0.bytes, [7; 4]);
 	}
 
 	#[test]
@@ -2713,5 +3034,149 @@ mod tests {
 		);
 		case.diagnostics()
 			.assert_error(DiagnosticCode::ConstEvaluationFailed);
+	}
+
+	fn exact(case: &TestCase<'_>, name: &str) -> i128 {
+		match case.state(name) {
+			ConstValueState::Exact(value) => *value,
+			state => panic!("expected `{name}` to be untyped: {state:?}"),
+		}
+	}
+
+	#[test]
+	fn an_untyped_constant_takes_the_type_of_each_use() {
+		test_case!(
+			case = indoc! {r#"
+				const X: {integer} = 200 + 55;
+				const A: u8 = X;
+				const B: i64 = -X;
+				const C: u32 = X * 2;
+				const F: f32 = X;
+				const U: {char} = 'u';
+				const CODE: u8 = U;
+				const LETTER: Char = U;
+			"#}
+		);
+		case.diagnostics().assert_none();
+		assert_eq!(exact(&case, "X"), 255);
+		assert_eq!(case.value("A"), [ConstScalar::u8(255)]);
+		assert_eq!(case.value("B"), [ConstScalar::i64(-255)]);
+		assert_eq!(case.value("C"), [ConstScalar::u32(510)]);
+		assert_eq!(case.value("F"), [ConstScalar::f32(255.0)]);
+		assert_eq!(exact(&case, "U"), 117);
+		assert_eq!(case.value("CODE"), [ConstScalar::u8(117)]);
+		assert_eq!(case.value("LETTER"), [ConstScalar::char('u')]);
+	}
+
+	/// The value has no type yet, so nothing in between is bounded by one.
+	/// A typed use types each operand, as it would literals: `BIG >> 66` in a
+	/// `u8` is `BIG` as a `u8`.
+	#[test]
+	fn an_untyped_constant_is_computed_exactly() {
+		test_case!(
+			case = indoc! {r#"
+				const BIG: {integer} = 1 << 70;
+				const SHIFTED: {integer} = BIG >> 66;
+				const SMALL: u8 = SHIFTED;
+				const TYPED_OPERAND: u8 = BIG >> 66;
+				const MINUS_ONE: {integer} = 0 - 1;
+				const SIGNED: i8 = MINUS_ONE;
+				const TOO_BIG: {integer} = 1 << 127;
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::ConstEvaluationFailed,
+		]);
+		case.diagnostics().assert_error_saying(
+			"constant `BIG` cannot be represented as `u8`",
+		);
+		case.diagnostics()
+			.assert_error_saying("evaluation of constant `TOO_BIG` failed");
+		assert_eq!(exact(&case, "BIG"), 1 << 70);
+		assert_eq!(case.value("SMALL"), [ConstScalar::u8(16)]);
+		assert_eq!(case.value("SIGNED"), [ConstScalar::i8(-1)]);
+	}
+
+	#[test]
+	fn an_untyped_constant_is_checked_where_it_is_used() {
+		test_case!(
+			case = indoc! {r#"
+				const X: {integer} = 300;
+				const MINUS: {integer} = -1;
+				const A: u8 = X;
+				const B: u16 = X;
+				func f() -> u32 { MINUS }
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+		case.diagnostics()
+			.assert_error_saying("constant `X` cannot be represented as `u8`");
+		case.diagnostics().assert_error_saying(
+			"constant `MINUS` cannot be represented as `u32`",
+		);
+		assert_eq!(case.value("B"), [ConstScalar::u16(300)]);
+	}
+
+	/// No default type: an untyped constant needs a use that gives one, as
+	/// a literal does.
+	#[test]
+	fn an_untyped_constant_has_no_default_type() {
+		test_case!(
+			case = indoc! {r#"
+				const X: {integer} = 4;
+				func f() { local x = X; }
+			"#}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+	}
+
+	#[test]
+	fn an_untyped_constant_holds_only_its_kind() {
+		test_case!(
+			case = indoc! {r#"
+				const LETTER: {integer} = 'a';
+				const TYPED: u32 = 4;
+				const NAMED: {integer} = TYPED;
+				const NUMBER: {char} = 'a' + 1;
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(exact(&case, "NUMBER"), 98);
+	}
+
+	/// A length is a count: an untyped constant is representable as it by
+	/// value.
+	#[test]
+	fn an_untyped_constant_is_an_array_length() {
+		test_case!(
+			case = indoc! {r#"
+				memory heap: u32;
+				const N: {integer} = 2 * 2;
+				const NEGATIVE: {integer} = -4;
+				const HUGE: {integer} = 1 << 40;
+				const S: heap::&[u8; N] = "abcd";
+				const T: heap::&[u8; NEGATIVE] = "abcd";
+				func g(p: heap::&[u8; HUGE]) {}
+			"#}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::IntegerLiteralOutOfRange,
+		]);
+		case.diagnostics().assert_error_saying(
+			"an array's length is a count, but `NEGATIVE` is `-4`",
+		);
+		let [address, ..] = case.value("S") else {
+			panic!("expected an address");
+		};
+		assert_eq!(*case.pointee(*address).0.bytes, *b"abcd");
 	}
 }

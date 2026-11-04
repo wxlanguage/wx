@@ -31,63 +31,70 @@ pub struct Char(value: u32);
 /// A reference to a function of any signature: a Wasm `funcref`.
 pub type funcref;
 
+/// The literal kinds, written `{integer}` and `{char}`: the type of a literal
+/// that has no type yet, and of an untyped constant
+/// (`const X: {integer} = 4;`), which takes its type where it is used.
+pub type integer;
+
+pub type char;
+
 /// Aborts execution by trapping: normal control flow never continues past a
 /// call to `trap`, so it has the bottom type `!`.
 pub crate func trap() -> !;
 
-pub trait Add {
+pub trait Add: StackValue {
     func add(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Sub {
+pub trait Sub: StackValue {
     func sub(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Mul {
+pub trait Mul: StackValue {
     func mul(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Div {
+pub trait Div: StackValue {
     func div(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Rem {
+pub trait Rem: StackValue {
     func rem(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Neg {
+pub trait Neg: StackValue {
     func neg(self: Self) -> Self;
 }
 
-pub trait BitAnd {
+pub trait BitAnd: StackValue {
     func bitand(self: Self, rhs: Self) -> Self;
 }
 
-pub trait BitOr {
+pub trait BitOr: StackValue {
     func bitor(self: Self, rhs: Self) -> Self;
 }
 
-pub trait BitXor {
+pub trait BitXor: StackValue {
     func bitxor(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Shl {
+pub trait Shl: StackValue {
     func shl(self: Self, rhs: Self) -> Self;
 }
 
-pub trait Shr {
+pub trait Shr: StackValue {
     func shr(self: Self, rhs: Self) -> Self;
 }
 
-pub trait BitNot {
+pub trait BitNot: StackValue {
     func bitnot(self: Self) -> Self;
 }
 
-pub trait Not {
+pub trait Not: StackValue {
     func not(self: Self) -> Self;
 }
 
-pub trait PartialEq {
+pub trait PartialEq: StackValue {
     func eq(self: Self, other: Self) -> Bool;
 
     #[inline]
@@ -192,86 +199,70 @@ pub trait Ord: PartialOrd + Eq {
 
 /// The slice of `len` values starting at `data`.
 #[inline]
-pub func slice_from_parts<Mem: Memory, T>(data: Mem::&T, len: Mem::Size) -> Mem::&[T] {
+pub func slice_from_parts<Mem: Memory, T: StackValue>(data: Mem::&T, len: Mem::Size) -> Mem::&[T] {
     transmute((data, len))
 }
 
 /// The exclusive slice of `len` values starting at `data`.
 #[inline]
-pub func slice_from_parts_mut<Mem: Memory, T>(data: Mem::*T, len: Mem::Size) -> Mem::*[T] {
+pub func slice_from_parts_mut<Mem: Memory, T: StackValue>(data: Mem::*T, len: Mem::Size) -> Mem::*[T] {
     transmute((data, len))
 }
 
 /// The array of the one value `data` points at.
 #[inline]
-pub func array_from_ref<Mem: Memory, T>(data: Mem::&T) -> Mem::&[T; 1] {
+pub func array_from_ref<Mem: Memory, T: StackValue>(data: Mem::&T) -> Mem::&[T; 1] {
     transmute(data)
 }
 
 /// The exclusive array of the one value `data` points at.
 #[inline]
-pub func array_from_mut<Mem: Memory, T>(data: Mem::*T) -> Mem::*[T; 1] {
+pub func array_from_mut<Mem: Memory, T: StackValue>(data: Mem::*T) -> Mem::*[T; 1] {
     transmute(data)
 }
 
-/// A run of values in one memory. The compiler implements it for every slice
-/// and array type, `&` and `*` alike.
+/// A run of values in no memory, `[T]` or `[T; N]`, which only a pointer
+/// holds. The compiler implements it for every slice and array; a method
+/// takes the memory from its receiver, since one slice is what pointers into
+/// every memory point at.
 pub trait Slice {
     type Value;
-    type Mem: Memory;
 
-    func len(self: Self) -> Self::Mem::Size;
+    func len<M: Memory>(self: M::&Self) -> M::Size;
 
-    func as_ref(self: Self) -> Self::Mem::&Self::Value;
-
-    /// The value at `index`; traps when it is out of bounds.
-    func index(self: Self, index: Self::Mem::Size) -> Self::Mem::&Self::Value;
+    func as_ref<M: Memory>(self: M::&Self) -> M::&Self::Value;
 
     #[inline]
-    func first(self: Self) -> Self::Mem::&Self::Value {
+    func first<M: Memory>(self: M::&Self) -> M::&Self::Value {
         if self.len() == 0 { trap() };
-        self.index(0)
+        self[0].&
     }
 
     #[inline]
-    func last(self: Self) -> Self::Mem::&Self::Value {
+    func last<M: Memory>(self: M::&Self) -> M::&Self::Value {
         if self.len() == 0 { trap() };
-        self.index(self.len() - 1)
+        self[self.len() - 1].&
     }
 }
 
-/// A run of values that may be written: the compiler implements it for every
-/// exclusive slice and array type.
-pub trait SliceMut: Slice {
-    func as_ptr(self: Self) -> Self::Mem::*Self::Value;
-
-    /// The value at `index`; traps when it is out of bounds.
-    func index_mut(self: Self, index: Self::Mem::Size) -> Self::Mem::*Self::Value;
-
-    #[inline]
-    func first_mut(self: Self) -> Self::Mem::*Self::Value {
-        if self.len() == 0 { trap() };
-        self.index_mut(0)
-    }
-
-    #[inline]
-    func last_mut(self: Self) -> Self::Mem::*Self::Value {
-        if self.len() == 0 { trap() };
-        self.index_mut(self.len() - 1)
-    }
-}
-
-/// A run of values whose length is part of its type: the compiler implements
-/// it for every array type.
+/// A slice whose length is part of its type, `[T; N]`: the compiler
+/// implements it for every array.
 pub trait Array: Slice {
-    const SIZE: Self::Mem::Size;
+    const LEN: {integer};
 
-    func as_slice(self: Self) -> Self::Mem::&[Self::Value];
-}
+    func as_slice<
+        Self: Array where { const LEN: Mem::Size, Value: StackValue },
+        Mem: Memory
+    >(self: Mem::&Self) -> Mem::&[Self::Value] {
+        slice_from_parts(transmute(self), Self::LEN)
+    }
 
-/// The compiler implements it for every exclusive array type.
-pub trait ArrayMut: Array + SliceMut {
-    func as_slice_mut(self: Self) -> Self::Mem::*[Self::Value];
+    func as_slice_mut<
+        Self: Array where { const LEN: Mem::Size, Value: StackValue },
+        Mem: Memory,
+    >(self: Mem::*Self) -> Mem::*[Self::Value] {
+        slice_from_parts_mut(transmute(self), Self::LEN)
+    }
 }
 
 pub crate func i64_extend_i32(value: i32) -> i64;
@@ -2135,11 +2126,11 @@ pub typeset Integer: Add + Sub + Mul + Div + Rem + BitAnd + BitOr + BitXor + Shl
     i64,
 }
 
-pub trait UnsignedInt {
+pub trait UnsignedInt: StackValue {
     type Signed: SignedInt where { Unsigned = Self };
 }
 
-pub trait SignedInt {
+pub trait SignedInt: StackValue {
     type Unsigned: UnsignedInt where { Signed = Self };
 }
 
@@ -2202,11 +2193,12 @@ crate func global_get<G: Global>(g: G) -> G::Value;
 
 crate func global_set<G: Global>(g: G, value: G::Value);
 
-/// How a value sits on the Wasm stack. Every type but `!` (and any type
-/// containing it) is one; the compiler answers it from the type's structure.
-/// `Repr` is the value's Wasm values as wx's own primitives: its parts in
-/// declaration order, flattened, zero-sized ones dropped. `Point(u32, u32)` and
-/// `(u8, u8)` are both `(i32, i32)`, `Meters(u32)` is `i32`, `()` is `()`.
+/// How a value sits on the Wasm stack; the compiler answers it from the type's
+/// structure. `Repr` is the value's Wasm values as wx's own primitives: its
+/// parts in declaration order, flattened, zero-sized ones dropped.
+/// `Point(u32, u32)` and `(u8, u8)` are both `(i32, i32)`, `Meters(u32)` is
+/// `i32`, `()` is `()`. A type containing `!` has no value and is held as `!`,
+/// which no other type is, so `transmute` never makes one.
 pub trait StackValue {
     type Repr;
 }
@@ -2222,7 +2214,51 @@ pub crate func transmute<
     U: StackValue where { Repr = T::Repr },
 >(value: T) -> U;
 
-pub trait Global {
+/// Every pointer type, `M::&T` and `M::*T`; the compiler answers it from the
+/// pointer's structure. `Metadata` is what the pointer carries beside its
+/// address, each count a `Memory::Size`: `()` for a pointer to a value or an
+/// array, the length for a pointer to a slice.
+pub trait Pointer: StackValue where {
+    Repr = <(Self::Memory::Size, Self::Metadata) as StackValue>::Repr,
+} {
+    type Memory: Memory;
+    type Pointee;
+    type Metadata: StackValue;
+}
+
+/// The pointer of type `P` at `address`, carrying `metadata` beside it.
+#[inline]
+pub func from_raw_parts<P: Pointer>(
+    address: P::Memory::Size,
+    metadata: P::Metadata,
+) -> P {
+    transmute(address, metadata)
+}
+
+#[inline]
+pub func into_raw_parts<P: Pointer>(
+    pointer: P
+) -> (P::Memory::Size, P::Metadata) {
+    transmute(pointer)
+}
+
+/// What `pointer` carries beside its address: a slice's length, or `()`.
+#[inline]
+pub func metadata<P: Pointer>(pointer: P) -> P::Metadata {
+    local (_, metadata) =
+        transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+    metadata
+}
+
+/// Where `pointer` points: its address in its memory.
+#[inline]
+pub func address<P: Pointer>(pointer: P) -> P::Memory::Size {
+    local (address, _) =
+        transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+    address
+}
+
+pub trait Global: StackValue {
     type Value: StackValue where { Repr: StackScalar };
 
     func get(self: Self) -> Self::Value {
@@ -2236,11 +2272,8 @@ pub trait GlobalMut: Global {
     }
 }
 
-pub trait Memory {
+pub trait Memory: StackValue {
     type Size: PointerSize;
-
-    /// This constant exposes internal information about which index this memory will use in the generated wasm module.
-    const INDEX: u32;
 
     /// The address right after the compiler's statically-placed data (string and array literals) in this memory.
     /// This can be used as a safe starting point for making dynamic allocations.
@@ -2269,9 +2302,9 @@ pub trait Memory {
     }
 }
 
-pub trait Call {
-    type Args;
-    type Result;
+pub trait Call: StackValue {
+    type Args: StackValue;
+    type Result: StackValue;
 
     func call(self: Self, args: Self::Args) -> Self::Result;
 }
@@ -2315,14 +2348,14 @@ pub trait Allocator {
     func allocate(self: Self::Mem::*Self, layout: Layout<Self::Mem>) -> Self::Mem::*u8;
 
     #[inline]
-    func allocate_value<T>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
+    func allocate_value<T: StackValue>(self: Self::Mem::*Self, value: T) -> Self::Mem::*T {
         local ptr: Self::Mem::*T = transmute(self.allocate(Layout::of::<T>()));
         ptr.* = value;
         ptr
     }
 
     #[inline]
-    func allocate_slice_uninit<T>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
+    func allocate_slice_uninit<T: StackValue>(self: Self::Mem::*Self, len: Self::Mem::Size) -> Self::Mem::*[T] {
         slice_from_parts_mut(
             transmute::<_, Self::Mem::*T>(self.allocate(Layout::array::<T>(len))),
             len,
@@ -2346,28 +2379,8 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
     }
 
     #[inline]
-    pub func from_ref(ref: Mem::&T) -> Self {
-        Self({ addr: transmute(ref) })
-    }
-
-    #[inline]
-    pub func from_ptr(ptr: Mem::*T) -> Self {
-        Self({ addr: transmute(ptr) })
-    }
-
-    #[inline]
     pub func from_addr(addr: Mem::Size) -> Self {
         Self({ addr })
-    }
-
-    #[inline]
-    pub func as_ref(self: Self) -> Mem::&T {
-        transmute(self.addr)
-    }
-
-    #[inline]
-    pub func as_ptr(self: Self) -> Mem::*T {
-        transmute(self.addr)
     }
 
     #[inline]
@@ -2378,6 +2391,29 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
     #[inline]
     pub func cast<U>(self: Self) -> RawPtr<Mem, U> {
         RawPtr({ addr: self.addr })
+    }
+}
+
+/// What needs `T`'s pointers thin: an address and nothing else.
+impl<Mem: Memory, T: StackValue> RawPtr<Mem, T> {
+    #[inline]
+    pub func from_ref(ref: Mem::&T) -> Self {
+        Self({ addr: transmute(ref) })
+    }
+
+    #[inline]
+    pub func from_ptr(ptr: Mem::*T) -> Self {
+        Self({ addr: transmute(ptr) })
+    }
+
+    #[inline]
+    pub func as_ref(self: Self) -> Mem::&T {
+        transmute(self.addr)
+    }
+
+    #[inline]
+    pub func as_ptr(self: Self) -> Mem::*T {
+        transmute(self.addr)
     }
 }
 

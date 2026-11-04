@@ -1391,7 +1391,7 @@ pub enum BoundExpression {
 	/// associated-type bindings.
 	WithBindings {
 		path: Box<BoundExpression>,
-		bindings: Box<[AssocTypeBinding]>,
+		bindings: Box<[AssocBinding]>,
 	},
 	/// `Bound1 + Bound2 + Bound3` — multiple bounds joined by `+`.
 	BoundList(Box<[Spanned<BoundExpression>]>),
@@ -1489,23 +1489,36 @@ pub struct FunctionTypeParam {
 	pub ty: Box<Spanned<TypeExpression>>,
 }
 
-/// `Size = u32` (equality) or `Size: UnsignedInt` (bound) inside a `where {
-/// }` block — constrains an associated type.
+/// One entry of a `where { .. }` block, constraining a member of the bound's
+/// trait: an associated type (`Size = u32`, `Size: UnsignedInt`) or, marked
+/// `const`, an associated constant (`const LEN: u32`, `const LEN = 4`).
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub struct AssocTypeBinding {
+pub struct AssocBinding {
 	pub name: Spanned<SymbolU32>,
-	pub kind: AssocTypeBindingKind,
+	pub kind: AssocBindingKind,
 }
 
-/// The right-hand side of an [`AssocTypeBinding`].
+/// What an [`AssocBinding`] states. The `const` keyword alone tells a
+/// constant's entry from a type's.
 #[cfg_attr(test, derive(serde::Serialize))]
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum AssocTypeBindingKind {
+pub enum AssocBindingKind {
 	/// `Size = u32` — the associated type must equal exactly this type.
 	Equals(Spanned<TypeExpression>),
 	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
 	Bound(Spanned<BoundExpression>),
+	/// `const LEN: u32` — the constant's value must be representable as this
+	/// type.
+	ConstRepresentable {
+		const_span: TextSpan,
+		ty: Spanned<TypeExpression>,
+	},
+	/// `const LEN = 4` — the constant must have this value.
+	ConstEquals {
+		const_span: TextSpan,
+		value: Spanned<ConstArgument>,
+	},
 }
 
 /// `*T` = exclusive pointer/slice/array, `&T` = shared, always read-only.
@@ -1545,28 +1558,22 @@ pub enum TypeExpression {
 		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
 		result: Option<Box<Spanned<TypeExpression>>>,
 	},
-	/// `*u8` or `&u8`; `heap::*u8` names the memory it points into. The
-	/// parser accepts an untagged pointer and the type checker reports it,
-	/// since a pointer always needs its memory. The tag is carried on the
-	/// pointer itself
-	/// (rather than as a separate wrapper node) so only a pointer/slice/
-	/// array can ever be tagged, a constraint the parser otherwise has to
-	/// enforce by hand against an arbitrary inner type expression.
+	/// `*u8` or `&u8`; `heap::*u8` names the memory it points into, and
+	/// `heap::&[u8]` is a pointer to the slice `[u8]`. The parser accepts
+	/// an untagged pointer and the type checker reports it, since a pointer
+	/// always needs its memory. The tag is carried on the pointer itself
+	/// (rather than as a separate wrapper node) so only a pointer can ever
+	/// be tagged, a constraint the parser otherwise has to enforce by hand
+	/// against an arbitrary inner type expression.
 	Pointer {
 		ownership: Ownership,
 		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 	},
-	/// `*[u8]` or `&[u8]`; see `Pointer` for the optional `heap::` tag.
-	Slice {
-		ownership: Ownership,
-		memory: Option<Box<[PathSegment]>>,
-		inner: Box<Spanned<TypeExpression>>,
-	},
-	/// `*[u8; 5]` or `&[u8; N]`; see `Pointer` for the optional `heap::` tag.
+	/// `[u8]`, a slice: a run of values in no memory, held by a pointer.
+	Slice { inner: Box<Spanned<TypeExpression>> },
+	/// `[u8; 5]` or `[u8; N]`, an array: a slice of a known length.
 	Array {
-		ownership: Ownership,
-		memory: Option<Box<[PathSegment]>>,
 		inner: Box<Spanned<TypeExpression>>,
 		/// A literal or a constant, as a constant argument is.
 		length: Spanned<ConstArgument>,
@@ -1587,6 +1594,9 @@ pub enum TypeExpression {
 		inner: Box<Spanned<TypeExpression>>,
 		segments: Box<[PathSegment]>,
 	},
+	/// `{integer}`: a literal kind, the type of a literal that has none yet.
+	/// The braces hold any type; TIR checks that it names a literal kind.
+	Literal { inner: Box<Spanned<TypeExpression>> },
 }
 
 /// A pattern, as written. What each term *is* follows from its own shape:
@@ -3086,8 +3096,17 @@ impl<'ctx> Parser<'ctx> {
 				Some(Keyword::Const) => Some(self.lexer.next().span),
 				_ => None,
 			};
+			// `Self` is a name here, as `self` is among a function's
+			// parameters; where it may stand is the signature's to check.
+			let self_type =
+				matches!(self.peek_keyword(), Some(Keyword::SelfPascal));
 			let name_span = self.next_expect(Token::Identifier)?.span;
-			let name_symbol = self.intern_identifier(name_span);
+			let name_symbol = if self_type {
+				self.strings
+					.get_or_intern(name_span.extract_str(self.source))
+			} else {
+				self.intern_identifier(name_span)
+			};
 			let name = Spanned {
 				inner: name_symbol,
 				span: name_span,
@@ -3213,7 +3232,7 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// A constant: a literal, `_`, or a path naming one, written with a
-	/// bracketed root (`<T as Array>::SIZE`, `<heap::&[u8; 4]>::SIZE`) or
+	/// bracketed root (`<T as Array>::LEN`, `<[u8; 4]>::LEN`) or
 	/// without.
 	fn parse_const_argument(&mut self) -> Result<Spanned<ConstArgument>, ()> {
 		if let Some(Keyword::Underscore) = self.peek_keyword() {
@@ -3280,16 +3299,17 @@ impl<'ctx> Parser<'ctx> {
 		self.parse_const_argument()
 	}
 
-	/// Parse `where { Name = Type, Name: Bound, ... }` — the bindings block
+	/// Parse `where { Name = Type, Name: Bound, const N: Type, const N = 4 }`,
+	/// the bindings block
 	/// following a type. Returns a `Spanned` whose span covers from `{`
 	/// through `}`. The `where` keyword must already be confirmed as the next
 	/// token by the caller.
 	fn parse_where_bindings(
 		&mut self,
-	) -> Result<Spanned<Box<[AssocTypeBinding]>>, ()> {
+	) -> Result<Spanned<Box<[AssocBinding]>>, ()> {
 		self.lexer.next(); // consume `where`
 		let open_span = self.next_expect(Token::OpenBrace)?.span;
-		let mut bindings: Vec<AssocTypeBinding> = Vec::new();
+		let mut bindings: Vec<AssocBinding> = Vec::new();
 
 		let close_span = loop {
 			let peeked = self.lexer.peek();
@@ -3308,19 +3328,39 @@ impl<'ctx> Parser<'ctx> {
 				break peeked.span;
 			}
 
+			let const_span = match self.peek_keyword() {
+				Some(Keyword::Const) => Some(self.lexer.next().span),
+				_ => None,
+			};
 			let name_span = self.next_expect(Token::Identifier)?.span;
 			let name = Spanned {
 				inner: self.intern_identifier(name_span),
 				span: name_span,
 			};
-			let kind = if self.lexer.next_if(Token::Colon).is_some() {
-				AssocTypeBindingKind::Bound(self.parse_bounds_expression()?)
-			} else {
+			let colon = self.lexer.next_if(Token::Colon).is_some();
+			if !colon {
 				self.next_expect(Token::Eq)?;
-				AssocTypeBindingKind::Equals(self.parse_type_expression()?)
+			}
+			let kind = match (const_span, colon) {
+				(None, true) => {
+					AssocBindingKind::Bound(self.parse_bounds_expression()?)
+				}
+				(None, false) => {
+					AssocBindingKind::Equals(self.parse_type_expression()?)
+				}
+				(Some(const_span), true) => {
+					AssocBindingKind::ConstRepresentable {
+						const_span,
+						ty: self.parse_type_expression()?,
+					}
+				}
+				(Some(const_span), false) => AssocBindingKind::ConstEquals {
+					const_span,
+					value: self.parse_const_argument()?,
+				},
 			};
 			self.lexer.next_if(Token::Comma);
-			bindings.push(AssocTypeBinding { name, kind });
+			bindings.push(AssocBinding { name, kind });
 		};
 
 		Ok(Spanned {
@@ -3539,6 +3579,18 @@ impl<'ctx> Parser<'ctx> {
 				})
 			}
 			Token::OpenParen => self.parse_tuple_or_paren_type_expression(),
+			Token::OpenBracket => self.parse_slice_type_expression(),
+			Token::OpenBrace => {
+				let open = self.lexer.next().span; // consume `{`
+				let inner = self.parse_type_expression()?;
+				let close = self.next_expect(Token::CloseBrace)?.span;
+				Ok(Spanned {
+					inner: TypeExpression::Literal {
+						inner: Box::new(inner),
+					},
+					span: TextSpan::new(open.start, close.end),
+				})
+			}
 			Token::LeftArrow => {
 				let open_span = self.lexer.next().span; // consume `<`
 				self.parse_qualified_path_type_expression(open_span)
@@ -3667,12 +3719,11 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// Parses a leading `*`/`&` sigil (not yet consumed — the caller only
-	/// peeks to route here) and everything after it: a bare type (`*T`,
-	/// `&T` → `Pointer`), or a bracketed one (`*[T]`/`&[T]` → `Slice`,
-	/// `*[T; N]`/`&[T; N]` → `Array`). `memory` is the path already parsed
-	/// before an explicit `heap::` tag, if any — its first segment's start
-	/// becomes the whole expression's span start instead of the sigil's
-	/// own, since the tag is written before it.
+	/// peeks to route here) and the type it points at, a slice included
+	/// (`*[T]`, `&[T; N]`). `memory` is the path already parsed before an
+	/// explicit `heap::` tag, if any — its first segment's start becomes the
+	/// whole expression's span start instead of the sigil's own, since the
+	/// tag is written before it.
 	fn parse_pointer_type_expression(
 		&mut self,
 		memory: Option<Box<[PathSegment]>>,
@@ -3688,46 +3739,37 @@ impl<'ctx> Parser<'ctx> {
 			.and_then(|segments| segments.first())
 			.map_or(sigil.span.start, |segment| segment.ident.span.start);
 
-		if self.lexer.peek().inner != Token::OpenBracket {
-			let inner = self.parse_type_expression()?;
-			let span = TextSpan::new(start, inner.span.end);
-			return Ok(Spanned {
-				inner: TypeExpression::Pointer {
-					ownership,
-					memory,
-					inner: Box::new(inner),
-				},
-				span,
-			});
-		}
-
-		self.lexer.next(); // consume `[`
 		let inner = self.parse_type_expression()?;
+		let span = TextSpan::new(start, inner.span.end);
+		Ok(Spanned {
+			inner: TypeExpression::Pointer {
+				ownership,
+				memory,
+				inner: Box::new(inner),
+			},
+			span,
+		})
+	}
+
+	/// Parses a slice or an array, `[T]` or `[T; N]`, from its `[` (not yet
+	/// consumed).
+	fn parse_slice_type_expression(
+		&mut self,
+	) -> Result<Spanned<TypeExpression>, ()> {
+		let open = self.lexer.next().span; // consume `[`
+		let inner = Box::new(self.parse_type_expression()?);
 		let next = self.lexer.next();
 		match next.inner {
-			Token::CloseBracket => {
-				let span = TextSpan::new(start, next.span.end);
-				Ok(Spanned {
-					inner: TypeExpression::Slice {
-						ownership,
-						memory,
-						inner: Box::new(inner),
-					},
-					span,
-				})
-			}
+			Token::CloseBracket => Ok(Spanned {
+				inner: TypeExpression::Slice { inner },
+				span: TextSpan::new(open.start, next.span.end),
+			}),
 			Token::SemiColon => {
 				let length = self.parse_length()?;
 				let close_span = self.next_expect(Token::CloseBracket)?.span;
-				let span = TextSpan::new(start, close_span.end);
 				Ok(Spanned {
-					inner: TypeExpression::Array {
-						ownership,
-						memory,
-						inner: Box::new(inner),
-						length,
-					},
-					span,
+					inner: TypeExpression::Array { inner, length },
+					span: TextSpan::new(open.start, close_span.end),
 				})
 			}
 			_ => {

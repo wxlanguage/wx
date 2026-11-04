@@ -10,7 +10,7 @@
 //! `self` right after — the same reason the legacy one existed as its own
 //! type rather than living on the (bigger, `&mut`-heavy) `Builder`.
 //!
-//! Borrows `types`/`defs`/`strings` plus `type_envs` for generic parameter
+//! Borrows `types`/`defs`/`strings` plus `generic_envs` for generic parameter
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
 //! The formatter currently wraps `TypeContext`'s pieces.
@@ -22,7 +22,7 @@ use crate::ast::{Ownership, StringInterner};
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
 use super::defs::{ConstIdx, DefinitionRegistry, MemberOwner};
 use super::signatures::TypeContext;
-use super::types::{Type, TypeEnvArena, TypeIndex, TypeInterner};
+use super::types::{GenericEnvArena, Type, TypeIndex, TypeInterner};
 
 /// The bytes a type may take in a message, as rustc shortens a long type.
 const TYPE_DISPLAY_BUDGET: usize = 64;
@@ -31,7 +31,7 @@ pub(super) struct TypeFormatter<'a> {
 	pub(super) types: &'a TypeInterner,
 	pub(super) defs: &'a DefinitionRegistry,
 	pub(super) strings: &'a StringInterner,
-	pub(super) type_envs: &'a TypeEnvArena,
+	pub(super) generic_envs: &'a GenericEnvArena,
 	/// How many bytes a type may take before the rest of it is written as
 	/// `...`. A type can be far larger than its interned form (a doubling
 	/// chain of shared parts is a handful of types and 2^n leaves), so this
@@ -53,7 +53,7 @@ impl TypeContext<'_, '_, '_> {
 			types: &self.types,
 			defs: self.defs,
 			strings: self.strings,
-			type_envs: &self.type_envs,
+			generic_envs: &self.generic_envs,
 			budget: TYPE_DISPLAY_BUDGET,
 		}
 	}
@@ -103,19 +103,35 @@ impl BoundFormatter<'_> {
 			if i > 0 {
 				f.push_str(", ");
 			}
-			let symbol = self.type_formatter.defs.assoc_types
-				[usize::from(binding.target.assoc_type_index)]
-			.name
-			.inner;
-			f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
+			let defs = self.type_formatter.defs;
+			let name =
+				|symbol| self.type_formatter.strings.resolve(symbol).unwrap();
 			match &binding.kind {
-				BindingRequirement::Equals(ty) => {
+				BindingRequirement::Equals(target, ty) => {
+					f.push_str(name(
+						defs.assoc_types[usize::from(target.assoc_type_index)]
+							.name
+							.inner,
+					));
 					f.push_str(" = ");
 					self.type_formatter.write_type(f, ty.inner);
 				}
-				BindingRequirement::Bound(bounds) => {
+				BindingRequirement::Bound(target, bounds) => {
+					f.push_str(name(
+						defs.assoc_types[usize::from(target.assoc_type_index)]
+							.name
+							.inner,
+					));
 					f.push_str(": ");
 					self.write_bounds(f, bounds);
+				}
+				BindingRequirement::Representable(target, ty) => {
+					f.push_str("const ");
+					f.push_str(name(
+						defs.constants[usize::from(target.constant)].name.inner,
+					));
+					f.push_str(": ");
+					self.type_formatter.write_type(f, ty.inner);
 				}
 			}
 		}
@@ -158,8 +174,6 @@ impl TypeFormatter<'_> {
 			Type::IntegerLiteral => f.push_str("{integer}"),
 			Type::FloatLiteral => f.push_str("{float}"),
 			Type::CharLiteral => f.push_str("{char}"),
-			Type::StringLiteral => f.push_str("{string}"),
-			Type::ArrayLiteral => f.push_str("{array}"),
 			Type::U8 => f.push_str("u8"),
 			Type::I8 => f.push_str("i8"),
 			Type::U16 => f.push_str("u16"),
@@ -213,27 +227,12 @@ impl TypeFormatter<'_> {
 				f.push(ownership_sigil(*ownership));
 				self.write_part(f, limit, *to);
 			}
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => {
-				self.write_part(f, limit, *memory);
-				f.push_str("::");
-				f.push(ownership_sigil(*ownership));
+			Type::Slice { of } => {
 				f.push('[');
 				self.write_part(f, limit, *of);
 				f.push(']');
 			}
-			Type::Array {
-				of,
-				length,
-				memory,
-				ownership,
-			} => {
-				self.write_part(f, limit, *memory);
-				f.push_str("::");
-				f.push(ownership_sigil(*ownership));
+			Type::Array { of, length } => {
 				f.push('[');
 				self.write_part(f, limit, *of);
 				f.push_str("; ");
@@ -298,7 +297,7 @@ impl TypeFormatter<'_> {
 			Type::TypeParam {
 				env, param_index, ..
 			} => {
-				let symbol = self.type_envs.param_names(*env)
+				let symbol = self.generic_envs.param_names(*env)
 					[*param_index as usize]
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
@@ -331,7 +330,7 @@ impl TypeFormatter<'_> {
 	}
 
 	/// `constant` with `args`: a trait's declaration over its `Self` as a
-	/// projection is (`<T as Array>::SIZE`), any other with its arguments.
+	/// projection is (`<T as Array>::LEN`), any other with its arguments.
 	pub(super) fn display_constant(
 		&self,
 		constant: ConstIdx,
@@ -425,18 +424,17 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::signatures::{FunctionSignature, ParamBounds, QueryInfo};
+	use crate::tir::signatures::{FunctionSignature, QueryInfo};
 	use crate::tir::solver::Solver;
-	use crate::tir::types::TypeEnvIdx;
+	use crate::tir::types::GenericEnvIdx;
 	use crate::vfs;
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,
 		defs: DefinitionRegistry,
 		types: TypeInterner,
-		type_envs: TypeEnvArena,
+		generic_envs: GenericEnvArena,
 		bounds: BoundArena,
-		param_bounds: Vec<Box<[ParamBounds]>>,
 		functions: Vec<FunctionSignature>,
 	}
 
@@ -503,9 +501,8 @@ mod tests {
 
 			Self {
 				types: signatures.types,
-				type_envs: signatures.type_envs,
+				generic_envs: signatures.generic_envs,
 				bounds: signatures.bounds,
-				param_bounds: signatures.param_bounds,
 				functions: signatures.functions,
 				graph,
 				defs,
@@ -537,11 +534,15 @@ mod tests {
 			index
 		}
 
-		fn parameter(&self, function: &str, name: &str) -> (TypeEnvIdx, usize) {
+		fn parameter(
+			&self,
+			function: &str,
+			name: &str,
+		) -> (GenericEnvIdx, usize) {
 			let env = self.functions[usize::from(self.function(function))]
 				.type_params;
 			let index = self
-				.type_envs
+				.generic_envs
 				.param_names(env)
 				.iter()
 				.position(|param| {
@@ -560,19 +561,49 @@ mod tests {
 				types: &self.types,
 				defs: &self.defs,
 				strings: &self.graph.strings,
-				type_envs: &self.type_envs,
+				generic_envs: &self.generic_envs,
 				budget: TYPE_DISPLAY_BUDGET,
 			}
 		}
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.type_envs.param_types(env)[index]
+			self.generic_envs.param_types(env)[index]
 		}
 
-		fn declared_bounds(&self, function: &str, param: &str) -> &[BoundId] {
+		/// The bounds written on `param`, as written: every top-level bound
+		/// between its name and the next parameter's.
+		fn declared_bounds(&self, function: &str, param: &str) -> Vec<BoundId> {
 			let (env, index) = self.parameter(function, param);
-			&self.param_bounds[usize::from(env)][index].declared_bounds
+			let names = self.generic_envs.param_names(env);
+			let after = names[index].span.end;
+			let before =
+				names.get(index + 1).map_or(u32::MAX, |n| n.span.start);
+			let file_id = self.defs.functions
+				[usize::from(self.function(function))]
+			.file_id;
+			let written: Vec<BoundId> = self
+				.bounds
+				.ids()
+				.filter(|&id| {
+					let span = self.bounds.span(id);
+					span.file_id == file_id
+						&& (after..before).contains(&span.span.start)
+				})
+				.collect();
+			let nested: Vec<BoundId> = written
+				.iter()
+				.flat_map(|&id| self.bounds.get(id).bindings.iter())
+				.flat_map(|binding| match &binding.kind {
+					BindingRequirement::Bound(_, nested) => nested.to_vec(),
+					BindingRequirement::Equals(..)
+					| BindingRequirement::Representable(..) => Vec::new(),
+				})
+				.collect();
+			written
+				.into_iter()
+				.filter(|id| !nested.contains(id))
+				.collect()
 		}
 
 		/// `name` is looked up directly against the trait's own member
@@ -634,8 +665,9 @@ mod tests {
 	fn memory_qualified_types_preserve_ownership_and_shape() {
 		let mut case = TestCase::new("func allocate<M>() {}");
 		let memory = case.type_param("allocate", "M");
-		let slice = case.types.intern(Type::Slice {
-			of: TypeIndex::I32,
+		let slice = case.types.intern(Type::Slice { of: TypeIndex::I32 });
+		let slice = case.types.intern(Type::Pointer {
+			to: slice,
 			memory,
 			ownership: Ownership::Shared,
 		});
@@ -648,12 +680,16 @@ mod tests {
 		let array = case.types.intern(Type::Array {
 			of: TypeIndex::I32,
 			length: four,
+		});
+		let to_array = case.types.intern(Type::Pointer {
+			to: array,
 			memory,
 			ownership: Ownership::Exclusive,
 		});
 		let formatter = case.type_formatter();
 		assert_eq!(formatter.display_type(pointer), "M::*M::&[i32]");
-		assert_eq!(formatter.display_type(array), "M::*[i32; 4]");
+		assert_eq!(formatter.display_type(to_array), "M::*[i32; 4]");
+		assert_eq!(formatter.display_type(array), "[i32; 4]");
 	}
 
 	#[test]
@@ -694,7 +730,7 @@ mod tests {
 		for (param, expected) in [("T", ""), ("U", "A"), ("V", "B + A + B")] {
 			assert_eq!(
 				formatter
-					.display_bounds(case.declared_bounds("subject", param)),
+					.display_bounds(&case.declared_bounds("subject", param)),
 				expected
 			);
 		}
@@ -729,7 +765,7 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bounds(case.declared_bounds("subject", "S")),
+				.display_bounds(&case.declared_bounds("subject", "S")),
 			"Outer where { Item: Inner where { Value = Wrapper<T> } + Leaf, Count = u32 } + Plain"
 		);
 	}

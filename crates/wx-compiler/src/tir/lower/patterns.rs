@@ -28,7 +28,8 @@ use crate::tir::body::{
 };
 use crate::tir::defs::{ConstIdx, FieldIdx, MemberKind};
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::types::{TypeEnvIdx, TypeIndex, TypeList};
+use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::types::{GenericArgs, TypeIndex};
 
 /// A value of the match scrutinee at some field path, read from one root
 /// local. `range` is a flat scalar range in that local and `tir_ty` says what
@@ -587,7 +588,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		pattern: PatIdx,
 		subject: Projection,
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	) -> Result<Option<mir::ExprId>, ()> {
 		let span = body.pattern_span(pattern);
 		if !type_args.is_empty() {
@@ -678,7 +679,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		};
 		// The subject's type is concrete, so no assumption can apply.
 		let lookup = match self.context.find_trait_impl_query(
-			TypeEnvIdx::ROOT,
+			AssumptionEnvIdx::ROOT,
 			subject.tir_ty,
 			method.trait_index,
 		) {

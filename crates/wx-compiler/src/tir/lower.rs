@@ -48,7 +48,10 @@ use super::layout::Primitive;
 use super::members::ResolvedFunction;
 use super::signatures::TypeContext;
 use super::solver::{NormalizationDepth, RewriteFlags};
-use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
+use super::bounds::AssumptionEnvIdx;
+use super::types::{
+	GenericArgs, GenericEnvIdx, Substitution, Type, TypeIndex, TypeList,
+};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::mir;
@@ -98,7 +101,7 @@ struct FunctionState {
 	/// in, and the instance's arguments for its parameters. A body type is
 	/// made concrete with both where it is read (`Lowerer::expr_ty`); every
 	/// type past that point has no parameter.
-	env: TypeEnvIdx,
+	env: GenericEnvIdx,
 	args: Box<[TypeIndex]>,
 	/// The instance being lowered, which a call in its body records as the
 	/// callee's caller.
@@ -345,11 +348,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		state: &FunctionState,
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		span: TextSpan,
 	) -> Result<(FunctionInstance, Dispatch), ()> {
 		let written: Vec<TypeIndex> =
-			self.context.types.list(type_args).to_vec();
+			self.context.generic_args.types(type_args).to_vec();
 		let args: Vec<TypeIndex> = written
 			.into_iter()
 			.map(|arg| self.substitute(arg, state.env, &state.args))
@@ -387,7 +390,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		state: &FunctionState,
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		span: TextSpan,
 	) -> Result<(FunctionInstance, mir::FunctionId), ()> {
 		let (instance, dispatch) =
@@ -699,7 +702,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		});
 		let kind = match self
 			.context
-			.address_primitive(TypeEnvIdx::ROOT, memory_type)
+			.address_primitive(AssumptionEnvIdx::ROOT, memory_type)
 		{
 			Ok(Some(Primitive::U32)) => mir::MemoryKind::Memory32,
 			Ok(Some(Primitive::U64)) => mir::MemoryKind::Memory64,
@@ -751,7 +754,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		memory: TypeIndex,
 	) -> mir::MemoryId {
 		let Ok(memory) = self.context.normalize(
-			TypeEnvIdx::ROOT,
+			AssumptionEnvIdx::ROOT,
 			memory,
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
@@ -789,7 +792,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		// checked call, and the checker refuses to export a generic function
 		// (E2019), so a missing argument is a broken invariant.
 		assert_eq!(
-			self.context.type_envs.identity_args(type_params).len(),
+			self.context.generic_envs.identity_args(type_params).len(),
 			instance.args.len(),
 			"an instance has an argument for every parameter in its chain"
 		);
@@ -819,13 +822,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn substitute(
 		&mut self,
 		ty: TypeIndex,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		args: &[TypeIndex],
 	) -> TypeIndex {
 		let ty = self.context.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.context.type_envs,
+				envs: &self.context.generic_envs,
 				env,
 				args,
 			},
@@ -881,7 +884,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		instance: FunctionInstance,
 		file_id: FileId,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		args: Box<[TypeIndex]>,
 		body: &Body,
 		param_types: &[mir::ValueType],
@@ -1366,7 +1369,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		state: &mut FunctionState,
 		expr: ExprIdx,
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		receiver: Option<ExprIdx>,
 		args: ExprIdx,
 		ty: mir::ValueType,
@@ -1845,7 +1848,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		target: ExprIdx,
 		value: ExprIdx,
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		span: TextSpan,
 	) -> Result<mir::ExprId, ()> {
 		let target_ty = self.expr_ty(body, state, target);
@@ -2036,7 +2039,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			"lowering normalizes concrete types only"
 		);
 		match self.context.normalize(
-			TypeEnvIdx::ROOT,
+			AssumptionEnvIdx::ROOT,
 			ty,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -2118,7 +2121,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let lowered = if scalars.is_empty() {
 			mir::ValueType::Unit
 		} else {
-			let memory = match self.context.memory_values(TypeEnvIdx::ROOT, ty)
+			let memory = match self.context.memory_values(AssumptionEnvIdx::ROOT, ty)
 			{
 				Ok(Some((layout, values))) => {
 					assert_eq!(
@@ -2191,7 +2194,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					fields.push(self.context.types.substitute(
 						field,
 						Substitution {
-							envs: &self.context.type_envs,
+							envs: &self.context.generic_envs,
 							env: signature_env,
 							args: &args,
 						},
@@ -3955,7 +3958,7 @@ mod tests {
 	fn a_generic_function_has_one_instance_per_argument_list() {
 		// Inferred and written arguments name the same instance.
 		let source = r#"
-			func id<T>(x: T) -> T { x }
+			func id<T: StackValue>(x: T) -> T { x }
 			func run(a: i32, b: i64) -> (i32, i64) {
 				(id(a) + id::<i32>(a), id(b))
 			}
@@ -3978,8 +3981,8 @@ mod tests {
 		// `id<Wrap<u32>>` in the two instances of `pair`.
 		let source = r#"
 			struct Wrap<T>(value: T);
-			func id<T>(x: T) -> T { x }
-			func pair<T>(x: T) -> (T, T) { (id(x), id::<T>(x)) }
+			func id<T: StackValue>(x: T) -> T { x }
+			func pair<T: StackValue>(x: T) -> (T, T) { (id(x), id::<T>(x)) }
 			func run(a: u8, b: u32) -> u32 {
 				local (c, d) = pair(a);
 				local (Wrap(e), Wrap(f)) = pair(Wrap(b));
@@ -4002,7 +4005,7 @@ mod tests {
 	fn a_generic_impl_method_runs_on_a_concrete_type() {
 		let source = r#"
 			struct Pair<T>(a: T, b: T);
-			impl<T> Pair<T> {
+			impl<T: StackValue> Pair<T> {
 				pub func new(a: T, b: T) -> Pair<T> { Pair(a, b) }
 				pub func swap(self: Self) -> Pair<T> { Pair(self.b, self.a) }
 			}
@@ -4022,7 +4025,7 @@ mod tests {
 	#[test]
 	fn a_recursive_generic_call_with_the_same_arguments_is_one_instance() {
 		let source = r#"
-			func count<T>(x: T, n: u32) -> u32 {
+			func count<T: StackValue>(x: T, n: u32) -> u32 {
 				if n == 0 { 0 } else { count(x, n - 1) + 1 }
 			}
 			func run(n: u32) -> u32 { count((1: u8), n) }
@@ -4066,7 +4069,7 @@ mod tests {
 	#[test]
 	fn a_trait_method_on_a_type_parameter_runs_the_impl_its_type_selects() {
 		let source = r#"
-			trait Shape { func area(self: Self) -> u32; }
+			trait Shape: StackValue { func area(self: Self) -> u32; }
 			struct Square(side: u32);
 			struct Rect(w: u32, h: u32);
 			impl Shape for Square {
@@ -4097,7 +4100,7 @@ mod tests {
 	#[test]
 	fn an_inherited_default_runs_for_a_concrete_and_an_abstract_self() {
 		let source = r#"
-			trait Counter {
+			trait Counter: StackValue {
 				func base(self: Self) -> u32;
 				func next(self: Self) -> u32 { self.base() + 1 }
 			}
@@ -4243,7 +4246,7 @@ mod tests {
 		// so the slot limit stops it at about sixteen levels, long before the
 		// recursion limit would.
 		let source = r#"
-			func grow<T>(x: T, n: u32) -> u32 {
+			func grow<T: StackValue>(x: T, n: u32) -> u32 {
 				if n == 0 { 0 } else { grow((x, x), n - 1) }
 			}
 			func run(n: u32) -> u32 { grow((1: u8), n) }
@@ -4272,7 +4275,7 @@ mod tests {
 		// No slots, so only the recursion limit stops it, and its message
 		// names a type of 2^128 leaves by printing only the start of it.
 		let source = r#"
-			func grow<T>(x: T, n: u32) -> u32 {
+			func grow<T: StackValue>(x: T, n: u32) -> u32 {
 				if n == 0 { 0 } else { grow((x, x), n - 1) }
 			}
 			func run(n: u32) -> u32 { grow((), n) }
@@ -4295,7 +4298,7 @@ mod tests {
 		for source in [
 			r#"
 				struct Wrap<T>(value: T);
-				func grow<T>(x: T, n: u32) -> u32 {
+				func grow<T: StackValue>(x: T, n: u32) -> u32 {
 					if n == 0 { 0 } else { grow(Wrap(x), n - 1) }
 				}
 				func run(n: u32) -> u32 { grow((1: u8), n) }
@@ -4303,10 +4306,10 @@ mod tests {
 			"#,
 			r#"
 				struct Wrap<T>(value: T);
-				func ping<T>(x: T, n: u32) -> u32 {
+				func ping<T: StackValue>(x: T, n: u32) -> u32 {
 					if n == 0 { 0 } else { pong(Wrap(x), n - 1) }
 				}
-				func pong<T>(x: T, n: u32) -> u32 { ping(x, n) }
+				func pong<T: StackValue>(x: T, n: u32) -> u32 { ping(x, n) }
 				func run(n: u32) -> u32 { ping((1: u8), n) }
 				export { run as "run" }
 			"#,
@@ -7332,10 +7335,10 @@ mod tests {
 	fn edge_recursive_generic_aggregate_results_cross_calls_and_joins() {
 		let source = r#"
 		struct Pair<T>(a: T, empty: (), b: T);
-		impl<T> Pair<T> {
+		impl<T: StackValue> Pair<T> {
 			pub func swap(self: Self) -> Self { Pair(self.b, (), self.a) }
 		}
-		func rotate<T>(p: Pair<T>, n: i32) -> Pair<T> {
+		func rotate<T: StackValue>(p: Pair<T>, n: i32) -> Pair<T> {
 			if n == 0 { p } else { rotate(p.swap(), n - 1) }
 		}
 		func run(a: i32, b: i32, n: i32) -> (i32, (), i32) {

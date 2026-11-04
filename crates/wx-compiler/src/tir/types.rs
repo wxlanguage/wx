@@ -1,5 +1,5 @@
 //! Type identity: the structurally hash-consed `Type` arena every resolved
-//! signature and expression points into, plus `TypeEnvArena` — the
+//! signature and expression points into, plus `GenericEnvArena` — the
 //! complementary arena answering "what does this *written name* currently
 //! mean," rather than "what does this *shape* mean."
 //!
@@ -12,14 +12,14 @@
 //! reason as `TraitIdx`) but nothing
 //! here calls into name resolution, and nothing in `defs` depends back on
 //! this module — see `tir/defs.rs`'s own doc comment for why that direction
-//! has to stay one-way. `TypeEnvArena` fits the same charter: given a name,
+//! has to stay one-way. `GenericEnvArena` fits the same charter: given a name,
 //! it hands back a `TypeIndex` already sitting in this module, with no
 //! namespace lookup, no diagnostics, and no notion of `signatures.rs`'s
 //! demand-driven queries at all.
 //! Structural substitution likewise only replaces parameter identities in
 //! an existing type; it never resolves or normalizes associated types.
 //!
-//! A generic-parameter frame's owner (`TypeEnvOwner`) is an enum of registry
+//! A generic-parameter frame's owner (`GenericEnvOwner`) is an enum of registry
 //! indices, so it indexes straight into the right registry array
 //! (`defs.structs`, `defs.functions`, ...) without a lookup.
 
@@ -29,6 +29,7 @@ use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
 
 use crate::ast::Spanned;
+use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
 use crate::tir::defs::{
 	DefinitionRegistry, FunctionIdx, IntrinsicDefs, TypeAliasIdx,
@@ -58,9 +59,7 @@ impl TypeIndex {
 	pub fn is_literal(self) -> bool {
 		self == TypeIndex::INTEGER_LITERAL
 			|| self == TypeIndex::FLOAT_LITERAL
-			|| self == TypeIndex::STRING_LITERAL
 			|| self == TypeIndex::CHAR_LITERAL
-			|| self == TypeIndex::ARRAY_LITERAL
 	}
 
 	#[inline]
@@ -113,10 +112,8 @@ impl TypeIndex {
 	pub const BOOL: TypeIndex = TypeIndex(16);
 	/// std's `Char`, a struct.
 	pub const CHAR: TypeIndex = TypeIndex(17);
-	pub const STRING_LITERAL: TypeIndex = TypeIndex(18);
-	pub const ARRAY_LITERAL: TypeIndex = TypeIndex(19);
-	pub const FUNCREF: TypeIndex = TypeIndex(20);
-	pub const CHAR_LITERAL: TypeIndex = TypeIndex(21);
+	pub const FUNCREF: TypeIndex = TypeIndex(18);
+	pub const CHAR_LITERAL: TypeIndex = TypeIndex(19);
 }
 
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
@@ -167,6 +164,77 @@ impl TypeList {
 	}
 }
 
+/// The generic arguments of one use of an item (a written type, a path, a
+/// call, a selected impl): a run of `GenericArgArena`, flat over the item's
+/// whole chain as `Substitution` reads them.
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(Clone, Copy)]
+pub(super) struct GenericArgs {
+	start: u32,
+	len: u32,
+}
+
+impl GenericArgs {
+	pub(super) const EMPTY: GenericArgs = GenericArgs { start: 0, len: 0 };
+
+	pub(super) fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub(super) fn is_empty(self) -> bool {
+		self.len == 0
+	}
+
+	/// The first `len` arguments: those of a flat list's outer frames.
+	pub(super) fn prefix(self, len: usize) -> GenericArgs {
+		assert!(len <= self.len(), "a prefix longer than its arguments");
+		GenericArgs {
+			start: self.start,
+			len: len as u32,
+		}
+	}
+
+	fn range(self) -> std::ops::Range<usize> {
+		self.start as usize..(self.start + self.len) as usize
+	}
+}
+
+/// Every use's generic arguments, each with the span it is given at: the
+/// written argument, the value it was learned from, or the use. Uses are
+/// not interned, so this is apart from the interner's lists.
+#[derive(Default)]
+pub(super) struct GenericArgArena {
+	types: Vec<TypeIndex>,
+	spans: Vec<TextSpan>,
+}
+
+impl GenericArgArena {
+	pub(super) fn push(
+		&mut self,
+		args: impl IntoIterator<Item = (TypeIndex, TextSpan)>,
+	) -> GenericArgs {
+		let start = self.types.len();
+		for (ty, span) in args {
+			self.types.push(ty);
+			self.spans.push(span);
+		}
+		GenericArgs {
+			start: u32::try_from(start)
+				.expect("generic arguments exceeded u32"),
+			len: u32::try_from(self.types.len() - start)
+				.expect("generic arguments exceeded u32"),
+		}
+	}
+
+	pub(super) fn types(&self, args: GenericArgs) -> &[TypeIndex] {
+		&self.types[args.range()]
+	}
+
+	pub(super) fn spans(&self, args: GenericArgs) -> &[TextSpan] {
+		&self.spans[args.range()]
+	}
+}
+
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,16 +255,8 @@ pub enum Type {
 	IntegerLiteral,
 	FloatLiteral,
 	/// A character literal's type until its context gives it one: `Char`,
-	/// or an integer type its code point fits (`coerce`).
+	/// or an integer type that can represent its code point (`coerce`).
 	CharLiteral,
-	/// A string literal's type until its context gives it one: a shared byte
-	/// slice or a shared byte array of its length, in a memory the context
-	/// names (`coerce`).
-	StringLiteral,
-	/// An array literal's type until its context gives it one: a shared array
-	/// of its length or a shared slice of its elements' type, in a memory the
-	/// context names (`coerce`).
-	ArrayLiteral,
 	U8,
 	I8,
 	U16,
@@ -248,18 +308,18 @@ pub enum Type {
 		memory: TypeIndex,
 		ownership: crate::ast::Ownership,
 	},
-	/// `M::&[T; N]`. The length is a type-level constant: a `Value`, or
-	/// `Infer` until its context gives one.
+	/// `[T; N]`: exactly `N` values of `T`, in no memory. Only a pointer or a
+	/// constant holds one (`M::&[T; N]` is a `Pointer` to it). The length is
+	/// a count: a `Value`, a `Const`, or `Infer` until its context gives one.
 	Array {
 		of: TypeIndex,
 		length: TypeIndex,
-		memory: TypeIndex,
-		ownership: crate::ast::Ownership,
 	},
+	/// `[T]`: values of `T` whose count is known only at runtime, in no
+	/// memory. Unsized: only a pointer holds one, and that pointer is fat
+	/// (its address and a length of its memory's `Size`).
 	Slice {
 		of: TypeIndex,
-		memory: TypeIndex,
-		ownership: crate::ast::Ownership,
 	},
 	Enum {
 		enum_index: EnumIdx,
@@ -285,7 +345,7 @@ pub enum Type {
 	/// have different `env`s; lookup and substitution must respect both
 	/// parts of the identity. The frame itself records its declaration owner.
 	TypeParam {
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		param_index: u32,
 	},
 	/// A constant in a type, such as an array's length. It holds the bits
@@ -336,9 +396,19 @@ impl TypeFlags {
 	pub(super) const HAS_PROJECTION: Self = Self(1 << 4);
 	/// A `Const` is in it: its value can replace it, once evaluated.
 	pub(super) const HAS_CONST: Self = Self(1 << 5);
+	/// A slice or an array is in it, held directly or by a tuple's element:
+	/// as an expression's type, data not placed in a memory yet, which its
+	/// context places. Only a tuple passes it on; behind a pointer, in a
+	/// nominal type's arguments or in a function type the data is placed (or
+	/// is no expression's own), so those drop it.
+	pub(super) const HAS_UNPLACED: Self = Self(1 << 6);
 
 	fn union(self, other: Self) -> Self {
 		Self(self.0 | other.0)
+	}
+
+	fn without(self, other: Self) -> Self {
+		Self(self.0 & !other.0)
 	}
 
 	fn contains(self, other: Self) -> bool {
@@ -420,8 +490,8 @@ impl TypeInterner {
 		&self,
 		pattern: TypeIndex,
 		actual: TypeIndex,
-		envs: &TypeEnvArena,
-		env: TypeEnvIdx,
+		envs: &GenericEnvArena,
+		env: GenericEnvIdx,
 	) -> Option<Box<[TypeIndex]>> {
 		let mut args = vec![None; envs.generic_count(env)];
 		self.match_pattern(pattern, actual, envs, env, &mut args)?;
@@ -432,8 +502,8 @@ impl TypeInterner {
 		&self,
 		pattern: TypeIndex,
 		actual: TypeIndex,
-		envs: &TypeEnvArena,
-		env: TypeEnvIdx,
+		envs: &GenericEnvArena,
+		env: GenericEnvIdx,
 		args: &mut [Option<TypeIndex>],
 	) -> Option<()> {
 		let (expected, found) = (self.resolve(pattern), self.resolve(actual));
@@ -549,37 +619,14 @@ impl TypeInterner {
 				self.match_pattern(*xm, *ym, envs, env, args)
 			}
 			(
-				Type::Array {
-					of: x,
-					length: xl,
-					memory: xm,
-					ownership: xo,
-				},
-				Type::Array {
-					of: y,
-					length: yl,
-					memory: ym,
-					ownership: yo,
-				},
-			) if xo == yo => {
+				Type::Array { of: x, length: xl },
+				Type::Array { of: y, length: yl },
+			) => {
 				self.match_pattern(*x, *y, envs, env, args)?;
-				self.match_pattern(*xl, *yl, envs, env, args)?;
-				self.match_pattern(*xm, *ym, envs, env, args)
+				self.match_pattern(*xl, *yl, envs, env, args)
 			}
-			(
-				Type::Slice {
-					of: x,
-					memory: xm,
-					ownership: xo,
-				},
-				Type::Slice {
-					of: y,
-					memory: ym,
-					ownership: yo,
-				},
-			) if xo == yo => {
-				self.match_pattern(*x, *y, envs, env, args)?;
-				self.match_pattern(*xm, *ym, envs, env, args)
+			(Type::Slice { of: x }, Type::Slice { of: y }) => {
+				self.match_pattern(*x, *y, envs, env, args)
 			}
 			(
 				Type::TypeProjection {
@@ -602,8 +649,8 @@ impl TypeInterner {
 		&self,
 		expected: &[TypeIndex],
 		found: &[TypeIndex],
-		envs: &TypeEnvArena,
-		env: TypeEnvIdx,
+		envs: &GenericEnvArena,
+		env: GenericEnvIdx,
 		args: &mut [Option<TypeIndex>],
 	) -> Option<()> {
 		if expected.len() != found.len() {
@@ -654,8 +701,6 @@ impl TypeInterner {
 				struct_index: char,
 				type_args: TypeList::EMPTY,
 			},
-			Type::StringLiteral,
-			Type::ArrayLiteral,
 			Type::Funcref,
 			Type::CharLiteral,
 		] {
@@ -829,52 +874,49 @@ impl TypeInterner {
 		list.slice(&self.lists)
 	}
 
+	/// The flags of a list's elements, joined.
+	fn flags_of_list(&self, list: TypeList) -> TypeFlags {
+		list.slice(&self.lists)
+			.iter()
+			.fold(TypeFlags::default(), |flags, &part| {
+				flags.union(self.flags[usize::from(part)])
+			})
+	}
+
 	/// The flags of a type about to be interned: its own kind's, joined with
 	/// those of its parts, which are interned already.
 	fn flags_of(&self, ty: Type) -> TypeFlags {
 		match ty {
 			Type::Infer => TypeFlags::HAS_INFER,
 			Type::Error => TypeFlags::HAS_ERROR,
-			Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral => TypeFlags::HAS_LITERAL,
-			Type::Tuple { elements: list }
-			| Type::Struct {
-				type_args: list, ..
+			Type::IntegerLiteral | Type::FloatLiteral | Type::CharLiteral => {
+				TypeFlags::HAS_LITERAL
 			}
-			| Type::Function {
-				type_args: list, ..
-			} => {
-				let mut flags = TypeFlags::default();
-				for &part in list.slice(&self.lists) {
-					flags = flags.union(self.flags[usize::from(part)]);
-				}
-				flags
+			Type::Tuple { elements } => self.flags_of_list(elements),
+			Type::Struct { type_args, .. }
+			| Type::Function { type_args, .. } => self
+				.flags_of_list(type_args)
+				.without(TypeFlags::HAS_UNPLACED),
+			Type::Pointer { to, memory, .. } => self.flags[usize::from(to)]
+				.union(self.flags[usize::from(memory)])
+				.without(TypeFlags::HAS_UNPLACED),
+			Type::Slice { of } => {
+				TypeFlags::HAS_UNPLACED.union(self.flags[usize::from(of)])
 			}
-			Type::Pointer { to: of, memory, .. }
-			| Type::Slice { of, memory, .. } => self.flags[usize::from(of)]
-				.union(self.flags[usize::from(memory)]),
-			Type::Array {
-				of, length, memory, ..
-			} => self.flags[usize::from(of)]
-				.union(self.flags[usize::from(length)])
-				.union(self.flags[usize::from(memory)]),
+			Type::Array { of, length } => TypeFlags::HAS_UNPLACED
+				.union(self.flags[usize::from(of)])
+				.union(self.flags[usize::from(length)]),
 			Type::TypedFuncref { param, result } => self.flags
 				[usize::from(param)]
-			.union(self.flags[usize::from(result)]),
-			Type::TypeProjection { base, .. } => {
-				TypeFlags::HAS_PROJECTION.union(self.flags[usize::from(base)])
-			}
-			Type::Const { type_args, .. } => {
-				let mut flags =
-					TypeFlags::HAS_PROJECTION.union(TypeFlags::HAS_CONST);
-				for &part in type_args.slice(&self.lists) {
-					flags = flags.union(self.flags[usize::from(part)]);
-				}
-				flags
-			}
+			.union(self.flags[usize::from(result)])
+			.without(TypeFlags::HAS_UNPLACED),
+			Type::TypeProjection { base, .. } => TypeFlags::HAS_PROJECTION
+				.union(self.flags[usize::from(base)])
+				.without(TypeFlags::HAS_UNPLACED),
+			Type::Const { type_args, .. } => TypeFlags::HAS_PROJECTION
+				.union(TypeFlags::HAS_CONST)
+				.union(self.flags_of_list(type_args))
+				.without(TypeFlags::HAS_UNPLACED),
 			Type::TypeParam { .. } => TypeFlags::HAS_PARAM,
 			Type::Never
 			| Type::U8
@@ -919,6 +961,26 @@ impl TypeInterner {
 	/// Whether a literal's type is anywhere in `ty`.
 	pub(super) fn has_literal(&self, ty: TypeIndex) -> bool {
 		self.flags[usize::from(ty)].contains(TypeFlags::HAS_LITERAL)
+	}
+
+	/// Whether `ty` is a slice or an array, `[T]` or `[T; N]`: as an
+	/// expression's type, data not placed in a memory yet (a string or array
+	/// literal, a constant holding one), which its context places.
+	pub(super) fn is_unplaced(&self, ty: TypeIndex) -> bool {
+		matches!(self.resolve(ty), Type::Slice { .. } | Type::Array { .. })
+	}
+
+	/// Whether a slice or an array is in `ty`, held directly or by a
+	/// tuple (`HAS_UNPLACED`).
+	pub(super) fn has_unplaced(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_UNPLACED)
+	}
+
+	/// Whether an expression of type `ty` waits for its context: an untyped
+	/// literal is given a type, and unplaced data a memory, a tuple's
+	/// included.
+	pub(super) fn needs_context(&self, ty: TypeIndex) -> bool {
+		self.has_literal(ty) || self.has_unplaced(ty)
 	}
 
 	/// Whether `ty`'s head is a parameter or a projection: the types with
@@ -1062,48 +1124,19 @@ impl TypeInterner {
 				}))
 			}
 			(
-				Type::Array {
-					of,
-					length,
-					memory,
-					ownership,
-				},
+				Type::Array { of, length },
 				Type::Array {
 					of: other_of,
 					length: other_length,
-					memory: other_memory,
-					ownership: other_ownership,
 				},
-			) if ownership == other_ownership => {
+			) => {
 				let of = self.meet(of, other_of)?;
 				let length = self.meet(length, other_length)?;
-				let memory = self.meet(memory, other_memory)?;
-				Some(self.intern(Type::Array {
-					of,
-					length,
-					memory,
-					ownership,
-				}))
+				Some(self.intern(Type::Array { of, length }))
 			}
-			(
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				},
-				Type::Slice {
-					of: other_of,
-					memory: other_memory,
-					ownership: other_ownership,
-				},
-			) if ownership == other_ownership => {
+			(Type::Slice { of }, Type::Slice { of: other_of }) => {
 				let of = self.meet(of, other_of)?;
-				let memory = self.meet(memory, other_memory)?;
-				Some(self.intern(Type::Slice {
-					of,
-					memory,
-					ownership,
-				}))
+				Some(self.intern(Type::Slice { of }))
 			}
 			(
 				Type::TypeProjection {
@@ -1138,8 +1171,8 @@ impl TypeInterner {
 	/// is not known yet, so it teaches nothing either.
 	pub(super) fn learn(
 		&mut self,
-		envs: &TypeEnvArena,
-		env: TypeEnvIdx,
+		envs: &GenericEnvArena,
+		env: GenericEnvIdx,
 		slots: &mut [TypeIndex],
 		declared: TypeIndex,
 		actual: TypeIndex,
@@ -1214,48 +1247,31 @@ impl TypeInterner {
 			}
 			(
 				Type::Pointer {
-					to: of,
+					to,
 					memory,
 					ownership,
 				},
 				Type::Pointer {
-					to: other_of,
-					memory: other_memory,
-					ownership: other_ownership,
-				},
-			)
-			| (
-				Type::Slice {
-					of,
-					memory,
-					ownership,
-				},
-				Type::Slice {
-					of: other_of,
+					to: other_to,
 					memory: other_memory,
 					ownership: other_ownership,
 				},
 			) if ownership == other_ownership => {
-				self.learn(envs, env, slots, of, other_of);
+				self.learn(envs, env, slots, to, other_to);
 				self.learn(envs, env, slots, memory, other_memory);
 			}
+			(Type::Slice { of }, Type::Slice { of: other_of }) => {
+				self.learn(envs, env, slots, of, other_of);
+			}
 			(
-				Type::Array {
-					of,
-					length,
-					memory,
-					ownership,
-				},
+				Type::Array { of, length },
 				Type::Array {
 					of: other_of,
 					length: other_length,
-					memory: other_memory,
-					ownership: other_ownership,
 				},
-			) if ownership == other_ownership => {
+			) => {
 				self.learn(envs, env, slots, of, other_of);
 				self.learn(envs, env, slots, length, other_length);
-				self.learn(envs, env, slots, memory, other_memory);
 			}
 			// A projection's value is not its base: `<T as Tr>::X` being `u8`
 			// says nothing of `T`.
@@ -1267,8 +1283,8 @@ impl TypeInterner {
 	/// Each pair is read just before it is learned from, as in `meet_lists`.
 	fn learn_lists(
 		&mut self,
-		envs: &TypeEnvArena,
-		env: TypeEnvIdx,
+		envs: &GenericEnvArena,
+		env: GenericEnvIdx,
 		slots: &mut [TypeIndex],
 		declared: TypeList,
 		actual: TypeList,
@@ -1391,44 +1407,24 @@ impl TypeInterner {
 					})
 				}
 			}
-			Type::Array {
-				of,
-				length,
-				memory,
-				ownership,
-			} => {
+			Type::Array { of, length } => {
 				let next_of = self.substitute(of, substitution);
 				let next_length = self.substitute(length, substitution);
-				let next_memory = self.substitute(memory, substitution);
-				if next_of == of
-					&& next_length == length
-					&& next_memory == memory
-				{
+				if next_of == of && next_length == length {
 					ty
 				} else {
 					self.intern(Type::Array {
 						of: next_of,
 						length: next_length,
-						memory: next_memory,
-						ownership,
 					})
 				}
 			}
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => {
+			Type::Slice { of } => {
 				let next_of = self.substitute(of, substitution);
-				let next_memory = self.substitute(memory, substitution);
-				if next_of == of && next_memory == memory {
+				if next_of == of {
 					ty
 				} else {
-					self.intern(Type::Slice {
-						of: next_of,
-						memory: next_memory,
-						ownership,
-					})
+					self.intern(Type::Slice { of: next_of })
 				}
 			}
 			Type::TypeProjection {
@@ -1453,8 +1449,6 @@ impl TypeInterner {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1493,21 +1487,21 @@ impl TypeInterner {
 	}
 }
 
-// A `Copy` handle into a `TypeEnvArena` — see that type's doc comment.
-index_newtype!(TypeEnvIdx);
+// A `Copy` handle into a `GenericEnvArena` — see that type's doc comment.
+index_newtype!(GenericEnvIdx);
 
 /// Replacements for every parameter on `env`'s chain: `args` is the chain's
 /// flat argument list, outer frames first, so `TypeParam { env: e, i }` is
 /// replaced by `args[parent_count(e) + i]` for each frame `e` on the chain
-/// (`TypeEnvArena::flat_slot`). Parameters of any other frame, including a
+/// (`GenericEnvArena::flat_slot`). Parameters of any other frame, including a
 /// frame nested inside `env`, are untouched, so instantiating an outer frame
 /// alone is a partial substitution. This borrows an instantiation's arguments
 /// without changing the original lexical environment. Replacement types may
 /// themselves contain parameters.
 #[derive(Clone, Copy)]
 pub(super) struct Substitution<'a> {
-	pub(super) envs: &'a TypeEnvArena,
-	pub(super) env: TypeEnvIdx,
+	pub(super) envs: &'a GenericEnvArena,
+	pub(super) env: GenericEnvIdx,
 	pub(super) args: &'a [TypeIndex],
 }
 
@@ -1516,7 +1510,7 @@ pub(super) struct Substitution<'a> {
 /// array — so `name`/`file_id` can reach straight into `defs.structs[..]`. Constants and enums are also represented for
 /// diagnostics, even though they currently have no type parameters.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum TypeEnvOwner {
+pub(super) enum GenericEnvOwner {
 	Constant(ConstIdx),
 	Enum(EnumIdx),
 	Struct(StructIdx),
@@ -1536,7 +1530,7 @@ pub(super) enum ImplKind {
 	Trait(TraitImplIdx),
 }
 
-impl TypeEnvOwner {
+impl GenericEnvOwner {
 	pub(super) fn noun(self) -> &'static str {
 		match self {
 			Self::Constant(_) => "constant",
@@ -1609,7 +1603,7 @@ impl TypeEnvOwner {
 /// A parameter is a `T` from `<T: Bound>`, or a trait's or typeset's own
 /// `Self`, interned as `Type::TypeParam { env, param_index }` the moment its
 /// frame is built. An impl's `Self` is not a parameter: it names the impl's
-/// target, found through the impl's frame (`TypeEnvArena::enclosing_impl`).
+/// target, found through the impl's frame (`GenericEnvArena::enclosing_impl`).
 /// No bounds here: those are a resolved-signature fact (see `signatures.rs`'s
 /// own doc comment), not an identity one.
 ///
@@ -1618,11 +1612,11 @@ impl TypeEnvOwner {
 /// flat argument list is `parent_count + param_index`. A frame's parameters
 /// live in the arena's tables: `len` names from `names_start`, and from
 /// `types_start` its identity arguments, `parent_count + len` of them.
-enum TypeEnv {
+enum GenericEnv {
 	Root,
 	Frame {
-		owner: TypeEnvOwner,
-		parent: TypeEnvIdx,
+		owner: GenericEnvOwner,
+		parent: GenericEnvIdx,
 		parent_count: u32,
 		len: u32,
 		names_start: u32,
@@ -1630,13 +1624,13 @@ enum TypeEnv {
 	},
 }
 
-/// Owns every [`TypeEnv`] frame ever pushed while resolving *any* item's
+/// Owns every [`GenericEnv`] frame ever pushed while resolving *any* item's
 /// signature — one arena for the whole Phase 2 run, same lifetime and shape
 /// as `TypeInterner` (append-only, addressed by a cheap `Copy` id, never
-/// invalidated). A signature struct stores the `TypeEnvId` of its own frame
+/// invalidated). A signature struct stores the `GenericEnvIdx` of its own frame
 /// rather than an owned param list.
 ///
-/// Generalizes `builder::type_compare::TypeEnv` (which answers "what does
+/// Generalizes `builder::type_compare::GenericEnv` (which answers "what does
 /// this abstract variable mean, once an impl's own args are known," for
 /// read-only structural comparison after signatures already exist) to also
 /// answer "what does this written name refer to" while a signature is
@@ -1645,11 +1639,11 @@ enum TypeEnv {
 /// makes that persistence safe under reentrancy: `ensure_signature` calling
 /// back into itself for some *other* item (a field type naming another
 /// struct, say) pushes that item's own frames on top without disturbing —
-/// or invalidating the `TypeEnvId` of — anything the outer call already
+/// or invalidating the `GenericEnvIdx` of — anything the outer call already
 /// holds, the exact same guarantee `TypeInterner::intern` already gives for
 /// `TypeIndex`.
-pub(super) struct TypeEnvArena {
-	envs: Vec<TypeEnv>,
+pub(super) struct GenericEnvArena {
+	envs: Vec<GenericEnv>,
 	/// Each frame's own parameter names.
 	names: Vec<Spanned<SymbolU32>>,
 	/// Each frame's identity arguments: the parameters of its whole chain,
@@ -1658,19 +1652,19 @@ pub(super) struct TypeEnvArena {
 	types: Vec<TypeIndex>,
 }
 
-impl TypeEnvIdx {
-	/// The always-present slot-0 frame — a [`TypeEnv::Root`]. A sentinel
+impl GenericEnvIdx {
+	/// The always-present slot-0 frame — a [`GenericEnv::Root`]. A sentinel
 	/// constant on the id type itself, same as `TypeIndex::INFER`/`ERROR`/…
 	/// below rather than on the arena that produces the rest — built via the
-	/// tuple constructor directly since `TypeEnvId::new` isn't `const fn`,
+	/// tuple constructor directly since `GenericEnvIdx::new` isn't `const fn`,
 	/// the one place within this module that's allowed to reach past it.
-	pub(super) const ROOT: TypeEnvIdx = TypeEnvIdx(0);
+	pub(super) const ROOT: GenericEnvIdx = GenericEnvIdx(0);
 }
 
-impl TypeEnvArena {
+impl GenericEnvArena {
 	pub(super) fn new() -> Self {
 		Self {
-			envs: vec![TypeEnv::Root],
+			envs: vec![GenericEnv::Root],
 			names: Vec::new(),
 			types: Vec::new(),
 		}
@@ -1692,11 +1686,11 @@ impl TypeEnvArena {
 	pub(super) fn push_param_frame(
 		&mut self,
 		types: &mut TypeInterner,
-		owner: TypeEnvOwner,
-		parent: TypeEnvIdx,
+		owner: GenericEnvOwner,
+		parent: GenericEnvIdx,
 		names: impl IntoIterator<Item = Spanned<SymbolU32>>,
-	) -> TypeEnvIdx {
-		let frame = TypeEnvIdx::new(u32::try_from(self.envs.len()).unwrap());
+	) -> GenericEnvIdx {
+		let frame = GenericEnvIdx::new(u32::try_from(self.envs.len()).unwrap());
 		let parent_count = self.generic_count(parent);
 		let names_start = self.names.len();
 		self.names.extend(names);
@@ -1709,7 +1703,7 @@ impl TypeEnvArena {
 				param_index: u32::try_from(index).unwrap(),
 			})
 		}));
-		self.envs.push(TypeEnv::Frame {
+		self.envs.push(GenericEnv::Frame {
 			owner,
 			parent,
 			parent_count: u32::try_from(parent_count).unwrap(),
@@ -1723,31 +1717,34 @@ impl TypeEnvArena {
 	/// The names of `env`'s own parameters. A declaration without generics
 	/// has no frame of its own and stores `ROOT`, which declares none.
 	#[inline]
-	pub(super) fn param_names(&self, env: TypeEnvIdx) -> &[Spanned<SymbolU32>] {
+	pub(super) fn param_names(
+		&self,
+		env: GenericEnvIdx,
+	) -> &[Spanned<SymbolU32>] {
 		match self.envs[usize::from(env)] {
-			TypeEnv::Frame {
+			GenericEnv::Frame {
 				len, names_start, ..
 			} => &self.names[names_start as usize..][..len as usize],
-			TypeEnv::Root => &[],
+			GenericEnv::Root => &[],
 		}
 	}
 
 	/// The types of `env`'s own parameters.
 	#[inline]
-	pub(super) fn param_types(&self, env: TypeEnvIdx) -> &[TypeIndex] {
+	pub(super) fn param_types(&self, env: GenericEnvIdx) -> &[TypeIndex] {
 		&self.identity_args(env)[self.parent_count(env)..]
 	}
 
 	/// The arguments that instantiate `env`'s chain with its own parameters,
 	/// each at its flat slot (`flat_slot`).
 	#[inline]
-	pub(super) fn identity_args(&self, env: TypeEnvIdx) -> &[TypeIndex] {
+	pub(super) fn identity_args(&self, env: GenericEnvIdx) -> &[TypeIndex] {
 		&self.types[self.identity_range(env)]
 	}
 
-	fn identity_range(&self, env: TypeEnvIdx) -> std::ops::Range<usize> {
+	fn identity_range(&self, env: GenericEnvIdx) -> std::ops::Range<usize> {
 		match self.envs[usize::from(env)] {
-			TypeEnv::Frame {
+			GenericEnv::Frame {
 				parent_count,
 				len,
 				types_start,
@@ -1756,57 +1753,57 @@ impl TypeEnvArena {
 				let start = types_start as usize;
 				start..start + (parent_count + len) as usize
 			}
-			TypeEnv::Root => 0..0,
+			GenericEnv::Root => 0..0,
 		}
 	}
 
 	#[inline]
-	pub(super) fn owner(&self, env: TypeEnvIdx) -> TypeEnvOwner {
+	pub(super) fn owner(&self, env: GenericEnvIdx) -> GenericEnvOwner {
 		match &self.envs[usize::from(env)] {
-			TypeEnv::Frame { owner, .. } => *owner,
+			GenericEnv::Frame { owner, .. } => *owner,
 			_ => unreachable!(),
 		}
 	}
 
 	/// The enclosing lexical frame; Root has no parent.
-	pub(super) fn parent(&self, env: TypeEnvIdx) -> Option<TypeEnvIdx> {
+	pub(super) fn parent(&self, env: GenericEnvIdx) -> Option<GenericEnvIdx> {
 		match &self.envs[usize::from(env)] {
-			TypeEnv::Root => None,
-			TypeEnv::Frame { parent, .. } => Some(*parent),
+			GenericEnv::Root => None,
+			GenericEnv::Frame { parent, .. } => Some(*parent),
 		}
 	}
 
 	/// How many parameters the frames above `env` declare.
 	#[inline]
-	pub(super) fn parent_count(&self, env: TypeEnvIdx) -> usize {
+	pub(super) fn parent_count(&self, env: GenericEnvIdx) -> usize {
 		match &self.envs[usize::from(env)] {
-			TypeEnv::Root => 0,
-			TypeEnv::Frame { parent_count, .. } => *parent_count as usize,
+			GenericEnv::Root => 0,
+			GenericEnv::Frame { parent_count, .. } => *parent_count as usize,
 		}
 	}
 
 	/// How many arguments instantiating `env` takes: every parameter on its
 	/// chain.
 	#[inline]
-	pub(super) fn generic_count(&self, env: TypeEnvIdx) -> usize {
+	pub(super) fn generic_count(&self, env: GenericEnvIdx) -> usize {
 		self.identity_args(env).len()
 	}
 
 	/// `env` and the frames above it, innermost first, without `Root`.
 	pub(super) fn chain(
 		&self,
-		env: TypeEnvIdx,
-	) -> impl Iterator<Item = TypeEnvIdx> + '_ {
+		env: GenericEnvIdx,
+	) -> impl Iterator<Item = GenericEnvIdx> + '_ {
 		std::iter::successors(Some(env), |&frame| self.parent(frame))
-			.take_while(|&frame| frame != TypeEnvIdx::ROOT)
+			.take_while(|&frame| frame != GenericEnvIdx::ROOT)
 	}
 
 	/// The position of `TypeParam { env: owner, param_index }` in the flat
 	/// argument list of `env`'s chain, or `None` when `owner` is not on it.
 	pub(super) fn flat_slot(
 		&self,
-		env: TypeEnvIdx,
-		owner: TypeEnvIdx,
+		env: GenericEnvIdx,
+		owner: GenericEnvIdx,
 		param_index: u32,
 	) -> Option<usize> {
 		self.chain(env)
@@ -1817,16 +1814,16 @@ impl TypeEnvArena {
 	/// The impl owning the nearest impl frame on `env`'s chain, if any.
 	pub(super) fn enclosing_impl(
 		&self,
-		mut env: TypeEnvIdx,
+		mut env: GenericEnvIdx,
 	) -> Option<ImplKind> {
-		while let TypeEnv::Frame { owner, parent, .. } =
+		while let GenericEnv::Frame { owner, parent, .. } =
 			&self.envs[usize::from(env)]
 		{
 			match *owner {
-				TypeEnvOwner::InherentImpl(index) => {
+				GenericEnvOwner::InherentImpl(index) => {
 					return Some(ImplKind::Inherent(index));
 				}
-				TypeEnvOwner::TraitImpl(index) => {
+				GenericEnvOwner::TraitImpl(index) => {
 					return Some(ImplKind::Trait(index));
 				}
 				_ => env = *parent,
@@ -1840,14 +1837,14 @@ impl TypeEnvArena {
 	/// the chain declares it.
 	pub(super) fn resolve(
 		&self,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		name: SymbolU32,
-	) -> Option<(TypeEnvIdx, u32)> {
+	) -> Option<(GenericEnvIdx, u32)> {
 		let mut current = env;
 		loop {
 			match &self.envs[usize::from(current)] {
-				TypeEnv::Root => return None,
-				TypeEnv::Frame { parent, .. } => {
+				GenericEnv::Root => return None,
+				GenericEnv::Frame { parent, .. } => {
 					if let Some(index) = self
 						.param_names(current)
 						.iter()
@@ -1882,6 +1879,8 @@ impl IntrinsicDefs {
 			(self.f32, TypeIndex::F32),
 			(self.f64, TypeIndex::F64),
 			(self.funcref, TypeIndex::FUNCREF),
+			(self.integer_kind, TypeIndex::INTEGER_LITERAL),
+			(self.char_kind, TypeIndex::CHAR_LITERAL),
 		]
 		.into_iter()
 		.find_map(|(slot, ty)| (slot == Some(idx)).then_some(ty))
@@ -1940,13 +1939,47 @@ mod tests {
 		assert!(!types.has_error(nested));
 	}
 
+	/// Literal data's type waits for a memory where it is an expression's
+	/// own, or a tuple's element; behind a pointer, or as a nominal type's
+	/// argument, it is placed or is no expression's type, so the flag stops.
+	#[test]
+	fn a_type_has_unplaced_data_only_through_tuples() {
+		let mut types = TypeInterner::for_tests();
+		let length = types.intern(Type::Value { bits: 5 });
+		let array = types.intern(Type::Array {
+			of: TypeIndex::U8,
+			length,
+		});
+		let slice = types.intern(Type::Slice { of: TypeIndex::U8 });
+		let in_tuple = types.intern_tuple(&[array, TypeIndex::U8]);
+		let nested = types.intern_tuple(&[in_tuple, TypeIndex::U16]);
+		let memory = types.intern(Type::Memory {
+			memory_index: MemoryIdx::new(0),
+		});
+		let pointer = types.intern(Type::Pointer {
+			to: array,
+			memory,
+			ownership: Ownership::Shared,
+		});
+		let pointers = types.intern_tuple(&[pointer, TypeIndex::U8]);
+		let boxed = types.intern_struct(StructIdx::new(0), &[memory, slice]);
+		for ty in [array, slice, in_tuple, nested] {
+			assert!(types.has_unplaced(ty));
+			assert!(types.needs_context(ty));
+		}
+		for ty in [pointer, pointers, boxed, TypeIndex::U8] {
+			assert!(!types.has_unplaced(ty));
+			assert!(!types.needs_context(ty));
+		}
+	}
+
 	/// A parameter is what substitution replaces and a projection is what
 	/// normalization reduces; a function type is nominal and has neither of
 	/// its own, only what its arguments have.
 	#[test]
 	fn a_type_has_a_param_or_projection_when_one_is_anywhere_in_it() {
 		let mut types = TypeInterner::for_tests();
-		let t = parameter(&mut types, TypeEnvIdx::new(1), 0);
+		let t = parameter(&mut types, GenericEnvIdx::new(1), 0);
 		let wrapped = types.intern_struct(StructIdx::new(0), &[t]);
 		let projection = |types: &mut TypeInterner, base| {
 			types.intern(Type::TypeProjection {
@@ -1974,10 +2007,10 @@ mod tests {
 		assert!(!types.has_projection(make_point));
 	}
 
-	/// Two unrelated root frames: `TypeEnvIdx(1)` with two parameters and
-	/// `TypeEnvIdx(2)` with one.
-	fn root_frames(types: &mut TypeInterner) -> TypeEnvArena {
-		let mut envs = TypeEnvArena::new();
+	/// Two unrelated root frames: `GenericEnvIdx(1)` with two parameters and
+	/// `GenericEnvIdx(2)` with one.
+	fn root_frames(types: &mut TypeInterner) -> GenericEnvArena {
+		let mut envs = GenericEnvArena::new();
 		let name = Spanned {
 			inner: Keyword::SelfPascal.symbol(),
 			span: TextSpan::new(0, 0),
@@ -1985,8 +2018,8 @@ mod tests {
 		for count in [2, 1] {
 			envs.push_param_frame(
 				types,
-				TypeEnvOwner::Function(FunctionIdx::new(0)),
-				TypeEnvIdx::ROOT,
+				GenericEnvOwner::Function(FunctionIdx::new(0)),
+				GenericEnvIdx::ROOT,
 				vec![name.clone(); count],
 			);
 		}
@@ -1995,7 +2028,7 @@ mod tests {
 
 	fn parameter(
 		types: &mut TypeInterner,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 		param_index: u32,
 	) -> TypeIndex {
 		types.intern(Type::TypeParam { env, param_index })
@@ -2005,10 +2038,10 @@ mod tests {
 	fn substitution_replaces_only_the_targeted_frames_parameters() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
-		let other = parameter(&mut types, TypeEnvIdx::new(2), 0);
+		let other = parameter(&mut types, GenericEnvIdx::new(2), 0);
 		let original = types.intern_tuple(&[t, u, other]);
 		let expected =
 			types.intern_tuple(&[TypeIndex::I32, TypeIndex::BOOL, other]);
@@ -2059,11 +2092,15 @@ mod tests {
 		let array = types.intern(Type::Array {
 			of: pointer,
 			length: seven,
+		});
+		let array = types.intern(Type::Pointer {
+			to: array,
 			memory,
 			ownership: Ownership::Exclusive,
 		});
-		let slice = types.intern(Type::Slice {
-			of: element,
+		let slice = types.intern(Type::Slice { of: element });
+		let slice = types.intern(Type::Pointer {
+			to: slice,
 			memory,
 			ownership: Ownership::Shared,
 		});
@@ -2080,7 +2117,7 @@ mod tests {
 	fn substitution_traverses_nested_types_without_normalizing_projections() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let m = parameter(&mut types, env, 1);
 		let memory = types.intern(Type::Memory {
@@ -2106,7 +2143,7 @@ mod tests {
 	fn unchanged_substitution_preserves_indices_without_growing_the_interner() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let m = parameter(&mut types, env, 1);
 		let original = nested_signature(&mut types, t, m);
@@ -2117,7 +2154,7 @@ mod tests {
 				original,
 				Substitution {
 					envs: &envs,
-					env: TypeEnvIdx::new(2),
+					env: GenericEnvIdx::new(2),
 					args: &[]
 				},
 			),
@@ -2141,7 +2178,7 @@ mod tests {
 	fn substitution_preserves_unchanged_list_elements_around_late_changes() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
 		let substitution = Substitution {
@@ -2175,7 +2212,7 @@ mod tests {
 	{
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let substitution = Substitution {
 			envs: &envs,
@@ -2225,7 +2262,7 @@ mod tests {
 	fn substitution_inserts_replacements_without_substituting_them_again() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		let u = parameter(&mut types, env, 1);
 		let original = types.intern_tuple(&[t, u]);
@@ -2250,7 +2287,7 @@ mod tests {
 	fn substitution_preserves_a_projection_with_an_error_receiver() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let subject = parameter(&mut types, env, 0);
 		let projection = types.intern(Type::TypeProjection {
 			base: subject,
@@ -2329,7 +2366,7 @@ mod tests {
 					ty,
 					Substitution {
 						envs: &envs,
-						env: TypeEnvIdx::new(1),
+						env: GenericEnvIdx::new(1),
 						args: &[]
 					}
 				),
@@ -2343,7 +2380,7 @@ mod tests {
 	fn substitution_keeps_error_and_inference_arguments_as_supplied() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let t = parameter(&mut types, env, 0);
 		for replacement in [TypeIndex::ERROR, TypeIndex::INFER] {
 			assert_eq!(
@@ -2367,7 +2404,7 @@ mod tests {
 	fn substitution_rejects_missing_arguments_for_the_targeted_frame() {
 		let mut types = TypeInterner::for_tests();
 		let envs = root_frames(&mut types);
-		let env = TypeEnvIdx::new(1);
+		let env = GenericEnvIdx::new(1);
 		let u = parameter(&mut types, env, 1);
 		types.substitute(
 			u,

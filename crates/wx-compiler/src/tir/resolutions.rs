@@ -20,7 +20,7 @@ use super::body::{BodyOwner, LabelIdx, LocalIdx};
 use super::defs::{
 	DefKey, InherentImplIdx, MemberKind, Tier, TraitImplIdx, UseItemIndex,
 };
-use super::types::TypeEnvIdx;
+use super::types::GenericEnvIdx;
 use crate::diagnostics::SourceSpan;
 
 /// Keyed by the written name's span and the tier it was looked up in: a
@@ -47,7 +47,7 @@ pub(super) enum Referent {
 	},
 	/// A generic parameter, or a trait's own `Self`: its frame and position
 	/// in it.
-	TypeParam { env: TypeEnvIdx, index: u32 },
+	TypeParam { env: GenericEnvIdx, index: u32 },
 	/// `Self` inside an inherent impl, which names the impl's target and is
 	/// not a parameter of it.
 	InherentImplSelf(InherentImplIdx),

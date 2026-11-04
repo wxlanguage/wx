@@ -11,14 +11,14 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::StringInterner;
+use crate::ast::{Ownership, StringInterner};
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
 use super::body::ConstBody;
 use super::bounds::{
-	BindingRef, BoundClauses, BoundId, ClauseArena, ClauseTables, Equalities,
-	Readiness, SelfSubstitution, known_distinct,
+	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, ClauseArena,
+	ClauseTables, Readiness, SelfSubstitution, known_distinct,
 };
 use super::defs::{
 	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
@@ -27,14 +27,15 @@ use super::defs::{
 use super::eval::{Allocation, ConstValueState, Instance, ResolvedConstant};
 use super::impls::{ImplDispatch, ImplTarget};
 use super::layout::Layouts;
+use super::literals::UntypedValue;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::{
 	AssocTypeSignature, ConstantSignature, EnumSignature,
-	InherentImplSignature, ParamBounds, StructSignature, TraitImplSignature,
-	TraitSignature, TypeContext,
+	InherentImplSignature, StructSignature, TraitImplSignature, TraitSignature,
+	TypeContext,
 };
 use super::types::{
-	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
+	GenericEnvArena, GenericEnvIdx, ImplKind, Substitution, Type, TypeIndex,
 	TypeInterner, TypeList,
 };
 
@@ -59,54 +60,104 @@ pub(super) enum SolverError {
 	Cycle(Box<ProjectionCycle>),
 }
 
-/// Why a bound does not hold, for the check that owns it to report.
+/// Which of a run's clauses a proof reads, and how their subjects meet the
+/// use.
+#[derive(Clone, Copy)]
+pub(super) enum Subjects {
+	/// Every clause, its subject substituted like its other types: an env's
+	/// clauses proved for a use's arguments.
+	All,
+	/// The clauses about paths over `root`, each read over `subject`: one
+	/// argument's share of an env, or an associated declaration's clauses,
+	/// whose root is a projection.
+	Rooted { root: TypeIndex, subject: TypeIndex },
+}
+
+impl Subjects {
+	/// Whether a clause about `ty` is read.
+	fn reads(self, types: &TypeInterner, ty: TypeIndex) -> bool {
+		match self {
+			Subjects::All => true,
+			Subjects::Rooted { root, .. } => is_path_over(types, ty, root),
+		}
+	}
+
+	/// `ty`, a clause's subject, as the use states it.
+	fn stated(
+		self,
+		types: &mut TypeInterner,
+		(envs, env, args): (&GenericEnvArena, GenericEnvIdx, &[TypeIndex]),
+		ty: TypeIndex,
+	) -> TypeIndex {
+		match self {
+			Subjects::All => {
+				types.substitute(ty, Substitution { envs, env, args })
+			}
+			Subjects::Rooted { root, subject } => {
+				rebase(types, ty, root, subject)
+			}
+		}
+	}
+}
+
+/// Why a bound does not hold, for the check that owns it to report. `written`
+/// is the clause's subject as the declaration writes it.
 pub(super) enum UnsatisfiedClause {
 	/// `subject` lacks `trait_index`, which the bound `source` requires.
+	/// `subject` is the clause's subject as stated, with the use's arguments;
+	/// `reduced` is what it reduces to.
 	Trait {
+		written: TypeIndex,
 		subject: TypeIndex,
+		reduced: TypeIndex,
 		trait_index: TraitIdx,
 		source: BoundId,
 	},
+	/// `subject`'s value of the trait constant `constant` is not representable
+	/// as `ty`, which the entry `source` requires: `value` is it, or `None`
+	/// when `subject` is abstract and no representability clause in scope says
+	/// so.
+	Representable {
+		written: TypeIndex,
+		subject: TypeIndex,
+		constant: ConstIdx,
+		ty: TypeIndex,
+		value: Option<i128>,
+		source: BindingRef,
+	},
 	/// The projection the equality `source` names has another value.
+	/// `projection` and `required` are the equality's sides as stated, with
+	/// the use's arguments; `found` and `expected` are what they reduce to.
 	Equality {
+		written: TypeIndex,
 		projection: TypeIndex,
+		required: TypeIndex,
 		found: TypeIndex,
 		expected: TypeIndex,
 		source: BindingRef,
 	},
 }
 
-/// The value of `assoc_type_index` for `receiver`, whose trait the compiler
-/// answers from its structure: `func(A) -> R`'s `Call::Args` is `A` and its
-/// `Call::Result` is `R`, and `M::&[T]`'s or `M::&[T; N]`'s `Slice::Value`
-/// is `T` and its `Slice::Mem` is `M`.
-fn builtin_assoc_value(
-	view: &TypeContext<'_, '_, '_>,
-	receiver: TypeIndex,
-	assoc_type_index: AssocTypeIdx,
-) -> Option<TypeIndex> {
-	let intrinsics = &view.defs.intrinsics;
-	let this = Some(assoc_type_index);
-	match *view.types.resolve(receiver) {
-		Type::Slice { of, memory, .. } | Type::Array { of, memory, .. } => {
-			if this == intrinsics.slice_value {
-				Some(of)
-			} else if this == intrinsics.slice_mem {
-				Some(memory)
-			} else {
-				None
-			}
+impl UnsatisfiedClause {
+	pub(super) fn written(&self) -> TypeIndex {
+		match *self {
+			UnsatisfiedClause::Trait { written, .. }
+			| UnsatisfiedClause::Equality { written, .. }
+			| UnsatisfiedClause::Representable { written, .. } => written,
 		}
-		Type::TypedFuncref { param, result } => {
-			if this == intrinsics.call_args {
-				Some(param)
-			} else if this == intrinsics.call_result {
-				Some(result)
-			} else {
-				None
-			}
-		}
-		_ => None,
+	}
+}
+
+/// How many counts `metadata`, a `pointer_metadata` answer, holds: its
+/// tuples flattened.
+pub(super) fn metadata_len(types: &TypeInterner, metadata: TypeIndex) -> usize {
+	match *types.resolve(metadata) {
+		Type::Tuple { elements } => types
+			.list(elements)
+			.iter()
+			.map(|&element| metadata_len(types, element))
+			.sum(),
+		_ => 1,
 	}
 }
 
@@ -120,6 +171,23 @@ fn is_stack_scalar(ty: TypeIndex) -> bool {
 			| TypeIndex::F64
 			| TypeIndex::FUNCREF
 	)
+}
+
+/// Whether `ty` is `root` or a projection path over it.
+fn is_path_over(
+	types: &TypeInterner,
+	mut ty: TypeIndex,
+	root: TypeIndex,
+) -> bool {
+	loop {
+		if ty == root {
+			return true;
+		}
+		match *types.resolve(ty) {
+			Type::TypeProjection { base, .. } => ty = base,
+			_ => return false,
+		}
+	}
 }
 
 /// `ty`, a projection path over `root`, with `root` replaced by `onto`.
@@ -148,22 +216,37 @@ fn rebase(
 	})
 }
 
-/// Whether a step of `ty`'s projection path is a membership in `failed`.
-fn through_failed(
+/// Whether a projection anywhere in `ty` passes through a membership in
+/// `failed`, so whatever `ty` reduces to derives from that failure.
+fn reads_failed(
 	types: &TypeInterner,
-	mut ty: TypeIndex,
+	ty: TypeIndex,
 	failed: &[(TypeIndex, TraitIdx)],
 ) -> bool {
-	while let Type::TypeProjection {
-		base, trait_index, ..
-	} = *types.resolve(ty)
-	{
-		if failed.contains(&(base, trait_index)) {
-			return true;
-		}
-		ty = base;
+	if !types.has_projection(ty) {
+		return false;
 	}
-	false
+	let reads = |ty| reads_failed(types, ty, failed);
+	match *types.resolve(ty) {
+		Type::TypeProjection {
+			base, trait_index, ..
+		} => failed.contains(&(base, trait_index)) || reads(base),
+		Type::Tuple { elements: list }
+		| Type::Struct {
+			type_args: list, ..
+		}
+		| Type::Function {
+			type_args: list, ..
+		}
+		| Type::Const {
+			type_args: list, ..
+		} => types.list(list).iter().any(|&part| reads(part)),
+		Type::TypedFuncref { param, result } => reads(param) || reads(result),
+		Type::Pointer { to, memory, .. } => reads(to) || reads(memory),
+		Type::Array { of, length } => reads(of) || reads(length),
+		Type::Slice { of } => reads(of),
+		_ => false,
+	}
 }
 
 /// A projection that normalization reached again while normalizing it: the
@@ -507,7 +590,7 @@ impl TypeContext<'_, '_, '_> {
 			),
 		});
 		let result = self.normalize(
-			scope,
+			self.assumption_envs.of_frame(scope),
 			value,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -654,7 +737,7 @@ impl TypeContext<'_, '_, '_> {
 /// both cycle detection and the cache.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Normalization {
-	env: TypeEnvIdx,
+	env: AssumptionEnvIdx,
 	pub(super) ty: TypeIndex,
 	depth: NormalizationDepth,
 	facts: RewriteFlags,
@@ -667,7 +750,7 @@ impl Normalization {
 	/// its request is the root's, computed and cached once for all of them.
 	fn new(
 		types: &TypeInterner,
-		env: TypeEnvIdx,
+		env: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -675,7 +758,7 @@ impl Normalization {
 		let env = if types.has_param(ty) {
 			env
 		} else {
-			TypeEnvIdx::ROOT
+			AssumptionEnvIdx::ROOT
 		};
 		debug_assert!(
 			types.has_projection(ty),
@@ -810,7 +893,7 @@ impl TypeContext<'_, '_, '_> {
 				Ok(self.types.substitute(
 					default,
 					Substitution {
-						envs: &self.type_envs,
+						envs: &self.generic_envs,
 						env,
 						args: &[target],
 					},
@@ -950,7 +1033,7 @@ impl TypeContext<'_, '_, '_> {
 	/// itself, or reads silently become order-dependent.
 	pub(super) fn normalize(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1002,7 +1085,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn normalize_uncached(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1053,7 +1136,7 @@ impl TypeContext<'_, '_, '_> {
 	/// it keeps its normalized arguments.
 	fn normalize_const(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		constant: ConstIdx,
 		type_args: TypeList,
 		depth: NormalizationDepth,
@@ -1091,7 +1174,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn normalize_projection(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1131,7 +1214,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn reduce_projection(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1148,6 +1231,7 @@ impl TypeContext<'_, '_, '_> {
 		// receiver to a value that no longer carries their provenance.
 		if self.types.is_param_or_projection(base) {
 			match self.projection_equality(
+				assumption_context,
 				base,
 				trait_index,
 				assoc_type_index,
@@ -1198,38 +1282,136 @@ impl TypeContext<'_, '_, '_> {
 			(next, normalization.env)
 		};
 		if self.types.is_param_or_projection(next_base) {
-			return match self.projection_equality(
+			match self.projection_equality(
+				assumption_context,
 				next_base,
 				trait_index,
 				assoc_type_index,
 			)? {
-				EqualityLookup::Known(value) => self.reduce_by_equality(
-					assumption_context,
-					projection,
-					value,
-					depth,
-					facts,
-				),
-				EqualityLookup::Absent | EqualityLookup::Ambiguous => {
-					Ok(projection)
+				EqualityLookup::Known(value) => {
+					return self.reduce_by_equality(
+						assumption_context,
+						projection,
+						value,
+						depth,
+						facts,
+					);
 				}
-			};
-		}
-		if matches!(self.types.resolve(next_base), Type::Infer) {
-			return Ok(projection);
+				EqualityLookup::Absent | EqualityLookup::Ambiguous => {}
+			}
 		}
 		if !facts.contains(RewriteFlags::DEFINITIONS) {
 			return Ok(projection);
 		}
-		// `None` is silent on purpose: normalization is a query and reports
-		// nothing. The construct that wrote this projection owns the report,
-		// either when it formed the projection or through the membership check
-		// it recorded; a failure derived from it stays quiet.
-		let Some(found) = self.find_trait_impl_query(
+		self.project_value(Normalization::new(
+			&self.types,
 			assumption_context,
-			next_base,
+			projection,
+			depth,
+			facts,
+		))
+	}
+
+	/// Computes compiler-defined associated values directly, or selects a
+	/// declared provider. Repr establishes membership while computing its value;
+	/// the other builtin rules apply to their receiver's structural shape.
+	fn project_value(
+		&mut self,
+		request: Normalization,
+	) -> Result<TypeIndex, SolverError> {
+		let Type::TypeProjection {
+			base,
+			assoc_type_index,
+			..
+		} = *self.types.resolve(request.ty)
+		else {
+			unreachable!(
+				"a projection's value is computed after receiver rewriting"
+			)
+		};
+		let intrinsics = &self.defs.intrinsics;
+		let member = Some(assoc_type_index);
+		if member == intrinsics.stack_value_repr {
+			return self.compute_stack_value_repr(request);
+		}
+		let value = match *self.types.resolve(base) {
+			Type::Slice { of } | Type::Array { of, .. }
+				if member == intrinsics.slice_value =>
+			{
+				of
+			}
+			Type::Pointer { to, memory, .. }
+				if member == intrinsics.pointer_metadata =>
+			{
+				let size = self.address_size(request.env, memory)?;
+				self.compute_pointer_metadata(
+					request.env,
+					to,
+					memory,
+					size,
+					request.facts,
+				)?
+				.unwrap_or_else(|| self.pointer_metadata_projection(to, memory))
+			}
+			Type::Pointer { memory, .. }
+				if member == intrinsics.pointer_memory =>
+			{
+				memory
+			}
+			Type::Pointer { to, .. }
+				if member == intrinsics.pointer_pointee =>
+			{
+				to
+			}
+			Type::TypedFuncref { param, .. }
+				if member == intrinsics.call_args =>
+			{
+				param
+			}
+			Type::TypedFuncref { result, .. }
+				if member == intrinsics.call_result =>
+			{
+				result
+			}
+			// Call::Args and Call::Result on a callable struct, for example,
+			// come from its impl rather than the function-reference rule.
+			_ => return self.declared_projection_value(request),
+		};
+		// Unknown metadata is already the canonical projection. Normalizing it
+		// again here would reenter its own active frame.
+		if value == request.ty {
+			return Ok(value);
+		}
+		self.normalize(request.env, value, request.depth, request.facts)
+	}
+
+	fn declared_projection_value(
+		&mut self,
+		request: Normalization,
+	) -> Result<TypeIndex, SolverError> {
+		let Type::TypeProjection {
+			base,
 			trait_index,
-		)?
+			assoc_type_index,
+		} = *self.types.resolve(request.ty)
+		else {
+			unreachable!("the request names an associated type")
+		};
+		let Normalization {
+			env: assumption_context,
+			ty: projection,
+			depth,
+			facts,
+		} = request;
+		if self.types.is_param_or_projection(base)
+			|| matches!(self.types.resolve(base), Type::Infer)
+		{
+			return Ok(projection);
+		}
+		// A missing provider stays silent: the construct requiring the trait
+		// owns the report, and consumers recover from its poisoned projection.
+		let Some(found) =
+			self.find_trait_impl_query(assumption_context, base, trait_index)?
 		else {
 			return Err(SolverError::Poisoned);
 		};
@@ -1237,27 +1419,11 @@ impl TypeContext<'_, '_, '_> {
 			TraitImplLookup::Concrete { impl_index, args } => {
 				(impl_index, args)
 			}
-			TraitImplLookup::Builtin => {
-				let value = if Some(assoc_type_index)
-					== self.defs.intrinsics.stack_value_repr
-				{
-					self.stack_repr(
-						assumption_context,
-						next_base,
-						trait_index,
-						assoc_type_index,
-					)?
-				} else {
-					builtin_assoc_value(self, next_base, assoc_type_index)
-				};
-				// A canonical `Repr` is its own answer.
-				let Some(value) = value.filter(|&value| value != projection)
-				else {
-					return Ok(projection);
-				};
-				return self.normalize(assumption_context, value, depth, facts);
+			// An abstract impl, or a builtin trait with no rule for this
+			// associated member, supplies no value to reduce further.
+			TraitImplLookup::Abstract | TraitImplLookup::Builtin => {
+				return Ok(projection);
 			}
-			TraitImplLookup::Abstract => return Ok(projection),
 		};
 		let member = ImplMember {
 			impl_index,
@@ -1271,11 +1437,11 @@ impl TypeContext<'_, '_, '_> {
 				.as_ref()
 				.expect("a generic selected impl has a resolved header")
 				.type_params;
-			debug_assert_ne!(env, TypeEnvIdx::ROOT);
+			debug_assert_ne!(env, GenericEnvIdx::ROOT);
 			self.types.substitute(
 				value,
 				Substitution {
-					envs: &self.type_envs,
+					envs: &self.generic_envs,
 					env,
 					args: &args,
 				},
@@ -1288,7 +1454,7 @@ impl TypeContext<'_, '_, '_> {
 	/// restates the projection (`A = T::A` for `T::A`) leaves it abstract.
 	fn reduce_by_equality(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		value: TypeIndex,
 		depth: NormalizationDepth,
@@ -1307,7 +1473,7 @@ impl TypeContext<'_, '_, '_> {
 	/// returns the original index when nothing changed.
 	fn normalize_children(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
@@ -1383,12 +1549,7 @@ impl TypeContext<'_, '_, '_> {
 				)?,
 				ownership,
 			},
-			Type::Array {
-				of,
-				length,
-				memory,
-				ownership,
-			} => Type::Array {
+			Type::Array { of, length } => Type::Array {
 				of: self.normalize(assumption_context, of, depth, facts)?,
 				length: self.normalize(
 					assumption_context,
@@ -1396,27 +1557,9 @@ impl TypeContext<'_, '_, '_> {
 					depth,
 					facts,
 				)?,
-				memory: self.normalize(
-					assumption_context,
-					memory,
-					depth,
-					facts,
-				)?,
-				ownership,
 			},
-			Type::Slice {
-				of,
-				memory,
-				ownership,
-			} => Type::Slice {
+			Type::Slice { of } => Type::Slice {
 				of: self.normalize(assumption_context, of, depth, facts)?,
-				memory: self.normalize(
-					assumption_context,
-					memory,
-					depth,
-					facts,
-				)?,
-				ownership,
 			},
 			Type::TypeProjection { .. } | Type::Const { .. } => {
 				unreachable!(
@@ -1429,8 +1572,6 @@ impl TypeContext<'_, '_, '_> {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1453,7 +1594,7 @@ impl TypeContext<'_, '_, '_> {
 
 	pub(super) fn find_trait_impl_query(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 	) -> Result<Option<TraitImplLookup>, SolverError> {
@@ -1463,8 +1604,18 @@ impl TypeContext<'_, '_, '_> {
 		}
 		// Every type is a stack value by its structure, whatever impls exist.
 		if Some(required_trait) == self.defs.intrinsics.stack_value {
-			let elements = self.stack_elements(assumption_context, receiver)?;
-			return Ok(elements.map(|_| TraitImplLookup::Builtin));
+			return match self.stack_value_repr(assumption_context, receiver) {
+				Ok(_) => Ok(Some(TraitImplLookup::Builtin)),
+				Err(SolverError::Poisoned) => {
+					match self
+						.explain_non_stack_value(assumption_context, receiver)?
+					{
+						Some(_) => Ok(None),
+						None => Err(SolverError::Poisoned),
+					}
+				}
+				Err(error) => Err(error),
+			};
 		}
 		// Only an abstract type takes a trait from assumptions. Any other type
 		// has the trait exactly when its impl says so: there is one impl per
@@ -1533,38 +1684,237 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
+	/// The representation is also the proof that `ty` is a `StackValue`.
+	/// Concrete and symbolic answers share the ordinary normalization cache,
+	/// environment key, budget and rollback rules. Absence is not cached.
+	pub(super) fn stack_value_repr(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+	) -> Result<TypeIndex, SolverError> {
+		let intrinsics = &self.defs.intrinsics;
+		let trait_index =
+			intrinsics.stack_value.expect("std declares `StackValue`");
+		let assoc_type_index = intrinsics
+			.stack_value_repr
+			.expect("`StackValue` declares `Repr`");
+		let projection = self.types.intern(Type::TypeProjection {
+			base: ty,
+			trait_index,
+			assoc_type_index,
+		});
+		self.normalize(
+			assumption_context,
+			projection,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)
+	}
+
 	/// How a value of `ty` sits on the Wasm stack, as `StackValue` judges it:
 	/// its parts in declaration order, flattened, zero-sized ones dropped.
 	/// Each element is a scalar (`is_stack_scalar`) or an abstract part
-	/// assumed `StackValue`, standing for its own `Repr`. `None` when `ty` is
-	/// no `StackValue`: it contains `!`, or an abstract part not assumed one.
-	pub(super) fn stack_elements(
+	/// assumed `StackValue`, standing for its own `Repr`. A type containing
+	/// `!` is uninhabited and its one element is `!`: no Wasm value is ever
+	/// held for it, since the code that would hold one is unreachable. `None`
+	/// when `ty` is no `StackValue`: it holds a slice or an array, or an
+	/// abstract part not assumed one.
+	fn stack_elements(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
 		let mut elements = Vec::new();
-		let is_stack_value =
-			self.push_stack_elements(assumption_context, ty, &mut elements, 0)?;
-		Ok(is_stack_value.then_some(elements))
+		if !self.push_stack_elements(
+			assumption_context,
+			ty,
+			&mut elements,
+			&mut Vec::new(),
+			0,
+		)? {
+			return Ok(None);
+		}
+		if elements.contains(&TypeIndex::NEVER) {
+			elements.clear();
+			elements.push(TypeIndex::NEVER);
+		}
+		Ok(Some(elements))
 	}
 
-	/// `<ty as StackValue>::Repr`, `ty` being a `StackValue` that is not
-	/// abstract itself. With no abstract part, the flat tuple of its
-	/// scalars; otherwise the projection again, over the canonical self type:
-	/// the flat tuple of its elements, which flattens as `ty` does. So
+	/// Finds the offending part only after the representation query failed.
+	/// Successful children use that same query; the diagnostic walk needs no
+	/// element vector. Solver errors remain the responsibility of their owner.
+	#[cold]
+	pub(super) fn explain_non_stack_value(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		self.explain_non_stack_value_inner(
+			assumption_context,
+			ty,
+			&mut Vec::new(),
+		)
+	}
+
+	fn explain_non_stack_value_inner(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+		visiting: &mut Vec<TypeIndex>,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		// The root query already failed. For children, reuse successful
+		// representations before descending into their structure.
+		if !visiting.is_empty() {
+			match self.stack_value_repr(assumption_context, ty) {
+				Ok(_) => return Ok(None),
+				Err(SolverError::Poisoned) => {}
+				Err(error) => return Err(error),
+			}
+		}
+		if visiting.len() > self.solver.state.recursion_budget {
+			return Err(SolverError::Overflow);
+		}
+		if visiting.contains(&ty) {
+			return Err(SolverError::Poisoned);
+		}
+		visiting.push(ty);
+		let result = (|| {
+			let ty = self.normalize(
+				assumption_context,
+				ty,
+				NormalizationDepth::Deep,
+				RewriteFlags::ALL,
+			)?;
+			match *self.types.resolve(ty) {
+				Type::Struct {
+					struct_index,
+					type_args,
+				} => {
+					let signature = &self.structs[usize::from(struct_index)];
+					let (env, fields) =
+						(signature.type_params, signature.field_types);
+					let args: Box<[TypeIndex]> =
+						self.types.list(type_args).into();
+					for at in 0..fields.len() {
+						let field = self.types.list(fields)[at];
+						let field = self.types.substitute(
+							field,
+							Substitution {
+								envs: &self.generic_envs,
+								env,
+								args: &args,
+							},
+						);
+						if let Some(part) = self.explain_non_stack_value_inner(
+							assumption_context,
+							field,
+							visiting,
+						)? {
+							return Ok(Some(part));
+						}
+					}
+				}
+				Type::Tuple { elements } => {
+					for at in 0..elements.len() {
+						let element = self.types.list(elements)[at];
+						if let Some(part) = self.explain_non_stack_value_inner(
+							assumption_context,
+							element,
+							visiting,
+						)? {
+							return Ok(Some(part));
+						}
+					}
+				}
+				Type::Pointer { to, memory, .. } => {
+					let size = self.address_size(assumption_context, memory)?;
+					let metadata = self.pointer_metadata_value(
+						assumption_context,
+						to,
+						memory,
+					)?;
+					for part in [size, metadata] {
+						if let Some(part) = self.explain_non_stack_value_inner(
+							assumption_context,
+							part,
+							visiting,
+						)? {
+							return Ok(Some(part));
+						}
+					}
+				}
+				Type::Enum { enum_index } => {
+					let repr = self.enums[usize::from(enum_index)].repr;
+					return self.explain_non_stack_value_inner(
+						assumption_context,
+						repr,
+						visiting,
+					);
+				}
+				Type::Slice { .. } | Type::Array { .. } => return Ok(Some(ty)),
+				Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+					let stack_value = self
+						.defs
+						.intrinsics
+						.stack_value
+						.expect("std declares `StackValue`");
+					if !self.assumes(assumption_context, ty, stack_value)? {
+						return Ok(Some(ty));
+					}
+				}
+				Type::Error
+				| Type::Infer
+				| Type::IntegerLiteral
+				| Type::FloatLiteral
+				| Type::CharLiteral
+				| Type::Value { .. }
+				| Type::Const { .. } => return Err(SolverError::Poisoned),
+				_ => {}
+			}
+			Ok(None)
+		})();
+		visiting.pop();
+		result
+	}
+
+	/// Proves and computes `<ty as StackValue>::Repr`. An abstract receiver
+	/// needs evidence of the bound and keeps its symbolic representation.
+	/// `!` for an uninhabited type, so `transmute` makes no
+	/// `!` out of `()` and a global is never one. With no abstract part, the
+	/// flat tuple of its scalars; otherwise the projection again, over the
+	/// canonical self type: the flat tuple of its elements, which flattens as
+	/// `ty` does. So
 	/// `Wrap<T>` gives `T::Repr`, and `Pair<T, u32>` and `(T, u32)` both give
 	/// `<(T, i32) as StackValue>::Repr`.
-	fn stack_repr(
+	fn compute_stack_value_repr(
 		&mut self,
-		assumption_context: TypeEnvIdx,
-		ty: TypeIndex,
-		trait_index: TraitIdx,
-		assoc_type_index: AssocTypeIdx,
-	) -> Result<Option<TypeIndex>, SolverError> {
-		let Some(parts) = self.stack_elements(assumption_context, ty)? else {
-			return Ok(None);
+		request: Normalization,
+	) -> Result<TypeIndex, SolverError> {
+		let Type::TypeProjection {
+			base: ty,
+			trait_index,
+			assoc_type_index,
+		} = *self.types.resolve(request.ty)
+		else {
+			unreachable!("the request names StackValue::Repr")
 		};
+		let assumption_context = request.env;
+		if self.types.is_param_or_projection(ty) {
+			// A symbolic Repr is a finished answer only under evidence of the
+			// bound. Unbounded parameters must not seed the positive cache.
+			return if self.assumes(assumption_context, ty, trait_index)? {
+				Ok(request.ty)
+			} else {
+				Err(SolverError::Poisoned)
+			};
+		}
+		let Some(parts) = self.stack_elements(assumption_context, ty)? else {
+			return Err(SolverError::Poisoned);
+		};
+		if parts == [TypeIndex::NEVER] {
+			return Ok(TypeIndex::NEVER);
+		}
 		let mut elements = Vec::with_capacity(parts.len());
 		for part in parts {
 			if is_stack_scalar(part) {
@@ -1591,13 +1941,13 @@ impl TypeContext<'_, '_, '_> {
 		}
 		let base = self.types.intern_tuple(&elements);
 		if elements.iter().copied().all(is_stack_scalar) {
-			return Ok(Some(base));
+			return Ok(base);
 		}
-		Ok(Some(self.types.intern(Type::TypeProjection {
+		Ok(self.types.intern(Type::TypeProjection {
 			base,
 			trait_index,
 			assoc_type_index,
-		})))
+		}))
 	}
 
 	/// Appends the elements of `value`, a part's normalized `Repr`; `false`
@@ -1641,24 +1991,28 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	/// Appends `ty`'s elements to `out`; `false` when it is no `StackValue`.
+	/// Appends `ty`'s elements to `out`; false when it has no representation.
+	/// Offending parts are located separately, only when reporting an error.
 	fn push_stack_elements(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<TypeIndex>,
+		visiting: &mut Vec<TypeIndex>,
 		depth: usize,
 	) -> Result<bool, SolverError> {
 		if depth > self.solver.state.recursion_budget {
 			return Err(SolverError::Overflow);
 		}
+		// Deep, as a declaration's other checks read it: a loop through an
+		// equality stays the projection it is, not unfolded a step at a time.
 		let ty = self.normalize(
 			assumption_context,
 			ty,
-			NormalizationDepth::Shallow,
+			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
-		let is_stack_value = match *self.types.resolve(ty) {
+		match *self.types.resolve(ty) {
 			// A constant is no value's type; lowering puts one only where a
 			// constant is expected.
 			Type::Error
@@ -1666,17 +2020,17 @@ impl TypeContext<'_, '_, '_> {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::Value { .. }
-			| Type::Const { .. } => {
-				return Err(SolverError::Poisoned);
+			| Type::Const { .. } => Err(SolverError::Poisoned),
+			// Uninhabited: `stack_elements` makes it the whole type's one
+			// element.
+			Type::Never => {
+				out.push(TypeIndex::NEVER);
+				Ok(true)
 			}
-			// An uninhabited type has no representation.
-			Type::Never => false,
 			Type::Function { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. } => true,
+			| Type::Global { .. } => Ok(true),
 			Type::U8
 			| Type::I8
 			| Type::U16
@@ -1684,19 +2038,19 @@ impl TypeContext<'_, '_, '_> {
 			| Type::U32
 			| Type::I32 => {
 				out.push(TypeIndex::I32);
-				true
+				Ok(true)
 			}
 			Type::U64 | Type::I64 => {
 				out.push(TypeIndex::I64);
-				true
+				Ok(true)
 			}
 			Type::F32 | Type::F64 | Type::Funcref => {
 				out.push(ty);
-				true
+				Ok(true)
 			}
 			Type::TypedFuncref { .. } => {
 				out.push(TypeIndex::FUNCREF);
-				true
+				Ok(true)
 			}
 			Type::Enum { enum_index } => {
 				let repr = self.enums[usize::from(enum_index)].repr;
@@ -1704,21 +2058,38 @@ impl TypeContext<'_, '_, '_> {
 					assumption_context,
 					repr,
 					out,
+					visiting,
 					depth + 1,
-				)?
+				)
 			}
-			// An address, as wide as its memory's `Size`.
-			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
-				self.push_address(assumption_context, memory, out, depth)?
+			// An address, as wide as its memory's `Size`, then the pointee's
+			// counts, each as wide again (`Pointer::Metadata`).
+			Type::Pointer { to, memory, .. } => {
+				let size = self.address_size(assumption_context, memory)?;
+				let metadata = self.pointer_metadata_value(
+					assumption_context,
+					to,
+					memory,
+				)?;
+				if !self.push_stack_elements(
+					assumption_context,
+					size,
+					out,
+					visiting,
+					depth + 1,
+				)? {
+					return Ok(false);
+				}
+				self.push_stack_elements(
+					assumption_context,
+					metadata,
+					out,
+					visiting,
+					depth + 1,
+				)
 			}
-			// An address and a length, both as wide as the memory's `Size`.
-			Type::Slice { memory, .. } => {
-				let start = out.len();
-				let is_stack_value =
-					self.push_address(assumption_context, memory, out, depth)?;
-				out.extend_from_within(start..);
-				is_stack_value
-			}
+			// A slice or an array is never a value: only a pointer holds one.
+			Type::Slice { .. } | Type::Array { .. } => Ok(false),
 			Type::Tuple { elements } => {
 				// Read one element at a time: normalizing may store more lists.
 				for at in 0..elements.len() {
@@ -1727,17 +2098,23 @@ impl TypeContext<'_, '_, '_> {
 						assumption_context,
 						element,
 						out,
+						visiting,
 						depth + 1,
 					)? {
 						return Ok(false);
 					}
 				}
-				true
+				Ok(true)
 			}
 			Type::Struct {
 				struct_index,
 				type_args,
 			} => {
+				// A struct containing itself is reported where it is declared.
+				if visiting.contains(&ty) {
+					return Err(SolverError::Poisoned);
+				}
+				visiting.push(ty);
 				let signature = &self.structs[usize::from(struct_index)];
 				let (env, fields) =
 					(signature.type_params, signature.field_types);
@@ -1748,7 +2125,7 @@ impl TypeContext<'_, '_, '_> {
 					let field = self.types.substitute(
 						field,
 						Substitution {
-							envs: &self.type_envs,
+							envs: &self.generic_envs,
 							env,
 							args: &args,
 						},
@@ -1757,46 +2134,39 @@ impl TypeContext<'_, '_, '_> {
 						assumption_context,
 						field,
 						out,
+						visiting,
 						depth + 1,
 					)? {
+						visiting.pop();
 						return Ok(false);
 					}
 				}
-				true
+				visiting.pop();
+				Ok(true)
 			}
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
 				let stack_value = self
 					.defs
 					.intrinsics
 					.stack_value
-					.expect("only `StackValue` asks for stack elements");
-				match self.check_assumed_trait(
-					assumption_context,
-					ty,
-					stack_value,
-				)? {
-					Assumption::Holds => {
-						out.push(ty);
-						true
-					}
-					Assumption::Unproven => false,
-					Assumption::Pending => return Err(SolverError::Pending),
+					.expect("std declares `StackValue`");
+				if self.assumes(assumption_context, ty, stack_value)? {
+					out.push(ty);
+					Ok(true)
+				} else {
+					Ok(false)
 				}
 			}
-		};
-		Ok(is_stack_value)
+		}
 	}
 
-	/// Appends one address into `memory`: its `Size`'s elements. An abstract
-	/// memory's is its abstract `Size`, the same element for every pointer
-	/// into it, so `M::*u8` and `M::Size` are held alike.
-	fn push_address(
+	/// The type of an address into `memory`: a declared memory's `Size`, or
+	/// `M::Size` for an abstract one.
+	pub(super) fn address_size(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		memory: TypeIndex,
-		out: &mut Vec<TypeIndex>,
-		depth: usize,
-	) -> Result<bool, SolverError> {
+	) -> Result<TypeIndex, SolverError> {
 		let memory = self.normalize(
 			assumption_context,
 			memory,
@@ -1815,7 +2185,153 @@ impl TypeContext<'_, '_, '_> {
 			Type::Error | Type::Infer => return Err(SolverError::Poisoned),
 			_ => self.memory_size(memory).ok_or(SolverError::Poisoned)?,
 		};
-		self.push_stack_elements(assumption_context, size, out, depth + 1)
+		Ok(size)
+	}
+
+	/// `<M::&T as Pointer>::Metadata`, reduced by the ordinary normalization
+	/// query. Its projection supplies the cache key, active frame, recursion
+	/// budget and equality rollback; recursive element metadata goes through
+	/// that same query. Shared and exclusive pointers give one metadata type.
+	pub(super) fn pointer_metadata_value(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		to: TypeIndex,
+		memory: TypeIndex,
+	) -> Result<TypeIndex, SolverError> {
+		let projection = self.pointer_metadata_projection(to, memory);
+		self.normalize(
+			assumption_context,
+			projection,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)
+	}
+
+	/// The canonical query identity, also the answer when the shape is unknown.
+	fn pointer_metadata_projection(
+		&mut self,
+		to: TypeIndex,
+		memory: TypeIndex,
+	) -> TypeIndex {
+		let intrinsics = &self.defs.intrinsics;
+		let (trait_index, assoc_type_index) = (
+			intrinsics.pointer.expect("std declares `Pointer`"),
+			intrinsics
+				.pointer_metadata
+				.expect("`Pointer` declares `Metadata`"),
+		);
+		let shared = self.types.intern(Type::Pointer {
+			to,
+			memory,
+			ownership: Ownership::Shared,
+		});
+		self.types.intern(Type::TypeProjection {
+			base: shared,
+			trait_index,
+			assoc_type_index,
+		})
+	}
+
+	/// The query's known shape, for layout and constant evaluation: `None`
+	/// when metadata remains a rigid `Pointer::Metadata` projection.
+	pub(super) fn pointer_metadata(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		pointee: TypeIndex,
+		memory: TypeIndex,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		let metadata =
+			self.pointer_metadata_value(assumption_context, pointee, memory)?;
+		Ok(self.known_pointer_metadata(metadata))
+	}
+
+	fn known_pointer_metadata(&self, metadata: TypeIndex) -> Option<TypeIndex> {
+		match *self.types.resolve(metadata) {
+			Type::TypeProjection {
+				assoc_type_index, ..
+			} if assoc_type_index
+				== self
+					.defs
+					.intrinsics
+					.pointer_metadata
+					.expect("`Pointer` declares `Metadata`") =>
+			{
+				None
+			}
+			_ => Some(metadata),
+		}
+	}
+
+	/// The builtin reduction, called with a metadata projection on the solver
+	/// stack. A slice adds its length to its element's metadata; an abstract
+	/// pointee is thin only when assumed `StackValue` or `Array`.
+	fn compute_pointer_metadata(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		pointee: TypeIndex,
+		memory: TypeIndex,
+		size: TypeIndex,
+		facts: RewriteFlags,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		// Keep looping equalities rigid. Shallow reduction would unfold
+		// `T::Item = [T::Item]` once per element and start the loop afresh.
+		let pointee = self.normalize(
+			assumption_context,
+			pointee,
+			NormalizationDepth::Deep,
+			facts,
+		)?;
+		match *self.types.resolve(pointee) {
+			Type::Slice { of } => {
+				let projection = self.pointer_metadata_projection(of, memory);
+				let metadata = self.normalize(
+					assumption_context,
+					projection,
+					NormalizationDepth::Deep,
+					facts,
+				)?;
+				let Some(element) = self.known_pointer_metadata(metadata)
+				else {
+					return Ok(None);
+				};
+				Ok(Some(if element == TypeIndex::UNIT {
+					size
+				} else {
+					self.types.intern_tuple(&[size, element])
+				}))
+			}
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				let intrinsics = &self.defs.intrinsics;
+				let (Some(stack_value), Some(array)) =
+					(intrinsics.stack_value, intrinsics.array)
+				else {
+					return Ok(Some(TypeIndex::UNIT));
+				};
+				if self.assumes(assumption_context, pointee, stack_value)?
+					|| self.assumes(assumption_context, pointee, array)?
+				{
+					Ok(Some(TypeIndex::UNIT))
+				} else {
+					Ok(None)
+				}
+			}
+			_ => Ok(Some(TypeIndex::UNIT)),
+		}
+	}
+
+	/// Whether the facts in scope prove `ty: required` (`check_assumed_trait`);
+	/// `Pending` while a table they come from is unfinished.
+	fn assumes(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+		required: TraitIdx,
+	) -> Result<bool, SolverError> {
+		match self.check_assumed_trait(assumption_context, ty, required)? {
+			Assumption::Holds => Ok(true),
+			Assumption::Unproven => Ok(false),
+			Assumption::Pending => Err(SolverError::Pending),
+		}
 	}
 
 	/// Whether the facts in scope prove `ty: required`, from three sources:
@@ -1840,7 +2356,7 @@ impl TypeContext<'_, '_, '_> {
 	/// an unfinished table is `Assumption::Pending`, never an error.
 	pub(super) fn check_assumed_trait(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<Assumption, SolverError> {
@@ -1848,6 +2364,7 @@ impl TypeContext<'_, '_, '_> {
 		// 1. Declared on `ty`'s own path.
 		let mut declared = tables.declared_traits(
 			&self.types,
+			assumption_context,
 			ty,
 			self.solver.state.recursion_budget,
 		);
@@ -1916,7 +2433,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Reads the finished header: one still missing is `Pending`.
 	pub(super) fn match_trait_impl_candidate_query(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		impl_index: TraitImplIdx,
 		receiver: TypeIndex,
 	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
@@ -1939,9 +2456,9 @@ impl TypeContext<'_, '_, '_> {
 	/// candidate's.
 	pub(super) fn match_impl_target_and_bounds(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		impl_kind: ImplKind,
-		impl_env: TypeEnvIdx,
+		impl_env: GenericEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
 	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
@@ -1966,7 +2483,7 @@ impl TypeContext<'_, '_, '_> {
 		let Some(args) = self.types.match_impl_target(
 			target,
 			receiver,
-			&self.type_envs,
+			&self.generic_envs,
 			impl_env,
 		) else {
 			return Ok(None);
@@ -1977,8 +2494,8 @@ impl TypeContext<'_, '_, '_> {
 		if *self.solver.verdict(Definition::Requirements(impl_kind))
 			== Verdict::InProgress
 		{
-			if assumption_context == impl_env
-				&& *args == *self.type_envs.identity_args(impl_env)
+			if assumption_context == self.assumption_envs.of_frame(impl_env)
+				&& *args == *self.generic_envs.identity_args(impl_env)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
 				return Ok(Some(args));
@@ -2029,7 +2546,7 @@ impl TypeContext<'_, '_, '_> {
 			.map(|header| header.type_params),
 		}
 		.ok_or(SolverError::Pending)?;
-		let args = self.type_envs.identity_args(impl_env).to_vec();
+		let args = self.generic_envs.identity_args(impl_env).to_vec();
 		self.solver.verdicts.insert(definition, Verdict::InProgress);
 		let index = self.solver.state.frames.len();
 		self.solver.state.frames.push(SolverFrame::Requirements {
@@ -2040,8 +2557,12 @@ impl TypeContext<'_, '_, '_> {
 				self.solver.recursion_limit,
 			),
 		});
-		let result =
-			self.prove_requirements(impl_env, impl_env, &args, Some(index));
+		let result = self.prove_requirements(
+			self.assumption_envs.of_frame(impl_env),
+			impl_env,
+			&args,
+			Some(index),
+		);
 		let Some(SolverFrame::Requirements {
 			bound,
 			outer_budget,
@@ -2092,85 +2613,94 @@ impl TypeContext<'_, '_, '_> {
 		answer
 	}
 
-	/// Whether every bound on `impl_env`'s chain holds for `args` (its flat
-	/// arguments) under `assumption_context`. A judgement passes its frame,
-	/// which records the bound being proved.
+	/// Whether every clause `impl_env`'s item and the items around it state
+	/// holds for `args` (the flat arguments of its chain) under
+	/// `assumption_context`: each frame's requirements, proved whole. A
+	/// judgement passes its frame, which records the bound being proved.
 	fn prove_requirements(
 		&mut self,
-		assumption_context: TypeEnvIdx,
-		impl_env: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
+		impl_env: GenericEnvIdx,
 		args: &[TypeIndex],
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		// Every parameter on the impl's chain is an argument of the match,
-		// at its flat slot; its bounds stay in its own frame.
-		let chain: Vec<TypeEnvIdx> = self.type_envs.chain(impl_env).collect();
-		for frame in chain {
-			let start = self.type_envs.parent_count(frame);
-			for index in 0..self.param_bounds[usize::from(frame)].len() {
-				let clauses =
-					self.param_bounds[usize::from(frame)][index].clauses;
-				if !self.satisfies_clauses(
-					assumption_context,
-					clauses,
-					(
-						self.type_envs.param_types(frame)[index],
-						args[start + index],
-					),
-					(impl_env, args),
-					None,
-					judgement,
-				)? {
-					return Ok(false);
-				}
+		let mut frame = Some(impl_env);
+		while let Some(current) = frame {
+			if !self.satisfies_clauses(
+				assumption_context,
+				self.assumption_envs.requirements(current),
+				Subjects::All,
+				(impl_env, args),
+				None,
+				judgement,
+			)? {
+				return Ok(false);
 			}
+			frame = self.generic_envs.parent(current);
 		}
 		Ok(true)
 	}
 
-	/// Whether `subject` satisfies `clauses`, which a declaration states
-	/// about `root`: each membership, then each equality, as Rust proves `T:
-	/// Tr<A = X, A: Other>`. A clause's subject is a path over `root`, read
-	/// over `subject` and named by its value; its other types are substituted
-	/// over `substitution` (the frame the clauses are written in and the
-	/// arguments for its whole chain). A clause reached through a membership
-	/// that does not hold is not proved: that membership is the failure. With
-	/// `failures`, every failure is collected for the caller to report;
-	/// without, the first one answers. A judgement passes its frame, which
-	/// records the bound being proved. A subject whose equality pass has not
-	/// run yet has no answer (`SolverError::Pending`), not a failure.
+	/// Whether `clauses`, which a declaration states, hold for a use: each
+	/// membership, then each equality, as Rust proves `T: Tr<A = X, A:
+	/// Other>`. `subjects` says which clauses are read and how a subject
+	/// meets the use; every other type is substituted over `substitution`
+	/// (the frame the clauses are written in and the arguments for its whole
+	/// chain). A clause reached through a membership that does not hold is
+	/// not proved: that membership is the failure. With `failures`, every
+	/// failure is collected for the caller to report; without, the first one
+	/// answers. A judgement passes its frame, which records the bound being
+	/// proved. Clauses whose equality pass has not run yet have no answer
+	/// (`SolverError::Pending`), not a failure.
 	pub(super) fn satisfies_clauses(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		clauses: BoundClauses,
-		(root, subject): (TypeIndex, TypeIndex),
-		(frame, arguments): (TypeEnvIdx, &[TypeIndex]),
+		subjects: Subjects,
+		(frame, arguments): (GenericEnvIdx, &[TypeIndex]),
 		mut failures: Option<&mut Vec<UnsatisfiedClause>>,
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		let Equalities::Final(equalities) = clauses.equalities else {
+		let Some(range) = clauses.final_range() else {
 			return Err(SolverError::Pending);
 		};
-		// Copied out: proving a clause normalizes through `self` again.
-		let trait_clauses = self.clauses.traits(clauses.traits).to_vec();
-		let equality_clauses = self.clauses.equalities(equalities).to_vec();
+		// A clause that reads a membership already failed derives from that
+		// failure, which is reported once. `failed` is empty, and no type is
+		// walked, unless a clause has failed.
 		let mut failed = Vec::new();
 		let mut satisfied = true;
-		for clause in trait_clauses {
-			if through_failed(&self.types, clause.subject, &failed) {
+		// Read one clause at a time: proving one normalizes through `self`
+		// again, and the arena only grows, so the range stays valid. Every
+		// membership is proved first.
+		for at in 0..range.len() {
+			let Clause::Trait(clause) = self.clauses.get(range)[at] else {
+				continue;
+			};
+			if !subjects.reads(&self.types, clause.subject)
+				|| !failed.is_empty()
+					&& reads_failed(&self.types, clause.subject, &failed)
+			{
 				continue;
 			}
 			self.solver.record_proving(judgement, clause.origin);
-			let mut receiver =
-				rebase(&mut self.types, clause.subject, root, subject);
-			if clause.subject != root {
-				receiver = self.normalize(
+			let stated = subjects.stated(
+				&mut self.types,
+				(&self.generic_envs, frame, arguments),
+				clause.subject,
+			);
+			let receiver = if matches!(
+				self.types.resolve(clause.subject),
+				Type::TypeProjection { .. }
+			) {
+				self.normalize(
 					assumption_context,
-					receiver,
+					stated,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
-				)?;
-			}
+				)?
+			} else {
+				stated
+			};
 			if self
 				.find_trait_impl_query(
 					assumption_context,
@@ -2186,66 +2716,183 @@ impl TypeContext<'_, '_, '_> {
 				return Ok(false);
 			};
 			failures.push(UnsatisfiedClause::Trait {
-				subject: receiver,
+				written: clause.subject,
+				subject: stated,
+				reduced: receiver,
 				trait_index: clause.trait_index,
 				source: clause.source,
 			});
 			satisfied = false;
 		}
-		for clause in &equality_clauses {
-			// A conflict is the declaration's own error.
-			if equality_clauses.iter().any(|other| {
-				other.projection == clause.projection
-					&& known_distinct(&self.types, other.value, clause.value)
-			}) || through_failed(&self.types, clause.projection, &failed)
-			{
-				continue;
+		// Then what is stated through the memberships, each skipped when one
+		// it reads failed.
+		for at in 0..range.len() {
+			match self.clauses.get(range)[at] {
+				Clause::Trait(_) => {}
+				Clause::Equality(clause) => {
+					// A conflict is the declaration's own error.
+					if !subjects.reads(&self.types, clause.projection)
+						|| self.clauses.equalities(range).any(|other| {
+							other.projection == clause.projection
+								&& known_distinct(
+									&self.types,
+									other.value,
+									clause.value,
+								)
+						}) || !failed.is_empty()
+						&& (reads_failed(
+							&self.types,
+							clause.projection,
+							&failed,
+						) || reads_failed(
+							&self.types,
+							clause.value,
+							&failed,
+						)) {
+						continue;
+					}
+					self.solver.record_proving(judgement, clause.origin);
+					let projection = subjects.stated(
+						&mut self.types,
+						(&self.generic_envs, frame, arguments),
+						clause.projection,
+					);
+					let required = self.types.substitute(
+						clause.value,
+						Substitution {
+							envs: &self.generic_envs,
+							env: frame,
+							args: arguments,
+						},
+					);
+					let found = self.normalize(
+						assumption_context,
+						projection,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					let expected = self.normalize(
+						assumption_context,
+						required,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					if found == expected
+						|| found == TypeIndex::ERROR
+						|| expected == TypeIndex::ERROR
+					{
+						continue;
+					}
+					let Some(failures) = failures.as_deref_mut() else {
+						return Ok(false);
+					};
+					failures.push(UnsatisfiedClause::Equality {
+						written: clause.projection,
+						projection,
+						required,
+						found,
+						expected,
+						source: clause.source,
+					});
+					satisfied = false;
+				}
+				Clause::Representable(clause) => {
+					if !subjects.reads(&self.types, clause.subject)
+						|| !failed.is_empty()
+							&& (failed.contains(&(
+								clause.subject,
+								clause.target.trait_index,
+							)) || reads_failed(
+								&self.types,
+								clause.subject,
+								&failed,
+							) || reads_failed(
+								&self.types,
+								clause.ty,
+								&failed,
+							)) {
+						continue;
+					}
+					self.solver.record_proving(judgement, clause.origin);
+					let stated = subjects.stated(
+						&mut self.types,
+						(&self.generic_envs, frame, arguments),
+						clause.subject,
+					);
+					let subject = self.normalize(
+						assumption_context,
+						stated,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					let ty = self.types.substitute(
+						clause.ty,
+						Substitution {
+							envs: &self.generic_envs,
+							env: frame,
+							args: arguments,
+						},
+					);
+					let ty = self.normalize(
+						assumption_context,
+						ty,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					if subject == TypeIndex::ERROR || ty == TypeIndex::ERROR {
+						continue;
+					}
+					let constant = clause.target.constant;
+					let value = match self.untyped_value(
+						assumption_context,
+						constant,
+						&[subject],
+					)? {
+						UntypedValue::Known(value) => {
+							if self.value_representable(
+								assumption_context,
+								ty,
+								value,
+							) {
+								continue;
+							}
+							Some(value)
+						}
+						UntypedValue::Abstract => {
+							if self.assumed_representable(
+								assumption_context,
+								subject,
+								constant,
+								ty,
+							)? {
+								continue;
+							}
+							None
+						}
+						// Reported where the constant fails.
+						UntypedValue::Failed => continue,
+					};
+					let Some(failures) = failures.as_deref_mut() else {
+						return Ok(false);
+					};
+					failures.push(UnsatisfiedClause::Representable {
+						written: clause.subject,
+						subject,
+						constant,
+						ty,
+						value,
+						source: clause.source,
+					});
+					satisfied = false;
+				}
 			}
-			self.solver.record_proving(judgement, clause.origin);
-			let projection =
-				rebase(&mut self.types, clause.projection, root, subject);
-			let expected = self.types.substitute(
-				clause.value,
-				Substitution {
-					envs: &self.type_envs,
-					env: frame,
-					args: arguments,
-				},
-			);
-			let found = self.normalize(
-				assumption_context,
-				projection,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			let expected = self.normalize(
-				assumption_context,
-				expected,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			if found == expected
-				|| found == TypeIndex::ERROR
-				|| expected == TypeIndex::ERROR
-			{
-				continue;
-			}
-			let Some(failures) = failures.as_deref_mut() else {
-				return Ok(false);
-			};
-			failures.push(UnsatisfiedClause::Equality {
-				projection,
-				found,
-				expected,
-				source: clause.source,
-			});
-			satisfied = false;
 		}
 		Ok(satisfied)
 	}
 
 	pub(super) fn projection_equality(
 		&mut self,
+		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		trait_index: TraitIdx,
 		assoc_type_index: AssocTypeIdx,
@@ -2260,6 +2907,7 @@ impl TypeContext<'_, '_, '_> {
 		let types = &self.types;
 		let sources = tables.declarations_of(
 			types,
+			assumption_context,
 			receiver,
 			self.solver.state.recursion_budget,
 		);
@@ -2271,7 +2919,6 @@ impl TypeContext<'_, '_, '_> {
 		for source in sources {
 			let equalities = source
 				.clauses
-				.equalities
 				.final_range()
 				.expect("a ready walk reached only final clauses");
 			for clause in tables.clauses.equalities(equalities) {
@@ -2285,7 +2932,7 @@ impl TypeContext<'_, '_, '_> {
 				};
 				if clause_trait != trait_index
 					|| clause_assoc != assoc_type_index
-					|| !source.names(types, tables.type_envs, base, receiver)
+					|| !source.names(types, tables.generic_envs, base, receiver)
 				{
 					continue;
 				}
@@ -2323,7 +2970,7 @@ impl TypeContext<'_, '_, '_> {
 			Some(context) => self.types.substitute(
 				fact.value,
 				Substitution {
-					envs: &self.type_envs,
+					envs: &self.generic_envs,
 					env: context.env,
 					args: &[context.receiver],
 				},
@@ -2340,7 +2987,7 @@ impl TypeContext<'_, '_, '_> {
 	#[cfg(test)]
 	pub(super) fn normalize_head(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {
@@ -2356,7 +3003,7 @@ impl TypeContext<'_, '_, '_> {
 	#[cfg(test)]
 	pub(super) fn normalize_type(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {

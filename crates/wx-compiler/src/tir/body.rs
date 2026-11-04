@@ -26,7 +26,7 @@ use super::defs::{
 };
 use super::intrinsics::Intrinsic;
 use super::obligations::TypeObligation;
-use super::types::{TypeIndex, TypeList};
+use super::types::{GenericArgs, TypeIndex};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
@@ -110,6 +110,9 @@ pub(super) enum ExprObligation {
 	/// A `match`'s exhaustiveness and unreachable arms: a pattern compares
 	/// with a constant's value.
 	Match(ExprIdx),
+	/// An untyped constant `expr` (`const X: {integer}`) was given the type
+	/// `target`: its value is representable as it, as a literal's would be.
+	Representable { expr: ExprIdx, target: TypeIndex },
 }
 
 /// What building a body left undecided, beside the body: a function's or a
@@ -198,12 +201,12 @@ pub(super) enum PatternKind {
 	/// type arguments as `ExprKind::Const` holds them.
 	Constant {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// A trait's declaration of a constant; `type_args` is `[Self]`.
 	AbstractConstant {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// Alternatives, which bind the same names: the same name in two of
 	/// them is one local.
@@ -236,18 +239,19 @@ pub(super) enum ExprKind {
 	Int(u64),
 	Float(f64),
 	Char(char),
-	/// A string literal's contents, unescaped. Its type is a shared byte
-	/// slice or byte array its context gives (`Type::StringLiteral` until then).
+	/// A string literal's contents, unescaped. Its type is the byte array of
+	/// its length (`[u8; 5]`), data in no memory until its context places it
+	/// (a shared pointer to it or to the slice of its bytes).
 	String(SymbolU32),
-	/// An array literal `[a, b, c]`. Its type is a shared array of its length
-	/// or a shared slice its context gives (`Type::ArrayLiteral` until then),
-	/// and each element has that type's element type.
+	/// An array literal `[a, b, c]`. Its type is the array of its elements and
+	/// its length (`[{integer}; 3]`), data in no memory until its context
+	/// places it, and each element has that type's element type.
 	Array {
 		elements: ExprRange,
 	},
-	/// A repeat `[value; count]`, typed as an array literal is; `count` is
-	/// an integer literal or a constant, or `None` for `_`, the length of the
-	/// array its context gives.
+	/// A repeat `[value; count]`, typed as an array literal is, its length
+	/// the count; `count` is an integer literal or a constant, or `None` for
+	/// `_`, the length of the array its context gives.
 	ArrayRepeat {
 		value: ExprIdx,
 		count: Option<ExprIdx>,
@@ -257,13 +261,13 @@ pub(super) enum ExprKind {
 	/// flat type arguments, the impl's; empty when it has none.
 	Const {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// A trait's declaration of a constant, whose impl is selected once
 	/// `Self` is known; `type_args` is `[Self]`.
 	AbstractConst {
 		constant: ConstIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	/// An enum variant written without a value: the value of the variant
 	/// before it, plus one, in the enum's repr.
@@ -279,7 +283,7 @@ pub(super) enum ExprKind {
 	/// with its type arguments, flat as a call's.
 	Function {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 	// Operators, calls and compound assignment. What defines the operation:
 	// a primitive scalar's operator (`Primitive*`, holding the `op`); a known
@@ -309,7 +313,7 @@ pub(super) enum ExprKind {
 	/// (`f(p)`).
 	Call {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		args: ExprIdx,
 	},
 	/// A call of a trait's declaration, whose impl is selected once `Self`
@@ -317,7 +321,7 @@ pub(super) enum ExprKind {
 	/// inherits the trait's default. `args` as for `Call`.
 	AbstractCall {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		args: ExprIdx,
 	},
 	/// `receiver.m(..)` of a known function: an impl method, the impl method
@@ -326,7 +330,7 @@ pub(super) enum ExprKind {
 	/// `args` is the value of the parameters after it, as for `Call`.
 	MethodCall {
 		function: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		receiver: ExprIdx,
 		args: ExprIdx,
 	},
@@ -335,7 +339,7 @@ pub(super) enum ExprKind {
 	/// inherits, or `Call::call` of a function item or an abstract `F: Call`.
 	AbstractMethodCall {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		receiver: ExprIdx,
 		args: ExprIdx,
 	},
@@ -442,7 +446,7 @@ pub(super) enum ExprKind {
 	/// method.
 	ConcreteCompoundAssign {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		target: ExprIdx,
 		value: ExprIdx,
 	},
@@ -450,7 +454,7 @@ pub(super) enum ExprKind {
 	/// declaration of the method.
 	AbstractCompoundAssign {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		target: ExprIdx,
 		value: ExprIdx,
 	},
@@ -465,7 +469,7 @@ pub(super) enum ExprKind {
 	/// method.
 	ConcreteCompoundStore {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		place: PlaceIdx,
 		value: ExprIdx,
 	},
@@ -473,7 +477,7 @@ pub(super) enum ExprKind {
 	/// declaration of the method.
 	AbstractCompoundStore {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 		place: PlaceIdx,
 		value: ExprIdx,
 	},
@@ -541,6 +545,10 @@ pub(super) enum PlaceKind {
 	/// `place.field`; in the same memory as `object`, and as writable. The
 	/// field is its declared index.
 	Field { object: PlaceIdx, field: FieldIdx },
+	/// `place[index]`, an element of the slice or array `object`; in its
+	/// memory, and as writable. The index is the memory's `Size`, checked
+	/// against the length when it is read.
+	Element { object: PlaceIdx, index: ExprIdx },
 }
 
 /// One definition's checked expression tree.

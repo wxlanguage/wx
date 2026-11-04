@@ -9,9 +9,10 @@
 //! later stages, which keep interning types into it rather than reading a
 //! frozen copy.
 //!
-//! A type parameter's *identity* lives in `TypeEnvArena` (addressed by the
-//! `TypeEnvIdx` each signature carries); its *bounds* are a resolved-signature
-//! fact in `param_bounds`, index-aligned with that frame. Parameters are not
+//! A type parameter's *identity* lives in `GenericEnvArena` (addressed by the
+//! `GenericEnvIdx` each signature carries); what a scope's bounds state is a
+//! resolved-signature fact in `assumption_envs` (`bounds::AssumptionEnvArena`), clauses
+//! about any subject rather than one parameter's. Parameters are not
 //! `defs.rs` citizens: nobody writes `foo::T`, so a parameter is only ever
 //! reachable from the item that declares it.
 
@@ -24,17 +25,18 @@ use string_interner::symbol::SymbolU32;
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::tir::defs::TypeAliasIdx;
-use crate::tir::types::TypeEnvOwner;
+use crate::tir::types::GenericEnvOwner;
 use crate::vfs::{FileId, Files};
 
 use super::body::{
 	Body, BodyOwner, ConstBody, FunctionImplementation, Obligations,
 };
 use super::bounds::{
-	BindingRequirement, BoundArena, BoundClauses, BoundId, ClauseArena,
-	ClauseRange, Equalities, SourceAssocBinding, SourceTraitBound, TraitClause,
-	push_trait_clause, report_duplicate_assoc_type_binding,
-	report_not_a_trait_bound, report_not_an_associated_type,
+	AssumptionEnvArena, AssumptionEnvIdx, BindingRequirement, BoundArena,
+	BoundClauses, BoundId, Clause, ClauseArena, ClauseRange,
+	SourceAssocBinding, SourceTraitBound, TraitClause, push_trait_clause,
+	report_duplicate_assoc_type_binding, report_not_a_binding_member,
+	report_not_a_trait_bound,
 };
 use super::defs::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingTarget, ConstIdx,
@@ -46,8 +48,8 @@ use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
 use super::intrinsics::Intrinsic;
 use super::members::{
-	ApplicableMember, MemberLookup, TraitMemberSelection, TypeProjectionTarget,
-	report_ambiguous_type_member,
+	ApplicableMember, ConstantTarget, MemberLookup, TraitMemberSelection,
+	TypeProjectionTarget, report_ambiguous_type_member,
 };
 use super::obligations::{BoundRequirements, TypeObligation};
 use super::operators::OperatorTraits;
@@ -57,38 +59,9 @@ use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 use super::solver::{ImplMember, Solver, SolverError};
 use super::typecheck::BodyContext;
 use super::types::{
-	ImplKind, Substitution, Type, TypeEnvArena, TypeEnvIdx, TypeIndex,
-	TypeInterner, TypeList,
+	GenericArgArena, GenericEnvArena, GenericEnvIdx, ImplKind, Substitution,
+	Type, TypeIndex, TypeInterner, TypeList,
 };
-
-/// One generic parameter's bounds — everything about a `Type::TypeParam`
-/// beyond its own identity (which lives in `TypeEnvArena`, addressed by the
-/// same `(env, param_index)` pair; see that module's own doc comment for
-/// why the two are split apart rather than living on `TypeParam` directly).
-/// Stored in `TypeContext::param_bounds`, index-aligned with
-/// `TypeEnvArena`'s own frames — one `Box<[ParamBounds]>` per frame,
-/// reserved for it by `reserve_param_bounds` right after, so the two arrays
-/// can never drift out of length.
-pub struct ParamBounds {
-	/// One-hop, as written (`T: A + B`) — used for display and as the seed
-	/// the clauses are built from. Left empty for a frame whose one
-	/// entry is never itself abstract (an impl's own `Self`, bound
-	/// directly to a concrete type) — nothing ever queries bounds for one
-	/// of those, so there's nothing to fill in.
-	pub declared_bounds: Box<[BoundId]>,
-	/// What the parameter assumes, its inherited and nested bounds included
-	/// (`BoundClauses`).
-	pub(super) clauses: BoundClauses,
-}
-
-impl ParamBounds {
-	fn empty() -> Self {
-		Self {
-			declared_bounds: Box::new([]),
-			clauses: BoundClauses::PENDING,
-		}
-	}
-}
 
 /// One accepted bound occurrence, decided once by
 /// `TypeContext::collect_bound_occurrences` and shared by both the
@@ -103,20 +76,37 @@ struct BoundOccurrence<'expr> {
 }
 
 struct BindingOccurrence<'expr> {
-	target: TypeProjectionTarget,
 	name: Spanned<SymbolU32>,
 	kind: BindingOccurrenceKind<'expr>,
 }
 
+/// An entry and the member it names. A written type is not resolved yet:
+/// `fill_source_bounds` resolves it once every sibling param has
+/// provisional memberships published.
 enum BindingOccurrenceKind<'expr> {
-	/// RHS not resolved yet — `fill_source_bounds` resolves it once
-	/// every sibling param has provisional memberships published.
-	Equals(&'expr Spanned<ast::TypeExpression>),
-	Bound(Vec<BoundOccurrence<'expr>>),
+	Equals(TypeProjectionTarget, &'expr Spanned<ast::TypeExpression>),
+	Bound(TypeProjectionTarget, Vec<BoundOccurrence<'expr>>),
+	Representable(ConstantTarget, &'expr Spanned<ast::TypeExpression>),
+}
+
+impl BindingOccurrenceKind<'_> {
+	/// Whether two entries name one member.
+	fn same_member(&self, other: &Self) -> bool {
+		match (self, other) {
+			(
+				Self::Equals(a, _) | Self::Bound(a, _),
+				Self::Equals(b, _) | Self::Bound(b, _),
+			) => a.assoc_type_index == b.assoc_type_index,
+			(Self::Representable(a, _), Self::Representable(b, _)) => {
+				a.constant == b.constant
+			}
+			_ => false,
+		}
+	}
 }
 
 pub struct TypeAliasSignature {
-	type_params: TypeEnvIdx,
+	type_params: GenericEnvIdx,
 	target: TypeIndex,
 }
 
@@ -124,7 +114,7 @@ pub struct TypeAliasSignature {
 /// signatures (`TraitFunction`/`TraitConst`/`TraitAssocType`) are separate
 /// queries, same as an impl's; identity already lives in `defs.rs`.
 pub struct TraitSignature {
-	pub env: TypeEnvIdx,
+	pub env: GenericEnvIdx,
 }
 
 /// A resolved `func name<...>(params) -> Result { ... }` — covers both
@@ -138,7 +128,7 @@ pub struct FunctionSignature {
 	/// The signature's scope scope, including enclosing impl/trait frames.
 	/// Without own parameters this is the parent's scope. Bounds remain in
 	/// the registry's parameter table; body assumptions use this same scope.
-	pub(super) type_params: TypeEnvIdx,
+	pub(super) type_params: GenericEnvIdx,
 	/// The parameter types as written, `self` included: a run of the
 	/// interner's lists, which the function's `Call::Args` tuple is built
 	/// from.
@@ -152,7 +142,7 @@ pub struct FunctionSignature {
 /// that struct has, so record vs. tuple doesn't need re-deriving here.
 pub struct StructSignature {
 	/// See `TypeAliasSignature::type_params`.
-	pub(super) type_params: TypeEnvIdx,
+	pub(super) type_params: GenericEnvIdx,
 	/// The field types as written, in declaration order: a run of the
 	/// interner's lists, like a function's `param_types`.
 	pub(super) field_types: TypeList,
@@ -186,7 +176,7 @@ pub struct ConstantSignature {
 	pub(super) ty: TypeIndex,
 	/// The type scope the constant is declared in, where its type and
 	/// initializer are read.
-	pub(super) env: TypeEnvIdx,
+	pub(super) env: GenericEnvIdx,
 }
 
 /// One `AssocTypeIdx`'s resolved signature. `declared_bounds`/
@@ -210,14 +200,14 @@ pub struct AssocTypeSignature {
 /// separate queries; names and identities already live in `defs.rs`.
 pub struct InherentImplSignature {
 	/// See `TypeAliasSignature::type_params`.
-	pub type_params: TypeEnvIdx,
+	pub type_params: GenericEnvIdx,
 	pub target: Spanned<TypeIndex>,
 }
 
 /// The resolved header of `impl<...> Trait for Target { ... }`.
 pub struct TraitImplSignature {
 	/// See `TypeAliasSignature::type_params`.
-	pub type_params: TypeEnvIdx,
+	pub type_params: GenericEnvIdx,
 	pub target: Spanned<TypeIndex>,
 }
 
@@ -228,7 +218,7 @@ pub(super) enum InferSignatureKind {
 	Struct,
 	TypeAlias,
 	EnumRepr,
-	AssocTypeBinding,
+	AssocBinding,
 	Const,
 }
 
@@ -240,7 +230,7 @@ impl InferSignatureKind {
 			Self::Struct => "structs",
 			Self::TypeAlias => "type aliases",
 			Self::EnumRepr => "enum reprs",
-			Self::AssocTypeBinding => "associated type bindings",
+			Self::AssocBinding => "associated type bindings",
 			Self::Const => "consts",
 		}
 	}
@@ -395,13 +385,14 @@ impl TypeContext<'_, '_, '_> {
 		let entry = &self.ast_nodes
 			[self.query_state[&DefId::Const(const_index)].ast_index as usize];
 		let env = match entry.node {
-			AstNodeRef::EnumVariant { .. } => TypeEnvIdx::ROOT,
+			AstNodeRef::EnumVariant { .. } => GenericEnvIdx::ROOT,
 			_ => self.constants[usize::from(const_index)].env,
 		};
 		LexicalScope {
 			file_id: entry.file_id,
 			namespace: entry.namespace,
-			env,
+			generic_env: env,
+			assumption_env: self.assumption_envs.of_frame(env),
 		}
 	}
 
@@ -449,7 +440,10 @@ impl TypeContext<'_, '_, '_> {
 					let scope = LexicalScope {
 						file_id: entry.file_id,
 						namespace: entry.namespace,
-						env: TypeEnvIdx::ROOT,
+						generic_env: GenericEnvIdx::ROOT,
+						assumption_env: self
+							.assumption_envs
+							.of_frame(GenericEnvIdx::ROOT),
 					};
 					let ty = self.global_value_type(global_index);
 					let owner = BodyOwner::Global(global_index);
@@ -489,7 +483,11 @@ impl TypeContext<'_, '_, '_> {
 		let scope = LexicalScope {
 			file_id: entry.file_id,
 			namespace: entry.namespace,
-			env: self.functions[usize::from(function_index)].type_params,
+			generic_env: self.functions[usize::from(function_index)]
+				.type_params,
+			assumption_env: self.assumption_envs.of_frame(
+				self.functions[usize::from(function_index)].type_params,
+			),
 		};
 		let owner = BodyOwner::Function(function_index);
 		let (body, obligations) = BodyContext::new(self, scope, owner)
@@ -548,7 +546,7 @@ impl TypeContext<'_, '_, '_> {
 			let item = match kind {
 				DefKind::Function(index)
 					if self.functions[usize::from(index)].type_params
-						== TypeEnvIdx::ROOT =>
+						== GenericEnvIdx::ROOT =>
 				{
 					ExportedItem::Function(index)
 				}
@@ -680,12 +678,16 @@ pub(super) struct QueryInfo {
 pub(super) struct LexicalScope {
 	pub(super) file_id: FileId,
 	pub(super) namespace: Scope,
-	pub(super) env: TypeEnvIdx,
+	pub(super) generic_env: GenericEnvIdx,
+	/// What the scope assumes: the env `generic_env`'s item states its
+	/// clauses in.
+	pub(super) assumption_env: AssumptionEnvIdx,
 }
 
 #[derive(Clone, Copy)]
 enum BoundSubject {
-	Param { env: TypeEnvIdx, index: usize },
+	/// A trait's or typeset's `Self`, whose frame's env holds its clauses.
+	Scope(GenericEnvIdx),
 	Assoc(AssocTypeIdx),
 }
 
@@ -719,18 +721,13 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// What each parameter and associated declaration assumes, flat
 	/// (`BoundClauses`).
 	pub(super) clauses: ClauseArena,
-	pub(super) type_envs: TypeEnvArena,
-	/// Every generic-param-bearing frame's bounds, index-aligned with
-	/// `type_envs`'s own frames (one `Box<[ParamBounds]>` per `TypeEnvId`,
-	/// itself index-aligned with that frame's `params`) — kept as a
-	/// sibling table here rather than inside `TypeEnvArena` itself, since
-	/// `types.rs` is deliberately independent of this module's
-	/// resolved-signature data (`BoundId`, diagnostics, ...; see that
-	/// module's own doc comment). Grown only through
-	/// `reserve_param_bounds` and `resolve_generic_params`, once per frame
-	/// right after `push_param_frame` created it, so the two arrays can
-	/// never drift in length.
-	pub(super) param_bounds: Vec<Box<[ParamBounds]>>,
+	pub(super) generic_envs: GenericEnvArena,
+	/// What each scope's bounds state (`bounds::AssumptionEnvArena`), kept apart
+	/// from the frames' identities in `generic_envs`. Grown once per frame,
+	/// right after `push_param_frame` created it.
+	pub(super) assumption_envs: AssumptionEnvArena,
+	/// Every use's generic arguments, with where each is given.
+	pub(super) generic_args: GenericArgArena,
 	pub(super) type_aliases: Vec<TypeAliasSignature>,
 	pub(super) traits: Vec<TraitSignature>,
 	pub(super) structs: Vec<StructSignature>,
@@ -764,6 +761,12 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Every declaration's obligations, one contiguous run per declaration
 	/// (`QueryEntry::obligations`).
 	pub(super) obligations: Vec<TypeObligation>,
+}
+
+/// Whether `param` is written `Self`: a bound on the trait's `Self`, never a
+/// parameter.
+fn is_self_entry(param: &ast::TypeParam) -> bool {
+	param.name().inner == ast::Keyword::SelfPascal.symbol()
 }
 
 impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
@@ -853,16 +856,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			),
 			bounds: BoundArena::default(),
 			clauses: ClauseArena::default(),
-			type_envs: TypeEnvArena::new(),
-			// `TypeEnvArena::new()` seeds one `Root` entry (`TypeEnvId::ROOT`)
-			// before anything else is pushed — matched here with one empty
-			// placeholder so the two arrays start, and stay, the same length.
-			param_bounds: vec![Box::new([])],
+			generic_envs: GenericEnvArena::new(),
+			assumption_envs: AssumptionEnvArena::new(),
+			generic_args: GenericArgArena::default(),
 			type_aliases: defs
 				.type_aliases
 				.iter()
 				.map(|_| TypeAliasSignature {
-					type_params: TypeEnvIdx::ROOT,
+					type_params: GenericEnvIdx::ROOT,
 					target: TypeIndex::ERROR,
 				})
 				.collect(),
@@ -870,14 +871,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.traits
 				.iter()
 				.map(|_| TraitSignature {
-					env: TypeEnvIdx::ROOT,
+					env: GenericEnvIdx::ROOT,
 				})
 				.collect(),
 			structs: defs
 				.structs
 				.iter()
 				.map(|_| StructSignature {
-					type_params: TypeEnvIdx::ROOT,
+					type_params: GenericEnvIdx::ROOT,
 					field_types: TypeList::EMPTY,
 				})
 				.collect(),
@@ -900,7 +901,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.functions
 				.iter()
 				.map(|_| FunctionSignature {
-					type_params: TypeEnvIdx::ROOT,
+					type_params: GenericEnvIdx::ROOT,
 					param_types: TypeList::EMPTY,
 					return_type: TypeIndex::ERROR,
 				})
@@ -910,7 +911,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				.iter()
 				.map(|_| ConstantSignature {
 					ty: TypeIndex::ERROR,
-					env: TypeEnvIdx::ROOT,
+					env: GenericEnvIdx::ROOT,
 				})
 				.collect(),
 			const_bodies: defs
@@ -941,34 +942,36 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// Returns that frame — parented at `parent`, so a bound naming
 	/// something from outer context (`Self`, an enclosing impl's own `<T>`)
 	/// still resolves, and for the caller to go on using as the scope for
-	/// the rest of this item's own signature. Each param's bounds are
-	/// resolved here too, but no longer handed back — they're persisted
-	/// directly into `self.param_bounds`, index-aligned with the returned
-	/// frame, the same place every other item's bounds live (see that
-	/// field's own doc comment for why this replaced a per-signature-struct
-	/// `type_param_bounds` field).
+	/// the rest of this item's own signature. The params' bounds are
+	/// resolved here too, into the frame's env (`assumption_envs`).
 	pub(super) fn resolve_generic_params(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
-		owner: TypeEnvOwner,
-		parent: TypeEnvIdx,
+		owner: GenericEnvOwner,
+		parent: GenericEnvIdx,
 		params: &[ast::TypeParam],
-	) -> TypeEnvIdx {
+	) -> GenericEnvIdx {
+		let first_obligation = obligations.len();
+		// `Self` is never a parameter: written first in a trait's function it
+		// bounds the trait's `Self`, in a trait impl's the impl's target, and
+		// anywhere else it is reported.
+		let self_subject = self.self_entry(file_id, owner, parent, params);
+		let declared = || params.iter().filter(|param| !is_self_entry(param));
 		// An impl always owns a frame, even an empty one: it is where a `Self`
 		// written inside the impl finds the impl it means (`resolve_impl_self`).
 		let is_impl = matches!(
 			owner,
-			TypeEnvOwner::InherentImpl(_) | TypeEnvOwner::TraitImpl(_)
+			GenericEnvOwner::InherentImpl(_) | GenericEnvOwner::TraitImpl(_)
 		);
-		if params.is_empty() && !is_impl {
+		if declared().next().is_none() && !is_impl && self_subject.is_none() {
 			return parent;
 		}
 
-		for (index, param) in params.iter().enumerate() {
-			if let Some(colliding_param) = params[..index]
-				.iter()
+		for (index, param) in declared().enumerate() {
+			if let Some(colliding_param) = declared()
+				.take(index)
 				.find(|p| p.name().inner == param.name().inner)
 				.map(|p| p.name())
 			{
@@ -981,33 +984,76 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 		}
 
-		let type_env = self.type_envs.push_param_frame(
+		let generic_env = self.generic_envs.push_param_frame(
 			&mut self.types,
 			owner,
 			parent,
-			params.iter().map(|p| p.name()),
+			declared().map(|p| p.name()),
 		);
-		self.param_bounds
-			.push((0..params.len()).map(|_| ParamBounds::empty()).collect());
+		// What the bounds are written on: the `Self` entry's subject, else
+		// each parameter, in order.
+		let self_entry = self_subject.map(|_| &params[0]);
+		let written = || self_entry.into_iter().chain(declared());
+		// In a trait impl's function the entry is about the impl's target:
+		// a use proves its clauses as written, and the function assumes
+		// them once they are normalized (`NormalizeSelfEntry`), which
+		// construction cannot do. Until then they are in no env.
+		let deferred = usize::from(
+			self_subject.is_some()
+				&& matches!(
+					self.generic_envs.owner(parent),
+					GenericEnvOwner::TraitImpl(_)
+				),
+		);
+		let is_bounded = |param: &ast::TypeParam| {
+			matches!(
+				param,
+				ast::TypeParam::Type {
+					bounds: Some(_),
+					..
+				}
+			)
+		};
+		let entry_bounded = written().take(deferred).any(is_bounded);
+		// Only an item that writes a bound states clauses; any other shares
+		// its parent's env.
+		let parent_env = self.assumption_envs.of_frame(parent);
+		let own_env = written()
+			.skip(deferred)
+			.any(is_bounded)
+			.then(|| self.assumption_envs.push(parent_env, None));
+		let states_clauses = own_env.is_some() || entry_bounded;
+		self.assumption_envs.bind_frame(
+			generic_env,
+			own_env.unwrap_or(parent_env),
+			states_clauses,
+		);
 		match owner {
-			TypeEnvOwner::Struct(index) => {
-				self.structs[usize::from(index)].type_params = type_env
+			GenericEnvOwner::Struct(index) => {
+				self.structs[usize::from(index)].type_params = generic_env
 			}
-			TypeEnvOwner::Function(index) => {
-				self.functions[usize::from(index)].type_params = type_env
+			GenericEnvOwner::Function(index) => {
+				self.functions[usize::from(index)].type_params = generic_env
 			}
-			TypeEnvOwner::TypeAlias(index) => {
-				self.type_aliases[usize::from(index)].type_params = type_env
+			GenericEnvOwner::TypeAlias(index) => {
+				self.type_aliases[usize::from(index)].type_params = generic_env
 			}
 			_ => {}
 		}
 
-		// A single walk per param decides which bound occurrences exist;
-		// both the membership pass below and the source-bound pass after it
-		// consume that same decided tree, so they cannot disagree about what
-		// they saw. See `collect_bound_occurrences`.
-		let mut occurrences_per_param = Vec::with_capacity(params.len());
-		for ast_param in params {
+		// A single walk per written bound decides which bound occurrences
+		// exist; both the membership pass below and the source-bound pass
+		// after it consume that same decided tree, so they cannot disagree
+		// about what they saw. See `collect_bound_occurrences`.
+		let mut bounded = Vec::new();
+		for (at, ast_param) in written().enumerate() {
+			let subject = match self_subject {
+				Some(self_type) if at == 0 => self_type,
+				_ => {
+					let slot = at - usize::from(self_subject.is_some());
+					self.generic_envs.param_types(generic_env)[slot]
+				}
+			};
 			let mut occurrences = Vec::new();
 			match ast_param {
 				ast::TypeParam::Type {
@@ -1039,78 +1085,153 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						),
 				),
 			}
-			occurrences_per_param.push(occurrences);
+			bounded.push((subject, ast_param.name().inner, occurrences));
 		}
 
 		// Publish every sibling's memberships first: an equality's value,
 		// resolved next, can name the members they supply. No value is
-		// resolved here.
-		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
-			let subject = self.type_envs.param_types(type_env)[index];
-			let traits = self.trait_clauses(subject, occurrences);
-			self.param_bounds[usize::from(type_env)][index] = ParamBounds {
-				declared_bounds: occurrences.iter().map(|o| o.id).collect(),
-				clauses: BoundClauses {
-					traits,
-					equalities: Equalities::Pending,
-				},
-			};
+		// resolved here. A deferred entry's clauses come first.
+		let mut traits = Vec::new();
+		let mut entry_traits = 0;
+		for (at, (subject, _, occurrences)) in bounded.iter().enumerate() {
+			self.collect_occurrence_clauses(&mut traits, *subject, occurrences);
+			if at < deferred {
+				entry_traits = traits.len();
+			}
+		}
+		let provisional = self.clauses.push_traits(&traits);
+		if states_clauses {
+			self.assumption_envs.set_requirements(
+				generic_env,
+				BoundClauses::Provisional(provisional),
+			);
+		}
+		if let Some(env) = own_env {
+			*self.assumption_envs.clauses_mut(env) =
+				BoundClauses::Provisional(provisional.split_at(entry_traits).1);
 		}
 
 		// Resolve source bounds now that every sibling has provisional
 		// memberships published, so an equality RHS can reference them.
 		// Bound IDs were published above; filling their sources preserves them.
-		for (index, occurrences) in occurrences_per_param.iter().enumerate() {
-			let subject = self.type_envs.param_types(type_env)[index];
-			self.fill_source_bounds(
-				obligations,
-				LexicalScope {
-					file_id,
-					namespace,
-					env: type_env,
+		let scope = LexicalScope {
+			file_id,
+			namespace,
+			generic_env,
+			assumption_env: self.assumption_envs.of_frame(generic_env),
+		};
+		for (subject, _, occurrences) in &bounded {
+			self.fill_source_bounds(obligations, scope, *subject, occurrences);
+		}
+
+		let mut equalities = Vec::new();
+		let mut entry_equalities = 0;
+		for (at, (subject, name, occurrences)) in bounded.iter().enumerate() {
+			let ids: Box<[BoundId]> =
+				occurrences.iter().map(|o| o.id).collect();
+			self.collect_value_clauses(&mut equalities, *subject, &ids, *name);
+			if at < deferred {
+				entry_equalities = equalities.len();
+			}
+		}
+		// The final run: the entry's clauses, then the parameters', each
+		// memberships first.
+		let (entry, own) = (
+			(&traits[..entry_traits], &equalities[..entry_equalities]),
+			(&traits[entry_traits..], &equalities[entry_equalities..]),
+		);
+		let run: Vec<Clause> = [entry, own]
+			.into_iter()
+			.flat_map(|(traits, values)| {
+				let traits = traits.iter().copied().map(Clause::Trait);
+				traits.chain(values.iter().copied())
+			})
+			.collect();
+		let run = self.clauses.push(&run);
+		let (entry, own) = run.split_at(entry.0.len() + entry.1.len());
+		if states_clauses {
+			self.assumption_envs
+				.set_requirements(generic_env, BoundClauses::Final(run));
+		}
+		if let Some(env) = own_env {
+			*self.assumption_envs.clauses_mut(env) = BoundClauses::Final(own);
+		}
+		// First in this item's run: its other checks read the env it
+		// completes.
+		if entry_bounded {
+			obligations.insert(
+				first_obligation,
+				TypeObligation::NormalizeSelfEntry {
+					frame: generic_env,
+					clauses: BoundClauses::Final(entry),
+					reference: SourceSpan::new(file_id, params[0].name().span),
 				},
-				subject,
-				occurrences,
 			);
 		}
 
-		for (index, ast_param) in params.iter().enumerate() {
-			let subject = self.type_envs.param_types(type_env)[index];
-			let ids = std::mem::take(
-				&mut self.param_bounds[usize::from(type_env)][index]
-					.declared_bounds,
-			);
-			let equalities =
-				self.equality_clauses(subject, &ids, ast_param.name().inner);
-			let bounds = &mut self.param_bounds[usize::from(type_env)][index];
-			bounds.declared_bounds = ids;
-			bounds.clauses.equalities = Equalities::Final(equalities);
-		}
-
-		type_env
+		generic_env
 	}
 
-	/// Reserves `frame`'s own `param_bounds` slot, initially empty —
-	/// bookkeeping `TypeEnvArena` itself has no vocabulary for (`ParamBounds`
-	/// is `BoundId`-shaped resolved-signature data, not an identity concern;
-	/// see that module's own doc comment), so it's kept as a deliberately
-	/// separate step from whatever just built the frame's identities rather
-	/// than folded into one combining call. Must be called exactly once per
-	/// frame, immediately after `push_param_frame` creates it, so the two
-	/// arrays can never drift in
-	/// length; this is the one place `param_bounds` is ever pushed to.
-	///
-	/// The placeholder is filled in by `resolve_generic_params`, right after
-	/// it resolves the bounds that needed the frame to exist first (a bound
-	/// can reference a sibling param). A trait's or typeset's `Self` frame
-	/// (not routed through `resolve_generic_params`) is filled by the
-	/// trait's own signature: its supertraits, as clauses on `Self`, which
-	/// `inherit_trait_clauses` copies into every bound that names the trait.
-	fn reserve_param_bounds(&mut self, frame: TypeEnvIdx) {
-		debug_assert_eq!(usize::from(frame), self.param_bounds.len());
-		let count = self.type_envs.param_types(frame).len();
-		self.param_bounds
-			.push((0..count).map(|_| ParamBounds::empty()).collect());
+	/// What a `Self` written first in `params` stands for: in a trait's
+	/// function, the trait's `Self`, and in a trait impl's, the impl's
+	/// target, which its bounds describe. Every other `Self` is reported;
+	/// none declares a parameter.
+	fn self_entry(
+		&mut self,
+		file_id: FileId,
+		owner: GenericEnvOwner,
+		parent: GenericEnvIdx,
+		params: &[ast::TypeParam],
+	) -> Option<TypeIndex> {
+		let mut subject = None;
+		for (index, param) in params.iter().enumerate() {
+			if !is_self_entry(param) {
+				continue;
+			}
+			let label =
+				SourceSpan::new(file_id, param.name().span).primary_label();
+			let enclosing = (parent != GenericEnvIdx::ROOT)
+				.then(|| self.generic_envs.owner(parent));
+			let diagnostic = match (index, owner, enclosing, param) {
+				(
+					0,
+					GenericEnvOwner::Function(_),
+					Some(GenericEnvOwner::Trait(_)),
+					ast::TypeParam::Type { .. },
+				) => {
+					subject = Some(self.generic_envs.param_types(parent)[0]);
+					continue;
+				}
+				(
+					0,
+					GenericEnvOwner::Function(_),
+					Some(GenericEnvOwner::TraitImpl(_)),
+					ast::TypeParam::Type { .. },
+				) => {
+					let (_, target) = self
+						.resolve_impl_self(parent)
+						.expect("an impl's function is built after its header");
+					subject = Some(target);
+					continue;
+				}
+				(0, ..) => Diagnostic::error()
+					.with_code(DiagnosticCode::MisplacedSelfBound.code())
+					.with_message("only a trait's function can bound `Self`")
+					.with_label(label.with_message("not a parameter here"))
+					.with_note(
+						"`Self` is a trait's parameter; a function written in \
+						 it can require more of it",
+					),
+				_ => Diagnostic::error()
+					.with_code(DiagnosticCode::MisplacedSelfBound.code())
+					.with_message("`Self` can be bounded only first")
+					.with_label(
+						label.with_message("write it before the parameters"),
+					),
+			};
+			self.diagnostics.push(diagnostic);
+		}
+		subject
 	}
 
 	/// What `Self` means inside an impl: the impl's target, found through the
@@ -1118,9 +1239,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// header, whose target is what `Self` would name.
 	pub(super) fn resolve_impl_self(
 		&self,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 	) -> Option<(ImplKind, TypeIndex)> {
-		let impl_kind = self.type_envs.enclosing_impl(env)?;
+		let impl_kind = self.generic_envs.enclosing_impl(env)?;
 		let target = match impl_kind {
 			ImplKind::Inherent(index) => {
 				self.inherent_impls[usize::from(index)].as_ref()?.target
@@ -1255,7 +1376,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					obligations,
 					scope,
 					arg,
-					InferPolicy::Reject(InferSignatureKind::AssocTypeBinding),
+					InferPolicy::Reject(InferSignatureKind::AssocBinding),
 				)
 			})
 			.collect();
@@ -1266,14 +1387,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			params_env,
 			&[],
 			&resolved_args,
-			TypeEnvOwner::Struct(struct_index),
+			GenericEnvOwner::Struct(struct_index),
 		);
 		self.types.intern_struct(struct_index, &args)
 	}
 
 	pub(super) fn match_inherent_impl_candidate_query(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		impl_index: InherentImplIdx,
 		receiver: TypeIndex,
 	) -> Result<bool, SolverError> {
@@ -1401,12 +1522,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		function_index: FunctionIdx,
 		signature: &ast::FunctionSignature,
 	) -> SignatureLocation {
-		let type_env = self.resolve_generic_params(
+		let generic_env = self.resolve_generic_params(
 			obligations,
 			file_id,
 			namespace,
-			TypeEnvOwner::Function(function_index),
-			TypeEnvIdx::ROOT,
+			GenericEnvOwner::Function(function_index),
+			GenericEnvIdx::ROOT,
 			&signature.type_params,
 		);
 
@@ -1427,12 +1548,15 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				if receiver {
 					return TypeIndex::ERROR;
 				}
-				self.resolve_type(
+				self.resolve_value_type(
 					obligations,
 					LexicalScope {
 						file_id,
 						namespace,
-						env: type_env,
+						generic_env,
+						assumption_env: self
+							.assumption_envs
+							.of_frame(generic_env),
 					},
 					&param.inner.inner.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
@@ -1441,12 +1565,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.collect();
 
 		let return_type = match &signature.result {
-			Some(result) => self.resolve_type(
+			Some(result) => self.resolve_value_type(
 				obligations,
 				LexicalScope {
 					file_id,
 					namespace,
-					env: type_env,
+					generic_env,
+					assumption_env: self.assumption_envs.of_frame(generic_env),
 				},
 				result,
 				InferPolicy::Reject(InferSignatureKind::ReturnType),
@@ -1459,13 +1584,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			obligations,
 			file_id,
 			function_index,
-			type_env,
+			generic_env,
 			param_types,
 			return_type,
 			signature,
 		);
 		self.functions[usize::from(function_index)] = FunctionSignature {
-			type_params: type_env,
+			type_params: generic_env,
 			param_types,
 			return_type,
 		};
@@ -1481,7 +1606,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		function_index: FunctionIdx,
-		type_env: TypeEnvIdx,
+		generic_env: GenericEnvIdx,
 		param_types: TypeList,
 		return_type: TypeIndex,
 		signature: &ast::FunctionSignature,
@@ -1497,12 +1622,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				elements: param_types,
 			}),
 		};
-		// Instantiating `type_env` takes an argument for every parameter on
+		// Instantiating `generic_env` takes an argument for every parameter on
 		// its chain, outer first, so a member's type carries its parent's
 		// parameters ahead of its own (`Wrap<T>::get<U>` is `get<T, U>`).
 		let function_type = self.types.intern_function(
 			function_index,
-			self.type_envs.identity_args(type_env),
+			self.generic_envs.identity_args(generic_env),
 		);
 		// Each value is judged as the member's own (`CheckAssocValue`), so a
 		// loop through it (`func f() -> f::Result`) is reported once, here.
@@ -1558,7 +1683,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		] {
 			self.trait_impls[usize::from(trait_impl_index)] =
 				Some(TraitImplSignature {
-					type_params: type_env,
+					type_params: generic_env,
 					target: Spanned {
 						inner: function_type,
 						span: name_span,
@@ -1576,14 +1701,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		file_id: FileId,
 		namespace: Scope,
 		function_index: FunctionIdx,
-		parent: TypeEnvIdx,
+		parent: GenericEnvIdx,
 		signature: &ast::FunctionSignature,
 	) -> SignatureLocation {
 		let scope = self.resolve_generic_params(
 			obligations,
 			file_id,
 			namespace,
-			TypeEnvOwner::Function(function_index),
+			GenericEnvOwner::Function(function_index),
 			parent,
 			&signature.type_params,
 		);
@@ -1593,12 +1718,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.params
 			.iter()
 			.map(|param| {
-				self.resolve_type(
+				self.resolve_value_type(
 					obligations,
 					LexicalScope {
 						file_id,
 						namespace,
-						env: scope,
+						generic_env: scope,
+						assumption_env: self.assumption_envs.of_frame(scope),
 					},
 					&param.inner.inner.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
@@ -1607,12 +1733,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.collect();
 
 		let return_type = match &signature.result {
-			Some(result) => self.resolve_type(
+			Some(result) => self.resolve_value_type(
 				obligations,
 				LexicalScope {
 					file_id,
 					namespace,
-					env: scope,
+					generic_env: scope,
+					assumption_env: self.assumption_envs.of_frame(scope),
 				},
 				result,
 				InferPolicy::Reject(InferSignatureKind::ReturnType),
@@ -1645,21 +1772,51 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		file_id: FileId,
 		namespace: Scope,
 		const_index: ConstIdx,
-		scope: TypeEnvIdx,
+		scope: GenericEnvIdx,
 		name: Spanned<SymbolU32>,
 		ty: Option<&Spanned<ast::TypeExpression>>,
 	) -> SignatureLocation {
+		let lexical = LexicalScope {
+			file_id,
+			namespace,
+			generic_env: scope,
+			assumption_env: self.assumption_envs.of_frame(scope),
+		};
+		let policy = InferPolicy::Reject(InferSignatureKind::Const);
 		let ty = match ty {
-			Some(ty) => self.resolve_type(
-				obligations,
-				LexicalScope {
-					file_id,
-					namespace,
-					env: scope,
-				},
-				ty,
-				InferPolicy::Reject(InferSignatureKind::Const),
-			),
+			// An untyped constant, `const X: {integer} = 4`. A free one only,
+			// for now: an impl's or a trait's would need its representability
+			// stated in bounds.
+			Some(Spanned {
+				inner: ast::TypeExpression::Literal { inner },
+				span,
+			}) => {
+				let kind = self.resolve_literal_kind(
+					obligations,
+					lexical,
+					inner,
+					policy,
+				);
+				if scope == GenericEnvIdx::ROOT || kind == TypeIndex::ERROR {
+					kind
+				} else {
+					self.diagnostics.push(
+						Diagnostic::bug()
+							.with_code(
+								DiagnosticCode::UnsupportedExpression.code(),
+							)
+							.with_message(
+								"an untyped constant in an impl is not \
+								 supported by the checker yet",
+							)
+							.with_label(
+								SourceSpan::new(file_id, *span).primary_label(),
+							),
+					);
+					TypeIndex::ERROR
+				}
+			}
+			Some(ty) => self.resolve_type(obligations, lexical, ty, policy),
 			None => {
 				self.diagnostics
 					.push(report_missing_constant_type(file_id, name));
@@ -1783,7 +1940,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			LexicalScope {
 				file_id,
 				namespace,
-				env: TypeEnvIdx::ROOT,
+				generic_env: GenericEnvIdx::ROOT,
+				assumption_env: self
+					.assumption_envs
+					.of_frame(GenericEnvIdx::ROOT),
 			},
 			trait_impl_index,
 			size_assoc_type_index,
@@ -1814,32 +1974,29 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			index
 		};
 		let memory_type = self.types.intern(Type::Memory { memory_index });
-		let checked_size = self.record_bounds_check(
+		self.record_bounds_check(
 			obligations,
-			TypeEnvIdx::ROOT,
+			GenericEnvIdx::ROOT,
 			BoundRequirements::AssociatedType {
 				declaration: declared_size_index,
 				trait_index: memory_trait,
 				receiver: memory_type,
-			},
-			Spanned {
-				inner: resolved_size,
-				span: size.span,
+				value: resolved_size,
 			},
 			SourceSpan::new(file_id, size.span),
-			TypeEnvOwner::Trait(memory_trait),
+			GenericEnvOwner::Trait(memory_trait),
 		);
 
 		self.assoc_types[usize::from(size_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
 				clauses: BoundClauses::NONE,
-				value: Some(checked_size),
+				value: Some(resolved_size),
 			});
 		self.check_memory_limits(file_id, memory_index, resolved_size);
 		self.trait_impls[usize::from(trait_impl_index)] =
 			Some(TraitImplSignature {
-				type_params: TypeEnvIdx::ROOT,
+				type_params: GenericEnvIdx::ROOT,
 				target: Spanned {
 					inner: memory_type,
 					span: name.span,
@@ -1956,33 +2113,31 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		else {
 			panic!("the stdlib's `Global` trait must declare `type Value`")
 		};
-		let resolved_value = if value.inner == TypeIndex::ERROR {
-			value.inner
-		} else {
+		if value.inner != TypeIndex::ERROR {
 			self.record_bounds_check(
 				obligations,
-				TypeEnvIdx::ROOT,
+				GenericEnvIdx::ROOT,
 				BoundRequirements::AssociatedType {
 					declaration: declared_value_index,
 					trait_index: global_trait,
 					receiver: global_type,
+					value: value.inner,
 				},
-				value,
 				SourceSpan::new(file_id, value.span),
-				TypeEnvOwner::Trait(global_trait),
-			)
-		};
+				GenericEnvOwner::Trait(global_trait),
+			);
+		}
 
 		self.assoc_types[usize::from(value_assoc_type_index)] =
 			Some(AssocTypeSignature {
 				declared_bounds: Box::new([]),
 				clauses: BoundClauses::NONE,
-				value: Some(resolved_value),
+				value: Some(value.inner),
 			});
 
 		self.trait_impls[usize::from(trait_impl_index)] =
 			Some(TraitImplSignature {
-				type_params: TypeEnvIdx::ROOT,
+				type_params: GenericEnvIdx::ROOT,
 				target: Spanned {
 					inner: global_type,
 					span: name.span,
@@ -1992,7 +2147,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			debug_assert!(mut_span.is_some());
 			self.trait_impls[usize::from(mut_trait_impl_index)] =
 				Some(TraitImplSignature {
-					type_params: TypeEnvIdx::ROOT,
+					type_params: GenericEnvIdx::ROOT,
 					target: Spanned {
 						inner: global_type,
 						span: name.span,
@@ -2035,16 +2190,16 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let signature =
 					match self.defs.intrinsics.identity_of(type_alias_index) {
 						Some(target) => TypeAliasSignature {
-							type_params: TypeEnvIdx::ROOT,
+							type_params: GenericEnvIdx::ROOT,
 							target,
 						},
 						None => {
-							let type_env = self.resolve_generic_params(
+							let generic_env = self.resolve_generic_params(
 								obligations,
 								file_id,
 								namespace,
-								TypeEnvOwner::TypeAlias(type_alias_index),
-								TypeEnvIdx::ROOT,
+								GenericEnvOwner::TypeAlias(type_alias_index),
+								GenericEnvIdx::ROOT,
 								type_params,
 							);
 							let target = match body {
@@ -2053,7 +2208,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 									LexicalScope {
 										file_id,
 										namespace,
-										env: type_env,
+										generic_env,
+										assumption_env: self
+											.assumption_envs
+											.of_frame(generic_env),
 									},
 									body,
 									InferPolicy::Reject(
@@ -2072,7 +2230,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								}
 							};
 							TypeAliasSignature {
-								type_params: type_env,
+								type_params: generic_env,
 								target,
 							}
 						}
@@ -2094,7 +2252,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					file_id,
 					namespace,
 					const_index,
-					TypeEnvIdx::ROOT,
+					GenericEnvIdx::ROOT,
 					name,
 					ty,
 				)
@@ -2114,41 +2272,43 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// every member's own resolution (`TraitFunction`/
 				// `TraitConst`) parents its own frame at this same one
 				// rather than each minting its own `Self` binding.
-				let self_scope = self.type_envs.push_param_frame(
+				let self_scope = self.generic_envs.push_param_frame(
 					&mut self.types,
-					TypeEnvOwner::Trait(trait_index),
-					TypeEnvIdx::ROOT,
+					GenericEnvOwner::Trait(trait_index),
+					GenericEnvIdx::ROOT,
 					[Spanned {
 						inner: ast::Keyword::SelfPascal.symbol(),
 						span: name.span,
 					}],
 				);
-				self.reserve_param_bounds(self_scope);
+				let self_type = self.generic_envs.param_types(self_scope)[0];
+				let env = self.assumption_envs.push(
+					AssumptionEnvIdx::ROOT,
+					Some((self_type, trait_index)),
+				);
+				self.assumption_envs.bind_frame(self_scope, env, true);
 
 				// The Self identity is available while its facts are collected;
 				// the surrounding signature query remains in progress.
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
-				let subject = self.type_envs.param_types(self_scope)[0];
-				let (declared_bounds, clauses) = self.resolve_subject_bounds(
+				let subject = self.generic_envs.param_types(self_scope)[0];
+				let (_, clauses) = self.resolve_subject_bounds(
 					obligations,
 					LexicalScope {
 						file_id,
 						namespace,
-						env: self_scope,
+						generic_env: self_scope,
+						assumption_env: self
+							.assumption_envs
+							.of_frame(self_scope),
 					},
 					supertraits.as_ref(),
-					BoundSubject::Param {
-						env: self_scope,
-						index: 0,
-					},
+					BoundSubject::Scope(self_scope),
 					subject,
 					name.inner,
 				);
-				self.param_bounds[usize::from(self_scope)][0] = ParamBounds {
-					declared_bounds,
-					clauses,
-				};
+				self.assumption_envs.publish(self_scope, clauses);
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
 				SignatureLocation::Trait(trait_index)
@@ -2201,17 +2361,25 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					requested_at: None,
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
-
-				let resolved_ty = self.resolve_type(
-					obligations,
-					LexicalScope {
-						file_id,
-						namespace,
-						env: self_scope,
-					},
-					ty,
-					InferPolicy::Reject(InferSignatureKind::Const),
-				);
+				let lexical = LexicalScope {
+					file_id,
+					namespace,
+					generic_env: self_scope,
+					assumption_env: self.assumption_envs.of_frame(self_scope),
+				};
+				let policy = InferPolicy::Reject(InferSignatureKind::Const);
+				// An untyped constant, `const LEN: {integer}`: each use gives
+				// it a type, as a free one's does.
+				let resolved_ty = match &ty.inner {
+					ast::TypeExpression::Literal { inner } => self
+						.resolve_literal_kind(
+							obligations,
+							lexical,
+							inner,
+							policy,
+						),
+					_ => self.resolve_type(obligations, lexical, ty, policy),
+				};
 
 				self.constants[usize::from(const_index)] = ConstantSignature {
 					ty: resolved_ty,
@@ -2245,7 +2413,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				});
 				let self_scope = self.traits[usize::from(trait_index)].env;
 
-				let base = self.type_envs.param_types(self_scope)[0];
+				let base = self.generic_envs.param_types(self_scope)[0];
 				let subject = self.types.intern(Type::TypeProjection {
 					base,
 					trait_index,
@@ -2256,7 +2424,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					LexicalScope {
 						file_id,
 						namespace,
-						env: self_scope,
+						generic_env: self_scope,
+						assumption_env: self
+							.assumption_envs
+							.of_frame(self_scope),
 					},
 					bounds.as_ref(),
 					BoundSubject::Assoc(assoc_type_index),
@@ -2269,12 +2440,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						LexicalScope {
 							file_id,
 							namespace,
-							env: self_scope,
+							generic_env: self_scope,
+							assumption_env: self
+								.assumption_envs
+								.of_frame(self_scope),
 						},
 						value,
-						InferPolicy::Reject(
-							InferSignatureKind::AssocTypeBinding,
-						),
+						InferPolicy::Reject(InferSignatureKind::AssocBinding),
 					)
 				});
 				self.assoc_types[usize::from(assoc_type_index)] =
@@ -2371,7 +2543,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					LexicalScope {
 						file_id,
 						namespace,
-						env: scope,
+						generic_env: scope,
+						assumption_env: self.assumption_envs.of_frame(scope),
 					},
 					block_index,
 					assoc_type_index,
@@ -2442,7 +2615,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								LexicalScope {
 									file_id,
 									namespace,
-									env: TypeEnvIdx::ROOT,
+									generic_env: GenericEnvIdx::ROOT,
+									assumption_env: self
+										.assumption_envs
+										.of_frame(GenericEnvIdx::ROOT),
 								},
 								global_def.trait_impl_index,
 								global_def.value_assoc_type_index,
@@ -2489,7 +2665,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						LexicalScope {
 							file_id,
 							namespace,
-							env: TypeEnvIdx::ROOT,
+							generic_env: GenericEnvIdx::ROOT,
+							assumption_env: self
+								.assumption_envs
+								.of_frame(GenericEnvIdx::ROOT),
 						},
 						global_def.trait_impl_index,
 						global_def.value_assoc_type_index,
@@ -2516,12 +2695,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					unreachable!()
 				};
 
-				let type_env = self.resolve_generic_params(
+				let generic_env = self.resolve_generic_params(
 					obligations,
 					file_id,
 					namespace,
-					TypeEnvOwner::Struct(struct_index),
-					TypeEnvIdx::ROOT,
+					GenericEnvOwner::Struct(struct_index),
+					GenericEnvIdx::ROOT,
 					ast_type_params,
 				);
 				// Written before fields are touched, not alongside
@@ -2532,7 +2711,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// bounds instead of the placeholder `ROOT` frame it started
 				// in. Same reasoning as `ast_node` already letting identity
 				// be read before a query finishes, just for one more fact.
-				self.structs[usize::from(struct_index)].type_params = type_env;
+				self.structs[usize::from(struct_index)].type_params =
+					generic_env;
 
 				// One-to-one with `defs.structs[..].fields` — a duplicate
 				// name still gets its own slot resolved there, so it does
@@ -2547,7 +2727,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						LexicalScope {
 							file_id,
 							namespace,
-							env: type_env,
+							generic_env,
+							assumption_env: self
+								.assumption_envs
+								.of_frame(generic_env),
 						},
 						ty_expr,
 						InferPolicy::Reject(InferSignatureKind::Struct),
@@ -2612,8 +2795,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					obligations,
 					file_id,
 					namespace,
-					TypeEnvOwner::InherentImpl(block_index),
-					TypeEnvIdx::ROOT,
+					GenericEnvOwner::InherentImpl(block_index),
+					GenericEnvIdx::ROOT,
 					type_params,
 				);
 				let target_type = self.resolve_impl_target(
@@ -2621,7 +2804,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					LexicalScope {
 						file_id,
 						namespace,
-						env: scope,
+						generic_env: scope,
+						assumption_env: self.assumption_envs.of_frame(scope),
 					},
 					target,
 					self.impl_dispatch.inherent_target(block_index),
@@ -2634,7 +2818,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							span: target.span(),
 						},
 					});
-				if !self.type_envs.param_types(scope).is_empty() {
+				if !self.generic_envs.param_types(scope).is_empty() {
 					obligations.push(TypeObligation::CheckImplRequirements {
 						impl_kind: ImplKind::Inherent(block_index),
 						reference: SourceSpan::new(file_id, target.span()),
@@ -2717,8 +2901,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					obligations,
 					file_id,
 					namespace,
-					TypeEnvOwner::TraitImpl(block_index),
-					TypeEnvIdx::ROOT,
+					GenericEnvOwner::TraitImpl(block_index),
+					GenericEnvIdx::ROOT,
 					type_params,
 				);
 				let header = self.impl_dispatch.trait_header(block_index);
@@ -2727,7 +2911,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					LexicalScope {
 						file_id,
 						namespace,
-						env: scope,
+						generic_env: scope,
+						assumption_env: self.assumption_envs.of_frame(scope),
 					},
 					target,
 					header.target,
@@ -2740,7 +2925,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							span: target.span(),
 						},
 					});
-				if !self.type_envs.param_types(scope).is_empty() {
+				if !self.generic_envs.param_types(scope).is_empty() {
 					obligations.push(TypeObligation::CheckImplRequirements {
 						impl_kind: ImplKind::Trait(block_index),
 						reference: SourceSpan::new(file_id, target.span()),
@@ -2792,7 +2977,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							LexicalScope {
 								file_id,
 								namespace,
-								env: TypeEnvIdx::ROOT,
+								generic_env: GenericEnvIdx::ROOT,
+								assumption_env: self
+									.assumption_envs
+									.of_frame(GenericEnvIdx::ROOT),
 							},
 							repr_expr,
 							InferPolicy::Reject(InferSignatureKind::EnumRepr),
@@ -2844,7 +3032,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let ty = self.types.intern(Type::Enum { enum_index });
 				self.constants[usize::from(const_index)] = ConstantSignature {
 					ty,
-					env: TypeEnvIdx::ROOT,
+					env: GenericEnvIdx::ROOT,
 				};
 				SignatureLocation::Constant(const_index)
 			}
@@ -2873,41 +3061,43 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				// hand-written `trait X: A + B {}`, `Self` included (e.g.
 				// `typeset Int: Add where { Rhs = Self } { ... }`). Members
 				// don't get this frame — see below, where they're resolved.
-				let self_scope = self.type_envs.push_param_frame(
+				let self_scope = self.generic_envs.push_param_frame(
 					&mut self.types,
-					TypeEnvOwner::Trait(trait_index),
-					TypeEnvIdx::ROOT,
+					GenericEnvOwner::Trait(trait_index),
+					GenericEnvIdx::ROOT,
 					[Spanned {
 						inner: ast::Keyword::SelfPascal.symbol(),
 						span: name.span,
 					}],
 				);
-				self.param_bounds.push(Box::new([ParamBounds::empty()]));
+				let self_type = self.generic_envs.param_types(self_scope)[0];
+				let env = self.assumption_envs.push(
+					AssumptionEnvIdx::ROOT,
+					Some((self_type, trait_index)),
+				);
+				self.assumption_envs.bind_frame(self_scope, env, true);
 
 				// The Self identity is available while its facts are collected;
 				// the surrounding signature query remains in progress.
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
-				let subject = self.type_envs.param_types(self_scope)[0];
-				let (clause_bounds, clauses) = self.resolve_subject_bounds(
+				let subject = self.generic_envs.param_types(self_scope)[0];
+				let (_, clauses) = self.resolve_subject_bounds(
 					obligations,
 					LexicalScope {
 						file_id,
 						namespace,
-						env: self_scope,
+						generic_env: self_scope,
+						assumption_env: self
+							.assumption_envs
+							.of_frame(self_scope),
 					},
 					bounds.as_ref(),
-					BoundSubject::Param {
-						env: self_scope,
-						index: 0,
-					},
+					BoundSubject::Scope(self_scope),
 					subject,
 					name.inner,
 				);
-				self.param_bounds[usize::from(self_scope)][0] = ParamBounds {
-					declared_bounds: clause_bounds,
-					clauses,
-				};
+				self.assumption_envs.publish(self_scope, clauses);
 				self.traits[usize::from(trait_index)] =
 					TraitSignature { env: self_scope };
 
@@ -2921,7 +3111,10 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						LexicalScope {
 							file_id,
 							namespace,
-							env: TypeEnvIdx::ROOT,
+							generic_env: GenericEnvIdx::ROOT,
+							assumption_env: self
+								.assumption_envs
+								.of_frame(GenericEnvIdx::ROOT),
 						},
 						&m.inner.inner,
 						self.impl_dispatch.trait_header(impl_index).target,
@@ -2937,7 +3130,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					// doc comment).
 					self.trait_impls[usize::from(impl_index)] =
 						Some(TraitImplSignature {
-							type_params: TypeEnvIdx::ROOT,
+							type_params: GenericEnvIdx::ROOT,
 							target: target_spanned,
 						});
 					resolved_members.push(target_spanned);
@@ -2977,7 +3170,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			),
 		);
 		let obligation = TypeObligation::CheckTraitMembership {
-			assumption_context: scope.env,
+			frame: scope.generic_env,
 			subject: ty,
 			required,
 			reference,
@@ -3058,30 +3251,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 	}
 
-	/// An array's length in `memory`, as written: a `Value` of its `Size`,
-	/// which the value must fit (`CheckConstantFits`), a constant named by a
-	/// path (`Type::Const`), or `Infer` for `_`.
+	/// An array's length, as written: a count, which is a `Value`, a constant
+	/// named by a path (`Type::Const`), or `Infer` for `_`. It has no type
+	/// until a pointer holds the array (`length_representable`).
 	fn array_length(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		memory: TypeIndex,
 		length: &Spanned<ast::ConstArgument>,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let site = SourceSpan::new(scope.file_id, length.span);
 		let diagnostic = match length.inner {
 			ast::ConstArgument::Literal(ast::Literal::Int(bits)) => {
-				// Without a `Memory` there is no `Size`, and its absence is
-				// reported where the memory is declared.
-				if let Some(size) = self.memory_size(memory) {
-					obligations.push(TypeObligation::CheckConstantFits {
-						assumption_context: scope.env,
-						ty: size,
-						bits,
-						reference: site,
-					});
-				}
 				return self.types.intern(Type::Value { bits });
 			}
 			ast::ConstArgument::Infer => match infer_policy {
@@ -3100,7 +3282,6 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				return self.constant_length(
 					obligations,
 					scope,
-					memory,
 					segments,
 					site,
 					infer_policy,
@@ -3131,14 +3312,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					receiver,
 					member,
 				);
-				return self.type_constant_length(
-					obligations,
-					scope,
-					memory,
-					selected,
-					member,
-					site,
-				);
+				return self.type_constant_length(scope, selected, member);
 			}
 			ast::ConstArgument::QualifiedPath {
 				ref root,
@@ -3166,14 +3340,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 								member,
 							)
 						});
-					return self.type_constant_length(
-						obligations,
-						scope,
-						memory,
-						selected,
-						member,
-						site,
-					);
+					return self.type_constant_length(scope, selected, member);
 				}
 				_ => Diagnostic::bug()
 					.with_code(DiagnosticCode::UnsupportedExpression.code())
@@ -3188,22 +3355,22 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		TypeIndex::ERROR
 	}
 
-	/// A length named by a constant: the constant, whose type must be
-	/// `memory`'s `Size` (`CheckConstantType`), and whose value it means once
-	/// evaluated. One named through a type (`T::SIZE`, `A::SIZE`) is that
+	/// A length named by a constant: the constant, whose value it means once
+	/// evaluated. One named through a type (`T::LEN`, `A::LEN`) is that
 	/// type's constant.
 	fn constant_length(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		memory: TypeIndex,
 		segments: &[ast::PathSegment],
 		site: SourceSpan,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let first = segments[0].ident.inner;
-		let through_type = self.type_envs.resolve(scope.env, first).is_some()
-			|| first == Keyword::SelfPascal.symbol();
+		let through_type =
+			self.generic_envs
+				.resolve(scope.generic_env, first)
+				.is_some() || first == Keyword::SelfPascal.symbol();
 		let walk = (!through_type).then(|| {
 			PathResolver::new(
 				self.diagnostics,
@@ -3248,14 +3415,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					receiver,
 					member,
 				);
-				return self.type_constant_length(
-					obligations,
-					scope,
-					memory,
-					selected,
-					member,
-					site,
-				);
+				return self.type_constant_length(scope, selected, member);
 			}
 		};
 		let Some(key) = target.def_key() else {
@@ -3277,7 +3437,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			self.report_length_not_constant(kind.noun(), name.inner, site);
 			return TypeIndex::ERROR;
 		};
-		self.length_constant(obligations, scope, memory, constant, &[], site)
+		self.types.intern_const(constant, &[])
 	}
 
 	/// A length named by a type's constant `member`, as its path `selected`
@@ -3285,12 +3445,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// type arguments of its own.
 	fn type_constant_length(
 		&mut self,
-		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		memory: TypeIndex,
 		selected: Option<(ConstIdx, Vec<TypeIndex>)>,
 		member: &ast::PathSegment,
-		site: SourceSpan,
 	) -> TypeIndex {
 		let Some((constant, type_args)) = selected else {
 			return TypeIndex::ERROR;
@@ -3304,14 +3461,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				TypeArgsNotAllowedOn::Declaration(DefKind::Const(constant)),
 			));
 		}
-		self.length_constant(
-			obligations,
-			scope,
-			memory,
-			constant,
-			&type_args,
-			site,
-		)
+		self.types.intern_const(constant, &type_args)
 	}
 
 	/// What a length names is not a constant: a `noun` called `name`.
@@ -3333,27 +3483,42 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		);
 	}
 
-	/// `constant` with `type_args` as a length in `memory`, whose type it
-	/// must have.
-	fn length_constant(
+	/// A pointer into `memory` holds the array whose `length` is written at
+	/// `site`, so the length is held as the memory's `Size`: a value must be it
+	/// (`CheckConstantRepresentable`), and a constant must have it as its type
+	/// or be an untyped count representable as it (`CheckConstantType`).
+	fn length_representable(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		memory: TypeIndex,
-		constant: ConstIdx,
-		type_args: &[TypeIndex],
+		length: TypeIndex,
 		site: SourceSpan,
-	) -> TypeIndex {
-		let length = self.types.intern_const(constant, type_args);
-		if let Some(size) = self.memory_size(memory) {
-			obligations.push(TypeObligation::CheckConstantType {
-				assumption_context: scope.env,
-				length,
-				expected: size,
-				reference: site,
-			});
+	) {
+		// Without a `Memory` there is no `Size`, and its absence is reported
+		// where the memory is declared.
+		let Some(size) = self.memory_size(memory) else {
+			return;
+		};
+		match *self.types.resolve(length) {
+			Type::Value { bits } => {
+				obligations.push(TypeObligation::CheckConstantRepresentable {
+					frame: scope.generic_env,
+					ty: size,
+					bits,
+					reference: site,
+				});
+			}
+			Type::Const { .. } => {
+				obligations.push(TypeObligation::CheckConstantType {
+					frame: scope.generic_env,
+					length,
+					expected: size,
+					reference: site,
+				});
+			}
+			_ => {}
 		}
-		length
 	}
 
 	/// `memory`'s `Size`, `<memory as Memory>::Size`, as written; `None`
@@ -3403,12 +3568,43 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		);
 		if ty != TypeIndex::ERROR {
 			obligations.push(TypeObligation::CheckWellFormed {
-				assumption_context: scope.env,
+				frame: scope.generic_env,
 				ty,
 				reference: SourceSpan::new(scope.file_id, type_expr.span),
 			});
 		}
 		ty
+	}
+
+	/// `resolve_type` for a type held by value (a parameter's, a result's, a
+	/// local's), which must be a `StackValue` (`CheckValueType`).
+	pub(super) fn resolve_value_type(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		type_expr: &Spanned<ast::TypeExpression>,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		let ty = self.resolve_type(obligations, scope, type_expr, infer_policy);
+		self.record_value_type(obligations, scope, ty, type_expr.span);
+		ty
+	}
+
+	/// Records that `ty`, written or made at `span`, is held by value.
+	fn record_value_type(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		ty: TypeIndex,
+		span: TextSpan,
+	) {
+		if ty != TypeIndex::ERROR {
+			obligations.push(TypeObligation::CheckValueType {
+				frame: scope.generic_env,
+				ty,
+				reference: SourceSpan::new(scope.file_id, span),
+			});
+		}
 	}
 
 	/// Resolve the value an impl supplies for an associated type: a written
@@ -3426,7 +3622,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		type_expr: &Spanned<ast::TypeExpression>,
 	) -> TypeIndex {
 		let infer_policy =
-			InferPolicy::Reject(InferSignatureKind::AssocTypeBinding);
+			InferPolicy::Reject(InferSignatureKind::AssocBinding);
 		let declaration = self
 			.impl_dispatch
 			.trait_header(impl_index)
@@ -3473,7 +3669,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		segments: &[ast::PathSegment],
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
-		// The first segment tries `TypeEnv` regardless of how many
+		// The first segment tries `GenericEnv` regardless of how many
 		// segments follow — `Self::Value`/`T::Size` never touch the
 		// scope.namespace graph at all for their own first hop, same as a
 		// bare `T`/`Self` doesn't. Only once that fails does the
@@ -3484,8 +3680,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let first = &segments[0];
 		let site =
 			(SourceSpan::new(scope.file_id, first.ident.span), Tier::Type);
-		let (current, next) = if let Some((frame, index)) =
-			self.type_envs.resolve(scope.env, first.ident.inner)
+		let (current, next) = if let Some((frame, index)) = self
+			.generic_envs
+			.resolve(scope.generic_env, first.ident.inner)
 		{
 			self.resolutions
 				.by_site
@@ -3506,15 +3703,16 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					scope.file_id,
 					first,
 					TypeArgsNotAllowedOn::TypeParam {
-						owner: self.type_envs.owner(frame),
-						name: &self.type_envs.param_names(frame)
+						owner: self.generic_envs.owner(frame),
+						name: &self.generic_envs.param_names(frame)
 							[index as usize],
 					},
 				));
 			}
-			(self.type_envs.param_types(frame)[index as usize], 1)
+			(self.generic_envs.param_types(frame)[index as usize], 1)
 		} else if first.ident.inner == Keyword::SelfPascal.symbol()
-			&& let Some((impl_kind, target)) = self.resolve_impl_self(scope.env)
+			&& let Some((impl_kind, target)) =
+				self.resolve_impl_self(scope.generic_env)
 		{
 			self.resolutions.by_site.insert(
 				site,
@@ -3672,12 +3870,12 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							type_params,
 							&[],
 							&resolved_args,
-							TypeEnvOwner::TypeAlias(index),
+							GenericEnvOwner::TypeAlias(index),
 						);
 						self.types.substitute(
 							target,
 							Substitution {
-								envs: &self.type_envs,
+								envs: &self.generic_envs,
 								env: type_params,
 								args: &type_args,
 							},
@@ -3732,7 +3930,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					params_env,
 					&[],
 					&resolved_args,
-					TypeEnvOwner::Struct(struct_index),
+					GenericEnvOwner::Struct(struct_index),
 				);
 				self.types.intern_struct(struct_index, &type_args)
 			}
@@ -3841,7 +4039,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 					params_env,
 					&[],
 					&resolved_args,
-					TypeEnvOwner::Function(func_index),
+					GenericEnvOwner::Function(func_index),
 				);
 				self.types.intern_function(func_index, &type_args)
 			}
@@ -3908,14 +4106,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			});
 		}
 		let type_params = self.functions[usize::from(function)].type_params;
-		let own = if type_params != TypeEnvIdx::ROOT
+		let own = if type_params != GenericEnvIdx::ROOT
 			&& matches!(
-				self.type_envs.owner(type_params),
-				TypeEnvOwner::Function(owner) if owner == function
+				self.generic_envs.owner(type_params),
+				GenericEnvOwner::Function(owner) if owner == function
 			) {
 			type_params
 		} else {
-			TypeEnvIdx::ROOT
+			GenericEnvIdx::ROOT
 		};
 		let written: Box<[TypeIndex]> = segment
 			.type_args
@@ -3936,7 +4134,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			own,
 			parent_args,
 			&written,
-			TypeEnvOwner::Function(function),
+			GenericEnvOwner::Function(function),
 		)
 	}
 
@@ -3995,12 +4193,63 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 			},
 			ast::TypeExpression::Never => TypeIndex::NEVER,
-			ast::TypeExpression::Path(segments) => self.resolve_type_path(
-				obligations,
-				scope,
-				segments,
-				infer_policy,
-			),
+			ast::TypeExpression::Path(segments) => {
+				let ty = self.resolve_type_path(
+					obligations,
+					scope,
+					segments,
+					infer_policy,
+				);
+				if !ty.is_literal() {
+					return ty;
+				}
+				let name = self.type_formatter().display_type(ty);
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::LiteralKindWithoutBraces.code(),
+						)
+						.with_message(format!(
+							"`{}` is a literal kind, written `{name}`",
+							&name[1..name.len() - 1]
+						))
+						.with_label(
+							SourceSpan::new(scope.file_id, type_expr.span)
+								.primary_label()
+								.with_message(format!("write `{name}`")),
+						),
+				);
+				TypeIndex::ERROR
+			}
+			ast::TypeExpression::Literal { inner } => {
+				if self.resolve_literal_kind(
+					obligations,
+					scope,
+					inner,
+					infer_policy,
+				) == TypeIndex::ERROR
+				{
+					return TypeIndex::ERROR;
+				}
+				self.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::MisplacedLiteralKind.code())
+						.with_message(
+							"a literal kind is only the type of a constant",
+						)
+						.with_label(
+							SourceSpan::new(scope.file_id, type_expr.span)
+								.primary_label()
+								.with_message(
+									"no value of this type exists at runtime",
+								),
+						)
+						.with_note(
+							"a literal kind types an untyped constant: `const X: {integer} = 4;`",
+						),
+				);
+				TypeIndex::ERROR
+			}
 			ast::TypeExpression::Grouped { inner, segments } => {
 				// `<T>::Item` — no scope.namespace prefix to consume first
 				// (unlike `Path`'s `T::Item`, where `T` might itself be a
@@ -4046,7 +4295,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				let first = &segments[0];
 				let Ok(declaration) = self.resolve_trait_qualified_type_member(
 					obligations,
-					scope.env,
+					scope.generic_env,
 					base_ty,
 					required_trait,
 					BindingKey::ty(first.ident.inner),
@@ -4106,33 +4355,41 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			}
 			ast::TypeExpression::Function { params, result } => {
 				// One parameter type: a single one is itself, any other count
-				// is its tuple (`()` for none).
-				let param = if let [param] = &params[..] {
-					self.resolve_type_expression(
+				// is its tuple (`()` for none). Each is held by value.
+				let mut elements = Vec::with_capacity(params.len());
+				for param in params.iter() {
+					let written = &param.inner.inner.ty;
+					let ty = self.resolve_type_expression(
 						obligations,
 						scope,
-						&param.inner.inner.ty,
+						written,
 						infer_policy,
-					)
-				} else {
-					let mut elements = Vec::with_capacity(params.len());
-					for param in params.iter() {
-						elements.push(self.resolve_type_expression(
+					);
+					self.record_value_type(
+						obligations,
+						scope,
+						ty,
+						written.span,
+					);
+					elements.push(ty);
+				}
+				let param = self.types.intern_tuple(&elements);
+				let result_type = match result {
+					Some(result) => {
+						let ty = self.resolve_type_expression(
 							obligations,
 							scope,
-							&param.inner.inner.ty,
+							result,
 							infer_policy,
-						));
+						);
+						self.record_value_type(
+							obligations,
+							scope,
+							ty,
+							result.span,
+						);
+						ty
 					}
-					self.types.intern_tuple(&elements)
-				};
-				let result_type = match result {
-					Some(result) => self.resolve_type_expression(
-						obligations,
-						scope,
-						result,
-						infer_policy,
-					),
 					None => TypeIndex::UNIT,
 				};
 				self.types.intern(Type::TypedFuncref {
@@ -4160,92 +4417,109 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				) else {
 					return TypeIndex::ERROR;
 				};
+				// The length of an array it points at is held as the memory's
+				// `Size`, which must represent it.
+				if let ast::TypeExpression::Array {
+					length: written, ..
+				} = &inner.inner && let Type::Array { length, .. } =
+					*self.types.resolve(to)
+				{
+					self.length_representable(
+						obligations,
+						scope,
+						memory,
+						length,
+						SourceSpan::new(scope.file_id, written.span),
+					);
+				}
 				self.types.intern(Type::Pointer {
 					to,
 					memory,
 					ownership: *ownership,
 				})
 			}
-			ast::TypeExpression::Slice {
-				ownership,
-				memory,
-				inner,
-			} => {
+			ast::TypeExpression::Slice { inner } => {
 				let of = self.resolve_type_expression(
 					obligations,
 					scope,
 					inner,
 					infer_policy,
 				);
-				let Ok(memory) = self.resolve_pointer_memory(
-					obligations,
-					scope,
-					memory,
-					type_expr.span,
-					infer_policy,
-				) else {
-					return TypeIndex::ERROR;
-				};
-				self.types.intern(Type::Slice {
-					of,
-					memory,
-					ownership: *ownership,
-				})
+				self.types.intern(Type::Slice { of })
 			}
-			ast::TypeExpression::Array {
-				ownership,
-				memory,
-				inner,
-				length,
-			} => {
+			ast::TypeExpression::Array { inner, length } => {
 				let of = self.resolve_type_expression(
 					obligations,
 					scope,
 					inner,
 					infer_policy,
 				);
-				let Ok(memory) = self.resolve_pointer_memory(
-					obligations,
-					scope,
-					memory,
-					type_expr.span,
-					infer_policy,
-				) else {
-					return TypeIndex::ERROR;
-				};
-				let length = self.array_length(
-					obligations,
-					scope,
-					memory,
-					length,
-					infer_policy,
-				);
+				let length =
+					self.array_length(obligations, scope, length, infer_policy);
 				if length == TypeIndex::ERROR {
 					return TypeIndex::ERROR;
 				}
-				self.types.intern(Type::Array {
-					of,
-					length,
-					memory,
-					ownership: *ownership,
-				})
+				self.types.intern(Type::Array { of, length })
 			}
 			ast::TypeExpression::Tuple { elements } => {
 				let mut elems: Vec<TypeIndex> =
 					Vec::with_capacity(elements.len());
 				for element in elements.iter() {
-					elems.push(self.resolve_type_expression(
+					let ty = self.resolve_type_expression(
 						obligations,
 						scope,
 						&element.inner,
 						infer_policy,
-					));
+					);
+					elems.push(ty);
 				}
-				// A tuple of one is its element, which interning unwraps.
 				self.types.intern_tuple(&elems)
 			}
-			_ => todo!("this type-expression form isn't implemented yet"),
 		}
+	}
+
+	/// The literal kind `{inner}` names: `inner` resolves as any type, and
+	/// must be one of std's literal kinds (`integer`, `char`). `ERROR` when it
+	/// is not, which is reported.
+	fn resolve_literal_kind(
+		&mut self,
+		obligations: &mut Vec<TypeObligation>,
+		scope: LexicalScope,
+		inner: &Spanned<ast::TypeExpression>,
+		infer_policy: InferPolicy,
+	) -> TypeIndex {
+		// A path is resolved directly: inside the braces a literal kind is
+		// what it should name.
+		let ty = match &inner.inner {
+			ast::TypeExpression::Path(segments) => self.resolve_type_path(
+				obligations,
+				scope,
+				segments,
+				infer_policy,
+			),
+			_ => self.resolve_type_expression(
+				obligations,
+				scope,
+				inner,
+				infer_policy,
+			),
+		};
+		if ty == TypeIndex::ERROR || ty.is_literal() {
+			return ty;
+		}
+		let found = self.type_formatter().display_type(ty);
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::NotALiteralKind.code())
+				.with_message(format!("`{found}` is not a literal kind"))
+				.with_label(
+					SourceSpan::new(scope.file_id, inner.span)
+						.primary_label()
+						.with_message("expected a literal kind"),
+				)
+				.with_note("the literal kinds are `integer` and `char`"),
+		);
+		TypeIndex::ERROR
 	}
 
 	/// Builds the diagnostic for a cycle just detected while trying to
@@ -4524,9 +4798,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				&mut occurrences,
 			);
 		}
-		if matches!(location, BoundSubject::Param { .. })
-			&& matches!(self.type_envs.owner(scope.env), TypeEnvOwner::Trait(_))
-		{
+		if matches!(location, BoundSubject::Scope(_))
+			&& matches!(
+				self.generic_envs.owner(scope.generic_env),
+				GenericEnvOwner::Trait(_)
+			) {
 			for occurrence in &occurrences {
 				let def_id = self.trait_def_id(occurrence.trait_index);
 				let reference = occurrence.span;
@@ -4541,15 +4817,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				}
 			}
 		}
-		let traits = self.trait_clauses(subject, &occurrences);
-		let provisional = BoundClauses {
-			traits,
-			equalities: Equalities::Pending,
-		};
+		let mut traits = Vec::new();
+		self.collect_occurrence_clauses(&mut traits, subject, &occurrences);
+		let provisional =
+			BoundClauses::Provisional(self.clauses.push_traits(&traits));
 		match location {
-			BoundSubject::Param { env, index } => {
-				self.param_bounds[usize::from(env)][index].clauses =
-					provisional;
+			BoundSubject::Scope(env) => {
+				self.assumption_envs.publish(env, provisional);
 			}
 			BoundSubject::Assoc(index) => {
 				self.assoc_types[usize::from(index)] =
@@ -4562,33 +4836,26 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		}
 		self.fill_source_bounds(obligations, scope, subject, &occurrences);
 		let ids: Box<[BoundId]> = occurrences.iter().map(|o| o.id).collect();
-		let equalities = self.equality_clauses(subject, &ids, name);
+		let mut equalities = Vec::new();
+		self.collect_value_clauses(&mut equalities, subject, &ids, name);
 		(
 			ids,
-			BoundClauses {
-				traits,
-				equalities: Equalities::Final(equalities),
-			},
+			BoundClauses::Final(self.clauses.push_final(&traits, &equalities)),
 		)
 	}
 
 	/// The memberships `occurrences` state about `subject`, published before
-	/// any equality's value is resolved (`BoundClauses`).
-	fn trait_clauses(
+	/// any equality's value is resolved (`BoundClauses`), appended to `out`,
+	/// which may hold other subjects'.
+	fn collect_occurrence_clauses(
 		&mut self,
+		out: &mut Vec<TraitClause>,
 		subject: TypeIndex,
 		occurrences: &[BoundOccurrence<'_>],
-	) -> ClauseRange<TraitClause> {
-		let mut traits = Vec::new();
+	) {
 		for occurrence in occurrences {
-			self.collect_trait_clauses(
-				&mut traits,
-				subject,
-				occurrence,
-				occurrence.id,
-			);
+			self.collect_trait_clauses(out, subject, occurrence, occurrence.id);
 		}
-		self.clauses.push_traits(&traits)
 	}
 
 	/// The memberships `occurrence` states about `subject`: its trait, its
@@ -4610,10 +4877,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			},
 		);
 		for binding in &occurrence.bindings {
-			let BindingOccurrenceKind::Bound(nested) = &binding.kind else {
+			let BindingOccurrenceKind::Bound(target, nested) = &binding.kind
+			else {
 				continue;
 			};
-			let projection = binding.target.project(&mut self.types, subject);
+			let projection = target.project(&mut self.types, subject);
 			for nested in nested {
 				self.collect_trait_clauses(out, projection, nested, origin);
 			}
@@ -4668,12 +4936,38 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let id = self.bounds.reserve(trait_index, span);
 		let mut occurrence_bindings = Vec::new();
 		for binding in bindings.iter() {
-			let target = match self.binding_target(
-				trait_index,
-				binding.name.inner,
-				span,
-			) {
-				MemberLookup::Found(member) => member.type_declaration(),
+			let key = match binding.kind {
+				ast::AssocBindingKind::ConstEquals { const_span, .. } => {
+					self.diagnostics.push(
+						Diagnostic::bug()
+							.with_code(
+								DiagnosticCode::UnsupportedExpression.code(),
+							)
+							.with_message(
+								"a constant's value in a bound is not \
+								 supported yet",
+							)
+							.with_label(
+								SourceSpan::new(
+									file_id,
+									TextSpan::new(
+										const_span.start,
+										binding.name.span.end,
+									),
+								)
+								.primary_label(),
+							),
+					);
+					continue;
+				}
+				ast::AssocBindingKind::ConstRepresentable { .. } => {
+					BindingKey::value(binding.name.inner)
+				}
+				ast::AssocBindingKind::Equals(_)
+				| ast::AssocBindingKind::Bound(_) => BindingKey::ty(binding.name.inner),
+			};
+			let member = match self.binding_target(trait_index, key, span) {
+				MemberLookup::Found(member) => Some(member),
 				MemberLookup::Ambiguous(candidates) => {
 					let diagnostic = report_ambiguous_type_member(
 						file_id,
@@ -4691,20 +4985,74 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				MemberLookup::Error => continue,
 				_ => None,
 			};
-			let Some(target) = target else {
-				self.diagnostics.push(report_not_an_associated_type(
+			let kind = match &binding.kind {
+				ast::AssocBindingKind::Equals(ty) => member
+					.and_then(ApplicableMember::type_declaration)
+					.map(|target| BindingOccurrenceKind::Equals(target, ty)),
+				ast::AssocBindingKind::Bound(rhs) => member
+					.and_then(ApplicableMember::type_declaration)
+					.map(|target| {
+						let mut nested = Vec::new();
+						self.collect_bound_occurrences(
+							file_id,
+							namespace,
+							rhs,
+							&mut nested,
+						);
+						BindingOccurrenceKind::Bound(target, nested)
+					}),
+				ast::AssocBindingKind::ConstRepresentable { ty, .. } => member
+					.and_then(ApplicableMember::constant_declaration)
+					.map(|target| {
+						BindingOccurrenceKind::Representable(target, ty)
+					}),
+				ast::AssocBindingKind::ConstEquals { .. } => {
+					unreachable!("a constant's value is reported above")
+				}
+			};
+			let Some(kind) = kind else {
+				let noun = match key.tier {
+					Tier::Type => "an associated type",
+					Tier::Value => "a constant",
+				};
+				self.diagnostics.push(report_not_a_binding_member(
 					file_id,
 					self.strings,
 					binding.name,
 					self.defs.traits[usize::from(trait_index)].name.inner,
+					noun,
 				));
 				continue;
 			};
+			// A bound states what an untyped constant is representable as; a
+			// typed constant's type is its declaration's.
+			if let BindingOccurrenceKind::Representable(target, ty) = &kind {
+				let status = self.ensure_signature(QueryInfo {
+					def_id: DefId::Const(target.constant),
+					requested_at: None,
+				});
+				// Without its signature (a cycle, reported where it closes)
+				// the entry is kept as written.
+				let declared = self.constants[usize::from(target.constant)].ty;
+				if matches!(status, SignatureStatus::Available(_))
+					&& !declared.is_literal()
+				{
+					let diagnostic = self.report_typed_constant_bound(
+						SourceSpan::new(
+							file_id,
+							TextSpan::new(binding.name.span.start, ty.span.end),
+						),
+						target.constant,
+						declared,
+					);
+					self.diagnostics.push(diagnostic);
+					continue;
+				}
+			}
 			if occurrence_bindings
 				.iter()
-				.any(|b: &BindingOccurrence<'expr>| {
-					b.target.assoc_type_index == target.assoc_type_index
-				}) {
+				.any(|b: &BindingOccurrence<'expr>| b.kind.same_member(&kind))
+			{
 				self.diagnostics.push(report_duplicate_assoc_type_binding(
 					file_id,
 					self.strings,
@@ -4712,23 +5060,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				));
 				continue;
 			}
-			let kind = match &binding.kind {
-				ast::AssocTypeBindingKind::Equals(ty) => {
-					BindingOccurrenceKind::Equals(ty)
-				}
-				ast::AssocTypeBindingKind::Bound(rhs) => {
-					let mut nested = Vec::new();
-					self.collect_bound_occurrences(
-						file_id,
-						namespace,
-						rhs,
-						&mut nested,
-					);
-					BindingOccurrenceKind::Bound(nested)
-				}
-			};
 			occurrence_bindings.push(BindingOccurrence {
-				target,
 				name: binding.name,
 				kind,
 			});
@@ -4759,7 +5091,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				Vec::with_capacity(occurrence.bindings.len());
 			for binding in &occurrence.bindings {
 				let kind = match &binding.kind {
-					BindingOccurrenceKind::Equals(ty) => {
+					BindingOccurrenceKind::Equals(target, ty) => {
 						// Store the resolved expression without reducing
 						// its final value. Member lookup may still need
 						// to expose a receiver's constructor.
@@ -4768,7 +5100,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							scope,
 							ty,
 							InferPolicy::Reject(
-								InferSignatureKind::AssocTypeBinding,
+								InferSignatureKind::AssocBinding,
 							),
 						);
 						let value = Spanned {
@@ -4781,24 +5113,22 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						if value.inner != TypeIndex::ERROR {
 							self.record_bounds_check(
 								obligations,
-								scope.env,
+								scope.generic_env,
 								BoundRequirements::AssociatedType {
-									declaration: binding
-										.target
-										.assoc_type_index,
-									trait_index: binding.target.trait_index,
+									declaration: target.assoc_type_index,
+									trait_index: target.trait_index,
 									receiver: subject,
+									value: value.inner,
 								},
-								value,
 								SourceSpan::new(scope.file_id, ty.span),
-								TypeEnvOwner::Trait(binding.target.trait_index),
+								GenericEnvOwner::Trait(target.trait_index),
 							);
 						}
-						BindingRequirement::Equals(value)
+						BindingRequirement::Equals(*target, value)
 					}
-					BindingOccurrenceKind::Bound(nested) => {
+					BindingOccurrenceKind::Bound(target, nested) => {
 						let projection =
-							binding.target.project(&mut self.types, subject);
+							target.project(&mut self.types, subject);
 						self.fill_source_bounds(
 							obligations,
 							scope,
@@ -4806,12 +5136,29 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 							nested,
 						);
 						BindingRequirement::Bound(
+							*target,
 							nested.iter().map(|o| o.id).collect(),
+						)
+					}
+					BindingOccurrenceKind::Representable(target, ty) => {
+						let resolved = self.resolve_type_expression(
+							obligations,
+							scope,
+							ty,
+							InferPolicy::Reject(
+								InferSignatureKind::AssocBinding,
+							),
+						);
+						BindingRequirement::Representable(
+							*target,
+							Spanned {
+								inner: resolved,
+								span: ty.span,
+							},
 						)
 					}
 				};
 				source_bindings.push(SourceAssocBinding {
-					target: binding.target,
 					name: binding.name,
 					kind,
 				});
@@ -4835,14 +5182,18 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	fn binding_target(
 		&mut self,
 		trait_index: TraitIdx,
-		name: SymbolU32,
+		key: BindingKey,
 		reference: SourceSpan,
 	) -> MemberLookup {
-		let key = BindingKey::ty(name);
 		let defs = self.defs;
 		let declared = |trait_index| {
-			defs.declared_trait_member(trait_index, key)
-				.filter(|kind| matches!(kind, MemberKind::AssociatedType(_)))
+			defs.declared_trait_member(trait_index, key).filter(|kind| {
+				matches!(
+					(key.tier, kind),
+					(Tier::Type, MemberKind::AssociatedType(_))
+						| (Tier::Value, MemberKind::Constant(_))
+				)
+			})
 		};
 		if let Some(declaration) = declared(trait_index) {
 			return MemberLookup::Found(
@@ -4861,12 +5212,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let Some(env) = self.trait_env(trait_index, reference) else {
 			return MemberLookup::Error;
 		};
-		let own_self = self.type_envs.param_types(env)[0];
-		let range = self.param_bounds[usize::from(env)][0].clauses.traits;
+		let own_self = self.generic_envs.param_types(env)[0];
+		let range = self.assumption_envs.requirements(env).range();
 		let supertraits = self
 			.clauses
 			.traits(range)
-			.iter()
 			.filter(|clause| clause.subject == own_self)
 			.map(|clause| clause.trait_index)
 			.filter(|&supertrait| declared(supertrait).is_some());
@@ -5086,6 +5436,9 @@ fn report_missing_constant_type(
 				.primary_label()
 				.with_message("expected `: Type` here"),
 		)
+		.with_note(
+			"an untyped constant names its literal kind: `const X: {integer} = 4;`",
+		)
 }
 
 fn report_pointer_without_memory(
@@ -5203,12 +5556,12 @@ pub(super) mod tests {
 	#[test]
 	fn every_resolved_name_is_recorded_where_it_is_written() {
 		const SOURCE: &str = indoc! {"
-			mod m { pub struct S(); pub trait Tr { type A; } }
+			mod m { pub struct S(); pub trait Tr { type A: StackValue; } }
 			mod g { pub struct G(); }
 			use m::S;
 			use g::*;
 			struct T();
-			func f<T: m::Tr>(a: S, b: m::S, c: T, d: T::A, e: <T as m::Tr>::A, x: G) {}
+			func f<T: m::Tr + StackValue>(a: S, b: m::S, c: T, d: T::A, e: <T as m::Tr>::A, x: G) {}
 		"};
 		test_case!(case = SOURCE);
 		case.diagnostics().assert_none();
@@ -5591,7 +5944,7 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn literals_must_fit_their_type() {
+		fn literals_must_be_representable_as_their_type() {
 			for (initializer, code) in [
 				(
 					"const A: u8 = 256;",
@@ -5689,7 +6042,8 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn a_literal_of_abstract_type_fits_every_typeset_member() {
+		fn a_literal_of_abstract_type_is_representable_as_every_typeset_member()
+		{
 			test_case!(
 				case = "typeset Small { u8, i8 }
 					trait Holder {
@@ -5698,7 +6052,7 @@ pub(super) mod tests {
 						const TOO_BIG: Self::S = 200;
 					}"
 			);
-			// `200` fits `u8` but not `i8`.
+			// `200` is representable as `u8` but not as `i8`.
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::TypesetBoundViolation]);
 		}
@@ -6450,12 +6804,13 @@ pub(super) mod tests {
 
 		fn memberships(
 			signatures: &TypeContext<'_, '_, '_>,
-			scope: TypeEnvIdx,
+			scope: GenericEnvIdx,
 		) -> (Readiness, Vec<(TypeIndex, TraitIdx)>) {
 			let tables = signatures.clause_tables();
+			let env = signatures.assumption_envs.of_frame(scope);
 			(
-				tables.assumptions_readiness(scope),
-				tables.assumed_traits(scope).collect(),
+				tables.assumptions_readiness(env),
+				tables.assumed_traits(env).collect(),
 			)
 		}
 
@@ -6518,7 +6873,7 @@ pub(super) mod tests {
 			let outer_scope =
 				case.context.inherent_impls[0].as_ref().unwrap().type_params;
 			let outer_param =
-				case.context.type_envs.param_types(outer_scope)[0];
+				case.context.generic_envs.param_types(outer_scope)[0];
 			for (name, own_trait) in [
 				("own", Some(local)),
 				("sibling", Some(other)),
@@ -6534,7 +6889,7 @@ pub(super) mod tests {
 					.unwrap();
 				let scope = case.context.functions[index].type_params;
 				let own_param = own_trait
-					.map(|_| case.context.type_envs.param_types(scope)[0]);
+					.map(|_| case.context.generic_envs.param_types(scope)[0]);
 				let (readiness, actual) = memberships(&case.context, scope);
 				assert_eq!(readiness, Readiness::Ready);
 				let mut expected = Vec::new();
@@ -6552,7 +6907,7 @@ pub(super) mod tests {
 				}
 			}
 			let (readiness, facts) =
-				memberships(&case.context, TypeEnvIdx::ROOT);
+				memberships(&case.context, GenericEnvIdx::ROOT);
 			assert_eq!(readiness, Readiness::Ready);
 			assert!(facts.is_empty());
 		}
@@ -6573,7 +6928,7 @@ pub(super) mod tests {
 				case.context.diagnostics
 			);
 			let scope = case.function_signature("f").type_params;
-			let base = case.context.type_envs.param_types(scope)[0];
+			let base = case.context.generic_envs.param_types(scope)[0];
 			let item = projection(&mut case, base, "Outer", "Item");
 			let value = projection(&mut case, item, "Inner", "Value");
 			let other = projection(&mut case, base, "Outer", "Other");
@@ -6591,11 +6946,15 @@ pub(super) mod tests {
 			for membership in &expected {
 				assert!(traits.contains(membership));
 			}
-			let clauses =
-				case.context.param_bounds[usize::from(scope)][0].clauses;
+			let clauses = case.context.assumption_envs.requirements(scope);
 			// Each clause names the written bound that states it, whether
 			// written here or inherited from a supertrait's declaration.
-			for clause in case.context.clauses.traits(clauses.traits) {
+			for clause in case
+				.context
+				.clauses
+				.traits(clauses.range())
+				.collect::<Vec<_>>()
+			{
 				assert_eq!(
 					case.context.bounds.trait_index(clause.source),
 					clause.trait_index
@@ -6604,13 +6963,14 @@ pub(super) mod tests {
 			let equalities = case
 				.context
 				.clauses
-				.equalities(clauses.equalities.resolved());
+				.equalities(clauses.resolved())
+				.collect::<Vec<_>>();
 			assert_eq!(equalities.len(), 1);
 			assert_eq!(equalities[0].projection, value);
 			assert_eq!(equalities[0].value, TypeIndex::I32);
 			assert!(
 				matches!(case.context.bounds.binding(equalities[0].source).kind,
-				BindingRequirement::Equals(value) if value.inner == TypeIndex::I32)
+				BindingRequirement::Equals(_, value) if value.inner == TypeIndex::I32)
 			);
 		}
 
@@ -6629,7 +6989,7 @@ pub(super) mod tests {
 				case.context.diagnostics
 			);
 			let scope = case.function_signature("f").type_params;
-			let base = case.context.type_envs.param_types(scope)[0];
+			let base = case.context.generic_envs.param_types(scope)[0];
 			let item = projection(&mut case, base, "Outer", "Item");
 			let value = projection(&mut case, item, "Inner", "Value");
 			let output = projection(&mut case, value, "Deep", "Output");
@@ -6639,41 +6999,58 @@ pub(super) mod tests {
 				case.context.traits[usize::from(case.trait_index("Outer"))].env;
 			let tables = case.context.clause_tables();
 			let types = &case.context.types;
-			let mut sources = tables.declarations_of(types, item, 128);
+			let mut sources = tables.declarations_of(
+				types,
+				case.context.assumption_envs.of_frame(scope),
+				item,
+				128,
+			);
 			assert_eq!(sources.readiness, Readiness::Ready);
 			// `Item`'s declaration first, read with `Self` as `T`.
 			let source = sources.next().unwrap();
 			let context = source.context.unwrap();
 			assert_eq!(context.env, outer_env);
 			assert_eq!(context.receiver, base);
-			let traits = tables.clauses.traits(source.clauses.traits);
+			let traits = tables
+				.clauses
+				.traits(source.clauses.range())
+				.collect::<Vec<_>>();
 			assert_eq!(traits.len(), 2);
 			assert!(
-				source.names(types, tables.type_envs, traits[0].subject, item)
-					&& traits[0].trait_index == inner
+				source.names(
+					types,
+					tables.generic_envs,
+					traits[0].subject,
+					item
+				) && traits[0].trait_index == inner
 			);
 			assert!(
-				source.names(types, tables.type_envs, traits[1].subject, value)
-					&& traits[1].trait_index == deep
+				source.names(
+					types,
+					tables.generic_envs,
+					traits[1].subject,
+					value
+				) && traits[1].trait_index == deep
 			);
 			let equalities = tables
 				.clauses
-				.equalities(source.clauses.equalities.resolved());
+				.equalities(source.clauses.resolved())
+				.collect::<Vec<_>>();
 			assert_eq!(equalities.len(), 1);
 			assert!(source.names(
 				types,
-				tables.type_envs,
+				tables.generic_envs,
 				equalities[0].projection,
 				output
 			));
 			let written = equalities[0].value;
-			// Then the parameter at the path's root.
+			// Then the scope of the parameter at the path's root: `f`'s.
 			assert!(sources.next().unwrap().context.is_none());
 			assert!(sources.next().is_none());
 			let value = case.context.types.substitute(
 				written,
 				Substitution {
-					envs: &case.context.type_envs,
+					envs: &case.context.generic_envs,
 					env: context.env,
 					args: &[context.receiver],
 				},
@@ -6688,13 +7065,16 @@ pub(super) mod tests {
 			let child = case.trait_index("Child");
 			let parent = case.trait_index("Parent");
 			let scope = case.context.traits[usize::from(child)].env;
-			let subject = case.context.type_envs.param_types(scope)[0];
+			let subject = case.context.generic_envs.param_types(scope)[0];
 			let (readiness, facts) = memberships(&case.context, scope);
 			assert_eq!(readiness, Readiness::Ready);
 			assert_eq!(facts, [(subject, child), (subject, parent)]);
-			let clauses =
-				case.context.param_bounds[usize::from(scope)][0].clauses;
-			let traits = case.context.clauses.traits(clauses.traits);
+			let clauses = case.context.assumption_envs.requirements(scope);
+			let traits = case
+				.context
+				.clauses
+				.traits(clauses.range())
+				.collect::<Vec<_>>();
 			assert_eq!(traits.len(), 1);
 			assert_eq!(traits[0].trait_index, parent);
 		}
@@ -6716,19 +7096,22 @@ pub(super) mod tests {
 				("conflicting", Some([TypeIndex::I32, TypeIndex::U32])),
 			] {
 				let scope = case.function_signature(name).type_params;
-				let base = case.context.type_envs.param_types(scope)[0];
+				let base = case.context.generic_envs.param_types(scope)[0];
 				let expected_subject =
 					projection(&mut case, base, "Value", "Item");
 				let expected_values = values.map_or_else(
-					|| case.context.type_envs.param_types(scope)[1..].to_vec(),
+					|| {
+						case.context.generic_envs.param_types(scope)[1..]
+							.to_vec()
+					},
 					|values| values.to_vec(),
 				);
-				let clauses =
-					case.context.param_bounds[usize::from(scope)][0].clauses;
+				let clauses = case.context.assumption_envs.requirements(scope);
 				let equalities = case
 					.context
 					.clauses
-					.equalities(clauses.equalities.resolved());
+					.equalities(clauses.resolved())
+					.collect::<Vec<_>>();
 				assert!(
 					equalities
 						.iter()
@@ -6757,18 +7140,18 @@ pub(super) mod tests {
 						requested_at: None,
 					});
 					let scope = builder.functions[0].type_params;
-					let clauses =
-						builder.param_bounds[usize::from(scope)][1].clauses;
-					builder.param_bounds[usize::from(scope)][1]
-						.clauses
-						.equalities = Equalities::Pending;
+					let env = builder.assumption_envs.of_frame(scope);
+					let clauses = builder.assumption_envs.clauses(env);
+					*builder.assumption_envs.clauses_mut(env) =
+						BoundClauses::Provisional(clauses.range());
 					let (readiness, facts) = memberships(builder, scope);
 					assert_eq!(readiness, Readiness::Pending);
 					assert_eq!(facts[0].1, TraitIdx::new(0));
-					builder.param_bounds[usize::from(scope)][1].clauses =
-						clauses;
+					*builder.assumption_envs.clauses_mut(env) = clauses;
 					assert_eq!(
-						builder.clause_tables().assumptions_readiness(scope),
+						builder.clause_tables().assumptions_readiness(
+							builder.assumption_envs.of_frame(scope)
+						),
 						Readiness::Ready
 					);
 				},
@@ -6786,7 +7169,7 @@ pub(super) mod tests {
 						requested_at: None,
 					});
 					let scope = builder.functions[0].type_params;
-					let base = builder.type_envs.param_types(scope)[0];
+					let base = builder.generic_envs.param_types(scope)[0];
 					let declaration =
 						match builder.defs.traits[1].members[0].kind {
 							MemberKind::AssociatedType(index) => index,
@@ -6801,9 +7184,13 @@ pub(super) mod tests {
 						builder.assoc_types[usize::from(declaration)].is_none()
 					);
 					{
-						let mut traits = builder
-							.clause_tables()
-							.declared_traits(&builder.types, item, 128);
+						let mut traits =
+							builder.clause_tables().declared_traits(
+								&builder.types,
+								builder.assumption_envs.of_frame(scope),
+								item,
+								128,
+							);
 						assert_eq!(traits.readiness, Readiness::Pending);
 						assert!(traits.next().is_none());
 					}
@@ -6820,23 +7207,42 @@ pub(super) mod tests {
 					assert_eq!(
 						builder
 							.clause_tables()
-							.declared_traits(&builder.types, item, 128)
+							.declared_traits(
+								&builder.types,
+								builder.assumption_envs.of_frame(scope),
+								item,
+								128
+							)
 							.readiness,
 						Readiness::Ready
 					);
 					builder.assoc_types[usize::from(declaration)]
 						.as_mut()
 						.unwrap()
-						.clauses
-						.equalities = Equalities::Pending;
+						.clauses = BoundClauses::Provisional(
+						builder.assoc_types[usize::from(declaration)]
+							.as_ref()
+							.unwrap()
+							.clauses
+							.range(),
+					);
 					let tables = builder.clause_tables();
-					let traits =
-						tables.declared_traits(&builder.types, item, 128);
+					let traits = tables.declared_traits(
+						&builder.types,
+						builder.assumption_envs.of_frame(scope),
+						item,
+						128,
+					);
 					assert_eq!(traits.readiness, Readiness::Pending);
 					assert_eq!(traits.collect::<Vec<_>>(), [TraitIdx::new(0)]);
 					assert_eq!(
 						tables
-							.declared_traits(&builder.types, item, 0)
+							.declared_traits(
+								&builder.types,
+								builder.assumption_envs.of_frame(scope),
+								item,
+								0
+							)
 							.readiness,
 						Readiness::Overflowed
 					);
@@ -6851,7 +7257,7 @@ pub(super) mod tests {
 			);
 			assert!(case.context.diagnostics.is_empty());
 			let scope = case.function_signature("f").type_params;
-			let base = case.context.type_envs.param_types(scope)[0];
+			let base = case.context.generic_envs.param_types(scope)[0];
 			let next = projection(&mut case, base, "Node", "Next");
 			let next_next = projection(&mut case, next, "Node", "Next");
 			let (readiness, facts) = memberships(&case.context, scope);
@@ -6859,14 +7265,23 @@ pub(super) mod tests {
 			assert_eq!(facts.len(), 1);
 			let tables = case.context.clause_tables();
 			for subject in [next, next_next] {
-				let traits =
-					tables.declared_traits(&case.context.types, subject, 128);
+				let traits = tables.declared_traits(
+					&case.context.types,
+					case.context.assumption_envs.of_frame(scope),
+					subject,
+					128,
+				);
 				assert_eq!(traits.readiness, Readiness::Ready);
 				assert_eq!(traits.collect::<Vec<_>>(), [TraitIdx::new(0)]);
 			}
 			assert_eq!(
 				tables
-					.declared_traits(&case.context.types, next_next, 1)
+					.declared_traits(
+						&case.context.types,
+						case.context.assumption_envs.of_frame(scope),
+						next_next,
+						1
+					)
 					.readiness,
 				Readiness::Overflowed
 			);
@@ -6957,7 +7372,7 @@ pub(super) mod tests {
 		let name = builder.strings.get(name).unwrap();
 		let key = BindingKey::ty(name);
 		let MemberLookup::Found(member) = builder.resolve_applicable_member(
-			TypeEnvIdx::ROOT,
+			AssumptionEnvIdx::ROOT,
 			receiver,
 			key,
 			reference,
@@ -6968,7 +7383,11 @@ pub(super) mod tests {
 		let declaration = member.assoc_type_index;
 		let trait_index = member.trait_index;
 		let Some(TraitImplLookup::Concrete { impl_index, .. }) = builder
-			.find_trait_impl_query(TypeEnvIdx::ROOT, receiver, trait_index)
+			.find_trait_impl_query(
+				AssumptionEnvIdx::ROOT,
+				receiver,
+				trait_index,
+			)
 			.unwrap()
 		else {
 			panic!("expected an impl override")
@@ -6992,6 +7411,39 @@ pub(super) mod tests {
 			AstNodeRef::TraitAssocType { .. }
 		));
 		(declaration, provider, reference)
+	}
+
+	/// The bounds written on `subject` among `env`'s clauses, in written
+	/// order: the bounds the clauses about it, or a path over it, came from.
+	pub(in crate::tir) fn written_bounds(
+		types: &TypeInterner,
+		assumption_envs: &AssumptionEnvArena,
+		clauses: &ClauseArena,
+		env: GenericEnvIdx,
+		subject: TypeIndex,
+	) -> Vec<BoundId> {
+		let over_subject = |mut ty: TypeIndex| loop {
+			if ty == subject {
+				return true;
+			}
+			match *types.resolve(ty) {
+				Type::TypeProjection { base, .. } => ty = base,
+				_ => return false,
+			}
+		};
+		let env = assumption_envs.requirements(env);
+		let traits = clauses
+			.traits(env.range())
+			.filter(|clause| over_subject(clause.subject))
+			.map(|clause| clause.origin);
+		let equalities = clauses
+			.equalities(env.resolved())
+			.filter(|clause| over_subject(clause.projection))
+			.map(|clause| clause.origin);
+		let mut origins: Vec<BoundId> = traits.chain(equalities).collect();
+		origins.sort_by_key(|&id| u32::from(id));
+		origins.dedup();
+		origins
 	}
 
 	/// Parses `source` as a single-file binary over the embedded stdlib.
@@ -7206,11 +7658,17 @@ pub(super) mod tests {
 		fn trait_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
 			let env =
 				self.context.traits[usize::from(self.trait_index(path))].env;
-			self.context.param_bounds[usize::from(env)][0]
-				.declared_bounds
-				.iter()
-				.map(|&id| self.context.bounds.get(id))
-				.collect()
+			let subject = self.context.generic_envs.param_types(env)[0];
+			written_bounds(
+				&self.context.types,
+				&self.context.assumption_envs,
+				&self.context.clauses,
+				env,
+				subject,
+			)
+			.into_iter()
+			.map(|id| self.context.bounds.get(id))
+			.collect()
 		}
 
 		fn typeset_index(&self, path: &str) -> TypesetIdx {
@@ -7246,11 +7704,17 @@ pub(super) mod tests {
 			let env = self.context.traits
 				[usize::from(self.typeset_trait_index(path))]
 			.env;
-			self.context.param_bounds[usize::from(env)][0]
-				.declared_bounds
-				.iter()
-				.map(|&id| self.context.bounds.get(id))
-				.collect()
+			let subject = self.context.generic_envs.param_types(env)[0];
+			written_bounds(
+				&self.context.types,
+				&self.context.assumption_envs,
+				&self.context.clauses,
+				env,
+				subject,
+			)
+			.into_iter()
+			.map(|id| self.context.bounds.get(id))
+			.collect()
 		}
 
 		/// `name` is looked up directly against the trait's own member
@@ -7510,12 +7974,12 @@ pub(super) mod tests {
 		/// stored index.
 		fn normalized(
 			&mut self,
-			scope: TypeEnvIdx,
+			scope: GenericEnvIdx,
 			ty: TypeIndex,
 		) -> TypeIndex {
 			self.context
 				.normalize(
-					scope,
+					self.context.assumption_envs.of_frame(scope),
 					ty,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
@@ -7543,7 +8007,7 @@ pub(super) mod tests {
 			let scope = self.function_signature(path).type_params;
 			let ty = self.param_types(path)[index];
 			self.context.normalize(
-				scope,
+				self.context.assumption_envs.of_frame(scope),
 				ty,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
@@ -7582,21 +8046,28 @@ pub(super) mod tests {
 
 		/// The one-hop declared bounds on generic parameter `param_index` of
 		/// whichever item owns `env` — bounds no longer live on the
-		/// signature struct itself, see `TypeContext::param_bounds`.
+		/// signature struct itself, see `TypeContext::assumption_envs`.
 		fn declared_bounds(
 			&self,
-			env: TypeEnvIdx,
+			env: GenericEnvIdx,
 			param_index: u32,
 		) -> Vec<&SourceTraitBound> {
-			self.context.param_bounds[usize::from(env)][param_index as usize]
-				.declared_bounds
-				.iter()
-				.map(|&id| self.context.bounds.get(id))
-				.collect()
+			let subject = self.context.generic_envs.param_types(env)
+				[param_index as usize];
+			written_bounds(
+				&self.context.types,
+				&self.context.assumption_envs,
+				&self.context.clauses,
+				env,
+				subject,
+			)
+			.into_iter()
+			.map(|id| self.context.bounds.get(id))
+			.collect()
 		}
 
-		fn param_count(&self, env: TypeEnvIdx) -> usize {
-			self.context.param_bounds[usize::from(env)].len()
+		fn param_count(&self, env: GenericEnvIdx) -> usize {
+			self.context.generic_envs.param_names(env).len()
 		}
 	}
 
@@ -7705,7 +8176,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn nested_function_type_uses_generic_scope_and_defaults_to_unit() {
-		test_case!(case = "type Callback<T> = func(T) -> func();");
+		test_case!(case = "type Callback<T: StackValue> = func(T) -> func();");
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -8745,7 +9216,7 @@ pub(super) mod tests {
 		test_case!(
 			case = indoc! {"
 			struct T();
-			func f<T>(x: T<u8>) {}
+			func f<T: StackValue>(x: T<u8>) {}
 		"}
 		);
 		case.diagnostics()
@@ -8794,8 +9265,12 @@ pub(super) mod tests {
 	fn type_arguments_on_a_parameter_point_at_its_declaration() {
 		let call = "";
 		for (source, declared, name) in [
-			("func f<T>(x: T<u8>) {}", "f<T", "T"),
-			("trait Tr { func g(x: Self<u8>); }", "trait Tr", "Tr"),
+			("func f<T: StackValue>(x: T<u8>) {}", "f<T", "T"),
+			(
+				"trait Tr: StackValue { func g(x: Self<u8>); }",
+				"trait Tr",
+				"Tr",
+			),
 		] {
 			let source = format!("{source} {call}");
 			test_case!(case = &source);
@@ -8826,7 +9301,7 @@ pub(super) mod tests {
 				true,
 			),
 			(
-				"trait Tr { func f(x: Self); } impl Tr for u8 { func f(x: Self<u8>) {} }",
+				"trait Tr: StackValue { func f(x: Self); } impl Tr for u8 { func f(x: Self<u8>) {} }",
 				"u8 {",
 				"`Self` is `u8` in this impl",
 				false,
@@ -8861,7 +9336,7 @@ pub(super) mod tests {
 	fn type_arguments_on_self_are_diagnosed() {
 		test_case!(
 			case = indoc! {"
-			trait Tr { func g(x: Self<u8>); }
+			trait Tr: StackValue { func g(x: Self<u8>); }
 		"}
 		);
 		case.diagnostics()
@@ -8876,7 +9351,7 @@ pub(super) mod tests {
 	fn a_type_parameter_with_arguments_still_selects_its_members() {
 		test_case!(
 			case = indoc! {"
-			trait Tr { type A; }
+			trait Tr { type A: StackValue; }
 			func f<T: Tr>(x: T<u8>::A) {}
 		"}
 		);
@@ -9050,7 +9525,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_generic_function_param_resolves_to_its_type_param() {
-		test_case!(case = "func identity<T>(x: T) -> T { x }");
+		test_case!(case = "func identity<T: StackValue>(x: T) -> T { x }");
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -9116,7 +9591,7 @@ pub(super) mod tests {
 			crate func i32_add(a: i32, b: i32) -> i32;
 			func missing();
 			import "env" as host { func trap() -> i32; }
-			trait Requirement {
+			trait Requirement: StackValue {
 				func required(self: Self);
 				func provided(self: Self) {}
 			}
@@ -9179,6 +9654,7 @@ pub(super) mod tests {
 	#[test]
 	fn std_contract_binding_ignores_ordinary_function_names() {
 		test_case!(std case = indoc! {"
+			pub trait StackValue { type Repr; }
 			pub trait Call { type Args; type Result; }
 			pub trait Function: Call {}
 			type u8;
@@ -9288,7 +9764,7 @@ pub(super) mod tests {
 		for source in [
 			"func f(x) { } ",
 			"func f(x); ",
-			"trait Foo { func get(self: Self, x) -> Self; } ",
+			"trait Foo: StackValue { func get(self: Self, x) -> Self; } ",
 			"struct S(); impl S { func get(self: Self, x) -> Self { self } } ",
 		] {
 			test_case!(case = source);
@@ -9404,7 +9880,7 @@ pub(super) mod tests {
 		);
 		// Stored as written (`Need<S::Item>`), meaning `Need<i32>`.
 		let written = case.constant_signature("VALUE").ty;
-		let ty = case.normalized(TypeEnvIdx::ROOT, written);
+		let ty = case.normalized(GenericEnvIdx::ROOT, written);
 		let Type::Struct {
 			struct_index,
 			type_args,
@@ -9561,20 +10037,31 @@ pub(super) mod tests {
 
 	#[test]
 	fn enum_type_identity_does_not_force_its_representation_query() {
-		with_pending_std_signatures(
+		with_pending_signatures(
 			indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			func f(x: Color) -> Color {}
 			enum Color(i32) { Red }
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"},
 			|builder| {
-				let function = DefId::Function(FunctionIdx::new(0));
-				let enumeration = DefId::Enum(EnumIdx::new(0));
+				let function_index = builder
+					.defs
+					.functions
+					.iter()
+					.position(|def| {
+						builder.strings.resolve(def.name.inner) == Some("f")
+					})
+					.unwrap();
+				let enum_index = builder
+					.defs
+					.enums
+					.iter()
+					.position(|def| {
+						builder.strings.resolve(def.name.inner) == Some("Color")
+					})
+					.unwrap();
+				let function =
+					DefId::Function(FunctionIdx::new(function_index as u32));
+				let enumeration = DefId::Enum(EnumIdx::new(enum_index as u32));
 				let _ = builder.ensure_signature(QueryInfo {
 					def_id: function,
 					requested_at: None,
@@ -9585,7 +10072,9 @@ pub(super) mod tests {
 				));
 				assert!(matches!(
 					builder.types.resolve(
-						builder.types.list(builder.functions[0].param_types)[0]
+						builder.types.list(
+							builder.functions[function_index].param_types
+						)[0]
 					),
 					Type::Enum { .. }
 				));
@@ -9593,7 +10082,7 @@ pub(super) mod tests {
 					def_id: enumeration,
 					requested_at: None,
 				});
-				assert_eq!(builder.enums[0].repr, TypeIndex::I32);
+				assert_eq!(builder.enums[enum_index].repr, TypeIndex::I32);
 				assert!(
 					builder.diagnostics.is_empty(),
 					"{:?}",
@@ -9688,7 +10177,7 @@ pub(super) mod tests {
 			let signature = &case.context.constants[usize::from(const_index)];
 			assert_eq!(
 				(signature.ty, signature.env),
-				(color, TypeEnvIdx::ROOT),
+				(color, GenericEnvIdx::ROOT),
 				"{path}"
 			);
 		}
@@ -9800,11 +10289,11 @@ pub(super) mod tests {
 			mut case = indoc! {"
 			trait Container {
 				type SelfType = Self;
-				type Item = Self::Other;
+				type Item: StackValue = Self::Other;
 				type Other;
 			}
 			struct Wrapper<T>();
-			impl<T> Container for Wrapper<T> { type Other = T; }
+			impl<T: StackValue> Container for Wrapper<T> { type Other = T; }
 			func self_type(x: <Wrapper<i32> as Container>::SelfType) {}
 			func item(x: <Wrapper<i32> as Container>::Item) {}
 			func abstract_item<T: Container>(x: T::Item) {}
@@ -9901,7 +10390,7 @@ pub(super) mod tests {
 			));
 			assert!(matches!(
 				case.context.normalize(
-					scope,
+					case.context.assumption_envs.of_frame(scope),
 					written,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL
@@ -9919,7 +10408,7 @@ pub(super) mod tests {
 		// although judging `V::B` reaches `V::B` again.
 		const DECLS: &str = "
 			trait Tr { type A: Tr2 where { B = <V as Tr2>::B }; }
-			trait Tr2 { type B; }
+			trait Tr2 { type B: StackValue; }
 			struct W();
 			struct V();
 		";
@@ -9991,7 +10480,7 @@ pub(super) mod tests {
 		// answer holds only while the loop is open. From the top it is `u32`.
 		test_case!(
 			mut case = "
-				trait Tr { type A; }
+				trait Tr { type A: StackValue; }
 				trait Tr2 { type B; }
 				struct W();
 				impl Tr2 for W { type B = u32; }
@@ -10013,8 +10502,8 @@ pub(super) mod tests {
 		// reads none of it, so its answer is cached for later requests.
 		test_case!(
 			case = "
-				trait Tr { type A: Tr; }
-				func f<T: Tr where { A = V }, V: Tr>(x: <<T as Tr>::A as Tr>::A) {}
+				trait Tr { type A: Tr + StackValue; }
+				func f<T: Tr where { A = V }, V: Tr + StackValue>(x: <<T as Tr>::A as Tr>::A) {}
 			"
 		);
 		case.diagnostics().assert_none();
@@ -10190,7 +10679,7 @@ pub(super) mod tests {
 					let key = BindingKey::new(Tier::Value, name);
 					let MemberLookup::Found(member) = builder
 						.resolve_applicable_member(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							receiver,
 							key,
 							reference,
@@ -10236,7 +10725,7 @@ pub(super) mod tests {
 					let qualified = builder
 						.resolve_trait_qualified_value(
 							&mut Vec::new(),
-							TypeEnvIdx::ROOT,
+							GenericEnvIdx::ROOT,
 							receiver,
 							trait_index,
 							Spanned {
@@ -10259,7 +10748,7 @@ pub(super) mod tests {
 				// become a projection with a provider index as its identity.
 				assert!(matches!(
 					builder.resolve_applicable_member(
-						TypeEnvIdx::ROOT,
+						AssumptionEnvIdx::ROOT,
 						receiver,
 						BindingKey::ty(builder.strings.get("Extra").unwrap()),
 						reference
@@ -10280,7 +10769,7 @@ pub(super) mod tests {
 					builder
 						.resolve_trait_qualified_value(
 							&mut Vec::new(),
-							TypeEnvIdx::ROOT,
+							GenericEnvIdx::ROOT,
 							receiver,
 							trait_index,
 							Spanned {
@@ -10330,7 +10819,7 @@ pub(super) mod tests {
 				));
 				assert_eq!(
 					case.context.normalize(
-						scope,
+						case.context.assumption_envs.of_frame(scope),
 						written,
 						NormalizationDepth::Deep,
 						RewriteFlags::ALL
@@ -10822,37 +11311,42 @@ pub(super) mod tests {
 		else {
 			panic!("expected exactly two parameters");
 		};
-		let Type::Slice {
-			of,
+		let &Type::Pointer {
+			to,
 			memory,
 			ownership,
 		} = case.context.types.resolve(slice_type)
 		else {
-			panic!("expected `s` to resolve to a slice type");
+			panic!("expected `s` to resolve to a pointer");
 		};
-		assert_eq!(*of, TypeIndex::U32);
-		assert_eq!(*ownership, ast::Ownership::Shared);
 		assert_eq!(
-			case.context.types.resolve(*memory),
+			case.context.types.resolve(to),
+			&Type::Slice { of: TypeIndex::U32 }
+		);
+		assert_eq!(ownership, ast::Ownership::Shared);
+		assert_eq!(
+			case.context.types.resolve(memory),
 			&Type::Memory { memory_index }
 		);
-		let Type::Array {
-			of,
-			length,
+		let &Type::Pointer {
+			to,
 			memory,
 			ownership,
 		} = case.context.types.resolve(array_type)
 		else {
-			panic!("expected `a` to resolve to an array type");
+			panic!("expected `a` to resolve to a pointer");
 		};
-		assert_eq!(*of, TypeIndex::U32);
+		let Type::Array { of, length } = *case.context.types.resolve(to) else {
+			panic!("expected `a` to point at an array");
+		};
+		assert_eq!(of, TypeIndex::U32);
 		assert_eq!(
-			case.context.types.resolve(*length),
+			case.context.types.resolve(length),
 			&Type::Value { bits: 4 }
 		);
-		assert_eq!(*ownership, ast::Ownership::Exclusive);
+		assert_eq!(ownership, ast::Ownership::Exclusive);
 		assert_eq!(
-			case.context.types.resolve(*memory),
+			case.context.types.resolve(memory),
 			&Type::Memory { memory_index }
 		);
 	}
@@ -10927,20 +11421,13 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_generic_memory_for_pointers_slices_and_arrays() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             func test<M: Memory>(
                 value: M,
                 ptr: M::*u8,
                 slice: M::&[u8],
                 array: M::*[u8; 4],
             ) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -10956,15 +11443,29 @@ pub(super) mod tests {
 				ownership: ast::Ownership::Exclusive
 			}
 		);
+		let Type::Pointer { to: slice, .. } =
+			*case.context.types.resolve(params[2])
+		else {
+			panic!("expected a pointer");
+		};
+		assert_eq!(
+			case.context.types.resolve(slice),
+			&Type::Slice { of: TypeIndex::U8 }
+		);
 		assert_eq!(
 			case.context.types.resolve(params[2]),
-			&Type::Slice {
-				of: TypeIndex::U8,
+			&Type::Pointer {
+				to: slice,
 				memory: params[0],
 				ownership: ast::Ownership::Shared
 			}
 		);
-		let Type::Array { length, .. } = *case.context.types.resolve(params[3])
+		let Type::Pointer { to: array, .. } =
+			*case.context.types.resolve(params[3])
+		else {
+			panic!("expected a pointer");
+		};
+		let Type::Array { length, .. } = *case.context.types.resolve(array)
 		else {
 			panic!("expected an array");
 		};
@@ -10974,9 +11475,8 @@ pub(super) mod tests {
 		);
 		assert_eq!(
 			case.context.types.resolve(params[3]),
-			&Type::Array {
-				of: TypeIndex::U8,
-				length,
+			&Type::Pointer {
+				to: array,
 				memory: params[0],
 				ownership: ast::Ownership::Exclusive
 			}
@@ -10986,18 +11486,12 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_requires_a_bound_and_accepts_a_memory_supertrait() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
+			case = indoc! {"
             trait SpecialMemory: Memory {}
 
-            func unbounded<M>(value: M, ptr: M::*u8) {}
+            func unbounded<M: StackValue>(value: M, ptr: M::*u8) {}
 
             func inherited<M: SpecialMemory>(value: M, ptr: M::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11036,19 +11530,12 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_a_generic_associated_type_bounded_by_memory() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             trait Container {
                 type Mem: Memory;
             }
 
             func test<T: Container>(value: T::Mem, ptr: T::Mem::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11073,17 +11560,10 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_self_with_a_memory_supertrait() {
 		test_case!(
-			std case = indoc! {"
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             trait Tagged: Memory {
                 func test(value: Self, ptr: Self::*u8);
             }
-        pub trait Call { type Args; type Result; } pub trait Function: Call {}
-        type u32;
-        enum Bool(u8) { False = 0, True = 1 }
-        struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11104,13 +11584,9 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_accepts_struct_impls_and_concrete_associated_types() {
 		test_case!(
-			std mut case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			mut case = indoc! {"
             struct Heap();
-            impl Memory for Heap {}
+            impl Memory for Heap { type Size = u32; const DATA_END: Self::*u8 = transmute::<u32, Self::*u8>(0); }
 
             trait Container {
                 type Mem: Memory;
@@ -11125,9 +11601,6 @@ pub(super) mod tests {
             func direct(ptr: Heap::*u8) {}
 
             func associated(value: Holder::Mem, ptr: Holder::Mem::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11151,20 +11624,13 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_resolves_generic_arguments_and_checks_impl_requirements() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             struct Heap<M>();
-            impl<M: Memory> Memory for Heap<M> {}
+            impl<M: Memory> Memory for Heap<M> { type Size = u32; const DATA_END: Self::*u8 = transmute::<u32, Self::*u8>(0); }
 
             func bounded<M: Memory>(value: Heap<M>, ptr: Heap<M>::*u8) {}
 
             func unbounded<M>(ptr: Heap<M>::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11249,7 +11715,7 @@ pub(super) mod tests {
 
             memory M: u32;
 
-            func test<M>(value: M, ptr: M::*u8) {}
+            func test<M: StackValue>(value: M, ptr: M::*u8) {}
         "}
 		);
 		case.diagnostics()
@@ -11315,7 +11781,7 @@ pub(super) mod tests {
             trait Memory {}
 
             trait Container {
-                type Mem;
+                type Mem: StackValue;
             }
 
             func test<T: Container>(value: T::Mem, ptr: T::Mem::*u8) {}
@@ -11345,12 +11811,8 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_membership_waits_for_associated_equalities() {
 		test_case!(
-			std mut case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            type u32;
-            trait Memory {}
-            impl Memory for u32 {}
+			mut case = indoc! {"
+            impl Memory for u32 { type Size = u32; const DATA_END: Self::*u8 = transmute::<u32, Self::*u8>(0); }
 
             trait Container {
                 type Item;
@@ -11360,8 +11822,6 @@ pub(super) mod tests {
                 T: Container where { Item = U::Item::*u8 },
                 U: Container where { Item = u32 },
             >(ptr: T::Item) {}
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics().assert_none();
@@ -11414,11 +11874,7 @@ pub(super) mod tests {
 	#[test]
 	fn memory_tag_with_a_failed_projection_preserves_the_pointer() {
 		test_case!(
-			std case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			case = indoc! {"
             trait Container {
                 type Item;
             }
@@ -11429,11 +11885,8 @@ pub(super) mod tests {
 
             func test<
                 T: Container where { Item = <U as Project>::Output },
-                U,
+                U: StackValue,
             >(value: U, ptr: T::Item::*u8) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11464,11 +11917,7 @@ pub(super) mod tests {
 	fn memory_tag_deferred_projection_failure_preserves_its_surrounding_pointer()
 	 {
 		test_case!(
-			std mut case = indoc! {"
-            pub trait Call { type Args; type Result; } pub trait Function: Call {}
-            type u8;
-            trait Memory {}
-
+			mut case = indoc! {"
             trait Container {
                 type Item;
             }
@@ -11480,11 +11929,8 @@ pub(super) mod tests {
             func test<
                 T: Container where { Item = V::Item::*u8 },
                 V: Container where { Item = <U as Project>::Output },
-                U,
+                U: StackValue,
             >(value: U, ptr: T::Item) {}
-            type u32;
-            enum Bool(u8) { False = 0, True = 1 }
-            struct Char(value: u32);
         "}
 		);
 		case.diagnostics()
@@ -11548,7 +11994,9 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_untyped_self_param_resolves_to_the_traits_own_self() {
-		test_case!(case = "trait Foo { func get(self: Self) -> Self; } ");
+		test_case!(
+			case = "trait Foo: StackValue { func get(self: Self) -> Self; } "
+		);
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -11622,7 +12070,10 @@ pub(super) mod tests {
 	{
 		test_case!(
 			case = indoc! {"
-			trait Service { func get(self: Self) -> Self; func make(x: Self) -> Self; }
+			trait Service: StackValue {
+				func get(self: Self) -> Self;
+				func make(x: Self) -> Self;
+			}
 			struct S();
 			impl Service for S {
 				func get(self: Self) -> Self { self }
@@ -11655,18 +12106,18 @@ pub(super) mod tests {
 	fn trait_impl_member_generics_inherit_the_impl_scope_and_allow_shadowing() {
 		test_case!(
 			case = indoc! {"
-			typeset Number { i32 }
-			trait Service {
-				type Item;
-				func get<U>(self: Self, x: Self::Item, y: U) -> Self;
-				func shadow<T>(self: Self, x: T) -> Self;
+			typeset Number: StackValue { i32 }
+			trait Service: StackValue {
+				type Item: StackValue;
+				func get<U: StackValue>(self: Self, x: Self::Item, y: U) -> Self;
+				func shadow<T: StackValue>(self: Self, x: T) -> Self;
 				const VALUE: Self::Item;
 			}
 			struct Wrap<T>();
 			impl<T: Number> Service for Wrap<T> {
 				type Item = T;
-				func get<U>(self: Self, x: T, y: U) -> Self { self }
-				func shadow<T>(self: Self, x: T) -> Self { self }
+				func get<U: StackValue>(self: Self, x: T, y: U) -> Self { self }
+				func shadow<T: StackValue>(self: Self, x: T) -> Self { self }
 				const VALUE: T = 0;
 			}
 		"}
@@ -11680,7 +12131,8 @@ pub(super) mod tests {
 		let header = case.context.trait_impls[usize::from(impl_index)]
 			.as_ref()
 			.unwrap();
-		let outer = case.context.type_envs.param_types(header.type_params)[0];
+		let outer =
+			case.context.generic_envs.param_types(header.type_params)[0];
 		let get = case.trait_impl_function_signature("Wrap", "Service", "get");
 		assert_eq!(
 			case.context.types.list(get.param_types)[0],
@@ -11689,11 +12141,11 @@ pub(super) mod tests {
 		assert_eq!(case.context.types.list(get.param_types)[1], outer);
 		assert_eq!(
 			case.context.types.list(get.param_types)[2],
-			case.context.type_envs.param_types(get.type_params)[0]
+			case.context.generic_envs.param_types(get.type_params)[0]
 		);
 		assert_eq!(get.return_type, header.target.inner);
 		assert_eq!(
-			case.context.type_envs.parent(get.type_params),
+			case.context.generic_envs.parent(get.type_params),
 			Some(header.type_params)
 		);
 		let shadow =
@@ -11719,7 +12171,7 @@ pub(super) mod tests {
 			impl Marker for i32 {}
 			trait Container { type Item; }
 			struct Need<T: Marker>();
-			trait Service {
+			trait Service: StackValue {
 				type Item: Marker;
 				func get<U: Container where { Item = i32 }>(self: Self, x: Need<Self::Item>, y: Need<U::Item>);
 			}
@@ -11761,7 +12213,7 @@ pub(super) mod tests {
 			impl Marker for i32 {}
 			struct Need<T: Marker>();
 			trait Container { type A; type B; }
-			trait Service {
+			trait Service: StackValue {
 				func get<U: Container where { A = Need<U::B>, B = i32 }>(self: Self, x: U::A);
 			}
 			struct S();
@@ -11796,7 +12248,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			trait Marker {}
 			struct Need<T: Marker>();
-			trait Service { func get(self: Self, x: i32); const VALUE: i32; }
+			trait Service: StackValue { func get(self: Self, x: i32); const VALUE: i32; }
 			struct S();
 			impl Service for S {
 				func get(self: Self, x: Need<i32>) {}
@@ -11850,7 +12302,10 @@ pub(super) mod tests {
 		// Stored as `Self::Item`, declared after the constant; it means `i32`.
 		let written =
 			case.trait_impl_const_signature("S", "Service", "VALUE").ty;
-		assert_eq!(case.normalized(TypeEnvIdx::ROOT, written), TypeIndex::I32);
+		assert_eq!(
+			case.normalized(GenericEnvIdx::ROOT, written),
+			TypeIndex::I32
+		);
 	}
 
 	#[test]
@@ -11889,7 +12344,10 @@ pub(super) mod tests {
 	fn invalid_trait_impl_member_annotations_are_diagnosed_without_panicking() {
 		test_case!(
 			case = indoc! {"
-			trait Service { func get(self: Self, x: i32, y: i32) -> i32; const VALUE: i32; }
+			trait Service: StackValue {
+				func get(self: Self, x: i32, y: i32) -> i32;
+				const VALUE: i32;
+			}
 			struct S();
 			impl Service for S {
 				func get(self: Self, x, y: _) -> _ {}
@@ -11938,23 +12396,29 @@ pub(super) mod tests {
 	#[test]
 	fn trait_impl_member_requests_force_the_parent_header() {
 		for method_first in [false, true] {
-			with_pending_std_signatures(
+			with_pending_signatures(
 				indoc! {"
-				type i32;
-				trait Service { func get(self: Self) -> Self; const VALUE: i32; }
+				trait Service: StackValue { func get(self: Self) -> Self; const VALUE: i32; }
 				struct S();
 				impl Service for S { func get(self: Self) -> Self { self } const VALUE: i32 = 0; }
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 			"},
 				|builder| {
+					let file_id = builder
+						.defs
+						.structs
+						.iter()
+						.find(|def| {
+							builder.strings.resolve(def.name.inner) == Some("S")
+						})
+						.unwrap()
+						.file_id;
 					let member = builder
 						.ast_nodes
 						.iter()
 						.find(|entry| {
+							if entry.file_id != file_id {
+								return false;
+							}
 							if method_first {
 								matches!(
 									entry.node,
@@ -11973,6 +12437,7 @@ pub(super) mod tests {
 						builder
 							.ast_nodes
 							.iter()
+							.filter(|entry| entry.file_id == file_id)
 							.find_map(|entry| match entry.node {
 								AstNodeRef::TraitImplBlock {
 									block_index,
@@ -12010,7 +12475,9 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_trait_functions_own_generic_param_is_distinct_from_self() {
-		test_case!(case = "trait Foo { func get<T>(self: Self, x: T) -> T; } ");
+		test_case!(
+			case = "trait Foo: StackValue { func get<T: StackValue>(self: Self, x: T) -> T; } "
+		);
 
 		assert!(
 			case.context.diagnostics.is_empty(),
@@ -12111,7 +12578,7 @@ pub(super) mod tests {
 	fn a_trait_consts_type_can_reference_self() {
 		test_case!(
 			case = indoc! {"
-			trait Foo {
+			trait Foo: StackValue {
 				const X: Self;
 				func get(self: Self) -> Self;
 			}
@@ -12178,10 +12645,13 @@ pub(super) mod tests {
 		assert_eq!(bounds[0].bindings.len(), 1);
 		assert!(matches!(
 			bounds[0].bindings[0].kind,
-			BindingRequirement::Equals(Spanned {
-				inner: TypeIndex::I32,
-				..
-			})
+			BindingRequirement::Equals(
+				_,
+				Spanned {
+					inner: TypeIndex::I32,
+					..
+				}
+			)
 		));
 	}
 
@@ -12220,10 +12690,13 @@ pub(super) mod tests {
 		let env = case.function_signature("f").type_params;
 		assert!(matches!(
 			case.declared_bounds(env, 0)[0].bindings[0].kind,
-			BindingRequirement::Equals(Spanned {
-				inner: TypeIndex::I32,
-				..
-			})
+			BindingRequirement::Equals(
+				_,
+				Spanned {
+					inner: TypeIndex::I32,
+					..
+				}
+			)
 		));
 		assert_eq!(case.normalized_param("f", 0), TypeIndex::I32);
 	}
@@ -12302,7 +12775,7 @@ pub(super) mod tests {
 	fn a_traits_own_associated_type_wins_over_a_supertraits() {
 		test_case!(
 			mut case = indoc! {"
-			trait Base { type Item; }
+			trait Base { type Item: StackValue; }
 			trait Derived: Base { type Item; }
 			func f<T: Derived where { Item = u32 }>(
 				own: <T as Derived>::Item,
@@ -12498,12 +12971,37 @@ pub(super) mod tests {
 		);
 	}
 
+	/// A supertrait equality whose value reads the trait's own member derives
+	/// from the trait: without it, only the missing trait is reported.
+	#[test]
+	fn an_equality_reading_a_missing_trait_is_not_reported_again() {
+		test_case!(
+			case = indoc! {"
+			trait Base { type Item; }
+			trait Tr: Base where { Item = Self::Own } { type Own; }
+			impl Base for u8 { type Item = u8; }
+			impl Tr for u8 { type Own = u8; }
+			impl Base for u16 { type Item = u16; }
+			struct Needs<T: Tr>();
+			func ok(x: Needs<u8>) {}
+			func concrete(x: Needs<u16>) {}
+			func abstract<U: Base>(x: Needs<U>) {}
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `u16: Tr` is not satisfied");
+		case.diagnostics()
+			.assert_error_saying("the trait bound `U: Tr` is not satisfied");
+	}
+
 	#[test]
 	fn a_use_proves_a_nested_bound_on_the_projection() {
 		test_case!(
-			std case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; 
+			case = indoc! {"
 			trait HasItem { type Item; }
 			trait Outer { type Inner; }
 			impl HasItem for u64 { type Item = u8; }
@@ -12512,16 +13010,19 @@ pub(super) mod tests {
 			struct W<T: Outer where { Inner: HasItem where { Item = u8 } }>();
 			func ok(w: W<u8>) {}
 			func bad(w: W<Bool>) {}
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"}
 		);
 
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
-			"the trait bound `Bool: HasItem` is not satisfied",
+			"the trait bound `<Bool as Outer>::Inner: HasItem` is not satisfied",
+		);
+		let rendered = case.diagnostics().render();
+		assert!(
+			rendered
+				.contains("the trait `HasItem` is not implemented for `Bool`"),
+			"{rendered}"
 		);
 	}
 
@@ -12562,7 +13063,7 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
-			"type mismatch resolving `<u64 as HasItem>::Item == Bool`",
+			"type mismatch resolving `<u64 as HasItem>::Item == <T as Tr>::B`",
 		);
 	}
 
@@ -12585,7 +13086,8 @@ pub(super) mod tests {
 		let bounds = case.declared_bounds(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].bindings.len(), 1);
-		let BindingRequirement::Bound(rhs_bounds) = &bounds[0].bindings[0].kind
+		let BindingRequirement::Bound(_, rhs_bounds) =
+			&bounds[0].bindings[0].kind
 		else {
 			panic!("expected a `Bound` binding kind");
 		};
@@ -12661,7 +13163,8 @@ pub(super) mod tests {
 		);
 		let env = case.function_signature("copy").type_params;
 		let bounds = case.declared_bounds(env, 0);
-		let BindingRequirement::Equals(ty) = &bounds[0].bindings[0].kind else {
+		let BindingRequirement::Equals(_, ty) = &bounds[0].bindings[0].kind
+		else {
 			panic!("expected an `Equals` binding kind");
 		};
 		assert!(matches!(
@@ -12801,8 +13304,8 @@ pub(super) mod tests {
 	fn self_assoc_type_projects_through_the_traits_own_self() {
 		test_case!(
 			case = indoc! {"
-			trait Global {
-				type Value;
+			trait Global: StackValue {
+				type Value: StackValue;
 				func get(self: Self) -> Self::Value;
 			}
 		"}
@@ -12836,8 +13339,8 @@ pub(super) mod tests {
 	fn grouped_bracketed_self_type_projects_the_same_as_a_bare_path() {
 		test_case!(
 			case = indoc! {"
-			trait Global {
-				type Value;
+			trait Global: StackValue {
+				type Value: StackValue;
 				func get(self: Self) -> <Self>::Value;
 			}
 		"}
@@ -12868,7 +13371,7 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			trait A { type X; }
+			trait A { type X: StackValue; }
 			trait B { type X; }
 			func f<T: A + B>(x: <T as A>::X) { }
 		"}
@@ -12892,7 +13395,7 @@ pub(super) mod tests {
 	fn qualified_path_continues_projecting_after_its_first_segment() {
 		test_case!(
 			case = indoc! {"
-			trait B { type Y; }
+			trait B { type Y: StackValue; }
 			trait A { type X: B; }
 			func f<T: A>(x: <T as A>::X::Y) { }
 		"}
@@ -12940,7 +13443,7 @@ pub(super) mod tests {
 	{
 		test_case!(
 			case = indoc! {"
-			trait A { type X; }
+			trait A { type X: StackValue; }
 			trait B {}
 			func f<T: B>(x: <T as A>::X) { }
 		"}
@@ -13108,7 +13611,7 @@ pub(super) mod tests {
 		// The projection's value is a type parameter, only by way of the impl.
 		const DECLARATIONS: &str = "
 			trait Container { type Item; }
-			trait Element { type Value; }
+			trait Element { type Value: StackValue; }
 			struct Wrap<X>();
 			impl<X: Element> Container for Wrap<X> { type Item = X; }
 		";
@@ -13292,25 +13795,29 @@ pub(super) mod tests {
 		// verdict on the definition: reported at the definition, and the readers
 		// stay silent.
 		const SOURCE: &str = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type i32;
 			trait Project { type Out; }
 			struct Wrap<T>();
 			impl<T: Project> Project for Wrap<T> { type Out = T::Out; }
 			struct Leaf();
 			impl Project for Leaf { type Out = i32; }
 			impl Project for i32 { type Out = <Wrap<Wrap<Wrap<Wrap<Leaf>>>> as Project>::Out; }
-			func first(x: <i32 as Project>::Out) {}
-			func second(x: <i32 as Project>::Out) {}
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
+			func overflow_reader_first(x: <i32 as Project>::Out) {}
+			func overflow_reader_second(x: <i32 as Project>::Out) {}
 		"};
-		with_pending_std_signatures(SOURCE, |builder| {
+		with_pending_signatures(SOURCE, |builder| {
 			builder.solver.set_limit_for_test(3);
 			builder.sweep();
-			let readers = SOURCE.find("func first").unwrap();
+			let file_id = builder
+				.defs
+				.functions
+				.iter()
+				.find(|def| {
+					builder.strings.resolve(def.name.inner)
+						== Some("overflow_reader_first")
+				})
+				.unwrap()
+				.file_id;
+			let readers = SOURCE.find("func overflow_reader_first").unwrap();
 			let value_start = SOURCE.find("<Wrap<Wrap<").unwrap();
 			let value_end = value_start
 				+ SOURCE[value_start..].find("::Out;").unwrap()
@@ -13319,10 +13826,12 @@ pub(super) mod tests {
 				.diagnostics
 				.iter()
 				.filter(|diagnostic| {
-					diagnostic.code.as_deref()
-						== Some(
-							DiagnosticCode::TypeNormalizationOverflow.code(),
-						)
+					diagnostic.labels[0].file_id == file_id
+						&& diagnostic.code.as_deref()
+							== Some(
+								DiagnosticCode::TypeNormalizationOverflow
+									.code(),
+							)
 				})
 				.collect();
 			// The value itself reports once (its path's own membership check is
@@ -13431,7 +13940,7 @@ pub(super) mod tests {
 		assert!(!values.is_empty());
 		for written in values {
 			assert_eq!(
-				case.normalized(TypeEnvIdx::ROOT, written),
+				case.normalized(GenericEnvIdx::ROOT, written),
 				TypeIndex::U32
 			);
 		}
@@ -13490,14 +13999,18 @@ pub(super) mod tests {
 					});
 				assert_eq!(
 					builder.normalize_head(
-						TypeEnvIdx::ROOT,
+						AssumptionEnvIdx::ROOT,
 						projection,
 						reference
 					),
 					tuple
 				);
 				assert_eq!(
-					builder.normalize_head(TypeEnvIdx::ROOT, tuple, reference),
+					builder.normalize_head(
+						AssumptionEnvIdx::ROOT,
+						tuple,
+						reference
+					),
 					tuple
 				);
 				// The stored value contains the projection that reads it: a cycle.
@@ -13505,7 +14018,7 @@ pub(super) mod tests {
 				// asked owns the report.
 				assert!(matches!(
 					builder.normalize(
-						TypeEnvIdx::ROOT,
+						AssumptionEnvIdx::ROOT,
 						projection,
 						NormalizationDepth::Deep,
 						RewriteFlags::ALL
@@ -13519,7 +14032,7 @@ pub(super) mod tests {
 				);
 				assert_eq!(
 					builder.normalize(
-						TypeEnvIdx::ROOT,
+						AssumptionEnvIdx::ROOT,
 						TypeIndex::I32,
 						NormalizationDepth::Deep,
 						RewriteFlags::ALL
@@ -13564,7 +14077,7 @@ pub(super) mod tests {
 						});
 					assert_eq!(
 						builder.normalize_head(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							projection,
 							reference
 						),
@@ -13572,7 +14085,7 @@ pub(super) mod tests {
 					);
 					assert_eq!(
 						builder.normalize_type(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							projection,
 							reference
 						),
@@ -13585,7 +14098,11 @@ pub(super) mod tests {
 					assoc_type_index: declaration,
 				});
 				assert_eq!(
-					builder.normalize_type(TypeEnvIdx::ROOT, error, reference),
+					builder.normalize_type(
+						AssumptionEnvIdx::ROOT,
+						error,
+						reference
+					),
 					TypeIndex::ERROR
 				);
 				assert!(
@@ -13679,33 +14196,23 @@ pub(super) mod tests {
 						builder.types.intern(Type::Array {
 							of: projection,
 							length: seven,
-							memory: projection,
-							ownership: Ownership::Exclusive,
 						}),
 						builder.types.intern(Type::Array {
 							of: TypeIndex::I32,
 							length: seven,
-							memory: TypeIndex::I32,
-							ownership: Ownership::Exclusive,
 						}),
 					),
 					(
-						builder.types.intern(Type::Slice {
-							of: projection,
-							memory: projection,
-							ownership: Ownership::Shared,
-						}),
-						builder.types.intern(Type::Slice {
-							of: TypeIndex::I32,
-							memory: TypeIndex::I32,
-							ownership: Ownership::Shared,
-						}),
+						builder.types.intern(Type::Slice { of: projection }),
+						builder
+							.types
+							.intern(Type::Slice { of: TypeIndex::I32 }),
 					),
 				];
 				for (before, after) in cases {
 					assert_eq!(
 						builder.normalize_head(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							before,
 							reference
 						),
@@ -13713,7 +14220,7 @@ pub(super) mod tests {
 					);
 					assert_eq!(
 						builder.normalize_type(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							before,
 							reference
 						),
@@ -13721,7 +14228,7 @@ pub(super) mod tests {
 					);
 					assert_eq!(
 						builder.normalize_type(
-							TypeEnvIdx::ROOT,
+							AssumptionEnvIdx::ROOT,
 							after,
 							reference
 						),
@@ -13757,7 +14264,11 @@ pub(super) mod tests {
 					.types
 					.intern_tuple(&[TypeIndex::I32, TypeIndex::I32]);
 				assert_eq!(
-					builder.normalize_type(TypeEnvIdx::ROOT, pair, reference),
+					builder.normalize_type(
+						AssumptionEnvIdx::ROOT,
+						pair,
+						reference
+					),
 					expected
 				);
 				assert!(
@@ -13767,6 +14278,56 @@ pub(super) mod tests {
 				);
 			},
 		);
+	}
+
+	#[test]
+	fn pointer_metadata_uses_the_normalization_budget_and_cache() {
+		checked_case!(mut case = "memory heap: u32;");
+		case.diagnostics().assert_none();
+		let DefKind::Memory(memory_index) = case.resolve(Tier::Type, "heap")
+		else {
+			unreachable!()
+		};
+		let memory = case.context.types.intern(Type::Memory { memory_index });
+		let mut pointee = TypeIndex::U8;
+		for _ in 0..8 {
+			pointee = case.context.types.intern(Type::Slice { of: pointee });
+		}
+
+		case.context.solver.set_limit_for_test(3);
+		assert_eq!(
+			case.context.pointer_metadata_value(
+				AssumptionEnvIdx::ROOT,
+				pointee,
+				memory,
+			),
+			Err(SolverError::Overflow),
+		);
+		assert!(case.context.solver.state.frames.is_empty());
+		assert!(case.context.solver.state.blocked_at.is_none());
+		assert_eq!(case.context.solver.state.recursion_budget, 3);
+
+		// Overflow is not cached: retrying with enough budget computes the
+		// eight counts. A finished answer then needs no budget to read again.
+		case.context.solver.set_limit_for_test(128);
+		let metadata = case
+			.context
+			.pointer_metadata_value(AssumptionEnvIdx::ROOT, pointee, memory)
+			.unwrap();
+		assert_eq!(
+			crate::tir::solver::metadata_len(&case.context.types, metadata),
+			8
+		);
+		case.context.solver.set_limit_for_test(0);
+		assert_eq!(
+			case.context.pointer_metadata_value(
+				AssumptionEnvIdx::ROOT,
+				pointee,
+				memory,
+			),
+			Ok(metadata),
+		);
+		case.diagnostics().assert_none();
 	}
 
 	#[test]
@@ -13788,7 +14349,11 @@ pub(super) mod tests {
 				nested = builder.types.intern_tuple(&[nested, TypeIndex::I32]);
 			}
 			assert_eq!(
-				builder.normalize_type(TypeEnvIdx::ROOT, nested, reference),
+				builder.normalize_type(
+					AssumptionEnvIdx::ROOT,
+					nested,
+					reference
+				),
 				TypeIndex::ERROR
 			);
 			assert_eq!(builder.diagnostics.len(), 1);
@@ -13798,7 +14363,7 @@ pub(super) mod tests {
 			);
 			assert_eq!(
 				builder.normalize_type(
-					TypeEnvIdx::ROOT,
+					AssumptionEnvIdx::ROOT,
 					TypeIndex::I32,
 					reference
 				),
@@ -13839,7 +14404,11 @@ pub(super) mod tests {
 					});
 				}
 				assert_eq!(
-					builder.normalize_type(TypeEnvIdx::ROOT, nested, reference),
+					builder.normalize_type(
+						AssumptionEnvIdx::ROOT,
+						nested,
+						reference
+					),
 					TypeIndex::ERROR
 				);
 				assert_eq!(builder.diagnostics.len(), 1);
@@ -13849,7 +14418,11 @@ pub(super) mod tests {
 				);
 				builder.solver.set_limit_for_test(128);
 				assert_eq!(
-					builder.normalize_type(TypeEnvIdx::ROOT, nested, reference),
+					builder.normalize_type(
+						AssumptionEnvIdx::ROOT,
+						nested,
+						reference
+					),
 					nested
 				);
 				assert_eq!(builder.diagnostics.len(), 1);
@@ -14107,9 +14680,7 @@ pub(super) mod tests {
 	#[test]
 	fn an_impl_requirement_proves_a_nested_bound() {
 		test_case!(
-			std case = indoc! {"
-			pub trait Call { type Args; type Result; } pub trait Function: Call {}
-			type u8; type u64; 
+			case = indoc! {"
 			trait HasItem { type Item; }
 			trait Outer { type Inner; }
 			impl HasItem for u64 { type Item = u8; }
@@ -14121,9 +14692,6 @@ pub(super) mod tests {
 			struct Need<X: Show>();
 			func ok(x: Need<W<u8>>) {}
 			func bad(x: Need<W<Bool>>) {}
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"}
 		);
 
@@ -14281,7 +14849,7 @@ pub(super) mod tests {
 		);
 		assert!(matches!(
 			case.context.normalize(
-				scope,
+				case.context.assumption_envs.of_frame(scope),
 				written,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL
@@ -14320,7 +14888,7 @@ pub(super) mod tests {
 	}
 
 	/// Regression test: `TraitAssocType`'s own arm used to resolve at
-	/// `TypeEnvId::ROOT` instead of forcing the trait header and using its
+	/// `GenericEnvIdx::ROOT` instead of forcing the trait header and using its
 	/// `self_scope`, the way `TraitFunction`/`TraitConst` already did — so
 	/// `Self` silently failed to resolve inside a declared bound's own
 	/// `where { .. }` clause (`type Item: Elem where { Assoc = Self::Item }`
@@ -14344,7 +14912,7 @@ pub(super) mod tests {
 		let sig = case.assoc_type_signature("Container", "Item");
 		let bound = case.context.bounds.get(sig.declared_bounds[0]);
 		let SourceAssocBinding {
-			kind: BindingRequirement::Equals(value),
+			kind: BindingRequirement::Equals(_, value),
 			..
 		} = &bound.bindings[0]
 		else {
@@ -14384,7 +14952,7 @@ pub(super) mod tests {
 	fn a_bound_generic_params_associated_type_projects_through_the_bound() {
 		test_case!(
 			case = indoc! {"
-			trait HasSize { type Size; }
+			trait HasSize { type Size: StackValue; }
 			func f<T: HasSize>(x: T::Size) -> T::Size { x }
 		"}
 		);
@@ -14455,7 +15023,7 @@ pub(super) mod tests {
 	/// = u64> {}`, `func f<T: B + C>() {}`): rejected immediately with
 	/// `E0284`, zero uses of `T` anywhere past the bound list — bound
 	/// well-formedness is checked once at declaration, not deferred to
-	/// first use. wx matches that here (see `ParamBounds::clauses`);
+	/// first use. wx matches that here (see `bounds::AssumptionEnv`);
 	/// `a_functions_unused_bound_combination_with_conflicting_assoc_type_bindings_is_still_diagnosed`
 	/// below re-checks the fully-unused case, which the old
 	/// lazy-on-first-projection design let compile silently.
@@ -14464,7 +15032,7 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			trait A { type X; }
+			trait A { type X: StackValue; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
 			func f<T: B + C>(x: T::X) { }
@@ -14591,7 +15159,7 @@ pub(super) mod tests {
 	fn conflicting_binding_does_not_poison_another_associated_type() {
 		test_case!(
 			case = indoc! {"
-			trait A { type X; type Y; }
+			trait A { type X; type Y: StackValue; }
 			trait B: A where { X = u32 } {}
 			trait C: A where { X = u64 } {}
 			func f<T: B + C>(x: T::Y) {}
@@ -14683,14 +15251,15 @@ pub(super) mod tests {
 	/// to, one list per projection, in clause order.
 	fn equality_values(
 		case: &TestCase,
-		env: TypeEnvIdx,
+		env: GenericEnvIdx,
 	) -> Vec<Vec<TypeIndex>> {
-		let clauses = case.context.param_bounds[usize::from(env)][0].clauses;
+		let clauses = case.context.assumption_envs.requirements(env);
 		let mut groups: Vec<(TypeIndex, Vec<TypeIndex>)> = Vec::new();
 		for clause in case
 			.context
 			.clauses
-			.equalities(clauses.equalities.resolved())
+			.equalities(clauses.resolved())
+			.collect::<Vec<_>>()
 		{
 			match groups
 				.iter_mut()
@@ -14773,15 +15342,22 @@ pub(super) mod tests {
 			let env = case.context.traits
 				[usize::from(case.trait_index(trait_name))]
 			.env;
-			let bounds = &case.context.param_bounds[usize::from(env)][0];
+			let clauses = case.context.assumption_envs.requirements(env);
 			let membership = case
 				.context
 				.clauses
-				.traits(bounds.clauses.traits)
-				.iter()
+				.traits(clauses.range())
 				.find(|clause| clause.trait_index == case.trait_index("A"))
 				.unwrap();
-			assert_eq!(membership.source, bounds.declared_bounds[0]);
+			let subject = case.context.generic_envs.param_types(env)[0];
+			let written = written_bounds(
+				&case.context.types,
+				&case.context.assumption_envs,
+				&case.context.clauses,
+				env,
+				subject,
+			);
+			assert_eq!(membership.source, written[0]);
 			assert_eq!(equality_values(&case, env), [vec![TypeIndex::U32]]);
 		}
 	}
@@ -14813,8 +15389,8 @@ pub(super) mod tests {
 			trait Base { type Item; }
 			trait Middle: Base where { Item = Self } {}
 			trait Final: Middle {}
-			func f<T: Final>(x: T::Item) {}
-			func g<U: Final>(x: U::Item) {}
+			func f<T: StackValue + Final>(x: T::Item) {}
+			func g<U: StackValue + Final>(x: U::Item) {}
 		"}
 		);
 		assert!(
@@ -14876,7 +15452,7 @@ pub(super) mod tests {
 			trait Outer { type Item; }
 			trait Middle: Outer where { Item: Inner where { Value = Self } } {}
 			trait Final: Middle {}
-			func f<T: Final>(x: T::Item::Value) {}
+			func f<T: StackValue + Final>(x: T::Item::Value) {}
 		"}
 		);
 		assert!(
@@ -14897,7 +15473,7 @@ pub(super) mod tests {
 			mut case = indoc! {"
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner where { Value = Self }; }
-			func f<T: Outer>(x: T::Item::Value) {}
+			func f<T: StackValue + Outer>(x: T::Item::Value) {}
 		"}
 		);
 		assert!(
@@ -14962,8 +15538,8 @@ pub(super) mod tests {
 			trait SignedInt { type Unsigned: UnsignedInt where { Signed = Self }; }
 			impl UnsignedInt for u8 { type Signed = i8; }
 			impl SignedInt for i8 { type Unsigned = u8; }
-			func f<T: UnsignedInt>(x: <T::Signed as SignedInt>::Unsigned) {}
-			func g<T: SignedInt>(x: <T::Unsigned as UnsignedInt>::Signed) {}
+			func f<T: StackValue + UnsignedInt>(x: <T::Signed as SignedInt>::Unsigned) {}
+			func g<T: StackValue + SignedInt>(x: <T::Unsigned as UnsignedInt>::Signed) {}
 			func concrete(x: <u8 as UnsignedInt>::Signed::Unsigned) {}
 		"}
 		);
@@ -14987,7 +15563,7 @@ pub(super) mod tests {
 	 {
 		test_case!(
 			case = indoc! {"
-			trait Pair { type First; type Second; }
+			trait Pair { type First: StackValue; type Second: StackValue; }
 			func tautology<T: Pair where { First = T::First }>(x: T::First) {}
 			func mutual<T: Pair where { First = T::Second, Second = T::First }>(x: T::First, y: T::Second) {}
 			func structural<T: Pair where { First = (T::First, T::First) }>(x: T::First) {}
@@ -15016,8 +15592,8 @@ pub(super) mod tests {
 	fn normalization_leaves_competing_symbolic_equalities_unresolved() {
 		test_case!(
 			case = indoc! {"
-			trait Container { type Item; }
-			func f<T: Container where { Item = U } + Container where { Item = V }, U, V>(x: T::Item) {}
+			trait Container { type Item: StackValue; }
+			func f<T: Container where { Item = U } + Container where { Item = V }, U: StackValue, V: StackValue>(x: T::Item) {}
 			func equivalent<T: Container where { Item = U::Item } + Container where { Item = i32 }, U: Container where { Item = i32 }>(x: T::Item) {}
 		"}
 		);
@@ -15049,7 +15625,7 @@ pub(super) mod tests {
 					requested_at: None,
 				});
 				let env = builder.functions[0].type_params;
-				let base = builder.type_envs.param_types(env)[0];
+				let base = builder.generic_envs.param_types(env)[0];
 				let assoc_type_index =
 					match builder.defs.traits[0].members[0].kind {
 						MemberKind::AssociatedType(index) => index,
@@ -15060,22 +15636,23 @@ pub(super) mod tests {
 					trait_index: TraitIdx::new(0),
 					assoc_type_index,
 				});
-				let clauses = builder.param_bounds[usize::from(env)][0].clauses;
-				builder.param_bounds[usize::from(env)][0].clauses.equalities =
-					Equalities::Pending;
+				let assumption_env = builder.assumption_envs.of_frame(env);
+				let clauses = builder.assumption_envs.clauses(assumption_env);
+				*builder.assumption_envs.clauses_mut(assumption_env) =
+					BoundClauses::Provisional(clauses.range());
 				assert_eq!(
 					builder.normalize(
-						env,
+						builder.assumption_envs.of_frame(env),
 						projection,
 						NormalizationDepth::Deep,
 						RewriteFlags::ALL
 					),
 					Err(SolverError::Pending)
 				);
-				builder.param_bounds[usize::from(env)][0].clauses = clauses;
+				*builder.assumption_envs.clauses_mut(assumption_env) = clauses;
 				assert_eq!(
 					builder.normalize(
-						env,
+						builder.assumption_envs.of_frame(env),
 						projection,
 						NormalizationDepth::Deep,
 						RewriteFlags::ALL
@@ -15096,7 +15673,9 @@ pub(super) mod tests {
 			mut case = indoc! {"
 			trait Inner { type Value; }
 			trait Outer { type Item: Inner where { Value = Self }; }
-			func f<T: Outer where { Item: Inner where { Value = T } }>(x: T::Item::Value) {}
+			func f<T: StackValue + Outer where { Item: Inner where { Value = T } }>(
+				x: T::Item::Value,
+			) {}
 		"}
 		);
 		assert!(
@@ -15133,7 +15712,7 @@ pub(super) mod tests {
 	{
 		test_case!(
 			case = indoc! {"
-			trait Value { type Item; }
+			trait Value { type Item: StackValue; }
 			trait Pair {
 				type First: Value where { Item = Self::Second::Item };
 				type Second: Value where { Item = Self::First::Item };
@@ -15178,7 +15757,7 @@ pub(super) mod tests {
 			mut case = indoc! {"
 			trait Leaf { type Value; }
 			trait Branch { type Item; }
-			trait Marked: Branch where { Item: Leaf where { Value = Self } } {}
+			trait Marked: StackValue + Branch where { Item: Leaf where { Value = Self } } {}
 			trait Outer { type Branch: Marked; }
 			func f<T: Outer>(x: T::Branch::Item::Value, y: T::Branch) {}
 		"}
@@ -15212,7 +15791,8 @@ pub(super) mod tests {
 		for (name, t_index, u_index) in [("f", 1, 0), ("g", 0, 1)] {
 			let signature = case.function_signature(name);
 			let source = case.declared_bounds(signature.type_params, t_index);
-			let BindingRequirement::Equals(value) = source[0].bindings[0].kind
+			let BindingRequirement::Equals(_, value) =
+				source[0].bindings[0].kind
 			else {
 				panic!("expected equality");
 			};
@@ -15409,15 +15989,10 @@ pub(super) mod tests {
 
 		#[test]
 		fn swept_context_preserves_evidence_for_a_normalized_parameter() {
-			checked_case!(std mut case = indoc! {"
+			checked_case!(mut case = indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
-                func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
+                func f<T: Container where { Item = U } + Container where { Item: Marker }, U: StackValue>(x: T::Item) {}
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15427,7 +16002,8 @@ pub(super) mod tests {
 			let signature = case.function_signature("f");
 			let assumption_context = signature.type_params;
 			let written = case.context.types.list(signature.param_types)[0];
-			let params = case.context.type_envs.param_types(assumption_context);
+			let params =
+				case.context.generic_envs.param_types(assumption_context);
 			let (t, u) = (params[0], params[1]);
 			// The parameter is stored as `T::Item` and means `U`; the evidence
 			// about `T::Item` is kept as written.
@@ -15439,24 +16015,36 @@ pub(super) mod tests {
 			let stored = u;
 			let projection = case.context.types.intern(Type::TypeProjection {
 				base: t,
-				trait_index: TraitIdx::new(1),
-				assoc_type_index: AssocTypeIdx::new(0),
+				trait_index: case.trait_index("Container"),
+				assoc_type_index: match case.defs.traits
+					[usize::from(case.trait_index("Container"))]
+				.members[0]
+					.kind
+				{
+					MemberKind::AssociatedType(index) => index,
+					_ => unreachable!(),
+				},
 			});
 			assert!(
-				memberships(&case.context, assumption_context)
-					.contains(&(projection, TraitIdx::new(0)))
+				memberships(
+					&case.context,
+					case.context.assumption_envs.of_frame(assumption_context)
+				)
+				.contains(&(projection, case.trait_index("Marker")))
 			);
-			let clauses = case.context.param_bounds
-				[usize::from(assumption_context)][0]
-				.clauses;
+			let clauses = case
+				.context
+				.assumption_envs
+				.requirements(assumption_context);
 			let equalities = case
 				.context
 				.clauses
-				.equalities(clauses.equalities.resolved());
+				.equalities(clauses.resolved())
+				.collect::<Vec<_>>();
 			assert_eq!(equalities.len(), 1);
 			assert_eq!(equalities[0].projection, projection);
 			assert_eq!(equalities[0].value, stored);
-			let BindingRequirement::Equals(source) =
+			let BindingRequirement::Equals(_, source) =
 				case.context.bounds.binding(equalities[0].source).kind
 			else {
 				panic!()
@@ -15490,13 +16078,15 @@ pub(super) mod tests {
 			};
 			assert_eq!(case.context.types.list(*type_args), &[TypeIndex::I32]);
 			// ...while the stored clause keeps `U::Item` symbolic.
-			let clauses = case.context.param_bounds
-				[usize::from(assumption_context)][0]
-				.clauses;
+			let clauses = case
+				.context
+				.assumption_envs
+				.requirements(assumption_context);
 			let clause = case
 				.context
 				.clauses
-				.equalities(clauses.equalities.resolved())[0];
+				.equalities(clauses.resolved())
+				.collect::<Vec<_>>()[0];
 			let (raw, source) = (clause.value, clause.source);
 			let Type::Struct { type_args, .. } =
 				case.context.types.resolve(raw)
@@ -15509,7 +16099,7 @@ pub(super) mod tests {
 					.resolve(case.context.types.list(*type_args)[0]),
 				Type::TypeProjection { .. }
 			));
-			let BindingRequirement::Equals(value) =
+			let BindingRequirement::Equals(_, value) =
 				case.context.bounds.binding(source).kind
 			else {
 				panic!()
@@ -15519,7 +16109,7 @@ pub(super) mod tests {
 
 		fn memberships(
 			registry: &TypeContext<'_, '_, '_>,
-			assumption_context: TypeEnvIdx,
+			assumption_context: AssumptionEnvIdx,
 		) -> Vec<(TypeIndex, TraitIdx)> {
 			let tables = registry.clause_tables();
 			assert_eq!(
@@ -15531,8 +16121,8 @@ pub(super) mod tests {
 
 		#[test]
 		fn method_context_keeps_local_evidence_about_an_outer_parameter() {
-			checked_case!(std mut case = indoc! {"
-                trait Outer {}
+			checked_case!(mut case = indoc! {"
+                trait Outer: StackValue {}
                 trait Marker {}
                 trait Container { type Item; }
                 struct Host<T>();
@@ -15541,11 +16131,6 @@ pub(super) mod tests {
                     func plain(self: Self, x: T) {}
                 }
                 func free() {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15565,9 +16150,12 @@ pub(super) mod tests {
 			let scoped = function("scoped");
 			let plain = function("plain");
 			let free = function("free");
-			let outer_env =
-				case.context.inherent_impls[0].as_ref().unwrap().type_params;
-			let outer = case.context.type_envs.param_types(outer_env)[0];
+			let outer_env = case.context.inherent_impls
+				[usize::from(case.inherent_impl_index("Host"))]
+			.as_ref()
+			.unwrap()
+			.type_params;
+			let outer = case.context.generic_envs.param_types(outer_env)[0];
 			let assumption_context = case.context.functions[scoped].type_params;
 			assert_ne!(
 				assumption_context, outer_env,
@@ -15582,37 +16170,55 @@ pub(super) mod tests {
 			let plain_cx = case.context.functions[plain].type_params;
 			assert_eq!(
 				plain_cx,
-				case.context.inherent_impls[0].as_ref().unwrap().type_params
+				case.context.inherent_impls
+					[usize::from(case.inherent_impl_index("Host"))]
+				.as_ref()
+				.unwrap()
+				.type_params
 			);
 			let free_cx = case.context.functions[free].type_params;
-			assert_eq!(free_cx, TypeEnvIdx::ROOT);
-			let local = memberships(&case.context, assumption_context);
-			assert!(local.contains(&(outer, TraitIdx::new(0))));
-			assert!(local.iter().any(|&(_, index)| index == TraitIdx::new(1)));
-			assert_eq!(
-				memberships(&case.context, plain_cx),
-				vec![(outer, TraitIdx::new(0))]
+			assert_eq!(free_cx, GenericEnvIdx::ROOT);
+			let local = memberships(
+				&case.context,
+				case.context.assumption_envs.of_frame(assumption_context),
 			);
-			assert!(memberships(&case.context, free_cx).is_empty());
+			assert!(local.contains(&(outer, case.trait_index("Outer"))));
+			assert!(
+				local
+					.iter()
+					.any(|&(_, index)| index == case.trait_index("Marker"))
+			);
+			assert_eq!(
+				memberships(
+					&case.context,
+					case.context.assumption_envs.of_frame(plain_cx)
+				),
+				vec![
+					(outer, case.trait_index("Outer")),
+					(outer, case.context.defs.intrinsics.stack_value.unwrap())
+				]
+			);
+			assert!(
+				memberships(
+					&case.context,
+					case.context.assumption_envs.of_frame(free_cx)
+				)
+				.is_empty()
+			);
 		}
 
 		#[test]
 		fn trait_body_context_and_instantiated_declaration_bounds_survive_the_sweep()
 		 {
 			use crate::tir::types::Substitution;
-			checked_case!(std mut case = indoc! {"
+			checked_case!(mut case = indoc! {"
                 trait Project { type Output; }
-                trait Parent {}
+                trait Parent: StackValue {}
                 trait Child: Parent {
-                    type Item: Project where { Output = Self };
+					type Item: StackValue + Project where { Output = Self };
                     func provided(self: Self, x: Self::Item) {}
                 }
                 func user<T: Child>(x: T::Item) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "});
 			assert!(
 				case.context.diagnostics.is_empty(),
@@ -15629,8 +16235,9 @@ pub(super) mod tests {
 				})
 				.unwrap();
 			let assumption_context = case.context.functions[index].type_params;
-			let self_env = case.context.traits[2].env;
-			let trait_self = case.context.type_envs.param_types(self_env)[0];
+			let self_env =
+				case.context.traits[usize::from(case.trait_index("Child"))].env;
+			let trait_self = case.context.generic_envs.param_types(self_env)[0];
 			assert_eq!(assumption_context, self_env);
 			assert_eq!(
 				case.context
@@ -15638,24 +16245,32 @@ pub(super) mod tests {
 					.list(case.context.functions[index].param_types)[0],
 				trait_self
 			);
-			let facts = memberships(&case.context, assumption_context);
-			assert!(facts.contains(&(trait_self, TraitIdx::new(2))));
-			assert!(facts.contains(&(trait_self, TraitIdx::new(1))));
+			let facts = memberships(
+				&case.context,
+				case.context.assumption_envs.of_frame(assumption_context),
+			);
+			assert!(facts.contains(&(trait_self, case.trait_index("Child"))));
+			assert!(facts.contains(&(trait_self, case.trait_index("Parent"))));
 			let signature = case.function_signature("user");
 			let subject = case.context.types.list(signature.param_types)[0];
 			let receiver =
-				case.context.type_envs.param_types(signature.type_params)[0];
+				case.context.generic_envs.param_types(signature.type_params)[0];
 			// `Item`'s declaration states its equality with `Self` read as
 			// the receiver.
 			let tables = case.context.clause_tables();
-			let sources =
-				tables.declarations_of(&case.context.types, subject, 128);
+			let sources = tables.declarations_of(
+				&case.context.types,
+				case.context.assumption_envs.of_frame(signature.type_params),
+				subject,
+				128,
+			);
 			assert_eq!(sources.readiness, Readiness::Ready);
 			let mut equalities = Vec::new();
 			for source in sources {
 				for clause in tables
 					.clauses
-					.equalities(source.clauses.equalities.resolved())
+					.equalities(source.clauses.resolved())
+					.collect::<Vec<_>>()
 				{
 					equalities.push((clause.value, source.context.unwrap()));
 				}
@@ -15666,7 +16281,7 @@ pub(super) mod tests {
 			let rhs = case.context.types.substitute(
 				value,
 				Substitution {
-					envs: &case.context.type_envs,
+					envs: &case.context.generic_envs,
 					env: context.env,
 					args: &[context.receiver],
 				},
@@ -15682,20 +16297,44 @@ pub(super) mod tests {
 				" }".repeat(16)
 			);
 			let source = format!(
-				"trait Node {{ type Next: Node; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);",
+				"trait Node {{ type Next: Node + StackValue; }} trait Marker {{}} func f<T: Node where {{ {nested} }}, U: Node + StackValue>(x: T{path}) {{}}",
 				path = "::Next".repeat(16)
 			);
-			with_pending_std_signatures(&source, |builder| {
+			with_pending_signatures(&source, |builder| {
 				builder.sweep();
-				let env = builder.functions[0].type_params;
-				let ty =
-					builder.types.list(builder.functions[0].param_types)[0];
+				let function = builder
+					.defs
+					.functions
+					.iter()
+					.position(|def| {
+						builder.strings.resolve(def.name.inner) == Some("f")
+					})
+					.unwrap();
+				let marker = TraitIdx::new(
+					builder
+						.defs
+						.traits
+						.iter()
+						.position(|def| {
+							builder.strings.resolve(def.name.inner)
+								== Some("Marker")
+						})
+						.unwrap() as u32,
+				);
+				let env = builder.functions[function].type_params;
+				let ty = builder
+					.types
+					.list(builder.functions[function].param_types)[0];
 				builder.solver.set_limit_for_test(8);
 				// Overflow is returned as such, never folded into "not a member" or
 				// an error type; the site that asked owns the report.
 				assert_eq!(
 					builder
-						.find_trait_impl_query(env, ty, TraitIdx::new(1))
+						.find_trait_impl_query(
+							builder.assumption_envs.of_frame(env),
+							ty,
+							marker
+						)
 						.map(|found| found.is_some()),
 					Err(SolverError::Overflow)
 				);
@@ -15707,7 +16346,11 @@ pub(super) mod tests {
 				builder.solver.set_limit_for_test(128);
 				assert_eq!(
 					builder
-						.find_trait_impl_query(env, ty, TraitIdx::new(1))
+						.find_trait_impl_query(
+							builder.assumption_envs.of_frame(env),
+							ty,
+							marker
+						)
 						.map(|found| found.is_some()),
 					Ok(false)
 				);
@@ -15726,15 +16369,10 @@ pub(super) mod tests {
 		#[test]
 		fn equivalent_subjects_support_unqualified_and_qualified_members() {
 			checked_case!(
-				std case = indoc! {"
-                trait Project { type Output; }
+				case = indoc! {"
+                trait Project { type Output: StackValue; }
                 trait Container { type Item; }
                 func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output, y: <U as Project>::Output) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "}
 			);
 			assert!(
@@ -15758,11 +16396,13 @@ pub(super) mod tests {
 			else {
 				panic!("ordinary projection expected")
 			};
-			assert_eq!(*trait_index, TraitIdx::new(0));
-			assert_eq!(*assoc_type_index, AssocTypeIdx::new(0));
+			assert_eq!(*trait_index, case.trait_index("Project"));
+			assert!(
+				matches!(case.defs.traits[usize::from(case.trait_index("Project"))].members[0].kind, MemberKind::AssociatedType(index) if index == *assoc_type_index)
+			);
 			assert_eq!(
 				*base,
-				case.context.type_envs.param_types(signature.type_params)[1]
+				case.context.generic_envs.param_types(signature.type_params)[1]
 			);
 		}
 
@@ -15771,16 +16411,11 @@ pub(super) mod tests {
 			// `Item: Project` belongs to `T::Item`; `Item = U` does not lend it
 			// to `U`, so `U::Output` needs `U: Project` written.
 			checked_case!(
-				std case = indoc! {"
-                trait Project { type Output; }
+				case = indoc! {"
+                trait Project { type Output: StackValue; }
                 trait Container { type Item: Project; }
                 func f<T: Container where { Item = U }, U>(x: U::Output) {}
                 func g<T: Container where { Item = U }, U: Project>(x: U::Output) {}
-                pub trait Call { type Args; type Result; } pub trait Function: Call {}
-                type u8;
-                type u32;
-                enum Bool(u8) { False = 0, True = 1 }
-                struct Char(value: u32);
             "}
 			);
 			case.diagnostics().assert_codes(&[
@@ -15788,7 +16423,7 @@ pub(super) mod tests {
 				DiagnosticCode::TraitBoundViolation,
 			]);
 			assert!(
-				matches!(case.context.types.resolve(case.context.types.list(case.function_signature("g").param_types)[0]), Type::TypeProjection { trait_index, .. } if *trait_index == TraitIdx::new(0))
+				matches!(case.context.types.resolve(case.context.types.list(case.function_signature("g").param_types)[0]), Type::TypeProjection { trait_index, .. } if *trait_index == case.trait_index("Project"))
 			);
 		}
 
@@ -15797,7 +16432,7 @@ pub(super) mod tests {
 		 {
 			checked_case!(
 				valid = indoc! {"
-                trait Project { type Output; }
+                trait Project { type Output: StackValue; }
                 trait Container { type Item: Project; }
                 func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output) {}
             "}
@@ -15832,7 +16467,7 @@ pub(super) mod tests {
 		fn contextual_member_evidence_does_not_escape_to_a_sibling() {
 			checked_case!(
 				case = indoc! {"
-                trait Project { type Output; }
+                trait Project { type Output: StackValue; }
                 trait Container { type Item; }
                 struct Host<T>();
                 impl<T> Host<T> {
@@ -16075,7 +16710,9 @@ pub(super) mod tests {
 					);
 					let proof = builder
 						.find_trait_impl_query(
-							assumption_context,
+							builder
+								.assumption_envs
+								.of_frame(assumption_context),
 							TypeIndex::I32,
 							TraitIdx::new(0),
 						)
@@ -16088,7 +16725,9 @@ pub(super) mod tests {
 						BindingKey::ty(builder.strings.get("Output").unwrap());
 					let MemberLookup::Found(member) = builder
 						.resolve_applicable_member(
-							assumption_context,
+							builder
+								.assumption_envs
+								.of_frame(assumption_context),
 							TypeIndex::I32,
 							key,
 							reference,
@@ -16102,7 +16741,9 @@ pub(super) mod tests {
 					let ty = builder.project_assoc_type(TypeIndex::I32, member);
 					assert_eq!(
 						builder.normalize(
-							assumption_context,
+							builder
+								.assumption_envs
+								.of_frame(assumption_context),
 							ty,
 							NormalizationDepth::Deep,
 							RewriteFlags::ALL
@@ -16170,7 +16811,7 @@ pub(super) mod tests {
 				builder.solver.set_limit_for_test(8);
 				assert!(matches!(
 					builder.resolve_applicable_member(
-						env,
+						builder.assumption_envs.of_frame(env),
 						ty,
 						BindingKey::ty(builder.strings.get("Output").unwrap()),
 						reference
@@ -16188,7 +16829,7 @@ pub(super) mod tests {
 				builder.solver.set_limit_for_test(128);
 				assert!(matches!(
 					builder.resolve_applicable_member(
-						env,
+						builder.assumption_envs.of_frame(env),
 						ty,
 						BindingKey::ty(builder.strings.get("Output").unwrap()),
 						reference
@@ -16232,7 +16873,9 @@ pub(super) mod tests {
 					);
 					let MemberLookup::Found(member) = builder
 						.resolve_applicable_member(
-							assumption_context,
+							builder
+								.assumption_envs
+								.of_frame(assumption_context),
 							receiver,
 							key,
 							reference,
@@ -16268,6 +16911,134 @@ pub(super) mod tests {
 	mod stack_values {
 		use super::*;
 
+		#[test]
+		fn repr_queries_share_the_normalization_cache_and_retry_overflow() {
+			checked_case!(mut case = "");
+			case.diagnostics().assert_none();
+			let mut ty = TypeIndex::F64;
+			for _ in 0..8 {
+				ty = case.context.types.intern_tuple(&[TypeIndex::U8, ty]);
+			}
+			let env = AssumptionEnvIdx::ROOT;
+			let entries = case.context.solver.normalized.len();
+			case.context.solver.set_limit_for_test(3);
+			assert_eq!(
+				case.context.stack_value_repr(env, ty),
+				Err(SolverError::Overflow)
+			);
+			assert_eq!(case.context.solver.normalized.len(), entries);
+			assert!(case.context.solver.state.frames.is_empty());
+			assert!(case.context.solver.state.blocked_at.is_none());
+			assert_eq!(case.context.solver.state.recursion_budget, 3);
+
+			case.context.solver.set_limit_for_test(128);
+			let repr = case.context.stack_value_repr(env, ty).unwrap();
+			let projection = case.context.types.intern(Type::TypeProjection {
+				base: ty,
+				trait_index: case.context.defs.intrinsics.stack_value.unwrap(),
+				assoc_type_index: case
+					.context
+					.defs
+					.intrinsics
+					.stack_value_repr
+					.unwrap(),
+			});
+			case.context.solver.set_limit_for_test(0);
+			assert_eq!(
+				case.context.normalize(
+					env,
+					projection,
+					NormalizationDepth::Deep,
+					RewriteFlags::ALL
+				),
+				Ok(repr)
+			);
+			assert_eq!(case.context.stack_value_repr(env, ty), Ok(repr));
+			assert!(
+				case.context
+					.find_trait_impl_query(
+						env,
+						ty,
+						case.context.defs.intrinsics.stack_value.unwrap()
+					)
+					.unwrap()
+					.is_some()
+			);
+		}
+
+		#[test]
+		fn symbolic_repr_answers_require_evidence_and_stay_in_their_environment()
+		 {
+			let source = with_stack_value(indoc! {"
+				func unknown<T>() {}
+				func bounded<T: StackValue>() {}
+				func fixed<T: StackValue where { Repr = i32 }>() {}
+			"});
+			checked_case!(std mut case = &source);
+			case.diagnostics().assert_none();
+			let trait_index = case.context.defs.intrinsics.stack_value.unwrap();
+			let assoc_type_index =
+				case.context.defs.intrinsics.stack_value_repr.unwrap();
+			for name in ["unknown", "bounded", "fixed"] {
+				let frame = case.function_signature(name).type_params;
+				let env = case.context.assumption_envs.of_frame(frame);
+				let ty = case.context.generic_envs.param_types(frame)[0];
+				let projection =
+					case.context.types.intern(Type::TypeProjection {
+						base: ty,
+						trait_index,
+						assoc_type_index,
+					});
+				// Equality-only normalization can leave even an unproven Repr
+				// rigid. That cache entry is not evidence of membership.
+				if name == "unknown" {
+					assert_eq!(
+						case.context.normalize(
+							env,
+							projection,
+							NormalizationDepth::Deep,
+							RewriteFlags::EQUALITIES
+						),
+						Ok(projection)
+					);
+					let entries = case.context.solver.normalized.len();
+					assert_eq!(
+						case.context.stack_value_repr(env, ty),
+						Err(SolverError::Poisoned)
+					);
+					assert_eq!(case.context.solver.normalized.len(), entries);
+					assert_eq!(
+						case.context.normalize(
+							env,
+							projection,
+							NormalizationDepth::Deep,
+							RewriteFlags::ALL
+						),
+						Err(SolverError::Poisoned)
+					);
+					continue;
+				}
+				let repr = case.context.stack_value_repr(env, ty).unwrap();
+				if name == "bounded" {
+					assert_eq!(repr, projection);
+					assert!(case.context.types.has_param(repr));
+					assert!(case.context.types.has_projection(repr));
+				} else {
+					assert_eq!(repr, TypeIndex::I32);
+				}
+				case.context.solver.set_limit_for_test(0);
+				assert_eq!(case.context.stack_value_repr(env, ty), Ok(repr));
+				case.context.solver.set_limit_for_test(128);
+				// Even a concrete output was derived from this environment's
+				// bound. Input flags, not output flags, govern the cache key.
+				assert_eq!(
+					case.context.stack_value_repr(AssumptionEnvIdx::ROOT, ty),
+					Err(SolverError::Poisoned)
+				);
+			}
+			case.diagnostics().assert_none();
+		}
+
 		/// The declarations a `StackValue` test builds on, as std writes them,
 		/// with `Is<X, R>` stating `<X as StackValue>::Repr == R`.
 		fn with_stack_value(source: &str) -> String {
@@ -16283,6 +17054,11 @@ pub(super) mod tests {
 				typeset StackScalar { i32, i64, f32, f64, funcref }
 				typeset PointerSize: StackValue { u32 }
 				trait Memory { type Size: PointerSize; }
+				trait Pointer: StackValue {
+					type Memory: Memory;
+					type Pointee;
+					type Metadata: StackValue;
+				}
 				trait Global { type Value: StackValue where { Repr: StackScalar }; }
 				memory heap: u32;
 				func transmute<
@@ -16337,17 +17113,48 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn a_type_containing_never_is_no_stack_value() {
+		fn a_type_containing_never_is_held_as_never() {
 			let source = with_stack_value(indoc! {"
 				struct S(x: !);
-				func f(a: Needs<!>, b: Needs<(u32, !)>, c: Needs<S>) {}
+				struct Wrap<T>(T);
+				func f(
+					a: Is<!, !>,
+					b: Is<(u32, !), !>,
+					c: Is<S, !>,
+					d: Is<Wrap<(!, u64)>, !>,
+				) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics().assert_none();
+		}
+
+		/// `!` is held as itself, not as `()`, so no value of it can be made
+		/// from one of another type, nor one of another type from it.
+		#[test]
+		fn never_is_transmuted_only_into_never() {
+			let source = with_stack_value(indoc! {"
+				func make(x: ()) -> ! { transmute(x) }
+				func from(x: !) -> () { transmute(x) }
+				func into(x: !) -> u32 { transmute(x) }
+				func same(x: (!, u32)) -> ! { transmute(x) }
 			"});
 			checked_case!(std case = &source);
 			case.diagnostics().assert_codes(&[
-				DiagnosticCode::TraitBoundViolation,
-				DiagnosticCode::TraitBoundViolation,
-				DiagnosticCode::TraitBoundViolation,
+				DiagnosticCode::AssocTypeEqualityMismatch,
+				DiagnosticCode::AssocTypeEqualityMismatch,
+				DiagnosticCode::AssocTypeEqualityMismatch,
 			]);
+		}
+
+		#[test]
+		fn a_global_value_is_never_uninhabited() {
+			let source = with_stack_value(indoc! {"
+				struct Scalar<V: StackValue where { Repr: StackScalar }>();
+				func f(a: Scalar<u32>, b: Scalar<!>) {}
+			"});
+			checked_case!(std case = &source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		}
 
 		#[test]
@@ -16568,7 +17375,7 @@ pub(super) mod tests {
 			};
 			assert_eq!(
 				case.context.types.list(*type_args),
-				&[case.context.type_envs.param_types(scope)[1]]
+				&[case.context.generic_envs.param_types(scope)[1]]
 			);
 		}
 
@@ -16612,14 +17419,33 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_stored_projection_is_checked_in_its_own_context() {
-			with_pending_std_signatures(
-				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+			with_pending_signatures(
+				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U: StackValue>(x: T::Item) {}     ",
 				|builder| {
 					builder.sweep();
-					let signature = &builder.functions[0];
+					let function = builder
+						.defs
+						.functions
+						.iter()
+						.position(|def| {
+							builder.strings.resolve(def.name.inner) == Some("f")
+						})
+						.unwrap();
+					let marker = TraitIdx::new(
+						builder
+							.defs
+							.traits
+							.iter()
+							.position(|def| {
+								builder.strings.resolve(def.name.inner)
+									== Some("Marker")
+							})
+							.unwrap() as u32,
+					);
+					let signature = &builder.functions[function];
 					let env = signature.type_params;
 					let written = builder.types.list(signature.param_types)[0];
-					let u = builder.type_envs.param_types(env)[1];
+					let u = builder.generic_envs.param_types(env)[1];
 					// The parameter is stored as written, `T::Item`, and under its
 					// own context means `U`...
 					assert!(matches!(
@@ -16628,7 +17454,7 @@ pub(super) mod tests {
 					));
 					assert_eq!(
 						builder.normalize(
-							env,
+							builder.assumption_envs.of_frame(env),
 							written,
 							NormalizationDepth::Deep,
 							RewriteFlags::ALL
@@ -16640,9 +17466,9 @@ pub(super) mod tests {
 						assert_eq!(
 							builder
 								.find_trait_impl_query(
-									env,
+									builder.assumption_envs.of_frame(env),
 									ty,
-									TraitIdx::new(0)
+									marker
 								)
 								.map(|found| found.is_some()),
 							Ok(true)
@@ -16807,22 +17633,31 @@ pub(super) mod tests {
 					let env = builder.functions[0].type_params;
 					// `U` is only provably a `Marker` through `T::Item = U`, an
 					// equality fact: the proof must wait for the facts to be final.
-					let ty = builder.type_envs.param_types(env)[1];
+					let ty = builder.generic_envs.param_types(env)[1];
+					let assumption_env = builder.assumption_envs.of_frame(env);
 					let clauses =
-						builder.param_bounds[usize::from(env)][0].clauses;
-					builder.param_bounds[usize::from(env)][0]
-						.clauses
-						.equalities = Equalities::Pending;
+						builder.assumption_envs.clauses(assumption_env);
+					*builder.assumption_envs.clauses_mut(assumption_env) =
+						BoundClauses::Provisional(clauses.range());
 					assert_eq!(
 						builder
-							.find_trait_impl_query(env, ty, TraitIdx::new(0))
+							.find_trait_impl_query(
+								builder.assumption_envs.of_frame(env),
+								ty,
+								TraitIdx::new(0)
+							)
 							.map(|found| found.is_some()),
 						Err(SolverError::Pending)
 					);
-					builder.param_bounds[usize::from(env)][0].clauses = clauses;
+					*builder.assumption_envs.clauses_mut(assumption_env) =
+						clauses;
 					assert_eq!(
 						builder
-							.find_trait_impl_query(env, ty, TraitIdx::new(0))
+							.find_trait_impl_query(
+								builder.assumption_envs.of_frame(env),
+								ty,
+								TraitIdx::new(0)
+							)
 							.map(|found| found.is_some()),
 						Ok(true)
 					);
@@ -16848,7 +17683,7 @@ pub(super) mod tests {
 			with_pending_std_signatures(&source, |builder| {
 				builder.sweep();
 				let env = builder.functions[0].type_params;
-				let ty = builder.type_envs.param_types(env)[1];
+				let ty = builder.generic_envs.param_types(env)[1];
 				assert!(
 					builder.diagnostics.is_empty(),
 					"{:?}",
@@ -16859,7 +17694,11 @@ pub(super) mod tests {
 				// not reported: the site that asked owns the report.
 				assert_eq!(
 					builder
-						.find_trait_impl_query(env, ty, TraitIdx::new(0))
+						.find_trait_impl_query(
+							builder.assumption_envs.of_frame(env),
+							ty,
+							TraitIdx::new(0)
+						)
 						.map(|found| found.is_some()),
 					Err(SolverError::Overflow)
 				);
@@ -16871,7 +17710,11 @@ pub(super) mod tests {
 				builder.solver.set_limit_for_test(128);
 				assert_eq!(
 					builder
-						.find_trait_impl_query(env, ty, TraitIdx::new(0))
+						.find_trait_impl_query(
+							builder.assumption_envs.of_frame(env),
+							ty,
+							TraitIdx::new(0)
+						)
 						.map(|found| found.is_some()),
 					Ok(false)
 				);
@@ -16943,13 +17786,15 @@ pub(super) mod tests {
 			// The stored fact `Item = Need<U::Item>` is exactly as written; the
 			// failed check does not rewrite it.
 			let signature = case.function_signature("bad");
-			let clauses = case.context.param_bounds
-				[usize::from(signature.type_params)][0]
-				.clauses;
+			let clauses = case
+				.context
+				.assumption_envs
+				.requirements(signature.type_params);
 			let clause = case
 				.context
 				.clauses
-				.equalities(clauses.equalities.resolved())[0];
+				.equalities(clauses.resolved())
+				.collect::<Vec<_>>()[0];
 			let Type::Struct { type_args, .. } =
 				case.context.types.resolve(clause.value)
 			else {
@@ -17334,25 +18179,12 @@ pub(super) mod tests {
 	#[test]
 	fn an_imported_declaration_resolves_its_types_in_the_enclosing_scope() {
 		let mut builder = vfs::CompilationUnitBuilder::new();
-		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
-			(
-				"std.wx".to_string(),
-				"pub trait Call { type Args; type Result; } pub trait Function: Call {} pub type u32; type u8; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);"
-					.to_string(),
-			),
-			(
+		builder.load_stdlib();
+		let workspace =
+			vfs::VirtualFileSource::from_relative(HashMap::from([(
 				"main.wx".to_string(),
 				r#"struct S(); import "env" { func f(s: S); }"#.to_string(),
-			),
-		]));
-		let std = builder
-			.load_package(
-				vfs::PackageKind::Library,
-				vfs::AbsolutePath::new("/std.wx"),
-				&workspace,
-			)
-			.unwrap();
-		builder.set_stdlib(std);
+			)]));
 		let root = builder
 			.load_package(
 				vfs::PackageKind::Library,
@@ -17402,7 +18234,7 @@ pub(super) mod tests {
 			case = indoc! {"
 			trait Global { type Value; }
 			global counter: i32 = 0;
-			func id<T>(x: T) -> T { loop {} }
+			func id<T: StackValue>(x: T) -> T { loop {} }
 			func takes(g: counter, f: id<i32>, me: takes) {}
 			func bare(f: id) {}
 			func applied(g: counter<i32>) {}
@@ -17484,7 +18316,7 @@ pub(super) mod tests {
 	fn a_generic_function_types_projections_substitute_its_arguments() {
 		test_case!(
 			mut case = indoc! {"
-			func id<T>(x: T) -> T { loop {} }
+			func id<T: StackValue>(x: T) -> T { loop {} }
 			func f(x: id<i32>::Args, y: <id<i32> as Call>::Result) {}
 		"}
 		);
@@ -17525,8 +18357,8 @@ pub(super) mod tests {
 		test_case!(
 			mut case = indoc! {"
 			struct Wrap<T>();
-			impl<T> Wrap<T> {
-				func get<U>(self: Self, u: U) -> T { loop {} }
+			impl<T: StackValue> Wrap<T> {
+				func get<U: StackValue>(self: Self, u: U) -> T { loop {} }
 			}
 			func f(a: Wrap<i32>::get<Bool>::Args, b: Wrap<i32>::get<Bool>::Result) {}
 		"}
@@ -17549,7 +18381,7 @@ pub(super) mod tests {
 	fn a_trait_function_stays_its_declaration_over_self() {
 		test_case!(
 			mut case = indoc! {"
-			trait Make {
+			trait Make: StackValue {
 				func make(x: i32) -> Self;
 				func fresh() -> Self { loop {} }
 			}
@@ -17561,7 +18393,7 @@ pub(super) mod tests {
 				y: <Point as Make>::fresh,
 				z: <Point as Make>::make::Args,
 			) {}
-			func generic<T: Make>(x: T::make, y: T::make::Result) {}
+			func generic<T: StackValue + Make>(x: T::make, y: T::make::Result) {}
 		"}
 		);
 		case.diagnostics().assert_none();
@@ -17601,7 +18433,7 @@ pub(super) mod tests {
 			"<Point as Make>::make"
 		);
 		let env = case.function_signature("generic").type_params;
-		let t = case.context.type_envs.param_types(env)[0];
+		let t = case.context.generic_envs.param_types(env)[0];
 		let make_t = case.context.types.intern_function(make, &[t]);
 		assert_eq!(case.normalized_param("generic", 0), make_t);
 		assert_eq!(case.normalized_param("generic", 1), t);
@@ -17615,10 +18447,10 @@ pub(super) mod tests {
 		test_case!(
 			mut case = indoc! {"
 			struct Foo<T>();
-			impl<T> Foo<T> { func new<U>(x: U) -> T { loop {} } }
-			trait Make { func make<U>(x: U) -> Self; }
+			impl<T: StackValue> Foo<T> { func new<U: StackValue>(x: U) -> T { loop {} } }
+			trait Make: StackValue { func make<U: StackValue>(x: U) -> Self; }
 			struct Wrap<T>();
-			impl<T> Make for Wrap<T> { func make<U>(x: U) -> Wrap<T> { loop {} } }
+			impl<T> Make for Wrap<T> { func make<U: StackValue>(x: U) -> Wrap<T> { loop {} } }
 			func f(
 				a: Foo<i32>::new<u8>::Args,
 				b: Foo<i32>::new<u8>::Result,
@@ -17644,7 +18476,7 @@ pub(super) mod tests {
 	fn an_inherent_function_takes_precedence_over_a_traits_in_a_type() {
 		test_case!(
 			mut case = indoc! {"
-			trait Make { func make() -> Self; }
+			trait Make: StackValue { func make() -> Self; }
 			struct Point();
 			impl Point { func make() -> i32 { loop {} } }
 			impl Make for Point { func make() -> Point { loop {} } }
@@ -17742,6 +18574,59 @@ pub(super) mod tests {
 			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
 	}
 
+	/// A literal kind is std's `integer` or `char`, named in braces: the
+	/// braces say a literal kind is meant, and a bare name is reported.
+	#[test]
+	fn a_literal_kind_is_written_in_braces() {
+		test_case!(
+			case = indoc! {"
+			const X: integer = 4;
+			const Y: {integer} = 4;
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::LiteralKindWithoutBraces]);
+		case.diagnostics().assert_error_saying(
+			"`integer` is a literal kind, written `{integer}`",
+		);
+	}
+
+	#[test]
+	fn only_a_literal_kind_goes_in_braces() {
+		test_case!(
+			case = indoc! {"
+			struct Point(x: i32);
+			const P: {Point} = 4;
+			const Q: {u32} = 4;
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NotALiteralKind,
+			DiagnosticCode::NotALiteralKind,
+		]);
+		case.diagnostics()
+			.assert_error_saying("`Point` is not a literal kind");
+	}
+
+	/// No value of a literal kind exists at runtime, so it is only a
+	/// constant's type.
+	#[test]
+	fn a_literal_kind_is_only_a_constants_type() {
+		test_case!(
+			case = indoc! {"
+			struct S(x: {integer});
+			type I = {char};
+			func f(x: {integer}) -> {integer} { x }
+		"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+			DiagnosticCode::MisplacedLiteralKind,
+		]);
+	}
+
 	/// The synthetic impl is the only one: a function is not a path an impl
 	/// can be written for.
 	#[test]
@@ -17757,20 +18642,30 @@ pub(super) mod tests {
 			.assert_codes(&[DiagnosticCode::InvalidImplTarget]);
 	}
 
+	/// An impl is written only for a nominal type: a slice (like an array, a
+	/// tuple, a pointer or a function reference) is not a path, and an alias
+	/// naming one has no identity to dispatch on.
+	#[test]
+	fn an_impl_cannot_be_written_for_an_alias_of_a_slice() {
+		test_case!(
+			case = indoc! {"
+			memory heap: u32;
+			trait Marker {}
+			type Bytes = heap::&[u8];
+			impl Marker for Bytes {}
+		"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::InvalidImplTarget]);
+	}
+
 	/// `Call` is an ordinary trait a struct can implement, like an operator
 	/// trait; `Function` is only ever the synthetic impl of a function item.
 	/// Both satisfy a `Call` bound, only the function a `Function` bound.
 	#[test]
 	fn a_struct_can_implement_call_but_only_functions_are_function() {
 		test_case!(
-			std mut case = indoc! {"
-			type i32;
-			pub trait Call {
-				type Args;
-				type Result;
-				func call(self: Self, args: Self::Args) -> Self::Result;
-			}
-			pub trait Function: Call {}
+			mut case = indoc! {"
 			struct Adder(value: i32);
 			impl Call for Adder {
 				type Args = i32;
@@ -17783,10 +18678,6 @@ pub(super) mod tests {
 			func callables(a: Callable<Adder>, b: Callable<handler>, c: Adder::Result) {}
 			func items(a: Item<handler>, b: Item<Adder>) {}
 			func generic<F: Function>(x: F::Args, y: F::Result) {}
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
 		"}
 		);
 		// `Adder: Call` holds, so only `Adder: Function` fails.
@@ -17804,7 +18695,7 @@ pub(super) mod tests {
 	#[test]
 	fn impl_self_names_the_target_through_the_impls_own_frame() {
 		const SOURCE: &str = indoc! {"
-			trait Service { func make() -> Self; }
+			trait Service: StackValue { func make() -> Self; }
 			struct Wrap<T>();
 			struct Plain();
 			impl<T> Wrap<T> { func get(self: Self) -> Self { loop {} } }
@@ -17820,7 +18711,7 @@ pub(super) mod tests {
 			let header = case.context.inherent_impls[usize::from(impl_index)]
 				.as_ref()
 				.unwrap();
-			assert_ne!(header.type_params, TypeEnvIdx::ROOT, "{path}");
+			assert_ne!(header.type_params, GenericEnvIdx::ROOT, "{path}");
 			let get = case.inherent_function_signature(path, "get");
 			assert_eq!(get.return_type, header.target.inner, "{path}");
 			assert_eq!(get.type_params, header.type_params, "{path}");
@@ -17831,7 +18722,7 @@ pub(super) mod tests {
 		.unwrap();
 		assert!(
 			case.context
-				.type_envs
+				.generic_envs
 				.param_types(plain.type_params)
 				.is_empty()
 		);
@@ -17908,9 +18799,9 @@ pub(super) mod tests {
 			trait Number {}
 			impl Number for i32 {}
 			struct Wrap<T>();
-			impl<T: Number> Wrap<T> { func get<U>(self: Self, x: T, y: U) -> (T, U) { loop {} } }
-			func free<V>(v: V) {}
-			trait Service { func make<W>(w: W) -> Self; }
+			impl<T: StackValue + Number> Wrap<T> { func get<U: StackValue>(self: Self, x: T, y: U) -> (T, U) { loop {} } }
+			func free<V: StackValue>(v: V) {}
+			trait Service: StackValue { func make<W: StackValue>(w: W) -> Self; }
 		"}
 		);
 		case.diagnostics().assert_none();
@@ -17923,7 +18814,7 @@ pub(super) mod tests {
 		.type_params;
 		let free = case.function_signature("free").type_params;
 		let make = case.trait_function_signature("Service", "make").type_params;
-		let envs = &case.context.type_envs;
+		let envs = &case.context.generic_envs;
 		let t = envs.param_types(outer)[0];
 		let u = envs.param_types(method)[0];
 		let v = envs.param_types(free)[0];
@@ -17931,7 +18822,7 @@ pub(super) mod tests {
 		// Counts: rustc's `parent_count`, and the whole chain's length.
 		assert_eq!(envs.parent(method), Some(outer));
 		for (env, parent_count, generic_count) in [
-			(TypeEnvIdx::ROOT, 0, 0),
+			(GenericEnvIdx::ROOT, 0, 0),
 			(outer, 0, 1),
 			(method, 1, 2),
 			(free, 0, 1),
@@ -18000,14 +18891,14 @@ pub(super) mod tests {
 		// against the outer argument, nothing against `U`.
 		let impl_kind = case
 			.context
-			.type_envs
+			.generic_envs
 			.enclosing_impl(method)
 			.expect("the method is inside an impl");
 		let swapped = case.context.types.intern_tuple(&[bool_, i32_]);
 		assert_eq!(
 			case.context
 				.match_impl_target_and_bounds(
-					TypeEnvIdx::ROOT,
+					AssumptionEnvIdx::ROOT,
 					impl_kind,
 					method,
 					pair,
@@ -18019,7 +18910,7 @@ pub(super) mod tests {
 		);
 		assert_eq!(
 			case.context.match_impl_target_and_bounds(
-				TypeEnvIdx::ROOT,
+				AssumptionEnvIdx::ROOT,
 				impl_kind,
 				method,
 				pair,

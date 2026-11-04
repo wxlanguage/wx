@@ -26,10 +26,13 @@ use std::hash::BuildHasher;
 use hashbrown::HashTable;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
+use super::bounds::AssumptionEnvIdx;
 use super::defs::{FieldOrder, StructIdx};
 use super::signatures::TypeContext;
-use super::solver::{NormalizationDepth, RewriteFlags, Solver, SolverError};
-use super::types::{Substitution, Type, TypeEnvIdx, TypeIndex, TypeList};
+use super::solver::{
+	NormalizationDepth, RewriteFlags, Solver, SolverError, metadata_len,
+};
+use super::types::{GenericEnvIdx, Substitution, Type, TypeIndex, TypeList};
 use crate::index::index_newtype;
 
 index_newtype!(AggregateIdx);
@@ -233,7 +236,7 @@ impl TypeContext<'_, '_, '_> {
 	/// overflows.
 	pub(super) fn memory_layout(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Layout>, SolverError> {
 		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
@@ -245,7 +248,7 @@ impl TypeContext<'_, '_, '_> {
 	/// declaration order (an aggregate's `values`).
 	pub(super) fn memory_values(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<(Layout, Box<[(Primitive, u32)]>)>, SolverError> {
 		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
@@ -267,7 +270,7 @@ impl TypeContext<'_, '_, '_> {
 	/// `None` for any other type, too.
 	pub(super) fn aggregate_layout(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<AggregateIdx>, SolverError> {
 		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
@@ -281,7 +284,7 @@ impl TypeContext<'_, '_, '_> {
 	/// one again is a struct containing itself.
 	fn piece(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
@@ -297,8 +300,6 @@ impl TypeContext<'_, '_, '_> {
 			| Type::IntegerLiteral
 			| Type::FloatLiteral
 			| Type::CharLiteral
-			| Type::StringLiteral
-			| Type::ArrayLiteral
 			| Type::Value { .. }
 			| Type::Const { .. } => return Err(SolverError::Poisoned),
 			Type::Never
@@ -326,28 +327,27 @@ impl TypeContext<'_, '_, '_> {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				return self.piece(assumption_context, repr, visiting);
 			}
-			Type::Pointer { memory, .. } | Type::Array { memory, .. } => {
+			// An address, then the pointee's counts, each as wide as the
+			// memory's `Size`.
+			Type::Pointer { to, memory, .. } => {
 				let Some(primitive) =
 					self.address_primitive(assumption_context, memory)?
 				else {
 					return Ok(None);
 				};
-				Piece::Primitives {
-					primitive,
-					count: 1,
-				}
-			}
-			Type::Slice { memory, .. } => {
-				let Some(primitive) =
-					self.address_primitive(assumption_context, memory)?
+				let Some(metadata) =
+					self.pointer_metadata(assumption_context, to, memory)?
 				else {
 					return Ok(None);
 				};
 				Piece::Primitives {
 					primitive,
-					count: 2,
+					count: 1 + metadata_len(&self.types, metadata) as u32,
 				}
 			}
+			// A slice or an array is no value's type: only a pointer holds
+			// one, and what it points at is laid out where it is placed.
+			Type::Slice { .. } | Type::Array { .. } => return Ok(None),
 			Type::Tuple { .. } | Type::Struct { .. } => {
 				return self.aggregate_piece(assumption_context, ty, visiting);
 			}
@@ -357,7 +357,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn aggregate_piece(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
@@ -399,7 +399,7 @@ impl TypeContext<'_, '_, '_> {
 					fields.push(self.types.substitute(
 						field,
 						Substitution {
-							envs: &self.type_envs,
+							envs: &self.generic_envs,
 							env,
 							args: &args,
 						},
@@ -437,7 +437,7 @@ impl TypeContext<'_, '_, '_> {
 	/// memory not known yet.
 	pub(super) fn address_primitive(
 		&mut self,
-		assumption_context: TypeEnvIdx,
+		assumption_context: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Option<Primitive>, SolverError> {
 		let memory = self.normalize(
@@ -663,7 +663,8 @@ mod tests {
 	) -> Result<Option<Layout>, SolverError> {
 		let scope = case.function_signature(path).type_params;
 		let ty = case.param_types(path)[index];
-		case.context.memory_layout(scope, ty)
+		case.context
+			.memory_layout(case.context.assumption_envs.of_frame(scope), ty)
 	}
 
 	/// The aggregate layout of parameter `index` of function `path`.
@@ -675,7 +676,7 @@ mod tests {
 		let scope = case.function_signature(path).type_params;
 		let ty = case.param_types(path)[index];
 		case.context
-			.aggregate_layout(scope, ty)
+			.aggregate_layout(case.context.assumption_envs.of_frame(scope), ty)
 			.expect("a parameter's layout is final")
 	}
 
@@ -912,7 +913,7 @@ mod tests {
 			#[fixed_order]
 			struct Swapped(u8, u32);
 			struct Wrap<T>(T);
-			func f<T>(
+			func f<T: StackValue>(
 				a: Pair<u32, u8>, b: (u32, u8), c: Named, d: Swapped,
 				e: Wrap<heap::&T>, g: Wrap<heap::&u8>,
 			) {}
@@ -933,10 +934,28 @@ mod tests {
 	}
 
 	#[test]
+	fn a_pointer_holds_one_count_per_slice_level() {
+		let source = with_memories(indoc! {"
+			func f<S: Slice, A: Array>(
+				a: heap::&[[u8]], b: wide::*[[[u16]]], c: heap::&[[u8; 4]],
+				d: heap::&S, e: heap::&A,
+			) {}
+		"});
+		test_case!(mut case = &source);
+		case.diagnostics().assert_none();
+		assert_eq!(param_layout(&mut case, "f", 0), Ok(known(12, 4)));
+		assert_eq!(param_layout(&mut case, "f", 1), Ok(known(32, 8)));
+		assert_eq!(param_layout(&mut case, "f", 2), Ok(known(8, 4)));
+		// A slice or an array: its counts are not known until it is.
+		assert_eq!(param_layout(&mut case, "f", 3), Ok(None));
+		assert_eq!(param_layout(&mut case, "f", 4), Ok(known(4, 4)));
+	}
+
+	#[test]
 	fn an_abstract_part_or_a_reference_has_no_layout() {
 		let source = with_memories(indoc! {"
 			struct Wrap<T>(T);
-			func f<T, Mem: Memory>(
+			func f<T: StackValue, Mem: Memory>(
 				a: T, b: Wrap<T>, c: heap::&T, d: Mem::&u8,
 				e: func(u32) -> u32, g: (u8, func(u32) -> u32),
 			) {}

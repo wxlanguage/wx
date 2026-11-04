@@ -511,6 +511,31 @@ fn test_fn_pointer_param() {
 	assert!(result.is_some(), "`-> i32` should be recorded");
 }
 
+/// What the pointer type `ty` points at.
+fn pointee(ty: &TypeExpression) -> &TypeExpression {
+	let TypeExpression::Pointer { inner, .. } = ty else {
+		panic!("expected a pointer type, got {ty:?}")
+	};
+	&inner.inner
+}
+
+#[test]
+fn a_slice_is_a_type_of_its_own() {
+	let case = TestCase::new("const S: [u8; 5] = \"hello\"; type T = [u32];");
+	case.diagnostics().assert_none();
+	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
+		panic!("expected a constant")
+	};
+	assert!(matches!(ty.inner, TypeExpression::Array { .. }));
+	let Item::TypeAlias {
+		body: Some(body), ..
+	} = case.item(1)
+	else {
+		panic!("expected a type alias")
+	};
+	assert!(matches!(body.inner, TypeExpression::Slice { .. }));
+}
+
 #[test]
 fn test_type_expression_forms() {
 	let case = TestCase::new(indoc! {"
@@ -533,11 +558,11 @@ fn test_type_expression_forms() {
 		Some(TypeExpression::Pointer { .. })
 	));
 	assert!(matches!(
-		Some(&fields[1].inner.inner.ty.inner),
-		Some(TypeExpression::Slice { .. })
+		pointee(&fields[1].inner.inner.ty.inner),
+		TypeExpression::Slice { .. }
 	));
 	assert!(matches!(
-		Some(&fields[2].inner.inner.ty.inner),
+		Some(pointee(&fields[2].inner.inner.ty.inner)),
 		Some(TypeExpression::Array {
 			length: Spanned {
 				inner: ConstArgument::Literal(Literal::Int(4)),
@@ -2698,7 +2723,7 @@ fn an_array_length_is_a_literal_or_a_path() {
 	for (param, length) in params.iter().zip([1, 2]) {
 		let TypeExpression::Array {
 			length: written, ..
-		} = &param.inner.inner.ty.inner
+		} = pointee(&param.inner.inner.ty.inner)
 		else {
 			panic!("expected an array type")
 		};
@@ -2739,7 +2764,7 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
 	let params = &case.function_signature(0).params;
 	let length = |at: usize| {
 		let TypeExpression::Array { length, .. } =
-			&params[at].inner.inner.ty.inner
+			pointee(&params[at].inner.inner.ty.inner)
 		else {
 			panic!("expected an array type")
 		};
@@ -2778,7 +2803,7 @@ fn an_array_length_can_be_left_to_its_context() {
 	else {
 		panic!("expected a local with a type")
 	};
-	let TypeExpression::Array { length, .. } = &ty.inner else {
+	let TypeExpression::Array { length, .. } = pointee(&ty.inner) else {
 		panic!("expected an array type")
 	};
 	assert!(matches!(length.inner, ConstArgument::Infer));
@@ -2997,6 +3022,63 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 	};
 	assert!(matches!(path.as_ref(), BoundExpression::Path(_)));
 	assert_eq!(bindings.len(), 1);
+}
+
+#[test]
+fn a_constant_binding_is_marked_const() {
+	let case = TestCase::new(indoc! {"
+        func f<A: Array where { const LEN: u8 }, B: Array where { const LEN = 4 }>() {}
+    "});
+	case.diagnostics().assert_none();
+	let Item::Function { signature, .. } = case.item(0) else {
+		panic!("expected function")
+	};
+	let kinds: Vec<_> = signature
+		.type_params
+		.iter()
+		.map(|param| {
+			let bounds = bounds(param).expect("expected bounds");
+			let BoundExpression::WithBindings { bindings, .. } = &bounds.inner
+			else {
+				panic!("expected WithBindings")
+			};
+			&bindings[0].kind
+		})
+		.collect();
+	assert!(matches!(
+		kinds[0],
+		AssocBindingKind::ConstRepresentable { .. }
+	));
+	assert!(matches!(
+		kinds[1],
+		AssocBindingKind::ConstEquals {
+			value: Spanned {
+				inner: ConstArgument::Literal(_),
+				..
+			},
+			..
+		}
+	));
+}
+
+#[test]
+fn self_is_a_type_parameter_name() {
+	// Where it may stand is the signature's to check, as for `self`.
+	let case = TestCase::new(indoc! {"
+        trait Tr { func f<Self: Other, T>(); }
+    "});
+	case.diagnostics().assert_none();
+	let Item::Trait { items, .. } = case.item(0) else {
+		panic!("expected trait")
+	};
+	let TraitItem::Function { signature, .. } = &items[0].inner.inner else {
+		panic!("expected function")
+	};
+	assert_eq!(signature.type_params.len(), 2);
+	assert_eq!(
+		case.strings.resolve(signature.type_params[0].name().inner),
+		Some("Self")
+	);
 }
 
 #[test]
@@ -3398,6 +3480,20 @@ fn test_turbofish_on_any_other_expression_is_an_error() {
 // ── remaining type expressions ───────────────────────────────────────────────
 
 #[test]
+fn test_literal_kind_type() {
+	let case = TestCase::new("const X: {integer} = 4;");
+	case.diagnostics().assert_none();
+	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
+		panic!("expected a typed constant");
+	};
+	let TypeExpression::Literal { inner } = &ty.inner else {
+		panic!("expected a literal kind");
+	};
+	assert!(matches!(inner.inner, TypeExpression::Path(_)));
+	assert_eq!(ty.span, TextSpan::new(9, 18));
+}
+
+#[test]
 fn test_never_type() {
 	let case = TestCase::new("func f(a: !) -> ! {}");
 	case.diagnostics().assert_none();
@@ -3417,19 +3513,22 @@ fn test_infer_and_memory_tagged_types() {
     "});
 	case.diagnostics().assert_none();
 
-	// a memory-tagged type names the memory its pointer or slice belongs to
+	// a memory-tagged type names the memory its pointer belongs to, a
+	// pointer to a slice included
 	let params = &case.function_signature(0).params;
 	for index in [0, 1] {
 		let ty = &params[index].inner.inner.ty.inner;
-		let memory = match ty {
-			TypeExpression::Pointer { memory, .. }
-			| TypeExpression::Slice { memory, .. } => {
-				memory.as_ref().expect("tagged with an explicit memory")
-			}
-			_ => panic!("expected a pointer or slice type"),
+		let TypeExpression::Pointer { memory, .. } = ty else {
+			panic!("expected a pointer type");
 		};
+		let memory = memory.as_ref().expect("tagged with an explicit memory");
 		assert_eq!(case.name(memory[0].ident.inner), "heap");
 	}
+	let TypeExpression::Pointer { inner, .. } = &params[1].inner.inner.ty.inner
+	else {
+		unreachable!()
+	};
+	assert!(matches!(inner.inner, TypeExpression::Slice { .. }));
 
 	let Statement::LocalDefinition { ty, .. } =
 		&case.function_block(0)[0].inner.inner

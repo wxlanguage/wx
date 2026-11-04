@@ -14,7 +14,8 @@ use crate::ast::BinaryOp;
 use crate::diagnostics::TextSpan;
 use crate::tir::body::{ExprIdx, PlaceIdx, PlaceKind};
 use crate::tir::defs::FunctionIdx;
-use crate::tir::types::{TypeEnvIdx, TypeList};
+use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::types::GenericArgs;
 
 /// Where a place's bytes are: `offset` bytes past the address `pointer`
 /// computes, in `memory`.
@@ -34,7 +35,7 @@ pub(super) enum Operation {
 	/// that the place's type selects.
 	Method {
 		method: FunctionIdx,
-		type_args: TypeList,
+		type_args: GenericArgs,
 	},
 }
 
@@ -67,7 +68,7 @@ impl Lowerer<'_, '_, '_, '_> {
 				let object_ty =
 					self.normalize_type(object_ty, state.file_id, data.span)?;
 				let Ok(Some(layout)) =
-					self.context.aggregate_layout(TypeEnvIdx::ROOT, object_ty)
+					self.context.aggregate_layout(AssumptionEnvIdx::ROOT, object_ty)
 				else {
 					unreachable!("a field's place is in a laid-out aggregate")
 				};
@@ -78,6 +79,17 @@ impl Lowerer<'_, '_, '_, '_> {
 					offset: address.offset + offset,
 					..address
 				})
+			}
+			// Waits for the slices step: an element's address is checked
+			// against its slice's length.
+			PlaceKind::Element { .. } => {
+				self.unsupported(
+					state.file_id,
+					data.span,
+					"an element of a slice or an array (the static-data \
+					 checkpoint)",
+				)?;
+				unreachable!()
 			}
 		}
 	}
