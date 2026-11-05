@@ -498,12 +498,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			self.context.defs.functions[usize::from(function)].name.span;
 		match &self.context.function_implementations[usize::from(function)] {
 			FunctionImplementation::Defined(_) => {}
-			FunctionImplementation::Intrinsic(_) => {
-				self.unsupported(
-					file_id,
-					name_span,
-					"exporting an intrinsic function (requires a wrapper)",
-				)?;
+			&FunctionImplementation::Intrinsic(intrinsic) => {
+				return self.lower_intrinsic_function(instance, intrinsic);
 			}
 			&FunctionImplementation::Imported(import) => {
 				return self.lower_imported_function(instance, import);
@@ -596,6 +592,74 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			flags.insert(mir::FunctionFlags::INLINE);
 		}
 		self.function_flags.push(flags);
+		Ok(())
+	}
+
+	/// A function the compiler implements, as a function of its own: its
+	/// expansion over its own parameters. Only something that needs the
+	/// function itself reaches here (an export); a call expands the
+	/// intrinsic in place (`lower_intrinsic`) and names no function. The
+	/// checker exports no generic function (E2019), so every intrinsic here
+	/// takes one scalar per parameter and no type argument.
+	fn lower_intrinsic_function(
+		&mut self,
+		instance: FunctionInstance,
+		intrinsic: super::intrinsics::Intrinsic,
+	) -> Result<(), ()> {
+		let id = self.ids[&instance];
+		let file_id =
+			self.context.defs.functions[usize::from(instance.function)].file_id;
+		let (signature_index, param_types, result_type) =
+			self.lower_signature(instance)?;
+		let mut state = FunctionState {
+			file_id,
+			env: self.context.functions[usize::from(instance.function)]
+				.type_params,
+			args: Box::default(),
+			instance,
+			local_map: Vec::new(),
+			locals: Vec::new(),
+			mir_body: mir::Body::default(),
+			labels: Vec::new(),
+			label_count: 0,
+			root: None,
+		};
+		// Parameters are the first MIR locals, in order, as in a defined
+		// function; each is read once, as its operand.
+		let mut operands = Vec::with_capacity(param_types.len());
+		for (position, &ty) in param_types.iter().enumerate() {
+			state.locals.push(mir::Local {
+				ty,
+				mutability: mir::Mutability::Immutable,
+			});
+			let local = mir::LocalIndex::new(position as u32);
+			operands.push(state.push(mir::ExprKind::LocalGet { local }, ty));
+		}
+		let root = self.expand_intrinsic(
+			&mut state,
+			instance,
+			intrinsic,
+			operands,
+			Vec::new(),
+			result_type,
+		)?;
+		if cfg!(debug_assertions)
+			&& let Err(error) =
+				mir::body::verify(&state.mir_body, root, &state.locals, 0)
+		{
+			panic!("lowering broke the MIR arena's invariants: {error:?}");
+		}
+		debug_assert_eq!(usize::from(id), self.functions.len());
+		self.functions.push(mir::Function {
+			signature_index,
+			origin: mir::Origin::Defined(mir::Code {
+				locals: state.locals,
+				label_count: 0,
+				body: state.mir_body,
+				root,
+			}),
+		});
+		self.function_flags.push(mir::FunctionFlags::empty());
 		Ok(())
 	}
 
@@ -2533,6 +2597,100 @@ mod tests {
 	}
 
 	#[test]
+	fn an_exported_intrinsic_is_its_expansion_over_its_parameters() {
+		let source = r#"
+			use std::{
+				i32_add, u32_div, f64_sqrt, u64_extend_u32,
+				i32_reinterpret_f32, u32_lt, trap,
+			};
+			export {
+				i32_add as "add", u32_div as "div", f64_sqrt as "sqrt",
+				u64_extend_u32 as "extend", i32_reinterpret_f32 as "bits",
+				u32_lt as "lt", trap as "trap"
+			}
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph)
+			.1
+			.expect("an exported intrinsic must lower");
+		// Each is a function of its own whose body is the operation: no
+		// call, no import.
+		assert_eq!(mir.functions.len(), 7);
+		assert!(mir.imports.is_empty());
+		for index in 0..mir.functions.len() {
+			let code = mir.code(mir::FunctionId::new(index as u32));
+			assert_eq!(code.callees().count(), 0);
+		}
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let add = instance
+				.get_typed_func::<(i32, i32), i32>(&mut store, "add")
+				.unwrap();
+			assert_eq!(add.call(&mut store, (i32::MAX, 1)).unwrap(), i32::MIN);
+			let div = instance
+				.get_typed_func::<(u32, u32), u32>(&mut store, "div")
+				.unwrap();
+			assert_eq!(
+				div.call(&mut store, (u32::MAX, 2)).unwrap(),
+				u32::MAX / 2
+			);
+			assert!(div.call(&mut store, (1, 0)).is_err());
+			let sqrt = instance
+				.get_typed_func::<f64, f64>(&mut store, "sqrt")
+				.unwrap();
+			assert_eq!(sqrt.call(&mut store, 2.25).unwrap(), 1.5);
+			let extend = instance
+				.get_typed_func::<u32, u64>(&mut store, "extend")
+				.unwrap();
+			assert_eq!(extend.call(&mut store, u32::MAX).unwrap(), 0xFFFF_FFFF);
+			let bits = instance
+				.get_typed_func::<f32, i32>(&mut store, "bits")
+				.unwrap();
+			assert_eq!(bits.call(&mut store, 1.0).unwrap(), 0x3F80_0000);
+			let lt = instance
+				.get_typed_func::<(u32, u32), i32>(&mut store, "lt")
+				.unwrap();
+			assert_eq!(lt.call(&mut store, (1, u32::MAX)).unwrap(), 1);
+			assert_eq!(lt.call(&mut store, (u32::MAX, 1)).unwrap(), 0);
+			let trap = instance
+				.get_typed_func::<(), ()>(&mut store, "trap")
+				.unwrap();
+			assert!(trap.call(&mut store, ()).is_err());
+		}
+	}
+
+	#[test]
+	fn exporting_an_intrinsic_leaves_its_calls_expanded_in_place() {
+		let source = r#"
+			use std::i32_add;
+			func run(a: i32) -> i32 { i32_add(a, 1) }
+			export { run as "run", i32_add as "add" }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph)
+			.1
+			.expect("an exported intrinsic must lower");
+		assert_eq!(mir.functions.len(), 2);
+		for index in 0..mir.functions.len() {
+			let code = mir.code(mir::FunctionId::new(index as u32));
+			assert_eq!(
+				code.callees().count(),
+				0,
+				"a call of an intrinsic names no function, exported or not"
+			);
+		}
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<i32, i32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, 41).unwrap(), 42);
+		let add = instance
+			.get_typed_func::<(i32, i32), i32>(&mut store, "add")
+			.unwrap();
+		assert_eq!(add.call(&mut store, (40, 2)).unwrap(), 42);
+	}
+
+	#[test]
 	fn scalar_intrinsics_expand_by_identity_and_preserve_operand_types() {
 		let source = r#"
 			use std::i32_add as sum;
@@ -3246,10 +3404,6 @@ mod tests {
 			(
 				r#"func trap() -> !; func run() -> ! { trap() } export { run as "run" }"#,
 				"without an implementation",
-			),
-			(
-				r#"use std::trap as provided; export { provided as "trap" }"#,
-				"requires a wrapper",
 			),
 		] {
 			let mut graph = crate::tir::signatures::tests::source_graph(source);
@@ -5814,6 +5968,39 @@ mod tests {
 		assert_eq!(run.call(&mut store, 2).unwrap(), 3);
 	}
 
+	/// Untyped arms before a typed one all take its type, including the
+	/// ones the typed arm did not meet directly.
+	#[test]
+	fn untyped_arms_before_a_typed_arm_lower_at_its_type() {
+		let source = r#"
+            func g() -> u8 { 5 }
+            func run(x: u32) -> u8 {
+                match x { 0 => 10, 1 => 11, 2 => 12, _ => g() }
+            }
+            func digit(c: Char) -> u8 {
+                match c {
+                    'a' | 'e' => 0,
+                    ' ' => 1,
+                    _ => if c.is_ascii_digit() { 2 } else { 3 },
+                }
+            }
+            export { run as "run", digit as "digit" }
+        "#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<u32, i32>(&mut store, "run")
+			.unwrap();
+		for (x, expected) in [(0, 10), (1, 11), (2, 12), (3, 5)] {
+			assert_eq!(run.call(&mut store, x).unwrap(), expected);
+		}
+		let digit = instance
+			.get_typed_func::<u32, i32>(&mut store, "digit")
+			.unwrap();
+		for (c, expected) in [('e', 0), (' ', 1), ('7', 2), ('z', 3)] {
+			assert_eq!(digit.call(&mut store, c as u32).unwrap(), expected);
+		}
+	}
+
 	/// Every enum variant covered without `_` is exhaustive; there is no
 	/// default body and reaching one would be unreachable.
 	#[test]
@@ -7508,51 +7695,6 @@ mod tests {
 				.unwrap();
 			assert_eq!(run.call(&mut store, ()).unwrap(), (3164, 123456));
 		}
-	}
-
-	#[test]
-	#[ignore = "C10: floating `%` is unsupported until a math library provides fmod"]
-	fn edge_float_remainder_agrees_with_constant_evaluation() {
-		let source = r#"
-		const EXPECTED: f64 = 5.0 % (1.0 / 0.0);
-		func run(x: f64, y: f64) -> (f64, f64) { (x % y, EXPECTED) }
-		export { run }
-	"#;
-		let mut results = Vec::new();
-		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
-			let (mut store, instance) = instantiate_with_policy(source, policy);
-			let run = instance
-				.get_typed_func::<(f64, f64), (f64, f64)>(&mut store, "run")
-				.unwrap();
-			results.push(run.call(&mut store, (5.0, f64::INFINITY)).unwrap());
-		}
-		assert_eq!(results, vec![(5.0, 5.0); 2]);
-	}
-
-	#[test]
-	#[ignore = "C10: floating `rem` is unsupported until a math library provides fmod"]
-	fn edge_float_remainder_methods_agree_with_constant_evaluation() {
-		let source = r#"
-		const EXPECTED: f64 = 5.0 % (1.0 / 0.0);
-		func run(x: f64, y: f64, a: f32, b: f32) -> (f64, f32, f64) {
-			(x.rem(y), a.rem(b), EXPECTED)
-		}
-		export { run }
-	"#;
-		let mut results = Vec::new();
-		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
-			let (mut store, instance) = instantiate_with_policy(source, policy);
-			let run = instance
-				.get_typed_func::<(f64, f64, f32, f32), (f64, f32, f64)>(
-					&mut store, "run",
-				)
-				.unwrap();
-			results.push(
-				run.call(&mut store, (5.0, f64::INFINITY, 5.0, f32::INFINITY))
-					.unwrap(),
-			);
-		}
-		assert_eq!(results, vec![(5.0, 5.0, 5.0); 2]);
 	}
 
 	#[test]

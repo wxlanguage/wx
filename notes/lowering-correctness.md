@@ -420,8 +420,8 @@ Validation: `cargo test -p wx-compiler` — **1,215 passed, 0 failed, 4 ignored*
 
 ### C10 — Floating remainder panics; its trait implementation also disagrees
 
-Status: **panic and incorrect stdlib implementation removed; general fmod is a
-math-library follow-up**.
+Status: **closed. Floating remainder is not part of the core library, by
+design: it belongs to the math library, as an `fmod` function.**
 
 ```wx
 func run(x: f64, y: f64) -> f64 { x % y }
@@ -450,15 +450,18 @@ instead of reaching the integer-only opt path:
   named `rem` found for type `f64`".
 
 No MIR is produced and the `opt/builder.rs` "remainder has integer operands"
-unreachable is no longer reachable from checked source. Constant evaluation of
-`5.0 % (1.0 / 0.0)` still uses the host `%` and remains the semantic reference
-for a future implementation.
+unreachable is no longer reachable from checked source. A constant is checked
+the same way (`const E: f64 = 5.0 % 2.0` is E2063), so the evaluator's float
+`Rem` arms (`eval.rs`'s `binary`) are `unreachable!` too.
 
-Added the unignored diagnostics regression
-`float_remainder_is_unsupported_without_a_stdlib_impl`. The two execution tests
-remain ignored as future fmod coverage:
-`edge_float_remainder_agrees_with_constant_evaluation` and
-`edge_float_remainder_methods_agree_with_constant_evaluation`.
+The diagnostics regression is `a_float_has_no_remainder` (`tir/typecheck.rs`:
+`%`, `.rem()` and a constant; added 2026-11-05, the earlier
+`float_remainder_is_unsupported_without_a_stdlib_impl` was not in the live
+suite). The two ignored
+execution probes (`edge_float_remainder_agrees_with_constant_evaluation`,
+`edge_float_remainder_methods_agree_with_constant_evaluation`) were removed on
+2026-11-05: they tested float `%` in the core language, which is not planned;
+the math library's `fmod` will have its own tests.
 
 Validation: `cargo test -p wx-compiler` — **1,215 passed, 0 failed, 4 ignored**;
 `primitive_operators_match_the_stdlib_impls`, the C09 native/std-method
@@ -546,7 +549,7 @@ and diff checks passed. Logs: `/tmp/opencode/wx-edge-fourth.log`,
 After the C08 fix, C10 removal, and C09 completion: `cargo test -p
 wx-compiler` — **1,215 passed, 0 failed, 4 ignored**; the C08 probe, both C09
 lowering tests, and the C10 diagnostics regression run unignored. The C10 fmod
-execution probes remain open.
+execution probes were later removed (float `%` is not a core-library operator).
 
 Record each case's failing regression, implementation, commands, and outcome in
 its section. Do not mark a case complete on checking or Wasm validation alone:

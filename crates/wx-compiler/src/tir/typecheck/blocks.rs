@@ -374,9 +374,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		expr
 	}
 
-	/// The type a match's arms share: the first typed one's, which an
+	/// The type a match's arms share: the first typed one's, which every
 	/// untyped arm takes; `!` gives way to the others, and with no arm the
-	/// match is `!`.
+	/// match is `!`. While the arms are untyped they join among themselves
+	/// (`{integer}` with `{float}` is `{float}`) and the match waits for its
+	/// context, which coerces each of them.
 	fn join_arms(&mut self, arms: &[ExprIdx]) -> TypeIndex {
 		let Some(&first) = arms
 			.iter()
@@ -398,6 +400,17 @@ impl BodyContext<'_, '_, '_, '_> {
 			// rest join.
 			if !self.cx.types.needs_context(self.body.ty(arm)) {
 				joined = arm;
+			}
+		}
+		// `join_branches` coerced only the arm a typed one met (`joined`);
+		// the untyped arms joined before it still wait for a type
+		// (`0, 1, g()` with `g() -> u8`). The match is typed now, so its
+		// context will not coerce them.
+		if ty != TypeIndex::ERROR && !self.cx.types.needs_context(ty) {
+			for &arm in arms {
+				if self.cx.types.needs_context(self.body.ty(arm)) {
+					self.coerce(arm, ty);
+				}
 			}
 		}
 		ty

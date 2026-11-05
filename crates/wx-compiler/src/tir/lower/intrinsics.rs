@@ -83,6 +83,22 @@ impl Lowerer<'_, '_, '_, '_> {
 				mir::ValueType::Never,
 			));
 		}
+		self.expand_intrinsic(state, callee, intrinsic, arguments, prefix, ty)
+	}
+
+	/// `intrinsic`'s operation over `arguments`, its operands already lowered
+	/// (one per parameter), after `prefix`. A call site lowers the operands
+	/// from its arguments; an intrinsic's own function
+	/// (`lower_intrinsic_function`) reads them from its parameters.
+	pub(super) fn expand_intrinsic(
+		&mut self,
+		state: &mut FunctionState,
+		callee: FunctionInstance,
+		intrinsic: Intrinsic,
+		arguments: Vec<mir::ExprId>,
+		mut prefix: Vec<mir::ExprId>,
+		ty: mir::ValueType,
+	) -> Result<mir::ExprId, ()> {
 		let mut arguments = arguments.into_iter();
 		macro_rules! operand {
 			() => {
@@ -349,7 +365,10 @@ impl Lowerer<'_, '_, '_, '_> {
 				len: operand!(),
 			},
 			Intrinsic::SizeOf | Intrinsic::AlignOf => {
-				unreachable!("lowered before its arguments")
+				unreachable!(
+					"lowered by its call site before its arguments, and \
+					 generic, so it has no function of its own"
+				)
 			}
 		};
 		assert!(arguments.next().is_none(), "std intrinsic operand count");

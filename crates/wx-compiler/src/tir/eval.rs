@@ -2388,7 +2388,9 @@ fn binary(
 				BinaryOp::Sub => a - b,
 				BinaryOp::Mul => a * b,
 				BinaryOp::Div => a / b,
-				BinaryOp::Rem => a % b,
+				// std implements no `Rem` for a float (an `fmod` is the math
+				// library's), so checked source never asks for one.
+				BinaryOp::Rem => unreachable!("a float has no `%`"),
 				_ => unreachable!(),
 			}))
 		}
@@ -2399,7 +2401,9 @@ fn binary(
 				BinaryOp::Sub => a - b,
 				BinaryOp::Mul => a * b,
 				BinaryOp::Div => a / b,
-				BinaryOp::Rem => a % b,
+				// std implements no `Rem` for a float (an `fmod` is the math
+				// library's), so checked source never asks for one.
+				BinaryOp::Rem => unreachable!("a float has no `%`"),
 				_ => unreachable!(),
 			}))
 		}

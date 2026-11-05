@@ -7526,6 +7526,28 @@ mod tests {
 		);
 	}
 
+	/// std implements no `Rem` for a float (an `fmod` is the math
+	/// library's), so float `%` is refused wherever it is written, a constant
+	/// included: constant evaluation relies on never meeting one.
+	#[test]
+	fn a_float_has_no_remainder() {
+		test_case!(
+			case = indoc! {"
+				func a(x: f64, y: f64) -> f64 { x % y }
+				func b(x: f32, y: f32) -> f32 { x.rem(y) }
+				const C: f64 = 5.0 % 2.0;
+			"}
+		);
+		// Constant bodies are checked before function bodies.
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::MethodNotFound,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the trait bound `f64: Rem` is not satisfied");
+	}
+
 	#[test]
 	fn match_arms_share_a_type() {
 		test_case!(
@@ -7541,6 +7563,24 @@ mod tests {
 			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
 		assert_eq!(case.body_type("f"), "u64");
 		assert_eq!(case.body_type("g"), "u8");
+	}
+
+	#[test]
+	fn every_untyped_arm_takes_a_later_typed_arms_type() {
+		// The typed arm meets the first untyped one; the ones between are
+		// coerced too, so `300` is held to `u8` like the others.
+		test_case!(
+			case = indoc! {"
+				func g() -> u8 { 5 }
+				func f(x: u32) -> u8 { match x { 0 => 1, 1 => 2, _ => g() } }
+				func h(x: u32) -> u8 { local v = match x { 0 => 1, 1 => 300, _ => g() }; v }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+		case.diagnostics()
+			.assert_error_saying("literal `300` cannot be represented as `u8`");
+		assert_eq!(case.body_type("f"), "u8");
 	}
 
 	#[test]
