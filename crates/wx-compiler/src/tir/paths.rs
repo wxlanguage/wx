@@ -4,7 +4,9 @@
 //! Matches rustc: an unqualified name is looked up only in the namespace it
 //! was written in (its own direct declarations, its own `use`/glob
 //! imports), then the std prelude as a fallback — **never** by climbing to an
-//! enclosing module. A struct declared at the package root is not visible,
+//! enclosing module. Import blocks follow the same rule: sibling declarations
+//! are local, and enclosing names need a qualified path or an explicit `use`.
+//! A struct declared at the package root is not visible,
 //! unqualified, from inside a child `mod inner { }` any more than it would
 //! be in Rust; reaching it needs `super::Outer`, exactly as it would there.
 //! (The pre-rewrite builder's `lookup_scope_chain`, in

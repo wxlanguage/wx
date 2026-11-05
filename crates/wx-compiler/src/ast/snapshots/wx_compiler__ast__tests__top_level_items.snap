@@ -331,44 +331,45 @@ items:
             inner:
               - inner:
                   inner:
-                    external_name: ~
-                    declaration:
-                      Function:
-                        signature:
-                          name:
-                            inner: 46
-                            span:
-                              start: 193
-                              end: 196
-                          type_params: []
-                          params:
-                            - inner:
-                                inner:
-                                  binding:
-                                    Name:
-                                      mut_span: ~
-                                      name:
-                                        inner: 47
-                                        span:
-                                          start: 197
-                                          end: 204
-                                  ty:
-                                    inner:
-                                      Path:
-                                        - ident:
-                                            inner: 48
-                                            span:
-                                              start: 206
-                                              end: 212
-                                          type_args: []
-                                    span:
-                                      start: 206
-                                      end: 212
-                                span:
-                                  start: 197
-                                  end: 212
-                              separator: ~
-                          result: ~
+                    Declaration:
+                      external_name: ~
+                      declaration:
+                        Function:
+                          signature:
+                            name:
+                              inner: 46
+                              span:
+                                start: 193
+                                end: 196
+                            type_params: []
+                            params:
+                              - inner:
+                                  inner:
+                                    binding:
+                                      Name:
+                                        mut_span: ~
+                                        name:
+                                          inner: 47
+                                          span:
+                                            start: 197
+                                            end: 204
+                                    ty:
+                                      inner:
+                                        Path:
+                                          - ident:
+                                              inner: 48
+                                              span:
+                                                start: 206
+                                                end: 212
+                                            type_args: []
+                                      span:
+                                        start: 206
+                                        end: 212
+                                  span:
+                                    start: 197
+                                    end: 212
+                                separator: ~
+                            result: ~
                   span:
                     start: 188
                     end: 213

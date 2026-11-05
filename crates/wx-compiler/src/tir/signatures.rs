@@ -11100,6 +11100,249 @@ pub(super) mod tests {
 	}
 
 	#[test]
+	fn import_signatures_resolve_sibling_memories_before_outer_bindings() {
+		test_case!(mut case = indoc! {r#"
+			memory io: u64;
+			import "host" as host {
+				use super::*;
+				func report(bytes: io::&[u8]) -> io::Size;
+				global cursor: io::*u8;
+				memory io: u32;
+			}
+			func expected(bytes: host::io::&[u8]) {}
+			func cursor() -> host::io::*u8 { host::cursor.get() }
+		"#});
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.normalized_param("host::report", 0),
+			case.normalized_param("expected", 0)
+		);
+		assert_eq!(case.normalized_return("host::report"), TypeIndex::U32);
+	}
+
+	#[test]
+	fn import_signatures_resolve_an_earlier_sibling_memory() {
+		test_case!(
+			case = indoc! {r#"
+			import "host" as host {
+				memory io: u32;
+				func report(bytes: io::&[u8]);
+			}
+			func forward(bytes: host::io::&[u8]) { host::report(bytes); }
+		"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn import_block_named_use_coexists_with_a_parent_glob() {
+		test_case!(
+			case = indoc! {r#"
+			struct Packet(value: u8);
+			import "host" as host {
+				use super::Packet;
+				func send(packet: Packet);
+			}
+			use host::*;
+			func forward(packet: Packet) { send(packet); }
+		"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn import_block_grouped_uses_resolve_aliases() {
+		test_case!(
+			case = indoc! {r#"
+			struct Packet(value: u8);
+			type Width = u32;
+			import "host" as host {
+				func send(packet: Message, size: Width);
+				use super::{Packet as Message, Width};
+			}
+			func forward(packet: Packet) { host::send(packet, 1); }
+		"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn import_block_glob_coexists_with_a_named_parent_import() {
+		test_case!(
+			case = indoc! {r#"
+			struct Packet(value: u8);
+			import "host" as host {
+				use super::*;
+				func send(packet: Packet);
+			}
+			use host::send;
+			func forward(packet: Packet) { send(packet); }
+		"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn import_block_private_glob_is_not_reexported() {
+		test_case!(
+			case = indoc! {r#"
+			mod types { pub struct Message(); }
+			import "host" as host { use super::types::*; }
+			mod client { use super::host::*; func wrong(packet: Message) {} }
+		"#}
+		);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::UndeclaredIdentifier);
+	}
+
+	#[test]
+	fn import_block_private_alias_cannot_be_named_from_outside() {
+		test_case!(
+			case = indoc! {r#"
+			struct Packet();
+			import "host" as host { use super::Packet as Message; func send(packet: Message); }
+			func wrong(packet: host::Message) {}
+		"#}
+		);
+		case.diagnostics().assert_error(DiagnosticCode::PrivateItem);
+	}
+
+	#[test]
+	fn import_block_named_reexport_exposes_a_public_type() {
+		test_case!(
+			case = indoc! {r#"
+			pub struct Packet(pub value: u8);
+			import "host" as host { pub use super::Packet; }
+			func round_trip(packet: host::Packet) -> Packet { packet }
+		"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn import_block_grouped_reexports_preserve_aliases() {
+		test_case!(
+			case = indoc! {r#"
+			pub struct Packet(pub value: u8);
+			pub type Width = u32;
+			import "host" as host { pub use super::{Packet as Message, Width}; }
+			func round_trip(packet: host::Message, width: host::Width) -> (Packet, u32) {
+				(packet, width)
+			}
+		"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn import_block_public_glob_is_visible_to_a_client() {
+		test_case!(
+			case = indoc! {r#"
+			mod types { pub struct Packet(pub value: u8); }
+			import "host" as host { pub use super::types::*; }
+			mod client {
+				use super::host::*;
+				func round_trip(packet: Packet) -> super::types::Packet { packet }
+			}
+		"#}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn import_blocks_cannot_reexport_private_items() {
+		test_case!(
+			case = indoc! {r#"
+			struct Packet(pub value: u8);
+			import "host" as host { pub use super::Packet; func send(packet: Packet); }
+		"#}
+		);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::PrivateReexport);
+	}
+
+	#[test]
+	fn import_block_private_glob_cycles_are_rejected() {
+		test_case!(
+			case = indoc! {r#"
+			use host::*;
+			import "host" as host { use super::*; func send(); }
+		"#}
+		);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::CyclicImport);
+	}
+
+	#[test]
+	fn import_block_private_glob_cycles_are_rejected_when_the_parent_use_is_later()
+	 {
+		test_case!(
+			case = indoc! {r#"
+			import "host" as host { use super::*; func send(); }
+			use host::*;
+		"#}
+		);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::CyclicImport);
+	}
+
+	#[test]
+	fn import_block_public_glob_does_not_bypass_cycle_checks() {
+		test_case!(
+			case = indoc! {r#"
+			use host::*;
+			import "host" as host { pub use super::*; func send(); }
+		"#}
+		);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::CyclicImport);
+	}
+
+	#[test]
+	fn import_signatures_reach_enclosing_types_through_scope_qualifiers() {
+		test_case!(mut case = indoc! {r#"
+			struct Root();
+			mod api {
+				type Width = u32;
+				struct Packet(value: u8);
+				import "host" as host {
+					func send(bytes: io::&[super::Packet], root: super::super::Root) -> io::Size;
+					memory io: super::Width;
+				}
+				func forward(bytes: host::io::&[Packet], root: crate::Root) -> u32 {
+					host::send(bytes, root)
+				}
+			}
+		"#});
+		case.diagnostics().assert_none();
+		assert_eq!(case.normalized_return("api::host::send"), TypeIndex::U32);
+	}
+
+	#[test]
+	fn import_signatures_do_not_implicitly_inherit_enclosing_types() {
+		test_case!(
+			case = indoc! {r#"
+			struct Packet();
+			import "host" as host { func send(packet: Packet); }
+		"#}
+		);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::UndeclaredIdentifier);
+	}
+
+	#[test]
+	fn import_signatures_do_not_make_siblings_visible_outside_the_block() {
+		test_case!(
+			case = indoc! {r#"
+			import "host" as host { memory io: u32; }
+			func wrong(bytes: io::&[u8]) {}
+		"#}
+		);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::UndeclaredIdentifier);
+	}
+
+	#[test]
 	fn imported_global_registers_a_synthetic_impl_with_its_value_type() {
 		test_case!(
 			std case = indoc! {r#"
@@ -13930,7 +14173,7 @@ pub(super) mod tests {
 			func f(a: heap::Size, b: host::shared::Size) {}
 			memory heap: Wrapper::Item;
 			global counter: Wrapper::Item = 0;
-			import "env" as host { memory shared: Wrapper::Item; global counter: Wrapper::Item; }
+			import "env" as host { memory shared: super::Wrapper::Item; global counter: super::Wrapper::Item; }
 		"#}
 		);
 		assert!(
@@ -13964,7 +14207,8 @@ pub(super) mod tests {
 		}
 		for declaration in [
 			"memory heap: heap::Size;",
-			"import \"env\" as host { memory heap: host::heap::Size; }",
+			"import \"env\" as host { memory heap: heap::Size; }",
+			"import \"env\" as host { memory heap: super::host::heap::Size; }",
 		] {
 			test_case!(
 				case = &format!("trait Memory {{ type Size; }} {declaration}")
@@ -18191,18 +18435,18 @@ pub(super) mod tests {
 		);
 	}
 
-	/// An import block's declarations are written in the scope around the
-	/// block, so their types resolve there. Test sources usually play the
-	/// stdlib's role, where the prelude would find `S` anyway; here the
-	/// stdlib is a separate package, so only the enclosing scope can.
+	/// Imported declarations reach enclosing types explicitly through `super`,
+	/// including when the standard library is a separate package.
 	#[test]
-	fn an_imported_declaration_resolves_its_types_in_the_enclosing_scope() {
+	fn an_imported_declaration_resolves_qualified_types_in_the_enclosing_scope()
+	{
 		let mut builder = vfs::CompilationUnitBuilder::new();
 		builder.load_stdlib();
 		let workspace =
 			vfs::VirtualFileSource::from_relative(HashMap::from([(
 				"main.wx".to_string(),
-				r#"struct S(); import "env" { func f(s: S); }"#.to_string(),
+				r#"struct S(); import "env" { func f(s: super::S); }"#
+					.to_string(),
 			)]));
 		let root = builder
 			.load_package(

@@ -1,6 +1,7 @@
 memory heap: u32;
 
 import "console" as console {
+    use super::heap;
     func log(message: heap::&[u8]);
 }
 

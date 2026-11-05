@@ -20,6 +20,7 @@ enum Errno(i32) {
 }
 
 import "wasi_snapshot_preview1" as wasi {
+    use super::{heap, Errno, FileDescriptor};
     func random_get(buf: heap::*[u8]) -> Errno;
     func fd_write(
         fd: FileDescriptor,

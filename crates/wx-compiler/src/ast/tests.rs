@@ -2911,20 +2911,104 @@ fn test_import_alias_and_entry_kinds() {
 	};
 	assert_eq!(case.strings.resolve(internal_name.inner), Some("host"));
 	assert!(matches!(
-		items.inner[0].inner.inner.declaration,
-		ImportDeclaration::Function { .. }
-	));
-	assert!(matches!(
-		items.inner[1].inner.inner.declaration,
-		ImportDeclaration::Global {
-			mut_span: Some(_),
+		items.inner[0].inner.inner,
+		ImportEntry::Declaration {
+			declaration: ImportDeclaration::Function { .. },
 			..
 		}
 	));
 	assert!(matches!(
-		items.inner[2].inner.inner.declaration,
-		ImportDeclaration::Memory { .. }
+		items.inner[1].inner.inner,
+		ImportEntry::Declaration {
+			declaration: ImportDeclaration::Global {
+				mut_span: Some(_),
+				..
+			},
+			..
+		}
 	));
+	assert!(matches!(
+		items.inner[2].inner.inner,
+		ImportEntry::Declaration {
+			declaration: ImportDeclaration::Memory { .. },
+			..
+		}
+	));
+}
+
+#[test]
+fn import_blocks_accept_private_use_trees() {
+	let case = TestCase::new(indoc! {r#"
+		import "host" as host {
+			use super::Packet;
+			use super::{Width, Packet as Message};
+			use super::*;
+			memory io: Width;
+			func send(bytes: io::&[Message]);
+		}
+	"#});
+	case.diagnostics().assert_none();
+	let Item::Import { items, .. } = case.item(0) else {
+		panic!("expected import block")
+	};
+	assert_eq!(items.inner.len(), 5);
+	assert!(matches!(
+		items.inner[0].inner.inner,
+		ImportEntry::Use { pub_span: None, .. }
+	));
+	assert!(matches!(
+		items.inner[1].inner.inner,
+		ImportEntry::Use { pub_span: None, .. }
+	));
+	assert!(matches!(
+		items.inner[2].inner.inner,
+		ImportEntry::Use { pub_span: None, .. }
+	));
+	assert!(matches!(
+		items.inner[3].inner.inner,
+		ImportEntry::Declaration {
+			declaration: ImportDeclaration::Memory { .. },
+			..
+		}
+	));
+}
+
+#[test]
+fn import_blocks_preserve_reexport_visibility() {
+	let case = TestCase::new(
+		r#"import "host" as host { pub use super::{Packet, Width}; func send(); }"#,
+	);
+	case.diagnostics().assert_none();
+	let Item::Import { items, .. } = case.item(0) else {
+		panic!("expected import block")
+	};
+	let ImportEntry::Use {
+		pub_span: Some(span),
+		..
+	} = &items.inner[0].inner.inner
+	else {
+		panic!("expected a public use item");
+	};
+	assert_eq!(
+		span.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
+		"pub"
+	);
+	assert!(matches!(
+		items.inner[1].inner.inner,
+		ImportEntry::Declaration {
+			declaration: ImportDeclaration::Function { .. },
+			..
+		}
+	));
+}
+
+#[test]
+fn import_declarations_still_reject_visibility_qualifiers() {
+	let case = TestCase::new(
+		r#"import "host" as host { pub func send(); func next(); }"#,
+	);
+	case.diagnostics()
+		.assert_error(DiagnosticCode::VisibilityNotPermitted);
 }
 
 #[test]
@@ -3645,8 +3729,10 @@ fn test_imported_function_is_a_declaration_without_a_body() {
 		panic!("item 0 is {}, not an import", item_kind(case.item(0)))
 	};
 	assert_eq!(entries.inner.len(), 1);
-	let ImportDeclaration::Function { signature, .. } =
-		&entries.inner[0].inner.inner.declaration
+	let ImportEntry::Declaration {
+		declaration: ImportDeclaration::Function { signature, .. },
+		..
+	} = &entries.inner[0].inner.inner
 	else {
 		panic!("expected an imported function")
 	};

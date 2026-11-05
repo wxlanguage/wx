@@ -436,156 +436,156 @@ enum ClockId(u32) {
 // out-pointers instead of one. This is the same shape already proven in
 // `examples/wasi_args`'s `args_sizes_get`.
 import "wasi_snapshot_preview1" as wasi {
-    func args_get(argv: heap::*u32, argv_buf: heap::*u8) -> Errno;
-    func args_sizes_get(argc: heap::*u32, argv_buf_size: heap::*u32) -> Errno;
-    func environ_get(environ: heap::*u32, environ_buf: heap::*u8) -> Errno;
+    func args_get(argv: super::heap::*u32, argv_buf: super::heap::*u8) -> super::Errno;
+    func args_sizes_get(argc: super::heap::*u32, argv_buf_size: super::heap::*u32) -> super::Errno;
+    func environ_get(environ: super::heap::*u32, environ_buf: super::heap::*u8) -> super::Errno;
     func environ_sizes_get(
-        environ_count: heap::*u32,
-        environ_buf_size: heap::*u32,
-    ) -> Errno;
-    func clock_res_get(id: ClockId, resolution: heap::*u64) -> Errno;
-    func clock_time_get(id: ClockId, precision: u64, time: heap::*u64) -> Errno;
-    func fd_advise(fd: Fd, offset: u64, len: u64, advice: Advice) -> Errno;
-    func fd_allocate(fd: Fd, offset: u64, len: u64) -> Errno;
-    func fd_close(fd: Fd) -> Errno;
-    func fd_datasync(fd: Fd) -> Errno;
-    func fd_fdstat_get(fd: Fd, stat: heap::*Fdstat) -> Errno;
-    func fd_fdstat_set_flags(fd: Fd, flags: u16) -> Errno;
+        environ_count: super::heap::*u32,
+        environ_buf_size: super::heap::*u32,
+    ) -> super::Errno;
+    func clock_res_get(id: super::ClockId, resolution: super::heap::*u64) -> super::Errno;
+    func clock_time_get(id: super::ClockId, precision: u64, time: super::heap::*u64) -> super::Errno;
+    func fd_advise(fd: super::Fd, offset: u64, len: u64, advice: super::Advice) -> super::Errno;
+    func fd_allocate(fd: super::Fd, offset: u64, len: u64) -> super::Errno;
+    func fd_close(fd: super::Fd) -> super::Errno;
+    func fd_datasync(fd: super::Fd) -> super::Errno;
+    func fd_fdstat_get(fd: super::Fd, stat: super::heap::*super::Fdstat) -> super::Errno;
+    func fd_fdstat_set_flags(fd: super::Fd, flags: u16) -> super::Errno;
     func fd_fdstat_set_rights(
-        fd: Fd,
+        fd: super::Fd,
         fs_rights_base: u64,
         fs_rights_inheriting: u64,
-    ) -> Errno;
-    func fd_filestat_get(fd: Fd, stat: heap::*Filestat) -> Errno;
-    func fd_filestat_set_size(fd: Fd, size: u64) -> Errno;
+    ) -> super::Errno;
+    func fd_filestat_get(fd: super::Fd, stat: super::heap::*super::Filestat) -> super::Errno;
+    func fd_filestat_set_size(fd: super::Fd, size: u64) -> super::Errno;
     func fd_filestat_set_times(
-        fd: Fd,
+        fd: super::Fd,
         atim: u64,
         mtim: u64,
         fst_flags: u16,
-    ) -> Errno;
+    ) -> super::Errno;
     func fd_pread(
-        fd: Fd,
-        iovs: heap::&[heap::*[u8]],
+        fd: super::Fd,
+        iovs: super::heap::&[super::heap::*[u8]],
         offset: u64,
-        nread: heap::*u32,
-    ) -> Errno;
-    func fd_prestat_get(fd: Fd, prestat: heap::*Prestat) -> Errno;
-    func fd_prestat_dir_name(fd: Fd, path: heap::*u8, path_len: u32) -> Errno;
+        nread: super::heap::*u32,
+    ) -> super::Errno;
+    func fd_prestat_get(fd: super::Fd, prestat: super::heap::*super::Prestat) -> super::Errno;
+    func fd_prestat_dir_name(fd: super::Fd, path: super::heap::*u8, path_len: u32) -> super::Errno;
     func fd_pwrite(
-        fd: Fd,
-        iovs: heap::&[heap::&[u8]],
+        fd: super::Fd,
+        iovs: super::heap::&[super::heap::&[u8]],
         offset: u64,
-        nwritten: heap::*u32,
-    ) -> Errno;
+        nwritten: super::heap::*u32,
+    ) -> super::Errno;
     func fd_read(
-        fd: Fd,
-        iovs: heap::&[heap::*[u8]],
-        nread: heap::*u32,
-    ) -> Errno;
+        fd: super::Fd,
+        iovs: super::heap::&[super::heap::*[u8]],
+        nread: super::heap::*u32,
+    ) -> super::Errno;
     func fd_readdir(
-        fd: Fd,
-        buf: heap::*u8,
+        fd: super::Fd,
+        buf: super::heap::*u8,
         buf_len: u32,
         cookie: u64,
-        bufused: heap::*u32,
-    ) -> Errno;
-    func fd_renumber(fd: Fd, to: Fd) -> Errno;
+        bufused: super::heap::*u32,
+    ) -> super::Errno;
+    func fd_renumber(fd: super::Fd, to: super::Fd) -> super::Errno;
     func fd_seek(
-        fd: Fd,
+        fd: super::Fd,
         offset: i64,
-        whence: Whence,
-        newoffset: heap::*u64,
-    ) -> Errno;
-    func fd_sync(fd: Fd) -> Errno;
-    func fd_tell(fd: Fd, offset: heap::*u64) -> Errno;
+        whence: super::Whence,
+        newoffset: super::heap::*u64,
+    ) -> super::Errno;
+    func fd_sync(fd: super::Fd) -> super::Errno;
+    func fd_tell(fd: super::Fd, offset: super::heap::*u64) -> super::Errno;
     func fd_write(
-        fd: Fd,
-        iovs: heap::&[heap::&[u8]],
-        nwritten: heap::*u32,
-    ) -> Errno;
-    func path_create_directory(fd: Fd, path: heap::&[u8]) -> Errno;
+        fd: super::Fd,
+        iovs: super::heap::&[super::heap::&[u8]],
+        nwritten: super::heap::*u32,
+    ) -> super::Errno;
+    func path_create_directory(fd: super::Fd, path: super::heap::&[u8]) -> super::Errno;
     func path_filestat_get(
-        fd: Fd,
+        fd: super::Fd,
         flags: u32,
-        path: heap::&[u8],
-        stat: heap::*Filestat,
-    ) -> Errno;
+        path: super::heap::&[u8],
+        stat: super::heap::*super::Filestat,
+    ) -> super::Errno;
     func path_filestat_set_times(
-        fd: Fd,
+        fd: super::Fd,
         flags: u32,
-        path: heap::&[u8],
+        path: super::heap::&[u8],
         atim: u64,
         mtim: u64,
         fst_flags: u16,
-    ) -> Errno;
+    ) -> super::Errno;
     func path_link(
-        old_fd: Fd,
+        old_fd: super::Fd,
         old_flags: u32,
-        old_path: heap::&[u8],
-        new_fd: Fd,
-        new_path: heap::&[u8],
-    ) -> Errno;
+        old_path: super::heap::&[u8],
+        new_fd: super::Fd,
+        new_path: super::heap::&[u8],
+    ) -> super::Errno;
     func path_open(
-        fd: Fd,
+        fd: super::Fd,
         dirflags: u32,
-        path: heap::&[u8],
+        path: super::heap::&[u8],
         oflags: u16,
         fs_rights_base: u64,
         fs_rights_inheriting: u64,
         fdflags: u16,
-        opened_fd: heap::*u32,
-    ) -> Errno;
+        opened_fd: super::heap::*u32,
+    ) -> super::Errno;
     func path_readlink(
-        fd: Fd,
-        path: heap::&[u8],
-        buf: heap::*u8,
+        fd: super::Fd,
+        path: super::heap::&[u8],
+        buf: super::heap::*u8,
         buf_len: u32,
-        bufused: heap::*u32,
-    ) -> Errno;
-    func path_remove_directory(fd: Fd, path: heap::&[u8]) -> Errno;
+        bufused: super::heap::*u32,
+    ) -> super::Errno;
+    func path_remove_directory(fd: super::Fd, path: super::heap::&[u8]) -> super::Errno;
     func path_rename(
-        fd: Fd,
-        old_path: heap::&[u8],
-        new_fd: Fd,
-        new_path: heap::&[u8],
-    ) -> Errno;
+        fd: super::Fd,
+        old_path: super::heap::&[u8],
+        new_fd: super::Fd,
+        new_path: super::heap::&[u8],
+    ) -> super::Errno;
     func path_symlink(
-        old_path: heap::&[u8],
-        fd: Fd,
-        new_path: heap::&[u8],
-    ) -> Errno;
-    func path_unlink_file(fd: Fd, path: heap::&[u8]) -> Errno;
+        old_path: super::heap::&[u8],
+        fd: super::Fd,
+        new_path: super::heap::&[u8],
+    ) -> super::Errno;
+    func path_unlink_file(fd: super::Fd, path: super::heap::&[u8]) -> super::Errno;
     // `$in`/`$out` are raw pointers to caller-managed arrays with the element
     // count passed separately (`nsubscriptions`), *not* witx `list`s — so
     // these stay single-element pointers rather than slices; the slice
     // ABI's implicit length would duplicate (and could disagree with)
     // `nsubscriptions`.
     func poll_oneoff(
-        in_: heap::&Subscription,
-        out: heap::*Event,
+        in_: super::heap::&super::Subscription,
+        out: super::heap::*super::Event,
         nsubscriptions: u32,
-        nevents: heap::*u32,
-    ) -> Errno;
+        nevents: super::heap::*u32,
+    ) -> super::Errno;
     func proc_exit(rval: u32);
-    func proc_raise(sig: Signal) -> Errno;
-    func sched_yield() -> Errno;
-    func random_get(buf: heap::*[u8]) -> Errno;
-    func sock_accept(fd: Fd, flags: u16, new_fd: heap::*u32) -> Errno;
+    func proc_raise(sig: super::Signal) -> super::Errno;
+    func sched_yield() -> super::Errno;
+    func random_get(buf: super::heap::*[u8]) -> super::Errno;
+    func sock_accept(fd: super::Fd, flags: u16, new_fd: super::heap::*u32) -> super::Errno;
     func sock_recv(
-        fd: Fd,
-        ri_data: heap::&[heap::*[u8]],
+        fd: super::Fd,
+        ri_data: super::heap::&[super::heap::*[u8]],
         ri_flags: u16,
-        ro_datalen: heap::*u32,
-        ro_flags: heap::*u16,
-    ) -> Errno;
+        ro_datalen: super::heap::*u32,
+        ro_flags: super::heap::*u16,
+    ) -> super::Errno;
     func sock_send(
-        fd: Fd,
-        si_data: heap::&[heap::&[u8]],
+        fd: super::Fd,
+        si_data: super::heap::&[super::heap::&[u8]],
         si_flags: u16,
-        so_datalen: heap::*u32,
-    ) -> Errno;
-    func sock_shutdown(fd: Fd, how: u8) -> Errno;
+        so_datalen: super::heap::*u32,
+    ) -> super::Errno;
+    func sock_shutdown(fd: super::Fd, how: u8) -> super::Errno;
 }
 
 // ── Demo ──────────────────────────────────────────────────────────────────

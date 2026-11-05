@@ -11,6 +11,7 @@ enum FileDescriptor(u8) {
 }
 
 import "wasi_snapshot_preview1" as wasi {
+    use super::{heap, FileDescriptor};
     func fd_write(
         file_descriptor: FileDescriptor,
         io_vecs: heap::&[heap::&[u8]],

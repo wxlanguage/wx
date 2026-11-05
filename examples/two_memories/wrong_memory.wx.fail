@@ -1,0 +1,5 @@
+// Appended to main.wx by the runner, in a temporary package.
+// An ordinary call cannot pass an internal-memory slice to the io interface.
+func wrong_memory(bytes: internal::&[u8]) {
+    host::report(bytes);
+}

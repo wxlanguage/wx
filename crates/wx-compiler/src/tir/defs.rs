@@ -1223,14 +1223,15 @@ pub enum Namespace {
 }
 
 /// A namespace code is written in: where an unqualified lookup starts, and
-/// the accessor of every privacy check. Only packages and modules are
-/// scopes; an enum's variants and an import block's declarations are only
-/// ever reached through a path.
+/// the accessor of every privacy check. Import signatures also have a scope:
+/// sibling declarations are local; `use` items can bring in other
+/// names. Enums expose variants through paths and are not scopes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Scope {
 	Package(PackageId),
 	Module(ModuleIdx),
+	Import(ImportIdx),
 }
 
 impl From<Scope> for Namespace {
@@ -1239,6 +1240,7 @@ impl From<Scope> for Namespace {
 		match scope {
 			Scope::Package(package) => Self::Package(package),
 			Scope::Module(module) => Self::Module(module),
+			Scope::Import(import) => Self::Import(import),
 		}
 	}
 }
@@ -1248,7 +1250,8 @@ impl Namespace {
 		match self {
 			Self::Package(package) => Some(Scope::Package(package)),
 			Self::Module(module) => Some(Scope::Module(module)),
-			Self::Enum(_) | Self::Import(_) => None,
+			Self::Import(import) => Some(Scope::Import(import)),
+			Self::Enum(_) => None,
 		}
 	}
 }
@@ -1289,7 +1292,7 @@ impl SymbolTable {
 	}
 }
 
-/// A scope's symbols, plus what only a scope has: a place in the module tree
+/// A scope's symbols, plus what only a scope has: a place in the lexical tree
 /// and the globs its `use path::*;` items brought in.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ScopeTable {
@@ -1303,6 +1306,36 @@ pub struct ScopeTable {
 	pub glob_imports: Vec<GlobImport>,
 }
 
+impl ScopeTable {
+	/// A module or import block has the same explicit scope qualifiers.
+	fn child(
+		mut symbols: SymbolTable,
+		scope: Scope,
+		parent: Scope,
+		package_id: PackageId,
+	) -> Self {
+		for (name, target) in [
+			(Keyword::SelfLower, Namespace::from(scope)),
+			(Keyword::Crate, Namespace::Package(package_id)),
+			(Keyword::Super, Namespace::from(parent)),
+		] {
+			symbols.bindings.insert(
+				BindingKey::ty(name.symbol()),
+				Binding::definition(
+					DefKey::new(target, LocalDefIdx::SELF),
+					Visibility::Public,
+				),
+			);
+		}
+		Self {
+			symbols,
+			parent: Some(parent),
+			package_id,
+			glob_imports: Vec::new(),
+		}
+	}
+}
+
 /// Every namespace's table, each list indexed by its owner's own index:
 /// `packages` by `PackageId`, `modules` by `ModuleIdx`, `enums` by `EnumIdx`
 /// and `imports` by `ImportIdx`. An owner and its table are pushed together,
@@ -1313,7 +1346,7 @@ pub struct Namespaces {
 	packages: Vec<ScopeTable>,
 	modules: Vec<ScopeTable>,
 	enums: Vec<SymbolTable>,
-	imports: Vec<SymbolTable>,
+	imports: Vec<ScopeTable>,
 	/// Every package instance, indexed by `PackageInstanceIdx`. Held here because what
 	/// a package instance's alias leads into is part of how a path walks, and the
 	/// item says which package that is.
@@ -1527,7 +1560,9 @@ impl Namespaces {
 				&self.modules[usize::from(module)].symbols
 			}
 			Namespace::Enum(enum_index) => &self.enums[usize::from(enum_index)],
-			Namespace::Import(import) => &self.imports[usize::from(import)],
+			Namespace::Import(import) => {
+				&self.imports[usize::from(import)].symbols
+			}
 		}
 	}
 
@@ -1542,7 +1577,9 @@ impl Namespaces {
 			Namespace::Enum(enum_index) => {
 				&mut self.enums[usize::from(enum_index)]
 			}
-			Namespace::Import(import) => &mut self.imports[usize::from(import)],
+			Namespace::Import(import) => {
+				&mut self.imports[usize::from(import)].symbols
+			}
 		}
 	}
 
@@ -1550,6 +1587,7 @@ impl Namespaces {
 		match scope {
 			Scope::Package(package) => &self.packages[package.as_usize()],
 			Scope::Module(module) => &self.modules[usize::from(module)],
+			Scope::Import(import) => &self.imports[usize::from(import)],
 		}
 	}
 
@@ -1557,6 +1595,7 @@ impl Namespaces {
 		match scope {
 			Scope::Package(package) => &mut self.packages[package.as_usize()],
 			Scope::Module(module) => &mut self.modules[usize::from(module)],
+			Scope::Import(import) => &mut self.imports[usize::from(import)],
 		}
 	}
 
@@ -1614,8 +1653,8 @@ impl Namespaces {
 	) -> bool {
 		match visibility {
 			Visibility::Public => true,
-			// No code is written inside an enum or an import block, so no
-			// accessor is ever inside one.
+			// An enum has no lexical scope; import signatures do, and inherit
+			// access to private declarations in their enclosing module.
 			Visibility::Private => target
 				.as_scope()
 				.is_some_and(|target| self.contains(target, accessor)),
@@ -1712,8 +1751,8 @@ impl Namespaces {
 	/// rule `is_accessible_from` applies everywhere else. Recurses via
 	/// `lookup` at each hop, not into itself, so a re-export chain composes
 	/// through direct declarations and further re-exports alike. Terminates
-	/// because `compute_glob_item` already rejects a cycle in this exact
-	/// edge set before it can be walked. Only a scope has globs.
+	/// because import resolution rejects any cycle that an accessor could
+	/// actually traverse. Only a scope has globs.
 	///
 	/// `accessor` also matters once two *distinct* candidates compete: a
 	/// candidate `accessor` could never legally choose is excluded right
@@ -1721,7 +1760,7 @@ impl Namespaces {
 	/// candidate is always returned `Found`, visibility included,
 	/// regardless of whether `accessor` can see *that candidate* — deferred
 	/// to the caller, same as a direct (non-glob) hit already is.
-	pub(super) fn indirect_lookup(
+	fn indirect_lookup(
 		&self,
 		use_items: &[UseItemDef],
 		accessor: Scope,
@@ -2931,8 +2970,8 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		);
 	}
 
-	/// Pushes a module together with its scope, which binds the module's own
-	/// name and `self` to the module, `crate` to its package's root and
+	/// Pushes a module together with its scope, which binds
+	/// `self` to the module, `crate` to its package's root and
 	/// `super` to the scope it was declared in.
 	fn push_module(
 		&mut self,
@@ -2942,42 +2981,22 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		let index = ModuleIdx::new(u32::try_from(self.modules.len()).unwrap());
 		let parent = module.parent_namespace;
 		let package_id = self.namespaces.scope(parent).package_id;
-		let this = DefKey::new(Namespace::Module(index), LocalDefIdx::SELF);
 		let mut symbols = SymbolTable::new(module.own_file);
 		symbols
 			.items
 			.push(ItemDef::new(DefKind::Module(index), content_span));
-		symbols.bindings.insert(
-			BindingKey::ty(ast::Keyword::SelfLower.symbol()),
-			Binding::definition(this, Visibility::Public),
-		);
-		symbols.bindings.insert(
-			BindingKey::ty(ast::Keyword::Crate.symbol()),
-			Binding::definition(
-				DefKey::new(Namespace::Package(package_id), LocalDefIdx::SELF),
-				Visibility::Public,
-			),
-		);
-		symbols.bindings.insert(
-			BindingKey::ty(ast::Keyword::Super.symbol()),
-			Binding::definition(
-				DefKey::new(parent.into(), LocalDefIdx::SELF),
-				Visibility::Public,
-			),
-		);
 		self.modules.push(module);
-		self.namespaces.modules.push(ScopeTable {
+		self.namespaces.modules.push(ScopeTable::child(
 			symbols,
-			parent: Some(parent),
+			Scope::Module(index),
+			parent,
 			package_id,
-			glob_imports: Vec::new(),
-		});
+		));
 		index
 	}
 
-	/// Pushes an import block together with its table, which holds only the
-	/// block's own declarations: an import block is entered through a path,
-	/// never written in, so it binds no `self`, `crate` or `super`.
+	/// Pushes an import block with its own signature scope, using the same
+	/// `self`, `crate` and `super` qualifiers as a module.
 	fn push_import(
 		&mut self,
 		import: ImportDef,
@@ -2985,12 +3004,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		content_span: TextSpan,
 	) -> ImportIdx {
 		let index = ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
+		let parent = import.parent_namespace;
+		let package_id = self.namespaces.scope(parent).package_id;
 		let mut symbols = SymbolTable::new(file_id);
 		symbols
 			.items
 			.push(ItemDef::new(DefKind::Import(index), content_span));
 		self.imports.push(import);
-		self.namespaces.imports.push(symbols);
+		self.namespaces.imports.push(ScopeTable::child(
+			symbols,
+			Scope::Import(index),
+			parent,
+			package_id,
+		));
 		index
 	}
 
@@ -3995,8 +4021,22 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					);
 				}
 
+				// Imported declarations are written inside the block: resolve
+				// their signatures (and synthetic impls) in its sibling scope.
+				let namespace = Scope::Import(import);
 				for item in items.inner.iter() {
-					match &item.inner.inner.declaration {
+					let decl = match &item.inner.inner {
+						ast::ImportEntry::Use { tree, pub_span } => {
+							self.scan_use_tree(
+								namespace, tree, None, *pub_span,
+							);
+							continue;
+						}
+						ast::ImportEntry::Declaration {
+							declaration, ..
+						} => declaration,
+					};
+					match decl {
 						ast::ImportDeclaration::Memory { name, .. } => {
 							let memory_index = MemoryIdx::new(
 								u32::try_from(self.memories.len()).unwrap(),
@@ -4037,7 +4077,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								node: AstNodeRef::ImportedMemory {
 									memory_index,
 									import_index: import,
-									decl: &item.inner.inner.declaration,
+									decl,
 								},
 							});
 						}
@@ -4088,7 +4128,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								node: AstNodeRef::ImportedFunction {
 									function_index,
 									import_index: import,
-									decl: &item.inner.inner.declaration,
+									decl,
 								},
 							});
 						}
@@ -4142,7 +4182,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 								node: AstNodeRef::ImportedGlobal {
 									global_index,
 									import_index: import,
-									decl: &item.inner.inner.declaration,
+									decl,
 								},
 							});
 						}
@@ -5224,11 +5264,13 @@ mod tests {
 		"#});
 		case.diagnostics().assert_no_errors();
 
-		// An import block's declarations are written in the scope around
-		// the block, so that is their namespace too.
+		// Imported declarations are written in their block's own scope.
 		let root = case.root_namespace();
+		let imported = Scope::Import(ImportIdx::new(0));
 		let mut indices = Vec::new();
-		for (path, name) in [("heap", "heap"), ("host::shared", "shared")] {
+		for (path, name, namespace) in
+			[("heap", "heap", root), ("host::shared", "shared", imported)]
+		{
 			let kind = case.resolve(Tier::Type, path).expect_success();
 			assert_eq!(kind, case.resolve(Tier::Value, path).expect_success());
 			let DefKind::Memory(index) = kind else {
@@ -5239,7 +5281,7 @@ mod tests {
 				case.graph.strings.resolve(memory.name.inner),
 				Some(name)
 			);
-			assert_eq!(memory.namespace, root);
+			assert_eq!(memory.namespace, namespace);
 			assert_eq!(
 				memory.file_id,
 				case.defs.namespaces.file_id(root.into())
@@ -5259,7 +5301,7 @@ mod tests {
 			panic!("expected an imported function");
 		};
 		let function = &case.defs.functions[usize::from(index)];
-		assert_eq!(function.namespace, root);
+		assert_eq!(function.namespace, imported);
 		assert_eq!(
 			case.graph.strings.resolve(function.name.inner),
 			Some("log")
@@ -5290,7 +5332,7 @@ mod tests {
 	}
 
 	#[test]
-	fn an_import_block_is_entered_through_a_path_but_never_written_in() {
+	fn an_import_block_has_the_same_scope_qualifiers_as_a_module() {
 		let mut case = TestCase::new(indoc! {r#"
 			import "env" as host { func log(); }
 		"#});
@@ -5299,13 +5341,23 @@ mod tests {
 			case.resolve(Tier::Value, "host::log").expect_success(),
 			DefKind::Function(_),
 		));
-		// The block holds only its own declarations: it is not a scope, so
-		// it binds neither its own name nor `self`, `crate` or `super`.
-		for path in ["host::host", "host::self", "host::crate", "host::super"] {
-			case.resolve(Tier::Type, path)
-				.diagnostics()
-				.assert_error(DiagnosticCode::UndeclaredIdentifier);
-		}
+		let host = case.resolve(Tier::Type, "host").expect_success();
+		assert_eq!(
+			case.resolve(Tier::Type, "host::self").expect_success(),
+			host
+		);
+		let root = DefKind::Package(case.defs.root_package);
+		assert_eq!(
+			case.resolve(Tier::Type, "host::crate").expect_success(),
+			root
+		);
+		assert_eq!(
+			case.resolve(Tier::Type, "host::super").expect_success(),
+			root
+		);
+		case.resolve(Tier::Type, "host::host")
+			.diagnostics()
+			.assert_error(DiagnosticCode::UndeclaredIdentifier);
 	}
 
 	/// An import block is a namespace like an enum is: `use` can reach its
@@ -6011,7 +6063,7 @@ mod tests {
 		let helper = case.graph.strings.get_or_intern("helper");
 
 		assert!(matches!(
-			case.defs.namespaces.indirect_lookup(
+			case.defs.namespaces.lookup(
 				&case.defs.use_items,
 				root,
 				b.into(),
@@ -6049,7 +6101,7 @@ mod tests {
 			.unwrap();
 		let helper = case.graph.strings.get_or_intern("helper");
 
-		match case.defs.namespaces.indirect_lookup(
+		match case.defs.namespaces.lookup(
 			&case.defs.use_items,
 			inner,
 			m.into(),
@@ -6095,7 +6147,7 @@ mod tests {
 			panic!("`a::helper` should resolve directly");
 		};
 
-		match case.defs.namespaces.indirect_lookup(
+		match case.defs.namespaces.lookup(
 			&case.defs.use_items,
 			root,
 			hub.into(),
@@ -6137,7 +6189,7 @@ mod tests {
 		let hub = case.scope("hub");
 		let pick = case.graph.strings.get_or_intern("pick");
 
-		match case.defs.namespaces.indirect_lookup(
+		match case.defs.namespaces.lookup(
 			&case.defs.use_items,
 			root,
 			hub.into(),

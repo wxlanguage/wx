@@ -1955,9 +1955,16 @@ pub enum ImportDeclaration {
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub struct ImportEntry {
-	pub external_name: Option<Spanned<SymbolU32>>,
-	pub declaration: ImportDeclaration,
+pub enum ImportEntry {
+	Declaration {
+		external_name: Option<Spanned<SymbolU32>>,
+		declaration: ImportDeclaration,
+	},
+	/// A source-level import/re-export, not an entity imported from the host.
+	Use {
+		pub_span: Option<TextSpan>,
+		tree: Spanned<UseTree>,
+	},
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
@@ -6509,6 +6516,8 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_import_entry(
 		parser: &mut Parser,
 	) -> Result<Spanned<ImportEntry>, ()> {
+		let pub_span = matches!(parser.peek_keyword(), Some(Keyword::Pub))
+			.then(|| parser.lexer.next().span);
 		let token = parser.lexer.peek();
 		let keyword = match token.inner {
 			Token::Identifier => {
@@ -6516,10 +6525,38 @@ impl<'ctx> Parser<'ctx> {
 			}
 			_ => None,
 		};
+		if let Some(span) = pub_span
+			&& !matches!(keyword, Some(Keyword::Use))
+		{
+			parser.ast.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::VisibilityNotPermitted.code())
+					.with_message(
+						"visibility qualifiers are not permitted on host import declarations",
+					)
+					.with_label(
+						SourceSpan::new(parser.ast.file_id, span)
+							.primary_label()
+							.with_message("remove `pub`"),
+					)
+					.with_note(
+						"inside an import block, `pub` is supported on `use` items only",
+					),
+			);
+		}
 		match keyword {
+			Some(Keyword::Use) => {
+				let use_span = parser.lexer.next().span;
+				let start = pub_span.unwrap_or(use_span).start;
+				let tree = Self::parse_use_tree(parser)?;
+				Ok(Spanned {
+					span: TextSpan::new(start, tree.span.end),
+					inner: ImportEntry::Use { pub_span, tree },
+				})
+			}
 			Some(Keyword::Func) => {
 				parser.parse_function_signature().map(|signature| Spanned {
-					inner: ImportEntry {
+					inner: ImportEntry::Declaration {
 						external_name: None,
 						declaration: ImportDeclaration::Function {
 							signature: signature.inner,
@@ -6531,7 +6568,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Global) => parser
 				.parse_global_import_declaration()
 				.map(|decl| Spanned {
-					inner: ImportEntry {
+					inner: ImportEntry::Declaration {
 						external_name: None,
 						declaration: decl.inner,
 					},
@@ -6540,7 +6577,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Memory) => parser
 				.parse_memory_import_declaration()
 				.map(|decl| Spanned {
-					inner: ImportEntry {
+					inner: ImportEntry::Declaration {
 						external_name: None,
 						declaration: decl.inner,
 					},

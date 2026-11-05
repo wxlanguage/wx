@@ -118,6 +118,37 @@ fn test_format_use_trees() {
 }
 
 #[test]
+fn test_format_uses_and_reexports_in_import_blocks() {
+	let source = indoc! {r#"
+		import "host" as host {
+			// Types used by the interface, not host imports.
+			use super::{Packet as Message, Width};
+			use super::*;
+			pub use super::PublicPacket as ExposedPacket;
+			pub use super::types::*;
+
+			memory io: Width;
+			func send(bytes: io::&[Message]);
+		}
+	"#};
+	let expected = source.replace('\t', "    ");
+	for input in [source, expected.as_str()] {
+		let case = TestCase::new(input);
+		assert!(case.ast.diagnostics.is_empty());
+		let output = format(
+			&case.ast,
+			&case.interner,
+			&case.files.get(case.ast.file_id).unwrap().source,
+			RendererConfig {
+				max_line_width: 80,
+				indent_width: 4,
+			},
+		);
+		assert_eq!(output, expected);
+	}
+}
+
+#[test]
 fn test_format_import_block() {
 	let case = TestCase::new(indoc! {"
         import \"math\" as math {

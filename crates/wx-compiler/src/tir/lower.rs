@@ -7843,6 +7843,43 @@ mod tests {
 	}
 
 	#[test]
+	fn import_block_reexports_do_not_create_host_import_entries() {
+		let source = r#"
+			mod helpers { pub func add_one(value: i32) -> i32 { value + 1 } }
+			import "host" as host {
+				pub use super::helpers::add_one as prepare;
+				func exchange(value: i32) -> i32;
+			}
+			func run(value: i32) -> i32 { host::exchange(host::prepare(value)) }
+			export { run }
+		"#;
+		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mir = crate::tir::build(&mut graph)
+			.1
+			.expect("re-exported function lowers");
+		mir.verify_imports().unwrap();
+		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+			.unwrap()
+			.encode();
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, bytes).unwrap();
+		let imports: Vec<_> = module
+			.imports()
+			.map(|item| (item.module().to_string(), item.name().to_string()))
+			.collect();
+		assert_eq!(imports, [("host".to_string(), "exchange".to_string())]);
+		let mut store = wasmtime::Store::new(&engine, ());
+		let host = wasmtime::Func::wrap(&mut store, |value: i32| value * 2);
+		let instance =
+			wasmtime::Instance::new(&mut store, &module, &[host.into()])
+				.unwrap();
+		let run = instance
+			.get_typed_func::<i32, i32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, 5).unwrap(), 12);
+	}
+
+	#[test]
 	fn edge_imported_multivalue_calls_erase_only_zero_sized_slots() {
 		let source = r#"
 		import "host" as host {

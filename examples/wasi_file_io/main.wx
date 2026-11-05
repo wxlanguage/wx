@@ -41,6 +41,7 @@ mod Rights {
 }
 
 import "wasi_snapshot_preview1" as wasi {
+    use super::{heap, Errno, FileDescriptor};
     func path_open(
         dir_fd: FileDescriptor,
         dir_flags: u32,

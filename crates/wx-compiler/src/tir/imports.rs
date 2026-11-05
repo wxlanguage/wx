@@ -552,19 +552,9 @@ impl<'r> ImportResolver<'r> {
 		}
 	}
 
-	/// The actual glob-import resolution logic. Resolves the glob's own
-	/// path, then — `pub` or not — forces every glob `target` itself
-	/// declares to resolve first, because `indirect_lookup` will walk
-	/// straight through this edge into `target`'s own glob edges later,
-	/// regardless of either one's visibility. That chase, via
-	/// `resolve_stack` rather than `ensure_import_item`'s generic re-entrancy
-	/// check, is where a cyclic glob graph is caught — and, unlike a cyclic
-	/// named import, *not every* glob cycle is actually dangerous to leave
-	/// standing (see `glob_cycle_is_unsafe`), so only the unsafe ones stop
-	/// this edge from ever being recorded into `glob_imports` at all.
-	/// That's what makes `indirect_lookup`'s own "terminates because a
-	/// cycle can't reach here" assumption actually true, instead of merely
-	/// hoped for.
+	/// Resolves a glob's path and the target's glob edges. Rejects cycles
+	/// that any accessor could traverse, including private glob cycles on
+	/// an ancestor chain. The lookup itself needs no cycle-tracking state.
 	fn compute_glob_import(&mut self, index: UseItemIndex, path: UsePathIndex) {
 		let namespace = self.use_items[usize::from(index)].namespace;
 
@@ -618,8 +608,7 @@ impl<'r> ImportResolver<'r> {
 		}
 
 		if unsafe_cycle {
-			// Recording this edge would put the exact cycle just diagnosed
-			// into `glob_imports` for `indirect_lookup` to walk into later.
+			// Never install a cycle that recursive lookup could walk forever.
 			return;
 		}
 		self.namespaces
@@ -631,29 +620,10 @@ impl<'r> ImportResolver<'r> {
 			});
 	}
 
-	/// Whether some accessor could actually walk `cycle` forever through
-	/// `indirect_lookup` — if not, it's safe to leave the edge that closes
-	/// it standing rather than reject it. A `pub` edge is crossable by
-	/// any accessor; a `private` edge only by one already inside its
-	/// declaring namespace. Two siblings privately glob-importing each
-	/// other are safe — no accessor is ever inside both at once:
-	///
-	///   mod a { use crate::b::*; }
-	///   mod b { use crate::a::*; }
-	///
-	/// Nest one inside the other and it's unsafe — an accessor inside
-	/// `inner` is automatically inside `a` too, satisfying both edges:
-	///
-	///   mod a {
-	///       use crate::a::inner::*;
-	///       mod inner { use super::*; }
-	///   }
-	///
-	/// Checked with a single running-`deepest` fold rather than a full
-	/// pairwise comparison: on a tree, anything ancestor-or-descendant of
-	/// a common `deepest` is automatically ancestor-or-descendant of
-	/// everything else already folded in, so one incomparable pair
-	/// against `deepest` is enough to prove the whole set isn't a chain.
+	/// A public edge is crossable by any accessor; a private one only by
+	/// an accessor inside its declaring scope. All private scopes must lie
+	/// on one ancestor chain for a single accessor to traverse the cycle.
+	/// Sibling private globs remain safe: nobody is inside both scopes.
 	fn glob_cycle_is_unsafe(&self, cycle: &[UseItemIndex]) -> bool {
 		let mut deepest: Option<Scope> = None;
 		for use_item in cycle.iter().copied() {
@@ -674,15 +644,9 @@ impl<'r> ImportResolver<'r> {
 				{
 					candidate
 				}
-				// Two private edges on separate branches: no single
-				// accessor can be inside both namespaces at once, so this
-				// cycle can never actually be walked.
 				Some(_) => return false,
 			});
 		}
-		// Either no private edges at all (an all-`pub` cycle, walkable by
-		// any accessor), or every private edge's namespace lies on one
-		// straight ancestor chain (walkable by `deepest` itself).
 		true
 	}
 
@@ -2523,13 +2487,8 @@ mod tests {
 
 	#[test]
 	fn nested_mutual_private_globs_report_cyclic_import() {
-		// Unlike `mutually_private_globs_are_not_a_cycle`'s siblings, `a`
-		// and `inner` here are nested (`inner` is a descendant of `a`) —
-		// so an accessor inside `inner` satisfies *both* edges' private
-		// containment check at once (`inner` is inside `a`'s subtree, and
-		// trivially inside its own), and the walk can loop forever. This
-		// is exactly the shape `mutually_private_globs_are_not_a_cycle`
-		// deliberately avoids by keeping the two namespaces as siblings.
+		// Both private edges are visible from `inner`, so reject the cycle
+		// before recursive lookup can enter it.
 		let case = TestCase::new(indoc! {"
 			mod a {
 				use crate::a::inner::*;

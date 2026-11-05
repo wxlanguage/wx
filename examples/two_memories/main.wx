@@ -1,0 +1,40 @@
+import "host" as host {
+    memory io: u32;
+    func report(bytes: io::&[u8]);
+}
+
+memory internal: u32;
+
+// One algorithm, checked over any memory and its own address type.
+func sum<M: Memory>(bytes: M::&[u8]) -> u32 {
+    local mut total: u32 = 0;
+    local mut i: M::Size = 0;
+    loop {
+        if i == bytes.len() { break };
+        total += transmute::<u8, u32>(bytes[i]);
+        i += 1;
+    }
+    total
+}
+
+func sum_input(bytes: host::io::&[u8]) -> u32 {
+    sum(bytes)
+}
+
+func sum_internal() -> u32 {
+    // The type selects the literal's memory. It is not in the host's io.
+    local bytes: internal::&[u8] = "WX";
+    sum(bytes)
+}
+
+func report_input(bytes: host::io::&[u8]) {
+    host::report(bytes);
+}
+
+// The host has no direct handle to internal. This is an interface choice,
+// not a claim that a guest cannot intentionally copy private data into io.
+export {
+    sum_input,
+    sum_internal,
+    report_input,
+}

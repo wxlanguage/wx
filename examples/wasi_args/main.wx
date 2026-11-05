@@ -21,6 +21,7 @@ enum Errno(i32) {
 }
 
 import "wasi_snapshot_preview1" as wasi {
+    use super::{heap, Errno, FileDescriptor};
     func args_sizes_get(argc: heap::*u32, argv_buf_size: heap::*u32) -> Errno;
     func args_get(argv: heap::*heap::&u8, argv_buf: heap::*u8) -> Errno;
     func fd_write(

@@ -1093,41 +1093,60 @@ impl<'a> Builder<'a> {
 
 				let mut entry_nodes: Vec<NodeId> = Vec::new();
 
-				if let Some(ext_name) = &entry.inner.inner.external_name {
-					entry_nodes.push(self.symbol(ext_name.inner));
-					entry_nodes.push(self.text(Text::ColonSp));
-				}
-
-				match &entry.inner.inner.declaration {
-					ast::ImportDeclaration::Function { signature, .. } => {
-						self.build_function_signature(
-							&mut entry_nodes,
-							signature,
-						);
-						let concat = self.arena.concat(entry_nodes);
-						let group = self.arena.group(concat);
-						entry_nodes = vec![group];
-					}
-					ast::ImportDeclaration::Global {
-						mut_span,
-						name,
-						ty,
-						..
-					} => {
-						entry_nodes.push(self.text(Text::Global));
-						if mut_span.is_some() {
-							entry_nodes.push(self.text(Text::Mut));
+				match &entry.inner.inner {
+					ast::ImportEntry::Use { tree, pub_span } => {
+						if pub_span.is_some() {
+							entry_nodes.push(self.text(Text::Pub));
 						}
-						entry_nodes.push(self.symbol(name.inner));
-						entry_nodes.push(self.text(Text::ColonSp));
-						entry_nodes.push(self.build_type_expression(&ty.inner));
+						entry_nodes.push(self.text(Text::Use));
+						entry_nodes.push(self.build_use_tree(&tree.inner));
 					}
-					ast::ImportDeclaration::Memory { name, size } => {
-						entry_nodes.push(self.text(Text::Memory));
-						entry_nodes.push(self.symbol(name.inner));
-						entry_nodes.push(self.text(Text::ColonSp));
-						entry_nodes
-							.push(self.build_type_expression(&size.inner));
+					ast::ImportEntry::Declaration {
+						external_name,
+						declaration,
+					} => {
+						if let Some(ext_name) = external_name {
+							entry_nodes.push(self.symbol(ext_name.inner));
+							entry_nodes.push(self.text(Text::ColonSp));
+						}
+						match declaration {
+							ast::ImportDeclaration::Function {
+								signature,
+								..
+							} => {
+								self.build_function_signature(
+									&mut entry_nodes,
+									signature,
+								);
+								let concat = self.arena.concat(entry_nodes);
+								let group = self.arena.group(concat);
+								entry_nodes = vec![group];
+							}
+							ast::ImportDeclaration::Global {
+								mut_span,
+								name,
+								ty,
+								..
+							} => {
+								entry_nodes.push(self.text(Text::Global));
+								if mut_span.is_some() {
+									entry_nodes.push(self.text(Text::Mut));
+								}
+								entry_nodes.push(self.symbol(name.inner));
+								entry_nodes.push(self.text(Text::ColonSp));
+								entry_nodes.push(
+									self.build_type_expression(&ty.inner),
+								);
+							}
+							ast::ImportDeclaration::Memory { name, size } => {
+								entry_nodes.push(self.text(Text::Memory));
+								entry_nodes.push(self.symbol(name.inner));
+								entry_nodes.push(self.text(Text::ColonSp));
+								entry_nodes.push(
+									self.build_type_expression(&size.inner),
+								);
+							}
+						}
 					}
 				}
 
