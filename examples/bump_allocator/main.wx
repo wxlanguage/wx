@@ -1,5 +1,3 @@
-use std::*;
-
 // Bump allocator — the simplest possible dynamic memory allocator.
 //
 // Strategy: maintain a `bump` pointer that starts right after static data
@@ -13,64 +11,65 @@ use std::*;
 //   └──────────────┴──────────┴──────────┴──────────┴────── ·· ─┘
 //   0          DATA_END                            bump      heap end
 #[memory_limits({ min_pages: 1 })]
-memory heap: Memory where { Size = u32 };
-// start with one 64 KiB page
+memory heap: u32; // start with one 64 KiB page
+
 // ── allocator state ───────────────────────────────────────────────────────────
-// Starts at 4, not `heap::DATA_END` — this example never emits static data,
-// so `DATA_END` is 0, and address 0 is bit-identical to `ptr::null()`. A
-// real allocation landing there would get misread as null by any
-// `== ptr::null()` check, so `bump` starts one word past it instead.
-global mut bump: heap::*u8 = transmute::<u32, _>(4);
+// The address of the next free byte. It starts at 4, not `heap::DATA_END`:
+// this example never emits static data, so `DATA_END` is 0, and address 0 is
+// `RawPtr::null()`. A real allocation landing there would be misread as null,
+// so `bump` starts one word past it instead.
+global mut bump: u32 = 4;
 
 // ── core allocator ────────────────────────────────────────────────────────────
 // Allocates space for one T, respecting its alignment.
-pub func alloc<T>() -> heap::*T {
-    local align = align_of::<T, heap>();
-    local ptr = ptr::align_up::<heap>(transmute(bump), align);
-    local new_end = ptr + size_of::<T, heap>();
+pub func alloc<T: StackValue>() -> heap::*T {
+    local ptr =
+        RawPtr::<heap, T>::from_addr(bump.get()).align_up(
+            align_of::<T, heap>(),
+        );
+    local new_end = ptr.addr() + size_of::<T, heap>();
     local cur_end = heap.size_bytes();
     if new_end > cur_end {
-        local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-        local _grew = heap.grow(needed);
+        local needed =
+            (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
+        _ = heap.grow(needed);
     }
-    bump = transmute(new_end);
-    transmute(ptr)
+    bump.set(new_end);
+    ptr.as_ptr()
 }
 
 pub func reset() {
-    bump = transmute::<u32, _>(4)
+    bump.set(4)
 }
 
 pub func bytes_used() -> u32 {
-    transmute(bump)
+    bump.get()
 }
 
-struct Node(
-    value: i32,
-    next: &Node,
-);
+struct Node(value: i32, next: RawPtr<heap, Node>);
 
 impl Node {
-    pub func new(value: i32, next: &Node) -> &Node {
+    pub func new(value: i32, next: RawPtr<heap, Node>) -> RawPtr<heap, Node> {
         local n = alloc::<Node>();
-        n.* = Node({ value: value, next: next });
-        n
+        n.* = Node({ value, next });
+        RawPtr::from_ptr(n)
     }
 }
 
 // ── demo entry point ──────────────────────────────────────────────────────────
 // Builds the list  3 → 2 → 1  and returns the sum of all node values.
 pub func demo() -> i32 {
-    local n1 = Node::new(1, ptr::null());
+    local n1 = Node::new(1, RawPtr::null());
     local n2 = Node::new(2, n1);
     local n3 = Node::new(3, n2);
-    
+
     local mut sum: i32 = 0;
-    local mut cur: &Node = n3;
+    local mut cur = n3;
     loop {
-        if cur == ptr::null() { break sum };
-        sum += cur.*.value;
-        cur = cur.*.next;
+        if cur.is_null() { break sum };
+        local node = cur.as_ref();
+        sum += node.value;
+        cur = node.next;
     }
 }
 

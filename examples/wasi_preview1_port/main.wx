@@ -11,7 +11,7 @@
 //      it's approximated as a `u32`-repr enum naming only the well-known
 //      standard descriptors (`Fd::Stdin`/`Stdout`/`Stderr`); an arbitrary
 //      host-assigned descriptor (e.g. returned by `path_open`) is brought
-//      into the type with `raw_u32 as Fd`, which wx permits for any integer
+//      into the type with `transmute(raw_u32)`, which wx permits for any integer
 //      value, not just a declared variant — the same escape hatch C's own
 //      enums rely on.
 //
@@ -21,12 +21,10 @@
 //      separate union/ADT construct. The workaround models the real C ABI
 //      the union compiles to instead of the union itself: a tag field
 //      followed by a payload field typed as the *largest* variant, with
-//      every other (smaller) variant addressed by computing its byte
-//      offset within the payload (via a null-pointer `offsetof`, since
-//      `.&` only ever yields a shared reference, never a reinterpretable
-//      pointer) and reinterpreting the base pointer's address plus that
-//      offset as the smaller variant's type — valid because union members
-//      always share the union's base address. See `SubscriptionU` below.
+//      every other (smaller) variant read by reinterpreting the payload
+//      field's address (`address(u.clock.&)`) as a pointer to that variant
+//      (`RawPtr::from_addr`) — valid because union members always share the
+//      payload's base address. See `SubscriptionU` below.
 //
 // A third issue — a struct-of-structs (`Subscription.u: SubscriptionU`,
 // itself containing `SubscriptionClock`) used to either crash the compiler
@@ -44,10 +42,11 @@
 // natural C-style alignment padding, rather than wx's default
 // alignment-sorted layout) so that a WASI host writing raw struct bytes
 // through a pointer lines up with the fields wx code reads back.
-use std::*;
+
+crate "alloc" as alloc;
 
 #[memory_limits({ min_pages: 1 })]
-memory heap: Memory where { Size = u32 };
+memory heap: u32;
 // ── Plain scalar typedefs ───────────────────────────────────────────────────
 type Size = u32;
 type Filesize = u64;
@@ -194,8 +193,8 @@ mod Rights {
 // No struct needed at all: wx's native slice ABI already lowers to
 // exactly `{ ptr: u32, len: u32 }` in linear memory (see
 // `examples/wasi_hello_world`), which is bit-for-bit `__wasi_ciovec_t`'s
-// layout. `&[u8]` *is* `$ciovec` and `*[u8]` *is* `$iovec`; `&[&[u8]]` /
-// `&[*[u8]]` are the `_array` list variants. Used inline below.
+// layout. `heap::&[u8]` *is* `$ciovec` and `heap::*[u8]` *is* `$iovec`; `heap::&[heap::&[u8]]` /
+// `heap::&[heap::*[u8]]` are the `_array` list variants. Used inline below.
 // ── `$whence` ────────────────────────────────────────────────────────────────
 enum Whence(u8) {
     Set = 0,
@@ -300,10 +299,7 @@ mod Eventrwflags {
 
 // ── `$event_fd_readwrite` ────────────────────────────────────────────────────
 #[fixed_order]
-struct EventFdReadwrite(
-    nbytes: Filesize,
-    flags: u16,
-);
+struct EventFdReadwrite(nbytes: Filesize, flags: u16);
 
 // ── `$event` ─────────────────────────────────────────────────────────────────
 // witx's field name `type` collides with the wx keyword used for type
@@ -332,9 +328,7 @@ struct SubscriptionClock(
 
 // ── `$subscription_fd_readwrite` ─────────────────────────────────────────────
 #[fixed_order]
-struct SubscriptionFdReadwrite(
-    file_descriptor: Fd,
-);
+struct SubscriptionFdReadwrite(file_descriptor: Fd);
 
 // ── `$subscription_u` (union — see limitation 2 in the file header) ─────────
 // `SubscriptionClock` (24 bytes, align 8) is the larger of the two variants;
@@ -343,23 +337,19 @@ struct SubscriptionFdReadwrite(
 // below rather than a second field, which would double-allocate space no
 // real union has.
 #[fixed_order]
-struct SubscriptionU(
-    tag: Eventtype,
-    clock: SubscriptionClock,
-);
+struct SubscriptionU(tag: Eventtype, clock: SubscriptionClock);
 
-func subscription_u_as_fd_readwrite(u: *SubscriptionU) -> *SubscriptionFdReadwrite {
-    local base: *SubscriptionU = ptr::null_mut();
-    local offset = transmute::<_, heap::Size>(base.*.clock.&) - transmute::<_, heap::Size>(base);
-    transmute(transmute::<_, heap::Size>(u) + offset)
+func subscription_u_as_fd_readwrite(
+    u: heap::*SubscriptionU,
+) -> heap::*SubscriptionFdReadwrite {
+    RawPtr::<heap, SubscriptionFdReadwrite>::from_addr(
+        address(u.clock.&),
+    ).as_ptr()
 }
 
 // ── `$subscription` ──────────────────────────────────────────────────────────
 #[fixed_order]
-struct Subscription(
-    userdata: Userdata,
-    u: SubscriptionU,
-);
+struct Subscription(userdata: Userdata, u: SubscriptionU);
 
 // ── `$signal` ────────────────────────────────────────────────────────────────
 enum Signal(u8) {
@@ -422,15 +412,10 @@ enum Preopentype(u8) {
 // variant, so — unlike `$subscription_u` — a plain tag + single payload
 // field already matches the real layout with no reinterpretation needed.
 #[fixed_order]
-struct PrestatDir(
-    pr_name_len: Size,
-);
+struct PrestatDir(pr_name_len: Size);
 
 #[fixed_order]
-struct Prestat(
-    tag: Preopentype,
-    dir: PrestatDir,
-);
+struct Prestat(tag: Preopentype, dir: PrestatDir);
 
 // `$clockid`, used by `$subscription_clock` above, declared last among the
 // plain enums only because `SubscriptionClock` needed it first — order
@@ -451,43 +436,85 @@ enum ClockId(u32) {
 // out-pointers instead of one. This is the same shape already proven in
 // `examples/wasi_args`'s `args_sizes_get`.
 import "wasi_snapshot_preview1" as wasi {
-    func args_get(argv: *u32, argv_buf: *u8) -> Errno;
-    func args_sizes_get(argc: *u32, argv_buf_size: *u32) -> Errno;
-    func environ_get(environ: *u32, environ_buf: *u8) -> Errno;
-    func environ_sizes_get(environ_count: *u32, environ_buf_size: *u32) -> Errno;
-    func clock_res_get(id: ClockId, resolution: *u64) -> Errno;
-    func clock_time_get(id: ClockId, precision: u64, time: *u64) -> Errno;
+    func args_get(argv: heap::*u32, argv_buf: heap::*u8) -> Errno;
+    func args_sizes_get(argc: heap::*u32, argv_buf_size: heap::*u32) -> Errno;
+    func environ_get(environ: heap::*u32, environ_buf: heap::*u8) -> Errno;
+    func environ_sizes_get(
+        environ_count: heap::*u32,
+        environ_buf_size: heap::*u32,
+    ) -> Errno;
+    func clock_res_get(id: ClockId, resolution: heap::*u64) -> Errno;
+    func clock_time_get(id: ClockId, precision: u64, time: heap::*u64) -> Errno;
     func fd_advise(fd: Fd, offset: u64, len: u64, advice: Advice) -> Errno;
     func fd_allocate(fd: Fd, offset: u64, len: u64) -> Errno;
     func fd_close(fd: Fd) -> Errno;
     func fd_datasync(fd: Fd) -> Errno;
-    func fd_fdstat_get(fd: Fd, stat: *Fdstat) -> Errno;
+    func fd_fdstat_get(fd: Fd, stat: heap::*Fdstat) -> Errno;
     func fd_fdstat_set_flags(fd: Fd, flags: u16) -> Errno;
     func fd_fdstat_set_rights(
         fd: Fd,
         fs_rights_base: u64,
         fs_rights_inheriting: u64,
     ) -> Errno;
-    func fd_filestat_get(fd: Fd, stat: *Filestat) -> Errno;
+    func fd_filestat_get(fd: Fd, stat: heap::*Filestat) -> Errno;
     func fd_filestat_set_size(fd: Fd, size: u64) -> Errno;
-    func fd_filestat_set_times(fd: Fd, atim: u64, mtim: u64, fst_flags: u16) -> Errno;
-    func fd_pread(fd: Fd, iovs: &[*[u8]], offset: u64, nread: *u32) -> Errno;
-    func fd_prestat_get(fd: Fd, prestat: *Prestat) -> Errno;
-    func fd_prestat_dir_name(fd: Fd, path: *u8, path_len: u32) -> Errno;
-    func fd_pwrite(fd: Fd, iovs: &[&[u8]], offset: u64, nwritten: *u32) -> Errno;
-    func fd_read(fd: Fd, iovs: &[*[u8]], nread: *u32) -> Errno;
-    func fd_readdir(fd: Fd, buf: *u8, buf_len: u32, cookie: u64, bufused: *u32) -> Errno;
+    func fd_filestat_set_times(
+        fd: Fd,
+        atim: u64,
+        mtim: u64,
+        fst_flags: u16,
+    ) -> Errno;
+    func fd_pread(
+        fd: Fd,
+        iovs: heap::&[heap::*[u8]],
+        offset: u64,
+        nread: heap::*u32,
+    ) -> Errno;
+    func fd_prestat_get(fd: Fd, prestat: heap::*Prestat) -> Errno;
+    func fd_prestat_dir_name(fd: Fd, path: heap::*u8, path_len: u32) -> Errno;
+    func fd_pwrite(
+        fd: Fd,
+        iovs: heap::&[heap::&[u8]],
+        offset: u64,
+        nwritten: heap::*u32,
+    ) -> Errno;
+    func fd_read(
+        fd: Fd,
+        iovs: heap::&[heap::*[u8]],
+        nread: heap::*u32,
+    ) -> Errno;
+    func fd_readdir(
+        fd: Fd,
+        buf: heap::*u8,
+        buf_len: u32,
+        cookie: u64,
+        bufused: heap::*u32,
+    ) -> Errno;
     func fd_renumber(fd: Fd, to: Fd) -> Errno;
-    func fd_seek(fd: Fd, offset: i64, whence: Whence, newoffset: *u64) -> Errno;
+    func fd_seek(
+        fd: Fd,
+        offset: i64,
+        whence: Whence,
+        newoffset: heap::*u64,
+    ) -> Errno;
     func fd_sync(fd: Fd) -> Errno;
-    func fd_tell(fd: Fd, offset: *u64) -> Errno;
-    func fd_write(fd: Fd, iovs: &[&[u8]], nwritten: *u32) -> Errno;
-    func path_create_directory(fd: Fd, path: &[u8]) -> Errno;
-    func path_filestat_get(fd: Fd, flags: u32, path: &[u8], stat: *Filestat) -> Errno;
+    func fd_tell(fd: Fd, offset: heap::*u64) -> Errno;
+    func fd_write(
+        fd: Fd,
+        iovs: heap::&[heap::&[u8]],
+        nwritten: heap::*u32,
+    ) -> Errno;
+    func path_create_directory(fd: Fd, path: heap::&[u8]) -> Errno;
+    func path_filestat_get(
+        fd: Fd,
+        flags: u32,
+        path: heap::&[u8],
+        stat: heap::*Filestat,
+    ) -> Errno;
     func path_filestat_set_times(
         fd: Fd,
         flags: u32,
-        path: &[u8],
+        path: heap::&[u8],
         atim: u64,
         mtim: u64,
         fst_flags: u16,
@@ -495,49 +522,69 @@ import "wasi_snapshot_preview1" as wasi {
     func path_link(
         old_fd: Fd,
         old_flags: u32,
-        old_path: &[u8],
+        old_path: heap::&[u8],
         new_fd: Fd,
-        new_path: &[u8],
+        new_path: heap::&[u8],
     ) -> Errno;
     func path_open(
         fd: Fd,
         dirflags: u32,
-        path: &[u8],
+        path: heap::&[u8],
         oflags: u16,
         fs_rights_base: u64,
         fs_rights_inheriting: u64,
         fdflags: u16,
-        opened_fd: *u32,
+        opened_fd: heap::*u32,
     ) -> Errno;
-    func path_readlink(fd: Fd, path: &[u8], buf: *u8, buf_len: u32, bufused: *u32) -> Errno;
-    func path_remove_directory(fd: Fd, path: &[u8]) -> Errno;
-    func path_rename(fd: Fd, old_path: &[u8], new_fd: Fd, new_path: &[u8]) -> Errno;
-    func path_symlink(old_path: &[u8], fd: Fd, new_path: &[u8]) -> Errno;
-    func path_unlink_file(fd: Fd, path: &[u8]) -> Errno;
+    func path_readlink(
+        fd: Fd,
+        path: heap::&[u8],
+        buf: heap::*u8,
+        buf_len: u32,
+        bufused: heap::*u32,
+    ) -> Errno;
+    func path_remove_directory(fd: Fd, path: heap::&[u8]) -> Errno;
+    func path_rename(
+        fd: Fd,
+        old_path: heap::&[u8],
+        new_fd: Fd,
+        new_path: heap::&[u8],
+    ) -> Errno;
+    func path_symlink(
+        old_path: heap::&[u8],
+        fd: Fd,
+        new_path: heap::&[u8],
+    ) -> Errno;
+    func path_unlink_file(fd: Fd, path: heap::&[u8]) -> Errno;
     // `$in`/`$out` are raw pointers to caller-managed arrays with the element
     // count passed separately (`nsubscriptions`), *not* witx `list`s — so
     // these stay single-element pointers rather than slices; the slice
     // ABI's implicit length would duplicate (and could disagree with)
     // `nsubscriptions`.
     func poll_oneoff(
-        in_: &Subscription,
-        out: *Event,
+        in_: heap::&Subscription,
+        out: heap::*Event,
         nsubscriptions: u32,
-        nevents: *u32,
+        nevents: heap::*u32,
     ) -> Errno;
     func proc_exit(rval: u32);
     func proc_raise(sig: Signal) -> Errno;
     func sched_yield() -> Errno;
-    func random_get(buf: *[u8]) -> Errno;
-    func sock_accept(fd: Fd, flags: u16, new_fd: *u32) -> Errno;
+    func random_get(buf: heap::*[u8]) -> Errno;
+    func sock_accept(fd: Fd, flags: u16, new_fd: heap::*u32) -> Errno;
     func sock_recv(
         fd: Fd,
-        ri_data: &[*[u8]],
+        ri_data: heap::&[heap::*[u8]],
         ri_flags: u16,
-        ro_datalen: *u32,
-        ro_flags: *u16,
+        ro_datalen: heap::*u32,
+        ro_flags: heap::*u16,
     ) -> Errno;
-    func sock_send(fd: Fd, si_data: &[&[u8]], si_flags: u16, so_datalen: *u32) -> Errno;
+    func sock_send(
+        fd: Fd,
+        si_data: heap::&[heap::&[u8]],
+        si_flags: u16,
+        so_datalen: heap::*u32,
+    ) -> Errno;
     func sock_shutdown(fd: Fd, how: u8) -> Errno;
 }
 
@@ -550,40 +597,26 @@ import "wasi_snapshot_preview1" as wasi {
 // exercises both, plus a couple of representative calls from elsewhere in
 // the spec, and prints results instead of just asserting success so a
 // human running it can see real values came back.
-global mut bump: *u8 = heap::DATA_END;
 
-struct BumpAllocator();
-
-impl Allocator for BumpAllocator {
-    type Mem = heap;
-
-    func reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
-        local ptr = ptr::align_up::<Self::Mem>(transmute(bump), layout.align());
-        local new_end = ptr + layout.size();
-        local cur_end = heap.size_bytes();
-        if new_end > cur_end {
-            local needed =
-                (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-            if heap.grow(needed) == -1 { trap() }
-        }
-        bump = transmute(new_end);
-        transmute(ptr)
-    }
+/// The shared bump allocator for `heap`. `bootstrap` places it right after
+/// static data on first use and returns the same allocator afterwards.
+func allocator() -> heap::*alloc::BumpAllocator<heap> {
+    alloc::BumpAllocator::<heap>::bootstrap(heap)
 }
 
-func write_all(fd: Fd, bytes: &[u8]) {
-    local alloc: *BumpAllocator = std::ptr::null_mut();
-    local io_vecs = alloc.alloc_slice::<&[u8]>(1);
+func write_all(fd: Fd, bytes: heap::&[u8]) {
+    local alloc = allocator();
+    local io_vecs = alloc.allocate_slice_uninit::<heap::&[u8]>(1);
     io_vecs[0] = bytes;
-    local nwritten = alloc.alloc::<u32>(0);
-    if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { trap() };
+    local nwritten = alloc.allocate_value::<u32>(0);
+    if wasi::fd_write(fd, io_vecs.*.&, nwritten) != Errno::Success { trap() };
 }
 
 // Decimal, not hex, so the demo output reads naturally; values here are all
 // small (enum tags, event counts), so a 10-digit buffer is more than enough.
 func write_decimal(fd: Fd, mut value: u32) {
-    local alloc: *BumpAllocator = std::ptr::null_mut();
-    local buf = alloc.alloc_slice::<u8>(10);
+    local alloc = allocator();
+    local buf = alloc.allocate_slice_uninit::<u8>(10);
     local mut i: u32 = 10;
     if value == 0 {
         i -= 1;
@@ -596,33 +629,31 @@ func write_decimal(fd: Fd, mut value: u32) {
             value /= 10;
         }
     }
-    write_all(fd, slice_from_parts(ptr::add(buf.ptr(), i), 10 - i));
+    write_all(fd, slice_from_parts(buf[i].&, 10 - i));
 }
 
 func main() {
-    local alloc: *BumpAllocator = std::ptr::null_mut();
+    local alloc = allocator();
 
     // clock_time_get: a plain scalar (u64) out-param.
-    local time_ptr = alloc.alloc::<u64>(0);
+    local time_ptr = alloc.allocate_value::<u64>(0);
     if wasi::clock_time_get(ClockId::Monotonic, 0, time_ptr) != Errno::Success {
         trap()
-    };
+    }
     write_all(Fd::Stdout, "clock_time_get: ok\n");
 
     // fd_fdstat_get: reads a #[fixed_order] record back through a pointer a
     // real host wrote into — proves the struct's byte layout actually lines
     // up, not just that wx accepted the declaration.
-    local stat_ptr = alloc.alloc(Fdstat({
+    local stat_ptr = alloc.allocate_value(Fdstat({
         fs_filetype: Filetype::Unknown,
         fs_flags: 0,
         fs_rights_base: 0,
         fs_rights_inheriting: 0,
     }));
-    if wasi::fd_fdstat_get(Fd::Stdout, stat_ptr) != Errno::Success {
-        trap()
-    };
+    if wasi::fd_fdstat_get(Fd::Stdout, stat_ptr) != Errno::Success { trap() };
     write_all(Fd::Stdout, "fd_fdstat_get: fs_filetype=");
-    write_decimal(Fd::Stdout, transmute(stat_ptr.*.fs_filetype));
+    write_decimal(Fd::Stdout, transmute(stat_ptr.fs_filetype));
     write_all(Fd::Stdout, "\n");
 
     // poll_oneoff: one clock subscription (relative 5ms timeout), read back
@@ -631,7 +662,7 @@ func main() {
     //
     // `Subscription` nests two levels deep (`u.clock`) — plain nested struct
     // literals, same as any other struct.
-    local sub_ptr = alloc.alloc(Subscription({
+    local sub_ptr = alloc.allocate_value(Subscription({
         userdata: 0,
         u: SubscriptionU({
             tag: Eventtype::Clock,
@@ -643,14 +674,15 @@ func main() {
             }),
         }),
     }));
-    local event_ptr = alloc.alloc(Event({
+    local event_ptr = alloc.allocate_value(Event({
         userdata: 0,
         error: Errno::Success,
         event_type: Eventtype::Clock,
         fd_readwrite: EventFdReadwrite({ nbytes: 0, flags: 0 }),
     }));
-    local nevents_ptr = alloc.alloc::<u32>(0);
-    local poll_result = wasi::poll_oneoff(sub_ptr, event_ptr, 1, nevents_ptr);
+    local nevents_ptr = alloc.allocate_value::<u32>(0);
+    local poll_result =
+        wasi::poll_oneoff(sub_ptr.*.&, event_ptr, 1, nevents_ptr);
     write_all(Fd::Stdout, "poll_oneoff: errno=");
     write_decimal(Fd::Stdout, transmute(poll_result));
     write_all(Fd::Stdout, " nevents=");
@@ -658,18 +690,19 @@ func main() {
     write_all(Fd::Stdout, "\n");
 
     // Round-trip the union workaround itself, independent of any real WASI
-    // call: write through the smaller variant (SubscriptionFdReadwrite),
-    // read back through the same bytes via the larger field's address.
-    local scratch = alloc.alloc(SubscriptionU({
+    // call: write through the larger variant (`clock.id = Monotonic`, 1) and
+    // read the same bytes back through the smaller one
+    // (`SubscriptionFdReadwrite`), which must see 1.
+    local scratch = alloc.allocate_value(SubscriptionU({
         tag: Eventtype::FdRead,
         clock: SubscriptionClock({
-            id: ClockId::Realtime,
+            id: ClockId::Monotonic,
             timeout: 0,
             precision: 0,
             flags: 0,
         }),
     }));
-    local recovered = subscription_u_as_fd_readwrite(scratch).*.file_descriptor;
+    local recovered = subscription_u_as_fd_readwrite(scratch).file_descriptor;
     write_all(Fd::Stdout, "union round-trip: file_descriptor=");
     write_decimal(Fd::Stdout, transmute(recovered));
     write_all(Fd::Stdout, "\n");

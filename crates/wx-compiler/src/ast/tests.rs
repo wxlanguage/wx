@@ -284,6 +284,10 @@ fn expression_kind(expression: &Expression) -> &'static str {
 		Expression::NamedMethodCall(_) => "named-method-call",
 		Expression::ObjectAccess { .. } => "field",
 		Expression::Tuple { .. } => "tuple",
+		Expression::IfElse { .. } => "if",
+		Expression::Match { .. } => "match",
+		Expression::Loop { .. } => "loop",
+		Expression::Block { .. } => "block",
 		Expression::Float => "float",
 		Expression::Char => "char",
 		Expression::String => "string",
@@ -2578,6 +2582,30 @@ fn test_package_instance_requires_an_alias() {
 		.assert_codes(&[DiagnosticCode::MissingPackageAlias]);
 }
 
+/// Assignment does not associate, as comparison does not: an assignment's
+/// value is `()`, so neither `(a = b) = c` nor `a = (b = c)` means anything
+/// (the latter would even check, for an `a` of type `()`).
+#[test]
+fn chained_assignments_are_an_error() {
+	for source in ["a = b = c", "a += b += c", "a = b += c", "a = b = c = d"] {
+		TestCase::new(&format!("func f() {{ {source} }}"))
+			.diagnostics()
+			.assert_error(DiagnosticCode::ChainedAssignment);
+	}
+	TestCase::new("func f() { a = b = c }")
+		.diagnostics()
+		.assert_codes(&[DiagnosticCode::ChainedAssignment]);
+	// Written parentheses are a tuple, not a chain: what they assign to is
+	// the checker's to judge.
+	assert_eq!(shape_of("(a = b) = c"), "(= (tuple (= a b)) c)");
+	assert_eq!(shape_of("a = (b = c)"), "(= a (tuple (= b c)))");
+	// One mistake, one diagnostic: the second `=` continues the assignment,
+	// not the `if`.
+	TestCase::new("func f() { x = if c { 1 } else { 2 } = y }")
+		.diagnostics()
+		.assert_codes(&[DiagnosticCode::ChainedAssignment]);
+}
+
 #[test]
 fn test_chained_comparison_error() {
 	let case = TestCase::new(indoc! {"
@@ -3272,14 +3300,6 @@ fn test_binary_operators_associate_to_the_left() {
 		("a - b - c", "(- (- a b) c)"),
 		("a / b / c", "(/ (/ a b) c)"),
 		("a << b << c", "(<< (<< a b) c)"),
-		// Assignment is left-associative too, unlike most languages. That is
-		// intended and unobservable: an assignment evaluates to `()`, so
-		// `a = b = c` is rejected either way — as an invalid assignment
-		// target when grouped `(a = b) = c`, or as a type mismatch were it
-		// grouped `a = (b = c)`. Only if assignment ever yields its assigned
-		// value would the grouping become meaningful.
-		("a = b = c", "(= (= a b) c)"),
-		("a += b += c", "(+= (+= a b) c)"),
 	] {
 		assert_eq!(shape_of(source), expected, "parsing `{source}`");
 	}
@@ -3988,4 +4008,94 @@ fn every_generic_argument_site_may_open_with_a_qualified_type() {
 	] {
 		TestCase::new(source).diagnostics().assert_none();
 	}
+}
+
+/// A block-like expression ends at its closing `}`: what follows a statement
+/// that is one is the next statement, never an operator applied to it.
+#[test]
+fn a_block_like_statement_ends_at_its_brace() {
+	for (source, second) in [
+		("if c { a() } (x, y)", "(tuple x y)"),
+		("if c { a() } else { b() } (x, y)", "(tuple x y)"),
+		("match n { _ => a() } -1", "(u- 1)"),
+		("loop { break } [1]", "<other>"),
+		("block { a() } (x)", "(tuple x)"),
+	] {
+		let case = TestCase::new(&format!("func f() {{ {source} }}"));
+		case.diagnostics().assert_none();
+		let statements = case.function_block(0);
+		assert_eq!(statements.len(), 2, "{source}");
+		assert!(
+			statement_expression(statements, 0).is_block_like(),
+			"{source}"
+		);
+		assert_eq!(
+			case.shape(statement_expression(statements, 1)),
+			second,
+			"{source}"
+		);
+	}
+}
+
+/// Parentheses make a block-like expression an operand: `(e)` is the
+/// one-element tuple, which is no longer block-like.
+#[test]
+fn a_parenthesized_block_like_expression_is_an_operand() {
+	assert_eq!(
+		shape_of("(if c { f } else { g })(x)"),
+		"(call (tuple <if>) x)"
+	);
+	assert_eq!(
+		shape_of("x + (match n { _ => 1 })"),
+		"(+ x (tuple <match>))"
+	);
+	assert_eq!(shape_of("-(block { 1 })"), "(u- (tuple <block>))");
+}
+
+/// A block-like expression fills any whole expression position, an
+/// assignment's value included.
+#[test]
+fn a_block_like_expression_fills_a_whole_position() {
+	for source in [
+		"x = if c { 1 } else { 2 }",
+		"x += match n { _ => 1 }",
+		"local v = if c { f } else { g }",
+		"return if c { 1 } else { 2 }",
+		"g(if c { 1 } else { 2 }, loop { break 3 })",
+		"match n { _ => if c { 1 } else { 2 } }",
+	] {
+		TestCase::new(&format!("func f() {{ {source} }}"))
+			.diagnostics()
+			.assert_none();
+	}
+	assert_eq!(shape_of("x = if c { 1 } else { 2 }"), "(= x <if>)");
+	TestCase::new("func f() { x = if c { 1 } else { 2 } + 3 }")
+		.diagnostics()
+		.assert_codes(&[DiagnosticCode::BlockLikeOperand]);
+}
+
+/// No operator takes a block-like expression without parentheses, on
+/// either side.
+#[test]
+fn a_block_like_expression_is_not_an_operand() {
+	for source in [
+		"local v = x + if c { 1 } else { 2 };",
+		"local v = -if c { 1 } else { 2 };",
+		"local v = !match n { _ => c };",
+		"local v = match n { _ => s }.len();",
+		"local v = if c { 1 } else { 2 } * 3;",
+		"local v = block { 1 } == 1;",
+		"match n { _ => s }.len()",
+		"if c { 1 } else { 2 } + 3",
+	] {
+		let case = TestCase::new(&format!("func f() {{ {source} }}"));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::BlockLikeOperand]);
+	}
+	TestCase::new("func f() { local v = x + if c { 1 } else { 2 }; }")
+		.diagnostics()
+		.assert_error_saying("`if` cannot be an operand");
+	TestCase::new("func f() { local v = match n { _ => s }.len(); }")
+		.diagnostics()
+		.assert_error_saying("wrap it in parentheses: `(match ..)`");
 }

@@ -31,7 +31,7 @@ pub func rem_pio2f(x: f32) -> (i32, f64) {
         local tmp = x64 * INV_PIO2 + TOINT;
         local f_n = tmp - TOINT;
         return (f_n.to_i32(), x64 - f_n * PIO2_1 - f_n * PIO2_1T);
-    };
+    }
 
     // Large finite `x`, or `x` is inf/NaN — the former would need `__rem_pio2_large`, the
     // latter is a genuine NaN result either way (`x - x` for inf or NaN is NaN in the

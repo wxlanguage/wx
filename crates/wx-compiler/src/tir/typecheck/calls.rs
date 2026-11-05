@@ -18,6 +18,7 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
+use super::members::Expected;
 use super::{Arguments, BodyContext};
 use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
@@ -322,7 +323,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		segment: &ast::PathSegment,
 		receiver: Option<ExprIdx>,
 		arguments: Arguments<'_>,
-		expected: TypeIndex,
+		expected: Expected,
 		span: TextSpan,
 	) -> ExprIdx {
 		let Callee {
@@ -339,6 +340,15 @@ impl BodyContext<'_, '_, '_, '_> {
 			GenericEnvOwner::Function(function),
 			&mut type_args,
 		);
+		// A method's receiver is expected to be what the method takes as
+		// `self`, as far as the method call's own expected type tells.
+		let expected = match expected {
+			Expected::Type(ty) => ty,
+			Expected::Receiver(receiver_of) => {
+				let shape = self.instantiate(return_type, env, &type_args);
+				self.receiver_expectation(shape, receiver_of)
+			}
+		};
 		// The result is learned from first: a disagreement teaches nothing,
 		// and the call's own type is held to the expected one by the caller.
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
@@ -854,7 +864,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// A function's parameter frames: its whole chain, which its type
 	/// arguments instantiate, and its own frame (`ROOT` when it declares no
 	/// parameters, which then stores its parent's frame).
-	fn function_frames(
+	pub(super) fn function_frames(
 		&self,
 		function: FunctionIdx,
 	) -> (GenericEnvIdx, GenericEnvIdx) {

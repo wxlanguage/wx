@@ -2947,12 +2947,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		symbols
 			.items
 			.push(ItemDef::new(DefKind::Module(index), content_span));
-		for symbol in [module.name.inner, ast::Keyword::SelfLower.symbol()] {
-			symbols.bindings.insert(
-				BindingKey::ty(symbol),
-				Binding::definition(this, Visibility::Public),
-			);
-		}
+		symbols.bindings.insert(
+			BindingKey::ty(ast::Keyword::SelfLower.symbol()),
+			Binding::definition(this, Visibility::Public),
+		);
 		symbols.bindings.insert(
 			BindingKey::ty(ast::Keyword::Crate.symbol()),
 			Binding::definition(
@@ -5269,6 +5267,25 @@ mod tests {
 		assert!(matches!(
 			case.resolve(Tier::Value, "host::counter").expect_success(),
 			DefKind::Global(_),
+		));
+	}
+
+	/// A module does not bind its own name inside itself (`self` names it),
+	/// so an item there may share the module's name, as `math::sin::sin`.
+	#[test]
+	fn a_module_item_may_share_the_modules_name() {
+		let mut case = TestCase::new(indoc! {r#"
+			mod sin { pub func sin() {} pub struct cos(); }
+			mod cos { pub struct cos(); }
+		"#});
+		case.diagnostics().assert_none();
+		assert!(matches!(
+			case.resolve(Tier::Value, "sin::sin").expect_success(),
+			DefKind::Function(_),
+		));
+		assert!(matches!(
+			case.resolve(Tier::Type, "cos::cos").expect_success(),
+			DefKind::Struct(_),
 		));
 	}
 

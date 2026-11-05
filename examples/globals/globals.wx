@@ -1,16 +1,16 @@
 global mut x: f32 = 0.0;
 
 func get() -> f32 {
-  x
+    x.get()
 }
 
 func set(value: f32) -> f32 {
-  x = value;
+    x.set(value);
 
-  x
+    x.get()
 }
 
 export {
-  get,
-  set
+    get,
+    set,
 }

@@ -1,12 +1,14 @@
 // WASI Preview 1 command-line arguments — queries the size of the argv
 // buffer, allocates it, fills it in, and prints each argument on its own
 // line. See run.mjs for the actual argv the host hands to the guest.
-use std::*;
+
+crate "alloc" as alloc;
 
 #[memory_limits({ min_pages: 1 })]
-memory heap: Memory where { Size = u32 };
+memory heap: u32;
+
 enum FileDescriptor(u32) {
-  Stdout = 1,
+    Stdout = 1,
 }
 
 // WASI Preview 1 encodes every result as `__wasi_errno_t` (a u16, passed as
@@ -15,80 +17,79 @@ enum FileDescriptor(u32) {
 // success/failure distinction, so `Success` is the only variant declared —
 // see the WASI Preview 1 spec for the full errno list.
 enum Errno(i32) {
-  Success = 0,
+    Success = 0,
 }
 
 import "wasi_snapshot_preview1" as wasi {
-  func args_sizes_get(argc: *u32, argv_buf_size: *u32) -> Errno;
-  func args_get(argv: *u32, argv_buf: *u8) -> Errno;
-  func fd_write(fd: FileDescriptor, io_vecs: &[&[u8]], bytes_written: *u32) -> Errno;
+    func args_sizes_get(argc: heap::*u32, argv_buf_size: heap::*u32) -> Errno;
+    func args_get(argv: heap::*heap::&u8, argv_buf: heap::*u8) -> Errno;
+    func fd_write(
+        fd: FileDescriptor,
+        io_vecs: heap::&[heap::&[u8]],
+        bytes_written: heap::*u32,
+    ) -> Errno;
 }
 
-global mut bump: *u8 = heap::DATA_END;
-
-struct BumpAllocator();
-
-impl Allocator for BumpAllocator {
-  type Mem = heap;
-
-  func reserve(self: *Self, layout: Layout<Self::Mem>) -> *u8 {
-    local ptr = ptr::align_up::<Self::Mem>(transmute(bump), layout.align());
-    local new_end = ptr + layout.size();
-    local cur_end = heap.size_bytes();
-    if new_end > cur_end {
-      local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-      if heap.grow(needed) == -1 { trap() }
-    }
-    bump = transmute(new_end);
-    transmute(ptr)
-  }
+/// The shared bump allocator for `heap`. `bootstrap` places it right after
+/// static data on first use and returns the same allocator afterwards.
+func allocator() -> heap::*alloc::BumpAllocator<heap> {
+    alloc::BumpAllocator::<heap>::bootstrap(heap)
 }
 
-func write_all(fd: FileDescriptor, bytes: &[u8]) {
-  local alloc: *BumpAllocator = std::ptr::null_mut();
-  local io_vecs = alloc.alloc_slice::<&[u8]>(1);
-  io_vecs[0] = bytes;
-  local nwritten = alloc.alloc::<u32>(0);
-  if wasi::fd_write(fd, io_vecs, nwritten) != Errno::Success { trap() };
+func write_all(fd: FileDescriptor, bytes: heap::&[u8]) {
+    local alloc = allocator();
+    local io_vecs = alloc.allocate_slice_uninit::<heap::&[u8]>(1);
+    io_vecs[0] = bytes;
+    local nwritten = alloc.allocate_value::<u32>(0);
+    if wasi::fd_write(fd, io_vecs.*.&, nwritten) != Errno::Success { trap() };
 }
 
 // WASI argv/environ strings are NUL-terminated C strings; scan forward to
 // find the length before turning a pointer into a wx slice.
-func cstr_len(mut p: &u8) -> u32 {
-  local mut len: u32 = 0;
-  loop {
-    if p.* == 0 { break len };
-    p = ptr::add(p, 1);
-    len += 1;
-  }
+func cstr_len(mut p: heap::&u8) -> u32 {
+    local mut len: u32 = 0;
+    loop {
+        if p.* == 0 { break len };
+        p = RawPtr::from_ref(p).add(1).as_ref();
+        len += 1;
+    }
+}
+
+/// Where `slice`'s elements start: its address, without its length.
+func data_ptr<T: StackValue>(slice: heap::*[T]) -> heap::*T {
+    RawPtr::<heap, T>::from_addr(address(slice)).as_ptr()
 }
 
 func main() {
-  local alloc: *BumpAllocator = std::ptr::null_mut();
+    local alloc = allocator();
 
-  local argc_ptr = alloc.alloc::<u32>(0);
-  local argv_buf_size_ptr = alloc.alloc::<u32>(0);
-  if wasi::args_sizes_get(argc_ptr, argv_buf_size_ptr) != Errno::Success { trap() };
+    local argc_ptr = alloc.allocate_value::<u32>(0);
+    local argv_buf_size_ptr = alloc.allocate_value::<u32>(0);
+    if wasi::args_sizes_get(argc_ptr, argv_buf_size_ptr) != Errno::Success {
+        trap()
+    }
 
-  local argc = argc_ptr.*;
-  local argv = alloc.alloc_slice::<u32>(argc);
-  local argv_buf = alloc.alloc_slice::<u8>(argv_buf_size_ptr.*);
-  if wasi::args_get(transmute(argv.ptr()), transmute(argv_buf.ptr())) != Errno::Success { trap() };
+    local argc = argc_ptr.*;
+    local argv = alloc.allocate_slice_uninit::<heap::&u8>(argc);
+    local argv_buf = alloc.allocate_slice_uninit::<u8>(argv_buf_size_ptr.*);
+    if wasi::args_get(data_ptr(argv), data_ptr(argv_buf)) != Errno::Success {
+        trap()
+    }
 
-  local mut i: u32 = 0;
-  loop {
-    if i == argc { break };
+    local mut i: u32 = 0;
+    loop {
+        if i == argc { break };
 
-    local str_ptr: *u8 = transmute(ptr::add(argv.ptr(), i).*);
-    local len = cstr_len(str_ptr);
-    write_all(FileDescriptor::Stdout, slice_from_parts(str_ptr, len));
-    write_all(FileDescriptor::Stdout, "\n");
+        local str_ptr = argv[i];
+        local len = cstr_len(str_ptr);
+        write_all(FileDescriptor::Stdout, slice_from_parts(str_ptr, len));
+        write_all(FileDescriptor::Stdout, "\n");
 
-    i += 1;
-  }
+        i += 1;
+    }
 }
 
 export {
-  main as "_start",
-  heap as "memory",
+    main as "_start",
+    heap as "memory",
 }

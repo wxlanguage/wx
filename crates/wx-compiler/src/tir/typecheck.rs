@@ -71,6 +71,7 @@ use crate::ast::{
 };
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
+use members::Expected;
 
 /// Checks the expressions of one definition into a `Body`.
 pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
@@ -442,14 +443,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
 				Arguments::Positional(arguments),
-				expected,
+				Expected::Type(expected),
 				span,
 			),
 			ast::Expression::NamedCall { callee, arguments } => self
 				.build_call(
 					callee,
 					Arguments::Named(arguments),
-					expected,
+					Expected::Type(expected),
 					span,
 				),
 			ast::Expression::Tuple { elements } => {
@@ -516,14 +517,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				&call.object,
 				&call.method,
 				Arguments::Positional(&call.arguments),
-				expected,
+				Expected::Type(expected),
 				span,
 			),
 			ast::Expression::NamedMethodCall(call) => self.build_method_call(
 				&call.object,
 				&call.method,
 				Arguments::Named(&call.arguments),
-				expected,
+				Expected::Type(expected),
 				span,
 			),
 			ast::Expression::Match { scrutinee, arms } => {
@@ -1053,11 +1054,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 
 	/// A call: of a function named by a path, the construction of a struct,
 	/// or of any other value whose type is callable (`build_value_call`).
+	/// As a method call's receiver, a function's call reads its expected
+	/// type from the method.
 	fn build_call(
 		&mut self,
 		callee: &Spanned<ast::Expression>,
 		arguments: Arguments<'_>,
-		expected: TypeIndex,
+		expected: Expected,
 		span: TextSpan,
 	) -> ExprIdx {
 		let segments = match &callee.inner {
@@ -1112,7 +1115,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				type_args,
 				segment,
 				arguments,
-				expected,
+				expected.ty(),
 				span,
 			);
 		}
@@ -1173,13 +1176,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		// The struct's type arguments are learned within this call: from what
 		// is written on its name, the expected type, and then the fields.
-		let type_args = self.struct_type_args(struct_index, segment, expected);
+		let type_args =
+			self.struct_type_args(struct_index, segment, expected.ty());
 		self.build_construction(
 			struct_index,
 			type_args,
 			segment,
 			arguments,
-			expected,
+			expected.ty(),
 			span,
 		)
 	}
@@ -6403,6 +6407,43 @@ mod tests {
 		assert_eq!(case.shape("from_expected"), "(block => (call empty<u16>))");
 		assert_eq!(case.shape("with_own"), "(block => (call of<Bool, u8>))");
 		assert_eq!(case.shape("picked"), "(block => (call only))");
+	}
+
+	#[test]
+	fn a_receiver_call_learns_its_type_arguments_from_the_method() {
+		test_case!(
+			case = indoc! {"
+				memory heap: u32;
+				struct P<M: Memory, T>(addr: M::Size);
+				impl<M: Memory, T: StackValue> P<M, T> {
+					pub func at(addr: M::Size) -> Self { Self({ addr }) }
+					pub func get(self: Self) -> M::*T { transmute(self.addr) }
+					pub func peek(self: heap::&Self) -> M::&T { loop {} }
+				}
+				func by_value(n: u32) -> heap::*u8 { P::at(n).get() }
+				func make<M: Memory, T: StackValue>(a: u32) -> M::*P<M, T> {
+					loop {}
+				}
+				func by_pointer(n: u32) -> heap::&u8 { make(n).peek() }
+				func nothing_expected(n: u32) { P::at(n).get(); }
+				func written_wins(n: u32) -> heap::*u8 {
+					P::<heap, u16>::at(n).get()
+				}
+			"}
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TypeAnnotationRequired,
+			DiagnosticCode::TypeMistmatch,
+		]);
+		assert_eq!(
+			case.shape("by_value"),
+			"(block => (call get<heap, u8> (call at<heap, u8> n#0)))"
+		);
+		assert_eq!(
+			case.shape("by_pointer"),
+			"(block => (call peek<heap, u8> (.& (* (call make<heap, u8> n#0)))))"
+		);
 	}
 
 	#[test]

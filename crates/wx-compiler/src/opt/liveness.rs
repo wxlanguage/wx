@@ -89,14 +89,15 @@ fn mark_block_roots(
 				if outputs.is_empty() {
 					mark_stack_result_live(*result, live, worklist);
 				}
-				// `own_values` need no separate marking here: each arm's raw
-				// contribution to a divergent slot is either the slot's sole
-				// `outputs` node directly, or was folded into it through a
-				// chain of intermediate Phi nodes (`Phi::left`/`right`) that
-				// `mark_node_inputs_live` already walks — so marking the
-				// slot's one `outputs` entry live transitively covers every
-				// arm's own value for that slot.
+				// Each arm stores its own value for every slot at its exit
+				// (`SwitchCase::own_values`). A slot's `outputs` Phi is only a
+				// typed placeholder over two of the arms' values
+				// (`merge_switch_slot`), so the rest are reachable from here
+				// alone.
 				for case in cases.iter().chain(default.iter()) {
+					for &own in case.own_values.iter() {
+						mark_stack_result_live(own, live, worklist);
+					}
 					mark_block_roots(func, case.block, live, worklist);
 				}
 			}

@@ -2168,7 +2168,11 @@ pub typeset PointerSize:
     + Add
     + Sub
     + Mul
+    + Div
+    + BitAnd
+    + BitNot
     + PartialEq
+    + PartialOrd
     + UnsignedInt
     + StackValue
     + PartialEq { u32, u64 }

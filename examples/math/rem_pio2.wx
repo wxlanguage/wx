@@ -74,7 +74,7 @@ func medium(x: f64, ix: u64) -> (i32, f64, f64) {
             w = f_n * PIO2_3T - ((t - r) - w);
             y0 = r - w;
         }
-    };
+    }
 
     (n, y0, (r - y0) - w)
 }
@@ -92,27 +92,27 @@ pub func rem_pio2(x: f64) -> (i32, f64, f64) {
         if (ix & 0xfffff) == 0x921fb {
             // |x| ~= pi/2 or 2*pi/2 — cancellation, use the medium case
             return medium(x, ix);
-        };
+        }
         if ix <= 0x4002d97c {
             // |x| ~<= 3pi/4 — one round, good to 85 bits
             if sign {
                 local z = x + PIO2_1;
                 local y0 = z + PIO2_1T;
                 return (-1, y0, (z - y0) + PIO2_1T);
-            };
+            }
             local z = x - PIO2_1;
             local y0 = z - PIO2_1T;
             return (1, y0, (z - y0) - PIO2_1T);
-        };
+        }
         if sign {
             local z = x + 2.0 * PIO2_1;
             local y0 = z + 2.0 * PIO2_1T;
             return (-2, y0, (z - y0) + 2.0 * PIO2_1T);
-        };
+        }
         local z = x - 2.0 * PIO2_1;
         local y0 = z - 2.0 * PIO2_1T;
         return (2, y0, (z - y0) - 2.0 * PIO2_1T);
-    };
+    }
 
     if ix <= 0x401c463b {
         // |x| ~<= 9pi/4
@@ -121,32 +121,34 @@ pub func rem_pio2(x: f64) -> (i32, f64, f64) {
             if ix == 0x4012d97c {
                 // |x| ~= 3pi/2
                 return medium(x, ix);
-            };
+            }
             if sign {
                 local z = x + 3.0 * PIO2_1;
                 local y0 = z + 3.0 * PIO2_1T;
                 return (-3, y0, (z - y0) + 3.0 * PIO2_1T);
-            };
+            }
             local z = x - 3.0 * PIO2_1;
             local y0 = z - 3.0 * PIO2_1T;
             return (3, y0, (z - y0) - 3.0 * PIO2_1T);
-        };
+        }
         if ix == 0x401921fb {
             // |x| ~= 4pi/2
             return medium(x, ix);
-        };
+        }
         if sign {
             local z = x + 4.0 * PIO2_1;
             local y0 = z + 4.0 * PIO2_1T;
             return (-4, y0, (z - y0) + 4.0 * PIO2_1T);
-        };
+        }
         local z = x - 4.0 * PIO2_1;
         local y0 = z - 4.0 * PIO2_1T;
         return (4, y0, (z - y0) - 4.0 * PIO2_1T);
-    };
+    }
 
     // |x| ~< 2^20*(pi/2), medium size — 33+33+33 bit pi is good enough here.
-    if ix < 0x413921fb { return medium(x, ix); };
+    if ix < 0x413921fb {
+        return medium(x, ix);
+    }
 
     // Large finite `x`, or `x` is inf/NaN — the former would need `rem_pio2_large`, the latter
     // is a genuine NaN result either way (`x - x` for inf or NaN is NaN in the original); both

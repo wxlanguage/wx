@@ -21,7 +21,8 @@ use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::defs::{
-	BindingKey, ConstIdx, DefKind, MemberKind, Tier, TraitIdx, Visibility,
+	BindingKey, ConstIdx, DefKind, InherentImplIdx, MemberKind, Tier, TraitIdx,
+	Visibility,
 };
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
@@ -35,6 +36,35 @@ use crate::tir::satisfaction::{
 use crate::tir::signatures::InferPolicy;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{Substitution, Type, TypeIndex};
+
+/// What a call's context expects of it.
+#[derive(Clone, Copy)]
+pub(super) enum Expected {
+	/// A type (`INFER` for none).
+	Type(TypeIndex),
+	/// The call is the receiver of a method call, `f(x).method(..)`, which
+	/// expects of it what the method takes as `self`
+	/// (`BodyContext::receiver_expectation`).
+	Receiver(ReceiverOf),
+}
+
+impl Expected {
+	/// The type expected, without reading a method's: `INFER` for a
+	/// receiver.
+	pub(super) fn ty(self) -> TypeIndex {
+		match self {
+			Self::Type(ty) => ty,
+			Self::Receiver(_) => TypeIndex::INFER,
+		}
+	}
+}
+
+/// A method call's name and the type expected of the method call.
+#[derive(Clone, Copy)]
+pub(super) struct ReceiverOf {
+	pub(super) method: BindingKey,
+	pub(super) expected: TypeIndex,
+}
 
 /// A member of a type a path names.
 pub(super) struct MemberPath<'s> {
@@ -303,7 +333,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		path: MemberPath<'_>,
 		callee_span: TextSpan,
 		arguments: Arguments<'_>,
-		expected: TypeIndex,
+		expected: Expected,
 		span: TextSpan,
 	) -> ExprIdx {
 		match self.select_member(&path) {
@@ -332,6 +362,48 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 	}
 
+	/// A method call's receiver. A call there learns its type arguments from
+	/// what the method expects of it (`receiver_expectation`), since nothing
+	/// else gives the receiver an expected type; any other receiver expects
+	/// nothing.
+	fn build_receiver(
+		&mut self,
+		object: &Spanned<ast::Expression>,
+		receiver_of: ReceiverOf,
+	) -> ExprIdx {
+		let span = object.span;
+		match &object.inner {
+			ast::Expression::Call { callee, arguments } => self.build_call(
+				callee,
+				Arguments::Positional(arguments),
+				Expected::Receiver(receiver_of),
+				span,
+			),
+			ast::Expression::NamedCall { callee, arguments } => self
+				.build_call(
+					callee,
+					Arguments::Named(arguments),
+					Expected::Receiver(receiver_of),
+					span,
+				),
+			ast::Expression::MethodCall(call) => self.build_method_call(
+				&call.object,
+				&call.method,
+				Arguments::Positional(&call.arguments),
+				Expected::Receiver(receiver_of),
+				span,
+			),
+			ast::Expression::NamedMethodCall(call) => self.build_method_call(
+				&call.object,
+				&call.method,
+				Arguments::Named(&call.arguments),
+				Expected::Receiver(receiver_of),
+				span,
+			),
+			_ => self.build(object, TypeIndex::INFER),
+		}
+	}
+
 	/// `receiver.method(a, b)` or `receiver.method({ b, a })`: a call of the
 	/// method the receiver's type has, the receiver its first argument. A
 	/// pointer is not dereferenced: a method of the pointee is found only when
@@ -344,10 +416,18 @@ impl BodyContext<'_, '_, '_, '_> {
 		object: &Spanned<ast::Expression>,
 		method: &ast::PathSegment,
 		arguments: Arguments<'_>,
-		expected: TypeIndex,
+		expected: Expected,
 		span: TextSpan,
 	) -> ExprIdx {
-		let receiver = self.build(object, TypeIndex::INFER);
+		// A method call that is itself a receiver expects nothing it can
+		// pass on: its method is selected only once its receiver is built.
+		let receiver = self.build_receiver(
+			object,
+			ReceiverOf {
+				method: BindingKey::value(method.ident.inner),
+				expected: expected.ty(),
+			},
+		);
 		let receiver_ty = self.body.ty(receiver);
 		if self.cx.types.needs_context(receiver_ty) {
 			self.report_annotation_required(receiver);
@@ -594,6 +674,47 @@ impl BodyContext<'_, '_, '_, '_> {
 			return None;
 		};
 		let impl_dispatch = self.cx.impl_dispatch;
+		let mut candidates =
+			self.inherent_candidates_with_holes(target, receiver, key);
+		// A type's inherent impls declare a name once between them, so a
+		// second candidate is a duplicate already reported.
+		if candidates.len() > 1 {
+			return None;
+		}
+		let Some((impl_index, kind, impl_args)) = candidates.pop() else {
+			let is_trait_member = impl_dispatch
+				.trait_candidates(target)
+				.iter()
+				.any(|&(trait_index, _)| {
+					self.cx
+						.defs
+						.declared_trait_member(trait_index, key)
+						.is_some()
+				});
+			if is_trait_member {
+				self.report_unsupported(
+					member.ident.span,
+					"a trait member of a type without its type arguments",
+				);
+			} else {
+				self.report_no_member(receiver, member);
+			}
+			return None;
+		};
+		Some((ApplicableMember::Inherent { impl_index, kind }, impl_args))
+	}
+
+	/// The inherent impls of `target` that declare `key` and whose target,
+	/// with what `receiver` (partly unknown) teaches their parameters, still
+	/// meets it: each with the member and the impl's arguments learned.
+	/// Reports nothing.
+	fn inherent_candidates_with_holes(
+		&mut self,
+		target: ImplTarget,
+		receiver: TypeIndex,
+		key: BindingKey,
+	) -> Vec<(InherentImplIdx, MemberKind, Box<[TypeIndex]>)> {
+		let impl_dispatch = self.cx.impl_dispatch;
 		let mut candidates = Vec::new();
 		for &impl_index in impl_dispatch.inherent_candidates(target) {
 			let impl_def =
@@ -629,32 +750,81 @@ impl BodyContext<'_, '_, '_, '_> {
 				candidates.push((impl_index, kind, impl_args));
 			}
 		}
-		// A type's inherent impls declare a name once between them, so a
-		// second candidate is a duplicate already reported.
-		if candidates.len() > 1 {
-			return None;
+		candidates
+	}
+
+	/// What a method call expects of its receiver, before the receiver has
+	/// settled its type arguments: `shape` is the receiver's type as far as
+	/// it knows it (`RawPtr<_, _>`), and the method `receiver_of` names,
+	/// found on that shape, learns its arguments from the type expected of
+	/// the call (`heap::*u8` against `Mem::*T`) and instantiates its `self`
+	/// (`RawPtr<heap, u8>`). Only a hint: the method is selected again, and
+	/// reported, once the receiver is built. `INFER` when the shape is known
+	/// already or the method is not found on it.
+	pub(super) fn receiver_expectation(
+		&mut self,
+		shape: TypeIndex,
+		receiver_of: ReceiverOf,
+	) -> TypeIndex {
+		let ReceiverOf { method, expected } = receiver_of;
+		if !self.cx.types.has_infer(shape)
+			|| expected == TypeIndex::INFER
+			|| expected == TypeIndex::ERROR
+		{
+			return TypeIndex::INFER;
 		}
-		let Some((impl_index, kind, impl_args)) = candidates.pop() else {
-			let is_trait_member = impl_dispatch
-				.trait_candidates(target)
-				.iter()
-				.any(|&(trait_index, _)| {
-					self.cx
-						.defs
-						.declared_trait_member(trait_index, key)
-						.is_some()
-				});
-			if is_trait_member {
-				self.report_unsupported(
-					member.ident.span,
-					"a trait member of a type without its type arguments",
-				);
-			} else {
-				self.report_no_member(receiver, member);
-			}
-			return None;
+		let pointer = match *self.cx.types.resolve(shape) {
+			Type::Pointer { to, ownership, .. } => Some((to, ownership)),
+			_ => None,
 		};
-		Some((ApplicableMember::Inherent { impl_index, kind }, impl_args))
+		let selected = pointer.map_or(shape, |(to, _)| to);
+		let Some(target) =
+			ImplTarget::from_type(self.cx.types.resolve(selected))
+		else {
+			return TypeIndex::INFER;
+		};
+		let mut candidates =
+			self.inherent_candidates_with_holes(target, selected, method);
+		// More than one is a duplicate, reported where it is declared.
+		if candidates.len() != 1 {
+			return TypeIndex::INFER;
+		}
+		let (_, kind, impl_args) = candidates.pop().unwrap();
+		let MemberKind::Method(function) = kind else {
+			return TypeIndex::INFER;
+		};
+		let Callee { mut type_args, .. } =
+			Callee::new(self.cx, function, &impl_args, 0);
+		let (env, _) = self.function_frames(function);
+		let signature = &self.cx.functions[usize::from(function)];
+		let (return_type, params) =
+			(signature.return_type, signature.param_types);
+		let expected = self.normalized(expected, self.scope.assumption_env);
+		self.cx.types.learn(
+			&self.cx.generic_envs,
+			env,
+			&mut type_args,
+			return_type,
+			expected,
+		);
+		let Some(&declared) = self.cx.types.list(params).first() else {
+			return TypeIndex::INFER;
+		};
+		let hint = self.instantiate(declared, env, &type_args);
+		// A receiver's pointer gives a method taking `self` by either kind
+		// of pointer (`*` for `&` is `receiver.*.&`), so its own kind is
+		// kept: the parts are what the call learns from.
+		match (pointer, *self.cx.types.resolve(hint)) {
+			(Some((_, ownership)), Type::Pointer { to, memory, .. }) => {
+				self.cx.types.intern(Type::Pointer {
+					to,
+					memory,
+					ownership,
+				})
+			}
+			(None, Type::Pointer { .. }) | (Some(_), _) => TypeIndex::INFER,
+			(None, _) => hint,
+		}
 	}
 
 	/// Reports a member not visible here: an inherent member by its own

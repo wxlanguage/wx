@@ -2653,6 +2653,22 @@ fn function_bodies_always_break() {
 	}
 }
 
+/// The `;` a multi-line block-like statement drops was never what ended it:
+/// its closing `}` is, so a tuple on the next line stays a statement of its
+/// own rather than becoming a call of the `if`.
+#[test]
+fn a_dropped_block_like_separator_keeps_the_next_statement() {
+	let output = checked_format(
+		"func f() -> (u32, u32) { if c { a(); return (1, 2); }; (3, 4) }",
+		80,
+		4,
+	);
+	assert_eq!(
+		output,
+		"func f() -> (u32, u32) {\n    if c {\n        a();\n        return (1, 2);\n    }\n    (3, 4)\n}\n"
+	);
+}
+
 #[test]
 fn block_like_statement_separators() {
 	// Every block-like form, with and without its optional `;`.

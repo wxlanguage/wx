@@ -119,6 +119,8 @@ define_diagnostic_codes! {
 		LabelOnIf => "E1025",
 		CrateMemberHasBody => "E1026",
 		AttributeArgumentsAreNamed => "E1027",
+		BlockLikeOperand => "E1028",
+		ChainedAssignment => "E1029",
 		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
 		RedundantConstMarker => "W1003",

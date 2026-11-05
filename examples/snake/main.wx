@@ -1,38 +1,40 @@
-use std::*;
-
-memory heap: Memory where { Size = u32 };
-
-global mut bump: heap::*u8 = heap::DATA_END;
-
-pub func alloc<T>() -> heap::*T {
-  local align = align_of::<T, heap>();
-  local ptr = ptr::align_up::<heap>(transmute(bump), align);
-  local new_end = ptr + size_of::<T, heap>();
-  local cur_end = heap.size_bytes();
-  if new_end > cur_end {
-    local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-    _ = heap.grow(needed);
-  }
-  bump = transmute(new_end);
-  transmute(ptr)
-}
+memory heap: u32;
 
 import "host" as host {
-  func draw_rect(x: i32, y: i32, w: i32, h: i32, color: u32);
-  func clear(color: u32);
-  func poll_key() -> i32;
-  func get_time_ms() -> i64;
+    func draw_rect(x: i32, y: i32, w: i32, h: i32, color: u32);
+    func clear(color: u32);
+    func poll_key() -> i32;
+    func get_time_ms() -> i64;
 }
 
+// ── allocator ─────────────────────────────────────────────────────────────────
+// The address of the next free byte. Nothing is ever freed: `reset` rewinds it.
+// It starts one word past 0, so no allocation is ever `RawPtr::null()`.
+global mut bump: u32 = 4;
+
+func alloc<T: StackValue>() -> heap::*T {
+    local ptr =
+        RawPtr::<heap, T>::from_addr(bump.get()).align_up(
+            align_of::<T, heap>(),
+        );
+    local new_end = ptr.addr() + size_of::<T, heap>();
+    local cur_end = heap.size_bytes();
+    if new_end > cur_end {
+        _
+            = heap.grow(
+                (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE,
+            );
+    }
+    bump.set(new_end);
+    ptr.as_ptr()
+}
+
+// ── game state ────────────────────────────────────────────────────────────────
 enum Direction(u32) {
-  Right = 0,
-  Down = 1,
-  Left = 2,
-  Up = 3,
-}
-
-func test() -> Direction {
-  Direction::Right
+    Right = 0,
+    Down = 1,
+    Left = 2,
+    Up = 3,
 }
 
 const CELL_SIZE: i32 = 8;
@@ -40,166 +42,161 @@ const GRID_W: i32 = 32;
 const GRID_H: i32 = 24;
 const STEP_MS: i64 = 120;
 
-struct Node(
-  x: i32,
-  y: i32,
-  next: heap::*Node,
-);
+/// One body segment; `next` is the segment behind it, null at the tail.
+struct Node(x: i32, y: i32, next: RawPtr<heap, Node>);
 
-global mut head: heap::*Node = ptr::null_mut();
-global mut len: i32 = 0;
-global mut dir: i32 = 0;
+// The address of the head segment, 0 when the snake is empty.
+global mut head: u32 = 0;
+global mut dir: Direction = Direction::Right;
 global mut food_x: i32 = 16;
 global mut food_y: i32 = 12;
 global mut acc_ms: i64 = 0;
 
-pub func node_new(value_x: i32, value_y: i32, next: heap::*Node) -> heap::*Node {
-  local n: heap::*Node = alloc::<Node>();
-  n.* = Node({ x: value_x, y: value_y, next: next });
-  n
+func push_front(x: i32, y: i32) {
+    local n = alloc::<Node>();
+    n.* = Node({ x, y, next: RawPtr::from_addr(head.get()) });
+    head.set(RawPtr::from_ptr(n).addr());
 }
 
-pub func push_front(x: i32, y: i32) {
-  head = node_new(x, y, head);
-  len += 1;
-}
-
-pub func pop_back() {
-  if ptr::is_null(head) { return; }
-  if ptr::is_null(head.*.next) {
-    head = ptr::null_mut();
-    len = 0;
-    return;
-  }
-  local mut cur: *Node = transmute(head);
-  loop {
-    local mut n = cur.*;
-    if ptr::is_null(n.next.*.next) {
-      n.next = ptr::null_mut();
-      cur.* = n;
-      len -= 1;
-      break;
+func pop_back() {
+    local first = RawPtr::<heap, Node>::from_addr(head.get());
+    if first.is_null() { return };
+    if first.as_ref().next.is_null() {
+        head.set(0);
+        return;
     }
-    cur = n.next;
-  }
+    local mut cur = first;
+    loop {
+        local next = cur.as_ref().next;
+        if next.as_ref().next.is_null() {
+            cur.as_ptr().next = RawPtr::null();
+            break;
+        }
+        cur = next;
+    }
 }
 
-pub func contains(x: i32, y: i32) -> Bool {
-  local mut cur: &Node = head;
-  loop {
-    if ptr::is_null(cur) { break False }
-    local n = cur.*;
-    if n.x == x && n.y == y { break True }
-    cur = n.next;
-  }
+func contains(x: i32, y: i32) -> Bool {
+    local mut cur = RawPtr::<heap, Node>::from_addr(head.get());
+    loop {
+        if cur.is_null() { break False };
+        local n = cur.as_ref();
+        if n.x == x && n.y == y { break True };
+        cur = n.next;
+    }
 }
 
-pub func place_food() {
-  local t = host::get_time_ms();
-  local mut fx = (i32_wrap_i64(t) % GRID_W + GRID_W) % GRID_W;
-  local fy = ((i32_wrap_i64(t) / 13) % GRID_H + GRID_H) % GRID_H;
-  if contains(fx, fy) { fx = (fx + 3) % GRID_W; }
-  food_x = fx;
-  food_y = fy;
+func place_food() {
+    local t = i32_wrap_i64(host::get_time_ms());
+    local mut fx = (t % GRID_W + GRID_W) % GRID_W;
+    local fy = ((t / 13) % GRID_H + GRID_H) % GRID_H;
+    if contains(fx, fy) {
+        fx = (fx + 3) % GRID_W;
+    }
+    food_x.set(fx);
+    food_y.set(fy);
 }
 
-pub func start() {
-  reset();
-  
-  push_front(5, 5);
-  push_front(4, 5);
-  push_front(3, 5);
-  dir = 0;
-  place_food();
+func reset() {
+    bump.set(4);
+    head.set(0);
+    acc_ms.set(0);
 }
 
-pub func reset() {
-  bump = heap::DATA_END;
-  head = ptr::null_mut();
-  len = 0;
-  acc_ms = 0;
+func start() {
+    reset();
+
+    // Tail first, so the head is the rightmost segment, facing `Right`.
+    push_front(3, 5);
+    push_front(4, 5);
+    push_front(5, 5);
+    dir.set(Direction::Right);
+    place_food();
 }
 
-pub func step() {
-  local key = host::poll_key();
-  if key == 1 && dir != 0 { dir = 2 }
-  if key == 2 && dir != 3 { dir = 1 }
-  if key == 3 && dir != 2 { dir = 0 }
-  if key == 4 && dir != 1 { dir = 3 }
-  
-  local mut hx: i32 = 0;
-  local mut hy: i32 = 0;
-  if ptr::is_null(head) {
-    hx = 0;
-    hy = 0;
-  } else {
-    hx = head.*.x;
-    hy = head.*.y;
-  }
-  if dir == 0 { hx = (hx + 1) % GRID_W }
-  if dir == 1 { hy = (hy + 1) % GRID_H }
-  if dir == 2 { hx = (hx - 1 + GRID_W) % GRID_W }
-  if dir == 3 { hy = (hy - 1 + GRID_H) % GRID_H }
-  
-  if contains(hx, hy) {
-    start();
-    return;
-  }
-  
-  push_front(hx, hy);
-  
-  if hx == food_x && hy == food_y { place_food() } else { pop_back() }
+/// The direction the key turns to, unless it would reverse onto the body.
+func turn(key: i32, current: Direction) -> Direction {
+    match (key, current) {
+        (1, Direction::Right) | (2, Direction::Up) | (3, Direction::Left) | (4, Direction::Down) => current,
+        (1, _) => Direction::Left,
+        (2, _) => Direction::Down,
+        (3, _) => Direction::Right,
+        (4, _) => Direction::Up,
+        _ => current,
+    }
 }
 
-pub func update(dt: i64) {
-  acc_ms = acc_ms + dt;
-  loop {
-    if acc_ms < STEP_MS { break }
-    acc_ms = acc_ms - STEP_MS;
-    step();
-  }
-}
+func step() {
+    dir.set(turn(host::poll_key(), dir.get()));
 
-pub func draw() {
-  host::clear(0xFF101010);
-  
-  host::draw_rect(
-    food_x * CELL_SIZE,
-    food_y * CELL_SIZE,
-    CELL_SIZE,
-    CELL_SIZE,
-    0xFFFFFF00,
-  );
-  
-  local mut cur: heap::*Node = head;
-  local mut first: Bool = True;
-  loop {
-    if ptr::is_null(cur) { break }
-    if first {
-      host::draw_rect(
-        cur.*.x * CELL_SIZE,
-        cur.*.y * CELL_SIZE,
-        CELL_SIZE,
-        CELL_SIZE,
-        0xFFFF0000,
-      );
-      first = False;
+    local first = RawPtr::<heap, Node>::from_addr(head.get());
+    local (mut hx, mut hy) = if first.is_null() {
+        (0, 0)
     } else {
-      host::draw_rect(
-        cur.*.x * CELL_SIZE,
-        cur.*.y * CELL_SIZE,
-        CELL_SIZE,
-        CELL_SIZE,
-        0xFF00FF00,
-      );
+        local n = first.as_ref();
+        (n.x, n.y)
+    };
+    match dir.get() {
+        Direction::Right => hx = (hx + 1) % GRID_W,
+        Direction::Down => hy = (hy + 1) % GRID_H,
+        Direction::Left => hx = (hx - 1 + GRID_W) % GRID_W,
+        Direction::Up => hy = (hy - 1 + GRID_H) % GRID_H,
     }
-    cur = cur.*.next;
-  }
+
+    if contains(hx, hy) {
+        start();
+        return;
+    }
+
+    push_front(hx, hy);
+
+    if hx == food_x.get() && hy == food_y.get() {
+        place_food()
+    } else {
+        pop_back()
+    }
+}
+
+func update(dt: i64) {
+    acc_ms.set(acc_ms.get() + dt);
+    loop {
+        if acc_ms.get() < STEP_MS { break };
+        acc_ms.set(acc_ms.get() - STEP_MS);
+        step();
+    }
+}
+
+func draw() {
+    host::clear(0xFF101010);
+
+    host::draw_rect(
+        food_x.get() * CELL_SIZE,
+        food_y.get() * CELL_SIZE,
+        CELL_SIZE,
+        CELL_SIZE,
+        0xFFFFFF00,
+    );
+
+    local mut cur = RawPtr::<heap, Node>::from_addr(head.get());
+    local mut color: u32 = 0xFFFF0000; // the head, then the body
+    loop {
+        if cur.is_null() { break };
+        local n = cur.as_ref();
+        host::draw_rect(
+            n.x * CELL_SIZE,
+            n.y * CELL_SIZE,
+            CELL_SIZE,
+            CELL_SIZE,
+            color,
+        );
+        color = 0xFF00FF00;
+        cur = n.next;
+    }
 }
 
 export {
-  heap as "memory",
-  start,
-  update,
-  draw,
+    heap as "memory",
+    start,
+    update,
+    draw,
 }

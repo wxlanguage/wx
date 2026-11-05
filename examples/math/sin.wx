@@ -30,9 +30,9 @@ pub func sin(x: f64) -> f64 {
             // |x| < 2**-26, where sin(x) rounds to x. The original raises the inexact and
             // underflow flags here; wasm has no floating-point exception flags to raise.
             return x;
-        };
+        }
         return k_sin(x, 0.0, 0);
-    };
+    }
 
     // sin(Inf or NaN) is NaN
     if ix >= 0x7ff00000 { return x - x };
@@ -40,9 +40,9 @@ pub func sin(x: f64) -> f64 {
     // argument reduction needed
     local (n, y0, y1) = rem_pio2(x);
     match n & 3 {
-        0 -> { k_sin(y0, y1, 1) },
-        1 -> { k_cos(y0, y1) },
-        2 -> { -k_sin(y0, y1, 1) },
-        _ -> { -k_cos(y0, y1) }
+        0 => k_sin(y0, y1, 1),
+        1 => k_cos(y0, y1),
+        2 => -k_sin(y0, y1, 1),
+        _ => -k_cos(y0, y1),
     }
 }

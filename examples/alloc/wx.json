@@ -1,4 +1,4 @@
 {
-    "type": "bin",
+    "type": "lib",
     "entry": "main.wx"
 }

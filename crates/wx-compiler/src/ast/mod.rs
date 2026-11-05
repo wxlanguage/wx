@@ -305,6 +305,43 @@ fn report_incomplete_unary_expression(
 		)
 }
 
+/// A block-like expression (`if`, `match`, `loop`, `block`) met as an
+/// operand: `operator` is the token that would take it, or `None` when it
+/// is itself the operand an operator before it parsed.
+fn report_block_like_operand(
+	file_id: FileId,
+	expression: &Spanned<Expression>,
+	operator: Option<TextSpan>,
+) -> Diagnostic<FileId> {
+	let keyword = match expression.inner {
+		Expression::IfElse { .. } => "if",
+		Expression::Match { .. } => "match",
+		Expression::Loop { .. } => "loop",
+		_ => "block",
+	};
+	let diagnostic = Diagnostic::error()
+		.with_code(DiagnosticCode::BlockLikeOperand.code())
+		.with_message(format!("`{keyword}` cannot be an operand"));
+	let diagnostic = match operator {
+		Some(operator) => diagnostic
+			.with_label(Label::primary(file_id, operator).with_message(
+				format!("this operator would take the `{keyword}`"),
+			))
+			.with_label(
+				Label::secondary(file_id, expression.span)
+					.with_message(format!("the `{keyword}` ends here")),
+			),
+		None => diagnostic.with_label(
+			Label::primary(file_id, expression.span)
+				.with_message(format!("this `{keyword}` is an operand")),
+		),
+	};
+	diagnostic
+		.with_note(format!(
+			"a block-like expression ends at its closing `}}`; wrap it in parentheses: `({keyword} ..)`"
+		))
+}
+
 fn report_chained_comparisons(
 	file_id: FileId,
 	first_operator_span: TextSpan,
@@ -316,6 +353,21 @@ fn report_chained_comparisons(
         .with_label(Label::primary(file_id, first_operator_span))
         .with_label(Label::primary(file_id, second_operator_span))
         .with_note("consider using logical operator like `&&` or `||` to split the comparisons or use parentheses to group them")
+}
+
+fn report_chained_assignments(
+	file_id: FileId,
+	first_operator_span: TextSpan,
+	second_operator_span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::ChainedAssignment.code())
+		.with_message("assignments cannot be chained")
+		.with_label(Label::primary(file_id, first_operator_span))
+		.with_label(Label::primary(file_id, second_operator_span))
+		.with_note(
+			"an assignment's value is `()`; write each assignment as its own statement",
+		)
 }
 
 /// A `const` before a path that is a constant already: it changes nothing,
@@ -4025,6 +4077,42 @@ impl<'ctx> Parser<'ctx> {
 		};
 		let mut left = nud_handler(self)?;
 
+		// A block-like expression is never an operand: it fills an
+		// expression position whole and ends at its closing `}`, so no
+		// operator continues it and none takes it without parentheses
+		// (`(if c { f } else { g })(x)`). An assignment's value is a whole
+		// position too, as a `local`'s initializer is (`x = if c { 1 } else
+		// { 2 }`): only an operator binding tighter takes an operand. In a
+		// statement list, what follows is the next statement: `if c { .. }
+		// (a, b)` is two. Once that is reported, the operators are read as
+		// before, so the caller sees one diagnostic and a whole expression.
+		if left.inner.is_block_like() {
+			let token = self.lexer.peek();
+			if limit_bp > BindingPower::Assignment {
+				self.ast.diagnostics.push(report_block_like_operand(
+					self.ast.file_id,
+					&left,
+					None,
+				));
+			} else if self
+				.led_lookup(token)
+				.is_some_and(|(_, bp)| bp > limit_bp)
+				&& self.nud_lookup(token).is_none()
+			{
+				// A token that can only continue this expression; one that
+				// can also start one (`(`, `[`, `-`) starts whatever comes
+				// next, and one that binds no tighter than `limit_bp`
+				// continues an enclosing expression instead.
+				self.ast.diagnostics.push(report_block_like_operand(
+					self.ast.file_id,
+					&left,
+					Some(token.span),
+				));
+			} else {
+				return Ok(left);
+			}
+		}
+
 		loop {
 			let token = self.lexer.peek();
 
@@ -4343,33 +4431,30 @@ impl<'ctx> Parser<'ctx> {
 		}
 		let right = parser.parse_expression(bp)?;
 
-		if bp == BindingPower::Comparison {
-			match &left.inner {
-				Expression::Binary {
-					operator: left_operator,
-					..
-				} if BindingPower::from(left_operator.inner)
-					== BindingPower::Comparison =>
-				{
+		// Comparisons and assignments do not associate: neither grouping of
+		// `a < b < c` or `a = b = c` means anything (a comparison is a `Bool`,
+		// an assignment `()`), so a chain is an error rather than a grouping.
+		// Operators parse left-grouped, so a chain is always in `left`;
+		// written parentheses make a tuple, which is no chain.
+		if let Expression::Binary {
+			operator: left_operator,
+			..
+		} = &left.inner
+			&& BindingPower::from(left_operator.inner) == bp
+		{
+			match bp {
+				BindingPower::Comparison => {
 					parser.ast.diagnostics.push(report_chained_comparisons(
 						parser.ast.file_id,
 						left_operator.span,
 						operator_token.span,
 					));
 				}
-				_ => {}
-			}
-			match &right.inner {
-				Expression::Binary {
-					operator: right_operator,
-					..
-				} if BindingPower::from(right_operator.inner)
-					== BindingPower::Comparison =>
-				{
-					parser.ast.diagnostics.push(report_chained_comparisons(
+				BindingPower::Assignment => {
+					parser.ast.diagnostics.push(report_chained_assignments(
 						parser.ast.file_id,
+						left_operator.span,
 						operator_token.span,
-						right_operator.span,
 					));
 				}
 				_ => {}

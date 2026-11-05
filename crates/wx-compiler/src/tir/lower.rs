@@ -5926,6 +5926,35 @@ mod tests {
 		assert_eq!(run.call(&mut store, 2).unwrap(), 30);
 	}
 
+	/// Every arm's own value for a binding the arms change is live, not only
+	/// the two its join's placeholder Phi names: a third arm's division
+	/// (a trapping result) is stored at its exit, so it must be captured.
+	#[test]
+	fn a_third_arms_trapping_value_reaches_the_join() {
+		let source = r#"
+            func run(d: i32, w: i32) -> i32 {
+                local mut x: i32 = 7;
+                local mut y: i32 = 7;
+                match d {
+                    0 => x = x / w,
+                    1 => y = y / w,
+                    2 => x = x % w,
+                    _ => {},
+                }
+                x * 10 + y
+            }
+            export { run as "run" }
+        "#;
+		let (mut store, instance) = instantiate(source);
+		let run = instance
+			.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+			.unwrap();
+		assert_eq!(run.call(&mut store, (0, 2)).unwrap(), 37);
+		assert_eq!(run.call(&mut store, (1, 2)).unwrap(), 73);
+		assert_eq!(run.call(&mut store, (2, 4)).unwrap(), 37);
+		assert_eq!(run.call(&mut store, (3, 2)).unwrap(), 77);
+	}
+
 	/// An arm body need not be a block; a bare expression is its value.
 	#[test]
 	fn a_match_arm_body_may_be_an_expression() {

@@ -20,9 +20,9 @@ pub func cos(x: f64) -> f64 {
             // `if x as i32 == 0` purely to raise the inexact flag for non-zero `x`; the
             // truncation is zero for every `x` this small, and wasm has no flag to raise.
             return 1.0;
-        };
+        }
         return k_cos(x, 0.0);
-    };
+    }
 
     // cos(Inf or NaN) is NaN
     if ix >= 0x7ff00000 { return x - x };
@@ -30,9 +30,9 @@ pub func cos(x: f64) -> f64 {
     // argument reduction needed
     local (n, y0, y1) = rem_pio2(x);
     match n & 3 {
-        0 -> { k_cos(y0, y1) },
-        1 -> { -k_sin(y0, y1, 1) },
-        2 -> { -k_cos(y0, y1) },
-        _ -> { k_sin(y0, y1, 1) }
+        0 => k_cos(y0, y1),
+        1 => -k_sin(y0, y1, 1),
+        2 => -k_cos(y0, y1),
+        _ => k_sin(y0, y1, 1),
     }
 }

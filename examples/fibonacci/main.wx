@@ -1,16 +1,14 @@
-memory heap: Memory where { Size = u32 };
+memory heap: u32;
 
 import "console" as console {
-    func log(message: &[u8]);
+    func log(message: heap::&[u8]);
 }
 
-// func fibonacci(n: i32, b: i32, c: i32, d: i32, e: i32, h: i32) -> i32 {
-//     if n <= 1 { return n };
+func fibonacci(n: i32) -> i32 {
+    if n <= 1 { return n };
 
-//     console::log("calculating fibonacci");
-//     console::log("gewgew");
-//     fibonacci(n - 1) + fibonacci(n - 2)
-// }
+    fibonacci(n - 1) + fibonacci(n - 2)
+}
 
 func fibonacci_iterative(mut n: i32) -> i32 {
     if n <= 1 { return n };
@@ -30,51 +28,8 @@ func fibonacci_iterative(mut n: i32) -> i32 {
     }
 }
 
-func main() {
-    console::log("hello");
-}
-
-export {
-    // fibonacci,
-    fibonacci_iterative,
-    main,
-}
-
-// struct Point(
-//     r: i32,
-//     g: i32,
-//     b: i32,
-// );
-
-// func test() {
-//     Point({
-//         r: 5,
-//         g: 1,
-//         b: 1
-//     })
-//     Point(1, 2, 3)
-// }
-
-// func Point(r: i32, g: i32, b: i32) -> Point {
-//     Point({ r, g, b })
-
-// struct Point(i32, i32);
-
-// func test() -> Point {
-//     Point(5, 2)
-// }
-
-// variant Option<T> {
-//     Some(T),
-//     None,
-// }
-
-// func test() -> Option<i32> {
-//     Option::Some(5)
-// }
-
 func binary_search<
-    M: Memory where { Size: Sub + Add + Div + Eq },
+    M: Memory where { Size: Sub + Add + Div + Ord },
     T: Ord,
 >(arr: M::&[T], target: T) -> (Bool, M::Size) {
     local mut low: M::Size = 0;
@@ -85,9 +40,26 @@ func binary_search<
 
         local mid = low + (high - low) / 2;
         match arr[mid].cmp(target) {
-            Ordering::Less -> { low = mid + 1 },
-            Ordering::Greater -> { high = mid },
-            Ordering::Equal -> { return (True, mid) },
+            Ordering::Less => low = mid + 1,
+            Ordering::Greater => high = mid,
+            Ordering::Equal => return (True, mid),
         }
     }
+}
+
+func contains(arr: heap::&[u32], target: u32) -> Bool {
+    local (found, _) = binary_search(arr, target);
+    found
+}
+
+func main() {
+    console::log("hello");
+}
+
+export {
+    fibonacci,
+    fibonacci_iterative,
+    contains,
+    main,
+    heap as "memory",
 }

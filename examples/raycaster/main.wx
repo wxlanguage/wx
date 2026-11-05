@@ -1,5 +1,8 @@
 #[memory_limits({ min_pages: 4 })]
-memory heap: Memory where { Size = u32 };
+memory heap: u32;
+
+crate "math" as math;
+use math::Float;
 
 import "host" as host {
     func key_down(code: i32) -> i32;
@@ -24,17 +27,23 @@ const ROT_SPEED: f64 = 2.5;
 // `frame()` call.
 global mut map_w: u32 = 0;
 global mut map_h: u32 = 0;
-global mut map_data: heap::&u8 = transmute::<u32, _>(0);
+// Placeholder until `init` allocates the buffer.
+global mut map_data: heap::*u8 = heap::DATA_END;
 
 pub func map_ptr() -> i32 {
-    transmute(map_data)
+    transmute(map_data.get())
 }
 
 pub func map_at(x: i32, y: i32) -> u8 {
-    if x < 0 || y < 0 || x >= transmute(map_w) || y >= transmute(map_h) {
+    if x < 0
+        || y < 0
+        || x >= transmute(map_w.get())
+        || y >= transmute(map_h.get()) {
         1
     } else {
-        RawPtr::from_ref(map_data).add(transmute::<_, u32>(y) * map_w + transmute(x)).as_ref().*
+        RawPtr::from_ptr(map_data.get()).add(
+            transmute::<_, u32>(y) * map_w.get() + transmute(x),
+        ).as_ref().*
     }
 }
 
@@ -49,15 +58,15 @@ func find_spawn() {
     local mut found = False;
     loop {
         if found { break };
-        if y >= transmute(map_h) { break };
+        if y >= transmute(map_h.get()) { break };
         local mut x: i32 = 0;
         loop {
             if found { break };
-            if x >= transmute(map_w) { break };
+            if x >= transmute(map_w.get()) { break };
             if map_at(x, y) == 0 {
-                player_x = f64_convert_i32(x) + 0.5;
-                player_y = f64_convert_i32(y) + 0.5;
-                player_angle = 0.0;
+                player_x.set(x.to_f64() + 0.5);
+                player_y.set(y.to_f64() + 0.5);
+                player_angle.set(0.0);
                 found = True;
             }
             x += 1;
@@ -71,8 +80,8 @@ func find_spawn() {
 // buffer's capacity so a bad `w`/`h` from the host can never make `map_at`
 // read past `map_data`.
 pub func load_map(w: i32, h: i32) {
-    map_w = transmute::<_, u32>(w.max(0)).min(MAP_MAX_W);
-    map_h = transmute::<_, u32>(h.max(0)).min(MAP_MAX_H);
+    map_w.set(transmute::<_, u32>(w.max(0)).min(MAP_MAX_W));
+    map_h.set(transmute::<_, u32>(h.max(0)).min(MAP_MAX_H));
     find_spawn();
 }
 
@@ -80,7 +89,7 @@ pub func load_map(w: i32, h: i32) {
 global mut bump: heap::*u8 = heap::DATA_END;
 
 func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
-    local start = RawPtr::from_ptr(bump).align_up(align);
+    local start = RawPtr::from_ptr(bump.get()).align_up(align);
     local end = start.add(size);
     local cur_end = heap.size_bytes();
     if end.addr() > cur_end {
@@ -88,34 +97,36 @@ func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
             (end.addr() - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     }
-    bump = end.as_ptr();
+    bump.set(end.as_ptr());
     start.as_ptr()
 }
 
-global mut fb_ptr: heap::*u8 = transmute::<u32, _>(0);
+// Placeholder until `init` allocates the framebuffer.
+global mut fb_ptr: heap::*u8 = heap::DATA_END;
 
 pub func framebuffer_ptr() -> i32 {
-    transmute(fb_ptr)
+    transmute(fb_ptr.get())
 }
 
 func put_pixel(x: i32, y: i32, r: u8, g: u8, b: u8) {
     if x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H {
         return;
     }
-    local idx = transmute::<_, u32>(y) * transmute::<_, u32>(SCREEN_W) + transmute(x);
+    local idx =
+        transmute::<_, u32>(y) * transmute::<_, u32>(SCREEN_W) + transmute(x);
     local rgba =
-        transmute::<_, u32>(r) | (transmute::<_, u32>(g) << 8) | (transmute::<_, u32>(b) << 16) | ((255: u32) << 24);
-    RawPtr::from_ptr(fb_ptr).cast::<u32>().add(idx).as_ptr().* = rgba;
+        transmute::<_, u32>(r)
+            | (transmute::<_, u32>(g) << 8)
+            | (transmute::<_, u32>(b) << 16)
+            | ((255: u32) << 24);
+    RawPtr::from_ptr(fb_ptr.get()).cast::<u32>().add(idx).as_ptr().* = rgba;
 }
 
 global mut player_x: f64 = 3.5;
 global mut player_y: f64 = 3.5;
 global mut player_angle: f64 = 0.0;
 
-struct RayHit(
-    dist: f64,
-    side: i32,
-);
+struct RayHit(dist: f64, side: i32);
 
 func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
     local dir_x = angle.cos();
@@ -136,17 +147,17 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
 
     if dir_x < 0.0 {
         step_x = -1;
-        side_dist_x = (ox - f64_convert_i32(map_x)) * delta_dist_x;
+        side_dist_x = (ox - map_x.to_f64()) * delta_dist_x;
     } else {
         step_x = 1;
-        side_dist_x = (f64_convert_i32(map_x) + 1.0 - ox) * delta_dist_x;
+        side_dist_x = (map_x.to_f64() + 1.0 - ox) * delta_dist_x;
     }
     if dir_y < 0.0 {
         step_y = -1;
-        side_dist_y = (oy - f64_convert_i32(map_y)) * delta_dist_y;
+        side_dist_y = (oy - map_y.to_f64()) * delta_dist_y;
     } else {
         step_y = 1;
-        side_dist_y = (f64_convert_i32(map_y) + 1.0 - oy) * delta_dist_y;
+        side_dist_y = (map_y.to_f64() + 1.0 - oy) * delta_dist_y;
     }
 
     local mut side: i32 = 0;
@@ -166,11 +177,9 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
     }
 
     local dist = if side == 0 {
-        (f64_convert_i32(map_x) - ox + (1.0 - f64_convert_i32(step_x)) / 2.0)
-            / dir_x
+        (map_x.to_f64() - ox + (1.0 - step_x.to_f64()) / 2.0) / dir_x
     } else {
-        (f64_convert_i32(map_y) - oy + (1.0 - f64_convert_i32(step_y)) / 2.0)
-            / dir_y
+        (map_y.to_f64() - oy + (1.0 - step_y.to_f64()) / 2.0) / dir_y
     };
 
     RayHit({ dist, side })
@@ -182,19 +191,20 @@ pub func render() {
     loop {
         if x >= SCREEN_W { break };
 
-        local t = f64_convert_i32(x) / f64_convert_i32(SCREEN_W);
-        local ray_angle = player_angle - FOV / 2.0 + FOV * t;
-        local hit = cast_ray(player_x, player_y, ray_angle);
-        local corrected = hit.dist * (ray_angle - player_angle).cos();
+        local t = x.to_f64() / SCREEN_W.to_f64();
+        local ray_angle = player_angle.get() - FOV / 2.0 + FOV * t;
+        local hit = cast_ray(player_x.get(), player_y.get(), ray_angle);
+        local corrected = hit.dist * (ray_angle - player_angle.get()).cos();
 
         local mut line_height = SCREEN_H;
         if corrected > 0.0001 {
-            line_height = (f64_convert_i32(SCREEN_H) / corrected).to_i32();
+            line_height = (SCREEN_H.to_f64() / corrected).to_i32();
         }
 
         local draw_start =
             (SCREEN_H / 2 - line_height / 2).clamp(0, SCREEN_H - 1);
-        local draw_end = (SCREEN_H / 2 + line_height / 2).clamp(0, SCREEN_H - 1);
+        local draw_end =
+            (SCREEN_H / 2 + line_height / 2).clamp(0, SCREEN_H - 1);
 
         local mut shade: u8 = 200;
         if hit.side == 1 { shade = 140 };
@@ -219,7 +229,7 @@ pub func render() {
 
 // ── input + movement ───────────────────────────────────────────────────────
 pub func update(dt_ms: i64) {
-    local dt = f64_convert_i64(dt_ms) / 1000.0;
+    local dt = dt_ms.to_f64() / 1000.0;
     local mut forward: f64 = 0.0;
     local mut strafe: f64 = 0.0;
 
@@ -228,25 +238,28 @@ pub func update(dt_ms: i64) {
     if host::key_down(68) != 0 { strafe += 1.0 };
     if host::key_down(65) != 0 { strafe -= 1.0 };
     if host::key_down(39) != 0 {
-        player_angle += ROT_SPEED * dt;
+        player_angle.set(player_angle.get() + ROT_SPEED * dt);
     }
     if host::key_down(37) != 0 {
-        player_angle -= ROT_SPEED * dt;
+        player_angle.set(player_angle.get() - ROT_SPEED * dt);
     }
 
-    local dir_x = player_angle.cos();
-    local dir_y = player_angle.sin();
+    local angle = player_angle.get();
+    local dir_x = angle.cos();
+    local dir_y = angle.sin();
     local perp_x = -dir_y;
     local perp_y = dir_x;
 
-    local nx = player_x + (dir_x * forward + perp_x * strafe) * MOVE_SPEED * dt;
-    local ny = player_y + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
+    local nx =
+        player_x.get() + (dir_x * forward + perp_x * strafe) * MOVE_SPEED * dt;
+    local ny =
+        player_y.get() + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
 
-    if !is_wall(nx, player_y) {
-        player_x = nx;
+    if !is_wall(nx, player_y.get()) {
+        player_x.set(nx);
     }
-    if !is_wall(player_x, ny) {
-        player_y = ny;
+    if !is_wall(player_x.get(), ny) {
+        player_y.set(ny);
     };
 }
 
@@ -256,8 +269,13 @@ pub func frame(dt_ms: i64) {
 }
 
 pub func init() {
-    fb_ptr = alloc_bytes(transmute::<_, u32>(SCREEN_W) * transmute::<_, u32>(SCREEN_H) * 4, 4);
-    map_data = alloc_bytes(MAP_MAX_W * MAP_MAX_H, 1);
+    fb_ptr.set(
+        alloc_bytes(
+            transmute::<_, u32>(SCREEN_W) * transmute::<_, u32>(SCREEN_H) * 4,
+            4,
+        ),
+    );
+    map_data.set(alloc_bytes(MAP_MAX_W * MAP_MAX_H, 1));
 }
 
 export {

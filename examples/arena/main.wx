@@ -1,10 +1,4 @@
-use std::*;
-
-struct Arena<Mem: Memory>(
-    start: Mem::&u8,
-    end: Mem::&u8,
-    cursor: Mem::&u8,
-);
+struct Arena<Mem: Memory>(start: Mem::&u8, end: Mem::&u8, cursor: Mem::&u8);
 
 impl<Mem: Memory> Arena<Mem> {
     func new(buffer: Mem::&[u8]) -> Self {
@@ -16,17 +10,11 @@ impl<Mem: Memory> Arena<Mem> {
     }
 }
 
-memory heap: Memory where { Size = u32 };
+memory heap: u32;
 
-struct Range<Idx>(
-    start: Idx,
-    end: Idx,
-);
+struct Range<Idx>(start: Idx, end: Idx);
 
-struct RangeIter<Idx>(
-    start: Idx,
-    end: Idx,
-);
+struct RangeIter<Idx>(start: Idx, end: Idx);
 
 enum Option(u8) {
     None = 0,
@@ -86,9 +74,7 @@ trait IntoIterator {
     func into_iter(self: Self) -> Self::IntoIter;
 }
 
-struct BumpAllocator(
-    next: RawPtr<heap, u8>,
-);
+struct BumpAllocator(next: RawPtr<heap, u8>);
 
 impl BumpAllocator {
     pub func from_addr(start: u32) -> Self {
