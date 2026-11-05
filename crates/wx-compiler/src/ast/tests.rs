@@ -3147,6 +3147,52 @@ fn test_typeset_bound_clause_parses() {
 }
 
 #[test]
+fn a_bound_list_may_lead_with_a_plus() {
+	// The leading `+` is layout: the list is the same as without it, and a
+	// lone bound after one is still a single bound.
+	let case = TestCase::new(indoc! {"
+        typeset PointerSize:
+            + Add
+            + Sub
+            + PartialEq { u32, u64 }
+        trait T: + StackValue { type Size: + Add + Sub; }
+        func f<M: + Memory where { Size: + Add + Sub }>() {}
+    "});
+	case.diagnostics().assert_none();
+	let Item::TypeSet {
+		bounds: Some(bounds),
+		..
+	} = case.item(0)
+	else {
+		panic!("expected a typeset with bounds")
+	};
+	assert!(
+		matches!(bounds.inner, BoundExpression::BoundList(ref b) if b.len() == 3)
+	);
+	// The list's span starts at its first bound, not at the `+`.
+	let source = &case.files.get(case.ast.file_id).unwrap().source;
+	assert_eq!(
+		bounds.span.extract_str(source),
+		"Add\n    + Sub\n    + PartialEq"
+	);
+	let Item::Trait {
+		supertraits: Some(supertraits),
+		..
+	} = case.item(1)
+	else {
+		panic!("expected a trait with a supertrait")
+	};
+	assert!(matches!(supertraits.inner, BoundExpression::Path(_)));
+}
+
+#[test]
+fn a_lone_plus_is_not_a_bound() {
+	let case = TestCase::new("typeset S: + { u32 }");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UnexpectedToken);
+}
+
+#[test]
 fn test_typeset_bound_clause_with_where_bindings_parses() {
 	let case = TestCase::new(
 		"typeset Integer: Add where { Output = Self } { i32, i64 }",

@@ -3502,12 +3502,16 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// Parse one or more `+`-separated bounds: `Bound1 + Bound2 + ...`.
-	/// Returns a single `BoundExpression` when only one bound is present,
-	/// or `BoundExpression::BoundList` for two or more.
+	/// Parse one or more `+`-separated bounds: `Bound1 + Bound2 + ...`,
+	/// optionally led by a `+` (`+ Bound1 + Bound2`), so a long list can put
+	/// each bound on its own line, `+` first. The leading `+` is layout, not
+	/// meaning, and is not recorded: the formatter writes it when it breaks
+	/// the list. Returns a single `BoundExpression` when only one bound is
+	/// present, or `BoundExpression::BoundList` for two or more.
 	fn parse_bounds_expression(
 		&mut self,
 	) -> Result<Spanned<BoundExpression>, ()> {
+		let _ = self.lexer.next_if(Token::Plus);
 		let first = self.parse_bound()?;
 		if self.lexer.peek().inner != Token::Plus {
 			return Ok(first);
