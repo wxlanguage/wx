@@ -67,13 +67,12 @@ index_newtype!(
 	AggregateIndex
 );
 
-// `Debug` is gated on `debug_assertions` rather than `test` so that panics in
-// a debug build can name the offending type. It must *not* also appear in the
-// `test` derive below: `cargo test` enables both cfgs, and two `derive(Debug)`
-// would be conflicting impls.
+// `Debug` is gated on `debug_assertions` as well as `test`, so that panics in
+// a debug build can name the offending type and a release test build can
+// still `assert_eq!` on it. It must *not* also appear in the `test` derive
+// below: two `derive(Debug)` would be conflicting impls.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ValueType {
 	I32,
 	I64,
@@ -130,8 +129,7 @@ index_newtype!(
 
 /// A contiguous selection in a flat value pack, including an empty selection.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct ScalarRange {
 	pub start: ScalarIndex,
 	pub len: u32,
@@ -154,7 +152,7 @@ impl ScalarRange {
 /// An owned, nonempty flat value representation. No entry may be another
 /// aggregate, `Unit`, or `Never`. Source structure belongs to TIR only.
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Aggregate {
 	pub scalars: Box<[ValueType]>,
 	/// Some stack values have no linear-memory representation. This is
@@ -164,7 +162,7 @@ pub struct Aggregate {
 
 /// Memory attributes paired with a flat pack's slots, in the same order.
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AggregateMemory {
 	pub layout: Layout,
 	pub offsets: Box<[u32]>,
@@ -178,8 +176,7 @@ pub struct AggregateMemory {
 /// validates the `Size` binding is one of the two and passes the
 /// `TypeIndex` straight through.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum MemoryKind {
 	Memory32,
 	Memory64,
@@ -195,7 +192,7 @@ impl MemoryKind {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct MemoryInfo {
 	pub id: MemoryId,
 	pub kind: MemoryKind,
@@ -212,7 +209,7 @@ pub struct MemoryInfo {
 /// Read-only bytes placed in a memory's data segment: a literal's, or data
 /// a constant or a global points into. Codegen lays out the entries
 /// something reaches and gives each its address.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(PartialEq, Eq, Hash)]
 pub struct StaticEntry {
 	pub bytes: Box<[u8]>,
@@ -226,7 +223,7 @@ pub struct StaticEntry {
 /// An address inside a static entry's bytes. The bytes at `offset`, as
 /// wide as the addresses of the memory `target` is in, hold an offset from
 /// it; codegen adds `target`'s address to them.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Relocation {
 	pub offset: u32,
@@ -234,7 +231,7 @@ pub struct Relocation {
 }
 
 /// What an address codegen resolves points at.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AddressTarget {
 	/// A static entry, in its memory.
@@ -274,7 +271,7 @@ pub struct MIR {
 /// Attributes of a function that its callers and the backend read, a byte
 /// per function in [`MIR::function_flags`].
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct FunctionFlags(u8);
 
 impl FunctionFlags {
@@ -296,8 +293,7 @@ impl FunctionFlags {
 
 /// A module-level item an import or an export names.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Item {
 	Function(FunctionId),
 	Global(GlobalId),
@@ -310,7 +306,7 @@ pub enum Item {
 /// two imports may share both names, and even their external type. Each is
 /// its own item here; codegen gives entries with the same names and external
 /// type one Wasm import.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Import {
 	pub module: SymbolU32,
 	pub name: SymbolU32,
@@ -319,7 +315,7 @@ pub struct Import {
 	pub item: Item,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Export {
 	pub name: SymbolU32,
 	pub item: Item,
@@ -328,7 +324,7 @@ pub struct Export {
 /// Whether an item is provided by the host or defined by the module, and what
 /// a definition has that an import does not.
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum Origin<D> {
 	/// Its entry in [`MIR::imports`], which names the item back.
 	Imported(ImportIdx),
@@ -351,14 +347,14 @@ impl<D> Origin<D> {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy)]
 pub enum Mutability {
 	Mutable,
 	Immutable,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone)]
 pub struct Local {
 	pub ty: ValueType,
@@ -366,7 +362,7 @@ pub struct Local {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionSignature {
 	pub items: Box<[ValueType]>,
 	pub params_count: usize,
@@ -432,7 +428,7 @@ impl Code {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy)]
 pub enum ConstInit {
 	Int(i64),
@@ -448,7 +444,7 @@ pub enum ConstInit {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Global {
 	pub id: GlobalId,
 	pub ty: ValueType,
@@ -461,7 +457,7 @@ pub struct Global {
 
 /// Memory layout of a type: size in bytes and required alignment in bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Layout {
 	pub size: u32,
 	pub align: u32,

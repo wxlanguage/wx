@@ -90,7 +90,7 @@ index_newtype!(PackageInstanceIdx);
 /// twice. Resolution does not yet tell the instances apart: both aliases
 /// bind the package's one namespace. This list is what a stage that must
 /// (emitting a separate copy of the package per instance) walks instead.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct PackageInstanceDef {
 	pub file_id: FileId,
 	/// The scope the item was written in, where `alias` is bound.
@@ -107,13 +107,13 @@ pub struct PackageInstanceDef {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct UsePathSegment {
 	pub(super) segment: Spanned<SymbolU32>,
 	pub(super) parent: Option<UsePathIndex>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum UseItemKind {
 	Name {
 		name: Spanned<SymbolU32>,
@@ -131,7 +131,7 @@ pub enum UseItemKind {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct UseItemDef {
 	pub namespace: Scope,
 	pub pub_span: Option<TextSpan>,
@@ -142,8 +142,7 @@ pub struct UseItemDef {
 /// values. One name can be bound once in each, as a struct is (its type and
 /// its constructor).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Tier {
 	Type,
 	Value,
@@ -159,8 +158,7 @@ impl Tier {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) struct BindingKey {
 	pub(super) tier: Tier,
 	pub(super) symbol: SymbolU32,
@@ -186,7 +184,7 @@ impl BindingKey {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TraitDef {
 	/// The typeset this trait was generated for, whose signature query builds
 	/// it; `None` for a written trait.
@@ -203,7 +201,7 @@ pub struct TraitDef {
 	pub members: Vec<TraitMemberDef>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TraitImplDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -215,7 +213,7 @@ pub struct TraitImplDef {
 	pub bindings: FxHashMap<BindingKey, MemberIdx>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct InherentImplDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -229,7 +227,7 @@ pub struct InherentImplDef {
 
 /// Field identity only (names, `pub_span`, lookup) — field *types* are
 /// `signatures::StructSignature::field_types`, index-aligned with `fields`.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct StructDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -250,8 +248,7 @@ pub struct StructDef {
 
 /// How a struct's fields are placed in linear memory.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum FieldOrder {
 	/// In declaration order, as `#[fixed_order]` asks: a layout the program
 	/// shares with something outside it.
@@ -265,8 +262,7 @@ pub enum FieldOrder {
 /// so a function's never holds `FIXED_ORDER`. An attribute is a hint to the
 /// compiler: none of them changes a type or an identity.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Attributes(u8);
 
 impl Attributes {
@@ -451,7 +447,7 @@ impl StructDef {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct EnumDef {
 	pub file_id: FileId,
 	pub parent_namespace: Scope,
@@ -468,7 +464,7 @@ pub struct EnumDef {
 	pub variants: Range<ConstIdx>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TypeAliasDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -482,7 +478,7 @@ pub struct TypeAliasDef {
 /// `member_impls` is index-aligned with the AST's own `members` list: one
 /// generated `impl <trait_index> for <member>` per written member, filled in
 /// with the member's resolved type by that same query.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TypesetDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -498,7 +494,7 @@ pub struct TypesetDef {
 ///
 /// Every function is its own type, so each has `function_impls`, its
 /// synthetic `impl Call` and `impl Function`.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -515,7 +511,7 @@ pub struct FunctionDef {
 /// or imported one), or as a member of a trait or impl. A trait's
 /// declaration is reached through the impl its `Self` selects.
 #[derive(Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum MemberOwner {
 	Free,
 	Trait(TraitIdx),
@@ -528,7 +524,7 @@ pub enum MemberOwner {
 /// (like a `global mut`'s `GlobalMut` impl). Pre-allocated for the same
 /// reason as `MemoryDef`'s own fields.
 #[derive(Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionImpls {
 	pub call_impl_index: TraitImplIdx,
 	pub args_assoc_type_index: AssocTypeIdx,
@@ -549,7 +545,7 @@ pub struct FunctionImpls {
 /// this impl for dispatch (`impls.rs`); if std never declared one, that's
 /// where it's diagnosed as the broken-stdlib error it is, not something
 /// every reader of this struct has to keep re-checking for.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct MemoryDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -567,8 +563,7 @@ pub struct MemoryDef {
 /// (`TypeContext::check_memory_limits`), since it depends on the memory's
 /// `Size`.
 #[derive(Clone, Copy, Default)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct MemoryLimits {
 	pub min_pages: Option<Spanned<u64>>,
 	pub max_pages: Option<Spanned<u64>>,
@@ -586,7 +581,7 @@ pub struct MemoryLimits {
 /// gets (`GlobalMut` declares no members of its own — an empty impl is
 /// enough to make it a dispatch candidate) — genuinely absent for a
 /// non-`mut` global, unlike the other two fields.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct GlobalDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -598,7 +593,7 @@ pub struct GlobalDef {
 
 /// Identity of a free, trait, or impl constant. Its type and value are
 /// resolved in later phases.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ConstDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -609,7 +604,7 @@ pub struct ConstDef {
 
 /// Each trait declaration and each impl definition has its own identity.
 /// Declared bounds and impl target types remain in the AST for resolution.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AssocTypeDef {
 	pub file_id: FileId,
 	pub namespace: Scope,
@@ -634,13 +629,13 @@ index_newtype!(GlobalIdx);
 index_newtype!(ConstIdx);
 index_newtype!(AssocTypeIdx);
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TraitMemberDef {
 	pub kind: MemberKind,
 	pub span: TextSpan,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct InherentMemberDef {
 	pub kind: MemberKind,
 	pub visibility: Visibility,
@@ -654,8 +649,7 @@ impl LocalDefIdx {
 }
 
 #[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) struct AstEntry<'ast> {
 	pub(super) file_id: FileId,
 	/// The scope the item is written in, where its signature resolves. For
@@ -666,8 +660,7 @@ pub(super) struct AstEntry<'ast> {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) enum AstNodeRef<'ast> {
 	Function {
 		item: &'ast ast::Item,
@@ -820,7 +813,7 @@ impl AstNodeRef<'_> {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct ExportEntrySource {
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
@@ -849,20 +842,20 @@ pub(super) enum CrateMemberItem {
 	Type(TypeAliasIdx),
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct DefinitionRegistry {
 	pub stdlib_package: PackageId,
 	pub root_package: PackageId,
 	pub namespaces: Namespaces,
 	/// The scope each file's top-level items live in, indexed by `FileId`.
-	#[cfg_attr(test, serde(skip))]
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub file_namespaces: Vec<Scope>,
 	pub modules: Vec<ModuleDef>,
 	pub imports: Vec<ImportDef>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
 	pub exports: FxHashMap<SymbolU32, ExportEntrySource>,
 	/// Package-level contract keys, indexed by `PackageId`.
-	#[cfg_attr(test, serde(skip))]
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub(super) crate_contracts: Vec<CrateContract>,
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
@@ -900,8 +893,7 @@ pub(super) struct DefinitionRegistry {
 /// name — e.g. a stray `type Add;` in std can't clobber the `Add` trait's
 /// entry, since only `trait_slot_mut` ever resolves `"Add"`.
 #[derive(Default)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct IntrinsicDefs {
 	pub u8: Option<TypeAliasIdx>,
 	pub i8: Option<TypeAliasIdx>,
@@ -1065,8 +1057,7 @@ impl IntrinsicDefs {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Visibility {
 	Public,
 	Private,
@@ -1115,8 +1106,7 @@ pub enum DefId {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum DefKind {
 	Module(ModuleIdx),
 	Import(ImportIdx),
@@ -1224,8 +1214,7 @@ impl DefKind {
 /// package, a module, an enum or an import block. Each is addressed by its
 /// owner's own index, so the handle and the owner are one thing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Namespace {
 	Package(PackageId),
 	Module(ModuleIdx),
@@ -1238,8 +1227,7 @@ pub enum Namespace {
 /// scopes; an enum's variants and an import block's declarations are only
 /// ever reached through a path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Scope {
 	Package(PackageId),
 	Module(ModuleIdx),
@@ -1265,7 +1253,7 @@ impl Namespace {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct ItemDef {
 	pub(super) kind: DefKind,
 	pub(super) span: TextSpan,
@@ -1280,7 +1268,7 @@ impl ItemDef {
 /// What one namespace holds: the definitions declared in it (`items`, which
 /// a `DefKey` addresses) and the names it binds. Every namespace is written in
 /// one file.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct SymbolTable {
 	pub file_id: FileId,
 	#[cfg_attr(
@@ -1303,7 +1291,7 @@ impl SymbolTable {
 
 /// A scope's symbols, plus what only a scope has: a place in the module tree
 /// and the globs its `use path::*;` items brought in.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ScopeTable {
 	pub symbols: SymbolTable,
 	pub parent: Option<Scope>,
@@ -1320,7 +1308,7 @@ pub struct ScopeTable {
 /// and `imports` by `ImportIdx`. An owner and its table are pushed together,
 /// which is what keeps the two aligned.
 #[derive(Default)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Namespaces {
 	packages: Vec<ScopeTable>,
 	modules: Vec<ScopeTable>,
@@ -1346,7 +1334,7 @@ pub struct Namespaces {
 /// construction, every entry that survives into this variant was already
 /// confirmed accessible to whichever `accessor` `indirect_lookup` was asked
 /// on behalf of, so there's nothing left for it to say.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum BindingLookup {
 	NotFound,
 	Found {
@@ -1822,8 +1810,7 @@ impl Namespaces {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) enum BindingTarget {
 	Accessible(DefKey),
 	/// Resolved to a real def, but the source wasn't visible from the
@@ -1848,14 +1835,14 @@ impl BindingTarget {
 }
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 enum BindingSource {
 	Definition,
 	Import(UseItemIndex),
 }
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct Binding {
 	pub(super) target: BindingTarget,
 	pub(super) visibility: Visibility,
@@ -1934,7 +1921,7 @@ impl Binding {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ModuleDef {
 	/// The scope `mod foo;` was written in — where the name `foo` itself
 	/// gets bound. The "outside" of the module.
@@ -1967,14 +1954,13 @@ pub struct ModuleDef {
 /// stores its *unresolved* `path`, and resolving it to a namespace is this
 /// whole pass's job.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct GlobImport {
 	pub use_item: UseItemIndex,
 	pub namespace: Namespace,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ImportDef {
 	pub parent_namespace: Scope,
 	pub external_name: ast::Spanned<SymbolU32>,
@@ -1982,7 +1968,7 @@ pub struct ImportDef {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum MemberKind {
 	Function(FunctionIdx),
 	Method(FunctionIdx),
@@ -2026,8 +2012,7 @@ impl MemberKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct DefKey {
 	pub(super) namespace: Namespace,
 	pub(super) def_idx: LocalDefIdx,
@@ -2541,14 +2526,6 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			result_assoc_type_index,
 			function_impl_index,
 		}
-	}
-
-	#[inline]
-	fn push_typeset(&mut self, item: TypesetDef) -> TypesetIdx {
-		let index =
-			TypesetIdx::new(u32::try_from(self.typesets.len()).unwrap());
-		self.typesets.push(item);
-		index
 	}
 
 	/// Reads the attributes written on one item. An unknown name is ignored

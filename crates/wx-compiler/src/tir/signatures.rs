@@ -29,20 +29,20 @@ use crate::tir::types::GenericEnvOwner;
 use crate::vfs::{FileId, Files};
 
 use super::body::{
-	Body, BodyOwner, ConstBody, FunctionImplementation, Obligations,
+	Body, BodyIdx, BodyOwner, ConstBody, FunctionImplementation, Obligations,
 };
 use super::bounds::{
 	AssumptionEnvArena, AssumptionEnvIdx, BindingRequirement, BoundArena,
-	BoundClauses, BoundId, Clause, ClauseArena, ClauseRange,
-	SourceAssocBinding, SourceTraitBound, TraitClause, push_trait_clause,
+	BoundClauses, BoundId, Clause, ClauseArena, SourceAssocBinding,
+	SourceTraitBound, TraitClause, push_trait_clause,
 	report_duplicate_assoc_type_binding, report_not_a_binding_member,
 	report_not_a_trait_bound,
 };
 use super::defs::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingTarget, ConstIdx,
-	CrateMemberItem, DefId, DefKey, DefKind, DefinitionRegistry, EnumIdx,
-	FunctionIdx, GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope,
-	StructIdx, Tier, TraitIdx, TraitImplIdx, TypesetIdx,
+	DefId, DefKey, DefKind, DefinitionRegistry, EnumIdx, FunctionIdx,
+	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier,
+	TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
@@ -362,12 +362,12 @@ impl TypeContext<'_, '_, '_> {
 		else {
 			return;
 		};
-		let ConstBody::Built(body) = std::mem::replace(
-			&mut self.const_bodies[usize::from(const_index)],
-			ConstBody::NotBuilt,
-		) else {
+		let ConstBody::Built(index) =
+			self.const_bodies[usize::from(const_index)]
+		else {
 			unreachable!("a constant with obligations has a built body")
 		};
+		let body = std::mem::take(&mut self.bodies[usize::from(index)]);
 		let scope = self.const_scope(const_index);
 		let body = BodyContext::decide_obligations(
 			self,
@@ -376,7 +376,7 @@ impl TypeContext<'_, '_, '_> {
 			body,
 			obligations,
 		);
-		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
+		self.bodies[usize::from(index)] = body;
 	}
 
 	/// Where a constant's initializer is written: a variant's in the root type
@@ -405,25 +405,23 @@ impl TypeContext<'_, '_, '_> {
 		let ast_nodes = self.ast_nodes;
 		for entry in ast_nodes {
 			match entry.node {
-				AstNodeRef::Function { item, .. } => {
-					if let ast::Item::Function {
-						signature, block, ..
-					} = item
-					{
-						self.check_function_body(entry, signature, block);
-					}
-				}
-				AstNodeRef::TraitFunction { item, .. } => {
-					// A required trait method has no block.
-					if let ast::TraitItem::Function {
-						signature,
-						body: Some(block),
-						..
-					} = item
-					{
-						self.check_function_body(entry, signature, block);
-					}
-				}
+				AstNodeRef::Function {
+					item:
+						ast::Item::Function {
+							signature, block, ..
+						},
+					..
+				} => self.check_function_body(entry, signature, block),
+				// A required trait method has no block.
+				AstNodeRef::TraitFunction {
+					item:
+						ast::TraitItem::Function {
+							signature,
+							body: Some(block),
+							..
+						},
+					..
+				} => self.check_function_body(entry, signature, block),
 				AstNodeRef::TraitImplFunction { item, .. }
 				| AstNodeRef::InherentImplFunction { item, .. } => {
 					if let ast::ImplItem::Function {
@@ -458,7 +456,8 @@ impl TypeContext<'_, '_, '_> {
 						body,
 						obligations,
 					);
-					self.global_bodies[usize::from(global_index)] = Some(body);
+					self.global_bodies[usize::from(global_index)] =
+						Some(self.push_body(body));
 					if !self.diagnostics[reported..].has_errors() {
 						self.evaluate_global(global_index);
 					}
@@ -502,7 +501,7 @@ impl TypeContext<'_, '_, '_> {
 		);
 		let statics = body.statics().to_vec();
 		self.function_implementations[usize::from(function_index)] =
-			FunctionImplementation::Defined(Box::new(body));
+			FunctionImplementation::Defined(self.push_body(body));
 		// Static data is evaluated at compile time, so what fails in it is
 		// reported here, for a function with no parameters. A generic one's
 		// may depend on its arguments: each instance is evaluated, and
@@ -749,6 +748,11 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
 	pub(super) functions: Vec<FunctionSignature>,
 	pub(super) constants: Vec<ConstantSignature>,
+	/// Every checked body: function blocks, constant and global
+	/// initializers. Each owner's table holds the index of its own (a
+	/// `BodyOwner` column beside it, for the reverse lookup the LSP will
+	/// want, could be added when something needs it).
+	pub(super) bodies: Vec<Body>,
 	/// Each constant's checked initializer, by `ConstIdx`; all built before
 	/// anything evaluates (`build_constant_bodies`). A trait constant without
 	/// a default has none.
@@ -762,7 +766,7 @@ pub(super) struct TypeContext<'ast, 'ctx, 'dispatch> {
 	pub(super) function_implementations: Vec<FunctionImplementation>,
 	/// Each global's checked initializer, by `GlobalIdx`; `None` for an
 	/// imported one.
-	pub(super) global_bodies: Vec<Option<Body>>,
+	pub(super) global_bodies: Vec<Option<BodyIdx>>,
 	/// Each global's initial value, evaluated at compile time; `None` until
 	/// its body is checked and evaluated, and for an imported global or one
 	/// whose evaluation failed (reported).
@@ -818,40 +822,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.collect();
 
 		let operators = OperatorTraits::new(defs, strings);
-		let mut function_implementations: Vec<_> = defs
+		let function_implementations = defs
 			.functions
 			.iter()
 			.map(|_| FunctionImplementation::Declaration)
 			.collect();
-		for entry in ast_nodes {
-			if let AstNodeRef::ImportedFunction {
-				function_index,
-				import_index,
-				..
-			} = entry.node
-			{
-				function_implementations[usize::from(function_index)] =
-					FunctionImplementation::Imported(import_index);
-			}
-		}
-		// Only the compiler-created std package is fulfilled. Other package
-		// contracts remain declarations; general instantiation is not modeled.
-		for (key, member) in
-			&defs.crate_contracts[defs.stdlib_package.as_usize()].members
-		{
-			// A function claims both tiers; bind its value-tier entry only.
-			if key.tier == Tier::Value
-				&& let CrateMemberItem::Function(function) = member.item
-			{
-				let name = strings.resolve(key.symbol).unwrap();
-				let intrinsic =
-					Intrinsic::from_std_name(name).unwrap_or_else(|| {
-						panic!("unknown std function parameter `{name}`")
-					});
-				function_implementations[usize::from(function)] =
-					FunctionImplementation::Intrinsic(intrinsic);
-			}
-		}
 		Self {
 			diagnostics,
 			resolutions,
@@ -935,6 +910,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			const_obligations: FxHashMap::default(),
 			function_implementations,
 			global_bodies: defs.globals.iter().map(|_| None).collect(),
+			bodies: Vec::new(),
 			global_values: defs.globals.iter().map(|_| None).collect(),
 			inherent_impls: defs.inherent_impls.iter().map(|_| None).collect(),
 			trait_impls: defs.trait_impls.iter().map(|_| None).collect(),
@@ -1844,10 +1820,19 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 	/// A constant's body; `None` when it has none (a required trait
 	/// constant) or, before `build_constant_bodies`, is not built yet.
 	pub(super) fn const_body(&self, const_index: ConstIdx) -> Option<&Body> {
-		match &self.const_bodies[usize::from(const_index)] {
-			ConstBody::Built(body) => Some(body),
+		match self.const_bodies[usize::from(const_index)] {
+			ConstBody::Built(body) => Some(self.body(body)),
 			ConstBody::NotBuilt | ConstBody::Missing => None,
 		}
+	}
+
+	pub(super) fn body(&self, body: BodyIdx) -> &Body {
+		&self.bodies[usize::from(body)]
+	}
+
+	fn push_body(&mut self, body: Body) -> BodyIdx {
+		self.bodies.push(body);
+		BodyIdx::new(u32::try_from(self.bodies.len() - 1).unwrap())
 	}
 
 	/// Checks a constant's initializer into its `Body` (`const_bodies`).
@@ -1925,7 +1910,8 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		body: Body,
 		obligations: Obligations,
 	) {
-		self.const_bodies[usize::from(const_index)] = ConstBody::Built(body);
+		self.const_bodies[usize::from(const_index)] =
+			ConstBody::Built(self.push_body(body));
 		if !obligations.is_empty() {
 			self.const_obligations.insert(const_index, obligations);
 		}
@@ -2770,6 +2756,23 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				else {
 					unreachable!()
 				};
+				// Only the compiler-created std package is fulfilled. Other
+				// package contracts remain declarations; general instantiation
+				// is not modeled.
+				if matches!(item, ast::Item::CrateFunction { .. })
+					&& self.defs.namespaces.scope(namespace).package_id
+						== self.defs.stdlib_package
+				{
+					let name =
+						self.strings.resolve(signature.name.inner).unwrap();
+					let intrinsic = Intrinsic::from_std_name(name)
+						.unwrap_or_else(|| {
+							panic!("unknown std function parameter `{name}`")
+						});
+					self.function_implementations
+						[usize::from(function_index)] =
+						FunctionImplementation::Intrinsic(intrinsic);
+				}
 				self.resolve_function_signature(
 					obligations,
 					file_id,
@@ -2781,12 +2784,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			AstNodeRef::ImportedFunction {
 				function_index,
 				decl,
-				..
+				import_index,
 			} => {
 				let ast::ImportDeclaration::Function { signature, .. } = decl
 				else {
 					unreachable!()
 				};
+				self.function_implementations[usize::from(function_index)] =
+					FunctionImplementation::Imported(import_index);
 				self.resolve_function_signature(
 					obligations,
 					file_id,
@@ -6858,7 +6863,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn scopes_preserve_outer_parameters_and_exclude_siblings() {
-			test_case!(std mut case = indoc! {"
+			test_case!(std case = indoc! {"
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Outer {}
 				trait Local {}
@@ -7154,7 +7159,7 @@ pub(super) mod tests {
 					});
 					let scope = builder.functions[0].type_params;
 					let env = builder.assumption_envs.of_frame(scope);
-					let clauses = builder.assumption_envs.clauses(env);
+					let clauses = builder.assumption_envs.get(env).clauses;
 					*builder.assumption_envs.clauses_mut(env) =
 						BoundClauses::Provisional(clauses.range());
 					let (readiness, facts) = memberships(builder, scope);
@@ -7656,7 +7661,7 @@ pub(super) mod tests {
 			let def_key = target.def_key().unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {scratch:?}")
 			});
-			def_key.symbol_kind(&self.defs)
+			def_key.symbol_kind(self.defs)
 		}
 
 		fn trait_index(&self, path: &str) -> TraitIdx {
@@ -7695,9 +7700,9 @@ pub(super) mod tests {
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
 			DiagnosticView::new(
-				"siganture",
-				&self.context.diagnostics,
-				&self.context.files,
+				"signature",
+				self.context.diagnostics,
+				self.context.files,
 			)
 		}
 
@@ -9799,7 +9804,7 @@ pub(super) mod tests {
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(
-			&*case.param_types("f"),
+			case.param_types("f"),
 			&[TypeIndex::I32, TypeIndex::U8, TypeIndex::I32]
 		);
 		let DefKind::Function(index) = case.resolve(Tier::Value, "f") else {
@@ -13962,7 +13967,7 @@ pub(super) mod tests {
 			"import \"env\" as host { memory heap: host::heap::Size; }",
 		] {
 			test_case!(
-				mut case = &format!("trait Memory {{ type Size; }} {declaration}")
+				case = &format!("trait Memory {{ type Size; }} {declaration}")
 			);
 			assert_eq!(
 				case.context.diagnostics.len(),
@@ -15650,7 +15655,8 @@ pub(super) mod tests {
 					assoc_type_index,
 				});
 				let assumption_env = builder.assumption_envs.of_frame(env);
-				let clauses = builder.assumption_envs.clauses(assumption_env);
+				let clauses =
+					builder.assumption_envs.get(assumption_env).clauses;
 				*builder.assumption_envs.clauses_mut(assumption_env) =
 					BoundClauses::Provisional(clauses.range());
 				assert_eq!(
@@ -17649,7 +17655,7 @@ pub(super) mod tests {
 					let ty = builder.generic_envs.param_types(env)[1];
 					let assumption_env = builder.assumption_envs.of_frame(env);
 					let clauses =
-						builder.assumption_envs.clauses(assumption_env);
+						builder.assumption_envs.get(assumption_env).clauses;
 					*builder.assumption_envs.clauses_mut(assumption_env) =
 						BoundClauses::Provisional(clauses.range());
 					assert_eq!(
@@ -18174,14 +18180,14 @@ pub(super) mod tests {
 			&case.defs.exports[&case.context.strings.get("run").unwrap()];
 		assert_eq!(export.name.inner, case.context.strings.get("f").unwrap());
 		assert!(
-			case.defs
+			!case
+				.defs
 				.namespaces
 				.symbols(Namespace::Package(dep))
 				.bindings
-				.get(&BindingKey::value(
+				.contains_key(&BindingKey::value(
 					case.context.strings.get("run").unwrap()
 				))
-				.is_none()
 		);
 	}
 

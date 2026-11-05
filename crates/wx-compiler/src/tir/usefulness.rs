@@ -23,7 +23,7 @@ use super::types::TypeIndex;
 
 /// What a pattern matches at its root.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Ctor {
 	/// The one constructor of a tuple or a struct, with one field per element
 	/// or field.
@@ -39,7 +39,7 @@ pub(super) enum Ctor {
 
 /// A pattern, as the algorithm sees it.
 #[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Pat {
 	/// `_`, a binding, or anything that matches every value.
 	Wild,
@@ -49,7 +49,7 @@ pub(super) enum Pat {
 }
 
 /// Every constructor of a type.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum CtorSet {
 	/// A tuple, a struct, `()`.
 	Single,
@@ -74,7 +74,7 @@ pub(super) trait Shapes {
 
 /// A value no row matches, as a pattern: `Wild` stands for any value.
 #[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Witness {
 	Wild,
 	Ctor {

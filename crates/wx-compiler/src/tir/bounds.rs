@@ -62,14 +62,14 @@ index_newtype!(AssumptionEnvIdx);
 /// One binding within a source bound. The index is stable because an
 /// occurrence's completed binding slice is immutable after publication.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct BindingRef {
 	pub(super) bound: BoundId,
 	pub(super) index: u32,
 }
 
 /// One resolved trait bound as written, including its source location.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct SourceTraitBound {
 	pub(super) trait_index: TraitIdx,
 	pub(super) span: SourceSpan,
@@ -78,7 +78,7 @@ pub(super) struct SourceTraitBound {
 
 /// One entry of a written bound's binding block: `Assoc = Type`, `Assoc:
 /// Bounds` or `const NAME: Type`.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct SourceAssocBinding {
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) kind: BindingRequirement,
@@ -86,7 +86,7 @@ pub(super) struct SourceAssocBinding {
 
 /// What an entry states, about the member it names under the trait that
 /// declares it: the bound's own trait, or one of its supertraits.
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) enum BindingRequirement {
 	/// `Assoc = Type`.
 	Equals(TypeProjectionTarget, Spanned<TypeIndex>),
@@ -101,7 +101,7 @@ pub(super) enum BindingRequirement {
 /// clause is the bound in the supertrait's declaration; `origin` is the bound
 /// written on this declaration's subject whose expansion brought it in.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct TraitClause {
 	pub(super) subject: TypeIndex,
 	pub(super) trait_index: TraitIdx,
@@ -114,7 +114,7 @@ pub(super) struct TraitClause {
 /// `u8`), stated by a bound. `source` is the written entry; `origin` as for
 /// `TraitClause`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct RepresentableClause {
 	pub(super) subject: TypeIndex,
 	pub(super) target: ConstantTarget,
@@ -126,7 +126,7 @@ pub(super) struct RepresentableClause {
 /// The clause `projection == value`, stated by a bound.
 /// `source` is the written equality; `origin` as for `TraitClause`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct EqualityClause {
 	pub(super) projection: TypeIndex,
 	pub(super) value: TypeIndex,
@@ -138,7 +138,7 @@ pub(super) struct EqualityClause {
 /// subject's clauses are one run of them; a reader of one kind filters
 /// (`ClauseArena::traits`, `ClauseArena::equalities`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Clause {
 	Trait(TraitClause),
 	Equality(EqualityClause),
@@ -452,11 +452,6 @@ impl AssumptionEnvArena {
 
 	pub(super) fn get(&self, env: AssumptionEnvIdx) -> &AssumptionEnv {
 		&self.envs[usize::from(env)]
-	}
-
-	/// `env`'s own clauses.
-	pub(super) fn clauses(&self, env: AssumptionEnvIdx) -> BoundClauses {
-		self.get(env).clauses
 	}
 
 	pub(super) fn clauses_mut(
@@ -977,7 +972,7 @@ impl<'a> ClauseTables<'a> {
 		// Computed up front, so stopping early cannot hide `Pending`.
 		let mut readiness = Readiness::Ready;
 		let mut walk = DeclarationSources { ..sources };
-		while let Some(source) = walk.next() {
+		for source in walk.by_ref() {
 			readiness = readiness.and(Readiness::from(source.clauses));
 		}
 		if walk.remaining == 0 {

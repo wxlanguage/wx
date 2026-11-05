@@ -33,8 +33,7 @@ mod tests;
 /// variant — from the editor's addressing perspective there are only ever
 /// these two cases.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum FileOrigin {
 	Local,
 	Virtual,
@@ -124,7 +123,7 @@ impl FileSource for VirtualFileSource {
 }
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct File {
 	pub name: String,
 	pub source: String,
@@ -148,7 +147,7 @@ impl File {
 	}
 }
 
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct FileId(u32);
 
@@ -160,7 +159,7 @@ impl FileId {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Files {
 	files: Vec<File>,
 }
@@ -258,8 +257,7 @@ impl<'files> files::Files<'files> for Files {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct ModuleId(u32);
 
 impl ModuleId {
@@ -275,8 +273,7 @@ impl ModuleId {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct PackageId(u32);
 
 impl PackageId {

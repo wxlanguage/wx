@@ -30,7 +30,7 @@ index_newtype!(
 
 /// A run of `Body::lists`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct ExprList {
 	start: u32,
 	len: u32,
@@ -50,7 +50,7 @@ impl ExprList {
 
 /// A run of `Body::cases`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct CaseList {
 	start: u32,
 	len: u32,
@@ -58,7 +58,7 @@ pub struct CaseList {
 
 /// One arm of a `Switch`: the arm taken when the selector equals `value`.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Case {
 	/// A canonical `i64`: the raw value for an integer, 0/1 for a `Bool`,
 	/// the code point for a `Char`, an enum variant's discriminant.
@@ -69,7 +69,7 @@ pub struct Case {
 /// An operator on one operand, of the node's type. `Eqz` is the exception:
 /// it compares its operand with zero and gives a `Bool`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum UnaryOp {
 	Neg,
 	BitNot,
@@ -86,7 +86,7 @@ pub enum UnaryOp {
 /// right shift are unsigned for an unsigned type
 /// ([`ValueType::is_unsigned`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum BinaryOp {
 	Add,
 	Sub,
@@ -106,7 +106,7 @@ pub enum BinaryOp {
 /// A comparison of two operands of one type, giving a `Bool`. Ordering is
 /// unsigned for an unsigned operand type.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum CompareOp {
 	Eq,
 	Ne,
@@ -117,7 +117,7 @@ pub enum CompareOp {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum ExprKind {
 	/// Unit, with no effect.
 	Noop,

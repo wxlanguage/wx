@@ -2290,7 +2290,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let local = case.expect_direct_def(root, Tier::Value, "X");
-		assert_eq!(local.namespace, root.into());
+		assert_eq!(local.namespace, root);
 		let selected = case.expect_direct_def(root, Tier::Value, "selected");
 		assert_eq!(selected, local);
 	}

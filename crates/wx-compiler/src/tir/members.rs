@@ -69,8 +69,7 @@ impl From<SolverError> for MemberLookup {
 /// A resolved trait constant, the declaration a representability clause reads
 /// over its subject (`<T as Array>::LEN`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) struct ConstantTarget {
 	pub(super) trait_index: TraitIdx,
 	pub(super) constant: ConstIdx,
@@ -78,7 +77,7 @@ pub(super) struct ConstantTarget {
 
 /// A resolved trait-associated type, ready to form a projection on a base.
 #[derive(Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct TypeProjectionTarget {
 	pub(super) trait_index: TraitIdx,
 	pub(super) assoc_type_index: AssocTypeIdx,

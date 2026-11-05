@@ -13,7 +13,7 @@ use crate::mir;
 mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum ScalarType {
 	I32,
 	I64,
@@ -69,7 +69,8 @@ pub fn flatten_type_to_scalars(
 }
 
 /// The `memarg` immediate carried by every WebAssembly memory instruction.
-#[cfg_attr(test, derive(Debug, PartialEq, serde::Serialize))]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy)]
 pub struct MemArg {
 	/// Log2 of the alignment hint in bytes (e.g. 2 = 4-byte aligned).
@@ -80,14 +81,14 @@ pub struct MemArg {
 }
 
 /// A WASM local variable declaration.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(test, serde(transparent))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), serde(transparent))]
 #[derive(Clone, Copy)]
 pub struct Local {
 	pub ty: ScalarType,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Function {
 	/// Locals in declaration order (params first, then spill slots).
 	pub locals: Vec<Local>,
@@ -103,7 +104,8 @@ pub struct Function {
 /// A subset of WASM instructions produced by the scheduler.
 /// Each variant maps 1-to-1 to a WASM opcode; operands are pushed onto the
 /// implicit value stack by the preceding instructions.
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
+#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone)]
 pub enum Instruction {
 	// Constants
@@ -318,7 +320,8 @@ pub enum Instruction {
 	},
 }
 
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
+#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy)]
 pub enum BlockType {
 	Empty,

@@ -37,7 +37,7 @@ impl CommentMap {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum Token {
 	// Literals
 	Int,
@@ -948,8 +948,7 @@ impl<'src> Lexer<'src> {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum BinaryOp {
 	// Arithmetic
 	Add,
@@ -1074,8 +1073,7 @@ impl TryFrom<Token> for BinaryOp {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum UnaryOp {
 	InvertSign,
 	Not,
@@ -1112,8 +1110,7 @@ impl std::fmt::Display for UnaryOp {
 }
 
 #[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Spanned<T> {
 	pub inner: T,
 	pub span: TextSpan,
@@ -1127,15 +1124,13 @@ impl<T: Copy> Copy for Spanned<T> {}
 /// Used for comma-separated lists like function parameters `(a, b, c)` or
 /// statement sequences. The `separator` field holds the token that follows this
 /// item (e.g., `,` or `;`), if present.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Separated<T> {
 	pub inner: T,
 	pub separator: Option<TextSpan>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Expression {
 	Error,
 	/// `1`. Always the raw, non-negative magnitude as written — `-1` is a
@@ -1294,8 +1289,7 @@ pub enum Expression {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 /// A method call; `Argument` is `Expression` for one by position and
 /// `NamedArgument` for one by name.
 pub struct MethodCallExpr<Argument = Expression> {
@@ -1306,8 +1300,7 @@ pub struct MethodCallExpr<Argument = Expression> {
 	pub arguments: Box<[Separated<Spanned<Argument>>]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct NamedArgument {
 	pub name: Spanned<SymbolU32>,
 	/// `None` means shorthand: `{ name }` is equivalent to `{ name: name }`
@@ -1318,8 +1311,7 @@ pub struct NamedArgument {
 /// `{pattern} => expr`. The pattern
 /// says what each of its terms is on its own: a name binds, a literal
 /// compares with that value, a qualified path with that constant.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct MatchArm {
 	pub pattern: Spanned<Pattern>,
 	pub body: Box<Spanned<Expression>>,
@@ -1331,8 +1323,7 @@ pub struct MatchArm {
 /// spelling of `type_args` depends on which parser produced the segment —
 /// bare `<...>` from `parse_type_path`, turbofish `::<...>` from
 /// `parse_value_path` — never both; empty when no type args are provided.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct PathSegment {
 	pub ident: Spanned<SymbolU32>,
 	pub type_args: Box<[TypeArgument]>,
@@ -1344,8 +1335,7 @@ pub struct PathSegment {
 /// inherent impl on `[PathSegment]` itself, only on a named local type, and
 /// a stored `Spanned` wrapper around the box would just duplicate what
 /// `span()` recomputes on demand from the segments themselves.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Path {
 	pub segments: Box<[PathSegment]>,
 }
@@ -1367,8 +1357,7 @@ impl Path {
 /// `<self_type as trait_path>`, not including the trailing `::item`) rather
 /// than that span having to be reconstructed from separately-threaded
 /// pieces at every diagnostic call site.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct QualifiedPathRoot {
 	pub self_type: Box<Spanned<TypeExpression>>,
 	pub trait_path: Box<[PathSegment]>,
@@ -1382,8 +1371,7 @@ enum BracketedRoot {
 }
 
 /// A trait or typeset bound expression.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum BoundExpression {
 	/// `Trait` or `module::Trait`
 	Path(Box<[PathSegment]>),
@@ -1419,8 +1407,7 @@ impl Expression {
 
 /// A generic parameter declaration: a type, `T` or `T: Bound1 + Bound2`, or
 /// a constant, `const N: Type`.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TypeParam {
 	/// A type, with its trait bounds. `None` = unconstrained.
 	Type {
@@ -1446,8 +1433,7 @@ impl TypeParam {
 /// One argument in a `<...>` list. What it is follows from its own shape: a
 /// literal is a constant, and anything else is a type unless `const` marks
 /// it as a constant (`const SIZE`).
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TypeArgument {
 	Type(Spanned<TypeExpression>),
 	Const(Spanned<ConstArgument>),
@@ -1464,8 +1450,7 @@ impl TypeArgument {
 
 /// A constant argument: `5`, `-1`, `'a'`, or a path marked `const`. An
 /// array's length can also be `_`, left to its context.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ConstArgument {
 	Literal(Literal),
 	Path(Box<[PathSegment]>),
@@ -1482,8 +1467,7 @@ pub enum ConstArgument {
 	Infer,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct FunctionTypeParam {
 	pub name: Option<Spanned<SymbolU32>>,
 	pub ty: Box<Spanned<TypeExpression>>,
@@ -1492,8 +1476,7 @@ pub struct FunctionTypeParam {
 /// One entry of a `where { .. }` block, constraining a member of the bound's
 /// trait: an associated type (`Size = u32`, `Size: UnsignedInt`) or, marked
 /// `const`, an associated constant (`const LEN: u32`, `const LEN = 4`).
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct AssocBinding {
 	pub name: Spanned<SymbolU32>,
 	pub kind: AssocBindingKind,
@@ -1501,8 +1484,7 @@ pub struct AssocBinding {
 
 /// What an [`AssocBinding`] states. The `const` keyword alone tells a
 /// constant's entry from a type's.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum AssocBindingKind {
 	/// `Size = u32` — the associated type must equal exactly this type.
 	Equals(Spanned<TypeExpression>),
@@ -1525,15 +1507,13 @@ pub enum AssocBindingKind {
 /// No enforcement of "only one exclusive value at a time" — this is a naming
 /// convention carried through the type system, not a move-checker.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Ownership {
 	Exclusive,
 	Shared,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TypeExpression {
 	/// A type the parser expected and did not find, already reported; it
 	/// resolves to `ERROR` without a word.
@@ -1608,8 +1588,7 @@ pub enum TypeExpression {
 /// The parser resolves every term while parsing, so a name reaches the AST
 /// already decided — a [`Pattern::Binding`] or a [`Pattern::Constant`] —
 /// and never as something a later stage has to reinterpret.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Pattern {
 	/// `_`
 	Wildcard,
@@ -1635,8 +1614,7 @@ pub enum Pattern {
 }
 
 /// Destructuring; each of its children is a pattern of its own.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Destructure {
 	/// `(a, .., z)`
 	Tuple { elements: PatternElements },
@@ -1659,8 +1637,7 @@ pub enum Destructure {
 /// is a semantic question TIR answers, not a parse-time assumption.
 pub type PatternElements = Box<[Separated<Spanned<PatternElement>>]>;
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum PatternElement {
 	Pattern(Pattern),
 	/// `..`
@@ -1670,16 +1647,14 @@ pub enum PatternElement {
 /// A named list exactly as written; see [`PatternElements`].
 pub type PatternFields = Box<[Separated<Spanned<PatternFieldItem>>]>;
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum PatternFieldItem {
 	Field(PatternField),
 	/// `..`
 	Rest,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct PatternField {
 	pub name: Spanned<SymbolU32>,
 	/// `None` = shorthand `{ x }`: the field binds a local of its own name,
@@ -1689,8 +1664,7 @@ pub struct PatternField {
 
 /// A literal written where a value is compared or given as a type
 /// argument: a pattern's, or a constant argument's.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Literal {
 	/// `1`; the value is the number itself.
 	Int(u64),
@@ -1710,8 +1684,7 @@ pub enum Literal {
 	String,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Statement {
 	/// `{expr}`
 	Expression(Box<Spanned<Expression>>),
@@ -1733,8 +1706,7 @@ impl Statement {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 /// What a parameter or a field is bound to, written before a `:`. One left
 /// out is no `Binding` at all, and binds nothing as `_` does.
 pub enum Binding {
@@ -1757,8 +1729,7 @@ impl Binding {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 /// A parameter, written like a struct field: `binding: Type`, or `Type`
 /// alone, which binds nothing as `_: Type` does. The receiver is
 /// `self: Type`.
@@ -1768,8 +1739,7 @@ pub struct FunctionParam {
 }
 
 /// The payload of an attribute.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum AttributeValue {
 	/// `#[inline]` — name only, no payload.
 	Word,
@@ -1781,15 +1751,13 @@ pub enum AttributeValue {
 
 /// A single attribute on an item, e.g. `#[inline]` or
 /// `#[memory_limits({ min_pages: 1 })]`.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Attribute {
 	pub name: Spanned<SymbolU32>,
 	pub value: AttributeValue,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ImplItem {
 	/// A method or associated function — TIR distinguishes the two after
 	/// parsing, by checking whether the first param is named `self`.
@@ -1827,8 +1795,7 @@ impl ImplItem {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TraitItem {
 	/// A method with an optional default body.
 	Function {
@@ -1867,8 +1834,7 @@ impl TraitItem {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct FunctionSignature {
 	pub name: Spanned<SymbolU32>,
 	/// Generic type parameters `<T, U: Bound>`. Empty = monomorphic.
@@ -1888,8 +1854,7 @@ pub struct FunctionSignature {
 /// would be invisible to earlier lookups), while a `Name` *cannot* be
 /// resolved that early — files are prescanned in order, so `use math::add;`
 /// in `main.wx` runs before `math.wx`'s items exist.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum UseTree {
 	/// `*` — every visible name in the namespace walked to so far.
 	Glob { segment: Spanned<SymbolU32> },
@@ -1914,16 +1879,14 @@ pub enum UseTree {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct ExportEntry {
 	pub name: Spanned<SymbolU32>,
 	/// The span of the raw quoted external name.
 	pub alias: Option<TextSpan>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ImportDeclaration {
 	Function {
 		signature: FunctionSignature,
@@ -1939,22 +1902,19 @@ pub enum ImportDeclaration {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct ImportEntry {
 	pub external_name: Option<Spanned<SymbolU32>>,
 	pub declaration: ImportDeclaration,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct EnumVariant {
 	pub name: Spanned<SymbolU32>,
 	pub value: Option<Box<Spanned<Expression>>>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Item {
 	Function {
 		pub_span: Option<TextSpan>,
@@ -2113,8 +2073,7 @@ pub enum Item {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct StructField {
 	pub pub_span: Option<TextSpan>,
 	/// `None` for a positional field: `struct Pair(i32, i32);`. A binding's
@@ -2183,12 +2142,12 @@ impl Item {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AST {
 	pub file_id: FileId,
 	pub diagnostics: Vec<Diagnostic<FileId>>,
 	pub items: Vec<Separated<Spanned<Item>>>,
-	#[cfg_attr(test, serde(skip))]
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub comments: CommentMap,
 }
 

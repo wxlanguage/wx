@@ -308,6 +308,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		match pointer_ty {
 			mir::ValueType::Aggregate { aggregate_index } => {
 				let length_ty = self.aggregates.get(aggregate_index).scalars[1];
+				#[cfg(debug_assertions)]
 				debug_assert_eq!(length_ty, size_ty);
 				state.push(
 					mir::ExprKind::AggregateGet {
@@ -371,6 +372,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		} else {
 			self.sequence_base(state, local, pointer_ty)
 		};
+		#[cfg(debug_assertions)]
 		debug_assert_eq!(state.ty(value), ty);
 		Ok(self.sequence(state, vec![set], value))
 	}

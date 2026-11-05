@@ -30,16 +30,16 @@ use super::bounds::AssumptionEnvIdx;
 use super::defs::{FieldOrder, StructIdx};
 use super::signatures::TypeContext;
 use super::solver::{
-	NormalizationDepth, RewriteFlags, Solver, SolverError, metadata_len,
+	NormalizationDepth, RewriteFlags, SolverError, metadata_len,
 };
-use super::types::{GenericEnvIdx, Substitution, Type, TypeIndex, TypeList};
+use super::types::{Substitution, Type, TypeIndex, TypeList};
 use crate::index::index_newtype;
 
 index_newtype!(AggregateIdx);
 
 /// Size and alignment of a value in linear memory.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Layout {
 	pub(super) size: u32,
 	pub(super) align: u32,
@@ -47,7 +47,7 @@ pub(super) struct Layout {
 
 /// A struct's or a tuple's layout.
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct AggregateLayout {
 	pub(super) layout: Layout,
 	/// Each field's byte offset, by declared index.
@@ -83,7 +83,7 @@ pub(super) struct Layouts {
 /// One value as linear memory holds it: an integer of a width and a
 /// signedness, or a float. An address is held as its memory's `Size`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Primitive {
 	U8,
 	I8,
@@ -553,6 +553,7 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::FunctionSignature;
 	use crate::tir::signatures::tests::source_graph;
+	use crate::tir::solver::Solver;
 	use crate::vfs::{self, FileId, Files};
 
 	/// `test_case!(mut case = "source")` declares the graph, the inputs and
@@ -654,7 +655,7 @@ mod tests {
 		fn diagnostics(&self) -> DiagnosticView<'_> {
 			DiagnosticView::new(
 				"layout",
-				&self.context.diagnostics,
+				self.context.diagnostics,
 				self.context.files,
 			)
 		}

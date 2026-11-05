@@ -12,7 +12,8 @@ macro_rules! index_newtype {
 	($(#[$meta:meta])* $name:ident) => {
 		$(#[$meta])*
 		#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-		#[cfg_attr(test, derive(serde::Serialize, PartialOrd, Ord))]
+		#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+		#[cfg_attr(test, derive(PartialOrd, Ord))]
 		pub struct $name(u32);
 
 		impl $name {

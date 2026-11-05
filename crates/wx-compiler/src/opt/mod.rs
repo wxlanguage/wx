@@ -34,8 +34,7 @@ pub type BlockIndex = u32;
 /// Sign only matters for narrow loads: `i32.load8_s` vs `i32.load8_u`.
 /// Full-width loads and stores are always unsigned.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum MemAccess {
 	I8S,
 	I8U,
@@ -114,7 +113,7 @@ impl StackResult {
 /// Scalar operations whose possible trap is observable. They belong to control,
 /// not to the movable/CSE'd data graph. Integer operations have I32/I64 `ty`.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum TrappingOp {
 	DivS {
 		left: DataNodeIndex,
@@ -201,7 +200,7 @@ impl TrappingOp {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum DataNodeKind {
 	// ── Constants ──────────────────────────────────────────────────────────
 	Int {
@@ -839,7 +838,7 @@ index_newtype!(
 /// whether it's an actual break target (`Block::join`) — an ordinary
 /// if/else or switch-arm body is `Block`-shaped without ever being a join.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum BlockKind {
 	Block,
 	Loop,

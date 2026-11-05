@@ -906,6 +906,21 @@ fn report_type_arg_count_mismatch(
 		.with_labels(labels)
 }
 
+/// A `Self` entry's clause that normalizes to a statement about a type with a
+/// parameter that is not abstract, which no lookup would read.
+fn report_unassumable_clause(
+	at: SourceSpan,
+	clause: &str,
+) -> Diagnostic<FileId> {
+	Diagnostic::bug()
+		.with_code(DiagnosticCode::UnsupportedExpression.code())
+		.with_message(format!("assuming `{clause}` is not supported yet"))
+		.with_label(at.primary_label().with_message(
+			"a bound on `Self` here is assumed only about a parameter or a \
+			 projection out of one",
+		))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1242,19 +1257,4 @@ mod tests {
 			},
 		);
 	}
-}
-
-/// A `Self` entry's clause that normalizes to a statement about a type with a
-/// parameter that is not abstract, which no lookup would read.
-fn report_unassumable_clause(
-	at: SourceSpan,
-	clause: &str,
-) -> Diagnostic<FileId> {
-	Diagnostic::bug()
-		.with_code(DiagnosticCode::UnsupportedExpression.code())
-		.with_message(format!("assuming `{clause}` is not supported yet"))
-		.with_label(at.primary_label().with_message(
-			"a bound on `Self` here is assumed only about a parameter or a \
-			 projection out of one",
-		))
 }

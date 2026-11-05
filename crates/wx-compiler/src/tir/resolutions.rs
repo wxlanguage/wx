@@ -32,7 +32,7 @@ pub(super) struct NameResolutions {
 
 /// What a written name refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Referent {
 	/// A definition declared in the namespace the name was looked up in:
 	/// an item, a module, a package or an import block.

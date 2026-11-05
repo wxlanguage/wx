@@ -11,32 +11,24 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::{Ownership, StringInterner};
+use crate::ast::Ownership;
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
-use super::body::ConstBody;
 use super::bounds::{
-	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, ClauseArena,
-	ClauseTables, Readiness, SelfSubstitution, known_distinct,
+	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, Readiness,
+	SelfSubstitution, known_distinct,
 };
-use super::defs::{
-	AssocTypeIdx, ConstIdx, DefinitionRegistry, MemberKind, TraitIdx,
-	TraitImplIdx,
-};
+use super::defs::{AssocTypeIdx, ConstIdx, MemberKind, TraitIdx, TraitImplIdx};
 use super::eval::{
 	Allocation, ConstValue, ConstValueState, Instance, ResolvedConstant,
 	StaticInstance,
 };
-use super::impls::{ImplDispatch, ImplTarget};
+use super::impls::ImplTarget;
 use super::layout::Layouts;
 use super::literals::UntypedValue;
 use super::members::{TraitImplLookup, TraitMemberSelection};
-use super::signatures::{
-	AssocTypeSignature, ConstantSignature, EnumSignature,
-	InherentImplSignature, StructSignature, TraitImplSignature, TraitSignature,
-	TypeContext,
-};
+use super::signatures::TypeContext;
 use super::types::{
 	GenericEnvArena, GenericEnvIdx, ImplKind, Substitution, Type, TypeIndex,
 	TypeInterner, TypeList,
@@ -46,7 +38,7 @@ use super::types::{
 /// engine) has no answer. It only reports why; whoever wrote the type or the
 /// requirement owns any diagnostic, so a query never emits one.
 #[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum SolverError {
 	/// A fact the answer depends on is not final yet (declarations are still
 	/// being built). It is not evidence of absence; ask again once construction
@@ -255,7 +247,7 @@ fn reads_failed(
 /// A projection that normalization reached again while normalizing it: the
 /// loop, read from the projection that closed it.
 #[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct ProjectionCycle {
 	/// The projection that was requested again.
 	pub(super) projection: TypeIndex,
@@ -276,7 +268,7 @@ pub(super) struct ProjectionCycle {
 /// an impl proves its requirements. Another declaration's bounds are proved
 /// only where it is used, by the obligation that uses it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Definition {
 	/// An impl member's value.
 	Member(ImplMember),
@@ -309,7 +301,7 @@ impl Definition {
 /// trait's default when it supplies none. The unit the solver judges, since a
 /// default means something different in every impl that inherits it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct ImplMember {
 	pub(super) impl_index: TraitImplIdx,
 	pub(super) declaration: AssocTypeIdx,
@@ -332,7 +324,7 @@ impl ImplMember {
 /// for a value that failed to lower. The verdict depends on the definitions
 /// alone, so it does not matter who asks first.
 #[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Verdict {
 	/// Not asked for yet.
 	Unchecked,

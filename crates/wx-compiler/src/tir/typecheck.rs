@@ -2578,7 +2578,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let text = self.body.span(expr).extract_str(source);
 		let mut value = None;
 		for &concrete in concrete_types {
-			match concrete.read_float(&text) {
+			match concrete.read_float(text) {
 				Ok(Some(read)) => {
 					value.get_or_insert(read);
 				}
@@ -3238,7 +3238,7 @@ mod tests {
 			DiagnosticView::new(
 				"typecheck",
 				self.context.diagnostics,
-				&self.context.files,
+				self.context.files,
 			)
 		}
 
@@ -3274,9 +3274,11 @@ mod tests {
 			let DefKind::Function(index) = self.resolve(name) else {
 				panic!("expected `{name}` to be a function");
 			};
-			self.context.function_implementations[usize::from(index)]
-				.body()
-				.expect("a function with a block has a body")
+			self.context.body(
+				self.context.function_implementations[usize::from(index)]
+					.body()
+					.expect("a function with a block has a body"),
+			)
 		}
 
 		/// The rendered block of the member `name`, which only one impl or
@@ -3294,8 +3296,9 @@ mod tests {
 			);
 			let (index, _) = found.next().unwrap();
 			assert!(found.next().is_none(), "`{name}` is declared twice");
-			let body =
-				self.context.function_implementations[index].body().unwrap();
+			let body = self.context.body(
+				self.context.function_implementations[index].body().unwrap(),
+			);
 			self.render(body, body.root())
 		}
 

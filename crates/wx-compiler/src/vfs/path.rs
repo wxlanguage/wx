@@ -47,7 +47,7 @@ fn join_segments(base: &str, segment: &str) -> String {
 /// concrete, absolute location, never as a base in its own right — see
 /// `AbsolutePath::join`.
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct RelativePath(String);
 
 impl RelativePath {
@@ -112,7 +112,7 @@ impl<'de> serde::Deserialize<'de> for RelativePath {
 /// legitimate: inside `NativeFileSource`, at the exact point of a real
 /// `std::fs` call.
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct AbsolutePath(String);
 
 impl AbsolutePath {

@@ -13,8 +13,7 @@ pub struct FuncIndex(pub u32);
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct GlobalIndex(pub u32);
 
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FunctionSignature {
 	pub param_count: usize,
@@ -31,7 +30,7 @@ impl FunctionSignature {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TypeSection {
 	signatures: Box<[FunctionSignature]>,
 }
@@ -52,7 +51,7 @@ pub struct SignatureIndex(pub u32);
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct TableIndex(pub u32);
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionSection {
 	types: Box<[SignatureIndex]>,
 }
@@ -74,18 +73,18 @@ pub enum ExportItem {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ExportSection {
 	items: Box<[ExportItem]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionBody {
 	locals: Box<[wasm::Local]>,
 	expressions: Box<[u8]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct CodeSection {
 	functions: Box<[FunctionBody]>,
 }
@@ -108,36 +107,36 @@ pub struct TableType {
 	limits: ResizableLimits,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TableSection {
 	tables: Box<[TableType]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ElementSegment {
 	table_index: TableIndex,
 	offset: u32,
 	indices: Box<[FuncIndex]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ElementSection {
 	segments: Box<[ElementSegment]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct GlobalSection {
 	globals: Box<[Global]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Mutability {
 	Immutable,
 	Mutable,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 struct Global {
 	ty: ScalarType,
 	mutability: Mutability,
@@ -147,7 +146,7 @@ struct Global {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum ImportDesc {
 	Function {
 		signature_index: SignatureIndex,
@@ -162,24 +161,24 @@ pub enum ImportDesc {
 }
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Import {
 	pub module: String,
 	pub name: String,
 	pub desc: ImportDesc,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ImportSection {
 	imports: Box<[Import]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 struct StartSection {
 	func_index: u32,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct WasmModule {
 	types: TypeSection,
 	imports: ImportSection,
@@ -1757,7 +1756,7 @@ impl Encode for ElementSection {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct DataSection {
 	pub segments: Box<[DataSegment]>,
 }
@@ -1777,7 +1776,7 @@ impl Encode for DataSection {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct DataSegment {
 	pub memory_index: u32,
 	pub offset: u32,
@@ -1815,20 +1814,20 @@ impl Encode for DataSegment {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct MemorySection {
 	pub memories: Box<[Memory]>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Memory {
 	pub limits: MemoryLimits,
 	pub kind: mir::MemoryKind,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum MemoryLimits {
 	Unbounded { initial_pages: u64 },
 	Bounded { initial_pages: u64, max_pages: u64 },

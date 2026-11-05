@@ -630,10 +630,7 @@ mod tests {
 		);
 		assert_eq!(mir.functions.len(), 1);
 		assert_eq!(call_count(&mir), 0);
-		assert_eq!(
-			call::<i32, i32>(&graph, &mir, "run", 1),
-			10 * -1 + (-4) * 10
-		);
+		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 1), -10 + (-4) * 10);
 
 		let (_, mir) = inlined(
 			&format!(

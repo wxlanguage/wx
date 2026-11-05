@@ -17,20 +17,19 @@
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
-use super::bounds::{AssumptionEnvIdx, BoundArena, BoundClauses};
-use super::defs::{AssocTypeIdx, ConstIdx, TraitIdx, TraitImplIdx};
+use super::bounds::{AssumptionEnvIdx, BoundClauses};
+use super::defs::{AssocTypeIdx, TraitIdx, TraitImplIdx};
 use super::literals::ConcreteType;
 use super::members::report_type_does_not_implement_trait;
-use super::signatures::{ConstantSignature, TypeContext, TypeSetSignature};
+use super::signatures::TypeContext;
 use super::solver::{
 	Definition, ImplMember, NormalizationDepth, ProjectionCycle, RewriteFlags,
-	Solver, SolverError, Verdict,
+	SolverError, Verdict,
 };
 use super::types::{
 	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
 	TypeIndex,
 };
-use crate::ast::{Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
 

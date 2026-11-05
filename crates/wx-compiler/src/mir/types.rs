@@ -25,7 +25,7 @@ index_newtype!(
 /// A fully-instantiated semantic type. Unlike [`tir::Type`], this cannot
 /// contain inference sentinels, type parameters or associated projections.
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ConcreteType {
 	Unit,
 	Never,

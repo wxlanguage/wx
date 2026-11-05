@@ -31,6 +31,7 @@ use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
 
+index_newtype!(BodyIdx);
 index_newtype!(ExprIdx);
 // The declared position of a parameter: what an argument gives. A struct's
 // fields are the parameters of its construction, in declaration order.
@@ -49,7 +50,7 @@ impl ScopeIdx {
 
 /// The definition a body belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum BodyOwner {
 	Const(ConstIdx),
 	Function(FunctionIdx),
@@ -60,16 +61,17 @@ pub(super) enum BodyOwner {
 /// This is independent of signature-query readiness. A declaration may be a
 /// trait requirement, an unfulfilled package parameter, or an ordinary
 /// bodiless function; its source definition retains that distinction.
+#[derive(Clone, Copy)]
 pub(super) enum FunctionImplementation {
-	/// Keep the checked arena out of the compact intrinsic/import slots.
-	Defined(Box<Body>),
+	/// Its checked block, in `TypeContext::bodies`.
+	Defined(BodyIdx),
 	Intrinsic(Intrinsic),
 	Imported(ImportIdx),
 	Declaration,
 }
 
 impl FunctionImplementation {
-	pub(super) fn body(&self) -> Option<&Body> {
+	pub(super) fn body(self) -> Option<BodyIdx> {
 		match self {
 			Self::Defined(body) => Some(body),
 			Self::Intrinsic(_) | Self::Imported(_) | Self::Declaration => None,
@@ -80,11 +82,12 @@ impl FunctionImplementation {
 /// A constant's checked initializer. Every one is built before anything
 /// evaluates (`TypeContext::build_constant_bodies`), so evaluation never
 /// reads a `NotBuilt` one.
+#[derive(Clone, Copy)]
 pub(super) enum ConstBody {
 	/// Not built yet.
 	NotBuilt,
-	/// Built.
-	Built(Body),
+	/// Built, in `TypeContext::bodies`.
+	Built(BodyIdx),
 	/// It has none: a required trait constant.
 	Missing,
 }
@@ -135,7 +138,7 @@ impl Obligations {
 /// order they are written, which is the order they are evaluated in; or the
 /// statements of a block.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct ExprRange {
 	start: u32,
 	len: u32,
@@ -150,7 +153,7 @@ impl ExprRange {
 /// A run of `Body::pat_lists`: the children of a tuple, struct or `|`
 /// pattern.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct PatternRange {
 	start: u32,
 	len: u32,
@@ -158,7 +161,7 @@ pub(super) struct PatternRange {
 
 /// A run of `Body::arms`: a match's arms, in written order.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct ArmRange {
 	start: u32,
 	len: u32,
@@ -167,7 +170,7 @@ pub(super) struct ArmRange {
 /// One arm of a match. Its bindings are declared in `scope`, which holds
 /// `body`.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Arm {
 	pub(super) scope: ScopeIdx,
 	pub(super) pattern: PatIdx,
@@ -175,7 +178,7 @@ pub(super) struct Arm {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum PatternKind {
 	// Structure: always matches, and takes the value apart.
 	/// `_`, an element or field `..` covers, or a field a named pattern
@@ -220,7 +223,7 @@ pub(super) enum PatternKind {
 /// How the written order of a tuple's elements relates to the positions they
 /// give.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ElementOrder {
 	/// The n-th element gives the n-th position.
 	InOrder,
@@ -230,7 +233,7 @@ pub(super) enum ElementOrder {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ExprKind {
 	/// Already reported; whatever reads it stays silent.
 	Error,
@@ -484,7 +487,7 @@ pub(super) enum ExprKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ScopeKind {
 	/// A block, an `if`/`else` branch, a match arm (holding its bindings),
 	/// or the body itself (the root scope, the one without a parent).
@@ -500,7 +503,7 @@ pub(super) enum ScopeKind {
 
 /// One lexical block.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Scope {
 	pub(super) kind: ScopeKind,
 	/// `None` only for the root.
@@ -512,14 +515,14 @@ pub(super) struct Scope {
 
 /// A label written on a block or a loop.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Label {
 	pub(super) name: Spanned<SymbolU32>,
 }
 
 /// A function's parameter, or a name a `local` declares.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Local {
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) ty: TypeIndex,
@@ -530,7 +533,7 @@ pub(super) struct Local {
 /// the memory it is in and whether it may be written are known when it is
 /// built, from that pointer's type.
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Place {
 	pub(super) kind: PlaceKind,
 	/// The type of the value stored there.
@@ -543,7 +546,7 @@ pub(super) struct Place {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum PlaceKind {
 	/// `pointer.*`, the only way into linear memory.
 	Deref { pointer: ExprIdx },

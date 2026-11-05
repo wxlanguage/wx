@@ -170,8 +170,8 @@ pub fn build(
 // index_newtype!(FieldIndex);
 // index_newtype!(BodyIndex);
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone, PartialEq, Eq, Hash)]
 // pub struct FunctionSignature {
 // 	items: Box<[TypeIndex]>,
@@ -188,8 +188,8 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 // pub enum TypeParamOwner {
 // 	Function(DefId),
@@ -209,8 +209,8 @@ pub fn build(
 // /// but no `TypeParamOwner` — there's nothing to inherit, but it's still a
 // /// member of a block that gates how the item can be referenced (`Point::new()`,
 // /// never bare `new()`).
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 // pub enum ItemParent {
 // 	/// Inherent `impl Target { }` — generic (`impl<Params> Target { }`) or
@@ -229,8 +229,8 @@ pub fn build(
 // 	Trait(TraitIndex),
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone, PartialEq, Eq, Hash)]
 // pub enum Type {
 // 	Error,
@@ -322,11 +322,11 @@ pub fn build(
 // 	},
 // }
 
-// #[cfg_attr(test, derive(serde::Serialize))]
-// #[cfg_attr(test, serde(transparent))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), serde(transparent))]
 // pub struct TypeInterner {
 // 	entries: Vec<Type>,
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	index_lookup: HashMap<Type, TypeIndex>,
 // }
 
@@ -493,7 +493,7 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Constant {
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -511,7 +511,7 @@ pub fn build(
 // 	pub attributes: Box<[ItemAttribute]>,
 // }
 
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Trait {
 // 	pub id: ast::DefId,
 // 	pub file_id: FileId,
@@ -569,7 +569,7 @@ pub fn build(
 // ///
 // /// Use [`IntegerRange::contains`] to test whether a literal fits; use
 // /// [`IntegerRange::intersect`] to narrow two ranges to their overlap.
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct IntegerRange {
 // 	min: u64,
 // 	max: u64,
@@ -672,7 +672,7 @@ pub fn build(
 
 // /// A closed compile-time set of concrete types, used as a type param bound.
 // /// `typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }`
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct TypeSet {
 // 	pub id: ast::DefId,
 // 	pub file_id: FileId,
@@ -696,8 +696,8 @@ pub fn build(
 // /// Rust's place / value distinction).  Every `Place` carries the memory it
 // /// belongs to and whether it was reached through a mutable pointer — both
 // /// propagated at build time so callers never need a recursive walk.
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Place {
 // 	pub kind: PlaceKind,
 // 	/// Type of the value stored at this location.
@@ -709,8 +709,8 @@ pub fn build(
 // 	pub span: TextSpan,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum PlaceKind {
 // 	/// `ptr.*` — the only way to enter linear memory.
 // 	Deref { pointer: Box<Expression> },
@@ -741,8 +741,8 @@ pub fn build(
 // /// never again accidentally construct `Binary` with an assignment operator)
 // /// rather than merely a convention.
 // #[derive(Clone, Copy, PartialEq, Eq)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum BinaryOp {
 // 	Add,
 // 	Sub,
@@ -816,8 +816,8 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum ExprKind {
 // 	Error,
 // 	Placeholder,
@@ -1091,8 +1091,8 @@ pub fn build(
 // 	},
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Expression {
 // 	pub kind: ExprKind,
 // 	pub ty: TypeIndex,
@@ -1104,8 +1104,8 @@ pub fn build(
 // /// it, so the tree stays available for LSP/semantic-analysis use while codegen and
 // /// validation can read the value directly without re-interpreting the tree.
 // #[derive(Clone, Copy, PartialEq)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum ConstValue {
 // 	Int(i64),
 // 	Float(f64),
@@ -1114,8 +1114,8 @@ pub fn build(
 // }
 
 // #[derive(Clone, Copy, PartialEq)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum AccessKind {
 // 	Read,
 // 	Write,
@@ -1123,8 +1123,8 @@ pub fn build(
 // }
 
 // #[derive(Clone, Copy)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // struct AccessContext {
 // 	/// Hint for type inference at this expression site.
 // 	/// `TypeIndex::INFER` means "no constraint".
@@ -1135,15 +1135,15 @@ pub fn build(
 // }
 
 // #[derive(Clone, Copy)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct LocalAccess {
 // 	pub span: TextSpan,
 // 	pub kind: AccessKind,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Local {
 // 	pub name: Spanned<SymbolU32>,
 // 	pub ty: TypeIndex,
@@ -1158,8 +1158,8 @@ pub fn build(
 // /// type it is indexing into — `lower_type_index(aggregate_ty)` hands back the
 // /// interned `Aggregate` directly, generic substitution already applied, and
 // /// its `decl_to_phys` maps `index` onto the alignment-sorted slot.
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone, Copy)]
 // pub struct PathStep {
 // 	pub aggregate_ty: TypeIndex,
@@ -1173,16 +1173,16 @@ pub fn build(
 // /// reaching its value from the scrutinee. Nested patterns are flattened, so
 // /// `local (x, (y, z)) = t;` yields paths `[0]`, `[1, 0]`, `[1, 1]` rather
 // /// than a nested structure.
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct PatternBinding {
 // 	pub scope_index: ScopeIndex,
 // 	pub local_index: LocalIndex,
 // 	pub path: Box<[PathStep]>,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone, Copy, PartialEq)]
 // pub enum BlockKind {
 // 	Block,
@@ -1190,15 +1190,15 @@ pub fn build(
 // 	Loop,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct BlockLabel {
 // 	pub name: Spanned<SymbolU32>,
 // 	pub accesses: Vec<TextSpan>,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct BlockScope {
 // 	pub kind: BlockKind,
 // 	pub label: Option<LabelIndex>,
@@ -1223,8 +1223,8 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct StackFrame {
 // 	pub labels: Vec<BlockLabel>,
 // 	pub scopes: Vec<BlockScope>,
@@ -1285,8 +1285,8 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone)]
 // pub struct FunctionParam {
 // 	pub mut_span: Option<TextSpan>,
@@ -1306,8 +1306,8 @@ pub fn build(
 // /// without a stub would be a `Pending` with nothing behind it, and the
 // /// duplicate-definition diagnostic for `use a::foo;` alongside `func foo`
 // /// would panic on the missing key rather than report.
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct UseItem {
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -1339,8 +1339,8 @@ pub fn build(
 // ///
 // /// Two separate statements — `use math::add; use math::sub;` — get two
 // /// entries, correctly: they are two distinct mentions of `math`.
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct UsePrefix {
 // 	/// The segments as written. Purely syntactic — prescan cannot resolve
 // 	/// them, which is exactly why named leaves defer to Phase 2. Recorded
@@ -1356,8 +1356,8 @@ pub fn build(
 // /// walk it, the second means stay quiet, since the diagnostic was already
 // /// reported by whoever walked it.
 // #[derive(Clone, Copy)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum PrefixTarget {
 // 	Unwalked,
 // 	Resolved(NamespaceIndex),
@@ -1416,8 +1416,8 @@ pub fn build(
 // 	},
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Enum {
 // 	pub id: ast::DefId,
 // 	pub file_id: FileId,
@@ -1435,8 +1435,8 @@ pub fn build(
 // 	pub accesses: Vec<SourceSpan>,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct EnumVariant {
 // 	pub name: ast::Spanned<SymbolU32>,
 // 	pub value: Option<Box<Expression>>,
@@ -1461,8 +1461,8 @@ pub fn build(
 // /// syntax (see `Builder::build_pattern`) — no bindings, no or-patterns, no
 // /// guards.
 // #[derive(Clone, Copy)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum Pattern {
 // 	Int(i64),
 // 	Bool(bool),
@@ -1474,8 +1474,8 @@ pub fn build(
 // 	Wildcard,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct MatchArm {
 // 	pub pattern: Pattern,
 // 	pub pattern_span: TextSpan,
@@ -1556,15 +1556,15 @@ pub fn build(
 // }
 
 // #[derive(Clone, Copy)]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum ImportValue {
 // 	Function { id: DefId },
 // 	Global { id: DefId },
 // 	Memory { id: DefId },
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Memory {
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -1584,7 +1584,7 @@ pub fn build(
 
 // /// A member's stable arena identity, independent of signature resolution.
 // #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum TraitMemberKind {
 // 	Function(DefId),
 // 	Constant(DefId),
@@ -1639,8 +1639,8 @@ pub fn build(
 // }
 
 // #[derive(Clone, Copy, PartialEq, Eq)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum ImplEntry {
 // 	Method(FunctionIndex),
 // 	AssocFunction(FunctionIndex),
@@ -1653,7 +1653,7 @@ pub fn build(
 // /// Impl definitions own their assigned type; required bounds remain on the
 // /// trait declaration rather than being copied into each implementation.
 // #[derive(Clone)]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct AssociatedType {
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -1666,11 +1666,11 @@ pub fn build(
 // 	/// for a memory impl's synthesized members, which are built complete and
 // 	/// never take part in demand-driven resolution. Used to qualify the name
 // 	/// (`A::Elem`, `Container::Elem`) in diagnostics.
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub parent: Option<ItemParent>,
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub bounds: Bounds,
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub accesses: Vec<SourceSpan>,
 // 	pub ty: Option<Spanned<TypeIndex>>,
 // 	pub attributes: Box<[ItemAttribute]>,
@@ -1742,7 +1742,7 @@ pub fn build(
 // }
 
 // #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 // pub enum ImplTarget {
 // 	U8,
 // 	I8,
@@ -1803,8 +1803,8 @@ pub fn build(
 // }
 
 // #[derive(Clone, PartialEq)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum ItemAttribute {
 // 	Inline,
 // 	Intrinsic,
@@ -1815,8 +1815,8 @@ pub fn build(
 // }
 
 // #[derive(Clone)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct TraitBound {
 // 	pub trait_index: TraitIndex,
 // 	/// Resolved RHS of each `where { AssocType = RhsType }` / `where {
@@ -1832,8 +1832,8 @@ pub fn build(
 // /// sides. Spans belong to `file_id`, including when effective lookup consults
 // /// this binding from a declaration in another file.
 // #[derive(Clone)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct AssocBinding {
 // 	pub file_id: FileId,
 // 	pub name: Spanned<SymbolU32>,
@@ -1842,8 +1842,8 @@ pub fn build(
 
 // /// The right-hand side of one `TraitBound` binding.
 // #[derive(Clone)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum AssocBindingKind {
 // 	/// `AssocType = RhsType`.
 // 	Equals(TypeIndex),
@@ -1853,8 +1853,8 @@ pub fn build(
 // }
 
 // #[derive(Clone, Default)]
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Bounds {
 // 	pub traits: Box<[TraitBound]>,
 // }
@@ -1892,11 +1892,11 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Function {
 // 	/// Whether the first parameter is the receiver named `self`.
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub is_method: bool,
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -1929,14 +1929,14 @@ pub fn build(
 // /// Produced in Phase 3 (`ensure_body`) for any item with an expression
 // /// implementation — function bodies and global initializers alike — and stored
 // /// in the shared [`ItemRegistry::bodies`] arena, referenced by [`BodyIndex`].
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Body {
 // 	pub stack: StackFrame,
 // 	pub block: Box<Expression>,
 // }
 
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Global {
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -1951,8 +1951,8 @@ pub fn build(
 // 	pub value: Option<BodyIndex>,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum FieldAccessKind {
 // 	Read,
 // 	Write,
@@ -1980,16 +1980,16 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct FieldAccess {
 // 	pub kind: FieldAccessKind,
 // 	pub file_id: FileId,
 // 	pub span: TextSpan,
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct StructField {
 // 	pub name: Spanned<SymbolU32>,
 // 	pub ty: Spanned<TypeIndex>,
@@ -2003,8 +2003,8 @@ pub fn build(
 // /// destructuring (`local Point(x, y) = p;`) pushes a read kind per bound
 // /// (non-`_`, non-rest) element — position stands in for a name wherever the
 // /// dead-field-write lint or a diagnostic needs to name the field.
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct TupleFieldInfo {
 // 	pub ty: Spanned<TypeIndex>,
 // 	pub pub_span: Option<TextSpan>,
@@ -2018,8 +2018,8 @@ pub fn build(
 // /// types: every other struct-level concern (impls, generics, monomorphization,
 // /// layout) is already keyed purely by `StructIndex`/`TypeIndex` identity and
 // /// never inspects field shape at all.
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum StructKind {
 // 	Record {
 // 		fields: Box<[StructField]>,
@@ -2034,8 +2034,8 @@ pub fn build(
 // 	},
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Struct {
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -2045,7 +2045,7 @@ pub fn build(
 // 	/// Empty for non-generic structs.
 // 	pub type_params: Box<[TypeParamDef]>,
 // 	/// `Type::Struct { struct_index, args: [] }` for this struct.
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub self_type: TypeIndex,
 // 	pub attributes: Box<[ItemAttribute]>,
 // 	pub fields: StructKind,
@@ -2068,8 +2068,8 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(debug_assertions, derive(Debug))]
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct TypeAlias {
 // 	pub id: DefId,
 // 	pub file_id: FileId,
@@ -2534,7 +2534,7 @@ pub fn build(
 // 	AssocType(AssocTypeIndex),
 // }
 
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct ItemRegistry {
 // 	pub functions: Vec<Function>,
 // 	pub globals: Vec<Global>,
@@ -2548,7 +2548,7 @@ pub fn build(
 // 	/// Every inherent impl block — concrete (`impl Target { .. }`, empty
 // 	/// `type_params`) and generic (`impl<T> Target { .. }`) alike. See
 // 	/// `ImplBlock`.
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub inherent_impls: Vec<InherentImpl>,
 // 	/// Dispatch index: `(outer type constructor, member name) → every block
 // 	/// index that provides that name for that shape`. Coarse on purpose — a
@@ -2559,7 +2559,7 @@ pub fn build(
 // 	/// (`ItemRegistry::unify_inherent_impl_target`) to find out which ones really apply,
 // 	/// and it's *that* per-receiver count — not this bucket's raw length —
 // 	/// that decides whether there's a genuine conflict.
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub inherent_impl_dispatch:
 // 		HashMap<(ImplTarget, SymbolU32), Vec<InherentImplIndex>>,
 // 	pub traits: Vec<Trait>,
@@ -2576,7 +2576,7 @@ pub fn build(
 // 	/// `impl Show for Foo<i32>` and `impl Show for Foo<bool>` coexist here
 // 	/// without conflating: the bucket is only a coarse first-pass filter,
 // 	/// per-candidate unification is what actually disambiguates.
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub trait_impl_dispatch:
 // 		HashMap<ImplTarget, Vec<(TraitIndex, TraitImplIndex)>>,
 // 	pub constants: Vec<Constant>,
@@ -2586,13 +2586,13 @@ pub fn build(
 // 	/// carries no relation to `functions`/`globals` order.
 // 	pub bodies: Vec<Body>,
 // 	pub associated_types: Vec<AssociatedType>,
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub tagged_items: HashMap<SymbolU32, DefId>,
 // 	pub typesets: Vec<TypeSet>,
 // 	pub type_aliases: Vec<TypeAlias>,
 // 	/// Unified lookup: maps every named item's `DefId` to its kind and dense Vec index.
 // 	/// Replaces the previous per-kind hashmaps (`function_index_lookup`, etc.).
-// 	#[cfg_attr(test, serde(skip))]
+// 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub item_lookup: HashMap<DefId, ItemIndex>,
 // }
 
@@ -2806,7 +2806,7 @@ pub fn build(
 // 	}
 // }
 
-// #[cfg_attr(test, derive(serde::Serialize))]
+// #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct TIR {
 // 	pub types: TypeInterner,
 // 	pub diagnostics: Vec<Diagnostic<FileId>>,

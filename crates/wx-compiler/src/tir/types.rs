@@ -119,8 +119,7 @@ impl TypeIndex {
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
 /// interned on its own; the type holding it is, by the list's contents, so
 /// equal types still share one `TypeIndex`. Built only by the interner.
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeList {
 	start: u32,
@@ -167,7 +166,7 @@ impl TypeList {
 /// The generic arguments of one use of an item (a written type, a path, a
 /// call, a selected impl): a run of `GenericArgArena`, flat over the item's
 /// whole chain as `Substitution` reads them.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Copy)]
 pub(super) struct GenericArgs {
 	start: u32,
@@ -235,8 +234,7 @@ impl GenericArgArena {
 	}
 }
 
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 // `TypeParam`/`TypeProjection` echo the enum's own
 // name because "type" is the domain term (a type parameter, an associated
@@ -416,21 +414,21 @@ impl TypeFlags {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(test, serde(transparent))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), serde(transparent))]
 pub struct TypeInterner {
 	entries: Vec<Type>,
 	/// Each entry's flags, by the entry's index.
-	#[cfg_attr(test, serde(skip))]
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	flags: Vec<TypeFlags>,
 	/// Every `TypeList`'s elements, back to back.
-	#[cfg_attr(test, serde(skip))]
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	lists: Vec<TypeIndex>,
 	/// The index of every entry, found by its contents: a type's fields
 	/// and its list's elements, never where the list is stored.
-	#[cfg_attr(test, serde(skip))]
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	index_lookup: HashTable<TypeIndex>,
-	#[cfg_attr(test, serde(skip))]
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	hasher: FxBuildHasher,
 }
 
@@ -1524,7 +1522,7 @@ pub(super) enum GenericEnvOwner {
 
 /// The impl a frame chain is inside of: what `Self` there names.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ImplKind {
 	Inherent(InherentImplIdx),
 	Trait(TraitImplIdx),
@@ -2020,7 +2018,7 @@ mod tests {
 				types,
 				GenericEnvOwner::Function(FunctionIdx::new(0)),
 				GenericEnvIdx::ROOT,
-				vec![name.clone(); count],
+				vec![name; count],
 			);
 		}
 		envs

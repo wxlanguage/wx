@@ -496,12 +496,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			self.context.defs.functions[usize::from(function)].file_id;
 		let name_span =
 			self.context.defs.functions[usize::from(function)].name.span;
-		match &self.context.function_implementations[usize::from(function)] {
+		match self.context.function_implementations[usize::from(function)] {
 			FunctionImplementation::Defined(_) => {}
-			&FunctionImplementation::Intrinsic(intrinsic) => {
+			FunctionImplementation::Intrinsic(intrinsic) => {
 				return self.lower_intrinsic_function(instance, intrinsic);
 			}
-			&FunctionImplementation::Imported(import) => {
+			FunctionImplementation::Imported(import) => {
 				return self.lower_imported_function(instance, import);
 			}
 			FunctionImplementation::Declaration => {
@@ -532,33 +532,26 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 
 		// The evaluator reads the body, which lowering holds: the instance's
 		// static data is evaluated first, and lowering reads the values.
-		let statics = match &self.context.function_implementations
+		let index = self.context.function_implementations
 			[usize::from(function)]
-		{
-			FunctionImplementation::Defined(body) => body.statics().to_vec(),
-			_ => Vec::new(),
-		};
+		.body()
+		.expect("only a defined function enters body lowering");
+		let statics = self.context.body(index).statics().to_vec();
 		for expr in statics {
 			let _ = self.context.static_value(function, &args, expr);
 		}
-		let implementation = std::mem::replace(
-			&mut self.context.function_implementations[usize::from(function)],
-			FunctionImplementation::Declaration,
-		);
+		let body = std::mem::take(&mut self.context.bodies[usize::from(index)]);
 		let lowered = self.lower_body(
 			instance,
 			file_id,
 			env,
 			args,
-			implementation
-				.body()
-				.expect("only a defined function enters body lowering"),
+			&body,
 			&param_types,
 			result_type,
 		);
 		// Put the checked body back: lowering borrows it, it does not consume it.
-		self.context.function_implementations[usize::from(function)] =
-			implementation;
+		self.context.bodies[usize::from(index)] = body;
 		let state = lowered?;
 		let root = state.root.expect("a lowered body has a root");
 		if cfg!(debug_assertions)
@@ -765,14 +758,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 						Val::DataEnd { memory } => mir::ConstInit::DataEnd {
 							memory: self.memory(memory),
 						},
-						Val::V128(_) => {
-							self.unsupported(
-								file_id,
-								name.span,
-								"a global holding a vector",
-							)?;
-							unreachable!()
-						}
 					})
 				}
 			};
@@ -2115,9 +2100,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			// A pointer with metadata (to a slice) is the address and then
 			// its metadata, as its `StackValue::Repr` is.
 			Type::Pointer { to, memory, .. } => {
-				if self.pointer_metadata(to, memory, file_id, span)?
-					!= TypeIndex::UNIT
-				{
+				if self.pointer_metadata(to, memory)? != TypeIndex::UNIT {
 					return self.lower_aggregate_type(ty, file_id, span);
 				}
 				let id = self.memory_of_type(memory);
@@ -2203,8 +2186,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			// The address has no TIR type of its own (`Pointer::address`
 			// reads it as the memory's `Size`); MIR keeps it a pointer.
 			Type::Pointer { to, memory, .. } => {
-				let metadata =
-					self.pointer_metadata(to, memory, file_id, span)?;
+				let metadata = self.pointer_metadata(to, memory)?;
 				let id = self.memory_of_type(memory);
 				let address = mir::ValueType::Pointer {
 					kind: self.memories[usize::from(id)].kind,
@@ -2375,8 +2357,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		to: TypeIndex,
 		memory: TypeIndex,
-		file_id: FileId,
-		span: TextSpan,
 	) -> Result<TypeIndex, ()> {
 		match self
 			.context

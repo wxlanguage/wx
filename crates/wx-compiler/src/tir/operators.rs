@@ -18,7 +18,7 @@ use crate::ast::{BinaryOp, StringInterner, UnaryOp};
 
 /// A primitive scalar type: what builtin operators are defined on.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Scalar {
 	U8,
 	I8,

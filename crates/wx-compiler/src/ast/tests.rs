@@ -284,7 +284,7 @@ fn expression_kind(expression: &Expression) -> &'static str {
 		Expression::NamedMethodCall(_) => "named-method-call",
 		Expression::ObjectAccess { .. } => "field",
 		Expression::Tuple { .. } => "tuple",
-		Expression::Float { .. } => "float",
+		Expression::Float => "float",
 		Expression::Char => "char",
 		Expression::String => "string",
 		Expression::Placeholder => "placeholder",

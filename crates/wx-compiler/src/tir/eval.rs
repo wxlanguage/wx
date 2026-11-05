@@ -62,13 +62,13 @@ index_newtype!(AllocIdx);
 /// yet: it is an offset into an allocation, and its number is known once
 /// the allocation is placed in its memory.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Val {
 	I32(u32),
 	I64(u64),
 	F32(u32),
 	F64(u64),
-	V128(u128),
+	// V128(u128),
 	/// As wide as its allocation's memory's `Size`.
 	MemoryOffset {
 		alloc: AllocIdx,
@@ -84,7 +84,7 @@ pub(super) enum Val {
 
 /// What an address written in an allocation's bytes points at.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum AddressTarget {
 	/// The bytes hold the offset into the allocation.
 	Allocation(AllocIdx),
@@ -96,7 +96,7 @@ pub(super) enum AddressTarget {
 /// the program is laid out. Constant evaluation creates them (a string
 /// literal's contents) and never writes them afterwards.
 #[derive(Clone, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Allocation {
 	pub(super) memory: MemoryIdx,
 	pub(super) align: u32,
@@ -112,7 +112,7 @@ pub(super) struct Allocation {
 /// `expect_*` reader per scalar, the one place each scalar's holding is
 /// written.
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct ConstScalar {
 	pub(super) val: Val,
 	pub(super) scalar: Scalar,
@@ -123,14 +123,14 @@ pub(super) type ConstValue = Box<[ConstScalar]>;
 
 /// Why evaluating a body failed, at the node that failed.
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct EvalError {
 	pub(super) span: TextSpan,
 	pub(super) kind: EvalErrorKind,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum EvalErrorKind {
 	/// The node is not a constant expression.
 	NotConst,
@@ -144,7 +144,7 @@ pub(super) enum EvalErrorKind {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Operation {
 	Binary(BinaryOp),
 	Negate,
@@ -152,7 +152,7 @@ pub(super) enum Operation {
 
 /// The value query's state for one constant.
 #[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ConstValueState {
 	/// Its body is built but not checked: what building it recorded is not
 	/// decided. Asking for its value checks it first (`check_constant`), and a
@@ -200,7 +200,6 @@ pub(super) fn value_bits(value: &[ConstScalar]) -> Option<u64> {
 			Val::I64(bits) => Some(bits),
 			Val::F32(_)
 			| Val::F64(_)
-			| Val::V128(_)
 			| Val::MemoryOffset { .. }
 			| Val::DataEnd { .. } => None,
 		},
@@ -230,7 +229,7 @@ enum Halt {
 /// `Type::Const`, so equal instances are equal; empty for a constant with no
 /// parameters, which is its own one instance.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Instance {
 	pub(super) constant: ConstIdx,
 	args: TypeList,
@@ -250,7 +249,7 @@ impl Instance {
 /// function: its arguments are interned as the function's item type's, so
 /// equal instances are equal.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct StaticInstance {
 	function: FunctionIdx,
 	args: TypeList,
@@ -294,18 +293,18 @@ fn body_of<'a>(
 ) -> &'a Body {
 	match owner.body {
 		Evaluated::Constant(const_index) => {
-			match &view.const_bodies[usize::from(const_index)] {
-				ConstBody::Built(body) => body,
+			match view.const_bodies[usize::from(const_index)] {
+				ConstBody::Built(body) => view.body(body),
 				_ => unreachable!("an evaluated constant's body is built"),
 			}
 		}
-		Evaluated::Global(global_index) => view.global_bodies
-			[usize::from(global_index)]
-		.as_ref()
-		.expect("an evaluated global's body is built"),
+		Evaluated::Global(global_index) => view.body(
+			view.global_bodies[usize::from(global_index)]
+				.expect("an evaluated global's body is built"),
+		),
 		Evaluated::Function(function_index) => {
-			match &view.function_implementations[usize::from(function_index)] {
-				FunctionImplementation::Defined(body) => body,
+			match view.function_implementations[usize::from(function_index)] {
+				FunctionImplementation::Defined(body) => view.body(body),
 				_ => unreachable!("an evaluated function's body is checked"),
 			}
 		}
@@ -660,11 +659,6 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 
-	fn const_name(&self, index: ConstIdx) -> &str {
-		let def = &self.defs.constants[usize::from(index)];
-		self.strings.resolve(def.name.inner).unwrap()
-	}
-
 	/// An instance as a path names it (`<P as Tr>::X`).
 	fn instance_name(&self, instance: Instance) -> String {
 		self.type_formatter()
@@ -847,8 +841,8 @@ impl TypeContext<'_, '_, '_> {
 					.expect("a state past evaluation is final");
 			}
 		}
-		let root = match &self.const_bodies[usize::from(const_index)] {
-			ConstBody::Built(body) => body.root(),
+		let root = match self.const_bodies[usize::from(const_index)] {
+			ConstBody::Built(body) => self.body(body).root(),
 			// A required trait constant, with no initializer at all. An
 			// instance reads one only for an impl missing it, which
 			// conformance reports.
@@ -1105,8 +1099,8 @@ impl TypeContext<'_, '_, '_> {
 					.types
 					.is_unplaced(self.constants[usize::from(constant)].ty) =>
 			{
-				let root = match &self.const_bodies[usize::from(constant)] {
-					ConstBody::Built(body) => body.root(),
+				let root = match self.const_bodies[usize::from(constant)] {
+					ConstBody::Built(body) => self.body(body).root(),
 					// Reported where the constant is.
 					_ => return Err(Halt::Silent),
 				};
@@ -1251,8 +1245,8 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::Array { .. }
 			| ExprKind::ArrayRepeat { .. } => self.eval_static(owner, expr, ty, stack),
 			ExprKind::Const { constant, .. } => {
-				let root = match &self.const_bodies[usize::from(constant)] {
-					ConstBody::Built(body) => body.root(),
+				let root = match self.const_bodies[usize::from(constant)] {
+					ConstBody::Built(body) => self.body(body).root(),
 					// Reported where the constant is.
 					_ => return Err(Halt::Silent),
 				};
@@ -2185,7 +2179,6 @@ fn write_value(
 		let bits = match number.val {
 			Val::I32(bits) | Val::F32(bits) => u128::from(bits),
 			Val::I64(bits) | Val::F64(bits) => u128::from(bits),
-			Val::V128(bits) => bits,
 			Val::MemoryOffset { alloc, offset } => {
 				relocations.push((at, AddressTarget::Allocation(alloc)));
 				u128::from(offset)
