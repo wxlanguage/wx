@@ -21,6 +21,9 @@ macro_rules! define_text {
         }
 
         impl $name {
+            /// Every variant, in declaration order: `ALL[t as usize] == t`.
+            const ALL: &'static [Self] = &[$(Self::$variant,)*];
+
             fn as_str(self) -> &'static str {
                 match self {
                     $(Self::$variant => $str,)*
@@ -67,7 +70,6 @@ define_text! {
 		DotAmp           => ".&",
 		DotDot           => "..",
 		LBrace           => "{",
-		LBraceSpace      => "{ ",
 		RBrace           => "}",
 		LParen           => "(",
 		RParen           => ")",
@@ -89,7 +91,7 @@ define_text! {
 		ColonSp          => ": ",
 		CommaSp          => ", ",
 		VbarSp           => " | ",
-		PlusSp           => " + ",
+		PlusLead         => "+ ",
 		EqSp             => " = ",
 		EqBare           => " =",
 		Else             => " else ",
@@ -97,7 +99,6 @@ define_text! {
 		LabelColon       => " :",
 		Space            => " ",
 		SpaceLBrace      => " {",
-		SpaceRBrace      => " }",
 		Where        => " where ",
 		// compound tokens
 		ExportLBrace => "export {",
@@ -215,28 +216,47 @@ enum Node {
 	IfBroken(NodeId),
 }
 
-/// TODO: about half of what this holds is duplicates. `Node::HardLine`,
-/// `SoftLine`, `Line`, `BlankLine` and `Node::Text(_)` carry
-/// nothing to tell two of them apart, yet every `hard_line()`/`text()` call
-/// allocates a fresh one — measured over `std/main.wx`, 19% of nodes are line
-/// breaks and 32% are fixed tokens, drawn from ~95 distinct values in total.
+/// Every node the builder makes, children of concatenations in a side list.
 ///
-/// The fix is to allocate each of those once in `new()` and hand out the id:
-/// a `Box<[NodeId]>` indexed by `token as usize` (the `define_text!` macro
-/// would emit the variant list), plus one field per line-break kind. It is
-/// safe — nothing mutates a node after it is built, and the renderer decides
-/// everything from the current mode and indent, never from node identity.
-/// Left undone deliberately; the formatter is not on any hot path today.
+/// A fixed token or a line break carries nothing to tell two of them apart,
+/// so each is made once, in `new`, and every use shares it. That is safe
+/// because a node never changes once built, and the renderer decides
+/// everything from its mode and indent, never from a node's identity.
 struct Arena {
 	nodes: Vec<Node>,
 	children: Vec<NodeId>,
+	/// Each token's node, indexed by `Text as usize`.
+	texts: Box<[NodeId]>,
+	soft_line: NodeId,
+	line: NodeId,
+	hard_line: NodeId,
+	blank_line: NodeId,
+	/// The concatenation of nothing.
+	empty: NodeId,
 }
 
 impl Arena {
 	fn new() -> Self {
+		let mut nodes = Vec::new();
+		let mut shared = |node| {
+			nodes.push(node);
+			(nodes.len() - 1) as NodeId
+		};
+		let texts = Text::ALL.iter().map(|&t| shared(Node::Text(t))).collect();
+		let soft_line = shared(Node::SoftLine);
+		let line = shared(Node::Line);
+		let hard_line = shared(Node::HardLine);
+		let blank_line = shared(Node::BlankLine);
+		let empty = shared(Node::Concat { start: 0, len: 0 });
 		Self {
-			nodes: Vec::new(),
+			nodes,
 			children: Vec::new(),
+			texts,
+			soft_line,
+			line,
+			hard_line,
+			blank_line,
+			empty,
 		}
 	}
 
@@ -249,7 +269,7 @@ impl Arena {
 
 	fn concat(&mut self, children: Vec<NodeId>) -> NodeId {
 		match children.len() {
-			0 => self.alloc(Node::Concat { start: 0, len: 0 }),
+			0 => self.empty,
 			1 => children[0],
 			_ => {
 				let start = self.children.len() as u32;
@@ -291,24 +311,6 @@ impl Arena {
 		self.children.push(c);
 		self.children.push(d);
 		self.alloc(Node::Concat { start, len: 4 })
-	}
-
-	#[inline]
-	fn concat5(
-		&mut self,
-		a: NodeId,
-		b: NodeId,
-		c: NodeId,
-		d: NodeId,
-		e: NodeId,
-	) -> NodeId {
-		let start = self.children.len() as u32;
-		self.children.push(a);
-		self.children.push(b);
-		self.children.push(c);
-		self.children.push(d);
-		self.children.push(e);
-		self.alloc(Node::Concat { start, len: 5 })
 	}
 
 	#[inline]
@@ -379,27 +381,27 @@ enum Blank {
 impl<'a> Builder<'a> {
 	#[inline]
 	fn text(&mut self, t: Text) -> NodeId {
-		self.arena.alloc(Node::Text(t))
+		self.arena.texts[t as usize]
 	}
 
 	#[inline]
 	fn hard_line(&mut self) -> NodeId {
-		self.arena.alloc(Node::HardLine)
+		self.arena.hard_line
 	}
 
 	#[inline]
 	fn soft_line(&mut self) -> NodeId {
-		self.arena.alloc(Node::SoftLine)
+		self.arena.soft_line
 	}
 
 	#[inline]
 	fn line(&mut self) -> NodeId {
-		self.arena.alloc(Node::Line)
+		self.arena.line
 	}
 
 	#[inline]
 	fn blank_line(&mut self) -> NodeId {
-		self.arena.alloc(Node::BlankLine)
+		self.arena.blank_line
 	}
 
 	#[inline]
@@ -563,6 +565,23 @@ impl<'a> Builder<'a> {
 	/// The caller must have pushed the preceding entry *and* its separator
 	/// first, since a trailing comment goes after both.
 	fn push_between(&mut self, out: &mut Vec<NodeId>, from: Before, to: After) {
+		let hard_line = self.hard_line();
+		self.push_between_breaking(out, from, to, hard_line);
+	}
+
+	/// `push_between`, opening the next entry with `empty` (a `SoftLine` or a
+	/// `Line`, which a group may lay out flat) when the gap holds nothing:
+	/// no comment and no blank line. A gap that holds something ends in a
+	/// hard break as always, which keeps its group broken, so a list that
+	/// collapses when it fits needs no check of its own for comments.
+	/// Returns whether the gap held a comment.
+	fn push_between_breaking(
+		&mut self,
+		out: &mut Vec<NodeId>,
+		from: Before,
+		to: After,
+		empty: NodeId,
+	) -> bool {
 		let (start, first_blank, may_trail) = match from {
 			Before::Opener { from } => (from, Blank::Suppress, false),
 			Before::Entry { end } => (end, Blank::Preserve, true),
@@ -599,8 +618,22 @@ impl<'a> Builder<'a> {
 				true => first_blank,
 				false => Blank::Preserve,
 			};
-			self.push_line_break(out, cursor, next, blank);
+			let wants_blank = match blank {
+				Blank::Force => true,
+				Blank::Suppress => false,
+				Blank::Preserve => Self::has_blank_line(
+					self.source,
+					cursor as usize,
+					next as usize,
+				),
+			};
+			if trailing.is_none() && own_line.is_empty() && !wants_blank {
+				out.push(empty);
+			} else {
+				self.push_line_break(out, cursor, next, blank);
+			}
 		}
+		trailing.is_some() || !own_line.is_empty()
 	}
 
 	fn build(&mut self, ast: &ast::AST) -> NodeId {
@@ -1692,7 +1725,6 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let mut items: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut items, attributes);
-		let attribute_count = items.len();
 		if pub_span.is_some() {
 			items.push(self.text(Text::Pub));
 		}
@@ -1702,76 +1734,20 @@ impl<'a> Builder<'a> {
 			items.push(self.text(Text::ColonSp));
 			items.push(self.build_bound_expression(&bounds.inner));
 		}
-		items.push(self.text(Text::SpaceLBrace));
-
-		// The comment and empty paths mirror `enum`/`struct`: an ungrouped
-		// concat, always multi-line, `push_between` for every gap. Only the
-		// no-comment path is wrapped in a `group` so `{ u32, u64 }` may
-		// collapse onto one line when it fits `max_line_width`.
-		if members.is_empty() {
-			self.build_empty_braced_comments(&mut items, span);
-			items.push(self.text(Text::RBrace));
-			return self.arena.concat(items);
-		}
-
-		if self.block_has_comments(span) {
-			let mut member_items: Vec<NodeId> = Vec::new();
-			for (index, member) in members.iter().enumerate() {
-				self.push_between(
-					&mut member_items,
-					match index {
-						0 => Before::Opener { from: span.start },
-						_ => Before::Entry {
-							end: members[index - 1].inner.span.end,
-						},
-					},
-					After::Entry {
-						start: member.inner.span.start,
-					},
-				);
-				let mut mn: Vec<NodeId> =
-					vec![self.build_type_path(&member.inner.inner.segments)];
-				if index + 1 < members.len() {
-					mn.push(self.text(Text::Comma));
-				} else {
-					mn.push(self.if_break_comma());
-				}
-				member_items.push(self.arena.concat(mn));
-			}
-			self.push_between(
-				&mut member_items,
-				Before::Entry {
-					end: members.last().unwrap().inner.span.end,
-				},
-				After::End { at: span.end },
-			);
-
-			let concat = self.arena.concat(member_items);
-			items.push(self.arena.indent(concat));
-			items.push(self.hard_line());
-			items.push(self.text(Text::RBrace));
-			return self.arena.concat(items);
-		}
-
-		let mut inner: Vec<NodeId> = vec![self.soft_line()];
-		for (index, member) in members.iter().enumerate() {
-			inner.push(self.build_type_path(&member.inner.inner.segments));
-			if index + 1 < members.len() {
-				inner.push(self.text(Text::Comma));
-				inner.push(self.soft_line());
-			} else {
-				inner.push(self.if_break_comma());
-			}
-		}
-		let inner_concat = self.arena.concat(inner);
-		items.push(self.arena.indent(inner_concat));
-		items.push(self.soft_line());
-		items.push(self.text(Text::RBrace));
-
-		let declaration = items.split_off(attribute_count);
-		let concat = self.arena.concat(declaration);
-		let declaration = self.arena.group(concat);
-		items.push(declaration);
+		let entries = members
+			.iter()
+			.map(|member| {
+				let path = self.build_type_path(&member.inner.inner.segments);
+				(member.inner.span, path)
+			})
+			.collect();
+		items.push(self.build_delimited_list(
+			span,
+			Text::SpaceLBrace,
+			Text::RBrace,
+			true,
+			entries,
+		));
 		self.arena.concat(items)
 	}
 
@@ -1792,51 +1768,29 @@ impl<'a> Builder<'a> {
 		items.push(self.text(Text::Struct));
 		items.push(self.symbol(name.inner));
 		self.build_type_params(&mut items, type_params);
-		items.push(self.text(Text::LParen));
 
-		if !fields.is_empty() {
-			let mut field_items: Vec<NodeId> = Vec::new();
-			for (index, field) in fields.iter().enumerate() {
-				self.push_between(
-					&mut field_items,
-					match index {
-						0 => Before::Opener { from: span.start },
-						_ => Before::Entry {
-							end: fields[index - 1].inner.span.end,
-						},
-					},
-					After::Entry {
-						start: field.inner.span.start,
-					},
-				);
-				let mut func: Vec<NodeId> = Vec::new();
+		let entries = fields
+			.iter()
+			.map(|field| {
+				let mut nodes: Vec<NodeId> = Vec::new();
 				if field.inner.inner.pub_span.is_some() {
-					func.push(self.text(Text::Pub));
+					nodes.push(self.text(Text::Pub));
 				}
 				self.build_binding_and_type(
-					&mut func,
+					&mut nodes,
 					field.inner.inner.binding,
 					&field.inner.inner.ty.inner,
 				);
-				func.push(self.text(Text::Comma));
-				field_items.push(self.arena.concat(func));
-			}
-			self.push_between(
-				&mut field_items,
-				Before::Entry {
-					end: fields.last().unwrap().inner.span.end,
-				},
-				After::End { at: span.end },
-			);
-
-			let concat = self.arena.concat(field_items);
-			items.push(self.arena.indent(concat));
-			items.push(self.hard_line());
-		} else {
-			self.build_empty_braced_comments(&mut items, span);
-		}
-
-		items.push(self.text(Text::RParen));
+				(field.inner.span, self.arena.concat(nodes))
+			})
+			.collect();
+		items.push(self.build_delimited_list(
+			span,
+			Text::LParen,
+			Text::RParen,
+			false,
+			entries,
+		));
 		items.push(self.text(Text::Semi));
 		self.arena.concat(items)
 	}
@@ -1912,6 +1866,73 @@ impl<'a> Builder<'a> {
 	/// there, and they are the list's like any others: an opener on one side,
 	/// the closing brace on the other, which is exactly the fourth combination
 	/// `push_between` already covers.
+	/// A comma-separated list between `open` and `close`, as one group: on one
+	/// line when it fits, otherwise one entry per line with a trailing comma.
+	/// `entries` are each entry's span and its built node. A comment or a
+	/// blank line the author left is kept, and keeps the list broken (see
+	/// `push_between_breaking`). `padded` puts a space inside the delimiters
+	/// when flat (`{ u32, u64 }`), otherwise none (`(x: i32)`). An empty list
+	/// is `open`, its comments, `close`.
+	fn build_delimited_list(
+		&mut self,
+		span: TextSpan,
+		open: Text,
+		close: Text,
+		padded: bool,
+		entries: Vec<(TextSpan, NodeId)>,
+	) -> NodeId {
+		let open = self.text(open);
+		let Some(&(last, _)) = entries.last() else {
+			let mut items = vec![open];
+			self.build_empty_braced_comments(&mut items, span);
+			items.push(self.text(close));
+			return self.arena.concat(items);
+		};
+		let end_break = match padded {
+			true => self.soft_line(),
+			false => self.line(),
+		};
+		let count = entries.len();
+		let mut inner: Vec<NodeId> = Vec::new();
+		let mut previous_end = None;
+		for (index, (entry_span, node)) in entries.into_iter().enumerate() {
+			let (from, empty) = match previous_end {
+				None => (Before::Opener { from: span.start }, end_break),
+				Some(end) => (Before::Entry { end }, self.soft_line()),
+			};
+			self.push_between_breaking(
+				&mut inner,
+				from,
+				After::Entry {
+					start: entry_span.start,
+				},
+				empty,
+			);
+			inner.push(node);
+			inner.push(match index + 1 < count {
+				true => self.text(Text::Comma),
+				false => self.if_break_comma(),
+			});
+			previous_end = Some(entry_span.end);
+		}
+		// Comments before `close` end on a line of their own.
+		let commented = self.push_between_breaking(
+			&mut inner,
+			Before::Entry { end: last.end },
+			After::End { at: span.end },
+			end_break,
+		);
+		let inner = self.arena.concat(inner);
+		let inner = self.arena.indent(inner);
+		let end = match commented {
+			true => self.hard_line(),
+			false => end_break,
+		};
+		let close = self.text(close);
+		let list = self.arena.concat4(open, inner, end, close);
+		self.arena.group(list)
+	}
+
 	fn build_empty_braced_comments(
 		&mut self,
 		items: &mut Vec<NodeId>,
@@ -2972,14 +2993,17 @@ impl<'a> Builder<'a> {
 		match bound {
 			ast::BoundExpression::Path(segs) => self.build_type_path(segs),
 			ast::BoundExpression::WithBindings { path, bindings } => {
+				// `where { A = u32, B: Tr }` when it fits; otherwise one
+				// binding per line, as other braced lists break.
 				let base_id = self.build_bound_expression(path);
 				let where_kw = self.text(Text::Where);
-				let open = self.text(Text::LBraceSpace);
-				let close = self.text(Text::SpaceRBrace);
-				let mut binding_parts: Vec<NodeId> = Vec::new();
+				let open = self.text(Text::LBrace);
+				let close = self.text(Text::RBrace);
+				let mut binding_parts: Vec<NodeId> = vec![self.soft_line()];
 				for (i, binding) in bindings.iter().enumerate() {
 					if i > 0 {
-						binding_parts.push(self.text(Text::CommaSp));
+						binding_parts.push(self.text(Text::Comma));
+						binding_parts.push(self.soft_line());
 					}
 					let mut key = self.symbol(binding.name.inner);
 					if let ast::AssocBindingKind::ConstRepresentable {
@@ -3020,24 +3044,36 @@ impl<'a> Builder<'a> {
 					};
 					binding_parts.push(self.arena.concat2(key, rhs));
 				}
+				binding_parts.push(self.if_break_comma());
 				let bindings_concat = self.arena.concat(binding_parts);
-				self.arena.concat5(
-					base_id,
-					where_kw,
-					open,
-					bindings_concat,
-					close,
-				)
+				let bindings_indented = self.arena.indent(bindings_concat);
+				let end = self.soft_line();
+				let block =
+					self.arena.concat4(open, bindings_indented, end, close);
+				let block = self.arena.group(block);
+				self.arena.concat3(base_id, where_kw, block)
 			}
+			// `A + B + C` when it fits; otherwise one bound per line, each led
+			// by its `+`, indented under the line that names the list:
+			//
+			//     pub typeset PointerSize:
+			//         + Add
+			//         + Sub {
 			ast::BoundExpression::BoundList(items) => {
-				let mut parts: Vec<NodeId> = Vec::new();
+				let line = self.line();
+				let lead = self.text(Text::PlusLead);
+				let lead = self.arena.alloc(Node::IfBroken(lead));
+				let mut parts: Vec<NodeId> = vec![line, lead];
 				for (i, b) in items.iter().enumerate() {
 					if i > 0 {
-						parts.push(self.text(Text::PlusSp));
+						parts.push(self.soft_line());
+						parts.push(self.text(Text::PlusLead));
 					}
 					parts.push(self.build_bound_expression(&b.inner));
 				}
-				self.arena.concat(parts)
+				let parts = self.arena.concat(parts);
+				let indented = self.arena.indent(parts);
+				self.arena.group(indented)
 			}
 		}
 	}
@@ -3230,6 +3266,8 @@ struct Renderer<'a> {
 	buffer: String,
 	position: usize,
 	indent: usize,
+	/// `fits`'s work list, a field so each group's decision reuses it.
+	unmeasured: Vec<Unmeasured>,
 }
 
 #[derive(Clone, Copy)]
@@ -3253,11 +3291,23 @@ impl<'a> Renderer<'a> {
 			buffer: String::new(),
 			position: 0,
 			indent: 0,
+			unmeasured: Vec::new(),
 		}
 	}
 
+	/// Renders the document from an explicit stack of what is left to print,
+	/// as Wadler's and Prettier's printers do, so a group's decision can see
+	/// what follows it (`fits`).
 	fn render(mut self, root: NodeId) -> String {
-		self.render_node(root, RenderMode::Break);
+		let mut rest = vec![Command {
+			id: root,
+			indent: 0,
+			mode: RenderMode::Break,
+		}];
+		while let Some(command) = rest.pop() {
+			self.indent = command.indent;
+			self.render_node(command, &mut rest);
+		}
 		self.buffer
 	}
 
@@ -3281,20 +3331,17 @@ impl<'a> Renderer<'a> {
 	}
 
 	/// Ends the current line and opens the next one at the current indent.
-	///
-	/// TODO: `" ".repeat` heap-allocates a `String` per line break, and every
-	/// broken line goes through here — thousands of throwaway allocations per
-	/// file. A `push_str` from a static run of spaces (looping only for an
-	/// indent deeper than it) writes the same bytes with none. Left with the
-	/// arena TODO above; neither is worth doing until the formatter is
-	/// somewhere that its speed is felt.
 	fn newline_indented(&mut self) {
 		self.newline();
-		self.buffer.push_str(&" ".repeat(self.indent));
+		self.buffer.extend(std::iter::repeat_n(' ', self.indent));
 		self.position = self.indent;
 	}
 
-	fn render_node(&mut self, id: NodeId, mode: RenderMode) {
+	/// Prints `command`'s node, or pushes its parts onto `rest`, the stack of
+	/// what is left to print (its top is printed next).
+	fn render_node(&mut self, command: Command, rest: &mut Vec<Command>) {
+		let Command { id, indent, mode } = command;
+		let part = |id| Command { id, indent, mode };
 		match self.arena.nodes[id as usize] {
 			Node::Text(t) => {
 				let s = t.as_str();
@@ -3330,67 +3377,149 @@ impl<'a> Renderer<'a> {
 			}
 			Node::HardLine => self.newline_indented(),
 			Node::Concat { start, len } => {
-				for i in start as usize..(start + len) as usize {
-					self.render_node(self.arena.children[i], mode);
+				for i in (start as usize..(start + len) as usize).rev() {
+					rest.push(part(self.arena.children[i]));
 				}
 			}
-			Node::Group(inner_id) => {
-				let mode = if matches!(mode, RenderMode::Flat)
-					|| self.measure_flat(id).is_some_and(|width| {
-						width
-							<= (self.config.max_line_width as usize)
-								.saturating_sub(self.position)
-					}) {
-					RenderMode::Flat
-				} else {
-					RenderMode::Break
+			Node::Group(inner) => {
+				let mode = match mode {
+					RenderMode::Flat => RenderMode::Flat,
+					RenderMode::Break => {
+						let width = (self.config.max_line_width as usize)
+							.saturating_sub(self.position);
+						match self.fits(inner, rest, width) {
+							true => RenderMode::Flat,
+							false => RenderMode::Break,
+						}
+					}
 				};
-				self.render_node(inner_id, mode);
+				rest.push(Command {
+					id: inner,
+					indent,
+					mode,
+				});
 			}
-			Node::Indent(inner_id) => {
-				self.indent += self.config.indent_width as usize;
-				self.render_node(inner_id, mode);
-				self.indent -= self.config.indent_width as usize;
-			}
+			Node::Indent(inner) => rest.push(Command {
+				id: inner,
+				indent: indent + self.config.indent_width as usize,
+				mode,
+			}),
 			Node::IfFlat(fragment) if matches!(mode, RenderMode::Flat) => {
-				self.render_node(fragment, mode);
+				rest.push(part(fragment));
 			}
 			Node::IfBroken(fragment) if matches!(mode, RenderMode::Break) => {
-				self.render_node(fragment, mode);
+				rest.push(part(fragment));
 			}
 			Node::IfFlat(_) | Node::IfBroken(_) => {}
 		}
 	}
 
-	fn measure_flat(&self, id: NodeId) -> Option<usize> {
-		let mut width = 0usize;
-		let mut stack: Vec<NodeId> = vec![id];
-		while let Some(current_id) = stack.pop() {
-			match self.arena.nodes[current_id as usize] {
-				Node::Text(t) => width += t.as_str().len(),
+	/// Whether `group`, laid out flat, fits in `width` together with what
+	/// follows it on the same line: the commands in `rest`, in their own
+	/// modes, up to the first line break one of them takes. A group still
+	/// to be decided there counts as broken, so its first possible break ends
+	/// the line (it can always take it). A hard break, or source text over
+	/// several lines, inside `group` means it cannot be flat at all.
+	fn fits(&mut self, group: NodeId, rest: &[Command], width: usize) -> bool {
+		self.unmeasured.clear();
+		self.unmeasured.push(Unmeasured {
+			id: group,
+			mode: RenderMode::Flat,
+			follows: false,
+		});
+		let mut width = width as isize;
+		let mut next_rest = rest.len();
+		loop {
+			let entry = match self.unmeasured.pop() {
+				Some(entry) => entry,
+				None => {
+					let Some(index) = next_rest.checked_sub(1) else {
+						return true;
+					};
+					next_rest = index;
+					Unmeasured {
+						id: rest[index].id,
+						mode: rest[index].mode,
+						follows: true,
+					}
+				}
+			};
+			let Unmeasured { id, mode, follows } = entry;
+			match self.arena.nodes[id as usize] {
+				Node::Text(t) => width -= t.as_str().len() as isize,
 				Node::SourceText(span) => {
 					let text = span.extract_str(self.source);
-					if text.contains(['\n', '\r']) {
-						return None;
+					match text.find(['\n', '\r']) {
+						None => width -= text.len() as isize,
+						Some(_) if !follows => return false,
+						Some(line_end) => {
+							return width >= line_end as isize;
+						}
 					}
-					width += text.len()
 				}
-				Node::Symbol { len, .. } => width += len as usize,
-				Node::SoftLine => width += 1,
-				Node::Line => {}
-				Node::IfFlat(fragment) => stack.push(fragment),
-				Node::IfBroken(_) => {}
-				Node::BlankLine | Node::HardLine => return None,
-				Node::Group(inner) | Node::Indent(inner) => stack.push(inner),
+				Node::Symbol { len, .. } => width -= len as isize,
+				Node::SoftLine | Node::Line => match mode {
+					RenderMode::Flat => {
+						if let Node::SoftLine = self.arena.nodes[id as usize] {
+							width -= 1;
+						}
+					}
+					RenderMode::Break => return true,
+				},
+				Node::BlankLine | Node::HardLine => return follows,
 				Node::Concat { start, len } => {
 					for i in (start as usize..(start + len) as usize).rev() {
-						stack.push(self.arena.children[i]);
+						self.unmeasured.push(Unmeasured {
+							id: self.arena.children[i],
+							..entry
+						});
+					}
+				}
+				Node::Group(inner) | Node::Indent(inner) => {
+					self.unmeasured.push(Unmeasured { id: inner, ..entry });
+				}
+				Node::IfFlat(fragment) => {
+					if let RenderMode::Flat = mode {
+						self.unmeasured.push(Unmeasured {
+							id: fragment,
+							..entry
+						});
+					}
+				}
+				Node::IfBroken(fragment) => {
+					if let RenderMode::Break = mode {
+						self.unmeasured.push(Unmeasured {
+							id: fragment,
+							..entry
+						});
 					}
 				}
 			}
+			if width < 0 {
+				return false;
+			}
 		}
-		Some(width)
 	}
+}
+
+/// A node `fits` has yet to measure, and the mode it is measured in.
+#[derive(Clone, Copy)]
+struct Unmeasured {
+	id: NodeId,
+	mode: RenderMode,
+	/// Whether the node comes after the group being decided (from `rest`)
+	/// rather than inside it: a line break there ends the line, one inside
+	/// the group means the group cannot be flat.
+	follows: bool,
+}
+
+/// One thing left to print: a node, the indentation its lines open at, and
+/// the mode of the group it is in.
+#[derive(Clone, Copy)]
+struct Command {
+	id: NodeId,
+	indent: usize,
+	mode: RenderMode,
 }
 
 fn ownership_sigil(ownership: ast::Ownership) -> Text {

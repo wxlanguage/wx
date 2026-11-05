@@ -368,10 +368,14 @@ fn test_format_qualified_path() {
 			indent_width: 4,
 		},
 	);
+	// The header is 90 columns flat, so its parameters break.
 	assert_eq!(
 		output,
 		indoc! {"
-            func grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> <Mem::Size as Unsigned>::Signed {
+            func grow<Mem: Memory>(
+                mem: Mem,
+                delta: Mem::Size,
+            ) -> <Mem::Size as Unsigned>::Signed {
                 <Thing as Greeter>::greet(mem)
             }
 
@@ -569,14 +573,9 @@ fn test_format_struct_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            pub struct Point(
-                pub x: i32,
-                y: i32,
-            );
+            pub struct Point(pub x: i32, y: i32);
 
-            struct Unit(
-                value: f64,
-            );
+            struct Unit(value: f64);
         "}
 	);
 }
@@ -602,10 +601,7 @@ fn test_format_parameter_and_field_slots() {
 		indoc! {"
             func f(i32, _: u8, mut d: i32) {}
 
-            struct S(
-                _: u8,
-                pub mut e: i32,
-            );
+            struct S(_: u8, pub mut e: i32);
         "}
 	);
 }
@@ -732,14 +728,9 @@ fn test_format_generic_struct_stays_inline() {
 	assert_eq!(
 		output,
 		indoc! {"
-            struct Pair<A, B>(
-                first: A,
-                second: B,
-            );
+            struct Pair<A, B>(first: A, second: B);
 
-            struct Wrapper<T>(
-                value: T,
-            );
+            struct Wrapper<T>(value: T);
         "}
 	);
 }
@@ -3083,10 +3074,7 @@ fn test_format_current_syntax_forms() {
             use a::b::*;
             use a::{b, c::{d, e as f}, g::*};
 
-            struct Pair(
-                i32,
-                pub u8,
-            );
+            struct Pair(i32, pub u8);
 
             struct Unit();
 
@@ -3282,4 +3270,159 @@ fn ascriptions_and_labels_are_printed_as_written() {
 			format!("func f() {{\n    {expected}\n}}\n")
 		);
 	}
+}
+
+#[test]
+fn a_bound_list_breaks_with_each_bound_led_by_its_plus() {
+	// A leading `+` is accepted and is layout only: a list that fits is
+	// written on one line without it.
+	assert_eq!(
+		checked_format("typeset Small: + Add + Sub { u32, u64 }", 80, 4),
+		"typeset Small: Add + Sub { u32, u64 }\n",
+	);
+	assert_eq!(
+		checked_format("func f<T: + Add>(x: T) -> T { x }", 80, 4),
+		"func f<T: Add>(x: T) -> T {\n    x\n}\n",
+	);
+	// Too long: one bound per line under the header, and the members, a
+	// group of their own, stay on the last line when they fit.
+	assert_eq!(
+		checked_format(
+			"pub typeset PointerSize: Add + Sub + Mul + PartialEq + PartialOrd + UnsignedInt + StackValue { u32, u64 }",
+			80,
+			4,
+		),
+		indoc! {"
+			pub typeset PointerSize:
+			    + Add
+			    + Sub
+			    + Mul
+			    + PartialEq
+			    + PartialOrd
+			    + UnsignedInt
+			    + StackValue { u32, u64 }
+		"},
+	);
+	// Supertraits and an associated type's bounds break the same way.
+	assert_eq!(
+		checked_format(
+			"trait Big: PartialEq + PartialOrd + StackValue { type Unit: Add + Mul + Sub + PartialOrd; }",
+			32,
+			4,
+		),
+		indoc! {"
+			trait Big:
+			    + PartialEq
+			    + PartialOrd
+			    + StackValue {
+			    type Unit:
+			        + Add
+			        + Mul
+			        + Sub
+			        + PartialOrd;
+			}
+		"},
+	);
+}
+
+#[test]
+fn a_where_binding_block_breaks_one_binding_per_line() {
+	assert_eq!(
+		checked_format(
+			"func g<M: Memory where { Size: Add + Sub + PartialEq, Item = u32 }>() {}",
+			40,
+			4,
+		),
+		indoc! {"
+			func g<
+			    M: Memory where {
+			        Size: Add + Sub + PartialEq,
+			        Item = u32,
+			    },
+			>() {}
+		"},
+	);
+}
+
+#[test]
+fn struct_fields_stay_on_one_line_unless_something_needs_more() {
+	assert_eq!(
+		checked_format("pub struct Char(\n    value: u32,\n);", 80, 4),
+		"pub struct Char(value: u32);\n",
+	);
+	// Too long: one field per line, with a trailing comma.
+	assert_eq!(
+		checked_format(
+			"struct Header(len: u32, cap: u32, data: heap::*u8);",
+			32,
+			4
+		),
+		indoc! {"
+			struct Header(
+			    len: u32,
+			    cap: u32,
+			    data: heap::*u8,
+			);
+		"},
+	);
+	// A comment or a blank line the author left keeps a line per field.
+	let commented = indoc! {"
+		struct P(
+		    // horizontal
+		    x: i32,
+		    y: i32,
+		);
+	"};
+	assert_eq!(checked_format(commented, 80, 4), commented);
+	let spaced = indoc! {"
+		struct P(
+		    x: i32,
+
+		    y: i32,
+		);
+	"};
+	assert_eq!(checked_format(spaced, 80, 4), spaced);
+}
+
+#[test]
+fn a_group_fits_only_with_what_follows_it_on_its_line() {
+	// The bounds alone are 79 columns; with ` {` after them they are 81, so
+	// they break.
+	assert_eq!(
+		checked_format(
+			"pub typeset PointerSize: Add + Sub + Mul + PartialEq + UnsignedInt + StackValue { u32, u64 }",
+			80,
+			4,
+		),
+		indoc! {"
+			pub typeset PointerSize:
+			    + Add
+			    + Sub
+			    + Mul
+			    + PartialEq
+			    + UnsignedInt
+			    + StackValue { u32, u64 }
+		"},
+	);
+	// The parameters fit up to `)`; the result type after them does not.
+	assert_eq!(
+		checked_format(
+			"func grow<Mem: Memory>(mem: Mem, delta: Mem::Size) -> Mem::Size::Signed;",
+			60,
+			4,
+		),
+		indoc! {"
+			func grow<Mem: Memory>(
+			    mem: Mem,
+			    delta: Mem::Size,
+			) -> Mem::Size::Signed;
+		"},
+	);
+	// Exactly at the limit, `;` included, stays on one line.
+	let exact = "struct Pair(first: u32, second: u32);\n";
+	assert_eq!(checked_format(exact, exact.len() as u32 - 1, 4), exact);
+	assert_eq!(
+		checked_format(exact, exact.len() as u32 - 2, 4),
+		"struct Pair(\n    first: u32,\n    second: u32,\n);\n",
+	);
 }
