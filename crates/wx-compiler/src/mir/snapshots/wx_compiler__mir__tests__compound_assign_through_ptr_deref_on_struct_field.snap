@@ -3,31 +3,28 @@ source: crates/wx-compiler/src/mir/tests.rs
 expression: case.mir
 ---
 functions:
-  - id: 473
+  - id: 669
     signature_index: 1
     scopes:
       - kind: Block
-        parent: ~
-        locals:
-          - ty:
-              Pointer:
-                memory: 471
-                kind: Memory32
-            mutability: Immutable
-          - ty:
-              Pointer:
-                memory: 471
-                kind: Memory32
-            mutability: Immutable
-          - ty: U32
-            mutability: Immutable
-          - ty: U32
-            mutability: Immutable
         result: Unit
       - kind: Block
-        parent: 0
-        locals: []
         result: U32
+    locals:
+      - ty:
+          Pointer:
+            memory: 667
+            kind: Memory32
+        mutability: Immutable
+      - ty:
+          Pointer:
+            memory: 667
+            kind: Memory32
+        mutability: Immutable
+      - ty: U32
+        mutability: Immutable
+      - ty: U32
+        mutability: Immutable
     block:
       kind:
         Block:
@@ -35,16 +32,14 @@ functions:
           expressions:
             - kind:
                 LocalSet:
-                  scope_index: 0
                   local_index: 1
                   value:
                     kind:
                       LocalGet:
-                        scope_index: 0
                         local_index: 0
                     ty:
                       Pointer:
-                        memory: 471
+                        memory: 667
                         kind: Memory32
               ty: Unit
             - kind:
@@ -52,11 +47,10 @@ functions:
                   pointer:
                     kind:
                       LocalGet:
-                        scope_index: 0
                         local_index: 1
                     ty:
                       Pointer:
-                        memory: 471
+                        memory: 667
                         kind: Memory32
                   value:
                     kind:
@@ -65,7 +59,6 @@ functions:
                         expressions:
                           - kind:
                               LocalSet:
-                                scope_index: 0
                                 local_index: 2
                                 value:
                                   kind:
@@ -73,19 +66,17 @@ functions:
                                       pointer:
                                         kind:
                                           LocalGet:
-                                            scope_index: 0
                                             local_index: 1
                                         ty:
                                           Pointer:
-                                            memory: 471
+                                            memory: 667
                                             kind: Memory32
                                       offset: 4
-                                      memory: 471
+                                      memory: 667
                                   ty: U32
                             ty: Unit
                           - kind:
                               LocalSet:
-                                scope_index: 0
                                 local_index: 3
                                 value:
                                   kind:
@@ -102,20 +93,18 @@ functions:
                                         left:
                                           kind:
                                             LocalGet:
-                                              scope_index: 0
                                               local_index: 2
                                           ty: I32
                                         right:
                                           kind:
                                             LocalGet:
-                                              scope_index: 0
                                               local_index: 3
                                           ty: I32
                                     ty: U32
                             ty: U32
                     ty: U32
                   offset: 4
-                  memory: 471
+                  memory: 667
               ty: Unit
       ty: Unit
     static_data: []
@@ -127,130 +116,17 @@ signatures:
     params_count: 2
   - items:
       - Pointer:
-          memory: 471
+          memory: 667
           kind: Memory32
       - Unit
     params_count: 1
   - items:
-      - F32
-      - F32
+      - I8
+      - Bool
     params_count: 1
   - items:
-      - F32
-      - F32
-      - F32
-    params_count: 2
-  - items:
-      - F32
-      - I32
-    params_count: 1
-  - items:
-      - F32
-      - U32
-    params_count: 1
-  - items:
-      - I32
-      - F32
-    params_count: 1
-  - items:
-      - U32
-      - F32
-    params_count: 1
-  - items:
-      - F32
-      - F64
-    params_count: 1
-  - items:
-      - F32
-      - I64
-    params_count: 1
-  - items:
-      - F32
-      - U64
-    params_count: 1
-  - items:
-      - F64
-      - F64
-    params_count: 1
-  - items:
-      - F64
-      - F64
-      - F64
-    params_count: 2
-  - items:
-      - F64
-      - I64
-    params_count: 1
-  - items:
-      - F64
-      - U64
-    params_count: 1
-  - items:
-      - I64
-      - F64
-    params_count: 1
-  - items:
-      - U64
-      - F64
-    params_count: 1
-  - items:
-      - F64
-      - F32
-    params_count: 1
-  - items:
-      - F64
-      - I32
-    params_count: 1
-  - items:
-      - F64
-      - U32
-    params_count: 1
-  - items:
-      - I32
-      - F64
-    params_count: 1
-  - items:
-      - I32
-      - I32
-      - I32
-    params_count: 2
-  - items:
-      - I32
-      - I32
-    params_count: 1
-  - items:
-      - U32
-      - F64
-    params_count: 1
-  - items:
-      - U32
-      - U32
-    params_count: 1
-  - items:
-      - I64
-      - F32
-    params_count: 1
-  - items:
-      - I64
-      - I64
-      - I64
-    params_count: 2
-  - items:
-      - I64
-      - I64
-    params_count: 1
-  - items:
-      - U64
-      - F32
-    params_count: 1
-  - items:
-      - U64
-      - U64
-      - U64
-    params_count: 2
-  - items:
-      - U64
-      - U64
+      - I8
+      - I8
     params_count: 1
   - items:
       - I8
@@ -258,8 +134,125 @@ signatures:
       - I8
     params_count: 2
   - items:
-      - I8
-      - I8
+      - F32
+      - F32
+    params_count: 1
+  - items:
+      - F32
+      - F32
+      - F32
+    params_count: 2
+  - items:
+      - F32
+      - I32
+    params_count: 1
+  - items:
+      - F32
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F32
+    params_count: 1
+  - items:
+      - U32
+      - F32
+    params_count: 1
+  - items:
+      - F32
+      - F64
+    params_count: 1
+  - items:
+      - F32
+      - I64
+    params_count: 1
+  - items:
+      - F32
+      - U64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F64
+      - F64
+    params_count: 2
+  - items:
+      - F64
+      - I64
+    params_count: 1
+  - items:
+      - F64
+      - U64
+    params_count: 1
+  - items:
+      - I64
+      - F64
+    params_count: 1
+  - items:
+      - U64
+      - F64
+    params_count: 1
+  - items:
+      - F64
+      - F32
+    params_count: 1
+  - items:
+      - F64
+      - I32
+    params_count: 1
+  - items:
+      - F64
+      - U32
+    params_count: 1
+  - items:
+      - I32
+      - F64
+    params_count: 1
+  - items:
+      - I32
+      - I32
+      - I32
+    params_count: 2
+  - items:
+      - I32
+      - I32
+    params_count: 1
+  - items:
+      - U32
+      - F64
+    params_count: 1
+  - items:
+      - U32
+      - U32
+    params_count: 1
+  - items:
+      - I64
+      - F32
+    params_count: 1
+  - items:
+      - I64
+      - I64
+      - I64
+    params_count: 2
+  - items:
+      - I64
+      - I64
+    params_count: 1
+  - items:
+      - U64
+      - F32
+    params_count: 1
+  - items:
+      - U64
+      - U64
+      - U64
+    params_count: 2
+  - items:
+      - U64
+      - U64
     params_count: 1
   - items:
       - U8
@@ -292,6 +285,104 @@ signatures:
       - Bool
       - Bool
       - Bool
+    params_count: 2
+  - items:
+      - I32
+      - Bool
+    params_count: 1
+  - items:
+      - Bool
+      - Bool
+    params_count: 1
+  - items:
+      - I32
+      - I32
+      - Bool
+    params_count: 2
+  - items:
+      - U32
+      - U32
+      - Bool
+    params_count: 2
+  - items:
+      - I64
+      - I64
+      - Bool
+    params_count: 2
+  - items:
+      - U64
+      - U64
+      - Bool
+    params_count: 2
+  - items:
+      - I8
+      - I8
+      - Bool
+    params_count: 2
+  - items:
+      - U8
+      - U8
+      - Bool
+    params_count: 2
+  - items:
+      - I16
+      - I16
+      - Bool
+    params_count: 2
+  - items:
+      - U16
+      - U16
+      - Bool
+    params_count: 2
+  - items:
+      - F32
+      - F32
+      - Bool
+    params_count: 2
+  - items:
+      - F64
+      - F64
+      - Bool
+    params_count: 2
+  - items:
+      - U8
+      - U8
+      - I8
+    params_count: 2
+  - items:
+      - U16
+      - U16
+      - I8
+    params_count: 2
+  - items:
+      - U32
+      - U32
+      - I8
+    params_count: 2
+  - items:
+      - U64
+      - U64
+      - I8
+    params_count: 2
+  - items:
+      - I16
+      - I16
+      - I8
+    params_count: 2
+  - items:
+      - I32
+      - I32
+      - I8
+    params_count: 2
+  - items:
+      - I64
+      - I64
+      - I8
+    params_count: 2
+  - items:
+      - Bool
+      - Bool
+      - I8
     params_count: 2
   - items:
       - U32
@@ -300,27 +391,39 @@ signatures:
 globals: []
 exports:
   - Function:
-      id: 473
-      name: 245
+      id: 669
+      name: 311
 imports: []
 memories:
-  - id: 471
+  - id: 667
     source: Internal
     kind: Memory32
     min_pages: ~
     max_pages: ~
 aggregates:
-  - values:
-      - U32
-      - U32
-      - U32
-    offsets:
-      - 0
-      - 4
-      - 8
+  - fields:
+      - ty: U32
+        offset: 0
+      - ty: U32
+        offset: 4
+      - ty: U32
+        offset: 8
     layout:
       size: 12
       align: 4
+    scalars:
+      entries:
+        - ty: U32
+          offset: 0
+        - ty: U32
+          offset: 4
+        - ty: U32
+          offset: 8
+      field_starts:
+        - 0
+        - 1
+        - 2
+        - 3
     decl_to_phys:
       - 0
       - 1

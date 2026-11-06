@@ -122,15 +122,11 @@ fn main() {
 	}
 }
 
-/// The other subcommands are synchronous; only this one needs an async
-/// runtime, so it builds one for itself rather than making `main` async.
-/// Current-thread is enough — `tower_lsp_server::Server` schedules its own
-/// request concurrency independent of the runtime's thread count.
 fn cmd_lsp() {
-	tokio::runtime::Builder::new_current_thread()
-		.build()
-		.unwrap()
-		.block_on(wx_lsp::run_stdio(tokio::io::stdin(), tokio::io::stdout()));
+	eprintln!(
+		"error: the language server is not connected to the new type checker yet"
+	);
+	std::process::exit(1);
 }
 
 #[derive(Clone)]
@@ -325,13 +321,20 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let tir = tir::TIR::build(&mut compilation);
-	emit_diagnostics(&compilation, &tir.diagnostics, format.clone());
-	abort_if_errors(tir.diagnostics.error_count());
+	let (diagnostics, mir) = tir::build(&mut compilation);
+	emit_diagnostics(&compilation, &diagnostics, format.clone());
+	abort_if_errors(diagnostics.error_count());
+	let mut mir =
+		mir.expect("lowering without an error diagnostic produces MIR");
 
-	let mir =
-		mir::MIR::build(&tir, &compilation.interner, compilation.id_generator);
-	let module = codegen::Builder::build(&mir, &compilation.interner).unwrap();
+	let Ok(module) = backend::emit(
+		&mut mir,
+		&compilation.strings,
+		Some(mir::inline::Policy::DEFAULT),
+	) else {
+		eprintln!("error: WebAssembly code generation failed");
+		std::process::exit(1);
+	};
 	let bytecode = module.encode();
 
 	if output == Some("-") {
@@ -343,9 +346,25 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 		Some(path) => path.to_string(),
 		None => format!("{}.wasm", output_stem(project_path)),
 	};
-	let mut file = fs::File::create(&out_path).unwrap();
-	file.write_all(&bytecode).unwrap();
+	if let Err(error) = fs::write(&out_path, &bytecode) {
+		eprintln!("error: could not write '{out_path}': {error}");
+		std::process::exit(1);
+	}
 	eprintln!("Wrote {} bytes to {out_path}", bytecode.len());
+}
+
+/// Derives a default output filename from the project's own directory
+/// name — `path` is always a directory, so there's no file extension to
+/// strip. Resolved to an absolute path first so `.`/`./` name the real
+/// directory rather than becoming a literal `.`.
+fn output_stem(path: &str) -> String {
+	let absolute = resolve_cli_path(path);
+	absolute
+		.as_str()
+		.rsplit('/')
+		.find(|segment| !segment.is_empty())
+		.unwrap_or("out")
+		.to_string()
 }
 
 fn cmd_check(project_path: &str, format: MessageFormat) {
@@ -357,9 +376,9 @@ fn cmd_check(project_path: &str, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let tir = tir::TIR::build(&mut compilation);
-	emit_diagnostics(&compilation, &tir.diagnostics, format.clone());
-	abort_if_errors(tir.diagnostics.error_count());
+	let diagnostics = tir::check(&mut compilation);
+	emit_diagnostics(&compilation, &diagnostics, format.clone());
+	abort_if_errors(diagnostics.error_count());
 
 	println!("No errors found.");
 }
@@ -430,18 +449,4 @@ fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
 	if any_error || (check && any_would_change) {
 		std::process::exit(1);
 	}
-}
-
-/// Derives a default output filename from the project's own directory
-/// name — `path` is always a directory now, so there's no file extension
-/// to strip the way there used to be. Resolved to an absolute path first
-/// so `.`/`./` name the real directory rather than becoming a literal `.`.
-fn output_stem(path: &str) -> String {
-	let absolute = resolve_cli_path(path);
-	absolute
-		.as_str()
-		.rsplit('/')
-		.find(|segment| !segment.is_empty())
-		.unwrap_or("out")
-		.to_string()
 }

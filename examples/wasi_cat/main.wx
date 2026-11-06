@@ -1,0 +1,18 @@
+// cat: copies standard input to standard output until it ends.
+package "wasi" as wasi;
+use wasi::{Fd, heap};
+
+func main() {
+    local arena = wasi::arena();
+    local buffer = arena.allocate_slice_uninit::<u8>(4096);
+    loop {
+        local chunk = Fd::Stdin.read(arena, buffer);
+        if chunk.len() == 0 { break };
+        Fd::Stdout.write(arena, chunk);
+    }
+}
+
+export {
+    main as "_start",
+    heap as "memory",
+}

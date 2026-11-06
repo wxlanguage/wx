@@ -1,0 +1,46 @@
+// The host supplies the bytes and manages their lifetime. No allocator,
+// static data or initialization writes are needed in this module.
+import "host" as host {
+    memory buffer: u32;
+}
+
+// A slice pointer becomes two i32 parameters: byte offset and element count.
+func sum(bytes: host::buffer::&[u8]) -> u32 {
+    local mut total: u32 = 0;
+    local mut i: u32 = 0;
+    loop {
+        if i == bytes.len() { break };
+        total += transmute::<u8, u32>(bytes[i]);
+        i += 1;
+    }
+    total
+}
+
+// This writes the same bytes that the host sees in its memory.
+// Only ASCII lowercase letters change; this is not Unicode case conversion.
+func uppercase(bytes: host::buffer::*[u8]) {
+    local mut i: u32 = 0;
+    loop {
+        if i == bytes.len() { break };
+        local byte = bytes[i];
+        if byte >= 97 && byte <= 122 { bytes[i] = byte - 32 };
+        i += 1;
+    }
+}
+
+// Indexing checks the slice length, not just the whole memory's bounds.
+func byte_at(bytes: host::buffer::&[u8], index: u32) -> u8 {
+    bytes[index]
+}
+
+// A pointer to one byte becomes just one i32 address (plus the byte argument).
+func store_byte(dst: host::buffer::*u8, value: u8) {
+    dst.* = value;
+}
+
+export {
+    sum,
+    uppercase,
+    byte_at,
+    store_byte,
+}

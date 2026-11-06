@@ -12,8 +12,8 @@ pub use diagnostics::DiagnosticView;
 use std::collections::HashMap;
 
 /// Serializes a HashMap with keys sorted for deterministic snapshot output.
-pub fn serialize_sorted_map<K, V, S>(
-	map: &HashMap<K, V>,
+pub fn serialize_sorted_map<K, V, H, S>(
+	map: &HashMap<K, V, H>,
 	serializer: S,
 ) -> Result<S::Ok, S::Error>
 where

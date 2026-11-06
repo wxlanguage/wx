@@ -1,0 +1,208 @@
+// A typed layer over WASI Preview 1.
+//
+// What belongs here is what WASI is: descriptors, error codes, and the calls
+// that cross to the host. Everything else is a package of its own: `fmt`
+// turns numbers into text and `slices` cuts slices, and neither knows about
+// WASI.
+//
+// WASI Preview 1 has a single memory and the host reads and writes it through
+// raw addresses, so the memory belongs here with the imports: `heap` is the
+// memory every pointer below points into. A program that uses this package
+// exports it (`use wasi::heap;`, then `heap as "memory"`).
+//
+// A call passes the host a few cells of memory (a list of buffers, a count).
+// WX has no addressable locals, so they come from an `Arena`: a call takes
+// them, calls the host and gives them back, so nothing accumulates. The
+// caller owns every buffer, and nothing is kept between calls.
+//
+// A call that can fail comes in two forms. `try_write` returns the `Errno`,
+// for a program that handles it; `write` ends the program with it as the exit
+// status, for a command that has nothing better to do.
+package "alloc" as alloc;
+package "slices" as slices;
+
+// A program's static data may be empty, which would give a memory of no
+// pages, and the allocator places its state in the memory it manages.
+#[memory_limits({ min_pages: 1 })]
+pub memory heap: u32;
+
+/// The allocator of `heap`, which the calls below take their cells from.
+pub type Arena = alloc::BumpAllocator<heap>;
+
+/// The arena of `heap`: placed after the static data on first use, and the
+/// same one on every later call.
+pub func arena() -> heap::*Arena {
+    Arena::bootstrap(heap)
+}
+
+/// The codes a stream program can meet; the full list is in
+/// `examples/wasi_preview1_port`. The host may return others, which `..`
+/// admits, so a `match` on an `Errno` needs a `_` arm.
+pub enum Errno(u16) {
+    Success = 0,
+    Again = 6,
+    Badf = 8,
+    Intr = 27,
+    Inval = 28,
+    Io = 29,
+    Pipe = 64,
+    ..
+}
+
+impl Errno {
+    /// Ends the program, with the code as its exit status, unless this is
+    /// `Success`.
+    pub func or_exit(self: Self) {
+        match self {
+            Errno::Success => (),
+            _ => sys::proc_exit(transmute(self)),
+        }
+    }
+}
+
+/// A file descriptor. The three every program starts with are named; the host
+/// hands out others (from `path_open`, say), which `..` admits.
+pub enum Fd(u32) {
+    Stdin = 0,
+    Stdout = 1,
+    Stderr = 2,
+    ..
+}
+
+import "wasi_snapshot_preview1" as sys {
+    use super::*;
+    func fd_read(
+        fd: Fd,
+        io_vecs: heap::&[heap::*[u8]],
+        bytes_read: heap::*u32,
+    ) -> Errno;
+    func fd_write(
+        fd: Fd,
+        io_vecs: heap::&[heap::&[u8]],
+        bytes_written: heap::*u32,
+    ) -> Errno;
+    // The host writes through `argv` and `argv_buf`, and the arguments are
+    // read from the text alone, so they are given as the first element of the
+    // slices that hold them (a slice has a length too, which is not passed).
+    func args_sizes_get(argc: heap::*u32, argv_buf_size: heap::*u32) -> Errno;
+    func args_get(argv: heap::&heap::&u8, argv_buf: heap::&u8) -> Errno;
+    func proc_exit(code: u32) -> !;
+}
+
+impl Fd {
+    /// The descriptor the host numbered `raw`.
+    pub func from_raw(raw: u32) -> Self {
+        transmute(raw)
+    }
+
+    /// Writes all of `bytes`, retrying after a partial write.
+    pub func try_write(
+        self: Self,
+        arena: heap::*Arena,
+        bytes: heap::&[u8],
+    ) -> Errno {
+        local mark = arena.mark();
+        local io_vecs = arena.allocate_slice_uninit::<heap::&[u8]>(1);
+        local count = arena.allocate_value::<u32>(0);
+        local mut rest = bytes;
+        local error = loop {
+            if rest.len() == 0 { break Errno::Success };
+            io_vecs[0] = rest;
+            local error = sys::fd_write(self, io_vecs.*.&, count);
+            if error != Errno::Success { break error };
+            rest = slices::slice_at(rest, count.*, rest.len() - count.*);
+        };
+        arena.release(mark);
+        error
+    }
+
+    pub func write(self: Self, arena: heap::*Arena, bytes: heap::&[u8]) {
+        self.try_write(arena, bytes).or_exit();
+    }
+
+    /// Reads into `buffer` and returns the bytes read, a view of its start.
+    /// An empty view with `Success` means end of input. An empty `buffer` is
+    /// `Inval`.
+    pub func try_read(self: Self, arena: heap::*Arena, buffer: heap::*[u8]) -> (
+        Errno,
+        heap::&[u8],
+    ) {
+        if buffer.*.&.len() == 0 { return (Errno::Inval, "") };
+        local mark = arena.mark();
+        local io_vecs = arena.allocate_slice_uninit::<heap::*[u8]>(1);
+        local count = arena.allocate_value::<u32>(0);
+        io_vecs[0] = buffer;
+        local error = sys::fd_read(self, io_vecs.*.&, count);
+        local read = count.*;
+        arena.release(mark);
+        if error != Errno::Success { return (error, "") };
+        (Errno::Success, slices::slice_at(buffer.*.&, 0, read))
+    }
+
+    pub func read(
+        self: Self,
+        arena: heap::*Arena,
+        buffer: heap::*[u8],
+    ) -> heap::&[u8] {
+        local (error, bytes) = self.try_read(arena, buffer);
+        error.or_exit();
+        bytes
+    }
+}
+
+/// Prints `message` and a newline to standard error, then ends the program
+/// with status 1. A failure to print is not reported: there is nowhere left
+/// to report it.
+pub func panic(arena: heap::*Arena, message: heap::&[u8]) -> ! {
+    _ = Fd::Stderr.try_write(arena, message);
+    _ = Fd::Stderr.try_write(arena, "\n");
+    sys::proc_exit(1)
+}
+
+/// Ends the program with `code` as its exit status.
+pub func exit(code: u32) -> ! {
+    sys::proc_exit(code)
+}
+
+/// The program's arguments, the first being its name. They are placed in
+/// `arena` and kept, so the views are valid for the life of the program.
+pub func try_args(arena: heap::*Arena) -> (Errno, heap::&[heap::&[u8]]) {
+    // Only the sizes need freeing: the arguments stay.
+    local mark = arena.mark();
+    local count = arena.allocate_value::<u32>(0);
+    local size = arena.allocate_value::<u32>(0);
+    local mut error = sys::args_sizes_get(count, size);
+    local total = count.*;
+    local text_size = size.*;
+    arena.release(mark);
+    if error != Errno::Success || total == 0 { return (error, []) };
+
+    // The host also fills in a pointer to each argument. They are not needed:
+    // the arguments follow one another in the text, each ending in a NUL.
+    local pointers = arena.allocate_slice_uninit::<heap::&u8>(total);
+    local text = arena.allocate_slice_uninit::<u8>(text_size);
+    error = sys::args_get(pointers[0].&, text[0].&);
+    if error != Errno::Success { return (error, []) };
+    local arguments = arena.allocate_slice_uninit::<heap::&[u8]>(total);
+
+    local bytes = text.*.&;
+    local mut next: u32 = 0;
+    local mut start: u32 = 0;
+    local mut at: u32 = 0;
+    loop {
+        if at == bytes.len() { break };
+        if bytes[at] == '\0' {
+            arguments[next] = slices::slice_at(bytes, start, at - start);
+            next += 1;
+            start = at + 1;
+        }
+        at += 1;
+    }
+    (Errno::Success, arguments.*.&)
+}
+
+pub func args(arena: heap::*Arena) -> heap::&[heap::&[u8]] {
+    local (error, arguments) = try_args(arena);
+    error.or_exit();
+    arguments
+}

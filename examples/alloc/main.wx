@@ -1,0 +1,91 @@
+// A reusable bump allocator over any wx memory.
+//
+// A bump allocator only moves its `next` pointer forward, so it cannot free
+// individual allocations; the whole arena is reclaimed at once. It grows the
+// memory on demand and traps on out-of-memory instead of handing out a
+// pointer that is already past the end.
+//
+// Usage:
+//
+//   package "alloc" as alloc;
+//
+//   func allocator() -> heap::*alloc::BumpAllocator<heap> {
+//       alloc::BumpAllocator::<heap>::bootstrap(heap)
+//   }
+//
+// `bootstrap` places the allocator right after static data and is idempotent,
+// so helpers can call `allocator()` instead of threading a pointer around.
+
+/// A monotonic bump allocator over any memory.
+///
+/// The state is the `next` free address. `Mem` itself is zero-sized, so the
+/// header is one pointer wide in `Mem`'s address space.
+pub struct BumpAllocator<Mem: Memory>(mem: Mem, next: RawPtr<Mem, u8>);
+
+impl<Mem: Memory> BumpAllocator<Mem> {
+    /// Creates an allocator whose first allocation starts at `start`.
+    pub func new(mem: Mem, start: Mem::Size) -> Self {
+        Self({ mem, next: RawPtr::from_addr(start) })
+    }
+
+    /// Returns the allocator for `mem`, placing it right after the program's
+    /// static data on first use. Repeated calls return the same allocator, so
+    /// helpers can call this without threading a pointer through every
+    /// signature.
+    pub func bootstrap(mem: Mem) -> Mem::*Self {
+        local align = align_of::<Self, Mem>();
+        local end = RawPtr::from_ptr(Mem::DATA_END).addr();
+        // Address 0 is `RawPtr::null()`, so nothing is placed there: with no
+        // static data the first usable address is 1, which aligns up to `align`.
+        local start = if end == 0 { 1 } else { end };
+        local base = RawPtr::<Mem, u8>::from_addr(start).align_up(align);
+        local this: Mem::*Self = transmute(base.addr());
+        // Wasm memory is zero-initialized and a live `next` is never 0, so a
+        // null `next` means "not bootstrapped yet".
+        if this.next.is_null() {
+            this.* = Self::new(mem, base.addr() + size_of::<Self, Mem>());
+        }
+        this
+    }
+}
+
+impl<Mem: Memory> BumpAllocator<Mem> {
+    /// The current end of the allocations, to give back to `release`.
+    pub func mark(self: Mem::*Self) -> RawPtr<Mem, u8> {
+        self.next
+    }
+
+    /// Frees everything allocated since `mark` returned it, which makes the
+    /// allocator a stack: scratch space a function needs for one call. A
+    /// pointer into what was freed must not be used afterwards.
+    pub func release(self: Mem::*Self, mark: RawPtr<Mem, u8>) {
+        self.next = mark;
+    }
+}
+
+impl<Mem: Memory> Allocator for BumpAllocator<Mem> {
+    type Mem = Mem;
+
+    func allocate(self: Mem::*Self, layout: Layout<Mem>) -> Mem::*u8 {
+        local ptr = self.next.align_up(layout.align());
+        local new_end = ptr.addr() + layout.size();
+        // The addition wrapped: this allocation cannot fit in the address
+        // space at all.
+        if new_end < ptr.addr() { trap() };
+
+        local cur_end = self.mem.size_bytes();
+        if new_end > cur_end {
+            // `delta - 1` first, so the page-rounding addition cannot wrap.
+            local delta = new_end - cur_end;
+            local needed = (delta - 1) / Mem::PAGE_SIZE + 1;
+            local before = self.mem.size_pages();
+            _ = self.mem.grow(needed);
+            // `grow` returns the old size or -1, but the signed size has no
+            // `PartialEq` in std; comparing the page count catches both.
+            if self.mem.size_pages() == before { trap() }
+        }
+
+        self.next = RawPtr::from_addr(new_end);
+        ptr.as_ptr()
+    }
+}

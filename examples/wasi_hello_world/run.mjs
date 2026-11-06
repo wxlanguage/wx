@@ -1,8 +1,7 @@
 // Runs main.wasm (compiled from main.wx) as a WASI Preview 1 "command"
 // module using Node's built-in WASI runtime.
 //
-//   cargo run -p wx-cli -- compile examples/wasi_hello_world/main.wx
-//   mv main.wasm examples/wasi_hello_world/main.wasm
+//   wx build examples/wasi_hello_world -o examples/wasi_hello_world/main.wasm
 //   node examples/wasi_hello_world/run.mjs
 
 import { readFile } from "node:fs/promises";

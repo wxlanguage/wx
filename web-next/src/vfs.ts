@@ -21,10 +21,10 @@ const DEFAULT_MAIN_WX = `use std::*;
 memory heap: Memory where { Size = u32 };
 
 import "console" {
-	fn log(message: heap::[]u8);
+	func log(message: heap::[]u8);
 }
 
-fn main() {
+func main() {
 	console::log("hello from wx!");
 }
 

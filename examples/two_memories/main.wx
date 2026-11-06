@@ -1,0 +1,103 @@
+// A packet filter over two memories.
+//
+// The host owns `io`, writes one packet into it and asks for a verdict. The
+// filter's rules live in `policy`, a memory this module defines and does not
+// export, so the host has no way to read or change them. Both are `u32`
+// memories and both hold bytes, yet the type of a pointer says which one it
+// points into: a rule can never be passed where a packet is expected.
+//
+// Packet (in `io`, one byte per cell unless noted):
+//
+//   0       1         2..4          4        5..
+//   version protocol  port (u16 BE) payload  payload bytes
+//   (== 1)  (6 tcp,                 length
+//            17 udp)
+//
+// Rule (in `policy`, four bytes, first match wins, no match drops):
+//
+//   0                    1..3          3
+//   protocol (0 = any)   port (u16 BE) action (1 accept, 0 drop)
+import "host" as host {
+    memory io: u32;
+}
+
+memory policy: u32;
+
+enum Verdict(u32) {
+    Drop = 0,
+    Accept = 1,
+    // Wrong version, a header cut short, or a length that disagrees with the
+    // bytes the host actually provided.
+    Malformed = 2,
+}
+
+const HEADER_LEN: u32 = 5;
+const RULE_LEN: u32 = 4;
+
+global mut accepted_count: u32 = 0;
+global mut dropped_count: u32 = 0;
+
+// The rules are a constant. Each use places the bytes in the memory its
+// context names, so the host never sees them.
+const RULES: policy::&[u8] = [0, 0, 23, 0, 6, 0, 80, 1, 6, 1, 187, 1, 17, 0, 53, 1];
+
+// One definition reads a big-endian u16 from any memory's bytes. `at` is that
+// memory's own address type, so the same code serves a 32-bit and a 64-bit
+// memory.
+func be16<M: Memory>(bytes: M::&[u8], at: M::Size) -> u32 {
+    transmute::<u8, u32>(bytes[at]) * 256 + transmute::<u8, u32>(bytes[at + 1])
+}
+
+func decide(packet: host::io::&[u8]) -> Verdict {
+    // Check lengths explicitly so a bad packet is a verdict, not a trap.
+    if packet.len() < HEADER_LEN { return Verdict::Malformed };
+    if packet[0] != 1 { return Verdict::Malformed };
+    if HEADER_LEN + transmute::<u8, u32>(packet[4]) != packet.len() {
+        return Verdict::Malformed
+    }
+
+    local protocol = packet[1];
+    local port = be16(packet, 2);
+
+    local table = RULES;
+    local mut i: u32 = 0;
+    loop {
+        if i == table.len() { break Verdict::Drop };
+        if (table[i] == 0 || table[i] == protocol)
+            && be16(table, i + 1) == port {
+            if table[i + 3] == 1 { break Verdict::Accept };
+            break Verdict::Drop
+        }
+        i += RULE_LEN;
+    }
+}
+
+func filter(packet: host::io::&[u8]) -> Verdict {
+    local verdict = decide(packet);
+    match verdict {
+        Verdict::Accept => accepted_count.set(accepted_count.get() + 1),
+        _ => dropped_count.set(dropped_count.get() + 1),
+    }
+    verdict
+}
+
+func accepted() -> u32 {
+    accepted_count.get()
+}
+
+func dropped() -> u32 {
+    dropped_count.get()
+}
+
+func rule_count() -> u32 {
+    RULES.len() / RULE_LEN
+}
+
+// The host can send packets and read counters. It has no export that returns
+// a rule, and no handle to `policy`.
+export {
+    filter,
+    accepted,
+    dropped,
+    rule_count,
+}

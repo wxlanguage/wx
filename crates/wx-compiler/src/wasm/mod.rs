@@ -13,7 +13,7 @@ use crate::mir;
 mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum ScalarType {
 	I32,
 	I64,
@@ -21,70 +21,74 @@ pub enum ScalarType {
 	F64,
 }
 
-impl TryFrom<mir::Type> for ScalarType {
+impl TryFrom<mir::ValueType> for ScalarType {
 	type Error = ();
-	fn try_from(ty: mir::Type) -> Result<Self, ()> {
+	fn try_from(ty: mir::ValueType) -> Result<Self, ()> {
 		Ok(match ty {
-			mir::Type::I32
-			| mir::Type::U32
-			| mir::Type::Bool
-			| mir::Type::U8
-			| mir::Type::I8
-			| mir::Type::U16
-			| mir::Type::I16
-			| mir::Type::Function { .. } => ScalarType::I32,
-			mir::Type::I64 | mir::Type::U64 => ScalarType::I64,
-			mir::Type::Pointer { kind, .. } => match kind {
+			mir::ValueType::I32
+			| mir::ValueType::U32
+			| mir::ValueType::Bool
+			| mir::ValueType::U8
+			| mir::ValueType::I8
+			| mir::ValueType::U16
+			| mir::ValueType::I16
+			| mir::ValueType::Function { .. } => ScalarType::I32,
+			mir::ValueType::I64 | mir::ValueType::U64 => ScalarType::I64,
+			mir::ValueType::Pointer { kind, .. } => match kind {
 				mir::MemoryKind::Memory32 => ScalarType::I32,
 				mir::MemoryKind::Memory64 => ScalarType::I64,
 			},
-			mir::Type::F32 => ScalarType::F32,
-			mir::Type::F64 => ScalarType::F64,
+			mir::ValueType::F32 => ScalarType::F32,
+			mir::ValueType::F64 => ScalarType::F64,
 			_ => return Err(()),
 		})
 	}
 }
 
-/// Recursively flatten a MIR type into its constituent WASM scalar types.
-/// Unit/Never produce zero slots; Aggregate recurses into its fields. The
-/// one place this conversion happens; every producer of a `Function` should
-/// call this rather than repeating the match itself.
+/// Flatten a MIR type into its constituent WASM scalar types.
+/// Unit/Never produce zero slots; a pack already stores flat scalar types.
+/// The one place this conversion happens; every producer of a
+/// `Function` should call this rather than repeating the match itself.
 pub fn flatten_type_to_scalars(
-	ty: mir::Type,
+	ty: mir::ValueType,
 	aggregates: &[mir::Aggregate],
 ) -> Vec<ScalarType> {
 	match ty {
-		mir::Type::Unit | mir::Type::Never => vec![],
-		mir::Type::Aggregate { aggregate_index } => aggregates
-			[aggregate_index as usize]
-			.values
-			.iter()
-			.flat_map(|&f| flatten_type_to_scalars(f, aggregates))
-			.collect(),
+		mir::ValueType::Unit | mir::ValueType::Never => vec![],
+		mir::ValueType::Aggregate { aggregate_index } => aggregates
+			[usize::from(aggregate_index)]
+		.scalars
+		.iter()
+		.map(|&ty| {
+			ScalarType::try_from(ty)
+				.expect("a ScalarTable entry is scalar by construction")
+		})
+		.collect(),
 		t => vec![ScalarType::try_from(t).expect("must be scalar")],
 	}
 }
 
 /// The `memarg` immediate carried by every WebAssembly memory instruction.
-#[cfg_attr(test, derive(Debug, PartialEq, serde::Serialize))]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy)]
 pub struct MemArg {
 	/// Log2 of the alignment hint in bytes (e.g. 2 = 4-byte aligned).
 	pub align: u32,
 	/// Static byte offset added to the runtime address.
 	pub offset: u32,
-	pub memory: crate::ast::DefId,
+	pub memory: mir::MemoryId,
 }
 
 /// A WASM local variable declaration.
-#[cfg_attr(test, derive(serde::Serialize))]
-#[cfg_attr(test, serde(transparent))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), serde(transparent))]
 #[derive(Clone, Copy)]
 pub struct Local {
 	pub ty: ScalarType,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Function {
 	/// Locals in declaration order (params first, then spill slots).
 	pub locals: Vec<Local>,
@@ -100,7 +104,8 @@ pub struct Function {
 /// A subset of WASM instructions produced by the scheduler.
 /// Each variant maps 1-to-1 to a WASM opcode; operands are pushed onto the
 /// implicit value stack by the preceding instructions.
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
+#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone)]
 pub enum Instruction {
 	// Constants
@@ -113,8 +118,8 @@ pub enum Instruction {
 	LocalSet(u32),
 	LocalTee(u32),
 	// Globals
-	GlobalGet(crate::ast::DefId),
-	GlobalSet(crate::ast::DefId),
+	GlobalGet(mir::GlobalId),
+	GlobalSet(mir::GlobalId),
 	// Arithmetic — i32
 	I32Add,
 	I32Sub,
@@ -235,23 +240,23 @@ pub enum Instruction {
 	// Calls
 	/// Direct call; the encoder resolves the WASM function index from
 	/// `func_wasm_index`, covering both internal and imported functions.
-	Call(crate::ast::DefId),
+	Call(mir::FunctionId),
 	/// Indirect call via the function table; the encoder resolves `type_index`
 	/// from the referenced MIR signature.
 	CallIndirectSym {
-		mir_sig_index: u32,
+		mir_sig_index: mir::SignatureIndex,
 	},
 	// Memory
-	MemorySize(crate::ast::DefId),
-	MemoryGrow(crate::ast::DefId),
-	MemoryFill(crate::ast::DefId),
+	MemorySize(mir::MemoryId),
+	MemoryGrow(mir::MemoryId),
+	MemoryFill(mir::MemoryId),
 	MemoryCopy {
-		dst: crate::ast::DefId,
-		src: crate::ast::DefId,
+		dst: mir::MemoryId,
+		src: mir::MemoryId,
 	},
 	/// Wasm linear-memory index as an `i32.const`, resolved at codegen.
 	MemoryIndex {
-		memory: crate::ast::DefId,
+		memory: mir::MemoryId,
 	},
 	// Pointer load/store
 	I32Load8S(MemArg),
@@ -300,21 +305,23 @@ pub enum Instruction {
 	// codegen encoder, which has access to the string pool and function table.
 	/// A function referenced as a value; the encoder pushes it into the
 	/// function table and emits `i32.const <table_index>`.
-	FunctionPointer(crate::ast::DefId),
-	/// End of the static data section for a given memory (base of writable
-	/// heap); the encoder emits `i32.const <data_section_end>`.
-	DataSectionEnd {
-		memory: crate::ast::DefId,
+	FunctionPointer(mir::FunctionId),
+	/// The address right after a memory's static data; the encoder emits a
+	/// constant as wide as the memory's addresses.
+	DataEnd {
+		memory: mir::MemoryId,
 	},
-	/// A static array; the encoder resolves the index to a byte offset in the
-	/// data segment and emits `i32.const <byte_offset>`.
+	/// The address `offset` bytes into a static entry; the encoder adds the
+	/// entry's address and emits a constant of `ty`.
 	StaticDataPointer {
-		data_index: u32,
+		entry: mir::StaticEntryId,
+		offset: u32,
 		ty: ScalarType,
 	},
 }
 
-#[cfg_attr(test, derive(Debug, serde::Serialize))]
+#[cfg_attr(test, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy)]
 pub enum BlockType {
 	Empty,
