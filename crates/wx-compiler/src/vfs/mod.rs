@@ -333,7 +333,7 @@ pub struct Package {
 	/// The packages this package's manifest declares, by the key it
 	/// declares them under. A key only *makes a package available*: nothing
 	/// is nameable in the source until a package instance,
-	/// `crate "<key>" as <alias>;`, instantiates it, which is also what lets
+	/// `package "<key>" as <alias>;`, instantiates it, which is also what lets
 	/// one package be instantiated under several aliases, in any module. The stdlib is registered here
 	/// first, as `std`, since every package depends on it.
 	///

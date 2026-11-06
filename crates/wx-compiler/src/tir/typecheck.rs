@@ -7194,6 +7194,135 @@ mod tests {
 	}
 
 	#[test]
+	fn an_open_enum_is_exhaustive_only_with_a_wildcard() {
+		test_case!(
+			case = indoc! {"
+				enum Closed(u8) { A = 0, B = 1, C = 2 }
+				enum Open(u8) { A = 0, B = 1, .. }
+				func closed(c: Closed) -> u8 {
+					match c { Closed::A => { 1 }, Closed::B => { 2 }, Closed::C => { 3 } }
+				}
+				func named(o: Open) -> u8 {
+					match o { Open::A => { 1 }, Open::B => { 2 } }
+				}
+				func rest(o: Open) -> u8 {
+					match o { Open::A => { 1 }, Open::B => { 2 }, _ => { 3 } }
+				}
+				func binding(o: Open) -> u8 {
+					match o { Open::A => { 1 }, other => { 2 } }
+				}
+				func destructure(o: Open) { local x = o; local _ = o; }
+				func same(a: Open, b: Open) -> Bool { a == b }
+			"}
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::NonExhaustiveMatch]);
+	}
+
+	#[test]
+	fn an_open_enum_is_its_variants_and_the_rest() {
+		// What is not covered is named by variant first, then `_` for the rest.
+		test_case!(
+			case = indoc! {"
+				enum Open(u8) { A = 0, B = 1, C = 2, .. }
+				func f(o: Open) -> u8 { match o { Open::A => { 1 } } }
+			"}
+		);
+		case.diagnostics()
+			.assert_error_saying("patterns `Open::B`, `Open::C` and `_`");
+
+		// Inside a tuple, and with a signed repr.
+		test_case!(
+			case = indoc! {"
+				enum Sign(i8) { Minus = -1, Zero = 0, .. }
+				func f(a: Sign, b: Bool) -> u8 {
+					match (a, b) {
+						(Sign::Minus, _) => { 1 },
+						(Sign::Zero, _) => { 2 },
+						(_, _) => { 3 },
+					}
+				}
+			"}
+		);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn an_open_enum_that_names_every_value_has_no_rest() {
+		// `..` admits nothing here (and is warned about), so the enum is closed
+		// in effect: listing every variant is exhaustive, and a wildcard after
+		// them is unreachable.
+		let all: Vec<String> =
+			(0..256).map(|n| format!("V{n} = {n}")).collect();
+		let arms: Vec<String> =
+			(0..256).map(|n| format!("E::V{n} => {{ 1 }}")).collect();
+		let source = format!(
+			"enum E(u8) {{ {}, .. }}\nfunc f(e: E) -> u8 {{ match e {{ {} }} }}",
+			all.join(", "),
+			arms.join(", ")
+		);
+		test_case!(case = source.as_str());
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::RedundantOpenMarker]);
+
+		let source = format!(
+			"enum E(u8) {{ {}, .. }}\nfunc f(e: E) -> u8 {{ match e {{ {}, _ => {{ 2 }} }} }}",
+			all.join(", "),
+			arms.join(", ")
+		);
+		test_case!(case = source.as_str());
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::RedundantOpenMarker,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+	}
+
+	#[test]
+	fn the_dots_of_an_enum_are_judged_when_its_signature_is_built() {
+		// Fine: one `..`, last.
+		test_case!(case = "enum E(u8) { A = 0, .. }");
+		case.diagnostics().assert_none();
+
+		// Any `..` opens the enum, so a misplaced one only draws a warning.
+		test_case!(case = "enum E(u8) { A = 0, .., B = 1 }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MisplacedOpenMarker]);
+
+		// A second adds nothing.
+		test_case!(case = "enum E(u8) { A = 0, .., .. }");
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::MisplacedOpenMarker,
+			DiagnosticCode::RedundantOpenMarker,
+		]);
+
+		// Nothing is left for it to admit once the variants name every value.
+		let all: Vec<String> =
+			(0..256).map(|n| format!("V{n} = {n}")).collect();
+		let source = format!("enum E(u8) {{ {}, .. }}", all.join(", "));
+		test_case!(case = source.as_str());
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::RedundantOpenMarker]);
+
+		// One value short, it is not.
+		let source = format!("enum E(u8) {{ {}, .. }}", all[1..].join(", "));
+		test_case!(case = source.as_str());
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn an_open_enum_missing_arm_is_a_wildcard() {
+		test_case!(
+			case = indoc! {"
+				enum Open(u8) { A = 0, .. }
+				func named(o: Open) -> u8 {
+					match o { Open::A => { 1 } }
+				}
+			"}
+		);
+		case.diagnostics().assert_error_saying("pattern `_`");
+	}
+
+	#[test]
 	fn a_struct_pattern_of_its_fields_as_one_value_counts_for_exhaustiveness() {
 		test_case!(
 			case = indoc! {"

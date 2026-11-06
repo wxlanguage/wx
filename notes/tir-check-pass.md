@@ -238,23 +238,23 @@ Two structs in `solver.rs`, with `TypeContext` holding only the second:
 `Solver::normalize` is the cache layer and `normalize_uncached` the
 computation, so the computation knows nothing about the cache.
 
-### The solver is scoped by a view
+### The solver's state is separate from its queries
 
 Normalization and impl selection recurse into each other, so they are one
-engine, and all of it lives on `Solver` in `solver.rs`:
-`normalize*`, `find_trait_impl_query`, `check_assumed_trait`,
-`match_trait_impl_candidate_query`, `match_impl_target_and_bounds`,
-`projection_equality`. Every method takes a `SolverView<'_>`, a temporary struct
-lent by `TypeContext::solver_and_view()` that holds exactly what the engine reads: the
-interner (the one thing it extends) and read-only `defs`, `impl_dispatch`,
-`traits`, `trait_impls`, `assoc_types`, `param_bounds`, `type_envs`. Diagnostics,
-strings, the query engine, `query_state` and the other signature tables are
-absent, so the solver can neither report nor construct, and the compiler
-enforces it. `TypeContext` keeps thin wrappers (`normalize_*_query`,
-`find_trait_impl_query`, `check_assumed_trait`, `match_impl_target_and_bounds`)
-for the rest of `tir`; the impl-based ones also `debug_assert` that no signature
-is being built. The cluster was measured, not guessed: it touched those eight
-tables, its own state, and `query_stack` for that one assertion.
+engine: `normalize*`, `find_trait_impl_query`, `satisfies_clauses`,
+`stack_value_repr` and the rest are methods of `TypeContext` in `solver.rs`
+(and `eval.rs` for constant values). What the engine keeps lives in a plain
+`Solver` struct: the derivation in flight (`SolverState`), the normalization
+cache, the `Verdict`s, layouts and constant values. `tir::check`/`tir::build`
+create it and lend it to the context as `&mut Solver`, so it outlives every
+context, and it is reached through the context so that a query can re-enter
+body checking.
+
+An earlier design lent the engine a restricted `SolverView` so that it could
+neither report nor construct. That struct no longer exists. The same property
+now holds by convention: a query returns `Result<_, SolverError>` and the
+construct that owns the requirement reports it (`overflow_diagnostic`,
+`cycle_diagnostic` in `obligations.rs`).
 
 The cache is a pure performance cache with no diagnostic meaning, keyed by `(assumption_context: TypeEnvIdx, TypeIndex, Mode)`:
 

@@ -2845,7 +2845,7 @@ pub fn build(
 // 			NamespaceKind::Package(_) => {
 // 				let target = self.namespaces[usize::from(namespace)].package_id;
 // 				if target == from_package {
-// 					ast::Keyword::Crate.symbol()
+// 					ast::Keyword::Package.symbol()
 // 				} else {
 // 					packages[from_package.as_usize()].dependency_names[&target]
 // 				}

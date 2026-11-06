@@ -277,7 +277,7 @@ impl Intrinsic {
 #[cfg(test)]
 mod tests {
 	use super::Intrinsic;
-	use crate::tir::defs::{CrateMemberItem, DefinitionRegistry, Tier};
+	use crate::tir::defs::{DefinitionRegistry, PackageMemberItem, Tier};
 	use crate::tir::resolutions::NameResolutions;
 
 	#[test]
@@ -297,10 +297,10 @@ mod tests {
 		assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 		let mut seen = Vec::new();
 		for (key, member) in
-			&defs.crate_contracts[graph.stdlib_package.as_usize()].members
+			&defs.package_contracts[graph.stdlib_package.as_usize()].members
 		{
 			if key.tier != Tier::Value
-				|| !matches!(member.item, CrateMemberItem::Function(_))
+				|| !matches!(member.item, PackageMemberItem::Function(_))
 			{
 				continue;
 			}

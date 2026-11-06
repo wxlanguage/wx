@@ -30,10 +30,11 @@
 //! constants holding data, addresses in constants and globals) is the
 //! evaluator's value, its allocations MIR's static entries (`statics.rs`);
 //! a pointer to a slice is its address and its count; `Memory::DATA_END` is
-//! resolved by codegen once the data is laid out. Indexing, calls the
-//! compiler implements (`notes/static-data.md`),
-//! function references, and float equality tests (floats have no total
-//! equality) are not lowered yet. Every other checked form is reported as
+//! resolved by codegen once the data is laid out. Indexing and the calls the
+//! compiler implements (`notes/static-data.md`) are lowered. Function
+//! references (`call_ref`, function types), constants of function or vector
+//! type, a slice that is a field (an unsized tail) and float constant patterns
+//! (floats have no total equality) are not lowered yet. Every other checked form is reported as
 //! `UnsupportedExpression`; no unsupported form becomes `Noop` and no
 //! unsupported form disappears from the output.
 
@@ -509,7 +510,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					self.context
 						.ast_node(super::defs::DefId::Function(function)),
 					super::defs::AstNodeRef::Function {
-						item: crate::ast::Item::CrateFunction { .. },
+						item: crate::ast::Item::PackageFunction { .. },
 						..
 					}
 				);
@@ -2577,6 +2578,36 @@ mod tests {
 	}
 
 	#[test]
+	fn a_value_no_variant_names_reaches_an_open_enums_wildcard() {
+		let program = |dots: &str, last: &str| {
+			format!(
+				r#"
+				enum E(u8) {{ A = 0, B = 1, {dots} }}
+				func f(x: u8) -> u32 {{
+					match transmute::<u8, E>(x) {{ E::A => 10, E::B => 20, {last} }}
+				}}
+				export {{ f as "f" }}
+			"#
+			)
+		};
+		let (mut store, instance) = instantiate(&program("..", "_ => 30"));
+		let f = instance
+			.get_typed_func::<u32, u32>(&mut store, "f")
+			.unwrap();
+		assert_eq!(f.call(&mut store, 0).unwrap(), 10);
+		assert_eq!(f.call(&mut store, 1).unwrap(), 20);
+		assert_eq!(f.call(&mut store, 7).unwrap(), 30);
+
+		// Closed, the same value is a hazard that traps.
+		let (mut store, instance) = instantiate(&program("", ""));
+		let f = instance
+			.get_typed_func::<u32, u32>(&mut store, "f")
+			.unwrap();
+		assert_eq!(f.call(&mut store, 1).unwrap(), 20);
+		assert!(f.call(&mut store, 7).is_err());
+	}
+
+	#[test]
 	fn an_exported_intrinsic_is_its_expansion_over_its_parameters() {
 		let source = r#"
 			use std::{
@@ -3378,7 +3409,7 @@ mod tests {
 	fn unavailable_function_implementations_are_explicit_diagnostics() {
 		for (source, message) in [
 			(
-				r#"crate func trap() -> !; func run() -> ! { trap() } export { run as "run" }"#,
+				r#"package func trap() -> !; func run() -> ! { trap() } export { run as "run" }"#,
 				"unfulfilled package function",
 			),
 			(

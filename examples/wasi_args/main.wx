@@ -1,91 +1,22 @@
-// WASI Preview 1 command-line arguments — queries the size of the argv
-// buffer, allocates it, fills it in, and prints each argument on its own
-// line. See run.mjs for the actual argv the host hands to the guest.
-
-crate "alloc" as alloc;
-
-#[memory_limits({ min_pages: 1 })]
-memory heap: u32;
-
-enum FileDescriptor(u32) {
-    Stdout = 1,
-}
-
-// WASI Preview 1 encodes every result as `__wasi_errno_t` (a u16, passed as
-// i32 at the raw wasm ABI boundary): 0 always means success, and every other
-// value names a specific failure. These examples only ever care about the
-// success/failure distinction, so `Success` is the only variant declared —
-// see the WASI Preview 1 spec for the full errno list.
-enum Errno(i32) {
-    Success = 0,
-}
-
-import "wasi_snapshot_preview1" as wasi {
-    use super::{heap, Errno, FileDescriptor};
-    func args_sizes_get(argc: heap::*u32, argv_buf_size: heap::*u32) -> Errno;
-    func args_get(argv: heap::*heap::&u8, argv_buf: heap::*u8) -> Errno;
-    func fd_write(
-        fd: FileDescriptor,
-        io_vecs: heap::&[heap::&[u8]],
-        bytes_written: heap::*u32,
-    ) -> Errno;
-}
-
-/// The shared bump allocator for `heap`. `bootstrap` places it right after
-/// static data on first use and returns the same allocator afterwards.
-func allocator() -> heap::*alloc::BumpAllocator<heap> {
-    alloc::BumpAllocator::<heap>::bootstrap(heap)
-}
-
-func write_all(fd: FileDescriptor, bytes: heap::&[u8]) {
-    local alloc = allocator();
-    local io_vecs = alloc.allocate_slice_uninit::<heap::&[u8]>(1);
-    io_vecs[0] = bytes;
-    local nwritten = alloc.allocate_value::<u32>(0);
-    if wasi::fd_write(fd, io_vecs.*.&, nwritten) != Errno::Success { trap() };
-}
-
-// WASI argv/environ strings are NUL-terminated C strings; scan forward to
-// find the length before turning a pointer into a wx slice.
-func cstr_len(mut p: heap::&u8) -> u32 {
-    local mut len: u32 = 0;
-    loop {
-        if p.* == 0 { break len };
-        p = RawPtr::from_ref(p).add(1).as_ref();
-        len += 1;
-    }
-}
-
-/// Where `slice`'s elements start: its address, without its length.
-func data_ptr<T: StackValue>(slice: heap::*[T]) -> heap::*T {
-    RawPtr::<heap, T>::from_addr(address(slice)).as_ptr()
-}
+// args: prints each command-line argument on its own line, numbered from 0.
+// With no argument besides the program's name it prints a usage message to
+// standard error and fails.
+package "wasi" as wasi;
+package "fmt" as fmt;
+use wasi::{Fd, heap};
 
 func main() {
-    local alloc = allocator();
-
-    local argc_ptr = alloc.allocate_value::<u32>(0);
-    local argv_buf_size_ptr = alloc.allocate_value::<u32>(0);
-    if wasi::args_sizes_get(argc_ptr, argv_buf_size_ptr) != Errno::Success {
-        trap()
-    }
-
-    local argc = argc_ptr.*;
-    local argv = alloc.allocate_slice_uninit::<heap::&u8>(argc);
-    local argv_buf = alloc.allocate_slice_uninit::<u8>(argv_buf_size_ptr.*);
-    if wasi::args_get(data_ptr(argv), data_ptr(argv_buf)) != Errno::Success {
-        trap()
-    }
-
+    local arena = wasi::arena();
+    local digits = arena.allocate_slice_uninit::<u8>(fmt::DECIMAL_LEN);
+    local arguments = wasi::args(arena);
+    if arguments.len() < 2 { wasi::panic(arena, "usage: args <word>...") };
     local mut i: u32 = 0;
     loop {
-        if i == argc { break };
-
-        local str_ptr = argv[i];
-        local len = cstr_len(str_ptr);
-        write_all(FileDescriptor::Stdout, slice_from_parts(str_ptr, len));
-        write_all(FileDescriptor::Stdout, "\n");
-
+        if i == arguments.len() { break };
+        Fd::Stdout.write(arena, fmt::decimal::<heap>(digits, i));
+        Fd::Stdout.write(arena, ": ");
+        Fd::Stdout.write(arena, arguments[i]);
+        Fd::Stdout.write(arena, "\n");
         i += 1;
     }
 }

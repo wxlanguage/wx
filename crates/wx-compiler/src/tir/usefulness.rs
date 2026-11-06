@@ -55,9 +55,13 @@ pub(super) enum CtorSet {
 	Single,
 	/// A finite set of values, all listed: an enum's variants'.
 	Listed(Vec<u64>),
+	/// Some values listed, and the rest: every other value of the type, as
+	/// one constructor no pattern but a wildcard covers (an open enum's
+	/// variants, and every number they do not name).
+	Open(Vec<u64>),
 	/// `count` values, in order from `0` up, too many to list: an integer's
-	/// (by their bits), `Char`'s (valid scalar values, by their code point).
-	Counted { count: u128, valid: fn(u64) -> bool },
+	/// (by their bits).
+	Counted { count: u128 },
 	/// No values at all (`!`): no arm is needed.
 	Empty,
 	/// Values no pattern can list (floats, pointers, type parameters): only a
@@ -145,6 +149,7 @@ pub(super) fn witnesses(
 			let complete = match &set {
 				CtorSet::Single | CtorSet::Empty => true,
 				CtorSet::Listed(all) => all.iter().all(|c| present.contains(c)),
+				CtorSet::Open(_) => false,
 				CtorSet::Counted { count, .. } => {
 					present.len() as u128 == *count
 				}
@@ -194,8 +199,15 @@ pub(super) fn witnesses(
 						.filter(|c| !present.contains(c))
 						.map(|&v| value_witness(v, ty))
 						.collect(),
-					CtorSet::Counted { valid, .. } => (0..)
-						.find(|v| valid(*v) && !present.contains(v))
+					// The variants no row names, then the rest, which none does.
+					CtorSet::Open(all) => all
+						.iter()
+						.filter(|c| !present.contains(c))
+						.map(|&v| value_witness(v, ty))
+						.chain(std::iter::once(Witness::Wild))
+						.collect(),
+					CtorSet::Counted { .. } => (0..)
+						.find(|v| !present.contains(v))
 						.map(|v| vec![value_witness(v, ty)])
 						.unwrap_or_else(|| vec![Witness::Wild]),
 					_ => vec![Witness::Wild],
@@ -351,10 +363,7 @@ mod tests {
 			match ty {
 				PAIR => CtorSet::Single,
 				B => CtorSet::Listed(vec![0, 1]),
-				NIBBLE => CtorSet::Counted {
-					count: 4,
-					valid: |_| true,
-				},
+				NIBBLE => CtorSet::Counted { count: 4 },
 				_ => CtorSet::Unlisted,
 			}
 		}

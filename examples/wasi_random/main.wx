@@ -1,7 +1,7 @@
 // WASI Preview 1 randomness — fills a buffer via random_get and prints it
 // to stdout as a hex string.
 
-crate "alloc" as alloc;
+package "alloc" as alloc;
 
 #[memory_limits({ min_pages: 1 })]
 memory heap: u32;

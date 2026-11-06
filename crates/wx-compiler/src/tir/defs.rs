@@ -46,7 +46,7 @@ struct DefinitionRegistryBuilder<'ast, 'ctx> {
 	imports: Vec<ImportDef>,
 	ast_nodes: Vec<AstEntry<'ast>>,
 	exports: FxHashMap<SymbolU32, ExportEntrySource>,
-	crate_contracts: Vec<CrateContract>,
+	package_contracts: Vec<PackageContract>,
 	traits: Vec<TraitDef>,
 	trait_impls: Vec<TraitImplDef>,
 	inherent_impls: Vec<InherentImplDef>,
@@ -82,11 +82,11 @@ index_newtype!(UsePathIndex);
 index_newtype!(UseItemIndex);
 index_newtype!(PackageInstanceIdx);
 
-/// One package instance, written `crate "key" as alias;`: an instantiation of
+/// One package instance, written `package "key" as alias;`: an instantiation of
 /// a package.
 ///
 /// Every instance is its own instantiation site, so the same package named by
-/// two instances (`crate "math" as a; crate "math" as b;`) is instantiated
+/// two instances (`package "math" as a; package "math" as b;`) is instantiated
 /// twice. Resolution does not yet tell the instances apart: both aliases
 /// bind the package's one namespace. This list is what a stage that must
 /// (emitting a separate copy of the package per instance) walks instead.
@@ -376,17 +376,17 @@ impl AttributeTarget {
 				(Self::Function, attributes)
 			}
 			ast::Item::FunctionDeclaration { attributes, .. }
-			| ast::Item::CrateFunction { attributes, .. } => {
+			| ast::Item::PackageFunction { attributes, .. } => {
 				(Self::BodilessFunction, attributes)
 			}
 			ast::Item::Struct { attributes, .. } => (Self::Struct, attributes),
 			ast::Item::Memory { attributes, .. } => (Self::Memory, attributes),
 			ast::Item::Enum { attributes, .. } => (Self::Enum, attributes),
 			ast::Item::Const { attributes, .. }
-			| ast::Item::CrateConst { attributes, .. } => (Self::Constant, attributes),
+			| ast::Item::PackageConst { attributes, .. } => (Self::Constant, attributes),
 			ast::Item::Global { attributes, .. } => (Self::Global, attributes),
 			ast::Item::TypeAlias { attributes, .. }
-			| ast::Item::CrateType { attributes, .. } => (Self::TypeAlias, attributes),
+			| ast::Item::PackageType { attributes, .. } => (Self::TypeAlias, attributes),
 			ast::Item::Trait { attributes, .. } => (Self::Trait, attributes),
 			ast::Item::TypeSet { attributes, .. } => {
 				(Self::Typeset, attributes)
@@ -462,6 +462,10 @@ pub struct EnumDef {
 	/// the variant before `c` is `c - 1` while that is still in the range. Any
 	/// change to how variants are pushed must keep them together.
 	pub variants: Range<ConstIdx>,
+	/// The first `..` in the body, if there is one: the variants name some of
+	/// the enum's values and every value of its repr is valid. A `..` is not
+	/// a variant and has no constant.
+	pub open: Option<TextSpan>,
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
@@ -824,19 +828,19 @@ pub(super) struct ExportEntrySource {
 /// modules in which their names are visible. A free function claims both
 /// tiers, as it does in its module's ordinary symbol table.
 #[derive(Default)]
-pub(super) struct CrateContract {
-	pub(super) members: FxHashMap<BindingKey, CrateMember>,
+pub(super) struct PackageContract {
+	pub(super) members: FxHashMap<BindingKey, PackageMember>,
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CrateMember {
-	pub(super) item: CrateMemberItem,
+pub(super) struct PackageMember {
+	pub(super) item: PackageMemberItem,
 	pub(super) namespace: Scope,
 	pub(super) source: SourceSpan,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CrateMemberItem {
+pub(super) enum PackageMemberItem {
 	Function(FunctionIdx),
 	Constant(ConstIdx),
 	Type(TypeAliasIdx),
@@ -856,7 +860,7 @@ pub(super) struct DefinitionRegistry {
 	pub exports: FxHashMap<SymbolU32, ExportEntrySource>,
 	/// Package-level contract keys, indexed by `PackageId`.
 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
-	pub(super) crate_contracts: Vec<CrateContract>,
+	pub(super) package_contracts: Vec<PackageContract>,
 	pub traits: Vec<TraitDef>,
 	pub trait_impls: Vec<TraitImplDef>,
 	pub inherent_impls: Vec<InherentImplDef>,
@@ -1111,7 +1115,7 @@ pub enum DefKind {
 	Module(ModuleIdx),
 	Import(ImportIdx),
 	Package(PackageId),
-	/// A package instance, `crate "key" as alias;`: the name it binds. What a path
+	/// A package instance, `package "key" as alias;`: the name it binds. What a path
 	/// continues into is the package it instantiates, which only
 	/// [`Namespaces::entered_by`] can say.
 	PackageInstance(PackageInstanceIdx),
@@ -1316,7 +1320,7 @@ impl ScopeTable {
 	) -> Self {
 		for (name, target) in [
 			(Keyword::SelfLower, Namespace::from(scope)),
-			(Keyword::Crate, Namespace::Package(package_id)),
+			(Keyword::Package, Namespace::Package(package_id)),
 			(Keyword::Super, Namespace::from(parent)),
 		] {
 			symbols.bindings.insert(
@@ -2199,7 +2203,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			));
 			for symbol in [
 				ast::Keyword::SelfLower.symbol(),
-				ast::Keyword::Crate.symbol(),
+				ast::Keyword::Package.symbol(),
 			] {
 				symbols.bindings.insert(
 					BindingKey::ty(symbol),
@@ -2258,9 +2262,9 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			use_paths: Vec::new(),
 			ast_nodes: Vec::new(),
 			exports: FxHashMap::default(),
-			crate_contracts: packages
+			package_contracts: packages
 				.iter()
-				.map(|_| CrateContract::default())
+				.map(|_| PackageContract::default())
 				.collect(),
 			intrinsics: IntrinsicDefs::default(),
 			pending_named_imports: FxHashMap::default(),
@@ -2301,7 +2305,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			modules: builder.modules,
 			imports: builder.imports,
 			exports: builder.exports,
-			crate_contracts: builder.crate_contracts,
+			package_contracts: builder.package_contracts,
 			traits: builder.traits,
 			trait_impls: builder.trait_impls,
 			inherent_impls: builder.inherent_impls,
@@ -2853,19 +2857,19 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 		file_id: FileId,
 		namespace: Scope,
 		name: Spanned<SymbolU32>,
-		item: CrateMemberItem,
+		item: PackageMemberItem,
 		keys: &[BindingKey],
 	) {
 		let package = self.namespaces.scope(namespace).package_id;
 		let source = SourceSpan::new(file_id, name.span);
-		let member = CrateMember {
+		let member = PackageMember {
 			item,
 			namespace,
 			source,
 		};
 		let mut reported = Vec::new();
 		for &key in keys {
-			let previous = self.crate_contracts[package.as_usize()]
+			let previous = self.package_contracts[package.as_usize()]
 				.members
 				.get(&key)
 				.copied();
@@ -2887,14 +2891,14 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					reported.push(previous.source);
 				}
 			} else {
-				self.crate_contracts[package.as_usize()]
+				self.package_contracts[package.as_usize()]
 					.members
 					.insert(key, member);
 			}
 		}
 	}
 
-	/// Records a package instance, `crate "key" as alias;`, and binds `alias` in its scope
+	/// Records a package instance, `package "key" as alias;`, and binds `alias` in its scope
 	/// to the package the manifest declares under `key`. The binding is as
 	/// visible as the item: private to the scope and everything inside it,
 	/// or public with `pub`, which lets a downstream package name the
@@ -3120,7 +3124,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				pub_span,
 				..
 			}
-			| ast::Item::CrateFunction {
+			| ast::Item::PackageFunction {
 				signature,
 				pub_span,
 				..
@@ -3163,12 +3167,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					function_impls,
 					attributes,
 				});
-				if matches!(item, ast::Item::CrateFunction { .. }) {
+				if matches!(item, ast::Item::PackageFunction { .. }) {
 					self.record_crate_member(
 						file_id,
 						namespace,
 						signature.name,
-						CrateMemberItem::Function(func_index),
+						PackageMemberItem::Function(func_index),
 						&[
 							BindingKey::ty(signature.name.inner),
 							BindingKey::value(signature.name.inner),
@@ -3322,9 +3326,22 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 			ast::Item::Enum {
 				pub_span,
 				name,
-				variants,
+				entries,
 				..
 			} => {
+				// The variants among the entries, in written order, and the
+				// first `..`.
+				let variants: Vec<&ast::EnumVariant> = entries
+					.iter()
+					.filter_map(|entry| match &entry.inner.inner {
+						ast::EnumEntry::Variant(variant) => Some(variant),
+						ast::EnumEntry::Rest => None,
+					})
+					.collect();
+				let open = entries.iter().find_map(|entry| {
+					matches!(entry.inner.inner, ast::EnumEntry::Rest)
+						.then_some(entry.inner.span)
+				});
 				let enum_index =
 					EnumIdx::new(u32::try_from(self.enums.len()).unwrap());
 				let own_namespace = Namespace::Enum(enum_index);
@@ -3337,7 +3354,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 						file_id,
 						namespace,
 						owner: MemberOwner::Free,
-						name: variant.inner.inner.name,
+						name: variant.name,
 					}
 				}));
 				let end_variant =
@@ -3353,6 +3370,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					parent_namespace: namespace,
 					name: *name,
 					variants: first_variant..end_variant,
+					open,
 				});
 				self.namespaces.enums.push(SymbolTable::new(file_id));
 				let def_key = self.push_def(
@@ -3373,8 +3391,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 
 				// A variant's written value is read in the scope around the
 				// enum, like any constant's initializer.
-				for (offset, variant) in variants.iter().enumerate() {
-					let variant = &variant.inner.inner;
+				for (offset, &variant) in variants.iter().enumerate() {
 					let const_index = ConstIdx::new(
 						u32::from(first_variant)
 							+ u32::try_from(offset).unwrap(),
@@ -3404,10 +3421,10 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				}
 			}
 			ast::Item::TypeAlias { pub_span, name, .. }
-			| ast::Item::CrateType { pub_span, name, .. } => {
+			| ast::Item::PackageType { pub_span, name, .. } => {
 				let bodyless = match item {
 					ast::Item::TypeAlias { body, .. } => body.is_none(),
-					ast::Item::CrateType { .. } => true,
+					ast::Item::PackageType { .. } => true,
 					_ => unreachable!(),
 				};
 				let type_alias_index = TypeAliasIdx::new(
@@ -3443,12 +3460,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					namespace,
 					name: *name,
 				});
-				if matches!(item, ast::Item::CrateType { .. }) {
+				if matches!(item, ast::Item::PackageType { .. }) {
 					self.record_crate_member(
 						file_id,
 						namespace,
 						*name,
-						CrateMemberItem::Type(type_alias_index),
+						PackageMemberItem::Type(type_alias_index),
 						&[BindingKey::ty(name.inner)],
 					);
 				}
@@ -3500,7 +3517,7 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Const { pub_span, name, .. }
-			| ast::Item::CrateConst { pub_span, name, .. } => {
+			| ast::Item::PackageConst { pub_span, name, .. } => {
 				let const_index =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				self.constants.push(ConstDef {
@@ -3519,12 +3536,12 @@ impl<'ast, 'ctx> DefinitionRegistryBuilder<'ast, 'ctx> {
 					Binding::definition(def_key, Visibility::from(*pub_span)),
 					name.span,
 				);
-				if matches!(item, ast::Item::CrateConst { .. }) {
+				if matches!(item, ast::Item::PackageConst { .. }) {
 					self.record_crate_member(
 						file_id,
 						namespace,
 						*name,
-						CrateMemberItem::Constant(const_index),
+						PackageMemberItem::Constant(const_index),
 						&[BindingKey::value(name.inner)],
 					);
 				}
@@ -4753,37 +4770,37 @@ mod tests {
 	fn crate_contract_records_binding_tiers_across_modules() {
 		let case = TestCase::new(indoc! {"
 			mod first {
-				pub crate type Shared;
-				pub crate func compute(x: i32) -> i32;
+				pub package type Shared;
+				pub package func compute(x: i32) -> i32;
 			}
 			mod second {
-				crate const Shared: i32;
+				package const Shared: i32;
 			}
 		"});
 		case.diagnostics().assert_none();
 		let contract =
-			&case.defs.crate_contracts[case.graph.root_package.as_usize()];
+			&case.defs.package_contracts[case.graph.root_package.as_usize()];
 		let shared = case.graph.strings.get("Shared").unwrap();
 		let compute = case.graph.strings.get("compute").unwrap();
 		assert!(matches!(
 			contract.members[&BindingKey::ty(shared)].item,
-			CrateMemberItem::Type(_)
+			PackageMemberItem::Type(_)
 		));
 		assert!(matches!(
 			contract.members[&BindingKey::value(shared)].item,
-			CrateMemberItem::Constant(_)
+			PackageMemberItem::Constant(_)
 		));
 		let ty = contract.members[&BindingKey::ty(compute)];
 		let value = contract.members[&BindingKey::value(compute)];
-		assert!(matches!(ty.item, CrateMemberItem::Function(_)));
+		assert!(matches!(ty.item, PackageMemberItem::Function(_)));
 		assert_eq!(ty.source, value.source);
 	}
 
 	#[test]
 	fn crate_contract_rejects_duplicate_keys_in_different_modules() {
 		let case = TestCase::new(indoc! {"
-			mod first { crate type Shared; }
-			mod second { crate type Shared; }
+			mod first { package type Shared; }
+			mod second { package type Shared; }
 		"});
 		let duplicates: Vec<_> = case
 			.diagnostics
@@ -5348,7 +5365,7 @@ mod tests {
 		);
 		let root = DefKind::Package(case.defs.root_package);
 		assert_eq!(
-			case.resolve(Tier::Type, "host::crate").expect_success(),
+			case.resolve(Tier::Type, "host::package").expect_success(),
 			root
 		);
 		assert_eq!(
@@ -6053,7 +6070,7 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod b {
-				use crate::a::*;
+				use package::a::*;
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -6087,7 +6104,7 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod m {
-				use crate::a::*;
+				use package::a::*;
 				mod inner {}
 			}
 		"});
@@ -6126,7 +6143,7 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod hub {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -6179,8 +6196,8 @@ mod tests {
 				pub func pick() -> i32 { 2 }
 			}
 			mod hub {
-				pub use crate::a::*;
-				pub use crate::b::*;
+				pub use package::a::*;
+				pub use package::b::*;
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -6215,7 +6232,7 @@ mod tests {
 				pub func pick() -> i32 { 1 }
 			}
 			mod hub {
-				pub use crate::a::*;
+				pub use package::a::*;
 				func pick() -> i32 { 2 }
 			}
 		"});
@@ -6518,7 +6535,7 @@ mod tests {
 		assert!(diagnostics.is_empty(), "{diagnostics:?}");
 	}
 
-	// ── package instances (`crate "key" as alias;`) ─────────────────────────
+	// ── package instances (`package "key" as alias;`) ─────────────────────────
 
 	/// A real project on virtual files: `/app` is the root, and every
 	/// `wx.json` is read, so a package instance looks its key up in an actual
@@ -6550,7 +6567,7 @@ mod tests {
 	fn a_package_instance_binds_its_alias_to_the_declared_package() {
 		let mut case = manifest_case(&[
 			("/app/wx.json", APP_WITH_MATH),
-			("/app/main.wx", r#"crate "math" as m;"#),
+			("/app/main.wx", r#"package "math" as m;"#),
 			("/math/wx.json", MATH_MANIFEST),
 			("/math/main.wx", MATH_SOURCE),
 		]);
@@ -6579,7 +6596,7 @@ mod tests {
 			("/app/wx.json", APP_WITH_MATH),
 			(
 				"/app/main.wx",
-				r#"crate "math" as math; pub crate "math" as math2;"#,
+				r#"package "math" as math; pub package "math" as math2;"#,
 			),
 			("/math/wx.json", MATH_MANIFEST),
 			("/math/main.wx", MATH_SOURCE),
@@ -6623,7 +6640,7 @@ mod tests {
 			("/app/wx.json", APP_WITH_MATH),
 			(
 				"/app/main.wx",
-				r#"mod outer { pub mod inner { pub crate "math" as m; } }"#,
+				r#"mod outer { pub mod inner { pub package "math" as m; } }"#,
 			),
 			("/math/wx.json", MATH_MANIFEST),
 			("/math/main.wx", MATH_SOURCE),
@@ -6644,7 +6661,7 @@ mod tests {
 	fn a_private_package_instance_is_not_visible_outside_its_module() {
 		let mut case = manifest_case(&[
 			("/app/wx.json", APP_WITH_MATH),
-			("/app/main.wx", r#"pub mod inner { crate "math" as m; }"#),
+			("/app/main.wx", r#"pub mod inner { package "math" as m; }"#),
 			("/math/wx.json", MATH_MANIFEST),
 			("/math/main.wx", MATH_SOURCE),
 		]);
@@ -6672,7 +6689,7 @@ mod tests {
 		let files = |mid_source: &'static str| {
 			vec![
 				("/app/wx.json", app),
-				("/app/main.wx", r#"crate "mid" as mid;"#),
+				("/app/main.wx", r#"package "mid" as mid;"#),
 				("/mid/wx.json", mid),
 				("/mid/main.wx", mid_source),
 				("/math/wx.json", MATH_MANIFEST),
@@ -6680,7 +6697,8 @@ mod tests {
 			]
 		};
 
-		let mut public = manifest_case(&files(r#"pub crate "math" as math;"#));
+		let mut public =
+			manifest_case(&files(r#"pub package "math" as math;"#));
 		public.diagnostics().assert_none();
 		assert!(matches!(
 			public
@@ -6689,7 +6707,7 @@ mod tests {
 			DefKind::Function(_)
 		));
 
-		let mut private = manifest_case(&files(r#"crate "math" as math;"#));
+		let mut private = manifest_case(&files(r#"package "math" as math;"#));
 		private.diagnostics().assert_none();
 		private
 			.resolve(Tier::Value, "mid::math::add")
@@ -6701,7 +6719,7 @@ mod tests {
 	fn a_package_instance_naming_an_undeclared_dependency_is_an_error() {
 		let mut case = manifest_case(&[
 			("/app/wx.json", APP_WITH_MATH),
-			("/app/main.wx", r#"crate "nope" as nope;"#),
+			("/app/main.wx", r#"package "nope" as nope;"#),
 			("/math/wx.json", MATH_MANIFEST),
 			("/math/main.wx", MATH_SOURCE),
 		]);
@@ -6726,8 +6744,8 @@ mod tests {
 	fn a_package_alias_colliding_with_another_name_is_a_duplicate() {
 		// Whichever is written first, the diagnostic points at both sites.
 		for source in [
-			r#"crate "math" as m; struct m();"#,
-			r#"struct m(); crate "math" as m;"#,
+			r#"package "math" as m; struct m();"#,
+			r#"struct m(); package "math" as m;"#,
 		] {
 			let case = manifest_case(&[
 				("/app/wx.json", APP_WITH_MATH),
@@ -6757,7 +6775,7 @@ mod tests {
 	fn a_package_alias_is_a_definition_a_use_can_lead_through() {
 		let mut case = manifest_case(&[
 			("/app/wx.json", APP_WITH_MATH),
-			("/app/main.wx", r#"crate "math" as m; use m::add;"#),
+			("/app/main.wx", r#"package "math" as m; use m::add;"#),
 			("/math/wx.json", MATH_MANIFEST),
 			("/math/main.wx", MATH_SOURCE),
 		]);

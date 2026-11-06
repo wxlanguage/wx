@@ -56,7 +56,7 @@ define_text! {
 		Match   => "match ",
 		Enum    => "enum ",
 		Export  => "export ",
-		Crate   => "crate ",
+		Package => "package ",
 		Block   => "block ",
 		// keywords without trailing space
 		Break       => "break",
@@ -751,7 +751,7 @@ impl<'a> Builder<'a> {
 				items.push(self.text(Text::Semi));
 				self.arena.concat(items)
 			}
-			ast::Item::CrateFunction {
+			ast::Item::PackageFunction {
 				pub_span,
 				attributes,
 				signature,
@@ -762,12 +762,12 @@ impl<'a> Builder<'a> {
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
-				items.push(self.text(Text::Crate));
+				items.push(self.text(Text::Package));
 				self.build_function_signature(&mut items, signature);
 				items.push(self.text(Text::Semi));
 				self.arena.concat(items)
 			}
-			ast::Item::CrateConst {
+			ast::Item::PackageConst {
 				pub_span,
 				attributes,
 				name,
@@ -779,7 +779,7 @@ impl<'a> Builder<'a> {
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
-				items.push(self.text(Text::Crate));
+				items.push(self.text(Text::Package));
 				items.push(self.text(Text::Const));
 				items.push(self.symbol(name.inner));
 				items.push(self.text(Text::ColonSp));
@@ -787,7 +787,7 @@ impl<'a> Builder<'a> {
 				items.push(self.text(Text::Semi));
 				self.arena.concat(items)
 			}
-			ast::Item::CrateType {
+			ast::Item::PackageType {
 				pub_span,
 				attributes,
 				name,
@@ -799,7 +799,7 @@ impl<'a> Builder<'a> {
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
-				items.push(self.text(Text::Crate));
+				items.push(self.text(Text::Package));
 				items.push(self.text(Text::TypeKw));
 				items.push(self.symbol(name.inner));
 				self.build_type_params(&mut items, type_params);
@@ -865,10 +865,10 @@ impl<'a> Builder<'a> {
 				attributes,
 				repr,
 				name,
-				variants,
+				entries,
 				..
 			} => self.build_enum_definition(
-				span, *pub_span, attributes, repr, name, variants,
+				span, *pub_span, attributes, repr, name, entries,
 			),
 			ast::Item::InherentImpl {
 				type_params,
@@ -978,7 +978,7 @@ impl<'a> Builder<'a> {
 				if pub_span.is_some() {
 					parts.push(self.text(Text::Pub));
 				}
-				parts.push(self.text(Text::Crate));
+				parts.push(self.text(Text::Package));
 				parts.push(self.source_text(*package));
 				parts.push(self.text(Text::As));
 				parts.push(self.symbol(alias.inner));
@@ -1664,7 +1664,7 @@ impl<'a> Builder<'a> {
 		attributes: &[ast::Attribute],
 		repr: &Option<Box<ast::Spanned<ast::TypeExpression>>>,
 		name: &ast::Spanned<SymbolU32>,
-		variants: &[ast::Separated<ast::Spanned<ast::EnumVariant>>],
+		entries: &[ast::Separated<ast::Spanned<ast::EnumEntry>>],
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut nodes, attributes);
@@ -1680,43 +1680,73 @@ impl<'a> Builder<'a> {
 		}
 		nodes.push(self.text(Text::SpaceLBrace));
 
-		if !variants.is_empty() {
-			let mut variant_items: Vec<NodeId> = Vec::new();
-			for (index, variant) in variants.iter().enumerate() {
+		// A body of only `..`, with nothing around it: `{ .. }`.
+		if let [only] = entries
+			&& matches!(only.inner.inner, ast::EnumEntry::Rest)
+			&& self
+				.comments
+				.between(span.start, only.inner.span.start)
+				.is_empty()
+			&& self
+				.comments
+				.between(only.inner.span.end, span.end)
+				.is_empty()
+		{
+			nodes.push(self.text(Text::Space));
+			nodes.push(self.text(Text::DotDot));
+			nodes.push(self.text(Text::Space));
+			nodes.push(self.text(Text::RBrace));
+			return self.arena.concat(nodes);
+		}
+
+		if !entries.is_empty() {
+			let mut entry_items: Vec<NodeId> = Vec::new();
+			for (index, entry) in entries.iter().enumerate() {
 				self.push_between(
-					&mut variant_items,
+					&mut entry_items,
 					match index {
 						0 => Before::Opener { from: span.start },
 						_ => Before::Entry {
-							end: variants[index - 1].inner.span.end,
+							end: entries[index - 1].inner.span.end,
 						},
 					},
 					After::Entry {
-						start: variant.inner.span.start,
+						start: entry.inner.span.start,
 					},
 				);
-				let mut vn: Vec<NodeId> =
-					vec![self.symbol(variant.inner.inner.name.inner)];
-				if let Some(value) = &variant.inner.inner.value {
-					vn.push(self.text(Text::EqSp));
-					vn.push(self.build_expression(value));
+				let mut en: Vec<NodeId> = Vec::new();
+				match &entry.inner.inner {
+					ast::EnumEntry::Variant(variant) => {
+						en.push(self.symbol(variant.name.inner));
+						if let Some(value) = &variant.value {
+							en.push(self.text(Text::EqSp));
+							en.push(self.build_expression(value));
+						}
+					}
+					ast::EnumEntry::Rest => en.push(self.text(Text::DotDot)),
 				}
-				if index + 1 < variants.len() {
-					vn.push(self.text(Text::Comma));
-				} else {
-					vn.push(self.if_break_comma());
+				// Entries are separated by commas. The last takes one when the
+				// body breaks, except a `..`, which takes none: it ends the
+				// list, as it does in a pattern.
+				if index + 1 < entries.len() {
+					en.push(self.text(Text::Comma));
+				} else if matches!(
+					entry.inner.inner,
+					ast::EnumEntry::Variant(_)
+				) {
+					en.push(self.if_break_comma());
 				}
-				variant_items.push(self.arena.concat(vn));
+				entry_items.push(self.arena.concat(en));
 			}
 			self.push_between(
-				&mut variant_items,
+				&mut entry_items,
 				Before::Entry {
-					end: variants.last().unwrap().inner.span.end,
+					end: entries.last().unwrap().inner.span.end,
 				},
 				After::End { at: span.end },
 			);
 
-			let concat = self.arena.concat(variant_items);
+			let concat = self.arena.concat(entry_items);
 			nodes.push(self.arena.indent(concat));
 			nodes.push(self.hard_line());
 		} else {

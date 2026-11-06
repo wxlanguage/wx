@@ -613,12 +613,49 @@ impl TypeContext<'_, '_, '_> {
 	pub(super) fn check_discriminants(&mut self, enum_index: EnumIdx) {
 		let enum_def = &self.defs.enums[usize::from(enum_index)];
 		let (file_id, name_span) = (enum_def.file_id, enum_def.name.span);
-		let run = enum_def.variants.clone();
+		let (run, open) = (enum_def.variants.clone(), enum_def.open);
 		let mut values = Vec::new();
 		for variant in u32::from(run.start)..u32::from(run.end) {
 			let variant = ConstIdx::new(variant);
 			if let Ok(&[value]) = self.const_value(variant) {
 				values.push((value, variant));
+			}
+		}
+		// An open enum whose variants already name every value of its repr has
+		// nothing left for its `..` to admit.
+		if let Some(open) = open
+			&& values.len() as u32 == u32::from(run.end) - u32::from(run.start)
+		{
+			let bits: u32 = match self.enum_repr(enum_index) {
+				TypeIndex::U8 | TypeIndex::I8 => 8,
+				TypeIndex::U16 | TypeIndex::I16 => 16,
+				TypeIndex::U32 | TypeIndex::I32 => 32,
+				_ => 64,
+			};
+			let mut distinct: Vec<u64> = values
+				.iter()
+				.map(|(value, _)| match value.val {
+					Val::I32(bits) => u64::from(bits),
+					Val::I64(bits) => bits,
+					_ => unreachable!("an enum's repr is an integer"),
+				})
+				.collect();
+			distinct.sort_unstable();
+			distinct.dedup();
+			if distinct.len() as u128 == 1u128 << bits {
+				self.diagnostics.push(
+					Diagnostic::warning()
+						.with_code(DiagnosticCode::RedundantOpenMarker.code())
+						.with_message("this `..` is redundant")
+						.with_label(
+							SourceSpan::new(file_id, open)
+								.primary_label()
+								.with_message(
+									"the variants already name every value of \
+									 the repr",
+								),
+						),
+				);
 			}
 		}
 		// Every variant has the repr's scalar, an integer, so equal values are

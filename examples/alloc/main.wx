@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//   crate "alloc" as alloc;
+//   package "alloc" as alloc;
 //
 //   func allocator() -> heap::*alloc::BumpAllocator<heap> {
 //       alloc::BumpAllocator::<heap>::bootstrap(heap)
@@ -34,10 +34,11 @@ impl<Mem: Memory> BumpAllocator<Mem> {
     /// signature.
     pub func bootstrap(mem: Mem) -> Mem::*Self {
         local align = align_of::<Self, Mem>();
-        local start = RawPtr::from_ptr(Mem::DATA_END).addr();
-        local mut base = RawPtr::<Mem, u8>::from_addr(start).align_up(align);
-        // Address 0 is `RawPtr::null()`, so never place the allocator there.
-        if base.addr() == 0 { base = RawPtr::<Mem, u8>::from_addr(align) };
+        local end = RawPtr::from_ptr(Mem::DATA_END).addr();
+        // Address 0 is `RawPtr::null()`, so nothing is placed there: with no
+        // static data the first usable address is 1, which aligns up to `align`.
+        local start = if end == 0 { 1 } else { end };
+        local base = RawPtr::<Mem, u8>::from_addr(start).align_up(align);
         local this: Mem::*Self = transmute(base.addr());
         // Wasm memory is zero-initialized and a live `next` is never 0, so a
         // null `next` means "not bootstrapped yet".
@@ -45,6 +46,20 @@ impl<Mem: Memory> BumpAllocator<Mem> {
             this.* = Self::new(mem, base.addr() + size_of::<Self, Mem>());
         }
         this
+    }
+}
+
+impl<Mem: Memory> BumpAllocator<Mem> {
+    /// The current end of the allocations, to give back to `release`.
+    pub func mark(self: Mem::*Self) -> RawPtr<Mem, u8> {
+        self.next
+    }
+
+    /// Frees everything allocated since `mark` returned it, which makes the
+    /// allocator a stack: scratch space a function needs for one call. A
+    /// pointer into what was freed must not be used afterwards.
+    pub func release(self: Mem::*Self, mark: RawPtr<Mem, u8>) {
+        self.next = mark;
     }
 }
 

@@ -6,7 +6,7 @@
 // to a real host directory (./sandbox) via node:wasi's `preopens` option.
 // Paths passed to `path_open` are resolved relative to that directory.
 
-crate "alloc" as alloc;
+package "alloc" as alloc;
 
 #[memory_limits({ min_pages: 1 })]
 memory heap: u32;

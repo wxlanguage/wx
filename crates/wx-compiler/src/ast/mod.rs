@@ -1973,6 +1973,16 @@ pub struct EnumVariant {
 	pub value: Option<Box<Spanned<Expression>>>,
 }
 
+/// An entry of an enum body, as written.
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub enum EnumEntry {
+	Variant(EnumVariant),
+	/// A `..`: the variants name some of the enum's values, and every value of
+	/// its repr is valid. It is not a variant. Where it is written, and how
+	/// many there are, is for the checker to judge.
+	Rest,
+}
+
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Item {
 	Function {
@@ -1987,20 +1997,20 @@ pub enum Item {
 		signature: FunctionSignature,
 	},
 	/// A package contract member whose implementation is supplied externally.
-	CrateFunction {
+	PackageFunction {
 		pub_span: Option<TextSpan>,
 		crate_span: TextSpan,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
 	},
-	CrateConst {
+	PackageConst {
 		pub_span: Option<TextSpan>,
 		crate_span: TextSpan,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		ty: Box<Spanned<TypeExpression>>,
 	},
-	CrateType {
+	PackageType {
 		pub_span: Option<TextSpan>,
 		crate_span: TextSpan,
 		attributes: Box<[Attribute]>,
@@ -2032,7 +2042,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		repr: Option<Box<Spanned<TypeExpression>>>,
 		name: Spanned<SymbolU32>,
-		variants: Box<[Separated<Spanned<EnumVariant>>]>,
+		entries: Box<[Separated<Spanned<EnumEntry>>]>,
 		attributes: Box<[Attribute]>,
 	},
 	/// `impl Type { ... }`
@@ -2082,7 +2092,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 	},
-	/// A package instance, `crate "math" as math;` — instantiates the package the manifest
+	/// A package instance, `package "math" as math;` — instantiates the package the manifest
 	/// declares under the key `"math"` and binds it here as `math`. With
 	/// `pub`, whoever can see this module can also name the package through
 	/// it. Allowed in any module, not just a package's root.
@@ -2156,9 +2166,9 @@ impl Item {
 			Item::Global { .. }
 			| Item::Export { .. }
 			| Item::Const { .. }
-			| Item::CrateFunction { .. }
-			| Item::CrateConst { .. }
-			| Item::CrateType { .. }
+			| Item::PackageFunction { .. }
+			| Item::PackageConst { .. }
+			| Item::PackageType { .. }
 			| Item::Memory { .. }
 			| Item::FunctionDeclaration { .. }
 			| Item::ModuleDeclaration { .. }
@@ -2175,9 +2185,9 @@ impl Item {
 		match self {
 			Item::Function { attributes, .. }
 			| Item::FunctionDeclaration { attributes, .. }
-			| Item::CrateFunction { attributes, .. }
-			| Item::CrateConst { attributes, .. }
-			| Item::CrateType { attributes, .. }
+			| Item::PackageFunction { attributes, .. }
+			| Item::PackageConst { attributes, .. }
+			| Item::PackageType { attributes, .. }
 			| Item::Trait { attributes, .. }
 			| Item::TypeSet { attributes, .. }
 			| Item::Const { attributes, .. }
@@ -2353,7 +2363,7 @@ define_keywords! {
 	Underscore => "_",
 	Use => "use",
 	Where => "where",
-	Crate => "crate",
+	Package => "package",
 	Super => "super",
 	Block => "block",
 }
@@ -2669,7 +2679,7 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Const) => Ok(Parser::parse_const_item),
 			Some(Keyword::Mod) => Ok(Parser::parse_module_item),
 			Some(Keyword::Use) => Ok(Parser::parse_use_item),
-			Some(Keyword::Crate) => Ok(Parser::parse_crate_item),
+			Some(Keyword::Package) => Ok(Parser::parse_crate_item),
 			Some(Keyword::Pub) => Ok(Parser::parse_pub_item),
 			Some(Keyword::Trait) => Ok(Parser::parse_trait_item),
 			Some(Keyword::Typeset) => Ok(Parser::parse_typeset_item),
@@ -3581,7 +3591,7 @@ impl<'ctx> Parser<'ctx> {
 					// `intern_path_segment`) — none of the three are ever
 					// reserved here, so they intern like ordinary text.
 					Ok(Keyword::SelfPascal)
-					| Ok(Keyword::Crate)
+					| Ok(Keyword::Package)
 					| Ok(Keyword::Super) => {
 						let tok = self.lexer.next();
 						let sym = self
@@ -4173,7 +4183,7 @@ impl<'ctx> Parser<'ctx> {
 			Ok(Keyword::SelfLower)
 			| Ok(Keyword::SelfPascal)
 			| Ok(Keyword::Underscore)
-			| Ok(Keyword::Crate)
+			| Ok(Keyword::Package)
 			| Ok(Keyword::Super)
 			| Err(_) => {}
 			Ok(_) => {
@@ -5310,7 +5320,7 @@ impl<'ctx> Parser<'ctx> {
 		let name_span = parser.next_expect(Token::Identifier)?.span;
 		let text = name_span.extract_str(parser.source);
 		let first = match Keyword::try_from(text) {
-			Ok(Keyword::SelfPascal | Keyword::Crate | Keyword::Super) => {
+			Ok(Keyword::SelfPascal | Keyword::Package | Keyword::Super) => {
 				parser.strings.get_or_intern(text)
 			}
 			_ => parser.intern_identifier(name_span),
@@ -5748,12 +5758,20 @@ impl<'ctx> Parser<'ctx> {
 			None
 		};
 
-		let variants = SeparatedGroup {
+		// A `..` is an entry of the body like a variant. Where it stands and
+		// how many there are is judged when the enum's signature is built.
+		let entries = SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
 			item_handler:
-				|parser: &mut Parser| -> Result<Spanned<EnumVariant>, ()> {
+				|parser: &mut Parser| -> Result<Spanned<EnumEntry>, ()> {
+					if let Some(dots) = parser.lexer.next_if(Token::DotDot) {
+						return Ok(Spanned {
+							inner: EnumEntry::Rest,
+							span: dots.span,
+						});
+					}
 					let name_token = parser.next_expect(Token::Identifier)?;
 					let name_symbol = parser.intern_identifier(name_token.span);
 
@@ -5771,13 +5789,13 @@ impl<'ctx> Parser<'ctx> {
 						};
 
 					Ok(Spanned {
-						inner: EnumVariant {
+						inner: EnumEntry::Variant(EnumVariant {
 							name: Spanned {
 								inner: name_symbol,
 								span: name_token.span,
 							},
 							value,
-						},
+						}),
 						span,
 					})
 				},
@@ -5785,7 +5803,7 @@ impl<'ctx> Parser<'ctx> {
 		}
 		.parse(parser)?;
 
-		let span = TextSpan::new(enum_span.start, variants.span.end);
+		let span = TextSpan::new(enum_span.start, entries.span.end);
 
 		Ok(Spanned {
 			inner: Item::Enum {
@@ -5795,7 +5813,7 @@ impl<'ctx> Parser<'ctx> {
 					inner: name_symbol,
 					span: name_span,
 				},
-				variants: variants.inner,
+				entries: entries.inner,
 				attributes: Box::new([]),
 			},
 			span,
@@ -6400,9 +6418,9 @@ impl<'ctx> Parser<'ctx> {
 		match &mut item.inner {
 			Item::Function { pub_span: span, .. }
 			| Item::FunctionDeclaration { pub_span: span, .. }
-			| Item::CrateFunction { pub_span: span, .. }
-			| Item::CrateConst { pub_span: span, .. }
-			| Item::CrateType { pub_span: span, .. }
+			| Item::PackageFunction { pub_span: span, .. }
+			| Item::PackageConst { pub_span: span, .. }
+			| Item::PackageType { pub_span: span, .. }
 			| Item::Global { pub_span: span, .. }
 			| Item::Enum { pub_span: span, .. }
 			| Item::Struct { pub_span: span, .. }
@@ -6679,7 +6697,7 @@ impl<'ctx> Parser<'ctx> {
 		let token = self.next_expect(Token::Identifier)?;
 		let text = token.span.extract_str(self.source);
 		let symbol = match Keyword::try_from(text) {
-			Ok(Keyword::Crate | Keyword::Super | Keyword::SelfLower)
+			Ok(Keyword::Package | Keyword::Super | Keyword::SelfLower)
 			| Err(_) => self.strings.get_or_intern(text),
 			Ok(kwd) => {
 				self.ast.diagnostics.push(report_reserved_identifier(
@@ -6776,7 +6794,7 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// `crate func`, `crate const`, `crate type`, or a package instance.
+	/// `package func`, `package const`, `package type`, or a package instance.
 	fn parse_crate_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let crate_span = parser.lexer.next().span;
 		if parser.lexer.peek().inner == Token::String {
@@ -6793,7 +6811,7 @@ impl<'ctx> Parser<'ctx> {
 					signature.span.end
 				};
 				(
-					Item::CrateFunction {
+					Item::PackageFunction {
 						pub_span: None,
 						crate_span,
 						attributes: Box::new([]),
@@ -6820,7 +6838,7 @@ impl<'ctx> Parser<'ctx> {
 					ty.span.end
 				};
 				(
-					Item::CrateConst {
+					Item::PackageConst {
 						pub_span: None,
 						crate_span,
 						attributes: Box::new([]),
@@ -6851,7 +6869,7 @@ impl<'ctx> Parser<'ctx> {
 					name_span.end
 				};
 				(
-					Item::CrateType {
+					Item::PackageType {
 						pub_span: None,
 						crate_span,
 						attributes: Box::new([]),
@@ -6879,8 +6897,8 @@ impl<'ctx> Parser<'ctx> {
 	fn report_crate_member_body(&mut self, span: TextSpan) {
 		self.ast.diagnostics.push(
 			Diagnostic::error()
-				.with_code(DiagnosticCode::CrateMemberHasBody.code())
-				.with_message("a crate member cannot have a body")
+				.with_code(DiagnosticCode::PackageMemberHasBody.code())
+				.with_message("a package member cannot have a body")
 				.with_label(
 					Label::primary(self.ast.file_id, span)
 						.with_message("remove this body"),
@@ -6888,7 +6906,7 @@ impl<'ctx> Parser<'ctx> {
 		);
 	}
 
-	/// `crate "name" as alias;`. The trailing `;` is left for the caller, like
+	/// `package "name" as alias;`. The trailing `;` is left for the caller, like
 	/// every other item's.
 	fn parse_package_instance(
 		parser: &mut Parser,

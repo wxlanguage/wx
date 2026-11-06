@@ -1,0 +1,8 @@
+{
+    "type": "lib",
+    "entry": "main.wx",
+    "dependencies": {
+        "alloc": { "type": "local", "path": "../alloc" },
+        "slices": { "type": "local", "path": "../slices" }
+    }
+}

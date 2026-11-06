@@ -144,7 +144,7 @@ own clauses do not take part in normalizing each other.
 - **One env, `Pending` until normalized:** every unqualified `T::Name` in the
   function's signature would fail, the impl's own `T` included.
 - **The solver finishes the env on first read:** the solver cannot publish
-  (it reads a `SolverView`), so every reader would need a prepare step or a
+  (its queries do not publish into the signature tables), so every reader would need a prepare step or a
   solver-side table of normalized runs.
 - **Normalizing during construction:** construction neither checks nor
   normalizes, and nothing bounds which signatures a normalization reaches.

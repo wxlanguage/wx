@@ -391,15 +391,16 @@ items:
             span:
               start: 222
               end: 227
-          variants:
+          entries:
             - inner:
                 inner:
-                  name:
-                    inner: 50
-                    span:
-                      start: 234
-                      end: 237
-                  value: ~
+                  Variant:
+                    name:
+                      inner: 50
+                      span:
+                        start: 234
+                        end: 237
+                    value: ~
                 span:
                   start: 234
                   end: 237
@@ -408,18 +409,19 @@ items:
                 end: 238
             - inner:
                 inner:
-                  name:
-                    inner: 51
-                    span:
-                      start: 243
-                      end: 248
-                  value:
-                    inner:
-                      Int:
-                        value: 1
-                    span:
-                      start: 251
-                      end: 252
+                  Variant:
+                    name:
+                      inner: 51
+                      span:
+                        start: 243
+                        end: 248
+                    value:
+                      inner:
+                        Int:
+                          value: 1
+                      span:
+                        start: 251
+                        end: 252
                 span:
                   start: 243
                   end: 252
@@ -428,12 +430,13 @@ items:
                 end: 253
             - inner:
                 inner:
-                  name:
-                    inner: 52
-                    span:
-                      start: 258
-                      end: 262
-                  value: ~
+                  Variant:
+                    name:
+                      inner: 52
+                      span:
+                        start: 258
+                        end: 262
+                    value: ~
                 span:
                   start: 258
                   end: 262

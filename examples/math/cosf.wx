@@ -1,4 +1,4 @@
-use crate::{k_cosf::k_cosf, k_sinf::k_sinf, rem_pio2f::rem_pio2f};
+use package::{k_cosf::k_cosf, k_sinf::k_sinf, rem_pio2f::rem_pio2f};
 
 // Small multiples of pi/2 rounded to double precision.
 const C1_PIO2: f64 = 1. * f64::FRAC_PI_2; // 0x3FF921FB, 0x54442D18

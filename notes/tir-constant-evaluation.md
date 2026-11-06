@@ -90,8 +90,9 @@ is).
   It is read from the same stack as a loop through projections.
 - Normalizing a `Type::Const` evaluates it in place: no retry protocol between
   the solver and `TypeContext`.
-- The solver reads built bodies and builds none. `SolverView` lends it constant
-  signatures, constant bodies, and strings (a string literal's contents).
+- The solver reads built bodies and builds none: it reads constant signatures,
+  constant bodies and strings (a string literal's contents) through the
+  `TypeContext` it is run over.
 - Reporting stays in `TypeContext`: `evaluate_constant` reads the solver's
   state and reports what a constant owns.
 

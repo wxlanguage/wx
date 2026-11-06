@@ -135,11 +135,19 @@ impl BodyContext<'_, '_, '_, '_> {
 				Pat::Ctor(Ctor::Single, lowered)
 			}
 			PatternKind::Int(bits) => value(bits),
+			// `Char` is a struct of its code point, which is what a char
+			// pattern compares.
+			PatternKind::Char(c) if ty == TypeIndex::CHAR => {
+				Pat::Ctor(Ctor::Single, vec![value(u64::from(c))])
+			}
 			PatternKind::Char(c) => value(u64::from(c)),
 			PatternKind::Constant {
 				constant,
 				type_args,
 			} => match self.pattern_constant_value(constant, type_args, ty) {
+				Some(bits) if ty == TypeIndex::CHAR => {
+					Pat::Ctor(Ctor::Single, vec![value(bits)])
+				}
 				Some(bits) => value(bits),
 				None => Pat::Ctor(Ctor::Opaque, Vec::new()),
 			},
@@ -207,6 +215,18 @@ impl BodyContext<'_, '_, '_, '_> {
 			return "_".to_string();
 		};
 		let ty = *ty;
+		if ty == TypeIndex::CHAR {
+			return match fields.as_slice() {
+				[
+					Witness::Ctor {
+						ctor: Ctor::Value(bits),
+						..
+					},
+				] => char::from_u32(*bits as u32)
+					.map_or_else(|| "_".to_string(), |c| format!("{c:?}")),
+				_ => "_".to_string(),
+			};
+		}
 		let fields: Vec<String> = fields
 			.iter()
 			.map(|field| self.render_witness(field))
@@ -223,10 +243,6 @@ impl BodyContext<'_, '_, '_, '_> {
 				_ => format!("({})", fields.join(", ")),
 			};
 		};
-		if ty == TypeIndex::CHAR {
-			return char::from_u32(bits as u32)
-				.map_or_else(|| "_".to_string(), |c| format!("{c:?}"));
-		}
 		if let Some(integer) = Integer::from_type(ty) {
 			if integer.is_signed() {
 				let shift = 64 - integer.mask().count_ones();
@@ -256,29 +272,32 @@ impl BodyContext<'_, '_, '_, '_> {
 
 impl Shapes for BodyContext<'_, '_, '_, '_> {
 	fn ctor_set(&mut self, ty: TypeIndex) -> CtorSet {
-		if ty == TypeIndex::CHAR {
-			return CtorSet::Counted {
-				// Every scalar value but the surrogates.
-				count: 0x11_0000 - 0x800,
-				valid: |value| {
-					u32::try_from(value)
-						.is_ok_and(|v| char::from_u32(v).is_some())
-				},
-			};
-		}
 		if ty == TypeIndex::NEVER {
 			return CtorSet::Empty;
 		}
 		if let Some(integer) = Integer::from_type(ty) {
 			return CtorSet::Counted {
 				count: u128::from(integer.mask()) + 1,
-				valid: |_| true,
 			};
 		}
 		match *self.cx.types.resolve(ty) {
 			Type::Tuple { .. } | Type::Struct { .. } => CtorSet::Single,
 			Type::Enum { enum_index } => {
+				let open =
+					self.cx.defs.enums[usize::from(enum_index)].open.is_some();
+				let range = Integer::from_type(self.cx.enum_repr(enum_index))
+					.map(|integer| u128::from(integer.mask()) + 1);
 				match self.variant_values(enum_index) {
+					// An open enum has the rest of its repr's values, unless
+					// its variants name them all: then it is closed in effect.
+					Some(values)
+						if open
+							&& range.is_none_or(|range| {
+								(values.len() as u128) < range
+							}) =>
+					{
+						CtorSet::Open(values)
+					}
 					Some(values) => CtorSet::Listed(values),
 					None => CtorSet::Unlisted,
 				}

@@ -2,7 +2,7 @@
 // `wasi_snapshot_preview1` module (the raw core-wasm ABI WASI hosts expose),
 // builds a WASI iovec in linear memory, and writes it to fd 1 (stdout).
 
-crate "alloc" as alloc;
+package "alloc" as alloc;
 
 enum FileDescriptor(u8) {
     StdIn = 0,

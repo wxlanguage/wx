@@ -303,9 +303,9 @@ fn item_kind(item: &Item) -> &'static str {
 	match item {
 		Item::Function { .. } => "a function",
 		Item::FunctionDeclaration { .. } => "a function declaration",
-		Item::CrateFunction { .. } => "a crate function",
-		Item::CrateConst { .. } => "a crate constant",
-		Item::CrateType { .. } => "a crate type",
+		Item::PackageFunction { .. } => "a package function",
+		Item::PackageConst { .. } => "a package constant",
+		Item::PackageType { .. } => "a package type",
 		Item::Global { .. } => "a global",
 		Item::Export { .. } => "an export",
 		Item::ExportBlock { .. } => "an export block",
@@ -446,7 +446,7 @@ fn test_enum_repr_after_name() {
 	let Item::Enum {
 		repr,
 		name,
-		variants,
+		entries,
 		..
 	} = case.item(0)
 	else {
@@ -460,7 +460,7 @@ fn test_enum_repr_after_name() {
 			if p.len() == 1
 				&& case.strings.resolve(p[0].ident.inner) == Some("i32")
 	));
-	assert_eq!(variants.len(), 2);
+	assert_eq!(entries.len(), 2);
 }
 
 #[test]
@@ -1453,11 +1453,11 @@ fn an_old_enum_repr_is_reported_and_read_as_the_new_one() {
 	let case = TestCase::new("enum Status: i32 { Foo }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::EnumReprNeedsParentheses]);
-	let Item::Enum { repr, variants, .. } = case.item(0) else {
+	let Item::Enum { repr, entries, .. } = case.item(0) else {
 		panic!("expected enum item")
 	};
 	assert!(repr.is_some());
-	assert_eq!(variants.len(), 1);
+	assert_eq!(entries.len(), 1);
 
 	let case = TestCase::new("enum Status(i32 { Foo }");
 	case.diagnostics()
@@ -2075,7 +2075,7 @@ fn a_pattern_path_starts_where_an_expression_path_can() {
 	let case = TestCase::new(indoc! {"
         func f(p: Point) {
             local Self(a, ..) = p;
-            local crate::geom::Point({ x, .. }) = p;
+            local package::geom::Point({ x, .. }) = p;
             local super::super::Point(b, ..) = p;
         }
     "});
@@ -2084,7 +2084,7 @@ fn a_pattern_path_starts_where_an_expression_path_can() {
 		case.local_patterns(0),
 		[
 			"(Self a ..)",
-			"(crate::geom::Point { x, .. })",
+			"(package::geom::Point { x, .. })",
 			"(super::super::Point b ..)",
 		]
 	);
@@ -2508,8 +2508,8 @@ fn test_external_module_item() {
 #[test]
 fn test_package_instances() {
 	let case = TestCase::new(indoc! {"
-        crate \"math\" as math;
-        pub crate \"math\" as math2;
+        package \"math\" as math;
+        pub package \"math\" as math2;
     "});
 
 	case.diagnostics().assert_none();
@@ -2553,7 +2553,7 @@ fn test_package_instance_in_a_nested_module() {
 	let case = TestCase::new(indoc! {"
         mod outer {
             mod inner {
-                pub crate \"math\" as math;
+                pub package \"math\" as math;
             }
         }
     "});
@@ -2576,7 +2576,7 @@ fn test_package_instance_in_a_nested_module() {
 
 #[test]
 fn test_package_instance_requires_an_alias() {
-	let case = TestCase::new("crate \"math\";");
+	let case = TestCase::new("package \"math\";");
 
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::MissingPackageAlias]);
@@ -3773,25 +3773,25 @@ fn test_bodyless_function_is_a_declaration() {
 #[test]
 fn test_crate_contract_items_parse_and_keep_visibility() {
 	let case = TestCase::new(indoc! {"
-        pub crate type Word;
-        crate const LIMIT: Word;
-        pub crate func choose<T>(value: T) -> T;
-        crate \"math\" as math;
+        pub package type Word;
+        package const LIMIT: Word;
+        pub package func choose<T>(value: T) -> T;
+        package \"math\" as math;
     "});
 	case.diagnostics().assert_none();
 	assert!(matches!(
 		case.item(0),
-		Item::CrateType { pub_span: Some(_), name, .. }
+		Item::PackageType { pub_span: Some(_), name, .. }
 			if case.name(name.inner) == "Word"
 	));
 	assert!(matches!(
 		case.item(1),
-		Item::CrateConst { pub_span: None, name, .. }
+		Item::PackageConst { pub_span: None, name, .. }
 			if case.name(name.inner) == "LIMIT"
 	));
 	assert!(matches!(
 		case.item(2),
-		Item::CrateFunction { pub_span: Some(_), signature, .. }
+		Item::PackageFunction { pub_span: Some(_), signature, .. }
 			if case.name(signature.name.inner) == "choose"
 	));
 	assert!(matches!(case.item(3), Item::PackageInstance { .. }));
@@ -3800,15 +3800,15 @@ fn test_crate_contract_items_parse_and_keep_visibility() {
 #[test]
 fn test_crate_contract_items_reject_bodies() {
 	for source in [
-		"crate func f() {}",
-		"crate const N: i32 = 1;",
-		"crate type T = i32;",
+		"package func f() {}",
+		"package const N: i32 = 1;",
+		"package type T = i32;",
 	] {
 		let case = TestCase::new(source);
 		assert!(
 			case.ast.diagnostics.iter().any(|diagnostic| {
 				diagnostic.code.as_deref()
-					== Some(DiagnosticCode::CrateMemberHasBody.code())
+					== Some(DiagnosticCode::PackageMemberHasBody.code())
 			}),
 			"{source}"
 		);
@@ -4184,4 +4184,32 @@ fn a_block_like_expression_is_not_an_operand() {
 	TestCase::new("func f() { local v = match n { _ => s }.len(); }")
 		.diagnostics()
 		.assert_error_saying("wrap it in parentheses: `(match ..)`");
+}
+
+#[test]
+fn dots_in_an_enum_body_are_an_entry_wherever_they_are_written() {
+	// The parser records `..` as written; where it stands and how many there
+	// are is judged when the enum's signature is built.
+	for (source, shape) in [
+		("enum E(u8) { A, B, .. }", "VVR"),
+		("enum E(u8) { A, B, .., }", "VVR"),
+		("enum E(u8) { A, .., B }", "VRV"),
+		("enum E(u8) { .., .. }", "RR"),
+		("enum E(u8) { .. }", "R"),
+		("enum E(u8) { A, B }", "VV"),
+	] {
+		let case = TestCase::new(source);
+		case.diagnostics().assert_none();
+		let Item::Enum { entries, .. } = case.item(0) else {
+			panic!("expected enum item")
+		};
+		let written: String = entries
+			.iter()
+			.map(|entry| match entry.inner.inner {
+				EnumEntry::Variant(_) => 'V',
+				EnumEntry::Rest => 'R',
+			})
+			.collect();
+		assert_eq!(written, shape, "{source}");
+	}
 }

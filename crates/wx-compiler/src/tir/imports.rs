@@ -1791,7 +1791,7 @@ mod tests {
 				use self::helper as via_self;
 				mod inner {
 					use super::helper as via_super;
-					use crate::outer::helper as via_crate;
+					use package::outer::helper as via_crate;
 				}
 			}
 		"});
@@ -1933,11 +1933,11 @@ mod tests {
 		// facts.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				use crate::b::*;
+				use package::b::*;
 			}
 
 			mod b {
-				use crate::a::*;
+				use package::a::*;
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -1952,7 +1952,7 @@ mod tests {
 	#[test]
 	fn self_targeting_pub_glob_reports_cyclic_import() {
 		let case = TestCase::new(indoc! {"
-			pub use crate::*;
+			pub use package::*;
 		"});
 
 		case.diagnostics()
@@ -1970,10 +1970,10 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod b {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 			mod c {
-				pub use crate::b::*;
+				pub use package::b::*;
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -1996,7 +1996,7 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod b {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 			use b::helper;
 		"});
@@ -2019,7 +2019,7 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod b {
-				use crate::a::*;
+				use package::a::*;
 			}
 			use b::helper;
 		"});
@@ -2038,8 +2038,8 @@ mod tests {
 				pub func pick() -> i32 { 2 }
 			}
 			mod hub {
-				pub use crate::a::*;
-				pub use crate::b::*;
+				pub use package::a::*;
+				pub use package::b::*;
 			}
 			use hub::pick;
 		"});
@@ -2060,8 +2060,8 @@ mod tests {
 				pub const pick: i32 = 2;
 			}
 			mod hub {
-				pub use crate::a::*;
-				pub use crate::b::*;
+				pub use package::a::*;
+				pub use package::b::*;
 			}
 			use hub::pick;
 		"});
@@ -2103,14 +2103,14 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod b {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 			mod c {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 			mod d {
-				pub use crate::b::*;
-				pub use crate::c::*;
+				pub use package::b::*;
+				pub use package::c::*;
 			}
 			use d::helper;
 		"});
@@ -2137,11 +2137,11 @@ mod tests {
 				pub func helper() -> i32 { 1 }
 			}
 			mod broken {
-				pub use crate::a::nonexistent_fn as helper;
+				pub use package::a::nonexistent_fn as helper;
 			}
 			mod d {
-				pub use crate::a::*;
-				pub use crate::broken::*;
+				pub use package::a::*;
+				pub use package::broken::*;
 			}
 			use d::helper;
 		"});
@@ -2163,10 +2163,10 @@ mod tests {
 				pub func something_else() -> i32 { 1 }
 			}
 			mod broken {
-				pub use crate::a::nonexistent_fn as helper;
+				pub use package::a::nonexistent_fn as helper;
 			}
 			mod hub {
-				pub use crate::broken::*;
+				pub use package::broken::*;
 			}
 			use hub::helper;
 		"});
@@ -2189,8 +2189,8 @@ mod tests {
 				func pick() -> i32 { 2 }
 			}
 			mod hub {
-				pub use crate::a::*;
-				pub use crate::b::*;
+				pub use package::a::*;
+				pub use package::b::*;
 			}
 			use hub::pick;
 		"});
@@ -2223,8 +2223,8 @@ mod tests {
 				func pick() -> i32 { 2 }
 			}
 			mod hub {
-				pub use crate::b::*;
-				pub use crate::a::*;
+				pub use package::b::*;
+				pub use package::a::*;
 			}
 			use hub::pick;
 		"});
@@ -2365,8 +2365,8 @@ mod tests {
 				pub func pick() -> i32 { 2 }
 			}
 			mod hub {
-				pub use crate::a::*;
-				pub use crate::b::*;
+				pub use package::a::*;
+				pub use package::b::*;
 			}
 		"});
 		case.diagnostics().assert_none();
@@ -2380,13 +2380,13 @@ mod tests {
 		// three hops instead of two.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub use crate::b::*;
+				pub use package::b::*;
 			}
 			mod b {
-				pub use crate::c::*;
+				pub use package::c::*;
 			}
 			mod c {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 		"});
 
@@ -2471,10 +2471,10 @@ mod tests {
 		// straight back and forth between `a` and `b` forever.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub use crate::b::*;
+				pub use package::b::*;
 			}
 			mod b {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 			use a::whatever;
 		"});
@@ -2491,7 +2491,7 @@ mod tests {
 		// before recursive lookup can enter it.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				use crate::a::inner::*;
+				use package::a::inner::*;
 				mod inner {
 					use super::*;
 					use undefined_name;
@@ -2513,11 +2513,11 @@ mod tests {
 		// by any single accessor, so they're deliberately left standing).
 		let case = TestCase::new(indoc! {"
 			mod a {
-				use crate::b::*;
+				use package::b::*;
 				pub func only_in_a() -> i32 { 1 }
 			}
 			mod b {
-				use crate::a::*;
+				use package::a::*;
 				use only_in_a as selected;
 			}
 		"});
@@ -2577,10 +2577,10 @@ mod tests {
 		// import", "this glob import depends on itself").
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub use crate::b::*;
+				pub use package::b::*;
 			}
 			mod b {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 		"});
 
@@ -2617,7 +2617,7 @@ mod tests {
 
 				assert!(
 					diagnostic.notes.iter().any(|note| note
-						== "cycle: `crate::b::*` -> `crate::a::*` -> `crate::b::*`"),
+						== "cycle: `package::b::*` -> `package::a::*` -> `package::b::*`"),
 					"expected the full chain in a note, got: {:?}",
 					diagnostic.notes
 				);
@@ -2634,13 +2634,13 @@ mod tests {
 		// target path repeated at the end of the `cycle: ...` note.
 		let case = TestCase::new(indoc! {"
 			mod a {
-				pub use crate::b::*;
+				pub use package::b::*;
 			}
 			mod b {
-				pub use crate::c::*;
+				pub use package::c::*;
 			}
 			mod c {
-				pub use crate::a::*;
+				pub use package::a::*;
 			}
 		"});
 
@@ -2677,8 +2677,8 @@ mod tests {
 
 				assert!(
 					diagnostic.notes.iter().any(|note| {
-						note == "cycle: `crate::b::*` -> `crate::c::*` -> \
-						         `crate::a::*` -> `crate::b::*`"
+						note == "cycle: `package::b::*` -> `package::c::*` -> \
+						         `package::a::*` -> `package::b::*`"
 					}),
 					"expected the full chain in a note, got: {:?}",
 					diagnostic.notes

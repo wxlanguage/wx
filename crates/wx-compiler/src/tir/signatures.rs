@@ -1848,7 +1848,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 		let value = match entry.node {
 			AstNodeRef::Constant { item, .. } => match item {
 				ast::Item::Const { value, .. } => value,
-				ast::Item::CrateConst { .. } => {
+				ast::Item::PackageConst { .. } => {
 					self.const_bodies[usize::from(const_index)] =
 						ConstBody::Missing;
 					return;
@@ -2175,7 +2175,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						body,
 						..
 					} => (name, type_params, body.as_deref(), false),
-					ast::Item::CrateType {
+					ast::Item::PackageType {
 						name, type_params, ..
 					} => (name, type_params, None, true),
 					_ => unreachable!(),
@@ -2241,7 +2241,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			AstNodeRef::Constant { const_index, item } => {
 				let (name, ty) = match item {
 					ast::Item::Const { name, ty, .. } => (*name, ty.as_deref()),
-					ast::Item::CrateConst { name, ty, .. } => {
+					ast::Item::PackageConst { name, ty, .. } => {
 						(*name, Some(ty.as_ref()))
 					}
 					_ => unreachable!(),
@@ -2752,14 +2752,14 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			} => {
 				let (ast::Item::Function { signature, .. }
 				| ast::Item::FunctionDeclaration { signature, .. }
-				| ast::Item::CrateFunction { signature, .. }) = item
+				| ast::Item::PackageFunction { signature, .. }) = item
 				else {
 					unreachable!()
 				};
 				// Only the compiler-created std package is fulfilled. Other
 				// package contracts remain declarations; general instantiation
 				// is not modeled.
-				if matches!(item, ast::Item::CrateFunction { .. })
+				if matches!(item, ast::Item::PackageFunction { .. })
 					&& self.defs.namespaces.scope(namespace).package_id
 						== self.defs.stdlib_package
 				{
@@ -2984,7 +2984,13 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				SignatureLocation::TraitImpl(block_index)
 			}
 			AstNodeRef::Enum { enum_index, item } => {
-				let ast::Item::Enum { repr, name, .. } = item else {
+				let ast::Item::Enum {
+					repr,
+					name,
+					entries,
+					..
+				} = item
+				else {
 					unreachable!()
 				};
 
@@ -3035,6 +3041,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 						TypeIndex::ERROR
 					}
 				};
+
+				self.diagnostics
+					.extend(report_open_markers(file_id, entries));
 
 				self.enums[usize::from(enum_index)] =
 					EnumSignature { repr: repr_type };
@@ -3218,8 +3227,11 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				infer_policy,
 			)),
 			None => {
-				self.diagnostics
-					.push(report_pointer_without_memory(scope.file_id, span));
+				self.diagnostics.push(report_pointer_without_memory(
+					self.files,
+					scope.file_id,
+					span,
+				));
 				Err(())
 			}
 		}
@@ -5347,6 +5359,57 @@ fn report_missing_enum_repr(
 		)
 }
 
+/// What the written `..` of an enum body get wrong without changing its
+/// meaning: any `..` opens the enum, so a second one adds nothing, and one
+/// that entries follow is easy to miss. A `..` is also redundant when the
+/// variants already name every value, which needs their values, so
+/// `check_discriminants` decides that.
+fn report_open_markers(
+	file_id: FileId,
+	entries: &[ast::Separated<ast::Spanned<ast::EnumEntry>>],
+) -> Vec<Diagnostic<FileId>> {
+	let rests: Vec<(usize, TextSpan)> = entries
+		.iter()
+		.enumerate()
+		.filter(|(_, entry)| matches!(entry.inner.inner, ast::EnumEntry::Rest))
+		.map(|(at, entry)| (at, entry.inner.span))
+		.collect();
+	let mut reports = Vec::new();
+	let Some(&(first_at, first)) = rests.first() else {
+		return reports;
+	};
+	if first_at + 1 != entries.len() {
+		reports.push(
+			Diagnostic::warning()
+				.with_code(DiagnosticCode::MisplacedOpenMarker.code())
+				.with_message("`..` should be the last entry of an enum body")
+				.with_label(
+					SourceSpan::new(file_id, first)
+						.primary_label()
+						.with_message("entries follow it"),
+				),
+		);
+	}
+	for &(_, span) in &rests[1..] {
+		reports.push(
+			Diagnostic::warning()
+				.with_code(DiagnosticCode::RedundantOpenMarker.code())
+				.with_message("this `..` is redundant")
+				.with_label(
+					SourceSpan::new(file_id, span)
+						.primary_label()
+						.with_message("an earlier `..` already opens the enum"),
+				)
+				.with_label(
+					SourceSpan::new(file_id, first)
+						.secondary_label()
+						.with_message("the enum is open here"),
+				),
+		);
+	}
+	reports
+}
+
 fn report_missing_type_alias_body(
 	file_id: FileId,
 	span: TextSpan,
@@ -5459,22 +5522,27 @@ fn report_missing_constant_type(
 		)
 }
 
+/// The help repeats the pointer type as written, read from the source, so
+/// the suggestion can be pasted in.
 fn report_pointer_without_memory(
+	files: &Files,
 	file_id: FileId,
 	span: TextSpan,
 ) -> Diagnostic<FileId> {
+	let written = files
+		.get(file_id)
+		.ok()
+		.and_then(|file| {
+			file.source.get(span.start as usize..span.end as usize)
+		})
+		.unwrap_or("*T");
 	Diagnostic::error()
 		.with_code(DiagnosticCode::PointerWithoutMemory.code())
-		.with_message("a pointer type must name its memory")
-		.with_label(
-			SourceSpan::new(file_id, span)
-				.primary_label()
-				.with_message("no memory written here"),
-		)
-		.with_note(
-			"write the memory before the sigil: `heap::*T`, or a memory \
-			 parameter `Mem::*T`",
-		)
+		.with_message("missing memory in pointer type")
+		.with_label(SourceSpan::new(file_id, span).primary_label())
+		.with_note(format!(
+			"help: write the memory before the pointer, like `heap::{written}`"
+		))
 }
 
 #[cfg(test)]
@@ -9606,7 +9674,7 @@ pub(super) mod tests {
 			case = indoc! {r#"
 			use std::trap as stop;
 			func trap() -> i32 { 42 }
-			crate func i32_add(a: i32, b: i32) -> i32;
+			package func i32_add(a: i32, b: i32) -> i32;
 			func missing();
 			import "env" as host { func trap() -> i32; }
 			trait Requirement: StackValue {
@@ -9679,7 +9747,7 @@ pub(super) mod tests {
 			type u32;
 			enum Bool(u8) { False = 0, True = 1 }
 			struct Char(value: u32);
-			mod operations { pub crate func trap() -> !; }
+			mod operations { pub package func trap() -> !; }
 			func f32_sqrt();
 		"});
 		case.diagnostics().assert_none();
@@ -9714,7 +9782,7 @@ pub(super) mod tests {
 			type u32;
 			enum Bool(u8) { False = 0, True = 1 }
 			struct Char(value: u32);
-			crate func unknown_operation();
+			package func unknown_operation();
 		"});
 		let _ = case;
 	}
@@ -9723,9 +9791,9 @@ pub(super) mod tests {
 	fn crate_contract_declarations_keep_signatures_without_bodies() {
 		test_case!(
 			case = indoc! {"
-			crate func supplied(x: i32) -> i32;
-			crate const LIMIT: i32;
-			crate type Native;
+			package func supplied(x: i32) -> i32;
+			package const LIMIT: i32;
+			package type Native;
 		"}
 		);
 		case.diagnostics().assert_no_errors();
@@ -11309,7 +11377,7 @@ pub(super) mod tests {
 					func send(bytes: io::&[super::Packet], root: super::super::Root) -> io::Size;
 					memory io: super::Width;
 				}
-				func forward(bytes: host::io::&[Packet], root: crate::Root) -> u32 {
+				func forward(bytes: host::io::&[Packet], root: package::Root) -> u32 {
 					host::send(bytes, root)
 				}
 			}

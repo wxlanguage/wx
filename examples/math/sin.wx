@@ -15,7 +15,7 @@
 //
 // Unlike `sinf`, there are no dedicated branches for the first few multiples of pi/2 here —
 // `rem_pio2` already special-cases those internally.
-use crate::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
+use package::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
 
 /// The sine of `x`, with `x` in radians.
 ///

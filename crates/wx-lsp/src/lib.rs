@@ -924,7 +924,7 @@ async fn handle_command(
 					// above for the operator filter — TODO: revisit with a
 					// cheaper, kind-based exclusion if this ever shows up on
 					// a profile.
-					if matches!(span_text, Some("crate" | "super")) {
+					if matches!(span_text, Some("package" | "super")) {
 						continue;
 					}
 					let Some(pos) = byte_to_position(

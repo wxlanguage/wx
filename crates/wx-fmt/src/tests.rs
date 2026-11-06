@@ -72,10 +72,10 @@ fn test_format_simple_function() {
 #[test]
 fn test_format_crate_contract_items() {
 	let source = indoc! {"
-        pub crate type Word;
-        crate const LIMIT: Word;
-        pub crate func choose<T>(value: T) -> T;
-        crate \"math\" as math;
+        pub package type Word;
+        package const LIMIT: Word;
+        pub package func choose<T>(value: T) -> T;
+        package \"math\" as math;
     "};
 	let case = TestCase::new(source);
 	assert!(case.ast.diagnostics.is_empty());
@@ -3073,8 +3073,8 @@ fn test_format_current_syntax_forms() {
 	let source = indoc! {"
         memory heap: Memory32;
 
-        crate \"math\" as math;
-        pub crate \"math\" as math2;
+        package \"math\" as math;
+        pub package \"math\" as math2;
 
         export main;
 
@@ -3113,8 +3113,8 @@ fn test_format_current_syntax_forms() {
 		indoc! {"
             memory heap: Memory32;
 
-            crate \"math\" as math;
-            pub crate \"math\" as math2;
+            package \"math\" as math;
+            pub package \"math\" as math2;
 
             export main;
 
@@ -3472,4 +3472,46 @@ fn a_group_fits_only_with_what_follows_it_on_its_line() {
 		checked_format(exact, exact.len() as u32 - 2, 4),
 		"struct Pair(\n    first: u32,\n    second: u32,\n);\n",
 	);
+}
+
+#[test]
+fn an_open_enum_ends_in_dots_without_a_comma() {
+	let source = indoc! {"
+        enum Errno(u16) {
+            Success = 0, // fine
+            // the others
+            Badf = 8,
+            // anything else
+            .., // dropped
+        }
+        enum Any(u8) { .. }
+        enum Few(u8) { A, .. }
+    "};
+	let formatted = checked_format(source, 80, 4);
+	assert_eq!(
+		formatted,
+		indoc! {"
+            enum Errno(u16) {
+                Success = 0, // fine
+                // the others
+                Badf = 8,
+                // anything else
+                .. // dropped
+            }
+
+            enum Any(u8) { .. }
+
+            enum Few(u8) {
+                A,
+                ..
+            }
+        "}
+	);
+	// A `..` that is not last keeps its place and takes a comma, as it must to
+	// separate the entries that follow.
+	let formatted = checked_format("enum M(u8) { A, .., B }\n", 80, 4);
+	assert_eq!(formatted, "enum M(u8) {\n    A,\n    ..,\n    B,\n}\n");
+	// A comment inside an all-`..` body keeps the body broken.
+	let formatted = checked_format("enum E(u8) { // c\n .. }\n", 80, 4);
+	assert_eq!(formatted, "enum E(u8) {\n    // c\n    ..\n}\n");
 }

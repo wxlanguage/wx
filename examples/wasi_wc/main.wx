@@ -1,0 +1,58 @@
+// wc: prints the lines, words and bytes of standard input.
+//
+// A line is a byte 10. A word is a maximal run of bytes that are not ASCII
+// whitespace (9 to 13 and 32). There is no Unicode handling.
+package "wasi" as wasi;
+package "fmt" as fmt;
+use wasi::{Fd, heap};
+
+func is_space(byte: u8) -> Bool {
+    byte == ' ' || (byte >= '\t' && byte <= '\r')
+}
+
+func print(
+    arena: heap::*wasi::Arena,
+    digits: heap::*[u8],
+    value: u32,
+    separator: heap::&[u8],
+) {
+    Fd::Stdout.write(arena, fmt::decimal::<heap>(digits, value));
+    Fd::Stdout.write(arena, separator);
+}
+
+func main() {
+    local arena = wasi::arena();
+    local buffer = arena.allocate_slice_uninit::<u8>(4096);
+    local digits = arena.allocate_slice_uninit::<u8>(fmt::DECIMAL_LEN);
+    local mut lines: u32 = 0;
+    local mut words: u32 = 0;
+    local mut bytes: u32 = 0;
+    // Whether the previous byte, in this chunk or an earlier one, was in a word.
+    local mut in_word = False;
+    loop {
+        local chunk = Fd::Stdin.read(arena, buffer);
+        if chunk.len() == 0 { break };
+        bytes += chunk.len();
+        local mut i: u32 = 0;
+        loop {
+            if i == chunk.len() { break };
+            local byte = chunk[i];
+            if byte == '\n' { lines += 1 };
+            if is_space(byte) {
+                in_word = False;
+            } else {
+                if !in_word { words += 1 };
+                in_word = True;
+            }
+            i += 1;
+        }
+    }
+    print(arena, digits, lines, " ");
+    print(arena, digits, words, " ");
+    print(arena, digits, bytes, "\n");
+}
+
+export {
+    main as "_start",
+    heap as "memory",
+}

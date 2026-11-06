@@ -5,7 +5,7 @@
 // Small |x| goes straight to the `k_sinf` kernel; up to |x| ~<= 9*pi/4 the argument is
 // reduced by subtracting a small multiple of pi/2 and dispatching to `k_sinf`/`k_cosf`
 // with the appropriate sign; beyond that `rem_pio2f` does the general reduction.
-use crate::{k_cosf::k_cosf, k_sinf::k_sinf, rem_pio2f::rem_pio2f};
+use package::{k_cosf::k_cosf, k_sinf::k_sinf, rem_pio2f::rem_pio2f};
 
 // Small multiples of pi/2 rounded to double precision.
 const S1_PIO2: f64 = 1. * f64::FRAC_PI_2; // 0x3FF921FB, 0x54442D18

@@ -4,7 +4,7 @@
 // Small |x| goes straight to the `k_cos` kernel; everything else is reduced by `rem_pio2` to
 // `y0 + y1 = x - n*(pi/2)` in [-pi/4, pi/4] and dispatched on `n mod 4` — see `sin.wx` for the
 // table.
-use crate::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
+use package::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
 
 /// The cosine of `x`, with `x` in radians.
 ///

@@ -1,7 +1,7 @@
 #[memory_limits({ min_pages: 4 })]
 memory heap: u32;
 
-crate "math" as math;
+package "math" as math;
 use math::Float;
 
 import "host" as host {

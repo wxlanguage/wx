@@ -1,0 +1,16 @@
+// Hello, world in a browser. The page supplies `env.print`, and the module
+// exports the memory its text lives in so the page can read the bytes.
+memory text: u32;
+
+import "env" as env {
+    func print(message: super::text::&[u8]);
+}
+
+func main() {
+    env::print("Hello, world!");
+}
+
+export {
+    main,
+    text as "memory",
+}

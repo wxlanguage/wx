@@ -43,7 +43,7 @@
 // alignment-sorted layout) so that a WASI host writing raw struct bytes
 // through a pointer lines up with the fields wx code reads back.
 
-crate "alloc" as alloc;
+package "alloc" as alloc;
 
 #[memory_limits({ min_pages: 1 })]
 memory heap: u32;

@@ -1,0 +1,37 @@
+// Naive substring search over bytes, generic over the memory they are in.
+//
+// Two nested loops and an early exit with a value: `find` returns whether
+// `pattern` occurs in `text` and the first position where it does.
+// Positions are the memory's own address type, so the same code searches a
+// 32-bit and a 64-bit memory.
+import "host" as host {
+    memory data: u32;
+}
+
+func find<M: Memory>(text: M::&[u8], pattern: M::&[u8]) -> (Bool, M::Size) {
+    local mut start: M::Size = 0;
+    loop :outer {
+        if start + pattern.len() > text.len() { break :outer (False, 0) };
+        local mut k: M::Size = 0;
+        loop {
+            if k == pattern.len() { break :outer (True, start) };
+            if text[start + k] != pattern[k] {
+                start += 1;
+                continue :outer
+            }
+            k += 1;
+        }
+    }
+}
+
+// An export is monomorphic: this instance searches the host's memory.
+func find_in_data(text: host::data::&[u8], pattern: host::data::&[u8]) -> (
+    Bool,
+    u32,
+) {
+    find(text, pattern)
+}
+
+export {
+    find_in_data as "find",
+}
