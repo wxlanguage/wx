@@ -1,10 +1,11 @@
 # MIR pipeline
 
-Status as of 2026-11-07, branch `tir-refactor`: step 1 of "Order of work"
-is done (scalar locals and signatures, `Values`, `SetLocals`, per-scalar
-loads and stores), and so is step 2.1 (MIR's vocabulary: Wasm types, flat
-opcodes, one signature table); next is 2.2, the codegen walk; steps 3–4
-are design. "Today" below describes the code before step 1. Replaces
+Status as of 2026-11-07, branch `tir-refactor`, commit `5878b44`: step 1
+of "Order of work" is done (scalar locals and signatures, `Values`,
+`SetLocals`, per-scalar loads and stores), and so is step 2.1 (MIR's
+vocabulary: Wasm types, flat opcodes, one signature table); next is 2.2,
+the codegen walk ("Resuming at step 2.2", under "Order of work"); steps
+3–4 are design. "Today" below describes the code before step 1. Replaces
 `notes/mir-dce.md`, whose pass is the "Dead-code elimination" section
 below, corrected against the code.
 
@@ -680,6 +681,20 @@ by lowering.
       - **`opt`** keeps its own node kinds; the builder maps an opcode to
         one without reading a type (`MemAccess::load`/`store`).
       - Output is byte-identical to step 1's on every example.
+
+      The cleanup after it: `wasm::flatten_type_to_scalars` (no caller
+      left) and lowering's `scalar_types` wrapper are gone;
+      `operators::Scalar` and `layout::Primitive`, the same ten primitives,
+      are one `tir::types::Primitive` (`of`, `is_integer`, `is_signed`,
+      `is_float`, `size`); a compound assignment on a narrow local now
+      wraps to its width as `x = x op v` and a compound store do (it left
+      300 in a `u8`; `a_narrow_compound_assignment_restores_its_width`);
+      `verify`'s opcode check has a test. Left on purpose, for the steps
+      that remove them: `opt`'s own `MemAccess` and `TrappingOp` (step
+      2.3, when `opt` takes MIR's enums), its aggregate nodes, whose
+      fields are still named `aggregate_index` though they hold a
+      `SignatureIndex` (step 2.5), and the unreachable `CallIndirectSym`
+      path (open point 3).
    2. **The codegen walk**, MIR → `wasm::Function`, tested without `opt`: a
       test-only switch in `backend::emit` skips `opt`, so every wasmtime
       suite (lowering's, `backend_tests.rs`, the inliner's) also runs
@@ -704,6 +719,20 @@ by lowering.
       builder (`should_use_br_table`, `build_switch_as_if_chain`) to
       codegen, so a `match` stays a `Switch` through `opt`. Kept out of
       step 3 so that parity there compares like with like.
+   **Resuming at step 2.2.** Codegen runs `opt` per function in
+   `codegen::Builder::build` (`codegen/mod.rs`, the loop over
+   `mir.functions_with_ids()`: `opt::builder::Builder::build`, then
+   `opt::scheduler::Scheduler::schedule`, then `encode_scheduled`). The
+   walk is a third choice there: a MIR body straight to a
+   `wasm::Function`, each node one instruction now that opcodes say
+   everything, then `wasm::coalesce_locals` and `wasm::peephole_local_tee`
+   (`wasm/mod.rs`) and, in debug, `opt::local_dominance::
+   verify_local_dominance`, as the scheduler does after itself
+   (`opt/scheduler.rs`). `backend::emit` takes the test-only switch.
+   Settle first: where the walk lives (`codegen/walk.rs`?), how a value
+   with several results reaches its user (on the stack in order; a
+   `SetLocals` pops them), and what the switch looks like; then run every
+   wasmtime suite both ways.
 3. **`mir::dce`**, taking `remove_dead_functions` from the inliner and the
    reachability walk from codegen.
 4. **`backend::emit` runs the sequence**; every harness goes through it.
