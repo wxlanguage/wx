@@ -47,22 +47,29 @@ pub enum MemAccess {
 }
 
 impl MemAccess {
-	pub fn from_mir(ty: mir::ValueType) -> Self {
-		match ty {
-			mir::ValueType::I8 => Self::I8S,
-			// `Bool` is std's `enum Bool(u8)`: one byte in memory, as TIR
-			// lays it out, though it is a whole `i32` on the stack.
-			mir::ValueType::U8 | mir::ValueType::Bool => Self::I8U,
-			mir::ValueType::I16 => Self::I16S,
-			mir::ValueType::U16 => Self::I16U,
-			mir::ValueType::I64 | mir::ValueType::U64 => Self::I64,
-			mir::ValueType::F32 => Self::F32,
-			mir::ValueType::F64 => Self::F64,
-			mir::ValueType::Pointer { kind, .. } => match kind {
-				mir::MemoryKind::Memory32 => Self::I32,
-				mir::MemoryKind::Memory64 => Self::I64,
-			},
-			_ => Self::I32,
+	pub fn load(access: mir::LoadAccess) -> Self {
+		match access {
+			mir::LoadAccess::I8S => Self::I8S,
+			mir::LoadAccess::I8U => Self::I8U,
+			mir::LoadAccess::I16S => Self::I16S,
+			mir::LoadAccess::I16U => Self::I16U,
+			mir::LoadAccess::I32 => Self::I32,
+			mir::LoadAccess::I64 => Self::I64,
+			mir::LoadAccess::F32 => Self::F32,
+			mir::LoadAccess::F64 => Self::F64,
+		}
+	}
+
+	/// A store's: a narrow store has no signedness, and the unsigned
+	/// access stands for its width.
+	pub fn store(access: mir::StoreAccess) -> Self {
+		match access {
+			mir::StoreAccess::I8 => Self::I8U,
+			mir::StoreAccess::I16 => Self::I16U,
+			mir::StoreAccess::I32 => Self::I32,
+			mir::StoreAccess::I64 => Self::I64,
+			mir::StoreAccess::F32 => Self::F32,
+			mir::StoreAccess::F64 => Self::F64,
 		}
 	}
 
@@ -91,7 +98,7 @@ impl MemAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeType {
 	Scalar(ScalarType),
-	Aggregate(mir::AggregateIndex),
+	Aggregate(mir::SignatureIndex),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -472,7 +479,7 @@ pub enum DataNodeKind {
 	Aggregate {
 		/// One scalar node per slot. No nested packs or zero-sized markers.
 		values: Box<[DataNodeIndex]>,
-		aggregate_index: mir::AggregateIndex,
+		aggregate_index: mir::SignatureIndex,
 	},
 	/// Projects a single WASM value out of an aggregate.
 	///
@@ -528,7 +535,7 @@ pub enum DataNodeKind {
 	/// Unlike `Aggregate`, has no concrete field sub-nodes — values come from
 	/// the WASM multi-return stack. `AggregateGet` of this node does not fold.
 	AggregateCallResult {
-		aggregate_index: mir::AggregateIndex,
+		aggregate_index: mir::SignatureIndex,
 	},
 	MemoryGrowResult {
 		memory: mir::MemoryId,

@@ -20,7 +20,9 @@
 
 use std::collections::HashSet;
 
-use super::{Body, ExprIdx, FunctionState, Lowerer, mir};
+use super::{
+	Body, ExprIdx, FunctionState, LocalRun, Lowerer, ScalarRange, mir,
+};
 use crate::ast::BinaryOp;
 use crate::diagnostics::TextSpan;
 use crate::tir::body::{
@@ -29,7 +31,8 @@ use crate::tir::body::{
 use crate::tir::bounds::AssumptionEnvIdx;
 use crate::tir::defs::{ConstIdx, FieldIdx, MemberKind};
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::types::{GenericArgs, TypeIndex};
+use crate::tir::types::Primitive;
+use crate::tir::types::{GenericArgs, Type, TypeIndex};
 
 /// A value of the match scrutinee at some field path, read from one root
 /// local. `range` is a flat scalar range in that local and `tir_ty` says what
@@ -37,8 +40,9 @@ use crate::tir::types::{GenericArgs, TypeIndex};
 /// separate type stack).
 #[derive(Clone, Copy)]
 struct Projection {
-	local: mir::LocalIndex,
-	range: mir::ScalarRange,
+	/// The locals of the stored value the projection is rooted in.
+	root: LocalRun,
+	range: ScalarRange,
 	ty: mir::ValueType,
 	/// Concrete: substituted with the instance's arguments where it was read.
 	tir_ty: TypeIndex,
@@ -77,11 +81,8 @@ impl Lowerer<'_, '_, '_, '_> {
 			}
 			PatternKind::Bind(local) => {
 				let value = self.lower_expr(body, state, value)?;
-				let local = state.local_map[usize::from(local)];
-				return Ok(state.push(
-					mir::ExprKind::LocalSet { local, value },
-					mir::ValueType::Unit,
-				));
+				let run = state.local_map[usize::from(local)];
+				return Ok(self.write_locals(state, run, value));
 			}
 			_ => {}
 		}
@@ -110,9 +111,17 @@ impl Lowerer<'_, '_, '_, '_> {
 		arms: ArmRange,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
-		let scrutinee_ty = self.expr_ty(body, state, scrutinee);
+		let tir_ty = self.expr_ty(body, state, scrutinee);
 		let scrutinee_ty =
-			self.lower_type(scrutinee_ty, state.file_id, body.span(scrutinee))?;
+			self.lower_type(tir_ty, state.file_id, body.span(scrutinee))?;
+		// A struct of one scalar is that scalar, but a constant of its type
+		// compares by the type's `PartialEq`, which a `Switch` cannot ask.
+		let tir_ty =
+			self.normalize_type(tir_ty, state.file_id, body.span(scrutinee))?;
+		let compares_by_eq = matches!(
+			self.context.types.resolve(tir_ty),
+			Type::Struct { .. } | Type::Tuple { .. }
+		);
 		// A diverging scrutinee means no arm runs. Keeping the scrutinee's
 		// `Never` value makes the match diverge too; the arms' checked result
 		// types are irrelevant on that path.
@@ -132,8 +141,11 @@ impl Lowerer<'_, '_, '_, '_> {
 			.map_or(arms.len(), |at| at + 1);
 		let arms = &arms[..effective];
 
-		if let Some(discriminants) =
-			self.switch_discriminants(body, arms, scrutinee_ty)
+		let primitive =
+			self.scalar_primitive(tir_ty, state.file_id, body.span(scrutinee))?;
+		if !compares_by_eq
+			&& let Some(discriminants) =
+				self.switch_discriminants(body, arms, scrutinee_ty, primitive)
 		{
 			return self.lower_switch_match(
 				body,
@@ -180,28 +192,18 @@ impl Lowerer<'_, '_, '_, '_> {
 		body: &Body,
 		arms: &[Arm],
 		ty: mir::ValueType,
+		primitive: Option<Primitive>,
 	) -> Option<Vec<Option<i64>>> {
 		// `Switch` compares integer discriminants. Floats have no canonical
 		// integer selector here, so they take the decision tree instead.
-		if !matches!(
-			ty,
-			mir::ValueType::I32
-				| mir::ValueType::U32
-				| mir::ValueType::I8
-				| mir::ValueType::U8
-				| mir::ValueType::I16
-				| mir::ValueType::U16
-				| mir::ValueType::I64
-				| mir::ValueType::U64
-				| mir::ValueType::Bool
-		) {
+		if !ty.is_integer() {
 			return None;
 		}
 		let mut discriminants = Vec::with_capacity(arms.len());
 		for arm in arms {
 			let discriminant = match body.pattern(arm.pattern) {
 				PatternKind::Int(bits) => {
-					Some(pattern_int_discriminant(bits, ty)?)
+					Some(pattern_int_discriminant(bits, primitive?)?)
 				}
 				PatternKind::Constant {
 					constant,
@@ -254,15 +256,7 @@ impl Lowerer<'_, '_, '_, '_> {
 			let (subject, spill) =
 				self.lower_subject(body, state, scrutinee, scrutinee_ty)?;
 			prefix = spill;
-			(
-				state.push(
-					mir::ExprKind::LocalGet {
-						local: subject.local,
-					},
-					scrutinee_ty,
-				),
-				Some(subject),
-			)
+			(self.projection_value(state, subject), Some(subject))
 		} else {
 			(self.lower_expr(body, state, scrutinee)?, None)
 		};
@@ -297,11 +291,8 @@ impl Lowerer<'_, '_, '_, '_> {
 						let subject = subject
 							.expect("a binding default has a stored scrutinee");
 						let bind = self.projection_value(state, subject);
-						let local = state.local_map[usize::from(local)];
-						let set = state.push(
-							mir::ExprKind::LocalSet { local, value: bind },
-							mir::ValueType::Unit,
-						);
+						let run = state.local_map[usize::from(local)];
+						let set = self.write_locals(state, run, bind);
 						self.sequence(state, vec![set], value)
 					}
 					_ => value,
@@ -401,25 +392,23 @@ impl Lowerer<'_, '_, '_, '_> {
 		ty: mir::ValueType,
 	) -> Result<(Projection, Vec<mir::ExprId>), ()> {
 		let tir_ty = self.expr_ty(body, state, scrutinee);
-		let (local, prefix) = match body.kind(scrutinee) {
+		let (root, prefix) = match body.kind(scrutinee) {
 			ExprKind::Local(local) => {
 				(state.local_map[usize::from(local)], Vec::new())
 			}
 			_ => {
 				let value = self.lower_expr(body, state, scrutinee)?;
-				let local = self.push_temp_local(state, ty);
-				let prefix = vec![state.push(
-					mir::ExprKind::LocalSet { local, value },
-					mir::ValueType::Unit,
-				)];
-				(local, prefix)
+				#[cfg(debug_assertions)]
+				debug_assert_eq!(state.ty(value), ty);
+				let (set, root) = self.temporary(state, value);
+				(root, vec![set])
 			}
 		};
-		let len = self.slot_count(ty) as u32;
+		let len = self.signatures.scalars(&ty).len() as u32;
 		Ok((
 			Projection {
-				local,
-				range: mir::ScalarRange::new(0, len),
+				root,
+				range: ScalarRange::new(0, len),
 				ty,
 				tir_ty,
 			},
@@ -472,9 +461,14 @@ impl Lowerer<'_, '_, '_, '_> {
 				self.lower_pattern_condition(body, state, fields, subject)
 			}
 			PatternKind::Int(bits) => {
-				let Some(discriminant) =
-					pattern_int_discriminant(bits, subject.ty)
-				else {
+				let primitive = self.scalar_primitive(
+					subject.tir_ty,
+					state.file_id,
+					body.pattern_span(pattern),
+				)?;
+				let Some(discriminant) = primitive.and_then(|primitive| {
+					pattern_int_discriminant(bits, primitive)
+				}) else {
 					self.unsupported(
 						state.file_id,
 						body.pattern_span(pattern),
@@ -506,9 +500,11 @@ impl Lowerer<'_, '_, '_, '_> {
 					*field_ty,
 					span,
 				)?;
-				let Some(codepoint) =
-					pattern_int_discriminant(u64::from(value), field.ty)
-				else {
+				let primitive =
+					self.scalar_primitive(field.tir_ty, state.file_id, span)?;
+				let Some(codepoint) = primitive.and_then(|primitive| {
+					pattern_int_discriminant(u64::from(value), primitive)
+				}) else {
 					self.unsupported(
 						state.file_id,
 						span,
@@ -621,6 +617,18 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			unreachable!()
 		}
+		// A struct or a tuple compares by its type's `PartialEq`, however
+		// many scalars it is: `P(x: i32)`'s may compare less than `x`.
+		if matches!(
+			self.context.types.resolve(subject.tir_ty),
+			Type::Struct { .. } | Type::Tuple { .. }
+		) {
+			let file_id = state.file_id;
+			let value = self.materialize_constant(
+				state, file_id, span, subject.ty, &value,
+			)?;
+			return Ok(Some(self.equality_test(state, subject, value, span)?));
+		}
 		if matches!(subject.ty, mir::ValueType::F32 | mir::ValueType::F64) {
 			self.unsupported(
 				state.file_id,
@@ -628,13 +636,6 @@ impl Lowerer<'_, '_, '_, '_> {
 				"a float constant pattern (floats have no total equality)",
 			)?;
 			unreachable!()
-		}
-		if matches!(subject.ty, mir::ValueType::Aggregate { .. }) {
-			let file_id = state.file_id;
-			let value = self.materialize_constant(
-				state, file_id, span, subject.ty, &value,
-			)?;
-			return Ok(Some(self.equality_test(state, subject, value, span)?));
 		}
 		let [scalar] = value.as_slice() else {
 			self.unsupported(
@@ -654,7 +655,7 @@ impl Lowerer<'_, '_, '_, '_> {
 				lhs: left,
 				rhs: constant,
 			},
-			mir::ValueType::Bool,
+			mir::ValueType::I32,
 		)))
 	}
 
@@ -727,8 +728,12 @@ impl Lowerer<'_, '_, '_, '_> {
 		// because the subject is, are the method's.
 		let callee = self.instance(function, &args);
 		let callee_id = self.enqueue_from(state, callee, span)?;
-		let (_, callee_params, ..) = self.lower_signature(callee)?;
-		if callee_params.len() != 2 {
+		// The checked signature's count; nothing about the callee is
+		// lowered for it.
+		let param_count = self.context.functions[usize::from(callee.function)]
+			.param_types
+			.len();
+		if param_count != 2 {
 			self.unsupported(
 				state.file_id,
 				span,
@@ -741,7 +746,7 @@ impl Lowerer<'_, '_, '_, '_> {
 			state,
 			callee_id,
 			vec![left, value],
-			mir::ValueType::Bool,
+			mir::ValueType::I32,
 		))
 	}
 
@@ -765,11 +770,8 @@ impl Lowerer<'_, '_, '_, '_> {
 			| PatternKind::Error => Ok(()),
 			PatternKind::Bind(local) => {
 				let value = self.projection_value(state, subject);
-				let local = state.local_map[usize::from(local)];
-				out.push(state.push(
-					mir::ExprKind::LocalSet { local, value },
-					mir::ValueType::Unit,
-				));
+				let run = state.local_map[usize::from(local)];
+				out.push(self.write_locals(state, run, value));
 				Ok(())
 			}
 			PatternKind::Tuple(children) => {
@@ -906,13 +908,13 @@ impl Lowerer<'_, '_, '_, '_> {
 		let ty = self.lower_type(child_ty, state.file_id, span)?;
 		debug_assert_eq!(
 			range.len as usize,
-			self.slot_count(ty),
+			self.signatures.scalars(&ty).len(),
 			"a field's pattern type and flat range agree"
 		);
-		let start = u32::from(subject.range.start) + u32::from(range.start);
+		let start = subject.range.start + range.start;
 		Ok(Projection {
-			local: subject.local,
-			range: mir::ScalarRange::new(start, range.len),
+			root: subject.root,
+			range: ScalarRange::new(start, range.len),
 			ty,
 			tir_ty: child_ty,
 		})
@@ -932,7 +934,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		let ty = self.lower_type(tir_ty, state.file_id, span)?;
 		debug_assert_eq!(
 			subject.range.len as usize,
-			self.slot_count(ty),
+			self.signatures.scalars(&ty).len(),
 			"a pattern's fields type has the same flat shape as its parent"
 		);
 		Ok(Projection {
@@ -942,35 +944,14 @@ impl Lowerer<'_, '_, '_, '_> {
 		})
 	}
 
-	/// Read a projection as a MIR value. A whole-value read is a `LocalGet`;
-	/// a field path is an `AggregateGet` over the root local's flat slots.
+	/// Read a projection as a MIR value: the locals of its scalars.
 	fn projection_value(
 		&self,
 		state: &mut FunctionState,
 		subject: Projection,
 	) -> mir::ExprId {
-		if subject.ty == mir::ValueType::Unit {
-			return state.push(mir::ExprKind::Noop, mir::ValueType::Unit);
-		}
-		let root_ty = state.locals[usize::from(subject.local)].ty;
-		let whole = u32::from(subject.range.start) == 0
-			&& subject.range.len as usize == self.slot_count(root_ty);
-		if whole && subject.ty == root_ty {
-			state.push(
-				mir::ExprKind::LocalGet {
-					local: subject.local,
-				},
-				subject.ty,
-			)
-		} else {
-			state.push(
-				mir::ExprKind::AggregateGet {
-					local: subject.local,
-					range: subject.range,
-				},
-				subject.ty,
-			)
-		}
+		let run = subject.root.slice(subject.range);
+		self.read_locals(state, run, subject.ty)
 	}
 
 	/// `subject == constant`, as a boolean.
@@ -988,7 +969,7 @@ impl Lowerer<'_, '_, '_, '_> {
 				lhs,
 				rhs,
 			},
-			mir::ValueType::Bool,
+			mir::ValueType::I32,
 		)
 	}
 }
@@ -996,18 +977,15 @@ impl Lowerer<'_, '_, '_, '_> {
 /// An integer pattern's discriminant, canonical in the selector's Wasm
 /// scalar. TIR stores int patterns as masked bits, so signed narrow types
 /// need sign extension before they compare with a runtime value.
-fn pattern_int_discriminant(bits: u64, ty: mir::ValueType) -> Option<i64> {
-	Some(match ty {
-		mir::ValueType::I8 => (bits as u8 as i8 as i32) as i64,
-		mir::ValueType::I16 => (bits as u16 as i16 as i32) as i64,
-		mir::ValueType::I32 => (bits as u32 as i32) as i64,
-		mir::ValueType::I64 => bits as i64,
-		mir::ValueType::U8 | mir::ValueType::U16 | mir::ValueType::U32 => {
+fn pattern_int_discriminant(bits: u64, primitive: Primitive) -> Option<i64> {
+	Some(match primitive {
+		Primitive::I8 => (bits as u8 as i8 as i32) as i64,
+		Primitive::I16 => (bits as u16 as i16 as i32) as i64,
+		Primitive::U8 | Primitive::U16 | Primitive::U32 | Primitive::I32 => {
 			(bits as u32 as i32) as i64
 		}
-		mir::ValueType::U64 => bits as i64,
-		mir::ValueType::Bool => (bits != 0) as i64,
-		_ => return None,
+		Primitive::U64 | Primitive::I64 => bits as i64,
+		Primitive::F32 | Primitive::F64 => return None,
 	})
 }
 
@@ -1016,14 +994,8 @@ fn pattern_int_discriminant(bits: u64, ty: mir::ValueType) -> Option<i64> {
 /// needed before comparing.
 fn constant_int_discriminant(bits: u64, ty: mir::ValueType) -> Option<i64> {
 	Some(match ty {
-		mir::ValueType::I8
-		| mir::ValueType::U8
-		| mir::ValueType::I16
-		| mir::ValueType::U16
-		| mir::ValueType::I32
-		| mir::ValueType::U32
-		| mir::ValueType::Bool => (bits as u32 as i32) as i64,
-		mir::ValueType::I64 | mir::ValueType::U64 => bits as i64,
+		mir::ValueType::I32 => (bits as u32 as i32) as i64,
+		mir::ValueType::I64 => bits as i64,
 		_ => return None,
 	})
 }
@@ -1033,7 +1005,7 @@ fn and_conditions(
 	left: Option<mir::ExprId>,
 	right: Option<mir::ExprId>,
 ) -> Option<mir::ExprId> {
-	combine(state, mir::BinaryOp::BitAnd, left, right)
+	combine(state, mir::BinaryOp::And, left, right)
 }
 
 fn or_conditions(
@@ -1041,7 +1013,7 @@ fn or_conditions(
 	left: Option<mir::ExprId>,
 	right: Option<mir::ExprId>,
 ) -> Option<mir::ExprId> {
-	combine(state, mir::BinaryOp::BitOr, left, right)
+	combine(state, mir::BinaryOp::Or, left, right)
 }
 
 /// Two `Bool` conditions joined by `op`, either of which may be absent (one
@@ -1056,9 +1028,11 @@ fn combine(
 	match (left, right) {
 		(None, right) => right,
 		(left, None) => left,
-		(Some(lhs), Some(rhs)) => Some(state.push(
-			mir::ExprKind::Binary { op, lhs, rhs },
-			mir::ValueType::Bool,
-		)),
+		(Some(lhs), Some(rhs)) => {
+			Some(state.push(
+				mir::ExprKind::Binary { op, lhs, rhs },
+				mir::ValueType::I32,
+			))
+		}
 	}
 }

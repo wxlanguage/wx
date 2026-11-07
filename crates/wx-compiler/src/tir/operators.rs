@@ -13,107 +13,15 @@
 use super::defs::{
 	BindingKey, DefinitionRegistry, FunctionIdx, MemberKind, TraitIdx,
 };
-use super::types::TypeIndex;
+use super::types::{Primitive, TypeIndex};
 use crate::ast::{BinaryOp, StringInterner, UnaryOp};
-
-/// A primitive scalar type: what builtin operators are defined on.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Scalar {
-	U8,
-	I8,
-	U16,
-	I16,
-	U32,
-	I32,
-	U64,
-	I64,
-	F32,
-	F64,
-}
-
-impl Scalar {
-	#[cfg(test)]
-	pub(super) const ALL: [Scalar; 10] = [
-		Self::U8,
-		Self::I8,
-		Self::U16,
-		Self::I16,
-		Self::U32,
-		Self::I32,
-		Self::U64,
-		Self::I64,
-		Self::F32,
-		Self::F64,
-	];
-
-	pub(super) fn from_type(ty: TypeIndex) -> Option<Self> {
-		Some(match ty {
-			TypeIndex::U8 => Self::U8,
-			TypeIndex::I8 => Self::I8,
-			TypeIndex::U16 => Self::U16,
-			TypeIndex::I16 => Self::I16,
-			TypeIndex::U32 => Self::U32,
-			TypeIndex::I32 => Self::I32,
-			TypeIndex::U64 => Self::U64,
-			TypeIndex::I64 => Self::I64,
-			TypeIndex::F32 => Self::F32,
-			TypeIndex::F64 => Self::F64,
-			_ => return None,
-		})
-	}
-
-	pub(super) fn ty(self) -> TypeIndex {
-		match self {
-			Self::U8 => TypeIndex::U8,
-			Self::I8 => TypeIndex::I8,
-			Self::U16 => TypeIndex::U16,
-			Self::I16 => TypeIndex::I16,
-			Self::U32 => TypeIndex::U32,
-			Self::I32 => TypeIndex::I32,
-			Self::U64 => TypeIndex::U64,
-			Self::I64 => TypeIndex::I64,
-			Self::F32 => TypeIndex::F32,
-			Self::F64 => TypeIndex::F64,
-		}
-	}
-
-	pub(super) fn is_integer(self) -> bool {
-		matches!(
-			self,
-			Self::U8
-				| Self::I8 | Self::U16
-				| Self::I16 | Self::U32
-				| Self::I32 | Self::U64
-				| Self::I64
-		)
-	}
-
-	pub(super) fn is_signed(self) -> bool {
-		matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
-	}
-
-	pub(super) fn is_float(self) -> bool {
-		matches!(self, Self::F32 | Self::F64)
-	}
-
-	/// Width in bits of an integer scalar.
-	pub(super) fn bits(self) -> u32 {
-		match self {
-			Self::U8 | Self::I8 => 8,
-			Self::U16 | Self::I16 => 16,
-			Self::U32 | Self::I32 | Self::F32 => 32,
-			Self::U64 | Self::I64 | Self::F64 => 64,
-		}
-	}
-}
 
 /// Whether the compiler implements `op` natively on `ty`, a primitive
 /// scalar; `false` for any other type. Mirrors the stdlib's primitive impls of
 /// the operator traits exactly (`primitive_operators_match_the_stdlib_impls`);
 /// `&&`/`||` are not overloadable and are checked before this is asked.
 pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
-	let Some(scalar) = Scalar::from_type(ty) else {
+	let Some(scalar) = Primitive::of(ty) else {
 		return false;
 	};
 	let numeric = scalar.is_integer() || scalar.is_float();
@@ -154,7 +62,7 @@ pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
 
 /// See `is_primitive_binary`.
 pub(super) fn is_primitive_unary(op: UnaryOp, ty: TypeIndex) -> bool {
-	let Some(scalar) = Scalar::from_type(ty) else {
+	let Some(scalar) = Primitive::of(ty) else {
 		return false;
 	};
 	match op {

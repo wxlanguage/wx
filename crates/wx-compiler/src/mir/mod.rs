@@ -13,15 +13,13 @@ use crate::index::index_newtype;
 // removed `tir::TIR` API.
 pub mod body;
 pub mod inline;
-#[allow(dead_code)]
-pub(crate) mod layout;
-#[allow(dead_code)]
 mod signatures;
 
 pub use body::{
-	BinaryOp, Body, Case, CaseList, CompareOp, ExprId, ExprKind, ExprList,
-	LabelId, UnaryOp,
+	BinaryOp, Body, Case, CaseList, CompareOp, ConvertOp, ExprId, ExprKind,
+	ExprList, LabelId, LoadAccess, StoreAccess, TargetList, UnaryOp,
 };
+pub use signatures::Signatures;
 
 index_newtype!(
 	/// Backend identity of one MIR function *instance*: its index in
@@ -58,19 +56,18 @@ index_newtype!(
 	ImportIdx
 );
 index_newtype!(
-	/// Index into `MIR::signatures`.
+	/// Index into [`MIR::signatures`]: a function's signature, or a
+	/// multi-result type.
 	SignatureIndex
-);
-index_newtype!(
-	/// Index into `MIR::aggregates`. Reach the aggregate itself with
-	/// [`MIR::aggregate`] rather than indexing the table by hand.
-	AggregateIndex
 );
 
 // `Debug` is gated on `debug_assertions` as well as `test`, so that panics in
 // a debug build can name the offending type and a release test build can
 // still `assert_eq!` on it. It must *not* also appear in the `test` derive
 // below: two `derive(Debug)` would be conflicting impls.
+/// A value's type, Wasm's: what a source type meant (signedness, width in
+/// memory, `Bool`, an address) is each operation's, chosen by lowering
+/// (`notes/mir-pipeline.md`, "MIR's vocabulary").
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ValueType {
@@ -78,95 +75,35 @@ pub enum ValueType {
 	I64,
 	F32,
 	F64,
-	U32,
-	U64,
-	U8,
-	I8,
-	U16,
-	I16,
 	Unit,
 	Never,
-	Bool,
-	/// An address. Which memory it points into is checked in TIR and named
-	/// by every node that reads or writes through it, so the type holds only
-	/// the address width: no module item id lives in a type.
-	Pointer {
-		kind: MemoryKind,
-	},
+	/// Several scalars as one value: the results of a signature with no
+	/// parameters, two or more of them.
 	Aggregate {
-		aggregate_index: AggregateIndex,
-	},
-	Function {
-		signature_index: SignatureIndex,
+		signature: SignatureIndex,
 	},
 }
 
 impl ValueType {
-	/// Types whose division, remainder, right shift, and ordered comparisons
-	/// must use the unsigned WASM instruction variants. Pointers are
-	/// unsigned addresses.
-	pub fn is_unsigned(self) -> bool {
-		matches!(
-			self,
-			ValueType::U8
-				| ValueType::U16
-				| ValueType::U32
-				| ValueType::U64
-				| ValueType::Pointer { .. }
-		)
+	/// One Wasm value.
+	pub fn is_scalar(self) -> bool {
+		matches!(self, Self::I32 | Self::I64 | Self::F32 | Self::F64)
+	}
+
+	pub fn is_integer(self) -> bool {
+		matches!(self, Self::I32 | Self::I64)
+	}
+
+	pub fn is_float(self) -> bool {
+		matches!(self, Self::F32 | Self::F64)
 	}
 }
 
 index_newtype!(
-	/// Index into an aggregate's flattened scalar (Wasm-value) list, in
-	/// **declaration pre-order**.
-	///
-	/// One scalar is one WebAssembly value: one signature slot, one local, one
-	/// stack entry. Source fields exist only in TIR; lowering translates
-	/// their projections into scalar ranges.
+	/// Index into a multi-result value's scalars, in **declaration
+	/// pre-order**: one Wasm value, one local, one stack entry.
 	ScalarIndex
 );
-
-/// A contiguous selection in a flat value pack, including an empty selection.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub struct ScalarRange {
-	pub start: ScalarIndex,
-	pub len: u32,
-}
-
-impl ScalarRange {
-	pub fn new(start: u32, len: u32) -> Self {
-		Self {
-			start: ScalarIndex::new(start),
-			len,
-		}
-	}
-
-	pub fn indices(self) -> std::ops::Range<usize> {
-		let start = usize::from(self.start);
-		start..start + self.len as usize
-	}
-}
-
-/// An owned, nonempty flat value representation. No entry may be another
-/// aggregate, `Unit`, or `Never`. Source structure belongs to TIR only.
-#[derive(Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub struct Aggregate {
-	pub scalars: Box<[ValueType]>,
-	/// Some stack values have no linear-memory representation. This is
-	/// copied from TIR when available, never inferred from the slot types.
-	pub memory: Option<AggregateMemory>,
-}
-
-/// Memory attributes paired with a flat pack's slots, in the same order.
-#[derive(Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub struct AggregateMemory {
-	pub layout: Layout,
-	pub offsets: Box<[u32]>,
-}
 
 /// A memory's index type, lowered from TIR's `TypeIndex::U32`/`U64` (see
 /// `tir::Memory::kind`) once and for all here — MIR and codegen branch on
@@ -183,6 +120,15 @@ pub enum MemoryKind {
 }
 
 impl MemoryKind {
+	/// The type of an address into such a memory.
+	#[inline]
+	pub fn address_type(self) -> ValueType {
+		match self {
+			MemoryKind::Memory32 => ValueType::I32,
+			MemoryKind::Memory64 => ValueType::I64,
+		}
+	}
+
 	#[inline]
 	pub fn pointer_size(self) -> u32 {
 		match self {
@@ -254,14 +200,14 @@ pub struct MIR {
 	/// What callers and the backend may do with each function, beside its
 	/// body; indexed by [`FunctionId`], as `functions` is.
 	pub function_flags: Vec<FunctionFlags>,
-	pub signatures: Vec<FunctionSignature>,
+	/// Every function's signature and every multi-result type.
+	pub signatures: Signatures,
 	pub globals: Vec<Global>,
 	pub exports: Vec<Export>,
 	/// What the host provides, one entry per imported item; indexed by
 	/// [`ImportIdx`].
 	pub imports: Vec<Import>,
 	pub memories: Vec<MemoryInfo>,
-	pub aggregates: Box<[Aggregate]>,
 	pub static_entries: Vec<StaticEntry>,
 	/// The synthetic start function that assigns all user-defined globals at
 	/// module instantiation time, if any globals are declared.
@@ -361,26 +307,10 @@ pub struct Local {
 	pub mutability: Mutability,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub struct FunctionSignature {
-	pub items: Box<[ValueType]>,
-	pub params_count: usize,
-}
-
-impl FunctionSignature {
-	pub fn params(&self) -> &[ValueType] {
-		&self.items[..self.params_count]
-	}
-
-	pub fn result(&self) -> ValueType {
-		self.items[self.params_count]
-	}
-}
-
 #[derive(Clone)]
 pub struct Function {
-	pub signature_index: SignatureIndex,
+	/// Its parameters' and results' scalars.
+	pub signature: SignatureIndex,
 	pub origin: Origin<Code>,
 }
 
@@ -453,14 +383,6 @@ pub struct Global {
 	/// are assigned at runtime by the start function. Immutable globals carry
 	/// their literal value directly.
 	pub origin: Origin<ConstInit>,
-}
-
-/// Memory layout of a type: size in bytes and required alignment in bytes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub struct Layout {
-	pub size: u32,
-	pub align: u32,
 }
 
 impl MIR {
@@ -537,11 +459,5 @@ impl MIR {
 			.iter()
 			.enumerate()
 			.map(|(index, function)| (FunctionId::new(index as u32), function))
-	}
-
-	/// The aggregate `index` refers to.
-	#[inline]
-	pub fn aggregate(&self, index: AggregateIndex) -> &Aggregate {
-		&self.aggregates[usize::from(index)]
 	}
 }

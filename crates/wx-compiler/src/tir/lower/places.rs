@@ -14,7 +14,7 @@
 //! it back through the same address.
 
 use super::{
-	Body, FunctionInstance, FunctionState, Lowerer, binary_kind,
+	Body, FunctionInstance, FunctionState, LocalRun, Lowerer, binary_kind,
 	canonical_narrow, mir,
 };
 use crate::ast::BinaryOp;
@@ -22,6 +22,8 @@ use crate::diagnostics::TextSpan;
 use crate::tir::body::{ExprIdx, Place, PlaceIdx, PlaceKind};
 use crate::tir::bounds::AssumptionEnvIdx;
 use crate::tir::defs::FunctionIdx;
+use crate::tir::layout::Piece;
+use crate::tir::types::Primitive;
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
 
 /// Where a place's bytes are: `offset` bytes past the address `pointer`
@@ -31,6 +33,24 @@ struct Address {
 	pointer: mir::ExprId,
 	offset: u32,
 	memory: mir::MemoryId,
+}
+
+/// A value in linear memory: its MIR type, whose scalars it holds, and TIR's
+/// layout of it, which says where each is from the place's address.
+#[derive(Clone, Copy)]
+struct PlaceValue {
+	ty: mir::ValueType,
+	piece: Piece,
+}
+
+/// How a load or a store reads the address it accesses, once per scalar.
+#[derive(Clone, Copy)]
+enum AddressRead {
+	/// The address expression itself, for a value of one scalar.
+	Direct(mir::ExprId),
+	/// The temporary holding the address, of its type, read again for
+	/// each scalar.
+	Temporary(LocalRun, mir::ValueType),
 }
 
 /// What a compound write applies to the value it reads.
@@ -92,9 +112,8 @@ impl Lowerer<'_, '_, '_, '_> {
 					// Checking reported a failure on this type.
 					Err(_) => return Err(()),
 				};
-				let offset =
-					self.context.solver.layouts.aggregate(layout).fields
-						[usize::from(field)];
+				let offset = self.context.solver.layouts.field_offsets(layout)
+					[usize::from(field)];
 				Ok(Address {
 					offset: address.offset + offset,
 					..address
@@ -175,8 +194,7 @@ impl Lowerer<'_, '_, '_, '_> {
 				memory,
 			});
 		}
-		let pointer_ty = state.ty(pointer);
-		let (set_pointer, pointer_local) = self.temporary(state, pointer);
+		let (set_pointer, pointer_locals) = self.temporary(state, pointer);
 		let mut prefix = vec![set_pointer];
 
 		let index = self.lower_expr(body, state, index)?;
@@ -190,25 +208,19 @@ impl Lowerer<'_, '_, '_, '_> {
 		let size_ty = state.ty(index);
 		let (set_index, index_local) = self.temporary(state, index);
 		prefix.push(set_index);
-		let index =
-			state.push(mir::ExprKind::LocalGet { local: index_local }, size_ty);
+		let index = self.read_locals(state, index_local, size_ty);
 
-		let base = self.sequence_base(state, pointer_local, pointer_ty);
-		let length = self.sequence_length(
-			state,
-			pointer_local,
-			pointer_ty,
-			sequence_ty,
-			size_ty,
-		);
+		let base = self.sequence_base(state, pointer_locals);
+		let length =
+			self.sequence_length(state, pointer_locals, sequence_ty, size_ty);
 
 		let out_of_bounds = state.push(
 			mir::ExprKind::Compare {
-				op: mir::CompareOp::Ge,
+				op: mir::CompareOp::GeU,
 				lhs: index,
 				rhs: length,
 			},
-			mir::ValueType::Bool,
+			mir::ValueType::I32,
 		);
 		let trap =
 			state.push(mir::ExprKind::Unreachable, mir::ValueType::Never);
@@ -222,13 +234,12 @@ impl Lowerer<'_, '_, '_, '_> {
 		));
 
 		let address_ty = state.ty(base);
+		// An index is the memory's `Size`, as wide as its addresses.
+		debug_assert!(address_ty == size_ty);
 		let address = match stride {
 			0 => base,
 			_ => {
-				let index = state.push(
-					mir::ExprKind::LocalGet { local: index_local },
-					size_ty,
-				);
+				let index = self.read_locals(state, index_local, size_ty);
 				let scaled = match stride {
 					1 => index,
 					_ => {
@@ -248,10 +259,6 @@ impl Lowerer<'_, '_, '_, '_> {
 						)
 					}
 				};
-				let scaled = state.push(
-					mir::ExprKind::Transmute { value: scaled },
-					address_ty,
-				);
 				state.push(
 					mir::ExprKind::Binary {
 						op: mir::BinaryOp::Add,
@@ -270,55 +277,36 @@ impl Lowerer<'_, '_, '_, '_> {
 	}
 
 	/// The address a pointer to a slice or an array holds, read from the
-	/// temporary `local` holding the pointer, of `pointer_ty`: a slice's
-	/// first scalar, or the whole thin pointer.
+	/// temporaries `pointer` holding the pointer: its first scalar, the
+	/// whole of a thin pointer.
 	fn sequence_base(
 		&self,
 		state: &mut FunctionState,
-		local: mir::LocalIndex,
-		pointer_ty: mir::ValueType,
+		pointer: LocalRun,
 	) -> mir::ExprId {
-		match pointer_ty {
-			mir::ValueType::Aggregate { aggregate_index } => {
-				let address_ty =
-					self.aggregates.get(aggregate_index).scalars[0];
-				state.push(
-					mir::ExprKind::AggregateGet {
-						local,
-						range: mir::ScalarRange::new(0, 1),
-					},
-					address_ty,
-				)
-			}
-			_ => state.push(mir::ExprKind::LocalGet { local }, pointer_ty),
-		}
+		let local = pointer.locals().next().expect("a pointer has an address");
+		let ty = state.locals[usize::from(local)].ty;
+		state.push(mir::ExprKind::LocalGet { local }, ty)
 	}
 
 	/// The length of the slice or array (`sequence_ty`, concrete) a pointer
-	/// in the temporary `local` points at, as `size_ty`, its memory's
-	/// `Size`: a slice's metadata, or an array's length, a constant.
+	/// in the temporaries `pointer` points at, as `size_ty`, its memory's
+	/// `Size`: a slice's metadata, its second scalar, or an array's length,
+	/// a constant.
 	fn sequence_length(
 		&self,
 		state: &mut FunctionState,
-		local: mir::LocalIndex,
-		pointer_ty: mir::ValueType,
+		pointer: LocalRun,
 		sequence_ty: TypeIndex,
 		size_ty: mir::ValueType,
 	) -> mir::ExprId {
-		match pointer_ty {
-			mir::ValueType::Aggregate { aggregate_index } => {
-				let length_ty = self.aggregates.get(aggregate_index).scalars[1];
+		match pointer.locals().nth(1) {
+			Some(local) => {
 				#[cfg(debug_assertions)]
-				debug_assert_eq!(length_ty, size_ty);
-				state.push(
-					mir::ExprKind::AggregateGet {
-						local,
-						range: mir::ScalarRange::new(1, 1),
-					},
-					length_ty,
-				)
+				debug_assert_eq!(state.locals[usize::from(local)].ty, size_ty);
+				state.push(mir::ExprKind::LocalGet { local }, size_ty)
 			}
-			_ => {
+			None => {
 				let Type::Array { length, .. } =
 					*self.context.types.resolve(sequence_ty)
 				else {
@@ -365,93 +353,157 @@ impl Lowerer<'_, '_, '_, '_> {
 		if state.ty(pointer) == mir::ValueType::Never {
 			return Ok(pointer);
 		}
-		let pointer_ty = state.ty(pointer);
-		let (set, local) = self.temporary(state, pointer);
+		let (set, locals) = self.temporary(state, pointer);
 		let value = if is_len {
-			self.sequence_length(state, local, pointer_ty, sequence_ty, ty)
+			self.sequence_length(state, locals, sequence_ty, ty)
 		} else {
-			self.sequence_base(state, local, pointer_ty)
+			self.sequence_base(state, locals)
 		};
 		#[cfg(debug_assertions)]
 		debug_assert_eq!(state.ty(value), ty);
 		Ok(self.sequence(state, vec![set], value))
 	}
 
-	/// `value` stored in a fresh temporary: the store, and the temporary,
-	/// which the caller reads as often as it needs.
-	fn temporary(
-		&mut self,
-		state: &mut FunctionState,
-		value: mir::ExprId,
-	) -> (mir::ExprId, mir::LocalIndex) {
-		let ty = state.ty(value);
-		let local = self.push_temp_local(state, ty);
-		let set = state.push(
-			mir::ExprKind::LocalSet { local, value },
-			mir::ValueType::Unit,
-		);
-		(set, local)
-	}
-
-	/// The MIR type of the value stored at `place`, which must have bytes
-	/// in linear memory.
-	fn place_type(
+	/// The value stored at `place`, which must have bytes in linear memory.
+	fn place_value(
 		&mut self,
 		body: &Body,
 		state: &FunctionState,
 		place: PlaceIdx,
-	) -> Result<mir::ValueType, ()> {
+	) -> Result<PlaceValue, ()> {
 		let data = *body.place(place);
 		let ty = self.substitute(data.ty, state.env, &state.args);
+		let ty = self.normalize_type(ty, state.file_id, data.span)?;
 		let lowered = self.lower_type(ty, state.file_id, data.span)?;
-		let has_bytes = match lowered {
-			mir::ValueType::Never => false,
-			mir::ValueType::Aggregate { aggregate_index } => {
-				self.aggregates.get(aggregate_index).memory.is_some()
-			}
-			_ => true,
+		let piece = match lowered {
+			mir::ValueType::Never => None,
+			_ => match self.context.memory_piece(AssumptionEnvIdx::ROOT, ty) {
+				Ok(piece) => piece,
+				// Checking reported a failure on this type.
+				Err(_) => return Err(()),
+			},
 		};
-		if !has_bytes {
+		let Some(piece) = piece else {
 			self.unsupported(
 				state.file_id,
 				data.span,
 				"a value with no linear-memory layout in memory",
 			)?;
 			unreachable!()
+		};
+		// Lowering's shape and TIR's layout flatten a value in one order.
+		debug_assert_eq!(
+			self.context.solver.layouts.scalar_count(piece),
+			self.signatures.scalars(&lowered).len(),
+			"TIR's layout and lowering's shape hold the same scalars"
+		);
+		Ok(PlaceValue { ty: lowered, piece })
+	}
+
+	/// How to read the address `pointer` computes once per scalar of
+	/// `value`: directly for one scalar, or else through a temporary, with
+	/// the store into it.
+	fn address_read(
+		&mut self,
+		state: &mut FunctionState,
+		pointer: mir::ExprId,
+		value: PlaceValue,
+	) -> (Option<mir::ExprId>, AddressRead) {
+		if self.signatures.scalars(&value.ty).len() == 1 {
+			return (None, AddressRead::Direct(pointer));
 		}
-		Ok(lowered)
+		let ty = state.ty(pointer);
+		let (set, locals) = self.temporary(state, pointer);
+		(Some(set), AddressRead::Temporary(locals, ty))
 	}
 
-	/// A load of `place`'s address, offset and memory, of type `ty`.
+	/// One read of the address, as `address` says.
+	fn read_address(
+		&self,
+		state: &mut FunctionState,
+		address: AddressRead,
+	) -> mir::ExprId {
+		match address {
+			AddressRead::Direct(pointer) => pointer,
+			AddressRead::Temporary(locals, ty) => {
+				self.read_locals(state, locals, ty)
+			}
+		}
+	}
+
+	/// A load of the value at `address`: one `PointerLoad` per scalar, at
+	/// its offset in TIR's layout.
 	fn load(
+		&self,
 		state: &mut FunctionState,
 		address: Address,
-		pointer: mir::ExprId,
-		ty: mir::ValueType,
+		read: AddressRead,
+		value: PlaceValue,
 	) -> mir::ExprId {
-		state.push(
-			mir::ExprKind::PointerLoad {
-				pointer,
-				offset: address.offset,
-				memory: address.memory,
-			},
-			ty,
-		)
+		let layouts = &self.context.solver.layouts;
+		let loads: Vec<_> = self
+			.signatures
+			.scalars(&value.ty)
+			.iter()
+			.enumerate()
+			.map(|(at, &ty)| {
+				let pointer = self.read_address(state, read);
+				let (primitive, offset) = layouts.scalar(value.piece, at);
+				state.push(
+					mir::ExprKind::PointerLoad {
+						pointer,
+						offset: address.offset + offset,
+						memory: address.memory,
+						access: load_access(primitive),
+					},
+					ty,
+				)
+			})
+			.collect();
+		match *loads {
+			[] => state.push(mir::ExprKind::Noop, mir::ValueType::Unit),
+			[load] => load,
+			_ => {
+				let values = state.list(loads);
+				state.push(mir::ExprKind::Values { values }, value.ty)
+			}
+		}
 	}
 
+	/// A store of the value in the temporaries `values` to `address`: one
+	/// `PointerStore` per scalar, at its offset in TIR's layout.
 	fn store(
+		&self,
 		state: &mut FunctionState,
 		address: Address,
-		pointer: mir::ExprId,
-		value: mir::ExprId,
+		read: AddressRead,
+		values: LocalRun,
+		value: PlaceValue,
 	) -> mir::ExprId {
+		let layouts = &self.context.solver.layouts;
+		let stores: Vec<_> = values
+			.locals()
+			.enumerate()
+			.map(|(at, local)| {
+				let pointer = self.read_address(state, read);
+				let ty = state.locals[usize::from(local)].ty;
+				let scalar = state.push(mir::ExprKind::LocalGet { local }, ty);
+				let (primitive, offset) = layouts.scalar(value.piece, at);
+				state.push(
+					mir::ExprKind::PointerStore {
+						pointer,
+						value: scalar,
+						offset: address.offset + offset,
+						memory: address.memory,
+						access: store_access(primitive),
+					},
+					mir::ValueType::Unit,
+				)
+			})
+			.collect();
+		let stores = state.list(stores);
 		state.push(
-			mir::ExprKind::PointerStore {
-				pointer,
-				value,
-				offset: address.offset,
-				memory: address.memory,
-			},
+			mir::ExprKind::Sequence { statements: stores },
 			mir::ValueType::Unit,
 		)
 	}
@@ -465,15 +517,16 @@ impl Lowerer<'_, '_, '_, '_> {
 		place: PlaceIdx,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
-		let ty = match ty {
-			mir::ValueType::Never => ty,
-			_ => self.place_type(body, state, place)?,
-		};
+		if ty == mir::ValueType::Never {
+			// The place's value is uninhabited, so its pointer diverges.
+			return Ok(self.lower_place(body, state, place)?.pointer);
+		}
+		let value = self.place_value(body, state, place)?;
 		let address = self.lower_place(body, state, place)?;
 		if state.ty(address.pointer) == mir::ValueType::Never {
 			return Ok(address.pointer);
 		}
-		if ty == mir::ValueType::Unit {
+		if value.ty == mir::ValueType::Unit {
 			let drop = state.push(
 				mir::ExprKind::Drop {
 					value: address.pointer,
@@ -483,7 +536,9 @@ impl Lowerer<'_, '_, '_, '_> {
 			let unit = state.push(mir::ExprKind::Noop, mir::ValueType::Unit);
 			return Ok(self.sequence(state, vec![drop], unit));
 		}
-		Ok(Self::load(state, address, address.pointer, ty))
+		let (set, read) = self.address_read(state, address.pointer, value);
+		let load = self.load(state, address, read, value);
+		Ok(self.sequence(state, set.into_iter().collect(), load))
 	}
 
 	/// `place.&`: the place's address, its fields' offset added. A shared
@@ -527,32 +582,29 @@ impl Lowerer<'_, '_, '_, '_> {
 		place: PlaceIdx,
 		value: ExprIdx,
 	) -> Result<mir::ExprId, ()> {
-		let ty = self.place_type(body, state, place)?;
+		let place_value = self.place_value(body, state, place)?;
 		let value = self.lower_expr(body, state, value)?;
 		if state.ty(value) == mir::ValueType::Never {
 			return Ok(value);
 		}
-		let mut prefix = vec![];
-		let value = if ty == mir::ValueType::Unit {
-			prefix.push(value);
-			None
-		} else {
-			let (set, get) = self.spill(state, value);
-			prefix.push(set);
-			Some(get)
-		};
+		let (set_value, values) = self.temporary(state, value);
+		let mut prefix = vec![set_value];
 		let address = self.lower_place(body, state, place)?;
 		if state.ty(address.pointer) == mir::ValueType::Never {
 			return Ok(self.sequence(state, prefix, address.pointer));
 		}
-		let write = match value {
-			Some(value) => Self::store(state, address, address.pointer, value),
-			None => state.push(
+		let write = if place_value.ty == mir::ValueType::Unit {
+			state.push(
 				mir::ExprKind::Drop {
 					value: address.pointer,
 				},
 				mir::ValueType::Unit,
-			),
+			)
+		} else {
+			let (set_pointer, read) =
+				self.address_read(state, address.pointer, place_value);
+			prefix.extend(set_pointer);
+			self.store(state, address, read, values, place_value)
 		};
 		Ok(self.sequence(state, prefix, write))
 	}
@@ -569,7 +621,8 @@ impl Lowerer<'_, '_, '_, '_> {
 		operation: Operation,
 		span: TextSpan,
 	) -> Result<mir::ExprId, ()> {
-		let ty = self.place_type(body, state, place)?;
+		let place_value = self.place_value(body, state, place)?;
+		let ty = place_value.ty;
 		let value = self.lower_expr(body, state, value)?;
 		if state.ty(value) == mir::ValueType::Never {
 			return Ok(value);
@@ -579,27 +632,34 @@ impl Lowerer<'_, '_, '_, '_> {
 		if state.ty(address.pointer) == mir::ValueType::Never {
 			return Ok(self.sequence(state, vec![set_value], address.pointer));
 		}
+		// Read and written back, so the address is always a temporary.
 		let pointer_ty = state.ty(address.pointer);
-		let (set_pointer, read_pointer) = self.spill(state, address.pointer);
-		let mir::ExprKind::LocalGet { local } =
-			state.mir_body.kind(read_pointer)
-		else {
-			unreachable!("a spill reads its temporary back")
-		};
-		let read = Self::load(state, address, read_pointer, ty);
+		let (set_pointer, pointer) = self.temporary(state, address.pointer);
+		let address_read = AddressRead::Temporary(pointer, pointer_ty);
+		let read = self.load(state, address, address_read, place_value);
 		let result = match operation {
 			Operation::Primitive(op) => {
-				let Some(kind) = binary_kind(op, read, operand) else {
+				let Piece::Primitives { primitive, .. } = place_value.piece
+				else {
+					unreachable!("a primitive operator's place is a primitive")
+				};
+				let Some(kind) = binary_kind(op, primitive, read, operand)
+				else {
 					unreachable!("a compound store's operator is arithmetic")
 				};
 				let result = state.push(kind, ty);
-				canonical_narrow(state, result, ty)
+				canonical_narrow(state, result, primitive)
 			}
 			Operation::Method { method, type_args } => {
 				let (callee, callee_id) =
 					self.callee(state, method, type_args, span)?;
-				let (_, callee_params, ..) = self.lower_signature(callee)?;
-				if callee_params.len() != 2 {
+				// The checked signature's count; nothing about the callee is
+				// lowered for it.
+				let param_count = self.context.functions
+					[usize::from(callee.function)]
+				.param_types
+				.len();
+				if param_count != 2 {
 					self.unsupported(
 						state.file_id,
 						span,
@@ -611,9 +671,40 @@ impl Lowerer<'_, '_, '_, '_> {
 				self.build_call(state, callee_id, vec![read, operand], ty)
 			}
 		};
-		let write_pointer =
-			state.push(mir::ExprKind::LocalGet { local }, pointer_ty);
-		let write = Self::store(state, address, write_pointer, result);
-		Ok(self.sequence(state, vec![set_value, set_pointer], write))
+		let (set_result, results) = self.temporary(state, result);
+		let write =
+			self.store(state, address, address_read, results, place_value);
+		Ok(self.sequence(
+			state,
+			vec![set_value, set_pointer, set_result],
+			write,
+		))
+	}
+}
+
+/// How a load reads a scalar laid out as `primitive`: a narrow one extended
+/// as its signedness says.
+fn load_access(primitive: Primitive) -> mir::LoadAccess {
+	match primitive {
+		Primitive::U8 => mir::LoadAccess::I8U,
+		Primitive::I8 => mir::LoadAccess::I8S,
+		Primitive::U16 => mir::LoadAccess::I16U,
+		Primitive::I16 => mir::LoadAccess::I16S,
+		Primitive::U32 | Primitive::I32 => mir::LoadAccess::I32,
+		Primitive::U64 | Primitive::I64 => mir::LoadAccess::I64,
+		Primitive::F32 => mir::LoadAccess::F32,
+		Primitive::F64 => mir::LoadAccess::F64,
+	}
+}
+
+/// How a store writes a scalar laid out as `primitive`.
+fn store_access(primitive: Primitive) -> mir::StoreAccess {
+	match primitive {
+		Primitive::U8 | Primitive::I8 => mir::StoreAccess::I8,
+		Primitive::U16 | Primitive::I16 => mir::StoreAccess::I16,
+		Primitive::U32 | Primitive::I32 => mir::StoreAccess::I32,
+		Primitive::U64 | Primitive::I64 => mir::StoreAccess::I64,
+		Primitive::F32 => mir::StoreAccess::F32,
+		Primitive::F64 => mir::StoreAccess::F64,
 	}
 }

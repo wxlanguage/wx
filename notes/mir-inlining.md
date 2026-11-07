@@ -216,13 +216,13 @@ pays for:
 
 | Node | Cost |
 | ---- | ---- |
-| `Sequence`, `Transmute`, `Noop` | 0 |
-| `Aggregate` (its values are its children) | 0 |
+| `Sequence`, `Noop` | 0 |
+| `Values` (its values are its children) | 0 |
 | `Block`, `Loop`, `IfElse` | 2 (the opcode and `end`), 3 for an `if` with an `else` |
 | `LocalGet`, `LocalSet`, `Global`, `GlobalSet`, `Int` | 2 |
-| `AggregateGet`, `AggregateSet` | 2 per slot |
+| `SetLocals` | 2 per target |
 | `Float` | 5 (the node does not say `f32` or `f64`) |
-| `Unary`, `Binary`, `Compare`, `Convert`, `Reinterpret`, `Drop` | 1 |
+| `Unary`, `Binary`, `Compare`, `Convert`, `Drop` | 1 |
 | `Break`, `Continue` | 2 |
 | `Return`, `Unreachable` | 1 |
 | `Switch` | 2 + one per case |

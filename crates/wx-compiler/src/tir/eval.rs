@@ -43,15 +43,15 @@ use super::defs::{
 	ConstIdx, EnumIdx, FunctionIdx, GlobalIdx, MemberKind, MemberOwner,
 	MemoryIdx,
 };
-use super::layout::Primitive;
 use super::members::{TraitImplLookup, TraitMemberSelection};
-use super::operators::Scalar;
 use super::signatures::TypeContext;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, Solver, SolverError, SolverFrame,
 	metadata_len,
 };
-use super::types::{GenericEnvIdx, Substitution, Type, TypeIndex, TypeList};
+use super::types::{
+	GenericEnvIdx, Primitive, Substitution, Type, TypeIndex, TypeList,
+};
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::index::index_newtype;
@@ -115,7 +115,7 @@ pub(super) struct Allocation {
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct ConstScalar {
 	pub(super) val: Val,
-	pub(super) scalar: Scalar,
+	pub(super) scalar: Primitive,
 }
 
 /// A constant's value: its numbers, in declaration order.
@@ -1082,7 +1082,7 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::AbstractCompoundStore { .. } => {
 				return Err(own(EvalErrorKind::NotConst));
 			}
-			ExprKind::Int(value) => match Scalar::from_type(ty) {
+			ExprKind::Int(value) => match Primitive::of(ty) {
 				Some(scalar) => {
 					stack.push(literal(value, false, scalar).expect(
 						"the checker keeps a literal in its type's range",
@@ -1090,9 +1090,11 @@ impl TypeContext<'_, '_, '_> {
 				}
 				None => return Err(own(EvalErrorKind::NotConst)),
 			},
-			ExprKind::Float(value) => match Scalar::from_type(ty) {
-				Some(Scalar::F32) => stack.push(ConstScalar::f32(value as f32)),
-				Some(Scalar::F64) => stack.push(ConstScalar::f64(value)),
+			ExprKind::Float(value) => match Primitive::of(ty) {
+				Some(Primitive::F32) => {
+					stack.push(ConstScalar::f32(value as f32))
+				}
+				Some(Primitive::F64) => stack.push(ConstScalar::f64(value)),
 				_ => return Err(own(EvalErrorKind::NotConst)),
 			},
 			// A function item and a global's or a memory's handle are
@@ -1178,7 +1180,7 @@ impl TypeContext<'_, '_, '_> {
 				operand,
 			} if let ExprKind::Int(value) =
 				body_of(self, owner).kind(operand)
-				&& let Some(scalar) = Scalar::from_type(ty) =>
+				&& let Some(scalar) = Primitive::of(ty) =>
 			{
 				stack.push(
 					literal(value, true, scalar).ok_or(own(
@@ -1509,7 +1511,7 @@ impl TypeContext<'_, '_, '_> {
 		owner: Owner<'_>,
 		ty: TypeIndex,
 		span: TextSpan,
-	) -> Result<(MemoryIdx, Scalar), Halt> {
+	) -> Result<(MemoryIdx, Primitive), Halt> {
 		let scope = self.assumption_envs.of_frame(body_env(self, owner));
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
@@ -1532,7 +1534,7 @@ impl TypeContext<'_, '_, '_> {
 	fn push_static(
 		&mut self,
 		allocation: Allocation,
-		width: Scalar,
+		width: Primitive,
 		ty: TypeIndex,
 		len: u64,
 		stack: &mut Vec<ConstScalar>,
@@ -1548,8 +1550,8 @@ impl TypeContext<'_, '_, '_> {
 		if let Type::Slice { .. } = self.types.resolve(self.static_pointee(ty))
 		{
 			stack.push(match width {
-				Scalar::U32 => ConstScalar::u32(u32::try_from(len).unwrap()),
-				Scalar::U64 => ConstScalar::u64(len),
+				Primitive::U32 => ConstScalar::u32(u32::try_from(len).unwrap()),
+				Primitive::U64 => ConstScalar::u64(len),
 				_ => unreachable!("`PointerSize` holds `u32` and `u64`"),
 			});
 		}
@@ -1727,7 +1729,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 			Ok(ResolvedConstant::Length(length)) => {
 				let length = self.length_value(owner, length)?;
-				let scalar = Scalar::from_type(ty)
+				let scalar = Primitive::of(ty)
 					.expect("an array's length is of a memory's `Size`");
 				stack.push(literal(length, false, scalar).expect(
 					"an array's length is representable as its memory's `Size`",
@@ -1785,7 +1787,7 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		const_index: ConstIdx,
 		owner: Owner<'_>,
-	) -> Result<Vec<Scalar>, ConstValueState> {
+	) -> Result<Vec<Primitive>, ConstValueState> {
 		let signature = &self.constants[usize::from(const_index)];
 		let (ty, scope) = (signature.ty, signature.env);
 		let ty = self.instance_type(owner, ty);
@@ -1813,7 +1815,7 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		scope: AssumptionEnvIdx,
 		ty: TypeIndex,
-		out: &mut Vec<Scalar>,
+		out: &mut Vec<Primitive>,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<(), ConstValueState> {
 		let ty = self
@@ -1822,7 +1824,7 @@ impl TypeContext<'_, '_, '_> {
 		if ty == TypeIndex::ERROR {
 			return Err(ConstValueState::Poisoned);
 		}
-		if let Some(scalar) = Scalar::from_type(ty) {
+		if let Some(scalar) = Primitive::of(ty) {
 			out.push(scalar);
 			return Ok(());
 		}
@@ -1908,7 +1910,7 @@ impl TypeContext<'_, '_, '_> {
 		&mut self,
 		scope: AssumptionEnvIdx,
 		memory: TypeIndex,
-	) -> Result<Scalar, ConstValueState> {
+	) -> Result<Primitive, ConstValueState> {
 		let Some(memory_index) = self.memory_of(scope, memory) else {
 			return Err(ConstValueState::NoValue);
 		};
@@ -1921,7 +1923,7 @@ impl TypeContext<'_, '_, '_> {
 		let size = self
 			.normalize(scope, size, NormalizationDepth::Deep, RewriteFlags::ALL)
 			.unwrap_or(size);
-		Scalar::from_type(size).ok_or(ConstValueState::Poisoned)
+		Primitive::of(size).ok_or(ConstValueState::Poisoned)
 	}
 
 	/// The memory `memory` names in `scope`, if it is a known one.
@@ -2000,70 +2002,70 @@ impl ConstScalar {
 	pub(super) fn u8(value: u8) -> Self {
 		Self {
 			val: Val::I32(u32::from(value)),
-			scalar: Scalar::U8,
+			scalar: Primitive::U8,
 		}
 	}
 
 	pub(super) fn i8(value: i8) -> Self {
 		Self {
 			val: Val::I32(i32::from(value) as u32),
-			scalar: Scalar::I8,
+			scalar: Primitive::I8,
 		}
 	}
 
 	pub(super) fn u16(value: u16) -> Self {
 		Self {
 			val: Val::I32(u32::from(value)),
-			scalar: Scalar::U16,
+			scalar: Primitive::U16,
 		}
 	}
 
 	pub(super) fn i16(value: i16) -> Self {
 		Self {
 			val: Val::I32(i32::from(value) as u32),
-			scalar: Scalar::I16,
+			scalar: Primitive::I16,
 		}
 	}
 
 	pub(super) fn u32(value: u32) -> Self {
 		Self {
 			val: Val::I32(value),
-			scalar: Scalar::U32,
+			scalar: Primitive::U32,
 		}
 	}
 
 	pub(super) fn i32(value: i32) -> Self {
 		Self {
 			val: Val::I32(value as u32),
-			scalar: Scalar::I32,
+			scalar: Primitive::I32,
 		}
 	}
 
 	pub(super) fn u64(value: u64) -> Self {
 		Self {
 			val: Val::I64(value),
-			scalar: Scalar::U64,
+			scalar: Primitive::U64,
 		}
 	}
 
 	pub(super) fn i64(value: i64) -> Self {
 		Self {
 			val: Val::I64(value as u64),
-			scalar: Scalar::I64,
+			scalar: Primitive::I64,
 		}
 	}
 
 	pub(super) fn f32(value: f32) -> Self {
 		Self {
 			val: Val::F32(value.to_bits()),
-			scalar: Scalar::F32,
+			scalar: Primitive::F32,
 		}
 	}
 
 	pub(super) fn f64(value: f64) -> Self {
 		Self {
 			val: Val::F64(value.to_bits()),
-			scalar: Scalar::F64,
+			scalar: Primitive::F64,
 		}
 	}
 
@@ -2081,7 +2083,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I32(bits),
-				scalar: Scalar::U8,
+				scalar: Primitive::U8,
 			} => bits as u8,
 			_ => unreachable!("not a `u8`"),
 		}
@@ -2091,7 +2093,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I32(bits),
-				scalar: Scalar::I8,
+				scalar: Primitive::I8,
 			} => bits as i8,
 			_ => unreachable!("not an `i8`"),
 		}
@@ -2101,7 +2103,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I32(bits),
-				scalar: Scalar::U16,
+				scalar: Primitive::U16,
 			} => bits as u16,
 			_ => unreachable!("not a `u16`"),
 		}
@@ -2111,7 +2113,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I32(bits),
-				scalar: Scalar::I16,
+				scalar: Primitive::I16,
 			} => bits as i16,
 			_ => unreachable!("not an `i16`"),
 		}
@@ -2121,7 +2123,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I32(bits),
-				scalar: Scalar::U32,
+				scalar: Primitive::U32,
 			} => bits,
 			_ => unreachable!("not a `u32`"),
 		}
@@ -2131,7 +2133,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I32(bits),
-				scalar: Scalar::I32,
+				scalar: Primitive::I32,
 			} => bits as i32,
 			_ => unreachable!("not an `i32`"),
 		}
@@ -2141,7 +2143,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I64(bits),
-				scalar: Scalar::U64,
+				scalar: Primitive::U64,
 			} => bits,
 			_ => unreachable!("not a `u64`"),
 		}
@@ -2151,7 +2153,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::I64(bits),
-				scalar: Scalar::I64,
+				scalar: Primitive::I64,
 			} => bits as i64,
 			_ => unreachable!("not an `i64`"),
 		}
@@ -2161,7 +2163,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::F32(bits),
-				scalar: Scalar::F32,
+				scalar: Primitive::F32,
 			} => f32::from_bits(bits),
 			_ => unreachable!("not an `f32`"),
 		}
@@ -2171,7 +2173,7 @@ impl ConstScalar {
 		match self {
 			Self {
 				val: Val::F64(bits),
-				scalar: Scalar::F64,
+				scalar: Primitive::F64,
 			} => f64::from_bits(bits),
 			_ => unreachable!("not an `f64`"),
 		}
@@ -2185,16 +2187,16 @@ impl ConstScalar {
 impl std::fmt::Display for ConstScalar {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self.scalar {
-			Scalar::U8 => write!(f, "{}", self.expect_u8()),
-			Scalar::I8 => write!(f, "{}", self.expect_i8()),
-			Scalar::U16 => write!(f, "{}", self.expect_u16()),
-			Scalar::I16 => write!(f, "{}", self.expect_i16()),
-			Scalar::U32 => write!(f, "{}", self.expect_u32()),
-			Scalar::I32 => write!(f, "{}", self.expect_i32()),
-			Scalar::U64 => write!(f, "{}", self.expect_u64()),
-			Scalar::I64 => write!(f, "{}", self.expect_i64()),
-			Scalar::F32 => write!(f, "{}", self.expect_f32()),
-			Scalar::F64 => write!(f, "{}", self.expect_f64()),
+			Primitive::U8 => write!(f, "{}", self.expect_u8()),
+			Primitive::I8 => write!(f, "{}", self.expect_i8()),
+			Primitive::U16 => write!(f, "{}", self.expect_u16()),
+			Primitive::I16 => write!(f, "{}", self.expect_i16()),
+			Primitive::U32 => write!(f, "{}", self.expect_u32()),
+			Primitive::I32 => write!(f, "{}", self.expect_i32()),
+			Primitive::U64 => write!(f, "{}", self.expect_u64()),
+			Primitive::I64 => write!(f, "{}", self.expect_i64()),
+			Primitive::F32 => write!(f, "{}", self.expect_f32()),
+			Primitive::F64 => write!(f, "{}", self.expect_f64()),
 		}
 	}
 }
@@ -2239,9 +2241,9 @@ fn exact_scalar(value: i128, ty: TypeIndex) -> Option<ConstScalar> {
 		return char::from_u32(u32::try_from(value).ok()?)
 			.map(ConstScalar::char);
 	}
-	match Scalar::from_type(ty)? {
-		Scalar::F32 => Some(ConstScalar::f32(value as f32)),
-		Scalar::F64 => Some(ConstScalar::f64(value as f64)),
+	match Primitive::of(ty)? {
+		Primitive::F32 => Some(ConstScalar::f32(value as f32)),
+		Primitive::F64 => Some(ConstScalar::f64(value as f64)),
 		scalar => literal(
 			u64::try_from(value.unsigned_abs()).ok()?,
 			value < 0,
@@ -2280,16 +2282,20 @@ fn exact_binary(op: BinaryOp, a: i128, b: i128) -> Result<i128, EvalErrorKind> {
 
 /// The integer literal `value` as `scalar`, negated when it is written
 /// `-value`; `None` when it is not representable.
-fn literal(value: u64, negated: bool, scalar: Scalar) -> Option<ConstScalar> {
+fn literal(
+	value: u64,
+	negated: bool,
+	scalar: Primitive,
+) -> Option<ConstScalar> {
 	if !scalar.is_signed() {
 		if negated && value != 0 {
 			return None;
 		}
 		return Some(match scalar {
-			Scalar::U8 => ConstScalar::u8(u8::try_from(value).ok()?),
-			Scalar::U16 => ConstScalar::u16(u16::try_from(value).ok()?),
-			Scalar::U32 => ConstScalar::u32(u32::try_from(value).ok()?),
-			Scalar::U64 => ConstScalar::u64(value),
+			Primitive::U8 => ConstScalar::u8(u8::try_from(value).ok()?),
+			Primitive::U16 => ConstScalar::u16(u16::try_from(value).ok()?),
+			Primitive::U32 => ConstScalar::u32(u32::try_from(value).ok()?),
+			Primitive::U64 => ConstScalar::u64(value),
 			_ => unreachable!("an integer literal has an integer type"),
 		});
 	}
@@ -2299,10 +2305,10 @@ fn literal(value: u64, negated: bool, scalar: Scalar) -> Option<ConstScalar> {
 		i64::try_from(value).ok()?
 	};
 	Some(match scalar {
-		Scalar::I8 => ConstScalar::i8(i8::try_from(value).ok()?),
-		Scalar::I16 => ConstScalar::i16(i16::try_from(value).ok()?),
-		Scalar::I32 => ConstScalar::i32(i32::try_from(value).ok()?),
-		Scalar::I64 => ConstScalar::i64(value),
+		Primitive::I8 => ConstScalar::i8(i8::try_from(value).ok()?),
+		Primitive::I16 => ConstScalar::i16(i16::try_from(value).ok()?),
+		Primitive::I32 => ConstScalar::i32(i32::try_from(value).ok()?),
+		Primitive::I64 => ConstScalar::i64(value),
 		_ => unreachable!("an integer literal has an integer type"),
 	})
 }
@@ -2343,10 +2349,10 @@ fn unary(
 	operand: ConstScalar,
 ) -> Result<ConstScalar, EvalErrorKind> {
 	match (op, operand.scalar) {
-		(UnaryOp::InvertSign, Scalar::F32) => {
+		(UnaryOp::InvertSign, Primitive::F32) => {
 			Ok(ConstScalar::f32(-operand.expect_f32()))
 		}
-		(UnaryOp::InvertSign, Scalar::F64) => {
+		(UnaryOp::InvertSign, Primitive::F64) => {
 			Ok(ConstScalar::f64(-operand.expect_f64()))
 		}
 		(UnaryOp::Not, _) => unreachable!("`!` is a call of `Not::not`"),
@@ -2362,39 +2368,39 @@ fn unary(
 fn integer_unary(op: UnaryOp, operand: ConstScalar) -> Option<ConstScalar> {
 	let negate = op == UnaryOp::InvertSign;
 	Some(match operand.scalar {
-		Scalar::U8 => {
+		Primitive::U8 => {
 			let a = operand.expect_u8();
 			ConstScalar::u8(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::I8 => {
+		Primitive::I8 => {
 			let a = operand.expect_i8();
 			ConstScalar::i8(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::U16 => {
+		Primitive::U16 => {
 			let a = operand.expect_u16();
 			ConstScalar::u16(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::I16 => {
+		Primitive::I16 => {
 			let a = operand.expect_i16();
 			ConstScalar::i16(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::U32 => {
+		Primitive::U32 => {
 			let a = operand.expect_u32();
 			ConstScalar::u32(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::I32 => {
+		Primitive::I32 => {
 			let a = operand.expect_i32();
 			ConstScalar::i32(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::U64 => {
+		Primitive::U64 => {
 			let a = operand.expect_u64();
 			ConstScalar::u64(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::I64 => {
+		Primitive::I64 => {
 			let a = operand.expect_i64();
 			ConstScalar::i64(if negate { a.checked_neg()? } else { !a })
 		}
-		Scalar::F32 | Scalar::F64 => {
+		Primitive::F32 | Primitive::F64 => {
 			unreachable!(
 				"the checker builds primitive operators on their scalars"
 			)
@@ -2411,7 +2417,7 @@ fn binary(
 		return Ok(ConstScalar::bool(ordering));
 	}
 	match lhs.scalar {
-		Scalar::F32 => {
+		Primitive::F32 => {
 			let (a, b) = (lhs.expect_f32(), rhs.expect_f32());
 			Ok(ConstScalar::f32(match op {
 				BinaryOp::Add => a + b,
@@ -2424,7 +2430,7 @@ fn binary(
 				_ => unreachable!(),
 			}))
 		}
-		Scalar::F64 => {
+		Primitive::F64 => {
 			let (a, b) = (lhs.expect_f64(), rhs.expect_f64());
 			Ok(ConstScalar::f64(match op {
 				BinaryOp::Add => a + b,
@@ -2462,7 +2468,7 @@ fn integer_binary(
 	rhs: ConstScalar,
 ) -> Option<ConstScalar> {
 	Some(match lhs.scalar {
-		Scalar::U8 => {
+		Primitive::U8 => {
 			let (a, b) = (lhs.expect_u8(), rhs.expect_u8());
 			ConstScalar::u8(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2478,7 +2484,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::I8 => {
+		Primitive::I8 => {
 			let (a, b) = (lhs.expect_i8(), rhs.expect_i8());
 			ConstScalar::i8(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2496,7 +2502,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::U16 => {
+		Primitive::U16 => {
 			let (a, b) = (lhs.expect_u16(), rhs.expect_u16());
 			ConstScalar::u16(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2512,7 +2518,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::I16 => {
+		Primitive::I16 => {
 			let (a, b) = (lhs.expect_i16(), rhs.expect_i16());
 			ConstScalar::i16(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2530,7 +2536,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::U32 => {
+		Primitive::U32 => {
 			let (a, b) = (lhs.expect_u32(), rhs.expect_u32());
 			ConstScalar::u32(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2546,7 +2552,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::I32 => {
+		Primitive::I32 => {
 			let (a, b) = (lhs.expect_i32(), rhs.expect_i32());
 			ConstScalar::i32(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2564,7 +2570,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::U64 => {
+		Primitive::U64 => {
 			let (a, b) = (lhs.expect_u64(), rhs.expect_u64());
 			ConstScalar::u64(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2582,7 +2588,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::I64 => {
+		Primitive::I64 => {
 			let (a, b) = (lhs.expect_i64(), rhs.expect_i64());
 			ConstScalar::i64(match op {
 				BinaryOp::Add => a.checked_add(b)?,
@@ -2600,7 +2606,7 @@ fn integer_binary(
 				_ => unreachable!(),
 			})
 		}
-		Scalar::F32 | Scalar::F64 => {
+		Primitive::F32 | Primitive::F64 => {
 			unreachable!(
 				"the checker builds primitive operators on their scalars"
 			)
@@ -2612,17 +2618,17 @@ fn integer_binary(
 fn compare(op: BinaryOp, lhs: ConstScalar, rhs: ConstScalar) -> Option<bool> {
 	use std::cmp::Ordering;
 	let ordering = match lhs.scalar {
-		Scalar::U8 => lhs.expect_u8().partial_cmp(&rhs.expect_u8()),
-		Scalar::I8 => lhs.expect_i8().partial_cmp(&rhs.expect_i8()),
-		Scalar::U16 => lhs.expect_u16().partial_cmp(&rhs.expect_u16()),
-		Scalar::I16 => lhs.expect_i16().partial_cmp(&rhs.expect_i16()),
-		Scalar::U32 => lhs.expect_u32().partial_cmp(&rhs.expect_u32()),
-		Scalar::I32 => lhs.expect_i32().partial_cmp(&rhs.expect_i32()),
-		Scalar::U64 => lhs.expect_u64().partial_cmp(&rhs.expect_u64()),
-		Scalar::I64 => lhs.expect_i64().partial_cmp(&rhs.expect_i64()),
+		Primitive::U8 => lhs.expect_u8().partial_cmp(&rhs.expect_u8()),
+		Primitive::I8 => lhs.expect_i8().partial_cmp(&rhs.expect_i8()),
+		Primitive::U16 => lhs.expect_u16().partial_cmp(&rhs.expect_u16()),
+		Primitive::I16 => lhs.expect_i16().partial_cmp(&rhs.expect_i16()),
+		Primitive::U32 => lhs.expect_u32().partial_cmp(&rhs.expect_u32()),
+		Primitive::I32 => lhs.expect_i32().partial_cmp(&rhs.expect_i32()),
+		Primitive::U64 => lhs.expect_u64().partial_cmp(&rhs.expect_u64()),
+		Primitive::I64 => lhs.expect_i64().partial_cmp(&rhs.expect_i64()),
 		// IEEE: any comparison with NaN is false, except `!=`.
-		Scalar::F32 => lhs.expect_f32().partial_cmp(&rhs.expect_f32()),
-		Scalar::F64 => lhs.expect_f64().partial_cmp(&rhs.expect_f64()),
+		Primitive::F32 => lhs.expect_f32().partial_cmp(&rhs.expect_f32()),
+		Primitive::F64 => lhs.expect_f64().partial_cmp(&rhs.expect_f64()),
 	};
 	Some(match op {
 		BinaryOp::Eq => ordering == Some(Ordering::Equal),
@@ -2975,7 +2981,7 @@ mod tests {
 			panic!("expected two values");
 		};
 		assert_eq!(*length, ConstScalar::u32(5));
-		assert_eq!(address.scalar, Scalar::U32);
+		assert_eq!(address.scalar, Primitive::U32);
 		let (allocation, offset) = case.pointee(*address);
 		assert_eq!(offset, 0);
 		assert_eq!(
@@ -3025,7 +3031,7 @@ mod tests {
 		let [wide] = case.value("WIDE") else {
 			panic!("expected an address");
 		};
-		assert_eq!(wide.scalar, Scalar::U64);
+		assert_eq!(wide.scalar, Primitive::U64);
 		assert_eq!(case.pointee(*wide).0.memory, case.memory("wide"));
 		assert_eq!(&*case.pointee(*wide).0.bytes, b"hello");
 		// Each use is a copy of its own.
@@ -3056,7 +3062,7 @@ mod tests {
 			panic!("expected two values");
 		};
 		assert!(matches!(address.val, Val::MemoryOffset { offset: 0, .. }));
-		assert_eq!(address.scalar, Scalar::U64);
+		assert_eq!(address.scalar, Primitive::U64);
 		assert_eq!(*length, ConstScalar::u64(3));
 		assert_eq!(case.pointee(*address).0.memory, case.memory("wide"));
 	}
@@ -3081,7 +3087,7 @@ mod tests {
 				memory: case.memory("wide")
 			}
 		);
-		assert_eq!(end.scalar, Scalar::U64);
+		assert_eq!(end.scalar, Primitive::U64);
 	}
 
 	#[test]

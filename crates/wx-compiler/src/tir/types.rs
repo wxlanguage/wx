@@ -116,6 +116,66 @@ impl TypeIndex {
 	pub const CHAR_LITERAL: TypeIndex = TypeIndex(19);
 }
 
+/// A primitive numeric type: what the builtin operators are defined on, what
+/// constant evaluation holds a number as, and how linear memory holds one
+/// value (an address as its memory's `Size`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub(super) enum Primitive {
+	U8,
+	I8,
+	U16,
+	I16,
+	U32,
+	I32,
+	U64,
+	I64,
+	F32,
+	F64,
+}
+
+impl Primitive {
+	/// The primitive `ty` is, if it is one.
+	pub(super) fn of(ty: TypeIndex) -> Option<Self> {
+		Some(match ty {
+			TypeIndex::U8 => Self::U8,
+			TypeIndex::I8 => Self::I8,
+			TypeIndex::U16 => Self::U16,
+			TypeIndex::I16 => Self::I16,
+			TypeIndex::U32 => Self::U32,
+			TypeIndex::I32 => Self::I32,
+			TypeIndex::U64 => Self::U64,
+			TypeIndex::I64 => Self::I64,
+			TypeIndex::F32 => Self::F32,
+			TypeIndex::F64 => Self::F64,
+			_ => return None,
+		})
+	}
+
+	pub(super) fn is_integer(self) -> bool {
+		!self.is_float()
+	}
+
+	/// An operator on it reads it signed.
+	pub(super) fn is_signed(self) -> bool {
+		matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
+	}
+
+	pub(super) fn is_float(self) -> bool {
+		matches!(self, Self::F32 | Self::F64)
+	}
+
+	/// The bytes it takes, which is also its alignment.
+	pub(super) fn size(self) -> u32 {
+		match self {
+			Self::U8 | Self::I8 => 1,
+			Self::U16 | Self::I16 => 2,
+			Self::U32 | Self::I32 | Self::F32 => 4,
+			Self::U64 | Self::I64 | Self::F64 => 8,
+		}
+	}
+}
+
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
 /// interned on its own; the type holding it is, by the list's contents, so
 /// equal types still share one `TypeIndex`. Built only by the interner.

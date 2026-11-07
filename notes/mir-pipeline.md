@@ -1,8 +1,12 @@
 # MIR pipeline
 
-Status as of 2026-11-07, branch `tir-refactor`: design, nothing
-implemented. Replaces `notes/mir-dce.md`, whose pass is the "Dead-code
-elimination" section below, corrected against the code.
+Status as of 2026-11-07, branch `tir-refactor`: step 1 of "Order of work"
+is done (scalar locals and signatures, `Values`, `SetLocals`, per-scalar
+loads and stores), and so is step 2.1 (MIR's vocabulary: Wasm types, flat
+opcodes, one signature table); next is 2.2, the codegen walk; steps 3–4
+are design. "Today" below describes the code before step 1. Replaces
+`notes/mir-dce.md`, whose pass is the "Dead-code elimination" section
+below, corrected against the code.
 
 ## Today
 
@@ -90,8 +94,8 @@ stack cannot do goes through a local.
 - **A node may have several results**: a `Values`, a `Call`, a `Block`/
   `IfElse`/`Switch`, a `Break`'s value. They are taken whole and in order,
   as Wasm takes them off the stack: by a call's arguments (each result is
-  one argument), a `Return`, an enclosing block's result, a `Transmute`, a
-  `Drop`, or a `SetLocals`.
+  one argument), a `Return`, an enclosing block's result, a `Drop`, or a
+  `SetLocals`.
 - **What the stack cannot do is a local:** taking one value out of several,
   or reading a value twice. No node takes one result out of several.
 
@@ -157,12 +161,143 @@ The alternative, keeping aggregates as lowering's output and scalarizing in
 a first MIR pass, leaves two forms of MIR every pass has to tell apart.
 Rejected.
 
+## MIR's vocabulary: Wasm's types, operations that say what they do
+
+After step 1, MIR still types its values with source types (`U8`, `I16`,
+`Bool`, `Pointer { kind }`) and leaves the instruction to them: a
+`Binary { Div }` of type `U32` is `i32.div_u`. `opt` does not: its nodes
+are instructions (`DivU`, `LtS`, `ShrU`) over Wasm's four types. So every
+stage after lowering picks instructions from source types again: the `opt`
+builder today, the codegen walk next, and `opt` writing MIR back would have
+to make the types up again.
+
+Step 2 moves MIR to `opt`'s level instead. Lowering, which has the TIR
+types, decides everything a source type means, once.
+
+### Types are Wasm's
+
+A value is `I32`, `I64`, `F32`, `F64` or a reference (`funcref`, a
+function reference by signature), plus `Unit`, `Never` and the
+multi-result types. `U8`, `U16`, `I8`, `I16`, `U32`/`U64` as distinct
+types, `Bool` and `Pointer` go:
+
+- **Signedness is the operation's**, not the value's (below). A value used
+  signed and unsigned is one value, with no cast between them.
+- **A load's or a store's width and extension is the access's**
+  (`LoadAccess`, `StoreAccess`, below), where today `opt`'s
+  `MemAccess::from_mir` reads it off the type.
+- **A narrow value is an `I32` with its masking written out.** Lowering
+  already writes it (`canonical_narrow`: an `and` mask, or a shift pair,
+  after each narrow operation); the type only repeated it.
+- **An address is an `I32` or an `I64`.** Every access names its memory
+  already.
+- **One table of signatures, Wasm's function types.** An entry is a run
+  of scalars in one column, its parameters then its results, with its
+  parameter count; the table is interned by content. A function's type is
+  one, and a multi-result type (`ValueType::Aggregate`) is one with no
+  parameters, as a Wasm block yielding several values is typed by a
+  function type `[] -> [t*]`. So equal scalars are one type, and a
+  function's results are its scalars rather than a reference into another
+  table. It replaces the aggregate table and the old signature list, whose
+  results could be an aggregate. A function
+  returning a pair repeats the pair's scalars in its own entry, as Wasm's
+  type section does.
+- **No function reference type yet** (open point 3).
+- **`Transmute` goes.** Its two sides have the same scalars, which are now
+  one MIR type, so lowering returns the operand (Closed, below).
+
+**Facts come from operations, never from types.** A source type is no
+guarantee about the bits in wx: std's narrow operators run the `i32`
+instruction and `transmute` the result back, so `200 + 100` on `u8` is 300
+under a `u8` type, and `transmute` makes any `i32`-represented value a
+`u8`, a `Bool` (holding 5) or an open enum's value. "A `u8` is below 256"
+would be an unsound rewrite. What an operation produces is always true:
+`i32.load8_u` and `x & 0xff` are below 256, a comparison is 0 or 1. That
+is what an optimizer reads (LLVM's known-bits analysis does), and if wx
+later makes narrow types hold (overflow checks that trap, or masks),
+lowering writes those checks as operations and the facts come from them.
+
+### Opcodes are flat; nodes are grouped by shape
+
+Two choices that are easy to conflate:
+
+- **The opcode** (what an operation does) is one flat list, where every
+  distinction is its own opcode: `DivS` and `DivU`, `LtS` and `LtU`,
+  `ShrS` and `ShrU`; integer and float operations apart, as Wasm keeps
+  them (`f32.div` has no signedness and does not trap; `i32.div_s` has one
+  and does).
+- **The node** (how many operands, of what kind) is grouped by shape:
+  `Unary`, `Binary`, `Compare`, `Convert`, loads, stores. One node shape is
+  one operand walk, one deduplication key and one folding table.
+
+What an opcode is (whether it traps, whether it is commutative, which
+signedness it uses) is a property of the opcode, defined once next to it:
+
+```rust
+pub enum BinaryOp {
+    Add, Sub, Mul, And, Or, Xor, Shl, ShrS, ShrU, // integers
+    DivS, DivU, RemS, RemU,                       // integers; trap
+    Div, Min, Max, Copysign,                      // floats
+}
+
+impl BinaryOp {
+    /// Traps on some operands: a zero divisor, or `MIN / -1`.
+    pub fn can_trap(self) -> bool {
+        matches!(self, Self::DivS | Self::DivU | Self::RemS | Self::RemU)
+    }
+}
+```
+
+and likewise `CompareOp { Eq, Ne, LtS, LtU, LeS, LeU, GtS, GtU, GeS, GeU,
+Lt, Le, Gt, Ge }` (the last four for floats), `UnaryOp { Eqz, Neg, Abs,
+Sqrt, Floor, Ceil, Trunc, Nearest }` (`Eqz` for integers, the rest for
+floats) and the conversions as opcodes of their own, from the operand's
+type to the node's: `ExtendS`, `ExtendU`, `Wrap`, `TruncS` and `TruncU`
+(which trap), `ConvertS`, `ConvertU`, `Promote`, `Demote`, `Reinterpret`.
+A node whose opcode does not fit its type (`DivS` of an `F32`) is a
+`verify` error.
+
+Every opcode is one Wasm instruction. Wasm has no integer negation or
+bitwise not, so lowering writes them as `0 - x` and `x ^ -1`. A load's
+access says its width and extension (`LoadAccess`: `I8S`, `I8U`, `I16S`,
+`I16U`, `I32`, `I64`, `F32`, `F64`) and a store's its width only
+(`StoreAccess`: `I8`, `I16`, `I32`, `I64`, `F32`, `F64`): a store has no
+signedness.
+
+This is Cranelift's design (a flat `Opcode`, `InstructionData` grouped by
+format, `can_trap()` and the like as properties) and LLVM's
+(`BinaryOperator` covers `sdiv` and `udiv`; `mayTrap()` is a property).
+Every optimizing IR of the kind (LLVM IR, CLIF, MLIR's `arith`) keeps
+integers signless and puts signedness in the operation, for the reason
+above; Binaryen, Wasm to Wasm, has only Wasm's four types, as here. Rust's
+MIR and GCC's GIMPLE pick instructions by source type, as wx's MIR does
+today; they sit before an optimizing IR, not in place of one.
+
+What it costs: today `ControlNode::Trapping` holds a `TrappingOp`, a type
+that holds only trapping operations. With one opcode list, "the builder
+puts an operation in program order when it can trap" is a check where the
+node is built (`debug_assert!(op.can_trap())`), not a type.
+
+### What each stage does with it
+
+- **Lowering** picks the opcode and the access from the TIR type: the one
+  place that knows a value was a `u8`.
+- **`opt`** uses MIR's opcode enums for its data nodes, so writing MIR back
+  is one node to one node, and the builder copies instead of translating
+  (`build_binary`, `build_cmp`, `build_conversion` stop choosing). It puts
+  an operation that can trap in program order (today's `ControlNode::
+  Trapping`), by `can_trap()`.
+- **Codegen** maps an opcode and its type to one Wasm instruction, choosing
+  nothing.
+
 ## `opt`: MIR → MIR
 
 The builder reads scalar MIR, so its aggregate code goes: the `Aggregate`,
 `AggregateGet` and `AggregateCallResult` nodes, the per-scalar merging,
 the load and store splitting. Several values at a join are several phis,
-as several scalars of one aggregate already are.
+as several scalars of one aggregate already are. Its data nodes take MIR's
+opcodes and types (see "MIR's vocabulary"), so a MIR node and its `opt`
+node say the same thing.
 
 The scheduler's emission (`emit_control`, `emit_value_inline`, about 1,000
 lines) builds a MIR body instead of wasm instructions:
@@ -322,7 +457,9 @@ walk.
 
 ## Codegen: MIR → wasm
 
-One walk over each body, children before their parent:
+One walk over each body, children before their parent. An opcode and its
+type are one Wasm instruction (`DivU` of an `I32` is `i32.div_u`), and an
+access is its load or store; codegen chooses no instruction.
 
 - a label becomes a branch depth;
 - a `Switch` becomes a `br_table` (dense cases) or a `br_if` chain;
@@ -357,21 +494,44 @@ it belongs in the last steps, not in the optimizer's reasoning.
    returning a struct or a slice gets `(result i32 i32)`, against the rule
    that output uses no extension unless the program uses it. Not part of
    this refactor; the direction is "Multi-value as an opt-in" below.
-2. **Where a multi-result type's list is kept:** today's aggregate table
-   without `memory`, or a `Results` table of its own. Minor: it is the list
-   of a `Values`' types either way.
-3. **Inlining thresholds.** Scalar MIR counts a struct-heavy callee as more
+2. **Inlining thresholds.** Scalar MIR counts a struct-heavy callee as more
    nodes; the policy's numbers may need a look.
+3. **Function references.** Not lowered yet (`Funcref`, `TypedFuncref` and
+   `CallRef` are reported unsupported), so MIR has no type for one; step 2
+   removes the old pipeline's `ValueType::Function`, which nothing
+   produces. For an optimizer the choice does not matter: devirtualizing
+   (`call_ref` of a `ref.func` to `call`) reads the value's producer, not
+   its type, as Binaryen does, and LLVM's opaque pointers and Cranelift's
+   integer callees put the signature on the call. What decides it is Wasm:
+   - **Table indices and `call_indirect $t`** (MVP, Cranelift's model, the
+     old pipeline's): the value is an `i32`, the signature is the call's
+     and checked at run time.
+   - **Typed references and `call_ref $t`** (the function-references
+     extension, opt-in): the operand must be `(ref null $t)`, so every
+     local and block holding one is declared with its type, and MIR's value
+     carries it. A bare `funcref` would need codegen to infer local types or
+     a `ref.cast` (GC) at each call.
+   TIR gives `func(A) -> R` the representation `funcref`, so `transmute`
+   between two function types checks today; under typed references that is
+   a cast, not a no-op, and the representation would have to name the
+   signature.
 
 Closed:
 
-- **`Transmute` between struct types.** It takes a multi-result value whole
-  and gives the same values under the target's types (`U32` and `I32` stay
-  apart, since a node's type picks its instruction), as it does today. A
-  struct of one scalar (`Char`, `Meters(u32)`) is that scalar, so the `opt`
-  builder's one-slot case (`opt/builder.rs:376`) goes, and so does the
-  `Transmute` around a global's read or write
-  (`tir/lower/intrinsics.rs:320`) wherever the two types are now equal.
+- **Where a multi-result type's list is kept:** in today's aggregate
+  table, without the memory layout: `ValueType::Aggregate` names a list of
+  two or more scalars, the type of a `Values`, a call or a block. A value
+  of one scalar is that scalar (`Char`, `Meters(u32)`), so the table holds
+  no list of one, and a constant pattern on a struct decides by the TIR
+  type, not the MIR one, that it compares by `PartialEq`. Renaming the
+  variant is left for when `opt` stops using it (step 2).
+
+- **`Transmute`.** It goes (step 2.1). `transmute` requires the same
+  `StackValue::Repr`, the same scalars in the same order, so with Wasm
+  types both sides are one list, and its only job, retyping a value so that
+  its users pick another instruction, is the opcode's now. Lowering returns
+  the operand. Two struct types with the same scalars are one MIR type
+  because the signature table is interned ("Types are Wasm's").
 - **A struct value as one node.** It stays one (`Values`, a call, a
   block); only reading one field needs it in locals.
 
@@ -459,12 +619,91 @@ by lowering.
 
 ## Order of work
 
-1. **Scalar MIR with multi-result nodes:** `Values`, `SetLocals` and the
-   `targets` column; lowering's struct locals and field reads; the `opt`
-   builder; `backend_tests.rs` (which builds aggregates by hand). The
-   wasmtime tests check the results do not change.
-2. **`opt` outputs MIR; codegen gets the MIR → wasm walk**, with the
-   child-or-local rules for control-flow values.
+1. **Scalar MIR with multi-result nodes** (done): `Values`, `SetLocals`
+   and the `targets` column; lowering's struct locals and field reads
+   (`LocalRun`, `read_locals`/`write_locals` in `tir/lower.rs`); per-scalar
+   loads and stores at TIR's offsets (`places.rs`); flat parameters, which
+   the inliner binds with a `SetLocals` per struct argument; `verify`
+   rejects a local that is not one scalar. The `opt` builder takes
+   `SetLocals` apart into bindings; its struct machinery for bindings
+   (aggregate loop and join params) is unreachable now and goes with
+   step 2, which removes its aggregate nodes.
+
+   Where the data lives after step 1:
+   - **Memory layout is TIR's** (`tir/layout.rs`), as runs into two
+     columns shared by every layout (`field_offsets`, `scalars`: each
+     scalar's `Primitive` and byte offset); a load or a store reads an
+     offset in place (`Layouts::scalar_offset`). Its unread per-field
+     scalar ranges are gone.
+   - **The stack shape is lowering's** (`tir/lower/shapes.rs`), its only
+     reader: each type's MIR type and a run of `field_scalars`, each
+     field's range among the scalars. The scalars' types are MIR's
+     aggregate table; nothing is stored twice. A debug check in
+     `place_value` keeps the two flattenings in one order. `StackValue`
+     keeps its own walk, since it judges abstract types.
+   - Nothing is cached that a lookup already answers: a call counts its
+     callee's parameters from the checked signature.
+
+   Still allocating, deliberately: `memory_values` copies its rows (the
+   evaluator expands arrays from them); MIR's aggregate table keeps a box
+   per entry; lowering collects node ids in a `Vec` before `state.list`.
+2. **`opt` outputs MIR; codegen gets the MIR → wasm walk**, in five
+   steps, each leaving every test passing:
+   1. **MIR's vocabulary** (done; "MIR's vocabulary" above): Wasm types;
+      flat opcodes with their properties; accesses with their width;
+      lowering picks all of it from TIR types. The `opt` builder copies
+      opcodes instead of choosing them.
+
+      Where it landed:
+      - **The opcodes** are `mir/body.rs`'s `UnaryOp`, `BinaryOp`,
+        `CompareOp`, `ConvertOp`, `LoadAccess` and `StoreAccess`, each with
+        what `verify` reads (`operands()`, `converts`, `value_type`) and
+        `can_trap()`, which the builder asserts where it puts an operation
+        in program order. `verify` rejects an operation whose types its
+        opcode does not take (`VerifyError::OpcodeType`); a diverging
+        operand fits anything.
+      - **The signature table** is `mir/signatures.rs` (`Signatures`,
+        `MIR::signatures`, interned by a `HashTable` over its column, as
+        `tir/layout.rs` interns its aggregates);
+        the aggregate table, the old `FunctionSignature` list and the dead
+        `SignatureInterner` are gone. It keeps Wasm's name for a
+        signature's index, `SignatureIndex`, though an entry with no
+        parameters also types a multi-result value.
+        Codegen still interns its own type section from it, by use.
+      - **Lowering** reads an operator's opcode off its operand's source
+        type through TIR's `Primitive` (`scalar_primitive`: an enum is its
+        repr's, so `Bool` is a `u8`), a load's or a store's access off the
+        layout's scalar (`Layouts::scalar` gives the primitive with the
+        offset), an integer pattern's bits the same way, and an intrinsic
+        is one opcode. A constant is its bits: a `Bool` constant is no
+        longer forced to 0 or 1.
+      - **`opt`** keeps its own node kinds; the builder maps an opcode to
+        one without reading a type (`MemAccess::load`/`store`).
+      - Output is byte-identical to step 1's on every example.
+   2. **The codegen walk**, MIR → `wasm::Function`, tested without `opt`: a
+      test-only switch in `backend::emit` skips `opt`, so every wasmtime
+      suite (lowering's, `backend_tests.rs`, the inliner's) also runs
+      lowering's MIR straight through the walk. `coalesce_locals`,
+      `peephole_local_tee` and the debug local check run on its output
+      unchanged. The old path stays the default.
+   3. **`opt` writes MIR.** Emission builds a MIR body: a value inlined at
+      its user is a child expression, a value in a local a `LocalSet`
+      statement and a `LocalGet`; a phi is a `LocalSet` in each arm; a
+      carried binding's update a `LocalSet` before its `Break`; an `opt`
+      block maps back to a label, a synthetic one gets a fresh label.
+      Placement and `should_spill` stay. Codegen becomes builder →
+      scheduler (MIR) → walk, and the scheduler's wasm emission goes. The
+      target is parity: the same tests, about the same example sizes.
+   4. **Control-flow values on the stack**: the child-or-local rule for an
+      `IfElse`/`Switch`/`BlockJoin`'s join values ("Child of its user, or a
+      local"), and the debug test that `opt` on its own output changes
+      nothing. This is where the output improves.
+   5. **Cleanup:** the builder's struct-binding code, unreachable since
+      step 1; a loop carries every local its body sets, even one dead at
+      the loop head; the `br_table`-or-`if`-chain choice moves from the
+      builder (`should_use_br_table`, `build_switch_as_if_chain`) to
+      codegen, so a `match` stays a `Switch` through `opt`. Kept out of
+      step 3 so that parity there compares like with like.
 3. **`mir::dce`**, taking `remove_dead_functions` from the inliner and the
    reachability walk from codegen.
 4. **`backend::emit` runs the sequence**; every harness goes through it.

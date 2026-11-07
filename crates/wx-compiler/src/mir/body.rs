@@ -3,8 +3,8 @@
 //!
 //! The arena is split by access pattern, as TIR's `Body` is: `kinds` and
 //! `types` are parallel, `lists` holds the runs of children a node has a
-//! variable number of (statements, call arguments, aggregate values), and
-//! `cases` holds `Switch` arms.
+//! variable number of (statements, call arguments, a `Values`' values),
+//! `cases` holds `Switch` arms, and `targets` the locals a `SetLocals` fills.
 //!
 //! Every node but the root is the child of exactly one node, and every node
 //! is reachable from the root ([`verify`]). So a scan over the nodes in index
@@ -12,8 +12,7 @@
 //! parent, since rewriting a node in place (inlining) breaks that.
 
 use super::{
-	FunctionId, GlobalId, Local, LocalIndex, MemoryId, ScalarRange,
-	StaticEntryId, ValueType,
+	FunctionId, GlobalId, Local, LocalIndex, MemoryId, StaticEntryId, ValueType,
 };
 use crate::index::index_newtype;
 
@@ -56,6 +55,24 @@ pub struct CaseList {
 	len: u32,
 }
 
+/// A run of `Body::targets`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub struct TargetList {
+	start: u32,
+	len: u32,
+}
+
+impl TargetList {
+	pub fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub fn is_empty(self) -> bool {
+		self.len == 0
+	}
+}
+
 /// One arm of a `Switch`: the arm taken when the selector equals `value`.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
@@ -66,54 +83,241 @@ pub struct Case {
 	pub body: ExprId,
 }
 
-/// An operator on one operand, of the node's type. `Eqz` is the exception:
-/// it compares its operand with zero and gives a `Bool`.
+// Every opcode is one Wasm instruction, its signedness and its operand
+// class its own: lowering, which knows the source types, picks it, and
+// nothing after lowering reads a type to choose an instruction
+// (`notes/mir-pipeline.md`, "MIR's vocabulary").
+
+/// Which operand types an opcode takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum Operands {
+	Integer,
+	Float,
+	Any,
+}
+
+impl Operands {
+	pub fn admit(self, ty: ValueType) -> bool {
+		match self {
+			Self::Integer => ty.is_integer(),
+			Self::Float => ty.is_float(),
+			Self::Any => ty.is_scalar(),
+		}
+	}
+}
+
+/// An operator on one operand, of the node's type; `Eqz` compares an
+/// integer with zero and gives an `I32`. Wasm has no integer negation or
+/// bitwise not: lowering writes `0 - x` and `x ^ -1`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum UnaryOp {
-	Neg,
-	BitNot,
 	Eqz,
-	Sqrt,
+	Neg,
 	Abs,
+	Sqrt,
 	Floor,
 	Ceil,
 	Trunc,
 	Nearest,
 }
 
-/// An operator on two operands of the node's type. Division, remainder and
-/// right shift are unsigned for an unsigned type
-/// ([`ValueType::is_unsigned`]).
+impl UnaryOp {
+	pub fn operands(self) -> Operands {
+		match self {
+			Self::Eqz => Operands::Integer,
+			_ => Operands::Float,
+		}
+	}
+}
+
+/// An operator on two operands of the node's type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum BinaryOp {
 	Add,
 	Sub,
 	Mul,
-	Div,
-	Rem,
-	BitAnd,
-	BitOr,
-	BitXor,
+	And,
+	Or,
+	Xor,
 	Shl,
-	Shr,
+	ShrS,
+	ShrU,
+	DivS,
+	DivU,
+	RemS,
+	RemU,
+	Div,
 	Min,
 	Max,
 	Copysign,
 }
 
-/// A comparison of two operands of one type, giving a `Bool`. Ordering is
-/// unsigned for an unsigned operand type.
+impl BinaryOp {
+	pub fn operands(self) -> Operands {
+		match self {
+			Self::Add | Self::Sub | Self::Mul => Operands::Any,
+			Self::And
+			| Self::Or
+			| Self::Xor
+			| Self::Shl
+			| Self::ShrS
+			| Self::ShrU
+			| Self::DivS
+			| Self::DivU
+			| Self::RemS
+			| Self::RemU => Operands::Integer,
+			Self::Div | Self::Min | Self::Max | Self::Copysign => {
+				Operands::Float
+			}
+		}
+	}
+
+	/// Traps on some operands: a zero divisor, or `MIN / -1`.
+	pub fn can_trap(self) -> bool {
+		matches!(self, Self::DivS | Self::DivU | Self::RemS | Self::RemU)
+	}
+}
+
+/// A comparison of two operands of one type, giving an `I32` of 0 or 1.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum CompareOp {
 	Eq,
 	Ne,
+	LtS,
+	LtU,
+	LeS,
+	LeU,
+	GtS,
+	GtU,
+	GeS,
+	GeU,
 	Lt,
 	Le,
 	Gt,
 	Ge,
+}
+
+impl CompareOp {
+	pub fn operands(self) -> Operands {
+		match self {
+			Self::Eq | Self::Ne => Operands::Any,
+			Self::LtS
+			| Self::LtU
+			| Self::LeS
+			| Self::LeU
+			| Self::GtS
+			| Self::GtU
+			| Self::GeS
+			| Self::GeU => Operands::Integer,
+			Self::Lt | Self::Le | Self::Gt | Self::Ge => Operands::Float,
+		}
+	}
+}
+
+/// A conversion from the operand's type to the node's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum ConvertOp {
+	/// `I32` to `I64`, sign- or zero-extended.
+	ExtendS,
+	ExtendU,
+	/// `I64` to `I32`, its low bits.
+	Wrap,
+	/// A float to an integer, rounded toward zero; traps when it does not
+	/// fit.
+	TruncS,
+	TruncU,
+	/// An integer to a float, read signed or unsigned.
+	ConvertS,
+	ConvertU,
+	/// `F32` to `F64`, and back.
+	Promote,
+	Demote,
+	/// The bits of an `F32`/`I32` or `F64`/`I64` read as the other.
+	Reinterpret,
+}
+
+impl ConvertOp {
+	/// Whether it converts `from` to `to`.
+	pub fn converts(self, from: ValueType, to: ValueType) -> bool {
+		use ValueType::*;
+		match self {
+			Self::ExtendS | Self::ExtendU => (from, to) == (I32, I64),
+			Self::Wrap => (from, to) == (I64, I32),
+			Self::TruncS | Self::TruncU => from.is_float() && to.is_integer(),
+			Self::ConvertS | Self::ConvertU => {
+				from.is_integer() && to.is_float()
+			}
+			Self::Promote => (from, to) == (F32, F64),
+			Self::Demote => (from, to) == (F64, F32),
+			Self::Reinterpret => matches!(
+				(from, to),
+				(I32, F32) | (F32, I32) | (I64, F64) | (F64, I64)
+			),
+		}
+	}
+
+	/// Traps on some operands: a float that no integer of the type holds.
+	pub fn can_trap(self) -> bool {
+		matches!(self, Self::TruncS | Self::TruncU)
+	}
+}
+
+/// How a load reads memory: its width, and for a narrow one how it is
+/// extended to an `I32`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum LoadAccess {
+	I8S,
+	I8U,
+	I16S,
+	I16U,
+	I32,
+	I64,
+	F32,
+	F64,
+}
+
+impl LoadAccess {
+	/// The type of the value it loads.
+	pub fn value_type(self) -> ValueType {
+		match self {
+			Self::I8S | Self::I8U | Self::I16S | Self::I16U | Self::I32 => {
+				ValueType::I32
+			}
+			Self::I64 => ValueType::I64,
+			Self::F32 => ValueType::F32,
+			Self::F64 => ValueType::F64,
+		}
+	}
+}
+
+/// How many bytes a store writes: a narrow one writes an `I32`'s low bits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum StoreAccess {
+	I8,
+	I16,
+	I32,
+	I64,
+	F32,
+	F64,
+}
+
+impl StoreAccess {
+	/// The type of the value it stores.
+	pub fn value_type(self) -> ValueType {
+		match self {
+			Self::I8 | Self::I16 | Self::I32 => ValueType::I32,
+			Self::I64 => ValueType::I64,
+			Self::F32 => ValueType::F32,
+			Self::F64 => ValueType::F64,
+		}
+	}
 }
 
 #[derive(Clone, Copy)]
@@ -136,21 +340,16 @@ pub enum ExprKind {
 		local: LocalIndex,
 		value: ExprId,
 	},
-	/// A flat value pack: every value is one scalar, in declaration
-	/// pre-order. Zero-sized initializer effects are sequenced outside it.
-	Aggregate {
+	/// Several values as one: each pushed in order, every one a scalar.
+	/// Zero-sized initializer effects are sequenced outside it.
+	Values {
 		values: ExprList,
 	},
-	/// A scalar or flat subpack of a local, selected by slot range.
-	AggregateGet {
-		local: LocalIndex,
-		range: ScalarRange,
-	},
-	/// Replace a local's slots in `range` with `value`, evaluated once. An
-	/// empty range still evaluates `value`.
-	AggregateSet {
-		local: LocalIndex,
-		range: ScalarRange,
+	/// Pop `value`'s results into `targets`, one per result, in order;
+	/// `None` drops that result. How a multi-result value is taken apart:
+	/// nothing else takes one result out of several.
+	SetLocals {
+		targets: TargetList,
 		value: ExprId,
 	},
 	Global {
@@ -175,23 +374,9 @@ pub enum ExprKind {
 		lhs: ExprId,
 		rhs: ExprId,
 	},
-	/// A numeric conversion, chosen by the operand's type and the node's:
-	/// extend, wrap, convert, truncate, promote or demote. An integer's
-	/// signedness is the operand's for an extension or a conversion to a
-	/// float, the node's for a truncation.
+	/// `value` converted from its type to the node's.
 	Convert {
-		value: ExprId,
-	},
-	/// The bits of an `f32`/`i32` or `f64`/`i64` read as the other.
-	Reinterpret {
-		value: ExprId,
-	},
-	/// `value`'s Wasm values read as the node's type (std's `transmute`):
-	/// both flatten to the same scalars in the same order, so no instruction
-	/// is emitted. A node of its own rather than a rewritten type, because a
-	/// node's own type selects its instruction (`DivS` or `DivU`), while its
-	/// consumers read the transmuted one.
-	Transmute {
+		op: ConvertOp,
 		value: ExprId,
 	},
 
@@ -280,18 +465,20 @@ pub enum ExprKind {
 		src: ExprId,
 		len: ExprId,
 	},
-	/// Load the node's type from `pointer + offset`.
+	/// Load the node's type from `pointer + offset`, as `access` reads it.
 	PointerLoad {
 		pointer: ExprId,
 		offset: u32,
 		memory: MemoryId,
+		access: LoadAccess,
 	},
-	/// Store `value` to `pointer + offset`.
+	/// Store `value` to `pointer + offset`, as `access` writes it.
 	PointerStore {
 		pointer: ExprId,
 		value: ExprId,
 		offset: u32,
 		memory: MemoryId,
+		access: StoreAccess,
 	},
 	/// The address `offset` bytes into a static data entry
 	/// (`MIR::static_entries`). The entries a function uses are read off
@@ -310,6 +497,8 @@ pub enum Id<'a> {
 	Expr(&'a mut ExprId),
 	List(&'a mut ExprList),
 	Cases(&'a mut CaseList),
+	/// A run of target locals; its entries are in the body, as a list's.
+	Targets(&'a mut TargetList),
 	Local(&'a mut LocalIndex),
 	Label(&'a mut LabelId),
 }
@@ -330,22 +519,21 @@ impl ExprKind {
 			| Self::MemoryIndex { .. }
 			| Self::MemorySize { .. }
 			| Self::StaticPointer { .. } => {}
-			Self::LocalGet { local } | Self::AggregateGet { local, .. } => {
-				f(Id::Local(local))
-			}
-			Self::LocalSet { local, value }
-			| Self::AggregateSet { local, value, .. } => {
+			Self::LocalGet { local } => f(Id::Local(local)),
+			Self::LocalSet { local, value } => {
 				f(Id::Local(local));
 				f(Id::Expr(value));
 			}
-			Self::Aggregate { values: list }
+			Self::SetLocals { targets, value } => {
+				f(Id::Targets(targets));
+				f(Id::Expr(value));
+			}
+			Self::Values { values: list }
 			| Self::Sequence { statements: list }
 			| Self::Call { args: list, .. } => f(Id::List(list)),
 			Self::GlobalSet { value, .. }
 			| Self::Unary { value, .. }
-			| Self::Convert { value }
-			| Self::Reinterpret { value }
-			| Self::Transmute { value }
+			| Self::Convert { value, .. }
 			| Self::Drop { value }
 			| Self::MemoryGrow { delta: value, .. } => f(Id::Expr(value)),
 			Self::Binary { lhs, rhs, .. } | Self::Compare { lhs, rhs, .. } => {
@@ -418,22 +606,18 @@ impl ExprKind {
 impl ExprKind {
 	/// About how many bytes the node's own instructions encode to, not
 	/// counting its children: the inliner's measure of a function
-	/// (`notes/mir-inlining.md`). A node that emits nothing (`Sequence`,
-	/// `Transmute`, an `Aggregate`, whose values are its children) costs 0.
+	/// (`notes/mir-inlining.md`). A node that emits nothing (`Sequence`, a
+	/// `Values`, whose values are its children) costs 0.
 	/// An estimate: an opcode is a byte, an index or a small constant one
 	/// more, a `memarg` two.
 	pub fn cost(&self) -> u32 {
 		match self {
-			Self::Noop
-			| Self::Sequence { .. }
-			| Self::Transmute { .. }
-			| Self::Aggregate { .. } => 0,
+			Self::Noop | Self::Sequence { .. } | Self::Values { .. } => 0,
 			Self::Unreachable
 			| Self::Unary { .. }
 			| Self::Binary { .. }
 			| Self::Compare { .. }
 			| Self::Convert { .. }
-			| Self::Reinterpret { .. }
 			| Self::Drop { .. }
 			| Self::Return { .. } => 1,
 			// An opcode and `end`; an `if` with an `else` one more.
@@ -456,9 +640,8 @@ impl ExprKind {
 			| Self::StaticPointer { .. } => 2,
 			// An `f32` or an `f64`: the node does not say which.
 			Self::Float { .. } => 5,
-			// One `local.get` or `local.set` per slot.
-			Self::AggregateGet { range, .. }
-			| Self::AggregateSet { range, .. } => 2 * range.len,
+			// A `local.set` or a `drop` per result.
+			Self::SetLocals { targets, .. } => 2 * targets.len,
 			// A table of depths, one per case.
 			Self::Switch { cases, .. } => 2 + cases.len,
 			Self::MemoryFill { .. }
@@ -476,6 +659,7 @@ pub struct Body {
 	types: Vec<ValueType>,
 	lists: Vec<ExprId>,
 	cases: Vec<Case>,
+	targets: Vec<Option<LocalIndex>>,
 }
 
 impl Body {
@@ -493,6 +677,20 @@ impl Body {
 
 	pub fn cases(&self, cases: CaseList) -> &[Case] {
 		&self.cases[cases.start as usize..(cases.start + cases.len) as usize]
+	}
+
+	pub fn targets(&self, targets: TargetList) -> &[Option<LocalIndex>] {
+		&self.targets
+			[targets.start as usize..(targets.start + targets.len) as usize]
+	}
+
+	/// The entries of a target run, to rename the locals in place.
+	pub fn targets_mut(
+		&mut self,
+		targets: TargetList,
+	) -> &mut [Option<LocalIndex>] {
+		&mut self.targets
+			[targets.start as usize..(targets.start + targets.len) as usize]
 	}
 
 	/// How many nodes there are; every `ExprId` is below it.
@@ -540,6 +738,16 @@ impl Body {
 		CaseList { start, len }
 	}
 
+	pub fn push_targets(
+		&mut self,
+		targets: impl IntoIterator<Item = Option<LocalIndex>>,
+	) -> TargetList {
+		let start = u32::try_from(self.targets.len()).unwrap();
+		self.targets.extend(targets);
+		let len = u32::try_from(self.targets.len()).unwrap() - start;
+		TargetList { start, len }
+	}
+
 	/// Every node, mutably, in index order. Rewriting a node's indices must
 	/// keep the arena's invariants ([`verify`]).
 	pub fn kinds_mut(&mut self) -> &mut [ExprKind] {
@@ -569,6 +777,10 @@ impl Body {
 		let exprs = u32::try_from(self.kinds.len()).unwrap();
 		let lists = u32::try_from(self.lists.len()).unwrap();
 		let cases = u32::try_from(self.cases.len()).unwrap();
+		let targets = u32::try_from(self.targets.len()).unwrap();
+		self.targets.extend(other.targets.iter().map(|target| {
+			target.map(|local| LocalIndex::new(u32::from(local) + locals))
+		}));
 		self.lists
 			.extend(other.lists.iter().map(|&id| shift_expr(id, exprs)));
 		self.cases.extend(other.cases.iter().map(|case| Case {
@@ -590,6 +802,7 @@ impl Body {
 						list.start += cases;
 					}
 				}
+				Id::Targets(list) => list.start += targets,
 				Id::Local(local) => {
 					*local = LocalIndex::new(u32::from(*local) + locals)
 				}
@@ -632,18 +845,29 @@ pub enum VerifyError {
 	/// A `Break` or `Continue` outside the node owning its label, or a
 	/// `Continue` of a `Block`'s label.
 	BadTarget { expr: ExprId },
+	/// A local that is not one scalar: every local holds one Wasm value.
+	NonScalarLocal { local: LocalIndex },
+	/// An operation whose operand or result type its opcode or access does
+	/// not take (`DivS` of an `F32`, an `I8U` load of an `I64`).
+	OpcodeType { expr: ExprId },
 }
 
-/// Check `body`'s invariants from `root`: every id in range, every node in the
-/// tree exactly once, every label owned by one `Block` or `Loop`, and every
-/// `Break` and `Continue` inside the node owning its label (a `Continue`'s a
-/// `Loop`).
+/// Check `body`'s invariants from `root`: every local one scalar, every id in
+/// range, every node in the tree exactly once, every label owned by one
+/// `Block` or `Loop`, every `Break` and `Continue` inside the node owning
+/// its label (a `Continue`'s a `Loop`), and every operation's types ones its
+/// opcode takes.
 pub fn verify(
 	body: &Body,
 	root: ExprId,
 	locals: &[Local],
 	label_count: u32,
 ) -> Result<(), VerifyError> {
+	if let Some(local) = locals.iter().position(|local| !local.ty.is_scalar()) {
+		return Err(VerifyError::NonScalarLocal {
+			local: LocalIndex::new(local as u32),
+		});
+	}
 	#[derive(Clone, Copy, PartialEq)]
 	enum Owner {
 		None,
@@ -692,6 +916,17 @@ pub fn verify(
 					children.extend(body.cases(*cases).iter().map(|c| c.body));
 				}
 			}
+			Id::Targets(targets) => {
+				if (targets.start + targets.len) as usize > body.targets.len()
+					|| body
+						.targets(*targets)
+						.iter()
+						.flatten()
+						.any(|local| usize::from(*local) >= locals.len())
+				{
+					in_range = false;
+				}
+			}
 			Id::Local(local) => {
 				if usize::from(*local) >= locals.len() {
 					in_range = false;
@@ -705,6 +940,9 @@ pub fn verify(
 		});
 		if !in_range {
 			return Err(VerifyError::OutOfRange { expr });
+		}
+		if !operation_types_fit(body, expr) {
+			return Err(VerifyError::OpcodeType { expr });
 		}
 		match kind {
 			ExprKind::Block { label, .. } | ExprKind::Loop { label, .. } => {
@@ -742,6 +980,51 @@ pub fn verify(
 			expr: ExprId::new(orphan as u32),
 		}),
 		None => Ok(()),
+	}
+}
+
+/// Whether `expr`'s opcode or access takes its operands' types and its own.
+/// A diverging operand never gives the operation a value, so it fits.
+fn operation_types_fit(body: &Body, expr: ExprId) -> bool {
+	let ty = body.ty(expr);
+	let operand = |value: ExprId| body.ty(value);
+	match body.kind(expr) {
+		ExprKind::Unary { op, value } => {
+			let from = operand(value);
+			from == ValueType::Never
+				|| op.operands().admit(from)
+					&& ty
+						== if op == UnaryOp::Eqz {
+							ValueType::I32
+						} else {
+							from
+						}
+		}
+		ExprKind::Binary { op, lhs, rhs } => {
+			let (lhs, rhs) = (operand(lhs), operand(rhs));
+			lhs == ValueType::Never
+				|| rhs == ValueType::Never
+				|| op.operands().admit(ty) && lhs == ty && rhs == ty
+		}
+		ExprKind::Compare { op, lhs, rhs } => {
+			let (lhs, rhs) = (operand(lhs), operand(rhs));
+			lhs == ValueType::Never
+				|| rhs == ValueType::Never
+				|| op.operands().admit(lhs)
+					&& rhs == lhs && ty == ValueType::I32
+		}
+		ExprKind::Convert { op, value } => {
+			let from = operand(value);
+			from == ValueType::Never || op.converts(from, ty)
+		}
+		ExprKind::PointerLoad {
+			pointer, access, ..
+		} => operand(pointer) == ValueType::Never || ty == access.value_type(),
+		ExprKind::PointerStore { value, access, .. } => {
+			let value = operand(value);
+			value == ValueType::Never || value == access.value_type()
+		}
+		_ => true,
 	}
 }
 
@@ -809,6 +1092,25 @@ mod tests {
 		assert!(matches!(
 			verify(&body, root, &[], 0),
 			Err(VerifyError::Shared { .. })
+		));
+	}
+
+	#[test]
+	fn an_opcode_given_a_type_it_does_not_take_is_rejected() {
+		let mut body = Body::default();
+		let one = body.push(ExprKind::Float { value: 1.0 }, ValueType::F32);
+		let two = body.push(ExprKind::Float { value: 2.0 }, ValueType::F32);
+		let root = body.push(
+			ExprKind::Binary {
+				op: BinaryOp::DivS,
+				lhs: one,
+				rhs: two,
+			},
+			ValueType::F32,
+		);
+		assert!(matches!(
+			verify(&body, root, &[], 0),
+			Err(VerifyError::OpcodeType { .. })
 		));
 	}
 

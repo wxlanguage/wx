@@ -11,7 +11,6 @@ use string_interner::symbol::SymbolU32;
 
 use crate::ast::StringInterner;
 use crate::mir;
-use crate::wasm;
 
 /// A function under construction: its arena, locals and labels.
 struct Fixture {
@@ -109,13 +108,13 @@ impl Fixture {
 	/// MIR's invariants, as lowering's does.
 	fn finish(
 		self,
-		signature_index: mir::SignatureIndex,
+		signature: mir::SignatureIndex,
 		root: mir::ExprId,
 	) -> mir::Function {
 		mir::body::verify(&self.body, root, &self.locals, self.label_count)
 			.expect("a fixture is a valid MIR arena");
 		mir::Function {
-			signature_index,
+			signature,
 			origin: mir::Origin::Defined(mir::Code {
 				locals: self.locals,
 				label_count: self.label_count,
@@ -126,13 +125,12 @@ impl Fixture {
 	}
 }
 
-/// A module of `functions`, which export `exports` and use `signatures`,
-/// `aggregates` and `memories`.
+/// A module of `functions`, which export `exports` and use `signatures`
+/// and `memories`.
 fn module(
 	functions: Vec<mir::Function>,
-	signatures: Vec<mir::FunctionSignature>,
+	signatures: mir::Signatures,
 	exports: Vec<mir::Export>,
-	aggregates: Box<[mir::Aggregate]>,
 	memories: Vec<mir::MemoryInfo>,
 ) -> mir::MIR {
 	let function_flags = vec![mir::FunctionFlags::empty(); functions.len()];
@@ -144,7 +142,6 @@ fn module(
 		exports,
 		imports: Vec::new(),
 		memories,
-		aggregates,
 		static_entries: Vec::new(),
 		start_function: None,
 	}
@@ -157,24 +154,13 @@ fn export(name: SymbolU32) -> Vec<mir::Export> {
 	}]
 }
 
-fn signature(
-	items: impl Into<Box<[mir::ValueType]>>,
-	params_count: usize,
-) -> mir::FunctionSignature {
-	mir::FunctionSignature {
-		items: items.into(),
-		params_count,
-	}
-}
-
 /// `func add(a: i32, b: i32) -> i32 { a + b }`, written directly as MIR, with
 /// the body built by `body` over the two `i32` parameters.
 ///
 /// Contract this fixture depends on:
-/// - parameters are the first `params_count` entries of `Function::locals`,
+/// - parameters are the first entries of `Function::locals`,
 /// - the root's value is returned implicitly,
-/// - `MIR::signatures[signature_index]` is the sole source of the Wasm
-///   signature.
+/// - `MIR::signatures[signature]` is the sole source of the Wasm signature.
 fn scalar_function(
 	name: SymbolU32,
 	body: impl FnOnce(&mut Fixture) -> mir::ExprId,
@@ -182,11 +168,12 @@ fn scalar_function(
 	let i32_ty = mir::ValueType::I32;
 	let mut fixture = Fixture::new(&[i32_ty, i32_ty]);
 	let root = body(&mut fixture);
+	let mut signatures = mir::Signatures::default();
+	let signature = signatures.intern(&[i32_ty, i32_ty], &[i32_ty]);
 	module(
-		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
-		vec![signature([i32_ty, i32_ty, i32_ty], 2)],
+		vec![fixture.finish(signature, root)],
+		signatures,
 		export(name),
-		Box::new([]),
 		Vec::new(),
 	)
 }
@@ -254,15 +241,6 @@ fn hand_built_scalar_add_exports_only_the_requested_name() {
 	);
 }
 
-/// A signature-only check that does not execute anything: flattening a
-/// zero-slot result must not produce a Wasm result slot.
-#[test]
-fn unit_result_flattens_to_no_wasm_slots() {
-	assert!(
-		wasm::flatten_type_to_scalars(mir::ValueType::Unit, &[]).is_empty()
-	);
-}
-
 /// `triple` (id 1) calls `add` (id 0) and is the only export. A call names its
 /// callee by `FunctionId`, which codegen maps to a Wasm index through its own
 /// table, so the export's index and the callee's are both looked up.
@@ -274,8 +252,9 @@ fn direct_call_resolves_its_callee_by_id() {
 	let i32_ty = mir::ValueType::I32;
 	let add_id = mir::FunctionId::new(0);
 	let triple_id = mir::FunctionId::new(1);
-	let add_sig = mir::SignatureIndex::new(0);
-	let triple_sig = mir::SignatureIndex::new(1);
+	let mut signatures = mir::Signatures::default();
+	let add_sig = signatures.intern(&[i32_ty, i32_ty], &[i32_ty]);
+	let triple_sig = signatures.intern(&[i32_ty], &[i32_ty]);
 
 	let mut add = Fixture::new(&[i32_ty, i32_ty]);
 	let a = add.local(0, i32_ty);
@@ -304,15 +283,11 @@ fn direct_call_resolves_its_callee_by_id() {
 
 	let mir = module(
 		vec![add, triple],
-		vec![
-			signature([i32_ty, i32_ty, i32_ty], 2),
-			signature([i32_ty, i32_ty], 1),
-		],
+		signatures,
 		vec![mir::Export {
 			name: triple_name,
 			item: mir::Item::Function(triple_id),
 		}],
-		Box::new([]),
 		Vec::new(),
 	);
 
@@ -324,230 +299,117 @@ fn direct_call_resolves_its_callee_by_id() {
 	assert_eq!(triple.call(&mut store, -2).unwrap(), -6);
 }
 
-// ── Aggregate layout fixtures ────────────────────────────────────────────────
+// ── Struct value fixtures ────────────────────────────────────────────────────
 
-use crate::mir::layout::AggregateTable;
-use crate::wasm::ScalarType;
+/// The scalars of a `(u8, i64, u8)` value: a `u8` is an `I32`.
+const MIXED: [mir::ValueType; 3] = [
+	mir::ValueType::I32,
+	mir::ValueType::I64,
+	mir::ValueType::I32,
+];
 
-/// MIR for `identity(s: T) -> T`, where `T` is the aggregate at
-/// `aggregate_index`. The Wasm signature is entirely derived from
-/// `FunctionSignature::items` + the aggregate's scalars, so this pins the
-/// parameter/result flattening without involving TIR.
-fn aggregate_identity_mir(
+/// The type of a `(u8, i64, u8)` value, and the table it is in.
+fn mixed_type() -> (mir::ValueType, mir::Signatures) {
+	let mut signatures = mir::Signatures::default();
+	(signatures.value_of(&MIXED), signatures)
+}
+
+/// The `Values` of locals `0..3`, the three scalars of a `(u8, i64, u8)`
+/// parameter.
+fn mixed_param(f: &mut Fixture, ty: mir::ValueType) -> mir::ExprId {
+	let a = f.local(0, mir::ValueType::I32);
+	let b = f.local(1, mir::ValueType::I64);
+	let c = f.local(2, mir::ValueType::I32);
+	let values = f.body.push_list([a, b, c]);
+	f.push(mir::ExprKind::Values { values }, ty)
+}
+
+/// MIR for `identity(s: (u8, i64, u8)) -> (u8, i64, u8)`, with the body
+/// `body` builds over the parameter's three locals.
+fn mixed_identity_mir(
 	name: SymbolU32,
-	aggregate_index: mir::AggregateIndex,
-	aggregates: Box<[mir::Aggregate]>,
+	memories: Vec<mir::MemoryInfo>,
+	body: impl FnOnce(&mut Fixture, mir::ValueType) -> mir::ExprId,
 ) -> mir::MIR {
-	let ty = mir::ValueType::Aggregate { aggregate_index };
-	let mut fixture = Fixture::new(&[ty]);
-	let root = fixture.local(0, ty);
+	let (ty, mut signatures) = mixed_type();
+	let mut fixture = Fixture::new(&MIXED);
+	let root = body(&mut fixture, ty);
+	let signature = signatures.intern(&MIXED, &MIXED);
 	module(
-		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
-		vec![signature([ty, ty], 1)],
+		vec![fixture.finish(signature, root)],
+		signatures,
 		export(name),
-		aggregates,
-		Vec::new(),
+		memories,
 	)
 }
 
-fn run_aggregate_identity(mir: &mir::MIR, interner: &StringInterner) {
+fn run_mixed_identity(mir: &mir::MIR, interner: &StringInterner) {
 	let (mut store, instance) = run(mir, interner);
 	let identity = instance
 		.get_typed_func::<(i32, i64, i32), (i32, i64, i32)>(
 			&mut store, "identity",
 		)
-		.expect("an aggregate's Wasm ABI is its flattened scalars");
+		.expect("a struct's Wasm ABI is its scalars");
 
 	let input = (7, 1 << 40, 9);
 	assert_eq!(identity.call(&mut store, input).unwrap(), input);
 }
 
-/// `struct S { a: u8, b: i64, c: u8 }` is laid out alignment-sorted, so its
-/// memory offsets are `b=0, a=8, c=9` — but its *value* order, and therefore
-/// its Wasm parameter and result order, stays declaration order: `a, b, c`.
+/// A struct value is its scalars in declaration order, as a parameter (one
+/// local each) and as a result (one Wasm result each), whatever its memory
+/// layout: TIR sorts `struct S(a: u8, b: i64, c: u8)`'s offsets to `b=0,
+/// a=8, c=9`, and MIR never sees them.
+#[test]
+fn a_struct_value_is_its_scalars_in_declaration_order() {
+	let mut interner = StringInterner::new();
+	let name = interner.get_or_intern("identity");
+	let (ty, signatures) = mixed_type();
+	assert_eq!(signatures.scalars(&ty), MIXED);
+
+	let mir = mixed_identity_mir(name, Vec::new(), mixed_param);
+	run_mixed_identity(&mir, &interner);
+}
+
+/// A struct in memory is one store and one load per scalar, at its offset
+/// and with its width: lowering writes them from TIR's layout (here the
+/// sorted `8, 0, 9`, a `u8` one byte), so the round trip through memory
+/// returns the value unchanged.
 ///
-/// This is the fixture that keeps "memory order is never a value order"
-/// honest: an encoder that sorted the slots would call this with the wrong
-/// values, and the round trip below would fail.
+/// ```text
+/// Sequence [
+///     PointerStore { 0, local 0, offset 8, I8 },
+///     PointerStore { 0, local 1, offset 0, I64 },
+///     PointerStore { 0, local 2, offset 9, I8 },
+///     Values [PointerLoad { 0, offset 8, I8U }, ..0, ..9],
+/// ]
+/// ```
 #[test]
-fn aggregate_slots_stay_in_declaration_order_while_offsets_are_sorted() {
+fn a_struct_in_memory_is_one_access_per_scalar() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("identity");
-
-	let mut table = AggregateTable::default();
-	let aggregate_index = table.push(
-		Box::new([mir::ValueType::U8, mir::ValueType::I64, mir::ValueType::U8]),
-		Some(mir::AggregateMemory {
-			offsets: Box::new([8, 0, 9]),
-			layout: mir::Layout { size: 16, align: 8 },
-		}),
-	);
-	let aggregates = table.finish();
-
-	let aggregate = &aggregates[usize::from(aggregate_index)];
-	let memory = aggregate.memory.as_ref().unwrap();
-	assert_eq!(
-		memory.offsets.as_ref(),
-		[8, 0, 9],
-		"memory layout is alignment-sorted"
-	);
-	assert_eq!((memory.layout.size, memory.layout.align), (16, 8));
-
-	let scalar_types: Vec<ScalarType> = aggregate
-		.scalars
-		.iter()
-		.map(|&ty| ScalarType::try_from(ty).unwrap())
-		.collect();
-	assert_eq!(
-		scalar_types,
-		vec![ScalarType::I32, ScalarType::I64, ScalarType::I32],
-		"slots follow declaration order, not memory order"
-	);
-
-	assert_eq!(
-		wasm::flatten_type_to_scalars(
-			mir::ValueType::Aggregate { aggregate_index },
-			&aggregates,
-		),
-		vec![ScalarType::I32, ScalarType::I64, ScalarType::I32],
-	);
-
-	let mir = aggregate_identity_mir(name, aggregate_index, aggregates);
-	run_aggregate_identity(&mir, &interner);
-}
-
-/// The `#[fixed_order]` counterpart: the same fields keep declaration
-/// offsets, so the only difference is memory layout. Value order is
-/// identical to the sorted case, which is what makes `#[fixed_order]` a pure
-/// layout attribute.
-#[test]
-fn fixed_order_changes_offsets_only() {
-	let mut interner = StringInterner::new();
-	let name = interner.get_or_intern("identity");
-
-	let mut table = AggregateTable::default();
-	let aggregate_index = table.push(
-		Box::new([mir::ValueType::U8, mir::ValueType::I64, mir::ValueType::U8]),
-		Some(mir::AggregateMemory {
-			offsets: Box::new([0, 8, 16]),
-			layout: mir::Layout { size: 24, align: 8 },
-		}),
-	);
-	let aggregates = table.finish();
-
-	let aggregate = &aggregates[usize::from(aggregate_index)];
-	let memory = aggregate.memory.as_ref().unwrap();
-	assert_eq!(
-		memory.offsets.as_ref(),
-		[0, 8, 16],
-		"declaration order, padded"
-	);
-	assert_eq!((memory.layout.size, memory.layout.align), (24, 8));
-
-	let mir = aggregate_identity_mir(name, aggregate_index, aggregates);
-	run_aggregate_identity(&mir, &interner);
-}
-
-/// A source zero-sized field has already disappeared. MIR selects the
-/// remaining second slot directly, without a declaration-field map.
-#[test]
-fn projection_indexes_flat_slots_not_source_fields() {
-	let mut interner = StringInterner::new();
-	let name = interner.get_or_intern("last");
-
-	let mut table = AggregateTable::default();
-	let aggregate_index = table.push(
-		Box::new([mir::ValueType::U8, mir::ValueType::U8]),
-		Some(mir::AggregateMemory {
-			offsets: Box::new([0, 1]),
-			layout: mir::Layout { size: 2, align: 1 },
-		}),
-	);
-	let aggregates = table.finish();
-
-	let aggregate = &aggregates[usize::from(aggregate_index)];
-	assert_eq!(aggregate.scalars.len(), 2);
-
-	let aggregate_ty = mir::ValueType::Aggregate { aggregate_index };
-	assert_eq!(
-		wasm::flatten_type_to_scalars(aggregate_ty, &aggregates),
-		vec![ScalarType::I32, ScalarType::I32],
-		"the zero-sized field consumes no parameter slot"
-	);
-
-	// `last(s: S) -> u8 { s.c }` — field 2, past the zero-sized field.
-	let mut fixture = Fixture::new(&[aggregate_ty]);
-	let root = fixture.push(
-		mir::ExprKind::AggregateGet {
-			local: mir::LocalIndex::new(0),
-			range: mir::ScalarRange::new(1, 1),
-		},
-		mir::ValueType::U8,
-	);
-	let mir = module(
-		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
-		vec![signature([aggregate_ty, mir::ValueType::U8], 1)],
-		export(name),
-		aggregates,
-		Vec::new(),
-	);
-
-	let (mut store, instance) = run(&mir, &interner);
-	let last = instance
-		.get_typed_func::<(i32, i32), i32>(&mut store, "last")
-		.expect("two scalar params, one scalar result");
-	assert_eq!(last.call(&mut store, (5, 42)).unwrap(), 42);
-}
-
-/// Store the reordered aggregate to memory and load it back, at the same
-/// address. The store walks declaration-order slots paired with their
-/// (sorted) byte offsets; the load walks the same pairs in reverse. Nothing
-/// permutes the value list, so the round trip must return the input
-/// unchanged.
-#[test]
-fn aggregate_memory_roundtrip_pairs_slots_with_their_offsets() {
-	let mut interner = StringInterner::new();
-	let name = interner.get_or_intern("identity");
-
-	let mut table = AggregateTable::default();
-	let aggregate_index = table.push(
-		Box::new([mir::ValueType::U8, mir::ValueType::I64, mir::ValueType::U8]),
-		Some(mir::AggregateMemory {
-			offsets: Box::new([8, 0, 9]),
-			layout: mir::Layout { size: 16, align: 8 },
-		}),
-	);
-	let aggregates = table.finish();
-	let aggregate_ty = mir::ValueType::Aggregate { aggregate_index };
 	let memory = mir::MemoryId::new(0);
-
-	let mut fixture = Fixture::new(&[aggregate_ty]);
-	let store_address = fixture.int(0, mir::ValueType::I32);
-	let param = fixture.local(0, aggregate_ty);
-	let store = fixture.push(
-		mir::ExprKind::PointerStore {
-			pointer: store_address,
-			value: param,
-			offset: 0,
-			memory,
-		},
-		mir::ValueType::Unit,
-	);
-	let load_address = fixture.int(0, mir::ValueType::I32);
-	let load = fixture.push(
-		mir::ExprKind::PointerLoad {
-			pointer: load_address,
-			offset: 0,
-			memory,
-		},
-		aggregate_ty,
-	);
-	let root = fixture.sequence([store, load], aggregate_ty);
-	let mir = module(
-		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
-		vec![signature([aggregate_ty, aggregate_ty], 1)],
-		export(name),
-		aggregates,
+	let scalars = [
+		(
+			mir::ValueType::I32,
+			8,
+			mir::LoadAccess::I8U,
+			mir::StoreAccess::I8,
+		),
+		(
+			mir::ValueType::I64,
+			0,
+			mir::LoadAccess::I64,
+			mir::StoreAccess::I64,
+		),
+		(
+			mir::ValueType::I32,
+			9,
+			mir::LoadAccess::I8U,
+			mir::StoreAccess::I8,
+		),
+	];
+	let mir = mixed_identity_mir(
+		name,
 		vec![mir::MemoryInfo {
 			id: memory,
 			kind: mir::MemoryKind::Memory32,
@@ -555,37 +417,54 @@ fn aggregate_memory_roundtrip_pairs_slots_with_their_offsets() {
 			max_pages: None,
 			origin: mir::Origin::Defined(()),
 		}],
+		|f, ty| {
+			let mut statements = Vec::new();
+			for (local, &(scalar, offset, _, access)) in
+				scalars.iter().enumerate()
+			{
+				let pointer = f.int(0, mir::ValueType::I32);
+				let value = f.local(local as u32, scalar);
+				statements.push(f.push(
+					mir::ExprKind::PointerStore {
+						pointer,
+						value,
+						offset,
+						memory,
+						access,
+					},
+					mir::ValueType::Unit,
+				));
+			}
+			let loads: Vec<_> = scalars
+				.iter()
+				.map(|&(scalar, offset, access, _)| {
+					let pointer = f.int(0, mir::ValueType::I32);
+					f.push(
+						mir::ExprKind::PointerLoad {
+							pointer,
+							offset,
+							memory,
+							access,
+						},
+						scalar,
+					)
+				})
+				.collect();
+			let values = f.body.push_list(loads);
+			statements.push(f.push(mir::ExprKind::Values { values }, ty));
+			f.sequence(statements, ty)
+		},
 	);
-
-	run_aggregate_identity(&mir, &interner);
-}
-
-#[test]
-fn flat_stack_values_do_not_require_a_memory_layout() {
-	let mut interner = StringInterner::new();
-	let name = interner.get_or_intern("identity");
-	let mut table = AggregateTable::default();
-	let index = table.push(
-		Box::new([
-			mir::ValueType::I32,
-			mir::ValueType::I64,
-			mir::ValueType::I32,
-		]),
-		None,
-	);
-	let mir = aggregate_identity_mir(name, index, table.finish());
-	assert!(mir.aggregate(index).memory.is_none());
-	run_aggregate_identity(&mir, &interner);
+	run_mixed_identity(&mir, &interner);
 }
 
 // ── Control-flow pack joins ─────────────────────────────────────────────────
 
-/// The pack every fixture below passes around: three scalars with no memory
-/// layout. Having no layout matters — it forces the aggregate through the
-/// flattened, local-per-scalar path instead of a memory round trip.
+/// The pack every fixture below passes around: three scalars, each a
+/// parameter of its own.
 const PACK_INPUT: (i32, i64, i32) = (7, 1 << 40, 9);
 
-/// The pack type and its aggregate table, for
+/// The pack type and the table it is in, for
 ///
 /// ```text
 /// fn run(pack: (i32, i64, i32), n: i32) -> (i32, i64, i32)
@@ -593,38 +472,46 @@ const PACK_INPUT: (i32, i64, i32) = (7, 1 << 40, 9);
 ///
 /// Each test builds the body as one control-flow construct and checks that
 /// the pack still crosses its join unchanged.
-fn pack_type() -> (mir::ValueType, Box<[mir::Aggregate]>) {
-	let mut table = AggregateTable::default();
-	let aggregate_index = table.push(
-		Box::new([
-			mir::ValueType::I32,
-			mir::ValueType::I64,
-			mir::ValueType::I32,
-		]),
-		None,
-	);
-	(
-		mir::ValueType::Aggregate { aggregate_index },
-		table.finish(),
-	)
+fn pack_type() -> (mir::ValueType, mir::Signatures) {
+	let mut signatures = mir::Signatures::default();
+	let scalars = [
+		mir::ValueType::I32,
+		mir::ValueType::I64,
+		mir::ValueType::I32,
+	];
+	(signatures.value_of(&scalars), signatures)
 }
 
-/// The `run` module whose body `body` builds over the pack (local 0) and `n`
-/// (local 1).
+/// The local holding `n`, after the pack's three.
+const N: u32 = 3;
+
+/// The `run` module whose body `body` builds over the pack (locals `0..3`)
+/// and `n` (local [`N`]).
 fn pack_join_mir(
 	name: SymbolU32,
 	body: impl FnOnce(&mut Fixture, mir::ValueType) -> mir::ExprId,
 ) -> mir::MIR {
-	let (pack, aggregates) = pack_type();
-	let mut fixture = Fixture::new(&[pack, mir::ValueType::I32]);
+	let (pack, mut signatures) = pack_type();
+	let (i32_ty, i64_ty) = (mir::ValueType::I32, mir::ValueType::I64);
+	let params = [i32_ty, i64_ty, i32_ty, i32_ty];
+	let mut fixture = Fixture::new(&params);
 	let root = body(&mut fixture, pack);
+	let signature = signatures.intern(&params, &params[..3]);
 	module(
-		vec![fixture.finish(mir::SignatureIndex::new(0), root)],
-		vec![signature([pack, mir::ValueType::I32, pack], 2)],
+		vec![fixture.finish(signature, root)],
+		signatures,
 		export(name),
-		aggregates,
 		Vec::new(),
 	)
+}
+
+/// The pack parameter's value: the `Values` of its three locals.
+fn pack_param(f: &mut Fixture, pack: mir::ValueType) -> mir::ExprId {
+	let first = f.local(0, mir::ValueType::I32);
+	let second = f.local(1, mir::ValueType::I64);
+	let third = f.local(2, mir::ValueType::I32);
+	let values = f.body.push_list([first, second, third]);
+	f.push(mir::ExprKind::Values { values }, pack)
 }
 
 fn pack_literal(
@@ -636,7 +523,7 @@ fn pack_literal(
 	let second = f.int(values.1, mir::ValueType::I64);
 	let third = f.int(i64::from(values.2), mir::ValueType::I32);
 	let values = f.body.push_list([first, second, third]);
-	f.push(mir::ExprKind::Aggregate { values }, pack)
+	f.push(mir::ExprKind::Values { values }, pack)
 }
 
 /// Run `mir`'s exported `run` for a few values of `n` and compare the pack
@@ -670,8 +557,8 @@ fn flat_pack_crosses_an_if_join() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
 	let mir = pack_join_mir(name, |f, pack| {
-		let condition = f.local(1, mir::ValueType::I32);
-		let then = f.local(0, pack);
+		let condition = f.local(N, mir::ValueType::I32);
+		let then = pack_param(f, pack);
 		let otherwise = pack_literal(f, pack, (1, 2, 3));
 		f.if_else(condition, then, Some(otherwise), pack)
 	});
@@ -700,11 +587,11 @@ fn flat_pack_crosses_a_switch_join() {
 	let mut interner = StringInterner::new();
 	let name = interner.get_or_intern("run");
 	let mir = pack_join_mir(name, |f, pack| {
-		let selector = f.local(1, mir::ValueType::I32);
+		let selector = f.local(N, mir::ValueType::I32);
 		let case_zero = pack_literal(f, pack, (1, 2, 3));
-		let case_one = f.local(0, pack);
+		let case_one = pack_param(f, pack);
 		let case_two = pack_literal(f, pack, (4, 5, 6));
-		let default = f.local(0, pack);
+		let default = pack_param(f, pack);
 		let cases = f.body.push_cases([
 			mir::Case {
 				value: 0,
@@ -753,13 +640,13 @@ fn flat_pack_crosses_a_loop_join() {
 		let label = f.label();
 
 		// `if n == 0 { break }`
-		let n = f.local(1, i32_ty);
+		let n = f.local(N, i32_ty);
 		let is_zero = f.push(
 			mir::ExprKind::Unary {
 				op: mir::UnaryOp::Eqz,
 				value: n,
 			},
-			mir::ValueType::Bool,
+			mir::ValueType::I32,
 		);
 		let leave = f.push(
 			mir::ExprKind::Break { label, value: None },
@@ -768,31 +655,24 @@ fn flat_pack_crosses_a_loop_join() {
 		let break_when_zero = f.if_else(is_zero, leave, None, unit);
 
 		// `pack.0 += 1`
-		let first = f.push(
-			mir::ExprKind::AggregateGet {
-				local: mir::LocalIndex::new(0),
-				range: mir::ScalarRange::new(0, 1),
-			},
-			i32_ty,
-		);
+		let first = f.local(0, i32_ty);
 		let one = f.int(1, i32_ty);
 		let bumped = f.binary(mir::BinaryOp::Add, first, one, i32_ty);
 		let bump_first_scalar = f.push(
-			mir::ExprKind::AggregateSet {
+			mir::ExprKind::LocalSet {
 				local: mir::LocalIndex::new(0),
-				range: mir::ScalarRange::new(0, 1),
 				value: bumped,
 			},
 			unit,
 		);
 
 		// `n -= 1`
-		let n = f.local(1, i32_ty);
+		let n = f.local(N, i32_ty);
 		let one = f.int(1, i32_ty);
 		let decremented = f.binary(mir::BinaryOp::Sub, n, one, i32_ty);
 		let decrement_n = f.push(
 			mir::ExprKind::LocalSet {
-				local: mir::LocalIndex::new(1),
+				local: mir::LocalIndex::new(N),
 				value: decremented,
 			},
 			unit,
@@ -801,7 +681,7 @@ fn flat_pack_crosses_a_loop_join() {
 		let body =
 			f.sequence([break_when_zero, bump_first_scalar, decrement_n], unit);
 		let looped = f.push(mir::ExprKind::Loop { label, body }, unit);
-		let result = f.local(0, pack);
+		let result = pack_param(f, pack);
 		f.sequence([looped, result], pack)
 	});
 
@@ -825,8 +705,8 @@ fn flat_pack_crosses_a_block_join() {
 	let name = interner.get_or_intern("run");
 	let mir = pack_join_mir(name, |f, pack| {
 		let label = f.label();
-		let condition = f.local(1, mir::ValueType::I32);
-		let value = f.local(0, pack);
+		let condition = f.local(N, mir::ValueType::I32);
+		let value = pack_param(f, pack);
 		let leave = f.push(
 			mir::ExprKind::Break {
 				label,
@@ -846,6 +726,72 @@ fn flat_pack_crosses_a_block_join() {
 	});
 }
 
+/// One result taken out of several: `run` reads the middle of what `pack`
+/// returns, through the `SetLocals` lowering writes for a field of a value in
+/// no local,
+///
+/// ```text
+/// Sequence [
+///     SetLocals { targets: [None, Some(t), None], value: Call pack },
+///     LocalGet t,
+/// ]
+/// ```
+///
+/// and the other two are dropped. `t` is `run`'s local 0.
+#[test]
+fn set_locals_takes_one_result_of_a_call() {
+	let mut interner = StringInterner::new();
+	let name = interner.get_or_intern("run");
+	let (pack, mut signatures) = pack_type();
+	let i64_ty = mir::ValueType::I64;
+	let pack_scalars = signatures.scalars(&pack).to_vec();
+	let callee_type = signatures.intern(&[], &pack_scalars);
+	let run_type = signatures.intern(&[], &[i64_ty]);
+
+	let mut callee = Fixture::new(&[]);
+	let root = pack_literal(&mut callee, pack, PACK_INPUT);
+	let callee = callee.finish(callee_type, root);
+
+	let mut run_fn = Fixture::new(&[i64_ty]);
+	let args = run_fn.body.push_list([]);
+	let call = run_fn.push(
+		mir::ExprKind::Call {
+			function: mir::FunctionId::new(0),
+			args,
+		},
+		pack,
+	);
+	let targets =
+		run_fn
+			.body
+			.push_targets([None, Some(mir::LocalIndex::new(0)), None]);
+	let set = run_fn.push(
+		mir::ExprKind::SetLocals {
+			targets,
+			value: call,
+		},
+		mir::ValueType::Unit,
+	);
+	let get = run_fn.local(0, i64_ty);
+	let root = run_fn.sequence([set, get], i64_ty);
+	let run_fn = run_fn.finish(run_type, root);
+
+	let mir = module(
+		vec![callee, run_fn],
+		signatures,
+		vec![mir::Export {
+			name,
+			item: mir::Item::Function(mir::FunctionId::new(1)),
+		}],
+		Vec::new(),
+	);
+	let (mut store, instance) = run(&mir, &interner);
+	let run = instance
+		.get_typed_func::<(), i64>(&mut store, "run")
+		.expect("`run` must be exported");
+	assert_eq!(run.call(&mut store, ()).unwrap(), PACK_INPUT.1);
+}
+
 /// A function body that is `Never` never falls through, but its final Wasm
 /// instruction may still be the `end` of a nested construct. The function
 /// needs an explicit terminator so validation does not expect the declared
@@ -856,7 +802,7 @@ fn a_diverging_function_body_is_terminated_for_wasm() {
 	let name = interner.get_or_intern("run");
 	let mir = scalar_function(name, |f| {
 		let i32_ty = mir::ValueType::I32;
-		let condition = f.int(1, mir::ValueType::Bool);
+		let condition = f.int(1, mir::ValueType::I32);
 		let one = f.int(1, i32_ty);
 		let then = f.ret(one);
 		let two = f.int(2, i32_ty);

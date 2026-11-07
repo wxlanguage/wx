@@ -71,7 +71,7 @@ pub fn run(mir: &mut MIR, policy: Policy) {
 			}
 			let (caller_code, callee_code) =
 				caller_and_callee(&mut mir.functions, caller, callee);
-			splice(caller_code, call, callee_code);
+			splice(caller_code, call, callee_code, &mir.signatures);
 		}
 		let code = mir.code(caller);
 		if cfg!(debug_assertions)
@@ -323,9 +323,15 @@ fn caller_and_callee(
 /// The callee's locals and labels are appended to the caller's, its nodes
 /// after the caller's with every index shifted, and each `Return` becomes a
 /// `Break` to a fresh wrapper label. The call node becomes the wrapper
-/// `Block`, keeping its type (the callee's result): first one `LocalSet` per
-/// argument into the parameter it fills, then the callee's root.
-fn splice(caller: &mut Code, call: ExprId, callee: &Code) {
+/// `Block`, keeping its type (the callee's result): first each argument
+/// stored in the parameter locals it fills, one per scalar (a `LocalSet`,
+/// a `SetLocals`, or the zero-sized argument alone), then the callee's root.
+fn splice(
+	caller: &mut Code,
+	call: ExprId,
+	callee: &Code,
+	signatures: &super::Signatures,
+) {
 	let ExprKind::Call { args, .. } = caller.body.kind(call) else {
 		unreachable!("only a call is spliced")
 	};
@@ -344,15 +350,33 @@ fn splice(caller: &mut Code, call: ExprId, callee: &Code) {
 	});
 	let args = caller.body.list(args).to_vec();
 	let mut statements = Vec::with_capacity(args.len() + 1);
-	// Parameters are the callee's first locals, one per argument.
-	for (param, value) in args.into_iter().enumerate() {
-		statements.push(caller.body.push(
-			ExprKind::LocalSet {
-				local: LocalIndex::new(locals + param as u32),
-				value,
-			},
-			ValueType::Unit,
-		));
+	// Parameters are the callee's first locals, one per scalar of each
+	// argument in turn.
+	let mut param = locals;
+	for value in args {
+		let count = signatures.scalars(&caller.body.ty(value)).len() as u32;
+		let statement = match count {
+			0 => value,
+			1 => caller.body.push(
+				ExprKind::LocalSet {
+					local: LocalIndex::new(param),
+					value,
+				},
+				ValueType::Unit,
+			),
+			_ => {
+				let targets = caller.body.push_targets(
+					(param..param + count)
+						.map(|local| Some(LocalIndex::new(local))),
+				);
+				caller.body.push(
+					ExprKind::SetLocals { targets, value },
+					ValueType::Unit,
+				)
+			}
+		};
+		statements.push(statement);
+		param += count;
 	}
 	statements.push(shift_expr(callee.root, offset));
 	let statements = caller.body.push_list(statements);

@@ -332,22 +332,22 @@ pub struct Builder {
 }
 
 impl Builder {
-	/// Intern a function signature built from a MIR signature + the aggregate
-	/// pool, correctly flattening any aggregate params/results into
-	/// individual wasm types.
+	/// The module's type index for MIR's signature `signature`, given
+	/// on first use: only the types the module's functions and blocks use
+	/// are written.
 	fn register_signature(
 		&mut self,
-		sig: &mir::FunctionSignature,
-		aggregates: &[mir::Aggregate],
+		signatures: &mir::Signatures,
+		signature: mir::SignatureIndex,
 	) -> SignatureIndex {
-		let mut param_results = Vec::new();
-		for &param in sig.params() {
-			param_results
-				.extend(wasm::flatten_type_to_scalars(param, aggregates));
-		}
-		let param_count = param_results.len();
-		param_results
-			.extend(wasm::flatten_type_to_scalars(sig.result(), aggregates));
+		let scalar = |&ty| ScalarType::try_from(ty).expect("a scalar");
+		let params = signatures.params(signature);
+		let param_count = params.len();
+		let param_results: Vec<ScalarType> = params
+			.iter()
+			.chain(signatures.results(signature))
+			.map(scalar)
+			.collect();
 		let signature = FunctionSignature {
 			param_count,
 			param_results: param_results.into_boxed_slice(),
@@ -386,9 +386,8 @@ impl Builder {
 			let desc = match import.item {
 				mir::Item::Function(id) => ImportDesc::Function {
 					signature_index: builder.register_signature(
-						&mir.signatures
-							[usize::from(mir.function(id).signature_index)],
-						&mir.aggregates,
+						&mir.signatures,
+						mir.function(id).signature,
 					),
 				},
 				mir::Item::Global(id) => {
@@ -496,10 +495,8 @@ impl Builder {
 			if func.code().is_none() {
 				continue;
 			}
-			let signature_index = builder.register_signature(
-				&mir.signatures[usize::from(func.signature_index)],
-				&mir.aggregates,
-			);
+			let signature_index =
+				builder.register_signature(&mir.signatures, func.signature);
 			function_signatures.push(signature_index);
 
 			let opt_func = crate::opt::builder::Builder::build(mir, id);
@@ -869,10 +866,8 @@ impl Builder {
 				wasm_idx.encode(sink);
 			}
 			SI::CallIndirectSym { mir_sig_index } => {
-				let type_index = self.register_signature(
-					&mir.signatures[usize::from(mir_sig_index)],
-					&mir.aggregates,
-				);
+				let type_index =
+					self.register_signature(&mir.signatures, mir_sig_index);
 				sink.push(Instruction::CallIndirect as u8);
 				type_index.0.encode(sink);
 				0u32.encode(sink); // table index 0 (single function table)
@@ -1622,10 +1617,10 @@ impl FunctionBody {
 		let mut body_content: Vec<u8> = Vec::new();
 
 		let type_index = module.functions.types[func_index.0 as usize];
-		let func_type = module.types.signatures[type_index.0 as usize].clone();
+		let signature = module.types.signatures[type_index.0 as usize].clone();
 
 		let mut grouped_locals = Vec::<(ScalarType, u32)>::new();
-		for local in self.locals.iter().skip(func_type.param_count) {
+		for local in self.locals.iter().skip(signature.param_count) {
 			match grouped_locals.last_mut() {
 				Some((last_ty, count)) if *last_ty == local.ty => {
 					*count += 1;

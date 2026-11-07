@@ -19,7 +19,14 @@
 //! normalized type, and only when that type is concrete, so the key needs no
 //! scope. Its layout is stored once per distinct content, as rustc interns
 //! its `LayoutData`: `Pair<u32, u8>` and `(u32, u8)` are two keys and one
-//! layout. Anything else is a direct mapping and is never stored.
+//! layout. Anything else is a direct mapping and is never stored. A layout's
+//! fields and scalars are rows of two columns shared by every layout
+//! (`Layouts::field_offsets`, `Layouts::scalars`), and it holds a run of
+//! each.
+//!
+//! This is memory only. How a value is held on the Wasm stack (its scalars'
+//! types, and which of them each field is) is lowering's
+//! (`tir/lower/shapes.rs`), its only reader.
 
 use std::hash::BuildHasher;
 
@@ -32,7 +39,7 @@ use super::signatures::TypeContext;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, metadata_len,
 };
-use super::types::{Substitution, Type, TypeIndex, TypeList};
+use super::types::{Primitive, Substitution, Type, TypeIndex, TypeList};
 use crate::index::index_newtype;
 
 index_newtype!(AggregateIdx);
@@ -45,21 +52,32 @@ pub(super) struct Layout {
 	pub(super) align: u32,
 }
 
-/// A struct's or a tuple's layout.
-#[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct AggregateLayout {
-	pub(super) layout: Layout,
-	/// Each field's byte offset, by declared index.
-	pub(super) fields: Box<[u32]>,
-	/// The aggregate as Wasm values, nested aggregates flattened, in
-	/// declaration order: each value's primitive and its byte offset from the
-	/// aggregate's start. An array field holds none: an aggregate holding
-	/// one is no `StackValue`, so it is never one value.
-	pub(super) values: Box<[(Primitive, u32)]>,
-	/// Field `i` owns `values[field_values[i]..field_values[i + 1]]`; the last
-	/// entry is `values.len()`.
-	pub(super) field_values: Box<[u32]>,
+/// A struct's or a tuple's layout: its size and alignment, and its rows in
+/// `Layouts`' columns.
+#[derive(Clone, Copy)]
+struct AggregateLayout {
+	layout: Layout,
+	fields: FieldList,
+	scalars: ScalarList,
+}
+
+/// A run of `Layouts::field_offsets`: one row per field, by declared index.
+#[derive(Clone, Copy)]
+struct FieldList {
+	start: u32,
+	len: u32,
+}
+
+/// A run of `Layouts::scalars`: one row per Wasm value, in declaration
+/// pre-order.
+#[derive(Clone, Copy)]
+struct ScalarList {
+	start: u32,
+	len: u32,
+}
+
+fn rows<T>(column: &[T], start: u32, len: u32) -> &[T] {
+	&column[start as usize..(start + len) as usize]
 }
 
 /// What an aggregate's layout is remembered by: its normalized type, read
@@ -75,60 +93,22 @@ enum AggregateKey {
 pub(super) struct Layouts {
 	keys: FxHashMap<AggregateKey, AggregateIdx>,
 	aggregates: Vec<AggregateLayout>,
+	/// Each field's byte offset from its aggregate's start.
+	field_offsets: Vec<u32>,
+	/// Each Wasm value an aggregate holds, nested aggregates flattened, in
+	/// declaration order: its primitive and its byte offset from the
+	/// aggregate's start. An array field holds none: an aggregate holding
+	/// one is no `StackValue`, so it is never one value.
+	scalars: Vec<(Primitive, u32)>,
 	/// The index of every aggregate layout, found by its contents.
 	lookup: HashTable<AggregateIdx>,
 	hasher: FxBuildHasher,
 }
 
-/// One value as linear memory holds it: an integer of a width and a
-/// signedness, or a float. An address is held as its memory's `Size`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Primitive {
-	U8,
-	I8,
-	U16,
-	I16,
-	U32,
-	I32,
-	U64,
-	I64,
-	F32,
-	F64,
-}
-
-impl Primitive {
-	/// The primitive a value of `ty` is held as, if `ty` is one.
-	fn of(ty: TypeIndex) -> Option<Self> {
-		Some(match ty {
-			TypeIndex::U8 => Self::U8,
-			TypeIndex::I8 => Self::I8,
-			TypeIndex::U16 => Self::U16,
-			TypeIndex::I16 => Self::I16,
-			TypeIndex::U32 => Self::U32,
-			TypeIndex::I32 => Self::I32,
-			TypeIndex::U64 => Self::U64,
-			TypeIndex::I64 => Self::I64,
-			TypeIndex::F32 => Self::F32,
-			TypeIndex::F64 => Self::F64,
-			_ => return None,
-		})
-	}
-
-	/// The bytes it takes, which is also its alignment.
-	pub(super) fn size(self) -> u32 {
-		match self {
-			Self::U8 | Self::I8 => 1,
-			Self::U16 | Self::I16 => 2,
-			Self::U32 | Self::I32 | Self::F32 => 4,
-			Self::U64 | Self::I64 | Self::F64 => 8,
-		}
-	}
-}
-
-/// A laid-out value, as a field contributes to its aggregate.
+/// A laid-out value, as a field contributes to its aggregate, and as a
+/// load or a store reads where its scalars are (`Layouts::scalar`).
 #[derive(Clone, Copy)]
-enum Piece {
+pub(super) enum Piece {
 	/// No bytes and no values.
 	Empty,
 	/// `count` values of `primitive`, one after another: one for a primitive
@@ -144,24 +124,61 @@ enum Piece {
 }
 
 impl Layouts {
-	pub(super) fn aggregate(&self, index: AggregateIdx) -> &AggregateLayout {
-		&self.aggregates[usize::from(index)]
+	/// Each field's byte offset, by declared index.
+	pub(super) fn field_offsets(&self, index: AggregateIdx) -> &[u32] {
+		let fields = self.aggregates[usize::from(index)].fields;
+		rows(&self.field_offsets, fields.start, fields.len)
 	}
 
-	fn layout(&self, piece: Piece) -> Layout {
+	/// Each Wasm value's primitive and byte offset, in declaration order.
+	pub(super) fn scalars(&self, index: AggregateIdx) -> &[(Primitive, u32)] {
+		let scalars = self.aggregates[usize::from(index)].scalars;
+		rows(&self.scalars, scalars.start, scalars.len)
+	}
+
+	/// How many Wasm values `piece` holds.
+	pub(super) fn scalar_count(&self, piece: Piece) -> usize {
+		match piece {
+			Piece::Empty | Piece::Array(_) => 0,
+			Piece::Primitives { count, .. } => count as usize,
+			Piece::Aggregate(index) => {
+				self.aggregates[usize::from(index)].scalars.len as usize
+			}
+		}
+	}
+
+	/// `piece`'s Wasm value `at`: the primitive it is in memory and its
+	/// byte offset from the start.
+	pub(super) fn scalar(&self, piece: Piece, at: usize) -> (Primitive, u32) {
+		match piece {
+			Piece::Primitives { primitive, count } => {
+				assert!(at < count as usize, "a scalar of the value");
+				(primitive, at as u32 * primitive.size())
+			}
+			Piece::Aggregate(index) => self.scalars(index)[at],
+			Piece::Empty | Piece::Array(_) => {
+				unreachable!("an empty value or an array holds no scalar")
+			}
+		}
+	}
+
+	pub(super) fn layout(&self, piece: Piece) -> Layout {
 		match piece {
 			Piece::Empty => Layout { size: 0, align: 1 },
 			Piece::Primitives { primitive, count } => Layout {
 				size: primitive.size() * count,
 				align: primitive.size(),
 			},
-			Piece::Aggregate(index) => self.aggregate(index).layout,
+			Piece::Aggregate(index) => {
+				self.aggregates[usize::from(index)].layout
+			}
 			Piece::Array(layout) => layout,
 		}
 	}
 
-	/// Places `fields` (in declaration order) in `order`.
-	fn place(&self, fields: &[Piece], order: FieldOrder) -> AggregateLayout {
+	/// Places `fields` (in declaration order) in `order` and stores the
+	/// layout, once per distinct content.
+	fn place(&mut self, fields: &[Piece], order: FieldOrder) -> AggregateIdx {
 		let layouts: Vec<Layout> =
 			fields.iter().map(|&field| self.layout(field)).collect();
 		let mut placed: Vec<usize> = (0..fields.len()).collect();
@@ -177,58 +194,87 @@ impl Layouts {
 			align = align.max(layouts[at].align);
 		}
 
-		let mut values = Vec::new();
-		let mut field_values = Vec::with_capacity(fields.len() + 1);
+		let mut scalars = Vec::new();
 		for (&field, &base) in fields.iter().zip(&offsets) {
-			field_values.push(u32::try_from(values.len()).unwrap());
 			match field {
 				Piece::Empty | Piece::Array(_) => {}
-				Piece::Primitives { primitive, count } => values.extend(
+				Piece::Primitives { primitive, count } => scalars.extend(
 					(0..count)
 						.map(|at| (primitive, base + at * primitive.size())),
 				),
-				Piece::Aggregate(index) => values.extend(
-					self.aggregate(index)
-						.values
+				Piece::Aggregate(index) => scalars.extend(
+					self.scalars(index)
 						.iter()
 						.map(|&(primitive, offset)| (primitive, base + offset)),
 				),
 			}
 		}
-		field_values.push(u32::try_from(values.len()).unwrap());
 
-		AggregateLayout {
-			layout: Layout {
-				size: size.next_multiple_of(align),
-				align,
-			},
-			fields: offsets.into_boxed_slice(),
-			values: values.into_boxed_slice(),
-			field_values: field_values.into_boxed_slice(),
-		}
+		let layout = Layout {
+			size: size.next_multiple_of(align),
+			align,
+		};
+		self.intern(layout, &offsets, &scalars)
 	}
 
-	/// The index of `layout`, stored only if no equal one is.
-	fn intern(&mut self, layout: AggregateLayout) -> AggregateIdx {
-		let hash = self.hasher.hash_one(&layout);
+	/// The index of the layout with these rows, stored only if no equal one
+	/// is: its rows are appended to the columns then.
+	fn intern(
+		&mut self,
+		layout: Layout,
+		field_offsets: &[u32],
+		scalars: &[(Primitive, u32)],
+	) -> AggregateIdx {
+		let hash = self.hasher.hash_one((layout, field_offsets, scalars));
 		let Self {
 			aggregates,
+			field_offsets: offset_column,
+			scalars: scalar_column,
 			lookup,
 			hasher,
 			..
 		} = self;
-		if let Some(&index) =
-			lookup.find(hash, |&index| aggregates[usize::from(index)] == layout)
-		{
+		if let Some(&index) = lookup.find(hash, |&index| {
+			let aggregate = &aggregates[usize::from(index)];
+			contents(aggregate, offset_column, scalar_column)
+				== (layout, field_offsets, scalars)
+		}) {
 			return index;
 		}
 		let index = AggregateIdx::new(u32::try_from(aggregates.len()).unwrap());
-		aggregates.push(layout);
+		aggregates.push(AggregateLayout {
+			layout,
+			fields: FieldList {
+				start: u32::try_from(offset_column.len()).unwrap(),
+				len: u32::try_from(field_offsets.len()).unwrap(),
+			},
+			scalars: ScalarList {
+				start: u32::try_from(scalar_column.len()).unwrap(),
+				len: u32::try_from(scalars.len()).unwrap(),
+			},
+		});
+		offset_column.extend_from_slice(field_offsets);
+		scalar_column.extend_from_slice(scalars);
 		lookup.insert_unique(hash, index, |&index| {
-			hasher.hash_one(&aggregates[usize::from(index)])
+			let aggregate = &aggregates[usize::from(index)];
+			hasher.hash_one(contents(aggregate, offset_column, scalar_column))
 		});
 		index
 	}
+}
+
+/// What an aggregate layout is compared and hashed by: its size and
+/// alignment, and its rows.
+fn contents<'a>(
+	aggregate: &AggregateLayout,
+	field_offsets: &'a [u32],
+	scalars: &'a [(Primitive, u32)],
+) -> (Layout, &'a [u32], &'a [(Primitive, u32)]) {
+	(
+		aggregate.layout,
+		rows(field_offsets, aggregate.fields.start, aggregate.fields.len),
+		rows(scalars, aggregate.scalars.start, aggregate.scalars.len),
+	)
 }
 
 impl TypeContext<'_, '_, '_> {
@@ -268,7 +314,7 @@ impl TypeContext<'_, '_, '_> {
 				.map(|at| (primitive, at * primitive.size()))
 				.collect(),
 			Piece::Aggregate(index) => {
-				self.solver.layouts.aggregate(index).values.clone()
+				self.solver.layouts.scalars(index).into()
 			}
 			Piece::Array(_) => {
 				let ty = self.normalize(
@@ -301,6 +347,17 @@ impl TypeContext<'_, '_, '_> {
 			}
 		};
 		Ok(Some((self.solver.layouts.layout(piece), values)))
+	}
+
+	/// Where a value of `ty`'s bytes and scalars are, as `memory_layout`
+	/// answers its layout; read a scalar's offset with
+	/// `Layouts::scalar`, with no copy of the aggregate's rows.
+	pub(super) fn memory_piece(
+		&mut self,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+	) -> Result<Option<Piece>, SolverError> {
+		self.piece(assumption_context, ty, &mut Vec::new())
 	}
 
 	/// The layout of a struct or a tuple, as `memory_layout` answers it.
@@ -487,8 +544,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 		visiting.pop();
 
-		let layout = self.solver.layouts.place(&pieces, order);
-		let index = self.solver.layouts.intern(layout);
+		let index = self.solver.layouts.place(&pieces, order);
 		if concrete {
 			self.solver.layouts.keys.insert(key, index);
 		}
@@ -526,13 +582,6 @@ impl TypeContext<'_, '_, '_> {
 			RewriteFlags::ALL,
 		)?;
 		Primitive::of(size).map(Some).ok_or(SolverError::Poisoned)
-	}
-}
-
-impl TypeContext<'_, '_, '_> {
-	#[allow(dead_code)] // Constant evaluation is its first caller.
-	pub(super) fn aggregate(&self, index: AggregateIdx) -> &AggregateLayout {
-		self.solver.layouts.aggregate(index)
 	}
 }
 
@@ -743,14 +792,31 @@ mod tests {
 			.expect("a parameter's layout is final")
 	}
 
+	/// An aggregate layout's contents, read out of the columns.
+	#[derive(Debug, PartialEq)]
+	struct Contents {
+		layout: Layout,
+		field_offsets: Vec<u32>,
+		scalars: Vec<(Primitive, u32)>,
+	}
+
+	fn contents(case: &TestCase<'_>, index: AggregateIdx) -> Contents {
+		let layouts = &case.context.solver.layouts;
+		Contents {
+			layout: layouts.layout(Piece::Aggregate(index)),
+			field_offsets: layouts.field_offsets(index).to_vec(),
+			scalars: layouts.scalars(index).to_vec(),
+		}
+	}
+
 	fn param_aggregate_layout(
 		case: &mut TestCase<'_>,
 		path: &str,
 		index: usize,
-	) -> AggregateLayout {
+	) -> Contents {
 		let aggregate = param_aggregate(case, path, index)
 			.expect("the parameter is a struct or a tuple");
-		case.context.aggregate(aggregate).clone()
+		contents(case, aggregate)
 	}
 
 	fn known(size: u32, align: u32) -> Option<Layout> {
@@ -759,15 +825,13 @@ mod tests {
 
 	fn aggregate(
 		(size, align): (u32, u32),
-		fields: &[u32],
-		values: &[(Primitive, u32)],
-		field_values: &[u32],
-	) -> AggregateLayout {
-		AggregateLayout {
+		field_offsets: &[u32],
+		scalars: &[(Primitive, u32)],
+	) -> Contents {
+		Contents {
 			layout: Layout { size, align },
-			fields: fields.into(),
-			values: values.into(),
-			field_values: field_values.into(),
+			field_offsets: field_offsets.into(),
+			scalars: scalars.into(),
 		}
 	}
 
@@ -833,7 +897,6 @@ mod tests {
 					(Primitive::U16, 8),
 					(Primitive::U8, 11)
 				],
-				&[0, 1, 2, 3, 4],
 			)
 		);
 		assert_eq!(
@@ -847,7 +910,6 @@ mod tests {
 					(Primitive::U16, 16),
 					(Primitive::U8, 18)
 				],
-				&[0, 1, 2, 3, 4],
 			)
 		);
 		assert_eq!(
@@ -860,12 +922,11 @@ mod tests {
 					(Primitive::U64, 0),
 					(Primitive::U16, 8)
 				],
-				&[0, 1, 2, 3],
 			)
 		);
 		assert_eq!(
 			param_aggregate_layout(&mut case, "f", 3),
-			aggregate((0, 1), &[], &[], &[0])
+			aggregate((0, 1), &[], &[])
 		);
 	}
 
@@ -892,7 +953,6 @@ mod tests {
 				(12, 4),
 				&[8, 0],
 				&[(Primitive::U8, 8), (Primitive::U32, 0), (Primitive::U32, 4)],
-				&[0, 1, 3],
 			)
 		);
 		assert_eq!(
@@ -906,7 +966,6 @@ mod tests {
 					(Primitive::U32, 0),
 					(Primitive::U32, 4)
 				],
-				&[0, 1, 4],
 			)
 		);
 		assert_eq!(
@@ -919,7 +978,6 @@ mod tests {
 					(Primitive::U64, 0),
 					(Primitive::U64, 8)
 				],
-				&[0, 1, 3],
 			)
 		);
 		// An enum is its repr.
@@ -929,7 +987,6 @@ mod tests {
 				(8, 4),
 				&[4, 0],
 				&[(Primitive::U16, 4), (Primitive::U32, 0)],
-				&[0, 1, 2],
 			)
 		);
 		// A struct nested in itself with other arguments is no loop.
@@ -944,7 +1001,6 @@ mod tests {
 					(Primitive::U8, 2),
 					(Primitive::U8, 3)
 				],
-				&[0, 2, 4],
 			)
 		);
 	}
@@ -963,7 +1019,6 @@ mod tests {
 				(8, 4),
 				&[4, 0],
 				&[(Primitive::U8, 4), (Primitive::U32, 0)],
-				&[0, 1, 2],
 			)
 		);
 	}
@@ -1064,12 +1119,11 @@ mod tests {
 			.expect("a laid-out struct");
 		// `len` at 0, `data` at 2 (six bytes), `tail` at 8.
 		assert_eq!(
-			case.context.aggregate(index).clone(),
+			contents(&case, index),
 			aggregate(
 				(12, 4),
 				&[0, 2, 8],
 				&[(Primitive::U8, 0), (Primitive::U32, 8)],
-				&[0, 1, 1, 2],
 			)
 		);
 		// An array's values are its element's, once per element.

@@ -5758,16 +5758,25 @@ pub(super) mod tests {
 
 	#[test]
 	fn primitive_operators_match_the_stdlib_impls() {
-		use crate::tir::operators::{
-			Scalar, is_primitive_binary, is_primitive_unary,
-		};
+		use crate::tir::operators::{is_primitive_binary, is_primitive_unary};
 		// The compiler builds `PrimitiveBinary`/`PrimitiveUnary` exactly where the stdlib has a
 		// primitive impl, so the two must name the same pairs.
 		test_case!(std case = include_str!("../../std/main.wx"));
-		let implements = |trait_index: TraitIdx, scalar: Scalar| {
+		let primitives = [
+			TypeIndex::U8,
+			TypeIndex::I8,
+			TypeIndex::U16,
+			TypeIndex::I16,
+			TypeIndex::U32,
+			TypeIndex::I32,
+			TypeIndex::U64,
+			TypeIndex::I64,
+			TypeIndex::F32,
+			TypeIndex::F64,
+		];
+		let implements = |trait_index: TraitIdx, ty: TypeIndex| {
 			let target =
-				ImplTarget::from_type(case.context.types.resolve(scalar.ty()))
-					.unwrap();
+				ImplTarget::from_type(case.context.types.resolve(ty)).unwrap();
 			case.context
 				.impl_dispatch
 				.trait_candidates(target)
@@ -5796,11 +5805,11 @@ pub(super) mod tests {
 				case.context.operators.binary(op).unwrap_or_else(|| {
 					panic!("`{}` has no method", op.as_str())
 				});
-			for scalar in Scalar::ALL {
+			for ty in primitives {
 				assert_eq!(
-					implements(method.trait_index, scalar),
-					is_primitive_binary(op, scalar.ty()),
-					"`{}` on {scalar:?}",
+					implements(method.trait_index, ty),
+					is_primitive_binary(op, ty),
+					"`{}` on {ty:?}",
 					op.as_str()
 				);
 			}
@@ -5811,11 +5820,11 @@ pub(super) mod tests {
 			ast::UnaryOp::Not,
 		] {
 			let method = case.context.operators.unary(op).unwrap();
-			for scalar in Scalar::ALL {
+			for ty in primitives {
 				assert_eq!(
-					implements(method.trait_index, scalar),
-					is_primitive_unary(op, scalar.ty()),
-					"{op:?} on {scalar:?}"
+					implements(method.trait_index, ty),
+					is_primitive_unary(op, ty),
+					"{op:?} on {ty:?}"
 				);
 			}
 		}

@@ -63,12 +63,12 @@ impl FunctionFlags {
 }
 
 pub struct Function {
-    pub signature_index: SignatureIndex,
+    pub signature: SignatureIndex,
     pub origin: Origin<Code>,
 }
 
 pub struct Code {
-    pub locals: Vec<Local>,   // params first
+    pub locals: Vec<Local>,   // params' scalars first; each one scalar
     pub label_count: u32,     // LabelId is in 0..label_count
     pub body: Body,
     pub root: ExprId,
@@ -78,12 +78,14 @@ pub struct Code {
 pub struct Body {
     kinds: Vec<ExprKind>,
     types: Vec<ValueType>,
-    lists: Vec<ExprId>,       // statements, call arguments, aggregate values
+    lists: Vec<ExprId>,       // statements, call arguments, `Values`' values
     cases: Vec<Case>,         // Switch arms
+    targets: Vec<Option<LocalIndex>>, // `SetLocals` targets; None drops
 }
 
 pub struct ExprList { start: u32, len: u32 } // a run of `lists`
 pub struct CaseList { start: u32, len: u32 } // a run of `cases`
+pub struct TargetList { start: u32, len: u32 } // a run of `targets`
 pub struct Case { pub value: i64, pub body: ExprId }
 
 #[derive(Clone, Copy)]
@@ -95,29 +97,26 @@ pub enum ExprKind {
 
     LocalGet { local: LocalIndex },
     LocalSet { local: LocalIndex, value: ExprId },
-    Aggregate { values: ExprList },
-    AggregateGet { local: LocalIndex, range: ScalarRange },
-    AggregateSet { local: LocalIndex, range: ScalarRange, value: ExprId },
+    /// Several scalar values as one (`notes/mir-pipeline.md`).
+    Values { values: ExprList },
+    /// `value`'s results into `targets`, a run of `Body::targets`.
+    SetLocals { targets: TargetList, value: ExprId },
     Global { id: GlobalId },
     GlobalSet { id: GlobalId, value: ExprId },
 
-    /// Same type in and out: Neg, BitNot, Eqz, Sqrt, Abs, Floor, Ceil,
-    /// Trunc, Nearest.
+    // Every opcode is one Wasm instruction, its signedness its own
+    // (`notes/mir-pipeline.md`, "MIR's vocabulary").
+    /// Eqz (integers, giving `I32`); Neg, Abs, Sqrt, Floor, Ceil, Trunc,
+    /// Nearest (floats).
     Unary { op: UnaryOp, value: ExprId },
-    /// Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Min, Max,
-    /// Copysign. Signedness (DivS/DivU, ShrS/ShrU) from the node's type.
+    /// Add, Sub, Mul, And, Or, Xor, Shl, ShrS, ShrU, DivS, DivU, RemS, RemU,
+    /// Div, Min, Max, Copysign.
     Binary { op: BinaryOp, lhs: ExprId, rhs: ExprId },
-    /// Eq, Ne, Lt, Le, Gt, Ge, giving `Bool`. Signedness from the operands'
-    /// type.
+    /// Eq, Ne, LtS, LtU, …, Lt, Le, Gt, Ge, giving `I32`.
     Compare { op: CompareOp, lhs: ExprId, rhs: ExprId },
-    /// A numeric conversion, chosen by the (operand, node) type pair:
-    /// extend, wrap, convert, trunc, promote, demote.
-    Convert { value: ExprId },
-    /// f32 <-> i32 and f64 <-> i64 bits.
-    Reinterpret { value: ExprId },
-    /// `transmute`: the same Wasm values read as the node's type. No
-    /// instruction.
-    Transmute { value: ExprId },
+    /// ExtendS, ExtendU, Wrap, TruncS, TruncU, ConvertS, ConvertU, Promote,
+    /// Demote, Reinterpret: from the operand's type to the node's.
+    Convert { op: ConvertOp, value: ExprId },
 
     /// Statements in order; the value is the last one's. No label, never a
     /// break target.
@@ -138,7 +137,8 @@ pub enum ExprKind {
 
     // Memory nodes keep their current fields, with `ExprId` operands:
     // MemoryOffset, MemoryIndex, MemorySize, MemoryGrow, MemoryFill,
-    // MemoryCopy, PointerLoad, PointerStore, StaticPointer. `static_data` is
+    // MemoryCopy, StaticPointer, and PointerLoad/PointerStore, which also
+    // carry their access (width, and a load's extension). `static_data` is
     // derived from the StaticPointer nodes.
 }
 ```
@@ -150,9 +150,10 @@ pub enum ExprKind {
    is an index or a scalar, about 16 to 24 bytes), so a pass matches
    `body.kind(id)` by value with no borrow conflicts.
 2. **One variant per shape of operation.** About 75 variants become about
-   25. Signedness and conversions are read from types, as `DivS`/`DivU` and
-   comparisons already are. A future saturating truncation would need an op
-   flag on `Convert`.
+   25. Signedness and conversions were read from types at first; since step
+   2.1 of `notes/mir-pipeline.md` they are the opcode's (`DivS`/`DivU`,
+   `ConvertOp`), and types are Wasm's. A future saturating truncation is
+   two more `ConvertOp`s.
 3. **`Sequence` and `Block { label }` are separate nodes.** A label exists
    only where something can break to it: a loop, a labelled block, an
    inlined function's wrapper. Synthetic sequencing, `if` branches (TIR

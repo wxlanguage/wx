@@ -96,19 +96,8 @@ impl Lowerer<'_, '_, '_, '_> {
 				}
 				Ok(state.push(mir::ExprKind::Noop, ty))
 			}
-			mir::ValueType::Bool => {
-				let [scalar] = scalars else {
-					return self.reject_constant_shape(file_id, span);
-				};
-				let value = match scalar.val {
-					Val::I32(bits) => bits != 0,
-					_ => return self.reject_constant_shape(file_id, span),
-				};
-				Ok(state.boolean(value))
-			}
-			mir::ValueType::Aggregate { aggregate_index } => {
-				let leaves =
-					self.aggregates.get(aggregate_index).scalars.clone();
+			mir::ValueType::Aggregate { .. } => {
+				let leaves = self.signatures.scalars(&ty).to_vec();
 				if leaves.len() != scalars.len() {
 					return self.reject_constant_shape(file_id, span);
 				}
@@ -119,7 +108,7 @@ impl Lowerer<'_, '_, '_, '_> {
 					)?);
 				}
 				let values = state.list(values);
-				Ok(state.push(mir::ExprKind::Aggregate { values }, ty))
+				Ok(state.push(mir::ExprKind::Values { values }, ty))
 			}
 			leaf => {
 				let [scalar] = scalars else {
@@ -140,22 +129,13 @@ impl Lowerer<'_, '_, '_, '_> {
 		ty: mir::ValueType,
 		scalar: ConstScalar,
 	) -> Result<mir::ExprId, ()> {
+		// A constant is its bits: a `Bool` holding 5 (by `transmute`) is 5,
+		// as it would be at run time.
 		let kind = match (ty, scalar.val) {
-			(mir::ValueType::Bool, Val::I32(bits)) => mir::ExprKind::Int {
-				value: if bits != 0 { 1 } else { 0 },
-			},
-			(
-				mir::ValueType::U8
-				| mir::ValueType::I8
-				| mir::ValueType::U16
-				| mir::ValueType::I16
-				| mir::ValueType::U32
-				| mir::ValueType::I32,
-				Val::I32(bits),
-			) => mir::ExprKind::Int {
+			(mir::ValueType::I32, Val::I32(bits)) => mir::ExprKind::Int {
 				value: i64::from(bits),
 			},
-			(mir::ValueType::U64 | mir::ValueType::I64, Val::I64(bits)) => {
+			(mir::ValueType::I64, Val::I64(bits)) => {
 				mir::ExprKind::Int { value: bits as i64 }
 			}
 			(mir::ValueType::F32, Val::F32(bits)) => mir::ExprKind::Float {
@@ -164,13 +144,14 @@ impl Lowerer<'_, '_, '_, '_> {
 			(mir::ValueType::F64, Val::F64(bits)) => mir::ExprKind::Float {
 				value: f64::from_bits(bits),
 			},
-			(mir::ValueType::Pointer { .. }, Val::DataEnd { memory }) => {
-				mir::ExprKind::DataEnd {
-					memory: self.memory(memory),
-				}
-			}
 			(
-				mir::ValueType::Pointer { .. },
+				mir::ValueType::I32 | mir::ValueType::I64,
+				Val::DataEnd { memory },
+			) => mir::ExprKind::DataEnd {
+				memory: self.memory(memory),
+			},
+			(
+				mir::ValueType::I32 | mir::ValueType::I64,
 				Val::MemoryOffset { alloc, offset },
 			) => mir::ExprKind::StaticPointer {
 				entry: self.static_entry(alloc),

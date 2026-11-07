@@ -70,8 +70,11 @@ impl<'mir> Builder<'mir> {
 
 	fn build_function(&mut self) {
 		let mir_func = self.mir_func;
-		let sig = &self.mir.signatures
-			[usize::from(self.mir.function(self.id).signature_index)];
+		let params = self
+			.mir
+			.signatures
+			.params(self.mir.function(self.id).signature)
+			.len();
 
 		// Seed data_bindings for the whole function at once — locals are
 		// flat and function-wide (`mir::Code::locals`), so every local's
@@ -83,16 +86,16 @@ impl<'mir> Builder<'mir> {
 		let mut data_bindings: Vec<Option<StackResult>> =
 			vec![None; mir_func.locals.len()];
 
-		// `wasm_idx` tracks the flattened WASM local index: an aggregate param
-		// occupies one slot per *scalar* it contains, a scalar param one slot
-		// each. Params are always the first `params_count` locals.
-		let mut wasm_idx = 0u32;
-		for (i, local) in mir_func.locals[..sig.params_count].iter().enumerate()
-		{
-			// A zero-sized param (e.g. a `Memory`-typed handle) occupies no
-			// WASM param slot — see the matching case in `build_call`.
+		// Each parameter is one scalar local, so its local index is its Wasm
+		// parameter index.
+		for (i, local) in mir_func.locals[..params].iter().enumerate() {
+			let ty = ScalarType::try_from(local.ty)
+				.expect("a parameter is one scalar");
 			data_bindings[i] =
-				Some(self.build_param_value(local.ty, &mut wasm_idx));
+				Some(StackResult::Value(self.node(DataNodeKind::Param {
+					index: i as u32,
+					ty,
+				})));
 		}
 
 		self.func.blocks[BODY_BLOCK as usize] = Some(Block {
@@ -126,50 +129,6 @@ impl<'mir> Builder<'mir> {
 		}
 	}
 
-	/// Build the value node for a function parameter of type `ty`, consuming
-	/// one flattened WASM param slot per *scalar* it contains (`*wasm_idx`
-	/// tracks the next free slot across the whole call). A scalar parameter is
-	/// just one `Param` node; an aggregate parameter is passed as a flattened
-	/// run of scalar WASM params, in the same declaration pre-order the
-	/// aggregate's scalars are listed in. A zero-sized parameter consumes no
-	/// slot and comes back as [`StackResult::Unit`].
-	fn build_param_value(
-		&mut self,
-		ty: mir::ValueType,
-		wasm_idx: &mut u32,
-	) -> StackResult {
-		if matches!(ty, mir::ValueType::Unit | mir::ValueType::Never) {
-			return StackResult::Unit;
-		}
-		match ty {
-			mir::ValueType::Aggregate { aggregate_index } => {
-				let mir = self.mir;
-				let agg = &mir.aggregate(aggregate_index);
-				let values: Box<[_]> = agg
-					.scalars
-					.iter()
-					.map(|&ty| {
-						self.build_param_value(ty, wasm_idx).unwrap_value()
-					})
-					.collect();
-				StackResult::Value(self.node(DataNodeKind::Aggregate {
-					values,
-					aggregate_index,
-				}))
-			}
-			_ => {
-				let scalar_ty =
-					ScalarType::try_from(ty).expect("param must be scalar");
-				let node = self.node(DataNodeKind::Param {
-					index: *wasm_idx,
-					ty: scalar_ty,
-				});
-				*wasm_idx += 1;
-				StackResult::Value(node)
-			}
-		}
-	}
-
 	// ── Expression builder ────────────────────────────────────────────────────
 
 	fn build_expr(
@@ -184,12 +143,6 @@ impl<'mir> Builder<'mir> {
 			ExprKind::Int { value } => {
 				let scalar =
 					ScalarType::try_from(ty).expect("Int must be scalar");
-				// A boolean is an integer `0`/`1`; the type, not a separate
-				// node, carries that invariant.
-				debug_assert!(
-					ty != mir::ValueType::Bool || matches!(value, 0 | 1),
-					"a Bool-typed Int must be 0 or 1"
-				);
 				StackResult::Value(self.int(value, scalar))
 			}
 			ExprKind::Float { value } => {
@@ -219,6 +172,34 @@ impl<'mir> Builder<'mir> {
 					return StackResult::Never;
 				}
 				bindings[usize::from(local)] = Some(new_val);
+				StackResult::Unit
+			}
+			// In the sea of nodes a local is a name for a value: each target
+			// is bound to its result, and a dropped one is never read.
+			ExprKind::SetLocals { targets, value } => {
+				let results = match self.build_expr(block_idx, bindings, value)
+				{
+					StackResult::Never => return StackResult::Never,
+					StackResult::Unit => Vec::new(),
+					StackResult::Value(node) => match self.ty(value) {
+						mir::ValueType::Aggregate { .. } => {
+							self.scalars_of(node)
+						}
+						_ => vec![node],
+					},
+				};
+				let targets = self.body().targets(targets);
+				assert_eq!(
+					targets.len(),
+					results.len(),
+					"a `SetLocals` has one target per result"
+				);
+				for (&target, result) in targets.iter().zip(results) {
+					if let Some(local) = target {
+						bindings[usize::from(local)] =
+							Some(StackResult::Value(result));
+					}
+				}
 				StackResult::Unit
 			}
 
@@ -295,10 +276,6 @@ impl<'mir> Builder<'mir> {
 						operand,
 						ty: scalar,
 					},
-					UnaryOp::BitNot => DataNodeKind::BitNot {
-						operand,
-						ty: scalar,
-					},
 					UnaryOp::Eqz => DataNodeKind::Eqz { operand },
 					UnaryOp::Sqrt => DataNodeKind::Sqrt {
 						operand,
@@ -333,7 +310,7 @@ impl<'mir> Builder<'mir> {
 			ExprKind::Compare { op, lhs, rhs } => {
 				self.build_cmp(block_idx, bindings, op, lhs, rhs)
 			}
-			ExprKind::Convert { value } => {
+			ExprKind::Convert { op, value } => {
 				let from = self.ty(value);
 				let Some(operand) =
 					self.build_value(block_idx, bindings, value)
@@ -341,79 +318,15 @@ impl<'mir> Builder<'mir> {
 					return StackResult::Never;
 				};
 				StackResult::Value(
-					self.build_conversion(block_idx, from, ty, operand),
+					self.build_conversion(block_idx, op, from, ty, operand),
 				)
 			}
-			ExprKind::Reinterpret { value } => {
-				let Some(operand) =
-					self.build_value(block_idx, bindings, value)
-				else {
-					return StackResult::Never;
-				};
-				let kind = match ScalarType::try_from(ty)
-					.expect("a reinterpretation is scalar")
-				{
-					ScalarType::I32 => {
-						DataNodeKind::I32ReinterpretF32 { operand }
-					}
-					ScalarType::F32 => {
-						DataNodeKind::F32ReinterpretI32 { operand }
-					}
-					ScalarType::I64 => {
-						DataNodeKind::I64ReinterpretF64 { operand }
-					}
-					ScalarType::F64 => {
-						DataNodeKind::F64ReinterpretI64 { operand }
-					}
-				};
-				StackResult::Value(self.node(kind))
-			}
-			// The same Wasm values under another type. A scalar passes
-			// through, and consumers read signedness from the node's type; an
-			// aggregate on either side is taken apart into its slots and
-			// regrouped, since a one-slot aggregate (`Char`) is still a pack
-			// node while the scalar it holds is not.
-			ExprKind::Transmute { value } => {
-				let source = match self.build_expr(block_idx, bindings, value) {
-					StackResult::Value(source) => source,
-					StackResult::Unit => {
-						#[cfg(debug_assertions)]
-						debug_assert_eq!(ty, mir::ValueType::Unit);
-						return StackResult::Unit;
-					}
-					StackResult::Never => return StackResult::Never,
-				};
-				let slots = match self.ty(value) {
-					mir::ValueType::Aggregate { aggregate_index } => {
-						let count =
-							self.mir.aggregate(aggregate_index).scalars.len();
-						(0..count as u32)
-							.map(|i| {
-								self.project_scalar(
-									source,
-									mir::ScalarIndex::new(i),
-								)
-							})
-							.collect()
-					}
-					_ => vec![source],
-				};
-				match ty {
-					mir::ValueType::Aggregate { aggregate_index } => {
-						StackResult::Value(
-							self.aggregate_from_scalars(aggregate_index, slots),
-						)
-					}
-					_ => {
-						assert_eq!(slots.len(), 1, "a scalar is one slot");
-						StackResult::Value(slots[0])
-					}
-				}
-			}
-
 			// ── Aggregates ────────────────────────────────────────────────
-			ExprKind::Aggregate { values } => {
-				let mir::ValueType::Aggregate { aggregate_index } = ty else {
+			ExprKind::Values { values } => {
+				let mir::ValueType::Aggregate {
+					signature: aggregate_index,
+				} = ty
+				else {
 					panic!("Aggregate expression must have Aggregate type")
 				};
 				let mut slots = Vec::with_capacity(values.len());
@@ -428,7 +341,7 @@ impl<'mir> Builder<'mir> {
 				}
 				assert_eq!(
 					slots.len(),
-					self.mir.aggregate(aggregate_index).scalars.len()
+					self.mir.signatures.results(aggregate_index).len()
 				);
 				let node = self.node(DataNodeKind::Aggregate {
 					values: slots.into_boxed_slice(),
@@ -436,82 +349,6 @@ impl<'mir> Builder<'mir> {
 				});
 				StackResult::Value(node)
 			}
-			ExprKind::AggregateGet { local, range } => {
-				let value = self.read_binding(bindings, usize::from(local));
-				if value == StackResult::Never {
-					return value;
-				}
-				if range.len == 0 {
-					assert!(
-						ty == mir::ValueType::Unit,
-						"an empty range is unit"
-					);
-					return StackResult::Unit;
-				}
-				let aggregate = value.unwrap_value();
-				match ty {
-					mir::ValueType::Aggregate { aggregate_index } => {
-						let slots = range
-							.indices()
-							.map(|i| {
-								self.project_scalar(
-									aggregate,
-									mir::ScalarIndex::new(i as u32),
-								)
-							})
-							.collect();
-						StackResult::Value(
-							self.aggregate_from_scalars(aggregate_index, slots),
-						)
-					}
-					_ => {
-						assert_eq!(range.len, 1);
-						StackResult::Value(
-							self.project_scalar(aggregate, range.start),
-						)
-					}
-				}
-			}
-			ExprKind::AggregateSet {
-				local,
-				range,
-				value,
-			} => {
-				let new_val = self.build_expr(block_idx, bindings, value);
-				if new_val == StackResult::Never {
-					return new_val;
-				}
-				if range.len == 0 {
-					assert_eq!(new_val, StackResult::Unit);
-					return StackResult::Unit;
-				}
-				let idx = usize::from(local);
-				let old_aggregate = match self.read_binding(bindings, idx) {
-					StackResult::Value(value) => value,
-					StackResult::Never => return StackResult::Never,
-					StackResult::Unit => {
-						panic!("AggregateSet on a zero-sized binding")
-					}
-				};
-				let aggregate_index = self.aggregate_index_of(old_aggregate);
-				let mut slots = self.scalars_of(old_aggregate);
-				let replacement = match self.ty(value) {
-					mir::ValueType::Aggregate { .. } => {
-						self.scalars_of(new_val.unwrap_value())
-					}
-					_ => vec![new_val.unwrap_value()],
-				};
-				assert_eq!(replacement.len(), range.len as usize);
-				slots[range.indices()].copy_from_slice(&replacement);
-				bindings[idx] = Some(StackResult::Value(self.node(
-					DataNodeKind::Aggregate {
-						values: slots.into_boxed_slice(),
-						aggregate_index,
-					},
-				)));
-				StackResult::Unit
-			}
-
 			// ── Control flow ──────────────────────────────────────────────
 			ExprKind::Return { value } => {
 				let result = match value {
@@ -632,85 +469,56 @@ impl<'mir> Builder<'mir> {
 				pointer,
 				offset,
 				memory,
+				access,
 			} => {
 				let Some(address) =
 					self.build_value(block_idx, bindings, pointer)
 				else {
 					return StackResult::Never;
 				};
-				match ty {
-					mir::ValueType::Aggregate { aggregate_index } => {
-						StackResult::Value(self.build_aggregate_load(
-							block_idx,
-							address,
-							offset,
-							aggregate_index,
-							memory,
-						))
-					}
-					_ => {
-						let access = MemAccess::from_mir(ty);
-						let result =
-							self.node(DataNodeKind::PointerLoadResult {
-								address,
-								access,
-							});
-						self.push_stmt(
-							block_idx,
-							ControlNode::PointerLoad {
-								address,
-								offset,
-								result,
-								memory,
-								access,
-							},
-						);
-						StackResult::Value(result)
-					}
-				}
+				let access = MemAccess::load(access);
+				let result = self
+					.node(DataNodeKind::PointerLoadResult { address, access });
+				self.push_stmt(
+					block_idx,
+					ControlNode::PointerLoad {
+						address,
+						offset,
+						result,
+						memory,
+						access,
+					},
+				);
+				StackResult::Value(result)
 			}
 			ExprKind::PointerStore {
 				pointer,
 				value,
 				offset,
 				memory,
+				access,
 			} => {
 				let Some(address) =
 					self.build_value(block_idx, bindings, pointer)
 				else {
 					return StackResult::Never;
 				};
-				let value_ty = self.ty(value);
 				let Some(value_node) =
 					self.build_value(block_idx, bindings, value)
 				else {
 					return StackResult::Never;
 				};
-				match value_ty {
-					mir::ValueType::Aggregate { aggregate_index } => {
-						self.emit_aggregate_store(
-							block_idx,
-							address,
-							offset,
-							value_node,
-							aggregate_index,
-							memory,
-						);
-					}
-					_ => {
-						let access = MemAccess::from_mir(value_ty);
-						self.push_stmt(
-							block_idx,
-							ControlNode::PointerStore {
-								address,
-								offset,
-								value: value_node,
-								memory,
-								access,
-							},
-						);
-					}
-				}
+				let access = MemAccess::store(access);
+				self.push_stmt(
+					block_idx,
+					ControlNode::PointerStore {
+						address,
+						offset,
+						value: value_node,
+						memory,
+						access,
+					},
+				);
 				StackResult::Unit
 			}
 			ExprKind::MemoryGrow { memory, delta } => {
@@ -1473,7 +1281,7 @@ impl<'mir> Builder<'mir> {
 			}
 			NodeType::Aggregate(aggregate_index) => {
 				let scalar_count =
-					self.mir.aggregate(aggregate_index).scalars.len();
+					self.mir.signatures.results(aggregate_index).len();
 				// Extract each value-bearing arm's fields exactly once (not
 				// once per field below). A `Never`/`Unit` arm propagates
 				// unchanged to every field — its body diverges before
@@ -1640,12 +1448,12 @@ impl<'mir> Builder<'mir> {
 		arguments: ExprList,
 		result_ty: mir::ValueType,
 	) -> StackResult {
-		let callee_sig = self.mir.function(function).signature_index;
+		let callee_sig = self.mir.function(function).signature;
 		let callee = self.node(DataNodeKind::FunctionRef { id: function });
 		// Zero-sized arguments (e.g. a `Memory`-typed handle) carry no
-		// runtime bits and occupy no WASM param slot (see
-		// `wasm::flatten_type_to_scalars`'s `Unit`/`Never` case) — drop them
-		// here to match, rather than materializing a nonexistent `Value`.
+		// runtime bits and occupy no WASM param slot (`Signatures::scalars`
+		// gives them none) — drop them here to match, rather than
+		// materializing a nonexistent `Value`.
 		// A diverging argument stops the call: it never reaches the callee,
 		// so later arguments are not evaluated either.
 		let mut args = Vec::with_capacity(arguments.len());
@@ -1658,26 +1466,27 @@ impl<'mir> Builder<'mir> {
 		}
 		let args = args.into_boxed_slice();
 
-		let result = match result_ty {
-			// A call whose declared result is `!` still runs for its effects,
-			// but it never hands control back to this block.
-			mir::ValueType::Never => StackResult::Never,
-			mir::ValueType::Unit => StackResult::Unit,
-			mir::ValueType::Aggregate { aggregate_index } => {
-				StackResult::Value(self.node(
+		let result =
+			match result_ty {
+				// A call whose declared result is `!` still runs for its effects,
+				// but it never hands control back to this block.
+				mir::ValueType::Never => StackResult::Never,
+				mir::ValueType::Unit => StackResult::Unit,
+				mir::ValueType::Aggregate {
+					signature: aggregate_index,
+				} => StackResult::Value(self.node(
 					DataNodeKind::AggregateCallResult { aggregate_index },
-				))
-			}
-			_ => {
-				let ty = ScalarType::try_from(result_ty)
-					.expect("scalar call result type");
-				StackResult::Value(self.node(DataNodeKind::CallResult {
-					callee,
-					args: args.clone(),
-					ty,
-				}))
-			}
-		};
+				)),
+				_ => {
+					let ty = ScalarType::try_from(result_ty)
+						.expect("scalar call result type");
+					StackResult::Value(self.node(DataNodeKind::CallResult {
+						callee,
+						args: args.clone(),
+						ty,
+					}))
+				}
+			};
 
 		self.push_stmt(
 			block_idx,
@@ -2123,8 +1932,8 @@ impl<'mir> Builder<'mir> {
 					}
 					NodeType::Aggregate(aggregate_index) => self
 						.mir
-						.aggregate(aggregate_index)
-						.scalars
+						.signatures
+						.results(aggregate_index)
 						.iter()
 						.map(|&ty| {
 							let ty = ScalarType::try_from(ty)
@@ -2289,7 +2098,7 @@ impl<'mir> Builder<'mir> {
 	) -> DataNodeIndex {
 		let aggregate_index = self.aggregate_index_of(aggregate);
 		let ty = ScalarType::try_from(
-			self.mir.aggregate(aggregate_index).scalars[usize::from(scalar)],
+			self.mir.signatures.results(aggregate_index)[usize::from(scalar)],
 		)
 		.expect("a ScalarTable entry is scalar by construction");
 		self.node(DataNodeKind::AggregateGet {
@@ -2300,7 +2109,7 @@ impl<'mir> Builder<'mir> {
 	}
 
 	/// The aggregate shape carried by any aggregate-typed node.
-	fn aggregate_index_of(&self, node: DataNodeIndex) -> mir::AggregateIndex {
+	fn aggregate_index_of(&self, node: DataNodeIndex) -> mir::SignatureIndex {
 		match self.func.data_nodes[node as usize].kind.node_type() {
 			NodeType::Aggregate(index) => index,
 			NodeType::Scalar(_) => panic!("expected an aggregate-typed node"),
@@ -2316,7 +2125,7 @@ impl<'mir> Builder<'mir> {
 			// No field sub-nodes — the values live on the multi-return stack,
 			// so each one has to be named by an explicit projection.
 			DataNodeKind::AggregateCallResult { aggregate_index } => {
-				let count = mir.aggregate(aggregate_index).scalars.len();
+				let count = mir.signatures.results(aggregate_index).len();
 				(0..count as u32)
 					.map(|i| {
 						self.project_scalar(node, mir::ScalarIndex::new(i))
@@ -2330,14 +2139,14 @@ impl<'mir> Builder<'mir> {
 	/// Group scalar nodes into a flat pack. No source field tree is rebuilt.
 	fn aggregate_from_scalars(
 		&mut self,
-		aggregate_index: mir::AggregateIndex,
+		aggregate_index: mir::SignatureIndex,
 		values: Vec<DataNodeIndex>,
 	) -> DataNodeIndex {
 		let mir = self.mir;
-		let agg = &mir.aggregate(aggregate_index);
+		let scalars = mir.signatures.results(aggregate_index);
 		debug_assert_eq!(
 			values.len(),
-			agg.scalars.len(),
+			scalars.len(),
 			"value count must match the aggregate's scalar count"
 		);
 		debug_assert!(values.iter().all(|&node| matches!(
@@ -2350,91 +2159,6 @@ impl<'mir> Builder<'mir> {
 		})
 	}
 
-	/// Store an aggregate value through a pointer, one memory access per WASM
-	/// value.
-	///
-	/// `MemAccess` has no notion of "store a whole nested struct", so this has
-	/// to reach the individual scalars. It used to recurse the field tree
-	/// accumulating offsets; the `ScalarTable` already holds each scalar's
-	/// offset relative to the aggregate base, so it is now a flat zip.
-	fn emit_aggregate_store(
-		&mut self,
-		block_idx: BlockIndex,
-		address: DataNodeIndex,
-		base_offset: u32,
-		value_node: DataNodeIndex,
-		aggregate_index: mir::AggregateIndex,
-		memory: mir::MemoryId,
-	) {
-		let values = self.scalars_of(value_node);
-		let mir = self.mir;
-		let scalars = &mir.aggregate(aggregate_index).scalars;
-		debug_assert_eq!(values.len(), scalars.len());
-		let offsets = &mir
-			.aggregate(aggregate_index)
-			.memory
-			.as_ref()
-			.expect("a memory store requires a memory representation")
-			.offsets;
-		for ((&value, &ty), &offset) in
-			values.iter().zip(scalars.iter()).zip(offsets.iter())
-		{
-			self.push_stmt(
-				block_idx,
-				ControlNode::PointerStore {
-					address,
-					offset: base_offset + offset,
-					value,
-					memory,
-					access: MemAccess::from_mir(ty),
-				},
-			);
-		}
-	}
-
-	/// Load an aggregate through a pointer, one memory access per WASM value,
-	/// then reassemble the shape. Mirrors `emit_aggregate_store`.
-	fn build_aggregate_load(
-		&mut self,
-		block_idx: BlockIndex,
-		address: DataNodeIndex,
-		base_offset: u32,
-		aggregate_index: mir::AggregateIndex,
-		memory: mir::MemoryId,
-	) -> DataNodeIndex {
-		let mir = self.mir;
-		let scalars = &mir.aggregate(aggregate_index).scalars;
-		let offsets = &mir
-			.aggregate(aggregate_index)
-			.memory
-			.as_ref()
-			.expect("a memory load requires a memory representation")
-			.offsets;
-		let values: Vec<DataNodeIndex> = scalars
-			.iter()
-			.zip(offsets.iter())
-			.map(|(&ty, &offset)| {
-				let access = MemAccess::from_mir(ty);
-				let result = self
-					.node(DataNodeKind::PointerLoadResult { address, access });
-				self.push_stmt(
-					block_idx,
-					ControlNode::PointerLoad {
-						address,
-						offset: base_offset + offset,
-						result,
-						memory,
-						access,
-					},
-				);
-				result
-			})
-			.collect();
-		self.aggregate_from_scalars(aggregate_index, values)
-	}
-
-	/// Merge two `StackResult`s at a control-flow join. `Never` defers to the
-	/// other side.
 	fn merge_stack_results(
 		&mut self,
 		a: StackResult,
@@ -2453,13 +2177,9 @@ impl<'mir> Builder<'mir> {
 
 	// ── Small helpers ─────────────────────────────────────────────────────────
 
-	/// Arithmetic, bitwise, and shift operators. WASM has separate signed
-	/// and unsigned instructions for division, remainder, and right shift;
-	/// `ScalarType` can't tell them apart (`u32` and `i32` are both `I32`
-	/// there), so the node kind is chosen from the MIR type. Unsigned
-	/// integers and pointers take the `_u` variants. Potentially trapping
-	/// integer division/remainder are control operations; float division stays
-	/// in the freely movable data graph.
+	/// Arithmetic, bitwise, and shift operators: the node for the opcode.
+	/// Potentially trapping integer division/remainder are control
+	/// operations; float division stays in the freely movable data graph.
 	fn build_binary(
 		&mut self,
 		block_idx: BlockIndex,
@@ -2473,7 +2193,6 @@ impl<'mir> Builder<'mir> {
 
 		let ty =
 			ScalarType::try_from(node_ty).expect("binary op must be scalar");
-		let unsigned = node_ty.is_unsigned();
 		let Some(left) = self.build_value(block_idx, bindings, lhs) else {
 			return StackResult::Never;
 		};
@@ -2481,21 +2200,18 @@ impl<'mir> Builder<'mir> {
 			return StackResult::Never;
 		};
 
-		if matches!(ty, ScalarType::I32 | ScalarType::I64) {
-			let trapping = match op {
-				BinaryOp::Div if unsigned => {
-					Some(TrappingOp::DivU { left, right, ty })
-				}
-				BinaryOp::Div => Some(TrappingOp::DivS { left, right, ty }),
-				BinaryOp::Rem if unsigned => {
-					Some(TrappingOp::RemU { left, right, ty })
-				}
-				BinaryOp::Rem => Some(TrappingOp::RemS { left, right, ty }),
-				_ => None,
-			};
-			if let Some(op) = trapping {
-				return StackResult::Value(self.build_trapping(block_idx, op));
-			}
+		let trapping = match op {
+			BinaryOp::DivS => Some(TrappingOp::DivS { left, right, ty }),
+			BinaryOp::DivU => Some(TrappingOp::DivU { left, right, ty }),
+			BinaryOp::RemS => Some(TrappingOp::RemS { left, right, ty }),
+			BinaryOp::RemU => Some(TrappingOp::RemU { left, right, ty }),
+			_ => None,
+		};
+		if let Some(trapping) = trapping {
+			debug_assert!(op.can_trap());
+			return StackResult::Value(
+				self.build_trapping(block_idx, trapping),
+			);
 		}
 
 		let kind = match op {
@@ -2503,16 +2219,21 @@ impl<'mir> Builder<'mir> {
 			BinaryOp::Sub => N::Sub { left, right, ty },
 			BinaryOp::Mul => N::Mul { left, right, ty },
 			BinaryOp::Div => N::Div { left, right, ty },
-			BinaryOp::Rem => unreachable!("remainder has integer operands"),
-			BinaryOp::BitAnd => N::BitAnd { left, right, ty },
-			BinaryOp::BitOr => N::BitOr { left, right, ty },
-			BinaryOp::BitXor => N::BitXor { left, right, ty },
+			BinaryOp::And => N::BitAnd { left, right, ty },
+			BinaryOp::Or => N::BitOr { left, right, ty },
+			BinaryOp::Xor => N::BitXor { left, right, ty },
 			BinaryOp::Shl => N::Shl { left, right, ty },
-			BinaryOp::Shr if unsigned => N::ShrU { left, right, ty },
-			BinaryOp::Shr => N::ShrS { left, right, ty },
+			BinaryOp::ShrS => N::ShrS { left, right, ty },
+			BinaryOp::ShrU => N::ShrU { left, right, ty },
 			BinaryOp::Min => N::Min { left, right, ty },
 			BinaryOp::Max => N::Max { left, right, ty },
 			BinaryOp::Copysign => N::Copysign { left, right, ty },
+			BinaryOp::DivS
+			| BinaryOp::DivU
+			| BinaryOp::RemS
+			| BinaryOp::RemU => {
+				unreachable!("built as a trapping operation")
+			}
 		};
 		StackResult::Value(self.node(kind))
 	}
@@ -2577,11 +2298,12 @@ impl<'mir> Builder<'mir> {
 		})
 	}
 
-	/// Signedness comes from the source for integer extension/float conversion,
-	/// and from the target for trapping float-to-integer truncation.
+	/// The node for `op` from `from` to `to`; a truncation, which can trap,
+	/// in program order.
 	fn build_conversion(
 		&mut self,
 		block_idx: BlockIndex,
+		op: mir::ConvertOp,
 		from: mir::ValueType,
 		to: mir::ValueType,
 		operand: DataNodeIndex,
@@ -2589,48 +2311,50 @@ impl<'mir> Builder<'mir> {
 		use DataNodeKind as N;
 		use ScalarType::{F32, F64, I32, I64};
 		use TrappingOp as T;
+		use mir::ConvertOp as C;
 		let source =
 			ScalarType::try_from(from).expect("a conversion is scalar");
 		let target = ScalarType::try_from(to).expect("a conversion is scalar");
-		let trapping = match (source, target) {
-			(F32, I32) if to.is_unsigned() => Some(T::U32TruncF32 { operand }),
-			(F32, I32) => Some(T::I32TruncF32 { operand }),
-			(F64, I32) if to.is_unsigned() => Some(T::U32TruncF64 { operand }),
-			(F64, I32) => Some(T::I32TruncF64 { operand }),
-			(F32, I64) if to.is_unsigned() => Some(T::U64TruncF32 { operand }),
-			(F32, I64) => Some(T::I64TruncF32 { operand }),
-			(F64, I64) if to.is_unsigned() => Some(T::U64TruncF64 { operand }),
-			(F64, I64) => Some(T::I64TruncF64 { operand }),
+		let trapping = match (op, source, target) {
+			(C::TruncU, F32, I32) => Some(T::U32TruncF32 { operand }),
+			(C::TruncS, F32, I32) => Some(T::I32TruncF32 { operand }),
+			(C::TruncU, F64, I32) => Some(T::U32TruncF64 { operand }),
+			(C::TruncS, F64, I32) => Some(T::I32TruncF64 { operand }),
+			(C::TruncU, F32, I64) => Some(T::U64TruncF32 { operand }),
+			(C::TruncS, F32, I64) => Some(T::I64TruncF32 { operand }),
+			(C::TruncU, F64, I64) => Some(T::U64TruncF64 { operand }),
+			(C::TruncS, F64, I64) => Some(T::I64TruncF64 { operand }),
 			_ => None,
 		};
-		if let Some(op) = trapping {
-			return self.build_trapping(block_idx, op);
+		if let Some(trapping) = trapping {
+			debug_assert!(op.can_trap());
+			return self.build_trapping(block_idx, trapping);
 		}
-		let kind = match (source, target) {
-			(I32, I64) if from.is_unsigned() => N::I64ExtendI32U { operand },
-			(I32, I64) => N::I64ExtendI32S { operand },
-			(I64, I32) => N::I32WrapI64 { operand },
-			(I32, F32) if from.is_unsigned() => N::F32ConvertU32 { operand },
-			(I32, F32) => N::F32ConvertI32 { operand },
-			(I64, F32) if from.is_unsigned() => N::F32ConvertU64 { operand },
-			(I64, F32) => N::F32ConvertI64 { operand },
-			(I32, F64) if from.is_unsigned() => N::F64ConvertU32 { operand },
-			(I32, F64) => N::F64ConvertI32 { operand },
-			(I64, F64) if from.is_unsigned() => N::F64ConvertU64 { operand },
-			(I64, F64) => N::F64ConvertI64 { operand },
-			(F32, F64) => N::F64PromoteF32 { operand },
-			(F64, F32) => N::F32DemoteF64 { operand },
-			(source, target) => {
-				unreachable!("no conversion from {source:?} to {target:?}")
-			}
+		let kind = match (op, source, target) {
+			(C::ExtendU, I32, I64) => N::I64ExtendI32U { operand },
+			(C::ExtendS, I32, I64) => N::I64ExtendI32S { operand },
+			(C::Wrap, I64, I32) => N::I32WrapI64 { operand },
+			(C::ConvertU, I32, F32) => N::F32ConvertU32 { operand },
+			(C::ConvertS, I32, F32) => N::F32ConvertI32 { operand },
+			(C::ConvertU, I64, F32) => N::F32ConvertU64 { operand },
+			(C::ConvertS, I64, F32) => N::F32ConvertI64 { operand },
+			(C::ConvertU, I32, F64) => N::F64ConvertU32 { operand },
+			(C::ConvertS, I32, F64) => N::F64ConvertI32 { operand },
+			(C::ConvertU, I64, F64) => N::F64ConvertU64 { operand },
+			(C::ConvertS, I64, F64) => N::F64ConvertI64 { operand },
+			(C::Promote, F32, F64) => N::F64PromoteF32 { operand },
+			(C::Demote, F64, F32) => N::F32DemoteF64 { operand },
+			(C::Reinterpret, F32, I32) => N::I32ReinterpretF32 { operand },
+			(C::Reinterpret, I32, F32) => N::F32ReinterpretI32 { operand },
+			(C::Reinterpret, F64, I64) => N::I64ReinterpretF64 { operand },
+			(C::Reinterpret, I64, F64) => N::F64ReinterpretI64 { operand },
+			_ => unreachable!("`verify` checks a conversion's types"),
 		};
 		self.node(kind)
 	}
 
-	/// Comparison operators. Like `build_binary`, the signed/unsigned
-	/// choice comes from the MIR type — but from the *operands*, since the
-	/// result is always Bool. The `ScalarType` likewise comes from the
-	/// built operand node.
+	/// Comparison operators. The `ScalarType` comes from the built operand
+	/// node; a float comparison is the signed node of a float type.
 	fn build_cmp(
 		&mut self,
 		block_idx: BlockIndex,
@@ -2641,7 +2365,6 @@ impl<'mir> Builder<'mir> {
 	) -> StackResult {
 		use DataNodeKind as N;
 
-		let unsigned = self.ty(lhs).is_unsigned();
 		let Some(left) = self.build_value(block_idx, bindings, lhs) else {
 			return StackResult::Never;
 		};
@@ -2653,14 +2376,14 @@ impl<'mir> Builder<'mir> {
 		let kind = match op {
 			CompareOp::Eq => N::Eq { left, right, ty },
 			CompareOp::Ne => N::NotEq { left, right, ty },
-			CompareOp::Lt if unsigned => N::LtU { left, right, ty },
-			CompareOp::Lt => N::LtS { left, right, ty },
-			CompareOp::Le if unsigned => N::LtEqU { left, right, ty },
-			CompareOp::Le => N::LtEqS { left, right, ty },
-			CompareOp::Gt if unsigned => N::GtU { left, right, ty },
-			CompareOp::Gt => N::GtS { left, right, ty },
-			CompareOp::Ge if unsigned => N::GtEqU { left, right, ty },
-			CompareOp::Ge => N::GtEqS { left, right, ty },
+			CompareOp::LtU => N::LtU { left, right, ty },
+			CompareOp::LtS | CompareOp::Lt => N::LtS { left, right, ty },
+			CompareOp::LeU => N::LtEqU { left, right, ty },
+			CompareOp::LeS | CompareOp::Le => N::LtEqS { left, right, ty },
+			CompareOp::GtU => N::GtU { left, right, ty },
+			CompareOp::GtS | CompareOp::Gt => N::GtS { left, right, ty },
+			CompareOp::GeU => N::GtEqU { left, right, ty },
+			CompareOp::GeS | CompareOp::Ge => N::GtEqS { left, right, ty },
 		};
 		StackResult::Value(self.node(kind))
 	}
@@ -2688,11 +2411,13 @@ impl<'mir> Builder<'mir> {
 	fn default_value(&mut self, ty: mir::ValueType) -> StackResult {
 		match ty {
 			mir::ValueType::Unit | mir::ValueType::Never => StackResult::Unit,
-			mir::ValueType::Aggregate { aggregate_index } => {
+			mir::ValueType::Aggregate {
+				signature: aggregate_index,
+			} => {
 				let mir = self.mir;
-				let agg = &mir.aggregate(aggregate_index);
-				let values: Box<[_]> = agg
-					.scalars
+				let values: Box<[_]> = mir
+					.signatures
+					.results(aggregate_index)
 					.iter()
 					.map(|&ty| self.default_value(ty).unwrap_value())
 					.collect();

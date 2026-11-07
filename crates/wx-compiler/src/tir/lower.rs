@@ -23,8 +23,9 @@
 //! addressed through `places.rs`; the memory intrinsics (`memory_size`,
 //! `memory_grow`, `memory_fill`, `memory_copy`, `size_of`, `align_of`) are
 //! MIR's memory nodes and constants.
-//! Aggregates keep their values in declaration order while TIR supplies the
-//! byte offsets and size. A constant pattern compares an aggregate through
+//! A struct's values stay in declaration order, one MIR local per scalar,
+//! and a struct in memory is loaded and stored one scalar at a time at the
+//! byte offsets TIR supplies. A constant pattern compares an aggregate through
 //! the concrete `PartialEq::eq` impl its checked `Eq` bound selects, so a
 //! type's own equality is honoured. Static data (string and array literals,
 //! constants holding data, addresses in constants and globals) is the
@@ -50,23 +51,24 @@ use super::body::{
 use super::bounds::AssumptionEnvIdx;
 use super::defs::{Attributes, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx};
 use super::eval::Val;
-use super::layout::Primitive;
 use super::members::ResolvedFunction;
 use super::signatures::TypeContext;
 use super::solver::{NormalizationDepth, RewriteFlags};
+use super::types::Primitive;
 use super::types::{
 	GenericArgs, GenericEnvIdx, Substitution, Type, TypeIndex, TypeList,
 };
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::mir;
-use crate::mir::layout::AggregateTable;
 use crate::vfs::FileId;
+use shapes::{ScalarRange, StackShapes};
 
 mod constants;
 mod intrinsics;
 mod patterns;
 mod places;
+mod shapes;
 mod statics;
 
 /// How a call's written arguments meet what it runs.
@@ -103,6 +105,37 @@ impl FunctionInstance {
 	}
 }
 
+/// The MIR locals one value is held in, one per scalar, in order: none for
+/// a zero-sized value. Lowering allocates a value's locals together, so here
+/// they are a run; MIR has no such notion, and every node names each local
+/// it reads or writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+struct LocalRun {
+	start: u32,
+	len: u32,
+}
+
+impl LocalRun {
+	const EMPTY: Self = Self { start: 0, len: 0 };
+
+	fn locals(self) -> impl Iterator<Item = mir::LocalIndex> {
+		(self.start..self.start + self.len).map(mir::LocalIndex::new)
+	}
+
+	/// The locals of the scalars in `range`, a field's.
+	fn slice(self, range: ScalarRange) -> Self {
+		assert!(
+			range.start + range.len <= self.len,
+			"a field is inside its value"
+		);
+		Self {
+			start: self.start + range.start,
+			len: range.len,
+		}
+	}
+}
+
 /// What one function's lowering keeps outside the shared [`Lowerer`].
 struct FunctionState {
 	file_id: FileId,
@@ -115,10 +148,11 @@ struct FunctionState {
 	/// The instance being lowered, which a call in its body records as the
 	/// callee's caller.
 	instance: FunctionInstance,
-	/// `body.locals()[i]` in the MIR local it was assigned.
-	local_map: Vec<mir::LocalIndex>,
-	/// MIR locals: the declared parameters first (including discard slots for
-	/// unnamed ones), then every remaining source local.
+	/// `body.locals()[i]` in the MIR locals it was assigned.
+	local_map: Vec<LocalRun>,
+	/// MIR locals, each one scalar: the declared parameters' first (an
+	/// unnamed one's too, so the parameters stay positional), then every
+	/// remaining source local's, then temporaries.
 	locals: Vec<mir::Local>,
 	/// The function's MIR nodes.
 	mir_body: mir::Body,
@@ -147,14 +181,14 @@ impl FunctionState {
 		self.mir_body.push_list(items)
 	}
 
-	/// A boolean literal: Wasm has none, so MIR holds it as an integer
-	/// `0`/`1` of type `Bool`.
+	/// A boolean literal: Wasm has none, so MIR holds it as an `I32` of 0
+	/// or 1.
 	fn boolean(&mut self, value: bool) -> mir::ExprId {
 		self.push(
 			mir::ExprKind::Int {
 				value: i64::from(value),
 			},
-			mir::ValueType::Bool,
+			mir::ValueType::I32,
 		)
 	}
 
@@ -186,20 +220,6 @@ impl FunctionState {
 	}
 }
 
-/// Source field selections are lowering metadata, never MIR type structure.
-/// Keep them once per normalized concrete type for constant-time projection.
-/// One field of an aggregate being lowered: a source type, or a value with
-/// no source type of its own (a fat pointer's address).
-enum AggregateField {
-	Type(TypeIndex),
-	Lowered(mir::ValueType),
-}
-
-struct AggregateLowering {
-	ty: mir::ValueType,
-	fields: Box<[mir::ScalarRange]>,
-}
-
 struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	context: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
 	functions: Vec<mir::Function>,
@@ -218,13 +238,14 @@ struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	/// names it (a pointer into it, an access, an export); indexed by
 	/// `MemoryIdx`.
 	memory_ids: Vec<Option<mir::MemoryId>>,
-	signatures: Vec<mir::FunctionSignature>,
 	/// Backend identity, minted here per instance. Never a source or Wasm
 	/// index.
 	ids: HashMap<FunctionInstance, mir::FunctionId>,
-	/// Concrete source types already translated into flat representations.
-	aggregate_types: HashMap<TypeIndex, AggregateLowering>,
-	aggregates: AggregateTable,
+	/// How each struct, tuple and fat pointer type lowered so far is held
+	/// on the stack.
+	shapes: StackShapes,
+	/// Every signature and multi-result type, MIR's.
+	signatures: mir::Signatures,
 	statics: statics::StaticData,
 	pending: VecDeque<FunctionInstance>,
 	/// The instance whose body first named each instance; the roots (the
@@ -236,13 +257,6 @@ struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 /// How many instances of one function may nest along a chain of callers,
 /// rustc's default `recursion_limit`.
 const RECURSION_LIMIT: u32 = 128;
-
-/// How many Wasm values one type may flatten to. A resource limit, not a
-/// language rule: interned types share their parts, so a doubling chain
-/// (`f((x, x))` in `f<T>`) is a handful of types that flatten to
-/// exponentially many values, long before the recursion limit stops it.
-/// Far above what a program writes by hand.
-const SLOT_LIMIT: usize = 1 << 16;
 
 /// The separate build entry point. `check` is untouched; this repeats its
 /// setup and then lowers the same live context instead of dropping it.
@@ -260,10 +274,9 @@ pub(super) fn build(
 		global_ids: vec![None; global_count],
 		memories: Vec::new(),
 		memory_ids: vec![None; memory_count],
-		signatures: Vec::new(),
 		ids: HashMap::new(),
-		aggregate_types: HashMap::new(),
-		aggregates: AggregateTable::default(),
+		shapes: StackShapes::default(),
+		signatures: mir::Signatures::default(),
 		statics: statics::StaticData::default(),
 		pending: VecDeque::new(),
 		callers: HashMap::new(),
@@ -322,7 +335,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			exports: mir_exports,
 			imports: self.imports,
 			memories: self.memories,
-			aggregates: self.aggregates.finish(),
 			static_entries: self.statics.finish(),
 			start_function: None,
 		};
@@ -525,7 +537,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				)?;
 			}
 		}
-		let (signature_index, param_types, result_type) =
+		let (signature, param_types, result_type) =
 			self.lower_signature(instance)?;
 		let env = self.context.functions[usize::from(function)].type_params;
 		let args: Box<[TypeIndex]> =
@@ -568,7 +580,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		// function's id is its index.
 		debug_assert_eq!(usize::from(id), self.functions.len());
 		self.functions.push(mir::Function {
-			signature_index,
+			signature,
 			origin: mir::Origin::Defined(mir::Code {
 				locals: state.locals,
 				label_count: state.label_count,
@@ -603,7 +615,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let id = self.ids[&instance];
 		let file_id =
 			self.context.defs.functions[usize::from(instance.function)].file_id;
-		let (signature_index, param_types, result_type) =
+		let (signature, param_types, result_type) =
 			self.lower_signature(instance)?;
 		let mut state = FunctionState {
 			file_id,
@@ -621,13 +633,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		// Parameters are the first MIR locals, in order, as in a defined
 		// function; each is read once, as its operand.
 		let mut operands = Vec::with_capacity(param_types.len());
-		for (position, &ty) in param_types.iter().enumerate() {
-			state.locals.push(mir::Local {
-				ty,
-				mutability: mir::Mutability::Immutable,
-			});
-			let local = mir::LocalIndex::new(position as u32);
-			operands.push(state.push(mir::ExprKind::LocalGet { local }, ty));
+		for &ty in &param_types {
+			let run =
+				self.push_locals(&mut state, ty, mir::Mutability::Immutable);
+			operands.push(self.read_locals(&mut state, run, ty));
 		}
 		let root = self.expand_intrinsic(
 			&mut state,
@@ -645,7 +654,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		debug_assert_eq!(usize::from(id), self.functions.len());
 		self.functions.push(mir::Function {
-			signature_index,
+			signature,
 			origin: mir::Origin::Defined(mir::Code {
 				locals: state.locals,
 				label_count: 0,
@@ -665,7 +674,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		import: super::defs::ImportIdx,
 	) -> Result<(), ()> {
 		let id = self.ids[&instance];
-		let (signature_index, _, _) = self.lower_signature(instance)?;
+		let (signature, _, _) = self.lower_signature(instance)?;
 		let entry =
 			mir::ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
 		self.imports.push(mir::Import {
@@ -679,7 +688,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		});
 		debug_assert_eq!(usize::from(id), self.functions.len());
 		self.functions.push(mir::Function {
-			signature_index,
+			signature,
 			origin: mir::Origin::Imported(entry),
 		});
 		self.function_flags.push(mir::FunctionFlags::empty());
@@ -699,19 +708,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let (file_id, name, mutable) =
 			(def.file_id, def.name, def.mut_trait_impl_index.is_some());
 		let value_type = self.context.global_value_type(global);
+		// The checker proved it one Wasm value: a scalar, which a struct of
+		// one (`Meters(u32)`) is too.
 		let ty = self.lower_type(value_type, file_id, name.span)?;
-		// The checker proved it one Wasm value: a scalar, or a pack of one
-		// (`Meters(u32)`), which the module holds as that scalar.
-		let ty = match ty {
-			mir::ValueType::Aggregate { aggregate_index } => {
-				let [scalar] = *self.aggregates.get(aggregate_index).scalars
-				else {
-					unreachable!("a global's value is one Wasm value")
-				};
-				scalar
-			}
-			ty => ty,
-		};
 		let id = mir::GlobalId::new(u32::try_from(self.globals.len()).unwrap());
 		let origin =
 			match self.context.ast_node(super::defs::DefId::Global(global)) {
@@ -896,10 +895,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let return_type = self.substitute(return_type, type_params, &args);
 		let result_type = self.lower_type(return_type, file_id, name_span)?;
 
-		let mut items = param_types.clone();
-		items.push(result_type);
-		let index =
-			self.intern_signature(items.into_boxed_slice(), param_types.len());
+		// Each parameter is its scalars, as its locals are, and so is the
+		// result.
+		let params: Vec<mir::ValueType> = param_types
+			.iter()
+			.flat_map(|ty| self.signatures.scalars(ty))
+			.copied()
+			.collect();
+		let results = self.signatures.scalars(&result_type).to_vec();
+		let index = self.signatures.intern(&params, &results);
 		Ok((index, param_types, result_type))
 	}
 
@@ -936,6 +940,47 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		self.substitute(body.pattern_ty(pattern), state.env, &state.args)
 	}
 
+	/// The primitive `expr`'s type is held as, in this instance (an enum's
+	/// its repr's), or `None` for a diverging one: a primitive operator's
+	/// operand, whose source type picks the operator's opcode.
+	fn operand_primitive(
+		&mut self,
+		body: &Body,
+		state: &FunctionState,
+		expr: ExprIdx,
+	) -> Result<Option<Primitive>, ()> {
+		let ty = self.expr_ty(body, state, expr);
+		if ty == TypeIndex::NEVER {
+			return Ok(None);
+		}
+		let primitive =
+			self.scalar_primitive(ty, state.file_id, body.span(expr))?;
+		assert!(
+			primitive.is_some(),
+			"a primitive operator's operand is a primitive"
+		);
+		Ok(primitive)
+	}
+
+	/// The primitive a value of `ty` is held as, an enum its repr's (`Bool`
+	/// a `u8`), or `None` for any other type: what an operator's opcode and
+	/// an integer pattern's bits are read as.
+	pub(super) fn scalar_primitive(
+		&mut self,
+		ty: TypeIndex,
+		file_id: FileId,
+		span: TextSpan,
+	) -> Result<Option<Primitive>, ()> {
+		let ty = self.normalize_type(ty, file_id, span)?;
+		match *self.context.types.resolve(ty) {
+			Type::Enum { enum_index } => {
+				let repr = self.context.enums[usize::from(enum_index)].repr;
+				self.scalar_primitive(repr, file_id, span)
+			}
+			_ => Ok(Primitive::of(ty)),
+		}
+	}
+
 	/// The concrete type of `expr` in this instance.
 	fn expr_ty(
 		&mut self,
@@ -944,26 +989,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		expr: ExprIdx,
 	) -> TypeIndex {
 		self.substitute(body.ty(expr), state.env, &state.args)
-	}
-
-	fn intern_signature(
-		&mut self,
-		items: Box<[mir::ValueType]>,
-		params_count: usize,
-	) -> mir::SignatureIndex {
-		for (index, signature) in self.signatures.iter().enumerate() {
-			if signature.params_count == params_count
-				&& signature.items == items
-			{
-				return mir::SignatureIndex::new(index as u32);
-			}
-		}
-		let index = mir::SignatureIndex::new(self.signatures.len() as u32);
-		self.signatures.push(mir::FunctionSignature {
-			items,
-			params_count,
-		});
-		index
 	}
 
 	fn lower_body(
@@ -991,7 +1016,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			env,
 			args,
 			instance,
-			local_map: vec![mir::LocalIndex::new(0); body.locals().len()],
+			local_map: vec![LocalRun::EMPTY; body.locals().len()],
 			locals: Vec::new(),
 			mir_body: mir::Body::default(),
 			labels: vec![None; body.scope_count()],
@@ -999,17 +1024,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			root: None,
 		};
 
-		// Parameters occupy the first `params_count` MIR locals, in order —
-		// the contract `opt::builder` relies on. An unnamed parameter still
-		// gets a discard local so the indices stay positional.
+		// Parameters' scalars are the first MIR locals, in order, as the
+		// signature lists them — the contract `opt::builder` relies on. An
+		// unnamed parameter still gets its locals, so the rest stay
+		// positional.
 		for (position, binding) in body.params().iter().enumerate() {
-			let index = mir::LocalIndex::new(state.locals.len() as u32);
-			state.locals.push(mir::Local {
-				ty: param_types[position],
-				mutability: mir::Mutability::Immutable,
-			});
+			let run = self.push_locals(
+				&mut state,
+				param_types[position],
+				mir::Mutability::Immutable,
+			);
 			if let Some(local) = binding {
-				state.local_map[usize::from(*local)] = index;
+				state.local_map[usize::from(*local)] = run;
 			}
 		}
 		// Every non-parameter local, in declaration order.
@@ -1024,16 +1050,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			let ty = self.substitute(local.ty, env, &state.args);
 			let ty = self.lower_type(ty, file_id, local.name.span)?;
-			let index = mir::LocalIndex::new(state.locals.len() as u32);
-			state.locals.push(mir::Local {
-				ty,
-				mutability: if local.mut_span.is_some() {
-					mir::Mutability::Mutable
-				} else {
-					mir::Mutability::Immutable
-				},
-			});
-			state.local_map[tir_index] = index;
+			let mutability = if local.mut_span.is_some() {
+				mir::Mutability::Mutable
+			} else {
+				mir::Mutability::Immutable
+			};
+			state.local_map[tir_index] =
+				self.push_locals(&mut state, ty, mutability);
 		}
 
 		let root = self.lower_expr(body, &mut state, body.root())?;
@@ -1076,8 +1099,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				Ok(state.push(mir::ExprKind::Float { value }, ty))
 			}
 			ExprKind::Local(local) => {
-				let local = state.local_map[usize::from(local)];
-				Ok(state.push(mir::ExprKind::LocalGet { local }, ty))
+				let run = state.local_map[usize::from(local)];
+				Ok(self.read_locals(state, run, ty))
 			}
 			ExprKind::PrimitiveUnary { op, operand } => {
 				if ty == mir::ValueType::Never {
@@ -1091,14 +1114,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					debug_assert_eq!(state.ty(operand), mir::ValueType::Never);
 					return Ok(operand);
 				}
+				let primitive = self
+					.operand_primitive(body, state, operand)?
+					.expect("a diverging operand makes the operator `!`");
 				let value = self.lower_expr(body, state, operand)?;
-				let op = match op {
-					UnaryOp::InvertSign => mir::UnaryOp::Neg,
-					UnaryOp::Not => mir::UnaryOp::Eqz,
-					UnaryOp::BitNot => mir::UnaryOp::BitNot,
-				};
-				let value = state.push(mir::ExprKind::Unary { op, value }, ty);
-				Ok(canonical_narrow(state, value, ty))
+				let value = primitive_unary(state, op, primitive, value, ty);
+				Ok(canonical_narrow(state, value, primitive))
 			}
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
 				if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -1114,9 +1135,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					debug_assert_eq!(state.ty(left), mir::ValueType::Never);
 					return Ok(left);
 				}
+				// From the operand that has a value: both diverging made the
+				// operator `!` above.
+				let primitive =
+					match self.operand_primitive(body, state, lhs)? {
+						Some(primitive) => primitive,
+						None => self
+							.operand_primitive(body, state, rhs)?
+							.expect("one operand has a value"),
+					};
 				let lhs = self.lower_expr(body, state, lhs)?;
 				let rhs = self.lower_expr(body, state, rhs)?;
-				let Some(kind) = binary_kind(op, lhs, rhs) else {
+				let Some(kind) = binary_kind(op, primitive, lhs, rhs) else {
 					self.unsupported(
 						state.file_id,
 						body.span(expr),
@@ -1124,8 +1154,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					)?;
 					unreachable!()
 				};
+				let compare = matches!(kind, mir::ExprKind::Compare { .. });
 				let value = state.push(kind, ty);
-				Ok(canonical_narrow(state, value, ty))
+				if compare {
+					return Ok(value);
+				}
+				Ok(canonical_narrow(state, value, primitive))
 			}
 			ExprKind::Call {
 				function,
@@ -1276,43 +1310,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			ExprKind::Char(value) => {
 				let codepoint = i64::from(u32::from(value));
-				match ty {
-					// The `Char` struct itself: one `u32` codepoint.
-					mir::ValueType::Aggregate { aggregate_index } => {
-						#[cfg(debug_assertions)]
-						debug_assert_eq!(
-							self.aggregates
-								.get(aggregate_index)
-								.scalars
-								.as_ref(),
-							[mir::ValueType::U32],
-							"`Char` is one `u32` codepoint"
-						);
-						let value = state.push(
-							mir::ExprKind::Int { value: codepoint },
-							mir::ValueType::U32,
-						);
-						let values = state.list([value]);
-						Ok(state.push(mir::ExprKind::Aggregate { values }, ty))
-					}
-					// `coerce_char` turns a character literal into that
-					// integer's value when its context is an integer type.
-					_ => {
-						debug_assert!(
-							matches!(
-								ty,
-								mir::ValueType::I8
-									| mir::ValueType::U8 | mir::ValueType::I16
-									| mir::ValueType::U16 | mir::ValueType::I32
-									| mir::ValueType::U32 | mir::ValueType::I64
-									| mir::ValueType::U64
-							),
-							"a character literal's non-`Char` type is an integer"
-						);
-						Ok(state
-							.push(mir::ExprKind::Int { value: codepoint }, ty))
-					}
-				}
+				// The `Char` struct is its one `u32` codepoint; `coerce_char`
+				// gives a character literal an integer type when its context
+				// is one.
+				debug_assert!(
+					ty.is_integer(),
+					"a character literal's type is an integer"
+				);
+				Ok(state.push(mir::ExprKind::Int { value: codepoint }, ty))
 			}
 			ExprKind::Match { scrutinee, arms } => {
 				self.lower_match(body, state, scrutinee, arms, ty)
@@ -1514,10 +1519,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			return Ok(self.sequence(state, prefix, call));
 		}
 		let callee_id = self.enqueue_from(state, callee, span)?;
-		let (_, callee_params, ..) = self.lower_signature(callee)?;
+		// The checked signature's count; nothing about the callee is
+		// lowered for it.
+		let param_count = self.context.functions[usize::from(callee.function)]
+			.param_types
+			.len();
 		// A lone remaining parameter is its value, so it must not be
 		// unpacked even when that value is itself a tuple.
-		let remaining = callee_params.len() - usize::from(receiver.is_some());
+		let remaining = param_count - usize::from(receiver.is_some());
 		let arguments = if remaining == 1 {
 			vec![self.lower_expr(body, state, args)?]
 		} else {
@@ -1542,20 +1551,108 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		Ok(self.sequence(state, prefix, call))
 	}
 
-	/// `value` stored in a fresh temporary: the store, and a read of it.
+	/// `value` stored in fresh temporaries: the store, and a read of it.
 	fn spill(
 		&mut self,
 		state: &mut FunctionState,
 		value: mir::ExprId,
 	) -> (mir::ExprId, mir::ExprId) {
 		let ty = state.ty(value);
-		let local = self.push_temp_local(state, ty);
-		let set = state.push(
-			mir::ExprKind::LocalSet { local, value },
-			mir::ValueType::Unit,
-		);
-		let get = state.push(mir::ExprKind::LocalGet { local }, ty);
+		let (set, run) = self.temporary(state, value);
+		let get = self.read_locals(state, run, ty);
 		(set, get)
+	}
+
+	/// `value` stored in fresh temporaries: the store, and the temporaries,
+	/// which the caller reads as often as it needs.
+	fn temporary(
+		&mut self,
+		state: &mut FunctionState,
+		value: mir::ExprId,
+	) -> (mir::ExprId, LocalRun) {
+		let ty = state.ty(value);
+		let run = self.push_temp_local(state, ty);
+		let set = self.write_locals(state, run, value);
+		(set, run)
+	}
+
+	/// Fresh locals for a value of `ty`, one per scalar.
+	fn push_locals(
+		&self,
+		state: &mut FunctionState,
+		ty: mir::ValueType,
+		mutability: mir::Mutability,
+	) -> LocalRun {
+		let start = u32::try_from(state.locals.len()).unwrap();
+		for &ty in self.signatures.scalars(&ty) {
+			state.locals.push(mir::Local { ty, mutability });
+		}
+		let len = u32::try_from(state.locals.len()).unwrap() - start;
+		LocalRun { start, len }
+	}
+
+	/// The value of type `ty` held in `run`: a `LocalGet` of its one local,
+	/// or the `Values` of each.
+	fn read_locals(
+		&self,
+		state: &mut FunctionState,
+		run: LocalRun,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		match run.len {
+			0 => match ty {
+				mir::ValueType::Never => {
+					state.push(mir::ExprKind::Unreachable, ty)
+				}
+				_ => state.push(mir::ExprKind::Noop, ty),
+			},
+			1 => state.push(
+				mir::ExprKind::LocalGet {
+					local: mir::LocalIndex::new(run.start),
+				},
+				ty,
+			),
+			_ => {
+				let values: Vec<_> = run
+					.locals()
+					.map(|local| {
+						let ty = state.locals[usize::from(local)].ty;
+						state.push(mir::ExprKind::LocalGet { local }, ty)
+					})
+					.collect();
+				let values = state.list(values);
+				state.push(mir::ExprKind::Values { values }, ty)
+			}
+		}
+	}
+
+	/// Store `value` in `run`, one result per local: a `LocalSet` of its
+	/// one local, or a `SetLocals` of each. A zero-sized value is only
+	/// evaluated.
+	fn write_locals(
+		&self,
+		state: &mut FunctionState,
+		run: LocalRun,
+		value: mir::ExprId,
+	) -> mir::ExprId {
+		match run.len {
+			0 => value,
+			1 => state.push(
+				mir::ExprKind::LocalSet {
+					local: mir::LocalIndex::new(run.start),
+					value,
+				},
+				mir::ValueType::Unit,
+			),
+			_ => {
+				let targets =
+					state.mir_body.push_targets(run.locals().map(Some));
+				state.push(
+					mir::ExprKind::SetLocals { targets, value },
+					mir::ValueType::Unit,
+				)
+			}
+		}
 	}
 
 	/// Lower a call's argument value into one MIR argument per parameter, in
@@ -1581,12 +1678,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			// A computed argument tuple is evaluated once. Its source fields
 			// may each be a subpack or Unit, not necessarily a single slot.
-			let value_ty = state.ty(value);
-			let local = self.push_temp_local(state, value_ty);
-			prefix.push(state.push(
-				mir::ExprKind::LocalSet { local, value },
-				mir::ValueType::Unit,
-			));
+			let (set, run) = self.temporary(state, value);
+			prefix.push(set);
 			let field_types = self.aggregate_field_types(
 				source_ty,
 				state.file_id,
@@ -1602,10 +1695,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					FieldIdx::new(at as u32),
 					body.span(args),
 				)?;
-				result.push(
-					state
-						.push(mir::ExprKind::AggregateGet { local, range }, ty),
-				);
+				result.push(self.read_locals(state, run.slice(range), ty));
 			}
 			return Ok(result);
 		};
@@ -1697,7 +1787,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			)?;
 		}
 		let mut prefix = Vec::with_capacity(values.len());
-		let mut slots = Vec::with_capacity(self.slot_count(ty));
+		let mut slots = Vec::with_capacity(self.signatures.scalars(&ty).len());
 		for value in values {
 			let value_ty = state.ty(value);
 			if value_ty == mir::ValueType::Never {
@@ -1712,42 +1802,35 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				);
 				continue;
 			}
-			let local = self.push_temp_local(state, value_ty);
-			prefix.push(state.push(
-				mir::ExprKind::LocalSet { local, value },
-				mir::ValueType::Unit,
-			));
-			match value_ty {
-				mir::ValueType::Aggregate { aggregate_index } => {
-					let scalars = &self.aggregates.get(aggregate_index).scalars;
-					for (at, ty) in scalars.iter().copied().enumerate() {
-						slots.push(state.push(
-							mir::ExprKind::AggregateGet {
-								local,
-								range: mir::ScalarRange::new(at as u32, 1),
-							},
-							ty,
-						));
-					}
-				}
-				_ => slots.push(
-					state.push(mir::ExprKind::LocalGet { local }, value_ty),
-				),
+			let (set, run) = self.temporary(state, value);
+			prefix.push(set);
+			for local in run.locals() {
+				let ty = state.locals[usize::from(local)].ty;
+				slots.push(state.push(mir::ExprKind::LocalGet { local }, ty));
 			}
 		}
-		let value = if ty == mir::ValueType::Unit {
-			assert!(slots.is_empty());
-			state.push(mir::ExprKind::Noop, ty)
-		} else {
-			let values = state.list(slots);
-			state.push(mir::ExprKind::Aggregate { values }, ty)
+		let value = match *slots {
+			[] => {
+				assert!(ty == mir::ValueType::Unit);
+				state.push(mir::ExprKind::Noop, ty)
+			}
+			// A struct of one scalar is that scalar.
+			[slot] => {
+				#[cfg(debug_assertions)]
+				debug_assert_eq!(state.ty(slot), ty);
+				slot
+			}
+			_ => {
+				let values = state.list(slots);
+				state.push(mir::ExprKind::Values { values }, ty)
+			}
 		};
 		Ok(self.sequence(state, prefix, value))
 	}
 
-	/// `object.field`. `AggregateGet` addresses a local, so an object that is
-	/// not already one is parked in a fresh temporary, which keeps the
-	/// object's evaluation exactly once.
+	/// `object.field`: the field's locals, read. A value in no local is
+	/// stored in fresh temporaries first, which keeps the object's
+	/// evaluation exactly once.
 	fn lower_field_access(
 		&mut self,
 		body: &Body,
@@ -1764,85 +1847,42 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			root = object;
 		}
 		if matches!(body.kind(root), ExprKind::Local(_)) {
-			let (local, range) = self.local_projection(body, state, expr)?;
-			return Ok(
-				state.push(mir::ExprKind::AggregateGet { local, range }, ty)
-			);
+			let run = self.local_projection(body, state, expr)?;
+			return Ok(self.read_locals(state, run, ty));
 		}
 		let object_value = self.lower_expr(body, state, object)?;
+		if state.ty(object_value) == mir::ValueType::Never {
+			return Ok(object_value);
+		}
 		let object_ty = self.expr_ty(body, state, object);
 		let range =
 			self.field_range(object_ty, state, field, body.span(expr))?;
-		if let mir::ExprKind::LocalGet { local } =
-			state.mir_body.kind(object_value)
-		{
-			// The read is replaced by the projection, so its node is left
-			// out of the tree; rewrite it into the projection itself.
-			state.mir_body.set_kind(
-				object_value,
-				mir::ExprKind::AggregateGet { local, range },
-			);
-			state.mir_body.set_ty(object_value, ty);
-			return Ok(object_value);
-		}
-		let object_ty = state.ty(object_value);
-		let local = self.push_temp_local(state, object_ty);
-		let set = state.push(
-			mir::ExprKind::LocalSet {
-				local,
-				value: object_value,
-			},
-			mir::ValueType::Unit,
-		);
-		let get = state.push(mir::ExprKind::AggregateGet { local, range }, ty);
+		let (set, run) = self.temporary(state, object_value);
+		let get = self.read_locals(state, run.slice(range), ty);
 		Ok(self.sequence(state, vec![set], get))
 	}
 
+	/// Fresh mutable locals for a temporary of `ty`.
 	fn push_temp_local(
-		&mut self,
+		&self,
 		state: &mut FunctionState,
 		ty: mir::ValueType,
-	) -> mir::LocalIndex {
-		let index = mir::LocalIndex::new(state.locals.len() as u32);
-		state.locals.push(mir::Local {
-			ty,
-			mutability: mir::Mutability::Mutable,
-		});
-		index
+	) -> LocalRun {
+		self.push_locals(state, ty, mir::Mutability::Mutable)
 	}
 
-	/// Translate one source declaration field of the concrete `ty` into
-	/// slots. This map is local
-	/// to lowering; the owned MIR contains neither field IDs nor field types.
-	fn field_range(
-		&mut self,
-		ty: TypeIndex,
-		state: &FunctionState,
-		field: FieldIdx,
-		span: TextSpan,
-	) -> Result<mir::ScalarRange, ()> {
-		let ty = self.normalize_type(ty, state.file_id, span)?;
-		self.lower_type(ty, state.file_id, span)?;
-		Ok(self.aggregate_types[&ty].fields[usize::from(field)])
-	}
-
-	/// A local field path has no address computation or runtime receiver.
-	/// Compose its slot ranges without loading/reconstructing subaggregates.
+	/// A local field path has no address computation or runtime receiver:
+	/// it is the locals of the field's scalars.
 	fn local_projection(
 		&mut self,
 		body: &Body,
 		state: &FunctionState,
 		target: ExprIdx,
-	) -> Result<(mir::LocalIndex, mir::ScalarRange), ()> {
+	) -> Result<LocalRun, ()> {
 		match body.kind(target) {
-			ExprKind::Local(local) => {
-				let index = state.local_map[usize::from(local)];
-				let len = self.slot_count(state.locals[usize::from(index)].ty);
-				Ok((index, mir::ScalarRange::new(0, len as u32)))
-			}
+			ExprKind::Local(local) => Ok(state.local_map[usize::from(local)]),
 			ExprKind::FieldAccess { object, field } => {
-				let (local, parent) =
-					self.local_projection(body, state, object)?;
+				let parent = self.local_projection(body, state, object)?;
 				let object_ty = self.expr_ty(body, state, object);
 				let child = self.field_range(
 					object_ty,
@@ -1850,14 +1890,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					field,
 					body.span(target),
 				)?;
-				assert!(child.indices().end <= parent.len as usize);
-				Ok((
-					local,
-					mir::ScalarRange::new(
-						u32::from(parent.start) + u32::from(child.start),
-						child.len,
-					),
-				))
+				Ok(parent.slice(child))
 			}
 			_ => {
 				self.unsupported(
@@ -1872,7 +1905,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 
 	/// Read an assignment target's current value. `target` is a local or a
 	/// field path rooted in one; `local_projection` validates that and
-	/// flattens the path to a slot range.
+	/// gives the field's locals.
 	fn read_target(
 		&mut self,
 		body: &Body,
@@ -1880,17 +1913,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		target: ExprIdx,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
-		let (local, range) = self.local_projection(body, state, target)?;
-		let kind = if matches!(body.kind(target), ExprKind::Local(_)) {
-			mir::ExprKind::LocalGet { local }
-		} else {
-			mir::ExprKind::AggregateGet { local, range }
-		};
-		Ok(state.push(kind, ty))
+		let run = self.local_projection(body, state, target)?;
+		Ok(self.read_locals(state, run, ty))
 	}
 
 	/// Store `value`, already evaluated, into an assignment target. The
-	/// target is a local or a flat field range rooted in one.
+	/// target is a local or a field path rooted in one.
 	fn write_target(
 		&mut self,
 		body: &Body,
@@ -1898,17 +1926,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		target: ExprIdx,
 		value: mir::ExprId,
 	) -> Result<mir::ExprId, ()> {
-		let (local, range) = self.local_projection(body, state, target)?;
-		let kind = if matches!(body.kind(target), ExprKind::Local(_)) {
-			mir::ExprKind::LocalSet { local, value }
-		} else {
-			mir::ExprKind::AggregateSet {
-				local,
-				range,
-				value,
-			}
-		};
-		Ok(state.push(kind, mir::ValueType::Unit))
+		let run = self.local_projection(body, state, target)?;
+		Ok(self.write_locals(state, run, value))
 	}
 
 	/// `target op= value` on a primitive scalar. The operand runs first, as
@@ -1924,6 +1943,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		op: BinaryOp,
 		span: TextSpan,
 	) -> Result<mir::ExprId, ()> {
+		let primitive = self
+			.operand_primitive(body, state, target)?
+			.expect("an assignment's target has a value");
 		let target_ty = self.expr_ty(body, state, target);
 		let target_ty =
 			self.lower_type(target_ty, state.file_id, body.span(target))?;
@@ -1933,7 +1955,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		let (set, operand) = self.spill(state, value);
 		let read = self.read_target(body, state, target, target_ty)?;
-		let Some(kind) = binary_kind(op, read, operand) else {
+		let Some(kind) = binary_kind(op, primitive, read, operand) else {
 			self.unsupported(
 				state.file_id,
 				span,
@@ -1942,6 +1964,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			unreachable!()
 		};
 		let result = state.push(kind, target_ty);
+		let result = canonical_narrow(state, result, primitive);
 		let store = self.write_target(body, state, target, result)?;
 		Ok(self.sequence(state, vec![set], store))
 	}
@@ -1972,8 +1995,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let read = self.read_target(body, state, target, target_ty)?;
 		let (callee, callee_id) =
 			self.callee(state, method, type_args, span)?;
-		let (_, callee_params, ..) = self.lower_signature(callee)?;
-		if callee_params.len() != 2 {
+		// The checked signature's count; nothing about the callee is
+		// lowered for it.
+		let param_count = self.context.functions[usize::from(callee.function)]
+			.param_types
+			.len();
+		if param_count != 2 {
 			self.unsupported(
 				state.file_id,
 				span,
@@ -1985,17 +2012,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			self.build_call(state, callee_id, vec![read, operand], target_ty);
 		let store = self.write_target(body, state, target, call)?;
 		Ok(self.sequence(state, vec![set], store))
-	}
-
-	fn slot_count(&self, ty: mir::ValueType) -> usize {
-		match ty {
-			mir::ValueType::Unit => 0,
-			mir::ValueType::Never => panic!("divergence is not an empty value"),
-			mir::ValueType::Aggregate { aggregate_index } => {
-				self.aggregates.get(aggregate_index).scalars.len()
-			}
-			_ => 1,
-		}
 	}
 
 	/// Run all setup expressions before producing `value`. In particular,
@@ -2046,7 +2062,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				then,
 				otherwise: Some(otherwise),
 			},
-			mir::ValueType::Bool,
+			mir::ValueType::I32,
 		))
 	}
 
@@ -2073,22 +2089,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			return Ok(mir::ValueType::Never);
 		}
 		let lowered = match *self.context.types.resolve(ty) {
-			Type::U8 => mir::ValueType::U8,
-			Type::I8 => mir::ValueType::I8,
-			Type::U16 => mir::ValueType::U16,
-			Type::I16 => mir::ValueType::I16,
-			Type::U32 => mir::ValueType::U32,
-			Type::I32 => mir::ValueType::I32,
-			Type::U64 => mir::ValueType::U64,
-			Type::I64 => mir::ValueType::I64,
+			// Signedness and width are each operation's.
+			Type::U8
+			| Type::I8
+			| Type::U16
+			| Type::I16
+			| Type::U32
+			| Type::I32 => mir::ValueType::I32,
+			Type::U64 | Type::I64 => mir::ValueType::I64,
 			Type::F32 => mir::ValueType::F32,
 			Type::F64 => mir::ValueType::F64,
 			Type::Never => mir::ValueType::Never,
-			Type::Enum { enum_index }
-				if Some(enum_index) == self.context.defs.intrinsics.bool =>
-			{
-				mir::ValueType::Bool
-			}
+			// `Bool` among them: `enum Bool(u8)`.
 			Type::Enum { enum_index } => {
 				let repr = self.context.enums[usize::from(enum_index)].repr;
 				self.lower_type(repr, file_id, span)?
@@ -2105,9 +2117,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 					return self.lower_aggregate_type(ty, file_id, span);
 				}
 				let id = self.memory_of_type(memory);
-				mir::ValueType::Pointer {
-					kind: self.memories[usize::from(id)].kind,
-				}
+				self.memories[usize::from(id)].kind.address_type()
 			}
 			Type::Array { .. } | Type::Slice { .. } => {
 				self.unsupported(
@@ -2169,138 +2179,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 				unreachable!()
 			}
 		}
-	}
-
-	/// Materialize one concrete type's flat representation, without a second
-	/// structural interner. Memory layout is copied from TIR when available.
-	fn lower_aggregate_type(
-		&mut self,
-		ty: TypeIndex,
-		file_id: FileId,
-		span: TextSpan,
-	) -> Result<mir::ValueType, ()> {
-		if let Some(representation) = self.aggregate_types.get(&ty) {
-			return Ok(representation.ty);
-		}
-
-		let field_types = match *self.context.types.resolve(ty) {
-			// The address has no TIR type of its own (`Pointer::address`
-			// reads it as the memory's `Size`); MIR keeps it a pointer.
-			Type::Pointer { to, memory, .. } => {
-				let metadata = self.pointer_metadata(to, memory)?;
-				let id = self.memory_of_type(memory);
-				let address = mir::ValueType::Pointer {
-					kind: self.memories[usize::from(id)].kind,
-				};
-				vec![
-					AggregateField::Lowered(address),
-					AggregateField::Type(metadata),
-				]
-			}
-			_ => self
-				.aggregate_field_types(ty, file_id, span)?
-				.into_iter()
-				.map(AggregateField::Type)
-				.collect(),
-		};
-		let mut scalars = Vec::new();
-		let mut fields = Vec::with_capacity(field_types.len());
-		for field in field_types {
-			let field = match field {
-				AggregateField::Type(field) => {
-					self.lower_type(field, file_id, span)?
-				}
-				AggregateField::Lowered(field) => field,
-			};
-			let start = scalars.len();
-			match field {
-				mir::ValueType::Unit => {}
-				mir::ValueType::Never => {
-					self.unsupported(
-						file_id,
-						span,
-						"an uninhabited aggregate value",
-					)?;
-				}
-				mir::ValueType::Aggregate { aggregate_index } => scalars
-					.extend_from_slice(
-						&self.aggregates.get(aggregate_index).scalars,
-					),
-				scalar => scalars.push(scalar),
-			}
-			// Every field passed this check when it was lowered, so this
-			// stops a doubling chain after one step past the limit, before
-			// `memory_values` flattens the type a second time.
-			if scalars.len() > SLOT_LIMIT {
-				let name = self.context.type_formatter().display_type(ty);
-				self.context.diagnostics.push(
-					Diagnostic::error()
-						.with_code(DiagnosticCode::SlotLimit.code())
-						.with_message(format!(
-							"the type `{name}` is too large to lower"
-						))
-						.with_label(
-							Label::primary(file_id, span).with_message(
-								"a value of this type is used here",
-							),
-						)
-						.with_note(format!(
-							"a value is held as one Wasm value per scalar it \
-							 contains, and the limit is {SLOT_LIMIT} for one type"
-						)),
-				);
-				return Err(());
-			}
-			fields.push(mir::ScalarRange::new(
-				start.try_into().unwrap(),
-				(scalars.len() - start).try_into().unwrap(),
-			));
-		}
-
-		let lowered = if scalars.is_empty() {
-			mir::ValueType::Unit
-		} else {
-			let memory =
-				match self.context.memory_values(AssumptionEnvIdx::ROOT, ty) {
-					Ok(Some((layout, values))) => {
-						assert_eq!(
-							values.len(),
-							scalars.len(),
-							"TIR stack and memory slot counts agree"
-						);
-						Some(mir::AggregateMemory {
-							layout: mir::Layout {
-								size: layout.size,
-								align: layout.align,
-							},
-							offsets: values
-								.iter()
-								.map(|&(_, offset)| offset)
-								.collect(),
-						})
-					}
-					Ok(None) => None,
-					Err(_) => {
-						self.unsupported(
-							file_id,
-							span,
-							"an aggregate whose memory layout failed",
-						)?;
-						unreachable!()
-					}
-				};
-			let aggregate_index =
-				self.aggregates.push(scalars.into_boxed_slice(), memory);
-			mir::ValueType::Aggregate { aggregate_index }
-		};
-		self.aggregate_types.insert(
-			ty,
-			AggregateLowering {
-				ty: lowered,
-				fields: fields.into_boxed_slice(),
-			},
-		);
-		Ok(lowered)
 	}
 
 	/// A tuple's element types, or a struct's field types substituted with
@@ -2388,93 +2266,108 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	}
 }
 
-/// The MIR node for the primitive operator `op`, or `None` for an
-/// assignment operator, which has no value.
-/// Restore the canonical in-slot representation of a narrow integer after a
-/// safe primitive operator: unsigned values are zero-extended, signed values
-/// sign-extended. `transmute` deliberately does not do this; only the result
-/// of a safe operator is normalized.
+/// Restore the canonical representation of a narrow integer after an
+/// arithmetic operator on `primitive`: an unsigned one zero-extended, a
+/// signed one sign-extended. `transmute` deliberately does not do this; only
+/// the result of a safe operator is normalized.
 fn canonical_narrow(
 	state: &mut FunctionState,
 	value: mir::ExprId,
-	ty: mir::ValueType,
+	primitive: Primitive,
 ) -> mir::ExprId {
-	fn mask(
-		state: &mut FunctionState,
-		value: mir::ExprId,
-		bits: i64,
-		ty: mir::ValueType,
-	) -> mir::ExprId {
-		let mask = state.push(mir::ExprKind::Int { value: bits }, ty);
-		state.push(
-			mir::ExprKind::Binary {
-				op: mir::BinaryOp::BitAnd,
-				lhs: value,
-				rhs: mask,
-			},
-			ty,
-		)
-	}
-
-	fn sign_extend(
-		state: &mut FunctionState,
-		value: mir::ExprId,
-		shift: i64,
-		ty: mir::ValueType,
-	) -> mir::ExprId {
-		let left_shift = state.push(mir::ExprKind::Int { value: shift }, ty);
-		let shifted = state.push(
-			mir::ExprKind::Binary {
-				op: mir::BinaryOp::Shl,
-				lhs: value,
-				rhs: left_shift,
-			},
-			ty,
-		);
-		let right_shift = state.push(mir::ExprKind::Int { value: shift }, ty);
-		state.push(
-			mir::ExprKind::Binary {
-				op: mir::BinaryOp::Shr,
-				lhs: shifted,
-				rhs: right_shift,
-			},
-			ty,
-		)
-	}
-
-	match ty {
-		mir::ValueType::U8 => mask(state, value, 0xFF, ty),
-		mir::ValueType::U16 => mask(state, value, 0xFFFF, ty),
-		mir::ValueType::I8 => sign_extend(state, value, 24, ty),
-		mir::ValueType::I16 => sign_extend(state, value, 16, ty),
+	let ty = mir::ValueType::I32;
+	let binary = |state: &mut FunctionState, op, lhs, constant| {
+		let rhs = state.push(mir::ExprKind::Int { value: constant }, ty);
+		state.push(mir::ExprKind::Binary { op, lhs, rhs }, ty)
+	};
+	let sign_extend = |state: &mut FunctionState, shift| {
+		let shifted = binary(state, mir::BinaryOp::Shl, value, shift);
+		binary(state, mir::BinaryOp::ShrS, shifted, shift)
+	};
+	match primitive {
+		Primitive::U8 => binary(state, mir::BinaryOp::And, value, 0xFF),
+		Primitive::U16 => binary(state, mir::BinaryOp::And, value, 0xFFFF),
+		Primitive::I8 => sign_extend(state, 24),
+		Primitive::I16 => sign_extend(state, 16),
 		_ => value,
 	}
 }
 
+/// The primitive unary operator `op` on `value`, of `primitive`. Wasm has
+/// no integer negation or bitwise not: they are `0 - x` and `x ^ -1`.
+fn primitive_unary(
+	state: &mut FunctionState,
+	op: UnaryOp,
+	primitive: Primitive,
+	value: mir::ExprId,
+	ty: mir::ValueType,
+) -> mir::ExprId {
+	let with_constant = |state: &mut FunctionState, op, constant, first| {
+		let constant = state.push(mir::ExprKind::Int { value: constant }, ty);
+		let (lhs, rhs) = if first {
+			(constant, value)
+		} else {
+			(value, constant)
+		};
+		state.push(mir::ExprKind::Binary { op, lhs, rhs }, ty)
+	};
+	match op {
+		UnaryOp::InvertSign if primitive.is_float() => state.push(
+			mir::ExprKind::Unary {
+				op: mir::UnaryOp::Neg,
+				value,
+			},
+			ty,
+		),
+		UnaryOp::InvertSign => {
+			with_constant(state, mir::BinaryOp::Sub, 0, true)
+		}
+		UnaryOp::BitNot => with_constant(state, mir::BinaryOp::Xor, -1, false),
+		UnaryOp::Not => unreachable!("`!` is a call of an impl, not primitive"),
+	}
+}
+
+/// The MIR node for the primitive operator `op` on operands of
+/// `primitive`, whose signedness and kind pick the opcode, or `None` for an
+/// assignment operator, which has no value.
 fn binary_kind(
 	op: BinaryOp,
+	primitive: Primitive,
 	lhs: mir::ExprId,
 	rhs: mir::ExprId,
 ) -> Option<mir::ExprKind> {
+	use mir::BinaryOp as B;
+	use mir::CompareOp as C;
 	let binary = |op| mir::ExprKind::Binary { op, lhs, rhs };
 	let compare = |op| mir::ExprKind::Compare { op, lhs, rhs };
+	// The signed, unsigned or float opcode, as `primitive` is.
+	fn pick<T>(primitive: Primitive, signed: T, unsigned: T, float: T) -> T {
+		if primitive.is_float() {
+			float
+		} else if primitive.is_signed() {
+			signed
+		} else {
+			unsigned
+		}
+	}
+	let by_sign = |s, u| pick(primitive, s, u, s);
 	Some(match op {
-		BinaryOp::Add => binary(mir::BinaryOp::Add),
-		BinaryOp::Sub => binary(mir::BinaryOp::Sub),
-		BinaryOp::Mul => binary(mir::BinaryOp::Mul),
-		BinaryOp::Div => binary(mir::BinaryOp::Div),
-		BinaryOp::Rem => binary(mir::BinaryOp::Rem),
-		BinaryOp::BitAnd => binary(mir::BinaryOp::BitAnd),
-		BinaryOp::BitOr => binary(mir::BinaryOp::BitOr),
-		BinaryOp::BitXor => binary(mir::BinaryOp::BitXor),
-		BinaryOp::LeftShift => binary(mir::BinaryOp::Shl),
-		BinaryOp::RightShift => binary(mir::BinaryOp::Shr),
-		BinaryOp::Eq => compare(mir::CompareOp::Eq),
-		BinaryOp::NotEq => compare(mir::CompareOp::Ne),
-		BinaryOp::Less => compare(mir::CompareOp::Lt),
-		BinaryOp::LessEq => compare(mir::CompareOp::Le),
-		BinaryOp::Greater => compare(mir::CompareOp::Gt),
-		BinaryOp::GreaterEq => compare(mir::CompareOp::Ge),
+		BinaryOp::Add => binary(B::Add),
+		BinaryOp::Sub => binary(B::Sub),
+		BinaryOp::Mul => binary(B::Mul),
+		BinaryOp::Div => binary(pick(primitive, B::DivS, B::DivU, B::Div)),
+		BinaryOp::Rem => binary(by_sign(B::RemS, B::RemU)),
+		BinaryOp::BitAnd => binary(B::And),
+		BinaryOp::BitOr => binary(B::Or),
+		BinaryOp::BitXor => binary(B::Xor),
+		BinaryOp::LeftShift => binary(B::Shl),
+		BinaryOp::RightShift => binary(by_sign(B::ShrS, B::ShrU)),
+		BinaryOp::Eq => compare(C::Eq),
+		BinaryOp::NotEq => compare(C::Ne),
+		BinaryOp::Less => compare(pick(primitive, C::LtS, C::LtU, C::Lt)),
+		BinaryOp::LessEq => compare(pick(primitive, C::LeS, C::LeU, C::Le)),
+		BinaryOp::Greater => compare(pick(primitive, C::GtS, C::GtU, C::Gt)),
+		BinaryOp::GreaterEq => compare(pick(primitive, C::GeS, C::GeU, C::Ge)),
 		// `&&`/`||` are lowered as `IfElse` branches (`lower_short_circuit`).
 		BinaryOp::And | BinaryOp::Or => {
 			unreachable!("a logical operator short-circuits")
@@ -3372,6 +3265,34 @@ mod tests {
 	}
 
 	#[test]
+	fn a_narrow_compound_assignment_restores_its_width() {
+		// `x op= v` on a local narrows as `x = x op v` and a compound store
+		// through a pointer do.
+		let source = r#"
+			func compound(a: u8, b: i8) -> (u8, i8) {
+				local mut x = a;
+				x += 100;
+				local mut y = b;
+				y += 1;
+				(x, y)
+			}
+			export { compound }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let compound = instance
+				.get_typed_func::<(i32, i32), (i32, i32)>(
+					&mut store, "compound",
+				)
+				.unwrap();
+			assert_eq!(
+				compound.call(&mut store, (200, 127)).unwrap(),
+				(44, -128)
+			);
+		}
+	}
+
+	#[test]
 	fn narrow_std_operator_methods_restore_their_width() {
 		// Explicit trait method calls and generic instantiations go through
 		// std's bodies instead of the primitive operator path.
@@ -3660,7 +3581,7 @@ mod tests {
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
 		let mir = crate::tir::build(&mut graph).1.expect("globals lower");
-		assert_eq!(mir.globals[0].ty, mir::ValueType::U32);
+		assert_eq!(mir.globals[0].ty, mir::ValueType::I32);
 		let (mut store, instance) = instantiate(source);
 		let double = instance
 			.get_typed_func::<(), u32>(&mut store, "double")
@@ -3790,7 +3711,10 @@ mod tests {
 			.1
 			.expect("a scalar add must lower");
 		assert_eq!(mir.functions.len(), 1);
-		assert_eq!(mir.signatures.len(), 1);
+		let signature = mir.functions[0].signature;
+		let i32_ty = mir::ValueType::I32;
+		assert_eq!(mir.signatures.params(signature), [i32_ty, i32_ty]);
+		assert_eq!(mir.signatures.results(signature), [i32_ty]);
 		assert_eq!(mir.exports.len(), 1);
 		drop(graph);
 
@@ -3925,17 +3849,11 @@ mod tests {
 			export { run as "run" }
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
+		// Every signature's items are scalars: `Signatures::intern`
+		// asserts it.
+		crate::tir::build(&mut graph)
 			.1
 			.expect("nested updates must lower");
-		assert!(mir.aggregates.iter().all(|pack| pack.scalars.iter().all(
-			|ty| !matches!(
-				ty,
-				mir::ValueType::Aggregate { .. }
-					| mir::ValueType::Unit
-					| mir::ValueType::Never
-			)
-		)));
 		let (mut store, instance) = instantiate(source);
 		let run = instance
 			.get_typed_func::<(), (i32, i64, i32)>(&mut store, "run")
@@ -3961,47 +3879,39 @@ mod tests {
 		assert_eq!(run.call(&mut store, ()).unwrap(), (7, 11));
 	}
 
+	/// Two structs with the same scalars and different layouts: each store
+	/// writes its own type's offsets, since every load and store is written
+	/// per scalar at its offset and no MIR type holds a layout.
 	#[test]
 	fn same_slot_types_with_distinct_layouts_coexist_in_one_module() {
 		let source = r#"
+			#[memory_limits({ min_pages: 1 })]
+			memory heap: u32;
 			struct Sorted(a: u8, b: i64, c: u8);
 			#[fixed_order]
 			struct Fixed(a: u8, b: i64, c: u8);
-			func sorted(x: Sorted) -> Sorted { x }
-			func fixed(x: Fixed) -> Fixed { x }
-			export { sorted as "sorted", fixed as "fixed" }
+			func write(sorted: u32, fixed: u32) {
+				local s: heap::*Sorted = transmute(sorted);
+				s.* = Sorted(1, 2, 3);
+				local f: heap::*Fixed = transmute(fixed);
+				f.* = Fixed(1, 2, 3);
+			}
+			export { write as "write", heap as "heap" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.unwrap();
-		let layouts: Vec<_> = mir
-			.aggregates
-			.iter()
-			.map(|pack| {
-				assert_eq!(
-					pack.scalars.as_ref(),
-					[
-						mir::ValueType::U8,
-						mir::ValueType::I64,
-						mir::ValueType::U8
-					]
-				);
-				pack.memory.as_ref().unwrap().offsets.to_vec()
-			})
-			.collect();
-		assert!(layouts.contains(&vec![8, 0, 9]));
-		assert!(layouts.contains(&vec![0, 8, 16]));
-		let (mut store, instance) = instantiate(source);
-		for name in ["sorted", "fixed"] {
-			let identity = instance
-				.get_typed_func::<(i32, i64, i32), (i32, i64, i32)>(
-					&mut store, name,
-				)
+		each_policy(source, |store, instance, memory| {
+			let write = instance
+				.get_typed_func::<(u32, u32), ()>(&mut *store, "write")
 				.unwrap();
-			assert_eq!(
-				identity.call(&mut store, (7, 1 << 40, 9)).unwrap(),
-				(7, 1 << 40, 9)
-			);
-		}
+			write.call(&mut *store, (0, 64)).unwrap();
+			let bytes = memory.data(&*store);
+			// Sorted: `b` at 0, `a` at 8, `c` at 9.
+			assert_eq!(bytes[0..8], 2i64.to_le_bytes());
+			assert_eq!((bytes[8], bytes[9]), (1, 3));
+			// Fixed: `a` at 0, `b` at 8, `c` at 16.
+			assert_eq!(bytes[64], 1);
+			assert_eq!(bytes[72..80], 2i64.to_le_bytes());
+			assert_eq!(bytes[80], 3);
+		});
 	}
 
 	#[test]
@@ -4134,46 +4044,25 @@ mod tests {
 		assert_eq!(run.call(&mut store, ()).unwrap(), 2);
 	}
 
+	/// A struct's values stay in declaration order, as its Wasm parameters
+	/// are, while its byte offsets are sorted by alignment (TIR's).
 	#[test]
 	fn mixed_alignment_aggregate_keeps_declaration_value_order() {
 		let source = r#"
             struct Mixed(a: u8, b: i64, c: u8);
             func take(m: Mixed) -> i64 { m.b + 1 }
             func run() -> i64 { take(Mixed(1, 1000000000000, 2)) }
-            export { run as "run" }
+            export { run as "run", take as "take" }
         "#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
-			.1
-			.expect("the aggregate must lower");
-
-		let aggregate = mir
-			.aggregates
-			.iter()
-			.find(|aggregate| {
-				aggregate.scalars.iter().copied().eq([
-					mir::ValueType::U8,
-					mir::ValueType::I64,
-					mir::ValueType::U8,
-				])
-			})
-			.expect("the struct's aggregate must be interned");
-		let offsets = aggregate.memory.as_ref().unwrap().offsets.to_vec();
-		assert_eq!(offsets, vec![8, 0, 9], "TIR decides the byte offsets");
-
-		let scalar_types = aggregate.scalars.to_vec();
-		assert_eq!(
-			scalar_types,
-			vec![mir::ValueType::U8, mir::ValueType::I64, mir::ValueType::U8],
-			"scalar slots stay in declaration order"
-		);
-		drop(graph);
-
 		let (mut store, instance) = instantiate(source);
 		let run = instance
 			.get_typed_func::<(), i64>(&mut store, "run")
 			.expect("`run` must be exported");
 		assert_eq!(run.call(&mut store, ()).unwrap(), 1_000_000_000_001);
+		let take = instance
+			.get_typed_func::<(i32, i64, i32), i64>(&mut store, "take")
+			.expect("a struct parameter is its scalars in declaration order");
+		assert_eq!(take.call(&mut store, (1, 41, 2)).unwrap(), 42);
 	}
 
 	#[test]

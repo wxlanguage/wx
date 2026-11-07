@@ -75,16 +75,14 @@ pub struct Scheduler<'f> {
 
 impl<'f> Scheduler<'f> {
 	pub fn schedule(func: &'f Function, mir: &'f mir::MIR) -> wasm::Function {
-		let sig =
-			&mir.signatures[usize::from(mir.function(func.id).signature_index)];
-
-		// Aggregate params are flattened to one local per scalar.
-		let locals: Vec<Local> = sig
-			.params()
+		// Every parameter is one scalar local.
+		let locals: Vec<Local> = mir
+			.signatures
+			.params(mir.function(func.id).signature)
 			.iter()
-			.copied()
-			.flat_map(|ty| wasm::flatten_type_to_scalars(ty, &mir.aggregates))
-			.map(|ty| Local { ty })
+			.map(|&ty| Local {
+				ty: ScalarType::try_from(ty).expect("a parameter is a scalar"),
+			})
 			.collect();
 		let params_count = locals.len();
 
@@ -223,7 +221,7 @@ impl<'f> Scheduler<'f> {
 							// args (return, call) not tracked in DataNode::uses.
 							let mir = self.mir;
 							let scalar_types =
-								&mir.aggregate(aggregate_index).scalars;
+								&mir.signatures.results(aggregate_index);
 							let mut locals =
 								Vec::with_capacity(scalar_types.len());
 							for &ty in scalar_types.iter().rev() {
@@ -2038,9 +2036,9 @@ impl<'f> Scheduler<'f> {
 			_ => panic!("ensure_aggregate_locals called on non-aggregate node"),
 		};
 		let mir = self.mir;
-		let agg = mir.aggregate(aggregate_index);
-		let mut locals = Vec::with_capacity(agg.scalars.len());
-		for (&ty, &value) in agg.scalars.iter().zip(values.iter()) {
+		let scalars = mir.signatures.results(aggregate_index);
+		let mut locals = Vec::with_capacity(scalars.len());
+		for (&ty, &value) in scalars.iter().zip(values.iter()) {
 			let scalar_ty =
 				ScalarType::try_from(ty).expect("pack slot must be scalar");
 			self.emit_value(value);

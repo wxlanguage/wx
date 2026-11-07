@@ -131,200 +131,146 @@ impl Lowerer<'_, '_, '_, '_> {
 				}
 			};
 		}
+		macro_rules! convert {
+			($op:ident) => {
+				mir::ExprKind::Convert {
+					op: mir::ConvertOp::$op,
+					value: operand!(),
+				}
+			};
+		}
+		// Wasm has no integer negation or bitwise not: `0 - x`, `x ^ -1`.
+		macro_rules! with_constant {
+			($op:ident, $constant:expr, $first:expr) => {{
+				let value = operand!();
+				let constant =
+					state.push(mir::ExprKind::Int { value: $constant }, ty);
+				let (lhs, rhs) = if $first {
+					(constant, value)
+				} else {
+					(value, constant)
+				};
+				mir::ExprKind::Binary {
+					op: mir::BinaryOp::$op,
+					lhs,
+					rhs,
+				}
+			}};
+		}
 		let kind = match intrinsic {
 			Intrinsic::Trap => mir::ExprKind::Unreachable,
-			Intrinsic::I32Neg => unary!(Neg),
-			Intrinsic::I64Neg => unary!(Neg),
-			Intrinsic::F32Neg => unary!(Neg),
-			Intrinsic::F64Neg => unary!(Neg),
-			Intrinsic::I32BitNot => unary!(BitNot),
-			Intrinsic::I64BitNot => unary!(BitNot),
+			Intrinsic::I32Neg | Intrinsic::I64Neg => {
+				with_constant!(Sub, 0, true)
+			}
+			Intrinsic::F32Neg | Intrinsic::F64Neg => unary!(Neg),
+			Intrinsic::I32BitNot | Intrinsic::I64BitNot => {
+				with_constant!(Xor, -1, false)
+			}
 			Intrinsic::I32Eqz => unary!(Eqz),
-			Intrinsic::F32Sqrt => unary!(Sqrt),
-			Intrinsic::F64Sqrt => unary!(Sqrt),
-			Intrinsic::F32Abs => unary!(Abs),
-			Intrinsic::F64Abs => unary!(Abs),
-			Intrinsic::F32Floor => unary!(Floor),
-			Intrinsic::F64Floor => unary!(Floor),
-			Intrinsic::F32Ceil => unary!(Ceil),
-			Intrinsic::F64Ceil => unary!(Ceil),
-			Intrinsic::F32Trunc => unary!(Trunc),
-			Intrinsic::F64Trunc => unary!(Trunc),
-			Intrinsic::F32Nearest => unary!(Nearest),
-			Intrinsic::F64Nearest => unary!(Nearest),
-			Intrinsic::I32Add => binary!(Add),
-			Intrinsic::I64Add => binary!(Add),
-			Intrinsic::F32Add => binary!(Add),
-			Intrinsic::F64Add => binary!(Add),
-			Intrinsic::I32Sub => binary!(Sub),
-			Intrinsic::I64Sub => binary!(Sub),
-			Intrinsic::F32Sub => binary!(Sub),
-			Intrinsic::F64Sub => binary!(Sub),
-			Intrinsic::I32Mul => binary!(Mul),
-			Intrinsic::I64Mul => binary!(Mul),
-			Intrinsic::F32Mul => binary!(Mul),
-			Intrinsic::F64Mul => binary!(Mul),
-			Intrinsic::I32DivS => binary!(Div),
-			Intrinsic::I32DivU => binary!(Div),
-			Intrinsic::I64DivS => binary!(Div),
-			Intrinsic::I64DivU => binary!(Div),
-			Intrinsic::F32Div => binary!(Div),
-			Intrinsic::F64Div => binary!(Div),
-			Intrinsic::I32RemS => binary!(Rem),
-			Intrinsic::I32RemU => binary!(Rem),
-			Intrinsic::I64RemS => binary!(Rem),
-			Intrinsic::I64RemU => binary!(Rem),
-			Intrinsic::I32BitAnd => binary!(BitAnd),
-			Intrinsic::I64BitAnd => binary!(BitAnd),
-			Intrinsic::I32BitOr => binary!(BitOr),
-			Intrinsic::I64BitOr => binary!(BitOr),
-			Intrinsic::I32BitXor => binary!(BitXor),
-			Intrinsic::I64BitXor => binary!(BitXor),
-			Intrinsic::I32Shl => binary!(Shl),
-			Intrinsic::I64Shl => binary!(Shl),
-			Intrinsic::I32ShrS => binary!(Shr),
-			Intrinsic::I32ShrU => binary!(Shr),
-			Intrinsic::I64ShrS => binary!(Shr),
-			Intrinsic::I64ShrU => binary!(Shr),
-			Intrinsic::I32Eq => compare!(Eq),
-			Intrinsic::I64Eq => compare!(Eq),
-			Intrinsic::F32Eq => compare!(Eq),
-			Intrinsic::F64Eq => compare!(Eq),
-			Intrinsic::I32Ne => compare!(Ne),
-			Intrinsic::I64Ne => compare!(Ne),
-			Intrinsic::F32Ne => compare!(Ne),
-			Intrinsic::F64Ne => compare!(Ne),
-			Intrinsic::I32LtS => compare!(Lt),
-			Intrinsic::I32LtU => compare!(Lt),
-			Intrinsic::I64LtS => compare!(Lt),
-			Intrinsic::I64LtU => compare!(Lt),
-			Intrinsic::F32Lt => compare!(Lt),
-			Intrinsic::F64Lt => compare!(Lt),
-			Intrinsic::I32LeS => compare!(Le),
-			Intrinsic::I32LeU => compare!(Le),
-			Intrinsic::I64LeS => compare!(Le),
-			Intrinsic::I64LeU => compare!(Le),
-			Intrinsic::F32Le => compare!(Le),
-			Intrinsic::F64Le => compare!(Le),
-			Intrinsic::I32GtS => compare!(Gt),
-			Intrinsic::I32GtU => compare!(Gt),
-			Intrinsic::I64GtS => compare!(Gt),
-			Intrinsic::I64GtU => compare!(Gt),
-			Intrinsic::F32Gt => compare!(Gt),
-			Intrinsic::F64Gt => compare!(Gt),
-			Intrinsic::I32GeS => compare!(Ge),
-			Intrinsic::I32GeU => compare!(Ge),
-			Intrinsic::I64GeS => compare!(Ge),
-			Intrinsic::I64GeU => compare!(Ge),
-			Intrinsic::F32Ge => compare!(Ge),
-			Intrinsic::F64Ge => compare!(Ge),
-			Intrinsic::F32Min => binary!(Min),
-			Intrinsic::F64Min => binary!(Min),
-			Intrinsic::F32Max => binary!(Max),
-			Intrinsic::F64Max => binary!(Max),
-			Intrinsic::F32Copysign => binary!(Copysign),
-			Intrinsic::F64Copysign => binary!(Copysign),
-			Intrinsic::I64ExtendI32S => {
-				mir::ExprKind::Convert { value: operand!() }
+			Intrinsic::F32Sqrt | Intrinsic::F64Sqrt => unary!(Sqrt),
+			Intrinsic::F32Abs | Intrinsic::F64Abs => unary!(Abs),
+			Intrinsic::F32Floor | Intrinsic::F64Floor => unary!(Floor),
+			Intrinsic::F32Ceil | Intrinsic::F64Ceil => unary!(Ceil),
+			Intrinsic::F32Trunc | Intrinsic::F64Trunc => unary!(Trunc),
+			Intrinsic::F32Nearest | Intrinsic::F64Nearest => unary!(Nearest),
+			Intrinsic::I32Add
+			| Intrinsic::I64Add
+			| Intrinsic::F32Add
+			| Intrinsic::F64Add => binary!(Add),
+			Intrinsic::I32Sub
+			| Intrinsic::I64Sub
+			| Intrinsic::F32Sub
+			| Intrinsic::F64Sub => binary!(Sub),
+			Intrinsic::I32Mul
+			| Intrinsic::I64Mul
+			| Intrinsic::F32Mul
+			| Intrinsic::F64Mul => binary!(Mul),
+			Intrinsic::I32DivS | Intrinsic::I64DivS => binary!(DivS),
+			Intrinsic::I32DivU | Intrinsic::I64DivU => binary!(DivU),
+			Intrinsic::F32Div | Intrinsic::F64Div => binary!(Div),
+			Intrinsic::I32RemS | Intrinsic::I64RemS => binary!(RemS),
+			Intrinsic::I32RemU | Intrinsic::I64RemU => binary!(RemU),
+			Intrinsic::I32BitAnd | Intrinsic::I64BitAnd => binary!(And),
+			Intrinsic::I32BitOr | Intrinsic::I64BitOr => binary!(Or),
+			Intrinsic::I32BitXor | Intrinsic::I64BitXor => binary!(Xor),
+			Intrinsic::I32Shl | Intrinsic::I64Shl => binary!(Shl),
+			Intrinsic::I32ShrS | Intrinsic::I64ShrS => binary!(ShrS),
+			Intrinsic::I32ShrU | Intrinsic::I64ShrU => binary!(ShrU),
+			Intrinsic::I32Eq
+			| Intrinsic::I64Eq
+			| Intrinsic::F32Eq
+			| Intrinsic::F64Eq => compare!(Eq),
+			Intrinsic::I32Ne
+			| Intrinsic::I64Ne
+			| Intrinsic::F32Ne
+			| Intrinsic::F64Ne => compare!(Ne),
+			Intrinsic::I32LtS | Intrinsic::I64LtS => compare!(LtS),
+			Intrinsic::I32LtU | Intrinsic::I64LtU => compare!(LtU),
+			Intrinsic::F32Lt | Intrinsic::F64Lt => compare!(Lt),
+			Intrinsic::I32LeS | Intrinsic::I64LeS => compare!(LeS),
+			Intrinsic::I32LeU | Intrinsic::I64LeU => compare!(LeU),
+			Intrinsic::F32Le | Intrinsic::F64Le => compare!(Le),
+			Intrinsic::I32GtS | Intrinsic::I64GtS => compare!(GtS),
+			Intrinsic::I32GtU | Intrinsic::I64GtU => compare!(GtU),
+			Intrinsic::F32Gt | Intrinsic::F64Gt => compare!(Gt),
+			Intrinsic::I32GeS | Intrinsic::I64GeS => compare!(GeS),
+			Intrinsic::I32GeU | Intrinsic::I64GeU => compare!(GeU),
+			Intrinsic::F32Ge | Intrinsic::F64Ge => compare!(Ge),
+			Intrinsic::F32Min | Intrinsic::F64Min => binary!(Min),
+			Intrinsic::F32Max | Intrinsic::F64Max => binary!(Max),
+			Intrinsic::F32Copysign | Intrinsic::F64Copysign => {
+				binary!(Copysign)
 			}
-			Intrinsic::I64ExtendI32U => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::I32WrapI64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F32ConvertI32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F32ConvertU32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F32ConvertI64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F32ConvertU64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F64ConvertI32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F64ConvertU32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F64ConvertI64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F64ConvertU64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::I32TruncF32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::U32TruncF32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::I32TruncF64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::U32TruncF64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::I64TruncF32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::U64TruncF32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::I64TruncF64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::U64TruncF64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F64PromoteF32 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::F32DemoteF64 => {
-				mir::ExprKind::Convert { value: operand!() }
-			}
-			Intrinsic::I32ReinterpretF32 => {
-				mir::ExprKind::Reinterpret { value: operand!() }
-			}
-			Intrinsic::F32ReinterpretI32 => {
-				mir::ExprKind::Reinterpret { value: operand!() }
-			}
-			Intrinsic::I64ReinterpretF64 => {
-				mir::ExprKind::Reinterpret { value: operand!() }
-			}
-			Intrinsic::F64ReinterpretI64 => {
-				mir::ExprKind::Reinterpret { value: operand!() }
-			}
-			// Its bounds make both types flatten to the same Wasm values, so
-			// it needs no type arguments: the operand's type and `ty` say it.
+			Intrinsic::I64ExtendI32S => convert!(ExtendS),
+			Intrinsic::I64ExtendI32U => convert!(ExtendU),
+			Intrinsic::I32WrapI64 => convert!(Wrap),
+			Intrinsic::F32ConvertI32
+			| Intrinsic::F32ConvertI64
+			| Intrinsic::F64ConvertI32
+			| Intrinsic::F64ConvertI64 => convert!(ConvertS),
+			Intrinsic::F32ConvertU32
+			| Intrinsic::F32ConvertU64
+			| Intrinsic::F64ConvertU32
+			| Intrinsic::F64ConvertU64 => convert!(ConvertU),
+			Intrinsic::I32TruncF32
+			| Intrinsic::I32TruncF64
+			| Intrinsic::I64TruncF32
+			| Intrinsic::I64TruncF64 => convert!(TruncS),
+			Intrinsic::U32TruncF32
+			| Intrinsic::U32TruncF64
+			| Intrinsic::U64TruncF32
+			| Intrinsic::U64TruncF64 => convert!(TruncU),
+			Intrinsic::F64PromoteF32 => convert!(Promote),
+			Intrinsic::F32DemoteF64 => convert!(Demote),
+			Intrinsic::I32ReinterpretF32
+			| Intrinsic::F32ReinterpretI32
+			| Intrinsic::I64ReinterpretF64
+			| Intrinsic::F64ReinterpretI64 => convert!(Reinterpret),
+			// Its bounds give both types the same Wasm values, which are one
+			// MIR type: the operand is the value.
 			Intrinsic::Transmute => {
-				mir::ExprKind::Transmute { value: operand!() }
+				let value = operand!();
+				debug_assert!(
+					state.ty(value) == ty,
+					"`transmute`'s two types are one MIR type"
+				);
+				assert!(
+					arguments.next().is_none(),
+					"std intrinsic operand count"
+				);
+				return Ok(self.sequence(state, prefix, value));
 			}
 			// `global_get<G>(g)`/`global_set<G>(g, value)`: the handle `g` is
-			// zero-sized and runs for its effects; `G` names the global. The
-			// module holds the value as its one scalar, which a one-value
-			// pack (`Meters(u32)`) is read as and written from.
+			// zero-sized and runs for its effects; `G` names the global, whose
+			// value is one scalar (`Meters(u32)` is its `I32`).
 			Intrinsic::GlobalGet | Intrinsic::GlobalSet => {
 				let id = self.global_of(callee)?;
-				let scalar = self.globals[usize::from(id)].ty;
 				prefix.push(operand!());
 				let value = if intrinsic == Intrinsic::GlobalGet {
-					let get = state.push(mir::ExprKind::Global { id }, scalar);
-					if ty == scalar {
-						get
-					} else {
-						state.push(mir::ExprKind::Transmute { value: get }, ty)
-					}
+					debug_assert!(ty == self.globals[usize::from(id)].ty);
+					state.push(mir::ExprKind::Global { id }, ty)
 				} else {
-					let mut value = operand!();
-					if state.ty(value) != scalar {
-						value = state
-							.push(mir::ExprKind::Transmute { value }, scalar);
-					}
+					let value = operand!();
 					state.push(mir::ExprKind::GlobalSet { id, value }, ty)
 				};
 				assert!(

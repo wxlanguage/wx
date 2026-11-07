@@ -9,9 +9,6 @@
 
 use crate::mir;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum ScalarType {
@@ -25,46 +22,12 @@ impl TryFrom<mir::ValueType> for ScalarType {
 	type Error = ();
 	fn try_from(ty: mir::ValueType) -> Result<Self, ()> {
 		Ok(match ty {
-			mir::ValueType::I32
-			| mir::ValueType::U32
-			| mir::ValueType::Bool
-			| mir::ValueType::U8
-			| mir::ValueType::I8
-			| mir::ValueType::U16
-			| mir::ValueType::I16
-			| mir::ValueType::Function { .. } => ScalarType::I32,
-			mir::ValueType::I64 | mir::ValueType::U64 => ScalarType::I64,
-			mir::ValueType::Pointer { kind, .. } => match kind {
-				mir::MemoryKind::Memory32 => ScalarType::I32,
-				mir::MemoryKind::Memory64 => ScalarType::I64,
-			},
+			mir::ValueType::I32 => ScalarType::I32,
+			mir::ValueType::I64 => ScalarType::I64,
 			mir::ValueType::F32 => ScalarType::F32,
 			mir::ValueType::F64 => ScalarType::F64,
 			_ => return Err(()),
 		})
-	}
-}
-
-/// Flatten a MIR type into its constituent WASM scalar types.
-/// Unit/Never produce zero slots; a pack already stores flat scalar types.
-/// The one place this conversion happens; every producer of a
-/// `Function` should call this rather than repeating the match itself.
-pub fn flatten_type_to_scalars(
-	ty: mir::ValueType,
-	aggregates: &[mir::Aggregate],
-) -> Vec<ScalarType> {
-	match ty {
-		mir::ValueType::Unit | mir::ValueType::Never => vec![],
-		mir::ValueType::Aggregate { aggregate_index } => aggregates
-			[usize::from(aggregate_index)]
-		.scalars
-		.iter()
-		.map(|&ty| {
-			ScalarType::try_from(ty)
-				.expect("a ScalarTable entry is scalar by construction")
-		})
-		.collect(),
-		t => vec![ScalarType::try_from(t).expect("must be scalar")],
 	}
 }
 
