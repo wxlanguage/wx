@@ -162,7 +162,8 @@ it as a join with one entry.
 
 ### 4. Dead functions and compaction
 
-Moving to its own pass over every kind of item: `notes/mir-dce.md`. What
+Moving to its own pass over every kind of item: "Dead-code elimination"
+in `notes/mir-pipeline.md`. What
 follows is how `mir/inline.rs` does it today, for functions only.
 
 1. Rebuild the call graph over the inlined bodies (one more scan), and walk

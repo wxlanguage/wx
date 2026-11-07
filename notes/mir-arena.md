@@ -251,4 +251,4 @@ the automatic policy.
 5. Done: the inliner, `mir/inline.rs`, replacing `mir/inlining.rs`
    (deleted): `notes/mir-inlining.md`.
 6. Dead-code elimination over every kind of item, as its own pass after
-   the inliner: `notes/mir-dce.md`.
+   the inliner: "Dead-code elimination" in `notes/mir-pipeline.md`.

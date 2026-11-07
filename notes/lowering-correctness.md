@@ -17,7 +17,7 @@ TIR → MIR → opt → Wasm pipeline before extending the supported subset.
   semantic/design choices. Prefer an explicit invariant to a local workaround.
 - Test both lowered-only and inlined MIR where a transformation can change the
   outcome. The current CLI and the lowering test harness run different pipelines.
-- General MIR DCE (`mir-dce.md`), memory support, and example migration are separate
+- General MIR DCE (`mir-pipeline.md`), memory support, and example migration are separate
   follow-ups, not prerequisites for fixing the cases below.
 
 The review's baseline was 1,185 passing compiler tests, including 168 lowering
