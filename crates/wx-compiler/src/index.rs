@@ -4,10 +4,8 @@
 /// tables, with the conversions every such index needs.
 ///
 /// Wrapping these instead of passing bare `u32`s is what stops one table's
-/// index being used against another. The sharpest case is `mir::FieldIndex`
-/// vs `mir::ScalarIndex`: two index spaces over the *same* aggregate that
-/// coincide only when it is flat and free of zero-sized fields, so a mix-up
-/// compiles fine and silently emits wrong code for everything else.
+/// index being used against another, such as a function ID indexing a local
+/// table instead of the function table.
 macro_rules! index_newtype {
 	($(#[$meta:meta])* $name:ident) => {
 		$(#[$meta])*

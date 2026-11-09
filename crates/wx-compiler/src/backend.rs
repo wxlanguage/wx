@@ -6,10 +6,8 @@ use crate::ast::StringInterner;
 use crate::codegen::{self, WasmModule};
 use crate::mir::{self, MIR};
 
-/// Transforms `mir` in place (inlining under `inline`, which also drops
-/// functions nothing reaches) and generates its module. A build passes
-/// `Some(mir::inline::Policy::DEFAULT)`; `None` emits the MIR as lowered,
-/// for tests that tell lowering apart from inlining.
+/// Optionally inline, optimize reached function bodies, and emit retained items.
+/// `None` skips inlining; function optimization and reachability always run.
 pub fn emit(
 	mir: &mut MIR,
 	strings: &StringInterner,
@@ -18,7 +16,8 @@ pub fn emit(
 	if let Some(policy) = inline {
 		mir::inline::run(mir, policy);
 	}
-	codegen::Builder::build(mir, strings)
+	let reached = crate::opt::optimize_reachable(mir);
+	codegen::Builder::build(mir, strings, &reached)
 }
 
 #[cfg(test)]
@@ -52,7 +51,7 @@ mod tests {
 	}
 
 	/// The build sequence honours `#[inline]`: the callee is spliced into
-	/// its caller and dropped, and the module still computes the result.
+	/// its caller and omitted from output, and the module still computes the result.
 	#[test]
 	fn a_build_inlines_an_inline_callee() {
 		let source = r#"
@@ -69,7 +68,7 @@ mod tests {
 			emit(&mut mir, &graph.strings, Some(mir::inline::Policy::DEFAULT))
 				.expect("the MIR encodes")
 				.encode();
-		assert_eq!(mir.functions.len(), 1);
+		assert_eq!(mir.functions.len(), 2, "MIR IDs stay stable");
 		assert!(
 			mir.functions
 				.iter()
@@ -86,5 +85,50 @@ mod tests {
 			.get_typed_func::<i32, i32>(&mut store, "run")
 			.unwrap();
 		assert_eq!(run.call(&mut store, 20).unwrap(), 41);
+	}
+
+	#[test]
+	fn removed_calls_do_not_keep_host_imports_with_or_without_inlining() {
+		let source = r#"
+			import "host" as host { func probe(value: i32) -> i32; }
+			func dead(x: i32) -> i32 { host::probe(x) }
+			func run(x: i32) -> i32 { return x; dead(x) }
+			export { run as "run" }
+		"#;
+		for inline in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let mut graph = source_graph(source);
+			let mut mir = crate::tir::build(&mut graph).1.unwrap();
+			let count = mir.functions.len();
+			let exports: Vec<_> = mir.exports.iter().map(|e| e.item).collect();
+			let module = emit(&mut mir, &graph.strings, inline).unwrap();
+			assert_eq!(mir.functions.len(), count);
+			assert_eq!(
+				mir.exports.iter().map(|e| e.item).collect::<Vec<_>>(),
+				exports
+			);
+			assert_eq!(
+				mir.imports.len(),
+				1,
+				"import metadata keeps its MIR ID"
+			);
+			mir.verify_imports().unwrap();
+			let engine = wasmtime::Engine::default();
+			let module =
+				wasmtime::Module::new(&engine, module.encode()).unwrap();
+			assert_eq!(
+				module.imports().count(),
+				0,
+				"dead imports are omitted from output"
+			);
+			let mut store = wasmtime::Store::new(&engine, ());
+			let instance =
+				wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+			let run = instance
+				.get_typed_func::<i32, i32>(&mut store, "run")
+				.unwrap();
+			for x in [0, 42, i32::MIN, i32::MAX] {
+				assert_eq!(run.call(&mut store, x).unwrap(), x);
+			}
+		}
 	}
 }

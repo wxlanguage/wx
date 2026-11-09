@@ -1,13 +1,12 @@
 # MIR pipeline
 
-Status as of 2026-11-07, branch `tir-refactor`, commit `5878b44`: step 1
-of "Order of work" is done (scalar locals and signatures, `Values`,
-`SetLocals`, per-scalar loads and stores), and so is step 2.1 (MIR's
-vocabulary: Wasm types, flat opcodes, one signature table); next is 2.2,
-the codegen walk ("Resuming at step 2.2", under "Order of work"); steps
-3–4 are design. "Today" below describes the code before step 1. Replaces
-`notes/mir-dce.md`, whose pass is the "Dead-code elimination" section
-below, corrected against the code.
+Status as of 2026-11-09, branch `tir-refactor`: scalar MIR, graph-to-MIR
+optimization, demand-driven use/placement planning, module reachability and
+selective codegen are implemented. The default backend runs optional inlining,
+optimizes reached bodies, and emits retained items with stable MIR IDs. The old
+optimizer, physical inliner cleanup and backend-selection flags have been removed.
+See [integration status](opt-integration.md) for checks and remaining refinements.
+"Today" below preserves the pre-refactor problem statement.
 
 ## Today
 
@@ -67,18 +66,27 @@ What this shape costs:
 ## Target
 
 ```
-lower → inline → opt → dce → codegen
-MIR      MIR→MIR  MIR→MIR  MIR→MIR  MIR→wasm→bytes
+lower → optional inline → reachability worklist + per-function opt
+                        → codegen(MIR, reachability) → wasm::Function → bytes
 ```
 
-Each pass runs once, in this order, and takes and returns the same MIR.
-Nothing repeats (see "Later").
+Scheduling decision, 2026-11-09: `opt` and module reachability are coordinated.
+After optional inlining, a worklist starts from exports and the start function.
+Each reached defined function is optimized once, then its emitted MIR supplies
+the references to discover next. MIR IDs stay stable through codegen, which
+assigns Wasm indices and emits only reached items. This avoids optimizing bodies
+that are never reached; it does not introduce a repeating whole-pipeline
+optimization loop. See
+[opt-integration.md](opt-integration.md#decision-optimize-functions-when-reachability-discovers-them)
+for the accepted algorithm, lifetime constraints and acceptance checks.
 
 - `opt` is a MIR → MIR pass: MIR → sea of nodes → MIR, per function.
-- `dce` runs after `opt`, so it sees what `opt` deleted.
-- Codegen turns MIR into wasm by one walk and encodes it; it decides no
-  optimization.
-- `backend::emit` runs the whole sequence, including `dce` when inlining is
+- Reachability reads each reached function after `opt`, so it sees what `opt`
+  deleted; its marks select the items codegen emits, without physical compaction.
+- Codegen linearizes each reached MIR body into a `wasm::Function`, may run Wasm
+  passes over it, and encodes it ("Codegen: MIR → wasm"). Linearizing and
+  encoding consume retention decisions rather than rediscovering dependencies.
+- `backend::emit` runs the whole sequence, including reachability when inlining is
   off: lowering alone already leaves dead items.
 
 ## What MIR represents
@@ -117,7 +125,7 @@ SetLocals { targets: TargetList, value: ExprId },
 
 and `Return` takes a list. `TargetList` is a run of a new body column,
 `Body::targets: Vec<Option<LocalIndex>>`, as `ExprList` is of `lists` and
-`CaseList` of `cases`; `ids_mut` hands it out as `Id::Targets`, so a pass
+`CaseList` of `cases`; `body_ids_mut` hands it out as `BodyId::Targets`, so a pass
 that renumbers locals rewrites its entries as it does every other local.
 `verify` checks that a `SetLocals` has one target per result and that each
 target local's type is its result's. The single `LocalSet { local, value }`
@@ -169,7 +177,7 @@ After step 1, MIR still types its values with source types (`U8`, `I16`,
 `Binary { Div }` of type `U32` is `i32.div_u`. `opt` does not: its nodes
 are instructions (`DivU`, `LtS`, `ShrU`) over Wasm's four types. So every
 stage after lowering picks instructions from source types again: the `opt`
-builder today, the codegen walk next, and `opt` writing MIR back would have
+builder today, linearizing next, and `opt` writing MIR back would have
 to make the types up again.
 
 Step 2 moves MIR to `opt`'s level instead. Lowering, which has the TIR
@@ -288,8 +296,8 @@ node is built (`debug_assert!(op.can_trap())`), not a type.
   (`build_binary`, `build_cmp`, `build_conversion` stop choosing). It puts
   an operation that can trap in program order (today's `ControlNode::
   Trapping`), by `can_trap()`.
-- **Codegen** maps an opcode and its type to one Wasm instruction, choosing
-  nothing.
+- **Codegen** linearizes: an opcode and its type are one Wasm instruction,
+  chosen by nothing.
 
 ## `opt`: MIR → MIR
 
@@ -342,12 +350,14 @@ returns them.
 `opt` on its own output changes nothing; a debug test checks it, since a
 round trip that adds locals would make code worse each time it runs.
 
-## Dead-code elimination: `mir::dce::run(mir: &mut MIR)`
+## Module reachability and selective output
 
-Mark and sweep over every kind of item, each knowing nothing of the
-other's details. `remove_dead_functions` moves here and generalizes; the
-inliner keeps its `rooted` column (the one-call-site rule reads it) and
-removes nothing. Roots are one function both use.
+Mark reached items of every kind, then let codegen emit only marked contents.
+`opt::optimize_reachable` coordinates discovery with function optimization.
+Remove `remove_dead_functions` from the inliner during integration; the inliner
+keeps its `rooted` column (the one-call-site rule reads it) and removes nothing.
+Root enumeration is shared where applicable. This replaces the earlier
+`mir::dce` mark-and-compact proposal.
 
 What leaves items dead: lowering naming one through a type only (the memory
 above), and code `opt` deletes. Inlining does not: a spliced callee's nodes
@@ -363,14 +373,14 @@ own node type rather than an `Item::Data` that `Import::item` and
 `Export::item` could hold:
 
 ```rust
-pub enum Node {
+pub enum Reference {
     Item(Item),
     Data(StaticEntryId),
 }
 
 impl MIR {
     /// Every node `node` refers to.
-    pub fn dependencies(&self, node: Node, f: impl FnMut(Node));
+    pub fn dependencies(&self, node: Reference, f: impl FnMut(Reference));
 }
 ```
 
@@ -382,7 +392,7 @@ impl MIR {
 | static data | its memory; its relocations' targets: data (`AddressTarget::Entry`), memories (`AddressTarget::DataEnd`) |
 | memory | nothing |
 
-Which items a node names is one match in `mir/body.rs`, beside `ids_mut`
+Which items a node names is one match in `mir/body.rs`, beside `body_ids_mut`
 and `cost`:
 
 ```rust
@@ -401,81 +411,145 @@ impl ExprKind {
 `Call` names a function; `Global` and `GlobalSet` a global; `DataEnd`,
 `MemoryIndex`, `MemorySize`, `MemoryGrow`, `MemoryFill`, `PointerLoad`,
 `PointerStore` their memory, `MemoryCopy` two; `StaticPointer` its data. A
-new variant that names an item says so in this one arm. `ids_mut` stays the
+new variant that names an item says so in this one arm. `body_ids_mut` stays the
 walk over indices inside one body; item ids are module-level and only
 module-level passes read them. Marking calls `items_mut` on a copy
 (`ExprKind` is `Copy`), so the list is written once.
 
 ### Mark
 
-Roots: exports of every kind and `start_function`. A work list of `Node`
-walks `dependencies` from them, with one `live` column per kind. A dead
-function is never marked, so nothing it names is marked through it. This is
-reachability, so cycles (data pointing at data) need nothing special.
+Roots: exports of every kind and `start_function`. A work list of `Reference`
+walks `dependencies` from them, with one `live` column per kind. Mark on enqueue
+to suppress duplicates. Before reading a reached defined function's dependencies,
+optimize and replace its body. This discovery uses final emitted references,
+so removed calls do not enqueue their callees. A never-reached function is never
+optimized. Keep MIR item IDs stable through codegen. This is reachability, so cycles
+(including recursive calls and data pointing at data) need no recursive traversal.
 
-### Sweep
+Implemented as `opt::optimize_reachable`, returning `Reachability` with dense
+boolean columns over stable IDs. This operates on the whole MIR program for one
+Wasm output, independently of source-file boundaries. It does not compact tables
+or change normal backend selection yet; see [integration status](opt-integration.md#reachability-worklist-implemented).
 
-For each kind, the live items get new ids in id order (`Vec<Option<_>>`,
-old to new), and so do the import entries of live items. Then every stored
-id is rewritten:
+Backing-data decision, 2026-11-09: constants are compile-time values and do not
+require runtime storage merely because they were declared. Static entries are
+backend backing storage, retained through reachable function references, global
+initializers and relocations. An entry depends on its memory; exporting a memory
+does not introduce the reverse dependency or retain all entries assigned to it.
+An exported global containing a pointer is the explicit way to expose a backing
+object and its compiler-chosen address. Numeric addresses do not root unused
+constants, and `DATA_END` describes the retained-data layout rather than retaining
+every candidate entry. See the accepted
+[backing-storage decision](opt-integration.md#decision-constants-do-not-require-runtime-backing-storage).
 
-- every node, through `items_mut`;
-- `exports`, `imports` (each entry's item), and `Origin::Imported` of each
-  imported item;
-- `start_function`;
-- each global's `ConstInit::Static { entry }` and `ConstInit::DataEnd
-  { memory }`;
-- each static entry's `memory` and its relocations' targets.
+### Selective codegen, with stable MIR IDs
 
-Each table keeps only its live entries, at their new positions. Every table
-is indexed by its own id, so `Global` and `MemoryInfo` drop their `id`
-fields, as `Function` did. Debug builds run `verify_imports` afterwards.
+Implemented as the independently callable
+`codegen::Builder::build(&MIR, &StringInterner, &Reachability)`;
+[checks and integration status](opt-integration.md#selective-codegen-implemented).
+The default backend now uses this path after optional inlining and reachability.
 
-Codegen then lays out every entry in `static_entries` and drops its own
-walk.
+Accepted 2026-11-09: pass optimized MIR and reachability into codegen, without
+moving MIR entries or rewriting their IDs. Codegen already maps MIR item IDs to
+Wasm indices for import-first numbering and import merging. Assign those indices
+only to reached items and resolve stored references through the existing maps.
+
+- Filter imports by their provided item's mark before assigning/merging output
+  imports. MIR import records and `Origin::Imported` IDs remain unchanged.
+- Assign Wasm indices and emit bodies/sections only for reached functions, globals
+  and memories. Dead functions must not be linearized or analyzed by codegen's
+  test hooks. Keep function signatures and bodies in matching output order.
+- Lay out only marked static entries and patch relocations using that layout;
+  replace the separate static-data dependency walk. `DATA_END` uses this layout.
+- Resolve calls, exports, start and initializers from stable MIR IDs to output
+  indices/addresses. A retained reference to an unmarked item is an invariant
+  failure.
+
+Flags, initializers, relocation targets and table entries keep their existing MIR
+IDs. Unreachable storage expires when MIR is dropped. Physical compaction or
+earlier reclamation is optional future work if a measured memory problem or a
+new consumer justifies it. See the
+[accepted decision](opt-integration.md#decision-retain-mir-ids-and-filter-during-codegen).
 
 ### Decisions
 
-1. **An unused import entry is dropped**, for every kind. Only an embedder
+1. **An unused import entry is omitted from output**, for every kind. Only an embedder
    filling imports by position notices; accepted already for functions
    (`notes/mir-arena.md`, decision 14).
-2. **An unused defined memory is dropped**, unless exported.
+2. **An unused defined memory is omitted from output**, unless exported.
 3. **Static data is a node of the graph, not an `Item`**: it depends on its
    memory and its relocations' targets.
 
-### Tests (`mir/dce.rs`)
+### Tests (reachability and codegen)
 
-- A memory named only by a pointer type is dropped.
-- An imported global or function nothing live names loses its import
-  entry; `verify_imports` holds afterwards.
+- A memory named only by a pointer type is absent from output.
+- An imported global or function nothing live names has no output import;
+  MIR imports/origins remain intact and `verify_imports` still holds.
 - An exported item is kept with nothing naming it.
 - A data entry and its memory go with the only function pointing at it,
   and stay while one live function, a global or another live entry does.
-- After the sweep, every id a node, an export, an import entry, the start
-  function, a global's initializer or a static entry holds is in range, and
-  each table's index is its id.
+- Gaps in every MIR item ID space resolve correctly through output maps; imports
+  precede definitions and equivalent retained imports can still merge.
+- Calls, exports, start, global initializers and relocations resolve consistently;
+  every reference in retained content targets a retained item.
+- Dead bodies are not linearized, and backing data in retained memories is still
+  omitted unless separately reached. MIR IDs and tables remain unchanged.
 - Every lowering test still runs under wasmtime with the same result.
 
 ## Codegen: MIR → wasm
 
-One walk over each body, children before their parent. An opcode and its
-type are one Wasm instruction (`DivU` of an `I32` is `i32.div_u`), and an
-access is its load or store; codegen chooses no instruction.
+Per function, three stages, with module assembly (sections, index spaces,
+static data, the function table) around them:
+
+```
+MIR body ─ linearize ─→ wasm::Function ─ Wasm passes ─→ wasm::Function ─ encode ─→ bytes
+           mechanical                     optional                       mechanical
+```
+
+**`wasm::Function` is the Wasm body codegen owns**: a flat instruction
+list, one variant per Wasm instruction, which Wasm-specific per-function
+optimizations rewrite before encoding. Linearizing and encoding are pure
+translations and never optimize, so an optimization is always a pass of
+its own: on MIR (`opt`) when it changes the tree's shape, on the
+instruction list when it only exists once code is linear.
+
+- **On MIR**, in `opt`: which value is a child of its user and which a
+  local ("Child of its user, or a local"), control-flow join values, what
+  inlining and folding change. These are about the tree, and MIR is it.
+- **On the instruction list**, in `wasm/`: `local.set x; local.get x` as
+  `local.tee x` across sibling statements, values left on the stack
+  between statements (which a tree cannot say), code after a `br`/`return`/
+  `unreachable`, redundant `block`/`end`. Reusing locals
+  (`coalesce_locals`) only renumbers, so it could be either; it is written
+  for the list. None of these is part of this refactor.
+
+Binaryen makes the same split: its IR is a Wasm-shaped tree, and a linear
+Stack IR exists only for what the tree cannot express.
+
+The list keeps symbolic references (`Call(FunctionId)`, `GlobalGet`,
+`DataEnd`, `StaticDataPointer`, `FunctionPointer`, `MemoryIndex`), so a
+pass needs nothing module-level; the encoder resolves them, as it does
+today. Branches are depths, as in Wasm.
+
+**Linearizing** (`codegen/linearize.rs`, `MIR body → wasm::Function`) emits
+each node after its children. An opcode and its type are one Wasm
+instruction (`DivU` of an `I32` is `i32.div_u`), and an access is its load
+or store:
 
 - a label becomes a branch depth;
-- a `Switch` becomes a `br_table` (dense cases) or a `br_if` chain;
-- a block's type is its node's: none, one scalar, or several (a type-section
-  entry; the signature table is already shared with multi-value block
-  types, `codegen/mod.rs:330`);
+- a `Switch`, the one node with no single instruction, becomes a
+  `br_table` (dense cases) or a `br_if` chain by a fixed rule on its cases;
+- a block's type is its node's: none, one scalar, or several (a
+  signature index; `wasm::BlockType` grows that case, the signature table
+  is already shared with multi-value block types);
 - a `Call` leaves its results on the stack for its user; a `SetLocals`
   takes its targets in reverse, a `local.set` or a `drop` each.
 
-Then the existing encoder (`encode_scheduled_instr`) runs unchanged;
-`wasm::Function` stays the boundary. Reusing locals (`opt/liveness.rs`) is
-an optional last step here: it only makes the binary smaller.
+**Encoding** is today's `encode_scheduled_instr` (to be renamed for what
+it does, `encode_function`), unchanged: one instruction to its bytes.
 
-**Extensions are decided here only.** When multi-value is not allowed, a
-multi-result block is lowered to locals mechanically: each arm sets them,
+**Extensions are decided here only.** When multi-value is not allowed,
+linearizing turns a multi-result block into locals: each arm sets them,
 and they are read after `end`. MIR and `opt` never know which extensions
 are on.
 
@@ -491,10 +565,12 @@ it belongs in the last steps, not in the optimizer's reasoning.
 
 ## Open points
 
-1. **Multi-value is already emitted without an opt-in.** A function
-   returning a struct or a slice gets `(result i32 i32)`, against the rule
-   that output uses no extension unless the program uses it. Not part of
-   this refactor; the direction is "Multi-value as an opt-in" below.
+1. **Multi-value is used wherever it fits** (decided 2026-11-08): function
+   results, and blocks a multi-result value crosses (linearizing emits
+   `block (result i32 i32)`). A configuration flag will later choose
+   between that and locals; until then codegen assumes multi-value, and
+   nothing earlier knows. "Multi-value as an opt-in" below is the older
+   direction this replaces for the default.
 2. **Inlining thresholds.** Scalar MIR counts a struct-heavy callee as more
    nodes; the policy's numbers may need a look.
 3. **Function references.** Not lowered yet (`Funcref`, `TypedFuncref` and
@@ -648,7 +724,7 @@ by lowering.
    Still allocating, deliberately: `memory_values` copies its rows (the
    evaluator expands arrays from them); MIR's aggregate table keeps a box
    per entry; lowering collects node ids in a `Vec` before `state.list`.
-2. **`opt` outputs MIR; codegen gets the MIR → wasm walk**, in five
+2. **`opt` outputs MIR; codegen linearizes MIR into `wasm::Function`**, in five
    steps, each leaving every test passing:
    1. **MIR's vocabulary** (done; "MIR's vocabulary" above): Wasm types;
       flat opcodes with their properties; accesses with their width;
@@ -695,20 +771,28 @@ by lowering.
       fields are still named `aggregate_index` though they hold a
       `SignatureIndex` (step 2.5), and the unreachable `CallIndirectSym`
       path (open point 3).
-   2. **The codegen walk**, MIR → `wasm::Function`, tested without `opt`: a
-      test-only switch in `backend::emit` skips `opt`, so every wasmtime
-      suite (lowering's, `backend_tests.rs`, the inliner's) also runs
-      lowering's MIR straight through the walk. `coalesce_locals`,
-      `peephole_local_tee` and the debug local check run on its output
-      unchanged. The old path stays the default.
+   2. **Linearizing**, MIR → `wasm::Function` (`codegen/linearize.rs`),
+      tested without `opt`: a test-only switch in `backend::emit` skips
+      `opt`, so every wasmtime suite (lowering's, `backend_tests.rs`, the
+      inliner's) also runs lowering's MIR through linearize → encode. That
+      path runs no Wasm passes: `coalesce_locals`, `peephole_local_tee`
+      and the debug local check stay where they are, at the end of the
+      scheduler. The old path stays the default.
+   Steps 3–5 are redesigned in `notes/opt-design.md` (join tables sized by
+   write sets, `Uses`, emission to MIR), whose "Order of work" replaces
+   them; they are kept below as the original plan.
    3. **`opt` writes MIR.** Emission builds a MIR body: a value inlined at
       its user is a child expression, a value in a local a `LocalSet`
       statement and a `LocalGet`; a phi is a `LocalSet` in each arm; a
       carried binding's update a `LocalSet` before its `Break`; an `opt`
       block maps back to a label, a synthetic one gets a fresh label.
       Placement and `should_spill` stay. Codegen becomes builder →
-      scheduler (MIR) → walk, and the scheduler's wasm emission goes. The
-      target is parity: the same tests, about the same example sizes.
+      scheduler (MIR) → linearize → encode, and the scheduler's wasm
+      emission goes; the scheduler's post-passes become the Wasm passes
+      stage after linearizing (the debug local check before
+      `coalesce_locals`, which relies on it), so the default path keeps
+      them. The target is parity: the same tests, about the same example
+      sizes.
    4. **Control-flow values on the stack**: the child-or-local rule for an
       `IfElse`/`Switch`/`BlockJoin`'s join values ("Child of its user, or a
       local"), and the debug test that `opt` on its own output changes
@@ -719,22 +803,41 @@ by lowering.
       builder (`should_use_br_table`, `build_switch_as_if_chain`) to
       codegen, so a `match` stays a `Switch` through `opt`. Kept out of
       step 3 so that parity there compares like with like.
-   **Resuming at step 2.2.** Codegen runs `opt` per function in
-   `codegen::Builder::build` (`codegen/mod.rs`, the loop over
-   `mir.functions_with_ids()`: `opt::builder::Builder::build`, then
-   `opt::scheduler::Scheduler::schedule`, then `encode_scheduled`). The
-   walk is a third choice there: a MIR body straight to a
-   `wasm::Function`, each node one instruction now that opcodes say
-   everything, then `wasm::coalesce_locals` and `wasm::peephole_local_tee`
-   (`wasm/mod.rs`) and, in debug, `opt::local_dominance::
-   verify_local_dominance`, as the scheduler does after itself
-   (`opt/scheduler.rs`). `backend::emit` takes the test-only switch.
-   Settle first: where the walk lives (`codegen/walk.rs`?), how a value
-   with several results reaches its user (on the stack in order; a
-   `SetLocals` pops them), and what the switch looks like; then run every
-   wasmtime suite both ways.
-3. **`mir::dce`**, taking `remove_dead_functions` from the inliner and the
-   reachability walk from codegen.
+   **Where 2.2 landed.**
+   - `wasm::Instruction` carries MIR's opcodes with their operand type
+     (`Binary(op, ty)`, `Compare`, `Unary`, `Convert { op, from, to }`,
+     `Load(access, memarg)`, `Store`), so the encoder's opcode tables
+     (`codegen/mod.rs`, a row per opcode indexed by type) are the one
+     place an opcode becomes a byte; the scheduler maps `opt`'s node kinds
+     onto them until 2.3. `BlockType::Results(signature)` is a block with
+     several results.
+   - `codegen/linearize.rs` emits each node after its children; its module
+     doc lists the forms a node has no single instruction for (a loop
+     something leaves in a `block`, a `Switch` as a `br_table` over nested
+     blocks with the selector inside them or an `if` chain with one scratch
+     local per selector type, `unreachable` after a structured node of type
+     `Never`, nothing after a diverging child). Whether a switch is a
+     `br_table` is `codegen::uses_br_table`, which `opt`'s builder calls
+     too.
+   - The switch is `WX_NO_OPT=1 cargo test`: codegen reads it under
+     `#[cfg(test)]` (`skips_opt`), so every harness, including the tests
+     that call `codegen::Builder::build` directly, runs lowering's MIR
+     through linearize → encode. Delete it in 2.3. Both ways pass the
+     whole suite, and the examples' runtime checks
+     (`examples/test_memory_examples.mjs`) pass on both builds.
+   - Linearized output is about half the size of `opt`'s (51 KB → 25 KB
+     over the 23 binary examples, with inlining on): `opt` puts join
+     values, loop-carried values and multi-use values in locals (`search`:
+     403 local instructions against 89). Step 2.4's child-or-local rule
+     is what `opt` needs before it pays for itself; until then the 2.3
+     parity target ("about the same example sizes") compares against a
+     baseline that is worse than no `opt` at all.
+   - Linearizing uses multi-value blocks for a multi-result value crossing
+     a block, which `opt` never emits (it uses locals); see open point 1.
+
+3. **Reachability plus selective codegen**, replacing `remove_dead_functions`
+   in the inliner and the backing-data reachability walk in codegen. Keep MIR
+   IDs stable and use codegen's output index maps; no physical compaction.
 4. **`backend::emit` runs the sequence**; every harness goes through it.
 
 Steps 1 and 3 are independent of each other; step 2 is simplest after 1.

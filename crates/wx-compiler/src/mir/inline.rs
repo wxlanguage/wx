@@ -1,17 +1,13 @@
-//! Inlining and dead-function removal over the arena MIR. Design:
-//! `notes/mir-inlining.md`.
+//! Inlining over the arena MIR. Design: `notes/mir-inlining.md`.
 //!
-//! One pass in four steps: build the call graph and the per-function columns,
-//! order the functions callees first (Tarjan's strongly connected
-//! components), splice each call the policy accepts, and drop what the roots
-//! no longer reach, renumbering so a `FunctionId` stays its index.
-//! Everything the pass keeps is a column indexed by `FunctionId`, dropped at
-//! its end.
+//! Build the call graph and per-function columns, order callees first through
+//! strongly connected components, then splice accepted calls. MIR item IDs stay
+//! stable; the optimizer's reachability worklist decides output retention later.
+//! All temporary columns expire at the end of this pass.
 
 use super::body::{self, ExprId, ExprKind, LabelId, shift_expr};
 use super::{
-	Code, FunctionFlags, FunctionId, ImportIdx, Item, LocalIndex, MIR, Origin,
-	ValueType,
+	Code, FunctionFlags, FunctionId, Item, LocalIndex, MIR, ValueType,
 };
 
 /// Which calls the pass inlines beyond those it must.
@@ -42,8 +38,7 @@ impl Policy {
 /// What calling a function costs at a call site: `call` and its index.
 const CALL_COST: u32 = 2;
 
-/// Inline what `policy` accepts, then drop every function the exports and the
-/// start function no longer reach.
+/// Inline what `policy` accepts, preserving every item and its MIR ID.
 pub fn run(mir: &mut MIR, policy: Policy) {
 	let graph = CallGraph::build(mir);
 	let order = Components::of(&graph);
@@ -85,8 +80,6 @@ pub fn run(mir: &mut MIR, policy: Policy) {
 		}
 		columns.cost[usize::from(caller)] = code.body.cost();
 	}
-
-	remove_dead_functions(mir, &columns.rooted);
 }
 
 /// The functions each function calls, once per call node, in node order:
@@ -389,108 +382,6 @@ fn splice(
 	);
 }
 
-/// Drop every function the roots no longer reach, and every import entry of
-/// one, renumbering both so a `FunctionId` stays its index and an
-/// `ImportIdx` its entry's.
-fn remove_dead_functions(mir: &mut MIR, rooted: &[bool]) {
-	let graph = CallGraph::build(mir);
-	let mut live = rooted.to_vec();
-	let mut work: Vec<usize> = (0..live.len()).filter(|&f| live[f]).collect();
-	while let Some(function) = work.pop() {
-		for &callee in graph.callees(function) {
-			let callee = usize::from(callee);
-			if !live[callee] {
-				live[callee] = true;
-				work.push(callee);
-			}
-		}
-	}
-
-	let mut next = 0;
-	let remap: Vec<Option<FunctionId>> = live
-		.iter()
-		.map(|&live| {
-			live.then(|| {
-				next += 1;
-				FunctionId::new(next - 1)
-			})
-		})
-		.collect();
-	let new_id = |id: FunctionId| {
-		remap[usize::from(id)].expect("a live function calls only live ones")
-	};
-
-	// The import entries of dropped functions go too.
-	let mut next = 0;
-	let import_remap: Vec<Option<ImportIdx>> = (mir.imports.iter())
-		.map(|import| {
-			let kept = match import.item {
-				Item::Function(id) => live[usize::from(id)],
-				Item::Global(_) | Item::Memory(_) => true,
-			};
-			kept.then(|| {
-				next += 1;
-				ImportIdx::new(next - 1)
-			})
-		})
-		.collect();
-	let new_import = |import: ImportIdx| {
-		import_remap[usize::from(import)].expect("a live item's import is kept")
-	};
-
-	let functions = std::mem::take(&mut mir.functions);
-	let flags = std::mem::take(&mut mir.function_flags);
-	for ((mut function, flags), live) in
-		functions.into_iter().zip(flags).zip(&live)
-	{
-		if !live {
-			continue;
-		}
-		match &mut function.origin {
-			Origin::Imported(import) => *import = new_import(*import),
-			Origin::Defined(code) => {
-				for kind in code.body.kinds_mut() {
-					if let ExprKind::Call { function, .. } = kind {
-						*function = new_id(*function);
-					}
-				}
-			}
-		}
-		mir.functions.push(function);
-		mir.function_flags.push(flags);
-	}
-	for global in &mut mir.globals {
-		if let Origin::Imported(import) = &mut global.origin {
-			*import = new_import(*import);
-		}
-	}
-	for memory in &mut mir.memories {
-		if let Origin::Imported(import) = &mut memory.origin {
-			*import = new_import(*import);
-		}
-	}
-
-	let imports = std::mem::take(&mut mir.imports);
-	mir.imports = imports
-		.into_iter()
-		.zip(&import_remap)
-		.filter(|(_, kept)| kept.is_some())
-		.map(|(mut import, _)| {
-			if let Item::Function(id) = &mut import.item {
-				*id = new_id(*id);
-			}
-			import
-		})
-		.collect();
-	for export in &mut mir.exports {
-		if let Item::Function(id) = &mut export.item {
-			*id = new_id(*id);
-		}
-	}
-	mir.start_function = mir.start_function.map(new_id);
-	debug_assert!(mir.verify_imports().is_ok());
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -531,7 +422,24 @@ mod tests {
 				diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
 			)
 		};
+		let function_count = mir.functions.len();
+		let flags = mir.function_flags.clone();
+		let imports: Vec<_> = mir.imports.iter().map(|i| i.item).collect();
+		let exports: Vec<_> = mir.exports.iter().map(|e| e.item).collect();
+		let start = mir.start_function;
 		run(&mut mir, policy);
+		assert_eq!(mir.functions.len(), function_count);
+		assert!(mir.function_flags == flags);
+		assert_eq!(
+			mir.imports.iter().map(|i| i.item).collect::<Vec<_>>(),
+			imports
+		);
+		assert_eq!(
+			mir.exports.iter().map(|e| e.item).collect::<Vec<_>>(),
+			exports
+		);
+		assert_eq!(mir.start_function, start);
+		assert_dense(&mir);
 		(graph, mir)
 	}
 
@@ -553,9 +461,10 @@ mod tests {
 		A: wasmtime::WasmParams,
 		R: wasmtime::WasmResults,
 	{
-		let bytes = crate::codegen::Builder::build(mir, &graph.strings)
-			.expect("inlined MIR must encode")
-			.encode();
+		let bytes =
+			crate::codegen::Builder::build_linearized(mir, &graph.strings)
+				.expect("inlined MIR must encode")
+				.encode();
 		let engine = wasmtime::Engine::default();
 		let module = wasmtime::Module::new(&engine, &bytes)
 			.expect("inlined MIR must be valid Wasm");
@@ -590,14 +499,14 @@ mod tests {
 	}
 
 	#[test]
-	fn an_inline_callee_is_spliced_into_every_caller_and_dropped() {
+	fn an_inline_callee_is_spliced_into_every_caller_with_stable_ids() {
 		let source = r#"
 			#[inline] func double(x: i32) -> i32 { x + x }
 			func run(a: i32) -> i32 { double(a) + double(3) }
 			export { run as "run" }
 		"#;
 		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
-		assert_eq!(mir.functions.len(), 1, "only `run` is left");
+		assert_eq!(mir.functions.len(), 2, "both MIR entries keep their IDs");
 		assert_eq!(call_count(&mir), 0);
 		assert_dense(&mir);
 		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 5), 16);
@@ -627,7 +536,11 @@ mod tests {
 			export { run as "run" }
 		"#;
 		let (graph, mir) = inlined(source, Policy::DEFAULT);
-		assert_eq!(mir.functions.len(), 2, "`run` and `large`");
+		assert_eq!(
+			mir.functions.len(),
+			3,
+			"`run`, `large` and inlined `small`"
+		);
 		assert_eq!(call_count(&mir), 2, "both calls of `large`");
 		assert_dense(&mir);
 		let large = |x: i32| {
@@ -640,7 +553,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_callee_with_one_call_site_is_inlined_and_removed_unless_exported() {
+	fn a_callee_with_one_call_site_is_inlined_unless_exported() {
 		let large = r#"
 			func large(x: i32) -> i32 {
 				(x * 3 + 7) * (x - 2) + (x * x - 5) * (x + 9) + (x - 1) * (x - 4)
@@ -652,7 +565,7 @@ mod tests {
 			),
 			Policy::DEFAULT,
 		);
-		assert_eq!(mir.functions.len(), 1);
+		assert_eq!(mir.functions.len(), 2);
 		assert_eq!(call_count(&mir), 0);
 		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 1), -10 + (-4) * 10);
 
@@ -697,14 +610,14 @@ mod tests {
 	}
 
 	#[test]
-	fn an_early_return_leaves_only_the_inlined_copy() {
+	fn an_inlined_early_return_leaves_the_callers_wrapper() {
 		let source = r#"
 			#[inline] func clamp(x: i32) -> i32 { if x < 0 { return 0; } x }
 			func run(a: i32) -> i32 { clamp(a) + clamp(a - 10) }
 			export { run as "run" }
 		"#;
 		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
-		assert_eq!(mir.functions.len(), 1);
+		assert_eq!(mir.functions.len(), 2);
 		assert!(
 			!(mir.code(FunctionId::new(0)).body.kinds().iter())
 				.any(|kind| matches!(kind, ExprKind::Return { .. })),
@@ -731,12 +644,12 @@ mod tests {
 			export { run as "run" }
 		"#;
 		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
-		assert_eq!(mir.functions.len(), 1);
+		assert_eq!(mir.functions.len(), 2);
 		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 4), 16);
 	}
 
 	#[test]
-	fn compaction_renumbers_calls_and_import_entries() {
+	fn inlining_preserves_calls_and_import_ids() {
 		let source = r#"
 			import "host" as host { func log(value: i32); }
 			func helper(x: i32) { host::log(x); host::log(x + 1); }
@@ -744,8 +657,8 @@ mod tests {
 			export { run as "run" }
 		"#;
 		let (_, mir) = inlined(source, Policy::DEFAULT);
-		// `run` 0, `helper` 1, `log` 2 as lowered; `helper` is gone.
-		assert_eq!(mir.functions.len(), 2);
+		// `run` 0, `helper` 1, `log` 2 stay at their original IDs.
+		assert_eq!(mir.functions.len(), 3);
 		assert_dense(&mir);
 		let [import] = mir.imports.as_slice() else {
 			panic!("one import entry")
@@ -753,9 +666,10 @@ mod tests {
 		let Item::Function(log) = import.item else {
 			panic!("a function import")
 		};
-		assert_eq!(log, FunctionId::new(1));
+		assert_eq!(log, FunctionId::new(2));
 		assert!(mir.code(FunctionId::new(0)).callees().all(|id| id == log));
-		assert_eq!(call_count(&mir), 2);
+		assert_eq!(mir.code(FunctionId::new(0)).callees().count(), 2);
+		assert_eq!(call_count(&mir), 4, "original helper remains in MIR");
 	}
 
 	#[test]
@@ -845,7 +759,7 @@ mod tests {
 		let (graph, mir) = inlined(source, Policy::DEFAULT);
 		// `c` is small and goes into `b`; `b`, with two copies of it, is no
 		// longer small, and neither is `a`, so both stay calls.
-		assert_eq!(mir.functions.len(), 3, "`run`, `a` and `b`");
+		assert_eq!(mir.functions.len(), 4, "`run`, `a`, `b` and inlined `c`");
 		assert_eq!(call_count(&mir), 4);
 		assert_dense(&mir);
 		let c = |x: i32| x * 3;

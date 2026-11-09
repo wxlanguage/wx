@@ -1,10 +1,11 @@
 # MIR inlining
 
-Status as of 2026-11-04, branch `tir-translation`: implemented in
-`mir/inline.rs` (steps 1 to 5 of "Order of work"); the corpus and the
-tuning are next. Replaced `mir/inlining.rs` (the tree inliner, deleted) and
-the "Inlining" section of `notes/mir-arena.md`, whose arena shape this
-builds on.
+Status as of 2026-11-09, branch `tir-refactor`: inlining preserves all MIR item
+IDs and table entries. Its old dead-function cleanup and compaction step have
+been removed. The optimizer's reachability worklist and selective codegen decide
+which items reach the output, after per-function optimization. See
+[integration status](opt-integration.md). The compaction discussion below records
+the original design and is superseded by that decision.
 
 ## What the old pass got right and wrong
 
@@ -42,14 +43,14 @@ Dropped:
    hand (and a level's static data was once unioned into every caller).
    Both are now derived from the nodes.
 6. **Two 75-arm walkers** (`Rebaser`, `inline_expr`). The arena has one
-   child visitor, `ExprKind::ids_mut`.
+   child visitor, `ExprKind::body_ids_mut`.
 7. **No policy.** Every call of an `#[inline]` function is inlined however
    large it is, and no other call is, however small the callee.
 8. **`retain` breaks `FunctionId == index`**, which MIR now relies on.
 
 ## Shape
 
-One pass, `mir::inline::run(mir: &mut MIR, policy: Policy)`, in four steps.
+One pass, `mir::inline::run(mir: &mut MIR, policy: Policy)`, in three steps.
 `tir::build` returns MIR as lowered, so lowering's tests see lowering's
 output; whoever builds the module runs the pass before codegen (today the
 wasmtime harness of `tir/lower.rs`, so every program those tests run is
@@ -58,7 +59,8 @@ inlined).
 1. Build the call graph and the per-function columns.
 2. Order the functions callees first.
 3. For each function in that order, decide and splice its calls.
-4. Drop unreachable functions and compact the ids.
+Final output retention runs later in the optimizer worklist and codegen;
+inlining does not remove or renumber items.
 
 Everything it keeps is a column indexed by `FunctionId`, owned by the pass
 and dropped at its end. None of it is stored in `MIR`.
@@ -143,7 +145,7 @@ the decision does not depend on the call site (see "Policy").
 2. Append `callee.locals` to `caller.locals`. Parameters come first, so
    parameter `i` is local `v + i`.
 3. Append the callee's `kinds`, `types`, `lists` and `cases`. Shift each
-   appended kind through `ids_mut`: `Expr` by `e`, `List` and `Cases` by
+   appended kind through `body_ids_mut`: `Expr` by `e`, `List` and `Cases` by
    `l` and `c` (their `start`), `Local` by `v`, `Label` by `b`. A
    `Return { value }` becomes `Break { label: w, value }`.
 4. Push one `LocalSet { local: v + i, value: args[i] }` per argument, with
@@ -160,7 +162,7 @@ else: no clones of a tree, no second walk. A `Block` whose label nothing
 breaks to (a callee without an early `return`) is left as it is; opt builds
 it as a join with one entry.
 
-### 4. Dead functions and compaction
+### Historical step 4: dead functions and compaction (removed)
 
 Moving to its own pass over every kind of item: "Dead-code elimination"
 in `notes/mir-pipeline.md`. What
@@ -210,7 +212,7 @@ is per call site and left for later.
 ### Cost
 
 `ExprKind::cost(&self) -> u32` is one match in `mir/body.rs`, next to
-`ids_mut`, so a new variant gets a cost where it gets its children.
+`body_ids_mut`, so a new variant gets a cost where it gets its children.
 The weights estimate encoded bytes, since code size is what a Wasm program
 pays for:
 

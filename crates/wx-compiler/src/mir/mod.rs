@@ -13,11 +13,12 @@ use crate::index::index_newtype;
 // removed `tir::TIR` API.
 pub mod body;
 pub mod inline;
+pub mod references;
 mod signatures;
 
 pub use body::{
 	BinaryOp, Body, Case, CaseList, CompareOp, ConvertOp, ExprId, ExprKind,
-	ExprList, LabelId, LoadAccess, StoreAccess, TargetList, UnaryOp,
+	ExprList, LabelId, LoadAccess, Operands, StoreAccess, TargetList, UnaryOp,
 };
 pub use signatures::Signatures;
 
@@ -98,12 +99,6 @@ impl ValueType {
 		matches!(self, Self::F32 | Self::F64)
 	}
 }
-
-index_newtype!(
-	/// Index into a multi-result value's scalars, in **declaration
-	/// pre-order**: one Wasm value, one local, one stack entry.
-	ScalarIndex
-);
 
 /// A memory's index type, lowered from TIR's `TypeIndex::U32`/`U64` (see
 /// `tir::Memory::kind`) once and for all here — MIR and codegen branch on

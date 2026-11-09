@@ -4057,6 +4057,27 @@ mod tests {
 	}
 
 	#[test]
+	fn unreachable_statements_and_tail_are_still_typechecked() {
+		test_case!(
+			case = "func f() -> u32 { return 1; local x: u32 = True; missing }"
+		);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::UnreachableCode,
+			DiagnosticCode::UndeclaredIdentifier,
+		]);
+		case.diagnostics()
+			.assert_warning(DiagnosticCode::UnreachableCode);
+	}
+
+	#[test]
+	fn an_uncalled_function_body_is_still_typechecked() {
+		test_case!(case = "func unused() -> u32 { missing }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+	}
+
+	#[test]
 	fn if_branches_share_a_type() {
 		test_case!(
 			case = indoc! {"

@@ -1025,9 +1025,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		};
 
 		// Parameters' scalars are the first MIR locals, in order, as the
-		// signature lists them — the contract `opt::builder` relies on. An
-		// unnamed parameter still gets its locals, so the rest stay
-		// positional.
+		// signature lists them. Graph construction and linearization consume
+		// that order. An unnamed parameter still gets its locals, so the rest
+		// stay positional.
 		for (position, binding) in body.params().iter().enumerate() {
 			let run = self.push_locals(
 				&mut state,
@@ -2996,8 +2996,7 @@ mod tests {
 	}
 
 	#[test]
-	fn trapping_integer_operations_preserve_overflow_and_safe_constant_folding()
-	{
+	fn trapping_integer_operations_preserve_overflow_and_constant_results() {
 		let source = r#"
 			func divide32(a: i32, b: i32) -> i32 { a / b }
 			func divide64(a: i64, b: i64) -> i64 { a / b }
@@ -3012,31 +3011,6 @@ mod tests {
 			}
 			export { divide32, divide64, remainder32, remainder64, overflow32, overflow64, folded }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let lowered = crate::tir::build(&mut graph)
-			.1
-			.expect("integer operations lower");
-		let folded_id = lowered
-			.exports
-			.iter()
-			.find_map(|export| {
-				if graph.strings.resolve(export.name) == Some("folded") {
-					let mir::Item::Function(id) = export.item else {
-						unreachable!()
-					};
-					Some(id)
-				} else {
-					None
-				}
-			})
-			.unwrap();
-		let optimized =
-			crate::opt::builder::Builder::build(&lowered, folded_id);
-		assert!(optimized.blocks.iter().flatten().all(|block| {
-			block.statements.iter().all(|stmt| {
-				!matches!(stmt, crate::opt::ControlNode::Trapping { .. })
-			})
-		}));
 		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
 			let (mut store, instance) = instantiate_with_policy(source, policy);
 			assert!(
@@ -3399,8 +3373,8 @@ mod tests {
 	fn codegen_gives_imports_with_the_same_names_and_wasm_type_one_entry() {
 		let mut graph =
 			crate::tir::signatures::tests::source_graph(OVERLOADED_IMPORTS);
-		let mir = crate::tir::build(&mut graph).1.expect("imports lower");
-		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+		let mut mir = crate::tir::build(&mut graph).1.expect("imports lower");
+		let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
 			.expect("lowered MIR must encode")
 			.encode();
 		let engine = wasmtime::Engine::default();
@@ -7774,11 +7748,11 @@ mod tests {
 			export { run }
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
+		let mut mir = crate::tir::build(&mut graph)
 			.1
 			.expect("re-exported function lowers");
 		mir.verify_imports().unwrap();
-		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+		let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
 			.unwrap()
 			.encode();
 		let engine = wasmtime::Engine::default();
@@ -7818,7 +7792,7 @@ mod tests {
 			if let Some(policy) = policy {
 				mir::inline::run(&mut mir, policy);
 			}
-			let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+			let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
 				.unwrap()
 				.encode();
 			let engine = wasmtime::Engine::default();
@@ -8127,7 +8101,7 @@ mod tests {
 			export { read as "read" }
 		"#;
 		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("memories lower");
+		let mut mir = crate::tir::build(&mut graph).1.expect("memories lower");
 		let [import] = mir.imports.as_slice() else {
 			panic!("one import entry")
 		};
@@ -8135,7 +8109,7 @@ mod tests {
 		assert_eq!(graph.strings.resolve(import.name), Some("mem"));
 		assert_eq!(import.item, mir::Item::Memory(mir::MemoryId::new(0)));
 		mir.verify_imports().unwrap();
-		let bytes = crate::codegen::Builder::build(&mir, &graph.strings)
+		let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
 			.expect("lowered MIR must encode")
 			.encode();
 		let engine = engine();

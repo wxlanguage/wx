@@ -1,11 +1,7 @@
-//! The WASM-shaped instruction representation the scheduler targets — a
-//! flat, linear sequence of instructions for a stack machine, as opposed to
-//! the tree (`mir::Function`) or graph (`opt::Function`) representations
-//! earlier in the pipeline. `opt::scheduler` is the sole producer of a
-//! [`Function`] today; it doesn't own these types — they're the contract
-//! `codegen` consumes — which is also why the peephole optimizations that
-//! operate purely on this representation ([`coalesce_locals`],
-//! [`peephole_local_tee`]) live here rather than inside the producer.
+//! Wasm-shaped stack instructions produced by MIR linearization and consumed
+//! by codegen's encoder. Optional local coalescing and peepholes live here;
+//! they are independent of graph construction and are not required by the
+//! default backend pipeline.
 
 use crate::mir;
 
@@ -16,6 +12,12 @@ pub enum ScalarType {
 	I64,
 	F32,
 	F64,
+}
+
+impl ScalarType {
+	pub fn is_float(self) -> bool {
+		matches!(self, Self::F32 | Self::F64)
+	}
 }
 
 impl TryFrom<mir::ValueType> for ScalarType {
@@ -64,12 +66,13 @@ pub struct Function {
 	pub br_table_depths: Vec<u32>,
 }
 
-/// A subset of WASM instructions produced by the scheduler.
-/// Each variant maps 1-to-1 to a WASM opcode; operands are pushed onto the
-/// implicit value stack by the preceding instructions.
+/// One Wasm instruction; operands are pushed onto the implicit value stack
+/// by the preceding instructions. An operation carries MIR's opcode and the
+/// type of its operands, which name the instruction together (`Binary(DivU,
+/// I32)` is `i32.div_u`); only a pair MIR's `verify` admits is ever built.
 #[cfg_attr(test, derive(Debug))]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum Instruction {
 	// Constants
 	I32Const(i32),
@@ -83,99 +86,17 @@ pub enum Instruction {
 	// Globals
 	GlobalGet(mir::GlobalId),
 	GlobalSet(mir::GlobalId),
-	// Arithmetic — i32
-	I32Add,
-	I32Sub,
-	I32Mul,
-	I32DivS,
-	I32DivU,
-	I32RemS,
-	I32RemU,
-	I32And,
-	I32Or,
-	I32Xor,
-	I32Shl,
-	I32ShrS,
-	I32ShrU,
-	I32Eqz,
-	I32Eq,
-	I32Ne,
-	I32LtS,
-	I32LtU,
-	I32LeS,
-	I32LeU,
-	I32GtS,
-	I32GtU,
-	I32GeS,
-	I32GeU,
-	I32Clz,
-	I32Ctz,
-	// Arithmetic — i64
-	I64Add,
-	I64Sub,
-	I64Mul,
-	I64DivS,
-	I64DivU,
-	I64RemS,
-	I64RemU,
-	I64And,
-	I64Or,
-	I64Xor,
-	I64Shl,
-	I64ShrS,
-	I64ShrU,
-	I64Eqz,
-	I64Eq,
-	I64Ne,
-	I64LtS,
-	I64LtU,
-	I64LeS,
-	I64LeU,
-	I64GtS,
-	I64GtU,
-	I64GeS,
-	I64GeU,
-	// Arithmetic — f32 / f64
-	F32Add,
-	F32Sub,
-	F32Mul,
-	F32Div,
-	F32Neg,
-	F32Sqrt,
-	F32Abs,
-	F32Floor,
-	F32Ceil,
-	F32Trunc,
-	F32Nearest,
-	F32Min,
-	F32Max,
-	F32Copysign,
-	F64Add,
-	F64Sub,
-	F64Mul,
-	F64Div,
-	F64Neg,
-	F64Sqrt,
-	F64Abs,
-	F64Floor,
-	F64Ceil,
-	F64Trunc,
-	F64Nearest,
-	F64Min,
-	F64Max,
-	F64Copysign,
-	F32Eq,
-	F32Ne,
-	F32Lt,
-	F32Le,
-	F32Gt,
-	F32Ge,
-	F64Eq,
-	F64Ne,
-	F64Lt,
-	F64Le,
-	F64Gt,
-	F64Ge,
+	// Operations, each typed by its operands
+	Unary(mir::UnaryOp, ScalarType),
+	Binary(mir::BinaryOp, ScalarType),
+	Compare(mir::CompareOp, ScalarType),
+	Convert {
+		op: mir::ConvertOp,
+		from: ScalarType,
+		to: ScalarType,
+	},
+	Load(mir::LoadAccess, MemArg),
+	Store(mir::StoreAccess, MemArg),
 	// Control flow
 	Block {
 		ty: BlockType,
@@ -221,47 +142,6 @@ pub enum Instruction {
 	MemoryIndex {
 		memory: mir::MemoryId,
 	},
-	// Pointer load/store
-	I32Load8S(MemArg),
-	I32Load8U(MemArg),
-	I32Load16S(MemArg),
-	I32Load16U(MemArg),
-	I32Load(MemArg),
-	I64Load(MemArg),
-	F32Load(MemArg),
-	F64Load(MemArg),
-	I32Store8(MemArg),
-	I32Store16(MemArg),
-	I32Store(MemArg),
-	I64Store(MemArg),
-	F32Store(MemArg),
-	F64Store(MemArg),
-	// Conversion
-	I64ExtendI32S,
-	I64ExtendI32U,
-	I32WrapI64,
-	F32ConvertI32S,
-	F32ConvertI32U,
-	F32ConvertI64S,
-	F32ConvertI64U,
-	F64ConvertI32S,
-	F64ConvertI32U,
-	F64ConvertI64S,
-	F64ConvertI64U,
-	I32TruncF32S,
-	I32TruncF32U,
-	I32TruncF64S,
-	I32TruncF64U,
-	I64TruncF32S,
-	I64TruncF32U,
-	I64TruncF64S,
-	I64TruncF64U,
-	F64PromoteF32,
-	F32DemoteF64,
-	I32ReinterpretF32,
-	F32ReinterpretI32,
-	I64ReinterpretF64,
-	F64ReinterpretI64,
 	// Nop (used as a placeholder)
 	Nop,
 	// Symbolic references — resolved to concrete i32.const values by the
@@ -289,6 +169,8 @@ pub enum Instruction {
 pub enum BlockType {
 	Empty,
 	Value(ScalarType),
+	/// Several results: the signature's, which has no parameters.
+	Results(mir::SignatureIndex),
 }
 
 // ── Local coalescing ──────────────────────────────────────────────────────────
@@ -515,7 +397,7 @@ pub fn peephole_local_tee(body: &mut Vec<Instruction>) {
 				}
 			}
 		}
-		out.push(body[i].clone());
+		out.push(body[i]);
 		i += 1;
 	}
 	*body = out;

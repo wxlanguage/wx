@@ -1,1188 +1,642 @@
-//! Sea-of-nodes SSA IR for per-function optimization.
+//! Optimize reached MIR function bodies through the structured graph.
 //!
-//! Pipeline position: `mir::Function` → [`builder`] → [`Function`] →
-//! [`scheduler`] → codegen
-//!
-//! # Structure
-//! - [`DataNode`] — a movable computation or the result of a control operation.
-//!   Only interchangeable computations are deduplicated (CSE).
-//! - [`ControlNode`] — an effectful/trapping operation or control-flow construct.
-//!   Placed sequentially inside [`Block`]s.
-//! - [`Block`] — a linear sequence of `ControlNode`s, one per MIR scope.
-//! - [`Function`] — the complete graph for one MIR function.
+//! `optimize_reachable` coordinates root discovery and per-function optimization.
+//! Each function's graph, uses, locations and placement expire after emission;
+//! reachability marks live through codegen while MIR item IDs remain stable.
 
-use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::ops::Range;
 
-pub mod builder;
-mod liveness;
-#[cfg(debug_assertions)]
-mod local_dominance;
-pub mod scheduler;
-
-// Disconnected from the module graph: `tests.rs` still calls the removed
-// `tir::TIR::build` and is kept on disk as a reference corpus for new tests.
-// #[cfg(test)]
-// mod tests;
+use hashbrown::HashTable;
+use rustc_hash::FxBuildHasher;
 
 use crate::index::index_newtype;
-use crate::mir;
-pub use crate::wasm::ScalarType;
+use crate::mir::{
+	BinaryOp, CompareOp, ConvertOp, FunctionId, GlobalId, LoadAccess,
+	LocalIndex, MemoryId, StaticEntryId, StoreAccess, UnaryOp,
+};
+use crate::wasm::ScalarType;
 
-pub type DataNodeIndex = u32;
-pub type BlockIndex = u32;
+mod build;
+mod dominators;
+mod emit;
+mod function;
+mod locations;
+mod placement;
+mod reachability;
+mod uses;
+#[cfg(test)]
+mod verify;
 
-/// Sign only matters for narrow loads: `i32.load8_s` vs `i32.load8_u`.
-/// Full-width loads and stores are always unsigned.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub enum MemAccess {
-	I8S,
-	I8U,
-	I16S,
-	I16U,
-	I32,
-	I64,
-	F32,
-	F64,
-}
-
-impl MemAccess {
-	pub fn load(access: mir::LoadAccess) -> Self {
-		match access {
-			mir::LoadAccess::I8S => Self::I8S,
-			mir::LoadAccess::I8U => Self::I8U,
-			mir::LoadAccess::I16S => Self::I16S,
-			mir::LoadAccess::I16U => Self::I16U,
-			mir::LoadAccess::I32 => Self::I32,
-			mir::LoadAccess::I64 => Self::I64,
-			mir::LoadAccess::F32 => Self::F32,
-			mir::LoadAccess::F64 => Self::F64,
-		}
-	}
-
-	/// A store's: a narrow store has no signedness, and the unsigned
-	/// access stands for its width.
-	pub fn store(access: mir::StoreAccess) -> Self {
-		match access {
-			mir::StoreAccess::I8 => Self::I8U,
-			mir::StoreAccess::I16 => Self::I16U,
-			mir::StoreAccess::I32 => Self::I32,
-			mir::StoreAccess::I64 => Self::I64,
-			mir::StoreAccess::F32 => Self::F32,
-			mir::StoreAccess::F64 => Self::F64,
-		}
-	}
-
-	pub fn scalar_type(self) -> ScalarType {
-		match self {
-			Self::I8S | Self::I8U | Self::I16S | Self::I16U | Self::I32 => {
-				ScalarType::I32
-			}
-			Self::I64 => ScalarType::I64,
-			Self::F32 => ScalarType::F32,
-			Self::F64 => ScalarType::F64,
-		}
-	}
-
-	/// Log2 of the natural alignment in bytes (WASM memarg encoding).
-	pub fn align_log2(self) -> u32 {
-		match self {
-			Self::I8S | Self::I8U => 0,
-			Self::I16S | Self::I16U => 1,
-			Self::I32 | Self::F32 => 2,
-			Self::I64 | Self::F64 => 3,
-		}
-	}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NodeType {
-	Scalar(ScalarType),
-	Aggregate(mir::SignatureIndex),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StackResult {
-	Value(DataNodeIndex),
-	Unit,
-	Never,
-}
-
-impl StackResult {
-	pub fn unwrap_value(self) -> DataNodeIndex {
-		match self {
-			StackResult::Value(idx) => idx,
-			r => panic!("expected Value, got {:?}", r),
-		}
-	}
-}
-
-/// Scalar operations whose possible trap is observable. They belong to control,
-/// not to the movable/CSE'd data graph. Integer operations have I32/I64 `ty`.
-#[derive(Clone, Copy)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub enum TrappingOp {
-	DivS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	DivU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	RemS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	RemU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	I32TruncF32 {
-		operand: DataNodeIndex,
-	},
-	U32TruncF32 {
-		operand: DataNodeIndex,
-	},
-	I32TruncF64 {
-		operand: DataNodeIndex,
-	},
-	U32TruncF64 {
-		operand: DataNodeIndex,
-	},
-	I64TruncF32 {
-		operand: DataNodeIndex,
-	},
-	U64TruncF32 {
-		operand: DataNodeIndex,
-	},
-	I64TruncF64 {
-		operand: DataNodeIndex,
-	},
-	U64TruncF64 {
-		operand: DataNodeIndex,
-	},
-}
-
-impl TrappingOp {
-	pub fn result_type(self) -> ScalarType {
-		match self {
-			Self::DivS { ty, .. }
-			| Self::DivU { ty, .. }
-			| Self::RemS { ty, .. }
-			| Self::RemU { ty, .. } => ty,
-			Self::I32TruncF32 { .. }
-			| Self::U32TruncF32 { .. }
-			| Self::I32TruncF64 { .. }
-			| Self::U32TruncF64 { .. } => ScalarType::I32,
-			Self::I64TruncF32 { .. }
-			| Self::U64TruncF32 { .. }
-			| Self::I64TruncF64 { .. }
-			| Self::U64TruncF64 { .. } => ScalarType::I64,
-		}
-	}
-
-	/// Read by liveness and scheduling at the operation's control position.
-	pub fn operands(self) -> impl Iterator<Item = DataNodeIndex> {
-		let (first, second) = match self {
-			Self::DivS { left, right, .. }
-			| Self::DivU { left, right, .. }
-			| Self::RemS { left, right, .. }
-			| Self::RemU { left, right, .. } => (left, Some(right)),
-			Self::I32TruncF32 { operand }
-			| Self::U32TruncF32 { operand }
-			| Self::I32TruncF64 { operand }
-			| Self::U32TruncF64 { operand }
-			| Self::I64TruncF32 { operand }
-			| Self::U64TruncF32 { operand }
-			| Self::I64TruncF64 { operand }
-			| Self::U64TruncF64 { operand } => (operand, None),
-		};
-		[Some(first), second].into_iter().flatten()
-	}
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub enum DataNodeKind {
-	// ── Constants ──────────────────────────────────────────────────────────
-	Int {
-		value: i64,
-		ty: ScalarType,
-	},
-	/// Float bits stored as u64 to allow hashing.
-	Float {
-		bits: u64,
-		ty: ScalarType,
-	},
-
-	// ── Inputs ─────────────────────────────────────────────────────────────
-	Param {
-		index: u32,
-		ty: ScalarType,
-	},
-	/// Value captured by one `ControlNode::GlobalGet`. Excluded from CSE.
-	GlobalGetResult {
-		ty: ScalarType,
-	},
-	/// Value produced by one `ControlNode::Trapping`, never CSE'd or recomputed.
-	TrappingResult {
-		ty: ScalarType,
-	},
-	/// Constant index into the WASM function table.
-	FunctionRef {
-		id: mir::FunctionId,
-	},
-	/// Pointer into the static data segment for a string or array constant.
-	/// `ty` is the pointer width of the memory holding the static data.
-	StaticDataRef {
-		entry: mir::StaticEntryId,
-		offset: u32,
-		ty: ScalarType,
-	},
-	/// The address right after the memory's static data
-	/// (`ExprKind::DataEnd`). `ty` is the memory's pointer width.
-	DataEnd {
-		memory: mir::MemoryId,
-		ty: ScalarType,
-	},
-	/// WASM linear-memory index as an integer constant, resolved at codegen.
-	MemoryIndex {
-		memory: mir::MemoryId,
-	},
-	/// Result of a `MemorySize` control node. Excluded from CSE; always
-	/// spilled. `ty` is the memory's size type (I64 for Memory64).
-	MemorySizeResult {
-		memory: mir::MemoryId,
-		ty: ScalarType,
-	},
-
-	// ── Arithmetic ─────────────────────────────────────────────────────────
-	Add {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Sub {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Mul {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	/// Non-trapping floating-point division. Integer division is control.
-	Div {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Min {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Max {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Copysign {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-
-	// ── Bitwise ────────────────────────────────────────────────────────────
-	BitAnd {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	BitOr {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	BitXor {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Shl {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	ShrS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	ShrU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-
-	// ── Unary ──────────────────────────────────────────────────────────────
-	Neg {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Sqrt {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Abs {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Floor {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Ceil {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Trunc {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	Nearest {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	BitNot {
-		operand: DataNodeIndex,
-		ty: ScalarType,
-	},
-	/// `i32.eqz` — produces I32.
-	Eqz {
-		operand: DataNodeIndex,
-	},
-	/// `i64.extend_i32_s` — sign-extends I32 to I64.
-	I64ExtendI32S {
-		operand: DataNodeIndex,
-	},
-	/// `i64.extend_i32_u` — zero-extends I32 to I64.
-	I64ExtendI32U {
-		operand: DataNodeIndex,
-	},
-	/// `i32.wrap_i64` — truncates I64 to I32.
-	I32WrapI64 {
-		operand: DataNodeIndex,
-	},
-	F32ConvertI32 {
-		operand: DataNodeIndex,
-	},
-	F32ConvertU32 {
-		operand: DataNodeIndex,
-	},
-	F32ConvertI64 {
-		operand: DataNodeIndex,
-	},
-	F32ConvertU64 {
-		operand: DataNodeIndex,
-	},
-	F64ConvertI32 {
-		operand: DataNodeIndex,
-	},
-	F64ConvertU32 {
-		operand: DataNodeIndex,
-	},
-	F64ConvertI64 {
-		operand: DataNodeIndex,
-	},
-	F64ConvertU64 {
-		operand: DataNodeIndex,
-	},
-	F64PromoteF32 {
-		operand: DataNodeIndex,
-	},
-	F32DemoteF64 {
-		operand: DataNodeIndex,
-	},
-	I32ReinterpretF32 {
-		operand: DataNodeIndex,
-	},
-	F32ReinterpretI32 {
-		operand: DataNodeIndex,
-	},
-	I64ReinterpretF64 {
-		operand: DataNodeIndex,
-	},
-	F64ReinterpretI64 {
-		operand: DataNodeIndex,
-	},
-
-	// ── Comparisons (always produce I32 / WASM bool) ───────────────────────
-	Eq {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	NotEq {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	LtS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	LtU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	LtEqS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	LtEqU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	GtS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	GtU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	GtEqS {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-	GtEqU {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-
-	// ── Aggregates (structs as SSA values) ─────────────────────────────────
-	Aggregate {
-		/// One scalar node per slot. No nested packs or zero-sized markers.
-		values: Box<[DataNodeIndex]>,
-		aggregate_index: mir::SignatureIndex,
-	},
-	/// Projects a single WASM value out of an aggregate.
-	///
-	/// Indexed by [`mir::ScalarIndex`], *not* by declaration field: a nested
-	/// field spans several scalars and a zero-sized field spans none, so a
-	/// field index would not name a value at all. This is why `ty` can be a
-	/// `ScalarType` — a scalar index always names exactly one WASM value.
-	/// To project a whole nested field, build one of these per scalar in the
-	/// field's range and rewrap them (see `Builder::get_aggregate_field`).
-	///
-	/// Folds immediately when `aggregate` is a known `Aggregate` node.
-	AggregateGet {
-		aggregate: DataNodeIndex,
-		scalar: mir::ScalarIndex,
-		ty: ScalarType,
-	},
-
-	// ── Control-flow joins ─────────────────────────────────────────────────
-	/// Merge two scalar values at a branch join point.
-	/// Aggregate phis are decomposed field-by-field by the builder.
-	Phi {
-		left: DataNodeIndex,
-		right: DataNodeIndex,
-		ty: ScalarType,
-	},
-
-	/// A scalar value that flows around a loop. `after` starts as `before` and
-	/// is patched once the loop body is built (see
-	/// `Function::patch_loop_param`).
-	LoopParam {
-		block_index: BlockIndex,
-		before: DataNodeIndex,
-		after: DataNodeIndex,
-		ty: ScalarType,
-	},
-
-	/// A stable value written by exits of a breakable block/loop. Used for
-	/// result slots and for a plain block's carried bindings. No before/after
-	/// split: every exit writes its own contribution to the same identity,
-	/// and only consumers past the target read it. It is never substituted
-	/// into the body's live bindings (unlike a loop's `LoopParam`).
-	JoinParam {
-		block_index: BlockIndex,
-		ty: ScalarType,
-	},
-
-	// ── Call / memory results (excluded from CSE: side effects) ────────────
-	CallResult {
-		callee: DataNodeIndex,
-		args: Box<[DataNodeIndex]>,
-		ty: ScalarType,
-	},
-	/// Unlike `Aggregate`, has no concrete field sub-nodes — values come from
-	/// the WASM multi-return stack. `AggregateGet` of this node does not fold.
-	AggregateCallResult {
-		aggregate_index: mir::SignatureIndex,
-	},
-	MemoryGrowResult {
-		memory: mir::MemoryId,
-		delta: DataNodeIndex,
-		ty: ScalarType,
-	},
-	/// Value produced by a `ControlNode::PointerLoad`. Always spilled.
-	PointerLoadResult {
-		address: DataNodeIndex,
-		access: MemAccess,
-	},
-}
-
-impl DataNodeKind {
-	pub fn node_type(&self) -> NodeType {
-		match self {
-			DataNodeKind::Int { ty, .. }
-			| DataNodeKind::Param { ty, .. }
-			| DataNodeKind::Add { ty, .. }
-			| DataNodeKind::Sub { ty, .. }
-			| DataNodeKind::Mul { ty, .. }
-			| DataNodeKind::Div { ty, .. }
-			| DataNodeKind::Min { ty, .. }
-			| DataNodeKind::Max { ty, .. }
-			| DataNodeKind::Copysign { ty, .. }
-			| DataNodeKind::BitAnd { ty, .. }
-			| DataNodeKind::BitOr { ty, .. }
-			| DataNodeKind::BitXor { ty, .. }
-			| DataNodeKind::Shl { ty, .. }
-			| DataNodeKind::ShrS { ty, .. }
-			| DataNodeKind::ShrU { ty, .. }
-			| DataNodeKind::Neg { ty, .. }
-			| DataNodeKind::Sqrt { ty, .. }
-			| DataNodeKind::Abs { ty, .. }
-			| DataNodeKind::Floor { ty, .. }
-			| DataNodeKind::Ceil { ty, .. }
-			| DataNodeKind::Trunc { ty, .. }
-			| DataNodeKind::Nearest { ty, .. }
-			| DataNodeKind::BitNot { ty, .. }
-			| DataNodeKind::AggregateGet { ty, .. }
-			| DataNodeKind::Phi { ty, .. }
-			| DataNodeKind::LoopParam { ty, .. }
-			| DataNodeKind::JoinParam { ty, .. }
-			| DataNodeKind::CallResult { ty, .. }
-			| DataNodeKind::TrappingResult { ty }
-			| DataNodeKind::Float { ty, .. } => NodeType::Scalar(*ty),
-
-			DataNodeKind::Eqz { .. }
-			| DataNodeKind::Eq { .. }
-			| DataNodeKind::NotEq { .. }
-			| DataNodeKind::LtS { .. }
-			| DataNodeKind::LtU { .. }
-			| DataNodeKind::LtEqS { .. }
-			| DataNodeKind::LtEqU { .. }
-			| DataNodeKind::GtS { .. }
-			| DataNodeKind::GtU { .. }
-			| DataNodeKind::GtEqS { .. }
-			| DataNodeKind::GtEqU { .. }
-			| DataNodeKind::FunctionRef { .. }
-			| DataNodeKind::MemoryIndex { .. }
-			| DataNodeKind::I32WrapI64 { .. }
-			| DataNodeKind::I32ReinterpretF32 { .. } => {
-				NodeType::Scalar(ScalarType::I32)
-			}
-			DataNodeKind::I64ExtendI32S { .. }
-			| DataNodeKind::I64ExtendI32U { .. }
-			| DataNodeKind::I64ReinterpretF64 { .. } => {
-				NodeType::Scalar(ScalarType::I64)
-			}
-			DataNodeKind::F32ConvertI32 { .. }
-			| DataNodeKind::F32ConvertU32 { .. }
-			| DataNodeKind::F32ConvertI64 { .. }
-			| DataNodeKind::F32ConvertU64 { .. }
-			| DataNodeKind::F32DemoteF64 { .. }
-			| DataNodeKind::F32ReinterpretI32 { .. } => {
-				NodeType::Scalar(ScalarType::F32)
-			}
-			DataNodeKind::F64ConvertI32 { .. }
-			| DataNodeKind::F64ConvertU32 { .. }
-			| DataNodeKind::F64ConvertI64 { .. }
-			| DataNodeKind::F64ConvertU64 { .. }
-			| DataNodeKind::F64PromoteF32 { .. }
-			| DataNodeKind::F64ReinterpretI64 { .. } => {
-				NodeType::Scalar(ScalarType::F64)
-			}
-			DataNodeKind::GlobalGetResult { ty }
-			| DataNodeKind::StaticDataRef { ty, .. }
-			| DataNodeKind::DataEnd { ty, .. }
-			| DataNodeKind::MemorySizeResult { ty, .. }
-			| DataNodeKind::MemoryGrowResult { ty, .. } => NodeType::Scalar(*ty),
-
-			DataNodeKind::PointerLoadResult { access, .. } => {
-				NodeType::Scalar(access.scalar_type())
-			}
-
-			DataNodeKind::Aggregate {
-				aggregate_index, ..
-			}
-			| DataNodeKind::AggregateCallResult { aggregate_index } => {
-				NodeType::Aggregate(*aggregate_index)
-			}
-		}
-	}
-
-	pub fn unwrap_scalar(&self) -> ScalarType {
-		match self.node_type() {
-			NodeType::Scalar(s) => s,
-			NodeType::Aggregate(_) => {
-				panic!("expected scalar node type, got aggregate")
-			}
-		}
-	}
-
-	/// Returns true when two nodes with the same inputs are guaranteed to
-	/// produce the same value and can be deduplicated. Impure nodes (reads of
-	/// mutable state, call results, memory ops) and LoopParams (mutated after
-	/// creation) are not pure and each represent a distinct value. Phi is not
-	/// pure either: its value is control-dependent on the specific join point
-	/// that produced it (which predecessor branch is live), so two Phis with
-	/// identical `(left, right, ty)` from *unrelated* branches are not
-	/// interchangeable even though they look structurally equal — CSE-ing
-	/// them would silently make one join's value leak into the other's. A
-	/// `Phi{left, right}` with `left == right` is still simplified away, but
-	/// that happens in `Builder::node` before nodes ever reach `intern_node`,
-	/// so excluding `Phi` here only removes the unsound cross-join dedup.
-	fn is_pure(&self) -> bool {
-		match self {
-			DataNodeKind::GlobalGetResult { .. }
-			| DataNodeKind::TrappingResult { .. }
-			| DataNodeKind::MemorySizeResult { .. }
-			| DataNodeKind::CallResult { .. }
-			| DataNodeKind::AggregateCallResult { .. }
-			| DataNodeKind::MemoryGrowResult { .. }
-			| DataNodeKind::PointerLoadResult { .. }
-			| DataNodeKind::LoopParam { .. }
-			| DataNodeKind::JoinParam { .. }
-			| DataNodeKind::Phi { .. } => false,
-			_ => true,
-		}
-	}
-}
-
-pub struct DataNode {
-	pub kind: DataNodeKind,
-	pub uses: Vec<DataNodeIndex>,
-}
-
-pub enum ControlNode {
-	/// Runs at this control position even if its result is unused. Consumers
-	/// read `result`; they never reschedule the operation itself.
-	Trapping {
-		op: TrappingOp,
-		result: DataNodeIndex,
-	},
-	/// Capture the global at this point, before any subsequent write/call.
-	GlobalGet {
-		id: mir::GlobalId,
-		result: DataNodeIndex,
-	},
-	Return {
-		value: StackResult,
-	},
-	GlobalSet {
-		id: mir::GlobalId,
-		value: DataNodeIndex,
-	},
-	Call {
-		callee: DataNodeIndex,
-		args: Box<[DataNodeIndex]>,
-		result: StackResult,
-		/// MIR signature index for this call; used by the scheduler to emit
-		/// `CallIndirectSym` when the callee is not a statically known
-		/// `FunctionRef`.
-		callee_sig: mir::SignatureIndex,
-	},
-	IfElse {
-		condition: DataNodeIndex,
-		then_block: BlockIndex,
-		else_block: Option<BlockIndex>,
-		/// Phi nodes produced at the join point (one per differing binding).
-		/// An aggregate binding contributes one phi per differing *scalar*
-		/// (`mir::ScalarTable`), not per field — a nested field spans several
-		/// scalars and a zero-sized field spans none.
-		outputs: Box<[DataNodeIndex]>,
-		result: StackResult,
-	},
-	/// A `match`, kept as a genuine N-way branch rather than desugared to
-	/// nested `IfElse` — the scheduler picks a WASM `br_table` (dense case
-	/// values) or a `br_if` chain (sparse) based on the case set.
-	Switch {
-		selector: DataNodeIndex,
-		cases: Box<[SwitchCase]>,
-		/// The wildcard arm, if the source had one (absent only when TIR
-		/// proved exhaustiveness by covering every enum variant).
-		default: Option<SwitchCase>,
-		/// Merged (Phi) nodes, one per divergent binding across arms, plus —
-		/// if the arms' own result values differ — one more for the overall
-		/// match result. Same role as `IfElse.outputs`, but folded N-way.
-		outputs: Box<[DataNodeIndex]>,
-		result: StackResult,
-	},
-	Loop {
-		body: BlockIndex,
-		/// LoopParam nodes for bindings that change across the loop.
-		/// An aggregate binding contributes one loop-param per *scalar*
-		/// (`mir::ScalarTable`), not per field — a nested field spans several
-		/// scalars and a zero-sized field spans none. Reading this as
-		/// "per field" is what made a nested aggregate crossing a loop
-		/// unrepresentable.
-		outputs: Box<[DataNodeIndex]>,
-		result: StackResult,
-	},
-	/// A plain `{}` block that's an actual `break` target — the block-join
-	/// analogue of `Loop`, minus everything that exists only to solve the
-	/// loop back-edge problem. See `DataNodeKind::JoinParam`'s doc comment.
-	BlockJoin {
-		body: BlockIndex,
-		/// Same role as `Loop::outputs`, but these are `JoinParam` nodes —
-		/// no back-edge, so no before/after two-phase commit.
-		outputs: Box<[DataNodeIndex]>,
-		/// The fallthrough path's own commit pairs — same shape/role as
-		/// `Break::carried_binding_updates`, but there is no `ControlNode`
-		/// to attach it to (falling off the end of a block isn't itself a
-		/// control node), so it lives here instead.
-		fallthrough_updates: Box<[(DataNodeIndex, DataNodeIndex)]>,
-		/// The fallthrough's raw tail value, stored into the target's result
-		/// slots before carried-binding updates. Distinct from `result`,
-		/// which names those joined slots. Like `Break::value`, this is
-		/// required even for a single exit; fallthrough has no control node
-		/// of its own, so it lives here alongside `fallthrough_updates`.
-		fallthrough_value: StackResult,
-		result: StackResult,
-	},
-	Break {
-		target: BlockIndex,
-		value: StackResult,
-		/// `(carried_node, current_value_node)` pairs, decomposed to
-		/// scalars — the target's own carried bindings (a loop's
-		/// `JoinData::entry_placeholders`) as of this exact break site.
-		/// The target's normal "commit
-		/// accumulated bindings, then branch back/fall through" tail code
-		/// only runs on the ordinary path (a loop's back-edge, or a block's
-		/// own fallthrough); an early exit bypasses it entirely, so every
-		/// `break`/`continue` site must independently commit whatever its
-		/// own current values are — mirroring how `break_result_outputs`
-		/// already does this for the trailing *value* specifically.
-		carried_binding_updates: Box<[(DataNodeIndex, DataNodeIndex)]>,
-	},
-	Continue {
-		target: BlockIndex,
-		/// See `Break::carried_binding_updates`. Always targets a loop — TIR
-		/// guarantees a `continue` can never target a plain block (see
-		/// `tir::builder::control::build_continue_expression`).
-		carried_binding_updates: Box<[(DataNodeIndex, DataNodeIndex)]>,
-	},
-	Unreachable,
-	MemorySize {
-		memory: mir::MemoryId,
-		result: DataNodeIndex,
-	},
-	MemoryGrow {
-		memory: mir::MemoryId,
-		delta: DataNodeIndex,
-		result: DataNodeIndex,
-	},
-	MemoryFill {
-		memory: mir::MemoryId,
-		dst: DataNodeIndex,
-		val: DataNodeIndex,
-		len: DataNodeIndex,
-	},
-	MemoryCopy {
-		dst_memory: mir::MemoryId,
-		src_memory: mir::MemoryId,
-		dst: DataNodeIndex,
-		src: DataNodeIndex,
-		len: DataNodeIndex,
-	},
-	PointerLoad {
-		address: DataNodeIndex,
-		/// Byte offset added to `address` at the WASM instruction level (memarg).
-		offset: u32,
-		result: DataNodeIndex,
-		memory: mir::MemoryId,
-		access: MemAccess,
-	},
-	PointerStore {
-		address: DataNodeIndex,
-		/// Byte offset added to `address` at the WASM instruction level (memarg).
-		offset: u32,
-		value: DataNodeIndex,
-		memory: mir::MemoryId,
-		access: MemAccess,
-	},
-}
+pub use build::build;
+pub use dominators::Dominators;
+pub use emit::emit;
+#[cfg(test)]
+pub(crate) use emit::emit_for_tests;
+pub use function::optimize_function;
+pub use locations::{JoinLocation, Location, Locations};
+pub use placement::{Placement, PlacementError, ValuePlacement};
+pub use reachability::{Reachability, optimize_reachable};
+pub use uses::{UseSite, Uses};
 
 index_newtype!(
-	/// Index into `Function::joins`, not the block table.
-	JoinIndex
+	/// A value.
+	NodeId
+);
+index_newtype!(
+	/// A statement, pinned in program order.
+	EffectId
+);
+index_newtype!(
+	/// A block, a loop's body, an arm, a case, or the function's body.
+	RegionId
+);
+index_newtype!(
+	/// Where values from several edges meet.
+	JoinId
 );
 
-/// A block's shape — mirrors the same `Block`/`Loop` distinction TIR and MIR
-/// already carry per scope (`tir::BlockKind`, `mir::BlockScope::kind`), kept
-/// as opt's own type rather than reused directly since opt's `kind` also
-/// covers synthetic blocks with no MIR scope at all (see
-/// `Builder::push_synthetic_block`). Every `Block` has one, independent of
-/// whether it's an actual break target (`Block::join`) — an ordinary
-/// if/else or switch-arm body is `Block`-shaped without ever being a join.
+/// `len` entries of a column from `start`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub enum BlockKind {
-	Block,
-	Loop,
+#[cfg_attr(test, derive(Debug))]
+pub struct Run {
+	start: u32,
+	len: u32,
 }
 
-pub struct Block {
-	pub parent: Option<BlockIndex>,
-	pub statements: Vec<ControlNode>,
-	/// Exit value. Overwritten as the block is built; the final value is
-	/// what callers (e.g. `IfElse`/`Switch` arm handling) read back. For
-	/// loop blocks, overwritten with `body_fallthrough` after `build_loop`
-	/// finishes building the body — the pre-overwrite value (accumulated
-	/// from every `break <value>` inside) is saved into
-	/// `ControlNode::Loop.result` before this happens.
-	pub result: StackResult,
-	pub kind: BlockKind,
-	/// `Some` only for a block that's an actual break target — every loop
-	/// body (see `build_loop`), or a plain `{}` block something breaks to
-	/// (see `Builder::break_targets`) — indexing into `Function::joins`.
-	/// Most blocks (ordinary if/else/switch arm bodies) are neither, hence
-	/// `Option` rather than an always-present field. `kind == Loop` always
-	/// implies `Some` (`build_loop` registers both together); `kind ==
-	/// Block` may be either, depending on `Builder::break_targets`.
-	pub join: Option<JoinIndex>,
-}
+impl Run {
+	pub const EMPTY: Self = Self { start: 0, len: 0 };
 
-impl Block {
-	pub fn is_loop(&self) -> bool {
-		matches!(self.kind, BlockKind::Loop)
+	fn of(start: usize, end: usize) -> Self {
+		Self {
+			start: u32::try_from(start).unwrap(),
+			len: u32::try_from(end - start).unwrap(),
+		}
 	}
 
-	pub fn is_block_join(&self) -> bool {
-		self.join.is_some() && matches!(self.kind, BlockKind::Block)
+	pub fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub fn is_empty(self) -> bool {
+		self.len == 0
+	}
+
+	fn range(self) -> Range<usize> {
+		self.start as usize..(self.start + self.len) as usize
 	}
 }
 
-/// Per-join-target extra data for a block that's an actual `break` target —
-/// shared storage shape for both a loop body and a plain `{}` block's
-/// block-join, distinguished by `Block::kind`. Holds
-/// exactly what both forms need identically; the one thing that isn't
-/// identical (a loop's back-edge before/after split) lives on the
-/// `LoopParam`/`JoinParam` `DataNodeKind` variants instead, not here — see
-/// `DataNodeKind::JoinParam`'s doc comment.
-pub struct JoinData {
-	/// JoinParam result slots for every value-producing exit — every
-	/// `break <value>` targeting this block, plus (for a block-join only;
-	/// a loop's own "fallthrough" is its back-edge, already covered by
-	/// `entry_placeholders`) the block's own fallthrough tail value.
-	/// Scheduler pre-allocates WASM locals for these; each exit stores into
-	/// them before committing carried bindings and branching. These slots
-	/// exist even for a single exit; empty only for Unit/Never results.
-	pub break_result_outputs: Vec<DataNodeIndex>,
-	/// This target's own per-slot carried-binding placeholders — a loop's
-	/// `LoopParam`s (`Builder::create_loop_params`) or a block-join's
-	/// `JoinParam`s (`Builder::create_join_params`) — one entry per
-	/// function-wide local, `Some` only where that local already had a
-	/// value at entry (`None` means "not yet declared on this build path,"
-	/// e.g. a temp only declared inside the body itself; see
-	/// `Builder::read_binding`'s doc comment). Kept around so a nested
-	/// `break`/`continue` — however deep inside the body — can look up
-	/// which placeholder node corresponds to which binding slot; see
-	/// `ControlNode::Break::carried_binding_updates`.
-	pub entry_placeholders: Vec<Option<StackResult>>,
-	/// Scalar-level placeholder nodes any exit (a `break`/`continue` inside
-	/// the body, or — for a block-join — the fallthrough) has ever recorded
-	/// a genuine commit for (see `Builder::carried_binding_updates`),
-	/// independent of what the fallthrough/back-edge path alone would
-	/// conclude. Unioned into `patch_loop_binding`'s/
-	/// `finalize_block_join_binding`'s divergence decision so a binding
-	/// some exit mutates — but the ordinary path never touches, or resets
-	/// back to the same value — still gets a real output local. A plain
-	/// `Vec` (not a `HashSet`): carried bindings are typically few enough
-	/// that a linear `.contains()` check is cheaper than hashing.
-	pub divergent_params: Vec<DataNodeIndex>,
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(test, derive(Debug))]
+pub enum NodeKind {
+	Int(i64),
+	/// The scalar's bits, so that it hashes. F32 uses the low 32 bits;
+	/// F64 uses all 64 bits.
+	Float(u64),
+	Param(u32),
+	Unary(UnaryOp, NodeId),
+	Binary(BinaryOp, NodeId, NodeId),
+	Compare(CompareOp, NodeId, NodeId),
+	Convert(ConvertOp, NodeId),
+	DataEnd(MemoryId),
+	MemoryIndex(MemoryId),
+	StaticPointer {
+		entry: StaticEntryId,
+		offset: u32,
+	},
+	/// Column `column` of `join`, where its rows disagree.
+	Phi {
+		join: JoinId,
+		column: u32,
+	},
+	/// Result `index` of an effect.
+	Result {
+		effect: EffectId,
+		index: u32,
+	},
 }
 
-/// One `match` arm, lowered. `own_values` is required because `DataNodeKind::Phi`
-/// is strictly binary (`left`/`right`, positionally keyed by convention) — an
-/// N-ary join can't recover "this specific arm's contribution" the way
-/// `IfElse`'s `emit_phi_stores_for_branch` reads `left`/`right` structurally,
-/// so each case carries its own per-slot values explicitly.
-pub struct SwitchCase {
-	/// `None` only for the default/wildcard arm.
-	pub discriminant: Option<i64>,
-	pub block: BlockIndex,
-	/// This case's own value for each of `Switch.outputs`, same length/order
-	/// as `outputs`. `StackResult::Never` means this arm's body diverges
-	/// before reaching the join, so the scheduler emits no store for it.
-	pub own_values: Box<[StackResult]>,
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+pub enum Effect {
+	Call {
+		function: FunctionId,
+		args: Run,
+	},
+	Load {
+		address: NodeId,
+		offset: u32,
+		memory: MemoryId,
+		access: LoadAccess,
+	},
+	Store {
+		address: NodeId,
+		value: NodeId,
+		offset: u32,
+		memory: MemoryId,
+		access: StoreAccess,
+	},
+	/// An operation that can trap: it runs where it is written.
+	Trapping(TrappingOp),
+	GlobalGet(GlobalId),
+	GlobalSet(GlobalId, NodeId),
+	MemorySize(MemoryId),
+	MemoryGrow(MemoryId, NodeId),
+	MemoryFill {
+		memory: MemoryId,
+		dst: NodeId,
+		value: NodeId,
+		len: NodeId,
+	},
+	MemoryCopy {
+		dst_memory: MemoryId,
+		src_memory: MemoryId,
+		dst: NodeId,
+		src: NodeId,
+		len: NodeId,
+	},
+	/// A nested block, loop, `if` or switch.
+	Region(RegionId),
+	/// Control moves to `join`, giving its row `row`: a `break`, a
+	/// `continue`, or a region's end where it falls through to its join.
+	Branch {
+		join: JoinId,
+		row: u32,
+	},
+	Return {
+		values: Run,
+	},
+	Unreachable,
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+pub enum TrappingOp {
+	Binary(BinaryOp, NodeId, NodeId),
+	Convert(ConvertOp, NodeId),
+}
+
+pub struct Region {
+	kind: RegionKind,
+	/// Into `Function::sequence`.
+	effects: Run,
+}
+
+#[derive(Clone, Copy)]
+pub enum RegionKind {
+	/// A block: its breaks and its end reach `exit`.
+	Block { exit: JoinId },
+	/// A loop: its `continue`s and its end reach `header`, whose row 0 is
+	/// the entry; its breaks reach `exit`.
+	Loop { header: JoinId, exit: JoinId },
+	/// Two arms, each a region, joined at `exit`. Without an `else` in MIR,
+	/// `otherwise` only reaches `exit`.
+	If {
+		condition: NodeId,
+		then: RegionId,
+		otherwise: RegionId,
+		exit: JoinId,
+	},
+	/// Each case an arm; `default` is absent where the cases are
+	/// exhaustive.
+	Switch {
+		selector: NodeId,
+		cases: Run,
+		default: Option<RegionId>,
+		exit: JoinId,
+	},
+	/// An arm, a case, or the function's body: statements, no join.
+	Arm,
+}
+
+#[derive(Clone, Copy)]
+pub struct Case {
+	pub value: i64,
+	pub region: RegionId,
+}
+
+pub struct Join {
+	/// Into `Function::columns`.
+	columns: Run,
+	/// Where its rows start in `Function::rows`, row-major,
+	/// `columns.len` wide.
+	rows: u32,
+	edges: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
+pub enum Column {
+	/// A local the construct writes.
+	Local(LocalIndex),
+	/// Scalar `i` of the construct's value.
+	Result(u32),
 }
 
 pub struct Function {
-	pub id: mir::FunctionId,
-	pub data_nodes: Vec<DataNode>,
-	/// One slot per MIR scope (indexed by scope index). `None` until the scope
-	/// is built.
-	pub blocks: Vec<Option<Block>>,
-	/// Per-join-target extra data, indexed by `Block::join`'s `JoinIndex` —
-	/// shared by both loop bodies and block-joins; see `JoinData`'s doc
-	/// comment.
-	pub joins: Vec<JoinData>,
-	/// CSE map: `DataNodeKind` → existing `DataNodeIndex`. Impure nodes excluded.
-	data_lookup: HashMap<DataNodeKind, DataNodeIndex>,
+	kinds: Vec<NodeKind>,
+	types: Vec<ScalarType>,
+	/// Indexed by node: itself, or a loop placeholder's replacement.
+	/// Replacements can form chains; `resolve` follows them to the final node.
+	node_replacements: Vec<NodeId>,
+	/// Construction lookup for identical `(kind, type)` pairs, storing IDs only.
+	interned_nodes: HashTable<NodeId>,
+	/// Hashes node keys for `interned_nodes`.
+	node_hasher: FxBuildHasher,
+	/// Runs of the effects' operands.
+	operands: Vec<NodeId>,
+
+	effects: Vec<Effect>,
+	/// Every region's statements, each region's a run.
+	sequence: Vec<EffectId>,
+	regions: Vec<Region>,
+	cases: Vec<Case>,
+	root: RegionId,
+
+	joins: Vec<Join>,
+	columns: Vec<Column>,
+	rows: Vec<NodeId>,
 }
 
 impl Function {
-	pub fn new(id: mir::FunctionId, scope_count: usize) -> Self {
-		Function {
-			id,
-			data_nodes: Vec::new(),
-			blocks: (0..scope_count).map(|_| None).collect(),
+	fn new() -> Self {
+		Self {
+			kinds: Vec::new(),
+			types: Vec::new(),
+			node_replacements: Vec::new(),
+			interned_nodes: HashTable::new(),
+			node_hasher: FxBuildHasher,
+			operands: Vec::new(),
+			effects: Vec::new(),
+			sequence: Vec::new(),
+			regions: Vec::new(),
+			cases: Vec::new(),
+			root: RegionId::new(0),
 			joins: Vec::new(),
-			data_lookup: HashMap::new(),
+			columns: Vec::new(),
+			rows: Vec::new(),
 		}
 	}
 
-	/// Registers a new join target's `JoinData` and returns its `JoinIndex`.
-	pub fn push_join_data(&mut self, data: JoinData) -> JoinIndex {
-		let idx = JoinIndex::new(self.joins.len() as u32);
-		self.joins.push(data);
-		idx
+	/// The node `kind` of type `ty`: an equal one if there is one.
+	fn node(&mut self, kind: NodeKind, ty: ScalarType) -> NodeId {
+		let hash = self.node_hasher.hash_one((kind, ty));
+		let Self {
+			kinds,
+			types,
+			interned_nodes,
+			..
+		} = self;
+		if let Some(&node) = interned_nodes.find(hash, |&node| {
+			kinds[usize::from(node)] == kind && types[usize::from(node)] == ty
+		}) {
+			return node;
+		}
+		let node = self.push(kind, ty);
+		let Self {
+			kinds,
+			types,
+			interned_nodes,
+			node_hasher,
+			..
+		} = self;
+		interned_nodes.insert_unique(hash, node, |&node| {
+			let index = usize::from(node);
+			node_hasher.hash_one((kinds[index], types[index]))
+		});
+		node
 	}
 
-	/// The `JoinData` for a loop or block-join target. Panics if `block_idx`
-	/// is neither.
-	pub fn join_data(&self, block_idx: BlockIndex) -> &JoinData {
-		let idx = self.blocks[block_idx as usize]
-			.as_ref()
-			.unwrap()
-			.join
-			.expect("join_data called on a block with no join entry");
-		&self.joins[usize::from(idx)]
+	/// A node no other equals: a phi, an effect's result.
+	fn push(&mut self, kind: NodeKind, ty: ScalarType) -> NodeId {
+		let node = NodeId::new(u32::try_from(self.kinds.len()).unwrap());
+		self.kinds.push(kind);
+		self.types.push(ty);
+		self.node_replacements.push(node);
+		node
 	}
 
-	/// Mutable counterpart of `join_data`.
-	pub fn join_data_mut(&mut self, block_idx: BlockIndex) -> &mut JoinData {
-		let idx = self.blocks[block_idx as usize]
-			.as_ref()
-			.unwrap()
-			.join
-			.expect("join_data_mut called on a block with no join entry");
-		&mut self.joins[usize::from(idx)]
+	fn push_operands(&mut self, values: &[NodeId]) -> Run {
+		let start = self.operands.len();
+		self.operands.extend_from_slice(values);
+		Run::of(start, self.operands.len())
 	}
 
-	/// Get or create a data node via CSE only. Does not apply any algebraic
-	/// simplification — call `Builder::node` for that.
-	pub fn intern_node(&mut self, kind: DataNodeKind) -> DataNodeIndex {
-		if kind.is_pure() {
-			if let Some(&id) = self.data_lookup.get(&kind) {
-				return id;
+	pub fn kind(&self, node: NodeId) -> NodeKind {
+		self.kinds[usize::from(node)]
+	}
+
+	pub fn ty(&self, node: NodeId) -> ScalarType {
+		self.types[usize::from(node)]
+	}
+
+	/// What `node` stands for: itself, or a resolved loop placeholder's
+	/// value.
+	pub fn resolve(&self, mut node: NodeId) -> NodeId {
+		loop {
+			let next = self.node_replacements[usize::from(node)];
+			if next == node {
+				return node;
+			}
+			node = next;
+		}
+	}
+
+	pub fn width(&self, join: JoinId) -> usize {
+		self.joins[usize::from(join)].columns.len()
+	}
+
+	pub fn edges(&self, join: JoinId) -> u32 {
+		self.joins[usize::from(join)].edges
+	}
+
+	pub fn columns(&self, join: JoinId) -> &[Column] {
+		&self.columns[self.joins[usize::from(join)].columns.range()]
+	}
+
+	/// Row `row` of `join`, unresolved.
+	pub fn row(&self, join: JoinId, row: u32) -> &[NodeId] {
+		let width = self.width(join);
+		let start =
+			self.joins[usize::from(join)].rows as usize + row as usize * width;
+		&self.rows[start..start + width]
+	}
+
+	/// Resolved input occurrences and their read sites. Phi inputs are read
+	/// on incoming rows, rather than at the merge itself.
+	pub fn inputs(&self, node: NodeId, mut f: impl FnMut(NodeId, UseSite)) {
+		let node = self.resolve(node);
+		let mut input = |value| f(self.resolve(value), UseSite::Node(node));
+		match self.kind(node) {
+			NodeKind::Int(_)
+			| NodeKind::Float(_)
+			| NodeKind::Param(_)
+			| NodeKind::DataEnd(_)
+			| NodeKind::MemoryIndex(_)
+			| NodeKind::StaticPointer { .. }
+			| NodeKind::Result { .. } => {}
+			NodeKind::Unary(_, value) | NodeKind::Convert(_, value) => {
+				input(value)
+			}
+			NodeKind::Binary(_, lhs, rhs) | NodeKind::Compare(_, lhs, rhs) => {
+				input(lhs);
+				input(rhs);
+			}
+			NodeKind::Phi { join, column } => {
+				for row in 0..self.edges(join) {
+					f(
+						self.resolve(self.row(join, row)[column as usize]),
+						UseSite::Row { join, row },
+					);
+				}
 			}
 		}
+	}
 
-		let id = self.data_nodes.len() as DataNodeIndex;
-		self.register_uses(&kind, id);
-
-		if kind.is_pure() {
-			self.data_lookup.insert(kind.clone(), id);
+	/// An effect's operands, resolved. A branch has none: its row is read
+	/// by the join's phis, not by the branch.
+	pub fn operands(&self, effect: EffectId, mut f: impl FnMut(NodeId)) {
+		let mut operand = |node| f(self.resolve(node));
+		match self.effects[usize::from(effect)] {
+			Effect::Call { args: values, .. } | Effect::Return { values } => {
+				for &value in &self.operands[values.range()] {
+					operand(value);
+				}
+			}
+			Effect::Load { address, .. } => operand(address),
+			Effect::GlobalSet(_, value) | Effect::MemoryGrow(_, value) => {
+				operand(value)
+			}
+			Effect::Store { address, value, .. } => {
+				operand(address);
+				operand(value);
+			}
+			Effect::Trapping(TrappingOp::Binary(_, lhs, rhs)) => {
+				operand(lhs);
+				operand(rhs);
+			}
+			Effect::Trapping(TrappingOp::Convert(_, value)) => operand(value),
+			Effect::MemoryFill {
+				dst, value, len, ..
+			} => {
+				operand(dst);
+				operand(value);
+				operand(len);
+			}
+			Effect::MemoryCopy { dst, src, len, .. } => {
+				operand(dst);
+				operand(src);
+				operand(len);
+			}
+			Effect::Region(region) => {
+				match self.regions[usize::from(region)].kind {
+					RegionKind::If { condition, .. } => operand(condition),
+					RegionKind::Switch { selector, .. } => operand(selector),
+					_ => {}
+				}
+			}
+			Effect::GlobalGet(_)
+			| Effect::MemorySize(_)
+			| Effect::Branch { .. }
+			| Effect::Unreachable => {}
 		}
-		self.data_nodes.push(DataNode {
-			kind,
-			uses: Vec::new(),
-		});
-		id
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::mir::{self, MIR};
+	use crate::testing::DiagnosticView;
+	use crate::vfs;
+
+	/// The graph of the function exported as `name` from `source`, as
+	/// lowered (no inlining).
+	pub(super) fn graph_of(source: &str, name: &str) -> Function {
+		let mut builder = vfs::CompilationUnitBuilder::new();
+		builder.load_stdlib();
+		let root = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(
+					std::collections::HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)]),
+				),
+			)
+			.unwrap();
+		let mut unit = builder.build(root);
+		let (diagnostics, mir) = crate::tir::build(&mut unit);
+		DiagnosticView::new("tir", &diagnostics, &unit.files)
+			.assert_no_errors();
+		let mir: MIR = mir.expect("the source lowers");
+		let id = mir
+			.exports
+			.iter()
+			.find_map(|export| match export.item {
+				mir::Item::Function(id)
+					if unit.strings.resolve(export.name) == Some(name) =>
+				{
+					Some(id)
+				}
+				_ => None,
+			})
+			.expect("the export exists");
+		let graph = build(&mir, id);
+		graph.verify().expect("the graph is well formed");
+		graph
 	}
 
-	/// Create a loop-param placeholder for `before` with `after = before`.
-	/// Call `patch_loop_param` once the loop body has been built.
-	pub fn push_loop_param(
-		&mut self,
-		block_index: BlockIndex,
-		before: DataNodeIndex,
-		ty: ScalarType,
-	) -> DataNodeIndex {
-		let id = self.data_nodes.len() as DataNodeIndex;
-		self.data_nodes.push(DataNode {
-			kind: DataNodeKind::LoopParam {
-				block_index,
-				before,
-				after: before,
-				ty,
-			},
-			uses: Vec::new(),
-		});
-		id
+	/// The phis no resolution removed.
+	fn phis(graph: &Function) -> Vec<NodeId> {
+		(0..graph.kinds.len() as u32)
+			.map(NodeId::new)
+			.filter(|&node| {
+				matches!(graph.kind(node), NodeKind::Phi { .. })
+					&& graph.resolve(node) == node
+			})
+			.collect()
 	}
 
-	/// Create a join-param placeholder for an exit result or a block's carried
-	/// binding. Unlike `push_loop_param`, there is no `before`/`after` split
-	/// and no later patch step. Result slots go in `break_result_outputs`;
-	/// carried-binding slots go in `BlockJoin::outputs` only when an exit
-	/// changes the binding. Unneeded binding placeholders remain unused.
-	/// See `DataNodeKind::JoinParam`'s doc comment.
-	pub fn push_join_param(
-		&mut self,
-		block_index: BlockIndex,
-		ty: ScalarType,
-	) -> DataNodeIndex {
-		let id = self.data_nodes.len() as DataNodeIndex;
-		self.data_nodes.push(DataNode {
-			kind: DataNodeKind::JoinParam { block_index, ty },
-			uses: Vec::new(),
-		});
-		id
+	fn loop_header(graph: &Function) -> JoinId {
+		graph
+			.regions
+			.iter()
+			.find_map(|region| match region.kind {
+				RegionKind::Loop { header, .. } => Some(header),
+				_ => None,
+			})
+			.expect("a loop")
 	}
 
-	/// Finalize a loop-param once the loop body is fully built.
-	/// If `after == before` (the binding was never mutated), the node is left
-	/// as-is and no uses are registered — the scheduler will see zero uses and
-	/// skip it.
-	pub fn patch_loop_param(
-		&mut self,
-		id: DataNodeIndex,
-		after: DataNodeIndex,
-	) {
-		let (block_index, before, ty) = match self.data_nodes[id as usize].kind
-		{
-			DataNodeKind::LoopParam {
-				block_index,
-				before,
-				ty,
-				..
-			} => (block_index, before, ty),
-			_ => panic!("patch_loop_param called on non-LoopParam node"),
-		};
-		if before == after {
-			return;
+	/// Arms that leave a local with the same value merge to that value.
+	#[test]
+	fn arms_that_agree_need_no_phi() {
+		let graph = graph_of(
+			r#"
+				func f(c: Bool, x: i32) -> i32 {
+					local mut y: i32 = 0;
+					if c { y = x } else { y = x };
+					y
+				}
+				export { f as "f" }
+			"#,
+			"f",
+		);
+		assert!(phis(&graph).is_empty());
+	}
+
+	/// A block's join merges only what the block writes: here its value,
+	/// not the locals around it.
+	#[test]
+	fn a_block_join_has_columns_only_for_what_it_writes() {
+		let graph = graph_of(
+			r#"
+				func f(a: i32, b: i32) -> i32 {
+					local s = a + b;
+					local r: i32 = block :done {
+						if b > 0 { break :done 1 };
+						2
+					};
+					s + r
+				}
+				export { f as "f" }
+			"#,
+			"f",
+		);
+		let exit = graph
+			.regions
+			.iter()
+			.find_map(|region| match region.kind {
+				RegionKind::Block { exit } => Some(exit),
+				_ => None,
+			})
+			.expect("a block");
+		assert_eq!(graph.columns(exit), &[Column::Result(0)]);
+		assert_eq!(graph.edges(exit), 2);
+		assert_eq!(phis(&graph).len(), 1);
+	}
+
+	/// The placeholder of `local` at `header`.
+	fn placeholder(graph: &Function, header: JoinId, local: u32) -> NodeId {
+		let column = graph
+			.columns(header)
+			.iter()
+			.position(|&column| column == Column::Local(LocalIndex::new(local)))
+			.expect("the local is a column") as u32;
+		(0..graph.kinds.len() as u32)
+			.map(NodeId::new)
+			.find(|&node| {
+				graph.kind(node)
+					== NodeKind::Phi {
+						join: header,
+						column,
+					}
+			})
+			.expect("its placeholder")
+	}
+
+	/// A loop's header merges the locals its body writes (lowering's
+	/// temporaries among them, whose phis nothing reads) and no others.
+	#[test]
+	fn a_loop_header_merges_only_the_locals_its_body_writes() {
+		// Locals: `n` 0, `k` 1, `i` 2, `s` 3.
+		let graph = graph_of(
+			r#"
+				func sum(n: i32) -> i32 {
+					local k: i32 = n * 2;
+					local mut i: i32 = 0;
+					local mut s: i32 = 0;
+					loop {
+						if i == n { break };
+						s += i + k;
+						i += 1;
+					};
+					s
+				}
+				export { sum as "sum" }
+			"#,
+			"sum",
+		);
+		let header = loop_header(&graph);
+		let columns = graph.columns(header);
+		for local in [2, 3] {
+			assert!(columns.contains(&Column::Local(LocalIndex::new(local))));
 		}
-		self.data_nodes[id as usize].kind = DataNodeKind::LoopParam {
-			block_index,
-			before,
-			after,
-			ty,
-		};
-		self.data_nodes[before as usize].uses.push(id);
-		self.data_nodes[after as usize].uses.push(id);
+		for local in [0, 1] {
+			assert!(!columns.contains(&Column::Local(LocalIndex::new(local))));
+		}
+		// Entry and the back edge.
+		assert_eq!(graph.edges(header), 2);
 	}
 
-	fn register_uses(&mut self, kind: &DataNodeKind, user_id: DataNodeIndex) {
-		match kind {
-            DataNodeKind::Add { left, right, .. }
-            | DataNodeKind::Sub { left, right, .. }
-            | DataNodeKind::Mul { left, right, .. }
-			| DataNodeKind::Div { left, right, .. }
-            | DataNodeKind::Min { left, right, .. }
-            | DataNodeKind::Max { left, right, .. }
-            | DataNodeKind::Copysign { left, right, .. }
-            | DataNodeKind::BitAnd { left, right, .. }
-            | DataNodeKind::BitOr  { left, right, .. }
-            | DataNodeKind::BitXor { left, right, .. }
-            | DataNodeKind::Shl    { left, right, .. }
-            | DataNodeKind::ShrS   { left, right, .. }
-            | DataNodeKind::ShrU   { left, right, .. }
-            | DataNodeKind::Eq     { left, right, .. }
-            | DataNodeKind::NotEq  { left, right, .. }
-            | DataNodeKind::LtS    { left, right, .. }
-            | DataNodeKind::LtU    { left, right, .. }
-            | DataNodeKind::LtEqS  { left, right, .. }
-            | DataNodeKind::LtEqU  { left, right, .. }
-            | DataNodeKind::GtS    { left, right, .. }
-            | DataNodeKind::GtU    { left, right, .. }
-            | DataNodeKind::GtEqS  { left, right, .. }
-            | DataNodeKind::GtEqU  { left, right, .. }
-            | DataNodeKind::Phi    { left, right, .. } => {
-                self.data_nodes[*left as usize].uses.push(user_id);
-                self.data_nodes[*right as usize].uses.push(user_id);
-            }
-
-            DataNodeKind::Neg    { operand, .. }
-            | DataNodeKind::Sqrt { operand, .. }
-            | DataNodeKind::Abs { operand, .. }
-            | DataNodeKind::Floor { operand, .. }
-            | DataNodeKind::Ceil { operand, .. }
-            | DataNodeKind::Trunc { operand, .. }
-            | DataNodeKind::Nearest { operand, .. }
-            | DataNodeKind::BitNot { operand, .. }
-            | DataNodeKind::Eqz    { operand }
-            | DataNodeKind::I64ExtendI32S { operand }
-            | DataNodeKind::I64ExtendI32U { operand }
-            | DataNodeKind::I32WrapI64 { operand }
-            | DataNodeKind::F32ConvertI32 { operand }
-            | DataNodeKind::F32ConvertU32 { operand }
-            | DataNodeKind::F32ConvertI64 { operand }
-            | DataNodeKind::F32ConvertU64 { operand }
-            | DataNodeKind::F64ConvertI32 { operand }
-            | DataNodeKind::F64ConvertU32 { operand }
-            | DataNodeKind::F64ConvertI64 { operand }
-            | DataNodeKind::F64ConvertU64 { operand }
-            | DataNodeKind::F64PromoteF32 { operand }
-            | DataNodeKind::F32DemoteF64 { operand }
-            | DataNodeKind::I32ReinterpretF32 { operand }
-            | DataNodeKind::F32ReinterpretI32 { operand }
-            | DataNodeKind::I64ReinterpretF64 { operand }
-            | DataNodeKind::F64ReinterpretI64 { operand }
-            | DataNodeKind::AggregateGet { aggregate: operand, .. } => {
-                self.data_nodes[*operand as usize].uses.push(user_id);
-            }
-
-            DataNodeKind::Aggregate { values, .. } => {
-                for &value in values.iter() {
-                    self.data_nodes[value as usize].uses.push(user_id);
-                }
-            }
-
-            DataNodeKind::CallResult { callee, args, .. } => {
-                self.data_nodes[*callee as usize].uses.push(user_id);
-                for &a in args.iter() {
-                    self.data_nodes[a as usize].uses.push(user_id);
-                }
-            }
-
-            DataNodeKind::MemoryGrowResult { delta, .. } => {
-                self.data_nodes[*delta as usize].uses.push(user_id);
-            }
-
-            DataNodeKind::PointerLoadResult { address, .. } => {
-                self.data_nodes[*address as usize].uses.push(user_id);
-            }
-
-            // Leaf nodes: no inputs to register.
-            DataNodeKind::Int { .. }
-            | DataNodeKind::Float { .. }
-            | DataNodeKind::Param { .. }
-            | DataNodeKind::GlobalGetResult { .. }
-            | DataNodeKind::TrappingResult { .. }
-            | DataNodeKind::FunctionRef { .. }
-            | DataNodeKind::StaticDataRef { .. }
-            | DataNodeKind::DataEnd { .. }
-            | DataNodeKind::MemoryIndex { .. }
-            | DataNodeKind::MemorySizeResult { .. }
-            | DataNodeKind::AggregateCallResult { .. }
-            // LoopParam uses are registered by patch_loop_param after both
-            // `before` and `after` are known.
-            | DataNodeKind::LoopParam { .. }
-            // JoinParam has no before/after (see its own doc comment) and
-            // no operand fields of its own — nothing to register, ever.
-            | DataNodeKind::JoinParam { .. } => {}
-        }
+	/// A placeholder whose back edge gives it back unchanged is its entry
+	/// value.
+	#[test]
+	fn a_loop_placeholder_given_back_unchanged_resolves() {
+		// Locals: `n` 0, `x` 1, `i` 2, `y` 3.
+		let graph = graph_of(
+			r#"
+				func f(n: i32, x: i32) -> i32 {
+					local mut i: i32 = 0;
+					local mut y: i32 = x;
+					loop {
+						if i == n { break };
+						y = y;
+						i += 1;
+					};
+					y
+				}
+				export { f as "f" }
+			"#,
+			"f",
+		);
+		let header = loop_header(&graph);
+		let y = placeholder(&graph, header, 3);
+		assert_eq!(graph.kind(graph.resolve(y)), NodeKind::Param(1));
+		let i = placeholder(&graph, header, 2);
+		assert_eq!(graph.resolve(i), i);
 	}
 }

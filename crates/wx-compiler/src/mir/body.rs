@@ -110,8 +110,8 @@ impl Operands {
 /// An operator on one operand, of the node's type; `Eqz` compares an
 /// integer with zero and gives an `I32`. Wasm has no integer negation or
 /// bitwise not: lowering writes `0 - x` and `x ^ -1`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum UnaryOp {
 	Eqz,
 	Neg,
@@ -133,8 +133,8 @@ impl UnaryOp {
 }
 
 /// An operator on two operands of the node's type.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum BinaryOp {
 	Add,
 	Sub,
@@ -182,8 +182,8 @@ impl BinaryOp {
 }
 
 /// A comparison of two operands of one type, giving an `I32` of 0 or 1.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum CompareOp {
 	Eq,
 	Ne,
@@ -219,8 +219,8 @@ impl CompareOp {
 }
 
 /// A conversion from the operand's type to the node's.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ConvertOp {
 	/// `I32` to `I64`, sign- or zero-extended.
 	ExtendS,
@@ -270,7 +270,7 @@ impl ConvertOp {
 /// How a load reads memory: its width, and for a narrow one how it is
 /// extended to an `I32`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum LoadAccess {
 	I8S,
 	I8U,
@@ -283,6 +283,16 @@ pub enum LoadAccess {
 }
 
 impl LoadAccess {
+	/// Its natural alignment, as a power of two: its width in bytes.
+	pub fn align_log2(self) -> u32 {
+		match self {
+			Self::I8S | Self::I8U => 0,
+			Self::I16S | Self::I16U => 1,
+			Self::I32 | Self::F32 => 2,
+			Self::I64 | Self::F64 => 3,
+		}
+	}
+
 	/// The type of the value it loads.
 	pub fn value_type(self) -> ValueType {
 		match self {
@@ -298,7 +308,7 @@ impl LoadAccess {
 
 /// How many bytes a store writes: a narrow one writes an `I32`'s low bits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum StoreAccess {
 	I8,
 	I16,
@@ -309,6 +319,16 @@ pub enum StoreAccess {
 }
 
 impl StoreAccess {
+	/// Its natural alignment, as a power of two: its width in bytes.
+	pub fn align_log2(self) -> u32 {
+		match self {
+			Self::I8 => 0,
+			Self::I16 => 1,
+			Self::I32 | Self::F32 => 2,
+			Self::I64 | Self::F64 => 3,
+		}
+	}
+
 	/// The type of the value it stores.
 	pub fn value_type(self) -> ValueType {
 		match self {
@@ -492,8 +512,8 @@ pub enum ExprKind {
 // A node is matched by value everywhere; keep it small.
 const _: () = assert!(std::mem::size_of::<ExprKind>() <= 24);
 
-/// An index a node holds, as [`ExprKind::ids_mut`] hands it out.
-pub enum Id<'a> {
+/// A body-local index a node holds, as [`ExprKind::body_ids_mut`] hands it out.
+pub enum BodyId<'a> {
 	Expr(&'a mut ExprId),
 	List(&'a mut ExprList),
 	Cases(&'a mut CaseList),
@@ -504,11 +524,64 @@ pub enum Id<'a> {
 }
 
 impl ExprKind {
-	/// Every index this node holds, in evaluation order of its children.
-	/// The one per-variant walk: every rewrite and check goes through it, so
-	/// a new variant is one arm here. A list's or a case list's entries are
-	/// in the body, not in the node; the caller reads them there.
-	pub fn ids_mut(&mut self, mut f: impl FnMut(Id<'_>)) {
+	/// Module references stored directly in this node, for discovery and
+	/// remapping. This does not visit children or indices local to the body.
+	/// Read-only callers visit a copy; no reference list is allocated.
+	pub fn items_mut(
+		&mut self,
+		mut f: impl FnMut(super::references::ItemRef<'_>),
+	) {
+		use super::references::ItemRef;
+		match self {
+			Self::Call { function, .. } => f(ItemRef::Function(function)),
+			Self::Global { id } | Self::GlobalSet { id, .. } => {
+				f(ItemRef::Global(id));
+			}
+			Self::DataEnd { memory }
+			| Self::MemoryIndex { memory }
+			| Self::MemorySize { memory }
+			| Self::MemoryGrow { memory, .. }
+			| Self::MemoryFill { memory, .. }
+			| Self::PointerLoad { memory, .. }
+			| Self::PointerStore { memory, .. } => f(ItemRef::Memory(memory)),
+			Self::MemoryCopy {
+				dst_memory,
+				src_memory,
+				..
+			} => {
+				f(ItemRef::Memory(dst_memory));
+				f(ItemRef::Memory(src_memory));
+			}
+			Self::StaticPointer { entry, .. } => f(ItemRef::Data(entry)),
+			Self::Noop
+			| Self::Unreachable
+			| Self::Int { .. }
+			| Self::Float { .. }
+			| Self::LocalGet { .. }
+			| Self::LocalSet { .. }
+			| Self::Values { .. }
+			| Self::SetLocals { .. }
+			| Self::Unary { .. }
+			| Self::Binary { .. }
+			| Self::Compare { .. }
+			| Self::Convert { .. }
+			| Self::Sequence { .. }
+			| Self::Block { .. }
+			| Self::Loop { .. }
+			| Self::Break { .. }
+			| Self::Continue { .. }
+			| Self::Return { .. }
+			| Self::IfElse { .. }
+			| Self::Switch { .. }
+			| Self::Drop { .. } => {}
+		}
+	}
+
+	/// Every body-local index this node holds, in evaluation order of its
+	/// children. Body-local rewrites and checks share this per-variant walk;
+	/// module references use [`Self::items_mut`]. A list's or a case list's
+	/// entries are in the body, not in the node; the caller reads them there.
+	pub fn body_ids_mut(&mut self, mut f: impl FnMut(BodyId<'_>)) {
 		match self {
 			Self::Noop
 			| Self::Unreachable
@@ -519,45 +592,45 @@ impl ExprKind {
 			| Self::MemoryIndex { .. }
 			| Self::MemorySize { .. }
 			| Self::StaticPointer { .. } => {}
-			Self::LocalGet { local } => f(Id::Local(local)),
+			Self::LocalGet { local } => f(BodyId::Local(local)),
 			Self::LocalSet { local, value } => {
-				f(Id::Local(local));
-				f(Id::Expr(value));
+				f(BodyId::Local(local));
+				f(BodyId::Expr(value));
 			}
 			Self::SetLocals { targets, value } => {
-				f(Id::Targets(targets));
-				f(Id::Expr(value));
+				f(BodyId::Targets(targets));
+				f(BodyId::Expr(value));
 			}
 			Self::Values { values: list }
 			| Self::Sequence { statements: list }
-			| Self::Call { args: list, .. } => f(Id::List(list)),
+			| Self::Call { args: list, .. } => f(BodyId::List(list)),
 			Self::GlobalSet { value, .. }
 			| Self::Unary { value, .. }
 			| Self::Convert { value, .. }
 			| Self::Drop { value }
-			| Self::MemoryGrow { delta: value, .. } => f(Id::Expr(value)),
+			| Self::MemoryGrow { delta: value, .. } => f(BodyId::Expr(value)),
 			Self::Binary { lhs, rhs, .. } | Self::Compare { lhs, rhs, .. } => {
-				f(Id::Expr(lhs));
-				f(Id::Expr(rhs));
+				f(BodyId::Expr(lhs));
+				f(BodyId::Expr(rhs));
 			}
 			Self::Block { label, statements } => {
-				f(Id::Label(label));
-				f(Id::List(statements));
+				f(BodyId::Label(label));
+				f(BodyId::List(statements));
 			}
 			Self::Loop { label, body } => {
-				f(Id::Label(label));
-				f(Id::Expr(body));
+				f(BodyId::Label(label));
+				f(BodyId::Expr(body));
 			}
 			Self::Break { label, value } => {
 				if let Some(value) = value {
-					f(Id::Expr(value));
+					f(BodyId::Expr(value));
 				}
-				f(Id::Label(label));
+				f(BodyId::Label(label));
 			}
-			Self::Continue { label } => f(Id::Label(label)),
+			Self::Continue { label } => f(BodyId::Label(label)),
 			Self::Return { value } => {
 				if let Some(value) = value {
-					f(Id::Expr(value));
+					f(BodyId::Expr(value));
 				}
 			}
 			Self::IfElse {
@@ -565,10 +638,10 @@ impl ExprKind {
 				then,
 				otherwise,
 			} => {
-				f(Id::Expr(condition));
-				f(Id::Expr(then));
+				f(BodyId::Expr(condition));
+				f(BodyId::Expr(then));
 				if let Some(otherwise) = otherwise {
-					f(Id::Expr(otherwise));
+					f(BodyId::Expr(otherwise));
 				}
 			}
 			Self::Switch {
@@ -576,28 +649,28 @@ impl ExprKind {
 				cases,
 				default,
 			} => {
-				f(Id::Expr(selector));
-				f(Id::Cases(cases));
+				f(BodyId::Expr(selector));
+				f(BodyId::Cases(cases));
 				if let Some(default) = default {
-					f(Id::Expr(default));
+					f(BodyId::Expr(default));
 				}
 			}
 			Self::MemoryFill {
 				dst, value, len, ..
 			} => {
-				f(Id::Expr(dst));
-				f(Id::Expr(value));
-				f(Id::Expr(len));
+				f(BodyId::Expr(dst));
+				f(BodyId::Expr(value));
+				f(BodyId::Expr(len));
 			}
 			Self::MemoryCopy { dst, src, len, .. } => {
-				f(Id::Expr(dst));
-				f(Id::Expr(src));
-				f(Id::Expr(len));
+				f(BodyId::Expr(dst));
+				f(BodyId::Expr(src));
+				f(BodyId::Expr(len));
 			}
-			Self::PointerLoad { pointer, .. } => f(Id::Expr(pointer)),
+			Self::PointerLoad { pointer, .. } => f(BodyId::Expr(pointer)),
 			Self::PointerStore { pointer, value, .. } => {
-				f(Id::Expr(pointer));
-				f(Id::Expr(value));
+				f(BodyId::Expr(pointer));
+				f(BodyId::Expr(value));
 			}
 		}
 	}
@@ -790,23 +863,23 @@ impl Body {
 		self.types.extend_from_slice(&other.types);
 		self.kinds.extend(other.kinds.iter().map(|&kind| {
 			let mut kind = kind;
-			kind.ids_mut(|id| match id {
-				Id::Expr(expr) => *expr = shift_expr(*expr, exprs),
-				Id::List(list) => {
+			kind.body_ids_mut(|id| match id {
+				BodyId::Expr(expr) => *expr = shift_expr(*expr, exprs),
+				BodyId::List(list) => {
 					if list.len != 0 {
 						list.start += lists;
 					}
 				}
-				Id::Cases(list) => {
+				BodyId::Cases(list) => {
 					if list.len != 0 {
 						list.start += cases;
 					}
 				}
-				Id::Targets(list) => list.start += targets,
-				Id::Local(local) => {
+				BodyId::Targets(list) => list.start += targets,
+				BodyId::Local(local) => {
 					*local = LocalIndex::new(u32::from(*local) + locals)
 				}
-				Id::Label(label) => {
+				BodyId::Label(label) => {
 					*label = LabelId::new(u32::from(*label) + labels)
 				}
 			});
@@ -900,23 +973,23 @@ pub fn verify(
 		let mut kind = body.kind(expr);
 		let mut in_range = true;
 		let mut children = Vec::new();
-		kind.ids_mut(|id| match id {
-			Id::Expr(child) => children.push(*child),
-			Id::List(list) => {
+		kind.body_ids_mut(|id| match id {
+			BodyId::Expr(child) => children.push(*child),
+			BodyId::List(list) => {
 				if (list.start + list.len) as usize > body.lists.len() {
 					in_range = false;
 				} else {
 					children.extend_from_slice(body.list(*list));
 				}
 			}
-			Id::Cases(cases) => {
+			BodyId::Cases(cases) => {
 				if (cases.start + cases.len) as usize > body.cases.len() {
 					in_range = false;
 				} else {
 					children.extend(body.cases(*cases).iter().map(|c| c.body));
 				}
 			}
-			Id::Targets(targets) => {
+			BodyId::Targets(targets) => {
 				if (targets.start + targets.len) as usize > body.targets.len()
 					|| body
 						.targets(*targets)
@@ -927,12 +1000,12 @@ pub fn verify(
 					in_range = false;
 				}
 			}
-			Id::Local(local) => {
+			BodyId::Local(local) => {
 				if usize::from(*local) >= locals.len() {
 					in_range = false;
 				}
 			}
-			Id::Label(label) => {
+			BodyId::Label(label) => {
 				if u32::from(*label) >= label_count {
 					in_range = false;
 				}

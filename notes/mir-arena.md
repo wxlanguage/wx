@@ -225,11 +225,11 @@ pub enum ExprKind {
 
 ## Child visitor
 
-`ExprKind::ids_mut(&mut self, f: impl FnMut(Id))` is the one per-variant
-function, where `Id` is `Expr(&mut ExprId)`, `List(&mut ExprList)`,
-`Cases(&mut CaseList)`, `Local(&mut LocalIndex)` or `Label(&mut LabelId)`. Every
-rewrite (inlining, a verifier, a future pass) goes through it, so a new
-variant is one arm in one place.
+`ExprKind::body_ids_mut(&mut self, f: impl FnMut(BodyId))` is the one per-variant
+function, where `BodyId` is `Expr(&mut ExprId)`, `List(&mut ExprList)`,
+`Cases(&mut CaseList)`, `Targets(&mut TargetList)`, `Local(&mut LocalIndex)` or
+`Label(&mut LabelId)`. Body-local rewrites and checks share this visitor;
+module references are enumerated separately by `items_mut`.
 
 ## Inlining
 

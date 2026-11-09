@@ -12,6 +12,8 @@ use string_interner::symbol::SymbolU32;
 use crate::ast::StringInterner;
 use crate::mir;
 
+mod graph_emission;
+
 /// A function under construction: its arena, locals and labels.
 struct Fixture {
 	body: mir::Body,
@@ -199,7 +201,7 @@ fn run(
 	mir: &mir::MIR,
 	interner: &StringInterner,
 ) -> (wasmtime::Store<()>, wasmtime::Instance) {
-	let module = crate::codegen::Builder::build(mir, interner)
+	let module = crate::codegen::Builder::build_linearized(mir, interner)
 		.expect("a fixture module must lower");
 	let bytes = module.encode();
 	let (engine, module) = instantiate(&bytes);
