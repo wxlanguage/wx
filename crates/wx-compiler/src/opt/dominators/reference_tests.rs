@@ -211,7 +211,8 @@ fn check(graph: &Function) {
 			let reader = match site {
 				UseSite::Node(consumer) => {
 					match plan.value(consumer).unwrap() {
-						ValuePlacement::Compute(location) => location,
+						ValuePlacement::Stored(location)
+						| ValuePlacement::Nested(location) => location,
 						_ => panic!(
 							"an ordinary consumer must have a computation"
 						),
@@ -237,7 +238,8 @@ fn check(graph: &Function) {
 			match plan.value(node).unwrap() {
 				ValuePlacement::Direct => {}
 				ValuePlacement::Fixed(definition)
-				| ValuePlacement::Compute(definition) => {
+				| ValuePlacement::Stored(definition)
+				| ValuePlacement::Nested(definition) => {
 					let definition = reference
 						.points
 						.iter()

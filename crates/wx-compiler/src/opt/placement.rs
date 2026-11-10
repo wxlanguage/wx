@@ -9,12 +9,20 @@ use super::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValuePlacement {
-	/// Emit directly at each reader: constants, parameters and pure leaves.
+	/// Emit a leaf at each use without introducing a temporary local.
+	/// For example, `x + 2` directly reads parameter `x` and emits constant `2`.
 	Direct,
-	/// An effect result or phi; capture/row updates establish the definition.
+	/// Read a local established by an effect or incoming join row. The location
+	/// marks availability; for example, `t = call f()` captures the call result,
+	/// while `t = if c { a } else { b }` receives the selected arm's value.
 	Fixed(Location),
-	/// An ordinary pure computation, initially materialized in a local.
-	Compute(Location),
+	/// Compute at the planned location and store the result in a local.
+	/// For example, `t = x + y; t * t` computes the shared addition once.
+	Stored(Location),
+	/// Build a computation inside its sole consumer at the planned location.
+	/// For example, `(x + y) * 2` nests the addition in the multiplication,
+	/// passing its result directly without a temporary local.
+	Nested(Location),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -176,6 +184,7 @@ impl<'a> Placement<'a> {
 
 		for &node in plan.computations.iter().rev() {
 			let mut candidate = None;
+			let mut has_multiple_uses = false;
 			for site in uses.sites(node) {
 				let reader = plan.reader(site, locations);
 				if !dominators.is_reachable(reader) {
@@ -184,6 +193,7 @@ impl<'a> Placement<'a> {
 				candidate = Some(match candidate {
 					None => reader,
 					Some(previous) => {
+						has_multiple_uses = true;
 						dominators.common_dominator(previous, reader).unwrap()
 					}
 				});
@@ -197,8 +207,11 @@ impl<'a> Placement<'a> {
 					reader: location,
 				});
 			}
-			plan.values[usize::from(node)] =
-				Some(ValuePlacement::Compute(location));
+			plan.values[usize::from(node)] = Some(if has_multiple_uses {
+				ValuePlacement::Stored(location)
+			} else {
+				ValuePlacement::Nested(location)
+			});
 		}
 		drop(earliest);
 
@@ -208,7 +221,8 @@ impl<'a> Placement<'a> {
 			let definition = match plan.values[usize::from(node)].unwrap() {
 				ValuePlacement::Direct => None,
 				ValuePlacement::Fixed(location)
-				| ValuePlacement::Compute(location) => Some(location),
+				| ValuePlacement::Stored(location)
+				| ValuePlacement::Nested(location) => Some(location),
 			};
 			for site in uses.sites(node) {
 				let reader = plan.reader(site, locations);
@@ -234,7 +248,10 @@ impl<'a> Placement<'a> {
 			UseSite::Effect(effect) => locations.before(effect),
 			UseSite::Row { join, row } => locations.row(join, row),
 			UseSite::Node(node) => match self.values[usize::from(node)] {
-				Some(ValuePlacement::Compute(location)) => location,
+				Some(
+					ValuePlacement::Stored(location)
+					| ValuePlacement::Nested(location),
+				) => location,
 				_ => unreachable!(
 					"an ordinary reader is placed before its inputs"
 				),
@@ -278,10 +295,55 @@ mod tests {
 	}
 
 	fn computed(plan: &Placement<'_>, node: NodeId) -> Location {
-		let Some(ValuePlacement::Compute(location)) = plan.value(node) else {
+		let Some(
+			ValuePlacement::Stored(location) | ValuePlacement::Nested(location),
+		) = plan.value(node)
+		else {
 			panic!("expected computation");
 		};
 		location
+	}
+
+	#[test]
+	fn single_operand_occurrences_nest_but_repeated_operands_stay_shared() {
+		let graph = graph_of(
+			r#"
+			func f(x: i32, y: i32) -> i32 {
+				local shared = x + y;
+				(shared * shared) - (x - y)
+			}
+			export { f as "f" }
+			"#,
+			"f",
+		);
+		let uses = Uses::collect(&graph);
+		let locations = Locations::build(&graph);
+		let plan = Placement::build(&uses, &locations).unwrap();
+		let mut shared = 0;
+		let mut nested = 0;
+		for &node in plan.computations() {
+			match plan.value(node).unwrap() {
+				ValuePlacement::Stored(_) => {
+					assert_eq!(uses.sites(node).count(), 2);
+					assert!(matches!(
+						graph.kind(node),
+						NodeKind::Binary(BinaryOp::Add, ..)
+					));
+					shared += 1;
+				}
+				ValuePlacement::Nested(location) => {
+					let mut readers = uses.sites(node);
+					assert_eq!(
+						location,
+						plan.reader(readers.next().unwrap(), &locations)
+					);
+					assert_eq!(readers.next(), None);
+					nested += 1;
+				}
+				_ => panic!("expected a computation"),
+			}
+		}
+		assert_eq!((shared, nested), (1, 3));
 	}
 
 	#[test]

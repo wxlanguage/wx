@@ -932,3 +932,162 @@ fn a_diverging_break_value_does_not_break() {
 		.unwrap();
 	assert!(run.call(&mut store, (0, 0)).is_err());
 }
+
+#[test]
+fn deeply_nested_control_linearizes_without_recursion() {
+	let mut interner = StringInterner::new();
+	let name = interner.get_or_intern("run");
+	for depth in [128, 4096] {
+		let mir = scalar_function(name, |f| {
+			let mut body = f.int(7, mir::ValueType::I32);
+			for level in 0..depth {
+				if level % 2 == 0 {
+					let label = f.label();
+					let statements = f.body.push_list([body]);
+					body = f.push(
+						mir::ExprKind::Block { label, statements },
+						mir::ValueType::I32,
+					);
+				} else {
+					let condition = f.int(1, mir::ValueType::I32);
+					let otherwise = f.int(0, mir::ValueType::I32);
+					body = f.if_else(
+						condition,
+						body,
+						Some(otherwise),
+						mir::ValueType::I32,
+					);
+				}
+			}
+			body
+		});
+		let output = crate::codegen::Builder::build_linearized(&mir, &interner)
+			.unwrap()
+			.encode();
+		wasmtime::Module::validate(&wasmtime::Engine::default(), &output)
+			.unwrap();
+		// Exercise the result at moderate depth, without relying on a runtime
+		// compiler's ability to compile arbitrarily nested structured control.
+		if depth == 128 {
+			let (mut store, instance) = run(&mir, &interner);
+			let run = instance
+				.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+				.unwrap();
+			assert_eq!(run.call(&mut store, (0, 0)).unwrap(), 7);
+		}
+	}
+}
+
+#[test]
+fn nested_switches_preserve_case_order_for_both_lowerings() {
+	let mut interner = StringInterner::new();
+	let name = interner.get_or_intern("run");
+	for (outer_dense, inner_dense) in
+		[(false, false), (false, true), (true, false), (true, true)]
+	{
+		let outer_step = if outer_dense { 1 } else { 10 };
+		let inner_step = if inner_dense { 1 } else { 10 };
+		let mir = scalar_function(name, |f| {
+			let mut outer_cases = Vec::new();
+			for outer in 0..3 {
+				let mut inner_cases = Vec::new();
+				for inner in 0..3 {
+					let body = f.int(outer * 100 + inner, mir::ValueType::I32);
+					inner_cases.push(mir::Case {
+						value: inner * inner_step,
+						body,
+					});
+				}
+				let selector = f.local(1, mir::ValueType::I32);
+				let default = f.int(outer * 100 + 9, mir::ValueType::I32);
+				let cases = f.body.push_cases(inner_cases);
+				let body = f.push(
+					mir::ExprKind::Switch {
+						selector,
+						cases,
+						default: Some(default),
+					},
+					mir::ValueType::I32,
+				);
+				outer_cases.push(mir::Case {
+					value: outer * outer_step,
+					body,
+				});
+			}
+			let selector = f.local(0, mir::ValueType::I32);
+			let default = f.int(-1, mir::ValueType::I32);
+			let cases = f.body.push_cases(outer_cases);
+			f.push(
+				mir::ExprKind::Switch {
+					selector,
+					cases,
+					default: Some(default),
+				},
+				mir::ValueType::I32,
+			)
+		});
+		let (mut store, instance) = run(&mir, &interner);
+		let run = instance
+			.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+			.unwrap();
+		for outer in [-1, 0, 1, 2, 3, 10, 20] {
+			for inner in [-1, 0, 1, 2, 3, 10, 20] {
+				let outer_case =
+					(0..3).find(|&i| i * outer_step as i32 == outer);
+				let inner_case =
+					(0..3).find(|&i| i * inner_step as i32 == inner);
+				let expected = outer_case
+					.map_or(-1, |outer| outer * 100 + inner_case.unwrap_or(9));
+				assert_eq!(
+					run.call(&mut store, (outer, inner)).unwrap(),
+					expected
+				);
+			}
+		}
+	}
+}
+
+#[test]
+fn divergent_argument_stops_the_call_and_later_arguments_but_closes_its_block()
+{
+	let mut interner = StringInterner::new();
+	let name = interner.get_or_intern("run");
+	let mut mir = scalar_function(name, |f| {
+		let first = f.int(11, mir::ValueType::I32);
+		let second = f.unreachable();
+		let third = f.int(22, mir::ValueType::I32);
+		let args = f.body.push_list([first, second, third]);
+		let call = f.push(
+			mir::ExprKind::Call {
+				function: mir::FunctionId::new(1),
+				args,
+			},
+			mir::ValueType::I32,
+		);
+		let label = f.label();
+		let statements = f.body.push_list([call]);
+		f.push(
+			mir::ExprKind::Block { label, statements },
+			mir::ValueType::I32,
+		)
+	});
+	let signature = mir
+		.signatures
+		.intern(&[mir::ValueType::I32; 3], &[mir::ValueType::I32]);
+	let mut callee = Fixture::new(&[mir::ValueType::I32; 3]);
+	let root = callee.local(0, mir::ValueType::I32);
+	mir.functions.push(callee.finish(signature, root));
+	mir.function_flags.push(mir::FunctionFlags::empty());
+	let output = crate::codegen::Builder::build_linearized(&mir, &interner)
+		.unwrap()
+		.encode();
+	let text = wasmprinter::print_bytes(&output).unwrap();
+	assert!(text.contains("i32.const 11"));
+	assert!(!text.contains("i32.const 22"));
+	assert!(!text.contains("call "));
+	let (mut store, instance) = run(&mir, &interner);
+	let run = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+		.unwrap();
+	assert!(run.call(&mut store, (0, 0)).is_err());
+}

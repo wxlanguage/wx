@@ -133,7 +133,11 @@ fn shared_arithmetic_is_materialized_once_and_executes_with_wrapping_values() {
 			.count(),
 		1
 	);
-	assert_eq!(code.locals.len(), 4, "two parameters and two computations");
+	assert_eq!(
+		code.locals.len(),
+		3,
+		"two parameters and one shared computation"
+	);
 	for emitted in [false, true] {
 		let (mut store, instance) =
 			run_mode(shared_arithmetic(name), &interner, emitted);
@@ -1007,5 +1011,67 @@ fn nonlocal_exits_keep_their_wrapper_and_skip_parent_continuation() {
 			run.call(&mut store, flag).unwrap(),
 			if flag == 0 { (9, 2) } else { (7, 1) }
 		);
+	}
+}
+
+#[test]
+fn single_use_arithmetic_nests_without_intermediate_locals() {
+	let source = r#"
+		func run(x: i32, y: i32) -> i32 { (x - y) * (x + y) }
+		export { run as "run" }
+	"#;
+	let (unit, mut mir) = lower_source(source);
+	opt::emit_for_tests(&mut mir);
+	let code = mir.code(mir::FunctionId::new(0));
+	assert_eq!(code.locals.len(), 2, "only the two parameters need locals");
+	assert!(
+		!code
+			.body
+			.kinds()
+			.iter()
+			.any(|kind| matches!(kind, E::LocalSet { .. }))
+	);
+	let (mut store, instance) = run_mode(mir, &unit.strings, false);
+	let run = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+		.unwrap();
+	for (x, y) in [(5i32, 3i32), (-5, 3), (i32::MAX, 1), (i32::MIN, -1)] {
+		assert_eq!(
+			run.call(&mut store, (x, y)).unwrap(),
+			x.wrapping_sub(y).wrapping_mul(x.wrapping_add(y))
+		);
+	}
+}
+
+#[test]
+fn long_single_use_chains_construct_and_linearize_without_recursion() {
+	let mut interner = StringInterner::new();
+	let name = interner.get_or_intern("run");
+	let mut mir = scalar_function(name, |f| {
+		// Flat input MIR becomes a deep expression only after graph emission.
+		let mut statements = Vec::new();
+		for _ in 0..4096 {
+			let input = f.local(0, T::I32);
+			let one = f.int(1, T::I32);
+			let value = f.binary(mir::BinaryOp::Add, input, one, T::I32);
+			statements.push(f.push(
+				E::LocalSet {
+					local: mir::LocalIndex::new(0),
+					value,
+				},
+				T::Unit,
+			));
+		}
+		statements.push(f.local(0, T::I32));
+		f.sequence(statements, T::I32)
+	});
+	opt::optimize_function(&mut mir, mir::FunctionId::new(0));
+	assert_eq!(mir.code(mir::FunctionId::new(0)).locals.len(), 2);
+	let (mut store, instance) = run_mode(mir, &interner, false);
+	let run = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+		.unwrap();
+	for x in [0i32, -4096, i32::MAX, i32::MIN] {
+		assert_eq!(run.call(&mut store, (x, 0)).unwrap(), x.wrapping_add(4096));
 	}
 }

@@ -41,6 +41,8 @@ pub fn emit(
 		region_gap_offsets: Vec::with_capacity(graph.regions.len() + 1),
 		computation_offsets: Vec::new(),
 		scheduled_computations: Vec::new(),
+		pending_computations: Vec::new(),
+		computation_inputs: Vec::new(),
 	};
 	for index in 0..graph.kinds.len() {
 		let node = NodeId::new(index as u32);
@@ -49,7 +51,7 @@ pub fn emit(
 		}
 		if matches!(
 			placement.value(node),
-			Some(ValuePlacement::Compute(_) | ValuePlacement::Fixed(_))
+			Some(ValuePlacement::Stored(_) | ValuePlacement::Fixed(_))
 		) {
 			let local = LocalIndex::new(emitter.locals.len() as u32);
 			emitter.locals.push(mir::Local {
@@ -127,9 +129,9 @@ pub fn emit(
 	emitter.computation_offsets =
 		vec![0; emitter.region_gap_offsets.last().unwrap() + 1];
 	for &node in placement.computations() {
-		let Some(ValuePlacement::Compute(location)) = placement.value(node)
+		let Some(ValuePlacement::Stored(location)) = placement.value(node)
 		else {
-			unreachable!()
+			continue;
 		};
 		let gap = emitter.region_gap_offsets[usize::from(location.region)]
 			+ location.position as usize;
@@ -143,11 +145,11 @@ pub fn emit(
 		[..emitter.computation_offsets.len() - 1]
 		.to_vec();
 	emitter.scheduled_computations =
-		vec![NodeId::new(0); placement.computations().len()];
+		vec![NodeId::new(0); *emitter.computation_offsets.last().unwrap()];
 	for &node in placement.computations() {
-		let Some(ValuePlacement::Compute(location)) = placement.value(node)
+		let Some(ValuePlacement::Stored(location)) = placement.value(node)
 		else {
-			unreachable!()
+			continue;
 		};
 		let gap = emitter.region_gap_offsets[usize::from(location.region)]
 			+ location.position as usize;
@@ -267,6 +269,12 @@ enum JoinTarget {
 	LoopHeader(RegionId),
 }
 
+/// Iterative expression construction; the input stack holds completed children.
+enum ComputationTask {
+	Read(NodeId),
+	Finish(NodeId),
+}
+
 struct Emitter<'a> {
 	graph: &'a Function,
 	placement: &'a Placement<'a>,
@@ -289,6 +297,9 @@ struct Emitter<'a> {
 	/// Gap index to a run in `scheduled_computations`, with an end offset.
 	computation_offsets: Vec<usize>,
 	scheduled_computations: Vec<NodeId>,
+	/// Reused across expressions, empty between computations.
+	pending_computations: Vec<ComputationTask>,
+	computation_inputs: Vec<ExprId>,
 }
 
 impl Emitter<'_> {
@@ -531,11 +542,12 @@ impl Emitter<'_> {
 			.value(node)
 			.expect("a read requires a value")
 		{
-			ValuePlacement::Fixed(_) | ValuePlacement::Compute(_) => {
+			ValuePlacement::Fixed(_) | ValuePlacement::Stored(_) => {
 				ExprKind::LocalGet {
 					local: self.value_locals[usize::from(node)].unwrap(),
 				}
 			}
+			ValuePlacement::Nested(_) => return self.computation(node),
 			ValuePlacement::Direct => match self.graph.kind(node) {
 				NodeKind::Int(value) => ExprKind::Int { value },
 				NodeKind::Float(bits) => ExprKind::Float {
@@ -561,29 +573,75 @@ impl Emitter<'_> {
 		self.body.push(kind, value_type(self.graph.ty(node)))
 	}
 
-	fn computation(&mut self, node: NodeId) -> ExprId {
-		let kind = match self.graph.kind(node) {
-			NodeKind::Unary(op, input) => ExprKind::Unary {
-				op,
-				value: self.read(input),
-			},
-			NodeKind::Binary(op, lhs, rhs) => ExprKind::Binary {
-				op,
-				lhs: self.read(lhs),
-				rhs: self.read(rhs),
-			},
-			NodeKind::Compare(op, lhs, rhs) => ExprKind::Compare {
-				op,
-				lhs: self.read(lhs),
-				rhs: self.read(rhs),
-			},
-			NodeKind::Convert(op, input) => ExprKind::Convert {
-				op,
-				value: self.read(input),
-			},
-			_ => unreachable!("only ordinary computations are scheduled"),
-		};
-		self.body.push(kind, value_type(self.graph.ty(node)))
+	fn computation(&mut self, root: NodeId) -> ExprId {
+		debug_assert!(self.pending_computations.is_empty());
+		debug_assert!(self.computation_inputs.is_empty());
+		self.pending_computations.push(ComputationTask::Read(root));
+		while let Some(task) = self.pending_computations.pop() {
+			let node = match task {
+				ComputationTask::Read(node) => {
+					let node = self.graph.resolve(node);
+					if node != root
+						&& !matches!(
+							self.placement.value(node),
+							Some(ValuePlacement::Nested(_))
+						) {
+						let value = self.read(node);
+						self.computation_inputs.push(value);
+						continue;
+					}
+					self.pending_computations
+						.push(ComputationTask::Finish(node));
+					match self.graph.kind(node) {
+						NodeKind::Unary(_, input)
+						| NodeKind::Convert(_, input) => {
+							self.pending_computations
+								.push(ComputationTask::Read(input));
+						}
+						NodeKind::Binary(_, lhs, rhs)
+						| NodeKind::Compare(_, lhs, rhs) => {
+							self.pending_computations
+								.push(ComputationTask::Read(rhs));
+							self.pending_computations
+								.push(ComputationTask::Read(lhs));
+						}
+						_ => {
+							unreachable!("only pure computations can be nested")
+						}
+					}
+					continue;
+				}
+				ComputationTask::Finish(node) => node,
+			};
+			let kind = match self.graph.kind(node) {
+				NodeKind::Unary(op, _) => ExprKind::Unary {
+					op,
+					value: self.computation_inputs.pop().unwrap(),
+				},
+				NodeKind::Convert(op, _) => ExprKind::Convert {
+					op,
+					value: self.computation_inputs.pop().unwrap(),
+				},
+				NodeKind::Binary(op, ..) => {
+					let rhs = self.computation_inputs.pop().unwrap();
+					let lhs = self.computation_inputs.pop().unwrap();
+					ExprKind::Binary { op, lhs, rhs }
+				}
+				NodeKind::Compare(op, ..) => {
+					let rhs = self.computation_inputs.pop().unwrap();
+					let lhs = self.computation_inputs.pop().unwrap();
+					ExprKind::Compare { op, lhs, rhs }
+				}
+				_ => {
+					unreachable!("only pure computations are constructed here")
+				}
+			};
+			let value = self.body.push(kind, value_type(self.graph.ty(node)));
+			self.computation_inputs.push(value);
+		}
+		let value = self.computation_inputs.pop().unwrap();
+		debug_assert!(self.computation_inputs.is_empty());
+		value
 	}
 
 	fn values(&mut self, run: super::Run) -> mir::ExprList {
