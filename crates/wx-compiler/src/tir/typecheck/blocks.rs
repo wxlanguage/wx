@@ -640,7 +640,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			};
 			if found {
 				if let (Some(name), Some(scope_label)) = (label, scope_label) {
-					self.cx.resolutions.by_site.insert(
+					self.cx.resolutions.record(
 						(
 							SourceSpan::new(self.scope.file_id, name.span),
 							Tier::Value,

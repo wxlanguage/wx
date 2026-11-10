@@ -358,7 +358,10 @@ impl BodyContext<'_, '_, '_, '_> {
 				);
 				self.build_value_call(callee, arguments, span)
 			}
-			None => self.body.push(ExprKind::Error, TypeIndex::ERROR, span),
+			None => {
+				self.build_unchecked_arguments(arguments);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
 		}
 	}
 
@@ -431,6 +434,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let receiver_ty = self.body.ty(receiver);
 		if self.cx.types.needs_context(receiver_ty) {
 			self.report_annotation_required(receiver);
+			self.build_unchecked_arguments(arguments);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
 		let receiver_ty =
@@ -444,9 +448,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			Some(Member::Method(callee)) => callee,
 			Some(Member::Function(_) | Member::Constant { .. }) => {
 				self.report_not_a_method(receiver_ty, method);
+				self.build_unchecked_arguments(arguments);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 			None => {
+				self.build_unchecked_arguments(arguments);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 		};
@@ -466,6 +472,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			} = *self.cx.types.resolve(declared)
 			else {
 				self.report_by_value_through_pointer(receiver_ty, method);
+				self.build_unchecked_arguments(arguments);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			};
 			match (ownership, declared) {
@@ -474,6 +481,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				}
 				(Ownership::Shared, Ownership::Exclusive) => {
 					self.report_shared_receiver(receiver, method);
+					self.build_unchecked_arguments(arguments);
 					return self.body.push(
 						ExprKind::Error,
 						TypeIndex::ERROR,
@@ -577,7 +585,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				return None;
 			}
 		};
-		self.cx.resolutions.by_site.insert(
+		self.cx.resolutions.record(
 			(reference, Tier::Value),
 			Referent::Member(found.selected_kind(self.cx.defs)),
 		);

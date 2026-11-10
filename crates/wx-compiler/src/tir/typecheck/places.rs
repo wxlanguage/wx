@@ -19,8 +19,9 @@ use super::{BodyContext, SelectedMethod};
 use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
-use crate::tir::defs::{TraitIdx, Visibility};
+use crate::tir::defs::{Tier, TraitIdx, Visibility};
 use crate::tir::operators::is_primitive_binary;
+use crate::tir::resolutions::Selection;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
@@ -500,6 +501,16 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 			return None;
 		};
+		self.cx.resolutions.record_selection(
+			(
+				SourceSpan::new(self.scope.file_id, member.span),
+				Tier::Value,
+			),
+			Selection::Field {
+				owner: struct_index,
+				field,
+			},
+		);
 		let visibility =
 			Visibility::from(def.field_pub_spans[usize::from(field)]);
 		if !self.cx.defs.namespaces.is_accessible_from(

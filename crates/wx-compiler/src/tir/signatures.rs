@@ -3715,8 +3715,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			.resolve(scope.generic_env, first.ident.inner)
 		{
 			self.resolutions
-				.by_site
-				.insert(site, Referent::TypeParam { env: frame, index });
+				.record(site, Referent::TypeParam { env: frame, index });
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
 				for arg in &first.type_args {
@@ -3744,7 +3743,7 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 			&& let Some((impl_kind, target)) =
 				self.resolve_impl_self(scope.generic_env)
 		{
-			self.resolutions.by_site.insert(
+			self.resolutions.record(
 				site,
 				match impl_kind {
 					ImplKind::Inherent(index) => {
@@ -5557,6 +5556,7 @@ pub(super) mod tests {
 		DefinitionRegistry, MemberOwner, Namespace, Scope, UseItemKind,
 	};
 	use crate::tir::impls::ImplTarget;
+	use crate::tir::resolutions::Resolution;
 	use crate::tir::solver::{NormalizationDepth, RewriteFlags, Verdict};
 	use crate::vfs;
 
@@ -5660,16 +5660,18 @@ pub(super) mod tests {
 				SOURCE.find(context).unwrap() + context.find(name).unwrap();
 			TextSpan::new(start as u32, (start + name.len()) as u32)
 		};
-		let at =
-			|context: &str, name: &str| {
-				let site = (
-					SourceSpan::new(file_id, span_of(context, name)),
-					Tier::Type,
-				);
-				*case.context.resolutions.by_site.get(&site).unwrap_or_else(
+		let at = |context: &str, name: &str| {
+			let site =
+				(SourceSpan::new(file_id, span_of(context, name)), Tier::Type);
+			let resolution =
+				case.context.resolutions.by_site.get(&site).unwrap_or_else(
 					|| panic!("`{name}` in `{context}` is not recorded"),
-				)
+				);
+			let Resolution::Reference(referent) = *resolution else {
+				panic!("expected a single referent");
 			};
+			referent
+		};
 		let declared = |referent: Referent| {
 			let Referent::Definition(def_key) = referent else {
 				panic!("expected a declared definition, got {referent:?}");
@@ -10836,7 +10838,9 @@ pub(super) mod tests {
 					// The selected definition is what the written name means.
 					assert_eq!(
 						builder.resolutions.by_site[&(reference, Tier::Value)],
-						Referent::Member(MemberKind::Function(actual))
+						Resolution::Reference(Referent::Member(
+							MemberKind::Function(actual)
+						))
 					);
 				}
 				// No declaration exists for this impl member, so it must not
@@ -19087,7 +19091,13 @@ pub(super) mod tests {
 					.find(|((site, tier), _)| {
 						*tier == Tier::Type && site.span == span
 					})
-					.map(|(_, referent)| *referent)
+					.map(|(_, resolution)| {
+						let Resolution::Reference(referent) = *resolution
+						else {
+							panic!("expected a single referent");
+						};
+						referent
+					})
 			})
 			.collect();
 		assert!(matches!(referents[0], Some(Referent::TypeParam { .. })));

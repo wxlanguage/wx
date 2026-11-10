@@ -37,7 +37,7 @@ use super::defs::{
 };
 use super::members::TraitMemberSelection;
 use super::obligations::BoundRequirements;
-use super::resolutions::Referent;
+use super::resolutions::{Referent, Resolution};
 use super::signatures::TypeContext;
 use super::solver::{
 	ImplMember, NormalizationDepth, RewriteFlags, SolverError, Subjects,
@@ -1210,10 +1210,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 						.by_site
 						.get(&site)
 						.and_then(|referent| match *referent {
-							Referent::Definition(key)
-							| Referent::Import {
-								definition: key, ..
-							} => Some(key),
+							Resolution::Reference(
+								Referent::Definition(key)
+								| Referent::Import {
+									definition: key, ..
+								},
+							) => Some(key),
 							_ => None,
 						})
 						.is_some_and(|key| {

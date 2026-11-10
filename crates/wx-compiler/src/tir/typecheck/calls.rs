@@ -24,9 +24,11 @@ use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::defs::{
-	AssocTypeIdx, BindingKey, FunctionIdx, MemberKind, MemberOwner, StructIdx,
+	AssocTypeIdx, BindingKey, FieldIdx, FunctionIdx, MemberKind, MemberOwner,
+	StructIdx, Tier,
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
+use crate::tir::resolutions::{Resolution, Selection};
 use crate::tir::signatures::TypeContext;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
@@ -777,6 +779,27 @@ impl BodyContext<'_, '_, '_, '_> {
 				reported = true;
 				continue;
 			};
+			let selection = match target.kind {
+				CallTargetKind::Function(function) => Selection::Parameter {
+					function: naming_declaration(self.cx, function),
+					parameter: param,
+				},
+				CallTargetKind::StructConstructor(owner) => Selection::Field {
+					owner,
+					field: FieldIdx::new(u32::from(param)),
+				},
+			};
+			let site =
+				(SourceSpan::new(self.scope.file_id, name.span), Tier::Value);
+			let resolution = if argument.value.is_none()
+				&& let Some(Resolution::Reference(value)) =
+					self.cx.resolutions.by_site.get(&site).copied()
+			{
+				Resolution::Shorthand { selection, value }
+			} else {
+				Resolution::Selection(selection)
+			};
+			self.cx.resolutions.by_site.insert(site, resolution);
 			if let Some(&(_, first)) =
 				named.iter().find(|&&(named, _)| named == param)
 			{
@@ -1234,7 +1257,10 @@ impl BodyContext<'_, '_, '_, '_> {
 
 	/// Checks the arguments of a call that has no target, for their own
 	/// diagnostics.
-	fn build_unchecked_arguments(&mut self, arguments: Arguments<'_>) {
+	pub(super) fn build_unchecked_arguments(
+		&mut self,
+		arguments: Arguments<'_>,
+	) {
 		match arguments {
 			Arguments::Positional(arguments) => {
 				for argument in arguments {

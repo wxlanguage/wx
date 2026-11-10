@@ -30,9 +30,10 @@ use super::{BodyContext, Integer, ValuePath};
 use crate::ast::{self, Keyword, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprKind, LocalIdx, PatIdx, PatternKind};
-use crate::tir::defs::{BindingTarget, DefKind, StructIdx, TraitIdx};
+use crate::tir::defs::{BindingTarget, DefKind, StructIdx, Tier, TraitIdx};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
+use crate::tir::resolutions::Selection;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
 use crate::vfs::FileId;
@@ -877,6 +878,13 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.check_field(field, TypeIndex::ERROR, context);
 				continue;
 			};
+			self.cx.resolutions.record_selection(
+				(SourceSpan::new(self.scope.file_id, name.span), Tier::Value),
+				Selection::Field {
+					owner: struct_index,
+					field: index,
+				},
+			);
 			let at = usize::from(index);
 			if let Some((_, first)) = given[at] {
 				let field_name = self.cx.strings.resolve(name.inner).unwrap();

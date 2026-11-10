@@ -1043,7 +1043,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	fn record_local(&mut self, local: LocalIdx, span: TextSpan) {
-		self.cx.resolutions.by_site.insert(
+		self.cx.resolutions.record(
 			(SourceSpan::new(self.scope.file_id, span), Tier::Value),
 			Referent::Local {
 				owner: self.owner,
@@ -1076,7 +1076,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						expected,
 						span,
 					),
-					Err(error) => error,
+					Err(error) => {
+						self.build_unchecked_arguments(arguments);
+						error
+					}
 				};
 			}
 			_ => {
@@ -1100,6 +1103,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let Some((struct_index, type_args)) =
 				self.impl_self_struct(segment)
 			else {
+				self.build_unchecked_arguments(arguments);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			};
 			if !self.constructor_accessible(struct_index) {
@@ -1130,9 +1134,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					span,
 				);
 			}
-			Err(error) => return error,
+			Err(error) => {
+				self.build_unchecked_arguments(arguments);
+				return error;
+			}
 		};
 		let Some(key) = walk.target.def_key() else {
+			self.build_unchecked_arguments(arguments);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		let kind = key.symbol_kind(self.cx.defs);
@@ -1486,7 +1494,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			);
 			return None;
 		};
-		self.cx.resolutions.by_site.insert(
+		self.cx.resolutions.record(
 			(site, Tier::Value),
 			match impl_kind {
 				ImplKind::Inherent(index) => Referent::InherentImplSelf(index),
@@ -3090,7 +3098,7 @@ mod tests {
 	use super::super::eval::{ConstScalar, ConstValueState};
 	use super::super::impls::ImplDispatch;
 	use super::super::paths::PathResolver;
-	use super::super::resolutions::{NameResolutions, Referent};
+	use super::super::resolutions::{NameResolutions, Referent, Resolution};
 	use super::super::signatures::TypeContext;
 	use super::super::solver::{NormalizationDepth, RewriteFlags, Solver};
 	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
@@ -3858,7 +3866,7 @@ mod tests {
 		);
 		assert!(matches!(
 			case.context.resolutions.by_site.get(&site),
-			Some(Referent::Local { local, .. }) if u32::from(*local) == 0
+			Some(Resolution::Reference(Referent::Local { local, .. })) if u32::from(*local) == 0
 		));
 	}
 
@@ -4299,7 +4307,7 @@ mod tests {
 		);
 		assert!(matches!(
 			case.context.resolutions.by_site.get(&site),
-			Some(Referent::Label { label, .. }) if u32::from(*label) == 0
+			Some(Resolution::Reference(Referent::Label { label, .. })) if u32::from(*label) == 0
 		));
 	}
 

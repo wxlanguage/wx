@@ -614,7 +614,7 @@ impl TypeContext<'_, '_, '_> {
 				required: trait_index,
 				reference: SourceSpan::new(scope.file_id, segment.ident.span),
 			});
-			self.resolutions.by_site.insert(
+			self.resolutions.record(
 				(
 					SourceSpan::new(scope.file_id, segment.ident.span),
 					Tier::Type,
@@ -815,8 +815,7 @@ impl TypeContext<'_, '_, '_> {
 			reference,
 		});
 		self.resolutions
-			.by_site
-			.insert((reference, Tier::Value), Referent::Member(declaration));
+			.record((reference, Tier::Value), Referent::Member(declaration));
 		Some((constant, vec![receiver]))
 	}
 
@@ -959,8 +958,7 @@ impl TypeContext<'_, '_, '_> {
 				GenericEnvOwner::InherentImpl(impl_index),
 			);
 			self.resolutions
-				.by_site
-				.insert((reference, key.tier), Referent::Member(kind));
+				.record((reference, key.tier), Referent::Member(kind));
 			return Some((kind, impl_args.into_vec()));
 		}
 		None
@@ -999,7 +997,7 @@ impl TypeContext<'_, '_, '_> {
 			name,
 			file_id,
 		)?;
-		self.resolutions.by_site.insert(
+		self.resolutions.record(
 			(SourceSpan::new(file_id, name.span), key.tier),
 			Referent::Member(kind),
 		);
@@ -1058,7 +1056,7 @@ impl TypeContext<'_, '_, '_> {
 				}
 			}
 		};
-		self.resolutions.by_site.insert(
+		self.resolutions.record(
 			(SourceSpan::new(file_id, name.span), Tier::Value),
 			Referent::Member(member.selected_kind(self.defs)),
 		);

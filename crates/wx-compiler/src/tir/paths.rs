@@ -226,7 +226,7 @@ impl<'r> PathResolver<'r> {
 					// hop that has no real `DefKey` behind it.
 					let def_key = target.def_key();
 					if let Some(def_key) = def_key {
-						self.resolutions.by_site.insert(
+						self.resolutions.record(
 							(
 								SourceSpan::new(file_id, segment.ident.span),
 								seg_tier,

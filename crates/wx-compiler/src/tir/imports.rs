@@ -679,7 +679,7 @@ impl<'r> ImportResolver<'r> {
 				import,
 			} => {
 				if let Some(def_key) = target.def_key() {
-					self.resolutions.by_site.insert(
+					self.resolutions.record(
 						(source_span, key.tier),
 						Referent::from_lookup(def_key, import),
 					);
@@ -869,7 +869,7 @@ impl<'r> ImportResolver<'r> {
 				import,
 			} => {
 				if let Some(def_key) = target.def_key() {
-					self.resolutions.by_site.insert(
+					self.resolutions.record(
 						(source_span, key.tier),
 						Referent::from_lookup(def_key, import),
 					);
