@@ -549,10 +549,7 @@ fn empty_and_zero_initialized_values_need_no_computation_locals() {
 	}
 }
 
-fn run_source(
-	source: &str,
-	emitted: bool,
-) -> (wasmtime::Store<()>, wasmtime::Instance) {
+fn lower_source(source: &str) -> (crate::vfs::CompilationUnit, mir::MIR) {
 	let mut builder = crate::vfs::CompilationUnitBuilder::new();
 	builder.load_stdlib();
 	let root = builder
@@ -570,7 +567,15 @@ fn run_source(
 	let (diagnostics, mir) = crate::tir::build(&mut unit);
 	crate::testing::DiagnosticView::new("tir", &diagnostics, &unit.files)
 		.assert_no_errors();
-	run_mode(mir.expect("source lowers"), &unit.strings, emitted)
+	(unit, mir.expect("source lowers"))
+}
+
+fn run_source(
+	source: &str,
+	emitted: bool,
+) -> (wasmtime::Store<()>, wasmtime::Instance) {
+	let (unit, mir) = lower_source(source);
+	run_mode(mir, &unit.strings, emitted)
 }
 
 #[test]
@@ -891,5 +896,116 @@ fn computations_shared_by_back_edges_and_post_loop_reads_stay_inside_loop() {
 		for n in [0, 1, 2, 20] {
 			assert_eq!(run.call(&mut store, n).unwrap(), n + 1);
 		}
+	}
+}
+
+#[test]
+fn untargeted_blocks_fall_through_without_labels_or_transfers() {
+	let source = r#"
+		func run(x: i32) -> i32 {
+			block { block {}; block {}; block { x + 1 } }
+		}
+		export { run as "run" }
+	"#;
+	let (unit, mut mir) = lower_source(source);
+	opt::emit_for_tests(&mut mir);
+	let code = mir.code(mir::FunctionId::new(0));
+	assert_eq!(code.label_count, 0);
+	assert!(!code.body.kinds().iter().any(|kind| matches!(
+		kind,
+		E::Block { .. } | E::Break { .. } | E::Continue { .. }
+	)));
+	let (mut store, instance) = run_mode(mir, &unit.strings, false);
+	let run = instance
+		.get_typed_func::<i32, i32>(&mut store, "run")
+		.unwrap();
+	for x in [0i32, -1, 42, i32::MAX] {
+		assert_eq!(run.call(&mut store, x).unwrap(), x.wrapping_add(1));
+	}
+}
+
+#[test]
+fn falling_through_if_and_switch_arms_keep_computations_and_join_updates() {
+	for body in [
+		"if n == 0 { block { x + 1 } } else { block { x * 2 } }",
+		"match n { 0 => block { x + 1 }, 1 => block { x * 2 }, 2 => block { x * 2 }, _ => block { x * 2 } }",
+	] {
+		let source = format!(
+			"func run(n: i32, x: i32) -> i32 {{ {body} }} export {{ run as \"run\" }}"
+		);
+		let (unit, mut mir) = lower_source(&source);
+		opt::emit_for_tests(&mut mir);
+		let code = mir.code(mir::FunctionId::new(0));
+		assert_eq!(code.label_count, 0, "normal arm exits need no labels");
+		assert!(
+			!code
+				.body
+				.kinds()
+				.iter()
+				.any(|kind| matches!(kind, E::Block { .. } | E::Break { .. }))
+		);
+		assert!(code.body.kinds().iter().any(|kind| matches!(kind,
+			E::SetLocals { targets, .. } if !code.body.targets(*targets).is_empty())));
+		let (mut store, instance) = run_mode(mir, &unit.strings, false);
+		let run = instance
+			.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+			.unwrap();
+		for n in [-1, 0, 1, 2, 3] {
+			for x in [-17i32, 0, 42, i32::MAX] {
+				let expected = if n == 0 {
+					x.wrapping_add(1)
+				} else {
+					x.wrapping_mul(2)
+				};
+				assert_eq!(run.call(&mut store, (n, x)).unwrap(), expected);
+			}
+		}
+	}
+}
+
+#[test]
+fn nonlocal_exits_keep_their_wrapper_and_skip_parent_continuation() {
+	let source = r#"
+		global mut trace: i32 = 0;
+		func run(flag: Bool) -> (i32, i32) {
+			trace.set(0);
+			local value: i32 = block :done {
+				block {
+					if flag { trace.set(1); break :done 7; };
+				};
+				trace.set(2);
+				9
+			};
+			(value, trace.get())
+		}
+		export { run as "run" }
+	"#;
+	let (unit, mut mir) = lower_source(source);
+	opt::emit_for_tests(&mut mir);
+	let code = mir.code(mir::FunctionId::new(0));
+	assert_eq!(code.label_count, 1, "only the nonlocal exit needs a label");
+	assert!(
+		code.body
+			.kinds()
+			.iter()
+			.any(|kind| matches!(kind, E::Break { .. }))
+	);
+	assert_eq!(
+		code.body
+			.kinds()
+			.iter()
+			.filter(|kind| matches!(kind, E::Block { .. }))
+			.count(),
+		1
+	);
+	let (mut store, instance) = run_mode(mir, &unit.strings, false);
+	let run = instance
+		.get_typed_func::<i32, (i32, i32)>(&mut store, "run")
+		.unwrap();
+	for flag in [0, 1, 0, 1] {
+		assert_eq!(
+			run.call(&mut store, flag).unwrap(),
+			if flag == 0 { (9, 2) } else { (7, 1) }
+		);
 	}
 }
