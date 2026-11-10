@@ -7,8 +7,9 @@ use super::*;
 use crate::testing::DiagnosticView;
 use crate::vfs;
 
-fn lower(source: &str) -> (vfs::CompilationUnit, mir::MIR) {
-	let mut builder = vfs::CompilationUnitBuilder::new();
+fn lower(source: &str) -> (ast::StringInterner, mir::MIR) {
+	let mut strings = crate::symbols::Keyword::create_interner();
+	let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 	builder.load_stdlib();
 	let root = builder
 		.load_binary(
@@ -21,10 +22,10 @@ fn lower(source: &str) -> (vfs::CompilationUnit, mir::MIR) {
 			),
 		)
 		.unwrap();
-	let mut unit = builder.build(root);
-	let (diagnostics, mir) = crate::tir::build(&mut unit);
+	let unit = builder.build(root);
+	let (diagnostics, mir) = crate::tir::build(&unit, &mut strings);
 	DiagnosticView::new("tir", &diagnostics, &unit.files).assert_no_errors();
-	(unit, mir.expect("source lowers"))
+	(strings, mir.expect("source lowers"))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -96,9 +97,9 @@ fn compare_emitter_size_locals_and_execution() {
 		);
 		let mut reference = None;
 		for mode in [Mode::Direct, Mode::Graph, Mode::GraphWithTee] {
-			let (unit, mut mir) = lower(&source);
+			let (strings, mut mir) = lower(&source);
 			mir::inline::run(&mut mir, mir::inline::Policy::DEFAULT);
-			let module = compile(&mut mir, &unit.strings, mode);
+			let module = compile(&mut mir, &strings, mode);
 			let locals: usize = module
 				.code
 				.functions
@@ -150,7 +151,7 @@ fn graph_emission_removes_dead_calls_without_changing_item_ids() {
 		export { run as "run" }
 	"#;
 	for inline in [false, true] {
-		let (unit, mut mir) = lower(source);
+		let (strings, mut mir) = lower(source);
 		// ATTRIBUTE_ONLY keeps helper calls in the arena until graph construction.
 		if inline {
 			mir::inline::run(&mut mir, mir::inline::Policy::ATTRIBUTE_ONLY);
@@ -172,7 +173,7 @@ fn graph_emission_removes_dead_calls_without_changing_item_ids() {
 				.filter_map(|function| function.code())
 				.all(|code| code.callees().next().is_none())
 		);
-		let module = Builder::build_linearized(&mir, &unit.strings).unwrap();
+		let module = Builder::build_linearized(&mir, &strings).unwrap();
 		let engine = wasmtime::Engine::default();
 		let module = wasmtime::Module::new(&engine, module.encode()).unwrap();
 		let mut store = wasmtime::Store::new(&engine, ());
@@ -198,7 +199,7 @@ fn reachability_skips_a_removed_callee_and_the_program_still_executes() {
 		export { run as "run" }
 	"#;
 	for inline in [false, true] {
-		let (unit, mut mir) = lower(source);
+		let (strings, mut mir) = lower(source);
 		if inline {
 			mir::inline::run(&mut mir, mir::inline::Policy::ATTRIBUTE_ONLY);
 		}
@@ -222,7 +223,7 @@ fn reachability_skips_a_removed_callee_and_the_program_still_executes() {
 			callee_before
 		);
 		assert_eq!(mir.functions.len(), 2, "MIR tables keep their stable IDs");
-		let module = Builder::build(&mir, &unit.strings, &reached).unwrap();
+		let module = Builder::build(&mir, &strings, &reached).unwrap();
 		assert_eq!(module.code.functions.len(), 1);
 		assert_eq!(module.functions.types.len(), 1);
 		let engine = wasmtime::Engine::default();

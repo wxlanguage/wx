@@ -13,11 +13,8 @@ pub(super) struct TestCase {
 
 impl TestCase {
 	pub(super) fn new(source: &str) -> Self {
-		// The builder's interner is the one the real pipeline parses with: it
-		// has the keywords pre-interned, which `StringInterner::new()` does not.
-		let builder = vfs::CompilationUnitBuilder::new();
-		let mut interner = builder.strings;
-		let mut files = builder.files;
+		let mut interner = wx_compiler::symbols::Keyword::create_interner();
+		let mut files = vfs::Files::new();
 		let file_id = files
 			.add(
 				"main.wx".to_string(),

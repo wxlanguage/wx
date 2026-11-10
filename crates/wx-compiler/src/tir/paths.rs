@@ -520,6 +520,7 @@ mod tests {
 	/// stays self-contained, same as `imports.rs`'s own copy.
 	struct TestCase {
 		graph: vfs::CompilationUnit,
+		strings: StringInterner,
 		defs: DefinitionRegistry,
 		diagnostics: Vec<Diagnostic<FileId>>,
 	}
@@ -558,7 +559,10 @@ mod tests {
 	}
 
 	impl TestCase {
-		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
+		fn from_graph(
+			graph: vfs::CompilationUnit,
+			mut strings: StringInterner,
+		) -> Self {
 			let parser_diagnostics = graph.collect_parser_diagnostics();
 			DiagnosticView::new("parse", &parser_diagnostics, &graph.files)
 				.assert_no_errors();
@@ -571,7 +575,7 @@ mod tests {
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
-				&mut graph.strings,
+				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
 				graph.stdlib_package,
@@ -581,13 +585,15 @@ mod tests {
 
 			Self {
 				graph,
+				strings,
 				defs,
 				diagnostics,
 			}
 		}
 
 		fn new(source: &str) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 			builder.load_stdlib();
 			let root_id = builder
 				.load_binary(
@@ -598,14 +604,15 @@ mod tests {
 					)])),
 				)
 				.unwrap();
-			Self::from_graph(builder.build(root_id))
+			Self::from_graph(builder.build(root_id), strings)
 		}
 
 		fn new_workspace(
 			entry_path: vfs::AbsolutePath,
 			workspace: HashMap<vfs::AbsolutePath, String>,
 		) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 			builder.load_stdlib();
 			let root_id = builder
 				.load_binary(
@@ -613,7 +620,7 @@ mod tests {
 					&vfs::VirtualFileSource::new(workspace),
 				)
 				.unwrap();
-			Self::from_graph(builder.build(root_id))
+			Self::from_graph(builder.build(root_id), strings)
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
@@ -640,7 +647,7 @@ mod tests {
 					};
 					PathSegment {
 						ident: crate::ast::Spanned {
-							inner: self.graph.strings.get_or_intern(name),
+							inner: self.strings.get_or_intern(name),
 							span,
 						},
 						type_args: Box::new([]),
@@ -661,7 +668,7 @@ mod tests {
 			PathResolver::new(
 				&mut Vec::new(),
 				&mut NameResolutions::default(),
-				&self.graph.strings,
+				&self.strings,
 				&self.defs,
 			)
 			.try_resolve_path(file_id, from, &segments, tier)
@@ -691,7 +698,7 @@ mod tests {
 			let target = PathResolver::new(
 				&mut diagnostics,
 				&mut resolutions,
-				&self.graph.strings,
+				&self.strings,
 				&self.defs,
 			)
 			.resolve_path(file_id, from, segments, tier);
@@ -830,7 +837,7 @@ mod tests {
 		let walk = PathResolver::new(
 			&mut diagnostics,
 			&mut resolutions,
-			&case.graph.strings,
+			&case.strings,
 			&case.defs,
 		)
 		.walk_path(file_id, root, &segments, Tier::Type);
@@ -951,7 +958,7 @@ mod tests {
 			panic!("expected the private module");
 		};
 		let name = case.defs.modules[usize::from(module)].name;
-		assert_eq!(case.graph.strings.resolve(name.inner), Some("b"));
+		assert_eq!(case.strings.resolve(name.inner), Some("b"));
 		let namespace = Scope::Module(module);
 		let original =
 			case.resolve(namespace, Tier::Type, "C").expect_success();
@@ -987,8 +994,7 @@ mod tests {
 			panic!("expected struct C");
 		};
 		assert_eq!(
-			case.graph
-				.strings
+			case.strings
 				.resolve(case.defs.structs[usize::from(index)].name.inner),
 			Some("C")
 		);
@@ -1098,7 +1104,7 @@ mod tests {
 		let definition = PathResolver::new(
 			&mut diagnostics,
 			&mut NameResolutions::default(),
-			&case.graph.strings,
+			&case.strings,
 			&case.defs,
 		)
 		.resolve_definition(file_id, root, &segments, Tier::Type);
@@ -1150,8 +1156,7 @@ mod tests {
 			panic!("expected struct C");
 		};
 		assert_eq!(
-			case.graph
-				.strings
+			case.strings
 				.resolve(case.defs.structs[usize::from(index)].name.inner),
 			Some("C")
 		);

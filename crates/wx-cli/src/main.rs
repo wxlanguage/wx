@@ -242,9 +242,12 @@ fn resolve_cli_path(file_path: &str) -> vfs::AbsolutePath {
 /// `wx.json`/`entry`. There's no anonymous, manifest-less mode any more
 /// than `wx format` has one; every file `build`/`check` touches belongs to
 /// a project.
-fn load_compilation(path: &str) -> vfs::CompilationUnit {
+fn load_compilation(
+	path: &str,
+	strings: &mut symbols::StringInterner,
+) -> vfs::CompilationUnit {
 	let absolute = resolve_cli_path(path);
-	match vfs::open_manifest(absolute, &vfs::NativeFileSource) {
+	match vfs::open_manifest(absolute, &vfs::NativeFileSource, strings) {
 		Ok(compilation) => compilation,
 		Err(()) => {
 			eprintln!(
@@ -305,7 +308,8 @@ fn abort_if_errors(count: usize) {
 }
 
 fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
-	let mut compilation = load_compilation(project_path);
+	let mut strings = symbols::Keyword::create_interner();
+	let compilation = load_compilation(project_path, &mut strings);
 
 	if compilation.packages[compilation.root_package.as_usize()].kind
 		== vfs::PackageKind::Library
@@ -321,17 +325,15 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let (diagnostics, mir) = tir::build(&mut compilation);
+	let (diagnostics, mir) = tir::build(&compilation, &mut strings);
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 	let mut mir =
 		mir.expect("lowering without an error diagnostic produces MIR");
 
-	let Ok(module) = backend::emit(
-		&mut mir,
-		&compilation.strings,
-		Some(mir::inline::Policy::DEFAULT),
-	) else {
+	let Ok(module) =
+		backend::emit(&mut mir, &strings, Some(mir::inline::Policy::DEFAULT))
+	else {
 		eprintln!("error: WebAssembly code generation failed");
 		std::process::exit(1);
 	};
@@ -368,7 +370,8 @@ fn output_stem(path: &str) -> String {
 }
 
 fn cmd_check(project_path: &str, format: MessageFormat) {
-	let mut compilation = load_compilation(project_path);
+	let mut strings = symbols::Keyword::create_interner();
+	let compilation = load_compilation(project_path, &mut strings);
 
 	// Gathered once, then both printed and counted — rather than walking the
 	// package graph a second time to recount what was just printed.
@@ -376,7 +379,7 @@ fn cmd_check(project_path: &str, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let diagnostics = tir::check(&mut compilation);
+	let diagnostics = tir::check(&compilation, &mut strings);
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 

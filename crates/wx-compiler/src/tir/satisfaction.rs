@@ -945,14 +945,15 @@ mod tests {
 		source: &str,
 		f: impl FnOnce(&mut TypeContext) -> R,
 	) -> R {
-		let mut graph = source_graph(source);
+		let mut strings = Keyword::create_interner();
+		let graph = source_graph(source, &mut strings);
 
 		let mut diagnostics = Vec::new();
 		let mut resolutions = NameResolutions::default();
 		let (defs, ast_nodes) = DefinitionRegistry::build(
 			&graph.packages,
 			&graph.files,
-			&mut graph.strings,
+			&mut strings,
 			&mut diagnostics,
 			&mut resolutions,
 			graph.stdlib_package,
@@ -961,7 +962,7 @@ mod tests {
 		let impl_dispatch = ImplDispatch::build(
 			&mut diagnostics,
 			&mut resolutions,
-			&graph.strings,
+			&strings,
 			&defs,
 			&ast_nodes,
 		);
@@ -969,7 +970,7 @@ mod tests {
 		let mut builder = TypeContext::new(
 			&mut diagnostics,
 			&mut resolutions,
-			&mut graph.strings,
+			&mut strings,
 			&mut solver,
 			&graph.files,
 			&defs,

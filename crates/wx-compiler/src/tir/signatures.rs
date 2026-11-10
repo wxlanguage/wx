@@ -5566,25 +5566,29 @@ pub(super) mod tests {
 	/// `test_case!(std case = ..)` plays the stdlib itself.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
-			test_case!($case from source_graph($source));
+			let mut strings = Keyword::create_interner();
+			test_case!($case from source_graph($source, &mut strings), strings);
 		};
 		(mut $case:ident = $source:expr $(,)?) => {
-			test_case!(mut $case from source_graph($source));
+			let mut strings = Keyword::create_interner();
+			test_case!(mut $case from source_graph($source, &mut strings), strings);
 		};
 		(std $case:ident = $source:expr $(,)?) => {
-			test_case!($case from std_source_graph($source));
+			let mut strings = Keyword::create_interner();
+			test_case!($case from std_source_graph($source, &mut strings), strings);
 		};
 		(std mut $case:ident = $source:expr $(,)?) => {
-			test_case!(mut $case from std_source_graph($source));
+			let mut strings = Keyword::create_interner();
+			test_case!(mut $case from std_source_graph($source, &mut strings), strings);
 		};
-		($case:ident from $graph:expr) => {
-			let mut graph = $graph;
-			let mut inputs = TestInputs::new(&mut graph);
+		($case:ident from $graph:expr, $strings:ident) => {
+			let graph = $graph;
+			let mut inputs = TestInputs::new(&graph, &mut $strings);
 			let $case = TestCase::new(&mut inputs);
 		};
-		(mut $case:ident from $graph:expr) => {
-			let mut graph = $graph;
-			let mut inputs = TestInputs::new(&mut graph);
+		(mut $case:ident from $graph:expr, $strings:ident) => {
+			let graph = $graph;
+			let mut inputs = TestInputs::new(&graph, &mut $strings);
 			let mut $case = TestCase::new(&mut inputs);
 		};
 	}
@@ -5592,24 +5596,28 @@ pub(super) mod tests {
 	/// `test_case!` that first asserts the source parses and links cleanly.
 	macro_rules! checked_case {
 		($case:ident = $source:expr $(,)?) => {
-			let graph = source_graph($source);
+			let mut strings = Keyword::create_interner();
+			let graph = source_graph($source, &mut strings);
 			assert_graph_clean(&graph);
-			test_case!($case from graph);
+			test_case!($case from graph, strings);
 		};
 		(mut $case:ident = $source:expr $(,)?) => {
-			let graph = source_graph($source);
+			let mut strings = Keyword::create_interner();
+			let graph = source_graph($source, &mut strings);
 			assert_graph_clean(&graph);
-			test_case!(mut $case from graph);
+			test_case!(mut $case from graph, strings);
 		};
 		(std $case:ident = $source:expr $(,)?) => {
-			let graph = std_source_graph($source);
+			let mut strings = Keyword::create_interner();
+			let graph = std_source_graph($source, &mut strings);
 			assert_graph_clean(&graph);
-			test_case!($case from graph);
+			test_case!($case from graph, strings);
 		};
 		(std mut $case:ident = $source:expr $(,)?) => {
-			let graph = std_source_graph($source);
+			let mut strings = Keyword::create_interner();
+			let graph = std_source_graph($source, &mut strings);
 			assert_graph_clean(&graph);
-			test_case!(mut $case from graph);
+			test_case!(mut $case from graph, strings);
 		};
 	}
 
@@ -7390,7 +7398,9 @@ pub(super) mod tests {
 		source: &str,
 		check: impl FnOnce(&mut TypeContext<'_, '_, '_>),
 	) {
-		pending_signatures(tests::source_graph(source), check);
+		let mut strings = Keyword::create_interner();
+		let graph = tests::source_graph(source, &mut strings);
+		pending_signatures(graph, &mut strings, check);
 	}
 
 	/// `with_pending_signatures`, playing the stdlib itself.
@@ -7398,11 +7408,14 @@ pub(super) mod tests {
 		source: &str,
 		check: impl FnOnce(&mut TypeContext<'_, '_, '_>),
 	) {
-		pending_signatures(tests::std_source_graph(source), check);
+		let mut strings = Keyword::create_interner();
+		let graph = tests::std_source_graph(source, &mut strings);
+		pending_signatures(graph, &mut strings, check);
 	}
 
 	fn pending_signatures(
-		mut graph: vfs::CompilationUnit,
+		graph: vfs::CompilationUnit,
+		strings: &mut StringInterner,
 		check: impl FnOnce(&mut TypeContext<'_, '_, '_>),
 	) {
 		DiagnosticView::new(
@@ -7422,7 +7435,7 @@ pub(super) mod tests {
 		let (defs, ast_nodes) = DefinitionRegistry::build(
 			&graph.packages,
 			&graph.files,
-			&mut graph.strings,
+			strings,
 			&mut diagnostics,
 			&mut resolutions,
 			graph.stdlib_package,
@@ -7431,7 +7444,7 @@ pub(super) mod tests {
 		let dispatch = ImplDispatch::build(
 			&mut diagnostics,
 			&mut resolutions,
-			&graph.strings,
+			strings,
 			&defs,
 			&ast_nodes,
 		);
@@ -7441,7 +7454,7 @@ pub(super) mod tests {
 		check(&mut TypeContext::new(
 			&mut diagnostics,
 			&mut resolutions,
-			&mut graph.strings,
+			strings,
 			&mut solver,
 			&graph.files,
 			&defs,
@@ -7544,8 +7557,11 @@ pub(super) mod tests {
 	}
 
 	/// Parses `source` as a single-file binary over the embedded stdlib.
-	pub(in crate::tir) fn source_graph(source: &str) -> vfs::CompilationUnit {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+	pub(in crate::tir) fn source_graph(
+		source: &str,
+		strings: &mut StringInterner,
+	) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new(strings);
 		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
@@ -7577,8 +7593,9 @@ pub(super) mod tests {
 	/// (`type u8;`), lang items (`Bool`, `Char`) and traits.
 	pub(in crate::tir) fn std_source_graph(
 		source: &str,
+		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+		let mut builder = vfs::CompilationUnitBuilder::new(strings);
 		let root_id = builder
 			.load_binary(
 				vfs::AbsolutePath::new("/main.wx"),
@@ -7618,11 +7635,13 @@ pub(super) mod tests {
 	}
 
 	impl<'g> TestInputs<'g> {
-		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+		fn new(
+			graph: &'g vfs::CompilationUnit,
+			strings: &'g mut StringInterner,
+		) -> Self {
 			let vfs::CompilationUnit {
 				files,
 				packages,
-				strings,
 				stdlib_package,
 				root_package,
 			} = graph;
@@ -18458,7 +18477,8 @@ pub(super) mod tests {
 
 	#[test]
 	fn dependency_exports_are_ignored_and_package_kind_does_not_gate_exports() {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+		let mut strings = Keyword::create_interner();
+		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
 			(
 				"dep.wx".to_string(),
@@ -18498,7 +18518,7 @@ pub(super) mod tests {
 				&workspace,
 			)
 			.unwrap();
-		test_case!(case from builder.build(root));
+		test_case!(case from builder.build(root), strings);
 		case.diagnostics().assert_none();
 		assert_eq!(case.defs.exports.len(), 1);
 		let export =
@@ -18521,7 +18541,8 @@ pub(super) mod tests {
 	#[test]
 	fn an_imported_declaration_resolves_qualified_types_in_the_enclosing_scope()
 	{
-		let mut builder = vfs::CompilationUnitBuilder::new();
+		let mut strings = Keyword::create_interner();
+		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 		builder.load_stdlib();
 		let workspace =
 			vfs::VirtualFileSource::from_relative(HashMap::from([(
@@ -18536,7 +18557,7 @@ pub(super) mod tests {
 				&workspace,
 			)
 			.unwrap();
-		test_case!(case from builder.build(root));
+		test_case!(case from builder.build(root), strings);
 		case.diagnostics().assert_none();
 	}
 

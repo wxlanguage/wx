@@ -610,8 +610,9 @@ mod tests {
 	/// test.
 	macro_rules! test_case {
 		(mut $case:ident = $source:expr $(,)?) => {
-			let mut graph = source_graph($source);
-			let mut inputs = TestInputs::new(&mut graph);
+			let mut strings = ast::Keyword::create_interner();
+			let graph = source_graph($source, &mut strings);
+			let mut inputs = TestInputs::new(&graph, &mut strings);
 			let mut $case = TestCase::new(&mut inputs);
 		};
 	}
@@ -629,11 +630,13 @@ mod tests {
 	}
 
 	impl<'g> TestInputs<'g> {
-		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+		fn new(
+			graph: &'g vfs::CompilationUnit,
+			strings: &'g mut StringInterner,
+		) -> Self {
 			let vfs::CompilationUnit {
 				files,
 				packages,
-				strings,
 				stdlib_package,
 				root_package,
 			} = graph;

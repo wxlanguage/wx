@@ -8,6 +8,7 @@ use string_interner::symbol::SymbolU32;
 
 use crate::ast;
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::symbols::StringInterner;
 
 mod manifest;
 pub use manifest::{
@@ -347,6 +348,8 @@ pub struct Package {
 	pub path_to_module: HashMap<AbsolutePath, ModuleId>,
 }
 
+/// Parsed inputs. All symbols use the caller-owned interner supplied while
+/// loading; keep that interner available when interpreting these inputs.
 pub struct CompilationUnit {
 	pub files: Files,
 	pub packages: Vec<Package>,
@@ -357,7 +360,6 @@ pub struct CompilationUnit {
 	/// `Option`. Equal to `root_package` when the root package *is* the
 	/// stdlib.
 	pub stdlib_package: PackageId,
-	pub strings: ast::StringInterner,
 }
 
 impl CompilationUnit {
@@ -392,9 +394,11 @@ impl CompilationUnit {
 	}
 }
 
-pub struct CompilationUnitBuilder {
+/// Temporary loader. Its single interner borrow ensures every loaded package
+/// uses the same symbol identities. Building releases the borrow.
+pub struct CompilationUnitBuilder<'strings> {
 	pub files: Files,
-	pub strings: ast::StringInterner,
+	strings: &'strings mut StringInterner,
 	pub packages: Vec<Package>,
 	/// Set once the stdlib exists, and seeded into every package loaded
 	/// afterwards as its implicit `std` dependency. `None` only while the
@@ -462,17 +466,15 @@ impl FileSource for StdlibFileSource {
 	}
 }
 
-impl Default for CompilationUnitBuilder {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl CompilationUnitBuilder {
-	pub fn new() -> Self {
+impl<'strings> CompilationUnitBuilder<'strings> {
+	/// Uses one caller-owned interner for every package loaded by this builder.
+	/// It must be seeded with [`crate::symbols::Keyword::create_interner`].
+	/// Consuming the builder with [`Self::build`] releases its interner borrow;
+	/// the resulting compilation owns only parsed inputs.
+	pub fn new(strings: &'strings mut StringInterner) -> Self {
 		Self {
 			files: Files::new(),
-			strings: ast::Keyword::create_interner(),
+			strings,
 			packages: Vec::new(),
 			stdlib: None,
 		}
@@ -619,24 +621,25 @@ impl CompilationUnitBuilder {
 			packages: self.packages,
 			root_package,
 			stdlib_package,
-			strings: self.strings,
 		}
 	}
 }
 
-struct Loader<'ctx, 'src, S: FileSource> {
+struct Loader<'ctx, 'src, 'strings, S: FileSource> {
 	package_id: PackageId,
 	file_source: &'src S,
 	modules: Vec<SourceModule>,
 	diagnostics: Vec<Diagnostic<FileId>>,
 	path_to_module: HashMap<AbsolutePath, ModuleId>,
-	ctx: &'ctx mut CompilationUnitBuilder,
+	ctx: &'ctx mut CompilationUnitBuilder<'strings>,
 }
 
-impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
+impl<'ctx, 'src, 'strings, Source: FileSource>
+	Loader<'ctx, 'src, 'strings, Source>
+{
 	#[inline]
 	fn new(
-		ctx: &'ctx mut CompilationUnitBuilder,
+		ctx: &'ctx mut CompilationUnitBuilder<'strings>,
 		package_id: PackageId,
 		file_source: &'src Source,
 	) -> Self {
@@ -678,7 +681,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 				"file count should never realistically approach FileId's limit",
 			);
 		let ast =
-			ast::Parser::parse(file_id, &self.ctx.files, &mut self.ctx.strings);
+			ast::Parser::parse(file_id, &self.ctx.files, self.ctx.strings);
 
 		let module_id = ModuleId(self.modules.len() as u32);
 		let child_decls: Box<[ModuleDeclaration]> = ast

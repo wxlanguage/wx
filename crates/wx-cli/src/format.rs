@@ -40,7 +40,8 @@ pub fn expand_project(
 	let manifest = PackageManifest::parse(&manifest_source).map_err(|_| ())?;
 	let config = RendererConfig::from_manifest(manifest.format);
 
-	let mut builder = CompilationUnitBuilder::new();
+	let mut interner = wx_compiler::symbols::Keyword::create_interner();
+	let mut builder = CompilationUnitBuilder::new(&mut interner);
 	let modules = match files {
 		None => {
 			let entry = dir.join(&manifest.entry);
@@ -63,7 +64,7 @@ pub fn expand_project(
 
 	Ok(FormatSelection {
 		files: builder.files,
-		interner: builder.strings,
+		interner,
 		modules,
 		config,
 	})

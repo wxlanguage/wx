@@ -26,8 +26,11 @@ mod tests {
 	use crate::testing::DiagnosticView;
 	use crate::vfs;
 
-	fn source_graph(source: &str) -> vfs::CompilationUnit {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+	fn source_graph(
+		source: &str,
+		strings: &mut StringInterner,
+	) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new(strings);
 		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
@@ -60,12 +63,14 @@ mod tests {
 			func run(x: i32) -> i32 { double(x) + 1 }
 			export { run as "run" }
 		"#;
-		let mut graph = source_graph(source);
-		let mut mir =
-			crate::tir::build(&mut graph).1.expect("the source lowers");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph = source_graph(source, &mut strings);
+		let mut mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("the source lowers");
 		assert_eq!(mir.functions.len(), 2);
 		let bytes =
-			emit(&mut mir, &graph.strings, Some(mir::inline::Policy::DEFAULT))
+			emit(&mut mir, &strings, Some(mir::inline::Policy::DEFAULT))
 				.expect("the MIR encodes")
 				.encode();
 		assert_eq!(mir.functions.len(), 2, "MIR IDs stay stable");
@@ -96,11 +101,12 @@ mod tests {
 			export { run as "run" }
 		"#;
 		for inline in [None, Some(mir::inline::Policy::DEFAULT)] {
-			let mut graph = source_graph(source);
-			let mut mir = crate::tir::build(&mut graph).1.unwrap();
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let mut mir = crate::tir::build(&graph, &mut strings).1.unwrap();
 			let count = mir.functions.len();
 			let exports: Vec<_> = mir.exports.iter().map(|e| e.item).collect();
-			let module = emit(&mut mir, &graph.strings, inline).unwrap();
+			let module = emit(&mut mir, &strings, inline).unwrap();
 			assert_eq!(mir.functions.len(), count);
 			assert_eq!(
 				mir.exports.iter().map(|e| e.item).collect::<Vec<_>>(),

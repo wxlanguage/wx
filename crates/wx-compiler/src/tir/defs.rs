@@ -4780,8 +4780,8 @@ mod tests {
 		case.diagnostics().assert_none();
 		let contract =
 			&case.defs.package_contracts[case.graph.root_package.as_usize()];
-		let shared = case.graph.strings.get("Shared").unwrap();
-		let compute = case.graph.strings.get("compute").unwrap();
+		let shared = case.strings.get("Shared").unwrap();
+		let compute = case.strings.get("compute").unwrap();
 		assert!(matches!(
 			contract.members[&BindingKey::ty(shared)].item,
 			PackageMemberItem::Type(_)
@@ -4816,6 +4816,7 @@ mod tests {
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,
+		strings: StringInterner,
 		defs: DefinitionRegistry,
 		diagnostics: Vec<Diagnostic<FileId>>,
 	}
@@ -4826,7 +4827,7 @@ mod tests {
 		case: &'a TestCase,
 		member: &str,
 	) -> &'a TraitImplDef {
-		let key = BindingKey::value(case.graph.strings.get(member).unwrap());
+		let key = BindingKey::value(case.strings.get(member).unwrap());
 		case.defs
 			.trait_impls
 			.iter()
@@ -4880,7 +4881,10 @@ mod tests {
 	}
 
 	impl TestCase {
-		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
+		fn from_graph(
+			graph: vfs::CompilationUnit,
+			mut strings: StringInterner,
+		) -> Self {
 			let parser_diagnostics = graph.collect_parser_diagnostics();
 			DiagnosticView::new("parse", &parser_diagnostics, &graph.files)
 				.assert_no_errors();
@@ -4893,7 +4897,7 @@ mod tests {
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
-				&mut graph.strings,
+				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
 				graph.stdlib_package,
@@ -4907,13 +4911,15 @@ mod tests {
 
 			TestCase {
 				graph,
+				strings,
 				defs,
 				diagnostics,
 			}
 		}
 
 		fn new(source: &str) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
+			let mut strings = Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 			builder.load_stdlib();
 			let root_id = builder
 				.load_binary(
@@ -4924,14 +4930,15 @@ mod tests {
 					)])),
 				)
 				.unwrap();
-			Self::from_graph(builder.build(root_id))
+			Self::from_graph(builder.build(root_id), strings)
 		}
 
 		fn new_workspace(
 			entry_path: vfs::AbsolutePath,
 			workspace: HashMap<vfs::AbsolutePath, String>,
 		) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
+			let mut strings = Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 			builder.load_stdlib();
 			let root_id = builder
 				.load_binary(
@@ -4939,7 +4946,7 @@ mod tests {
 					&vfs::VirtualFileSource::new(workspace),
 				)
 				.unwrap();
-			Self::from_graph(builder.build(root_id))
+			Self::from_graph(builder.build(root_id), strings)
 		}
 
 		/// A `"type": "std"` root — no embedded stdlib loaded, so `source`
@@ -4948,6 +4955,7 @@ mod tests {
 		/// themselves rather than asserting against the real, separately
 		/// evolving `std/main.wx`.
 		fn new_stdlib(source: &str) -> Self {
+			let mut strings = Keyword::create_interner();
 			let workspace = vfs::VirtualFileSource::new(HashMap::from([
 				(
 					vfs::AbsolutePath::new("/std/wx.json"),
@@ -4955,10 +4963,13 @@ mod tests {
 				),
 				(vfs::AbsolutePath::new("/std/main.wx"), source.to_string()),
 			]));
-			let graph =
-				vfs::open_manifest(vfs::AbsolutePath::new("/std"), &workspace)
-					.unwrap();
-			Self::from_graph(graph)
+			let graph = vfs::open_manifest(
+				vfs::AbsolutePath::new("/std"),
+				&workspace,
+				&mut strings,
+			)
+			.unwrap();
+			Self::from_graph(graph, strings)
 		}
 
 		fn root_namespace(&self) -> Scope {
@@ -4986,7 +4997,7 @@ mod tests {
 				.split("::")
 				.map(|segment| ast::PathSegment {
 					ident: Spanned {
-						inner: self.graph.strings.get_or_intern(segment),
+						inner: self.strings.get_or_intern(segment),
 						span: TextSpan::new(0, 0),
 					},
 					type_args: Box::new([]),
@@ -5007,7 +5018,7 @@ mod tests {
 			let target = PathResolver::new(
 				&mut diagnostics,
 				&mut resolutions,
-				&self.graph.strings,
+				&self.strings,
 				&self.defs,
 			)
 			.resolve_path(file_id, namespace, segments, tier);
@@ -5137,14 +5148,14 @@ mod tests {
 				panic!("missing intrinsic `{expected_name}`")
 			});
 			let name = case.defs.type_aliases[usize::from(index)].name.inner;
-			assert_eq!(case.graph.strings.resolve(name), Some(expected_name));
+			assert_eq!(case.strings.resolve(name), Some(expected_name));
 		}
 		let bool = intrinsics.bool.expect("`Bool` is recorded");
 		let name = case.defs.enums[usize::from(bool)].name.inner;
-		assert_eq!(case.graph.strings.resolve(name), Some("Bool"));
+		assert_eq!(case.strings.resolve(name), Some("Bool"));
 		let char = intrinsics.char.expect("`Char` is recorded");
 		let name = case.defs.structs[usize::from(char)].name.inner;
-		assert_eq!(case.graph.strings.resolve(name), Some("Char"));
+		assert_eq!(case.strings.resolve(name), Some("Char"));
 	}
 
 	#[test]
@@ -5192,7 +5203,7 @@ mod tests {
 				panic!("missing intrinsic `{expected_name}`")
 			});
 			let name = case.defs.traits[usize::from(index)].name.inner;
-			assert_eq!(case.graph.strings.resolve(name), Some(expected_name));
+			assert_eq!(case.strings.resolve(name), Some(expected_name));
 		}
 	}
 
@@ -5206,7 +5217,7 @@ mod tests {
 		let integer =
 			case.defs.intrinsics.integer.expect("`Integer` is recorded");
 		let name = case.defs.typesets[usize::from(integer)].name.inner;
-		assert_eq!(case.graph.strings.resolve(name), Some("Integer"));
+		assert_eq!(case.strings.resolve(name), Some("Integer"));
 	}
 
 	#[test]
@@ -5294,10 +5305,7 @@ mod tests {
 				panic!("expected `{path}` to be a memory");
 			};
 			let memory = &case.defs.memories[usize::from(index)];
-			assert_eq!(
-				case.graph.strings.resolve(memory.name.inner),
-				Some(name)
-			);
+			assert_eq!(case.strings.resolve(memory.name.inner), Some(name));
 			assert_eq!(memory.namespace, namespace);
 			assert_eq!(
 				memory.file_id,
@@ -5319,10 +5327,7 @@ mod tests {
 		};
 		let function = &case.defs.functions[usize::from(index)];
 		assert_eq!(function.namespace, imported);
-		assert_eq!(
-			case.graph.strings.resolve(function.name.inner),
-			Some("log")
-		);
+		assert_eq!(case.strings.resolve(function.name.inner), Some("log"));
 		assert!(matches!(
 			case.resolve(Tier::Value, "host::counter").expect_success(),
 			DefKind::Global(_),
@@ -5469,7 +5474,7 @@ mod tests {
 					(case.defs.assoc_types[usize::from(index)].name, "Item")
 				}
 			};
-			assert_eq!(case.graph.strings.resolve(name.inner), Some(expected));
+			assert_eq!(case.strings.resolve(name.inner), Some(expected));
 		}
 		assert_eq!(ids.len(), 12);
 		for def in &case.defs.constants {
@@ -5532,7 +5537,7 @@ mod tests {
 		}
 		let case = TestCase::new_stdlib("struct S(); impl S { func f() {} }");
 		case.diagnostics().assert_none();
-		let symbol = case.graph.strings.get("f").unwrap();
+		let symbol = case.strings.get("f").unwrap();
 		let owner = &case.defs.inherent_impls[0];
 		assert_eq!(
 			owner.bindings[&BindingKey::ty(symbol)],
@@ -5584,7 +5589,7 @@ mod tests {
 			panic!("expected a function");
 		};
 		assert_eq!(
-			case.graph.strings.resolve(
+			case.strings.resolve(
 				case.defs.functions[usize::from(index)].params[0]
 					.unwrap()
 					.inner
@@ -5675,7 +5680,7 @@ mod tests {
 		let names: Vec<_> = (u32::from(run.start)..u32::from(run.end))
 			.map(|index| {
 				let name = case.defs.constants[index as usize].name.inner;
-				case.graph.strings.resolve(name).unwrap()
+				case.strings.resolve(name).unwrap()
 			})
 			.collect();
 		assert_eq!(names, ["Same", "Same", "After"]);
@@ -5691,9 +5696,8 @@ mod tests {
 			let case = TestCase::new_stdlib(source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
-			let f = BindingKey::value(case.graph.strings.get("f").unwrap());
-			let after =
-				BindingKey::value(case.graph.strings.get("after").unwrap());
+			let f = BindingKey::value(case.strings.get("f").unwrap());
+			let after = BindingKey::value(case.strings.get("after").unwrap());
 			let (original, later) =
 				if let Some(owner) = case.defs.inherent_impls.first() {
 					(
@@ -5721,7 +5725,7 @@ mod tests {
 				panic!("expected an associated function");
 			};
 			assert_eq!(
-				case.graph.strings.resolve(
+				case.strings.resolve(
 					case.defs.functions[usize::from(index)].params[0]
 						.unwrap()
 						.inner
@@ -5732,7 +5736,7 @@ mod tests {
 				panic!("expected a later associated function");
 			};
 			assert_eq!(
-				case.graph.strings.resolve(
+				case.strings.resolve(
 					case.defs.functions[usize::from(index)].name.inner
 				),
 				Some("after")
@@ -5747,7 +5751,7 @@ mod tests {
 		"});
 		case.diagnostics().assert_none();
 
-		let point_symbol = case.graph.strings.get_or_intern("Point");
+		let point_symbol = case.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
 		let bindings =
 			&case.defs.namespaces.symbols(root_namespace.into()).bindings;
@@ -5766,7 +5770,7 @@ mod tests {
 		"});
 		case.diagnostics().assert_none();
 
-		let point_symbol = case.graph.strings.get_or_intern("Point");
+		let point_symbol = case.strings.get_or_intern("Point");
 		let root_namespace = case.root_namespace();
 		let bindings =
 			&case.defs.namespaces.symbols(root_namespace.into()).bindings;
@@ -5889,7 +5893,7 @@ mod tests {
 				.params
 				.iter()
 				.map(|param| {
-					case.graph.strings.resolve(param.unwrap().inner).unwrap()
+					case.strings.resolve(param.unwrap().inner).unwrap()
 				})
 				.collect();
 			assert_eq!(names, ["x", "x", "tail"]);
@@ -5993,7 +5997,7 @@ mod tests {
 				_ => panic!("expected a function member"),
 			};
 			assert_eq!(
-				case.graph.strings.resolve(
+				case.strings.resolve(
 					case.defs.functions[usize::from(index)].name.inner
 				),
 				Some(expected_name)
@@ -6036,7 +6040,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let helper = case.graph.strings.get_or_intern("helper");
+		let helper = case.strings.get_or_intern("helper");
 
 		assert!(matches!(
 			case.defs.namespaces.lookup(
@@ -6077,7 +6081,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let b = case.scope("b");
-		let helper = case.graph.strings.get_or_intern("helper");
+		let helper = case.strings.get_or_intern("helper");
 
 		assert!(matches!(
 			case.defs.namespaces.lookup(
@@ -6116,7 +6120,7 @@ mod tests {
 			.expect_namespace()
 			.as_scope()
 			.unwrap();
-		let helper = case.graph.strings.get_or_intern("helper");
+		let helper = case.strings.get_or_intern("helper");
 
 		match case.defs.namespaces.lookup(
 			&case.defs.use_items,
@@ -6151,7 +6155,7 @@ mod tests {
 		let root = case.root_namespace();
 		let a = case.scope("a");
 		let hub = case.scope("hub");
-		let helper = case.graph.strings.get_or_intern("helper");
+		let helper = case.strings.get_or_intern("helper");
 
 		let Some(Binding {
 			target: BindingTarget::Accessible(original),
@@ -6204,7 +6208,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let hub = case.scope("hub");
-		let pick = case.graph.strings.get_or_intern("pick");
+		let pick = case.strings.get_or_intern("pick");
 
 		match case.defs.namespaces.lookup(
 			&case.defs.use_items,
@@ -6240,7 +6244,7 @@ mod tests {
 
 		let root = case.root_namespace();
 		let hub = case.scope("hub");
-		let pick = case.graph.strings.get_or_intern("pick");
+		let pick = case.strings.get_or_intern("pick");
 
 		let Some(Binding {
 			target: BindingTarget::Accessible(direct),
@@ -6286,10 +6290,7 @@ mod tests {
 		case.diagnostics().assert_none();
 		let import = &case.defs.imports[0];
 		assert_eq!(
-			case.graph
-				.strings
-				.resolve(import.external_name.inner)
-				.unwrap(),
+			case.strings.resolve(import.external_name.inner).unwrap(),
 			"slash\\n"
 		);
 		let source = &case
@@ -6323,10 +6324,9 @@ mod tests {
         "});
 		case.diagnostics().assert_none();
 		assert_eq!(case.defs.exports.len(), 3);
-		let f = case.graph.strings.get("f").unwrap();
+		let f = case.strings.get("f").unwrap();
 		for name in ["run", "start"] {
-			let export =
-				&case.defs.exports[&case.graph.strings.get(name).unwrap()];
+			let export = &case.defs.exports[&case.strings.get(name).unwrap()];
 			assert_eq!(export.name.inner, f);
 			assert_eq!(
 				export.external_span.span.extract_str(
@@ -6344,7 +6344,7 @@ mod tests {
 			!case
 				.defs
 				.exports
-				.contains_key(&case.graph.strings.get("f").unwrap())
+				.contains_key(&case.strings.get("f").unwrap())
 		);
 	}
 
@@ -6363,9 +6363,8 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::DuplicateExport]);
 		assert_eq!(case.defs.exports.len(), 1);
-		let export =
-			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
-		assert_eq!(export.name.inner, case.graph.strings.get("first").unwrap());
+		let export = &case.defs.exports[&case.strings.get("run").unwrap()];
+		assert_eq!(export.name.inner, case.strings.get("first").unwrap());
 	}
 
 	#[test]
@@ -6386,9 +6385,8 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::DuplicateExport]);
 		assert_eq!(case.defs.exports.len(), 1);
-		let export =
-			&case.defs.exports[&case.graph.strings.get("run").unwrap()];
-		assert_eq!(export.name.inner, case.graph.strings.get("first").unwrap());
+		let export = &case.defs.exports[&case.strings.get("run").unwrap()];
+		assert_eq!(export.name.inner, case.strings.get("first").unwrap());
 		assert_eq!(export.namespace, Scope::Package(case.defs.root_package));
 		let diagnostic = &case.diagnostics[0];
 		assert_eq!(diagnostic.labels.len(), 2);
@@ -6410,14 +6408,14 @@ mod tests {
 		case.diagnostics().assert_none();
 		assert_eq!(case.defs.exports.len(), 4);
 		for expected in ["line\n", "slash\\n", "quote\"", ""] {
-			let symbol = case.graph.strings.get(expected).unwrap();
+			let symbol = case.strings.get(expected).unwrap();
 			let export = &case.defs.exports[&symbol];
 			let file =
 				case.graph.files.get(export.external_span.file_id).unwrap();
 			let written = export.external_span.span.extract_str(&file.source);
 			assert!(written.starts_with('"') && written.ends_with('"'));
 		}
-		assert!(case.graph.strings.get(r#""line\n""#).is_none());
+		assert!(case.strings.get(r#""line\n""#).is_none());
 	}
 
 	#[test]
@@ -6461,20 +6459,20 @@ mod tests {
 				diagnostic.labels[0].message,
 				"unknown character escape"
 			);
-			assert!(case.graph.strings.get(r#""\o""#).is_none());
-			assert!(case.graph.strings.get(r"\o").is_none());
+			assert!(case.strings.get(r#""\o""#).is_none());
+			assert!(case.strings.get(r"\o").is_none());
 			if source.starts_with("import") {
 				assert_eq!(
 					case.defs.imports[0].external_name.inner,
 					Keyword::Error.symbol()
 				);
-				assert!(case.graph.strings.get("after").is_some());
+				assert!(case.strings.get("after").is_some());
 			} else {
 				assert_eq!(case.defs.exports.len(), 1);
 				assert!(
-					case.defs.exports.contains_key(
-						&case.graph.strings.get("valid").unwrap()
-					)
+					case.defs
+						.exports
+						.contains_key(&case.strings.get("valid").unwrap())
 				);
 			}
 		}
@@ -6500,7 +6498,8 @@ mod tests {
 
 	#[test]
 	fn discarded_attributes_do_not_produce_literal_diagnostics() {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+		let mut strings = Keyword::create_interner();
+		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
@@ -6514,7 +6513,7 @@ mod tests {
 				)])),
 			)
 			.unwrap();
-		let mut graph = builder.build(root_id);
+		let graph = builder.build(root_id);
 		let parser_diagnostics = graph.collect_parser_diagnostics();
 		assert_eq!(parser_diagnostics.len(), 1, "{parser_diagnostics:?}");
 		assert_eq!(
@@ -6526,7 +6525,7 @@ mod tests {
 		let _ = DefinitionRegistry::build(
 			&graph.packages,
 			&graph.files,
-			&mut graph.strings,
+			&mut strings,
 			&mut diagnostics,
 			&mut resolutions,
 			graph.stdlib_package,
@@ -6541,6 +6540,7 @@ mod tests {
 	/// `wx.json` is read, so a package instance looks its key up in an actual
 	/// manifest.
 	fn manifest_case(files: &[(&str, &str)]) -> TestCase {
+		let mut strings = Keyword::create_interner();
 		let workspace = vfs::VirtualFileSource::new(
 			files
 				.iter()
@@ -6549,10 +6549,13 @@ mod tests {
 				})
 				.collect(),
 		);
-		let graph =
-			vfs::open_manifest(vfs::AbsolutePath::new("/app"), &workspace)
-				.unwrap();
-		TestCase::from_graph(graph)
+		let graph = vfs::open_manifest(
+			vfs::AbsolutePath::new("/app"),
+			&workspace,
+			&mut strings,
+		)
+		.unwrap();
+		TestCase::from_graph(graph, strings)
 	}
 
 	const APP_WITH_MATH: &str = r#"{
@@ -6575,11 +6578,8 @@ mod tests {
 
 		assert_eq!(case.defs.namespaces.package_instances().len(), 1);
 		let item = &case.defs.namespaces.package_instances()[0];
-		assert_eq!(
-			case.graph.strings.resolve(item.package_name.inner),
-			Some("math")
-		);
-		assert_eq!(case.graph.strings.resolve(item.alias.inner), Some("m"));
+		assert_eq!(case.strings.resolve(item.package_name.inner), Some("math"));
+		assert_eq!(case.strings.resolve(item.alias.inner), Some("m"));
 		assert!(item.package.is_some());
 
 		assert!(matches!(
@@ -6819,7 +6819,7 @@ mod tests {
 
 	/// The attributes prescan recorded on the function named `name`.
 	fn function_attributes(case: &TestCase, name: &str) -> Attributes {
-		let symbol = case.graph.strings.get(name).unwrap();
+		let symbol = case.strings.get(name).unwrap();
 		let mut found = case
 			.defs
 			.functions
@@ -6861,7 +6861,7 @@ mod tests {
 		assert_eq!(function_attributes(&case, "plain"), Attributes::empty());
 		// The trait's declaration and the impl's function are two functions
 		// with the attribute only on the impl's.
-		let required = case.graph.strings.get("required").unwrap();
+		let required = case.strings.get("required").unwrap();
 		let inline: Vec<bool> = case
 			.defs
 			.functions
@@ -6877,7 +6877,7 @@ mod tests {
 		case: &TestCase,
 		name: &str,
 	) -> (Option<u64>, Option<u64>) {
-		let symbol = case.graph.strings.get(name).unwrap();
+		let symbol = case.strings.get(name).unwrap();
 		let memory = case
 			.defs
 			.memories

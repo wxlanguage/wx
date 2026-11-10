@@ -385,11 +385,15 @@ fn splice(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::symbols::{Keyword, StringInterner};
 	use crate::testing::DiagnosticView;
 	use crate::vfs;
 
-	fn source_graph(source: &str) -> vfs::CompilationUnit {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+	fn source_graph(
+		source: &str,
+		strings: &mut StringInterner,
+	) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new(strings);
 		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
@@ -413,9 +417,10 @@ mod tests {
 	}
 
 	/// `source` checked, lowered and inlined under `policy`.
-	fn inlined(source: &str, policy: Policy) -> (vfs::CompilationUnit, MIR) {
-		let mut graph = source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
+	fn inlined(source: &str, policy: Policy) -> (StringInterner, MIR) {
+		let mut strings = Keyword::create_interner();
+		let graph = source_graph(source, &mut strings);
+		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 		let Some(mut mir) = mir else {
 			panic!(
 				"the source must lower: {:?}",
@@ -440,7 +445,7 @@ mod tests {
 		);
 		assert_eq!(mir.start_function, start);
 		assert_dense(&mir);
-		(graph, mir)
+		(strings, mir)
 	}
 
 	fn call_count(mir: &MIR) -> usize {
@@ -451,20 +456,14 @@ mod tests {
 	}
 
 	/// The export `name` of `mir`, encoded and run on `arg`.
-	fn call<A, R>(
-		graph: &vfs::CompilationUnit,
-		mir: &MIR,
-		name: &str,
-		arg: A,
-	) -> R
+	fn call<A, R>(strings: &StringInterner, mir: &MIR, name: &str, arg: A) -> R
 	where
 		A: wasmtime::WasmParams,
 		R: wasmtime::WasmResults,
 	{
-		let bytes =
-			crate::codegen::Builder::build_linearized(mir, &graph.strings)
-				.expect("inlined MIR must encode")
-				.encode();
+		let bytes = crate::codegen::Builder::build_linearized(mir, strings)
+			.expect("inlined MIR must encode")
+			.encode();
 		let engine = wasmtime::Engine::default();
 		let module = wasmtime::Module::new(&engine, &bytes)
 			.expect("inlined MIR must be valid Wasm");
@@ -505,11 +504,11 @@ mod tests {
 			func run(a: i32) -> i32 { double(a) + double(3) }
 			export { run as "run" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
+		let (strings, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
 		assert_eq!(mir.functions.len(), 2, "both MIR entries keep their IDs");
 		assert_eq!(call_count(&mir), 0);
 		assert_dense(&mir);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 5), 16);
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", 5), 16);
 	}
 
 	#[test]
@@ -519,10 +518,10 @@ mod tests {
 			func run(a: i32) -> i32 { small(a) + small(2) }
 			export { run as "run" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
+		let (strings, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
 		assert_eq!(mir.functions.len(), 2);
 		assert_eq!(call_count(&mir), 2);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 5), 9);
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", 5), 9);
 	}
 
 	#[test]
@@ -535,7 +534,7 @@ mod tests {
 			func run(a: i32) -> i32 { small(a) + small(a + 1) + large(a) + large(2) }
 			export { run as "run" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::DEFAULT);
+		let (strings, mir) = inlined(source, Policy::DEFAULT);
 		assert_eq!(
 			mir.functions.len(),
 			3,
@@ -547,7 +546,7 @@ mod tests {
 			(x * 3 + 7) * (x - 2) + (x * x - 5) * (x + 9) + (x - 1) * (x - 4)
 		};
 		assert_eq!(
-			call::<i32, i32>(&graph, &mir, "run", 5),
+			call::<i32, i32>(&strings, &mir, "run", 5),
 			6 + 7 + large(5) + large(2)
 		);
 	}
@@ -559,7 +558,7 @@ mod tests {
 				(x * 3 + 7) * (x - 2) + (x * x - 5) * (x + 9) + (x - 1) * (x - 4)
 			}
 		"#;
-		let (graph, mir) = inlined(
+		let (strings, mir) = inlined(
 			&format!(
 				r#"{large} func run(a: i32) -> i32 {{ large(a) }} export {{ run as "run" }}"#
 			),
@@ -567,7 +566,7 @@ mod tests {
 		);
 		assert_eq!(mir.functions.len(), 2);
 		assert_eq!(call_count(&mir), 0);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 1), -10 + (-4) * 10);
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", 1), -10 + (-4) * 10);
 
 		let (_, mir) = inlined(
 			&format!(
@@ -587,12 +586,12 @@ mod tests {
 			func run(n: u32) -> u32 { count(n) }
 			export { run as "run" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::DEFAULT);
+		let (strings, mir) = inlined(source, Policy::DEFAULT);
 		// One level of `count` goes into `run`; its own call stays.
 		assert_eq!(mir.functions.len(), 2);
 		assert_eq!(call_count(&mir), 2);
 		assert_dense(&mir);
-		assert_eq!(call::<u32, u32>(&graph, &mir, "run", 5), 5);
+		assert_eq!(call::<u32, u32>(&strings, &mir, "run", 5), 5);
 	}
 
 	#[test]
@@ -602,11 +601,11 @@ mod tests {
 			func odd(n: u32) -> u32 { if n == 0 { 0 } else { even(n - 1) } }
 			export { even as "even" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::DEFAULT);
+		let (strings, mir) = inlined(source, Policy::DEFAULT);
 		assert_eq!(mir.functions.len(), 2);
 		assert_eq!(call_count(&mir), 2);
-		assert_eq!(call::<u32, u32>(&graph, &mir, "even", 6), 1);
-		assert_eq!(call::<u32, u32>(&graph, &mir, "even", 7), 0);
+		assert_eq!(call::<u32, u32>(&strings, &mir, "even", 6), 1);
+		assert_eq!(call::<u32, u32>(&strings, &mir, "even", 7), 0);
 	}
 
 	#[test]
@@ -616,16 +615,16 @@ mod tests {
 			func run(a: i32) -> i32 { clamp(a) + clamp(a - 10) }
 			export { run as "run" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
+		let (strings, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
 		assert_eq!(mir.functions.len(), 2);
 		assert!(
 			!(mir.code(FunctionId::new(0)).body.kinds().iter())
 				.any(|kind| matches!(kind, ExprKind::Return { .. })),
 			"a callee's `return` leaves its wrapper, not the caller"
 		);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 5), 5);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 20), 30);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", -3), 0);
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", 5), 5);
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", 20), 30);
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", -3), 0);
 	}
 
 	#[test]
@@ -643,9 +642,9 @@ mod tests {
 			func run(a: i32) -> i32 { sum_to(a) + sum_to(3) }
 			export { run as "run" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
+		let (strings, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
 		assert_eq!(mir.functions.len(), 2);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 4), 16);
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", 4), 16);
 	}
 
 	#[test]
@@ -700,16 +699,12 @@ mod tests {
 	}
 
 	/// `mir`'s function exported as `name`.
-	fn exported(
-		graph: &vfs::CompilationUnit,
-		mir: &MIR,
-		name: &str,
-	) -> FunctionId {
+	fn exported(strings: &StringInterner, mir: &MIR, name: &str) -> FunctionId {
 		mir.exports
 			.iter()
 			.find_map(|export| match export.item {
 				Item::Function(id)
-					if graph.strings.resolve(export.name) == Some(name) =>
+					if strings.resolve(export.name) == Some(name) =>
 				{
 					Some(id)
 				}
@@ -728,13 +723,16 @@ mod tests {
 			#[inline] func c(x: i32) -> i32 { x * 3 }
 			export { a as "a", b as "b", c as "c" }
 		"#;
-		let mut graph = source_graph(source);
-		let lowered =
-			crate::tir::build(&mut graph).1.expect("the source lowers");
-		let (graph, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
+		let mut strings = Keyword::create_interner();
+		let graph = source_graph(source, &mut strings);
+		let lowered = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("the source lowers");
+		let (strings, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
 		assert_eq!(call_count(&mir), 0);
-		let len =
-			|mir: &MIR, name| mir.code(exported(&graph, mir, name)).body.len();
+		let len = |mir: &MIR, name| {
+			mir.code(exported(&strings, mir, name)).body.len()
+		};
 		// A splice appends the callee's nodes and one `LocalSet` per
 		// argument, and reuses the call node as the wrapper.
 		let c = len(&mir, "c");
@@ -744,7 +742,7 @@ mod tests {
 		assert_eq!(len(&mir, "a"), len(&lowered, "a") + 2 * (b + 1));
 		let c = |x: i32| x * 3;
 		let b = |x: i32| c(x) * c(x + 2);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "a", 2), b(2) * b(3));
+		assert_eq!(call::<i32, i32>(&strings, &mir, "a", 2), b(2) * b(3));
 	}
 
 	#[test]
@@ -756,7 +754,7 @@ mod tests {
 			func run(x: i32) -> i32 { a(x) + a(x + 5) }
 			export { run as "run" }
 		"#;
-		let (graph, mir) = inlined(source, Policy::DEFAULT);
+		let (strings, mir) = inlined(source, Policy::DEFAULT);
 		// `c` is small and goes into `b`; `b`, with two copies of it, is no
 		// longer small, and neither is `a`, so both stay calls.
 		assert_eq!(mir.functions.len(), 4, "`run`, `a`, `b` and inlined `c`");
@@ -765,6 +763,6 @@ mod tests {
 		let c = |x: i32| x * 3;
 		let b = |x: i32| c(x) * c(x + 2);
 		let a = |x: i32| b(x) * b(x + 1);
-		assert_eq!(call::<i32, i32>(&graph, &mir, "run", 1), a(1) + a(6));
+		assert_eq!(call::<i32, i32>(&strings, &mir, "run", 1), a(1) + a(6));
 	}
 }

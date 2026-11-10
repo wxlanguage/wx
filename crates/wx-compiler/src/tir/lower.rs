@@ -2420,15 +2420,17 @@ mod tests {
 		source: &str,
 		policy: Option<mir::inline::Policy>,
 	) -> (wasmtime::Store<()>, wasmtime::Instance) {
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 		let Some(mut mir) = mir else {
 			panic!(
 				"the checkpoint must lower: {:?}",
 				diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
 			)
 		};
-		let module = crate::backend::emit(&mut mir, &graph.strings, policy)
+		let module = crate::backend::emit(&mut mir, &strings, policy)
 			.expect("lowered MIR must encode");
 		let bytes = module.encode();
 		let engine = engine();
@@ -2447,8 +2449,12 @@ mod tests {
 			func fail() -> ! { stop() }
 			export { fail as "fail" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("trap must expand");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("trap must expand");
 		assert_eq!(mir.functions.len(), 1);
 		let function = mir.code(mir::FunctionId::new(0));
 		assert_eq!(function.callees().count(), 0);
@@ -2513,8 +2519,10 @@ mod tests {
 				u32_lt as "lt", trap as "trap"
 			}
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
 			.1
 			.expect("an exported intrinsic must lower");
 		// Each is a function of its own whose body is the operation: no
@@ -2570,8 +2578,10 @@ mod tests {
 			func run(a: i32) -> i32 { i32_add(a, 1) }
 			export { run as "run", i32_add as "add" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
 			.1
 			.expect("an exported intrinsic must lower");
 		assert_eq!(mir.functions.len(), 2);
@@ -2606,8 +2616,10 @@ mod tests {
 			func bits(x: f32) -> i32 { std::i32_reinterpret_f32(x) }
 			export { run as "run", unsigned as "unsigned", compare as "compare", convert as "convert", bits as "bits" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
 			.1
 			.expect("scalar intrinsics must expand");
 		assert_eq!(
@@ -3312,8 +3324,12 @@ mod tests {
 				"without an implementation",
 			),
 		] {
-			let mut graph = crate::tir::signatures::tests::source_graph(source);
-			let (diagnostics, mir) = crate::tir::build(&mut graph);
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let graph = crate::tir::signatures::tests::source_graph(
+				source,
+				&mut strings,
+			);
+			let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 			assert!(
 				mir.is_none(),
 				"unsupported implementation must not emit MIR"
@@ -3344,14 +3360,19 @@ mod tests {
 
 	#[test]
 	fn each_imported_function_is_its_own_item_with_its_own_import_entry() {
-		let mut graph =
-			crate::tir::signatures::tests::source_graph(OVERLOADED_IMPORTS);
-		let mir = crate::tir::build(&mut graph).1.expect("imports lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph = crate::tir::signatures::tests::source_graph(
+			OVERLOADED_IMPORTS,
+			&mut strings,
+		);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("imports lower");
 		assert_eq!(mir.imports.len(), 3, "never merged by name in MIR");
 		mir.verify_imports().unwrap();
 		for import in &mir.imports {
-			assert_eq!(graph.strings.resolve(import.module), Some("host"));
-			assert_eq!(graph.strings.resolve(import.name), Some("log"));
+			assert_eq!(strings.resolve(import.module), Some("host"));
+			assert_eq!(strings.resolve(import.name), Some("log"));
 			let mir::Item::Function(id) = import.item else {
 				panic!("only functions are imported")
 			};
@@ -3371,10 +3392,15 @@ mod tests {
 
 	#[test]
 	fn codegen_gives_imports_with_the_same_names_and_wasm_type_one_entry() {
-		let mut graph =
-			crate::tir::signatures::tests::source_graph(OVERLOADED_IMPORTS);
-		let mut mir = crate::tir::build(&mut graph).1.expect("imports lower");
-		let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph = crate::tir::signatures::tests::source_graph(
+			OVERLOADED_IMPORTS,
+			&mut strings,
+		);
+		let mut mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("imports lower");
+		let bytes = crate::backend::emit(&mut mir, &strings, None)
 			.expect("lowered MIR must encode")
 			.encode();
 		let engine = wasmtime::Engine::default();
@@ -3522,8 +3548,12 @@ mod tests {
 			}
 			export { bump as "bump" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("globals lower");
 		let [global] = mir.globals.as_slice() else {
 			panic!("one global")
 		};
@@ -3553,8 +3583,12 @@ mod tests {
 			}
 			export { double as "double" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("globals lower");
 		assert_eq!(mir.globals[0].ty, mir::ValueType::I32);
 		let (mut store, instance) = instantiate(source);
 		let double = instance
@@ -3573,8 +3607,12 @@ mod tests {
 			global unused: u32 = 1;
 			export { answer as "answer", ratio as "ratio" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("globals lower");
 		assert_eq!(
 			mir.globals.len(),
 			2,
@@ -3595,18 +3633,22 @@ mod tests {
 			func read() -> i32 { env::base.get() + 1 }
 			export { read as "read" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mut mir = crate::tir::build(&mut graph).1.expect("globals lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mut mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("globals lower");
 		let [import] = mir.imports.as_slice() else {
 			panic!("one import entry")
 		};
-		assert_eq!(graph.strings.resolve(import.module), Some("env"));
-		assert_eq!(graph.strings.resolve(import.name), Some("base"));
+		assert_eq!(strings.resolve(import.module), Some("env"));
+		assert_eq!(strings.resolve(import.name), Some("base"));
 		assert_eq!(import.item, mir::Item::Global(mir::GlobalId::new(0)));
 		mir.verify_imports().unwrap();
 		let bytes = crate::backend::emit(
 			&mut mir,
-			&graph.strings,
+			&strings,
 			Some(crate::mir::inline::Policy::DEFAULT),
 		)
 		.expect("lowered MIR must encode")
@@ -3663,8 +3705,10 @@ mod tests {
 			func read() -> u32 { g.get() }
 			export { read as "read" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 		assert!(mir.is_none());
 		crate::testing::DiagnosticView::new(
 			"build",
@@ -3680,8 +3724,10 @@ mod tests {
             func add(a: i32, b: i32) -> i32 { a + b }
             export { add as "add" }
         "#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
 			.1
 			.expect("a scalar add must lower");
 		assert_eq!(mir.functions.len(), 1);
@@ -3744,8 +3790,10 @@ mod tests {
             }
             export { pick as "pick" }
         "#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 		assert!(
 			mir.is_none(),
 			"an aggregate constant pattern has no equality"
@@ -3822,10 +3870,12 @@ mod tests {
 			}
 			export { run as "run" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
 		// Every signature's items are scalars: `Signatures::intern`
 		// asserts it.
-		crate::tir::build(&mut graph)
+		crate::tir::build(&graph, &mut strings)
 			.1
 			.expect("nested updates must lower");
 		let (mut store, instance) = instantiate(source);
@@ -4062,8 +4112,12 @@ mod tests {
 			func big(b: u64) -> u64 { twice(b) }
 			export { small as "small", big as "big" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("the source lowers");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("the source lowers");
 		// `small`, `big`, `twice` for `u32` and `u64`, and std's `#[inline]`
 		// `add` for each.
 		assert_eq!(mir.functions.len(), 6);
@@ -4110,8 +4164,12 @@ mod tests {
 			}
 			export { run as "run" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("`id` must lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("`id` must lower");
 		assert_eq!(mir.functions.len(), 3, "`run`, `id<i32>` and `id<i64>`");
 		drop(graph);
 		let (mut store, instance) = instantiate(source);
@@ -4136,8 +4194,12 @@ mod tests {
 			}
 			export { run as "run" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("`pair` must lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("`pair` must lower");
 		assert_eq!(mir.functions.len(), 5, "`run`, two `pair`s, two `id`s");
 		drop(graph);
 		let (mut store, instance) = instantiate(source);
@@ -4177,8 +4239,12 @@ mod tests {
 			func run(n: u32) -> u32 { count((1: u8), n) }
 			export { run as "run" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("`count` must lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("`count` must lower");
 		assert_eq!(mir.functions.len(), 2);
 		drop(graph);
 		let (mut store, instance) = instantiate(source);
@@ -4377,8 +4443,10 @@ mod tests {
 		source: &str,
 		code: DiagnosticCode,
 	) -> Vec<Diagnostic<FileId>> {
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 		assert!(mir.is_none(), "a failed instantiation emits no MIR");
 		diagnostics
 			.into_iter()
@@ -4460,8 +4528,12 @@ mod tests {
 				export { run as "run" }
 			"#,
 		] {
-			let mut graph = crate::tir::signatures::tests::source_graph(source);
-			let (diagnostics, mir) = crate::tir::build(&mut graph);
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let graph = crate::tir::signatures::tests::source_graph(
+				source,
+				&mut strings,
+			);
+			let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 			assert!(mir.is_none(), "an unbounded instantiation emits no MIR");
 			let reports: Vec<_> = diagnostics
 				.iter()
@@ -6672,8 +6744,10 @@ mod tests {
             }
             export { run as "run" }
         "#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 		assert!(mir.is_none(), "a float constant pattern has no equality");
 		assert!(
 			diagnostics.iter().any(|d| {
@@ -7263,8 +7337,10 @@ mod tests {
             }
             export { run as "run" }
         "#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph)
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
 			.1
 			.expect("`continue` must lower");
 		let function = mir.code(mir::FunctionId::new(0));
@@ -7747,12 +7823,14 @@ mod tests {
 			func run(value: i32) -> i32 { host::exchange(host::prepare(value)) }
 			export { run }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mut mir = crate::tir::build(&mut graph)
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mut mir = crate::tir::build(&graph, &mut strings)
 			.1
 			.expect("re-exported function lowers");
 		mir.verify_imports().unwrap();
-		let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
+		let bytes = crate::backend::emit(&mut mir, &strings, None)
 			.unwrap()
 			.encode();
 		let engine = wasmtime::Engine::default();
@@ -7786,13 +7864,18 @@ mod tests {
 		export { run }
 	"#;
 		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
-			let mut graph = crate::tir::signatures::tests::source_graph(source);
-			let mut mir =
-				crate::tir::build(&mut graph).1.expect("import must lower");
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let graph = crate::tir::signatures::tests::source_graph(
+				source,
+				&mut strings,
+			);
+			let mut mir = crate::tir::build(&graph, &mut strings)
+				.1
+				.expect("import must lower");
 			if let Some(policy) = policy {
 				mir::inline::run(&mut mir, policy);
 			}
-			let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
+			let bytes = crate::backend::emit(&mut mir, &strings, None)
 				.unwrap()
 				.encode();
 			let engine = wasmtime::Engine::default();
@@ -8100,16 +8183,20 @@ mod tests {
 			}
 			export { read as "read" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mut mir = crate::tir::build(&mut graph).1.expect("memories lower");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mut mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("memories lower");
 		let [import] = mir.imports.as_slice() else {
 			panic!("one import entry")
 		};
-		assert_eq!(graph.strings.resolve(import.module), Some("env"));
-		assert_eq!(graph.strings.resolve(import.name), Some("mem"));
+		assert_eq!(strings.resolve(import.module), Some("env"));
+		assert_eq!(strings.resolve(import.name), Some("mem"));
 		assert_eq!(import.item, mir::Item::Memory(mir::MemoryId::new(0)));
 		mir.verify_imports().unwrap();
-		let bytes = crate::backend::emit(&mut mir, &graph.strings, None)
+		let bytes = crate::backend::emit(&mut mir, &strings, None)
 			.expect("lowered MIR must encode")
 			.encode();
 		let engine = engine();
@@ -8230,8 +8317,12 @@ mod tests {
 			func both() -> (heap::&[u8], heap::&[u8]) { (A, B) }
 			export { both as "both", heap as "heap" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let mir = crate::tir::build(&mut graph).1.expect("static data lowers");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mir = crate::tir::build(&graph, &mut strings)
+			.1
+			.expect("static data lowers");
 		assert_eq!(mir.static_entries.len(), 1);
 		each_policy(source, |store, instance, _| {
 			let both = instance
@@ -8336,8 +8427,10 @@ mod tests {
 			func run() -> heap::&[u8] { data::<u8>() }
 			export { run as "run" }
 		"#;
-		let mut graph = crate::tir::signatures::tests::source_graph(source);
-		let (diagnostics, mir) = crate::tir::build(&mut graph);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
 		assert!(mir.is_none());
 		crate::testing::DiagnosticView::new(
 			"lower",

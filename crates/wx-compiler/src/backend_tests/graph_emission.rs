@@ -553,8 +553,9 @@ fn empty_and_zero_initialized_values_need_no_computation_locals() {
 	}
 }
 
-fn lower_source(source: &str) -> (crate::vfs::CompilationUnit, mir::MIR) {
-	let mut builder = crate::vfs::CompilationUnitBuilder::new();
+fn lower_source(source: &str) -> (StringInterner, mir::MIR) {
+	let mut strings = crate::symbols::Keyword::create_interner();
+	let mut builder = crate::vfs::CompilationUnitBuilder::new(&mut strings);
 	builder.load_stdlib();
 	let root = builder
 		.load_binary(
@@ -567,19 +568,19 @@ fn lower_source(source: &str) -> (crate::vfs::CompilationUnit, mir::MIR) {
 			),
 		)
 		.unwrap();
-	let mut unit = builder.build(root);
-	let (diagnostics, mir) = crate::tir::build(&mut unit);
+	let unit = builder.build(root);
+	let (diagnostics, mir) = crate::tir::build(&unit, &mut strings);
 	crate::testing::DiagnosticView::new("tir", &diagnostics, &unit.files)
 		.assert_no_errors();
-	(unit, mir.expect("source lowers"))
+	(strings, mir.expect("source lowers"))
 }
 
 fn run_source(
 	source: &str,
 	emitted: bool,
 ) -> (wasmtime::Store<()>, wasmtime::Instance) {
-	let (unit, mir) = lower_source(source);
-	run_mode(mir, &unit.strings, emitted)
+	let (strings, mir) = lower_source(source);
+	run_mode(mir, &strings, emitted)
 }
 
 #[test]
@@ -911,7 +912,7 @@ fn untargeted_blocks_fall_through_without_labels_or_transfers() {
 		}
 		export { run as "run" }
 	"#;
-	let (unit, mut mir) = lower_source(source);
+	let (strings, mut mir) = lower_source(source);
 	opt::emit_for_tests(&mut mir);
 	let code = mir.code(mir::FunctionId::new(0));
 	assert_eq!(code.label_count, 0);
@@ -919,7 +920,7 @@ fn untargeted_blocks_fall_through_without_labels_or_transfers() {
 		kind,
 		E::Block { .. } | E::Break { .. } | E::Continue { .. }
 	)));
-	let (mut store, instance) = run_mode(mir, &unit.strings, false);
+	let (mut store, instance) = run_mode(mir, &strings, false);
 	let run = instance
 		.get_typed_func::<i32, i32>(&mut store, "run")
 		.unwrap();
@@ -937,7 +938,7 @@ fn falling_through_if_and_switch_arms_keep_computations_and_join_updates() {
 		let source = format!(
 			"func run(n: i32, x: i32) -> i32 {{ {body} }} export {{ run as \"run\" }}"
 		);
-		let (unit, mut mir) = lower_source(&source);
+		let (strings, mut mir) = lower_source(&source);
 		opt::emit_for_tests(&mut mir);
 		let code = mir.code(mir::FunctionId::new(0));
 		assert_eq!(code.label_count, 0, "normal arm exits need no labels");
@@ -950,7 +951,7 @@ fn falling_through_if_and_switch_arms_keep_computations_and_join_updates() {
 		);
 		assert!(code.body.kinds().iter().any(|kind| matches!(kind,
 			E::SetLocals { targets, .. } if !code.body.targets(*targets).is_empty())));
-		let (mut store, instance) = run_mode(mir, &unit.strings, false);
+		let (mut store, instance) = run_mode(mir, &strings, false);
 		let run = instance
 			.get_typed_func::<(i32, i32), i32>(&mut store, "run")
 			.unwrap();
@@ -984,7 +985,7 @@ fn nonlocal_exits_keep_their_wrapper_and_skip_parent_continuation() {
 		}
 		export { run as "run" }
 	"#;
-	let (unit, mut mir) = lower_source(source);
+	let (strings, mut mir) = lower_source(source);
 	opt::emit_for_tests(&mut mir);
 	let code = mir.code(mir::FunctionId::new(0));
 	assert_eq!(code.label_count, 1, "only the nonlocal exit needs a label");
@@ -1002,7 +1003,7 @@ fn nonlocal_exits_keep_their_wrapper_and_skip_parent_continuation() {
 			.count(),
 		1
 	);
-	let (mut store, instance) = run_mode(mir, &unit.strings, false);
+	let (mut store, instance) = run_mode(mir, &strings, false);
 	let run = instance
 		.get_typed_func::<i32, (i32, i32)>(&mut store, "run")
 		.unwrap();
@@ -1020,7 +1021,7 @@ fn single_use_arithmetic_nests_without_intermediate_locals() {
 		func run(x: i32, y: i32) -> i32 { (x - y) * (x + y) }
 		export { run as "run" }
 	"#;
-	let (unit, mut mir) = lower_source(source);
+	let (strings, mut mir) = lower_source(source);
 	opt::emit_for_tests(&mut mir);
 	let code = mir.code(mir::FunctionId::new(0));
 	assert_eq!(code.locals.len(), 2, "only the two parameters need locals");
@@ -1031,7 +1032,7 @@ fn single_use_arithmetic_nests_without_intermediate_locals() {
 			.iter()
 			.any(|kind| matches!(kind, E::LocalSet { .. }))
 	);
-	let (mut store, instance) = run_mode(mir, &unit.strings, false);
+	let (mut store, instance) = run_mode(mir, &strings, false);
 	let run = instance
 		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
 		.unwrap();

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use codespan_reporting::diagnostic::Diagnostic;
 
+use crate::symbols::StringInterner;
+
 use super::manifest::ResolvedDependency;
 use super::{
 	AbsolutePath, CompilationUnit, CompilationUnitBuilder, DependencySource,
@@ -58,11 +60,15 @@ pub fn package_kind(kind: &PackageManifestKind) -> PackageKind {
 /// can't be threaded through `&impl FileSource` here without widening it
 /// to `&dyn FileSource` first — deliberately not done now, since that
 /// variant is explicitly out of scope for this plan.
+///
+/// `strings` must be keyword-seeded and remain available to interpret symbols
+/// in the returned compilation. It may also be shared with other compilations.
 pub fn open_manifest(
 	dir: AbsolutePath,
 	source: &impl FileSource,
+	strings: &mut StringInterner,
 ) -> Result<CompilationUnit, ()> {
-	open_manifest_with_manifests(dir, source, &HashMap::new())
+	open_manifest_with_manifests(dir, source, &HashMap::new(), strings)
 }
 
 /// Uses retained manifest data supplied by a frontend. Entries not supplied
@@ -72,13 +78,14 @@ pub fn open_manifest_with_manifests(
 	dir: AbsolutePath,
 	source: &impl FileSource,
 	manifests: &HashMap<AbsolutePath, &PackageManifest>,
+	strings: &mut StringInterner,
 ) -> Result<CompilationUnit, ()> {
 	let mut resolution = DependencyResolution {
 		manifests,
 		resolved: HashMap::new(),
 		in_progress: HashMap::new(),
 	};
-	let mut builder = CompilationUnitBuilder::new();
+	let mut builder = CompilationUnitBuilder::new(strings);
 
 	// Loaded here rather than through `open_manifest_package` because two
 	// things are true of the root and of nothing else: it has no name
@@ -158,7 +165,7 @@ struct DependencyResolution<'a> {
 /// finds a real package to bind its own name to rather than only a
 /// diagnostic.
 fn open_manifest_package(
-	builder: &mut CompilationUnitBuilder,
+	builder: &mut CompilationUnitBuilder<'_>,
 	dir: &AbsolutePath,
 	name: &PackageName,
 	identity: &ResolvedDependency,
@@ -223,7 +230,7 @@ fn open_manifest_package(
 /// package that made the cyclic reference and doesn't recurse into it again,
 /// rather than failing resolution outright or recursing forever.
 fn resolve_dependencies(
-	builder: &mut CompilationUnitBuilder,
+	builder: &mut CompilationUnitBuilder<'_>,
 	owner: PackageId,
 	dir: &AbsolutePath,
 	dependencies: &HashMap<PackageName, DependencySource>,
@@ -307,6 +314,7 @@ fn report_circular_dependency(key: &str) -> Diagnostic<FileId> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::symbols::Keyword;
 	use crate::testing::DiagnosticView;
 	use crate::vfs::tests::workspace;
 
@@ -317,8 +325,9 @@ mod tests {
 		compilation: &CompilationUnit,
 		owner: PackageId,
 		name: &str,
+		strings: &StringInterner,
 	) -> Option<PackageId> {
-		let symbol = compilation.strings.get(name)?;
+		let symbol = strings.get(name)?;
 		compilation.packages[owner.as_usize()]
 			.dependencies
 			.get(&symbol)
@@ -327,6 +336,7 @@ mod tests {
 
 	#[test]
 	fn retained_manifests_load_root_and_dependencies_without_json_reads() {
+		let mut strings = Keyword::create_interner();
 		struct Source {
 			files: crate::vfs::VirtualFileSource,
 			json_reads: std::cell::Cell<usize>,
@@ -368,25 +378,36 @@ mod tests {
 				AbsolutePath::new("/app"),
 				&source,
 				&manifests,
+				&mut strings,
 			)
 			.unwrap();
-			assert!(dependency_of(&graph, graph.root_package, "dep").is_some());
+			assert!(
+				dependency_of(&graph, graph.root_package, "dep", &strings)
+					.is_some()
+			);
 		}
 		assert_eq!(source.json_reads.get(), 0);
 	}
 
 	#[test]
 	fn manifested_binary_with_no_dependencies_gets_std() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
 			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		assert_eq!(compilation.packages.len(), 2, "root + std");
 		assert_eq!(
-			dependency_of(&compilation, compilation.root_package, "std"),
+			dependency_of(
+				&compilation,
+				compilation.root_package,
+				"std",
+				&strings
+			),
 			Some(compilation.stdlib_package),
 			"every package can reach the stdlib without declaring it"
 		);
@@ -400,6 +421,7 @@ mod tests {
 	/// manifest's own directory.
 	#[test]
 	fn manifested_binary_resolves_a_non_conventional_entry_name() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -408,7 +430,8 @@ mod tests {
 			("/app/src/start.wx", "func add() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		let root = &compilation.packages[compilation.root_package.as_usize()];
 		assert_eq!(root.entry_path.as_str(), "/app/src/start.wx");
@@ -416,9 +439,11 @@ mod tests {
 
 	#[test]
 	fn manifest_directory_without_a_wx_json_fails() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[("/app/main.wx", "func add() {}")]);
 		assert!(
-			open_manifest(AbsolutePath::new("/app"), &source).is_err(),
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.is_err(),
 			"a directory argument commits to the manifest-driven path — no \
 			 fallback to guessing an entry file"
 		);
@@ -426,12 +451,14 @@ mod tests {
 
 	#[test]
 	fn std_root_package_does_not_get_a_second_std_loaded() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			("/app/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
 			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		assert_eq!(
 			compilation.packages.len(),
@@ -440,7 +467,12 @@ mod tests {
 		);
 		assert_eq!(compilation.stdlib_package, compilation.root_package);
 		assert_eq!(
-			dependency_of(&compilation, compilation.root_package, "std"),
+			dependency_of(
+				&compilation,
+				compilation.root_package,
+				"std",
+				&strings
+			),
 			None,
 			"a stdlib doesn't depend on itself — nothing seeds `std` into \
 			 the package that provides it"
@@ -452,6 +484,7 @@ mod tests {
 	/// the first-claim-wins race rather than needing a reserved-key check.
 	#[test]
 	fn dependency_bound_to_std_collides_with_the_stdlib() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -471,10 +504,16 @@ mod tests {
 			("/alt_std/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		assert_eq!(
-			dependency_of(&compilation, compilation.root_package, "std"),
+			dependency_of(
+				&compilation,
+				compilation.root_package,
+				"std",
+				&strings
+			),
 			Some(compilation.stdlib_package),
 			"the stdlib holds the name; the declared one can't take it"
 		);
@@ -491,6 +530,7 @@ mod tests {
 	/// ignored.
 	#[test]
 	fn std_package_as_a_dependency_is_diagnosed() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -507,7 +547,8 @@ mod tests {
 			("/mystd/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		assert_eq!(
 			compilation.packages.len(),
@@ -515,7 +556,12 @@ mod tests {
 			"std, root, mystd — the embedded stdlib is still loaded"
 		);
 		assert_eq!(
-			dependency_of(&compilation, compilation.root_package, "std"),
+			dependency_of(
+				&compilation,
+				compilation.root_package,
+				"std",
+				&strings
+			),
 			Some(compilation.stdlib_package),
 			"a `std`-kind dependency does not become the stdlib provider"
 		);
@@ -531,6 +577,7 @@ mod tests {
 	/// available, and either can be instantiated under any alias.
 	#[test]
 	fn one_package_may_be_declared_under_two_keys() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -551,7 +598,8 @@ mod tests {
 			("/shared/main.wx", "func shared() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		DiagnosticView::new(
 			"link",
@@ -561,14 +609,15 @@ mod tests {
 		.assert_none();
 		let root = compilation.root_package;
 		assert_eq!(
-			dependency_of(&compilation, root, "one"),
-			dependency_of(&compilation, root, "two"),
+			dependency_of(&compilation, root, "one", &strings),
+			dependency_of(&compilation, root, "two", &strings),
 		);
-		assert!(dependency_of(&compilation, root, "one").is_some());
+		assert!(dependency_of(&compilation, root, "one", &strings).is_some());
 	}
 
 	#[test]
 	fn two_packages_may_use_the_same_key_for_different_targets() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -599,7 +648,8 @@ mod tests {
 			("/z/main.wx", "func from_z() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		// The same key in two different packages is not a collision.
 		let diagnostics = compilation.collect_linker_diagnostics();
@@ -608,16 +658,17 @@ mod tests {
 
 		// Each `libx` resolves within its own package, to a different target.
 		let app = compilation.root_package;
-		let y = dependency_of(&compilation, app, "liby").unwrap();
+		let y = dependency_of(&compilation, app, "liby", &strings).unwrap();
 		assert_ne!(
-			dependency_of(&compilation, app, "libx"),
-			dependency_of(&compilation, y, "libx"),
+			dependency_of(&compilation, app, "libx", &strings),
+			dependency_of(&compilation, y, "libx", &strings),
 			"`libx` means `/x` in `app` and `/z` in `y`"
 		);
 	}
 
 	#[test]
 	fn diamond_dependency_is_loaded_only_once() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
@@ -660,7 +711,8 @@ mod tests {
 			("/shared/main.wx", "func from_shared() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/app"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
+				.unwrap();
 
 		assert_eq!(
 			compilation.packages.len(),
@@ -675,6 +727,7 @@ mod tests {
 
 	#[test]
 	fn circular_dependency_is_diagnosed_without_infinite_recursion() {
+		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/a/wx.json",
@@ -700,7 +753,8 @@ mod tests {
 			("/b/main.wx", "func from_b() {}"),
 		]);
 		let compilation =
-			open_manifest(AbsolutePath::new("/a"), &source).unwrap();
+			open_manifest(AbsolutePath::new("/a"), &source, &mut strings)
+				.unwrap();
 
 		let all_diagnostics: Vec<_> = compilation
 			.packages

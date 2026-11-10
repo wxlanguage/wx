@@ -3113,19 +3113,24 @@ mod tests {
 	/// and globals are checked against its actual traits.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
-			let mut graph = source_graph($source);
-			let mut inputs = TestInputs::new(&mut graph);
+			let mut strings = ast::Keyword::create_interner();
+			let graph = source_graph($source, &mut strings);
+			let mut inputs = TestInputs::new(&graph, &mut strings);
 			let $case = TestCase::new(&mut inputs);
 		};
 		(mut $case:ident = $source:expr $(,)?) => {
-			let mut graph = source_graph($source);
-			let mut inputs = TestInputs::new(&mut graph);
+			let mut strings = ast::Keyword::create_interner();
+			let graph = source_graph($source, &mut strings);
+			let mut inputs = TestInputs::new(&graph, &mut strings);
 			let mut $case = TestCase::new(&mut inputs);
 		};
 	}
 
-	fn source_graph(source: &str) -> vfs::CompilationUnit {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+	fn source_graph(
+		source: &str,
+		strings: &mut StringInterner,
+	) -> vfs::CompilationUnit {
+		let mut builder = vfs::CompilationUnitBuilder::new(strings);
 		builder.load_stdlib();
 		let root_id = builder
 			.load_binary(
@@ -3161,11 +3166,13 @@ mod tests {
 	}
 
 	impl<'g> TestInputs<'g> {
-		fn new(graph: &'g mut vfs::CompilationUnit) -> Self {
+		fn new(
+			graph: &'g vfs::CompilationUnit,
+			strings: &'g mut StringInterner,
+		) -> Self {
 			let vfs::CompilationUnit {
 				files,
 				packages,
-				strings,
 				stdlib_package,
 				root_package,
 			} = graph;

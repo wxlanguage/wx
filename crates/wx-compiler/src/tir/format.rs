@@ -431,6 +431,7 @@ mod tests {
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,
+		strings: StringInterner,
 		defs: DefinitionRegistry,
 		types: TypeInterner,
 		generic_envs: GenericEnvArena,
@@ -440,7 +441,8 @@ mod tests {
 
 	impl TestCase {
 		fn new(source: &str) -> Self {
-			let mut graph = source_graph(source);
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
 			DiagnosticView::new(
 				"parse",
 				&graph.collect_parser_diagnostics(),
@@ -459,7 +461,7 @@ mod tests {
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
-				&mut graph.strings,
+				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
 				graph.stdlib_package,
@@ -471,7 +473,7 @@ mod tests {
 			let dispatch = ImplDispatch::build(
 				&mut diagnostics,
 				&mut resolutions,
-				&graph.strings,
+				&strings,
 				&defs,
 				&ast_nodes,
 			);
@@ -479,7 +481,7 @@ mod tests {
 			let mut signatures = TypeContext::new(
 				&mut diagnostics,
 				&mut resolutions,
-				&mut graph.strings,
+				&mut strings,
 				&mut solver,
 				&graph.files,
 				&defs,
@@ -505,16 +507,14 @@ mod tests {
 				bounds: signatures.bounds,
 				functions: signatures.functions,
 				graph,
+				strings,
 				defs,
 			}
 		}
 
 		fn definition(&self, tier: Tier, name: &str) -> DefKind {
-			let symbol = self
-				.graph
-				.strings
-				.get(name)
-				.expect("expected a fixture name");
+			let symbol =
+				self.strings.get(name).expect("expected a fixture name");
 			let root = Namespace::Package(self.defs.root_package);
 			let BindingTarget::Accessible(key) =
 				self.defs.namespaces.symbols(root).bindings
@@ -546,7 +546,7 @@ mod tests {
 				.param_names(env)
 				.iter()
 				.position(|param| {
-					self.graph.strings.resolve(param.inner) == Some(name)
+					self.strings.resolve(param.inner) == Some(name)
 				})
 				.unwrap_or_else(|| {
 					panic!(
@@ -560,7 +560,7 @@ mod tests {
 			TypeFormatter {
 				types: &self.types,
 				defs: &self.defs,
-				strings: &self.graph.strings,
+				strings: &self.strings,
 				generic_envs: &self.generic_envs,
 				budget: TYPE_DISPLAY_BUDGET,
 			}
@@ -616,7 +616,6 @@ mod tests {
 			name: &str,
 		) -> AssocTypeIdx {
 			let symbol = self
-				.graph
 				.strings
 				.get(name)
 				.expect("already interned from source");

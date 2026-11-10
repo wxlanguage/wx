@@ -40,6 +40,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 
 use crate::diagnostics::Diagnostics;
 use crate::mir::MIR;
+use crate::symbols::StringInterner;
 use crate::vfs::{CompilationUnit, FileId};
 
 use self::defs::DefinitionRegistry;
@@ -50,11 +51,14 @@ use self::solver::Solver;
 
 /// Checks declarations and bodies and returns their diagnostics.
 /// Parser and package diagnostics remain available on `compilation`.
-pub fn check(compilation: &mut CompilationUnit) -> Vec<Diagnostic<FileId>> {
+/// `strings` must be the interner used to load the compilation.
+pub fn check(
+	compilation: &CompilationUnit,
+	strings: &mut StringInterner,
+) -> Vec<Diagnostic<FileId>> {
 	let CompilationUnit {
 		files,
 		packages,
-		strings,
 		stdlib_package,
 		root_package,
 	} = compilation;
@@ -94,19 +98,19 @@ pub fn check(compilation: &mut CompilationUnit) -> Vec<Diagnostic<FileId>> {
 
 /// Checks and then lowers the same live context into [`MIR`].
 ///
-/// This is deliberately separate from [`check`], which is left untouched: it
-/// repeats the setup, keeps the [`TypeContext`] alive instead of dropping it,
-/// and hands it to the lowering entry point. The diagnostics are returned
+/// This repeats [`check`]'s setup, keeps the [`TypeContext`] alive instead of
+/// dropping it, and hands it to the lowering entry point. The diagnostics are returned
 /// either way, so a successful build still reports its warnings; on any error
 /// or bug diagnostic from checking, or on a lowering failure, no MIR is
 /// produced.
+/// `strings` must be the interner used to load the compilation.
 pub fn build(
-	compilation: &mut CompilationUnit,
+	compilation: &CompilationUnit,
+	strings: &mut StringInterner,
 ) -> (Vec<Diagnostic<FileId>>, Option<MIR>) {
 	let CompilationUnit {
 		files,
 		packages,
-		strings,
 		stdlib_package,
 		root_package,
 	} = compilation;

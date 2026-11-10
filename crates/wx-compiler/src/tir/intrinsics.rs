@@ -282,13 +282,15 @@ mod tests {
 
 	#[test]
 	fn std_function_parameters_have_distinct_intrinsics() {
-		let mut graph = crate::tir::signatures::tests::source_graph("");
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph("", &mut strings);
 		let mut diagnostics = Vec::new();
 		let mut resolutions = NameResolutions::default();
 		let (defs, _) = DefinitionRegistry::build(
 			&graph.packages,
 			&graph.files,
-			&mut graph.strings,
+			&mut strings,
 			&mut diagnostics,
 			&mut resolutions,
 			graph.stdlib_package,
@@ -304,7 +306,7 @@ mod tests {
 			{
 				continue;
 			}
-			let name = graph.strings.resolve(key.symbol).unwrap();
+			let name = strings.resolve(key.symbol).unwrap();
 			let intrinsic = Intrinsic::from_std_name(name)
 				.unwrap_or_else(|| panic!("unmapped std function `{name}`"));
 			assert!(

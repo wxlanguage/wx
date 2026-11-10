@@ -454,7 +454,8 @@ mod tests {
 	/// The graph of the function exported as `name` from `source`, as
 	/// lowered (no inlining).
 	pub(super) fn graph_of(source: &str, name: &str) -> Function {
-		let mut builder = vfs::CompilationUnitBuilder::new();
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 		builder.load_stdlib();
 		let root = builder
 			.load_binary(
@@ -467,8 +468,8 @@ mod tests {
 				),
 			)
 			.unwrap();
-		let mut unit = builder.build(root);
-		let (diagnostics, mir) = crate::tir::build(&mut unit);
+		let unit = builder.build(root);
+		let (diagnostics, mir) = crate::tir::build(&unit, &mut strings);
 		DiagnosticView::new("tir", &diagnostics, &unit.files)
 			.assert_no_errors();
 		let mir: MIR = mir.expect("the source lowers");
@@ -477,7 +478,7 @@ mod tests {
 			.iter()
 			.find_map(|export| match export.item {
 				mir::Item::Function(id)
-					if unit.strings.resolve(export.name) == Some(name) =>
+					if strings.resolve(export.name) == Some(name) =>
 				{
 					Some(id)
 				}

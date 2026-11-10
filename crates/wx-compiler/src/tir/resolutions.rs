@@ -162,7 +162,8 @@ mod tests {
 
 	impl<'s> Analysis<'s> {
 		fn new(source: &'s str) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
+			let mut strings = ast::Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 			builder.load_stdlib();
 			let root = builder
 				.load_binary(
@@ -175,7 +176,7 @@ mod tests {
 					),
 				)
 				.unwrap();
-			let mut compilation = builder.build(root);
+			let compilation = builder.build(root);
 			let parse_diagnostics = compilation.collect_diagnostics();
 			assert!(!parse_diagnostics.has_errors(), "{parse_diagnostics:?}");
 			let mut diagnostics = Vec::new();
@@ -183,7 +184,7 @@ mod tests {
 			let (defs, nodes) = DefinitionRegistry::build(
 				&compilation.packages,
 				&compilation.files,
-				&mut compilation.strings,
+				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
 				compilation.stdlib_package,
@@ -195,7 +196,7 @@ mod tests {
 			let dispatch = ImplDispatch::build(
 				&mut diagnostics,
 				&mut resolutions,
-				&mut compilation.strings,
+				&strings,
 				&defs,
 				&nodes,
 			);
@@ -203,7 +204,7 @@ mod tests {
 			let mut context = TypeContext::new(
 				&mut diagnostics,
 				&mut resolutions,
-				&mut compilation.strings,
+				&mut strings,
 				&mut solver,
 				&compilation.files,
 				&defs,
@@ -239,7 +240,7 @@ mod tests {
 				file,
 				resolutions,
 				defs,
-				strings: compilation.strings,
+				strings,
 				impl_dispatch: dispatch,
 				function_locals,
 				function_envs,

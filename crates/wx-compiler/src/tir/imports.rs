@@ -1183,12 +1183,16 @@ mod tests {
 	/// Builds definitions and inspects the bindings installed by `use` resolution.
 	struct TestCase {
 		graph: vfs::CompilationUnit,
+		strings: StringInterner,
 		defs: DefinitionRegistry,
 		diagnostics: Vec<Diagnostic<FileId>>,
 	}
 
 	impl TestCase {
-		fn from_graph(mut graph: vfs::CompilationUnit) -> Self {
+		fn from_graph(
+			graph: vfs::CompilationUnit,
+			mut strings: StringInterner,
+		) -> Self {
 			let parser_diagnostics = graph.collect_parser_diagnostics();
 			DiagnosticView::new("parse", &parser_diagnostics, &graph.files)
 				.assert_no_errors();
@@ -1201,7 +1205,7 @@ mod tests {
 			let (defs, ast_nodes) = DefinitionRegistry::build(
 				&graph.packages,
 				&graph.files,
-				&mut graph.strings,
+				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
 				graph.stdlib_package,
@@ -1215,13 +1219,15 @@ mod tests {
 
 			TestCase {
 				graph,
+				strings,
 				defs,
 				diagnostics,
 			}
 		}
 
 		fn new(source: &str) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 			builder.load_stdlib();
 			let root_id = builder
 				.load_binary(
@@ -1232,14 +1238,15 @@ mod tests {
 					)])),
 				)
 				.unwrap();
-			Self::from_graph(builder.build(root_id))
+			Self::from_graph(builder.build(root_id), strings)
 		}
 
 		fn new_workspace(
 			entry_path: vfs::AbsolutePath,
 			workspace: HashMap<vfs::AbsolutePath, String>,
 		) -> Self {
-			let mut builder = vfs::CompilationUnitBuilder::new();
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 			builder.load_stdlib();
 			let root_id = builder
 				.load_binary(
@@ -1247,7 +1254,7 @@ mod tests {
 					&vfs::VirtualFileSource::new(workspace),
 				)
 				.unwrap();
-			Self::from_graph(builder.build(root_id))
+			Self::from_graph(builder.build(root_id), strings)
 		}
 
 		fn root_namespace(&self) -> Namespace {
@@ -1265,7 +1272,7 @@ mod tests {
 			tier: Tier,
 			name: &str,
 		) -> Option<&Binding> {
-			let symbol = self.graph.strings.get(name)?;
+			let symbol = self.strings.get(name)?;
 			self.defs
 				.namespaces
 				.symbols(namespace)
