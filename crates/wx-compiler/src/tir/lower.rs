@@ -42,6 +42,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
+use rustc_hash::FxHashMap;
 use string_interner::symbol::{Symbol, SymbolU32};
 
 use super::body::{
@@ -49,8 +50,12 @@ use super::body::{
 	ScopeIdx,
 };
 use super::bounds::AssumptionEnvIdx;
-use super::defs::{Attributes, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx};
+use super::defs::{
+	Attributes, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx, PackageMemberItem,
+	Scope,
+};
 use super::eval::Val;
+use super::intrinsics::Intrinsic;
 use super::members::ResolvedFunction;
 use super::signatures::TypeContext;
 use super::solver::{NormalizationDepth, RewriteFlags};
@@ -241,6 +246,9 @@ struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	/// Backend identity, minted here per instance. Never a source or Wasm
 	/// index.
 	ids: HashMap<FunctionInstance, mir::FunctionId>,
+	/// The operation the compiler supplies for each of std's package
+	/// function parameters: the compiler is std's instantiator.
+	intrinsics: FxHashMap<FunctionIdx, Intrinsic>,
 	/// How each struct, tuple and fat pointer type lowered so far is held
 	/// on the stack.
 	shapes: StackShapes,
@@ -265,6 +273,7 @@ pub(super) fn build(
 ) -> Result<mir::MIR, ()> {
 	let global_count = context.defs.globals.len();
 	let memory_count = context.defs.memories.len();
+	let intrinsics = std_intrinsics(context);
 	Lowerer {
 		context,
 		functions: Vec::new(),
@@ -275,6 +284,7 @@ pub(super) fn build(
 		memories: Vec::new(),
 		memory_ids: vec![None; memory_count],
 		ids: HashMap::new(),
+		intrinsics,
 		shapes: StackShapes::default(),
 		signatures: mir::Signatures::default(),
 		statics: statics::StaticData::default(),
@@ -283,6 +293,34 @@ pub(super) fn build(
 		next_id: 0,
 	}
 	.run()
+}
+
+/// Each function in std's package contract is the operation of its name.
+/// Std is maintained with the compiler, so an unknown name is an invariant
+/// failure.
+fn std_intrinsics(
+	context: &TypeContext<'_, '_, '_>,
+) -> FxHashMap<FunctionIdx, Intrinsic> {
+	let defs = context.defs;
+	defs.package_contracts[defs.stdlib_package.as_usize()]
+		.members
+		.values()
+		.filter_map(|member| match member.item {
+			PackageMemberItem::Function(function) => Some(function),
+			PackageMemberItem::Constant(_) | PackageMemberItem::Type(_) => None,
+		})
+		.map(|function| {
+			let name = context
+				.strings
+				.resolve(defs.functions[usize::from(function)].name.inner)
+				.unwrap();
+			let intrinsic =
+				Intrinsic::from_std_name(name).unwrap_or_else(|| {
+					panic!("unknown std function parameter `{name}`")
+				});
+			(function, intrinsic)
+		})
+		.collect()
 }
 
 impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
@@ -511,29 +549,24 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			self.context.defs.functions[usize::from(function)].name.span;
 		match self.context.function_implementations[usize::from(function)] {
 			FunctionImplementation::Defined(_) => {}
-			FunctionImplementation::Intrinsic(intrinsic) => {
-				return self.lower_intrinsic_function(instance, intrinsic);
-			}
 			FunctionImplementation::Imported(import) => {
 				return self.lower_imported_function(instance, import);
 			}
-			FunctionImplementation::Declaration => {
-				let provided = matches!(
-					self.context
-						.ast_node(super::defs::DefId::Function(function)),
-					super::defs::AstNodeRef::Function {
-						item: crate::ast::Item::PackageFunction { .. },
-						..
-					}
-				);
+			FunctionImplementation::Parameter => {
+				if let Some(&intrinsic) = self.intrinsics.get(&function) {
+					return self.lower_intrinsic_function(instance, intrinsic);
+				}
 				self.unsupported(
 					file_id,
 					name_span,
-					if provided {
-						"an unfulfilled package function parameter"
-					} else {
-						"a function declaration without an implementation"
-					},
+					"an unfulfilled package function parameter",
+				)?;
+			}
+			FunctionImplementation::Declaration => {
+				self.unsupported(
+					file_id,
+					name_span,
+					"a function declaration without an implementation",
 				)?;
 			}
 		}
@@ -610,7 +643,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn lower_intrinsic_function(
 		&mut self,
 		instance: FunctionInstance,
-		intrinsic: super::intrinsics::Intrinsic,
+		intrinsic: Intrinsic,
 	) -> Result<(), ()> {
 		let id = self.ids[&instance];
 		let file_id =
@@ -713,11 +746,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.lower_type(value_type, file_id, name.span)?;
 		let id = mir::GlobalId::new(u32::try_from(self.globals.len()).unwrap());
 		let origin =
-			match self.context.ast_node(super::defs::DefId::Global(global)) {
-				&super::defs::AstNodeRef::ImportedGlobal {
-					import_index,
-					..
-				} => {
+			match self.context.defs.globals[usize::from(global)].namespace {
+				Scope::Import(import_index) => {
 					let entry = mir::ImportIdx::new(
 						u32::try_from(self.imports.len()).unwrap(),
 					);
@@ -800,11 +830,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let pages =
 			|bound: Option<Spanned<u64>>| bound.map(|pages| pages.inner);
 		let origin =
-			match *self.context.ast_node(super::defs::DefId::Memory(memory)) {
-				super::defs::AstNodeRef::ImportedMemory {
-					import_index,
-					..
-				} => {
+			match self.context.defs.memories[usize::from(memory)].namespace {
+				Scope::Import(import_index) => {
 					let entry = mir::ImportIdx::new(
 						u32::try_from(self.imports.len()).unwrap(),
 					);
@@ -1509,9 +1536,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			(None, _) => None,
 		};
-		if let FunctionImplementation::Intrinsic(intrinsic) =
-			self.context.function_implementations[usize::from(callee.function)]
-		{
+		if let Some(&intrinsic) = self.intrinsics.get(&callee.function) {
 			debug_assert!(receiver.is_none(), "an intrinsic is no method");
 			let call = self.lower_intrinsic(
 				body, state, expr, callee, intrinsic, args, ty,
@@ -2440,6 +2465,29 @@ mod tests {
 		let instance =
 			wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
 		(store, instance)
+	}
+
+	#[test]
+	#[should_panic(
+		expected = "unknown std function parameter `unknown_operation`"
+	)]
+	fn an_unknown_std_intrinsic_is_a_compiler_invariant_failure() {
+		let source = r#"
+			pub trait StackValue { type Repr; }
+			pub trait Call { type Args; type Result; }
+			pub trait Function: Call {}
+			type u8;
+			type u32;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
+			package func unknown_operation();
+		"#;
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph = crate::tir::signatures::tests::std_source_graph(
+			source,
+			&mut strings,
+		);
+		let _ = crate::tir::build(&graph, &mut strings);
 	}
 
 	#[test]

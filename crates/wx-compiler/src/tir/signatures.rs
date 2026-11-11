@@ -46,7 +46,6 @@ use super::defs::{
 };
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
-use super::intrinsics::Intrinsic;
 use super::members::{
 	ApplicableMember, ConstantTarget, MemberLookup, TraitMemberSelection,
 	TypeProjectionTarget, report_ambiguous_type_member,
@@ -2756,22 +2755,9 @@ impl<'ast, 'ctx, 'dispatch> TypeContext<'ast, 'ctx, 'dispatch> {
 				else {
 					unreachable!()
 				};
-				// Only the compiler-created std package is fulfilled. Other
-				// package contracts remain declarations; general instantiation
-				// is not modeled.
-				if matches!(item, ast::Item::PackageFunction { .. })
-					&& self.defs.namespaces.scope(namespace).package_id
-						== self.defs.stdlib_package
-				{
-					let name =
-						self.strings.resolve(signature.name.inner).unwrap();
-					let intrinsic = Intrinsic::from_std_name(name)
-						.unwrap_or_else(|| {
-							panic!("unknown std function parameter `{name}`")
-						});
+				if matches!(item, ast::Item::PackageFunction { .. }) {
 					self.function_implementations
-						[usize::from(function_index)] =
-						FunctionImplementation::Intrinsic(intrinsic);
+						[usize::from(function_index)] = FunctionImplementation::Parameter;
 				}
 				self.resolve_function_signature(
 					obligations,
@@ -9727,7 +9713,7 @@ pub(super) mod tests {
 		));
 		assert!(matches!(
 			implementation("std::trap"),
-			FunctionImplementation::Intrinsic(Intrinsic::Trap)
+			FunctionImplementation::Parameter
 		));
 		assert!(std::ptr::eq(
 			implementation("stop"),
@@ -9735,7 +9721,7 @@ pub(super) mod tests {
 		));
 		assert!(matches!(
 			implementation("i32_add"),
-			FunctionImplementation::Declaration
+			FunctionImplementation::Parameter
 		));
 		assert!(matches!(
 			implementation("missing"),
@@ -9788,7 +9774,7 @@ pub(super) mod tests {
 		};
 		assert!(matches!(
 			case.context.function_implementations[usize::from(trap)],
-			FunctionImplementation::Intrinsic(Intrinsic::Trap)
+			FunctionImplementation::Parameter
 		));
 		let DefKind::Function(ordinary) = case.resolve(Tier::Value, "f32_sqrt")
 		else {
@@ -9798,23 +9784,6 @@ pub(super) mod tests {
 			case.context.function_implementations[usize::from(ordinary)],
 			FunctionImplementation::Declaration
 		));
-	}
-
-	#[test]
-	#[should_panic(
-		expected = "unknown std function parameter `unknown_operation`"
-	)]
-	fn an_unknown_std_intrinsic_is_a_compiler_invariant_failure() {
-		test_case!(std case = indoc! {"
-			pub trait Call { type Args; type Result; }
-			pub trait Function: Call {}
-			type u8;
-			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
-			struct Char(value: u32);
-			package func unknown_operation();
-		"});
-		let _ = case;
 	}
 
 	#[test]

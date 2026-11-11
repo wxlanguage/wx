@@ -656,9 +656,8 @@ impl LocalDefIdx {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) struct AstEntry<'ast> {
 	pub(super) file_id: FileId,
-	/// The scope the item is written in, where its signature resolves. For
-	/// an imported declaration that is the scope around its import block;
-	/// the block itself is named by the entry (`AstNodeRef::Imported*`).
+	/// The scope the item is written in, where its signature resolves: for
+	/// an imported declaration, its import block's own scope.
 	pub(super) namespace: Scope,
 	pub(super) node: AstNodeRef<'ast>,
 }

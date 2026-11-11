@@ -1,7 +1,7 @@
 # TypeContext ownership and explicit borrowing refactor
 
 Status: proposed design and implementation plan, not an implemented API.
-Date: 2026-11-10.
+Date: 2026-11-10; direction revised 2026-11-11 (see "Revised direction").
 Companion: [native LSP migration plan](lsp-refactor-plan.md).
 
 ## Current status
@@ -39,6 +39,190 @@ Latest design clarification: the three conceptual parts do not require exactly
 three struct fields. Products may remain directly on TypeContext. Grouping is
 open and should follow real parameter forwarding and disjoint borrowing needs,
 not be fixed before the re-entrant compiler-path prototype.
+
+## Revised direction (2026-11-11): construction owns the AST borrow
+
+The owned-AST-locator approach (phase 2 below, as first written) is dropped.
+Auditing what TIR reads from the AST, and when, showed the borrow belongs to
+checking, not to the semantic state:
+
+| Reader | When | Needs |
+| --- | --- | --- |
+| `ensure_signature` (written types, params, bounds, attributes) | sweep | syntax |
+| `BodyContext` (blocks, constant initializers) | sweep | syntax |
+| `conformance.rs` (pointing at a written mismatch) | sweep | syntax |
+| `ImplDispatch::build` (impl targets, trait paths) | before sweep | syntax |
+| solver, eval, layout, member queries | any time | finished signatures and bodies only; they never force a signature |
+| lowering | after checking | nothing, since 2026-11-11 (below) |
+
+`query_state`/`query_stack` are construction bookkeeping too: outside the
+signature code they are read only by three `debug_assert!`s in `solver.rs`.
+
+So `TypeContext` today fuses two things: the semantic state the LSP keeps
+(defs, dispatch, types, signatures, bodies, values, resolutions, diagnostics,
+the solver) and the construction machinery that only lives while checking
+(`ast_nodes`, query state and stack, per-query obligations, and the
+signature/body/conformance entry points). The `'ast` lifetime belongs wholly
+to the second. The target shape:
+
+```rust
+pub fn check(compilation: &CompilationUnit, strings: &mut StringInterner) -> TypeContext {
+    let (defs, entries) = DefinitionRegistry::build(..); // entries keep &'ast refs
+    let mut cx = TypeContext::new(defs, ..);              // owned, no lifetime
+    Construction::new(compilation, entries, &mut cx).sweep();
+    cx                                                    // AST borrow ends here
+}
+```
+
+`Construction<'ast>` holds `entries: Vec<AstEntry<'ast>>` unchanged,
+`query_state`, `query_stack` and the obligation lists, and lends `&mut
+TypeContext`; signature building, body checking and conformance are its
+methods. It is dropped when the sweep ends. The AST representation does not
+change: no owned locator, no mirror enum, no parent table. This is the three-way
+split below with one refinement: the signature-query part is the construction
+phase and need not outlive it.
+
+Open point for the prototype: the re-entry path (normalization -> `check_constant`
+-> `decide_obligations`) runs during the sweep. It works on built bodies, not on
+syntax, so it should live with the semantic state; confirm on real code that no
+solver path needs `Construction`. If on-demand checking of a single body is ever
+wanted after the sweep, a new `Construction` is built from the AST (its entries
+are a deterministic walk); an arena AST or an `ItemTree` with stable item IDs is
+only worth it once checking stops re-running whole-program per edit.
+
+### Settled shapes (2026-11-11)
+
+Measured before settling:
+
+- After phase 1 of the sweep, no signature is ever computed and no cycle is
+  hit: a temporary probe panicking on either passed the whole suite and every
+  example. Every later `ensure_signature` is a read of a final status.
+- What may force a signature (a call graph over `tir/`, collisions checked):
+  ~45 `TypeContext` methods that turn written syntax into types (the
+  `resolve_*` family, `resolve_*_signature`, name-based member selection,
+  `trait_env`, `prepare_declarations_of`, the sweep) and body building. The
+  solver, evaluation, `check_obligation`, `check_constant`,
+  `decide_obligations`, lowering and `format.rs` cannot reach it.
+- Body building calls those syntax methods at 10 sites (`typecheck.rs`,
+  `typecheck/blocks.rs`, `typecheck/members.rs`).
+- Deciding reaches 25 of `BodyContext`'s 199 methods, which read only `cx`,
+  `body` and `scope`; building calls into them 64 times (`normalized` 23,
+  `source_span` 11).
+
+**`Construction`, a sibling of `TypeContext`, not a wrapper.** It holds the
+syntax-reading scheduler and lends nothing; its operations take the context as
+a parameter:
+
+```rust
+pub(super) struct Construction<'ast> {
+    entries: Vec<AstEntry<'ast>>,               // ast_nodes, borrowed refs kept
+    query_state: FxHashMap<DefId, QueryEntry>,
+    query_stack: Vec<QueryInfo>,
+    obligations: Vec<TypeObligation>,           // per-declaration runs
+}
+impl<'ast> Construction<'ast> {
+    fn sweep(&mut self, cx: &mut TypeContext);
+    fn ensure_signature(&mut self, cx: &mut TypeContext, query: QueryInfo) -> SignatureStatus;
+    fn resolve_type(&mut self, cx: &mut TypeContext, obligations: &mut Vec<TypeObligation>,
+                    scope: LexicalScope, type_expr: &Spanned<ast::TypeExpression>,
+                    infer: InferPolicy) -> TypeIndex;
+    // … the other syntax methods, same pattern
+}
+```
+
+`TypeContext` keeps the products and the solver, with no lifetime; the solver,
+evaluation and obligation checking stay its methods. Being a sibling is what
+lets `BodyBuilder` hold `cx` and `construction` as two disjoint `&mut`s.
+
+**`BodyContext` / `BodyBuilder`.** Deciding is its own entity, a body in its
+scope and what is valid on it regardless of syntax; building uses it, and it
+knows nothing of building. Rejected: an `Option<&mut Construction>` field
+(runtime `expect`), a mode type parameter (typestate), and nesting a core
+struct inside the builder (`self.core.cx` everywhere).
+
+```rust
+/// A body in the scope it is written in: normalize, compare, report, check
+/// usefulness, decide what building left open. Knows nothing about syntax.
+pub(super) struct BodyContext<'a> {
+    cx: &'a mut TypeContext,
+    body: &'a mut Body,
+    scope: LexicalScope,
+    owner: BodyOwner,
+}
+impl<'a> BodyContext<'a> {
+    pub(super) fn new(cx: &'a mut TypeContext, body: &'a mut Body,
+                      scope: LexicalScope, owner: BodyOwner) -> Self;
+    pub(super) fn decide(&mut self, obligations: Obligations);
+    // + the other deciding-reachable methods: decide_*, equality, normalize_at,
+    // normalized, static_target, untyped_value, field_type, report_*,
+    // mismatch_at, reject, push_error, source_span, exhaustiveness (`Shapes`)
+}
+
+/// Builds a body from written syntax, during construction.
+pub(super) struct BodyBuilder<'a, 'ast> {
+    cx: &'a mut TypeContext,
+    construction: &'a mut Construction<'ast>,
+    body: Body,
+    scope: LexicalScope,
+    owner: BodyOwner,
+    obligations: Obligations,
+    current: ScopeIdx,
+    lookup: FxHashMap<(ScopeIdx, SymbolU32), LocalIdx>,
+    scope_types: Vec<ScopeType>,
+}
+impl<'a, 'ast> BodyBuilder<'a, 'ast> {
+    pub(super) fn new(cx: &'a mut TypeContext, construction: &'a mut Construction<'ast>,
+                      scope: LexicalScope, owner: BodyOwner) -> Self;
+    pub(super) fn check_body(self, expr: &Spanned<ast::Expression>,
+                             expected: TypeIndex) -> (Body, Obligations);
+    fn context(&mut self) -> BodyContext<'_> {
+        BodyContext::new(self.cx, &mut self.body, self.scope, self.owner)
+    }
+}
+```
+
+Call sites: building keeps flat fields (`self.cx`, `self.body`); the 64 shared
+calls become `self.context().f(..)`, with arguments that read `self` computed
+first; the 10 syntax calls become
+`self.construction.resolve_type(self.cx, &mut self.obligations.types, ..)`.
+The solver's re-entry has no builder and no `Construction`:
+
+```rust
+fn decide_obligations(&mut self, const_index: ConstIdx) {   // on TypeContext
+    let Some(obligations) = self.const_obligations.remove(&const_index) else { return };
+    let mut body = std::mem::take(&mut self.bodies[index]);
+    BodyContext::new(self, &mut body, scope, BodyOwner::Const(const_index)).decide(obligations);
+    self.bodies[index] = body;
+}
+```
+
+`const_scope` reads the constant's file and namespace from `ConstDef`, not
+from the entries. The `decide_*` may move to their own `typecheck/decide.rs`.
+
+**Order.** (1) Split `BodyContext` into `BodyContext` and `BodyBuilder`; it
+does not depend on `Construction` (the builder holds only `cx` at first) and
+lands and tests on its own. (2) Introduce `Construction` with the entries,
+query state and stack and declaration obligations; move `ensure_signature`,
+`compute_signature`, the ~45 syntax methods, the sweep, conformance and
+`ImplDispatch::build`'s entry reading onto it, and give `BodyBuilder` its
+`construction` field. (3) Drop `TypeContext`'s lifetimes and make `check`
+return the owned context.
+
+### Done: lowering reads no AST (2026-11-11)
+
+- `FunctionImplementation::Intrinsic` is replaced by `Parameter` (a package
+  function parameter: whoever instantiates its package supplies it). Checking
+  never read the intrinsic, and calls are not constant expressions, so TIR does
+  not map intrinsics. `Declaration` no longer covers both a bodiless function
+  and an unfulfilled parameter. No `PackageId` payload: the package is the
+  declaring scope's, and per-instance fulfilment will need its own structure,
+  keyed by instance and parameter, not by `FunctionIdx`.
+- Lowering fulfils std's parameters: the compiler is std's instantiator.
+  `std_intrinsics` builds an `FxHashMap<FunctionIdx, Intrinsic>` from std's
+  package contract (sized by std's interface, not the program), resolving each
+  name once and panicking on an unknown one on every build.
+- An imported global or memory is recognized by its namespace,
+  `Scope::Import(import)`; nothing new is stored.
 
 ## Conceptual ownership split: three disjoint parts
 
@@ -185,6 +369,9 @@ Retain all of these coherently. Do not drop allocations or reset the solver when
 checking calls back into another operation.
 
 ### Borrowed AST entry list is the other ownership obstacle
+
+(Resolved by the revised direction: the entry list stays borrowed and moves to
+`Construction`, which does not outlive the sweep.)
 
 `AstEntry<'ast>` carries file/namespace and an `AstNodeRef<'ast>`. The latter
 borrows ordinary items, trait/impl members, enum variants, and import declarations.
@@ -440,6 +627,10 @@ whole-engine `mem::take` operations, but do not ban local work-list moves.
 
 ## Owned AST locations
 
+**Superseded 2026-11-11** by "Revised direction": nothing after the sweep
+needs the AST, so the entries stay borrowed inside `Construction`. Kept for
+the record.
+
 Replace persistent borrowed AST references with owned locations addressed from
 immutable CompilationUnit inputs. Keep AstNodeRef as a short-lived typed result.
 
@@ -496,6 +687,7 @@ Requirements:
 | Extract a finished reduced semantic result | Superseded by user direction; loses the desired live query foundation |
 | Need/Resume results, explicit work queue, or callback traits | Possible later if genuine algorithmic need; too disruptive now and changes recursive scheduling/cycle reasoning |
 | Move shared arenas into yet another separately owned database immediately | Defer unless concrete borrow constraints justify it; do not preemptively fragment state |
+| Owned AST locators (`AstNode` mirror enum + item addresses) | Dropped 2026-11-11: makes construction-only data persistent; borrow it inside `Construction` instead |
 
 ## Body checking and lowering
 
@@ -526,15 +718,17 @@ allocation identity and exports.
   mutation. Temporary legacy entry-point adapters may keep builds green, but
   remove diagnostics-returning adapters when the owned context API lands.
 
-### 2. Owned declaration-source locations
+### 2. Nothing after the sweep reads the AST
 
-- Audit every AST-entry creation and consumer.
-- Choose the smallest owned locator representation; confirm nontrivial AST layout
-  changes with the user.
-- Replace borrowed entry persistence, validate identical definition order and
-  source identity, and keep typed short-lived AST access.
+- Done 2026-11-11 for lowering (see "Revised direction"). Remaining after-sweep
+  readers: none known; `members.rs:1384`'s `ast_node` assertion runs inside the
+  sweep.
 
 ### 3. Real compiler-path borrowing prototype
+
+- Prototype `Construction<'ast>` beside an owned `TypeContext` on one path
+  (constant body building is a good first one), and check the re-entry path
+  above against it.
 
 - Prototype an owned signature/semantic store and solver boundary in a bounded
   path, not just the standalone language test.
@@ -592,7 +786,9 @@ allocation identity and exports.
 
 1. Naming/scope of the state that owns types, signatures, bodies and query metadata:
    `SignatureState` versus a broader `SemanticState` (recommended broad meaning).
-2. Concrete owned AST locator layout after inspecting scanner/AST nesting.
+   Query metadata now belongs to `Construction`, not to that state.
+2. ~~Concrete owned AST locator layout~~: resolved 2026-11-11, no locator; the
+   AST borrow lives in `Construction`.
 3. Final body-builder and lowering dependency signatures after real-path prototype.
 4. Repeated check API: idempotent orchestration versus explicit construction/check
    lifecycle, without speculative incremental invalidation machinery.

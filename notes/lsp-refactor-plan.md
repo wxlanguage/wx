@@ -511,3 +511,9 @@ Next concrete action: audit how query state indexes AST entries and design the
 owned-state/borrowed-execution-view split, preserving disjoint borrows and the
 existing live lowering path. Confirm significant representation changes with the
 user before implementation.
+
+Resolved 2026-11-11: query metadata and the AST-entry list are construction
+state, not semantic state. Neither is needed after the sweep, so both move into
+a `Construction<'ast>` that lives only while checking; no locators are needed.
+See "Revised direction" in
+[type-context-ownership-refactor.md](type-context-ownership-refactor.md).

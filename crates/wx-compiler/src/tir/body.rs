@@ -24,7 +24,6 @@ use string_interner::symbol::SymbolU32;
 use super::defs::{
 	ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, ImportIdx, MemoryIdx, StructIdx,
 };
-use super::intrinsics::Intrinsic;
 use super::obligations::TypeObligation;
 use super::types::{GenericArgs, TypeIndex};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
@@ -59,14 +58,16 @@ pub(super) enum BodyOwner {
 
 /// What implements a function, indexed by `FunctionIdx` in `TypeContext`.
 /// This is independent of signature-query readiness. A declaration may be a
-/// trait requirement, an unfulfilled package parameter, or an ordinary
-/// bodiless function; its source definition retains that distinction.
+/// trait requirement or an ordinary bodiless function; its source definition
+/// retains that distinction.
 #[derive(Clone, Copy)]
 pub(super) enum FunctionImplementation {
 	/// Its checked block, in `TypeContext::bodies`.
 	Defined(BodyIdx),
-	Intrinsic(Intrinsic),
 	Imported(ImportIdx),
+	/// A package function parameter: whoever instantiates its package
+	/// supplies it (for std, the compiler, when lowering).
+	Parameter,
 	Declaration,
 }
 
@@ -74,7 +75,7 @@ impl FunctionImplementation {
 	pub(super) fn body(self) -> Option<BodyIdx> {
 		match self {
 			Self::Defined(body) => Some(body),
-			Self::Intrinsic(_) | Self::Imported(_) | Self::Declaration => None,
+			Self::Imported(_) | Self::Parameter | Self::Declaration => None,
 		}
 	}
 }
