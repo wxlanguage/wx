@@ -33,8 +33,10 @@ use super::decls::{
 	DeclKey, FieldIdx, FunctionIdx, InherentImplIdx, MemberKind, StructIdx,
 	Tier, TraitImplIdx, UseItemIndex,
 };
-use super::types::GenericEnvIdx;
-use crate::diagnostics::SourceSpan;
+use super::signatures::Semantics;
+use super::types::{GenericEnvIdx, GenericEnvOwner};
+use crate::diagnostics::{SourceSpan, TextSpan};
+use crate::vfs::FileId;
 
 /// Where a name is written, and the role it plays there; see the module doc.
 /// Entries order by position first, so what is written at one place is
@@ -223,6 +225,196 @@ impl Referent {
 				import,
 			},
 			None => Self::Declaration(declaration),
+		}
+	}
+}
+
+impl Semantics {
+	/// Where the definition of the name written at `offset` in `file` is
+	/// declared: the declaring name's span (a module's or an import block's
+	/// content, for those). `None` when no resolved name is written there, or
+	/// its target has no written name (`Self` in an impl, a package).
+	///
+	/// Names do not nest, so the entry is the last one starting at or before
+	/// `offset`; a few earlier ones share its span at most (the roles of one
+	/// site), and the first of them with a definition wins.
+	pub fn definition_at(
+		&self,
+		file: FileId,
+		offset: u32,
+	) -> Option<SourceSpan> {
+		let probe = Site::Label(SourceSpan::new(
+			file,
+			TextSpan {
+				start: offset,
+				end: u32::MAX,
+			},
+		));
+		let mut last = None;
+		for (site, reference) in self.resolutions.by_site.range(..=probe).rev()
+		{
+			let span = site.span();
+			if span.file_id != file {
+				break;
+			}
+			if last.is_some_and(|last| last != span) {
+				break;
+			}
+			if span.span.end < offset {
+				break;
+			}
+			// A zero-width synthetic span never covers a cursor.
+			if span.span.start <= offset
+				&& offset <= span.span.end
+				&& span.span.start != span.span.end
+			{
+				last = Some(span);
+				if let Some(definition) = self.definition_of(*reference) {
+					return Some(definition);
+				}
+			}
+		}
+		None
+	}
+
+	/// Where `reference` is declared.
+	fn definition_of(&self, reference: Reference) -> Option<SourceSpan> {
+		let decls = &self.decls;
+		match reference {
+			Reference::Name(referent) => match referent {
+				Referent::Declaration(key)
+				| Referent::Import {
+					declaration: key, ..
+				} => Some(key.source_span(&decls.namespaces)),
+				Referent::TypeParam { env, index } => {
+					let name = self
+						.generic_envs
+						.param_names(env)
+						.get(index as usize)?;
+					let file =
+						self.env_owner_file(self.generic_envs.owner(env));
+					Some(SourceSpan::new(file, name.span))
+				}
+				Referent::InherentImplSelf(_) | Referent::TraitImplSelf(_) => {
+					None
+				}
+				Referent::Member(kind) => {
+					let (file, name) = match kind {
+						MemberKind::Function(function)
+						| MemberKind::Method(function) => {
+							let function =
+								&decls.functions[usize::from(function)];
+							(function.file_id, function.name)
+						}
+						MemberKind::Constant(constant) => {
+							let constant =
+								&decls.constants[usize::from(constant)];
+							(constant.file_id, constant.name)
+						}
+						MemberKind::AssociatedType(assoc) => {
+							let assoc = &decls.assoc_types[usize::from(assoc)];
+							(assoc.file_id, assoc.name)
+						}
+					};
+					Some(SourceSpan::new(file, name.span))
+				}
+				Referent::Label { owner, label } => {
+					let body = self.owner_body(owner)?;
+					Some(SourceSpan::new(
+						self.owner_file(owner),
+						body.label(label).name.span,
+					))
+				}
+			},
+			Reference::Local { owner, local, .. } => {
+				let body = self.owner_body(owner)?;
+				Some(SourceSpan::new(
+					self.owner_file(owner),
+					body.local(local).name.span,
+				))
+			}
+			Reference::Field { owner, field, .. } => {
+				self.field_definition(owner, field)
+			}
+			Reference::ArgumentLabel(ArgumentLabel::Field { owner, field }) => {
+				self.field_definition(owner, field)
+			}
+			Reference::ArgumentLabel(ArgumentLabel::Parameter {
+				function,
+				parameter,
+			}) => {
+				let function = &decls.functions[usize::from(function)];
+				let name =
+					function.params.get(usize::from(parameter))?.as_ref()?;
+				Some(SourceSpan::new(function.file_id, name.span))
+			}
+		}
+	}
+
+	fn field_definition(
+		&self,
+		owner: StructIdx,
+		field: FieldIdx,
+	) -> Option<SourceSpan> {
+		let decl = &self.decls.structs[usize::from(owner)];
+		let name = decl.field_names.get(usize::from(field))?.as_ref()?;
+		Some(SourceSpan::new(decl.file_id, name.span))
+	}
+
+	fn owner_body(&self, owner: BodyOwner) -> Option<&super::body::Body> {
+		match owner {
+			BodyOwner::Const(constant) => self.const_body(constant),
+			BodyOwner::Function(function) => self.function_implementations
+				[usize::from(function)]
+			.body()
+			.map(|body| self.body(body)),
+			BodyOwner::Global(global) => self.global_bodies
+				[usize::from(global)]
+			.map(|body| self.body(body)),
+		}
+	}
+
+	fn owner_file(&self, owner: BodyOwner) -> FileId {
+		match owner {
+			BodyOwner::Const(index) => {
+				self.decls.constants[usize::from(index)].file_id
+			}
+			BodyOwner::Function(index) => {
+				self.decls.functions[usize::from(index)].file_id
+			}
+			BodyOwner::Global(index) => {
+				self.decls.globals[usize::from(index)].file_id
+			}
+		}
+	}
+
+	fn env_owner_file(&self, owner: GenericEnvOwner) -> FileId {
+		let decls = &self.decls;
+		match owner {
+			GenericEnvOwner::Constant(index) => {
+				decls.constants[usize::from(index)].file_id
+			}
+			GenericEnvOwner::Enum(index) => {
+				decls.enums[usize::from(index)].file_id
+			}
+			GenericEnvOwner::Struct(index) => {
+				decls.structs[usize::from(index)].file_id
+			}
+			GenericEnvOwner::Function(index) => {
+				decls.functions[usize::from(index)].file_id
+			}
+			GenericEnvOwner::Trait(index) => {
+				decls.traits[usize::from(index)].file_id
+			}
+			GenericEnvOwner::TypeAlias(index) => {
+				decls.type_aliases[usize::from(index)].file_id
+			}
+			GenericEnvOwner::InherentImpl(index) => {
+				decls.inherent_impls[usize::from(index)].file_id
+			}
+			GenericEnvOwner::TraitImpl(index) => {
+				decls.trait_impls[usize::from(index)].file_id
+			}
 		}
 	}
 }
@@ -1529,5 +1721,127 @@ mod tests {
 		assert_eq!(resolutions.get(Site::Value(span)), Some(updated));
 		assert_eq!(resolutions.get(Site::Label(span)), Some(label));
 		assert_eq!(resolutions.get(Site::Type(span)), None);
+	}
+
+	/// A source with labelled positions. `$[label]` is written right before a
+	/// name and is removed from the text the compiler sees; the label stands
+	/// for that name's position.
+	struct Marked {
+		source: String,
+		marks: Vec<(&'static str, u32)>,
+	}
+
+	impl Marked {
+		fn new(marked: &'static str) -> Self {
+			let mut source = String::new();
+			let mut marks = Vec::new();
+			let mut rest = marked;
+			while let Some(open) = rest.find("$[") {
+				source.push_str(&rest[..open]);
+				let after = &rest[open + "$[".len()..];
+				let close = after.find(']').expect("an unclosed marker");
+				marks.push((&after[..close], source.len() as u32));
+				rest = &after[close + "]".len()..];
+			}
+			source.push_str(rest);
+			Self { source, marks }
+		}
+
+		/// The span of the name the mark `label` is written before.
+		fn name(&self, label: &str) -> TextSpan {
+			let (_, start) = *self
+				.marks
+				.iter()
+				.find(|(mark, _)| *mark == label)
+				.unwrap_or_else(|| panic!("no mark `{label}`"));
+			let length = self.source[start as usize..]
+				.find(|c: char| !c.is_alphanumeric() && c != '_')
+				.unwrap_or(self.source.len() - start as usize);
+			TextSpan::new(start, start + length as u32)
+		}
+
+		/// Asserts that the cursor on the name marked `used` (at its start,
+		/// inside it and at its end) goes to the name marked `declared`.
+		#[track_caller]
+		fn assert_definition(
+			&self,
+			analysis: &Analysis<'_>,
+			used: &str,
+			declared: &str,
+		) {
+			let used_span = self.name(used);
+			let declared_span =
+				SourceSpan::new(analysis.file, self.name(declared));
+			for offset in [used_span.start, used_span.start + 1, used_span.end]
+			{
+				assert_eq!(
+					analysis.sema.definition_at(analysis.file, offset),
+					Some(declared_span),
+					"from `{used}` at offset {offset}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn definition_at_reaches_items_locals_labels_parameters_and_fields() {
+		let marked = Marked::new(indoc! {"
+			struct $[Point]Point($[width]width: i32, height: i32);
+			func $[make]make($[amount]amount: i32) -> i32 {
+				local $[total]total = $[amount.read]amount;
+				loop :$[done]done { break :$[done.break]done $[total.read]total }
+			}
+			func main() {
+				local p = $[Point.call]Point({ $[width.label]width: 1, height: 2 });
+				_ = $[make.call]make({ $[amount.label]amount: 3 });
+				local q: $[Point.type]Point = p;
+			}
+		"});
+		let analysis = Analysis::clean(&marked.source);
+		for (used, declared) in [
+			("Point.call", "Point"),
+			("Point.type", "Point"),
+			("make.call", "make"),
+			("amount.read", "amount"),
+			("amount.label", "amount"),
+			("total.read", "total"),
+			("done.break", "done"),
+			("width.label", "width"),
+		] {
+			marked.assert_definition(&analysis, used, declared);
+		}
+	}
+
+	#[test]
+	fn definition_at_reaches_type_parameters_and_members() {
+		let marked = Marked::new(indoc! {"
+			struct $[Meters]Meters(value: u32);
+			impl Meters { pub func $[zero]zero() -> Meters { Meters(0) } }
+			func id<$[Elem]Elem: StackValue>(x: $[Elem.param]Elem) -> $[Elem.result]Elem { x }
+			func main() { local m = $[Meters.path]Meters::$[zero.call]zero(); }
+		"});
+		let analysis = Analysis::clean(&marked.source);
+		for (used, declared) in [
+			("Elem.param", "Elem"),
+			("Elem.result", "Elem"),
+			("zero.call", "zero"),
+			("Meters.path", "Meters"),
+		] {
+			marked.assert_definition(&analysis, used, declared);
+		}
+	}
+
+	#[test]
+	fn definition_at_is_none_away_from_a_resolved_name() {
+		let source = "func f() { local x = 1; }";
+		let analysis = Analysis::new(source);
+		let keyword = source.find("local").unwrap() as u32;
+		assert_eq!(analysis.sema.definition_at(analysis.file, keyword), None);
+		assert_eq!(
+			analysis
+				.sema
+				.definition_at(analysis.file, source.len() as u32 + 5),
+			None
+		);
 	}
 }
