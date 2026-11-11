@@ -59,6 +59,15 @@ pub(super) enum BoundRequirements {
 
 #[derive(Clone, Copy)]
 pub(super) enum TypeObligation {
+	/// A method receives its enclosing `Self` by value or through exactly
+	/// one pointer. Compare after signatures exist so aliases and associated
+	/// types have their meaning, rather than inspecting the written syntax.
+	CheckReceiverType {
+		frame: GenericEnvIdx,
+		ty: TypeIndex,
+		self_type: TypeIndex,
+		reference: SourceSpan,
+	},
 	CheckBounds {
 		frame: GenericEnvIdx,
 		requirements: BoundRequirements,
@@ -200,6 +209,58 @@ impl Semantics {
 		obligation: &TypeObligation,
 	) -> Result<(), ()> {
 		match *obligation {
+			TypeObligation::CheckReceiverType {
+				frame,
+				ty,
+				self_type,
+				reference,
+			} => {
+				let env = self.assumption_envs.of_frame(frame);
+				let normalized = (|| {
+					let ty = self.normalize(
+						strings,
+						env,
+						ty,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					let self_type = self.normalize(
+						strings,
+						env,
+						self_type,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					Ok((ty, self_type))
+				})();
+				let (normalized, self_type) = match normalized {
+					Ok(types) => types,
+					Err(SolverError::Pending) => return Err(()),
+					// The written type's well-formedness check owns this error.
+					Err(_) => return Ok(()),
+				};
+				if !self.types.has_error(normalized)
+					&& !self.types.has_error(self_type)
+					&& normalized != self_type
+					&& !matches!(self.types.resolve(normalized), Type::Pointer { to, .. } if *to == self_type)
+				{
+					let name = self.type_formatter(strings).display_type(ty);
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(DiagnosticCode::InvalidSelfType.code())
+							.with_message(format!(
+								"invalid `self` parameter type: `{name}`"
+							))
+							.with_label(reference.primary_label().with_message(
+								"type of `self` must be `Self` or a type that dereferences to it",
+							))
+							.with_note(
+								"consider changing to `Self` or `*Self`",
+							),
+					);
+				}
+				Ok(())
+			}
 			TypeObligation::CheckBounds {
 				frame,
 				requirements,
@@ -731,5 +792,192 @@ impl Semantics {
 				.with_note("an array's length is of its memory's `Size`"),
 		);
 		Err(SolverError::Poisoned)
+	}
+}
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use indoc::indoc;
+
+	use super::*;
+	use crate::ast::Keyword;
+	use crate::testing::DiagnosticView;
+	use crate::vfs::{self, Files};
+
+	struct TestCase {
+		files: Files,
+		diagnostics: Vec<Diagnostic<FileId>>,
+	}
+
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
+			builder.load_stdlib();
+			let root = builder
+				.load_binary(
+					vfs::AbsolutePath::new("/main.wx"),
+					&vfs::VirtualFileSource::from_relative(HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)])),
+				)
+				.unwrap();
+			let graph = builder.build(root);
+			DiagnosticView::new(
+				"parse/link",
+				&graph.collect_diagnostics(),
+				&graph.files,
+			)
+			.assert_no_errors();
+			let sema = crate::tir::check(&graph, &mut strings);
+			Self {
+				files: graph.files,
+				diagnostics: sema.diagnostics,
+			}
+		}
+
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new("check", &self.diagnostics, &self.files)
+		}
+	}
+
+	#[test]
+	fn receiver_types_reject_unrelated_types_wrappers_and_double_pointers() {
+		for receiver in [
+			"u32",
+			"Other",
+			"Wrapper<Self>",
+			"heap::&heap::&Self",
+			"heap::&Other",
+		] {
+			let source = format!(
+				"memory heap: u32; struct S(); struct Other(); struct Wrapper<T>(T); \
+				 impl S {{ func bad(self: {receiver}) {{}} }}"
+			);
+			let case = TestCase::new(&source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::InvalidSelfType]);
+			let diagnostic = &case.diagnostics[0];
+			assert!(
+				diagnostic
+					.message
+					.starts_with("invalid `self` parameter type: `")
+			);
+			assert_eq!(
+				diagnostic.severity,
+				codespan_reporting::diagnostic::Severity::Error
+			);
+			assert_eq!(diagnostic.labels.len(), 1);
+			let label = &diagnostic.labels[0];
+			assert_eq!(
+				label.style,
+				codespan_reporting::diagnostic::LabelStyle::Primary
+			);
+			assert_eq!(
+				&case.files.get(label.file_id).unwrap().source
+					[label.range.clone()],
+				receiver
+			);
+			assert_eq!(
+				label.message,
+				"type of `self` must be `Self` or a type that dereferences to it"
+			);
+			assert_eq!(
+				diagnostic.notes,
+				["consider changing to `Self` or `*Self`"]
+			);
+		}
+	}
+
+	#[test]
+	fn receiver_types_are_checked_in_trait_declarations_and_impls() {
+		let case = TestCase::new(indoc! {"
+			trait Tr: StackValue { func bad(self: u32); }
+			struct S();
+			impl Tr for S { func bad(self: u32) {} }
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InvalidSelfType,
+			DiagnosticCode::InvalidSelfType,
+		]);
+	}
+
+	#[test]
+	fn receiver_types_accept_self_and_one_pointer_in_generic_methods() {
+		let case = TestCase::new(indoc! {"
+			memory heap: u32;
+			struct S<T>(T);
+			impl<T: StackValue> S<T> {
+				func explicit(self: Self) {}
+				func named(self: S<T>) {}
+				func shared(self: heap::&Self) {}
+				func exclusive(self: heap::*Self) {}
+				func generic<M: Memory>(self: M::&Self) {}
+				func associated(x: u32) {}
+			}
+			trait Tr: StackValue {
+				func shared<M: Memory>(self: M::&Self);
+				func exclusive<M: Memory>(self: M::*Self);
+			}
+			func free(x: u32) {}
+		"});
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn receiver_types_read_aliases_and_later_associated_type_values() {
+		let case = TestCase::new(indoc! {"
+			memory heap: u32;
+			struct S();
+			impl S {
+				func alias(self: Alias) {}
+				func pointer_alias(self: Ref) {}
+				func projected(self: Self::This) {}
+				func pointer_projected(self: heap::&Self::This) {}
+			}
+			type Alias = S;
+			type Ref = heap::&S;
+			trait Identity { type This: StackValue; }
+			impl Identity for S { type This = S; }
+		"});
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn receiver_types_use_the_methods_self_refinements() {
+		let case = TestCase::new(indoc! {"
+			trait Tr: StackValue {
+				type This: StackValue;
+				func refined<Self: Tr where { This = Self }>(self: Self::This);
+			}
+		"});
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn receiver_types_do_not_add_errors_for_broken_types_or_positions() {
+		for (source, code) in [
+			(
+				"struct S(); impl S { func f(self: Missing) {} }",
+				DiagnosticCode::UndeclaredIdentifier,
+			),
+			(
+				"struct S(); impl S { func f(self: _) {} }",
+				DiagnosticCode::InferInSignature,
+			),
+			(
+				"struct S(); type Bad = Bad; impl S { func f(self: Bad) {} }",
+				DiagnosticCode::CyclicTypeAlias,
+			),
+			(
+				"struct S(); impl S { func f(x: u8, self: u32) {} }",
+				DiagnosticCode::SelfParamPosition,
+			),
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics().assert_codes(&[code]);
+		}
 	}
 }

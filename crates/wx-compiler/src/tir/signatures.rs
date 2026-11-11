@@ -2388,6 +2388,34 @@ impl<'ast> SemanticsBuilder<'ast> {
 			})
 			.collect();
 
+		if let Some(param) = signature.params.first()
+			&& param
+				.inner
+				.inner
+				.binding
+				.and_then(ast::Binding::name)
+				.is_some_and(|name| name.inner == Keyword::SelfLower.symbol())
+		{
+			let self_type = match sema.generic_envs.owner(parent) {
+				GenericEnvOwner::Trait(_) => {
+					sema.generic_envs.param_types(parent)[0]
+				}
+				GenericEnvOwner::InherentImpl(_)
+				| GenericEnvOwner::TraitImpl(_) => {
+					sema.resolve_impl_self(parent)
+						.expect("a member's impl header is resolved")
+						.1
+				}
+				_ => unreachable!("a member's parent is a trait or impl"),
+			};
+			obligations.push(TypeObligation::CheckReceiverType {
+				frame: scope,
+				ty: param_types[0],
+				self_type,
+				reference: SourceSpan::new(file_id, param.inner.inner.ty.span),
+			});
+		}
+
 		let return_type = match &signature.result {
 			Some(result) => self.resolve_value_type(
 				sema,
