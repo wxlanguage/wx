@@ -6,11 +6,6 @@ use string_interner::symbol::SymbolU32;
 
 use crate::index::index_newtype;
 
-// Only the pieces MIR still owns are in the module graph. The pre-transition
-// lowering pass (`legacy_lowering.rs`) and its helpers (`builder/`,
-// `types.rs`, `mono.rs`, `static_data.rs`, `tests.rs`) stay on
-// disk as reference but are deliberately not compiled: they target the
-// removed `tir::TIR` API.
 pub mod body;
 pub mod inline;
 pub mod references;

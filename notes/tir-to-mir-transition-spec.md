@@ -113,6 +113,10 @@ source item indices into MIR or Wasm indices.
 
 ### Current target and migration obstacles
 
+Historical migration context: the legacy files below were removed after the
+new lowering became active. Their last retained version is commit `05e2978`;
+the current lowerer is `tir/lower.rs` and `tir/lower/`.
+
 - [`mir::MIR::build`](../crates/wx-compiler/src/mir/mod.rs) reads the removed
   owned `tir::TIR` and tree-shaped `tir::Expression`. Its builder and
   [`mir/types.rs`](../crates/wx-compiler/src/mir/types.rs) are a rewrite, not

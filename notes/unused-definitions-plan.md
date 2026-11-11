@@ -8,7 +8,9 @@ end.
 ## Goal
 
 Report, as warnings, what the old checker's end-of-check pass reported
-(`tir/builder/mod.rs`, `report_unused`-shaped code around lines 636-860), on
+(`tir/builder/mod.rs` in commit `05e2978`, `report_unused_items` and
+`report_unused_enum_variants`; local and label warnings are in
+`tir/builder/body.rs::report_stack_warnings`), on
 the new `Semantics`, at check time (so `wx check` and the LSP get it without
 lowering):
 
@@ -23,6 +25,14 @@ lowering):
 | W2009 `UnusedEnumVariant` | a variant never named |
 
 All seven codes already exist in `diagnostics.rs`.
+
+The disconnected legacy TIR source and tests have been removed; recover them
+from commit `05e2978` when comparing behavior. In particular, the old field
+warning required an initialization and no `Read` or `ReadWrite`, and was
+suppressed when the struct itself was unused. The old local warning required
+no accesses at all (writes counted as use), and exempted `self` and
+underscore-prefixed names. Step 1 below proposes some policy changes rather
+than exact parity; settle these explicitly when implementing the pass.
 
 ## Where we are
 
