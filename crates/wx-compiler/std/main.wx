@@ -2153,7 +2153,11 @@ pub package func memory_size<Mem: Memory>(mem: Mem) -> Mem::Size;
 
 /// This is analogous to `memset` in C. \
 /// https://developer.mozilla.org/en-US/docs/WebAssembly/Reference/Memory/fill
-pub package func memory_fill<Mem: Memory>(dst: Mem::*u8, val: u8, len: Mem::Size);
+pub package func memory_fill<Mem: Memory>(
+    dst: Mem::*u8,
+    val: u8,
+    len: Mem::Size,
+);
 
 /// Can copy across two different memories as long as they have the same pointer size.
 /// This is analogous to `memmove` in C. \
@@ -2197,9 +2201,10 @@ pub typeset StackScalar { i32, i64, f32, f64, funcref }
 /// Reinterprets a value as another type held the same way on the stack. Changing
 /// a value's representation (`i32` to `i64`, an integer to a float) is an
 /// instruction's job.
-pub package func transmute<T: StackValue, U: StackValue where { Repr = T::Repr }>(
-    value: T,
-) -> U;
+pub package func transmute<
+    T: StackValue,
+    U: StackValue where { Repr = T::Repr },
+>(value: T) -> U;
 
 /// Every pointer type, `M::&T` and `M::*T`; the compiler answers it from the
 /// pointer's structure. `Metadata` is what the pointer carries beside its

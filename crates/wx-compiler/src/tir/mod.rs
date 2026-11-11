@@ -27,11 +27,23 @@ use crate::mir::MIR;
 use crate::symbols::StringInterner;
 use crate::vfs::CompilationUnit;
 
+pub use self::body::{
+	Body, BodyOwner, Label, LabelIdx, Local, LocalIdx, ParamIdx,
+};
 use self::decls::Declarations;
+pub use self::decls::{
+	AssocTypeIdx, ConstIdx, DeclKey, DeclKind, EnumIdx, FieldIdx, FunctionIdx,
+	GlobalIdx, InherentImplIdx, MemberKind, MemoryIdx, StructIdx, TraitIdx,
+	TraitImplIdx, TypeAliasIdx, TypesetIdx, UseItemIndex,
+};
+pub use self::eval::{AllocIdx, ConstScalar, Val};
+pub use self::format::{BoundFormatter, TypeFormatter};
 use self::impls::ImplDispatch;
 use self::resolutions::NameResolutions;
+pub use self::resolutions::{AccessKind, Definition, Reference, Route};
 pub use self::signatures::Semantics;
 use self::signatures::SemanticsBuilder;
+pub use self::types::{GenericEnvIdx, Primitive, Type, TypeIndex};
 
 /// Checks declarations and bodies into a live [`Semantics`], which holds
 /// their diagnostics. Parser and package diagnostics remain available on

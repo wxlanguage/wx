@@ -570,7 +570,7 @@ impl BodyBuilder<'_, '_> {
 		};
 		let recorded =
 			Site::Value(SourceSpan::new(self.scope.file_id, member.span));
-		self.sema.resolutions.record_reference(
+		self.sema.resolutions.record(
 			recorded,
 			Reference::Field {
 				access,

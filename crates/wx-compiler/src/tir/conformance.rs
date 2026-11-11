@@ -36,7 +36,7 @@ use super::decls::{
 };
 use super::members::TraitMemberSelection;
 use super::obligations::BoundRequirements;
-use super::resolutions::{Reference, Referent, Site};
+use super::resolutions::{Reference, Site};
 use super::signatures::{Semantics, SemanticsBuilder};
 use super::solver::{
 	ImplMember, NormalizationDepth, RewriteFlags, SolverError, Subjects,
@@ -667,12 +667,7 @@ impl Semantics {
 						.resolutions
 						.get(site)
 						.and_then(|reference| match reference {
-							Reference::Name(
-								Referent::Declaration(key)
-								| Referent::Import {
-									declaration: key, ..
-								},
-							) => Some(key),
+							Reference::Item { item, .. } => Some(item),
 							_ => None,
 						})
 						.is_some_and(|key| {

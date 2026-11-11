@@ -893,7 +893,7 @@ impl BodyBuilder<'_, '_> {
 				self.check_field(field, TypeIndex::ERROR, context);
 				continue;
 			};
-			self.sema.resolutions.record_reference(
+			self.sema.resolutions.record(
 				Site::Value(SourceSpan::new(self.scope.file_id, name.span)),
 				Reference::Field {
 					access: AccessKind::Read,

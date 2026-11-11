@@ -60,7 +60,7 @@ use super::operators::{
 	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
-use super::resolutions::{AccessKind, Reference, Referent, Site};
+use super::resolutions::{AccessKind, Reference, Site};
 use super::signatures::{
 	InferPolicy, LexicalScope, Semantics, SemanticsBuilder,
 };
@@ -521,6 +521,27 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			&& actual != TypeIndex::NEVER
 			&& actual != expected
 		{
+			// An exclusive pointer fits where a shared one to the same
+			// place is expected: `p` is `p.*.&`.
+			if let (
+				Type::Pointer {
+					to: expected_to,
+					memory: expected_memory,
+					ownership: Ownership::Shared,
+				},
+				Type::Pointer {
+					to,
+					memory,
+					ownership: Ownership::Exclusive,
+				},
+			) = (
+				*self.sema.types.resolve(expected),
+				*self.sema.types.resolve(actual),
+			) {
+				if expected_to == to && expected_memory == memory {
+					return self.shared_receiver(expr, to, memory);
+				}
+			}
 			let span = self.body.span(expr);
 			match self.context().equality(
 				expected,
@@ -997,7 +1018,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			&& segment.type_args.is_empty()
 			&& let Some((local, reach)) = self.lookup_local(segment.ident.inner)
 		{
-			self.sema.resolutions.record_reference(
+			self.sema.resolutions.record(
 				Site::Value(SourceSpan::new(
 					self.scope.file_id,
 					segment.ident.span,
@@ -1637,8 +1658,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		self.sema.resolutions.record(
 			Site::Value(site),
 			match impl_kind {
-				ImplKind::Inherent(index) => Referent::InherentImplSelf(index),
-				ImplKind::Trait(index) => Referent::TraitImplSelf(index),
+				ImplKind::Inherent(index) => Reference::InherentImplSelf(index),
+				ImplKind::Trait(index) => Reference::TraitImplSelf(index),
 			},
 		);
 		if !segment.type_args.is_empty() {
@@ -2972,9 +2993,7 @@ mod tests {
 	};
 	use super::super::eval::{ConstScalar, ConstValueState};
 	use super::super::paths::PathResolver;
-	use super::super::resolutions::{
-		NameResolutions, Reference, Referent, Site,
-	};
+	use super::super::resolutions::{NameResolutions, Reference, Site};
 	use super::super::signatures::Semantics;
 	use super::super::solver::{NormalizationDepth, RewriteFlags};
 	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
@@ -4071,7 +4090,7 @@ mod tests {
 		));
 		assert!(matches!(
 			case.sema.resolutions.get(site),
-			Some(Reference::Name(Referent::Label { label, .. })) if u32::from(label) == 0
+			Some(Reference::Label { label, .. }) if u32::from(label) == 0
 		));
 	}
 
@@ -7826,6 +7845,27 @@ mod tests {
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
+	}
+
+	#[test]
+	fn an_exclusive_pointer_fits_a_shared_one() {
+		let case = TestCase::new(indoc! {"
+				memory heap: u32;
+				memory other: u32;
+				func read(s: heap::&[u8]) {}
+				func f(s: heap::*[u8]) {
+					read(s);
+					local t: heap::&[u8] = s;
+				}
+				func g(s: heap::&[u8]) -> heap::*[u8] { s }
+				func h(s: other::*[u8]) { read(s); }
+				func first<M: Memory>(s: M::&[u8]) {}
+				func i(s: heap::*[u8]) { first(s); }
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
 	}
 
 	#[test]

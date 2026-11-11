@@ -197,7 +197,7 @@ pub struct TraitDecl {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: FxHashMap<BindingKey, MemberIdx>,
+	pub(super) bindings: FxHashMap<BindingKey, MemberIdx>,
 	pub members: Vec<TraitMemberDecl>,
 }
 
@@ -210,7 +210,7 @@ pub struct TraitImplDecl {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: FxHashMap<BindingKey, MemberIdx>,
+	pub(super) bindings: FxHashMap<BindingKey, MemberIdx>,
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
@@ -221,7 +221,7 @@ pub struct InherentImplDecl {
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
 	)]
-	pub bindings: FxHashMap<BindingKey, MemberIdx>,
+	pub(super) bindings: FxHashMap<BindingKey, MemberIdx>,
 	pub members: Vec<InherentMemberDecl>,
 }
 
@@ -846,7 +846,7 @@ pub(super) enum PackageMemberItem {
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub(super) struct Declarations {
+pub struct Declarations {
 	pub stdlib_package: PackageId,
 	pub root_package: PackageId,
 	pub namespaces: Namespaces,
@@ -856,7 +856,7 @@ pub(super) struct Declarations {
 	pub modules: Vec<ModuleDecl>,
 	pub imports: Vec<ImportDecl>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
-	pub exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	pub(super) exports: FxHashMap<SymbolU32, ExportEntrySource>,
 	/// Package-level contract keys, indexed by `PackageId`.
 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub(super) package_contracts: Vec<PackageContract>,
@@ -873,7 +873,7 @@ pub(super) struct Declarations {
 	pub assoc_types: Vec<AssocTypeDecl>,
 	pub type_aliases: Vec<TypeAliasDecl>,
 	pub use_items: Vec<UseItemDecl>,
-	pub use_paths: Vec<UsePathSegment>,
+	pub(super) use_paths: Vec<UsePathSegment>,
 	/// The `DeclKey` of every language builtin recognized by name in the
 	/// stdlib package — primitive types (`u8`, `funcref`, ...), `Bool`, `Char` and
 	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
@@ -1588,6 +1588,29 @@ impl Namespaces {
 		}
 	}
 
+	/// Every declaration of every namespace, in no particular order.
+	pub fn keys(&self) -> impl Iterator<Item = DeclKey> + '_ {
+		let packages = self
+			.packages
+			.iter()
+			.map(|table| Namespace::Package(table.package_id));
+		let modules = (0..self.modules.len())
+			.map(|index| Namespace::Module(ModuleIdx::new(index as u32)));
+		let enums = (0..self.enums.len())
+			.map(|index| Namespace::Enum(EnumIdx::new(index as u32)));
+		let imports = (0..self.imports.len())
+			.map(|index| Namespace::Import(ImportIdx::new(index as u32)));
+		packages
+			.chain(modules)
+			.chain(enums)
+			.chain(imports)
+			.flat_map(move |namespace| {
+				(0..self.symbols(namespace).items.len()).map(move |index| {
+					DeclKey::new(namespace, LocalDeclIdx::new(index as u32))
+				})
+			})
+	}
+
 	pub(super) fn scope(&self, scope: Scope) -> &ScopeTable {
 		match scope {
 			Scope::Package(package) => &self.packages[package.as_usize()],
@@ -2082,7 +2105,7 @@ impl DeclKey {
 	}
 
 	#[inline]
-	pub fn symbol_kind(self, decls: &Declarations) -> DeclKind {
+	pub(super) fn symbol_kind(self, decls: &Declarations) -> DeclKind {
 		decls.namespaces.kind(self)
 	}
 }
@@ -2176,6 +2199,39 @@ impl Declarations {
 			resolutions,
 			stdlib_package,
 			root_package,
+		)
+	}
+}
+
+/// The span of the name `key` is declared by. A module's or an import block's
+/// namespace entry describes its contents, so those read their own name.
+fn declaration_name_span(
+	namespaces: &Namespaces,
+	modules: &[ModuleDecl],
+	imports: &[ImportDecl],
+	key: DeclKey,
+) -> SourceSpan {
+	match namespaces.kind(key) {
+		DeclKind::Module(index) => {
+			let module = &modules[usize::from(index)];
+			SourceSpan::new(module.declaration_file, module.name.span)
+		}
+		DeclKind::Import(index) => SourceSpan::new(
+			namespaces.file_id(Namespace::Import(index)),
+			imports[usize::from(index)].internal_name.span,
+		),
+		_ => key.source_span(namespaces),
+	}
+}
+
+impl Declarations {
+	/// Where `key` is declared: the span of its name.
+	pub fn declaration_span(&self, key: DeclKey) -> SourceSpan {
+		declaration_name_span(
+			&self.namespaces,
+			&self.modules,
+			&self.imports,
+			key,
 		)
 	}
 }
@@ -2787,17 +2843,12 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	/// Namespace self entries describe their contents; collision labels need
 	/// the declaration name, which may be written in a different file.
 	fn definition_span(&self, key: DeclKey) -> SourceSpan {
-		match self.namespaces.kind(key) {
-			DeclKind::Module(index) => {
-				let module = &self.modules[usize::from(index)];
-				SourceSpan::new(module.declaration_file, module.name.span)
-			}
-			DeclKind::Import(index) => SourceSpan::new(
-				self.namespaces.file_id(Namespace::Import(index)),
-				self.imports[usize::from(index)].internal_name.span,
-			),
-			_ => key.source_span(&self.namespaces),
-		}
+		declaration_name_span(
+			&self.namespaces,
+			&self.modules,
+			&self.imports,
+			key,
+		)
 	}
 
 	fn insert_binding(

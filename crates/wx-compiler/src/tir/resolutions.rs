@@ -30,8 +30,8 @@ use std::collections::BTreeMap;
 
 use super::body::{BodyOwner, LabelIdx, LocalIdx, ParamIdx};
 use super::decls::{
-	DeclKey, FieldIdx, FunctionIdx, InherentImplIdx, MemberKind, StructIdx,
-	Tier, TraitImplIdx, UseItemIndex,
+	ConstIdx, DeclKey, DeclKind, FieldIdx, FunctionIdx, GlobalIdx,
+	InherentImplIdx, MemberKind, StructIdx, Tier, TraitImplIdx, UseItemIndex,
 };
 use super::signatures::Semantics;
 use super::types::{GenericEnvIdx, GenericEnvOwner};
@@ -68,6 +68,16 @@ impl Site {
 		}
 	}
 
+	/// Which of the entries at one name is the one it means where it is
+	/// used; see `Semantics::symbol_at`.
+	fn priority(self) -> u8 {
+		match self {
+			Site::Value(_) => 2,
+			Site::Type(_) => 1,
+			Site::Label(_) => 0,
+		}
+	}
+
 	fn role(self) -> u8 {
 		match self {
 			Site::Type(_) => 0,
@@ -95,15 +105,7 @@ pub(super) struct NameResolutions {
 }
 
 impl NameResolutions {
-	pub(super) fn record(&mut self, site: Site, referent: Referent) {
-		self.record_reference(site, Reference::Name(referent));
-	}
-
-	pub(super) fn record_reference(
-		&mut self,
-		site: Site,
-		reference: Reference,
-	) {
+	pub(super) fn record(&mut self, site: Site, reference: Reference) {
 		self.by_site.insert(site, reference);
 	}
 
@@ -138,111 +140,169 @@ impl NameResolutions {
 	}
 }
 
-/// The meaning and access of one written name. Parameters used in bodies are
-/// locals; parameter labels identify the callee's declaration, not a read of it.
+/// One written name: what it refers to and how it was reached. Parameters
+/// used in bodies are locals; a named argument's parameter identifies the
+/// callee's declaration, not a read of it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Reference {
-	Name(Referent),
+pub enum Reference {
+	/// A declaration in the namespace the name was looked up in: an item, a
+	/// module, a package or an import block.
+	Item { item: DeclKey, route: Route },
+	/// A local, a parameter included, of the body `owner`.
 	Local {
 		owner: BodyOwner,
 		local: LocalIdx,
 		access: AccessKind,
 	},
+	/// A field selected, matched or named by an argument.
 	Field {
 		owner: StructIdx,
 		field: FieldIdx,
 		access: AccessKind,
 	},
-	ArgumentLabel(ArgumentLabel),
-}
-
-/// How a use reaches a local or a field. A field label that initializes is
-/// not one: that is `ArgumentLabel::Field`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum AccessKind {
-	Read,
-	Write,
-	ReadWrite,
-}
-
-/// A target reached through name lookup, independent of its source occurrence.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Referent {
-	/// A declaration in the namespace the name was looked up in: an item, a
-	/// module, a package or an import block.
-	Declaration(DeclKey),
-	/// A declaration the namespace it was looked up in made visible through
-	/// a `use` item there, a named import or a glob. Only that first `use`
-	/// is recorded; one it leads through in another namespace can be found
-	/// again by looking the name up from it.
-	Import {
-		declaration: DeclKey,
-		import: UseItemIndex,
+	/// A named argument's parameter, owned by the declaration whose names the
+	/// call uses (the trait declaration for a trait implementation's method).
+	/// This does not require the callee to have a body or a corresponding
+	/// local.
+	Parameter {
+		function: FunctionIdx,
+		parameter: ParamIdx,
 	},
 	/// A generic parameter, or a trait's own `Self`: its frame and position
 	/// in it.
 	TypeParam { env: GenericEnvIdx, index: u32 },
+	/// A member selected through a type: `T::A`, `<X as Tr>::A`.
+	Member(MemberKind),
+	/// A label of the body `owner`, named by a `break` or `continue`.
+	Label { owner: BodyOwner, label: LabelIdx },
 	/// `Self` inside an inherent impl, which names the impl's target and is
 	/// not a parameter of it.
 	InherentImplSelf(InherentImplIdx),
 	/// `Self` inside a trait impl; see `InherentImplSelf`.
 	TraitImplSelf(TraitImplIdx),
-	/// A member selected through a type: `T::A`, `<X as Tr>::A`.
-	Member(MemberKind),
-	/// A label of the body `owner`, named by a `break` or `continue`.
-	Label { owner: BodyOwner, label: LabelIdx },
 }
 
-/// A named call argument. A field label always initializes that field;
-/// pattern fields instead use `Reference::Field` with read access.
+/// How a name reached the declaration it names.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum ArgumentLabel {
-	/// A constructor field initialized by this argument.
-	Field { owner: StructIdx, field: FieldIdx },
-	/// A named argument's parameter, owned by the declaration whose names the
-	/// call uses (the trait declaration for a trait implementation's method).
-	/// This does not require the callee to have a body or a corresponding local.
+pub enum Route {
+	/// The declaration is in the namespace the name was looked up in.
+	Direct,
+	/// The namespace made the declaration visible through this `use` item, a
+	/// named import or a glob. Only that first `use` is recorded; one it
+	/// leads through in another namespace can be found again by looking the
+	/// name up from it.
+	Import(UseItemIndex),
+}
+
+/// How a use reaches a local or a field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum AccessKind {
+	Read,
+	Write,
+	ReadWrite,
+	/// A constructor's field label gives the field its value.
+	Initialize,
+}
+
+/// A declared name: what a written name can be declared as. A reference
+/// refers to one (`Reference::definition`), and the declaration is written
+/// at `Semantics::definition_span`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum Definition {
+	Item(DeclKey),
+	Local {
+		owner: BodyOwner,
+		local: LocalIdx,
+	},
+	Field {
+		owner: StructIdx,
+		field: FieldIdx,
+	},
 	Parameter {
 		function: FunctionIdx,
 		parameter: ParamIdx,
 	},
+	TypeParam {
+		env: GenericEnvIdx,
+		index: u32,
+	},
+	Member(MemberKind),
+	Label {
+		owner: BodyOwner,
+		label: LabelIdx,
+	},
+	/// What `Self` names in an inherent impl: the target type written in its
+	/// header.
+	InherentImplTarget(InherentImplIdx),
+	/// What `Self` names in a trait impl; see `InherentImplTarget`.
+	TraitImplTarget(TraitImplIdx),
 }
 
-impl Referent {
+impl Reference {
 	/// What a namespace lookup found: `import` is the `use` item it came
 	/// through, as `BindingLookup::Found` reports it.
 	pub(super) fn from_lookup(
 		declaration: DeclKey,
 		import: Option<UseItemIndex>,
 	) -> Self {
-		match import {
-			Some(import) => Self::Import {
-				declaration,
-				import,
+		Self::Item {
+			item: declaration,
+			route: import.map_or(Route::Direct, Route::Import),
+		}
+	}
+
+	/// The declaration this refers to, without how it was reached.
+	pub fn definition(self) -> Definition {
+		match self {
+			Reference::Item { item, .. } => Definition::Item(item),
+			Reference::Local { owner, local, .. } => {
+				Definition::Local { owner, local }
+			}
+			Reference::Field { owner, field, .. } => {
+				Definition::Field { owner, field }
+			}
+			Reference::Parameter {
+				function,
+				parameter,
+			} => Definition::Parameter {
+				function,
+				parameter,
 			},
-			None => Self::Declaration(declaration),
+			Reference::TypeParam { env, index } => {
+				Definition::TypeParam { env, index }
+			}
+			Reference::Member(kind) => Definition::Member(kind),
+			Reference::Label { owner, label } => {
+				Definition::Label { owner, label }
+			}
+			Reference::InherentImplSelf(index) => {
+				Definition::InherentImplTarget(index)
+			}
+			Reference::TraitImplSelf(index) => {
+				Definition::TraitImplTarget(index)
+			}
 		}
 	}
 }
 
 impl Semantics {
-	/// Where the definition of the name written at `offset` in `file` is
-	/// declared: the declaring name's span (a module's or an import block's
-	/// content, for those). `None` when no resolved name is written there, or
-	/// its target has no written name (`Self` in an impl, a package).
+	/// What the name written at `offset` in `file` resolved to, with the span
+	/// of the name. `None` when no resolved name is written there.
 	///
 	/// Names do not nest, so the entry is the last one starting at or before
-	/// `offset`; a few earlier ones share its span at most (the roles of one
-	/// site), and the first of them with a definition wins.
-	pub fn definition_at(
+	/// `offset`. One written name can hold up to three entries (the roles of
+	/// one site: a `use` leaf is a type and a value, a shorthand argument is
+	/// a label and a value); the value wins, then the type, then the label,
+	/// which is what the name means where it is used.
+	pub fn symbol_at(
 		&self,
 		file: FileId,
 		offset: u32,
-	) -> Option<SourceSpan> {
+	) -> Option<(SourceSpan, Reference)> {
 		let probe = Site::Label(SourceSpan::new(
 			file,
 			TextSpan {
@@ -250,104 +310,231 @@ impl Semantics {
 				end: u32::MAX,
 			},
 		));
-		let mut last = None;
+		let mut found: Option<(SourceSpan, Site, Reference)> = None;
 		for (site, reference) in self.resolutions.by_site.range(..=probe).rev()
 		{
 			let span = site.span();
-			if span.file_id != file {
+			if span.file_id != file || span.span.end < offset {
 				break;
 			}
-			if last.is_some_and(|last| last != span) {
-				break;
-			}
-			if span.span.end < offset {
+			if found.is_some_and(|(found, ..)| found != span) {
 				break;
 			}
 			// A zero-width synthetic span never covers a cursor.
-			if span.span.start <= offset
-				&& offset <= span.span.end
-				&& span.span.start != span.span.end
+			if span.span.start == span.span.end {
+				continue;
+			}
+			if found
+				.is_none_or(|(_, kept, _)| site.priority() > kept.priority())
 			{
-				last = Some(span);
-				if let Some(definition) = self.definition_of(*reference) {
-					return Some(definition);
-				}
+				found = Some((span, *site, *reference));
 			}
 		}
-		None
+		found.map(|(span, _, reference)| (span, reference))
 	}
 
-	/// Where `reference` is declared.
-	fn definition_of(&self, reference: Reference) -> Option<SourceSpan> {
+	/// Where the definition of the name written at `offset` in `file` is
+	/// declared: the declaring name's span (a module's or an import block's
+	/// content, for those). `None` when no resolved name is written there, or
+	/// its target has no written name (`Self` in an impl, a package).
+	pub fn definition_at(
+		&self,
+		file: FileId,
+		offset: u32,
+	) -> Option<SourceSpan> {
+		let (_, reference) = self.symbol_at(file, offset)?;
+		self.definition_target(reference.definition())
+	}
+
+	/// What kind of declaration `key` names.
+	pub fn declaration_kind(&self, key: DeclKey) -> DeclKind {
+		key.symbol_kind(&self.decls)
+	}
+
+	/// Where go-to-definition leads for `definition`: where it is declared,
+	/// except a module in a file of its own, which leads to the start of that
+	/// file, its contents.
+	pub fn definition_target(
+		&self,
+		definition: Definition,
+	) -> Option<SourceSpan> {
+		if let Definition::Item(key) = definition
+			&& let DeclKind::Module(index) = self.declaration_kind(key)
+		{
+			let module = &self.decls.modules[usize::from(index)];
+			if module.own_file != module.declaration_file {
+				return Some(SourceSpan::new(
+					module.own_file,
+					TextSpan { start: 0, end: 0 },
+				));
+			}
+		}
+		self.definition_span(definition)
+	}
+
+	/// Where `definition` is declared: the declaring name's span, or `None`
+	/// when the target has no written name.
+	pub fn definition_span(
+		&self,
+		definition: Definition,
+	) -> Option<SourceSpan> {
 		let decls = &self.decls;
-		match reference {
-			Reference::Name(referent) => match referent {
-				Referent::Declaration(key)
-				| Referent::Import {
-					declaration: key, ..
-				} => Some(key.source_span(&decls.namespaces)),
-				Referent::TypeParam { env, index } => {
-					let name = self
-						.generic_envs
-						.param_names(env)
-						.get(index as usize)?;
-					let file =
-						self.env_owner_file(self.generic_envs.owner(env));
-					Some(SourceSpan::new(file, name.span))
-				}
-				Referent::InherentImplSelf(_) | Referent::TraitImplSelf(_) => {
-					None
-				}
-				Referent::Member(kind) => {
-					let (file, name) = match kind {
-						MemberKind::Function(function)
-						| MemberKind::Method(function) => {
-							let function =
-								&decls.functions[usize::from(function)];
-							(function.file_id, function.name)
-						}
-						MemberKind::Constant(constant) => {
-							let constant =
-								&decls.constants[usize::from(constant)];
-							(constant.file_id, constant.name)
-						}
-						MemberKind::AssociatedType(assoc) => {
-							let assoc = &decls.assoc_types[usize::from(assoc)];
-							(assoc.file_id, assoc.name)
-						}
-					};
-					Some(SourceSpan::new(file, name.span))
-				}
-				Referent::Label { owner, label } => {
-					let body = self.owner_body(owner)?;
-					Some(SourceSpan::new(
-						self.owner_file(owner),
-						body.label(label).name.span,
-					))
-				}
-			},
-			Reference::Local { owner, local, .. } => {
+		match definition {
+			Definition::Item(key) => Some(decls.declaration_span(key)),
+			Definition::TypeParam { env, index } => {
+				let name =
+					self.generic_envs.param_names(env).get(index as usize)?;
+				let file = self.env_owner_file(self.generic_envs.owner(env));
+				Some(SourceSpan::new(file, name.span))
+			}
+			Definition::Member(kind) => {
+				let (file, name) = match kind {
+					MemberKind::Function(function)
+					| MemberKind::Method(function) => {
+						let function = &decls.functions[usize::from(function)];
+						(function.file_id, function.name)
+					}
+					MemberKind::Constant(constant) => {
+						let constant = &decls.constants[usize::from(constant)];
+						(constant.file_id, constant.name)
+					}
+					MemberKind::AssociatedType(assoc) => {
+						let assoc = &decls.assoc_types[usize::from(assoc)];
+						(assoc.file_id, assoc.name)
+					}
+				};
+				Some(SourceSpan::new(file, name.span))
+			}
+			Definition::Label { owner, label } => {
+				let body = self.owner_body(owner)?;
+				Some(SourceSpan::new(
+					self.owner_file(owner),
+					body.label(label).name.span,
+				))
+			}
+			Definition::Local { owner, local } => {
 				let body = self.owner_body(owner)?;
 				Some(SourceSpan::new(
 					self.owner_file(owner),
 					body.local(local).name.span,
 				))
 			}
-			Reference::Field { owner, field, .. } => {
+			Definition::Field { owner, field } => {
 				self.field_definition(owner, field)
 			}
-			Reference::ArgumentLabel(ArgumentLabel::Field { owner, field }) => {
-				self.field_definition(owner, field)
+			Definition::InherentImplTarget(index) => {
+				let header =
+					self.inherent_impls[usize::from(index)].as_ref()?;
+				let file = decls.inherent_impls[usize::from(index)].file_id;
+				Some(SourceSpan::new(file, header.target.span))
 			}
-			Reference::ArgumentLabel(ArgumentLabel::Parameter {
+			Definition::TraitImplTarget(index) => {
+				let header = self.trait_impls[usize::from(index)].as_ref()?;
+				let file = decls.trait_impls[usize::from(index)].file_id;
+				Some(SourceSpan::new(file, header.target.span))
+			}
+			Definition::Parameter {
 				function,
 				parameter,
-			}) => {
+			} => {
 				let function = &decls.functions[usize::from(function)];
 				let name =
 					function.params.get(usize::from(parameter))?.as_ref()?;
 				Some(SourceSpan::new(function.file_id, name.span))
 			}
+		}
+	}
+
+	/// Every declared name that has a written name, with where it is written.
+	/// Where two share a span (a memory and the `Size` its synthetic impl
+	/// declares at its name, a trait and its `Self`), the item wins.
+	pub fn definitions(&self) -> BTreeMap<SourceSpan, Definition> {
+		let decls = &self.decls;
+		let mut found = BTreeMap::new();
+		let mut add = |definition: Definition| {
+			if let Some(span) = self.definition_span(definition)
+				&& span.span.start != span.span.end
+			{
+				found.insert(span, definition);
+			}
+		};
+		for member in decls.traits.iter().flat_map(|decl| &decl.members) {
+			add(Definition::Member(member.kind));
+		}
+		for member in decls.trait_impls.iter().flat_map(|decl| &decl.members) {
+			add(Definition::Member(member.kind));
+		}
+		for member in decls.inherent_impls.iter().flat_map(|decl| &decl.members)
+		{
+			add(Definition::Member(member.kind));
+		}
+		for (index, decl) in decls.structs.iter().enumerate() {
+			let owner = StructIdx::new(index as u32);
+			for field in 0..decl.field_names.len() {
+				add(Definition::Field {
+					owner,
+					field: FieldIdx::new(field as u32),
+				});
+			}
+		}
+		for env in self.generic_envs.frames() {
+			for index in 0..self.generic_envs.param_names(env).len() {
+				add(Definition::TypeParam {
+					env,
+					index: index as u32,
+				});
+			}
+		}
+		for index in 0..decls.functions.len() {
+			let function = FunctionIdx::new(index as u32);
+			let owner = BodyOwner::Function(function);
+			// A parameter of a function with a body is a local of it; the
+			// others are known by the declaration alone.
+			if self.owner_body(owner).is_none() {
+				for parameter in 0..decls.functions[index].params.len() {
+					add(Definition::Parameter {
+						function,
+						parameter: ParamIdx::new(parameter as u32),
+					});
+				}
+			}
+			self.add_body_definitions(owner, &mut add);
+		}
+		for index in 0..decls.constants.len() {
+			let owner = BodyOwner::Const(ConstIdx::new(index as u32));
+			self.add_body_definitions(owner, &mut add);
+		}
+		for index in 0..decls.globals.len() {
+			let owner = BodyOwner::Global(GlobalIdx::new(index as u32));
+			self.add_body_definitions(owner, &mut add);
+		}
+		for key in decls.namespaces.keys() {
+			if !matches!(self.declaration_kind(key), DeclKind::Package(_)) {
+				add(Definition::Item(key));
+			}
+		}
+		found
+	}
+
+	fn add_body_definitions(
+		&self,
+		owner: BodyOwner,
+		add: &mut impl FnMut(Definition),
+	) {
+		let Some(body) = self.owner_body(owner) else {
+			return;
+		};
+		for index in 0..body.locals().len() {
+			add(Definition::Local {
+				owner,
+				local: LocalIdx::new(index as u32),
+			});
+		}
+		for index in 0..body.labels().len() {
+			add(Definition::Label {
+				owner,
+				label: LabelIdx::new(index as u32),
+			});
 		}
 	}
 
@@ -361,7 +548,8 @@ impl Semantics {
 		Some(SourceSpan::new(decl.file_id, name.span))
 	}
 
-	fn owner_body(&self, owner: BodyOwner) -> Option<&super::body::Body> {
+	/// The checked body of `owner`, if it has one.
+	pub fn owner_body(&self, owner: BodyOwner) -> Option<&super::body::Body> {
 		match owner {
 			BodyOwner::Const(constant) => self.const_body(constant),
 			BodyOwner::Function(function) => self.function_implementations
@@ -423,7 +611,7 @@ impl Semantics {
 mod tests {
 	#[derive(Debug, PartialEq, Eq)]
 	struct Shorthand {
-		label: ArgumentLabel,
+		label: Reference,
 		value: Reference,
 	}
 
@@ -524,12 +712,8 @@ mod tests {
 
 		/// A shorthand argument: its label and the value it supplies.
 		fn shorthand(&self, context: &str, name: &str) -> Option<Shorthand> {
-			let Reference::ArgumentLabel(label) = self.label(context, name)
-			else {
-				panic!("expected an argument label");
-			};
 			Some(Shorthand {
-				label,
+				label: self.label(context, name),
 				value: self.at(context, name, Tier::Value)?,
 			})
 		}
@@ -726,15 +910,22 @@ mod tests {
 		"});
 		assert!(matches!(
 			a.at("m::run();", "m", Tier::Type),
-			Some(Reference::Name(Referent::Declaration(_)))
+			Some(Reference::Item {
+				item: _,
+				route: Route::Direct
+			})
 		));
-		let Reference::Name(Referent::Declaration(direct)) =
-			a.value("m::run();", "run")
+		let Reference::Item {
+			item: direct,
+			route: Route::Direct,
+		} = a.value("m::run();", "run")
 		else {
 			panic!()
 		};
-		let Reference::Name(Referent::Import { declaration, .. }) =
-			a.value("alias();", "alias")
+		let Reference::Item {
+			item: declaration,
+			route: Route::Import(_),
+		} = a.value("alias();", "alias")
 		else {
 			panic!()
 		};
@@ -755,7 +946,7 @@ mod tests {
 		"});
 		assert!(matches!(
 			a.at("x: T", "T", Tier::Type),
-			Some(Reference::Name(Referent::TypeParam { .. }))
+			Some(Reference::TypeParam { .. })
 		));
 		assert_eq!(
 			a.at("x: T", "T", Tier::Type),
@@ -763,7 +954,7 @@ mod tests {
 		);
 		assert!(matches!(
 			a.value("s.get()", "get"),
-			Reference::Name(Referent::Member(MemberKind::Method(_)))
+			Reference::Member(MemberKind::Method(_))
 		));
 	}
 
@@ -846,11 +1037,11 @@ mod tests {
 				x
 			}
 		"});
-		let selection = ArgumentLabel::Parameter {
+		let selection = Reference::Parameter {
 			function: a.function_index("take"),
 			parameter: ParamIdx::new(0),
 		};
-		assert_eq!(a.label("{ x: 1", "x"), Reference::ArgumentLabel(selection));
+		assert_eq!(a.label("{ x: 1", "x"), selection);
 		assert_eq!(
 			a.shorthand("{ x }", "x"),
 			Some(Shorthand {
@@ -870,14 +1061,12 @@ mod tests {
 				value
 			}
 		"});
-		let field = ArgumentLabel::Field {
+		let field = Reference::Field {
 			owner: a.struct_index("S"),
 			field: FieldIdx::new(1),
+			access: AccessKind::Initialize,
 		};
-		assert_eq!(
-			a.label("value: 1", "value"),
-			Reference::ArgumentLabel(field)
-		);
+		assert_eq!(a.label("value: 1", "value"), field);
 		assert_eq!(
 			a.shorthand("value });", "value"),
 			Some(Shorthand {
@@ -899,11 +1088,17 @@ mod tests {
 			}
 		"});
 		let value = a.value("\n\tvalue\n", "value");
-		assert!(matches!(value, Reference::Name(Referent::Import { .. })));
+		assert!(matches!(
+			value,
+			Reference::Item {
+				route: Route::Import(_),
+				..
+			}
+		));
 		assert_eq!(
 			a.shorthand("{ value }", "value"),
 			Some(Shorthand {
-				label: ArgumentLabel::Parameter {
+				label: Reference::Parameter {
 					function: a.function_index("take"),
 					parameter: ParamIdx::new(0),
 				},
@@ -923,10 +1118,10 @@ mod tests {
 		assert!(a.has_errors());
 		assert_eq!(
 			a.label("{ value }", "value"),
-			Reference::ArgumentLabel(ArgumentLabel::Parameter {
+			Reference::Parameter {
 				function: a.function_index("take"),
 				parameter: ParamIdx::new(0),
-			})
+			}
 		);
 	}
 
@@ -983,7 +1178,7 @@ mod tests {
 			assert_eq!(
 				a.shorthand(call, "value"),
 				Some(Shorthand {
-					label: ArgumentLabel::Parameter {
+					label: Reference::Parameter {
 						function,
 						parameter: ParamIdx::new(0),
 					},
@@ -1061,7 +1256,7 @@ mod tests {
 			}
 		"});
 		let label = a.label("break :outer", "outer");
-		assert!(matches!(label, Reference::Name(Referent::Label { .. })));
+		assert!(matches!(label, Reference::Label { .. }));
 		assert_eq!(label, a.label("continue :outer", "outer"));
 		assert_eq!(a.at("loop :outer", "outer", Tier::Value), None);
 	}
@@ -1077,7 +1272,10 @@ mod tests {
 		assert!(a.has_errors());
 		assert!(matches!(
 			a.at("m::missing", "m", Tier::Type),
-			Some(Reference::Name(Referent::Declaration(_)))
+			Some(Reference::Item {
+				item: _,
+				route: Route::Direct
+			})
 		));
 		assert_eq!(a.at("m::missing", "missing", Tier::Value), None);
 	}
@@ -1149,11 +1347,11 @@ mod tests {
 				<T as Tr>::make(value)
 			}
 		"});
-		let parameter = Reference::Name(Referent::TypeParam {
+		let parameter = Reference::TypeParam {
 			env: a.sema.functions[usize::from(a.function_index("f"))]
 				.type_params,
 			index: 0,
-		});
+		};
 		for context in [
 			"value: T::Value",
 			"-> <T as Tr>::Value",
@@ -1166,36 +1364,29 @@ mod tests {
 		for context in ["value: T::Value", "-> <T as Tr>::Value"] {
 			assert_eq!(
 				a.at(context, "Value", Tier::Type),
-				Some(Reference::Name(Referent::Member(a.trait_member(
+				Some(Reference::Member(a.trait_member(
 					"Tr",
 					"Value",
 					Tier::Type
-				))))
+				)))
 			);
 		}
 		for context in ["T::COUNT", "<T as Tr>::COUNT"] {
 			assert_eq!(
 				a.value(context, "COUNT"),
-				Reference::Name(Referent::Member(a.trait_member(
-					"Tr",
-					"COUNT",
-					Tier::Value
-				)))
+				Reference::Member(a.trait_member("Tr", "COUNT", Tier::Value))
 			);
 		}
 		assert_eq!(
 			a.value("<T as Tr>::make", "make"),
-			Reference::Name(Referent::Member(a.trait_member(
-				"Tr",
-				"make",
-				Tier::Value
-			)))
+			Reference::Member(a.trait_member("Tr", "make", Tier::Value))
 		);
 		assert_eq!(
 			a.at("<T as Tr>::make", "Tr", Tier::Type),
-			Some(Reference::Name(Referent::Declaration(
-				a.declaration("Tr", Tier::Type)
-			)))
+			Some(Reference::Item {
+				item: a.declaration("Tr", Tier::Type),
+				route: Route::Direct
+			})
 		);
 	}
 
@@ -1218,10 +1409,10 @@ mod tests {
 		};
 		assert_eq!(
 			a.at("self: Self", "Self", Tier::Type),
-			Some(Reference::Name(Referent::TypeParam {
+			Some(Reference::TypeParam {
 				env: a.sema.traits[usize::from(trait_index)].env,
 				index: 0,
-			}))
+			})
 		);
 		let target = ImplTarget::Struct(a.struct_index("S"));
 		let &[inherent] = a.sema.impl_dispatch.inherent_candidates(target)
@@ -1230,11 +1421,11 @@ mod tests {
 		};
 		assert_eq!(
 			a.at("make() -> Self", "Self", Tier::Type),
-			Some(Reference::Name(Referent::InherentImplSelf(inherent)))
+			Some(Reference::InherentImplSelf(inherent))
 		);
 		assert_eq!(
 			a.at("{ Self()", "Self", Tier::Value),
-			Some(Reference::Name(Referent::InherentImplSelf(inherent)))
+			Some(Reference::InherentImplSelf(inherent))
 		);
 		let &[(actual_trait, implementation)] =
 			a.sema.impl_dispatch.trait_candidates(target)
@@ -1244,7 +1435,7 @@ mod tests {
 		assert_eq!(actual_trait, trait_index);
 		assert_eq!(
 			a.at("impl Tr for S {\n\tfunc id(self: Self)", "Self", Tier::Type),
-			Some(Reference::Name(Referent::TraitImplSelf(implementation)))
+			Some(Reference::TraitImplSelf(implementation))
 		);
 		let MemberKind::Method(function) =
 			a.trait_member("Tr", "id", Tier::Value)
@@ -1274,13 +1465,16 @@ mod tests {
 		let declaration = a.declaration("m::run", Tier::Value);
 		assert_eq!(
 			a.value("use m::run", "run"),
-			Reference::Name(Referent::Declaration(declaration))
+			Reference::Item {
+				item: declaration,
+				route: Route::Direct
+			}
 		);
 		let imported = a.value("alias();", "alias");
-		let Reference::Name(Referent::Import {
-			declaration: actual,
-			..
-		}) = imported
+		let Reference::Item {
+			item: actual,
+			route: Route::Import(_),
+		} = imported
 		else {
 			panic!("expected an import")
 		};
@@ -1306,19 +1500,25 @@ mod tests {
 		for tier in [Tier::Type, Tier::Value] {
 			assert_eq!(
 				a.at("use m::S", "S", tier),
-				Some(Reference::Name(Referent::Declaration(
-					a.declaration("m::S", tier)
-				)))
+				Some(Reference::Item {
+					item: a.declaration("m::S", tier),
+					route: Route::Direct
+				})
 			);
 		}
 		let imported = a.value("\n\tS()", "S");
-		let Reference::Name(Referent::Import { declaration, .. }) = imported
+		let Reference::Item {
+			item: declaration,
+			route: Route::Import(_),
+		} = imported
 		else {
 			panic!("expected a named import")
 		};
 		assert_eq!(declaration, a.declaration("m::S", Tier::Value));
-		let Reference::Name(Referent::Import { declaration, .. }) =
-			a.value("run();", "run")
+		let Reference::Item {
+			item: declaration,
+			route: Route::Import(_),
+		} = a.value("run();", "run")
 		else {
 			panic!("expected a glob import")
 		};
@@ -1371,7 +1571,7 @@ mod tests {
 		assert_eq!(
 			a.shorthand("{ x,", "x"),
 			Some(Shorthand {
-				label: ArgumentLabel::Parameter {
+				label: Reference::Parameter {
 					function: a.function_index("take"),
 					parameter: ParamIdx::new(0)
 				},
@@ -1384,10 +1584,10 @@ mod tests {
 		);
 		assert_eq!(
 			a.label("y: missing", "y"),
-			Reference::ArgumentLabel(ArgumentLabel::Parameter {
+			Reference::Parameter {
 				function: a.function_index("take"),
 				parameter: ParamIdx::new(1)
-			})
+			}
 		);
 		assert_eq!(a.at("y: missing", "missing", Tier::Value), None);
 		assert_eq!(
@@ -1439,27 +1639,31 @@ mod tests {
 		"#});
 		assert_eq!(
 			a.at("super::types::S", "types", Tier::Type),
-			Some(Reference::Name(Referent::Declaration(
-				a.declaration("types", Tier::Type)
-			)))
+			Some(Reference::Item {
+				item: a.declaration("types", Tier::Type),
+				route: Route::Direct
+			})
 		);
 		assert_eq!(
 			a.at("super::types::S", "S", Tier::Type),
-			Some(Reference::Name(Referent::Declaration(
-				a.declaration("types::S", Tier::Type)
-			)))
+			Some(Reference::Item {
+				item: a.declaration("types::S", Tier::Type),
+				route: Route::Direct
+			})
 		);
 		assert_eq!(
 			a.at("host::run", "host", Tier::Type),
-			Some(Reference::Name(Referent::Declaration(
-				a.declaration("host", Tier::Type)
-			)))
+			Some(Reference::Item {
+				item: a.declaration("host", Tier::Type),
+				route: Route::Direct
+			})
 		);
 		assert_eq!(
 			a.value("host::run", "run"),
-			Reference::Name(Referent::Declaration(
-				a.declaration("host::run", Tier::Value)
-			))
+			Reference::Item {
+				item: a.declaration("host::run", Tier::Value),
+				route: Route::Direct
+			}
 		);
 		assert_eq!(
 			a.value("run(value)", "value"),
@@ -1485,21 +1689,24 @@ mod tests {
 		"});
 		assert_eq!(
 			a.value("const LIMIT =>", "LIMIT"),
-			Reference::Name(Referent::Declaration(
-				a.declaration("LIMIT", Tier::Value)
-			))
+			Reference::Item {
+				item: a.declaration("LIMIT", Tier::Value),
+				route: Route::Direct
+			}
 		);
 		assert_eq!(
 			a.at("E::A =>", "E", Tier::Type),
-			Some(Reference::Name(Referent::Declaration(
-				a.declaration("E", Tier::Type)
-			)))
+			Some(Reference::Item {
+				item: a.declaration("E", Tier::Type),
+				route: Route::Direct
+			})
 		);
 		assert_eq!(
 			a.value("E::A =>", "A"),
-			Reference::Name(Referent::Declaration(
-				a.declaration("E::A", Tier::Value)
-			))
+			Reference::Item {
+				item: a.declaration("E::A", Tier::Value),
+				route: Route::Direct
+			}
 		);
 	}
 
@@ -1707,17 +1914,18 @@ mod tests {
 		let a = Analysis::clean("func f(x: u32) { _ = x; }");
 		let span = SourceSpan::new(a.file, a.span("x;", "x"));
 		let value = a.value("x;", "x");
-		let label = Reference::ArgumentLabel(ArgumentLabel::Parameter {
+		let label = Reference::Parameter {
 			function: a.function_index("f"),
 			parameter: ParamIdx::new(0),
-		});
+		};
 		let mut resolutions = NameResolutions::default();
-		resolutions.record_reference(Site::Value(span), value);
-		resolutions.record_reference(Site::Label(span), label);
-		let updated = Reference::Name(Referent::Declaration(
-			a.declaration("f", Tier::Value),
-		));
-		resolutions.record_reference(Site::Value(span), updated);
+		resolutions.record(Site::Value(span), value);
+		resolutions.record(Site::Label(span), label);
+		let updated = Reference::Item {
+			item: a.declaration("f", Tier::Value),
+			route: Route::Direct,
+		};
+		resolutions.record(Site::Value(span), updated);
 		assert_eq!(resolutions.get(Site::Value(span)), Some(updated));
 		assert_eq!(resolutions.get(Site::Label(span)), Some(label));
 		assert_eq!(resolutions.get(Site::Type(span)), None);
@@ -1843,5 +2051,45 @@ mod tests {
 				.definition_at(analysis.file, source.len() as u32 + 5),
 			None
 		);
+	}
+
+	#[test]
+	fn symbol_at_returns_the_resolved_reference_and_the_names_span() {
+		let marked = Marked::new(indoc! {"
+			func $[make]make(amount: i32) -> i32 { amount }
+			func main() {
+				local amount: i32 = 1;
+				_ = $[call]make({ $[label]amount: 3 });
+				_ = make({ $[short]amount });
+			}
+		"});
+		let analysis = Analysis::clean(&marked.source);
+		let at = |label: &str| {
+			let span = marked.name(label);
+			let (found, reference) = analysis
+				.sema
+				.symbol_at(analysis.file, span.start + 1)
+				.unwrap_or_else(|| panic!("nothing at `{label}`"));
+			assert_eq!(found, SourceSpan::new(analysis.file, span));
+			reference
+		};
+
+		// A call names the function, whose kind is read through the sema.
+		let Reference::Item {
+			item: key,
+			route: Route::Direct,
+		} = at("call")
+		else {
+			panic!("expected a declaration");
+		};
+		assert!(matches!(
+			analysis.sema.declaration_kind(key),
+			DeclKind::Function(_)
+		));
+		// A named argument's label is the parameter, not a read of it.
+		assert!(matches!(at("label"), Reference::Parameter { .. }));
+		// A shorthand argument is a label and the value it supplies: the
+		// value is what the name means where it is used.
+		assert!(matches!(at("short"), Reference::Local { .. }));
 	}
 }

@@ -122,11 +122,13 @@ fn main() {
 	}
 }
 
+/// Serves the language server over stdio. A current-thread runtime is enough:
+/// the server's state lives on one task, and checking is synchronous.
 fn cmd_lsp() {
-	eprintln!(
-		"error: the language server is not connected to the new type checker yet"
-	);
-	std::process::exit(1);
+	tokio::runtime::Builder::new_current_thread()
+		.build()
+		.unwrap()
+		.block_on(wx_lsp::run_stdio(tokio::io::stdin(), tokio::io::stdout()));
 }
 
 #[derive(Clone)]

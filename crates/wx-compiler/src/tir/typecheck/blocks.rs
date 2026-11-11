@@ -18,7 +18,7 @@ use crate::tir::body::{
 	Obligations, Scope, ScopeIdx, ScopeKind,
 };
 use crate::tir::decls::FunctionIdx;
-use crate::tir::resolutions::{Reference, Referent, Site};
+use crate::tir::resolutions::{Reference, Site};
 use crate::tir::signatures::InferPolicy;
 use crate::tir::types::TypeIndex;
 
@@ -641,15 +641,15 @@ impl BodyBuilder<'_, '_> {
 			};
 			if found {
 				if let (Some(name), Some(scope_label)) = (label, scope_label) {
-					self.sema.resolutions.record_reference(
+					self.sema.resolutions.record(
 						Site::Label(SourceSpan::new(
 							self.scope.file_id,
 							name.span,
 						)),
-						Reference::Name(Referent::Label {
+						Reference::Label {
 							owner: self.owner,
 							label: scope_label,
-						}),
+						},
 					);
 				}
 				if jump == Jump::Continue && kind != ScopeKind::Loop {

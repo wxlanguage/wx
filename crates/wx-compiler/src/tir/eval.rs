@@ -63,7 +63,7 @@ index_newtype!(AllocIdx);
 /// the allocation is placed in its memory.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Val {
+pub enum Val {
 	I32(u32),
 	I64(u64),
 	F32(u32),
@@ -113,9 +113,9 @@ pub(super) struct Allocation {
 /// written.
 #[derive(Clone, Copy, PartialEq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct ConstScalar {
-	pub(super) val: Val,
-	pub(super) scalar: Primitive,
+pub struct ConstScalar {
+	pub val: Val,
+	pub scalar: Primitive,
 }
 
 /// A constant's value: its numbers, in declaration order.
@@ -799,6 +799,17 @@ impl Semantics {
 			);
 		}
 		diagnostic
+	}
+}
+
+impl Semantics {
+	/// An evaluated constant's numbers, in declaration order. `None` when it
+	/// has not been evaluated (or has no compile-time value).
+	pub fn constant_value(&self, constant: ConstIdx) -> Option<&[ConstScalar]> {
+		match &self.solver.const_values[usize::from(constant)] {
+			ConstValueState::Evaluated(value) => Some(value),
+			_ => None,
+		}
 	}
 }
 

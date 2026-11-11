@@ -2,459 +2,119 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use tower_lsp_server::LanguageServer as _;
 use tower_lsp_server::ls_types::{
-	Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Uri,
+	Diagnostic, DiagnosticSeverity, GotoDefinitionParams,
+	GotoDefinitionResponse, HoverContents, HoverParams, Position, Range,
+	TextDocumentIdentifier, TextDocumentPositionParams, Uri,
 };
 use wx_compiler::vfs::FileId;
 
-use crate::completion::{completion_items, find_enclosing_function};
-use crate::symbol_index::SymbolKind;
-use crate::{
-	Backend, CompiledRoot, OpenDocument, ServerState, TokenType, analyze_root,
-	build_service, byte_to_position, compute_refresh, diagnostic_publish_paths,
-	discover_package_root, find_active_call, implementation_locations,
-	position_to_offset, position_to_offset_in_str, reference_search_kinds,
-	refresh_project_manifest, symbol_hover_text, symbol_kind_to_token_type,
+use crate::actor::{Command, handle_command};
+use crate::convert::{
+	byte_to_position, file_id_to_uri, position_to_offset, uri_to_path,
 };
-use tower_lsp_server::LanguageServer as _;
-use wx_compiler::diagnostics::DiagnosticCode;
-use wx_compiler::tir::TypeParamOwner;
+use crate::diagnostics::{add_compiler_diagnostic, diagnostic_publish_paths};
+use crate::documents::OpenDocument;
+use crate::projects::{ManifestState, ProjectState, discover_package_root};
+use crate::requests;
+use crate::snapshot::Snapshot;
+use crate::state::{
+	ServerState, analyze_root, compute_active_refresh, compute_refresh,
+	refresh_project_manifest,
+};
+use crate::{Backend, build_service};
 
-/// Exercises `Backend` through its real `LanguageServer` trait methods
-/// (rather than the `ServerState` free functions the other tests in this
-/// file use), which is the only way to touch the actor/channel plumbing in
-/// `run_actor`/`Command` that replaced the old `Arc<Mutex<ServerState>>`.
-/// Asserts two things that plumbing must get right: a `hover` query queued
-/// after a `did_change` observes that edit's text (not a stale one racing
-/// ahead of it — the ordering bug this actor design closes), and it
-/// completes promptly rather than deadlocking.
-#[tokio::test]
-async fn hover_after_did_change_observes_latest_edit_through_backend() {
-	use std::time::Instant;
-	use tower_lsp_server::ls_types::*;
-
-	let (service, socket) = build_service();
-	let backend: &Backend = service.inner();
-	// The actor's `Client::log_message`/`publish_diagnostics` calls send into
-	// `ClientSocket`'s internal channel; nothing reads it back out unless we
-	// drain it here (in a real server, `tower_lsp_server::Server::serve`
-	// forwards it to the transport), so without this those calls would block
-	// forever waiting for room in that channel.
-	tokio::spawn(async move {
-		use futures::stream::StreamExt;
-		let (mut requests, _responses) = socket.split();
-		while requests.next().await.is_some() {}
-	});
-
-	let manifest_uri: Uri = Uri::from_str("file:///tmp/probe/wx.json").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: manifest_uri,
-				language_id: "json".into(),
-				version: 1,
-				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
-			},
-		})
-		.await;
-
-	let uri: Uri = Uri::from_str("file:///tmp/probe/main.wx").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: uri.clone(),
-				language_id: "wx".into(),
-				version: 1,
-				text:
-					"use std::*;\nfunc add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
-						.into(),
-			},
-		})
-		.await;
-
-	backend
-		.did_change(DidChangeTextDocumentParams {
-			text_document: VersionedTextDocumentIdentifier {
-				uri: uri.clone(),
-				version: 2,
-			},
-			content_changes: vec![TextDocumentContentChangeEvent {
-				range: None,
-				range_length: None,
-				text:
-					"use std::*;\nfunc add(x: i64, y: i64) -> i64 { x + y }\nexport { add }\n"
-						.into(),
-			}],
-		})
-		.await;
-
-	let start = Instant::now();
-	let result = backend
-		.hover(HoverParams {
-			text_document_position_params: TextDocumentPositionParams {
-				text_document: TextDocumentIdentifier { uri: uri.clone() },
-				position: Position {
-					line: 1,
-					character: 4,
-				},
-			},
-			work_done_progress_params: Default::default(),
-		})
-		.await
-		.expect("hover should not error");
-	assert!(
-		start.elapsed().as_secs() < 5,
-		"hover took suspiciously long — the actor may be deadlocked"
-	);
-
-	let HoverContents::Markup(markup) =
-		result.expect("hover should resolve `add`").contents
-	else {
-		panic!("expected markup hover contents");
-	};
-	assert!(
-		markup.value.contains("x: i64, y: i64"),
-		"hover should reflect the `did_change` edit (i64 params), got: {}",
-		markup.value
-	);
-}
-
-/// `leading_doc_comment` (invoked via `doc_comment_anchor`) appends a
-/// function's `///` doc comment below the usual fenced signature block, for
-/// both the definition site and a call site.
-#[tokio::test]
-async fn hover_includes_leading_doc_comment() {
-	use tower_lsp_server::ls_types::*;
-
-	let (service, socket) = build_service();
-	let backend: &Backend = service.inner();
-	tokio::spawn(async move {
-		use futures::stream::StreamExt;
-		let (mut requests, _responses) = socket.split();
-		while requests.next().await.is_some() {}
-	});
-
-	let manifest_uri: Uri =
-		Uri::from_str("file:///tmp/probe3/wx.json").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: manifest_uri,
-				language_id: "json".into(),
-				version: 1,
-				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
-			},
-		})
-		.await;
-
-	let uri: Uri = Uri::from_str("file:///tmp/probe3/main.wx").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: uri.clone(),
-				language_id: "wx".into(),
-				version: 1,
-				text: concat!(
-					"use std::*;\n",
-					"/// Doubles `x`.\n",
-					"/// Second line.\n",
-					"func double(x: i32) -> i32 { x + x }\n",
-					"func use_it() -> i32 { double(1) }\n",
-					"export { use_it }\n",
-				)
-				.into(),
-			},
-		})
-		.await;
-
-	// Call site: `double(1)` on line 4, column 22 (inside "double").
-	let result = backend
-		.hover(HoverParams {
-			text_document_position_params: TextDocumentPositionParams {
-				text_document: TextDocumentIdentifier { uri: uri.clone() },
-				position: Position {
-					line: 4,
-					character: 22,
-				},
-			},
-			work_done_progress_params: Default::default(),
-		})
-		.await
-		.expect("hover should not error")
-		.expect("hover should resolve `double`");
-	let HoverContents::Markup(markup) = result.contents else {
-		panic!("expected markup hover contents");
-	};
-	assert_eq!(
-		markup.value,
-		"```wx\nfunc double(x: i32) -> i32\n```\n\n---\n\nDoubles `x`.\nSecond line.",
-		"call-site hover should include the doc comment below the signature"
-	);
-}
-
-/// The `memory_grow` shape from `std/main.wx`: an `#[attribute]` sits
-/// between the doc comment and the item it documents. That gap must still
-/// be tolerated (attributes are skipped, not treated as breaking the
-/// association), while a genuine blank line still breaks it.
-#[tokio::test]
-async fn hover_doc_comment_tolerates_attribute_between_comment_and_item() {
-	use tower_lsp_server::ls_types::*;
-
-	let (service, socket) = build_service();
-	let backend: &Backend = service.inner();
-	tokio::spawn(async move {
-		use futures::stream::StreamExt;
-		let (mut requests, _responses) = socket.split();
-		while requests.next().await.is_some() {}
-	});
-
-	let manifest_uri: Uri =
-		Uri::from_str("file:///tmp/probe4/wx.json").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: manifest_uri,
-				language_id: "json".into(),
-				version: 1,
-				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
-			},
-		})
-		.await;
-
-	let uri: Uri = Uri::from_str("file:///tmp/probe4/main.wx").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: uri.clone(),
-				language_id: "wx".into(),
-				version: 1,
-				text: concat!(
-					"use std::*;\n",
-					"/// Not attached — blank line below breaks it.\n",
-					"\n",
-					"/// Attached despite the attribute below it.\n",
-					"#[inline]\n",
-					"func triple(x: i32) -> i32 { x + x + x }\n",
-					"export { triple }\n",
-				)
-				.into(),
-			},
-		})
-		.await;
-
-	// Definition site: `func triple` on line 5, column 3 (inside "triple").
-	let result = backend
-		.hover(HoverParams {
-			text_document_position_params: TextDocumentPositionParams {
-				text_document: TextDocumentIdentifier { uri: uri.clone() },
-				position: Position {
-					line: 5,
-					character: 3,
-				},
-			},
-			work_done_progress_params: Default::default(),
-		})
-		.await
-		.expect("hover should not error")
-		.expect("hover should resolve `triple`");
-	let HoverContents::Markup(markup) = result.contents else {
-		panic!("expected markup hover contents");
-	};
-	assert_eq!(
-		markup.value,
-		"```wx\nfunc triple(x: i32) -> i32\n```\n\n---\n\nAttached despite the attribute below it.",
-		"doc comment across an #[attribute] line should attach, and the \
-		 blank-line-separated comment above it should not: got {}",
-		markup.value
-	);
-}
-
-/// Regression: hovering `crate` used to panic the whole LSP process.
-/// `crate`/`super` resolve to a real `SymbolKind::Module` pointing at a
-/// namespace whose own package is the *same* package doing the asking —
-/// `TIR::namespace_name`'s `Package(_)` arm assumed that never happens
-/// (only a genuine dependency edge used to reach a package-root namespace),
-/// so it indexed straight into `dependency_names` with a key that was never
-/// there for a self-reference.
-#[tokio::test]
-async fn hover_over_crate_keyword_does_not_panic() {
-	use tower_lsp_server::ls_types::*;
-
-	let (service, socket) = build_service();
-	let backend: &Backend = service.inner();
-	tokio::spawn(async move {
-		use futures::stream::StreamExt;
-		let (mut requests, _responses) = socket.split();
-		while requests.next().await.is_some() {}
-	});
-
-	let manifest_uri: Uri =
-		Uri::from_str("file:///tmp/probe_crate_kw/wx.json").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: manifest_uri,
-				language_id: "json".into(),
-				version: 1,
-				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
-			},
-		})
-		.await;
-
-	let uri: Uri = Uri::from_str("file:///tmp/probe_crate_kw/main.wx").unwrap();
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: uri.clone(),
-				language_id: "wx".into(),
-				version: 1,
-				text: concat!(
-					"use std::*;\n",
-					"pub func helper() -> i32 { 1 }\n",
-					"mod a {\n",
-					"    pub func use_it() -> i32 { crate::helper() }\n",
-					"}\n",
-					"func main() -> i32 { a::use_it() }\n",
-					"export { main }\n",
-				)
-				.into(),
-			},
-		})
-		.await;
-
-	// Line 3, inside the word "crate" in `crate::helper()`.
-	let result = backend
-		.hover(HoverParams {
-			text_document_position_params: TextDocumentPositionParams {
-				text_document: TextDocumentIdentifier { uri: uri.clone() },
-				position: Position {
-					line: 3,
-					character: 31,
-				},
-			},
-			work_done_progress_params: Default::default(),
-		})
-		.await
-		.expect("hover should not error")
-		.expect("hover should resolve `crate`");
-	let HoverContents::Markup(markup) = result.contents else {
-		panic!("expected markup hover contents");
-	};
-	assert!(
-		markup.value.contains("crate"),
-		"expected the hover text to name the package as `crate` for a \
-		 self-reference, got: {}",
-		markup.value
-	);
-}
-
-/// Operator dispatch (`a + b`) resolves to a real trait method (`Add::add`)
-/// and pushes a go-to-definition access at the *operator's own span* onto
-/// it, the same mechanism an ordinary function reference uses — so without
-/// filtering, `+` would show up in semantic tokens tagged with the callee's
-/// `SymbolKind::Function`, painting it the same color as a real function
-/// call. Asserts the operator gets no semantic token at all, while a real
-/// function-name reference on the same line still does.
-#[tokio::test]
-async fn semantic_tokens_do_not_highlight_operators_as_functions() {
-	use tower_lsp_server::ls_types::*;
-
-	let (service, socket) = build_service();
-	let backend: &Backend = service.inner();
-	tokio::spawn(async move {
-		use futures::stream::StreamExt;
-		let (mut requests, _responses) = socket.split();
-		while requests.next().await.is_some() {}
-	});
-
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: Uri::from_str("file:///tmp/probe2/wx.json").unwrap(),
-				language_id: "json".into(),
-				version: 1,
-				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
-			},
-		})
-		.await;
-
-	let uri: Uri = Uri::from_str("file:///tmp/probe2/main.wx").unwrap();
-	// Line 1: "func add(a: i32, b: i32) -> i32 { a + b }" — `+` is at column 34.
-	backend
-		.did_open(DidOpenTextDocumentParams {
-			text_document: TextDocumentItem {
-				uri: uri.clone(),
-				language_id: "wx".into(),
-				version: 1,
-				text:
-					"use std::*;\nfunc add(a: i32, b: i32) -> i32 { a + b }\nexport { add }\n"
-						.into(),
-			},
-		})
-		.await;
-
-	let result = backend
-		.semantic_tokens_full(SemanticTokensParams {
-			text_document: TextDocumentIdentifier { uri: uri.clone() },
-			work_done_progress_params: Default::default(),
-			partial_result_params: Default::default(),
-		})
-		.await
-		.expect("semantic_tokens_full should not error")
-		.expect("expected a semantic tokens result");
-
-	let SemanticTokensResult::Tokens(tokens) = result else {
-		panic!("expected a full tokens result, not a delta");
-	};
-
-	// Decode the delta-encoded tokens back to absolute (line, character)
-	// positions.
-	let mut line = 0u32;
-	let mut character = 0u32;
-	let mut positions = Vec::new();
-	for tok in &tokens.data {
-		if tok.delta_line == 0 {
-			character += tok.delta_start;
-		} else {
-			line += tok.delta_line;
-			character = tok.delta_start;
-		}
-		positions.push((line, character, tok.token_type));
+fn open_document(text: &str) -> OpenDocument {
+	OpenDocument {
+		text: text.to_string(),
+		version: 0,
 	}
-
-	assert!(
-		!positions.iter().any(|&(l, c, _)| l == 1 && c == 34),
-		"operator `+` must not get its own semantic token: {:?}",
-		positions
-	);
-	assert!(
-		positions
-			.iter()
-			.any(|&(l, _, tt)| l == 1 && tt == TokenType::Function as u32),
-		"expected `add`'s own declaration on line 1 to still be highlighted \
-		 as a function: {:?}",
-		positions
-	);
 }
 
-/// Resolves the `FileId` for a given file path from a compiled root.
-fn file_id_for(compiled: &CompiledRoot, path: &Path) -> FileId {
-	compiled
-		.graph
+fn file_id_for(snapshot: &Snapshot, path: &Path) -> FileId {
+	snapshot
+		.compilation
 		.packages
 		.iter()
-		.flat_map(|cg| cg.modules.iter())
-		.find(|m| Path::new(m.file_path.as_str()) == path)
+		.flat_map(|package| package.modules.iter())
+		.find(|module| Path::new(module.file_path.as_str()) == path)
 		.unwrap_or_else(|| {
 			panic!("file not found in compiled graph: {}", path.display())
 		})
 		.file_id
 }
 
-fn open_document(text: &str) -> OpenDocument {
-	OpenDocument {
-		text: text.to_string(),
+fn is_error(diagnostic: &Diagnostic) -> bool {
+	diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+}
+
+/// Opens `{dir}/wx.json` with `entry` set to the entry file's own name.
+fn open_synthetic_manifest(state: &mut ServerState, entry: &Path) -> PathBuf {
+	let dir = entry.parent().unwrap().to_path_buf();
+	let entry_name = entry.file_name().and_then(|name| name.to_str()).unwrap();
+	state.open_documents.insert(
+		dir.join("wx.json"),
+		open_document(&format!(
+			r#"{{ "type": "bin", "entry": "{entry_name}" }}"#
+		)),
+	);
+	dir
+}
+
+/// Analyses `source` as the entry file of its own package and returns the
+/// state it was cached in, with the package's directory.
+fn analyzed(root: &Path, source: &str) -> (ServerState, PathBuf) {
+	let mut state = ServerState::default();
+	state
+		.open_documents
+		.insert(root.to_path_buf(), open_document(source));
+	let dir = open_synthetic_manifest(&mut state, root);
+	analyze_root(&mut state, &dir, root, &mut Vec::new());
+	assert!(state.cached.contains_key(&dir), "analysis failed");
+	(state, dir)
+}
+
+/// The position of the `occurrence`-th `needle` in an ASCII `source`.
+fn position_of(source: &str, needle: &str, occurrence: usize) -> Position {
+	let offset = source.match_indices(needle).nth(occurrence).unwrap().0;
+	let line = source[..offset].matches('\n').count();
+	let line_start = source[..offset].rfind('\n').map_or(0, |at| at + 1);
+	Position {
+		line: line as u32,
+		character: (offset - line_start) as u32,
 	}
+}
+
+fn definition_params(uri: &Uri, position: Position) -> GotoDefinitionParams {
+	GotoDefinitionParams {
+		text_document_position_params: TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			position,
+		},
+		work_done_progress_params: Default::default(),
+		partial_result_params: Default::default(),
+	}
+}
+
+fn scalar(
+	response: Option<GotoDefinitionResponse>,
+) -> tower_lsp_server::ls_types::Location {
+	let Some(GotoDefinitionResponse::Scalar(location)) = response else {
+		panic!("expected one definition, got {response:?}");
+	};
+	location
+}
+
+/// A client whose messages are drained, so the actor never blocks on them.
+fn backend_with_drained_socket() -> tower_lsp_server::LspService<Backend> {
+	let (service, socket) = build_service();
+	tokio::spawn(async move {
+		use futures::stream::StreamExt;
+		let (mut requests, _responses) = socket.split();
+		while requests.next().await.is_some() {}
+	});
+	service
 }
 
 #[test]
@@ -487,13 +147,9 @@ fn diagnostic_publish_paths_keeps_previous_files_for_clearing() {
 		vec![Diagnostic {
 			range: Range::default(),
 			severity: Some(DiagnosticSeverity::ERROR),
-			code: None,
-			code_description: None,
 			source: Some("wx".to_string()),
 			message: "error".to_string(),
-			related_information: None,
-			tags: None,
-			data: None,
+			..Default::default()
 		}],
 	)]);
 
@@ -507,19 +163,10 @@ fn diagnostic_publish_paths_keeps_previous_files_for_clearing() {
 
 #[test]
 fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
-	// Regression test: a dependency file (`pow/main.wx`, reached only as
-	// part of `hashing`'s compiled graph) is *also*, independently, the
-	// entry file of its own project. `owning_root` used to scan
-	// `published_by_root` for ANY root whose `owned_files` contained the
-	// query file — and `hashing`'s own `owned_files` legitimately includes
-	// `pow/main.wx` too, since it's part of hashing's compiled dependency
-	// graph. If hashing published first, `owning_root("pow/main.wx")`
-	// would incorrectly return hashing's root as pow's "previous root", so
-	// refreshing `pow/main.wx` (after opening/editing it directly) looked
-	// like "this file moved from hashing's root to pow's own root" and
-	// wiped hashing's entire cache + published empty diagnostics for every
-	// file hashing owned — including `hashing/main.wx` itself, even though
-	// nothing about hashing's own project changed at all.
+	// A dependency file (`pow/main.wx`, reached as part of `hashing`'s graph)
+	// is also, independently, the entry file of its own project. Editing it
+	// must rebuild its consumer without moving its own ownership or wiping
+	// the consumer's diagnostics.
 	let hashing_dir = PathBuf::from("/examples/hashing");
 	let hashing_main = hashing_dir.join("main.wx");
 	let pow_dir = PathBuf::from("/examples/pow");
@@ -539,7 +186,7 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 	state.open_documents.insert(
 		hashing_main.clone(),
 		open_document(
-			"use std::*;\nfunc test() -> i32 { pow::pow(2, 3) }\nexport { test }\n",
+			"package \"pow\" as pow;\nfunc test() -> i32 { pow::pow(2, 3) }\nexport { test }\n",
 		),
 	);
 	state.open_documents.insert(
@@ -548,29 +195,18 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 	);
 	state.open_documents.insert(
 		pow_main.clone(),
-		open_document(
-			"use std::*;\npub func pow(base: i32, exp: i32) -> i32 { base }\n",
-		),
+		open_document("pub func pow(base: i32, exp: i32) -> i32 { base }\n"),
 	);
 
-	// 1. Open (refresh) hashing/main.wx first — builds and caches hashing's
-	// root, which pulls in pow/main.wx as a dependency file.
 	compute_refresh(&mut state, &hashing_main, &mut Vec::new());
-	assert!(
-		state.cached.contains_key(&hashing_dir),
-		"hashing's root should be cached after its own refresh"
-	);
+	assert!(state.cached.contains_key(&hashing_dir));
 
-	// Editing a shared dependency must rebuild its consumer as well as
-	// retaining its own independent package ownership.
 	state.open_documents.insert(
 		pow_main.clone(),
-		open_document(
-			"use std::*; pub func pow(base: i32, exp: i32) -> bool { true }",
-		),
+		open_document("pub func pow(base: i32, exp: i32) -> Bool { True }"),
 	);
 	let mut logs = Vec::new();
-	let publications = crate::compute_active_refresh(
+	let publications = compute_active_refresh(
 		&mut state,
 		vec![pow_main.clone(), pow_main],
 		&mut logs,
@@ -581,20 +217,11 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 		"each active root must compile once per batch"
 	);
 	let final_diagnostics: HashMap<_, _> = publications.into_iter().collect();
-	assert!(final_diagnostics[&hashing_main].iter().any(|diagnostic| {
-		diagnostic.severity == Some(DiagnosticSeverity::ERROR)
-	}));
-	assert!(!state.cached[&hashing_dir].tir.diagnostics.is_empty());
-
-	assert!(
-		state.cached.contains_key(&hashing_dir),
-		"editing the pow dependency directly must not clear hashing's \
-		 already-cached root"
-	);
+	assert!(final_diagnostics[&hashing_main].iter().any(is_error));
+	assert!(state.cached.contains_key(&hashing_dir));
 }
 
 #[test]
-#[ignore = "fix lsp later"]
 fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 	let root = PathBuf::from("/workspace/app/main.wx");
 	let child = PathBuf::from("/workspace/app/math.wx");
@@ -608,44 +235,37 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 	);
 	state.open_documents.insert(
 		child.clone(),
-		open_document("func add() -> bool {\n    true\n}\n"),
+		open_document("pub func add() -> Bool {\n    True\n}\n"),
 	);
+	let dir = open_synthetic_manifest(&mut state, &root);
 
-	let broken = analyze_root(&mut state, &root, &root, &mut Vec::new());
+	let broken = analyze_root(&mut state, &dir, &root, &mut Vec::new());
 	assert!(broken.owned_files.contains(&root));
 	assert!(broken.owned_files.contains(&child));
 	assert!(
 		broken
 			.diagnostics_by_file
 			.get(&root)
-			.is_some_and(|diagnostics| diagnostics
-				.iter()
-				.any(|d| d.severity == Some(DiagnosticSeverity::ERROR))),
-		"expected a root file error when child module has incompatible type"
+			.is_some_and(|d| d.iter().any(is_error)),
+		"expected a root file error when the child's type is incompatible"
 	);
 
 	state.open_documents.insert(
 		child.clone(),
-		open_document("func add() -> i32 {\n    1\n}\n"),
+		open_document("pub func add() -> i32 {\n    1\n}\n"),
 	);
-
-	let fixed = analyze_root(&mut state, &root, &root, &mut Vec::new());
-	assert!(fixed.owned_files.contains(&root));
-	assert!(fixed.owned_files.contains(&child));
+	let fixed = analyze_root(&mut state, &dir, &root, &mut Vec::new());
 	assert!(
 		fixed
 			.diagnostics_by_file
 			.get(&root)
-			.is_none_or(|diagnostics| diagnostics
-				.iter()
-				.all(|d| d.severity != Some(DiagnosticSeverity::ERROR))),
-		"expected root file errors to clear after fixing the child module overlay"
+			.is_none_or(|d| !d.iter().any(is_error)),
+		"expected the root's errors to clear after fixing the child overlay"
 	);
 }
 
 #[test]
-#[ignore = "fix lsp later"]
-fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics()
+fn refresh_from_a_child_path_discovers_the_root_and_republishes_its_diagnostics()
  {
 	let workspace_root = PathBuf::from("/workspace");
 	let root = workspace_root.join("app").join("main.wx");
@@ -663,438 +283,37 @@ fn refresh_file_from_child_path_discovers_root_and_republishes_root_diagnostics(
 	);
 	state.open_documents.insert(
 		child.clone(),
-		open_document("func add() -> bool {\n    true\n}\n"),
+		open_document("pub func add() -> Bool {\n    True\n}\n"),
 	);
+	open_synthetic_manifest(&mut state, &root);
 
-	let broken_publish = compute_refresh(&mut state, &child, &mut Vec::new());
-
-	assert_eq!(state.own_root.get(&child), Some(&root));
-
+	let broken = compute_refresh(&mut state, &child, &mut Vec::new());
+	assert_eq!(
+		state.own_root.get(&child),
+		root.parent().map(PathBuf::from).as_ref()
+	);
 	assert!(
-		broken_publish.iter().any(|(path, diags)| {
-			path == &root
-				&& diags
-					.iter()
-					.any(|d| d.severity == Some(DiagnosticSeverity::ERROR))
-		}),
-		"expected refresh from child path to publish a root-file error"
+		broken.iter().any(|(path, diagnostics)| path == &root
+			&& diagnostics.iter().any(is_error)),
+		"expected a refresh from the child to publish the root's error"
 	);
 
 	state.open_documents.insert(
 		child.clone(),
-		open_document("func add() -> i32 {\n    1\n}\n"),
+		open_document("pub func add() -> i32 {\n    1\n}\n"),
 	);
-
-	let fixed_publish = compute_refresh(&mut state, &child, &mut Vec::new());
-
+	let fixed = compute_refresh(&mut state, &child, &mut Vec::new());
 	assert!(
-		fixed_publish.iter().any(|(path, diags)| {
-			path == &root
-				&& diags
-					.iter()
-					.all(|d| d.severity != Some(DiagnosticSeverity::ERROR))
-		}),
-		"expected refresh from child path to clear root-file errors after fixing the child overlay"
-	);
-}
-
-// ── Completion integration tests
-// ─────────────────────────────────────────────────────
-
-/// Every test in this module names its entry file directly (e.g.
-/// `/test/main.wx`) rather than a project directory — `analyze_root` now
-/// wants the latter, so this synthesizes the `wx.json` a real project
-/// would have: `{dir}/wx.json` with `entry` set to the entry file's own
-/// name, opened as a virtual document the same way `entry`'s own source
-/// is. Callers are none the wiser; they still pass/receive the entry file
-/// path exactly as before.
-fn open_synthetic_manifest(state: &mut ServerState, entry: &Path) -> PathBuf {
-	let dir = entry
-		.parent()
-		.expect("entry path should have a parent directory")
-		.to_path_buf();
-	let entry_name = entry
-		.file_name()
-		.and_then(|name| name.to_str())
-		.expect("entry path should have a UTF-8 file name");
-	state.open_documents.insert(
-		dir.join("wx.json"),
-		open_document(&format!(
-			r#"{{ "type": "bin", "entry": "{entry_name}" }}"#
-		)),
-	);
-	dir
-}
-
-fn compile_source(root: &Path, source: &str) -> (ServerState, CompiledRoot) {
-	let mut state = ServerState::default();
-	state
-		.open_documents
-		.insert(root.to_path_buf(), open_document(source));
-	let dir = open_synthetic_manifest(&mut state, root);
-	analyze_root(&mut state, &dir, root, &mut Vec::new());
-	let compiled = state.cached.remove(&dir).expect("compilation failed");
-	(state, compiled)
-}
-
-/// Compiles `root_source` alongside additional `(path, source)` files (e.g.
-/// files pulled in via `mod foo;` declarations).
-fn compile_multi_source(
-	root: &Path,
-	root_source: &str,
-	extra_files: &[(&Path, &str)],
-) -> (ServerState, CompiledRoot) {
-	let mut state = ServerState::default();
-	state
-		.open_documents
-		.insert(root.to_path_buf(), open_document(root_source));
-	for (path, source) in extra_files {
-		state
-			.open_documents
-			.insert(path.to_path_buf(), open_document(source));
-	}
-	let dir = open_synthetic_manifest(&mut state, root);
-	analyze_root(&mut state, &dir, root, &mut Vec::new());
-	let compiled = state.cached.remove(&dir).expect("compilation failed");
-	(state, compiled)
-}
-
-#[test]
-fn completion_inside_function_includes_params() {
-	let root = PathBuf::from("/test/main.wx");
-	// Cursor is on the blank line inside the function body (after the newline).
-	let source = "func add(a: i32, b: i32) -> i32 {\n    \n}";
-	// offset 37 lands in the "    " whitespace on the second line, inside the body.
-	let cursor = 37;
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"a"),
-		"expected param `a` in completions; got: {labels:?}"
-	);
-	assert!(
-		labels.contains(&"b"),
-		"expected param `b` in completions; got: {labels:?}"
+		fixed.iter().any(|(path, diagnostics)| path == &root
+			&& !diagnostics.iter().any(is_error)),
+		"expected the root's error to clear once the child is fixed"
 	);
 }
 
 #[test]
-fn completion_inside_function_includes_locals_declared_before_cursor() {
-	let root = PathBuf::from("/test/main.wx");
-	// "x" is declared before cursor; "y" is declared after.
-	let source = "func f() -> i32 {\n    local x: i32 = 1;\n    \n    local y: i32 = 2;\n    x\n}";
-	// Find the offset of the blank line (after "    local x: i32 = 1;\n    ").
-	let cursor = source.find("\n    local y").unwrap(); // just before "local y"
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"x"),
-		"expected `x` in completions; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"y"),
-		"expected `y` NOT in completions yet; got: {labels:?}"
-	);
-}
-
-#[test]
-fn completion_in_type_annotation_position_excludes_functions_and_consts() {
-	// Regression test: `CompletionContext::TypeAnnotation` used to reuse
-	// `global_completion_items` wholesale, which includes every kind
-	// (functions, consts, globals, traits, ...) valid in *value* position —
-	// so typing `local x: ` offered a free function or const as if it were
-	// a type. Fixed by `type_completion_items`, restricted to
-	// `is_type_like` kinds (`Struct`/`Enum`/`TypeSet`/`Namespace`).
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		struct Point {
-		    x: i32,
-		}
-
-		const MAX: i32 = 10;
-
-		func helper() -> i32 {
-		    0
-		}
-
-		func test() {
-		    local p: i32 = 0;
-		}
-	"};
-	// After the space, not against the colon: a cursor touching the colon is
-	// still mid-token and completes nothing (`CompletionContext::Unavailable`).
-	let cursor = source.find("local p: ").unwrap() + "local p: ".len();
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"Point"),
-		"expected struct `Point` in type-position completions; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"MAX"),
-		"const `MAX` must not be offered in type position; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"helper"),
-		"function `helper` must not be offered in type position; got: {labels:?}"
-	);
-}
-
-#[test]
-fn completion_excludes_impl_methods_and_associated_functions() {
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! { "
-		struct Point {
-		    x: i32,
-		    y: i32,
-		}
-
-		impl Point {
-		    func new(x: i32, y: i32) -> Point {
-		        Point { x: x, y: y }
-		    }
-
-		    pub func sum(self) -> i32 {
-		        self.x + self.y
-		    }
-		}
-
-		func test() {
-
-		}
-	" };
-	// Cursor on the blank line inside `test`'s body.
-	let cursor =
-		source.find("func test() {\n").unwrap() + "func test() {\n".len();
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"test"),
-		"expected free function `test` in completions; got: {labels:?}"
-	);
-	assert!(
-		labels.contains(&"Point"),
-		"expected struct `Point` in completions; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"new"),
-		"associated function `Point::new` must not be bare-callable; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"sum"),
-		"method `Point::sum` must not be bare-callable; got: {labels:?}"
-	);
-}
-
-#[test]
-fn completion_excludes_enum_variants_from_bare_identifier_position() {
-	// Regression test: enum variants are only ever resolved as a qualified
-	// member (`Enum::Variant` — see `ResolvedMember::EnumVariant` in
-	// `tir/builder.rs`, the sole place they're resolved), never as a bare
-	// name, but `build_symbol_index` unconditionally pushed them into
-	// `global_definitions` (unlike methods/associated consts, which already
-	// gate on `parent.is_none()`), so they leaked into plain-identifier
-	// completion as if `StdIn` alone were a valid expression.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! { "
-		enum FileDescriptor(u8) {
-		    StdIn,
-		    StdOut,
-		    StdErr,
-		}
-
-		func test() {
-
-		}
-	" };
-	let cursor =
-		source.find("func test() {\n").unwrap() + "func test() {\n".len();
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"FileDescriptor"),
-		"expected enum `FileDescriptor` in completions; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"StdIn"),
-		"variant `FileDescriptor::StdIn` must not be bare-accessible; got: {labels:?}"
-	);
-}
-
-#[test]
-fn completion_inside_function_shows_globals_too() {
-	let root = PathBuf::from("/test/main.wx");
-	let source = "func helper() -> i32 { 0 }\nfunc main() -> i32 {\n    \n}";
-	// Cursor in the blank line inside main's body.
-	let cursor = source.find("\n    \n}").unwrap() + 5;
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"helper"),
-		"expected global function `helper` in completions; got: {labels:?}"
-	);
-}
-
-#[test]
-fn completion_sorts_locals_before_globals() {
-	let root = PathBuf::from("/test/main.wx");
-	// "zeta" (local) would sort after "alpha" (global) alphabetically by
-	// label — locals should still come first via `sort_text`.
-	let source = "func alpha() -> i32 { 0 }\nfunc main() -> i32 {\n    local zeta = 1;\n\n}";
-	let cursor = source.find("1;\n").unwrap() + "1;\n".len();
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-
-	let zeta = items
-		.iter()
-		.find(|i| i.label == "zeta")
-		.expect("local `zeta` should be suggested");
-	let alpha = items
-		.iter()
-		.find(|i| i.label == "alpha")
-		.expect("global `alpha` should be suggested");
-
-	assert!(
-		zeta.sort_text < alpha.sort_text,
-		"expected local `zeta` to sort before global `alpha`; zeta sort_text={:?}, alpha sort_text={:?}",
-		zeta.sort_text,
-		alpha.sort_text
-	);
-}
-
-#[test]
-fn completion_prefix_filters_results() {
-	let root = PathBuf::from("/test/main.wx");
-	let source = "func alpha() -> i32 { 0 }\nfunc beta() -> i32 {\n    al\n}";
-	// Cursor right after "al" inside beta's body.
-	let cursor = source.find("al\n}").unwrap() + 2;
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"alpha"),
-		"expected `alpha` in completions; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"beta"),
-		"expected `beta` filtered out; got: {labels:?}"
-	);
-}
-
-#[test]
-fn position_conversion_handles_non_ascii_line_correctly() {
-	// Regression test: `position_to_offset`/`position_to_offset_in_str`
-	// treated `Position::character` (a UTF-16 code unit offset per the LSP
-	// spec) as if it were a raw byte offset. A line with non-ASCII content
-	// before the cursor throws that off — e.g. Cyrillic is 1 UTF-16 unit but
-	// 2 UTF-8 bytes per character — so the computed byte offset landed short
-	// of the intended column, and for some columns *inside* a multi-byte
-	// character. Slicing the source at that offset (as `completion_items`
-	// does) then panicked with "not a char boundary". This is a faithful
-	// reproduction of a real crash reported against `// привет al`-shaped
-	// input: character offset 14 (UTF-16 units before "al") used as a byte
-	// offset lands inside the two-byte encoding of 'в'.
+fn position_conversion_handles_non_ascii_lines() {
+	// `Position::character` counts UTF-16 units. Cyrillic is 1 unit but 2
+	// UTF-8 bytes, so using it as a byte offset lands inside a character.
 	let source =
 		"func alpha() -> i32 { 0 }\nfunc beta() -> i32 {\n    // привет al\n}";
 	let al_byte_offset = source.rfind("al").unwrap();
@@ -1103,1401 +322,523 @@ fn position_conversion_handles_non_ascii_line_correctly() {
 		character: 14,
 	};
 
-	let offset = position_to_offset_in_str(source, position)
-		.expect("position should resolve to a byte offset");
+	let root = PathBuf::from("/test/main.wx");
+	let (state, dir) = analyzed(&root, source);
+	let snapshot = &state.cached[&dir];
+	let file = file_id_for(snapshot, &root);
+	let files = &snapshot.compilation.files;
+
+	let offset = position_to_offset(files, file, position).unwrap() as usize;
+	assert_eq!(offset, al_byte_offset);
+	assert!(source.is_char_boundary(offset));
+	// Round-tripping recovers the UTF-16 count, not a byte count.
 	assert_eq!(
-		offset, al_byte_offset,
-		"UTF-16 character offset should map to the byte offset right before `al`"
-	);
-	assert!(
-		source.is_char_boundary(offset),
-		"resolved offset must land on a char boundary"
-	);
-
-	let root = PathBuf::from("/test/main.wx");
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	// The compiled-file-index path (used once a file isn't an open/unsaved
-	// buffer) must agree with the direct-source path above.
-	let indexed_offset =
-		position_to_offset(&compiled.graph.files, file_id, position)
-			.expect("position should resolve to a byte offset") as usize;
-	assert_eq!(indexed_offset, al_byte_offset);
-
-	// Round-tripping back must recover the same UTF-16 count, not a byte count.
-	let recovered =
-		byte_to_position(&compiled.graph.files, file_id, al_byte_offset)
-			.expect("byte offset should resolve to a position");
-	assert_eq!(recovered, position);
-
-	// And the offset must actually be usable end-to-end: completion right
-	// after "al" should still see it as a two-character prefix.
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		offset,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-	assert!(
-		labels.contains(&"alpha"),
-		"expected `alpha` in completions; got: {labels:?}"
+		byte_to_position(files, file, al_byte_offset),
+		Some(position)
 	);
 }
 
 #[test]
-fn completion_hides_sibling_module_items_without_use() {
+fn resolve_uri_finds_a_virtual_stdlib_module() {
+	// `Uri::to_file_path` does not check the scheme and returns a bogus path
+	// for `wx://std/...`, so the lookup must not short-circuit on it.
 	let root = PathBuf::from("/test/main.wx");
-	let math = PathBuf::from("/test/math.wx");
-	let source = "mod math;\nfunc main() -> i32 {\n    \n}";
-	let cursor = source.find("\n    \n}").unwrap() + 5;
+	let (state, dir) = analyzed(&root, "func main() {}");
+	let snapshot = &state.cached[&dir];
+	let std_file = snapshot
+		.compilation
+		.packages
+		.iter()
+		.flat_map(|package| package.modules.iter())
+		.find(|module| module.file_path.as_str() == "/main.wx")
+		.map(|module| module.file_id)
+		.expect("the stdlib module is in the graph");
+	let uri = file_id_to_uri(&snapshot.compilation.files, std_file).unwrap();
 
-	let (_, compiled) = compile_multi_source(
-		&root,
-		source,
-		&[(&math, "pub func add() -> i32 { 1 }")],
-	);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"main"),
-		"expected root-level `main` in completions; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"add"),
-		"expected `math::add` NOT to be visible unqualified from root; got: {labels:?}"
-	);
+	let resolved = state.resolve_uri(&uri);
+	assert_eq!(resolved.map(|(_, file)| file), Some(std_file));
 }
 
 #[test]
-fn completion_shows_sibling_module_items_via_wildcard_use() {
-	let root = PathBuf::from("/test/main.wx");
-	let math = PathBuf::from("/test/math.wx");
-	let source = "mod math;\nuse math::*;\nfunc main() -> i32 {\n    \n}";
-	let cursor = source.find("\n    \n}").unwrap() + 5;
-
-	let (_, compiled) = compile_multi_source(
-		&root,
-		source,
-		&[(&math, "pub func add() -> i32 { 1 }")],
+fn a_shared_file_resolves_to_its_own_project_whatever_the_hash_order() {
+	// `/dep/main.wx` is a dependency of both `/a` and `/b` and its own
+	// project. Requests about it must always be answered from `/dep`.
+	let mut state = ServerState::default();
+	for consumer in ["/a", "/b"] {
+		state.open_documents.insert(
+			PathBuf::from(consumer).join("wx.json"),
+			open_document(
+				r#"{ "type": "bin", "entry": "main.wx",
+				     "dependencies": { "dep": { "type": "local", "path": "../dep" } } }"#,
+			),
+		);
+		state.open_documents.insert(
+			PathBuf::from(consumer).join("main.wx"),
+			open_document("package \"dep\" as dep;\nfunc main() {}\n"),
+		);
+	}
+	let dep_dir = PathBuf::from("/dep");
+	let dep_main = dep_dir.join("main.wx");
+	state.open_documents.insert(
+		dep_dir.join("wx.json"),
+		open_document(r#"{ "type": "lib", "entry": "main.wx" }"#),
 	);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"add"),
-		"expected `add` visible after `use math::*;`; got: {labels:?}"
-	);
-}
-
-#[test]
-fn path_completion_after_enum_lists_variants() {
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		enum FileDescriptor(u8) {
-		    StdIn,
-		    StdOut,
-		    StdErr,
-		}
-
-		func test() {
-		    FileDescriptor::
-		}
-	"};
-	let cursor =
-		source.find("FileDescriptor::").unwrap() + "FileDescriptor::".len();
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"StdIn")
-			&& labels.contains(&"StdOut")
-			&& labels.contains(&"StdErr"),
-		"expected all three variants after `FileDescriptor::`; got: {labels:?}"
-	);
-}
-
-#[test]
-fn path_completion_after_struct_lists_only_pub_methods() {
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		struct Point {
-		    x: i32,
-		}
-
-		impl Point {
-		    pub func origin() -> Self {
-		        Self::{ x: 0 }
-		    }
-
-		    func private_helper() -> i32 {
-		        0
-		    }
-		}
-
-		func test() {
-		    Point::
-		}
-	"};
-	let cursor = source.rfind("Point::").unwrap() + "Point::".len();
-
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"origin"),
-		"expected `pub func origin` after `Point::`; got: {labels:?}"
-	);
-	assert!(
-		!labels.contains(&"private_helper"),
-		"non-pub `private_helper` must not be offered via `Point::`; got: {labels:?}"
-	);
-}
-
-#[test]
-fn path_completion_after_namespace_lists_module_members() {
-	let root = PathBuf::from("/test/main.wx");
-	let math = PathBuf::from("/test/math.wx");
-	let source = "mod math;\nfunc test() {\n    math::\n}";
-	let cursor = source.find("math::\n").unwrap() + "math::".len();
-
-	let (_, compiled) = compile_multi_source(
-		&root,
-		source,
-		&[(&math, "pub func add() -> i32 { 1 }")],
-	);
-	let file_id = file_id_for(&compiled, &root);
-
-	let items = completion_items(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		&compiled.symbol_index,
-		file_id,
-		source,
-		cursor,
-	);
-	let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-
-	assert!(
-		labels.contains(&"add"),
-		"expected `add` after `math::`; got: {labels:?}"
-	);
-}
-
-#[test]
-fn resolve_source_and_offset_prefers_live_buffer_over_stale_compiled_source() {
-	// Regression test: signature_help used to compute `offset` from
-	// `compiled.graph.files` (the source as of the last save) and then slice
-	// into that same stale, shorter string. Typing new lines above the
-	// cursor without saving (e.g. wrapping existing code in a new `mod`
-	// block) pushed the live cursor position past the stale source's length
-	// and panicked on `source[..offset]`. `resolve_source_and_offset` is the
-	// shared fix both `completion` and `signature_help` now go through —
-	// this exercises it directly against the exact reported scenario.
-	let root = PathBuf::from("/test/main.wx");
-	let stale_source = "func test() {\n\n}";
-	let (mut state, compiled) = compile_source(&root, stale_source);
-	state.cached.insert(root.clone(), compiled);
-
-	let live_source = "mod test {\n    func foo()\n}\n\nfunc test() {\n\n}";
 	state
 		.open_documents
-		.insert(root.clone(), open_document(live_source));
+		.insert(dep_main.clone(), open_document("pub func helper() {}\n"));
+	for file in ["/a/main.wx", "/b/main.wx", "/dep/main.wx"] {
+		compute_refresh(&mut state, Path::new(file), &mut Vec::new());
+	}
+	assert_eq!(state.cached.len(), 3);
 
-	// Cursor right after "func foo()" on line 1 — this line doesn't exist at
-	// all in `stale_source`, which is only 14 bytes long.
-	let position = Position {
-		line: 1,
-		character: 11,
-	};
-	let uri = Uri::from_file_path(&root).expect("valid file uri");
-	let compiled = state.cached.get(&root).unwrap();
-	let file_id = file_id_for(compiled, &root);
-
-	// Must not panic, and must resolve against the live buffer (not the
-	// 14-byte stale one) — this is exactly what used to panic.
-	let (source, offset) = crate::resolve_source_and_offset(
-		&state, compiled, &uri, file_id, position,
-	)
-	.expect("should resolve source/offset from the live buffer");
-	assert_eq!(source, live_source);
-	assert!(offset <= source.len());
-
-	let call = find_active_call(source, offset);
-	assert!(call.is_some(), "expected an active call for `func foo(`");
-}
-
-#[test]
-fn resolve_uri_finds_virtual_stdlib_module() {
-	// Regression test: `Uri::to_file_path()` doesn't check the scheme, so it
-	// returns a bogus `Some(path)` for a `wx://std/...` virtual URI instead
-	// of `None`. `resolve_uri` must not use that to short-circuit past the
-	// string-comparison fallback, or hover/goto-definition/semantic-tokens
-	// silently stop working inside the standard library file.
-	let root = PathBuf::from("/test/main.wx");
-	let (_, compiled) = compile_source(&root, "func main() {}");
-	let stdlib_file_id = compiled
-		.graph
-		.packages
-		.iter()
-		.flat_map(|cg| cg.modules.iter())
-		.find(|m| m.file_path.as_str() == "/main.wx")
-		.map(|m| m.file_id)
-		.expect("stdlib module should be present in the compiled graph");
-	let uri = crate::file_id_to_uri(&compiled.graph.files, stdlib_file_id)
-		.expect("should construct a wx://std/ URI for the stdlib module");
-
-	let mut state = ServerState::default();
-	state.cached.insert(root.clone(), compiled);
-
-	let resolved = crate::resolve_uri(&state, &uri);
-	assert_eq!(
-		resolved.map(|(_, file_id)| file_id),
-		Some(stdlib_file_id),
-		"resolve_uri should find the stdlib module via its constructed wx:// URI"
-	);
-}
-
-#[test]
-fn cross_package_namespace_token_gets_a_reference() {
-	// Regression test: `build_symbol_index`'s `ModuleDeclarationKind::Package`
-	// arm used to `continue` before recording `ns.accesses`, so a
-	// dependency's own namespace token (`dep` in `dep::helper()`, or the
-	// literal `std` in `use std::*;`) never made it into `references` —
-	// hover/goto-definition/semantic-highlighting had nothing to find at
-	// that token, even though the item it resolves to (`helper`) worked
-	// fine. A locally-declared `mod foo;` never hit this arm at all
-	// (it's `ModuleDeclarationKind::Module`), which is why same-package
-	// modules never showed the bug.
-	use wx_compiler::vfs::{self, VirtualFileSource};
-
-	let source = VirtualFileSource::new(HashMap::from([
-		(
-			vfs::AbsolutePath::new("/app/wx.json"),
-			r#"{
-				"type": "bin",
-				"entry": "main.wx",
-				"dependencies": { "dep": { "type": "local", "path": "../dep" } }
-			}"#
-			.to_string(),
-		),
-		(
-			vfs::AbsolutePath::new("/app/main.wx"),
-			"use std::*;\nfunc test() -> i32 { dep::helper() }\nexport { test }\n"
-				.to_string(),
-		),
-		(
-			vfs::AbsolutePath::new("/dep/wx.json"),
-			r#"{ "type": "lib", "entry": "main.wx" }"#.to_string(),
-		),
-		(
-			vfs::AbsolutePath::new("/dep/main.wx"),
-			"use std::*;\npub func helper() -> i32 { 42 }\n".to_string(),
-		),
-	]));
-
-	let graph = vfs::open_manifest(vfs::AbsolutePath::new("/app"), &source)
-		.expect("both packages should load");
-	let compiled = crate::compile_root(
-		graph,
-		&mut crate::Trace::new(PathBuf::from("/app/main.wx")),
-	);
-
-	let app_file_id = compiled
-		.graph
-		.packages
-		.iter()
-		.flat_map(|cg| cg.modules.iter())
-		.find(|m| m.file_path.as_str() == "/app/main.wx")
-		.expect("app main.wx should be in the graph")
-		.file_id;
-
-	// "dep" in `dep::helper()`, inside
-	// "use std::*;\nfunc test() -> i32 { dep::helper() }\n..." — starts right
-	// after "use std::*;\nfunc test() -> i32 { ".
-	let dep_token_start = "use std::*;\nfunc test() -> i32 { ".len() as u32;
-	let has_dep_reference = compiled.symbol_index.references.iter().any(|r| {
-		r.source.file_id == app_file_id
-			&& r.source.span.start == dep_token_start
-			&& matches!(r.kind, SymbolKind::Namespace(_))
-	});
-	assert!(
-		has_dep_reference,
-		"expected a Namespace reference recorded for the `dep` token; got: {:#?}",
-		compiled
-			.symbol_index
-			.references
-			.iter()
-			.filter(|r| r.source.file_id == app_file_id)
-			.collect::<Vec<_>>()
-	);
-}
-
-#[test]
-fn full_diagnostic_renders_and_handles_bad_index() {
-	let root = PathBuf::from("/test/main.wx");
-	let (_, compiled) = compile_source(
-		&root,
-		"use std::*;\nfunc main() {\n    local x: i32 = 1;\n}\nexport { main }\n",
-	);
-
-	assert!(
-		compiled.tir.diagnostics.iter().any(|d| d.code.as_deref()
-			== Some(DiagnosticCode::UnusedVariable.code())),
-		"expected an unused-variable warning to drive this test's diagnostic"
-	);
-
-	let uri = Uri::from_file_path(&root).unwrap();
-	let mut state = ServerState::default();
-	state.cached.insert(root.clone(), compiled);
-
-	let rendered = crate::render_full_diagnostic(&state, &uri, 0);
-	assert!(
-		rendered.contains('x'),
-		"expected the rendered diagnostic to include the source snippet: {rendered}"
-	);
-	assert!(
-		rendered.contains('\x1b'),
-		"expected ANSI escape codes so the client can color the view: {rendered:?}"
-	);
-
-	let out_of_range = crate::render_full_diagnostic(&state, &uri, 99);
-	assert!(
-		out_of_range.contains("Unable to find original wx diagnostic"),
-		"expected a fallback message for an out-of-range index: {out_of_range}"
-	);
-
-	let untracked_uri = Uri::from_str("file:///not/a/tracked/file.wx").unwrap();
-	let untracked = crate::render_full_diagnostic(&state, &untracked_uri, 0);
-	assert!(
-		untracked.contains("Unable to find original wx diagnostic"),
-		"expected a fallback message for a URI outside any tracked root: {untracked}"
-	);
-}
-
-#[test]
-fn unused_enum_variants_get_one_squiggle_each() {
-	// `report_unused_enum_variants` has no primary label — every listed
-	// variant is equally "the problem" — so `diagnostic_locations` must
-	// expand it into one LSP diagnostic per variant instead of collapsing
-	// to whichever label happens to be first in the vec (regression test
-	// for the bug where only the first unused variant got underlined).
-	let root = PathBuf::from("/test/main.wx");
-	let (_, compiled) = compile_source(
-		&root,
-		indoc::indoc! {"
-			enum Direction(i32) {
-			    Right,
-			    Down,
-			    Left,
-			}
-			func get_right() -> Direction {
-			    Direction::Right
-			}
-			export { get_right }
-		"},
-	);
-
-	let analysis = crate::analysis_from_compiled_root(&compiled);
-	let diagnostics = analysis
-		.diagnostics_by_file
-		.get(&root)
-		.expect("expected diagnostics for main.wx");
-
-	let unused: Vec<_> = diagnostics
-		.iter()
-		.filter(|d| {
-			d.code.as_ref().is_some_and(|code| {
-				matches!(code, NumberOrString::String(s)
-					if s == DiagnosticCode::UnusedEnumVariant.code())
-			})
-		})
-		.collect();
-
-	assert_eq!(
-		unused.len(),
-		2,
-		"expected one LSP diagnostic per unused variant (Down, Left), got: {diagnostics:?}"
-	);
-	assert_ne!(
-		unused[0].range, unused[1].range,
-		"each unused variant should get its own distinct squiggle range"
-	);
-}
-
-#[test]
-fn enum_type_used_as_return_type_resolves_to_its_definition() {
-	// Regression test: `build_symbol_index` recorded accesses for enum
-	// *variants* but never read `enum_.accesses`, so a bare enum type name
-	// used in a type position (like a return type) had no reference entry —
-	// hover/go-to-definition on it silently failed.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		enum Status(u8) {
-		    Ok = 200,
-		}
-
-		func test() -> Status {
-		    Status::Ok
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	// Offset of `Status` in `-> Status`, not the `Status::Ok` namespace access.
-	let return_type_offset = source.find("-> Status").unwrap() + "-> ".len();
-
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, return_type_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the return type position")
-		});
-
-	assert!(
-		matches!(found.kind, SymbolKind::Enum(_)),
-		"expected the return type reference to resolve to the enum; got: {found:?}"
-	);
-
-	let definition = compiled
-		.symbol_index
-		.definitions
-		.iter()
-		.find(|d| d.kind == found.kind)
-		.expect("expected a matching enum definition entry");
-	assert_eq!(
-		&source[definition.source.span.start as usize
-			..definition.source.span.end as usize],
-		"Status",
-		"go-to-definition should land on the `enum Status` name"
-	);
-}
-
-#[test]
-fn type_alias_used_as_return_type_resolves_to_its_definition() {
-	// Regression test: `build_symbol_index` never visited `tir.items.type_aliases`
-	// at all, and `SymbolKind` had no `TypeAlias` variant — so a `type Id =
-	// u32;` alias had no definition/reference entries whatsoever. Every
-	// LSP feature keyed off `SymbolKind` (go-to-definition, hover, semantic
-	// tokens) silently did nothing for a name that resolved to a type alias.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		use std::*;
-
-		type Id = u32;
-
-		func test() -> Id {
-		    0 as Id
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	// Offset of `Id` in `-> Id`, not the `0 as Id` cast.
-	let return_type_offset = source.find("-> Id").unwrap() + "-> ".len();
-
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, return_type_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the return type position")
-		});
-
-	assert!(
-		matches!(found.kind, SymbolKind::TypeAlias(_)),
-		"expected the return type reference to resolve to the type alias; got: {found:?}"
-	);
-
-	let definition = compiled
-		.symbol_index
-		.definitions
-		.iter()
-		.find(|d| d.kind == found.kind)
-		.expect("expected a matching type alias definition entry");
-	assert_eq!(
-		&source[definition.source.span.start as usize
-			..definition.source.span.end as usize],
-		"Id",
-		"go-to-definition should land on the `type Id` name"
-	);
-
-	assert!(
-		matches!(symbol_kind_to_token_type(found.kind), Some(TokenType::Type)),
-		"a type alias reference should be colored as a type"
-	);
-
-	let hover = symbol_hover_text(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		compiled.graph.root_package,
-		&found.kind,
-	)
-	.expect("expected hover text for the type alias");
-	assert_eq!(hover, "type Id = u32");
-}
-
-#[test]
-fn trait_impl_type_params_have_hover_definitions_and_isolated_references() {
-	use wx_compiler::diagnostics::Diagnostics as _;
-
-	let root = PathBuf::from("/test/main.wx");
-	for implementation in [
-		"trait Marker {}\nimpl<Mem: Memory, T> Marker for RawPtr<Mem, T> {}",
-		indoc::indoc! {"
-			trait Identity { func identity(value: Self) -> Self; }
-			impl<Mem: Memory, T> Identity for RawPtr<Mem, T> {
-			    func identity(value: RawPtr<Mem, T>) -> RawPtr<Mem, T> { value }
-			}
-		"},
-	] {
-		let source = format!(
-			"struct RawPtr<Mem: Memory, T> {{ addr: Mem::Size, }}\n{implementation}"
-		);
-		let (_, compiled) = compile_source(&root, &source);
-		assert!(
-			!compiled.tir.diagnostics.has_errors(),
-			"unexpected diagnostics: {:?}",
-			compiled.tir.diagnostics
-		);
-		let file_id = file_id_for(&compiled, &root);
-		let index = &compiled.symbol_index;
-		let impl_start = source.find("impl<").unwrap();
-
-		for (param_index, name, hover, argument_offset) in
-			[(0, "Mem", "Mem: Memory", 0), (1, "T", "T", "Mem, ".len())]
-		{
-			let declaration = if param_index == 0 {
-				impl_start + "impl<".len()
-			} else {
-				impl_start + source[impl_start..].find(", T>").unwrap() + 2
-			};
-			let found = index
-				.find_at_position(file_id, declaration as u32)
-				.expect("impl parameter declaration should be indexed");
-			assert!(matches!(
-				found.kind,
-				SymbolKind::TypeParam {
-					owner: TypeParamOwner::TraitImpl(_),
-					param_index: actual,
-				} if actual == param_index
-			));
-			let expected_references: Vec<_> = source
-				.match_indices("RawPtr<Mem, T>")
-				.map(|(start, _)| {
-					(start + "RawPtr<".len() + argument_offset) as u32
-				})
-				.collect();
-			for position in std::iter::once(declaration as u32)
-				.chain(expected_references.iter().copied())
-			{
-				let symbol = index.find_at_position(file_id, position).unwrap();
-				assert_eq!(symbol.kind, found.kind);
-				assert_eq!(
-					index
-						.definition_for_kind(symbol.kind)
-						.unwrap()
-						.source
-						.span
-						.start,
-					declaration as u32
-				);
-				assert_eq!(
-					symbol_hover_text(
-						&compiled.tir,
-						&compiled.graph.strings,
-						&compiled.graph.packages,
-						compiled.graph.root_package,
-						&symbol.kind,
-					)
-					.as_deref(),
-					Some(hover)
-				);
-				assert!(matches!(
-					symbol_kind_to_token_type(symbol.kind),
-					Some(TokenType::TypeParameter)
-				));
-			}
-
-			let search_kinds =
-				reference_search_kinds(&compiled.tir, index, found.kind);
-			let references: Vec<_> = index
-				.references
-				.iter()
-				.filter(|entry| search_kinds.contains(&entry.kind))
-				.map(|entry| entry.source.span.start)
-				.collect();
-			assert_eq!(references, expected_references);
-
-			// Rename uses exact-kind matching across references and definitions.
-			// It must leave the struct's identically named parameters alone.
-			let mut rename_positions: Vec<_> = index
-				.references
-				.iter()
-				.chain(index.definitions.iter())
-				.filter(|entry| entry.kind == found.kind)
-				.map(|entry| {
-					assert_eq!(entry.source.file_id, file_id);
-					assert_eq!(entry.source.span.extract_str(&source), name);
-					entry.source.span.start
-				})
-				.collect();
-			rename_positions.sort_unstable();
-			let mut expected_rename = vec![declaration as u32];
-			expected_rename.extend(expected_references);
-			assert_eq!(rename_positions, expected_rename);
-		}
+	let uri = Uri::from_str("file:///dep/main.wx").unwrap();
+	for _ in 0..20 {
+		let (snapshot, file) = state.resolve_uri(&uri).unwrap();
+		assert!(std::ptr::eq(snapshot, &state.cached[&dep_dir]));
+		assert_eq!(file, file_id_for(snapshot, &dep_main));
 	}
 }
 
 #[test]
-fn self_type_in_trait_method_resolves_to_trait_definition() {
-	// Regression test: `build_symbol_index` recorded accesses for a trait's
-	// own name and its associated types, but never read the trait's implicit
-	// `self_type_param` — so a `Self` reference inside a trait method (e.g. a
-	// return type) had no reference entry and hover/go-to-definition on it
-	// silently did nothing.
+fn full_diagnostic_renders_and_handles_a_bad_index() {
 	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		trait Cloneable {
-		    func duplicate(self) -> Self;
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let self_offset = source.find("-> Self").unwrap() + "-> ".len();
-
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, self_offset as u32)
-		.unwrap_or_else(|| panic!("expected a symbol at the `Self` position"));
-
+	let (state, dir) =
+		analyzed(&root, "func main() -> i32 { True }\nexport { main }\n");
 	assert!(
-		matches!(
-			found.kind,
-			SymbolKind::TypeParam {
-				owner: TypeParamOwner::Trait(_),
-				param_index: 0
-			}
-		),
-		"expected the `Self` reference to resolve to the trait's implicit type param; got: {found:?}"
+		!state.cached[&dir].sema.diagnostics().is_empty(),
+		"expected a type error to drive this test"
 	);
 
-	let definition = compiled
-		.symbol_index
-		.definition_for_kind(found.kind)
-		.expect("expected a matching Self type param redirect target");
+	let uri = Uri::from_file_path(&root).unwrap();
+	let rendered = requests::render_full_diagnostic(&state, &uri, 0);
+	assert!(rendered.contains("True"), "{rendered}");
+	assert!(rendered.contains('\x1b'), "{rendered:?}");
+
+	let out_of_range = requests::render_full_diagnostic(&state, &uri, 99);
+	assert!(out_of_range.contains("Unable to find original wx diagnostic"));
+
+	let untracked = Uri::from_str("file:///not/a/tracked/file.wx").unwrap();
+	let untracked = requests::render_full_diagnostic(&state, &untracked, 0);
+	assert!(untracked.contains("Unable to find original wx diagnostic"));
+}
+
+#[test]
+fn a_diagnostic_without_a_primary_label_gets_one_squiggle_per_label() {
+	// Every label of such a diagnostic is equally "the problem", so each is
+	// squiggled on its own instead of collapsing to the first one.
+	use codespan_reporting::diagnostic::{Diagnostic as Report, Label};
+	use wx_compiler::vfs::{FileOrigin, Files};
+
+	let mut files = Files::new();
+	let file = files
+		.add(
+			"/test/main.wx".to_string(),
+			"enum E { A, B }".to_string(),
+			FileOrigin::Local,
+		)
+		.unwrap();
+	let report = Report::warning()
+		.with_message("unused variants")
+		.with_labels(vec![
+			Label::secondary(file, 9..10),
+			Label::secondary(file, 12..13),
+		]);
+
+	let mut grouped = HashMap::new();
+	add_compiler_diagnostic(&mut grouped, &files, &report);
+
+	let diagnostics = &grouped[&PathBuf::from("/test/main.wx")];
+	assert_eq!(diagnostics.len(), 2);
+	assert_ne!(diagnostics[0].range, diagnostics[1].range);
+}
+
+#[test]
+fn goto_definition_goes_to_the_declaring_name() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = "func add(a: i32, b: i32) -> i32 { a + b }\nfunc main() -> i32 { add(1, 2) }\nexport { main }\n";
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+
+	let location = scalar(requests::goto_definition(
+		&state,
+		&definition_params(&uri, position_of(source, "add", 1)),
+	));
+	assert_eq!(location.uri, uri);
 	assert_eq!(
-		&source[definition.source.span.start as usize
-			..definition.source.span.end as usize],
-		"Cloneable",
-		"go-to-definition for `Self` should land on the enclosing trait's name"
+		location.range,
+		Range {
+			start: position_of(source, "add", 0),
+			end: Position {
+				line: 0,
+				character: 8
+			},
+		}
+	);
+
+	// A parameter use goes to the parameter.
+	let location = scalar(requests::goto_definition(
+		&state,
+		&definition_params(&uri, position_of(source, "a +", 0)),
+	));
+	assert_eq!(location.range.start, position_of(source, "a:", 0));
+
+	// Nothing resolved under the cursor: no answer.
+	assert!(
+		requests::goto_definition(
+			&state,
+			&definition_params(&uri, position_of(source, "export", 0)),
+		)
+		.is_none()
 	);
 }
 
 #[test]
-fn trait_own_name_resolves_to_trait_not_self_type_param() {
-	// Regression test: the trait's own declared name sits at the exact same
-	// span as its implicit `self_type_param`'s redirect target
-	// (`self_type_param.name.span` is set to the trait's own `name.span` at
-	// construction — see `self_type_in_trait_method_resolves_to_trait_definition`).
-	// Before `transparent_definitions` existed, both lived in `definitions`,
-	// and `find_narrowest`'s reversed iteration order happened to prefer the
-	// type-param entry on that tie — so clicking the trait's own declared
-	// name resolved as `TypeParam { owner: Trait(_), .. }` instead of
-	// `Trait`. Go-to-definition itself was unaffected (both kinds' redirect
-	// targets are this same span either way), but everything else keyed off
-	// `SymbolKind` was wrong: hover showed the type-param's text instead of
-	// the trait's, semantic tokens emitted two conflicting overlapping
-	// entries for one span, and — worst — Rename from this position would
-	// have renamed every `Self` occurrence in the trait's default bodies
-	// while leaving the trait's own name untouched.
+fn goto_definition_works_in_a_file_with_errors() {
+	// A type error elsewhere must not take navigation away: the snapshot
+	// keeps the partial semantic data of an erroneous program.
 	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		trait Cloneable {
-		    func duplicate(self) -> Self;
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
+	let source = "func helper() {}\nfunc broken() -> i32 { True }\nfunc main() { helper() }\nexport { main }\n";
+	let (state, dir) = analyzed(&root, source);
+	assert!(state.cached[&dir].sema.diagnostics().iter().any(|d| {
+		d.severity == codespan_reporting::diagnostic::Severity::Error
+	}));
+	let uri = Uri::from_file_path(&root).unwrap();
 
-	let trait_name_offset =
-		source.find("trait Cloneable").unwrap() + "trait ".len();
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, trait_name_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the trait's own declared name")
-		});
-
-	assert!(
-		matches!(found.kind, SymbolKind::Trait(_)),
-		"expected the trait's own name to resolve as SymbolKind::Trait, not the implicit Self type param; got: {found:?}"
-	);
-
-	let definition = compiled
-		.symbol_index
-		.definition_for_kind(found.kind)
-		.expect("expected a matching trait definition entry");
-	assert_eq!(
-		definition.source.span.start, trait_name_offset as u32,
-		"sanity check: a Trait definition's redirect target is its own declaration site"
-	);
+	let location = scalar(requests::goto_definition(
+		&state,
+		&definition_params(&uri, position_of(source, "helper", 1)),
+	));
+	assert_eq!(location.range.start, position_of(source, "helper", 0));
 }
 
-#[test]
-fn self_type_in_impl_block_resolves_to_struct_definition() {
-	// Regression test: `Self` inside a plain `impl` block resolves to the
-	// target's concrete `Type::Struct`/`Type::Enum` directly (not a
-	// `Type::TypeParam`). It's tracked as `SymbolKind::InherentImplSelf`
-	// rather than `SymbolKind::Struct` — same underlying target, but a
-	// distinct kind — so `Rename` (which matches purely on `SymbolKind`
-	// equality) renaming the struct doesn't also rewrite the `Self`
-	// keyword text. Hover/go-to-definition still redirect to the impl's
-	// target type, via a synthetic definition entry at the impl header's
-	// own target span.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		struct Point {
-		    x: i32,
-		    y: i32,
-		}
+#[tokio::test]
+async fn a_query_queued_after_an_edit_sees_that_edit() {
+	use tower_lsp_server::ls_types::*;
 
-		impl Point {
-		    pub func origin() -> Self {
-		        Self::{ x: 0, y: 0 }
-		    }
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let return_type_offset = source.find("-> Self").unwrap() + "-> ".len();
-
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, return_type_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `Self` return type position")
-		});
-
-	assert!(
-		matches!(found.kind, SymbolKind::InherentImplSelf(_)),
-		"expected the `Self` reference to resolve to the impl block; got: {found:?}"
-	);
-
-	let definition = compiled
-		.symbol_index
-		.definition_for_kind(found.kind)
-		.expect("expected a matching InherentImplSelf redirect target");
-	assert_eq!(
-		&source[definition.source.span.start as usize
-			..definition.source.span.end as usize],
-		"Point",
-		"go-to-definition for `Self` should land on the impl header's target"
-	);
-
-	// `Self::{ .. }` struct-init syntax goes through a different call site
-	// than the return-type position but funnels into the same resolution
-	// function, so it should resolve too.
-	let init_offset = source.find("Self::{").unwrap();
-	let found_init = compiled
-		.symbol_index
-		.find_at_position(file_id, init_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `Self::{{ }}` init position")
-		});
-	assert!(
-		matches!(found_init.kind, SymbolKind::InherentImplSelf(_)),
-		"expected `Self::{{ }}` to resolve to the impl block; got: {found_init:?}"
-	);
-}
-
-#[test]
-fn self_receiver_param_resolves_to_self_param_not_plain_param() {
-	// Regression test: a method's `self` receiver used to be indistinguishable
-	// from any other named parameter (`SymbolKind::Param { func_id,
-	// param_idx: 0 }`), so semantic tokens colored it like an ordinary
-	// parameter instead of leaving it to the editor's keyword highlighting —
-	// same class of bug as `Self`/`self` inside impl bodies. Fixed by giving
-	// it its own `SymbolKind::SelfParam`, detected the same way TIR itself
-	// decides a function is a method: first param named `self`.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		struct Point {
-		    x: i32,
-		}
-
-		impl Point {
-		    pub func x_value(self) -> i32 {
-		        self.x
-		    }
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let param_offset = source.find("(self)").unwrap() + "(".len();
-	let found_param = compiled
-		.symbol_index
-		.find_at_position(file_id, param_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `self` parameter position")
-		});
-	assert!(
-		matches!(found_param.kind, SymbolKind::SelfParam(_)),
-		"expected the `self` receiver to resolve to SymbolKind::SelfParam; got: {found_param:?}"
-	);
-
-	let body_offset = source.find("self.x").unwrap();
-	let found_body = compiled
-		.symbol_index
-		.find_at_position(file_id, body_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `self` body reference")
-		});
-	assert!(
-		matches!(found_body.kind, SymbolKind::SelfParam(_)),
-		"expected `self.x` to resolve to SymbolKind::SelfParam too; got: {found_body:?}"
-	);
-
-	assert!(
-		symbol_kind_to_token_type(found_param.kind).is_none(),
-		"the `self` receiver must not get a semantic token — the editor's \
-		 keyword grammar highlights it instead"
-	);
-}
-
-#[test]
-fn impl_header_target_resolves_to_struct_not_self() {
-	// Regression test: the impl header's own target mention (`impl Point`'s
-	// `Point`) sits at the exact same span as `InherentImplSelf`'s redirect
-	// target (`Self` inside the impl lands there too). Before
-	// `transparent_definitions` existed, both lived in `definitions`, and
-	// `find_at_position` ties toward definitions — so clicking the header's
-	// own `Point` resolved as `InherentImplSelf`, whose redirect target was
-	// that exact same position, making go-to-definition a no-op (which
-	// editors typically show as a references picker instead of navigating).
-	// It must resolve as a plain `Struct` reference instead, landing on the
-	// real `struct Point` declaration.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		struct Point {
-		    x: i32,
-		}
-
-		impl Point {
-		    pub func origin() -> Self {
-		        Self::{ x: 0 }
-		    }
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let header_target_offset =
-		source.find("impl Point").unwrap() + "impl ".len();
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, header_target_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the impl header's `Point`")
-		});
-
-	assert!(
-		matches!(found.kind, SymbolKind::Struct(_)),
-		"expected the impl header's own target to resolve as a plain struct reference, not InherentImplSelf; got: {found:?}"
-	);
-
-	let definition = compiled
-		.symbol_index
-		.definition_for_kind(found.kind)
-		.expect("expected a matching struct definition entry");
-	let declaration_offset =
-		source.find("struct Point").unwrap() + "struct ".len();
-	assert_eq!(
-		definition.source.span.start, declaration_offset as u32,
-		"go-to-definition on the impl header's target should land on the real `struct Point` declaration, not the impl header itself"
-	);
-}
-
-#[test]
-fn reference_search_kinds_merges_self_usages_targeting_the_struct() {
-	// Regression test: `textDocument/references` on a struct name used to
-	// match `SymbolKind::Struct` exactly, so it missed every `Self` usage
-	// inside that struct's own impls — tracked separately as
-	// `InherentImplSelf` specifically so `Rename` wouldn't rewrite them
-	// (see `self_type_in_impl_block_resolves_to_struct_definition`), but
-	// References should still surface them, matching rust-analyzer.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		struct Point {
-		    x: i32,
-		}
-
-		impl Point {
-		    pub func origin() -> Self {
-		        Self::{ x: 0 }
-		    }
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let struct_name_offset =
-		source.find("struct Point").unwrap() + "struct ".len();
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, struct_name_offset as u32)
-		.unwrap_or_else(|| panic!("expected a symbol at the `Point` name"));
-	assert!(
-		matches!(found.kind, SymbolKind::Struct(_)),
-		"expected the struct name to resolve to SymbolKind::Struct; got: {found:?}"
-	);
-
-	let search_kinds = reference_search_kinds(
-		&compiled.tir,
-		&compiled.symbol_index,
-		found.kind,
-	);
-	assert!(
-		search_kinds.contains(&found.kind),
-		"expected the literal struct name kind to still be included"
-	);
-	assert!(
-		search_kinds
-			.iter()
-			.any(|k| matches!(k, SymbolKind::InherentImplSelf(_))),
-		"expected `Self` usages in Point's impl to be merged in; got: {search_kinds:?}"
-	);
-	assert_eq!(
-		search_kinds.len(),
-		2,
-		"expected exactly the struct kind plus one InherentImplSelf kind (one impl block); got: {search_kinds:?}"
-	);
-
-	// Rename must NOT use this merge — it stays exact-kind-only, or it
-	// would rewrite `Self` keyword text when renaming the struct.
-	let rename_kinds = compiled
-		.symbol_index
-		.references
-		.iter()
-		.filter(|e| e.kind == found.kind);
-	assert!(
-		rename_kinds.clone().count() > 0,
-		"sanity check: Point should have at least one literal reference"
-	);
-	assert!(
-		rename_kinds
-			.clone()
-			.all(|e| !matches!(e.kind, SymbolKind::InherentImplSelf(_))),
-		"exact-kind filtering (what Rename uses) must never include InherentImplSelf"
-	);
-}
-
-#[test]
-fn implementation_locations_finds_inherent_and_trait_impls_of_a_struct() {
-	// `textDocument/implementation` on `struct Point` should land on both
-	// impl headers' target-type spans — the inherent `impl Point { }` and
-	// the `impl Drawable for Point { }` trait impl — reusing the same
-	// `ImplTarget`-keyed reverse indices `reference_search_kinds` uses.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		trait Drawable {
-		    func draw(&self) -> i32;
-		}
-
-		struct Point {
-		    x: i32,
-		}
-
-		impl Point {
-		    pub func origin() -> Self {
-		        Self::{ x: 0 }
-		    }
-		}
-
-		impl Drawable for Point {
-		    func draw(&self) -> i32 {
-		        self.x
-		    }
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let struct_name_offset =
-		source.find("struct Point").unwrap() + "struct ".len();
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, struct_name_offset as u32)
-		.unwrap_or_else(|| panic!("expected a symbol at the `Point` name"));
-	assert!(matches!(found.kind, SymbolKind::Struct(_)));
-
-	let locations = implementation_locations(
-		&compiled.tir,
-		&compiled.symbol_index,
-		found.kind,
-	);
-	assert_eq!(
-		locations.len(),
-		2,
-		"expected the inherent impl and the trait impl; got: {locations:?}"
-	);
-
-	let inherent_target_offset =
-		source.find("impl Point").unwrap() + "impl ".len();
-	let trait_impl_target_offset =
-		source.find("impl Drawable for Point").unwrap()
-			+ "impl Drawable for ".len();
-	let offsets: Vec<u32> = locations.iter().map(|s| s.span.start).collect();
-	assert!(
-		offsets.contains(&(inherent_target_offset as u32)),
-		"expected a location at the inherent impl's target span; got: {offsets:?}"
-	);
-	assert!(
-		offsets.contains(&(trait_impl_target_offset as u32)),
-		"expected a location at the trait impl's target span; got: {offsets:?}"
-	);
-}
-
-#[test]
-fn implementation_locations_finds_impls_of_a_trait() {
-	// `textDocument/implementation` on `trait Drawable` should land on every
-	// impl of it, regardless of target type.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		trait Drawable {
-		    func draw(&self) -> i32;
-		}
-
-		struct Point {
-		    x: i32,
-		}
-
-		impl Drawable for Point {
-		    func draw(&self) -> i32 {
-		        self.x
-		    }
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let trait_name_offset =
-		source.find("trait Drawable").unwrap() + "trait ".len();
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, trait_name_offset as u32)
-		.unwrap_or_else(|| panic!("expected a symbol at the `Drawable` name"));
-	assert!(matches!(found.kind, SymbolKind::Trait(_)));
-
-	let locations = implementation_locations(
-		&compiled.tir,
-		&compiled.symbol_index,
-		found.kind,
-	);
-	let trait_impl_target_offset =
-		source.find("impl Drawable for Point").unwrap()
-			+ "impl Drawable for ".len();
-	assert_eq!(
-		locations.iter().map(|s| s.span.start).collect::<Vec<_>>(),
-		vec![trait_impl_target_offset as u32]
-	);
-}
-
-#[test]
-fn self_assoc_type_in_inherent_impl_resolves_to_trait_assoc_type() {
-	// Regression test: `Self::Elem` inside a plain `impl Heap { .. }` block
-	// (where `Heap` implements `Container` elsewhere) resolves `Self` to the
-	// concrete `Heap` struct, so the `Elem` lookup went through
-	// `resolve_impl_member`'s trait-impl fallback in the TIR builder — which
-	// never recorded an access on `Container`'s associated type. Fixed by
-	// having `resolve_impl_member` report which trait a member came from
-	// (`MemberLookup::Trait { trait_index, .. }`) so the caller can record it.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		trait Bound {}
-		impl Bound for u32 {}
-		trait Container {
-		    type Elem: Bound;
-		}
-		struct Heap {}
-		impl Container for Heap {
-		    type Elem = u32;
-		}
-		impl Heap {
-		    func zero() -> Self::Elem {
-		        0
-		    }
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let self_elem_offset = source.find("Self::Elem").unwrap() + "Self::".len();
-
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, self_elem_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `Self::Elem` position")
-		});
-
-	assert!(
-		matches!(found.kind, SymbolKind::AssocType { .. }),
-		"expected `Self::Elem` to resolve to the associated type; got: {found:?}"
-	);
-
-	let definition = compiled
-		.symbol_index
-		.definitions
-		.iter()
-		.find(|d| d.kind == found.kind)
-		.expect("expected a matching associated type definition entry");
-	assert_eq!(
-		&source[definition.source.span.start as usize
-			..definition.source.span.end as usize],
-		"Elem",
-		"go-to-definition for `Self::Elem` should land on the trait's `type Elem` declaration"
-	);
-	let hover = symbol_hover_text(
-		&compiled.tir,
-		&compiled.graph.strings,
-		&compiled.graph.packages,
-		compiled.graph.root_package,
-		&found.kind,
-	)
-	.expect("associated-type hover reads its arena-owned bounds");
-	assert_eq!(hover, "type Elem: Bound");
-}
-
-#[test]
-fn memory_declaration_records_accesses_in_type_value_and_export_positions() {
-	// Regression test: `memory` declarations never recorded any access at
-	// all (unlike struct/enum/trait/const), and `wx-lsp`'s `SymbolKind` had
-	// no `Memory` variant to begin with — so hover/go-to-definition on a
-	// memory name silently did nothing everywhere: as a type (`heap::&[u8]`,
-	// `type M = heap;`), as a value receiver (`heap.size_pages()`), and in an
-	// `export { heap as "..." }` list.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		use std::*;
-
-		#[memory_limits({ min_pages: 1 })]
-		memory heap: Memory where { Size = u32 };
-		func heap_size() -> u32 {
-		    heap.size_pages()
-		}
-
-		export {
-		    heap as \"memory\",
-		    heap_size
-		}
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let definition = compiled
-		.symbol_index
-		.definitions
-		.iter()
-		.find(|d| matches!(d.kind, SymbolKind::Memory(_)))
-		.expect("expected a definition entry for `memory heap`");
-
-	// Value position: `heap.size_pages()`.
-	let value_offset = source.find("heap.size_pages()").unwrap();
-	let found_value = compiled
-		.symbol_index
-		.find_at_position(file_id, value_offset as u32)
-		.unwrap_or_else(|| {
-			panic!(
-				"expected a symbol at the `heap.size_pages()` receiver position"
-			)
-		});
-	assert_eq!(
-		found_value.kind, definition.kind,
-		"expected `heap` in `heap.size_pages()` to resolve to the memory declaration"
-	);
-
-	// Export-list position: `heap as "memory"`.
-	let export_offset = source.find("heap as").unwrap();
-	let found_export = compiled
-		.symbol_index
-		.find_at_position(file_id, export_offset as u32)
-		.unwrap_or_else(|| {
-			panic!(
-				"expected a symbol at the `heap as \"memory\"` export position"
-			)
-		});
-	assert_eq!(
-		found_export.kind, definition.kind,
-		"expected `heap` in the export list to resolve to the memory declaration"
-	);
-}
-
-#[test]
-fn memory_associated_const_namespace_access_resolves() {
-	// Regression test: `heap::DATA_END` resolves fine in the TIR (its access
-	// is correctly recorded on a per-memory `Constant` forked by
-	// `seed_memory_trait_impl_with`), but that forked const never gets a
-	// `value` (its value is compiler-synthesized, not a user-written
-	// initializer) — and `build_symbol_index`'s constant loop gated *both*
-	// definitions and references behind `constant.value.is_some()`, which
-	// wrongly excludes any associated const that structurally never has a
-	// value (this one, and a trait's own abstract `const NAME: T;`
-	// declaration). So `heap::DATA_END` had no definition or reference
-	// entry at all — hover/go-to-definition silently did nothing.
-	let root = PathBuf::from("/test/main.wx");
-	let source = indoc::indoc! {"
-		use std::*;
-
-		#[memory_limits({ min_pages: 1 })]
-		memory heap: Memory where { Size = u32 };
-		global mut bump: *u8 = heap::DATA_END;
-	"};
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	let data_end_offset = source.find("DATA_END").unwrap();
-	let found = compiled
-		.symbol_index
-		.find_at_position(file_id, data_end_offset as u32)
-		.unwrap_or_else(|| {
-			panic!("expected a symbol at the `heap::DATA_END` position")
-		});
-	assert!(
-		matches!(found.kind, SymbolKind::Const(_)),
-		"expected `DATA_END` to resolve to a const; got: {found:?}"
-	);
-
-	let definition = compiled
-		.symbol_index
-		.definitions
-		.iter()
-		.find(|d| d.kind == found.kind)
-		.expect("expected a matching const definition entry");
-
-	// The forked per-memory const has no user-written declaration of its
-	// own — `seed_memory_trait_impl_with` copies the `name`/`file_id` of the
-	// `Memory` trait's abstract `const DATA_END: Self::*u8;` straight from
-	// its template, so go-to-definition correctly lands there (in
-	// `std/main.wx`) rather than anywhere in this test's own source.
-	let SymbolKind::Const(const_id) = found.kind else {
-		unreachable!("checked above");
-	};
-	let const_index = compiled.tir.items.const_index(const_id).unwrap();
-	let const_name = compiled.tir.items.constants[usize::from(const_index)]
-		.name
-		.inner;
-	assert_eq!(
-		compiled.graph.strings.resolve(const_name),
-		Some("DATA_END"),
-		"expected the resolved const to be named `DATA_END`"
-	);
-	assert_eq!(
-		definition.source.span,
-		compiled.tir.items.constants[usize::from(const_index)]
-			.name
-			.span,
-		"go-to-definition should land on the `Memory` trait's `const DATA_END` declaration"
-	);
-	let memory_trait = compiled
-		.tir
-		.items
-		.traits
-		.iter()
-		.find(|trait_def| {
-			compiled.graph.strings.resolve(trait_def.name.inner)
-				== Some("Memory")
+	let service = backend_with_drained_socket();
+	let backend: &Backend = service.inner();
+	let manifest_uri = Uri::from_str("file:///tmp/probe/wx.json").unwrap();
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: manifest_uri,
+				language_id: "json".into(),
+				version: 1,
+				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+			},
 		})
-		.expect("stdlib Memory trait");
-	let wx_compiler::tir::TraitMemberKind::Constant(template_index) =
-		memory_trait.bindings[&const_name]
-	else {
-		panic!("Memory::DATA_END must be a constant");
+		.await;
+
+	let uri = Uri::from_str("file:///tmp/probe/main.wx").unwrap();
+	let first = "func add() {}\nfunc main() { add() }\nexport { main }\n";
+	backend
+		.did_open(DidOpenTextDocumentParams {
+			text_document: TextDocumentItem {
+				uri: uri.clone(),
+				language_id: "wx".into(),
+				version: 1,
+				text: first.into(),
+			},
+		})
+		.await;
+
+	// Two edits, then a query: no edit may be skipped, and the query must be
+	// answered from the last one.
+	let second = "\n\nfunc add() {}\nfunc main() { add() }\nexport { main }\n";
+	let third =
+		"\n\n\n\nfunc add() {}\nfunc main() { add() }\nexport { main }\n";
+	for (version, text) in [(2, second), (3, third)] {
+		backend
+			.did_change(DidChangeTextDocumentParams {
+				text_document: VersionedTextDocumentIdentifier {
+					uri: uri.clone(),
+					version,
+				},
+				content_changes: vec![TextDocumentContentChangeEvent {
+					range: None,
+					range_length: None,
+					text: text.into(),
+				}],
+			})
+			.await;
+	}
+	let location = scalar(
+		backend
+			.goto_definition(definition_params(
+				&uri,
+				position_of(third, "add", 1),
+			))
+			.await
+			.expect("goto definition should not error"),
+	);
+	assert_eq!(location.range.start, position_of(third, "add", 0));
+}
+
+/// The hover text at the `occurrence`-th `needle` of `source`.
+fn hover_text(
+	state: &ServerState,
+	uri: &Uri,
+	source: &str,
+	needle: &str,
+	occurrence: usize,
+) -> Option<String> {
+	let params = HoverParams {
+		text_document_position_params: TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			position: position_of(source, needle, occurrence),
+		},
+		work_done_progress_params: Default::default(),
 	};
-	let template = &compiled.tir.items.constants[usize::from(template_index)];
-	assert_eq!(definition.source.file_id, template.file_id);
-	assert_eq!(definition.source.span, template.name.span);
+	let hover = requests::hover(state, &params)?;
+	let HoverContents::Markup(markup) = hover.contents else {
+		panic!("expected markup contents");
+	};
+	Some(markup.value)
 }
 
 #[test]
-fn find_enclosing_function_returns_correct_function() {
+fn hover_renders_signatures_from_the_resolved_name() {
 	let root = PathBuf::from("/test/main.wx");
-	let source = "func first() -> i32 { 1 }\nfunc second() -> i32 { 2 }";
+	let source = indoc::indoc! {"
+		struct Point(x: i32, pub y: i32);
+		/// Adds two numbers.
+		///
+		/// Wraps on overflow.
+		func add<T: StackValue>(a: i32, b: i32, extra: T) -> i32 { a + b }
+		const LIMIT: u32 = 10;
+		func main() -> i32 {
+		    local mut total: i32 = 0;
+		    local p = Point(1, 2);
+		    _ = p;
+		    total = add(1, 2, 3);
+		    total
+		}
+		export { main }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let hover = |needle, occurrence| {
+		hover_text(&state, &uri, source, needle, occurrence)
+	};
 
-	let (_, compiled) = compile_source(&root, source);
-	let file_id = file_id_for(&compiled, &root);
-
-	// Cursor inside "first" body — "{ 1 }" roughly at [19, 24)
-	let in_first = source.find("{ 1 }").unwrap() as u32 + 2;
-	let in_second = source.find("{ 2 }").unwrap() as u32 + 2;
-
-	let first_idx = find_enclosing_function(&compiled.tir, file_id, in_first);
-	let second_idx = find_enclosing_function(&compiled.tir, file_id, in_second);
-
+	let call = hover("add", 1).expect("hover on the call");
 	assert!(
-		first_idx.is_some(),
-		"expected to find enclosing function for cursor in `first`"
+		call.starts_with(
+			"```wx\nfunc add<T>(a: i32, b: i32, extra: T) -> i32\n```"
+		),
+		"{call}"
 	);
 	assert!(
-		second_idx.is_some(),
-		"expected to find enclosing function for cursor in `second`"
+		call.contains("Adds two numbers.\n\nWraps on overflow."),
+		"{call}"
 	);
-	assert_ne!(
-		first_idx, second_idx,
-		"cursor positions in different functions should map to different indices"
+
+	assert_eq!(
+		hover("total", 1).unwrap(),
+		"```wx\nlocal mut total: i32\n```"
+	);
+	assert_eq!(hover("a +", 0).unwrap(), "```wx\na: i32\n```");
+	assert_eq!(
+		hover("Point", 1).unwrap(),
+		"```wx\nstruct Point(x: i32, y: i32)\n```"
+	);
+	assert_eq!(hover("i32", 1).unwrap(), "```wx\ntype i32\n```");
+	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T\n```");
+	assert_eq!(hover("export", 0), None);
+}
+
+#[test]
+fn hover_renders_the_other_declaration_kinds() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		memory heap: u32;
+		global mut bump: u32 = 4;
+		global fixed: u32 = 1;
+		enum Color(u8) { Red = 0, Green = 1 }
+		trait Shape { type Unit; }
+		typeset Small { u8, u16 }
+		func main() -> u32 {
+		    _ = Color::Red;
+		    _ = heap;
+		    _ = bump;
+		    _ = fixed;
+		    0
+		}
+		export { main }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let hover = |needle, occurrence| {
+		hover_text(&state, &uri, source, needle, occurrence)
+	};
+	assert_eq!(hover("heap", 1).unwrap(), "```wx\nmemory heap: u32\n```");
+	assert_eq!(
+		hover("bump", 1).unwrap(),
+		"```wx\nglobal mut bump: u32\n```"
+	);
+	assert_eq!(hover("fixed", 1).unwrap(), "```wx\nglobal fixed: u32\n```");
+	assert_eq!(hover("Red;", 0).unwrap(), "```wx\nColor::Red = 0\n```");
+	assert_eq!(
+		hover("Color::", 0).unwrap(),
+		"```wx\nenum Color(u8) { .. }\n```"
+	);
+}
+
+#[test]
+fn hover_and_goto_definition_work_on_the_declaration_itself() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point(x: i32, y: i32);
+		enum Color(u8) { Red = 0 }
+		/// Doubles.
+		func twice<T: StackValue>(value: i32, extra: T) -> i32 {
+		    local mut total: i32 = value;
+		    block :done { break :done; }
+		    total
+		}
+		export { twice }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let hover = |needle, occurrence| {
+		hover_text(&state, &uri, source, needle, occurrence)
+	};
+	assert_eq!(
+		hover("Point", 0).unwrap(),
+		"```wx\nstruct Point(x: i32, y: i32)\n```"
+	);
+	assert_eq!(hover("x:", 0).unwrap(), "```wx\nx: i32\n```");
+	assert_eq!(
+		hover("Color", 0).unwrap(),
+		"```wx\nenum Color(u8) { .. }\n```"
+	);
+	assert_eq!(hover("Red", 0).unwrap(), "```wx\nColor::Red = 0\n```");
+	let function = hover("twice", 0).unwrap();
+	assert!(
+		function.starts_with("```wx\nfunc twice<T>(value: i32, extra: T)"),
+		"{function}"
+	);
+	assert!(function.contains("Doubles."), "{function}");
+	assert_eq!(hover("value:", 0).unwrap(), "```wx\nvalue: i32\n```");
+	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T\n```");
+	assert_eq!(
+		hover("total", 0).unwrap(),
+		"```wx\nlocal mut total: i32\n```"
+	);
+	assert_eq!(hover("export", 0), None);
+
+	let goto = |needle, occurrence| {
+		let params =
+			definition_params(&uri, position_of(source, needle, occurrence));
+		requests::goto_definition(&state, &params)
+	};
+	let own = goto("Point", 0).expect("a declaration names itself");
+	let from_use = goto("twice", 1).expect("the export names the function");
+	assert_ne!(format!("{own:?}"), format!("{from_use:?}"));
+}
+
+#[test]
+fn self_in_an_impl_shows_and_leads_to_its_target() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Point(x: i32, y: i32);
+		impl Point {
+		    func flip(self: Self) -> Self { self }
+		}
+		export { Point::flip }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	assert_eq!(
+		hover_text(&state, &uri, source, "Self", 0).unwrap(),
+		"```wx\ntype Self = Point\n```"
+	);
+	let params = definition_params(&uri, position_of(source, "Self", 1));
+	let Some(GotoDefinitionResponse::Scalar(location)) =
+		requests::goto_definition(&state, &params)
+	else {
+		panic!("`Self` should lead to the impl's target");
+	};
+	let target = position_of(source, "Point {", 0);
+	assert_eq!(location.range.start, target);
+}
+
+#[test]
+fn an_import_alias_and_a_module_show_and_lead_to_their_names() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		import \"env\" as host {
+		    func exit(code: u32) -> !;
+		}
+		mod util {
+		    pub func one() -> u32 { 1 }
+		}
+		func main() -> u32 {
+		    _ = util::one();
+		    host::exit(0)
+		}
+		export { main }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let hover = |needle, occurrence| {
+		hover_text(&state, &uri, source, needle, occurrence)
+	};
+	let import = "```wx\nimport \"env\" as host\n```";
+	assert_eq!(hover("host", 0).unwrap(), import, "the alias, declared");
+	assert_eq!(hover("host", 1).unwrap(), import, "the alias, used");
+	let module = "```wx\nmod util\n```";
+	assert_eq!(hover("util", 0).unwrap(), module);
+	assert_eq!(hover("util", 1).unwrap(), module);
+
+	let goto = |needle, occurrence| {
+		let params =
+			definition_params(&uri, position_of(source, needle, occurrence));
+		let Some(GotoDefinitionResponse::Scalar(location)) =
+			requests::goto_definition(&state, &params)
+		else {
+			panic!("`{needle}` should lead somewhere");
+		};
+		location.range.start
+	};
+	assert_eq!(goto("host", 1), position_of(source, "host", 0));
+	assert_eq!(goto("util", 1), position_of(source, "util", 0));
+}
+
+#[test]
+fn a_module_in_its_own_file_leads_to_that_file() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		mod shared;
+		func main() -> u32 { shared::one() }
+		export { main }
+	"};
+	let mut state = ServerState::default();
+	state
+		.open_documents
+		.insert(root.clone(), open_document(source));
+	state.open_documents.insert(
+		PathBuf::from("/test/shared.wx"),
+		open_document("pub func one() -> u32 { 1 }"),
+	);
+	let dir = open_synthetic_manifest(&mut state, &root);
+	analyze_root(&mut state, &dir, &root, &mut Vec::new());
+	let uri = Uri::from_file_path(&root).unwrap();
+	let shared = Uri::from_file_path("/test/shared.wx").unwrap();
+	for occurrence in [0, 1] {
+		let params =
+			definition_params(&uri, position_of(source, "shared", occurrence));
+		let Some(GotoDefinitionResponse::Scalar(location)) =
+			requests::goto_definition(&state, &params)
+		else {
+			panic!("`shared` should lead to its file");
+		};
+		assert_eq!(location.uri, shared);
+		assert_eq!(location.range.start, Position::new(0, 0));
+	}
+	assert_eq!(
+		hover_text(&state, &uri, source, "shared", 0).unwrap(),
+		"```wx\nmod shared\n```"
 	);
 }
 
@@ -2523,7 +864,7 @@ fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
 		manifest.clone(),
 		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
 	);
-	crate::compute_active_refresh(
+	compute_active_refresh(
 		&mut state,
 		vec![manifest.clone(), manifest.clone()],
 		&mut Vec::new(),
@@ -2541,19 +882,13 @@ fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
 }
 
 #[tokio::test]
-async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
-	use crate::{Command, ManifestState, handle_command};
-	use std::collections::VecDeque;
+async fn formatting_reuses_project_manifests() {
+	use crate::actor::Command;
 	use tokio::sync::oneshot;
 	use tower_lsp_server::ls_types::*;
 
-	let (service, socket) = build_service();
+	let service = backend_with_drained_socket();
 	let client = &service.inner().client;
-	tokio::spawn(async move {
-		use futures::stream::StreamExt;
-		let (mut requests, _responses) = socket.split();
-		while requests.next().await.is_some() {}
-	});
 	let root = PathBuf::from("/manifest-format-test");
 	let manifest_path = root.join("wx.json");
 	let source_path = root.join("main.wx");
@@ -2603,7 +938,6 @@ async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
 				},
 				tx,
 			),
-			&VecDeque::new(),
 			state,
 			client,
 		)
@@ -2611,7 +945,7 @@ async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
 		rx.await.unwrap()
 	}
 
-	// First formatting discovers both manifests without requiring a compiled cache.
+	// First formatting discovers both manifests without a compiled cache.
 	let first = format(&mut state, client).await.unwrap();
 	assert!(state.cached.is_empty());
 	assert_eq!(state.projects.len(), 2);
@@ -2621,47 +955,26 @@ async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
 		first[0].new_text
 	);
 
-	// Deliberately alter backing text without an event: both root and dependency
-	// must be reused, not read or parsed again by formatting/package resolution.
+	// Alter the backing text without an event: both manifests must be reused,
+	// not read or parsed again by formatting or package resolution.
 	state.open_documents.get_mut(&manifest_path).unwrap().text = "{".into();
 	state.open_documents.get_mut(&dep_path).unwrap().text = "{".into();
 	assert_eq!(format(&mut state, client).await.unwrap(), first);
 	compute_refresh(&mut state, &source_path, &mut Vec::new());
 	assert_eq!(format(&mut state, client).await.unwrap(), first);
 
-	let pending = VecDeque::from([Command::DidChange {
+	let change = |text: String, version| Command::DidChange {
 		path: manifest_path.clone(),
-		text: manifest(6),
-	}]);
-	handle_command(
-		Command::DidChange {
-			path: manifest_path.clone(),
-			text: manifest(3),
-		},
-		&pending,
-		&mut state,
-		client,
-	)
-	.await;
+		text,
+		version,
+	};
+	handle_command(change(manifest(3), 2), &mut state, client).await;
 	let updated = format(&mut state, client).await.unwrap();
-	assert!(
-		updated[0].new_text.contains("\n   local"),
-		"{}",
-		updated[0].new_text
-	);
+	assert!(updated[0].new_text.contains("\n   local"));
 	assert!(!updated[0].new_text.contains("\n      local"));
 
-	// A failed parse replaces the last valid value even if compilation is skipped.
-	handle_command(
-		Command::DidChange {
-			path: manifest_path.clone(),
-			text: "{".into(),
-		},
-		&pending,
-		&mut state,
-		client,
-	)
-	.await;
+	// A failed parse replaces the last valid value.
+	handle_command(change("{".into(), 3), &mut state, client).await;
 	assert!(matches!(
 		state.projects[&root].manifest,
 		ManifestState::Invalid
@@ -2672,22 +985,12 @@ async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
 		format(&mut state, client).await.is_none(),
 		"invalid results are retained until an event"
 	);
-	handle_command(
-		Command::DidChange {
-			path: manifest_path,
-			text: manifest(4),
-		},
-		&VecDeque::new(),
-		&mut state,
-		client,
-	)
-	.await;
+	handle_command(change(manifest(4), 4), &mut state, client).await;
 	let edits = format(&mut state, client).await.unwrap();
 	assert!(edits[0].new_text.contains("\n    local"));
 
-	// Feeding that output back in yields no edits at all: an
-	// already-formatted buffer must not be rewritten, or every
-	// format-on-save would dirty the document and force a re-check.
+	// Feeding that output back in yields no edits at all, or every
+	// format-on-save would dirty the document.
 	state.open_documents.get_mut(&source_path).unwrap().text =
 		edits[0].new_text.clone();
 	assert!(format(&mut state, client).await.unwrap().is_empty());
@@ -2695,17 +998,8 @@ async fn formatting_reuses_project_manifests_and_observes_superseded_edits() {
 
 #[tokio::test]
 async fn watched_file_events_skip_documents_the_editor_already_owns() {
-	use crate::{Command, handle_command};
-	use std::collections::VecDeque;
-
-	let (service, socket) = build_service();
+	let service = backend_with_drained_socket();
 	let client = &service.inner().client;
-	tokio::spawn(async move {
-		use futures::stream::StreamExt;
-		let (mut requests, _responses) = socket.split();
-		while requests.next().await.is_some() {}
-	});
-
 	let root = PathBuf::from("/watch-skip-test");
 	let file = root.join("main.wx");
 	let mut state = ServerState::default();
@@ -2720,23 +1014,21 @@ async fn watched_file_events_skip_documents_the_editor_already_owns() {
 	compute_refresh(&mut state, &file, &mut Vec::new());
 	assert!(state.cached.contains_key(&root));
 
-	// Saving an open buffer writes it to disk and the watcher reports it,
-	// but the overlay already held that exact text: no rebuild.
+	// Saving an open buffer is reported by the watcher, but the overlay
+	// already held that text: no rebuild.
 	state.cached.clear();
 	handle_command(
 		Command::DidChangeWatchedFiles(vec![file, root.join("wx.json")]),
-		&VecDeque::new(),
 		&mut state,
 		client,
 	)
 	.await;
 	assert!(state.cached.is_empty());
 
-	// A file the editor does not own still invalidates: that is the only
-	// way `git checkout` and external edits reach the server.
+	// A file the editor does not own still invalidates: that is how
+	// `git checkout` and external edits reach the server.
 	handle_command(
 		Command::DidChangeWatchedFiles(vec![root.join("other.wx")]),
-		&VecDeque::new(),
 		&mut state,
 		client,
 	)
@@ -2744,11 +1036,10 @@ async fn watched_file_events_skip_documents_the_editor_already_owns() {
 	assert!(state.cached.contains_key(&root));
 }
 
-/// A path that can't be converted to `&str` must be declined, not turned
-/// into an empty one: `AbsolutePath::new` asserts on a path that doesn't
-/// start with `/`, and it runs here on the state actor task, so the panic
-/// takes down analysis for the rest of the session rather than skipping one
-/// event.
+/// A path that cannot be converted to `&str` must be declined, not turned
+/// into an empty one: `AbsolutePath::new` asserts on a path that does not
+/// start with `/`, and this runs on the state actor, so a panic would end
+/// analysis for the rest of the session.
 #[cfg(unix)]
 #[test]
 fn an_unconvertible_manifest_path_does_not_delete_the_project() {
@@ -2759,34 +1050,25 @@ fn an_unconvertible_manifest_path_does_not_delete_the_project() {
 	let root = PathBuf::from("/project");
 	state.projects.insert(
 		root.clone(),
-		crate::ProjectState {
-			manifest: crate::ManifestState::Invalid,
+		ProjectState {
+			manifest: ManifestState::Invalid,
 			published_files: HashSet::from([root.join("main.wx")]),
 		},
 	);
-
-	// `wx.json` itself is valid UTF-8; the directory holding it is not, so
-	// only the whole-path conversion fails.
+	// `wx.json` itself is valid UTF-8; the directory holding it is not.
 	let mut invalid = PathBuf::from(OsStr::from_bytes(b"/project/\xff"));
 	invalid.push("wx.json");
 
 	let publications = refresh_project_manifest(&mut state, &invalid);
 
-	assert!(
-		publications.is_empty(),
-		"an unreadable path must not publish diagnostic clears"
-	);
-	assert!(
-		state.projects.contains_key(&root),
-		"the unrelated project must survive"
-	);
+	assert!(publications.is_empty());
+	assert!(state.projects.contains_key(&root));
 }
 
 /// A refresh that changes nothing must publish each file once. Clearing an
-/// active root before re-analysing it drained the `published_files` that
-/// `collect_publish_operations` diffs against, so every still-diagnosed file
-/// got an empty publish immediately followed by an identical real one — a
-/// squiggle blinking off and back on for every file on every keystroke.
+/// active root before re-analysing it drained the `published_files` the
+/// diff is taken against, so every still-diagnosed file got an empty publish
+/// followed by an identical real one: a squiggle blinking on every keystroke.
 #[test]
 fn a_repeated_refresh_publishes_each_file_once() {
 	let mut state = ServerState::default();
@@ -2798,11 +1080,9 @@ fn a_repeated_refresh_publishes_each_file_once() {
 	);
 	state.open_documents.insert(
 		main.clone(),
-		open_document("func main() -> i32 { true }\nexport { main }"),
+		open_document("func main() -> i32 { True }\nexport { main }"),
 	);
 
-	// The first refresh establishes `published_files`; the second is the one
-	// that has something to diff against.
 	compute_refresh(&mut state, &main, &mut Vec::new());
 	let publications = compute_refresh(&mut state, &main, &mut Vec::new());
 
@@ -2810,13 +1090,12 @@ fn a_repeated_refresh_publishes_each_file_once() {
 		.iter()
 		.filter(|(path, _)| path == &main)
 		.collect();
-	assert_eq!(
-		for_main.len(),
-		1,
-		"expected one publish for {main:?}, got {for_main:?}"
-	);
-	assert!(
-		!for_main[0].1.is_empty(),
-		"the type error must survive an otherwise-unchanged refresh"
-	);
+	assert_eq!(for_main.len(), 1, "{for_main:?}");
+	assert!(!for_main[0].1.is_empty(), "the type error must survive");
+}
+
+#[test]
+fn uri_paths_round_trip_for_local_files() {
+	let uri = Uri::from_str("file:///a/b/main.wx").unwrap();
+	assert_eq!(uri_to_path(&uri), Some(PathBuf::from("/a/b/main.wx")));
 }

@@ -108,7 +108,7 @@ impl Fd {
         local error = loop {
             if rest.len() == 0 { break Errno::Success };
             io_vecs[0] = rest;
-            local error = sys::fd_write(self, io_vecs.*.&, count);
+            local error = sys::fd_write(self, io_vecs, count);
             if error != Errno::Success { break error };
             rest = slices::slice_at(rest, count.*, rest.len() - count.*);
         };
@@ -185,14 +185,13 @@ pub func try_args(arena: heap::*Arena) -> (Errno, heap::&[heap::&[u8]]) {
     if error != Errno::Success { return (error, []) };
     local arguments = arena.allocate_slice_uninit::<heap::&[u8]>(total);
 
-    local bytes = text.*.&;
     local mut next: u32 = 0;
     local mut start: u32 = 0;
     local mut at: u32 = 0;
     loop {
-        if at == bytes.len() { break };
-        if bytes[at] == '\0' {
-            arguments[next] = slices::slice_at(bytes, start, at - start);
+        if at == text.len() { break };
+        if text[at] == '\0' {
+            arguments[next] = slices::slice_at(text, start, at - start);
             next += 1;
             start = at + 1;
         }

@@ -29,7 +29,7 @@ use crate::tir::members::{
 	ApplicableMember, MemberLookup, TraitImplLookup, TraitMemberSelection,
 	report_ambiguous_type_member,
 };
-use crate::tir::resolutions::{Referent, Site};
+use crate::tir::resolutions::{Reference, Site};
 use crate::tir::satisfaction::{
 	TypeArgsNotAllowedOn, report_type_args_not_allowed,
 };
@@ -595,7 +595,7 @@ impl BodyBuilder<'_, '_> {
 		};
 		self.sema.resolutions.record(
 			Site::Value(reference),
-			Referent::Member(found.selected_kind(&self.sema.decls)),
+			Reference::Member(found.selected_kind(&self.sema.decls)),
 		);
 		self.check_member_access(found, key, member);
 		let receiver = self.context().normalized(receiver);
@@ -946,7 +946,7 @@ impl BodyBuilder<'_, '_> {
 
 	/// The exclusive pointer `receiver` to `to` in `memory`, as a shared one:
 	/// `receiver.*.&`.
-	fn shared_receiver(
+	pub(super) fn shared_receiver(
 		&mut self,
 		receiver: ExprIdx,
 		to: TypeIndex,

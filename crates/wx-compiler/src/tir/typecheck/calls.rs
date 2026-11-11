@@ -28,7 +28,7 @@ use crate::tir::decls::{
 	MemberOwner, StructIdx,
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::resolutions::{AccessKind, ArgumentLabel, Reference, Site};
+use crate::tir::resolutions::{AccessKind, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
@@ -805,22 +805,19 @@ impl BodyBuilder<'_, '_> {
 				continue;
 			};
 			let label = match target.kind {
-				CallTargetKind::Function(function) => {
-					ArgumentLabel::Parameter {
-						function: naming_declaration(self.sema, function),
-						parameter: param,
-					}
-				}
-				CallTargetKind::StructConstructor(owner) => {
-					ArgumentLabel::Field {
-						owner,
-						field: FieldIdx::new(u32::from(param)),
-					}
-				}
+				CallTargetKind::Function(function) => Reference::Parameter {
+					function: naming_declaration(self.sema, function),
+					parameter: param,
+				},
+				CallTargetKind::StructConstructor(owner) => Reference::Field {
+					owner,
+					field: FieldIdx::new(u32::from(param)),
+					access: AccessKind::Initialize,
+				},
 			};
-			self.sema.resolutions.record_reference(
+			self.sema.resolutions.record(
 				Site::Label(SourceSpan::new(self.scope.file_id, name.span)),
-				Reference::ArgumentLabel(label),
+				label,
 			);
 			if let Some(&(_, first)) =
 				named.iter().find(|&&(named, _)| named == param)

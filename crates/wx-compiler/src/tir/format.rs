@@ -27,7 +27,7 @@ use super::types::{GenericEnvArena, Type, TypeIndex, TypeInterner};
 /// The bytes a type may take in a message, as rustc shortens a long type.
 const TYPE_DISPLAY_BUDGET: usize = 64;
 
-pub(super) struct TypeFormatter<'a> {
+pub struct TypeFormatter<'a> {
 	pub(super) types: &'a TypeInterner,
 	pub(super) decls: &'a Declarations,
 	pub(super) strings: &'a StringInterner,
@@ -42,13 +42,13 @@ pub(super) struct TypeFormatter<'a> {
 /// Formats declared source bounds, preserving their order and bindings.
 /// Implied bounds are merged requirements and cannot be rendered by reading
 /// only their originating source occurrences.
-pub(super) struct BoundFormatter<'a> {
+pub struct BoundFormatter<'a> {
 	type_formatter: TypeFormatter<'a>,
 	bounds: &'a BoundArena,
 }
 
 impl Semantics {
-	pub(super) fn type_formatter<'a>(
+	pub fn type_formatter<'a>(
 		&'a self,
 		strings: &'a StringInterner,
 	) -> TypeFormatter<'a> {
@@ -61,7 +61,7 @@ impl Semantics {
 		}
 	}
 
-	pub(super) fn bound_formatter<'a>(
+	pub fn bound_formatter<'a>(
 		&'a self,
 		strings: &'a StringInterner,
 	) -> BoundFormatter<'a> {
@@ -73,13 +73,13 @@ impl Semantics {
 }
 
 impl BoundFormatter<'_> {
-	pub(super) fn display_bound(&self, bound: BoundId) -> String {
+	pub fn display_bound(&self, bound: BoundId) -> String {
 		let mut buffer = String::new();
 		self.write_bound(&mut buffer, bound);
 		buffer
 	}
 
-	pub(super) fn display_bounds(&self, bounds: &[BoundId]) -> String {
+	pub fn display_bounds(&self, bounds: &[BoundId]) -> String {
 		let mut buffer = String::new();
 		self.write_bounds(&mut buffer, bounds);
 		buffer
@@ -148,7 +148,7 @@ impl BoundFormatter<'_> {
 }
 
 impl TypeFormatter<'_> {
-	pub(super) fn display_type(&self, ty: TypeIndex) -> String {
+	pub fn display_type(&self, ty: TypeIndex) -> String {
 		let mut buffer = String::new();
 		self.write_type(&mut buffer, ty);
 		buffer
@@ -156,7 +156,7 @@ impl TypeFormatter<'_> {
 
 	/// Writes `ty` at the end of `f`, within `budget` bytes of where it
 	/// starts.
-	pub(super) fn write_type(&self, f: &mut String, ty: TypeIndex) {
+	pub fn write_type(&self, f: &mut String, ty: TypeIndex) {
 		let limit = f.len().saturating_add(self.budget);
 		self.write_part(f, limit, ty);
 	}
@@ -339,7 +339,7 @@ impl TypeFormatter<'_> {
 
 	/// `constant` with `args`: a trait's declaration over its `Self` as a
 	/// projection is (`<T as Array>::LEN`), any other with its arguments.
-	pub(super) fn display_constant(
+	pub fn display_constant(
 		&self,
 		constant: ConstIdx,
 		args: &[TypeIndex],

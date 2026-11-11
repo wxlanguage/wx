@@ -71,7 +71,7 @@ use super::imports::{
 	report_ambiguous_identifier, report_cannot_use_as_namespace,
 	report_private_identifier,
 };
-use super::resolutions::{NameResolutions, Referent, Site};
+use super::resolutions::{NameResolutions, Reference, Site};
 use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 
 /// The result of walking a whole path. `stopped_with` is the answer for
@@ -231,7 +231,7 @@ impl<'r> PathResolver<'r> {
 								seg_tier,
 								SourceSpan::new(file_id, segment.ident.span),
 							),
-							Referent::from_lookup(decl_key, *import),
+							Reference::from_lookup(decl_key, *import),
 						);
 					}
 					if first_inaccessible.is_none()

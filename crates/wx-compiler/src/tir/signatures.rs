@@ -57,7 +57,7 @@ use super::members::{
 use super::obligations::{BoundRequirements, TypeObligation};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
-use super::resolutions::{NameResolutions, Referent, Site};
+use super::resolutions::{NameResolutions, Reference, Site};
 use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 use super::solver::{ImplMember, Solver, SolverError};
 use super::typecheck::{BodyBuilder, BodyContext};
@@ -109,8 +109,8 @@ impl BindingOccurrenceKind<'_> {
 }
 
 pub struct TypeAliasSignature {
-	type_params: GenericEnvIdx,
-	target: TypeIndex,
+	pub type_params: GenericEnvIdx,
+	pub target: TypeIndex,
 }
 
 /// A trait's own resolved header: `trait X: Y + Z { ... }`. Member
@@ -131,13 +131,13 @@ pub struct FunctionSignature {
 	/// The signature's scope scope, including enclosing impl/trait frames.
 	/// Without own parameters this is the parent's scope. Bounds remain in
 	/// the registry's parameter table; body assumptions use this same scope.
-	pub(super) type_params: GenericEnvIdx,
+	pub type_params: GenericEnvIdx,
 	/// The parameter types as written, `self` included: a run of the
 	/// interner's lists, which the function's `Call::Args` tuple is built
 	/// from.
-	pub(super) param_types: TypeList,
+	pub param_types: TypeList,
 	/// `TypeIndex::UNIT` when the source omits `-> Result`.
-	pub(super) return_type: TypeIndex,
+	pub return_type: TypeIndex,
 }
 
 /// Field *types* only — names/dedup/lookup already settled in
@@ -145,10 +145,10 @@ pub struct FunctionSignature {
 /// that struct has, so record vs. tuple doesn't need re-deriving here.
 pub struct StructSignature {
 	/// See `TypeAliasSignature::type_params`.
-	pub(super) type_params: GenericEnvIdx,
+	pub type_params: GenericEnvIdx,
 	/// The field types as written, in declaration order: a run of the
 	/// interner's lists, like a function's `param_types`.
-	pub(super) field_types: TypeList,
+	pub field_types: TypeList,
 }
 
 /// The repr every variant's value is held in. A variant is a constant
@@ -157,7 +157,7 @@ pub struct StructSignature {
 /// a non-integer type — either way already diagnosed once, here, when that
 /// happened.
 pub struct EnumSignature {
-	pub(super) repr: TypeIndex,
+	pub repr: TypeIndex,
 }
 
 /// Resolved member types only — identity (the backing trait, the
@@ -176,10 +176,10 @@ pub struct TypeSetSignature {
 /// which doesn't exist in this architecture yet (see `EnumSignature::repr`,
 /// deferred for the identical reason).
 pub struct ConstantSignature {
-	pub(super) ty: TypeIndex,
+	pub ty: TypeIndex,
 	/// The type scope the constant is declared in, where its type and
 	/// initializer are read.
-	pub(super) env: GenericEnvIdx,
+	pub env: GenericEnvIdx,
 }
 
 /// One `AssocTypeIdx`'s resolved signature. `declared_bounds`/
@@ -191,12 +191,12 @@ pub struct ConstantSignature {
 /// Each impl definition has a separate `AssocTypeIdx` from its declaration;
 /// only the declaration carries bounds and clauses.
 pub struct AssocTypeSignature {
-	pub(super) declared_bounds: Box<[BoundId]>,
+	pub declared_bounds: Box<[BoundId]>,
 	/// What the declaration assumes about `<Self as Trait>::Name`
 	/// (`BoundClauses`); its memberships can be read while equality values
 	/// are still being resolved.
 	pub(super) clauses: BoundClauses,
-	pub(super) value: Option<TypeIndex>,
+	pub value: Option<TypeIndex>,
 }
 
 /// The resolved header of `impl<...> Target { ... }`. Member signatures are
@@ -503,33 +503,33 @@ pub struct Semantics {
 	/// can re-enter body checking.
 	pub(super) solver: Solver,
 
-	pub(super) decls: Declarations,
+	pub decls: Declarations,
 	/// Built before the signature sweep and never mutated by its queries.
 	pub(super) impl_dispatch: ImplDispatch,
 	/// The trait and method each overloadable operator dispatches through.
 	pub(super) operators: OperatorTraits,
 
 	// The resolved data below is read across the sibling TIR modules.
-	pub(super) types: TypeInterner,
+	pub types: TypeInterner,
 	pub(super) bounds: BoundArena,
 	/// What each parameter and associated declaration assumes, flat
 	/// (`BoundClauses`).
 	pub(super) clauses: ClauseArena,
-	pub(super) generic_envs: GenericEnvArena,
+	pub generic_envs: GenericEnvArena,
 	/// What each scope's bounds state (`bounds::AssumptionEnvArena`), kept apart
 	/// from the frames' identities in `generic_envs`. Grown once per frame,
 	/// right after `push_param_frame` created it.
 	pub(super) assumption_envs: AssumptionEnvArena,
 	/// Every use's generic arguments, with where each is given.
 	pub(super) generic_args: GenericArgArena,
-	pub(super) type_aliases: Vec<TypeAliasSignature>,
-	pub(super) traits: Vec<TraitSignature>,
-	pub(super) structs: Vec<StructSignature>,
-	pub(super) enums: Vec<EnumSignature>,
+	pub type_aliases: Vec<TypeAliasSignature>,
+	pub traits: Vec<TraitSignature>,
+	pub structs: Vec<StructSignature>,
+	pub enums: Vec<EnumSignature>,
 	pub(super) typesets: Vec<TypeSetSignature>,
-	pub(super) assoc_types: Vec<Option<AssocTypeSignature>>,
-	pub(super) functions: Vec<FunctionSignature>,
-	pub(super) constants: Vec<ConstantSignature>,
+	pub assoc_types: Vec<Option<AssocTypeSignature>>,
+	pub functions: Vec<FunctionSignature>,
+	pub constants: Vec<ConstantSignature>,
 	/// Every checked body: function blocks, constant and global
 	/// initializers. Each owner's table holds the index of its own (a
 	/// `BodyOwner` column beside it, for the reverse lookup the LSP will
@@ -553,8 +553,8 @@ pub struct Semantics {
 	/// its body is checked and evaluated, and for an imported global or one
 	/// whose evaluation failed (reported).
 	pub(super) global_values: Vec<Option<super::eval::ConstValue>>,
-	pub(super) inherent_impls: Vec<Option<InherentImplSignature>>,
-	pub(super) trait_impls: Vec<Option<TraitImplSignature>>,
+	pub inherent_impls: Vec<Option<InherentImplSignature>>,
+	pub trait_impls: Vec<Option<TraitImplSignature>>,
 	/// Resolved, exportable targets keyed by decoded external name; filled by `SemanticsBuilder::build`.
 	pub(super) exports: FxHashMap<SymbolU32, ExportedItem>,
 }
@@ -1499,28 +1499,6 @@ fn report_duplicate_generic_param(
 			SourceSpan::new(file_id, first.span)
 				.secondary_label()
 				.with_message(format!("first use of `{name_str}`")),
-		)
-}
-
-fn report_duplicate_function_param(
-	strings: &StringInterner,
-	file_id: FileId,
-	name: Spanned<SymbolU32>,
-	first: Spanned<SymbolU32>,
-) -> Diagnostic<FileId> {
-	let name_str = strings.resolve(name.inner).unwrap();
-	Diagnostic::error()
-		.with_code(DiagnosticCode::DuplicateDefinition.code())
-		.with_message(format!(
-			"identifier `{name_str}` is bound more than once in this parameter list"
-		))
-		.with_label(SourceSpan::new(file_id, name.span).primary_label())
-		.with_label(
-			SourceSpan::new(file_id, first.span)
-				.secondary_label()
-				.with_message(format!(
-					"first use of `{name_str}` as a parameter"
-				)),
 		)
 }
 
@@ -4217,7 +4195,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.resolve(scope.generic_env, first.ident.inner)
 		{
 			sema.resolutions
-				.record(site, Referent::TypeParam { env: frame, index });
+				.record(site, Reference::TypeParam { env: frame, index });
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
 				for arg in &first.type_args {
@@ -4250,9 +4228,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 				site,
 				match impl_kind {
 					ImplKind::Inherent(index) => {
-						Referent::InherentImplSelf(index)
+						Reference::InherentImplSelf(index)
 					}
-					ImplKind::Trait(index) => Referent::TraitImplSelf(index),
+					ImplKind::Trait(index) => Reference::TraitImplSelf(index),
 				},
 			);
 			if !first.type_args.is_empty() {
@@ -5888,7 +5866,7 @@ pub(super) mod tests {
 		Declarations, MemberOwner, Namespace, Scope, UseItemKind,
 	};
 	use crate::tir::impls::ImplTarget;
-	use crate::tir::resolutions::{Reference, Site};
+	use crate::tir::resolutions::{Reference, Route, Site};
 	use crate::tir::solver::{NormalizationDepth, RewriteFlags, Verdict};
 	use crate::vfs;
 
@@ -5946,21 +5924,22 @@ pub(super) mod tests {
 				case.sema.resolutions.get(site).unwrap_or_else(|| {
 					panic!("`{name}` in `{context}` is not recorded")
 				});
-			let Reference::Name(referent) = resolution else {
-				panic!("expected a single referent");
-			};
-			referent
+			resolution
 		};
-		let declared = |referent: Referent| {
-			let Referent::Declaration(decl_key) = referent else {
+		let declared = |referent: Reference| {
+			let Reference::Item {
+				item: decl_key,
+				route: Route::Direct,
+			} = referent
+			else {
 				panic!("expected a declared definition, got {referent:?}");
 			};
 			decl_key.symbol_kind(&case.sema.decls)
 		};
-		let imported = |referent: Referent| {
-			let Referent::Import {
-				declaration,
-				import,
+		let imported = |referent: Reference| {
+			let Reference::Item {
+				item: declaration,
+				route: Route::Import(import),
 			} = referent
 			else {
 				panic!("expected an imported definition, got {referent:?}");
@@ -5970,8 +5949,8 @@ pub(super) mod tests {
 				&case.sema.decls.use_items[usize::from(import)].kind,
 			)
 		};
-		let assoc_a = |referent: Referent| {
-			let Referent::Member(MemberKind::AssociatedType(index)) = referent
+		let assoc_a = |referent: Reference| {
+			let Reference::Member(MemberKind::AssociatedType(index)) = referent
 			else {
 				panic!("expected an associated type, got {referent:?}");
 			};
@@ -5985,7 +5964,7 @@ pub(super) mod tests {
 		let struct_s = DeclKind::Struct(case.struct_index("m::S"));
 		let struct_g = DeclKind::Struct(case.struct_index("g::G"));
 		let tr = DeclKind::Trait(case.trait_index("m::Tr"));
-		let param_t = Referent::TypeParam {
+		let param_t = Reference::TypeParam {
 			env: case.function_signature("f").type_params,
 			index: 0,
 		};
@@ -10944,9 +10923,7 @@ pub(super) mod tests {
 					// The selected definition is what the written name means.
 					assert_eq!(
 						sema.resolutions.get(Site::Value(reference)),
-						Some(Reference::Name(Referent::Member(
-							MemberKind::Function(actual)
-						)))
+						Some(Reference::Member(MemberKind::Function(actual)))
 					);
 				}
 				// No declaration exists for this impl member, so it must not
@@ -18762,32 +18739,27 @@ pub(super) mod tests {
 					.find(
 						|(site, _)| matches!(site, Site::Type(site) if site.span == span),
 					)
-					.map(|(_, reference)| {
-						let Reference::Name(referent) = *reference else {
-							panic!("expected a single referent");
-						};
-						referent
-					})
+					.map(|(_, reference)| *reference)
 			})
 			.collect();
-		assert!(matches!(referents[0], Some(Referent::TypeParam { .. })));
+		assert!(matches!(referents[0], Some(Reference::TypeParam { .. })));
 		assert_eq!(
 			referents[1..],
 			[
 				// `self: Self` and `-> Self` in each inherent impl.
-				Some(Referent::InherentImplSelf(
+				Some(Reference::InherentImplSelf(
 					case.inherent_impl_index("Wrap")
 				)),
-				Some(Referent::InherentImplSelf(
+				Some(Reference::InherentImplSelf(
 					case.inherent_impl_index("Wrap")
 				)),
-				Some(Referent::InherentImplSelf(
+				Some(Reference::InherentImplSelf(
 					case.inherent_impl_index("Plain")
 				)),
-				Some(Referent::InherentImplSelf(
+				Some(Reference::InherentImplSelf(
 					case.inherent_impl_index("Plain")
 				)),
-				Some(Referent::TraitImplSelf(
+				Some(Reference::TraitImplSelf(
 					case.trait_impl_index("Plain", "Service")
 				)),
 			]

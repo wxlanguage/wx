@@ -14,15 +14,14 @@ pub const HEX_LEN: u32 = 8;
 /// `value` in decimal, written at the end of `buffer`, which must hold
 /// `DECIMAL_LEN` bytes.
 pub func decimal<M: Memory>(buffer: M::*[u8], mut value: u32) -> M::&[u8] {
-    local view = buffer.*.&;
-    local mut at = view.len();
+    local mut at = buffer.len();
     loop {
         at -= 1;
         buffer[at] = transmute('0' + value % 10);
         value /= 10;
         if value == 0 { break };
     }
-    slices::slice_at(view, at, view.len() - at)
+    slices::slice_at(buffer, at, buffer.len() - at)
 }
 
 /// `value` in decimal with a minus sign when negative, written at the end of
@@ -31,17 +30,15 @@ pub func signed<M: Memory>(buffer: M::*[u8], value: i32) -> M::&[u8] {
     if value >= 0 { return decimal::<M>(buffer, transmute(value)) };
     // The magnitude as a `u32`, which also holds that of the smallest `i32`.
     local digits = decimal::<M>(buffer, 0 - transmute::<i32, u32>(value));
-    local view = buffer.*.&;
-    local at = view.len() - digits.len() - 1;
+    local at = buffer.len() - digits.len() - 1;
     buffer[at] = '-';
-    slices::slice_at(view, at, digits.len() + 1)
+    slices::slice_at(buffer, at, digits.len() + 1)
 }
 
 /// `value` in lowercase hexadecimal without leading zeros, written at the end
 /// of `buffer`, which must hold `HEX_LEN` bytes.
 pub func hex<M: Memory>(buffer: M::*[u8], mut value: u32) -> M::&[u8] {
-    local view = buffer.*.&;
-    local mut at = view.len();
+    local mut at = buffer.len();
     loop {
         at -= 1;
         local digit = value % 16;
@@ -54,5 +51,5 @@ pub func hex<M: Memory>(buffer: M::*[u8], mut value: u32) -> M::&[u8] {
         value /= 16;
         if value == 0 { break };
     }
-    slices::slice_at(view, at, view.len() - at)
+    slices::slice_at(buffer, at, buffer.len() - at)
 }

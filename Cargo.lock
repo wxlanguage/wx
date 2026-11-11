@@ -2229,8 +2229,10 @@ dependencies = [
  "serde",
  "serde_json",
  "string-interner",
+ "tokio",
  "wx-compiler",
  "wx-fmt",
+ "wx-lsp",
 ]
 
 [[package]]

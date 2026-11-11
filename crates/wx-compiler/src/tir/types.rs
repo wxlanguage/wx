@@ -121,7 +121,7 @@ impl TypeIndex {
 /// value (an address as its memory's `Size`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Primitive {
+pub enum Primitive {
 	U8,
 	I8,
 	U16,
@@ -157,7 +157,7 @@ impl Primitive {
 	}
 
 	/// An operator on it reads it signed.
-	pub(super) fn is_signed(self) -> bool {
+	pub fn is_signed(self) -> bool {
 		matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
 	}
 
@@ -1314,7 +1314,12 @@ impl TypeInterner {
 					memory: other_memory,
 					ownership: other_ownership,
 				},
-			) if ownership == other_ownership => {
+			) if ownership == other_ownership
+				// An exclusive pointer is accepted where a shared one is
+				// declared (`expect` converts it), so it teaches as one.
+				|| (ownership == crate::ast::Ownership::Shared
+					&& other_ownership == crate::ast::Ownership::Exclusive) =>
+			{
 				self.learn(envs, env, slots, to, other_to);
 				self.learn(envs, env, slots, memory, other_memory);
 			}
@@ -1702,7 +1707,7 @@ enum GenericEnv {
 /// or invalidating the `GenericEnvIdx` of — anything the outer call already
 /// holds, the exact same guarantee `TypeInterner::intern` already gives for
 /// `TypeIndex`.
-pub(super) struct GenericEnvArena {
+pub struct GenericEnvArena {
 	envs: Vec<GenericEnv>,
 	/// Each frame's own parameter names.
 	names: Vec<Spanned<SymbolU32>>,
@@ -1777,10 +1782,14 @@ impl GenericEnvArena {
 	/// The names of `env`'s own parameters. A declaration without generics
 	/// has no frame of its own and stores `ROOT`, which declares none.
 	#[inline]
-	pub(super) fn param_names(
-		&self,
-		env: GenericEnvIdx,
-	) -> &[Spanned<SymbolU32>] {
+	/// Every frame that declares parameters of its own.
+	pub fn frames(&self) -> impl Iterator<Item = GenericEnvIdx> + '_ {
+		(0..self.envs.len())
+			.map(|index| GenericEnvIdx::new(index as u32))
+			.filter(|&env| !self.param_names(env).is_empty())
+	}
+
+	pub fn param_names(&self, env: GenericEnvIdx) -> &[Spanned<SymbolU32>] {
 		match self.envs[usize::from(env)] {
 			GenericEnv::Frame {
 				len, names_start, ..

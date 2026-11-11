@@ -50,7 +50,7 @@ impl ScopeIdx {
 /// The definition a body belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum BodyOwner {
+pub enum BodyOwner {
 	Const(ConstIdx),
 	Function(FunctionIdx),
 	Global(GlobalIdx),
@@ -517,17 +517,17 @@ pub(super) struct Scope {
 /// A label written on a block or a loop.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct Label {
-	pub(super) name: Spanned<SymbolU32>,
+pub struct Label {
+	pub name: Spanned<SymbolU32>,
 }
 
 /// A function's parameter, or a name a `local` declares.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct Local {
-	pub(super) name: Spanned<SymbolU32>,
-	pub(super) ty: TypeIndex,
-	pub(super) mut_span: Option<TextSpan>,
+pub struct Local {
+	pub name: Spanned<SymbolU32>,
+	pub ty: TypeIndex,
+	pub mut_span: Option<TextSpan>,
 }
 
 /// A location in linear memory. Every place is reached through a pointer, so
@@ -562,7 +562,7 @@ pub(super) enum PlaceKind {
 
 /// One definition's checked expression tree.
 #[derive(Default)]
-pub(super) struct Body {
+pub struct Body {
 	kinds: Vec<ExprKind>,
 	types: Vec<TypeIndex>,
 	spans: Vec<TextSpan>,
@@ -630,21 +630,26 @@ impl Body {
 		self.scopes.len()
 	}
 
-	pub(super) fn label(&self, label: LabelIdx) -> &Label {
+	pub fn label(&self, label: LabelIdx) -> &Label {
 		&self.labels[usize::from(label)]
 	}
 
-	pub(super) fn local(&self, local: LocalIdx) -> &Local {
+	pub fn local(&self, local: LocalIdx) -> &Local {
 		&self.locals[usize::from(local)]
 	}
 
 	/// Every local, in declaration order (`LocalIdx` order).
-	pub(super) fn locals(&self) -> &[Local] {
+	pub fn locals(&self) -> &[Local] {
 		&self.locals
 	}
 
+	/// Every label, in declaration order (`LabelIdx` order).
+	pub fn labels(&self) -> &[Label] {
+		&self.labels
+	}
+
 	/// The local each parameter binds, `None` for an unnamed one.
-	pub(super) fn params(&self) -> &[Option<LocalIdx>] {
+	pub fn params(&self) -> &[Option<LocalIdx>] {
 		&self.params
 	}
 
