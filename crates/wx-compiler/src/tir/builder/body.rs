@@ -824,10 +824,6 @@ impl<'ast> Builder<'ast, '_> {
 				.build_index_expression(
 					func_ctx, access_ctx, expr.span, object, index,
 				),
-			ast::Expression::SliceRange { object, start, end } => self
-				.build_slice_range_expression(
-					func_ctx, expr.span, object, start, end,
-				),
 			ast::Expression::AddressOf { value } => {
 				let operand = self.build_expression(
 					func_ctx,

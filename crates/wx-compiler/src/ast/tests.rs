@@ -3402,7 +3402,7 @@ fn test_unary_binds_tighter_than_any_binary_operator() {
 	}
 }
 
-// ── indexing, slicing and array literals ─────────────────────────────────────
+// ── indexing and array literals ─────────────────────────────────────
 
 #[test]
 fn test_index_and_array_literal_expressions() {
@@ -3435,42 +3435,14 @@ fn test_index_and_array_literal_expressions() {
 		ConstArgument::Literal(Literal::Int(8))
 	));
 
-	// a single subscript is an `Index`, never a one-bound `SliceRange`
+	// A subscript is an index expression.
 	assert!(matches!(
 		local_definition_value(statements, 2),
 		Expression::Index { .. }
 	));
 }
 
-#[test]
-fn test_slice_range_bounds_are_independently_optional() {
-	let case = TestCase::new(indoc! {"
-        func f(a: &[i32]) {
-            local both = a[1..3];
-            local from = a[1..];
-            local to   = a[..3];
-            local all  = a[..];
-        }
-    "});
-	case.diagnostics().assert_none();
-	let statements = case.function_block(0);
-
-	let bounds = |index: usize| {
-		let Expression::SliceRange { start, end, .. } =
-			local_definition_value(statements, index)
-		else {
-			panic!("expected a slice range")
-		};
-		(start.is_some(), end.is_some())
-	};
-	assert_eq!(bounds(0), (true, true), "a[1..3]");
-	assert_eq!(bounds(1), (true, false), "a[1..]");
-	assert_eq!(bounds(2), (false, true), "a[..3]");
-	assert_eq!(bounds(3), (false, false), "a[..]");
-}
-
 // ── qualified and grouped paths ──────────────────────────────────────────────
-
 #[test]
 fn test_qualified_path_records_its_trait_and_grouped_does_not() {
 	// The two forms differ only in whether a trait disambiguates the item, so

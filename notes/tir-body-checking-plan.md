@@ -814,8 +814,9 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
 
 ### 3. Think first
 
-- **Pointers and memory**: array literals and repeats (static data), indexing,
-  slice ranges. There is no ambient memory: a pointer type always names its
+- **Pointers and memory**: array literals and repeats (static data), indexing.
+  Slice range syntax has been removed; future range syntax will construct a
+  proper range type. There is no ambient memory: a pointer type always names its
   memory (`heap::*T`, `Mem::*T`; an untagged one is `PointerWithoutMemory`,
   E2038), and the compiler never picks one from how many are declared. A
   literal that becomes static data takes its type, and so its memory, from its

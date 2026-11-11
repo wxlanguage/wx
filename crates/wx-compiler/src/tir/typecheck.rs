@@ -688,9 +688,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::ArrayRepeat { value, count } => {
 				self.build_array_repeat(value, count, expected, span)
 			}
-			ast::Expression::SliceRange { .. } => {
-				self.unsupported(span, "a slice range")
-			}
 		}
 	}
 
@@ -6570,19 +6567,6 @@ mod tests {
 			DiagnosticCode::UndeclaredIdentifier,
 			DiagnosticCode::TypeMistmatch,
 		]);
-	}
-
-	#[test]
-	fn an_unsupported_form_is_reported_once_as_a_bug() {
-		let case = TestCase::new(indoc! {"
-				memory heap: u32;
-				func f(s: heap::&[u8]) -> heap::&[u8] {
-					s[1..]
-				}
-			"});
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
-		assert_eq!(case.shape("f"), "(block => error)");
 	}
 
 	#[test]

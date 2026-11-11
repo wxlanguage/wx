@@ -2703,20 +2703,6 @@ impl<'a> Builder<'a> {
 				let close = self.text(Text::RBracket);
 				self.arena.concat4(obj_id, open, idx, close)
 			}
-			ast::Expression::SliceRange { object, start, end } => {
-				let obj_id = self.build_expression(object);
-				let mut parts: Vec<NodeId> =
-					vec![obj_id, self.text(Text::LBracket)];
-				if let Some(s) = start {
-					parts.push(self.build_expression(s));
-				}
-				parts.push(self.text(Text::DotDot));
-				if let Some(e) = end {
-					parts.push(self.build_expression(e));
-				}
-				parts.push(self.text(Text::RBracket));
-				self.arena.concat(parts)
-			}
 			ast::Expression::Tuple { elements } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::LParen)];
 

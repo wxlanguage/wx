@@ -920,7 +920,7 @@ impl<'src> Lexer<'src> {
 				Some('0'..='9' | '_') => cursor = probe,
 				Some('.') if !seen_dot => {
 					// `probe` is now past the `.`; don't consume it if the
-					// next char is also `.` (the `..` range operator).
+					// next char is also `.` (the `..` token).
 					if probe.clone().next() == Some('.') {
 						break;
 					}
@@ -1331,16 +1331,6 @@ pub enum Expression {
 	Index {
 		object: Box<Spanned<Expression>>,
 		index: Box<Spanned<Expression>>,
-	},
-	/// `expr[start..end]` — exclusive slice range; either bound may be absent.
-	/// `expr[..]` = `start:None, end:None`
-	/// `expr[i..]` = `start:Some(i), end:None`
-	/// `expr[..n]` = `start:None, end:Some(n)`
-	/// `expr[i..n]` = `start:Some(i), end:Some(n)`
-	SliceRange {
-		object: Box<Spanned<Expression>>,
-		start: Option<Box<Spanned<Expression>>>,
-		end: Option<Box<Spanned<Expression>>>,
 	},
 }
 
@@ -5041,34 +5031,8 @@ impl<'ctx> Parser<'ctx> {
 		_: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
 		_ = parser.lexer.next(); // consume `[`
+		let index = Box::new(parser.parse_expression(BindingPower::Default)?);
 
-		// Detect slice-range form: `[..]`, `[i..]`, `[..n]`, `[i..n]`
-		let start = if parser.lexer.peek().inner == Token::DotDot {
-			None
-		} else {
-			Some(Box::new(parser.parse_expression(BindingPower::Default)?))
-		};
-
-		if parser.lexer.next_if(Token::DotDot).is_some() {
-			let end = if parser.lexer.peek().inner == Token::CloseBracket {
-				None
-			} else {
-				Some(Box::new(parser.parse_expression(BindingPower::Default)?))
-			};
-			let close_span = parser.next_expect(Token::CloseBracket)?.span;
-			let span = TextSpan::new(object.span.start, close_span.end);
-			return Ok(Spanned {
-				inner: Expression::SliceRange {
-					object: Box::new(object),
-					start,
-					end,
-				},
-				span,
-			});
-		}
-
-		// Plain index: `[expr]`
-		let index = start.expect("no DotDot consumed so start must be Some");
 		let close_span = parser.next_expect(Token::CloseBracket)?.span;
 		let span = TextSpan::new(object.span.start, close_span.end);
 		Ok(Spanned {

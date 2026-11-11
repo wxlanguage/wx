@@ -1,5 +1,4 @@
-// Sub-slices, until a slice range (`bytes[start..end]`) is checked by the
-// compiler. This is the one place that builds a slice from parts.
+// Sub-slices built explicitly from a starting address and length.
 
 /// The `length` elements of `bytes` from `start`. Traps if they are not all
 /// inside `bytes`.

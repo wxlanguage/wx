@@ -955,14 +955,6 @@ pub fn lower(
 // 		memory: TypeIndex,
 // 	},
 
-// 	/// `object[start..end]` — exclusive slice range.
-// 	/// `None` means the bound was omitted: `start = None` is `0`, `end = None`
-// 	/// is the object's length.  MIR fills these in during lowering.
-// 	SliceRange {
-// 		object: Box<Expression>,
-// 		start: Option<Box<Expression>>,
-// 		end: Option<Box<Expression>>,
-// 	},
 // 	/// Load a value from a memory place (`place.*` or `place.field`, etc.).
 // 	Load {
 // 		place: Box<Place>,
