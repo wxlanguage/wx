@@ -32,12 +32,13 @@ written for a model (build a `SignatureBuilder`, freeze it into a
 
 ### Tests
 
-`signatures.rs` tests keep the inputs on their own stack:
-`test_case!(case = "source")` (also `mut case`, and `case from <graph>`)
-declares the graph, `TestInputs`, and a swept `TestCase` as three locals.
-`checked_case!` additionally asserts a clean parse and link. Read state through
-`case.context.<field>`. `satisfaction.rs` uses a closure (`with_resolved`)
-that hands out the live `&mut TypeContext`.
+Each suite's `TestCase` owns what it was checked from: `TestCase::new("source")`
+returns the files, the interner and the `Semantics` that `tir::check` produced
+(`TestCase::checked` also asserts a clean parse and link; in `signatures.rs`,
+`TestCase::std` plays the stdlib and `TestCase::from_graph` takes a built
+graph). Read state through `case.sema.<field>`. Only a test that drives the
+signature queries by hand needs the `SemanticsBuilder`, which borrows the
+syntax: `with_pending_signatures(source, |sema, builder| ..)`.
 
 The embedded stdlib sweeps with zero diagnostics (checked 2026-10-11; no
 committed test covers it yet).

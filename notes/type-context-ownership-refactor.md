@@ -248,6 +248,16 @@ error or a bug, so lowering never runs on a failed check, which is what
   signatures suite keeps `TestInputs` (what its builder borrows, kept past the
   sweep) and reads the interner as `case.builder.strings`. The lowering and
   backend tests call `check` and then `lower`.
+- **Tests, afterwards**: since nothing borrows anymore, every suite's
+  `TestCase` owns its files, interner and `Semantics` and is built by a plain
+  constructor (`TestCase::new(source)`, `checked`, `std`, `from_graph`); the
+  `test_case!`/`checked_case!` macros, `TestInputs` and satisfaction's
+  `with_resolved` closure are gone, and the resolutions and format harnesses
+  hold `sema` whole instead of copying fields out of it. Only
+  `with_pending_signatures` keeps its closure: its builder borrows the syntax.
+  Phase 5's persistence tests are in `lower.rs`:
+  `semantics_answers_queries_after_checking_and_after_lowering` and
+  `an_erroneous_program_keeps_its_declarations_references_and_bodies`.
 
 Validation: 1450 compiler tests pass (2 ignored), 75 formatter tests pass;
 build warnings unchanged; every example checks and every binary example

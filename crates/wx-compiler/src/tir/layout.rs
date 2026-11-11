@@ -626,40 +626,29 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::FunctionSignature;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::vfs::{self, Files};
-
-	/// `test_case!(mut case = "source")` declares the interner, the graph and
-	/// the checked `TestCase` as three locals of the calling test.
-	macro_rules! test_case {
-		(mut $case:ident = $source:expr $(,)?) => {
-			let mut strings = ast::Keyword::create_interner();
-			let graph = source_graph($source, &mut strings);
-			let mut $case = TestCase::new(&graph, &mut strings);
-		};
-	}
+	use crate::vfs::Files;
 
 	/// A checked `Semantics`, with the inputs it was checked from.
-	struct TestCase<'a> {
-		files: &'a Files,
-		strings: &'a StringInterner,
+	struct TestCase {
+		files: Files,
+		strings: StringInterner,
 		sema: Semantics,
 	}
 
-	impl<'a> TestCase<'a> {
-		fn new(
-			graph: &'a vfs::CompilationUnit,
-			strings: &'a mut StringInterner,
-		) -> Self {
-			let mut sema = crate::tir::check(graph, strings);
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = ast::Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let sema = crate::tir::check(&graph, &mut strings);
 			Self {
-				files: &graph.files,
+				files: graph.files,
 				strings,
 				sema,
 			}
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
-			DiagnosticView::new("layout", &self.sema.diagnostics, self.files)
+			DiagnosticView::new("layout", &self.sema.diagnostics, &self.files)
 		}
 
 		/// The function a root-level `name` resolves to, by real path
@@ -682,7 +671,7 @@ mod tests {
 			let target = PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				self.strings,
+				&self.strings,
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &[segment], Tier::Value);
@@ -722,14 +711,14 @@ mod tests {
 	/// The layout of parameter `index` of function `path`, in the
 	/// function's own scope.
 	fn param_layout(
-		case: &mut TestCase<'_>,
+		case: &mut TestCase,
 		path: &str,
 		index: usize,
 	) -> Result<Option<Layout>, SolverError> {
 		let scope = case.function_signature(path).type_params;
 		let ty = case.param_types(path)[index];
 		case.sema.memory_layout(
-			case.strings,
+			&case.strings,
 			case.sema.assumption_envs.of_frame(scope),
 			ty,
 		)
@@ -737,7 +726,7 @@ mod tests {
 
 	/// The aggregate layout of parameter `index` of function `path`.
 	fn param_aggregate(
-		case: &mut TestCase<'_>,
+		case: &mut TestCase,
 		path: &str,
 		index: usize,
 	) -> Option<AggregateIdx> {
@@ -745,7 +734,7 @@ mod tests {
 		let ty = case.param_types(path)[index];
 		case.sema
 			.aggregate_layout(
-				case.strings,
+				&case.strings,
 				case.sema.assumption_envs.of_frame(scope),
 				ty,
 			)
@@ -760,7 +749,7 @@ mod tests {
 		scalars: Vec<(Primitive, u32)>,
 	}
 
-	fn contents(case: &TestCase<'_>, index: AggregateIdx) -> Contents {
+	fn contents(case: &TestCase, index: AggregateIdx) -> Contents {
 		let layouts = &case.sema.solver.layouts;
 		Contents {
 			layout: layouts.layout(Piece::Aggregate(index)),
@@ -770,7 +759,7 @@ mod tests {
 	}
 
 	fn param_aggregate_layout(
-		case: &mut TestCase<'_>,
+		case: &mut TestCase,
 		path: &str,
 		index: usize,
 	) -> Contents {
@@ -805,7 +794,7 @@ mod tests {
 				k: heap::&[u8], l: wide::&[u8], m: (), n: Small,
 			) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		let expected = [
 			known(1, 1),
@@ -842,7 +831,7 @@ mod tests {
 			struct Empty();
 			func f(a: Mixed, b: Fixed, c: (u8, u64, u16), d: Empty) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		// `b` at 0, `c` at 8, then `a` and `d` in declaration order. The
 		// values stay in declaration order, whatever their offsets.
@@ -904,7 +893,7 @@ mod tests {
 				e: Pair<Pair<u8>>,
 			) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		// A slice is two values: its address, then its length.
 		assert_eq!(
@@ -971,7 +960,7 @@ mod tests {
 			struct Letter(upper: Bool, code: Char);
 			func f(a: Letter) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		assert_eq!(
 			param_aggregate_layout(&mut case, "f", 0),
@@ -996,7 +985,7 @@ mod tests {
 				e: Wrap<heap::&T>, g: Wrap<heap::&u8>,
 			) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		let pair = param_aggregate(&mut case, "f", 0);
 		assert!(pair.is_some());
@@ -1019,7 +1008,7 @@ mod tests {
 				d: heap::&S, e: heap::&A,
 			) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		assert_eq!(param_layout(&mut case, "f", 0), Ok(known(12, 4)));
 		assert_eq!(param_layout(&mut case, "f", 1), Ok(known(32, 8)));
@@ -1038,7 +1027,7 @@ mod tests {
 				e: func(u32) -> u32, g: (u8, func(u32) -> u32),
 			) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		assert_eq!(param_layout(&mut case, "f", 0), Ok(None));
 		assert_eq!(param_layout(&mut case, "f", 1), Ok(None));
@@ -1063,7 +1052,7 @@ mod tests {
 				c: heap::&Holder<[u8]>, d: heap::&Holder<[[u32; 2]; 0]>,
 			) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 		let pointees: Vec<TypeIndex> = (case.param_types("f").to_vec())
 			.into_iter()
@@ -1074,7 +1063,11 @@ mod tests {
 			.collect();
 		let index = case
 			.sema
-			.aggregate_layout(case.strings, AssumptionEnvIdx::ROOT, pointees[0])
+			.aggregate_layout(
+				&case.strings,
+				AssumptionEnvIdx::ROOT,
+				pointees[0],
+			)
 			.unwrap()
 			.expect("a laid-out struct");
 		// `len` at 0, `data` at 2 (six bytes), `tail` at 8.
@@ -1089,7 +1082,7 @@ mod tests {
 		// An array's values are its element's, once per element.
 		let (layout, values) = case
 			.sema
-			.memory_values(case.strings, AssumptionEnvIdx::ROOT, pointees[1])
+			.memory_values(&case.strings, AssumptionEnvIdx::ROOT, pointees[1])
 			.unwrap()
 			.expect("a laid-out array");
 		assert_eq!(layout, Layout { size: 6, align: 1 });
@@ -1099,7 +1092,7 @@ mod tests {
 		);
 		let mut layout = |ty| {
 			case.sema
-				.memory_layout(case.strings, AssumptionEnvIdx::ROOT, ty)
+				.memory_layout(&case.strings, AssumptionEnvIdx::ROOT, ty)
 		};
 		assert_eq!(layout(pointees[2]), Ok(None));
 		assert_eq!(layout(pointees[3]), Ok(known(0, 4)));
@@ -1111,7 +1104,7 @@ mod tests {
 			struct Selfish(s: Selfish);
 			func f(x: Selfish) {}
 		"});
-		test_case!(mut case = &source);
+		let mut case = TestCase::new(&source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::RecursiveTypeWithoutIndirection]);
 		assert_eq!(param_layout(&mut case, "f", 0), Err(SolverError::Poisoned));

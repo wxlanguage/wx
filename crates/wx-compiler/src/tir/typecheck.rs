@@ -169,7 +169,7 @@ impl<'a> BodyContext<'a> {
 		scope: AssumptionEnvIdx,
 	) -> TypeIndex {
 		match self.sema.normalize(
-			self.strings,
+			&self.strings,
 			scope,
 			ty,
 			NormalizationDepth::Deep,
@@ -191,7 +191,7 @@ impl<'a> BodyContext<'a> {
 	) -> Result<TypeIndex, ()> {
 		let site = SourceSpan::new(self.scope.file_id, site);
 		match self.sema.normalize(
-			self.strings,
+			&self.strings,
 			self.scope.assumption_env,
 			ty,
 			NormalizationDepth::Deep,
@@ -208,7 +208,7 @@ impl<'a> BodyContext<'a> {
 			}
 			Err(SolverError::Cycle(cycle)) => {
 				let diagnostic =
-					self.sema.cycle_diagnostic(self.strings, &cycle, site);
+					self.sema.cycle_diagnostic(&self.strings, &cycle, site);
 				self.sema.diagnostics.push(diagnostic);
 				Err(())
 			}
@@ -355,7 +355,7 @@ impl<'a> BodyContext<'a> {
 			.with_code(DiagnosticCode::UnableToCoerce.code())
 			.with_message(format!(
 				"unable to coerce to type `{}`",
-				self.sema.type_formatter(self.strings).display_type(target)
+				self.sema.type_formatter(&self.strings).display_type(target)
 			))
 			.with_label(self.source_span(expr).primary_label())
 	}
@@ -366,7 +366,7 @@ impl<'a> BodyContext<'a> {
 		actual: TypeIndex,
 		span: TextSpan,
 	) -> Diagnostic<FileId> {
-		let formatter = self.sema.type_formatter(self.strings);
+		let formatter = self.sema.type_formatter(&self.strings);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMistmatch.code())
 			.with_message("type mismatch")
@@ -2972,23 +2972,6 @@ mod tests {
 	use crate::testing::DiagnosticView;
 	use crate::vfs::{self, Files};
 
-	/// `test_case!(case = "source")` declares the interner, the graph and the
-	/// checked `TestCase` as three locals of the calling test.
-	/// The source is a binary over the real stdlib, so operators, memories
-	/// and globals are checked against its actual traits.
-	macro_rules! test_case {
-		($case:ident = $source:expr $(,)?) => {
-			let mut strings = ast::Keyword::create_interner();
-			let graph = source_graph($source, &mut strings);
-			let $case = TestCase::new(&graph, &mut strings);
-		};
-		(mut $case:ident = $source:expr $(,)?) => {
-			let mut strings = ast::Keyword::create_interner();
-			let graph = source_graph($source, &mut strings);
-			let mut $case = TestCase::new(&graph, &mut strings);
-		};
-	}
-
 	fn source_graph(
 		source: &str,
 		strings: &mut StringInterner,
@@ -3016,18 +2999,19 @@ mod tests {
 		graph
 	}
 
-	struct TestCase<'a> {
-		files: &'a Files,
-		strings: &'a StringInterner,
+	/// The source is a binary over the real stdlib, so operators, memories
+	/// and globals are checked against its actual traits.
+	struct TestCase {
+		files: Files,
+		strings: StringInterner,
 		sema: Semantics,
 	}
 
-	impl<'a> TestCase<'a> {
-		fn new(
-			graph: &'a vfs::CompilationUnit,
-			strings: &'a mut StringInterner,
-		) -> Self {
-			let mut sema = crate::tir::check(graph, strings);
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = ast::Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let mut sema = crate::tir::check(&graph, &mut strings);
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
 			let root_file = sema
@@ -3044,14 +3028,18 @@ mod tests {
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
 			});
 			Self {
-				files: &graph.files,
+				files: graph.files,
 				strings,
 				sema,
 			}
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
-			DiagnosticView::new("typecheck", &self.sema.diagnostics, self.files)
+			DiagnosticView::new(
+				"typecheck",
+				&self.sema.diagnostics,
+				&self.files,
+			)
 		}
 
 		fn resolve(&self, name: &str) -> DeclKind {
@@ -3072,7 +3060,7 @@ mod tests {
 			PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				self.strings,
+				&self.strings,
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &segments, Tier::Value)
@@ -3117,7 +3105,7 @@ mod tests {
 
 		fn display(&self, ty: TypeIndex) -> String {
 			self.sema
-				.type_formatter(self.strings)
+				.type_formatter(&self.strings)
 				.display_type(ty)
 				.to_string()
 		}
@@ -3633,14 +3621,14 @@ mod tests {
 
 	#[test]
 	fn the_embedded_stdlib_reports_nothing_but_unsupported_forms() {
-		test_case!(case = "");
+		let case = TestCase::new("");
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn parameters_are_locals_of_the_root_scope() {
 		const SOURCE: &str = "func f(a: u32, mut b: u32) -> u32 { a + b }";
-		test_case!(case = SOURCE);
+		let case = TestCase::new(SOURCE);
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("f"), "(block => (+ a#0 b#1))");
 		assert_eq!(
@@ -3672,7 +3660,7 @@ mod tests {
 	/// An unnamed parameter is passed like any other, but binds no local.
 	#[test]
 	fn an_unnamed_parameter_binds_no_local() {
-		test_case!(case = "func f(u32, _: u8, c: u32) -> u32 { c }");
+		let case = TestCase::new("func f(u32, _: u8, c: u32) -> u32 { c }");
 		case.diagnostics().assert_none();
 		assert_eq!(case.locals("f"), [("c".into(), "u32".into())]);
 		let params: Vec<_> = case
@@ -3686,13 +3674,11 @@ mod tests {
 
 	#[test]
 	fn a_block_result_takes_the_return_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func literal() -> u8 { 200 + 50 }
 				func nothing() {}
 				func diverges() -> u32 { loop {} }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.body_type("literal"), "u8");
 		assert_eq!(case.body_type("nothing"), "()");
@@ -3701,22 +3687,20 @@ mod tests {
 
 	#[test]
 	fn a_block_without_a_result_does_not_give_a_value() {
-		test_case!(case = "func f() -> u32 { local x: u32 = 1; }");
+		let case = TestCase::new("func f() -> u32 { local x: u32 = 1; }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
 
 	#[test]
 	fn a_local_takes_its_written_type_or_its_values() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(a: u64) {
 					local x: u8 = 1;
 					local y = a;
 					local z = (x, y);
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.locals("f"),
@@ -3731,7 +3715,7 @@ mod tests {
 
 	#[test]
 	fn a_local_of_an_untyped_literal_needs_a_type() {
-		test_case!(case = "func f() { local x = 1; }");
+		let case = TestCase::new("func f() { local x = 1; }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
 		assert_eq!(case.locals("f"), [("x".into(), "{unknown}".into())]);
@@ -3739,16 +3723,14 @@ mod tests {
 
 	#[test]
 	fn a_character_literal_is_a_char_or_an_integer_that_represents_it() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func c() -> Char { 'a' }
 				func b() -> u8 { 'a' }
 				func w() -> u16 { '€' }
 				func digit(d: u8) -> u8 { d + '0' }
 				func next() -> u8 { 'a' + 1 }
 				func any<T: Integer>() -> T { 'a' }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("c"), "(block => 'a')");
 		assert_eq!(case.shape("b"), "(block => 97)");
@@ -3758,25 +3740,25 @@ mod tests {
 
 	#[test]
 	fn a_character_literal_must_be_representable_as_its_integer() {
-		test_case!(case = "func f() -> u8 { '€' }");
+		let case = TestCase::new("func f() -> u8 { '€' }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 		case.diagnostics()
 			.assert_error_saying("literal '€' cannot be represented as `u8`");
-		test_case!(case = "func f<T: Integer>() -> T { '€' }");
+		let case = TestCase::new("func f<T: Integer>() -> T { '€' }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypesetBoundViolation]);
 	}
 
 	#[test]
 	fn a_character_literal_is_no_float_and_has_no_default() {
-		test_case!(case = "func f() -> f32 { 'a' }");
+		let case = TestCase::new("func f() -> f32 { 'a' }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
-		test_case!(case = "func f() { local c = 'a'; }");
+		let case = TestCase::new("func f() { local c = 'a'; }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
-		test_case!(case = "func f() -> Char { 'a' + 1 }");
+		let case = TestCase::new("func f() -> Char { 'a' + 1 }");
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::TraitBoundViolation,
@@ -3785,16 +3767,13 @@ mod tests {
 
 	#[test]
 	fn a_character_pattern_compares_an_integer_by_code_point() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(b: u8) -> u32 { match b { 'a' => { 1 }, _ => { 0 } } }
 				func g(c: Char) -> u32 { match c { 'a' => { 1 }, _ => { 0 } } }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
-		test_case!(
-			case =
-				"func f(b: u8) -> u32 { match b { '€' => { 1 }, _ => { 0 } } }"
+		let case = TestCase::new(
+			"func f(b: u8) -> u32 { match b { '€' => { 1 }, _ => { 0 } } }",
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
@@ -3804,8 +3783,8 @@ mod tests {
 
 	#[test]
 	fn a_later_local_shadows_an_earlier_one_from_its_declaration_on() {
-		test_case!(
-			case = "func f() -> u32 { local x: u32 = 1; local x = x + 1; x }"
+		let case = TestCase::new(
+			"func f() -> u32 { local x: u32 = 1; local x = x + 1; x }",
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(
@@ -3816,22 +3795,20 @@ mod tests {
 
 	#[test]
 	fn a_local_is_visible_only_in_its_block() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f() -> u32 {
 					block { local inner: u32 = 1; };
 					inner
 				}
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}
 
 	#[test]
 	fn a_local_shadows_an_item_of_the_same_name() {
-		test_case!(
-			case = "const x: u8 = 1; func f() -> u16 { local x: u16 = 2; x }"
+		let case = TestCase::new(
+			"const x: u8 = 1; func f() -> u16 { local x: u16 = 2; x }",
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("f"), "(block (local x#0 2) => x#0)");
@@ -3839,15 +3816,13 @@ mod tests {
 
 	#[test]
 	fn a_statement_value_must_be_used_or_dropped() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func one() -> u32 { 1 }
 				func f() {
 					one();
 					_ = one();
 				}
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnusedValue]);
 		assert_eq!(case.shape("f"), "(block (call one) (drop (call one)))");
@@ -3855,7 +3830,8 @@ mod tests {
 
 	#[test]
 	fn code_after_a_diverging_statement_is_unreachable() {
-		test_case!(case = "func f() -> u32 { return 1; local x: u32 = 2; x }");
+		let case =
+			TestCase::new("func f() -> u32 { return 1; local x: u32 = 2; x }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnreachableCode]);
 		case.diagnostics()
@@ -3865,8 +3841,8 @@ mod tests {
 
 	#[test]
 	fn unreachable_statements_and_tail_are_still_typechecked() {
-		test_case!(
-			case = "func f() -> u32 { return 1; local x: u32 = True; missing }"
+		let case = TestCase::new(
+			"func f() -> u32 { return 1; local x: u32 = True; missing }",
 		);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
@@ -3879,22 +3855,20 @@ mod tests {
 
 	#[test]
 	fn an_uncalled_function_body_is_still_typechecked() {
-		test_case!(case = "func unused() -> u32 { missing }");
+		let case = TestCase::new("func unused() -> u32 { missing }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}
 
 	#[test]
 	fn if_branches_share_a_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func pick(c: Bool, a: u8) -> u8 { if c { a } else { 1 } }
 				func nested(c: Bool) -> u16 { if c { 1 } else { if !c { 2 } else { 3 } } }
 				func diverging(c: Bool, a: u8) -> u8 { if c { return a; } else { a } }
 				func statement(c: Bool) { if c { pick(c, 1); } }
 				func untyped(c: Bool) { local x: i64 = if c { 1 } else { 2 }; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnusedValue]);
 		assert_eq!(
@@ -3929,9 +3903,8 @@ mod tests {
 
 	#[test]
 	fn an_untyped_branch_takes_the_other_branchs_type() {
-		test_case!(
-			case =
-				"func f(c: Bool, a: u8) { local x = if c { 1 } else { a }; }"
+		let case = TestCase::new(
+			"func f(c: Bool, a: u8) { local x = if c { 1 } else { a }; }",
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(case.locals("f")[2], ("x".into(), "u8".into()));
@@ -3939,13 +3912,11 @@ mod tests {
 
 	#[test]
 	fn if_errors_are_reported_where_they_are_written() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func condition(a: u8) { if a { } }
 				func mismatch(c: Bool, a: u8, b: u16) { local x = if c { a } else { b }; }
 				func missing_else(c: Bool, a: u8) -> u8 { if c { a } }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
@@ -3955,8 +3926,7 @@ mod tests {
 
 	#[test]
 	fn a_loop_is_typed_by_its_breaks() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func first(n: u32) -> u32 {
 					local mut i: u32 = 0;
 					loop {
@@ -3966,8 +3936,7 @@ mod tests {
 				}
 				func endless() -> u8 { loop {} }
 				func unit() { loop { break; } }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("first"),
@@ -3987,14 +3956,12 @@ mod tests {
 
 	#[test]
 	fn break_values_must_agree() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(c: Bool, a: u8, b: u16) {
 					local x = loop { if c { break a; } break b; };
 				}
 				func untyped() { local x = loop { break 1; }; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeAnnotationRequired,
@@ -4003,8 +3970,7 @@ mod tests {
 
 	#[test]
 	fn a_label_names_the_scope_a_jump_leaves() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(c: Bool) -> u32 {
 					loop :outer {
 						loop {
@@ -4019,8 +3985,7 @@ mod tests {
 						2
 					}
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -4036,14 +4001,12 @@ mod tests {
 
 	#[test]
 	fn an_ascription_checks_its_value_against_its_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func id<T: StackValue>(t: T) -> T { t }
 				func literal() -> u8 { (5: u8) }
 				func inferred() { local x = id(5: u16); }
 				func elements() { local t = (1: u8, 2: u16); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		// It leaves no node of its own.
 		assert_eq!(case.shape("literal"), "(block => 5)");
@@ -4054,14 +4017,12 @@ mod tests {
 
 	#[test]
 	fn an_ascription_converts_nothing() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func takes(x: u16) {}
 				func widened(a: u8) -> u16 { (a: u16) }
 				func argument() { takes(1: u8); }
 				func out_of_range() { local x = (300: u8); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
@@ -4071,14 +4032,12 @@ mod tests {
 
 	#[test]
 	fn jumps_need_a_target() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func outside() { break; }
 				func outside_continue() { continue; }
 				func unknown() { loop { break :nowhere; } }
 				func not_a_loop() { block :l { continue :l; } }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::BreakOutsideOfLoop,
 			DiagnosticCode::ContinueOutsideOfLoop,
@@ -4090,7 +4049,7 @@ mod tests {
 	#[test]
 	fn a_labelled_jump_is_recorded_as_a_reference_to_its_label() {
 		const SOURCE: &str = "func f() { loop :outer { break :outer; } }";
-		test_case!(case = SOURCE);
+		let case = TestCase::new(SOURCE);
 		case.diagnostics().assert_none();
 		let file_id = case
 			.sema
@@ -4113,14 +4072,12 @@ mod tests {
 
 	#[test]
 	fn return_gives_the_function_its_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func early(c: Bool) -> u8 { if c { return 1; } 2 }
 				func bare() { return; }
 				func wrong() -> u8 { return; }
 				func mismatch(a: u16) -> u8 { return a; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
@@ -4133,8 +4090,7 @@ mod tests {
 
 	#[test]
 	fn assignment_writes_a_mutable_local() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f() {
 					local mut x: u8 = 1;
 					x = 2;
@@ -4145,8 +4101,7 @@ mod tests {
 					errors() = ();
 					_ = 1;
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::CannotMutateImmutable,
 			DiagnosticCode::InvalidAssignmentTarget,
@@ -4157,15 +4112,13 @@ mod tests {
 
 	#[test]
 	fn a_global_is_a_handle_and_is_not_assigned() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				global mut counter: u32 = 0;
 				func f() {
 					counter = 3;
 					counter += 1;
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::InvalidAssignmentTarget,
 			DiagnosticCode::InvalidAssignmentTarget,
@@ -4177,8 +4130,7 @@ mod tests {
 
 	#[test]
 	fn a_diverging_operand_takes_the_other_operands_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func stop() -> ! { loop {} }
 				func left(x: i32) -> i32 { stop() + x }
 				func right(x: i32) -> i32 { x + stop() }
@@ -4189,8 +4141,7 @@ mod tests {
 				func both() -> i32 { stop() + stop() }
 				func takes(x: u8) -> u8 { x }
 				func argument() -> u8 { takes(stop() + 1) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.body_type("left"), "i32");
 		assert_eq!(case.body_type("right"), "i32");
@@ -4203,13 +4154,11 @@ mod tests {
 
 	#[test]
 	fn an_untyped_comparison_against_a_diverging_operand_needs_an_annotation() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func stop() -> ! { loop {} }
 				func left() -> Bool { stop() == 1 }
 				func right() -> Bool { 1 == stop() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ComparisonTypeAnnotationRequired,
 			DiagnosticCode::ComparisonTypeAnnotationRequired,
@@ -4218,9 +4167,8 @@ mod tests {
 
 	#[test]
 	fn a_diverging_operand_does_not_skip_literal_coercion() {
-		test_case!(
-			case =
-				"func stop() -> ! { loop {} } func f() -> u8 { stop() + 256 }"
+		let case = TestCase::new(
+			"func stop() -> ! { loop {} } func f() -> u8 { stop() + 256 }",
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
@@ -4228,8 +4176,8 @@ mod tests {
 
 	#[test]
 	fn a_diverging_operand_does_not_make_a_literal_operable() {
-		test_case!(
-			case = r#"func stop() -> ! { loop {} } func f() -> Bool { stop() == "x" }"#
+		let case = TestCase::new(
+			r#"func stop() -> ! { loop {} } func f() -> Bool { stop() == "x" }"#,
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
@@ -4239,13 +4187,11 @@ mod tests {
 
 	#[test]
 	fn a_diverging_operand_makes_a_unary_expression_diverge() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func stop() -> ! { loop {} }
 				func negate() -> i32 { -stop() }
 				func logical() -> Bool { !stop() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.body_type("negate"), "!");
 		assert_eq!(case.body_type("logical"), "!");
@@ -4253,15 +4199,13 @@ mod tests {
 
 	#[test]
 	fn an_operator_call_carries_its_type_arguments() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct W<T>(x: T);
 				impl<T: StackValue> Add for W<T> { func add(self: Self, rhs: Self) -> Self { rhs } }
 				func concrete(w: W<u8>) -> W<u8> { w + w }
 				func generic<T: Add>(t: T) -> T { t + t }
 				func assigned(w: W<u8>) { local mut v = w; v += w; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("concrete"), "(block => (call add<u8> w#0 w#0))");
 		assert_eq!(
@@ -4276,16 +4220,14 @@ mod tests {
 
 	#[test]
 	fn compound_assignment_dispatches_like_its_operator() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct V(x: u32);
 				impl Add for V { func add(self: Self, rhs: Self) -> Self { rhs } }
 				func scalar() { local mut a: u32 = 1; a += 2; a <<= 1; }
 				func overloaded(v: V) { local mut w = v; w += v; }
 				func generic<T: Add>(t: T) { local mut u = t; u += t; }
 				func missing(c: Bool) { local mut d = c; d -= c; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		assert_eq!(
@@ -4304,8 +4246,7 @@ mod tests {
 
 	#[test]
 	fn a_field_of_a_value_is_read_and_written_through_its_root() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct Inner(v: u8);
 				struct Outer(inner: Inner, n: u32);
 				struct Wrap<T>(value: T);
@@ -4314,8 +4255,7 @@ mod tests {
 				func write(o: Outer) { local mut p = o; p.inner.v = 1; p.n += 1; }
 				func immutable(o: Outer) { o.n = 1; }
 				func temporary(o: Outer) { read(o).v = 1; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::CannotMutateImmutable,
 			DiagnosticCode::UnknownStructField,
@@ -4330,14 +4270,12 @@ mod tests {
 
 	#[test]
 	fn field_access_checks_the_field() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				mod m { pub struct S(pub open: u8, closed: u8); }
 				func f(s: m::S) -> u8 { s.open + s.closed }
 				func g(s: m::S) -> u8 { s.missing }
 				func h(x: u8) -> u8 { x.field }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::PrivateStructField,
 			DiagnosticCode::UnknownStructField,
@@ -4347,28 +4285,24 @@ mod tests {
 
 	#[test]
 	fn a_field_takes_no_type_arguments() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct P(x: u8);
 				func f(p: P) -> u8 { p.x::<u8> }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 	}
 
 	#[test]
 	fn a_place_in_memory_is_read_written_and_addressed() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct Node(value: u32, next: heap::*Node);
 				func read(p: heap::&Node) -> u32 { p.*.value }
 				func write(p: heap::*Node) { p.* = Node(1, p); p.*.value += 2; }
 				func value_address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
 				func next(p: heap::*Node) -> u32 { p.*.next.*.value }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("read"), "(block => (load (. (* p#0) value)))");
 		assert_eq!(
@@ -4387,14 +4321,12 @@ mod tests {
 
 	#[test]
 	fn a_place_is_written_only_through_an_exclusive_pointer() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func shared(p: heap::&u32) { p.* = 1; }
 				func not_a_pointer(x: u32) -> u32 { x.* }
 				func local_address(x: u32) -> heap::&u32 { x.& }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::CannotMutateImmutable,
 			DiagnosticCode::CannotDerefNonPointer,
@@ -4404,14 +4336,12 @@ mod tests {
 
 	#[test]
 	fn a_call_checks_its_arguments_against_the_parameters() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func add(a: u32, b: u32) -> u32 { a + b }
 				func f() -> u32 { add(1, 2) }
 				func count() -> u32 { add(1) }
 				func mismatch(c: Bool) -> u32 { add(c, 2) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::TypeMistmatch,
@@ -4421,8 +4351,7 @@ mod tests {
 
 	#[test]
 	fn a_generic_call_learns_its_type_arguments() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Number {}
 				impl Number for u32 {}
 				impl Number for i64 {}
@@ -4434,8 +4363,7 @@ mod tests {
 				func from_result() -> u32 { zero() }
 				func nothing() { _ = zero(); }
 				func unsatisfied() { local x = zero::<Bool>(); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeAnnotationRequired,
 			DiagnosticCode::TraitBoundViolation,
@@ -4448,12 +4376,10 @@ mod tests {
 
 	#[test]
 	fn a_function_is_a_value_of_its_own_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func id<T: StackValue>(x: T) -> T { x }
 				func f() { local g = id::<u8>; local h = id; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
 		assert_eq!(case.locals("f")[0], ("g".into(), "id<u8>".into()));
@@ -4461,8 +4387,7 @@ mod tests {
 
 	#[test]
 	fn a_function_item_held_in_a_value_is_called_through_call() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func id<T: StackValue>(x: T) -> T { x }
 				func pair(a: u8, b: u16) {}
 				func positional() -> u8 { local g = id::<u8>; g(1) }
@@ -4474,8 +4399,7 @@ mod tests {
 				func method(v: V) -> u32 { local m = V::area; m({ k: 1, self: v }) }
 				trait Make: StackValue { func make(n: u32) -> Self; }
 				func declared<T: StackValue + Make>() -> T { local g = T::make; g(1) }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ArgumentCountMismatch]);
 		assert_eq!(
@@ -4509,13 +4433,11 @@ mod tests {
 
 	#[test]
 	fn a_tuple_of_one_is_its_element() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: (u8,)) -> u8 { local (y,) = x; local (z) = y; (z,) }
 				func g(p: (u8, u16)) { local (..) = p; }
 				func h(mut a: u8) { (a,) = 1; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.locals("f"),
@@ -4534,8 +4456,7 @@ mod tests {
 
 	#[test]
 	fn a_value_is_called_through_its_call_impl() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct Adder(n: u32);
 				impl Call for Adder {
 					type Args = (u32, u32);
@@ -4545,8 +4466,7 @@ mod tests {
 				func spread(a: Adder) -> u32 { a(1, 2) }
 				func whole(a: Adder, p: (u32, u32)) -> u32 { a(p) }
 				func apply<F: Call>(f: F, x: F::Args) -> F::Result { f(x) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("spread"),
@@ -4561,8 +4481,7 @@ mod tests {
 
 	#[test]
 	fn a_value_without_a_call_impl_cannot_be_called() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct Adder(n: u32);
 				impl Call for Adder {
 					type Args = (u32, u32);
@@ -4572,8 +4491,7 @@ mod tests {
 				func number(x: u32) { x(1); }
 				func named(a: Adder) { a({ args: (1, 2) }); }
 				func too_many(a: Adder) { _ = a(1, 2, 3); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::PositionalOnlyCall,
@@ -4585,8 +4503,7 @@ mod tests {
 	/// parameter, the whole list is its value.
 	#[test]
 	fn the_argument_list_is_the_value_of_a_lone_parameter() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func g(p: (u8, u16)) {}
 				func id<T: StackValue>(x: T) -> T { x }
 				func unit(x: ()) {}
@@ -4602,8 +4519,7 @@ mod tests {
 				func method(v: V, a: u8, b: u16) { v.m(a, b); }
 				func qualified(v: V, a: u8, b: u16) { V::m(v, (a, b)); }
 				func item(a: u8, b: u16) { local k = g; k(a, b); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("spread"), "(block (call g (tuple a#0 b#1)))");
 		assert_eq!(case.shape("whole"), "(block (call g (tuple a#0 b#1)))");
@@ -4623,8 +4539,7 @@ mod tests {
 	/// known type that is no such tuple, is a wrong count.
 	#[test]
 	fn the_argument_list_fills_several_parameters_one_each() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(a: u8, b: u16) {}
 				func h(x: u32) {}
 				struct V();
@@ -4633,8 +4548,7 @@ mod tests {
 				func none() { h(); }
 				func several() { h(1, 2); }
 				func qualified(v: V, a: u8, b: u16) { V::m(v, a, b); }
-			"}
-		);
+			"});
 		// The arguments that do fall on a parameter are still held to it.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArgumentCountMismatch,
@@ -4649,8 +4563,7 @@ mod tests {
 	/// the list they form would be: the call holds it whole.
 	#[test]
 	fn one_value_is_the_arguments_of_several_parameters() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(a: u8, b: u16) -> u16 { b }
 				func none() {}
 				struct Point(x: u8, y: u16);
@@ -4663,8 +4576,7 @@ mod tests {
 				func method(v: V, p: (u8, u16)) { v.m(p); }
 				func qualified(t: (V, u8, u16)) { V::m(t); }
 				func grouped(v: V, p: (u8, u16)) { V::m(v, p); }
-			"}
-		);
+			"});
 		// `V::m(v, p)` is no regrouping: `p` falls on `a`.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArgumentCountMismatch,
@@ -4684,8 +4596,7 @@ mod tests {
 	/// impl.
 	#[test]
 	fn a_value_call_reads_args_and_result_from_its_call_impl() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct X(n: u32);
 				impl Call for X {
 					type Args = u32;
@@ -4693,8 +4604,7 @@ mod tests {
 					func call(self: Self) -> u8 { 0 }
 				}
 				func f(x: X) -> u32 { x(1) }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		assert_eq!(case.body_type("f"), "u32");
@@ -4702,20 +4612,17 @@ mod tests {
 
 	#[test]
 	fn a_function_item_is_not_a_function_reference() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func id<T: StackValue>(x: T) -> T { x }
 				func f() { local g: func(u8) -> u8 = id; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
 
 	#[test]
 	fn a_function_reference_is_callable_by_a_compiler_rule() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func twice(f: func(u32) -> u32, x: u32) -> u32 { f(f(x)) }
 				func spread(f: func(u32, u8) -> u8) -> u8 { f(1, 2) }
 				func whole(f: func(u32, u8) -> u8, p: (u32, u8)) -> u8 { f(p) }
@@ -4723,8 +4630,7 @@ mod tests {
 				func apply<F: Call>(f: F, x: F::Args) -> F::Result { f(x) }
 				func through(f: func(u32) -> u8) -> u8 { apply(f, 1) }
 				func projected(x: <func(u32) -> u8 as Call>::Result) -> u8 { x }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("twice"),
@@ -4742,12 +4648,10 @@ mod tests {
 
 	#[test]
 	fn a_function_reference_has_call_as_a_method() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func one(f: func(u32) -> u8) -> u8 { f.call(1) }
 				func two(f: func(u32, u8) -> u8) -> u8 { f.call(1, 2) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("one"),
@@ -4761,13 +4665,11 @@ mod tests {
 
 	#[test]
 	fn a_function_reference_is_called_by_position_with_its_parameter() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func named(f: func(u32) -> u32) { _ = f({ x: 1 }); }
 				func too_many(f: func(u32, u8) -> u8) { _ = f(1, 2, 3); }
 				func wrong(f: func(u32) -> u32) { _ = f(True); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::PositionalOnlyCall,
 			DiagnosticCode::ArgumentCountMismatch,
@@ -4777,13 +4679,11 @@ mod tests {
 
 	#[test]
 	fn a_computed_function_item_is_evaluated_as_the_receiver() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func pair(a: u8, b: u16) {}
 				func make() -> pair { pair }
 				func f() { make()({ b: 2, a: 1 }); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -4793,8 +4693,7 @@ mod tests {
 
 	#[test]
 	fn an_expected_item_type_gives_a_function_value_its_arguments() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func id<T: StackValue>(x: T) -> T { x }
 				func take(g: id<u8>) {}
 				func annotated() { local g: id<u8> = id; }
@@ -4802,8 +4701,7 @@ mod tests {
 				func returned() -> id<u16> { id }
 				func generic<T: StackValue>() { local g: id<T> = id; }
 				func other() { local g: id<u8> = take; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 		assert_eq!(case.locals("annotated"), [("g".into(), "id<u8>".into())]);
@@ -4814,8 +4712,7 @@ mod tests {
 
 	#[test]
 	fn a_string_literal_takes_a_byte_slice_or_array_from_its_context() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func slice() -> heap::&[u8] { "hello" }
 				func array() -> heap::&[u8; 5] { "hello" }
@@ -4824,8 +4721,7 @@ mod tests {
 				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
 				func tuple() -> (heap::&[u8], u8) { ("a", 1) }
 				func any_memory<Mem: Memory>() -> Mem::&[u8] { "abstract" }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("slice"), r#"(block => "hello")"#);
 		assert_eq!(case.body_type("slice"), "heap::&[u8]");
@@ -4842,8 +4738,7 @@ mod tests {
 
 	#[test]
 	fn an_array_literal_takes_a_shared_array_or_slice_from_its_context() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				memory wide: u64;
 				const SIZE: u32 = 3;
@@ -4856,8 +4751,7 @@ mod tests {
 				func repeat_constant() -> heap::&[u16; 3] { [7; SIZE] }
 				func repeat_wide() -> wide::&[u8; 5] { [1; 5] }
 				func any_memory<Mem: Memory>() -> Mem::&[u8; 2] { [1; 2] }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("slice"), "(block => (array 1 2 3))");
 		assert_eq!(case.body_type("slice"), "heap::&[u32]");
@@ -4896,8 +4790,7 @@ mod tests {
 
 	#[test]
 	fn an_array_literal_is_only_what_its_context_allows() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const LONG: u64 = 2;
 				func exclusive() -> heap::*[u8] { [1] }
@@ -4910,8 +4803,7 @@ mod tests {
 				func computed_slice(n: u32) -> heap::&[u8] { [0; n] }
 				func untyped() { local a = [1]; }
 				func operator() -> heap::&[u8] { [1] + [2] }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::UnableToCoerce,
@@ -4932,16 +4824,14 @@ mod tests {
 	/// it.
 	#[test]
 	fn a_local_cannot_be_used_in_static_data() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const x: u8 = 5;
 				func param(x: u8) -> heap::&[u8] { [x, 1] }
 				func declared() -> heap::&[u8] { local y: u8 = 1; [y] }
 				func inner() -> heap::&[u8] { [block { local z: u8 = 1; z }] }
 				func outside(x: u8) -> heap::&[u8; 2] { [0; 2] }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::LocalInStaticData,
 			DiagnosticCode::LocalInStaticData,
@@ -4954,8 +4844,7 @@ mod tests {
 	/// evaluated per instance, where it is lowered.
 	#[test]
 	fn static_data_is_evaluated_when_its_function_is_checked() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func one() -> u8 { 1 }
 				func call() -> heap::&[u8] { [one(), 1] }
@@ -4963,8 +4852,7 @@ mod tests {
 				func nested() -> heap::&[heap::&[u8]] { [[one()]] }
 				func generic<T>() -> heap::&[u8] { [one()] }
 				func fine() -> heap::&[u16] { [1, 2 + 3, 4] }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NotConstEvaluatable,
 			DiagnosticCode::ConstEvaluationFailed,
@@ -4974,13 +4862,11 @@ mod tests {
 
 	#[test]
 	fn a_body_records_its_string_literals_as_static_data() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
 				func none() -> u32 { 1 }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let body = case.body("branches");
 		let contents: Vec<&str> = body
@@ -4999,20 +4885,17 @@ mod tests {
 
 	#[test]
 	fn a_string_literal_waits_for_a_generic_call_to_learn_its_memory() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func take<Mem: Memory>(s: Mem::&[u8], p: Mem::&u8) {}
 				func call(p: heap::&u8) { take("abc", p); }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_string_literal_is_a_shared_byte_type_of_its_length() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func length() -> heap::&[u8; 4] { "abc" }
 				func exclusive() -> heap::*[u8] { "abc" }
@@ -5023,8 +4906,7 @@ mod tests {
 				func expected(c: Bool) -> heap::&[u8] { if c { "a" } else { 1 } }
 				func joined(c: Bool) { local x = if c { "a" } else { 1 }; }
 				func escape() -> heap::&[u8] { "\q" }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArraySizeMismatch,
 			DiagnosticCode::UnableToCoerce,
@@ -5043,16 +4925,14 @@ mod tests {
 
 	#[test]
 	fn a_string_literal_is_ascribed_what_it_can_become() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func array() -> heap::&[u8; 3] { ("abc": heap::&[u8; 3]) }
 				func slice() -> heap::&[u8] { ("abc": heap::&[u8]) }
 				func number() -> u32 { ("abc": u32) }
 				func exclusive() -> heap::*[u8] { ("abc": heap::*[u8]) }
 				func length() -> heap::&[u8; 2] { ("abc": heap::&[u8; 2]) }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::UnableToCoerce,
@@ -5063,8 +4943,7 @@ mod tests {
 
 	#[test]
 	fn an_array_literal_is_ascribed_what_it_can_become() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func array() -> heap::&[u8; 2] { ([1, 2]: heap::&[u8; 2]) }
 				func slice() -> heap::&[u32] { ([1, 2]: heap::&[u32]) }
@@ -5075,8 +4954,7 @@ mod tests {
 				func exclusive() -> heap::*[u8] { ([1]: heap::*[u8]) }
 				func length() -> heap::&[u8; 2] { ([1]: heap::&[u8; 2]) }
 				func element() -> heap::&[u8] { ([True]: heap::&[u8]) }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnableToCoerce,
 			DiagnosticCode::UnableToCoerce,
@@ -5093,12 +4971,10 @@ mod tests {
 
 	#[test]
 	fn constant_parameters_and_arguments_are_not_checked_yet() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				struct Buffer<const N: u32>(u8);
 				func f(b: Buffer<4>) {}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnsupportedExpression,
 			DiagnosticCode::UnsupportedExpression,
@@ -5109,11 +4985,9 @@ mod tests {
 	fn a_constant_value_in_a_bound_is_not_checked_yet() {
 		// Representability (`const LEN: u8`) is a clause; a value (`const LEN =
 		// 4`) is not supported yet.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				func g<A: Array where { const LEN: u8 }, B: Array where { const LEN = 4 }>() {}
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
 	}
@@ -5121,14 +4995,12 @@ mod tests {
 	#[test]
 	fn an_abstract_constant_is_representable_as_what_a_bound_says() {
 		// `u8` gives `u16`, not `i8`.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				func f<A: Array where { const LEN: u8 }>() -> u8 { A::LEN }
 				func wider<A: Array where { const LEN: u8 }>() -> u16 { A::LEN }
 				func signed<A: Array where { const LEN: u8 }>() -> i8 { A::LEN }
 				func none<A: Array>() -> u8 { A::LEN }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnrepresentableConstant,
 			DiagnosticCode::UnrepresentableConstant,
@@ -5143,16 +5015,14 @@ mod tests {
 
 	#[test]
 	fn representability_is_proved_at_a_call() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				func f<A: Array where { const LEN: u8 }>() {}
 				func representable() { f::<[u16; 255]>() }
 				func overflows() { f::<[u16; 256]>() }
 				func implied<B: Array where { const LEN: u8 }>() { f::<B>() }
 				func wider<B: Array where { const LEN: u16 }>() { f::<B>() }
 				func unstated<B: Array>() { f::<B>() }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnrepresentableConstant,
 			DiagnosticCode::UnrepresentableConstant,
@@ -5167,14 +5037,12 @@ mod tests {
 	fn representability_as_a_memory_size_is_read_through_its_typesets() {
 		// `M::Size` is `u32` or `u64`: it gives `u32`, not `u16`, and `u8`
 		// gives it.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				func f<M: Memory, A: Array where { const LEN: M::Size }>() -> M::Size { A::LEN }
 				func narrow<M: Memory, A: Array where { const LEN: M::Size }>() -> u32 { A::LEN }
 				func narrower<M: Memory, A: Array where { const LEN: M::Size }>() -> u16 { A::LEN }
 				func small<M: Memory, A: Array where { const LEN: u8 }>() -> M::Size { A::LEN }
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnrepresentableConstant]);
 		case.diagnostics().assert_error_saying(
@@ -5184,27 +5052,23 @@ mod tests {
 
 	#[test]
 	fn representability_is_inherited_from_a_supertraits_bound() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Small: Array where { const LEN: u8 } {}
 				func f<A: Small>() -> u8 { A::LEN }
 				func g<A: Small>() -> i8 { A::LEN }
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnrepresentableConstant]);
 	}
 
 	#[test]
 	fn a_bound_states_representability_of_an_untyped_constant_only() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Sized { const SIZE: u32; type Item; const FIRST: Self::Item; }
 				func typed<T: Sized where { const SIZE: u8 }>() {}
 				func projected<T: Sized where { const FIRST: u8 }>() {}
 				func untyped<A: Array where { const LEN: u8 }>() {}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypedConstantBound,
 			DiagnosticCode::TypedConstantBound,
@@ -5218,23 +5082,20 @@ mod tests {
 	#[test]
 	fn a_trait_function_bounding_self_assumes_it_in_its_body() {
 		// `Self` written first is no parameter: `f` takes one argument.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Show: StackValue { func show(self: Self); }
 				trait Tr: StackValue {
 					func f<Self: Show, T: StackValue>(self: Self, t: T) { self.show() }
 					func g<Self: Show>(self: Self) { self.show() }
 				}
 				func call<X: StackValue + Tr + Show>(x: X) { x.f::<u8>(1); x.g() }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_call_proves_what_a_trait_function_requires_of_self() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Show: StackValue { func show(self: Self); }
 				trait Tr: StackValue {
 					func f<Self: Show>(self: Self) { self.show() }
@@ -5246,8 +5107,7 @@ mod tests {
 				impl Tr for B {}
 				func concrete(a: A, b: B) { a.f(); b.f() }
 				func generic<X: StackValue + Tr>(x: X) { x.f() }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::TraitBoundViolation,
@@ -5273,7 +5133,7 @@ mod tests {
 				third.f()
 			}
 		"#};
-		test_case!(case = source);
+		let case = TestCase::new(source);
 		case.diagnostics().print();
 		let at: Vec<&str> = case
 			.sema
@@ -5290,8 +5150,7 @@ mod tests {
 
 	#[test]
 	fn self_is_bounded_only_first_in_a_trait_function() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Show {}
 				trait Tr: StackValue {
 					func late<T: StackValue, Self: Show>(t: T);
@@ -5304,8 +5163,7 @@ mod tests {
 					func late<T: StackValue>(t: T) {}
 					func f(self: Self) {}
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::MisplacedSelfBound,
 			DiagnosticCode::MisplacedSelfBound,
@@ -5328,10 +5186,9 @@ mod tests {
 	#[test]
 	fn a_trait_impl_function_assumes_what_its_self_entry_means() {
 		// `<Wrap<T> as Container>::Item: Show` means `T: Show` in the impl.
-		test_case!(
-			case = &format!(
-				"{SHOWN_ITEMS}{}",
-				indoc! {r#"
+		let case = TestCase::new(&format!(
+			"{SHOWN_ITEMS}{}",
+			indoc! {r#"
 					impl<T: StackValue> Container for Wrap<T> {
 						type Item = T;
 						func show_all<Self: Container where { Item: Show }>(
@@ -5341,24 +5198,21 @@ mod tests {
 						}
 					}
 				"#}
-			)
-		);
+		));
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn without_its_self_entry_a_trait_impl_function_assumes_nothing() {
-		test_case!(
-			case = &format!(
-				"{SHOWN_ITEMS}{}",
-				indoc! {r#"
+		let case = TestCase::new(&format!(
+			"{SHOWN_ITEMS}{}",
+			indoc! {r#"
 					impl<T: StackValue> Container for Wrap<T> {
 						type Item = T;
 						func show_all(self: Self) { self.inner.show() }
 					}
 				"#}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::MethodNotFound]);
 	}
@@ -5366,8 +5220,7 @@ mod tests {
 	#[test]
 	fn a_self_entry_reads_in_its_function_signature_checks() {
 		// `Shown<Self::Item>` needs `Item: Show`, which only the entry gives.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Show: StackValue { func show(self: Self); }
 				struct Shown<X: Show>(x: X);
 				trait Container {
@@ -5383,17 +5236,15 @@ mod tests {
 						item: Shown<Self::Item>,
 					) {}
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_self_entry_about_a_concrete_item_is_proved_where_it_is_written() {
-		test_case!(
-			case = &format!(
-				"{SHOWN_ITEMS}{}",
-				indoc! {r#"
+		let case = TestCase::new(&format!(
+			"{SHOWN_ITEMS}{}",
+			indoc! {r#"
 					struct Bytes();
 					struct Text();
 					impl Show for Text { func show(self: Self) {} }
@@ -5412,8 +5263,7 @@ mod tests {
 						) {}
 					}
 				"#}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
@@ -5423,10 +5273,9 @@ mod tests {
 
 	#[test]
 	fn a_call_of_a_trait_impl_function_proves_its_self_entry() {
-		test_case!(
-			case = &format!(
-				"{SHOWN_ITEMS}{}",
-				indoc! {r#"
+		let case = TestCase::new(&format!(
+			"{SHOWN_ITEMS}{}",
+			indoc! {r#"
 					impl<T: StackValue> Container for Wrap<T> {
 						type Item = T;
 						func show_all<Self: Container where { Item: Show }>(
@@ -5443,8 +5292,7 @@ mod tests {
 						yes.show_all()
 					}
 				"#}
-			)
-		);
+		));
 		// Reported at the method for now; at the receiver, which gives
 		// `Self`, is 6d-3.
 		case.diagnostics()
@@ -5459,10 +5307,9 @@ mod tests {
 	fn a_self_entry_assumes_only_about_an_abstract_type() {
 		// `Wrap2<T>: Show` would hold only if `T: Show`, which nothing reads
 		// from an assumption about `Wrap2<T>`; `Always<T>: Show` holds anyway.
-		test_case!(
-			case = &format!(
-				"{SHOWN_ITEMS}{}",
-				indoc! {r#"
+		let case = TestCase::new(&format!(
+			"{SHOWN_ITEMS}{}",
+			indoc! {r#"
 					struct Wrap2<T>(x: T);
 					impl<T: StackValue + Show> Show for Wrap2<T> { func show(self: Self) {} }
 					struct Always<T>(x: T);
@@ -5482,8 +5329,7 @@ mod tests {
 						) {}
 					}
 				"#}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
 		case.diagnostics().assert_error_saying(
@@ -5496,8 +5342,7 @@ mod tests {
 		// The declaration's entry, read with `Self` as `Wrap<T>`, means
 		// `T: Show`, which the impl's own entry asks no more than; asking
 		// for `Item: Eq` beside it is more than the trait does.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Show: StackValue { func show(self: Self); }
 				trait Eq: StackValue { func eq(self: Self, other: Self); }
 				trait Container: StackValue {
@@ -5523,8 +5368,7 @@ mod tests {
 						Self: Container where { Item: Show + Eq },
 					>(self: Self) {}
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
 	}
@@ -5560,7 +5404,7 @@ mod tests {
 					) {}
 				}
 			"#};
-		test_case!(case = source);
+		let case = TestCase::new(source);
 		// `u8 == u8` holds, `u16 == u8` never does, and `T == u8` would be
 		// an assumption about a parameter's value. Each is reported at the
 		// equality itself.
@@ -5583,8 +5427,7 @@ mod tests {
 
 	#[test]
 	fn an_array_type_length_is_an_integer_literal_or_a_constant() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				memory wide: u64;
 				const N: u32 = 2;
@@ -5593,8 +5436,7 @@ mod tests {
 				func not_integer(a: heap::&[u8; True]) {}
 				func too_long(a: heap::&[u8; 5000000000]) {}
 				func long(a: wide::&[u8; 5000000000]) {}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::IntegerLiteralOutOfRange,
@@ -5603,8 +5445,7 @@ mod tests {
 
 	#[test]
 	fn a_constant_length_means_its_value() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				struct Buffer(data: heap::&[u8; TWO]);
 				const TWO: u32 = 1 + 1;
@@ -5612,23 +5453,20 @@ mod tests {
 				func text() { local s: heap::&[u8; TWO] = "ab"; }
 				func repeat() { local z: heap::&[u8; TWO] = [0; _]; }
 				func long() { local s: heap::&[u8; TWO] = "abc"; }
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ArraySizeMismatch]);
 	}
 
 	#[test]
 	fn a_constant_length_has_its_memorys_size_type() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const SHORT: u16 = 2;
 				const N: u32 = 2;
 				func narrow(a: heap::&[u8; SHORT]) {}
 				func abstract<M: Memory>(a: M::&[u8; N]) {}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
@@ -5637,15 +5475,13 @@ mod tests {
 
 	#[test]
 	fn a_length_path_names_a_free_constant() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				trait Sized { const SIZE: u32; }
 				func f() {}
 				func function(a: heap::&[u8; f]) {}
 				func missing(a: heap::&[u8; NOPE]) {}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArrayRepeatCountNotConst,
 			DiagnosticCode::UndeclaredIdentifier,
@@ -5654,8 +5490,7 @@ mod tests {
 
 	#[test]
 	fn a_length_names_a_constant_of_a_type() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				trait Sized { const SIZE: u32; }
 				struct P();
@@ -5682,15 +5517,13 @@ mod tests {
 					local a: heap::&[u8; 3] = [0; <P as Sized>::SIZE];
 				}
 				const C: heap::&[u8; <P as Sized>::SIZE] = [7; _];
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_length_through_a_type_is_checked_as_any_constant() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				trait Sized { const SIZE: u32; }
 				trait Wide { const N: u64; }
@@ -5701,8 +5534,7 @@ mod tests {
 				func no_such(a: heap::&[u8; P::NOPE]) {}
 				func wide<T: Wide>(a: heap::&[u8; T::N]) {}
 				func wrong(a: heap::&[u8; 2]) { of_param::<P>(a); }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NotATraitMember,
 			DiagnosticCode::NotATraitMember,
@@ -5719,15 +5551,13 @@ mod tests {
 
 	#[test]
 	fn a_constant_named_in_a_type_inside_its_own_value_is_a_cycle() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const C: u32 = block {
 					local a: heap::&[u8; C] = [0; _];
 					1
 				};
-			"#}
-		);
+			"#});
 		// The local's type is compared once `C` has a value, and `C` has none
 		// until its body is checked: rustc's `typeck(C)` to `eval(C)` and back.
 		case.diagnostics()
@@ -5736,12 +5566,10 @@ mod tests {
 
 	#[test]
 	fn a_constant_whose_value_needs_its_own_type_is_a_cycle() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const A: heap::&[u8; A] = [0; _];
-			"#}
-		);
+			"#});
 		// `[0; _]` is as long as `A`'s type says, which is `A`'s value. The
 		// constant owns the loop; the checks that met it are silent.
 		case.diagnostics()
@@ -5750,8 +5578,7 @@ mod tests {
 
 	#[test]
 	fn a_constant_body_may_name_a_later_constant_in_a_type() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				struct Buf(data: heap::&[u8; N]);
 				const N: u32 = M * 2;
@@ -5759,22 +5586,19 @@ mod tests {
 				const COPY: heap::&[u8; 8] = TEXT;
 				const ZEROS: heap::&[u8; 8] = [0; N];
 				const M: u32 = 4;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_length_named_by_a_later_constant_is_checked_once_it_is_known() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const TEXT: heap::&[u8; N] = "abc";
 				const COPY: heap::&[u8; 2] = TEXT;
 				const ZEROS: heap::&[u8; 2] = [0; N];
 				const N: u32 = 4;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArraySizeMismatch,
 			DiagnosticCode::TypeMistmatch,
@@ -5788,26 +5612,22 @@ mod tests {
 		// compared with `N` after what the body could decide itself, in a
 		// constant's and in a function's alike; the constant waits for the
 		// other constants, the function does not.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const N: u32 = 4;
 				const IN_CONSTANT: (heap::&[u8; N], u8) = ("ab", True);
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::ArraySizeMismatch,
 		]);
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const N: u32 = 4;
 				func in_function() {
 					local t: (heap::&[u8; N], u8) = ("ab", True);
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::ArraySizeMismatch,
@@ -5815,10 +5635,7 @@ mod tests {
 	}
 
 	/// The scope and type of the first parameter of the function `name`.
-	fn first_param(
-		case: &TestCase<'_>,
-		name: &str,
-	) -> (GenericEnvIdx, TypeIndex) {
+	fn first_param(case: &TestCase, name: &str) -> (GenericEnvIdx, TypeIndex) {
 		let DeclKind::Function(index) = case.resolve(name) else {
 			panic!("expected `{name}` to be a function");
 		};
@@ -5831,14 +5648,12 @@ mod tests {
 
 	#[test]
 	fn a_named_length_is_kept_unless_values_are_read() {
-		test_case!(
-			mut case = indoc! {r#"
+		let mut case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const N: u32 = 4;
 				func named(a: heap::&[u8; N]) {}
 				func written(a: heap::&[u8; 4]) {}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let (scope, named) = first_param(&case, "named");
 		let (_, written) = first_param(&case, "written");
@@ -5846,7 +5661,7 @@ mod tests {
 		let mut normalize = |ty, facts| {
 			case.sema
 				.normalize(
-					case.strings,
+					&case.strings,
 					case.sema.assumption_envs.of_frame(scope),
 					ty,
 					NormalizationDepth::Deep,
@@ -5869,8 +5684,7 @@ mod tests {
 
 	#[test]
 	fn a_match_in_a_constant_reads_later_constants() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				const PICK: u8 = match ON {
 					const YES => { 1 },
 					const NO => { 0 },
@@ -5883,8 +5697,7 @@ mod tests {
 					Side::Right => { 2 },
 				};
 				enum Side(u8) { Left = 0, Right = 1 }
-			"#}
-		);
+			"#});
 		// Both matches are exhaustive once the constants they read are known;
 		// a match is not evaluated (yet), which is all that is reported.
 		case.diagnostics().assert_codes(&[
@@ -5895,15 +5708,13 @@ mod tests {
 
 	#[test]
 	fn an_array_length_in_an_abstract_memory_is_representable_as_every_size() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				func short<M: Memory>(a: M::&[u8; 5]) {}
 				func long<M: Memory>(a: M::&[u8; 5000000000]) {}
 				func local<M: Memory>() {
 					local a: M::&[u8; 5000000000] = [0; _];
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypesetBoundViolation,
 			DiagnosticCode::TypesetBoundViolation,
@@ -5912,8 +5723,7 @@ mod tests {
 
 	#[test]
 	fn an_inferred_length_is_the_literals() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func f() {
 					local s: heap::&[u8; _] = "abc";
@@ -5926,22 +5736,19 @@ mod tests {
 					local s: heap::&[u8; _] = "abc";
 					local t: heap::&[u8; 4] = s;
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
 
 	#[test]
 	fn an_inferred_length_needs_an_array_to_learn_from() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func signature(a: heap::&[u8; _]) {}
 				func slice() { local z: heap::&[u8] = [0; _]; }
 				func neither() { local z: heap::&[u8; _] = [0; _]; }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::InferInSignature,
 			DiagnosticCode::TypeAnnotationRequired,
@@ -5951,21 +5758,19 @@ mod tests {
 
 	#[test]
 	fn enums_and_pointers_compare_natively() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func less(o: Ordering) -> Bool { o == Ordering::Less }
 				func same(a: heap::&u8, b: heap::&u8) -> Bool { a != b }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("less"), "(block => (== o#0 Less))");
 	}
 
 	#[test]
 	fn a_constant_comparing_variants_is_evaluated() {
-		test_case!(
-			case = "const SAME: Bool = Ordering::Less == Ordering::Greater;"
+		let case = TestCase::new(
+			"const SAME: Bool = Ordering::Less == Ordering::Greater;",
 		);
 		case.diagnostics().assert_none();
 		let DeclKind::Const(index) = case.resolve("SAME") else {
@@ -5983,14 +5788,12 @@ mod tests {
 		// says so, and that has not happened by the time anything could read
 		// the value, so nothing does: `BAD` is poisoned, and `READ`, which
 		// names it, is silent.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const N: u32 = 4;
 				const BAD: heap::&[u8; N] = "ab";
 				const READ: heap::&[u8; N] = BAD;
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ArraySizeMismatch]);
 		for name in ["BAD", "READ"] {
@@ -6009,27 +5812,23 @@ mod tests {
 	fn a_constant_is_checked_before_a_later_constant_reads_it() {
 		// `B` reads `A`'s value in its own check, before `A`'s turn: `A` is
 		// checked on demand, and a mismatch in it is reported once.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const B: heap::&[u8; A] = [0; _];
 				const A: u32 = True;
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
 
 	#[test]
 	fn a_function_item_is_a_zero_sized_constant() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func id<T: StackValue>(x: T) -> T { x }
 				const ID: id<u8> = id;
 				const AGAIN: id<u8> = ID;
 				func f() -> u8 { ID(1) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		for name in ["ID", "AGAIN"] {
 			let DeclKind::Const(index) = case.resolve(name) else {
@@ -6046,16 +5845,14 @@ mod tests {
 	/// `Value` is `Global`'s, bound through its subtrait `GlobalMut`.
 	#[test]
 	fn a_bound_on_a_supertraits_value_holds_for_each_global() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				global mut hits: u32 = 0;
 				global mut flag: Bool = False;
 				func bump<G: GlobalMut where { Value = u32 }>(g: G) {
 					g.set(g.get() + 1);
 				}
 				func f() { bump(hits); bump(flag); }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		case.diagnostics().assert_error_saying(
@@ -6065,13 +5862,11 @@ mod tests {
 
 	#[test]
 	fn a_global_handle_is_a_zero_sized_constant() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				global mut counter: u32 = 0;
 				const COUNTER: counter = counter;
 				func read() -> u32 { COUNTER.get() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		let DeclKind::Const(index) = case.resolve("COUNTER") else {
 			panic!("expected a constant");
@@ -6088,15 +5883,14 @@ mod tests {
 
 	#[test]
 	fn a_global_initializer_is_checked_against_its_type() {
-		test_case!(case = "global small: u8 = 300;");
+		let case = TestCase::new("global small: u8 = 300;");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 	}
 
 	#[test]
 	fn a_path_through_a_type_calls_its_member_directly() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum E(u8) { A = 0 }
 				impl E { pub func pick<T: StackValue>(t: T) -> E { E::A } }
 				struct W<T>(x: T);
@@ -6113,8 +5907,7 @@ mod tests {
 				func constructed() -> W<u16> { W::<u16>::new(1) }
 				func trait_impl() -> P { P::make() }
 				func value() { local f = W::<u8>::new; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("inherent"), "(block => (call pick<Bool> True))");
 		assert_eq!(case.shape("generic_impl"), "(block => (call get<u8> w#0))");
@@ -6126,8 +5919,7 @@ mod tests {
 
 	#[test]
 	fn a_trait_declaration_is_called_with_its_receiver_as_self() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Make: StackValue {
 					func make() -> Self;
 					func zero() -> u32 { 0 }
@@ -6136,8 +5928,7 @@ mod tests {
 				impl Make for P { func make() -> Self { P() } }
 				func abstract_receiver<T: StackValue + Make>() -> T { T::make() }
 				func inherited_default() -> u32 { P::zero() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("abstract_receiver"),
@@ -6151,8 +5942,7 @@ mod tests {
 
 	#[test]
 	fn a_bracketed_root_names_the_receiver_and_maybe_its_trait() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Make: StackValue { func make() -> Self; }
 				trait Other: StackValue { func make() -> Self; }
 				struct P();
@@ -6165,8 +5955,7 @@ mod tests {
 				func grouped() -> W<u8> { <W<u8>>::new(1) }
 				func ambiguous() -> P { P::make() }
 				func not_implemented() -> Bool { <Bool as Make>::make() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::AmbiguousTraitMember,
 			DiagnosticCode::TraitBoundViolation,
@@ -6181,8 +5970,7 @@ mod tests {
 
 	#[test]
 	fn a_member_must_exist_and_be_visible() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				mod inner {
 					pub struct S();
 					impl S { func hidden() {} pub func shown() {} }
@@ -6192,8 +5980,7 @@ mod tests {
 				func missing() { inner::S::nothing(); }
 				func private() { inner::S::hidden(); inner::S::shown(); }
 				func private_trait() { inner::S::secret(); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::MethodNotFound,
 			DiagnosticCode::PrivateItem,
@@ -6205,8 +5992,7 @@ mod tests {
 
 	#[test]
 	fn a_type_named_without_its_arguments_leaves_them_to_the_call() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct W<T>(x: T);
 				impl<T: StackValue> W<T> {
 					pub func new(x: T) -> W<T> { W(x) }
@@ -6222,8 +6008,7 @@ mod tests {
 				func picked() -> M<u32> { M::only() }
 				func uninferred() { W::empty(); }
 				func other_impl() -> M<u8> { M::only() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeAnnotationRequired,
 			DiagnosticCode::TypeMistmatch,
@@ -6241,8 +6026,7 @@ mod tests {
 
 	#[test]
 	fn a_receiver_call_learns_its_type_arguments_from_the_method() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct P<M: Memory, T>(addr: M::Size);
 				impl<M: Memory, T: StackValue> P<M, T> {
@@ -6259,8 +6043,7 @@ mod tests {
 				func written_wins(n: u32) -> heap::*u8 {
 					P::<heap, u16>::at(n).get()
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeAnnotationRequired,
 			DiagnosticCode::TypeAnnotationRequired,
@@ -6278,24 +6061,21 @@ mod tests {
 
 	#[test]
 	fn an_impl_selected_before_its_arguments_proves_its_bounds_at_the_call() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Small {}
 				impl Small for u8 {}
 				struct B<T>(x: T);
 				impl<T: StackValue + Small> B<T> { pub func new(x: T) -> B<T> { B(x) } }
 				func holds(a: u8) { local b = B::new(a); }
 				func violated() { local b = B::new(True); }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 	}
 
 	#[test]
 	fn a_wrong_type_argument_count_makes_that_frame_an_error() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func id<T: StackValue>(x: T) -> T { x }
 				func pair<A: StackValue, B: StackValue>(a: A, b: B) {}
 				func plain() {}
@@ -6306,8 +6086,7 @@ mod tests {
 				func own_none() { plain::<u8>(); }
 				func method(w: W<u8>) -> u8 { w.get::<u8>() }
 				func construction() { _ = W::<u8, u16>(1); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeArgumentCountMismatch,
 			DiagnosticCode::TypeArgumentCountMismatch,
@@ -6330,23 +6109,20 @@ mod tests {
 
 	#[test]
 	fn a_function_value_proves_its_bounds_once_where_it_is_named() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Small {}
 				impl Small for u8 {}
 				func take<T: StackValue + Small>(x: T) {}
 				func holds(a: u8) { local g = take::<u8>; g(a); }
 				func violated() { local g = take::<Bool>; g(True); }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 	}
 
 	#[test]
 	fn self_constructs_the_struct_its_impl_is_for() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct W<T>(x: T);
 				impl<T: StackValue> W<T> {
 					func positional(x: T) -> W<T> { Self(x) }
@@ -6355,8 +6131,7 @@ mod tests {
 				struct P();
 				trait Make: StackValue { func make() -> Self; }
 				impl Make for P { func make() -> Self { Self() } }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.member_shape("positional"), "(block => (W x#0))");
 		assert_eq!(case.member_shape("named"), "(block => (W x#0))");
@@ -6365,8 +6140,7 @@ mod tests {
 
 	#[test]
 	fn self_is_constructed_only_where_it_names_an_accessible_struct() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				mod inner { pub struct P(x: u32); }
 				impl inner::P { func outside() -> inner::P { Self(1) } }
 				struct W(x: u32);
@@ -6378,8 +6152,7 @@ mod tests {
 				impl E { func variant() -> E { Self(0) } }
 				trait Tr: StackValue { func make() -> Self { Self() } }
 				func free() { Self(); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::PrivateItem,
 			DiagnosticCode::StructUsedAsValue,
@@ -6398,8 +6171,7 @@ mod tests {
 
 	#[test]
 	fn an_associated_constant_is_read_like_its_function_would_be_called() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Sized {
 					const SIZE: u32;
 					const ALIGN: u32 = 4;
@@ -6417,8 +6189,7 @@ mod tests {
 				func qualified() -> u32 { <P as Sized>::SIZE }
 				const EVALUATED: u8 = P::ORIGIN;
 				func written() -> u8 { P::ORIGIN::<u8> }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeArgumentsNotAllowed]);
 		assert_eq!(case.shape("inherent"), "(block => ORIGIN)");
@@ -6441,8 +6212,7 @@ mod tests {
 
 	#[test]
 	fn a_method_call_passes_its_receiver_first() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct W<T>(x: T);
 				impl<T: StackValue> W<T> {
@@ -6459,8 +6229,7 @@ mod tests {
 				func abstract_receiver<T: StackValue + Twice>(t: T) -> T { t.twice() }
 				func pointer(p: heap::*W<u8>) -> u8 { p.by_pointer() }
 				func reverse(o: Ordering) -> Ordering { o.reverse() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("inherent"), "(block => (call get<u8> w#0))");
 		assert_eq!(
@@ -6487,8 +6256,7 @@ mod tests {
 	/// inherit, so they are called with the global as `Self`.
 	#[test]
 	fn a_global_is_read_and_written_through_its_handle() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				global mut counter: u32 = 0;
 				global limit: u32 = 10;
 				func bump() -> u32 {
@@ -6496,8 +6264,7 @@ mod tests {
 					counter.get()
 				}
 				func fixed() { limit.set(1); }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::MethodNotFound]);
 		assert_eq!(
@@ -6509,8 +6276,7 @@ mod tests {
 
 	#[test]
 	fn a_method_call_needs_a_method_of_the_receiver() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct S();
 				impl S {
@@ -6523,8 +6289,7 @@ mod tests {
 				func loaded(p: heap::*S) { p.*.by_value(); }
 				func untyped() { (1).add(2); }
 				func arguments(s: S) { s.by_value(1); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::MethodNotFound,
 			DiagnosticCode::NotAMethod,
@@ -6539,8 +6304,7 @@ mod tests {
 
 	#[test]
 	fn a_call_by_name_binds_each_argument_to_its_parameter() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(a: u32, b: i64) -> u32 { a }
 				func id<T: StackValue>(value: T, flag: Bool) -> T { value }
 				func by_name() -> u32 {
@@ -6550,8 +6314,7 @@ mod tests {
 				func in_order() -> u32 { f({ a: 1, b: 2 }) }
 				func positional() -> u32 { f(1, 2) }
 				func generic(x: u8) -> u8 { id({ flag: True, value: x }) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("by_name"),
@@ -6567,16 +6330,14 @@ mod tests {
 
 	#[test]
 	fn a_method_is_called_by_name_with_its_receiver_named_self() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct S(n: u32);
 				impl S {
 					pub func pick(self: Self, n: u32, m: u32) -> u32 { n }
 				}
 				func method(s: S) -> u32 { s.pick({ m: 1, n: 2 }) }
 				func path(s: S) -> u32 { S::pick({ n: 2, self: s, m: 1 }) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("method"), "(block => (call pick s#0 1=1 0=2))");
 		assert_eq!(case.shape("path"), "(block => (call pick 1=2 0=s#0 2=1))");
@@ -6587,14 +6348,12 @@ mod tests {
 	/// leaves out, and conformance reports the member.
 	#[test]
 	fn a_call_skips_an_impl_member_of_another_kind() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Size: StackValue { func size(self: Self) -> u32 { 0 } }
 				struct S();
 				impl Size for S { const size: u32 = 1; }
 				func f(s: S) -> u32 { s.size() }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplItemKindMismatch]);
 		assert_eq!(case.shape("f"), "(block => (abstract size<S> s#0))");
@@ -6602,8 +6361,7 @@ mod tests {
 
 	#[test]
 	fn a_trait_impl_function_is_called_by_its_traits_names() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct P(v: u32);
 				impl Add for P {
 					func add(self: Self, other: Self) -> Self { other }
@@ -6612,8 +6370,7 @@ mod tests {
 				func path(p: P, q: P) -> P { P::add({ rhs: q, self: p }) }
 				func generic<T: Add>(a: T, b: T) -> T { a.add({ rhs: b }) }
 				func impl_name(p: P, q: P) -> P { p.add({ other: q }) }
-			"}
-		);
+			"});
 		// The impl's own name breaks the trait's contract, and calls still use
 		// the trait's.
 		case.diagnostics().assert_codes(&[
@@ -6634,8 +6391,7 @@ mod tests {
 
 	#[test]
 	fn every_path_to_a_known_function_can_be_called_by_name() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Make: StackValue {
 					func make(value: u32, scale: u32) -> Self;
 				}
@@ -6658,8 +6414,7 @@ mod tests {
 				}
 				func generic<T: StackValue + Make>() -> T { T::make({ scale: 1, value: 2 }) }
 				func learned(a: u8) -> W<u8> { W::new({ flag: True, x: a }) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.member_shape("again"),
@@ -6678,8 +6433,7 @@ mod tests {
 
 	#[test]
 	fn a_call_by_name_follows_the_traits_names_even_where_it_leaves_one_out() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Scale: StackValue {
 					func scale(self: Self, u32) -> Self;
 				}
@@ -6689,8 +6443,7 @@ mod tests {
 				}
 				func named(s: S) -> S { s.scale({ by: 2 }) }
 				func positional(s: S) -> S { s.scale(2) }
-			"}
-		);
+			"});
 		// Naming the parameter breaks the trait's contract, and the call still
 		// follows the trait's declaration, which has no name to call it by.
 		case.diagnostics().assert_codes(&[
@@ -6706,13 +6459,11 @@ mod tests {
 
 	#[test]
 	fn a_call_by_name_reaches_the_first_parameter_of_a_name_declared_twice() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func d(a: u32, a: u32) {}
 				func once() { d({ a: 1 }) }
 				func twice() { d({ a: 1, a: 2 }) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::DuplicateFunctionParameter,
 			DiagnosticCode::DuplicateNamedArgument,
@@ -6722,14 +6473,12 @@ mod tests {
 
 	#[test]
 	fn an_empty_call_by_name_gives_no_argument() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func none() {}
 				func some(a: u32) {}
 				func empty() { none({}) }
 				func missing() { some({}) }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::MissingArguments]);
 		assert_eq!(case.shape("empty"), "(block => (call none))");
@@ -6737,8 +6486,7 @@ mod tests {
 
 	#[test]
 	fn a_call_by_name_reports_what_does_not_match_its_parameters() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct S();
 				impl S {
 					pub func m(self: Self, n: u32) {}
@@ -6751,8 +6499,7 @@ mod tests {
 				func unnamed() { g({ b: 1 }) }
 				func receiver(s: S) { s.m({ self: s, n: 1 }) }
 				func mismatch(x: i64) { f({ a: x, b: x }) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnknownParameterName,
 			DiagnosticCode::DuplicateNamedArgument,
@@ -6779,8 +6526,7 @@ mod tests {
 
 	#[test]
 	fn a_reported_argument_list_does_not_also_report_an_uninferred_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func pair<T: StackValue>(a: T, b: T) -> T { a }
 				func none<T: StackValue>(flag: Bool) -> T { loop {} }
 				func g<T: StackValue>(T, b: u32) -> T { loop {} }
@@ -6793,8 +6539,7 @@ mod tests {
 				func construction() { W(1); }
 				func construction_by_name() { W({ x: 1 }); }
 				func uninferred() { none(True); }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::MissingArguments,
@@ -6815,12 +6560,10 @@ mod tests {
 
 	#[test]
 	fn an_argument_built_with_a_known_type_is_held_to_it() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func three<T: StackValue>(a: T, b: T, c: T) -> T { a }
 				func f(x: u8, y: u16) { three(x, y, nothing); }
-			"}
-		);
+			"});
 		// `T` is `u8` from `x` before `y` is built, so `y` is held to `u8`
 		// although the failed third argument leaves `T` an error.
 		case.diagnostics().assert_codes(&[
@@ -6831,14 +6574,12 @@ mod tests {
 
 	#[test]
 	fn an_unsupported_form_is_reported_once_as_a_bug() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func f(s: heap::&[u8]) -> heap::&[u8] {
 					s[1..]
 				}
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
 		assert_eq!(case.shape("f"), "(block => error)");
@@ -6846,8 +6587,7 @@ mod tests {
 
 	#[test]
 	fn a_local_pattern_takes_its_value_apart() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct Point(x: u32, y: i64);
 				struct W<T>(a: T, b: Bool);
 				func f(p: Point, t: (u8, (u16, u32)), w: W<u8>) {
@@ -6857,8 +6597,7 @@ mod tests {
 					local (.., (d, ..)) = t;
 					local W(e, mut g) = w;
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -6881,8 +6620,7 @@ mod tests {
 
 	#[test]
 	fn a_local_pattern_must_fit_its_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct Point(x: u32, y: u32);
 				struct Pair(u32, u32);
 				func f(p: Point, t: (u32, u32), q: Pair) {
@@ -6895,8 +6633,7 @@ mod tests {
 					local (m, k) = p;
 					local Pair(r, s) = p;
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::DuplicateRestPattern,
@@ -6916,14 +6653,12 @@ mod tests {
 
 	#[test]
 	fn a_local_pattern_cannot_test_a_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(t: (u32, u32)) -> u32 {
 					local (a, 0) = t;
 					a
 				}
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::RefutablePatternInLocal]);
 		assert_eq!(
@@ -6934,8 +6669,7 @@ mod tests {
 
 	#[test]
 	fn a_match_checks_each_arm_against_the_scrutinee() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func sign(x: i32) -> i32 {
 					match x {
 						0 => { 0 },
@@ -6943,8 +6677,7 @@ mod tests {
 						n => { n },
 					}
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("sign"),
@@ -6958,8 +6691,7 @@ mod tests {
 
 	#[test]
 	fn a_match_compares_with_constants_and_destructures() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Dir(u8) { North = 0, South = 1 }
 				const LIMIT: u8 = 10;
 				struct P(x: u8, d: Dir);
@@ -6975,8 +6707,7 @@ mod tests {
 						_ => { 4 },
 					}
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -6994,8 +6725,7 @@ mod tests {
 	/// tuple, several for a lone tuple field match that tuple.
 	#[test]
 	fn a_struct_pattern_matches_its_fields_as_one_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct P(x: u8, y: u16);
 				struct W(x: (u8, u16));
 				struct Unit();
@@ -7006,8 +6736,7 @@ mod tests {
 				func lone_rest(w: W) -> u16 { local W(.., b) = w; b }
 				func field(w: W) -> (u8, u16) { local W(t) = w; t }
 				func unit(u: Unit) { local Unit(e) = u; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.locals("whole")[1], ("t".into(), "(u8, u16)".into()));
 		assert_eq!(
@@ -7025,8 +6754,7 @@ mod tests {
 
 	#[test]
 	fn an_open_enum_is_exhaustive_only_with_a_wildcard() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Closed(u8) { A = 0, B = 1, C = 2 }
 				enum Open(u8) { A = 0, B = 1, .. }
 				func closed(c: Closed) -> u8 {
@@ -7043,8 +6771,7 @@ mod tests {
 				}
 				func destructure(o: Open) { local x = o; local _ = o; }
 				func same(a: Open, b: Open) -> Bool { a == b }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::NonExhaustiveMatch]);
 	}
@@ -7052,18 +6779,15 @@ mod tests {
 	#[test]
 	fn an_open_enum_is_its_variants_and_the_rest() {
 		// What is not covered is named by variant first, then `_` for the rest.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Open(u8) { A = 0, B = 1, C = 2, .. }
 				func f(o: Open) -> u8 { match o { Open::A => { 1 } } }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_error_saying("patterns `Open::B`, `Open::C` and `_`");
 
 		// Inside a tuple, and with a signed repr.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Sign(i8) { Minus = -1, Zero = 0, .. }
 				func f(a: Sign, b: Bool) -> u8 {
 					match (a, b) {
@@ -7072,8 +6796,7 @@ mod tests {
 						(_, _) => { 3 },
 					}
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 	}
 
@@ -7091,7 +6814,7 @@ mod tests {
 			all.join(", "),
 			arms.join(", ")
 		);
-		test_case!(case = source.as_str());
+		let case = TestCase::new(source.as_str());
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::RedundantOpenMarker]);
 
@@ -7100,7 +6823,7 @@ mod tests {
 			all.join(", "),
 			arms.join(", ")
 		);
-		test_case!(case = source.as_str());
+		let case = TestCase::new(source.as_str());
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::RedundantOpenMarker,
 			DiagnosticCode::UnreachableMatchArm,
@@ -7110,16 +6833,16 @@ mod tests {
 	#[test]
 	fn the_dots_of_an_enum_are_judged_when_its_signature_is_built() {
 		// Fine: one `..`, last.
-		test_case!(case = "enum E(u8) { A = 0, .. }");
+		let case = TestCase::new("enum E(u8) { A = 0, .. }");
 		case.diagnostics().assert_none();
 
 		// Any `..` opens the enum, so a misplaced one only draws a warning.
-		test_case!(case = "enum E(u8) { A = 0, .., B = 1 }");
+		let case = TestCase::new("enum E(u8) { A = 0, .., B = 1 }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::MisplacedOpenMarker]);
 
 		// A second adds nothing.
-		test_case!(case = "enum E(u8) { A = 0, .., .. }");
+		let case = TestCase::new("enum E(u8) { A = 0, .., .. }");
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::MisplacedOpenMarker,
 			DiagnosticCode::RedundantOpenMarker,
@@ -7129,33 +6852,30 @@ mod tests {
 		let all: Vec<String> =
 			(0..256).map(|n| format!("V{n} = {n}")).collect();
 		let source = format!("enum E(u8) {{ {}, .. }}", all.join(", "));
-		test_case!(case = source.as_str());
+		let case = TestCase::new(source.as_str());
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::RedundantOpenMarker]);
 
 		// One value short, it is not.
 		let source = format!("enum E(u8) {{ {}, .. }}", all[1..].join(", "));
-		test_case!(case = source.as_str());
+		let case = TestCase::new(source.as_str());
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn an_open_enum_missing_arm_is_a_wildcard() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Open(u8) { A = 0, .. }
 				func named(o: Open) -> u8 {
 					match o { Open::A => { 1 } }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_error_saying("pattern `_`");
 	}
 
 	#[test]
 	fn a_struct_pattern_of_its_fields_as_one_value_counts_for_exhaustiveness() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct P(x: u8, y: u16);
 				struct W(x: (u8, u16));
 				func covered(p: P) -> u8 {
@@ -7169,8 +6889,7 @@ mod tests {
 				}
 				func count(p: P) { local P(a, b, c) = p; }
 				func lone(w: W) { local W(a, b, c) = w; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NonExhaustiveMatch,
 			DiagnosticCode::UnreachableMatchArm,
@@ -7183,8 +6902,7 @@ mod tests {
 	fn a_constant_has_its_value_wherever_a_pattern_may_name_it() {
 		// A constant's value is known wherever a pattern may name it: in a
 		// function's block, in a global's initializer, in a constant's own.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Dir(u8) { North = 0, East = 1, South = 2 }
 				const N: Dir = Dir::North;
 				global g: Dir = match (N) {
@@ -7206,8 +6924,7 @@ mod tests {
 						_ => {},
 					}
 				}
-			"}
-		);
+			"});
 		// In both, the second arm is covered by the first. Each global's
 		// `match` is a constant in principle, but the evaluator folds no
 		// control flow yet, so its initializer is not evaluated (E2015).
@@ -7225,8 +6942,7 @@ mod tests {
 		// checking one asks for the other's value, which needs the other
 		// checked, which asks for the first one's value again. Only a checked
 		// body is evaluated, so that is a loop, reported once.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				const A: Bool = match (True) { const B => { True }, _ => { False } };
 				const B: Bool = match (True) { const A => { True }, _ => { False } };
 				func f() -> Bool {
@@ -7235,8 +6951,7 @@ mod tests {
 						_ => { False },
 					}
 				}
-			"}
-		);
+			"});
 		// The constants are poisoned, so the function that names them is silent.
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CyclicConstant]);
@@ -7246,14 +6961,12 @@ mod tests {
 	fn a_float_literal_needs_eq_and_a_string_cannot_be_matched() {
 		// The parser reads them; a float has only partial equality, and a
 		// string has no equality at all.
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				func f(x: f32, s: u8) {
 					match x { 1.5 => {}, _ => {} }
 					match s { "hi" => {}, _ => {} }
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::UnmatchableLiteral,
@@ -7266,8 +6979,7 @@ mod tests {
 
 	#[test]
 	fn a_match_constant_needs_eq() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct P(x: u8);
 				const F: f32 = 1.0;
 				const ORIGIN: P = P(0);
@@ -7277,8 +6989,7 @@ mod tests {
 				func points(p: P) {
 					match p { const ORIGIN => {}, _ => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::TraitBoundViolation,
@@ -7291,8 +7002,7 @@ mod tests {
 
 	#[test]
 	fn an_enum_satisfies_eq_and_partial_eq_structurally() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Color(u8) { Red = 0, Green }
 				func needs_eq<T: Eq>(value: T) {}
 				func needs_partial<T: PartialEq>(value: T) {}
@@ -7300,15 +7010,13 @@ mod tests {
 					needs_eq(color);
 					needs_partial(color);
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_float_or_an_aggregate_can_still_be_bound() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct P(x: u8);
 				func floats(x: f32) -> f32 {
 					match x { whole => { whole + 1.0 } }
@@ -7316,8 +7024,7 @@ mod tests {
 				func points(p: P) -> P {
 					match p { whole => { whole }, }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 	}
 
@@ -7326,16 +7033,14 @@ mod tests {
 		// A `local` always matches: every test in it is a mistake, and each
 		// one poisons its own pattern, so the pattern takes the value apart
 		// and binds without testing. Only the first test is reported.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				const C: u8 = 1;
 				func f(x: (u8, u8)) {
 					local (a, 5) = x;
 					local (b, const C) = x;
 					local (c, 5) | (0, 10) = x;
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::RefutablePatternInLocal,
 			DiagnosticCode::RefutablePatternInLocal,
@@ -7354,13 +7059,11 @@ mod tests {
 		// The name is bound twice in the second alternative, which is a
 		// mistake, but it is still the one local the alternatives share: the
 		// two bindings are of different types, and that is said too.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i32, i64)) {
 					match x { (a, 5, 6) | (a, b, a) => { local _ = a; }, _ => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::DuplicatePatternBinding,
 			DiagnosticCode::TypeMistmatch,
@@ -7378,13 +7081,11 @@ mod tests {
 	fn the_same_name_in_two_alternatives_is_one_local() {
 		// The same name in two alternatives is one local, which the arm's
 		// body reads.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i64)) {
 					match x { (a, 5) | (a, 10) => { local _ = a; }, _ => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -7395,13 +7096,11 @@ mod tests {
 
 	#[test]
 	fn a_binding_bound_differently_in_two_alternatives_is_an_error() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i64)) {
 					match x { (mut a, 5) | (a, 10) => {}, _ => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::InconsistentPatternBinding]);
 		case.diagnostics().assert_error_saying(
@@ -7414,13 +7113,11 @@ mod tests {
 	fn a_binding_must_have_the_same_type_in_all_alternatives() {
 		// The two alternatives bind `a` and `b` at different types, so
 		// neither can be one local of one type.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i64)) {
 					match x { (a, b) | (b, a) => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
@@ -7435,15 +7132,13 @@ mod tests {
 	fn nested_alternatives_bind_the_same_names() {
 		// Each `|` is checked on its own: the inner one binds `a` in one
 		// alternative and `b` in the other, and the outer one sees both.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: ((i32, i32), i32)) {
 					match x { ((a, 1) | (a, 2), 3) => {}, _ => {} }
 					match x { ((a, 1) | (b, 2), 3) => {}, _ => {} }
 					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) => {}, _ => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NotBoundInAllAlternatives,
 			DiagnosticCode::NotBoundInAllAlternatives,
@@ -7457,16 +7152,14 @@ mod tests {
 	fn a_name_bound_twice_in_one_pattern_is_an_error() {
 		// A name bound in the same product is bound twice: the alternatives
 		// of a `|` share a name, but two groups in one pattern do not.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: ((i32, i32), (i32, i32))) {
 					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) => {}, _ => {} }
 				}
 				func g(x: ((i32, i32), i32)) {
 					match x { ((a, 1) | (a, 2), a) => {}, _ => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::DuplicatePatternBinding,
 			DiagnosticCode::DuplicatePatternBinding,
@@ -7476,16 +7169,14 @@ mod tests {
 
 	#[test]
 	fn a_local_pattern_binds_the_same_names_in_its_alternatives() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i64)) {
 					local (a, b) | (a, b) = x;
 				}
 				func g(x: (i32, i64)) {
 					local (a, 5) | (0, 10) = x;
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::RefutablePatternInLocal,
 			DiagnosticCode::NotBoundInAllAlternatives,
@@ -7498,8 +7189,7 @@ mod tests {
 
 	#[test]
 	fn a_value_in_a_pattern_is_a_constant_of_the_matched_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				const C: u8 = 1;
 				func g() {}
 				func f(x: u8, b: Bool) {
@@ -7511,8 +7201,7 @@ mod tests {
 					match b { const C => {}, _ => {} }
 					match x { 1 | z => {}, _ => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UndeclaredIdentifier,
 			DiagnosticCode::InvalidMatchPattern,
@@ -7534,13 +7223,11 @@ mod tests {
 	/// included: constant evaluation relies on never meeting one.
 	#[test]
 	fn a_float_has_no_remainder() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func a(x: f64, y: f64) -> f64 { x % y }
 				func b(x: f32, y: f32) -> f32 { x.rem(y) }
 				const C: f64 = 5.0 % 2.0;
-			"}
-		);
+			"});
 		// Constant bodies are checked before function bodies.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitBoundViolation,
@@ -7553,15 +7240,13 @@ mod tests {
 
 	#[test]
 	fn match_arms_share_a_type() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: u8) -> u64 { match x { 0 => { 1 }, _ => { 2 } } }
 				func g(x: u8) -> u8 {
 					match x { 0 => { return 0 }, _ => { x } }
 				}
 				func h(x: u8) { local v = match x { 0 => { 1 }, _ => { True } }; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
 		assert_eq!(case.body_type("f"), "u64");
@@ -7572,13 +7257,11 @@ mod tests {
 	fn every_untyped_arm_takes_a_later_typed_arms_type() {
 		// The typed arm meets the first untyped one; the ones between are
 		// coerced too, so `300` is held to `u8` like the others.
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func g() -> u8 { 5 }
 				func f(x: u32) -> u8 { match x { 0 => 1, 1 => 2, _ => g() } }
 				func h(x: u32) -> u8 { local v = match x { 0 => 1, 1 => 300, _ => g() }; v }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
 		case.diagnostics()
@@ -7588,30 +7271,26 @@ mod tests {
 
 	#[test]
 	fn match_arm_bodies_may_be_expressions() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func f(x: u8) -> u8 {
 					match x {
 						0 => 1,
 						n => n + 1,
 					}
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.body_type("f"), "u8");
 	}
 
 	#[test]
 	fn self_destructures_the_struct_its_impl_is_for() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct W(x: u32, y: u32);
 				impl W {
 					func head(self: Self) -> u32 { local Self(x, ..) = self; x }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.member_shape("head"),
@@ -7621,8 +7300,7 @@ mod tests {
 
 	#[test]
 	fn a_match_must_cover_every_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Dir(u8) { North = 0, East, South, West }
 				struct P(x: Bool, y: Bool);
 				func a(d: Dir) -> u8 {
@@ -7641,8 +7319,7 @@ mod tests {
 				func s(p: P) {
 					match p { P(const True, _) => {}, P(const False, const True) => {} }
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NonExhaustiveMatch,
 			DiagnosticCode::NonExhaustiveMatch,
@@ -7669,8 +7346,7 @@ mod tests {
 
 	#[test]
 	fn an_arm_the_arms_before_it_cover_is_unreachable() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				const ZERO: u8 = 0;
 				func u(x: u8) { match x { _ => {}, 0 => {} } }
 				func v(b: Bool) {
@@ -7678,8 +7354,7 @@ mod tests {
 				}
 				func w(x: u8) { match x { 0 | 1 => {}, 1 => {}, _ => {} } }
 				func z(x: u8) { match x { const ZERO => {}, 0 => {}, _ => {} } }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnreachableMatchArm,
 			DiagnosticCode::UnreachableMatchArm,
@@ -7692,8 +7367,7 @@ mod tests {
 
 	#[test]
 	fn a_constant_counts_by_its_value_unless_it_is_abstract() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				enum Dir(u8) { North = 0, East, South }
 				const N: Dir = Dir::North;
 				trait Lim { const MAX: u8; }
@@ -7702,8 +7376,7 @@ mod tests {
 				}
 				func l<T: Lim>(x: u8) { match x { T::MAX => {} } }
 				func m<T: Lim>(x: u8) { match x { T::MAX => {}, _ => {} } }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::NonExhaustiveMatch]);
 		case.diagnostics().assert_error_saying(
@@ -7713,7 +7386,8 @@ mod tests {
 
 	#[test]
 	fn a_match_with_a_failed_pattern_is_not_checked_for_coverage() {
-		test_case!(case = "func f(x: u8) { match x { const nope => {} } }");
+		let case =
+			TestCase::new("func f(x: u8) { match x { const nope => {} } }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}
@@ -7745,15 +7419,14 @@ mod tests {
 			),
 		];
 		for (source, owner) in cases {
-			test_case!(case = source);
+			let case = TestCase::new(source);
 			case.diagnostics().assert_codes(&[owner]);
 		}
 	}
 
 	#[test]
 	fn slices_and_arrays_have_the_slice_traits() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func f(s: heap::&[u8], a: heap::*[u16; 4]) {
 					local n: u32 = s.len();
@@ -7765,8 +7438,7 @@ mod tests {
 				}
 				func g<M: Memory, T>(s: M::&[T]) -> M::Size { s.len() - 1 }
 				func h<M: Memory, S: Slice>(s: M::&S) -> M::&S::Value { s.first() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -7782,8 +7454,7 @@ mod tests {
 
 	#[test]
 	fn pointers_have_the_pointer_trait() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct Is<
 					P: Pointer where { Memory = M, Pointee = T },
@@ -7797,8 +7468,7 @@ mod tests {
 				func size<P: Pointer>(n: <P::Memory as Memory>::Size) {}
 				func element<M: Memory, S: Slice>(p: M::&<M::*S as Pointer>::Pointee) -> M::&S::Value { p[0].& }
 				func not_pointers(a: Needs<u32>, b: Needs<(heap::&u8, u8)>) {}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::TraitBoundViolation,
@@ -7807,8 +7477,7 @@ mod tests {
 
 	#[test]
 	fn pointer_metadata_keeps_recursive_slice_equalities_rigid() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				trait Tr { type Item; }
 				func direct<T: Tr where { Item = [T::Item] }>(
@@ -7828,16 +7497,14 @@ mod tests {
 				func not_thin<T: Tr where { Item = [T::Item] }>(
 					p: heap::&T::Item,
 				) -> u32 { transmute(p) }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 	}
 
 	#[test]
 	fn a_pointer_carries_its_pointee_counts_as_metadata() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct Is<P: Pointer where { Metadata = X }, X: StackValue>();
 				func concrete(
@@ -7859,8 +7526,7 @@ mod tests {
 					x
 				}
 				func not_thin<M: Memory, S: Slice>(x: <M::&S as Pointer>::Metadata) -> () { x }
-			"}
-		);
+			"});
 		// Neither an unbounded `T` nor a `Slice` that may not be an array is
 		// known to be thin.
 		case.diagnostics().assert_codes(&[
@@ -7871,16 +7537,14 @@ mod tests {
 
 	#[test]
 	fn a_pointer_is_held_as_its_address_and_metadata() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct Needs<V: StackValue>();
 				func nested(p: heap::&[[u8]]) -> (u32, u32, u32) { transmute(p) }
 				func shared<M: Memory, S: Slice>(p: M::*S) -> M::&S { transmute(p) }
 				func held<M: Memory, S: Slice>(a: Needs<M::&S>, b: Needs<(M::*S, u8)>) {}
 				func not_thin<M: Memory, S: Slice>(p: M::&S) -> M::Size { transmute(p) }
-			"}
-		);
+			"});
 		case.diagnostics().print();
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
@@ -7888,8 +7552,7 @@ mod tests {
 
 	#[test]
 	fn a_pointer_is_built_from_and_taken_apart_into_its_parts() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func slice(address: u32, len: u32) -> heap::&[u8] {
 					from_raw_parts(address, len)
@@ -7908,8 +7571,7 @@ mod tests {
 				func round_trip<P: Pointer>(p: P) -> P { from_raw_parts(address(p), metadata(p)) }
 				func passed<P: Pointer>(p: P) -> P { transmute(p) }
 				func no_length(address: u32) -> heap::&[u8] { from_raw_parts(address, ()) }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
@@ -7918,16 +7580,14 @@ mod tests {
 	/// says what its sides reduce to.
 	#[test]
 	fn an_equality_mismatch_states_the_equality_and_shows_the_values() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				trait Container { type Item; }
 				struct Bytes(); impl Container for Bytes { type Item = u8; }
 				struct Words(); impl Container for Words { type Item = u16; }
 				func same<A: Container, B: Container where { Item = A::Item }>() {}
 				func pair() { same::<Bytes, Words>(); }
 				func widen(x: u32) -> u64 { transmute(x) }
-			"}
-		);
+			"});
 		let diagnostics = case.diagnostics();
 		diagnostics.assert_codes(&[
 			DiagnosticCode::AssocTypeEqualityMismatch,
@@ -7956,21 +7616,18 @@ mod tests {
 	/// shadow its: `address(5)` calls the program's `address`, not std's.
 	#[test]
 	fn a_program_item_shadows_the_std_prelude() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				struct Layout();
 				func trap() {}
 				func address(x: u32) -> u32 { x }
 				func f() -> u32 { address(5) }
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_value_is_a_stack_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				type R = [u8];
 				struct S(x: [u8; 4]);
@@ -7981,8 +7638,7 @@ mod tests {
 				func l(p: heap::&[u8]) { local v: [u8; 2] = trap(); }
 				func m<M: Memory, T>(t: T, p: M::&[T], q: M::*[T; 3], r: ([u8])) {}
 				func n() -> S { trap() }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NotStackValue,
 			DiagnosticCode::NotStackValue,
@@ -8009,8 +7665,7 @@ mod tests {
 	/// them by value states what it needs.
 	#[test]
 	fn a_type_argument_may_be_a_slice() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct Box<T>(p: heap::*T);
 				struct Header(len: u32, data: [u8; 16]);
@@ -8027,8 +7682,7 @@ mod tests {
 					value::<[u8]>();
 					local z = size_of::<[u8], heap>();
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitBoundViolation,
 			DiagnosticCode::TraitBoundViolation,
@@ -8037,14 +7691,12 @@ mod tests {
 
 	#[test]
 	fn a_load_reads_a_stack_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func f<M: Memory, T>(p: M::&T) { local x = p.*; }
 				func g<M: Memory, T: StackValue>(p: M::&T) -> T { p.* }
 				func h(p: heap::&[u8; 2]) { local x = p.*; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NotStackValue,
 			DiagnosticCode::NotStackValue,
@@ -8055,23 +7707,20 @@ mod tests {
 	/// slice; otherwise its pointer's metadata is unknown.
 	#[test]
 	fn a_pointer_to_an_unbounded_parameter_may_be_fat() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				func thin<M: Memory, T: StackValue>(p: M::&T) -> M::Size {
 					transmute(p)
 				}
 				func fat<M: Memory, T>(p: M::&T) -> M::Size { transmute(p) }
 				func any<M: Memory, T>(p: M::&T) -> M::&T { p }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 	}
 
 	#[test]
 	fn a_literal_is_data_its_context_places() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const GREETING: [u8; 5] = "hello";
 				const SHORT: heap::&[u8; 4] = GREETING;
@@ -8084,8 +7733,7 @@ mod tests {
 					local v = GREETING;
 					local w = "a" + "b";
 				}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::ArraySizeMismatch,
 			DiagnosticCode::TypeMistmatch,
@@ -8112,20 +7760,17 @@ mod tests {
 
 	#[test]
 	fn a_method_of_a_slice_takes_its_ownership_from_the_receiver() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func f(a: heap::&[u8; 2]) { a.as_slice_mut(); }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
 
 	#[test]
 	fn an_element_is_a_place_in_the_slice() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func f(s: heap::&[u8], a: heap::*[u16; 4], m: heap::&[heap::&[u8]]) {
 					local e: u8 = s[0];
@@ -8139,8 +7784,7 @@ mod tests {
 				) -> S::Value {
 					s[i]
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -8158,8 +7802,7 @@ mod tests {
 	/// exclusive. `s.*[i]` is the same element as `s[i]`.
 	#[test]
 	fn an_array_place_is_indexed_in_place() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct Header(len: u32, data: [u8; 4]);
 				func f(h: heap::*Header, s: heap::&[u8], m: heap::&[[u8; 2]]) {
@@ -8169,8 +7812,7 @@ mod tests {
 				}
 				func g(h: heap::&Header) { h.data[0] = 1; }
 				func k(h: heap::&Header) { local x = h.len[0]; }
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::CannotMutateImmutable,
 			DiagnosticCode::CannotIndex,
@@ -8186,28 +7828,24 @@ mod tests {
 
 	#[test]
 	fn an_element_of_a_shared_slice_is_read_only() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func f(s: heap::&[u8]) { s[0] = 1; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
 	}
 
 	#[test]
 	fn only_a_slice_or_an_array_is_indexed() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				func f(ps: heap::&heap::&[u8], o: Ordering) {
 					local a: u8 = ps[0];
 					local b: u8 = o[0];
 					local c: u8 = 7[0];
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::CannotIndex,
 			DiagnosticCode::CannotIndex,
@@ -8220,8 +7858,7 @@ mod tests {
 
 	#[test]
 	fn a_field_is_reached_through_one_pointer() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct P(x: u32, next: heap::&P);
 				func f(p: heap::*P) {
@@ -8231,8 +7868,7 @@ mod tests {
 					local z: u32 = p.*.x;
 				}
 				func g(pp: heap::&heap::&P) -> u32 { pp.x }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnknownStructField]);
 		case.diagnostics().assert_error_saying("as `p.*.field`");
@@ -8248,8 +7884,7 @@ mod tests {
 
 	#[test]
 	fn a_field_through_a_pointer_is_a_place() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct P(x: u32, next: heap::&P);
 				func f(p: heap::*P, s: heap::&[heap::&P], v: heap::&[P]) {
@@ -8259,8 +7894,7 @@ mod tests {
 					local b: u32 = s[0].x;
 					local c: u32 = v[0].x;
 				}
-			"}
-		);
+			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
@@ -8275,13 +7909,11 @@ mod tests {
 
 	#[test]
 	fn a_field_through_a_shared_pointer_is_read_only() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 				memory heap: u32;
 				struct P(x: u32);
 				func f(p: heap::&P) { p.x = 1; }
-			"}
-		);
+			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
 	}

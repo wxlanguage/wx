@@ -2772,17 +2772,6 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 	use crate::vfs::{self, Files};
 
-	/// `test_case!(case = "source")` declares the interner, the graph and the
-	/// checked `TestCase` as three locals of the calling test.
-	/// The source is a binary over the real stdlib.
-	macro_rules! test_case {
-		($case:ident = $source:expr $(,)?) => {
-			let mut strings = ast::Keyword::create_interner();
-			let graph = source_graph($source, &mut strings);
-			let $case = TestCase::new(&graph, &mut strings);
-		};
-	}
-
 	fn source_graph(
 		source: &str,
 		strings: &mut StringInterner,
@@ -2811,18 +2800,18 @@ mod tests {
 	}
 
 	/// A checked `Semantics`, with the inputs it was checked from.
-	struct TestCase<'a> {
-		files: &'a Files,
-		strings: &'a StringInterner,
+	/// The source is a binary over the real stdlib.
+	struct TestCase {
+		files: Files,
+		strings: StringInterner,
 		sema: Semantics,
 	}
 
-	impl<'a> TestCase<'a> {
-		fn new(
-			graph: &'a vfs::CompilationUnit,
-			strings: &'a mut StringInterner,
-		) -> Self {
-			let mut sema = crate::tir::check(graph, strings);
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = ast::Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let mut sema = crate::tir::check(&graph, &mut strings);
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
 			let root_file = sema
@@ -2839,14 +2828,14 @@ mod tests {
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
 			});
 			Self {
-				files: &graph.files,
+				files: graph.files,
 				strings,
 				sema,
 			}
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
-			DiagnosticView::new("eval", &self.sema.diagnostics, self.files)
+			DiagnosticView::new("eval", &self.sema.diagnostics, &self.files)
 		}
 
 		/// What a root-level `name` resolves to in `tier`, by real path
@@ -2866,7 +2855,7 @@ mod tests {
 			PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				self.strings,
+				&self.strings,
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &[segment], tier)
@@ -2908,8 +2897,7 @@ mod tests {
 
 	#[test]
 	fn a_trait_constant_is_its_impls_or_the_default_it_inherits() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Tr { const X: u32 = Self::Y + 1; const Y: u32; }
 				struct P();
 				struct Q();
@@ -2921,8 +2909,7 @@ mod tests {
 				const OVERRIDDEN: u32 = <Q as Tr>::X;
 				const OF_GENERIC_IMPL: u32 = <W<P> as Tr>::Y;
 				const INHERITED_BY_GENERIC_IMPL: u32 = W::<Q>::X;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		assert_eq!(case.value("INHERITED"), [ConstScalar::u32(8)]);
 		assert_eq!(case.value("OVERRIDDEN"), [ConstScalar::u32(2)]);
@@ -2935,15 +2922,13 @@ mod tests {
 
 	#[test]
 	fn a_loop_through_a_default_is_reported_once_for_its_instance() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Loop { const A: u32 = Self::A + 1; }
 				struct P();
 				impl Loop for P {}
 				const FIRST: u32 = P::A;
 				const SECOND: u32 = P::A;
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CyclicConstant]);
 		case.diagnostics().assert_error_saying(
@@ -2953,8 +2938,7 @@ mod tests {
 
 	#[test]
 	fn an_instance_failure_is_reported_once_by_its_first_reader() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				trait Fail { const F: u8 = Self::G + 200; const G: u8; }
 				struct P();
 				struct Q();
@@ -2963,8 +2947,7 @@ mod tests {
 				const FIRST: u8 = P::F;
 				const SECOND: u8 = P::F;
 				const FITS: u8 = Q::F;
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ConstEvaluationFailed]);
 		case.diagnostics().assert_error_saying(
@@ -2980,8 +2963,7 @@ mod tests {
 
 	#[test]
 	fn an_arrays_len_is_its_length() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const N: u32 = 3;
 				type A = [u8; 4];
@@ -2991,8 +2973,7 @@ mod tests {
 				const WIDE: u64 = <[u8; 9] as Array>::LEN;
 				const NARROW: u8 = <[u8; 9] as Array>::LEN;
 				const FILLED: heap::&[u8; A::LEN] = [7; _];
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let [address] = case.value("FILLED") else {
 			panic!("expected an address");
@@ -3013,13 +2994,11 @@ mod tests {
 
 	#[test]
 	fn a_string_constant_points_into_an_allocation_of_its_contents() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const SLICE: heap::&[u8] = "hello";
 				const ARRAY: heap::&[u8; 2] = "a\n";
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 
 		// A slice is its address and its length.
@@ -3049,8 +3028,7 @@ mod tests {
 
 	#[test]
 	fn a_constant_of_data_is_placed_at_each_use() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				memory wide: u64;
 				const GREETING: [u8; 5] = "hello";
@@ -3062,8 +3040,7 @@ mod tests {
 				const AGAIN: heap::&[u8; 5] = GREETING;
 				const WORDS: heap::&[u16] = NUMBERS;
 				const SEVENS: heap::&[u8; 4] = FILLED;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		// Data in no memory has no value of its own: each use places it.
 		assert!(matches!(case.state("GREETING"), ConstValueState::NoValue));
@@ -3097,12 +3074,10 @@ mod tests {
 
 	#[test]
 	fn an_address_into_a_64_bit_memory_is_64_bits_wide() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory wide: u64;
 				const TEXT: wide::&[u8] = "abc";
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let [address, length] = case.value("TEXT") else {
 			panic!("expected two values");
@@ -3117,12 +3092,10 @@ mod tests {
 	/// value is the memory's data end, as wide as the memory's addresses.
 	#[test]
 	fn data_end_is_a_late_bound_address() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory wide: u64;
 				const END: wide::*u8 = wide::DATA_END;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let [end] = case.value("END") else {
 			panic!("expected one value");
@@ -3138,26 +3111,22 @@ mod tests {
 
 	#[test]
 	fn a_constant_naming_another_shares_its_allocation() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const ORIGINAL: heap::&[u8] = "shared";
 				const COPY: heap::&[u8] = ORIGINAL;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		assert_eq!(case.value("COPY"), case.value("ORIGINAL"));
 	}
 
 	#[test]
 	fn an_aggregate_holds_an_address_among_its_values() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				struct Text(len: u8, bytes: heap::&[u8]);
 				const GREETING: Text = Text(5, "hello");
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		// In declaration order: the length field, then the slice's address
 		// and its length.
@@ -3171,25 +3140,21 @@ mod tests {
 
 	#[test]
 	fn a_pointer_constant_with_no_constant_initializer_is_reported() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func make() -> heap::&u8 { loop {} }
 				const P: heap::&u8 = make();
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_error(DiagnosticCode::NotConstEvaluatable);
 	}
 
 	#[test]
 	fn a_struct_nested_in_itself_with_other_arguments_is_evaluated() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				struct Pair<T>(a: T, b: T);
 				const P: Pair<Pair<u8>> = Pair(Pair(1, 2), Pair(3, 4));
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.value("P"),
@@ -3199,7 +3164,7 @@ mod tests {
 
 	/// The address and the length of the slice constant `name`, and the
 	/// allocation it points to.
-	fn slice<'c>(case: &'c TestCase<'_>, name: &str) -> (&'c Allocation, u64) {
+	fn slice<'c>(case: &'c TestCase, name: &str) -> (&'c Allocation, u64) {
 		let [address, length] = case.value(name) else {
 			panic!("expected `{name}` to be a slice");
 		};
@@ -3215,16 +3180,14 @@ mod tests {
 
 	#[test]
 	fn an_array_constant_is_its_elements_laid_out() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				struct Mixed(a: u8, b: u32);
 				const WORDS: heap::&[u32] = [1, 2, 0x01020304];
 				const SIGNED: heap::&[i8] = [-1, 2];
 				const FLAGS: heap::&[Bool] = [True, False];
 				const STRUCTS: heap::&[Mixed; 2] = [Mixed(1, 2), Mixed(3, 4)];
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 
 		let (words, len) = slice(&case, "WORDS");
@@ -3250,13 +3213,11 @@ mod tests {
 
 	#[test]
 	fn a_nested_literal_is_an_allocation_its_outer_one_points_to() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const NESTED: heap::&[heap::&[u8]] = [[1], [2, 3]];
 				const NAMES: heap::&[heap::&[u8]] = ["ab", "c"];
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		for (name, inner) in
 			[("NESTED", [&[1u8][..], &[2, 3]]), ("NAMES", [b"ab", b"c"])]
@@ -3293,16 +3254,14 @@ mod tests {
 
 	#[test]
 	fn a_repeat_writes_its_value_count_times() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const SIZE: u32 = 2;
 				const SEVENS: heap::&[u16; 3] = [7; 3];
 				const ZEROS: heap::&[u8] = [0; SIZE];
 				const NINES: heap::&[u8; TWO] = [9; _];
 				const TWO: u32 = SIZE;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let [address] = case.value("NINES") else {
 			panic!("expected an array's address");
@@ -3319,12 +3278,10 @@ mod tests {
 
 	#[test]
 	fn an_address_in_64_bit_static_data_is_8_bytes_wide() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory wide: u64;
 				const NAMES: wide::&[wide::&[u8]] = ["a"];
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let (names, len) = slice(&case, "NAMES");
 		assert_eq!(len, 1);
@@ -3337,25 +3294,21 @@ mod tests {
 
 	#[test]
 	fn an_element_that_is_not_constant_is_reported() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				func one() -> u8 { 1 }
 				const BAD: heap::&[u8] = [1, one()];
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_error(DiagnosticCode::NotConstEvaluatable);
 	}
 
 	#[test]
 	fn a_repeat_of_a_zero_sized_value_takes_no_bytes() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const UNITS: heap::&[()] = [(); 3];
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		let (units, len) = slice(&case, "UNITS");
 		assert_eq!(len, 3);
@@ -3364,17 +3317,15 @@ mod tests {
 
 	#[test]
 	fn static_data_of_more_than_4_gib_is_reported() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const BIG: heap::&[u64] = [0; 1000000000];
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_error(DiagnosticCode::ConstEvaluationFailed);
 	}
 
-	fn exact(case: &TestCase<'_>, name: &str) -> i128 {
+	fn exact(case: &TestCase, name: &str) -> i128 {
 		match case.state(name) {
 			ConstValueState::Exact(value) => *value,
 			state => panic!("expected `{name}` to be untyped: {state:?}"),
@@ -3383,8 +3334,7 @@ mod tests {
 
 	#[test]
 	fn an_untyped_constant_takes_the_type_of_each_use() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				const X: {integer} = 200 + 55;
 				const A: u8 = X;
 				const B: i64 = -X;
@@ -3393,8 +3343,7 @@ mod tests {
 				const U: {char} = 'u';
 				const CODE: u8 = U;
 				const LETTER: Char = U;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_none();
 		assert_eq!(exact(&case, "X"), 255);
 		assert_eq!(case.value("A"), [ConstScalar::u8(255)]);
@@ -3411,8 +3360,7 @@ mod tests {
 	/// `u8` is `BIG` as a `u8`.
 	#[test]
 	fn an_untyped_constant_is_computed_exactly() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				const BIG: {integer} = 1 << 70;
 				const SHIFTED: {integer} = BIG >> 66;
 				const SMALL: u8 = SHIFTED;
@@ -3420,8 +3368,7 @@ mod tests {
 				const MINUS_ONE: {integer} = 0 - 1;
 				const SIGNED: i8 = MINUS_ONE;
 				const TOO_BIG: {integer} = 1 << 127;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::IntegerLiteralOutOfRange,
 			DiagnosticCode::ConstEvaluationFailed,
@@ -3438,15 +3385,13 @@ mod tests {
 
 	#[test]
 	fn an_untyped_constant_is_checked_where_it_is_used() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				const X: {integer} = 300;
 				const MINUS: {integer} = -1;
 				const A: u8 = X;
 				const B: u16 = X;
 				func f() -> u32 { MINUS }
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::IntegerLiteralOutOfRange,
 			DiagnosticCode::IntegerLiteralOutOfRange,
@@ -3463,26 +3408,22 @@ mod tests {
 	/// a literal does.
 	#[test]
 	fn an_untyped_constant_has_no_default_type() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				const X: {integer} = 4;
 				func f() { local x = X; }
-			"#}
-		);
+			"#});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
 	}
 
 	#[test]
 	fn an_untyped_constant_holds_only_its_kind() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				const LETTER: {integer} = 'a';
 				const TYPED: u32 = 4;
 				const NAMED: {integer} = TYPED;
 				const NUMBER: {char} = 'a' + 1;
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
@@ -3494,8 +3435,7 @@ mod tests {
 	/// value.
 	#[test]
 	fn an_untyped_constant_is_an_array_length() {
-		test_case!(
-			case = indoc! {r#"
+		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
 				const N: {integer} = 2 * 2;
 				const NEGATIVE: {integer} = -4;
@@ -3503,8 +3443,7 @@ mod tests {
 				const S: heap::&[u8; N] = "abcd";
 				const T: heap::&[u8; NEGATIVE] = "abcd";
 				func g(p: heap::&[u8; HUGE]) {}
-			"#}
-		);
+			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::IntegerLiteralOutOfRange,
 			DiagnosticCode::IntegerLiteralOutOfRange,

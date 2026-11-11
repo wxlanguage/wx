@@ -947,7 +947,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let trait_env = sema.traits[usize::from(trait_index)].env;
 		let args = sema.generic_args.push([(target.inner, target.span)]);
 		let result = sema.check_bound_requirements(
-			self.strings,
+			&self.strings,
 			sema.assumption_envs.of_frame(scope),
 			BoundRequirements::Frame {
 				env: trait_env,
@@ -956,7 +956,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			at_target,
 			owner,
 		);
-		sema.report_unfinished(self.strings, result, at_target)?;
+		sema.report_unfinished(&self.strings, result, at_target)?;
 
 		for member_index in
 			0..sema.decls.traits[usize::from(trait_index)].members.len()
@@ -972,7 +972,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			// that has no meaning; one the impl omits with no default is
 			// reported missing above.
 			let value = match sema.assoc_value(
-				self.strings,
+				&self.strings,
 				ImplMember {
 					impl_index,
 					declaration: declaration_index,
@@ -1006,7 +1006,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					_ => at_target,
 				};
 			let result = sema.check_bound_requirements(
-				self.strings,
+				&self.strings,
 				sema.assumption_envs.of_frame(scope),
 				BoundRequirements::AssociatedType {
 					declaration: declaration_index,
@@ -1017,7 +1017,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				reference,
 				owner,
 			);
-			sema.report_unfinished(self.strings, result, reference)?;
+			sema.report_unfinished(&self.strings, result, reference)?;
 		}
 		Ok(())
 	}
@@ -1066,7 +1066,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				})
 			else {
 				sema.report_not_a_member(
-					self.strings,
+					&self.strings,
 					trait_index,
 					member,
 					name,
@@ -1090,7 +1090,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						found,
 						target,
 					);
-					sema.report_unfinished(self.strings, result, at_member)?;
+					sema.report_unfinished(&self.strings, result, at_member)?;
 				}
 				(
 					MemberKind::Constant(expected),
@@ -1103,14 +1103,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 						found,
 						target,
 					);
-					sema.report_unfinished(self.strings, result, at_member)?;
+					sema.report_unfinished(&self.strings, result, at_member)?;
 				}
 				(
 					MemberKind::AssociatedType(_),
 					MemberKind::AssociatedType(_),
 				) => {}
 				_ => sema.report_kind_mismatch(
-					self.strings,
+					&self.strings,
 					trait_index,
 					declaration,
 					member,
@@ -1130,7 +1130,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.map(|member| sema.decls.name(member.kind.decl_id()))
 			.collect();
 		if !missing.is_empty() {
-			sema.report_missing(self.strings, trait_index, &missing, at_target);
+			sema.report_missing(
+				&self.strings,
+				trait_index,
+				&missing,
+				at_target,
+			);
 		}
 		Ok(())
 	}
@@ -1186,7 +1191,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		);
 		if expected_own != own {
 			sema.report_count_mismatch(
-				self.strings,
+				&self.strings,
 				trait_index,
 				member,
 				(declaration, function),
@@ -1196,9 +1201,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Ok(());
 		}
 		let contract =
-			sema.contract_env(self.strings, declaration, function, target)?;
+			sema.contract_env(&self.strings, declaration, function, target)?;
 		if !sema.check_own_bounds(
-			self.strings,
+			&self.strings,
 			trait_index,
 			(declaration, function),
 			contract,
@@ -1219,7 +1224,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let expected_count = sema.types.list(expected_params).len();
 		if expected_count != params {
 			sema.report_count_mismatch(
-				self.strings,
+				&self.strings,
 				trait_index,
 				member,
 				(declaration, function),
@@ -1279,14 +1284,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 				},
 			);
 			let expected = sema.normalize(
-				self.strings,
+				&self.strings,
 				contract,
 				expected,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
 			)?;
 			let found = sema.normalize(
-				self.strings,
+				&self.strings,
 				contract,
 				found,
 				NormalizationDepth::Deep,
@@ -1318,13 +1323,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 			};
 			let head = sema.signature_mismatch(
-				self.strings,
+				&self.strings,
 				trait_index,
 				member,
 				function,
 			);
 			sema.report_type_mismatch(
-				self.strings,
+				&self.strings,
 				head,
 				(
 					sema.decls.functions[usize::from(declaration)].file_id,
@@ -1365,14 +1370,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 			},
 		);
 		let expected = sema.normalize(
-			self.strings,
+			&self.strings,
 			sema.assumption_envs.of_frame(env),
 			expected,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let found = sema.normalize(
-			self.strings,
+			&self.strings,
 			sema.assumption_envs.of_frame(env),
 			found,
 			NormalizationDepth::Deep,
@@ -1408,10 +1413,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.with_message(format!(
 				"constant `{}` has an incompatible type for trait `{}`",
 				self.strings.resolve(name).unwrap(),
-				sema.trait_name(self.strings, trait_index),
+				sema.trait_name(&self.strings, trait_index),
 			));
 		sema.report_type_mismatch(
-			self.strings,
+			&self.strings,
 			head,
 			(
 				sema.decls.constants[usize::from(declaration)].file_id,
@@ -1483,7 +1488,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			)
 		};
 		let diagnostic = sema
-			.signature_mismatch(self.strings, trait_index, member, function)
+			.signature_mismatch(&self.strings, trait_index, member, function)
 			.with_label(
 				SourceSpan::new(
 					sema.decls.functions[usize::from(function)].file_id,
@@ -1519,38 +1524,24 @@ mod tests {
 	use indoc::indoc;
 
 	use super::*;
-	use crate::ast::StringInterner;
 	use crate::diagnostics::DiagnosticCode;
 	use crate::testing::DiagnosticView;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::vfs::{self, Files};
+	use crate::vfs::Files;
 
-	/// `test_case!(case = "source")` declares the interner, the graph and the
-	/// checked `TestCase` as three locals of the calling test.
-	macro_rules! test_case {
-		($case:ident = $source:expr $(,)?) => {
-			let mut strings = crate::symbols::Keyword::create_interner();
-			let graph = source_graph($source, &mut strings);
-			let $case = TestCase::new(&graph, &mut strings);
-		};
-	}
-
-	/// A checked `Semantics`, with the inputs it was checked from.
-	struct TestCase<'a> {
-		files: &'a Files,
-		strings: &'a StringInterner,
+	/// A checked `Semantics`, with the files it was checked from.
+	struct TestCase {
+		files: Files,
 		sema: Semantics,
 	}
 
-	impl<'a> TestCase<'a> {
-		fn new(
-			graph: &'a vfs::CompilationUnit,
-			strings: &'a mut StringInterner,
-		) -> Self {
-			let mut sema = crate::tir::check(graph, strings);
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let sema = crate::tir::check(&graph, &mut strings);
 			Self {
-				files: &graph.files,
-				strings,
+				files: graph.files,
 				sema,
 			}
 		}
@@ -1559,35 +1550,31 @@ mod tests {
 			DiagnosticView::new(
 				"conformance",
 				&self.sema.diagnostics,
-				self.files,
+				&self.files,
 			)
 		}
 	}
 
 	#[test]
 	fn an_associated_type_value_satisfies_its_declared_bound() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Size {}
 			impl Size for u32 {}
 			trait Container { type Item: Size; }
 			struct Bag();
 			impl Container for Bag { type Item = u32; }
-		"}
-		);
+		"});
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn an_associated_type_value_violating_its_declared_bound_is_reported() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Size {}
 			trait Container { type Item: Size; }
 			struct Bag();
 			impl Container for Bag { type Item = u8; }
-		"}
-		);
+		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics()
@@ -1596,14 +1583,12 @@ mod tests {
 
 	#[test]
 	fn an_inherited_default_is_checked_against_the_bound_per_impl() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Size {}
 			trait Container { type Item: Size = u8; }
 			struct Bag();
 			impl Container for Bag {}
-		"}
-		);
+		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 	}
@@ -1612,13 +1597,11 @@ mod tests {
 	/// for, but a value's bound does not depend on it.
 	#[test]
 	fn an_impl_of_an_unresolved_target_still_checks_its_values() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Size {}
 			trait Container: Size + StackValue { type Item: Size; func f(self: Self); }
 			impl Container for Missing { type Item = u8; func f(self: Self) {} }
-		"}
-		);
+		"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UndeclaredIdentifier,
 			DiagnosticCode::TraitBoundViolation,
@@ -1629,16 +1612,14 @@ mod tests {
 
 	#[test]
 	fn a_value_naming_an_impl_parameter_needs_the_parameter_bounded() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Size {}
 			trait Container { type Item: Size; }
 			struct Bounded<T>();
 			struct Unbounded<T>();
 			impl<T: Size> Container for Bounded<T> { type Item = T; }
 			impl<T> Container for Unbounded<T> { type Item = T; }
-		"}
-		);
+		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics()
@@ -1647,8 +1628,7 @@ mod tests {
 
 	#[test]
 	fn a_nested_equality_on_an_associated_type_is_proved_for_the_value() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Inner { type Value; }
 			struct Good();
 			struct Bad();
@@ -1659,16 +1639,14 @@ mod tests {
 			struct B();
 			impl Outer for A { type Item = Good; }
 			impl Outer for B { type Item = Bad; }
-		"}
-		);
+		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 	}
 
 	#[test]
 	fn an_impl_requires_its_traits_supertraits() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Base {}
 			trait Derived: Base {}
 			struct Both();
@@ -1676,8 +1654,7 @@ mod tests {
 			impl Base for Both {}
 			impl Derived for Both {}
 			impl Derived for Only {}
-		"}
-		);
+		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
@@ -1687,8 +1664,7 @@ mod tests {
 
 	#[test]
 	fn a_generic_impl_proves_its_supertraits_with_its_own_bounds() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Marker {}
 			trait Base {}
 			trait Derived: Base {}
@@ -1698,8 +1674,7 @@ mod tests {
 			impl<T: Marker> Derived for W<T> {}
 			impl<T: Marker> Base for V<T> {}
 			impl<T> Derived for V<T> {}
-		"}
-		);
+		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		case.diagnostics().assert_error_saying(
@@ -1709,8 +1684,7 @@ mod tests {
 
 	#[test]
 	fn a_supertraits_binding_is_proved_for_the_target() {
-		test_case!(
-			case = indoc! {"
+		let case = TestCase::new(indoc! {"
 			trait Base { type Out; }
 			trait Derived: Base where { Out = u32 } {}
 			struct Good();
@@ -1719,8 +1693,7 @@ mod tests {
 			impl Derived for Good {}
 			impl Base for Bad { type Out = u8; }
 			impl Derived for Bad {}
-		"}
-		);
+		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 	}
@@ -1761,16 +1734,15 @@ mod tests {
 			}
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_declaration_without_a_default_must_be_provided() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{}",
+			indoc! {"
 				trait Store: StackValue {
 					type Item;
 					type Kept = u8;
@@ -1782,8 +1754,7 @@ mod tests {
 				struct Bag();
 				impl Store for Bag {}
 			"}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IncompleteTraitImpl]);
 		assert_eq!(
@@ -1794,16 +1765,14 @@ mod tests {
 
 	#[test]
 	fn a_member_of_another_kind_does_not_provide_its_declaration() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{}",
+			indoc! {"
 				trait Store { func size() -> u32; type Item; }
 				struct Bag();
 				impl Store for Bag { const size: u32 = 0; func Item() {} }
 			"}
-			)
-		);
+		));
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitImplItemKindMismatch,
 			DiagnosticCode::TraitImplItemKindMismatch,
@@ -1823,32 +1792,28 @@ mod tests {
 	#[test]
 	fn a_member_of_another_kind_is_reported_once_where_the_trait_has_a_default()
 	{
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{}",
+			indoc! {"
 				trait Store { func size() -> u32 { 0 } }
 				struct Bag();
 				impl Store for Bag { type size = u32; }
 			"}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplItemKindMismatch]);
 	}
 
 	#[test]
 	fn a_member_the_trait_does_not_declare_is_reported() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{}",
+			indoc! {"
 				trait Store {}
 				struct Bag();
 				impl Store for Bag { func extra() {} type Extra = u8; }
 			"}
-			)
-		);
+		));
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NotATraitMember,
 			DiagnosticCode::NotATraitMember,
@@ -1880,7 +1845,7 @@ mod tests {
 			}
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		// `named` and `bare` leave the trait's name unbound, which keeps the
 		// contract.
 		case.diagnostics().assert_codes(&[
@@ -1905,10 +1870,9 @@ mod tests {
 
 	#[test]
 	fn the_counts_of_type_parameters_and_parameters_must_match() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{}",
+			indoc! {"
 				trait Store: StackValue {
 					func generic<T: StackValue>(x: T);
 					func arity(self: Self, a: u32);
@@ -1919,8 +1883,7 @@ mod tests {
 					func arity(self: Self) {}
 				}
 			"}
-			)
-		);
+		));
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitImplSignatureMismatch,
 			DiagnosticCode::TraitImplSignatureMismatch,
@@ -1937,16 +1900,14 @@ mod tests {
 
 	#[test]
 	fn own_type_parameters_correspond_by_position() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{}",
+			indoc! {"
 				trait Store { func pair<A: StackValue, B: StackValue>(a: A, b: B); }
 				struct Bag();
 				impl Store for Bag { func pair<A: StackValue, B: StackValue>(a: B, b: A) {} }
 			"}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		assert_eq!(
@@ -1965,7 +1926,7 @@ mod tests {
 			impl Store for Bag { func put(self: Self, slot: Box<(u8, u64)>) {} }
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		let diagnostic = &case.sema.diagnostics[0];
@@ -1986,7 +1947,7 @@ mod tests {
 			impl Store for Bag { type Item = u8; func get(self: Self) -> Box<u16> { Box() } }
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		let diagnostic = &case.sema.diagnostics[0];
@@ -2006,7 +1967,7 @@ mod tests {
 			impl Store for Bag { func put(self: Self, slot: Alias) {} }
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		let diagnostic = &case.sema.diagnostics[0];
@@ -2030,7 +1991,7 @@ mod tests {
 			impl Store for Bag { func count(self: Self) {} }
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		let diagnostic = &case.sema.diagnostics[0];
@@ -2048,7 +2009,7 @@ mod tests {
 			impl Store for Bag { const SELF: Bag = Bag(); const N: u64 = 0; }
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplConstTypeMismatch]);
 		case.diagnostics().assert_error_saying(
@@ -2068,10 +2029,9 @@ mod tests {
 
 	#[test]
 	fn an_impl_function_may_require_less_than_or_as_much_as_its_trait() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{ORDERING}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
 				trait Sorter {
 					func fewer<T: StackValue + PartialEq>(x: T);
 					func same<T: StackValue + PartialOrd>(x: T);
@@ -2083,8 +2043,7 @@ mod tests {
 					func implied<T: StackValue + PartialEq>(x: T) {}
 				}
 			"}
-			)
-		);
+		));
 		case.diagnostics().assert_none();
 	}
 
@@ -2097,7 +2056,7 @@ mod tests {
 			impl Sorter for Bag { func sort<T: StackValue + Ord>(x: T) {} }
 		"}
 		);
-		test_case!(case = &source);
+		let case = TestCase::new(&source);
 		// `Ord` brings `PartialOrd` and `Eq`, which do not follow either; the
 		// written bound is the one report.
 		case.diagnostics()
@@ -2116,17 +2075,15 @@ mod tests {
 
 	#[test]
 	fn an_extra_equality_is_a_stricter_requirement() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{ORDERING}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
 				trait Store { func take<U: StackValue + Container>(x: U); }
 				impl Store for Bag {
 					func take<U: StackValue + Container where { Item = u32 }>(x: U) {}
 				}
 			"}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
 		assert_eq!(
@@ -2137,17 +2094,15 @@ mod tests {
 
 	#[test]
 	fn a_conflicting_equality_is_a_stricter_requirement() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{ORDERING}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
 				trait Store { func take<U: StackValue + Container where { Item = u8 }>(x: U); }
 				impl Store for Bag {
 					func take<U: StackValue + Container where { Item = u16 }>(x: U) {}
 				}
 			"}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
 		assert_eq!(
@@ -2161,10 +2116,9 @@ mod tests {
 	/// follows from nothing.
 	#[test]
 	fn a_nested_bound_is_proved_from_the_traits() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{ORDERING}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
 				trait Store {
 					func strict<U: StackValue + Container>(x: U);
 					func loose<U: StackValue + Container where { Item: Ord }>(x: U);
@@ -2174,8 +2128,7 @@ mod tests {
 					func loose<U: StackValue + Container where { Item: PartialEq }>(x: U) {}
 				}
 			"}
-			)
-		);
+		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
 		assert_eq!(
@@ -2186,27 +2139,24 @@ mod tests {
 
 	#[test]
 	fn self_in_a_declarations_bound_is_the_impls_target() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{ORDERING}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
 				trait Into { type Out; }
 				trait Convert { func from<T: StackValue + Into where { Out = Self }>(x: T); }
 				impl Convert for Bag {
 					func from<T: StackValue + Into where { Out = Bag }>(x: T) {}
 				}
 			"}
-			)
-		);
+		));
 		case.diagnostics().assert_none();
 	}
 
 	#[test]
 	fn a_signature_is_compared_under_the_traits_assumptions() {
-		test_case!(
-			case = &format!(
-				"{PRELUDE}{ORDERING}{}",
-				indoc! {"
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
 				trait Store {
 					func read<U: Container where { Item = u32 }>(x: U::Item);
 					func write<U: Container where { Item = u32 }>(x: u32);
@@ -2216,8 +2166,7 @@ mod tests {
 					func write<U: Container>(x: U::Item) {}
 				}
 			"}
-			)
-		);
+		));
 		// Both read `U::Item` as `u32`, the trait's equality, though the impl
 		// does not repeat it.
 		case.diagnostics().assert_none();

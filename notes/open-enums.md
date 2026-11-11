@@ -179,7 +179,7 @@ Write new tests where the code under test is (`CLAUDE.md`, "Testing patterns").
 - **Parser** (`ast/tests.rs`): `..` last parses and is recorded; `..` not last,
   a second `..`, and `..` with no repr each report a diagnostic (assert the
   specific code with `DiagnosticView`); `{ .. }` alone parses.
-- **TIR** (`tir/typecheck.rs` or `exhaustiveness.rs` tests, with `test_case!`):
+- **TIR** (`tir/typecheck.rs` or `exhaustiveness.rs` tests, with `TestCase::new`):
   closed enum, all variants covered: no error (unchanged). Open enum, all named
   variants covered, no `_`: `NonExhaustiveMatch` (E2066). Open enum with a `_`
   arm: no error and no `UnreachableMatchArm` warning. Open enum where the arms

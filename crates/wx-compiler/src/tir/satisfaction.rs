@@ -961,332 +961,206 @@ mod tests {
 	use crate::tir::signatures::tests::source_graph;
 	use crate::tir::types::Type;
 
-	/// Checks `source` over the embedded stdlib, then hands the live
-	/// `Semantics` and the interner to `f`.
-	fn with_resolved<R>(
-		source: &str,
-		f: impl FnOnce(&mut Semantics, &StringInterner) -> R,
-	) -> R {
-		let mut strings = Keyword::create_interner();
-		let graph = source_graph(source, &mut strings);
-		let mut sema = crate::tir::check(&graph, &mut strings);
-		assert!(sema.diagnostics.is_empty(), "{:?}", sema.diagnostics);
-		f(&mut sema, &strings)
+	/// A checked `Semantics` over the embedded stdlib, with its interner.
+	struct TestCase {
+		strings: StringInterner,
+		sema: Semantics,
 	}
 
-	/// Resolves `path` (`::`-separated) as a `tier`-tier path from the root
-	/// namespace — same mechanism a written bound or type actually uses,
-	/// mirroring `signatures::tests::TestCase::resolve`.
-	fn resolve(
-		sema: &Semantics,
-		strings: &StringInterner,
-		tier: Tier,
-		path: &str,
-	) -> DeclKind {
-		let root = Scope::Package(sema.decls.root_package);
-		let file_id = sema.decls.namespaces.file_id(root.into());
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let sema = crate::tir::check(&graph, &mut strings);
+			assert!(sema.diagnostics.is_empty(), "{:?}", sema.diagnostics);
+			Self { strings, sema }
+		}
 
-		let segments: Box<[ast::PathSegment]> = path
-			.split("::")
-			.map(|segment| ast::PathSegment {
-				ident: Spanned {
-					inner: strings
-						.get(segment)
-						.expect("already interned from source"),
-					span: TextSpan::new(0, 0),
-				},
-				type_args: Box::new([]),
-			})
-			.collect();
-		let mut diagnostics = Vec::new();
-		let mut resolutions = NameResolutions::default();
-		let target = PathResolver::new(
-			&mut diagnostics,
-			&mut resolutions,
-			strings,
-			&sema.decls,
-		)
-		.resolve_path(file_id, root, &segments, tier);
-		target
+		/// Resolves `path` (`::`-separated) as a `tier`-tier path from the
+		/// root namespace, the same mechanism a written bound or type uses.
+		fn resolve(&self, tier: Tier, path: &str) -> DeclKind {
+			let root = Scope::Package(self.sema.decls.root_package);
+			let file_id = self.sema.decls.namespaces.file_id(root.into());
+			let segments: Box<[ast::PathSegment]> = path
+				.split("::")
+				.map(|segment| ast::PathSegment {
+					ident: Spanned {
+						inner: self
+							.strings
+							.get(segment)
+							.expect("already interned from source"),
+						span: TextSpan::new(0, 0),
+					},
+					type_args: Box::new([]),
+				})
+				.collect();
+			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
+			PathResolver::new(
+				&mut diagnostics,
+				&mut resolutions,
+				&self.strings,
+				&self.sema.decls,
+			)
+			.resolve_path(file_id, root, &segments, tier)
 			.decl_key()
 			.unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {diagnostics:?}")
 			})
-			.symbol_kind(&sema.decls)
-	}
+			.symbol_kind(&self.sema.decls)
+		}
 
-	fn trait_index(
-		sema: &Semantics,
-		strings: &StringInterner,
-		path: &str,
-	) -> TraitIdx {
-		let DeclKind::Trait(trait_index) =
-			resolve(sema, strings, Tier::Type, path)
-		else {
-			panic!("expected `{path}` to be a trait");
-		};
-		trait_index
-	}
+		fn trait_index(&self, path: &str) -> TraitIdx {
+			let DeclKind::Trait(trait_index) = self.resolve(Tier::Type, path)
+			else {
+				panic!("expected `{path}` to be a trait");
+			};
+			trait_index
+		}
 
-	/// The `TraitIndex` of `path`'s compiler-generated backing trait — what
-	/// a `T: <path>` bound naming this typeset actually resolves to. See
-	/// `TypeSetSignature`'s own doc comment.
-	fn typeset_trait_index(
-		sema: &Semantics,
-		strings: &StringInterner,
-		path: &str,
-	) -> TraitIdx {
-		let DeclKind::TypeSet(typeset_index) =
-			resolve(sema, strings, Tier::Type, path)
-		else {
-			panic!("expected `{path}` to be a typeset");
-		};
-		sema.decls.typesets[usize::from(typeset_index)].trait_index
-	}
+		/// The compiler-generated backing trait of the typeset `path`: what
+		/// a `T: <path>` bound naming it resolves to.
+		fn typeset_trait_index(&self, path: &str) -> TraitIdx {
+			let DeclKind::TypeSet(typeset_index) =
+				self.resolve(Tier::Type, path)
+			else {
+				panic!("expected `{path}` to be a typeset");
+			};
+			self.sema.decls.typesets[usize::from(typeset_index)].trait_index
+		}
 
-	/// `path`'s own `TypeIndex` — a non-generic struct only(a generic
-	/// struct's instantiated `TypeIndex` needs type-argument resolution,
-	/// which isn't implemented yet — see `impls.rs::resolve_impl_target`).
-	fn struct_type(
-		sema: &mut Semantics,
-		strings: &StringInterner,
-		path: &str,
-	) -> TypeIndex {
-		let DeclKind::Struct(struct_index) =
-			resolve(sema, strings, Tier::Type, path)
-		else {
-			panic!("expected `{path}` to be a struct");
-		};
-		sema.types.intern_struct(struct_index, &[])
-	}
+		/// The type of the non-generic struct `path`.
+		fn struct_type(&mut self, path: &str) -> TypeIndex {
+			let DeclKind::Struct(struct_index) = self.resolve(Tier::Type, path)
+			else {
+				panic!("expected `{path}` to be a struct");
+			};
+			self.sema.types.intern_struct(struct_index, &[])
+		}
 
-	/// The `TypeIndex` of `function_path`'s `param_index`-th own declared
-	/// generic parameter — e.g. the `T` in `func target<T: Bound>(x: T)`.
-	/// Declaring the type under test as a generic function's own type
-	/// parameter, rather than reading a resolved parameter type back out of
-	/// `FunctionSignature` (private to `signatures.rs` — nothing outside it
-	/// needs a function's own resolved types yet), is what lets this same
-	/// harness reach a `TypeParam` receiver without a wider accessor.
-	/// Where `param` is declared: the assumptions of its own declaration.
-	fn param_scope(sema: &Semantics, param: TypeIndex) -> AssumptionEnvIdx {
-		let Type::TypeParam { env, .. } = *sema.types.resolve(param) else {
-			panic!("expected a type parameter");
-		};
-		sema.assumption_envs.of_frame(env)
-	}
+		/// The `param_index`-th own type parameter of `function_path`, the
+		/// `T` in `func target<T: Bound>(x: T)`, and the assumptions of the
+		/// function that declares it.
+		fn generic_param(
+			&mut self,
+			function_path: &str,
+			param_index: u32,
+		) -> (TypeIndex, AssumptionEnvIdx) {
+			let DeclKind::Function(function_index) =
+				self.resolve(Tier::Value, function_path)
+			else {
+				panic!("expected `{function_path}` to be a function");
+			};
+			let env =
+				self.sema.functions[usize::from(function_index)].type_params;
+			let param =
+				self.sema.types.intern(Type::TypeParam { env, param_index });
+			(param, self.sema.assumption_envs.of_frame(env))
+		}
 
-	fn generic_param_type(
-		sema: &mut Semantics,
-		strings: &StringInterner,
-		function_path: &str,
-		param_index: u32,
-	) -> TypeIndex {
-		let DeclKind::Function(function_index) =
-			resolve(sema, strings, Tier::Value, function_path)
-		else {
-			panic!("expected `{function_path}` to be a function");
-		};
-		let env = sema.functions[usize::from(function_index)].type_params;
-		sema.types.intern(Type::TypeParam { env, param_index })
+		/// Whether `receiver` implements `required_trait` under `env`.
+		fn implements(
+			&mut self,
+			env: AssumptionEnvIdx,
+			receiver: TypeIndex,
+			required_trait: TraitIdx,
+		) -> Result<bool, SolverError> {
+			self.sema
+				.find_trait_impl_query(
+					&self.strings,
+					env,
+					receiver,
+					required_trait,
+				)
+				.map(|found| found.is_some())
+		}
 	}
 
 	#[test]
 	fn error_and_infer_are_recovery_not_proofs() {
-		with_resolved(
-			indoc! {"
-			trait Foo {}
-		"},
-			|sema, strings| {
-				let foo = trait_index(sema, strings, "Foo");
-				assert!(
-					(sema
-						.find_trait_impl_query(
-							strings,
-							AssumptionEnvIdx::ROOT,
-							TypeIndex::ERROR,
-							foo
-						)
-						.map(|found| found.is_some())
-						== Err(SolverError::Poisoned))
-				);
-				assert!(
-					(sema
-						.find_trait_impl_query(
-							strings,
-							AssumptionEnvIdx::ROOT,
-							TypeIndex::INFER,
-							foo
-						)
-						.map(|found| found.is_some())
-						== Err(SolverError::Poisoned))
-				);
-			},
-		);
+		let mut case = TestCase::new("trait Foo {}");
+		let foo = case.trait_index("Foo");
+		for receiver in [TypeIndex::ERROR, TypeIndex::INFER] {
+			assert_eq!(
+				case.implements(AssumptionEnvIdx::ROOT, receiver, foo),
+				Err(SolverError::Poisoned)
+			);
+		}
 	}
 
 	#[test]
 	fn a_struct_with_a_matching_impl_satisfies_the_trait() {
-		with_resolved(
-			indoc! {"
-				trait Foo {}
-				struct S();
-				impl Foo for S {}
-			"},
-			|sema, strings| {
-				let foo = trait_index(sema, strings, "Foo");
-				let s = struct_type(sema, strings, "S");
-				assert!(
-					(sema
-						.find_trait_impl_query(
-							strings,
-							AssumptionEnvIdx::ROOT,
-							s,
-							foo
-						)
-						.map(|found| found.is_some())
-						== Ok(true))
-				);
-			},
-		);
+		let mut case = TestCase::new(indoc! {"
+			trait Foo {}
+			struct S();
+			impl Foo for S {}
+		"});
+		let foo = case.trait_index("Foo");
+		let s = case.struct_type("S");
+		assert_eq!(case.implements(AssumptionEnvIdx::ROOT, s, foo), Ok(true));
 	}
 
 	#[test]
 	fn a_struct_with_no_impl_does_not_satisfy_the_trait() {
-		with_resolved(
-			indoc! {"
-				trait Foo {}
-				trait Bar {}
-				struct S();
-				impl Foo for S {}
-			"},
-			|sema, strings| {
-				let bar = trait_index(sema, strings, "Bar");
-				let s = struct_type(sema, strings, "S");
-				assert!(
-					!(sema
-						.find_trait_impl_query(
-							strings,
-							AssumptionEnvIdx::ROOT,
-							s,
-							bar
-						)
-						.map(|found| found.is_some())
-						== Ok(true))
-				);
-			},
-		);
+		let mut case = TestCase::new(indoc! {"
+			trait Foo {}
+			trait Bar {}
+			struct S();
+			impl Foo for S {}
+		"});
+		let bar = case.trait_index("Bar");
+		let s = case.struct_type("S");
+		assert_eq!(case.implements(AssumptionEnvIdx::ROOT, s, bar), Ok(false));
 	}
 
 	#[test]
 	fn a_struct_listed_in_a_typeset_satisfies_its_backing_trait() {
-		with_resolved(
-			indoc! {"
-				struct S();
-				typeset Nums { S }
-			"},
-			|sema, strings| {
-				let nums = typeset_trait_index(sema, strings, "Nums");
-				let s = struct_type(sema, strings, "S");
-				assert!(
-					(sema
-						.find_trait_impl_query(
-							strings,
-							AssumptionEnvIdx::ROOT,
-							s,
-							nums
-						)
-						.map(|found| found.is_some())
-						== Ok(true))
-				);
-			},
-		);
+		let mut case = TestCase::new(indoc! {"
+			struct S();
+			typeset Nums { S }
+		"});
+		let nums = case.typeset_trait_index("Nums");
+		let s = case.struct_type("S");
+		assert_eq!(case.implements(AssumptionEnvIdx::ROOT, s, nums), Ok(true));
 	}
 
 	#[test]
 	fn a_generic_param_with_a_matching_bound_satisfies_the_trait() {
-		with_resolved(
-			indoc! {"
-				trait Bound {}
-				func target<T: Bound + StackValue>(x: T) {}
-			"},
-			|sema, strings| {
-				let bound = trait_index(sema, strings, "Bound");
-				let t = generic_param_type(sema, strings, "target", 0);
-				assert!(
-					(sema
-						.find_trait_impl_query(
-							strings,
-							param_scope(sema, t),
-							t,
-							bound
-						)
-						.map(|found| found.is_some())
-						== Ok(true))
-				);
-				// Outside `target` its bounds are not assumed.
-				assert_eq!(
-					sema.find_trait_impl_query(
-						strings,
-						AssumptionEnvIdx::ROOT,
-						t,
-						bound
-					)
-					.map(|found| found.is_some()),
-					Ok(false)
-				);
-			},
+		let mut case = TestCase::new(indoc! {"
+			trait Bound {}
+			func target<T: Bound + StackValue>(x: T) {}
+		"});
+		let bound = case.trait_index("Bound");
+		let (t, env) = case.generic_param("target", 0);
+		assert_eq!(case.implements(env, t, bound), Ok(true));
+		// Outside `target` its bounds are not assumed.
+		assert_eq!(
+			case.implements(AssumptionEnvIdx::ROOT, t, bound),
+			Ok(false)
 		);
 	}
 
 	#[test]
 	fn a_generic_param_without_the_bound_does_not_satisfy_the_trait() {
-		with_resolved(
-			indoc! {"
-				trait Bound {}
-				trait Other {}
-				func target<T: Bound + StackValue>(x: T) {}
-			"},
-			|sema, strings| {
-				let other = trait_index(sema, strings, "Other");
-				let t = generic_param_type(sema, strings, "target", 0);
-				assert!(
-					!(sema
-						.find_trait_impl_query(
-							strings,
-							param_scope(sema, t),
-							t,
-							other
-						)
-						.map(|found| found.is_some())
-						== Ok(true))
-				);
-			},
-		);
+		let mut case = TestCase::new(indoc! {"
+			trait Bound {}
+			trait Other {}
+			func target<T: Bound + StackValue>(x: T) {}
+		"});
+		let other = case.trait_index("Other");
+		let (t, env) = case.generic_param("target", 0);
+		assert_eq!(case.implements(env, t, other), Ok(false));
 	}
 
 	#[test]
 	fn a_generic_param_satisfies_a_bounds_supertrait_transitively() {
-		with_resolved(
-			indoc! {"
-				trait Super {}
-				trait Sub: Super {}
-				func target<T: Sub + StackValue>(x: T) {}
-			"},
-			|sema, strings| {
-				let super_trait = trait_index(sema, strings, "Super");
-				let t = generic_param_type(sema, strings, "target", 0);
-				assert!(
-					(sema
-						.find_trait_impl_query(
-							strings,
-							param_scope(sema, t),
-							t,
-							super_trait
-						)
-						.map(|found| found.is_some())
-						== Ok(true))
-				);
-			},
-		);
+		let mut case = TestCase::new(indoc! {"
+			trait Super {}
+			trait Sub: Super {}
+			func target<T: Sub + StackValue>(x: T) {}
+		"});
+		let super_trait = case.trait_index("Super");
+		let (t, env) = case.generic_param("target", 0);
+		assert_eq!(case.implements(env, t, super_trait), Ok(true));
 	}
 }

@@ -143,22 +143,17 @@ mod tests {
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{Diagnostics, TextSpan};
 	use crate::tir::body::Local;
-	use crate::tir::decls::{BindingKey, DeclKind, Declarations, Scope};
-	use crate::tir::impls::{ImplDispatch, ImplTarget};
+	use crate::tir::decls::{BindingKey, DeclKind, Scope};
+	use crate::tir::impls::ImplTarget;
 	use crate::tir::paths::PathResolver;
+	use crate::tir::signatures::Semantics;
 	use crate::vfs::{self, FileId};
 
 	struct Analysis<'s> {
 		source: &'s str,
 		file: FileId,
-		resolutions: NameResolutions,
-		decls: Declarations,
 		strings: StringInterner,
-		impl_dispatch: ImplDispatch,
-		function_locals: Vec<Vec<Local>>,
-		function_envs: Vec<GenericEnvIdx>,
-		trait_envs: Vec<GenericEnvIdx>,
-		errors: Vec<String>,
+		sema: Semantics,
 	}
 
 	impl<'s> Analysis<'s> {
@@ -181,50 +176,37 @@ mod tests {
 			let parse_diagnostics = compilation.collect_diagnostics();
 			assert!(!parse_diagnostics.has_errors(), "{parse_diagnostics:?}");
 			let sema = crate::tir::check(&compilation, &mut strings);
-			let file = sema
-				.decls
-				.namespaces
-				.file_id(crate::tir::decls::Scope::Package(root).into());
-			let function_locals = sema
-				.function_implementations
-				.iter()
-				.map(|implementation| {
-					implementation
-						.body()
-						.map(|body| sema.body(body).locals().to_vec())
-						.unwrap_or_default()
-				})
-				.collect();
-			let function_envs = sema
-				.functions
-				.iter()
-				.map(|signature| signature.type_params)
-				.collect();
-			let trait_envs =
-				sema.traits.iter().map(|signature| signature.env).collect();
-			let errors = sema
-				.diagnostics
-				.errors()
-				.map(|d| d.message.clone())
-				.collect();
+			let file =
+				sema.decls.namespaces.file_id(Scope::Package(root).into());
 			Self {
 				source,
 				file,
-				resolutions: sema.resolutions,
-				decls: sema.decls,
 				strings,
-				impl_dispatch: sema.impl_dispatch,
-				function_locals,
-				function_envs,
-				trait_envs,
-				errors,
+				sema,
 			}
 		}
 
 		fn clean(source: &'s str) -> Self {
 			let analysis = Self::new(source);
-			assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+			assert!(
+				!analysis.has_errors(),
+				"{:?}",
+				analysis.sema.diagnostics.errors().collect::<Vec<_>>()
+			);
 			analysis
+		}
+
+		fn has_errors(&self) -> bool {
+			self.sema.diagnostics.has_errors()
+		}
+
+		/// The local `index` of the body of the function `function`.
+		fn local(&self, function: FunctionIdx, index: usize) -> &Local {
+			let body = self.sema.function_implementations
+				[usize::from(function)]
+			.body()
+			.expect("a function with a block has a body");
+			&self.sema.body(body).locals()[index]
 		}
 
 		fn at(
@@ -248,7 +230,8 @@ mod tests {
 			tier: Tier,
 		) -> Option<Resolution> {
 			let span = self.span(context, name);
-			self.resolutions
+			self.sema
+				.resolutions
 				.by_site
 				.get(&(SourceSpan::new(self.file, span), tier))
 				.copied()
@@ -276,7 +259,7 @@ mod tests {
 		}
 
 		fn resolve(&self, path: &str, tier: Tier) -> DeclKind {
-			self.declaration(path, tier).symbol_kind(&self.decls)
+			self.declaration(path, tier).symbol_kind(&self.sema.decls)
 		}
 
 		fn declaration(&self, path: &str, tier: Tier) -> DeclKey {
@@ -297,11 +280,11 @@ mod tests {
 				&mut diagnostics,
 				&mut resolutions,
 				&self.strings,
-				&self.decls,
+				&self.sema.decls,
 			)
 			.resolve_path(
 				self.file,
-				Scope::Package(self.decls.root_package),
+				Scope::Package(self.sema.decls.root_package),
 				&segments,
 				tier,
 			);
@@ -335,7 +318,8 @@ mod tests {
 			let DeclKind::Trait(index) = self.resolve(path, Tier::Type) else {
 				panic!("expected `{path}` to name a trait");
 			};
-			self.decls
+			self.sema
+				.decls
 				.declared_trait_member(
 					index,
 					BindingKey::new(tier, self.strings.get(name).unwrap()),
@@ -509,7 +493,7 @@ mod tests {
 				x;
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		assert_eq!(a.at("missing;", "missing", Tier::Value), None);
 		assert_eq!(a.value("\n\tx;\n", "x"), a.value("missing;\n\tx;", "x"));
 	}
@@ -595,7 +579,7 @@ mod tests {
 				take({ value });
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		assert_eq!(
 			a.selection("{ value }", "value"),
 			Selection::Parameter {
@@ -614,7 +598,7 @@ mod tests {
 				value
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		assert_eq!(
 			a.value("{ value }", "value"),
 			a.value("\n\tvalue\n", "value")
@@ -642,7 +626,7 @@ mod tests {
 			panic!("expected a trait");
 		};
 		let Some(MemberKind::Function(function)) =
-			a.decls.declared_trait_member(
+			a.sema.decls.declared_trait_member(
 				trait_index,
 				crate::tir::decls::BindingKey::value(
 					a.strings.get("make").unwrap(),
@@ -746,7 +730,7 @@ mod tests {
 				m::missing();
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		assert!(matches!(
 			a.at("m::missing", "m", Tier::Type),
 			Some(Referent::Declaration(_))
@@ -764,7 +748,7 @@ mod tests {
 				s.value
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		assert_eq!(
 			a.selection("s.value", "value"),
 			Selection::Field {
@@ -798,7 +782,7 @@ mod tests {
 				local: LocalIdx::new(1),
 			}
 		);
-		let declaration = &a.function_locals[usize::from(function)][1];
+		let declaration = a.local(function, 1);
 		assert_eq!(declaration.name.span, a.span("{ value }", "value"));
 		assert_eq!(a.strings.resolve(declaration.name.inner), Some("value"));
 	}
@@ -819,7 +803,8 @@ mod tests {
 			}
 		"});
 		let parameter = Referent::TypeParam {
-			env: a.function_envs[usize::from(a.function_index("f"))],
+			env: a.sema.functions[usize::from(a.function_index("f"))]
+				.type_params,
 			index: 0,
 		};
 		for context in [
@@ -877,12 +862,13 @@ mod tests {
 		assert_eq!(
 			a.at("self: Self", "Self", Tier::Type),
 			Some(Referent::TypeParam {
-				env: a.trait_envs[usize::from(trait_index)],
+				env: a.sema.traits[usize::from(trait_index)].env,
 				index: 0,
 			})
 		);
 		let target = ImplTarget::Struct(a.struct_index("S"));
-		let &[inherent] = a.impl_dispatch.inherent_candidates(target) else {
+		let &[inherent] = a.sema.impl_dispatch.inherent_candidates(target)
+		else {
 			panic!("expected one inherent impl")
 		};
 		assert_eq!(
@@ -894,7 +880,7 @@ mod tests {
 			Some(Referent::InherentImplSelf(inherent))
 		);
 		let &[(actual_trait, implementation)] =
-			a.impl_dispatch.trait_candidates(target)
+			a.sema.impl_dispatch.trait_candidates(target)
 		else {
 			panic!("expected one trait impl")
 		};
@@ -991,7 +977,7 @@ mod tests {
 				x
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		let function = a.function_index("f");
 		let receiver = Referent::Local {
 			owner: BodyOwner::Function(function),
@@ -1020,7 +1006,7 @@ mod tests {
 				x
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		assert_eq!(
 			a.resolution("{ x,", "x", Tier::Value),
 			Some(Resolution::Shorthand {
@@ -1062,7 +1048,7 @@ mod tests {
 				x
 			}
 		"});
-		assert!(!a.errors.is_empty());
+		assert!(a.has_errors());
 		let expected = Referent::Local {
 			owner: BodyOwner::Function(a.function_index("f")),
 			local: LocalIdx::new(0),

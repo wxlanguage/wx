@@ -29,8 +29,8 @@ type expression parser). Writing a space (`Is< <A as B>::C>`) or parentheses
 
 Found while writing `StackValue` tests: TIR's harness reported only the
 follow-on "struct `Is` takes 2 generic arguments but 0 generic arguments were
-supplied", because `test_case!` does not assert a clean parse
-(`checked_case!` does).
+supplied", because `TestCase::new` does not assert a clean parse
+(`TestCase::checked` does).
 
 ## The fix
 

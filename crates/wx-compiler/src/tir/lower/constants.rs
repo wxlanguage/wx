@@ -62,7 +62,7 @@ impl Lowerer<'_> {
 				Err(_) => return Err(()),
 			};
 		// Copy the flat value out before lowering: building its nodes needs
-		// the context mutably, and the evaluator's slice borrows it.
+		// `sema` mutably, and the evaluator's slice borrows it.
 		let used_at = SourceSpan::new(file_id, span);
 		let scalars = match self.sema.instance_value(
 			self.strings,

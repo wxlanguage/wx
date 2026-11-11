@@ -910,7 +910,7 @@ impl<'a> Lowerer<'a> {
 			"an instance has an argument for every parameter in its chain"
 		);
 
-		// Copy the lists out so lowering a type may borrow the context mutably.
+		// Copy the lists out so lowering a type may borrow `sema` mutably.
 		let args: Box<[TypeIndex]> = self.sema.types.list(instance.args).into();
 		let params: Vec<TypeIndex> = self.sema.types.list(param_list).to_vec();
 		let mut param_types = Vec::with_capacity(params.len());
@@ -2092,7 +2092,7 @@ impl<'a> Lowerer<'a> {
 	/// fully concrete is a lowering error, never an accidental `Unit`.
 	/// The one type funnel: checked TIR type → MIR value type.
 	///
-	/// Normalization runs through the live context first, so an alias, an
+	/// Normalization runs through the live `Semantics` first, so an alias, an
 	/// associated-type projection the solver can resolve, or a constant in a
 	/// type reaches MIR as its concrete type. Anything still not fully
 	/// concrete is a lowering error with a source location, never an
@@ -2414,6 +2414,10 @@ fn binary_kind(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::diagnostics::Diagnostics;
+	use crate::tir::body::BodyOwner;
+	use crate::tir::decls::{ConstIdx, MemberOwner};
+	use crate::tir::resolutions::{Referent, Resolution, Selection};
 
 	/// Every direct call in `mir`, across its functions.
 	fn call_count(mir: &mir::MIR) -> usize {
@@ -9062,5 +9066,179 @@ mod tests {
 			assert_eq!(len, 3);
 			assert_eq!(read_bytes(store, memory, address, 6), [5; 6]);
 		});
+	}
+
+	/// The free function `name` of the program.
+	fn free_function(
+		sema: &Semantics,
+		strings: &StringInterner,
+		name: &str,
+	) -> FunctionIdx {
+		let symbol = strings.get(name).unwrap();
+		let position = sema
+			.decls
+			.functions
+			.iter()
+			.position(|function| {
+				function.name.inner == symbol
+					&& matches!(function.owner, MemberOwner::Free)
+			})
+			.unwrap_or_else(|| panic!("expected a function `{name}`"));
+		FunctionIdx::new(u32::try_from(position).unwrap())
+	}
+
+	#[test]
+	fn semantics_answers_queries_after_checking_and_after_lowering() {
+		let source = r#"
+			trait Container {
+				type Item;
+			}
+
+			struct Bag();
+
+			impl Container for Bag {
+				type Item = u32;
+			}
+
+			const WIDTH: u32 = 2 + 3;
+
+			func take(x: <Bag as Container>::Item) -> u32 {
+				x + WIDTH
+			}
+
+			export {
+				take as "take"
+			}
+		"#;
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let reported = sema.diagnostics().len();
+		let take = free_function(&sema, &strings, "take");
+		let signature = &sema.functions[usize::from(take)];
+		let env = sema.assumption_envs.of_frame(signature.type_params);
+		let item = sema.types.list(signature.param_types)[0];
+		assert!(sema.types.has_projection(item));
+		let symbol = strings.get("WIDTH").unwrap();
+		let width = ConstIdx::new(
+			u32::try_from(
+				sema.decls
+					.constants
+					.iter()
+					.position(|constant| constant.name.inner == symbol)
+					.unwrap(),
+			)
+			.unwrap(),
+		);
+		let query = |sema: &mut Semantics| {
+			let item = sema
+				.normalize(
+					&strings,
+					env,
+					item,
+					NormalizationDepth::Deep,
+					RewriteFlags::ALL,
+				)
+				.unwrap();
+			let Ok(width) = sema.const_value(&strings, width) else {
+				panic!("`WIDTH` must evaluate")
+			};
+			let width = width.to_vec();
+			(item, width)
+		};
+
+		let (checked_item, checked_width) = query(&mut sema);
+		assert_eq!(checked_item, TypeIndex::U32);
+		assert_eq!(checked_width.len(), 1);
+		assert_eq!(checked_width[0].val, Val::I32(5));
+		let cached = sema.solver.normalized.len();
+
+		let mut first = crate::tir::lower(&mut sema, &strings).unwrap();
+		assert_eq!(query(&mut sema), (checked_item, checked_width.clone()));
+		assert!(sema.solver.normalized.len() >= cached);
+
+		// Lowering again reads the same state and adds nothing to it.
+		let mut second = crate::tir::lower(&mut sema, &strings).unwrap();
+		assert_eq!(query(&mut sema), (checked_item, checked_width));
+		assert_eq!(sema.diagnostics().len(), reported);
+		let encode = |mir: &mut mir::MIR| {
+			crate::backend::emit(mir, &strings, None).unwrap().encode()
+		};
+		assert_eq!(encode(&mut first), encode(&mut second));
+	}
+
+	#[test]
+	fn an_erroneous_program_keeps_its_declarations_references_and_bodies() {
+		let source = r#"
+			struct Point(x: u32, y: u32);
+
+			func broken(p: Point) -> u32 {
+				local sum = p.x + p.y;
+				sum + missing
+			}
+
+			func fine(p: Point) -> u32 {
+				p.x
+			}
+		"#;
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let reported = sema.diagnostics().len();
+		assert!(sema.diagnostics().has_errors());
+		assert!(crate::tir::lower(&mut sema, &strings).is_err());
+		assert_eq!(sema.diagnostics().len(), reported);
+
+		let broken = free_function(&sema, &strings, "broken");
+		let fine = free_function(&sema, &strings, "fine");
+		for function in [broken, fine] {
+			let params = sema
+				.types
+				.list(sema.functions[usize::from(function)].param_types);
+			assert!(matches!(
+				sema.types.resolve(params[0]),
+				Type::Struct { .. }
+			));
+		}
+
+		let body = |function: FunctionIdx| {
+			sema.body(
+				sema.function_implementations[usize::from(function)]
+					.body()
+					.expect("a function with a block has a body"),
+			)
+		};
+		let sum = strings.get("sum").unwrap();
+		assert!(
+			body(broken)
+				.locals()
+				.iter()
+				.any(|local| local.name.inner == sum
+					&& local.ty == TypeIndex::U32)
+		);
+		let fine_body = body(fine);
+		assert_eq!(fine_body.ty(fine_body.root()), TypeIndex::U32);
+
+		let resolutions = sema.resolutions.by_site.values();
+		let locals_of_broken = resolutions
+			.clone()
+			.filter(|resolution| {
+				matches!(
+					resolution,
+					Resolution::Reference(Referent::Local {
+						owner: BodyOwner::Function(owner),
+						..
+					}) if *owner == broken
+				)
+			})
+			.count();
+		// `p` twice and `sum` once; `missing` resolved to nothing.
+		assert_eq!(locals_of_broken, 3);
+		assert!(resolutions.into_iter().any(|resolution| matches!(
+			resolution,
+			Resolution::Selection(Selection::Field { .. })
+		)));
 	}
 }

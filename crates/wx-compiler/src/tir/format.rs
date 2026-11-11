@@ -432,20 +432,14 @@ mod tests {
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::signatures::{
-		FunctionSignature, QueryInfo, SemanticsBuilder,
-	};
+	use crate::tir::signatures::{QueryInfo, SemanticsBuilder};
 	use crate::tir::types::GenericEnvIdx;
-	use crate::vfs;
 
+	/// A `Semantics` with every signature built and no body checked, and
+	/// its interner.
 	struct TestCase {
-		graph: vfs::CompilationUnit,
 		strings: StringInterner,
-		decls: Declarations,
-		types: TypeInterner,
-		generic_envs: GenericEnvArena,
-		bounds: BoundArena,
-		functions: Vec<FunctionSignature>,
+		sema: Semantics,
 	}
 
 	impl TestCase {
@@ -507,29 +501,21 @@ mod tests {
 			DiagnosticView::new("signature", &sema.diagnostics, &graph.files)
 				.assert_none();
 
-			Self {
-				types: sema.types,
-				generic_envs: sema.generic_envs,
-				bounds: sema.bounds,
-				functions: sema.functions,
-				decls: sema.decls,
-				graph,
-				strings,
-			}
+			Self { strings, sema }
 		}
 
 		fn definition(&self, tier: Tier, name: &str) -> DeclKind {
 			let symbol =
 				self.strings.get(name).expect("expected a fixture name");
-			let root = Namespace::Package(self.decls.root_package);
+			let root = Namespace::Package(self.sema.decls.root_package);
 			let BindingTarget::Accessible(key) =
-				self.decls.namespaces.symbols(root).bindings
+				self.sema.decls.namespaces.symbols(root).bindings
 					[&BindingKey::new(tier, symbol)]
 					.target
 			else {
 				panic!("expected `{name}` to be accessible");
 			};
-			key.symbol_kind(&self.decls)
+			key.symbol_kind(&self.sema.decls)
 		}
 
 		fn function(&self, name: &str) -> FunctionIdx {
@@ -545,9 +531,10 @@ mod tests {
 			function: &str,
 			name: &str,
 		) -> (GenericEnvIdx, usize) {
-			let env = self.functions[usize::from(self.function(function))]
+			let env = self.sema.functions[usize::from(self.function(function))]
 				.type_params;
 			let index = self
+				.sema
 				.generic_envs
 				.param_names(env)
 				.iter()
@@ -563,43 +550,38 @@ mod tests {
 		}
 
 		fn type_formatter(&self) -> TypeFormatter<'_> {
-			TypeFormatter {
-				types: &self.types,
-				decls: &self.decls,
-				strings: &self.strings,
-				generic_envs: &self.generic_envs,
-				budget: TYPE_DISPLAY_BUDGET,
-			}
+			self.sema.type_formatter(&self.strings)
 		}
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.generic_envs.param_types(env)[index]
+			self.sema.generic_envs.param_types(env)[index]
 		}
 
 		/// The bounds written on `param`, as written: every top-level bound
 		/// between its name and the next parameter's.
 		fn declared_bounds(&self, function: &str, param: &str) -> Vec<BoundId> {
 			let (env, index) = self.parameter(function, param);
-			let names = self.generic_envs.param_names(env);
+			let names = self.sema.generic_envs.param_names(env);
 			let after = names[index].span.end;
 			let before =
 				names.get(index + 1).map_or(u32::MAX, |n| n.span.start);
-			let file_id = self.decls.functions
+			let file_id = self.sema.decls.functions
 				[usize::from(self.function(function))]
 			.file_id;
 			let written: Vec<BoundId> = self
+				.sema
 				.bounds
 				.ids()
 				.filter(|&id| {
-					let span = self.bounds.span(id);
+					let span = self.sema.bounds.span(id);
 					span.file_id == file_id
 						&& (after..before).contains(&span.span.start)
 				})
 				.collect();
 			let nested: Vec<BoundId> = written
 				.iter()
-				.flat_map(|&id| self.bounds.get(id).bindings.iter())
+				.flat_map(|&id| self.sema.bounds.get(id).bindings.iter())
 				.flat_map(|binding| match &binding.kind {
 					BindingRequirement::Bound(_, nested) => nested.to_vec(),
 					BindingRequirement::Equals(..)
@@ -625,7 +607,7 @@ mod tests {
 				.strings
 				.get(name)
 				.expect("already interned from source");
-			let trait_decl = &self.decls.traits[usize::from(trait_index)];
+			let trait_decl = &self.sema.decls.traits[usize::from(trait_index)];
 			let &member_index = trait_decl
 				.bindings
 				.get(&BindingKey::ty(symbol))
@@ -643,20 +625,19 @@ mod tests {
 		}
 
 		fn bound_formatter(&self) -> BoundFormatter<'_> {
-			BoundFormatter {
-				type_formatter: self.type_formatter(),
-				bounds: &self.bounds,
-			}
+			self.sema.bound_formatter(&self.strings)
 		}
 	}
 
 	#[test]
 	fn function_types_format_nested_tuples_and_recovery_placeholders() {
 		let mut case = TestCase::new("");
-		let tuple =
-			case.types.intern_tuple(&[TypeIndex::I32, TypeIndex::ERROR]);
-		let param = case.types.intern_tuple(&[tuple, TypeIndex::INFER]);
-		let function = case.types.intern(Type::TypedFuncref {
+		let tuple = case
+			.sema
+			.types
+			.intern_tuple(&[TypeIndex::I32, TypeIndex::ERROR]);
+		let param = case.sema.types.intern_tuple(&[tuple, TypeIndex::INFER]);
+		let function = case.sema.types.intern(Type::TypedFuncref {
 			param,
 			result: TypeIndex::NEVER,
 		});
@@ -670,23 +651,23 @@ mod tests {
 	fn memory_qualified_types_preserve_ownership_and_shape() {
 		let mut case = TestCase::new("func allocate<M>() {}");
 		let memory = case.type_param("allocate", "M");
-		let slice = case.types.intern(Type::Slice { of: TypeIndex::I32 });
-		let slice = case.types.intern(Type::Pointer {
+		let slice = case.sema.types.intern(Type::Slice { of: TypeIndex::I32 });
+		let slice = case.sema.types.intern(Type::Pointer {
 			to: slice,
 			memory,
 			ownership: Ownership::Shared,
 		});
-		let pointer = case.types.intern(Type::Pointer {
+		let pointer = case.sema.types.intern(Type::Pointer {
 			to: slice,
 			memory,
 			ownership: Ownership::Exclusive,
 		});
-		let four = case.types.intern(Type::Value { bits: 4 });
-		let array = case.types.intern(Type::Array {
+		let four = case.sema.types.intern(Type::Value { bits: 4 });
+		let array = case.sema.types.intern(Type::Array {
 			of: TypeIndex::I32,
 			length: four,
 		});
-		let to_array = case.types.intern(Type::Pointer {
+		let to_array = case.sema.types.intern(Type::Pointer {
 			to: array,
 			memory,
 			ownership: Ownership::Exclusive,
@@ -710,12 +691,13 @@ mod tests {
 			panic!("expected Iterable to be a trait");
 		};
 		let assoc_type_index = case.assoc_type_index(trait_index, "Item");
-		let projection = case.types.intern(Type::TypeProjection {
+		let projection = case.sema.types.intern(Type::TypeProjection {
 			trait_index,
 			assoc_type_index,
 			base: param,
 		});
 		let function = case
+			.sema
 			.types
 			.intern_function(case.function("iterate"), &[param]);
 		let formatter = case.type_formatter();
@@ -783,7 +765,7 @@ mod tests {
 	#[test]
 	fn a_type_within_the_budget_is_written_whole() {
 		let mut case = TestCase::new("");
-		let tuple = case.types.intern_tuple(&[TypeIndex::U32; 4]);
+		let tuple = case.sema.types.intern_tuple(&[TypeIndex::U32; 4]);
 		assert_eq!(
 			case.type_formatter().display_type(tuple),
 			"(u32, u32, u32, u32)"
@@ -793,7 +775,7 @@ mod tests {
 	#[test]
 	fn a_long_list_ends_in_an_ellipsis_once_the_budget_is_spent() {
 		let mut case = TestCase::new("");
-		let tuple = case.types.intern_tuple(&[TypeIndex::U32; 30]);
+		let tuple = case.sema.types.intern_tuple(&[TypeIndex::U32; 30]);
 		assert_eq!(case.type_formatter().display_type(tuple), elided_u32s(13));
 	}
 
@@ -802,8 +784,8 @@ mod tests {
 		// The `u8` after the long tuple is part of the elided rest, so the
 		// outer list adds no `, ...` of its own.
 		let mut case = TestCase::new("");
-		let inner = case.types.intern_tuple(&[TypeIndex::U32; 30]);
-		let outer = case.types.intern_tuple(&[inner, TypeIndex::U8]);
+		let inner = case.sema.types.intern_tuple(&[TypeIndex::U32; 30]);
+		let outer = case.sema.types.intern_tuple(&[inner, TypeIndex::U8]);
 		assert_eq!(
 			case.type_formatter().display_type(outer),
 			format!("({})", elided_u32s(13))
@@ -813,8 +795,8 @@ mod tests {
 	#[test]
 	fn a_part_after_its_parents_own_text_is_elided_on_its_own() {
 		let mut case = TestCase::new("");
-		let param = case.types.intern_tuple(&[TypeIndex::U32; 30]);
-		let function = case.types.intern(Type::TypedFuncref {
+		let param = case.sema.types.intern_tuple(&[TypeIndex::U32; 30]);
+		let function = case.sema.types.intern(Type::TypedFuncref {
 			param,
 			result: TypeIndex::U8,
 		});
@@ -832,7 +814,7 @@ mod tests {
 		let mut case = TestCase::new("");
 		let mut doubled = TypeIndex::U8;
 		for _ in 0..300 {
-			doubled = case.types.intern_tuple(&[doubled, doubled]);
+			doubled = case.sema.types.intern_tuple(&[doubled, doubled]);
 		}
 		let depth = TYPE_DISPLAY_BUDGET;
 		assert_eq!(
@@ -845,8 +827,8 @@ mod tests {
 	fn the_budget_counts_from_where_the_type_starts() {
 		// A message written before the type does not spend its budget.
 		let mut case = TestCase::new("");
-		let short = case.types.intern_tuple(&[TypeIndex::U32; 4]);
-		let long = case.types.intern_tuple(&[TypeIndex::U32; 30]);
+		let short = case.sema.types.intern_tuple(&[TypeIndex::U32; 4]);
+		let long = case.sema.types.intern_tuple(&[TypeIndex::U32; 30]);
 		let formatter = case.type_formatter();
 		let prefix = "x".repeat(2 * TYPE_DISPLAY_BUDGET);
 		let mut buffer = prefix.clone();
