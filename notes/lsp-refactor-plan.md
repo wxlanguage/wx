@@ -1,7 +1,7 @@
 # Native LSP migration to the new TIR
 
-Status: exploration and proposed architecture; no LSP implementation changes yet.
-Last updated: 2026-11-10.
+Status: compiler prerequisites done; server not yet reconnected.
+Last updated: 2026-11-11.
 
 Current compiler prerequisite design:
 [TypeContext ownership and explicit borrowing refactor](type-context-ownership-refactor.md).
@@ -44,11 +44,12 @@ explicitly identified as existing code.
 Commit `4bde6f6` (`refactor(tir): model name resolutions and audit reference
 coverage`) establishes the resolution model and its coverage audit.
 
-- `NameResolutions::by_site` remains keyed by `(SourceSpan, Tier)`.
-- Values are `Resolution::Reference`, `Resolution::Selection`, or
-  `Resolution::Shorthand { selection, value }`.
-- `Referent` represents name-lookup targets; `Selection` owns field and named
-  parameter targets. All three enums remain flat and `Copy`.
+- (Updated 2026-11-11.) `NameResolutions::by_site` is a
+  `BTreeMap<Site, Reference>`; `Site` is `Type`/`Value`/`Label(SourceSpan)`,
+  ordered by position then role. `Reference` is `Name(Referent)`, `Local`,
+  `Field` or `ArgumentLabel`; all flat and `Copy`, and all `pub(super)` to
+  `tir`, so navigation needs a public `Semantics` query.
+- A shorthand argument is two entries at one span (its label and its value).
 - Named argument labels target the naming declaration, including trait
   declarations whose implementations use unnamed parameters.
 - Pattern shorthand records a field selection; its local declaration remains in
@@ -138,17 +139,13 @@ request
 | Completion | Defer semantic rewrite; textual classification may be reusable |
 | Tests | Preserve behavior scenarios; replace obsolete fixtures/assertions |
 
-## Ownership and lifetimes: proposed boundary
+## Ownership and lifetimes
 
-`tir::check()` currently builds semantic state, runs `TypeContext::sweep()`, then
-drops the context and returns only diagnostics. `tir::build()` separately keeps
-the context alive long enough to lower to MIR.
-
-Do not store `TypeContext` in the server. It borrows mutable diagnostics,
-resolutions, strings, and solver, plus files, definitions, dispatch, and borrowed
-AST entries. Persisting that arrangement would invite self-referential storage.
-
-Separate checking machinery from retained semantic tables:
+Settled by the ownership refactor ([record](type-context-ownership-refactor.md),
+2026-11-11): `tir::check` returns an owned, lifetime-free `Semantics`, and the
+AST borrow lives only in the `SemanticsBuilder` for the length of the build. The
+old advice "do not store `TypeContext` in the server" and the separate
+`SemanticData` are superseded; there is no second semantic model.
 
 ```text
 server lifetime
@@ -157,37 +154,20 @@ server lifetime
   current snapshots
   diagnostic publication bookkeeping
 
-snapshot lifetime
-  exact compilation sources, ASTs, packages, string interner
-  owned semantic tables
-  compiler diagnostics
-  derived lookup indexes
-
-checking-run lifetime
-  borrowed AST entries
-  TypeContext
-  solver and query execution state
-  temporary obligations / scratch storage
+snapshot lifetime (one per package root)
+  AnalysisSnapshot { revision, compilation: CompilationUnit,
+                     strings: StringInterner, sema: Semantics }
+  built by tir::check; diagnostics = compilation.collect_diagnostics()
+  + sema.diagnostics()
 
 request lifetime
   borrowed snapshot view
   owned response
 ```
 
-Illustrative server-side storage:
-
-```rust
-struct AnalysisSnapshot {
-    revision: Revision,
-    compilation: CompilationUnit,
-    semantics: SemanticData,
-}
-```
-
-The compiler owns `SemanticData` representation and semantic query logic. The
-LSP owns scheduling, versions, publication, and protocol conversion. A query view
-can borrow compilation and semantics together; stored fields need not borrow
-one another.
+The compiler owns semantic queries (`Semantics` methods); the LSP owns
+scheduling, versions, publication and protocol conversion. Interner scope:
+see the decision recorded under step B.
 
 ### Snapshot invariants
 
@@ -201,26 +181,6 @@ one another.
 - Requests read data; they should not need to restart mutable checking queries.
 - Single ownership is sufficient initially. Add `Arc` only when concurrent users
   actually need to retain snapshots; immutability does not require cloning them.
-
-### Retained semantic data
-
-Audit `TypeContext` fields before deciding the exact storage split. Expected
-categories are definitions/namespaces, resolutions, types and dependent arenas,
-generic environments, signatures, bodies and owner-to-body mappings, diagnostics,
-and checked relationships needed by queries.
-
-Move existing tables into owned storage rather than copying them into a second
-editor-specific model. Do not preserve all solver/query machinery just because it
-currently shares a struct with useful output. Conversely, do not extract type
-indices while dropping arenas needed to interpret their contents.
-
-Existing useful foundations:
-
-- `DefinitionRegistry` is owned; `AstEntry`/`AstNodeRef` borrow AST nodes.
-- `NameResolutions` is already keyed by file/span/tier in a `BTreeMap`.
-- Declaration names are intentionally absent from that reference table.
-- Bodies have flat expression kind/type/span columns and local/label tables.
-- Owner-to-body mappings already exist for functions, constants, and globals.
 
 ## Query boundary and derived indexes
 
@@ -322,6 +282,9 @@ Possible later extensions preserve these boundaries:
 
 ### A. Compiler analysis ownership
 
+Done (2026-11-11): owned `Semantics`, ownership audit, resolution table and its
+coverage tests. Remaining: the navigation query (`definition_at`).
+
 - Audit persistent versus temporary `TypeContext` fields and arena dependencies.
 - Design owned semantic storage and a small borrowed query view.
 - Preserve useful output for erroneous programs.
@@ -387,133 +350,12 @@ Add focused regressions for:
 - `notes/lsp-full-diagnostic-view-plan.md`: existing custom diagnostic-view context.
 - `notes/lsp-completions.md`: previous completion context; not the new-TIR API plan.
 
-## Storage audit: first findings (2026-11-10)
+## Storage audit (historical)
 
-The first audit traced `TypeContext`, the type/bound arenas, formatting, lowering,
-and solver storage. No compiler storage changes have been made yet.
-
-### Field classification
-
-| Existing storage | Proposed analysis treatment | Reason / dependencies |
-| --- | --- | --- |
-| `files`, `strings`, borrowed through context | Owned by the enclosing compilation | Source spans and interned names must remain paired with the exact inputs |
-| `defs` | Move the owned `DefinitionRegistry` into the result after context consumption | Declaration identities, member/namespace lookup, and declaration spans |
-| `resolutions`, `diagnostics` | Move caller-owned outputs into the result | Already external to the context; no need to clone |
-| `ast_nodes` | Discard borrowed entry list after checking | Contains references into compilation ASTs; query storage must not retain these |
-| `types` | Retain whole interner | Types contain `TypeList` ranges into the interner's own list storage |
-| `generic_envs` | Retain whole arena | Referents and types contain environment IDs; arena stores owner, parent, parameter names/spans, and identity types |
-| `bounds`, `clauses`, `assumption_envs` | Retain together initially | Signatures contain `BoundId`/clause ranges; assumption frames contain clause ranges and parent IDs; source-bound formatting reads the bound arena |
-| `generic_args` | Retain with bodies | Checked expressions use ranges of argument types and source spans |
-| `type_aliases`, `traits`, `structs`, `enums`, `typesets`, `assoc_types`, `functions`, `constants`, `inherent_impls`, `trait_impls` | Retain existing signature tables | References to the above arenas must stay valid, including error placeholders and optional signatures |
-| `bodies` | Retain existing flat body tables | Local/label declarations and expression types/spans; no source-tree reconstruction |
-| `const_bodies`, `function_implementations`, `global_bodies` | Retain owner-to-body mappings | Resolve `BodyOwner` references; imported and bodiless functions need no artificial body |
-| `exports` | Retain | Completed semantic relationship, cheap to move |
-| `query_state`, `query_stack` | Discard for read-only analysis | AST-entry indices, construction readiness/cycles, and obligation ranges; not needed to interpret completed signature tables |
-| `obligations`, `const_obligations` | Discard for read-only analysis | Check execution work, not declaration identity; constant obligations are removed as decided |
-| `operators` | Not needed for initial read-only queries | Checker/lowering lookup helper; lowering still uses it on the live context |
-| `impl_dispatch` | Keep ownership decision open until an implementation/member query needs it | It is owned outside the context and can be retained without AST borrows; initial name navigation does not require re-selection |
-| `solver`, `global_values` | See evaluated-value caveat below | Cannot treat all solver contents as disposable if evaluated values are retained |
-
-### Important correction: Solver is not just scratch
-
-`Solver` mixes recursion frames, normalization caches, verdicts and layouts with
-evaluated constant/instance/static values and the allocation arena those values
-can reference. `TypeContext::global_values` contains `ConstValue`s that can also
-refer into that allocation arena. Retaining those values while dropping the
-solver's allocations would leave uninterpretable IDs.
-
-For the first navigation milestone, the simplest coherent boundary is to retain
-checked types/bodies but not evaluated-value results or solver caches. This does
-not prevent retaining them later as a coherent value store. Do not keep
-`global_values` alone, or suggest the existing solver is entirely temporary.
-Constant-value hover and read-only normalization are not promised by this first
-API. Interned projections/constants can still be inspected/formatted structurally
-without re-running the solver.
-
-### Existing read-only path is encouraging
-
-`TypeFormatter` already borrows only types, definitions, strings, and generic
-environments; `BoundFormatter` adds the bound arena. Neither inherently needs a
-live checker or solver. Their construction currently lives on `TypeContext`, but
-the underlying read-only representation is reusable.
-
-Lowering is different: it normalizes, evaluates, computes layouts, and interns new
-types through a mutable live `TypeContext`. Keep that path intact. An immutable
-editor result should not force lowering to be redesigned as a read-only pass.
-
-### First design choice to confirm
-
-Two implementation shapes remain possible:
-
-1. Consume the context after `sweep()` and move its retained fields into an owned
-   result. This adds an explicit extraction boundary, changes no checking field
-   access, preserves disjoint-field borrows, and leaves lowering on its existing
-   live context. It repeats the retained field list in the result/extraction,
-   but does not duplicate runtime data or create another semantic representation.
-2. Group retained tables into a shared storage struct now and make checking use
-   that storage directly. This avoids a separate extraction field list, but
-   touches checking/lowering consumers and can affect disjoint borrowing; avoid
-   hiding the storage boundary behind `Deref` solely to preserve field syntax.
-
-### User direction: preserve the live semantic state
-
-Subsequent clarification: refactor `TypeContext` itself into owned mutable
-semantic state, with inputs passed explicitly to operations. Do not introduce
-another storage wrapper or boilerplate borrowing view around it. The earlier
-owned-state/borrowed-execution-view proposal below is superseded by that direction.
-The target is an owned context without lifetime parameters, retaining solver and
-query state. Borrowed AST entries need replacement with owned input locations;
-their concrete representation is still to be designed.
-
-The string interner should eventually be passed explicitly and shared across
-compilations as appropriate. No `CompilerSession` wrapper, interner newtype,
-global storage, or synchronization is wanted for this prerequisite. Module
-placement is independent of resource ownership.
-
-Prerequisite implemented: move the existing `StringInterner` alias and keyword
-definitions into `crates/wx-compiler/src/symbols.rs`. Keep `ast` compatibility
-re-exports for existing consumers. `Keyword::create_interner` is public so callers
-can explicitly construct correctly seeded shared interners. Keyword order and
-symbol numbering are unchanged. Compilation/builder ownership is unchanged in
-this step; explicit interner threading is separate work.
-
-Prerequisite validation: 1,449 compiler tests passed (2 ignored), 75 formatter
-tests passed, formatting and `git diff --check` passed. The new symbol test
-checks every keyword's seeded ID, spelling round-trip, and classification, plus
-ordinary identifiers starting after the reserved prefix and keyword reinterning.
-
-The user does not favor consuming the context into a reduced finished result:
-the context should be the mutable semantic state of the program, capable of
-additional queries later and a foundation for eventual incremental checking.
-The extraction recommendation above is therefore superseded pending the design
-below; no extraction implementation has been made.
-
-Distinguish preserving semantic state from preserving the exact borrowed Rust
-struct instance. The present context borrows mutable strings/diagnostics/
-resolutions/solver, immutable files/definitions/dispatch, and AST entries that in
-turn borrow AST nodes. Putting it alongside its owners in a returned struct would
-be self-referential. A lifetime parameter alone does not solve that ownership.
-
-Proposed direction to investigate: keep all reusable mutable state (including
-solver/value arenas and query state) in an owned semantic-state object. Keep the
-borrowing context as a short-lived execution view over that state and its input
-owners. Dropping the view drops no semantic state; later queries borrow the same
-state again. This is not a freeze/extract transition or an editor-specific IR.
-
-The remaining complication is query metadata referencing the borrowed AST-entry
-list. Determine whether that list can initially be reconstructed with stable
-ordering for the same unchanged compilation, or whether owned AST locators are a
-better replacement. Rebuilding a view is not permission to reset query tables or
-change the meaning of their AST indices. Cross-edit reuse remains out of scope:
-replace the entire state on source changes until invalidation is designed.
-
-Next concrete action: audit how query state indexes AST entries and design the
-owned-state/borrowed-execution-view split, preserving disjoint borrows and the
-existing live lowering path. Confirm significant representation changes with the
-user before implementation.
-
-Resolved 2026-11-11: query metadata and the AST-entry list are construction
-state, not semantic state. Neither is needed after the sweep, so both move into
-a `Construction<'ast>` that lives only while checking; no locators are needed.
-See "Revised direction" in
-[type-context-ownership-refactor.md](type-context-ownership-refactor.md).
+The 2026-11-10 audit of what to retain from `TypeContext`, and the proposals to
+consume it into a reduced result, are obsolete: the user's direction (keep the
+live mutable semantic state, no extraction, no storage wrapper) was implemented
+as the owned `Semantics`. See
+[type-context-ownership-refactor.md](type-context-ownership-refactor.md). One
+fact from it stays true: evaluated values refer into the solver's allocation
+arena, so never retain `global_values` apart from the solver.
