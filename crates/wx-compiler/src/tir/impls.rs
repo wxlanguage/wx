@@ -258,6 +258,11 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					};
 					self.inherent_targets[usize::from(*block_index)] =
 						Some(target);
+					self.check_inherent_impl_locality(
+						entry.file_id,
+						entry.namespace,
+						target,
+					);
 					self.register_inherent(target, *block_index, entry.file_id);
 				}
 				AstNodeRef::TraitImplBlock { item, block_index } => {
@@ -695,6 +700,75 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		self.inherent.entry(target.inner).or_default().push(index);
 	}
 
+	/// Inherent members belong to the package defining their target. Builtin
+	/// constructors belong to std; named targets keep their declaration's
+	/// owner even when reached through an import or a package instance.
+	/// Trait impls deliberately have no such restriction.
+	fn check_inherent_impl_locality(
+		&mut self,
+		file_id: FileId,
+		namespace: Scope,
+		target: Spanned<ImplTarget>,
+	) {
+		let decls = self.decls;
+		let target_scope = match target.inner {
+			ImplTarget::Struct(index) => {
+				decls.structs[usize::from(index)].namespace
+			}
+			ImplTarget::Enum(index) => {
+				decls.enums[usize::from(index)].parent_namespace
+			}
+			ImplTarget::Memory(index) => {
+				decls.memories[usize::from(index)].namespace
+			}
+			ImplTarget::Global(index) => {
+				decls.globals[usize::from(index)].namespace
+			}
+			ImplTarget::Function(index) => {
+				decls.functions[usize::from(index)].namespace
+			}
+			ImplTarget::U8
+			| ImplTarget::I8
+			| ImplTarget::U16
+			| ImplTarget::I16
+			| ImplTarget::U32
+			| ImplTarget::I32
+			| ImplTarget::U64
+			| ImplTarget::I64
+			| ImplTarget::F32
+			| ImplTarget::F64
+			| ImplTarget::Funcref
+			| ImplTarget::TypedFuncref
+			| ImplTarget::Array
+			| ImplTarget::Slice => Scope::Package(decls.stdlib_package),
+		};
+		if decls.namespaces.scope(target_scope).package_id
+			== decls.namespaces.scope(namespace).package_id
+		{
+			return;
+		}
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::ForeignImplTarget.code())
+				.with_message(
+					"cannot define inherent `impl` for a type outside of the \
+					 package where the type is defined",
+				)
+				.with_label(
+					SourceSpan::new(file_id, target.span)
+						.primary_label()
+						.with_message(
+							"impl for type defined outside of package",
+						),
+				)
+				.with_note(
+					"consider defining a trait and implementing it for the \
+					 type, or wrapping it in a struct of your own and \
+					 implementing that instead",
+				),
+		);
+	}
+
 	fn resolve_target(
 		&mut self,
 		file_id: FileId,
@@ -836,5 +910,236 @@ impl Semantics {
 				"memory/global/function impls are never resolved through a written path — see ImplTarget's own doc comment"
 			),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use indoc::indoc;
+
+	use super::*;
+	use crate::ast::Keyword;
+	use crate::testing::DiagnosticView;
+	use crate::vfs::{self, Files};
+
+	struct TestCase {
+		files: Files,
+		diagnostics: Vec<Diagnostic<FileId>>,
+	}
+
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
+			builder.load_stdlib();
+			let root = builder
+				.load_binary(
+					vfs::AbsolutePath::new("/main.wx"),
+					&vfs::VirtualFileSource::from_relative(HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)])),
+				)
+				.unwrap();
+			Self::from_graph(builder.build(root), strings)
+		}
+
+		/// Collect declarations and dispatch candidates only: signature and
+		/// body checking are not needed to establish an impl's ownership.
+		fn from_graph(
+			graph: vfs::CompilationUnit,
+			mut strings: StringInterner,
+		) -> Self {
+			DiagnosticView::new(
+				"parse/link",
+				&graph.collect_diagnostics(),
+				&graph.files,
+			)
+			.assert_no_errors();
+			let mut diagnostics = Vec::new();
+			let mut resolutions = NameResolutions::default();
+			let (decls, ast_nodes) = Declarations::build(
+				&graph.packages,
+				&graph.files,
+				&mut strings,
+				&mut diagnostics,
+				&mut resolutions,
+				graph.stdlib_package,
+				graph.root_package,
+			);
+			DiagnosticView::new("declarations", &diagnostics, &graph.files)
+				.assert_none();
+			ImplDispatch::build(
+				&mut diagnostics,
+				&mut resolutions,
+				&strings,
+				&decls,
+				&ast_nodes,
+			);
+			Self {
+				files: graph.files,
+				diagnostics,
+			}
+		}
+
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new("impl dispatch", &self.diagnostics, &self.files)
+		}
+	}
+
+	#[test]
+	fn inherent_impl_locality_rejects_foreign_targets_through_imports() {
+		const SOURCE: &str = indoc! {r#"
+			package "dep" as dep;
+			use dep::Point as Imported;
+			impl Imported {}
+			mod nested {
+				impl super::dep::Kind {}
+			}
+			trait Extension {}
+			impl Extension for Imported {}
+			impl Extension for dep::Kind {}
+		"#};
+		let mut strings = Keyword::create_interner();
+		let name = strings.get_or_intern("dep");
+		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
+		builder.load_stdlib();
+		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
+			("main.wx".to_string(), SOURCE.to_string()),
+			(
+				"dep.wx".to_string(),
+				indoc! {"
+				pub struct Point();
+				pub enum Kind(u8) { A = 0 }
+				impl Point {}
+				mod nested { impl super::Kind {} }
+			"}
+				.to_string(),
+			),
+		]));
+		let dep = builder
+			.load_package(
+				vfs::PackageKind::Library,
+				vfs::AbsolutePath::new("/dep.wx"),
+				&workspace,
+			)
+			.unwrap();
+		let root = builder
+			.load_binary(vfs::AbsolutePath::new("/main.wx"), &workspace)
+			.unwrap();
+		builder.add_dependency(root, name, dep);
+		let graph = builder.build(root);
+		let case = TestCase::from_graph(graph, strings);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::ForeignImplTarget,
+			DiagnosticCode::ForeignImplTarget,
+		]);
+		for (diagnostic, target) in case
+			.diagnostics
+			.iter()
+			.zip(["Imported", "super::dep::Kind"])
+		{
+			assert_eq!(
+				diagnostic.severity,
+				codespan_reporting::diagnostic::Severity::Error
+			);
+			assert_eq!(
+				diagnostic.message,
+				"cannot define inherent `impl` for a type outside of the package where the type is defined"
+			);
+			assert_eq!(diagnostic.labels.len(), 1);
+			let label = &diagnostic.labels[0];
+			assert_eq!(
+				label.style,
+				codespan_reporting::diagnostic::LabelStyle::Primary
+			);
+			let file = case.files.get(label.file_id).unwrap();
+			assert_eq!(file.source, SOURCE);
+			assert_eq!(&file.source[label.range.clone()], target);
+			assert_eq!(
+				label.message,
+				"impl for type defined outside of package"
+			);
+			assert_eq!(
+				diagnostic.notes,
+				[
+					"consider defining a trait and implementing it for the type, or wrapping it in a struct of your own and implementing that instead"
+				]
+			);
+		}
+	}
+
+	#[test]
+	fn inherent_impl_locality_allows_other_files_of_the_defining_package() {
+		let mut strings = Keyword::create_interner();
+		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
+		builder.load_stdlib();
+		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
+			(
+				"main.wx".to_string(),
+				indoc! {"
+				mod geom;
+				use geom::Point;
+				impl<T: StackValue> Point<T> {}
+				mod nested { impl super::geom::Kind {} }
+			"}
+				.to_string(),
+			),
+			(
+				"geom.wx".to_string(),
+				"pub struct Point<T>(T); pub enum Kind(u8) { A = 0 }"
+					.to_string(),
+			),
+		]));
+		let root = builder
+			.load_binary(vfs::AbsolutePath::new("/main.wx"), &workspace)
+			.unwrap();
+		let graph = builder.build(root);
+		let case = TestCase::from_graph(graph, strings);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn inherent_impl_locality_reserves_primitives_and_std_types_for_std() {
+		for target in [
+			"u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64",
+			"funcref", "Bool", "Char",
+		] {
+			let case = TestCase::new(&format!(
+				"use std::{target} as Imported; impl Imported {{}} \
+				 trait Extension {{}} impl Extension for Imported {{}}"
+			));
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::ForeignImplTarget]);
+		}
+	}
+
+	#[test]
+	fn inherent_impl_locality_allows_std_to_implement_its_builtins() {
+		let source = indoc! {"
+			type u8; type u32; type funcref;
+			enum Bool(u8) { False = 0, True = 1 }
+			struct Char(value: u32);
+			mod nested {
+				impl u8 {} impl u32 {} impl funcref {}
+				impl Bool {} impl Char {}
+			}
+		"};
+		let mut strings = Keyword::create_interner();
+		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
+		let root = builder
+			.load_binary(
+				vfs::AbsolutePath::new("/main.wx"),
+				&vfs::VirtualFileSource::from_relative(HashMap::from([(
+					"main.wx".to_string(),
+					source.to_string(),
+				)])),
+			)
+			.unwrap();
+		builder.set_stdlib(root);
+		let case = TestCase::from_graph(builder.build(root), strings);
+		case.diagnostics().assert_none();
 	}
 }
