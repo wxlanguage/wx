@@ -1,7 +1,6 @@
 //! Trait-impl conformance: whether `impl Tr for X` keeps the contract `Tr`
-//! states for `X`. It is one check per impl (`TypeObligation::
-//! CheckConformance`), run with the other declaration checks once every
-//! signature exists, so everything an impl owes its trait is decided and
+//! states for `X`. It is one check per impl, run after the impl's other
+//! declaration checks once every signature exists (`check_declarations`), so everything an impl owes its trait is decided and
 //! reported in one place:
 //! - every member the impl writes is one the trait declares, of the same
 //!   kind, and every declaration without a default is provided;
@@ -31,14 +30,14 @@ use super::bounds::{
 	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
 	RepresentableClause, TraitClause,
 };
-use super::defs::{
-	AstNodeRef, BindingKey, ConstIdx, DefId, DefKind, FunctionIdx, MemberIdx,
+use super::decls::{
+	AstNodeRef, BindingKey, ConstIdx, DeclId, DeclKind, FunctionIdx, MemberIdx,
 	MemberKind, Tier, TraitIdx, TraitImplIdx,
 };
 use super::members::TraitMemberSelection;
 use super::obligations::BoundRequirements;
 use super::resolutions::{Referent, Resolution};
-use super::signatures::TypeContext;
+use super::signatures::{Semantics, SemanticsBuilder};
 use super::solver::{
 	ImplMember, NormalizationDepth, RewriteFlags, SolverError, Subjects,
 	UnsatisfiedClause,
@@ -46,218 +45,13 @@ use super::solver::{
 use super::types::{
 	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
 };
-use crate::ast::{self, Spanned};
+use crate::ast::{self, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
-impl<'ast> TypeContext<'ast, '_, '_> {
-	/// Checks what `impl_index` owes its trait. Each part is reported on its
-	/// own, so one failure does not hide the next; only "not decided yet"
-	/// is returned.
-	pub(super) fn check_conformance(
-		&mut self,
-		impl_index: TraitImplIdx,
-	) -> Result<(), SolverError> {
-		// An impl of an unresolved trait reported that already.
-		let Some(trait_def) =
-			self.impl_dispatch.trait_header(impl_index).trait_def
-		else {
-			return Ok(());
-		};
-		let trait_index = trait_def.inner;
-		let header = self.trait_impls[usize::from(impl_index)]
-			.as_ref()
-			.expect("every signature exists when declarations are checked");
-		let (scope, target) = (header.type_params, header.target);
-		let file_id = self.defs.trait_impls[usize::from(impl_index)].file_id;
-		let at_target = SourceSpan::new(file_id, target.span);
-		let owner = GenericEnvOwner::Trait(trait_index);
-
-		self.check_members(impl_index, trait_index, target.inner, at_target)?;
-
-		// The supertraits are the clauses on the trait's `Self`; the target
-		// must satisfy them where the impl is written, with its parameters'
-		// bounds assumed.
-		let trait_env = self.traits[usize::from(trait_index)].env;
-		let args = self.generic_args.push([(target.inner, target.span)]);
-		let result = self.check_bound_requirements(
-			self.assumption_envs.of_frame(scope),
-			BoundRequirements::Frame {
-				env: trait_env,
-				args,
-			},
-			at_target,
-			owner,
-		);
-		self.report_unfinished(result, at_target)?;
-
-		for member_index in
-			0..self.defs.traits[usize::from(trait_index)].members.len()
-		{
-			let declaration @ MemberKind::AssociatedType(declaration_index) =
-				self.defs.traits[usize::from(trait_index)].members
-					[member_index]
-					.kind
-			else {
-				continue;
-			};
-			// The value's own judgement (`CheckAssocValue`) reports a value
-			// that has no meaning; one the impl omits with no default is
-			// reported missing above.
-			let value = match self.assoc_value(
-				ImplMember {
-					impl_index,
-					declaration: declaration_index,
-				},
-				None,
-			) {
-				Ok(value) => value,
-				Err(SolverError::Pending) => return Err(SolverError::Pending),
-				Err(_) => continue,
-			};
-			// A written value is pointed at; an inherited default is written
-			// in the trait, so the impl's target stands for it.
-			let reference =
-				match self.defs.select_trait_member(impl_index, declaration) {
-					TraitMemberSelection::Impl(MemberKind::AssociatedType(
-						provider,
-					)) => {
-						let AstNodeRef::TraitImplAssocType {
-							item: ast::ImplItem::AssocType { ty, .. },
-							..
-						} = *self.ast_node(DefId::AssocType(provider))
-						else {
-							unreachable!("a trait impl's associated type")
-						};
-						SourceSpan::new(
-							self.defs.assoc_types[usize::from(provider)]
-								.file_id,
-							ty.span,
-						)
-					}
-					_ => at_target,
-				};
-			let result = self.check_bound_requirements(
-				self.assumption_envs.of_frame(scope),
-				BoundRequirements::AssociatedType {
-					declaration: declaration_index,
-					trait_index,
-					receiver: target.inner,
-					value,
-				},
-				reference,
-				owner,
-			);
-			self.report_unfinished(result, reference)?;
-		}
-		Ok(())
-	}
-
-	/// The impl's members against the trait's declarations, in the order the
-	/// impl writes them, then the declarations it leaves out. Each side is a
-	/// lookup in the other's bindings. A member is matched to the declaration
-	/// of its name, of its own tier first: one of the other tier is the
-	/// declaration it was meant to provide, of another kind. A declaration is
-	/// missing when the impl does not provide it (`provides`) and it has no
-	/// default.
-	fn check_members(
-		&mut self,
-		impl_index: TraitImplIdx,
-		trait_index: TraitIdx,
-		target: TypeIndex,
-		at_target: SourceSpan,
-	) -> Result<(), SolverError> {
-		let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
-		let impl_file = impl_def.file_id;
-		for index in 0..impl_def.members.len() {
-			let impl_def = &self.defs.trait_impls[usize::from(impl_index)];
-			let member = impl_def.members[index].kind;
-			let name = self.defs.name(member.def_id());
-			// A second member of one name was reported as a duplicate.
-			if impl_def
-				.bindings
-				.get(&BindingKey::new(member.tier(), name.inner))
-				!= Some(&MemberIdx::new(index as u32))
-			{
-				continue;
-			}
-			let at_member = SourceSpan::new(impl_file, name.span);
-			let other_tier = match member.tier() {
-				Tier::Type => Tier::Value,
-				Tier::Value => Tier::Type,
-			};
-			let trait_def = &self.defs.traits[usize::from(trait_index)];
-			let Some(declaration_index) =
-				[member.tier(), other_tier].into_iter().find_map(|tier| {
-					trait_def
-						.bindings
-						.get(&BindingKey::new(tier, name.inner))
-						.copied()
-				})
-			else {
-				self.report_not_a_member(trait_index, member, name, at_member);
-				continue;
-			};
-			let declaration =
-				trait_def.members[usize::from(declaration_index)].kind;
-			match (declaration, member) {
-				(
-					MemberKind::Function(expected)
-					| MemberKind::Method(expected),
-					MemberKind::Function(found) | MemberKind::Method(found),
-				) => {
-					let result = self.compare_function(
-						trait_index,
-						declaration,
-						expected,
-						found,
-						target,
-					);
-					self.report_unfinished(result, at_member)?;
-				}
-				(
-					MemberKind::Constant(expected),
-					MemberKind::Constant(found),
-				) => {
-					let result = self.compare_constant(
-						trait_index,
-						expected,
-						found,
-						target,
-					);
-					self.report_unfinished(result, at_member)?;
-				}
-				(
-					MemberKind::AssociatedType(_),
-					MemberKind::AssociatedType(_),
-				) => {}
-				_ => self.report_kind_mismatch(
-					trait_index,
-					declaration,
-					member,
-					at_member,
-				),
-			}
-		}
-
-		let trait_def = &self.defs.traits[usize::from(trait_index)];
-		let missing: Vec<Spanned<SymbolU32>> = trait_def
-			.members
-			.iter()
-			.filter(|member| {
-				!self.provides(impl_index, member.kind)
-					&& !self.has_default(member.kind)
-			})
-			.map(|member| self.defs.name(member.kind.def_id()))
-			.collect();
-		if !missing.is_empty() {
-			self.report_missing(trait_index, &missing, at_target);
-		}
-		Ok(())
-	}
-
+impl Semantics {
 	/// Whether the impl provides `declaration`: selection finds a member of
 	/// its kind under its name. One of another kind is reported as such, and
 	/// provides nothing.
@@ -267,201 +61,9 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		declaration: MemberKind,
 	) -> bool {
 		matches!(
-			self.defs.select_trait_member(impl_index, declaration),
+			self.decls.select_trait_member(impl_index, declaration),
 			TraitMemberSelection::Impl(_)
 		)
-	}
-
-	/// Whether the trait's declaration supplies what an impl omits.
-	fn has_default(&self, declaration: MemberKind) -> bool {
-		match declaration {
-			MemberKind::AssociatedType(index) => self.assoc_types
-				[usize::from(index)]
-			.as_ref()
-			.is_some_and(|signature| signature.value.is_some()),
-			MemberKind::Function(index) | MemberKind::Method(index) => {
-				matches!(
-					*self.ast_node(DefId::Function(index)),
-					AstNodeRef::TraitFunction {
-						item: ast::TraitItem::Function { body: Some(_), .. },
-						..
-					}
-				)
-			}
-			MemberKind::Constant(index) => matches!(
-				*self.ast_node(DefId::Const(index)),
-				AstNodeRef::TraitConst {
-					item: ast::TraitItem::Const { value: Some(_), .. },
-					..
-				}
-			),
-		}
-	}
-
-	/// The impl's `function` against the trait's `declaration`, read in the
-	/// env a caller through the trait sees (`contract_env`): `Self` is
-	/// `target`, and the declaration's own type parameters are the
-	/// function's, by position, assuming what the declaration's do. Reports
-	/// the first difference: the number of own type parameters, a bound the
-	/// declaration does not imply, the number of parameters, then each
-	/// parameter's name and type in order, then the result.
-	fn compare_function(
-		&mut self,
-		trait_index: TraitIdx,
-		member: MemberKind,
-		declaration: FunctionIdx,
-		function: FunctionIdx,
-		target: TypeIndex,
-	) -> Result<(), SolverError> {
-		let declaration_env =
-			self.functions[usize::from(declaration)].type_params;
-		let env = self.functions[usize::from(function)].type_params;
-		let (expected_own, own) = (
-			self.own_params(declaration_env).len(),
-			self.own_params(env).len(),
-		);
-		if expected_own != own {
-			self.report_count_mismatch(
-				trait_index,
-				member,
-				(declaration, function),
-				"type parameter",
-				(expected_own, own),
-			);
-			return Ok(());
-		}
-		let contract = self.contract_env(declaration, function, target)?;
-		if !self.check_own_bounds(
-			trait_index,
-			(declaration, function),
-			contract,
-		)? {
-			return Ok(());
-		}
-		let (expected_signature, signature) = (
-			&self.functions[usize::from(declaration)],
-			&self.functions[usize::from(function)],
-		);
-		let (expected_params, expected_result) = (
-			expected_signature.param_types,
-			expected_signature.return_type,
-		);
-		let (found_params, found_result) =
-			(signature.param_types, signature.return_type);
-		let params = self.types.list(found_params).len();
-		let expected_count = self.types.list(expected_params).len();
-		if expected_count != params {
-			self.report_count_mismatch(
-				trait_index,
-				member,
-				(declaration, function),
-				"parameter",
-				(expected_count, params),
-			);
-			return Ok(());
-		}
-		let arguments: Box<[TypeIndex]> = std::iter::once(target)
-			.chain(self.own_params(env).iter().copied())
-			.collect();
-		// The result is compared as one more position, after the parameters.
-		for position in 0..=params {
-			let (expected, found) = if position < params {
-				(
-					self.types.list(expected_params)[position],
-					self.types.list(found_params)[position],
-				)
-			} else {
-				(expected_result, found_result)
-			};
-			// A type that failed to lower was reported where it is written,
-			// and the parameter is not understood well enough to compare,
-			// its name included.
-			if self.types.has_error(expected) || self.types.has_error(found) {
-				continue;
-			}
-			if position < params {
-				let expected_name = self.defs.functions
-					[usize::from(declaration)]
-				.params[position];
-				let name =
-					self.defs.functions[usize::from(function)].params[position];
-				// Leaving the parameter unnamed only binds no local: the contract
-				// is still the trait's, and so are the names calls use.
-				if name.is_some()
-					&& expected_name.map(|name| name.inner)
-						!= name.map(|name| name.inner)
-				{
-					self.report_name_mismatch(
-						trait_index,
-						member,
-						(declaration, function),
-						position,
-						(expected_name, name),
-					);
-					return Ok(());
-				}
-			}
-			let expected = self.types.substitute(
-				expected,
-				Substitution {
-					envs: &self.generic_envs,
-					env: declaration_env,
-					args: &arguments,
-				},
-			);
-			let expected = self.normalize(
-				contract,
-				expected,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			let found = self.normalize(
-				contract,
-				found,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			// Normalizing may still meet an error (a projection with no value),
-			// which was reported where it belongs.
-			if expected == found
-				|| self.types.has_error(expected)
-				|| self.types.has_error(found)
-			{
-				continue;
-			}
-			let (expected_syntax, syntax) = (
-				self.function_syntax(declaration),
-				self.function_syntax(function),
-			);
-			// A left-out result is `()`; its function's name stands for it.
-			let written = |syntax: &'ast ast::FunctionSignature| {
-				if position < params {
-					WrittenType::Written(
-						&syntax.params[position].inner.inner.ty,
-					)
-				} else {
-					syntax.result.as_deref().map_or(
-						WrittenType::Implied(syntax.name.span),
-						WrittenType::Written,
-					)
-				}
-			};
-			let head = self.signature_mismatch(trait_index, member, function);
-			self.report_type_mismatch(
-				head,
-				(
-					self.defs.functions[usize::from(declaration)].file_id,
-					written(expected_syntax),
-				),
-				(
-					self.defs.functions[usize::from(function)].file_id,
-					written(syntax),
-				),
-				(expected, found),
-			);
-			return Ok(());
-		}
-		Ok(())
 	}
 
 	/// The env a caller through the trait sees `function` in: the impl's
@@ -473,6 +75,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	/// declaration states nothing is read in its impl's.
 	fn contract_env(
 		&mut self,
+		strings: &StringInterner,
 		declaration: FunctionIdx,
 		function: FunctionIdx,
 		target: TypeIndex,
@@ -490,7 +93,8 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			.collect();
 		let clauses =
 			self.instantiate_clauses(requirements, declaration_env, &arguments);
-		let (assumed, _) = self.normalize_clauses(impl_env, clauses)?;
+		let (assumed, _) =
+			self.normalize_clauses(strings, impl_env, clauses)?;
 		let contract = self.assumption_envs.push(impl_env, None);
 		*self.assumption_envs.clauses_mut(contract) = assumed;
 		Ok(contract)
@@ -553,6 +157,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	/// every bound follows.
 	fn check_own_bounds(
 		&mut self,
+		strings: &StringInterner,
 		trait_index: TraitIdx,
 		(declaration, function): (FunctionIdx, FunctionIdx),
 		contract: AssumptionEnvIdx,
@@ -567,11 +172,13 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		// it is written (`normalize_self_entry`). Each is read where the
 		// function is written, not under the contract's assumptions.
 		let impl_env = self.impl_env(function);
-		let (clauses, _) = self.normalize_clauses(impl_env, requirements)?;
+		let (clauses, _) =
+			self.normalize_clauses(strings, impl_env, requirements)?;
 		let arguments: Box<[TypeIndex]> =
 			self.generic_envs.identity_args(env).into();
 		let mut failures = Vec::new();
 		let holds = self.satisfies_clauses(
+			strings,
 			contract,
 			clauses,
 			Subjects::All,
@@ -613,6 +220,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 				}
 				reported.push(origin);
 				self.report_stricter_bound(
+					strings,
 					trait_index,
 					(declaration, function),
 					origin,
@@ -621,87 +229,6 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			}
 		}
 		Ok(holds)
-	}
-
-	/// The impl's constant against the trait's `declaration`, with `Self` as
-	/// `target`.
-	fn compare_constant(
-		&mut self,
-		trait_index: TraitIdx,
-		declaration: ConstIdx,
-		constant: ConstIdx,
-		target: TypeIndex,
-	) -> Result<(), SolverError> {
-		let expected_signature = &self.constants[usize::from(declaration)];
-		let (expected, declaration_env) =
-			(expected_signature.ty, expected_signature.env);
-		let signature = &self.constants[usize::from(constant)];
-		let (found, env) = (signature.ty, signature.env);
-		let expected = self.types.substitute(
-			expected,
-			Substitution {
-				envs: &self.generic_envs,
-				env: declaration_env,
-				args: &[target],
-			},
-		);
-		let expected = self.normalize(
-			self.assumption_envs.of_frame(env),
-			expected,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		)?;
-		let found = self.normalize(
-			self.assumption_envs.of_frame(env),
-			found,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		)?;
-		if expected == found
-			|| self.types.has_error(expected)
-			|| self.types.has_error(found)
-		{
-			return Ok(());
-		}
-		// A constant whose type is left out is reported and typed `ERROR`, so
-		// both are written here.
-		let AstNodeRef::TraitConst {
-			item: ast::TraitItem::Const {
-				ty: expected_ty, ..
-			},
-			..
-		} = *self.ast_node(DefId::Const(declaration))
-		else {
-			unreachable!("a trait's constant")
-		};
-		let AstNodeRef::TraitImplConstant {
-			item: ast::ImplItem::Constant { ty: Some(ty), .. },
-			..
-		} = *self.ast_node(DefId::Const(constant))
-		else {
-			unreachable!("a trait impl's constant with a written type")
-		};
-		let name = self.defs.constants[usize::from(constant)].name.inner;
-		let head = Diagnostic::error()
-			.with_code(DiagnosticCode::TraitImplConstTypeMismatch.code())
-			.with_message(format!(
-				"constant `{}` has an incompatible type for trait `{}`",
-				self.strings.resolve(name).unwrap(),
-				self.trait_name(trait_index),
-			));
-		self.report_type_mismatch(
-			head,
-			(
-				self.defs.constants[usize::from(declaration)].file_id,
-				WrittenType::Written(expected_ty),
-			),
-			(
-				self.defs.constants[usize::from(constant)].file_id,
-				WrittenType::Written(ty),
-			),
-			(expected, found),
-		);
-		Ok(())
 	}
 
 	/// A function's own type parameters, given its frame: none when that is
@@ -740,32 +267,22 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		}
 	}
 
-	/// The written signature of a trait's or a trait impl's function, for
-	/// its spans.
-	fn function_syntax(
+	fn trait_name<'s>(
 		&self,
-		function: FunctionIdx,
-	) -> &'ast ast::FunctionSignature {
-		match *self.ast_node(DefId::Function(function)) {
-			AstNodeRef::TraitFunction {
-				item: ast::TraitItem::Function { signature, .. },
-				..
-			}
-			| AstNodeRef::TraitImplFunction {
-				item: ast::ImplItem::Function { signature, .. },
-				..
-			} => signature,
-			_ => unreachable!("a trait's or a trait impl's function"),
-		}
+		strings: &'s StringInterner,
+		trait_index: TraitIdx,
+	) -> &'s str {
+		let name = self.decls.traits[usize::from(trait_index)].name.inner;
+		strings.resolve(name).unwrap()
 	}
 
-	fn trait_name(&self, trait_index: TraitIdx) -> &str {
-		let name = self.defs.traits[usize::from(trait_index)].name.inner;
-		self.strings.resolve(name).unwrap()
-	}
-
-	fn expected_found(&self, expected: TypeIndex, found: TypeIndex) -> String {
-		let formatter = self.type_formatter();
+	fn expected_found(
+		&self,
+		strings: &StringInterner,
+		expected: TypeIndex,
+		found: TypeIndex,
+	) -> String {
+		let formatter = self.type_formatter(strings);
 		format!(
 			"expected `{}`, found `{}`",
 			formatter.display_type(expected),
@@ -777,23 +294,25 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	/// function and its trait.
 	fn signature_mismatch(
 		&self,
+		strings: &StringInterner,
 		trait_index: TraitIdx,
 		member: MemberKind,
 		function: FunctionIdx,
 	) -> Diagnostic<FileId> {
-		let name = self.defs.functions[usize::from(function)].name.inner;
+		let name = self.decls.functions[usize::from(function)].name.inner;
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TraitImplSignatureMismatch.code())
 			.with_message(format!(
 				"{} `{}` has an incompatible signature for trait `{}`",
 				member_noun(member),
-				self.strings.resolve(name).unwrap(),
-				self.trait_name(trait_index),
+				strings.resolve(name).unwrap(),
+				self.trait_name(strings, trait_index),
 			))
 	}
 
 	fn report_count_mismatch(
 		&mut self,
+		strings: &StringInterner,
 		trait_index: TraitIdx,
 		member: MemberKind,
 		(declaration, function): (FunctionIdx, FunctionIdx),
@@ -801,14 +320,14 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		(expected, found): (usize, usize),
 	) {
 		let plural = |count: usize| if count == 1 { "" } else { "s" };
-		let (expected_def, def) = (
-			&self.defs.functions[usize::from(declaration)],
-			&self.defs.functions[usize::from(function)],
+		let (expected_decl, decl) = (
+			&self.decls.functions[usize::from(declaration)],
+			&self.decls.functions[usize::from(function)],
 		);
 		let diagnostic = self
-			.signature_mismatch(trait_index, member, function)
+			.signature_mismatch(strings, trait_index, member, function)
 			.with_label(
-				SourceSpan::new(def.file_id, def.name.span)
+				SourceSpan::new(decl.file_id, decl.name.span)
 					.primary_label()
 					.with_message(format!(
 						"expected {expected} {what}{}, found {found}",
@@ -816,7 +335,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					)),
 			)
 			.with_label(
-				SourceSpan::new(expected_def.file_id, expected_def.name.span)
+				SourceSpan::new(expected_decl.file_id, expected_decl.name.span)
 					.secondary_label()
 					.with_message(format!(
 						"the trait declares {expected} {what}{}",
@@ -826,77 +345,12 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 		self.diagnostics.push(diagnostic);
 	}
 
-	/// A parameter's name is part of the trait's contract: a call by name
-	/// uses the declaration's names, whichever impl it reaches. So an impl
-	/// names a parameter as the trait does, or leaves it unnamed, which binds
-	/// no local and changes nothing for callers; it never renames one, nor
-	/// names one the trait leaves unnamed. Only the name is compared; whether
-	/// its local is `mut` is the body's own.
-	fn report_name_mismatch(
-		&mut self,
-		trait_index: TraitIdx,
-		member: MemberKind,
-		(declaration, function): (FunctionIdx, FunctionIdx),
-		position: usize,
-		(expected, found): (
-			Option<Spanned<SymbolU32>>,
-			Option<Spanned<SymbolU32>>,
-		),
-	) {
-		let describe = |name: Option<Spanned<SymbolU32>>| match name {
-			Some(name) => {
-				format!("`{}`", self.strings.resolve(name.inner).unwrap())
-			}
-			None => "an unnamed parameter".to_owned(),
-		};
-		// An unnamed parameter is pointed at by its type.
-		let at = |function: FunctionIdx, name: Option<Spanned<SymbolU32>>| {
-			name.map_or_else(
-				|| {
-					self.function_syntax(function).params[position]
-						.inner
-						.inner
-						.ty
-						.span
-				},
-				|name| name.span,
-			)
-		};
-		let diagnostic = self
-			.signature_mismatch(trait_index, member, function)
-			.with_label(
-				SourceSpan::new(
-					self.defs.functions[usize::from(function)].file_id,
-					at(function, found),
-				)
-				.primary_label()
-				.with_message(format!(
-					"expected {}, found {}",
-					describe(expected),
-					describe(found),
-				)),
-			)
-			.with_label(
-				SourceSpan::new(
-					self.defs.functions[usize::from(declaration)].file_id,
-					at(declaration, expected),
-				)
-				.secondary_label()
-				.with_message("parameter in trait"),
-			)
-			.with_note(
-				"a parameter's name is part of the trait's contract: a call \
-				 by name uses the trait's names, so an impl names it the same \
-				 or leaves it unnamed",
-			);
-		self.diagnostics.push(diagnostic);
-	}
-
 	/// rustc's E0276: a bound the impl writes on its function's own type
 	/// parameter that the trait's declaration does not imply. It is pointed
 	/// at as written; the clause that fails is what the label names.
 	fn report_stricter_bound(
 		&mut self,
+		strings: &StringInterner,
 		trait_index: TraitIdx,
 		(declaration, function): (FunctionIdx, FunctionIdx),
 		origin: BoundId,
@@ -908,7 +362,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			} => Some(self.types.intern_const(constant, &[subject])),
 			_ => None,
 		};
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let requirement = match *failure {
 			UnsatisfiedClause::Trait {
 				subject,
@@ -916,11 +370,11 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 				..
 			} => {
 				let name =
-					self.defs.traits[usize::from(trait_index)].name.inner;
+					self.decls.traits[usize::from(trait_index)].name.inner;
 				format!(
 					"{}: {}",
 					formatter.display_type(subject),
-					self.strings.resolve(name).unwrap(),
+					strings.resolve(name).unwrap(),
 				)
 			}
 			UnsatisfiedClause::Equality {
@@ -940,23 +394,23 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 				formatter.display_type(ty),
 			),
 		};
-		let expected_def = &self.defs.functions[usize::from(declaration)];
-		let name = self.defs.functions[usize::from(function)].name.inner;
+		let expected_decl = &self.decls.functions[usize::from(declaration)];
+		let name = self.decls.functions[usize::from(function)].name.inner;
 		let diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::ImplStricterThanTrait.code())
 			.with_message(format!(
 				"impl has stricter requirements than trait `{}`",
-				self.trait_name(trait_index),
+				self.trait_name(strings, trait_index),
 			))
 			.with_label(self.bounds.span(origin).primary_label().with_message(
 				format!("impl has extra requirement `{requirement}`"),
 			))
 			.with_label(
-				SourceSpan::new(expected_def.file_id, expected_def.name.span)
+				SourceSpan::new(expected_decl.file_id, expected_decl.name.span)
 					.secondary_label()
 					.with_message(format!(
 						"definition of `{}` from trait",
-						self.strings.resolve(name).unwrap(),
+						strings.resolve(name).unwrap(),
 					)),
 			)
 			.with_note(
@@ -968,18 +422,19 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 
 	fn report_not_a_member(
 		&mut self,
+		strings: &StringInterner,
 		trait_index: TraitIdx,
 		member: MemberKind,
 		name: Spanned<SymbolU32>,
 		at_member: SourceSpan,
 	) {
-		let trait_name = self.trait_name(trait_index);
+		let trait_name = self.trait_name(strings, trait_index);
 		let diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::NotATraitMember.code())
 			.with_message(format!(
 				"{} `{}` is not a member of trait `{trait_name}`",
 				member_noun(member),
-				self.strings.resolve(name.inner).unwrap(),
+				strings.resolve(name.inner).unwrap(),
 			))
 			.with_label(
 				at_member
@@ -991,21 +446,22 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 
 	fn report_kind_mismatch(
 		&mut self,
+		strings: &StringInterner,
 		trait_index: TraitIdx,
 		declaration: MemberKind,
 		member: MemberKind,
 		at_member: SourceSpan,
 	) {
-		let name = self.defs.name(declaration.def_id());
-		let trait_def = &self.defs.traits[usize::from(trait_index)];
+		let name = self.decls.name(declaration.decl_id());
+		let trait_decl = &self.decls.traits[usize::from(trait_index)];
 		let diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::TraitImplItemKindMismatch.code())
 			.with_message(format!(
 				"`{}` is {} {}, but trait `{}` declares {} {}",
-				self.strings.resolve(name.inner).unwrap(),
+				strings.resolve(name.inner).unwrap(),
 				article(member),
 				member_noun(member),
-				self.trait_name(trait_index),
+				self.trait_name(strings, trait_index),
 				article(declaration),
 				member_noun(declaration),
 			))
@@ -1015,7 +471,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					.with_message("does not match the trait"),
 			)
 			.with_label(
-				SourceSpan::new(trait_def.file_id, name.span)
+				SourceSpan::new(trait_decl.file_id, name.span)
 					.secondary_label()
 					.with_message(format!(
 						"declared as {} {} here",
@@ -1028,24 +484,23 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 
 	fn report_missing(
 		&mut self,
+		strings: &StringInterner,
 		trait_index: TraitIdx,
 		missing: &[Spanned<SymbolU32>],
 		at_target: SourceSpan,
 	) {
 		let names = missing
 			.iter()
-			.map(|name| {
-				format!("`{}`", self.strings.resolve(name.inner).unwrap())
-			})
+			.map(|name| format!("`{}`", strings.resolve(name.inner).unwrap()))
 			.collect::<Vec<_>>()
 			.join(", ");
-		let trait_file = self.defs.traits[usize::from(trait_index)].file_id;
+		let trait_file = self.decls.traits[usize::from(trait_index)].file_id;
 		let mut diagnostic =
 			Diagnostic::error()
 				.with_code(DiagnosticCode::IncompleteTraitImpl.code())
 				.with_message(format!(
 					"not all members of trait `{}` are implemented",
-					self.trait_name(trait_index),
+					self.trait_name(strings, trait_index),
 				))
 				.with_label(at_target.primary_label().with_message(format!(
 					"missing {names} in implementation"
@@ -1056,7 +511,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 					.secondary_label()
 					.with_message(format!(
 						"`{}` from trait",
-						self.strings.resolve(name.inner).unwrap(),
+						strings.resolve(name.inner).unwrap(),
 					)),
 			);
 		}
@@ -1069,8 +524,9 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	/// side is labelled with the parts that differ at the depth its syntax
 	/// reaches; a note names the parts further in, when its syntax stops short
 	/// (an alias, a projection, `Self`).
-	fn report_type_mismatch(
+	fn report_type_mismatch<'ast>(
 		&mut self,
+		strings: &StringInterner,
 		head: Diagnostic<FileId>,
 		(expected_file, expected_written): (FileId, WrittenType<'ast>),
 		(found_file, found_written): (FileId, WrittenType<'ast>),
@@ -1090,9 +546,11 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 			.with_label(
 				SourceSpan::new(found_file, at_found)
 					.primary_label()
-					.with_message(
-						self.expected_found(label_expected, label_found),
-					),
+					.with_message(self.expected_found(
+						strings,
+						label_expected,
+						label_found,
+					)),
 			)
 			.with_label(
 				SourceSpan::new(expected_file, at_expected)
@@ -1109,7 +567,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 				.join(" → ");
 			diagnostic = diagnostic.with_note(format!(
 				"they differ in {place}: {}",
-				self.expected_found(inner_expected, inner_found),
+				self.expected_found(strings, inner_expected, inner_found),
 			));
 		}
 		self.diagnostics.push(diagnostic);
@@ -1121,7 +579,7 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	/// and a path to a struct or a function with its arguments. It stops at
 	/// anything whose meaning is not spelled where it is written: an alias,
 	/// a parameter, `Self`, a projection.
-	fn written_part(
+	fn written_part<'ast>(
 		&self,
 		file_id: FileId,
 		written: WrittenType<'ast>,
@@ -1211,17 +669,17 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 						.get(&site)
 						.and_then(|referent| match *referent {
 							Resolution::Reference(
-								Referent::Definition(key)
+								Referent::Declaration(key)
 								| Referent::Import {
-									definition: key, ..
+									declaration: key, ..
 								},
 							) => Some(key),
 							_ => None,
 						})
 						.is_some_and(|key| {
 							matches!(
-								key.symbol_kind(self.defs),
-								DefKind::Struct(_) | DefKind::Function(_)
+								key.symbol_kind(&self.decls),
+								DeclKind::Struct(_) | DeclKind::Function(_)
 							)
 						});
 					match last.type_args.get(index) {
@@ -1375,13 +833,15 @@ impl<'ast> TypeContext<'ast, '_, '_> {
 	/// "not decided yet" is passed on.
 	fn report_unfinished(
 		&mut self,
+		strings: &StringInterner,
 		result: Result<(), SolverError>,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
 		match result {
 			Ok(()) | Err(SolverError::Poisoned) => Ok(()),
 			Err(SolverError::Cycle(cycle)) => {
-				let diagnostic = self.cycle_diagnostic(&cycle, reference);
+				let diagnostic =
+					self.cycle_diagnostic(strings, &cycle, reference);
 				self.diagnostics.push(diagnostic);
 				Ok(())
 			}
@@ -1449,6 +909,610 @@ fn article(member: MemberKind) -> &'static str {
 	}
 }
 
+impl<'ast> SemanticsBuilder<'ast> {
+	/// Checks what `impl_index` owes its trait. Each part is reported on its
+	/// own, so one failure does not hide the next; only "not decided yet"
+	/// is returned.
+	pub(super) fn check_conformance(
+		&mut self,
+		sema: &mut Semantics,
+		impl_index: TraitImplIdx,
+	) -> Result<(), SolverError> {
+		// An impl of an unresolved trait reported that already.
+		let Some(trait_decl) =
+			sema.impl_dispatch.trait_header(impl_index).trait_decl
+		else {
+			return Ok(());
+		};
+		let trait_index = trait_decl.inner;
+		let header = sema.trait_impls[usize::from(impl_index)]
+			.as_ref()
+			.expect("every signature exists when declarations are checked");
+		let (scope, target) = (header.type_params, header.target);
+		let file_id = sema.decls.trait_impls[usize::from(impl_index)].file_id;
+		let at_target = SourceSpan::new(file_id, target.span);
+		let owner = GenericEnvOwner::Trait(trait_index);
+
+		self.check_members(
+			sema,
+			impl_index,
+			trait_index,
+			target.inner,
+			at_target,
+		)?;
+
+		// The supertraits are the clauses on the trait's `Self`; the target
+		// must satisfy them where the impl is written, with its parameters'
+		// bounds assumed.
+		let trait_env = sema.traits[usize::from(trait_index)].env;
+		let args = sema.generic_args.push([(target.inner, target.span)]);
+		let result = sema.check_bound_requirements(
+			self.strings,
+			sema.assumption_envs.of_frame(scope),
+			BoundRequirements::Frame {
+				env: trait_env,
+				args,
+			},
+			at_target,
+			owner,
+		);
+		sema.report_unfinished(self.strings, result, at_target)?;
+
+		for member_index in
+			0..sema.decls.traits[usize::from(trait_index)].members.len()
+		{
+			let declaration @ MemberKind::AssociatedType(declaration_index) =
+				sema.decls.traits[usize::from(trait_index)].members
+					[member_index]
+					.kind
+			else {
+				continue;
+			};
+			// The value's own judgement (`CheckAssocValue`) reports a value
+			// that has no meaning; one the impl omits with no default is
+			// reported missing above.
+			let value = match sema.assoc_value(
+				self.strings,
+				ImplMember {
+					impl_index,
+					declaration: declaration_index,
+				},
+				None,
+			) {
+				Ok(value) => value,
+				Err(SolverError::Pending) => return Err(SolverError::Pending),
+				Err(_) => continue,
+			};
+			// A written value is pointed at; an inherited default is written
+			// in the trait, so the impl's target stands for it.
+			let reference =
+				match sema.decls.select_trait_member(impl_index, declaration) {
+					TraitMemberSelection::Impl(MemberKind::AssociatedType(
+						provider,
+					)) => {
+						let AstNodeRef::TraitImplAssocType {
+							item: ast::ImplItem::AssocType { ty, .. },
+							..
+						} = *self.ast_node(DeclId::AssocType(provider))
+						else {
+							unreachable!("a trait impl's associated type")
+						};
+						SourceSpan::new(
+							sema.decls.assoc_types[usize::from(provider)]
+								.file_id,
+							ty.span,
+						)
+					}
+					_ => at_target,
+				};
+			let result = sema.check_bound_requirements(
+				self.strings,
+				sema.assumption_envs.of_frame(scope),
+				BoundRequirements::AssociatedType {
+					declaration: declaration_index,
+					trait_index,
+					receiver: target.inner,
+					value,
+				},
+				reference,
+				owner,
+			);
+			sema.report_unfinished(self.strings, result, reference)?;
+		}
+		Ok(())
+	}
+
+	/// The impl's members against the trait's declarations, in the order the
+	/// impl writes them, then the declarations it leaves out. Each side is a
+	/// lookup in the other's bindings. A member is matched to the declaration
+	/// of its name, of its own tier first: one of the other tier is the
+	/// declaration it was meant to provide, of another kind. A declaration is
+	/// missing when the impl does not provide it (`provides`) and it has no
+	/// default.
+	fn check_members(
+		&mut self,
+		sema: &mut Semantics,
+		impl_index: TraitImplIdx,
+		trait_index: TraitIdx,
+		target: TypeIndex,
+		at_target: SourceSpan,
+	) -> Result<(), SolverError> {
+		let impl_decl = &sema.decls.trait_impls[usize::from(impl_index)];
+		let impl_file = impl_decl.file_id;
+		for index in 0..impl_decl.members.len() {
+			let impl_decl = &sema.decls.trait_impls[usize::from(impl_index)];
+			let member = impl_decl.members[index].kind;
+			let name = sema.decls.name(member.decl_id());
+			// A second member of one name was reported as a duplicate.
+			if impl_decl
+				.bindings
+				.get(&BindingKey::new(member.tier(), name.inner))
+				!= Some(&MemberIdx::new(index as u32))
+			{
+				continue;
+			}
+			let at_member = SourceSpan::new(impl_file, name.span);
+			let other_tier = match member.tier() {
+				Tier::Type => Tier::Value,
+				Tier::Value => Tier::Type,
+			};
+			let trait_decl = &sema.decls.traits[usize::from(trait_index)];
+			let Some(declaration_index) =
+				[member.tier(), other_tier].into_iter().find_map(|tier| {
+					trait_decl
+						.bindings
+						.get(&BindingKey::new(tier, name.inner))
+						.copied()
+				})
+			else {
+				sema.report_not_a_member(
+					self.strings,
+					trait_index,
+					member,
+					name,
+					at_member,
+				);
+				continue;
+			};
+			let declaration =
+				trait_decl.members[usize::from(declaration_index)].kind;
+			match (declaration, member) {
+				(
+					MemberKind::Function(expected)
+					| MemberKind::Method(expected),
+					MemberKind::Function(found) | MemberKind::Method(found),
+				) => {
+					let result = self.compare_function(
+						sema,
+						trait_index,
+						declaration,
+						expected,
+						found,
+						target,
+					);
+					sema.report_unfinished(self.strings, result, at_member)?;
+				}
+				(
+					MemberKind::Constant(expected),
+					MemberKind::Constant(found),
+				) => {
+					let result = self.compare_constant(
+						sema,
+						trait_index,
+						expected,
+						found,
+						target,
+					);
+					sema.report_unfinished(self.strings, result, at_member)?;
+				}
+				(
+					MemberKind::AssociatedType(_),
+					MemberKind::AssociatedType(_),
+				) => {}
+				_ => sema.report_kind_mismatch(
+					self.strings,
+					trait_index,
+					declaration,
+					member,
+					at_member,
+				),
+			}
+		}
+
+		let trait_decl = &sema.decls.traits[usize::from(trait_index)];
+		let missing: Vec<Spanned<SymbolU32>> = trait_decl
+			.members
+			.iter()
+			.filter(|member| {
+				!sema.provides(impl_index, member.kind)
+					&& !self.has_default(sema, member.kind)
+			})
+			.map(|member| sema.decls.name(member.kind.decl_id()))
+			.collect();
+		if !missing.is_empty() {
+			sema.report_missing(self.strings, trait_index, &missing, at_target);
+		}
+		Ok(())
+	}
+
+	/// Whether the trait's declaration supplies what an impl omits.
+	fn has_default(&self, sema: &Semantics, declaration: MemberKind) -> bool {
+		match declaration {
+			MemberKind::AssociatedType(index) => sema.assoc_types
+				[usize::from(index)]
+			.as_ref()
+			.is_some_and(|signature| signature.value.is_some()),
+			MemberKind::Function(index) | MemberKind::Method(index) => {
+				matches!(
+					*self.ast_node(DeclId::Function(index)),
+					AstNodeRef::TraitFunction {
+						item: ast::TraitItem::Function { body: Some(_), .. },
+						..
+					}
+				)
+			}
+			MemberKind::Constant(index) => matches!(
+				*self.ast_node(DeclId::Const(index)),
+				AstNodeRef::TraitConst {
+					item: ast::TraitItem::Const { value: Some(_), .. },
+					..
+				}
+			),
+		}
+	}
+
+	/// The impl's `function` against the trait's `declaration`, read in the
+	/// env a caller through the trait sees (`contract_env`): `Self` is
+	/// `target`, and the declaration's own type parameters are the
+	/// function's, by position, assuming what the declaration's do. Reports
+	/// the first difference: the number of own type parameters, a bound the
+	/// declaration does not imply, the number of parameters, then each
+	/// parameter's name and type in order, then the result.
+	fn compare_function(
+		&mut self,
+		sema: &mut Semantics,
+		trait_index: TraitIdx,
+		member: MemberKind,
+		declaration: FunctionIdx,
+		function: FunctionIdx,
+		target: TypeIndex,
+	) -> Result<(), SolverError> {
+		let declaration_env =
+			sema.functions[usize::from(declaration)].type_params;
+		let env = sema.functions[usize::from(function)].type_params;
+		let (expected_own, own) = (
+			sema.own_params(declaration_env).len(),
+			sema.own_params(env).len(),
+		);
+		if expected_own != own {
+			sema.report_count_mismatch(
+				self.strings,
+				trait_index,
+				member,
+				(declaration, function),
+				"type parameter",
+				(expected_own, own),
+			);
+			return Ok(());
+		}
+		let contract =
+			sema.contract_env(self.strings, declaration, function, target)?;
+		if !sema.check_own_bounds(
+			self.strings,
+			trait_index,
+			(declaration, function),
+			contract,
+		)? {
+			return Ok(());
+		}
+		let (expected_signature, signature) = (
+			&sema.functions[usize::from(declaration)],
+			&sema.functions[usize::from(function)],
+		);
+		let (expected_params, expected_result) = (
+			expected_signature.param_types,
+			expected_signature.return_type,
+		);
+		let (found_params, found_result) =
+			(signature.param_types, signature.return_type);
+		let params = sema.types.list(found_params).len();
+		let expected_count = sema.types.list(expected_params).len();
+		if expected_count != params {
+			sema.report_count_mismatch(
+				self.strings,
+				trait_index,
+				member,
+				(declaration, function),
+				"parameter",
+				(expected_count, params),
+			);
+			return Ok(());
+		}
+		let arguments: Box<[TypeIndex]> = std::iter::once(target)
+			.chain(sema.own_params(env).iter().copied())
+			.collect();
+		// The result is compared as one more position, after the parameters.
+		for position in 0..=params {
+			let (expected, found) = if position < params {
+				(
+					sema.types.list(expected_params)[position],
+					sema.types.list(found_params)[position],
+				)
+			} else {
+				(expected_result, found_result)
+			};
+			// A type that failed to lower was reported where it is written,
+			// and the parameter is not understood well enough to compare,
+			// its name included.
+			if sema.types.has_error(expected) || sema.types.has_error(found) {
+				continue;
+			}
+			if position < params {
+				let expected_name = sema.decls.functions
+					[usize::from(declaration)]
+				.params[position];
+				let name = sema.decls.functions[usize::from(function)].params
+					[position];
+				// Leaving the parameter unnamed only binds no local: the contract
+				// is still the trait's, and so are the names calls use.
+				if name.is_some()
+					&& expected_name.map(|name| name.inner)
+						!= name.map(|name| name.inner)
+				{
+					self.report_name_mismatch(
+						sema,
+						trait_index,
+						member,
+						(declaration, function),
+						position,
+						(expected_name, name),
+					);
+					return Ok(());
+				}
+			}
+			let expected = sema.types.substitute(
+				expected,
+				Substitution {
+					envs: &sema.generic_envs,
+					env: declaration_env,
+					args: &arguments,
+				},
+			);
+			let expected = sema.normalize(
+				self.strings,
+				contract,
+				expected,
+				NormalizationDepth::Deep,
+				RewriteFlags::ALL,
+			)?;
+			let found = sema.normalize(
+				self.strings,
+				contract,
+				found,
+				NormalizationDepth::Deep,
+				RewriteFlags::ALL,
+			)?;
+			// Normalizing may still meet an error (a projection with no value),
+			// which was reported where it belongs.
+			if expected == found
+				|| sema.types.has_error(expected)
+				|| sema.types.has_error(found)
+			{
+				continue;
+			}
+			let (expected_syntax, syntax) = (
+				self.function_syntax(declaration),
+				self.function_syntax(function),
+			);
+			// A left-out result is `()`; its function's name stands for it.
+			let written = |syntax: &'ast ast::FunctionSignature| {
+				if position < params {
+					WrittenType::Written(
+						&syntax.params[position].inner.inner.ty,
+					)
+				} else {
+					syntax.result.as_deref().map_or(
+						WrittenType::Implied(syntax.name.span),
+						WrittenType::Written,
+					)
+				}
+			};
+			let head = sema.signature_mismatch(
+				self.strings,
+				trait_index,
+				member,
+				function,
+			);
+			sema.report_type_mismatch(
+				self.strings,
+				head,
+				(
+					sema.decls.functions[usize::from(declaration)].file_id,
+					written(expected_syntax),
+				),
+				(
+					sema.decls.functions[usize::from(function)].file_id,
+					written(syntax),
+				),
+				(expected, found),
+			);
+			return Ok(());
+		}
+		Ok(())
+	}
+
+	/// The impl's constant against the trait's `declaration`, with `Self` as
+	/// `target`.
+	fn compare_constant(
+		&mut self,
+		sema: &mut Semantics,
+		trait_index: TraitIdx,
+		declaration: ConstIdx,
+		constant: ConstIdx,
+		target: TypeIndex,
+	) -> Result<(), SolverError> {
+		let expected_signature = &sema.constants[usize::from(declaration)];
+		let (expected, declaration_env) =
+			(expected_signature.ty, expected_signature.env);
+		let signature = &sema.constants[usize::from(constant)];
+		let (found, env) = (signature.ty, signature.env);
+		let expected = sema.types.substitute(
+			expected,
+			Substitution {
+				envs: &sema.generic_envs,
+				env: declaration_env,
+				args: &[target],
+			},
+		);
+		let expected = sema.normalize(
+			self.strings,
+			sema.assumption_envs.of_frame(env),
+			expected,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)?;
+		let found = sema.normalize(
+			self.strings,
+			sema.assumption_envs.of_frame(env),
+			found,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)?;
+		if expected == found
+			|| sema.types.has_error(expected)
+			|| sema.types.has_error(found)
+		{
+			return Ok(());
+		}
+		// A constant whose type is left out is reported and typed `ERROR`, so
+		// both are written here.
+		let AstNodeRef::TraitConst {
+			item: ast::TraitItem::Const {
+				ty: expected_ty, ..
+			},
+			..
+		} = *self.ast_node(DeclId::Const(declaration))
+		else {
+			unreachable!("a trait's constant")
+		};
+		let AstNodeRef::TraitImplConstant {
+			item: ast::ImplItem::Constant { ty: Some(ty), .. },
+			..
+		} = *self.ast_node(DeclId::Const(constant))
+		else {
+			unreachable!("a trait impl's constant with a written type")
+		};
+		let name = sema.decls.constants[usize::from(constant)].name.inner;
+		let head = Diagnostic::error()
+			.with_code(DiagnosticCode::TraitImplConstTypeMismatch.code())
+			.with_message(format!(
+				"constant `{}` has an incompatible type for trait `{}`",
+				self.strings.resolve(name).unwrap(),
+				sema.trait_name(self.strings, trait_index),
+			));
+		sema.report_type_mismatch(
+			self.strings,
+			head,
+			(
+				sema.decls.constants[usize::from(declaration)].file_id,
+				WrittenType::Written(expected_ty),
+			),
+			(
+				sema.decls.constants[usize::from(constant)].file_id,
+				WrittenType::Written(ty),
+			),
+			(expected, found),
+		);
+		Ok(())
+	}
+
+	/// The written signature of a trait's or a trait impl's function, for
+	/// its spans.
+	fn function_syntax(
+		&self,
+		function: FunctionIdx,
+	) -> &'ast ast::FunctionSignature {
+		match *self.ast_node(DeclId::Function(function)) {
+			AstNodeRef::TraitFunction {
+				item: ast::TraitItem::Function { signature, .. },
+				..
+			}
+			| AstNodeRef::TraitImplFunction {
+				item: ast::ImplItem::Function { signature, .. },
+				..
+			} => signature,
+			_ => unreachable!("a trait's or a trait impl's function"),
+		}
+	}
+
+	/// A parameter's name is part of the trait's contract: a call by name
+	/// uses the declaration's names, whichever impl it reaches. So an impl
+	/// names a parameter as the trait does, or leaves it unnamed, which binds
+	/// no local and changes nothing for callers; it never renames one, nor
+	/// names one the trait leaves unnamed. Only the name is compared; whether
+	/// its local is `mut` is the body's own.
+	fn report_name_mismatch(
+		&mut self,
+		sema: &mut Semantics,
+		trait_index: TraitIdx,
+		member: MemberKind,
+		(declaration, function): (FunctionIdx, FunctionIdx),
+		position: usize,
+		(expected, found): (
+			Option<Spanned<SymbolU32>>,
+			Option<Spanned<SymbolU32>>,
+		),
+	) {
+		let describe = |name: Option<Spanned<SymbolU32>>| match name {
+			Some(name) => {
+				format!("`{}`", self.strings.resolve(name.inner).unwrap())
+			}
+			None => "an unnamed parameter".to_owned(),
+		};
+		// An unnamed parameter is pointed at by its type.
+		let at = |function: FunctionIdx, name: Option<Spanned<SymbolU32>>| {
+			name.map_or_else(
+				|| {
+					self.function_syntax(function).params[position]
+						.inner
+						.inner
+						.ty
+						.span
+				},
+				|name| name.span,
+			)
+		};
+		let diagnostic = sema
+			.signature_mismatch(self.strings, trait_index, member, function)
+			.with_label(
+				SourceSpan::new(
+					sema.decls.functions[usize::from(function)].file_id,
+					at(function, found),
+				)
+				.primary_label()
+				.with_message(format!(
+					"expected {}, found {}",
+					describe(expected),
+					describe(found),
+				)),
+			)
+			.with_label(
+				SourceSpan::new(
+					sema.decls.functions[usize::from(declaration)].file_id,
+					at(declaration, expected),
+				)
+				.secondary_label()
+				.with_message("parameter in trait"),
+			)
+			.with_note(
+				"a parameter's name is part of the trait's contract: a call \
+				 by name uses the trait's names, so an impl names it the same \
+				 or leaves it unnamed",
+			);
+		sema.diagnostics.push(diagnostic);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use codespan_reporting::diagnostic::Diagnostic;
@@ -1458,115 +1522,44 @@ mod tests {
 	use crate::ast::StringInterner;
 	use crate::diagnostics::DiagnosticCode;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{AstEntry, DefinitionRegistry};
-	use crate::tir::impls::ImplDispatch;
-	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::solver::Solver;
-	use crate::vfs::{self, FileId, Files};
+	use crate::vfs::{self, Files};
 
-	/// `test_case!(case = "source")` declares the graph, the inputs and the
-	/// swept `TestCase` borrowing them as three locals of the calling test.
+	/// `test_case!(case = "source")` declares the interner, the graph and the
+	/// checked `TestCase` as three locals of the calling test.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut strings = crate::symbols::Keyword::create_interner();
 			let graph = source_graph($source, &mut strings);
-			let mut inputs = TestInputs::new(&graph, &mut strings);
-			let $case = TestCase::new(&mut inputs);
+			let $case = TestCase::new(&graph, &mut strings);
 		};
 	}
 
-	/// Everything a `TypeContext` borrows, kept on the test's stack.
-	struct TestInputs<'g> {
-		files: &'g Files,
-		strings: &'g mut StringInterner,
-		defs: DefinitionRegistry,
-		ast_nodes: Vec<AstEntry<'g>>,
-		impl_dispatch: ImplDispatch,
-		diagnostics: Vec<Diagnostic<FileId>>,
-		resolutions: NameResolutions,
-		solver: Solver,
-	}
-
-	impl<'g> TestInputs<'g> {
-		fn new(
-			graph: &'g vfs::CompilationUnit,
-			strings: &'g mut StringInterner,
-		) -> Self {
-			let vfs::CompilationUnit {
-				files,
-				packages,
-				stdlib_package,
-				root_package,
-			} = graph;
-			let mut diagnostics = Vec::new();
-			let mut resolutions = NameResolutions::default();
-			let (defs, ast_nodes) = DefinitionRegistry::build(
-				packages,
-				files,
-				strings,
-				&mut diagnostics,
-				&mut resolutions,
-				*stdlib_package,
-				*root_package,
-			);
-			let impl_dispatch = ImplDispatch::build(
-				&mut diagnostics,
-				&mut resolutions,
-				strings,
-				&defs,
-				&ast_nodes,
-			);
-			let solver = Solver::new(defs.constants.len());
-			Self {
-				files,
-				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			}
-		}
-	}
-
-	/// A swept `TypeContext` over `TestInputs`.
+	/// A checked `Semantics`, with the inputs it was checked from.
 	struct TestCase<'a> {
-		context: TypeContext<'a, 'a, 'a>,
+		files: &'a Files,
+		strings: &'a StringInterner,
+		sema: Semantics,
 	}
 
 	impl<'a> TestCase<'a> {
-		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
-			let TestInputs {
-				files,
+		fn new(
+			graph: &'a vfs::CompilationUnit,
+			strings: &'a mut StringInterner,
+		) -> Self {
+			let mut sema = crate::tir::check(graph, strings);
+			Self {
+				files: &graph.files,
 				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			} = inputs;
-			let mut context = TypeContext::new(
-				diagnostics,
-				resolutions,
-				strings,
-				solver,
-				files,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-			);
-			context.sweep();
-			Self { context }
+				sema,
+			}
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
 			DiagnosticView::new(
 				"conformance",
-				self.context.diagnostics,
-				self.context.files,
+				&self.sema.diagnostics,
+				self.files,
 			)
 		}
 	}
@@ -1794,7 +1787,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IncompleteTraitImpl]);
 		assert_eq!(
-			case.context.diagnostics[0].labels[0].message,
+			case.sema.diagnostics[0].labels[0].message,
 			"missing `Item`, `get`, `N` in implementation"
 		);
 	}
@@ -1895,7 +1888,7 @@ mod tests {
 			DiagnosticCode::TraitImplSignatureMismatch,
 			DiagnosticCode::TraitImplSignatureMismatch,
 		]);
-		let [renamed, unnamed, receiver] = &case.context.diagnostics[..] else {
+		let [renamed, unnamed, receiver] = &case.sema.diagnostics[..] else {
 			unreachable!()
 		};
 		assert_eq!(labelled(&source, renamed, 0), "other");
@@ -1933,11 +1926,11 @@ mod tests {
 			DiagnosticCode::TraitImplSignatureMismatch,
 		]);
 		assert_eq!(
-			case.context.diagnostics[0].labels[0].message,
+			case.sema.diagnostics[0].labels[0].message,
 			"expected 1 type parameter, found 2"
 		);
 		assert_eq!(
-			case.context.diagnostics[1].labels[0].message,
+			case.sema.diagnostics[1].labels[0].message,
 			"expected 2 parameters, found 1"
 		);
 	}
@@ -1957,7 +1950,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
 		assert_eq!(
-			case.context.diagnostics[0].labels[0].message,
+			case.sema.diagnostics[0].labels[0].message,
 			"expected `A`, found `B`"
 		);
 	}
@@ -1975,7 +1968,7 @@ mod tests {
 		test_case!(case = &source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
-		let diagnostic = &case.context.diagnostics[0];
+		let diagnostic = &case.sema.diagnostics[0];
 		let impl_side = source.rfind("u64").unwrap();
 		assert_eq!(diagnostic.labels[0].range.start, impl_side);
 		assert_eq!(diagnostic.labels[0].message, "expected `u32`, found `u64`");
@@ -1996,7 +1989,7 @@ mod tests {
 		test_case!(case = &source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
-		let diagnostic = &case.context.diagnostics[0];
+		let diagnostic = &case.sema.diagnostics[0];
 		assert_eq!(labelled(&source, diagnostic, 0), "u16");
 		assert_eq!(diagnostic.labels[0].message, "expected `u8`, found `u16`");
 		assert_eq!(labelled(&source, diagnostic, 1), "Self::Item");
@@ -2016,7 +2009,7 @@ mod tests {
 		test_case!(case = &source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
-		let diagnostic = &case.context.diagnostics[0];
+		let diagnostic = &case.sema.diagnostics[0];
 		assert_eq!(labelled(&source, diagnostic, 0), "Alias");
 		assert_eq!(
 			diagnostic.notes,
@@ -2040,7 +2033,7 @@ mod tests {
 		test_case!(case = &source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitImplSignatureMismatch]);
-		let diagnostic = &case.context.diagnostics[0];
+		let diagnostic = &case.sema.diagnostics[0];
 		assert_eq!(labelled(&source, diagnostic, 0), "count");
 		assert_eq!(diagnostic.labels[0].message, "expected `u32`, found `()`");
 	}
@@ -2061,7 +2054,7 @@ mod tests {
 		case.diagnostics().assert_error_saying(
 			"constant `N` has an incompatible type for trait `Store`",
 		);
-		assert_eq!(labelled(&source, &case.context.diagnostics[0], 0), "u64");
+		assert_eq!(labelled(&source, &case.sema.diagnostics[0], 0), "u64");
 	}
 
 	const ORDERING: &str = "
@@ -2112,7 +2105,7 @@ mod tests {
 		case.diagnostics().assert_error_saying(
 			"impl has stricter requirements than trait `Sorter`",
 		);
-		let diagnostic = &case.context.diagnostics[0];
+		let diagnostic = &case.sema.diagnostics[0];
 		assert_eq!(labelled(&source, diagnostic, 0), "Ord");
 		assert_eq!(
 			diagnostic.labels[0].message,
@@ -2137,7 +2130,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
 		assert_eq!(
-			case.context.diagnostics[0].labels[0].message,
+			case.sema.diagnostics[0].labels[0].message,
 			"impl has extra requirement `<U as Container>::Item == u32`"
 		);
 	}
@@ -2158,7 +2151,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
 		assert_eq!(
-			case.context.diagnostics[0].labels[0].message,
+			case.sema.diagnostics[0].labels[0].message,
 			"impl has extra requirement `<U as Container>::Item == u16`"
 		);
 	}
@@ -2186,7 +2179,7 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ImplStricterThanTrait]);
 		assert_eq!(
-			case.context.diagnostics[0].labels[0].message,
+			case.sema.diagnostics[0].labels[0].message,
 			"impl has extra requirement `<U as Container>::Item: Ord`"
 		);
 	}

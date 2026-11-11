@@ -34,12 +34,13 @@ use hashbrown::HashTable;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::bounds::AssumptionEnvIdx;
-use super::defs::{FieldOrder, StructIdx};
-use super::signatures::TypeContext;
+use super::decls::{FieldOrder, StructIdx};
+use super::signatures::Semantics;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, metadata_len,
 };
 use super::types::{Primitive, Substitution, Type, TypeIndex, TypeList};
+use crate::ast::StringInterner;
 use crate::index::index_newtype;
 
 index_newtype!(AggregateIdx);
@@ -277,7 +278,7 @@ fn contents<'a>(
 	)
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// The layout of a value of `ty` in linear memory. `None` when the
 	/// compiler does not know its bytes: some part of it is abstract (a
 	/// parameter, a projection that does not reduce, an address into a memory
@@ -287,10 +288,12 @@ impl TypeContext<'_, '_, '_> {
 	/// overflows.
 	pub(super) fn memory_layout(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Layout>, SolverError> {
-		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
+		let piece =
+			self.piece(strings, assumption_context, ty, &mut Vec::new())?;
 		Ok(piece.map(|piece| self.solver.layouts.layout(piece)))
 	}
 
@@ -300,11 +303,12 @@ impl TypeContext<'_, '_, '_> {
 	/// once per element, as static data writes it).
 	pub(super) fn memory_values(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<(Layout, Box<[(Primitive, u32)]>)>, SolverError> {
 		let Some(piece) =
-			self.piece(assumption_context, ty, &mut Vec::new())?
+			self.piece(strings, assumption_context, ty, &mut Vec::new())?
 		else {
 			return Ok(None);
 		};
@@ -318,6 +322,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 			Piece::Array(_) => {
 				let ty = self.normalize(
+					strings,
 					assumption_context,
 					ty,
 					NormalizationDepth::Shallow,
@@ -327,7 +332,7 @@ impl TypeContext<'_, '_, '_> {
 					unreachable!("an array's piece is an array's")
 				};
 				let Some((element, values)) =
-					self.memory_values(assumption_context, of)?
+					self.memory_values(strings, assumption_context, of)?
 				else {
 					unreachable!(
 						"an array with a layout has an element with one"
@@ -354,20 +359,23 @@ impl TypeContext<'_, '_, '_> {
 	/// `Layouts::scalar`, with no copy of the aggregate's rows.
 	pub(super) fn memory_piece(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Piece>, SolverError> {
-		self.piece(assumption_context, ty, &mut Vec::new())
+		self.piece(strings, assumption_context, ty, &mut Vec::new())
 	}
 
 	/// The layout of a struct or a tuple, as `memory_layout` answers it.
 	/// `None` for any other type, too.
 	pub(super) fn aggregate_layout(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<AggregateIdx>, SolverError> {
-		let piece = self.piece(assumption_context, ty, &mut Vec::new())?;
+		let piece =
+			self.piece(strings, assumption_context, ty, &mut Vec::new())?;
 		Ok(match piece {
 			Some(Piece::Aggregate(index)) => Some(index),
 			_ => None,
@@ -378,11 +386,13 @@ impl TypeContext<'_, '_, '_> {
 	/// one again is a struct containing itself.
 	fn piece(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
 		let ty = self.normalize(
+			strings,
 			assumption_context,
 			ty,
 			NormalizationDepth::Shallow,
@@ -419,18 +429,25 @@ impl TypeContext<'_, '_, '_> {
 			| Type::TypeProjection { .. } => return Ok(None),
 			Type::Enum { enum_index } => {
 				let repr = self.enums[usize::from(enum_index)].repr;
-				return self.piece(assumption_context, repr, visiting);
+				return self.piece(strings, assumption_context, repr, visiting);
 			}
 			// An address, then the pointee's counts, each as wide as the
 			// memory's `Size`.
 			Type::Pointer { to, memory, .. } => {
-				let Some(primitive) =
-					self.address_primitive(assumption_context, memory)?
+				let Some(primitive) = self.address_primitive(
+					strings,
+					assumption_context,
+					memory,
+				)?
 				else {
 					return Ok(None);
 				};
-				let Some(metadata) =
-					self.pointer_metadata(assumption_context, to, memory)?
+				let Some(metadata) = self.pointer_metadata(
+					strings,
+					assumption_context,
+					to,
+					memory,
+				)?
 				else {
 					return Ok(None);
 				};
@@ -443,6 +460,7 @@ impl TypeContext<'_, '_, '_> {
 			// A slice has no size, nor does an array of an abstract length.
 			Type::Array { of, length } => {
 				let length = self.normalize(
+					strings,
 					assumption_context,
 					length,
 					NormalizationDepth::Shallow,
@@ -452,7 +470,7 @@ impl TypeContext<'_, '_, '_> {
 					return Ok(None);
 				};
 				let Some(element) =
-					self.piece(assumption_context, of, visiting)?
+					self.piece(strings, assumption_context, of, visiting)?
 				else {
 					return Ok(None);
 				};
@@ -468,7 +486,12 @@ impl TypeContext<'_, '_, '_> {
 			}
 			Type::Slice { .. } => return Ok(None),
 			Type::Tuple { .. } | Type::Struct { .. } => {
-				return self.aggregate_piece(assumption_context, ty, visiting);
+				return self.aggregate_piece(
+					strings,
+					assumption_context,
+					ty,
+					visiting,
+				);
 			}
 		};
 		Ok(Some(piece))
@@ -476,11 +499,13 @@ impl TypeContext<'_, '_, '_> {
 
 	fn aggregate_piece(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<Option<Piece>, SolverError> {
 		let ty = self.normalize(
+			strings,
 			assumption_context,
 			ty,
 			NormalizationDepth::Deep,
@@ -524,7 +549,7 @@ impl TypeContext<'_, '_, '_> {
 						},
 					));
 				}
-				(self.defs.structs[usize::from(struct_index)].order, fields)
+				(self.decls.structs[usize::from(struct_index)].order, fields)
 			}
 			AggregateKey::Tuple(elements) => {
 				(FieldOrder::Optimal, self.types.list(elements).to_vec())
@@ -534,7 +559,7 @@ impl TypeContext<'_, '_, '_> {
 		visiting.push(ty);
 		let mut pieces = Vec::with_capacity(fields.len());
 		for field in fields {
-			match self.piece(assumption_context, field, visiting) {
+			match self.piece(strings, assumption_context, field, visiting) {
 				Ok(Some(piece)) => pieces.push(piece),
 				unknown => {
 					visiting.pop();
@@ -555,10 +580,12 @@ impl TypeContext<'_, '_, '_> {
 	/// memory not known yet.
 	pub(super) fn address_primitive(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Option<Primitive>, SolverError> {
 		let memory = self.normalize(
+			strings,
 			assumption_context,
 			memory,
 			NormalizationDepth::Shallow,
@@ -567,8 +594,8 @@ impl TypeContext<'_, '_, '_> {
 		let Type::Memory { memory_index } = *self.types.resolve(memory) else {
 			return Ok(None);
 		};
-		let size =
-			self.defs.memories[usize::from(memory_index)].size_assoc_type_index;
+		let size = self.decls.memories[usize::from(memory_index)]
+			.size_assoc_type_index;
 		let Some(size) = self.assoc_types[usize::from(size)]
 			.as_ref()
 			.and_then(|signature| signature.value)
@@ -576,6 +603,7 @@ impl TypeContext<'_, '_, '_> {
 			return Err(SolverError::Pending);
 		};
 		let size = self.normalize(
+			strings,
 			assumption_context,
 			size,
 			NormalizationDepth::Shallow,
@@ -587,140 +615,61 @@ impl TypeContext<'_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
-	use codespan_reporting::diagnostic::Diagnostic;
 	use indoc::indoc;
 
 	use super::*;
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{
-		AstEntry, DefKind, DefinitionRegistry, FunctionIdx, Scope, Tier,
-	};
-	use crate::tir::impls::ImplDispatch;
+	use crate::tir::decls::{DeclKind, FunctionIdx, Scope, Tier};
 	use crate::tir::paths::PathResolver;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::FunctionSignature;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::solver::Solver;
-	use crate::vfs::{self, FileId, Files};
+	use crate::vfs::{self, Files};
 
-	/// `test_case!(mut case = "source")` declares the graph, the inputs and
-	/// the swept `TestCase` borrowing them as three locals of the calling
-	/// test.
+	/// `test_case!(mut case = "source")` declares the interner, the graph and
+	/// the checked `TestCase` as three locals of the calling test.
 	macro_rules! test_case {
 		(mut $case:ident = $source:expr $(,)?) => {
 			let mut strings = ast::Keyword::create_interner();
 			let graph = source_graph($source, &mut strings);
-			let mut inputs = TestInputs::new(&graph, &mut strings);
-			let mut $case = TestCase::new(&mut inputs);
+			let mut $case = TestCase::new(&graph, &mut strings);
 		};
 	}
 
-	/// Everything a `TypeContext` borrows, kept on the test's stack.
-	struct TestInputs<'g> {
-		files: &'g Files,
-		strings: &'g mut StringInterner,
-		defs: DefinitionRegistry,
-		ast_nodes: Vec<AstEntry<'g>>,
-		impl_dispatch: ImplDispatch,
-		diagnostics: Vec<Diagnostic<FileId>>,
-		resolutions: NameResolutions,
-		solver: Solver,
-	}
-
-	impl<'g> TestInputs<'g> {
-		fn new(
-			graph: &'g vfs::CompilationUnit,
-			strings: &'g mut StringInterner,
-		) -> Self {
-			let vfs::CompilationUnit {
-				files,
-				packages,
-				stdlib_package,
-				root_package,
-			} = graph;
-			let mut diagnostics = Vec::new();
-			let mut resolutions = NameResolutions::default();
-			let (defs, ast_nodes) = DefinitionRegistry::build(
-				packages,
-				files,
-				strings,
-				&mut diagnostics,
-				&mut resolutions,
-				*stdlib_package,
-				*root_package,
-			);
-			let impl_dispatch = ImplDispatch::build(
-				&mut diagnostics,
-				&mut resolutions,
-				strings,
-				&defs,
-				&ast_nodes,
-			);
-			let solver = Solver::new(defs.constants.len());
-			Self {
-				files,
-				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			}
-		}
-	}
-
-	/// A swept `TypeContext` over `TestInputs`.
+	/// A checked `Semantics`, with the inputs it was checked from.
 	struct TestCase<'a> {
-		defs: &'a DefinitionRegistry,
-		context: TypeContext<'a, 'a, 'a>,
+		files: &'a Files,
+		strings: &'a StringInterner,
+		sema: Semantics,
 	}
 
 	impl<'a> TestCase<'a> {
-		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
-			let TestInputs {
-				files,
+		fn new(
+			graph: &'a vfs::CompilationUnit,
+			strings: &'a mut StringInterner,
+		) -> Self {
+			let mut sema = crate::tir::check(graph, strings);
+			Self {
+				files: &graph.files,
 				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			} = inputs;
-			let mut context = TypeContext::new(
-				diagnostics,
-				resolutions,
-				strings,
-				solver,
-				files,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-			);
-			context.sweep();
-			Self { defs, context }
+				sema,
+			}
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
-			DiagnosticView::new(
-				"layout",
-				self.context.diagnostics,
-				self.context.files,
-			)
+			DiagnosticView::new("layout", &self.sema.diagnostics, self.files)
 		}
 
 		/// The function a root-level `name` resolves to, by real path
 		/// resolution.
 		fn function(&self, name: &str) -> FunctionIdx {
-			let root = Scope::Package(self.defs.root_package);
-			let file_id = self.defs.namespaces.file_id(root.into());
+			let root = Scope::Package(self.sema.decls.root_package);
+			let file_id = self.sema.decls.namespaces.file_id(root.into());
 			let segment = ast::PathSegment {
 				ident: Spanned {
 					inner: self
-						.context
 						.strings
 						.get(name)
 						.expect("already interned from source"),
@@ -733,14 +682,15 @@ mod tests {
 			let target = PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				self.context.strings,
-				self.defs,
+				self.strings,
+				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &[segment], Tier::Value);
-			let def_key = target.def_key().unwrap_or_else(|| {
+			let decl_key = target.decl_key().unwrap_or_else(|| {
 				panic!("expected `{name}` to resolve: {scratch:?}")
 			});
-			let DefKind::Function(index) = def_key.symbol_kind(self.defs)
+			let DeclKind::Function(index) =
+				decl_key.symbol_kind(&self.sema.decls)
 			else {
 				panic!("expected `{name}` to be a function");
 			};
@@ -748,11 +698,11 @@ mod tests {
 		}
 
 		fn function_signature(&self, name: &str) -> &FunctionSignature {
-			&self.context.functions[usize::from(self.function(name))]
+			&self.sema.functions[usize::from(self.function(name))]
 		}
 
 		fn param_types(&self, name: &str) -> &[TypeIndex] {
-			self.context
+			self.sema
 				.types
 				.list(self.function_signature(name).param_types)
 		}
@@ -778,8 +728,11 @@ mod tests {
 	) -> Result<Option<Layout>, SolverError> {
 		let scope = case.function_signature(path).type_params;
 		let ty = case.param_types(path)[index];
-		case.context
-			.memory_layout(case.context.assumption_envs.of_frame(scope), ty)
+		case.sema.memory_layout(
+			case.strings,
+			case.sema.assumption_envs.of_frame(scope),
+			ty,
+		)
 	}
 
 	/// The aggregate layout of parameter `index` of function `path`.
@@ -790,8 +743,12 @@ mod tests {
 	) -> Option<AggregateIdx> {
 		let scope = case.function_signature(path).type_params;
 		let ty = case.param_types(path)[index];
-		case.context
-			.aggregate_layout(case.context.assumption_envs.of_frame(scope), ty)
+		case.sema
+			.aggregate_layout(
+				case.strings,
+				case.sema.assumption_envs.of_frame(scope),
+				ty,
+			)
 			.expect("a parameter's layout is final")
 	}
 
@@ -804,7 +761,7 @@ mod tests {
 	}
 
 	fn contents(case: &TestCase<'_>, index: AggregateIdx) -> Contents {
-		let layouts = &case.context.solver.layouts;
+		let layouts = &case.sema.solver.layouts;
 		Contents {
 			layout: layouts.layout(Piece::Aggregate(index)),
 			field_offsets: layouts.field_offsets(index).to_vec(),
@@ -1110,14 +1067,14 @@ mod tests {
 		case.diagnostics().assert_none();
 		let pointees: Vec<TypeIndex> = (case.param_types("f").to_vec())
 			.into_iter()
-			.map(|ty| match *case.context.types.resolve(ty) {
+			.map(|ty| match *case.sema.types.resolve(ty) {
 				Type::Pointer { to, .. } => to,
 				_ => panic!("a pointer"),
 			})
 			.collect();
 		let index = case
-			.context
-			.aggregate_layout(AssumptionEnvIdx::ROOT, pointees[0])
+			.sema
+			.aggregate_layout(case.strings, AssumptionEnvIdx::ROOT, pointees[0])
 			.unwrap()
 			.expect("a laid-out struct");
 		// `len` at 0, `data` at 2 (six bytes), `tail` at 8.
@@ -1131,8 +1088,8 @@ mod tests {
 		);
 		// An array's values are its element's, once per element.
 		let (layout, values) = case
-			.context
-			.memory_values(AssumptionEnvIdx::ROOT, pointees[1])
+			.sema
+			.memory_values(case.strings, AssumptionEnvIdx::ROOT, pointees[1])
 			.unwrap()
 			.expect("a laid-out array");
 		assert_eq!(layout, Layout { size: 6, align: 1 });
@@ -1140,8 +1097,10 @@ mod tests {
 			&*values,
 			(0..6).map(|at| (Primitive::U8, at)).collect::<Vec<_>>()
 		);
-		let mut layout =
-			|ty| case.context.memory_layout(AssumptionEnvIdx::ROOT, ty);
+		let mut layout = |ty| {
+			case.sema
+				.memory_layout(case.strings, AssumptionEnvIdx::ROOT, ty)
+		};
 		assert_eq!(layout(pointees[2]), Ok(None));
 		assert_eq!(layout(pointees[3]), Ok(known(0, 4)));
 	}

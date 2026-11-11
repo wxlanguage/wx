@@ -20,11 +20,11 @@ use super::bounds::{
 };
 use string_interner::symbol::SymbolU32;
 
-use super::defs::{BindingKey, DefKind, DefinitionRegistry, TraitIdx};
+use super::decls::{BindingKey, DeclKind, Declarations, TraitIdx};
 use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
 use super::obligations::{BoundRequirements, TypeObligation};
-use super::signatures::{LexicalScope, TypeContext};
+use super::signatures::{LexicalScope, Semantics};
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, Subjects, UnsatisfiedClause,
 };
@@ -35,7 +35,7 @@ use crate::tir::bounds::{BindingRef, BindingRequirement};
 use crate::tir::types::GenericEnvOwner;
 use crate::vfs::FileId;
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// Records the check of `requirements` in `obligations`, for whoever
 	/// lowers it to check. Construction never decides a bound: the argument
 	/// is kept as written, and a failure is diagnosed later without
@@ -68,6 +68,7 @@ impl TypeContext<'_, '_, '_> {
 	/// a failure about one is reported at the segment.
 	pub(super) fn resolve_type_args(
 		&mut self,
+		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		segment: &ast::PathSegment,
@@ -76,7 +77,9 @@ impl TypeContext<'_, '_, '_> {
 		args: &[TypeIndex],
 		owner: GenericEnvOwner,
 	) -> Box<[TypeIndex]> {
-		if !self.check_type_arg_count(scope, segment, params_env, owner) {
+		if !self
+			.check_type_arg_count(strings, scope, segment, params_env, owner)
+		{
 			let expected = self.generic_envs.param_names(params_env).len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
@@ -110,6 +113,7 @@ impl TypeContext<'_, '_, '_> {
 	/// declares; reports the mismatch when it does not.
 	pub(super) fn check_type_arg_count(
 		&mut self,
+		strings: &StringInterner,
 		scope: LexicalScope,
 		segment: &ast::PathSegment,
 		params_env: GenericEnvIdx,
@@ -120,8 +124,8 @@ impl TypeContext<'_, '_, '_> {
 			return true;
 		}
 		self.diagnostics.push(report_type_arg_count_mismatch(
-			self.strings,
-			self.defs,
+			strings,
+			&self.decls,
 			scope.file_id,
 			segment,
 			owner,
@@ -132,7 +136,7 @@ impl TypeContext<'_, '_, '_> {
 }
 
 /// The checks bound satisfaction owns, run by the declaration check.
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// Completes `frame`'s env with what its `Self` entry, `clauses` about a
 	/// trait impl's target, means (`normalize_clauses`). What is not about an
 	/// abstract type is proved there and dropped. One that does not hold is
@@ -142,15 +146,18 @@ impl TypeContext<'_, '_, '_> {
 	/// reads).
 	pub(super) fn normalize_self_entry(
 		&mut self,
+		strings: &StringInterner,
 		frame: GenericEnvIdx,
 		clauses: BoundClauses,
 	) -> Result<(), SolverError> {
 		let env = self.assumption_envs.of_frame(frame);
-		let (assumed, proved) = self.normalize_clauses(env, clauses)?;
+		let (assumed, proved) =
+			self.normalize_clauses(strings, env, clauses)?;
 		let arguments: Box<[TypeIndex]> =
 			self.generic_envs.identity_args(frame).into();
 		let mut failures = Vec::new();
 		self.satisfies_clauses(
+			strings,
 			env,
 			proved,
 			Subjects::All,
@@ -170,18 +177,19 @@ impl TypeContext<'_, '_, '_> {
 				} => {
 					let at = self.bounds.span(source);
 					if self.types.has_param(reduced) {
-						let trait_name = self.defs.traits
+						let trait_name = self.decls.traits
 							[usize::from(trait_index)]
 						.name
 						.inner;
 						let clause = format!(
 							"{}: {}",
-							self.type_formatter().display_type(reduced),
-							self.strings.resolve(trait_name).unwrap()
+							self.type_formatter(strings).display_type(reduced),
+							strings.resolve(trait_name).unwrap()
 						);
 						report_unassumable_clause(at, &clause)
 					} else {
 						self.report_trait_bound_violation(
+							strings,
 							at.file_id,
 							Spanned {
 								inner: (subject, reduced),
@@ -206,10 +214,11 @@ impl TypeContext<'_, '_, '_> {
 						|| self.types.has_param(expected)
 					{
 						self.report_unassumable_equality(
-							at, projection, found, expected,
+							strings, at, projection, found, expected,
 						)
 					} else {
 						self.report_equality_mismatch(
+							strings,
 							at,
 							(projection, required),
 							found,
@@ -230,6 +239,7 @@ impl TypeContext<'_, '_, '_> {
 					let at = self.binding_span(source);
 					match value {
 						Some(_) => self.report_unrepresentable_constant(
+							strings,
 							at,
 							(subject, constant),
 							ty,
@@ -239,7 +249,7 @@ impl TypeContext<'_, '_, '_> {
 						None => {
 							let read =
 								self.types.intern_const(constant, &[subject]);
-							let formatter = self.type_formatter();
+							let formatter = self.type_formatter(strings);
 							let clause = format!(
 								"{} is representable as {}",
 								formatter.display_type(read),
@@ -266,12 +276,13 @@ impl TypeContext<'_, '_, '_> {
 	/// make a parameter equal a type, which no assumption can state.
 	fn report_unassumable_equality(
 		&self,
+		strings: &StringInterner,
 		at: SourceSpan,
 		projection: TypeIndex,
 		found: TypeIndex,
 		expected: TypeIndex,
 	) -> Diagnostic<FileId> {
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let (projection, found, expected) = (
 			formatter.display_type(projection),
 			formatter.display_type(found),
@@ -317,6 +328,7 @@ impl TypeContext<'_, '_, '_> {
 	/// written, which holds or not of its own and assumes nothing.
 	pub(super) fn normalize_clauses(
 		&mut self,
+		strings: &StringInterner,
 		env: AssumptionEnvIdx,
 		clauses: BoundClauses,
 	) -> Result<(BoundClauses, BoundClauses), SolverError> {
@@ -331,6 +343,7 @@ impl TypeContext<'_, '_, '_> {
 			let normalized = match clause {
 				Clause::Trait(clause) => {
 					let subject = self.normalize(
+						strings,
 						env,
 						clause.subject,
 						NormalizationDepth::Deep,
@@ -342,6 +355,7 @@ impl TypeContext<'_, '_, '_> {
 				}
 				Clause::Equality(clause) => {
 					let projection = self.normalize(
+						strings,
 						env,
 						clause.projection,
 						NormalizationDepth::Deep,
@@ -353,6 +367,7 @@ impl TypeContext<'_, '_, '_> {
 					) && self.types.is_abstract(projection)
 					{
 						let value = self.normalize(
+							strings,
 							env,
 							clause.value,
 							NormalizationDepth::Deep,
@@ -369,6 +384,7 @@ impl TypeContext<'_, '_, '_> {
 				}
 				Clause::Representable(clause) => {
 					let subject = self.normalize(
+						strings,
 						env,
 						clause.subject,
 						NormalizationDepth::Deep,
@@ -376,6 +392,7 @@ impl TypeContext<'_, '_, '_> {
 					)?;
 					if self.types.is_abstract(subject) {
 						let ty = self.normalize(
+							strings,
 							env,
 							clause.ty,
 							NormalizationDepth::Deep,
@@ -406,6 +423,7 @@ impl TypeContext<'_, '_, '_> {
 	/// be pending, and a retry must not duplicate a diagnostic.
 	pub(super) fn check_bound_requirements(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
@@ -452,6 +470,7 @@ impl TypeContext<'_, '_, '_> {
 			};
 		let mut failures = Vec::new();
 		if self.satisfies_clauses(
+			strings,
 			assumption_context,
 			clauses,
 			subjects,
@@ -477,6 +496,7 @@ impl TypeContext<'_, '_, '_> {
 					source,
 					..
 				} => self.report_trait_bound_violation(
+					strings,
 					reference.file_id,
 					Spanned {
 						inner: (subject, reduced),
@@ -494,6 +514,7 @@ impl TypeContext<'_, '_, '_> {
 					source,
 					..
 				} => self.report_equality_mismatch(
+					strings,
 					SourceSpan::new(reference.file_id, at),
 					(projection, required),
 					found,
@@ -509,6 +530,7 @@ impl TypeContext<'_, '_, '_> {
 					source,
 					..
 				} => self.report_unrepresentable_constant(
+					strings,
 					SourceSpan::new(reference.file_id, at),
 					(subject, constant),
 					ty,
@@ -550,6 +572,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Always fails: the lowered type was `ERROR`.
 	pub(super) fn check_projection_member(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		name: SymbolU32,
@@ -560,12 +583,13 @@ impl TypeContext<'_, '_, '_> {
 			inner: name,
 			span: reference.span,
 		};
-		let declared_anywhere = (0..self.defs.traits.len()).any(|index| {
-			self.defs
+		let declared_anywhere = (0..self.decls.traits.len()).any(|index| {
+			self.decls
 				.declared_trait_member(TraitIdx::new(index as u32), key)
 				.is_some()
 		});
 		let normalized = match self.normalize(
+			strings,
 			assumption_context,
 			projection,
 			NormalizationDepth::Shallow,
@@ -579,7 +603,7 @@ impl TypeContext<'_, '_, '_> {
 				if !declared_anywhere {
 					self.diagnostics.push(report_no_such_type_member(
 						reference.file_id,
-						self.strings,
+						strings,
 						ident,
 						"associated type",
 					));
@@ -596,7 +620,7 @@ impl TypeContext<'_, '_, '_> {
 			Some(target) => {
 				for trait_index in self.trait_candidates(target) {
 					if self
-						.defs
+						.decls
 						.declared_trait_member(trait_index, key)
 						.is_some()
 					{
@@ -616,8 +640,10 @@ impl TypeContext<'_, '_, '_> {
 					normalized,
 					self.solver.state.recursion_budget,
 				);
-				match TypeContext::select_declared_member(
-					self.defs, declared, key,
+				match Semantics::select_declared_member(
+					&self.decls,
+					declared,
+					key,
 				) {
 					MemberLookup::Found(member) => {
 						traits.extend(
@@ -637,14 +663,14 @@ impl TypeContext<'_, '_, '_> {
 		if traits.is_empty() {
 			self.diagnostics.push(report_no_such_type_member(
 				reference.file_id,
-				self.strings,
+				strings,
 				ident,
 				"associated type",
 			));
 			return Err(SolverError::Poisoned);
 		}
-		let name_str = self.strings.resolve(name).unwrap().to_string();
-		let receiver = self.type_formatter().display_type(projection);
+		let name_str = strings.resolve(name).unwrap().to_string();
+		let receiver = self.type_formatter(strings).display_type(projection);
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMemberNeedsQualification.code())
 			.with_message(format!("ambiguous associated type `{name_str}`"))
@@ -652,9 +678,8 @@ impl TypeContext<'_, '_, '_> {
 				"`{receiver}` is known only through an impl, so the trait must be named"
 			)));
 		for trait_index in traits {
-			let trait_name = self
-				.strings
-				.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
+			let trait_name = strings
+				.resolve(self.decls.traits[usize::from(trait_index)].name.inner)
 				.unwrap();
 			diagnostic = diagnostic.with_note(format!(
 				"qualify the trait: `<{receiver} as {trait_name}>::{name_str}`"
@@ -668,21 +693,21 @@ impl TypeContext<'_, '_, '_> {
 	/// names the type it reduces to, which lacks the trait.
 	fn report_trait_bound_violation(
 		&self,
+		strings: &StringInterner,
 		file_id: FileId,
 		argument: Spanned<(TypeIndex, TypeIndex)>,
 		trait_index: TraitIdx,
 		bound_id: BoundId,
 		owner: GenericEnvOwner,
 	) -> Diagnostic<FileId> {
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let (subject, reduced) = argument.inner;
 		let (subject, reduced) = (
 			formatter.display_type(subject),
 			formatter.display_type(reduced),
 		);
-		let trait_name = self
-			.strings
-			.resolve(self.defs.traits[usize::from(trait_index)].name.inner)
+		let trait_name = strings
+			.resolve(self.decls.traits[usize::from(trait_index)].name.inner)
 			.unwrap();
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TraitBoundViolation.code())
@@ -699,10 +724,10 @@ impl TypeContext<'_, '_, '_> {
 			.with_label(
 				self.bounds.span(bound_id).secondary_label().with_message(
 					// An impl has no name to point at; its bound is shown.
-					match owner.name(self.defs) {
+					match owner.name(&self.decls) {
 						Some(name) => format!(
 							"required by a bound in `{}`",
-							self.strings.resolve(name.inner).unwrap()
+							strings.resolve(name.inner).unwrap()
 						),
 						None => "required by this bound".to_owned(),
 					},
@@ -716,6 +741,7 @@ impl TypeContext<'_, '_, '_> {
 	/// since that is what the value failed.
 	fn report_equality_mismatch(
 		&self,
+		strings: &StringInterner,
 		reference: SourceSpan,
 		(projection, required): (TypeIndex, TypeIndex),
 		found: TypeIndex,
@@ -723,7 +749,7 @@ impl TypeContext<'_, '_, '_> {
 		source: BindingRef,
 		owner: GenericEnvOwner,
 	) -> Diagnostic<FileId> {
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let (projection, required, found, expected) = (
 			formatter.display_type(projection),
 			formatter.display_type(required),
@@ -748,10 +774,10 @@ impl TypeContext<'_, '_, '_> {
 				"expected `{expected}`, found `{found}`"
 			)))
 			.with_label(written.secondary_label().with_message(
-				match owner.name(self.defs) {
+				match owner.name(&self.decls) {
 					Some(name) => format!(
 						"required by this equality in `{}`",
-						self.strings.resolve(name.inner).unwrap()
+						strings.resolve(name.inner).unwrap()
 					),
 					None => "required by this equality".to_owned(),
 				},
@@ -765,7 +791,7 @@ impl TypeContext<'_, '_, '_> {
 pub(super) enum TypeArgsNotAllowedOn<'a> {
 	/// A namespace a path passes through, an enum, a global, a memory, an
 	/// associated type or an intrinsic type alias.
-	Declaration(DefKind),
+	Declaration(DeclKind),
 	/// A generic parameter or a trait's `Self`, and the declaration whose
 	/// frame declares it.
 	TypeParam {
@@ -778,14 +804,14 @@ pub(super) enum TypeArgsNotAllowedOn<'a> {
 /// count for one that declares a parameter list.
 pub(super) fn report_type_args_not_allowed(
 	strings: &StringInterner,
-	defs: &DefinitionRegistry,
+	decls: &Declarations,
 	file_id: FileId,
 	segment: &ast::PathSegment,
 	target: TypeArgsNotAllowedOn<'_>,
 ) -> Diagnostic<FileId> {
 	let (noun, declared_at) = match target {
 		TypeArgsNotAllowedOn::Declaration(kind) => {
-			(kind.noun(), kind.declared_at(defs))
+			(kind.noun(), kind.declared_at(decls))
 		}
 		TypeArgsNotAllowedOn::TypeParam { owner, name } => (
 			if name.inner == Keyword::SelfPascal.symbol() {
@@ -793,7 +819,7 @@ pub(super) fn report_type_args_not_allowed(
 			} else {
 				"type parameter"
 			},
-			Some(SourceSpan::new(owner.file_id(defs), name.span)),
+			Some(SourceSpan::new(owner.file_id(decls), name.span)),
 		),
 	};
 	let name = strings.resolve(segment.ident.inner).unwrap();
@@ -841,15 +867,15 @@ pub(super) fn report_type_args_not_allowed(
 /// parameter list, possibly empty: a struct, a function or a type alias.
 fn report_type_arg_count_mismatch(
 	strings: &StringInterner,
-	defs: &DefinitionRegistry,
+	decls: &Declarations,
 	file_id: FileId,
 	segment: &ast::PathSegment,
 	owner: GenericEnvOwner,
 	params: &[Spanned<SymbolU32>],
 ) -> Diagnostic<FileId> {
 	let (noun, name) = (owner.noun(), segment.ident.inner);
-	let declaration = owner.name(defs).map(|declared| {
-		(SourceSpan::new(owner.file_id(defs), declared.span), params)
+	let declaration = owner.name(decls).map(|declared| {
+		(SourceSpan::new(owner.file_id(decls), declared.span), params)
 	});
 	let args = &segment.type_args;
 	let params = declaration.map_or(&[][..], |(_, params)| params);
@@ -929,73 +955,42 @@ mod tests {
 	use super::*;
 	use crate::ast::{self, Spanned};
 	use crate::diagnostics::TextSpan;
-	use crate::tir::defs::{DefKind, DefinitionRegistry, Scope, Tier};
-	use crate::tir::impls::ImplDispatch;
+	use crate::tir::decls::{DeclKind, Scope, Tier};
 	use crate::tir::paths::PathResolver;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::solver::Solver;
 	use crate::tir::types::Type;
 
-	/// Parses `source` over the embedded stdlib, sweeps every registered
-	/// item's signature, then hands the live `TypeContext` to `f`. Nothing
-	/// borrowed here (`graph`, `defs`, `ast_nodes`, `diagnostics`) may escape
-	/// this call; only `f`'s own, owned return value does.
+	/// Checks `source` over the embedded stdlib, then hands the live
+	/// `Semantics` and the interner to `f`.
 	fn with_resolved<R>(
 		source: &str,
-		f: impl FnOnce(&mut TypeContext) -> R,
+		f: impl FnOnce(&mut Semantics, &StringInterner) -> R,
 	) -> R {
 		let mut strings = Keyword::create_interner();
 		let graph = source_graph(source, &mut strings);
-
-		let mut diagnostics = Vec::new();
-		let mut resolutions = NameResolutions::default();
-		let (defs, ast_nodes) = DefinitionRegistry::build(
-			&graph.packages,
-			&graph.files,
-			&mut strings,
-			&mut diagnostics,
-			&mut resolutions,
-			graph.stdlib_package,
-			graph.root_package,
-		);
-		let impl_dispatch = ImplDispatch::build(
-			&mut diagnostics,
-			&mut resolutions,
-			&strings,
-			&defs,
-			&ast_nodes,
-		);
-		let mut solver = Solver::new(defs.constants.len());
-		let mut builder = TypeContext::new(
-			&mut diagnostics,
-			&mut resolutions,
-			&mut strings,
-			&mut solver,
-			&graph.files,
-			&defs,
-			&ast_nodes,
-			&impl_dispatch,
-		);
-		builder.sweep();
-		assert!(builder.diagnostics.is_empty(), "{:?}", builder.diagnostics);
-
-		f(&mut builder)
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		assert!(sema.diagnostics.is_empty(), "{:?}", sema.diagnostics);
+		f(&mut sema, &strings)
 	}
 
 	/// Resolves `path` (`::`-separated) as a `tier`-tier path from the root
 	/// namespace — same mechanism a written bound or type actually uses,
 	/// mirroring `signatures::tests::TestCase::resolve`.
-	fn resolve(builder: &TypeContext, tier: Tier, path: &str) -> DefKind {
-		let root = Scope::Package(builder.defs.root_package);
-		let file_id = builder.defs.namespaces.file_id(root.into());
+	fn resolve(
+		sema: &Semantics,
+		strings: &StringInterner,
+		tier: Tier,
+		path: &str,
+	) -> DeclKind {
+		let root = Scope::Package(sema.decls.root_package);
+		let file_id = sema.decls.namespaces.file_id(root.into());
 
 		let segments: Box<[ast::PathSegment]> = path
 			.split("::")
 			.map(|segment| ast::PathSegment {
 				ident: Spanned {
-					inner: builder
-						.strings
+					inner: strings
 						.get(segment)
 						.expect("already interned from source"),
 					span: TextSpan::new(0, 0),
@@ -1008,20 +1003,25 @@ mod tests {
 		let target = PathResolver::new(
 			&mut diagnostics,
 			&mut resolutions,
-			builder.strings,
-			builder.defs,
+			strings,
+			&sema.decls,
 		)
 		.resolve_path(file_id, root, &segments, tier);
 		target
-			.def_key()
+			.decl_key()
 			.unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {diagnostics:?}")
 			})
-			.symbol_kind(builder.defs)
+			.symbol_kind(&sema.decls)
 	}
 
-	fn trait_index(builder: &TypeContext, path: &str) -> TraitIdx {
-		let DefKind::Trait(trait_index) = resolve(builder, Tier::Type, path)
+	fn trait_index(
+		sema: &Semantics,
+		strings: &StringInterner,
+		path: &str,
+	) -> TraitIdx {
+		let DeclKind::Trait(trait_index) =
+			resolve(sema, strings, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a trait");
 		};
@@ -1031,24 +1031,33 @@ mod tests {
 	/// The `TraitIndex` of `path`'s compiler-generated backing trait — what
 	/// a `T: <path>` bound naming this typeset actually resolves to. See
 	/// `TypeSetSignature`'s own doc comment.
-	fn typeset_trait_index(builder: &TypeContext, path: &str) -> TraitIdx {
-		let DefKind::TypeSet(typeset_index) =
-			resolve(builder, Tier::Type, path)
+	fn typeset_trait_index(
+		sema: &Semantics,
+		strings: &StringInterner,
+		path: &str,
+	) -> TraitIdx {
+		let DeclKind::TypeSet(typeset_index) =
+			resolve(sema, strings, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a typeset");
 		};
-		builder.defs.typesets[usize::from(typeset_index)].trait_index
+		sema.decls.typesets[usize::from(typeset_index)].trait_index
 	}
 
 	/// `path`'s own `TypeIndex` — a non-generic struct only(a generic
 	/// struct's instantiated `TypeIndex` needs type-argument resolution,
 	/// which isn't implemented yet — see `impls.rs::resolve_impl_target`).
-	fn struct_type(builder: &mut TypeContext, path: &str) -> TypeIndex {
-		let DefKind::Struct(struct_index) = resolve(builder, Tier::Type, path)
+	fn struct_type(
+		sema: &mut Semantics,
+		strings: &StringInterner,
+		path: &str,
+	) -> TypeIndex {
+		let DeclKind::Struct(struct_index) =
+			resolve(sema, strings, Tier::Type, path)
 		else {
 			panic!("expected `{path}` to be a struct");
 		};
-		builder.types.intern_struct(struct_index, &[])
+		sema.types.intern_struct(struct_index, &[])
 	}
 
 	/// The `TypeIndex` of `function_path`'s `param_index`-th own declared
@@ -1059,28 +1068,26 @@ mod tests {
 	/// needs a function's own resolved types yet), is what lets this same
 	/// harness reach a `TypeParam` receiver without a wider accessor.
 	/// Where `param` is declared: the assumptions of its own declaration.
-	fn param_scope(
-		builder: &TypeContext,
-		param: TypeIndex,
-	) -> AssumptionEnvIdx {
-		let Type::TypeParam { env, .. } = *builder.types.resolve(param) else {
+	fn param_scope(sema: &Semantics, param: TypeIndex) -> AssumptionEnvIdx {
+		let Type::TypeParam { env, .. } = *sema.types.resolve(param) else {
 			panic!("expected a type parameter");
 		};
-		builder.assumption_envs.of_frame(env)
+		sema.assumption_envs.of_frame(env)
 	}
 
 	fn generic_param_type(
-		builder: &mut TypeContext,
+		sema: &mut Semantics,
+		strings: &StringInterner,
 		function_path: &str,
 		param_index: u32,
 	) -> TypeIndex {
-		let DefKind::Function(function_index) =
-			resolve(builder, Tier::Value, function_path)
+		let DeclKind::Function(function_index) =
+			resolve(sema, strings, Tier::Value, function_path)
 		else {
 			panic!("expected `{function_path}` to be a function");
 		};
-		let env = builder.functions[usize::from(function_index)].type_params;
-		builder.types.intern(Type::TypeParam { env, param_index })
+		let env = sema.functions[usize::from(function_index)].type_params;
+		sema.types.intern(Type::TypeParam { env, param_index })
 	}
 
 	#[test]
@@ -1089,11 +1096,12 @@ mod tests {
 			indoc! {"
 			trait Foo {}
 		"},
-			|builder| {
-				let foo = trait_index(builder, "Foo");
+			|sema, strings| {
+				let foo = trait_index(sema, strings, "Foo");
 				assert!(
-					(builder
+					(sema
 						.find_trait_impl_query(
+							strings,
 							AssumptionEnvIdx::ROOT,
 							TypeIndex::ERROR,
 							foo
@@ -1102,8 +1110,9 @@ mod tests {
 						== Err(SolverError::Poisoned))
 				);
 				assert!(
-					(builder
+					(sema
 						.find_trait_impl_query(
+							strings,
 							AssumptionEnvIdx::ROOT,
 							TypeIndex::INFER,
 							foo
@@ -1123,12 +1132,17 @@ mod tests {
 				struct S();
 				impl Foo for S {}
 			"},
-			|builder| {
-				let foo = trait_index(builder, "Foo");
-				let s = struct_type(builder, "S");
+			|sema, strings| {
+				let foo = trait_index(sema, strings, "Foo");
+				let s = struct_type(sema, strings, "S");
 				assert!(
-					(builder
-						.find_trait_impl_query(AssumptionEnvIdx::ROOT, s, foo)
+					(sema
+						.find_trait_impl_query(
+							strings,
+							AssumptionEnvIdx::ROOT,
+							s,
+							foo
+						)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);
@@ -1145,12 +1159,17 @@ mod tests {
 				struct S();
 				impl Foo for S {}
 			"},
-			|builder| {
-				let bar = trait_index(builder, "Bar");
-				let s = struct_type(builder, "S");
+			|sema, strings| {
+				let bar = trait_index(sema, strings, "Bar");
+				let s = struct_type(sema, strings, "S");
 				assert!(
-					!(builder
-						.find_trait_impl_query(AssumptionEnvIdx::ROOT, s, bar)
+					!(sema
+						.find_trait_impl_query(
+							strings,
+							AssumptionEnvIdx::ROOT,
+							s,
+							bar
+						)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);
@@ -1165,12 +1184,17 @@ mod tests {
 				struct S();
 				typeset Nums { S }
 			"},
-			|builder| {
-				let nums = typeset_trait_index(builder, "Nums");
-				let s = struct_type(builder, "S");
+			|sema, strings| {
+				let nums = typeset_trait_index(sema, strings, "Nums");
+				let s = struct_type(sema, strings, "S");
 				assert!(
-					(builder
-						.find_trait_impl_query(AssumptionEnvIdx::ROOT, s, nums)
+					(sema
+						.find_trait_impl_query(
+							strings,
+							AssumptionEnvIdx::ROOT,
+							s,
+							nums
+						)
 						.map(|found| found.is_some())
 						== Ok(true))
 				);
@@ -1185,13 +1209,14 @@ mod tests {
 				trait Bound {}
 				func target<T: Bound + StackValue>(x: T) {}
 			"},
-			|builder| {
-				let bound = trait_index(builder, "Bound");
-				let t = generic_param_type(builder, "target", 0);
+			|sema, strings| {
+				let bound = trait_index(sema, strings, "Bound");
+				let t = generic_param_type(sema, strings, "target", 0);
 				assert!(
-					(builder
+					(sema
 						.find_trait_impl_query(
-							param_scope(builder, t),
+							strings,
+							param_scope(sema, t),
 							t,
 							bound
 						)
@@ -1200,9 +1225,13 @@ mod tests {
 				);
 				// Outside `target` its bounds are not assumed.
 				assert_eq!(
-					builder
-						.find_trait_impl_query(AssumptionEnvIdx::ROOT, t, bound)
-						.map(|found| found.is_some()),
+					sema.find_trait_impl_query(
+						strings,
+						AssumptionEnvIdx::ROOT,
+						t,
+						bound
+					)
+					.map(|found| found.is_some()),
 					Ok(false)
 				);
 			},
@@ -1217,13 +1246,14 @@ mod tests {
 				trait Other {}
 				func target<T: Bound + StackValue>(x: T) {}
 			"},
-			|builder| {
-				let other = trait_index(builder, "Other");
-				let t = generic_param_type(builder, "target", 0);
+			|sema, strings| {
+				let other = trait_index(sema, strings, "Other");
+				let t = generic_param_type(sema, strings, "target", 0);
 				assert!(
-					!(builder
+					!(sema
 						.find_trait_impl_query(
-							param_scope(builder, t),
+							strings,
+							param_scope(sema, t),
 							t,
 							other
 						)
@@ -1242,13 +1272,14 @@ mod tests {
 				trait Sub: Super {}
 				func target<T: Sub + StackValue>(x: T) {}
 			"},
-			|builder| {
-				let super_trait = trait_index(builder, "Super");
-				let t = generic_param_type(builder, "target", 0);
+			|sema, strings| {
+				let super_trait = trait_index(sema, strings, "Super");
+				let t = generic_param_type(sema, strings, "target", 0);
 				assert!(
-					(builder
+					(sema
 						.find_trait_impl_query(
-							param_scope(builder, t),
+							strings,
+							param_scope(sema, t),
 							t,
 							super_trait
 						)

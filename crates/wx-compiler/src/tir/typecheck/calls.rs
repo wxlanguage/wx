@@ -19,17 +19,17 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::members::Expected;
-use super::{Arguments, BodyContext};
-use crate::ast::{self, Separated, Spanned};
+use super::{Arguments, BodyBuilder};
+use crate::ast::{self, Separated, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
-use crate::tir::defs::{
-	AssocTypeIdx, BindingKey, FieldIdx, FunctionIdx, MemberKind, MemberOwner,
-	StructIdx, Tier,
+use crate::tir::decls::{
+	AssocTypeIdx, BindingKey, Declarations, FieldIdx, FunctionIdx, MemberKind,
+	MemberOwner, StructIdx, Tier,
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::resolutions::{Resolution, Selection};
-use crate::tir::signatures::TypeContext;
+use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
 	GenericArgs, GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
@@ -63,14 +63,14 @@ impl Callee {
 	/// or `Self` for a trait's declaration), the first `proven` of them
 	/// proven, its own arguments left to the call.
 	pub(super) fn new(
-		cx: &TypeContext<'_, '_, '_>,
+		sema: &Semantics,
 		function: FunctionIdx,
 		leading: &[TypeIndex],
 		proven: usize,
 	) -> Self {
-		let env = cx.functions[usize::from(function)].type_params;
+		let env = sema.functions[usize::from(function)].type_params;
 		let mut type_args =
-			vec![TypeIndex::INFER; cx.generic_envs.generic_count(env)]
+			vec![TypeIndex::INFER; sema.generic_envs.generic_count(env)]
 				.into_boxed_slice();
 		type_args[..leading.len()].copy_from_slice(leading);
 		Self {
@@ -108,52 +108,67 @@ pub(super) struct GivenArgument {
 /// What a call calls, read once per call: a function, or a struct's
 /// constructor, whose parameters are the struct's fields. A call's arguments
 /// are checked against either the same way, by position or by name.
-pub(super) struct CallTarget<'ctx> {
+pub(super) struct CallTarget {
 	pub(super) kind: CallTargetKind,
 	/// The frames the parameter types are written with: the whole chain the
 	/// call's flat type arguments instantiate.
 	pub(super) generic_env: GenericEnvIdx,
 	/// Each parameter's type as declared, `self` included.
 	pub(super) param_types: TypeList,
-	/// Each parameter's name as a call by name spells it, `None` when it is
-	/// unnamed. A function's are its naming declaration's.
-	pub(super) param_names: &'ctx [Option<Spanned<SymbolU32>>],
+	/// The declaration whose parameter names a call by name spells: a
+	/// function's naming declaration, or the struct (`param_names`).
+	names: CallTargetKind,
 }
 
-impl<'ctx> CallTarget<'ctx> {
-	pub(super) fn function(
-		cx: &TypeContext<'_, 'ctx, '_>,
-		function: FunctionIdx,
-	) -> Self {
-		let signature = &cx.functions[usize::from(function)];
+impl CallTarget {
+	pub(super) fn function(sema: &Semantics, function: FunctionIdx) -> Self {
+		let signature = &sema.functions[usize::from(function)];
 		Self {
 			kind: CallTargetKind::Function(function),
 			generic_env: signature.type_params,
 			param_types: signature.param_types,
-			param_names: &cx.defs.functions
-				[usize::from(naming_declaration(cx, function))]
-			.params,
+			names: CallTargetKind::Function(naming_declaration(sema, function)),
 		}
 	}
 
 	pub(super) fn struct_constructor(
-		cx: &TypeContext<'_, 'ctx, '_>,
+		sema: &Semantics,
 		struct_index: StructIdx,
 	) -> Self {
-		let signature = &cx.structs[usize::from(struct_index)];
+		let signature = &sema.structs[usize::from(struct_index)];
 		Self {
 			kind: CallTargetKind::StructConstructor(struct_index),
 			generic_env: signature.type_params,
 			param_types: signature.field_types,
-			param_names: &cx.defs.structs[usize::from(struct_index)]
-				.field_names,
+			names: CallTargetKind::StructConstructor(struct_index),
+		}
+	}
+
+	/// Each parameter's name as a call by name spells it, `None` when it is
+	/// unnamed.
+	pub(super) fn param_names<'d>(
+		&self,
+		decls: &'d Declarations,
+	) -> &'d [Option<Spanned<SymbolU32>>] {
+		match self.names {
+			CallTargetKind::Function(function) => {
+				&decls.functions[usize::from(function)].params
+			}
+			CallTargetKind::StructConstructor(struct_index) => {
+				&decls.structs[usize::from(struct_index)].field_names
+			}
 		}
 	}
 
 	/// The first parameter from `from` on named `name`: a later one of the
 	/// same name was reported on the declaration.
-	fn find_param(&self, name: SymbolU32, from: usize) -> Option<ParamIdx> {
-		self.param_names
+	fn find_param(
+		&self,
+		decls: &Declarations,
+		name: SymbolU32,
+		from: usize,
+	) -> Option<ParamIdx> {
+		self.param_names(decls)
 			.iter()
 			.enumerate()
 			.skip(from)
@@ -190,29 +205,33 @@ impl CallTargetKind {
 	}
 
 	/// The target's name as written: the function's, or the struct's.
-	fn name<'c>(self, cx: &'c TypeContext<'_, '_, '_>) -> &'c str {
+	fn name<'s>(
+		self,
+		strings: &'s StringInterner,
+		sema: &Semantics,
+	) -> &'s str {
 		let name = match self {
 			Self::Function(function) => {
-				cx.defs.functions[usize::from(function)].name
+				sema.decls.functions[usize::from(function)].name
 			}
 			Self::StructConstructor(struct_index) => {
-				cx.defs.structs[usize::from(struct_index)].name
+				sema.decls.structs[usize::from(struct_index)].name
 			}
 		};
-		cx.strings.resolve(name.inner).unwrap()
+		strings.resolve(name.inner).unwrap()
 	}
 
 	/// A label at the declaration's name, where a diagnostic points for the
 	/// target's parameters.
-	fn declared_here(self, cx: &TypeContext<'_, '_, '_>) -> Label<FileId> {
+	fn declared_here(self, sema: &Semantics) -> Label<FileId> {
 		let declaration = match self {
 			Self::Function(function) => {
-				let def = &cx.defs.functions[usize::from(function)];
-				SourceSpan::new(def.file_id, def.name.span)
+				let decl = &sema.decls.functions[usize::from(function)];
+				SourceSpan::new(decl.file_id, decl.name.span)
 			}
 			Self::StructConstructor(struct_index) => {
-				let def = &cx.defs.structs[usize::from(struct_index)];
-				SourceSpan::new(def.file_id, def.name.span)
+				let decl = &sema.decls.structs[usize::from(struct_index)];
+				SourceSpan::new(decl.file_id, decl.name.span)
 			}
 		};
 		declaration.secondary_label().with_message("declared here")
@@ -223,21 +242,19 @@ impl CallTargetKind {
 /// for a trait impl's function, its trait's declaration, so a call is named
 /// the same whichever impl it reaches; otherwise the function itself. An impl
 /// function its trait does not declare names its own.
-fn naming_declaration(
-	cx: &TypeContext<'_, '_, '_>,
-	function: FunctionIdx,
-) -> FunctionIdx {
-	let def = &cx.defs.functions[usize::from(function)];
-	let MemberOwner::TraitImpl(impl_index) = def.owner else {
+fn naming_declaration(sema: &Semantics, function: FunctionIdx) -> FunctionIdx {
+	let decl = &sema.decls.functions[usize::from(function)];
+	let MemberOwner::TraitImpl(impl_index) = decl.owner else {
 		return function;
 	};
-	let Some(trait_index) = cx.impl_dispatch.trait_header(impl_index).trait_def
+	let Some(trait_index) =
+		sema.impl_dispatch.trait_header(impl_index).trait_decl
 	else {
 		return function;
 	};
-	match cx.defs.declared_trait_member(
+	match sema.decls.declared_trait_member(
 		trait_index.inner,
-		BindingKey::value(def.name.inner),
+		BindingKey::value(decl.name.inner),
 	) {
 		Some(
 			MemberKind::Function(declaration) | MemberKind::Method(declaration),
@@ -246,7 +263,7 @@ fn naming_declaration(
 	}
 }
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyBuilder<'_, '_> {
 	/// A function named without a call. Its type arguments are written, or
 	/// given by an expected item type of the same function (`local g: id<u8>
 	/// = id;`); there are no arguments to learn from.
@@ -271,13 +288,13 @@ impl BodyContext<'_, '_, '_, '_> {
 		);
 		let mut mismatched = false;
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
-			let expected = self.normalized(expected, self.scope.assumption_env);
-			let declared = self.cx.types.intern_function(
+			let expected = self.context().normalized(expected);
+			let declared = self.sema.types.intern_function(
 				function,
-				self.cx.generic_envs.identity_args(env),
+				self.sema.generic_envs.identity_args(env),
 			);
-			self.cx.types.learn(
-				&self.cx.generic_envs,
+			self.sema.types.learn(
+				&self.sema.generic_envs,
 				env,
 				&mut type_args,
 				declared,
@@ -286,15 +303,16 @@ impl BodyContext<'_, '_, '_, '_> {
 			// No item of another type can teach its arguments: what is wrong
 			// is the type, not a missing annotation.
 			let same_item = matches!(
-				*self.cx.types.resolve(expected),
+				*self.sema.types.resolve(expected),
 				Type::Function { func_index, .. } if func_index == function
 			);
 			if !same_item
-				&& !self.cx.types.has_infer(expected)
-				&& type_args.iter().any(|&arg| self.cx.types.has_infer(arg))
+				&& !self.sema.types.has_infer(expected)
+				&& type_args.iter().any(|&arg| self.sema.types.has_infer(arg))
 			{
-				let diagnostic = self.mismatch_at(expected, declared, span);
-				self.cx.diagnostics.push(diagnostic);
+				let diagnostic =
+					self.context().mismatch_at(expected, declared, span);
+				self.sema.diagnostics.push(diagnostic);
 				mismatched = true;
 			}
 		}
@@ -304,11 +322,11 @@ impl BodyContext<'_, '_, '_, '_> {
 			mismatched,
 			&mut type_args,
 		);
-		let target = CallTarget::function(self.cx, function);
+		let target = CallTarget::function(self.sema, function);
 		let args = self.use_args(&target, segment, &type_args, &[]);
 		self.check_use_bounds(&target, proven, segment, args);
-		let ty = self.cx.types.intern_function(function, &type_args);
-		let ty = self.cx.types.collapse_error(ty);
+		let ty = self.sema.types.intern_function(function, &type_args);
+		let ty = self.sema.types.collapse_error(ty);
 		let kind = ExprKind::Function {
 			function,
 			type_args: args,
@@ -333,8 +351,9 @@ impl BodyContext<'_, '_, '_, '_> {
 			mut type_args,
 			proven,
 		} = callee;
-		let target = CallTarget::function(self.cx, function);
-		let return_type = self.cx.functions[usize::from(function)].return_type;
+		let target = CallTarget::function(self.sema, function);
+		let return_type =
+			self.sema.functions[usize::from(function)].return_type;
 		let (env, own) = self.function_frames(function);
 		self.write_type_args(
 			segment,
@@ -354,9 +373,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		// The result is learned from first: a disagreement teaches nothing,
 		// and the call's own type is held to the expected one by the caller.
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
-			let expected = self.normalized(expected, self.scope.assumption_env);
-			self.cx.types.learn(
-				&self.cx.generic_envs,
+			let expected = self.context().normalized(expected);
+			self.sema.types.learn(
+				&self.sema.generic_envs,
 				env,
 				&mut type_args,
 				return_type,
@@ -365,7 +384,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let mut given = Vec::new();
 		if let Some(receiver) = receiver {
-			let declared = self.cx.types.list(target.param_types)[0];
+			let declared = self.sema.types.list(target.param_types)[0];
 			self.learn_argument(&target, &mut type_args, declared, receiver);
 			// Checked before its parameter's type was instantiated, so it is
 			// held to that type at the end.
@@ -387,7 +406,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let already_reported = expected == TypeIndex::ERROR
 			|| reported
 			|| given.iter().any(|argument| {
-				self.cx.types.has_error(self.body.ty(argument.value))
+				self.sema.types.has_error(self.body.ty(argument.value))
 			});
 		self.settle_uninferred(
 			env,
@@ -404,7 +423,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			&target, &type_args, &given, skipped, reported, span,
 		);
 		let ty = self.instantiate(return_type, env, &type_args);
-		let ty = self.cx.types.collapse_error(ty);
+		let ty = self.sema.types.collapse_error(ty);
 		let kind = self.call_node(function, use_args, receiver, args);
 		self.body.push(kind, ty, span)
 	}
@@ -419,7 +438,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		receiver: Option<ExprIdx>,
 		args: ExprIdx,
 	) -> ExprKind {
-		let owner = self.cx.defs.functions[usize::from(function)].owner;
+		let owner = self.sema.decls.functions[usize::from(function)].owner;
 		match (Dispatch::of(owner), receiver) {
 			(Dispatch::Direct, None) => ExprKind::Call {
 				function,
@@ -456,7 +475,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// a reported list is `ERROR`.
 	pub(super) fn arguments_value(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &[TypeIndex],
 		given: &[GivenArgument],
 		skipped: usize,
@@ -494,10 +513,10 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// as one value: their tuple, or a lone one's own type.
 	fn declared_after(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		skipped: usize,
 	) -> TypeIndex {
-		self.cx.types.intern(Type::Tuple {
+		self.sema.types.intern(Type::Tuple {
 			elements: target.param_types.suffix(skipped),
 		})
 	}
@@ -509,7 +528,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// why a type argument stays unknown.
 	pub(super) fn build_arguments(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &mut [TypeIndex],
 		arguments: Arguments<'_>,
 		given: &mut Vec<GivenArgument>,
@@ -532,12 +551,12 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// are instantiated again.
 	pub(super) fn expect_arguments(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &[TypeIndex],
 		given: &[GivenArgument],
 	) {
 		for argument in given {
-			let ty = if self.cx.types.has_infer(argument.expected) {
+			let ty = if self.sema.types.has_infer(argument.expected) {
 				self.instantiate(
 					argument.declared,
 					target.generic_env,
@@ -554,14 +573,14 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// call's type arguments.
 	fn learn_argument(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &mut [TypeIndex],
 		declared: TypeIndex,
 		value: ExprIdx,
 	) {
 		let actual = self.body.ty(value);
-		self.cx.types.learn(
-			&self.cx.generic_envs,
+		self.sema.types.learn(
+			&self.sema.generic_envs,
 			target.generic_env,
 			type_args,
 			declared,
@@ -577,7 +596,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// is their value as a tuple (`f(p)`).
 	fn positional_arguments(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &mut [TypeIndex],
 		arguments: &[Separated<Spanned<ast::Expression>>],
 		given: &mut Vec<GivenArgument>,
@@ -608,7 +627,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			let param = ParamIdx::new((skipped + at) as u32);
 			let declared =
-				self.cx.types.list(target.param_types)[usize::from(param)];
+				self.sema.types.list(target.param_types)[usize::from(param)];
 			let hint =
 				self.instantiate(declared, target.generic_env, type_args);
 			let value = self.build(&argument.inner, hint);
@@ -629,7 +648,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// likely is (`f(a)` missing `b`).
 	fn one_value_for_all(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &mut [TypeIndex],
 		argument: &Separated<Spanned<ast::Expression>>,
 		given: &mut Vec<GivenArgument>,
@@ -642,9 +661,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		let value = self.build(&argument.inner, hint);
 		let actual = self.body.ty(value);
 		let is_tuple =
-			matches!(self.cx.types.resolve(actual), Type::Tuple { .. });
+			matches!(self.sema.types.resolve(actual), Type::Tuple { .. });
 		if !is_tuple {
-			if !self.cx.types.has_error(actual) {
+			if !self.sema.types.has_error(actual) {
 				self.report_argument_count(target, open, 1, span);
 			}
 			return true;
@@ -664,7 +683,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// one not known yet learns it (`id(1, 2)`), any other is a wrong count.
 	fn whole_argument_list(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &mut [TypeIndex],
 		arguments: &[Separated<Spanned<ast::Expression>>],
 		given: &mut Vec<GivenArgument>,
@@ -672,11 +691,11 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> bool {
 		let param = ParamIdx::new(given.len() as u32);
 		let declared =
-			self.cx.types.list(target.param_types)[usize::from(param)];
+			self.sema.types.list(target.param_types)[usize::from(param)];
 		let hint = self.instantiate(declared, target.generic_env, type_args);
-		let fits = match *self.cx.types.resolve(hint) {
+		let fits = match *self.sema.types.resolve(hint) {
 			Type::Tuple { elements } => elements.len() == arguments.len(),
-			_ => self.cx.types.has_infer(hint),
+			_ => self.sema.types.has_infer(hint),
 		};
 		if !fits {
 			if hint != TypeIndex::ERROR {
@@ -710,20 +729,23 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// is built and dropped.
 	fn named_arguments(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		type_args: &mut [TypeIndex],
 		arguments: &[Separated<Spanned<ast::NamedArgument>>],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
 		let skipped = given.len();
-		let count = target.param_names.len();
+		let param_names = target.param_names(&self.sema.decls);
+		let count = param_names.len();
 		let positional_only =
-			target.param_names[skipped..].iter().any(Option::is_none);
+			param_names[skipped..].iter().any(Option::is_none);
 		if positional_only {
-			let (kind, target_name) =
-				(target.kind.describe(), target.kind.name(self.cx));
-			self.cx.diagnostics.push(
+			let (kind, target_name) = (
+				target.kind.describe(),
+				target.kind.name(self.builder.strings, self.sema),
+			);
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::PositionalOnlyCall.code())
 					.with_message(format!(
@@ -731,7 +753,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						 it is called by position"
 					))
 					.with_label(Label::primary(self.scope.file_id, span))
-					.with_label(target.kind.declared_here(self.cx)),
+					.with_label(target.kind.declared_here(self.sema)),
 			);
 			for argument in arguments {
 				self.build_named_argument(
@@ -749,21 +771,24 @@ impl BodyContext<'_, '_, '_, '_> {
 		for argument in arguments {
 			let argument = &argument.inner.inner;
 			let name = argument.name;
-			let param = target.find_param(name.inner, skipped);
+			let param =
+				target.find_param(&self.sema.decls, name.inner, skipped);
 			let hint = match param {
 				Some(param) => {
-					let declared = self.cx.types.list(target.param_types)
+					let declared = self.sema.types.list(target.param_types)
 						[usize::from(param)];
 					self.instantiate(declared, target.generic_env, type_args)
 				}
 				None => TypeIndex::INFER,
 			};
 			let value = self.build_named_argument(argument, hint);
-			let param_name = self.cx.strings.resolve(name.inner).unwrap();
+			let param_name = self.builder.strings.resolve(name.inner).unwrap();
 			let Some(param) = param else {
-				let (kind, target_name) =
-					(target.kind.describe(), target.kind.name(self.cx));
-				self.cx.diagnostics.push(
+				let (kind, target_name) = (
+					target.kind.describe(),
+					target.kind.name(self.builder.strings, self.sema),
+				);
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::UnknownParameterName.code())
 						.with_message(format!(
@@ -774,14 +799,14 @@ impl BodyContext<'_, '_, '_, '_> {
 							self.scope.file_id,
 							name.span,
 						))
-						.with_label(target.kind.declared_here(self.cx)),
+						.with_label(target.kind.declared_here(self.sema)),
 				);
 				reported = true;
 				continue;
 			};
 			let selection = match target.kind {
 				CallTargetKind::Function(function) => Selection::Parameter {
-					function: naming_declaration(self.cx, function),
+					function: naming_declaration(self.sema, function),
 					parameter: param,
 				},
 				CallTargetKind::StructConstructor(owner) => Selection::Field {
@@ -793,17 +818,17 @@ impl BodyContext<'_, '_, '_, '_> {
 				(SourceSpan::new(self.scope.file_id, name.span), Tier::Value);
 			let resolution = if argument.value.is_none()
 				&& let Some(Resolution::Reference(value)) =
-					self.cx.resolutions.by_site.get(&site).copied()
+					self.sema.resolutions.by_site.get(&site).copied()
 			{
 				Resolution::Shorthand { selection, value }
 			} else {
 				Resolution::Selection(selection)
 			};
-			self.cx.resolutions.by_site.insert(site, resolution);
+			self.sema.resolutions.by_site.insert(site, resolution);
 			if let Some(&(_, first)) =
 				named.iter().find(|&&(named, _)| named == param)
 			{
-				self.cx.diagnostics.push(
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::DuplicateNamedArgument.code(),
@@ -824,7 +849,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				continue;
 			}
 			let declared =
-				self.cx.types.list(target.param_types)[usize::from(param)];
+				self.sema.types.list(target.param_types)[usize::from(param)];
 			self.learn_argument(target, type_args, declared, value);
 			named.push((param, name.span));
 			given.push(GivenArgument {
@@ -840,17 +865,23 @@ impl BodyContext<'_, '_, '_, '_> {
 			.map(|at| ParamIdx::new(at as u32))
 			.filter(|&param| !named.iter().any(|&(named, _)| named == param))
 			.filter_map(|param| {
-				let name = target.param_names[usize::from(param)]?.inner;
-				(target.find_param(name, skipped) == Some(param)).then(|| {
-					format!("`{}`", self.cx.strings.resolve(name).unwrap())
+				let name = target.param_names(&self.sema.decls)
+					[usize::from(param)]?
+				.inner;
+				(target.find_param(&self.sema.decls, name, skipped)
+					== Some(param))
+				.then(|| {
+					format!("`{}`", self.builder.strings.resolve(name).unwrap())
 				})
 			})
 			.collect();
 		if !missing.is_empty() {
 			reported = true;
-			let (kind, target_name) =
-				(target.kind.describe(), target.kind.name(self.cx));
-			self.cx.diagnostics.push(
+			let (kind, target_name) = (
+				target.kind.describe(),
+				target.kind.name(self.builder.strings, self.sema),
+			);
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::MissingArguments.code())
 					.with_message(format!(
@@ -860,7 +891,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						missing.join(", ")
 					))
 					.with_label(Label::primary(self.scope.file_id, span))
-					.with_label(target.kind.declared_here(self.cx)),
+					.with_label(target.kind.declared_here(self.sema)),
 			);
 		}
 		reported
@@ -891,9 +922,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		&self,
 		function: FunctionIdx,
 	) -> (GenericEnvIdx, GenericEnvIdx) {
-		let env = self.cx.functions[usize::from(function)].type_params;
+		let env = self.sema.functions[usize::from(function)].type_params;
 		let own = if env != GenericEnvIdx::ROOT
-			&& self.cx.generic_envs.owner(env)
+			&& self.sema.generic_envs.owner(env)
 				== GenericEnvOwner::Function(function)
 		{
 			env
@@ -912,29 +943,31 @@ impl BodyContext<'_, '_, '_, '_> {
 		env: GenericEnvIdx,
 		args: &[TypeIndex],
 	) -> TypeIndex {
-		let ty = self.cx.types.substitute(
+		let ty = self.sema.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.cx.generic_envs,
+				envs: &self.sema.generic_envs,
 				env,
 				args,
 			},
 		);
-		let ty = self.normalized(ty, self.scope.assumption_env);
-		self.cx.types.collapse_error(ty)
+		let ty = self.context().normalized(ty);
+		self.sema.types.collapse_error(ty)
 	}
 
 	fn report_argument_count(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		expected: usize,
 		found: usize,
 		span: TextSpan,
 	) {
 		let plural = |n: usize| if n == 1 { "" } else { "s" };
-		let (kind, target_name) =
-			(target.kind.describe(), target.kind.name(self.cx));
-		self.cx.diagnostics.push(
+		let (kind, target_name) = (
+			target.kind.describe(),
+			target.kind.name(self.builder.strings, self.sema),
+		);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::ArgumentCountMismatch.code())
 				.with_message(format!(
@@ -951,7 +984,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						),
 					),
 				)
-				.with_label(target.kind.declared_here(self.cx)),
+				.with_label(target.kind.declared_here(self.sema)),
 		);
 	}
 }
@@ -966,7 +999,7 @@ enum ValueCallee {
 	Reference { param: TypeIndex, result: TypeIndex },
 }
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyBuilder<'_, '_> {
 	/// `v(a, b)` where `v` is a value, checked already: a local, a constant,
 	/// or a computed callee. Its type says how it is called: through its
 	/// `Call` impl, with the value as `self` and the arguments forming its
@@ -980,10 +1013,10 @@ impl BodyContext<'_, '_, '_, '_> {
 		arguments: Arguments<'_>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let ty =
-			self.normalized(self.body.ty(value), self.scope.assumption_env);
+		let ty = self.body.ty(value);
+		let ty = self.context().normalized(ty);
 		let callee = self.value_callee(value, ty);
-		let item = match *self.cx.types.resolve(ty) {
+		let item = match *self.sema.types.resolve(ty) {
 			Type::Function {
 				func_index,
 				type_args,
@@ -1025,7 +1058,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			// Read from the trait, not the impl's `call`, whose shape nothing
 			// has checked yet.
 			(None, Arguments::Positional(arguments)) => {
-				let intrinsics = &self.cx.defs.intrinsics;
+				let intrinsics = &self.sema.decls.intrinsics;
 				let (args, result) =
 					(intrinsics.call_args, intrinsics.call_result);
 				let args_type = self.call_projection(ty, args);
@@ -1037,7 +1070,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		};
 		let value_span = self.body.span(value);
 		let type_args = self
-			.cx
+			.sema
 			.generic_args
 			.push(callee.type_args.iter().map(|&arg| (arg, value_span)));
 		let kind =
@@ -1057,9 +1090,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		arguments: Arguments<'_>,
 		span: TextSpan,
 	) -> (ExprIdx, TypeIndex) {
-		let target = CallTarget::function(self.cx, function);
+		let target = CallTarget::function(self.sema, function);
 		let mut type_args: Box<[TypeIndex]> =
-			self.cx.types.list(type_args).into();
+			self.sema.types.list(type_args).into();
 		let mut given = Vec::new();
 		let reported = self.build_arguments(
 			&target,
@@ -1069,7 +1102,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			span,
 		);
 		self.expect_arguments(&target, &type_args, &given);
-		let return_type = self.cx.functions[usize::from(function)].return_type;
+		let return_type =
+			self.sema.functions[usize::from(function)].return_type;
 		let result =
 			self.instantiate(return_type, target.generic_env, &type_args);
 		let args = self
@@ -1085,17 +1119,17 @@ impl BodyContext<'_, '_, '_, '_> {
 		assoc: Option<AssocTypeIdx>,
 	) -> TypeIndex {
 		let (Some(trait_index), Some(assoc_type_index)) =
-			(self.cx.defs.intrinsics.call, assoc)
+			(self.sema.decls.intrinsics.call, assoc)
 		else {
 			return TypeIndex::ERROR;
 		};
-		let projection = self.cx.types.intern(Type::TypeProjection {
+		let projection = self.sema.types.intern(Type::TypeProjection {
 			trait_index,
 			assoc_type_index,
 			base: ty,
 		});
-		let projection = self.normalized(projection, self.scope.assumption_env);
-		self.cx.types.collapse_error(projection)
+		let projection = self.context().normalized(projection);
+		self.sema.types.collapse_error(projection)
 	}
 
 	/// A call's arguments as a tuple of `values`, spanning them (the call's
@@ -1127,11 +1161,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		value: ExprIdx,
 		ty: TypeIndex,
 	) -> Option<ValueCallee> {
-		if self.cx.types.has_error(ty) {
+		if self.sema.types.has_error(ty) {
 			return None;
 		}
-		let call = self.cx.defs.intrinsics.call.and_then(|call_trait| {
-			let members = &self.cx.defs.traits[usize::from(call_trait)].members;
+		let call = self.sema.decls.intrinsics.call.and_then(|call_trait| {
+			let members =
+				&self.sema.decls.traits[usize::from(call_trait)].members;
 			members.iter().find_map(|member| match member.kind {
 				MemberKind::Method(function) => Some((call_trait, function)),
 				_ => None,
@@ -1142,16 +1177,17 @@ impl BodyContext<'_, '_, '_, '_> {
 			return None;
 		};
 		// A trait's declaration is selected over `[Self]`.
-		let over_self = |cx| Callee::new(cx, declaration, &[ty], 1);
+		let over_self = |sema| Callee::new(sema, declaration, &[ty], 1);
 		// A function item's impl is its own, which requires its function's
 		// bounds, proven where the item was named.
-		if let Type::Function { .. } = self.cx.types.resolve(ty) {
-			return Some(ValueCallee::Call(over_self(self.cx)));
+		if let Type::Function { .. } = self.sema.types.resolve(ty) {
+			return Some(ValueCallee::Call(over_self(self.sema)));
 		}
-		let found = if self.cx.types.needs_context(ty) {
+		let found = if self.sema.types.needs_context(ty) {
 			Ok(None)
 		} else {
-			self.cx.find_trait_impl_query(
+			self.sema.find_trait_impl_query(
+				self.builder.strings,
 				self.scope.assumption_env,
 				ty,
 				call_trait,
@@ -1159,21 +1195,21 @@ impl BodyContext<'_, '_, '_, '_> {
 		};
 		let callee = match found {
 			Ok(Some(TraitImplLookup::Concrete { impl_index, args })) => {
-				match self.cx.defs.select_trait_member(
+				match self.sema.decls.select_trait_member(
 					impl_index,
 					MemberKind::Method(declaration),
 				) {
 					TraitMemberSelection::Impl(
 						MemberKind::Method(function)
 						| MemberKind::Function(function),
-					) => Callee::new(self.cx, function, &args, args.len()),
-					_ => over_self(self.cx),
+					) => Callee::new(self.sema, function, &args, args.len()),
+					_ => over_self(self.sema),
 				}
 			}
-			Ok(Some(TraitImplLookup::Abstract)) => over_self(self.cx),
+			Ok(Some(TraitImplLookup::Abstract)) => over_self(self.sema),
 			Ok(Some(TraitImplLookup::Builtin)) => {
 				let Type::TypedFuncref { param, result } =
-					*self.cx.types.resolve(ty)
+					*self.sema.types.resolve(ty)
 				else {
 					unreachable!(
 						"only a function reference is called by a rule"
@@ -1190,14 +1226,16 @@ impl BodyContext<'_, '_, '_, '_> {
 					SourceSpan::new(self.scope.file_id, self.body.span(value));
 				match error {
 					SolverError::Overflow => {
-						self.cx
+						self.sema
 							.diagnostics
-							.push(self.cx.overflow_diagnostic(reference));
+							.push(self.sema.overflow_diagnostic(reference));
 					}
 					SolverError::Cycle(cycle) => {
-						self.cx
-							.diagnostics
-							.push(self.cx.cycle_diagnostic(&cycle, reference));
+						self.sema.diagnostics.push(self.sema.cycle_diagnostic(
+							self.builder.strings,
+							&cycle,
+							reference,
+						));
 					}
 					_ => {}
 				}
@@ -1222,7 +1260,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			let value = self.build(&argument.inner, args_type);
 			return self.expect(value, args_type);
 		}
-		let element_types = match *self.cx.types.resolve(args_type) {
+		let element_types = match *self.sema.types.resolve(args_type) {
 			Type::Tuple { elements } if elements.len() == arguments.len() => {
 				Some(elements)
 			}
@@ -1242,7 +1280,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			.enumerate()
 			.map(|(at, argument)| {
 				let hint = element_types.map_or(TypeIndex::ERROR, |types| {
-					self.cx.types.list(types)[at]
+					self.sema.types.list(types)[at]
 				});
 				let value = self.build(&argument.inner, hint);
 				self.expect(value, hint)
@@ -1279,8 +1317,11 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	fn report_not_callable(&mut self, value: ExprIdx, ty: TypeIndex) {
-		let ty = self.cx.type_formatter().display_type(ty);
-		self.cx.diagnostics.push(
+		let ty = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(ty);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TraitBoundViolation.code())
 				.with_message(format!(
@@ -1296,8 +1337,11 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	fn report_named_value_call(&mut self, ty: TypeIndex, span: TextSpan) {
-		let ty = self.cx.type_formatter().display_type(ty);
-		self.cx.diagnostics.push(
+		let ty = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(ty);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::PositionalOnlyCall.code())
 				.with_message(format!(
@@ -1315,7 +1359,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		found: usize,
 		span: TextSpan,
 	) {
-		let expected = match *self.cx.types.resolve(args_type) {
+		let expected = match *self.sema.types.resolve(args_type) {
 			Type::Tuple { elements } if elements.is_empty() => {
 				"no arguments".to_string()
 			}
@@ -1324,12 +1368,12 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			_ => "1 argument".to_string(),
 		};
-		let formatter = self.cx.type_formatter();
+		let formatter = self.sema.type_formatter(self.builder.strings);
 		let (callee_type, args_type) = (
 			formatter.display_type(callee_type),
 			formatter.display_type(args_type),
 		);
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::ArgumentCountMismatch.code())
 				.with_message(format!(

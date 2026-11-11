@@ -26,6 +26,7 @@
 
 mod blocks;
 mod calls;
+mod decide;
 mod exhaustiveness;
 mod members;
 mod patterns;
@@ -44,14 +45,14 @@ use super::body::{
 	ExprRange, LocalIdx, Obligations, Scope, ScopeIdx, ScopeKind,
 };
 use super::bounds::AssumptionEnvIdx;
-use super::defs::{
-	BindingTarget, ConstIdx, DefKey, DefKind, FunctionIdx, MemberKind,
+use super::decls::{
+	BindingTarget, ConstIdx, DeclKey, DeclKind, FunctionIdx, MemberKind,
 	StructIdx, Tier, Visibility,
 };
 use super::imports::report_private_identifier;
 use super::literals::{
 	CharLiteralError, CharMiss, ConcreteType, FloatMiss, Integer, IntegerMiss,
-	UntypedValue, parse_char_literal, unescape_string_literal,
+	parse_char_literal, unescape_string_literal,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::obligations::BoundRequirements;
@@ -60,28 +61,45 @@ use super::operators::{
 };
 use super::paths::{PathResolver, PathWalk};
 use super::resolutions::Referent;
-use super::signatures::{InferPolicy, LexicalScope, TypeContext};
+use super::signatures::{
+	InferPolicy, LexicalScope, Semantics, SemanticsBuilder,
+};
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{
 	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
 	TypeIndex,
 };
 use crate::ast::{
-	self, BinaryOp, Keyword, Ownership, Separated, Spanned, UnaryOp,
+	self, BinaryOp, Keyword, Ownership, Separated, Spanned, StringInterner,
+	UnaryOp,
 };
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
 use members::Expected;
 
-/// Checks the expressions of one definition into a `Body`.
-pub(super) struct BodyContext<'a, 'ast, 'ctx, 'dispatch> {
-	cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
-	body: Body,
-	/// What lowering the body's types and expressions left to decide.
-	obligations: Obligations,
+/// A body in the scope it is written in: what is valid on it whatever wrote
+/// it. It normalizes, compares, reports, checks usefulness and decides what
+/// building left open, and knows nothing about syntax.
+pub(super) struct BodyContext<'a> {
+	sema: &'a mut Semantics,
+	strings: &'a StringInterner,
+	body: &'a mut Body,
 	/// Where the expressions are written. Its type scope is the root for a
 	/// free constant, the impl's or trait's `Self` scope for an associated one,
 	/// the function's own for a function's block.
+	scope: LexicalScope,
+}
+
+/// Builds the expressions of one definition into a `Body` from its written
+/// syntax. What is valid on the body whatever wrote it is its `BodyContext`'s.
+pub(super) struct BodyBuilder<'a, 'ast> {
+	sema: &'a mut Semantics,
+	/// What lowers the written types and paths the body names.
+	builder: &'a mut SemanticsBuilder<'ast>,
+	body: Body,
+	/// What lowering the body's types and expressions left to decide.
+	obligations: Obligations,
+	/// Where the expressions are written (`BodyContext::scope`).
 	scope: LexicalScope,
 	owner: BodyOwner,
 	/// The block scope being checked.
@@ -122,14 +140,256 @@ struct ScopeType {
 	ty: TypeIndex,
 }
 
-impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
+impl<'a> BodyContext<'a> {
 	pub(super) fn new(
-		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
+		sema: &'a mut Semantics,
+		strings: &'a StringInterner,
+		body: &'a mut Body,
+		scope: LexicalScope,
+	) -> Self {
+		Self {
+			sema,
+			strings,
+			body,
+			scope,
+		}
+	}
+
+	/// What a type means in this body's scope: comparisons and literal coercion
+	/// work on normalized types.
+	fn normalized(&mut self, ty: TypeIndex) -> TypeIndex {
+		self.normalized_in(ty, self.scope.assumption_env)
+	}
+
+	/// What a type means in `scope`. A projection that does not normalize stays
+	/// as written; whoever wrote it has reported why.
+	fn normalized_in(
+		&mut self,
+		ty: TypeIndex,
+		scope: AssumptionEnvIdx,
+	) -> TypeIndex {
+		match self.sema.normalize(
+			self.strings,
+			scope,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+		) {
+			Ok(normalized) => normalized,
+			Err(_) => ty,
+		}
+	}
+
+	/// `ty` in this body's scope, rewritten by `facts`. A normalization that
+	/// diverges is reported here, at `site`, once; `Err` means the failure is
+	/// explained (here, or by its owner) and the caller only recovers.
+	fn normalize_at(
+		&mut self,
+		ty: TypeIndex,
+		facts: RewriteFlags,
+		site: TextSpan,
+	) -> Result<TypeIndex, ()> {
+		let site = SourceSpan::new(self.scope.file_id, site);
+		match self.sema.normalize(
+			self.strings,
+			self.scope.assumption_env,
+			ty,
+			NormalizationDepth::Deep,
+			facts,
+		) {
+			Ok(ty) => Ok(ty),
+			// Its owner reported it.
+			Err(SolverError::Poisoned) => Err(()),
+			Err(SolverError::Overflow) => {
+				self.sema
+					.diagnostics
+					.push(self.sema.overflow_diagnostic(site));
+				Err(())
+			}
+			Err(SolverError::Cycle(cycle)) => {
+				let diagnostic =
+					self.sema.cycle_diagnostic(self.strings, &cycle, site);
+				self.sema.diagnostics.push(diagnostic);
+				Err(())
+			}
+			Err(SolverError::Pending) => {
+				unreachable!("every signature is final when bodies are checked")
+			}
+		}
+	}
+
+	/// Whether two types are equal once `facts` have rewritten both. `Err`
+	/// means one does not normalize and that is explained: by its owner, or
+	/// here, at `site`.
+	fn equality(
+		&mut self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		facts: RewriteFlags,
+		site: TextSpan,
+	) -> Result<TypeEquality, ()> {
+		if expected == actual {
+			return Ok(TypeEquality::Equal);
+		}
+		if !self.sema.types.has_projection(expected)
+			&& !self.sema.types.has_projection(actual)
+		{
+			return Ok(TypeEquality::Diff);
+		}
+		let expected = self.normalize_at(expected, facts, site)?;
+		let actual = self.normalize_at(actual, facts, site)?;
+		Ok(if expected == actual {
+			TypeEquality::Equal
+		} else if !facts.contains(RewriteFlags::VALUES)
+			&& (self.sema.types.has_const(expected)
+				|| self.sema.types.has_const(actual))
+		{
+			TypeEquality::NeedsValues
+		} else {
+			TypeEquality::Diff
+		})
+	}
+
+	/// A field's type, as expected of the value given for it: as declared,
+	/// with the struct's type arguments `args` for its parameters. An argument
+	/// not known yet leaves its parts `INFER`, which expect nothing.
+	fn field_type(
+		&mut self,
+		struct_index: StructIdx,
+		args: &[TypeIndex],
+		field: usize,
+	) -> TypeIndex {
+		let ty = self
+			.sema
+			.types
+			.list(self.sema.structs[usize::from(struct_index)].field_types)[field];
+		let ty = self.sema.types.substitute(
+			ty,
+			Substitution {
+				envs: &self.sema.generic_envs,
+				env: self.sema.structs[usize::from(struct_index)].type_params,
+				args,
+			},
+		);
+		let ty = self.normalized(ty);
+		self.sema.types.collapse_error(ty)
+	}
+
+	/// What a string or array literal can become, read off `target`: a
+	/// shared pointer to an array or a slice, or an array in no memory (a
+	/// constant's type).
+	fn static_target(&self, target: TypeIndex) -> Option<StaticTarget> {
+		let (to, memory) = match *self.sema.types.resolve(target) {
+			Type::Pointer {
+				to,
+				memory,
+				ownership: Ownership::Shared,
+			} => (to, Some(memory)),
+			_ => (target, None),
+		};
+		match *self.sema.types.resolve(to) {
+			Type::Array { of, length } => Some(StaticTarget {
+				of,
+				memory,
+				length: Some(length),
+			}),
+			Type::Slice { of } if memory.is_some() => Some(StaticTarget {
+				of,
+				memory,
+				length: None,
+			}),
+			_ => None,
+		}
+	}
+
+	fn source_span(&self, expr: ExprIdx) -> SourceSpan {
+		SourceSpan::new(self.scope.file_id, self.body.span(expr))
+	}
+
+	/// Reports at `expr` and leaves it at `ERROR`, so nothing reports it again.
+	fn push_error(
+		&mut self,
+		code: DiagnosticCode,
+		message: String,
+		expr: ExprIdx,
+	) {
+		self.sema.diagnostics.push(
+			Diagnostic::error()
+				.with_code(code.code())
+				.with_message(message)
+				.with_label(self.source_span(expr).primary_label()),
+		);
+		self.body.set_ty(expr, TypeIndex::ERROR);
+	}
+
+	/// Reports `diagnostic` about `expr` and leaves `expr` at `ERROR`, so
+	/// nothing reports it again.
+	fn reject(&mut self, expr: ExprIdx, diagnostic: Diagnostic<FileId>) {
+		self.sema.diagnostics.push(diagnostic);
+		self.body.set_ty(expr, TypeIndex::ERROR);
+	}
+
+	fn report_mismatch(&mut self, expr: ExprIdx, expected: TypeIndex) {
+		let actual = self.body.ty(expr);
+		let diagnostic = self.report_type_mismatch(expected, actual, expr);
+		self.sema.diagnostics.push(diagnostic);
+		// Reported: nothing reads a value from it, or reports it again.
+		self.body.set_ty(expr, TypeIndex::ERROR);
+	}
+
+	fn report_type_mismatch(
+		&self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		expr: ExprIdx,
+	) -> Diagnostic<FileId> {
+		self.mismatch_at(expected, actual, self.body.span(expr))
+	}
+
+	fn report_unable_to_coerce(
+		&self,
+		expr: ExprIdx,
+		target: TypeIndex,
+	) -> Diagnostic<FileId> {
+		Diagnostic::error()
+			.with_code(DiagnosticCode::UnableToCoerce.code())
+			.with_message(format!(
+				"unable to coerce to type `{}`",
+				self.sema.type_formatter(self.strings).display_type(target)
+			))
+			.with_label(self.source_span(expr).primary_label())
+	}
+
+	fn mismatch_at(
+		&self,
+		expected: TypeIndex,
+		actual: TypeIndex,
+		span: TextSpan,
+	) -> Diagnostic<FileId> {
+		let formatter = self.sema.type_formatter(self.strings);
+		Diagnostic::error()
+			.with_code(DiagnosticCode::TypeMistmatch.code())
+			.with_message("type mismatch")
+			.with_label(Label::primary(self.scope.file_id, span).with_message(
+				format!(
+					"expected `{}`, found `{}`",
+					formatter.display_type(expected),
+					formatter.display_type(actual)
+				),
+			))
+	}
+}
+
+impl<'a, 'ast> BodyBuilder<'a, 'ast> {
+	pub(super) fn new(
+		sema: &'a mut Semantics,
+		builder: &'a mut SemanticsBuilder<'ast>,
 		scope: LexicalScope,
 		owner: BodyOwner,
 	) -> Self {
 		Self {
-			cx,
+			sema,
+			builder,
 			body: Body::default(),
 			obligations: Obligations::default(),
 			scope,
@@ -155,48 +415,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		built
 	}
 
-	/// Decides what building a body recorded, once every constant body is
-	/// built and every declaration is checked, and reports what fails.
-	pub(super) fn decide_obligations(
-		cx: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
-		scope: LexicalScope,
-		owner: BodyOwner,
-		body: Body,
-		obligations: Obligations,
-	) -> Body {
-		let mut this = Self::new(cx, scope, owner);
-		this.body = body;
-		this.obligations = obligations;
-		this.decide();
-		this.body
-	}
-
-	/// Decides every recorded obligation, reading values.
-	fn decide(&mut self) {
-		let obligations = std::mem::take(&mut self.obligations);
-		for obligation in &obligations.types {
-			self.cx
-				.check_obligation(obligation)
-				.expect("every signature and every constant body exists");
-		}
-		for check in obligations.exprs {
-			match check {
-				ExprObligation::Equal { expr, expected } => {
-					self.decide_equal(expr, expected);
-				}
-				ExprObligation::StaticLength {
-					expr,
-					target,
-					length,
-				} => self.decide_static_length(expr, target, length),
-				ExprObligation::Match(expr) => {
-					self.check_match_usefulness(expr)
-				}
-				ExprObligation::Representable { expr, target } => {
-					self.decide_representable(expr, target)
-				}
-			}
-		}
+	/// The body built so far, in its scope.
+	fn context(&mut self) -> BodyContext<'_> {
+		BodyContext::new(
+			self.sema,
+			self.builder.strings,
+			&mut self.body,
+			self.scope,
+		)
 	}
 
 	/// Checks `expr` as the whole body, against `expected`.
@@ -205,7 +431,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expr: &Spanned<ast::Expression>,
 		expected: TypeIndex,
 	) -> (Body, Obligations) {
-		let expected = self.normalized(expected, self.scope.assumption_env);
+		let expected = self.context().normalized(expected);
 		self.enter_root(expr.span, expected);
 		self.check(expr, expected);
 		(self.body, self.obligations)
@@ -250,7 +476,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					.push(ExprKind::NextDiscriminant(previous), repr, span)
 			}
 			(None, None) => {
-				self.cx.diagnostics.push(
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::EnumVariantRequiresExplicitValue
@@ -289,14 +515,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return expr;
 		}
 		let actual = self.body.ty(expr);
-		if self.cx.types.needs_context(actual) {
+		if self.sema.types.needs_context(actual) {
 			self.coerce(expr, expected);
 		} else if actual != TypeIndex::ERROR
 			&& actual != TypeIndex::NEVER
 			&& actual != expected
 		{
 			let span = self.body.span(expr);
-			match self.equality(
+			match self.context().equality(
 				expected,
 				actual,
 				RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
@@ -311,98 +537,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						.push(ExprObligation::Equal { expr, expected });
 					return expr;
 				}
-				Ok(TypeEquality::Diff) => self.report_mismatch(expr, expected),
+				Ok(TypeEquality::Diff) => {
+					self.context().report_mismatch(expr, expected)
+				}
 				// Explained: nothing reads a value from it, and no mismatch
 				// on top.
 				Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
 			}
 		}
 		expr
-	}
-
-	/// Decides a recorded `Equal`, now that constants have values.
-	fn decide_equal(&mut self, expr: ExprIdx, expected: TypeIndex) {
-		let actual = self.body.ty(expr);
-		let span = self.body.span(expr);
-		match self.equality(expected, actual, RewriteFlags::ALL, span) {
-			Ok(TypeEquality::Equal) => {}
-			Ok(_) => self.report_mismatch(expr, expected),
-			Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
-		}
-	}
-
-	/// Whether two types are equal once `facts` have rewritten both. `Err`
-	/// means one does not normalize and that is explained: by its owner, or
-	/// here, at `site`.
-	fn equality(
-		&mut self,
-		expected: TypeIndex,
-		actual: TypeIndex,
-		facts: RewriteFlags,
-		site: TextSpan,
-	) -> Result<TypeEquality, ()> {
-		if expected == actual {
-			return Ok(TypeEquality::Equal);
-		}
-		if !self.cx.types.has_projection(expected)
-			&& !self.cx.types.has_projection(actual)
-		{
-			return Ok(TypeEquality::Diff);
-		}
-		let expected = self.normalize_at(expected, facts, site)?;
-		let actual = self.normalize_at(actual, facts, site)?;
-		Ok(if expected == actual {
-			TypeEquality::Equal
-		} else if !facts.contains(RewriteFlags::VALUES)
-			&& (self.cx.types.has_const(expected)
-				|| self.cx.types.has_const(actual))
-		{
-			TypeEquality::NeedsValues
-		} else {
-			TypeEquality::Diff
-		})
-	}
-
-	/// `ty` in this body's scope, rewritten by `facts`. A normalization that
-	/// diverges is reported here, at `site`, once; `Err` means the failure is
-	/// explained (here, or by its owner) and the caller only recovers.
-	fn normalize_at(
-		&mut self,
-		ty: TypeIndex,
-		facts: RewriteFlags,
-		site: TextSpan,
-	) -> Result<TypeIndex, ()> {
-		let site = SourceSpan::new(self.scope.file_id, site);
-		match self.cx.normalize(
-			self.scope.assumption_env,
-			ty,
-			NormalizationDepth::Deep,
-			facts,
-		) {
-			Ok(ty) => Ok(ty),
-			// Its owner reported it.
-			Err(SolverError::Poisoned) => Err(()),
-			Err(SolverError::Overflow) => {
-				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
-				Err(())
-			}
-			Err(SolverError::Cycle(cycle)) => {
-				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
-				self.cx.diagnostics.push(diagnostic);
-				Err(())
-			}
-			Err(SolverError::Pending) => {
-				unreachable!("every signature is final when bodies are checked")
-			}
-		}
-	}
-
-	fn report_mismatch(&mut self, expr: ExprIdx, expected: TypeIndex) {
-		let actual = self.body.ty(expr);
-		let diagnostic = self.report_type_mismatch(expected, actual, expr);
-		self.cx.diagnostics.push(diagnostic);
-		// Reported: nothing reads a value from it, or reports it again.
-		self.body.set_ty(expr, TypeIndex::ERROR);
 	}
 
 	/// Lowers `expr`. `expected` is the type the context hints at this site:
@@ -495,7 +638,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				self.build_address_of(value, span)
 			}
 			ast::Expression::Placeholder => {
-				self.cx.diagnostics.push(
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::InvalidAssignmentTarget.code(),
@@ -562,13 +705,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// Reports that `value`, untyped, needs a type from its context, and
 	/// leaves it at `ERROR`.
 	fn report_annotation_required(&mut self, value: ExprIdx) {
-		self.cx.diagnostics.push(
+		let at = self.context().source_span(value);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TypeAnnotationRequired.code())
 				.with_message("type annotation required")
 				.with_label(
-					self.source_span(value)
-						.primary_label()
+					at.primary_label()
 						.with_message("the type of this value is not known"),
 				),
 		);
@@ -576,7 +719,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	fn report_unsupported(&mut self, span: TextSpan, what: &str) {
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::bug()
 				.with_code(DiagnosticCode::UnsupportedExpression.code())
 				.with_message(format!("checking {what} is not supported yet"))
@@ -598,7 +741,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if let [element] = elements {
 			return self.build(&element.inner, expected);
 		}
-		let hints = match *self.cx.types.resolve(expected) {
+		let hints = match *self.sema.types.resolve(expected) {
 			Type::Tuple { elements: hints }
 				if hints.len() == elements.len() =>
 			{
@@ -610,15 +753,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let mut types = Vec::with_capacity(elements.len());
 		for (at, element) in elements.iter().enumerate() {
 			let hint = match hints {
-				Some(hints) => self.cx.types.list(hints)[at],
+				Some(hints) => self.sema.types.list(hints)[at],
 				None => TypeIndex::INFER,
 			};
 			let value = self.build(&element.inner, hint);
 			values.push(value);
 			types.push(self.body.ty(value));
 		}
-		let ty = self.cx.types.intern_tuple(&types);
-		let ty = self.cx.types.collapse_error(ty);
+		let ty = self.sema.types.intern_tuple(&types);
+		let ty = self.sema.types.collapse_error(ty);
 		let elements = self.body.push_args(values);
 		let kind = ExprKind::Tuple {
 			elements,
@@ -647,12 +790,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let of = values
 			.iter()
 			.map(|&value| self.body.ty(value))
-			.find(|&ty| !self.cx.types.has_literal(ty))
+			.find(|&ty| !self.sema.types.has_literal(ty))
 			.or_else(|| values.first().map(|&value| self.body.ty(value)))
 			.unwrap_or(hint);
 		let bits = u64::try_from(values.len()).unwrap();
-		let length = self.cx.types.intern(Type::Value { bits });
-		let ty = self.cx.types.intern(Type::Array { of, length });
+		let length = self.sema.types.intern(Type::Value { bits });
+		let ty = self.sema.types.intern(Type::Array { of, length });
 		let elements = self.body.push_args(values);
 		let expr = self.body.push(ExprKind::Array { elements }, ty, span);
 		self.body.push_static(expr);
@@ -683,7 +826,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = if length == TypeIndex::ERROR {
 			TypeIndex::ERROR
 		} else {
-			self.cx.types.intern(Type::Array { of, length })
+			self.sema.types.intern(Type::Array { of, length })
 		};
 		let expr =
 			self.body
@@ -708,7 +851,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				))
 			}
 			ast::ConstArgument::Literal(_) => {
-				self.cx.diagnostics.push(
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::TypeMistmatch.code())
 						.with_message("an array's length is an integer")
@@ -746,11 +889,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn repeat_length(&mut self, count: ExprIdx) -> TypeIndex {
 		match self.body.kind(count) {
 			_ if self.body.ty(count) == TypeIndex::ERROR => TypeIndex::ERROR,
-			ExprKind::Int(bits) => self.cx.types.intern(Type::Value { bits }),
+			ExprKind::Int(bits) => self.sema.types.intern(Type::Value { bits }),
 			ExprKind::Const {
 				constant,
 				type_args,
-			} if type_args.is_empty() => self.cx.types.intern_const(constant, &[]),
+			} if type_args.is_empty() => self.sema.types.intern_const(constant, &[]),
 			// An impl's constant may depend on the impl's arguments, which
 			// evaluation does not substitute (yet).
 			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
@@ -762,7 +905,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				TypeIndex::ERROR
 			}
 			_ => {
-				self.push_error(
+				self.context().push_error(
 					DiagnosticCode::ArrayRepeatCountNotConst,
 					"an array's length is a literal or a constant".to_string(),
 					count,
@@ -775,11 +918,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// The element type an expected array or slice, or a pointer to one,
 	/// gives its literal's elements; no constraint otherwise.
 	fn array_element_hint(&self, expected: TypeIndex) -> TypeIndex {
-		let expected = match *self.cx.types.resolve(expected) {
+		let expected = match *self.sema.types.resolve(expected) {
 			Type::Pointer { to, .. } => to,
 			_ => expected,
 		};
-		match *self.cx.types.resolve(expected) {
+		match *self.sema.types.resolve(expected) {
 			Type::Array { of, .. } | Type::Slice { of } => of,
 			_ => TypeIndex::INFER,
 		}
@@ -788,13 +931,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// A string literal is the byte array of its length (`[u8; 5]`), data in
 	/// no memory until its context places it (`coerce_static`).
 	fn build_string(&mut self, span: TextSpan) -> ExprIdx {
-		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
+		let source =
+			&self.builder.files.get(self.scope.file_id).unwrap().source;
 		match unescape_string_literal(span.extract_str(source)) {
 			Ok(contents) => {
 				let bits = u64::try_from(contents.len()).unwrap();
-				let symbol = self.cx.strings.get_or_intern(contents);
-				let length = self.cx.types.intern(Type::Value { bits });
-				let ty = self.cx.types.intern(Type::Array {
+				let symbol = self.builder.strings.get_or_intern(contents);
+				let length = self.sema.types.intern(Type::Value { bits });
+				let ty = self.sema.types.intern(Type::Array {
 					of: TypeIndex::U8,
 					length,
 				});
@@ -803,7 +947,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				expr
 			}
 			Err(error) => {
-				self.cx.diagnostics.push(
+				self.sema.diagnostics.push(
 					error.diagnostic(SourceSpan::new(self.scope.file_id, span)),
 				);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
@@ -812,7 +956,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	fn build_char(&mut self, span: TextSpan) -> ExprIdx {
-		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
+		let source =
+			&self.builder.files.get(self.scope.file_id).unwrap().source;
 		match parse_char_literal(span.extract_str(source)) {
 			Ok(value) => self.body.push(
 				ExprKind::Char(value),
@@ -826,7 +971,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						"character literal may only contain one codepoint"
 					}
 				};
-				self.cx.diagnostics.push(
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::InvalidCharacterLiteral.code(),
@@ -877,56 +1022,57 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			Err(error) => return error,
 		};
-		let Some(key) = walk.target.def_key() else {
+		let Some(key) = walk.target.decl_key() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
-		let kind = key.symbol_kind(self.cx.defs);
+		let kind = key.symbol_kind(&self.sema.decls);
 		// A bare struct name is an error of its own, whoever may construct it.
 		if let BindingTarget::Inaccessible(_) = walk.target
-			&& !matches!(kind, DefKind::Struct(_))
+			&& !matches!(kind, DeclKind::Struct(_))
 		{
 			let segment = &segments[walk.stopped_at as usize];
-			self.cx.diagnostics.push(report_private_identifier(
-				&self.cx.defs.namespaces,
-				self.cx.strings,
+			self.sema.diagnostics.push(report_private_identifier(
+				&self.sema.decls.namespaces,
+				self.builder.strings,
 				segment.ident.inner,
 				SourceSpan::new(self.scope.file_id, segment.ident.span),
 				Some(key),
 			));
 		}
 		match kind {
-			DefKind::Const(const_index) | DefKind::EnumVariant(const_index) => {
-				let signature = &self.cx.constants[usize::from(const_index)];
-				let ty = self.normalized(
-					signature.ty,
-					self.cx.assumption_envs.of_frame(signature.env),
-				);
+			DeclKind::Const(const_index)
+			| DeclKind::EnumVariant(const_index) => {
+				let signature = &self.sema.constants[usize::from(const_index)];
+				let ty = signature.ty;
+				let env = self.sema.assumption_envs.of_frame(signature.env);
+				let ty = self.context().normalized_in(ty, env);
 				let kind = ExprKind::Const {
 					constant: const_index,
 					type_args: GenericArgs::EMPTY,
 				};
 				self.body.push(kind, ty, span)
 			}
-			DefKind::Struct(struct_index) => {
-				let name = self.cx.defs.structs[usize::from(struct_index)].name;
+			DeclKind::Struct(struct_index) => {
+				let name =
+					self.sema.decls.structs[usize::from(struct_index)].name;
 				self.report_struct_used_as_value(name.inner, span);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
-			DefKind::Function(function_index) => self.build_function_value(
-				Callee::new(self.cx, function_index, &[], 0),
+			DeclKind::Function(function_index) => self.build_function_value(
+				Callee::new(self.sema, function_index, &[], 0),
 				segments.last().unwrap(),
 				expected,
 				span,
 			),
 			// A global's name is its handle, of its own nominal type: its value
 			// is read with `Global::get` and written with `GlobalMut::set`.
-			DefKind::Global(global_index) => {
-				let ty = self.cx.types.intern(Type::Global { global_index });
+			DeclKind::Global(global_index) => {
+				let ty = self.sema.types.intern(Type::Global { global_index });
 				self.body.push(ExprKind::Global(global_index), ty, span)
 			}
 			// A memory's name is its handle, as a global's is.
-			DefKind::Memory(memory_index) => {
-				let ty = self.cx.types.intern(Type::Memory { memory_index });
+			DeclKind::Memory(memory_index) => {
+				let ty = self.sema.types.intern(Type::Memory { memory_index });
 				self.body.push(ExprKind::Memory(memory_index), ty, span)
 			}
 			_ => {
@@ -950,12 +1096,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if !prefix.is_empty()
 			&& (first == Keyword::SelfPascal.symbol()
 				|| self
-					.cx
+					.sema
 					.generic_envs
 					.resolve(self.scope.generic_env, first)
 					.is_some())
 		{
-			let receiver = self.cx.resolve_type_path(
+			let receiver = self.builder.resolve_type_path(
+				self.sema,
 				&mut self.obligations.types,
 				self.scope,
 				prefix,
@@ -964,10 +1111,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			return Ok(ValuePath::Member(MemberPath::new(receiver, member)));
 		}
 		let walk = PathResolver::new(
-			self.cx.diagnostics,
-			self.cx.resolutions,
-			self.cx.strings,
-			self.cx.defs,
+			&mut self.sema.diagnostics,
+			&mut self.sema.resolutions,
+			self.builder.strings,
+			&self.sema.decls,
 		)
 		.walk_path(
 			self.scope.file_id,
@@ -975,7 +1122,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			segments,
 			Tier::Value,
 		);
-		let Some(key) = walk.target.def_key() else {
+		let Some(key) = walk.target.decl_key() else {
 			return Ok(ValuePath::Item(walk));
 		};
 		if walk.is_complete(segments) {
@@ -986,10 +1133,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// A generic struct named without its arguments leaves them to the
 		// call to learn, as its construction does (`Layout::of::<T>()`).
 		if stopped.type_args.is_empty()
-			&& let DefKind::Struct(struct_index) = key.symbol_kind(self.cx.defs)
+			&& let DeclKind::Struct(struct_index) =
+				key.symbol_kind(&self.sema.decls)
 		{
-			let params = self.cx.structs[usize::from(struct_index)].type_params;
-			let count = self.cx.generic_envs.param_names(params).len();
+			let params =
+				self.sema.structs[usize::from(struct_index)].type_params;
+			let count = self.sema.generic_envs.param_names(params).len();
 			if count > 0 {
 				if stop + 1 != prefix.len() {
 					return Err(self.unsupported(
@@ -997,7 +1146,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						"a path past a generic type without its type arguments",
 					));
 				}
-				let receiver = self.cx.types.intern_struct(
+				let receiver = self.sema.types.intern_struct(
 					struct_index,
 					&vec![TypeIndex::INFER; count],
 				);
@@ -1006,14 +1155,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				)));
 			}
 		}
-		let head = self.cx.resolve_named_type(
+		let head = self.builder.resolve_named_type(
+			self.sema,
 			&mut self.obligations.types,
 			self.scope,
 			key,
 			stopped,
 			InferPolicy::Allow,
 		);
-		let receiver = self.cx.resolve_type_member_path(
+		let receiver = self.builder.resolve_type_member_path(
+			self.sema,
 			&mut self.obligations.types,
 			self.scope,
 			head,
@@ -1043,7 +1194,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	fn record_local(&mut self, local: LocalIdx, span: TextSpan) {
-		self.cx.resolutions.record(
+		self.sema.resolutions.record(
 			(SourceSpan::new(self.scope.file_id, span), Tier::Value),
 			Referent::Local {
 				owner: self.owner,
@@ -1112,7 +1263,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					None,
 					segment,
 				);
-				self.cx.diagnostics.push(diagnostic);
+				self.sema.diagnostics.push(diagnostic);
 			}
 			return self.build_construction(
 				struct_index,
@@ -1139,33 +1290,33 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				return error;
 			}
 		};
-		let Some(key) = walk.target.def_key() else {
+		let Some(key) = walk.target.decl_key() else {
 			self.build_unchecked_arguments(arguments);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
-		let kind = key.symbol_kind(self.cx.defs);
+		let kind = key.symbol_kind(&self.sema.decls);
 		// Any other item is called as the value it names.
-		if !matches!(kind, DefKind::Struct(_) | DefKind::Function(_)) {
+		if !matches!(kind, DeclKind::Struct(_) | DeclKind::Function(_)) {
 			let callee =
 				self.build_path(segments, TypeIndex::INFER, callee.span);
 			return self.build_value_call(callee, arguments, span);
 		}
-		let DefKind::Struct(struct_index) = kind else {
+		let DeclKind::Struct(struct_index) = kind else {
 			if let BindingTarget::Inaccessible(_) = walk.target {
 				let segment = &segments[walk.stopped_at as usize];
-				self.cx.diagnostics.push(report_private_identifier(
-					&self.cx.defs.namespaces,
-					self.cx.strings,
+				self.sema.diagnostics.push(report_private_identifier(
+					&self.sema.decls.namespaces,
+					self.builder.strings,
 					segment.ident.inner,
 					SourceSpan::new(self.scope.file_id, segment.ident.span),
 					Some(key),
 				));
 			}
-			let DefKind::Function(function_index) = kind else {
+			let DeclKind::Function(function_index) = kind else {
 				unreachable!("any other item is called as a value")
 			};
 			return self.build_function_call(
-				Callee::new(self.cx, function_index, &[], 0),
+				Callee::new(self.sema, function_index, &[], 0),
 				segments.last().unwrap(),
 				None,
 				arguments,
@@ -1180,7 +1331,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				Some(key),
 				segment,
 			);
-			self.cx.diagnostics.push(diagnostic);
+			self.sema.diagnostics.push(diagnostic);
 		}
 		// The struct's type arguments are learned within this call: from what
 		// is written on its name, the expected type, and then the fields.
@@ -1207,7 +1358,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		let target = CallTarget::struct_constructor(self.cx, struct_index);
+		let target = CallTarget::struct_constructor(self.sema, struct_index);
 		let mut given = Vec::new();
 		let reported = self.build_arguments(
 			&target,
@@ -1220,7 +1371,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let already_reported = expected == TypeIndex::ERROR
 			|| reported
 			|| given.iter().any(|argument| {
-				self.cx.types.has_error(self.body.ty(argument.value))
+				self.sema.types.has_error(self.body.ty(argument.value))
 			});
 		self.settle_uninferred(
 			target.generic_env,
@@ -1233,8 +1384,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		self.check_use_bounds(&target, 0, segment, args);
 		let fields = self
 			.arguments_value(&target, &type_args, &given, 0, reported, span);
-		let ty = self.cx.types.intern_struct(struct_index, &type_args);
-		let ty = self.cx.types.collapse_error(ty);
+		let ty = self.sema.types.intern_struct(struct_index, &type_args);
+		let ty = self.sema.types.collapse_error(ty);
 		// Fields need nothing; the value made of them does.
 		let ty = self.require_stack_value(ty, span);
 		self.body.push(
@@ -1258,8 +1409,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		segment: &ast::PathSegment,
 		expected: TypeIndex,
 	) -> Box<[TypeIndex]> {
-		let params_env = self.cx.structs[usize::from(struct_index)].type_params;
-		let count = self.cx.generic_envs.param_names(params_env).len();
+		let params_env =
+			self.sema.structs[usize::from(struct_index)].type_params;
+		let count = self.sema.generic_envs.param_names(params_env).len();
 		let mut type_args = vec![TypeIndex::INFER; count].into_boxed_slice();
 		self.write_type_args(
 			segment,
@@ -1272,16 +1424,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		// A disagreement teaches nothing: the construction's own type is held
 		// to the expected one where the call is checked.
-		let expected = self.normalized(expected, self.scope.assumption_env);
+		let expected = self.context().normalized(expected);
 		if let Type::Struct {
 			struct_index: hinted,
 			type_args: hints,
-		} = *self.cx.types.resolve(expected)
+		} = *self.sema.types.resolve(expected)
 			&& hinted == struct_index
 		{
 			for at in 0..count {
-				let hint = self.cx.types.list(hints)[at];
-				if let Some(met) = self.cx.types.meet(type_args[at], hint) {
+				let hint = self.sema.types.list(hints)[at];
+				if let Some(met) = self.sema.types.meet(type_args[at], hint) {
 					type_args[at] = met;
 				}
 			}
@@ -1304,13 +1456,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if segment.type_args.is_empty() {
 			return;
 		}
-		let start = self.cx.generic_envs.parent_count(params_env);
-		let len = self.cx.generic_envs.param_names(params_env).len();
+		let start = self.sema.generic_envs.parent_count(params_env);
+		let len = self.sema.generic_envs.param_names(params_env).len();
 		let slots = &mut type_args[start..start + len];
 		// Every written argument is resolved, extra ones too, for their own
 		// diagnostics.
 		for (at, arg) in segment.type_args.iter().enumerate() {
-			let ty = self.cx.resolve_type_argument(
+			let ty = self.builder.resolve_type_argument(
+				self.sema,
 				&mut self.obligations.types,
 				self.scope,
 				arg,
@@ -1322,10 +1475,13 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				*slot = ty;
 			}
 		}
-		if !self
-			.cx
-			.check_type_arg_count(self.scope, segment, params_env, owner)
-		{
+		if !self.sema.check_type_arg_count(
+			self.builder.strings,
+			self.scope,
+			segment,
+			params_env,
+			owner,
+		) {
 			slots.fill(TypeIndex::ERROR);
 		}
 	}
@@ -1336,16 +1492,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// receiver for `Self`), else the name.
 	fn use_args(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		segment: &ast::PathSegment,
 		type_args: &[TypeIndex],
 		given: &[GivenArgument],
 	) -> GenericArgs {
 		let env = target.generic_env;
 		let written_from = (env != GenericEnvIdx::ROOT
-			&& self.cx.generic_envs.owner(env) == target.kind.owner())
-		.then(|| self.cx.generic_envs.parent_count(env));
-		let identity = self.cx.generic_envs.identity_args(env);
+			&& self.sema.generic_envs.owner(env) == target.kind.owner())
+		.then(|| self.sema.generic_envs.parent_count(env));
+		let identity = self.sema.generic_envs.identity_args(env);
 		let body = &self.body;
 		let span_of = |slot: usize| {
 			if let Some(written) = written_from
@@ -1361,7 +1517,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					body.span(argument.value)
 				})
 		};
-		self.cx.generic_args.push(
+		self.sema.generic_args.push(
 			type_args
 				.iter()
 				.enumerate()
@@ -1374,17 +1530,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// proved those.
 	fn check_use_bounds(
 		&mut self,
-		target: &CallTarget<'_>,
+		target: &CallTarget,
 		proven: usize,
 		segment: &ast::PathSegment,
 		args: GenericArgs,
 	) {
 		let mut frame = target.generic_env;
 		while frame != GenericEnvIdx::ROOT {
-			let start = self.cx.generic_envs.parent_count(frame);
+			let start = self.sema.generic_envs.parent_count(frame);
 			if start >= proven {
-				let own = self.cx.generic_envs.param_names(frame).len();
-				self.cx.record_bounds_check(
+				let own = self.sema.generic_envs.param_names(frame).len();
+				self.sema.record_bounds_check(
 					&mut self.obligations.types,
 					self.scope.generic_env,
 					BoundRequirements::Frame {
@@ -1392,10 +1548,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						args: args.prefix(start + own),
 					},
 					SourceSpan::new(self.scope.file_id, segment.ident.span),
-					self.cx.generic_envs.owner(frame),
+					self.sema.generic_envs.owner(frame),
 				);
 			}
-			frame = self.cx.generic_envs.parent(frame).unwrap();
+			frame = self.sema.generic_envs.parent(frame).unwrap();
 		}
 	}
 
@@ -1412,7 +1568,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		args: &mut [TypeIndex],
 	) {
 		for at in 0..args.len() {
-			if !self.cx.types.has_infer(args[at]) {
+			if !self.sema.types.has_infer(args[at]) {
 				continue;
 			}
 			args[at] = TypeIndex::ERROR;
@@ -1420,15 +1576,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				continue;
 			}
 			let frame = self
-				.cx
+				.sema
 				.generic_envs
 				.chain(params_env)
-				.find(|&frame| self.cx.generic_envs.parent_count(frame) <= at)
+				.find(|&frame| self.sema.generic_envs.parent_count(frame) <= at)
 				.unwrap();
-			let index = at - self.cx.generic_envs.parent_count(frame);
-			let name = self.cx.generic_envs.param_names(frame)[index].inner;
-			let name = self.cx.strings.resolve(name).unwrap();
-			self.cx.diagnostics.push(
+			let index = at - self.sema.generic_envs.parent_count(frame);
+			let name = self.sema.generic_envs.param_names(frame)[index].inner;
+			let name = self.builder.strings.resolve(name).unwrap();
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
 					.with_message(format!(
@@ -1440,31 +1596,6 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					),
 			);
 		}
-	}
-
-	/// A field's type, as expected of the value given for it: as declared,
-	/// with the struct's type arguments `args` for its parameters. An argument
-	/// not known yet leaves its parts `INFER`, which expect nothing.
-	fn field_type(
-		&mut self,
-		struct_index: StructIdx,
-		args: &[TypeIndex],
-		field: usize,
-	) -> TypeIndex {
-		let ty = self
-			.cx
-			.types
-			.list(self.cx.structs[usize::from(struct_index)].field_types)[field];
-		let ty = self.cx.types.substitute(
-			ty,
-			Substitution {
-				envs: &self.cx.generic_envs,
-				env: self.cx.structs[usize::from(struct_index)].type_params,
-				args,
-			},
-		);
-		let ty = self.normalized(ty, self.scope.assumption_env);
-		self.cx.types.collapse_error(ty)
 	}
 
 	/// A struct's constructor is as visible as the struct and every one of
@@ -1479,11 +1610,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Option<(StructIdx, Box<[TypeIndex]>)> {
 		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
 		let Some((impl_kind, target)) =
-			self.cx.resolve_impl_self(self.scope.generic_env)
+			self.sema.resolve_impl_self(self.scope.generic_env)
 		else {
 			// A trait's `Self` is the type implementing it, which is not
 			// known to be a struct; elsewhere `Self` names nothing.
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::CannotCallExpression.code())
 					.with_message("`Self` names no struct here")
@@ -1494,7 +1625,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			);
 			return None;
 		};
-		self.cx.resolutions.record(
+		self.sema.resolutions.record(
 			(site, Tier::Value),
 			match impl_kind {
 				ImplKind::Inherent(index) => Referent::InherentImplSelf(index),
@@ -1502,21 +1633,25 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			},
 		);
 		if !segment.type_args.is_empty() {
-			let diagnostic = self.cx.report_type_args_on_impl_self(
+			let diagnostic = self.sema.report_type_args_on_impl_self(
+				self.builder.strings,
 				self.scope.file_id,
 				segment,
 				impl_kind,
 			);
-			self.cx.diagnostics.push(diagnostic);
+			self.sema.diagnostics.push(diagnostic);
 		}
 		let Type::Struct {
 			struct_index,
 			type_args,
-		} = *self.cx.types.resolve(target)
+		} = *self.sema.types.resolve(target)
 		else {
 			if target != TypeIndex::ERROR {
-				let target = self.cx.type_formatter().display_type(target);
-				self.cx.diagnostics.push(
+				let target = self
+					.sema
+					.type_formatter(self.builder.strings)
+					.display_type(target);
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::CannotCallExpression.code())
 						.with_message(format!(
@@ -1530,24 +1665,24 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			return None;
 		};
-		Some((struct_index, self.cx.types.list(type_args).into()))
+		Some((struct_index, self.sema.types.list(type_args).into()))
 	}
 
 	/// Whether every field of `struct_index` is visible here, which is where
 	/// its constructor is.
 	fn constructor_accessible(&self, struct_index: StructIdx) -> bool {
-		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		def.field_pub_spans.iter().all(|&pub_span| {
-			self.cx.defs.namespaces.is_accessible_from(
+		let decl = &self.sema.decls.structs[usize::from(struct_index)];
+		decl.field_pub_spans.iter().all(|&pub_span| {
+			self.sema.decls.namespaces.is_accessible_from(
 				self.scope.namespace,
-				def.namespace.into(),
+				decl.namespace.into(),
 				Visibility::from(pub_span),
 			)
 		})
 	}
 
 	fn report_local_in_static_data(&mut self, span: TextSpan) {
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::LocalInStaticData.code())
 				.with_message("a local variable cannot be used in static data")
@@ -1563,8 +1698,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	}
 
 	fn report_struct_used_as_value(&mut self, name: SymbolU32, span: TextSpan) {
-		let name = self.cx.strings.resolve(name).unwrap();
-		self.cx.diagnostics.push(
+		let name = self.builder.strings.resolve(name).unwrap();
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::StructUsedAsValue.code())
 				.with_message(format!(
@@ -1582,16 +1717,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	fn report_private_constructor(
 		&self,
 		struct_index: StructIdx,
-		key: Option<DefKey>,
+		key: Option<DeclKey>,
 		segment: &ast::PathSegment,
 	) -> Diagnostic<FileId> {
-		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		let strings = &*self.cx.strings;
-		let name = strings.resolve(def.name.inner).unwrap();
-		let private: Vec<String> = def
+		let decl = &self.sema.decls.structs[usize::from(struct_index)];
+		let strings = &*self.builder.strings;
+		let name = strings.resolve(decl.name.inner).unwrap();
+		let private: Vec<String> = decl
 			.field_names
 			.iter()
-			.zip(&def.field_pub_spans)
+			.zip(&decl.field_pub_spans)
 			.enumerate()
 			.filter(|(_, (_, pub_span))| pub_span.is_none())
 			.map(|(at, (name, _))| match name {
@@ -1604,7 +1739,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
 		if private.is_empty() {
 			return report_private_identifier(
-				&self.cx.defs.namespaces,
+				&self.sema.decls.namespaces,
 				strings,
 				segment.ident.inner,
 				site,
@@ -1619,13 +1754,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			.with_label(
 				site.primary_label().with_message("private constructor"),
 			);
-		for (name, pub_span) in def.field_names.iter().zip(&def.field_pub_spans)
+		for (name, pub_span) in
+			decl.field_names.iter().zip(&decl.field_pub_spans)
 		{
 			if pub_span.is_none()
 				&& let Some(field_name) = name
 			{
 				diagnostic = diagnostic.with_label(
-					SourceSpan::new(def.file_id, field_name.span)
+					SourceSpan::new(decl.file_id, field_name.span)
 						.secondary_label()
 						.with_message("private field"),
 				);
@@ -1668,7 +1804,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				span,
 			);
 		}
-		if self.cx.types.is_unplaced(ty) {
+		if self.sema.types.is_unplaced(ty) {
 			return self.report_operator_on_literal(
 				op.inner.as_str(),
 				operand,
@@ -1743,7 +1879,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let left_ty = self.body.ty(lhs);
 		// A diverging left operand has no type to lend the right one, so it
 		// must not become the right side's expectation.
-		let rhs = if self.cx.types.needs_context(left_ty)
+		let rhs = if self.sema.types.needs_context(left_ty)
 			|| left_ty == TypeIndex::NEVER
 		{
 			self.build(right, expected)
@@ -1757,7 +1893,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		// Data not placed in a memory has no operators of its own.
 		for (ty, operand) in [(left_ty, lhs), (right_ty, rhs)] {
-			if self.cx.types.is_unplaced(ty) {
+			if self.sema.types.is_unplaced(ty) {
 				return self.report_operator_on_literal(
 					op.inner.as_str(),
 					operand,
@@ -1766,8 +1902,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 		}
 		let operand_ty = match (
-			self.cx.types.has_literal(left_ty),
-			self.cx.types.has_literal(right_ty),
+			self.sema.types.has_literal(left_ty),
+			self.sema.types.has_literal(right_ty),
 		) {
 			(true, true) => {
 				if is_comparison(op.inner) {
@@ -1812,9 +1948,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					&& left_ty != TypeIndex::ERROR
 					&& right_ty != TypeIndex::ERROR
 				{
-					let diagnostic =
-						self.report_type_mismatch(left_ty, right_ty, rhs);
-					self.cx.diagnostics.push(diagnostic);
+					let diagnostic = self
+						.context()
+						.report_type_mismatch(left_ty, right_ty, rhs);
+					self.sema.diagnostics.push(diagnostic);
 					return self.body.push(
 						ExprKind::Error,
 						TypeIndex::ERROR,
@@ -1859,7 +1996,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			left_ty
 		};
 		// Data not placed in a memory has no operators of its own.
-		if self.cx.types.is_unplaced(live_ty) {
+		if self.sema.types.is_unplaced(live_ty) {
 			let live = if left_ty == TypeIndex::NEVER {
 				rhs
 			} else {
@@ -1871,7 +2008,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				span,
 			);
 		}
-		if self.cx.types.has_literal(live_ty) {
+		if self.sema.types.has_literal(live_ty) {
 			if is_comparison(op.inner) {
 				return self.report_untyped_comparison(span);
 			}
@@ -1893,7 +2030,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// diverging operand — has no concrete type from which to choose its
 	/// instruction.
 	fn report_untyped_comparison(&mut self, span: TextSpan) -> ExprIdx {
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(
 					DiagnosticCode::ComparisonTypeAnnotationRequired.code(),
@@ -1917,7 +2054,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let ty = self.body.ty(operand);
 		let Some(lookup) = self.operator_impl(
 			ty,
-			self.cx.operators.unary(op.inner),
+			self.sema.operators.unary(op.inner),
 			self.body.span(operand),
 			op.span,
 			op.inner.as_str(),
@@ -1946,7 +2083,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		// Enums and pointers compare natively, by discriminant and address.
 		if is_comparison(op.inner)
 			&& matches!(
-				self.cx.types.resolve(ty),
+				self.sema.types.resolve(ty),
 				Type::Enum { .. } | Type::Pointer { .. }
 			) {
 			let kind = ExprKind::PrimitiveBinary {
@@ -1958,7 +2095,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		let Some(lookup) = self.operator_impl(
 			ty,
-			self.cx.operators.binary(op.inner),
+			self.sema.operators.binary(op.inner),
 			self.body.span(lhs),
 			op.span,
 			op.inner.as_str(),
@@ -1996,7 +2133,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		let found = match method {
 			Some(method) => {
-				match self.cx.find_trait_impl_query(
+				match self.sema.find_trait_impl_query(
+					self.builder.strings,
 					self.scope.assumption_env,
 					ty,
 					method.trait_index,
@@ -2006,14 +2144,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						let site = SourceSpan::new(self.scope.file_id, op_span);
 						match error {
 							SolverError::Overflow => {
-								self.cx
+								self.sema
 									.diagnostics
-									.push(self.cx.overflow_diagnostic(site));
+									.push(self.sema.overflow_diagnostic(site));
 							}
 							SolverError::Cycle(cycle) => {
-								let diagnostic =
-									self.cx.cycle_diagnostic(&cycle, site);
-								self.cx.diagnostics.push(diagnostic);
+								let diagnostic = self.sema.cycle_diagnostic(
+									self.builder.strings,
+									&cycle,
+									site,
+								);
+								self.sema.diagnostics.push(diagnostic);
 							}
 							_ => {}
 						}
@@ -2024,15 +2165,19 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			None => None,
 		};
 		if found.is_none() {
-			let ty = self.cx.type_formatter().display_type(ty).to_string();
+			let ty = self
+				.sema
+				.type_formatter(self.builder.strings)
+				.display_type(ty)
+				.to_string();
 			let label = Label::primary(self.scope.file_id, operand_span);
 			let (message, label) = match method {
 				Some(method) => {
-					let name = self.cx.defs.traits
+					let name = self.sema.decls.traits
 						[usize::from(method.trait_index)]
 					.name
 					.inner;
-					let name = self.cx.strings.resolve(name).unwrap();
+					let name = self.builder.strings.resolve(name).unwrap();
 					(
 						format!(
 							"the trait bound `{ty}: {name}` is not satisfied"
@@ -2044,7 +2189,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				}
 				None => (format!("cannot apply `{op}` to `{ty}`"), label),
 			};
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TraitBoundViolation.code())
 					.with_message(message)
@@ -2108,50 +2253,31 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		if let TraitImplLookup::Concrete { impl_index, args } = lookup
 			&& let TraitMemberSelection::Impl(
 				MemberKind::Method(function) | MemberKind::Function(function),
-			) = self.cx.defs.select_trait_member(
+			) = self.sema.decls.select_trait_member(
 				impl_index,
 				MemberKind::Method(method.method),
 			) {
 			return SelectedMethod::Concrete {
 				function,
 				type_args: self
-					.cx
+					.sema
 					.generic_args
 					.push(args.iter().map(|&arg| (arg, span))),
 			};
 		}
 		SelectedMethod::Abstract {
 			method: method.method,
-			type_args: self.cx.generic_args.push([(ty, span)]),
-		}
-	}
-
-	/// What a type means in `scope`: comparisons and literal coercion work on
-	/// normalized types. A projection that does not normalize stays as written;
-	/// whoever wrote it has reported why.
-	fn normalized(
-		&mut self,
-		ty: TypeIndex,
-		scope: AssumptionEnvIdx,
-	) -> TypeIndex {
-		match self.cx.normalize(
-			scope,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
-		) {
-			Ok(normalized) => normalized,
-			Err(_) => ty,
+			type_args: self.sema.generic_args.push([(ty, span)]),
 		}
 	}
 
 	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
 	/// when the stdlib declares no `Memory`.
 	fn memory_size(&mut self, memory: TypeIndex) -> TypeIndex {
-		let Some(projection) = self.cx.memory_size(memory) else {
+		let Some(projection) = self.sema.memory_size(memory) else {
 			return TypeIndex::ERROR;
 		};
-		self.normalized(projection, self.scope.assumption_env)
+		self.context().normalized(projection)
 	}
 
 	/// Gives an untyped subtree the type `target`, checking each literal is
@@ -2174,15 +2300,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			let actual = self.body.ty(expr);
 			if actual != target {
 				let diagnostic =
-					self.report_type_mismatch(target, actual, expr);
-				self.cx.diagnostics.push(diagnostic);
+					self.context().report_type_mismatch(target, actual, expr);
+				self.sema.diagnostics.push(diagnostic);
 				self.body.set_ty(expr, TypeIndex::ERROR);
 			}
 			return;
 		}
 		match self.body.kind(expr) {
 			ExprKind::Const { .. }
-				if self.cx.types.is_unplaced(self.body.ty(expr)) =>
+				if self.sema.types.is_unplaced(self.body.ty(expr)) =>
 			{
 				return self.place_constant(expr, target);
 			}
@@ -2212,7 +2338,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				..
 			} => {
 				for branch in [then_block, else_block] {
-					if self.cx.types.needs_context(self.body.ty(branch)) {
+					if self.sema.types.needs_context(self.body.ty(branch)) {
 						self.coerce(branch, target);
 					}
 				}
@@ -2222,7 +2348,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				let bodies: Vec<ExprIdx> =
 					self.body.arms(arms).iter().map(|arm| arm.body).collect();
 				for arm in bodies {
-					if self.cx.types.needs_context(self.body.ty(arm)) {
+					if self.sema.types.needs_context(self.body.ty(arm)) {
 						self.coerce(arm, target);
 					}
 				}
@@ -2231,11 +2357,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			_ => {}
 		}
 		let concrete_types =
-			self.cx.concrete_types(self.scope.assumption_env, target);
+			self.sema.concrete_types(self.scope.assumption_env, target);
 		if concrete_types.is_empty() {
-			self.cx
-				.diagnostics
-				.push(self.report_unable_to_coerce(expr, target));
+			let diagnostic =
+				self.context().report_unable_to_coerce(expr, target);
+			self.sema.diagnostics.push(diagnostic);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
 		self.coerce_against(expr, target, &concrete_types);
@@ -2246,139 +2372,19 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// a constant's body reads none.
 	fn coerce_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
 		if self
-			.cx
+			.sema
 			.concrete_types(self.scope.assumption_env, target)
 			.is_empty()
 		{
-			self.cx
-				.diagnostics
-				.push(self.report_unable_to_coerce(expr, target));
+			let diagnostic =
+				self.context().report_unable_to_coerce(expr, target);
+			self.sema.diagnostics.push(diagnostic);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
 		self.body.set_ty(expr, target);
 		self.obligations
 			.exprs
 			.push(ExprObligation::Representable { expr, target });
-	}
-
-	/// The constant an untyped `expr` names, and its value. `None` when it has
-	/// none here: it failed (reported where it is), or it is a trait's constant
-	/// over a type not known here and no representability clause in scope says
-	/// it is representable as `target` (reported); `Some` with no value when
-	/// one does.
-	fn untyped_value(
-		&mut self,
-		expr: ExprIdx,
-		target: TypeIndex,
-	) -> Option<(ConstIdx, Option<i128>)> {
-		let (constant, args) = match self.body.kind(expr) {
-			ExprKind::Const { constant, .. } => (constant, Vec::new()),
-			ExprKind::AbstractConst {
-				constant,
-				type_args,
-			} => (constant, self.cx.generic_args.types(type_args).to_vec()),
-			_ => unreachable!("only a constant's representability is decided"),
-		};
-		let env = self.scope.assumption_env;
-		match self.cx.untyped_value(env, constant, &args).ok()? {
-			UntypedValue::Known(value) => Some((constant, Some(value))),
-			UntypedValue::Failed => None,
-			UntypedValue::Abstract => {
-				let subject = self.normalized(args[0], env);
-				if self
-					.cx
-					.assumed_representable(env, subject, constant, target)
-					.ok()?
-				{
-					return Some((constant, None));
-				}
-				let diagnostic = self.cx.report_unrepresentable_constant(
-					self.source_span(expr),
-					(subject, constant),
-					target,
-					None,
-					None,
-				);
-				self.cx.diagnostics.push(diagnostic);
-				None
-			}
-		}
-	}
-
-	/// Decides a recorded `Representable`: the untyped constant `expr` names
-	/// has a value of its kind representable as `target`, as a literal of that
-	/// value would. A constant without a value reports itself.
-	fn decide_representable(&mut self, expr: ExprIdx, target: TypeIndex) {
-		// Without a value, a representability clause in scope said it is.
-		let Some((constant, Some(value))) = self.untyped_value(expr, target)
-		else {
-			return;
-		};
-		let kind = self.cx.constants[usize::from(constant)].ty;
-		let name = self.cx.defs.constants[usize::from(constant)].name.inner;
-		let name = self.cx.strings.resolve(name).unwrap().to_owned();
-		let at = self.source_span(expr);
-		for concrete in
-			self.cx.concrete_types(self.scope.assumption_env, target)
-		{
-			let held = if kind == TypeIndex::CHAR_LITERAL {
-				u32::try_from(value)
-					.map_err(|_| CharMiss::OutOfRange)
-					.and_then(|code_point| concrete.holds_char(code_point))
-					.map_err(|miss| match miss {
-						CharMiss::OutOfRange => IntegerMiss::OutOfRange,
-						CharMiss::WrongKind => IntegerMiss::WrongKind,
-					})
-			} else {
-				concrete.holds_integer(value)
-			};
-			let Err(miss) = held else {
-				continue;
-			};
-			let ty = self.cx.type_formatter().display_type(target);
-			let diagnostic = match (concrete, miss) {
-				(ConcreteType::Member(typeset, member), _) => {
-					self.cx.report_typeset_member(
-						format_args!("constant `{name}`"),
-						typeset,
-						member,
-						at,
-					)
-				}
-				(ConcreteType::Target(_), IntegerMiss::OutOfRange) => {
-					Diagnostic::error()
-						.with_code(
-							DiagnosticCode::IntegerLiteralOutOfRange.code(),
-						)
-						.with_message(format!(
-							"constant `{name}` cannot be represented as `{ty}`"
-						))
-						.with_label(at.primary_label().with_message(format!(
-							"its value `{value}` is out of range for `{ty}`"
-						)))
-				}
-				(ConcreteType::Target(_), IntegerMiss::Inexact) => {
-					Diagnostic::error()
-						.with_code(
-							DiagnosticCode::IntegerLiteralNotRepresentable
-								.code(),
-						)
-						.with_message(format!(
-							"constant `{name}` cannot be represented exactly \
-							 as `{ty}`"
-						))
-						.with_label(
-							at.primary_label().with_message(format!(
-								"its value is `{value}`"
-							)),
-						)
-				}
-				(ConcreteType::Target(_), IntegerMiss::WrongKind) => {
-					self.report_unable_to_coerce(expr, target)
-				}
-			};
-			return self.reject(expr, diagnostic);
-		}
 	}
 
 	/// `coerce` against the scalars a literal must be representable as:
@@ -2413,18 +2419,20 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					}
 					let diagnostic = match concrete {
 						ConcreteType::Member(typeset, member) => {
-							self.cx.report_typeset_member(
+							let at = self.context().source_span(expr);
+							self.sema.report_typeset_member(
+								self.builder.strings,
 								"literal",
 								typeset,
 								member,
-								self.source_span(expr),
+								at,
 							)
 						}
 						ConcreteType::Target(_) => {
-							self.report_unable_to_coerce(expr, target)
+							self.context().report_unable_to_coerce(expr, target)
 						}
 					};
-					return self.reject(expr, diagnostic);
+					return self.context().reject(expr, diagnostic);
 				}
 				let coerced = match (op, self.body.kind(operand)) {
 					// `-128` is in range for `i8` though `128` is not: a
@@ -2489,7 +2497,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		} else {
 			i128::from(magnitude)
 		};
-		let at = self.source_span(report);
+		let at = self.context().source_span(report);
 		let mut all_float = true;
 		for &concrete in concrete_types {
 			let Err(miss) = concrete.holds_integer(value) else {
@@ -2498,7 +2506,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			};
 			let diagnostic = match (concrete, miss) {
 				(ConcreteType::Member(typeset, member), _) => {
-					self.cx.report_typeset_member(
+					self.sema.report_typeset_member(
+						self.builder.strings,
 						format_args!("literal `{value}`"),
 						typeset,
 						member,
@@ -2506,7 +2515,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					)
 				}
 				(ConcreteType::Target(_), IntegerMiss::OutOfRange) => {
-					self.cx.report_out_of_range(
+					self.sema.report_out_of_range(
+						self.builder.strings,
 						format_args!("literal `{value}`"),
 						target,
 						at,
@@ -2521,15 +2531,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						.with_message(format!(
 							"literal `{value}` cannot be represented exactly \
 							 as `{}`",
-							self.cx.type_formatter().display_type(target)
+							self.sema
+								.type_formatter(self.builder.strings)
+								.display_type(target)
 						))
 						.with_label(at.primary_label())
 				}
 				(ConcreteType::Target(_), IntegerMiss::WrongKind) => {
-					self.report_unable_to_coerce(report, target)
+					self.context().report_unable_to_coerce(report, target)
 				}
 			};
-			self.reject(report, diagnostic);
+			self.context().reject(report, diagnostic);
 			return false;
 		}
 		// An integer literal of float type is a float.
@@ -2551,7 +2563,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		order: ElementOrder,
 		target: TypeIndex,
 	) {
-		let targets = match *self.cx.types.resolve(target) {
+		let targets = match *self.sema.types.resolve(target) {
 			Type::Tuple { elements: targets }
 				if targets.len() == elements.len() =>
 			{
@@ -2560,8 +2572,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			_ => {
 				let actual = self.body.ty(expr);
 				let diagnostic =
-					self.report_type_mismatch(target, actual, expr);
-				self.cx.diagnostics.push(diagnostic);
+					self.context().report_type_mismatch(target, actual, expr);
+				self.sema.diagnostics.push(diagnostic);
 				return self.body.set_ty(expr, TypeIndex::ERROR);
 			}
 		};
@@ -2569,12 +2581,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		for at in 0..elements.len() {
 			let element = self.body.args(elements)[at];
 			let position = usize::from(self.body.declared_index(order, at));
-			let element_target = self.cx.types.list(targets)[position];
+			let element_target = self.sema.types.list(targets)[position];
 			let element = self.expect(element, element_target);
 			types[position] = self.body.ty(element);
 		}
-		let ty = self.cx.types.intern_tuple(&types);
-		let ty = self.cx.types.collapse_error(ty);
+		let ty = self.sema.types.intern_tuple(&types);
+		let ty = self.sema.types.collapse_error(ty);
 		self.body.set_ty(expr, ty);
 	}
 
@@ -2586,7 +2598,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		target: TypeIndex,
 		concrete_types: &[ConcreteType],
 	) {
-		let source = &self.cx.files.get(self.scope.file_id).unwrap().source;
+		let source =
+			&self.builder.files.get(self.scope.file_id).unwrap().source;
 		let text = self.body.span(expr).extract_str(source);
 		let mut value = None;
 		for &concrete in concrete_types {
@@ -2597,9 +2610,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				// Malformed syntax was reported by the parser.
 				Ok(None) => return self.body.set_ty(expr, TypeIndex::ERROR),
 				Err(miss) => {
-					let at = self.source_span(expr);
-					let ty =
-						self.cx.type_formatter().display_type(concrete.ty());
+					let at = self.context().source_span(expr);
+					let ty = self
+						.sema
+						.type_formatter(self.builder.strings)
+						.display_type(concrete.ty());
 					let diagnostic = match (concrete, miss) {
 						(_, FloatMiss::TooLarge) => Diagnostic::error()
 							.with_code(
@@ -2621,17 +2636,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 						(
 							ConcreteType::Member(typeset, member),
 							FloatMiss::WrongKind,
-						) => self.cx.report_typeset_member(
+						) => self.sema.report_typeset_member(
+							self.builder.strings,
 							"float literal",
 							typeset,
 							member,
 							at,
 						),
 						(ConcreteType::Target(_), FloatMiss::WrongKind) => {
-							self.report_unable_to_coerce(expr, target)
+							self.context().report_unable_to_coerce(expr, target)
 						}
 					};
-					return self.reject(expr, diagnostic);
+					return self.context().reject(expr, diagnostic);
 				}
 			}
 		}
@@ -2648,14 +2664,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		concrete_types: &[ConcreteType],
 		value: char,
 	) {
-		let at = self.source_span(expr);
+		let at = self.context().source_span(expr);
 		for &concrete in concrete_types {
 			let Err(miss) = concrete.holds_char(u32::from(value)) else {
 				continue;
 			};
 			let diagnostic = match (concrete, miss) {
 				(ConcreteType::Member(typeset, member), _) => {
-					self.cx.report_typeset_member(
+					self.sema.report_typeset_member(
+						self.builder.strings,
 						format_args!("literal {value:?}"),
 						typeset,
 						member,
@@ -2663,29 +2680,23 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 					)
 				}
 				(ConcreteType::Target(_), CharMiss::OutOfRange) => {
-					self.cx.report_out_of_range(
+					self.sema.report_out_of_range(
+						self.builder.strings,
 						format_args!("literal {value:?}"),
 						target,
 						at,
 					)
 				}
 				(ConcreteType::Target(_), CharMiss::WrongKind) => {
-					self.report_unable_to_coerce(expr, target)
+					self.context().report_unable_to_coerce(expr, target)
 				}
 			};
-			return self.reject(expr, diagnostic);
+			return self.context().reject(expr, diagnostic);
 		}
 		if target != TypeIndex::CHAR {
 			self.body.set_kind(expr, ExprKind::Int(u64::from(value)));
 		}
 		self.body.set_ty(expr, target);
-	}
-
-	/// Reports `diagnostic` about `expr` and leaves `expr` at `ERROR`, so
-	/// nothing reports it again.
-	fn reject(&mut self, expr: ExprIdx, diagnostic: Diagnostic<FileId>) {
-		self.cx.diagnostics.push(diagnostic);
-		self.body.set_ty(expr, TypeIndex::ERROR);
 	}
 
 	/// Places a string or array literal, data in no memory: it becomes a
@@ -2698,19 +2709,19 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// memory, of its `Size`.
 	fn coerce_static(&mut self, expr: ExprIdx, target: TypeIndex) {
 		let Type::Array { length, .. } =
-			*self.cx.types.resolve(self.body.ty(expr))
+			*self.sema.types.resolve(self.body.ty(expr))
 		else {
 			unreachable!("a literal is an array")
 		};
 		// Only an array's length can be left to the literal.
-		let parts = self.static_target(target);
+		let parts = self.context().static_target(target);
 		let known = parts.is_some_and(|parts| {
-			!self.cx.types.has_infer(parts.of)
+			!self.sema.types.has_infer(parts.of)
 				&& parts
 					.memory
-					.is_none_or(|memory| !self.cx.types.has_infer(memory))
+					.is_none_or(|memory| !self.sema.types.has_infer(memory))
 		});
-		if self.cx.types.has_infer(target) && !known {
+		if self.sema.types.has_infer(target) && !known {
 			self.report_annotation_required(expr);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		}
@@ -2723,9 +2734,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				ExprKind::String(_) => STRING_TARGETS_NOTE,
 				_ => ARRAY_TARGETS_NOTE,
 			};
-			let diagnostic =
-				self.report_unable_to_coerce(expr, target).with_note(note);
-			self.cx.diagnostics.push(diagnostic);
+			let diagnostic = self
+				.context()
+				.report_unable_to_coerce(expr, target)
+				.with_note(note);
+			self.sema.diagnostics.push(diagnostic);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		};
 		match kind {
@@ -2766,22 +2779,23 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 	/// constant's type) keeps it in no memory.
 	fn place_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
 		let Type::Array { of: actual, length } =
-			*self.cx.types.resolve(self.body.ty(expr))
+			*self.sema.types.resolve(self.body.ty(expr))
 		else {
-			self.cx
-				.diagnostics
-				.push(self.report_unable_to_coerce(expr, target));
+			let diagnostic =
+				self.context().report_unable_to_coerce(expr, target);
+			self.sema.diagnostics.push(diagnostic);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		};
-		let Some(parts) = self.static_target(target) else {
+		let Some(parts) = self.context().static_target(target) else {
 			let diagnostic = self
+				.context()
 				.report_unable_to_coerce(expr, target)
 				.with_note(ARRAY_TARGETS_NOTE);
-			self.cx.diagnostics.push(diagnostic);
+			self.sema.diagnostics.push(diagnostic);
 			return self.body.set_ty(expr, TypeIndex::ERROR);
 		};
 		let span = self.body.span(expr);
-		match self.equality(
+		match self.context().equality(
 			parts.of,
 			actual,
 			RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
@@ -2789,7 +2803,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		) {
 			Ok(TypeEquality::Equal | TypeEquality::NeedsValues) => {}
 			Ok(TypeEquality::Diff) => {
-				return self.report_mismatch(expr, target);
+				return self.context().report_mismatch(expr, target);
 			}
 			Err(()) => return self.body.set_ty(expr, TypeIndex::ERROR),
 		}
@@ -2814,9 +2828,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		};
 		if target_length == TypeIndex::INFER {
 			let of = parts.of;
-			let mut ty = self.cx.types.intern(Type::Array { of, length });
+			let mut ty = self.sema.types.intern(Type::Array { of, length });
 			if let Some(memory) = parts.memory {
-				ty = self.cx.types.intern(Type::Pointer {
+				ty = self.sema.types.intern(Type::Pointer {
 					to: ty,
 					memory,
 					ownership: Ownership::Shared,
@@ -2840,15 +2854,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 		let Some(StaticTarget {
 			length: Some(target_length),
 			..
-		}) = self.static_target(target)
+		}) = self.context().static_target(target)
 		else {
 			unreachable!("a literal with a length becomes an array")
 		};
 		if target_length == length {
 			return;
 		}
-		if self.cx.types.has_const(target_length)
-			|| self.cx.types.has_const(length)
+		if self.sema.types.has_const(target_length)
+			|| self.sema.types.has_const(length)
 		{
 			return self.obligations.exprs.push(ExprObligation::StaticLength {
 				expr,
@@ -2856,92 +2870,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 				length,
 			});
 		}
-		self.decide_static_length(expr, target, length);
-	}
-
-	/// Decides a literal's length against its array's, reading values.
-	fn decide_static_length(
-		&mut self,
-		expr: ExprIdx,
-		target: TypeIndex,
-		length: TypeIndex,
-	) {
-		let Some(StaticTarget {
-			length: Some(target_length),
-			..
-		}) = self.static_target(target)
-		else {
-			unreachable!("a literal with a length becomes an array")
-		};
-		let scope = self.scope.assumption_env;
-		let target_now = self.cx.normalize(
-			scope,
-			target_length,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		);
-		let length_now = self.cx.normalize(
-			scope,
-			length,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		);
-		let (expected, actual) = match (target_now, length_now) {
-			(Ok(expected), Ok(actual)) => (expected, actual),
-			// Reported where the constant is.
-			_ => return,
-		};
-		let (Type::Value { bits }, Type::Value { bits: length }) = (
-			*self.cx.types.resolve(expected),
-			*self.cx.types.resolve(actual),
-		) else {
-			return;
-		};
-		if bits == length {
-			return;
-		}
-		let target = self.cx.type_formatter().display_type(target);
-		let literal = match self.body.kind(expr) {
-			ExprKind::String(_) => {
-				format!("this string literal is {length} bytes long")
-			}
-			ExprKind::Const { .. } => {
-				format!("this constant holds {length} elements")
-			}
-			_ => format!("this array literal has {length} elements"),
-		};
-		self.push_error(
-			DiagnosticCode::ArraySizeMismatch,
-			format!("{literal}, but `{target}` holds {bits}"),
-			expr,
-		);
-	}
-
-	/// What a string or array literal can become, read off `target`: a
-	/// shared pointer to an array or a slice, or an array in no memory (a
-	/// constant's type).
-	fn static_target(&self, target: TypeIndex) -> Option<StaticTarget> {
-		let (to, memory) = match *self.cx.types.resolve(target) {
-			Type::Pointer {
-				to,
-				memory,
-				ownership: Ownership::Shared,
-			} => (to, Some(memory)),
-			_ => (target, None),
-		};
-		match *self.cx.types.resolve(to) {
-			Type::Array { of, length } => Some(StaticTarget {
-				of,
-				memory,
-				length: Some(length),
-			}),
-			Type::Slice { of } if memory.is_some() => Some(StaticTarget {
-				of,
-				memory,
-				length: None,
-			}),
-			_ => None,
-		}
+		self.context().decide_static_length(expr, target, length);
 	}
 
 	/// An operator applied to an untyped string or array literal, which has
@@ -2960,76 +2889,15 @@ impl<'a, 'ast, 'ctx, 'dispatch> BodyContext<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			_ => ("data in no memory", ARRAY_TARGETS_NOTE),
 		};
-		self.cx.diagnostics.push(
+		let at = self.context().source_span(operand);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TraitBoundViolation.code())
 				.with_message(format!("cannot apply `{op}` to {noun}"))
-				.with_label(self.source_span(operand).primary_label())
+				.with_label(at.primary_label())
 				.with_note(note),
 		);
 		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
-	}
-
-	fn report_unable_to_coerce(
-		&self,
-		expr: ExprIdx,
-		target: TypeIndex,
-	) -> Diagnostic<FileId> {
-		Diagnostic::error()
-			.with_code(DiagnosticCode::UnableToCoerce.code())
-			.with_message(format!(
-				"unable to coerce to type `{}`",
-				self.cx.type_formatter().display_type(target)
-			))
-			.with_label(self.source_span(expr).primary_label())
-	}
-
-	/// Reports at `expr` and leaves it at `ERROR`, so nothing reports it again.
-	fn push_error(
-		&mut self,
-		code: DiagnosticCode,
-		message: String,
-		expr: ExprIdx,
-	) {
-		self.cx.diagnostics.push(
-			Diagnostic::error()
-				.with_code(code.code())
-				.with_message(message)
-				.with_label(self.source_span(expr).primary_label()),
-		);
-		self.body.set_ty(expr, TypeIndex::ERROR);
-	}
-
-	fn report_type_mismatch(
-		&self,
-		expected: TypeIndex,
-		actual: TypeIndex,
-		expr: ExprIdx,
-	) -> Diagnostic<FileId> {
-		self.mismatch_at(expected, actual, self.body.span(expr))
-	}
-
-	fn mismatch_at(
-		&self,
-		expected: TypeIndex,
-		actual: TypeIndex,
-		span: TextSpan,
-	) -> Diagnostic<FileId> {
-		let formatter = self.cx.type_formatter();
-		Diagnostic::error()
-			.with_code(DiagnosticCode::TypeMistmatch.code())
-			.with_message("type mismatch")
-			.with_label(Label::primary(self.scope.file_id, span).with_message(
-				format!(
-					"expected `{}`, found `{}`",
-					formatter.display_type(expected),
-					formatter.display_type(actual)
-				),
-			))
-	}
-
-	fn source_span(&self, expr: ExprIdx) -> SourceSpan {
-		SourceSpan::new(self.scope.file_id, self.body.span(expr))
 	}
 }
 
@@ -3085,44 +2953,39 @@ enum Arguments<'e> {
 
 #[cfg(test)]
 mod tests {
-	use codespan_reporting::diagnostic::Diagnostic;
 	use indoc::indoc;
 
 	use super::super::body::{
 		Body, ElementOrder, ExprIdx, ExprKind, ExprRange, PlaceIdx, PlaceKind,
 	};
-	use super::super::defs::{
-		AstEntry, DefKind, DefinitionRegistry, FunctionIdx, MemberOwner, Scope,
-		Tier,
+	use super::super::decls::{
+		DeclKind, FunctionIdx, MemberOwner, Scope, Tier,
 	};
 	use super::super::eval::{ConstScalar, ConstValueState};
-	use super::super::impls::ImplDispatch;
 	use super::super::paths::PathResolver;
 	use super::super::resolutions::{NameResolutions, Referent, Resolution};
-	use super::super::signatures::TypeContext;
-	use super::super::solver::{NormalizationDepth, RewriteFlags, Solver};
+	use super::super::signatures::Semantics;
+	use super::super::solver::{NormalizationDepth, RewriteFlags};
 	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
-	use crate::vfs::{self, FileId, Files};
+	use crate::vfs::{self, Files};
 
-	/// `test_case!(case = "source")` declares the graph, the inputs and the
-	/// swept `TestCase` borrowing them as three locals of the calling test.
+	/// `test_case!(case = "source")` declares the interner, the graph and the
+	/// checked `TestCase` as three locals of the calling test.
 	/// The source is a binary over the real stdlib, so operators, memories
 	/// and globals are checked against its actual traits.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut strings = ast::Keyword::create_interner();
 			let graph = source_graph($source, &mut strings);
-			let mut inputs = TestInputs::new(&graph, &mut strings);
-			let $case = TestCase::new(&mut inputs);
+			let $case = TestCase::new(&graph, &mut strings);
 		};
 		(mut $case:ident = $source:expr $(,)?) => {
 			let mut strings = ast::Keyword::create_interner();
 			let graph = source_graph($source, &mut strings);
-			let mut inputs = TestInputs::new(&graph, &mut strings);
-			let mut $case = TestCase::new(&mut inputs);
+			let mut $case = TestCase::new(&graph, &mut strings);
 		};
 	}
 
@@ -3153,95 +3016,25 @@ mod tests {
 		graph
 	}
 
-	/// Everything a `TypeContext` borrows, kept on the test's stack.
-	struct TestInputs<'g> {
-		files: &'g Files,
-		strings: &'g mut StringInterner,
-		defs: DefinitionRegistry,
-		ast_nodes: Vec<AstEntry<'g>>,
-		impl_dispatch: ImplDispatch,
-		diagnostics: Vec<Diagnostic<FileId>>,
-		resolutions: NameResolutions,
-		solver: Solver,
-	}
-
-	impl<'g> TestInputs<'g> {
-		fn new(
-			graph: &'g vfs::CompilationUnit,
-			strings: &'g mut StringInterner,
-		) -> Self {
-			let vfs::CompilationUnit {
-				files,
-				packages,
-				stdlib_package,
-				root_package,
-			} = graph;
-			let mut diagnostics = Vec::new();
-			let mut resolutions = NameResolutions::default();
-			let (defs, ast_nodes) = DefinitionRegistry::build(
-				packages,
-				files,
-				strings,
-				&mut diagnostics,
-				&mut resolutions,
-				*stdlib_package,
-				*root_package,
-			);
-			let impl_dispatch = ImplDispatch::build(
-				&mut diagnostics,
-				&mut resolutions,
-				strings,
-				&defs,
-				&ast_nodes,
-			);
-			let solver = Solver::new(defs.constants.len());
-			Self {
-				files,
-				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			}
-		}
-	}
-
 	struct TestCase<'a> {
-		defs: &'a DefinitionRegistry,
-		context: TypeContext<'a, 'a, 'a>,
+		files: &'a Files,
+		strings: &'a StringInterner,
+		sema: Semantics,
 	}
 
 	impl<'a> TestCase<'a> {
-		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
-			let TestInputs {
-				files,
-				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			} = inputs;
-			let mut context = TypeContext::new(
-				diagnostics,
-				resolutions,
-				strings,
-				solver,
-				files,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-			);
-			context.sweep();
+		fn new(
+			graph: &'a vfs::CompilationUnit,
+			strings: &'a mut StringInterner,
+		) -> Self {
+			let mut sema = crate::tir::check(graph, strings);
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
-			let root_file = defs
+			let root_file = sema
+				.decls
 				.namespaces
-				.file_id(Scope::Package(defs.root_package).into());
-			context.diagnostics.retain(|diagnostic| {
+				.file_id(Scope::Package(sema.decls.root_package).into());
+			sema.diagnostics.retain(|diagnostic| {
 				let in_stdlib = diagnostic
 					.labels
 					.first()
@@ -3250,25 +3043,25 @@ mod tests {
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
 			});
-			Self { defs, context }
+			Self {
+				files: &graph.files,
+				strings,
+				sema,
+			}
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
-			DiagnosticView::new(
-				"typecheck",
-				self.context.diagnostics,
-				self.context.files,
-			)
+			DiagnosticView::new("typecheck", &self.sema.diagnostics, self.files)
 		}
 
-		fn resolve(&self, name: &str) -> DefKind {
-			let root = Scope::Package(self.defs.root_package);
-			let file_id = self.defs.namespaces.file_id(root.into());
+		fn resolve(&self, name: &str) -> DeclKind {
+			let root = Scope::Package(self.sema.decls.root_package);
+			let file_id = self.sema.decls.namespaces.file_id(root.into());
 			let segments: Box<[ast::PathSegment]> = name
 				.split("::")
 				.map(|segment| ast::PathSegment {
 					ident: Spanned {
-						inner: self.context.strings.get(segment).unwrap(),
+						inner: self.strings.get(segment).unwrap(),
 						span: TextSpan::new(0, 0),
 					},
 					type_args: Box::new([]),
@@ -3279,22 +3072,22 @@ mod tests {
 			PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				self.context.strings,
-				self.defs,
+				self.strings,
+				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &segments, Tier::Value)
-			.def_key()
+			.decl_key()
 			.unwrap_or_else(|| panic!("expected `{name}` to resolve"))
-			.symbol_kind(self.defs)
+			.symbol_kind(&self.sema.decls)
 		}
 
 		/// The checked block of the function `name`.
 		fn body(&self, name: &str) -> &Body {
-			let DefKind::Function(index) = self.resolve(name) else {
+			let DeclKind::Function(index) = self.resolve(name) else {
 				panic!("expected `{name}` to be a function");
 			};
-			self.context.body(
-				self.context.function_implementations[usize::from(index)]
+			self.sema.body(
+				self.sema.function_implementations[usize::from(index)]
 					.body()
 					.expect("a function with a block has a body"),
 			)
@@ -3303,26 +3096,30 @@ mod tests {
 		/// The rendered block of the member `name`, which only one impl or
 		/// trait in the test defines with a block.
 		fn member_shape(&self, name: &str) -> String {
-			let symbol = self.context.strings.get(name).unwrap();
-			let mut found = self.defs.functions.iter().enumerate().filter(
-				|&(index, function)| {
-					function.name.inner == symbol
-						&& !matches!(function.owner, MemberOwner::Free)
-						&& self.context.function_implementations[index]
-							.body()
-							.is_some()
-				},
-			);
+			let symbol = self.strings.get(name).unwrap();
+			let mut found =
+				self.sema.decls.functions.iter().enumerate().filter(
+					|&(index, function)| {
+						function.name.inner == symbol
+							&& !matches!(function.owner, MemberOwner::Free)
+							&& self.sema.function_implementations[index]
+								.body()
+								.is_some()
+					},
+				);
 			let (index, _) = found.next().unwrap();
 			assert!(found.next().is_none(), "`{name}` is declared twice");
-			let body = self.context.body(
-				self.context.function_implementations[index].body().unwrap(),
+			let body = self.sema.body(
+				self.sema.function_implementations[index].body().unwrap(),
 			);
 			self.render(body, body.root())
 		}
 
 		fn display(&self, ty: TypeIndex) -> String {
-			self.context.type_formatter().display_type(ty).to_string()
+			self.sema
+				.type_formatter(self.strings)
+				.display_type(ty)
+				.to_string()
 		}
 
 		/// The type of `name`'s whole block.
@@ -3377,9 +3174,7 @@ mod tests {
 		}
 
 		fn param_count(&self, function: FunctionIdx) -> usize {
-			self.context.functions[usize::from(function)]
-				.param_types
-				.len()
+			self.sema.functions[usize::from(function)].param_types.len()
 		}
 
 		/// Renders a node without types: `(block (local x 1) => (+ x 2))`.
@@ -3394,17 +3189,14 @@ mod tests {
 				}
 				text + ")"
 			};
-			let name = |symbol| self.context.strings.resolve(symbol).unwrap();
+			let name = |symbol| self.strings.resolve(symbol).unwrap();
 			match body.kind(expr) {
 				ExprKind::Error => "error".to_string(),
 				ExprKind::Int(value) => value.to_string(),
 				ExprKind::Float(value) => format!("{value:?}"),
 				ExprKind::Char(value) => format!("{value:?}"),
 				ExprKind::String(contents) => {
-					format!(
-						"{:?}",
-						self.context.strings.resolve(contents).unwrap()
-					)
+					format!("{:?}", self.strings.resolve(contents).unwrap())
 				}
 				ExprKind::Array { elements } => {
 					list("array", body.args(elements))
@@ -3424,19 +3216,19 @@ mod tests {
 					"(abstract {})",
 					self.constant_name(constant, type_args)
 				),
-				ExprKind::NextDiscriminant(index) => {
-					name(self.defs.constants[usize::from(index)].name.inner)
-						.to_string()
-				}
+				ExprKind::NextDiscriminant(index) => name(
+					self.sema.decls.constants[usize::from(index)].name.inner,
+				)
+				.to_string(),
 				ExprKind::Local(local) => self.local_name(body, local),
 				ExprKind::Global(index) => {
-					name(self.defs.globals[usize::from(index)].name.inner)
+					name(self.sema.decls.globals[usize::from(index)].name.inner)
 						.to_string()
 				}
-				ExprKind::Memory(index) => {
-					name(self.defs.memories[usize::from(index)].name.inner)
-						.to_string()
-				}
+				ExprKind::Memory(index) => name(
+					self.sema.decls.memories[usize::from(index)].name.inner,
+				)
+				.to_string(),
 				ExprKind::Function {
 					function,
 					type_args,
@@ -3522,9 +3314,11 @@ mod tests {
 					fields,
 				} => {
 					let name = name(
-						self.defs.structs[usize::from(struct_index)].name.inner,
+						self.sema.decls.structs[usize::from(struct_index)]
+							.name
+							.inner,
 					);
-					let count = self.context.structs[usize::from(struct_index)]
+					let count = self.sema.structs[usize::from(struct_index)]
 						.field_types
 						.len();
 					self.render_arguments(body, name, count, fields)
@@ -3682,10 +3476,12 @@ mod tests {
 					struct_index,
 					fields,
 				} => {
-					let name =
-						self.defs.structs[usize::from(struct_index)].name.inner;
-					let name = self.context.strings.resolve(name).unwrap();
-					let count = self.context.structs[usize::from(struct_index)]
+					let name = self.sema.decls.structs
+						[usize::from(struct_index)]
+					.name
+					.inner;
+					let name = self.strings.resolve(name).unwrap();
+					let count = self.sema.structs[usize::from(struct_index)]
 						.field_types
 						.len();
 					match body.pattern(fields) {
@@ -3745,8 +3541,8 @@ mod tests {
 		}
 
 		fn function_name(&self, index: super::FunctionIdx) -> &str {
-			let name = self.defs.functions[usize::from(index)].name.inner;
-			self.context.strings.resolve(name).unwrap()
+			let name = self.sema.decls.functions[usize::from(index)].name.inner;
+			self.strings.resolve(name).unwrap()
 		}
 
 		/// A constant's name, with its type arguments when it has any.
@@ -3755,11 +3551,8 @@ mod tests {
 			index: super::ConstIdx,
 			type_args: super::GenericArgs,
 		) -> String {
-			let name = self.defs.constants[usize::from(index)].name.inner;
-			self.with_type_args(
-				self.context.strings.resolve(name).unwrap(),
-				type_args,
-			)
+			let name = self.sema.decls.constants[usize::from(index)].name.inner;
+			self.with_type_args(self.strings.resolve(name).unwrap(), type_args)
 		}
 
 		/// A called function's name, with its type arguments when it has
@@ -3777,7 +3570,7 @@ mod tests {
 			name: &str,
 			type_args: super::GenericArgs,
 		) -> String {
-			let type_args = self.context.generic_args.types(type_args);
+			let type_args = self.sema.generic_args.types(type_args);
 			if type_args.is_empty() {
 				return name.to_string();
 			}
@@ -3790,7 +3583,7 @@ mod tests {
 			let name = body.local(local).name.inner;
 			format!(
 				"{}#{}",
-				self.context.strings.resolve(name).unwrap(),
+				self.strings.resolve(name).unwrap(),
 				u32::from(local)
 			)
 		}
@@ -3798,17 +3591,17 @@ mod tests {
 		fn field_name(
 			&self,
 			object: TypeIndex,
-			field: crate::tir::defs::FieldIdx,
+			field: crate::tir::decls::FieldIdx,
 		) -> &str {
 			let Type::Struct { struct_index, .. } =
-				*self.context.types.resolve(object)
+				*self.sema.types.resolve(object)
 			else {
 				panic!("a field of a non-struct");
 			};
-			let field = self.defs.structs[usize::from(struct_index)]
+			let field = self.sema.decls.structs[usize::from(struct_index)]
 				.field_names[usize::from(field)]
 			.unwrap();
-			self.context.strings.resolve(field.inner).unwrap()
+			self.strings.resolve(field.inner).unwrap()
 		}
 
 		/// A jump's target: its label, else the kind of scope it leaves.
@@ -3816,7 +3609,6 @@ mod tests {
 			let scope = body.scope(scope);
 			match scope.label {
 				Some(label) => self
-					.context
 					.strings
 					.resolve(body.label(label).name.inner)
 					.unwrap()
@@ -3832,8 +3624,7 @@ mod tests {
 				.locals()
 				.iter()
 				.map(|local| {
-					let name =
-						self.context.strings.resolve(local.name.inner).unwrap();
+					let name = self.strings.resolve(local.name.inner).unwrap();
 					(name.to_string(), self.display(local.ty))
 				})
 				.collect()
@@ -3860,9 +3651,10 @@ mod tests {
 		assert!(body.scope(super::ScopeIdx::ROOT).parent.is_none());
 		// Each use of a parameter is recorded as a reference to it.
 		let file_id = case
-			.defs
+			.sema
+			.decls
 			.namespaces
-			.file_id(Scope::Package(case.defs.root_package).into());
+			.file_id(Scope::Package(case.sema.decls.root_package).into());
 		let start = SOURCE.find("a + b").unwrap() as u32;
 		let site = (
 			crate::diagnostics::SourceSpan::new(
@@ -3872,7 +3664,7 @@ mod tests {
 			Tier::Value,
 		);
 		assert!(matches!(
-			case.context.resolutions.by_site.get(&site),
+			case.sema.resolutions.by_site.get(&site),
 			Some(Resolution::Reference(Referent::Local { local, .. })) if u32::from(*local) == 0
 		));
 	}
@@ -4301,9 +4093,10 @@ mod tests {
 		test_case!(case = SOURCE);
 		case.diagnostics().assert_none();
 		let file_id = case
-			.defs
+			.sema
+			.decls
 			.namespaces
-			.file_id(Scope::Package(case.defs.root_package).into());
+			.file_id(Scope::Package(case.sema.decls.root_package).into());
 		let start = (SOURCE.rfind(":outer").unwrap() + 1) as u32;
 		let site = (
 			crate::diagnostics::SourceSpan::new(
@@ -4313,7 +4106,7 @@ mod tests {
 			Tier::Value,
 		);
 		assert!(matches!(
-			case.context.resolutions.by_site.get(&site),
+			case.sema.resolutions.by_site.get(&site),
 			Some(Resolution::Reference(Referent::Label { label, .. })) if u32::from(*label) == 0
 		));
 	}
@@ -5197,7 +4990,7 @@ mod tests {
 				let ExprKind::String(symbol) = body.kind(expr) else {
 					panic!("expected a string literal");
 				};
-				case.context.strings.resolve(symbol).unwrap()
+				case.strings.resolve(symbol).unwrap()
 			})
 			.collect();
 		assert_eq!(contents, ["yes", "no"]);
@@ -5483,7 +5276,7 @@ mod tests {
 		test_case!(case = source);
 		case.diagnostics().print();
 		let at: Vec<&str> = case
-			.context
+			.sema
 			.diagnostics
 			.iter()
 			.filter(|diagnostic| {
@@ -5780,7 +5573,7 @@ mod tests {
 			 require to be `u8`",
 		);
 		let at: Vec<&str> = case
-			.context
+			.sema
 			.diagnostics
 			.iter()
 			.map(|diagnostic| &source[diagnostic.labels[0].range.clone()])
@@ -6026,13 +5819,13 @@ mod tests {
 		case: &TestCase<'_>,
 		name: &str,
 	) -> (GenericEnvIdx, TypeIndex) {
-		let DefKind::Function(index) = case.resolve(name) else {
+		let DeclKind::Function(index) = case.resolve(name) else {
 			panic!("expected `{name}` to be a function");
 		};
-		let signature = &case.context.functions[usize::from(index)];
+		let signature = &case.sema.functions[usize::from(index)];
 		(
 			signature.type_params,
-			case.context.types.list(signature.param_types)[0],
+			case.sema.types.list(signature.param_types)[0],
 		)
 	}
 
@@ -6051,9 +5844,10 @@ mod tests {
 		let (_, written) = first_param(&case, "written");
 		let without_values = RewriteFlags::ALL.without(RewriteFlags::VALUES);
 		let mut normalize = |ty, facts| {
-			case.context
+			case.sema
 				.normalize(
-					case.context.assumption_envs.of_frame(scope),
+					case.strings,
+					case.sema.assumption_envs.of_frame(scope),
 					ty,
 					NormalizationDepth::Deep,
 					facts,
@@ -6069,8 +5863,8 @@ mod tests {
 		// A type that cannot reach a constant means the same either way.
 		assert_eq!(normalize(written, without_values), written);
 		assert_eq!(normalize(written, RewriteFlags::ALL), written);
-		assert!(case.context.types.has_const(named));
-		assert!(!case.context.types.has_const(written));
+		assert!(case.sema.types.has_const(named));
+		assert!(!case.sema.types.has_const(written));
 	}
 
 	#[test]
@@ -6174,11 +5968,11 @@ mod tests {
 			case = "const SAME: Bool = Ordering::Less == Ordering::Greater;"
 		);
 		case.diagnostics().assert_none();
-		let DefKind::Const(index) = case.resolve("SAME") else {
+		let DeclKind::Const(index) = case.resolve("SAME") else {
 			panic!("expected a constant");
 		};
 		assert_eq!(
-			case.context.solver.const_values[usize::from(index)],
+			case.sema.solver.const_values[usize::from(index)],
 			ConstValueState::Evaluated(Box::new([ConstScalar::bool(false)]))
 		);
 	}
@@ -6200,11 +5994,11 @@ mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::ArraySizeMismatch]);
 		for name in ["BAD", "READ"] {
-			let DefKind::Const(index) = case.resolve(name) else {
+			let DeclKind::Const(index) = case.resolve(name) else {
 				panic!("expected a constant");
 			};
 			assert_eq!(
-				case.context.solver.const_values[usize::from(index)],
+				case.sema.solver.const_values[usize::from(index)],
 				ConstValueState::Poisoned,
 				"{name}"
 			);
@@ -6238,11 +6032,11 @@ mod tests {
 		);
 		case.diagnostics().assert_none();
 		for name in ["ID", "AGAIN"] {
-			let DefKind::Const(index) = case.resolve(name) else {
+			let DeclKind::Const(index) = case.resolve(name) else {
 				panic!("expected a constant");
 			};
 			assert_eq!(
-				case.context.solver.const_values[usize::from(index)],
+				case.sema.solver.const_values[usize::from(index)],
 				ConstValueState::Evaluated(Box::new([]))
 			);
 		}
@@ -6279,11 +6073,11 @@ mod tests {
 			"}
 		);
 		case.diagnostics().assert_none();
-		let DefKind::Const(index) = case.resolve("COUNTER") else {
+		let DeclKind::Const(index) = case.resolve("COUNTER") else {
 			panic!("expected a constant");
 		};
 		assert_eq!(
-			case.context.solver.const_values[usize::from(index)],
+			case.sema.solver.const_values[usize::from(index)],
 			ConstValueState::Evaluated(Box::new([]))
 		);
 		assert_eq!(
@@ -6636,11 +6430,11 @@ mod tests {
 			"(block => (abstract SIZE<T>))"
 		);
 		assert_eq!(case.shape("qualified"), "(block => SIZE)");
-		let DefKind::Const(index) = case.resolve("EVALUATED") else {
+		let DeclKind::Const(index) = case.resolve("EVALUATED") else {
 			panic!("expected a constant");
 		};
 		assert!(matches!(
-			case.context.solver.const_values[usize::from(index)],
+			case.sema.solver.const_values[usize::from(index)],
 			ConstValueState::Evaluated(_)
 		));
 	}

@@ -1,6 +1,7 @@
 # TypeContext ownership and explicit borrowing refactor
 
-Status: proposed design and implementation plan, not an implemented API.
+Status: implemented (2026-11-11); see "Done: step 3". The sections after it
+are the design as it was planned, kept for its reasoning.
 Date: 2026-11-10; direction revised 2026-11-11 (see "Revised direction").
 Companion: [native LSP migration plan](lsp-refactor-plan.md).
 
@@ -207,6 +208,105 @@ query state and stack and declaration obligations; move `ensure_signature`,
 `ImplDispatch::build`'s entry reading onto it, and give `BodyBuilder` its
 `construction` field. (3) Drop `TypeContext`'s lifetimes and make `check`
 return the owned context.
+
+### Done: step 3, owned `Semantics` (2026-11-11)
+
+`Semantics` has no lifetime. It owns `decls`, `impl_dispatch`, the solver
+(built by `Semantics::new` from the constant count), the diagnostics and the
+name resolutions; `Declarations::build` and `ImplDispatch::build` still write
+into local diagnostics and resolutions, which then move in. The API:
+
+```rust
+pub fn check(compilation: &CompilationUnit, strings: &mut StringInterner) -> Semantics;
+pub fn lower(sema: &mut Semantics, strings: &StringInterner) -> Result<MIR, ()>;
+impl Semantics { pub fn diagnostics(&self) -> &[Diagnostic<FileId>]; }
+```
+
+`tir::build` is gone. `lower` refuses a `Semantics` whose checking reported an
+error or a bug, so lowering never runs on a failed check, which is what
+`build` guaranteed.
+
+- **Strings are passed explicitly** (option (a), chosen with the user):
+  `Semantics` interns nothing (the one interning, a string literal's
+  contents, is the builder's), so its methods that read a name take
+  `strings: &StringInterner` as their first parameter (125 of them, the
+  solver chain included: `normalize` re-enters body deciding, which reports).
+  The short-lived structs over `sema` hold it as a field instead:
+  `BodyContext<'a>` and `Lowerer<'a>` (`&'a StringInterner`) and
+  `SemanticsBuilder<'ast>` (`&'ast mut`); `BodyBuilder` reads its builder's.
+  Clippy's `too_many_arguments` went from 12 to 18.
+- **`files` moved to `SemanticsBuilder`**: only syntax readers use it (literal
+  text, one diagnostic).
+- **Borrows that owning broke**: four loops read `decls`/`impl_dispatch` while
+  calling a `&mut` method. Each now collects the candidates that declare the
+  name first (a pure read) and then queries them, as the trait-candidate loop
+  beside them already did. `CallTarget` no longer borrows its parameter names
+  for the whole call; it records the naming declaration and reads them on
+  demand (`param_names(decls)`).
+- **Tests**: the conformance, eval, layout, typecheck and satisfaction
+  harnesses build through `tir::check`, so they need no `TestInputs`; the
+  signatures suite keeps `TestInputs` (what its builder borrows, kept past the
+  sweep) and reads the interner as `case.builder.strings`. The lowering and
+  backend tests call `check` and then `lower`.
+
+Validation: 1450 compiler tests pass (2 ignored), 75 formatter tests pass;
+build warnings unchanged; every example checks and every binary example
+builds; `cargo fmt` clean.
+
+### Renamed (2026-11-11)
+
+`TypeContext` is `Semantics` (variable `sema`): what the declarations mean,
+not only types. `Construction` is `SemanticsBuilder` (variable `builder`),
+and its `sweep` is `build`. A plain plural for the contents and `…Builder`
+for what produces them, as `Body`/`BodyBuilder`; the sections below keep the
+names they were written with.
+
+The prescan's output followed: `DefinitionRegistry` is `Declarations`
+(`decls`, `decls.rs`), with `DeclId`, `DeclKind`, `DeclKey` and
+`FunctionDecl`, `StructDecl`, … for `DefId`, `DefKind`, `DefKey` and the
+`*Def` records, and `Referent::Declaration` for `Referent::Definition`. It
+records what is declared and where; what a declaration means is
+`Semantics`'s. Unchanged: `solver::Definition` (an impl member's value or
+requirements, a different notion), the `DuplicateDefinition` diagnostic and
+`FunctionImplementation::Declaration` (a function with no body).
+
+### Done: step 2, `Construction` (2026-11-11)
+
+`Construction<'ast>` holds `entries: &'ast [AstEntry<'ast>]` (borrowed: the
+caller keeps the prescan's `Vec`, which `ImplDispatch::build` reads first, and
+construction iterates it while calling `&mut self` methods), the query state
+and stack, and the declaration obligations. 66 methods moved onto it, each
+taking `cx: &mut TypeContext` (or `&TypeContext`) when it needs the context:
+the measured 65 plus `check_function_body`, which builds a body. A context
+method may still take syntax as an argument (`resolve_type_args`,
+`self_entry`, conformance's `written_part`); what moved is what reads
+construction state, so `Construction` has no method that ignores `self`.
+`BodyBuilder` holds `construction` beside `cx` and calls through it at the 10
+measured sites. Three cuts first:
+
+- `const_scope` reads `ConstDef`'s file and namespace and the signature's env
+  (a variant's is `ROOT`).
+- Conformance is not a `TypeObligation`: `check_declarations` checks it after
+  a trait impl's own obligations, so `TypeObligation` is purely semantic.
+- The solver's three `query_stack.is_empty()` debug asserts are dropped:
+  nothing builds a signature after phase 1, and phase 1 is now visibly
+  construction code.
+
+`TypeContext` lost `'ast` (`TypeContext<'ctx, 'dispatch>`), and so did
+`BodyContext` and `Lowerer`. Four methods crossed clippy's argument limit by
+taking `cx` (12 `too_many_arguments`, from 8); most pass `(obligations,
+file_id, namespace, ..)`, a candidate for grouping.
+
+### Done: step 1, `BodyContext` / `BodyBuilder` (2026-11-11)
+
+As settled, with two differences found while doing it. `BodyContext` has no
+`owner`: nothing deciding reads it. And `normalized(ty)` normalizes in the
+body's own scope, which 21 of its 23 building callers passed explicitly (the
+argument read `self` while `context()` held it); `normalized_in(ty, env)` is
+the other two, a constant's type in its own frame. `decide` and the `decide_*`
+are in `typecheck/decide.rs`, exhaustiveness stays in `exhaustiveness.rs`, and
+the other shared methods are one `impl BodyContext` block at the top of
+`typecheck.rs`. Building reaches them through `self.context()` (61 sites).
 
 ### Done: lowering reads no AST (2026-11-11)
 

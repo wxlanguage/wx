@@ -277,7 +277,7 @@ impl Intrinsic {
 #[cfg(test)]
 mod tests {
 	use super::Intrinsic;
-	use crate::tir::defs::{DefinitionRegistry, PackageMemberItem, Tier};
+	use crate::tir::decls::{Declarations, PackageMemberItem, Tier};
 	use crate::tir::resolutions::NameResolutions;
 
 	#[test]
@@ -287,7 +287,7 @@ mod tests {
 			crate::tir::signatures::tests::source_graph("", &mut strings);
 		let mut diagnostics = Vec::new();
 		let mut resolutions = NameResolutions::default();
-		let (defs, _) = DefinitionRegistry::build(
+		let (decls, _) = Declarations::build(
 			&graph.packages,
 			&graph.files,
 			&mut strings,
@@ -299,7 +299,7 @@ mod tests {
 		assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 		let mut seen = Vec::new();
 		for (key, member) in
-			&defs.package_contracts[graph.stdlib_package.as_usize()].members
+			&decls.package_contracts[graph.stdlib_package.as_usize()].members
 		{
 			if key.tier != Tier::Value
 				|| !matches!(member.item, PackageMemberItem::Function(_))

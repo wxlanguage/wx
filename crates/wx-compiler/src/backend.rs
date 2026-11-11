@@ -65,9 +65,11 @@ mod tests {
 		"#;
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph = source_graph(source, &mut strings);
-		let mut mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("the source lowers");
+		let mut mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("the source lowers");
 		assert_eq!(mir.functions.len(), 2);
 		let bytes =
 			emit(&mut mir, &strings, Some(mir::inline::Policy::DEFAULT))
@@ -103,7 +105,11 @@ mod tests {
 		for inline in [None, Some(mir::inline::Policy::DEFAULT)] {
 			let mut strings = crate::symbols::Keyword::create_interner();
 			let graph = source_graph(source, &mut strings);
-			let mut mir = crate::tir::build(&graph, &mut strings).1.unwrap();
+			let mut mir = crate::tir::lower(
+				&mut crate::tir::check(&graph, &mut strings),
+				&strings,
+			)
+			.unwrap();
 			let count = mir.functions.len();
 			let exports: Vec<_> = mir.exports.iter().map(|e| e.item).collect();
 			let module = emit(&mut mir, &strings, inline).unwrap();

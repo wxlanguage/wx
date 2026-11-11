@@ -29,7 +29,7 @@ use crate::tir::body::{
 	Arm, ArmRange, ExprKind, PatIdx, PatternKind, PatternRange,
 };
 use crate::tir::bounds::AssumptionEnvIdx;
-use crate::tir::defs::{ConstIdx, FieldIdx, MemberKind};
+use crate::tir::decls::{ConstIdx, FieldIdx, MemberKind};
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::types::Primitive;
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
@@ -48,7 +48,7 @@ struct Projection {
 	tir_ty: TypeIndex,
 }
 
-impl Lowerer<'_, '_, '_, '_> {
+impl Lowerer<'_> {
 	/// Lower `local pattern = value`. The initializer runs exactly once,
 	/// before any binding. A binding or wildcard keeps the direct store/drop
 	/// form; anything structural is read through a projection of that one
@@ -119,7 +119,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		let tir_ty =
 			self.normalize_type(tir_ty, state.file_id, body.span(scrutinee))?;
 		let compares_by_eq = matches!(
-			self.context.types.resolve(tir_ty),
+			self.sema.types.resolve(tir_ty),
 			Type::Struct { .. } | Type::Tuple { .. }
 		);
 		// A diverging scrutinee means no arm runs. Keeping the scrutinee's
@@ -212,7 +212,7 @@ impl Lowerer<'_, '_, '_, '_> {
 					if !type_args.is_empty() {
 						return None;
 					}
-					match self.context.constant_bits(constant) {
+					match self.sema.constant_bits(self.strings, constant) {
 						Ok(Some(bits)) => {
 							Some(constant_int_discriminant(bits, ty)?)
 						}
@@ -595,7 +595,7 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			unreachable!()
 		}
-		let value = match self.context.const_value(constant) {
+		let value = match self.sema.const_value(self.strings, constant) {
 			Ok(value) => value.to_vec(),
 			Err(_) => {
 				self.unsupported(
@@ -620,7 +620,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		// A struct or a tuple compares by its type's `PartialEq`, however
 		// many scalars it is: `P(x: i32)`'s may compare less than `x`.
 		if matches!(
-			self.context.types.resolve(subject.tir_ty),
+			self.sema.types.resolve(subject.tir_ty),
 			Type::Struct { .. } | Type::Tuple { .. }
 		) {
 			let file_id = state.file_id;
@@ -670,7 +670,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		value: mir::ExprId,
 		span: TextSpan,
 	) -> Result<mir::ExprId, ()> {
-		let Some(method) = self.context.operators.binary(BinaryOp::Eq) else {
+		let Some(method) = self.sema.operators.binary(BinaryOp::Eq) else {
 			self.unsupported(
 				state.file_id,
 				span,
@@ -679,7 +679,8 @@ impl Lowerer<'_, '_, '_, '_> {
 			unreachable!()
 		};
 		// The subject's type is concrete, so no assumption can apply.
-		let lookup = match self.context.find_trait_impl_query(
+		let lookup = match self.sema.find_trait_impl_query(
+			self.strings,
 			AssumptionEnvIdx::ROOT,
 			subject.tir_ty,
 			method.trait_index,
@@ -713,8 +714,8 @@ impl Lowerer<'_, '_, '_, '_> {
 		let TraitMemberSelection::Impl(
 			MemberKind::Method(function) | MemberKind::Function(function),
 		) = self
-			.context
-			.defs
+			.sema
+			.decls
 			.select_trait_member(impl_index, MemberKind::Method(method.method))
 		else {
 			self.unsupported(
@@ -730,7 +731,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		let callee_id = self.enqueue_from(state, callee, span)?;
 		// The checked signature's count; nothing about the callee is
 		// lowered for it.
-		let param_count = self.context.functions[usize::from(callee.function)]
+		let param_count = self.sema.functions[usize::from(callee.function)]
 			.param_types
 			.len();
 		if param_count != 2 {

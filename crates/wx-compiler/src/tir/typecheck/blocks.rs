@@ -10,19 +10,19 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::patterns::PatternContext;
-use super::{BodyContext, ScopeType};
+use super::{BodyBuilder, ScopeType};
 use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{
 	self, Body, ExprIdx, ExprKind, ExprObligation, LabelIdx, LocalIdx,
 	Obligations, Scope, ScopeIdx, ScopeKind,
 };
-use crate::tir::defs::{FunctionIdx, Tier};
+use crate::tir::decls::{FunctionIdx, Tier};
 use crate::tir::resolutions::Referent;
 use crate::tir::signatures::InferPolicy;
 use crate::tir::types::TypeIndex;
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyBuilder<'_, '_> {
 	/// Checks a function's block as its body. Its named parameters are the
 	/// root scope's first locals (`Body::params` says which parameter each
 	/// is), and the block's statements are written directly in the root
@@ -33,20 +33,18 @@ impl BodyContext<'_, '_, '_, '_> {
 		signature: &ast::FunctionSignature,
 		block: &Spanned<ast::Expression>,
 	) -> (Body, Obligations) {
-		let env = self.scope.generic_env;
-		let function = &self.cx.functions[usize::from(function_index)];
+		let function = &self.sema.functions[usize::from(function_index)];
 		let (param_types, return_type) =
 			(function.param_types, function.return_type);
 		// A type with a reported part in it expects nothing more.
-		let return_type =
-			self.normalized(return_type, self.cx.assumption_envs.of_frame(env));
-		let return_type = self.cx.types.collapse_error(return_type);
+		let return_type = self.context().normalized(return_type);
+		let return_type = self.sema.types.collapse_error(return_type);
 		self.enter_root(block.span, return_type);
 		for (at, param) in signature.params.iter().enumerate() {
 			let param = &param.inner.inner;
-			let ty = self.cx.types.list(param_types)[at];
-			let ty = self.normalized(ty, self.cx.assumption_envs.of_frame(env));
-			let ty = self.cx.types.collapse_error(ty);
+			let ty = self.sema.types.list(param_types)[at];
+			let ty = self.context().normalized(ty);
+			let ty = self.sema.types.collapse_error(ty);
 			// An unnamed parameter binds nothing, so it has no local.
 			let local = match param.binding {
 				Some(ast::Binding::Name { mut_span, name }) => {
@@ -192,7 +190,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			.map(|result| result.span.end)
 			.or(statements.last().map(|statement| statement.inner.span.end));
 		if let (Some(start), Some(end)) = (start, end) {
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::warning()
 					.with_code(DiagnosticCode::UnreachableCode.code())
 					.with_message("unreachable code")
@@ -216,19 +214,19 @@ impl BodyContext<'_, '_, '_, '_> {
 			ast::Statement::Expression(expr) => {
 				let value = self.build(expr, TypeIndex::INFER);
 				let ty = self.body.ty(value);
-				if self.cx.types.needs_context(ty) {
+				if self.sema.types.needs_context(ty) {
 					self.report_annotation_required(value);
 				} else if ty != TypeIndex::UNIT
 					&& ty != TypeIndex::NEVER
 					&& ty != TypeIndex::ERROR
 				{
-					self.cx.diagnostics.push(
+					let at = self.context().source_span(value);
+					self.sema.diagnostics.push(
 						Diagnostic::error()
 							.with_code(DiagnosticCode::UnusedValue.code())
 							.with_message("value must be used")
 							.with_label(
-								self.source_span(value)
-									.primary_label()
+								at.primary_label()
 									.with_message("value never used"),
 							)
 							.with_note(
@@ -252,13 +250,14 @@ impl BodyContext<'_, '_, '_, '_> {
 		value: &Spanned<ast::Expression>,
 		ty: &Spanned<ast::TypeExpression>,
 	) -> ExprIdx {
-		let ty = self.cx.resolve_value_type(
+		let ty = self.builder.resolve_value_type(
+			self.sema,
 			&mut self.obligations.types,
 			self.scope,
 			ty,
 			InferPolicy::Allow,
 		);
-		let ty = self.normalized(ty, self.scope.assumption_env);
+		let ty = self.context().normalized(ty);
 		self.check(value, ty)
 	}
 
@@ -273,13 +272,14 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let declared = ty.map(|ty| {
-			let ty = self.cx.resolve_value_type(
+			let ty = self.builder.resolve_value_type(
+				self.sema,
 				&mut self.obligations.types,
 				self.scope,
 				ty,
 				InferPolicy::Allow,
 			);
-			self.normalized(ty, self.scope.assumption_env)
+			self.context().normalized(ty)
 		});
 		let value = match declared {
 			Some(declared) => self.check(value, declared),
@@ -289,18 +289,18 @@ impl BodyContext<'_, '_, '_, '_> {
 		// A written `_` in the type is learned from the value.
 		let mut local_ty = match declared {
 			Some(declared) => {
-				self.cx.types.meet(declared, value_ty).unwrap_or(declared)
+				self.sema.types.meet(declared, value_ty).unwrap_or(declared)
 			}
 			None => value_ty,
 		};
 		// A written slice or array is reported as held by value.
 		let unplaced =
-			declared.is_none() && self.cx.types.needs_context(local_ty);
+			declared.is_none() && self.sema.types.needs_context(local_ty);
 		if unplaced
-			|| self.cx.types.has_literal(local_ty)
-			|| self.cx.types.has_infer(local_ty)
+			|| self.sema.types.has_literal(local_ty)
+			|| self.sema.types.has_infer(local_ty)
 		{
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
 					.with_message("type annotation required")
@@ -337,7 +337,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> ExprIdx {
 		let scrutinee = self.build(scrutinee, TypeIndex::INFER);
 		let mut scrutinee_ty = self.body.ty(scrutinee);
-		if self.cx.types.needs_context(scrutinee_ty) {
+		if self.sema.types.needs_context(scrutinee_ty) {
 			self.report_annotation_required(scrutinee);
 			scrutinee_ty = TypeIndex::ERROR;
 		}
@@ -398,7 +398,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			// An untyped arm that gave way keeps the typed one as the one the
 			// rest join.
-			if !self.cx.types.needs_context(self.body.ty(arm)) {
+			if !self.sema.types.needs_context(self.body.ty(arm)) {
 				joined = arm;
 			}
 		}
@@ -406,9 +406,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		// the untyped arms joined before it still wait for a type
 		// (`0, 1, g()` with `g() -> u8`). The match is typed now, so its
 		// context will not coerce them.
-		if ty != TypeIndex::ERROR && !self.cx.types.needs_context(ty) {
+		if ty != TypeIndex::ERROR && !self.sema.types.needs_context(ty) {
 			for &arm in arms {
-				if self.cx.types.needs_context(self.body.ty(arm)) {
+				if self.sema.types.needs_context(self.body.ty(arm)) {
 					self.coerce(arm, ty);
 				}
 			}
@@ -438,18 +438,18 @@ impl BodyContext<'_, '_, '_, '_> {
 				&& then_ty != TypeIndex::ERROR
 			{
 				ty = TypeIndex::ERROR;
-				let found = self.cx.type_formatter().display_type(then_ty);
-				self.cx.diagnostics.push(
+				let found = self
+					.sema
+					.type_formatter(self.builder.strings)
+					.display_type(then_ty);
+				let at = self.context().source_span(then_block);
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::MissingElseBlock.code())
 						.with_message("`if` may be missing an `else` clause")
-						.with_label(
-							self.source_span(then_block)
-								.primary_label()
-								.with_message(format!(
-									"expected `()`, found `{found}`"
-								)),
-						)
+						.with_label(at.primary_label().with_message(format!(
+							"expected `()`, found `{found}`"
+						)))
 						.with_note("`if` without `else` evaluates to `()`"),
 				);
 			}
@@ -504,8 +504,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			return TypeIndex::ERROR;
 		}
 		match (
-			self.cx.types.needs_context(first_ty),
-			self.cx.types.needs_context(second_ty),
+			self.sema.types.needs_context(first_ty),
+			self.sema.types.needs_context(second_ty),
 		) {
 			(true, false) => {
 				self.coerce(first, second_ty);
@@ -532,9 +532,10 @@ impl BodyContext<'_, '_, '_, '_> {
 				TypeIndex::FLOAT_LITERAL
 			}
 			_ => {
-				let diagnostic =
-					self.report_type_mismatch(first_ty, second_ty, second);
-				self.cx.diagnostics.push(diagnostic);
+				let diagnostic = self
+					.context()
+					.report_type_mismatch(first_ty, second_ty, second);
+				self.sema.diagnostics.push(diagnostic);
 				TypeIndex::ERROR
 			}
 		}
@@ -640,7 +641,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			};
 			if found {
 				if let (Some(name), Some(scope_label)) = (label, scope_label) {
-					self.cx.resolutions.record(
+					self.sema.resolutions.record(
 						(
 							SourceSpan::new(self.scope.file_id, name.span),
 							Tier::Value,
@@ -652,7 +653,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					);
 				}
 				if jump == Jump::Continue && kind != ScopeKind::Loop {
-					self.cx.diagnostics.push(
+					self.sema.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::ContinueOutsideOfLoop.code(),
@@ -671,7 +672,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		let diagnostic = match (label, jump) {
 			(Some(name), _) => {
-				let name_text = self.cx.strings.resolve(name.inner).unwrap();
+				let name_text =
+					self.builder.strings.resolve(name.inner).unwrap();
 				Diagnostic::error()
 					.with_code(DiagnosticCode::UndeclaredLabel.code())
 					.with_message(format!(
@@ -691,7 +693,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				.with_message("`continue` outside of a loop")
 				.with_label(Label::primary(self.scope.file_id, span)),
 		};
-		self.cx.diagnostics.push(diagnostic);
+		self.sema.diagnostics.push(diagnostic);
 		None
 	}
 
@@ -730,7 +732,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			self.expect(value, hint);
 			return;
 		}
-		if self.cx.types.needs_context(ty) && !allow_untyped {
+		if self.sema.types.needs_context(ty) && !allow_untyped {
 			self.report_annotation_required(value);
 			self.scope_types[usize::from(scope)].ty = TypeIndex::ERROR;
 			return;
@@ -751,8 +753,9 @@ impl BodyContext<'_, '_, '_, '_> {
 		if hint == TypeIndex::ERROR {
 			return;
 		}
-		let diagnostic = self.mismatch_at(hint, TypeIndex::UNIT, span);
-		self.cx.diagnostics.push(diagnostic);
+		let diagnostic =
+			self.context().mismatch_at(hint, TypeIndex::UNIT, span);
+		self.sema.diagnostics.push(diagnostic);
 	}
 }
 

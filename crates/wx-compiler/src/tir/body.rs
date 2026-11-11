@@ -21,7 +21,7 @@
 
 use string_interner::symbol::SymbolU32;
 
-use super::defs::{
+use super::decls::{
 	ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, ImportIdx, MemoryIdx, StructIdx,
 };
 use super::obligations::TypeObligation;
@@ -56,13 +56,13 @@ pub(super) enum BodyOwner {
 	Global(GlobalIdx),
 }
 
-/// What implements a function, indexed by `FunctionIdx` in `TypeContext`.
+/// What implements a function, indexed by `FunctionIdx` in `Semantics`.
 /// This is independent of signature-query readiness. A declaration may be a
 /// trait requirement or an ordinary bodiless function; its source definition
 /// retains that distinction.
 #[derive(Clone, Copy)]
 pub(super) enum FunctionImplementation {
-	/// Its checked block, in `TypeContext::bodies`.
+	/// Its checked block, in `Semantics::bodies`.
 	Defined(BodyIdx),
 	Imported(ImportIdx),
 	/// A package function parameter: whoever instantiates its package
@@ -81,13 +81,13 @@ impl FunctionImplementation {
 }
 
 /// A constant's checked initializer. Every one is built before anything
-/// evaluates (`TypeContext::build_constant_bodies`), so evaluation never
+/// evaluates (`Semantics::build_constant_bodies`), so evaluation never
 /// reads a `NotBuilt` one.
 #[derive(Clone, Copy)]
 pub(super) enum ConstBody {
 	/// Not built yet.
 	NotBuilt,
-	/// Built, in `TypeContext::bodies`.
+	/// Built, in `Semantics::bodies`.
 	Built(BodyIdx),
 	/// It has none: a required trait constant.
 	Missing,
@@ -98,7 +98,7 @@ pub(super) enum ConstBody {
 /// subject is a type and which the solver decides. Building a body never reads
 /// a value, so it records these beside the body; a function's or a global's are
 /// decided as the body is finished, a constant's once every constant it reads
-/// is checked (`TypeContext::check_constant_bodies`).
+/// is checked (`Semantics::check_constant_bodies`).
 #[derive(Clone, Copy)]
 pub(super) enum ExprObligation {
 	/// `expr`'s type is `expected`; one of them holds a constant not
@@ -121,7 +121,7 @@ pub(super) enum ExprObligation {
 
 /// What building a body left undecided, beside the body: a function's or a
 /// global's are decided as the body is finished, a constant's are kept
-/// (`TypeContext::const_obligations`) until it is checked.
+/// (`Semantics::const_obligations`) until it is checked.
 #[derive(Default)]
 pub(super) struct Obligations {
 	/// What lowering the body's written types required.

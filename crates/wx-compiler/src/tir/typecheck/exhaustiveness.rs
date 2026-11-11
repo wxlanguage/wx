@@ -13,14 +13,14 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
 use crate::tir::body::{ExprIdx, ExprKind, PatIdx, PatternKind};
-use crate::tir::defs::{ConstIdx, EnumIdx};
+use crate::tir::decls::{ConstIdx, EnumIdx};
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
 use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
 
 /// How many missing patterns a non-exhaustive match names.
 const SHOWN_WITNESSES: usize = 3;
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyContext<'_> {
 	/// Reports each arm of `expr`, a `match`, that the arms before it cover,
 	/// and the values no arm matches. A match with a pattern that failed to
 	/// check is left alone: what failed has said why. Decided as an
@@ -31,7 +31,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		};
 		let arms = self.body.arms(arms).to_vec();
 		let ty = self.body.ty(scrutinee);
-		if self.cx.types.has_error(ty) {
+		if self.sema.types.has_error(ty) {
 			return;
 		}
 		let mut rows = Vec::with_capacity(arms.len());
@@ -51,7 +51,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			witnesses(self, &rows, &[Pat::Wild], &[ty], SHOWN_WITNESSES + 1);
 		for pattern in unreachable {
 			let span = self.body.pattern_span(pattern);
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::warning()
 					.with_code(DiagnosticCode::UnreachableMatchArm.code())
 					.with_message("unreachable match arm")
@@ -86,7 +86,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			[] => unreachable!(),
 		};
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::NonExhaustiveMatch.code())
 				.with_message(format!(
@@ -117,7 +117,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				fields,
 			} => {
 				let fields = self.lower_pattern(fields)?;
-				let count = self.cx.structs[usize::from(struct_index)]
+				let count = self.sema.structs[usize::from(struct_index)]
 					.field_types
 					.len();
 				if count == 1 {
@@ -180,7 +180,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		let bits = self.pattern_bits(constant)?;
 		match Integer::from_type(ty) {
 			Some(integer) => Some(bits & integer.mask()),
-			None => match *self.cx.types.resolve(ty) {
+			None => match *self.sema.types.resolve(ty) {
 				Type::Enum { .. } => Some(bits),
 				_ if ty == TypeIndex::CHAR => Some(bits),
 				_ => None,
@@ -191,14 +191,18 @@ impl BodyContext<'_, '_, '_, '_> {
 	/// A constant's value as a pattern compares with it; `None` when it has
 	/// none (it is opaque to the match).
 	fn pattern_bits(&mut self, constant: ConstIdx) -> Option<u64> {
-		self.cx.constant_bits(constant).ok().flatten()
+		self.sema
+			.constant_bits(self.strings, constant)
+			.ok()
+			.flatten()
 	}
 
 	/// The value of each of an enum's variants, in written order, each once;
 	/// `None` when one has no value here.
 	fn variant_values(&mut self, enum_index: EnumIdx) -> Option<Vec<u64>> {
-		let variants =
-			self.cx.defs.enums[usize::from(enum_index)].variants.clone();
+		let variants = self.sema.decls.enums[usize::from(enum_index)]
+			.variants
+			.clone();
 		let mut values = Vec::new();
 		for at in u32::from(variants.start)..u32::from(variants.end) {
 			let bits = self.pattern_bits(ConstIdx::new(at))?;
@@ -232,12 +236,13 @@ impl BodyContext<'_, '_, '_, '_> {
 			.map(|field| self.render_witness(field))
 			.collect();
 		let Ctor::Value(bits) = *ctor else {
-			return match *self.cx.types.resolve(ty) {
+			return match *self.sema.types.resolve(ty) {
 				Type::Struct { struct_index, .. } => {
-					let name = self.cx.defs.structs[usize::from(struct_index)]
-						.name
-						.inner;
-					let name = self.cx.strings.resolve(name).unwrap();
+					let name = self.sema.decls.structs
+						[usize::from(struct_index)]
+					.name
+					.inner;
+					let name = self.strings.resolve(name).unwrap();
 					format!("{name}({})", fields.join(", "))
 				}
 				_ => format!("({})", fields.join(", ")),
@@ -250,18 +255,19 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			return bits.to_string();
 		}
-		if let Type::Enum { enum_index } = *self.cx.types.resolve(ty) {
-			let def = &self.cx.defs.enums[usize::from(enum_index)];
-			let (enum_name, variants) = (def.name.inner, def.variants.clone());
+		if let Type::Enum { enum_index } = *self.sema.types.resolve(ty) {
+			let decl = &self.sema.decls.enums[usize::from(enum_index)];
+			let (enum_name, variants) =
+				(decl.name.inner, decl.variants.clone());
 			for at in u32::from(variants.start)..u32::from(variants.end) {
 				let constant = ConstIdx::new(at);
 				if self.pattern_bits(constant) == Some(bits) {
 					let variant =
-						self.cx.defs.constants[at as usize].name.inner;
+						self.sema.decls.constants[at as usize].name.inner;
 					return format!(
 						"{}::{}",
-						self.cx.strings.resolve(enum_name).unwrap(),
-						self.cx.strings.resolve(variant).unwrap()
+						self.strings.resolve(enum_name).unwrap(),
+						self.strings.resolve(variant).unwrap()
 					);
 				}
 			}
@@ -270,7 +276,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 }
 
-impl Shapes for BodyContext<'_, '_, '_, '_> {
+impl Shapes for BodyContext<'_> {
 	fn ctor_set(&mut self, ty: TypeIndex) -> CtorSet {
 		if ty == TypeIndex::NEVER {
 			return CtorSet::Empty;
@@ -280,12 +286,13 @@ impl Shapes for BodyContext<'_, '_, '_, '_> {
 				count: u128::from(integer.mask()) + 1,
 			};
 		}
-		match *self.cx.types.resolve(ty) {
+		match *self.sema.types.resolve(ty) {
 			Type::Tuple { .. } | Type::Struct { .. } => CtorSet::Single,
 			Type::Enum { enum_index } => {
-				let open =
-					self.cx.defs.enums[usize::from(enum_index)].open.is_some();
-				let range = Integer::from_type(self.cx.enum_repr(enum_index))
+				let open = self.sema.decls.enums[usize::from(enum_index)]
+					.open
+					.is_some();
+				let range = Integer::from_type(self.sema.enum_repr(enum_index))
 					.map(|integer| u128::from(integer.mask()) + 1);
 				match self.variant_values(enum_index) {
 					// An open enum has the rest of its repr's values, unless
@@ -307,14 +314,14 @@ impl Shapes for BodyContext<'_, '_, '_, '_> {
 	}
 
 	fn fields(&mut self, ty: TypeIndex) -> Vec<TypeIndex> {
-		match *self.cx.types.resolve(ty) {
-			Type::Tuple { elements } => self.cx.types.list(elements).to_vec(),
+		match *self.sema.types.resolve(ty) {
+			Type::Tuple { elements } => self.sema.types.list(elements).to_vec(),
 			Type::Struct {
 				struct_index,
 				type_args,
 			} => {
-				let type_args = self.cx.types.list(type_args).to_vec();
-				let count = self.cx.structs[usize::from(struct_index)]
+				let type_args = self.sema.types.list(type_args).to_vec();
+				let count = self.sema.structs[usize::from(struct_index)]
 					.field_types
 					.len();
 				(0..count)

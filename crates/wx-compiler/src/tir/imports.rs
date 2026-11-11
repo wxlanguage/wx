@@ -1,5 +1,5 @@
 //! Resolves `use` imports demand-driven and memoized against cycles, once
-//! `defs.rs`'s prescan has populated every namespace's bindings and every
+//! `decls.rs`'s prescan has populated every namespace's bindings and every
 //! `use` item/path segment.
 
 use rustc_hash::FxHashMap;
@@ -14,23 +14,23 @@ use crate::{
 	vfs::FileId,
 };
 
-use super::defs::{
-	Binding, BindingKey, BindingLookup, BindingTarget, DefKey,
+use super::decls::{
+	Binding, BindingKey, BindingLookup, BindingTarget, DeclKey,
 	DuplicateDefinitionDiagnostic, GlobImport, Namespace, Namespaces, Scope,
-	UseItemDef, UseItemIndex, UseItemKind, UsePathIndex, UsePathSegment,
+	UseItemDecl, UseItemIndex, UseItemKind, UsePathIndex, UsePathSegment,
 	Visibility,
 };
 use super::resolutions::{NameResolutions, Referent};
 
 /// Outcome of looking up one `BindingKey` slot for a `use` leaf's target
-/// name. Kept distinct from a plain `Option<DefKey>` so the caller can
+/// name. Kept distinct from a plain `Option<DeclKey>` so the caller can
 /// tell "nothing by this name here" apart from "something's here, but not
-/// visible" — resolution proceeds either way (both carry the `DefKey`),
+/// visible" — resolution proceeds either way (both carry the `DeclKey`),
 /// but only `Absent` means there's truly nothing to install.
 #[derive(Clone, Copy)]
 enum ImportSlot {
-	Accessible(DefKey, Visibility),
-	Inaccessible(DefKey, Visibility),
+	Accessible(DeclKey, Visibility),
+	Inaccessible(DeclKey, Visibility),
 	/// No binding for this key at all — genuinely nothing by this name.
 	Absent,
 	/// A binding exists, but it's an `Error`-recovery placeholder from an
@@ -118,11 +118,11 @@ impl<T: Copy> ResolveStatus<T> {
 }
 
 /// Everything import resolution needs, split out of
-/// `DefinitionRegistryBuilder` along the line that actually matters here:
+/// `DeclarationsBuilder` along the line that actually matters here:
 /// `namespaces` (bindings get inserted into it) and `diagnostics` are still
 /// mutated; `use_items`/`use_paths`/`pending_named_imports` are frozen by
 /// the time this phase runs. Storing the frozen parts as borrows (not the
-/// owned `Vec`/`HashMap` fields `DefinitionRegistryBuilder` has) means
+/// owned `Vec`/`HashMap` fields `DeclarationsBuilder` has) means
 /// reading them never competes with the `&mut self` calls that touch
 /// `namespaces`/`diagnostics`.
 pub(super) struct ImportResolver<'r> {
@@ -131,7 +131,7 @@ pub(super) struct ImportResolver<'r> {
 	strings: &'r StringInterner,
 	namespaces: &'r mut Namespaces,
 
-	use_items: &'r [UseItemDef],
+	use_items: &'r [UseItemDecl],
 	use_paths: &'r [UsePathSegment],
 	pending_named_imports:
 		&'r FxHashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
@@ -149,15 +149,15 @@ pub(super) struct ImportResolver<'r> {
 }
 
 impl<'r> ImportResolver<'r> {
-	/// Entry point for `DefinitionRegistryBuilder::resolve_imports` — the
-	/// only thing `defs.rs` needs to know about this module. Keeps every
+	/// Entry point for `DeclarationsBuilder::resolve_imports` — the
+	/// only thing `decls.rs` needs to know about this module. Keeps every
 	/// other field/method on `ImportResolver` private to this file.
 	pub(super) fn resolve_imports(
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		resolutions: &mut NameResolutions,
 		strings: &StringInterner,
 		namespaces: &mut Namespaces,
-		use_items: &[UseItemDef],
+		use_items: &[UseItemDecl],
 		use_paths: &[UsePathSegment],
 		pending_named_imports: &FxHashMap<
 			(Scope, SymbolU32),
@@ -415,13 +415,13 @@ impl<'r> ImportResolver<'r> {
 			}
 		}
 
-		let (mut type_def, type_ambiguity) = self.resolve_member_def(
+		let (mut type_decl, type_ambiguity) = self.resolve_member_decl(
 			namespace,
 			scope,
 			BindingKey::ty(name.inner),
 			name.span,
 		);
-		let (mut value_def, value_ambiguity) = self.resolve_member_def(
+		let (mut value_decl, value_ambiguity) = self.resolve_member_decl(
 			namespace,
 			scope,
 			BindingKey::value(name.inner),
@@ -442,22 +442,22 @@ impl<'r> ImportResolver<'r> {
 		// and whoever uses the constructor reports it. With nothing accessible
 		// the `use` itself is the error, reported once, here, and installed
 		// `Accessible`: having been reported, there is nothing left to defer.
-		match (type_def, value_def) {
+		match (type_decl, value_decl) {
 			(ImportSlot::Accessible(..), _)
 			| (_, ImportSlot::Accessible(..)) => {}
-			(ImportSlot::Inaccessible(def_key, _), _)
-			| (_, ImportSlot::Inaccessible(def_key, _)) => {
+			(ImportSlot::Inaccessible(decl_key, _), _)
+			| (_, ImportSlot::Inaccessible(decl_key, _)) => {
 				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = report_private_identifier(
 					self.namespaces,
 					self.strings,
 					name.inner,
 					SourceSpan::new(file_id, name.span),
-					Some(def_key),
+					Some(decl_key),
 				);
 				self.diagnostics.push(diagnostic);
-				type_def = type_def.recovered();
-				value_def = value_def.recovered();
+				type_decl = type_decl.recovered();
+				value_decl = value_decl.recovered();
 			}
 			_ => {}
 		}
@@ -471,11 +471,11 @@ impl<'r> ImportResolver<'r> {
 		// `Errored` too and stays silent, however many hops deep the
 		// chain goes, instead of hitting genuine `Absent` again and
 		// reporting the same underlying problem a second time.
-		if matches!(type_def, ImportSlot::Absent | ImportSlot::Poisoned)
-			&& matches!(value_def, ImportSlot::Absent | ImportSlot::Poisoned)
+		if matches!(type_decl, ImportSlot::Absent | ImportSlot::Poisoned)
+			&& matches!(value_decl, ImportSlot::Absent | ImportSlot::Poisoned)
 		{
-			if matches!(type_def, ImportSlot::Absent)
-				&& matches!(value_def, ImportSlot::Absent)
+			if matches!(type_decl, ImportSlot::Absent)
+				&& matches!(value_decl, ImportSlot::Absent)
 			{
 				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = self.report_unresolved_import(
@@ -500,9 +500,10 @@ impl<'r> ImportResolver<'r> {
 			return;
 		}
 
-		let (type_def, value_def) = (type_def.resolved(), value_def.resolved());
+		let (type_decl, value_decl) =
+			(type_decl.resolved(), value_decl.resolved());
 		// One leaf re-exports one name, however many tiers it fills.
-		let reexports_private = [type_def, value_def]
+		let reexports_private = [type_decl, value_decl]
 			.into_iter()
 			.flatten()
 			.any(|(target, source_visibility)| {
@@ -526,7 +527,7 @@ impl<'r> ImportResolver<'r> {
 					index,
 				)
 			};
-		match (type_def.map(binding), value_def.map(binding)) {
+		match (type_decl.map(binding), value_decl.map(binding)) {
 			(Some(ty), Some(value)) => self.insert_type_and_value(
 				namespace,
 				local_name.inner,
@@ -655,7 +656,7 @@ impl<'r> ImportResolver<'r> {
 	/// def kind (function, struct, const...), not just a namespace, so
 	/// there's no `Namespace::of` requirement here, just visibility and
 	/// `Def`-ness.
-	fn resolve_member_def(
+	fn resolve_member_decl(
 		&mut self,
 		accessor: Scope,
 		scope: Namespace,
@@ -678,10 +679,10 @@ impl<'r> ImportResolver<'r> {
 				visibility,
 				import,
 			} => {
-				if let Some(def_key) = target.def_key() {
+				if let Some(decl_key) = target.decl_key() {
 					self.resolutions.record(
 						(source_span, key.tier),
-						Referent::from_lookup(def_key, import),
+						Referent::from_lookup(decl_key, import),
 					);
 				}
 				(target, visibility)
@@ -707,17 +708,17 @@ impl<'r> ImportResolver<'r> {
 		let slot = match target {
 			// Already inaccessible at an earlier link in a re-export chain —
 			// can't become more accessible by being re-exported further.
-			BindingTarget::Inaccessible(def_key) => {
-				ImportSlot::Inaccessible(def_key, visibility)
+			BindingTarget::Inaccessible(decl_key) => {
+				ImportSlot::Inaccessible(decl_key, visibility)
 			}
-			BindingTarget::Accessible(def_key) => {
+			BindingTarget::Accessible(decl_key) => {
 				if self
 					.namespaces
 					.is_accessible_from(accessor, scope, visibility)
 				{
-					ImportSlot::Accessible(def_key, visibility)
+					ImportSlot::Accessible(decl_key, visibility)
 				} else {
-					ImportSlot::Inaccessible(def_key, visibility)
+					ImportSlot::Inaccessible(decl_key, visibility)
 				}
 			}
 			// An `Error`-recovery placeholder — already diagnosed by
@@ -868,10 +869,10 @@ impl<'r> ImportResolver<'r> {
 				visibility,
 				import,
 			} => {
-				if let Some(def_key) = target.def_key() {
+				if let Some(decl_key) = target.decl_key() {
 					self.resolutions.record(
 						(source_span, key.tier),
-						Referent::from_lookup(def_key, import),
+						Referent::from_lookup(decl_key, import),
 					);
 				}
 				(target, visibility)
@@ -910,15 +911,15 @@ impl<'r> ImportResolver<'r> {
 				self.strings,
 				segment.segment.inner,
 				source_span,
-				target.def_key(),
+				target.decl_key(),
 			);
 			self.diagnostics.push(diagnostic);
 		}
-		let BindingTarget::Accessible(def_key) = target else {
+		let BindingTarget::Accessible(decl_key) = target else {
 			return Err(());
 		};
 
-		match self.namespaces.entered_by(def_key) {
+		match self.namespaces.entered_by(decl_key) {
 			Some(namespace) => Ok(namespace),
 			None => {
 				let diagnostic = report_cannot_use_as_namespace(
@@ -926,7 +927,7 @@ impl<'r> ImportResolver<'r> {
 					self.strings,
 					segment.segment.inner,
 					source_span,
-					def_key,
+					decl_key,
 				);
 				self.diagnostics.push(diagnostic);
 				Err(())
@@ -1093,12 +1094,12 @@ pub(super) fn report_ambiguous_identifier(
 		.with_message(format!("`{resolved_name}` is ambiguous"))
 		.with_label(span.primary_label().with_message("ambiguous name"));
 	for (index, (target, candidate_span)) in candidates.iter().enumerate() {
-		let def_key = target.def_key().expect(
+		let decl_key = target.decl_key().expect(
 			"an ambiguity candidate always carries a real DefKey — \
 			 CandidateMerge::push never lets a BindingTarget::Error \
 			 become one",
 		);
-		let noun = namespaces.kind(def_key).noun();
+		let noun = namespaces.kind(decl_key).noun();
 		let also = if index == 0 { "" } else { "also " };
 		diagnostic = diagnostic.with_label(
 			candidate_span.secondary_label().with_message(format!(
@@ -1115,7 +1116,7 @@ pub(super) fn report_ambiguous_identifier(
 /// `paths.rs` hits the same "resolved, but not visible" case and reuses
 /// this rather than duplicating it.
 ///
-/// `def_key` is `Option` so the message can name the item's kind when
+/// `decl_key` is `Option` so the message can name the item's kind when
 /// known (matching rustc's `` struct `Priv` is private ``) — `None` only
 /// for a `Found(BindingTarget::Error, _)` reached through an
 /// already-errored glob candidate (see `CandidateMerge::push`), which has
@@ -1125,10 +1126,10 @@ pub(super) fn report_private_identifier(
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
-	def_key: Option<DefKey>,
+	decl_key: Option<DeclKey>,
 ) -> Diagnostic<FileId> {
 	let name = strings.resolve(name).unwrap();
-	let noun = def_key.map(|def_key| namespaces.kind(def_key).noun());
+	let noun = decl_key.map(|decl_key| namespaces.kind(decl_key).noun());
 	let message = match noun {
 		Some(noun) => format!("{noun} `{name}` is private"),
 		None => format!("`{name}` is private"),
@@ -1150,7 +1151,7 @@ pub(super) fn report_private_identifier(
 /// difference in whether a caller invokes this at all, not in what it says
 /// once it does — hence one function, not two.
 ///
-/// `def_key` is required, not `Option`, unlike `report_private_identifier`:
+/// `decl_key` is required, not `Option`, unlike `report_private_identifier`:
 /// both call sites already know they have a real item in hand (a
 /// `BindingTarget::Error` mid-path is handled — or skipped — before either
 /// one gets here).
@@ -1159,10 +1160,10 @@ pub(super) fn report_cannot_use_as_namespace(
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
-	def_key: DefKey,
+	decl_key: DeclKey,
 ) -> Diagnostic<FileId> {
 	let name = strings.resolve(name).unwrap();
-	let noun = namespaces.kind(def_key).noun();
+	let noun = namespaces.kind(decl_key).noun();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::CannotUseAsNamespace.code())
 		.with_message(format!("cannot use {noun} `{name}` as a namespace"))
@@ -1177,14 +1178,14 @@ mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{DefinitionRegistry, Tier};
+	use crate::tir::decls::{Declarations, Tier};
 	use crate::vfs;
 
 	/// Builds definitions and inspects the bindings installed by `use` resolution.
 	struct TestCase {
 		graph: vfs::CompilationUnit,
 		strings: StringInterner,
-		defs: DefinitionRegistry,
+		decls: Declarations,
 		diagnostics: Vec<Diagnostic<FileId>>,
 	}
 
@@ -1202,7 +1203,7 @@ mod tests {
 
 			let mut diagnostics = Vec::new();
 			let mut resolutions = NameResolutions::default();
-			let (defs, ast_nodes) = DefinitionRegistry::build(
+			let (decls, ast_nodes) = Declarations::build(
 				&graph.packages,
 				&graph.files,
 				&mut strings,
@@ -1211,16 +1212,16 @@ mod tests {
 				graph.stdlib_package,
 				graph.root_package,
 			);
-			// Only Phase 1 (defs.rs + this module) is under test here —
+			// Only Phase 1 (decls.rs + this module) is under test here —
 			// `ast_nodes` is Phase 2's input, and dropping it now is what
-			// lets `defs` (and `graph`, moved below) outlive this
+			// lets `decls` (and `graph`, moved below) outlive this
 			// constructor with no lingering borrow between them.
 			drop(ast_nodes);
 
 			TestCase {
 				graph,
 				strings,
-				defs,
+				decls,
 				diagnostics,
 			}
 		}
@@ -1258,7 +1259,7 @@ mod tests {
 		}
 
 		fn root_namespace(&self) -> Namespace {
-			Namespace::Package(self.defs.root_package)
+			Namespace::Package(self.decls.root_package)
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
@@ -1273,7 +1274,7 @@ mod tests {
 			name: &str,
 		) -> Option<&Binding> {
 			let symbol = self.strings.get(name)?;
-			self.defs
+			self.decls
 				.namespaces
 				.symbols(namespace)
 				.bindings
@@ -1281,12 +1282,12 @@ mod tests {
 		}
 
 		#[track_caller]
-		fn expect_direct_def(
+		fn expect_direct_decl(
 			&self,
 			namespace: Namespace,
 			tier: Tier,
 			name: &str,
-		) -> DefKey {
+		) -> DeclKey {
 			let target = self
 				.direct_binding(namespace, tier, name)
 				.map(|binding| binding.target);
@@ -1307,11 +1308,11 @@ mod tests {
 			namespace: Namespace,
 			name: &str,
 		) -> Namespace {
-			let key = self.expect_direct_def(namespace, Tier::Type, name);
-			self.defs.namespaces.entered_by(key).unwrap_or_else(|| {
+			let key = self.expect_direct_decl(namespace, Tier::Type, name);
+			self.decls.namespaces.entered_by(key).unwrap_or_else(|| {
 				panic!(
 					"`{name}` is not a namespace: {:?}",
-					key.symbol_kind(&self.defs)
+					key.symbol_kind(&self.decls)
 				)
 			})
 		}
@@ -1319,7 +1320,7 @@ mod tests {
 		/// The namespaces `namespace` glob-imports, in declaration order.
 		fn glob_targets(&self, namespace: Namespace) -> Vec<Namespace> {
 			let scope = namespace.as_scope().expect("only a scope has globs");
-			self.defs
+			self.decls
 				.namespaces
 				.scope(scope)
 				.glob_imports
@@ -1330,7 +1331,7 @@ mod tests {
 	}
 
 	#[test]
-	fn use_binds_to_the_same_def_as_the_original() {
+	fn use_binds_to_the_same_decl_as_the_original() {
 		let case = TestCase::new(indoc! {"
 			mod inner {
 				pub func helper() -> i32 { 1 }
@@ -1341,8 +1342,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let inner = case.child_namespace(root, "inner");
-		let original = case.expect_direct_def(inner, Tier::Value, "helper");
-		let imported = case.expect_direct_def(root, Tier::Value, "helper");
+		let original = case.expect_direct_decl(inner, Tier::Value, "helper");
+		let imported = case.expect_direct_decl(root, Tier::Value, "helper");
 		assert_eq!(imported, original);
 	}
 
@@ -1356,8 +1357,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let color = case.child_namespace(root, "Color");
-		let original = case.expect_direct_def(color, Tier::Value, "Red");
-		let imported = case.expect_direct_def(root, Tier::Value, "Red");
+		let original = case.expect_direct_decl(color, Tier::Value, "Red");
+		let imported = case.expect_direct_decl(root, Tier::Value, "Red");
 		assert_eq!(imported, original);
 	}
 
@@ -1384,8 +1385,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let math = case.child_namespace(root, "math");
-		let original = case.expect_direct_def(math, Tier::Value, "add");
-		let imported = case.expect_direct_def(root, Tier::Value, "add");
+		let original = case.expect_direct_decl(math, Tier::Value, "add");
+		let imported = case.expect_direct_decl(root, Tier::Value, "add");
 		assert_eq!(imported, original);
 	}
 
@@ -1398,8 +1399,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let original = case.expect_direct_def(root, Tier::Value, "add");
-		let aliased = case.expect_direct_def(root, Tier::Value, "sub");
+		let original = case.expect_direct_decl(root, Tier::Value, "add");
+		let aliased = case.expect_direct_decl(root, Tier::Value, "sub");
 		assert_eq!(aliased, original);
 	}
 
@@ -1426,7 +1427,7 @@ mod tests {
 		);
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "secret");
+		case.expect_direct_decl(root, Tier::Value, "secret");
 	}
 
 	#[test]
@@ -1443,8 +1444,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Type, "Y");
-		case.expect_direct_def(root, Tier::Value, "Y");
+		case.expect_direct_decl(root, Tier::Type, "Y");
+		case.expect_direct_decl(root, Tier::Value, "Y");
 	}
 
 	#[test]
@@ -1646,8 +1647,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Type, "X");
-		case.expect_direct_def(root, Tier::Value, "X");
+		case.expect_direct_decl(root, Tier::Type, "X");
+		case.expect_direct_decl(root, Tier::Value, "X");
 	}
 
 	/// Both definitions competing here are the local `use` declarations. The
@@ -1691,7 +1692,7 @@ mod tests {
 	}
 
 	#[test]
-	fn reexport_chain_of_two_hops_resolves_to_the_original_def() {
+	fn reexport_chain_of_two_hops_resolves_to_the_original_decl() {
 		let case = TestCase::new(indoc! {"
 			mod a {
 				mod b {
@@ -1706,8 +1707,8 @@ mod tests {
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(a, "b");
-		let original = case.expect_direct_def(b, Tier::Value, "f");
-		let reexported = case.expect_direct_def(root, Tier::Value, "f");
+		let original = case.expect_direct_decl(b, Tier::Value, "f");
+		let reexported = case.expect_direct_decl(root, Tier::Value, "f");
 		assert_eq!(reexported, original);
 	}
 
@@ -1772,8 +1773,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "add");
-		case.expect_direct_def(root, Tier::Value, "sub");
+		case.expect_direct_decl(root, Tier::Value, "add");
+		case.expect_direct_decl(root, Tier::Value, "sub");
 	}
 
 	#[test]
@@ -1787,7 +1788,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "helper");
+		case.expect_direct_decl(root, Tier::Value, "helper");
 	}
 
 	#[test]
@@ -1808,9 +1809,9 @@ mod tests {
 		let outer = case.child_namespace(root, "outer");
 		let inner = case.child_namespace(outer, "inner");
 
-		case.expect_direct_def(outer, Tier::Value, "via_self");
-		case.expect_direct_def(inner, Tier::Value, "via_super");
-		case.expect_direct_def(inner, Tier::Value, "via_crate");
+		case.expect_direct_decl(outer, Tier::Value, "via_self");
+		case.expect_direct_decl(inner, Tier::Value, "via_super");
+		case.expect_direct_decl(inner, Tier::Value, "via_crate");
 	}
 
 	#[test]
@@ -1827,8 +1828,8 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "Y");
-		case.expect_direct_def(root, Tier::Type, "Y");
+		case.expect_direct_decl(root, Tier::Value, "Y");
+		case.expect_direct_decl(root, Tier::Type, "Y");
 	}
 
 	#[test]
@@ -1845,7 +1846,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "public_helper");
+		case.expect_direct_decl(root, Tier::Value, "public_helper");
 	}
 
 	#[test]
@@ -1871,7 +1872,7 @@ mod tests {
 		]);
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "public_secret");
+		case.expect_direct_decl(root, Tier::Value, "public_secret");
 	}
 
 	#[test]
@@ -1892,7 +1893,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "helper");
+		case.expect_direct_decl(root, Tier::Value, "helper");
 	}
 
 	#[test]
@@ -2011,8 +2012,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let original = case.expect_direct_def(a, Tier::Value, "helper");
-		let reexported = case.expect_direct_def(root, Tier::Value, "helper");
+		let original = case.expect_direct_decl(a, Tier::Value, "helper");
+		let reexported = case.expect_direct_decl(root, Tier::Value, "helper");
 		assert_eq!(reexported, original);
 	}
 
@@ -2056,7 +2057,7 @@ mod tests {
 	}
 
 	#[test]
-	fn ambiguous_reexport_names_each_candidates_def_kind() {
+	fn ambiguous_reexport_names_each_candidates_decl_kind() {
 		// A function and a constant, not two functions, so the "function"
 		// vs "constant" wording is actually exercised.
 		let case = TestCase::new(indoc! {"
@@ -2103,7 +2104,7 @@ mod tests {
 		// `b` and `c` both re-export everything from `a`, and `d` globs
 		// both `b` and `c` — the same `a::helper` is reached twice, once
 		// via each edge. That's a diamond, not a conflict: both edges name
-		// the exact same `DefKey`, so it must collapse into one candidate
+		// the exact same `DeclKey`, so it must collapse into one candidate
 		// rather than reading as two re-exports disagreeing on the name.
 		let case = TestCase::new(indoc! {"
 			mod a {
@@ -2125,8 +2126,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let original = case.expect_direct_def(a, Tier::Value, "helper");
-		let imported = case.expect_direct_def(root, Tier::Value, "helper");
+		let original = case.expect_direct_decl(a, Tier::Value, "helper");
+		let imported = case.expect_direct_decl(root, Tier::Value, "helper");
 		assert_eq!(imported, original);
 	}
 
@@ -2205,8 +2206,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let a_pick = case.expect_direct_def(a, Tier::Value, "pick");
-		let resolved = case.expect_direct_def(root, Tier::Value, "pick");
+		let a_pick = case.expect_direct_decl(a, Tier::Value, "pick");
+		let resolved = case.expect_direct_decl(root, Tier::Value, "pick");
 		assert_eq!(resolved, a_pick);
 	}
 
@@ -2239,8 +2240,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
-		let a_pick = case.expect_direct_def(a, Tier::Value, "pick");
-		let resolved = case.expect_direct_def(root, Tier::Value, "pick");
+		let a_pick = case.expect_direct_decl(a, Tier::Value, "pick");
+		let resolved = case.expect_direct_decl(root, Tier::Value, "pick");
 		assert_eq!(resolved, a_pick);
 	}
 
@@ -2260,9 +2261,9 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let local = case.expect_direct_def(root, Tier::Value, "X");
+		let local = case.expect_direct_decl(root, Tier::Value, "X");
 		assert_eq!(local.namespace, root);
-		let selected = case.expect_direct_def(root, Tier::Value, "selected");
+		let selected = case.expect_direct_decl(root, Tier::Value, "selected");
 		assert_eq!(selected, local);
 	}
 
@@ -2349,8 +2350,8 @@ mod tests {
 
 		let root = case.root_namespace();
 		let b = case.child_namespace(root, "b");
-		let b_pick = case.expect_direct_def(b, Tier::Value, "pick");
-		let resolved = case.expect_direct_def(root, Tier::Value, "pick");
+		let b_pick = case.expect_direct_decl(b, Tier::Value, "pick");
+		let resolved = case.expect_direct_decl(root, Tier::Value, "pick");
 		assert_eq!(resolved, b_pick);
 	}
 
@@ -2359,7 +2360,7 @@ mod tests {
 		// Same shape as `two_pub_globs_disagreeing_on_a_name_report_ambiguous_reexport`,
 		// but nothing ever consults `hub::pick` — no `use hub::pick;`, no
 		// other reference. Ambiguity between glob candidates is only ever
-		// computed on demand (inside `resolve_member_def`/
+		// computed on demand (inside `resolve_member_decl`/
 		// `binding_to_import_scope`, both driven by an actual lookup), so
 		// two globs merely *disagreeing* on a name, unreferenced, must
 		// produce no diagnostic at all — matching rustc, where an ambiguous
@@ -2418,7 +2419,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		case.expect_direct_def(root, Tier::Value, "c");
+		case.expect_direct_decl(root, Tier::Value, "c");
 
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(a, "b");
@@ -2533,8 +2534,8 @@ mod tests {
 		let root = case.root_namespace();
 		let a = case.child_namespace(root, "a");
 		let b = case.child_namespace(root, "b");
-		let original = case.expect_direct_def(a, Tier::Value, "only_in_a");
-		let selected = case.expect_direct_def(b, Tier::Value, "selected");
+		let original = case.expect_direct_decl(a, Tier::Value, "only_in_a");
+		let selected = case.expect_direct_decl(b, Tier::Value, "selected");
 		assert_eq!(selected, original);
 	}
 

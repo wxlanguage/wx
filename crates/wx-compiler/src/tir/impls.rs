@@ -10,20 +10,20 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::{self, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
-	tir::defs::{EnumIdx, FunctionIdx, GlobalIdx, MemoryIdx, StructIdx},
+	tir::decls::{EnumIdx, FunctionIdx, GlobalIdx, MemoryIdx, StructIdx},
 	vfs::FileId,
 };
 
 use super::{
 	bounds::report_not_a_trait_bound,
-	defs::{
-		AstEntry, AstNodeRef, BindingKey, DefKind, DefinitionRegistry,
+	decls::{
+		AstEntry, AstNodeRef, BindingKey, DeclKind, Declarations,
 		DuplicateDefinitionDiagnostic, InherentImplIdx, IntrinsicDefs,
 		MemberIdx, Scope, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
 	resolutions::NameResolutions,
-	signatures::TypeContext,
+	signatures::Semantics,
 	types::{Type, TypeIndex},
 };
 
@@ -93,7 +93,7 @@ impl ImplTarget {
 
 #[derive(Clone, Copy)]
 pub(super) struct TraitImplHead {
-	pub(super) trait_def: Option<Spanned<TraitIdx>>,
+	pub(super) trait_decl: Option<Spanned<TraitIdx>>,
 	pub(super) target: Option<Spanned<ImplTarget>>,
 }
 
@@ -108,7 +108,7 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	diagnostics: &'a mut Vec<Diagnostic<FileId>>,
 	resolutions: &'a mut NameResolutions,
 	strings: &'a StringInterner,
-	defs: &'a DefinitionRegistry,
+	decls: &'a Declarations,
 	ast_nodes: &'a [AstEntry<'ast>],
 	inherent: FxHashMap<ImplTarget, Vec<InherentImplIdx>>,
 	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
@@ -159,14 +159,14 @@ impl ImplDispatch {
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		resolutions: &mut NameResolutions,
 		strings: &StringInterner,
-		defs: &DefinitionRegistry,
+		decls: &Declarations,
 		ast_nodes: &[AstEntry<'_>],
 	) -> Self {
 		ImplDispatchBuilder::new(
 			diagnostics,
 			resolutions,
 			strings,
-			defs,
+			decls,
 			ast_nodes,
 		)
 		.build()
@@ -208,31 +208,31 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		diagnostics: &'a mut Vec<Diagnostic<FileId>>,
 		resolutions: &'a mut NameResolutions,
 		strings: &'a StringInterner,
-		defs: &'a DefinitionRegistry,
+		decls: &'a Declarations,
 		ast_nodes: &'a [AstEntry<'ast>],
 	) -> Self {
 		Self {
 			diagnostics,
 			resolutions,
 			strings,
-			defs,
+			decls,
 			ast_nodes,
 			inherent: FxHashMap::default(),
 			traits: FxHashMap::default(),
-			inherent_targets: vec![None; defs.inherent_impls.len()],
+			inherent_targets: vec![None; decls.inherent_impls.len()],
 			trait_headers: vec![
 				TraitImplHead {
-					trait_def: None,
+					trait_decl: None,
 					target: None,
 				};
-				defs.trait_impls.len()
+				decls.trait_impls.len()
 			],
 		}
 	}
 
 	fn build(mut self) -> ImplDispatch {
 		let ast_nodes = self.ast_nodes;
-		let defs = self.defs;
+		let decls = self.decls;
 		for entry in ast_nodes {
 			match &entry.node {
 				AstNodeRef::InherentImplBlock { item, block_index } => {
@@ -289,7 +289,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					);
 					self.trait_headers[usize::from(*block_index)] =
 						TraitImplHead {
-							trait_def: trait_idx.map(|idx| Spanned {
+							trait_decl: trait_idx.map(|idx| Spanned {
 								inner: idx,
 								span: trait_name.span(),
 							}),
@@ -313,9 +313,9 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					let ast::Item::TypeSet { name, members, .. } = item else {
 						unreachable!()
 					};
-					let def = &defs.typesets[usize::from(*typeset_index)];
+					let decl = &decls.typesets[usize::from(*typeset_index)];
 					for (member, &impl_index) in
-						members.iter().zip(def.member_impls.iter())
+						members.iter().zip(decl.member_impls.iter())
 					{
 						let target = self
 							.resolve_target(
@@ -331,8 +331,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 							});
 						self.trait_headers[usize::from(impl_index)] =
 							TraitImplHead {
-								trait_def: Some(Spanned {
-									inner: def.trait_index,
+								trait_decl: Some(Spanned {
+									inner: decl.trait_index,
 									span: member.inner.span,
 								}),
 								target,
@@ -340,7 +340,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						if let Some(target) = target {
 							self.register_trait(
 								target,
-								def.trait_index,
+								decl.trait_index,
 								name.inner,
 								impl_index,
 								entry.file_id,
@@ -359,9 +359,12 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					);
 				}
 				AstNodeRef::ImportedMemory {
-					memory_index, decl, ..
+					memory_index,
+					import_block,
+					..
 				} => {
-					let ast::ImportDeclaration::Memory { name, .. } = decl
+					let ast::ImportDeclaration::Memory { name, .. } =
+						import_block
 					else {
 						unreachable!()
 					};
@@ -383,11 +386,13 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					);
 				}
 				AstNodeRef::ImportedGlobal {
-					global_index, decl, ..
+					global_index,
+					import_block,
+					..
 				} => {
 					let ast::ImportDeclaration::Global {
 						name, mut_span, ..
-					} = decl
+					} = import_block
 					else {
 						unreachable!()
 					};
@@ -447,7 +452,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					)
 					.with_label(
 						SourceSpan::new(
-							self.defs.trait_impls[usize::from(earlier)].file_id,
+							self.decls.trait_impls[usize::from(earlier)]
+								.file_id,
 							earlier_target.span,
 						)
 						.secondary_label()
@@ -470,16 +476,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		name_span: TextSpan,
 		file_id: FileId,
 	) {
-		let defs = self.defs;
-		let memory_def = &defs.memories[usize::from(memory_index)];
-		let trait_idx = defs.intrinsics.memory.unwrap_or_else(|| {
+		let decls = self.decls;
+		let memory_decl = &decls.memories[usize::from(memory_index)];
+		let trait_idx = decls.intrinsics.memory.unwrap_or_else(|| {
 			panic!(
 				"the stdlib package must declare a `Memory` trait — every `memory` declaration needs one to synthesize its impl against"
 			)
 		});
-		self.trait_headers[usize::from(memory_def.trait_impl_index)] =
+		self.trait_headers[usize::from(memory_decl.trait_impl_index)] =
 			TraitImplHead {
-				trait_def: Some(Spanned {
+				trait_decl: Some(Spanned {
 					inner: trait_idx,
 					span: name_span,
 				}),
@@ -494,8 +500,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				span: name_span,
 			},
 			trait_idx,
-			defs.traits[usize::from(trait_idx)].name.inner,
-			memory_def.trait_impl_index,
+			decls.traits[usize::from(trait_idx)].name.inner,
+			memory_decl.trait_impl_index,
 			file_id,
 		);
 	}
@@ -511,16 +517,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		mut_span: Option<TextSpan>,
 		file_id: FileId,
 	) {
-		let defs = self.defs;
-		let global_def = &defs.globals[usize::from(global_index)];
-		let global_trait_idx = defs.intrinsics.global.unwrap_or_else(|| {
+		let decls = self.decls;
+		let global_decl = &decls.globals[usize::from(global_index)];
+		let global_trait_idx = decls.intrinsics.global.unwrap_or_else(|| {
 			panic!(
 				"the stdlib package must declare a `Global` trait — every `global` declaration needs one to synthesize its impl against"
 			)
 		});
-		self.trait_headers[usize::from(global_def.trait_impl_index)] =
+		self.trait_headers[usize::from(global_decl.trait_impl_index)] =
 			TraitImplHead {
-				trait_def: Some(Spanned {
+				trait_decl: Some(Spanned {
 					inner: global_trait_idx,
 					span: name_span,
 				}),
@@ -535,21 +541,21 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				span: name_span,
 			},
 			global_trait_idx,
-			defs.traits[usize::from(global_trait_idx)].name.inner,
-			global_def.trait_impl_index,
+			decls.traits[usize::from(global_trait_idx)].name.inner,
+			global_decl.trait_impl_index,
 			file_id,
 		);
-		if let Some(mut_trait_impl_index) = global_def.mut_trait_impl_index {
+		if let Some(mut_trait_impl_index) = global_decl.mut_trait_impl_index {
 			debug_assert!(mut_span.is_some());
 			let global_mut_trait_idx =
-				defs.intrinsics.global_mut.unwrap_or_else(|| {
+				decls.intrinsics.global_mut.unwrap_or_else(|| {
 					panic!(
 						"the stdlib package must declare a `GlobalMut` trait — every `global mut` declaration needs one to synthesize its impl against"
 					)
 				});
 			self.trait_headers[usize::from(mut_trait_impl_index)] =
 				TraitImplHead {
-					trait_def: Some(Spanned {
+					trait_decl: Some(Spanned {
 						inner: global_mut_trait_idx,
 						span: name_span,
 					}),
@@ -564,7 +570,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					span: name_span,
 				},
 				global_mut_trait_idx,
-				defs.traits[usize::from(global_mut_trait_idx)].name.inner,
+				decls.traits[usize::from(global_mut_trait_idx)].name.inner,
 				mut_trait_impl_index,
 				file_id,
 			);
@@ -579,16 +585,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		func_index: FunctionIdx,
 		file_id: FileId,
 	) {
-		let defs = self.defs;
-		let function_def = &defs.functions[usize::from(func_index)];
-		let function_impls = function_def.function_impls;
-		let name_span = function_def.name.span;
-		let call_trait_idx = defs.intrinsics.call.unwrap_or_else(|| {
+		let decls = self.decls;
+		let function_decl = &decls.functions[usize::from(func_index)];
+		let function_impls = function_decl.function_impls;
+		let name_span = function_decl.name.span;
+		let call_trait_idx = decls.intrinsics.call.unwrap_or_else(|| {
 			panic!(
 				"the stdlib package must declare a `Call` trait — every function needs one to synthesize its impl against"
 			)
 		});
-		let function_trait_idx = defs.intrinsics.function.unwrap_or_else(|| {
+		let function_trait_idx = decls.intrinsics.function.unwrap_or_else(|| {
 			panic!(
 				"the stdlib package must declare a `Function` trait — every function needs one to synthesize its impl against"
 			)
@@ -598,7 +604,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			(function_trait_idx, function_impls.function_impl_index),
 		] {
 			self.trait_headers[usize::from(trait_impl_index)] = TraitImplHead {
-				trait_def: Some(Spanned {
+				trait_decl: Some(Spanned {
 					inner: trait_idx,
 					span: name_span,
 				}),
@@ -613,7 +619,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					span: name_span,
 				},
 				trait_idx,
-				defs.traits[usize::from(trait_idx)].name.inner,
+				decls.traits[usize::from(trait_idx)].name.inner,
 				trait_impl_index,
 				file_id,
 			);
@@ -627,7 +633,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	/// it's per member name rather than per whole impl, since ordinary
 	/// `impl Foo { }` blocks are just separate sources of members for one
 	/// bucket, not competing candidates. Reuses each impl's own
-	/// `bindings`/`members` (already built by `defs.rs`) rather than
+	/// `bindings`/`members` (already built by `decls.rs`) rather than
 	/// keeping a second copy of this data just for the check.
 	fn register_inherent(
 		&mut self,
@@ -635,8 +641,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		index: InherentImplIdx,
 		file_id: FileId,
 	) {
-		let defs = self.defs;
-		let new_impl = &defs.inherent_impls[usize::from(index)];
+		let decls = self.decls;
+		let new_impl = &decls.inherent_impls[usize::from(index)];
 		let earlier_in_bucket = self
 			.inherent
 			.get(&target.inner)
@@ -663,7 +669,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				continue;
 			}
 			let collision = earlier_in_bucket.iter().find_map(|&earlier| {
-				let earlier_impl = &defs.inherent_impls[usize::from(earlier)];
+				let earlier_impl = &decls.inherent_impls[usize::from(earlier)];
 				earlier_impl.bindings.get(&key).map(|&member| {
 					(
 						earlier_impl.file_id,
@@ -716,19 +722,19 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			self.diagnostics,
 			self.resolutions,
 			self.strings,
-			self.defs,
+			self.decls,
 		)
 		.resolve_definition(file_id, namespace, &path.segments, Tier::Type);
-		let kind = definition?.symbol_kind(self.defs);
+		let kind = definition?.symbol_kind(self.decls);
 		let target = match kind {
-			DefKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
-			DefKind::Enum(idx) => Some(ImplTarget::Enum(idx)),
+			DeclKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
+			DeclKind::Enum(idx) => Some(ImplTarget::Enum(idx)),
 			// A user-written alias (`type Foo = Bar;`) has no identity of
 			// its own to dispatch on — only the closed set of std's own
 			// bodiless `#[intrinsic]` aliases (`u8`, `funcref`, ...) do, via
 			// their pre-interned `TypeIndex`. `intrinsic_target` returns
 			// `None` for every other alias, same as any non-namespace kind.
-			DefKind::TypeAlias(idx) => self.intrinsic_target(idx),
+			DeclKind::TypeAlias(idx) => self.intrinsic_target(idx),
 			_ => None,
 		};
 		target.ok_or_else(|| {
@@ -756,11 +762,11 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			self.diagnostics,
 			self.resolutions,
 			self.strings,
-			self.defs,
+			self.decls,
 		)
 		.resolve_definition(file_id, namespace, &path.segments, Tier::Type);
-		match definition.ok()?.symbol_kind(self.defs) {
-			DefKind::Trait(idx) => Some(idx),
+		match definition.ok()?.symbol_kind(self.decls) {
+			DeclKind::Trait(idx) => Some(idx),
 			other => {
 				self.diagnostics.push(report_not_a_trait_bound(
 					file_id,
@@ -778,7 +784,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	/// `never` has no bucket here (nothing can be implemented on it), so
 	/// it's the one `IntrinsicDefs` type slot this deliberately excludes.
 	fn intrinsic_target(&self, idx: TypeAliasIdx) -> Option<ImplTarget> {
-		let intrinsics = &self.defs.intrinsics;
+		let intrinsics = &self.decls.intrinsics;
 		[
 			(intrinsics.u8, ImplTarget::U8),
 			(intrinsics.i8, ImplTarget::I8),
@@ -797,7 +803,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	pub(super) fn impl_target_type(&mut self, target: ImplTarget) -> TypeIndex {
 		match target {
 			ImplTarget::U8 => TypeIndex::U8,

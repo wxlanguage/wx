@@ -51,7 +51,7 @@ impl StaticData {
 	}
 }
 
-impl Lowerer<'_, '_, '_, '_> {
+impl Lowerer<'_> {
 	/// A piece of static data in `state`'s body (a literal, or a constant
 	/// holding data, placed): its value for the instance, a pointer to its
 	/// data. Its evaluation's failure is reported by the query.
@@ -63,8 +63,8 @@ impl Lowerer<'_, '_, '_, '_> {
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
 		let args: Box<[TypeIndex]> = state.args.clone();
-		let value = (self.context)
-			.static_value(state.instance.function, &args, expr)
+		let value = (self.sema)
+			.static_value(self.strings, state.instance.function, &args, expr)
 			.ok_or(())?
 			.to_vec();
 		self.materialize_constant(
@@ -86,7 +86,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		if let Some(&id) = self.statics.of_allocation.get(&alloc) {
 			return id;
 		}
-		let allocation = &self.context.solver.allocations[usize::from(alloc)];
+		let allocation = &self.sema.solver.allocations[usize::from(alloc)];
 		let (memory, align, bytes, targets) = (
 			allocation.memory,
 			allocation.align,

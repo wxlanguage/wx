@@ -16,13 +16,13 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::calls::{Callee, Dispatch};
-use super::{Arguments, BodyContext};
+use super::{Arguments, BodyBuilder};
 use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
-use crate::tir::defs::{
-	BindingKey, ConstIdx, DefKind, InherentImplIdx, MemberKind, Tier, TraitIdx,
-	Visibility,
+use crate::tir::decls::{
+	BindingKey, ConstIdx, DeclKind, InherentImplIdx, MemberKind, Tier,
+	TraitIdx, Visibility,
 };
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
@@ -44,7 +44,7 @@ pub(super) enum Expected {
 	Type(TypeIndex),
 	/// The call is the receiver of a method call, `f(x).method(..)`, which
 	/// expects of it what the method takes as `self`
-	/// (`BodyContext::receiver_expectation`).
+	/// (`BodyBuilder::receiver_expectation`).
 	Receiver(ReceiverOf),
 }
 
@@ -148,7 +148,7 @@ enum Member {
 	},
 }
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyBuilder<'_, '_> {
 	/// `<T as Trait>::member` or `<T>::member`, written at `span`: a member
 	/// of the bracketed type. Only one segment may follow a trait-qualified
 	/// root.
@@ -160,13 +160,15 @@ impl BodyContext<'_, '_, '_, '_> {
 		let path = match path {
 			RootedPath::Grouped { inner, segments } => {
 				let (member, prefix) = segments.split_last().unwrap();
-				let root = self.cx.resolve_type(
+				let root = self.builder.resolve_type(
+					self.sema,
 					&mut self.obligations.types,
 					self.scope,
 					inner,
 					InferPolicy::Allow,
 				);
-				let receiver = self.cx.resolve_type_member_path(
+				let receiver = self.builder.resolve_type_member_path(
+					self.sema,
 					&mut self.obligations.types,
 					self.scope,
 					root,
@@ -182,13 +184,15 @@ impl BodyContext<'_, '_, '_, '_> {
 						"a path past a trait-qualified member",
 					));
 				};
-				let receiver = self.cx.resolve_type(
+				let receiver = self.builder.resolve_type(
+					self.sema,
 					&mut self.obligations.types,
 					self.scope,
 					&root.self_type,
 					InferPolicy::Allow,
 				);
-				let qualified = self.cx.resolve_trait_bound_path(
+				let qualified = self.sema.resolve_trait_bound_path(
+					self.builder.strings,
 					self.scope.file_id,
 					self.scope.namespace,
 					&root.trait_path,
@@ -256,8 +260,9 @@ impl BodyContext<'_, '_, '_, '_> {
 				type_args,
 			} => Some(self.constant_value(constant, &type_args, path.member)),
 			Member::Function(_) | Member::Method(_) => {
-				let name = self.cx.strings.resolve(path.member.ident.inner);
-				self.cx.diagnostics.push(
+				let name =
+					self.builder.strings.resolve(path.member.ident.inner);
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::InvalidMatchPattern.code())
 						.with_message(format!(
@@ -284,32 +289,32 @@ impl BodyContext<'_, '_, '_, '_> {
 		member: &ast::PathSegment,
 	) -> (ExprKind, TypeIndex) {
 		if !member.type_args.is_empty() {
-			self.cx.diagnostics.push(report_type_args_not_allowed(
-				self.cx.strings,
-				self.cx.defs,
+			self.sema.diagnostics.push(report_type_args_not_allowed(
+				self.builder.strings,
+				&self.sema.decls,
 				self.scope.file_id,
 				member,
-				TypeArgsNotAllowedOn::Declaration(DefKind::Const(constant)),
+				TypeArgsNotAllowedOn::Declaration(DeclKind::Const(constant)),
 			));
 		}
-		let signature = &self.cx.constants[usize::from(constant)];
+		let signature = &self.sema.constants[usize::from(constant)];
 		debug_assert_eq!(
-			self.cx.generic_envs.generic_count(signature.env),
+			self.sema.generic_envs.generic_count(signature.env),
 			type_args.len()
 		);
-		let ty = self.cx.types.substitute(
+		let ty = self.sema.types.substitute(
 			signature.ty,
 			Substitution {
-				envs: &self.cx.generic_envs,
+				envs: &self.sema.generic_envs,
 				env: signature.env,
 				args: type_args,
 			},
 		);
-		let ty = self.normalized(ty, self.scope.assumption_env);
-		let ty = self.cx.types.collapse_error(ty);
-		let owner = self.cx.defs.constants[usize::from(constant)].owner;
+		let ty = self.context().normalized(ty);
+		let ty = self.sema.types.collapse_error(ty);
+		let owner = self.sema.decls.constants[usize::from(constant)].owner;
 		let type_args = self
-			.cx
+			.sema
 			.generic_args
 			.push(type_args.iter().map(|&arg| (arg, member.ident.span)));
 		let kind = match Dispatch::of(owner) {
@@ -432,14 +437,13 @@ impl BodyContext<'_, '_, '_, '_> {
 			},
 		);
 		let receiver_ty = self.body.ty(receiver);
-		if self.cx.types.needs_context(receiver_ty) {
+		if self.sema.types.needs_context(receiver_ty) {
 			self.report_annotation_required(receiver);
 			self.build_unchecked_arguments(arguments);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
-		let receiver_ty =
-			self.normalized(receiver_ty, self.scope.assumption_env);
-		let pointee = match *self.cx.types.resolve(receiver_ty) {
+		let receiver_ty = self.context().normalized(receiver_ty);
+		let pointee = match *self.sema.types.resolve(receiver_ty) {
 			Type::Pointer { to, .. } => Some(to),
 			_ => None,
 		};
@@ -461,15 +465,15 @@ impl BodyContext<'_, '_, '_, '_> {
 			to,
 			memory,
 			ownership,
-		} = *self.cx.types.resolve(receiver_ty)
+		} = *self.sema.types.resolve(receiver_ty)
 		{
 			let params =
-				self.cx.functions[usize::from(callee.function)].param_types;
-			let declared = self.cx.types.list(params)[0];
+				self.sema.functions[usize::from(callee.function)].param_types;
+			let declared = self.sema.types.list(params)[0];
 			let Type::Pointer {
 				ownership: declared,
 				..
-			} = *self.cx.types.resolve(declared)
+			} = *self.sema.types.resolve(declared)
 			else {
 				self.report_by_value_through_pointer(receiver_ty, method);
 				self.build_unchecked_arguments(arguments);
@@ -522,7 +526,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			// The named trait alone is searched; that the receiver implements
 			// it is checked, and reported, here.
 			Some(trait_index) => {
-				let found = self.cx.resolve_trait_qualified_value(
+				let found = self.sema.resolve_trait_qualified_value(
+					self.builder.strings,
 					&mut self.obligations.types,
 					self.scope.generic_env,
 					receiver,
@@ -535,13 +540,14 @@ impl BodyContext<'_, '_, '_, '_> {
 					Err(()) => MemberLookup::Error,
 				}
 			}
-			None if self.cx.types.has_infer(receiver) => {
+			None if self.sema.types.has_infer(receiver) => {
 				let (found, impl_args) =
 					self.select_inherent_with_holes(receiver, key, member)?;
 				learned = Some(impl_args);
 				MemberLookup::Found(found)
 			}
-			None => self.cx.resolve_applicable_member(
+			None => self.builder.resolve_applicable_member(
+				self.sema,
 				self.scope.assumption_env,
 				receiver,
 				key,
@@ -554,14 +560,16 @@ impl BodyContext<'_, '_, '_, '_> {
 			MemberLookup::Stuck(error) => {
 				match error {
 					SolverError::Overflow => {
-						self.cx
+						self.sema
 							.diagnostics
-							.push(self.cx.overflow_diagnostic(reference));
+							.push(self.sema.overflow_diagnostic(reference));
 					}
 					SolverError::Cycle(cycle) => {
-						self.cx
-							.diagnostics
-							.push(self.cx.cycle_diagnostic(&cycle, reference));
+						self.sema.diagnostics.push(self.sema.cycle_diagnostic(
+							self.builder.strings,
+							&cycle,
+							reference,
+						));
 					}
 					_ => {}
 				}
@@ -575,22 +583,22 @@ impl BodyContext<'_, '_, '_, '_> {
 				return None;
 			}
 			MemberLookup::Ambiguous(candidates) => {
-				self.cx.diagnostics.push(report_ambiguous_type_member(
+				self.sema.diagnostics.push(report_ambiguous_type_member(
 					self.scope.file_id,
-					self.cx.strings,
-					self.cx.defs,
+					self.builder.strings,
+					&self.sema.decls,
 					member.ident,
 					&candidates,
 				));
 				return None;
 			}
 		};
-		self.cx.resolutions.record(
+		self.sema.resolutions.record(
 			(reference, Tier::Value),
-			Referent::Member(found.selected_kind(self.cx.defs)),
+			Referent::Member(found.selected_kind(&self.sema.decls)),
 		);
 		self.check_member_access(found, key, member);
-		let receiver = self.normalized(receiver, self.scope.assumption_env);
+		let receiver = self.context().normalized(receiver);
 		// The impl's arguments, and whether the selection proved them; a
 		// trait's declaration is selected over `[Self]` instead.
 		let (kind, impl_args, proven) = match found {
@@ -600,17 +608,17 @@ impl BodyContext<'_, '_, '_, '_> {
 				(kind, Some(impl_args), false)
 			}
 			ApplicableMember::Inherent { impl_index, kind } => {
-				let header = self.cx.inherent_impls[usize::from(impl_index)]
+				let header = self.sema.inherent_impls[usize::from(impl_index)]
 					.as_ref()
 					.expect("a selected impl has a header");
 				// The lookup matched this impl's target to the receiver.
 				let leading = self
-					.cx
+					.sema
 					.types
 					.match_impl_target(
 						header.target.inner,
 						receiver,
-						&self.cx.generic_envs,
+						&self.sema.generic_envs,
 						header.type_params,
 					)
 					.expect("the selected impl's target matches the receiver");
@@ -620,11 +628,15 @@ impl BodyContext<'_, '_, '_, '_> {
 				trait_index,
 				impl_index,
 				declaration,
-			} => match self.cx.defs.select_trait_member(impl_index, declaration)
+			} => match self
+				.sema
+				.decls
+				.select_trait_member(impl_index, declaration)
 			{
 				TraitMemberSelection::Impl(kind) => {
 					let Ok(Some(TraitImplLookup::Concrete { args, .. })) =
-						self.cx.find_trait_impl_query(
+						self.sema.find_trait_impl_query(
+							self.builder.strings,
 							self.scope.assumption_env,
 							receiver,
 							trait_index,
@@ -648,11 +660,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		let proven = if proven { leading.len() } else { 0 };
 		Some(match kind {
 			MemberKind::Function(function) => Member::Function(Callee::new(
-				self.cx, function, leading, proven,
+				self.sema, function, leading, proven,
 			)),
-			MemberKind::Method(function) => {
-				Member::Method(Callee::new(self.cx, function, leading, proven))
-			}
+			MemberKind::Method(function) => Member::Method(Callee::new(
+				self.sema, function, leading, proven,
+			)),
 			MemberKind::Constant(constant) => Member::Constant {
 				constant,
 				type_args: impl_args.unwrap_or_else(|| Box::from([receiver])),
@@ -676,12 +688,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		member: &ast::PathSegment,
 	) -> Option<(ApplicableMember, Box<[TypeIndex]>)> {
 		let Some(target) =
-			ImplTarget::from_type(self.cx.types.resolve(receiver))
+			ImplTarget::from_type(self.sema.types.resolve(receiver))
 		else {
 			self.report_no_member(receiver, member);
 			return None;
 		};
-		let impl_dispatch = self.cx.impl_dispatch;
 		let mut candidates =
 			self.inherent_candidates_with_holes(target, receiver, key);
 		// A type's inherent impls declare a name once between them, so a
@@ -690,15 +701,15 @@ impl BodyContext<'_, '_, '_, '_> {
 			return None;
 		}
 		let Some((impl_index, kind, impl_args)) = candidates.pop() else {
-			let is_trait_member = impl_dispatch
-				.trait_candidates(target)
-				.iter()
-				.any(|&(trait_index, _)| {
-					self.cx
-						.defs
-						.declared_trait_member(trait_index, key)
-						.is_some()
-				});
+			let is_trait_member =
+				self.sema.impl_dispatch.trait_candidates(target).iter().any(
+					|&(trait_index, _)| {
+						self.sema
+							.decls
+							.declared_trait_member(trait_index, key)
+							.is_some()
+					},
+				);
 			if is_trait_member {
 				self.report_unsupported(
 					member.ident.span,
@@ -722,39 +733,40 @@ impl BodyContext<'_, '_, '_, '_> {
 		receiver: TypeIndex,
 		key: BindingKey,
 	) -> Vec<(InherentImplIdx, MemberKind, Box<[TypeIndex]>)> {
-		let impl_dispatch = self.cx.impl_dispatch;
+		let impl_dispatch = &self.sema.impl_dispatch;
 		let mut candidates = Vec::new();
 		for &impl_index in impl_dispatch.inherent_candidates(target) {
-			let impl_def =
-				&self.cx.defs.inherent_impls[usize::from(impl_index)];
-			let Some(&member_index) = impl_def.bindings.get(&key) else {
+			let impl_decl =
+				&self.sema.decls.inherent_impls[usize::from(impl_index)];
+			let Some(&member_index) = impl_decl.bindings.get(&key) else {
 				continue;
 			};
-			let kind = impl_def.members[usize::from(member_index)].kind;
-			let Some(header) = &self.cx.inherent_impls[usize::from(impl_index)]
+			let kind = impl_decl.members[usize::from(member_index)].kind;
+			let Some(header) =
+				&self.sema.inherent_impls[usize::from(impl_index)]
 			else {
 				continue;
 			};
 			let (env, pattern) = (header.type_params, header.target.inner);
-			let count = self.cx.generic_envs.generic_count(env);
+			let count = self.sema.generic_envs.generic_count(env);
 			let mut impl_args =
 				vec![TypeIndex::INFER; count].into_boxed_slice();
-			self.cx.types.learn(
-				&self.cx.generic_envs,
+			self.sema.types.learn(
+				&self.sema.generic_envs,
 				env,
 				&mut impl_args,
 				pattern,
 				receiver,
 			);
-			let instantiated = self.cx.types.substitute(
+			let instantiated = self.sema.types.substitute(
 				pattern,
 				Substitution {
-					envs: &self.cx.generic_envs,
+					envs: &self.sema.generic_envs,
 					env,
 					args: &impl_args,
 				},
 			);
-			if self.cx.types.meet(instantiated, receiver).is_some() {
+			if self.sema.types.meet(instantiated, receiver).is_some() {
 				candidates.push((impl_index, kind, impl_args));
 			}
 		}
@@ -775,19 +787,19 @@ impl BodyContext<'_, '_, '_, '_> {
 		receiver_of: ReceiverOf,
 	) -> TypeIndex {
 		let ReceiverOf { method, expected } = receiver_of;
-		if !self.cx.types.has_infer(shape)
+		if !self.sema.types.has_infer(shape)
 			|| expected == TypeIndex::INFER
 			|| expected == TypeIndex::ERROR
 		{
 			return TypeIndex::INFER;
 		}
-		let pointer = match *self.cx.types.resolve(shape) {
+		let pointer = match *self.sema.types.resolve(shape) {
 			Type::Pointer { to, ownership, .. } => Some((to, ownership)),
 			_ => None,
 		};
 		let selected = pointer.map_or(shape, |(to, _)| to);
 		let Some(target) =
-			ImplTarget::from_type(self.cx.types.resolve(selected))
+			ImplTarget::from_type(self.sema.types.resolve(selected))
 		else {
 			return TypeIndex::INFER;
 		};
@@ -802,29 +814,29 @@ impl BodyContext<'_, '_, '_, '_> {
 			return TypeIndex::INFER;
 		};
 		let Callee { mut type_args, .. } =
-			Callee::new(self.cx, function, &impl_args, 0);
+			Callee::new(self.sema, function, &impl_args, 0);
 		let (env, _) = self.function_frames(function);
-		let signature = &self.cx.functions[usize::from(function)];
+		let signature = &self.sema.functions[usize::from(function)];
 		let (return_type, params) =
 			(signature.return_type, signature.param_types);
-		let expected = self.normalized(expected, self.scope.assumption_env);
-		self.cx.types.learn(
-			&self.cx.generic_envs,
+		let expected = self.context().normalized(expected);
+		self.sema.types.learn(
+			&self.sema.generic_envs,
 			env,
 			&mut type_args,
 			return_type,
 			expected,
 		);
-		let Some(&declared) = self.cx.types.list(params).first() else {
+		let Some(&declared) = self.sema.types.list(params).first() else {
 			return TypeIndex::INFER;
 		};
 		let hint = self.instantiate(declared, env, &type_args);
 		// A receiver's pointer gives a method taking `self` by either kind
 		// of pointer (`*` for `&` is `receiver.*.&`), so its own kind is
 		// kept: the parts are what the call learns from.
-		match (pointer, *self.cx.types.resolve(hint)) {
+		match (pointer, *self.sema.types.resolve(hint)) {
 			(Some((_, ownership)), Type::Pointer { to, memory, .. }) => {
-				self.cx.types.intern(Type::Pointer {
+				self.sema.types.intern(Type::Pointer {
 					to,
 					memory,
 					ownership,
@@ -843,32 +855,32 @@ impl BodyContext<'_, '_, '_, '_> {
 		key: BindingKey,
 		member: &ast::PathSegment,
 	) {
-		let defs = self.cx.defs;
+		let decls = &self.sema.decls;
 		let (namespace, visibility) = match found {
 			ApplicableMember::Inherent { impl_index, .. } => {
-				let impl_def = &defs.inherent_impls[usize::from(impl_index)];
-				let index = impl_def.bindings[&key];
+				let impl_decl = &decls.inherent_impls[usize::from(impl_index)];
+				let index = impl_decl.bindings[&key];
 				(
-					impl_def.namespace,
-					impl_def.members[usize::from(index)].visibility,
+					impl_decl.namespace,
+					impl_decl.members[usize::from(index)].visibility,
 				)
 			}
 			ApplicableMember::TraitImplMember { trait_index, .. }
 			| ApplicableMember::AbstractTraitMember { trait_index, .. } => {
-				let trait_def = &defs.traits[usize::from(trait_index)];
-				(trait_def.namespace, Visibility::from(trait_def.pub_span))
+				let trait_decl = &decls.traits[usize::from(trait_index)];
+				(trait_decl.namespace, Visibility::from(trait_decl.pub_span))
 			}
 		};
-		if defs.namespaces.is_accessible_from(
+		if decls.namespaces.is_accessible_from(
 			self.scope.namespace,
 			namespace.into(),
 			visibility,
 		) {
 			return;
 		}
-		let noun = member_noun(found.selected_kind(defs));
-		let name = self.cx.strings.resolve(member.ident.inner).unwrap();
-		self.cx.diagnostics.push(
+		let noun = member_noun(found.selected_kind(decls));
+		let name = self.builder.strings.resolve(member.ident.inner).unwrap();
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::PrivateItem.code())
 				.with_message(format!("{noun} `{name}` is private"))
@@ -884,9 +896,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		receiver: TypeIndex,
 		member: &ast::PathSegment,
 	) {
-		let name = self.cx.strings.resolve(member.ident.inner).unwrap();
-		let receiver = self.cx.type_formatter().display_type(receiver);
-		self.cx.diagnostics.push(
+		let name = self.builder.strings.resolve(member.ident.inner).unwrap();
+		let receiver = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(receiver);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::MethodNotFound.code())
 				.with_message(format!(
@@ -901,15 +916,18 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 }
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyBuilder<'_, '_> {
 	fn report_not_a_method(
 		&mut self,
 		receiver: TypeIndex,
 		method: &ast::PathSegment,
 	) {
-		let name = self.cx.strings.resolve(method.ident.inner).unwrap();
-		let receiver = self.cx.type_formatter().display_type(receiver);
-		self.cx.diagnostics.push(
+		let name = self.builder.strings.resolve(method.ident.inner).unwrap();
+		let receiver = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(receiver);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::NotAMethod.code())
 				.with_message(format!(
@@ -942,7 +960,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			mutable: true,
 			span,
 		});
-		let ty = self.cx.types.intern(Type::Pointer {
+		let ty = self.sema.types.intern(Type::Pointer {
 			to,
 			memory,
 			ownership: Ownership::Shared,
@@ -957,23 +975,20 @@ impl BodyContext<'_, '_, '_, '_> {
 		receiver: ExprIdx,
 		method: &ast::PathSegment,
 	) {
-		let name = self.cx.strings.resolve(method.ident.inner).unwrap();
+		let at = self.context().source_span(receiver);
+		let name = self.builder.strings.resolve(method.ident.inner).unwrap();
 		let found = self
-			.cx
-			.type_formatter()
+			.sema
+			.type_formatter(self.builder.strings)
 			.display_type(self.body.ty(receiver));
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TypeMistmatch.code())
 				.with_message(format!(
 					"`{name}` takes `self` by exclusive pointer, but the \
 					 receiver is `{found}`"
 				))
-				.with_label(
-					self.source_span(receiver)
-						.primary_label()
-						.with_message("a shared pointer"),
-				)
+				.with_label(at.primary_label().with_message("a shared pointer"))
 				.with_label(Label::secondary(
 					self.scope.file_id,
 					method.ident.span,
@@ -986,9 +1001,12 @@ impl BodyContext<'_, '_, '_, '_> {
 		receiver: TypeIndex,
 		method: &ast::PathSegment,
 	) {
-		let name = self.cx.strings.resolve(method.ident.inner).unwrap();
-		let receiver = self.cx.type_formatter().display_type(receiver);
-		self.cx.diagnostics.push(
+		let name = self.builder.strings.resolve(method.ident.inner).unwrap();
+		let receiver = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(receiver);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::MethodNotFound.code())
 				.with_message(format!(

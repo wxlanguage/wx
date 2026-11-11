@@ -3,25 +3,25 @@
 //! delegates equality types to [`TypeFormatter`], sharing one output buffer.
 //!
 //! A separate borrowing entity (the legacy `TypeFormatter<'a>`'s own
-//! shape), not methods directly on `TypeContext`: formatting is a
+//! shape), not methods directly on `Semantics`: formatting is a
 //! read-only concern with its own vocabulary (`write_type`, `write_bounds`,
-//! ...), and keeping it off `TypeContext` means a call site can hold
+//! ...), and keeping it off `Semantics` means a call site can hold
 //! one to build a message while the surrounding code is about to mutate
 //! `self` right after — the same reason the legacy one existed as its own
 //! type rather than living on the (bigger, `&mut`-heavy) `Builder`.
 //!
-//! Borrows `types`/`defs`/`strings` plus `generic_envs` for generic parameter
+//! Borrows `types`/`decls`/`strings` plus `generic_envs` for generic parameter
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
-//! The formatter currently wraps `TypeContext`'s pieces.
+//! The formatter currently wraps `Semantics`'s pieces.
 
 use std::fmt::Write as _;
 
 use crate::ast::{Ownership, StringInterner};
 
 use super::bounds::{BindingRequirement, BoundArena, BoundId};
-use super::defs::{ConstIdx, DefinitionRegistry, MemberOwner};
-use super::signatures::TypeContext;
+use super::decls::{ConstIdx, Declarations, MemberOwner};
+use super::signatures::Semantics;
 use super::types::{GenericEnvArena, Type, TypeIndex, TypeInterner};
 
 /// The bytes a type may take in a message, as rustc shortens a long type.
@@ -29,7 +29,7 @@ const TYPE_DISPLAY_BUDGET: usize = 64;
 
 pub(super) struct TypeFormatter<'a> {
 	pub(super) types: &'a TypeInterner,
-	pub(super) defs: &'a DefinitionRegistry,
+	pub(super) decls: &'a Declarations,
 	pub(super) strings: &'a StringInterner,
 	pub(super) generic_envs: &'a GenericEnvArena,
 	/// How many bytes a type may take before the rest of it is written as
@@ -47,20 +47,26 @@ pub(super) struct BoundFormatter<'a> {
 	bounds: &'a BoundArena,
 }
 
-impl TypeContext<'_, '_, '_> {
-	pub(super) fn type_formatter(&self) -> TypeFormatter<'_> {
+impl Semantics {
+	pub(super) fn type_formatter<'a>(
+		&'a self,
+		strings: &'a StringInterner,
+	) -> TypeFormatter<'a> {
 		TypeFormatter {
 			types: &self.types,
-			defs: self.defs,
-			strings: self.strings,
+			decls: &self.decls,
+			strings,
 			generic_envs: &self.generic_envs,
 			budget: TYPE_DISPLAY_BUDGET,
 		}
 	}
 
-	pub(super) fn bound_formatter(&self) -> BoundFormatter<'_> {
+	pub(super) fn bound_formatter<'a>(
+		&'a self,
+		strings: &'a StringInterner,
+	) -> BoundFormatter<'a> {
 		BoundFormatter {
-			type_formatter: self.type_formatter(),
+			type_formatter: self.type_formatter(strings),
 			bounds: &self.bounds,
 		}
 	}
@@ -90,7 +96,7 @@ impl BoundFormatter<'_> {
 
 	fn write_bound(&self, f: &mut String, bound: BoundId) {
 		let bound = self.bounds.get(bound);
-		let symbol = self.type_formatter.defs.traits
+		let symbol = self.type_formatter.decls.traits
 			[usize::from(bound.trait_index)]
 		.name
 		.inner;
@@ -103,13 +109,13 @@ impl BoundFormatter<'_> {
 			if i > 0 {
 				f.push_str(", ");
 			}
-			let defs = self.type_formatter.defs;
+			let decls = self.type_formatter.decls;
 			let name =
 				|symbol| self.type_formatter.strings.resolve(symbol).unwrap();
 			match &binding.kind {
 				BindingRequirement::Equals(target, ty) => {
 					f.push_str(name(
-						defs.assoc_types[usize::from(target.assoc_type_index)]
+						decls.assoc_types[usize::from(target.assoc_type_index)]
 							.name
 							.inner,
 					));
@@ -118,7 +124,7 @@ impl BoundFormatter<'_> {
 				}
 				BindingRequirement::Bound(target, bounds) => {
 					f.push_str(name(
-						defs.assoc_types[usize::from(target.assoc_type_index)]
+						decls.assoc_types[usize::from(target.assoc_type_index)]
 							.name
 							.inner,
 					));
@@ -128,7 +134,9 @@ impl BoundFormatter<'_> {
 				BindingRequirement::Representable(target, ty) => {
 					f.push_str("const ");
 					f.push_str(name(
-						defs.constants[usize::from(target.constant)].name.inner,
+						decls.constants[usize::from(target.constant)]
+							.name
+							.inner,
 					));
 					f.push_str(": ");
 					self.type_formatter.write_type(f, ty.inner);
@@ -198,23 +206,23 @@ impl TypeFormatter<'_> {
 				type_args,
 			} => {
 				let symbol =
-					self.defs.structs[usize::from(*struct_index)].name.inner;
+					self.decls.structs[usize::from(*struct_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				self.write_type_args(f, limit, self.types.list(*type_args));
 			}
 			Type::Enum { enum_index } => {
 				let symbol =
-					self.defs.enums[usize::from(*enum_index)].name.inner;
+					self.decls.enums[usize::from(*enum_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
 			Type::Memory { memory_index, .. } => {
 				let symbol =
-					self.defs.memories[usize::from(*memory_index)].name.inner;
+					self.decls.memories[usize::from(*memory_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
 			Type::Global { global_index } => {
 				let symbol =
-					self.defs.globals[usize::from(*global_index)].name.inner;
+					self.decls.globals[usize::from(*global_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
 			Type::Pointer {
@@ -273,7 +281,7 @@ impl TypeFormatter<'_> {
 				type_args,
 			} => {
 				let function =
-					&self.defs.functions[usize::from(*function_index)];
+					&self.decls.functions[usize::from(*function_index)];
 				let mut type_args = self.types.list(*type_args);
 				// A trait's declaration takes `Self` first; it is written as
 				// the receiver, `<Self as Trait>::f<own>`, always qualified
@@ -286,7 +294,7 @@ impl TypeFormatter<'_> {
 					self.write_part(f, limit, receiver);
 					f.push_str(" as ");
 					let symbol =
-						self.defs.traits[usize::from(trait_index)].name.inner;
+						self.decls.traits[usize::from(trait_index)].name.inner;
 					f.push_str(self.strings.resolve(symbol).unwrap());
 					f.push_str(">::");
 					type_args = own;
@@ -317,10 +325,10 @@ impl TypeFormatter<'_> {
 				self.write_part(f, limit, *base);
 				f.push_str(" as ");
 				let symbol =
-					self.defs.traits[usize::from(*trait_index)].name.inner;
+					self.decls.traits[usize::from(*trait_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				f.push_str(">::");
-				let assoc_symbol = self.defs.assoc_types
+				let assoc_symbol = self.decls.assoc_types
 					[usize::from(*assoc_type_index)]
 				.name
 				.inner;
@@ -348,15 +356,15 @@ impl TypeFormatter<'_> {
 		constant: ConstIdx,
 		args: &[TypeIndex],
 	) {
-		let def = &self.defs.constants[usize::from(constant)];
-		let name = self.strings.resolve(def.name.inner).unwrap();
-		match def.owner {
+		let decl = &self.decls.constants[usize::from(constant)];
+		let name = self.strings.resolve(decl.name.inner).unwrap();
+		match decl.owner {
 			MemberOwner::Trait(trait_index) => {
 				f.push('<');
 				self.write_part(f, limit, args[0]);
 				f.push_str(" as ");
 				let symbol =
-					self.defs.traits[usize::from(trait_index)].name.inner;
+					self.decls.traits[usize::from(trait_index)].name.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				f.push_str(">::");
 				f.push_str(name);
@@ -417,22 +425,23 @@ mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{
-		AssocTypeIdx, BindingKey, BindingTarget, DefKind, FunctionIdx,
+	use crate::tir::decls::{
+		AssocTypeIdx, BindingKey, BindingTarget, DeclKind, FunctionIdx,
 		MemberKind, Namespace, Tier, TraitIdx,
 	};
 	use crate::tir::impls::ImplDispatch;
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::tir::signatures::{FunctionSignature, QueryInfo};
-	use crate::tir::solver::Solver;
+	use crate::tir::signatures::{
+		FunctionSignature, QueryInfo, SemanticsBuilder,
+	};
 	use crate::tir::types::GenericEnvIdx;
 	use crate::vfs;
 
 	struct TestCase {
 		graph: vfs::CompilationUnit,
 		strings: StringInterner,
-		defs: DefinitionRegistry,
+		decls: Declarations,
 		types: TypeInterner,
 		generic_envs: GenericEnvArena,
 		bounds: BoundArena,
@@ -458,7 +467,7 @@ mod tests {
 
 			let mut diagnostics = Vec::new();
 			let mut resolutions = NameResolutions::default();
-			let (defs, ast_nodes) = DefinitionRegistry::build(
+			let (decls, ast_nodes) = Declarations::build(
 				&graph.packages,
 				&graph.files,
 				&mut strings,
@@ -474,60 +483,57 @@ mod tests {
 				&mut diagnostics,
 				&mut resolutions,
 				&strings,
-				&defs,
+				&decls,
 				&ast_nodes,
 			);
-			let mut solver = Solver::new(defs.constants.len());
-			let mut signatures = TypeContext::new(
-				&mut diagnostics,
-				&mut resolutions,
-				&mut strings,
-				&mut solver,
-				&graph.files,
-				&defs,
-				&ast_nodes,
-				&dispatch,
+			let mut sema = Semantics::new(
+				decls,
+				dispatch,
+				diagnostics,
+				resolutions,
+				&strings,
 			);
+			let mut builder =
+				SemanticsBuilder::new(&graph.files, &mut strings, &ast_nodes);
 			for entry in &ast_nodes {
-				let _ = signatures.ensure_signature(QueryInfo {
-					def_id: entry.node.def_id(),
-					requested_at: None,
-				});
+				let _ = builder.ensure_signature(
+					&mut sema,
+					QueryInfo {
+						decl_id: entry.node.decl_id(),
+						requested_at: None,
+					},
+				);
 			}
-			DiagnosticView::new(
-				"signature",
-				signatures.diagnostics,
-				&graph.files,
-			)
-			.assert_none();
+			DiagnosticView::new("signature", &sema.diagnostics, &graph.files)
+				.assert_none();
 
 			Self {
-				types: signatures.types,
-				generic_envs: signatures.generic_envs,
-				bounds: signatures.bounds,
-				functions: signatures.functions,
+				types: sema.types,
+				generic_envs: sema.generic_envs,
+				bounds: sema.bounds,
+				functions: sema.functions,
+				decls: sema.decls,
 				graph,
 				strings,
-				defs,
 			}
 		}
 
-		fn definition(&self, tier: Tier, name: &str) -> DefKind {
+		fn definition(&self, tier: Tier, name: &str) -> DeclKind {
 			let symbol =
 				self.strings.get(name).expect("expected a fixture name");
-			let root = Namespace::Package(self.defs.root_package);
+			let root = Namespace::Package(self.decls.root_package);
 			let BindingTarget::Accessible(key) =
-				self.defs.namespaces.symbols(root).bindings
+				self.decls.namespaces.symbols(root).bindings
 					[&BindingKey::new(tier, symbol)]
 					.target
 			else {
 				panic!("expected `{name}` to be accessible");
 			};
-			key.symbol_kind(&self.defs)
+			key.symbol_kind(&self.decls)
 		}
 
 		fn function(&self, name: &str) -> FunctionIdx {
-			let DefKind::Function(index) = self.definition(Tier::Value, name)
+			let DeclKind::Function(index) = self.definition(Tier::Value, name)
 			else {
 				panic!("expected `{name}` to be a function");
 			};
@@ -559,7 +565,7 @@ mod tests {
 		fn type_formatter(&self) -> TypeFormatter<'_> {
 			TypeFormatter {
 				types: &self.types,
-				defs: &self.defs,
+				decls: &self.decls,
 				strings: &self.strings,
 				generic_envs: &self.generic_envs,
 				budget: TYPE_DISPLAY_BUDGET,
@@ -579,7 +585,7 @@ mod tests {
 			let after = names[index].span.end;
 			let before =
 				names.get(index + 1).map_or(u32::MAX, |n| n.span.start);
-			let file_id = self.defs.functions
+			let file_id = self.decls.functions
 				[usize::from(self.function(function))]
 			.file_id;
 			let written: Vec<BoundId> = self
@@ -619,8 +625,8 @@ mod tests {
 				.strings
 				.get(name)
 				.expect("already interned from source");
-			let trait_def = &self.defs.traits[usize::from(trait_index)];
-			let &member_index = trait_def
+			let trait_decl = &self.decls.traits[usize::from(trait_index)];
+			let &member_index = trait_decl
 				.bindings
 				.get(&BindingKey::ty(symbol))
 				.unwrap_or_else(|| {
@@ -629,7 +635,7 @@ mod tests {
 					)
 				});
 			let MemberKind::AssociatedType(index) =
-				trait_def.members[usize::from(member_index)].kind
+				trait_decl.members[usize::from(member_index)].kind
 			else {
 				panic!("expected `{name}` to be an associated type");
 			};
@@ -698,7 +704,7 @@ mod tests {
 			func iterate<T: Iterable>() {}
 		"});
 		let param = case.type_param("iterate", "T");
-		let DefKind::Trait(trait_index) =
+		let DeclKind::Trait(trait_index) =
 			case.definition(Tier::Type, "Iterable")
 		else {
 			panic!("expected Iterable to be a trait");

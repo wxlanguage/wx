@@ -22,7 +22,7 @@
 //! and is owned by its first-defined member: it is reported once whichever
 //! constant is asked first. The solver reads bodies and builds none: every
 //! constant body is built before anything evaluates
-//! (`TypeContext::build_constant_bodies`).
+//! (`Semantics::build_constant_bodies`).
 //!
 //! A constant with parameters (a trait's, an impl's with arguments) has a
 //! value per instance, the constant with its arguments (`Instance`): its body
@@ -39,12 +39,12 @@ use super::body::{
 	FunctionImplementation,
 };
 use super::bounds::AssumptionEnvIdx;
-use super::defs::{
+use super::decls::{
 	ConstIdx, EnumIdx, FunctionIdx, GlobalIdx, MemberKind, MemberOwner,
 	MemoryIdx,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
-use super::signatures::TypeContext;
+use super::signatures::Semantics;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, Solver, SolverError, SolverFrame,
 	metadata_len,
@@ -52,7 +52,7 @@ use super::solver::{
 use super::types::{
 	GenericEnvIdx, Primitive, Substitution, Type, TypeIndex, TypeList,
 };
-use crate::ast::{BinaryOp, UnaryOp};
+use crate::ast::{BinaryOp, StringInterner, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::index::index_newtype;
 
@@ -165,7 +165,7 @@ pub(super) enum ConstValueState {
 	Evaluated(ConstValue),
 	/// The value of an untyped constant (`const X: {integer}`): a number of
 	/// its kind, exact, with no type until a use gives it one
-	/// (`TypeContext::exact_value`).
+	/// (`Semantics::exact_value`).
 	Exact(i128),
 	/// Not evaluated at all: the evaluator holds no values of its type
 	/// (`check_value_type`), or it has no initializer. A constant that reads
@@ -287,24 +287,21 @@ pub(super) enum ResolvedConstant {
 }
 
 /// The checked body `owner` evaluates, as built.
-fn body_of<'a>(
-	view: &'a TypeContext<'_, '_, '_>,
-	owner: Owner<'_>,
-) -> &'a Body {
+fn body_of<'a>(sema: &'a Semantics, owner: Owner<'_>) -> &'a Body {
 	match owner.body {
 		Evaluated::Constant(const_index) => {
-			match view.const_bodies[usize::from(const_index)] {
-				ConstBody::Built(body) => view.body(body),
+			match sema.const_bodies[usize::from(const_index)] {
+				ConstBody::Built(body) => sema.body(body),
 				_ => unreachable!("an evaluated constant's body is built"),
 			}
 		}
-		Evaluated::Global(global_index) => view.body(
-			view.global_bodies[usize::from(global_index)]
+		Evaluated::Global(global_index) => sema.body(
+			sema.global_bodies[usize::from(global_index)]
 				.expect("an evaluated global's body is built"),
 		),
 		Evaluated::Function(function_index) => {
-			match view.function_implementations[usize::from(function_index)] {
-				FunctionImplementation::Defined(body) => view.body(body),
+			match sema.function_implementations[usize::from(function_index)] {
+				FunctionImplementation::Defined(body) => sema.body(body),
 				_ => unreachable!("an evaluated function's body is checked"),
 			}
 		}
@@ -312,59 +309,62 @@ fn body_of<'a>(
 }
 
 /// The type scope `owner`'s body is checked in: a global's is the root.
-fn body_env(view: &TypeContext<'_, '_, '_>, owner: Owner<'_>) -> GenericEnvIdx {
+fn body_env(sema: &Semantics, owner: Owner<'_>) -> GenericEnvIdx {
 	match owner.body {
 		Evaluated::Constant(const_index) => {
-			view.constants[usize::from(const_index)].env
+			sema.constants[usize::from(const_index)].env
 		}
 		Evaluated::Global(_) => GenericEnvIdx::ROOT,
 		Evaluated::Function(function_index) => {
-			view.functions[usize::from(function_index)].type_params
+			sema.functions[usize::from(function_index)].type_params
 		}
 	}
 }
 
 /// The file `owner`'s body is written in.
-fn body_file(
-	view: &TypeContext<'_, '_, '_>,
-	owner: Owner<'_>,
-) -> crate::vfs::FileId {
+fn body_file(sema: &Semantics, owner: Owner<'_>) -> crate::vfs::FileId {
 	match owner.body {
 		Evaluated::Constant(const_index) => {
-			view.defs.constants[usize::from(const_index)].file_id
+			sema.decls.constants[usize::from(const_index)].file_id
 		}
 		Evaluated::Global(global_index) => {
-			view.defs.globals[usize::from(global_index)].file_id
+			sema.decls.globals[usize::from(global_index)].file_id
 		}
 		Evaluated::Function(function_index) => {
-			view.defs.functions[usize::from(function_index)].file_id
+			sema.decls.functions[usize::from(function_index)].file_id
 		}
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// Evaluates a constant in the body phase, and reports what it owns. One
 	/// with parameters is only checked: its instances are evaluated, and
 	/// reported, where they are read.
-	pub(super) fn evaluate_constant(&mut self, const_index: ConstIdx) {
+	pub(super) fn evaluate_constant(
+		&mut self,
+		strings: &StringInterner,
+		const_index: ConstIdx,
+	) {
 		let env = self.constants[usize::from(const_index)].env;
 		if self.generic_envs.generic_count(env) > 0 {
 			if self.solver.const_values[usize::from(const_index)]
 				== ConstValueState::Unchecked
 			{
-				self.check_constant(const_index);
+				self.check_constant(strings, const_index);
 			}
 			return;
 		}
-		let _ = self.const_value(const_index);
-		let diagnostic = match &self.solver.const_values
-			[usize::from(const_index)]
-		{
-			ConstValueState::Failed(error) => {
-				self.report_eval_failure(Instance::of(const_index), error, None)
-			}
-			_ => return,
-		};
+		let _ = self.const_value(strings, const_index);
+		let diagnostic =
+			match &self.solver.const_values[usize::from(const_index)] {
+				ConstValueState::Failed(error) => self.report_eval_failure(
+					strings,
+					Instance::of(const_index),
+					error,
+					None,
+				),
+				_ => return,
+			};
 		self.diagnostics.push(diagnostic);
 	}
 
@@ -373,7 +373,11 @@ impl TypeContext<'_, '_, '_> {
 	/// its body is checked without an error. A global reads no other global
 	/// (reading one is a call of `Global::get`, which is not constant), so
 	/// no loop can pass through it and it needs no frame of its own.
-	pub(super) fn evaluate_global(&mut self, global_index: GlobalIdx) {
+	pub(super) fn evaluate_global(
+		&mut self,
+		strings: &StringInterner,
+		global_index: GlobalIdx,
+	) {
 		let owner = Owner {
 			body: Evaluated::Global(global_index),
 			args: &[],
@@ -385,6 +389,7 @@ impl TypeContext<'_, '_, '_> {
 		// check (`Global::Value`'s bounds).
 		if self
 			.push_scalars(
+				strings,
 				AssumptionEnvIdx::ROOT,
 				ty,
 				&mut scalars,
@@ -395,7 +400,7 @@ impl TypeContext<'_, '_, '_> {
 			return;
 		}
 		let mut stack = Vec::new();
-		match self.eval(owner, root, &mut stack) {
+		match self.eval(strings, owner, root, &mut stack) {
 			Ok(()) if stack.iter().map(|value| value.scalar).eq(scalars) => {
 				self.global_values[usize::from(global_index)] =
 					Some(stack.into_boxed_slice());
@@ -403,7 +408,7 @@ impl TypeContext<'_, '_, '_> {
 			Ok(()) | Err(Halt::Silent) => {}
 			Err(Halt::Own(error)) => {
 				let diagnostic =
-					self.report_global_failure(global_index, &error);
+					self.report_global_failure(strings, global_index, &error);
 				self.diagnostics.push(diagnostic);
 			}
 		}
@@ -418,6 +423,7 @@ impl TypeContext<'_, '_, '_> {
 	/// instance is lowered.
 	pub(super) fn static_value(
 		&mut self,
+		strings: &StringInterner,
 		function: FunctionIdx,
 		args: &[TypeIndex],
 		expr: ExprIdx,
@@ -438,7 +444,7 @@ impl TypeContext<'_, '_, '_> {
 			expr,
 		};
 		if !self.solver.static_values.contains_key(&key) {
-			let value = self.evaluate_static(key);
+			let value = self.evaluate_static(strings, key);
 			self.solver.static_values.insert(key, value);
 		}
 		self.solver.static_values[&key].as_deref()
@@ -448,26 +454,35 @@ impl TypeContext<'_, '_, '_> {
 	/// its query's to report.
 	fn push_static_value(
 		&mut self,
+		strings: &StringInterner,
 		function: FunctionIdx,
 		args: &[TypeIndex],
 		expr: ExprIdx,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
 		let value = self
-			.static_value(function, args, expr)
+			.static_value(strings, function, args, expr)
 			.ok_or(Halt::Silent)?;
 		stack.extend_from_slice(value);
 		Ok(())
 	}
 
 	/// Evaluates `key`'s static data, reporting what fails in it.
-	fn evaluate_static(&mut self, key: StaticInstance) -> Option<ConstValue> {
+	fn evaluate_static(
+		&mut self,
+		strings: &StringInterner,
+		key: StaticInstance,
+	) -> Option<ConstValue> {
 		let args: Box<[TypeIndex]> = self.types.list(key.args).into();
 		let owner = Owner {
 			body: Evaluated::Function(key.function),
 			args: &args,
 		};
-		let ty = self.instance_type(owner, body_of(self, owner).ty(key.expr));
+		let ty = self.instance_type(
+			strings,
+			owner,
+			body_of(self, owner).ty(key.expr),
+		);
 		let mut stack = Vec::new();
 		// Placed: a literal, or a constant holding one (`place_data`); not
 		// placed (an element of an enclosing array), only its elements.
@@ -477,9 +492,9 @@ impl TypeContext<'_, '_, '_> {
 			_ => false,
 		};
 		let result = if placed {
-			self.place_data(owner, key.expr, ty, &mut stack)
+			self.place_data(strings, owner, key.expr, ty, &mut stack)
 		} else {
-			self.eval_static(owner, key.expr, ty, &mut stack)
+			self.eval_static(strings, owner, key.expr, ty, &mut stack)
 		};
 		match result {
 			Ok(()) => Some(stack.into_boxed_slice()),
@@ -495,12 +510,13 @@ impl TypeContext<'_, '_, '_> {
 
 	fn report_global_failure(
 		&self,
+		strings: &StringInterner,
 		global_index: GlobalIdx,
 		error: &EvalError,
 	) -> Diagnostic<crate::vfs::FileId> {
-		let def = &self.defs.globals[usize::from(global_index)];
-		let name = self.strings.resolve(def.name.inner).unwrap_or("?");
-		let site = SourceSpan::new(def.file_id, error.span);
+		let decl = &self.decls.globals[usize::from(global_index)];
+		let name = strings.resolve(decl.name.inner).unwrap_or("?");
+		let site = SourceSpan::new(decl.file_id, error.span);
 		let (code, message) = match error.kind {
 			EvalErrorKind::NotConst => (
 				DiagnosticCode::NonConstantGlobalInitializer,
@@ -529,7 +545,11 @@ impl TypeContext<'_, '_, '_> {
 	/// same way. A body that reported an error, building or here, is never
 	/// evaluated: its constant is `Poisoned`, and so is every reader. Reading
 	/// the constant while it is checked closes a loop (`const_cycle`).
-	pub(super) fn check_constant(&mut self, const_index: ConstIdx) {
+	pub(super) fn check_constant(
+		&mut self,
+		strings: &StringInterner,
+		const_index: ConstIdx,
+	) {
 		let at = usize::from(const_index);
 		debug_assert!(matches!(
 			self.solver.const_values[at],
@@ -545,7 +565,7 @@ impl TypeContext<'_, '_, '_> {
 			),
 		});
 		let reported = self.diagnostics.len();
-		self.decide_obligations(const_index);
+		self.decide_obligations(strings, const_index);
 		let clean = !self.diagnostics[reported..].has_errors();
 		let Some(SolverFrame::Evaluation { outer_budget, .. }) =
 			self.solver.state.frames.pop()
@@ -564,18 +584,22 @@ impl TypeContext<'_, '_, '_> {
 
 	/// The bits of `instance`'s one number, as a type means it; `None` when
 	/// it has no such value, which its check or the site naming it reports.
-	pub(super) fn instance_bits(&mut self, instance: Instance) -> Option<u64> {
+	pub(super) fn instance_bits(
+		&mut self,
+		strings: &StringInterner,
+		instance: Instance,
+	) -> Option<u64> {
 		// An untyped constant is a count where a type reads it.
 		if self.constants[usize::from(instance.constant)]
 			.ty
 			.is_literal()
 		{
 			return self
-				.exact_value(instance.constant)
+				.exact_value(strings, instance.constant)
 				.ok()
 				.and_then(|value| u64::try_from(value).ok());
 		}
-		self.instance_value(instance, None)
+		self.instance_value(strings, instance, None)
 			.ok()
 			.and_then(value_bits)
 	}
@@ -585,10 +609,13 @@ impl TypeContext<'_, '_, '_> {
 	/// `const_value`'s.
 	pub(super) fn exact_value(
 		&mut self,
+		strings: &StringInterner,
 		const_index: ConstIdx,
 	) -> Result<i128, Unevaluable> {
 		let instance = Instance::of(const_index);
-		if let Err(Unevaluable::Silent) = self.instance_value(instance, None) {
+		if let Err(Unevaluable::Silent) =
+			self.instance_value(strings, instance, None)
+		{
 			return Err(Unevaluable::Silent);
 		}
 		match *self.solver.const_state(instance) {
@@ -603,21 +630,26 @@ impl TypeContext<'_, '_, '_> {
 	/// `None` when it is more than one number.
 	pub(super) fn constant_bits(
 		&mut self,
+		strings: &StringInterner,
 		const_index: ConstIdx,
 	) -> Result<Option<u64>, Unevaluable> {
-		self.const_value(const_index).map(value_bits)
+		self.const_value(strings, const_index).map(value_bits)
 	}
 
 	/// Reports each set of an enum's variants that share a value, once, on the
 	/// enum. A variant without a value reports itself and is left out.
-	pub(super) fn check_discriminants(&mut self, enum_index: EnumIdx) {
-		let enum_def = &self.defs.enums[usize::from(enum_index)];
-		let (file_id, name_span) = (enum_def.file_id, enum_def.name.span);
-		let (run, open) = (enum_def.variants.clone(), enum_def.open);
+	pub(super) fn check_discriminants(
+		&mut self,
+		strings: &StringInterner,
+		enum_index: EnumIdx,
+	) {
+		let enum_decl = &self.decls.enums[usize::from(enum_index)];
+		let (file_id, name_span) = (enum_decl.file_id, enum_decl.name.span);
+		let (run, open) = (enum_decl.variants.clone(), enum_decl.open);
 		let mut values = Vec::new();
 		for variant in u32::from(run.start)..u32::from(run.end) {
 			let variant = ConstIdx::new(variant);
-			if let Ok(&[value]) = self.const_value(variant) {
+			if let Ok(&[value]) = self.const_value(strings, variant) {
 				values.push((value, variant));
 			}
 		}
@@ -697,8 +729,12 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// An instance as a path names it (`<P as Tr>::X`).
-	fn instance_name(&self, instance: Instance) -> String {
-		self.type_formatter()
+	fn instance_name(
+		&self,
+		strings: &StringInterner,
+		instance: Instance,
+	) -> String {
+		self.type_formatter(strings)
 			.display_constant(instance.constant, self.types.list(instance.args))
 	}
 
@@ -706,13 +742,14 @@ impl TypeContext<'_, '_, '_> {
 	/// reported by its first reader, `used_at`.
 	fn report_eval_failure(
 		&self,
+		strings: &StringInterner,
 		instance: Instance,
 		error: &EvalError,
 		used_at: Option<SourceSpan>,
 	) -> Diagnostic<crate::vfs::FileId> {
-		let def = &self.defs.constants[usize::from(instance.constant)];
-		let site = SourceSpan::new(def.file_id, error.span);
-		let name = self.instance_name(instance);
+		let decl = &self.decls.constants[usize::from(instance.constant)];
+		let site = SourceSpan::new(decl.file_id, error.span);
+		let name = self.instance_name(strings, instance);
 		let message = match error.kind {
 			EvalErrorKind::NotConst => {
 				format!("`{name}` cannot be evaluated at compile time")
@@ -734,28 +771,30 @@ impl TypeContext<'_, '_, '_> {
 
 	fn report_const_cycle(
 		&self,
+		strings: &StringInterner,
 		cycle: &[Instance],
 	) -> Diagnostic<crate::vfs::FileId> {
-		let def = &self.defs.constants[usize::from(cycle[0].constant)];
+		let decl = &self.decls.constants[usize::from(cycle[0].constant)];
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CyclicConstant.code())
 			.with_message(format!(
 				"cycle detected when evaluating constant `{}`",
-				self.instance_name(cycle[0])
+				self.instance_name(strings, cycle[0])
 			))
 			.with_label(
-				SourceSpan::new(def.file_id, def.name.span).primary_label(),
+				SourceSpan::new(decl.file_id, decl.name.span).primary_label(),
 			);
 		for (at, &member) in cycle.iter().enumerate() {
 			let next = cycle[(at + 1) % cycle.len()];
-			let member_def = &self.defs.constants[usize::from(member.constant)];
+			let member_decl =
+				&self.decls.constants[usize::from(member.constant)];
 			diagnostic = diagnostic.with_label(
-				SourceSpan::new(member_def.file_id, member_def.name.span)
+				SourceSpan::new(member_decl.file_id, member_decl.name.span)
 					.secondary_label()
 					.with_message(format!(
 						"`{}` requires evaluating `{}`",
-						self.instance_name(member),
-						self.instance_name(next)
+						self.instance_name(strings, member),
+						self.instance_name(strings, next)
 					)),
 			);
 		}
@@ -822,7 +861,7 @@ impl Solver {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// The memoized value of a constant, evaluated on first use. The
 	/// evaluation is a frame on the solver's own stack, with a budget of its
 	/// own, as an impl member's judgement is: reaching the constant again
@@ -830,9 +869,10 @@ impl TypeContext<'_, '_, '_> {
 	/// must be built.
 	pub(super) fn const_value(
 		&mut self,
+		strings: &StringInterner,
 		const_index: ConstIdx,
 	) -> Result<&[ConstScalar], Unevaluable> {
-		self.instance_value(Instance::of(const_index), None)
+		self.instance_value(strings, Instance::of(const_index), None)
 	}
 
 	/// The memoized value of `instance`, as `const_value`. An instance of a
@@ -841,6 +881,7 @@ impl TypeContext<'_, '_, '_> {
 	/// reader that first asks for it, `used_at`.
 	pub(super) fn instance_value(
 		&mut self,
+		strings: &StringInterner,
 		instance: Instance,
 		used_at: Option<SourceSpan>,
 	) -> Result<&[ConstScalar], Unevaluable> {
@@ -848,16 +889,15 @@ impl TypeContext<'_, '_, '_> {
 		if self.solver.const_values[usize::from(const_index)]
 			== ConstValueState::Unchecked
 		{
-			self.check_constant(const_index);
+			self.check_constant(strings, const_index);
 		}
 		if !instance.args.is_empty() {
 			match self.solver.const_values[usize::from(const_index)] {
 				ConstValueState::Poisoned => return Err(Unevaluable::Silent),
 				// Read while its constant is checked.
 				ConstValueState::InProgress => {
-					return Err(
-						self.close_const_loop(Instance::of(const_index))
-					);
+					return Err(self
+						.close_const_loop(strings, Instance::of(const_index)));
 				}
 				_ => {}
 			}
@@ -868,7 +908,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 			ConstValueState::Checked => {}
 			ConstValueState::InProgress => {
-				return Err(self.close_const_loop(instance));
+				return Err(self.close_const_loop(strings, instance));
 			}
 			_ => {
 				return self
@@ -889,7 +929,7 @@ impl TypeContext<'_, '_, '_> {
 				} else {
 					ConstValueState::Poisoned
 				};
-				return self.settle_constant(instance, state, used_at);
+				return self.settle_constant(strings, instance, state, used_at);
 			}
 			ConstBody::NotBuilt => {
 				unreachable!("every constant body is built before it evaluates")
@@ -915,15 +955,15 @@ impl TypeContext<'_, '_, '_> {
 		let scalars = if untyped {
 			Ok(Vec::new())
 		} else {
-			self.constant_scalars(const_index, owner)
+			self.constant_scalars(strings, const_index, owner)
 		};
 		let mut stack = Vec::new();
 		let mut exact = None;
 		let evaluated = match &scalars {
 			Ok(_) if untyped => self
-				.eval_exact(owner, root)
+				.eval_exact(strings, owner, root)
 				.map(|value| exact = Some(value)),
-			Ok(_) => self.eval(owner, root, &mut stack),
+			Ok(_) => self.eval(strings, owner, root, &mut stack),
 			Err(_) => Ok(()),
 		};
 		let Some(SolverFrame::Evaluation { outer_budget, .. }) =
@@ -937,7 +977,7 @@ impl TypeContext<'_, '_, '_> {
 		let scalars = match scalars {
 			Ok(scalars) => scalars,
 			Err(state) => {
-				return self.settle_constant(instance, state, used_at);
+				return self.settle_constant(strings, instance, state, used_at);
 			}
 		};
 
@@ -957,7 +997,7 @@ impl TypeContext<'_, '_, '_> {
 			Err(Halt::Own(error)) => ConstValueState::Failed(error),
 			Err(Halt::Silent) => ConstValueState::Poisoned,
 		};
-		self.settle_constant(instance, state, used_at)
+		self.settle_constant(strings, instance, state, used_at)
 	}
 
 	/// Records the final state of `instance` and answers its reader with it.
@@ -965,6 +1005,7 @@ impl TypeContext<'_, '_, '_> {
 	/// here, by its first reader: no sweep reaches it.
 	fn settle_constant(
 		&mut self,
+		strings: &StringInterner,
 		instance: Instance,
 		state: ConstValueState,
 		used_at: Option<SourceSpan>,
@@ -974,7 +1015,8 @@ impl TypeContext<'_, '_, '_> {
 			&& let ConstValueState::Failed(error) =
 				self.solver.const_state(instance)
 		{
-			let diagnostic = self.report_eval_failure(instance, error, used_at);
+			let diagnostic =
+				self.report_eval_failure(strings, instance, error, used_at);
 			self.diagnostics.push(diagnostic);
 		}
 		self.solver
@@ -987,9 +1029,13 @@ impl TypeContext<'_, '_, '_> {
 	/// evaluated, closes, once, against its first-defined member. Its members
 	/// are poisoned, so every later reader, and the members' own checks and
 	/// evaluations, fail silently.
-	fn close_const_loop(&mut self, instance: Instance) -> Unevaluable {
+	fn close_const_loop(
+		&mut self,
+		strings: &StringInterner,
+		instance: Instance,
+	) -> Unevaluable {
 		let cycle = self.solver.const_cycle(instance);
-		let diagnostic = self.report_const_cycle(&cycle);
+		let diagnostic = self.report_const_cycle(strings, &cycle);
 		self.diagnostics.push(diagnostic);
 		for &member in &*cycle {
 			*self.solver.const_state_mut(member) = ConstValueState::Poisoned;
@@ -1001,6 +1047,7 @@ impl TypeContext<'_, '_, '_> {
 	/// held in the positions `order` gives them.
 	fn eval_ordered(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		elements: ExprRange,
 		order: ElementOrder,
@@ -1009,7 +1056,7 @@ impl TypeContext<'_, '_, '_> {
 		let ElementOrder::Permuted { .. } = order else {
 			for at in 0..elements.len() {
 				let arg = body_of(self, owner).args(elements)[at];
-				self.eval(owner, arg, stack)?;
+				self.eval(strings, owner, arg, stack)?;
 			}
 			return Ok(());
 		};
@@ -1020,7 +1067,7 @@ impl TypeContext<'_, '_, '_> {
 			let (arg, index) =
 				(body.args(elements)[at], body.declared_index(order, at));
 			let arg_start = stack.len();
-			self.eval(owner, arg, stack)?;
+			self.eval(strings, owner, arg, stack)?;
 			declared.push((
 				usize::from(index),
 				arg_start - start..stack.len() - start,
@@ -1039,6 +1086,7 @@ impl TypeContext<'_, '_, '_> {
 	/// held while a constant it names is evaluated.
 	fn eval(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		expr: ExprIdx,
 		stack: &mut Vec<ConstScalar>,
@@ -1046,7 +1094,7 @@ impl TypeContext<'_, '_, '_> {
 		let body = body_of(self, owner);
 		let (kind, ty, span) =
 			(body.kind(expr), body.ty(expr), body.span(expr));
-		let ty = self.instance_type(owner, ty);
+		let ty = self.instance_type(strings, owner, ty);
 		if ty == TypeIndex::ERROR {
 			return Err(Halt::Silent);
 		}
@@ -1109,12 +1157,14 @@ impl TypeContext<'_, '_, '_> {
 			| ExprKind::ArrayRepeat { .. }
 				if let Evaluated::Function(function) = owner.body =>
 			{
-				self.push_static_value(function, owner.args, expr, stack)?;
+				self.push_static_value(
+					strings, function, owner.args, expr, stack,
+				)?;
 			}
 			ExprKind::String(_)
 			| ExprKind::Array { .. }
 			| ExprKind::ArrayRepeat { .. } => {
-				self.eval_static(owner, expr, ty, stack)?;
+				self.eval_static(strings, owner, expr, ty, stack)?;
 			}
 			// A constant holding data in no memory, placed here: a copy of
 			// its data in the memory `ty` names.
@@ -1125,9 +1175,11 @@ impl TypeContext<'_, '_, '_> {
 					) =>
 			{
 				if let Evaluated::Function(function) = owner.body {
-					self.push_static_value(function, owner.args, expr, stack)?;
+					self.push_static_value(
+						strings, function, owner.args, expr, stack,
+					)?;
 				} else {
-					self.place_data(owner, expr, ty, stack)?;
+					self.place_data(strings, owner, expr, ty, stack)?;
 				}
 			}
 			// Data in no memory has no value of its own; as an element of
@@ -1147,7 +1199,7 @@ impl TypeContext<'_, '_, '_> {
 					body: Evaluated::Constant(constant),
 					args: &[],
 				};
-				self.eval(owner, root, stack)?;
+				self.eval(strings, owner, root, stack)?;
 			}
 			ExprKind::Char(value) => stack.push(ConstScalar::char(value)),
 			ExprKind::Const {
@@ -1161,13 +1213,21 @@ impl TypeContext<'_, '_, '_> {
 				let args: Vec<TypeIndex> = (0..type_args.len())
 					.map(|at| {
 						let arg = self.generic_args.types(type_args)[at];
-						self.instance_type(owner, arg)
+						self.instance_type(strings, owner, arg)
 					})
 					.collect();
-				self.read_reference(owner, constant, &args, ty, span, stack)?;
+				self.read_reference(
+					strings, owner, constant, &args, ty, span, stack,
+				)?;
 			}
 			ExprKind::NextDiscriminant(previous) => {
-				self.read_constant(Instance::of(previous), None, span, stack)?;
+				self.read_constant(
+					strings,
+					Instance::of(previous),
+					None,
+					span,
+					stack,
+				)?;
 				let previous = stack.pop().expect("a variant's value");
 				let one = literal(1, false, previous.scalar)
 					.expect("an enum's repr holds one");
@@ -1189,22 +1249,22 @@ impl TypeContext<'_, '_, '_> {
 				);
 			}
 			ExprKind::PrimitiveUnary { op, operand } => {
-				self.eval(owner, operand, stack)?;
+				self.eval(strings, owner, operand, stack)?;
 				let operand = stack.pop().expect("an operand's value");
 				stack.push(unary(op, operand).map_err(own)?);
 			}
 			// Its values are its elements', in declared order, as its type's
 			// layout is.
 			ExprKind::Tuple { elements, order } => {
-				self.eval_ordered(owner, elements, order, stack)?;
+				self.eval_ordered(strings, owner, elements, order, stack)?;
 			}
 			// Its fields' value; one missing was reported, which makes it
 			// `ERROR`.
 			ExprKind::StructConstructor { fields, .. } => {
-				self.eval(owner, fields, stack)?;
+				self.eval(strings, owner, fields, stack)?;
 			}
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
-				self.eval(owner, lhs, stack)?;
+				self.eval(strings, owner, lhs, stack)?;
 				// `&&` and `||` do not evaluate a right side they do not need;
 				// otherwise the right side is the answer.
 				if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -1213,9 +1273,9 @@ impl TypeContext<'_, '_, '_> {
 						return Ok(());
 					}
 					stack.pop();
-					return self.eval(owner, rhs, stack);
+					return self.eval(strings, owner, rhs, stack);
 				}
-				self.eval(owner, rhs, stack)?;
+				self.eval(strings, owner, rhs, stack)?;
 				let rhs = stack.pop().expect("an operand's value");
 				let lhs = stack.pop().expect("an operand's value");
 				stack.push(binary(op, lhs, rhs).map_err(own)?);
@@ -1231,6 +1291,7 @@ impl TypeContext<'_, '_, '_> {
 	/// given.
 	fn eval_exact(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		expr: ExprIdx,
 	) -> Result<i128, Halt> {
@@ -1244,22 +1305,22 @@ impl TypeContext<'_, '_, '_> {
 		match kind {
 			ExprKind::Int(value) => Ok(i128::from(value)),
 			ExprKind::Char(value) => Ok(i128::from(u32::from(value))),
-			ExprKind::Const { constant, .. } => {
-				self.exact_value(constant).map_err(|error| match error {
+			ExprKind::Const { constant, .. } => self
+				.exact_value(strings, constant)
+				.map_err(|error| match error {
 					Unevaluable::NoValue => own(EvalErrorKind::NotConst),
 					Unevaluable::Silent => Halt::Silent,
-				})
-			}
+				}),
 			ExprKind::PrimitiveUnary {
 				op: UnaryOp::InvertSign,
 				operand,
 			} => self
-				.eval_exact(owner, operand)?
+				.eval_exact(strings, owner, operand)?
 				.checked_neg()
 				.ok_or(own(EvalErrorKind::Overflow(Operation::Negate))),
 			ExprKind::PrimitiveBinary { op, lhs, rhs } => {
-				let a = self.eval_exact(owner, lhs)?;
-				let b = self.eval_exact(owner, rhs)?;
+				let a = self.eval_exact(strings, owner, lhs)?;
+				let b = self.eval_exact(strings, owner, rhs)?;
 				exact_binary(op, a, b).map_err(own)
 			}
 			ExprKind::Error => Err(Halt::Silent),
@@ -1272,6 +1333,7 @@ impl TypeContext<'_, '_, '_> {
 	/// names: the pointer, pushed.
 	fn place_data(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		expr: ExprIdx,
 		ty: TypeIndex,
@@ -1282,7 +1344,9 @@ impl TypeContext<'_, '_, '_> {
 		match kind {
 			ExprKind::String(_)
 			| ExprKind::Array { .. }
-			| ExprKind::ArrayRepeat { .. } => self.eval_static(owner, expr, ty, stack),
+			| ExprKind::ArrayRepeat { .. } => {
+				self.eval_static(strings, owner, expr, ty, stack)
+			}
 			ExprKind::Const { constant, .. } => {
 				let root = match self.const_bodies[usize::from(constant)] {
 					ConstBody::Built(body) => self.body(body).root(),
@@ -1293,7 +1357,7 @@ impl TypeContext<'_, '_, '_> {
 					body: Evaluated::Constant(constant),
 					args: &[],
 				};
-				self.place_data(owner, root, ty, stack)
+				self.place_data(strings, owner, root, ty, stack)
 			}
 			_ => Err(Halt::Own(EvalError {
 				span,
@@ -1309,6 +1373,7 @@ impl TypeContext<'_, '_, '_> {
 	/// as the data holding it writes them in place.
 	fn eval_static(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		expr: ExprIdx,
 		ty: TypeIndex,
@@ -1320,10 +1385,10 @@ impl TypeContext<'_, '_, '_> {
 		let start = stack.len();
 		match kind {
 			ExprKind::String(contents) if placed => {
-				self.eval_string(owner, contents, ty, span, stack)
+				self.eval_string(strings, owner, contents, ty, span, stack)
 			}
 			ExprKind::String(contents) => {
-				let bytes = self.strings.resolve(contents).unwrap().as_bytes();
+				let bytes = strings.resolve(contents).unwrap().as_bytes();
 				stack.extend(bytes.iter().map(|&byte| ConstScalar::u8(byte)));
 				Ok(())
 			}
@@ -1332,21 +1397,21 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::Array { elements } => {
 				for at in 0..elements.len() {
 					let element = body_of(self, owner).args(elements)[at];
-					self.eval(owner, element, stack)?;
+					self.eval(strings, owner, element, stack)?;
 				}
 				if !placed {
 					return Ok(());
 				}
 				let count = u64::try_from(elements.len()).unwrap();
-				self.place_static(owner, ty, span, count, start, stack)
+				self.place_static(strings, owner, ty, span, count, start, stack)
 			}
 			// One element's values, laid out `count` times; `_` is the
 			// array's own length.
 			ExprKind::ArrayRepeat { value, count } => {
-				self.eval(owner, value, stack)?;
+				self.eval(strings, owner, value, stack)?;
 				let array = if placed { self.static_pointee(ty) } else { ty };
 				let count = match count {
-					Some(count) => self.repeat_count(owner, count)?,
+					Some(count) => self.repeat_count(strings, owner, count)?,
 					// As long as its array.
 					None => {
 						let Type::Array { length, .. } =
@@ -1354,12 +1419,13 @@ impl TypeContext<'_, '_, '_> {
 						else {
 							unreachable!("`_` is the length of an array")
 						};
-						self.length_value(owner, length)?
+						self.length_value(strings, owner, length)?
 					}
 				};
 				if placed {
-					return self
-						.place_static(owner, ty, span, count, start, stack);
+					return self.place_static(
+						strings, owner, ty, span, count, start, stack,
+					);
 				}
 				// The one element's values, once per element.
 				let element = stack.split_off(start);
@@ -1382,6 +1448,7 @@ impl TypeContext<'_, '_, '_> {
 	/// free constant (`repeat_length`), a count whatever type it was given.
 	fn repeat_count(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		count: ExprIdx,
 	) -> Result<u64, Halt> {
@@ -1389,7 +1456,7 @@ impl TypeContext<'_, '_, '_> {
 			ExprKind::Int(bits) => Ok(bits),
 			ExprKind::Const { constant, .. } => {
 				let length = self.types.intern_const(constant, &[]);
-				self.length_value(owner, length)
+				self.length_value(strings, owner, length)
 			}
 			// Reported where the count is written.
 			_ => Err(Halt::Silent),
@@ -1399,15 +1466,16 @@ impl TypeContext<'_, '_, '_> {
 	/// A string literal's value: its contents, placed as static data.
 	fn eval_string(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		contents: SymbolU32,
 		ty: TypeIndex,
 		span: TextSpan,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let (memory, width) = self.static_memory(owner, ty, span)?;
+		let (memory, width) = self.static_memory(strings, owner, ty, span)?;
 		let bytes: Box<[u8]> =
-			self.strings.resolve(contents).unwrap().as_bytes().into();
+			strings.resolve(contents).unwrap().as_bytes().into();
 		let len = bytes.len() as u64;
 		let allocation = Allocation {
 			memory,
@@ -1427,6 +1495,7 @@ impl TypeContext<'_, '_, '_> {
 	#[allow(clippy::too_many_arguments)]
 	fn place_static(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		ty: TypeIndex,
 		span: TextSpan,
@@ -1434,7 +1503,7 @@ impl TypeContext<'_, '_, '_> {
 		start: usize,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		let (memory, width) = self.static_memory(owner, ty, span)?;
+		let (memory, width) = self.static_memory(strings, owner, ty, span)?;
 		let (Type::Slice { of } | Type::Array { of, .. }) =
 			*self.types.resolve(self.static_pointee(ty))
 		else {
@@ -1443,6 +1512,7 @@ impl TypeContext<'_, '_, '_> {
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
 		let (layout, places) = match self.memory_values(
+			strings,
 			self.assumption_envs.of_frame(body_env(self, owner)),
 			of,
 		) {
@@ -1508,6 +1578,7 @@ impl TypeContext<'_, '_, '_> {
 	/// memory not known yet there is nowhere to place it.
 	fn static_memory(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		ty: TypeIndex,
 		span: TextSpan,
@@ -1516,7 +1587,7 @@ impl TypeContext<'_, '_, '_> {
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
 		};
-		let Some(memory_index) = self.memory_of(scope, memory) else {
+		let Some(memory_index) = self.memory_of(strings, scope, memory) else {
 			return Err(Halt::Own(EvalError {
 				span,
 				kind: EvalErrorKind::NotConst,
@@ -1524,7 +1595,7 @@ impl TypeContext<'_, '_, '_> {
 		};
 		// The memory is known, so its `Size` is: a failure was reported.
 		let width = self
-			.address_scalar(scope, memory)
+			.address_scalar(strings, scope, memory)
 			.map_err(|_| Halt::Silent)?;
 		Ok((memory_index, width))
 	}
@@ -1561,11 +1632,13 @@ impl TypeContext<'_, '_, '_> {
 	/// constant it names, evaluated. A constant that fails reports itself.
 	fn length_value(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		length: TypeIndex,
 	) -> Result<u64, Halt> {
 		let env = body_env(self, owner);
 		match self.normalize(
+			strings,
 			self.assumption_envs.of_frame(env),
 			length,
 			NormalizationDepth::Shallow,
@@ -1580,7 +1653,12 @@ impl TypeContext<'_, '_, '_> {
 	}
 
 	/// `ty`, written in `owner`'s body, with the instance's arguments.
-	fn instance_type(&mut self, owner: Owner<'_>, ty: TypeIndex) -> TypeIndex {
+	fn instance_type(
+		&mut self,
+		strings: &StringInterner,
+		owner: Owner<'_>,
+		ty: TypeIndex,
+	) -> TypeIndex {
 		if owner.args.is_empty() {
 			return ty;
 		}
@@ -1594,6 +1672,7 @@ impl TypeContext<'_, '_, '_> {
 			},
 		);
 		self.normalize(
+			strings,
 			self.assumption_envs.of_frame(env),
 			ty,
 			NormalizationDepth::Deep,
@@ -1625,11 +1704,12 @@ impl TypeContext<'_, '_, '_> {
 	/// trait it implements (`Array::LEN`).
 	pub(super) fn resolve_constant(
 		&mut self,
+		strings: &StringInterner,
 		constant: ConstIdx,
 		args: &[TypeIndex],
 	) -> Result<ResolvedConstant, SolverError> {
 		let MemberOwner::Trait(trait_index) =
-			self.defs.constants[usize::from(constant)].owner
+			self.decls.constants[usize::from(constant)].owner
 		else {
 			return Ok(ResolvedConstant::Instance(
 				self.instance(constant, args),
@@ -1641,6 +1721,7 @@ impl TypeContext<'_, '_, '_> {
 		}
 		Ok(
 			match self.find_trait_impl_query(
+				strings,
 				AssumptionEnvIdx::ROOT,
 				receiver,
 				trait_index,
@@ -1649,7 +1730,7 @@ impl TypeContext<'_, '_, '_> {
 					impl_index,
 					args: impl_args,
 				}) => {
-					match self.defs.select_trait_member(
+					match self.decls.select_trait_member(
 						impl_index,
 						MemberKind::Constant(constant),
 					) {
@@ -1659,7 +1740,7 @@ impl TypeContext<'_, '_, '_> {
 							self.instance(own, &impl_args),
 						),
 						_ if Some(constant)
-							== self.defs.intrinsics.memory_data_end
+							== self.decls.intrinsics.memory_data_end
 							&& let Type::Memory { memory_index } =
 								*self.types.resolve(receiver) =>
 						{
@@ -1680,7 +1761,7 @@ impl TypeContext<'_, '_, '_> {
 					};
 					debug_assert_eq!(
 						Some(constant),
-						self.defs.intrinsics.array_len
+						self.decls.intrinsics.array_len
 					);
 					ResolvedConstant::Length(length)
 				}
@@ -1696,6 +1777,7 @@ impl TypeContext<'_, '_, '_> {
 	#[allow(clippy::too_many_arguments)]
 	fn read_reference(
 		&mut self,
+		strings: &StringInterner,
 		owner: Owner<'_>,
 		constant: ConstIdx,
 		args: &[TypeIndex],
@@ -1703,13 +1785,13 @@ impl TypeContext<'_, '_, '_> {
 		span: TextSpan,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		match self.resolve_constant(constant, args) {
+		match self.resolve_constant(strings, constant, args) {
 			Ok(ResolvedConstant::Instance(instance))
 				if self.constants[usize::from(instance.constant)]
 					.ty
 					.is_literal() =>
 			{
-				let value = match self.exact_value(instance.constant) {
+				let value = match self.exact_value(strings, instance.constant) {
 					Ok(value) => value,
 					Err(Unevaluable::NoValue) => {
 						return Err(Halt::Own(EvalError {
@@ -1725,10 +1807,16 @@ impl TypeContext<'_, '_, '_> {
 			}
 			Ok(ResolvedConstant::Instance(instance)) => {
 				let used_at = SourceSpan::new(body_file(self, owner), span);
-				self.read_constant(instance, Some(used_at), span, stack)
+				self.read_constant(
+					strings,
+					instance,
+					Some(used_at),
+					span,
+					stack,
+				)
 			}
 			Ok(ResolvedConstant::Length(length)) => {
-				let length = self.length_value(owner, length)?;
+				let length = self.length_value(strings, owner, length)?;
 				let scalar = Primitive::of(ty)
 					.expect("an array's length is of a memory's `Size`");
 				stack.push(literal(length, false, scalar).expect(
@@ -1741,7 +1829,11 @@ impl TypeContext<'_, '_, '_> {
 					memory_index: memory,
 				});
 				let scalar = self
-					.address_scalar(AssumptionEnvIdx::ROOT, memory_type)
+					.address_scalar(
+						strings,
+						AssumptionEnvIdx::ROOT,
+						memory_type,
+					)
 					.map_err(|_| Halt::Silent)?;
 				stack.push(ConstScalar {
 					val: Val::DataEnd { memory },
@@ -1762,12 +1854,13 @@ impl TypeContext<'_, '_, '_> {
 	/// not a scalar) makes the naming node not a constant expression.
 	fn read_constant(
 		&mut self,
+		strings: &StringInterner,
 		instance: Instance,
 		used_at: Option<SourceSpan>,
 		span: TextSpan,
 		stack: &mut Vec<ConstScalar>,
 	) -> Result<(), Halt> {
-		match self.instance_value(instance, used_at) {
+		match self.instance_value(strings, instance, used_at) {
 			Ok(value) => {
 				stack.extend_from_slice(value);
 				Ok(())
@@ -1785,14 +1878,16 @@ impl TypeContext<'_, '_, '_> {
 	/// holds no values of.
 	fn constant_scalars(
 		&mut self,
+		strings: &StringInterner,
 		const_index: ConstIdx,
 		owner: Owner<'_>,
 	) -> Result<Vec<Primitive>, ConstValueState> {
 		let signature = &self.constants[usize::from(const_index)];
 		let (ty, scope) = (signature.ty, signature.env);
-		let ty = self.instance_type(owner, ty);
+		let ty = self.instance_type(strings, owner, ty);
 		let mut scalars = Vec::new();
 		self.push_scalars(
+			strings,
 			self.assumption_envs.of_frame(scope),
 			ty,
 			&mut scalars,
@@ -1813,13 +1908,20 @@ impl TypeContext<'_, '_, '_> {
 	/// instantiated, contains itself, which is reported on the struct.
 	fn push_scalars(
 		&mut self,
+		strings: &StringInterner,
 		scope: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<Primitive>,
 		visiting: &mut Vec<TypeIndex>,
 	) -> Result<(), ConstValueState> {
 		let ty = self
-			.normalize(scope, ty, NormalizationDepth::Deep, RewriteFlags::ALL)
+			.normalize(
+				strings,
+				scope,
+				ty,
+				NormalizationDepth::Deep,
+				RewriteFlags::ALL,
+			)
 			.unwrap_or(ty);
 		if ty == TypeIndex::ERROR {
 			return Err(ConstValueState::Poisoned);
@@ -1834,12 +1936,13 @@ impl TypeContext<'_, '_, '_> {
 			| Type::Global { .. } => Ok(()),
 			Type::Enum { enum_index } => {
 				let repr = self.enums[usize::from(enum_index)].repr;
-				self.push_scalars(scope, repr, out, visiting)
+				self.push_scalars(strings, scope, repr, out, visiting)
 			}
 			// An address, then the pointee's counts.
 			Type::Pointer { to, memory, .. } => {
-				let scalar = self.address_scalar(scope, memory)?;
-				let metadata = self.pointer_metadata(scope, to, memory);
+				let scalar = self.address_scalar(strings, scope, memory)?;
+				let metadata =
+					self.pointer_metadata(strings, scope, to, memory);
 				let count = match metadata {
 					Ok(Some(metadata)) => metadata_len(&self.types, metadata),
 					Ok(None) => return Err(ConstValueState::NoValue),
@@ -1854,7 +1957,9 @@ impl TypeContext<'_, '_, '_> {
 					let element = self.types.list(elements)[at];
 					held = merge(
 						held,
-						self.push_scalars(scope, element, out, visiting),
+						self.push_scalars(
+							strings, scope, element, out, visiting,
+						),
 					);
 					if held == Err(ConstValueState::Poisoned) {
 						break;
@@ -1891,7 +1996,7 @@ impl TypeContext<'_, '_, '_> {
 					);
 					held = merge(
 						held,
-						self.push_scalars(scope, field, out, visiting),
+						self.push_scalars(strings, scope, field, out, visiting),
 					);
 					if held == Err(ConstValueState::Poisoned) {
 						break;
@@ -1908,20 +2013,27 @@ impl TypeContext<'_, '_, '_> {
 	/// for an address into a memory not known yet.
 	fn address_scalar(
 		&mut self,
+		strings: &StringInterner,
 		scope: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<Primitive, ConstValueState> {
-		let Some(memory_index) = self.memory_of(scope, memory) else {
+		let Some(memory_index) = self.memory_of(strings, scope, memory) else {
 			return Err(ConstValueState::NoValue);
 		};
-		let size =
-			self.defs.memories[usize::from(memory_index)].size_assoc_type_index;
+		let size = self.decls.memories[usize::from(memory_index)]
+			.size_assoc_type_index;
 		let size = self.assoc_types[usize::from(size)]
 			.as_ref()
 			.and_then(|signature| signature.value)
 			.ok_or(ConstValueState::Poisoned)?;
 		let size = self
-			.normalize(scope, size, NormalizationDepth::Deep, RewriteFlags::ALL)
+			.normalize(
+				strings,
+				scope,
+				size,
+				NormalizationDepth::Deep,
+				RewriteFlags::ALL,
+			)
 			.unwrap_or(size);
 		Primitive::of(size).ok_or(ConstValueState::Poisoned)
 	}
@@ -1929,11 +2041,13 @@ impl TypeContext<'_, '_, '_> {
 	/// The memory `memory` names in `scope`, if it is a known one.
 	fn memory_of(
 		&mut self,
+		strings: &StringInterner,
 		scope: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Option<MemoryIdx> {
 		let memory = self
 			.normalize(
+				strings,
 				scope,
 				memory,
 				NormalizationDepth::Deep,
@@ -2647,30 +2761,25 @@ fn compare(op: BinaryOp, lhs: ConstScalar, rhs: ConstScalar) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-	use codespan_reporting::diagnostic::Diagnostic;
 	use indoc::indoc;
 
 	use super::*;
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::DiagnosticCode;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{
-		AstEntry, DefKind, DefinitionRegistry, Scope, Tier,
-	};
-	use crate::tir::impls::ImplDispatch;
+	use crate::tir::decls::{DeclKind, Scope, Tier};
 	use crate::tir::paths::PathResolver;
 	use crate::tir::resolutions::NameResolutions;
-	use crate::vfs::{self, FileId, Files};
+	use crate::vfs::{self, Files};
 
-	/// `test_case!(case = "source")` declares the graph, the inputs and the
-	/// swept `TestCase` borrowing them as three locals of the calling test.
+	/// `test_case!(case = "source")` declares the interner, the graph and the
+	/// checked `TestCase` as three locals of the calling test.
 	/// The source is a binary over the real stdlib.
 	macro_rules! test_case {
 		($case:ident = $source:expr $(,)?) => {
 			let mut strings = ast::Keyword::create_interner();
 			let graph = source_graph($source, &mut strings);
-			let mut inputs = TestInputs::new(&graph, &mut strings);
-			let $case = TestCase::new(&mut inputs);
+			let $case = TestCase::new(&graph, &mut strings);
 		};
 	}
 
@@ -2701,96 +2810,26 @@ mod tests {
 		graph
 	}
 
-	/// Everything a `TypeContext` borrows, kept on the test's stack.
-	struct TestInputs<'g> {
-		files: &'g Files,
-		strings: &'g mut StringInterner,
-		defs: DefinitionRegistry,
-		ast_nodes: Vec<AstEntry<'g>>,
-		impl_dispatch: ImplDispatch,
-		diagnostics: Vec<Diagnostic<FileId>>,
-		resolutions: NameResolutions,
-		solver: Solver,
-	}
-
-	impl<'g> TestInputs<'g> {
-		fn new(
-			graph: &'g vfs::CompilationUnit,
-			strings: &'g mut StringInterner,
-		) -> Self {
-			let vfs::CompilationUnit {
-				files,
-				packages,
-				stdlib_package,
-				root_package,
-			} = graph;
-			let mut diagnostics = Vec::new();
-			let mut resolutions = NameResolutions::default();
-			let (defs, ast_nodes) = DefinitionRegistry::build(
-				packages,
-				files,
-				strings,
-				&mut diagnostics,
-				&mut resolutions,
-				*stdlib_package,
-				*root_package,
-			);
-			let impl_dispatch = ImplDispatch::build(
-				&mut diagnostics,
-				&mut resolutions,
-				strings,
-				&defs,
-				&ast_nodes,
-			);
-			let solver = Solver::new(defs.constants.len());
-			Self {
-				files,
-				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			}
-		}
-	}
-
-	/// A swept `TypeContext` over `TestInputs`.
+	/// A checked `Semantics`, with the inputs it was checked from.
 	struct TestCase<'a> {
-		defs: &'a DefinitionRegistry,
-		context: TypeContext<'a, 'a, 'a>,
+		files: &'a Files,
+		strings: &'a StringInterner,
+		sema: Semantics,
 	}
 
 	impl<'a> TestCase<'a> {
-		fn new(inputs: &'a mut TestInputs<'_>) -> Self {
-			let TestInputs {
-				files,
-				strings,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-				diagnostics,
-				resolutions,
-				solver,
-			} = inputs;
-			let mut context = TypeContext::new(
-				diagnostics,
-				resolutions,
-				strings,
-				solver,
-				files,
-				defs,
-				ast_nodes,
-				impl_dispatch,
-			);
-			context.sweep();
+		fn new(
+			graph: &'a vfs::CompilationUnit,
+			strings: &'a mut StringInterner,
+		) -> Self {
+			let mut sema = crate::tir::check(graph, strings);
 			// The stdlib's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
-			let root_file = defs
+			let root_file = sema
+				.decls
 				.namespaces
-				.file_id(Scope::Package(defs.root_package).into());
-			context.diagnostics.retain(|diagnostic| {
+				.file_id(Scope::Package(sema.decls.root_package).into());
+			sema.diagnostics.retain(|diagnostic| {
 				let in_stdlib = diagnostic
 					.labels
 					.first()
@@ -2799,25 +2838,25 @@ mod tests {
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
 			});
-			Self { defs, context }
+			Self {
+				files: &graph.files,
+				strings,
+				sema,
+			}
 		}
 
 		fn diagnostics(&self) -> DiagnosticView<'_> {
-			DiagnosticView::new(
-				"eval",
-				self.context.diagnostics,
-				self.context.files,
-			)
+			DiagnosticView::new("eval", &self.sema.diagnostics, self.files)
 		}
 
 		/// What a root-level `name` resolves to in `tier`, by real path
 		/// resolution.
-		fn resolve(&self, tier: Tier, name: &str) -> DefKind {
-			let root = Scope::Package(self.defs.root_package);
-			let file_id = self.defs.namespaces.file_id(root.into());
+		fn resolve(&self, tier: Tier, name: &str) -> DeclKind {
+			let root = Scope::Package(self.sema.decls.root_package);
+			let file_id = self.sema.decls.namespaces.file_id(root.into());
 			let segment = ast::PathSegment {
 				ident: Spanned {
-					inner: self.context.strings.get(name).unwrap(),
+					inner: self.strings.get(name).unwrap(),
 					span: TextSpan::new(0, 0),
 				},
 				type_args: Box::new([]),
@@ -2827,20 +2866,20 @@ mod tests {
 			PathResolver::new(
 				&mut scratch,
 				&mut resolutions,
-				self.context.strings,
-				self.defs,
+				self.strings,
+				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &[segment], tier)
-			.def_key()
+			.decl_key()
 			.unwrap_or_else(|| panic!("expected `{name}` to resolve"))
-			.symbol_kind(self.defs)
+			.symbol_kind(&self.sema.decls)
 		}
 
 		fn state(&self, name: &str) -> &ConstValueState {
-			let DefKind::Const(index) = self.resolve(Tier::Value, name) else {
+			let DeclKind::Const(index) = self.resolve(Tier::Value, name) else {
 				panic!("expected `{name}` to be a constant");
 			};
-			&self.context.solver.const_values[usize::from(index)]
+			&self.sema.solver.const_values[usize::from(index)]
 		}
 
 		fn value(&self, name: &str) -> &[ConstScalar] {
@@ -2851,7 +2890,8 @@ mod tests {
 		}
 
 		fn memory(&self, name: &str) -> MemoryIdx {
-			let DefKind::Memory(index) = self.resolve(Tier::Value, name) else {
+			let DeclKind::Memory(index) = self.resolve(Tier::Value, name)
+			else {
 				panic!("expected `{name}` to be a memory");
 			};
 			index
@@ -2862,7 +2902,7 @@ mod tests {
 			let Val::MemoryOffset { alloc, offset } = address.val else {
 				panic!("expected an address, got {address:?}");
 			};
-			(&self.context.solver.allocations[usize::from(alloc)], offset)
+			(&self.sema.solver.allocations[usize::from(alloc)], offset)
 		}
 	}
 
@@ -2931,7 +2971,7 @@ mod tests {
 			"evaluation of constant `<P as Fail>::F` failed",
 		);
 		// The first reader is the one the report points at.
-		let labels = &case.context.diagnostics[0].labels;
+		let labels = &case.sema.diagnostics[0].labels;
 		assert!(labels.iter().any(|label| {
 			label.message == "`<P as Fail>::F` is evaluated for this use"
 		}));
@@ -2961,7 +3001,7 @@ mod tests {
 			panic!("expected an address");
 		};
 		assert_eq!(
-			*case.context.solver.allocations[usize::from(alloc)].bytes,
+			*case.sema.solver.allocations[usize::from(alloc)].bytes,
 			[7; 4]
 		);
 		assert_eq!(case.value("QUALIFIED"), [ConstScalar::u32(4)]);
@@ -3243,7 +3283,7 @@ mod tests {
 					panic!("expected an address into an allocation");
 				};
 				assert_eq!(
-					&*case.context.solver.allocations[usize::from(alloc)].bytes,
+					&*case.sema.solver.allocations[usize::from(alloc)].bytes,
 					contents,
 					"{name}"
 				);

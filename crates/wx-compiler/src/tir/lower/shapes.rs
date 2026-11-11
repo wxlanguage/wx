@@ -17,7 +17,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::{FunctionState, Lowerer, mir};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
-use crate::tir::defs::FieldIdx;
+use crate::tir::decls::FieldIdx;
 use crate::tir::types::{Type, TypeIndex};
 use crate::vfs::FileId;
 
@@ -77,7 +77,7 @@ enum Field {
 	Lowered(mir::ValueType),
 }
 
-impl Lowerer<'_, '_, '_, '_> {
+impl Lowerer<'_> {
 	/// The scalars of field `field` of the concrete `ty`, among its
 	/// value's.
 	pub(super) fn field_range(
@@ -107,7 +107,7 @@ impl Lowerer<'_, '_, '_, '_> {
 			return Ok(shape.ty);
 		}
 
-		let fields = match *self.context.types.resolve(ty) {
+		let fields = match *self.sema.types.resolve(ty) {
 			// The address has no TIR type of its own (`Pointer::address`
 			// reads it as the memory's `Size`); MIR keeps it a pointer.
 			Type::Pointer { to, memory, .. } => {
@@ -181,8 +181,8 @@ impl Lowerer<'_, '_, '_, '_> {
 		file_id: FileId,
 		span: TextSpan,
 	) {
-		let name = self.context.type_formatter().display_type(ty);
-		self.context.diagnostics.push(
+		let name = self.sema.type_formatter(self.strings).display_type(ty);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::SlotLimit.code())
 				.with_message(format!(

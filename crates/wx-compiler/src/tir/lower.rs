@@ -1,9 +1,9 @@
 //! TIR → MIR lowering for the first executable checkpoint.
 //!
 //! This is deliberately not a view or a second IR: it takes the live
-//! [`TypeContext`] the checker already built, reads the checked tables
+//! [`Semantics`] the checker already built, reads the checked tables
 //! directly, and constructs [`mir::MIR`]. Type normalization and aggregate
-//! layout need `&mut TypeContext`, which is why the entry point is mutable.
+//! layout need `&mut Semantics`, which is why the entry point is mutable.
 //!
 //! The current checkpoints cover exported functions, direct calls, method
 //! calls (a trait's declaration through the impl its `Self` selects, or the
@@ -50,20 +50,20 @@ use super::body::{
 	ScopeIdx,
 };
 use super::bounds::AssumptionEnvIdx;
-use super::defs::{
+use super::decls::{
 	Attributes, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx, PackageMemberItem,
 	Scope,
 };
 use super::eval::Val;
 use super::intrinsics::Intrinsic;
 use super::members::ResolvedFunction;
-use super::signatures::TypeContext;
+use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags};
 use super::types::Primitive;
 use super::types::{
 	GenericArgs, GenericEnvIdx, Substitution, Type, TypeIndex, TypeList,
 };
-use crate::ast::{BinaryOp, Spanned, UnaryOp};
+use crate::ast::{BinaryOp, Spanned, StringInterner, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
 use crate::mir;
 use crate::vfs::FileId;
@@ -225,8 +225,9 @@ impl FunctionState {
 	}
 }
 
-struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
-	context: &'a mut TypeContext<'ast, 'ctx, 'dispatch>,
+struct Lowerer<'a> {
+	sema: &'a mut Semantics,
+	strings: &'a StringInterner,
 	functions: Vec<mir::Function>,
 	/// Index-aligned with `functions`.
 	function_flags: Vec<mir::FunctionFlags>,
@@ -266,16 +267,18 @@ struct Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 /// rustc's default `recursion_limit`.
 const RECURSION_LIMIT: u32 = 128;
 
-/// The separate build entry point. `check` is untouched; this repeats its
-/// setup and then lowers the same live context instead of dropping it.
+/// Lowers what the exports and the globals reach, from a checked `sema`
+/// (`tir::lower`).
 pub(super) fn build(
-	context: &mut TypeContext<'_, '_, '_>,
+	sema: &mut Semantics,
+	strings: &StringInterner,
 ) -> Result<mir::MIR, ()> {
-	let global_count = context.defs.globals.len();
-	let memory_count = context.defs.memories.len();
-	let intrinsics = std_intrinsics(context);
+	let global_count = sema.decls.globals.len();
+	let memory_count = sema.decls.memories.len();
+	let intrinsics = std_intrinsics(strings, sema);
 	Lowerer {
-		context,
+		sema,
+		strings,
 		functions: Vec::new(),
 		function_flags: Vec::new(),
 		imports: Vec::new(),
@@ -299,10 +302,11 @@ pub(super) fn build(
 /// Std is maintained with the compiler, so an unknown name is an invariant
 /// failure.
 fn std_intrinsics(
-	context: &TypeContext<'_, '_, '_>,
+	strings: &StringInterner,
+	sema: &Semantics,
 ) -> FxHashMap<FunctionIdx, Intrinsic> {
-	let defs = context.defs;
-	defs.package_contracts[defs.stdlib_package.as_usize()]
+	let decls = &sema.decls;
+	decls.package_contracts[decls.stdlib_package.as_usize()]
 		.members
 		.values()
 		.filter_map(|member| match member.item {
@@ -310,9 +314,8 @@ fn std_intrinsics(
 			PackageMemberItem::Constant(_) | PackageMemberItem::Type(_) => None,
 		})
 		.map(|function| {
-			let name = context
-				.strings
-				.resolve(defs.functions[usize::from(function)].name.inner)
+			let name = strings
+				.resolve(decls.functions[usize::from(function)].name.inner)
 				.unwrap();
 			let intrinsic =
 				Intrinsic::from_std_name(name).unwrap_or_else(|| {
@@ -323,10 +326,10 @@ fn std_intrinsics(
 		.collect()
 }
 
-impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
+impl<'a> Lowerer<'a> {
 	fn run(mut self) -> Result<mir::MIR, ()> {
 		let mut exports: Vec<(SymbolU32, super::signatures::ExportedItem)> =
-			self.context
+			self.sema
 				.exports
 				.iter()
 				.map(|(&name, item)| (name, *item))
@@ -394,12 +397,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			return FunctionInstance::of(function);
 		}
 		debug_assert!(
-			args.iter().all(|&arg| !self.context.types.has_param(arg)),
+			args.iter().all(|&arg| !self.sema.types.has_param(arg)),
 			"an instance's arguments are concrete"
 		);
-		let item = self.context.types.intern_function(function, args);
-		let Type::Function { type_args, .. } =
-			*self.context.types.resolve(item)
+		let item = self.sema.types.intern_function(function, args);
+		let Type::Function { type_args, .. } = *self.sema.types.resolve(item)
 		else {
 			unreachable!("a function interns as a `Type::Function`")
 		};
@@ -420,7 +422,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> Result<(FunctionInstance, Dispatch), ()> {
 		let written: Vec<TypeIndex> =
-			self.context.generic_args.types(type_args).to_vec();
+			self.sema.generic_args.types(type_args).to_vec();
 		// Normalized, so a projection the instance's arguments reduce
 		// (`M::Size`, an operator's `Self`) selects its impl.
 		let args = written
@@ -431,7 +433,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			})
 			.collect::<Result<Vec<TypeIndex>, ()>>()?;
 		let (function, args, dispatch) =
-			match self.context.resolve_function(function, &args) {
+			match self.sema.resolve_function(self.strings, function, &args) {
 				Ok(ResolvedFunction::Instance { function, args }) => {
 					(function, args, Dispatch::Direct)
 				}
@@ -494,15 +496,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		if depth > RECURSION_LIMIT {
 			let function =
-				&self.context.defs.functions[usize::from(instance.function)];
+				&self.sema.decls.functions[usize::from(instance.function)];
 			let (definition_file, definition_span) =
 				(function.file_id, function.name.span);
-			let item = self.context.types.intern_function(
+			let item = self.sema.types.intern_function(
 				instance.function,
-				self.context.types.list(instance.args).to_vec().as_slice(),
+				self.sema.types.list(instance.args).to_vec().as_slice(),
 			);
-			let name = self.context.type_formatter().display_type(item);
-			self.context.diagnostics.push(
+			let name =
+				self.sema.type_formatter(self.strings).display_type(item);
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::RecursionLimit.code())
 					.with_message(format!(
@@ -543,11 +546,10 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn lower_function(&mut self, instance: FunctionInstance) -> Result<(), ()> {
 		let function = instance.function;
 		let id = self.ids[&instance];
-		let file_id =
-			self.context.defs.functions[usize::from(function)].file_id;
+		let file_id = self.sema.decls.functions[usize::from(function)].file_id;
 		let name_span =
-			self.context.defs.functions[usize::from(function)].name.span;
-		match self.context.function_implementations[usize::from(function)] {
+			self.sema.decls.functions[usize::from(function)].name.span;
+		match self.sema.function_implementations[usize::from(function)] {
 			FunctionImplementation::Defined(_) => {}
 			FunctionImplementation::Imported(import) => {
 				return self.lower_imported_function(instance, import);
@@ -572,21 +574,19 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		}
 		let (signature, param_types, result_type) =
 			self.lower_signature(instance)?;
-		let env = self.context.functions[usize::from(function)].type_params;
-		let args: Box<[TypeIndex]> =
-			self.context.types.list(instance.args).into();
+		let env = self.sema.functions[usize::from(function)].type_params;
+		let args: Box<[TypeIndex]> = self.sema.types.list(instance.args).into();
 
 		// The evaluator reads the body, which lowering holds: the instance's
 		// static data is evaluated first, and lowering reads the values.
-		let index = self.context.function_implementations
-			[usize::from(function)]
-		.body()
-		.expect("only a defined function enters body lowering");
-		let statics = self.context.body(index).statics().to_vec();
+		let index = self.sema.function_implementations[usize::from(function)]
+			.body()
+			.expect("only a defined function enters body lowering");
+		let statics = self.sema.body(index).statics().to_vec();
 		for expr in statics {
-			let _ = self.context.static_value(function, &args, expr);
+			let _ = self.sema.static_value(self.strings, function, &args, expr);
 		}
-		let body = std::mem::take(&mut self.context.bodies[usize::from(index)]);
+		let body = std::mem::take(&mut self.sema.bodies[usize::from(index)]);
 		let lowered = self.lower_body(
 			instance,
 			file_id,
@@ -597,7 +597,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			result_type,
 		);
 		// Put the checked body back: lowering borrows it, it does not consume it.
-		self.context.bodies[usize::from(index)] = body;
+		self.sema.bodies[usize::from(index)] = body;
 		let state = lowered?;
 		let root = state.root.expect("a lowered body has a root");
 		if cfg!(debug_assertions)
@@ -624,7 +624,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		// Every instance of an `#[inline]` function is inline: the attribute
 		// is on the declaration, and an instance only fills its parameters.
 		let mut flags = mir::FunctionFlags::empty();
-		if self.context.defs.functions[usize::from(function)]
+		if self.sema.decls.functions[usize::from(function)]
 			.attributes
 			.contains(Attributes::INLINE)
 		{
@@ -647,12 +647,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	) -> Result<(), ()> {
 		let id = self.ids[&instance];
 		let file_id =
-			self.context.defs.functions[usize::from(instance.function)].file_id;
+			self.sema.decls.functions[usize::from(instance.function)].file_id;
 		let (signature, param_types, result_type) =
 			self.lower_signature(instance)?;
 		let mut state = FunctionState {
 			file_id,
-			env: self.context.functions[usize::from(instance.function)]
+			env: self.sema.functions[usize::from(instance.function)]
 				.type_params,
 			args: Box::default(),
 			instance,
@@ -704,17 +704,17 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	fn lower_imported_function(
 		&mut self,
 		instance: FunctionInstance,
-		import: super::defs::ImportIdx,
+		import: super::decls::ImportIdx,
 	) -> Result<(), ()> {
 		let id = self.ids[&instance];
 		let (signature, _, _) = self.lower_signature(instance)?;
 		let entry =
 			mir::ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
 		self.imports.push(mir::Import {
-			module: self.context.defs.imports[usize::from(import)]
+			module: self.sema.decls.imports[usize::from(import)]
 				.external_name
 				.inner,
-			name: self.context.defs.functions[usize::from(instance.function)]
+			name: self.sema.decls.functions[usize::from(instance.function)]
 				.name
 				.inner,
 			item: mir::Item::Function(id),
@@ -737,60 +737,60 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		if let Some(id) = self.global_ids[usize::from(global)] {
 			return Ok(id);
 		}
-		let def = &self.context.defs.globals[usize::from(global)];
+		let decl = &self.sema.decls.globals[usize::from(global)];
 		let (file_id, name, mutable) =
-			(def.file_id, def.name, def.mut_trait_impl_index.is_some());
-		let value_type = self.context.global_value_type(global);
+			(decl.file_id, decl.name, decl.mut_trait_impl_index.is_some());
+		let value_type = self.sema.global_value_type(global);
 		// The checker proved it one Wasm value: a scalar, which a struct of
 		// one (`Meters(u32)`) is too.
 		let ty = self.lower_type(value_type, file_id, name.span)?;
 		let id = mir::GlobalId::new(u32::try_from(self.globals.len()).unwrap());
-		let origin =
-			match self.context.defs.globals[usize::from(global)].namespace {
-				Scope::Import(import_index) => {
-					let entry = mir::ImportIdx::new(
-						u32::try_from(self.imports.len()).unwrap(),
-					);
-					self.imports.push(mir::Import {
-						module: self.context.defs.imports
-							[usize::from(import_index)]
+		let origin = match self.sema.decls.globals[usize::from(global)]
+			.namespace
+		{
+			Scope::Import(import_index) => {
+				let entry = mir::ImportIdx::new(
+					u32::try_from(self.imports.len()).unwrap(),
+				);
+				self.imports.push(mir::Import {
+					module: self.sema.decls.imports[usize::from(import_index)]
 						.external_name
 						.inner,
-						name: name.inner,
-						item: mir::Item::Global(id),
-					});
-					mir::Origin::Imported(entry)
-				}
-				_ => {
-					let value = self.context.global_values[usize::from(global)]
-						.as_deref()
-						.expect("a checked global without errors has a value");
-					let [scalar] = value else {
-						unreachable!("a global's value is one Wasm value")
-					};
-					mir::Origin::Defined(match scalar.val {
-						Val::I32(bits) => {
-							mir::ConstInit::Int(i64::from(bits as i32))
+					name: name.inner,
+					item: mir::Item::Global(id),
+				});
+				mir::Origin::Imported(entry)
+			}
+			_ => {
+				let value = self.sema.global_values[usize::from(global)]
+					.as_deref()
+					.expect("a checked global without errors has a value");
+				let [scalar] = value else {
+					unreachable!("a global's value is one Wasm value")
+				};
+				mir::Origin::Defined(match scalar.val {
+					Val::I32(bits) => {
+						mir::ConstInit::Int(i64::from(bits as i32))
+					}
+					Val::I64(bits) => mir::ConstInit::Int(bits as i64),
+					Val::F32(bits) => {
+						mir::ConstInit::Float(f64::from(f32::from_bits(bits)))
+					}
+					Val::F64(bits) => {
+						mir::ConstInit::Float(f64::from_bits(bits))
+					}
+					Val::MemoryOffset { alloc, offset } => {
+						mir::ConstInit::Static {
+							entry: self.static_entry(alloc),
+							offset: u32::try_from(offset).unwrap(),
 						}
-						Val::I64(bits) => mir::ConstInit::Int(bits as i64),
-						Val::F32(bits) => mir::ConstInit::Float(f64::from(
-							f32::from_bits(bits),
-						)),
-						Val::F64(bits) => {
-							mir::ConstInit::Float(f64::from_bits(bits))
-						}
-						Val::MemoryOffset { alloc, offset } => {
-							mir::ConstInit::Static {
-								entry: self.static_entry(alloc),
-								offset: u32::try_from(offset).unwrap(),
-							}
-						}
-						Val::DataEnd { memory } => mir::ConstInit::DataEnd {
-							memory: self.memory(memory),
-						},
-					})
-				}
-			};
+					}
+					Val::DataEnd { memory } => mir::ConstInit::DataEnd {
+						memory: self.memory(memory),
+					},
+				})
+			}
+		};
 		self.globals.push(mir::Global {
 			id,
 			ty,
@@ -812,13 +812,14 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		if let Some(id) = self.memory_ids[usize::from(memory)] {
 			return id;
 		}
-		let memory_type = self.context.types.intern(Type::Memory {
+		let memory_type = self.sema.types.intern(Type::Memory {
 			memory_index: memory,
 		});
-		let kind = match self
-			.context
-			.address_primitive(AssumptionEnvIdx::ROOT, memory_type)
-		{
+		let kind = match self.sema.address_primitive(
+			self.strings,
+			AssumptionEnvIdx::ROOT,
+			memory_type,
+		) {
 			Ok(Some(Primitive::U32)) => mir::MemoryKind::Memory32,
 			Ok(Some(Primitive::U64)) => mir::MemoryKind::Memory64,
 			_ => unreachable!("a checked memory's `Size` is `u32` or `u64`"),
@@ -826,29 +827,29 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let id =
 			mir::MemoryId::new(u32::try_from(self.memories.len()).unwrap());
 		// Checked against the memory's `Size`: a count of pages it holds.
-		let limits = self.context.defs.memories[usize::from(memory)].limits;
+		let limits = self.sema.decls.memories[usize::from(memory)].limits;
 		let pages =
 			|bound: Option<Spanned<u64>>| bound.map(|pages| pages.inner);
-		let origin =
-			match self.context.defs.memories[usize::from(memory)].namespace {
-				Scope::Import(import_index) => {
-					let entry = mir::ImportIdx::new(
-						u32::try_from(self.imports.len()).unwrap(),
-					);
-					self.imports.push(mir::Import {
-						module: self.context.defs.imports
-							[usize::from(import_index)]
+		let origin = match self.sema.decls.memories[usize::from(memory)]
+			.namespace
+		{
+			Scope::Import(import_index) => {
+				let entry = mir::ImportIdx::new(
+					u32::try_from(self.imports.len()).unwrap(),
+				);
+				self.imports.push(mir::Import {
+					module: self.sema.decls.imports[usize::from(import_index)]
 						.external_name
 						.inner,
-						name: self.context.defs.memories[usize::from(memory)]
-							.name
-							.inner,
-						item: mir::Item::Memory(id),
-					});
-					mir::Origin::Imported(entry)
-				}
-				_ => mir::Origin::Defined(()),
-			};
+					name: self.sema.decls.memories[usize::from(memory)]
+						.name
+						.inner,
+					item: mir::Item::Memory(id),
+				});
+				mir::Origin::Imported(entry)
+			}
+			_ => mir::Origin::Defined(()),
+		};
 		self.memories.push(mir::MemoryInfo {
 			id,
 			kind,
@@ -865,7 +866,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		&mut self,
 		memory: TypeIndex,
 	) -> mir::MemoryId {
-		let Ok(memory) = self.context.normalize(
+		let Ok(memory) = self.sema.normalize(
+			self.strings,
 			AssumptionEnvIdx::ROOT,
 			memory,
 			NormalizationDepth::Shallow,
@@ -873,7 +875,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		) else {
 			unreachable!("a concrete memory type normalizes")
 		};
-		let Type::Memory { memory_index } = *self.context.types.resolve(memory)
+		let Type::Memory { memory_index } = *self.sema.types.resolve(memory)
 		else {
 			unreachable!("a checked place or pointer is in a declared memory")
 		};
@@ -888,32 +890,29 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 	{
 		let function = instance.function;
 		let (type_params, param_list, return_type) = {
-			let signature = &self.context.functions[usize::from(function)];
+			let signature = &self.sema.functions[usize::from(function)];
 			(
 				signature.type_params,
 				signature.param_types,
 				signature.return_type,
 			)
 		};
-		let file_id =
-			self.context.defs.functions[usize::from(function)].file_id;
+		let file_id = self.sema.decls.functions[usize::from(function)].file_id;
 		let name_span =
-			self.context.defs.functions[usize::from(function)].name.span;
+			self.sema.decls.functions[usize::from(function)].name.span;
 		// The flat arguments cover the whole parameter chain: an enclosing
 		// impl's, then the function's own. Every instance comes from a
 		// checked call, and the checker refuses to export a generic function
 		// (E2019), so a missing argument is a broken invariant.
 		assert_eq!(
-			self.context.generic_envs.identity_args(type_params).len(),
+			self.sema.generic_envs.identity_args(type_params).len(),
 			instance.args.len(),
 			"an instance has an argument for every parameter in its chain"
 		);
 
 		// Copy the lists out so lowering a type may borrow the context mutably.
-		let args: Box<[TypeIndex]> =
-			self.context.types.list(instance.args).into();
-		let params: Vec<TypeIndex> =
-			self.context.types.list(param_list).to_vec();
+		let args: Box<[TypeIndex]> = self.sema.types.list(instance.args).into();
+		let params: Vec<TypeIndex> = self.sema.types.list(param_list).to_vec();
 		let mut param_types = Vec::with_capacity(params.len());
 		for ty in params {
 			let ty = self.substitute(ty, type_params, &args);
@@ -942,16 +941,16 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		env: GenericEnvIdx,
 		args: &[TypeIndex],
 	) -> TypeIndex {
-		let ty = self.context.types.substitute(
+		let ty = self.sema.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.context.generic_envs,
+				envs: &self.sema.generic_envs,
 				env,
 				args,
 			},
 		);
 		debug_assert!(
-			!self.context.types.has_param(ty),
+			!self.sema.types.has_param(ty),
 			"an instance's types are concrete"
 		);
 		ty
@@ -999,9 +998,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> Result<Option<Primitive>, ()> {
 		let ty = self.normalize_type(ty, file_id, span)?;
-		match *self.context.types.resolve(ty) {
+		match *self.sema.types.resolve(ty) {
 			Type::Enum { enum_index } => {
-				let repr = self.context.enums[usize::from(enum_index)].repr;
+				let repr = self.sema.enums[usize::from(enum_index)].repr;
 				self.scalar_primitive(repr, file_id, span)
 			}
 			_ => Ok(Primitive::of(ty)),
@@ -1031,7 +1030,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		if body.params().len() != param_types.len() {
 			self.unsupported(
 				file_id,
-				self.context.defs.functions[usize::from(instance.function)]
+				self.sema.decls.functions[usize::from(instance.function)]
 					.name
 					.span,
 				"a parameter list that does not match its checked signature",
@@ -1351,8 +1350,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			}
 			// A constant holding data in no memory, placed here.
 			ExprKind::Const { constant, .. }
-				if self.context.types.is_unplaced(
-					self.context.constants[usize::from(constant)].ty,
+				if self.sema.types.is_unplaced(
+					self.sema.constants[usize::from(constant)].ty,
 				) =>
 			{
 				self.lower_static(body, state, expr, ty)
@@ -1546,7 +1545,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		let callee_id = self.enqueue_from(state, callee, span)?;
 		// The checked signature's count; nothing about the callee is
 		// lowered for it.
-		let param_count = self.context.functions[usize::from(callee.function)]
+		let param_count = self.sema.functions[usize::from(callee.function)]
 			.param_types
 			.len();
 		// A lone remaining parameter is its value, so it must not be
@@ -1695,10 +1694,8 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			let source_ty = self.expr_ty(body, state, args);
 			let source_ty =
 				self.normalize_type(source_ty, state.file_id, body.span(args))?;
-			if !matches!(
-				self.context.types.resolve(source_ty),
-				Type::Tuple { .. }
-			) {
+			if !matches!(self.sema.types.resolve(source_ty), Type::Tuple { .. })
+			{
 				return Ok(vec![value]);
 			}
 			// A computed argument tuple is evaluated once. Its source fields
@@ -2022,7 +2019,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			self.callee(state, method, type_args, span)?;
 		// The checked signature's count; nothing about the callee is
 		// lowered for it.
-		let param_count = self.context.functions[usize::from(callee.function)]
+		let param_count = self.sema.functions[usize::from(callee.function)]
 			.param_types
 			.len();
 		if param_count != 2 {
@@ -2113,7 +2110,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		if ty == TypeIndex::NEVER {
 			return Ok(mir::ValueType::Never);
 		}
-		let lowered = match *self.context.types.resolve(ty) {
+		let lowered = match *self.sema.types.resolve(ty) {
 			// Signedness and width are each operation's.
 			Type::U8
 			| Type::I8
@@ -2127,7 +2124,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			Type::Never => mir::ValueType::Never,
 			// `Bool` among them: `enum Bool(u8)`.
 			Type::Enum { enum_index } => {
-				let repr = self.context.enums[usize::from(enum_index)].repr;
+				let repr = self.sema.enums[usize::from(enum_index)].repr;
 				self.lower_type(repr, file_id, span)?
 			}
 			Type::Tuple { .. } | Type::Struct { .. } => {
@@ -2185,10 +2182,11 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> Result<TypeIndex, ()> {
 		debug_assert!(
-			!self.context.types.has_param(ty),
+			!self.sema.types.has_param(ty),
 			"lowering normalizes concrete types only"
 		);
-		match self.context.normalize(
+		match self.sema.normalize(
+			self.strings,
 			AssumptionEnvIdx::ROOT,
 			ty,
 			NormalizationDepth::Deep,
@@ -2215,9 +2213,9 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 	) -> Result<Vec<TypeIndex>, ()> {
 		let ty = self.normalize_type(ty, file_id, span)?;
-		match *self.context.types.resolve(ty) {
+		match *self.sema.types.resolve(ty) {
 			Type::Tuple { elements } => {
-				Ok(self.context.types.list(elements).to_vec())
+				Ok(self.sema.types.list(elements).to_vec())
 			}
 			Type::Struct {
 				struct_index,
@@ -2225,18 +2223,18 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 			} => {
 				let (signature_env, field_list) = {
 					let signature =
-						&self.context.structs[usize::from(struct_index)];
+						&self.sema.structs[usize::from(struct_index)];
 					(signature.type_params, signature.field_types)
 				};
 				let args: Box<[TypeIndex]> =
-					self.context.types.list(type_args).into();
+					self.sema.types.list(type_args).into();
 				let mut fields = Vec::with_capacity(field_list.len());
 				for at in 0..field_list.len() {
-					let field = self.context.types.list(field_list)[at];
-					fields.push(self.context.types.substitute(
+					let field = self.sema.types.list(field_list)[at];
+					fields.push(self.sema.types.substitute(
 						field,
 						Substitution {
-							envs: &self.context.generic_envs,
+							envs: &self.sema.generic_envs,
 							env: signature_env,
 							args: &args,
 						},
@@ -2262,10 +2260,12 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		to: TypeIndex,
 		memory: TypeIndex,
 	) -> Result<TypeIndex, ()> {
-		match self
-			.context
-			.pointer_metadata(AssumptionEnvIdx::ROOT, to, memory)
-		{
+		match self.sema.pointer_metadata(
+			self.strings,
+			AssumptionEnvIdx::ROOT,
+			to,
+			memory,
+		) {
 			Ok(Some(metadata)) => Ok(metadata),
 			Ok(None) => {
 				unreachable!("a concrete pointee has known metadata")
@@ -2281,7 +2281,7 @@ impl<'a, 'ast, 'ctx, 'dispatch> Lowerer<'a, 'ast, 'ctx, 'dispatch> {
 		span: TextSpan,
 		what: &str,
 	) -> Result<(), ()> {
-		self.context.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::bug()
 				.with_code(DiagnosticCode::UnsupportedExpression.code())
 				.with_message(format!("lowering {what} is not supported yet"))
@@ -2448,7 +2448,9 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings).ok();
+		let diagnostics = sema.diagnostics();
 		let Some(mut mir) = mir else {
 			panic!(
 				"the checkpoint must lower: {:?}",
@@ -2487,7 +2489,8 @@ mod tests {
 			source,
 			&mut strings,
 		);
-		let _ = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let _ = crate::tir::lower(&mut sema, &strings);
 	}
 
 	#[test]
@@ -2500,9 +2503,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("trap must expand");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("trap must expand");
 		assert_eq!(mir.functions.len(), 1);
 		let function = mir.code(mir::FunctionId::new(0));
 		assert_eq!(function.callees().count(), 0);
@@ -2570,9 +2575,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("an exported intrinsic must lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("an exported intrinsic must lower");
 		// Each is a function of its own whose body is the operation: no
 		// call, no import.
 		assert_eq!(mir.functions.len(), 7);
@@ -2629,9 +2636,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("an exported intrinsic must lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("an exported intrinsic must lower");
 		assert_eq!(mir.functions.len(), 2);
 		for index in 0..mir.functions.len() {
 			let code = mir.code(mir::FunctionId::new(index as u32));
@@ -2667,9 +2676,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("scalar intrinsics must expand");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("scalar intrinsics must expand");
 		assert_eq!(
 			mir.functions.len(),
 			6,
@@ -3377,7 +3388,9 @@ mod tests {
 				source,
 				&mut strings,
 			);
-			let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+			let mut sema = crate::tir::check(&graph, &mut strings);
+			let mir = crate::tir::lower(&mut sema, &strings).ok();
+			let diagnostics = sema.diagnostics();
 			assert!(
 				mir.is_none(),
 				"unsupported implementation must not emit MIR"
@@ -3413,9 +3426,11 @@ mod tests {
 			OVERLOADED_IMPORTS,
 			&mut strings,
 		);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("imports lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("imports lower");
 		assert_eq!(mir.imports.len(), 3, "never merged by name in MIR");
 		mir.verify_imports().unwrap();
 		for import in &mir.imports {
@@ -3445,9 +3460,11 @@ mod tests {
 			OVERLOADED_IMPORTS,
 			&mut strings,
 		);
-		let mut mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("imports lower");
+		let mut mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("imports lower");
 		let bytes = crate::backend::emit(&mut mir, &strings, None)
 			.expect("lowered MIR must encode")
 			.encode();
@@ -3599,9 +3616,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("globals lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("globals lower");
 		let [global] = mir.globals.as_slice() else {
 			panic!("one global")
 		};
@@ -3634,9 +3653,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("globals lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("globals lower");
 		assert_eq!(mir.globals[0].ty, mir::ValueType::I32);
 		let (mut store, instance) = instantiate(source);
 		let double = instance
@@ -3658,9 +3679,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("globals lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("globals lower");
 		assert_eq!(
 			mir.globals.len(),
 			2,
@@ -3684,9 +3707,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mut mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("globals lower");
+		let mut mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("globals lower");
 		let [import] = mir.imports.as_slice() else {
 			panic!("one import entry")
 		};
@@ -3756,7 +3781,9 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings).ok();
+		let diagnostics = sema.diagnostics();
 		assert!(mir.is_none());
 		crate::testing::DiagnosticView::new(
 			"build",
@@ -3775,9 +3802,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("a scalar add must lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("a scalar add must lower");
 		assert_eq!(mir.functions.len(), 1);
 		let signature = mir.functions[0].signature;
 		let i32_ty = mir::ValueType::I32;
@@ -3841,7 +3870,9 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings).ok();
+		let diagnostics = sema.diagnostics();
 		assert!(
 			mir.is_none(),
 			"an aggregate constant pattern has no equality"
@@ -3923,9 +3954,11 @@ mod tests {
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
 		// Every signature's items are scalars: `Signatures::intern`
 		// asserts it.
-		crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("nested updates must lower");
+		crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("nested updates must lower");
 		let (mut store, instance) = instantiate(source);
 		let run = instance
 			.get_typed_func::<(), (i32, i64, i32)>(&mut store, "run")
@@ -4163,9 +4196,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("the source lowers");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("the source lowers");
 		// `small`, `big`, `twice` for `u32` and `u64`, and std's `#[inline]`
 		// `add` for each.
 		assert_eq!(mir.functions.len(), 6);
@@ -4215,9 +4250,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("`id` must lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("`id` must lower");
 		assert_eq!(mir.functions.len(), 3, "`run`, `id<i32>` and `id<i64>`");
 		drop(graph);
 		let (mut store, instance) = instantiate(source);
@@ -4245,9 +4282,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("`pair` must lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("`pair` must lower");
 		assert_eq!(mir.functions.len(), 5, "`run`, two `pair`s, two `id`s");
 		drop(graph);
 		let (mut store, instance) = instantiate(source);
@@ -4290,9 +4329,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("`count` must lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("`count` must lower");
 		assert_eq!(mir.functions.len(), 2);
 		drop(graph);
 		let (mut store, instance) = instantiate(source);
@@ -4494,11 +4535,14 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings).ok();
+		let diagnostics = sema.diagnostics();
 		assert!(mir.is_none(), "a failed instantiation emits no MIR");
 		diagnostics
-			.into_iter()
+			.iter()
 			.filter(|d| d.code.as_deref() == Some(code.code()))
+			.cloned()
 			.collect()
 	}
 
@@ -4581,7 +4625,9 @@ mod tests {
 				source,
 				&mut strings,
 			);
-			let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+			let mut sema = crate::tir::check(&graph, &mut strings);
+			let mir = crate::tir::lower(&mut sema, &strings).ok();
+			let diagnostics = sema.diagnostics();
 			assert!(mir.is_none(), "an unbounded instantiation emits no MIR");
 			let reports: Vec<_> = diagnostics
 				.iter()
@@ -6795,7 +6841,9 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings).ok();
+		let diagnostics = sema.diagnostics();
 		assert!(mir.is_none(), "a float constant pattern has no equality");
 		assert!(
 			diagnostics.iter().any(|d| {
@@ -7388,9 +7436,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("`continue` must lower");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("`continue` must lower");
 		let function = mir.code(mir::FunctionId::new(0));
 		let body = &function.body;
 		let only = |list: mir::ExprList| -> mir::ExprId { body.list(list)[0] };
@@ -7874,9 +7924,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mut mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("re-exported function lowers");
+		let mut mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("re-exported function lowers");
 		mir.verify_imports().unwrap();
 		let bytes = crate::backend::emit(&mut mir, &strings, None)
 			.unwrap()
@@ -7917,9 +7969,11 @@ mod tests {
 				source,
 				&mut strings,
 			);
-			let mut mir = crate::tir::build(&graph, &mut strings)
-				.1
-				.expect("import must lower");
+			let mut mir = crate::tir::lower(
+				&mut crate::tir::check(&graph, &mut strings),
+				&strings,
+			)
+			.expect("import must lower");
 			if let Some(policy) = policy {
 				mir::inline::run(&mut mir, policy);
 			}
@@ -8234,9 +8288,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mut mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("memories lower");
+		let mut mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("memories lower");
 		let [import] = mir.imports.as_slice() else {
 			panic!("one import entry")
 		};
@@ -8368,9 +8424,11 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let mir = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("static data lowers");
+		let mir = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("static data lowers");
 		assert_eq!(mir.static_entries.len(), 1);
 		each_policy(source, |store, instance, _| {
 			let both = instance
@@ -8478,7 +8536,9 @@ mod tests {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph(source, &mut strings);
-		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings).ok();
+		let diagnostics = sema.diagnostics();
 		assert!(mir.is_none());
 		crate::testing::DiagnosticView::new(
 			"lower",

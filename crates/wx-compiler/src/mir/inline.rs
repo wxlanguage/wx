@@ -420,7 +420,9 @@ mod tests {
 	fn inlined(source: &str, policy: Policy) -> (StringInterner, MIR) {
 		let mut strings = Keyword::create_interner();
 		let graph = source_graph(source, &mut strings);
-		let (diagnostics, mir) = crate::tir::build(&graph, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings).ok();
+		let diagnostics = sema.diagnostics();
 		let Some(mut mir) = mir else {
 			panic!(
 				"the source must lower: {:?}",
@@ -725,9 +727,11 @@ mod tests {
 		"#;
 		let mut strings = Keyword::create_interner();
 		let graph = source_graph(source, &mut strings);
-		let lowered = crate::tir::build(&graph, &mut strings)
-			.1
-			.expect("the source lowers");
+		let lowered = crate::tir::lower(
+			&mut crate::tir::check(&graph, &mut strings),
+			&strings,
+		)
+		.expect("the source lowers");
 		let (strings, mir) = inlined(source, Policy::ATTRIBUTE_ONLY);
 		assert_eq!(call_count(&mir), 0);
 		let len = |mir: &MIR, name| {

@@ -214,11 +214,14 @@ fn compilation_units_share_a_caller_owned_interner() {
 
 	for unit in [&first, &second] {
 		assert!(!unit.collect_diagnostics().has_errors());
-		let diagnostics = crate::tir::check(unit, &mut strings);
+		let sema = crate::tir::check(unit, &mut strings);
+		let diagnostics = sema.diagnostics();
 		assert!(!diagnostics.has_errors(), "{diagnostics:?}");
 	}
 	drop(second);
-	let (diagnostics, mir) = crate::tir::build(&first, &mut strings);
+	let mut sema = crate::tir::check(&first, &mut strings);
+	let mir = crate::tir::lower(&mut sema, &strings).ok();
+	let diagnostics = sema.diagnostics();
 	assert!(!diagnostics.has_errors(), "{diagnostics:?}");
 	let mut mir =
 		mir.expect("the first unit still lowers after interner growth");

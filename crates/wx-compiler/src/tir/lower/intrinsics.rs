@@ -5,7 +5,7 @@ use crate::tir::bounds::AssumptionEnvIdx;
 use crate::tir::intrinsics::Intrinsic;
 use crate::tir::types::Type;
 
-impl Lowerer<'_, '_, '_, '_> {
+impl Lowerer<'_> {
 	pub(super) fn lower_intrinsic(
 		&mut self,
 		body: &Body,
@@ -19,13 +19,14 @@ impl Lowerer<'_, '_, '_, '_> {
 		// `size_of<T, Mem>()`/`align_of<T, Mem>()` are `T`'s layout, a
 		// constant of `Mem::Size`; they take no arguments.
 		if let Intrinsic::SizeOf | Intrinsic::AlignOf = intrinsic {
-			let [value_type, _] = *self.context.types.list(callee.args) else {
+			let [value_type, _] = *self.sema.types.list(callee.args) else {
 				unreachable!("`size_of` and `align_of` take `T` and `Mem`")
 			};
-			let Ok(Some(layout)) = self
-				.context
-				.memory_layout(AssumptionEnvIdx::ROOT, value_type)
-			else {
+			let Ok(Some(layout)) = self.sema.memory_layout(
+				self.strings,
+				AssumptionEnvIdx::ROOT,
+				value_type,
+			) else {
 				self.unsupported(
 					state.file_id,
 					body.span(expr),
@@ -52,7 +53,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		// A lone argument is its parameter's value, so it must not be
 		// unpacked even when that value is itself a tuple (`transmute((a, b))`).
 		let params =
-			self.context.functions[usize::from(callee.function)].param_types;
+			self.sema.functions[usize::from(callee.function)].param_types;
 		let arguments = if params.len() == 1 {
 			vec![self.lower_expr(body, state, args)?]
 		} else {
@@ -329,7 +330,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		callee: FunctionInstance,
 		position: usize,
 	) -> mir::MemoryId {
-		let memory = self.context.types.list(callee.args)[position];
+		let memory = self.sema.types.list(callee.args)[position];
 		self.memory_of_type(memory)
 	}
 
@@ -339,10 +340,10 @@ impl Lowerer<'_, '_, '_, '_> {
 		&mut self,
 		callee: FunctionInstance,
 	) -> Result<mir::GlobalId, ()> {
-		let [handle] = *self.context.types.list(callee.args) else {
+		let [handle] = *self.sema.types.list(callee.args) else {
 			unreachable!("`global_get` and `global_set` take one type argument")
 		};
-		let Type::Global { global_index } = *self.context.types.resolve(handle)
+		let Type::Global { global_index } = *self.sema.types.resolve(handle)
 		else {
 			unreachable!("an instance's `G: Global` is a global's handle type")
 		};

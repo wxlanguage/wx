@@ -15,11 +15,11 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
-use super::{BodyContext, SelectedMethod};
+use super::{BodyBuilder, SelectedMethod};
 use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
-use crate::tir::defs::{Tier, TraitIdx, Visibility};
+use crate::tir::decls::{Tier, TraitIdx, Visibility};
 use crate::tir::operators::is_primitive_binary;
 use crate::tir::resolutions::Selection;
 use crate::tir::solver::SolverError;
@@ -40,7 +40,7 @@ enum CompoundMethod {
 	Method(SelectedMethod),
 }
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyBuilder<'_, '_> {
 	/// `p.*` or `value.field` where its value is used.
 	pub(super) fn build_read(
 		&mut self,
@@ -88,7 +88,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> Operand {
 		let pointer = self.build(pointer, TypeIndex::INFER);
 		let pointer_ty = self.body.ty(pointer);
-		match *self.cx.types.resolve(pointer_ty) {
+		match *self.sema.types.resolve(pointer_ty) {
 			Type::Pointer {
 				to,
 				memory,
@@ -106,17 +106,19 @@ impl BodyContext<'_, '_, '_, '_> {
 				span,
 			)),
 			_ => {
-				let found = self.cx.type_formatter().display_type(pointer_ty);
-				self.cx.diagnostics.push(
+				let found = self
+					.sema
+					.type_formatter(self.builder.strings)
+					.display_type(pointer_ty);
+				let at = self.context().source_span(pointer);
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::CannotDerefNonPointer.code())
 						.with_message(format!(
 							"type `{found}` cannot be dereferenced"
 						))
 						.with_label(
-							self.source_span(pointer)
-								.primary_label()
-								.with_message("not a pointer"),
+							at.primary_label().with_message("not a pointer"),
 						),
 				);
 				Operand::Value(self.body.push(
@@ -141,7 +143,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let (Some(first), Some(last)) =
 			(segment.type_args.first(), segment.type_args.last())
 		{
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
 					.with_message("type arguments are not allowed here")
@@ -163,7 +165,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			to,
 			memory,
 			ownership,
-		} = *self.cx.types.resolve(object_ty)
+		} = *self.sema.types.resolve(object_ty)
 		{
 			let pointer = match object {
 				Operand::Place(place) => self.load(place),
@@ -222,8 +224,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		let object = match self.build_operand(object) {
 			Operand::Place(place) => {
 				let ty = self.body.place(place).ty;
-				let ty = self.normalized(ty, self.scope.assumption_env);
-				match *self.cx.types.resolve(ty) {
+				let ty = self.context().normalized(ty);
+				match *self.sema.types.resolve(ty) {
 					Type::Pointer { .. } => Some(self.load(place)),
 					_ => match self.sequence_element(ty, object_span) {
 						Ok(Some(element)) => {
@@ -296,17 +298,17 @@ impl BodyContext<'_, '_, '_, '_> {
 		if ty == TypeIndex::ERROR {
 			return None;
 		}
-		if self.cx.types.needs_context(ty) {
+		if self.sema.types.needs_context(ty) {
 			self.report_annotation_required(pointer);
 			return None;
 		}
-		let ty = self.normalized(ty, self.scope.assumption_env);
+		let ty = self.context().normalized(ty);
 		let span = self.body.span(pointer);
 		let Type::Pointer {
 			to,
 			memory,
 			ownership,
-		} = *self.cx.types.resolve(ty)
+		} = *self.sema.types.resolve(ty)
 		else {
 			self.report_cannot_index(ty, span, None);
 			return None;
@@ -329,23 +331,23 @@ impl BodyContext<'_, '_, '_, '_> {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<Option<TypeIndex>, ()> {
-		match *self.cx.types.resolve(ty) {
+		match *self.sema.types.resolve(ty) {
 			Type::Slice { of } | Type::Array { of, .. } => Ok(Some(of)),
 			Type::Error => Err(()),
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-				let intrinsics = &self.cx.defs.intrinsics;
+				let intrinsics = &self.sema.decls.intrinsics;
 				let slice = intrinsics.slice.expect("std declares `Slice`");
 				let value =
 					intrinsics.slice_value.expect("`Slice` declares `Value`");
 				if !self.implements(ty, slice, span).ok_or(())? {
 					return Ok(None);
 				}
-				let element = self.cx.types.intern(Type::TypeProjection {
+				let element = self.sema.types.intern(Type::TypeProjection {
 					trait_index: slice,
 					assoc_type_index: value,
 					base: ty,
 				});
-				Ok(Some(self.normalized(element, self.scope.assumption_env)))
+				Ok(Some(self.context().normalized(element)))
 			}
 			_ => Ok(None),
 		}
@@ -359,7 +361,10 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 		pointee: Option<TypeIndex>,
 	) {
-		let found_ty = self.cx.type_formatter().display_type(ty);
+		let found_ty = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(ty);
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CannotIndex.code())
 			.with_message(format!("type `{found_ty}` cannot be indexed"))
@@ -370,9 +375,9 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 		// A pointer to a pointer to a slice: one step too far.
 		if let Some(to) = pointee
-			&& let Type::Pointer { to, .. } = *self.cx.types.resolve(to)
+			&& let Type::Pointer { to, .. } = *self.sema.types.resolve(to)
 			&& matches!(
-				self.cx.types.resolve(to),
+				self.sema.types.resolve(to),
 				Type::Slice { .. } | Type::Array { .. }
 			) {
 			diagnostic = diagnostic.with_note(
@@ -380,7 +385,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				 dereference the outer one first, as `x.*[i]`",
 			);
 		}
-		self.cx.diagnostics.push(diagnostic);
+		self.sema.diagnostics.push(diagnostic);
 	}
 
 	/// Whether `ty` has `trait_index` here. `None` when the solver cannot
@@ -391,7 +396,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		trait_index: TraitIdx,
 		span: TextSpan,
 	) -> Option<bool> {
-		match self.cx.find_trait_impl_query(
+		match self.sema.find_trait_impl_query(
+			self.builder.strings,
 			self.scope.assumption_env,
 			ty,
 			trait_index,
@@ -401,13 +407,17 @@ impl BodyContext<'_, '_, '_, '_> {
 				let site = SourceSpan::new(self.scope.file_id, span);
 				match error {
 					SolverError::Overflow => {
-						self.cx
+						self.sema
 							.diagnostics
-							.push(self.cx.overflow_diagnostic(site));
+							.push(self.sema.overflow_diagnostic(site));
 					}
 					SolverError::Cycle(cycle) => {
-						let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
-						self.cx.diagnostics.push(diagnostic);
+						let diagnostic = self.sema.cycle_diagnostic(
+							self.builder.strings,
+							&cycle,
+							site,
+						);
+						self.sema.diagnostics.push(diagnostic);
 					}
 					// Its owner reported it.
 					SolverError::Poisoned => {}
@@ -431,17 +441,25 @@ impl BodyContext<'_, '_, '_, '_> {
 			return ty;
 		}
 		let site = SourceSpan::new(self.scope.file_id, span);
-		match self
-			.cx
-			.check_value_type(self.scope.assumption_env, ty, site)
-		{
+		match self.sema.check_value_type(
+			self.builder.strings,
+			self.scope.assumption_env,
+			ty,
+			site,
+		) {
 			Ok(()) => return ty,
 			Err(SolverError::Overflow) => {
-				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
+				self.sema
+					.diagnostics
+					.push(self.sema.overflow_diagnostic(site));
 			}
 			Err(SolverError::Cycle(cycle)) => {
-				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
-				self.cx.diagnostics.push(diagnostic);
+				let diagnostic = self.sema.cycle_diagnostic(
+					self.builder.strings,
+					&cycle,
+					site,
+				);
+				self.sema.diagnostics.push(diagnostic);
 			}
 			// Its owner reported it.
 			Err(SolverError::Poisoned) => {}
@@ -459,36 +477,42 @@ impl BodyContext<'_, '_, '_, '_> {
 		&mut self,
 		object_ty: TypeIndex,
 		member: Spanned<SymbolU32>,
-	) -> Option<(crate::tir::defs::FieldIdx, TypeIndex)> {
+	) -> Option<(crate::tir::decls::FieldIdx, TypeIndex)> {
 		if object_ty == TypeIndex::ERROR {
 			return None;
 		}
-		let name = self.cx.strings.resolve(member.inner).unwrap();
+		let name = self.builder.strings.resolve(member.inner).unwrap();
 		let Type::Struct {
 			struct_index,
 			type_args,
-		} = *self.cx.types.resolve(object_ty)
+		} = *self.sema.types.resolve(object_ty)
 		else {
-			let found = self.cx.type_formatter().display_type(object_ty);
+			let found = self
+				.sema
+				.type_formatter(self.builder.strings)
+				.display_type(object_ty);
 			let mut diagnostic = Diagnostic::error()
 				.with_code(DiagnosticCode::UnknownStructField.code())
 				.with_message(format!("no field `{name}` on type `{found}`"))
 				.with_label(Label::primary(self.scope.file_id, member.span));
 			// The object was a pointer to it, gone through once already.
-			if matches!(self.cx.types.resolve(object_ty), Type::Pointer { .. })
-			{
+			if matches!(
+				self.sema.types.resolve(object_ty),
+				Type::Pointer { .. }
+			) {
 				diagnostic = diagnostic.with_note(
 					"a field is reached through one pointer, not two: \
 					 dereference the outer one first, as `p.*.field`",
 				);
 			}
-			self.cx.diagnostics.push(diagnostic);
+			self.sema.diagnostics.push(diagnostic);
 			return None;
 		};
-		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		let struct_name = self.cx.strings.resolve(def.name.inner).unwrap();
-		let Some(&field) = def.lookup.get(&member.inner) else {
-			self.cx.diagnostics.push(
+		let decl = &self.sema.decls.structs[usize::from(struct_index)];
+		let struct_name =
+			self.builder.strings.resolve(decl.name.inner).unwrap();
+		let Some(&field) = decl.lookup.get(&member.inner) else {
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::UnknownStructField.code())
 					.with_message(format!(
@@ -501,7 +525,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 			return None;
 		};
-		self.cx.resolutions.record_selection(
+		self.sema.resolutions.record_selection(
 			(
 				SourceSpan::new(self.scope.file_id, member.span),
 				Tier::Value,
@@ -512,13 +536,13 @@ impl BodyContext<'_, '_, '_, '_> {
 			},
 		);
 		let visibility =
-			Visibility::from(def.field_pub_spans[usize::from(field)]);
-		if !self.cx.defs.namespaces.is_accessible_from(
+			Visibility::from(decl.field_pub_spans[usize::from(field)]);
+		if !self.sema.decls.namespaces.is_accessible_from(
 			self.scope.namespace,
-			def.namespace.into(),
+			decl.namespace.into(),
 			visibility,
 		) {
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::PrivateStructField.code())
 					.with_message(format!(
@@ -531,20 +555,20 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 		}
 		let declared = self
-			.cx
+			.sema
 			.types
-			.list(self.cx.structs[usize::from(struct_index)].field_types)
+			.list(self.sema.structs[usize::from(struct_index)].field_types)
 			[usize::from(field)];
-		let args = self.cx.types.list(type_args).to_vec();
-		let ty = self.cx.types.substitute(
+		let args = self.sema.types.list(type_args).to_vec();
+		let ty = self.sema.types.substitute(
 			declared,
 			Substitution {
-				envs: &self.cx.generic_envs,
-				env: self.cx.structs[usize::from(struct_index)].type_params,
+				envs: &self.sema.generic_envs,
+				env: self.sema.structs[usize::from(struct_index)].type_params,
 				args: &args,
 			},
 		);
-		Some((field, self.normalized(ty, self.scope.assumption_env)))
+		Some((field, self.context().normalized(ty)))
 	}
 
 	/// `place.&`: a shared pointer to a place, in its memory. Only a place
@@ -557,7 +581,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		match self.build_operand(value) {
 			Operand::Place(place) => {
 				let Place { ty: to, memory, .. } = *self.body.place(place);
-				let ty = self.cx.types.intern(Type::Pointer {
+				let ty = self.sema.types.intern(Type::Pointer {
 					to,
 					memory,
 					ownership: Ownership::Shared,
@@ -570,19 +594,16 @@ impl BodyContext<'_, '_, '_, '_> {
 				value
 			}
 			Operand::Value(value) => {
-				self.cx.diagnostics.push(
+				let at = self.context().source_span(value);
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::InvalidAssignmentTarget.code(),
 						)
 						.with_message("cannot take the address of a value")
-						.with_label(
-							self.source_span(value)
-								.primary_label()
-								.with_message(
-									"this is a value, not a location in memory",
-								),
-						)
+						.with_label(at.primary_label().with_message(
+							"this is a value, not a location in memory",
+						))
 						.with_note(
 							"`.&` takes the address of a place reached \
 							 through a pointer, as `p.*` or `p.*.field`",
@@ -603,7 +624,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let ast::Expression::Placeholder = target.inner {
 			let value = self.build(value, TypeIndex::INFER);
 			let ty = self.body.ty(value);
-			if self.cx.types.needs_context(ty) {
+			if self.sema.types.needs_context(ty) {
 				self.report_annotation_required(value);
 			}
 			return self.body.push(
@@ -765,7 +786,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> Option<CompoundMethod> {
 		let selected = self.operator_impl(
 			ty,
-			self.cx.operators.binary(plain),
+			self.sema.operators.binary(plain),
 			target_span,
 			op.span,
 			op.inner.as_str(),
@@ -786,7 +807,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if place.mutable || place.ty == TypeIndex::ERROR {
 			return;
 		}
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::CannotMutateImmutable.code())
 				.with_message("cannot write through a shared pointer")
@@ -813,8 +834,8 @@ impl BodyContext<'_, '_, '_, '_> {
 				let local = *self.body.local(local);
 				if local.mut_span.is_none() {
 					let name =
-						self.cx.strings.resolve(local.name.inner).unwrap();
-					self.cx.diagnostics.push(
+						self.builder.strings.resolve(local.name.inner).unwrap();
+					self.sema.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::CannotMutateImmutable.code(),
@@ -842,9 +863,10 @@ impl BodyContext<'_, '_, '_, '_> {
 			// A global is a handle, not a location: it is written through
 			// `GlobalMut::set`, never with `=`.
 			ExprKind::Global(global) => {
-				let name = self.cx.defs.globals[usize::from(global)].name.inner;
-				let name = self.cx.strings.resolve(name).unwrap();
-				self.cx.diagnostics.push(
+				let name =
+					self.sema.decls.globals[usize::from(global)].name.inner;
+				let name = self.builder.strings.resolve(name).unwrap();
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::InvalidAssignmentTarget.code(),
@@ -863,7 +885,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				false
 			}
 			_ => {
-				self.cx.diagnostics.push(
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::InvalidAssignmentTarget.code(),

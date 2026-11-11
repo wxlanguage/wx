@@ -1,11 +1,11 @@
 //! Every written name the compiler resolved, in one table.
 //!
-//! The caller owns the table next to the diagnostics sink and lends it
-//! `&mut` to every stage: phase 1 records the segments of `use` paths, the
-//! path walk records every segment it resolves, and signature construction
-//! records generic parameters and selected members. Only code that has
-//! committed to a meaning records it, so a lookup that is tried and
-//! discarded leaves no trace.
+//! The table is built next to the diagnostics: phase 1 and impl dispatch
+//! are lent it `&mut`, and `Semantics` then owns it. Phase 1 records the
+//! segments of `use` paths, the path walk records every segment it resolves,
+//! and signature construction records generic parameters and selected
+//! members. Only code that has committed to a meaning records it, so a
+//! lookup that is tried and discarded leaves no trace.
 //!
 //! Entries are keyed by where the name is written, so resolving the same
 //! site again overwrites it instead of adding a second entry. The order is
@@ -26,8 +26,8 @@
 use std::collections::BTreeMap;
 
 use super::body::{BodyOwner, LabelIdx, LocalIdx, ParamIdx};
-use super::defs::{
-	DefKey, FieldIdx, FunctionIdx, InherentImplIdx, MemberKind, StructIdx,
+use super::decls::{
+	DeclKey, FieldIdx, FunctionIdx, InherentImplIdx, MemberKind, StructIdx,
 	Tier, TraitImplIdx, UseItemIndex,
 };
 use super::types::GenericEnvIdx;
@@ -76,15 +76,15 @@ pub(super) enum Resolution {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum Referent {
-	/// A definition declared in the namespace the name was looked up in:
-	/// an item, a module, a package or an import block.
-	Definition(DefKey),
-	/// A definition the namespace it was looked up in made visible through
+	/// A declaration in the namespace the name was looked up in: an item, a
+	/// module, a package or an import block.
+	Declaration(DeclKey),
+	/// A declaration the namespace it was looked up in made visible through
 	/// a `use` item there, a named import or a glob. Only that first `use`
 	/// is recorded; one it leads through in another namespace can be found
 	/// again by looking the name up from it.
 	Import {
-		definition: DefKey,
+		declaration: DeclKey,
 		import: UseItemIndex,
 	},
 	/// A generic parameter, or a trait's own `Self`: its frame and position
@@ -122,12 +122,15 @@ impl Referent {
 	/// What a namespace lookup found: `import` is the `use` item it came
 	/// through, as `BindingLookup::Found` reports it.
 	pub(super) fn from_lookup(
-		definition: DefKey,
+		declaration: DeclKey,
 		import: Option<UseItemIndex>,
 	) -> Self {
 		match import {
-			Some(import) => Self::Import { definition, import },
-			None => Self::Definition(definition),
+			Some(import) => Self::Import {
+				declaration,
+				import,
+			},
+			None => Self::Declaration(declaration),
 		}
 	}
 }
@@ -140,18 +143,16 @@ mod tests {
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{Diagnostics, TextSpan};
 	use crate::tir::body::Local;
-	use crate::tir::defs::{BindingKey, DefKind, DefinitionRegistry, Scope};
+	use crate::tir::decls::{BindingKey, DeclKind, Declarations, Scope};
 	use crate::tir::impls::{ImplDispatch, ImplTarget};
 	use crate::tir::paths::PathResolver;
-	use crate::tir::signatures::TypeContext;
-	use crate::tir::solver::Solver;
 	use crate::vfs::{self, FileId};
 
 	struct Analysis<'s> {
 		source: &'s str,
 		file: FileId,
 		resolutions: NameResolutions,
-		defs: DefinitionRegistry,
+		decls: Declarations,
 		strings: StringInterner,
 		impl_dispatch: ImplDispatch,
 		function_locals: Vec<Vec<Local>>,
@@ -179,69 +180,40 @@ mod tests {
 			let compilation = builder.build(root);
 			let parse_diagnostics = compilation.collect_diagnostics();
 			assert!(!parse_diagnostics.has_errors(), "{parse_diagnostics:?}");
-			let mut diagnostics = Vec::new();
-			let mut resolutions = NameResolutions::default();
-			let (defs, nodes) = DefinitionRegistry::build(
-				&compilation.packages,
-				&compilation.files,
-				&mut strings,
-				&mut diagnostics,
-				&mut resolutions,
-				compilation.stdlib_package,
-				root,
-			);
-			let file = defs
+			let sema = crate::tir::check(&compilation, &mut strings);
+			let file = sema
+				.decls
 				.namespaces
-				.file_id(crate::tir::defs::Scope::Package(root).into());
-			let dispatch = ImplDispatch::build(
-				&mut diagnostics,
-				&mut resolutions,
-				&strings,
-				&defs,
-				&nodes,
-			);
-			let mut solver = Solver::new(defs.constants.len());
-			let mut context = TypeContext::new(
-				&mut diagnostics,
-				&mut resolutions,
-				&mut strings,
-				&mut solver,
-				&compilation.files,
-				&defs,
-				&nodes,
-				&dispatch,
-			);
-			context.sweep();
-			let function_locals = context
+				.file_id(crate::tir::decls::Scope::Package(root).into());
+			let function_locals = sema
 				.function_implementations
 				.iter()
 				.map(|implementation| {
 					implementation
 						.body()
-						.map(|body| context.body(body).locals().to_vec())
+						.map(|body| sema.body(body).locals().to_vec())
 						.unwrap_or_default()
 				})
 				.collect();
-			let function_envs = context
+			let function_envs = sema
 				.functions
 				.iter()
 				.map(|signature| signature.type_params)
 				.collect();
-			let trait_envs = context
-				.traits
-				.iter()
-				.map(|signature| signature.env)
+			let trait_envs =
+				sema.traits.iter().map(|signature| signature.env).collect();
+			let errors = sema
+				.diagnostics
+				.errors()
+				.map(|d| d.message.clone())
 				.collect();
-			drop(context);
-			let errors =
-				diagnostics.errors().map(|d| d.message.clone()).collect();
 			Self {
 				source,
 				file,
-				resolutions,
-				defs,
+				resolutions: sema.resolutions,
+				decls: sema.decls,
 				strings,
-				impl_dispatch: dispatch,
+				impl_dispatch: sema.impl_dispatch,
 				function_locals,
 				function_envs,
 				trait_envs,
@@ -303,11 +275,11 @@ mod tests {
 			selection
 		}
 
-		fn resolve(&self, path: &str, tier: Tier) -> DefKind {
-			self.definition(path, tier).symbol_kind(&self.defs)
+		fn resolve(&self, path: &str, tier: Tier) -> DeclKind {
+			self.declaration(path, tier).symbol_kind(&self.decls)
 		}
 
-		fn definition(&self, path: &str, tier: Tier) -> DefKey {
+		fn declaration(&self, path: &str, tier: Tier) -> DeclKey {
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
 				.map(|name| ast::PathSegment {
@@ -325,29 +297,29 @@ mod tests {
 				&mut diagnostics,
 				&mut resolutions,
 				&self.strings,
-				&self.defs,
+				&self.decls,
 			)
 			.resolve_path(
 				self.file,
-				Scope::Package(self.defs.root_package),
+				Scope::Package(self.decls.root_package),
 				&segments,
 				tier,
 			);
 			assert!(diagnostics.is_empty(), "{diagnostics:?}");
 			target
-				.def_key()
+				.decl_key()
 				.unwrap_or_else(|| panic!("expected `{path}` to resolve"))
 		}
 
 		fn struct_index(&self, path: &str) -> StructIdx {
-			let DefKind::Struct(index) = self.resolve(path, Tier::Type) else {
+			let DeclKind::Struct(index) = self.resolve(path, Tier::Type) else {
 				panic!("expected `{path}` to name a struct");
 			};
 			index
 		}
 
 		fn function_index(&self, path: &str) -> FunctionIdx {
-			let DefKind::Function(index) = self.resolve(path, Tier::Value)
+			let DeclKind::Function(index) = self.resolve(path, Tier::Value)
 			else {
 				panic!("expected `{path}` to name a function");
 			};
@@ -360,10 +332,10 @@ mod tests {
 			name: &str,
 			tier: Tier,
 		) -> MemberKind {
-			let DefKind::Trait(index) = self.resolve(path, Tier::Type) else {
+			let DeclKind::Trait(index) = self.resolve(path, Tier::Type) else {
 				panic!("expected `{path}` to name a trait");
 			};
-			self.defs
+			self.decls
 				.declared_trait_member(
 					index,
 					BindingKey::new(tier, self.strings.get(name).unwrap()),
@@ -446,16 +418,16 @@ mod tests {
 		"});
 		assert!(matches!(
 			a.at("m::run();", "m", Tier::Type),
-			Some(Referent::Definition(_))
+			Some(Referent::Declaration(_))
 		));
-		let Referent::Definition(direct) = a.value("m::run();", "run") else {
+		let Referent::Declaration(direct) = a.value("m::run();", "run") else {
 			panic!()
 		};
-		let Referent::Import { definition, .. } = a.value("alias();", "alias")
+		let Referent::Import { declaration, .. } = a.value("alias();", "alias")
 		else {
 			panic!()
 		};
-		assert_eq!(direct, definition);
+		assert_eq!(direct, declaration);
 	}
 
 	#[test]
@@ -666,13 +638,13 @@ mod tests {
 				T::make({ value })
 			}
 		"});
-		let DefKind::Trait(trait_index) = a.resolve("Make", Tier::Type) else {
+		let DeclKind::Trait(trait_index) = a.resolve("Make", Tier::Type) else {
 			panic!("expected a trait");
 		};
 		let Some(MemberKind::Function(function)) =
-			a.defs.declared_trait_member(
+			a.decls.declared_trait_member(
 				trait_index,
-				crate::tir::defs::BindingKey::value(
+				crate::tir::decls::BindingKey::value(
 					a.strings.get("make").unwrap(),
 				),
 			)
@@ -777,7 +749,7 @@ mod tests {
 		assert!(!a.errors.is_empty());
 		assert!(matches!(
 			a.at("m::missing", "m", Tier::Type),
-			Some(Referent::Definition(_))
+			Some(Referent::Declaration(_))
 		));
 		assert_eq!(a.at("m::missing", "missing", Tier::Value), None);
 	}
@@ -881,7 +853,7 @@ mod tests {
 		);
 		assert_eq!(
 			a.at("<T as Tr>::make", "Tr", Tier::Type),
-			Some(Referent::Definition(a.definition("Tr", Tier::Type)))
+			Some(Referent::Declaration(a.declaration("Tr", Tier::Type)))
 		);
 	}
 
@@ -899,7 +871,7 @@ mod tests {
 				func id(self: Self) -> Self { self }
 			}
 		"});
-		let DefKind::Trait(trait_index) = a.resolve("Tr", Tier::Type) else {
+		let DeclKind::Trait(trait_index) = a.resolve("Tr", Tier::Type) else {
 			panic!()
 		};
 		assert_eq!(
@@ -955,19 +927,20 @@ mod tests {
 			func f() { alias(); }
 			export alias as \"external\"
 		"});
-		let definition = a.definition("m::run", Tier::Value);
+		let declaration = a.declaration("m::run", Tier::Value);
 		assert_eq!(
 			a.value("use m::run", "run"),
-			Referent::Definition(definition)
+			Referent::Declaration(declaration)
 		);
 		let imported = a.value("alias();", "alias");
 		let Referent::Import {
-			definition: actual, ..
+			declaration: actual,
+			..
 		} = imported
 		else {
 			panic!("expected an import")
 		};
-		assert_eq!(actual, definition);
+		assert_eq!(actual, declaration);
 		assert_eq!(a.value("export alias", "alias"), imported);
 		assert_eq!(
 			a.resolution("as \"external\"", "external", Tier::Value),
@@ -992,19 +965,19 @@ mod tests {
 		for tier in [Tier::Type, Tier::Value] {
 			assert_eq!(
 				a.at("use m::S", "S", tier),
-				Some(Referent::Definition(a.definition("m::S", tier)))
+				Some(Referent::Declaration(a.declaration("m::S", tier)))
 			);
 		}
 		let imported = a.value("\n\tS()", "S");
-		let Referent::Import { definition, .. } = imported else {
+		let Referent::Import { declaration, .. } = imported else {
 			panic!("expected a named import")
 		};
-		assert_eq!(definition, a.definition("m::S", Tier::Value));
-		let Referent::Import { definition, .. } = a.value("run();", "run")
+		assert_eq!(declaration, a.declaration("m::S", Tier::Value));
+		let Referent::Import { declaration, .. } = a.value("run();", "run")
 		else {
 			panic!("expected a glob import")
 		};
-		assert_eq!(definition, a.definition("m::run", Tier::Value));
+		assert_eq!(declaration, a.declaration("m::run", Tier::Value));
 	}
 
 	#[test]
@@ -1116,19 +1089,19 @@ mod tests {
 		"#});
 		assert_eq!(
 			a.at("super::types::S", "types", Tier::Type),
-			Some(Referent::Definition(a.definition("types", Tier::Type)))
+			Some(Referent::Declaration(a.declaration("types", Tier::Type)))
 		);
 		assert_eq!(
 			a.at("super::types::S", "S", Tier::Type),
-			Some(Referent::Definition(a.definition("types::S", Tier::Type)))
+			Some(Referent::Declaration(a.declaration("types::S", Tier::Type)))
 		);
 		assert_eq!(
 			a.at("host::run", "host", Tier::Type),
-			Some(Referent::Definition(a.definition("host", Tier::Type)))
+			Some(Referent::Declaration(a.declaration("host", Tier::Type)))
 		);
 		assert_eq!(
 			a.value("host::run", "run"),
-			Referent::Definition(a.definition("host::run", Tier::Value))
+			Referent::Declaration(a.declaration("host::run", Tier::Value))
 		);
 		assert_eq!(
 			a.value("run(value)", "value"),
@@ -1153,15 +1126,15 @@ mod tests {
 		"});
 		assert_eq!(
 			a.value("const LIMIT =>", "LIMIT"),
-			Referent::Definition(a.definition("LIMIT", Tier::Value))
+			Referent::Declaration(a.declaration("LIMIT", Tier::Value))
 		);
 		assert_eq!(
 			a.at("E::A =>", "E", Tier::Type),
-			Some(Referent::Definition(a.definition("E", Tier::Type)))
+			Some(Referent::Declaration(a.declaration("E", Tier::Type)))
 		);
 		assert_eq!(
 			a.value("E::A =>", "A"),
-			Referent::Definition(a.definition("E::A", Tier::Value))
+			Referent::Declaration(a.declaration("E::A", Tier::Value))
 		);
 	}
 }

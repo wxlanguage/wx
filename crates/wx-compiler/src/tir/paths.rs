@@ -1,5 +1,5 @@
 //! Namespace-graph path resolution: walks a `::`-separated sequence of name
-//! segments to the `DefKey` the last one names.
+//! segments to the `DeclKey` the last one names.
 //!
 //! Matches rustc: an unqualified name is looked up only in the namespace it
 //! was written in (its own direct declarations, its own `use`/glob
@@ -19,7 +19,7 @@
 //! qualified path's later segments are never "unqualified."
 //!
 //! Deliberately stops at the namespace graph's edge. Once a segment
-//! resolves to a `DefKind` that doesn't own a namespace of its own
+//! resolves to a `DeclKind` that doesn't own a namespace of its own
 //! (`Namespace::of` returns `None`) — a struct, an enum variant, a
 //! trait, ... — there's nowhere left to look up the next segment using this
 //! module's own machinery: namespace bindings are the only kind it knows
@@ -63,9 +63,9 @@ use crate::{
 	vfs::FileId,
 };
 
-use super::defs::{
-	BindingKey, BindingLookup, BindingTarget, DefKey, DefinitionRegistry,
-	Namespace, Scope, Tier,
+use super::decls::{
+	BindingKey, BindingLookup, BindingTarget, DeclKey, Declarations, Namespace,
+	Scope, Tier,
 };
 use super::imports::{
 	report_ambiguous_identifier, report_cannot_use_as_namespace,
@@ -103,20 +103,20 @@ use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 struct PathResolution {
 	stopped_at: u32,
 	stopped_with: BindingLookup,
-	/// `(segment index, its DefKey)` for the earliest segment whose binding
+	/// `(segment index, its DeclKey)` for the earliest segment whose binding
 	/// wasn't visible to `accessor` — `None` together, never one without
-	/// the other. Always a real `DefKey` when `Some`: an already-errored
+	/// the other. Always a real `DeclKey` when `Some`: an already-errored
 	/// placeholder (`BindingTarget::Error`) is never checked for
 	/// accessibility at all (see `try_resolve_path`), since there's nothing
 	/// real there to flag privacy on top of an already-reported problem —
-	/// which is what makes "a hop, but no DefKey" unrepresentable here
+	/// which is what makes "a hop, but no DeclKey" unrepresentable here
 	/// rather than a case this type has to account for.
-	first_inaccessible: Option<(u32, DefKey)>,
-	/// `(segment index, its DefKey)` for the earliest namespace the path
+	first_inaccessible: Option<(u32, DeclKey)>,
+	/// `(segment index, its DeclKey)` for the earliest namespace the path
 	/// passed through that was written with generic arguments (`m<u8>::S`).
 	/// A namespace has no generic parameters; the last segment's arguments
 	/// are the caller's, since only it knows what they apply to.
-	first_namespace_with_type_args: Option<(u32, DefKey)>,
+	first_namespace_with_type_args: Option<(u32, DeclKey)>,
 }
 
 /// [`PathResolver::walk_path`]'s result: the target reached, and which
@@ -144,7 +144,7 @@ pub(super) struct PathResolver<'r> {
 	diagnostics: &'r mut Vec<Diagnostic<FileId>>,
 	resolutions: &'r mut NameResolutions,
 	strings: &'r StringInterner,
-	defs: &'r DefinitionRegistry,
+	decls: &'r Declarations,
 	stdlib_root: Namespace,
 }
 
@@ -153,14 +153,14 @@ impl<'r> PathResolver<'r> {
 		diagnostics: &'r mut Vec<Diagnostic<FileId>>,
 		resolutions: &'r mut NameResolutions,
 		strings: &'r StringInterner,
-		defs: &'r DefinitionRegistry,
+		decls: &'r Declarations,
 	) -> Self {
 		Self {
 			diagnostics,
 			resolutions,
 			strings,
-			defs,
-			stdlib_root: Namespace::Package(defs.stdlib_package),
+			decls,
+			stdlib_root: Namespace::Package(decls.stdlib_package),
 		}
 	}
 
@@ -197,16 +197,16 @@ impl<'r> PathResolver<'r> {
 
 			// The std-prelude fallback only ever applies to the first
 			// segment, and only once nothing binds it directly.
-			let mut outcome = self.defs.namespaces.lookup(
-				&self.defs.use_items,
+			let mut outcome = self.decls.namespaces.lookup(
+				&self.decls.use_items,
 				accessor,
 				base,
 				key,
 			);
 			if index == 0 && matches!(outcome, BindingLookup::NotFound) {
 				base = self.stdlib_root;
-				outcome = self.defs.namespaces.lookup(
-					&self.defs.use_items,
+				outcome = self.decls.namespaces.lookup(
+					&self.decls.use_items,
 					accessor,
 					base,
 					key,
@@ -219,29 +219,29 @@ impl<'r> PathResolver<'r> {
 					visibility,
 					import,
 				} => {
-					// `target.def_key()` computed once and reused below —
+					// `target.decl_key()` computed once and reused below —
 					// also what makes an already-errored placeholder
 					// (`None` here) never get checked for accessibility at
 					// all, so `first_inaccessible` can never end up with a
-					// hop that has no real `DefKey` behind it.
-					let def_key = target.def_key();
-					if let Some(def_key) = def_key {
+					// hop that has no real `DeclKey` behind it.
+					let decl_key = target.decl_key();
+					if let Some(decl_key) = decl_key {
 						self.resolutions.record(
 							(
 								SourceSpan::new(file_id, segment.ident.span),
 								seg_tier,
 							),
-							Referent::from_lookup(def_key, *import),
+							Referent::from_lookup(decl_key, *import),
 						);
 					}
 					if first_inaccessible.is_none()
-						&& let Some(def_key) = def_key
-						&& !self.defs.namespaces.is_accessible_from(
+						&& let Some(decl_key) = decl_key
+						&& !self.decls.namespaces.is_accessible_from(
 							accessor,
 							base,
 							*visibility,
 						) {
-						first_inaccessible = Some((index as u32, def_key));
+						first_inaccessible = Some((index as u32, decl_key));
 					}
 					if is_last {
 						return PathResolution {
@@ -251,7 +251,7 @@ impl<'r> PathResolver<'r> {
 							first_namespace_with_type_args,
 						};
 					}
-					let Some(def_key) = def_key else {
+					let Some(decl_key) = decl_key else {
 						// `BindingTarget::Error` mid-path — nothing left to
 						// continue into.
 						return PathResolution {
@@ -262,7 +262,7 @@ impl<'r> PathResolver<'r> {
 						};
 					};
 					let Some(namespace) =
-						self.defs.namespaces.entered_by(def_key)
+						self.decls.namespaces.entered_by(decl_key)
 					else {
 						return PathResolution {
 							stopped_at: index as u32,
@@ -275,7 +275,7 @@ impl<'r> PathResolver<'r> {
 						&& !segment.type_args.is_empty()
 					{
 						first_namespace_with_type_args =
-							Some((index as u32, def_key));
+							Some((index as u32, decl_key));
 					}
 					base = namespace;
 					entered_by = Some((*target, *visibility, *import));
@@ -358,17 +358,17 @@ impl<'r> PathResolver<'r> {
 		let seg_tier = if is_last { tier } else { Tier::Type };
 		let span = segments[stopped_at as usize].ident.span;
 
-		if let Some((index, def_key)) =
+		if let Some((index, decl_key)) =
 			resolution.first_namespace_with_type_args
 		{
 			let segment = &segments[index as usize];
 			self.diagnostics.push(report_type_args_not_allowed(
 				self.strings,
-				self.defs,
+				self.decls,
 				file_id,
 				segment,
 				TypeArgsNotAllowedOn::Declaration(
-					self.defs.namespaces.kind(def_key),
+					self.decls.namespaces.kind(decl_key),
 				),
 			));
 		}
@@ -377,19 +377,19 @@ impl<'r> PathResolver<'r> {
 				match resolution.first_inaccessible {
 					// The named item itself is not visible here: the caller, which
 					// knows what it is used for, reports it.
-					Some((bad, def_key)) if is_last && bad == stopped_at => {
-						BindingTarget::Inaccessible(def_key)
+					Some((bad, decl_key)) if is_last && bad == stopped_at => {
+						BindingTarget::Inaccessible(decl_key)
 					}
-					Some((bad, def_key)) => {
+					Some((bad, decl_key)) => {
 						self.diagnostics.push(report_private_identifier(
-							&self.defs.namespaces,
+							&self.decls.namespaces,
 							self.strings,
 							segments[bad as usize].ident.inner,
 							SourceSpan::new(
 								file_id,
 								segments[bad as usize].ident.span,
 							),
-							Some(def_key),
+							Some(decl_key),
 						));
 						*target
 					}
@@ -408,7 +408,7 @@ impl<'r> PathResolver<'r> {
 			}
 			BindingLookup::Ambiguous(candidates) => {
 				self.diagnostics.push(report_ambiguous_identifier(
-					&self.defs.namespaces,
+					&self.decls.namespaces,
 					self.strings,
 					segments[stopped_at as usize].ident.inner,
 					SourceSpan::new(file_id, span),
@@ -440,16 +440,16 @@ impl<'r> PathResolver<'r> {
 		// `None` here means an already-errored placeholder
 		// (`BindingTarget::Error`) mid-path — already diagnosed by
 		// whoever caused that, nothing new to report.
-		if let Some(def_key) = walk.target.def_key() {
+		if let Some(decl_key) = walk.target.decl_key() {
 			self.diagnostics.push(report_cannot_use_as_namespace(
-				&self.defs.namespaces,
+				&self.decls.namespaces,
 				self.strings,
 				segments[walk.stopped_at as usize].ident.inner,
 				SourceSpan::new(
 					file_id,
 					segments[walk.stopped_at as usize].ident.span,
 				),
-				def_key,
+				decl_key,
 			));
 		}
 		BindingTarget::Error
@@ -466,19 +466,19 @@ impl<'r> PathResolver<'r> {
 		accessor: Scope,
 		segments: &[PathSegment],
 		tier: Tier,
-	) -> Result<DefKey, ()> {
+	) -> Result<DeclKey, ()> {
 		let target = self.resolve_path(file_id, accessor, segments, tier);
-		if let BindingTarget::Inaccessible(def_key) = target {
+		if let BindingTarget::Inaccessible(decl_key) = target {
 			let segment = segments.last().unwrap();
 			self.diagnostics.push(report_private_identifier(
-				&self.defs.namespaces,
+				&self.decls.namespaces,
 				self.strings,
 				segment.ident.inner,
 				SourceSpan::new(file_id, segment.ident.span),
-				Some(def_key),
+				Some(decl_key),
 			));
 		}
-		target.def_key().ok_or(())
+		target.decl_key().ok_or(())
 	}
 }
 
@@ -512,16 +512,16 @@ mod tests {
 
 	use super::*;
 	use crate::testing::DiagnosticView;
-	use crate::tir::defs::{DefKind, DefinitionRegistry};
+	use crate::tir::decls::{DeclKind, Declarations};
 	use crate::vfs;
 
-	/// Small, path-resolution-only duplicate of `defs::tests::TestCase` —
+	/// Small, path-resolution-only duplicate of `decls::tests::TestCase` —
 	/// kept separate rather than shared across files so each test module
 	/// stays self-contained, same as `imports.rs`'s own copy.
 	struct TestCase {
 		graph: vfs::CompilationUnit,
 		strings: StringInterner,
-		defs: DefinitionRegistry,
+		decls: Declarations,
 		diagnostics: Vec<Diagnostic<FileId>>,
 	}
 
@@ -546,7 +546,7 @@ mod tests {
 		}
 
 		#[track_caller]
-		fn expect_success(&self) -> DefKey {
+		fn expect_success(&self) -> DeclKey {
 			self.diagnostics().assert_none();
 			let BindingTarget::Accessible(key) = self.target else {
 				panic!(
@@ -572,7 +572,7 @@ mod tests {
 
 			let mut diagnostics = Vec::new();
 			let mut resolutions = NameResolutions::default();
-			let (defs, ast_nodes) = DefinitionRegistry::build(
+			let (decls, ast_nodes) = Declarations::build(
 				&graph.packages,
 				&graph.files,
 				&mut strings,
@@ -586,7 +586,7 @@ mod tests {
 			Self {
 				graph,
 				strings,
-				defs,
+				decls,
 				diagnostics,
 			}
 		}
@@ -628,7 +628,7 @@ mod tests {
 		}
 
 		fn root_namespace(&self) -> Scope {
-			Scope::Package(self.defs.root_package)
+			Scope::Package(self.decls.root_package)
 		}
 
 		/// Supply a source offset for diagnostic tests; synthetic queries use empty spans.
@@ -664,12 +664,12 @@ mod tests {
 			path: &str,
 		) -> PathResolution {
 			let segments = self.segments(path, None);
-			let file_id = self.defs.namespaces.file_id(from.into());
+			let file_id = self.decls.namespaces.file_id(from.into());
 			PathResolver::new(
 				&mut Vec::new(),
 				&mut NameResolutions::default(),
 				&self.strings,
-				&self.defs,
+				&self.decls,
 			)
 			.try_resolve_path(file_id, from, &segments, tier)
 		}
@@ -681,7 +681,7 @@ mod tests {
 			tier: Tier,
 			path: &str,
 		) -> ResolutionResult<'_> {
-			let file_id = self.defs.namespaces.file_id(from.into());
+			let file_id = self.decls.namespaces.file_id(from.into());
 			let segments = self.segments(path, None);
 			self.resolve_segments(file_id, from, tier, &segments)
 		}
@@ -699,7 +699,7 @@ mod tests {
 				&mut diagnostics,
 				&mut resolutions,
 				&self.strings,
-				&self.defs,
+				&self.decls,
 			)
 			.resolve_path(file_id, from, segments, tier);
 			ResolutionResult {
@@ -723,7 +723,7 @@ mod tests {
 		let key = case
 			.resolve(root, Tier::Type, "inner::Widget")
 			.expect_success();
-		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Struct(_)));
+		assert!(matches!(key.symbol_kind(&case.decls), DeclKind::Struct(_)));
 	}
 
 	#[test]
@@ -761,7 +761,7 @@ mod tests {
 		let root = case.root_namespace();
 		let inner_key =
 			case.resolve(root, Tier::Type, "inner").expect_success();
-		let DefKind::Module(inner) = inner_key.symbol_kind(&case.defs) else {
+		let DeclKind::Module(inner) = inner_key.symbol_kind(&case.decls) else {
 			panic!("expected a module");
 		};
 		let inner_namespace = Scope::Module(inner);
@@ -797,7 +797,10 @@ mod tests {
 
 		let root = case.root_namespace();
 		let key = case.resolve(root, Tier::Type, "i32").expect_success();
-		assert!(matches!(key.symbol_kind(&case.defs), DefKind::TypeAlias(_)));
+		assert!(matches!(
+			key.symbol_kind(&case.decls),
+			DeclKind::TypeAlias(_)
+		));
 
 		let resolution = case.try_resolve(root, Tier::Type, "inner::i32");
 		assert_eq!(resolution.stopped_at, 1);
@@ -812,7 +815,7 @@ mod tests {
 		let root = case.root_namespace();
 		let key = case.resolve(root, Tier::Type, "i32").expect_success();
 		assert_eq!(key.namespace, root.into());
-		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Struct(_)));
+		assert!(matches!(key.symbol_kind(&case.decls), DeclKind::Struct(_)));
 	}
 
 	#[test]
@@ -829,7 +832,7 @@ mod tests {
 		let original = case
 			.resolve(root, Tier::Type, "inner::Point")
 			.expect_success();
-		let file_id = case.defs.namespaces.file_id(root.into());
+		let file_id = case.decls.namespaces.file_id(root.into());
 		let path = "inner::Point::member";
 		let segments = case.segments(path, Some(source.find(path).unwrap()));
 		let mut diagnostics = Vec::new();
@@ -838,7 +841,7 @@ mod tests {
 			&mut diagnostics,
 			&mut resolutions,
 			&case.strings,
-			&case.defs,
+			&case.decls,
 		)
 		.walk_path(file_id, root, &segments, Tier::Type);
 
@@ -903,7 +906,10 @@ mod tests {
 		let key = case
 			.resolve(root, Tier::Value, "math::add")
 			.expect_success();
-		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Function(_)));
+		assert!(matches!(
+			key.symbol_kind(&case.decls),
+			DeclKind::Function(_)
+		));
 	}
 
 	#[test]
@@ -919,7 +925,10 @@ mod tests {
 		let key = case
 			.resolve(root, Tier::Value, "inner::helper")
 			.expect_success();
-		assert!(matches!(key.symbol_kind(&case.defs), DefKind::Function(_)));
+		assert!(matches!(
+			key.symbol_kind(&case.decls),
+			DeclKind::Function(_)
+		));
 	}
 
 	/// Mirrors a real rustc case I compiled: `mod a { mod b { pub struct C;
@@ -953,11 +962,11 @@ mod tests {
 			.first_inaccessible
 			.expect("expected an inaccessible hop");
 		assert_eq!(index, 1);
-		let DefKind::Module(module) = private_key.symbol_kind(&case.defs)
+		let DeclKind::Module(module) = private_key.symbol_kind(&case.decls)
 		else {
 			panic!("expected the private module");
 		};
-		let name = case.defs.modules[usize::from(module)].name;
+		let name = case.decls.modules[usize::from(module)].name;
 		assert_eq!(case.strings.resolve(name.inner), Some("b"));
 		let namespace = Scope::Module(module);
 		let original =
@@ -990,12 +999,12 @@ mod tests {
 				resolution.stopped_with
 			);
 		};
-		let DefKind::Struct(index) = key.symbol_kind(&case.defs) else {
+		let DeclKind::Struct(index) = key.symbol_kind(&case.decls) else {
 			panic!("expected struct C");
 		};
 		assert_eq!(
 			case.strings
-				.resolve(case.defs.structs[usize::from(index)].name.inner),
+				.resolve(case.decls.structs[usize::from(index)].name.inner),
 			Some("C")
 		);
 	}
@@ -1007,7 +1016,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces.file_id(root.into());
+		let file_id = case.decls.namespaces.file_id(root.into());
 		let path_start = source.rfind("DoesNotExist").unwrap();
 		let segments = case.segments("DoesNotExist", Some(path_start));
 		let result =
@@ -1051,7 +1060,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces.file_id(root.into());
+		let file_id = case.decls.namespaces.file_id(root.into());
 		let path_start = source.rfind("i32").unwrap();
 		let segments = case.segments("i32", Some(path_start));
 		let result =
@@ -1089,7 +1098,7 @@ mod tests {
 		"};
 		let mut case = TestCase::new(source);
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces.file_id(root.into());
+		let file_id = case.decls.namespaces.file_id(root.into());
 		let path_start = source.rfind("a::C").unwrap();
 		let segments = case.segments("a::C", Some(path_start));
 
@@ -1105,7 +1114,7 @@ mod tests {
 			&mut diagnostics,
 			&mut NameResolutions::default(),
 			&case.strings,
-			&case.defs,
+			&case.decls,
 		)
 		.resolve_definition(file_id, root, &segments, Tier::Type);
 		assert!(definition.is_ok());
@@ -1128,7 +1137,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces.file_id(root.into());
+		let file_id = case.decls.namespaces.file_id(root.into());
 		let path_start = source.rfind("a::b::C").unwrap();
 		let segments = case.segments("a::b::C", Some(path_start));
 		let result =
@@ -1152,12 +1161,12 @@ mod tests {
 				assert_eq!(diagnostic.message, "module `b` is private");
 			},
 		);
-		let DefKind::Struct(index) = key.symbol_kind(&case.defs) else {
+		let DeclKind::Struct(index) = key.symbol_kind(&case.decls) else {
 			panic!("expected struct C");
 		};
 		assert_eq!(
 			case.strings
-				.resolve(case.defs.structs[usize::from(index)].name.inner),
+				.resolve(case.decls.structs[usize::from(index)].name.inner),
 			Some("C")
 		);
 	}
@@ -1172,7 +1181,7 @@ mod tests {
 		case.diagnostics().assert_none();
 
 		let root = case.root_namespace();
-		let file_id = case.defs.namespaces.file_id(root.into());
+		let file_id = case.decls.namespaces.file_id(root.into());
 		let path_start = source.rfind("Point::x").unwrap();
 		let segments = case.segments("Point::x", Some(path_start));
 		let result =

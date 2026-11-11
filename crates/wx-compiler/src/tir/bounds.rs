@@ -46,10 +46,11 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::index::index_newtype;
 use crate::vfs::FileId;
 
-use super::defs::{DefId, DefKind, DefinitionRegistry, TraitIdx};
+use super::decls::{DeclId, DeclKind, Declarations, TraitIdx};
 use super::members::{ConstantTarget, TypeProjectionTarget};
 use super::signatures::{
-	AssocTypeSignature, QueryInfo, SignatureStatus, TraitSignature, TypeContext,
+	AssocTypeSignature, QueryInfo, Semantics, SemanticsBuilder,
+	SignatureStatus, TraitSignature,
 };
 use super::types::{
 	GenericEnvArena, GenericEnvIdx, GenericEnvOwner, Substitution, Type,
@@ -549,79 +550,13 @@ impl BoundArena {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
-	/// The frame whose `Self` clauses are the trait `bound` names, once its
-	/// signature is available. While it is being built the bound closes a
-	/// cycle, reported here at `bound`, and expands to nothing.
-	fn trait_clause_env(&mut self, bound: BoundId) -> Option<GenericEnvIdx> {
-		let trait_index = self.bounds.trait_index(bound);
-		self.trait_env(trait_index, self.bounds.span(bound))
-	}
-
+impl Semantics {
 	/// The declaration whose signature holds `trait_index`'s: its typeset's
 	/// for a trait a typeset generates.
-	pub(super) fn trait_def_id(&self, trait_index: TraitIdx) -> DefId {
-		match self.defs.traits[usize::from(trait_index)].typeset {
-			Some(typeset_index) => DefId::Typeset(typeset_index),
-			None => DefId::Trait(trait_index),
-		}
-	}
-
-	/// The frame of `trait_index`, once its signature is available. While it
-	/// is being built, `reference` closes a cycle, reported here once.
-	pub(super) fn trait_env(
-		&mut self,
-		trait_index: TraitIdx,
-		reference: SourceSpan,
-	) -> Option<GenericEnvIdx> {
-		let def_id = self.trait_def_id(trait_index);
-		match self.ensure_signature(QueryInfo {
-			def_id,
-			requested_at: Some(reference),
-		}) {
-			SignatureStatus::Available(_) => {
-				Some(self.traits[usize::from(trait_index)].env)
-			}
-			SignatureStatus::Cycle => {
-				let diagnostic =
-					self.report_cyclic_implied_trait_bounds(def_id, reference);
-				self.diagnostics.push(diagnostic);
-				None
-			}
-			SignatureStatus::CycleReported => None,
-		}
-	}
-
-	/// Appends the trait clauses of the trait `bound` names, with `Self`
-	/// replaced by `subject`, as brought in by `origin`.
-	pub(super) fn inherit_trait_clauses(
-		&mut self,
-		out: &mut Vec<TraitClause>,
-		subject: TypeIndex,
-		bound: BoundId,
-		origin: BoundId,
-	) {
-		let Some(env) = self.trait_clause_env(bound) else {
-			return;
-		};
-		let range = self.assumption_envs.requirements(env).range();
-		for clause in self.clauses.traits(range) {
-			let subject = self.types.substitute(
-				clause.subject,
-				Substitution {
-					envs: &self.generic_envs,
-					env,
-					args: &[subject],
-				},
-			);
-			push_trait_clause(
-				out,
-				TraitClause {
-					subject,
-					origin,
-					..*clause
-				},
-			);
+	pub(super) fn trait_decl_id(&self, trait_index: TraitIdx) -> DeclId {
+		match self.decls.traits[usize::from(trait_index)].typeset {
+			Some(typeset_index) => DeclId::Typeset(typeset_index),
+			None => DeclId::Trait(trait_index),
 		}
 	}
 
@@ -631,6 +566,7 @@ impl TypeContext<'_, '_, '_> {
 	/// values an outer constructor tells apart are a conflict, reported here.
 	pub(super) fn collect_value_clauses(
 		&mut self,
+		strings: &StringInterner,
 		out: &mut Vec<Clause>,
 		subject: TypeIndex,
 		ids: &[BoundId],
@@ -658,8 +594,8 @@ impl TypeContext<'_, '_, '_> {
 		} = builder;
 		for conflict in conflicts {
 			self.diagnostics.push(report_conflicting_assoc_type_binding(
-				self.strings,
-				self.defs,
+				strings,
+				&self.decls,
 				&self.bounds,
 				name,
 				conflict,
@@ -667,29 +603,6 @@ impl TypeContext<'_, '_, '_> {
 		}
 		out.extend(equalities.into_iter().map(Clause::Equality));
 		out.extend(representable.into_iter().map(Clause::Representable));
-	}
-
-	/// Demand the associated declarations along `receiver`'s projection path,
-	/// whose clauses can describe it (`ClauseTables::declarations_of`). A
-	/// declaration whose equalities are not resolved yet still supplies its
-	/// memberships, but not an equality.
-	pub(super) fn prepare_declarations_of(
-		&mut self,
-		mut receiver: TypeIndex,
-		reference: SourceSpan,
-	) -> Result<(), ()> {
-		while let Type::TypeProjection {
-			base,
-			assoc_type_index,
-			..
-		} = *self.types.resolve(receiver)
-		{
-			if self.assoc_types[usize::from(assoc_type_index)].is_none() {
-				self.ensure_assoc_type_bounds(assoc_type_index, reference)?;
-			}
-			receiver = base;
-		}
-		Ok(())
 	}
 }
 
@@ -1216,7 +1129,7 @@ impl From<BoundClauses> for Readiness {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	pub(super) fn clause_tables(&self) -> ClauseTables<'_> {
 		ClauseTables::new(
 			&self.generic_envs,
@@ -1295,7 +1208,7 @@ pub(super) fn report_not_a_trait_bound(
 	file_id: FileId,
 	strings: &StringInterner,
 	name: Spanned<SymbolU32>,
-	kind: DefKind,
+	kind: DeclKind,
 ) -> Diagnostic<FileId> {
 	let name_str = strings.resolve(name.inner).unwrap();
 	Diagnostic::error()
@@ -1333,7 +1246,7 @@ pub(super) fn report_duplicate_assoc_type_binding(
 /// incompatible values. The references retain both original value spans.
 fn report_conflicting_assoc_type_binding(
 	strings: &StringInterner,
-	defs: &DefinitionRegistry,
+	decls: &Declarations,
 	arena: &BoundArena,
 	subject: SymbolU32,
 	conflict: AssocBindingConflict,
@@ -1347,7 +1260,7 @@ fn report_conflicting_assoc_type_binding(
 		unreachable!("conflict points to a source equality")
 	};
 	let subject_str = strings.resolve(subject).unwrap();
-	let trait_name = defs.traits[usize::from(target.trait_index)].name.inner;
+	let trait_name = decls.traits[usize::from(target.trait_index)].name.inner;
 	let trait_str = strings.resolve(trait_name).unwrap();
 	let assoc_str = strings.resolve(first.name.inner).unwrap();
 	Diagnostic::error()
@@ -1400,10 +1313,116 @@ pub(super) fn report_not_a_binding_member(
 		.with_label(SourceSpan::new(file_id, name.span).primary_label())
 }
 
+impl<'ast> SemanticsBuilder<'ast> {
+	/// The frame whose `Self` clauses are the trait `bound` names, once its
+	/// signature is available. While it is being built the bound closes a
+	/// cycle, reported here at `bound`, and expands to nothing.
+	fn trait_clause_env(
+		&mut self,
+		sema: &mut Semantics,
+		bound: BoundId,
+	) -> Option<GenericEnvIdx> {
+		let trait_index = sema.bounds.trait_index(bound);
+		self.trait_env(sema, trait_index, sema.bounds.span(bound))
+	}
+
+	/// The frame of `trait_index`, once its signature is available. While it
+	/// is being built, `reference` closes a cycle, reported here once.
+	pub(super) fn trait_env(
+		&mut self,
+		sema: &mut Semantics,
+		trait_index: TraitIdx,
+		reference: SourceSpan,
+	) -> Option<GenericEnvIdx> {
+		let decl_id = sema.trait_decl_id(trait_index);
+		match self.ensure_signature(
+			sema,
+			QueryInfo {
+				decl_id,
+				requested_at: Some(reference),
+			},
+		) {
+			SignatureStatus::Available(_) => {
+				Some(sema.traits[usize::from(trait_index)].env)
+			}
+			SignatureStatus::Cycle => {
+				let diagnostic = self.report_cyclic_implied_trait_bounds(
+					sema, decl_id, reference,
+				);
+				sema.diagnostics.push(diagnostic);
+				None
+			}
+			SignatureStatus::CycleReported => None,
+		}
+	}
+
+	/// Appends the trait clauses of the trait `bound` names, with `Self`
+	/// replaced by `subject`, as brought in by `origin`.
+	pub(super) fn inherit_trait_clauses(
+		&mut self,
+		sema: &mut Semantics,
+		out: &mut Vec<TraitClause>,
+		subject: TypeIndex,
+		bound: BoundId,
+		origin: BoundId,
+	) {
+		let Some(env) = self.trait_clause_env(sema, bound) else {
+			return;
+		};
+		let range = sema.assumption_envs.requirements(env).range();
+		for clause in sema.clauses.traits(range) {
+			let subject = sema.types.substitute(
+				clause.subject,
+				Substitution {
+					envs: &sema.generic_envs,
+					env,
+					args: &[subject],
+				},
+			);
+			push_trait_clause(
+				out,
+				TraitClause {
+					subject,
+					origin,
+					..*clause
+				},
+			);
+		}
+	}
+
+	/// Demand the associated declarations along `receiver`'s projection path,
+	/// whose clauses can describe it (`ClauseTables::declarations_of`). A
+	/// declaration whose equalities are not resolved yet still supplies its
+	/// memberships, but not an equality.
+	pub(super) fn prepare_declarations_of(
+		&mut self,
+		sema: &mut Semantics,
+		mut receiver: TypeIndex,
+		reference: SourceSpan,
+	) -> Result<(), ()> {
+		while let Type::TypeProjection {
+			base,
+			assoc_type_index,
+			..
+		} = *sema.types.resolve(receiver)
+		{
+			if sema.assoc_types[usize::from(assoc_type_index)].is_none() {
+				self.ensure_assoc_type_bounds(
+					sema,
+					assoc_type_index,
+					reference,
+				)?;
+			}
+			receiver = base;
+		}
+		Ok(())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::tir::defs::EnumIdx;
+	use crate::tir::decls::EnumIdx;
 
 	fn clause(index: u32, value: TypeIndex) -> EqualityClause {
 		EqualityClause {

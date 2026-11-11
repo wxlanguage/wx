@@ -4,12 +4,12 @@ use std::fmt;
 use codespan_reporting::diagnostic::Diagnostic;
 
 use super::bounds::{AssumptionEnvIdx, BindingRef, Readiness};
-use super::defs::{ConstIdx, TypesetIdx};
+use super::decls::{ConstIdx, TypesetIdx};
 use super::eval::ResolvedConstant;
-use super::signatures::TypeContext;
+use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{GenericEnvOwner, Substitution, Type, TypeIndex};
-use crate::ast::{Spanned, UnaryOp};
+use crate::ast::{Spanned, StringInterner, UnaryOp};
 use crate::{
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	vfs::FileId,
@@ -443,16 +443,17 @@ pub(super) enum UntypedValue {
 	Failed,
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// The value of `constant` read with `args` (a trait constant's are
 	/// `[Self]`), in `env`.
 	pub(super) fn untyped_value(
 		&mut self,
+		strings: &StringInterner,
 		env: AssumptionEnvIdx,
 		constant: ConstIdx,
 		args: &[TypeIndex],
 	) -> Result<UntypedValue, SolverError> {
-		let resolved = match self.resolve_constant(constant, args) {
+		let resolved = match self.resolve_constant(strings, constant, args) {
 			Ok(resolved) => resolved,
 			Err(SolverError::Pending) => return Err(SolverError::Pending),
 			Err(_) => return Ok(UntypedValue::Failed),
@@ -460,6 +461,7 @@ impl TypeContext<'_, '_, '_> {
 		Ok(match resolved {
 			ResolvedConstant::Length(length) => {
 				let length = match self.normalize(
+					strings,
 					env,
 					length,
 					NormalizationDepth::Deep,
@@ -479,7 +481,7 @@ impl TypeContext<'_, '_, '_> {
 				}
 			}
 			ResolvedConstant::Instance(instance) => self
-				.exact_value(instance.constant)
+				.exact_value(strings, instance.constant)
 				.map_or(UntypedValue::Failed, UntypedValue::Known),
 			ResolvedConstant::Abstract => UntypedValue::Abstract,
 			ResolvedConstant::DataEnd(_) => {
@@ -513,7 +515,7 @@ impl TypeContext<'_, '_, '_> {
 			self.solver.state.recursion_budget,
 		) {
 			let Some(typeset) =
-				self.defs.traits[usize::from(trait_index)].typeset
+				self.decls.traits[usize::from(trait_index)].typeset
 			else {
 				continue;
 			};
@@ -580,6 +582,7 @@ impl TypeContext<'_, '_, '_> {
 	/// representable as `ty` (normalized).
 	pub(super) fn assumed_representable(
 		&mut self,
+		strings: &StringInterner,
 		env: AssumptionEnvIdx,
 		subject: TypeIndex,
 		constant: ConstIdx,
@@ -626,6 +629,7 @@ impl TypeContext<'_, '_, '_> {
 				None => assumed,
 			};
 			let assumed = self.normalize(
+				strings,
 				env,
 				assumed,
 				NormalizationDepth::Deep,
@@ -642,6 +646,7 @@ impl TypeContext<'_, '_, '_> {
 	/// type `ty`.
 	pub(super) fn report_out_of_range(
 		&self,
+		strings: &StringInterner,
 		what: impl fmt::Display,
 		ty: TypeIndex,
 		at: SourceSpan,
@@ -650,7 +655,7 @@ impl TypeContext<'_, '_, '_> {
 			.with_code(DiagnosticCode::IntegerLiteralOutOfRange.code())
 			.with_message(format!(
 				"{what} cannot be represented as `{}`",
-				self.type_formatter().display_type(ty)
+				self.type_formatter(strings).display_type(ty)
 			))
 			.with_label(at.primary_label())
 	}
@@ -659,14 +664,16 @@ impl TypeContext<'_, '_, '_> {
 	/// `typeset` an abstract target may be.
 	pub(super) fn report_typeset_member(
 		&self,
+		strings: &StringInterner,
 		what: impl fmt::Display,
 		typeset: TypesetIdx,
 		member: Spanned<TypeIndex>,
 		at: SourceSpan,
 	) -> Diagnostic<FileId> {
-		let def = &self.defs.typesets[usize::from(typeset)];
-		let name = self.strings.resolve(def.name.inner).unwrap();
-		let member_name = self.type_formatter().display_type(member.inner);
+		let decl = &self.decls.typesets[usize::from(typeset)];
+		let name = strings.resolve(decl.name.inner).unwrap();
+		let member_name =
+			self.type_formatter(strings).display_type(member.inner);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypesetBoundViolation.code())
 			.with_message(format!(
@@ -677,7 +684,7 @@ impl TypeContext<'_, '_, '_> {
 				"cannot be represented as `{member_name}`"
 			)))
 			.with_label(
-				SourceSpan::new(def.file_id, member.span)
+				SourceSpan::new(decl.file_id, member.span)
 					.secondary_label()
 					.with_message(format!("`{member_name}` is a member here")),
 			)
@@ -687,13 +694,14 @@ impl TypeContext<'_, '_, '_> {
 	/// constant has a type, `declared`.
 	pub(super) fn report_typed_constant_bound(
 		&self,
+		strings: &StringInterner,
 		at: SourceSpan,
 		constant: ConstIdx,
 		declared: TypeIndex,
 	) -> Diagnostic<FileId> {
-		let def = &self.defs.constants[usize::from(constant)];
-		let name = self.strings.resolve(def.name.inner).unwrap();
-		let declared = self.type_formatter().display_type(declared);
+		let decl = &self.decls.constants[usize::from(constant)];
+		let name = strings.resolve(decl.name.inner).unwrap();
+		let declared = self.type_formatter(strings).display_type(declared);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypedConstantBound.code())
 			.with_message(format!(
@@ -702,7 +710,7 @@ impl TypeContext<'_, '_, '_> {
 			))
 			.with_label(at.primary_label())
 			.with_label(
-				SourceSpan::new(def.file_id, def.name.span)
+				SourceSpan::new(decl.file_id, decl.name.span)
 					.secondary_label()
 					.with_message(format!(
 						"`{name}` is declared `{declared}` here"
@@ -719,6 +727,7 @@ impl TypeContext<'_, '_, '_> {
 	/// here and no representability clause in scope says it is.
 	pub(super) fn report_unrepresentable_constant(
 		&mut self,
+		strings: &StringInterner,
 		reference: SourceSpan,
 		(subject, constant): (TypeIndex, ConstIdx),
 		ty: TypeIndex,
@@ -726,11 +735,11 @@ impl TypeContext<'_, '_, '_> {
 		source: Option<(BindingRef, GenericEnvOwner)>,
 	) -> Diagnostic<FileId> {
 		let read = self.types.intern_const(constant, &[subject]);
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let (read, ty) =
 			(formatter.display_type(read), formatter.display_type(ty));
-		let name = self.defs.constants[usize::from(constant)].name.inner;
-		let name = self.strings.resolve(name).unwrap();
+		let name = self.decls.constants[usize::from(constant)].name.inner;
+		let name = strings.resolve(name).unwrap();
 		let label = match value {
 			Some(value) => {
 				format!("its value `{value}` is out of range for `{ty}`")
@@ -746,10 +755,10 @@ impl TypeContext<'_, '_, '_> {
 		if let Some((source, owner)) = source {
 			diagnostic = diagnostic.with_label(
 				self.binding_span(source).secondary_label().with_message(
-					match owner.name(self.defs) {
+					match owner.name(&self.decls) {
 						Some(owner) => format!(
 							"required by this bound in `{}`",
-							self.strings.resolve(owner.inner).unwrap()
+							strings.resolve(owner.inner).unwrap()
 						),
 						None => "required by this bound".to_owned(),
 					},

@@ -26,11 +26,11 @@ use std::ops::Range;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
-use super::{BodyContext, Integer, ValuePath};
+use super::{BodyBuilder, Integer, ValuePath};
 use crate::ast::{self, Keyword, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprKind, LocalIdx, PatIdx, PatternKind};
-use crate::tir::defs::{BindingTarget, DefKind, StructIdx, Tier, TraitIdx};
+use crate::tir::decls::{BindingTarget, DeclKind, StructIdx, Tier, TraitIdx};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
 use crate::tir::resolutions::Selection;
@@ -155,7 +155,7 @@ impl PatternContext {
 	}
 }
 
-impl BodyContext<'_, '_, '_, '_> {
+impl BodyBuilder<'_, '_> {
 	/// Checks `pattern` against `expected`, declaring its bindings in the
 	/// current scope.
 	pub(super) fn check_pattern(
@@ -240,7 +240,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		}
 		if !context.reported_refutable {
 			context.reported_refutable = true;
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::RefutablePatternInLocal.code())
 					.with_message("a `local` pattern cannot test a value")
@@ -270,8 +270,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		if ty == TypeIndex::ERROR {
 			return ty;
 		}
-		let normalized = self.normalized(ty, self.scope.assumption_env);
-		match *self.cx.types.resolve(normalized) {
+		let normalized = self.context().normalized(ty);
+		match *self.sema.types.resolve(normalized) {
 			// A literal or inference placeholder has its own diagnostic.
 			Type::Error
 			| Type::Infer
@@ -283,12 +283,13 @@ impl BodyContext<'_, '_, '_, '_> {
 			_ => {}
 		}
 		let trait_index = self
-			.cx
-			.defs
+			.sema
+			.decls
 			.intrinsics
 			.eq
 			.expect("the stdlib must declare the `Eq` trait");
-		match self.cx.find_trait_impl_query(
+		match self.sema.find_trait_impl_query(
+			self.builder.strings,
 			self.scope.assumption_env,
 			normalized,
 			trait_index,
@@ -300,13 +301,19 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 			Err(SolverError::Overflow) => {
 				let site = SourceSpan::new(self.scope.file_id, span);
-				self.cx.diagnostics.push(self.cx.overflow_diagnostic(site));
+				self.sema
+					.diagnostics
+					.push(self.sema.overflow_diagnostic(site));
 				TypeIndex::ERROR
 			}
 			Err(SolverError::Cycle(cycle)) => {
 				let site = SourceSpan::new(self.scope.file_id, span);
-				let diagnostic = self.cx.cycle_diagnostic(&cycle, site);
-				self.cx.diagnostics.push(diagnostic);
+				let diagnostic = self.sema.cycle_diagnostic(
+					self.builder.strings,
+					&cycle,
+					site,
+				);
+				self.sema.diagnostics.push(diagnostic);
 				TypeIndex::ERROR
 			}
 			// Another construct owns the error or the answer is not final.
@@ -321,14 +328,20 @@ impl BodyContext<'_, '_, '_, '_> {
 		trait_index: TraitIdx,
 		span: TextSpan,
 	) {
-		let name = self.cx.type_formatter().display_type(ty).to_string();
+		let name = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(ty)
+			.to_string();
 		let trait_name = self
-			.cx
+			.builder
 			.strings
-			.resolve(self.cx.defs.traits[usize::from(trait_index)].name.inner)
+			.resolve(
+				self.sema.decls.traits[usize::from(trait_index)].name.inner,
+			)
 			.unwrap()
 			.to_string();
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TraitBoundViolation.code())
 				.with_message(format!(
@@ -378,9 +391,9 @@ impl BodyContext<'_, '_, '_, '_> {
 			}
 		}
 		if let Some(first) = product {
-			let text = self.cx.strings.resolve(name.inner).unwrap();
+			let text = self.builder.strings.resolve(name.inner).unwrap();
 			let first_span = self.body.local(first).name.span;
-			self.cx.diagnostics.push(
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::DuplicatePatternBinding.code())
 					.with_message(format!(
@@ -399,8 +412,9 @@ impl BodyContext<'_, '_, '_, '_> {
 				// same way, and have the same type, in both.
 				let bound = *self.body.local(local);
 				if bound.mut_span.is_some() != mut_span.is_some() {
-					let text = self.cx.strings.resolve(name.inner).unwrap();
-					self.cx.diagnostics.push(
+					let text =
+						self.builder.strings.resolve(name.inner).unwrap();
+					self.sema.diagnostics.push(
 						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::InconsistentPatternBinding
@@ -423,14 +437,14 @@ impl BodyContext<'_, '_, '_, '_> {
 							),
 					);
 				}
-				if self.cx.types.meet(bound.ty, expected).is_none() {
+				if self.sema.types.meet(bound.ty, expected).is_none() {
 					let diagnostic = self.binding_mismatch(
 						bound.ty,
 						expected,
 						span,
 						bound.name.span,
 					);
-					self.cx.diagnostics.push(diagnostic);
+					self.sema.diagnostics.push(diagnostic);
 				}
 				local
 			}
@@ -503,7 +517,7 @@ impl BodyContext<'_, '_, '_, '_> {
 			if !missing {
 				continue;
 			}
-			let text = self.cx.strings.resolve(name).unwrap();
+			let text = self.builder.strings.resolve(name).unwrap();
 			let bound_span = self.body.local(local).name.span;
 			let mut diagnostic = Diagnostic::error()
 				.with_code(DiagnosticCode::NotBoundInAllAlternatives.code())
@@ -528,7 +542,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					);
 				}
 			}
-			self.cx.diagnostics.push(diagnostic);
+			self.sema.diagnostics.push(diagnostic);
 		}
 	}
 
@@ -540,7 +554,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 		first: TextSpan,
 	) -> Diagnostic<FileId> {
-		let formatter = self.cx.type_formatter();
+		let formatter = self.sema.type_formatter(self.builder.strings);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMistmatch.code())
 			.with_message("type mismatch")
@@ -657,8 +671,8 @@ impl BodyContext<'_, '_, '_, '_> {
 		expected: TypeIndex,
 		context: &mut PatternContext,
 	) -> PatIdx {
-		let types = match *self.cx.types.resolve(expected) {
-			Type::Tuple { elements } => self.cx.types.list(elements).to_vec(),
+		let types = match *self.sema.types.resolve(expected) {
+			Type::Tuple { elements } => self.sema.types.list(elements).to_vec(),
 			_ => {
 				if expected != TypeIndex::ERROR {
 					self.report_pattern_mismatch(expected, "a tuple", span);
@@ -694,7 +708,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				if let ast::PatternElement::Pattern(pattern) =
 					&element.inner.inner =>
 			{
-				let ty = self.cx.types.intern_tuple(types);
+				let ty = self.sema.types.intern_tuple(types);
 				Some(self.check_one_pattern(
 					pattern,
 					element.inner.span,
@@ -703,7 +717,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				))
 			}
 			(&[field], _)
-				if let Type::Tuple { .. } = self.cx.types.resolve(field) =>
+				if let Type::Tuple { .. } = self.sema.types.resolve(field) =>
 			{
 				Some(self.check_tuple(elements, span, field, context))
 			}
@@ -731,7 +745,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		if let [child] = *children {
 			return child;
 		}
-		let ty = self.cx.types.intern_tuple(types);
+		let ty = self.sema.types.intern_tuple(types);
 		let children = self.body.push_patterns(children);
 		self.body
 			.push_pattern(PatternKind::Tuple(children), ty, span)
@@ -822,10 +836,10 @@ impl BodyContext<'_, '_, '_, '_> {
 		span: TextSpan,
 		context: &mut PatternContext,
 	) -> Option<Vec<PatIdx>> {
-		let def = &self.cx.defs.structs[usize::from(struct_index)];
-		if !def.is_fully_named() {
-			let name = self.cx.strings.resolve(def.name.inner).unwrap();
-			self.cx.diagnostics.push(
+		let decl = &self.sema.decls.structs[usize::from(struct_index)];
+		if !decl.is_fully_named() {
+			let name = self.builder.strings.resolve(decl.name.inner).unwrap();
+			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TupleStructBracePattern.code())
 					.with_message(format!(
@@ -858,12 +872,13 @@ impl BodyContext<'_, '_, '_, '_> {
 				ast::PatternFieldItem::Field(field) => field,
 			};
 			let name = field.name;
-			let def = &self.cx.defs.structs[usize::from(struct_index)];
-			let Some(index) = def.lookup.get(&name.inner).copied() else {
+			let decl = &self.sema.decls.structs[usize::from(struct_index)];
+			let Some(index) = decl.lookup.get(&name.inner).copied() else {
 				let struct_name =
-					self.cx.strings.resolve(def.name.inner).unwrap();
-				let field_name = self.cx.strings.resolve(name.inner).unwrap();
-				self.cx.diagnostics.push(
+					self.builder.strings.resolve(decl.name.inner).unwrap();
+				let field_name =
+					self.builder.strings.resolve(name.inner).unwrap();
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::UnknownStructField.code())
 						.with_message(format!(
@@ -878,7 +893,7 @@ impl BodyContext<'_, '_, '_, '_> {
 				self.check_field(field, TypeIndex::ERROR, context);
 				continue;
 			};
-			self.cx.resolutions.record_selection(
+			self.sema.resolutions.record_selection(
 				(SourceSpan::new(self.scope.file_id, name.span), Tier::Value),
 				Selection::Field {
 					owner: struct_index,
@@ -887,8 +902,9 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 			let at = usize::from(index);
 			if let Some((_, first)) = given[at] {
-				let field_name = self.cx.strings.resolve(name.inner).unwrap();
-				self.cx.diagnostics.push(
+				let field_name =
+					self.builder.strings.resolve(name.inner).unwrap();
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::DuplicateStructFieldInit.code(),
@@ -912,20 +928,20 @@ impl BodyContext<'_, '_, '_, '_> {
 			given[at] = Some((child, name.span));
 		}
 		if rest.is_none() {
-			let def = &self.cx.defs.structs[usize::from(struct_index)];
+			let decl = &self.sema.decls.structs[usize::from(struct_index)];
 			let missing: Vec<String> = given
 				.iter()
 				.enumerate()
 				.filter(|(_, given)| given.is_none())
 				.map(|(at, _)| {
-					let name = def.field_names[at].unwrap().inner;
-					format!("`{}`", self.cx.strings.resolve(name).unwrap())
+					let name = decl.field_names[at].unwrap().inner;
+					format!("`{}`", self.builder.strings.resolve(name).unwrap())
 				})
 				.collect();
 			if !missing.is_empty() {
 				let struct_name =
-					self.cx.strings.resolve(def.name.inner).unwrap();
-				self.cx.diagnostics.push(
+					self.builder.strings.resolve(decl.name.inner).unwrap();
+				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::MissingStructFields.code())
 						.with_message(format!(
@@ -995,7 +1011,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					None,
 					segment,
 				);
-				self.cx.diagnostics.push(diagnostic);
+				self.sema.diagnostics.push(diagnostic);
 			}
 			(struct_index, type_args)
 		} else {
@@ -1007,9 +1023,9 @@ impl BodyContext<'_, '_, '_, '_> {
 				}
 				Err(_) => return None,
 			};
-			let key = walk.target.def_key()?;
-			let kind = key.symbol_kind(self.cx.defs);
-			let DefKind::Struct(struct_index) = kind else {
+			let key = walk.target.decl_key()?;
+			let kind = key.symbol_kind(&self.sema.decls);
+			let DeclKind::Struct(struct_index) = kind else {
 				self.report_not_a_struct(&format!("a {}", kind.noun()), span);
 				return None;
 			};
@@ -1019,10 +1035,11 @@ impl BodyContext<'_, '_, '_, '_> {
 					Some(key),
 					segment,
 				);
-				self.cx.diagnostics.push(diagnostic);
+				self.sema.diagnostics.push(diagnostic);
 			}
-			let params = self.cx.structs[usize::from(struct_index)].type_params;
-			let count = self.cx.generic_envs.param_names(params).len();
+			let params =
+				self.sema.structs[usize::from(struct_index)].type_params;
+			let count = self.sema.generic_envs.param_names(params).len();
 			let mut written = vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.write_type_args(
 				segment,
@@ -1032,29 +1049,33 @@ impl BodyContext<'_, '_, '_, '_> {
 			);
 			(struct_index, written)
 		};
-		let named = self.cx.types.intern_struct(struct_index, &written);
+		let named = self.sema.types.intern_struct(struct_index, &written);
 		let ty = if expected == TypeIndex::ERROR {
 			TypeIndex::ERROR
 		} else {
-			match self.cx.types.meet(expected, named) {
+			match self.sema.types.meet(expected, named) {
 				Some(ty) => ty,
 				None => {
-					let diagnostic = self.mismatch_at(expected, named, span);
-					self.cx.diagnostics.push(diagnostic);
+					let diagnostic =
+						self.context().mismatch_at(expected, named, span);
+					self.sema.diagnostics.push(diagnostic);
 					return None;
 				}
 			}
 		};
-		let type_args: Vec<TypeIndex> = match *self.cx.types.resolve(ty) {
+		let type_args: Vec<TypeIndex> = match *self.sema.types.resolve(ty) {
 			Type::Struct { type_args, .. } => {
-				self.cx.types.list(type_args).to_vec()
+				self.sema.types.list(type_args).to_vec()
 			}
 			_ => vec![TypeIndex::ERROR; written.len()],
 		};
-		let count =
-			self.cx.structs[usize::from(struct_index)].field_types.len();
+		let count = self.sema.structs[usize::from(struct_index)]
+			.field_types
+			.len();
 		let types = (0..count)
-			.map(|field| self.field_type(struct_index, &type_args, field))
+			.map(|field| {
+				self.context().field_type(struct_index, &type_args, field)
+			})
 			.collect();
 		Some((struct_index, ty, types))
 	}
@@ -1084,7 +1105,7 @@ impl BodyContext<'_, '_, '_, '_> {
 					return self.error_pattern(span);
 				}
 				let source =
-					&self.cx.files.get(self.scope.file_id).unwrap().source;
+					&self.builder.files.get(self.scope.file_id).unwrap().source;
 				match parse_char_literal(span.extract_str(source)) {
 					Ok(value) => match integer {
 						None => self.body.push_pattern(
@@ -1103,12 +1124,13 @@ impl BodyContext<'_, '_, '_, '_> {
 							)
 						}
 						Some(_) => {
-							let diagnostic = self.cx.report_out_of_range(
+							let diagnostic = self.sema.report_out_of_range(
+								self.builder.strings,
 								format_args!("literal {value:?}"),
 								expected,
 								SourceSpan::new(self.scope.file_id, span),
 							);
-							self.cx.diagnostics.push(diagnostic);
+							self.sema.diagnostics.push(diagnostic);
 							self.error_pattern(span)
 						}
 					},
@@ -1122,7 +1144,7 @@ impl BodyContext<'_, '_, '_, '_> {
 								 codepoint"
 							}
 						};
-						self.cx.diagnostics.push(
+						self.sema.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
 									DiagnosticCode::InvalidCharacterLiteral
@@ -1179,12 +1201,13 @@ impl BodyContext<'_, '_, '_, '_> {
 			i128::from(magnitude)
 		};
 		if !integer.contains(value) {
-			let diagnostic = self.cx.report_out_of_range(
+			let diagnostic = self.sema.report_out_of_range(
+				self.builder.strings,
 				format_args!("literal `{value}`"),
 				expected,
 				SourceSpan::new(self.scope.file_id, span),
 			);
-			self.cx.diagnostics.push(diagnostic);
+			self.sema.diagnostics.push(diagnostic);
 			return self.error_pattern(span);
 		}
 		let bits = if negated {
@@ -1209,30 +1232,30 @@ impl BodyContext<'_, '_, '_, '_> {
 	) -> PatIdx {
 		let found = match self.resolve_value_path(segments, span) {
 			Ok(ValuePath::Item(walk)) => {
-				let Some(key) = walk.target.def_key() else {
+				let Some(key) = walk.target.decl_key() else {
 					self.note_local_not_constant(segments);
 					return self.error_pattern(span);
 				};
-				let kind = key.symbol_kind(self.cx.defs);
+				let kind = key.symbol_kind(&self.sema.decls);
 				if let BindingTarget::Inaccessible(_) = walk.target {
 					let segment = &segments[walk.stopped_at as usize];
-					self.cx.diagnostics.push(report_private_identifier(
-						&self.cx.defs.namespaces,
-						self.cx.strings,
+					self.sema.diagnostics.push(report_private_identifier(
+						&self.sema.decls.namespaces,
+						self.builder.strings,
 						segment.ident.inner,
 						SourceSpan::new(self.scope.file_id, segment.ident.span),
 						Some(key),
 					));
 				}
 				match kind {
-					DefKind::Const(constant)
-					| DefKind::EnumVariant(constant) => {
+					DeclKind::Const(constant)
+					| DeclKind::EnumVariant(constant) => {
 						let signature =
-							&self.cx.constants[usize::from(constant)];
-						let ty = self.normalized(
-							signature.ty,
-							self.cx.assumption_envs.of_frame(signature.env),
-						);
+							&self.sema.constants[usize::from(constant)];
+						let ty = signature.ty;
+						let env =
+							self.sema.assumption_envs.of_frame(signature.env);
+						let ty = self.context().normalized_in(ty, env);
 						let kind = PatternKind::Constant {
 							constant,
 							type_args: GenericArgs::EMPTY,
@@ -1240,7 +1263,7 @@ impl BodyContext<'_, '_, '_, '_> {
 						Some((kind, ty))
 					}
 					_ => {
-						self.cx.diagnostics.push(
+						self.sema.diagnostics.push(
 							Diagnostic::error()
 								.with_code(
 									DiagnosticCode::InvalidMatchPattern.code(),
@@ -1248,7 +1271,7 @@ impl BodyContext<'_, '_, '_, '_> {
 								.with_message(format!(
 									"expected a constant, found {} `{}`",
 									kind.noun(),
-									self.cx
+									self.builder
 										.strings
 										.resolve(
 											segments
@@ -1309,8 +1332,8 @@ impl BodyContext<'_, '_, '_, '_> {
 			return self.error_pattern(span);
 		}
 		if ty != TypeIndex::ERROR && ty != expected {
-			let diagnostic = self.mismatch_at(expected, ty, span);
-			self.cx.diagnostics.push(diagnostic);
+			let diagnostic = self.context().mismatch_at(expected, ty, span);
+			self.sema.diagnostics.push(diagnostic);
 			return self.error_pattern(span);
 		}
 		self.body.push_pattern(kind, expected, span)
@@ -1323,13 +1346,13 @@ impl BodyContext<'_, '_, '_, '_> {
 		if self.lookup_local(segment.ident.inner).is_none() {
 			return;
 		}
-		let name = self.cx.strings.resolve(segment.ident.inner).unwrap();
+		let name = self.builder.strings.resolve(segment.ident.inner).unwrap();
 		let note = format!(
 			"`{name}` is a local; a pattern compares with constants, and \
 			 `{name}` would bind a new one"
 		);
 		let site = std::ops::Range::from(segment.ident.span);
-		if let Some(report) = self.cx.diagnostics.last_mut()
+		if let Some(report) = self.sema.diagnostics.last_mut()
 			&& report.labels.iter().any(|label| {
 				label.file_id == self.scope.file_id && label.range == site
 			}) {
@@ -1371,7 +1394,7 @@ impl BodyContext<'_, '_, '_, '_> {
 		kind: &str,
 		note: &str,
 	) {
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::UnmatchableLiteral.code())
 				.with_message(format!("{kind} cannot be matched"))
@@ -1386,8 +1409,11 @@ impl BodyContext<'_, '_, '_, '_> {
 		found: &str,
 		span: TextSpan,
 	) {
-		let expected = self.cx.type_formatter().display_type(expected);
-		self.cx.diagnostics.push(
+		let expected = self
+			.sema
+			.type_formatter(self.builder.strings)
+			.display_type(expected);
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TypeMistmatch.code())
 				.with_message("type mismatch")
@@ -1400,7 +1426,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	fn report_not_a_struct(&mut self, found: &str, span: TextSpan) {
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::InvalidMatchPattern.code())
 				.with_message(format!("expected a struct, found {found}"))
@@ -1409,7 +1435,7 @@ impl BodyContext<'_, '_, '_, '_> {
 	}
 
 	fn report_duplicate_rest(&mut self, span: TextSpan, first: TextSpan) {
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::DuplicateRestPattern.code())
 				.with_message("`..` can only be used once per pattern")
@@ -1432,14 +1458,15 @@ impl BodyContext<'_, '_, '_, '_> {
 		let plural = |n: usize| if n == 1 { "" } else { "s" };
 		let (noun, owner) = match struct_index {
 			Some(struct_index) => {
-				let name = self.cx.defs.structs[usize::from(struct_index)].name;
-				let name = self.cx.strings.resolve(name.inner).unwrap();
+				let name =
+					self.sema.decls.structs[usize::from(struct_index)].name;
+				let name = self.builder.strings.resolve(name.inner).unwrap();
 				("field", format!("struct `{name}`"))
 			}
 			None => ("element", "the tuple".to_string()),
 		};
 		let at_least = if rest { "at least " } else { "" };
-		self.cx.diagnostics.push(
+		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::ArgumentCountMismatch.code())
 				.with_message(format!(

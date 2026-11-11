@@ -325,11 +325,12 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let (diagnostics, mir) = tir::build(&compilation, &mut strings);
-	emit_diagnostics(&compilation, &diagnostics, format.clone());
-	abort_if_errors(diagnostics.error_count());
+	let mut sema = tir::check(&compilation, &mut strings);
+	let lowered = tir::lower(&mut sema, &strings);
+	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
+	abort_if_errors(sema.diagnostics().error_count());
 	let mut mir =
-		mir.expect("lowering without an error diagnostic produces MIR");
+		lowered.expect("lowering without an error diagnostic produces MIR");
 
 	let Ok(module) =
 		backend::emit(&mut mir, &strings, Some(mir::inline::Policy::DEFAULT))
@@ -379,9 +380,9 @@ fn cmd_check(project_path: &str, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let diagnostics = tir::check(&compilation, &mut strings);
-	emit_diagnostics(&compilation, &diagnostics, format.clone());
-	abort_if_errors(diagnostics.error_count());
+	let sema = tir::check(&compilation, &mut strings);
+	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
+	abort_if_errors(sema.diagnostics().error_count());
 
 	println!("No errors found.");
 }

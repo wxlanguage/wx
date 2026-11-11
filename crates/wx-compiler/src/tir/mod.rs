@@ -4,7 +4,7 @@
 // use codespan_reporting::diagnostic::{Diagnostic, Label};
 // use string_interner::symbol::SymbolU32;
 
-// use crate::ast::{self, DefId, Separated, Spanned};
+// use crate::ast::{self, DeclId, Separated, Spanned};
 // use crate::diagnostics::{SourceSpan, TextSpan};
 // use crate::vfs::{self, CompilationUnit, FileId, Package, PackageId};
 
@@ -15,7 +15,7 @@
 mod body;
 mod bounds;
 mod conformance;
-mod defs;
+mod decls;
 mod eval;
 mod format;
 mod impls;
@@ -36,26 +36,25 @@ mod typecheck;
 mod types;
 mod usefulness;
 
-use codespan_reporting::diagnostic::Diagnostic;
-
 use crate::diagnostics::Diagnostics;
 use crate::mir::MIR;
 use crate::symbols::StringInterner;
-use crate::vfs::{CompilationUnit, FileId};
+use crate::vfs::CompilationUnit;
 
-use self::defs::DefinitionRegistry;
+use self::decls::Declarations;
 use self::impls::ImplDispatch;
 use self::resolutions::NameResolutions;
-use self::signatures::TypeContext;
-use self::solver::Solver;
+pub use self::signatures::Semantics;
+use self::signatures::SemanticsBuilder;
 
-/// Checks declarations and bodies and returns their diagnostics.
-/// Parser and package diagnostics remain available on `compilation`.
-/// `strings` must be the interner used to load the compilation.
+/// Checks declarations and bodies into a live [`Semantics`], which holds
+/// their diagnostics. Parser and package diagnostics remain available on
+/// `compilation`. `strings` must be the interner used to load the
+/// compilation.
 pub fn check(
 	compilation: &CompilationUnit,
 	strings: &mut StringInterner,
-) -> Vec<Diagnostic<FileId>> {
+) -> Semantics {
 	let CompilationUnit {
 		files,
 		packages,
@@ -64,7 +63,7 @@ pub fn check(
 	} = compilation;
 	let mut diagnostics = Vec::new();
 	let mut resolutions = NameResolutions::default();
-	let (defs, ast_nodes) = DefinitionRegistry::build(
+	let (decls, ast_nodes) = Declarations::build(
 		packages,
 		files,
 		strings,
@@ -77,80 +76,26 @@ pub fn check(
 		&mut diagnostics,
 		&mut resolutions,
 		strings,
-		&defs,
+		&decls,
 		&ast_nodes,
 	);
-	let mut solver = Solver::new(defs.constants.len());
-	let mut context = TypeContext::new(
-		&mut diagnostics,
-		&mut resolutions,
-		strings,
-		&mut solver,
-		files,
-		&defs,
-		&ast_nodes,
-		&impl_dispatch,
-	);
-	context.sweep();
-	drop(context);
-	diagnostics
+	let mut sema =
+		Semantics::new(decls, impl_dispatch, diagnostics, resolutions, strings);
+	SemanticsBuilder::new(files, strings, &ast_nodes).build(&mut sema);
+	sema
 }
 
-/// Checks and then lowers the same live context into [`MIR`].
-///
-/// This repeats [`check`]'s setup, keeps the [`TypeContext`] alive instead of
-/// dropping it, and hands it to the lowering entry point. The diagnostics are returned
-/// either way, so a successful build still reports its warnings; on any error
-/// or bug diagnostic from checking, or on a lowering failure, no MIR is
-/// produced.
-/// `strings` must be the interner used to load the compilation.
-pub fn build(
-	compilation: &CompilationUnit,
-	strings: &mut StringInterner,
-) -> (Vec<Diagnostic<FileId>>, Option<MIR>) {
-	let CompilationUnit {
-		files,
-		packages,
-		stdlib_package,
-		root_package,
-	} = compilation;
-	let mut diagnostics = Vec::new();
-	let mut resolutions = NameResolutions::default();
-	let (defs, ast_nodes) = DefinitionRegistry::build(
-		packages,
-		files,
-		strings,
-		&mut diagnostics,
-		&mut resolutions,
-		*stdlib_package,
-		*root_package,
-	);
-	let impl_dispatch = ImplDispatch::build(
-		&mut diagnostics,
-		&mut resolutions,
-		strings,
-		&defs,
-		&ast_nodes,
-	);
-	let mut solver = Solver::new(defs.constants.len());
-	let mut context = TypeContext::new(
-		&mut diagnostics,
-		&mut resolutions,
-		strings,
-		&mut solver,
-		files,
-		&defs,
-		&ast_nodes,
-		&impl_dispatch,
-	);
-	context.sweep();
-	if context.diagnostics.has_errors() {
-		drop(context);
-		return (diagnostics, None);
+/// Lowers a checked program into [`MIR`]. A program whose checking reported
+/// an error or a bug is not lowered; a lowering failure is reported on
+/// `sema`. `strings` must be the interner `sema` was checked with.
+pub fn lower(
+	sema: &mut Semantics,
+	strings: &StringInterner,
+) -> Result<MIR, ()> {
+	if sema.diagnostics.has_errors() {
+		return Err(());
 	}
-	let lowered = lower::build(&mut context);
-	drop(context);
-	(diagnostics, lowered.ok())
+	lower::build(sema, strings)
 }
 
 // use crate::index::index_newtype;
@@ -196,9 +141,9 @@ pub fn build(
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 // pub enum TypeParamOwner {
-// 	Function(DefId),
-// 	Struct(DefId),
-// 	TypeAlias(DefId),
+// 	Function(DeclId),
+// 	Struct(DeclId),
+// 	TypeAlias(DeclId),
 // 	Trait(TraitIndex),
 // 	InherentImpl(InherentImplIndex),
 // 	TraitImpl(TraitImplIndex),
@@ -279,7 +224,7 @@ pub fn build(
 // 	///   - generic function, not yet instantiated → empty
 // 	///   - generic function, instantiated → one entry per type param
 // 	FunctionItem {
-// 		id: DefId,
+// 		id: DeclId,
 // 		type_args: Box<[TypeIndex]>,
 // 	},
 // 	Pointer {
@@ -302,7 +247,7 @@ pub fn build(
 // 		enum_index: EnumIndex,
 // 	},
 // 	Memory {
-// 		id: DefId,
+// 		id: DeclId,
 // 		/// `TypeIndex::U32` or `TypeIndex::U64` — the memory's index type.
 // 		size: TypeIndex,
 // 	},
@@ -499,7 +444,7 @@ pub fn build(
 
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Constant {
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	/// `Some` for associated consts (`impl Target { const FOO }` / trait
@@ -517,7 +462,7 @@ pub fn build(
 
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Trait {
-// 	pub id: ast::DefId,
+// 	pub id: ast::DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	pub pub_span: Option<TextSpan>,
@@ -678,7 +623,7 @@ pub fn build(
 // /// `typeset Integer { u8, i8, u16, i16, u32, i32, u64, i64 }`
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct TypeSet {
-// 	pub id: ast::DefId,
+// 	pub id: ast::DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	pub name: ast::Spanned<SymbolU32>,
@@ -838,13 +783,13 @@ pub fn build(
 // 		value: bool,
 // 	},
 // 	Global {
-// 		id: DefId,
+// 		id: DeclId,
 // 	},
 // 	Function {
-// 		id: DefId,
+// 		id: DeclId,
 // 	},
 // 	Memory {
-// 		id: DefId,
+// 		id: DeclId,
 // 	},
 // 	LocalDeclaration {
 // 		name: ast::Spanned<SymbolU32>,
@@ -897,19 +842,19 @@ pub fn build(
 // 	/// `type_args[i]` = concrete type substituted for `TypeParam { param_index:
 // 	/// i }`.
 // 	GenericCall {
-// 		id: DefId,
+// 		id: DeclId,
 // 		type_args: Box<[TypeIndex]>,
 // 		arguments: Box<[Expression]>,
 // 	},
 // 	/// `type_args[0]` = Self (receiver), `type_args[1..]` = explicit generics.
 // 	GenericMethodCall {
-// 		id: DefId,
+// 		id: DeclId,
 // 		type_args: Box<[TypeIndex]>,
 // 		arguments: Box<[Expression]>,
 // 	},
 // 	MethodCall {
 // 		arguments: Box<[Expression]>,
-// 		id: ast::DefId,
+// 		id: ast::DeclId,
 // 	},
 // 	Block {
 // 		scope_index: ScopeIndex,
@@ -951,10 +896,10 @@ pub fn build(
 // 	/// "accessed via `::`" wrapper.
 // 	AbstractConstAccess {
 // 		receiver: TypeIndex,
-// 		id: DefId,
+// 		id: DeclId,
 // 	},
 // 	Const {
-// 		id: ast::DefId,
+// 		id: ast::DeclId,
 // 	},
 // 	String {
 // 		symbol: SymbolU32,
@@ -1054,7 +999,7 @@ pub fn build(
 // 	CompoundAssign {
 // 		target: Box<Expression>,
 // 		rhs: Box<Expression>,
-// 		method_id: ast::DefId,
+// 		method_id: ast::DeclId,
 // 	},
 // 	/// The `CompoundAssign` counterpart for when `target`'s type isn't
 // 	/// concrete yet at TIR-build time (a bare `TypeParam` or a
@@ -1071,7 +1016,7 @@ pub fn build(
 // 	GenericCompoundAssign {
 // 		target: Box<Expression>,
 // 		rhs: Box<Expression>,
-// 		abstract_method_id: ast::DefId,
+// 		abstract_method_id: ast::DeclId,
 // 		self_type: TypeIndex,
 // 	},
 // 	/// The `Load{place}`-targeted analogue of `CompoundAssign`, named to
@@ -1083,14 +1028,14 @@ pub fn build(
 // 	CompoundStore {
 // 		target: Box<Place>,
 // 		rhs: Box<Expression>,
-// 		method_id: ast::DefId,
+// 		method_id: ast::DeclId,
 // 	},
 // 	/// The `Load{place}`-targeted analogue of `GenericCompoundAssign` — see
 // 	/// both `CompoundStore` and `GenericCompoundAssign`'s doc comments.
 // 	GenericCompoundStore {
 // 		target: Box<Place>,
 // 		rhs: Box<Expression>,
-// 		abstract_method_id: ast::DefId,
+// 		abstract_method_id: ast::DeclId,
 // 		self_type: TypeIndex,
 // 	},
 // }
@@ -1299,11 +1244,11 @@ pub fn build(
 // }
 
 // /// One named leaf of a `use` tree — `sin` in `use math::trig::{sin, cos};`.
-// /// One per leaf, so it is 1:1 with a `DefId`. Globs have no entry here:
+// /// One per leaf, so it is 1:1 with a `DeclId`. Globs have no entry here:
 // /// they register a [`WildcardImport`] at prescan and bind no name.
 // ///
 // /// This exists so that a `use` leaf is an *item* like any other.
-// /// `SymbolKind::Pending(def_id)` universally means "a stub for `def_id` is
+// /// `SymbolKind::Pending(decl_id)` universally means "a stub for `decl_id` is
 // /// already materialized, reachable through `item_lookup`" — that invariant
 // /// is what lets `get_symbol_location` produce a declaration span for a name
 // /// whose signature hasn't been computed yet. A leaf that bound a name
@@ -1313,7 +1258,7 @@ pub fn build(
 // #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct UseItem {
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	/// The namespace the `use` was written in — where `local_name` binds.
 // 	pub namespace: NamespaceIndex,
@@ -1406,24 +1351,24 @@ pub fn build(
 // 	Function {
 // 		internal_name: Spanned<SymbolU32>,
 // 		external_name: Option<Spanned<SymbolU32>>,
-// 		id: DefId,
+// 		id: DeclId,
 // 	},
 // 	Global {
 // 		internal_name: Spanned<SymbolU32>,
 // 		external_name: Option<Spanned<SymbolU32>>,
-// 		id: DefId,
+// 		id: DeclId,
 // 	},
 // 	Memory {
 // 		internal_name: Spanned<SymbolU32>,
 // 		external_name: Option<Spanned<SymbolU32>>,
-// 		id: DefId,
+// 		id: DeclId,
 // 	},
 // }
 
 // #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Enum {
-// 	pub id: ast::DefId,
+// 	pub id: ast::DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	pub pub_span: Option<TextSpan>,
@@ -1502,7 +1447,7 @@ pub fn build(
 // /// One entry in a [`ModuleNamespace`]'s symbol table — either a claim
 // /// registered at pre-scan with nothing resolved yet, or a settled binding.
 // ///
-// /// Split out of `SymbolKind` itself (which used to carry a `Pending(DefId)`
+// /// Split out of `SymbolKind` itself (which used to carry a `Pending(DeclId)`
 // /// variant of its own) so a still-unresolved claim simply has no
 // /// `visibility` to read: the underlying item's own `pub_span` (or a `use`
 // /// leaf's) isn't known until `ensure_signature` runs, so instead of
@@ -1531,7 +1476,7 @@ pub fn build(
 // 		scope_index: ScopeIndex,
 // 		local_index: LocalIndex,
 // 	},
-// 	Global(DefKind),
+// 	Global(DeclKind),
 // }
 
 // /// The kind of item found when resolving a member within a type namespace.
@@ -1562,15 +1507,15 @@ pub fn build(
 // #[derive(Clone, Copy)]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum ImportValue {
-// 	Function { id: DefId },
-// 	Global { id: DefId },
-// 	Memory { id: DefId },
+// 	Function { id: DeclId },
+// 	Global { id: DeclId },
+// 	Memory { id: DeclId },
 // }
 
 // #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Memory {
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	pub name: ast::Spanned<SymbolU32>,
 // 	pub size: Spanned<TypeIndex>,
@@ -1590,13 +1535,13 @@ pub fn build(
 // #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub enum TraitMemberKind {
-// 	Function(DefId),
-// 	Constant(DefId),
-// 	AssociatedType(DefId),
+// 	Function(DeclId),
+// 	Constant(DeclId),
+// 	AssociatedType(DeclId),
 // }
 
 // impl TraitMemberKind {
-// 	pub fn id(self) -> DefId {
+// 	pub fn id(self) -> DeclId {
 // 		match self {
 // 			Self::Function(id) => id,
 // 			Self::Constant(id) => id,
@@ -1659,7 +1604,7 @@ pub fn build(
 // #[derive(Clone)]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct AssociatedType {
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	/// The scope it was declared in. Kept alongside `file_id` so trait
 // 	/// conformance checking, which walks impls rather than source, can
@@ -1719,8 +1664,8 @@ pub fn build(
 // /// shape, so a concrete and a generic inherent impl can be compared/detected
 // /// as conflicting on equal footing instead of living in separate registries.
 // pub struct InherentImpl {
-// 	/// Synthetic `DefId` used to demand-drive this block's `ensure_signature`.
-// 	pub id: ast::DefId,
+// 	/// Synthetic `DeclId` used to demand-drive this block's `ensure_signature`.
+// 	pub id: ast::DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	pub type_params: Box<[TypeParamDef]>,
@@ -1762,9 +1707,9 @@ pub fn build(
 // 	Char,
 // 	Slice,
 // 	Array,
-// 	Struct(DefId),
-// 	Enum(DefId),
-// 	Memory(DefId),
+// 	Struct(DeclId),
+// 	Enum(DeclId),
+// 	Memory(DeclId),
 // }
 
 // impl ImplTarget {
@@ -1902,7 +1847,7 @@ pub fn build(
 // 	/// Whether the first parameter is the receiver named `self`.
 // 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 // 	pub is_method: bool,
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	/// `Some` for methods/associated functions (impl or trait members) —
@@ -1942,7 +1887,7 @@ pub fn build(
 
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Global {
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	pub accesses: Vec<SourceSpan>,
@@ -2041,7 +1986,7 @@ pub fn build(
 // #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct Struct {
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	pub pub_span: Option<TextSpan>,
@@ -2075,7 +2020,7 @@ pub fn build(
 // #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 // #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 // pub struct TypeAlias {
-// 	pub id: DefId,
+// 	pub id: DeclId,
 // 	pub file_id: FileId,
 // 	pub namespace: NamespaceIndex,
 // 	pub pub_span: Option<TextSpan>,
@@ -2107,7 +2052,7 @@ pub fn build(
 // pub struct TypeFormatter<'a> {
 // 	types: &'a TypeInterner,
 // 	items: &'a ItemRegistry,
-// 	defs: &'a DefinitionRegistry,
+// 	defs: &'a Declarations,
 // 	pub interner: &'a ast::StringInterner,
 // 	/// Needed to name a package, which has no name of its own — see
 // 	/// [`TIR::namespace_name`].
@@ -2120,7 +2065,7 @@ pub fn build(
 // 	pub fn new(
 // 		types: &'a TypeInterner,
 // 		items: &'a ItemRegistry,
-// 		defs: &'a DefinitionRegistry,
+// 		defs: &'a Declarations,
 // 		interner: &'a ast::StringInterner,
 // 		packages: &'a [Package],
 // 		from: PackageId,
@@ -2173,9 +2118,9 @@ pub fn build(
 // 		&self,
 // 		trait_index: TraitIndex,
 // 	) -> Result<String, std::fmt::Error> {
-// 		let trait_def = &self.items.traits[usize::from(trait_index)];
+// 		let trait_decl = &self.items.traits[usize::from(trait_index)];
 // 		let mut buffer = String::new();
-// 		self.write_bound_list(&mut buffer, trait_def.supertraits(trait_index))?;
+// 		self.write_bound_list(&mut buffer, trait_decl.supertraits(trait_index))?;
 // 		Ok(buffer)
 // 	}
 
@@ -2343,9 +2288,9 @@ pub fn build(
 // 			}
 // 			Type::TypeParam { owner, param_index } => {
 // 				let name = match owner {
-// 					TypeParamOwner::Function(def_id) => {
+// 					TypeParamOwner::Function(decl_id) => {
 // 						let func = &self.items.functions[usize::from(
-// 							self.items.expect_function_index(*def_id),
+// 							self.items.expect_function_index(*decl_id),
 // 						)];
 // 						let own_idx = (*param_index
 // 							- func.inherited_type_param_count)
@@ -2353,9 +2298,9 @@ pub fn build(
 // 						let symbol = func.type_params[own_idx].name.inner;
 // 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
 // 					}
-// 					TypeParamOwner::Struct(def_id) => {
+// 					TypeParamOwner::Struct(decl_id) => {
 // 						let symbol = self.items.structs[usize::from(
-// 							self.items.expect_struct_index(*def_id),
+// 							self.items.expect_struct_index(*decl_id),
 // 						)]
 // 						.type_params[*param_index as usize]
 // 							.name
@@ -2377,9 +2322,9 @@ pub fn build(
 // 							.inner;
 // 						self.interner.resolve(symbol).ok_or(std::fmt::Error)?
 // 					}
-// 					TypeParamOwner::TypeAlias(def_id) => {
+// 					TypeParamOwner::TypeAlias(decl_id) => {
 // 						let symbol = self.items.type_aliases[usize::from(
-// 							self.items.expect_type_alias_index(*def_id),
+// 							self.items.expect_type_alias_index(*decl_id),
 // 						)]
 // 						.type_params[*param_index as usize]
 // 							.name
@@ -2591,13 +2536,13 @@ pub fn build(
 // 	pub bodies: Vec<Body>,
 // 	pub associated_types: Vec<AssociatedType>,
 // 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
-// 	pub tagged_items: HashMap<SymbolU32, DefId>,
+// 	pub tagged_items: HashMap<SymbolU32, DeclId>,
 // 	pub typesets: Vec<TypeSet>,
 // 	pub type_aliases: Vec<TypeAlias>,
-// 	/// Unified lookup: maps every named item's `DefId` to its kind and dense Vec index.
+// 	/// Unified lookup: maps every named item's `DeclId` to its kind and dense Vec index.
 // 	/// Replaces the previous per-kind hashmaps (`function_index_lookup`, etc.).
 // 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
-// 	pub item_lookup: HashMap<DefId, ItemIndex>,
+// 	pub item_lookup: HashMap<DeclId, ItemIndex>,
 // }
 
 // impl ItemRegistry {
@@ -2815,11 +2760,11 @@ pub fn build(
 // 	pub types: TypeInterner,
 // 	pub diagnostics: Vec<Diagnostic<FileId>>,
 // 	pub items: ItemRegistry,
-// 	pub defs: DefinitionRegistry,
+// 	pub defs: Declarations,
 // 	pub export_block: Option<ExportBlock>,
 // }
 
-// impl DefinitionRegistry {
+// impl Declarations {
 // 	#[inline]
 // 	pub fn namespaces_with_indices(
 // 		&self,
@@ -2879,21 +2824,21 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn function_index(&self, id: ast::DefId) -> Option<FunctionIndex> {
+// 	pub fn function_index(&self, id: ast::DeclId) -> Option<FunctionIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::Function(i) => Some(*i),
 // 			_ => None,
 // 		}
 // 	}
 
-// 	/// Name and defining span of a named item. `None` for a `DefId` that is
+// 	/// Name and defining span of a named item. `None` for a `DeclId` that is
 // 	/// not a registered item, and for a trait impl — the one kind with no
 // 	/// name of its own, `impl Trait for Type` being known by the two names it
 // 	/// joins rather than by one of its own.
 // 	///
 // 	/// Exhaustive over [`ItemIndex`] deliberately: a new item kind must fail
 // 	/// to compile here rather than silently go unnamed at every call site.
-// 	pub fn item_name(&self, id: DefId) -> Option<(SymbolU32, SourceSpan)> {
+// 	pub fn item_name(&self, id: DeclId) -> Option<(SymbolU32, SourceSpan)> {
 // 		let (name, file_id) = match *self.item_lookup.get(&id)? {
 // 			ItemIndex::Function(i) => {
 // 				let item = &self.functions[usize::from(i)];
@@ -2945,7 +2890,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_function_index(&self, id: DefId) -> FunctionIndex {
+// 	pub fn expect_function_index(&self, id: DeclId) -> FunctionIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::Function(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -2958,7 +2903,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn struct_index(&self, id: DefId) -> Option<StructIndex> {
+// 	pub fn struct_index(&self, id: DeclId) -> Option<StructIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::Struct(i) => Some(*i),
 // 			_ => None,
@@ -2966,7 +2911,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_struct_index(&self, id: DefId) -> StructIndex {
+// 	pub fn expect_struct_index(&self, id: DeclId) -> StructIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::Struct(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -2979,7 +2924,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn type_alias_index(&self, id: DefId) -> Option<TypeAliasIndex> {
+// 	pub fn type_alias_index(&self, id: DeclId) -> Option<TypeAliasIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::TypeAlias(i) => Some(*i),
 // 			_ => None,
@@ -2987,7 +2932,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_type_alias_index(&self, id: DefId) -> TypeAliasIndex {
+// 	pub fn expect_type_alias_index(&self, id: DeclId) -> TypeAliasIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::TypeAlias(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -3000,7 +2945,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn const_index(&self, id: DefId) -> Option<ConstIndex> {
+// 	pub fn const_index(&self, id: DeclId) -> Option<ConstIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::Const(i) => Some(*i),
 // 			_ => None,
@@ -3008,7 +2953,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_const_index(&self, id: DefId) -> ConstIndex {
+// 	pub fn expect_const_index(&self, id: DeclId) -> ConstIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::Const(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -3019,7 +2964,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn global_index(&self, id: DefId) -> Option<GlobalIndex> {
+// 	pub fn global_index(&self, id: DeclId) -> Option<GlobalIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::Global(i) => Some(*i),
 // 			_ => None,
@@ -3027,7 +2972,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_global_index(&self, id: DefId) -> GlobalIndex {
+// 	pub fn expect_global_index(&self, id: DeclId) -> GlobalIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::Global(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -3040,7 +2985,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn memory_index(&self, id: DefId) -> Option<MemoryIndex> {
+// 	pub fn memory_index(&self, id: DeclId) -> Option<MemoryIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::Memory(i) => Some(*i),
 // 			_ => None,
@@ -3048,7 +2993,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_memory_index(&self, id: DefId) -> MemoryIndex {
+// 	pub fn expect_memory_index(&self, id: DeclId) -> MemoryIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::Memory(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -3061,7 +3006,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn typeset_index(&self, id: DefId) -> Option<TypesetIndex> {
+// 	pub fn typeset_index(&self, id: DeclId) -> Option<TypesetIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::TypeSet(i) => Some(*i),
 // 			_ => None,
@@ -3069,7 +3014,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_typeset_index(&self, id: DefId) -> TypesetIndex {
+// 	pub fn expect_typeset_index(&self, id: DeclId) -> TypesetIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::TypeSet(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -3082,7 +3027,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn trait_index(&self, id: DefId) -> Option<TraitIndex> {
+// 	pub fn trait_index(&self, id: DeclId) -> Option<TraitIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::Trait(i) => Some(*i),
 // 			_ => None,
@@ -3090,7 +3035,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_trait_index(&self, id: DefId) -> TraitIndex {
+// 	pub fn expect_trait_index(&self, id: DeclId) -> TraitIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::Trait(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -3101,7 +3046,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn trait_impl_index(&self, id: DefId) -> Option<TraitImplIndex> {
+// 	pub fn trait_impl_index(&self, id: DeclId) -> Option<TraitImplIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::TraitImpl(i) => Some(*i),
 // 			_ => None,
@@ -3109,7 +3054,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_trait_impl_index(&self, id: DefId) -> TraitImplIndex {
+// 	pub fn expect_trait_impl_index(&self, id: DeclId) -> TraitImplIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::TraitImpl(i) => i,
 // 			#[cfg(debug_assertions)]
@@ -3122,7 +3067,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn enum_index(&self, id: DefId) -> Option<EnumIndex> {
+// 	pub fn enum_index(&self, id: DeclId) -> Option<EnumIndex> {
 // 		match self.item_lookup.get(&id)? {
 // 			ItemIndex::Enum(i) => Some(*i),
 // 			_ => None,
@@ -3151,7 +3096,7 @@ pub fn build(
 // 	}
 
 // 	#[inline]
-// 	pub fn expect_enum_index(&self, id: DefId) -> EnumIndex {
+// 	pub fn expect_enum_index(&self, id: DeclId) -> EnumIndex {
 // 		match self.item_lookup[&id] {
 // 			ItemIndex::Enum(index) => index,
 // 			#[cfg(debug_assertions)]
@@ -3952,7 +3897,7 @@ pub fn build(
 // 	}
 
 // 	pub fn is_import_namespace(&self, namespace: NamespaceIndex) -> bool {
-// 		self.defs.is_import_namespace(namespace)
+// 		self.decls.is_import_namespace(namespace)
 // 	}
 
 // 	#[inline]

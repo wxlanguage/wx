@@ -3,15 +3,15 @@
 //! complementary arena answering "what does this *written name* currently
 //! mean," rather than "what does this *shape* mean."
 //!
-//! Deliberately independent of `defs`/`signatures`' resolution machinery —
+//! Deliberately independent of `decls`/`signatures`' resolution machinery —
 //! this module only answers identity questions, never "what type does this
 //! path/expression have" or "what scope am I resolving in." It depends on
-//! `defs` for `TraitIdx` (an associated-type projection names the trait
+//! `decls` for `TraitIdx` (an associated-type projection names the trait
 //! that declares it) and `StructIdx`/`EnumIdx`/`FunctionIdx`/`MemoryIdx`/
-//! `GlobalIdx` (all pre-allocated in `defs.rs`'s Phase 1, for the same
+//! `GlobalIdx` (all pre-allocated in `decls.rs`'s Phase 1, for the same
 //! reason as `TraitIdx`) but nothing
-//! here calls into name resolution, and nothing in `defs` depends back on
-//! this module — see `tir/defs.rs`'s own doc comment for why that direction
+//! here calls into name resolution, and nothing in `decls` depends back on
+//! this module — see `tir/decls.rs`'s own doc comment for why that direction
 //! has to stay one-way. `GenericEnvArena` fits the same charter: given a name,
 //! it hands back a `TypeIndex` already sitting in this module, with no
 //! namespace lookup, no diagnostics, and no notion of `signatures.rs`'s
@@ -21,7 +21,7 @@
 //!
 //! A generic-parameter frame's owner (`GenericEnvOwner`) is an enum of registry
 //! indices, so it indexes straight into the right registry array
-//! (`defs.structs`, `defs.functions`, ...) without a lookup.
+//! (`decls.structs`, `decls.functions`, ...) without a lookup.
 
 use std::hash::BuildHasher;
 
@@ -31,13 +31,13 @@ use rustc_hash::FxBuildHasher;
 use crate::ast::Spanned;
 use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
-use crate::tir::defs::{
-	DefinitionRegistry, FunctionIdx, IntrinsicDefs, TypeAliasIdx,
+use crate::tir::decls::{
+	Declarations, FunctionIdx, IntrinsicDefs, TypeAliasIdx,
 };
 use crate::vfs::FileId;
 use string_interner::symbol::SymbolU32;
 
-use super::defs::{
+use super::decls::{
 	AssocTypeIdx, ConstIdx, EnumIdx, GlobalIdx, InherentImplIdx, MemoryIdx,
 	StructIdx, TraitIdx, TraitImplIdx,
 };
@@ -385,15 +385,15 @@ pub enum Type {
 	/// Every `memory` declaration is its own nominal type constructor. Its
 	/// `Size` — and anything else `Memory`'s synthetic impl carries — is
 	/// never duplicated here; query it through that impl instead (see
-	/// `MemoryDef::size_assoc_type_index`), the same way a struct's own
-	/// field types live on `StructDef`/`StructSignature`, not on
+	/// `MemoryDecl::size_assoc_type_index`), the same way a struct's own
+	/// field types live on `StructDecl`/`StructSignature`, not on
 	/// `Type::Struct` itself.
 	Memory {
 		memory_index: MemoryIdx,
 	},
 	/// Every `global` declaration is its own nominal type constructor, same
 	/// reasoning as `Memory` above — `Value` lives on the synthetic impl
-	/// (`GlobalDef::value_assoc_type_index`), not here.
+	/// (`GlobalDecl::value_assoc_type_index`), not here.
 	Global {
 		global_index: GlobalIdx,
 	},
@@ -1564,8 +1564,8 @@ pub(super) struct Substitution<'a> {
 }
 
 /// A generic reference site's target, identified the same way dispatch and
-/// every other `defs.rs`-facing lookup is — by index into its own registry
-/// array — so `name`/`file_id` can reach straight into `defs.structs[..]`. Constants and enums are also represented for
+/// every other `decls.rs`-facing lookup is — by index into its own registry
+/// array — so `name`/`file_id` can reach straight into `decls.structs[..]`. Constants and enums are also represented for
 /// diagnostics, even though they currently have no type parameters.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum GenericEnvOwner {
@@ -1605,48 +1605,50 @@ impl GenericEnvOwner {
 	/// written name to report.
 	pub(super) fn name(
 		self,
-		defs: &DefinitionRegistry,
+		decls: &Declarations,
 	) -> Option<Spanned<SymbolU32>> {
 		Some(match self {
-			Self::Constant(index) => defs.constants[usize::from(index)].name,
-			Self::Enum(index) => defs.enums[usize::from(index)].name,
+			Self::Constant(index) => decls.constants[usize::from(index)].name,
+			Self::Enum(index) => decls.enums[usize::from(index)].name,
 			Self::Struct(struct_index) => {
-				defs.structs[usize::from(struct_index)].name
+				decls.structs[usize::from(struct_index)].name
 			}
 			Self::Function(func_index) => {
-				defs.functions[usize::from(func_index)].name
+				decls.functions[usize::from(func_index)].name
 			}
 			Self::Trait(trait_index) => {
-				defs.traits[usize::from(trait_index)].name
+				decls.traits[usize::from(trait_index)].name
 			}
 			Self::TypeAlias(type_alias_index) => {
-				defs.type_aliases[usize::from(type_alias_index)].name
+				decls.type_aliases[usize::from(type_alias_index)].name
 			}
 			Self::InherentImpl(_) | Self::TraitImpl(_) => return None,
 		})
 	}
 
-	pub(super) fn file_id(self, defs: &DefinitionRegistry) -> FileId {
+	pub(super) fn file_id(self, decls: &Declarations) -> FileId {
 		match self {
-			Self::Constant(index) => defs.constants[usize::from(index)].file_id,
-			Self::Enum(index) => defs.enums[usize::from(index)].file_id,
+			Self::Constant(index) => {
+				decls.constants[usize::from(index)].file_id
+			}
+			Self::Enum(index) => decls.enums[usize::from(index)].file_id,
 			Self::Struct(struct_index) => {
-				defs.structs[usize::from(struct_index)].file_id
+				decls.structs[usize::from(struct_index)].file_id
 			}
 			Self::Function(func_index) => {
-				defs.functions[usize::from(func_index)].file_id
+				decls.functions[usize::from(func_index)].file_id
 			}
 			Self::Trait(trait_index) => {
-				defs.traits[usize::from(trait_index)].file_id
+				decls.traits[usize::from(trait_index)].file_id
 			}
 			Self::TypeAlias(type_alias_index) => {
-				defs.type_aliases[usize::from(type_alias_index)].file_id
+				decls.type_aliases[usize::from(type_alias_index)].file_id
 			}
 			Self::InherentImpl(index) => {
-				defs.inherent_impls[usize::from(index)].file_id
+				decls.inherent_impls[usize::from(index)].file_id
 			}
 			Self::TraitImpl(index) => {
-				defs.trait_impls[usize::from(index)].file_id
+				decls.trait_impls[usize::from(index)].file_id
 			}
 		}
 	}

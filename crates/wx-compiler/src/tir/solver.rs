@@ -1,7 +1,7 @@
 //! The solver: associated-type normalization and impl selection, which recurse
-//! into each other and so are one engine, `Solver`. It reads the world through
-//! the `TypeContext` it is run over, which also lends it the solver's own
-//! state (owned by the caller), so a query can re-enter body checking.
+//! into each other and so are one engine, `Solver`. Its queries are methods
+//! of the `Semantics` that holds its state, so a query can re-enter body
+//! checking.
 //!
 //! Declaration identity stays in projections; abstract equalities come from
 //! equality clauses; concrete values come from selected impl members, whose
@@ -11,7 +11,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::Ownership;
+use crate::ast::{Ownership, StringInterner};
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
@@ -19,7 +19,9 @@ use super::bounds::{
 	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, Readiness,
 	SelfSubstitution, known_distinct,
 };
-use super::defs::{AssocTypeIdx, ConstIdx, MemberKind, TraitIdx, TraitImplIdx};
+use super::decls::{
+	AssocTypeIdx, ConstIdx, MemberKind, TraitIdx, TraitImplIdx,
+};
 use super::eval::{
 	Allocation, ConstValue, ConstValueState, Instance, ResolvedConstant,
 	StaticInstance,
@@ -28,7 +30,7 @@ use super::impls::ImplTarget;
 use super::layout::Layouts;
 use super::literals::UntypedValue;
 use super::members::{TraitImplLookup, TraitMemberSelection};
-use super::signatures::TypeContext;
+use super::signatures::Semantics;
 use super::types::{
 	GenericEnvArena, GenericEnvIdx, ImplKind, Substitution, Type, TypeIndex,
 	TypeInterner, TypeList,
@@ -406,7 +408,7 @@ pub(super) enum SolverFrame {
 		bound: Option<BoundId>,
 		outer_budget: usize,
 	},
-	/// A constant being checked or evaluated (`TypeContext::const_value`),
+	/// A constant being checked or evaluated (`Semantics::const_value`),
 	/// with the arguments its body is read with. Its state is `InProgress`
 	/// while this frame is on the stack; reading it again closes a loop
 	/// through constants. The budget is the evaluation's own, as for a
@@ -534,7 +536,7 @@ impl Solver {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// `member`'s value, judged once: normalized in its impl's `Self` scope with
 	/// a budget of its own, so the verdict depends on the definitions alone and
 	/// is memoized whoever asks first. `requested_by` is the projection that
@@ -547,6 +549,7 @@ impl TypeContext<'_, '_, '_> {
 	/// through an equality, it is a tautology the derivation itself blocks.
 	pub(super) fn assoc_value(
 		&mut self,
+		strings: &StringInterner,
 		member: ImplMember,
 		requested_by: Option<TypeIndex>,
 	) -> Result<TypeIndex, SolverError> {
@@ -589,6 +592,7 @@ impl TypeContext<'_, '_, '_> {
 			),
 		});
 		let result = self.normalize(
+			strings,
 			self.assumption_envs.of_frame(scope),
 			value,
 			NormalizationDepth::Deep,
@@ -837,7 +841,7 @@ pub(super) struct ContextualEquality {
 	pub(super) context: Option<SelfSubstitution>,
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// The value an impl supplies for an associated type, as lowered in its own
 	/// environment. Instantiation and any normalization made possible by
 	/// substitution belong to the caller. Reads the finished slot: an unfilled
@@ -870,7 +874,7 @@ impl TypeContext<'_, '_, '_> {
 			return Err(SolverError::Pending);
 		};
 		let target = header.target.inner;
-		match self.defs.select_trait_member(
+		match self.decls.select_trait_member(
 			member.impl_index,
 			MemberKind::AssociatedType(member.declaration),
 		) {
@@ -885,7 +889,7 @@ impl TypeContext<'_, '_, '_> {
 				let trait_index = self
 					.impl_dispatch
 					.trait_header(member.impl_index)
-					.trait_def
+					.trait_decl
 					.expect("a selected impl names its trait")
 					.inner;
 				let env = self.traits[usize::from(trait_index)].env;
@@ -1015,7 +1019,7 @@ impl Solver {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// The cache layer around `normalize_uncached`. An answer that read a frame
 	/// below its own request (cycle and rollback state, an open judgement)
 	/// holds only while that frame is open, so it is not stored. Only a request
@@ -1032,18 +1036,12 @@ impl TypeContext<'_, '_, '_> {
 	/// itself, or reads silently become order-dependent.
 	pub(super) fn normalize(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
 		facts: RewriteFlags,
 	) -> Result<TypeIndex, SolverError> {
-		// Assumption-only reduction reads declared bounds and may run
-		// mid-construction; the impl definitions are what it must not read.
-		debug_assert!(
-			!facts.contains(RewriteFlags::DEFINITIONS)
-				|| self.query_stack.is_empty(),
-			"{IMPL_WHILE_BUILDING}"
-		);
 		// Nothing to reduce: no frame is opened or read, and no budget spent,
 		// since a type without a projection cannot loop.
 		if !self.types.has_projection(ty) {
@@ -1067,8 +1065,13 @@ impl TypeContext<'_, '_, '_> {
 			&mut self.solver.state.lowest_frame_read,
 			usize::MAX,
 		);
-		let result =
-			self.normalize_uncached(normalization.env, ty, depth, facts);
+		let result = self.normalize_uncached(
+			strings,
+			normalization.env,
+			ty,
+			depth,
+			facts,
+		);
 		let lowest_read = self.solver.state.lowest_frame_read;
 		self.solver.state.lowest_frame_read = outer_read.min(lowest_read);
 		// A request that started with nothing in flight leaves nothing behind.
@@ -1084,6 +1087,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn normalize_uncached(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
@@ -1102,13 +1106,18 @@ impl TypeContext<'_, '_, '_> {
 		}
 		self.solver.state.recursion_budget -= 1;
 		let result = match *self.types.resolve(ty) {
-			Type::TypeProjection { .. } => {
-				self.normalize_projection(assumption_context, ty, depth, facts)
-			}
+			Type::TypeProjection { .. } => self.normalize_projection(
+				strings,
+				assumption_context,
+				ty,
+				depth,
+				facts,
+			),
 			Type::Const {
 				constant,
 				type_args,
 			} => self.normalize_const(
+				strings,
 				assumption_context,
 				constant,
 				type_args,
@@ -1118,6 +1127,7 @@ impl TypeContext<'_, '_, '_> {
 			_ => match depth {
 				NormalizationDepth::Shallow => Ok(ty),
 				NormalizationDepth::Deep => self.normalize_children(
+					strings,
 					assumption_context,
 					ty,
 					depth,
@@ -1135,6 +1145,7 @@ impl TypeContext<'_, '_, '_> {
 	/// it keeps its normalized arguments.
 	fn normalize_const(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		constant: ConstIdx,
 		type_args: TypeList,
@@ -1143,17 +1154,24 @@ impl TypeContext<'_, '_, '_> {
 	) -> Result<TypeIndex, SolverError> {
 		let mut args = self.types.list(type_args).to_vec();
 		for item in args.iter_mut() {
-			*item = self.normalize(assumption_context, *item, depth, facts)?;
+			*item = self.normalize(
+				strings,
+				assumption_context,
+				*item,
+				depth,
+				facts,
+			)?;
 		}
 		if !facts.contains(RewriteFlags::VALUES) {
 			return Ok(self.types.intern_const(constant, &args));
 		}
-		let value = match self.resolve_constant(constant, &args)? {
+		let value = match self.resolve_constant(strings, constant, &args)? {
 			ResolvedConstant::Instance(instance) => {
-				self.instance_bits(instance)
+				self.instance_bits(strings, instance)
 			}
 			ResolvedConstant::Length(length) => {
 				return self.normalize(
+					strings,
 					assumption_context,
 					length,
 					depth,
@@ -1176,6 +1194,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn normalize_projection(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		depth: NormalizationDepth,
@@ -1198,6 +1217,7 @@ impl TypeContext<'_, '_, '_> {
 		// Keep the frame active across receiver normalization, provider queries,
 		// and traversal of the resulting type, including compound results.
 		let result = self.reduce_projection(
+			strings,
 			assumption_context,
 			projection,
 			depth,
@@ -1216,6 +1236,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn reduce_projection(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		depth: NormalizationDepth,
@@ -1240,6 +1261,7 @@ impl TypeContext<'_, '_, '_> {
 			)? {
 				EqualityLookup::Known(value) => {
 					return self.reduce_by_equality(
+						strings,
 						assumption_context,
 						projection,
 						value,
@@ -1251,7 +1273,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 		}
 		let next_base =
-			self.normalize(assumption_context, base, depth, facts)?;
+			self.normalize(strings, assumption_context, base, depth, facts)?;
 		if next_base == TypeIndex::ERROR {
 			return Err(SolverError::Poisoned);
 		}
@@ -1292,6 +1314,7 @@ impl TypeContext<'_, '_, '_> {
 			)? {
 				EqualityLookup::Known(value) => {
 					return self.reduce_by_equality(
+						strings,
 						assumption_context,
 						projection,
 						value,
@@ -1305,13 +1328,16 @@ impl TypeContext<'_, '_, '_> {
 		if !facts.contains(RewriteFlags::DEFINITIONS) {
 			return Ok(projection);
 		}
-		self.project_value(Normalization::new(
-			&self.types,
-			assumption_context,
-			projection,
-			depth,
-			facts,
-		))
+		self.project_value(
+			strings,
+			Normalization::new(
+				&self.types,
+				assumption_context,
+				projection,
+				depth,
+				facts,
+			),
+		)
 	}
 
 	/// Computes compiler-defined associated values directly, or selects a
@@ -1319,6 +1345,7 @@ impl TypeContext<'_, '_, '_> {
 	/// the other builtin rules apply to their receiver's structural shape.
 	fn project_value(
 		&mut self,
+		strings: &StringInterner,
 		request: Normalization,
 	) -> Result<TypeIndex, SolverError> {
 		let Type::TypeProjection {
@@ -1331,10 +1358,10 @@ impl TypeContext<'_, '_, '_> {
 				"a projection's value is computed after receiver rewriting"
 			)
 		};
-		let intrinsics = &self.defs.intrinsics;
+		let intrinsics = &self.decls.intrinsics;
 		let member = Some(assoc_type_index);
 		if member == intrinsics.stack_value_repr {
-			return self.compute_stack_value_repr(request);
+			return self.compute_stack_value_repr(strings, request);
 		}
 		let value = match *self.types.resolve(base) {
 			Type::Slice { of } | Type::Array { of, .. }
@@ -1345,8 +1372,9 @@ impl TypeContext<'_, '_, '_> {
 			Type::Pointer { to, memory, .. }
 				if member == intrinsics.pointer_metadata =>
 			{
-				let size = self.address_size(request.env, memory)?;
+				let size = self.address_size(strings, request.env, memory)?;
 				self.compute_pointer_metadata(
+					strings,
 					request.env,
 					to,
 					memory,
@@ -1377,18 +1405,25 @@ impl TypeContext<'_, '_, '_> {
 			}
 			// Call::Args and Call::Result on a callable struct, for example,
 			// come from its impl rather than the function-reference rule.
-			_ => return self.declared_projection_value(request),
+			_ => return self.declared_projection_value(strings, request),
 		};
 		// Unknown metadata is already the canonical projection. Normalizing it
 		// again here would reenter its own active frame.
 		if value == request.ty {
 			return Ok(value);
 		}
-		self.normalize(request.env, value, request.depth, request.facts)
+		self.normalize(
+			strings,
+			request.env,
+			value,
+			request.depth,
+			request.facts,
+		)
 	}
 
 	fn declared_projection_value(
 		&mut self,
+		strings: &StringInterner,
 		request: Normalization,
 	) -> Result<TypeIndex, SolverError> {
 		let Type::TypeProjection {
@@ -1412,8 +1447,12 @@ impl TypeContext<'_, '_, '_> {
 		}
 		// A missing provider stays silent: the construct requiring the trait
 		// owns the report, and consumers recover from its poisoned projection.
-		let Some(found) =
-			self.find_trait_impl_query(assumption_context, base, trait_index)?
+		let Some(found) = self.find_trait_impl_query(
+			strings,
+			assumption_context,
+			base,
+			trait_index,
+		)?
 		else {
 			return Err(SolverError::Poisoned);
 		};
@@ -1431,7 +1470,7 @@ impl TypeContext<'_, '_, '_> {
 			impl_index,
 			declaration: assoc_type_index,
 		};
-		let value = self.assoc_value(member, Some(projection))?;
+		let value = self.assoc_value(strings, member, Some(projection))?;
 		let instantiated = if args.is_empty() {
 			value
 		} else {
@@ -1449,13 +1488,14 @@ impl TypeContext<'_, '_, '_> {
 				},
 			)
 		};
-		self.normalize(assumption_context, instantiated, depth, facts)
+		self.normalize(strings, assumption_context, instantiated, depth, facts)
 	}
 
 	/// An equality in scope gives `projection` the value `value`. One that
 	/// restates the projection (`A = T::A` for `T::A`) leaves it abstract.
 	fn reduce_by_equality(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
 		value: TypeIndex,
@@ -1466,7 +1506,8 @@ impl TypeContext<'_, '_, '_> {
 			return Ok(projection);
 		}
 		self.solver.state.frames.push(SolverFrame::Equality);
-		let result = self.normalize(assumption_context, value, depth, facts);
+		let result =
+			self.normalize(strings, assumption_context, value, depth, facts);
 		self.solver.state.frames.pop();
 		result
 	}
@@ -1475,6 +1516,7 @@ impl TypeContext<'_, '_, '_> {
 	/// returns the original index when nothing changed.
 	fn normalize_children(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		depth: NormalizationDepth,
@@ -1485,6 +1527,7 @@ impl TypeContext<'_, '_, '_> {
 				let mut elements = self.types.list(elements).to_vec();
 				for item in elements.iter_mut() {
 					*item = self.normalize(
+						strings,
 						assumption_context,
 						*item,
 						depth,
@@ -1500,6 +1543,7 @@ impl TypeContext<'_, '_, '_> {
 				let mut type_args = self.types.list(type_args).to_vec();
 				for item in type_args.iter_mut() {
 					*item = self.normalize(
+						strings,
 						assumption_context,
 						*item,
 						depth,
@@ -1515,6 +1559,7 @@ impl TypeContext<'_, '_, '_> {
 				let mut type_args = self.types.list(type_args).to_vec();
 				for item in type_args.iter_mut() {
 					*item = self.normalize(
+						strings,
 						assumption_context,
 						*item,
 						depth,
@@ -1525,12 +1570,14 @@ impl TypeContext<'_, '_, '_> {
 			}
 			Type::TypedFuncref { param, result } => Type::TypedFuncref {
 				param: self.normalize(
+					strings,
 					assumption_context,
 					param,
 					depth,
 					facts,
 				)?,
 				result: self.normalize(
+					strings,
 					assumption_context,
 					result,
 					depth,
@@ -1542,8 +1589,15 @@ impl TypeContext<'_, '_, '_> {
 				memory,
 				ownership,
 			} => Type::Pointer {
-				to: self.normalize(assumption_context, to, depth, facts)?,
+				to: self.normalize(
+					strings,
+					assumption_context,
+					to,
+					depth,
+					facts,
+				)?,
 				memory: self.normalize(
+					strings,
 					assumption_context,
 					memory,
 					depth,
@@ -1552,8 +1606,15 @@ impl TypeContext<'_, '_, '_> {
 				ownership,
 			},
 			Type::Array { of, length } => Type::Array {
-				of: self.normalize(assumption_context, of, depth, facts)?,
+				of: self.normalize(
+					strings,
+					assumption_context,
+					of,
+					depth,
+					facts,
+				)?,
 				length: self.normalize(
+					strings,
 					assumption_context,
 					length,
 					depth,
@@ -1561,7 +1622,13 @@ impl TypeContext<'_, '_, '_> {
 				)?,
 			},
 			Type::Slice { of } => Type::Slice {
-				of: self.normalize(assumption_context, of, depth, facts)?,
+				of: self.normalize(
+					strings,
+					assumption_context,
+					of,
+					depth,
+					facts,
+				)?,
 			},
 			Type::TypeProjection { .. } | Type::Const { .. } => {
 				unreachable!(
@@ -1596,22 +1663,28 @@ impl TypeContext<'_, '_, '_> {
 
 	pub(super) fn find_trait_impl_query(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 	) -> Result<Option<TraitImplLookup>, SolverError> {
-		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
 		if matches!(self.types.resolve(receiver), Type::Error | Type::Infer) {
 			return Err(SolverError::Poisoned);
 		}
 		// Every type is a stack value by its structure, whatever impls exist.
-		if Some(required_trait) == self.defs.intrinsics.stack_value {
-			return match self.stack_value_repr(assumption_context, receiver) {
+		if Some(required_trait) == self.decls.intrinsics.stack_value {
+			return match self.stack_value_repr(
+				strings,
+				assumption_context,
+				receiver,
+			) {
 				Ok(_) => Ok(Some(TraitImplLookup::Builtin)),
 				Err(SolverError::Poisoned) => {
-					match self
-						.explain_non_stack_value(assumption_context, receiver)?
-					{
+					match self.explain_non_stack_value(
+						strings,
+						assumption_context,
+						receiver,
+					)? {
 						Some(_) => Ok(None),
 						None => Err(SolverError::Poisoned),
 					}
@@ -1627,6 +1700,7 @@ impl TypeContext<'_, '_, '_> {
 		let mut assumed = Assumption::Unproven;
 		if self.types.is_param_or_projection(receiver) {
 			assumed = self.check_assumed_trait(
+				strings,
 				assumption_context,
 				receiver,
 				required_trait,
@@ -1636,6 +1710,7 @@ impl TypeContext<'_, '_, '_> {
 			}
 		}
 		let normalized = self.normalize(
+			strings,
 			assumption_context,
 			receiver,
 			NormalizationDepth::Shallow,
@@ -1644,7 +1719,7 @@ impl TypeContext<'_, '_, '_> {
 		if normalized == TypeIndex::ERROR {
 			return Err(SolverError::Poisoned);
 		}
-		if let Some(holds) = self.defs.intrinsics.implements_structurally(
+		if let Some(holds) = self.decls.intrinsics.implements_structurally(
 			self.types.resolve(normalized),
 			required_trait,
 		) {
@@ -1664,6 +1739,7 @@ impl TypeContext<'_, '_, '_> {
 			};
 			return Ok(self
 				.match_trait_impl_candidate_query(
+					strings,
 					assumption_context,
 					impl_index,
 					normalized,
@@ -1674,6 +1750,7 @@ impl TypeContext<'_, '_, '_> {
 			&& self.types.is_param_or_projection(normalized)
 		{
 			assumed = assumed.max(self.check_assumed_trait(
+				strings,
 				assumption_context,
 				normalized,
 				required_trait,
@@ -1691,10 +1768,11 @@ impl TypeContext<'_, '_, '_> {
 	/// environment key, budget and rollback rules. Absence is not cached.
 	pub(super) fn stack_value_repr(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<TypeIndex, SolverError> {
-		let intrinsics = &self.defs.intrinsics;
+		let intrinsics = &self.decls.intrinsics;
 		let trait_index =
 			intrinsics.stack_value.expect("std declares `StackValue`");
 		let assoc_type_index = intrinsics
@@ -1706,6 +1784,7 @@ impl TypeContext<'_, '_, '_> {
 			assoc_type_index,
 		});
 		self.normalize(
+			strings,
 			assumption_context,
 			projection,
 			NormalizationDepth::Deep,
@@ -1723,11 +1802,13 @@ impl TypeContext<'_, '_, '_> {
 	/// abstract part not assumed one.
 	fn stack_elements(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
 		let mut elements = Vec::new();
 		if !self.push_stack_elements(
+			strings,
 			assumption_context,
 			ty,
 			&mut elements,
@@ -1749,10 +1830,12 @@ impl TypeContext<'_, '_, '_> {
 	#[cold]
 	pub(super) fn explain_non_stack_value(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<TypeIndex>, SolverError> {
 		self.explain_non_stack_value_inner(
+			strings,
 			assumption_context,
 			ty,
 			&mut Vec::new(),
@@ -1761,6 +1844,7 @@ impl TypeContext<'_, '_, '_> {
 
 	fn explain_non_stack_value_inner(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		visiting: &mut Vec<TypeIndex>,
@@ -1768,7 +1852,7 @@ impl TypeContext<'_, '_, '_> {
 		// The root query already failed. For children, reuse successful
 		// representations before descending into their structure.
 		if !visiting.is_empty() {
-			match self.stack_value_repr(assumption_context, ty) {
+			match self.stack_value_repr(strings, assumption_context, ty) {
 				Ok(_) => return Ok(None),
 				Err(SolverError::Poisoned) => {}
 				Err(error) => return Err(error),
@@ -1783,6 +1867,7 @@ impl TypeContext<'_, '_, '_> {
 		visiting.push(ty);
 		let result = (|| {
 			let ty = self.normalize(
+				strings,
 				assumption_context,
 				ty,
 				NormalizationDepth::Deep,
@@ -1809,6 +1894,7 @@ impl TypeContext<'_, '_, '_> {
 							},
 						);
 						if let Some(part) = self.explain_non_stack_value_inner(
+							strings,
 							assumption_context,
 							field,
 							visiting,
@@ -1821,6 +1907,7 @@ impl TypeContext<'_, '_, '_> {
 					for at in 0..elements.len() {
 						let element = self.types.list(elements)[at];
 						if let Some(part) = self.explain_non_stack_value_inner(
+							strings,
 							assumption_context,
 							element,
 							visiting,
@@ -1830,14 +1917,17 @@ impl TypeContext<'_, '_, '_> {
 					}
 				}
 				Type::Pointer { to, memory, .. } => {
-					let size = self.address_size(assumption_context, memory)?;
+					let size =
+						self.address_size(strings, assumption_context, memory)?;
 					let metadata = self.pointer_metadata_value(
+						strings,
 						assumption_context,
 						to,
 						memory,
 					)?;
 					for part in [size, metadata] {
 						if let Some(part) = self.explain_non_stack_value_inner(
+							strings,
 							assumption_context,
 							part,
 							visiting,
@@ -1849,6 +1939,7 @@ impl TypeContext<'_, '_, '_> {
 				Type::Enum { enum_index } => {
 					let repr = self.enums[usize::from(enum_index)].repr;
 					return self.explain_non_stack_value_inner(
+						strings,
 						assumption_context,
 						repr,
 						visiting,
@@ -1857,11 +1948,16 @@ impl TypeContext<'_, '_, '_> {
 				Type::Slice { .. } | Type::Array { .. } => return Ok(Some(ty)),
 				Type::TypeParam { .. } | Type::TypeProjection { .. } => {
 					let stack_value = self
-						.defs
+						.decls
 						.intrinsics
 						.stack_value
 						.expect("std declares `StackValue`");
-					if !self.assumes(assumption_context, ty, stack_value)? {
+					if !self.assumes(
+						strings,
+						assumption_context,
+						ty,
+						stack_value,
+					)? {
 						return Ok(Some(ty));
 					}
 				}
@@ -1891,6 +1987,7 @@ impl TypeContext<'_, '_, '_> {
 	/// `<(T, i32) as StackValue>::Repr`.
 	fn compute_stack_value_repr(
 		&mut self,
+		strings: &StringInterner,
 		request: Normalization,
 	) -> Result<TypeIndex, SolverError> {
 		let Type::TypeProjection {
@@ -1905,13 +2002,20 @@ impl TypeContext<'_, '_, '_> {
 		if self.types.is_param_or_projection(ty) {
 			// A symbolic Repr is a finished answer only under evidence of the
 			// bound. Unbounded parameters must not seed the positive cache.
-			return if self.assumes(assumption_context, ty, trait_index)? {
+			return if self.assumes(
+				strings,
+				assumption_context,
+				ty,
+				trait_index,
+			)? {
 				Ok(request.ty)
 			} else {
 				Err(SolverError::Poisoned)
 			};
 		}
-		let Some(parts) = self.stack_elements(assumption_context, ty)? else {
+		let Some(parts) =
+			self.stack_elements(strings, assumption_context, ty)?
+		else {
 			return Err(SolverError::Poisoned);
 		};
 		if parts == [TypeIndex::NEVER] {
@@ -1930,6 +2034,7 @@ impl TypeContext<'_, '_, '_> {
 				assoc_type_index,
 			});
 			let value = self.normalize(
+				strings,
 				assumption_context,
 				repr,
 				NormalizationDepth::Deep,
@@ -1971,9 +2076,9 @@ impl TypeContext<'_, '_, '_> {
 				base,
 				trait_index,
 				assoc_type_index,
-			} if Some(trait_index) == self.defs.intrinsics.stack_value
+			} if Some(trait_index) == self.decls.intrinsics.stack_value
 				&& Some(assoc_type_index)
-					== self.defs.intrinsics.stack_value_repr =>
+					== self.decls.intrinsics.stack_value_repr =>
 			{
 				// A canonical self type is a flat tuple of elements or one
 				// abstract part; any other is left unreduced by a loop.
@@ -1997,6 +2102,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Offending parts are located separately, only when reporting an error.
 	fn push_stack_elements(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<TypeIndex>,
@@ -2009,6 +2115,7 @@ impl TypeContext<'_, '_, '_> {
 		// Deep, as a declaration's other checks read it: a loop through an
 		// equality stays the projection it is, not unfolded a step at a time.
 		let ty = self.normalize(
+			strings,
 			assumption_context,
 			ty,
 			NormalizationDepth::Deep,
@@ -2057,6 +2164,7 @@ impl TypeContext<'_, '_, '_> {
 			Type::Enum { enum_index } => {
 				let repr = self.enums[usize::from(enum_index)].repr;
 				self.push_stack_elements(
+					strings,
 					assumption_context,
 					repr,
 					out,
@@ -2067,13 +2175,16 @@ impl TypeContext<'_, '_, '_> {
 			// An address, as wide as its memory's `Size`, then the pointee's
 			// counts, each as wide again (`Pointer::Metadata`).
 			Type::Pointer { to, memory, .. } => {
-				let size = self.address_size(assumption_context, memory)?;
+				let size =
+					self.address_size(strings, assumption_context, memory)?;
 				let metadata = self.pointer_metadata_value(
+					strings,
 					assumption_context,
 					to,
 					memory,
 				)?;
 				if !self.push_stack_elements(
+					strings,
 					assumption_context,
 					size,
 					out,
@@ -2083,6 +2194,7 @@ impl TypeContext<'_, '_, '_> {
 					return Ok(false);
 				}
 				self.push_stack_elements(
+					strings,
 					assumption_context,
 					metadata,
 					out,
@@ -2097,6 +2209,7 @@ impl TypeContext<'_, '_, '_> {
 				for at in 0..elements.len() {
 					let element = self.types.list(elements)[at];
 					if !self.push_stack_elements(
+						strings,
 						assumption_context,
 						element,
 						out,
@@ -2133,6 +2246,7 @@ impl TypeContext<'_, '_, '_> {
 						},
 					);
 					if !self.push_stack_elements(
+						strings,
 						assumption_context,
 						field,
 						out,
@@ -2148,11 +2262,11 @@ impl TypeContext<'_, '_, '_> {
 			}
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
 				let stack_value = self
-					.defs
+					.decls
 					.intrinsics
 					.stack_value
 					.expect("std declares `StackValue`");
-				if self.assumes(assumption_context, ty, stack_value)? {
+				if self.assumes(strings, assumption_context, ty, stack_value)? {
 					out.push(ty);
 					Ok(true)
 				} else {
@@ -2166,10 +2280,12 @@ impl TypeContext<'_, '_, '_> {
 	/// `M::Size` for an abstract one.
 	pub(super) fn address_size(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		memory: TypeIndex,
 	) -> Result<TypeIndex, SolverError> {
 		let memory = self.normalize(
+			strings,
 			assumption_context,
 			memory,
 			NormalizationDepth::Shallow,
@@ -2177,7 +2293,7 @@ impl TypeContext<'_, '_, '_> {
 		)?;
 		let size = match *self.types.resolve(memory) {
 			Type::Memory { memory_index } => {
-				let size = self.defs.memories[usize::from(memory_index)]
+				let size = self.decls.memories[usize::from(memory_index)]
 					.size_assoc_type_index;
 				self.assoc_types[usize::from(size)]
 					.as_ref()
@@ -2196,12 +2312,14 @@ impl TypeContext<'_, '_, '_> {
 	/// that same query. Shared and exclusive pointers give one metadata type.
 	pub(super) fn pointer_metadata_value(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		to: TypeIndex,
 		memory: TypeIndex,
 	) -> Result<TypeIndex, SolverError> {
 		let projection = self.pointer_metadata_projection(to, memory);
 		self.normalize(
+			strings,
 			assumption_context,
 			projection,
 			NormalizationDepth::Deep,
@@ -2215,7 +2333,7 @@ impl TypeContext<'_, '_, '_> {
 		to: TypeIndex,
 		memory: TypeIndex,
 	) -> TypeIndex {
-		let intrinsics = &self.defs.intrinsics;
+		let intrinsics = &self.decls.intrinsics;
 		let (trait_index, assoc_type_index) = (
 			intrinsics.pointer.expect("std declares `Pointer`"),
 			intrinsics
@@ -2238,12 +2356,17 @@ impl TypeContext<'_, '_, '_> {
 	/// when metadata remains a rigid `Pointer::Metadata` projection.
 	pub(super) fn pointer_metadata(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		pointee: TypeIndex,
 		memory: TypeIndex,
 	) -> Result<Option<TypeIndex>, SolverError> {
-		let metadata =
-			self.pointer_metadata_value(assumption_context, pointee, memory)?;
+		let metadata = self.pointer_metadata_value(
+			strings,
+			assumption_context,
+			pointee,
+			memory,
+		)?;
 		Ok(self.known_pointer_metadata(metadata))
 	}
 
@@ -2253,7 +2376,7 @@ impl TypeContext<'_, '_, '_> {
 				assoc_type_index, ..
 			} if assoc_type_index
 				== self
-					.defs
+					.decls
 					.intrinsics
 					.pointer_metadata
 					.expect("`Pointer` declares `Metadata`") =>
@@ -2269,6 +2392,7 @@ impl TypeContext<'_, '_, '_> {
 	/// pointee is thin only when assumed `StackValue` or `Array`.
 	fn compute_pointer_metadata(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		pointee: TypeIndex,
 		memory: TypeIndex,
@@ -2278,6 +2402,7 @@ impl TypeContext<'_, '_, '_> {
 		// Keep looping equalities rigid. Shallow reduction would unfold
 		// `T::Item = [T::Item]` once per element and start the loop afresh.
 		let pointee = self.normalize(
+			strings,
 			assumption_context,
 			pointee,
 			NormalizationDepth::Deep,
@@ -2287,6 +2412,7 @@ impl TypeContext<'_, '_, '_> {
 			Type::Slice { of } => {
 				let projection = self.pointer_metadata_projection(of, memory);
 				let metadata = self.normalize(
+					strings,
 					assumption_context,
 					projection,
 					NormalizationDepth::Deep,
@@ -2303,15 +2429,23 @@ impl TypeContext<'_, '_, '_> {
 				}))
 			}
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-				let intrinsics = &self.defs.intrinsics;
+				let intrinsics = &self.decls.intrinsics;
 				let (Some(stack_value), Some(array)) =
 					(intrinsics.stack_value, intrinsics.array)
 				else {
 					return Ok(Some(TypeIndex::UNIT));
 				};
-				if self.assumes(assumption_context, pointee, stack_value)?
-					|| self.assumes(assumption_context, pointee, array)?
-				{
+				if self.assumes(
+					strings,
+					assumption_context,
+					pointee,
+					stack_value,
+				)? || self.assumes(
+					strings,
+					assumption_context,
+					pointee,
+					array,
+				)? {
 					Ok(Some(TypeIndex::UNIT))
 				} else {
 					Ok(None)
@@ -2325,11 +2459,17 @@ impl TypeContext<'_, '_, '_> {
 	/// `Pending` while a table they come from is unfinished.
 	fn assumes(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<bool, SolverError> {
-		match self.check_assumed_trait(assumption_context, ty, required)? {
+		match self.check_assumed_trait(
+			strings,
+			assumption_context,
+			ty,
+			required,
+		)? {
 			Assumption::Holds => Ok(true),
 			Assumption::Unproven => Ok(false),
 			Assumption::Pending => Err(SolverError::Pending),
@@ -2358,6 +2498,7 @@ impl TypeContext<'_, '_, '_> {
 	/// an unfinished table is `Assumption::Pending`, never an error.
 	pub(super) fn check_assumed_trait(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
@@ -2390,6 +2531,7 @@ impl TypeContext<'_, '_, '_> {
 				.collect();
 			if !subjects.is_empty() {
 				let meaning = match self.normalize(
+					strings,
 					assumption_context,
 					ty,
 					NormalizationDepth::Deep,
@@ -2404,6 +2546,7 @@ impl TypeContext<'_, '_, '_> {
 				if self.types.is_abstract(meaning) {
 					for subject in subjects {
 						match self.normalize(
+							strings,
 							assumption_context,
 							subject,
 							NormalizationDepth::Deep,
@@ -2435,6 +2578,7 @@ impl TypeContext<'_, '_, '_> {
 	/// Reads the finished header: one still missing is `Pending`.
 	pub(super) fn match_trait_impl_candidate_query(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		impl_index: TraitImplIdx,
 		receiver: TypeIndex,
@@ -2444,6 +2588,7 @@ impl TypeContext<'_, '_, '_> {
 			return Err(SolverError::Pending);
 		};
 		self.match_impl_target_and_bounds(
+			strings,
 			assumption_context,
 			ImplKind::Trait(impl_index),
 			header.type_params,
@@ -2458,13 +2603,13 @@ impl TypeContext<'_, '_, '_> {
 	/// candidate's.
 	pub(super) fn match_impl_target_and_bounds(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		impl_kind: ImplKind,
 		impl_env: GenericEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
 	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
-		debug_assert!(self.query_stack.is_empty(), "{IMPL_WHILE_BUILDING}");
 		// Structural matching below compares `receiver`'s nested children
 		// against `target`'s pattern directly, with no normalization of its
 		// own (`TypeInterner::match_pattern` is `&self`, with no access to
@@ -2477,6 +2622,7 @@ impl TypeContext<'_, '_, '_> {
 		// converges here, so normalizing once, here, closes the gap for all
 		// of them instead of requiring each to remember it independently.
 		let receiver = self.normalize(
+			strings,
 			assumption_context,
 			receiver,
 			NormalizationDepth::Deep,
@@ -2503,9 +2649,15 @@ impl TypeContext<'_, '_, '_> {
 				return Ok(Some(args));
 			}
 		} else {
-			self.requirements_verdict(impl_kind)?;
+			self.requirements_verdict(strings, impl_kind)?;
 		}
-		if self.prove_requirements(assumption_context, impl_env, &args, None)? {
+		if self.prove_requirements(
+			strings,
+			assumption_context,
+			impl_env,
+			&args,
+			None,
+		)? {
 			Ok(Some(args))
 		} else {
 			Ok(None)
@@ -2525,6 +2677,7 @@ impl TypeContext<'_, '_, '_> {
 	/// arguments.
 	pub(super) fn requirements_verdict(
 		&mut self,
+		strings: &StringInterner,
 		impl_kind: ImplKind,
 	) -> Result<(), SolverError> {
 		let definition = Definition::Requirements(impl_kind);
@@ -2560,6 +2713,7 @@ impl TypeContext<'_, '_, '_> {
 			),
 		});
 		let result = self.prove_requirements(
+			strings,
 			self.assumption_envs.of_frame(impl_env),
 			impl_env,
 			&args,
@@ -2621,6 +2775,7 @@ impl TypeContext<'_, '_, '_> {
 	/// judgement passes its frame, which records the bound being proved.
 	fn prove_requirements(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		impl_env: GenericEnvIdx,
 		args: &[TypeIndex],
@@ -2629,6 +2784,7 @@ impl TypeContext<'_, '_, '_> {
 		let mut frame = Some(impl_env);
 		while let Some(current) = frame {
 			if !self.satisfies_clauses(
+				strings,
 				assumption_context,
 				self.assumption_envs.requirements(current),
 				Subjects::All,
@@ -2656,6 +2812,7 @@ impl TypeContext<'_, '_, '_> {
 	/// (`SolverError::Pending`), not a failure.
 	pub(super) fn satisfies_clauses(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		clauses: BoundClauses,
 		subjects: Subjects,
@@ -2695,6 +2852,7 @@ impl TypeContext<'_, '_, '_> {
 				Type::TypeProjection { .. }
 			) {
 				self.normalize(
+					strings,
 					assumption_context,
 					stated,
 					NormalizationDepth::Deep,
@@ -2705,6 +2863,7 @@ impl TypeContext<'_, '_, '_> {
 			};
 			if self
 				.find_trait_impl_query(
+					strings,
 					assumption_context,
 					receiver,
 					clause.trait_index,
@@ -2768,12 +2927,14 @@ impl TypeContext<'_, '_, '_> {
 						},
 					);
 					let found = self.normalize(
+						strings,
 						assumption_context,
 						projection,
 						NormalizationDepth::Deep,
 						RewriteFlags::ALL,
 					)?;
 					let expected = self.normalize(
+						strings,
 						assumption_context,
 						required,
 						NormalizationDepth::Deep,
@@ -2822,6 +2983,7 @@ impl TypeContext<'_, '_, '_> {
 						clause.subject,
 					);
 					let subject = self.normalize(
+						strings,
 						assumption_context,
 						stated,
 						NormalizationDepth::Deep,
@@ -2836,6 +2998,7 @@ impl TypeContext<'_, '_, '_> {
 						},
 					);
 					let ty = self.normalize(
+						strings,
 						assumption_context,
 						ty,
 						NormalizationDepth::Deep,
@@ -2846,6 +3009,7 @@ impl TypeContext<'_, '_, '_> {
 					}
 					let constant = clause.target.constant;
 					let value = match self.untyped_value(
+						strings,
 						assumption_context,
 						constant,
 						&[subject],
@@ -2862,6 +3026,7 @@ impl TypeContext<'_, '_, '_> {
 						}
 						UntypedValue::Abstract => {
 							if self.assumed_representable(
+								strings,
 								assumption_context,
 								subject,
 								constant,
@@ -2982,45 +3147,50 @@ impl TypeContext<'_, '_, '_> {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// Test conveniences over the queries: an unfinished fact stays symbolic, a
 	/// failure becomes `ERROR`, and a divergence is reported at `site`. No
 	/// production path normalizes this way: lowering stores types as written.
 	#[cfg(test)]
 	pub(super) fn normalize_head(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {
 		let result = self.normalize(
+			strings,
 			assumption_context,
 			ty,
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
 		);
-		self.settle(result, ty, site)
+		self.settle(strings, result, ty, site)
 	}
 
 	#[cfg(test)]
 	pub(super) fn normalize_type(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		site: SourceSpan,
 	) -> TypeIndex {
 		let result = self.normalize(
+			strings,
 			assumption_context,
 			ty,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		);
-		self.settle(result, ty, site)
+		self.settle(strings, result, ty, site)
 	}
 
 	#[cfg(test)]
 	fn settle(
 		&mut self,
+		strings: &StringInterner,
 		result: Result<TypeIndex, SolverError>,
 		ty: TypeIndex,
 		site: SourceSpan,
@@ -3032,7 +3202,7 @@ impl TypeContext<'_, '_, '_> {
 				TypeIndex::ERROR
 			}
 			Err(SolverError::Cycle(cycle)) => {
-				let diagnostic = self.cycle_diagnostic(&cycle, site);
+				let diagnostic = self.cycle_diagnostic(strings, &cycle, site);
 				self.diagnostics.push(diagnostic);
 				TypeIndex::ERROR
 			}
@@ -3042,6 +3212,3 @@ impl TypeContext<'_, '_, '_> {
 		}
 	}
 }
-
-const IMPL_WHILE_BUILDING: &str =
-	"impl-based normalization cannot run while a signature is being built";

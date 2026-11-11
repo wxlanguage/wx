@@ -10,12 +10,12 @@
 
 use super::{Body, ExprIdx, FunctionState, Lowerer, mir};
 use crate::diagnostics::{SourceSpan, TextSpan};
-use crate::tir::defs::ConstIdx;
+use crate::tir::decls::ConstIdx;
 use crate::tir::eval::{ConstScalar, ResolvedConstant, Unevaluable, Val};
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
 use crate::vfs::FileId;
 
-impl Lowerer<'_, '_, '_, '_> {
+impl Lowerer<'_> {
 	pub(super) fn lower_constant(
 		&mut self,
 		body: &Body,
@@ -28,7 +28,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		let span = body.span(expr);
 		let file_id = state.file_id;
 		let written: Vec<TypeIndex> =
-			self.context.generic_args.types(type_args).to_vec();
+			self.sema.generic_args.types(type_args).to_vec();
 		let args = written
 			.into_iter()
 			.map(|arg| {
@@ -36,34 +36,39 @@ impl Lowerer<'_, '_, '_, '_> {
 				self.normalize_type(arg, file_id, span)
 			})
 			.collect::<Result<Vec<TypeIndex>, ()>>()?;
-		let instance = match self.context.resolve_constant(constant, &args) {
-			Ok(ResolvedConstant::Instance(instance)) => instance,
-			Ok(ResolvedConstant::Length(length)) => {
-				let length = self.normalize_type(length, file_id, span)?;
-				let Type::Value { bits } = *self.context.types.resolve(length)
-				else {
-					unreachable!("a concrete array's length is a value")
-				};
-				return Ok(
-					state.push(mir::ExprKind::Int { value: bits as i64 }, ty)
-				);
-			}
-			Ok(ResolvedConstant::DataEnd(memory)) => {
-				let memory = self.memory(memory);
-				return Ok(state.push(mir::ExprKind::DataEnd { memory }, ty));
-			}
-			Ok(ResolvedConstant::Abstract) => {
-				unreachable!("an instance's arguments are concrete")
-			}
-			// The checker proved the bound, so only a reported failure
-			// reaches here.
-			Err(_) => return Err(()),
-		};
+		let instance =
+			match self.sema.resolve_constant(self.strings, constant, &args) {
+				Ok(ResolvedConstant::Instance(instance)) => instance,
+				Ok(ResolvedConstant::Length(length)) => {
+					let length = self.normalize_type(length, file_id, span)?;
+					let Type::Value { bits } = *self.sema.types.resolve(length)
+					else {
+						unreachable!("a concrete array's length is a value")
+					};
+					return Ok(state
+						.push(mir::ExprKind::Int { value: bits as i64 }, ty));
+				}
+				Ok(ResolvedConstant::DataEnd(memory)) => {
+					let memory = self.memory(memory);
+					return Ok(
+						state.push(mir::ExprKind::DataEnd { memory }, ty)
+					);
+				}
+				Ok(ResolvedConstant::Abstract) => {
+					unreachable!("an instance's arguments are concrete")
+				}
+				// The checker proved the bound, so only a reported failure
+				// reaches here.
+				Err(_) => return Err(()),
+			};
 		// Copy the flat value out before lowering: building its nodes needs
 		// the context mutably, and the evaluator's slice borrows it.
 		let used_at = SourceSpan::new(file_id, span);
-		let scalars = match self.context.instance_value(instance, Some(used_at))
-		{
+		let scalars = match self.sema.instance_value(
+			self.strings,
+			instance,
+			Some(used_at),
+		) {
 			Ok(value) => value.to_vec(),
 			Err(Unevaluable::NoValue) => {
 				self.unsupported(

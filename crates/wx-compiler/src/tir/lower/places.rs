@@ -21,7 +21,7 @@ use crate::ast::BinaryOp;
 use crate::diagnostics::TextSpan;
 use crate::tir::body::{ExprIdx, Place, PlaceIdx, PlaceKind};
 use crate::tir::bounds::AssumptionEnvIdx;
-use crate::tir::defs::FunctionIdx;
+use crate::tir::decls::FunctionIdx;
 use crate::tir::layout::Piece;
 use crate::tir::types::Primitive;
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
@@ -66,7 +66,7 @@ pub(super) enum Operation {
 	},
 }
 
-impl Lowerer<'_, '_, '_, '_> {
+impl Lowerer<'_> {
 	/// `place`'s address. Its pointer may diverge (`Never`), in which case
 	/// the caller returns it in place of the access.
 	fn lower_place(
@@ -94,10 +94,11 @@ impl Lowerer<'_, '_, '_, '_> {
 					self.substitute(object_ty, state.env, &state.args);
 				let object_ty =
 					self.normalize_type(object_ty, state.file_id, data.span)?;
-				let layout = match self
-					.context
-					.aggregate_layout(AssumptionEnvIdx::ROOT, object_ty)
-				{
+				let layout = match self.sema.aggregate_layout(
+					self.strings,
+					AssumptionEnvIdx::ROOT,
+					object_ty,
+				) {
 					Ok(Some(layout)) => layout,
 					// A slice as the last field leaves the aggregate unsized.
 					Ok(None) => {
@@ -112,7 +113,7 @@ impl Lowerer<'_, '_, '_, '_> {
 					// Checking reported a failure on this type.
 					Err(_) => return Err(()),
 				};
-				let offset = self.context.solver.layouts.field_offsets(layout)
+				let offset = self.sema.solver.layouts.field_offsets(layout)
 					[usize::from(field)];
 				Ok(Address {
 					offset: address.offset + offset,
@@ -147,10 +148,11 @@ impl Lowerer<'_, '_, '_, '_> {
 		let sequence_ty = self.normalize_type(sequence_ty, file_id, span)?;
 		let element_ty = self.substitute(element.ty, state.env, &state.args);
 		let element_ty = self.normalize_type(element_ty, file_id, span)?;
-		let stride = match self
-			.context
-			.memory_layout(AssumptionEnvIdx::ROOT, element_ty)
-		{
+		let stride = match self.sema.memory_layout(
+			self.strings,
+			AssumptionEnvIdx::ROOT,
+			element_ty,
+		) {
 			Ok(Some(layout)) => layout.size,
 			Ok(None) => {
 				self.unsupported(
@@ -166,10 +168,8 @@ impl Lowerer<'_, '_, '_, '_> {
 
 		// A slice is reached through its pointer, which holds its length;
 		// an array is wherever its place is, as a field is.
-		let is_slice = matches!(
-			self.context.types.resolve(sequence_ty),
-			Type::Slice { .. }
-		);
+		let is_slice =
+			matches!(self.sema.types.resolve(sequence_ty), Type::Slice { .. });
 		let (pointer, offset) = match sequence.kind {
 			PlaceKind::Deref { pointer } if is_slice => {
 				(self.lower_expr(body, state, pointer)?, 0)
@@ -308,11 +308,11 @@ impl Lowerer<'_, '_, '_, '_> {
 			}
 			None => {
 				let Type::Array { length, .. } =
-					*self.context.types.resolve(sequence_ty)
+					*self.sema.types.resolve(sequence_ty)
 				else {
 					unreachable!("a thin pointer to a sequence is an array's")
 				};
-				let Type::Value { bits } = *self.context.types.resolve(length)
+				let Type::Value { bits } = *self.sema.types.resolve(length)
 				else {
 					unreachable!("a concrete array's length is a value")
 				};
@@ -336,7 +336,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
 		let (file_id, span) = (state.file_id, body.span(expr));
-		let intrinsics = &self.context.defs.intrinsics;
+		let intrinsics = &self.sema.decls.intrinsics;
 		let function = Some(callee.function);
 		let is_len = function == intrinsics.slice_len;
 		if !is_len && function != intrinsics.slice_as_ref {
@@ -347,7 +347,7 @@ impl Lowerer<'_, '_, '_, '_> {
 			)?;
 			unreachable!()
 		}
-		let sequence_ty = self.context.types.list(callee.args)[0];
+		let sequence_ty = self.sema.types.list(callee.args)[0];
 		let sequence_ty = self.normalize_type(sequence_ty, file_id, span)?;
 		let pointer = self.lower_expr(body, state, receiver)?;
 		if state.ty(pointer) == mir::ValueType::Never {
@@ -377,7 +377,11 @@ impl Lowerer<'_, '_, '_, '_> {
 		let lowered = self.lower_type(ty, state.file_id, data.span)?;
 		let piece = match lowered {
 			mir::ValueType::Never => None,
-			_ => match self.context.memory_piece(AssumptionEnvIdx::ROOT, ty) {
+			_ => match self.sema.memory_piece(
+				self.strings,
+				AssumptionEnvIdx::ROOT,
+				ty,
+			) {
 				Ok(piece) => piece,
 				// Checking reported a failure on this type.
 				Err(_) => return Err(()),
@@ -393,7 +397,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		};
 		// Lowering's shape and TIR's layout flatten a value in one order.
 		debug_assert_eq!(
-			self.context.solver.layouts.scalar_count(piece),
+			self.sema.solver.layouts.scalar_count(piece),
 			self.signatures.scalars(&lowered).len(),
 			"TIR's layout and lowering's shape hold the same scalars"
 		);
@@ -440,7 +444,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		read: AddressRead,
 		value: PlaceValue,
 	) -> mir::ExprId {
-		let layouts = &self.context.solver.layouts;
+		let layouts = &self.sema.solver.layouts;
 		let loads: Vec<_> = self
 			.signatures
 			.scalars(&value.ty)
@@ -480,7 +484,7 @@ impl Lowerer<'_, '_, '_, '_> {
 		values: LocalRun,
 		value: PlaceValue,
 	) -> mir::ExprId {
-		let layouts = &self.context.solver.layouts;
+		let layouts = &self.sema.solver.layouts;
 		let stores: Vec<_> = values
 			.locals()
 			.enumerate()
@@ -655,7 +659,7 @@ impl Lowerer<'_, '_, '_, '_> {
 					self.callee(state, method, type_args, span)?;
 				// The checked signature's count; nothing about the callee is
 				// lowered for it.
-				let param_count = self.context.functions
+				let param_count = self.sema.functions
 					[usize::from(callee.function)]
 				.param_types
 				.len();

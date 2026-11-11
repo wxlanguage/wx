@@ -10,8 +10,8 @@
 //! name exactly the primitive impls the stdlib defines; a test holds the two
 //! together.
 
-use super::defs::{
-	BindingKey, DefinitionRegistry, FunctionIdx, MemberKind, TraitIdx,
+use super::decls::{
+	BindingKey, Declarations, FunctionIdx, MemberKind, TraitIdx,
 };
 use super::types::{Primitive, TypeIndex};
 use crate::ast::{BinaryOp, StringInterner, UnaryOp};
@@ -120,15 +120,12 @@ pub(super) struct OperatorTraits {
 }
 
 impl OperatorTraits {
-	pub(super) fn new(
-		defs: &DefinitionRegistry,
-		strings: &StringInterner,
-	) -> Self {
-		let intrinsics = &defs.intrinsics;
+	pub(super) fn new(decls: &Declarations, strings: &StringInterner) -> Self {
+		let intrinsics = &decls.intrinsics;
 		let method = |trait_index: Option<TraitIdx>, name: &str| {
 			let trait_index = trait_index?;
 			let key = BindingKey::value(strings.get(name)?);
-			match defs.declared_trait_member(trait_index, key)? {
+			match decls.declared_trait_member(trait_index, key)? {
 				MemberKind::Method(method) | MemberKind::Function(method) => {
 					Some(OperatorMethod {
 						trait_index,

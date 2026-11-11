@@ -12,16 +12,16 @@
 //!
 //! What is written inside a declaration (a constant's initializer, an enum's
 //! discriminants) is not an obligation: it is a body, checked by the body
-//! phase that follows this pass (`TypeContext::check_bodies`).
+//! phase that follows this pass (`Semantics::check_bodies`).
 
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use super::bounds::{AssumptionEnvIdx, BoundClauses};
-use super::defs::{AssocTypeIdx, TraitIdx, TraitImplIdx};
+use super::decls::{AssocTypeIdx, TraitIdx};
 use super::literals::ConcreteType;
 use super::members::report_type_does_not_implement_trait;
-use super::signatures::TypeContext;
+use super::signatures::Semantics;
 use super::solver::{
 	Definition, ImplMember, NormalizationDepth, ProjectionCycle, RewriteFlags,
 	SolverError, Verdict,
@@ -30,6 +30,7 @@ use super::types::{
 	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
 	TypeIndex,
 };
+use crate::ast::StringInterner;
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
 
@@ -129,8 +130,6 @@ pub(super) enum TypeObligation {
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
-	/// A trait impl keeps its trait's contract (`conformance.rs`).
-	CheckConformance { impl_index: TraitImplIdx },
 	/// `Projection::name` was written, and the projection's declared bounds do
 	/// not name `name`. Whether its *value* has such a member depends on impls,
 	/// which construction cannot read, so the type was lowered to `ERROR` and
@@ -153,7 +152,7 @@ pub(super) enum TypeObligation {
 	},
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// The diagnostic for a normalization that ran out of its recursion budget,
 	/// reported at `site`, the construct that asked.
 	pub(super) fn overflow_diagnostic(
@@ -170,10 +169,11 @@ impl TypeContext<'_, '_, '_> {
 	/// `site`, the construct that asked.
 	pub(super) fn cycle_diagnostic(
 		&self,
+		strings: &StringInterner,
 		cycle: &ProjectionCycle,
 		site: SourceSpan,
 	) -> Diagnostic<FileId> {
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::CyclicAssociatedType.code())
 			.with_message(format!(
@@ -193,9 +193,10 @@ impl TypeContext<'_, '_, '_> {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	pub(super) fn check_obligation(
 		&mut self,
+		strings: &StringInterner,
 		obligation: &TypeObligation,
 	) -> Result<(), ()> {
 		match *obligation {
@@ -205,6 +206,7 @@ impl TypeContext<'_, '_, '_> {
 				reference,
 				owner,
 			} => match self.check_bound_requirements(
+				strings,
 				self.assumption_envs.of_frame(frame),
 				requirements,
 				reference,
@@ -212,7 +214,8 @@ impl TypeContext<'_, '_, '_> {
 			) {
 				Ok(_) => Ok(()),
 				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
 					self.diagnostics.push(diagnostic);
 					Ok(())
 				}
@@ -230,6 +233,7 @@ impl TypeContext<'_, '_, '_> {
 				reference,
 			} => {
 				match self.find_trait_impl_query(
+					strings,
 					self.assumption_envs.of_frame(frame),
 					subject,
 					required,
@@ -237,7 +241,7 @@ impl TypeContext<'_, '_, '_> {
 					Ok(Some(_)) => Ok(()),
 					Ok(None) => {
 						let diagnostic = report_type_does_not_implement_trait(
-							&self.type_formatter(),
+							&self.type_formatter(strings),
 							reference.file_id,
 							reference.span,
 							subject,
@@ -248,7 +252,7 @@ impl TypeContext<'_, '_, '_> {
 					}
 					Err(SolverError::Cycle(cycle)) => {
 						let diagnostic =
-							self.cycle_diagnostic(&cycle, reference);
+							self.cycle_diagnostic(strings, &cycle, reference);
 						self.diagnostics.push(diagnostic);
 						Ok(())
 					}
@@ -267,6 +271,7 @@ impl TypeContext<'_, '_, '_> {
 				reference,
 			} => {
 				match self.normalize(
+					strings,
 					self.assumption_envs.of_frame(frame),
 					ty,
 					NormalizationDepth::Deep,
@@ -275,7 +280,7 @@ impl TypeContext<'_, '_, '_> {
 					Ok(_) => Ok(()),
 					Err(SolverError::Cycle(cycle)) => {
 						let diagnostic =
-							self.cycle_diagnostic(&cycle, reference);
+							self.cycle_diagnostic(strings, &cycle, reference);
 						self.diagnostics.push(diagnostic);
 						Ok(())
 					}
@@ -296,7 +301,7 @@ impl TypeContext<'_, '_, '_> {
 				// kept for it. A failure another definition owns was reported
 				// there and stays silent here. Only "not decided yet" is
 				// forwarded.
-				match self.assoc_value(member, None) {
+				match self.assoc_value(strings, member, None) {
 					Ok(_) => Ok(()),
 					Err(SolverError::Pending) => Err(()),
 					Err(_) => {
@@ -308,8 +313,9 @@ impl TypeContext<'_, '_, '_> {
 								Ok(())
 							}
 							Verdict::Cyclic(cycle) => {
-								let diagnostic =
-									self.cycle_diagnostic(cycle, reference);
+								let diagnostic = self.cycle_diagnostic(
+									strings, cycle, reference,
+								);
 								self.diagnostics.push(diagnostic);
 								Ok(())
 							}
@@ -330,7 +336,7 @@ impl TypeContext<'_, '_, '_> {
 				// Like `CheckAssocValue`: ask once, then report the failure the
 				// impl's own verdict holds. Every selection of a failed impl
 				// stays silent.
-				match self.requirements_verdict(impl_kind) {
+				match self.requirements_verdict(strings, impl_kind) {
 					Ok(()) => Ok(()),
 					Err(SolverError::Pending) => Err(()),
 					Err(_) => {
@@ -350,6 +356,7 @@ impl TypeContext<'_, '_, '_> {
 									"an impl's requirements own a loop in a bound",
 								);
 								let diagnostic = self.cycle_diagnostic(
+									strings,
 									cycle,
 									self.bounds.span(bound),
 								);
@@ -372,6 +379,7 @@ impl TypeContext<'_, '_, '_> {
 				bits,
 				reference,
 			} => match self.check_constant_representable(
+				strings,
 				self.assumption_envs.of_frame(frame),
 				ty,
 				bits,
@@ -379,7 +387,8 @@ impl TypeContext<'_, '_, '_> {
 			) {
 				Ok(_) => Ok(()),
 				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
 					self.diagnostics.push(diagnostic);
 					Ok(())
 				}
@@ -396,6 +405,7 @@ impl TypeContext<'_, '_, '_> {
 				expected,
 				reference,
 			} => match self.check_constant_type(
+				strings,
 				self.assumption_envs.of_frame(frame),
 				length,
 				expected,
@@ -403,7 +413,8 @@ impl TypeContext<'_, '_, '_> {
 			) {
 				Ok(_) => Ok(()),
 				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
 					self.diagnostics.push(diagnostic);
 					Ok(())
 				}
@@ -420,6 +431,7 @@ impl TypeContext<'_, '_, '_> {
 				reference,
 			} => {
 				match self.check_value_type(
+					strings,
 					self.assumption_envs.of_frame(frame),
 					ty,
 					reference,
@@ -427,7 +439,7 @@ impl TypeContext<'_, '_, '_> {
 					Ok(_) => Ok(()),
 					Err(SolverError::Cycle(cycle)) => {
 						let diagnostic =
-							self.cycle_diagnostic(&cycle, reference);
+							self.cycle_diagnostic(strings, &cycle, reference);
 						self.diagnostics.push(diagnostic);
 						Ok(())
 					}
@@ -440,18 +452,15 @@ impl TypeContext<'_, '_, '_> {
 					Err(SolverError::Pending) => Err(()),
 				}
 			}
-			// Reports everything but "not decided yet" itself.
-			TypeObligation::CheckConformance { impl_index } => {
-				self.check_conformance(impl_index).map_err(|_| ())
-			}
 			TypeObligation::NormalizeSelfEntry {
 				frame,
 				clauses,
 				reference,
-			} => match self.normalize_self_entry(frame, clauses) {
+			} => match self.normalize_self_entry(strings, frame, clauses) {
 				Ok(()) => Ok(()),
 				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
 					self.diagnostics.push(diagnostic);
 					Ok(())
 				}
@@ -468,6 +477,7 @@ impl TypeContext<'_, '_, '_> {
 				name,
 				reference,
 			} => match self.check_projection_member(
+				strings,
 				self.assumption_envs.of_frame(frame),
 				projection,
 				name,
@@ -475,7 +485,8 @@ impl TypeContext<'_, '_, '_> {
 			) {
 				Ok(_) => Ok(()),
 				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic = self.cycle_diagnostic(&cycle, reference);
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
 					self.diagnostics.push(diagnostic);
 					Ok(())
 				}
@@ -490,17 +501,19 @@ impl TypeContext<'_, '_, '_> {
 	}
 }
 
-impl TypeContext<'_, '_, '_> {
+impl Semantics {
 	/// `bits` is representable as `ty`: an integer type, or every member of
 	/// every typeset an abstract one is bounded by.
 	fn check_constant_representable(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		bits: u64,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
 		let ty = self.normalize(
+			strings,
 			assumption_context,
 			ty,
 			NormalizationDepth::Deep,
@@ -515,12 +528,14 @@ impl TypeContext<'_, '_, '_> {
 			let diagnostic = match concrete {
 				ConcreteType::Member(typeset, member) => self
 					.report_typeset_member(
+						strings,
 						format_args!("`{bits}`"),
 						typeset,
 						member,
 						reference,
 					),
 				ConcreteType::Target(_) => self.report_out_of_range(
+					strings,
 					format_args!("`{bits}`"),
 					ty,
 					reference,
@@ -535,22 +550,24 @@ impl TypeContext<'_, '_, '_> {
 	/// `ty` may be held by value: it is a `StackValue`.
 	pub(super) fn check_value_type(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		match self.stack_value_repr(assumption_context, ty) {
+		match self.stack_value_repr(strings, assumption_context, ty) {
 			Ok(_) => return Ok(()),
 			Err(SolverError::Poisoned) => {}
 			Err(error) => return Err(error),
 		}
 		let Some(part) =
-			self.explain_non_stack_value(assumption_context, ty)?
+			self.explain_non_stack_value(strings, assumption_context, ty)?
 		else {
 			return Err(SolverError::Poisoned);
 		};
-		self.diagnostics
-			.push(self.not_stack_value_diagnostic(ty, part, reference));
+		self.diagnostics.push(
+			self.not_stack_value_diagnostic(strings, ty, part, reference),
+		);
 		Err(SolverError::Poisoned)
 	}
 
@@ -558,11 +575,12 @@ impl TypeContext<'_, '_, '_> {
 	/// `part` (`explain_non_stack_value`).
 	pub(super) fn not_stack_value_diagnostic(
 		&self,
+		strings: &StringInterner,
 		ty: TypeIndex,
 		part: TypeIndex,
 		reference: SourceSpan,
 	) -> Diagnostic<FileId> {
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let (found, part_name) =
 			(formatter.display_type(ty), formatter.display_type(part));
 		let (label, note) = match self.types.resolve(part) {
@@ -607,6 +625,7 @@ impl TypeContext<'_, '_, '_> {
 	/// the constant is named in.
 	fn check_constant_type(
 		&mut self,
+		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		length: TypeIndex,
 		expected: TypeIndex,
@@ -636,12 +655,14 @@ impl TypeContext<'_, '_, '_> {
 			env = assumption_context;
 		}
 		let found = self.normalize(
+			strings,
 			env,
 			ty,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let expected = self.normalize(
+			strings,
 			assumption_context,
 			expected,
 			NormalizationDepth::Deep,
@@ -656,11 +677,12 @@ impl TypeContext<'_, '_, '_> {
 		// An untyped integer constant is a count: its value is representable as
 		// the length's type, as a literal length's does.
 		if found == TypeIndex::INTEGER_LITERAL {
-			let Ok(value) = self.exact_value(constant) else {
+			let Ok(value) = self.exact_value(strings, constant) else {
 				return Ok(());
 			};
 			return match u64::try_from(value) {
 				Ok(bits) => self.check_constant_representable(
+					strings,
 					assumption_context,
 					expected,
 					bits,
@@ -669,9 +691,9 @@ impl TypeContext<'_, '_, '_> {
 				Err(_) => {
 					let message = format!(
 						"an array's length is a count, but `{}` is `{value}`",
-						self.strings
+						strings
 							.resolve(
-								self.defs.constants[usize::from(constant)]
+								self.decls.constants[usize::from(constant)]
 									.name
 									.inner
 							)
@@ -689,13 +711,13 @@ impl TypeContext<'_, '_, '_> {
 				}
 			};
 		}
-		let formatter = self.type_formatter();
+		let formatter = self.type_formatter(strings);
 		let (expected, found) = (
 			formatter.display_type(expected),
 			formatter.display_type(found),
 		);
-		let name = self.defs.constants[usize::from(constant)].name.inner;
-		let name = self.strings.resolve(name).unwrap();
+		let name = self.decls.constants[usize::from(constant)].name.inner;
+		let name = strings.resolve(name).unwrap();
 		self.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TypeMistmatch.code())
