@@ -2417,7 +2417,7 @@ mod tests {
 	use crate::diagnostics::Diagnostics;
 	use crate::tir::body::BodyOwner;
 	use crate::tir::decls::{ConstIdx, MemberOwner};
-	use crate::tir::resolutions::{Referent, Resolution, Selection};
+	use crate::tir::resolutions::Reference;
 
 	/// Every direct call in `mir`, across its functions.
 	fn call_count(mir: &mir::MIR) -> usize {
@@ -9221,24 +9221,26 @@ mod tests {
 		let fine_body = body(fine);
 		assert_eq!(fine_body.ty(fine_body.root()), TypeIndex::U32);
 
-		let resolutions = sema.resolutions.by_site.values();
-		let locals_of_broken = resolutions
-			.clone()
-			.filter(|resolution| {
+		let resolutions = sema.resolutions.references();
+		let locals_of_broken = sema
+			.resolutions
+			.references()
+			.filter(|reference| {
 				matches!(
-					resolution,
-					Resolution::Reference(Referent::Local {
+					reference,
+					Reference::Local {
 						owner: BodyOwner::Function(owner),
 						..
-					}) if *owner == broken
+					} if *owner == broken
 				)
 			})
 			.count();
 		// `p` twice and `sum` once; `missing` resolved to nothing.
 		assert_eq!(locals_of_broken, 3);
-		assert!(resolutions.into_iter().any(|resolution| matches!(
-			resolution,
-			Resolution::Selection(Selection::Field { .. })
-		)));
+		assert!(
+			resolutions
+				.into_iter()
+				.any(|reference| matches!(reference, Reference::Field { .. }))
+		);
 	}
 }

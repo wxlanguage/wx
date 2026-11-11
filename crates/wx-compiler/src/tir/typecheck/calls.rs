@@ -25,10 +25,10 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::decls::{
 	AssocTypeIdx, BindingKey, Declarations, FieldIdx, FunctionIdx, MemberKind,
-	MemberOwner, StructIdx, Tier,
+	MemberOwner, StructIdx,
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::resolutions::{Resolution, Selection};
+use crate::tir::resolutions::{AccessKind, ArgumentLabel, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
@@ -804,27 +804,24 @@ impl BodyBuilder<'_, '_> {
 				reported = true;
 				continue;
 			};
-			let selection = match target.kind {
-				CallTargetKind::Function(function) => Selection::Parameter {
-					function: naming_declaration(self.sema, function),
-					parameter: param,
-				},
-				CallTargetKind::StructConstructor(owner) => Selection::Field {
-					owner,
-					field: FieldIdx::new(u32::from(param)),
-				},
+			let label = match target.kind {
+				CallTargetKind::Function(function) => {
+					ArgumentLabel::Parameter {
+						function: naming_declaration(self.sema, function),
+						parameter: param,
+					}
+				}
+				CallTargetKind::StructConstructor(owner) => {
+					ArgumentLabel::Field {
+						owner,
+						field: FieldIdx::new(u32::from(param)),
+					}
+				}
 			};
-			let site =
-				(SourceSpan::new(self.scope.file_id, name.span), Tier::Value);
-			let resolution = if argument.value.is_none()
-				&& let Some(Resolution::Reference(value)) =
-					self.sema.resolutions.by_site.get(&site).copied()
-			{
-				Resolution::Shorthand { selection, value }
-			} else {
-				Resolution::Selection(selection)
-			};
-			self.sema.resolutions.by_site.insert(site, resolution);
+			self.sema.resolutions.record_reference(
+				Site::Label(SourceSpan::new(self.scope.file_id, name.span)),
+				Reference::ArgumentLabel(label),
+			);
 			if let Some(&(_, first)) =
 				named.iter().find(|&&(named, _)| named == param)
 			{
@@ -910,7 +907,12 @@ impl BodyBuilder<'_, '_> {
 					ident: argument.name,
 					type_args: Box::new([]),
 				}];
-				self.build_path(&path, hint, argument.name.span)
+				self.build_path(
+					&path,
+					hint,
+					argument.name.span,
+					AccessKind::Read,
+				)
 			}
 		}
 	}

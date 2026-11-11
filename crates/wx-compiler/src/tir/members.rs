@@ -24,7 +24,7 @@ use super::decls::{
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
 use super::obligations::{BoundRequirements, TypeObligation};
-use super::resolutions::Referent;
+use super::resolutions::{Referent, Site};
 use super::signatures::{
 	InferPolicy, LexicalScope, QueryInfo, Semantics, SemanticsBuilder,
 	SignatureLocation, SignatureStatus,
@@ -553,7 +553,7 @@ impl Semantics {
 			file_id,
 		)?;
 		self.resolutions.record(
-			(SourceSpan::new(file_id, name.span), key.tier),
+			Site::new(key.tier, SourceSpan::new(file_id, name.span)),
 			Referent::Member(kind),
 		);
 		// Naming the member does not need an impl; whether `receiver`
@@ -615,7 +615,7 @@ impl Semantics {
 			}
 		};
 		self.resolutions.record(
-			(SourceSpan::new(file_id, name.span), Tier::Value),
+			Site::Value(SourceSpan::new(file_id, name.span)),
 			Referent::Member(member.selected_kind(&self.decls)),
 		);
 		Ok(member)
@@ -1253,10 +1253,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				reference: SourceSpan::new(scope.file_id, segment.ident.span),
 			});
 			sema.resolutions.record(
-				(
-					SourceSpan::new(scope.file_id, segment.ident.span),
-					Tier::Type,
-				),
+				Site::Type(SourceSpan::new(scope.file_id, segment.ident.span)),
 				Referent::Member(declaration),
 			);
 			current = match declaration {
@@ -1377,7 +1374,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			reference,
 		});
 		sema.resolutions
-			.record((reference, Tier::Value), Referent::Member(declaration));
+			.record(Site::Value(reference), Referent::Member(declaration));
 		Some((constant, vec![receiver]))
 	}
 
@@ -1496,7 +1493,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				GenericEnvOwner::InherentImpl(impl_index),
 			);
 			sema.resolutions
-				.record((reference, key.tier), Referent::Member(kind));
+				.record(Site::new(key.tier, reference), Referent::Member(kind));
 			return Some((kind, impl_args.into_vec()));
 		}
 		None

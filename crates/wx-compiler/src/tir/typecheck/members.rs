@@ -21,15 +21,15 @@ use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::decls::{
-	BindingKey, ConstIdx, DeclKind, InherentImplIdx, MemberKind, Tier,
-	TraitIdx, Visibility,
+	BindingKey, ConstIdx, DeclKind, InherentImplIdx, MemberKind, TraitIdx,
+	Visibility,
 };
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
 	ApplicableMember, MemberLookup, TraitImplLookup, TraitMemberSelection,
 	report_ambiguous_type_member,
 };
-use crate::tir::resolutions::Referent;
+use crate::tir::resolutions::{Referent, Site};
 use crate::tir::satisfaction::{
 	TypeArgsNotAllowedOn, report_type_args_not_allowed,
 };
@@ -594,7 +594,7 @@ impl BodyBuilder<'_, '_> {
 			}
 		};
 		self.sema.resolutions.record(
-			(reference, Tier::Value),
+			Site::Value(reference),
 			Referent::Member(found.selected_kind(&self.sema.decls)),
 		);
 		self.check_member_access(found, key, member);

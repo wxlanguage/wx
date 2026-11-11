@@ -19,9 +19,12 @@
 //! Identities are local to one compilation; locals and labels need their body
 //! owner, and fields need their struct because their indices are owner-relative.
 //!
-//! A shorthand argument (`f({ x })` or `S({ x })`) has two references at
-//! one span and value tier. `Resolution::Shorthand` preserves both the label's
-//! parameter/field and the value it supplies; the lookup key stays unchanged.
+//! A written name can mean two things at one span: a `use` leaf names a type
+//! and a value, and a shorthand argument (`f({ x })`, `S({ x })`) is a label
+//! and the value it supplies. A `Site` says which role an entry is for,
+//! so each meaning has an entry of its own: `Type` and `Value` are the
+//! namespace tiers a name is looked up in, `Label` is a name that is not
+//! looked up at all.
 
 use std::collections::BTreeMap;
 
@@ -33,43 +36,133 @@ use super::decls::{
 use super::types::GenericEnvIdx;
 use crate::diagnostics::SourceSpan;
 
-/// Keyed by the written name's span and the tier it was looked up in: a
-/// `use` leaf names a type and a value at the same span.
+/// Where a name is written, and the role it plays there; see the module doc.
+/// Entries order by position first, so what is written at one place is
+/// adjacent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub(super) enum Site {
+	/// Looked up among types.
+	Type(SourceSpan),
+	/// Looked up among values.
+	Value(SourceSpan),
+	/// A name that picks out a declaration by where it is written: a named
+	/// argument's parameter or field, a `break`'s label.
+	Label(SourceSpan),
+}
+
+impl Site {
+	/// The site of a name looked up in `tier`.
+	pub(super) fn new(tier: Tier, span: SourceSpan) -> Self {
+		match tier {
+			Tier::Type => Site::Type(span),
+			Tier::Value => Site::Value(span),
+		}
+	}
+
+	pub(super) fn span(self) -> SourceSpan {
+		match self {
+			Site::Type(span) | Site::Value(span) | Site::Label(span) => span,
+		}
+	}
+
+	fn role(self) -> u8 {
+		match self {
+			Site::Type(_) => 0,
+			Site::Value(_) => 1,
+			Site::Label(_) => 2,
+		}
+	}
+}
+
+impl Ord for Site {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		(self.span(), self.role()).cmp(&(other.span(), other.role()))
+	}
+}
+
+impl PartialOrd for Site {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
 #[derive(Default)]
 pub(super) struct NameResolutions {
-	pub(super) by_site: BTreeMap<(SourceSpan, Tier), Resolution>,
+	pub(super) by_site: BTreeMap<Site, Reference>,
 }
 
 impl NameResolutions {
-	pub(super) fn record(
-		&mut self,
-		site: (SourceSpan, Tier),
-		referent: Referent,
-	) {
-		self.by_site.insert(site, Resolution::Reference(referent));
+	pub(super) fn record(&mut self, site: Site, referent: Referent) {
+		self.record_reference(site, Reference::Name(referent));
 	}
 
-	pub(super) fn record_selection(
+	pub(super) fn record_reference(
 		&mut self,
-		site: (SourceSpan, Tier),
-		selection: Selection,
+		site: Site,
+		reference: Reference,
 	) {
-		self.by_site.insert(site, Resolution::Selection(selection));
+		self.by_site.insert(site, reference);
+	}
+
+	pub(super) fn get(&self, site: Site) -> Option<Reference> {
+		self.by_site.get(&site).copied()
+	}
+
+	#[cfg(test)]
+	pub(super) fn references(&self) -> impl Iterator<Item = Reference> + '_ {
+		self.by_site.values().copied()
+	}
+
+	/// Sets the access of the local recorded at `site`.
+	pub(super) fn set_local_access(&mut self, site: Site, access: AccessKind) {
+		if let Some(Reference::Local {
+			access: recorded, ..
+		}) = self.by_site.get_mut(&site)
+		{
+			*recorded = access;
+		}
+	}
+
+	/// Makes the local or field recorded at `site` a plain read, for a name
+	/// first recorded as written that turned out to be only read through.
+	pub(super) fn downgrade_to_read(&mut self, site: Site) {
+		if let Some(
+			Reference::Local { access, .. } | Reference::Field { access, .. },
+		) = self.by_site.get_mut(&site)
+		{
+			*access = AccessKind::Read;
+		}
 	}
 }
 
-/// The meaning of one written name: one target, or the two targets of shorthand.
+/// The meaning and access of one written name. Parameters used in bodies are
+/// locals; parameter labels identify the callee's declaration, not a read of it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Resolution {
-	Reference(Referent),
-	Selection(Selection),
-	/// `selection` is a parameter or field; `value` is the independently resolved
-	/// value name, which can be a local, a constant, or an imported definition.
-	Shorthand {
-		selection: Selection,
-		value: Referent,
+pub(super) enum Reference {
+	Name(Referent),
+	Local {
+		owner: BodyOwner,
+		local: LocalIdx,
+		access: AccessKind,
 	},
+	Field {
+		owner: StructIdx,
+		field: FieldIdx,
+		access: AccessKind,
+	},
+	ArgumentLabel(ArgumentLabel),
+}
+
+/// How a use reaches a local or a field. A field label that initializes is
+/// not one: that is `ArgumentLabel::Field`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub(super) enum AccessKind {
+	Read,
+	Write,
+	ReadWrite,
 }
 
 /// A target reached through name lookup, independent of its source occurrence.
@@ -97,17 +190,16 @@ pub(super) enum Referent {
 	TraitImplSelf(TraitImplIdx),
 	/// A member selected through a type: `T::A`, `<X as Tr>::A`.
 	Member(MemberKind),
-	/// A local of the body `owner`: a parameter or a `local`.
-	Local { owner: BodyOwner, local: LocalIdx },
 	/// A label of the body `owner`, named by a `break` or `continue`.
 	Label { owner: BodyOwner, label: LabelIdx },
 }
 
-/// A field or parameter selected by name from a known owner.
+/// A named call argument. A field label always initializes that field;
+/// pattern fields instead use `Reference::Field` with read access.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum Selection {
-	/// A field selected on a struct value, a place or a named pattern.
+pub(super) enum ArgumentLabel {
+	/// A constructor field initialized by this argument.
 	Field { owner: StructIdx, field: FieldIdx },
 	/// A named argument's parameter, owned by the declaration whose names the
 	/// call uses (the trait declaration for a trait implementation's method).
@@ -137,6 +229,12 @@ impl Referent {
 
 #[cfg(test)]
 mod tests {
+	#[derive(Debug, PartialEq, Eq)]
+	struct Shorthand {
+		label: ArgumentLabel,
+		value: Reference,
+	}
+
 	use indoc::indoc;
 
 	use super::*;
@@ -214,27 +312,34 @@ mod tests {
 			context: &str,
 			name: &str,
 			tier: Tier,
-		) -> Option<Referent> {
-			self.resolution(context, name, tier).map(|resolution| {
-				let Resolution::Reference(referent) = resolution else {
-					panic!("expected one target for `{name}` in `{context}`");
-				};
-				referent
-			})
-		}
-
-		fn resolution(
-			&self,
-			context: &str,
-			name: &str,
-			tier: Tier,
-		) -> Option<Resolution> {
+		) -> Option<Reference> {
 			let span = self.span(context, name);
 			self.sema
 				.resolutions
-				.by_site
-				.get(&(SourceSpan::new(self.file, span), tier))
-				.copied()
+				.get(Site::new(tier, SourceSpan::new(self.file, span)))
+		}
+
+		/// The label recorded at `name`: an argument's or a jump's.
+		fn label(&self, context: &str, name: &str) -> Reference {
+			let span = self.span(context, name);
+			self.sema
+				.resolutions
+				.get(Site::Label(SourceSpan::new(self.file, span)))
+				.unwrap_or_else(|| {
+					panic!("label `{name}` in `{context}` was not recorded")
+				})
+		}
+
+		/// A shorthand argument: its label and the value it supplies.
+		fn shorthand(&self, context: &str, name: &str) -> Option<Shorthand> {
+			let Reference::ArgumentLabel(label) = self.label(context, name)
+			else {
+				panic!("expected an argument label");
+			};
+			Some(Shorthand {
+				label,
+				value: self.at(context, name, Tier::Value)?,
+			})
 		}
 
 		fn span(&self, context: &str, name: &str) -> TextSpan {
@@ -243,19 +348,16 @@ mod tests {
 			TextSpan::new(start as u32, (start + name.len()) as u32)
 		}
 
-		fn value(&self, context: &str, name: &str) -> Referent {
+		fn value(&self, context: &str, name: &str) -> Reference {
 			self.at(context, name, Tier::Value).unwrap_or_else(|| {
 				panic!("`{name}` in `{context}` was not recorded")
 			})
 		}
 
-		fn selection(&self, context: &str, name: &str) -> Selection {
-			let Some(Resolution::Selection(selection)) =
-				self.resolution(context, name, Tier::Value)
-			else {
-				panic!("expected a selection for `{name}` in `{context}`");
-			};
-			selection
+		fn reference(&self, context: &str, name: &str) -> Reference {
+			self.at(context, name, Tier::Value).unwrap_or_else(|| {
+				panic!("expected a reference for `{name}` in `{context}`")
+			})
 		}
 
 		fn resolve(&self, path: &str, tier: Tier) -> DeclKind {
@@ -344,12 +446,34 @@ mod tests {
 		"});
 		let x = a.value("= x;", "x");
 		let y = a.value("y = x +", "y");
-		assert!(matches!(x, Referent::Local { .. }));
-		assert!(matches!(y, Referent::Local { .. }));
+		assert!(matches!(x, Reference::Local { .. }));
+		assert!(matches!(y, Reference::Local { .. }));
 		assert_ne!(x, y);
 		assert_eq!(x, a.value("= x +", "x"));
-		assert_eq!(y, a.value("y +=", "y"));
-		assert_eq!(y, a.value("\n\ty\n", "y"));
+		let Reference::Local {
+			owner,
+			local,
+			access: AccessKind::Write,
+		} = y
+		else {
+			panic!()
+		};
+		assert_eq!(
+			a.value("y +=", "y"),
+			Reference::Local {
+				owner,
+				local,
+				access: AccessKind::ReadWrite
+			}
+		);
+		assert_eq!(
+			a.value("\n\ty\n", "y"),
+			Reference::Local {
+				owner,
+				local,
+				access: AccessKind::Read
+			}
+		);
 		assert_ne!(y, a.value("\n\t\ty\n", "y"));
 		// Bindings are declarations, not references.
 		assert_eq!(a.at("mut y =", "y", Tier::Value), None);
@@ -361,11 +485,19 @@ mod tests {
 			func f(x: u32) -> u32 { x }
 			func g(x: u32) -> u32 { x + 1 }
 		"});
-		let Referent::Local { owner: f, local: x } = a.value("{ x }", "x")
+		let Reference::Local {
+			owner: f,
+			local: x,
+			access: AccessKind::Read,
+		} = a.value("{ x }", "x")
 		else {
 			panic!()
 		};
-		let Referent::Local { owner: g, local: y } = a.value("{ x +", "x")
+		let Reference::Local {
+			owner: g,
+			local: y,
+			access: AccessKind::Read,
+		} = a.value("{ x +", "x")
 		else {
 			panic!()
 		};
@@ -383,8 +515,8 @@ mod tests {
 		"});
 		let left = a.value("left +", "left");
 		let right = a.value("+ right", "right");
-		assert!(matches!(left, Referent::Local { .. }));
-		assert!(matches!(right, Referent::Local { .. }));
+		assert!(matches!(left, Reference::Local { .. }));
+		assert!(matches!(right, Reference::Local { .. }));
 		assert_ne!(left, right);
 	}
 
@@ -402,12 +534,15 @@ mod tests {
 		"});
 		assert!(matches!(
 			a.at("m::run();", "m", Tier::Type),
-			Some(Referent::Declaration(_))
+			Some(Reference::Name(Referent::Declaration(_)))
 		));
-		let Referent::Declaration(direct) = a.value("m::run();", "run") else {
+		let Reference::Name(Referent::Declaration(direct)) =
+			a.value("m::run();", "run")
+		else {
 			panic!()
 		};
-		let Referent::Import { declaration, .. } = a.value("alias();", "alias")
+		let Reference::Name(Referent::Import { declaration, .. }) =
+			a.value("alias();", "alias")
 		else {
 			panic!()
 		};
@@ -428,7 +563,7 @@ mod tests {
 		"});
 		assert!(matches!(
 			a.at("x: T", "T", Tier::Type),
-			Some(Referent::TypeParam { .. })
+			Some(Reference::Name(Referent::TypeParam { .. }))
 		));
 		assert_eq!(
 			a.at("x: T", "T", Tier::Type),
@@ -436,7 +571,7 @@ mod tests {
 		);
 		assert!(matches!(
 			a.value("s.get()", "get"),
-			Referent::Member(MemberKind::Method(_))
+			Reference::Name(Referent::Member(MemberKind::Method(_)))
 		));
 	}
 
@@ -450,34 +585,45 @@ mod tests {
 				a.value
 			}
 		"});
-		let first = a.selection("a.value =", "value");
+		let first = a.reference("a.value =", "value");
 		assert_eq!(
 			first,
-			Selection::Field {
+			Reference::Field {
 				owner: a.struct_index("A"),
 				field: FieldIdx::new(0),
+				access: AccessKind::Write,
 			}
 		);
-		assert_eq!(first, a.selection("\n\ta.value\n", "value"));
-		let Selection::Field {
+		assert_eq!(
+			a.reference("\n\ta.value\n", "value"),
+			Reference::Field {
+				owner: a.struct_index("A"),
+				field: FieldIdx::new(0),
+				access: AccessKind::Read
+			}
+		);
+		let Reference::Field {
 			owner: a_owner,
 			field: a_field,
+			access: AccessKind::Write,
 		} = first
 		else {
 			panic!()
 		};
-		let Selection::Field {
+		let Reference::Field {
 			owner: b_owner,
 			field: b_field,
-		} = a.selection("b.value;", "value")
+			access: AccessKind::Read,
+		} = a.reference("b.value;", "value")
 		else {
 			panic!()
 		};
 		assert_eq!(
-			a.selection("b.value;", "value"),
-			Selection::Field {
+			a.reference("b.value;", "value"),
+			Reference::Field {
 				owner: a.struct_index("B"),
 				field: FieldIdx::new(0),
+				access: AccessKind::Read,
 			}
 		);
 		assert_eq!(a_field, b_field);
@@ -508,15 +654,15 @@ mod tests {
 				x
 			}
 		"});
-		let selection = Selection::Parameter {
+		let selection = ArgumentLabel::Parameter {
 			function: a.function_index("take"),
 			parameter: ParamIdx::new(0),
 		};
-		assert_eq!(a.selection("{ x: 1", "x"), selection);
+		assert_eq!(a.label("{ x: 1", "x"), Reference::ArgumentLabel(selection));
 		assert_eq!(
-			a.resolution("{ x }", "x", Tier::Value),
-			Some(Resolution::Shorthand {
-				selection,
+			a.shorthand("{ x }", "x"),
+			Some(Shorthand {
+				label: selection,
 				value: a.value("\n\tx\n", "x"),
 			})
 		);
@@ -532,15 +678,18 @@ mod tests {
 				value
 			}
 		"});
-		let field = Selection::Field {
+		let field = ArgumentLabel::Field {
 			owner: a.struct_index("S"),
 			field: FieldIdx::new(1),
 		};
-		assert_eq!(a.selection("value: 1", "value"), field);
 		assert_eq!(
-			a.resolution("value });", "value", Tier::Value),
-			Some(Resolution::Shorthand {
-				selection: field,
+			a.label("value: 1", "value"),
+			Reference::ArgumentLabel(field)
+		);
+		assert_eq!(
+			a.shorthand("value });", "value"),
+			Some(Shorthand {
+				label: field,
 				value: a.value("\n\tvalue\n", "value"),
 			})
 		);
@@ -558,11 +707,11 @@ mod tests {
 			}
 		"});
 		let value = a.value("\n\tvalue\n", "value");
-		assert!(matches!(value, Referent::Import { .. }));
+		assert!(matches!(value, Reference::Name(Referent::Import { .. })));
 		assert_eq!(
-			a.resolution("{ value }", "value", Tier::Value),
-			Some(Resolution::Shorthand {
-				selection: Selection::Parameter {
+			a.shorthand("{ value }", "value"),
+			Some(Shorthand {
+				label: ArgumentLabel::Parameter {
 					function: a.function_index("take"),
 					parameter: ParamIdx::new(0),
 				},
@@ -581,11 +730,11 @@ mod tests {
 		"});
 		assert!(a.has_errors());
 		assert_eq!(
-			a.selection("{ value }", "value"),
-			Selection::Parameter {
+			a.label("{ value }", "value"),
+			Reference::ArgumentLabel(ArgumentLabel::Parameter {
 				function: a.function_index("take"),
 				parameter: ParamIdx::new(0),
-			}
+			})
 		);
 	}
 
@@ -640,15 +789,16 @@ mod tests {
 			("T::make({ value })", "generic"),
 		] {
 			assert_eq!(
-				a.resolution(call, "value", Tier::Value),
-				Some(Resolution::Shorthand {
-					selection: Selection::Parameter {
+				a.shorthand(call, "value"),
+				Some(Shorthand {
+					label: ArgumentLabel::Parameter {
 						function,
 						parameter: ParamIdx::new(0),
 					},
-					value: Referent::Local {
+					value: Reference::Local {
 						owner: BodyOwner::Function(a.function_index(caller)),
 						local: LocalIdx::new(0),
+						access: AccessKind::Read,
 					},
 				})
 			);
@@ -666,17 +816,18 @@ mod tests {
 			}
 		"});
 		assert_eq!(
-			a.selection("{ value: x", "value"),
-			Selection::Field {
+			a.reference("{ value: x", "value"),
+			Reference::Field {
 				owner: a.struct_index("S"),
 				field: FieldIdx::new(0),
+				access: AccessKind::Read,
 			}
 		);
 		assert_eq!(
-			a.selection("{ value: x", "value"),
-			a.selection("s.value;", "value")
+			a.reference("{ value: x", "value"),
+			a.reference("s.value;", "value")
 		);
-		assert!(matches!(a.value("\n\tx\n", "x"), Referent::Local { .. }));
+		assert!(matches!(a.value("\n\tx\n", "x"), Reference::Local { .. }));
 	}
 
 	#[test]
@@ -690,19 +841,20 @@ mod tests {
 			}
 		"});
 		assert_eq!(
-			a.selection("p.value =", "value"),
-			Selection::Field {
+			a.reference("p.value =", "value"),
+			Reference::Field {
 				owner: a.struct_index("S"),
 				field: FieldIdx::new(0),
+				access: AccessKind::Write,
 			}
 		);
 		assert_eq!(
-			a.selection("p.value =", "value"),
-			a.selection("s.value;", "value")
+			a.reference("\n\tp.value\n", "value"),
+			a.reference("s.value;", "value")
 		);
-		assert_eq!(
-			a.selection("p.value =", "value"),
-			a.selection("\n\tp.value\n", "value")
+		assert_ne!(
+			a.reference("p.value =", "value"),
+			a.reference("\n\tp.value\n", "value")
 		);
 	}
 
@@ -716,9 +868,9 @@ mod tests {
 				}
 			}
 		"});
-		let label = a.value("break :outer", "outer");
-		assert!(matches!(label, Referent::Label { .. }));
-		assert_eq!(label, a.value("continue :outer", "outer"));
+		let label = a.label("break :outer", "outer");
+		assert!(matches!(label, Reference::Name(Referent::Label { .. })));
+		assert_eq!(label, a.label("continue :outer", "outer"));
 		assert_eq!(a.at("loop :outer", "outer", Tier::Value), None);
 	}
 
@@ -733,7 +885,7 @@ mod tests {
 		assert!(a.has_errors());
 		assert!(matches!(
 			a.at("m::missing", "m", Tier::Type),
-			Some(Referent::Declaration(_))
+			Some(Reference::Name(Referent::Declaration(_)))
 		));
 		assert_eq!(a.at("m::missing", "missing", Tier::Value), None);
 	}
@@ -750,10 +902,11 @@ mod tests {
 		"});
 		assert!(a.has_errors());
 		assert_eq!(
-			a.selection("s.value", "value"),
-			Selection::Field {
+			a.reference("s.value", "value"),
+			Reference::Field {
 				owner: a.struct_index("m::S"),
 				field: FieldIdx::new(1),
+				access: AccessKind::Read,
 			}
 		);
 	}
@@ -769,17 +922,19 @@ mod tests {
 		"});
 		let function = a.function_index("f");
 		assert_eq!(
-			a.selection("{ value }", "value"),
-			Selection::Field {
+			a.reference("{ value }", "value"),
+			Reference::Field {
 				owner: a.struct_index("S"),
 				field: FieldIdx::new(0),
+				access: AccessKind::Read,
 			}
 		);
 		assert_eq!(
 			a.value("\n\tvalue\n", "value"),
-			Referent::Local {
+			Reference::Local {
 				owner: BodyOwner::Function(function),
 				local: LocalIdx::new(1),
+				access: AccessKind::Read,
 			}
 		);
 		let declaration = a.local(function, 1);
@@ -802,11 +957,11 @@ mod tests {
 				<T as Tr>::make(value)
 			}
 		"});
-		let parameter = Referent::TypeParam {
+		let parameter = Reference::Name(Referent::TypeParam {
 			env: a.sema.functions[usize::from(a.function_index("f"))]
 				.type_params,
 			index: 0,
-		};
+		});
 		for context in [
 			"value: T::Value",
 			"-> <T as Tr>::Value",
@@ -819,26 +974,36 @@ mod tests {
 		for context in ["value: T::Value", "-> <T as Tr>::Value"] {
 			assert_eq!(
 				a.at(context, "Value", Tier::Type),
-				Some(Referent::Member(a.trait_member(
+				Some(Reference::Name(Referent::Member(a.trait_member(
 					"Tr",
 					"Value",
 					Tier::Type
-				)))
+				))))
 			);
 		}
 		for context in ["T::COUNT", "<T as Tr>::COUNT"] {
 			assert_eq!(
 				a.value(context, "COUNT"),
-				Referent::Member(a.trait_member("Tr", "COUNT", Tier::Value))
+				Reference::Name(Referent::Member(a.trait_member(
+					"Tr",
+					"COUNT",
+					Tier::Value
+				)))
 			);
 		}
 		assert_eq!(
 			a.value("<T as Tr>::make", "make"),
-			Referent::Member(a.trait_member("Tr", "make", Tier::Value))
+			Reference::Name(Referent::Member(a.trait_member(
+				"Tr",
+				"make",
+				Tier::Value
+			)))
 		);
 		assert_eq!(
 			a.at("<T as Tr>::make", "Tr", Tier::Type),
-			Some(Referent::Declaration(a.declaration("Tr", Tier::Type)))
+			Some(Reference::Name(Referent::Declaration(
+				a.declaration("Tr", Tier::Type)
+			)))
 		);
 	}
 
@@ -861,10 +1026,10 @@ mod tests {
 		};
 		assert_eq!(
 			a.at("self: Self", "Self", Tier::Type),
-			Some(Referent::TypeParam {
+			Some(Reference::Name(Referent::TypeParam {
 				env: a.sema.traits[usize::from(trait_index)].env,
 				index: 0,
-			})
+			}))
 		);
 		let target = ImplTarget::Struct(a.struct_index("S"));
 		let &[inherent] = a.sema.impl_dispatch.inherent_candidates(target)
@@ -873,11 +1038,11 @@ mod tests {
 		};
 		assert_eq!(
 			a.at("make() -> Self", "Self", Tier::Type),
-			Some(Referent::InherentImplSelf(inherent))
+			Some(Reference::Name(Referent::InherentImplSelf(inherent)))
 		);
 		assert_eq!(
 			a.at("{ Self()", "Self", Tier::Value),
-			Some(Referent::InherentImplSelf(inherent))
+			Some(Reference::Name(Referent::InherentImplSelf(inherent)))
 		);
 		let &[(actual_trait, implementation)] =
 			a.sema.impl_dispatch.trait_candidates(target)
@@ -887,7 +1052,7 @@ mod tests {
 		assert_eq!(actual_trait, trait_index);
 		assert_eq!(
 			a.at("impl Tr for S {\n\tfunc id(self: Self)", "Self", Tier::Type),
-			Some(Referent::TraitImplSelf(implementation))
+			Some(Reference::Name(Referent::TraitImplSelf(implementation)))
 		);
 		let MemberKind::Method(function) =
 			a.trait_member("Tr", "id", Tier::Value)
@@ -896,9 +1061,10 @@ mod tests {
 		};
 		assert_eq!(
 			a.value("{ self }", "self"),
-			Referent::Local {
+			Reference::Local {
 				owner: BodyOwner::Function(function),
 				local: LocalIdx::new(0),
+				access: AccessKind::Read,
 			}
 		);
 	}
@@ -916,22 +1082,19 @@ mod tests {
 		let declaration = a.declaration("m::run", Tier::Value);
 		assert_eq!(
 			a.value("use m::run", "run"),
-			Referent::Declaration(declaration)
+			Reference::Name(Referent::Declaration(declaration))
 		);
 		let imported = a.value("alias();", "alias");
-		let Referent::Import {
+		let Reference::Name(Referent::Import {
 			declaration: actual,
 			..
-		} = imported
+		}) = imported
 		else {
 			panic!("expected an import")
 		};
 		assert_eq!(actual, declaration);
 		assert_eq!(a.value("export alias", "alias"), imported);
-		assert_eq!(
-			a.resolution("as \"external\"", "external", Tier::Value),
-			None
-		);
+		assert_eq!(a.at("as \"external\"", "external", Tier::Value), None);
 	}
 
 	#[test]
@@ -951,15 +1114,19 @@ mod tests {
 		for tier in [Tier::Type, Tier::Value] {
 			assert_eq!(
 				a.at("use m::S", "S", tier),
-				Some(Referent::Declaration(a.declaration("m::S", tier)))
+				Some(Reference::Name(Referent::Declaration(
+					a.declaration("m::S", tier)
+				)))
 			);
 		}
 		let imported = a.value("\n\tS()", "S");
-		let Referent::Import { declaration, .. } = imported else {
+		let Reference::Name(Referent::Import { declaration, .. }) = imported
+		else {
 			panic!("expected a named import")
 		};
 		assert_eq!(declaration, a.declaration("m::S", Tier::Value));
-		let Referent::Import { declaration, .. } = a.value("run();", "run")
+		let Reference::Name(Referent::Import { declaration, .. }) =
+			a.value("run();", "run")
 		else {
 			panic!("expected a glob import")
 		};
@@ -979,22 +1146,24 @@ mod tests {
 		"});
 		assert!(a.has_errors());
 		let function = a.function_index("f");
-		let receiver = Referent::Local {
+		let receiver = Reference::Local {
 			owner: BodyOwner::Function(function),
 			local: LocalIdx::new(0),
+			access: AccessKind::Read,
 		};
-		let argument = Referent::Local {
+		let argument = Reference::Local {
 			owner: BodyOwner::Function(function),
 			local: LocalIdx::new(1),
+			access: AccessKind::Read,
 		};
 		assert_eq!(a.value("s.missing", "s"), receiver);
 		assert_eq!(a.value("s.absent", "s"), receiver);
 		assert_eq!(a.value("missing(x)", "x"), argument);
 		assert_eq!(a.value("value: x", "x"), argument);
-		assert_eq!(a.resolution("value: x", "value", Tier::Value), None);
+		assert_eq!(a.at("value: x", "value", Tier::Value), None);
 		assert_eq!(a.value("\n\tx\n", "x"), argument);
-		assert_eq!(a.resolution("s.missing", "missing", Tier::Value), None);
-		assert_eq!(a.resolution("s.absent", "absent", Tier::Value), None);
+		assert_eq!(a.at("s.missing", "missing", Tier::Value), None);
+		assert_eq!(a.at("s.absent", "absent", Tier::Value), None);
 	}
 
 	#[test]
@@ -1008,31 +1177,33 @@ mod tests {
 		"});
 		assert!(a.has_errors());
 		assert_eq!(
-			a.resolution("{ x,", "x", Tier::Value),
-			Some(Resolution::Shorthand {
-				selection: Selection::Parameter {
+			a.shorthand("{ x,", "x"),
+			Some(Shorthand {
+				label: ArgumentLabel::Parameter {
 					function: a.function_index("take"),
 					parameter: ParamIdx::new(0)
 				},
-				value: Referent::Local {
+				value: Reference::Local {
 					owner: BodyOwner::Function(a.function_index("f")),
-					local: LocalIdx::new(0)
+					local: LocalIdx::new(0),
+					access: AccessKind::Read,
 				},
 			})
 		);
 		assert_eq!(
-			a.selection("y: missing", "y"),
-			Selection::Parameter {
+			a.label("y: missing", "y"),
+			Reference::ArgumentLabel(ArgumentLabel::Parameter {
 				function: a.function_index("take"),
 				parameter: ParamIdx::new(1)
-			}
+			})
 		);
-		assert_eq!(a.resolution("y: missing", "missing", Tier::Value), None);
+		assert_eq!(a.at("y: missing", "missing", Tier::Value), None);
 		assert_eq!(
 			a.value("\n\tx\n", "x"),
-			Referent::Local {
+			Reference::Local {
 				owner: BodyOwner::Function(a.function_index("f")),
-				local: LocalIdx::new(0)
+				local: LocalIdx::new(0),
+				access: AccessKind::Read,
 			}
 		);
 	}
@@ -1049,14 +1220,15 @@ mod tests {
 			}
 		"});
 		assert!(a.has_errors());
-		let expected = Referent::Local {
+		let expected = Reference::Local {
 			owner: BodyOwner::Function(a.function_index("f")),
 			local: LocalIdx::new(0),
+			access: AccessKind::Read,
 		};
 		for context in ["missing(x)", "{ x }", "value: x", "\n\tx\n"] {
 			assert_eq!(a.value(context, "x"), expected);
 		}
-		assert_eq!(a.resolution("value: x", "value", Tier::Value), None);
+		assert_eq!(a.at("value: x", "value", Tier::Value), None);
 	}
 
 	#[test]
@@ -1075,25 +1247,34 @@ mod tests {
 		"#});
 		assert_eq!(
 			a.at("super::types::S", "types", Tier::Type),
-			Some(Referent::Declaration(a.declaration("types", Tier::Type)))
+			Some(Reference::Name(Referent::Declaration(
+				a.declaration("types", Tier::Type)
+			)))
 		);
 		assert_eq!(
 			a.at("super::types::S", "S", Tier::Type),
-			Some(Referent::Declaration(a.declaration("types::S", Tier::Type)))
+			Some(Reference::Name(Referent::Declaration(
+				a.declaration("types::S", Tier::Type)
+			)))
 		);
 		assert_eq!(
 			a.at("host::run", "host", Tier::Type),
-			Some(Referent::Declaration(a.declaration("host", Tier::Type)))
+			Some(Reference::Name(Referent::Declaration(
+				a.declaration("host", Tier::Type)
+			)))
 		);
 		assert_eq!(
 			a.value("host::run", "run"),
-			Referent::Declaration(a.declaration("host::run", Tier::Value))
+			Reference::Name(Referent::Declaration(
+				a.declaration("host::run", Tier::Value)
+			))
 		);
 		assert_eq!(
 			a.value("run(value)", "value"),
-			Referent::Local {
+			Reference::Local {
 				owner: BodyOwner::Function(a.function_index("f")),
 				local: LocalIdx::new(0),
+				access: AccessKind::Read,
 			}
 		);
 	}
@@ -1112,15 +1293,241 @@ mod tests {
 		"});
 		assert_eq!(
 			a.value("const LIMIT =>", "LIMIT"),
-			Referent::Declaration(a.declaration("LIMIT", Tier::Value))
+			Reference::Name(Referent::Declaration(
+				a.declaration("LIMIT", Tier::Value)
+			))
 		);
 		assert_eq!(
 			a.at("E::A =>", "E", Tier::Type),
-			Some(Referent::Declaration(a.declaration("E", Tier::Type)))
+			Some(Reference::Name(Referent::Declaration(
+				a.declaration("E", Tier::Type)
+			)))
 		);
 		assert_eq!(
 			a.value("E::A =>", "A"),
-			Referent::Declaration(a.declaration("E::A", Tier::Value))
+			Reference::Name(Referent::Declaration(
+				a.declaration("E::A", Tier::Value)
+			))
 		);
+	}
+
+	#[test]
+	fn only_the_named_target_of_a_write_is_written() {
+		let a = Analysis::clean(indoc! {"
+			memory heap: u32;
+			struct Inner(value: u32);
+			struct Outer(inner: Inner, pointer: heap::*Inner);
+			func f(mut s: Outer, p: heap::*Outer, n: u32) {
+				s.inner.value = n;
+				(s.inner.value) += n;
+				p.inner.value = n;
+				s.pointer.value += n;
+				p.pointer.value += n;
+				p.* = s;
+				local _ = p.inner.value.&;
+			}
+		"});
+		let local = |index, access| Reference::Local {
+			owner: BodyOwner::Function(a.function_index("f")),
+			local: LocalIdx::new(index),
+			access,
+		};
+		assert_eq!(
+			a.value("s.inner.value =", "s"),
+			local(0, AccessKind::Write)
+		);
+		assert_eq!(
+			a.value("(s.inner.value)", "s"),
+			local(0, AccessKind::ReadWrite)
+		);
+		assert_eq!(a.value("p.inner.value =", "p"), local(1, AccessKind::Read));
+		assert_eq!(
+			a.value("s.pointer.value +=", "s"),
+			local(0, AccessKind::Read)
+		);
+		assert_eq!(a.value("p.* =", "p"), local(1, AccessKind::Read));
+		for (context, field, owner, access) in [
+			("s.inner.value =", "inner", "Outer", AccessKind::Read),
+			("s.inner.value =", "value", "Inner", AccessKind::Write),
+			("(s.inner.value)", "inner", "Outer", AccessKind::Read),
+			("(s.inner.value)", "value", "Inner", AccessKind::ReadWrite),
+			("p.inner.value =", "inner", "Outer", AccessKind::Read),
+			("p.inner.value =", "value", "Inner", AccessKind::Write),
+			("s.pointer.value +=", "pointer", "Outer", AccessKind::Read),
+			(
+				"s.pointer.value +=",
+				"value",
+				"Inner",
+				AccessKind::ReadWrite,
+			),
+			("p.pointer.value +=", "pointer", "Outer", AccessKind::Read),
+			(
+				"p.pointer.value +=",
+				"value",
+				"Inner",
+				AccessKind::ReadWrite,
+			),
+			("p.inner.value.&", "inner", "Outer", AccessKind::Read),
+			("p.inner.value.&", "value", "Inner", AccessKind::Read),
+		] {
+			let index = if field == "pointer" { 1 } else { 0 };
+			assert_eq!(
+				a.reference(context, field),
+				Reference::Field {
+					owner: a.struct_index(owner),
+					field: FieldIdx::new(index),
+					access,
+				}
+			);
+		}
+		assert_eq!(a.value("= n;", "n"), local(2, AccessKind::Read));
+	}
+
+	#[test]
+	fn an_indexed_pointer_element_is_read_not_written() {
+		let a = Analysis::clean(indoc! {"
+			memory heap: u32;
+			struct Rows(data: [heap::*[u32; 4]; 4]);
+			func f(p: heap::*Rows, i: u32, j: u32) {
+				p.data[i][j] = 1;
+			}
+		"});
+		assert_eq!(
+			a.reference("p.data[i][j] =", "data"),
+			Reference::Field {
+				owner: a.struct_index("Rows"),
+				field: FieldIdx::new(0),
+				access: AccessKind::Read,
+			}
+		);
+	}
+
+	#[test]
+	fn only_a_value_chain_makes_its_root_local_written() {
+		let a = Analysis::clean(indoc! {"
+			memory heap: u32;
+			struct Inner(value: u32);
+			struct Outer(inner: Inner, pointer: heap::*Inner);
+			func through_value(mut s: Outer, n: u32) { s.inner.value = n; }
+			func through_pointer(s: Outer, n: u32) { s.pointer.value = n; }
+		"});
+		assert!(matches!(
+			a.value("s.inner.value = n", "s"),
+			Reference::Local {
+				access: AccessKind::Write,
+				..
+			}
+		));
+		assert!(matches!(
+			a.value("s.pointer.value = n", "s"),
+			Reference::Local {
+				access: AccessKind::Read,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn an_indexed_pointer_local_is_read_not_written() {
+		let a = Analysis::clean(indoc! {"
+			memory heap: u32;
+			func f(a: heap::*[u32; 4], i: u32) {
+				a[i] = 1;
+			}
+		"});
+		assert!(matches!(
+			a.value("a[i] =", "a"),
+			Reference::Local {
+				access: AccessKind::Read,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn indexed_writes_read_the_pointer_and_index() {
+		let a = Analysis::clean(indoc! {"
+			memory heap: u32;
+			struct Buffer(data: [u32; 4], pointer: heap::*[u32; 4]);
+			func f(p: heap::*Buffer, i: u32) {
+				p.data[i] = 1;
+				p.data[i] += 1;
+				p.pointer[i] = 1;
+				p.data[block { p.pointer[i] += 1; i }] = 2;
+			}
+		"});
+		for (context, access) in [
+			("p.data[i] =", AccessKind::Write),
+			("p.data[i] +=", AccessKind::ReadWrite),
+		] {
+			assert!(matches!(
+				a.value(context, "p"),
+				Reference::Local {
+					access: AccessKind::Read,
+					..
+				}
+			));
+			assert!(matches!(
+				a.value(context, "i"),
+				Reference::Local {
+					access: AccessKind::Read,
+					..
+				}
+			));
+			assert_eq!(
+				a.reference(context, "data"),
+				Reference::Field {
+					owner: a.struct_index("Buffer"),
+					field: FieldIdx::new(0),
+					access
+				}
+			);
+		}
+		for context in ["p.pointer[i] =", "p.pointer[i] +="] {
+			assert_eq!(
+				a.reference(context, "pointer"),
+				Reference::Field {
+					owner: a.struct_index("Buffer"),
+					field: FieldIdx::new(1),
+					access: AccessKind::Read
+				}
+			);
+			assert!(matches!(
+				a.value(context, "p"),
+				Reference::Local {
+					access: AccessKind::Read,
+					..
+				}
+			));
+		}
+		assert_eq!(
+			a.reference("p.data[block", "data"),
+			Reference::Field {
+				owner: a.struct_index("Buffer"),
+				field: FieldIdx::new(0),
+				access: AccessKind::Write
+			}
+		);
+	}
+
+	#[test]
+	fn a_label_and_a_value_at_one_span_are_separate_entries() {
+		let a = Analysis::clean("func f(x: u32) { _ = x; }");
+		let span = SourceSpan::new(a.file, a.span("x;", "x"));
+		let value = a.value("x;", "x");
+		let label = Reference::ArgumentLabel(ArgumentLabel::Parameter {
+			function: a.function_index("f"),
+			parameter: ParamIdx::new(0),
+		});
+		let mut resolutions = NameResolutions::default();
+		resolutions.record_reference(Site::Value(span), value);
+		resolutions.record_reference(Site::Label(span), label);
+		let updated = Reference::Name(Referent::Declaration(
+			a.declaration("f", Tier::Value),
+		));
+		resolutions.record_reference(Site::Value(span), updated);
+		assert_eq!(resolutions.get(Site::Value(span)), Some(updated));
+		assert_eq!(resolutions.get(Site::Label(span)), Some(label));
+		assert_eq!(resolutions.get(Site::Type(span)), None);
 	}
 }

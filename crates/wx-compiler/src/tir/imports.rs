@@ -20,7 +20,7 @@ use super::decls::{
 	UseItemDecl, UseItemIndex, UseItemKind, UsePathIndex, UsePathSegment,
 	Visibility,
 };
-use super::resolutions::{NameResolutions, Referent};
+use super::resolutions::{NameResolutions, Referent, Site};
 
 /// Outcome of looking up one `BindingKey` slot for a `use` leaf's target
 /// name. Kept distinct from a plain `Option<DeclKey>` so the caller can
@@ -681,7 +681,7 @@ impl<'r> ImportResolver<'r> {
 			} => {
 				if let Some(decl_key) = target.decl_key() {
 					self.resolutions.record(
-						(source_span, key.tier),
+						Site::new(key.tier, source_span),
 						Referent::from_lookup(decl_key, import),
 					);
 				}
@@ -871,7 +871,7 @@ impl<'r> ImportResolver<'r> {
 			} => {
 				if let Some(decl_key) = target.decl_key() {
 					self.resolutions.record(
-						(source_span, key.tier),
+						Site::new(key.tier, source_span),
 						Referent::from_lookup(decl_key, import),
 					);
 				}

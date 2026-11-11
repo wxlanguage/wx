@@ -57,7 +57,7 @@ use super::members::{
 use super::obligations::{BoundRequirements, TypeObligation};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
-use super::resolutions::{NameResolutions, Referent};
+use super::resolutions::{NameResolutions, Referent, Site};
 use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 use super::solver::{ImplMember, Solver, SolverError};
 use super::typecheck::{BodyBuilder, BodyContext};
@@ -4211,8 +4211,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// don't change what the name means: a parameter shadows an
 		// item of the same name with or without them, and takes none.
 		let first = &segments[0];
-		let site =
-			(SourceSpan::new(scope.file_id, first.ident.span), Tier::Type);
+		let site = Site::Type(SourceSpan::new(scope.file_id, first.ident.span));
 		let (current, next) = if let Some((frame, index)) = sema
 			.generic_envs
 			.resolve(scope.generic_env, first.ident.inner)
@@ -5889,7 +5888,7 @@ pub(super) mod tests {
 		Declarations, MemberOwner, Namespace, Scope, UseItemKind,
 	};
 	use crate::tir::impls::ImplTarget;
-	use crate::tir::resolutions::Resolution;
+	use crate::tir::resolutions::{Reference, Site};
 	use crate::tir::solver::{NormalizationDepth, RewriteFlags, Verdict};
 	use crate::vfs;
 
@@ -5942,12 +5941,12 @@ pub(super) mod tests {
 		};
 		let at = |context: &str, name: &str| {
 			let site =
-				(SourceSpan::new(file_id, span_of(context, name)), Tier::Type);
+				Site::Type(SourceSpan::new(file_id, span_of(context, name)));
 			let resolution =
-				case.sema.resolutions.by_site.get(&site).unwrap_or_else(|| {
+				case.sema.resolutions.get(site).unwrap_or_else(|| {
 					panic!("`{name}` in `{context}` is not recorded")
 				});
-			let Resolution::Reference(referent) = *resolution else {
+			let Reference::Name(referent) = resolution else {
 				panic!("expected a single referent");
 			};
 			referent
@@ -6039,7 +6038,7 @@ pub(super) mod tests {
 				.resolutions
 				.by_site
 				.keys()
-				.any(|(site, _)| site.file_id == file_id)
+				.any(|site| site.span().file_id == file_id)
 		);
 	}
 
@@ -10944,10 +10943,10 @@ pub(super) mod tests {
 					);
 					// The selected definition is what the written name means.
 					assert_eq!(
-						sema.resolutions.by_site[&(reference, Tier::Value)],
-						Resolution::Reference(Referent::Member(
+						sema.resolutions.get(Site::Value(reference)),
+						Some(Reference::Name(Referent::Member(
 							MemberKind::Function(actual)
-						))
+						)))
 					);
 				}
 				// No declaration exists for this impl member, so it must not
@@ -18760,12 +18759,11 @@ pub(super) mod tests {
 					.resolutions
 					.by_site
 					.iter()
-					.find(|((site, tier), _)| {
-						*tier == Tier::Type && site.span == span
-					})
-					.map(|(_, resolution)| {
-						let Resolution::Reference(referent) = *resolution
-						else {
+					.find(
+						|(site, _)| matches!(site, Site::Type(site) if site.span == span),
+					)
+					.map(|(_, reference)| {
+						let Reference::Name(referent) = *reference else {
 							panic!("expected a single referent");
 						};
 						referent

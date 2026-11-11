@@ -30,10 +30,10 @@ use super::{BodyBuilder, Integer, ValuePath};
 use crate::ast::{self, Keyword, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprKind, LocalIdx, PatIdx, PatternKind};
-use crate::tir::decls::{BindingTarget, DeclKind, StructIdx, Tier, TraitIdx};
+use crate::tir::decls::{BindingTarget, DeclKind, StructIdx, TraitIdx};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
-use crate::tir::resolutions::Selection;
+use crate::tir::resolutions::{AccessKind, Reference, Site};
 use crate::tir::solver::SolverError;
 use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
 use crate::vfs::FileId;
@@ -893,9 +893,10 @@ impl BodyBuilder<'_, '_> {
 				self.check_field(field, TypeIndex::ERROR, context);
 				continue;
 			};
-			self.sema.resolutions.record_selection(
-				(SourceSpan::new(self.scope.file_id, name.span), Tier::Value),
-				Selection::Field {
+			self.sema.resolutions.record_reference(
+				Site::Value(SourceSpan::new(self.scope.file_id, name.span)),
+				Reference::Field {
+					access: AccessKind::Read,
 					owner: struct_index,
 					field: index,
 				},

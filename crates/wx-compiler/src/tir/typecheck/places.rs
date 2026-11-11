@@ -19,9 +19,9 @@ use super::{BodyBuilder, SelectedMethod};
 use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
-use crate::tir::decls::{Tier, TraitIdx, Visibility};
+use crate::tir::decls::{TraitIdx, Visibility};
 use crate::tir::operators::is_primitive_binary;
-use crate::tir::resolutions::Selection;
+use crate::tir::resolutions::{AccessKind, Reference, Site};
 use crate::tir::solver::SolverError;
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
@@ -46,7 +46,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		expr: &Spanned<ast::Expression>,
 	) -> ExprIdx {
-		match self.build_operand(expr) {
+		match self.build_operand(expr, AccessKind::Read, &mut None) {
 			Operand::Place(place) => self.load(place),
 			Operand::Value(value) => value,
 		}
@@ -58,22 +58,50 @@ impl BodyBuilder<'_, '_> {
 		self.body.push(ExprKind::Load(place), ty, span)
 	}
 
-	/// `expr` as a place when it is one, else as a value.
-	fn build_operand(&mut self, expr: &Spanned<ast::Expression>) -> Operand {
+	/// `expr` as a place when it is one, else as a value. `access` is how the
+	/// use treats it. Only the named node the use ends at (`value` in
+	/// `s.inner.value = n`) carries it; the names it is reached through are
+	/// projections and read. An index passes it on to its object, since the
+	/// element has no name of its own: `data` in `p.data[i] = n` is written,
+	/// unless it turns out to be a pointer, which `[i]` only reads.
+	///
+	/// `site` is set to the name that was recorded with `access`, if one was,
+	/// so that an index which finds its object a pointer can make it a read.
+	fn build_operand(
+		&mut self,
+		expr: &Spanned<ast::Expression>,
+		access: AccessKind,
+		site: &mut Option<Site>,
+	) -> Operand {
 		match &expr.inner {
 			// `(p.*).x`: parentheses are a tuple of one, kept a place
 			// rather than loaded as a value.
 			ast::Expression::Tuple { elements } if elements.len() == 1 => {
-				self.build_operand(&elements[0].inner)
+				self.build_operand(&elements[0].inner, access, site)
 			}
 			ast::Expression::Deref { pointer } => {
 				self.build_deref(pointer, expr.span)
 			}
 			ast::Expression::ObjectAccess { object, member } => {
-				self.build_field(object, member, expr.span)
+				self.build_field(object, member, expr.span, access, site)
 			}
 			ast::Expression::Index { object, index } => {
-				self.build_index(object, index, expr.span)
+				self.build_index(object, index, expr.span, access, site)
+			}
+			ast::Expression::Path(segments) => {
+				let value = self.build_path(
+					segments,
+					TypeIndex::INFER,
+					expr.span,
+					access,
+				);
+				if let ExprKind::Local(_) = self.body.kind(value) {
+					*site = Some(Site::Value(SourceSpan::new(
+						self.scope.file_id,
+						expr.span,
+					)));
+				}
+				Operand::Value(value)
 			}
 			_ => Operand::Value(self.build(expr, TypeIndex::INFER)),
 		}
@@ -138,6 +166,8 @@ impl BodyBuilder<'_, '_> {
 		object: &Spanned<ast::Expression>,
 		segment: &ast::PathSegment,
 		span: TextSpan,
+		access: AccessKind,
+		site: &mut Option<Site>,
 	) -> Operand {
 		let member = segment.ident;
 		if let (Some(first), Some(last)) =
@@ -156,7 +186,8 @@ impl BodyBuilder<'_, '_> {
 					),
 			);
 		}
-		let mut object = self.build_operand(object);
+		let mut object =
+			self.build_operand(object, AccessKind::Read, &mut None);
 		let mut object_ty = match object {
 			Operand::Place(place) => self.body.place(place).ty,
 			Operand::Value(value) => self.body.ty(value),
@@ -180,7 +211,9 @@ impl BodyBuilder<'_, '_> {
 			}));
 			object_ty = to;
 		}
-		let Some((field, ty)) = self.select_field(object_ty, member) else {
+		let Some((field, ty)) =
+			self.select_field(object_ty, member, access, site)
+		else {
 			return Operand::Value(self.body.push(
 				ExprKind::Error,
 				TypeIndex::ERROR,
@@ -219,9 +252,11 @@ impl BodyBuilder<'_, '_> {
 		object: &Spanned<ast::Expression>,
 		index: &Spanned<ast::Expression>,
 		span: TextSpan,
+		access: AccessKind,
+		site: &mut Option<Site>,
 	) -> Operand {
 		let object_span = object.span;
-		let object = match self.build_operand(object) {
+		let object = match self.build_operand(object, access, site) {
 			Operand::Place(place) => {
 				let ty = self.body.place(place).ty;
 				let ty = self.context().normalized(ty);
@@ -242,6 +277,12 @@ impl BodyBuilder<'_, '_> {
 			}
 			Operand::Value(value) => Some(value),
 		};
+		// Past a sequence place (returned above), the object is a pointer
+		// value, or invalid: the index only reads it, whatever the use does
+		// to the element.
+		if let Some(site) = *site {
+			self.sema.resolutions.downgrade_to_read(site);
+		}
 		let Some((pointer, (to, element, memory, ownership))) = object
 			.and_then(|pointer| Some((pointer, self.indexed_slice(pointer)?)))
 		else {
@@ -477,6 +518,8 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		object_ty: TypeIndex,
 		member: Spanned<SymbolU32>,
+		access: AccessKind,
+		site: &mut Option<Site>,
 	) -> Option<(crate::tir::decls::FieldIdx, TypeIndex)> {
 		if object_ty == TypeIndex::ERROR {
 			return None;
@@ -525,16 +568,17 @@ impl BodyBuilder<'_, '_> {
 			);
 			return None;
 		};
-		self.sema.resolutions.record_selection(
-			(
-				SourceSpan::new(self.scope.file_id, member.span),
-				Tier::Value,
-			),
-			Selection::Field {
+		let recorded =
+			Site::Value(SourceSpan::new(self.scope.file_id, member.span));
+		self.sema.resolutions.record_reference(
+			recorded,
+			Reference::Field {
+				access,
 				owner: struct_index,
 				field,
 			},
 		);
+		*site = Some(recorded);
 		let visibility =
 			Visibility::from(decl.field_pub_spans[usize::from(field)]);
 		if !self.sema.decls.namespaces.is_accessible_from(
@@ -578,7 +622,7 @@ impl BodyBuilder<'_, '_> {
 		value: &Spanned<ast::Expression>,
 		span: TextSpan,
 	) -> ExprIdx {
-		match self.build_operand(value) {
+		match self.build_operand(value, AccessKind::Read, &mut None) {
 			Operand::Place(place) => {
 				let Place { ty: to, memory, .. } = *self.body.place(place);
 				let ty = self.sema.types.intern(Type::Pointer {
@@ -633,7 +677,9 @@ impl BodyBuilder<'_, '_> {
 				span,
 			);
 		}
-		match self.build_operand(target) {
+		let access = AccessKind::Write;
+		let operand = self.build_operand(target, access, &mut None);
+		match operand {
 			Operand::Place(place) => {
 				self.check_place_writable(place);
 				let ty = self.body.place(place).ty;
@@ -645,7 +691,7 @@ impl BodyBuilder<'_, '_> {
 				)
 			}
 			Operand::Value(target) => {
-				if !self.check_assignable(target) {
+				if !self.check_assignable(target, access) {
 					self.build(value, TypeIndex::ERROR);
 					return self.body.push(
 						ExprKind::Error,
@@ -675,7 +721,9 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let plain = plain_operator(op.inner);
-		match self.build_operand(target) {
+		let access = AccessKind::ReadWrite;
+		let operand = self.build_operand(target, access, &mut None);
+		match operand {
 			Operand::Place(place) => {
 				self.check_place_writable(place);
 				let Place {
@@ -723,7 +771,7 @@ impl BodyBuilder<'_, '_> {
 				self.body.push(kind, TypeIndex::UNIT, span)
 			}
 			Operand::Value(target) => {
-				if !self.check_assignable(target) {
+				if !self.check_assignable(target, access) {
 					self.build(value, TypeIndex::ERROR);
 					return self.body.push(
 						ExprKind::Error,
@@ -821,8 +869,15 @@ impl BodyBuilder<'_, '_> {
 	/// Whether `target`, a value, is something `=` can write: a local or a
 	/// field of a local. A target that is not is reported and gives
 	/// `false`; one that is but is not `mut` is reported and gives `true`,
-	/// since its type still holds the value to it.
-	fn check_assignable(&mut self, target: ExprIdx) -> bool {
+	/// since its type still holds the value to it. The root local is the one
+	/// that needs `mut`, so it is recorded as written however deep the field
+	/// chain is: a chain that went through a pointer is a place, not a value,
+	/// and never gets here.
+	fn check_assignable(
+		&mut self,
+		target: ExprIdx,
+		access: AccessKind,
+	) -> bool {
 		let mut root = target;
 		while let ExprKind::FieldAccess { object, .. } = self.body.kind(root) {
 			root = object;
@@ -831,6 +886,13 @@ impl BodyBuilder<'_, '_> {
 		match self.body.kind(root) {
 			ExprKind::Error => true,
 			ExprKind::Local(local) => {
+				self.sema.resolutions.set_local_access(
+					Site::Value(SourceSpan::new(
+						self.scope.file_id,
+						self.body.span(root),
+					)),
+					access,
+				);
 				let local = *self.body.local(local);
 				if local.mut_span.is_none() {
 					let name =

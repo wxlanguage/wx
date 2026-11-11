@@ -36,7 +36,7 @@ use super::decls::{
 };
 use super::members::TraitMemberSelection;
 use super::obligations::BoundRequirements;
-use super::resolutions::{Referent, Resolution};
+use super::resolutions::{Reference, Referent, Site};
 use super::signatures::{Semantics, SemanticsBuilder};
 use super::solver::{
 	ImplMember, NormalizationDepth, RewriteFlags, SolverError, Subjects,
@@ -662,13 +662,12 @@ impl Semantics {
 				) => {
 					let last = segments.last().expect("a path is never empty");
 					let site =
-						(SourceSpan::new(file_id, last.ident.span), Tier::Type);
+						Site::Type(SourceSpan::new(file_id, last.ident.span));
 					let spells_its_arguments = self
 						.resolutions
-						.by_site
-						.get(&site)
-						.and_then(|referent| match *referent {
-							Resolution::Reference(
+						.get(site)
+						.and_then(|reference| match reference {
+							Reference::Name(
 								Referent::Declaration(key)
 								| Referent::Import {
 									declaration: key, ..

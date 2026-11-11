@@ -60,7 +60,7 @@ use super::operators::{
 	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
-use super::resolutions::Referent;
+use super::resolutions::{AccessKind, Reference, Referent, Site};
 use super::signatures::{
 	InferPolicy, LexicalScope, Semantics, SemanticsBuilder,
 };
@@ -581,7 +581,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				right,
 			} => self.build_binary(*operator, left, right, expected, span),
 			ast::Expression::Path(segments) => {
-				self.build_path(segments, expected, span)
+				self.build_path(segments, expected, span, AccessKind::Read)
 			}
 			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
@@ -863,9 +863,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 					count.span,
 				))
 			}
-			ast::ConstArgument::Path(segments) => {
-				Some(self.build_path(segments, TypeIndex::INFER, count.span))
-			}
+			ast::ConstArgument::Path(segments) => Some(self.build_path(
+				segments,
+				TypeIndex::INFER,
+				count.span,
+				AccessKind::Read,
+			)),
 			ast::ConstArgument::QualifiedPath { .. }
 			| ast::ConstArgument::Grouped { .. } => {
 				let rooted = RootedPath::of_constant(&count.inner).unwrap();
@@ -988,12 +991,23 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		segments: &[ast::PathSegment],
 		expected: TypeIndex,
 		span: TextSpan,
+		access: AccessKind,
 	) -> ExprIdx {
 		if let [segment] = segments
 			&& segment.type_args.is_empty()
 			&& let Some((local, reach)) = self.lookup_local(segment.ident.inner)
 		{
-			self.record_local(local, segment.ident.span);
+			self.sema.resolutions.record_reference(
+				Site::Value(SourceSpan::new(
+					self.scope.file_id,
+					segment.ident.span,
+				)),
+				Reference::Local {
+					owner: self.owner,
+					local,
+					access,
+				},
+			);
 			if reach == LocalReach::BehindStatic {
 				self.report_local_in_static_data(span);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
@@ -1190,16 +1204,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		None
 	}
 
-	fn record_local(&mut self, local: LocalIdx, span: TextSpan) {
-		self.sema.resolutions.record(
-			(SourceSpan::new(self.scope.file_id, span), Tier::Value),
-			Referent::Local {
-				owner: self.owner,
-				local,
-			},
-		);
-	}
-
 	/// A call: of a function named by a path, the construction of a struct,
 	/// or of any other value whose type is callable (`build_value_call`).
 	/// As a method call's receiver, a function's call reads its expected
@@ -1239,8 +1243,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			&& segment.type_args.is_empty()
 			&& self.lookup_local(segment.ident.inner).is_some()
 		{
-			let callee =
-				self.build_path(segments, TypeIndex::INFER, callee.span);
+			let callee = self.build_path(
+				segments,
+				TypeIndex::INFER,
+				callee.span,
+				AccessKind::Read,
+			);
 			return self.build_value_call(callee, arguments, span);
 		}
 		// `Self(..)` constructs the struct the impl around it is for, with
@@ -1294,8 +1302,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		let kind = key.symbol_kind(&self.sema.decls);
 		// Any other item is called as the value it names.
 		if !matches!(kind, DeclKind::Struct(_) | DeclKind::Function(_)) {
-			let callee =
-				self.build_path(segments, TypeIndex::INFER, callee.span);
+			let callee = self.build_path(
+				segments,
+				TypeIndex::INFER,
+				callee.span,
+				AccessKind::Read,
+			);
 			return self.build_value_call(callee, arguments, span);
 		}
 		let DeclKind::Struct(struct_index) = kind else {
@@ -1623,7 +1635,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			return None;
 		};
 		self.sema.resolutions.record(
-			(site, Tier::Value),
+			Site::Value(site),
 			match impl_kind {
 				ImplKind::Inherent(index) => Referent::InherentImplSelf(index),
 				ImplKind::Trait(index) => Referent::TraitImplSelf(index),
@@ -2960,7 +2972,9 @@ mod tests {
 	};
 	use super::super::eval::{ConstScalar, ConstValueState};
 	use super::super::paths::PathResolver;
-	use super::super::resolutions::{NameResolutions, Referent, Resolution};
+	use super::super::resolutions::{
+		NameResolutions, Reference, Referent, Site,
+	};
 	use super::super::signatures::Semantics;
 	use super::super::solver::{NormalizationDepth, RewriteFlags};
 	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
@@ -3641,16 +3655,13 @@ mod tests {
 			.namespaces
 			.file_id(Scope::Package(case.sema.decls.root_package).into());
 		let start = SOURCE.find("a + b").unwrap() as u32;
-		let site = (
-			crate::diagnostics::SourceSpan::new(
-				file_id,
-				TextSpan::new(start, start + 1),
-			),
-			Tier::Value,
-		);
+		let site = Site::Value(crate::diagnostics::SourceSpan::new(
+			file_id,
+			TextSpan::new(start, start + 1),
+		));
 		assert!(matches!(
-			case.sema.resolutions.by_site.get(&site),
-			Some(Resolution::Reference(Referent::Local { local, .. })) if u32::from(*local) == 0
+			case.sema.resolutions.get(site),
+			Some(Reference::Local { local, .. }) if u32::from(local) == 0
 		));
 	}
 
@@ -4054,16 +4065,13 @@ mod tests {
 			.namespaces
 			.file_id(Scope::Package(case.sema.decls.root_package).into());
 		let start = (SOURCE.rfind(":outer").unwrap() + 1) as u32;
-		let site = (
-			crate::diagnostics::SourceSpan::new(
-				file_id,
-				TextSpan::new(start, start + "outer".len() as u32),
-			),
-			Tier::Value,
-		);
+		let site = Site::Label(crate::diagnostics::SourceSpan::new(
+			file_id,
+			TextSpan::new(start, start + "outer".len() as u32),
+		));
 		assert!(matches!(
-			case.sema.resolutions.by_site.get(&site),
-			Some(Resolution::Reference(Referent::Label { label, .. })) if u32::from(*label) == 0
+			case.sema.resolutions.get(site),
+			Some(Reference::Name(Referent::Label { label, .. })) if u32::from(label) == 0
 		));
 	}
 
