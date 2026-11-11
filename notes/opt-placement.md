@@ -341,7 +341,7 @@ against all recorded reads. It neither modifies the graph nor emits MIR.
 - `None`: no definition is needed for the canonical node.
 - `Direct`: a pure leaf is read directly at each use.
 - `Fixed(location)`: an effect result or phi has a fixed definition boundary.
-- `Compute(location)`: emit this ordinary computation at the chosen gap.
+- `Stored(location)`: emit this ordinary computation at the chosen gap.
 
 `computations()` returns each required ordinary computation once, with inputs
 before consumers. At one gap, this is the order the emitter must preserve.
@@ -619,3 +619,103 @@ without moving MIR entries. The old optimizer and both environment selection
 flags have been removed; commands above using those flags record historical
 validation runs. Direct original-MIR execution remains a test-only reference.
 See [integration status](opt-integration.md).
+
+
+## Trivial control transfers removed during emission, 2026-11-10
+
+The emitter now represents normal construct completion as fallthrough where it
+can prove that the final branch reaches the same join. This refines the initial
+uniform labeled-wrapper representation above; graph construction, uses,
+locations, dominance and placement are unchanged.
+
+The existing postorder work stack carries an optional natural-exit `JoinId`.
+A block's executable sequence naturally finishes at its own exit; if/switch arms
+finish at their owner's exit. Nested region effects do not inherit their parent's
+exit: falling out of a nested construct must still execute the parent's remaining
+computations and effects. Loop bodies have no fallthrough exit in this first
+slice; their backedges and breaks stay explicit.
+
+Only a sequence's final `Branch` to its natural exit loses its control transfer.
+The emitter still visits all placement gaps and emits the branch row's existing
+simultaneous `SetLocals` assignments. A region is never discarded based on its
+graph effect count: movable computations may be scheduled in its gaps even if
+its only stored effect is the final branch. Loads, stores, calls and trapping
+operations retain their order.
+
+The existing per-join target column now names owning regions instead of eager
+MIR labels. The existing per-region label column allocates a dense label only
+when a retained transfer requires one; loops always receive the label required
+by MIR. The original label counter moves into the emitter. Once all descendants
+have been emitted, an owner with no allocated label needs no block wrapper.
+This needs no new analysis table, no additional tree pass and no persistent
+analysis data. The extra exit context lives only on the current emission stack.
+
+MIR sequence types follow their last expression; if/switch types reflect whether
+an emitted arm can fall through. Non-returning calls still receive the explicit
+`unreachable` boundary required by Wasm. Wrapper/transfer decisions happen before
+allocating those MIR nodes, preserving arena ownership without orphan cleanup,
+body compaction or label rewriting.
+
+Three focused regressions check untargeted nested blocks, if and dense-switch
+arms with required computations/phi updates, and a nonlocal exit that must skip
+its parent's following global write. Existing execution tests cover simultaneous
+loop updates, nested break/continue, sparse/exhaustive switches, non-returning
+calls and observable trap ordering. All 1,414 compiler library tests pass, with
+2 ignored. The example memory/WASI suite also passes.
+
+The same 22-program comparison has new raw outputs under
+[control-cleanup](backend-comparison/2026-11-10/control-cleanup/README.md).
+The 15 repository examples fall from 10,483 to 7,983 bytes (23.8%); all 22 fall
+from 11,129 to 8,589 bytes (22.8%). Local counts are unchanged. All 22 saved
+modules validate and 197 arithmetic/hash/vector/control result assertions pass.
+
+## Single-use expression nesting — 2026-11-10
+
+Placement now distinguishes `Stored(location)` (a shared computation kept in a
+local) from `Nested(location)` (a computation with exactly one recorded operand
+occurrence). This decision is made while visiting readers in the existing latest
+placement loop. Duplicate operands count separately, even when their `UseSite`
+values are equal. A nested computation's location is its sole reader's location;
+chains therefore remain at the same executable gap. The existing availability
+and dominance validation applies to both forms.
+
+No use-count column or additional input-tree walk is needed. `Uses` and locations
+still expire after planning, before MIR emission. `computations()` retains its
+complete dependency order, but only `Compute` entries receive locals and enter
+the gap schedule. Fixed phi definitions and effect results remain in locals;
+loads, calls and trapping operations remain ordered effects.
+
+The emitter expands nested inputs on demand into fresh MIR expression nodes.
+Two reusable scratch vectors hold pending construction tasks and completed input
+expressions. They are empty between computations and retain capacity only until
+the emitter expires. Construction is iterative, including deep chains, and shared
+inputs produce local reads rather than duplicated computations. Incoming join
+rows still evaluate every source before writing any destination.
+
+The final linearizer's arithmetic walk is also iterative, using a reusable task
+stack. Binary operands retain left-to-right evaluation, and a diverging left
+operand suppresses the right operand and operation. Structured control handling
+retains its existing recursion; this change removes recursion through arithmetic
+chains, not all possible nesting in the backend. Reentrant expression walks stop
+at their own stack boundary so structured children cannot consume an enclosing
+expression's pending work.
+
+Validation: 1,417 compiler library tests passed, 2 ignored. Dedicated checks cover
+single-use nesting, repeated operands retaining a shared local, wrapping and
+noncommutative arithmetic, and a flat input with 4,096 dependent assignments that
+becomes one deep expression and executes successfully. Existing effect/trap,
+conversion, mixed-type return, loop and simultaneous-update tests remain active.
+The release CLI built; all 22 saved example modules validated and passed 197
+result assertions, and the existing memory example execution suite passed.
+
+Raw output versus the trivial-control cleanup baseline (`31aa121`): all 22
+programs shrink from 8,589 to 7,256 bytes (15.5%), with non-parameter locals falling
+from 593 to 273 (54.0%). The 15 repository examples shrink from 7,983 to 6,710 bytes
+(15.9%). No external Wasm optimizer was applied. Compiler throughput and runtime
+speed were not measured. Artifacts and the reproduction script are in
+`notes/backend-comparison/2026-11-10/expression-nesting/`.
+
+Follow-up (2026-11-10): the full linearizer now uses one iterative task stack,
+including structured control and both switch lowerings. The earlier arithmetic
+wrapper and recursive structured traversal have been replaced. See the
+implemented traversal update in `notes/mir-pipeline.md` for the model and checks.

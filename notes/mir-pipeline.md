@@ -538,12 +538,48 @@ or store:
 
 - a label becomes a branch depth;
 - a `Switch`, the one node with no single instruction, becomes a
-  `br_table` (dense cases) or a `br_if` chain by a fixed rule on its cases;
+  `br_table` (dense cases) or nested `if`s by a fixed rule on its cases;
 - a block's type is its node's: none, one scalar, or several (a
   signature index; `wasm::BlockType` grows that case, the signature table
   is already shared with multi-value block types);
 - a `Call` leaves its results on the stack for its user; a `SetLocals`
   takes its targets in reverse, a `local.set` or a `drop` each.
+
+Implemented traversal update (2026-11-10): the whole linearizer now uses one
+explicit task stack. Scheduling visits children and records the work to finish
+their parent; finishing emits the instruction or opens the selected structured
+lowering. Arithmetic, effects, blocks, loops, ifs and both switch forms use this
+same mechanism. No handler recursively walks child expressions.
+
+Tasks store expression IDs and `u32` cursors, recovering argument, statement and
+case lists from the immutable MIR body as they advance one child at a time.
+Types, defaults and selector metadata are also recovered from the owning node.
+Only dynamic state, such as a branch target frame, needs its own task field.
+`Else` has a dedicated task instead of carrying a full Wasm instruction. These
+changes reduce the task enum from 48 to 16 bytes on the development target;
+no boxing or extra storage table is introduced. They trade some repeated MIR
+reads for a smaller work stack; compiler throughput has not been measured.
+Switches with several comparisons allocate their own selector local, whose
+index travels in the case continuation. There is no function-wide selector-local
+cache or special reuse policy; future general local allocation can recover reuse.
+Zero- and one-case switches still consume the selector directly. The task enum
+remains 16 bytes on the development target with this explicit optional local.
+Fixed-arity operands contain at most three entries and can be scheduled directly.
+A diverging child suppresses later operands and the parent's instruction, or later
+statements. Construct-closing tasks remain
+independent, preserving required `end`s and `unreachable` markers. Branch depths
+are calculated when the transfer is emitted against the current open frames.
+There is no extra IR or per-node traversal table.
+
+Validation: 1,420 compiler library tests passed, 2 ignored. New checks validate
+4,096 alternating nested blocks/ifs (and execute a smaller nesting), execute
+nested switches in all four dense/sparse combinations, and verify that a diverging
+call argument suppresses later arguments and the call while its block still
+closes. Existing loop, nonlocal transfer, trap-order and simultaneous-update
+checks pass. All 22 saved programs produce byte-identical Wasm compared with the
+single-use nesting baseline, including after removing shared selector locals.
+The sample totals remain 7,256 bytes and 273 non-parameter locals; the existing
+memory example suite and 197 saved-program result assertions also pass.
 
 **Encoding** is today's `encode_scheduled_instr` (to be renamed for what
 it does, `encode_function`), unchanged: one instruction to its bytes.
