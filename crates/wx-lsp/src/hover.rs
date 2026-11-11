@@ -8,7 +8,8 @@ use string_interner::symbol::SymbolU32;
 use wx_compiler::ast::{Spanned, StringInterner};
 use wx_compiler::tir::{
 	AssocTypeIdx, ConstIdx, ConstScalar, DeclKind, Definition, FieldIdx,
-	FunctionIdx, GenericEnvIdx, MemberKind, Semantics, StructIdx, Type, Val,
+	FunctionIdx, GenericEnvIdx, MemberKind, MemberOwner, Semantics, StructIdx,
+	Type, Val,
 };
 
 /// What to show for one hovered name: a signature, as `wx` source.
@@ -200,8 +201,16 @@ impl Renderer<'_> {
 		if names.is_empty() {
 			return String::new();
 		}
-		let names: Vec<_> = names.iter().map(|name| self.name(*name)).collect();
-		format!("<{}>", names.join(", "))
+		let mut result = String::from("<");
+		use std::fmt::Write;
+		for (i, name) in names.iter().enumerate() {
+			if i > 0 {
+				result.push_str(", ");
+			}
+			write!(result, "{}", self.name(*name)).unwrap();
+		}
+		result.push('>');
+		result
 	}
 
 	fn function(&self, function: FunctionIdx) -> String {
@@ -216,13 +225,48 @@ impl Renderer<'_> {
 				None => self.ty(*ty),
 			})
 			.collect();
-		format!(
+		let signature = format!(
 			"func {}{}({}) -> {}",
 			self.name(decl.name),
-			self.type_params(signature.type_params),
+			self.type_params(self.sema.function_own_type_params(function)),
 			params.join(", "),
 			self.ty(signature.return_type)
-		)
+		);
+		match self.member_owner(decl.owner) {
+			Some(header) => format!("{header}\n{signature}"),
+			None => signature,
+		}
+	}
+
+	fn member_owner(&self, owner: MemberOwner) -> Option<String> {
+		match owner {
+			MemberOwner::Free => None,
+			MemberOwner::Trait(index) => {
+				let decl = &self.sema.decls.traits[usize::from(index)];
+				Some(format!("trait {}", self.name(decl.name)))
+			}
+			MemberOwner::InherentImpl(index) => {
+				let header =
+					self.sema.inherent_impls[usize::from(index)].as_ref()?;
+				Some(format!(
+					"impl{} {}",
+					self.type_params(header.type_params),
+					self.ty(header.target.inner),
+				))
+			}
+			MemberOwner::TraitImpl(index) => {
+				let header =
+					self.sema.trait_impls[usize::from(index)].as_ref()?;
+				let trait_index = self.sema.trait_impl_trait(index)?;
+				let decl = &self.sema.decls.traits[usize::from(trait_index)];
+				Some(format!(
+					"impl{} {} for {}",
+					self.type_params(header.type_params),
+					self.name(decl.name),
+					self.ty(header.target.inner),
+				))
+			}
+		}
 	}
 
 	fn structure(&self, index: StructIdx) -> String {

@@ -8,6 +8,7 @@ use tower_lsp_server::ls_types::{
 	GotoDefinitionResponse, HoverContents, HoverParams, Position, Range,
 	TextDocumentIdentifier, TextDocumentPositionParams, Uri,
 };
+use wx_compiler::diagnostics::Diagnostics;
 use wx_compiler::vfs::FileId;
 
 use crate::actor::{Command, handle_command};
@@ -91,6 +92,24 @@ fn definition_params(uri: &Uri, position: Position) -> GotoDefinitionParams {
 		text_document_position_params: TextDocumentPositionParams {
 			text_document: TextDocumentIdentifier { uri: uri.clone() },
 			position,
+		},
+		work_done_progress_params: Default::default(),
+		partial_result_params: Default::default(),
+	}
+}
+
+fn reference_params(
+	uri: &Uri,
+	position: Position,
+	include_declaration: bool,
+) -> tower_lsp_server::ls_types::ReferenceParams {
+	tower_lsp_server::ls_types::ReferenceParams {
+		text_document_position: TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			position,
+		},
+		context: tower_lsp_server::ls_types::ReferenceContext {
+			include_declaration,
 		},
 		work_done_progress_params: Default::default(),
 		partial_result_params: Default::default(),
@@ -572,6 +591,254 @@ async fn a_query_queued_after_an_edit_sees_that_edit() {
 			.expect("goto definition should not error"),
 	);
 	assert_eq!(location.range.start, position_of(third, "add", 0));
+	let references = backend
+		.references(reference_params(&uri, position_of(third, "add", 0), false))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(references.len(), 1);
+	assert_eq!(references[0].range.start, position_of(third, "add", 1));
+}
+
+#[test]
+fn references_work_from_declarations_and_uses_and_honor_include_declaration() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = "func helper() {}\nfunc main() { helper(); helper(); }\n";
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(root).unwrap();
+	for occurrence in 0..3 {
+		for include in [false, true] {
+			let references = requests::references(
+				&state,
+				&reference_params(
+					&uri,
+					position_of(source, "helper", occurrence),
+					include,
+				),
+			)
+			.unwrap();
+			let expected: Vec<_> = (usize::from(!include)..3)
+				.map(|i| position_of(source, "helper", i))
+				.collect();
+			assert_eq!(
+				references
+					.iter()
+					.map(|loc| loc.range.start)
+					.collect::<Vec<_>>(),
+				expected
+			);
+			assert!(references.iter().all(|loc| loc.uri == uri));
+		}
+	}
+}
+
+#[test]
+fn references_keep_shorthand_field_and_value_roles_separate() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct S(value: u32);
+		func take(value: u32) -> u32 { value }
+		func f(value: u32) -> u32 {
+			local s = S({ value });
+			_ = take({ value: s.value });
+			value
+		}
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(root).unwrap();
+	let refs = |needle, occurrence| {
+		requests::references(
+			&state,
+			&reference_params(
+				&uri,
+				position_of(source, needle, occurrence),
+				false,
+			),
+		)
+		.unwrap()
+		.into_iter()
+		.map(|loc| loc.range.start)
+		.collect::<Vec<_>>()
+	};
+	// The field and caller's local each include the shorthand, but are not
+	// the same symbol. The shorthand cursor chooses the value, as hover does.
+	let field = vec![
+		position_of(source, "value });", 0),
+		position_of(source, "value });", 1),
+	];
+	assert_eq!(refs("value:", 0), field);
+	let local = vec![
+		position_of(source, "value });", 0),
+		position_of(source, "value\n", 0),
+	];
+	assert_eq!(refs("value:", 2), local);
+	assert_eq!(refs("value });", 0), local);
+	// The callee's parameter includes both its body local and its call label.
+	assert_eq!(
+		refs("value:", 1),
+		vec![
+			position_of(source, "value }", 0),
+			position_of(source, "value: s", 0),
+		]
+	);
+}
+
+#[test]
+fn references_search_loaded_modules_and_include_the_module_name_not_file_start()
+{
+	let root = PathBuf::from("/test/main.wx");
+	let child = PathBuf::from("/test/shared.wx");
+	let source = "mod shared;\nuse shared::run as alias;\nfunc main() { shared::run(); alias(); }\n";
+	let child_source = "pub func run() {}\nfunc other() { run(); }\n";
+	let (mut state, dir) = analyzed(&root, source);
+	state
+		.open_documents
+		.insert(child.clone(), open_document(child_source));
+	analyze_root(&mut state, &dir, &root, &mut Vec::new());
+	let uri = Uri::from_file_path(&root).unwrap();
+	let child_uri = Uri::from_file_path(&child).unwrap();
+	let refs = requests::references(
+		&state,
+		&reference_params(&uri, position_of(source, "alias();", 0), true),
+	)
+	.unwrap();
+	assert_eq!(refs.len(), 5);
+	assert_eq!(refs.iter().filter(|loc| loc.uri == uri).count(), 3);
+	assert_eq!(refs.iter().filter(|loc| loc.uri == child_uri).count(), 2);
+	let module = requests::references(
+		&state,
+		&reference_params(&uri, position_of(source, "shared", 1), true),
+	)
+	.unwrap();
+	assert_eq!(module.len(), 3);
+	assert_eq!(module[0].uri, uri);
+	assert_eq!(module[0].range.start, position_of(source, "shared", 0));
+	assert_eq!(
+		module[0].range.end.character - module[0].range.start.character,
+		6
+	);
+}
+
+#[test]
+fn references_return_empty_for_unused_symbols_and_none_for_unresolved_names() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = "func unused() {}\nfunc broken() { missing(); }\n";
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(root).unwrap();
+	let params = |needle, include| {
+		reference_params(&uri, position_of(source, needle, 0), include)
+	};
+	assert_eq!(
+		requests::references(&state, &params("unused", false)),
+		Some(vec![])
+	);
+	assert_eq!(
+		requests::references(&state, &params("unused", true))
+			.unwrap()
+			.len(),
+		1
+	);
+	assert_eq!(
+		requests::references(&state, &params("missing", false)),
+		None
+	);
+	assert_eq!(requests::references(&state, &params("func", false)), None);
+}
+
+#[tokio::test]
+async fn initialization_advertises_references() {
+	let service = backend_with_drained_socket();
+	let result = service
+		.inner()
+		.initialize(Default::default())
+		.await
+		.unwrap();
+	assert_eq!(
+		result.capabilities.references_provider,
+		Some(tower_lsp_server::ls_types::OneOf::Left(true))
+	);
+}
+
+#[test]
+fn references_reach_dependencies_without_comparing_ids_from_other_snapshots() {
+	let app = PathBuf::from("/refs/app/main.wx");
+	let lib = PathBuf::from("/refs/lib/main.wx");
+	let source = "package \"lib\" as lib; func main() { lib::run(); }";
+	let lib_source = "pub func run() {} func other() { run(); }";
+	let mut state = ServerState::default();
+	state
+		.open_documents
+		.insert(app.clone(), open_document(source));
+	state
+		.open_documents
+		.insert(lib.clone(), open_document(lib_source));
+	state.open_documents.insert(app.parent().unwrap().join("wx.json"), open_document(
+		r#"{"type":"bin","entry":"main.wx","dependencies":{"lib":{"type":"local","path":"../lib"}}}"#,
+	));
+	state.open_documents.insert(
+		lib.parent().unwrap().join("wx.json"),
+		open_document(r#"{"type":"lib","entry":"main.wx"}"#),
+	);
+	compute_refresh(&mut state, &app, &mut Vec::new());
+	assert_eq!(state.cached.len(), 2);
+	let uri = Uri::from_file_path(&app).unwrap();
+	let lib_uri = Uri::from_file_path(&lib).unwrap();
+	let references = requests::references(
+		&state,
+		&reference_params(&uri, position_of(source, "run", 0), true),
+	)
+	.unwrap();
+	assert_eq!(references.len(), 3);
+	assert_eq!(references.iter().filter(|loc| loc.uri == uri).count(), 1);
+	assert_eq!(
+		references.iter().filter(|loc| loc.uri == lib_uri).count(),
+		2
+	);
+	// A query in the library's own project searches that graph, not every
+	// cached consumer. Cross-root search is intentionally not inferred from
+	// arena indices or navigation spans.
+	let references = requests::references(
+		&state,
+		&reference_params(&lib_uri, position_of(lib_source, "run", 0), false),
+	)
+	.unwrap();
+	assert_eq!(references.len(), 1);
+	assert_eq!(references[0].uri, lib_uri);
+}
+
+#[test]
+fn references_reuse_utf16_conversion_and_virtual_stdlib_uris() {
+	let root = PathBuf::from("/test/main.wx");
+	let source =
+		"func helper() {}\nfunc f() { local _: u32 = '😀'; helper(); }\n";
+	let column =
+		"func f() { local _: u32 = '😀'; ".encode_utf16().count() as u32;
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(root).unwrap();
+	let references = requests::references(
+		&state,
+		&reference_params(&uri, Position::new(1, column), false),
+	)
+	.unwrap();
+	assert_eq!(references.len(), 1);
+	assert_eq!(
+		references[0].range,
+		Range::new(Position::new(1, column), Position::new(1, column + 6))
+	);
+	let std = Uri::from_str("wx://std/main.wx").unwrap();
+	let (snapshot, file) = state.resolve_uri(&std).unwrap();
+	let source = &snapshot.compilation.files.get(file).unwrap().source;
+	let offset = source.find("pub type u32;").unwrap() + "pub type ".len();
+	let position =
+		byte_to_position(&snapshot.compilation.files, file, offset).unwrap();
+	let references =
+		requests::references(&state, &reference_params(&std, position, true))
+			.unwrap();
+	assert!(
+		references
+			.iter()
+			.any(|loc| loc.uri == std && loc.range.start == position)
+	);
 }
 
 /// The hover text at the `occurrence`-th `needle` of `source`.
@@ -685,6 +952,136 @@ fn hover_renders_the_other_declaration_kinds() {
 }
 
 #[test]
+fn hover_on_a_trait_method_shows_its_signature() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		trait Shl {
+		    func shl(self: Self, rhs: Self) -> Self;
+		}
+		impl Shl for i32 {
+		    func shl(self: Self, rhs: Self) -> Self { self }
+		}
+		func main() -> u32 { 0 }
+		export { main }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	assert_eq!(
+		hover_text(&state, &uri, source, "shl", 0).unwrap(),
+		"```wx\ntrait Shl\nfunc shl(self: Self, rhs: Self) -> Self\n```"
+	);
+	assert_eq!(
+		hover_text(&state, &uri, source, "shl", 1).unwrap(),
+		"```wx\nimpl Shl for i32\nfunc shl(self: i32, rhs: i32) -> i32\n```"
+	);
+}
+
+#[test]
+fn hover_separates_inherent_impl_and_function_type_params() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Layout<Mem: Memory>(size: Mem::Size);
+		impl<Mem: Memory> Layout<Mem> {
+		    func size(self: Self) -> Mem::Size { self.size }
+		    func with_extra<T: StackValue>(self: Self, extra: T) -> T { extra }
+		    func make(size: Mem::Size) -> Self { Self(size) }
+		}
+		memory heap: u32;
+		func main() -> u32 {
+		    local layout = Layout::<heap>(4);
+		    _ = layout.with_extra::<u32>(0);
+		    _ = Layout::<heap>::make(4);
+		    layout.size()
+		}
+		export { main }
+	"};
+	let (state, dir) = analyzed(&root, source);
+	assert!(
+		!state.cached[&dir].sema.diagnostics().has_errors(),
+		"{:?}",
+		state.cached[&dir].sema.diagnostics()
+	);
+	let uri = Uri::from_file_path(&root).unwrap();
+	for (needle, expected) in [
+		(
+			"size(",
+			"impl<Mem> Layout<Mem>\nfunc size(self: Layout<Mem>) -> <Mem as Memory>::Size",
+		),
+		(
+			"with_extra",
+			"impl<Mem> Layout<Mem>\nfunc with_extra<T>(self: Layout<Mem>, extra: T) -> T",
+		),
+		(
+			"make",
+			"impl<Mem> Layout<Mem>\nfunc make(size: <Mem as Memory>::Size) -> Layout<Mem>",
+		),
+	] {
+		for occurrence in 0..2 {
+			assert_eq!(
+				hover_text(&state, &uri, source, needle, occurrence).unwrap(),
+				format!("```wx\n{expected}\n```"),
+				"{needle}, occurrence {occurrence}",
+			);
+		}
+	}
+}
+
+#[test]
+fn hover_separates_trait_impl_and_function_type_params() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Wrapper<T: StackValue>(value: T);
+		trait Convert: StackValue {
+		    func convert<Self: StackValue, U: StackValue>(self: Self, value: U) -> U;
+		    func identity(self: Self) -> Self;
+		}
+		impl<T: StackValue> Convert for Wrapper<T> {
+		    func convert<Self: StackValue, U: StackValue>(self: Self, value: U) -> U { value }
+		    func identity(self: Self) -> Self { self }
+		}
+		func main() -> u32 {
+		    local wrapper = Wrapper::<u32>(0);
+		    _ = wrapper.identity();
+		    wrapper.convert::<u32>(1)
+		}
+		export { main }
+	"};
+	let (state, dir) = analyzed(&root, source);
+	assert!(
+		!state.cached[&dir].sema.diagnostics().has_errors(),
+		"{:?}",
+		state.cached[&dir].sema.diagnostics()
+	);
+	let uri = Uri::from_file_path(&root).unwrap();
+	assert_eq!(
+		hover_text(&state, &uri, source, "convert", 0).unwrap(),
+		"```wx\ntrait Convert\nfunc convert<U>(self: Self, value: U) -> U\n```",
+	);
+	assert_eq!(
+		hover_text(&state, &uri, source, "identity", 0).unwrap(),
+		"```wx\ntrait Convert\nfunc identity(self: Self) -> Self\n```",
+	);
+	for (needle, expected) in [
+		(
+			"convert",
+			"impl<T> Convert for Wrapper<T>\nfunc convert<U>(self: Wrapper<T>, value: U) -> U",
+		),
+		(
+			"identity",
+			"impl<T> Convert for Wrapper<T>\nfunc identity(self: Wrapper<T>) -> Wrapper<T>",
+		),
+	] {
+		for occurrence in 1..3 {
+			assert_eq!(
+				hover_text(&state, &uri, source, needle, occurrence).unwrap(),
+				format!("```wx\n{expected}\n```"),
+				"{needle}, occurrence {occurrence}",
+			);
+		}
+	}
+}
+
+#[test]
 fn hover_and_goto_definition_work_on_the_declaration_itself() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
@@ -752,6 +1149,10 @@ fn self_in_an_impl_shows_and_leads_to_its_target() {
 	assert_eq!(
 		hover_text(&state, &uri, source, "Self", 0).unwrap(),
 		"```wx\ntype Self = Point\n```"
+	);
+	assert_eq!(
+		hover_text(&state, &uri, source, "flip", 0).unwrap(),
+		"```wx\nimpl Point\nfunc flip(self: Point) -> Point\n```",
 	);
 	let params = definition_params(&uri, position_of(source, "Self", 1));
 	let Some(GotoDefinitionResponse::Scalar(location)) =

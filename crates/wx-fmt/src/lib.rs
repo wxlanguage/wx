@@ -2448,6 +2448,42 @@ impl<'a> Builder<'a> {
 		out.push(self.text(Text::RParen));
 	}
 
+	/// An `else { if .. }` wrapper is redundant only when the `if` is its
+	/// sole value. Keep wrappers that terminate the value or own comments.
+	fn else_if_expression<'b>(
+		&self,
+		block: &'b ast::Spanned<ast::Expression>,
+	) -> Option<&'b ast::Spanned<ast::Expression>> {
+		let ast::Expression::Block {
+			label: None,
+			statements,
+		} = &block.inner
+		else {
+			return None;
+		};
+		let [statement] = &**statements else {
+			return None;
+		};
+		let ast::Statement::Expression(expression) = &statement.inner.inner
+		else {
+			return None;
+		};
+		if statement.separator.is_some()
+			|| !matches!(expression.inner, ast::Expression::IfElse { .. })
+			|| !self
+				.comments
+				.between(block.span.start, expression.span.start)
+				.is_empty()
+			|| !self
+				.comments
+				.between(expression.span.end, block.span.end)
+				.is_empty()
+		{
+			return None;
+		}
+		Some(expression)
+	}
+
 	fn build_expression(
 		&mut self,
 		expression: &ast::Spanned<ast::Expression>,
@@ -2541,11 +2577,15 @@ impl<'a> Builder<'a> {
 				let then_statements = then_block.inner.as_block_statements();
 				let else_data = else_block.as_deref().map(|b| match &b.inner {
 					ast::Expression::Block { statements, .. } => {
-						self.build_block_content(statements, b.span)
+						if let Some(nested) = self.else_if_expression(b) {
+							self.build_expression_contents(nested)
+						} else {
+							self.build_block_content(statements, b.span)
+						}
 					}
-					// `else if`: the nested `if` starts with its own keyword,
-					// and `Text::Else` already carries the separating space.
-					_ => self.build_expression(b),
+					// A continuation belongs to the same layout group as the
+					// first `if`, so every branch breaks when the chain breaks.
+					_ => self.build_expression_contents(b),
 				});
 
 				let then_id =

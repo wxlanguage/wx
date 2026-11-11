@@ -2501,9 +2501,11 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		self.assoc_types.push(AssocTypeDecl {
 			file_id,
 			namespace,
+			// A synthetic associated type has no written name; its empty
+			// span keeps it out of the name-to-definition table.
 			name: Spanned {
 				inner: size_symbol,
-				span: name_span,
+				span: TextSpan::new(name_span.start, name_span.start),
 			},
 		});
 		let trait_impl_index = self.push_trait_impl(TraitImplDecl {
@@ -2539,7 +2541,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			namespace,
 			name: Spanned {
 				inner: value_symbol,
-				span: name_span,
+				span: TextSpan::new(name_span.start, name_span.start),
 			},
 		});
 		let trait_impl_index = self.push_trait_impl(TraitImplDecl {
@@ -2589,7 +2591,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			namespace,
 			name: Spanned {
 				inner: args_symbol,
-				span: name_span,
+				span: TextSpan::new(name_span.start, name_span.start),
 			},
 		});
 		let result_assoc_type_index =
@@ -2599,7 +2601,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			namespace,
 			name: Spanned {
 				inner: result_symbol,
-				span: name_span,
+				span: TextSpan::new(name_span.start, name_span.start),
 			},
 		});
 		let call_impl_index = self.push_trait_impl(TraitImplDecl {

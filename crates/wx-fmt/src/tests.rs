@@ -2453,8 +2453,8 @@ fn checked_format(source: &str, width: u32, indent: u8) -> String {
 	output
 }
 
-// Compare nested block roles while allowing precisely the two authorized
-// normalizations: non-final block-like separators and local definitions.
+// Compare nested block roles while allowing separator normalization and
+// redundant `else { if .. }` wrappers to become `else if ..`.
 fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 	use ast::Expression as E;
 	assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
@@ -2504,7 +2504,23 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 			preserve_roles(&at.inner, &bt.inner);
 			assert_eq!(ae.is_some(), be.is_some());
 			if let (Some(a), Some(b)) = (ae, be) {
-				preserve_roles(&a.inner, &b.inner);
+				if let E::Block { label, statements } = &a.inner
+					&& matches!(b.inner, E::IfElse { .. })
+				{
+					assert!(label.is_none());
+					let [statement] = &**statements else {
+						panic!("removed else block with multiple statements");
+					};
+					assert!(statement.separator.is_none());
+					let ast::Statement::Expression(nested) =
+						&statement.inner.inner
+					else {
+						panic!("removed else block without a tail expression");
+					};
+					preserve_roles(&nested.inner, &b.inner);
+				} else {
+					preserve_roles(&a.inner, &b.inner);
+				}
 			}
 		}
 		(E::Loop { block: a, .. }, E::Loop { block: b, .. }) => {
@@ -2858,6 +2874,119 @@ fn branch_coordination_and_comments() {
 		4,
 	);
 	assert!(output.contains("    } // boundary\n"), "{output}");
+}
+
+#[test]
+fn chained_if_branches_share_one_layout() {
+	for branch in ["prepare(); a()", "// branch\na()", "a() // branch\n"] {
+		for position in 0..3 {
+			let mut branches = ["a()", "b()", "c()"];
+			branches[position] = branch;
+			let [a, b, c] = branches;
+			let output = checked_format(
+				&format!(
+					"func f() {{ return if x {{ {a} }} else if y {{ {b} }} else {{ {c} }} }}"
+				),
+				120,
+				4,
+			);
+			assert!(output.contains("return if x {\n"), "{output}");
+			assert!(output.contains("} else if y {\n"), "{output}");
+			assert!(output.contains("} else {\n"), "{output}");
+		}
+	}
+
+	let expression =
+		"if x { a() } else if y { b() } else if z { c() } else { d() }";
+	let boundary = (4 + expression.len() + 1) as u32;
+	for width in [boundary - 1, boundary, boundary + 1] {
+		let output = checked_format(
+			&format!("func f() {{ {expression}; next() }}"),
+			width,
+			4,
+		);
+		if width >= boundary {
+			assert!(
+				output.contains(&format!("    {expression};\n")),
+				"{output}"
+			);
+		} else {
+			assert!(output.contains("if x {\n"), "{output}");
+			assert!(output.contains("} else if y {\n"), "{output}");
+			assert!(output.contains("} else if z {\n"), "{output}");
+			assert!(output.contains("} else {\n"), "{output}");
+			assert!(output.contains("\n    }\n    next()"), "{output}");
+		}
+	}
+}
+
+#[test]
+fn chained_if_keeps_nested_expressions_independent() {
+	assert_eq!(
+		checked_format(
+			"func f() { return if x { // branch\n-k_cosf(if sign { a + b } else { a - b }) } else if y { b() } else { c() } }",
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                return if x {
+                    // branch
+                    -k_cosf(if sign { a + b } else { a - b })
+                } else if y {
+                    b()
+                } else {
+                    c()
+                }
+            }
+        "},
+	);
+}
+
+#[test]
+fn redundant_else_if_wrappers_become_chains() {
+	for (source, expected) in [
+		(
+			"func f() { if x { a() } else { if y { b() } else { if z { c() } else { d() } } } }",
+			"func f() {\n    if x { a() } else if y { b() } else if z { c() } else { d() }\n}\n",
+		),
+		(
+			"func f() { return if x { a() } else { if y { // branch\nb() } else { c() } } }",
+			indoc! {"
+                func f() {
+                    return if x {
+                        a()
+                    } else if y {
+                        // branch
+                        b()
+                    } else {
+                        c()
+                    }
+                }
+            "},
+		),
+	] {
+		assert_eq!(checked_format(source, 120, 4), expected);
+	}
+}
+
+#[test]
+fn meaningful_else_if_wrappers_are_preserved() {
+	for body in [
+		"if y { b() } else { c() };",
+		"prepare(); if y { b() } else { c() }",
+		"// before\nif y { b() } else { c() }",
+		"if y { b() } else { c() } // after\n",
+	] {
+		let output = checked_format(
+			&format!("func f() {{ if x {{ a() }} else {{ {body} }} }}"),
+			120,
+			4,
+		);
+		assert!(output.contains("} else {\n"), "{output}");
+		assert!(!output.contains("} else if y"), "{output}");
+		assert_eq!(output.matches("//").count(), body.matches("//").count());
+	}
 }
 
 #[test]

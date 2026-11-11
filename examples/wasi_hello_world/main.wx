@@ -33,7 +33,7 @@ func main() {
     local io_vecs = alloc.allocate_slice_uninit::<heap::&[u8]>(1);
     io_vecs[0] = "Hello, world!\n";
     local written = alloc.allocate_value::<u32>(0);
-    _ = wasi::fd_write(FileDescriptor::StdOut, io_vecs.*.&, written);
+    _ = wasi::fd_write(FileDescriptor::StdOut, io_vecs, written);
 }
 
 export {

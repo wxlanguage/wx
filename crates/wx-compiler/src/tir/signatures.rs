@@ -572,6 +572,31 @@ impl Semantics {
 		&self.diagnostics
 	}
 
+	/// The function's own parameter frame, or the empty root frame when its
+	/// signature uses an enclosing impl's or trait's frame instead.
+	pub fn function_own_type_params(
+		&self,
+		function: FunctionIdx,
+	) -> GenericEnvIdx {
+		let env = self.functions[usize::from(function)].type_params;
+		if env != GenericEnvIdx::ROOT
+			&& self.generic_envs.owner(env)
+				== GenericEnvOwner::Function(function)
+		{
+			env
+		} else {
+			GenericEnvIdx::ROOT
+		}
+	}
+
+	/// The trait an impl implements, if its written trait name resolved.
+	pub fn trait_impl_trait(&self, index: TraitImplIdx) -> Option<TraitIdx> {
+		self.impl_dispatch
+			.trait_header(index)
+			.trait_decl
+			.map(|t| t.inner)
+	}
+
 	pub(super) fn new(
 		decls: Declarations,
 		impl_dispatch: ImplDispatch,

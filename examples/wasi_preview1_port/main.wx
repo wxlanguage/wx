@@ -436,27 +436,54 @@ enum ClockId(u32) {
 // out-pointers instead of one. This is the same shape already proven in
 // `examples/wasi_args`'s `args_sizes_get`.
 import "wasi_snapshot_preview1" as wasi {
-    func args_get(argv: super::heap::*u32, argv_buf: super::heap::*u8) -> super::Errno;
-    func args_sizes_get(argc: super::heap::*u32, argv_buf_size: super::heap::*u32) -> super::Errno;
-    func environ_get(environ: super::heap::*u32, environ_buf: super::heap::*u8) -> super::Errno;
+    func args_get(
+        argv: super::heap::*u32,
+        argv_buf: super::heap::*u8,
+    ) -> super::Errno;
+    func args_sizes_get(
+        argc: super::heap::*u32,
+        argv_buf_size: super::heap::*u32,
+    ) -> super::Errno;
+    func environ_get(
+        environ: super::heap::*u32,
+        environ_buf: super::heap::*u8,
+    ) -> super::Errno;
     func environ_sizes_get(
         environ_count: super::heap::*u32,
         environ_buf_size: super::heap::*u32,
     ) -> super::Errno;
-    func clock_res_get(id: super::ClockId, resolution: super::heap::*u64) -> super::Errno;
-    func clock_time_get(id: super::ClockId, precision: u64, time: super::heap::*u64) -> super::Errno;
-    func fd_advise(fd: super::Fd, offset: u64, len: u64, advice: super::Advice) -> super::Errno;
+    func clock_res_get(
+        id: super::ClockId,
+        resolution: super::heap::*u64,
+    ) -> super::Errno;
+    func clock_time_get(
+        id: super::ClockId,
+        precision: u64,
+        time: super::heap::*u64,
+    ) -> super::Errno;
+    func fd_advise(
+        fd: super::Fd,
+        offset: u64,
+        len: u64,
+        advice: super::Advice,
+    ) -> super::Errno;
     func fd_allocate(fd: super::Fd, offset: u64, len: u64) -> super::Errno;
     func fd_close(fd: super::Fd) -> super::Errno;
     func fd_datasync(fd: super::Fd) -> super::Errno;
-    func fd_fdstat_get(fd: super::Fd, stat: super::heap::*super::Fdstat) -> super::Errno;
+    func fd_fdstat_get(
+        fd: super::Fd,
+        stat: super::heap::*super::Fdstat,
+    ) -> super::Errno;
     func fd_fdstat_set_flags(fd: super::Fd, flags: u16) -> super::Errno;
     func fd_fdstat_set_rights(
         fd: super::Fd,
         fs_rights_base: u64,
         fs_rights_inheriting: u64,
     ) -> super::Errno;
-    func fd_filestat_get(fd: super::Fd, stat: super::heap::*super::Filestat) -> super::Errno;
+    func fd_filestat_get(
+        fd: super::Fd,
+        stat: super::heap::*super::Filestat,
+    ) -> super::Errno;
     func fd_filestat_set_size(fd: super::Fd, size: u64) -> super::Errno;
     func fd_filestat_set_times(
         fd: super::Fd,
@@ -470,8 +497,15 @@ import "wasi_snapshot_preview1" as wasi {
         offset: u64,
         nread: super::heap::*u32,
     ) -> super::Errno;
-    func fd_prestat_get(fd: super::Fd, prestat: super::heap::*super::Prestat) -> super::Errno;
-    func fd_prestat_dir_name(fd: super::Fd, path: super::heap::*u8, path_len: u32) -> super::Errno;
+    func fd_prestat_get(
+        fd: super::Fd,
+        prestat: super::heap::*super::Prestat,
+    ) -> super::Errno;
+    func fd_prestat_dir_name(
+        fd: super::Fd,
+        path: super::heap::*u8,
+        path_len: u32,
+    ) -> super::Errno;
     func fd_pwrite(
         fd: super::Fd,
         iovs: super::heap::&[super::heap::&[u8]],
@@ -504,7 +538,10 @@ import "wasi_snapshot_preview1" as wasi {
         iovs: super::heap::&[super::heap::&[u8]],
         nwritten: super::heap::*u32,
     ) -> super::Errno;
-    func path_create_directory(fd: super::Fd, path: super::heap::&[u8]) -> super::Errno;
+    func path_create_directory(
+        fd: super::Fd,
+        path: super::heap::&[u8],
+    ) -> super::Errno;
     func path_filestat_get(
         fd: super::Fd,
         flags: u32,
@@ -543,7 +580,10 @@ import "wasi_snapshot_preview1" as wasi {
         buf_len: u32,
         bufused: super::heap::*u32,
     ) -> super::Errno;
-    func path_remove_directory(fd: super::Fd, path: super::heap::&[u8]) -> super::Errno;
+    func path_remove_directory(
+        fd: super::Fd,
+        path: super::heap::&[u8],
+    ) -> super::Errno;
     func path_rename(
         fd: super::Fd,
         old_path: super::heap::&[u8],
@@ -555,7 +595,10 @@ import "wasi_snapshot_preview1" as wasi {
         fd: super::Fd,
         new_path: super::heap::&[u8],
     ) -> super::Errno;
-    func path_unlink_file(fd: super::Fd, path: super::heap::&[u8]) -> super::Errno;
+    func path_unlink_file(
+        fd: super::Fd,
+        path: super::heap::&[u8],
+    ) -> super::Errno;
     // `$in`/`$out` are raw pointers to caller-managed arrays with the element
     // count passed separately (`nsubscriptions`), *not* witx `list`s — so
     // these stay single-element pointers rather than slices; the slice
@@ -571,7 +614,11 @@ import "wasi_snapshot_preview1" as wasi {
     func proc_raise(sig: super::Signal) -> super::Errno;
     func sched_yield() -> super::Errno;
     func random_get(buf: super::heap::*[u8]) -> super::Errno;
-    func sock_accept(fd: super::Fd, flags: u16, new_fd: super::heap::*u32) -> super::Errno;
+    func sock_accept(
+        fd: super::Fd,
+        flags: u16,
+        new_fd: super::heap::*u32,
+    ) -> super::Errno;
     func sock_recv(
         fd: super::Fd,
         ri_data: super::heap::&[super::heap::*[u8]],

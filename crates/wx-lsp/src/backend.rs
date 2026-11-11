@@ -11,9 +11,9 @@ use tower_lsp_server::ls_types::{
 	DidOpenTextDocumentParams, DocumentFormattingParams, FileSystemWatcher,
 	GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
 	HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-	InitializedParams, MessageType, OneOf, Registration, ServerCapabilities,
-	TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-	TextEdit, Uri,
+	InitializedParams, Location, MessageType, OneOf, ReferenceParams,
+	Registration, ServerCapabilities, TextDocumentSyncCapability,
+	TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::vfs::{AbsolutePath, StdlibFileSource};
@@ -93,6 +93,7 @@ impl LanguageServer for Backend {
 				)),
 				hover_provider: Some(HoverProviderCapability::Simple(true)),
 				definition_provider: Some(OneOf::Left(true)),
+				references_provider: Some(OneOf::Left(true)),
 				document_formatting_provider: Some(OneOf::Left(true)),
 				..Default::default()
 			},
@@ -231,6 +232,17 @@ impl LanguageServer for Backend {
 		Ok(self
 			.state
 			.query(|reply| Command::GotoDefinition(params, reply))
+			.await
+			.flatten())
+	}
+
+	async fn references(
+		&self,
+		params: ReferenceParams,
+	) -> Result<Option<Vec<Location>>> {
+		Ok(self
+			.state
+			.query(|reply| Command::References(params, reply))
 			.await
 			.flatten())
 	}

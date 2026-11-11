@@ -7,7 +7,7 @@ use codespan_reporting::term::termcolor::Ansi;
 use tower_lsp_server::ls_types::{
 	GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
 	HoverParams, Location, MarkupContent, MarkupKind, Position, Range,
-	TextEdit, Uri,
+	ReferenceParams, TextEdit, Uri,
 };
 use wx_compiler::diagnostics::Diagnostics as _;
 use wx_compiler::symbols::Keyword;
@@ -39,6 +39,39 @@ pub(crate) fn goto_definition(
 		uri: file_id_to_uri(files, definition.file_id)?,
 		range: span_to_range(files, definition)?,
 	}))
+}
+
+/// Project-wide references in the selected snapshot's package graph. No
+/// compiler identities are compared across independently built snapshots.
+pub(crate) fn references(
+	state: &ServerState,
+	params: &ReferenceParams,
+) -> Option<Vec<Location>> {
+	let position = &params.text_document_position;
+	let (snapshot, file) = state.resolve_uri(&position.text_document.uri)?;
+	let files = &snapshot.compilation.files;
+	let offset = position_to_offset(files, file, position.position)?;
+	let (_, definition) = snapshot.definition_at(file, offset)?;
+	let mut spans = snapshot.sema.references_to(definition);
+	if params.context.include_declaration
+		&& let Some(span) = snapshot.sema.definition_span(definition)
+		&& span.span.start != span.span.end
+	{
+		spans.push(span);
+		spans.sort_unstable();
+		spans.dedup();
+	}
+	Some(
+		spans
+			.into_iter()
+			.filter_map(|span| {
+				Some(Location {
+					uri: file_id_to_uri(files, span.file_id)?,
+					range: span_to_range(files, span)?,
+				})
+			})
+			.collect(),
+	)
 }
 
 /// The signature and doc comment of the name under the cursor.

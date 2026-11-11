@@ -12,7 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
 	Diagnostic, DocumentFormattingParams, GotoDefinitionParams,
-	GotoDefinitionResponse, Hover, HoverParams, TextEdit, Uri,
+	GotoDefinitionResponse, Hover, HoverParams, Location, ReferenceParams,
+	TextEdit, Uri,
 };
 
 use crate::convert::path_to_file_uri;
@@ -45,6 +46,7 @@ pub(crate) enum Command {
 		oneshot::Sender<Option<GotoDefinitionResponse>>,
 	),
 	Hover(HoverParams, oneshot::Sender<Option<Hover>>),
+	References(ReferenceParams, oneshot::Sender<Option<Vec<Location>>>),
 	Formatting(
 		DocumentFormattingParams,
 		oneshot::Sender<Option<Vec<TextEdit>>>,
@@ -155,6 +157,9 @@ pub(crate) async fn handle_command(
 		}
 		Command::Hover(params, reply) => {
 			let _ = reply.send(requests::hover(state, &params));
+		}
+		Command::References(params, reply) => {
+			let _ = reply.send(requests::references(state, &params));
 		}
 		Command::Formatting(params, reply) => {
 			let mut trace = Trace::new(PathBuf::from(

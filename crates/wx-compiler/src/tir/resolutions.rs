@@ -290,6 +290,66 @@ impl Reference {
 }
 
 impl Semantics {
+	/// Every resolved name referring to `definition`, in source order and
+	/// without duplicate spans. Declarations are not references; callers may
+	/// include `definition_span` separately. Like every definition identity,
+	/// the argument and results belong to this compilation only.
+	///
+	/// This is the inverse of the existing resolution table, computed on
+	/// demand rather than stored alongside it. All roles at a site participate:
+	/// a shorthand can refer to both a parameter/field and its supplied value.
+	pub fn references_to(&self, definition: Definition) -> Vec<SourceSpan> {
+		let definition = self.reference_identity(definition);
+		let mut found = Vec::new();
+		for (site, reference) in &self.resolutions.by_site {
+			let span = site.span();
+			if span.span.start != span.span.end
+				&& self.reference_identity(reference.definition()) == definition
+				&& found.last() != Some(&span)
+			{
+				found.push(span);
+			}
+		}
+		found
+	}
+
+	/// Different ways of naming the same declaration, not declarations that
+	/// merely navigate to the same span (a trait and its `Self`, for example).
+	fn reference_identity(&self, definition: Definition) -> Definition {
+		match definition {
+			Definition::Item(key) => match self.declaration_kind(key) {
+				DeclKind::Function(index) => {
+					Definition::Member(MemberKind::Function(index))
+				}
+				DeclKind::Const(index) | DeclKind::EnumVariant(index) => {
+					Definition::Member(MemberKind::Constant(index))
+				}
+				DeclKind::TraitAssocType(index) => {
+					Definition::Member(MemberKind::AssociatedType(index))
+				}
+				_ => definition,
+			},
+			Definition::Member(MemberKind::Method(index)) => {
+				Definition::Member(MemberKind::Function(index))
+			}
+			Definition::Parameter {
+				function,
+				parameter,
+			} => {
+				let owner = BodyOwner::Function(function);
+				self.owner_body(owner)
+					.and_then(|body| body.params().get(usize::from(parameter)))
+					.copied()
+					.flatten()
+					.map_or(definition, |local| Definition::Local {
+						owner,
+						local,
+					})
+			}
+			_ => definition,
+		}
+	}
+
 	/// What the name written at `offset` in `file` resolved to, with the span
 	/// of the name. `None` when no resolved name is written there.
 	///
@@ -446,8 +506,8 @@ impl Semantics {
 	}
 
 	/// Every declared name that has a written name, with where it is written.
-	/// Where two share a span (a memory and the `Size` its synthetic impl
-	/// declares at its name, a trait and its `Self`), the item wins.
+	/// A synthetic associated type's name span is empty, so it is skipped;
+	/// where two still share a span (a trait and its `Self`), the item wins.
 	pub fn definitions(&self) -> BTreeMap<SourceSpan, Definition> {
 		let decls = &self.decls;
 		let mut found = BTreeMap::new();
@@ -803,6 +863,144 @@ mod tests {
 					BindingKey::new(tier, self.strings.get(name).unwrap()),
 				)
 				.unwrap()
+		}
+	}
+
+	#[test]
+	fn references_join_parameter_labels_and_body_locals_and_deduplicate_roles()
+	{
+		let a = Analysis::clean(indoc! {"
+			func take(value: u32) -> u32 {
+				_ = take({ value: 1 });
+				_ = take({ value });
+				value
+			}
+		"});
+		let local = a.value("\n\tvalue\n", "value").definition();
+		let parameter = a.label("{ value: 1", "value").definition();
+		let expected = [
+			a.span("{ value: 1", "value"),
+			a.span("{ value }", "value"),
+			a.span("\n\tvalue\n", "value"),
+		]
+		.map(|span| SourceSpan::new(a.file, span));
+		assert_ne!(local, parameter);
+		assert_eq!(a.sema.references_to(local), expected);
+		assert_eq!(a.sema.references_to(parameter), expected);
+	}
+
+	#[test]
+	fn references_include_both_constructor_tiers_and_import_routes() {
+		let a = Analysis::clean(indoc! {"
+			mod m { pub struct S(); }
+			use m::S as Alias;
+			func f(s: Alias) -> m::S { Alias() }
+		"});
+		let ty = a.at("s: Alias", "Alias", Tier::Type).unwrap().definition();
+		let value = a.value("{ Alias()", "Alias").definition();
+		let expected = [
+			a.span("use m::S", "S"),
+			a.span("s: Alias", "Alias"),
+			a.span("-> m::S", "S"),
+			a.span("{ Alias()", "Alias"),
+		]
+		.map(|span| SourceSpan::new(a.file, span));
+		assert_eq!(a.sema.references_to(ty), expected);
+		assert_eq!(a.sema.references_to(value), expected);
+	}
+
+	#[test]
+	fn references_preserve_owner_identity_and_ignore_access_kind() {
+		let a = Analysis::clean(indoc! {"
+			func f() -> u32 {
+				local mut x: u32 = 0;
+				x = 1;
+				x += 2;
+				local _ = block { local x: u32 = 3; x };
+				x
+			}
+			func g(x: u32) -> u32 { x }
+		"});
+		let definition = a.value("x = 1", "x").definition();
+		assert_eq!(
+			a.sema.references_to(definition),
+			[
+				a.span("x = 1", "x"),
+				a.span("x += 2", "x"),
+				a.span("\n\tx\n", "x"),
+			]
+			.map(|span| SourceSpan::new(a.file, span))
+		);
+	}
+
+	#[test]
+	fn references_do_not_merge_a_trait_with_its_self_parameter() {
+		let a = Analysis::clean(indoc! {"
+			trait Tr: StackValue { func id(self: Self) -> Self { self } }
+			func f<T: Tr>(x: T) -> T { x.id() }
+		"});
+		let tr = a.at("T: Tr", "Tr", Tier::Type).unwrap().definition();
+		let self_ty =
+			a.at("self: Self", "Self", Tier::Type).unwrap().definition();
+		assert_eq!(a.sema.definition_span(tr), a.sema.definition_span(self_ty));
+		assert_eq!(
+			a.sema.references_to(tr),
+			[SourceSpan::new(a.file, a.span("T: Tr", "Tr"))]
+		);
+		assert_eq!(a.sema.references_to(self_ty).len(), 2);
+	}
+
+	#[test]
+	fn references_find_members_from_their_declarations() {
+		let a = Analysis::clean(indoc! {"
+			struct S();
+			impl S {
+				func id(self: Self) -> Self { self }
+			}
+			func f(s: S) -> S { S::id(s).id() }
+		"});
+		let definition = a.value("S::id", "id").definition();
+		assert_eq!(
+			a.sema.references_to(definition),
+			[a.span("S::id", "id"), a.span(".id()", "id"),]
+				.map(|span| SourceSpan::new(a.file, span))
+		);
+		let span = SourceSpan::new(a.file, a.span("func id", "id"));
+		let declared = a.sema.definitions()[&span];
+		assert_eq!(
+			a.sema.references_to(declared),
+			a.sema.references_to(definition)
+		);
+	}
+
+	#[test]
+	fn references_find_labels_type_parameters_and_bodyless_parameters() {
+		let a = Analysis::clean(indoc! {r#"
+			import "host" as host { func take(value: u32); }
+			func f<T: StackValue>(x: T) -> T {
+				host::take({ value: 1 });
+				loop :done { break :done; }
+				x
+			}
+		"#});
+		for (reference, contexts, name) in [
+			(a.label("value: 1", "value"), vec!["value: 1"], "value"),
+			(a.label("break :done", "done"), vec!["break :done"], "done"),
+			(
+				a.at("x: T", "T", Tier::Type).unwrap(),
+				vec!["x: T", "-> T"],
+				"T",
+			),
+		] {
+			let definition = reference.definition();
+			let span = a.sema.definition_span(definition).unwrap();
+			let declared = a.sema.definitions()[&span];
+			let expected: Vec<_> = contexts
+				.into_iter()
+				.map(|context| SourceSpan::new(a.file, a.span(context, name)))
+				.collect();
+			assert_eq!(a.sema.references_to(definition), expected);
+			assert_eq!(a.sema.references_to(declared), expected);
 		}
 	}
 

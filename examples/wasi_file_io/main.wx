@@ -84,17 +84,16 @@ func main() {
     local alloc = allocator();
 
     local created_fd_ptr = alloc.allocate_value::<u32>(0);
-    local create_result =
-        wasi::path_open(
-            FileDescriptor::PreopenedDir,
-            0,
-            "message.txt",
-            OFlags::CREAT | OFlags::TRUNC,
-            Rights::FD_WRITE,
-            0,
-            0,
-            created_fd_ptr,
-        );
+    local create_result = wasi::path_open({
+        dir_fd: FileDescriptor::PreopenedDir,
+        dir_flags: 0,
+        path: "message.txt",
+        o_flags: OFlags::CREAT | OFlags::TRUNC,
+        fs_rights_base: Rights::FD_WRITE,
+        fs_rights_inheriting: 0,
+        fd_flags: 0,
+        opened_fd: created_fd_ptr,
+    });
     if create_result != Errno::Success { trap() };
 
     local created_fd: FileDescriptor = transmute(created_fd_ptr.*);
@@ -102,17 +101,16 @@ func main() {
     if wasi::fd_close(created_fd) != Errno::Success { trap() };
 
     local read_fd_ptr = alloc.allocate_value::<u32>(0);
-    local open_result =
-        wasi::path_open(
-            FileDescriptor::PreopenedDir,
-            0,
-            "message.txt",
-            0,
-            Rights::FD_READ,
-            0,
-            0,
-            read_fd_ptr,
-        );
+    local open_result = wasi::path_open({
+        dir_fd: FileDescriptor::PreopenedDir,
+        dir_flags: 0,
+        path: "message.txt",
+        o_flags: 0,
+        fs_rights_base: Rights::FD_READ,
+        fs_rights_inheriting: 0,
+        fd_flags: 0,
+        opened_fd: read_fd_ptr,
+    });
     if open_result != Errno::Success { trap() };
 
     local read_fd: FileDescriptor = transmute(read_fd_ptr.*);
@@ -120,7 +118,7 @@ func main() {
     local io_vecs = alloc.allocate_slice_uninit::<heap::*[u8]>(1);
     io_vecs[0] = buf;
     local nread = alloc.allocate_value::<u32>(0);
-    if wasi::fd_read(read_fd, io_vecs.*.&, nread) != Errno::Success { trap() };
+    if wasi::fd_read(read_fd, io_vecs, nread) != Errno::Success { trap() };
     if wasi::fd_close(read_fd) != Errno::Success { trap() };
 
     write_all(FileDescriptor::Stdout, slice_from_parts(buf.as_ref(), nread.*));
