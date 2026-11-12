@@ -56,9 +56,7 @@ fn open_synthetic_manifest(state: &mut ServerState, entry: &Path) -> PathBuf {
 	let entry_name = entry.file_name().and_then(|name| name.to_str()).unwrap();
 	state.open_documents.insert(
 		dir.join("wx.json"),
-		open_document(&format!(
-			r#"{{ "type": "bin", "entry": "{entry_name}" }}"#
-		)),
+		open_document(&format!(r#"{{ "entry": "{entry_name}" }}"#)),
 	);
 	dir
 }
@@ -145,7 +143,7 @@ fn discover_package_root_walks_up_to_wx_json() {
 	let mut open_documents = HashMap::new();
 	open_documents.insert(
 		package_dir.join("wx.json"),
-		open_document(r#"{ "type": "bin", "entry": "main.wx" }"#),
+		open_document(r#"{ "entry": "main.wx" }"#),
 	);
 
 	let discovered =
@@ -196,7 +194,6 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 		hashing_dir.join("wx.json"),
 		open_document(
 			r#"{
-				"type": "bin",
 				"entry": "main.wx",
 				"dependencies": { "pow": { "type": "local", "path": "../pow" } }
 			}"#,
@@ -210,7 +207,7 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 	);
 	state.open_documents.insert(
 		pow_dir.join("wx.json"),
-		open_document(r#"{ "type": "lib", "entry": "main.wx" }"#),
+		open_document(r#"{ "entry": "main.wx" }"#),
 	);
 	state.open_documents.insert(
 		pow_main.clone(),
@@ -358,24 +355,24 @@ fn position_conversion_handles_non_ascii_lines() {
 }
 
 #[test]
-fn resolve_uri_finds_a_virtual_stdlib_module() {
+fn resolve_uri_finds_a_virtual_core_module() {
 	// `Uri::to_file_path` does not check the scheme and returns a bogus path
-	// for `wx://std/...`, so the lookup must not short-circuit on it.
+	// for `wx://core/...`, so the lookup must not short-circuit on it.
 	let root = PathBuf::from("/test/main.wx");
 	let (state, dir) = analyzed(&root, "func main() {}");
 	let snapshot = &state.cached[&dir];
-	let std_file = snapshot
+	let core_file = snapshot
 		.compilation
 		.packages
 		.iter()
 		.flat_map(|package| package.modules.iter())
 		.find(|module| module.file_path.as_str() == "/main.wx")
 		.map(|module| module.file_id)
-		.expect("the stdlib module is in the graph");
-	let uri = file_id_to_uri(&snapshot.compilation.files, std_file).unwrap();
+		.expect("the core module is in the graph");
+	let uri = file_id_to_uri(&snapshot.compilation.files, core_file).unwrap();
 
 	let resolved = state.resolve_uri(&uri);
-	assert_eq!(resolved.map(|(_, file)| file), Some(std_file));
+	assert_eq!(resolved.map(|(_, file)| file), Some(core_file));
 }
 
 #[test]
@@ -387,7 +384,7 @@ fn a_shared_file_resolves_to_its_own_project_whatever_the_hash_order() {
 		state.open_documents.insert(
 			PathBuf::from(consumer).join("wx.json"),
 			open_document(
-				r#"{ "type": "bin", "entry": "main.wx",
+				r#"{ "entry": "main.wx",
 				     "dependencies": { "dep": { "type": "local", "path": "../dep" } } }"#,
 			),
 		);
@@ -400,7 +397,7 @@ fn a_shared_file_resolves_to_its_own_project_whatever_the_hash_order() {
 	let dep_main = dep_dir.join("main.wx");
 	state.open_documents.insert(
 		dep_dir.join("wx.json"),
-		open_document(r#"{ "type": "lib", "entry": "main.wx" }"#),
+		open_document(r#"{ "entry": "main.wx" }"#),
 	);
 	state
 		.open_documents
@@ -469,6 +466,44 @@ fn a_diagnostic_without_a_primary_label_gets_one_squiggle_per_label() {
 	let diagnostics = &grouped[&PathBuf::from("/test/main.wx")];
 	assert_eq!(diagnostics.len(), 2);
 	assert_ne!(diagnostics[0].range, diagnostics[1].range);
+}
+
+#[test]
+fn where_binding_names_support_definition_and_references() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = "trait Representation { type Repr; }\n\
+		trait Scalar {}\n\
+		trait Derived: Representation {}\n\
+		trait Example { type Value: Representation where { Repr: Scalar }; }\n\
+		func equality<T: Representation where { Repr = i32 }>() {}\n\
+		func inherited<T: Derived where { Repr: Scalar }>() {}\n";
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let declaration = position_of(source, "Repr;", 0);
+	let uses = [
+		position_of(source, "Repr: Scalar", 0),
+		position_of(source, "Repr = i32", 0),
+		position_of(source, "Repr: Scalar", 1),
+	];
+	for position in uses {
+		let location = scalar(requests::goto_definition(
+			&state,
+			&definition_params(&uri, position),
+		));
+		assert_eq!(location.uri, uri);
+		assert_eq!(location.range.start, declaration);
+	}
+	let references = requests::references(
+		&state,
+		&reference_params(&uri, declaration, false),
+	)
+	.unwrap();
+	assert_eq!(references.len(), uses.len());
+	for position in uses {
+		assert!(references.iter().any(|location| {
+			location.uri == uri && location.range.start == position
+		}));
+	}
 }
 
 #[test]
@@ -543,7 +578,7 @@ async fn a_query_queued_after_an_edit_sees_that_edit() {
 				uri: manifest_uri,
 				language_id: "json".into(),
 				version: 1,
-				text: r#"{ "type": "bin", "entry": "main.wx" }"#.into(),
+				text: r#"{ "entry": "main.wx" }"#.into(),
 			},
 		})
 		.await;
@@ -773,11 +808,11 @@ fn references_reach_dependencies_without_comparing_ids_from_other_snapshots() {
 		.open_documents
 		.insert(lib.clone(), open_document(lib_source));
 	state.open_documents.insert(app.parent().unwrap().join("wx.json"), open_document(
-		r#"{"type":"bin","entry":"main.wx","dependencies":{"lib":{"type":"local","path":"../lib"}}}"#,
+		r#"{"entry":"main.wx","dependencies":{"lib":{"type":"local","path":"../lib"}}}"#,
 	));
 	state.open_documents.insert(
 		lib.parent().unwrap().join("wx.json"),
-		open_document(r#"{"type":"lib","entry":"main.wx"}"#),
+		open_document(r#"{"entry":"main.wx"}"#),
 	);
 	compute_refresh(&mut state, &app, &mut Vec::new());
 	assert_eq!(state.cached.len(), 2);
@@ -807,7 +842,7 @@ fn references_reach_dependencies_without_comparing_ids_from_other_snapshots() {
 }
 
 #[test]
-fn references_reuse_utf16_conversion_and_virtual_stdlib_uris() {
+fn references_reuse_utf16_conversion_and_virtual_core_uris() {
 	let root = PathBuf::from("/test/main.wx");
 	let source =
 		"func helper() {}\nfunc f() { local _: u32 = '😀'; helper(); }\n";
@@ -825,19 +860,19 @@ fn references_reuse_utf16_conversion_and_virtual_stdlib_uris() {
 		references[0].range,
 		Range::new(Position::new(1, column), Position::new(1, column + 6))
 	);
-	let std = Uri::from_str("wx://std/main.wx").unwrap();
-	let (snapshot, file) = state.resolve_uri(&std).unwrap();
+	let core = Uri::from_str("wx://core/main.wx").unwrap();
+	let (snapshot, file) = state.resolve_uri(&core).unwrap();
 	let source = &snapshot.compilation.files.get(file).unwrap().source;
 	let offset = source.find("pub type u32;").unwrap() + "pub type ".len();
 	let position =
 		byte_to_position(&snapshot.compilation.files, file, offset).unwrap();
 	let references =
-		requests::references(&state, &reference_params(&std, position, true))
+		requests::references(&state, &reference_params(&core, position, true))
 			.unwrap();
 	assert!(
 		references
 			.iter()
-			.any(|loc| loc.uri == std && loc.range.start == position)
+			.any(|loc| loc.uri == core && loc.range.start == position)
 	);
 }
 
@@ -1255,16 +1290,15 @@ fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
 	);
 	state.open_documents.insert(
 		outer.join("wx.json"),
-		open_document(r#"{"type":"bin","entry":"nested/main.wx"}"#),
+		open_document(r#"{"entry":"nested/main.wx"}"#),
 	);
 	compute_refresh(&mut state, &file, &mut Vec::new());
 	assert_eq!(state.own_root.get(&file), Some(&outer));
 
 	let manifest = inner.join("wx.json");
-	state.open_documents.insert(
-		manifest.clone(),
-		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
-	);
+	state
+		.open_documents
+		.insert(manifest.clone(), open_document(r#"{"entry":"main.wx"}"#));
 	compute_active_refresh(
 		&mut state,
 		vec![manifest.clone(), manifest.clone()],
@@ -1296,7 +1330,7 @@ async fn formatting_reuses_project_manifests() {
 	let dep_path = root.join("dep/wx.json");
 	let manifest = |width| {
 		format!(
-			r#"{{"type":"bin","entry":"main.wx","format":{{"indent_width":{width}}},"dependencies":{{"dep":{{"type":"local","path":"dep"}}}}}}"#
+			r#"{{"entry":"main.wx","format":{{"indent_width":{width}}},"dependencies":{{"dep":{{"type":"local","path":"dep"}}}}}}"#
 		)
 	};
 	let mut state = ServerState::default();
@@ -1307,10 +1341,9 @@ async fn formatting_reuses_project_manifests() {
 		source_path.clone(),
 		open_document("func main() { local x = true; } export { main }"),
 	);
-	state.open_documents.insert(
-		dep_path.clone(),
-		open_document(r#"{"type":"lib","entry":"main.wx"}"#),
-	);
+	state
+		.open_documents
+		.insert(dep_path.clone(), open_document(r#"{"entry":"main.wx"}"#));
 	state.open_documents.insert(
 		root.join("dep/main.wx"),
 		open_document("pub func helper() {}"),
@@ -1406,7 +1439,7 @@ async fn watched_file_events_skip_documents_the_editor_already_owns() {
 	let mut state = ServerState::default();
 	state.open_documents.insert(
 		root.join("wx.json"),
-		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+		open_document(r#"{"entry":"main.wx"}"#),
 	);
 	state.open_documents.insert(
 		file.clone(),
@@ -1477,7 +1510,7 @@ fn a_repeated_refresh_publishes_each_file_once() {
 	let main = root.join("main.wx");
 	state.open_documents.insert(
 		root.join("wx.json"),
-		open_document(r#"{"type":"bin","entry":"main.wx"}"#),
+		open_document(r#"{"entry":"main.wx"}"#),
 	);
 	state.open_documents.insert(
 		main.clone(),
@@ -1738,8 +1771,8 @@ fn semantic_tokens_mark_only_what_the_compiler_provides() {
 		"the fixture checks cleanly"
 	);
 	let uri = Uri::from_file_path(&root).unwrap();
-	// `transmute` is a function std leaves to the compiler, and `u32` a
-	// primitive; `ne` has a body in std, so it is an ordinary method.
+	// `transmute` is a function core leaves to the compiler, and `u32` a
+	// primitive; `ne` has a body in core, so it is an ordinary method.
 	assert_eq!(
 		semantic_tokens(&state, &uri, source, None),
 		[

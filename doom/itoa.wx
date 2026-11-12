@@ -1,4 +1,4 @@
-use std::*;
+use core::*;
 
 #[memory_limits({ min_pages: 1 })]
 memory heap: Memory where { Size = u32 };

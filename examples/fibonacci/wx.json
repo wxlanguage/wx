@@ -1,5 +1,4 @@
 {
-  "type": "bin",
   "entry": "main.wx",
   "format": {
     "max_line_width": 60,

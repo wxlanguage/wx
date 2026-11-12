@@ -3,7 +3,7 @@
 //!
 //! Matches rustc: an unqualified name is looked up only in the namespace it
 //! was written in (its own direct declarations, its own `use`/glob
-//! imports), then the std prelude as a fallback — **never** by climbing to an
+//! imports), then the core prelude as a fallback — **never** by climbing to an
 //! enclosing module. Import blocks follow the same rule: sibling declarations
 //! are local, and enclosing names need a qualified path or an explicit `use`.
 //! A struct declared at the package root is not visible,
@@ -145,7 +145,7 @@ pub(super) struct PathResolver<'r> {
 	resolutions: &'r mut NameResolutions,
 	strings: &'r StringInterner,
 	decls: &'r Declarations,
-	stdlib_root: Namespace,
+	core_root: Namespace,
 }
 
 impl<'r> PathResolver<'r> {
@@ -160,7 +160,7 @@ impl<'r> PathResolver<'r> {
 			resolutions,
 			strings,
 			decls,
-			stdlib_root: Namespace::Package(decls.stdlib_package),
+			core_root: Namespace::Package(decls.core_package),
 		}
 	}
 
@@ -195,7 +195,7 @@ impl<'r> PathResolver<'r> {
 			let seg_tier = if is_last { tier } else { Tier::Type };
 			let key = BindingKey::new(seg_tier, segment.ident.inner);
 
-			// The std-prelude fallback only ever applies to the first
+			// The core-prelude fallback only ever applies to the first
 			// segment, and only once nothing binds it directly.
 			let mut outcome = self.decls.namespaces.lookup(
 				&self.decls.use_items,
@@ -204,7 +204,7 @@ impl<'r> PathResolver<'r> {
 				key,
 			);
 			if index == 0 && matches!(outcome, BindingLookup::NotFound) {
-				base = self.stdlib_root;
+				base = self.core_root;
 				outcome = self.decls.namespaces.lookup(
 					&self.decls.use_items,
 					accessor,
@@ -575,7 +575,7 @@ mod tests {
 				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
+				graph.core_package,
 				graph.root_package,
 			);
 			drop(ast_nodes);
@@ -591,9 +591,9 @@ mod tests {
 		fn new(source: &str) -> Self {
 			let mut strings = crate::symbols::Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root_id = builder
-				.load_binary(
+				.load_package(
 					vfs::AbsolutePath::new("/main.wx"),
 					&vfs::VirtualFileSource::from_relative(HashMap::from([(
 						"main.wx".to_string(),
@@ -610,9 +610,9 @@ mod tests {
 		) -> Self {
 			let mut strings = crate::symbols::Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root_id = builder
-				.load_binary(
+				.load_package(
 					entry_path,
 					&vfs::VirtualFileSource::new(workspace),
 				)
@@ -786,7 +786,7 @@ mod tests {
 	}
 
 	#[test]
-	fn falls_back_to_the_std_prelude_for_the_first_segment_only() {
+	fn falls_back_to_the_core_prelude_for_the_first_segment_only() {
 		let mut case = TestCase::new(indoc! {"
 			mod inner {}
 		"});
@@ -805,7 +805,7 @@ mod tests {
 	}
 
 	#[test]
-	fn local_definition_takes_precedence_over_the_std_prelude() {
+	fn local_definition_takes_precedence_over_the_core_prelude() {
 		let mut case = TestCase::new("struct i32();");
 		case.diagnostics().assert_none();
 

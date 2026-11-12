@@ -31,9 +31,9 @@ mod tests {
 		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new(strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let root_id = builder
-			.load_binary(
+			.load_package(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
@@ -51,6 +51,56 @@ mod tests {
 		)
 		.assert_no_errors();
 		graph
+	}
+
+	#[test]
+	fn ordinary_manifests_emit_wasm_with_or_without_exports() {
+		for export in ["", "export { answer }"] {
+			let mut strings = crate::symbols::Keyword::create_interner();
+			let source = vfs::VirtualFileSource::from_relative(
+				std::collections::HashMap::from([
+					(
+						"wx.json".to_string(),
+						r#"{ "entry": "main.wx" }"#.to_string(),
+					),
+					(
+						"main.wx".to_string(),
+						format!(
+							"pub func answer() -> i32 {{ core::i32_add(40, 2) }} {export}"
+						),
+					),
+				]),
+			);
+			let graph = vfs::open_manifest(
+				vfs::AbsolutePath::new("/"),
+				&source,
+				&mut strings,
+			)
+			.unwrap();
+			let mut sema = crate::tir::check(&graph, &mut strings);
+			let lowered = crate::tir::lower(&mut sema, &strings);
+			DiagnosticView::new("check", sema.diagnostics(), &graph.files)
+				.assert_no_errors();
+			let mut mir = lowered.expect("the package lowers");
+			let bytes =
+				emit(&mut mir, &strings, Some(mir::inline::Policy::DEFAULT))
+					.unwrap()
+					.encode();
+			let engine = wasmtime::Engine::default();
+			let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+			let mut store = wasmtime::Store::new(&engine, ());
+			let instance =
+				wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+			if export.is_empty() {
+				assert_eq!(bytes, b"\0asm\x01\0\0\0");
+				assert_eq!(instance.exports(&mut store).count(), 0);
+			} else {
+				let answer = instance
+					.get_typed_func::<(), i32>(&mut store, "answer")
+					.unwrap();
+				assert_eq!(answer.call(&mut store, ()).unwrap(), 42);
+			}
+		}
 	}
 
 	/// The build sequence honours `#[inline]`: the callee is spliced into

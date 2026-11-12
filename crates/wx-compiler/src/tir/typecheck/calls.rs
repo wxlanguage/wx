@@ -1108,7 +1108,7 @@ impl BodyBuilder<'_, '_> {
 		(args, result)
 	}
 
-	/// `<ty as Call>::{assoc}`, normalized; `ERROR` when std declares no such
+	/// `<ty as Call>::{assoc}`, normalized; `ERROR` when core declares no such
 	/// member.
 	fn call_projection(
 		&mut self,

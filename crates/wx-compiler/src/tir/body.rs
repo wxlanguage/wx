@@ -66,7 +66,7 @@ pub(super) enum FunctionImplementation {
 	Defined(BodyIdx),
 	Imported(ImportIdx),
 	/// A package function parameter: whoever instantiates its package
-	/// supplies it (for std, the compiler, when lowering).
+	/// supplies it (for core, the compiler, when lowering).
 	Parameter,
 	Declaration,
 }

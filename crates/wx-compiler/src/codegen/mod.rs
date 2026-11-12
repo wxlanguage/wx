@@ -1867,42 +1867,38 @@ impl WasmModule {
 		]
 		.to_vec();
 
-		self.types.encode(&mut sink);
-		match self.imports.imports.len() {
-			0 => {}
-			_ => self.imports.encode(&mut sink),
+		if !self.types.signatures.is_empty() {
+			self.types.encode(&mut sink);
 		}
-		match self.functions.types.len() {
-			0 => {}
-			_ => self.functions.encode(&mut sink),
+		if !self.imports.imports.is_empty() {
+			self.imports.encode(&mut sink);
 		}
-		match self.tables.tables.len() {
-			0 => {}
-			_ => self.tables.encode(&mut sink),
+		if !self.functions.types.is_empty() {
+			self.functions.encode(&mut sink);
 		}
-		match self.memory.memories.len() {
-			0 => {}
-			_ => self.memory.encode(&mut sink),
+		if !self.tables.tables.is_empty() {
+			self.tables.encode(&mut sink);
 		}
-		match self.globals.globals.len() {
-			0 => {}
-			_ => self.globals.encode(&mut sink),
+		if !self.memory.memories.is_empty() {
+			self.memory.encode(&mut sink);
 		}
-		match self.exports.items.len() {
-			0 => {}
-			_ => self.exports.encode(&mut sink),
+		if !self.globals.globals.is_empty() {
+			self.globals.encode(&mut sink);
+		}
+		if !self.exports.items.is_empty() {
+			self.exports.encode(&mut sink);
 		}
 		if let Some(ref start) = self.start {
 			start.encode(&mut sink);
 		}
-		match self.elements.segments.len() {
-			0 => {}
-			_ => self.elements.encode(&mut sink),
+		if !self.elements.segments.is_empty() {
+			self.elements.encode(&mut sink);
 		}
-		self.code.encode(&mut sink, self);
-		match self.data.segments.len() {
-			0 => {}
-			_ => self.data.encode(&mut sink),
+		if !self.code.functions.is_empty() {
+			self.code.encode(&mut sink, self);
+		}
+		if !self.data.segments.is_empty() {
+			self.data.encode(&mut sink);
 		}
 
 		sink

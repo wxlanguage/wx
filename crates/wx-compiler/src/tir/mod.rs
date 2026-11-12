@@ -59,7 +59,7 @@ pub fn check(
 	let CompilationUnit {
 		files,
 		packages,
-		stdlib_package,
+		core_package,
 		root_package,
 	} = compilation;
 	let mut diagnostics = Vec::new();
@@ -70,7 +70,7 @@ pub fn check(
 		strings,
 		&mut diagnostics,
 		&mut resolutions,
-		*stdlib_package,
+		*core_package,
 		*root_package,
 	);
 	let impl_dispatch = ImplDispatch::build(

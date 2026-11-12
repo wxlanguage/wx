@@ -2303,7 +2303,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	}
 
 	/// `memory`'s `Size` (`<memory as Memory>::Size`), normalized; `ERROR`
-	/// when the stdlib declares no `Memory`.
+	/// when the core declares no `Memory`.
 	fn memory_size(&mut self, memory: TypeIndex) -> TypeIndex {
 		let Some(projection) = self.sema.memory_size(memory) else {
 			return TypeIndex::ERROR;
@@ -3008,9 +3008,9 @@ mod tests {
 		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new(strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let root_id = builder
-			.load_binary(
+			.load_package(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
@@ -3030,7 +3030,7 @@ mod tests {
 		graph
 	}
 
-	/// The source is a binary over the real stdlib, so operators, memories
+	/// The source is a binary over the real core, so operators, memories
 	/// and globals are checked against its actual traits.
 	struct TestCase {
 		files: Files,
@@ -3043,18 +3043,18 @@ mod tests {
 			let mut strings = ast::Keyword::create_interner();
 			let graph = source_graph(source, &mut strings);
 			let mut sema = crate::tir::check(&graph, &mut strings);
-			// The stdlib's own bodies use forms the checker does not cover
+			// The core's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
 			let root_file = sema
 				.decls
 				.namespaces
 				.file_id(Scope::Package(sema.decls.root_package).into());
 			sema.diagnostics.retain(|diagnostic| {
-				let in_stdlib = diagnostic
+				let in_core = diagnostic
 					.labels
 					.first()
 					.is_some_and(|label| label.file_id != root_file);
-				!(in_stdlib
+				!(in_core
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
 			});
@@ -3641,7 +3641,7 @@ mod tests {
 	}
 
 	#[test]
-	fn the_embedded_stdlib_reports_nothing_but_unsupported_forms() {
+	fn the_embedded_core_reports_nothing_but_unsupported_forms() {
 		let case = TestCase::new("");
 		case.diagnostics().assert_none();
 	}
@@ -7220,7 +7220,7 @@ mod tests {
 		);
 	}
 
-	/// std implements no `Rem` for a float (an `fmod` is the math
+	/// core implements no `Rem` for a float (an `fmod` is the math
 	/// library's), so float `%` is refused wherever it is written, a constant
 	/// included: constant evaluation relies on never meeting one.
 	#[test]
@@ -7614,10 +7614,10 @@ mod tests {
 		);
 	}
 
-	/// std is the last place a name is looked up, so the program's own items
-	/// shadow its: `address(5)` calls the program's `address`, not std's.
+	/// core is the last place a name is looked up, so the program's own items
+	/// shadow its: `address(5)` calls the program's `address`, not core's.
 	#[test]
-	fn a_program_item_shadows_the_std_prelude() {
+	fn a_program_item_shadows_the_core_prelude() {
 		let case = TestCase::new(indoc! {"
 				struct Layout();
 				func trap() {}

@@ -10,9 +10,9 @@ use crate::vfs;
 fn lower(source: &str) -> (ast::StringInterner, mir::MIR) {
 	let mut strings = crate::symbols::Keyword::create_interner();
 	let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-	builder.load_stdlib();
+	builder.load_core();
 	let root = builder
-		.load_binary(
+		.load_package(
 			vfs::AbsolutePath::new("/main.wx"),
 			&vfs::VirtualFileSource::from_relative(
 				std::collections::HashMap::from([(

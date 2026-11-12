@@ -116,7 +116,7 @@ pub(crate) fn path_to_file_uri(path: &Path) -> Option<Uri> {
 }
 
 /// Converts a `FileId` to a URI: a `Local` file gets a `file://` URI, a
-/// `Virtual` file (i.e. the stdlib) gets a `wx://std/<name>` URI.
+/// `Virtual` file (i.e. the core) gets a `wx://core/<name>` URI.
 ///
 /// Deliberately not `Uri::from_file_path`: it gates on `Path::is_absolute()`
 /// to decide whether it can skip `canonicalize()` — and `is_absolute()` is
@@ -132,14 +132,14 @@ pub(crate) fn file_id_to_uri(
 	let file = files.get(file_id).ok()?;
 	match file.origin {
 		vfs::FileOrigin::Local => path_to_file_uri(Path::new(&file.name)),
-		// `file.name` is already `/`-prefixed (the embedded stdlib's own
+		// `file.name` is already `/`-prefixed (the embedded core's own
 		// `AbsolutePath` convention, e.g. `/main.wx`), so no separator goes
-		// between `wx://std` and it — `wx://std/main.wx`, not
-		// `wx://std//main.wx`. `virtual_file_content`'s `strip_prefix("wx://std")`
+		// between `wx://core` and it — `wx://core/main.wx`, not
+		// `wx://core//main.wx`. `virtual_file_content`'s `strip_prefix("wx://core")`
 		// expects exactly this: a leading-slash remainder it can feed
-		// straight into `stdlib_file`/`AbsolutePath::new`.
+		// straight into `core_file`/`AbsolutePath::new`.
 		vfs::FileOrigin::Virtual => {
-			Uri::from_str(&format!("wx://std{}", file.name)).ok()
+			Uri::from_str(&format!("wx://core{}", file.name)).ok()
 		}
 	}
 }

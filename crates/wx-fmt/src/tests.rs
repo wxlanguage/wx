@@ -718,7 +718,7 @@ fn test_format_typeset_with_bound_clause() {
 /// `attributes` away via `..` and never passed it to their respective
 /// `build_*_definition` functions — silently dropping any `#[...]` on those
 /// four item kinds (unlike `func`/`struct`/`typeset`/`type`, which were never
-/// affected). Caught by round-tripping `std/main.wx`'s `#[example]`-style
+/// affected). Caught by round-tripping `core/main.wx`'s `#[example]`-style
 /// operator traits through `wx format`.
 #[test]
 fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
@@ -3311,9 +3311,9 @@ fn test_format_current_syntax_forms() {
 // 	use wx_compiler::tir::TIR;
 // 	fn build(source: &str) -> (vfs::CompilationUnit, TIR) {
 // 		let mut builder = vfs::CompilationUnitBuilder::new();
-// 		builder.load_stdlib();
+// 		builder.load_core();
 // 		let root = builder
-// 			.load_binary(
+// 			.load_package(
 // 				vfs::AbsolutePath::new("/main.wx"),
 // 				&vfs::VirtualFileSource::new(HashMap::from([(
 // 					vfs::AbsolutePath::new("/main.wx"),

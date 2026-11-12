@@ -247,8 +247,8 @@ struct Lowerer<'a> {
 	/// Backend identity, minted here per instance. Never a source or Wasm
 	/// index.
 	ids: HashMap<FunctionInstance, mir::FunctionId>,
-	/// The operation the compiler supplies for each of std's package
-	/// function parameters: the compiler is std's instantiator.
+	/// The operation the compiler supplies for each of core's package
+	/// function parameters: the compiler is core's instantiator.
 	intrinsics: FxHashMap<FunctionIdx, Intrinsic>,
 	/// How each struct, tuple and fat pointer type lowered so far is held
 	/// on the stack.
@@ -275,7 +275,7 @@ pub(super) fn build(
 ) -> Result<mir::MIR, ()> {
 	let global_count = sema.decls.globals.len();
 	let memory_count = sema.decls.memories.len();
-	let intrinsics = std_intrinsics(strings, sema);
+	let intrinsics = core_intrinsics(strings, sema);
 	Lowerer {
 		sema,
 		strings,
@@ -298,15 +298,15 @@ pub(super) fn build(
 	.run()
 }
 
-/// Each function in std's package contract is the operation of its name.
-/// Std is maintained with the compiler, so an unknown name is an invariant
+/// Each function in core's package contract is the operation of its name.
+/// Core is maintained with the compiler, so an unknown name is an invariant
 /// failure.
-fn std_intrinsics(
+fn core_intrinsics(
 	strings: &StringInterner,
 	sema: &Semantics,
 ) -> FxHashMap<FunctionIdx, Intrinsic> {
 	let decls = &sema.decls;
-	decls.package_contracts[decls.stdlib_package.as_usize()]
+	decls.package_contracts[decls.core_package.as_usize()]
 		.members
 		.values()
 		.filter_map(|member| match member.item {
@@ -316,8 +316,8 @@ fn std_intrinsics(
 		.map(|function| {
 			let name = strings.resolve(decls.name(function).inner).unwrap();
 			let intrinsic =
-				Intrinsic::from_std_name(name).unwrap_or_else(|| {
-					panic!("unknown std function parameter `{name}`")
+				Intrinsic::from_core_name(name).unwrap_or_else(|| {
+					panic!("unknown core function parameter `{name}`")
 				});
 			(function, intrinsic)
 		})
@@ -2489,9 +2489,9 @@ mod tests {
 
 	#[test]
 	#[should_panic(
-		expected = "unknown std function parameter `unknown_operation`"
+		expected = "unknown core function parameter `unknown_operation`"
 	)]
-	fn an_unknown_std_intrinsic_is_a_compiler_invariant_failure() {
+	fn an_unknown_core_intrinsic_is_a_compiler_invariant_failure() {
 		let source = r#"
 			pub trait StackValue { type Repr; }
 			pub trait Call { type Args; type Result; }
@@ -2503,7 +2503,7 @@ mod tests {
 			package func unknown_operation();
 		"#;
 		let mut strings = crate::symbols::Keyword::create_interner();
-		let graph = crate::tir::signatures::tests::std_source_graph(
+		let graph = crate::tir::signatures::tests::core_source_graph(
 			source,
 			&mut strings,
 		);
@@ -2512,9 +2512,9 @@ mod tests {
 	}
 
 	#[test]
-	fn std_trap_lowers_to_unreachable_without_a_function_or_call_edge() {
+	fn core_trap_lowers_to_unreachable_without_a_function_or_call_edge() {
 		let source = r#"
-			use std::trap as stop;
+			use core::trap as stop;
 			func fail() -> ! { stop() }
 			export { fail as "fail" }
 		"#;
@@ -2580,7 +2580,7 @@ mod tests {
 	#[test]
 	fn an_exported_intrinsic_is_its_expansion_over_its_parameters() {
 		let source = r#"
-			use std::{
+			use core::{
 				i32_add, u32_div, f64_sqrt, u64_extend_u32,
 				i32_reinterpret_f32, u32_lt, trap,
 			};
@@ -2647,7 +2647,7 @@ mod tests {
 	#[test]
 	fn exporting_an_intrinsic_leaves_its_calls_expanded_in_place() {
 		let source = r#"
-			use std::i32_add;
+			use core::i32_add;
 			func run(a: i32) -> i32 { i32_add(a, 1) }
 			export { run as "run", i32_add as "add" }
 		"#;
@@ -2682,13 +2682,13 @@ mod tests {
 	#[test]
 	fn scalar_intrinsics_expand_by_identity_and_preserve_operand_types() {
 		let source = r#"
-			use std::i32_add as sum;
+			use core::i32_add as sum;
 			func i32_add(a: i32, b: i32) -> i32 { a - b }
 			func run() -> i32 { sum(20, 22) + i32_add(10, 3) }
-			func unsigned(a: u32, b: u32) -> u32 { std::u32_div(a, b) }
-			func compare(a: u32, b: u32) -> Bool { std::u32_lt(a, b) }
-			func convert(x: u32) -> f64 { std::f64_sqrt(std::f64_convert_u32(x)) }
-			func bits(x: f32) -> i32 { std::i32_reinterpret_f32(x) }
+			func unsigned(a: u32, b: u32) -> u32 { core::u32_div(a, b) }
+			func compare(a: u32, b: u32) -> Bool { core::u32_lt(a, b) }
+			func convert(x: u32) -> f64 { core::f64_sqrt(core::f64_convert_u32(x)) }
+			func bits(x: f32) -> i32 { core::i32_reinterpret_f32(x) }
 			export { run as "run", unsigned as "unsigned", compare as "compare", convert as "convert", bits as "bits" }
 		"#;
 		let mut strings = crate::symbols::Keyword::create_interner();
@@ -2753,19 +2753,19 @@ mod tests {
 	fn split_scalar_intrinsics_preserve_width_and_signedness() {
 		let source = r#"
 			func signed32(a: i32, b: i32) -> (i32, i32, i32, Bool) {
-				(std::i32_div(a, b), std::i32_rem(a, b), std::i32_shr(a, 1), std::i32_lt(a, b))
+				(core::i32_div(a, b), core::i32_rem(a, b), core::i32_shr(a, 1), core::i32_lt(a, b))
 			}
 			func unsigned32(a: u32, b: u32) -> (u32, u32, u32, Bool) {
-				(std::u32_div(a, b), std::u32_rem(a, b), std::u32_shr(a, 1), std::u32_lt(a, b))
+				(core::u32_div(a, b), core::u32_rem(a, b), core::u32_shr(a, 1), core::u32_lt(a, b))
 			}
 			func signed64(a: i64, b: i64) -> (i64, i64, i64, Bool) {
-				(std::i64_div(a, b), std::i64_rem(a, b), std::i64_shr(a, 1), std::i64_lt(a, b))
+				(core::i64_div(a, b), core::i64_rem(a, b), core::i64_shr(a, 1), core::i64_lt(a, b))
 			}
 			func unsigned64(a: u64, b: u64) -> (u64, u64, u64, Bool) {
-				(std::u64_div(a, b), std::u64_rem(a, b), std::u64_shr(a, 1), std::u64_lt(a, b))
+				(core::u64_div(a, b), core::u64_rem(a, b), core::u64_shr(a, 1), core::u64_lt(a, b))
 			}
 			func multiply(a: i32, b: i64, c: f32, d: f64) -> (i32, i64, f32, f64) {
-				(std::i32_mul(a, 3), std::i64_mul(b, 3), std::f32_div(std::f32_mul(c, 3), 2), std::f64_div(std::f64_mul(d, 3), 2))
+				(core::i32_mul(a, 3), core::i64_mul(b, 3), core::f32_div(core::f32_mul(c, 3), 2), core::f64_div(core::f64_mul(d, 3), 2))
 			}
 			export { signed32 as "signed32", unsigned32 as "unsigned32", signed64 as "signed64", unsigned64 as "unsigned64", multiply as "multiply" }
 		"#;
@@ -2827,7 +2827,7 @@ mod tests {
 			func subtract(a: i32, b: i32) -> i32 { a - b }
 			func run() -> i32 {
 				local mut x: i32 = 0
-				local a: i32 = std::i32_sub({
+				local a: i32 = core::i32_sub({
 					b: block { x = x + 1; x },
 					a: block { x = x + 1; x },
 				})
@@ -2872,8 +2872,8 @@ mod tests {
 	fn intrinsics_accept_computed_argument_tuples_and_diverging_arguments() {
 		let source = r#"
 			func pair(x: i32) -> (i32, i32) { (x, 2) }
-			func run(x: i32) -> i32 { std::i32_sub(pair(x)) }
-			func operand() -> i32 { std::i32_add(1, std::trap()) }
+			func run(x: i32) -> i32 { core::i32_sub(pair(x)) }
+			func operand() -> i32 { core::i32_add(1, core::trap()) }
 			export { run as "run", operand as "operand" }
 		"#;
 		let (mut store, instance) = instantiate(source);
@@ -2963,15 +2963,15 @@ mod tests {
 					r#"
 					global mut trace: i32 = 0;
 					func discarded(x: {from}) -> i32 {{
-						local _ = std::{to}_trunc_{from}(x);
+						local _ = core::{to}_trunc_{from}(x);
 						42
 					}}
 					func ordered(x: {from}) -> i32 {{
-						local result = std::{to}_trunc_{from}(x);
+						local result = core::{to}_trunc_{from}(x);
 						trace.set(9);
 						if result == 0 {{ 0 }} else {{ 1 }}
 					}}
-					func converted(x: {from}) -> {to} {{ std::{to}_trunc_{from}(x) }}
+					func converted(x: {from}) -> {to} {{ core::{to}_trunc_{from}(x) }}
 					func read() -> i32 {{ trace.get() }}
 					export {{ discarded, ordered, converted, read }}
 					"#
@@ -3246,8 +3246,8 @@ mod tests {
 	}
 
 	#[test]
-	fn std_impls_built_on_transmute_run() {
-		// `Bool`'s `!` and the narrow-integer operators are std impls over
+	fn core_impls_built_on_transmute_run() {
+		// `Bool`'s `!` and the narrow-integer operators are core impls over
 		// `transmute`d `i32` instructions.
 		let source = r#"
 			func not(b: u32) -> u32 { if !(b == 0) { 1 } else { 2 } }
@@ -3356,9 +3356,9 @@ mod tests {
 	}
 
 	#[test]
-	fn narrow_std_operator_methods_restore_their_width() {
+	fn narrow_core_operator_methods_restore_their_width() {
 		// Explicit trait method calls and generic instantiations go through
-		// std's bodies instead of the primitive operator path.
+		// core's bodies instead of the primitive operator path.
 		let source = r#"
 			func generic<T: Add>(a: T, b: T) -> T { a + b }
 			func u8_ops(a: u8, b: u8) -> (u8, u8, u8) {
@@ -4222,7 +4222,7 @@ mod tests {
 		let source = r#"
 			global mut trace: i32 = 0;
 			func mark(digit: i32) { trace.set(trace.get() * 10 + digit); }
-			func fail() { std::trap() }
+			func fail() { core::trap() }
 			func read() -> i32 { trace.get() }
 			func run() -> i32 {
 				local _ = (mark(1), fail(), mark(2));
@@ -4246,9 +4246,9 @@ mod tests {
 	#[test]
 	fn erased_zero_sized_values_still_execute_calls_and_can_trap() {
 		for source in [
-			r#"struct Zero(marker: ()); func fail() { std::trap() } func run() -> i32 { local z: Zero = Zero(fail()); _ = z; 7 } export { run as "run" }"#,
-			r#"struct Zero(marker: ()); func fail() { std::trap() } func run() -> i32 { local mut z: Zero = Zero(()); z.marker = fail(); 7 } export { run as "run" }"#,
-			r#"struct Zero(); func make() -> Zero { std::trap() } func run() -> i32 { _ = make(); 7 } export { run as "run" }"#,
+			r#"struct Zero(marker: ()); func fail() { core::trap() } func run() -> i32 { local z: Zero = Zero(fail()); _ = z; 7 } export { run as "run" }"#,
+			r#"struct Zero(marker: ()); func fail() { core::trap() } func run() -> i32 { local mut z: Zero = Zero(()); z.marker = fail(); 7 } export { run as "run" }"#,
+			r#"struct Zero(); func make() -> Zero { core::trap() } func run() -> i32 { _ = make(); 7 } export { run as "run" }"#,
 		] {
 			let (mut store, instance) = instantiate(source);
 			let run = instance
@@ -4326,7 +4326,7 @@ mod tests {
 			&strings,
 		)
 		.expect("the source lowers");
-		// `small`, `big`, `twice` for `u32` and `u64`, and std's `#[inline]`
+		// `small`, `big`, `twice` for `u32` and `u64`, and core's `#[inline]`
 		// `add` for each.
 		assert_eq!(mir.functions.len(), 6);
 		assert_eq!(mir.function_flags.len(), mir.functions.len());
@@ -4556,7 +4556,7 @@ mod tests {
 	}
 
 	#[test]
-	fn std_s_inherited_ne_runs_on_a_type_parameter() {
+	fn core_s_inherited_ne_runs_on_a_type_parameter() {
 		let source = r#"
 			func differ<T: PartialEq>(a: T, b: T) -> Bool { a != b }
 			func run(a: u32, b: u32) -> u32 {
@@ -4911,7 +4911,7 @@ mod tests {
 	#[test]
 	fn a_diverging_destructuring_initializer_is_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run() -> i32 {
                 local (a, b): (i32, i32) = stop()
                 a + b
@@ -5064,7 +5064,7 @@ mod tests {
 	#[test]
 	fn a_diverging_compound_operand_is_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run() -> i32 {
                 local mut x: i32 = 1
                 x += stop()
@@ -5136,7 +5136,7 @@ mod tests {
 	#[test]
 	fn a_diverging_call_argument_makes_the_call_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func identity(x: i32) -> i32 { x }
             func run() -> i32 { identity(stop()) }
             export { run as "run" }
@@ -5154,7 +5154,7 @@ mod tests {
 	#[test]
 	fn a_call_to_a_diverging_function_never_returns() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func fail() -> ! { stop() }
             func run() -> i32 { fail() }
             export { run as "run" }
@@ -5171,7 +5171,7 @@ mod tests {
 	#[test]
 	fn a_diverging_binary_operand_makes_the_operation_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func left(x: i32) -> i32 { stop() + x }
             func right(x: i32) -> i32 { x + stop() }
             func both(x: i32) -> i32 { stop() + stop() }
@@ -5191,7 +5191,7 @@ mod tests {
 	#[test]
 	fn a_diverging_unary_operand_makes_the_operation_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func negate(x: i32) -> i32 { -stop() }
             func logical(x: Bool) -> Bool { !stop() }
             export { negate as "negate", logical as "logical" }
@@ -5210,7 +5210,7 @@ mod tests {
 	#[test]
 	fn a_diverging_local_initializer_is_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run() -> i32 {
                 local x = stop()
                 x
@@ -5229,7 +5229,7 @@ mod tests {
 	#[test]
 	fn a_diverging_drop_is_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run() -> i32 {
                 _ = stop()
                 7
@@ -5249,7 +5249,7 @@ mod tests {
 	#[test]
 	fn a_diverging_statement_before_a_result_still_terminates_the_body() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func fail() -> ! { stop() }
             func run() -> i32 { fail(); 1 }
             export { run as "run" }
@@ -5265,7 +5265,7 @@ mod tests {
 	#[test]
 	fn a_diverging_return_value_is_unreachable() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run() -> i32 { return stop() }
             export { run as "run" }
         "#;
@@ -6031,9 +6031,9 @@ mod tests {
 		);
 	}
 
-	/// A std inherent method whose body calls an intrinsic works too.
+	/// A core inherent method whose body calls an intrinsic works too.
 	#[test]
-	fn a_std_method_reaches_its_intrinsic_body() {
+	fn a_core_method_reaches_its_intrinsic_body() {
 		let source = r#"
             func run(x: f32) -> f32 { x.abs() }
             export { run as "run" }
@@ -6071,7 +6071,7 @@ mod tests {
 	#[test]
 	fn a_diverging_receiver_never_calls_the_method() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             struct Point(x: i32, y: i32);
             impl Point {
                 func sum(self: Self) -> i32 { self.x + self.y }
@@ -6407,7 +6407,7 @@ mod tests {
 	#[test]
 	fn a_diverging_scrutinee_never_matches() {
 		let source = r#"
-            func make() -> i32 { std::trap() }
+            func make() -> i32 { core::trap() }
             func run() -> i32 {
                 match make() {
                     0 => { 1 },
@@ -6429,7 +6429,7 @@ mod tests {
 		let source = r#"
             func run(x: i32) -> i32 {
                 match x {
-                    0 => { std::trap() },
+                    0 => { core::trap() },
                     _ => { 7 },
                 }
             }
@@ -7050,7 +7050,7 @@ mod tests {
 	#[test]
 	fn and_skips_a_right_operand_it_does_not_need() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(a: i32) -> Bool { (a != a) && stop() }
             export { run as "run" }
         "#;
@@ -7065,7 +7065,7 @@ mod tests {
 	#[test]
 	fn and_evaluates_a_right_operand_it_needs() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(a: i32) -> Bool { (a == a) && stop() }
             export { run as "run" }
         "#;
@@ -7081,7 +7081,7 @@ mod tests {
 	#[test]
 	fn or_skips_a_right_operand_it_does_not_need() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(a: i32) -> Bool { (a == a) || stop() }
             export { run as "run" }
         "#;
@@ -7096,7 +7096,7 @@ mod tests {
 	#[test]
 	fn or_evaluates_a_right_operand_it_needs() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(a: i32) -> Bool { (a != a) || stop() }
             export { run as "run" }
         "#;
@@ -7112,7 +7112,7 @@ mod tests {
 	#[test]
 	fn logical_chains_stop_at_the_deciding_operand() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func and_chain(a: i32, b: i32) -> Bool {
                 (a != a) && (b == b) && stop()
             }
@@ -7136,7 +7136,7 @@ mod tests {
 	#[test]
 	fn constant_operands_short_circuit() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func and_false() -> Bool { False && stop() }
             func and_true() -> Bool { True && True }
             func or_true() -> Bool { True || stop() }
@@ -7165,7 +7165,7 @@ mod tests {
 	#[test]
 	fn a_diverging_left_operand_stops_both_operators() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func and(a: i32) -> Bool { stop() && (a == a) }
             func or(a: i32) -> Bool { stop() || (a == a) }
             export { and as "and", or as "or" }
@@ -7297,7 +7297,7 @@ mod tests {
 	#[test]
 	fn a_diverging_branch_contributes_no_value() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func then(c: Bool) -> i32 { if c { stop() } else { 2 } }
             func otherwise(c: Bool) -> i32 { if c { 1 } else { stop() } }
             export { then as "then", otherwise as "otherwise" }
@@ -7319,7 +7319,7 @@ mod tests {
 	#[test]
 	fn a_diverging_if_condition_never_enters_a_branch() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(c: Bool) -> i32 { if stop() { 1 } else { 2 } }
             export { run as "run" }
         "#;
@@ -7336,7 +7336,7 @@ mod tests {
 	#[test]
 	fn an_if_without_else_may_take_a_diverging_branch() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(c: Bool) { if c { stop() } }
             export { run as "run" }
         "#;
@@ -7403,7 +7403,7 @@ mod tests {
 	#[test]
 	fn an_if_whose_branches_both_diverge_is_never() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(c: Bool) -> ! {
                 if c { stop() } else { stop() }
             }
@@ -7422,7 +7422,7 @@ mod tests {
 	#[test]
 	fn a_diverging_branch_leaves_an_aggregate_value_intact() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(c: Bool) -> (i32, i32) {
                 if c { (1, 2) } else { stop() }
             }
@@ -7481,7 +7481,7 @@ mod tests {
 	#[test]
 	fn a_diverging_else_if_branch_still_joins_the_chain() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run(a: Bool, b: Bool) -> i32 {
                 if a { 1 } else if b { stop() } else { 2 }
             }
@@ -7531,7 +7531,7 @@ mod tests {
 	#[test]
 	fn a_diverging_break_value_never_breaks() {
 		let source = r#"
-            use std::trap as stop;
+            use core::trap as stop;
             func run() -> i32 { loop { break stop(); } }
             export { run as "run" }
         "#;
@@ -7705,7 +7705,7 @@ mod tests {
 		func run(x: f64) -> (f64, f64, f64, Bool, Bool) {
 			(x + 0.0, x * 0.0, x / x, x == x, x != x)
 		}
-		func bits(x: f64) -> i64 { std::i64_reinterpret_f64(-x) }
+		func bits(x: f64) -> i64 { core::i64_reinterpret_f64(-x) }
 		export { run, bits }
 	"#;
 		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
@@ -7904,7 +7904,7 @@ mod tests {
 		let source = r#"
 		global mut log: i32 = 0;
 		func mark(x: i32) -> i32 { log.set(log.get() * 10 + x); x }
-		func fail() { local _ = mark(2); std::trap(); }
+		func fail() { local _ = mark(2); core::trap(); }
 		func combine(a: i32, empty: (), b: i32) -> i32 { mark(9) }
 		func run() -> i32 {
 			log.set(0);

@@ -1,4 +1,4 @@
-// A growable array built on `std`'s `Allocator` trait — a walk through how
+// A growable array built on `core`'s `Allocator` trait — a walk through how
 // generics, traits and raw pointers compose in wx.
 //
 // The `Vec` header and its element buffer both live in linear memory: `push`

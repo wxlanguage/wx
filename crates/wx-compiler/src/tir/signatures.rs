@@ -543,7 +543,7 @@ pub struct Semantics {
 	/// (`check_constant`). A constant with nothing pending has no entry.
 	pub(super) const_obligations: FxHashMap<ConstIdx, Obligations>,
 	/// Each function's implementation, by `FunctionIdx`. Source blocks are
-	/// checked during the body phase; imports and compiler-provided std
+	/// checked during the body phase; imports and compiler-provided core
 	/// operations are bound at construction, independently of query readiness.
 	pub(super) function_implementations: Vec<FunctionImplementation>,
 	/// Each global's checked initializer, by `GlobalIdx`; `None` for an
@@ -616,8 +616,8 @@ impl Semantics {
 			operators,
 			solver: Solver::new(decls.constants.len()),
 			types: TypeInterner::new(
-				decls.intrinsics.bool.expect("std declares `Bool`"),
-				decls.intrinsics.char.expect("std declares `Char`"),
+				decls.intrinsics.bool.expect("core declares `Bool`"),
+				decls.intrinsics.char.expect("core declares `Char`"),
 			),
 			bounds: BoundArena::default(),
 			clauses: ClauseArena::default(),
@@ -1134,7 +1134,7 @@ impl Semantics {
 			.decls
 			.declared_trait_member(global_trait, BindingKey::ty(value_symbol))
 		else {
-			panic!("the stdlib's `Global` trait must declare `type Value`")
+			panic!("the core's `Global` trait must declare `type Value`")
 		};
 		if value.inner != TypeIndex::ERROR {
 			self.record_bounds_check(
@@ -1264,7 +1264,7 @@ impl Semantics {
 	}
 
 	/// `memory`'s `Size`, `<memory as Memory>::Size`, as written; `None`
-	/// when the stdlib declares no `Memory`.
+	/// when the core declares no `Memory`.
 	pub(super) fn memory_size(
 		&mut self,
 		memory: TypeIndex,
@@ -1490,7 +1490,7 @@ fn report_enum_repr_not_integer(
 	Diagnostic::error()
 		.with_code(DiagnosticCode::EnumReprNotInteger.code())
 		.with_message(format!(
-			"enum repr type must satisfy the stdlib `{typeset_name}` typeset"
+			"enum repr type must satisfy the core `{typeset_name}` typeset"
 		))
 		.with_label(
 			SourceSpan::new(file_id, span)
@@ -2640,11 +2640,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 			let &member_index = trait_decl
 				.bindings
 				.get(&BindingKey::ty(size_symbol))
-				.expect("the stdlib's `Memory` trait must declare `Size`");
+				.expect("the core's `Memory` trait must declare `Size`");
 			let MemberKind::AssociatedType(index) =
 				trait_decl.members[usize::from(member_index)].kind
 			else {
-				panic!("the stdlib's `Memory::Size` must be an associated type")
+				panic!("the core's `Memory::Size` must be an associated type")
 			};
 			index
 		};
@@ -3589,7 +3589,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							&& !resolved.is_integer()
 						{
 							let integer = sema.decls.intrinsics.integer.expect(
-								"the stdlib must declare the `Integer` \
+								"the core must declare the `Integer` \
 									 typeset",
 							);
 							let typeset =
@@ -5064,7 +5064,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 	}
 
 	/// The literal kind `{inner}` names: `inner` resolves as any type, and
-	/// must be one of std's literal kinds (`integer`, `char`). `ERROR` when it
+	/// must be one of core's literal kinds (`integer`, `char`). `ERROR` when it
 	/// is not, which is reported.
 	fn resolve_literal_kind(
 		&mut self,
@@ -5633,7 +5633,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 			};
 			let member = match self.binding_target(sema, trait_index, key, span)
 			{
-				MemberLookup::Found(member) => Some(member),
+				MemberLookup::Found(member) => {
+					sema.resolutions.record(
+						Site::new(
+							key.tier,
+							SourceSpan::new(file_id, binding.name.span),
+						),
+						Reference::Member(member.selected_kind(&sema.decls)),
+					);
+					Some(member)
+				}
 				MemberLookup::Ambiguous(candidates) => {
 					let diagnostic = report_ambiguous_type_member(
 						file_id,
@@ -5932,11 +5941,11 @@ pub(super) mod tests {
 		.assert_no_errors();
 	}
 
-	/// The shipped `std/main.wx` is the largest real input the sweep sees; it
+	/// The shipped `core/main.wx` is the largest real input the sweep sees; it
 	/// must stay free of diagnostics through every change to the solver.
 	#[test]
-	fn the_embedded_stdlib_sweeps_without_diagnostics() {
-		let case = TestCase::std(include_str!("../../std/main.wx"));
+	fn the_embedded_core_sweeps_without_diagnostics() {
+		let case = TestCase::core(include_str!("../../core/main.wx"));
 		case.diagnostics().assert_none();
 	}
 
@@ -6067,11 +6076,11 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn primitive_operators_match_the_stdlib_impls() {
+	fn primitive_operators_match_the_core_impls() {
 		use crate::tir::operators::{is_primitive_binary, is_primitive_unary};
-		// The compiler builds `PrimitiveBinary`/`PrimitiveUnary` exactly where the stdlib has a
+		// The compiler builds `PrimitiveBinary`/`PrimitiveUnary` exactly where the core has a
 		// primitive impl, so the two must name the same pairs.
-		let case = TestCase::std(include_str!("../../std/main.wx"));
+		let case = TestCase::core(include_str!("../../core/main.wx"));
 		let primitives = [
 			TypeIndex::U8,
 			TypeIndex::I8,
@@ -7117,7 +7126,7 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn the_stdlib_ordering_has_its_written_values() {
+		fn the_core_ordering_has_its_written_values() {
 			let case = TestCase::new("");
 			case.diagnostics().assert_none();
 			assert_eq!(scalar(&case, "Ordering::Less"), ConstScalar::i8(-1));
@@ -7240,7 +7249,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn scopes_preserve_outer_parameters_and_exclude_siblings() {
-			let case = TestCase::std(indoc! {"
+			let case = TestCase::core(indoc! {"
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				trait Outer {}
 				trait Local {}
@@ -7527,7 +7536,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn readiness_includes_unvisited_siblings_and_updates_on_publication() {
-			with_pending_std_signatures(
+			with_pending_core_signatures(
 				"trait A {} trait B {} func f<T: A, U: B>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
 					let query = SignatureQuery::Function(FunctionIdx::new(0));
@@ -7559,7 +7568,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn declaration_reading_preserves_pending_without_forcing_queries() {
-			with_pending_std_signatures(
+			with_pending_core_signatures(
 				"trait Inner {} trait Outer { type Item: Inner; } func f<T: Outer>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
 					let query = SignatureQuery::Function(FunctionIdx::new(0));
@@ -7652,7 +7661,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn recursive_declarations_are_read_along_finite_subject_paths() {
-			let mut case = TestCase::std(
+			let mut case = TestCase::core(
 				"trait Node { type Next: Node; } func f<T: Node>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			);
 			assert!(case.sema.diagnostics.is_empty());
@@ -7698,13 +7707,13 @@ pub(super) mod tests {
 		pending_signatures(graph, &mut strings, check);
 	}
 
-	/// `with_pending_signatures`, playing the stdlib itself.
-	pub(in crate::tir) fn with_pending_std_signatures(
+	/// `with_pending_signatures`, playing the core itself.
+	pub(in crate::tir) fn with_pending_core_signatures(
 		source: &str,
 		check: impl FnOnce(&mut Semantics, &mut SemanticsBuilder<'_>),
 	) {
 		let mut strings = Keyword::create_interner();
-		let graph = tests::std_source_graph(source, &mut strings);
+		let graph = tests::core_source_graph(source, &mut strings);
 		pending_signatures(graph, &mut strings, check);
 	}
 
@@ -7733,7 +7742,7 @@ pub(super) mod tests {
 			strings,
 			&mut diagnostics,
 			&mut resolutions,
-			graph.stdlib_package,
+			graph.core_package,
 			graph.root_package,
 		);
 		let dispatch = ImplDispatch::build(
@@ -7849,15 +7858,15 @@ pub(super) mod tests {
 		origins
 	}
 
-	/// Parses `source` as a single-file binary over the embedded stdlib.
+	/// Parses `source` as a single-file binary over the embedded core.
 	pub(in crate::tir) fn source_graph(
 		source: &str,
 		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new(strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let root_id = builder
-			.load_binary(
+			.load_package(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
@@ -7880,17 +7889,17 @@ pub(super) mod tests {
 		graph
 	}
 
-	/// Parses `source` as a single-file binary playing the stdlib's own role
-	/// (`set_stdlib`, as a `"type": "std"` package does), for a test about
-	/// what only the stdlib declares: it declares its own primitives
+	/// Parses `source` as a single-file binary playing the core's own role
+	/// (`set_core`, as a `"type": "core"` package does), for a test about
+	/// what only the core declares: it declares its own primitives
 	/// (`type u8;`), lang items (`Bool`, `Char`) and traits.
-	pub(in crate::tir) fn std_source_graph(
+	pub(in crate::tir) fn core_source_graph(
 		source: &str,
 		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new(strings);
 		let root_id = builder
-			.load_binary(
+			.load_package(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
@@ -7900,7 +7909,7 @@ pub(super) mod tests {
 				),
 			)
 			.unwrap();
-		builder.set_stdlib(root_id);
+		builder.set_core(root_id);
 		let graph = builder.build(root_id);
 		// Same parser/linker guard as `source_graph`.
 		DiagnosticView::new(
@@ -7913,7 +7922,7 @@ pub(super) mod tests {
 	}
 
 	/// A live, fully swept `Semantics`, with the files and the interner it
-	/// was checked from. `TestCase::std` plays the stdlib itself, and the
+	/// was checked from. `TestCase::core` plays the core itself, and the
 	/// `checked` constructors first assert the source parses and links
 	/// cleanly.
 	struct TestCase {
@@ -7929,9 +7938,9 @@ pub(super) mod tests {
 			Self::from_graph(graph, strings)
 		}
 
-		fn std(source: &str) -> Self {
+		fn core(source: &str) -> Self {
 			let mut strings = Keyword::create_interner();
-			let graph = std_source_graph(source, &mut strings);
+			let graph = core_source_graph(source, &mut strings);
 			Self::from_graph(graph, strings)
 		}
 
@@ -7942,9 +7951,9 @@ pub(super) mod tests {
 			Self::from_graph(graph, strings)
 		}
 
-		fn checked_std(source: &str) -> Self {
+		fn checked_core(source: &str) -> Self {
 			let mut strings = Keyword::create_interner();
-			let graph = std_source_graph(source, &mut strings);
+			let graph = core_source_graph(source, &mut strings);
 			assert_graph_clean(&graph);
 			Self::from_graph(graph, strings)
 		}
@@ -7954,7 +7963,7 @@ pub(super) mod tests {
 			mut strings: StringInterner,
 		) -> Self {
 			let mut sema = crate::tir::check(&graph, &mut strings);
-			// The body checker does not cover every form the stdlib's
+			// The body checker does not cover every form the core's
 			// function bodies use yet; what it does not cover is reported as
 			// unsupported, which these tests do not concern.
 			sema.diagnostics.retain(|diagnostic| {
@@ -8603,7 +8612,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn user_aliases_are_rejected_as_impl_targets_without_dispatch() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			trait Tr {}
 			impl Tr for Alias {}
 			impl Alias {}
@@ -8653,18 +8662,18 @@ pub(super) mod tests {
 	}
 
 	/// A package's root is a namespace, not a type or a trait: naming it
-	/// where one is expected says what it is, by every name it has (`std`,
+	/// where one is expected says what it is, by every name it has (`core`,
 	/// `package`, `super` at the root, a `use` alias).
 	#[test]
 	fn a_package_root_where_a_type_or_trait_is_expected_says_it_is_a_package() {
 		let case = TestCase::new(indoc! {"
-			use std as s;
+			use core as s;
 			mod m {
 			    pub type Up = super;
 			}
-			func g<T: std + StackValue>(x: T) {}
+			func g<T: core + StackValue>(x: T) {}
 			impl package {}
-			impl std for u32 {}
+			impl core for u32 {}
 			type A = s;
 			func f() -> u32 { package::<u8>::f() }
 			func k() -> s::u32 { 0 }
@@ -8673,7 +8682,7 @@ pub(super) mod tests {
 		for message in [
 			"expected type, found package `super`",
 			"expected type, found package `s`",
-			"expected trait, found package `std`",
+			"expected trait, found package `core`",
 			"cannot use package as an impl target",
 			"type arguments are not allowed on package `package`",
 		] {
@@ -8691,7 +8700,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn intrinsic_primitive_can_be_an_impl_target() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			trait Tr {}
 			impl Tr for u32 {}
@@ -8724,7 +8733,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn impl_type_parameter_does_not_resolve_to_a_same_named_struct() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			struct T();
 			trait Tr {}
 			impl<T> Tr for T {}
@@ -8749,7 +8758,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn typeset_member_alias_is_rejected_without_a_synthetic_impl() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			type Alias = u32;
 			typeset Int { Alias }
@@ -8772,7 +8781,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn impl_dispatch_rejects_duplicate_trait_for_same_constructor() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			trait Tr {}
 			struct S();
 			impl Tr for S {}
@@ -8802,7 +8811,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn impl_dispatch_does_not_index_invalid_targets() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			impl<T> T {}
 			impl Missing {}
 			type u8;
@@ -8826,7 +8835,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn impl_header_resolves_generic_bounds() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			trait Bound {}
 			struct S();
 			impl<T: Bound> S {}
@@ -8850,7 +8859,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn trait_impl_header_keeps_target_when_trait_path_is_not_a_trait() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			struct S();
 			impl S for S {}
 			type u8;
@@ -9900,7 +9909,7 @@ pub(super) mod tests {
 	#[test]
 	fn function_implementations_keep_distinct_sources() {
 		let case = TestCase::new(indoc! {r#"
-			use std::trap as stop;
+			use core::trap as stop;
 			func trap() -> i32 { 42 }
 			package func i32_add(a: i32, b: i32) -> i32;
 			func missing();
@@ -9923,12 +9932,12 @@ pub(super) mod tests {
 			FunctionImplementation::Defined(_)
 		));
 		assert!(matches!(
-			implementation("std::trap"),
+			implementation("core::trap"),
 			FunctionImplementation::Parameter
 		));
 		assert!(std::ptr::eq(
 			implementation("stop"),
-			implementation("std::trap")
+			implementation("core::trap")
 		));
 		assert!(matches!(
 			implementation("i32_add"),
@@ -9971,8 +9980,8 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn std_contract_binding_ignores_ordinary_function_names() {
-		let case = TestCase::std(indoc! {"
+	fn core_contract_binding_ignores_ordinary_function_names() {
+		let case = TestCase::core(indoc! {"
 			pub trait StackValue { type Repr; }
 			pub trait Call { type Args; type Result; }
 			pub trait Function: Call {}
@@ -10506,7 +10515,7 @@ pub(super) mod tests {
 		let diagnostic = &case.sema.diagnostics[0];
 		assert!(
 			diagnostic.message.contains("`Integer` typeset"),
-			"the repr error should name the stdlib `Integer` typeset: {diagnostic:#?}"
+			"the repr error should name the core `Integer` typeset: {diagnostic:#?}"
 		);
 		let integer = case
 			.sema
@@ -10919,7 +10928,7 @@ pub(super) mod tests {
 		use crate::tir::members::{
 			ApplicableMember, MemberLookup, TraitMemberSelection,
 		};
-		with_pending_std_signatures(
+		with_pending_core_signatures(
 			indoc! {"
 			trait Container { func overridden() {} func inherited() {} }
 			struct Wrapper();
@@ -11127,7 +11136,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_declaration_registers_a_synthetic_impl_with_a_checked_size() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
@@ -11166,7 +11175,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn memory_size_violating_pointer_size_is_diagnosed() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			
 			typeset PointerSize { u32 }
@@ -11203,7 +11212,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn global_declaration_registers_a_synthetic_impl_with_its_value_type() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			trait Global { type Value; }
 			global counter: u32 = 0;
@@ -11243,7 +11252,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn mutable_global_also_registers_a_global_mut_impl() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			trait Global { type Value; }
 			trait GlobalMut: Global {}
@@ -11308,7 +11317,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn imported_memory_registers_a_synthetic_impl_with_a_checked_size() {
-		let case = TestCase::std(indoc! {r#"
+		let case = TestCase::core(indoc! {r#"
 			type u32;
 			typeset PointerSize { u32 }
 			trait Memory { type Size: PointerSize; }
@@ -11559,7 +11568,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn imported_global_registers_a_synthetic_impl_with_its_value_type() {
-		let case = TestCase::std(indoc! {r#"
+		let case = TestCase::core(indoc! {r#"
 			type u32;
 			trait Global { type Value; }
 			import "env" as host {
@@ -11597,7 +11606,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn imported_mutable_global_also_registers_a_global_mut_impl() {
-		let case = TestCase::std(indoc! {r#"
+		let case = TestCase::core(indoc! {r#"
 			type u32;
 			trait Global { type Value; }
 			trait GlobalMut: Global {}
@@ -12915,7 +12924,7 @@ pub(super) mod tests {
 			enum Bool(u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"};
-		let case = TestCase::std(source);
+		let case = TestCase::core(source);
 		assert!(
 			case.sema.diagnostics.is_empty(),
 			"{:?}",
@@ -12949,7 +12958,7 @@ pub(super) mod tests {
 			case.trait_const_signature("Container", "COUNT").ty,
 			TypeIndex::I32
 		);
-		with_pending_std_signatures(source, |sema, builder| {
+		with_pending_core_signatures(source, |sema, builder| {
 			builder.build(sema);
 			for index in 0..sema.decls.assoc_types.len() {
 				let query =
@@ -13559,7 +13568,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_typeset_member_registers_a_synthetic_impl() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			typeset Int { u32 }
 			type u8;
@@ -13586,7 +13595,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn a_typeset_used_before_its_own_declaration_still_sees_its_members() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			func f<T: Int>() {}
 			type u32;
@@ -13609,7 +13618,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn duplicate_typeset_members_are_diagnosed() {
-		let case = TestCase::std(indoc! {"
+		let case = TestCase::core(indoc! {"
 			type u32;
 			typeset Int { u32, u32 }
 			type u8;
@@ -14269,7 +14278,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn head_normalization_exposes_constructor_without_traversing_children() {
-		with_pending_std_signatures(
+		with_pending_core_signatures(
 			indoc! {"
 			type i32;
 			trait Container { type Item; }
@@ -14347,7 +14356,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_preserves_abstract_and_inference_projections() {
-		with_pending_std_signatures(
+		with_pending_core_signatures(
 			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let query = SignatureQuery::Function(FunctionIdx::new(0));
@@ -14420,7 +14429,7 @@ pub(super) mod tests {
 	#[test]
 	fn deep_normalization_visits_all_supported_children_and_preserves_metadata()
 	{
-		with_pending_std_signatures(
+		with_pending_core_signatures(
 			indoc! {"
 			type i32;
 			trait Container { type Item; }
@@ -14541,7 +14550,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn repeated_sibling_projections_are_not_a_cycle() {
-		with_pending_std_signatures(
+		with_pending_core_signatures(
 			"type i32; trait Container { type Item; } struct Wrapper(); impl Container for Wrapper { type Item = i32; } type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let receiver = sema.types.intern_struct(StructIdx::new(0), &[]);
@@ -14675,7 +14684,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn distinct_projection_chain_hits_depth_limit_without_exact_repetition() {
-		with_pending_std_signatures(
+		with_pending_core_signatures(
 			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let query = SignatureQuery::Function(FunctionIdx::new(0));
@@ -15846,7 +15855,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn normalization_does_not_cache_an_unfinished_assumption_set() {
-		with_pending_std_signatures(
+		with_pending_core_signatures(
 			"type i32; trait Container { type Item; } func f<T: Container where { Item = i32 }>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let query = SignatureQuery::Function(FunctionIdx::new(0));
@@ -16869,7 +16878,7 @@ pub(super) mod tests {
 		#[test]
 		fn member_lookup_prefers_a_real_provider_for_a_concrete_equal_subject()
 		{
-			with_pending_std_signatures(
+			with_pending_core_signatures(
 				indoc! {"
                 type i32;
                 trait Project { type Output; }
@@ -16966,7 +16975,7 @@ pub(super) mod tests {
 				"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} trait Node {{ type Next: Node; }} trait Project {{ type Output; }} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);",
 				path = "::Next".repeat(16)
 			);
-			with_pending_std_signatures(&source, |sema, builder| {
+			with_pending_core_signatures(&source, |sema, builder| {
 				let id = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
 					sema,
@@ -17152,7 +17161,7 @@ pub(super) mod tests {
 				func bounded<T: StackValue>() {}
 				func fixed<T: StackValue where { Repr = i32 }>() {}
 			"});
-			let mut case = TestCase::checked_std(&source);
+			let mut case = TestCase::checked_core(&source);
 			case.diagnostics().assert_none();
 			let trait_index = case.sema.decls.intrinsics.stack_value.unwrap();
 			let assoc_type_index =
@@ -17226,7 +17235,7 @@ pub(super) mod tests {
 			case.diagnostics().assert_none();
 		}
 
-		/// The declarations a `StackValue` test builds on, as std writes them,
+		/// The declarations a `StackValue` test builds on, as core writes them,
 		/// with `Is<X, R>` stating `<X as StackValue>::Repr == R`.
 		fn with_stack_value(source: &str) -> String {
 			format!(
@@ -17285,7 +17294,7 @@ pub(super) mod tests {
 					p: Is<(<heap as Memory>::Size), i32>,
 				) {}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics().assert_none();
 		}
 
@@ -17294,7 +17303,7 @@ pub(super) mod tests {
 			let source = with_stack_value(indoc! {"
 				func f(x: Is<(u8, u64), (i64, i32)>) {}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::AssocTypeEqualityMismatch]);
 		}
@@ -17311,7 +17320,7 @@ pub(super) mod tests {
 					d: Is<Wrap<(!, u64)>, !>,
 				) {}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics().assert_none();
 		}
 
@@ -17325,7 +17334,7 @@ pub(super) mod tests {
 				func into(x: !) -> u32 { transmute(x) }
 				func same(x: (!, u32)) -> ! { transmute(x) }
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::AssocTypeEqualityMismatch,
 				DiagnosticCode::AssocTypeEqualityMismatch,
@@ -17339,7 +17348,7 @@ pub(super) mod tests {
 				struct Scalar<V: StackValue where { Repr: StackScalar }>();
 				func f(a: Scalar<u32>, b: Scalar<!>) {}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		}
@@ -17351,7 +17360,7 @@ pub(super) mod tests {
 				func bounded<T: StackValue>(x: Needs<Wrap<T>>) {}
 				func unbounded<T>(x: Needs<Wrap<T>>) {}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 		}
@@ -17379,7 +17388,7 @@ pub(super) mod tests {
 					global untyped: funcref;
 				}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics().assert_none();
 		}
 
@@ -17393,7 +17402,7 @@ pub(super) mod tests {
 				global empty: () = ();
 				global slice: heap::&[u8] = loop {};
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::TraitBoundViolation,
 				DiagnosticCode::TraitBoundViolation,
@@ -17407,7 +17416,7 @@ pub(super) mod tests {
 			let source = with_stack_value(indoc! {"
 				func f<G: Global where { Value = (u32, u32) }>() {}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics()
 				.assert_error(DiagnosticCode::TraitBoundViolation);
 		}
@@ -17437,7 +17446,7 @@ pub(super) mod tests {
 					transmute(p)
 				}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics().assert_none();
 		}
 
@@ -17448,7 +17457,7 @@ pub(super) mod tests {
 				func named() -> u32 { transmute::<i32, _>(5) }
 				func unnamed() -> u32 { transmute(5) }
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
 		}
@@ -17466,7 +17475,7 @@ pub(super) mod tests {
 					transmute(x)
 				}
 			"});
-			let case = TestCase::checked_std(&source);
+			let case = TestCase::checked_core(&source);
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::AssocTypeEqualityMismatch,
 				DiagnosticCode::AssocTypeEqualityMismatch,
@@ -17798,7 +17807,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn equality_proofs_wait_for_facts_and_do_not_cache_a_pending_answer() {
-			with_pending_std_signatures(
+			with_pending_core_signatures(
 				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
 					let id = SignatureQuery::Function(FunctionIdx::new(0));
@@ -17858,7 +17867,7 @@ pub(super) mod tests {
 			let source = format!(
 				"trait Marker {{}} trait Container {{ type Item; }} struct Wrap<X>(); func f<T: Container where {{ Item = {nested} }} + Container where {{ Item: Marker }}, U: Container>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);"
 			);
-			with_pending_std_signatures(&source, |sema, builder| {
+			with_pending_core_signatures(&source, |sema, builder| {
 				builder.build(sema);
 				let env = sema.functions[0].type_params;
 				let ty = sema.generic_envs.param_types(env)[1];
@@ -18259,7 +18268,7 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn dependency_exports_are_ignored_and_package_kind_does_not_gate_exports() {
+	fn only_the_selected_root_contributes_exports() {
 		let mut strings = Keyword::create_interner();
 		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
@@ -18280,26 +18289,18 @@ pub(super) mod tests {
 			(
 				"main.wx".to_string(),
 				r#"
-                use std::f;
+                use core::f;
                 export { f as "run" }
             "#
 				.to_string(),
 			),
 		]));
 		let dep = builder
-			.load_package(
-				vfs::PackageKind::Library,
-				vfs::AbsolutePath::new("/dep.wx"),
-				&workspace,
-			)
+			.load_package(vfs::AbsolutePath::new("/dep.wx"), &workspace)
 			.unwrap();
-		builder.set_stdlib(dep);
+		builder.set_core(dep);
 		let root = builder
-			.load_package(
-				vfs::PackageKind::Library,
-				vfs::AbsolutePath::new("/main.wx"),
-				&workspace,
-			)
+			.load_package(vfs::AbsolutePath::new("/main.wx"), &workspace)
 			.unwrap();
 		let case = TestCase::from_graph(builder.build(root), strings);
 		case.diagnostics().assert_none();
@@ -18327,7 +18328,7 @@ pub(super) mod tests {
 	{
 		let mut strings = Keyword::create_interner();
 		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let workspace =
 			vfs::VirtualFileSource::from_relative(HashMap::from([(
 				"main.wx".to_string(),
@@ -18335,11 +18336,7 @@ pub(super) mod tests {
 					.to_string(),
 			)]));
 		let root = builder
-			.load_package(
-				vfs::PackageKind::Library,
-				vfs::AbsolutePath::new("/main.wx"),
-				&workspace,
-			)
+			.load_package(vfs::AbsolutePath::new("/main.wx"), &workspace)
 			.unwrap();
 		let case = TestCase::from_graph(builder.build(root), strings);
 		case.diagnostics().assert_none();
@@ -18700,7 +18697,7 @@ pub(super) mod tests {
 			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
 	}
 
-	/// A literal kind is std's `integer` or `char`, named in braces: the
+	/// A literal kind is core's `integer` or `char`, named in braces: the
 	/// braces say a literal kind is meant, and a bare name is reported.
 	#[test]
 	fn a_literal_kind_is_written_in_braces() {

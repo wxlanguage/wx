@@ -956,7 +956,7 @@ mod tests {
 	use crate::tir::signatures::tests::source_graph;
 	use crate::tir::types::Type;
 
-	/// A checked `Semantics` over the embedded stdlib, with its interner.
+	/// A checked `Semantics` over the embedded core, with its interner.
 	struct TestCase {
 		strings: StringInterner,
 		sema: Semantics,

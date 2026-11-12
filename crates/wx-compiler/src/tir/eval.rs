@@ -2553,7 +2553,7 @@ fn binary(
 				BinaryOp::Sub => a - b,
 				BinaryOp::Mul => a * b,
 				BinaryOp::Div => a / b,
-				// std implements no `Rem` for a float (an `fmod` is the math
+				// core implements no `Rem` for a float (an `fmod` is the math
 				// library's), so checked source never asks for one.
 				BinaryOp::Rem => unreachable!("a float has no `%`"),
 				_ => unreachable!(),
@@ -2566,7 +2566,7 @@ fn binary(
 				BinaryOp::Sub => a - b,
 				BinaryOp::Mul => a * b,
 				BinaryOp::Div => a / b,
-				// std implements no `Rem` for a float (an `fmod` is the math
+				// core implements no `Rem` for a float (an `fmod` is the math
 				// library's), so checked source never asks for one.
 				BinaryOp::Rem => unreachable!("a float has no `%`"),
 				_ => unreachable!(),
@@ -2792,9 +2792,9 @@ mod tests {
 		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new(strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let root_id = builder
-			.load_binary(
+			.load_package(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(
 					std::collections::HashMap::from([(
@@ -2815,7 +2815,7 @@ mod tests {
 	}
 
 	/// A checked `Semantics`, with the inputs it was checked from.
-	/// The source is a binary over the real stdlib.
+	/// The source is a binary over the real core.
 	struct TestCase {
 		files: Files,
 		strings: StringInterner,
@@ -2827,18 +2827,18 @@ mod tests {
 			let mut strings = ast::Keyword::create_interner();
 			let graph = source_graph(source, &mut strings);
 			let mut sema = crate::tir::check(&graph, &mut strings);
-			// The stdlib's own bodies use forms the checker does not cover
+			// The core's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
 			let root_file = sema
 				.decls
 				.namespaces
 				.file_id(Scope::Package(sema.decls.root_package).into());
 			sema.diagnostics.retain(|diagnostic| {
-				let in_stdlib = diagnostic
+				let in_core = diagnostic
 					.labels
 					.first()
 					.is_some_and(|label| label.file_id != root_file);
-				!(in_stdlib
+				!(in_core
 					&& diagnostic.code.as_deref()
 						== Some(DiagnosticCode::UnsupportedExpression.code()))
 			});

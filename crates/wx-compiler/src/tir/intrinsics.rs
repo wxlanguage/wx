@@ -1,8 +1,8 @@
-//! Compiler implementations of std's function parameters.
+//! Compiler implementations of core's function parameters.
 //!
-//! Names are interpreted only when binding std's package contract. Checked
+//! Names are interpreted only when binding core's package contract. Checked
 //! calls retain their ordinary `FunctionIdx`; its implementation then names
-//! one of these operations, without further name or package checks. Std is
+//! one of these operations, without further name or package checks. Core is
 //! maintained with the compiler: an unknown provided function is an invariant
 //! failure, not a user-facing signature validation error.
 //! Scalar variants identify individual supplied operations, including width
@@ -139,9 +139,9 @@ pub(super) enum Intrinsic {
 }
 
 impl Intrinsic {
-	/// Only std contract members are eligible. Callers must not use this to
+	/// Only core contract members are eligible. Callers must not use this to
 	/// classify ordinary declarations or another package's parameters.
-	pub(super) fn from_std_name(name: &str) -> Option<Self> {
+	pub(super) fn from_core_name(name: &str) -> Option<Self> {
 		Some(match name {
 			"trap" => Self::Trap,
 			"i32_neg" => Self::I32Neg,
@@ -281,7 +281,7 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 
 	#[test]
-	fn std_function_parameters_have_distinct_intrinsics() {
+	fn core_function_parameters_have_distinct_intrinsics() {
 		let mut strings = crate::symbols::Keyword::create_interner();
 		let graph =
 			crate::tir::signatures::tests::source_graph("", &mut strings);
@@ -293,13 +293,13 @@ mod tests {
 			&mut strings,
 			&mut diagnostics,
 			&mut resolutions,
-			graph.stdlib_package,
+			graph.core_package,
 			graph.root_package,
 		);
 		assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 		let mut seen = Vec::new();
 		for (key, member) in
-			&decls.package_contracts[graph.stdlib_package.as_usize()].members
+			&decls.package_contracts[graph.core_package.as_usize()].members
 		{
 			if key.tier != Tier::Value
 				|| !matches!(member.item, PackageMemberItem::Function(_))
@@ -307,14 +307,14 @@ mod tests {
 				continue;
 			}
 			let name = strings.resolve(key.symbol).unwrap();
-			let intrinsic = Intrinsic::from_std_name(name)
-				.unwrap_or_else(|| panic!("unmapped std function `{name}`"));
+			let intrinsic = Intrinsic::from_core_name(name)
+				.unwrap_or_else(|| panic!("unmapped core function `{name}`"));
 			assert!(
 				!seen.contains(&intrinsic),
-				"std function `{name}` shares its intrinsic {intrinsic:?}"
+				"core function `{name}` shares its intrinsic {intrinsic:?}"
 			);
 			seen.push(intrinsic);
 		}
-		assert!(!seen.is_empty(), "the std contract must have functions");
+		assert!(!seen.is_empty(), "the core contract must have functions");
 	}
 }

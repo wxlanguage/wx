@@ -21,7 +21,7 @@ use tower_lsp_server::ls_types::{
 	WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService};
-use wx_compiler::vfs::{AbsolutePath, StdlibFileSource};
+use wx_compiler::vfs::{AbsolutePath, CoreFileSource};
 
 use crate::actor::{Command, StateHandle};
 use crate::convert::uri_to_path;
@@ -335,18 +335,18 @@ impl Backend {
 		params: VirtualFileContentParams,
 	) -> Result<String> {
 		let filename =
-			params.uri.strip_prefix("wx://std").ok_or_else(|| {
+			params.uri.strip_prefix("wx://core").ok_or_else(|| {
 				JsonRpcError::invalid_params(format!(
 					"not a wxstd URI: {}",
 					params.uri
 				))
 			})?;
-		// Keyed exactly as the stdlib package's own module paths, so any file
-		// the stdlib grows is servable here without touching this match.
-		match StdlibFileSource::source(&AbsolutePath::new(filename)) {
+		// Keyed exactly as the core package's own module paths, so any file
+		// the core grows is servable here without touching this match.
+		match CoreFileSource::source(&AbsolutePath::new(filename)) {
 			Some(source) => Ok(source.to_string()),
 			None => Err(JsonRpcError::invalid_params(format!(
-				"unknown stdlib file: {filename}"
+				"unknown core file: {filename}"
 			))),
 		}
 	}

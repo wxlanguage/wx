@@ -287,7 +287,7 @@ impl BodyBuilder<'_, '_> {
 			.decls
 			.intrinsics
 			.eq
-			.expect("the stdlib must declare the `Eq` trait");
+			.expect("the core must declare the `Eq` trait");
 		match self.sema.find_trait_impl_query(
 			self.builder.strings,
 			self.scope.assumption_env,

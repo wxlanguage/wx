@@ -104,7 +104,7 @@ pub(crate) fn diagnostic_publish_paths(
 }
 
 /// Resolves one label to the absolute path + LSP range it points at, or
-/// `None` if the label's file is `Virtual` (true for the stdlib's `wx://std/...`
+/// `None` if the label's file is `Virtual` (true for the core's `wx://core/...`
 /// "files", which have no real location on disk to file a diagnostic under),
 /// or the span doesn't map to a valid range.
 fn label_location(

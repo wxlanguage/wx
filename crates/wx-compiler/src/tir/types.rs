@@ -108,9 +108,9 @@ impl TypeIndex {
 	pub const I64: TypeIndex = TypeIndex(13);
 	pub const F32: TypeIndex = TypeIndex(14);
 	pub const F64: TypeIndex = TypeIndex(15);
-	/// std's `Bool`, an enum.
+	/// core's `Bool`, an enum.
 	pub const BOOL: TypeIndex = TypeIndex(16);
-	/// std's `Char`, a struct.
+	/// core's `Char`, a struct.
 	pub const CHAR: TypeIndex = TypeIndex(17);
 	pub const FUNCREF: TypeIndex = TypeIndex(18);
 	pub const CHAR_LITERAL: TypeIndex = TypeIndex(19);
@@ -722,7 +722,7 @@ impl TypeInterner {
 		Some(())
 	}
 
-	/// `bool` and `char` are std's `Bool` and `Char`, which hold the
+	/// `bool` and `char` are core's `Bool` and `Char`, which hold the
 	/// `BOOL` and `CHAR` slots, so interning their types finds them.
 	pub fn new(bool: EnumIdx, char: StructIdx) -> Self {
 		let mut types = Self {
@@ -1925,7 +1925,7 @@ impl IntrinsicDefs {
 	/// `idx`'s real identity as a primitive type, if it has one. `None` for
 	/// the common case — an ordinary, non-primitive alias — and `Some` only
 	/// for the handful of reserved names (`u8`, `funcref`, ...) that
-	/// prescan recognized as one of std's own `#[intrinsic]` type aliases.
+	/// prescan recognized as one of core's own `#[intrinsic]` type aliases.
 	/// Those are bodiless by design, so this pre-interned `TypeIndex` *is*
 	/// their identity — nothing else names what they resolve to.
 	pub(super) fn identity_of(&self, idx: TypeAliasIdx) -> Option<TypeIndex> {

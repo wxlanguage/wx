@@ -479,10 +479,10 @@ impl Semantics {
 	}
 
 	/// Whether the compiler provides `definition`, with no wx definition
-	/// behind it: a function std leaves to the compiler (a package function
-	/// of std's, as `transmute` or an intrinsic, and `Slice`'s bodiless
+	/// behind it: a function core leaves to the compiler (a package function
+	/// of core's, as `transmute` or an intrinsic, and `Slice`'s bodiless
 	/// `len` and `as_ref`), a primitive type or a literal kind. A function
-	/// std writes a body for is an ordinary function, even when that body
+	/// core writes a body for is an ordinary function, even when that body
 	/// calls one of these.
 	pub fn is_compiler_provided(&self, definition: Definition) -> bool {
 		let decls = &self.decls;
@@ -499,11 +499,11 @@ impl Semantics {
 			) => function,
 			_ => return false,
 		};
-		// Only a package function enters a contract, so std's entry under
+		// Only a package function enters a contract, so core's entry under
 		// this function's name being this function makes it one.
 		let name = BindingKey::value(decls.name(function).inner);
 		let package_function = decls.package_contracts
-			[decls.stdlib_package.as_usize()]
+			[decls.core_package.as_usize()]
 		.members
 		.get(&name)
 		.is_some_and(|member| {
@@ -781,9 +781,9 @@ mod tests {
 		fn new(source: &'s str) -> Self {
 			let mut strings = ast::Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root = builder
-				.load_binary(
+				.load_package(
 					vfs::AbsolutePath::new("/main.wx"),
 					&vfs::VirtualFileSource::from_relative(
 						std::collections::HashMap::from([(
@@ -2390,15 +2390,15 @@ mod tests {
 	}
 
 	#[test]
-	fn only_what_std_leaves_to_the_compiler_is_compiler_provided() {
+	fn only_what_core_leaves_to_the_compiler_is_compiler_provided() {
 		let a = Analysis::clean("func f() {}");
 		let item = |path| Definition::Item(a.declaration(path, Tier::Value));
 		let ty = |path| Definition::Item(a.declaration(path, Tier::Type));
-		// A package function of std's is supplied by the compiler; a std
+		// A package function of core's is supplied by the compiler; a core
 		// function with a body, even one calling it, is an ordinary one.
 		assert!(a.sema.is_compiler_provided(item("transmute")));
 		assert!(!a.sema.is_compiler_provided(item("slice_from_parts")));
-		// Primitives and literal kinds are bodiless; `Char` is a struct std
+		// Primitives and literal kinds are bodiless; `Char` is a struct core
 		// writes.
 		assert!(a.sema.is_compiler_provided(ty("u32")));
 		assert!(a.sema.is_compiler_provided(ty("integer")));

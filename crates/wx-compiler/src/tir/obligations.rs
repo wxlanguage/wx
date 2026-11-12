@@ -810,9 +810,9 @@ mod tests {
 		fn new(source: &str) -> Self {
 			let mut strings = Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root = builder
-				.load_binary(
+				.load_package(
 					vfs::AbsolutePath::new("/main.wx"),
 					&vfs::VirtualFileSource::from_relative(HashMap::from([(
 						"main.wx".to_string(),

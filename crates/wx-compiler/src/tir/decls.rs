@@ -34,8 +34,8 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	strings: &'ctx mut StringInterner,
 	files: &'ctx Files,
 	/// The package a builtin name (`u8`, `Add`, ...) is only recognized in.
-	/// Always present, from `CompilationUnit::stdlib_package`.
-	stdlib_package: PackageId,
+	/// Always present, from `CompilationUnit::core_package`.
+	core_package: PackageId,
 	root_package: PackageId,
 	/// What a package instance looks its key up in: each
 	/// package's manifest-declared dependencies.
@@ -539,8 +539,8 @@ pub struct FunctionImpls {
 /// resolving this memory's own signature. Allocating the slot never depends
 /// on `IntrinsicDefs::memory` — it's just an index and a name, no reference
 /// to the `Memory` trait itself. That trait is only needed later, to bucket
-/// this impl for dispatch (`impls.rs`); if std never declared one, that's
-/// where it's diagnosed as the broken-stdlib error it is, not something
+/// this impl for dispatch (`impls.rs`); if core never declared one, that's
+/// where it's diagnosed as the broken-core error it is, not something
 /// every reader of this struct has to keep re-checking for.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct MemoryDecl {
@@ -849,7 +849,7 @@ pub(super) enum PackageMemberItem {
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Declarations {
-	pub stdlib_package: PackageId,
+	pub core_package: PackageId,
 	pub root_package: PackageId,
 	pub namespaces: Namespaces,
 	/// The scope each file's top-level items live in, indexed by `FileId`.
@@ -880,12 +880,12 @@ pub struct Declarations {
 	pub use_items: Vec<UseItemDecl>,
 	pub(super) use_paths: Vec<UsePathSegment>,
 	/// The `ItemLoc` of every language builtin recognized by name in the
-	/// stdlib package — primitive types (`u8`, `funcref`, ...), `Bool`, `Char` and
+	/// core package — primitive types (`u8`, `funcref`, ...), `Bool`, `Char` and
 	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
 	/// prescan never found declared there. No `#[intrinsic]` marker is
 	/// involved: recognition is implicit — a reserved name, of the right
-	/// declaration kind, declared in the stdlib package *is* that builtin.
-	/// This is std's own responsibility to get right, same as any other
+	/// declaration kind, declared in the core package *is* that builtin.
+	/// This is core's own responsibility to get right, same as any other
 	/// name collision within a single package. Same epistemic status as
 	/// everything else on this registry: what was recorded, not a judgment
 	/// about completeness.
@@ -898,7 +898,7 @@ pub struct Declarations {
 /// [`IntrinsicDefs::typeset_slot_mut`] are kept as separate lookups (rather
 /// than one covering all fields) so a type alias, a trait and a typeset can
 /// never contend for the same slot just because they happen to share a
-/// name — e.g. a stray `type Add;` in std can't clobber the `Add` trait's
+/// name — e.g. a stray `type Add;` in core can't clobber the `Add` trait's
 /// entry, since only `trait_slot_mut` ever resolves `"Add"`.
 #[derive(Default)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
@@ -913,12 +913,12 @@ pub struct IntrinsicDefs {
 	pub i64: Option<TypeAliasIdx>,
 	pub f32: Option<TypeAliasIdx>,
 	pub f64: Option<TypeAliasIdx>,
-	/// std's `Bool` and `Char`, which the compiler's conditions and literals
+	/// core's `Bool` and `Char`, which the compiler's conditions and literals
 	/// are typed with.
 	pub bool: Option<EnumIdx>,
 	pub char: Option<StructIdx>,
 	pub funcref: Option<TypeAliasIdx>,
-	/// std's `Integer` typeset, whose members are the integer primitives.
+	/// core's `Integer` typeset, whose members are the integer primitives.
 	/// Enum representations are checked against it.
 	pub integer: Option<TypesetIdx>,
 	/// The literal kinds `integer` and `char`, written `{integer}` and
@@ -940,7 +940,7 @@ pub struct IntrinsicDefs {
 	pub not: Option<TraitIdx>,
 	pub partial_eq: Option<TraitIdx>,
 	pub partial_ord: Option<TraitIdx>,
-	/// std's `Eq`, the total-equality marker used by pattern tests.
+	/// core's `Eq`, the total-equality marker used by pattern tests.
 	pub eq: Option<TraitIdx>,
 	pub memory: Option<TraitIdx>,
 	/// `Memory`'s declaration of `Size`.
@@ -2263,7 +2263,7 @@ impl Declarations {
 		strings: &mut ast::StringInterner,
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
 		resolutions: &mut NameResolutions,
-		stdlib_package: PackageId,
+		core_package: PackageId,
 		root_package: PackageId,
 	) -> (Self, Vec<AstEntry<'ast>>) {
 		DeclarationsBuilder::build(
@@ -2272,7 +2272,7 @@ impl Declarations {
 			strings,
 			diagnostics,
 			resolutions,
-			stdlib_package,
+			core_package,
 			root_package,
 		)
 	}
@@ -2292,7 +2292,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		strings: &'ctx mut ast::StringInterner,
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 		resolutions: &mut NameResolutions,
-		stdlib_package: PackageId,
+		core_package: PackageId,
 		root_package: PackageId,
 	) -> (Declarations, Vec<AstEntry<'ast>>) {
 		let mut namespaces = Namespaces::default();
@@ -2327,16 +2327,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 			}
 
-			// The stdlib is implicit in every package but its own provider.
+			// The core is implicit in every package but its own provider.
 			// Every other dependency is named by a package instance, bound when
 			// that item is scanned.
-			if package.id != stdlib_package {
-				let std = strings.get_or_intern("std");
+			if package.id != core_package {
+				let core = strings.get_or_intern("core");
 				symbols.bindings.insert(
-					BindingKey::ty(std),
+					BindingKey::ty(core),
 					Binding::definition(
 						ItemLoc::new(
-							Namespace::Package(stdlib_package),
+							Namespace::Package(core_package),
 							DeclIdx::SELF,
 						),
 						Visibility::Public,
@@ -2357,7 +2357,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			namespaces,
 			strings,
 			files,
-			stdlib_package,
+			core_package,
 			root_package,
 			packages,
 			imports: Vec::new(),
@@ -2415,7 +2415,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		);
 
 		let decls = Declarations {
-			stdlib_package,
+			core_package,
 			root_package,
 			namespaces: builder.namespaces,
 			file_namespaces,
@@ -3444,7 +3444,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				}
 
 				if self.namespaces.scope(namespace).package_id
-					== self.stdlib_package
+					== self.core_package
 					&& self.strings.resolve(name.inner) == Some("Char")
 				{
 					self.intrinsics.char = Some(struct_index);
@@ -3526,7 +3526,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let end_variant =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				if self.namespaces.scope(namespace).package_id
-					== self.stdlib_package
+					== self.core_package
 					&& self.strings.resolve(name.inner) == Some("Bool")
 				{
 					self.intrinsics.bool = Some(enum_index);
@@ -3600,7 +3600,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 				if bodyless
 					&& self.namespaces.scope(namespace).package_id
-						== self.stdlib_package
+						== self.core_package
 				{
 					if let Some(name_str) = self.strings.resolve(name.inner) {
 						if let Some(slot) =
@@ -3767,7 +3767,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				if self.namespaces.scope(namespace).package_id
-					== self.stdlib_package
+					== self.core_package
 				{
 					if let Some(slot) = self.intrinsics.trait_slot_mut(
 						self.strings.resolve(name.inner).unwrap(),
@@ -4429,7 +4429,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					u32::try_from(self.typesets.len()).unwrap(),
 				);
 				if self.namespaces.scope(namespace).package_id
-					== self.stdlib_package
+					== self.core_package
 				{
 					if let Some(name_str) = self.strings.resolve(name.inner) {
 						if let Some(slot) =
@@ -5125,7 +5125,7 @@ mod tests {
 				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
+				graph.core_package,
 				graph.root_package,
 			);
 			// Only Phase 1 (this file) is under test here — `ast_nodes` is
@@ -5145,9 +5145,9 @@ mod tests {
 		fn new(source: &str) -> Self {
 			let mut strings = Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root_id = builder
-				.load_binary(
+				.load_package(
 					vfs::AbsolutePath::new("/main.wx"),
 					&vfs::VirtualFileSource::from_relative(HashMap::from([(
 						"main.wx".to_string(),
@@ -5164,9 +5164,9 @@ mod tests {
 		) -> Self {
 			let mut strings = Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root_id = builder
-				.load_binary(
+				.load_package(
 					entry_path,
 					&vfs::VirtualFileSource::new(workspace),
 				)
@@ -5174,22 +5174,22 @@ mod tests {
 			Self::from_graph(builder.build(root_id), strings)
 		}
 
-		/// A `"type": "std"` root — no embedded stdlib loaded, so `source`
-		/// is the *entire* package graph, and `stdlib_package == root_package`.
+		/// A `"type": "core"` root — no embedded core loaded, so `source`
+		/// is the *entire* package graph, and `core_package == root_package`.
 		/// For tests that need to control every `#[intrinsic]` declaration
 		/// themselves rather than asserting against the real, separately
-		/// evolving `std/main.wx`.
-		fn new_stdlib(source: &str) -> Self {
+		/// evolving `core/main.wx`.
+		fn new_core(source: &str) -> Self {
 			let mut strings = Keyword::create_interner();
 			let workspace = vfs::VirtualFileSource::new(HashMap::from([
 				(
-					vfs::AbsolutePath::new("/std/wx.json"),
-					r#"{ "type": "std", "entry": "main.wx" }"#.to_string(),
+					vfs::AbsolutePath::new("/core/wx.json"),
+					r#"{ "type": "core", "entry": "main.wx" }"#.to_string(),
 				),
-				(vfs::AbsolutePath::new("/std/main.wx"), source.to_string()),
+				(vfs::AbsolutePath::new("/core/main.wx"), source.to_string()),
 			]));
 			let graph = vfs::open_manifest(
-				vfs::AbsolutePath::new("/std"),
+				vfs::AbsolutePath::new("/core"),
 				&workspace,
 				&mut strings,
 			)
@@ -5337,8 +5337,8 @@ mod tests {
 	}
 
 	#[test]
-	fn stdlib_primitive_slots_reference_the_matching_aliases() {
-		let case = TestCase::new_stdlib(indoc! {"
+	fn core_primitive_slots_reference_the_matching_aliases() {
+		let case = TestCase::new_core(indoc! {"
 			type u8;
 			type i8;
 			type u16;
@@ -5384,8 +5384,8 @@ mod tests {
 	}
 
 	#[test]
-	fn stdlib_operator_slots_reference_the_matching_traits() {
-		let case = TestCase::new_stdlib(indoc! {"
+	fn core_operator_slots_reference_the_matching_traits() {
+		let case = TestCase::new_core(indoc! {"
 			trait Add {}
 			trait Sub {}
 			trait Mul {}
@@ -5433,8 +5433,8 @@ mod tests {
 	}
 
 	#[test]
-	fn stdlib_integer_typeset_is_recorded() {
-		let case = TestCase::new_stdlib(indoc! {"
+	fn core_integer_typeset_is_recorded() {
+		let case = TestCase::new_core(indoc! {"
 			type u8;
 			typeset Integer { u8 }
 		"});
@@ -5449,8 +5449,8 @@ mod tests {
 	}
 
 	#[test]
-	fn stdlib_missing_an_intrinsic_leaves_its_slot_empty() {
-		let case = TestCase::new_stdlib(indoc! {"
+	fn core_missing_an_intrinsic_leaves_its_slot_empty() {
+		let case = TestCase::new_core(indoc! {"
 			type u8;
 		"});
 		case.diagnostics().assert_none();
@@ -5462,29 +5462,29 @@ mod tests {
 	}
 
 	#[test]
-	fn reserved_name_outside_stdlib_is_not_recorded_as_intrinsic() {
+	fn reserved_name_outside_core_is_not_recorded_as_intrinsic() {
 		let case = TestCase::new(indoc! {"
 			type u8;
 		"});
 		case.diagnostics().assert_none();
 
-		// The real stdlib's own `u8` must still be the one on record — the
+		// The real core's own `u8` must still be the one on record — the
 		// same-named declaration in the binary package must not clobber it,
-		// and (since it isn't in the stdlib package) must not be recorded
+		// and (since it isn't in the core package) must not be recorded
 		// as an intrinsic at all.
 		let root_namespace = case.root_namespace();
-		let stdlib_namespace = Scope::Package(case.graph.stdlib_package);
+		let core_namespace = Scope::Package(case.graph.core_package);
 		assert_ne!(
-			root_namespace, stdlib_namespace,
-			"the binary package must not be the stdlib package"
+			root_namespace, core_namespace,
+			"the binary package must not be the core package"
 		);
 		let u8_index =
 			case.decls.intrinsics.u8.expect("u8 should still resolve");
 		assert_eq!(
 			case.decls
 				.scope(case.decls.type_aliases[usize::from(u8_index)].loc),
-			stdlib_namespace,
-			"u8 must still point into the stdlib package, not the binary one"
+			core_namespace,
+			"u8 must still point into the core package, not the binary one"
 		);
 	}
 
@@ -5493,7 +5493,7 @@ mod tests {
 		// A type alias and a trait sharing a reserved name must land in
 		// distinct slots — `type_slot_mut`/`trait_slot_mut` are separate
 		// lookups specifically so this can't happen.
-		let case = TestCase::new_stdlib(indoc! {"
+		let case = TestCase::new_core(indoc! {"
 			type Add;
 			trait u8 { func f(self: Self) -> Self; }
 		"});
@@ -5688,8 +5688,8 @@ mod tests {
 
 	/// Every declaration is a row, and its arena entry points back at it:
 	/// the row's kind leads back to the entry, and every row but a package's
-	/// own entry is exactly one entry's. Run over the user's package and std,
-	/// which between them declare every kind (and std every generated one).
+	/// own entry is exactly one entry's. Run over the user's package and core,
+	/// which between them declare every kind (and core every generated one).
 	/// The rows hold what is written: members, generated declarations and
 	/// import entries are rows of the scope they are written in, a generated
 	/// one's name span is empty, and the visibility is whether `pub` is
@@ -5904,7 +5904,7 @@ mod tests {
 	#[test]
 	fn member_identities_and_function_kinds_are_preserved_without_resolving_types()
 	 {
-		let mut case = TestCase::new_stdlib(indoc! {"
+		let mut case = TestCase::new_core(indoc! {"
 			const VALUE: Unknown = missing;
 			trait Api {
 				func make() -> Unknown;
@@ -6022,11 +6022,11 @@ mod tests {
 			"trait T { type X; func X(); }",
 			"trait T {} struct S(); impl T for S { type X = (); func X() {} }",
 		] {
-			TestCase::new_stdlib(source)
+			TestCase::new_core(source)
 				.diagnostics()
 				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 		}
-		let case = TestCase::new_stdlib("struct S(); impl S { func f() {} }");
+		let case = TestCase::new_core("struct S(); impl S { func f() {} }");
 		case.diagnostics().assert_none();
 		let symbol = case.strings.get("f").unwrap();
 		let owner = &case.decls.inherent_impls[0];
@@ -6184,7 +6184,7 @@ mod tests {
 			"struct S(); impl S { func f(original: i32) {} func f(replacement: i32) {} func after() {} }",
 			"trait T {} struct S(); impl T for S { func f(original: i32) {} func f(replacement: i32) {} func after() {} }",
 		] {
-			let case = TestCase::new_stdlib(source);
+			let case = TestCase::new_core(source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::DuplicateDefinition]);
 			let f = BindingKey::value(case.strings.get("f").unwrap());
@@ -6298,7 +6298,7 @@ mod tests {
 			Some(DiagnosticCode::DuplicateStructField.code())
 		);
 
-		// `Point` isn't necessarily `decls.structs[0]` — the real stdlib
+		// `Point` isn't necessarily `decls.structs[0]` — the real core
 		// (loaded by `TestCase::new`) declares its own structs (`Layout`,
 		// `RawPtr`), so look it up by name rather than assuming an index.
 		let DeclKind::Struct(point_struct_index) =
@@ -6380,7 +6380,7 @@ mod tests {
 			"struct S(); impl S { func f(x: i32, x: i32, tail: i32) {} }",
 			"trait T {} struct S(); impl T for S { func f(x: i32, x: i32, tail: i32) {} }",
 		] {
-			let case = TestCase::new_stdlib(source);
+			let case = TestCase::new_core(source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::DuplicateFunctionParameter]);
 			let function = &case.decls.functions[0];
@@ -6411,7 +6411,7 @@ mod tests {
 			"struct S(); impl S { func f(x: i32, self: Self) {} }",
 			"trait T {} struct S(); impl T for S { func f(x: i32, self: Self) {} }",
 		] {
-			let case = TestCase::new_stdlib(source);
+			let case = TestCase::new_core(source);
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::SelfParamPosition]);
 			case.diagnostics().assert_error_with(
@@ -6427,7 +6427,7 @@ mod tests {
 	#[test]
 	fn repeated_self_reports_both_duplicate_name_and_invalid_position() {
 		let source = "trait T { func f(self: Self, self: Self); }";
-		let case = TestCase::new_stdlib(source);
+		let case = TestCase::new_core(source);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::DuplicateFunctionParameter,
 			DiagnosticCode::SelfParamPosition,
@@ -6453,7 +6453,7 @@ mod tests {
 
 	#[test]
 	fn receiver_presence_classifies_trait_and_impl_functions() {
-		let case = TestCase::new_stdlib(indoc! {"
+		let case = TestCase::new_core(indoc! {"
 			trait T {
 				func method(self: Self, x: i32);
 				func associated(x: i32);
@@ -6997,9 +6997,9 @@ mod tests {
 	fn discarded_attributes_do_not_produce_literal_diagnostics() {
 		let mut strings = Keyword::create_interner();
 		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let root_id = builder
-			.load_binary(
+			.load_package(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
@@ -7025,7 +7025,7 @@ mod tests {
 			&mut strings,
 			&mut diagnostics,
 			&mut resolutions,
-			graph.stdlib_package,
+			graph.core_package,
 			graph.root_package,
 		);
 		assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -7056,11 +7056,10 @@ mod tests {
 	}
 
 	const APP_WITH_MATH: &str = r#"{
-		"type": "bin",
 		"entry": "main.wx",
 		"dependencies": { "math": { "type": "local", "path": "../math" } }
 	}"#;
-	const MATH_MANIFEST: &str = r#"{ "type": "lib", "entry": "main.wx" }"#;
+	const MATH_MANIFEST: &str = r#"{ "entry": "main.wx" }"#;
 	const MATH_SOURCE: &str = "pub func add() {}";
 
 	#[test]
@@ -7086,6 +7085,39 @@ mod tests {
 			case.resolve(Tier::Value, "m::add").expect_success(),
 			DeclKind::Function(_)
 		));
+	}
+
+	#[test]
+	fn package_instances_accept_dependency_keys_that_are_not_identifiers() {
+		for key in [
+			"SomeLib",
+			"my-lib",
+			"loop",
+			"@org/math",
+			"with spaces",
+			"数学",
+			"",
+		] {
+			let quoted = serde_json::to_string(key).unwrap();
+			let manifest = APP_WITH_MATH.replace("\"math\"", &quoted);
+			let source = format!("package {quoted} as math;");
+			let mut case = manifest_case(&[
+				("/app/wx.json", &manifest),
+				("/app/main.wx", &source),
+				("/math/wx.json", MATH_MANIFEST),
+				("/math/main.wx", MATH_SOURCE),
+			]);
+			case.diagnostics().assert_none();
+			let item = &case.decls.namespaces.package_instances()[0];
+			assert_eq!(
+				case.strings.resolve(item.package_name.inner),
+				Some(key)
+			);
+			assert!(matches!(
+				case.resolve(Tier::Value, "math::add").expect_success(),
+				DeclKind::Function(_)
+			));
+		}
 	}
 
 	/// The point of the item over the old implicit binding: one package can
@@ -7177,12 +7209,10 @@ mod tests {
 	#[test]
 	fn a_pub_package_instance_exposes_the_dependency_to_consumers() {
 		let app = r#"{
-			"type": "bin",
 			"entry": "main.wx",
 			"dependencies": { "mid": { "type": "local", "path": "../mid" } }
 		}"#;
 		let mid = r#"{
-			"type": "lib",
 			"entry": "main.wx",
 			"dependencies": { "math": { "type": "local", "path": "../math" } }
 		}"#;
@@ -7309,17 +7339,17 @@ mod tests {
 		));
 	}
 
-	/// The stdlib stays implicit: `std` needs no package instance.
+	/// The core stays implicit: `core` needs no package instance.
 	#[test]
-	fn std_is_bound_without_a_package_instance() {
+	fn core_is_bound_without_a_package_instance() {
 		let mut case = manifest_case(&[
-			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
+			("/app/wx.json", r#"{ "entry": "main.wx" }"#),
 			("/app/main.wx", "func main() {}"),
 		]);
 		case.diagnostics().assert_none();
 
 		assert!(matches!(
-			case.resolve(Tier::Type, "std::Memory").expect_success(),
+			case.resolve(Tier::Type, "core::Memory").expect_success(),
 			DeclKind::Trait(_)
 		));
 	}

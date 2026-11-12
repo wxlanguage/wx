@@ -313,16 +313,6 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	let mut strings = symbols::Keyword::create_interner();
 	let compilation = load_compilation(project_path, &mut strings);
 
-	if compilation.packages[compilation.root_package.as_usize()].kind
-		== vfs::PackageKind::Library
-	{
-		eprintln!(
-			"error: '{project_path}' is a library package and has no WASM \
-			 output to emit; use `wx check` instead"
-		);
-		std::process::exit(1);
-	}
-
 	let diagnostics = compilation.collect_diagnostics();
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());

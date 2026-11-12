@@ -42,7 +42,7 @@ pub(crate) struct ServerState {
 impl ServerState {
 	/// The snapshot a request for `uri` is answered from, and the file in
 	/// it. The file's own project wins; a file only reached as another
-	/// package's dependency (or the stdlib) is taken from the first root in
+	/// package's dependency (or the core) is taken from the first root in
 	/// path order that reaches it, so the choice never depends on hash
 	/// order.
 	pub(crate) fn resolve_uri(&self, uri: &Uri) -> Option<(&Snapshot, FileId)> {
@@ -117,7 +117,7 @@ pub(crate) fn refresh_project_manifest(
 /// changed file — a known cost, deliberately deferred. `paths` is merged into
 /// the set of all tracked files below, so by the time roots are chosen there
 /// is nothing left distinguishing what actually changed. A full `wx check` of
-/// the largest example here is ~10ms with process start, stdlib, and codegen
+/// the largest example here is ~10ms with process start, core, and codegen
 /// included, so one root is single-digit ms; this hurts on a workspace with
 /// many packages, not on this repo.
 ///

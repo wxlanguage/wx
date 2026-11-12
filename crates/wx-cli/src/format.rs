@@ -25,7 +25,7 @@ pub struct FormatSelection {
 ///
 /// `files`, if given, names an explicit list of paths relative to `dir` —
 /// format exactly those files, with no module-tree walk. Each is loaded
-/// independently via its own `load_binary` call; if it declares `mod`s
+/// independently via its own `load_package` call; if it declares `mod`s
 /// of its own, those get parsed too (parsing has to follow them to parse
 /// the file at all) but are not selected — only the named file is, same
 /// as a single shallow file always worked. With no `files`, every module
@@ -45,8 +45,8 @@ pub fn expand_project(
 	let modules = match files {
 		None => {
 			let entry = dir.join(&manifest.entry);
-			let package_id = builder.load_binary(entry, source)?;
-			// `load_binary` never resolves dependencies, so exactly one
+			let package_id = builder.load_package(entry, source)?;
+			// `load_package` never resolves dependencies, so exactly one
 			// package exists here — the one just loaded.
 			builder.packages.remove(package_id.as_usize()).modules
 		}
@@ -54,7 +54,7 @@ pub fn expand_project(
 			let mut modules = Vec::with_capacity(paths.len());
 			for path in paths {
 				let file_path = dir.join(&RelativePath::new(path.clone()));
-				let package_id = builder.load_binary(file_path, source)?;
+				let package_id = builder.load_package(file_path, source)?;
 				let mut graph = builder.packages.remove(package_id.as_usize());
 				modules.push(graph.modules.swap_remove(graph.root.as_usize()));
 			}

@@ -99,7 +99,7 @@ impl Snapshot {
 
 	/// The file `uri` names in this snapshot. Matched by rebuilding each
 	/// module's URI rather than converting `uri` to a path, since a path
-	/// conversion accepts a `wx://std/...` URI and returns a bogus path.
+	/// conversion accepts a `wx://core/...` URI and returns a bogus path.
 	pub(crate) fn file_for(&self, uri: &Uri) -> Option<FileId> {
 		self.compilation
 			.packages

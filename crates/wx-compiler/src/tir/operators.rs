@@ -7,7 +7,7 @@
 //! (`PrimitiveBinary`/`PrimitiveUnary`, lowered to native instructions and
 //! folded by constant evaluation), on any other type it is a call of the
 //! impl's or the trait's method. The primitive table below must
-//! name exactly the primitive impls the stdlib defines; a test holds the two
+//! name exactly the primitive impls the core defines; a test holds the two
 //! together.
 
 use super::decls::{
@@ -17,8 +17,8 @@ use super::types::{Primitive, TypeIndex};
 use crate::ast::{BinaryOp, StringInterner, UnaryOp};
 
 /// Whether the compiler implements `op` natively on `ty`, a primitive
-/// scalar; `false` for any other type. Mirrors the stdlib's primitive impls of
-/// the operator traits exactly (`primitive_operators_match_the_stdlib_impls`);
+/// scalar; `false` for any other type. Mirrors the core's primitive impls of
+/// the operator traits exactly (`primitive_operators_match_the_core_impls`);
 /// `&&`/`||` are not overloadable and are checked before this is asked.
 pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
 	let Some(scalar) = Primitive::of(ty) else {
@@ -26,7 +26,7 @@ pub(super) fn is_primitive_binary(op: BinaryOp, ty: TypeIndex) -> bool {
 	};
 	let numeric = scalar.is_integer() || scalar.is_float();
 	match op {
-		// Floats have no WASM remainder instruction, and the stdlib no longer
+		// Floats have no WASM remainder instruction, and the core no longer
 		// provides a `Rem` impl for them; a floating `%` is diagnosed rather
 		// than lowered.
 		BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
@@ -94,7 +94,7 @@ pub(super) struct OperatorMethod {
 }
 
 /// Every overloadable operator's method, resolved once from the operator
-/// traits phase 1 recorded by name (`IntrinsicDefs`). A slot is `None` when the stdlib
+/// traits phase 1 recorded by name (`IntrinsicDefs`). A slot is `None` when the core
 /// in use does not define the trait (or the method), in which case the
 /// operator applies to nothing.
 pub(super) struct OperatorTraits {
@@ -159,7 +159,7 @@ impl OperatorTraits {
 	}
 
 	/// `None` for an operator no trait overloads (`&&`, `||`, assignment) or
-	/// whose trait the stdlib does not define.
+	/// whose trait the core does not define.
 	pub(super) fn binary(&self, op: BinaryOp) -> Option<OperatorMethod> {
 		match op {
 			BinaryOp::Add => self.add,

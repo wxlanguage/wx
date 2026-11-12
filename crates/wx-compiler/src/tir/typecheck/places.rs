@@ -377,7 +377,7 @@ impl BodyBuilder<'_, '_> {
 			Type::Error => Err(()),
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
 				let intrinsics = &self.sema.decls.intrinsics;
-				let slice = intrinsics.slice.expect("std declares `Slice`");
+				let slice = intrinsics.slice.expect("core declares `Slice`");
 				let value =
 					intrinsics.slice_value.expect("`Slice` declares `Value`");
 				if !self.implements(ty, slice, span).ok_or(())? {

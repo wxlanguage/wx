@@ -221,7 +221,7 @@ mod tests {
 	#[test]
 	fn join_collapses_parent_dir_segments() {
 		assert_eq!(
-			AbsolutePath::new("/crates/wx-compiler/std")
+			AbsolutePath::new("/crates/wx-compiler/core")
 				.join(&RelativePath::new("../other"))
 				.as_str(),
 			"/crates/wx-compiler/other"

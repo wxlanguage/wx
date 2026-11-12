@@ -78,9 +78,9 @@ pub fn compile(
 		.collect();
 
 	let mut builder = vfs::CompilationUnitBuilder::new();
-	builder.load_stdlib();
+	builder.load_core();
 	let root_id = builder
-		.load_binary(
+		.load_package(
 			vfs::AbsolutePath::new(entry_path),
 			&vfs::VirtualFileSource::new(files),
 		)

@@ -81,7 +81,7 @@ impl<Mem: Memory> Allocator for BumpAllocator<Mem> {
             local before = self.mem.size_pages();
             _ = self.mem.grow(needed);
             // `grow` returns the old size or -1, but the signed size has no
-            // `PartialEq` in std; comparing the page count catches both.
+            // `PartialEq` in core; comparing the page count catches both.
             if self.mem.size_pages() == before { trap() }
         }
 

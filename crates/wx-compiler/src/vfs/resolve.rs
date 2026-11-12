@@ -7,28 +7,9 @@ use crate::symbols::StringInterner;
 use super::manifest::ResolvedDependency;
 use super::{
 	AbsolutePath, CompilationUnit, CompilationUnitBuilder, DependencySource,
-	DiagnosticCode, FileId, FileSource, PackageId, PackageKind,
-	PackageManifest, PackageManifestKind, PackageName, RelativePath,
+	DiagnosticCode, FileId, FileSource, PackageId, PackageManifest,
+	PackageManifestKind, RelativePath,
 };
-
-/// Maps a manifest's declared `"type"` to the resolved `PackageKind` used
-/// at runtime. No name is involved: what a package is
-/// called is decided by whoever depends on it, and is threaded separately
-/// (see `open_manifest_package`).
-///
-/// `Std` collapses to `Library` deliberately — being the stdlib is not a
-/// different kind of package, it's an ordinary library that additionally
-/// happens to be `CompilationUnit::stdlib_package`. Everything a library
-/// can't do (`export`, `memory`, ...) a stdlib can't do either, so the two
-/// must not diverge here.
-pub fn package_kind(kind: &PackageManifestKind) -> PackageKind {
-	match kind {
-		PackageManifestKind::Bin => PackageKind::Binary,
-		PackageManifestKind::Lib | PackageManifestKind::Std => {
-			PackageKind::Library
-		}
-	}
-}
 
 /// Loads the package whose manifest lives at `{dir}/wx.json` as the root of
 /// a compilation, resolving every dependency it declares. Requires a
@@ -44,11 +25,11 @@ pub fn package_kind(kind: &PackageManifestKind) -> PackageKind {
 /// starts, regardless of `type` — see the design doc for why entry-point
 /// resolution never varies with kind. Every `dependencies` entry is then
 /// resolved recursively, relative to *its declaring* manifest's own
-/// directory. The embedded stdlib is loaded first, before the root and
-/// before any dependency, unless the root declares `"type": "std"` and so
-/// provides it itself. That is the whole of the implicit-`std` rule: the
-/// stdlib is not replaceable, so there is no override path and no
-/// reserved-key check — a dependency bound to the key `std` simply loses
+/// directory. The embedded core is loaded first, before the root and
+/// before any dependency, unless the root declares `"type": "core"` and so
+/// provides it itself. That is the whole of the implicit-`core` rule: the
+/// core is not replaceable, so there is no override path and no
+/// reserved-key check — a dependency bound to the key `core` simply loses
 /// the first-claim-wins race and gets `DuplicatePackageName`.
 ///
 /// `source` is shared, unchanged, across every package this resolves —
@@ -90,7 +71,7 @@ pub fn open_manifest_with_manifests(
 	// Loaded here rather than through `open_manifest_package` because two
 	// things are true of the root and of nothing else: it has no name
 	// (nothing in this compilation depends on it), and its `"type"` is the
-	// only one that can decide whether a stdlib is loaded at all. Both are
+	// only one that can decide whether the embedded core is loaded. Both are
 	// properties of *being* the root, so threading them through the
 	// recursion would mean every dependency carrying parameters only the
 	// outermost call could ever use.
@@ -104,25 +85,24 @@ pub fn open_manifest_with_manifests(
 		&loaded
 	};
 	let entry_path = dir.join(&manifest.entry);
-	let kind = package_kind(&manifest.kind);
 
-	// The two kinds differ in *when* the stdlib is established relative to
-	// the root, which is the whole of the implicit-`std` rule — so the
+	// The two kinds differ in *when* the core is established relative to
+	// the root, which is the whole of the implicit-`core` rule — so the
 	// ordering lives in the arms rather than in flags read further down.
 	let root_id = match manifest.kind {
-		// The root provides the tagged items itself, so no embedded stdlib
+		// The root provides the tagged items itself, so no embedded core
 		// is loaded. Marked after loading, so it isn't listed as its own
 		// dependency; everything resolved below still sees it.
-		PackageManifestKind::Std => {
-			let root_id = builder.load_package(kind, entry_path, source)?;
-			builder.set_stdlib(root_id);
+		Some(PackageManifestKind::Core) => {
+			let root_id = builder.load_package(entry_path, source)?;
+			builder.set_core(root_id);
 			root_id
 		}
-		// Established first, so the root gets `std` seeded into its
+		// Established first, so the root gets `core` seeded into its
 		// dependencies like every other package.
-		PackageManifestKind::Lib | PackageManifestKind::Bin => {
-			builder.load_stdlib();
-			builder.load_package(kind, entry_path, source)?
+		None => {
+			builder.load_core();
+			builder.load_package(entry_path, source)?
 		}
 	};
 
@@ -158,7 +138,7 @@ struct DependencyResolution<'a> {
 /// Only ever called for dependencies — the root is loaded directly by
 /// `open_manifest`. Being in this function is therefore itself the proof
 /// that a package is *not* the root, which is what makes the `"type":
-/// "std"` check below need no flag to tell the two cases apart.
+/// "core"` check below need no flag to tell the two cases apart.
 ///
 /// Registers itself in `in_progress` under `identity` as soon as it has an
 /// id and *before* recursing, so a dependency edge that points back here
@@ -167,7 +147,7 @@ struct DependencyResolution<'a> {
 fn open_manifest_package(
 	builder: &mut CompilationUnitBuilder<'_>,
 	dir: &AbsolutePath,
-	name: &PackageName,
+	name: &str,
 	identity: &ResolvedDependency,
 	source: &impl FileSource,
 	resolution: &mut DependencyResolution<'_>,
@@ -183,24 +163,20 @@ fn open_manifest_package(
 	};
 	let entry_path = dir.join(&manifest.entry);
 
-	let id = builder.load_package(
-		package_kind(&manifest.kind),
-		entry_path,
-		source,
-	)?;
+	let id = builder.load_package(entry_path, source)?;
 	resolution.in_progress.insert(identity.clone(), id);
 
-	// A stdlib can only ever be the root of its own compilation. Declaring
-	// `"type": "std"` has exactly one effect — suppressing the embedded
-	// stdlib — and that decision belongs to the root, so here it could only
+	// The core provider can only ever be the root of its own compilation. Declaring
+	// `"type": "core"` has exactly one effect — suppressing the embedded
+	// core — and that decision belongs to the root, so here it could only
 	// ever be inert. Inert-but-accepted is the dangerous outcome: the
-	// package would load as an ordinary library while still declaring the
+	// package would load as an ordinary package while still declaring the
 	// items the language requires, silently competing for `Add`/`Sub`/...
-	// against the real stdlib's.
-	if matches!(manifest.kind, PackageManifestKind::Std) {
+	// against the real core's.
+	if matches!(manifest.kind, Some(PackageManifestKind::Core)) {
 		builder.packages[id.as_usize()]
 			.diagnostics
-			.push(report_std_package_as_dependency(name.as_str()));
+			.push(report_core_package_as_dependency(name));
 	}
 
 	resolve_dependencies(
@@ -233,7 +209,7 @@ fn resolve_dependencies(
 	builder: &mut CompilationUnitBuilder<'_>,
 	owner: PackageId,
 	dir: &AbsolutePath,
-	dependencies: &HashMap<PackageName, DependencySource>,
+	dependencies: &HashMap<String, DependencySource>,
 	source: &impl FileSource,
 	resolution: &mut DependencyResolution<'_>,
 ) -> Result<(), ()> {
@@ -289,18 +265,18 @@ fn resolve_dependencies(
 
 /// No label, for the same reason `report_duplicate_dependency_name` has
 /// none: there's no span inside a `wx.json` to point at from here.
-fn report_std_package_as_dependency(key: &str) -> Diagnostic<FileId> {
+fn report_core_package_as_dependency(key: &str) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::StdPackageAsDependency.code())
+		.with_code(DiagnosticCode::CorePackageAsDependency.code())
 		.with_message(format!(
-			"dependency `{key}` declares `\"type\": \"std\"`: a standard \
-			 library can only be the root of its own compilation, never a \
+			"dependency `{key}` declares `\"type\": \"core\"`: the core \
+			 package can only be the root of its own compilation, never a \
 			 dependency of one"
 		))
 }
 
 /// No label: there's no specific span inside a `wx.json` to point at from
-/// here (see `report_std_package_as_dependency`'s own reasoning) — the message just
+/// here (see `report_core_package_as_dependency`'s own reasoning) — the message just
 /// names the dependency key whose edge closes the cycle.
 fn report_circular_dependency(key: &str) -> Diagnostic<FileId> {
 	Diagnostic::error()
@@ -320,7 +296,7 @@ mod tests {
 
 	/// What `owner` calls the package it reaches under `name`. Replaces the
 	/// old global `package_by_name`: a name is a property of the edge, so
-	/// asking "what is `std` here?" now requires saying *here*.
+	/// asking "what is `core` here?" now requires saying *here*.
 	fn dependency_of(
 		compilation: &CompilationUnit,
 		owner: PackageId,
@@ -366,9 +342,8 @@ mod tests {
 			]),
 			json_reads: std::cell::Cell::new(0),
 		};
-		let app = PackageManifest::parse(r#"{"type":"bin","entry":"main.wx","dependencies":{"dep":{"type":"local","path":"../dep"}}}"#).unwrap();
-		let dep = PackageManifest::parse(r#"{"type":"lib","entry":"main.wx"}"#)
-			.unwrap();
+		let app = PackageManifest::parse(r#"{"entry":"main.wx","dependencies":{"dep":{"type":"local","path":"../dep"}}}"#).unwrap();
+		let dep = PackageManifest::parse(r#"{"entry":"main.wx"}"#).unwrap();
 		let manifests = HashMap::from([
 			(AbsolutePath::new("/app"), &app),
 			(AbsolutePath::new("/dep"), &dep),
@@ -390,29 +365,28 @@ mod tests {
 	}
 
 	#[test]
-	fn manifested_binary_with_no_dependencies_gets_std() {
+	fn manifested_package_with_no_dependencies_gets_core() {
 		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
-			("/app/wx.json", r#"{ "type": "bin", "entry": "main.wx" }"#),
+			("/app/wx.json", r#"{ "entry": "main.wx" }"#),
 			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
 				.unwrap();
 
-		assert_eq!(compilation.packages.len(), 2, "root + std");
+		assert_eq!(compilation.packages.len(), 2, "root + core");
 		assert_eq!(
 			dependency_of(
 				&compilation,
 				compilation.root_package,
-				"std",
+				"core",
 				&strings
 			),
-			Some(compilation.stdlib_package),
-			"every package can reach the stdlib without declaring it"
+			Some(compilation.core_package),
+			"every package can reach the core without declaring it"
 		);
 		let root = &compilation.packages[compilation.root_package.as_usize()];
-		assert!(matches!(root.kind, PackageKind::Binary));
 		assert_eq!(root.entry_path.as_str(), "/app/main.wx");
 	}
 
@@ -420,13 +394,10 @@ mod tests {
 	/// entry file can be named anything, and is resolved relative to the
 	/// manifest's own directory.
 	#[test]
-	fn manifested_binary_resolves_a_non_conventional_entry_name() {
+	fn manifested_package_resolves_a_non_conventional_entry_name() {
 		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
-			(
-				"/app/wx.json",
-				r#"{ "type": "bin", "entry": "src/start.wx" }"#,
-			),
+			("/app/wx.json", r#"{ "entry": "src/start.wx" }"#),
 			("/app/src/start.wx", "func add() {}"),
 		]);
 		let compilation =
@@ -450,10 +421,10 @@ mod tests {
 	}
 
 	#[test]
-	fn std_root_package_does_not_get_a_second_std_loaded() {
+	fn core_root_package_does_not_get_a_second_core_loaded() {
 		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
-			("/app/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
+			("/app/wx.json", r#"{ "type": "core", "entry": "main.wx" }"#),
 			("/app/main.wx", "func add() {}"),
 		]);
 		let compilation =
@@ -463,45 +434,41 @@ mod tests {
 		assert_eq!(
 			compilation.packages.len(),
 			1,
-			"only the root, no embedded std"
+			"only the root, no embedded core"
 		);
-		assert_eq!(compilation.stdlib_package, compilation.root_package);
+		assert_eq!(compilation.core_package, compilation.root_package);
 		assert_eq!(
 			dependency_of(
 				&compilation,
 				compilation.root_package,
-				"std",
+				"core",
 				&strings
 			),
 			None,
-			"a stdlib doesn't depend on itself — nothing seeds `std` into \
+			"a core doesn't depend on itself — nothing seeds `core` into \
 			 the package that provides it"
 		);
 	}
 
-	/// The stdlib isn't replaceable, and this is how that's enforced: it's
-	/// registered before anything else, so a dependency bound to `std` loses
+	/// The core isn't replaceable, and this is how that's enforced: it's
+	/// registered before anything else, so a dependency bound to `core` loses
 	/// the first-claim-wins race rather than needing a reserved-key check.
 	#[test]
-	fn dependency_bound_to_std_collides_with_the_stdlib() {
+	fn dependency_bound_to_core_collides_with_the_core() {
 		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
 				r#"{
-					"type": "bin",
 					"entry": "main.wx",
 					"dependencies": {
-						"std": { "type": "local", "path": "../alt_std" }
+						"core": { "type": "local", "path": "../alt_core" }
 					}
 				}"#,
 			),
 			("/app/main.wx", "func add() {}"),
-			(
-				"/alt_std/wx.json",
-				r#"{ "type": "lib", "entry": "main.wx" }"#,
-			),
-			("/alt_std/main.wx", "func replacement() {}"),
+			("/alt_core/wx.json", r#"{ "entry": "main.wx" }"#),
+			("/alt_core/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
@@ -511,11 +478,11 @@ mod tests {
 			dependency_of(
 				&compilation,
 				compilation.root_package,
-				"std",
+				"core",
 				&strings
 			),
-			Some(compilation.stdlib_package),
-			"the stdlib holds the name; the declared one can't take it"
+			Some(compilation.core_package),
+			"the core holds the name; the declared one can't take it"
 		);
 
 		let diagnostics = compilation.collect_linker_diagnostics();
@@ -523,28 +490,30 @@ mod tests {
 			.assert_error(DiagnosticCode::DuplicatePackageName);
 	}
 
-	/// `"type": "std"` says "suppress the embedded stdlib for this
+	/// `"type": "core"` says "suppress the embedded core for this
 	/// compilation" — a decision only the root can make. A dependency
 	/// declaring it would be inert, while the language items it declares
-	/// still competed with the real stdlib's, so it's rejected rather than
+	/// still competed with the real core's, so it's rejected rather than
 	/// ignored.
 	#[test]
-	fn std_package_as_a_dependency_is_diagnosed() {
+	fn core_package_as_a_dependency_is_diagnosed() {
 		let mut strings = Keyword::create_interner();
 		let source = workspace(&[
 			(
 				"/app/wx.json",
 				r#"{
-					"type": "bin",
 					"entry": "main.wx",
 					"dependencies": {
-						"mystd": { "type": "local", "path": "../mystd" }
+						"mycore": { "type": "local", "path": "../mycore" }
 					}
 				}"#,
 			),
 			("/app/main.wx", "func add() {}"),
-			("/mystd/wx.json", r#"{ "type": "std", "entry": "main.wx" }"#),
-			("/mystd/main.wx", "func replacement() {}"),
+			(
+				"/mycore/wx.json",
+				r#"{ "type": "core", "entry": "main.wx" }"#,
+			),
+			("/mycore/main.wx", "func replacement() {}"),
 		]);
 		let compilation =
 			open_manifest(AbsolutePath::new("/app"), &source, &mut strings)
@@ -553,22 +522,22 @@ mod tests {
 		assert_eq!(
 			compilation.packages.len(),
 			3,
-			"std, root, mystd — the embedded stdlib is still loaded"
+			"core, root, mycore — the embedded core is still loaded"
 		);
 		assert_eq!(
 			dependency_of(
 				&compilation,
 				compilation.root_package,
-				"std",
+				"core",
 				&strings
 			),
-			Some(compilation.stdlib_package),
-			"a `std`-kind dependency does not become the stdlib provider"
+			Some(compilation.core_package),
+			"a `core`-kind dependency does not become the core provider"
 		);
 
 		let diagnostics = compilation.collect_linker_diagnostics();
 		DiagnosticView::new("link", &diagnostics, &compilation.files)
-			.assert_error(DiagnosticCode::StdPackageAsDependency);
+			.assert_error(DiagnosticCode::CorePackageAsDependency);
 	}
 
 	/// A `dependencies` key only makes a package available; the names the
@@ -582,7 +551,6 @@ mod tests {
 			(
 				"/app/wx.json",
 				r#"{
-					"type": "bin",
 					"entry": "main.wx",
 					"dependencies": {
 						"one": { "type": "local", "path": "../shared" },
@@ -591,10 +559,7 @@ mod tests {
 				}"#,
 			),
 			("/app/main.wx", "func add() {}"),
-			(
-				"/shared/wx.json",
-				r#"{ "type": "lib", "entry": "main.wx" }"#,
-			),
+			("/shared/wx.json", r#"{ "entry": "main.wx" }"#),
 			("/shared/main.wx", "func shared() {}"),
 		]);
 		let compilation =
@@ -622,7 +587,6 @@ mod tests {
 			(
 				"/app/wx.json",
 				r#"{
-					"type": "bin",
 					"entry": "main.wx",
 					"dependencies": {
 						"libx": { "type": "local", "path": "../x" },
@@ -631,12 +595,11 @@ mod tests {
 				}"#,
 			),
 			("/app/main.wx", "func add() {}"),
-			("/x/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
+			("/x/wx.json", r#"{ "entry": "main.wx" }"#),
 			("/x/main.wx", "func from_x() {}"),
 			(
 				"/y/wx.json",
 				r#"{
-					"type": "bin",
 					"entry": "main.wx",
 					"dependencies": {
 						"libx": { "type": "local", "path": "../z" }
@@ -644,7 +607,7 @@ mod tests {
 				}"#,
 			),
 			("/y/main.wx", "func from_y() {}"),
-			("/z/wx.json", r#"{ "type": "lib", "entry": "main.wx" }"#),
+			("/z/wx.json", r#"{ "entry": "main.wx" }"#),
 			("/z/main.wx", "func from_z() {}"),
 		]);
 		let compilation =
@@ -673,7 +636,6 @@ mod tests {
 			(
 				"/app/wx.json",
 				r#"{
-					"type": "bin",
 					"entry": "main.wx",
 					"dependencies": {
 						"a": { "type": "local", "path": "../a" },
@@ -685,7 +647,6 @@ mod tests {
 			(
 				"/a/wx.json",
 				r#"{
-					"type": "lib",
 					"entry": "main.wx",
 					"dependencies": {
 						"shared": { "type": "local", "path": "../shared" }
@@ -696,7 +657,6 @@ mod tests {
 			(
 				"/b/wx.json",
 				r#"{
-					"type": "lib",
 					"entry": "main.wx",
 					"dependencies": {
 						"shared": { "type": "local", "path": "../shared" }
@@ -704,10 +664,7 @@ mod tests {
 				}"#,
 			),
 			("/b/main.wx", "func from_b() {}"),
-			(
-				"/shared/wx.json",
-				r#"{ "type": "lib", "entry": "main.wx" }"#,
-			),
+			("/shared/wx.json", r#"{ "entry": "main.wx" }"#),
 			("/shared/main.wx", "func from_shared() {}"),
 		]);
 		let compilation =
@@ -717,7 +674,7 @@ mod tests {
 		assert_eq!(
 			compilation.packages.len(),
 			5,
-			"app, std, a, b, shared — shared loaded exactly once despite two paths to it"
+			"app, core, a, b, shared — shared loaded exactly once despite two paths to it"
 		);
 		// A diamond dependency isn't a collision.
 		let diagnostics = compilation.collect_linker_diagnostics();
@@ -732,7 +689,6 @@ mod tests {
 			(
 				"/a/wx.json",
 				r#"{
-					"type": "lib",
 					"entry": "main.wx",
 					"dependencies": {
 						"b": { "type": "local", "path": "../b" }
@@ -743,7 +699,6 @@ mod tests {
 			(
 				"/b/wx.json",
 				r#"{
-					"type": "lib",
 					"entry": "main.wx",
 					"dependencies": {
 						"a": { "type": "local", "path": "../a" }

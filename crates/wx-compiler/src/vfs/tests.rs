@@ -34,14 +34,14 @@ struct TestCase {
 }
 
 impl TestCase {
-	/// Loads `files` as a binary package rooted at `entry`, which must be
+	/// Loads `files` as a package rooted at `entry`, which must be
 	/// readable — a missing entry file is a hard error rather than a
 	/// diagnostic, and has its own test.
 	fn binary(entry: &str, files: &[(&str, &str)]) -> Self {
 		let mut strings = Keyword::create_interner();
 		let mut builder = CompilationUnitBuilder::new(&mut strings);
 		let package = builder
-			.load_binary(AbsolutePath::new(entry), &workspace(files))
+			.load_package(AbsolutePath::new(entry), &workspace(files))
 			.expect("the entry file is readable");
 		let CompilationUnitBuilder {
 			files,
@@ -64,7 +64,7 @@ impl TestCase {
 	///
 	/// Scoped to the one package rather than going through
 	/// [`CompilationUnit::link_diagnostics`]: these tests stop at
-	/// `load_binary` and never `build()`, since building demands a stdlib
+	/// `load_package` and never `build()`, since building demands a core
 	/// that a single-package module-resolution test has no use for.
 	fn diagnostics(&self) -> DiagnosticView<'_> {
 		DiagnosticView::new("link", &self.graph().diagnostics, &self.files)
@@ -152,7 +152,7 @@ fn load_package_reports_missing_entry_file() {
 	let mut strings = Keyword::create_interner();
 	let mut builder = CompilationUnitBuilder::new(&mut strings);
 	assert_eq!(
-		builder.load_binary(AbsolutePath::new("/missing.wx"), &workspace(&[])),
+		builder.load_package(AbsolutePath::new("/missing.wx"), &workspace(&[])),
 		Err(()),
 		"expected missing entry file to be a fatal error, not a diagnostic \
 		 — there's no package to build without it"
@@ -166,9 +166,9 @@ fn compilation_units_share_a_caller_owned_interner() {
 
 	fn load(source: &str, strings: &mut StringInterner) -> CompilationUnit {
 		let mut builder = CompilationUnitBuilder::new(strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let root = builder
-			.load_binary(
+			.load_package(
 				AbsolutePath::new("/main.wx"),
 				&workspace(&[("/main.wx", source)]),
 			)
@@ -292,7 +292,7 @@ fn load_package_resolves_module_directory_file() {
 	let mut strings = Keyword::create_interner();
 	let mut builder = CompilationUnitBuilder::new(&mut strings);
 	let package_id = builder
-		.load_binary(as_absolute(&entry), &NativeFileSource)
+		.load_package(as_absolute(&entry), &NativeFileSource)
 		.unwrap();
 	let graph = &builder.packages[package_id.as_usize()];
 
@@ -308,9 +308,9 @@ fn load_package_resolves_module_directory_file() {
 fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
 	let mut strings = Keyword::create_interner();
 	let mut builder = CompilationUnitBuilder::new(&mut strings);
-	builder.load_stdlib();
+	builder.load_core();
 	let root_id = builder
-		.load_binary(
+		.load_package(
 			AbsolutePath::new("/src/main.wx"),
 			&workspace(&[
 				("/src/main.wx", "mod math;"),

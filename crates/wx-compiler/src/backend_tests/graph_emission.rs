@@ -556,9 +556,9 @@ fn empty_and_zero_initialized_values_need_no_computation_locals() {
 fn lower_source(source: &str) -> (StringInterner, mir::MIR) {
 	let mut strings = crate::symbols::Keyword::create_interner();
 	let mut builder = crate::vfs::CompilationUnitBuilder::new(&mut strings);
-	builder.load_stdlib();
+	builder.load_core();
 	let root = builder
-		.load_binary(
+		.load_package(
 			crate::vfs::AbsolutePath::new("/main.wx"),
 			&crate::vfs::VirtualFileSource::from_relative(
 				std::collections::HashMap::from([(

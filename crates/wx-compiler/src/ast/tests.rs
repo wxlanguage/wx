@@ -8,7 +8,7 @@ use crate::vfs::{FileOrigin, Files};
 /// A single parsed file, kept together with the [`Files`] its spans point
 /// into so diagnostics can be rendered with source context.
 ///
-/// Parser tests deliberately skip the package machinery — no stdlib, no
+/// Parser tests deliberately skip the package machinery — no core, no
 /// `CompilationUnit` — because nothing here needs it, and every extra stage
 /// would be another way for a test to fail for reasons it is not about.
 struct TestCase {
@@ -3578,7 +3578,7 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
 
 #[test]
 fn test_keyword_expressions() {
-	// `true` and `false` are not keywords: `True` and `False` are std's
+	// `true` and `false` are not keywords: `True` and `False` are core's
 	// constants, named like any other.
 	let case = TestCase::new(indoc! {"
         func f() -> Bool {

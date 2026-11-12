@@ -89,7 +89,7 @@ define_diagnostic_codes! {
 		AmbiguousModuleFile => "E0001",
 		DuplicatePackageName => "E0002",
 		CircularDependency => "E0003",
-		StdPackageAsDependency => "E0004",
+		CorePackageAsDependency => "E0004",
 
 		NestedModuleDeclaration => "E0006",
 

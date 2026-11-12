@@ -103,7 +103,7 @@ impl Lowerer<'_> {
 		let mut arguments = arguments.into_iter();
 		macro_rules! operand {
 			() => {
-				arguments.next().expect("std intrinsic operand")
+				arguments.next().expect("core intrinsic operand")
 			};
 		}
 		macro_rules! unary {
@@ -257,7 +257,7 @@ impl Lowerer<'_> {
 				);
 				assert!(
 					arguments.next().is_none(),
-					"std intrinsic operand count"
+					"core intrinsic operand count"
 				);
 				return Ok(self.sequence(state, prefix, value));
 			}
@@ -276,7 +276,7 @@ impl Lowerer<'_> {
 				};
 				assert!(
 					arguments.next().is_none(),
-					"std intrinsic operand count"
+					"core intrinsic operand count"
 				);
 				return Ok(self.sequence(state, prefix, value));
 			}
@@ -318,7 +318,7 @@ impl Lowerer<'_> {
 				)
 			}
 		};
-		assert!(arguments.next().is_none(), "std intrinsic operand count");
+		assert!(arguments.next().is_none(), "core intrinsic operand count");
 		let value = state.push(kind, ty);
 		Ok(self.sequence(state, prefix, value))
 	}

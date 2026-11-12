@@ -1774,7 +1774,7 @@ impl Semantics {
 	) -> Result<TypeIndex, SolverError> {
 		let intrinsics = &self.decls.intrinsics;
 		let trait_index =
-			intrinsics.stack_value.expect("std declares `StackValue`");
+			intrinsics.stack_value.expect("core declares `StackValue`");
 		let assoc_type_index = intrinsics
 			.stack_value_repr
 			.expect("`StackValue` declares `Repr`");
@@ -1951,7 +1951,7 @@ impl Semantics {
 						.decls
 						.intrinsics
 						.stack_value
-						.expect("std declares `StackValue`");
+						.expect("core declares `StackValue`");
 					if !self.assumes(
 						strings,
 						assumption_context,
@@ -2265,7 +2265,7 @@ impl Semantics {
 					.decls
 					.intrinsics
 					.stack_value
-					.expect("std declares `StackValue`");
+					.expect("core declares `StackValue`");
 				if self.assumes(strings, assumption_context, ty, stack_value)? {
 					out.push(ty);
 					Ok(true)
@@ -2335,7 +2335,7 @@ impl Semantics {
 	) -> TypeIndex {
 		let intrinsics = &self.decls.intrinsics;
 		let (trait_index, assoc_type_index) = (
-			intrinsics.pointer.expect("std declares `Pointer`"),
+			intrinsics.pointer.expect("core declares `Pointer`"),
 			intrinsics
 				.pointer_metadata
 				.expect("`Pointer` declares `Metadata`"),

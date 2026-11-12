@@ -83,8 +83,8 @@ const STATIC: u32 = 1 << 2;
 /// A local or a field written to: assigned, or the target of `+=`.
 const MODIFICATION: u32 = 1 << 3;
 /// Provided by the compiler rather than defined in wx: an intrinsic (a
-/// function std leaves to the compiler), a primitive type or a literal kind
-/// (`Semantics::is_compiler_provided`). A std function with a body is an
+/// function core leaves to the compiler), a primitive type or a literal kind
+/// (`Semantics::is_compiler_provided`). A core function with a body is an
 /// ordinary function.
 const DEFAULT_LIBRARY: u32 = 1 << 4;
 

@@ -8,8 +8,8 @@ export interface VirtualFileCallbacks {
 }
 
 /**
- * wx-lsp can point hover/definition/references at stdlib source through a
- * `wx://std/<name>` URI (see `file_id_to_uri` in `wx-lsp/src/lib.rs`) — it's
+ * wx-lsp can point hover/definition/references at core source through a
+ * `wx://core/<name>` URI (see `file_id_to_uri` in `wx-lsp/src/lib.rs`) — it's
  * not a real file, so there's nothing on disk for an editor to just open.
  * The server exposes its content through a custom `wx/virtualFileContent`
  * request instead (the same mechanism a real editor extension would use via
@@ -34,7 +34,7 @@ export interface VirtualFileCallbacks {
  * `modelService.getModel(resource)`, rejecting with "Model not found" if
  * nothing is registered yet — there's no async content-provider hook the
  * way a real VS Code extension host has. So the model has to already exist
- * by the time that fires, which is why the stdlib model is fetched and
+ * by the time that fires, which is why the core model is fetched and
  * registered eagerly below instead of waiting for the first navigation.
  *
  * This module owns no DOM itself — `callbacks` let the caller (an `App.vue`
@@ -46,7 +46,7 @@ export interface VirtualFileCallbacks {
  * have any number of open `.wx`/`.js` files) — `getActiveUserModel` is a
  * getter into whatever the caller currently considers "the last file the
  * user was actually editing", so "back" always returns to the right place
- * regardless of which file was open when the stdlib jump happened.
+ * regardless of which file was open when the core jump happened.
  */
 export function registerVirtualFileOpener(
 	editor: monaco.editor.IStandaloneCodeEditor,
@@ -67,11 +67,11 @@ export function registerVirtualFileOpener(
 		return model;
 	}
 
-	// wx-lsp currently only ever resolves `wx://std/lib.wx` (see
+	// wx-lsp currently only ever resolves `wx://core/main.wx` (see
 	// `virtual_file_content` in `wx-lsp/src/lib.rs`) — if it grows more
 	// virtual files, they'd need prefetching here too.
-	void getOrCreateVirtualModel("wx://std/lib.wx").catch((error: unknown) => {
-		console.error("[wx-lsp] failed to prefetch stdlib source:", error);
+	void getOrCreateVirtualModel("wx://core/main.wx").catch((error: unknown) => {
+		console.error("[wx-lsp] failed to prefetch core source:", error);
 	});
 
 	function returnToMainFile() {

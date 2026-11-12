@@ -1209,7 +1209,7 @@ mod tests {
 				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
+				graph.core_package,
 				graph.root_package,
 			);
 			// Only Phase 1 (decls.rs + this module) is under test here —
@@ -1229,9 +1229,9 @@ mod tests {
 		fn new(source: &str) -> Self {
 			let mut strings = crate::symbols::Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root_id = builder
-				.load_binary(
+				.load_package(
 					vfs::AbsolutePath::new("/main.wx"),
 					&vfs::VirtualFileSource::from_relative(HashMap::from([(
 						"main.wx".to_string(),
@@ -1248,9 +1248,9 @@ mod tests {
 		) -> Self {
 			let mut strings = crate::symbols::Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root_id = builder
-				.load_binary(
+				.load_package(
 					entry_path,
 					&vfs::VirtualFileSource::new(workspace),
 				)

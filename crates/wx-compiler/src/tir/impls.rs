@@ -485,7 +485,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		let memory_decl = &decls.memories[usize::from(memory_index)];
 		let trait_idx = decls.intrinsics.memory.unwrap_or_else(|| {
 			panic!(
-				"the stdlib package must declare a `Memory` trait — every `memory` declaration needs one to synthesize its impl against"
+				"the core package must declare a `Memory` trait — every `memory` declaration needs one to synthesize its impl against"
 			)
 		});
 		self.trait_headers[usize::from(memory_decl.trait_impl_index)] =
@@ -526,7 +526,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		let global_decl = &decls.globals[usize::from(global_index)];
 		let global_trait_idx = decls.intrinsics.global.unwrap_or_else(|| {
 			panic!(
-				"the stdlib package must declare a `Global` trait — every `global` declaration needs one to synthesize its impl against"
+				"the core package must declare a `Global` trait — every `global` declaration needs one to synthesize its impl against"
 			)
 		});
 		self.trait_headers[usize::from(global_decl.trait_impl_index)] =
@@ -555,7 +555,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			let global_mut_trait_idx =
 				decls.intrinsics.global_mut.unwrap_or_else(|| {
 					panic!(
-						"the stdlib package must declare a `GlobalMut` trait — every `global mut` declaration needs one to synthesize its impl against"
+						"the core package must declare a `GlobalMut` trait — every `global mut` declaration needs one to synthesize its impl against"
 					)
 				});
 			self.trait_headers[usize::from(mut_trait_impl_index)] =
@@ -596,12 +596,12 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		let name_span = decls.item(function_decl.loc).name.span;
 		let call_trait_idx = decls.intrinsics.call.unwrap_or_else(|| {
 			panic!(
-				"the stdlib package must declare a `Call` trait — every function needs one to synthesize its impl against"
+				"the core package must declare a `Call` trait — every function needs one to synthesize its impl against"
 			)
 		});
 		let function_trait_idx = decls.intrinsics.function.unwrap_or_else(|| {
 			panic!(
-				"the stdlib package must declare a `Function` trait — every function needs one to synthesize its impl against"
+				"the core package must declare a `Function` trait — every function needs one to synthesize its impl against"
 			)
 		});
 		for (trait_idx, trait_impl_index) in [
@@ -701,7 +701,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	}
 
 	/// Inherent members belong to the package defining their target. Builtin
-	/// constructors belong to std; named targets keep their declaration's
+	/// constructors belong to core; named targets keep their declaration's
 	/// owner even when reached through an import or a package instance.
 	/// Trait impls deliberately have no such restriction.
 	fn check_inherent_impl_locality(
@@ -740,7 +740,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			| ImplTarget::Funcref
 			| ImplTarget::TypedFuncref
 			| ImplTarget::Array
-			| ImplTarget::Slice => Scope::Package(decls.stdlib_package),
+			| ImplTarget::Slice => Scope::Package(decls.core_package),
 		};
 		if decls.namespaces.scope(target_scope).package_id
 			== decls.namespaces.scope(namespace).package_id
@@ -804,7 +804,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			DeclKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
 			DeclKind::Enum(idx) => Some(ImplTarget::Enum(idx)),
 			// A user-written alias (`type Foo = Bar;`) has no identity of
-			// its own to dispatch on — only the closed set of std's own
+			// its own to dispatch on — only the closed set of core's own
 			// bodiless `#[intrinsic]` aliases (`u8`, `funcref`, ...) do, via
 			// their pre-interned `TypeIndex`. `intrinsic_target` returns
 			// `None` for every other alias, same as any non-namespace kind.
@@ -853,7 +853,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		}
 	}
 
-	/// The dispatch bucket for `idx`, if it's one of std's own
+	/// The dispatch bucket for `idx`, if it's one of core's own
 	/// `#[intrinsic]` primitive aliases — `None` for an ordinary alias.
 	/// `never` has no bucket here (nothing can be implemented on it), so
 	/// it's the one `IntrinsicDefs` type slot this deliberately excludes.
@@ -933,9 +933,9 @@ mod tests {
 		fn new(source: &str) -> Self {
 			let mut strings = Keyword::create_interner();
 			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-			builder.load_stdlib();
+			builder.load_core();
 			let root = builder
-				.load_binary(
+				.load_package(
 					vfs::AbsolutePath::new("/main.wx"),
 					&vfs::VirtualFileSource::from_relative(HashMap::from([(
 						"main.wx".to_string(),
@@ -966,7 +966,7 @@ mod tests {
 				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
+				graph.core_package,
 				graph.root_package,
 			);
 			DiagnosticView::new("declarations", &diagnostics, &graph.files)
@@ -1005,7 +1005,7 @@ mod tests {
 		let mut strings = Keyword::create_interner();
 		let name = strings.get_or_intern("dep");
 		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
 			("main.wx".to_string(), SOURCE.to_string()),
 			(
@@ -1020,14 +1020,10 @@ mod tests {
 			),
 		]));
 		let dep = builder
-			.load_package(
-				vfs::PackageKind::Library,
-				vfs::AbsolutePath::new("/dep.wx"),
-				&workspace,
-			)
+			.load_package(vfs::AbsolutePath::new("/dep.wx"), &workspace)
 			.unwrap();
 		let root = builder
-			.load_binary(vfs::AbsolutePath::new("/main.wx"), &workspace)
+			.load_package(vfs::AbsolutePath::new("/main.wx"), &workspace)
 			.unwrap();
 		builder.add_dependency(root, name, dep);
 		let graph = builder.build(root);
@@ -1075,7 +1071,7 @@ mod tests {
 	fn inherent_impl_locality_allows_other_files_of_the_defining_package() {
 		let mut strings = Keyword::create_interner();
 		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
-		builder.load_stdlib();
+		builder.load_core();
 		let workspace = vfs::VirtualFileSource::from_relative(HashMap::from([
 			(
 				"main.wx".to_string(),
@@ -1094,7 +1090,7 @@ mod tests {
 			),
 		]));
 		let root = builder
-			.load_binary(vfs::AbsolutePath::new("/main.wx"), &workspace)
+			.load_package(vfs::AbsolutePath::new("/main.wx"), &workspace)
 			.unwrap();
 		let graph = builder.build(root);
 		let case = TestCase::from_graph(graph, strings);
@@ -1102,13 +1098,13 @@ mod tests {
 	}
 
 	#[test]
-	fn inherent_impl_locality_reserves_primitives_and_std_types_for_std() {
+	fn inherent_impl_locality_reserves_primitives_and_core_types_for_core() {
 		for target in [
 			"u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64",
 			"funcref", "Bool", "Char",
 		] {
 			let case = TestCase::new(&format!(
-				"use std::{target} as Imported; impl Imported {{}} \
+				"use core::{target} as Imported; impl Imported {{}} \
 				 trait Extension {{}} impl Extension for Imported {{}}"
 			));
 			case.diagnostics()
@@ -1117,7 +1113,7 @@ mod tests {
 	}
 
 	#[test]
-	fn inherent_impl_locality_allows_std_to_implement_its_builtins() {
+	fn inherent_impl_locality_allows_core_to_implement_its_builtins() {
 		let source = indoc! {"
 			type u8; type u32; type funcref;
 			enum Bool(u8) { False = 0, True = 1 }
@@ -1130,7 +1126,7 @@ mod tests {
 		let mut strings = Keyword::create_interner();
 		let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
 		let root = builder
-			.load_binary(
+			.load_package(
 				vfs::AbsolutePath::new("/main.wx"),
 				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
@@ -1138,7 +1134,7 @@ mod tests {
 				)])),
 			)
 			.unwrap();
-		builder.set_stdlib(root);
+		builder.set_core(root);
 		let case = TestCase::from_graph(builder.build(root), strings);
 		case.diagnostics().assert_none();
 	}

@@ -449,7 +449,7 @@ mod tests {
 				&mut strings,
 				&mut diagnostics,
 				&mut resolutions,
-				graph.stdlib_package,
+				graph.core_package,
 				graph.root_package,
 			);
 			DiagnosticView::new("prescan", &diagnostics, &graph.files)
