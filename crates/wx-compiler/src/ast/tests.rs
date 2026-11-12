@@ -3003,6 +3003,52 @@ fn import_blocks_preserve_reexport_visibility() {
 }
 
 #[test]
+fn import_entries_may_name_the_host_field_they_import() {
+	let source = r#"import "env" as env {
+		"Log": func log(value: u32);
+		"g": global mut counter: i32;
+		"mem": memory heap: u32;
+		func plain();
+	}"#;
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	let Item::Import { items, .. } = case.item(0) else {
+		panic!("expected import block")
+	};
+	let fields: Vec<_> = items
+		.inner
+		.iter()
+		.map(|entry| {
+			let ImportEntry::Declaration { external_name, .. } =
+				&entry.inner.inner
+			else {
+				panic!("expected a declaration")
+			};
+			(
+				external_name.map(|span| span.extract_str(source)),
+				entry.inner.span.extract_str(source).split(':').next(),
+			)
+		})
+		.collect();
+	assert_eq!(
+		fields,
+		[
+			(Some(r#""Log""#), Some(r#""Log""#)),
+			(Some(r#""g""#), Some(r#""g""#)),
+			(Some(r#""mem""#), Some(r#""mem""#)),
+			(None, Some("func plain()")),
+		],
+		"an entry with a field name starts at it"
+	);
+}
+
+#[test]
+fn a_use_in_an_import_block_takes_no_host_field_name() {
+	let case = TestCase::new(r#"import "host" as host { "x": use super::y; }"#);
+	case.diagnostics().assert_error(DiagnosticCode::InvalidItem);
+}
+
+#[test]
 fn import_declarations_still_reject_visibility_qualifiers() {
 	let case = TestCase::new(
 		r#"import "host" as host { pub func send(); func next(); }"#,

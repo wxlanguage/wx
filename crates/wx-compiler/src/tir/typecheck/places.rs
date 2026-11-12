@@ -552,8 +552,11 @@ impl BodyBuilder<'_, '_> {
 			return None;
 		};
 		let decl = &self.sema.decls.structs[usize::from(struct_index)];
-		let struct_name =
-			self.builder.strings.resolve(decl.name.inner).unwrap();
+		let struct_name = self
+			.builder
+			.strings
+			.resolve(self.sema.decls.item(decl.loc).name.inner)
+			.unwrap();
 		let Some(&field) = decl.lookup.get(&member.inner) else {
 			self.sema.diagnostics.push(
 				Diagnostic::error()
@@ -583,7 +586,7 @@ impl BodyBuilder<'_, '_> {
 			Visibility::from(decl.field_pub_spans[usize::from(field)]);
 		if !self.sema.decls.namespaces.is_accessible_from(
 			self.scope.namespace,
-			decl.namespace.into(),
+			self.sema.decls.scope(decl.loc).into(),
 			visibility,
 		) {
 			self.sema.diagnostics.push(
@@ -925,8 +928,7 @@ impl BodyBuilder<'_, '_> {
 			// A global is a handle, not a location: it is written through
 			// `GlobalMut::set`, never with `=`.
 			ExprKind::Global(global) => {
-				let name =
-					self.sema.decls.globals[usize::from(global)].name.inner;
+				let name = self.sema.decls.name(global).inner;
 				let name = self.builder.strings.resolve(name).unwrap();
 				self.sema.diagnostics.push(
 					Diagnostic::error()

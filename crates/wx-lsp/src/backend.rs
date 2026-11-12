@@ -11,9 +11,14 @@ use tower_lsp_server::ls_types::{
 	DidOpenTextDocumentParams, DocumentFormattingParams, FileSystemWatcher,
 	GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
 	HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-	InitializedParams, Location, MessageType, OneOf, ReferenceParams,
-	Registration, ServerCapabilities, TextDocumentSyncCapability,
+	InitializedParams, Location, MessageType, OneOf, PrepareRenameResponse,
+	ReferenceParams, Registration, RenameOptions, RenameParams,
+	SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+	SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+	SemanticTokensServerCapabilities, ServerCapabilities,
+	TextDocumentPositionParams, TextDocumentSyncCapability,
 	TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri,
+	WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::vfs::{AbsolutePath, StdlibFileSource};
@@ -69,6 +74,15 @@ impl LanguageServer for Backend {
 			.collect();
 		self.state
 			.notify(Command::SetWorkspaceFolders(workspace_folders));
+		self.state.notify(Command::SetSemanticTokensRefresh(
+			params
+				.capabilities
+				.workspace
+				.as_ref()
+				.and_then(|workspace| workspace.semantic_tokens.as_ref())
+				.and_then(|tokens| tokens.refresh_support)
+				.unwrap_or(false),
+		));
 		self.supports_dynamic_registration.store(
 			params
 				.capabilities
@@ -94,7 +108,21 @@ impl LanguageServer for Backend {
 				hover_provider: Some(HoverProviderCapability::Simple(true)),
 				definition_provider: Some(OneOf::Left(true)),
 				references_provider: Some(OneOf::Left(true)),
+				rename_provider: Some(OneOf::Right(RenameOptions {
+					prepare_provider: Some(true),
+					work_done_progress_options: Default::default(),
+				})),
 				document_formatting_provider: Some(OneOf::Left(true)),
+				semantic_tokens_provider: Some(
+					SemanticTokensServerCapabilities::SemanticTokensOptions(
+						SemanticTokensOptions {
+							legend: crate::semantic_tokens::legend(),
+							full: Some(SemanticTokensFullOptions::Bool(true)),
+							range: Some(true),
+							..Default::default()
+						},
+					),
+				),
 				..Default::default()
 			},
 			..Default::default()
@@ -247,6 +275,48 @@ impl LanguageServer for Backend {
 			.flatten())
 	}
 
+	async fn prepare_rename(
+		&self,
+		params: TextDocumentPositionParams,
+	) -> Result<Option<PrepareRenameResponse>> {
+		self.state
+			.query(|reply| Command::PrepareRename(params, reply))
+			.await
+			.map_or(Ok(None), |answer| answer.map_err(request_failed))
+	}
+
+	async fn rename(
+		&self,
+		params: RenameParams,
+	) -> Result<Option<WorkspaceEdit>> {
+		self.state
+			.query(|reply| Command::Rename(params, reply))
+			.await
+			.map_or(Ok(None), |answer| answer.map_err(request_failed))
+	}
+
+	async fn semantic_tokens_full(
+		&self,
+		params: SemanticTokensParams,
+	) -> Result<Option<SemanticTokensResult>> {
+		Ok(self
+			.state
+			.query(|reply| Command::SemanticTokensFull(params, reply))
+			.await
+			.flatten())
+	}
+
+	async fn semantic_tokens_range(
+		&self,
+		params: SemanticTokensRangeParams,
+	) -> Result<Option<SemanticTokensRangeResult>> {
+		Ok(self
+			.state
+			.query(|reply| Command::SemanticTokensRange(params, reply))
+			.await
+			.flatten())
+	}
+
 	async fn formatting(
 		&self,
 		params: DocumentFormattingParams,
@@ -297,6 +367,16 @@ impl Backend {
 			.unwrap_or_else(|| {
 				"wx-lsp internal error: state actor unavailable".to_string()
 			}))
+	}
+}
+
+/// A request the server understood and refuses, with the reason shown to
+/// the user: LSP's `RequestFailed`.
+fn request_failed(message: String) -> JsonRpcError {
+	JsonRpcError {
+		code: tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32803),
+		message: message.into(),
+		data: None,
 	}
 }
 

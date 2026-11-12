@@ -29,14 +29,14 @@ pub(crate) fn signature(
 				let signature = &sema.constants[usize::from(index)];
 				Some(format!(
 					"const {}: {}",
-					renderer.name(constant.name),
+					renderer.name(sema.decls.item(constant.loc).name),
 					renderer.ty(signature.ty)
 				))
 			}
 			DeclKind::TypeAlias(index) => {
 				let alias = &sema.decls.type_aliases[usize::from(index)];
 				let signature = &sema.type_aliases[usize::from(index)];
-				let name = renderer.name(alias.name);
+				let name = renderer.name(sema.decls.item(alias.loc).name);
 				let target = renderer.ty(signature.target);
 				// A primitive is declared without a body and names
 				// itself, which `type i32 = i32` would read as a loop.
@@ -51,11 +51,17 @@ pub(crate) fn signature(
 			DeclKind::EnumVariant(index) => renderer.variant(index),
 			DeclKind::Trait(index) => {
 				let decl = &sema.decls.traits[usize::from(index)];
-				Some(format!("trait {}", renderer.name(decl.name)))
+				Some(format!(
+					"trait {}",
+					renderer.name(sema.decls.item(decl.loc).name)
+				))
 			}
 			DeclKind::TypeSet(index) => {
 				let decl = &sema.decls.typesets[usize::from(index)];
-				Some(format!("typeset {}", renderer.name(decl.name)))
+				Some(format!(
+					"typeset {}",
+					renderer.name(sema.decls.item(decl.loc).name)
+				))
 			}
 			DeclKind::Memory(index) => {
 				let decl = &sema.decls.memories[usize::from(index)];
@@ -65,7 +71,7 @@ pub(crate) fn signature(
 				.value?;
 				Some(format!(
 					"memory {}: {}",
-					renderer.name(decl.name),
+					renderer.name(sema.decls.item(decl.loc).name),
 					renderer.ty(size)
 				))
 			}
@@ -82,24 +88,25 @@ pub(crate) fn signature(
 				};
 				Some(format!(
 					"global {mutable}{}: {}",
-					renderer.name(decl.name),
+					renderer.name(sema.decls.item(decl.loc).name),
 					renderer.ty(value)
 				))
 			}
-			DeclKind::TraitAssocType(index) => {
-				Some(renderer.associated_type(index))
-			}
+			DeclKind::AssocType(index) => Some(renderer.associated_type(index)),
 			DeclKind::Import(index) => {
 				let decl = &sema.decls.imports[usize::from(index)];
 				Some(format!(
 					"import \"{}\" as {}",
 					renderer.name(decl.external_name),
-					renderer.name(decl.internal_name)
+					renderer.name(sema.decls.item(decl.loc).name)
 				))
 			}
 			DeclKind::Module(index) => {
 				let decl = &sema.decls.modules[usize::from(index)];
-				Some(format!("mod {}", renderer.name(decl.name)))
+				Some(format!(
+					"mod {}",
+					renderer.name(sema.decls.item(decl.loc).name)
+				))
 			}
 			DeclKind::PackageInstance(index) => {
 				let decl = &sema.decls.namespaces.package_instances()
@@ -107,7 +114,7 @@ pub(crate) fn signature(
 				Some(format!(
 					"package \"{}\" as {}",
 					renderer.name(decl.package_name),
-					renderer.name(decl.alias)
+					renderer.name(sema.decls.item(decl.loc).name)
 				))
 			}
 			_ => None,
@@ -129,7 +136,7 @@ pub(crate) fn signature(
 			let signature = &sema.constants[usize::from(index)];
 			Some(format!(
 				"const {}: {}",
-				renderer.name(constant.name),
+				renderer.name(sema.decls.item(constant.loc).name),
 				renderer.ty(signature.ty)
 			))
 		}
@@ -227,7 +234,7 @@ impl Renderer<'_> {
 			.collect();
 		let signature = format!(
 			"func {}{}({}) -> {}",
-			self.name(decl.name),
+			self.name(self.sema.decls.item(decl.loc).name),
 			self.type_params(self.sema.function_own_type_params(function)),
 			params.join(", "),
 			self.ty(signature.return_type)
@@ -243,7 +250,10 @@ impl Renderer<'_> {
 			MemberOwner::Free => None,
 			MemberOwner::Trait(index) => {
 				let decl = &self.sema.decls.traits[usize::from(index)];
-				Some(format!("trait {}", self.name(decl.name)))
+				Some(format!(
+					"trait {}",
+					self.name(self.sema.decls.item(decl.loc).name)
+				))
 			}
 			MemberOwner::InherentImpl(index) => {
 				let header =
@@ -262,7 +272,7 @@ impl Renderer<'_> {
 				Some(format!(
 					"impl{} {} for {}",
 					self.type_params(header.type_params),
-					self.name(decl.name),
+					self.name(self.sema.decls.item(decl.loc).name),
 					self.ty(header.target.inner),
 				))
 			}
@@ -283,7 +293,7 @@ impl Renderer<'_> {
 			.collect();
 		format!(
 			"struct {}{}({})",
-			self.name(decl.name),
+			self.name(self.sema.decls.item(decl.loc).name),
 			self.type_params(signature.type_params),
 			fields.join(", ")
 		)
@@ -294,14 +304,14 @@ impl Renderer<'_> {
 		let signature = &self.sema.enums[usize::from(index)];
 		format!(
 			"enum {}({}) {{ .. }}",
-			self.name(decl.name),
+			self.name(self.sema.decls.item(decl.loc).name),
 			self.ty(signature.repr)
 		)
 	}
 
 	fn associated_type(&self, index: AssocTypeIdx) -> String {
 		let decl = &self.sema.decls.assoc_types[usize::from(index)];
-		let name = self.name(decl.name);
+		let name = self.name(self.sema.decls.item(decl.loc).name);
 		match self.sema.assoc_types[usize::from(index)]
 			.as_ref()
 			.and_then(|signature| signature.value)
@@ -325,8 +335,8 @@ impl Renderer<'_> {
 		let value = integer(self.sema.constant_value(index)?)?;
 		Some(format!(
 			"{}::{} = {value}",
-			self.name(enum_decl.name),
-			self.name(variant.name),
+			self.name(self.sema.decls.item(enum_decl.loc).name),
+			self.name(self.sema.decls.item(variant.loc).name),
 		))
 	}
 

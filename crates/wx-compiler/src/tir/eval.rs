@@ -324,15 +324,15 @@ fn body_env(sema: &Semantics, owner: Owner<'_>) -> GenericEnvIdx {
 /// The file `owner`'s body is written in.
 fn body_file(sema: &Semantics, owner: Owner<'_>) -> crate::vfs::FileId {
 	match owner.body {
-		Evaluated::Constant(const_index) => {
-			sema.decls.constants[usize::from(const_index)].file_id
-		}
-		Evaluated::Global(global_index) => {
-			sema.decls.globals[usize::from(global_index)].file_id
-		}
-		Evaluated::Function(function_index) => {
-			sema.decls.functions[usize::from(function_index)].file_id
-		}
+		Evaluated::Constant(const_index) => sema
+			.decls
+			.file_id(sema.decls.constants[usize::from(const_index)].loc),
+		Evaluated::Global(global_index) => sema
+			.decls
+			.file_id(sema.decls.globals[usize::from(global_index)].loc),
+		Evaluated::Function(function_index) => sema
+			.decls
+			.file_id(sema.decls.functions[usize::from(function_index)].loc),
 	}
 }
 
@@ -515,8 +515,10 @@ impl Semantics {
 		error: &EvalError,
 	) -> Diagnostic<crate::vfs::FileId> {
 		let decl = &self.decls.globals[usize::from(global_index)];
-		let name = strings.resolve(decl.name.inner).unwrap_or("?");
-		let site = SourceSpan::new(decl.file_id, error.span);
+		let name = strings
+			.resolve(self.decls.item(decl.loc).name.inner)
+			.unwrap_or("?");
+		let site = SourceSpan::new(self.decls.file_id(decl.loc), error.span);
 		let (code, message) = match error.kind {
 			EvalErrorKind::NotConst => (
 				DiagnosticCode::NonConstantGlobalInitializer,
@@ -644,7 +646,10 @@ impl Semantics {
 		enum_index: EnumIdx,
 	) {
 		let enum_decl = &self.decls.enums[usize::from(enum_index)];
-		let (file_id, name_span) = (enum_decl.file_id, enum_decl.name.span);
+		let (file_id, name_span) = (
+			self.decls.file_id(enum_decl.loc),
+			self.decls.item(enum_decl.loc).name.span,
+		);
 		let (run, open) = (enum_decl.variants.clone(), enum_decl.open);
 		let mut values = Vec::new();
 		for variant in u32::from(run.start)..u32::from(run.end) {
@@ -748,7 +753,7 @@ impl Semantics {
 		used_at: Option<SourceSpan>,
 	) -> Diagnostic<crate::vfs::FileId> {
 		let decl = &self.decls.constants[usize::from(instance.constant)];
-		let site = SourceSpan::new(decl.file_id, error.span);
+		let site = SourceSpan::new(self.decls.file_id(decl.loc), error.span);
 		let name = self.instance_name(strings, instance);
 		let message = match error.kind {
 			EvalErrorKind::NotConst => {
@@ -781,15 +786,14 @@ impl Semantics {
 				"cycle detected when evaluating constant `{}`",
 				self.instance_name(strings, cycle[0])
 			))
-			.with_label(
-				SourceSpan::new(decl.file_id, decl.name.span).primary_label(),
-			);
+			.with_label(self.decls.declaration_span(decl.loc).primary_label());
 		for (at, &member) in cycle.iter().enumerate() {
 			let next = cycle[(at + 1) % cycle.len()];
 			let member_decl =
 				&self.decls.constants[usize::from(member.constant)];
 			diagnostic = diagnostic.with_label(
-				SourceSpan::new(member_decl.file_id, member_decl.name.span)
+				self.decls
+					.declaration_span(member_decl.loc)
 					.secondary_label()
 					.with_message(format!(
 						"`{}` requires evaluating `{}`",
@@ -2870,7 +2874,7 @@ mod tests {
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &[segment], tier)
-			.decl_key()
+			.loc()
 			.unwrap_or_else(|| panic!("expected `{name}` to resolve"))
 			.symbol_kind(&self.sema.decls)
 		}

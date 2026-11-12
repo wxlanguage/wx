@@ -46,7 +46,7 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::index::index_newtype;
 use crate::vfs::FileId;
 
-use super::decls::{DeclId, DeclKind, Declarations, TraitIdx};
+use super::decls::{DeclKind, Declarations, SignatureQuery, TraitIdx};
 use super::members::{ConstantTarget, TypeProjectionTarget};
 use super::signatures::{
 	AssocTypeSignature, QueryInfo, Semantics, SemanticsBuilder,
@@ -553,10 +553,10 @@ impl BoundArena {
 impl Semantics {
 	/// The declaration whose signature holds `trait_index`'s: its typeset's
 	/// for a trait a typeset generates.
-	pub(super) fn trait_decl_id(&self, trait_index: TraitIdx) -> DeclId {
+	pub(super) fn trait_query(&self, trait_index: TraitIdx) -> SignatureQuery {
 		match self.decls.traits[usize::from(trait_index)].typeset {
-			Some(typeset_index) => DeclId::Typeset(typeset_index),
-			None => DeclId::Trait(trait_index),
+			Some(typeset_index) => SignatureQuery::Typeset(typeset_index),
+			None => SignatureQuery::Trait(trait_index),
 		}
 	}
 
@@ -1260,7 +1260,7 @@ fn report_conflicting_assoc_type_binding(
 		unreachable!("conflict points to a source equality")
 	};
 	let subject_str = strings.resolve(subject).unwrap();
-	let trait_name = decls.traits[usize::from(target.trait_index)].name.inner;
+	let trait_name = decls.name(target.trait_index).inner;
 	let trait_str = strings.resolve(trait_name).unwrap();
 	let assoc_str = strings.resolve(first.name.inner).unwrap();
 	Diagnostic::error()
@@ -1334,11 +1334,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 		trait_index: TraitIdx,
 		reference: SourceSpan,
 	) -> Option<GenericEnvIdx> {
-		let decl_id = sema.trait_decl_id(trait_index);
+		let query = sema.trait_query(trait_index);
 		match self.ensure_signature(
 			sema,
 			QueryInfo {
-				decl_id,
+				query,
 				requested_at: Some(reference),
 			},
 		) {
@@ -1346,9 +1346,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				Some(sema.traits[usize::from(trait_index)].env)
 			}
 			SignatureStatus::Cycle => {
-				let diagnostic = self.report_cyclic_implied_trait_bounds(
-					sema, decl_id, reference,
-				);
+				let diagnostic = self
+					.report_cyclic_implied_trait_bounds(sema, query, reference);
 				sema.diagnostics.push(diagnostic);
 				None
 			}

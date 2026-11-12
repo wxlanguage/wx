@@ -238,10 +238,7 @@ impl BodyContext<'_> {
 		let Ctor::Value(bits) = *ctor else {
 			return match *self.sema.types.resolve(ty) {
 				Type::Struct { struct_index, .. } => {
-					let name = self.sema.decls.structs
-						[usize::from(struct_index)]
-					.name
-					.inner;
+					let name = self.sema.decls.name(struct_index).inner;
 					let name = self.strings.resolve(name).unwrap();
 					format!("{name}({})", fields.join(", "))
 				}
@@ -257,13 +254,14 @@ impl BodyContext<'_> {
 		}
 		if let Type::Enum { enum_index } = *self.sema.types.resolve(ty) {
 			let decl = &self.sema.decls.enums[usize::from(enum_index)];
-			let (enum_name, variants) =
-				(decl.name.inner, decl.variants.clone());
+			let (enum_name, variants) = (
+				self.sema.decls.item(decl.loc).name.inner,
+				decl.variants.clone(),
+			);
 			for at in u32::from(variants.start)..u32::from(variants.end) {
 				let constant = ConstIdx::new(at);
 				if self.pattern_bits(constant) == Some(bits) {
-					let variant =
-						self.sema.decls.constants[at as usize].name.inner;
+					let variant = self.sema.decls.name(constant).inner;
 					return format!(
 						"{}::{}",
 						self.strings.resolve(enum_name).unwrap(),

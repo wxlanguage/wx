@@ -29,14 +29,17 @@
 use std::collections::BTreeMap;
 
 use super::body::{BodyOwner, LabelIdx, LocalIdx, ParamIdx};
+use super::decls::Declared;
 use super::decls::{
-	ConstIdx, DeclKey, DeclKind, FieldIdx, FunctionIdx, GlobalIdx,
-	InherentImplIdx, MemberKind, StructIdx, Tier, TraitImplIdx, UseItemIndex,
+	BindingKey, ConstIdx, DeclKind, FieldIdx, FunctionIdx, GlobalIdx,
+	InherentImplIdx, ItemLoc, MemberKind, PackageMemberItem, StructIdx, Tier,
+	TraitImplIdx, UseItemIndex,
 };
 use super::signatures::Semantics;
 use super::types::{GenericEnvIdx, GenericEnvOwner};
 use crate::diagnostics::{SourceSpan, TextSpan};
 use crate::vfs::FileId;
+use string_interner::symbol::SymbolU32;
 
 /// Where a name is written, and the role it plays there; see the module doc.
 /// Entries order by position first, so what is written at one place is
@@ -148,7 +151,7 @@ impl NameResolutions {
 pub enum Reference {
 	/// A declaration in the namespace the name was looked up in: an item, a
 	/// module, a package or an import block.
-	Item { item: DeclKey, route: Route },
+	Item { item: ItemLoc, route: Route },
 	/// A local, a parameter included, of the body `owner`.
 	Local {
 		owner: BodyOwner,
@@ -213,7 +216,7 @@ pub enum AccessKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum Definition {
-	Item(DeclKey),
+	Item(ItemLoc),
 	Local {
 		owner: BodyOwner,
 		local: LocalIdx,
@@ -246,7 +249,7 @@ impl Reference {
 	/// What a namespace lookup found: `import` is the `use` item it came
 	/// through, as `BindingLookup::Found` reports it.
 	pub(super) fn from_lookup(
-		declaration: DeclKey,
+		declaration: ItemLoc,
 		import: Option<UseItemIndex>,
 	) -> Self {
 		Self::Item {
@@ -313,6 +316,40 @@ impl Semantics {
 		found
 	}
 
+	/// Every resolved meaning of the name written at exactly `span`: one per
+	/// role it plays there (a shorthand argument is a label and a value).
+	pub fn references_at(
+		&self,
+		span: SourceSpan,
+	) -> impl Iterator<Item = Reference> + '_ {
+		self.resolutions
+			.by_site
+			.range(Site::Type(span)..=Site::Label(span))
+			.map(|(_, &reference)| reference)
+	}
+
+	/// Whether `a` and `b` name the same declaration, as `references_to`
+	/// compares them: a parameter and the local it binds, a trait member
+	/// reached as an item and through a type, are one.
+	pub fn same_definition(&self, a: Definition, b: Definition) -> bool {
+		self.reference_identity(a) == self.reference_identity(b)
+	}
+
+	/// Whether the name `name` written at `span` is an entry of the export
+	/// block with no `as "..."`, so its Wasm export name is its own name.
+	pub fn exported_under_own_name(
+		&self,
+		name: SymbolU32,
+		span: SourceSpan,
+	) -> bool {
+		// An entry's external span is its name's own when it has no alias,
+		// and the quoted string's when it has one.
+		self.decls
+			.exports
+			.get(&name)
+			.is_some_and(|entry| entry.external_span == span)
+	}
+
 	/// Different ways of naming the same declaration, not declarations that
 	/// merely navigate to the same span (a trait and its `Self`, for example).
 	fn reference_identity(&self, definition: Definition) -> Definition {
@@ -324,7 +361,7 @@ impl Semantics {
 				DeclKind::Const(index) | DeclKind::EnumVariant(index) => {
 					Definition::Member(MemberKind::Constant(index))
 				}
-				DeclKind::TraitAssocType(index) => {
+				DeclKind::AssocType(index) => {
 					Definition::Member(MemberKind::AssociatedType(index))
 				}
 				_ => definition,
@@ -393,6 +430,41 @@ impl Semantics {
 		found.map(|(span, _, reference)| (span, reference))
 	}
 
+	/// Every resolved name written in `file`, in source order, one per name:
+	/// where a name holds several entries, the one `symbol_at` would answer
+	/// (the value, then the type, then the label). Zero-width synthetic
+	/// spans are skipped, since nothing is written there.
+	pub fn resolutions_in(
+		&self,
+		file: FileId,
+	) -> impl Iterator<Item = (SourceSpan, Reference)> + '_ {
+		// The least site of `file`: the empty span at its start, first role.
+		let start =
+			Site::Type(SourceSpan::new(file, TextSpan { start: 0, end: 0 }));
+		let mut entries = self
+			.resolutions
+			.by_site
+			.range(start..)
+			.take_while(move |(site, _)| site.span().file_id == file)
+			.filter(|(site, _)| {
+				let span = site.span().span;
+				span.start != span.end
+			})
+			.peekable();
+		std::iter::from_fn(move || {
+			let (&site, &reference) = entries.next()?;
+			let mut found = (site, reference);
+			while let Some((&next, &reference)) =
+				entries.next_if(|(next, _)| next.span() == site.span())
+			{
+				if next.priority() > found.0.priority() {
+					found = (next, reference);
+				}
+			}
+			Some((found.0.span(), found.1))
+		})
+	}
+
 	/// Where the definition of the name written at `offset` in `file` is
 	/// declared: the declaring name's span (a module's or an import block's
 	/// content, for those). `None` when no resolved name is written there, or
@@ -406,9 +478,45 @@ impl Semantics {
 		self.definition_target(reference.definition())
 	}
 
-	/// What kind of declaration `key` names.
-	pub fn declaration_kind(&self, key: DeclKey) -> DeclKind {
-		key.symbol_kind(&self.decls)
+	/// Whether the compiler provides `definition`, with no wx definition
+	/// behind it: a function std leaves to the compiler (a package function
+	/// of std's, as `transmute` or an intrinsic, and `Slice`'s bodiless
+	/// `len` and `as_ref`), a primitive type or a literal kind. A function
+	/// std writes a body for is an ordinary function, even when that body
+	/// calls one of these.
+	pub fn is_compiler_provided(&self, definition: Definition) -> bool {
+		let decls = &self.decls;
+		let function = match definition {
+			Definition::Item(key) => match self.declaration_kind(key) {
+				DeclKind::Function(function) => function,
+				DeclKind::TypeAlias(alias) => {
+					return decls.intrinsics.is_builtin_type(alias);
+				}
+				_ => return false,
+			},
+			Definition::Member(
+				MemberKind::Function(function) | MemberKind::Method(function),
+			) => function,
+			_ => return false,
+		};
+		// Only a package function enters a contract, so std's entry under
+		// this function's name being this function makes it one.
+		let name = BindingKey::value(decls.name(function).inner);
+		let package_function = decls.package_contracts
+			[decls.stdlib_package.as_usize()]
+		.members
+		.get(&name)
+		.is_some_and(|member| {
+			member.item == PackageMemberItem::Function(function)
+		});
+		package_function
+			|| [decls.intrinsics.slice_len, decls.intrinsics.slice_as_ref]
+				.contains(&Some(function))
+	}
+
+	/// What kind of declaration `loc` names.
+	pub fn declaration_kind(&self, loc: ItemLoc) -> DeclKind {
+		loc.symbol_kind(&self.decls)
 	}
 
 	/// Where go-to-definition leads for `definition`: where it is declared,
@@ -422,7 +530,7 @@ impl Semantics {
 			&& let DeclKind::Module(index) = self.declaration_kind(key)
 		{
 			let module = &self.decls.modules[usize::from(index)];
-			if module.own_file != module.declaration_file {
+			if module.own_file != self.decls.file_id(module.loc) {
 				return Some(SourceSpan::new(
 					module.own_file,
 					TextSpan { start: 0, end: 0 },
@@ -448,22 +556,7 @@ impl Semantics {
 				Some(SourceSpan::new(file, name.span))
 			}
 			Definition::Member(kind) => {
-				let (file, name) = match kind {
-					MemberKind::Function(function)
-					| MemberKind::Method(function) => {
-						let function = &decls.functions[usize::from(function)];
-						(function.file_id, function.name)
-					}
-					MemberKind::Constant(constant) => {
-						let constant = &decls.constants[usize::from(constant)];
-						(constant.file_id, constant.name)
-					}
-					MemberKind::AssociatedType(assoc) => {
-						let assoc = &decls.assoc_types[usize::from(assoc)];
-						(assoc.file_id, assoc.name)
-					}
-				};
-				Some(SourceSpan::new(file, name.span))
+				Some(decls.declaration_span(kind.loc(decls)))
 			}
 			Definition::Label { owner, label } => {
 				let body = self.owner_body(owner)?;
@@ -500,14 +593,16 @@ impl Semantics {
 				let function = &decls.functions[usize::from(function)];
 				let name =
 					function.params.get(usize::from(parameter))?.as_ref()?;
-				Some(SourceSpan::new(function.file_id, name.span))
+				Some(SourceSpan::new(decls.file_id(function.loc), name.span))
 			}
 		}
 	}
 
 	/// Every declared name that has a written name, with where it is written.
-	/// A synthetic associated type's name span is empty, so it is skipped;
-	/// where two still share a span (a trait and its `Self`), the item wins.
+	/// A declaration is its row, a member's included; a generated one's name
+	/// span is empty (a package's own entry, a typeset's trait, a generated
+	/// impl's associated types), so it is skipped. Where two still share a
+	/// span (a trait and its `Self`), the item wins.
 	pub fn definitions(&self) -> BTreeMap<SourceSpan, Definition> {
 		let decls = &self.decls;
 		let mut found = BTreeMap::new();
@@ -518,16 +613,6 @@ impl Semantics {
 				found.insert(span, definition);
 			}
 		};
-		for member in decls.traits.iter().flat_map(|decl| &decl.members) {
-			add(Definition::Member(member.kind));
-		}
-		for member in decls.trait_impls.iter().flat_map(|decl| &decl.members) {
-			add(Definition::Member(member.kind));
-		}
-		for member in decls.inherent_impls.iter().flat_map(|decl| &decl.members)
-		{
-			add(Definition::Member(member.kind));
-		}
 		for (index, decl) in decls.structs.iter().enumerate() {
 			let owner = StructIdx::new(index as u32);
 			for field in 0..decl.field_names.len() {
@@ -569,9 +654,7 @@ impl Semantics {
 			self.add_body_definitions(owner, &mut add);
 		}
 		for key in decls.namespaces.keys() {
-			if !matches!(self.declaration_kind(key), DeclKind::Package(_)) {
-				add(Definition::Item(key));
-			}
+			add(Definition::Item(key));
 		}
 		found
 	}
@@ -605,7 +688,7 @@ impl Semantics {
 	) -> Option<SourceSpan> {
 		let decl = &self.decls.structs[usize::from(owner)];
 		let name = decl.field_names.get(usize::from(field))?.as_ref()?;
-		Some(SourceSpan::new(decl.file_id, name.span))
+		Some(SourceSpan::new(self.decls.file_id(decl.loc), name.span))
 	}
 
 	/// The checked body of `owner`, if it has one.
@@ -624,15 +707,15 @@ impl Semantics {
 
 	fn owner_file(&self, owner: BodyOwner) -> FileId {
 		match owner {
-			BodyOwner::Const(index) => {
-				self.decls.constants[usize::from(index)].file_id
-			}
-			BodyOwner::Function(index) => {
-				self.decls.functions[usize::from(index)].file_id
-			}
-			BodyOwner::Global(index) => {
-				self.decls.globals[usize::from(index)].file_id
-			}
+			BodyOwner::Const(index) => self
+				.decls
+				.file_id(self.decls.constants[usize::from(index)].loc),
+			BodyOwner::Function(index) => self
+				.decls
+				.file_id(self.decls.functions[usize::from(index)].loc),
+			BodyOwner::Global(index) => self
+				.decls
+				.file_id(self.decls.globals[usize::from(index)].loc),
 		}
 	}
 
@@ -640,22 +723,22 @@ impl Semantics {
 		let decls = &self.decls;
 		match owner {
 			GenericEnvOwner::Constant(index) => {
-				decls.constants[usize::from(index)].file_id
+				decls.file_id(decls.constants[usize::from(index)].loc)
 			}
 			GenericEnvOwner::Enum(index) => {
-				decls.enums[usize::from(index)].file_id
+				decls.file_id(decls.enums[usize::from(index)].loc)
 			}
 			GenericEnvOwner::Struct(index) => {
-				decls.structs[usize::from(index)].file_id
+				decls.file_id(decls.structs[usize::from(index)].loc)
 			}
 			GenericEnvOwner::Function(index) => {
-				decls.functions[usize::from(index)].file_id
+				decls.file_id(decls.functions[usize::from(index)].loc)
 			}
 			GenericEnvOwner::Trait(index) => {
-				decls.traits[usize::from(index)].file_id
+				decls.file_id(decls.traits[usize::from(index)].loc)
 			}
 			GenericEnvOwner::TypeAlias(index) => {
-				decls.type_aliases[usize::from(index)].file_id
+				decls.file_id(decls.type_aliases[usize::from(index)].loc)
 			}
 			GenericEnvOwner::InherentImpl(index) => {
 				decls.inherent_impls[usize::from(index)].file_id
@@ -800,7 +883,7 @@ mod tests {
 			self.declaration(path, tier).symbol_kind(&self.sema.decls)
 		}
 
-		fn declaration(&self, path: &str, tier: Tier) -> DeclKey {
+		fn declaration(&self, path: &str, tier: Tier) -> ItemLoc {
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
 				.map(|name| ast::PathSegment {
@@ -828,7 +911,7 @@ mod tests {
 			);
 			assert!(diagnostics.is_empty(), "{diagnostics:?}");
 			target
-				.decl_key()
+				.loc()
 				.unwrap_or_else(|| panic!("expected `{path}` to resolve"))
 		}
 
@@ -2249,6 +2332,108 @@ mod tests {
 				.definition_at(analysis.file, source.len() as u32 + 5),
 			None
 		);
+	}
+
+	#[test]
+	fn references_at_lists_every_role_of_one_name() {
+		let a = Analysis::clean(indoc! {"
+			func take(x: u32) {}
+			func f(x: u32) {
+				take({ x });
+			}
+		"});
+		let span = SourceSpan::new(a.file, a.span("{ x }", "x"));
+		let found: Vec<_> = a.sema.references_at(span).collect();
+		// The parameter it labels, and the local it supplies.
+		assert_eq!(found.len(), 2, "{found:?}");
+		assert!(found.contains(&a.label("{ x }", "x")));
+		assert!(found.contains(&a.value("{ x }", "x")));
+		// A parameter named by a label is the local it binds.
+		assert!(
+			a.sema.same_definition(
+				a.label("{ x }", "x").definition(),
+				Reference::Local {
+					owner: BodyOwner::Function(a.function_index("take")),
+					local: LocalIdx::new(0),
+					access: AccessKind::Read,
+				}
+				.definition(),
+			)
+		);
+	}
+
+	#[test]
+	fn an_export_entry_without_as_is_exported_under_its_own_name() {
+		let a = Analysis::clean(indoc! {"
+			func run() {}
+			func tick() {}
+			export { run, tick as \"step\" }
+		"});
+		let at = |context: &str, name: &str| {
+			SourceSpan::new(a.file, a.span(context, name))
+		};
+		let symbol = |name: &str| a.strings.get(name).unwrap();
+		assert!(
+			a.sema
+				.exported_under_own_name(symbol("run"), at("{ run,", "run"))
+		);
+		// Exported under the alias, so not under its own name.
+		assert!(
+			!a.sema
+				.exported_under_own_name(symbol("tick"), at("tick as", "tick"))
+		);
+		// The declaration is no export entry.
+		assert!(
+			!a.sema
+				.exported_under_own_name(symbol("run"), at("func run", "run"))
+		);
+	}
+
+	#[test]
+	fn only_what_std_leaves_to_the_compiler_is_compiler_provided() {
+		let a = Analysis::clean("func f() {}");
+		let item = |path| Definition::Item(a.declaration(path, Tier::Value));
+		let ty = |path| Definition::Item(a.declaration(path, Tier::Type));
+		// A package function of std's is supplied by the compiler; a std
+		// function with a body, even one calling it, is an ordinary one.
+		assert!(a.sema.is_compiler_provided(item("transmute")));
+		assert!(!a.sema.is_compiler_provided(item("slice_from_parts")));
+		// Primitives and literal kinds are bodiless; `Char` is a struct std
+		// writes.
+		assert!(a.sema.is_compiler_provided(ty("u32")));
+		assert!(a.sema.is_compiler_provided(ty("integer")));
+		assert!(!a.sema.is_compiler_provided(ty("Char")));
+		// `Slice::len` is a bodiless trait function lowering expands.
+		let len = a.sema.decls.intrinsics.slice_len.unwrap();
+		assert!(a.sema.is_compiler_provided(Definition::Member(
+			MemberKind::Function(len)
+		)));
+		// The user's own function is not.
+		assert!(!a.sema.is_compiler_provided(item("f")));
+	}
+
+	#[test]
+	fn resolutions_in_lists_one_entry_per_name_in_source_order() {
+		let a = Analysis::clean(indoc! {"
+			func take(x: u32) {}
+			func f(x: u32) {
+				take({ x });
+			}
+		"});
+		let found: Vec<_> = a.sema.resolutions_in(a.file).collect();
+		let spans: Vec<_> = found.iter().map(|(span, _)| span.span).collect();
+		let mut sorted = spans.clone();
+		sorted.sort();
+		sorted.dedup();
+		assert_eq!(spans, sorted, "ordered, without a repeated name");
+		// The shorthand is a label and a value at one name; the value wins.
+		let shorthand = a.span("{ x }", "x");
+		let at_shorthand: Vec<_> = found
+			.iter()
+			.filter(|(span, _)| span.span == shorthand)
+			.map(|&(_, reference)| reference)
+			.collect();
+		assert_eq!(at_shorthand, [a.value("{ x }", "x")]);
 	}
 
 	#[test]

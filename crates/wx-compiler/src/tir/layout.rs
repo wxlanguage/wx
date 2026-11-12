@@ -675,11 +675,10 @@ mod tests {
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &[segment], Tier::Value);
-			let decl_key = target.decl_key().unwrap_or_else(|| {
+			let loc = target.loc().unwrap_or_else(|| {
 				panic!("expected `{name}` to resolve: {scratch:?}")
 			});
-			let DeclKind::Function(index) =
-				decl_key.symbol_kind(&self.sema.decls)
+			let DeclKind::Function(index) = loc.symbol_kind(&self.sema.decls)
 			else {
 				panic!("expected `{name}` to be a function");
 			};

@@ -12,21 +12,24 @@ use tokio::sync::{mpsc, oneshot};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
 	Diagnostic, DocumentFormattingParams, GotoDefinitionParams,
-	GotoDefinitionResponse, Hover, HoverParams, Location, ReferenceParams,
-	TextEdit, Uri,
+	GotoDefinitionResponse, Hover, HoverParams, Location,
+	PrepareRenameResponse, ReferenceParams, RenameParams, SemanticTokensParams,
+	SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+	TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
 };
 
 use crate::convert::path_to_file_uri;
 use crate::documents::OpenDocument;
-use crate::requests;
 use crate::state::{
 	ServerState, compute_active_refresh, compute_refresh,
 	refresh_project_manifest,
 };
 use crate::trace::{Trace, flush_logs};
+use crate::{rename, requests};
 
 pub(crate) enum Command {
 	SetWorkspaceFolders(Vec<PathBuf>),
+	SetSemanticTokensRefresh(bool),
 	DidChangeWatchedFiles(Vec<PathBuf>),
 	DidOpen {
 		path: PathBuf,
@@ -47,6 +50,22 @@ pub(crate) enum Command {
 	),
 	Hover(HoverParams, oneshot::Sender<Option<Hover>>),
 	References(ReferenceParams, oneshot::Sender<Option<Vec<Location>>>),
+	PrepareRename(
+		TextDocumentPositionParams,
+		oneshot::Sender<Result<Option<PrepareRenameResponse>, String>>,
+	),
+	Rename(
+		RenameParams,
+		oneshot::Sender<Result<Option<WorkspaceEdit>, String>>,
+	),
+	SemanticTokensFull(
+		SemanticTokensParams,
+		oneshot::Sender<Option<SemanticTokensResult>>,
+	),
+	SemanticTokensRange(
+		SemanticTokensRangeParams,
+		oneshot::Sender<Option<SemanticTokensRangeResult>>,
+	),
 	Formatting(
 		DocumentFormattingParams,
 		oneshot::Sender<Option<Vec<TextEdit>>>,
@@ -101,6 +120,9 @@ pub(crate) async fn handle_command(
 		Command::SetWorkspaceFolders(folders) => {
 			state.workspace_folders = folders;
 		}
+		Command::SetSemanticTokensRefresh(supported) => {
+			state.semantic_tokens_refresh = supported;
+		}
 		Command::DidChangeWatchedFiles(paths) => {
 			// A disk event for a file the editor has open carries no
 			// information: the overlay answers from the buffer whatever the
@@ -126,6 +148,7 @@ pub(crate) async fn handle_command(
 			));
 			flush_logs(client, logs).await;
 			publish(client, state, publications).await;
+			refresh_semantic_tokens(client, state);
 		}
 		Command::DidOpen {
 			path,
@@ -144,6 +167,7 @@ pub(crate) async fn handle_command(
 			let publications = compute_refresh(state, &path, &mut logs);
 			flush_logs(client, logs).await;
 			publish(client, state, publications).await;
+			refresh_semantic_tokens(client, state);
 		}
 		Command::DidClose { path } => {
 			state.open_documents.remove(&path);
@@ -151,6 +175,7 @@ pub(crate) async fn handle_command(
 			let publications = compute_refresh(state, &path, &mut logs);
 			flush_logs(client, logs).await;
 			publish(client, state, publications).await;
+			refresh_semantic_tokens(client, state);
 		}
 		Command::GotoDefinition(params, reply) => {
 			let _ = reply.send(requests::goto_definition(state, &params));
@@ -160,6 +185,18 @@ pub(crate) async fn handle_command(
 		}
 		Command::References(params, reply) => {
 			let _ = reply.send(requests::references(state, &params));
+		}
+		Command::PrepareRename(params, reply) => {
+			let _ = reply.send(rename::prepare(state, &params));
+		}
+		Command::Rename(params, reply) => {
+			let _ = reply.send(rename::rename(state, &params));
+		}
+		Command::SemanticTokensFull(params, reply) => {
+			let _ = reply.send(requests::semantic_tokens_full(state, &params));
+		}
+		Command::SemanticTokensRange(params, reply) => {
+			let _ = reply.send(requests::semantic_tokens_range(state, &params));
 		}
 		Command::Formatting(params, reply) => {
 			let mut trace = Trace::new(PathBuf::from(
@@ -174,6 +211,19 @@ pub(crate) async fn handle_command(
 			let _ = reply
 				.send(requests::render_full_diagnostic(state, &uri, index));
 		}
+	}
+}
+
+/// Asks the client to re-request the semantic tokens of every open file,
+/// after a rebuild: an edit to one file can change what names in another
+/// mean, and the client asks again on its own only for the edited one.
+/// Spawned, so the actor does not wait for the client's answer.
+fn refresh_semantic_tokens(client: &Client, state: &ServerState) {
+	if state.semantic_tokens_refresh {
+		let client = client.clone();
+		crate::task::spawn(async move {
+			let _ = client.semantic_tokens_refresh().await;
+		});
 	}
 }
 

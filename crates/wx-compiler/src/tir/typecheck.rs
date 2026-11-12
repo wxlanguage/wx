@@ -46,7 +46,7 @@ use super::body::{
 };
 use super::bounds::AssumptionEnvIdx;
 use super::decls::{
-	BindingTarget, ConstIdx, DeclKey, DeclKind, FunctionIdx, MemberKind,
+	BindingTarget, ConstIdx, DeclKind, FunctionIdx, ItemLoc, MemberKind,
 	StructIdx, Tier, Visibility,
 };
 use super::imports::report_private_identifier;
@@ -1054,7 +1054,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			}
 			Err(error) => return error,
 		};
-		let Some(key) = walk.target.decl_key() else {
+		let Some(key) = walk.target.loc() else {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		let kind = key.symbol_kind(&self.sema.decls);
@@ -1085,8 +1085,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.body.push(kind, ty, span)
 			}
 			DeclKind::Struct(struct_index) => {
-				let name =
-					self.sema.decls.structs[usize::from(struct_index)].name;
+				let name = self.sema.decls.name(struct_index);
 				self.report_struct_used_as_value(name.inner, span);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
@@ -1154,7 +1153,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			segments,
 			Tier::Value,
 		);
-		let Some(key) = walk.target.decl_key() else {
+		let Some(key) = walk.target.loc() else {
 			return Ok(ValuePath::Item(walk));
 		};
 		if walk.is_complete(segments) {
@@ -1316,7 +1315,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				return error;
 			}
 		};
-		let Some(key) = walk.target.decl_key() else {
+		let Some(key) = walk.target.loc() else {
 			self.build_unchecked_arguments(arguments);
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
@@ -1705,7 +1704,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		decl.field_pub_spans.iter().all(|&pub_span| {
 			self.sema.decls.namespaces.is_accessible_from(
 				self.scope.namespace,
-				decl.namespace.into(),
+				self.sema.decls.scope(decl.loc).into(),
 				Visibility::from(pub_span),
 			)
 		})
@@ -1747,12 +1746,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	fn report_private_constructor(
 		&self,
 		struct_index: StructIdx,
-		key: Option<DeclKey>,
+		key: Option<ItemLoc>,
 		segment: &ast::PathSegment,
 	) -> Diagnostic<FileId> {
 		let decl = &self.sema.decls.structs[usize::from(struct_index)];
 		let strings = &*self.builder.strings;
-		let name = strings.resolve(decl.name.inner).unwrap();
+		let name = strings
+			.resolve(self.sema.decls.item(decl.loc).name.inner)
+			.unwrap();
 		let private: Vec<String> = decl
 			.field_names
 			.iter()
@@ -1791,9 +1792,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				&& let Some(field_name) = name
 			{
 				diagnostic = diagnostic.with_label(
-					SourceSpan::new(decl.file_id, field_name.span)
-						.secondary_label()
-						.with_message("private field"),
+					SourceSpan::new(
+						self.sema.decls.file_id(decl.loc),
+						field_name.span,
+					)
+					.secondary_label()
+					.with_message("private field"),
 				);
 			}
 		}
@@ -2203,10 +2207,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			let label = Label::primary(self.scope.file_id, operand_span);
 			let (message, label) = match method {
 				Some(method) => {
-					let name = self.sema.decls.traits
-						[usize::from(method.trait_index)]
-					.name
-					.inner;
+					let name = self.sema.decls.name(method.trait_index).inner;
 					let name = self.builder.strings.resolve(name).unwrap();
 					(
 						format!(
@@ -3094,7 +3095,7 @@ mod tests {
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &segments, Tier::Value)
-			.decl_key()
+			.loc()
 			.unwrap_or_else(|| panic!("expected `{name}` to resolve"))
 			.symbol_kind(&self.sema.decls)
 		}
@@ -3118,7 +3119,7 @@ mod tests {
 			let mut found =
 				self.sema.decls.functions.iter().enumerate().filter(
 					|&(index, function)| {
-						function.name.inner == symbol
+						self.sema.decls.item(function.loc).name.inner == symbol
 							&& !matches!(function.owner, MemberOwner::Free)
 							&& self.sema.function_implementations[index]
 								.body()
@@ -3234,19 +3235,16 @@ mod tests {
 					"(abstract {})",
 					self.constant_name(constant, type_args)
 				),
-				ExprKind::NextDiscriminant(index) => name(
-					self.sema.decls.constants[usize::from(index)].name.inner,
-				)
-				.to_string(),
+				ExprKind::NextDiscriminant(index) => {
+					name(self.sema.decls.name(index).inner).to_string()
+				}
 				ExprKind::Local(local) => self.local_name(body, local),
 				ExprKind::Global(index) => {
-					name(self.sema.decls.globals[usize::from(index)].name.inner)
-						.to_string()
+					name(self.sema.decls.name(index).inner).to_string()
 				}
-				ExprKind::Memory(index) => name(
-					self.sema.decls.memories[usize::from(index)].name.inner,
-				)
-				.to_string(),
+				ExprKind::Memory(index) => {
+					name(self.sema.decls.name(index).inner).to_string()
+				}
 				ExprKind::Function {
 					function,
 					type_args,
@@ -3331,11 +3329,7 @@ mod tests {
 					struct_index,
 					fields,
 				} => {
-					let name = name(
-						self.sema.decls.structs[usize::from(struct_index)]
-							.name
-							.inner,
-					);
+					let name = name(self.sema.decls.name(struct_index).inner);
 					let count = self.sema.structs[usize::from(struct_index)]
 						.field_types
 						.len();
@@ -3494,10 +3488,7 @@ mod tests {
 					struct_index,
 					fields,
 				} => {
-					let name = self.sema.decls.structs
-						[usize::from(struct_index)]
-					.name
-					.inner;
+					let name = self.sema.decls.name(struct_index).inner;
 					let name = self.strings.resolve(name).unwrap();
 					let count = self.sema.structs[usize::from(struct_index)]
 						.field_types
@@ -3559,7 +3550,7 @@ mod tests {
 		}
 
 		fn function_name(&self, index: super::FunctionIdx) -> &str {
-			let name = self.sema.decls.functions[usize::from(index)].name.inner;
+			let name = self.sema.decls.name(index).inner;
 			self.strings.resolve(name).unwrap()
 		}
 
@@ -3569,7 +3560,7 @@ mod tests {
 			index: super::ConstIdx,
 			type_args: super::GenericArgs,
 		) -> String {
-			let name = self.sema.decls.constants[usize::from(index)].name.inner;
+			let name = self.sema.decls.name(index).inner;
 			self.with_type_args(self.strings.resolve(name).unwrap(), type_args)
 		}
 

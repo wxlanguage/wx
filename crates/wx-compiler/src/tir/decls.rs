@@ -46,6 +46,7 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	imports: Vec<ImportDecl>,
 	ast_nodes: Vec<AstEntry<'ast>>,
 	exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	import_entries: FxHashMap<ItemLoc, ImportEntry>,
 	package_contracts: Vec<PackageContract>,
 	traits: Vec<TraitDecl>,
 	trait_impls: Vec<TraitImplDecl>,
@@ -92,13 +93,10 @@ index_newtype!(PackageInstanceIdx);
 /// (emitting a separate copy of the package per instance) walks instead.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct PackageInstanceDecl {
-	pub file_id: FileId,
-	/// The scope the item was written in, where `alias` is bound.
-	pub namespace: Scope,
-	pub pub_span: Option<TextSpan>,
+	/// Its row, in the table of the scope it is written in.
+	pub loc: ItemLoc,
 	/// The manifest key, decoded; the span covers the literal as written.
 	pub package_name: Spanned<SymbolU32>,
-	pub alias: Spanned<SymbolU32>,
 	/// The package `package_name` names, or `None` when the manifest
 	/// declares no such key (which is reported where the item is scanned).
 	/// Until instances are told apart, what the alias leads into is this
@@ -186,13 +184,12 @@ impl BindingKey {
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TraitDecl {
+	/// Its row, in the table of the scope it is written in; a typeset's
+	/// trait is a generated row beside the typeset's.
+	pub loc: ItemLoc,
 	/// The typeset this trait was generated for, whose signature query builds
 	/// it; `None` for a written trait.
 	pub typeset: Option<TypesetIdx>,
-	pub file_id: FileId,
-	pub namespace: Scope,
-	pub pub_span: Option<TextSpan>,
-	pub name: Spanned<SymbolU32>,
 	#[cfg_attr(
 		test,
 		serde(serialize_with = "crate::testing::serialize_sorted_map")
@@ -225,13 +222,12 @@ pub struct InherentImplDecl {
 	pub members: Vec<InherentMemberDecl>,
 }
 
-/// Field identity only (names, `pub_span`, lookup) — field *types* are
+/// Field identity only (names, each field's `pub`, lookup) — field *types* are
 /// `signatures::StructSignature::field_types`, index-aligned with `fields`.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct StructDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
-	pub name: Spanned<SymbolU32>,
+	/// Its row, in the table of the scope it is written in.
+	pub loc: ItemLoc,
 	/// Each field's name, `None` for a positional field.
 	pub field_names: Box<[Option<Spanned<SymbolU32>>]>,
 	/// Each field's `pub`, index-aligned with `field_names`.
@@ -449,9 +445,8 @@ impl StructDecl {
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct EnumDecl {
-	pub file_id: FileId,
-	pub parent_namespace: Scope,
-	pub name: Spanned<SymbolU32>,
+	/// Its row, in the table of the scope it is written in.
+	pub loc: ItemLoc,
 	/// The enum's variants, in written order, a duplicate name included: a
 	/// variant is a constant of the enum's type, and an enum's variants are
 	/// one run of `constants`, so a variant's position is what its implicit
@@ -470,23 +465,21 @@ pub struct EnumDecl {
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TypeAliasDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
-	pub name: Spanned<SymbolU32>,
+	/// Its row, in the table of the scope it is written in.
+	pub loc: ItemLoc,
 }
 
 /// `typeset X: A + B { m1, m2 }` — `trait_index` is a generated trait with
 /// no AST node of its own (`TraitDecl::typeset` names this typeset). Its
 /// data, the supertraits from `: A + B`, is written by this typeset's
-/// signature query, so forcing the trait means forcing `DeclId::Typeset`.
+/// signature query, so forcing the trait means forcing `SignatureQuery::Typeset`.
 /// `member_impls` is index-aligned with the AST's own `members` list: one
 /// generated `impl <trait_index> for <member>` per written member, filled in
 /// with the member's resolved type by that same query.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TypesetDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
-	pub name: Spanned<SymbolU32>,
+	/// Its row, in the table of the scope it is written in.
+	pub loc: ItemLoc,
 	pub trait_index: TraitIdx,
 	pub member_impls: Box<[TraitImplIdx]>,
 }
@@ -500,10 +493,10 @@ pub struct TypesetDecl {
 /// synthetic `impl Call` and `impl Function`.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
+	/// Its row, in the table of the scope it, or its trait or impl, is
+	/// written in.
+	pub loc: ItemLoc,
 	pub owner: MemberOwner,
-	pub name: Spanned<SymbolU32>,
 	/// Each parameter's name, `None` for an unnamed one.
 	pub params: Box<[Option<Spanned<SymbolU32>>]>,
 	pub function_impls: FunctionImpls,
@@ -551,9 +544,8 @@ pub struct FunctionImpls {
 /// every reader of this struct has to keep re-checking for.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct MemoryDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
-	pub name: Spanned<SymbolU32>,
+	/// Its row, in the table of the scope it is written in.
+	pub loc: ItemLoc,
 	pub trait_impl_index: TraitImplIdx,
 	pub size_assoc_type_index: AssocTypeIdx,
 	/// What its `#[memory_limits]` says; both bounds `None` without one, and
@@ -587,9 +579,8 @@ pub struct MemoryLimits {
 /// non-`mut` global, unlike the other two fields.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct GlobalDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
-	pub name: Spanned<SymbolU32>,
+	/// Its row, in the table of the scope it is written in.
+	pub loc: ItemLoc,
 	pub trait_impl_index: TraitImplIdx,
 	pub value_assoc_type_index: AssocTypeIdx,
 	pub mut_trait_impl_index: Option<TraitImplIdx>,
@@ -599,23 +590,23 @@ pub struct GlobalDecl {
 /// resolved in later phases.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ConstDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
+	/// Its row: a variant's in its enum's table, any other constant's in
+	/// the table of the scope it, or its trait or impl, is written in.
+	pub loc: ItemLoc,
 	/// An enum's variant is free: it is no trait's or impl's member.
 	pub owner: MemberOwner,
-	pub name: Spanned<SymbolU32>,
 }
 
 /// Each trait declaration and each impl definition has its own identity.
 /// Declared bounds and impl target types remain in the AST for resolution.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AssocTypeDecl {
-	pub file_id: FileId,
-	pub namespace: Scope,
-	pub name: Spanned<SymbolU32>,
+	/// Its row, in the table of the scope its trait or impl is written
+	/// in (or its generator, for a function's, memory's or global's impl).
+	pub loc: ItemLoc,
 }
 
-index_newtype!(LocalDeclIdx);
+index_newtype!(DeclIdx);
 index_newtype!(MemberIdx);
 index_newtype!(ModuleIdx);
 index_newtype!(ImportIdx);
@@ -642,14 +633,13 @@ pub struct TraitMemberDecl {
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct InherentMemberDecl {
 	pub kind: MemberKind,
-	pub visibility: Visibility,
 	pub span: TextSpan,
 }
 
-impl LocalDeclIdx {
-	/// each module has a `self` binding which is the first binding in the list of it's bindings
-	/// other modules can use it to reference it, for example `super`
-	pub(super) const SELF: Self = LocalDeclIdx(0);
+impl DeclIdx {
+	/// A package's own entry, the first in its table, which `self` and
+	/// `package` at its root, and `super` in its top-level modules, name.
+	pub(super) const SELF: Self = DeclIdx(0);
 }
 
 #[derive(Clone)]
@@ -773,44 +763,56 @@ pub(super) enum AstNodeRef<'ast> {
 
 impl AstNodeRef<'_> {
 	/// The declaration this entry writes.
-	pub(super) fn decl_id(&self) -> DeclId {
+	pub(super) fn query(&self) -> SignatureQuery {
 		match *self {
-			Self::Function { func_index, .. } => DeclId::Function(func_index),
+			Self::Function { func_index, .. } => {
+				SignatureQuery::Function(func_index)
+			}
 			Self::TraitFunction { function_index, .. }
 			| Self::TraitImplFunction { function_index, .. }
 			| Self::InherentImplFunction { function_index, .. }
 			| Self::ImportedFunction { function_index, .. } => {
-				DeclId::Function(function_index)
+				SignatureQuery::Function(function_index)
 			}
-			Self::Struct { struct_index, .. } => DeclId::Struct(struct_index),
-			Self::Enum { enum_index, .. } => DeclId::Enum(enum_index),
+			Self::Struct { struct_index, .. } => {
+				SignatureQuery::Struct(struct_index)
+			}
+			Self::Enum { enum_index, .. } => SignatureQuery::Enum(enum_index),
 			Self::Global { global_index, .. }
-			| Self::ImportedGlobal { global_index, .. } => DeclId::Global(global_index),
+			| Self::ImportedGlobal { global_index, .. } => {
+				SignatureQuery::Global(global_index)
+			}
 			Self::Memory { memory_index, .. }
-			| Self::ImportedMemory { memory_index, .. } => DeclId::Memory(memory_index),
+			| Self::ImportedMemory { memory_index, .. } => {
+				SignatureQuery::Memory(memory_index)
+			}
 			Self::Constant { const_index, .. }
 			| Self::TraitConst { const_index, .. }
 			| Self::TraitImplConstant { const_index, .. }
 			| Self::InherentImplConst { const_index, .. }
-			| Self::EnumVariant { const_index, .. } => DeclId::Const(const_index),
+			| Self::EnumVariant { const_index, .. } => {
+				SignatureQuery::Const(const_index)
+			}
 			Self::TypeSet { typeset_index, .. } => {
-				DeclId::Typeset(typeset_index)
+				SignatureQuery::Typeset(typeset_index)
 			}
 			Self::TypeAlias {
 				type_alias_index, ..
-			} => DeclId::TypeAlias(type_alias_index),
-			Self::Trait { trait_index, .. } => DeclId::Trait(trait_index),
+			} => SignatureQuery::TypeAlias(type_alias_index),
+			Self::Trait { trait_index, .. } => {
+				SignatureQuery::Trait(trait_index)
+			}
 			Self::TraitAssocType {
 				assoc_type_index, ..
 			}
 			| Self::TraitImplAssocType {
 				assoc_type_index, ..
-			} => DeclId::AssocType(assoc_type_index),
+			} => SignatureQuery::AssocType(assoc_type_index),
 			Self::TraitImplBlock { block_index, .. } => {
-				DeclId::TraitImpl(block_index)
+				SignatureQuery::TraitImpl(block_index)
 			}
 			Self::InherentImplBlock { block_index, .. } => {
-				DeclId::InherentImpl(block_index)
+				SignatureQuery::InherentImpl(block_index)
 			}
 		}
 	}
@@ -857,6 +859,9 @@ pub struct Declarations {
 	pub imports: Vec<ImportDecl>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
 	pub(super) exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	/// The entry each host-imported declaration is written in, by its row.
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
+	pub(super) import_entries: FxHashMap<ItemLoc, ImportEntry>,
 	/// Package-level contract keys, indexed by `PackageId`.
 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub(super) package_contracts: Vec<PackageContract>,
@@ -874,7 +879,7 @@ pub struct Declarations {
 	pub type_aliases: Vec<TypeAliasDecl>,
 	pub use_items: Vec<UseItemDecl>,
 	pub(super) use_paths: Vec<UsePathSegment>,
-	/// The `DeclKey` of every language builtin recognized by name in the
+	/// The `ItemLoc` of every language builtin recognized by name in the
 	/// stdlib package — primitive types (`u8`, `funcref`, ...), `Bool`, `Char` and
 	/// operator traits (`Add`, `PartialEq`, ...) alike. `None` for any name
 	/// prescan never found declared there. No `#[intrinsic]` marker is
@@ -989,6 +994,27 @@ impl IntrinsicDefs {
 			|| [self.slice_len, self.slice_as_ref].contains(&Some(function))
 	}
 
+	/// Whether `alias` is a type the compiler provides, a primitive or a
+	/// literal kind: one of the bodiless types `type_slot_mut` recognizes.
+	pub fn is_builtin_type(&self, alias: TypeAliasIdx) -> bool {
+		[
+			self.u8,
+			self.i8,
+			self.u16,
+			self.i16,
+			self.u32,
+			self.i32,
+			self.u64,
+			self.i64,
+			self.f32,
+			self.f64,
+			self.funcref,
+			self.integer_kind,
+			self.char_kind,
+		]
+		.contains(&Some(alias))
+	}
+
 	/// The mutable slot for `name` if it's one of the recognized primitive
 	/// type names — the one place that list is written.
 	fn type_slot_mut(
@@ -1093,7 +1119,7 @@ impl Visibility {
 /// typeset's trait and impls, a memory's or global's impl) is built by the
 /// signature query of the declaration that generates it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum DeclId {
+pub enum SignatureQuery {
 	Struct(StructIdx),
 	Enum(EnumIdx),
 	Trait(TraitIdx),
@@ -1127,7 +1153,7 @@ pub enum DeclKind {
 	Global(GlobalIdx),
 	Function(FunctionIdx),
 	Const(ConstIdx),
-	TraitAssocType(AssocTypeIdx),
+	AssocType(AssocTypeIdx),
 	TypeAlias(TypeAliasIdx),
 }
 
@@ -1148,7 +1174,7 @@ impl DeclKind {
 			DeclKind::Global(_) => "global",
 			DeclKind::Function(_) => "function",
 			DeclKind::Const(_) => "constant",
-			DeclKind::TraitAssocType(_) => "associated type",
+			DeclKind::AssocType(_) => "associated type",
 			DeclKind::TypeAlias(_) => "type alias",
 		}
 	}
@@ -1159,59 +1185,27 @@ impl DeclKind {
 		self,
 		decls: &Declarations,
 	) -> Option<SourceSpan> {
-		let (file_id, name) = match self {
+		let key = match self {
 			DeclKind::Module(_)
 			| DeclKind::Import(_)
 			| DeclKind::Package(_) => {
 				return None;
 			}
-			DeclKind::PackageInstance(index) => {
-				let decl =
-					&decls.namespaces.package_instances()[usize::from(index)];
-				(decl.file_id, decl.alias)
-			}
-			DeclKind::Enum(index) => {
-				let decl = &decls.enums[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
+			DeclKind::PackageInstance(index) => index.loc(decls),
+			DeclKind::Enum(index) => index.loc(decls),
 			DeclKind::EnumVariant(index) | DeclKind::Const(index) => {
-				let decl = &decls.constants[usize::from(index)];
-				(decl.file_id, decl.name)
+				index.loc(decls)
 			}
-			DeclKind::Struct(index) => {
-				let decl = &decls.structs[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
-			DeclKind::Memory(index) => {
-				let decl = &decls.memories[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
-			DeclKind::Trait(index) => {
-				let decl = &decls.traits[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
-			DeclKind::TypeSet(index) => {
-				let decl = &decls.typesets[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
-			DeclKind::Global(index) => {
-				let decl = &decls.globals[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
-			DeclKind::Function(index) => {
-				let decl = &decls.functions[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
-			DeclKind::TraitAssocType(index) => {
-				let decl = &decls.assoc_types[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
-			DeclKind::TypeAlias(index) => {
-				let decl = &decls.type_aliases[usize::from(index)];
-				(decl.file_id, decl.name)
-			}
+			DeclKind::Struct(index) => index.loc(decls),
+			DeclKind::Memory(index) => index.loc(decls),
+			DeclKind::Trait(index) => index.loc(decls),
+			DeclKind::TypeSet(index) => index.loc(decls),
+			DeclKind::Global(index) => index.loc(decls),
+			DeclKind::Function(index) => index.loc(decls),
+			DeclKind::AssocType(index) => index.loc(decls),
+			DeclKind::TypeAlias(index) => index.loc(decls),
 		};
-		Some(SourceSpan::new(file_id, name.span))
+		Some(decls.declaration_span(key))
 	}
 }
 
@@ -1261,20 +1255,43 @@ impl Namespace {
 	}
 }
 
+/// A declaration made in a table's namespace, as written: a row of
+/// `SymbolTable::items`, which a `ItemLoc` addresses.
+///
+/// A row is reachable by name only through a binding that points at it, so
+/// a trait's or an impl's member is a row of the scope its trait or impl is
+/// written in without being bound there. A generated declaration (a
+/// typeset's trait, the associated types of a function's, memory's or
+/// global's impl, a package's own entry) has a row whose name span is empty.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub(super) struct ItemDecl {
-	pub(super) kind: DeclKind,
-	pub(super) span: TextSpan,
+pub struct ItemDecl {
+	/// Which arena holds what it means, and its index there.
+	pub kind: DeclKind,
+	pub name: Spanned<SymbolU32>,
+	/// Whether `pub` is written on it. A rule that derives a visibility from
+	/// another (a trait member is as visible as its trait, an import
+	/// block's entries are visible in the block) is the code's that applies
+	/// it; a generated declaration has what its generator writes (a
+	/// typeset's trait the typeset's).
+	pub visibility: Visibility,
 }
 
 impl ItemDecl {
-	fn new(kind: DeclKind, span: TextSpan) -> Self {
-		Self { kind, span }
+	fn new(
+		kind: DeclKind,
+		name: Spanned<SymbolU32>,
+		visibility: Visibility,
+	) -> Self {
+		Self {
+			kind,
+			name,
+			visibility,
+		}
 	}
 }
 
 /// What one namespace holds: the definitions declared in it (`items`, which
-/// a `DeclKey` addresses) and the names it binds. Every namespace is written in
+/// a `ItemLoc` addresses) and the names it binds. Every namespace is written in
 /// one file.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct SymbolTable {
@@ -1312,24 +1329,27 @@ pub struct ScopeTable {
 }
 
 impl ScopeTable {
-	/// A module or import block has the same explicit scope qualifiers.
+	/// A module or import block has the same explicit scope qualifiers:
+	/// `self` names its own declaration `own`, `super` the one of the scope
+	/// it is written in, `parent_key`, and `package` its package's root.
 	fn child(
 		mut symbols: SymbolTable,
-		scope: Scope,
+		own: ItemLoc,
 		parent: Scope,
+		parent_key: ItemLoc,
 		package_id: PackageId,
 	) -> Self {
 		for (name, target) in [
-			(Keyword::SelfLower, Namespace::from(scope)),
-			(Keyword::Package, Namespace::Package(package_id)),
-			(Keyword::Super, Namespace::from(parent)),
+			(Keyword::SelfLower, own),
+			(
+				Keyword::Package,
+				ItemLoc::new(Namespace::Package(package_id), DeclIdx::SELF),
+			),
+			(Keyword::Super, parent_key),
 		] {
 			symbols.bindings.insert(
 				BindingKey::ty(name.symbol()),
-				Binding::definition(
-					DeclKey::new(target, LocalDeclIdx::SELF),
-					Visibility::Public,
-				),
+				Binding::definition(target, Visibility::Public),
 			);
 		}
 		Self {
@@ -1366,7 +1386,7 @@ pub struct Namespaces {
 ///
 /// `Ambiguous` carries every surviving candidate paired with the `pub use`
 /// edge responsible for it — the diagnostic needs to name each one, same as
-/// two colliding ordinary globs already do. The same `DeclKey` reached through
+/// two colliding ordinary globs already do. The same `ItemLoc` reached through
 /// two different edges is merged into one candidate before it ever becomes
 /// an entry here, not after — see `indirect_lookup`. No visibility here: by
 /// construction, every entry that survives into this variant was already
@@ -1393,7 +1413,7 @@ pub(super) enum BindingLookup {
 /// Two different kinds of "accessible" are in play here, at two different
 /// times. `BindingTarget::Accessible`/`Inaccessible` records whether *the
 /// edge that installed a binding* could see its def — baked in once. The
-/// same `DeclKey` reached through two `pub` edges (e.g. a diamond re-export)
+/// same `ItemLoc` reached through two `pub` edges (e.g. a diamond re-export)
 /// isn't a conflict, and when the two edges disagree, `Accessible` wins
 /// silently, same as `try_insert_binding` resolves the same disagreement
 /// for a direct same-namespace collision.
@@ -1402,7 +1422,7 @@ pub(super) enum BindingLookup {
 /// query's* accessor can see a given def at all, checked fresh. A lone real
 /// candidate is always kept as `One`, visibility included, regardless of
 /// that check — deferred to the caller, same as a direct hit. It's only
-/// consulted the moment a second, distinct `DeclKey` would otherwise promote
+/// consulted the moment a second, distinct `ItemLoc` would otherwise promote
 /// this into a real ambiguity: a candidate `accessor` could never legally
 /// choose is excluded right then, rather than surviving into a misleading
 /// `Ambiguous`.
@@ -1435,7 +1455,7 @@ enum Candidates {
 	// it for.
 	Error(GlobCandidate),
 	// `finish` never reads the span — `Found` doesn't carry one. It's kept
-	// for `push`: if a second, distinct `DeclKey` arrives later and this
+	// for `push`: if a second, distinct `ItemLoc` arrives later and this
 	// candidate turns out to still be a real competitor, its span is what
 	// seeds the new `Many` entry.
 	One(GlobCandidate),
@@ -1452,7 +1472,7 @@ impl<'a> CandidateMerge<'a> {
 	}
 
 	fn push(&mut self, candidate: GlobCandidate) {
-		let Some(decl_key) = candidate.target.decl_key() else {
+		let Some(loc) = candidate.target.loc() else {
 			if matches!(self.candidates, Candidates::Empty) {
 				self.candidates = Candidates::Error(candidate);
 			}
@@ -1466,10 +1486,10 @@ impl<'a> CandidateMerge<'a> {
 			Candidates::One(first) => {
 				let first_key = first
 					.target
-					.decl_key()
+					.loc()
 					.expect("a real candidate always carries a DefKey");
 
-				if first_key == decl_key {
+				if first_key == loc {
 					if matches!(candidate.target, BindingTarget::Accessible(_))
 						&& matches!(
 							first.target,
@@ -1487,7 +1507,7 @@ impl<'a> CandidateMerge<'a> {
 				);
 				let this_reachable = self.namespaces.is_accessible_from(
 					self.accessor,
-					decl_key.namespace,
+					loc.namespace,
 					candidate.visibility,
 				);
 
@@ -1511,14 +1531,14 @@ impl<'a> CandidateMerge<'a> {
 			Candidates::Many(items) => {
 				if !self.namespaces.is_accessible_from(
 					self.accessor,
-					decl_key.namespace,
+					loc.namespace,
 					candidate.visibility,
 				) {
 					return;
 				}
 				let slot = items
 					.iter_mut()
-					.find(|(target, _)| target.decl_key() == Some(decl_key));
+					.find(|(target, _)| target.loc() == Some(loc));
 				match slot {
 					Some(slot)
 						if matches!(
@@ -1589,7 +1609,7 @@ impl Namespaces {
 	}
 
 	/// Every declaration of every namespace, in no particular order.
-	pub fn keys(&self) -> impl Iterator<Item = DeclKey> + '_ {
+	pub fn keys(&self) -> impl Iterator<Item = ItemLoc> + '_ {
 		let packages = self
 			.packages
 			.iter()
@@ -1606,7 +1626,7 @@ impl Namespaces {
 			.chain(imports)
 			.flat_map(move |namespace| {
 				(0..self.symbols(namespace).items.len()).map(move |index| {
-					DeclKey::new(namespace, LocalDeclIdx::new(index as u32))
+					ItemLoc::new(namespace, DeclIdx::new(index as u32))
 				})
 			})
 	}
@@ -1631,21 +1651,25 @@ impl Namespaces {
 		self.symbols(namespace).file_id
 	}
 
-	/// What `decl_key` names.
-	pub(super) fn kind(&self, decl_key: DeclKey) -> DeclKind {
-		self.symbols(decl_key.namespace).items[usize::from(decl_key.decl_idx)]
-			.kind
+	/// The declaration `loc` addresses, its row.
+	pub fn item(&self, loc: ItemLoc) -> &ItemDecl {
+		&self.symbols(loc.namespace).items[usize::from(loc.decl_idx)]
+	}
+
+	/// What `loc` names.
+	pub(super) fn kind(&self, loc: ItemLoc) -> DeclKind {
+		self.item(loc).kind
 	}
 
 	pub fn package_instances(&self) -> &[PackageInstanceDecl] {
 		&self.package_instances
 	}
 
-	/// The namespace a path continues into after `decl_key`: what `a::` names
+	/// The namespace a path continues into after `loc`: what `a::` names
 	/// when `a` is a package, a module, an enum, an import block or a crate
 	/// item. `None` for anything a path cannot continue through.
-	pub(super) fn entered_by(&self, decl_key: DeclKey) -> Option<Namespace> {
-		Some(match self.kind(decl_key) {
+	pub(super) fn entered_by(&self, loc: ItemLoc) -> Option<Namespace> {
+		Some(match self.kind(loc) {
 			DeclKind::Package(package) => Namespace::Package(package),
 			DeclKind::Module(module) => Namespace::Module(module),
 			DeclKind::Enum(enum_index) => Namespace::Enum(enum_index),
@@ -1691,7 +1715,7 @@ impl Namespaces {
 	}
 
 	/// Inserts `binding` under `key` in `namespace`. `Err` carries the
-	/// colliding `DeclKey` when one was already there and both count as
+	/// colliding `ItemLoc` when one was already there and both count as
 	/// real occupants of the name — this is an error state, not merely an
 	/// optional value, hence `Result` over `Option`. No diagnostics here —
 	/// this only touches the namespace graph; a caller with
@@ -1703,7 +1727,7 @@ impl Namespaces {
 		namespace: Namespace,
 		key: BindingKey,
 		binding: Binding,
-	) -> Result<(), DeclKey> {
+	) -> Result<(), ItemLoc> {
 		use std::collections::hash_map::Entry;
 
 		match self.symbols_mut(namespace).bindings.entry(key) {
@@ -1880,13 +1904,13 @@ impl Namespaces {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) enum BindingTarget {
-	Accessible(DeclKey),
+	Accessible(ItemLoc),
 	/// Resolved to a real def, but the source wasn't visible from the
 	/// writing namespace when a `use` resolved it. Not poisoned like
 	/// `Error` — whatever already enforces privacy at reference sites for
 	/// direct qualified paths should apply the same check here, reporting
 	/// (or not) each time this binding is actually used, not just once.
-	Inaccessible(DeclKey),
+	Inaccessible(ItemLoc),
 	Error,
 }
 
@@ -1894,7 +1918,7 @@ impl BindingTarget {
 	/// The underlying definition this target names, if it names one at all
 	/// — `Error` doesn't, since it's recovery state for an already-diagnosed
 	/// failure rather than a reference to anything real.
-	pub(super) fn decl_key(self) -> Option<DeclKey> {
+	pub(super) fn loc(self) -> Option<ItemLoc> {
 		match self {
 			Self::Accessible(key) | Self::Inaccessible(key) => Some(key),
 			Self::Error => None,
@@ -1918,9 +1942,9 @@ pub(super) struct Binding {
 }
 
 impl Binding {
-	fn definition(key: DeclKey, visibility: Visibility) -> Self {
+	fn definition(loc: ItemLoc, visibility: Visibility) -> Self {
 		Self {
-			target: BindingTarget::Accessible(key),
+			target: BindingTarget::Accessible(loc),
 			visibility,
 			source: BindingSource::Definition,
 		}
@@ -1928,7 +1952,7 @@ impl Binding {
 
 	/// A name declared by a definition that could not be resolved, such as
 	/// a package instance whose key the manifest does not declare. It carries
-	/// no `DeclKey`, so a path through it ends silently on top of the error
+	/// no `ItemLoc`, so a path through it ends silently on top of the error
 	/// already reported at the declaration, instead of adding "undeclared"
 	/// errors at every use.
 	fn poisoned(visibility: Visibility) -> Self {
@@ -1960,7 +1984,7 @@ impl Binding {
 	) -> SourceSpan {
 		match self.source {
 			BindingSource::Definition => {
-				let decl_key = match self.target {
+				let loc = match self.target {
 					BindingTarget::Accessible(key)
 					| BindingTarget::Inaccessible(key) => key,
 					// Only a binding that rejected an insertion is asked
@@ -1972,7 +1996,7 @@ impl Binding {
 						)
 					}
 				};
-				decl_key.source_span(namespaces)
+				loc.source_span(namespaces)
 			}
 
 			BindingSource::Import(index) => {
@@ -1991,23 +2015,13 @@ impl Binding {
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ModuleDecl {
-	/// The scope `mod foo;` was written in — where the name `foo` itself
-	/// gets bound. The "outside" of the module.
-	pub parent_namespace: Scope,
-	/// The file containing the `mod foo;` (or `mod foo { .. }`) text
-	/// itself — not necessarily where `foo`'s own items live.
-	///
-	/// For inline `mod foo { .. }`, the module's content lives in this
-	/// same file, so `declaration_file == own_file`. For file-backed
-	/// `mod foo;`, the declaration is one line in this file but `foo`'s
-	/// actual content lives in `foo.wx`, so `own_file` points there
-	/// instead and the two differ.
-	pub declaration_file: FileId,
+	/// Its row, in the table of the scope `mod foo` is written in, which is
+	/// where its name is bound and what `super` names inside it.
+	pub loc: ItemLoc,
 	/// The file that IS `foo`'s content: `foo.wx` for `mod foo;`, or the
-	/// same file as `declaration_file` for inline `mod foo { .. }`.
+	/// file `mod foo { .. }` is written in, its row's
+	/// (`Declarations::file_id(decl)`), for an inline module.
 	pub own_file: FileId,
-	pub name: ast::Spanned<SymbolU32>,
-	pub pub_span: Option<TextSpan>,
 }
 
 /// One `use path::*;` edge — the namespace it resolved to, plus which item
@@ -2028,11 +2042,25 @@ pub struct GlobImport {
 	pub namespace: Namespace,
 }
 
+/// An import block's entry: the field of the block's module the host
+/// provides its item as. Wasm allows one `module.field` to be imported as
+/// several items, so the field is not an identity: the entry is keyed by the
+/// item it declares.
+pub struct ImportEntry {
+	/// The string written before the item, or else the item's name, which
+	/// then names it both in wx and to the host (as
+	/// `ExportEntrySource::external_span` does for `export { run }`).
+	pub field: Spanned<SymbolU32>,
+	/// The entry as written, `"field":` included, in the block's file.
+	pub span: TextSpan,
+}
+
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ImportDecl {
-	pub parent_namespace: Scope,
+	/// Its row, in the table of the scope the block is written in, where
+	/// its alias is bound.
+	pub loc: ItemLoc,
 	pub external_name: ast::Spanned<SymbolU32>,
-	pub internal_name: ast::Spanned<SymbolU32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2045,16 +2073,6 @@ pub enum MemberKind {
 }
 
 impl MemberKind {
-	pub(super) fn decl_id(self) -> DeclId {
-		match self {
-			Self::Function(index) | Self::Method(index) => {
-				DeclId::Function(index)
-			}
-			Self::Constant(index) => DeclId::Const(index),
-			Self::AssociatedType(index) => DeclId::AssocType(index),
-		}
-	}
-
 	/// Whether `other` is a member of the same kind: a function provides a
 	/// function or a method declaration alike, since what makes one a method
 	/// is its first parameter, which conformance compares.
@@ -2079,16 +2097,64 @@ impl MemberKind {
 	}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub struct DeclKey {
-	pub(super) namespace: Namespace,
-	pub(super) decl_idx: LocalDeclIdx,
+/// A typed index of a declaration: reaches its row through its arena entry's
+/// `loc`. An impl is not one (it has no row), so a signature query is not.
+pub trait Declared: Copy {
+	fn loc(self, decls: &Declarations) -> ItemLoc;
 }
 
-impl DeclKey {
+macro_rules! declared {
+	($($index:ty => $arena:ident),* $(,)?) => {
+		$(impl Declared for $index {
+			fn loc(self, decls: &Declarations) -> ItemLoc {
+				decls.$arena[usize::from(self)].loc
+			}
+		})*
+	};
+}
+
+declared! {
+	StructIdx => structs,
+	EnumIdx => enums,
+	TraitIdx => traits,
+	TypesetIdx => typesets,
+	TypeAliasIdx => type_aliases,
+	FunctionIdx => functions,
+	ConstIdx => constants,
+	MemoryIdx => memories,
+	GlobalIdx => globals,
+	AssocTypeIdx => assoc_types,
+}
+
+impl Declared for PackageInstanceIdx {
+	fn loc(self, decls: &Declarations) -> ItemLoc {
+		decls.namespaces.package_instances()[usize::from(self)].loc
+	}
+}
+
+impl Declared for MemberKind {
+	fn loc(self, decls: &Declarations) -> ItemLoc {
+		match self {
+			Self::Function(index) | Self::Method(index) => index.loc(decls),
+			Self::Constant(index) => index.loc(decls),
+			Self::AssociatedType(index) => index.loc(decls),
+		}
+	}
+}
+
+/// Where a declaration is made: slot `decl_idx` of `namespace`'s table, the
+/// row (`ItemDecl`) it addresses. A location, as rust-analyzer's `ItemLoc`
+/// is, not an id assigned to the declaration.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub struct ItemLoc {
+	pub(super) namespace: Namespace,
+	pub(super) decl_idx: DeclIdx,
+}
+
+impl ItemLoc {
 	#[inline]
-	pub fn new(namespace: Namespace, decl_idx: LocalDeclIdx) -> Self {
+	pub fn new(namespace: Namespace, decl_idx: DeclIdx) -> Self {
 		Self {
 			namespace,
 			decl_idx,
@@ -2100,7 +2166,7 @@ impl DeclKey {
 		let symbols = namespaces.symbols(self.namespace);
 		SourceSpan::new(
 			symbols.file_id,
-			symbols.items[usize::from(self.decl_idx)].span,
+			symbols.items[usize::from(self.decl_idx)].name.span,
 		)
 	}
 
@@ -2149,30 +2215,39 @@ impl DuplicateDefinitionDiagnostic<'_> {
 }
 
 impl Declarations {
-	/// The written name of `decl_id`'s declaration. A generated trait has its
-	/// typeset's name.
-	pub(super) fn name(&self, decl_id: DeclId) -> Spanned<SymbolU32> {
-		match decl_id {
-			DeclId::Struct(index) => self.structs[usize::from(index)].name,
-			DeclId::Enum(index) => self.enums[usize::from(index)].name,
-			DeclId::Trait(index) => self.traits[usize::from(index)].name,
-			DeclId::Typeset(index) => self.typesets[usize::from(index)].name,
-			DeclId::TypeAlias(index) => {
-				self.type_aliases[usize::from(index)].name
-			}
-			DeclId::Function(index) => self.functions[usize::from(index)].name,
-			DeclId::Const(index) => self.constants[usize::from(index)].name,
-			DeclId::Memory(index) => self.memories[usize::from(index)].name,
-			DeclId::Global(index) => self.globals[usize::from(index)].name,
-			DeclId::AssocType(index) => {
-				self.assoc_types[usize::from(index)].name
-			}
-			DeclId::TraitImpl(_) | DeclId::InherentImpl(_) => {
-				todo!(
-					"an impl has no name; describing one isn't implemented yet"
-				)
+	/// The declaration `loc` addresses, its row.
+	pub fn item(&self, loc: ItemLoc) -> &ItemDecl {
+		self.namespaces.item(loc)
+	}
+
+	/// The import block entry `loc` is declared in, when it is imported from
+	/// the host.
+	pub fn import_entry(&self, loc: ItemLoc) -> Option<&ImportEntry> {
+		self.import_entries.get(&loc)
+	}
+
+	/// The scope `loc` is declared in, where the names its signature writes
+	/// are looked up: its table's, or for an enum's variant, the enum's.
+	pub fn scope(&self, loc: ItemLoc) -> Scope {
+		match loc.namespace {
+			Namespace::Package(package) => Scope::Package(package),
+			Namespace::Module(module) => Scope::Module(module),
+			Namespace::Import(import) => Scope::Import(import),
+			Namespace::Enum(index) => {
+				self.scope(self.enums[usize::from(index)].loc)
 			}
 		}
+	}
+
+	/// The file `loc` is declared in: its table's, since every namespace is
+	/// written in one file.
+	pub fn file_id(&self, loc: ItemLoc) -> FileId {
+		self.namespaces.file_id(loc.namespace)
+	}
+
+	/// The name `index`'s declaration is written with, from its row.
+	pub(super) fn name(&self, index: impl Declared) -> Spanned<SymbolU32> {
+		self.item(index.loc(self)).name
 	}
 
 	/// Returns the registry alongside `ast_nodes` — every top-level item in
@@ -2203,36 +2278,10 @@ impl Declarations {
 	}
 }
 
-/// The span of the name `key` is declared by. A module's or an import block's
-/// namespace entry describes its contents, so those read their own name.
-fn declaration_name_span(
-	namespaces: &Namespaces,
-	modules: &[ModuleDecl],
-	imports: &[ImportDecl],
-	key: DeclKey,
-) -> SourceSpan {
-	match namespaces.kind(key) {
-		DeclKind::Module(index) => {
-			let module = &modules[usize::from(index)];
-			SourceSpan::new(module.declaration_file, module.name.span)
-		}
-		DeclKind::Import(index) => SourceSpan::new(
-			namespaces.file_id(Namespace::Import(index)),
-			imports[usize::from(index)].internal_name.span,
-		),
-		_ => key.source_span(namespaces),
-	}
-}
-
 impl Declarations {
-	/// Where `key` is declared: the span of its name.
-	pub fn declaration_span(&self, key: DeclKey) -> SourceSpan {
-		declaration_name_span(
-			&self.namespaces,
-			&self.modules,
-			&self.imports,
-			key,
-		)
+	/// Where `loc` is declared: the span of its name.
+	pub fn declaration_span(&self, loc: ItemLoc) -> SourceSpan {
+		loc.source_span(&self.namespaces)
 	}
 }
 
@@ -2253,16 +2302,20 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				package.id.as_usize(),
 				"packages are listed in `PackageId` order"
 			);
-			let root = DeclKey::new(
-				Namespace::Package(package.id),
-				LocalDeclIdx::SELF,
-			);
+			let root =
+				ItemLoc::new(Namespace::Package(package.id), DeclIdx::SELF);
 			let mut symbols = SymbolTable::new(
 				package.modules[package.root.as_usize()].file_id,
 			);
+			// Generated: nobody writes it, so its name is `package` and its
+			// span empty.
 			symbols.items.push(ItemDecl::new(
 				DeclKind::Package(package.id),
-				TextSpan::new(0, 0),
+				Spanned {
+					inner: Keyword::Package.symbol(),
+					span: TextSpan::new(0, 0),
+				},
+				Visibility::Private,
 			));
 			for symbol in [
 				ast::Keyword::SelfLower.symbol(),
@@ -2282,9 +2335,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				symbols.bindings.insert(
 					BindingKey::ty(std),
 					Binding::definition(
-						DeclKey::new(
+						ItemLoc::new(
 							Namespace::Package(stdlib_package),
-							LocalDeclIdx::SELF,
+							DeclIdx::SELF,
 						),
 						Visibility::Public,
 					),
@@ -2325,6 +2378,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			use_paths: Vec::new(),
 			ast_nodes: Vec::new(),
 			exports: FxHashMap::default(),
+			import_entries: FxHashMap::default(),
 			package_contracts: packages
 				.iter()
 				.map(|_| PackageContract::default())
@@ -2368,6 +2422,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			modules: builder.modules,
 			imports: builder.imports,
 			exports: builder.exports,
+			import_entries: builder.import_entries,
 			package_contracts: builder.package_contracts,
 			traits: builder.traits,
 			trait_impls: builder.trait_impls,
@@ -2387,6 +2442,30 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		};
 
 		(decls, builder.ast_nodes)
+	}
+
+	/// Records the entry `loc` is declared in: `span`, as written, and the
+	/// field it is provided as, the string `written` or else `name`. A
+	/// string that does not decode (which is reported) keeps its span, with
+	/// `name` as its value.
+	fn push_import_entry(
+		&mut self,
+		file_id: FileId,
+		loc: ItemLoc,
+		written: Option<TextSpan>,
+		name: Spanned<SymbolU32>,
+		span: TextSpan,
+	) {
+		let field = match written {
+			Some(written) => Spanned {
+				inner: self
+					.intern_string(file_id, written)
+					.unwrap_or(name.inner),
+				span: written,
+			},
+			None => name,
+		};
+		self.import_entries.insert(loc, ImportEntry { field, span });
 	}
 
 	fn intern_string(
@@ -2432,19 +2511,15 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					let parent_namespace =
 						file_namespaces[parent_module.file_id.as_usize()];
 					let module = self.push_module(
-						ModuleDecl {
-							declaration_file: parent_module.file_id,
-							own_file: source_module.file_id,
-							parent_namespace,
-							name: declaration.name,
-							pub_span: declaration.pub_span,
-						},
-						TextSpan::new(0, u32::MAX),
+						parent_namespace,
+						source_module.file_id,
+						declaration.name,
+						declaration.pub_span,
 					);
 					if let Err(collision) = self.bind_child(
 						parent_namespace,
 						declaration.name.inner,
-						Namespace::Module(module),
+						self.modules[usize::from(module)].loc,
 						Visibility::from(declaration.pub_span),
 					) {
 						self.diagnostics.push(
@@ -2486,6 +2561,35 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		index
 	}
 
+	/// A generated impl's associated type, `name`, and its row in
+	/// `namespace`'s table: a member of the impl that the declaration whose
+	/// name is at `generator` generates. It has no written name; its empty
+	/// span, at the generator's, keeps it out of the name-to-definition
+	/// table.
+	fn push_generated_assoc_type(
+		&mut self,
+		namespace: Scope,
+		name: SymbolU32,
+		generator: TextSpan,
+	) -> AssocTypeIdx {
+		let index =
+			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
+		let name = Spanned {
+			inner: name,
+			span: TextSpan::new(generator.start, generator.start),
+		};
+		let loc = self.push_decl(
+			namespace.into(),
+			ItemDecl::new(
+				DeclKind::AssocType(index),
+				name,
+				Visibility::Private,
+			),
+		);
+		self.assoc_types.push(AssocTypeDecl { loc });
+		index
+	}
+
 	/// Pre-allocates a memory declaration's synthetic `impl Memory for
 	/// <memory>` — see `MemoryDecl`'s own doc comment for why this never
 	/// needs `IntrinsicDefs::memory` to already be resolved.
@@ -2497,17 +2601,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	) -> (TraitImplIdx, AssocTypeIdx) {
 		let size_symbol = self.strings.get_or_intern("Size");
 		let size_assoc_type_index =
-			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
-		self.assoc_types.push(AssocTypeDecl {
-			file_id,
-			namespace,
-			// A synthetic associated type has no written name; its empty
-			// span keeps it out of the name-to-definition table.
-			name: Spanned {
-				inner: size_symbol,
-				span: TextSpan::new(name_span.start, name_span.start),
-			},
-		});
+			self.push_generated_assoc_type(namespace, size_symbol, name_span);
 		let trait_impl_index = self.push_trait_impl(TraitImplDecl {
 			file_id,
 			namespace,
@@ -2535,15 +2629,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	) -> (TraitImplIdx, AssocTypeIdx, Option<TraitImplIdx>) {
 		let value_symbol = self.strings.get_or_intern("Value");
 		let value_assoc_type_index =
-			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
-		self.assoc_types.push(AssocTypeDecl {
-			file_id,
-			namespace,
-			name: Spanned {
-				inner: value_symbol,
-				span: TextSpan::new(name_span.start, name_span.start),
-			},
-		});
+			self.push_generated_assoc_type(namespace, value_symbol, name_span);
 		let trait_impl_index = self.push_trait_impl(TraitImplDecl {
 			file_id,
 			namespace,
@@ -2585,25 +2671,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		let args_symbol = self.strings.get_or_intern("Args");
 		let result_symbol = self.strings.get_or_intern("Result");
 		let args_assoc_type_index =
-			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
-		self.assoc_types.push(AssocTypeDecl {
-			file_id,
-			namespace,
-			name: Spanned {
-				inner: args_symbol,
-				span: TextSpan::new(name_span.start, name_span.start),
-			},
-		});
+			self.push_generated_assoc_type(namespace, args_symbol, name_span);
 		let result_assoc_type_index =
-			AssocTypeIdx::new(u32::try_from(self.assoc_types.len()).unwrap());
-		self.assoc_types.push(AssocTypeDecl {
-			file_id,
-			namespace,
-			name: Spanned {
-				inner: result_symbol,
-				span: TextSpan::new(name_span.start, name_span.start),
-			},
-		});
+			self.push_generated_assoc_type(namespace, result_symbol, name_span);
 		let call_impl_index = self.push_trait_impl(TraitImplDecl {
 			file_id,
 			namespace,
@@ -2796,14 +2866,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	}
 
 	#[inline]
-	fn push_function(&mut self, item: FunctionDecl) -> FunctionIdx {
-		let index =
-			FunctionIdx::new(u32::try_from(self.functions.len()).unwrap());
-		self.functions.push(item);
-		index
-	}
-
-	#[inline]
 	fn push_inherent_impl(
 		&mut self,
 		item: InherentImplDecl,
@@ -2835,22 +2897,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		namespace: Namespace,
 		definition: ItemDecl,
-	) -> DeclKey {
+	) -> ItemLoc {
 		let items = &mut self.namespaces.symbols_mut(namespace).items;
-		let decl_idx = LocalDeclIdx::new(u32::try_from(items.len()).unwrap());
+		let decl_idx = DeclIdx::new(u32::try_from(items.len()).unwrap());
 		items.push(definition);
-		DeclKey::new(namespace, decl_idx)
+		ItemLoc::new(namespace, decl_idx)
 	}
 
-	/// Namespace self entries describe their contents; collision labels need
-	/// the declaration name, which may be written in a different file.
-	fn definition_span(&self, key: DeclKey) -> SourceSpan {
-		declaration_name_span(
-			&self.namespaces,
-			&self.modules,
-			&self.imports,
-			key,
-		)
+	/// Where `loc`'s name is written, for a collision's label.
+	fn definition_span(&self, loc: ItemLoc) -> SourceSpan {
+		loc.source_span(&self.namespaces)
 	}
 
 	fn insert_binding(
@@ -2899,7 +2955,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		namespace: Namespace,
 		key: BindingKey,
-		collision_key: DeclKey,
+		collision_key: ItemLoc,
 		span: TextSpan,
 	) {
 		self.diagnostics.push(
@@ -2987,18 +3043,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			.dependencies
 			.get(&package_name.inner)
 			.copied();
-		let index = PackageInstanceIdx::new(
-			u32::try_from(self.namespaces.package_instances.len()).unwrap(),
-		);
-		self.namespaces.package_instances.push(PackageInstanceDecl {
-			file_id,
-			namespace,
-			pub_span,
-			package_name,
-			alias,
-			package,
-		});
-
 		if package.is_none() {
 			self.diagnostics.push(
 				Diagnostic::error()
@@ -3019,13 +3063,23 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			return;
 		}
 
+		let index = PackageInstanceIdx::new(
+			u32::try_from(self.namespaces.package_instances.len()).unwrap(),
+		);
 		let visibility = Visibility::from(pub_span);
+		let loc = self.push_decl(
+			Namespace::from(namespace),
+			ItemDecl::new(DeclKind::PackageInstance(index), alias, visibility),
+		);
+		self.namespaces.package_instances.push(PackageInstanceDecl {
+			loc,
+			package_name,
+			package,
+		});
+		// An unknown key's instance has its row, but the alias binds no
+		// declaration, so a path through it ends silently.
 		let binding = if package.is_some() {
-			let decl_key = self.push_decl(
-				Namespace::from(namespace),
-				ItemDecl::new(DeclKind::PackageInstance(index), alias.span),
-			);
-			Binding::definition(decl_key, visibility)
+			Binding::definition(loc, visibility)
 		} else {
 			Binding::poisoned(visibility)
 		};
@@ -3037,51 +3091,77 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		);
 	}
 
-	/// Pushes a module together with its scope, which binds
-	/// `self` to the module, `crate` to its package's root and
+	/// The declaration that names `scope`: a module's or an import block's
+	/// row, or a package's own entry.
+	fn scope_key(&self, scope: Scope) -> ItemLoc {
+		match scope {
+			Scope::Package(package) => {
+				ItemLoc::new(Namespace::Package(package), DeclIdx::SELF)
+			}
+			Scope::Module(module) => self.modules[usize::from(module)].loc,
+			Scope::Import(import) => self.imports[usize::from(import)].loc,
+		}
+	}
+
+	/// Pushes a module, its row in `parent`'s table and its scope, which
+	/// binds `self` to the module, `package` to its package's root and
 	/// `super` to the scope it was declared in.
 	fn push_module(
 		&mut self,
-		module: ModuleDecl,
-		content_span: TextSpan,
+		parent: Scope,
+		own_file: FileId,
+		name: Spanned<SymbolU32>,
+		pub_span: Option<TextSpan>,
 	) -> ModuleIdx {
 		let index = ModuleIdx::new(u32::try_from(self.modules.len()).unwrap());
-		let parent = module.parent_namespace;
 		let package_id = self.namespaces.scope(parent).package_id;
-		let mut symbols = SymbolTable::new(module.own_file);
-		symbols
-			.items
-			.push(ItemDecl::new(DeclKind::Module(index), content_span));
-		self.modules.push(module);
+		let loc = self.push_decl(
+			parent.into(),
+			ItemDecl::new(
+				DeclKind::Module(index),
+				name,
+				Visibility::from(pub_span),
+			),
+		);
+		let parent_key = self.scope_key(parent);
+		self.modules.push(ModuleDecl { loc, own_file });
 		self.namespaces.modules.push(ScopeTable::child(
-			symbols,
-			Scope::Module(index),
+			SymbolTable::new(own_file),
+			loc,
 			parent,
+			parent_key,
 			package_id,
 		));
 		index
 	}
 
-	/// Pushes an import block with its own signature scope, using the same
-	/// `self`, `crate` and `super` qualifiers as a module.
+	/// Pushes an import block, its row in `parent`'s table and its own
+	/// signature scope, with the same `self`, `package` and `super`
+	/// qualifiers as a module.
 	fn push_import(
 		&mut self,
-		import: ImportDecl,
+		parent: Scope,
 		file_id: FileId,
-		content_span: TextSpan,
+		external_name: Spanned<SymbolU32>,
+		internal_name: Spanned<SymbolU32>,
 	) -> ImportIdx {
 		let index = ImportIdx::new(u32::try_from(self.imports.len()).unwrap());
-		let parent = import.parent_namespace;
 		let package_id = self.namespaces.scope(parent).package_id;
-		let mut symbols = SymbolTable::new(file_id);
-		symbols
-			.items
-			.push(ItemDecl::new(DeclKind::Import(index), content_span));
-		self.imports.push(import);
+		let loc = self.push_decl(
+			parent.into(),
+			ItemDecl::new(
+				DeclKind::Import(index),
+				internal_name,
+				Visibility::Private,
+			),
+		);
+		let parent_key = self.scope_key(parent);
+		self.imports.push(ImportDecl { loc, external_name });
 		self.namespaces.imports.push(ScopeTable::child(
-			symbols,
-			Scope::Import(index),
+			SymbolTable::new(file_id),
+			loc,
 			parent,
+			parent_key,
 			package_id,
 		));
 		index
@@ -3093,16 +3173,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		parent: Scope,
 		name: SymbolU32,
-		child: Namespace,
+		child: ItemLoc,
 		visibility: Visibility,
-	) -> Result<(), DeclKey> {
+	) -> Result<(), ItemLoc> {
 		self.namespaces.try_insert_binding(
 			parent.into(),
 			BindingKey::ty(name),
-			Binding::definition(
-				DeclKey::new(child, LocalDeclIdx::SELF),
-				visibility,
-			),
+			Binding::definition(child, visibility),
 		)
 	}
 }
@@ -3195,17 +3272,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let func_index = FunctionIdx::new(
 					u32::try_from(self.functions.len()).unwrap(),
 				);
-				let decl_key = self.push_decl(
+				let loc = self.push_decl(
 					Namespace::from(namespace),
 					ItemDecl::new(
 						DeclKind::Function(func_index),
-						signature.name.span,
+						signature.name,
+						Visibility::from(*pub_span),
 					),
 				);
 				// A function is a value and, like a struct, its own type: each
 				// one is a zero-sized type of its own (`foo<i32>`).
 				let binding =
-					Binding::definition(decl_key, Visibility::from(*pub_span));
+					Binding::definition(loc, Visibility::from(*pub_span));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					signature.name.inner,
@@ -3222,10 +3300,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					signature.name.span,
 				);
 				self.functions.push(FunctionDecl {
-					file_id,
-					namespace,
+					loc,
 					owner: MemberOwner::Free,
-					name: signature.name,
 					params,
 					function_impls,
 					attributes,
@@ -3266,22 +3342,24 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					name.span,
 					mut_span.is_some(),
 				);
+				let loc = self.push_decl(
+					Namespace::from(namespace),
+					ItemDecl::new(
+						DeclKind::Global(global_index),
+						*name,
+						Visibility::from(*pub_span),
+					),
+				);
 				self.globals.push(GlobalDecl {
-					file_id,
-					namespace,
-					name: *name,
+					loc,
 					trait_impl_index,
 					value_assoc_type_index,
 					mut_trait_impl_index,
 				});
-				let decl_key = self.push_decl(
-					Namespace::from(namespace),
-					ItemDecl::new(DeclKind::Global(global_index), name.span),
-				);
 				// The name is the global's zero-sized value and its own
 				// type, the one `Global` is implemented for.
 				let binding =
-					Binding::definition(decl_key, Visibility::from(*pub_span));
+					Binding::definition(loc, Visibility::from(*pub_span));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,
@@ -3303,9 +3381,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			} => {
 				let struct_index =
 					StructIdx::new(u32::try_from(self.structs.len()).unwrap());
-				let decl_key = self.push_decl(
+				let loc = self.push_decl(
 					Namespace::from(namespace),
-					ItemDecl::new(DeclKind::Struct(struct_index), name.span),
+					ItemDecl::new(
+						DeclKind::Struct(struct_index),
+						*name,
+						Visibility::from(*pub_span),
+					),
 				);
 				// The name is also the struct's constructor, called like a
 				// function. Constructing it takes every field, so it is only
@@ -3319,8 +3401,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,
-					Binding::definition(decl_key, Visibility::from(*pub_span)),
-					Binding::definition(decl_key, constructor_visibility),
+					Binding::definition(loc, Visibility::from(*pub_span)),
+					Binding::definition(loc, constructor_visibility),
 					name.span,
 				);
 
@@ -3368,9 +3450,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					self.intrinsics.char = Some(struct_index);
 				}
 				self.structs.push(StructDecl {
-					file_id,
-					namespace,
-					name: *name,
+					loc,
 					field_names: field_names.into_boxed_slice(),
 					field_pub_spans: field_pub_spans.into_boxed_slice(),
 					lookup,
@@ -3408,16 +3488,39 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let enum_index =
 					EnumIdx::new(u32::try_from(self.enums.len()).unwrap());
 				let own_namespace = Namespace::Enum(enum_index);
-				// All of the enum's variants in one `extend`, which is what keeps
-				// `EnumDecl::variants` contiguous.
+				let loc = self.push_decl(
+					Namespace::from(namespace),
+					ItemDecl::new(
+						DeclKind::Enum(enum_index),
+						*name,
+						Visibility::from(*pub_span),
+					),
+				);
+				self.namespaces.enums.push(SymbolTable::new(file_id));
+				// Each variant's row, in the enum's own table.
 				let first_variant =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
-				self.constants.extend(variants.iter().map(|variant| {
+				let mut variant_locs = Vec::with_capacity(variants.len());
+				for (offset, variant) in variants.iter().enumerate() {
+					let const_index = ConstIdx::new(
+						u32::from(first_variant)
+							+ u32::try_from(offset).unwrap(),
+					);
+					variant_locs.push(self.push_decl(
+						own_namespace,
+						ItemDecl::new(
+							DeclKind::EnumVariant(const_index),
+							variant.name,
+							Visibility::Private,
+						),
+					));
+				}
+				// All of the enum's variants in one `extend`, which is what keeps
+				// `EnumDecl::variants` contiguous.
+				self.constants.extend(variant_locs.iter().map(|&loc| {
 					ConstDecl {
-						file_id,
-						namespace,
+						loc,
 						owner: MemberOwner::Free,
-						name: variant.name,
 					}
 				}));
 				let end_variant =
@@ -3429,21 +3532,14 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					self.intrinsics.bool = Some(enum_index);
 				}
 				self.enums.push(EnumDecl {
-					file_id,
-					parent_namespace: namespace,
-					name: *name,
+					loc,
 					variants: first_variant..end_variant,
 					open,
 				});
-				self.namespaces.enums.push(SymbolTable::new(file_id));
-				let decl_key = self.push_decl(
-					Namespace::from(namespace),
-					ItemDecl::new(DeclKind::Enum(enum_index), name.span),
-				);
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
-					Binding::definition(decl_key, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_span)),
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -3454,17 +3550,12 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 
 				// A variant's written value is read in the scope around the
 				// enum, like any constant's initializer.
-				for (offset, &variant) in variants.iter().enumerate() {
+				for (offset, (&variant, variant_key)) in
+					variants.iter().zip(variant_locs).enumerate()
+				{
 					let const_index = ConstIdx::new(
 						u32::from(first_variant)
 							+ u32::try_from(offset).unwrap(),
-					);
-					let variant_key = self.push_decl(
-						own_namespace,
-						ItemDecl::new(
-							DeclKind::EnumVariant(const_index),
-							variant.name.span,
-						),
 					);
 					self.insert_binding(
 						own_namespace,
@@ -3493,17 +3584,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let type_alias_index = TypeAliasIdx::new(
 					u32::try_from(self.type_aliases.len()).unwrap(),
 				);
-				let decl_key = self.push_decl(
+				let loc = self.push_decl(
 					Namespace::from(namespace),
 					ItemDecl::new(
 						DeclKind::TypeAlias(type_alias_index),
-						name.span,
+						*name,
+						Visibility::from(*pub_span),
 					),
 				);
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
-					Binding::definition(decl_key, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_span)),
 					name.span,
 				);
 				if bodyless
@@ -3518,11 +3610,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						}
 					}
 				}
-				self.type_aliases.push(TypeAliasDecl {
-					file_id,
-					namespace,
-					name: *name,
-				});
+				self.type_aliases.push(TypeAliasDecl { loc });
 				if matches!(item, ast::Item::PackageType { .. }) {
 					self.record_crate_member(
 						file_id,
@@ -3552,20 +3640,22 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let (trait_impl_index, size_assoc_type_index) =
 					self.synthesize_memory_impl(file_id, namespace, name.span);
 				let limits = self.resolve_memory_limits(file_id, written);
+				let loc = self.push_decl(
+					Namespace::from(namespace),
+					ItemDecl::new(
+						DeclKind::Memory(memory_index),
+						*name,
+						Visibility::from(*pub_span),
+					),
+				);
 				self.memories.push(MemoryDecl {
-					file_id,
-					namespace,
-					name: *name,
+					loc,
 					trait_impl_index,
 					size_assoc_type_index,
 					limits,
 				});
-				let decl_key = self.push_decl(
-					Namespace::from(namespace),
-					ItemDecl::new(DeclKind::Memory(memory_index), name.span),
-				);
 				let binding =
-					Binding::definition(decl_key, Visibility::from(*pub_span));
+					Binding::definition(loc, Visibility::from(*pub_span));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,
@@ -3583,20 +3673,22 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			| ast::Item::PackageConst { pub_span, name, .. } => {
 				let const_index =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
-				self.constants.push(ConstDecl {
-					file_id,
-					namespace,
-					owner: MemberOwner::Free,
-					name: *name,
-				});
-				let decl_key = self.push_decl(
+				let loc = self.push_decl(
 					Namespace::from(namespace),
-					ItemDecl::new(DeclKind::Const(const_index), name.span),
+					ItemDecl::new(
+						DeclKind::Const(const_index),
+						*name,
+						Visibility::from(*pub_span),
+					),
 				);
+				self.constants.push(ConstDecl {
+					loc,
+					owner: MemberOwner::Free,
+				});
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::value(name.inner),
-					Binding::definition(decl_key, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_span)),
 					name.span,
 				);
 				if matches!(item, ast::Item::PackageConst { .. }) {
@@ -3619,20 +3711,12 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				items,
 				pub_span,
 			} => {
-				let module = self.push_module(
-					ModuleDecl {
-						parent_namespace: namespace,
-						declaration_file: file_id,
-						own_file: file_id,
-						name: *name,
-						pub_span: *pub_span,
-					},
-					items.span,
-				);
+				let module =
+					self.push_module(namespace, file_id, *name, *pub_span);
 				if let Err(collision) = self.bind_child(
 					namespace,
 					name.inner,
-					Namespace::Module(module),
+					self.modules[usize::from(module)].loc,
 					Visibility::from(*pub_span),
 				) {
 					self.diagnostics.push(
@@ -3657,7 +3741,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				}
 			}
 			// Nothing to do: Phase 1a already created this module's
-			// namespace (and set its `pub_span`) directly from vfs's
+			// namespace (and its row) directly from vfs's
 			// `SourceModule` tree, before any file's items were scanned.
 			ast::Item::ModuleDeclaration { .. } => {}
 			ast::Item::Trait {
@@ -3668,14 +3752,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			} => {
 				let trait_index =
 					TraitIdx(u32::try_from(self.traits.len()).unwrap());
-				let decl_key = self.push_decl(
+				let loc = self.push_decl(
 					Namespace::from(namespace),
-					ItemDecl::new(DeclKind::Trait(trait_index), name.span),
+					ItemDecl::new(
+						DeclKind::Trait(trait_index),
+						*name,
+						Visibility::from(*pub_span),
+					),
 				);
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
-					Binding::definition(decl_key, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_span)),
 					name.span,
 				);
 				if self.namespaces.scope(namespace).package_id
@@ -3720,16 +3808,24 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 									namespace,
 									signature.name.span,
 								);
-							let function_index =
-								self.push_function(FunctionDecl {
-									file_id,
-									namespace,
-									owner: MemberOwner::Trait(trait_index),
-									name: signature.name,
-									params,
-									function_impls,
-									attributes,
-								});
+							let function_index = FunctionIdx::new(
+								u32::try_from(self.functions.len()).unwrap(),
+							);
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::Function(function_index),
+									signature.name,
+									Visibility::Private,
+								),
+							);
+							self.functions.push(FunctionDecl {
+								loc,
+								owner: MemberOwner::Trait(trait_index),
+								params,
+								function_impls,
+								attributes,
+							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
 								namespace,
@@ -3755,11 +3851,17 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							let const_index = ConstIdx::new(
 								u32::try_from(self.constants.len()).unwrap(),
 							);
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::Const(const_index),
+									*name,
+									Visibility::Private,
+								),
+							);
 							self.constants.push(ConstDecl {
-								file_id,
-								namespace,
+								loc,
 								owner: MemberOwner::Trait(trait_index),
-								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -3782,11 +3884,15 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							let assoc_type_index = AssocTypeIdx::new(
 								u32::try_from(self.assoc_types.len()).unwrap(),
 							);
-							self.assoc_types.push(AssocTypeDecl {
-								file_id,
-								namespace,
-								name: *name,
-							});
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::AssocType(assoc_type_index),
+									*name,
+									Visibility::Private,
+								),
+							);
+							self.assoc_types.push(AssocTypeDecl { loc });
 							self.ast_nodes.push(AstEntry {
 								file_id,
 								namespace,
@@ -3894,11 +4000,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						};
 				}
 				let actual_index = self.push_trait(TraitDecl {
+					loc,
 					typeset: None,
-					file_id,
-					namespace,
-					pub_span: *pub_span,
-					name: *name,
 					bindings,
 					members,
 				});
@@ -3944,18 +4047,24 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 									namespace,
 									signature.name.span,
 								);
-							let function_index =
-								self.push_function(FunctionDecl {
-									file_id,
-									namespace,
-									owner: MemberOwner::InherentImpl(
-										block_index,
-									),
-									name: signature.name,
-									params,
-									function_impls,
-									attributes,
-								});
+							let function_index = FunctionIdx::new(
+								u32::try_from(self.functions.len()).unwrap(),
+							);
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::Function(function_index),
+									signature.name,
+									Visibility::from(*pub_span),
+								),
+							);
+							self.functions.push(FunctionDecl {
+								loc,
+								owner: MemberOwner::InherentImpl(block_index),
+								params,
+								function_impls,
+								attributes,
+							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
 								namespace,
@@ -3972,7 +4081,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 									} else {
 										MemberKind::Function(function_index)
 									},
-									visibility: Visibility::from(*pub_span),
 									span: signature.name.span,
 								},
 								BindingKey::value(signature.name.inner),
@@ -3983,11 +4091,17 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							let const_index = ConstIdx::new(
 								u32::try_from(self.constants.len()).unwrap(),
 							);
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::Const(const_index),
+									*name,
+									Visibility::from(*pub_span),
+								),
+							);
 							self.constants.push(ConstDecl {
-								file_id,
-								namespace,
+								loc,
 								owner: MemberOwner::InherentImpl(block_index),
-								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -4001,7 +4115,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							(
 								InherentMemberDecl {
 									kind: MemberKind::Constant(const_index),
-									visibility: Visibility::from(*pub_span),
 									span: name.span,
 								},
 								BindingKey::value(name.inner),
@@ -4073,19 +4186,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				};
 
 				let import = self.push_import(
-					ImportDecl {
-						external_name,
-						internal_name,
-						parent_namespace: namespace,
-					},
+					namespace,
 					file_id,
-					items.span,
+					external_name,
+					internal_name,
 				);
 				let own_namespace = Namespace::Import(import);
 				if let Err(collision) = self.bind_child(
 					namespace,
 					internal_name.inner,
-					own_namespace,
+					self.imports[usize::from(import)].loc,
 					Visibility::Public,
 				) {
 					self.diagnostics.push(
@@ -4105,7 +4215,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// their signatures (and synthetic impls) in its sibling scope.
 				let namespace = Scope::Import(import);
 				for item in items.inner.iter() {
-					let import_block = match &item.inner.inner {
+					let (import_block, external_name) = match &item.inner.inner
+					{
 						ast::ImportEntry::Use { tree, pub_span } => {
 							self.scan_use_tree(
 								namespace, tree, None, *pub_span,
@@ -4113,8 +4224,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							continue;
 						}
 						ast::ImportEntry::Declaration {
-							declaration, ..
-						} => declaration,
+							declaration,
+							external_name,
+						} => (declaration, *external_name),
 					};
 					match import_block {
 						ast::ImportDeclaration::Memory { name, .. } => {
@@ -4125,25 +4237,29 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								self.synthesize_memory_impl(
 									file_id, namespace, name.span,
 								);
-							self.memories.push(MemoryDecl {
+							let loc = self.push_decl(
+								own_namespace,
+								ItemDecl::new(
+									DeclKind::Memory(memory_index),
+									*name,
+									Visibility::Private,
+								),
+							);
+							self.push_import_entry(
 								file_id,
-								namespace,
-								name: *name,
+								loc,
+								external_name,
+								*name,
+								item.inner.span,
+							);
+							self.memories.push(MemoryDecl {
+								loc,
 								trait_impl_index,
 								size_assoc_type_index,
 								limits: MemoryLimits::default(),
 							});
-							let decl_key = self.push_decl(
-								own_namespace,
-								ItemDecl::new(
-									DeclKind::Memory(memory_index),
-									name.span,
-								),
-							);
-							let binding = Binding::definition(
-								decl_key,
-								Visibility::Public,
-							);
+							let binding =
+								Binding::definition(loc, Visibility::Public);
 							self.insert_type_and_value(
 								own_namespace,
 								name.inner,
@@ -4174,27 +4290,33 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 									namespace,
 									signature.name.span,
 								);
-							let function_index =
-								self.push_function(FunctionDecl {
-									file_id,
-									namespace,
-									owner: MemberOwner::Free,
-									name: signature.name,
-									params,
-									function_impls,
-									attributes: Attributes::empty(),
-								});
-							let decl_key = self.push_decl(
-								own_namespace,
+							let function_index = FunctionIdx::new(
+								u32::try_from(self.functions.len()).unwrap(),
+							);
+							let loc = self.push_decl(
+								Namespace::from(namespace),
 								ItemDecl::new(
 									DeclKind::Function(function_index),
-									signature.name.span,
+									signature.name,
+									Visibility::Private,
 								),
 							);
-							let binding = Binding::definition(
-								decl_key,
-								Visibility::Public,
+							self.functions.push(FunctionDecl {
+								loc,
+								owner: MemberOwner::Free,
+								params,
+								function_impls,
+								attributes: Attributes::empty(),
+							});
+							self.push_import_entry(
+								file_id,
+								loc,
+								external_name,
+								signature.name,
+								item.inner.span,
 							);
+							let binding =
+								Binding::definition(loc, Visibility::Public);
 							self.insert_type_and_value(
 								own_namespace,
 								signature.name.inner,
@@ -4230,25 +4352,29 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								name.span,
 								mut_span.is_some(),
 							);
+							let loc = self.push_decl(
+								own_namespace,
+								ItemDecl::new(
+									DeclKind::Global(global_index),
+									*name,
+									Visibility::Private,
+								),
+							);
 							self.globals.push(GlobalDecl {
-								file_id,
-								namespace,
-								name: *name,
+								loc,
 								trait_impl_index,
 								value_assoc_type_index,
 								mut_trait_impl_index,
 							});
-							let decl_key = self.push_decl(
-								own_namespace,
-								ItemDecl::new(
-									DeclKind::Global(global_index),
-									name.span,
-								),
+							self.push_import_entry(
+								file_id,
+								loc,
+								external_name,
+								*name,
+								item.inner.span,
 							);
-							let binding = Binding::definition(
-								decl_key,
-								Visibility::Public,
-							);
+							let binding =
+								Binding::definition(loc, Visibility::Public);
 							self.insert_type_and_value(
 								own_namespace,
 								name.inner,
@@ -4313,22 +4439,41 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						}
 					}
 				}
-				let decl_key = self.push_decl(
+				let loc = self.push_decl(
 					Namespace::from(namespace),
-					ItemDecl::new(DeclKind::TypeSet(typeset_index), name.span),
+					ItemDecl::new(
+						DeclKind::TypeSet(typeset_index),
+						*name,
+						Visibility::from(*pub_span),
+					),
 				);
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
-					Binding::definition(decl_key, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_span)),
 					name.span,
 				);
-				let trait_index = self.push_trait(TraitDecl {
+				// Its trait is generated: a row of its own, with the typeset's
+				// name and visibility and an empty span at the typeset's name.
+				let trait_index =
+					TraitIdx(u32::try_from(self.traits.len()).unwrap());
+				let trait_decl = self.push_decl(
+					Namespace::from(namespace),
+					ItemDecl::new(
+						DeclKind::Trait(trait_index),
+						Spanned {
+							inner: name.inner,
+							span: TextSpan::new(
+								name.span.start,
+								name.span.start,
+							),
+						},
+						Visibility::from(*pub_span),
+					),
+				);
+				let actual_index = self.push_trait(TraitDecl {
+					loc: trait_decl,
 					typeset: Some(typeset_index),
-					file_id,
-					namespace,
-					pub_span: *pub_span,
-					name: *name,
 					bindings: FxHashMap::default(),
 					members: Vec::new(),
 				});
@@ -4343,10 +4488,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						})
 					})
 					.collect();
+				debug_assert_eq!(trait_index, actual_index);
 				self.typesets.push(TypesetDecl {
-					file_id,
-					namespace,
-					name: *name,
+					loc,
 					trait_index,
 					member_impls,
 				});
@@ -4400,16 +4544,24 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 									namespace,
 									signature.name.span,
 								);
-							let function_index =
-								self.push_function(FunctionDecl {
-									file_id,
-									namespace,
-									owner: MemberOwner::TraitImpl(block_index),
-									name: signature.name,
-									params,
-									function_impls,
-									attributes,
-								});
+							let function_index = FunctionIdx::new(
+								u32::try_from(self.functions.len()).unwrap(),
+							);
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::Function(function_index),
+									signature.name,
+									Visibility::Private,
+								),
+							);
+							self.functions.push(FunctionDecl {
+								loc,
+								owner: MemberOwner::TraitImpl(block_index),
+								params,
+								function_impls,
+								attributes,
+							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
 								namespace,
@@ -4435,11 +4587,17 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							let const_index = ConstIdx::new(
 								u32::try_from(self.constants.len()).unwrap(),
 							);
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::Const(const_index),
+									*name,
+									Visibility::Private,
+								),
+							);
 							self.constants.push(ConstDecl {
-								file_id,
-								namespace,
+								loc,
 								owner: MemberOwner::TraitImpl(block_index),
-								name: *name,
 							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
@@ -4462,11 +4620,15 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							let assoc_type_index = AssocTypeIdx::new(
 								u32::try_from(self.assoc_types.len()).unwrap(),
 							);
-							self.assoc_types.push(AssocTypeDecl {
-								file_id,
-								namespace,
-								name: *name,
-							});
+							let loc = self.push_decl(
+								Namespace::from(namespace),
+								ItemDecl::new(
+									DeclKind::AssocType(assoc_type_index),
+									*name,
+									Visibility::Private,
+								),
+							);
+							self.assoc_types.push(AssocTypeDecl { loc });
 							self.ast_nodes.push(AstEntry {
 								file_id,
 								namespace,
@@ -5210,14 +5372,14 @@ mod tests {
 			let index = slot.unwrap_or_else(|| {
 				panic!("missing intrinsic `{expected_name}`")
 			});
-			let name = case.decls.type_aliases[usize::from(index)].name.inner;
+			let name = case.decls.name(index).inner;
 			assert_eq!(case.strings.resolve(name), Some(expected_name));
 		}
 		let bool = intrinsics.bool.expect("`Bool` is recorded");
-		let name = case.decls.enums[usize::from(bool)].name.inner;
+		let name = case.decls.name(bool).inner;
 		assert_eq!(case.strings.resolve(name), Some("Bool"));
 		let char = intrinsics.char.expect("`Char` is recorded");
-		let name = case.decls.structs[usize::from(char)].name.inner;
+		let name = case.decls.name(char).inner;
 		assert_eq!(case.strings.resolve(name), Some("Char"));
 	}
 
@@ -5265,7 +5427,7 @@ mod tests {
 			let index = slot.unwrap_or_else(|| {
 				panic!("missing intrinsic `{expected_name}`")
 			});
-			let name = case.decls.traits[usize::from(index)].name.inner;
+			let name = case.decls.name(index).inner;
 			assert_eq!(case.strings.resolve(name), Some(expected_name));
 		}
 	}
@@ -5282,7 +5444,7 @@ mod tests {
 			.intrinsics
 			.integer
 			.expect("`Integer` is recorded");
-		let name = case.decls.typesets[usize::from(integer)].name.inner;
+		let name = case.decls.name(integer).inner;
 		assert_eq!(case.strings.resolve(name), Some("Integer"));
 	}
 
@@ -5319,7 +5481,8 @@ mod tests {
 		let u8_index =
 			case.decls.intrinsics.u8.expect("u8 should still resolve");
 		assert_eq!(
-			case.decls.type_aliases[usize::from(u8_index)].namespace,
+			case.decls
+				.scope(case.decls.type_aliases[usize::from(u8_index)].loc),
 			stdlib_namespace,
 			"u8 must still point into the stdlib package, not the binary one"
 		);
@@ -5371,10 +5534,13 @@ mod tests {
 				panic!("expected `{path}` to be a memory");
 			};
 			let memory = &case.decls.memories[usize::from(index)];
-			assert_eq!(case.strings.resolve(memory.name.inner), Some(name));
-			assert_eq!(memory.namespace, namespace);
 			assert_eq!(
-				memory.file_id,
+				case.strings.resolve(case.decls.item(memory.loc).name.inner),
+				Some(name)
+			);
+			assert_eq!(case.decls.scope(memory.loc), namespace);
+			assert_eq!(
+				case.decls.file_id(memory.loc),
 				case.decls.namespaces.file_id(root.into())
 			);
 			indices.push(index);
@@ -5392,8 +5558,12 @@ mod tests {
 			panic!("expected an imported function");
 		};
 		let function = &case.decls.functions[usize::from(index)];
-		assert_eq!(function.namespace, imported);
-		assert_eq!(case.strings.resolve(function.name.inner), Some("log"));
+		assert_eq!(case.decls.scope(function.loc), imported);
+		assert_eq!(
+			case.strings
+				.resolve(case.decls.item(function.loc).name.inner),
+			Some("log")
+		);
 		assert!(matches!(
 			case.resolve(Tier::Value, "host::counter").expect_success(),
 			DeclKind::Global(_),
@@ -5446,6 +5616,265 @@ mod tests {
 		case.resolve(Tier::Type, "host::host")
 			.diagnostics()
 			.assert_error(DiagnosticCode::UndeclaredIdentifier);
+	}
+
+	/// Each host import records the entry it is written in and the field it
+	/// is imported as: the string written before it, or else its own name, at
+	/// the name's span. A string that does not decode keeps its span, so the
+	/// field is still the one written.
+	#[test]
+	fn a_host_import_records_its_entry_and_field() {
+		let source = indoc! {r#"
+			import "env" as host {
+				func log(value: i32);
+				"Tick": func tick();
+				"b\q": global depth: i32;
+			}
+		"#};
+		let mut case = TestCase::new(source);
+		let at = |text: &str| {
+			let start = u32::try_from(source.find(text).unwrap()).unwrap();
+			TextSpan::new(start, start + u32::try_from(text.len()).unwrap())
+		};
+		let mut entry = |path: &str| {
+			let loc = case.resolve(Tier::Value, path).target().loc().unwrap();
+			let entry = case.decls.import_entry(loc).unwrap();
+			let field = case.strings.resolve(entry.field.inner).unwrap();
+			(field.to_owned(), entry.field.span, entry.span.start)
+		};
+		assert_eq!(
+			entry("host::log"),
+			("log".to_owned(), at("log"), at("func log").start),
+		);
+		assert_eq!(
+			entry("host::tick"),
+			("Tick".to_owned(), at(r#""Tick""#), at(r#""Tick""#).start),
+		);
+		assert_eq!(
+			entry("host::depth"),
+			("depth".to_owned(), at(r#""b\q""#), at(r#""b\q""#).start),
+		);
+	}
+
+	/// A module and an import block are declared where their names are
+	/// written: a row in the table of the scope around them, which `self`
+	/// inside them and `super` inside their children name too.
+	#[test]
+	fn a_module_and_an_import_block_are_rows_where_their_names_are_written() {
+		let source = indoc! {r#"
+			mod geo {
+				import "env" as host { func log(); }
+			}
+		"#};
+		let mut case = TestCase::new(source);
+		case.diagnostics().assert_none();
+		let mut key =
+			|path| case.resolve(Tier::Type, path).target().loc().unwrap();
+		let (geo, host) = (key("geo"), key("geo::host"));
+		assert_eq!(key("geo::self"), geo);
+		assert_eq!(key("geo::host::self"), host);
+		assert_eq!(key("geo::host::super"), geo);
+		let root = case.decls.root_package;
+		assert_eq!(geo.namespace, Namespace::Package(root));
+		let DeclKind::Module(module) = case.decls.namespaces.kind(geo) else {
+			panic!("`geo` is a module");
+		};
+		assert_eq!(host.namespace, Namespace::Module(module));
+		for (key, name) in [(geo, "geo"), (host, "host")] {
+			let span = key.source_span(&case.decls.namespaces).span;
+			assert_eq!(span.extract_str(source), name);
+		}
+	}
+
+	/// Every declaration is a row, and its arena entry points back at it:
+	/// the row's kind leads back to the entry, and every row but a package's
+	/// own entry is exactly one entry's. Run over the user's package and std,
+	/// which between them declare every kind (and std every generated one).
+	/// The rows hold what is written: members, generated declarations and
+	/// import entries are rows of the scope they are written in, a generated
+	/// one's name span is empty, and the visibility is whether `pub` is
+	/// written.
+	#[test]
+	fn every_declaration_is_a_row_its_arena_entry_points_at() {
+		let source = indoc! {r#"
+			pub struct Point(x: u32, y: u32);
+			enum Color(u8) { Red = 0, Green, .. }
+			pub trait Shape {
+				type Unit;
+				const SIDES: u32;
+				func area(self: Self) -> u32;
+			}
+			impl Shape for Point {
+				type Unit = u32;
+				const SIDES: u32 = 0;
+				func area(self: Self) -> u32 { 0 }
+			}
+			impl Point {
+				pub func origin() -> Point { Point(0, 0) }
+				const ZERO: u32 = 0;
+			}
+			typeset Small: StackValue { u8, u16 }
+			type Alias = u32;
+			memory heap: u32;
+			pub global mut counter: u32 = 0;
+			const LIMIT: u32 = 4;
+			func run() {}
+			pub mod geo {
+				import "env" as host {
+					"Log": func log(value: u32);
+					global base: u32;
+					memory mem: u32;
+				}
+			}
+		"#};
+		let case = TestCase::new(source);
+		case.diagnostics().assert_no_errors();
+		let decls = &case.decls;
+		let namespaces = &decls.namespaces;
+		let mut rows = 0;
+		let mut check = |decl: ItemLoc, kind: DeclKind| {
+			assert_eq!(namespaces.kind(decl), kind);
+			rows += 1;
+		};
+		for (index, decl) in decls.structs.iter().enumerate() {
+			let kind = DeclKind::Struct(StructIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.enums.iter().enumerate() {
+			let kind = DeclKind::Enum(EnumIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		let variants: Vec<ConstIdx> = decls
+			.enums
+			.iter()
+			.flat_map(|decl| {
+				(u32::from(decl.variants.start)..u32::from(decl.variants.end))
+					.map(ConstIdx::new)
+			})
+			.collect();
+		for (index, decl) in decls.constants.iter().enumerate() {
+			let index = ConstIdx::new(index as u32);
+			let kind = if variants.contains(&index) {
+				DeclKind::EnumVariant(index)
+			} else {
+				DeclKind::Const(index)
+			};
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.traits.iter().enumerate() {
+			let kind = DeclKind::Trait(TraitIdx::new(index as u32));
+			// A typeset's trait has the typeset's name, written nowhere.
+			if decl.typeset.is_some() {
+				let name = namespaces.item(decl.loc).name;
+				assert_eq!(name.span.start, name.span.end);
+			}
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.typesets.iter().enumerate() {
+			let kind = DeclKind::TypeSet(TypesetIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.type_aliases.iter().enumerate() {
+			let kind = DeclKind::TypeAlias(TypeAliasIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.functions.iter().enumerate() {
+			let kind = DeclKind::Function(FunctionIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.memories.iter().enumerate() {
+			let kind = DeclKind::Memory(MemoryIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.globals.iter().enumerate() {
+			let kind = DeclKind::Global(GlobalIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.assoc_types.iter().enumerate() {
+			let kind = DeclKind::AssocType(AssocTypeIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.modules.iter().enumerate() {
+			let kind = DeclKind::Module(ModuleIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in decls.imports.iter().enumerate() {
+			let kind = DeclKind::Import(ImportIdx::new(index as u32));
+			check(decl.loc, kind);
+		}
+		for (index, decl) in namespaces.package_instances().iter().enumerate() {
+			let kind = DeclKind::PackageInstance(PackageInstanceIdx::new(
+				index as u32,
+			));
+			check(decl.loc, kind);
+		}
+		// Every other row is a package's own entry.
+		let packages = namespaces.packages.len();
+		assert_eq!(namespaces.keys().count(), rows + packages);
+		for package in &namespaces.packages {
+			let own = ItemLoc::new(
+				Namespace::Package(package.package_id),
+				DeclIdx::SELF,
+			);
+			let row = namespaces.item(own);
+			assert_eq!(row.kind, DeclKind::Package(package.package_id));
+			assert_eq!(row.name.inner, Keyword::Package.symbol());
+			assert_eq!(row.name.span, TextSpan::new(0, 0));
+		}
+		// The user's members, generated rows and import entries are rows of
+		// the scope they are written in, under their own names.
+		let root = Namespace::Package(decls.root_package);
+		let names_in = |namespace: Namespace| -> Vec<(&str, bool, Visibility)> {
+			namespaces
+				.symbols(namespace)
+				.items
+				.iter()
+				.map(|row| {
+					(
+						case.strings.resolve(row.name.inner).unwrap(),
+						row.name.span.start == row.name.span.end,
+						row.visibility,
+					)
+				})
+				.collect()
+		};
+		let root_rows = names_in(root);
+		for (written, visibility) in [
+			("Point", Visibility::Public),
+			("Color", Visibility::Private),
+			("Shape", Visibility::Public),
+			("area", Visibility::Private),
+			("SIDES", Visibility::Private),
+			("Unit", Visibility::Private),
+			("origin", Visibility::Public),
+			("ZERO", Visibility::Private),
+			("counter", Visibility::Public),
+			("geo", Visibility::Public),
+		] {
+			assert!(
+				root_rows.contains(&(written, false, visibility)),
+				"{written}"
+			);
+		}
+		// A typeset's trait is generated, with the typeset's visibility.
+		for generated in ["Small", "Args", "Result", "Size", "Value"] {
+			assert!(
+				root_rows.contains(&(generated, true, Visibility::Private)),
+				"{generated}"
+			);
+		}
+		let DeclKind::Import(import) = namespaces
+			.kind(case.decls.imports.last().expect("`host` is an import").loc)
+		else {
+			unreachable!()
+		};
+		let host_rows = names_in(Namespace::Import(import));
+		for written in ["log", "base", "mem"] {
+			assert!(
+				host_rows.contains(&(written, false, Visibility::Private)),
+				"{written}"
+			);
+		}
 	}
 
 	/// An import block is a namespace like an enum is: `use` can reach its
@@ -5504,7 +5933,7 @@ mod tests {
 			panic!("expected a free constant");
 		};
 		let mut ids =
-			std::collections::HashSet::from([DeclId::Const(free_constant)]);
+			std::collections::HashSet::from([free_constant.loc(&case.decls)]);
 		let members = case.decls.traits[0]
 			.members
 			.iter()
@@ -5523,31 +5952,27 @@ mod tests {
 			);
 		for kind in members {
 			assert!(
-				ids.insert(kind.decl_id()),
+				ids.insert(kind.loc(&case.decls)),
 				"members must have distinct identities"
 			);
 			let (name, expected) = match kind {
-				MemberKind::Function(index) => {
-					(case.decls.functions[usize::from(index)].name, "make")
-				}
-				MemberKind::Method(index) => {
-					(case.decls.functions[usize::from(index)].name, "get")
-				}
+				MemberKind::Function(index) => (case.decls.name(index), "make"),
+				MemberKind::Method(index) => (case.decls.name(index), "get"),
 				MemberKind::Constant(index) => {
-					(case.decls.constants[usize::from(index)].name, "VALUE")
+					(case.decls.name(index), "VALUE")
 				}
 				MemberKind::AssociatedType(index) => {
-					(case.decls.assoc_types[usize::from(index)].name, "Item")
+					(case.decls.name(index), "Item")
 				}
 			};
 			assert_eq!(case.strings.resolve(name.inner), Some(expected));
 		}
 		assert_eq!(ids.len(), 12);
 		for decl in &case.decls.constants {
-			assert_eq!(decl.namespace, case.root_namespace());
+			assert_eq!(case.decls.scope(decl.loc), case.root_namespace());
 		}
 		for decl in &case.decls.assoc_types {
-			assert_eq!(decl.namespace, case.root_namespace());
+			assert_eq!(case.decls.scope(decl.loc), case.root_namespace());
 		}
 	}
 
@@ -5719,7 +6144,7 @@ mod tests {
 		let DeclKind::EnumVariant(same) = result.expect_success() else {
 			panic!("`E::Same` is an enum variant");
 		};
-		let key = result.target().decl_key().unwrap();
+		let key = result.target().loc().unwrap();
 		let first = source.find("Same").unwrap();
 		assert_eq!(
 			std::ops::Range::from(key.source_span(&case.decls.namespaces).span),
@@ -5745,7 +6170,7 @@ mod tests {
 		assert_eq!(u32::from(after), u32::from(same) + 2);
 		let names: Vec<_> = (u32::from(run.start)..u32::from(run.end))
 			.map(|index| {
-				let name = case.decls.constants[index as usize].name.inner;
+				let name = case.decls.name(ConstIdx::new(index)).inner;
 				case.strings.resolve(name).unwrap()
 			})
 			.collect();
@@ -5802,9 +6227,7 @@ mod tests {
 				panic!("expected a later associated function");
 			};
 			assert_eq!(
-				case.strings.resolve(
-					case.decls.functions[usize::from(index)].name.inner
-				),
+				case.strings.resolve(case.decls.name(index).inner),
 				Some("after")
 			);
 		}
@@ -6069,9 +6492,7 @@ mod tests {
 				_ => panic!("expected a function member"),
 			};
 			assert_eq!(
-				case.strings.resolve(
-					case.decls.functions[usize::from(index)].name.inner
-				),
+				case.strings.resolve(case.decls.name(index).inner),
 				Some(expected_name)
 			);
 		}
@@ -6371,7 +6792,7 @@ mod tests {
 			.get(
 				case.decls
 					.namespaces
-					.file_id(import.parent_namespace.into()),
+					.file_id(case.decls.scope(import.loc).into()),
 			)
 			.unwrap()
 			.source;
@@ -6655,7 +7076,10 @@ mod tests {
 		assert_eq!(case.decls.namespaces.package_instances().len(), 1);
 		let item = &case.decls.namespaces.package_instances()[0];
 		assert_eq!(case.strings.resolve(item.package_name.inner), Some("math"));
-		assert_eq!(case.strings.resolve(item.alias.inner), Some("m"));
+		assert_eq!(
+			case.strings.resolve(case.decls.item(item.loc).name.inner),
+			Some("m")
+		);
 		assert!(item.package.is_some());
 
 		assert!(matches!(
@@ -6832,7 +7256,11 @@ mod tests {
 
 			case.diagnostics()
 				.assert_error(DiagnosticCode::DuplicateDefinition);
-			let alias = case.decls.namespaces.package_instances()[0].alias.span;
+			let alias = case
+				.decls
+				.item(case.decls.namespaces.package_instances()[0].loc)
+				.name
+				.span;
 			let ranges: Vec<_> = case.diagnostics[0]
 				.labels
 				.iter()
@@ -6867,9 +7295,12 @@ mod tests {
 		let declared = DeclKind::PackageInstance(index)
 			.declared_at(&case.decls)
 			.unwrap();
+		assert_eq!(declared, case.decls.declaration_span(item.loc));
 		assert_eq!(
-			(declared.file_id, declared.span),
-			(item.file_id, item.alias.span)
+			declared
+				.span
+				.extract_str(r#"package "math" as m; use m::add;"#),
+			"m"
 		);
 
 		assert!(matches!(
@@ -6896,11 +7327,9 @@ mod tests {
 	/// The attributes prescan recorded on the function named `name`.
 	fn function_attributes(case: &TestCase, name: &str) -> Attributes {
 		let symbol = case.strings.get(name).unwrap();
-		let mut found = case
-			.decls
-			.functions
-			.iter()
-			.filter(|function| function.name.inner == symbol);
+		let mut found = case.decls.functions.iter().filter(|function| {
+			case.decls.item(function.loc).name.inner == symbol
+		});
 		let function = found.next().expect("the function is declared");
 		assert!(found.next().is_none(), "`{name}` names one function");
 		function.attributes
@@ -6942,7 +7371,9 @@ mod tests {
 			.decls
 			.functions
 			.iter()
-			.filter(|function| function.name.inner == required)
+			.filter(|function| {
+				case.decls.item(function.loc).name.inner == required
+			})
 			.map(|function| function.attributes.contains(Attributes::INLINE))
 			.collect();
 		assert_eq!(inline, [false, true]);
@@ -6958,7 +7389,7 @@ mod tests {
 			.decls
 			.memories
 			.iter()
-			.find(|memory| memory.name.inner == symbol)
+			.find(|memory| case.decls.item(memory.loc).name.inner == symbol)
 			.expect("the memory is declared");
 		(
 			memory.limits.min_pages.map(|pages| pages.inner),

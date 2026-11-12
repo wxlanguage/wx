@@ -15,22 +15,22 @@ use crate::{
 };
 
 use super::decls::{
-	Binding, BindingKey, BindingLookup, BindingTarget, DeclKey,
-	DuplicateDefinitionDiagnostic, GlobImport, Namespace, Namespaces, Scope,
-	UseItemDecl, UseItemIndex, UseItemKind, UsePathIndex, UsePathSegment,
-	Visibility,
+	Binding, BindingKey, BindingLookup, BindingTarget,
+	DuplicateDefinitionDiagnostic, GlobImport, ItemLoc, Namespace, Namespaces,
+	Scope, UseItemDecl, UseItemIndex, UseItemKind, UsePathIndex,
+	UsePathSegment, Visibility,
 };
 use super::resolutions::{NameResolutions, Reference, Site};
 
 /// Outcome of looking up one `BindingKey` slot for a `use` leaf's target
-/// name. Kept distinct from a plain `Option<DeclKey>` so the caller can
+/// name. Kept distinct from a plain `Option<ItemLoc>` so the caller can
 /// tell "nothing by this name here" apart from "something's here, but not
-/// visible" — resolution proceeds either way (both carry the `DeclKey`),
+/// visible" — resolution proceeds either way (both carry the `ItemLoc`),
 /// but only `Absent` means there's truly nothing to install.
 #[derive(Clone, Copy)]
 enum ImportSlot {
-	Accessible(DeclKey, Visibility),
-	Inaccessible(DeclKey, Visibility),
+	Accessible(ItemLoc, Visibility),
+	Inaccessible(ItemLoc, Visibility),
 	/// No binding for this key at all — genuinely nothing by this name.
 	Absent,
 	/// A binding exists, but it's an `Error`-recovery placeholder from an
@@ -445,15 +445,15 @@ impl<'r> ImportResolver<'r> {
 		match (type_decl, value_decl) {
 			(ImportSlot::Accessible(..), _)
 			| (_, ImportSlot::Accessible(..)) => {}
-			(ImportSlot::Inaccessible(decl_key, _), _)
-			| (_, ImportSlot::Inaccessible(decl_key, _)) => {
+			(ImportSlot::Inaccessible(loc, _), _)
+			| (_, ImportSlot::Inaccessible(loc, _)) => {
 				let file_id = self.namespaces.file_id(namespace.into());
 				let diagnostic = report_private_identifier(
 					self.namespaces,
 					self.strings,
 					name.inner,
 					SourceSpan::new(file_id, name.span),
-					Some(decl_key),
+					Some(loc),
 				);
 				self.diagnostics.push(diagnostic);
 				type_decl = type_decl.recovered();
@@ -679,10 +679,10 @@ impl<'r> ImportResolver<'r> {
 				visibility,
 				import,
 			} => {
-				if let Some(decl_key) = target.decl_key() {
+				if let Some(loc) = target.loc() {
 					self.resolutions.record(
 						Site::new(key.tier, source_span),
-						Reference::from_lookup(decl_key, import),
+						Reference::from_lookup(loc, import),
 					);
 				}
 				(target, visibility)
@@ -708,17 +708,17 @@ impl<'r> ImportResolver<'r> {
 		let slot = match target {
 			// Already inaccessible at an earlier link in a re-export chain —
 			// can't become more accessible by being re-exported further.
-			BindingTarget::Inaccessible(decl_key) => {
-				ImportSlot::Inaccessible(decl_key, visibility)
+			BindingTarget::Inaccessible(loc) => {
+				ImportSlot::Inaccessible(loc, visibility)
 			}
-			BindingTarget::Accessible(decl_key) => {
+			BindingTarget::Accessible(loc) => {
 				if self
 					.namespaces
 					.is_accessible_from(accessor, scope, visibility)
 				{
-					ImportSlot::Accessible(decl_key, visibility)
+					ImportSlot::Accessible(loc, visibility)
 				} else {
-					ImportSlot::Inaccessible(decl_key, visibility)
+					ImportSlot::Inaccessible(loc, visibility)
 				}
 			}
 			// An `Error`-recovery placeholder — already diagnosed by
@@ -869,10 +869,10 @@ impl<'r> ImportResolver<'r> {
 				visibility,
 				import,
 			} => {
-				if let Some(decl_key) = target.decl_key() {
+				if let Some(loc) = target.loc() {
 					self.resolutions.record(
 						Site::new(key.tier, source_span),
-						Reference::from_lookup(decl_key, import),
+						Reference::from_lookup(loc, import),
 					);
 				}
 				(target, visibility)
@@ -911,15 +911,15 @@ impl<'r> ImportResolver<'r> {
 				self.strings,
 				segment.segment.inner,
 				source_span,
-				target.decl_key(),
+				target.loc(),
 			);
 			self.diagnostics.push(diagnostic);
 		}
-		let BindingTarget::Accessible(decl_key) = target else {
+		let BindingTarget::Accessible(loc) = target else {
 			return Err(());
 		};
 
-		match self.namespaces.entered_by(decl_key) {
+		match self.namespaces.entered_by(loc) {
 			Some(namespace) => Ok(namespace),
 			None => {
 				let diagnostic = report_cannot_use_as_namespace(
@@ -927,7 +927,7 @@ impl<'r> ImportResolver<'r> {
 					self.strings,
 					segment.segment.inner,
 					source_span,
-					decl_key,
+					loc,
 				);
 				self.diagnostics.push(diagnostic);
 				Err(())
@@ -1094,12 +1094,12 @@ pub(super) fn report_ambiguous_identifier(
 		.with_message(format!("`{resolved_name}` is ambiguous"))
 		.with_label(span.primary_label().with_message("ambiguous name"));
 	for (index, (target, candidate_span)) in candidates.iter().enumerate() {
-		let decl_key = target.decl_key().expect(
+		let loc = target.loc().expect(
 			"an ambiguity candidate always carries a real DefKey — \
 			 CandidateMerge::push never lets a BindingTarget::Error \
 			 become one",
 		);
-		let noun = namespaces.kind(decl_key).noun();
+		let noun = namespaces.kind(loc).noun();
 		let also = if index == 0 { "" } else { "also " };
 		diagnostic = diagnostic.with_label(
 			candidate_span.secondary_label().with_message(format!(
@@ -1116,7 +1116,7 @@ pub(super) fn report_ambiguous_identifier(
 /// `paths.rs` hits the same "resolved, but not visible" case and reuses
 /// this rather than duplicating it.
 ///
-/// `decl_key` is `Option` so the message can name the item's kind when
+/// `loc` is `Option` so the message can name the item's kind when
 /// known (matching rustc's `` struct `Priv` is private ``) — `None` only
 /// for a `Found(BindingTarget::Error, _)` reached through an
 /// already-errored glob candidate (see `CandidateMerge::push`), which has
@@ -1126,10 +1126,10 @@ pub(super) fn report_private_identifier(
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
-	decl_key: Option<DeclKey>,
+	loc: Option<ItemLoc>,
 ) -> Diagnostic<FileId> {
 	let name = strings.resolve(name).unwrap();
-	let noun = decl_key.map(|decl_key| namespaces.kind(decl_key).noun());
+	let noun = loc.map(|loc| namespaces.kind(loc).noun());
 	let message = match noun {
 		Some(noun) => format!("{noun} `{name}` is private"),
 		None => format!("`{name}` is private"),
@@ -1151,7 +1151,7 @@ pub(super) fn report_private_identifier(
 /// difference in whether a caller invokes this at all, not in what it says
 /// once it does — hence one function, not two.
 ///
-/// `decl_key` is required, not `Option`, unlike `report_private_identifier`:
+/// `loc` is required, not `Option`, unlike `report_private_identifier`:
 /// both call sites already know they have a real item in hand (a
 /// `BindingTarget::Error` mid-path is handled — or skipped — before either
 /// one gets here).
@@ -1160,10 +1160,10 @@ pub(super) fn report_cannot_use_as_namespace(
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
-	decl_key: DeclKey,
+	loc: ItemLoc,
 ) -> Diagnostic<FileId> {
 	let name = strings.resolve(name).unwrap();
-	let noun = namespaces.kind(decl_key).noun();
+	let noun = namespaces.kind(loc).noun();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::CannotUseAsNamespace.code())
 		.with_message(format!("cannot use {noun} `{name}` as a namespace"))
@@ -1287,7 +1287,7 @@ mod tests {
 			namespace: Namespace,
 			tier: Tier,
 			name: &str,
-		) -> DeclKey {
+		) -> ItemLoc {
 			let target = self
 				.direct_binding(namespace, tier, name)
 				.map(|binding| binding.target);
@@ -2104,7 +2104,7 @@ mod tests {
 		// `b` and `c` both re-export everything from `a`, and `d` globs
 		// both `b` and `c` — the same `a::helper` is reached twice, once
 		// via each edge. That's a diamond, not a conflict: both edges name
-		// the exact same `DeclKey`, so it must collapse into one candidate
+		// the exact same `ItemLoc`, so it must collapse into one candidate
 		// rather than reading as two re-exports disagreeing on the name.
 		let case = TestCase::new(indoc! {"
 			mod a {

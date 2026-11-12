@@ -1,5 +1,5 @@
 //! Namespace-graph path resolution: walks a `::`-separated sequence of name
-//! segments to the `DeclKey` the last one names.
+//! segments to the `ItemLoc` the last one names.
 //!
 //! Matches rustc: an unqualified name is looked up only in the namespace it
 //! was written in (its own direct declarations, its own `use`/glob
@@ -64,7 +64,7 @@ use crate::{
 };
 
 use super::decls::{
-	BindingKey, BindingLookup, BindingTarget, DeclKey, Declarations, Namespace,
+	BindingKey, BindingLookup, BindingTarget, Declarations, ItemLoc, Namespace,
 	Scope, Tier,
 };
 use super::imports::{
@@ -103,20 +103,20 @@ use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
 struct PathResolution {
 	stopped_at: u32,
 	stopped_with: BindingLookup,
-	/// `(segment index, its DeclKey)` for the earliest segment whose binding
+	/// `(segment index, its ItemLoc)` for the earliest segment whose binding
 	/// wasn't visible to `accessor` — `None` together, never one without
-	/// the other. Always a real `DeclKey` when `Some`: an already-errored
+	/// the other. Always a real `ItemLoc` when `Some`: an already-errored
 	/// placeholder (`BindingTarget::Error`) is never checked for
 	/// accessibility at all (see `try_resolve_path`), since there's nothing
 	/// real there to flag privacy on top of an already-reported problem —
-	/// which is what makes "a hop, but no DeclKey" unrepresentable here
+	/// which is what makes "a hop, but no ItemLoc" unrepresentable here
 	/// rather than a case this type has to account for.
-	first_inaccessible: Option<(u32, DeclKey)>,
-	/// `(segment index, its DeclKey)` for the earliest namespace the path
+	first_inaccessible: Option<(u32, ItemLoc)>,
+	/// `(segment index, its ItemLoc)` for the earliest namespace the path
 	/// passed through that was written with generic arguments (`m<u8>::S`).
 	/// A namespace has no generic parameters; the last segment's arguments
 	/// are the caller's, since only it knows what they apply to.
-	first_namespace_with_type_args: Option<(u32, DeclKey)>,
+	first_namespace_with_type_args: Option<(u32, ItemLoc)>,
 }
 
 /// [`PathResolver::walk_path`]'s result: the target reached, and which
@@ -219,29 +219,29 @@ impl<'r> PathResolver<'r> {
 					visibility,
 					import,
 				} => {
-					// `target.decl_key()` computed once and reused below —
+					// `target.loc()` computed once and reused below —
 					// also what makes an already-errored placeholder
 					// (`None` here) never get checked for accessibility at
 					// all, so `first_inaccessible` can never end up with a
-					// hop that has no real `DeclKey` behind it.
-					let decl_key = target.decl_key();
-					if let Some(decl_key) = decl_key {
+					// hop that has no real `ItemLoc` behind it.
+					let loc = target.loc();
+					if let Some(loc) = loc {
 						self.resolutions.record(
 							Site::new(
 								seg_tier,
 								SourceSpan::new(file_id, segment.ident.span),
 							),
-							Reference::from_lookup(decl_key, *import),
+							Reference::from_lookup(loc, *import),
 						);
 					}
 					if first_inaccessible.is_none()
-						&& let Some(decl_key) = decl_key
+						&& let Some(loc) = loc
 						&& !self.decls.namespaces.is_accessible_from(
 							accessor,
 							base,
 							*visibility,
 						) {
-						first_inaccessible = Some((index as u32, decl_key));
+						first_inaccessible = Some((index as u32, loc));
 					}
 					if is_last {
 						return PathResolution {
@@ -251,7 +251,7 @@ impl<'r> PathResolver<'r> {
 							first_namespace_with_type_args,
 						};
 					}
-					let Some(decl_key) = decl_key else {
+					let Some(loc) = loc else {
 						// `BindingTarget::Error` mid-path — nothing left to
 						// continue into.
 						return PathResolution {
@@ -261,8 +261,7 @@ impl<'r> PathResolver<'r> {
 							first_namespace_with_type_args,
 						};
 					};
-					let Some(namespace) =
-						self.decls.namespaces.entered_by(decl_key)
+					let Some(namespace) = self.decls.namespaces.entered_by(loc)
 					else {
 						return PathResolution {
 							stopped_at: index as u32,
@@ -275,7 +274,7 @@ impl<'r> PathResolver<'r> {
 						&& !segment.type_args.is_empty()
 					{
 						first_namespace_with_type_args =
-							Some((index as u32, decl_key));
+							Some((index as u32, loc));
 					}
 					base = namespace;
 					entered_by = Some((*target, *visibility, *import));
@@ -358,9 +357,7 @@ impl<'r> PathResolver<'r> {
 		let seg_tier = if is_last { tier } else { Tier::Type };
 		let span = segments[stopped_at as usize].ident.span;
 
-		if let Some((index, decl_key)) =
-			resolution.first_namespace_with_type_args
-		{
+		if let Some((index, loc)) = resolution.first_namespace_with_type_args {
 			let segment = &segments[index as usize];
 			self.diagnostics.push(report_type_args_not_allowed(
 				self.strings,
@@ -368,7 +365,7 @@ impl<'r> PathResolver<'r> {
 				file_id,
 				segment,
 				TypeArgsNotAllowedOn::Declaration(
-					self.decls.namespaces.kind(decl_key),
+					self.decls.namespaces.kind(loc),
 				),
 			));
 		}
@@ -377,10 +374,10 @@ impl<'r> PathResolver<'r> {
 				match resolution.first_inaccessible {
 					// The named item itself is not visible here: the caller, which
 					// knows what it is used for, reports it.
-					Some((bad, decl_key)) if is_last && bad == stopped_at => {
-						BindingTarget::Inaccessible(decl_key)
+					Some((bad, loc)) if is_last && bad == stopped_at => {
+						BindingTarget::Inaccessible(loc)
 					}
-					Some((bad, decl_key)) => {
+					Some((bad, loc)) => {
 						self.diagnostics.push(report_private_identifier(
 							&self.decls.namespaces,
 							self.strings,
@@ -389,7 +386,7 @@ impl<'r> PathResolver<'r> {
 								file_id,
 								segments[bad as usize].ident.span,
 							),
-							Some(decl_key),
+							Some(loc),
 						));
 						*target
 					}
@@ -440,7 +437,7 @@ impl<'r> PathResolver<'r> {
 		// `None` here means an already-errored placeholder
 		// (`BindingTarget::Error`) mid-path — already diagnosed by
 		// whoever caused that, nothing new to report.
-		if let Some(decl_key) = walk.target.decl_key() {
+		if let Some(loc) = walk.target.loc() {
 			self.diagnostics.push(report_cannot_use_as_namespace(
 				&self.decls.namespaces,
 				self.strings,
@@ -449,7 +446,7 @@ impl<'r> PathResolver<'r> {
 					file_id,
 					segments[walk.stopped_at as usize].ident.span,
 				),
-				decl_key,
+				loc,
 			));
 		}
 		BindingTarget::Error
@@ -466,19 +463,19 @@ impl<'r> PathResolver<'r> {
 		accessor: Scope,
 		segments: &[PathSegment],
 		tier: Tier,
-	) -> Result<DeclKey, ()> {
+	) -> Result<ItemLoc, ()> {
 		let target = self.resolve_path(file_id, accessor, segments, tier);
-		if let BindingTarget::Inaccessible(decl_key) = target {
+		if let BindingTarget::Inaccessible(loc) = target {
 			let segment = segments.last().unwrap();
 			self.diagnostics.push(report_private_identifier(
 				&self.decls.namespaces,
 				self.strings,
 				segment.ident.inner,
 				SourceSpan::new(file_id, segment.ident.span),
-				Some(decl_key),
+				Some(loc),
 			));
 		}
-		target.decl_key().ok_or(())
+		target.loc().ok_or(())
 	}
 }
 
@@ -546,7 +543,7 @@ mod tests {
 		}
 
 		#[track_caller]
-		fn expect_success(&self) -> DeclKey {
+		fn expect_success(&self) -> ItemLoc {
 			self.diagnostics().assert_none();
 			let BindingTarget::Accessible(key) = self.target else {
 				panic!(
@@ -966,7 +963,10 @@ mod tests {
 		else {
 			panic!("expected the private module");
 		};
-		let name = case.decls.modules[usize::from(module)].name;
+		let name = case
+			.decls
+			.item(case.decls.modules[usize::from(module)].loc)
+			.name;
 		assert_eq!(case.strings.resolve(name.inner), Some("b"));
 		let namespace = Scope::Module(module);
 		let original =
@@ -1003,8 +1003,7 @@ mod tests {
 			panic!("expected struct C");
 		};
 		assert_eq!(
-			case.strings
-				.resolve(case.decls.structs[usize::from(index)].name.inner),
+			case.strings.resolve(case.decls.name(index).inner),
 			Some("C")
 		);
 	}
@@ -1165,8 +1164,7 @@ mod tests {
 			panic!("expected struct C");
 		};
 		assert_eq!(
-			case.strings
-				.resolve(case.decls.structs[usize::from(index)].name.inner),
+			case.strings.resolve(case.decls.name(index).inner),
 			Some("C")
 		);
 	}

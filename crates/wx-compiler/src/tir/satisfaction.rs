@@ -177,10 +177,7 @@ impl Semantics {
 				} => {
 					let at = self.bounds.span(source);
 					if self.types.has_param(reduced) {
-						let trait_name = self.decls.traits
-							[usize::from(trait_index)]
-						.name
-						.inner;
+						let trait_name = self.decls.name(trait_index).inner;
 						let clause = format!(
 							"{}: {}",
 							self.type_formatter(strings).display_type(reduced),
@@ -678,9 +675,8 @@ impl Semantics {
 				"`{receiver}` is known only through an impl, so the trait must be named"
 			)));
 		for trait_index in traits {
-			let trait_name = strings
-				.resolve(self.decls.traits[usize::from(trait_index)].name.inner)
-				.unwrap();
+			let trait_name =
+				strings.resolve(self.decls.name(trait_index).inner).unwrap();
 			diagnostic = diagnostic.with_note(format!(
 				"qualify the trait: `<{receiver} as {trait_name}>::{name_str}`"
 			));
@@ -706,9 +702,8 @@ impl Semantics {
 			formatter.display_type(subject),
 			formatter.display_type(reduced),
 		);
-		let trait_name = strings
-			.resolve(self.decls.traits[usize::from(trait_index)].name.inner)
-			.unwrap();
+		let trait_name =
+			strings.resolve(self.decls.name(trait_index).inner).unwrap();
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TraitBoundViolation.code())
 			.with_message(format!(
@@ -1003,7 +998,7 @@ mod tests {
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &segments, tier)
-			.decl_key()
+			.loc()
 			.unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {diagnostics:?}")
 			})

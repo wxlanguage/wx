@@ -1500,3 +1500,492 @@ fn uri_paths_round_trip_for_local_files() {
 	let uri = Uri::from_str("file:///a/b/main.wx").unwrap();
 	assert_eq!(uri_to_path(&uri), Some(PathBuf::from("/a/b/main.wx")));
 }
+
+/// Each semantic token of `uri`, decoded back to its text, type and
+/// modifiers: `name:type.modifier..`.
+fn semantic_tokens(
+	state: &ServerState,
+	uri: &Uri,
+	source: &str,
+	range: Option<Range>,
+) -> Vec<String> {
+	use tower_lsp_server::ls_types::{
+		SemanticTokensParams, SemanticTokensRangeParams,
+		SemanticTokensRangeResult, SemanticTokensResult,
+	};
+	let text_document = TextDocumentIdentifier { uri: uri.clone() };
+	let data = match range {
+		None => {
+			let params = SemanticTokensParams {
+				text_document,
+				work_done_progress_params: Default::default(),
+				partial_result_params: Default::default(),
+			};
+			let Some(SemanticTokensResult::Tokens(tokens)) =
+				requests::semantic_tokens_full(state, &params)
+			else {
+				panic!("expected tokens");
+			};
+			tokens.data
+		}
+		Some(range) => {
+			let params = SemanticTokensRangeParams {
+				text_document,
+				range,
+				work_done_progress_params: Default::default(),
+				partial_result_params: Default::default(),
+			};
+			let Some(SemanticTokensRangeResult::Tokens(tokens)) =
+				requests::semantic_tokens_range(state, &params)
+			else {
+				panic!("expected tokens");
+			};
+			tokens.data
+		}
+	};
+	let legend = crate::semantic_tokens::legend();
+	let lines: Vec<&str> = source.lines().collect();
+	let (mut line, mut character) = (0, 0);
+	data.iter()
+		.map(|token| {
+			line += token.delta_line;
+			character = match token.delta_line {
+				0 => character + token.delta_start,
+				_ => token.delta_start,
+			};
+			let units: Vec<u16> = lines[line as usize]
+				.encode_utf16()
+				.skip(character as usize)
+				.take(token.length as usize)
+				.collect();
+			let text = String::from_utf16(&units).unwrap();
+			let mut rendered = format!(
+				"{text}:{}",
+				legend.token_types[token.token_type as usize].as_str()
+			);
+			for (bit, modifier) in legend.token_modifiers.iter().enumerate() {
+				if token.token_modifiers_bitset & (1 << bit) != 0 {
+					rendered.push('.');
+					rendered.push_str(modifier.as_str());
+				}
+			}
+			rendered
+		})
+		.collect()
+}
+
+#[test]
+fn semantic_tokens_colour_resolved_and_declared_names() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		mod geo {
+		    pub struct Point(pub x: i32, pub y: i32);
+		    impl Point {
+		        pub func sum(self: Self) -> i32 { self.x + self.y }
+		        pub func origin() -> Self { Self(0, 0) }
+		    }
+		    pub func limit() -> u32 { super::LIMIT + package::LIMIT }
+		}
+		use geo::Point;
+		global COUNT: u32 = 0;
+		const LIMIT: u32 = 10;
+		func id<T: StackValue>(value: T) -> T { value }
+		func main() -> i32 {
+		    local mut total: i32 = 0;
+		    local p = Point(1, 2);
+		    total = p.sum();
+		    total += id(1: i32);
+		    block :out { break :out; }
+		    total
+		}
+		export { main, COUNT }
+	"};
+	let (state, dir) = analyzed(&root, source);
+	assert!(
+		!state.cached[&dir].sema.diagnostics().has_errors(),
+		"the fixture checks cleanly"
+	);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let tokens = semantic_tokens(&state, &uri, source, None);
+	// A name written as a keyword is a keyword token, whatever it resolves
+	// to (the receiver, the impl's target, the parent module), with no
+	// modifiers; the label `out` is no token.
+	assert_eq!(
+		tokens,
+		[
+			"geo:namespace.declaration",
+			"Point:struct.declaration",
+			"x:property.declaration",
+			"i32:type.defaultLibrary",
+			"y:property.declaration",
+			"i32:type.defaultLibrary",
+			"Point:struct",
+			"sum:method.declaration",
+			"self:keyword",
+			"Self:keyword",
+			"i32:type.defaultLibrary",
+			"self:keyword",
+			"x:property",
+			"self:keyword",
+			"y:property",
+			"origin:function.declaration",
+			"Self:keyword",
+			"Self:keyword",
+			"limit:function.declaration",
+			"u32:type.defaultLibrary",
+			"super:keyword",
+			"LIMIT:variable.readonly",
+			"package:keyword",
+			"LIMIT:variable.readonly",
+			"geo:namespace",
+			"Point:struct",
+			"COUNT:variable.declaration.readonly.static",
+			"u32:type.defaultLibrary",
+			"LIMIT:variable.declaration.readonly",
+			"u32:type.defaultLibrary",
+			"id:function.declaration",
+			"T:typeParameter.declaration",
+			"StackValue:interface",
+			"value:parameter.declaration",
+			"T:typeParameter",
+			"T:typeParameter",
+			"value:parameter",
+			"main:function.declaration",
+			"i32:type.defaultLibrary",
+			"total:variable.declaration",
+			"i32:type.defaultLibrary",
+			"p:variable.declaration",
+			"Point:struct",
+			"total:variable.modification",
+			"p:variable",
+			"sum:method",
+			"total:variable.modification",
+			"id:function",
+			"i32:type.defaultLibrary",
+			"total:variable",
+			"main:function",
+			"COUNT:variable.readonly.static",
+		]
+	);
+}
+
+#[test]
+fn semantic_tokens_count_columns_in_utf16_and_honour_a_range() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Pair(left: u32, right: u32);
+		func main() -> u32 {
+		    local c: Char = '😀'; local d = c;
+		    _ = d;
+		    local Pair({ left, right }) = Pair(1, 2);
+		    left + right
+		}
+		export { main }
+	"};
+	let (state, dir) = analyzed(&root, source);
+	assert!(
+		!state.cached[&dir].sema.diagnostics().has_errors(),
+		"the fixture checks cleanly"
+	);
+	let uri = Uri::from_file_path(&root).unwrap();
+	// The emoji is two UTF-16 units: `d` and `c` after it still decode to
+	// their own text.
+	let line = Range {
+		start: position_of(source, "local c", 0),
+		end: position_of(source, "_ = d", 0),
+	};
+	assert_eq!(
+		semantic_tokens(&state, &uri, source, Some(line)),
+		[
+			"c:variable.declaration",
+			"Char:struct",
+			"d:variable.declaration",
+			"c:variable",
+		]
+	);
+	// A shorthand field pattern names the field and binds the local; the
+	// binding is what it means.
+	let pattern = Range {
+		start: position_of(source, "local Pair", 0),
+		end: position_of(source, "left +", 0),
+	};
+	assert_eq!(
+		semantic_tokens(&state, &uri, source, Some(pattern)),
+		[
+			"Pair:struct",
+			"left:variable.declaration",
+			"right:variable.declaration",
+			"Pair:struct",
+			"left:variable",
+		]
+	);
+}
+
+#[test]
+fn semantic_tokens_mark_only_what_the_compiler_provides() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		func main() -> i32 {
+		    local same = (1: u32).ne(2);
+		    _ = same;
+		    transmute(7: u32)
+		}
+		export { main }
+	"};
+	let (state, dir) = analyzed(&root, source);
+	assert!(
+		!state.cached[&dir].sema.diagnostics().has_errors(),
+		"the fixture checks cleanly"
+	);
+	let uri = Uri::from_file_path(&root).unwrap();
+	// `transmute` is a function std leaves to the compiler, and `u32` a
+	// primitive; `ne` has a body in std, so it is an ordinary method.
+	assert_eq!(
+		semantic_tokens(&state, &uri, source, None),
+		[
+			"main:function.declaration",
+			"i32:type.defaultLibrary",
+			"same:variable.declaration",
+			"u32:type.defaultLibrary",
+			"ne:method",
+			"same:variable",
+			"transmute:function.defaultLibrary",
+			"u32:type.defaultLibrary",
+			"main:function",
+		]
+	);
+}
+
+/// Renames the `occurrence`-th `needle` of an ASCII `source` to `new_name`
+/// and applies the edits for `uri`: the renamed source, or why the rename
+/// was refused.
+fn renamed(
+	state: &ServerState,
+	uri: &Uri,
+	source: &str,
+	needle: &str,
+	occurrence: usize,
+	new_name: &str,
+) -> Result<String, String> {
+	let position = TextDocumentPositionParams {
+		text_document: TextDocumentIdentifier { uri: uri.clone() },
+		position: position_of(source, needle, occurrence),
+	};
+	let prepared = crate::rename::prepare(state, &position)?;
+	assert!(prepared.is_some(), "a name under the cursor");
+	let params = tower_lsp_server::ls_types::RenameParams {
+		text_document_position: position,
+		new_name: new_name.to_string(),
+		work_done_progress_params: Default::default(),
+	};
+	let edit = crate::rename::rename(state, &params)?.expect("an edit");
+	let mut edits = edit.changes.unwrap().remove(uri).unwrap_or_default();
+	let offset = |position: Position| {
+		let line_start: usize = source
+			.split_inclusive('\n')
+			.take(position.line as usize)
+			.map(str::len)
+			.sum();
+		line_start + position.character as usize
+	};
+	edits.sort_by_key(|edit| std::cmp::Reverse(offset(edit.range.start)));
+	let mut text = source.to_string();
+	for edit in edits {
+		text.replace_range(
+			offset(edit.range.start)..offset(edit.range.end),
+			&edit.new_text,
+		);
+	}
+	Ok(text)
+}
+
+#[test]
+fn rename_rewrites_the_declaration_and_every_use() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		mod geo {
+		    pub struct Point(pub x: i32, pub y: i32);
+		    impl Point {
+		        pub func origin() -> Self { Self(0, 0) }
+		    }
+		}
+		use geo::Point;
+		use geo::Point as P;
+		func area(p: Point) -> i32 { p.x * p.y }
+		func main() -> i32 {
+		    local p: P = Point(2, 3);
+		    block :out { break :out; }
+		    area(p)
+		}
+		export { main }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let rename = |needle, occurrence, new| {
+		renamed(&state, &uri, source, needle, occurrence, new)
+	};
+
+	// The struct, its constructor call and the `use` leaf; `Self` and the
+	// alias `P` keep their spelling.
+	let text = rename("Point", 0, "Spot").unwrap();
+	assert!(text.contains("pub struct Spot(pub x: i32"), "{text}");
+	assert!(text.contains("impl Spot {"), "{text}");
+	assert!(text.contains("-> Self { Self(0, 0) }"), "{text}");
+	assert!(
+		text.contains("use geo::Spot;\nuse geo::Spot as P;"),
+		"{text}"
+	);
+	assert!(text.contains("func area(p: Spot)"), "{text}");
+	assert!(text.contains("local p: P = Spot(2, 3);"), "{text}");
+
+	// A field, from one of its uses.
+	let text = rename("x * ", 0, "width").unwrap();
+	assert!(text.contains("pub width: i32"), "{text}");
+	assert!(text.contains("p.width * p.y"), "{text}");
+
+	// A label, without its `:`.
+	let text = rename("out;", 0, "done").unwrap();
+	assert!(text.contains("block :done { break :done; }"), "{text}");
+
+	// An export with no `as` keeps its Wasm name.
+	let text = rename("main", 0, "start").unwrap();
+	assert!(text.contains("func start() -> i32"), "{text}");
+	assert!(text.contains("export { start as \"main\" }"), "{text}");
+}
+
+#[test]
+fn rename_expands_a_shorthand_to_keep_its_other_side() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		struct Pair(left: u32, right: u32);
+		func take(left: u32) -> u32 { left }
+		func main() -> u32 {
+		    local left: u32 = 1;
+		    local pair = Pair({ left, right: 2 });
+		    local Pair({ right, .. }) = pair;
+		    take({ left }) + right
+		}
+		export { main }
+	"};
+	let (state, dir) = analyzed(&root, source);
+	assert!(
+		!state.cached[&dir].sema.diagnostics().has_errors(),
+		"the fixture checks cleanly"
+	);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let rename = |needle, occurrence, new| {
+		renamed(&state, &uri, source, needle, occurrence, new)
+	};
+
+	// The caller's local is the value side of both argument shorthands.
+	let text = rename("left: u32 = 1", 0, "first").unwrap();
+	assert!(text.contains("local first: u32 = 1;"), "{text}");
+	assert!(text.contains("Pair({ left: first, right: 2 })"), "{text}");
+	assert!(text.contains("take({ left: first })"), "{text}");
+
+	// The field is the label side of the construction's shorthand.
+	let text = rename("left: u32, right", 0, "head").unwrap();
+	assert!(text.contains("struct Pair(head: u32"), "{text}");
+	assert!(text.contains("Pair({ head: left, right: 2 })"), "{text}");
+	assert!(text.contains("take({ left })"), "{text}");
+
+	// The callee's parameter is the label side of the call's shorthand.
+	let text = rename("left: u32) -> u32", 0, "value").unwrap();
+	assert!(
+		text.contains("func take(value: u32) -> u32 { value }"),
+		"{text}"
+	);
+	assert!(text.contains("take({ value: left })"), "{text}");
+
+	// A pattern's shorthand names the field and binds the local.
+	let text = rename("right: u32", 0, "tail").unwrap();
+	assert!(text.contains("local Pair({ tail: right, .. })"), "{text}");
+	assert!(text.contains("+ right"), "{text}");
+	let text = rename("right\n}", 0, "rest").unwrap();
+	assert!(text.contains("local Pair({ right: rest, .. })"), "{text}");
+	assert!(text.contains("+ rest"), "{text}");
+}
+
+#[test]
+fn rename_keeps_the_field_a_host_import_is_imported_as() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		import \"host\" as host {
+		    func log(value: i32);
+		    \"Tick\": func tick();
+		}
+		mod inner {
+		    import \"host\" as host { global depth: i32; }
+		}
+		func main() { host::log(1); host::tick(); }
+		export { main }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let text = renamed(&state, &uri, source, "log(1", 0, "print").unwrap();
+	assert!(text.contains("\"log\": func print(value: i32);"), "{text}");
+	assert!(text.contains("host::print(1)"), "{text}");
+	// Already named by its field, which renaming leaves alone.
+	let text = renamed(&state, &uri, source, "tick()", 1, "step").unwrap();
+	assert!(text.contains("\"Tick\": func step();"), "{text}");
+	assert!(text.contains("host::step()"), "{text}");
+	// A global, in an inline module's block.
+	let text = renamed(&state, &uri, source, "depth", 0, "level").unwrap();
+	assert!(text.contains("\"depth\": global level: i32;"), "{text}");
+}
+
+#[test]
+fn rename_refuses_what_it_cannot_rename() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		mod geo {
+		    pub struct Point(x: i32);
+		}
+		use geo::Point as P;
+		struct Meters(value: u32);
+		impl Meters {
+		    func get(self: Self) -> u32 { self.value }
+		}
+		func main(p: P) -> u32 { 0 }
+		export { main }
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let refusal = |needle, occurrence| {
+		renamed(&state, &uri, source, needle, occurrence, "fresh")
+			.expect_err("refused")
+	};
+	assert!(refusal("u32", 0).contains("standard library"));
+	assert!(refusal("self.", 0).contains("keyword"));
+	assert!(refusal("P)", 0).contains("through an alias"));
+	assert_eq!(
+		renamed(&state, &uri, source, "Meters", 0, "fn Bad").unwrap_err(),
+		"`fn Bad` is not an identifier"
+	);
+	assert_eq!(
+		renamed(&state, &uri, source, "Meters", 0, "loop").unwrap_err(),
+		"`loop` is a keyword"
+	);
+}
+
+#[test]
+fn rename_refuses_a_module_in_a_file_of_its_own() {
+	let dir = PathBuf::from("/test");
+	let main = dir.join("main.wx");
+	let source =
+		"mod geo;\nfunc main() -> i32 { geo::two() }\nexport { main }\n";
+	let mut state = ServerState::default();
+	state
+		.open_documents
+		.insert(main.clone(), open_document(source));
+	state.open_documents.insert(
+		dir.join("geo.wx"),
+		open_document("pub func two() -> i32 { 2 }\n"),
+	);
+	open_synthetic_manifest(&mut state, &main);
+	analyze_root(&mut state, &dir, &main, &mut Vec::new());
+	let uri = Uri::from_file_path(&main).unwrap();
+	let refusal = renamed(&state, &uri, source, "geo::", 0, "shapes")
+		.expect_err("refused");
+	assert!(refusal.contains("file of its own"), "{refusal}");
+}

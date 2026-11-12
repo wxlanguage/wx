@@ -16,14 +16,14 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum StringLiteralErrorKind {
+pub enum StringLiteralErrorKind {
 	UnknownEscape(char),
 	Unterminated,
 }
 
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug))]
-pub(super) struct StringLiteralError {
+pub struct StringLiteralError {
 	pub kind: StringLiteralErrorKind,
 	/// Byte range relative to the opening quote, including UTF-8 characters.
 	pub span: TextSpan,
@@ -60,7 +60,7 @@ impl StringLiteralError {
 /// Decodes a quoted string token. Plain strings borrow their contents;
 /// an owned buffer is allocated only when an escape needs decoding.
 /// Unknown escapes are errors, rather than silently becoming literal backslashes.
-pub(super) fn unescape_string_literal(
+pub fn unescape_string_literal(
 	source: &str,
 ) -> Result<Cow<'_, str>, StringLiteralError> {
 	let unterminated = || StringLiteralError {
@@ -671,7 +671,9 @@ impl Semantics {
 		at: SourceSpan,
 	) -> Diagnostic<FileId> {
 		let decl = &self.decls.typesets[usize::from(typeset)];
-		let name = strings.resolve(decl.name.inner).unwrap();
+		let name = strings
+			.resolve(self.decls.item(decl.loc).name.inner)
+			.unwrap();
 		let member_name =
 			self.type_formatter(strings).display_type(member.inner);
 		Diagnostic::error()
@@ -684,7 +686,7 @@ impl Semantics {
 				"cannot be represented as `{member_name}`"
 			)))
 			.with_label(
-				SourceSpan::new(decl.file_id, member.span)
+				SourceSpan::new(self.decls.file_id(decl.loc), member.span)
 					.secondary_label()
 					.with_message(format!("`{member_name}` is a member here")),
 			)
@@ -700,7 +702,9 @@ impl Semantics {
 		declared: TypeIndex,
 	) -> Diagnostic<FileId> {
 		let decl = &self.decls.constants[usize::from(constant)];
-		let name = strings.resolve(decl.name.inner).unwrap();
+		let name = strings
+			.resolve(self.decls.item(decl.loc).name.inner)
+			.unwrap();
 		let declared = self.type_formatter(strings).display_type(declared);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypedConstantBound.code())
@@ -710,7 +714,8 @@ impl Semantics {
 			))
 			.with_label(at.primary_label())
 			.with_label(
-				SourceSpan::new(decl.file_id, decl.name.span)
+				self.decls
+					.declaration_span(decl.loc)
 					.secondary_label()
 					.with_message(format!(
 						"`{name}` is declared `{declared}` here"
@@ -738,7 +743,7 @@ impl Semantics {
 		let formatter = self.type_formatter(strings);
 		let (read, ty) =
 			(formatter.display_type(read), formatter.display_type(ty));
-		let name = self.decls.constants[usize::from(constant)].name.inner;
+		let name = self.decls.name(constant).inner;
 		let name = strings.resolve(name).unwrap();
 		let label = match value {
 			Some(value) => {

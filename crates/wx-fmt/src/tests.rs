@@ -192,6 +192,39 @@ fn test_format_import_block() {
 }
 
 #[test]
+fn test_format_keeps_an_import_field_name_only_when_it_is_not_the_entrys_own() {
+	let source = indoc! {r#"
+        import "env" as env {
+            "Log":   func log(value: u32);
+            "a\\x":global base: i32;
+            "flush": func flush();
+            "heap": memory heap: u32;
+        }
+    "#};
+	let case = TestCase::new(source);
+	let output = format(
+		&case.ast,
+		&case.interner,
+		&case.files.get(case.ast.file_id).unwrap().source,
+		RendererConfig {
+			max_line_width: 80,
+			indent_width: 4,
+		},
+	);
+	assert_eq!(
+		output,
+		indoc! {r#"
+            import "env" as env {
+                "Log": func log(value: u32);
+                "a\\x": global base: i32;
+                func flush();
+                memory heap: u32;
+            }
+        "#}
+	);
+}
+
+#[test]
 fn test_format_single_import_function_stays_inline() {
 	let case = TestCase::new(indoc! {"
         import \"console\" as console {

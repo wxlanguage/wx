@@ -31,8 +31,8 @@ use super::bounds::{
 	RepresentableClause, TraitClause,
 };
 use super::decls::{
-	AstNodeRef, BindingKey, ConstIdx, DeclId, DeclKind, FunctionIdx, MemberIdx,
-	MemberKind, Tier, TraitIdx, TraitImplIdx,
+	AstNodeRef, BindingKey, ConstIdx, DeclKind, FunctionIdx, MemberIdx,
+	MemberKind, SignatureQuery, Tier, TraitIdx, TraitImplIdx,
 };
 use super::members::TraitMemberSelection;
 use super::obligations::BoundRequirements;
@@ -272,7 +272,7 @@ impl Semantics {
 		strings: &'s StringInterner,
 		trait_index: TraitIdx,
 	) -> &'s str {
-		let name = self.decls.traits[usize::from(trait_index)].name.inner;
+		let name = self.decls.name(trait_index).inner;
 		strings.resolve(name).unwrap()
 	}
 
@@ -299,7 +299,7 @@ impl Semantics {
 		member: MemberKind,
 		function: FunctionIdx,
 	) -> Diagnostic<FileId> {
-		let name = self.decls.functions[usize::from(function)].name.inner;
+		let name = self.decls.name(function).inner;
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TraitImplSignatureMismatch.code())
 			.with_message(format!(
@@ -327,7 +327,8 @@ impl Semantics {
 		let diagnostic = self
 			.signature_mismatch(strings, trait_index, member, function)
 			.with_label(
-				SourceSpan::new(decl.file_id, decl.name.span)
+				self.decls
+					.declaration_span(decl.loc)
 					.primary_label()
 					.with_message(format!(
 						"expected {expected} {what}{}, found {found}",
@@ -335,7 +336,8 @@ impl Semantics {
 					)),
 			)
 			.with_label(
-				SourceSpan::new(expected_decl.file_id, expected_decl.name.span)
+				self.decls
+					.declaration_span(expected_decl.loc)
 					.secondary_label()
 					.with_message(format!(
 						"the trait declares {expected} {what}{}",
@@ -369,8 +371,7 @@ impl Semantics {
 				trait_index,
 				..
 			} => {
-				let name =
-					self.decls.traits[usize::from(trait_index)].name.inner;
+				let name = self.decls.name(trait_index).inner;
 				format!(
 					"{}: {}",
 					formatter.display_type(subject),
@@ -395,7 +396,7 @@ impl Semantics {
 			),
 		};
 		let expected_decl = &self.decls.functions[usize::from(declaration)];
-		let name = self.decls.functions[usize::from(function)].name.inner;
+		let name = self.decls.name(function).inner;
 		let diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::ImplStricterThanTrait.code())
 			.with_message(format!(
@@ -406,7 +407,8 @@ impl Semantics {
 				format!("impl has extra requirement `{requirement}`"),
 			))
 			.with_label(
-				SourceSpan::new(expected_decl.file_id, expected_decl.name.span)
+				self.decls
+					.declaration_span(expected_decl.loc)
 					.secondary_label()
 					.with_message(format!(
 						"definition of `{}` from trait",
@@ -452,7 +454,7 @@ impl Semantics {
 		member: MemberKind,
 		at_member: SourceSpan,
 	) {
-		let name = self.decls.name(declaration.decl_id());
+		let name = self.decls.name(declaration);
 		let trait_decl = &self.decls.traits[usize::from(trait_index)];
 		let diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::TraitImplItemKindMismatch.code())
@@ -471,7 +473,7 @@ impl Semantics {
 					.with_message("does not match the trait"),
 			)
 			.with_label(
-				SourceSpan::new(trait_decl.file_id, name.span)
+				SourceSpan::new(self.decls.file_id(trait_decl.loc), name.span)
 					.secondary_label()
 					.with_message(format!(
 						"declared as {} {} here",
@@ -494,7 +496,9 @@ impl Semantics {
 			.map(|name| format!("`{}`", strings.resolve(name.inner).unwrap()))
 			.collect::<Vec<_>>()
 			.join(", ");
-		let trait_file = self.decls.traits[usize::from(trait_index)].file_id;
+		let trait_file = self
+			.decls
+			.file_id(self.decls.traits[usize::from(trait_index)].loc);
 		let mut diagnostic =
 			Diagnostic::error()
 				.with_code(DiagnosticCode::IncompleteTraitImpl.code())
@@ -987,13 +991,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 						let AstNodeRef::TraitImplAssocType {
 							item: ast::ImplItem::AssocType { ty, .. },
 							..
-						} = *self.ast_node(DeclId::AssocType(provider))
+						} = *self.ast_node(SignatureQuery::AssocType(provider))
 						else {
 							unreachable!("a trait impl's associated type")
 						};
 						SourceSpan::new(
-							sema.decls.assoc_types[usize::from(provider)]
-								.file_id,
+							sema.decls.file_id(
+								sema.decls.assoc_types[usize::from(provider)]
+									.loc,
+							),
 							ty.span,
 						)
 					}
@@ -1036,7 +1042,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		for index in 0..impl_decl.members.len() {
 			let impl_decl = &sema.decls.trait_impls[usize::from(impl_index)];
 			let member = impl_decl.members[index].kind;
-			let name = sema.decls.name(member.decl_id());
+			let name = sema.decls.name(member);
 			// A second member of one name was reported as a duplicate.
 			if impl_decl
 				.bindings
@@ -1121,7 +1127,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				!sema.provides(impl_index, member.kind)
 					&& !self.has_default(sema, member.kind)
 			})
-			.map(|member| sema.decls.name(member.kind.decl_id()))
+			.map(|member| sema.decls.name(member.kind))
 			.collect();
 		if !missing.is_empty() {
 			sema.report_missing(
@@ -1143,7 +1149,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.is_some_and(|signature| signature.value.is_some()),
 			MemberKind::Function(index) | MemberKind::Method(index) => {
 				matches!(
-					*self.ast_node(DeclId::Function(index)),
+					*self.ast_node(SignatureQuery::Function(index)),
 					AstNodeRef::TraitFunction {
 						item: ast::TraitItem::Function { body: Some(_), .. },
 						..
@@ -1151,7 +1157,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			MemberKind::Constant(index) => matches!(
-				*self.ast_node(DeclId::Const(index)),
+				*self.ast_node(SignatureQuery::Const(index)),
 				AstNodeRef::TraitConst {
 					item: ast::TraitItem::Const { value: Some(_), .. },
 					..
@@ -1326,11 +1332,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 				&self.strings,
 				head,
 				(
-					sema.decls.functions[usize::from(declaration)].file_id,
+					sema.decls.file_id(
+						sema.decls.functions[usize::from(declaration)].loc,
+					),
 					written(expected_syntax),
 				),
 				(
-					sema.decls.functions[usize::from(function)].file_id,
+					sema.decls.file_id(
+						sema.decls.functions[usize::from(function)].loc,
+					),
 					written(syntax),
 				),
 				(expected, found),
@@ -1390,18 +1400,18 @@ impl<'ast> SemanticsBuilder<'ast> {
 				ty: expected_ty, ..
 			},
 			..
-		} = *self.ast_node(DeclId::Const(declaration))
+		} = *self.ast_node(SignatureQuery::Const(declaration))
 		else {
 			unreachable!("a trait's constant")
 		};
 		let AstNodeRef::TraitImplConstant {
 			item: ast::ImplItem::Constant { ty: Some(ty), .. },
 			..
-		} = *self.ast_node(DeclId::Const(constant))
+		} = *self.ast_node(SignatureQuery::Const(constant))
 		else {
 			unreachable!("a trait impl's constant with a written type")
 		};
-		let name = sema.decls.constants[usize::from(constant)].name.inner;
+		let name = sema.decls.name(constant).inner;
 		let head = Diagnostic::error()
 			.with_code(DiagnosticCode::TraitImplConstTypeMismatch.code())
 			.with_message(format!(
@@ -1413,11 +1423,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&self.strings,
 			head,
 			(
-				sema.decls.constants[usize::from(declaration)].file_id,
+				sema.decls.file_id(
+					sema.decls.constants[usize::from(declaration)].loc,
+				),
 				WrittenType::Written(expected_ty),
 			),
 			(
-				sema.decls.constants[usize::from(constant)].file_id,
+				sema.decls
+					.file_id(sema.decls.constants[usize::from(constant)].loc),
 				WrittenType::Written(ty),
 			),
 			(expected, found),
@@ -1431,7 +1444,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		&self,
 		function: FunctionIdx,
 	) -> &'ast ast::FunctionSignature {
-		match *self.ast_node(DeclId::Function(function)) {
+		match *self.ast_node(SignatureQuery::Function(function)) {
 			AstNodeRef::TraitFunction {
 				item: ast::TraitItem::Function { signature, .. },
 				..
@@ -1485,7 +1498,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.signature_mismatch(&self.strings, trait_index, member, function)
 			.with_label(
 				SourceSpan::new(
-					sema.decls.functions[usize::from(function)].file_id,
+					sema.decls.file_id(
+						sema.decls.functions[usize::from(function)].loc,
+					),
 					at(function, found),
 				)
 				.primary_label()
@@ -1497,7 +1512,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			)
 			.with_label(
 				SourceSpan::new(
-					sema.decls.functions[usize::from(declaration)].file_id,
+					sema.decls.file_id(
+						sema.decls.functions[usize::from(declaration)].loc,
+					),
 					at(declaration, expected),
 				)
 				.secondary_label()

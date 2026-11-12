@@ -34,6 +34,9 @@ pub(crate) struct ServerState {
 	/// F's own project", never derived from the publication map ("which
 	/// files does root R reach", many-to-many).
 	pub(crate) own_root: HashMap<PathBuf, PathBuf>,
+	/// Whether the client accepts `workspace/semanticTokens/refresh`, from
+	/// `initialize`.
+	pub(crate) semantic_tokens_refresh: bool,
 }
 
 impl ServerState {

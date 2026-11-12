@@ -17,8 +17,8 @@ use crate::vfs::FileId;
 
 use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
 use super::decls::{
-	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, DeclId, Declarations,
-	FunctionIdx, InherentImplIdx, MemberKind, MemberOwner, Tier, TraitIdx,
+	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, Declarations, FunctionIdx,
+	InherentImplIdx, MemberKind, MemberOwner, SignatureQuery, Tier, TraitIdx,
 	TraitImplIdx,
 };
 use super::format::TypeFormatter;
@@ -204,14 +204,10 @@ impl Declarations {
 	fn member_key(&self, declaration: MemberKind) -> BindingKey {
 		let name = match declaration {
 			MemberKind::Function(index) | MemberKind::Method(index) => {
-				self.functions[usize::from(index)].name.inner
+				self.name(index).inner
 			}
-			MemberKind::Constant(index) => {
-				self.constants[usize::from(index)].name.inner
-			}
-			MemberKind::AssociatedType(index) => {
-				self.assoc_types[usize::from(index)].name.inner
-			}
+			MemberKind::Constant(index) => self.name(index).inner,
+			MemberKind::AssociatedType(index) => self.name(index).inner,
 		};
 		BindingKey::new(declaration.tier(), name)
 	}
@@ -637,7 +633,7 @@ impl Semantics {
 				file_id,
 				strings,
 				name,
-				trait_decl.name.inner,
+				self.decls.item(trait_decl.loc).name.inner,
 				key.tier,
 			));
 			return Err(());
@@ -970,9 +966,8 @@ pub(super) fn report_ambiguous_type_member(
 				unreachable!("inherent members cannot be ambiguous")
 			}
 		};
-		let trait_name = strings
-			.resolve(decls.traits[usize::from(*trait_index)].name.inner)
-			.unwrap();
+		let trait_name =
+			strings.resolve(decls.name(*trait_index).inner).unwrap();
 		diagnostic =
 			diagnostic.with_note(format!("provided by trait `{trait_name}`"));
 	}
@@ -995,11 +990,7 @@ pub(super) fn report_type_does_not_implement_trait(
 	let receiver_name = formatter.display_type(receiver);
 	let trait_name = formatter
 		.strings
-		.resolve(
-			formatter.decls.traits[usize::from(required_trait)]
-				.name
-				.inner,
-		)
+		.resolve(formatter.decls.name(required_trait).inner)
 		.unwrap();
 	Diagnostic::error()
 		.with_code(DiagnosticCode::TraitBoundViolation.code())
@@ -1465,7 +1456,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			let _ = self.ensure_signature(
 				sema,
 				QueryInfo {
-					decl_id: DeclId::InherentImpl(impl_index),
+					query: SignatureQuery::InherentImpl(impl_index),
 					requested_at: Some(reference),
 				},
 			);
@@ -1579,15 +1570,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 		assoc_type_index: AssocTypeIdx,
 		requested_at: SourceSpan,
 	) -> Result<(), ()> {
-		let decl_id = DeclId::AssocType(assoc_type_index);
+		let query = SignatureQuery::AssocType(assoc_type_index);
 		assert!(
-			matches!(self.ast_node(decl_id), AstNodeRef::TraitAssocType { .. }),
+			matches!(self.ast_node(query), AstNodeRef::TraitAssocType { .. }),
 			"bound access requires a trait declaration, not a provider"
 		);
 		match self.ensure_signature(
 			sema,
 			QueryInfo {
-				decl_id,
+				query,
 				requested_at: Some(requested_at),
 			},
 		) {
@@ -1600,7 +1591,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			SignatureStatus::Cycle => {
 				let diagnostic = self.report_cyclic_assoc_type_bound(
 					sema,
-					decl_id,
+					query,
 					requested_at,
 				);
 				sema.diagnostics.push(diagnostic);

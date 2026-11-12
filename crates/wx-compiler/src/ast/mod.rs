@@ -1950,7 +1950,9 @@ pub enum ImportDeclaration {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ImportEntry {
 	Declaration {
-		external_name: Option<Spanned<SymbolU32>>,
+		/// The field the host provides it as, a string literal as written
+		/// (`"Log": func log(..)`); its own name when left out.
+		external_name: Option<TextSpan>,
 		declaration: ImportDeclaration,
 	},
 	/// A source-level import/re-export, not an entity imported from the host.
@@ -6408,6 +6410,13 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<ImportEntry>, ()> {
 		let pub_span = matches!(parser.peek_keyword(), Some(Keyword::Pub))
 			.then(|| parser.lexer.next().span);
+		let external_name = match parser.lexer.next_if(Token::String) {
+			Some(string) => {
+				parser.next_expect(Token::Colon)?;
+				Some(string.span)
+			}
+			None => None,
+		};
 		let token = parser.lexer.peek();
 		let keyword = match token.inner {
 			Token::Identifier => {
@@ -6434,8 +6443,22 @@ impl<'ctx> Parser<'ctx> {
 					),
 			);
 		}
+		// An entry with a field name starts at it.
+		let entry_span = |span: TextSpan| match external_name {
+			Some(name) => TextSpan::new(name.start, span.end),
+			None => span,
+		};
 		match keyword {
 			Some(Keyword::Use) => {
+				// A `use` imports nothing from the host, so no field names it.
+				if let Some(name) = external_name {
+					parser.ast.diagnostics.push(
+						report_invalid_item(parser.ast.file_id, name)
+							.with_message(
+								"a `use` item has no host field name",
+							),
+					);
+				}
 				let use_span = parser.lexer.next().span;
 				let start = pub_span.unwrap_or(use_span).start;
 				let tree = Self::parse_use_tree(parser)?;
@@ -6447,31 +6470,31 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Func) => {
 				parser.parse_function_signature().map(|signature| Spanned {
 					inner: ImportEntry::Declaration {
-						external_name: None,
+						external_name,
 						declaration: ImportDeclaration::Function {
 							signature: signature.inner,
 						},
 					},
-					span: signature.span,
+					span: entry_span(signature.span),
 				})
 			}
 			Some(Keyword::Global) => parser
 				.parse_global_import_declaration()
 				.map(|decl| Spanned {
 					inner: ImportEntry::Declaration {
-						external_name: None,
+						external_name,
 						declaration: decl.inner,
 					},
-					span: decl.span,
+					span: entry_span(decl.span),
 				}),
 			Some(Keyword::Memory) => parser
 				.parse_memory_import_declaration()
 				.map(|decl| Spanned {
 					inner: ImportEntry::Declaration {
-						external_name: None,
+						external_name,
 						declaration: decl.inner,
 					},
-					span: decl.span,
+					span: entry_span(decl.span),
 				}),
 			_ => {
 				parser

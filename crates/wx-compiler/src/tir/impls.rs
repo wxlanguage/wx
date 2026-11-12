@@ -505,7 +505,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				span: name_span,
 			},
 			trait_idx,
-			decls.traits[usize::from(trait_idx)].name.inner,
+			decls.name(trait_idx).inner,
 			memory_decl.trait_impl_index,
 			file_id,
 		);
@@ -546,7 +546,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				span: name_span,
 			},
 			global_trait_idx,
-			decls.traits[usize::from(global_trait_idx)].name.inner,
+			decls.name(global_trait_idx).inner,
 			global_decl.trait_impl_index,
 			file_id,
 		);
@@ -575,7 +575,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					span: name_span,
 				},
 				global_mut_trait_idx,
-				decls.traits[usize::from(global_mut_trait_idx)].name.inner,
+				decls.name(global_mut_trait_idx).inner,
 				mut_trait_impl_index,
 				file_id,
 			);
@@ -593,7 +593,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		let decls = self.decls;
 		let function_decl = &decls.functions[usize::from(func_index)];
 		let function_impls = function_decl.function_impls;
-		let name_span = function_decl.name.span;
+		let name_span = decls.item(function_decl.loc).name.span;
 		let call_trait_idx = decls.intrinsics.call.unwrap_or_else(|| {
 			panic!(
 				"the stdlib package must declare a `Call` trait — every function needs one to synthesize its impl against"
@@ -624,7 +624,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					span: name_span,
 				},
 				trait_idx,
-				decls.traits[usize::from(trait_idx)].name.inner,
+				decls.name(trait_idx).inner,
 				trait_impl_index,
 				file_id,
 			);
@@ -713,19 +713,19 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		let decls = self.decls;
 		let target_scope = match target.inner {
 			ImplTarget::Struct(index) => {
-				decls.structs[usize::from(index)].namespace
+				decls.scope(decls.structs[usize::from(index)].loc)
 			}
 			ImplTarget::Enum(index) => {
-				decls.enums[usize::from(index)].parent_namespace
+				decls.scope(decls.enums[usize::from(index)].loc)
 			}
 			ImplTarget::Memory(index) => {
-				decls.memories[usize::from(index)].namespace
+				decls.scope(decls.memories[usize::from(index)].loc)
 			}
 			ImplTarget::Global(index) => {
-				decls.globals[usize::from(index)].namespace
+				decls.scope(decls.globals[usize::from(index)].loc)
 			}
 			ImplTarget::Function(index) => {
-				decls.functions[usize::from(index)].namespace
+				decls.scope(decls.functions[usize::from(index)].loc)
 			}
 			ImplTarget::U8
 			| ImplTarget::I8

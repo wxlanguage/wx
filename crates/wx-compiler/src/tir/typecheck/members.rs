@@ -21,8 +21,8 @@ use crate::ast::{self, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::decls::{
-	BindingKey, ConstIdx, DeclKind, InherentImplIdx, MemberKind, TraitIdx,
-	Visibility,
+	BindingKey, ConstIdx, DeclKind, Declared, InherentImplIdx, MemberKind,
+	TraitIdx,
 };
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
@@ -859,16 +859,20 @@ impl BodyBuilder<'_, '_> {
 		let (namespace, visibility) = match found {
 			ApplicableMember::Inherent { impl_index, .. } => {
 				let impl_decl = &decls.inherent_impls[usize::from(impl_index)];
-				let index = impl_decl.bindings[&key];
+				let member =
+					&impl_decl.members[usize::from(impl_decl.bindings[&key])];
 				(
 					impl_decl.namespace,
-					impl_decl.members[usize::from(index)].visibility,
+					decls.item(member.kind.loc(decls)).visibility,
 				)
 			}
 			ApplicableMember::TraitImplMember { trait_index, .. }
 			| ApplicableMember::AbstractTraitMember { trait_index, .. } => {
 				let trait_decl = &decls.traits[usize::from(trait_index)];
-				(trait_decl.namespace, Visibility::from(trait_decl.pub_span))
+				(
+					decls.scope(trait_decl.loc),
+					decls.item(trait_decl.loc).visibility,
+				)
 			}
 		};
 		if decls.namespaces.is_accessible_from(

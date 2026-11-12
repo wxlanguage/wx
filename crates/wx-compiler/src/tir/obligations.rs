@@ -753,11 +753,7 @@ impl Semantics {
 					let message = format!(
 						"an array's length is a count, but `{}` is `{value}`",
 						strings
-							.resolve(
-								self.decls.constants[usize::from(constant)]
-									.name
-									.inner
-							)
+							.resolve(self.decls.name(constant).inner)
 							.unwrap()
 					);
 					self.diagnostics.push(
@@ -777,7 +773,7 @@ impl Semantics {
 			formatter.display_type(expected),
 			formatter.display_type(found),
 		);
-		let name = self.decls.constants[usize::from(constant)].name.inner;
+		let name = self.decls.name(constant).inner;
 		let name = strings.resolve(name).unwrap();
 		self.diagnostics.push(
 			Diagnostic::error()

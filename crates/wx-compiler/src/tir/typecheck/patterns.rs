@@ -336,9 +336,7 @@ impl BodyBuilder<'_, '_> {
 		let trait_name = self
 			.builder
 			.strings
-			.resolve(
-				self.sema.decls.traits[usize::from(trait_index)].name.inner,
-			)
+			.resolve(self.sema.decls.name(trait_index).inner)
 			.unwrap()
 			.to_string();
 		self.sema.diagnostics.push(
@@ -838,7 +836,11 @@ impl BodyBuilder<'_, '_> {
 	) -> Option<Vec<PatIdx>> {
 		let decl = &self.sema.decls.structs[usize::from(struct_index)];
 		if !decl.is_fully_named() {
-			let name = self.builder.strings.resolve(decl.name.inner).unwrap();
+			let name = self
+				.builder
+				.strings
+				.resolve(self.sema.decls.item(decl.loc).name.inner)
+				.unwrap();
 			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TupleStructBracePattern.code())
@@ -874,8 +876,11 @@ impl BodyBuilder<'_, '_> {
 			let name = field.name;
 			let decl = &self.sema.decls.structs[usize::from(struct_index)];
 			let Some(index) = decl.lookup.get(&name.inner).copied() else {
-				let struct_name =
-					self.builder.strings.resolve(decl.name.inner).unwrap();
+				let struct_name = self
+					.builder
+					.strings
+					.resolve(self.sema.decls.item(decl.loc).name.inner)
+					.unwrap();
 				let field_name =
 					self.builder.strings.resolve(name.inner).unwrap();
 				self.sema.diagnostics.push(
@@ -940,8 +945,11 @@ impl BodyBuilder<'_, '_> {
 				})
 				.collect();
 			if !missing.is_empty() {
-				let struct_name =
-					self.builder.strings.resolve(decl.name.inner).unwrap();
+				let struct_name = self
+					.builder
+					.strings
+					.resolve(self.sema.decls.item(decl.loc).name.inner)
+					.unwrap();
 				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::MissingStructFields.code())
@@ -1024,7 +1032,7 @@ impl BodyBuilder<'_, '_> {
 				}
 				Err(_) => return None,
 			};
-			let key = walk.target.decl_key()?;
+			let key = walk.target.loc()?;
 			let kind = key.symbol_kind(&self.sema.decls);
 			let DeclKind::Struct(struct_index) = kind else {
 				self.report_not_a_struct(&format!("a {}", kind.noun()), span);
@@ -1233,7 +1241,7 @@ impl BodyBuilder<'_, '_> {
 	) -> PatIdx {
 		let found = match self.resolve_value_path(segments, span) {
 			Ok(ValuePath::Item(walk)) => {
-				let Some(key) = walk.target.decl_key() else {
+				let Some(key) = walk.target.loc() else {
 					self.note_local_not_constant(segments);
 					return self.error_pattern(span);
 				};
@@ -1459,8 +1467,7 @@ impl BodyBuilder<'_, '_> {
 		let plural = |n: usize| if n == 1 { "" } else { "s" };
 		let (noun, owner) = match struct_index {
 			Some(struct_index) => {
-				let name =
-					self.sema.decls.structs[usize::from(struct_index)].name;
+				let name = self.sema.decls.name(struct_index);
 				let name = self.builder.strings.resolve(name.inner).unwrap();
 				("field", format!("struct `{name}`"))
 			}

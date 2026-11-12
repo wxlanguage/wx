@@ -7,7 +7,9 @@ use codespan_reporting::term::termcolor::Ansi;
 use tower_lsp_server::ls_types::{
 	GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
 	HoverParams, Location, MarkupContent, MarkupKind, Position, Range,
-	ReferenceParams, TextEdit, Uri,
+	ReferenceParams, SemanticTokens, SemanticTokensParams,
+	SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+	TextEdit, Uri,
 };
 use wx_compiler::diagnostics::Diagnostics as _;
 use wx_compiler::symbols::Keyword;
@@ -19,6 +21,7 @@ use crate::convert::{
 use crate::diagnostics::diagnostic_locations;
 use crate::hover;
 use crate::projects::{ManifestState, discover_package_root};
+use crate::semantic_tokens;
 use crate::snapshot::load_compilation;
 use crate::state::ServerState;
 use crate::trace::Trace;
@@ -104,6 +107,32 @@ pub(crate) fn hover(
 		}),
 		range: span_to_range(files, name),
 	})
+}
+
+/// Every coloured name of the file.
+pub(crate) fn semantic_tokens_full(
+	state: &ServerState,
+	params: &SemanticTokensParams,
+) -> Option<SemanticTokensResult> {
+	let (snapshot, file) = state.resolve_uri(&params.text_document.uri)?;
+	let data = semantic_tokens::tokens(snapshot, file, None)?;
+	Some(SemanticTokensResult::Tokens(SemanticTokens {
+		result_id: None,
+		data,
+	}))
+}
+
+/// The coloured names of the file that overlap the requested range.
+pub(crate) fn semantic_tokens_range(
+	state: &ServerState,
+	params: &SemanticTokensRangeParams,
+) -> Option<SemanticTokensRangeResult> {
+	let (snapshot, file) = state.resolve_uri(&params.text_document.uri)?;
+	let data = semantic_tokens::tokens(snapshot, file, Some(params.range))?;
+	Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+		result_id: None,
+		data,
+	}))
 }
 
 /// The whole-file edit that formats `uri`, or no edits when it is already

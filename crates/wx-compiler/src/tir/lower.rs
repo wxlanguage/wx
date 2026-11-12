@@ -51,8 +51,8 @@ use super::body::{
 };
 use super::bounds::AssumptionEnvIdx;
 use super::decls::{
-	Attributes, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx, PackageMemberItem,
-	Scope,
+	Attributes, Declared, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx,
+	PackageMemberItem, Scope,
 };
 use super::eval::Val;
 use super::intrinsics::Intrinsic;
@@ -314,9 +314,7 @@ fn std_intrinsics(
 			PackageMemberItem::Constant(_) | PackageMemberItem::Type(_) => None,
 		})
 		.map(|function| {
-			let name = strings
-				.resolve(decls.functions[usize::from(function)].name.inner)
-				.unwrap();
+			let name = strings.resolve(decls.name(function).inner).unwrap();
 			let intrinsic =
 				Intrinsic::from_std_name(name).unwrap_or_else(|| {
 					panic!("unknown std function parameter `{name}`")
@@ -497,8 +495,9 @@ impl<'a> Lowerer<'a> {
 		if depth > RECURSION_LIMIT {
 			let function =
 				&self.sema.decls.functions[usize::from(instance.function)];
+			let definition = self.sema.decls.declaration_span(function.loc);
 			let (definition_file, definition_span) =
-				(function.file_id, function.name.span);
+				(definition.file_id, definition.span);
 			let item = self.sema.types.intern_function(
 				instance.function,
 				self.sema.types.list(instance.args).to_vec().as_slice(),
@@ -546,9 +545,11 @@ impl<'a> Lowerer<'a> {
 	fn lower_function(&mut self, instance: FunctionInstance) -> Result<(), ()> {
 		let function = instance.function;
 		let id = self.ids[&instance];
-		let file_id = self.sema.decls.functions[usize::from(function)].file_id;
-		let name_span =
-			self.sema.decls.functions[usize::from(function)].name.span;
+		let file_id = self
+			.sema
+			.decls
+			.file_id(self.sema.decls.functions[usize::from(function)].loc);
+		let name_span = self.sema.decls.name(function).span;
 		match self.sema.function_implementations[usize::from(function)] {
 			FunctionImplementation::Defined(_) => {}
 			FunctionImplementation::Imported(import) => {
@@ -646,8 +647,9 @@ impl<'a> Lowerer<'a> {
 		intrinsic: Intrinsic,
 	) -> Result<(), ()> {
 		let id = self.ids[&instance];
-		let file_id =
-			self.sema.decls.functions[usize::from(instance.function)].file_id;
+		let file_id = self.sema.decls.file_id(
+			self.sema.decls.functions[usize::from(instance.function)].loc,
+		);
 		let (signature, param_types, result_type) =
 			self.lower_signature(instance)?;
 		let mut state = FunctionState {
@@ -700,7 +702,7 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// An imported function: its signature, and the import entry naming it.
-	/// The host provides it as `module`.`name`, with `name` its written name.
+	/// The host provides it as `module`.`field`.
 	fn lower_imported_function(
 		&mut self,
 		instance: FunctionInstance,
@@ -714,8 +716,9 @@ impl<'a> Lowerer<'a> {
 			module: self.sema.decls.imports[usize::from(import)]
 				.external_name
 				.inner,
-			name: self.sema.decls.functions[usize::from(instance.function)]
-				.name
+			name: self.sema.decls.import_entries
+				[&instance.function.loc(&self.sema.decls)]
+				.field
 				.inner,
 			item: mir::Item::Function(id),
 		});
@@ -738,15 +741,20 @@ impl<'a> Lowerer<'a> {
 			return Ok(id);
 		}
 		let decl = &self.sema.decls.globals[usize::from(global)];
-		let (file_id, name, mutable) =
-			(decl.file_id, decl.name, decl.mut_trait_impl_index.is_some());
+		let (file_id, name, mutable) = (
+			self.sema.decls.file_id(decl.loc),
+			self.sema.decls.item(decl.loc).name,
+			decl.mut_trait_impl_index.is_some(),
+		);
 		let value_type = self.sema.global_value_type(global);
 		// The checker proved it one Wasm value: a scalar, which a struct of
 		// one (`Meters(u32)`) is too.
 		let ty = self.lower_type(value_type, file_id, name.span)?;
 		let id = mir::GlobalId::new(u32::try_from(self.globals.len()).unwrap());
-		let origin = match self.sema.decls.globals[usize::from(global)]
-			.namespace
+		let origin = match self
+			.sema
+			.decls
+			.scope(self.sema.decls.globals[usize::from(global)].loc)
 		{
 			Scope::Import(import_index) => {
 				let entry = mir::ImportIdx::new(
@@ -756,7 +764,10 @@ impl<'a> Lowerer<'a> {
 					module: self.sema.decls.imports[usize::from(import_index)]
 						.external_name
 						.inner,
-					name: name.inner,
+					name: self.sema.decls.import_entries
+						[&global.loc(&self.sema.decls)]
+						.field
+						.inner,
 					item: mir::Item::Global(id),
 				});
 				mir::Origin::Imported(entry)
@@ -830,8 +841,10 @@ impl<'a> Lowerer<'a> {
 		let limits = self.sema.decls.memories[usize::from(memory)].limits;
 		let pages =
 			|bound: Option<Spanned<u64>>| bound.map(|pages| pages.inner);
-		let origin = match self.sema.decls.memories[usize::from(memory)]
-			.namespace
+		let origin = match self
+			.sema
+			.decls
+			.scope(self.sema.decls.memories[usize::from(memory)].loc)
 		{
 			Scope::Import(import_index) => {
 				let entry = mir::ImportIdx::new(
@@ -841,8 +854,9 @@ impl<'a> Lowerer<'a> {
 					module: self.sema.decls.imports[usize::from(import_index)]
 						.external_name
 						.inner,
-					name: self.sema.decls.memories[usize::from(memory)]
-						.name
+					name: self.sema.decls.import_entries
+						[&memory.loc(&self.sema.decls)]
+						.field
 						.inner,
 					item: mir::Item::Memory(id),
 				});
@@ -897,9 +911,11 @@ impl<'a> Lowerer<'a> {
 				signature.return_type,
 			)
 		};
-		let file_id = self.sema.decls.functions[usize::from(function)].file_id;
-		let name_span =
-			self.sema.decls.functions[usize::from(function)].name.span;
+		let file_id = self
+			.sema
+			.decls
+			.file_id(self.sema.decls.functions[usize::from(function)].loc);
+		let name_span = self.sema.decls.name(function).span;
 		// The flat arguments cover the whole parameter chain: an enclosing
 		// impl's, then the function's own. Every instance comes from a
 		// checked call, and the checker refuses to export a generic function
@@ -1030,9 +1046,7 @@ impl<'a> Lowerer<'a> {
 		if body.params().len() != param_types.len() {
 			self.unsupported(
 				file_id,
-				self.sema.decls.functions[usize::from(instance.function)]
-					.name
-					.span,
+				self.sema.decls.name(instance.function).span,
 				"a parameter list that does not match its checked signature",
 			)?;
 		}
@@ -3422,6 +3436,113 @@ mod tests {
 		}
 		export { run as "run" }
 	"#;
+
+	#[test]
+	fn an_import_entry_is_provided_as_its_field_or_else_its_own_name() {
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph = crate::tir::signatures::tests::source_graph(
+			r#"
+			import "env" as env {
+				"Log": func log(value: u32);
+				"base\\x": global base: i32;
+				"mem": memory heap: u32;
+				func flush();
+			}
+			func run() -> i32 {
+				env::log(1);
+				env::flush();
+				local p: env::heap::&u8 = transmute(0: u32);
+				local _byte: u8 = p.*;
+				env::base.get()
+			}
+			export { run }
+			"#,
+			&mut strings,
+		);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let lowered = crate::tir::lower(&mut sema, &strings);
+		let mir = lowered.unwrap_or_else(|()| {
+			panic!("imports lower: {:#?}", sema.diagnostics())
+		});
+		let mut fields: Vec<_> = mir
+			.imports
+			.iter()
+			.map(|import| {
+				(
+					strings.resolve(import.module).unwrap(),
+					strings.resolve(import.name).unwrap(),
+				)
+			})
+			.collect();
+		fields.sort_unstable();
+		assert_eq!(
+			fields,
+			[
+				("env", "Log"),
+				("env", "base\\x"),
+				("env", "flush"),
+				("env", "mem"),
+			]
+		);
+	}
+
+	#[test]
+	fn one_host_field_may_be_imported_as_several_items_of_any_kind() {
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph = crate::tir::signatures::tests::source_graph(
+			r#"
+			import "env" as env {
+				"foo": func foo_i32(x: i32);
+				"foo": func foo_i64(x: i64);
+				"foo": global foo_global: i32;
+				"foo": memory foo_memory: u32;
+			}
+			import "env" as again {
+				"foo": func foo_i32(x: i32);
+			}
+			func run() -> i32 {
+				env::foo_i32(1);
+				env::foo_i64(2);
+				again::foo_i32(3);
+				local p: env::foo_memory::&u8 = transmute(0: u32);
+				local _byte: u8 = p.*;
+				env::foo_global.get()
+			}
+			export { run }
+			"#,
+			&mut strings,
+		);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let lowered = crate::tir::lower(&mut sema, &strings);
+		let mut mir = lowered.unwrap_or_else(|()| {
+			panic!("imports lower: {:#?}", sema.diagnostics())
+		});
+		// Five wx items, each its own MIR import entry.
+		assert_eq!(mir.imports.len(), 5);
+		mir.verify_imports().unwrap();
+		let bytes = crate::backend::emit(&mut mir, &strings, None)
+			.expect("lowered MIR must encode")
+			.encode();
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, &bytes)
+			.expect("lowered MIR must be valid Wasm");
+		let mut imports: Vec<String> = module
+			.imports()
+			.map(|import| {
+				let kind = match import.ty() {
+					wasmtime::ExternType::Func(ty) => format!("{ty}"),
+					wasmtime::ExternType::Global(_) => "global".into(),
+					wasmtime::ExternType::Memory(_) => "memory".into(),
+					other => format!("{other:?}"),
+				};
+				format!("{}.{}: {kind}", import.module(), import.name())
+			})
+			.collect();
+		imports.sort_unstable();
+		// The two `foo_i32`s are one Wasm entry; the rest stay apart.
+		assert_eq!(imports.len(), 4, "{imports:#?}");
+		assert!(imports.iter().all(|import| import.starts_with("env.foo:")));
+	}
 
 	#[test]
 	fn each_imported_function_is_its_own_item_with_its_own_import_entry() {
@@ -9080,7 +9201,7 @@ mod tests {
 			.functions
 			.iter()
 			.position(|function| {
-				function.name.inner == symbol
+				sema.decls.item(function.loc).name.inner == symbol
 					&& matches!(function.owner, MemberOwner::Free)
 			})
 			.unwrap_or_else(|| panic!("expected a function `{name}`"));
@@ -9126,7 +9247,9 @@ mod tests {
 				sema.decls
 					.constants
 					.iter()
-					.position(|constant| constant.name.inner == symbol)
+					.position(|constant| {
+						sema.decls.item(constant.loc).name.inner == symbol
+					})
 					.unwrap(),
 			)
 			.unwrap(),

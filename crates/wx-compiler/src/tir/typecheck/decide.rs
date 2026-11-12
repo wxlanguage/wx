@@ -65,7 +65,7 @@ impl BodyContext<'_> {
 			return;
 		};
 		let kind = self.sema.constants[usize::from(constant)].ty;
-		let name = self.sema.decls.constants[usize::from(constant)].name.inner;
+		let name = self.sema.decls.name(constant).inner;
 		let name = self.strings.resolve(name).unwrap().to_owned();
 		let at = self.source_span(expr);
 		for concrete in

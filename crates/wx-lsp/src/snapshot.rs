@@ -79,6 +79,24 @@ impl Snapshot {
 			.then_some((span, definition))
 	}
 
+	/// Every declared name written in `file`, in source order.
+	pub(crate) fn definitions_in(
+		&self,
+		file: FileId,
+	) -> impl Iterator<Item = (SourceSpan, Definition)> + '_ {
+		let start = SourceSpan::new(file, TextSpan { start: 0, end: 0 });
+		self.definitions
+			.range(start..)
+			.take_while(move |(span, _)| span.file_id == file)
+			.map(|(&span, &definition)| (span, definition))
+	}
+
+	/// What the name written at exactly `span` declares, if it declares
+	/// anything.
+	pub(crate) fn declared_at(&self, span: SourceSpan) -> Option<Definition> {
+		self.definitions.get(&span).copied()
+	}
+
 	/// The file `uri` names in this snapshot. Matched by rebuilding each
 	/// module's URI rather than converting `uri` to a path, since a path
 	/// conversion accepts a `wx://std/...` URI and returns a bogus path.

@@ -96,10 +96,7 @@ impl BoundFormatter<'_> {
 
 	fn write_bound(&self, f: &mut String, bound: BoundId) {
 		let bound = self.bounds.get(bound);
-		let symbol = self.type_formatter.decls.traits
-			[usize::from(bound.trait_index)]
-		.name
-		.inner;
+		let symbol = self.type_formatter.decls.name(bound.trait_index).inner;
 		f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
 		if bound.bindings.is_empty() {
 			return;
@@ -114,30 +111,18 @@ impl BoundFormatter<'_> {
 				|symbol| self.type_formatter.strings.resolve(symbol).unwrap();
 			match &binding.kind {
 				BindingRequirement::Equals(target, ty) => {
-					f.push_str(name(
-						decls.assoc_types[usize::from(target.assoc_type_index)]
-							.name
-							.inner,
-					));
+					f.push_str(name(decls.name(target.assoc_type_index).inner));
 					f.push_str(" = ");
 					self.type_formatter.write_type(f, ty.inner);
 				}
 				BindingRequirement::Bound(target, bounds) => {
-					f.push_str(name(
-						decls.assoc_types[usize::from(target.assoc_type_index)]
-							.name
-							.inner,
-					));
+					f.push_str(name(decls.name(target.assoc_type_index).inner));
 					f.push_str(": ");
 					self.write_bounds(f, bounds);
 				}
 				BindingRequirement::Representable(target, ty) => {
 					f.push_str("const ");
-					f.push_str(name(
-						decls.constants[usize::from(target.constant)]
-							.name
-							.inner,
-					));
+					f.push_str(name(decls.name(target.constant).inner));
 					f.push_str(": ");
 					self.type_formatter.write_type(f, ty.inner);
 				}
@@ -205,24 +190,20 @@ impl TypeFormatter<'_> {
 				struct_index,
 				type_args,
 			} => {
-				let symbol =
-					self.decls.structs[usize::from(*struct_index)].name.inner;
+				let symbol = self.decls.name(*struct_index).inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				self.write_type_args(f, limit, self.types.list(*type_args));
 			}
 			Type::Enum { enum_index } => {
-				let symbol =
-					self.decls.enums[usize::from(*enum_index)].name.inner;
+				let symbol = self.decls.name(*enum_index).inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
 			Type::Memory { memory_index, .. } => {
-				let symbol =
-					self.decls.memories[usize::from(*memory_index)].name.inner;
+				let symbol = self.decls.name(*memory_index).inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
 			Type::Global { global_index } => {
-				let symbol =
-					self.decls.globals[usize::from(*global_index)].name.inner;
+				let symbol = self.decls.name(*global_index).inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 			}
 			Type::Pointer {
@@ -293,13 +274,16 @@ impl TypeFormatter<'_> {
 					f.push('<');
 					self.write_part(f, limit, receiver);
 					f.push_str(" as ");
-					let symbol =
-						self.decls.traits[usize::from(trait_index)].name.inner;
+					let symbol = self.decls.name(trait_index).inner;
 					f.push_str(self.strings.resolve(symbol).unwrap());
 					f.push_str(">::");
 					type_args = own;
 				}
-				f.push_str(self.strings.resolve(function.name.inner).unwrap());
+				f.push_str(
+					self.strings
+						.resolve(self.decls.item(function.loc).name.inner)
+						.unwrap(),
+				);
 				self.write_type_args(f, limit, type_args);
 			}
 			Type::TypeParam {
@@ -324,14 +308,10 @@ impl TypeFormatter<'_> {
 				f.push('<');
 				self.write_part(f, limit, *base);
 				f.push_str(" as ");
-				let symbol =
-					self.decls.traits[usize::from(*trait_index)].name.inner;
+				let symbol = self.decls.name(*trait_index).inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				f.push_str(">::");
-				let assoc_symbol = self.decls.assoc_types
-					[usize::from(*assoc_type_index)]
-				.name
-				.inner;
+				let assoc_symbol = self.decls.name(*assoc_type_index).inner;
 				f.push_str(self.strings.resolve(assoc_symbol).unwrap());
 			}
 		}
@@ -357,14 +337,16 @@ impl TypeFormatter<'_> {
 		args: &[TypeIndex],
 	) {
 		let decl = &self.decls.constants[usize::from(constant)];
-		let name = self.strings.resolve(decl.name.inner).unwrap();
+		let name = self
+			.strings
+			.resolve(self.decls.item(decl.loc).name.inner)
+			.unwrap();
 		match decl.owner {
 			MemberOwner::Trait(trait_index) => {
 				f.push('<');
 				self.write_part(f, limit, args[0]);
 				f.push_str(" as ");
-				let symbol =
-					self.decls.traits[usize::from(trait_index)].name.inner;
+				let symbol = self.decls.name(trait_index).inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
 				f.push_str(">::");
 				f.push_str(name);
@@ -493,7 +475,7 @@ mod tests {
 				let _ = builder.ensure_signature(
 					&mut sema,
 					QueryInfo {
-						decl_id: entry.node.decl_id(),
+						query: entry.node.query(),
 						requested_at: None,
 					},
 				);
@@ -566,9 +548,10 @@ mod tests {
 			let after = names[index].span.end;
 			let before =
 				names.get(index + 1).map_or(u32::MAX, |n| n.span.start);
-			let file_id = self.sema.decls.functions
-				[usize::from(self.function(function))]
-			.file_id;
+			let file_id = self.sema.decls.file_id(
+				self.sema.decls.functions[usize::from(self.function(function))]
+					.loc,
+			);
 			let written: Vec<BoundId> = self
 				.sema
 				.bounds

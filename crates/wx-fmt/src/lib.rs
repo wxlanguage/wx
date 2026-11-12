@@ -1,6 +1,7 @@
 use string_interner::symbol::SymbolU32;
 use wx_compiler::ast;
 use wx_compiler::diagnostics::TextSpan;
+use wx_compiler::tir::unescape_string_literal;
 
 #[cfg(test)]
 mod tests;
@@ -1105,8 +1106,26 @@ impl<'a> Builder<'a> {
 						external_name,
 						declaration,
 					} => {
-						if let Some(ext_name) = external_name {
-							entry_nodes.push(self.symbol(ext_name.inner));
+						// A field that is the entry's own name says nothing
+						// (`"log": func log(..)`), so it is dropped.
+						let name = match declaration {
+							ast::ImportDeclaration::Function {
+								signature,
+								..
+							} => signature.name.inner,
+							ast::ImportDeclaration::Global { name, .. }
+							| ast::ImportDeclaration::Memory { name, .. } => name.inner,
+						};
+						// Compared as decoded, so any spelling of the name
+						// is its own; one that does not decode stays.
+						if let Some(field) = external_name
+							&& unescape_string_literal(
+								field.extract_str(self.source),
+							)
+							.ok()
+							.as_deref() != self.interner.resolve(name)
+						{
+							entry_nodes.push(self.source_text(*field));
 							entry_nodes.push(self.text(Text::ColonSp));
 						}
 						match declaration {

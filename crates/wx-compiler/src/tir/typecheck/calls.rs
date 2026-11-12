@@ -211,11 +211,9 @@ impl CallTargetKind {
 		sema: &Semantics,
 	) -> &'s str {
 		let name = match self {
-			Self::Function(function) => {
-				sema.decls.functions[usize::from(function)].name
-			}
+			Self::Function(function) => sema.decls.name(function),
 			Self::StructConstructor(struct_index) => {
-				sema.decls.structs[usize::from(struct_index)].name
+				sema.decls.name(struct_index)
 			}
 		};
 		strings.resolve(name.inner).unwrap()
@@ -227,11 +225,11 @@ impl CallTargetKind {
 		let declaration = match self {
 			Self::Function(function) => {
 				let decl = &sema.decls.functions[usize::from(function)];
-				SourceSpan::new(decl.file_id, decl.name.span)
+				sema.decls.declaration_span(decl.loc)
 			}
 			Self::StructConstructor(struct_index) => {
 				let decl = &sema.decls.structs[usize::from(struct_index)];
-				SourceSpan::new(decl.file_id, decl.name.span)
+				sema.decls.declaration_span(decl.loc)
 			}
 		};
 		declaration.secondary_label().with_message("declared here")
@@ -254,7 +252,7 @@ fn naming_declaration(sema: &Semantics, function: FunctionIdx) -> FunctionIdx {
 	};
 	match sema.decls.declared_trait_member(
 		trait_index.inner,
-		BindingKey::value(decl.name.inner),
+		BindingKey::value(sema.decls.item(decl.loc).name.inner),
 	) {
 		Some(
 			MemberKind::Function(declaration) | MemberKind::Method(declaration),

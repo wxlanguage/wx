@@ -1613,20 +1613,12 @@ impl GenericEnvOwner {
 		decls: &Declarations,
 	) -> Option<Spanned<SymbolU32>> {
 		Some(match self {
-			Self::Constant(index) => decls.constants[usize::from(index)].name,
-			Self::Enum(index) => decls.enums[usize::from(index)].name,
-			Self::Struct(struct_index) => {
-				decls.structs[usize::from(struct_index)].name
-			}
-			Self::Function(func_index) => {
-				decls.functions[usize::from(func_index)].name
-			}
-			Self::Trait(trait_index) => {
-				decls.traits[usize::from(trait_index)].name
-			}
-			Self::TypeAlias(type_alias_index) => {
-				decls.type_aliases[usize::from(type_alias_index)].name
-			}
+			Self::Constant(index) => decls.name(index),
+			Self::Enum(index) => decls.name(index),
+			Self::Struct(struct_index) => decls.name(struct_index),
+			Self::Function(func_index) => decls.name(func_index),
+			Self::Trait(trait_index) => decls.name(trait_index),
+			Self::TypeAlias(type_alias_index) => decls.name(type_alias_index),
 			Self::InherentImpl(_) | Self::TraitImpl(_) => return None,
 		})
 	}
@@ -1634,21 +1626,22 @@ impl GenericEnvOwner {
 	pub(super) fn file_id(self, decls: &Declarations) -> FileId {
 		match self {
 			Self::Constant(index) => {
-				decls.constants[usize::from(index)].file_id
+				decls.file_id(decls.constants[usize::from(index)].loc)
 			}
-			Self::Enum(index) => decls.enums[usize::from(index)].file_id,
+			Self::Enum(index) => {
+				decls.file_id(decls.enums[usize::from(index)].loc)
+			}
 			Self::Struct(struct_index) => {
-				decls.structs[usize::from(struct_index)].file_id
+				decls.file_id(decls.structs[usize::from(struct_index)].loc)
 			}
 			Self::Function(func_index) => {
-				decls.functions[usize::from(func_index)].file_id
+				decls.file_id(decls.functions[usize::from(func_index)].loc)
 			}
 			Self::Trait(trait_index) => {
-				decls.traits[usize::from(trait_index)].file_id
+				decls.file_id(decls.traits[usize::from(trait_index)].loc)
 			}
-			Self::TypeAlias(type_alias_index) => {
-				decls.type_aliases[usize::from(type_alias_index)].file_id
-			}
+			Self::TypeAlias(type_alias_index) => decls
+				.file_id(decls.type_aliases[usize::from(type_alias_index)].loc),
 			Self::InherentImpl(index) => {
 				decls.inherent_impls[usize::from(index)].file_id
 			}

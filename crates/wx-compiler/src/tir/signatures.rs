@@ -44,9 +44,9 @@ use super::bounds::{
 };
 use super::decls::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingTarget, ConstIdx,
-	DeclId, DeclKey, DeclKind, Declarations, EnumIdx, FunctionIdx, GlobalIdx,
-	InherentImplIdx, MemberKind, MemoryIdx, Scope, StructIdx, Tier, TraitIdx,
-	TraitImplIdx, TypesetIdx,
+	DeclKind, Declarations, Declared, EnumIdx, FunctionIdx, GlobalIdx,
+	InherentImplIdx, ItemLoc, MemberKind, MemoryIdx, Scope, SignatureQuery,
+	StructIdx, Tier, TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
@@ -126,7 +126,7 @@ pub struct TraitSignature {
 /// AST and so share one resolved shape here too. No name/identity fields:
 /// unlike `TypeAliasSignature`, nothing needs to display a function's name
 /// from just this struct — the one place that will (diagnostics, once
-/// bodies exist) already has the `DeclId` to look the name up from `decls`.
+/// bodies exist) already has the `SignatureQuery` to look the name up from `decls`.
 pub struct FunctionSignature {
 	/// The signature's scope scope, including enclosing impl/trait frames.
 	/// Without own parameters this is the parent's scope. Bounds remain in
@@ -283,8 +283,8 @@ impl Semantics {
 		let constant = &self.decls.constants[usize::from(const_index)];
 		let env = self.constants[usize::from(const_index)].env;
 		LexicalScope {
-			file_id: constant.file_id,
-			namespace: constant.namespace,
+			file_id: self.decls.file_id(constant.loc),
+			namespace: self.decls.scope(constant.loc),
 			generic_env: env,
 			assumption_env: self.assumption_envs.of_frame(env),
 		}
@@ -353,7 +353,7 @@ impl Semantics {
 	}
 }
 
-/// Where a `DeclId`'s data actually lives — one arena per item kind
+/// Where a `SignatureQuery`'s data actually lives — one arena per item kind
 /// `ensure_signature` can be asked about. `Trait`/`TraitImpl`/`InherentImpl`/
 /// `Struct` and the other item kinds use indices allocated in `decls.rs`
 /// and keep resolved data in index-aligned slots here.
@@ -416,12 +416,12 @@ enum QueryState {
 	Resolved(SignatureLocation),
 }
 
-/// `ast_index` is this `DeclId`'s position in `SemanticsBuilder::entries`
+/// `ast_index` is this `SignatureQuery`'s position in `SemanticsBuilder::entries`
 /// — set once, at construction, from `decls.rs`'s parse-order record, so
 /// `ensure_signature` never needs a second lookup to find the AST it's
 /// supposed to resolve.
 ///
-/// Keyed directly by `DeclId` (`query_state: FxHashMap<DeclId, QueryEntry>`
+/// Keyed directly by `SignatureQuery` (`query_state: FxHashMap<SignatureQuery, QueryEntry>`
 /// below) rather than through a `QueryKind`-tagged wrapper: signature
 /// resolution is the only query this engine runs — a body doesn't get one
 /// of its own, since (unlike a signature) it can't depend on anything that
@@ -439,13 +439,13 @@ struct QueryEntry {
 
 /// What a caller passes to `ensure_signature` — also pushed as-is onto
 /// `query_stack` as that in-progress query's own frame. `requested_at` is
-/// the span of the reference that demanded `decl_id`; `None` only for a
-/// top-level, non-reference demand (the per-`DeclId` driver loop) —
+/// the span of the reference that demanded `query`; `None` only for a
+/// top-level, non-reference demand (the per-`SignatureQuery` driver loop) —
 /// `resolve_type` always supplies `Some` when it recurses because of a
 /// written reference.
 #[derive(Clone, Copy)]
 pub(super) struct QueryInfo {
-	pub(super) decl_id: DeclId,
+	pub(super) query: SignatureQuery,
 	pub(super) requested_at: Option<SourceSpan>,
 }
 
@@ -462,7 +462,7 @@ pub(super) struct SemanticsBuilder<'ast> {
 	pub(super) strings: &'ast mut StringInterner,
 	/// The prescan's declarations, in parse order (`Declarations::build`).
 	entries: &'ast [AstEntry<'ast>],
-	query_state: FxHashMap<DeclId, QueryEntry>,
+	query_state: FxHashMap<SignatureQuery, QueryEntry>,
 	/// In-progress queries, in call order.
 	query_stack: Vec<QueryInfo>,
 	/// Every declaration's obligations, one contiguous run per declaration
@@ -839,7 +839,7 @@ impl Semantics {
 			]);
 		match self.types.resolve(target.inner) {
 			Type::Struct { struct_index, .. } => {
-				let name = self.decls.structs[usize::from(*struct_index)].name;
+				let name = self.decls.name(*struct_index);
 				diagnostic.with_note(format!(
 					"to write other type arguments, use the struct's name `{}` instead",
 					strings.resolve(name.inner).unwrap()
@@ -916,7 +916,7 @@ impl Semantics {
 	) {
 		let function_decl = &self.decls.functions[usize::from(function_index)];
 		let function_impls = function_decl.function_impls;
-		let name_span = function_decl.name.span;
+		let name_span = self.decls.item(function_decl.loc).name.span;
 		// The tuple is interned over the signature's own list, so nothing is
 		// copied; none is the empty tuple, `()`.
 		let args = match *self.types.list(param_types) {
@@ -953,7 +953,7 @@ impl Semantics {
 			if value == TypeIndex::ERROR {
 				continue;
 			}
-			let name = self.decls.assoc_types[usize::from(provider)].name.inner;
+			let name = self.decls.name(provider).inner;
 			let Some(MemberKind::AssociatedType(declaration)) = self
 				.decls
 				.declared_trait_member(call_trait, BindingKey::ty(name))
@@ -1324,7 +1324,7 @@ impl Semantics {
 		namespace: Scope,
 		segments: &[ast::PathSegment],
 	) -> Option<TraitIdx> {
-		let decl_key = PathResolver::new(
+		let loc = PathResolver::new(
 			&mut self.diagnostics,
 			&mut self.resolutions,
 			strings,
@@ -1332,7 +1332,7 @@ impl Semantics {
 		)
 		.resolve_definition(file_id, namespace, segments, Tier::Type)
 		.ok()?;
-		match decl_key.symbol_kind(&self.decls) {
+		match loc.symbol_kind(&self.decls) {
 			DeclKind::Trait(trait_index) => Some(trait_index),
 			// A `typeset` bound resolves to its own compiler-generated
 			// trait — `typeset_index` (and, through it, `trait_index`) is
@@ -1485,8 +1485,7 @@ fn report_enum_repr_not_integer(
 	file_id: FileId,
 	span: TextSpan,
 	typeset_name: &str,
-	typeset_file_id: FileId,
-	typeset_span: TextSpan,
+	typeset: SourceSpan,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
 		.with_code(DiagnosticCode::EnumReprNotInteger.code())
@@ -1499,7 +1498,7 @@ fn report_enum_repr_not_integer(
 				.with_message(format!("not a member of `{typeset_name}`")),
 		)
 		.with_label(
-			SourceSpan::new(typeset_file_id, typeset_span)
+			typeset
 				.secondary_label()
 				.with_message(format!("`{typeset_name}` is declared here")),
 		)
@@ -1593,7 +1592,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.enumerate()
 			.map(|(index, entry)| {
 				(
-					entry.node.decl_id(),
+					entry.node.query(),
 					QueryEntry {
 						ast_index: u32::try_from(index).unwrap(),
 						state: QueryState::Pending,
@@ -1626,7 +1625,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			let _ = self.ensure_signature(
 				sema,
 				QueryInfo {
-					decl_id: entry.node.decl_id(),
+					query: entry.node.query(),
 					requested_at: None,
 				},
 			);
@@ -1653,14 +1652,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let obligations = std::mem::take(&mut self.obligations);
 		for entry in self.entries {
 			let range =
-				self.query_state[&entry.node.decl_id()].obligations.clone();
+				self.query_state[&entry.node.query()].obligations.clone();
 			for obligation in
 				&obligations[range.start as usize..range.end as usize]
 			{
 				sema.check_obligation(&self.strings, obligation)
 					.expect("every signature and every constant body exists");
 			}
-			if let DeclId::TraitImpl(impl_index) = entry.node.decl_id() {
+			if let SignatureQuery::TraitImpl(impl_index) = entry.node.query() {
 				let checked = self.check_conformance(sema, impl_index);
 				assert!(
 					checked.is_ok(),
@@ -1801,7 +1800,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		signature: &ast::FunctionSignature,
 		block: &Spanned<ast::Expression>,
 	) {
-		let DeclId::Function(function_index) = entry.node.decl_id() else {
+		let SignatureQuery::Function(function_index) = entry.node.query()
+		else {
 			unreachable!("a function's entry is a function")
 		};
 		let scope = LexicalScope {
@@ -1841,9 +1841,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 	#[cfg(test)]
 	pub(super) fn signature_location(
 		&self,
-		decl_id: DeclId,
+		query: SignatureQuery,
 	) -> SignatureLocation {
-		let QueryState::Resolved(location) = self.query_state[&decl_id].state
+		let QueryState::Resolved(location) = self.query_state[&query].state
 		else {
 			unreachable!("`build` leaves every query resolved")
 		};
@@ -2146,12 +2146,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			return sema.impl_target_type(head.inner);
 		};
-		let decl_id = DeclId::Struct(struct_index);
-		if matches!(self.query_state[&decl_id].state, QueryState::Pending) {
+		let query = SignatureQuery::Struct(struct_index);
+		if matches!(self.query_state[&query].state, QueryState::Pending) {
 			let _ = self.ensure_signature(
 				sema,
 				QueryInfo {
-					decl_id,
+					query,
 					requested_at: Some(SourceSpan::new(
 						scope.file_id,
 						segment.ident.span,
@@ -2186,7 +2186,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema.types.intern_struct(struct_index, &args)
 	}
 
-	/// `decl_id`'s own `AstNodeRef` — `decls.rs`'s output, so this is pure
+	/// `query`'s own `AstNodeRef` — `decls.rs`'s output, so this is pure
 	/// identity: reading it never forces `ensure_signature` and is valid
 	/// the moment `Semantics` exists, before any query has run at
 	/// all. This is how a pre-seeded kind's own index
@@ -2194,16 +2194,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// without forcing that item's signature — the six pre-seeded kinds no
 	/// longer get an early `SignatureLocation` seeded into `query_state`;
 	/// they get this instead, which was already sitting there.
-	pub(super) fn ast_node(&self, decl_id: DeclId) -> &AstNodeRef<'ast> {
-		&self.entries[self.ast_index(decl_id) as usize].node
+	pub(super) fn ast_node(&self, query: SignatureQuery) -> &AstNodeRef<'ast> {
+		&self.entries[self.ast_index(query) as usize].node
 	}
 
 	/// The declaration's position in parse order, which is definition order.
-	pub(super) fn ast_index(&self, decl_id: DeclId) -> u32 {
-		self.query_state[&decl_id].ast_index
+	pub(super) fn ast_index(&self, query: SignatureQuery) -> u32 {
+		self.query_state[&query].ast_index
 	}
 
-	/// The demand-driven driver: computes `decl_id`'s signature if it hasn't
+	/// The demand-driven driver: computes `query`'s signature if it hasn't
 	/// been already. The two checks below are safe to return early from —
 	/// nothing has been pushed onto `query_stack` yet at that point. Past
 	/// that, no early `return`: `query_stack`'s frame has to pop and
@@ -2212,9 +2212,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 	pub(super) fn ensure_signature(
 		&mut self,
 		sema: &mut Semantics,
-		query: QueryInfo,
+		request: QueryInfo,
 	) -> SignatureStatus {
-		match self.query_state[&query.decl_id].state {
+		match self.query_state[&request.query].state {
 			QueryState::Resolved(location) => {
 				return SignatureStatus::Available(location);
 			}
@@ -2222,19 +2222,19 @@ impl<'ast> SemanticsBuilder<'ast> {
 				return SignatureStatus::CycleReported;
 			}
 			QueryState::InProgress => {
-				self.query_state.get_mut(&query.decl_id).unwrap().state =
+				self.query_state.get_mut(&request.query).unwrap().state =
 					QueryState::CycleReported;
 				return SignatureStatus::Cycle;
 			}
 			QueryState::Pending => {}
 		}
 
-		self.query_state.get_mut(&query.decl_id).unwrap().state =
+		self.query_state.get_mut(&request.query).unwrap().state =
 			QueryState::InProgress;
-		self.query_stack.push(query);
+		self.query_stack.push(request);
 
 		let entry =
-			&self.entries[self.query_state[&query.decl_id].ast_index as usize];
+			&self.entries[self.query_state[&request.query].ast_index as usize];
 		// A nested query keeps its own list, so this one's obligations join
 		// the shared list as one run when it finishes.
 		let mut obligations = Vec::new();
@@ -2250,7 +2250,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let start = u32::try_from(self.obligations.len()).unwrap();
 		self.obligations.extend(obligations);
 		let end = u32::try_from(self.obligations.len()).unwrap();
-		let entry = self.query_state.get_mut(&query.decl_id).unwrap();
+		let entry = self.query_state.get_mut(&request.query).unwrap();
 		entry.state = QueryState::Resolved(location);
 		entry.obligations = start..end;
 		SignatureStatus::Available(location)
@@ -2530,9 +2530,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			sema.const_bodies[usize::from(const_index)],
 			ConstBody::NotBuilt
 		));
-		let decl_id = DeclId::Const(const_index);
-		let entry =
-			&self.entries[self.query_state[&decl_id].ast_index as usize];
+		let query = SignatureQuery::Const(const_index);
+		let entry = &self.entries[self.query_state[&query].ast_index as usize];
 		let scope = sema.const_scope(const_index);
 		let value = match entry.node {
 			AstNodeRef::Constant { item, .. } => match item {
@@ -2793,7 +2792,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					unreachable!()
 				};
 
-				// `Self` is owned by the trait itself (`owner: decl_id`,
+				// `Self` is owned by the trait itself (`owner: query`,
 				// `param_index: 0`) — pushed *before* the supertrait clause
 				// is resolved (a bound may reference it, e.g. `trait X: Add
 				// where { Rhs = Self } {}`) and once here, at the root, so
@@ -2857,12 +2856,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// back through *this* member: a trait's own header only
 				// ever depends on other traits' signatures (its supertrait
 				// clause), never on one of its own members', so there's no
-				// path from here back to an in-progress `decl_id`.
-				let trait_decl_id = DeclId::Trait(trait_index);
+				// path from here back to an in-progress `query`.
+				let trait_query = SignatureQuery::Trait(trait_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: trait_decl_id,
+						query: trait_query,
 						requested_at: None,
 					},
 				);
@@ -2888,11 +2887,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				};
 
 				// See `TraitFunction`'s identical force — same reasoning.
-				let trait_decl_id = DeclId::Trait(trait_index);
+				let trait_query = SignatureQuery::Trait(trait_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: trait_decl_id,
+						query: trait_query,
 						requested_at: None,
 					},
 				);
@@ -2949,11 +2948,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// this member's own declared bound can reference the
 				// trait's `Self` (`type Size: Memory where { X = Self::Y }`),
 				// which needs `self_scope` in scope to resolve at all.
-				let trait_decl_id = DeclId::Trait(trait_index);
+				let trait_query = SignatureQuery::Trait(trait_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: trait_decl_id,
+						query: trait_query,
 						requested_at: None,
 					},
 				);
@@ -3013,11 +3012,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let ast::ImplItem::Function { signature, .. } = item else {
 					unreachable!()
 				};
-				let impl_decl_id = DeclId::TraitImpl(block_index);
+				let impl_decl_id = SignatureQuery::TraitImpl(block_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: impl_decl_id,
+						query: impl_decl_id,
 						requested_at: None,
 					},
 				);
@@ -3043,11 +3042,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let ast::ImplItem::Constant { name, ty, .. } = item else {
 					unreachable!()
 				};
-				let impl_decl_id = DeclId::TraitImpl(block_index);
+				let impl_decl_id = SignatureQuery::TraitImpl(block_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: impl_decl_id,
+						query: impl_decl_id,
 						requested_at: None,
 					},
 				);
@@ -3082,11 +3081,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// its trait, and equally cycle-free: an impl's own header
 				// only ever depends on other items' signatures, never on
 				// one of its own members'.
-				let impl_decl_id = DeclId::TraitImpl(block_index);
+				let impl_decl_id = SignatureQuery::TraitImpl(block_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: impl_decl_id,
+						query: impl_decl_id,
 						requested_at: None,
 					},
 				);
@@ -3426,11 +3425,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// never close a cycle back through *this* member: the
 				// block's own header only depends on its target path/
 				// generic bounds, never on one of its members' signatures.
-				let impl_decl_id = DeclId::InherentImpl(block_index);
+				let impl_decl_id = SignatureQuery::InherentImpl(block_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: impl_decl_id,
+						query: impl_decl_id,
 						requested_at: None,
 					},
 				);
@@ -3458,11 +3457,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				};
 				// See `InherentImplFunction`'s identical force — same
 				// reasoning.
-				let impl_decl_id = DeclId::InherentImpl(block_index);
+				let impl_decl_id = SignatureQuery::InherentImpl(block_index);
 				let _ = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: impl_decl_id,
+						query: impl_decl_id,
 						requested_at: None,
 					},
 				);
@@ -3597,14 +3596,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 								&sema.decls.typesets[usize::from(integer)];
 							let name = self
 								.strings
-								.resolve(typeset.name.inner)
+								.resolve(
+									sema.decls.item(typeset.loc).name.inner,
+								)
 								.unwrap();
 							let diagnostic = report_enum_repr_not_integer(
 								file_id,
 								repr_expr.span,
 								name,
-								typeset.file_id,
-								typeset.name.span,
+								sema.decls.declaration_span(typeset.loc),
 							);
 							sema.diagnostics.push(diagnostic);
 							TypeIndex::ERROR
@@ -4027,7 +4027,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let target = match walk {
 			Some(walk) if walk.is_complete(segments) => walk.target,
 			// Reported where the walk failed.
-			Some(walk) if walk.target.decl_key().is_none() => {
+			Some(walk) if walk.target.loc().is_none() => {
 				return TypeIndex::ERROR;
 			}
 			// A constant of a type: `T::SIZE`, `Self::SIZE`, `A::SIZE`.
@@ -4065,7 +4065,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				);
 			}
 		};
-		let Some(key) = target.decl_key() else {
+		let Some(key) = target.loc() else {
 			return TypeIndex::ERROR;
 		};
 		let name = segments.last().unwrap().ident;
@@ -4161,7 +4161,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.trait_header(impl_index)
 			.trait_decl
 			.and_then(|trait_decl| {
-				let name = sema.decls.assoc_types[usize::from(provider)].name;
+				let name = sema.decls.name(provider);
 				sema.decls.declared_trait_member(
 					trait_decl.inner,
 					BindingKey::ty(name.inner),
@@ -4287,7 +4287,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				&sema.decls,
 			)
 			.walk_path(scope.file_id, scope.namespace, segments, Tier::Type);
-			let Some(decl_key) = walk.target.decl_key() else {
+			let Some(loc) = walk.target.loc() else {
 				return TypeIndex::ERROR;
 			};
 			let stopped = &segments[walk.stopped_at as usize];
@@ -4297,7 +4297,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					&self.strings,
 					stopped.ident.inner,
 					SourceSpan::new(scope.file_id, stopped.ident.span),
-					Some(decl_key),
+					Some(loc),
 				));
 			}
 
@@ -4305,7 +4305,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				sema,
 				obligations,
 				scope,
-				decl_key,
+				loc,
 				stopped,
 				infer_policy,
 			);
@@ -4334,11 +4334,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		decl_key: DeclKey,
+		loc: ItemLoc,
 		stopped: &ast::PathSegment,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
-		match decl_key.symbol_kind(&sema.decls) {
+		match loc.symbol_kind(&sema.decls) {
 			// An intrinsic alias takes no arguments: it is a primitive,
 			// not an alias with an empty parameter list.
 			kind @ DeclKind::TypeAlias(type_alias_index)
@@ -4370,20 +4370,20 @@ impl<'ast> SemanticsBuilder<'ast> {
 				sema.decls.intrinsics.identity_of(type_alias_index).unwrap()
 			}
 			DeclKind::TypeAlias(type_alias_index) => {
-				let decl_id = DeclId::TypeAlias(type_alias_index);
+				let query = SignatureQuery::TypeAlias(type_alias_index);
 				let reference =
 					SourceSpan::new(scope.file_id, stopped.ident.span);
 				let status = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id,
+						query,
 						requested_at: Some(reference),
 					},
 				);
 				match status {
 					SignatureStatus::Cycle => {
 						let diagnostic = self
-							.report_cyclic_type_alias(sema, decl_id, reference);
+							.report_cyclic_type_alias(sema, query, reference);
 						sema.diagnostics.push(diagnostic);
 						TypeIndex::ERROR
 					}
@@ -4441,15 +4441,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// before fields, see `RecordStruct`/
 				// `TupleStruct` above) is already valid to
 				// read by the time we get here.
-				let decl_id = DeclId::Struct(struct_index);
-				if matches!(
-					self.query_state[&decl_id].state,
-					QueryState::Pending
-				) {
+				let query = SignatureQuery::Struct(struct_index);
+				if matches!(self.query_state[&query].state, QueryState::Pending)
+				{
 					let _ = self.ensure_signature(
 						sema,
 						QueryInfo {
-							decl_id,
+							query,
 							requested_at: Some(SourceSpan::new(
 								scope.file_id,
 								stopped.ident.span,
@@ -4558,15 +4556,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 			// pushed before the parameters are lowered, so a
 			// function naming itself reads a valid `type_params`.
 			DeclKind::Function(func_index) => {
-				let decl_id = DeclId::Function(func_index);
-				if matches!(
-					self.query_state[&decl_id].state,
-					QueryState::Pending
-				) {
+				let query = SignatureQuery::Function(func_index);
+				if matches!(self.query_state[&query].state, QueryState::Pending)
+				{
 					let _ = self.ensure_signature(
 						sema,
 						QueryInfo {
-							decl_id,
+							query,
 							requested_at: Some(SourceSpan::new(
 								scope.file_id,
 								stopped.ident.span,
@@ -4632,12 +4628,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 			DeclKind::EnumVariant(_) | DeclKind::Const(_) => unreachable!(
 				"value-tier DefKind from a type-scope.namespace path walk"
 			),
-			// Never constructed anywhere — associated types are
-			// only ever reached through `resolve_type_member_path`'s
-			// own `MemberKind::AssociatedType`, never as a
-			// top-level scope.namespace symbol.
-			DeclKind::TraitAssocType(_) => unreachable!(
-				"TraitAssocType is never registered as a scope.namespace symbol"
+			// An associated type is a member: its row is never bound, so
+			// it is only ever reached through `resolve_type_member_path`'s
+			// own `MemberKind::AssociatedType`.
+			DeclKind::AssocType(_) => unreachable!(
+				"an associated type's row is never bound in a namespace"
 			),
 		}
 	}
@@ -4655,12 +4650,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 		segment: &ast::PathSegment,
 		infer_policy: InferPolicy,
 	) -> Box<[TypeIndex]> {
-		let decl_id = DeclId::Function(function);
-		if matches!(self.query_state[&decl_id].state, QueryState::Pending) {
+		let query = SignatureQuery::Function(function);
+		if matches!(self.query_state[&query].state, QueryState::Pending) {
 			let _ = self.ensure_signature(
 				sema,
 				QueryInfo {
-					decl_id,
+					query,
 					requested_at: Some(SourceSpan::new(
 						scope.file_id,
 						segment.ident.span,
@@ -4729,7 +4724,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&sema.decls,
 			scope.file_id,
 			segment,
-			TypeArgsNotAllowedOn::Declaration(DeclKind::TraitAssocType(
+			TypeArgsNotAllowedOn::Declaration(DeclKind::AssocType(
 				assoc_type_index,
 			)),
 		));
@@ -5115,15 +5110,37 @@ impl<'ast> SemanticsBuilder<'ast> {
 		TypeIndex::ERROR
 	}
 
+	/// The declaration a cycle diagnostic names for `query`, or `None` for an
+	/// impl, which is not a declaration and has no name: its step is described
+	/// by the span it is at instead.
+	fn query_decl(sema: &Semantics, query: SignatureQuery) -> Option<ItemLoc> {
+		let decls = &sema.decls;
+		Some(match query {
+			SignatureQuery::Struct(index) => index.loc(decls),
+			SignatureQuery::Enum(index) => index.loc(decls),
+			SignatureQuery::Trait(index) => index.loc(decls),
+			SignatureQuery::Typeset(index) => index.loc(decls),
+			SignatureQuery::TypeAlias(index) => index.loc(decls),
+			SignatureQuery::Function(index) => index.loc(decls),
+			SignatureQuery::Const(index) => index.loc(decls),
+			SignatureQuery::Memory(index) => index.loc(decls),
+			SignatureQuery::Global(index) => index.loc(decls),
+			SignatureQuery::AssocType(index) => index.loc(decls),
+			SignatureQuery::TraitImpl(_) | SignatureQuery::InherentImpl(_) => {
+				return None;
+			}
+		})
+	}
+
 	/// Builds the diagnostic for a cycle just detected while trying to
-	/// re-enter `decl_id` (found `InProgress` somewhere on `query_stack`).
-	/// Mirrors rustc's E0391 structure: walks the stack from `decl_id`'s own
+	/// re-enter `query` (found `InProgress` somewhere on `query_stack`).
+	/// Mirrors rustc's E0391 structure: walks the stack from `query`'s own
 	/// frame to the top, and for hop `i` shows the span of the *next*
 	/// frame's `requested_at` — i.e. the reference inside hop `i`'s own body
 	/// that demanded the next item, the same "attach the span to the query
 	/// it justifies" shape `rustc_query_system::QueryInfo` uses. The one
 	/// edge with no frame of its own is the closing one (re-entering
-	/// `decl_id`), since that call never got to push anything — the caller
+	/// `query`), since that call never got to push anything — the caller
 	/// already has that span in hand at the point it detects `Cycle`, so it
 	/// passes it in directly as `closing_reference`.
 	///
@@ -5136,7 +5153,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 	fn report_cycle(
 		&self,
 		sema: &Semantics,
-		decl_id: DeclId,
+		query: SignatureQuery,
 		closing_reference: SourceSpan,
 		code: DiagnosticCode,
 		describe: impl Fn(&str) -> String,
@@ -5144,7 +5161,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let position = self
 			.query_stack
 			.iter()
-			.position(|frame| frame.decl_id == decl_id)
+			.position(|frame| frame.query == query)
 			.expect(
 				"Cycle is only ever returned for a query currently in progress",
 			);
@@ -5161,43 +5178,45 @@ impl<'ast> SemanticsBuilder<'ast> {
 				.unwrap_or(closing_reference)
 		};
 
-		let root_name = sema.decls.name(decl_id);
-		let root_name_str = self.strings.resolve(root_name.inner).unwrap();
+		// What each step does: `describe` of its declaration's name, or for
+		// an impl, which has none, what its query resolves.
+		let step = |query: SignatureQuery| match Self::query_decl(sema, query) {
+			Some(key) => {
+				let name = sema.decls.item(key).name.inner;
+				describe(self.strings.resolve(name).unwrap())
+			}
+			None => "resolving the header of this impl".to_owned(),
+		};
+		let root = step(query);
 
 		let mut diagnostic = Diagnostic::error()
 			.with_code(code.code())
-			.with_message(format!(
-				"cycle detected when {}",
-				describe(root_name_str)
-			))
+			.with_message(format!("cycle detected when {root}"))
 			.with_label(hop_span(0).primary_label());
 
 		for (i, frame) in chain.iter().enumerate().skip(1) {
-			let name = sema.decls.name(frame.decl_id);
-			let name_str = self.strings.resolve(name.inner).unwrap();
 			diagnostic = diagnostic.with_label(
 				hop_span(i).secondary_label().with_message(format!(
 					"...which requires {}...",
-					describe(name_str)
+					step(frame.query)
 				)),
 			);
 		}
 
 		diagnostic.with_note(format!(
-			"...which again requires {}, completing the cycle",
-			describe(root_name_str)
+			"...which again requires {root}, completing the cycle"
 		))
 	}
 
 	fn report_cyclic_type_alias(
 		&self,
 		sema: &Semantics,
-		decl_id: DeclId,
+		query: SignatureQuery,
 		closing_reference: SourceSpan,
 	) -> Diagnostic<FileId> {
 		self.report_cycle(
 			sema,
-			decl_id,
+			query,
 			closing_reference,
 			DiagnosticCode::CyclicTypeAlias,
 			|name| format!("expanding type alias `{name}`"),
@@ -5211,12 +5230,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 	fn report_cyclic_supertrait(
 		&self,
 		sema: &Semantics,
-		decl_id: DeclId,
+		query: SignatureQuery,
 		closing_reference: SourceSpan,
 	) -> Diagnostic<FileId> {
 		self.report_cycle(
 			sema,
-			decl_id,
+			query,
 			closing_reference,
 			DiagnosticCode::CyclicTraitBounds,
 			|name| format!("computing the supertraits of `{name}`"),
@@ -5227,12 +5246,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 	pub(super) fn report_cyclic_implied_trait_bounds(
 		&self,
 		sema: &Semantics,
-		decl_id: DeclId,
+		query: SignatureQuery,
 		closing_reference: SourceSpan,
 	) -> Diagnostic<FileId> {
 		self.report_cycle(
 			sema,
-			decl_id,
+			query,
 			closing_reference,
 			DiagnosticCode::CyclicTraitBounds,
 			|name| format!("computing the implied bounds of `{name}`"),
@@ -5246,12 +5265,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 	pub(super) fn report_cyclic_assoc_type_bound(
 		&self,
 		sema: &Semantics,
-		decl_id: DeclId,
+		query: SignatureQuery,
 		closing_reference: SourceSpan,
 	) -> Diagnostic<FileId> {
 		self.report_cycle(
 			sema,
-			decl_id,
+			query,
 			closing_reference,
 			DiagnosticCode::CyclicTraitBounds,
 			|name| format!("computing the bound of associated type `{name}`"),
@@ -5269,13 +5288,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 	fn report_recursive_struct_cycle(
 		&self,
 		sema: &Semantics,
-		decl_id: DeclId,
+		query: SignatureQuery,
 		closing_reference: SourceSpan,
 	) -> Diagnostic<FileId> {
 		let position = self
 			.query_stack
 			.iter()
-			.position(|frame| frame.decl_id == decl_id)
+			.position(|frame| frame.query == query)
 			.expect(
 				"Cycle is only ever returned for a query currently in progress",
 			);
@@ -5296,21 +5315,24 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.with_code(DiagnosticCode::RecursiveTypeWithoutIndirection.code());
 		let mut names = Vec::with_capacity(chain.len());
 		for (i, frame) in chain.iter().enumerate() {
-			let ast_index = self.query_state[&frame.decl_id].ast_index;
-			let file_id = self.entries[ast_index as usize].file_id;
-			let name = sema.decls.name(frame.decl_id);
-			names.push(self.strings.resolve(name.inner).unwrap());
-			diagnostic = diagnostic
-				.with_label(SourceSpan::new(file_id, name.span).primary_label())
-				.with_label(
-					hop_span(i)
-						.secondary_label()
-						.with_message("recursive without indirection"),
+			// An impl has no name to list or point at; its step is the
+			// span below.
+			if let Some(key) = Self::query_decl(sema, frame.query) {
+				let name = sema.decls.item(key).name.inner;
+				names.push(self.strings.resolve(name).unwrap());
+				diagnostic = diagnostic.with_label(
+					sema.decls.declaration_span(key).primary_label(),
 				);
+			}
+			diagnostic = diagnostic.with_label(
+				hop_span(i)
+					.secondary_label()
+					.with_message("recursive without indirection"),
+			);
 		}
 
 		let message = match names.as_slice() {
-			[] => unreachable!("a cycle always has at least one participant"),
+			[] => unreachable!("the cycle starts at the struct being forced"),
 			[only] => format!("recursive type `{only}` has infinite size"),
 			[rest @ .., last] => {
 				let joined = rest
@@ -5358,12 +5380,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 	) {
 		match *sema.types.resolve(ty) {
 			Type::Struct { struct_index, .. } => {
-				let embedded_decl_id = DeclId::Struct(struct_index);
+				let embedded_decl_id = SignatureQuery::Struct(struct_index);
 				let reference = SourceSpan::new(file_id, field_span);
 				let status = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: embedded_decl_id,
+						query: embedded_decl_id,
 						requested_at: Some(reference),
 					},
 				);
@@ -5414,17 +5436,17 @@ impl<'ast> SemanticsBuilder<'ast> {
 				GenericEnvOwner::Trait(_)
 			) {
 			for occurrence in &occurrences {
-				let decl_id = sema.trait_decl_id(occurrence.trait_index);
+				let query = sema.trait_query(occurrence.trait_index);
 				let reference = occurrence.span;
 				if let SignatureStatus::Cycle = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id,
+						query,
 						requested_at: Some(reference),
 					},
 				) {
 					let diagnostic =
-						self.report_cyclic_supertrait(sema, decl_id, reference);
+						self.report_cyclic_supertrait(sema, query, reference);
 					sema.diagnostics.push(diagnostic);
 				}
 			}
@@ -5664,7 +5686,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					&self.strings,
 					binding.name,
-					sema.decls.traits[usize::from(trait_index)].name.inner,
+					sema.decls.name(trait_index).inner,
 					noun,
 				));
 				continue;
@@ -5675,7 +5697,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let status = self.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: DeclId::Const(target.constant),
+						query: SignatureQuery::Const(target.constant),
 						requested_at: None,
 					},
 				);
@@ -5860,8 +5882,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		}
 		// A trait still being built has no supertraits to read yet; the bound
 		// that reached it again reports the cycle.
-		let decl_id = sema.trait_decl_id(trait_index);
-		if matches!(self.query_state[&decl_id].state, QueryState::InProgress) {
+		let query = sema.trait_query(trait_index);
+		if matches!(self.query_state[&query].state, QueryState::InProgress) {
 			return MemberLookup::Error;
 		}
 		let Some(env) = self.trait_env(sema, trait_index, reference) else {
@@ -5953,13 +5975,13 @@ pub(super) mod tests {
 		};
 		let declared = |referent: Reference| {
 			let Reference::Item {
-				item: decl_key,
+				item: loc,
 				route: Route::Direct,
 			} = referent
 			else {
 				panic!("expected a declared definition, got {referent:?}");
 			};
-			decl_key.symbol_kind(&case.sema.decls)
+			loc.symbol_kind(&case.sema.decls)
 		};
 		let imported = |referent: Reference| {
 			let Reference::Item {
@@ -5980,9 +6002,7 @@ pub(super) mod tests {
 				panic!("expected an associated type, got {referent:?}");
 			};
 			assert_eq!(
-				case.strings.resolve(
-					case.sema.decls.assoc_types[usize::from(index)].name.inner
-				),
+				case.strings.resolve(case.sema.decls.name(index).inner),
 				Some("A")
 			);
 		};
@@ -6148,17 +6168,11 @@ pub(super) mod tests {
 					ExprKind::Const {
 						constant: index, ..
 					} => {
-						let name = case.sema.decls.constants
-							[usize::from(index)]
-						.name
-						.inner;
+						let name = case.sema.decls.name(index).inner;
 						case.strings.resolve(name).unwrap().to_string()
 					}
 					ExprKind::NextDiscriminant(index) => {
-						let name = case.sema.decls.constants
-							[usize::from(index)]
-						.name
-						.inner;
+						let name = case.sema.decls.name(index).inner;
 						format!(
 							"(next {})",
 							case.strings.resolve(name).unwrap()
@@ -6199,10 +6213,7 @@ pub(super) mod tests {
 							} => (true, Some(receiver)),
 							_ => (false, None),
 						};
-						let name = case.sema.decls.functions
-							[usize::from(method)]
-						.name
-						.inner;
+						let name = case.sema.decls.name(method).inner;
 						let mut text = format!(
 							"({}{}",
 							if abstract_call { "abstract " } else { "call " },
@@ -6245,7 +6256,11 @@ pub(super) mod tests {
 						let strings = &case.strings;
 						let mut text = format!(
 							"({}",
-							strings.resolve(decl.name.inner).unwrap()
+							strings
+								.resolve(
+									case.sema.decls.item(decl.loc).name.inner
+								)
+								.unwrap()
 						);
 						let (args, order) = match body.kind(fields) {
 							ExprKind::Tuple { elements, order }
@@ -7209,9 +7224,7 @@ pub(super) mod tests {
 			.iter()
 			.find_map(|member| match member.kind {
 				MemberKind::AssociatedType(index)
-					if case.sema.decls.assoc_types[usize::from(index)]
-						.name
-						.inner == name =>
+					if case.sema.decls.name(index).inner == name =>
 				{
 					Some(index)
 				}
@@ -7268,7 +7281,10 @@ pub(super) mod tests {
 					.decls
 					.functions
 					.iter()
-					.position(|function| function.name.inner == name_symbol)
+					.position(|function| {
+						case.sema.decls.item(function.loc).name.inner
+							== name_symbol
+					})
 					.unwrap();
 				let scope = case.sema.functions[index].type_params;
 				let own_param = own_trait
@@ -7514,11 +7530,11 @@ pub(super) mod tests {
 			with_pending_std_signatures(
 				"trait A {} trait B {} func f<T: A, U: B>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
-					let decl_id = DeclId::Function(FunctionIdx::new(0));
+					let query = SignatureQuery::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(
 						sema,
 						QueryInfo {
-							decl_id,
+							query,
 							requested_at: None,
 						},
 					);
@@ -7546,11 +7562,11 @@ pub(super) mod tests {
 			with_pending_std_signatures(
 				"trait Inner {} trait Outer { type Item: Inner; } func f<T: Outer>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
-					let decl_id = DeclId::Function(FunctionIdx::new(0));
+					let query = SignatureQuery::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(
 						sema,
 						QueryInfo {
-							decl_id,
+							query,
 							requested_at: None,
 						},
 					);
@@ -7583,7 +7599,7 @@ pub(super) mod tests {
 						sema.assoc_types[usize::from(declaration)].is_none()
 					);
 					let reference = SourceSpan::new(
-						sema.decls.traits[1].file_id,
+						sema.decls.file_id(sema.decls.traits[1].loc),
 						TextSpan::new(0, 1),
 					);
 					builder
@@ -7794,7 +7810,7 @@ pub(super) mod tests {
 		};
 		assert_ne!(declaration, provider);
 		assert!(matches!(
-			builder.ast_node(DeclId::AssocType(declaration)),
+			builder.ast_node(SignatureQuery::AssocType(declaration)),
 			AstNodeRef::TraitAssocType { .. }
 		));
 		(declaration, provider, reference)
@@ -7990,10 +8006,10 @@ pub(super) mod tests {
 				&self.sema.decls,
 			)
 			.resolve_path(file_id, root, &segments, tier);
-			let decl_key = target.decl_key().unwrap_or_else(|| {
+			let loc = target.loc().unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {scratch:?}")
 			});
-			decl_key.symbol_kind(&self.sema.decls)
+			loc.symbol_kind(&self.sema.decls)
 		}
 
 		fn trait_index(&self, path: &str) -> TraitIdx {
@@ -8634,6 +8650,43 @@ pub(super) mod tests {
 		assert_eq!(trait_header.target.inner, TypeIndex::ERROR);
 		assert_eq!(inherent_header.target.inner, trait_header.target.inner);
 		assert!(case.sema.impl_dispatch.is_empty());
+	}
+
+	/// A package's root is a namespace, not a type or a trait: naming it
+	/// where one is expected says what it is, by every name it has (`std`,
+	/// `package`, `super` at the root, a `use` alias).
+	#[test]
+	fn a_package_root_where_a_type_or_trait_is_expected_says_it_is_a_package() {
+		let case = TestCase::new(indoc! {"
+			use std as s;
+			mod m {
+			    pub type Up = super;
+			}
+			func g<T: std + StackValue>(x: T) {}
+			impl package {}
+			impl std for u32 {}
+			type A = s;
+			func f() -> u32 { package::<u8>::f() }
+			func k() -> s::u32 { 0 }
+		"});
+		let diagnostics = case.diagnostics();
+		for message in [
+			"expected type, found package `super`",
+			"expected type, found package `s`",
+			"expected trait, found package `std`",
+			"cannot use package as an impl target",
+			"type arguments are not allowed on package `package`",
+		] {
+			diagnostics.assert_error_saying(message);
+		}
+		diagnostics.assert_codes(&[
+			DiagnosticCode::InvalidImplTarget,
+			DiagnosticCode::NotATraitBound,
+			DiagnosticCode::NotAType,
+			DiagnosticCode::NotATraitBound,
+			DiagnosticCode::NotAType,
+			DiagnosticCode::TypeArgumentsNotAllowed,
+		]);
 	}
 
 	#[test]
@@ -9899,7 +9952,11 @@ pub(super) mod tests {
 			Some("env")
 		);
 		for (index, function) in case.sema.decls.functions.iter().enumerate() {
-			match case.strings.resolve(function.name.inner).unwrap() {
+			match case
+				.strings
+				.resolve(case.sema.decls.item(function.loc).name.inner)
+				.unwrap()
+			{
 				"required" => assert!(matches!(
 					case.sema.function_implementations[index],
 					FunctionImplementation::Declaration
@@ -10065,9 +10122,9 @@ pub(super) mod tests {
 		with_pending_signatures(source, |sema, builder| {
 			builder.build(sema);
 			for index in 0..sema.decls.constants.len() {
-				let decl_id = DeclId::Const(ConstIdx::new(index as u32));
+				let query = SignatureQuery::Const(ConstIdx::new(index as u32));
 				assert!(matches!(
-					builder.signature_location(decl_id),
+					builder.signature_location(query),
 					SignatureLocation::Constant(found) if usize::from(found) == index
 				));
 			}
@@ -10248,11 +10305,15 @@ pub(super) mod tests {
 				panic!("expected an enum");
 			};
 			let definition = &case.sema.decls.enums[usize::from(index)];
-			assert_eq!(declaration.file_id, definition.file_id);
+			assert_eq!(
+				declaration.file_id,
+				case.sema.decls.file_id(definition.loc)
+			);
 			assert_eq!(
 				declaration.range,
-				definition.name.span.start as usize
-					..definition.name.span.end as usize
+				case.sema.decls.item(definition.loc).name.span.start as usize
+					..case.sema.decls.item(definition.loc).name.span.end
+						as usize
 			);
 			assert_eq!(declaration.message, "enum `Color` defined here");
 		}
@@ -10271,7 +10332,10 @@ pub(super) mod tests {
 					.functions
 					.iter()
 					.position(|decl| {
-						builder.strings.resolve(decl.name.inner) == Some("f")
+						builder
+							.strings
+							.resolve(sema.decls.item(decl.loc).name.inner)
+							== Some("f")
 					})
 					.unwrap();
 				let enum_index = sema
@@ -10279,17 +10343,21 @@ pub(super) mod tests {
 					.enums
 					.iter()
 					.position(|decl| {
-						builder.strings.resolve(decl.name.inner)
+						builder
+							.strings
+							.resolve(sema.decls.item(decl.loc).name.inner)
 							== Some("Color")
 					})
 					.unwrap();
-				let function =
-					DeclId::Function(FunctionIdx::new(function_index as u32));
-				let enumeration = DeclId::Enum(EnumIdx::new(enum_index as u32));
+				let function = SignatureQuery::Function(FunctionIdx::new(
+					function_index as u32,
+				));
+				let enumeration =
+					SignatureQuery::Enum(EnumIdx::new(enum_index as u32));
 				let _ = builder.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: function,
+						query: function,
 						requested_at: None,
 					},
 				);
@@ -10307,7 +10375,7 @@ pub(super) mod tests {
 				let _ = builder.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: enumeration,
+						query: enumeration,
 						requested_at: None,
 					},
 				);
@@ -10456,11 +10524,14 @@ pub(super) mod tests {
 					"expected a label at the `Integer` definition: {diagnostic:#?}"
 				)
 			});
-		assert_eq!(declaration.file_id, definition.file_id);
+		assert_eq!(
+			declaration.file_id,
+			case.sema.decls.file_id(definition.loc)
+		);
 		assert_eq!(
 			declaration.range,
-			definition.name.span.start as usize
-				..definition.name.span.end as usize
+			case.sema.decls.item(definition.loc).name.span.start as usize
+				..case.sema.decls.item(definition.loc).name.span.end as usize
 		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
 	}
@@ -10875,7 +10946,7 @@ pub(super) mod tests {
 					})
 					.unwrap();
 				let reference = SourceSpan::new(
-					sema.decls.traits[0].file_id,
+					sema.decls.file_id(sema.decls.traits[0].loc),
 					TextSpan::new(0, 1),
 				);
 				for (name, overridden) in
@@ -12722,16 +12793,18 @@ pub(super) mod tests {
 				impl Service for S { func get(self: Self) -> Self { self } const VALUE: i32 = 0; }
 			"},
 				|sema, builder| {
-					let file_id = sema
-						.decls
-						.structs
-						.iter()
-						.find(|decl| {
-							builder.strings.resolve(decl.name.inner)
-								== Some("S")
-						})
-						.unwrap()
-						.file_id;
+					let decl =
+						sema.decls
+							.structs
+							.iter()
+							.find(|decl| {
+								builder.strings.resolve(
+									sema.decls.item(decl.loc).name.inner,
+								) == Some("S")
+							})
+							.unwrap()
+							.loc;
+					let file_id = sema.decls.file_id(decl);
 					let member = builder
 						.entries
 						.iter()
@@ -12752,7 +12825,7 @@ pub(super) mod tests {
 							}
 						})
 						.unwrap();
-					let id = member.node.decl_id();
+					let id = member.node.query();
 					let impl_index = usize::from(
 						builder
 							.entries
@@ -12772,7 +12845,7 @@ pub(super) mod tests {
 						builder.ensure_signature(
 							sema,
 							QueryInfo {
-								decl_id: id,
+								query: id,
 								requested_at: None
 							}
 						),
@@ -12783,7 +12856,7 @@ pub(super) mod tests {
 						let _ = builder.ensure_signature(
 							sema,
 							QueryInfo {
-								decl_id: entry.node.decl_id(),
+								query: entry.node.query(),
 								requested_at: None,
 							},
 						);
@@ -12879,17 +12952,17 @@ pub(super) mod tests {
 		with_pending_std_signatures(source, |sema, builder| {
 			builder.build(sema);
 			for index in 0..sema.decls.assoc_types.len() {
-				let decl_id =
-					DeclId::AssocType(AssocTypeIdx::new(index as u32));
+				let query =
+					SignatureQuery::AssocType(AssocTypeIdx::new(index as u32));
 				assert!(matches!(
-					builder.signature_location(decl_id),
+					builder.signature_location(query),
 					SignatureLocation::AssocType(found) if usize::from(found) == index
 				));
 			}
 			for index in 0..sema.decls.constants.len() {
-				let decl_id = DeclId::Const(ConstIdx::new(index as u32));
+				let query = SignatureQuery::Const(ConstIdx::new(index as u32));
 				assert!(matches!(
-					builder.signature_location(decl_id),
+					builder.signature_location(query),
 					SignatureLocation::Constant(found) if usize::from(found) == index
 				));
 			}
@@ -14042,11 +14115,14 @@ pub(super) mod tests {
 				.functions
 				.iter()
 				.find(|decl| {
-					builder.strings.resolve(decl.name.inner)
+					builder
+						.strings
+						.resolve(sema.decls.item(decl.loc).name.inner)
 						== Some("overflow_reader_first")
 				})
 				.unwrap()
-				.file_id;
+				.loc;
+			let file_id = sema.decls.file_id(file_id);
 			let readers = SOURCE.find("func overflow_reader_first").unwrap();
 			let value_start = SOURCE.find("<Wrap<Wrap<").unwrap();
 			let value_end = value_start
@@ -14274,17 +14350,17 @@ pub(super) mod tests {
 		with_pending_std_signatures(
 			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
-				let decl_id = DeclId::Function(FunctionIdx::new(0));
+				let query = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id,
+						query,
 						requested_at: None,
 					},
 				);
 				let env = sema.functions[0].type_params;
 				let reference = SourceSpan::new(
-					sema.decls.traits[0].file_id,
+					sema.decls.file_id(sema.decls.traits[0].loc),
 					TextSpan::new(0, 1),
 				);
 				let declaration = match sema.decls.traits[0].members[0].kind {
@@ -14556,7 +14632,7 @@ pub(super) mod tests {
 			"trait Container { type Item; }",
 			|sema, builder| {
 				let reference = SourceSpan::new(
-					sema.decls.traits[0].file_id,
+					sema.decls.file_id(sema.decls.traits[0].loc),
 					TextSpan::new(0, 1),
 				);
 				sema.solver.set_limit_for_test(4);
@@ -14602,17 +14678,17 @@ pub(super) mod tests {
 		with_pending_std_signatures(
 			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
-				let decl_id = DeclId::Function(FunctionIdx::new(0));
+				let query = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id,
+						query,
 						requested_at: None,
 					},
 				);
 				let env = sema.functions[0].type_params;
 				let reference = SourceSpan::new(
-					sema.decls.traits[0].file_id,
+					sema.decls.file_id(sema.decls.traits[0].loc),
 					TextSpan::new(0, 1),
 				);
 				let declaration = match sema.decls.traits[0].members[0].kind {
@@ -15773,11 +15849,11 @@ pub(super) mod tests {
 		with_pending_std_signatures(
 			"type i32; trait Container { type Item; } func f<T: Container where { Item = i32 }>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
-				let decl_id = DeclId::Function(FunctionIdx::new(0));
+				let query = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id,
+						query,
 						requested_at: None,
 					},
 				);
@@ -16268,7 +16344,9 @@ pub(super) mod tests {
 					.functions
 					.iter()
 					.position(|decl| {
-						case.strings.resolve(decl.name.inner) == Some(name)
+						case.strings
+							.resolve(case.sema.decls.item(decl.loc).name.inner)
+							== Some(name)
 					})
 					.unwrap()
 			};
@@ -16356,7 +16434,9 @@ pub(super) mod tests {
 				.functions
 				.iter()
 				.position(|decl| {
-					case.strings.resolve(decl.name.inner) == Some("provided")
+					case.strings
+						.resolve(case.sema.decls.item(decl.loc).name.inner)
+						== Some("provided")
 				})
 				.unwrap();
 			let assumption_context = case.sema.functions[index].type_params;
@@ -16430,7 +16510,10 @@ pub(super) mod tests {
 					.functions
 					.iter()
 					.position(|decl| {
-						builder.strings.resolve(decl.name.inner) == Some("f")
+						builder
+							.strings
+							.resolve(sema.decls.item(decl.loc).name.inner)
+							== Some("f")
 					})
 					.unwrap();
 				let marker = TraitIdx::new(
@@ -16438,7 +16521,9 @@ pub(super) mod tests {
 						.traits
 						.iter()
 						.position(|decl| {
-							builder.strings.resolve(decl.name.inner)
+							builder
+								.strings
+								.resolve(sema.decls.item(decl.loc).name.inner)
 								== Some("Marker")
 						})
 						.unwrap() as u32,
@@ -16600,7 +16685,9 @@ pub(super) mod tests {
 					.decls
 					.functions
 					.iter()
-					.position(|decl| decl.name.inner == name)
+					.position(|decl| {
+						case.sema.decls.item(decl.loc).name.inner == name
+					})
 					.unwrap();
 				&case.sema.functions[index]
 			};
@@ -16799,7 +16886,7 @@ pub(super) mod tests {
 					builder.build(sema);
 					let assumption_context = sema.functions[0].type_params;
 					let reference = SourceSpan::new(
-						sema.decls.functions[0].file_id,
+						sema.decls.file_id(sema.decls.functions[0].loc),
 						TextSpan::new(0, 1),
 					);
 					let proof = sema
@@ -16880,18 +16967,18 @@ pub(super) mod tests {
 				path = "::Next".repeat(16)
 			);
 			with_pending_std_signatures(&source, |sema, builder| {
-				let id = DeclId::Function(FunctionIdx::new(0));
+				let id = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
 					sema,
 					QueryInfo {
-						decl_id: id,
+						query: id,
 						requested_at: None,
 					},
 				);
 				let env = sema.functions[0].type_params;
 				let ty = sema.types.list(sema.functions[0].param_types)[0];
 				let reference = SourceSpan::new(
-					sema.decls.functions[0].file_id,
+					sema.decls.file_id(sema.decls.functions[0].loc),
 					TextSpan::new(0, 1),
 				);
 				assert!(sema.diagnostics.is_empty(), "{:?}", sema.diagnostics);
@@ -16937,21 +17024,22 @@ pub(super) mod tests {
                 func f<U>(x: Wrap<U>) {}
             "},
 				|sema, builder| {
-					let index = sema
-						.decls
-						.functions
-						.iter()
-						.position(|decl| {
-							builder.strings.resolve(decl.name.inner)
-								== Some("f")
-						})
-						.unwrap();
+					let index =
+						sema.decls
+							.functions
+							.iter()
+							.position(|decl| {
+								builder.strings.resolve(
+									sema.decls.item(decl.loc).name.inner,
+								) == Some("f")
+							})
+							.unwrap();
 					builder.build(sema);
 					let signature = &sema.functions[index];
 					let assumption_context = signature.type_params;
 					let receiver = sema.types.list(signature.param_types)[0];
 					let reference = SourceSpan::new(
-						sema.decls.functions[index].file_id,
+						sema.decls.file_id(sema.decls.functions[index].loc),
 						TextSpan::new(0, 1),
 					);
 					let key = BindingKey::value(
@@ -17512,22 +17600,24 @@ pub(super) mod tests {
 				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U: StackValue>(x: T::Item) {}     ",
 				|sema, builder| {
 					builder.build(sema);
-					let function = sema
-						.decls
-						.functions
-						.iter()
-						.position(|decl| {
-							builder.strings.resolve(decl.name.inner)
-								== Some("f")
-						})
-						.unwrap();
+					let function =
+						sema.decls
+							.functions
+							.iter()
+							.position(|decl| {
+								builder.strings.resolve(
+									sema.decls.item(decl.loc).name.inner,
+								) == Some("f")
+							})
+							.unwrap();
 					let marker = TraitIdx::new(
 						sema.decls
 							.traits
 							.iter()
 							.position(|decl| {
-								builder.strings.resolve(decl.name.inner)
-									== Some("Marker")
+								builder.strings.resolve(
+									sema.decls.item(decl.loc).name.inner,
+								) == Some("Marker")
 							})
 							.unwrap() as u32,
 					);
@@ -17626,11 +17716,18 @@ pub(super) mod tests {
 				.decls
 				.functions
 				.iter()
-				.position(|definition| definition.name.inner == sibling)
+				.position(|definition| {
+					case.sema.decls.item(definition.loc).name.inner == sibling
+				})
 				.unwrap();
 			let diagnostic = &case.sema.diagnostics[0];
 			let label = &diagnostic.labels[0];
-			let sibling_span = case.sema.decls.functions[index].name.span;
+			let sibling_span = case
+				.sema
+				.decls
+				.item(case.sema.decls.functions[index].loc)
+				.name
+				.span;
 			assert!(
 				label.range.start >= sibling_span.start as usize,
 				"the violation belongs to `sibling`: {diagnostic:?}"
@@ -17704,11 +17801,11 @@ pub(super) mod tests {
 			with_pending_std_signatures(
 				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
-					let id = DeclId::Function(FunctionIdx::new(0));
+					let id = SignatureQuery::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(
 						sema,
 						QueryInfo {
-							decl_id: id,
+							query: id,
 							requested_at: None,
 						},
 					);
@@ -18446,11 +18543,11 @@ pub(super) mod tests {
 						.functions
 						.iter()
 						.position(|definition| {
-							definition.name.inner == name
-								&& matches!(
-									definition.owner,
-									MemberOwner::Trait(_)
-								)
+							case.sema.decls.item(definition.loc).name.inner
+								== name && matches!(
+								definition.owner,
+								MemberOwner::Trait(_)
+							)
 						})
 						.unwrap(),
 				)
