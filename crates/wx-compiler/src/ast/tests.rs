@@ -91,11 +91,16 @@ impl TestCase {
 				.map(|segment| self.name(segment.ident.inner))
 				.collect::<Vec<_>>()
 				.join("::"),
+			Expression::ObjectAccess { object, member } => format!(
+				"(. {} {})",
+				self.shape(&object.inner),
+				self.name(member.ident.inner)
+			),
 			Expression::Int { value } => value.to_string(),
 			Expression::Tuple { elements } => self.list("tuple", elements),
 			Expression::Call { callee, arguments } => self.list(
 				&format!("call {}", self.shape(&callee.inner)),
-				arguments,
+				&arguments.inner,
 			),
 			Expression::Ascription { value, ty } => {
 				let ty = match &ty.inner {
@@ -326,8 +331,8 @@ fn item_kind(item: &Item) -> &'static str {
 	}
 }
 
-fn bounds(param: &TypeParam) -> Option<&Spanned<BoundExpression>> {
-	match param {
+fn bounds(param: &Spanned<TypeParam>) -> Option<&Spanned<BoundExpression>> {
+	match &param.inner {
 		TypeParam::Type { bounds, .. } => bounds.as_ref(),
 		TypeParam::Const { .. } => None,
 	}
@@ -1174,7 +1179,7 @@ fn test_loop_break_label() {
 
 	// `break :result n` carries both a label and a value
 	let Expression::IfElse { then_block, .. } =
-		statement_expression(statements, 0)
+		statement_expression(&statements.inner, 0)
 	else {
 		panic!("expected an if")
 	};
@@ -1184,7 +1189,8 @@ fn test_loop_break_label() {
 	else {
 		panic!("expected a block")
 	};
-	let Expression::Break { label, value } = statement_expression(body, 0)
+	let Expression::Break { label, value } =
+		statement_expression(&body.inner, 0)
 	else {
 		panic!("expected a break")
 	};
@@ -1195,7 +1201,7 @@ fn test_loop_break_label() {
 	assert!(value.is_some(), "`break :result n` should record a value");
 
 	assert!(matches!(
-		statement_expression(statements, 2),
+		statement_expression(&statements.inner, 2),
 		Expression::Continue { .. }
 	));
 }
@@ -1262,7 +1268,7 @@ fn a_labelled_if_is_reported_and_read_as_a_labelled_block_around_it() {
 	};
 	assert_eq!(case.name(label.inner), "l");
 	assert!(matches!(
-		statement_expression(statements, 0),
+		statement_expression(&statements.inner, 0),
 		Expression::IfElse { .. }
 	));
 }
@@ -1311,7 +1317,45 @@ fn named_call(
 	let Expression::Path(path) = &callee.inner else {
 		panic!("expected a path callee")
 	};
-	(path, arguments)
+	(path, &arguments.inner)
+}
+
+#[test]
+fn a_named_argument_with_no_value_keeps_its_name() {
+	// `a:` with no value: the error node spans the gap up to the `,`, and
+	// the rest of the list is read.
+	let source = "func f() { g({ a: , b: 1 }) }";
+	let case = TestCase::new(source);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let (_, arguments) =
+		named_call(statement_expression(case.function_block(0), 0));
+	assert_eq!(arguments.len(), 2);
+	let value = (arguments[0].inner.inner.value.as_ref())
+		.expect("the value is kept, not read as a shorthand");
+	assert!(matches!(value.inner, Expression::Error));
+	assert_eq!(value.span, TextSpan::new(17, 18));
+	assert!(arguments[1].inner.inner.value.is_some());
+}
+
+#[test]
+fn a_call_keeps_the_span_of_its_delimiters() {
+	let source = "func f() { g(1, 2); h({ a: 1 }); }";
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	let statements = case.function_block(0);
+	let Expression::Call { arguments, .. } =
+		statement_expression(statements, 0)
+	else {
+		panic!("expected a call")
+	};
+	assert_eq!(arguments.span.extract_str(source), "(1, 2)");
+	let Expression::NamedCall { arguments, .. } =
+		statement_expression(statements, 1)
+	else {
+		panic!("expected a named call")
+	};
+	assert_eq!(arguments.span.extract_str(source), "{ a: 1 }");
 }
 
 #[test]
@@ -1351,7 +1395,7 @@ fn test_named_call() {
 	// No arguments at all is the positional form.
 	assert!(matches!(
 		local_definition_value(statements, 3),
-		Expression::Call { arguments, .. } if arguments.is_empty()
+		Expression::Call { arguments, .. } if arguments.inner.is_empty()
 	));
 }
 
@@ -1376,7 +1420,7 @@ fn test_named_method_call_and_turbofish() {
 		panic!("expected a named method call")
 	};
 	assert_eq!(case.name(call.method.ident.inner), "move_to");
-	assert_eq!(call.arguments.len(), 2);
+	assert_eq!(call.arguments.inner.len(), 2);
 }
 
 #[test]
@@ -1799,7 +1843,7 @@ fn test_call_field_namespace() {
 	else {
 		panic!("expected a call")
 	};
-	assert_eq!(arguments.len(), 2);
+	assert_eq!(arguments.inner.len(), 2);
 }
 
 #[test]
@@ -2395,7 +2439,15 @@ fn test_missing_initializer() {
 		"expected one MissingInitializer for local and one for global"
 	);
 	assert_eq!(case.ast.items.len(), 1);
-	assert!(case.function_block(0).is_empty());
+	// The local is kept, its value an error node.
+	let [statement] = case.function_block(0) else {
+		panic!("expected the local to be kept");
+	};
+	assert!(matches!(
+		&statement.inner.inner,
+		Statement::LocalDefinition { value, .. }
+			if matches!(value.inner, Expression::Error)
+	));
 }
 
 #[test]
@@ -2649,7 +2701,7 @@ fn test_generic_signatures() {
 	let params: Vec<&str> = signature
 		.type_params
 		.iter()
-		.map(|param| case.name(param.name().inner))
+		.map(|param| case.name(param.inner.name().inner))
 		.collect();
 	assert_eq!(params, ["T", "U", "V"]);
 	// only the bounded ones carry a bound expression
@@ -2664,6 +2716,23 @@ fn test_generic_signatures() {
 }
 
 #[test]
+fn a_type_parameter_and_a_binding_span_what_is_written() {
+	let source = "func f<T: Memory where { Size = u32 }, const N: u8>() {}";
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	let text = |span: TextSpan| span.extract_str(source);
+	let params = &case.function_signature(0).type_params;
+	assert_eq!(text(params[0].span), "T: Memory where { Size = u32 }");
+	assert_eq!(text(params[1].span), "const N: u8");
+	let Some(BoundExpression::WithBindings { bindings, .. }) =
+		bounds(&params[0]).map(|bound| &bound.inner)
+	else {
+		panic!("expected a bound with bindings")
+	};
+	assert_eq!(text(bindings[0].span), "Size = u32");
+}
+
+#[test]
 fn a_constant_parameter_is_marked_and_typed() {
 	let case = TestCase::new("func f<T: Add, const N: u32>() {}");
 	case.diagnostics().assert_none();
@@ -2671,13 +2740,13 @@ fn a_constant_parameter_is_marked_and_typed() {
 		panic!("expected two parameters")
 	};
 	assert!(matches!(
-		first,
+		first.inner,
 		TypeParam::Type {
 			bounds: Some(_),
 			..
 		}
 	));
-	let TypeParam::Const { name, ty, .. } = second else {
+	let TypeParam::Const { name, ty, .. } = &second.inner else {
 		panic!("expected a constant parameter")
 	};
 	assert_eq!(case.name(name.inner), "N");
@@ -2865,9 +2934,15 @@ fn test_generic_struct() {
 	};
 	assert_eq!(case.strings.resolve(name.inner), Some("Pair"));
 	assert_eq!(type_params.len(), 2);
-	assert_eq!(case.strings.resolve(type_params[0].name().inner), Some("T"));
+	assert_eq!(
+		case.strings.resolve(type_params[0].inner.name().inner),
+		Some("T")
+	);
 	assert!(bounds(&type_params[0]).is_none());
-	assert_eq!(case.strings.resolve(type_params[1].name().inner), Some("U"));
+	assert_eq!(
+		case.strings.resolve(type_params[1].inner.name().inner),
+		Some("U")
+	);
 	assert!(bounds(&type_params[1]).is_none());
 	assert_eq!(fields.len(), 2);
 }
@@ -3072,7 +3147,7 @@ fn test_turbofish_call() {
 	else {
 		panic!("expected a call")
 	};
-	assert_eq!(arguments.len(), 1);
+	assert_eq!(arguments.inner.len(), 1);
 	let Expression::Path(segments) = &callee.inner else {
 		panic!("expected a path callee")
 	};
@@ -3099,7 +3174,7 @@ fn test_turbofish_method_call() {
 	};
 	assert_eq!(case.name(call.method.ident.inner), "transform");
 	assert_eq!(call.method.type_args.len(), 1);
-	assert!(call.arguments.is_empty());
+	assert!(call.arguments.inner.is_empty());
 }
 
 #[test]
@@ -3200,7 +3275,7 @@ fn a_constant_binding_is_marked_const() {
 			else {
 				panic!("expected WithBindings")
 			};
-			&bindings[0].kind
+			&bindings[0].inner.kind
 		})
 		.collect();
 	assert!(matches!(
@@ -3234,7 +3309,8 @@ fn self_is_a_type_parameter_name() {
 	};
 	assert_eq!(signature.type_params.len(), 2);
 	assert_eq!(
-		case.strings.resolve(signature.type_params[0].name().inner),
+		case.strings
+			.resolve(signature.type_params[0].inner.name().inner),
 		Some("Self")
 	);
 }
@@ -3341,6 +3417,62 @@ fn a_bound_list_may_lead_with_a_plus() {
 		panic!("expected a trait with a supertrait")
 	};
 	assert!(matches!(supertraits.inner, BoundExpression::Path(_)));
+}
+
+#[test]
+fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
+	for source in [
+		"trait X:  {}\nfunc after() {}",
+		"func f<T:  >() {}\nfunc after() {}",
+		"typeset X:  { u8 }\nfunc after() {}",
+		"trait X { type Item:  ; }\nfunc after() {}",
+		"trait X { type Item:  = u8; }\nfunc after() {}",
+		"func f<T: Tr where { Item:  }>() {}\nfunc after() {}",
+	] {
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		let bound = match case.item(0) {
+			Item::Trait {
+				supertraits: Some(bound),
+				..
+			}
+			| Item::TypeSet {
+				bounds: Some(bound),
+				..
+			} => bound,
+			Item::Trait { items, .. } => {
+				let TraitItem::AssociatedType {
+					bounds: Some(bound),
+					..
+				} = &items[0].inner.inner
+				else {
+					panic!("expected an associated type")
+				};
+				bound
+			}
+			Item::Function { signature, .. } => {
+				let bound = bounds(&signature.type_params[0]).unwrap();
+				if let BoundExpression::WithBindings { bindings, .. } =
+					&bound.inner
+				{
+					let AssocBindingKind::Bound(bound) =
+						&bindings[0].inner.kind
+					else {
+						panic!("expected an associated bound")
+					};
+					bound
+				} else {
+					bound
+				}
+			}
+			_ => panic!("expected the owner to survive in {source:?}"),
+		};
+		assert!(matches!(bound.inner, BoundExpression::Error), "{source:?}");
+		assert_eq!(bound.span.extract_str(source), "  ");
+		assert_eq!(source.as_bytes()[bound.span.start as usize - 1], b':');
+		assert_eq!(case.name(case.function_signature(1).name.inner), "after");
+	}
 }
 
 #[test]
@@ -3467,7 +3599,10 @@ fn test_index_and_array_literal_expressions() {
 	else {
 		panic!("expected an array literal")
 	};
-	assert_eq!(elements.len(), 3);
+	let separated: Vec<bool> = (elements.iter())
+		.map(|element| element.separator.is_some())
+		.collect();
+	assert_eq!(separated, [true, true, false]);
 
 	// `[value; count]` keeps the two apart rather than expanding the value
 	let Expression::ArrayRepeat { value, count } =
@@ -3649,16 +3784,78 @@ fn test_turbofish_on_any_other_expression_is_an_error() {
 
 #[test]
 fn test_literal_kind_type() {
-	let case = TestCase::new("const X: {integer} = 4;");
+	let case = TestCase::new("const X: const_int = 4;");
 	case.diagnostics().assert_none();
 	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
 		panic!("expected a typed constant");
 	};
-	let TypeExpression::Literal { inner } = &ty.inner else {
+	let TypeExpression::Path(segments) = &ty.inner else {
 		panic!("expected a literal kind");
 	};
-	assert!(matches!(inner.inner, TypeExpression::Path(_)));
+	assert_eq!(case.name(segments[0].ident.inner), "const_int");
 	assert_eq!(ty.span, TextSpan::new(9, 18));
+}
+
+#[test]
+fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
+	for source in [
+		"func f() ->  {}\nfunc after() {}",
+		"func f() ->  { 1 }\nfunc after() {}",
+		"func f() ->  { local x = 1; x }\nfunc after() {}",
+		"impl S { pub func f(self: Self) ->  { self } }\nfunc after() {}",
+		"trait Tr { func f(self: Self) ->  { self } }\nfunc after() {}",
+		"trait Tr { func f(self: Self) ->  ; }\nfunc after() {}",
+	] {
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		let (signature, body) = match case.item(0) {
+			Item::Function {
+				signature, block, ..
+			} => (signature, Some(block.as_ref())),
+			Item::InherentImpl { items, .. } => {
+				let ImplItem::Function {
+					signature, block, ..
+				} = &items[0].inner.inner
+				else {
+					panic!("expected a method")
+				};
+				(signature, Some(block.as_ref()))
+			}
+			Item::Trait { items, .. } => {
+				let TraitItem::Function {
+					signature, body, ..
+				} = &items[0].inner.inner
+				else {
+					panic!("expected a trait method")
+				};
+				(signature, body.as_deref())
+			}
+			_ => panic!("expected a function in {source:?}"),
+		};
+		let result = signature
+			.result
+			.as_ref()
+			.expect("the result annotation survives");
+		assert!(matches!(result.inner, TypeExpression::Error));
+		assert_eq!(result.span.extract_str(source), "  ");
+		assert_eq!(
+			&source[result.span.start as usize - 2..result.span.start as usize],
+			"->"
+		);
+		if let Some(body) = body {
+			assert!(matches!(body.inner, Expression::Block { .. }));
+			assert_eq!(body.span.start, result.span.end);
+		}
+		assert_eq!(case.name(case.function_signature(1).name.inner), "after");
+	}
+}
+
+#[test]
+fn braces_do_not_start_a_type() {
+	let case = TestCase::new("const X: {const_int} = 4;");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UnexpectedToken);
 }
 
 #[test]
@@ -4230,4 +4427,249 @@ fn dots_in_an_enum_body_are_an_entry_wherever_they_are_written() {
 			.collect();
 		assert_eq!(written, shape, "{source}");
 	}
+}
+
+// ── Unfinished member accesses and paths ────────────────────────────────
+//
+// `x.` and `a::` with no name after them are what a user is in the middle
+// of typing. The parser reports the missing name once and keeps the access
+// or the path with the error symbol in its place (`PathSegment::missing`),
+// so the object or the path's prefix is still checked, and the token after
+// it is left to close or start whatever it does.
+
+#[test]
+fn a_member_access_with_no_member_keeps_its_object() {
+	let case = TestCase::new("func f() { p. }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let block = case.function_block(0);
+	assert_eq!(block.len(), 1);
+	assert_eq!(case.shape(statement_expression(block, 0)), "(. p <error>)");
+	let Expression::ObjectAccess { member, .. } =
+		statement_expression(block, 0)
+	else {
+		unreachable!()
+	};
+	assert!(member.is_missing());
+	assert_eq!(
+		member.ident.span,
+		TextSpan::new(13, 13),
+		"the missing name is the empty span right after the `.`"
+	);
+}
+
+/// Keywords lex as identifiers, so `x.` on a line of its own would read the
+/// next statement's `local` as its member and lose that statement.
+#[test]
+fn a_keyword_after_a_dot_starts_the_next_statement() {
+	let case = TestCase::new(indoc! {"
+		func f() {
+		    p.
+		    local b = 1;
+		}
+		func g() {}
+	"});
+	// The unfinished statement has no `;` either, which is reported too.
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::MissingSeparator,
+	]);
+	case.diagnostics()
+		.assert_error_saying("expected a member name after `.`, found `local`");
+	let block = case.function_block(0);
+	assert_eq!(block.len(), 2);
+	assert_eq!(case.shape(statement_expression(block, 0)), "(. p <error>)");
+	assert_eq!(case.shape(local_definition_value(block, 1)), "1");
+	assert_eq!(case.ast.items.len(), 2, "the next item still parses");
+}
+
+#[test]
+fn a_dot_before_a_call_is_a_method_call_with_no_method() {
+	let case = TestCase::new("func f() { p.(1) }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let Expression::MethodCall(call) =
+		statement_expression(case.function_block(0), 0)
+	else {
+		panic!("expected a method call")
+	};
+	assert!(call.method.is_missing());
+}
+
+#[test]
+fn a_path_with_no_last_segment_keeps_its_prefix() {
+	let case = TestCase::new(indoc! {"
+		func f() {
+		    a::b::
+		    local c = 1;
+		}
+	"});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::InvalidNamespace,
+		DiagnosticCode::MissingSeparator,
+	]);
+	let block = case.function_block(0);
+	assert_eq!(block.len(), 2);
+	assert_eq!(case.shape(statement_expression(block, 0)), "a::b::<error>");
+}
+
+#[test]
+fn super_still_follows_a_path_separator() {
+	assert_eq!(shape_of("super::super::x"), "super::super::x");
+}
+
+#[test]
+fn a_type_path_with_no_last_segment_keeps_its_prefix() {
+	let case = TestCase::new("func f(a: core::) {}\nfunc g() {}");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let param = &case.function_signature(0).params[0].inner.inner;
+	let TypeExpression::Path(path) = &param.ty.inner else {
+		panic!("expected a path type")
+	};
+	assert_eq!(case.path(path), "core::<error>");
+	assert_eq!(case.ast.items.len(), 2);
+}
+
+#[test]
+fn a_pattern_path_with_no_last_segment_keeps_its_prefix() {
+	let case = TestCase::new(indoc! {"
+		func f() {
+		    match o {
+		        Ordering:: => (),
+		        _ => (),
+		    }
+		}
+	"});
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::InvalidNamespace]);
+	let Expression::Match { arms, .. } =
+		statement_expression(case.function_block(0), 0)
+	else {
+		panic!("expected a match")
+	};
+	assert_eq!(arms.len(), 2);
+	assert_eq!(
+		case.pattern(&arms[0].inner.inner.pattern.inner),
+		"(const Ordering::<error>)"
+	);
+}
+
+/// The type and the value of a `local` being written: each part not written
+/// yet is reported and kept as an error node spanning the gap where it
+/// belongs, up to the token after it, which is left alone.
+fn local_parts(case: &TestCase) -> (Option<TextSpan>, TextSpan, bool, bool) {
+	let [statement] = case.function_block(0) else {
+		panic!("expected the local alone");
+	};
+	let Statement::LocalDefinition { ty, value, .. } = &statement.inner.inner
+	else {
+		panic!("expected a local");
+	};
+	(
+		ty.as_ref().map(|ty| ty.span),
+		value.span,
+		ty.as_ref()
+			.is_some_and(|ty| matches!(ty.inner, TypeExpression::Error)),
+		matches!(value.inner, Expression::Error),
+	)
+}
+
+#[test]
+fn a_local_with_a_type_and_no_value_keeps_its_type() {
+	let case = TestCase::new("func f() { local x: Fo }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingInitializer]);
+	let (ty, value, ty_missing, value_missing) = local_parts(&case);
+	assert_eq!(ty, Some(TextSpan::new(20, 22)));
+	assert!(!ty_missing && value_missing);
+	assert_eq!(value, TextSpan::new(22, 23), "up to the `}}`");
+}
+
+#[test]
+fn a_local_with_no_type_after_its_colon_keeps_the_rest() {
+	let case = TestCase::new("func f() { local x:  = 1; }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let (ty, _, ty_missing, value_missing) = local_parts(&case);
+	assert_eq!(ty, Some(TextSpan::new(19, 21)), "the gap before the `=`");
+	assert!(ty_missing && !value_missing);
+}
+
+#[test]
+fn a_local_with_no_value_after_its_eq_ends_its_statement() {
+	let case = TestCase::new("func f() { local y =  ; g(); }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::MissingInitializer]);
+	let block = case.function_block(0);
+	assert_eq!(block.len(), 2, "the next statement still parses");
+	let Statement::LocalDefinition { value, .. } = &block[0].inner.inner else {
+		panic!("expected a local");
+	};
+	assert!(matches!(value.inner, Expression::Error));
+	assert_eq!(value.span, TextSpan::new(20, 22), "the gap before the `;`");
+}
+
+#[test]
+fn a_keyword_block_keeps_the_span_of_its_braces() {
+	let source = "func f() { block :done { 1 } }";
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	let block = &case.function_block(0)[0].inner.inner;
+	let Statement::Expression(block) = block else {
+		panic!("expected an expression statement")
+	};
+	let Expression::Block { statements, .. } = &block.inner else {
+		panic!("expected a block")
+	};
+	assert_eq!(block.span.extract_str(source), "block :done { 1 }");
+	assert_eq!(statements.span.extract_str(source), "{ 1 }");
+}
+
+#[test]
+fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
+	// The error node spans the gap up to the `)`, and the binding is kept.
+	let source = "func f(x: u32, y: ) {}";
+	let case = TestCase::new(source);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let params = &case.function_signature(0).params;
+	assert_eq!(params.len(), 2);
+	let param = &params[1].inner.inner;
+	assert!(matches!(param.binding, Some(Binding::Name { .. })));
+	assert!(matches!(param.ty.inner, TypeExpression::Error));
+	assert_eq!(param.ty.span, TextSpan::new(17, 18));
+
+	let case = TestCase::new("struct P(a: u32, b: );");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let Item::Struct { fields, .. } = case.item(0) else {
+		panic!("expected a struct")
+	};
+	assert_eq!(fields.len(), 2);
+	assert!(matches!(
+		fields[1].inner.inner.ty.inner,
+		TypeExpression::Error
+	));
+}
+
+#[test]
+fn a_label_with_no_name_keeps_its_jump() {
+	let case = TestCase::new("func f() { loop { break :\n } }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	let Expression::Loop { block, .. } =
+		statement_expression(case.function_block(0), 0)
+	else {
+		panic!("expected a loop");
+	};
+	let Expression::Break { label, value } =
+		statement_expression(block.inner.as_block_statements(), 0)
+	else {
+		panic!("expected the break to be kept");
+	};
+	let label = label.expect("the label is kept");
+	assert_eq!(label.inner, Keyword::Error.symbol());
+	assert_eq!(label.span, TextSpan::new(25, 25), "right after the `:`");
+	assert!(value.is_none(), "the `}}` closes the loop");
 }

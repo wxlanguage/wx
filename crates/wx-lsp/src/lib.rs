@@ -1,5 +1,6 @@
 mod actor;
 mod backend;
+mod completion;
 mod convert;
 mod diagnostics;
 mod documents;

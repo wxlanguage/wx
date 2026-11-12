@@ -164,9 +164,9 @@ impl TypeFormatter<'_> {
 			Type::Error => f.push_str("{unknown}"),
 			Type::Infer => f.push('_'),
 			Type::Never => f.push('!'),
-			Type::IntegerLiteral => f.push_str("{integer}"),
-			Type::FloatLiteral => f.push_str("{float}"),
-			Type::CharLiteral => f.push_str("{char}"),
+			Type::ConstInt => f.push_str("const_int"),
+			Type::ConstFloat => f.push_str("const_float"),
+			Type::ConstChar => f.push_str("const_char"),
 			Type::U8 => f.push_str("u8"),
 			Type::I8 => f.push_str("i8"),
 			Type::U16 => f.push_str("u16"),
@@ -232,7 +232,7 @@ impl TypeFormatter<'_> {
 				let _ = write!(f, "{bits}");
 			}
 			// Written as its name, with its own arguments when it has any.
-			Type::Const {
+			Type::ConstRef {
 				constant,
 				type_args,
 			} => {

@@ -333,7 +333,7 @@ again in `select_member`), and the model selects once.
   after diagnostics from later in the statement. Sort a statement's
   diagnostics by span before pushing, or accept the order.
 - **A second representation of "unknown".** Literal pseudo-types
-  (`INTEGER_LITERAL`, `FLOAT_LITERAL`, `CHAR_LITERAL`) already are
+  (`CONST_INT`, `CONST_FLOAT`, `CONST_CHAR`) already are
   variables in all but name: they wait for context and are rewritten in
   place. They could become variables with a kind (rustc's `IntVar`/`FloatVar`)
   so there is one mechanism. That is optional and can come later; the

@@ -147,7 +147,7 @@ pub(crate) fn format(
 	let path = uri_to_path(uri)?;
 	let root = discover_package_root(
 		&state.open_documents,
-		&state.workspace_folders,
+		&state.client.workspace_folders,
 		&path,
 	)?;
 	let mut strings = Keyword::create_interner();

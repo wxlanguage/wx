@@ -12,6 +12,7 @@ use super::{Body, ExprIdx, FunctionState, Lowerer, mir};
 use crate::diagnostics::{SourceSpan, TextSpan};
 use crate::tir::decls::ConstIdx;
 use crate::tir::eval::{ConstScalar, ResolvedConstant, Unevaluable, Val};
+use crate::tir::literals::ConcreteType;
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
 use crate::vfs::FileId;
 
@@ -61,6 +62,35 @@ impl Lowerer<'_> {
 				// reaches here.
 				Err(_) => return Err(()),
 			};
+		if self.sema.constants[usize::from(instance.constant)].ty
+			== TypeIndex::CONST_FLOAT
+		{
+			let literal = self
+				.sema
+				.float_value(self.strings, instance)
+				.map_err(|_| ())?;
+			let target = match ty {
+				mir::ValueType::F32 => TypeIndex::F32,
+				mir::ValueType::F64 => TypeIndex::F64,
+				_ => unreachable!("a floating constant is used as a float"),
+			};
+			let value = self
+				.sema
+				.read_float_literal(literal, ConcreteType::Target(target))
+				.ok()
+				.ok_or(())?;
+			let scalar = match ty {
+				mir::ValueType::F32 => ConstScalar::f32(value as f32),
+				_ => ConstScalar::f64(value),
+			};
+			return self.materialize_constant(
+				state,
+				file_id,
+				span,
+				ty,
+				&[scalar],
+			);
+		}
 		// Copy the flat value out before lowering: building its nodes needs
 		// `sema` mutably, and the evaluator's slice borrows it.
 		let used_at = SourceSpan::new(file_id, span);

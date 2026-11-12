@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
-	Diagnostic, DocumentFormattingParams, GotoDefinitionParams,
-	GotoDefinitionResponse, Hover, HoverParams, Location,
+	CompletionParams, CompletionResponse, Diagnostic, DocumentFormattingParams,
+	GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, Location,
 	PrepareRenameResponse, ReferenceParams, RenameParams, SemanticTokensParams,
 	SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
 	TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
@@ -21,15 +21,14 @@ use tower_lsp_server::ls_types::{
 use crate::convert::path_to_file_uri;
 use crate::documents::OpenDocument;
 use crate::state::{
-	ServerState, compute_active_refresh, compute_refresh,
+	ClientConfig, ServerState, compute_active_refresh, compute_refresh,
 	refresh_project_manifest,
 };
 use crate::trace::{Trace, flush_logs};
-use crate::{rename, requests};
+use crate::{completion, rename, requests};
 
 pub(crate) enum Command {
-	SetWorkspaceFolders(Vec<PathBuf>),
-	SetSemanticTokensRefresh(bool),
+	Initialize(ClientConfig),
 	DidChangeWatchedFiles(Vec<PathBuf>),
 	DidOpen {
 		path: PathBuf,
@@ -49,6 +48,10 @@ pub(crate) enum Command {
 		oneshot::Sender<Option<GotoDefinitionResponse>>,
 	),
 	Hover(HoverParams, oneshot::Sender<Option<Hover>>),
+	Completion(
+		CompletionParams,
+		oneshot::Sender<Option<CompletionResponse>>,
+	),
 	References(ReferenceParams, oneshot::Sender<Option<Vec<Location>>>),
 	PrepareRename(
 		TextDocumentPositionParams,
@@ -117,11 +120,8 @@ pub(crate) async fn handle_command(
 	client: &Client,
 ) {
 	match command {
-		Command::SetWorkspaceFolders(folders) => {
-			state.workspace_folders = folders;
-		}
-		Command::SetSemanticTokensRefresh(supported) => {
-			state.semantic_tokens_refresh = supported;
+		Command::Initialize(client) => {
+			state.client = client;
 		}
 		Command::DidChangeWatchedFiles(paths) => {
 			// A disk event for a file the editor has open carries no
@@ -183,6 +183,9 @@ pub(crate) async fn handle_command(
 		Command::Hover(params, reply) => {
 			let _ = reply.send(requests::hover(state, &params));
 		}
+		Command::Completion(params, reply) => {
+			let _ = reply.send(completion::completion(state, &params));
+		}
 		Command::References(params, reply) => {
 			let _ = reply.send(requests::references(state, &params));
 		}
@@ -219,7 +222,7 @@ pub(crate) async fn handle_command(
 /// mean, and the client asks again on its own only for the edited one.
 /// Spawned, so the actor does not wait for the client's answer.
 fn refresh_semantic_tokens(client: &Client, state: &ServerState) {
-	if state.semantic_tokens_refresh {
+	if state.client.semantic_tokens_refresh {
 		let client = client.clone();
 		crate::task::spawn(async move {
 			let _ = client.semantic_tokens_refresh().await;

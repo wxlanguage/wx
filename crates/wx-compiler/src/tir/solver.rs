@@ -235,7 +235,7 @@ fn reads_failed(
 		| Type::Function {
 			type_args: list, ..
 		}
-		| Type::Const {
+		| Type::ConstRef {
 			type_args: list, ..
 		} => types.list(list).iter().any(|&part| reads(part)),
 		Type::TypedFuncref { param, result } => reads(param) || reads(result),
@@ -1113,7 +1113,7 @@ impl Semantics {
 				depth,
 				facts,
 			),
-			Type::Const {
+			Type::ConstRef {
 				constant,
 				type_args,
 			} => self.normalize_const(
@@ -1163,7 +1163,7 @@ impl Semantics {
 			)?;
 		}
 		if !facts.contains(RewriteFlags::VALUES) {
-			return Ok(self.types.intern_const(constant, &args));
+			return Ok(self.types.intern_const_ref(constant, &args));
 		}
 		let value = match self.resolve_constant(strings, constant, &args)? {
 			ResolvedConstant::Instance(instance) => {
@@ -1179,7 +1179,7 @@ impl Semantics {
 				);
 			}
 			ResolvedConstant::Abstract => {
-				return Ok(self.types.intern_const(constant, &args));
+				return Ok(self.types.intern_const_ref(constant, &args));
 			}
 			// An address, never a count: a length of its type is reported
 			// where it is written (`CheckConstantType`).
@@ -1630,7 +1630,7 @@ impl Semantics {
 					facts,
 				)?,
 			},
-			Type::TypeProjection { .. } | Type::Const { .. } => {
+			Type::TypeProjection { .. } | Type::ConstRef { .. } => {
 				unreachable!(
 					"projections are handled before structural traversal"
 				)
@@ -1638,9 +1638,9 @@ impl Semantics {
 			Type::Error
 			| Type::Infer
 			| Type::Never
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1963,11 +1963,11 @@ impl Semantics {
 				}
 				Type::Error
 				| Type::Infer
-				| Type::IntegerLiteral
-				| Type::FloatLiteral
-				| Type::CharLiteral
+				| Type::ConstInt
+				| Type::ConstFloat
+				| Type::ConstChar
 				| Type::Value { .. }
-				| Type::Const { .. } => return Err(SolverError::Poisoned),
+				| Type::ConstRef { .. } => return Err(SolverError::Poisoned),
 				_ => {}
 			}
 			Ok(None)
@@ -2126,11 +2126,11 @@ impl Semantics {
 			// constant is expected.
 			Type::Error
 			| Type::Infer
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
 			| Type::Value { .. }
-			| Type::Const { .. } => Err(SolverError::Poisoned),
+			| Type::ConstRef { .. } => Err(SolverError::Poisoned),
 			// Uninhabited: `stack_elements` makes it the whole type's one
 			// element.
 			Type::Never => {
@@ -3023,6 +3023,16 @@ impl Semantics {
 								continue;
 							}
 							Some(value)
+						}
+						UntypedValue::KnownFloat(value) => {
+							if self.float_representable(
+								assumption_context,
+								ty,
+								value,
+							) {
+								continue;
+							}
+							None
 						}
 						UntypedValue::Abstract => {
 							if self.assumed_representable(

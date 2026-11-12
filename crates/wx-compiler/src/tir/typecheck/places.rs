@@ -18,6 +18,7 @@ use string_interner::symbol::SymbolU32;
 use super::{BodyBuilder, SelectedMethod};
 use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::symbols::Keyword;
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
 use crate::tir::decls::{TraitIdx, Visibility};
 use crate::tir::operators::is_primitive_binary;
@@ -521,7 +522,10 @@ impl BodyBuilder<'_, '_> {
 		access: AccessKind,
 		site: &mut Option<Site>,
 	) -> Option<(crate::tir::decls::FieldIdx, TypeIndex)> {
-		if object_ty == TypeIndex::ERROR {
+		// No name is written (`x.` unfinished): the parser reported it.
+		if object_ty == TypeIndex::ERROR
+			|| member.inner == Keyword::Error.symbol()
+		{
 			return None;
 		}
 		let name = self.builder.strings.resolve(member.inner).unwrap();

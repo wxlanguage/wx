@@ -596,11 +596,13 @@ fn a_bracketed_constant_path_is_formatted_as_written() {
 }
 
 #[test]
-fn a_literal_kind_is_formatted_in_braces() {
+fn a_literal_kind_is_formatted_as_a_path() {
 	let source = indoc! {"
-        const X: {integer} = 4;
+        const X: const_int = 4;
 
-        const U: {char} = 'u';
+        const F: const_float = -1.25;
+
+        const U: const_char = 'u';
     "};
 	let case = TestCase::new(source);
 	let output = format(
@@ -2493,6 +2495,7 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 	assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
 	match (a, b) {
 		(E::Block { statements: a, .. }, E::Block { statements: b, .. }) => {
+			let (a, b) = (&a.inner, &b.inner);
 			assert_eq!(a.len(), b.len());
 			let count = a.len();
 			for (i, (a, b)) in a.iter().zip(b).enumerate() {
@@ -2541,7 +2544,7 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 					&& matches!(b.inner, E::IfElse { .. })
 				{
 					assert!(label.is_none());
-					let [statement] = &**statements else {
+					let [statement] = &*statements.inner else {
 						panic!("removed else block with multiple statements");
 					};
 					assert!(statement.separator.is_none());
@@ -2582,6 +2585,7 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 			E::NamedCall { arguments: a, .. },
 			E::NamedCall { arguments: b, .. },
 		) => {
+			let (a, b) = (&a.inner, &b.inner);
 			assert_eq!(a.len(), b.len());
 			for (a, b) in a.iter().zip(b) {
 				if let (Some(a), Some(b)) =
@@ -2593,8 +2597,8 @@ fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
 		}
 		(E::NamedMethodCall(a), E::NamedMethodCall(b)) => {
 			preserve_roles(&a.object.inner, &b.object.inner);
-			assert_eq!(a.arguments.len(), b.arguments.len());
-			for (a, b) in a.arguments.iter().zip(&b.arguments) {
+			assert_eq!(a.arguments.inner.len(), b.arguments.inner.len());
+			for (a, b) in a.arguments.inner.iter().zip(&b.arguments.inner) {
 				if let (Some(a), Some(b)) =
 					(&a.inner.inner.value, &b.inner.inner.value)
 				{

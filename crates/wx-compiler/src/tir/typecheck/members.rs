@@ -383,28 +383,28 @@ impl BodyBuilder<'_, '_> {
 		match &object.inner {
 			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
-				Arguments::Positional(arguments),
+				Arguments::Positional(&arguments.inner),
 				Expected::Receiver(receiver_of),
 				span,
 			),
 			ast::Expression::NamedCall { callee, arguments } => self
 				.build_call(
 					callee,
-					Arguments::Named(arguments),
+					Arguments::Named(&arguments.inner),
 					Expected::Receiver(receiver_of),
 					span,
 				),
 			ast::Expression::MethodCall(call) => self.build_method_call(
 				&call.object,
 				&call.method,
-				Arguments::Positional(&call.arguments),
+				Arguments::Positional(&call.arguments.inner),
 				Expected::Receiver(receiver_of),
 				span,
 			),
 			ast::Expression::NamedMethodCall(call) => self.build_method_call(
 				&call.object,
 				&call.method,
-				Arguments::Named(&call.arguments),
+				Arguments::Named(&call.arguments.inner),
 				Expected::Receiver(receiver_of),
 				span,
 			),
@@ -514,7 +514,8 @@ impl BodyBuilder<'_, '_> {
 			member,
 			qualified,
 		} = *path;
-		if receiver == TypeIndex::ERROR {
+		// No name is written (`x.` unfinished): the parser reported it.
+		if receiver == TypeIndex::ERROR || member.is_missing() {
 			return None;
 		}
 		let reference = SourceSpan::new(self.scope.file_id, member.ident.span);

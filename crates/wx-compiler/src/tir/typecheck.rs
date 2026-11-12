@@ -42,7 +42,7 @@ use string_interner::symbol::SymbolU32;
 
 use super::body::{
 	Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
-	ExprRange, LocalIdx, Obligations, Scope, ScopeIdx, ScopeKind,
+	ExprRange, LocalIdx, Obligations, ScopeIdx, ScopeKind,
 };
 use super::bounds::AssumptionEnvIdx;
 use super::decls::{
@@ -55,6 +55,7 @@ use super::literals::{
 	parse_char_literal, unescape_string_literal,
 };
 use super::members::{TraitImplLookup, TraitMemberSelection};
+use super::numbers::NumberError;
 use super::obligations::BoundRequirements;
 use super::operators::{
 	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
@@ -241,8 +242,8 @@ impl<'a> BodyContext<'a> {
 		Ok(if expected == actual {
 			TypeEquality::Equal
 		} else if !facts.contains(RewriteFlags::VALUES)
-			&& (self.sema.types.has_const(expected)
-				|| self.sema.types.has_const(actual))
+			&& (self.sema.types.has_const_ref(expected)
+				|| self.sema.types.has_const_ref(actual))
 		{
 			TypeEquality::NeedsValues
 		} else {
@@ -439,12 +440,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 
 	/// Pushes the root scope, which every body has.
 	fn enter_root(&mut self, span: TextSpan, expected: TypeIndex) {
-		let root = self.body.push_scope(Scope {
-			kind: ScopeKind::Block,
-			parent: None,
-			label: None,
-			span,
-		});
+		let root = self.body.push_scope(ScopeKind::Block, None, None, span);
 		debug_assert_eq!(root, ScopeIdx::ROOT);
 		self.scope_types.push(ScopeType {
 			expected,
@@ -583,15 +579,43 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		match &expr.inner {
 			ast::Expression::Int { value } => self.body.push(
 				ExprKind::Int(*value),
-				TypeIndex::INTEGER_LITERAL,
+				TypeIndex::CONST_INT,
 				span,
 			),
-			// The value is read from the source once the width is known.
-			ast::Expression::Float => self.body.push(
-				ExprKind::Float(0.0),
-				TypeIndex::FLOAT_LITERAL,
-				span,
-			),
+			ast::Expression::Float => {
+				let source =
+					&self.builder.files.get(self.scope.file_id).unwrap().source;
+				match self.sema.numbers.parse_float(span.extract_str(source)) {
+					Ok(value) => self.body.push(
+						ExprKind::Float(value),
+						TypeIndex::CONST_FLOAT,
+						span,
+					),
+					Err(error) => {
+						if error == NumberError::StorageLimit {
+							self.sema.diagnostics.push(
+								Diagnostic::error()
+									.with_code(
+										DiagnosticCode::UnsupportedExpression
+											.code(),
+									)
+									.with_message(
+										"numeric literal storage limit exceeded",
+									)
+									.with_label(
+										SourceSpan::new(
+											self.scope.file_id,
+											span,
+										)
+										.primary_label(),
+									),
+							);
+						}
+						// Invalid spelling was already reported by the parser.
+						self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+					}
+				}
+			}
 			ast::Expression::Char => self.build_char(span),
 			ast::Expression::Unary { operator, operand } => {
 				self.build_unary(*operator, operand, expected, span)
@@ -606,14 +630,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			}
 			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
-				Arguments::Positional(arguments),
+				Arguments::Positional(&arguments.inner),
 				Expected::Type(expected),
 				span,
 			),
 			ast::Expression::NamedCall { callee, arguments } => self
 				.build_call(
 					callee,
-					Arguments::Named(arguments),
+					Arguments::Named(&arguments.inner),
 					Expected::Type(expected),
 					span,
 				),
@@ -621,10 +645,13 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.build_tuple(elements, expected, span)
 			}
 			ast::Expression::Block { label, statements } => {
-				let label = label.map(|name| {
-					self.body.push_label(super::body::Label { name })
-				});
-				self.build_block(statements, expected, label, span)
+				// A name not written yet (`block : {`) declares nothing.
+				let label = label
+					.filter(|name| name.inner != Keyword::Error.symbol())
+					.map(|name| {
+						self.body.push_label(super::body::Label { name })
+					});
+				self.build_block(&statements.inner, expected, label, span)
 			}
 			ast::Expression::IfElse {
 				condition,
@@ -638,9 +665,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				span,
 			),
 			ast::Expression::Loop { label, block } => {
-				let label = label.map(|name| {
-					self.body.push_label(super::body::Label { name })
-				});
+				// A name not written yet (`block : {`) declares nothing.
+				let label = label
+					.filter(|name| name.inner != Keyword::Error.symbol())
+					.map(|name| {
+						self.body.push_label(super::body::Label { name })
+					});
 				self.build_loop(block, expected, label, span)
 			}
 			ast::Expression::Break { label, value } => {
@@ -680,14 +710,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::MethodCall(call) => self.build_method_call(
 				&call.object,
 				&call.method,
-				Arguments::Positional(&call.arguments),
+				Arguments::Positional(&call.arguments.inner),
 				Expected::Type(expected),
 				span,
 			),
 			ast::Expression::NamedMethodCall(call) => self.build_method_call(
 				&call.object,
 				&call.method,
-				Arguments::Named(&call.arguments),
+				Arguments::Named(&call.arguments.inner),
 				Expected::Type(expected),
 				span,
 			),
@@ -791,24 +821,24 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// An array literal is an array, data in no memory until its context
 	/// places it (`coerce_static`). Its elements are built with the expected
 	/// element type as their hint; its element type is the first typed
-	/// element's, or the first one's (`[{integer}; 3]`), which placing checks
+	/// element's, or the first one's (`[const_int; 3]`), which placing checks
 	/// each element against.
 	fn build_array(
 		&mut self,
-		elements: &[Spanned<ast::Expression>],
+		elements: &[Separated<Spanned<ast::Expression>>],
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		let hint = self.array_element_hint(expected);
 		let values: Vec<ExprIdx> = self.static_scope(span, |this| {
 			(elements.iter())
-				.map(|element| this.build(element, hint))
+				.map(|element| this.build(&element.inner, hint))
 				.collect()
 		});
 		let of = values
 			.iter()
 			.map(|&value| self.body.ty(value))
-			.find(|&ty| !self.sema.types.has_literal(ty))
+			.find(|&ty| !self.sema.types.has_const_kind(ty))
 			.or_else(|| values.first().map(|&value| self.body.ty(value)))
 			.unwrap_or(hint);
 		let bits = u64::try_from(values.len()).unwrap();
@@ -864,7 +894,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
 				Some(self.body.push(
 					ExprKind::Int(*value),
-					TypeIndex::INTEGER_LITERAL,
+					TypeIndex::CONST_INT,
 					count.span,
 				))
 			}
@@ -914,7 +944,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ExprKind::Const {
 				constant,
 				type_args,
-			} if type_args.is_empty() => self.sema.types.intern_const(constant, &[]),
+			} if type_args.is_empty() => self.sema.types.intern_const_ref(constant, &[]),
 			// An impl's constant may depend on the impl's arguments, which
 			// evaluation does not substitute (yet).
 			ExprKind::Const { .. } | ExprKind::AbstractConst { .. } => {
@@ -982,7 +1012,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		match parse_char_literal(span.extract_str(source)) {
 			Ok(value) => self.body.push(
 				ExprKind::Char(value),
-				TypeIndex::CHAR_LITERAL,
+				TypeIndex::CONST_CHAR,
 				span,
 			),
 			Err(error) => {
@@ -1845,7 +1875,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				span,
 			);
 		}
-		if ty.is_literal() {
+		if ty.is_const_kind() {
 			return self.body.push(
 				ExprKind::PrimitiveUnary {
 					op: op.inner,
@@ -1936,8 +1966,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			}
 		}
 		let operand_ty = match (
-			self.sema.types.has_literal(left_ty),
-			self.sema.types.has_literal(right_ty),
+			self.sema.types.has_const_kind(left_ty),
+			self.sema.types.has_const_kind(right_ty),
 		) {
 			(true, true) => {
 				if is_comparison(op.inner) {
@@ -1946,19 +1976,20 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				// Two literals are a character if either is, else a float if
 				// either is; anything else untyped (a tuple of literals) keeps
 				// the left side's shape.
-				let ty = if !left_ty.is_literal() || !right_ty.is_literal() {
-					left_ty
-				} else if left_ty == TypeIndex::CHAR_LITERAL
-					|| right_ty == TypeIndex::CHAR_LITERAL
-				{
-					TypeIndex::CHAR_LITERAL
-				} else if left_ty == TypeIndex::FLOAT_LITERAL
-					|| right_ty == TypeIndex::FLOAT_LITERAL
-				{
-					TypeIndex::FLOAT_LITERAL
-				} else {
-					TypeIndex::INTEGER_LITERAL
-				};
+				let ty =
+					if !left_ty.is_const_kind() || !right_ty.is_const_kind() {
+						left_ty
+					} else if left_ty == TypeIndex::CONST_CHAR
+						|| right_ty == TypeIndex::CONST_CHAR
+					{
+						TypeIndex::CONST_CHAR
+					} else if left_ty == TypeIndex::CONST_FLOAT
+						|| right_ty == TypeIndex::CONST_FLOAT
+					{
+						TypeIndex::CONST_FLOAT
+					} else {
+						TypeIndex::CONST_INT
+					};
 				return self.body.push(
 					ExprKind::PrimitiveBinary {
 						op: op.inner,
@@ -2042,7 +2073,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				span,
 			);
 		}
-		if self.sema.types.has_literal(live_ty) {
+		if self.sema.types.has_const_kind(live_ty) {
 			if is_comparison(op.inner) {
 				return self.report_untyped_comparison(span);
 			}
@@ -2327,7 +2358,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		}
 		// An untyped constant's body is of its kind already, and stays
 		// untyped.
-		if target.is_literal() {
+		if target.is_const_kind() {
 			let actual = self.body.ty(expr);
 			if actual != target {
 				let diagnostic =
@@ -2529,10 +2560,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			i128::from(magnitude)
 		};
 		let at = self.context().source_span(report);
-		let mut all_float = true;
 		for &concrete in concrete_types {
 			let Err(miss) = concrete.holds_integer(value) else {
-				all_float &= concrete.is_float();
 				continue;
 			};
 			let diagnostic = match (concrete, miss) {
@@ -2575,11 +2604,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			self.context().reject(report, diagnostic);
 			return false;
 		}
-		// An integer literal of float type is a float.
-		if all_float {
-			self.body
-				.set_kind(literal, ExprKind::Float(magnitude as f64));
-		}
+
 		self.body.set_ty(literal, target);
 		true
 	}
@@ -2621,25 +2646,19 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		self.body.set_ty(expr, ty);
 	}
 
-	/// Reads a float literal's value from its text at each concrete type's
-	/// width.
+	/// Rounds an exact float literal at each concrete type's width.
 	fn coerce_float(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
 		concrete_types: &[ConcreteType],
 	) {
-		let source =
-			&self.builder.files.get(self.scope.file_id).unwrap().source;
-		let text = self.body.span(expr).extract_str(source);
-		let mut value = None;
+		let ExprKind::Float(value) = self.body.kind(expr) else {
+			unreachable!("coerce_float reads a floating literal")
+		};
 		for &concrete in concrete_types {
-			match concrete.read_float(text) {
-				Ok(Some(read)) => {
-					value.get_or_insert(read);
-				}
-				// Malformed syntax was reported by the parser.
-				Ok(None) => return self.body.set_ty(expr, TypeIndex::ERROR),
+			match self.sema.read_float_literal(value, concrete) {
+				Ok(_) => {}
 				Err(miss) => {
 					let at = self.context().source_span(expr);
 					let ty = self
@@ -2682,7 +2701,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				}
 			}
 		}
-		self.body.set_kind(expr, ExprKind::Float(value.unwrap()));
 		self.body.set_ty(expr, target);
 	}
 
@@ -2892,8 +2910,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		if target_length == length {
 			return;
 		}
-		if self.sema.types.has_const(target_length)
-			|| self.sema.types.has_const(length)
+		if self.sema.types.has_const_ref(target_length)
+			|| self.sema.types.has_const_ref(length)
 		{
 			return self.obligations.exprs.push(ExprObligation::StaticLength {
 				expr,
@@ -3001,9 +3019,26 @@ mod tests {
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
-	use crate::vfs::{self, Files};
+	use crate::vfs::{self, FileId, Files};
+	use codespan_reporting::diagnostic::Diagnostic;
 
 	fn source_graph(
+		source: &str,
+		strings: &mut StringInterner,
+	) -> vfs::CompilationUnit {
+		let graph = recovered_graph(source, strings);
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_parser_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		graph
+	}
+
+	/// `source_graph` without its check for a clean parse: what checking
+	/// makes of the parser's recovery.
+	fn recovered_graph(
 		source: &str,
 		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
@@ -3020,14 +3055,7 @@ mod tests {
 				),
 			)
 			.unwrap();
-		let graph = builder.build(root_id);
-		DiagnosticView::new(
-			"parse",
-			&graph.collect_parser_diagnostics(),
-			&graph.files,
-		)
-		.assert_no_errors();
-		graph
+		builder.build(root_id)
 	}
 
 	/// The source is a binary over the real core, so operators, memories
@@ -3042,6 +3070,22 @@ mod tests {
 		fn new(source: &str) -> Self {
 			let mut strings = ast::Keyword::create_interner();
 			let graph = source_graph(source, &mut strings);
+			Self::checked(graph, strings)
+		}
+
+		/// A source the parser reports and recovers from, and the parser's
+		/// diagnostics, which `diagnostics` leaves out.
+		fn recovered(source: &str) -> (Self, Vec<Diagnostic<FileId>>) {
+			let mut strings = ast::Keyword::create_interner();
+			let graph = recovered_graph(source, &mut strings);
+			let parsed = graph.collect_parser_diagnostics();
+			(Self::checked(graph, strings), parsed)
+		}
+
+		fn checked(
+			graph: vfs::CompilationUnit,
+			mut strings: StringInterner,
+		) -> Self {
 			let mut sema = crate::tir::check(&graph, &mut strings);
 			// The core's own bodies use forms the checker does not cover
 			// yet; those reports are not what this suite is about.
@@ -3212,7 +3256,13 @@ mod tests {
 			match body.kind(expr) {
 				ExprKind::Error => "error".to_string(),
 				ExprKind::Int(value) => value.to_string(),
-				ExprKind::Float(value) => format!("{value:?}"),
+				ExprKind::Float(value) => match self.sema.read_float_literal(
+					value,
+					crate::tir::literals::ConcreteType::Target(body.ty(expr)),
+				) {
+					Ok(value) => format!("{value:?}"),
+					_ => self.sema.numbers.decimal_text(value),
+				},
 				ExprKind::Char(value) => format!("{value:?}"),
 				ExprKind::String(contents) => {
 					format!("{:?}", self.strings.resolve(contents).unwrap())
@@ -5693,8 +5743,8 @@ mod tests {
 		// A type that cannot reach a constant means the same either way.
 		assert_eq!(normalize(written, without_values), written);
 		assert_eq!(normalize(written, RewriteFlags::ALL), written);
-		assert!(case.sema.types.has_const(named));
-		assert!(!case.sema.types.has_const(written));
+		assert!(case.sema.types.has_const_ref(named));
+		assert!(!case.sema.types.has_const_ref(written));
 	}
 
 	#[test]
@@ -7939,5 +7989,208 @@ mod tests {
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::CannotMutateImmutable]);
+	}
+
+	// ── Unfinished member accesses and paths ────────────────────────────
+	//
+	// The parser keeps `x.` and `a::` with the error symbol for the missing
+	// name (`PathSegment::missing`) and reports it once. Checking builds the
+	// object or the path's prefix and selects nothing for the name, without
+	// a second report, and goes on with the rest of the body.
+
+	/// Exactly `parsed` from the parser, and nothing from checking.
+	fn assert_recovered(source: &str, parsed: &[DiagnosticCode]) {
+		let (case, parser) = TestCase::recovered(source);
+		DiagnosticView::new("parse", &parser, &case.files).assert_codes(parsed);
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn a_missing_function_result_is_reported_once() {
+		for source in [
+			"func f() -> {}",
+			"func f() -> { 1 }",
+			"struct S(); impl S { pub func f(self: Self) -> { self } }",
+			"trait Tr: StackValue { func f(self: Self) -> ; }",
+			"trait Tr: StackValue { func f(self: Self) -> { self } }",
+		] {
+			assert_recovered(source, &[DiagnosticCode::UnexpectedToken]);
+		}
+	}
+
+	#[test]
+	fn checking_continues_after_a_missing_function_result() {
+		let (case, parser) = TestCase::recovered(
+			"func f() -> { missing() }\nfunc g() { also_missing() }",
+		);
+		DiagnosticView::new("parse", &parser, &case.files)
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::UndeclaredIdentifier,
+		]);
+	}
+
+	#[test]
+	fn a_missing_bound_is_reported_once() {
+		for source in [
+			"trait X: {}",
+			"func f<T: >() {}",
+			"typeset X: { u8 }",
+			"trait X { type Item: ; }",
+			"trait X { type Item: = u8; }",
+			"trait Tr { type Item; }\nfunc f<T: Tr where { Item: }>() {}",
+		] {
+			assert_recovered(source, &[DiagnosticCode::UnexpectedToken]);
+		}
+	}
+
+	#[test]
+	fn a_missing_member_is_reported_once() {
+		let unexpected = &[DiagnosticCode::UnexpectedToken];
+		// A struct's field, directly and through a pointer.
+		assert_recovered(
+			"struct P(x: u32);\nfunc f(p: P) {\n    local a = p.\n}\n",
+			unexpected,
+		);
+		assert_recovered(
+			indoc! {"
+				memory heap: u32;
+				struct P(x: u32);
+				func f(p: heap::*P) {
+				    local a = p.
+				}
+			"},
+			unexpected,
+		);
+		// A value with no fields, and a method call.
+		assert_recovered(
+			"func f() {\n    local a = Ordering::Less;\n    local b = a.\n}\n",
+			unexpected,
+		);
+		assert_recovered(
+			"struct P(x: u32);\nfunc f(p: P) {\n    p.(1);\n}\n",
+			unexpected,
+		);
+	}
+
+	#[test]
+	fn a_missing_path_segment_is_reported_once() {
+		let namespace = &[DiagnosticCode::InvalidNamespace];
+		let unexpected = &[DiagnosticCode::UnexpectedToken];
+		// A value through a type and through a namespace.
+		assert_recovered(
+			"func f() {\n    local a = Ordering::\n}\n",
+			namespace,
+		);
+		assert_recovered("func f() {\n    local a = core::\n}\n", namespace);
+		// A pattern.
+		assert_recovered(
+			indoc! {"
+				func f(o: Ordering) {
+				    match o {
+				        Ordering:: => (),
+				        _ => (),
+				    }
+				}
+			"},
+			namespace,
+		);
+		// A type: a local's, a parameter's, a field's (a member of a type).
+		assert_recovered(
+			"func f() {\n    local a: core:: = 1;\n}\n",
+			unexpected,
+		);
+		assert_recovered("func f(a: core::) {}\n", unexpected);
+		assert_recovered("struct S(a: Ordering::);\n", unexpected);
+	}
+
+	/// The statement after an unfinished one, and the items after it, are
+	/// still checked.
+	#[test]
+	fn checking_goes_on_after_a_missing_name() {
+		let (case, parser) = TestCase::recovered(indoc! {"
+			struct P(x: u32);
+			func f(p: P) {
+			    p.
+			    local b: u8 = 300;
+			}
+			func g() -> u32 { h() }
+		"});
+		DiagnosticView::new("parse", &parser, &case.files).assert_codes(&[
+			DiagnosticCode::UnexpectedToken,
+			DiagnosticCode::MissingSeparator,
+		]);
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::IntegerLiteralOutOfRange,
+			DiagnosticCode::UndeclaredIdentifier,
+		]);
+	}
+
+	/// A `local` with no value yet (or no type after its `:`) is a local all
+	/// the same: reported by the parser alone, it is declared, so a later
+	/// use finds it and says nothing more.
+	#[test]
+	fn a_local_without_its_value_is_still_declared() {
+		let (case, parser) = TestCase::recovered(indoc! {"
+			func f() -> u32 {
+			    local a: u32
+			    local b: = 1;
+			    a + b
+			}
+		"});
+		DiagnosticView::new("parse", &parser, &case.files).assert_codes(&[
+			DiagnosticCode::MissingInitializer,
+			DiagnosticCode::MissingSeparator,
+			DiagnosticCode::UnexpectedToken,
+		]);
+		case.diagnostics().assert_none();
+	}
+
+	/// A parameter whose type is not written yet is still declared: its
+	/// uses find it, and its error type says nothing more.
+	#[test]
+	fn a_parameter_without_its_type_is_still_declared() {
+		let (case, parser) = TestCase::recovered(indoc! {"
+			func f(x: u32, y: ) -> u32 {
+			    x + y
+			}
+		"});
+		DiagnosticView::new("parse", &parser, &case.files)
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		case.diagnostics().assert_none();
+	}
+
+	/// A named argument whose value is not written yet still names its
+	/// parameter, so the call is checked whole and says nothing more.
+	#[test]
+	fn a_named_argument_without_its_value_is_silent() {
+		let (case, parser) = TestCase::recovered(indoc! {"
+			func g(a: u32, b: u32) {}
+			func f() {
+			    g({ a: , b: 1 });
+			}
+		"});
+		DiagnosticView::new("parse", &parser, &case.files)
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		case.diagnostics().assert_none();
+	}
+
+	/// A label not written yet declares nothing and names nothing, and the
+	/// checker says nothing about it.
+	#[test]
+	fn a_label_without_its_name_is_silent() {
+		let (case, parser) = TestCase::recovered(indoc! {"
+			func f() {
+			    block : {
+			        loop { break : }
+			    }
+			}
+		"});
+		DiagnosticView::new("parse", &parser, &case.files).assert_codes(&[
+			DiagnosticCode::UnexpectedToken,
+			DiagnosticCode::UnexpectedToken,
+		]);
+		case.diagnostics().assert_none();
 	}
 }

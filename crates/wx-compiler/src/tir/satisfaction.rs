@@ -244,8 +244,9 @@ impl Semantics {
 							None,
 						),
 						None => {
-							let read =
-								self.types.intern_const(constant, &[subject]);
+							let read = self
+								.types
+								.intern_const_ref(constant, &[subject]);
 							let formatter = self.type_formatter(strings);
 							let clause = format!(
 								"{} is representable as {}",

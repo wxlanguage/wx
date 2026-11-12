@@ -25,6 +25,9 @@ pub(crate) struct Snapshot {
 	pub(crate) sema: Semantics,
 	/// Every declared name, by where it is written.
 	definitions: BTreeMap<SourceSpan, Definition>,
+	/// Every impl, by its target's path (`Semantics::impls`), the one span
+	/// an impl keeps.
+	impls: BTreeMap<SourceSpan, Definition>,
 }
 
 impl Snapshot {
@@ -47,11 +50,13 @@ impl Snapshot {
 		let sema =
 			trace.step("check", || tir::check(&compilation, &mut strings));
 		let definitions = sema.definitions();
+		let impls = sema.impls().collect();
 		Ok(Self {
 			compilation,
 			strings,
 			sema,
 			definitions,
+			impls,
 		})
 	}
 
@@ -77,6 +82,14 @@ impl Snapshot {
 			self.definitions.range(..=probe).next_back()?;
 		(span.file_id == file && offset <= span.span.end)
 			.then_some((span, definition))
+	}
+
+	/// The impl whose target's path is written at exactly `target`.
+	pub(crate) fn impl_with_target(
+		&self,
+		target: SourceSpan,
+	) -> Option<Definition> {
+		self.impls.get(&target).copied()
 	}
 
 	/// Every declared name written in `file`, in source order.

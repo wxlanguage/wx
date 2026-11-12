@@ -208,7 +208,7 @@ parameter is; `Self` is the trait frame's parameter, hidden by default:
 
 ```wx
 pub trait Array: Slice {
-    const LEN: {integer};
+    const LEN: const_int;
     func as_slice<
         Self: Array where { const LEN: M::Size },
         M: Memory,

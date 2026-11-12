@@ -275,9 +275,9 @@ impl BodyBuilder<'_, '_> {
 			// A literal or inference placeholder has its own diagnostic.
 			Type::Error
 			| Type::Infer
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral => return ty,
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar => return ty,
 			// Unplaced data has its own diagnostic too.
 			Type::Slice { .. } | Type::Array { .. } => return ty,
 			_ => {}

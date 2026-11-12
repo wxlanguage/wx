@@ -24,6 +24,7 @@ use string_interner::symbol::SymbolU32;
 use super::decls::{
 	ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, ImportIdx, MemoryIdx, StructIdx,
 };
+use super::numbers::DecimalFloat;
 use super::obligations::TypeObligation;
 use super::types::{GenericArgs, TypeIndex};
 use crate::ast::{BinaryOp, Spanned, UnaryOp};
@@ -114,7 +115,7 @@ pub(super) enum ExprObligation {
 	/// A `match`'s exhaustiveness and unreachable arms: a pattern compares
 	/// with a constant's value.
 	Match(ExprIdx),
-	/// An untyped constant `expr` (`const X: {integer}`) was given the type
+	/// An untyped constant `expr` (`const X: const_int`) was given the type
 	/// `target`: its value is representable as it, as a literal's would be.
 	Representable { expr: ExprIdx, target: TypeIndex },
 }
@@ -156,6 +157,14 @@ impl ExprRange {
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct PatternRange {
+	start: u32,
+	len: u32,
+}
+
+/// A run of `Body::locals`: the locals one scope declares.
+#[derive(Clone, Copy)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub(super) struct LocalRange {
 	start: u32,
 	len: u32,
 }
@@ -241,14 +250,16 @@ pub(super) enum ExprKind {
 	/// A literal's magnitude, as written; `-1` is `PrimitiveUnary` over
 	/// `Int(1)`.
 	Int(u64),
-	Float(f64),
+	/// Exact decimal value. Its checked type determines the precision used
+	/// when evaluation or lowering converts it.
+	Float(DecimalFloat),
 	Char(char),
 	/// A string literal's contents, unescaped. Its type is the byte array of
 	/// its length (`[u8; 5]`), data in no memory until its context places it
 	/// (a shared pointer to it or to the slice of its bytes).
 	String(SymbolU32),
 	/// An array literal `[a, b, c]`. Its type is the array of its elements and
-	/// its length (`[{integer}; 3]`), data in no memory until its context
+	/// its length (`[const_int; 3]`), data in no memory until its context
 	/// places it, and each element has that type's element type.
 	Array {
 		elements: ExprRange,
@@ -490,9 +501,16 @@ pub(super) enum ExprKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ScopeKind {
-	/// A block, an `if`/`else` branch, a match arm (holding its bindings),
-	/// or the body itself (the root scope, the one without a parent).
+	/// A block, an `if`/`else` branch, a match arm (declaring its
+	/// bindings, from the end of its pattern), or the body itself (the root
+	/// scope, the one without a parent, declaring the parameters).
 	Block,
+	/// The rest of a block after a `local` statement, which declares what
+	/// the statement binds: from the statement's end to the block's. Each
+	/// `local` opens one inside the one before, so a later local of the
+	/// same name shadows by nesting, and the statement's own value, built
+	/// before it opens, sees the locals before it. Not a jump target.
+	Remainder,
 	/// A loop's block, which `continue` restarts.
 	Loop,
 	/// A string or array literal's elements, or a repeat's value:
@@ -502,7 +520,7 @@ pub(super) enum ScopeKind {
 	Static,
 }
 
-/// One lexical block.
+/// One lexical scope: a block, or the rest of one after a `local`.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Scope {
@@ -511,7 +529,21 @@ pub(super) struct Scope {
 	pub(super) parent: Option<ScopeIdx>,
 	/// `loop :outer { .. }` or `block :outer { .. }`.
 	pub(super) label: Option<LabelIdx>,
+	/// Where what it declares is in scope: the offsets after its start, up
+	/// to its end.
 	pub(super) span: TextSpan,
+	/// The locals it declares, one run: the parameters, one pattern's
+	/// bindings, or none.
+	locals: LocalRange,
+}
+
+/// What a label is written on: a `break` may leave either, a `continue`
+/// restarts only a loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum LabelKind {
+	Block,
+	Loop,
 }
 
 /// A label written on a block or a loop.
@@ -643,6 +675,99 @@ impl Body {
 		&self.locals
 	}
 
+	/// The innermost scope covering `offset`, if `offset` is in the body. A
+	/// scope is pushed after the one holding it, and siblings do not
+	/// overlap, so it is the last one covering `offset`.
+	fn scope_at(&self, offset: u32) -> Option<ScopeIdx> {
+		self.scopes
+			.iter()
+			.rposition(|scope| {
+				scope.span.start < offset && offset < scope.span.end
+			})
+			.map(|index| ScopeIdx::new(index as u32))
+	}
+
+	/// The scopes a name written at `offset` is looked up in, innermost
+	/// first, each with the locals it declares.
+	fn scopes_from(
+		&self,
+		offset: u32,
+	) -> impl Iterator<Item = (Scope, impl Iterator<Item = LocalIdx>)> + '_ {
+		std::iter::successors(self.scope_at(offset), |&at| {
+			self.scope(at).parent
+		})
+		.map(|at| {
+			let scope = *self.scope(at);
+			let LocalRange { start, len } = scope.locals;
+			(scope, (start..start + len).map(LocalIdx::new))
+		})
+	}
+
+	/// The locals a name written at `offset` can use: for each name, the
+	/// one its lookup finds there (`BodyBuilder::lookup_local`), innermost
+	/// scope first. Inside a `Static` scope (a literal's elements) the
+	/// locals of the scopes around it are out of reach, since using one is
+	/// an error (E2140), so they are left out. Empty when `offset` is not
+	/// in the body.
+	pub fn locals_at(&self, offset: u32) -> Vec<LocalIdx> {
+		let mut found: Vec<LocalIdx> = Vec::new();
+		for (scope, locals) in self.scopes_from(offset) {
+			for local in locals {
+				let name = self.local(local).name.inner;
+				if !found
+					.iter()
+					.any(|&kept| self.local(kept).name.inner == name)
+				{
+					found.push(local);
+				}
+			}
+			if scope.kind == ScopeKind::Static {
+				break;
+			}
+		}
+		found
+	}
+
+	/// The local `name`, written at `offset`, refers to, as the checker's
+	/// lookup finds it: the nearest one declared, past static data too,
+	/// where using it is an error (E2140) but it still means that local and
+	/// hides an item of its name.
+	pub fn local_named_at(
+		&self,
+		offset: u32,
+		name: SymbolU32,
+	) -> Option<LocalIdx> {
+		self.scopes_from(offset)
+			.flat_map(|(_, locals)| locals)
+			.find(|&local| self.local(local).name.inner == name)
+	}
+
+	/// The labels a `break` or `continue` written at `offset` can name: for
+	/// each name, the one its lookup finds there (`jump_target`), innermost
+	/// first, with what it is written on.
+	pub fn labels_at(&self, offset: u32) -> Vec<(LabelIdx, LabelKind)> {
+		let mut found: Vec<(LabelIdx, LabelKind)> = Vec::new();
+		for (scope, _) in self.scopes_from(offset) {
+			let Some(label) = scope.label else {
+				continue;
+			};
+			let name = self.label(label).name.inner;
+			if found
+				.iter()
+				.any(|&(kept, _)| self.label(kept).name.inner == name)
+			{
+				continue;
+			}
+			// Only a `block` and a loop take a label.
+			let kind = match scope.kind {
+				ScopeKind::Loop => LabelKind::Loop,
+				_ => LabelKind::Block,
+			};
+			found.push((label, kind));
+		}
+		found
+	}
+
 	/// Every label, in declaration order (`LabelIdx` order).
 	pub fn labels(&self) -> &[Label] {
 		&self.labels
@@ -718,10 +843,25 @@ impl Body {
 		ElementOrder::Permuted { start }
 	}
 
-	pub(super) fn push_scope(&mut self, scope: Scope) -> ScopeIdx {
-		debug_assert_eq!(self.scopes.is_empty(), scope.parent.is_none());
+	pub(super) fn push_scope(
+		&mut self,
+		kind: ScopeKind,
+		parent: Option<ScopeIdx>,
+		label: Option<LabelIdx>,
+		span: TextSpan,
+	) -> ScopeIdx {
+		debug_assert_eq!(self.scopes.is_empty(), parent.is_none());
 		let index = ScopeIdx::new(u32::try_from(self.scopes.len()).unwrap());
-		self.scopes.push(scope);
+		self.scopes.push(Scope {
+			kind,
+			parent,
+			label,
+			span,
+			locals: LocalRange {
+				start: u32::try_from(self.locals.len()).unwrap(),
+				len: 0,
+			},
+		});
 		index
 	}
 
@@ -736,8 +876,21 @@ impl Body {
 		self.params.push(local);
 	}
 
-	pub(super) fn push_local(&mut self, local: Local) -> LocalIdx {
+	/// Declares `local` in `scope`. A scope's locals are one run, so it
+	/// must be the last scope that declared any.
+	pub(super) fn push_local(
+		&mut self,
+		scope: ScopeIdx,
+		local: Local,
+	) -> LocalIdx {
 		let index = LocalIdx::new(u32::try_from(self.locals.len()).unwrap());
+		let run = &mut self.scopes[usize::from(scope)].locals;
+		debug_assert_eq!(
+			run.start + run.len,
+			u32::from(index),
+			"a scope's locals are declared together"
+		);
+		run.len += 1;
 		self.locals.push(local);
 		index
 	}
@@ -797,7 +950,309 @@ impl Body {
 
 #[cfg(test)]
 mod tests {
+	use indoc::indoc;
+
 	use super::*;
+	use crate::symbols::{Keyword, StringInterner};
+	use crate::tir::decls::{FunctionIdx, Scope};
+	use crate::tir::resolutions::Reference;
+	use crate::tir::signatures::Semantics;
+	use crate::tir::signatures::tests::source_graph;
+	use crate::vfs::FileId;
+
+	/// A checked source, read through its bodies.
+	struct Case<'s> {
+		source: &'s str,
+		file: FileId,
+		strings: StringInterner,
+		sema: Semantics,
+	}
+
+	impl<'s> Case<'s> {
+		fn new(source: &'s str) -> Self {
+			let mut strings = Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let sema = crate::tir::check(&graph, &mut strings);
+			let file = sema
+				.decls
+				.namespaces
+				.file_id(Scope::Package(sema.decls.root_package).into());
+			Self {
+				source,
+				file,
+				strings,
+				sema,
+			}
+		}
+
+		/// The body of the function named `name`.
+		fn body(&self, name: &str) -> &Body {
+			let function = (0..self.sema.decls.functions.len())
+				.map(|index| FunctionIdx::new(index as u32))
+				.find(|&function| {
+					let decl =
+						&self.sema.decls.functions[usize::from(function)];
+					self.sema.decls.file_id(decl.loc) == self.file
+						&& self
+							.strings
+							.resolve(self.sema.decls.name(function).inner)
+							== Some(name)
+				})
+				.unwrap_or_else(|| panic!("no function `{name}`"));
+			self.sema
+				.owner_body(BodyOwner::Function(function))
+				.expect("a function with a block has a body")
+		}
+
+		/// What `locals_at` offers in `function` at the comment `// {mark}`,
+		/// each as its name and the line it is declared on (`x@3`), which
+		/// tells shadowed locals apart.
+		fn visible(&self, function: &str, mark: &str) -> Vec<String> {
+			let offset = self
+				.source
+				.find(&format!("// {mark}"))
+				.unwrap_or_else(|| panic!("no `// {mark}`"));
+			let body = self.body(function);
+			body.locals_at(offset as u32)
+				.into_iter()
+				.map(|local| {
+					let name = body.local(local).name;
+					let line = self.source[..name.span.start as usize]
+						.matches('\n')
+						.count() + 1;
+					format!(
+						"{}@{line}",
+						self.strings.resolve(name.inner).unwrap()
+					)
+				})
+				.collect()
+		}
+	}
+
+	/// At every use of a local the checker resolved, `locals_at` offers
+	/// that local for its name: the scopes say what the lookup found.
+	#[test]
+	fn locals_at_agrees_with_the_checker() {
+		let case = Case::new(indoc! {"
+			func f(a: u32, _: u32, mut b: u32) -> u32 {
+			    local x = a;
+			    local x = x + b;
+			    b = x;
+			    block {
+			        local x = b;
+			        local y = x;
+			        b = y;
+			    }
+			    if a == 0 {
+			        local z = x;
+			        b = z;
+			    } else {
+			        local z = a;
+			        b = z;
+			    }
+			    local (p, q) = (x, b);
+			    match a {
+			        0 | 1 => p,
+			        n => n + q,
+			    }
+			}
+			func g(o: Ordering) -> i8 {
+			    local mut n: i8 = 0;
+			    loop {
+			        local d: i8 = 1;
+			        n = n + d;
+			        break;
+			    }
+			    match o {
+			        Ordering::Less => n,
+			        m => n,
+			    }
+			}
+		"});
+		case.sema.diagnostics.iter().for_each(|diagnostic| {
+			assert!(
+				diagnostic.severity
+					< codespan_reporting::diagnostic::Severity::Error,
+				"{diagnostic:?}"
+			);
+		});
+		let mut checked = 0;
+		for (span, reference) in case.sema.resolutions_in(case.file) {
+			let Reference::Local { owner, local, .. } = reference else {
+				continue;
+			};
+			let body = case.sema.owner_body(owner).unwrap();
+			let offered = body.locals_at(span.span.start);
+			let name = body.local(local).name.inner;
+			let same_name: Vec<_> = offered
+				.into_iter()
+				.filter(|&other| body.local(other).name.inner == name)
+				.collect();
+			assert_eq!(
+				body.local_named_at(span.span.start, name),
+				Some(local),
+				"`local_named_at` at {}",
+				case.source[span.span.start as usize..]
+					.lines()
+					.next()
+					.unwrap()
+			);
+			assert_eq!(
+				same_name,
+				[local],
+				"at {}",
+				case.source[span.span.start as usize..]
+					.lines()
+					.next()
+					.unwrap()
+			);
+			checked += 1;
+		}
+		assert!(checked > 20, "only {checked} uses checked");
+	}
+
+	#[test]
+	fn a_local_is_in_scope_after_its_statement() {
+		let case = Case::new(indoc! {"
+			func f(a: u32) {
+			    // start
+			    local x: u32 = a;
+			    local x: u32 =
+			        // value
+			        x;
+			    // after
+			}
+		"});
+		assert_eq!(case.visible("f", "start"), ["a@1"]);
+		// The value of `local x` is built before its `x` is in scope.
+		assert_eq!(case.visible("f", "value"), ["x@3", "a@1"]);
+		assert_eq!(case.visible("f", "after"), ["x@4", "a@1"]);
+	}
+
+	#[test]
+	fn a_block_or_a_branch_keeps_its_locals() {
+		let case = Case::new(indoc! {"
+			func f(c: Bool) {
+			    local a: u32 = 1;
+			    if c {
+			        local x: u32 = a;
+			        // then
+			    } else {
+			        local x: u32 = a;
+			        // else
+			    }
+			    // after
+			}
+		"});
+		assert_eq!(case.visible("f", "then"), ["x@4", "a@2", "c@1"]);
+		assert_eq!(case.visible("f", "else"), ["x@7", "a@2", "c@1"]);
+		assert_eq!(case.visible("f", "after"), ["a@2", "c@1"]);
+	}
+
+	#[test]
+	fn an_arm_binds_after_its_pattern() {
+		let case = Case::new(indoc! {"
+			func f(a: u32) -> u32 {
+			    match a {
+			        0 => {
+			            // first
+			            a
+			        }
+			        n => {
+			            // second
+			            n
+			        }
+			    }
+			}
+		"});
+		assert_eq!(case.visible("f", "first"), ["a@1"]);
+		assert_eq!(case.visible("f", "second"), ["n@7", "a@1"]);
+	}
+
+	#[test]
+	fn a_literal_reaches_no_local_around_it() {
+		let case = Case::new(indoc! {"
+			memory heap: u32;
+			func f(a: u32) {
+			    local s: heap::&[u32] = [
+			        // element
+			        1,
+			    ];
+			}
+		"});
+		assert_eq!(case.visible("f", "element"), Vec::<String>::new());
+	}
+
+	/// Inside a literal an outer local cannot be used, but a name there
+	/// still refers to it (E2140), so it hides an item of its name.
+	#[test]
+	fn a_local_behind_static_data_still_takes_its_name() {
+		let source = indoc! {"
+			memory heap: u32;
+			const x: u32 = 5;
+			func f(x: u32) -> heap::&[u32] {
+			    [x]
+			}
+		"};
+		let case = Case::new(source);
+		let body = case.body("f");
+		let at = source.find("[x]").unwrap() as u32 + 1;
+		assert!(body.locals_at(at).is_empty());
+		let found =
+			body.local_named_at(at, body.local(LocalIdx::new(0)).name.inner);
+		assert_eq!(found, Some(LocalIdx::new(0)));
+		// The checker's lookup recorded the same local for that use.
+		let (_, reference) = case.sema.symbol_at(case.file, at).unwrap();
+		assert!(matches!(
+			reference,
+			Reference::Local { local, .. } if local == LocalIdx::new(0)
+		));
+	}
+
+	/// The labels a jump at `// mark` can name, each with its kind.
+	fn labels(case: &Case, function: &str, mark: &str) -> Vec<String> {
+		let offset = case.source.find(&format!("// {mark}")).unwrap();
+		let body = case.body(function);
+		body.labels_at(offset as u32)
+			.into_iter()
+			.map(|(label, kind)| {
+				let name = case.strings.resolve(body.label(label).name.inner);
+				format!("{} {kind:?}", name.unwrap())
+			})
+			.collect()
+	}
+
+	#[test]
+	fn labels_at_lists_the_nearest_label_of_each_name() {
+		let case = Case::new(indoc::indoc! {"
+			func f() {
+			    loop :outer {
+			        block :inner {
+			            loop :outer {
+			                // innermost
+			            }
+			            // between
+			        }
+			    }
+			    // after
+			}
+		"});
+		assert_eq!(
+			labels(&case, "f", "innermost"),
+			["outer Loop", "inner Block"]
+		);
+		assert_eq!(
+			labels(&case, "f", "between"),
+			["inner Block", "outer Loop"]
+		);
+		assert_eq!(labels(&case, "f", "after"), Vec::<String>::new());
+	}
+
+	#[test]
+	fn nothing_is_in_scope_outside_the_body() {
+		let case = Case::new("func f(a: u32) {}\n// outside\n");
+		assert_eq!(case.visible("f", "outside"), Vec::<String>::new());
+	}
 
 	#[test]
 	fn an_expression_node_stays_small() {

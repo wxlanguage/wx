@@ -56,15 +56,15 @@ impl TypeIndex {
 		}
 	}
 
-	pub fn is_literal(self) -> bool {
-		self == TypeIndex::INTEGER_LITERAL
-			|| self == TypeIndex::FLOAT_LITERAL
-			|| self == TypeIndex::CHAR_LITERAL
+	pub fn is_const_kind(self) -> bool {
+		self == TypeIndex::CONST_INT
+			|| self == TypeIndex::CONST_FLOAT
+			|| self == TypeIndex::CONST_CHAR
 	}
 
 	#[inline]
-	pub fn is_number_literal(self) -> bool {
-		self == TypeIndex::INTEGER_LITERAL || self == TypeIndex::FLOAT_LITERAL
+	pub fn is_numeric_const_kind(self) -> bool {
+		self == TypeIndex::CONST_INT || self == TypeIndex::CONST_FLOAT
 	}
 
 	#[inline]
@@ -96,8 +96,8 @@ impl TypeIndex {
 	pub const ERROR: TypeIndex = TypeIndex(1);
 	pub const UNIT: TypeIndex = TypeIndex(2);
 	pub const NEVER: TypeIndex = TypeIndex(3);
-	pub const INTEGER_LITERAL: TypeIndex = TypeIndex(4);
-	pub const FLOAT_LITERAL: TypeIndex = TypeIndex(5);
+	pub const CONST_INT: TypeIndex = TypeIndex(4);
+	pub const CONST_FLOAT: TypeIndex = TypeIndex(5);
 	pub const U8: TypeIndex = TypeIndex(6);
 	pub const I8: TypeIndex = TypeIndex(7);
 	pub const U16: TypeIndex = TypeIndex(8);
@@ -113,7 +113,7 @@ impl TypeIndex {
 	/// core's `Char`, a struct.
 	pub const CHAR: TypeIndex = TypeIndex(17);
 	pub const FUNCREF: TypeIndex = TypeIndex(18);
-	pub const CHAR_LITERAL: TypeIndex = TypeIndex(19);
+	pub const CONST_CHAR: TypeIndex = TypeIndex(19);
 }
 
 /// A primitive numeric type: what the builtin operators are defined on, what
@@ -310,11 +310,16 @@ pub enum Type {
 	/// whenever `Infer` survives past the call site that created it.
 	Infer,
 	Never,
-	IntegerLiteral,
-	FloatLiteral,
-	/// A character literal's type until its context gives it one: `Char`,
-	/// or an integer type that can represent its code point (`coerce`).
-	CharLiteral,
+	/// An integer literal or untyped constant, before a use gives it a
+	/// concrete type. Written `const_int` in constant annotations.
+	ConstInt,
+	/// A float literal or untyped floating constant before a use gives it a
+	/// concrete type. Written `const_float` in constant annotations.
+	ConstFloat,
+	/// A character literal or untyped constant before a use gives it a
+	/// concrete type: `Char`, or an integer type that can represent its
+	/// code point (`coerce`). Written `const_char` in constant annotations.
+	ConstChar,
 	U8,
 	I8,
 	U16,
@@ -368,7 +373,7 @@ pub enum Type {
 	},
 	/// `[T; N]`: exactly `N` values of `T`, in no memory. Only a pointer or a
 	/// constant holds one (`M::&[T; N]` is a `Pointer` to it). The length is
-	/// a count: a `Value`, a `Const`, or `Infer` until its context gives one.
+	/// a count: a `Value`, a `ConstRef`, or `Infer` until its context gives one.
 	Array {
 		of: TypeIndex,
 		length: TypeIndex,
@@ -418,7 +423,7 @@ pub enum Type {
 	/// for a trait's declaration. Like a projection, it is replaced by what
 	/// it means, its `Value`, once that is known: a free constant's once it
 	/// is evaluated.
-	Const {
+	ConstRef {
 		constant: ConstIdx,
 		type_args: TypeList,
 	},
@@ -444,16 +449,16 @@ impl TypeFlags {
 	pub(super) const HAS_INFER: Self = Self(1 << 0);
 	/// An `Error` is in it: something about the type was reported.
 	pub(super) const HAS_ERROR: Self = Self(1 << 1);
-	/// A literal's type (`IntegerLiteral`, `CharLiteral`, ..) is in it, which
-	/// context has not replaced yet.
-	pub(super) const HAS_LITERAL: Self = Self(1 << 2);
+	/// A const kind (`ConstInt`, `ConstFloat`, `ConstChar`) is in it,
+	/// which context has not replaced with a concrete type yet.
+	pub(super) const HAS_CONST_KIND: Self = Self(1 << 2);
 	/// A `TypeParam` is in it: substitution can change the type.
 	pub(super) const HAS_PARAM: Self = Self(1 << 3);
-	/// An `TypeProjection` or a `Const` is in it: normalization can
+	/// A `TypeProjection` or a `ConstRef` is in it: normalization can
 	/// change the type.
 	pub(super) const HAS_PROJECTION: Self = Self(1 << 4);
-	/// A `Const` is in it: its value can replace it, once evaluated.
-	pub(super) const HAS_CONST: Self = Self(1 << 5);
+	/// A `ConstRef` is in it: its value can replace it, once evaluated.
+	pub(super) const HAS_CONST_REF: Self = Self(1 << 5);
 	/// A slice or an array is in it, held directly or by a tuple's element:
 	/// as an expression's type, data not placed in a memory yet, which its
 	/// context places. Only a tuple passes it on; behind a pointer, in a
@@ -524,11 +529,11 @@ impl Type {
 				},
 				type_args,
 			),
-			Type::Const {
+			Type::ConstRef {
 				constant,
 				type_args,
 			} => (
-				Type::Const {
+				Type::ConstRef {
 					constant,
 					type_args: TypeList::EMPTY,
 				},
@@ -633,11 +638,11 @@ impl TypeInterner {
 				args,
 			),
 			(
-				Type::Const {
+				Type::ConstRef {
 					constant: a,
 					type_args: xs,
 				},
-				Type::Const {
+				Type::ConstRef {
 					constant: b,
 					type_args: ys,
 				},
@@ -742,8 +747,8 @@ impl TypeInterner {
 				elements: TypeList::EMPTY,
 			},
 			Type::Never,
-			Type::IntegerLiteral,
-			Type::FloatLiteral,
+			Type::ConstInt,
+			Type::ConstFloat,
 			Type::U8,
 			Type::I8,
 			Type::U16,
@@ -760,7 +765,7 @@ impl TypeInterner {
 				type_args: TypeList::EMPTY,
 			},
 			Type::Funcref,
-			Type::CharLiteral,
+			Type::ConstChar,
 		] {
 			types.intern(ty);
 		}
@@ -853,12 +858,12 @@ impl TypeInterner {
 		)
 	}
 
-	pub(super) fn intern_const(
+	pub(super) fn intern_const_ref(
 		&mut self,
 		constant: ConstIdx,
 		type_args: &[TypeIndex],
 	) -> TypeIndex {
-		let shape = Type::Const {
+		let shape = Type::ConstRef {
 			constant,
 			type_args: TypeList::EMPTY,
 		};
@@ -869,7 +874,7 @@ impl TypeInterner {
 		let list = self.push_list(type_args);
 		self.insert(
 			hash,
-			Type::Const {
+			Type::ConstRef {
 				constant,
 				type_args: list,
 			},
@@ -947,8 +952,8 @@ impl TypeInterner {
 		match ty {
 			Type::Infer => TypeFlags::HAS_INFER,
 			Type::Error => TypeFlags::HAS_ERROR,
-			Type::IntegerLiteral | Type::FloatLiteral | Type::CharLiteral => {
-				TypeFlags::HAS_LITERAL
+			Type::ConstInt | Type::ConstFloat | Type::ConstChar => {
+				TypeFlags::HAS_CONST_KIND
 			}
 			Type::Tuple { elements } => self.flags_of_list(elements),
 			Type::Struct { type_args, .. }
@@ -971,8 +976,8 @@ impl TypeInterner {
 			Type::TypeProjection { base, .. } => TypeFlags::HAS_PROJECTION
 				.union(self.flags[usize::from(base)])
 				.without(TypeFlags::HAS_UNPLACED),
-			Type::Const { type_args, .. } => TypeFlags::HAS_PROJECTION
-				.union(TypeFlags::HAS_CONST)
+			Type::ConstRef { type_args, .. } => TypeFlags::HAS_PROJECTION
+				.union(TypeFlags::HAS_CONST_REF)
 				.union(self.flags_of_list(type_args))
 				.without(TypeFlags::HAS_UNPLACED),
 			Type::TypeParam { .. } => TypeFlags::HAS_PARAM,
@@ -1016,9 +1021,9 @@ impl TypeInterner {
 		}
 	}
 
-	/// Whether a literal's type is anywhere in `ty`.
-	pub(super) fn has_literal(&self, ty: TypeIndex) -> bool {
-		self.flags[usize::from(ty)].contains(TypeFlags::HAS_LITERAL)
+	/// Whether a const kind is anywhere in `ty`.
+	pub(super) fn has_const_kind(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_CONST_KIND)
 	}
 
 	/// Whether `ty` is a slice or an array, `[T]` or `[T; N]`: as an
@@ -1038,7 +1043,7 @@ impl TypeInterner {
 	/// literal is given a type, and unplaced data a memory, a tuple's
 	/// included.
 	pub(super) fn needs_context(&self, ty: TypeIndex) -> bool {
-		self.has_literal(ty) || self.has_unplaced(ty)
+		self.has_const_kind(ty) || self.has_unplaced(ty)
 	}
 
 	/// Whether `ty`'s head is a parameter or a projection: the types with
@@ -1079,8 +1084,8 @@ impl TypeInterner {
 
 	/// Whether something in `ty` is a constant named, not evaluated: without
 	/// one, no value changes it.
-	pub(super) fn has_const(&self, ty: TypeIndex) -> bool {
-		self.flags[usize::from(ty)].contains(TypeFlags::HAS_CONST)
+	pub(super) fn has_const_ref(&self, ty: TypeIndex) -> bool {
+		self.flags[usize::from(ty)].contains(TypeFlags::HAS_CONST_REF)
 	}
 
 	/// The type both `a` and `b` describe, where `Infer` is a part not known
@@ -1138,17 +1143,17 @@ impl TypeInterner {
 				Some(self.intern_function(func_index, &type_args))
 			}
 			(
-				Type::Const {
+				Type::ConstRef {
 					constant,
 					type_args: a,
 				},
-				Type::Const {
+				Type::ConstRef {
 					constant: other,
 					type_args: b,
 				},
 			) if constant == other => {
 				let type_args = self.meet_lists(a, b)?;
-				Some(self.intern_const(constant, &type_args))
+				Some(self.intern_const_ref(constant, &type_args))
 			}
 			(
 				Type::TypedFuncref { param, result },
@@ -1235,7 +1240,7 @@ impl TypeInterner {
 		declared: TypeIndex,
 		actual: TypeIndex,
 	) {
-		if self.has_literal(actual) {
+		if self.has_const_kind(actual) {
 			return;
 		}
 		match (*self.resolve(declared), *self.resolve(actual)) {
@@ -1282,11 +1287,11 @@ impl TypeInterner {
 				self.learn_lists(envs, env, slots, declared, actual)
 			}
 			(
-				Type::Const {
+				Type::ConstRef {
 					constant,
 					type_args: declared,
 				},
-				Type::Const {
+				Type::ConstRef {
 					constant: other,
 					type_args: actual,
 				},
@@ -1434,11 +1439,11 @@ impl TypeInterner {
 				Some(type_args) => self.intern_function(func_index, &type_args),
 				None => ty,
 			},
-			Type::Const {
+			Type::ConstRef {
 				constant,
 				type_args,
 			} => match self.substitute_list(type_args, substitution) {
-				Some(type_args) => self.intern_const(constant, &type_args),
+				Some(type_args) => self.intern_const_ref(constant, &type_args),
 				None => ty,
 			},
 			Type::TypedFuncref { param, result } => {
@@ -1509,9 +1514,9 @@ impl TypeInterner {
 			Type::Error
 			| Type::Infer
 			| Type::Never
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
 			| Type::U8
 			| Type::I8
 			| Type::U16
@@ -1941,8 +1946,9 @@ impl IntrinsicDefs {
 			(self.f32, TypeIndex::F32),
 			(self.f64, TypeIndex::F64),
 			(self.funcref, TypeIndex::FUNCREF),
-			(self.integer_kind, TypeIndex::INTEGER_LITERAL),
-			(self.char_kind, TypeIndex::CHAR_LITERAL),
+			(self.integer_kind, TypeIndex::CONST_INT),
+			(self.float_kind, TypeIndex::CONST_FLOAT),
+			(self.char_kind, TypeIndex::CONST_CHAR),
 		]
 		.into_iter()
 		.find_map(|(slot, ty)| (slot == Some(idx)).then_some(ty))
@@ -2389,8 +2395,8 @@ mod tests {
 			Type::Error,
 			Type::Infer,
 			Type::Never,
-			Type::IntegerLiteral,
-			Type::FloatLiteral,
+			Type::ConstInt,
+			Type::ConstFloat,
 			Type::U8,
 			Type::I8,
 			Type::U16,

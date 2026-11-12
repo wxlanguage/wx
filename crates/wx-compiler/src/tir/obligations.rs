@@ -126,7 +126,7 @@ pub(super) enum TypeObligation {
 	/// a constant's body therefore records it for after the values exist.
 	CheckConstantType {
 		frame: GenericEnvIdx,
-		/// The `Type::Const` the length names.
+		/// The `Type::ConstRef` the length names.
 		length: TypeIndex,
 		expected: TypeIndex,
 		reference: SourceSpan,
@@ -692,7 +692,7 @@ impl Semantics {
 		expected: TypeIndex,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		let Type::Const {
+		let Type::ConstRef {
 			constant,
 			type_args,
 		} = *self.types.resolve(length)
@@ -737,7 +737,7 @@ impl Semantics {
 		}
 		// An untyped integer constant is a count: its value is representable as
 		// the length's type, as a literal length's does.
-		if found == TypeIndex::INTEGER_LITERAL {
+		if found == TypeIndex::CONST_INT {
 			let Ok(value) = self.exact_value(strings, constant) else {
 				return Ok(());
 			};

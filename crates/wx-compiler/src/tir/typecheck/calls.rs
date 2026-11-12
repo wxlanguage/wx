@@ -24,11 +24,11 @@ use crate::ast::{self, Separated, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::decls::{
-	AssocTypeIdx, BindingKey, Declarations, FieldIdx, FunctionIdx, MemberKind,
-	MemberOwner, StructIdx,
+	AssocTypeIdx, BindingKey, DeclKind, Declarations, FieldIdx, FunctionIdx,
+	MemberKind, MemberOwner, StructIdx,
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::resolutions::{AccessKind, Reference, Site};
+use crate::tir::resolutions::{AccessKind, Definition, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
@@ -174,6 +174,63 @@ impl CallTarget {
 			.skip(from)
 			.find(|(_, param)| param.is_some_and(|param| param.inner == name))
 			.map(|(at, _)| ParamIdx::new(at as u32))
+	}
+}
+
+impl Semantics {
+	/// The names a call by name of `callee` can give, with what each names,
+	/// in its parameters' order after the first `given` (a method call's
+	/// receiver, which its object gives and no name can), as the checker
+	/// matches them (`CallTarget::param_names`): a function's, or for a trait
+	/// impl's function its trait declaration's, or a struct's fields. Nothing
+	/// for a target with an unnamed parameter, which is called by position
+	/// only, or for a callee that is no function or struct.
+	pub fn argument_names(
+		&self,
+		callee: Definition,
+		given: usize,
+	) -> Vec<(SymbolU32, Definition)> {
+		let target = match callee {
+			Definition::Item(loc) => match self.declaration_kind(loc) {
+				DeclKind::Function(function) => {
+					CallTarget::function(self, function)
+				}
+				DeclKind::Struct(struct_index) => {
+					CallTarget::struct_constructor(self, struct_index)
+				}
+				_ => return Vec::new(),
+			},
+			Definition::Member(
+				MemberKind::Function(function) | MemberKind::Method(function),
+			) => CallTarget::function(self, function),
+			_ => return Vec::new(),
+		};
+		let names = target.param_names(&self.decls);
+		if names.iter().any(Option::is_none) {
+			return Vec::new();
+		}
+		names
+			.iter()
+			.enumerate()
+			.skip(given)
+			.filter_map(|(at, name)| {
+				let definition = match target.names {
+					CallTargetKind::Function(function) => {
+						Definition::Parameter {
+							function,
+							parameter: ParamIdx::new(at as u32),
+						}
+					}
+					CallTargetKind::StructConstructor(owner) => {
+						Definition::Field {
+							owner,
+							field: FieldIdx::new(at as u32),
+						}
+					}
+				};
+				Some((name.as_ref()?.inner, definition))
+			})
+			.collect()
 	}
 }
 

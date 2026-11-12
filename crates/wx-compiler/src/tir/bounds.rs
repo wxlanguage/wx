@@ -1154,9 +1154,9 @@ pub(super) fn known_distinct(
 		(
 			Type::Error
 			| Type::Infer
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
 			| Type::TypeParam { .. }
 			| Type::TypeProjection { .. },
 			_,
@@ -1165,9 +1165,9 @@ pub(super) fn known_distinct(
 			_,
 			Type::Error
 			| Type::Infer
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
 			| Type::TypeParam { .. }
 			| Type::TypeProjection { .. },
 		) => false,

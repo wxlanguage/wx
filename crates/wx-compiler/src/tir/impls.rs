@@ -78,15 +78,15 @@ impl ImplTarget {
 			Type::Error
 			| Type::Infer
 			| Type::Never
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
 			| Type::Tuple { .. }
 			| Type::Pointer { .. }
 			| Type::TypeParam { .. }
 			| Type::TypeProjection { .. }
 			| Type::Value { .. }
-			| Type::Const { .. } => return None,
+			| Type::ConstRef { .. } => return None,
 		})
 	}
 }
@@ -774,12 +774,11 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		file_id: FileId,
 		namespace: Scope,
 		path: &ast::Path,
-		params: &[ast::TypeParam],
+		params: &[Spanned<ast::TypeParam>],
 	) -> Result<ImplTarget, ()> {
-		if params
-			.iter()
-			.any(|param| param.name().inner == path.segments[0].ident.inner)
-		{
+		if params.iter().any(|param| {
+			param.inner.name().inner == path.segments[0].ident.inner
+		}) {
 			self.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::InvalidImplTarget.code())

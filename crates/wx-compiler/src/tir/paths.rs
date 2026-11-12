@@ -145,7 +145,6 @@ pub(super) struct PathResolver<'r> {
 	resolutions: &'r mut NameResolutions,
 	strings: &'r StringInterner,
 	decls: &'r Declarations,
-	core_root: Namespace,
 }
 
 impl<'r> PathResolver<'r> {
@@ -160,7 +159,6 @@ impl<'r> PathResolver<'r> {
 			resolutions,
 			strings,
 			decls,
-			core_root: Namespace::Package(decls.core_package),
 		}
 	}
 
@@ -195,23 +193,21 @@ impl<'r> PathResolver<'r> {
 			let seg_tier = if is_last { tier } else { Tier::Type };
 			let key = BindingKey::new(seg_tier, segment.ident.inner);
 
-			// The core-prelude fallback only ever applies to the first
-			// segment, and only once nothing binds it directly.
-			let mut outcome = self.decls.namespaces.lookup(
-				&self.decls.use_items,
-				accessor,
-				base,
-				key,
-			);
-			if index == 0 && matches!(outcome, BindingLookup::NotFound) {
-				base = self.core_root;
-				outcome = self.decls.namespaces.lookup(
+			// The first segment is unqualified: its scope, then the core
+			// prelude. Every later one is looked up only in `base`.
+			let outcome = if index == 0 {
+				let (found_in, outcome) =
+					self.decls.lookup_unqualified(accessor, key);
+				base = found_in;
+				outcome
+			} else {
+				self.decls.namespaces.lookup(
 					&self.decls.use_items,
 					accessor,
 					base,
 					key,
-				);
-			}
+				)
+			};
 
 			match &outcome {
 				BindingLookup::Found {
@@ -394,13 +390,17 @@ impl<'r> PathResolver<'r> {
 				}
 			}
 			BindingLookup::NotFound => {
-				self.diagnostics.push(report_not_found(
-					self.strings,
-					file_id,
-					span,
-					seg_tier,
-					segments[stopped_at as usize].ident.inner,
-				));
+				// No name is written (`a::` unfinished): the parser
+				// reported it.
+				if !segments[stopped_at as usize].is_missing() {
+					self.diagnostics.push(report_not_found(
+						self.strings,
+						file_id,
+						span,
+						seg_tier,
+						segments[stopped_at as usize].ident.inner,
+					));
+				}
 				BindingTarget::Error
 			}
 			BindingLookup::Ambiguous(candidates) => {

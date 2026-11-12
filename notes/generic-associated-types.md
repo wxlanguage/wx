@@ -50,14 +50,14 @@ What carries over from rustc:
 ## Decisions
 
 1. **Representation: flat arguments.** `TypeProjection { assoc_type_index,
-   args }` with `args = [base, own…]`, as `Type::Const`'s `[Self]` and
+   args }` with `args = [base, own…]`, as `Type::ConstRef`'s `[Self]` and
    `Function`'s `[Self, own…]`, and rustc's `AliasTy`. Measured: `Type` is
    16 bytes today; an `args: TypeList` beside `base` makes it 24 (20 without
    `trait_index`), for every interned type and hash key; the flat form
    keeps 16. Costs: `base` is `list(args)[0]`, a projection without
    arguments stores a one-element list (deduplicated by content), and the
    trait comes from the declaration (`AssocTypeDef` gains its trait).
-   `Type::Const` takes the same layout for generic constants.
+   `Type::ConstRef` takes the same layout for generic constants.
 2. **A frame per GAT** (`TypeEnvOwner::AssocType`). On the trait's
    declaration its parent is the trait's `Self` frame, so its flat slots
    are `[Self, own…]`, exactly the projection's `args`: reading the declared
@@ -78,7 +78,7 @@ What carries over from rustc:
    explicit arguments, as in Rust and GHC (without its injectivity
    annotations). `match_pattern`'s projection arm compares every argument.
    `_` in a GAT's arguments is refused. `learn` does learn through
-   `Type::Const`'s `type_args`; harmless while no rigid constant can equal
+   `Type::ConstRef`'s `type_args`; harmless while no rigid constant can equal
    another, but the same question, to decide once for both.
 5. **Equality bindings refused.** `Metadata<S> = (S, S)` needs a binder,
    which Rust does not have for types either. `Metadata<u32> = u32` is

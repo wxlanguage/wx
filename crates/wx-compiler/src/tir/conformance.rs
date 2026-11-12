@@ -361,7 +361,7 @@ impl Semantics {
 		let read = match *failure {
 			UnsatisfiedClause::Representable {
 				subject, constant, ..
-			} => Some(self.types.intern_const(constant, &[subject])),
+			} => Some(self.types.intern_const_ref(constant, &[subject])),
 			_ => None,
 		};
 		let formatter = self.type_formatter(strings);
@@ -748,11 +748,11 @@ impl Semantics {
 					},
 				) if a == b => lists(a_args, b_args, TypePathStep::TypeArgument),
 				(
-					&Type::Const {
+					&Type::ConstRef {
 						constant: a,
 						type_args: a_args,
 					},
-					&Type::Const {
+					&Type::ConstRef {
 						constant: b,
 						type_args: b_args,
 					},

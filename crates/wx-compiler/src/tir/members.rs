@@ -439,6 +439,8 @@ impl Semantics {
 					.push(self.cycle_diagnostic(strings, &cycle, reference));
 			}
 			MemberLookup::Stuck(_) => {}
+			// No name is written (`T::` unfinished): the parser reported it.
+			MemberLookup::NotFound if segment.is_missing() => {}
 			// A projection's declared bounds are only half of what it can
 			// have: its value may be a type that does. That takes impls, so
 			// the declaration check decides what to say.

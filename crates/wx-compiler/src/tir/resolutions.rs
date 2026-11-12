@@ -31,12 +31,13 @@ use std::collections::BTreeMap;
 use super::body::{BodyOwner, LabelIdx, LocalIdx, ParamIdx};
 use super::decls::Declared;
 use super::decls::{
-	BindingKey, ConstIdx, DeclKind, FieldIdx, FunctionIdx, GlobalIdx,
-	InherentImplIdx, ItemLoc, MemberKind, PackageMemberItem, StructIdx, Tier,
-	TraitImplIdx, UseItemIndex,
+	BindingKey, BindingLookup, ConstIdx, DeclKind, FieldIdx, FunctionIdx,
+	GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, NameUse, Namespace,
+	PackageMemberItem, Scope, StructIdx, Tier, TraitImplIdx, UseItemIndex,
 };
 use super::signatures::Semantics;
-use super::types::{GenericEnvIdx, GenericEnvOwner};
+use super::types::{GenericEnvIdx, GenericEnvOwner, ImplKind};
+use crate::ast::Keyword;
 use crate::diagnostics::{SourceSpan, TextSpan};
 use crate::vfs::FileId;
 use string_interner::symbol::SymbolU32;
@@ -691,6 +692,293 @@ impl Semantics {
 		Some(SourceSpan::new(self.decls.file_id(decl.loc), name.span))
 	}
 
+	/// The body `declaration` owns: a function's block, a constant's or a
+	/// global's initializer (an enum variant's value is a constant's).
+	pub fn body_of(&self, declaration: Definition) -> Option<BodyOwner> {
+		let Definition::Item(loc) = declaration else {
+			return None;
+		};
+		let owner = match self.declaration_kind(loc) {
+			DeclKind::Function(index) => BodyOwner::Function(index),
+			DeclKind::Const(index) | DeclKind::EnumVariant(index) => {
+				BodyOwner::Const(index)
+			}
+			DeclKind::Global(index) => BodyOwner::Global(index),
+			_ => return None,
+		};
+		self.owner_body(owner).is_some().then_some(owner)
+	}
+
+	/// Every impl, by the span of its target's path (`ast::Path::span`, what
+	/// `Self` there names), the one span an impl keeps; a generated impl (a
+	/// function's `Call`) by its generator's. Nothing is kept: a caller that
+	/// finds impls by where they are written (the language server) indexes
+	/// them itself.
+	pub fn impls(&self) -> impl Iterator<Item = (SourceSpan, Definition)> + '_ {
+		let inherent = (0..self.inherent_impls.len()).map(|index| {
+			Definition::InherentImplTarget(InherentImplIdx::new(index as u32))
+		});
+		let traits = (0..self.trait_impls.len()).map(|index| {
+			Definition::TraitImplTarget(TraitImplIdx::new(index as u32))
+		});
+		inherent.chain(traits).filter_map(|definition| {
+			Some((self.definition_span(definition)?, definition))
+		})
+	}
+
+	/// Every name a bare identifier written at `offset` in `owner`'s body
+	/// can mean, used as `used_as` says, with what it would refer to there:
+	/// what an unqualified lookup of that name finds, so nothing it would
+	/// reject (a name that is out of reach, private, ambiguous, or hidden by
+	/// a nearer one) is listed, and only what can be written there
+	/// (`NameUse::admits`). As a value, the locals the name can use; as a
+	/// type, the type parameters in scope; then the items of the body's
+	/// scope and the core prelude a nearer name does not hide.
+	pub fn names_at(
+		&self,
+		owner: BodyOwner,
+		offset: u32,
+		used_as: NameUse,
+	) -> Vec<(SymbolU32, Definition)> {
+		let Some(body) = self.owner_body(owner) else {
+			return Vec::new();
+		};
+		let scope = self.owner_scope(owner);
+		let mut found = Vec::new();
+		// A value is looked up among the locals first.
+		if used_as == NameUse::Value {
+			found.extend(body.locals_at(offset).into_iter().map(|local| {
+				(
+					body.local(local).name.inner,
+					Definition::Local { owner, local },
+				)
+			}));
+		}
+		self.scope_names(
+			scope.namespace,
+			scope.generic_env,
+			used_as,
+			|name| body.local_named_at(offset, name).is_some(),
+			&mut found,
+		);
+		found
+	}
+
+	/// Every name a bare identifier written in the signature of `owner` can
+	/// mean, used as `used_as` says, as `names_at` lists them in a body,
+	/// which a signature has none of the locals of. `owner` is an item, or an impl by its
+	/// target (`InherentImplTarget`, `TraitImplTarget`); an associated
+	/// type's signature is read in its trait's or impl's scope.
+	pub fn names_in_signature(
+		&self,
+		owner: Definition,
+		used_as: NameUse,
+	) -> Vec<(SymbolU32, Definition)> {
+		let Some((namespace, env)) = self.signature_scope(owner) else {
+			return Vec::new();
+		};
+		let mut found = Vec::new();
+		self.scope_names(namespace, env, used_as, |_| false, &mut found);
+		found
+	}
+
+	/// Where `owner`'s signature is read: the scope its declaration is
+	/// written in, and its generic env, which holds its own type parameters
+	/// and those of its trait or impl (see `names_in_signature`).
+	fn signature_scope(
+		&self,
+		owner: Definition,
+	) -> Option<(Scope, GenericEnvIdx)> {
+		match owner {
+			Definition::Item(loc) => {
+				let env = match self.declaration_kind(loc) {
+					DeclKind::Function(index) => {
+						self.functions[usize::from(index)].type_params
+					}
+					DeclKind::Struct(index) => {
+						self.structs[usize::from(index)].type_params
+					}
+					DeclKind::TypeAlias(index) => {
+						self.type_aliases[usize::from(index)].type_params
+					}
+					DeclKind::Trait(index) => {
+						self.traits[usize::from(index)].env
+					}
+					DeclKind::Const(index) | DeclKind::EnumVariant(index) => {
+						self.constants[usize::from(index)].env
+					}
+					// Declares no type parameters.
+					_ => GenericEnvIdx::ROOT,
+				};
+				Some((self.decls.scope(loc), env))
+			}
+			Definition::InherentImplTarget(index) => Some((
+				self.decls.inherent_impls[usize::from(index)].namespace,
+				self.inherent_impls[usize::from(index)]
+					.as_ref()?
+					.type_params,
+			)),
+			Definition::TraitImplTarget(index) => Some((
+				self.decls.trait_impls[usize::from(index)].namespace,
+				self.trait_impls[usize::from(index)].as_ref()?.type_params,
+			)),
+			_ => None,
+		}
+	}
+
+	/// What a bare name used as `used_as` can mean in `namespace` with the
+	/// type parameters of `env`, after the locals a body lists itself: as a
+	/// type, the parameters along `env`'s chain (each kept when no nearer one
+	/// of its name hides it), then the items of `namespace` and of the core
+	/// prelude an unqualified lookup finds (`lookup_unqualified`), accessible
+	/// from `namespace`, that can be written there and that no parameter, or
+	/// local (`is_local`), of their name takes first. A trait, in a bound or
+	/// an impl, is looked up among the items alone, so no parameter is one
+	/// or hides one.
+	fn scope_names(
+		&self,
+		namespace: Scope,
+		env: GenericEnvIdx,
+		used_as: NameUse,
+		is_local: impl Fn(SymbolU32) -> bool,
+		found: &mut Vec<(SymbolU32, Definition)>,
+	) {
+		if used_as == NameUse::Type {
+			let envs = std::iter::successors(Some(env), |&env| {
+				self.generic_envs.parent(env)
+			});
+			for frame in envs {
+				for (index, name) in
+					self.generic_envs.param_names(frame).iter().enumerate()
+				{
+					let index = index as u32;
+					if self.generic_envs.resolve(env, name.inner)
+						== Some((frame, index))
+					{
+						found.push((
+							name.inner,
+							Definition::TypeParam { env: frame, index },
+						));
+					}
+				}
+			}
+			// An impl's implicit `Self` is its target, rather than a type
+			// parameter. A written parameter/refinement takes precedence,
+			// just as it does in `resolve_type_path`.
+			let self_name = Keyword::SelfPascal.symbol();
+			if self.generic_envs.resolve(env, self_name).is_none()
+				&& let Some((kind, _)) = self.resolve_impl_self(env)
+			{
+				let definition = match kind {
+					ImplKind::Inherent(index) => {
+						Definition::InherentImplTarget(index)
+					}
+					ImplKind::Trait(index) => {
+						Definition::TraitImplTarget(index)
+					}
+				};
+				found.push((self_name, definition));
+			}
+		}
+		let hidden = |name: SymbolU32| match used_as {
+			NameUse::Value => is_local(name),
+			NameUse::Type => self.generic_envs.resolve(env, name).is_some(),
+			NameUse::Bound | NameUse::Trait => false,
+		};
+		let tier = used_as.tier();
+		let roots = [
+			Namespace::from(namespace),
+			Namespace::Package(self.decls.core_package),
+		];
+		for name in self.candidates(&roots, tier) {
+			if hidden(name) {
+				continue;
+			}
+			let key = BindingKey::new(tier, name);
+			let (base, lookup) = self.decls.lookup_unqualified(namespace, key);
+			if let BindingLookup::Found {
+				target, visibility, ..
+			} = lookup && let Some(loc) = target.loc()
+				&& used_as.admits(self.declaration_kind(loc))
+				&& self
+					.decls
+					.namespaces
+					.is_accessible_from(namespace, base, visibility)
+			{
+				found.push((name, Definition::Item(loc)));
+			}
+		}
+	}
+
+	/// Every name a path written in `declaration` (its signature or its
+	/// body; see `names_in_signature` for what it may be) can continue with,
+	/// used as `used_as` says, after a prefix that means `prefix`, with what
+	/// it would refer to: what the walk's lookup of the next segment finds in
+	/// the namespace `prefix` enters (`Namespaces::lookup`), accessible from
+	/// where the path is written, that can be written there. Empty when
+	/// `prefix` enters no namespace: what follows a type is one of its
+	/// members, which the member search finds.
+	pub fn names_in(
+		&self,
+		declaration: Definition,
+		prefix: ItemLoc,
+		used_as: NameUse,
+	) -> Vec<(SymbolU32, Definition)> {
+		let tier = used_as.tier();
+		let Some((accessor, _)) = self.signature_scope(declaration) else {
+			return Vec::new();
+		};
+		let namespaces = &self.decls.namespaces;
+		let Some(base) = namespaces.entered_by(prefix) else {
+			return Vec::new();
+		};
+		let mut found = Vec::new();
+		for name in self.candidates(&[base], tier) {
+			let key = BindingKey::new(tier, name);
+			if let BindingLookup::Found {
+				target, visibility, ..
+			} = namespaces.lookup(&self.decls.use_items, accessor, base, key)
+				&& let Some(loc) = target.loc()
+				&& used_as.admits(self.declaration_kind(loc))
+				&& namespaces.is_accessible_from(accessor, base, visibility)
+			{
+				found.push((name, Definition::Item(loc)));
+			}
+		}
+		found
+	}
+
+	/// Every name of `tier` a lookup in `roots` might find, each once: their
+	/// own bindings and those their globs reach. A superset: the callers
+	/// keep what the lookup itself finds.
+	fn candidates(&self, roots: &[Namespace], tier: Tier) -> Vec<SymbolU32> {
+		let namespaces = &self.decls.namespaces;
+		let mut pending = roots.to_vec();
+		let mut visited = Vec::new();
+		let mut names = Vec::new();
+		while let Some(namespace) = pending.pop() {
+			if visited.contains(&namespace) {
+				continue;
+			}
+			visited.push(namespace);
+			for key in namespaces.symbols(namespace).bindings.keys() {
+				if key.tier == tier && !names.contains(&key.symbol) {
+					names.push(key.symbol);
+				}
+			}
+			if let Some(scope) = namespace.as_scope() {
+				pending.extend(
+					namespaces
+						.scope(scope)
+						.glob_imports
+						.iter()
+						.map(|glob| glob.namespace),
+				);
+			}
+		}
+		names
+	}
+
 	/// The checked body of `owner`, if it has one.
 	pub fn owner_body(&self, owner: BodyOwner) -> Option<&super::body::Body> {
 		match owner {
@@ -762,6 +1050,7 @@ mod tests {
 
 	use super::*;
 	use crate::ast::{self, Spanned, StringInterner};
+	use crate::diagnostics::DiagnosticCode;
 	use crate::diagnostics::{Diagnostics, TextSpan};
 	use crate::tir::body::Local;
 	use crate::tir::decls::{BindingKey, DeclKind, Scope};
@@ -859,6 +1148,30 @@ mod tests {
 				label: self.label(context, name),
 				value: self.at(context, name, Tier::Value)?,
 			})
+		}
+
+		/// What `names_at` lists at the comment `// {mark}`, as `name` for an
+		/// item, `name (local)` and `name (param)` for the others.
+		fn names(&self, mark: &str, used_as: NameUse) -> Vec<String> {
+			let offset =
+				self.source.find(&format!("// {mark}")).unwrap() as u32;
+			// Every test writes its mark in `f`.
+			let f = Definition::Item(self.declaration("f", Tier::Value));
+			let owner = self.sema.body_of(f).unwrap();
+			self.sema
+				.names_at(owner, offset, used_as)
+				.into_iter()
+				.map(|(name, definition)| {
+					let name = self.strings.resolve(name).unwrap();
+					match definition {
+						Definition::Local { .. } => format!("{name} (local)"),
+						Definition::TypeParam { .. } => {
+							format!("{name} (param)")
+						}
+						_ => name.to_string(),
+					}
+				})
+				.collect()
 		}
 
 		fn span(&self, context: &str, name: &str) -> TextSpan {
@@ -2401,7 +2714,7 @@ mod tests {
 		// Primitives and literal kinds are bodiless; `Char` is a struct core
 		// writes.
 		assert!(a.sema.is_compiler_provided(ty("u32")));
-		assert!(a.sema.is_compiler_provided(ty("integer")));
+		assert!(a.sema.is_compiler_provided(ty("const_int")));
 		assert!(!a.sema.is_compiler_provided(ty("Char")));
 		// `Slice::len` is a bodiless trait function lowering expands.
 		let len = a.sema.decls.intrinsics.slice_len.unwrap();
@@ -2474,5 +2787,345 @@ mod tests {
 		// A shorthand argument is a label and the value it supplies: the
 		// value is what the name means where it is used.
 		assert!(matches!(at("short"), Reference::Local { .. }));
+	}
+
+	// ── Names in scope (`Semantics::names_at`) ──────────────────────────
+
+	fn listed(names: &[String], name: &str) -> usize {
+		names.iter().filter(|listed| *listed == name).count()
+	}
+
+	#[test]
+	fn a_value_position_lists_locals_then_the_items_a_lookup_finds() {
+		let analysis = Analysis::new(indoc! {"
+			mod helpers {
+			    pub func shared() {}
+			}
+			use helpers::*;
+			const LIMIT: u32 = 3;
+			func f(a: u32) {
+			    local b: u32 = a;
+			    // here
+			}
+		"});
+		let names = analysis.names("here", NameUse::Value);
+		assert_eq!(names[..2], ["b (local)", "a (local)"]);
+		for item in ["LIMIT", "f", "shared", "True", "transmute"] {
+			assert_eq!(listed(&names, item), 1, "`{item}` in {names:?}");
+		}
+		// A module is a type-tier name.
+		assert_eq!(listed(&names, "helpers"), 0);
+	}
+
+	#[test]
+	fn a_local_hides_an_item_of_its_name() {
+		let analysis = Analysis::new(indoc! {"
+			const x: u32 = 1;
+			func f(x: u32) {
+			    // here
+			}
+		"});
+		let names = analysis.names("here", NameUse::Value);
+		assert_eq!(listed(&names, "x (local)"), 1);
+		assert_eq!(listed(&names, "x"), 0);
+	}
+
+	/// In a literal an outer local cannot be used, but it still takes its
+	/// name there (E2140), so the item of that name is not offered either.
+	#[test]
+	fn in_static_data_an_outer_local_is_neither_usable_nor_an_item() {
+		let analysis = Analysis::new(indoc! {"
+			memory heap: u32;
+			const x: u32 = 5;
+			const y: u32 = 6;
+			func f(x: u32) -> heap::&[u32] {
+			    [
+			        // here
+			        1,
+			    ]
+			}
+		"});
+		let names = analysis.names("here", NameUse::Value);
+		assert_eq!(listed(&names, "x (local)"), 0);
+		assert_eq!(listed(&names, "x"), 0);
+		assert_eq!(listed(&names, "y"), 1);
+	}
+
+	#[test]
+	fn a_type_position_lists_parameters_then_type_items() {
+		let analysis = Analysis::new(indoc! {"
+			struct Point(x: u32);
+			struct T();
+			func f<T>(t: T) {
+			    // here
+			}
+		"});
+		let names = analysis.names("here", NameUse::Type);
+		assert_eq!(names[0], "T (param)");
+		// The parameter hides the struct of its name.
+		assert_eq!(listed(&names, "T"), 0);
+		for item in ["Point", "u32", "Ordering", "Bool"] {
+			assert_eq!(listed(&names, item), 1, "`{item}` in {names:?}");
+		}
+		assert_eq!(listed(&names, "t (local)"), 0);
+		// A function is a type too: its own item type (`local g: f = f;`).
+		assert_eq!(listed(&names, "f"), 1);
+	}
+
+	/// A type position offers what `resolve_type_path` takes, and the
+	/// namespaces a path goes on into; a bound what
+	/// `resolve_trait_bound_path` takes, a trait or a typeset, and the same
+	/// namespaces, with no parameter (a bound never reads them).
+	#[test]
+	fn a_type_and_a_bound_list_what_each_takes() {
+		let analysis = Analysis::new(indoc! {"
+			trait Show {}
+			typeset Small { u8, u16 }
+			mod shapes {}
+			struct Point(x: u32);
+			func f<T>(t: T) {
+			    // here
+			}
+		"});
+		let types = analysis.names("here", NameUse::Type);
+		for name in ["T (param)", "Point", "u32", "f", "shapes"] {
+			assert_eq!(listed(&types, name), 1, "`{name}` in {types:?}");
+		}
+		for name in ["Show", "Small", "Add", "PointerSize"] {
+			assert_eq!(listed(&types, name), 0, "`{name}` in {types:?}");
+		}
+		let bounds = analysis.names("here", NameUse::Bound);
+		for name in ["Show", "Small", "Add", "PointerSize", "shapes"] {
+			assert_eq!(listed(&bounds, name), 1, "`{name}` in {bounds:?}");
+		}
+		for name in ["T (param)", "T", "Point", "u32", "f"] {
+			assert_eq!(listed(&bounds, name), 0, "`{name}` in {bounds:?}");
+		}
+	}
+
+	/// `NameUse::takes` is what the checker takes: a type position reports
+	/// all but a type (`NotAType`), a bound all but a trait or a typeset, and
+	/// an impl all but a trait (both `NotATraitBound`).
+	#[test]
+	fn each_use_takes_what_the_checker_takes() {
+		const DECLARATIONS: &str = "
+			mod m {}
+			struct S();
+			enum E(u8) { A = 0 }
+			type Alias = u32;
+			memory heap: u32;
+			func g() {}
+			global G: u32 = 0;
+			trait Tr {}
+			typeset Ts { u8 }
+		";
+		for name in [
+			"m", "package", "S", "E", "Alias", "heap", "g", "G", "Tr", "Ts",
+		] {
+			for (used_as, written, code) in [
+				(
+					NameUse::Type,
+					format!("func as_type(x: {name}) {{}}"),
+					DiagnosticCode::NotAType,
+				),
+				(
+					NameUse::Bound,
+					format!("func as_bound<X: {name}>() {{}}"),
+					DiagnosticCode::NotATraitBound,
+				),
+				(
+					NameUse::Trait,
+					format!("impl {name} for S {{}}"),
+					DiagnosticCode::NotATraitBound,
+				),
+			] {
+				let source = format!("{DECLARATIONS}\n{written}\n");
+				let analysis = Analysis::new(&source);
+				let kind = analysis
+					.sema
+					.declaration_kind(analysis.declaration(name, Tier::Type));
+				let reported =
+					(analysis.sema.diagnostics().iter()).any(|diagnostic| {
+						diagnostic.code.as_deref() == Some(code.code())
+					});
+				assert_eq!(
+					reported,
+					!used_as.takes(kind),
+					"`{name}` in `{written}`"
+				);
+			}
+		}
+	}
+
+	/// What `names_in` lists in `tier` after the prefix written as `name`
+	/// in `context`, in the function `f`, as the server asks: the prefix's
+	/// meaning from `symbol_at`.
+	fn names_after(
+		analysis: &Analysis,
+		context: &str,
+		name: &str,
+		used_as: NameUse,
+	) -> Vec<String> {
+		let span = analysis.span(context, name);
+		let (_, reference) =
+			analysis.sema.symbol_at(analysis.file, span.start).unwrap();
+		let Definition::Item(prefix) = reference.definition() else {
+			panic!("`{name}` is not an item");
+		};
+		// The function the path is written in.
+		let declaration =
+			Definition::Item(analysis.declaration("f", Tier::Value));
+		let mut names: Vec<_> = analysis
+			.sema
+			.names_in(declaration, prefix, used_as)
+			.into_iter()
+			.map(|(name, _)| {
+				analysis.strings.resolve(name).unwrap().to_string()
+			})
+			.collect();
+		names.sort();
+		names
+	}
+
+	#[test]
+	fn after_a_prefix_its_namespace_lists_what_the_walk_finds() {
+		let analysis = Analysis::new(indoc! {"
+			mod shapes {
+			    pub struct Square(pub side: u32);
+			    pub func area() -> u32 { 1 }
+			    func hidden() {}
+			    pub enum Kind(u8) { A = 0, B }
+			}
+			func f() {
+			    shapes::area();
+			    shapes::Kind::A;
+			}
+		"});
+		let prefix = "shapes::area";
+		assert_eq!(
+			names_after(&analysis, prefix, "shapes", NameUse::Value),
+			["Square", "area"],
+			"`hidden` is private to `shapes`"
+		);
+		// A constructor is a value only where every field is accessible.
+		let private_field = Analysis::new(indoc! {"
+			mod shapes { pub struct Square(side: u32); pub func area() {} }
+			func f() { shapes::area(); }
+		"});
+		assert_eq!(
+			names_after(
+				&private_field,
+				"shapes::area",
+				"shapes",
+				NameUse::Value
+			),
+			["area"]
+		);
+		assert_eq!(
+			names_after(&analysis, prefix, "shapes", NameUse::Type),
+			["Kind", "Square", "area", "package", "self", "super"],
+			"a module's path keywords are bindings of its own"
+		);
+		assert_eq!(
+			names_after(&analysis, "Kind::A", "Kind", NameUse::Value),
+			["A", "B"]
+		);
+		// As a bound, a module's traits and its path keywords.
+		let traits = Analysis::new(indoc! {"
+			mod shapes { pub trait Show {} pub struct Square(); }
+			func f() { shapes::Square(); }
+		"});
+		assert_eq!(
+			names_after(&traits, "shapes::Square", "shapes", NameUse::Bound),
+			["Show", "package", "self", "super"]
+		);
+	}
+
+	#[test]
+	fn after_a_type_nothing_is_listed() {
+		let analysis = Analysis::new(indoc! {"
+			struct P();
+			impl P { pub func new() -> P { P() } }
+			func f() { P::new(); }
+		"});
+		assert!(
+			names_after(&analysis, "P::new", "P", NameUse::Value).is_empty()
+		);
+	}
+
+	/// What `names_in_signature` lists for `owner`, as `name` for an item
+	/// and `name (param)` for a type parameter.
+	fn signature_names(
+		analysis: &Analysis,
+		owner: Definition,
+		used_as: NameUse,
+	) -> Vec<String> {
+		analysis
+			.sema
+			.names_in_signature(owner, used_as)
+			.into_iter()
+			.map(|(name, definition)| {
+				let name = analysis.strings.resolve(name).unwrap();
+				match definition {
+					Definition::TypeParam { .. } => format!("{name} (param)"),
+					_ => name.to_string(),
+				}
+			})
+			.collect()
+	}
+
+	#[test]
+	fn a_signature_lists_its_parameters_and_its_impls_then_items() {
+		let analysis = Analysis::new(indoc! {"
+			struct Wrap<T>(value: T);
+			trait Show { func show<U>(self: Self, u: U) -> u32; }
+			impl<T> Show for Wrap<T> {
+			    func show<U>(self: Self, u: U) -> u32 { 0 }
+			}
+			func free<A>(a: A) {}
+		"});
+		// The free function, found as the server finds it: by its name.
+		let free = analysis
+			.sema
+			.definitions()
+			.get(&SourceSpan::new(
+				analysis.file,
+				analysis.span("func free", "free"),
+			))
+			.copied()
+			.unwrap();
+		let names = signature_names(&analysis, free, NameUse::Type);
+		assert_eq!(names[0], "A (param)");
+		assert!(names.iter().any(|name| name == "Wrap"), "{names:?}");
+		assert!(names.iter().any(|name| name == "u32"), "{names:?}");
+		// The impl's method: its own parameter, then the impl's.
+		let show = analysis
+			.sema
+			.definitions()
+			.get(&SourceSpan::new(
+				analysis.file,
+				analysis.span("    func show", "show"),
+			))
+			.copied()
+			.unwrap();
+		let names = signature_names(&analysis, show, NameUse::Type);
+		assert_eq!(names[..2], ["U (param)", "T (param)"]);
+		// The impl's header, by its target as written.
+		let target = SourceSpan::new(
+			analysis.file,
+			analysis.span("for Wrap<T>", "Wrap"),
+		);
+		let (_, header) = analysis
+			.sema
+			.impls()
+			.find(|&(span, _)| span == target)
+			.unwrap();
+		let names = signature_names(&analysis, header, NameUse::Type);
+		assert_eq!(names[0], "T (param)");
+		assert!(!names.iter().any(|name| name == "U (param)"));
+		// A signature has no locals: values are items only.
+		let names = signature_names(&analysis, free, NameUse::Value);
+		assert!(names.iter().any(|name| name == "free"), "{names:?}");
+		assert!(!names.iter().any(|name| name == "a"), "{names:?}");
 	}
 }

@@ -54,6 +54,7 @@ use super::members::{
 	ApplicableMember, ConstantTarget, MemberLookup, TraitMemberSelection,
 	TypeProjectionTarget, report_ambiguous_type_member,
 };
+use super::numbers::NumberStorage;
 use super::obligations::{BoundRequirements, TypeObligation};
 use super::operators::OperatorTraits;
 use super::paths::PathResolver;
@@ -272,19 +273,33 @@ impl Semantics {
 			unreachable!("a constant with obligations has a built body")
 		};
 		let mut body = std::mem::take(&mut self.bodies[usize::from(index)]);
-		let scope = self.const_scope(const_index);
+		let scope = self.owner_scope(BodyOwner::Const(const_index));
 		BodyContext::new(self, strings, &mut body, scope).decide(obligations);
 		self.bodies[usize::from(index)] = body;
 	}
 
-	/// Where a constant's initializer is written: a variant's in the root type
-	/// scope, an associated constant's in its impl's or trait's.
-	fn const_scope(&self, const_index: ConstIdx) -> LexicalScope {
-		let constant = &self.decls.constants[usize::from(const_index)];
-		let env = self.constants[usize::from(const_index)].env;
+	/// The scope `owner`'s body is written and checked in: the scope its
+	/// declaration is in, and its own type parameters (a function's, a
+	/// constant's: a variant's are the root's, an associated constant's its
+	/// impl's or trait's; a global has none).
+	pub(super) fn owner_scope(&self, owner: BodyOwner) -> LexicalScope {
+		let (loc, env) = match owner {
+			BodyOwner::Function(index) => (
+				self.decls.functions[usize::from(index)].loc,
+				self.functions[usize::from(index)].type_params,
+			),
+			BodyOwner::Const(index) => (
+				self.decls.constants[usize::from(index)].loc,
+				self.constants[usize::from(index)].env,
+			),
+			BodyOwner::Global(index) => (
+				self.decls.globals[usize::from(index)].loc,
+				GenericEnvIdx::ROOT,
+			),
+		};
 		LexicalScope {
-			file_id: self.decls.file_id(constant.loc),
-			namespace: self.decls.scope(constant.loc),
+			file_id: self.decls.file_id(loc),
+			namespace: self.decls.scope(loc),
 			generic_env: env,
 			assumption_env: self.assumption_envs.of_frame(env),
 		}
@@ -496,6 +511,8 @@ enum BoundSubject {
 /// built by `SemanticsBuilder` and stays live afterwards. See the module doc;
 /// there is no separate finished form.
 pub struct Semantics {
+	/// Exact numeric literals, owned independently of syntax and source files.
+	pub(super) numbers: NumberStorage,
 	pub(super) diagnostics: Vec<Diagnostic<FileId>>,
 	/// Every written name resolved so far; see `resolutions.rs`.
 	pub(super) resolutions: NameResolutions,
@@ -611,6 +628,7 @@ impl Semantics {
 			.map(|_| FunctionImplementation::Declaration)
 			.collect();
 		Self {
+			numbers: NumberStorage::default(),
 			diagnostics,
 			resolutions,
 			operators,
@@ -706,10 +724,12 @@ impl Semantics {
 		file_id: FileId,
 		owner: GenericEnvOwner,
 		parent: GenericEnvIdx,
-		params: &[ast::TypeParam],
+		params: &[Spanned<ast::TypeParam>],
 	) -> Option<TypeIndex> {
 		let mut subject = None;
-		for (index, param) in params.iter().enumerate() {
+		for (index, param) in
+			params.iter().map(|param| &param.inner).enumerate()
+		{
 			if !is_self_entry(param) {
 				continue;
 			}
@@ -1202,7 +1222,7 @@ impl Semantics {
 				TypeArgsNotAllowedOn::Declaration(DeclKind::Const(constant)),
 			));
 		}
-		self.types.intern_const(constant, &type_args)
+		self.types.intern_const_ref(constant, &type_args)
 	}
 
 	/// What a length names is not a constant: a `noun` called `name`.
@@ -1251,7 +1271,7 @@ impl Semantics {
 					reference: site,
 				});
 			}
-			Type::Const { .. } => {
+			Type::ConstRef { .. } => {
 				obligations.push(TypeObligation::CheckConstantType {
 					frame: scope.generic_env,
 					length,
@@ -1552,7 +1572,7 @@ fn report_missing_constant_type(
 				.with_message("expected `: Type` here"),
 		)
 		.with_note(
-			"an untyped constant names its literal kind: `const X: {integer} = 4;`",
+			"an untyped constant names its literal kind: `const X: const_int = 4;`",
 		)
 }
 
@@ -1763,16 +1783,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 					let ast::Item::Global { value, .. } = item else {
 						unreachable!("a global's entry is a global")
 					};
-					let scope = LexicalScope {
-						file_id: entry.file_id,
-						namespace: entry.namespace,
-						generic_env: GenericEnvIdx::ROOT,
-						assumption_env: sema
-							.assumption_envs
-							.of_frame(GenericEnvIdx::ROOT),
-					};
-					let ty = sema.global_value_type(global_index);
 					let owner = BodyOwner::Global(global_index);
+					let scope = sema.owner_scope(owner);
+					let ty = sema.global_value_type(global_index);
 					let reported = sema.diagnostics.len();
 					let (mut body, obligations) =
 						BodyBuilder::new(sema, self, scope, owner)
@@ -1804,16 +1817,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		else {
 			unreachable!("a function's entry is a function")
 		};
-		let scope = LexicalScope {
-			file_id: entry.file_id,
-			namespace: entry.namespace,
-			generic_env: sema.functions[usize::from(function_index)]
-				.type_params,
-			assumption_env: sema.assumption_envs.of_frame(
-				sema.functions[usize::from(function_index)].type_params,
-			),
-		};
 		let owner = BodyOwner::Function(function_index);
+		let scope = sema.owner_scope(owner);
 		let reported = sema.diagnostics.len();
 		let (mut body, obligations) = BodyBuilder::new(
 			sema, self, scope, owner,
@@ -1871,14 +1876,19 @@ impl<'ast> SemanticsBuilder<'ast> {
 		namespace: Scope,
 		owner: GenericEnvOwner,
 		parent: GenericEnvIdx,
-		params: &[ast::TypeParam],
+		params: &[Spanned<ast::TypeParam>],
 	) -> GenericEnvIdx {
 		let first_obligation = obligations.len();
 		// `Self` is never a parameter: written first in a trait's function it
 		// bounds the trait's `Self`, in a trait impl's the impl's target, and
 		// anywhere else it is reported.
 		let self_subject = sema.self_entry(file_id, owner, parent, params);
-		let declared = || params.iter().filter(|param| !is_self_entry(param));
+		let declared = || {
+			params
+				.iter()
+				.map(|param| &param.inner)
+				.filter(|param| !is_self_entry(param))
+		};
 		// An impl always owns a frame, even an empty one: it is where a `Self`
 		// written inside the impl finds the impl it means (`resolve_impl_self`).
 		let is_impl = matches!(
@@ -1912,7 +1922,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		);
 		// What the bounds are written on: the `Self` entry's subject, else
 		// each parameter, in order.
-		let self_entry = self_subject.map(|_| &params[0]);
+		let self_entry = self_subject.map(|_| &params[0].inner);
 		let written = || self_entry.into_iter().chain(declared());
 		// In a trait impl's function the entry is about the impl's target:
 		// a use proves its clauses as written, and the function assumes
@@ -2102,7 +2112,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				TypeObligation::NormalizeSelfEntry {
 					frame: generic_env,
 					clauses: BoundClauses::Final(entry),
-					reference: SourceSpan::new(file_id, params[0].name().span),
+					reference: SourceSpan::new(
+						file_id,
+						params[0].inner.name().span,
+					),
 				},
 			);
 		}
@@ -2471,43 +2484,32 @@ impl<'ast> SemanticsBuilder<'ast> {
 			generic_env: scope,
 			assumption_env: sema.assumption_envs.of_frame(scope),
 		};
-		let policy = InferPolicy::Reject(InferSignatureKind::Const);
 		let ty = match ty {
-			// An untyped constant, `const X: {integer} = 4`. A free one only,
-			// for now: an impl's or a trait's would need its representability
-			// stated in bounds.
-			Some(Spanned {
-				inner: ast::TypeExpression::Literal { inner },
-				span,
-			}) => {
-				let kind = self.resolve_literal_kind(
+			Some(type_expr) => {
+				let ty = self.resolve_constant_type(
 					sema,
 					obligations,
 					lexical,
-					inner,
-					policy,
+					type_expr,
 				);
-				if scope == GenericEnvIdx::ROOT || kind == TypeIndex::ERROR {
-					kind
-				} else {
+				if ty.is_const_kind() && scope != GenericEnvIdx::ROOT {
 					sema.diagnostics.push(
 						Diagnostic::bug()
 							.with_code(
 								DiagnosticCode::UnsupportedExpression.code(),
 							)
 							.with_message(
-								"an untyped constant in an impl is not \
-								 supported by the checker yet",
+								"an untyped constant in an impl is not supported by the checker yet",
 							)
 							.with_label(
-								SourceSpan::new(file_id, *span).primary_label(),
+								SourceSpan::new(file_id, type_expr.span)
+									.primary_label(),
 							),
 					);
 					TypeIndex::ERROR
+				} else {
+					ty
 				}
-			}
-			Some(ty) => {
-				self.resolve_type(sema, obligations, lexical, ty, policy)
 			}
 			None => {
 				sema.diagnostics
@@ -2532,7 +2534,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		));
 		let query = SignatureQuery::Const(const_index);
 		let entry = &self.entries[self.query_state[&query].ast_index as usize];
-		let scope = sema.const_scope(const_index);
+		let scope = sema.owner_scope(BodyOwner::Const(const_index));
 		let value = match entry.node {
 			AstNodeRef::Constant { item, .. } => match item {
 				ast::Item::Const { value, .. } => value,
@@ -2902,26 +2904,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 					generic_env: self_scope,
 					assumption_env: sema.assumption_envs.of_frame(self_scope),
 				};
-				let policy = InferPolicy::Reject(InferSignatureKind::Const);
-				// An untyped constant, `const LEN: {integer}`: each use gives
-				// it a type, as a free one's does.
-				let resolved_ty = match &ty.inner {
-					ast::TypeExpression::Literal { inner } => self
-						.resolve_literal_kind(
-							sema,
-							obligations,
-							lexical,
-							inner,
-							policy,
-						),
-					_ => self.resolve_type(
-						sema,
-						obligations,
-						lexical,
-						ty,
-						policy,
-					),
-				};
+				// A literal kind leaves this constant untyped; each use gives it a type.
+				let resolved_ty =
+					self.resolve_constant_type(sema, obligations, lexical, ty);
 
 				sema.constants[usize::from(const_index)] = ConstantSignature {
 					ty: resolved_ty,
@@ -3872,7 +3857,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 	}
 
 	/// An array's length, as written: a count, which is a `Value`, a constant
-	/// named by a path (`Type::Const`), or `Infer` for `_`. It has no type
+	/// named by a path (`Type::ConstRef`), or `Infer` for `_`. It has no type
 	/// until a pointer holds the array (`length_representable`).
 	fn array_length(
 		&mut self,
@@ -4090,7 +4075,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 			return TypeIndex::ERROR;
 		};
-		sema.types.intern_const(constant, &[])
+		sema.types.intern_const_ref(constant, &[])
 	}
 
 	pub(super) fn resolve_type(
@@ -4764,38 +4749,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 					segments,
 					infer_policy,
 				);
-				if !ty.is_literal() {
+				if !ty.is_const_kind() {
 					return ty;
 				}
-				let name = sema.type_formatter(&self.strings).display_type(ty);
-				sema.diagnostics.push(
-					Diagnostic::error()
-						.with_code(
-							DiagnosticCode::LiteralKindWithoutBraces.code(),
-						)
-						.with_message(format!(
-							"`{}` is a literal kind, written `{name}`",
-							&name[1..name.len() - 1]
-						))
-						.with_label(
-							SourceSpan::new(scope.file_id, type_expr.span)
-								.primary_label()
-								.with_message(format!("write `{name}`")),
-						),
-				);
-				TypeIndex::ERROR
-			}
-			ast::TypeExpression::Literal { inner } => {
-				if self.resolve_literal_kind(
-					sema,
-					obligations,
-					scope,
-					inner,
-					infer_policy,
-				) == TypeIndex::ERROR
-				{
-					return TypeIndex::ERROR;
-				}
+
 				sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::MisplacedLiteralKind.code())
@@ -4810,7 +4767,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								),
 						)
 						.with_note(
-							"a literal kind types an untyped constant: `const X: {integer} = 4;`",
+							"a literal kind types an untyped constant: `const X: const_int = 4;`",
 						),
 				);
 				TypeIndex::ERROR
@@ -5063,51 +5020,37 @@ impl<'ast> SemanticsBuilder<'ast> {
 		}
 	}
 
-	/// The literal kind `{inner}` names: `inner` resolves as any type, and
-	/// must be one of core's literal kinds (`integer`, `char`). `ERROR` when it
-	/// is not, which is reported.
-	fn resolve_literal_kind(
+	/// A constant may directly name a literal kind (`const_int`, `const_float`,
+	/// `const_char`).
+	/// Other annotations use ordinary type checking, which rejects literal
+	/// kinds nested in compound types. Lookup still respects shadowing.
+	fn resolve_constant_type(
 		&mut self,
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		inner: &Spanned<ast::TypeExpression>,
-		infer_policy: InferPolicy,
+		type_expr: &Spanned<ast::TypeExpression>,
 	) -> TypeIndex {
-		// A path is resolved directly: inside the braces a literal kind is
-		// what it should name.
-		let ty = match &inner.inner {
-			ast::TypeExpression::Path(segments) => self.resolve_type_path(
+		let policy = InferPolicy::Reject(InferSignatureKind::Const);
+		let ast::TypeExpression::Path(segments) = &type_expr.inner else {
+			return self.resolve_type(
 				sema,
 				obligations,
 				scope,
-				segments,
-				infer_policy,
-			),
-			_ => self.resolve_type_expression(
-				sema,
-				obligations,
-				scope,
-				inner,
-				infer_policy,
-			),
+				type_expr,
+				policy,
+			);
 		};
-		if ty == TypeIndex::ERROR || ty.is_literal() {
-			return ty;
+		let ty =
+			self.resolve_type_path(sema, obligations, scope, segments, policy);
+		if ty != TypeIndex::ERROR && !ty.is_const_kind() {
+			obligations.push(TypeObligation::CheckWellFormed {
+				frame: scope.generic_env,
+				ty,
+				reference: SourceSpan::new(scope.file_id, type_expr.span),
+			});
 		}
-		let found = sema.type_formatter(&self.strings).display_type(ty);
-		sema.diagnostics.push(
-			Diagnostic::error()
-				.with_code(DiagnosticCode::NotALiteralKind.code())
-				.with_message(format!("`{found}` is not a literal kind"))
-				.with_label(
-					SourceSpan::new(scope.file_id, inner.span)
-						.primary_label()
-						.with_message("expected a literal kind"),
-				)
-				.with_note("the literal kinds are `integer` and `char`"),
-		);
-		TypeIndex::ERROR
+		ty
 	}
 
 	/// The declaration a cycle diagnostic names for `query`, or `None` for an
@@ -5571,6 +5514,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		out: &mut Vec<BoundOccurrence<'expr>>,
 	) {
 		let (segments, bindings) = match &expr.inner {
+			// Not written yet: the parser reported it, and it states nothing.
+			ast::BoundExpression::Error => return,
 			ast::BoundExpression::BoundList(list) => {
 				for entry in list.iter() {
 					self.collect_bound_occurrences(
@@ -5600,7 +5545,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let span = SourceSpan::new(file_id, expr.span);
 		let id = sema.bounds.reserve(trait_index, span);
 		let mut occurrence_bindings = Vec::new();
-		for binding in bindings.iter() {
+		for binding in bindings.iter().map(|binding| &binding.inner) {
 			let key = match binding.kind {
 				ast::AssocBindingKind::ConstEquals { const_span, .. } => {
 					sema.diagnostics.push(
@@ -5714,7 +5659,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// the entry is kept as written.
 				let declared = sema.constants[usize::from(target.constant)].ty;
 				if matches!(status, SignatureStatus::Available(_))
-					&& !declared.is_literal()
+					&& !declared.is_const_kind()
 				{
 					let diagnostic = sema.report_typed_constant_bound(
 						&self.strings,
@@ -6172,7 +6117,17 @@ pub(super) mod tests {
 				let node = match body.kind(expr) {
 					ExprKind::Error => "error".to_string(),
 					ExprKind::Int(value) => value.to_string(),
-					ExprKind::Float(value) => format!("{value:?}"),
+					ExprKind::Float(value) => {
+						match case.sema.read_float_literal(
+							value,
+							crate::tir::literals::ConcreteType::Target(
+								body.ty(expr),
+							),
+						) {
+							Ok(value) => format!("{value:?}"),
+							_ => case.sema.numbers.decimal_text(value),
+						}
+					}
 					ExprKind::Char(value) => format!("{value:?}"),
 					ExprKind::Const {
 						constant: index, ..
@@ -6335,7 +6290,7 @@ pub(super) mod tests {
 			assert_eq!(shape(&case, "A"), "(+ 1:u8 (* 2:u8 3:u8):u8):u8");
 			assert_eq!(shape(&case, "B"), "(- 128:i8):i8");
 			assert_eq!(shape(&case, "C"), "1.5:f32");
-			assert_eq!(shape(&case, "D"), "2.0:f64");
+			assert_eq!(shape(&case, "D"), "2:f64");
 			assert_eq!(shape(&case, "E"), "'a':Char");
 			assert_eq!(shape(&case, "F"), "True:Bool");
 		}
@@ -18697,34 +18652,31 @@ pub(super) mod tests {
 			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
 	}
 
-	/// A literal kind is core's `integer` or `char`, named in braces: the
-	/// braces say a literal kind is meant, and a bare name is reported.
+	/// Literal kinds use ordinary paths, including qualified paths. The
+	/// resolved kind, rather than special syntax, leaves a constant untyped.
 	#[test]
-	fn a_literal_kind_is_written_in_braces() {
+	fn a_literal_kind_is_written_as_a_path() {
 		let case = TestCase::new(indoc! {"
-			const X: integer = 4;
-			const Y: {integer} = 4;
+			const X: const_int = 4;
+			const Y: core::const_int = X + 1;
+			const C: const_char = 'x';
+			const D: core::const_char = C;
+			trait HasLength { const LEN: const_int; }
+			const TYPED: u8 = Y;
 		"});
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::LiteralKindWithoutBraces]);
-		case.diagnostics().assert_error_saying(
-			"`integer` is a literal kind, written `{integer}`",
-		);
+		case.diagnostics().assert_none();
 	}
 
 	#[test]
-	fn only_a_literal_kind_goes_in_braces() {
+	fn a_literal_kind_name_can_be_shadowed_by_an_ordinary_type() {
 		let case = TestCase::new(indoc! {"
-			struct Point(x: i32);
-			const P: {Point} = 4;
-			const Q: {u32} = 4;
+			type const_int = u32;
+			type const_char = u8;
+			const X: const_int = 4;
+			const Y: const_char = 5;
+			func f(x: const_int) -> const_char { 1 }
 		"});
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::NotALiteralKind,
-			DiagnosticCode::NotALiteralKind,
-		]);
-		case.diagnostics()
-			.assert_error_saying("`Point` is not a literal kind");
+		case.diagnostics().assert_none();
 	}
 
 	/// No value of a literal kind exists at runtime, so it is only a
@@ -18732,9 +18684,9 @@ pub(super) mod tests {
 	#[test]
 	fn a_literal_kind_is_only_a_constants_type() {
 		let case = TestCase::new(indoc! {"
-			struct S(x: {integer});
-			type I = {char};
-			func f(x: {integer}) -> {integer} { x }
+			struct S(x: const_int);
+			type I = const_char;
+			func f(x: const_int) -> const_int { x }
 		"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::MisplacedLiteralKind,
@@ -18742,6 +18694,38 @@ pub(super) mod tests {
 			DiagnosticCode::MisplacedLiteralKind,
 			DiagnosticCode::MisplacedLiteralKind,
 		]);
+	}
+
+	#[test]
+	fn a_literal_kind_is_rejected_in_runtime_and_compound_annotations() {
+		for source in [
+			"func f() { local x: const_int = 4; }",
+			"global X: const_int = 4;",
+			"const X: [const_int; 2] = [1, 2];",
+			"const X: (u8, const_char) = (1, 'x');",
+			"type F = func() -> const_int;",
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::MisplacedLiteralKind]);
+		}
+	}
+
+	#[test]
+	fn untyped_impl_constants_remain_unsupported() {
+		for source in [
+			"struct S<T>(v: T); impl<T> S<T> { const X: const_int = 4; }",
+			"struct S(); impl S { const X: const_int = 4; } const Y: u8 = S::X;",
+		] {
+			// TestCase filters unsupported diagnostics; this restriction must
+			// be checked against the complete checker output instead.
+			let mut strings = Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			assert_graph_clean(&graph);
+			let sema = crate::tir::check(&graph, &mut strings);
+			DiagnosticView::new("check", sema.diagnostics(), &graph.files)
+				.assert_codes(&[DiagnosticCode::UnsupportedExpression]);
+		}
 	}
 
 	/// The synthetic impl is the only one: a function is not a path an impl

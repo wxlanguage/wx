@@ -6,6 +6,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 use super::bounds::{AssumptionEnvIdx, BindingRef, Readiness};
 use super::decls::{ConstIdx, TypesetIdx};
 use super::eval::ResolvedConstant;
+use super::numbers::{DecimalFloat, FloatRangeError};
 use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{GenericEnvOwner, Substitution, Type, TypeIndex};
@@ -339,10 +340,11 @@ pub(super) enum CharMiss {
 
 /// Why a concrete type does not hold a float literal.
 #[derive(Clone, Copy)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum FloatMiss {
 	/// It reads as infinity at the concrete type's width.
 	TooLarge,
-	/// It is nonzero in text but reads as zero at the concrete type's width.
+	/// It is nonzero but rounds to zero at the concrete type's width.
 	TooSmall,
 	/// It is no float type.
 	WrongKind,
@@ -386,35 +388,6 @@ impl ConcreteType {
 		}
 	}
 
-	/// A float literal written `text`, read at the concrete type's width.
-	/// `None` when the text is no float, which the parser has reported.
-	pub(super) fn read_float(
-		&self,
-		text: &str,
-	) -> Result<Option<f64>, FloatMiss> {
-		let Some(float) = Float::from_type(self.ty()) else {
-			return Err(FloatMiss::WrongKind);
-		};
-		let read = match float {
-			// f64::from is a lossless conversion
-			Float::F32 => text.parse::<f32>().map(f64::from),
-			Float::F64 => text.parse::<f64>(),
-		};
-		match read {
-			Ok(value) if value.is_infinite() => Err(FloatMiss::TooLarge),
-			Ok(value)
-				if value == 0.0
-					&& text
-						.bytes()
-						.any(|b| b.is_ascii_digit() && b != b'0') =>
-			{
-				Err(FloatMiss::TooSmall)
-			}
-			Ok(value) => Ok(Some(value)),
-			Err(_) => Ok(None),
-		}
-	}
-
 	/// Whether `op` means anything over a value of the concrete type.
 	pub(super) fn allows_unary(&self, op: UnaryOp) -> bool {
 		let ty = self.ty();
@@ -427,15 +400,12 @@ impl ConcreteType {
 			UnaryOp::Not => false,
 		}
 	}
-
-	pub(super) fn is_float(&self) -> bool {
-		Float::from_type(self.ty()).is_some()
-	}
 }
 
 /// What an untyped constant reads as.
 pub(super) enum UntypedValue {
 	Known(i128),
+	KnownFloat(DecimalFloat),
 	/// A trait's constant over a `Self` not known here: only a representability
 	/// clause says what it is representable as.
 	Abstract,
@@ -444,6 +414,23 @@ pub(super) enum UntypedValue {
 }
 
 impl Semantics {
+	/// Convert an exact decimal once, directly at the concrete target width.
+	pub(super) fn read_float_literal(
+		&self,
+		literal: DecimalFloat,
+		concrete: ConcreteType,
+	) -> Result<f64, FloatMiss> {
+		let read = match Float::from_type(concrete.ty()) {
+			Some(Float::F32) => self.numbers.to_f32(literal).map(f64::from),
+			Some(Float::F64) => self.numbers.to_f64(literal),
+			None => return Err(FloatMiss::WrongKind),
+		};
+		read.map_err(|miss| match miss {
+			FloatRangeError::TooLarge => FloatMiss::TooLarge,
+			FloatRangeError::TooSmall => FloatMiss::TooSmall,
+		})
+	}
+
 	/// The value of `constant` read with `args` (a trait constant's are
 	/// `[Self]`), in `env`.
 	pub(super) fn untyped_value(
@@ -479,6 +466,13 @@ impl Semantics {
 					}
 					_ => UntypedValue::Abstract,
 				}
+			}
+			ResolvedConstant::Instance(instance)
+				if self.constants[usize::from(instance.constant)].ty
+					== TypeIndex::CONST_FLOAT =>
+			{
+				self.float_value(strings, instance)
+					.map_or(UntypedValue::Failed, UntypedValue::KnownFloat)
 			}
 			ResolvedConstant::Instance(instance) => self
 				.exact_value(strings, instance.constant)
@@ -555,6 +549,19 @@ impl Semantics {
 			.is_some_and(|(low, high)| low <= value && value <= high)
 	}
 
+	pub(super) fn float_representable(
+		&self,
+		env: AssumptionEnvIdx,
+		ty: TypeIndex,
+		value: DecimalFloat,
+	) -> bool {
+		let concrete = self.concrete_types(env, ty);
+		!concrete.is_empty()
+			&& concrete
+				.iter()
+				.all(|&ty| self.read_float_literal(value, ty).is_ok())
+	}
+
 	/// Whether being representable as `assumed` implies being representable as
 	/// `target`.
 	fn representable_implies(
@@ -564,6 +571,19 @@ impl Semantics {
 		target: TypeIndex,
 	) -> bool {
 		if assumed == target {
+			return true;
+		}
+		let assumed_types = self.concrete_types(env, assumed);
+		let targets = self.concrete_types(env, target);
+		let fits_f32 = assumed_types.iter().any(|ty| ty.ty() == TypeIndex::F32);
+		let fits_f64 = fits_f32
+			|| assumed_types.iter().any(|ty| ty.ty() == TypeIndex::F64);
+		if fits_f64
+			&& !targets.is_empty()
+			&& targets.iter().all(|ty| {
+				ty.ty() == TypeIndex::F64
+					|| (fits_f32 && ty.ty() == TypeIndex::F32)
+			}) {
 			return true;
 		}
 		match (
@@ -722,7 +742,7 @@ impl Semantics {
 					)),
 			)
 			.with_note(
-				"only an untyped constant (`{integer}`, `{char}`) takes its type \
+				"only an untyped constant (`const_int`, `const_float`, `const_char`) takes its type \
 				 from where it is used",
 			)
 	}
@@ -739,7 +759,7 @@ impl Semantics {
 		value: Option<i128>,
 		source: Option<(BindingRef, GenericEnvOwner)>,
 	) -> Diagnostic<FileId> {
-		let read = self.types.intern_const(constant, &[subject]);
+		let read = self.types.intern_const_ref(constant, &[subject]);
 		let formatter = self.type_formatter(strings);
 		let (read, ty) =
 			(formatter.display_type(read), formatter.display_type(ty));

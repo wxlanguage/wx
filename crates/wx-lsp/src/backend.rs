@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp_server::jsonrpc::{Error as JsonRpcError, Result};
 use tower_lsp_server::ls_types::{
+	CompletionOptions, CompletionParams, CompletionResponse,
 	DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
 	DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
 	DidOpenTextDocumentParams, DocumentFormattingParams, FileSystemWatcher,
@@ -25,6 +26,7 @@ use wx_compiler::vfs::{AbsolutePath, CoreFileSource};
 
 use crate::actor::{Command, StateHandle};
 use crate::convert::uri_to_path;
+use crate::state::ClientConfig;
 
 #[derive(serde::Deserialize)]
 struct VirtualFileContentParams {
@@ -66,23 +68,29 @@ impl LanguageServer for Backend {
 		self.client
 			.log_message(MessageType::LOG, "initializing...")
 			.await;
-		let workspace_folders = params
-			.workspace_folders
-			.iter()
-			.flatten()
-			.filter_map(|folder| uri_to_path(&folder.uri))
-			.collect();
-		self.state
-			.notify(Command::SetWorkspaceFolders(workspace_folders));
-		self.state.notify(Command::SetSemanticTokensRefresh(
-			params
+		self.state.notify(Command::Initialize(ClientConfig {
+			workspace_folders: params
+				.workspace_folders
+				.iter()
+				.flatten()
+				.filter_map(|folder| uri_to_path(&folder.uri))
+				.collect(),
+			semantic_tokens_refresh: params
 				.capabilities
 				.workspace
 				.as_ref()
 				.and_then(|workspace| workspace.semantic_tokens.as_ref())
 				.and_then(|tokens| tokens.refresh_support)
 				.unwrap_or(false),
-		));
+			completion_snippets: params
+				.capabilities
+				.text_document
+				.as_ref()
+				.and_then(|document| document.completion.as_ref())
+				.and_then(|completion| completion.completion_item.as_ref())
+				.and_then(|item| item.snippet_support)
+				.unwrap_or(false),
+		}));
 		self.supports_dynamic_registration.store(
 			params
 				.capabilities
@@ -106,6 +114,7 @@ impl LanguageServer for Backend {
 					},
 				)),
 				hover_provider: Some(HoverProviderCapability::Simple(true)),
+				completion_provider: Some(CompletionOptions::default()),
 				definition_provider: Some(OneOf::Left(true)),
 				references_provider: Some(OneOf::Left(true)),
 				rename_provider: Some(OneOf::Right(RenameOptions {
@@ -249,6 +258,17 @@ impl LanguageServer for Backend {
 		Ok(self
 			.state
 			.query(|reply| Command::Hover(params, reply))
+			.await
+			.flatten())
+	}
+
+	async fn completion(
+		&self,
+		params: CompletionParams,
+	) -> Result<Option<CompletionResponse>> {
+		Ok(self
+			.state
+			.query(|reply| Command::Completion(params, reply))
 			.await
 			.flatten())
 	}

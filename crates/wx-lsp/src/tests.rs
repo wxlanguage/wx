@@ -21,8 +21,8 @@ use crate::projects::{ManifestState, ProjectState, discover_package_root};
 use crate::requests;
 use crate::snapshot::Snapshot;
 use crate::state::{
-	ServerState, analyze_root, compute_active_refresh, compute_refresh,
-	refresh_project_manifest,
+	ClientConfig, ServerState, analyze_root, compute_active_refresh,
+	compute_refresh, refresh_project_manifest,
 };
 use crate::{Backend, build_service};
 
@@ -288,7 +288,10 @@ fn refresh_from_a_child_path_discovers_the_root_and_republishes_its_diagnostics(
 	let child = workspace_root.join("app").join("math.wx");
 
 	let mut state = ServerState {
-		workspace_folders: vec![workspace_root],
+		client: ClientConfig {
+			workspace_folders: vec![workspace_root],
+			..Default::default()
+		},
 		..Default::default()
 	};
 	state.open_documents.insert(
@@ -2021,4 +2024,476 @@ fn rename_refuses_a_module_in_a_file_of_its_own() {
 	let refusal = renamed(&state, &uri, source, "geo::", 0, "shapes")
 		.expect_err("refused");
 	assert!(refusal.contains("file of its own"), "{refusal}");
+}
+
+// ── Completion ──────────────────────────────────────────────────────────
+
+/// The labels completion offers where `$0` is written in `source`, in the
+/// order they sort; `None` when it offers nothing there.
+fn completions(source: &str) -> Option<Vec<String>> {
+	let items = completion_items(source, false)?;
+	Some(items.into_iter().map(|item| item.label).collect())
+}
+
+/// The items offered at `$0`, sorted as the client shows them, by a server
+/// whose client takes snippets or not.
+fn completion_items(
+	source: &str,
+	snippets: bool,
+) -> Option<Vec<tower_lsp_server::ls_types::CompletionItem>> {
+	let offset = source.find("$0").expect("a `$0` marks the cursor");
+	let text = source.replacen("$0", "", 1);
+	let root = PathBuf::from("/test/main.wx");
+	let (mut state, _) = analyzed(&root, &text);
+	state.client.completion_snippets = snippets;
+	let uri = Uri::from_file_path(&root).unwrap();
+	let line = text[..offset].matches('\n').count();
+	let line_start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
+	let params = tower_lsp_server::ls_types::CompletionParams {
+		text_document_position: TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier { uri },
+			position: Position {
+				line: line as u32,
+				character: (offset - line_start) as u32,
+			},
+		},
+		work_done_progress_params: Default::default(),
+		partial_result_params: Default::default(),
+		context: None,
+	};
+	let Some(tower_lsp_server::ls_types::CompletionResponse::Array(mut items)) =
+		crate::completion::completion(&state, &params)
+	else {
+		return None;
+	};
+	if items.is_empty() {
+		return None;
+	}
+	items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+	Some(items)
+}
+
+/// Whether `labels` holds every one of `expected`, and none of `absent`.
+fn assert_offers(labels: &[String], expected: &[&str], absent: &[&str]) {
+	for name in expected {
+		assert!(
+			labels.iter().any(|l| l == name),
+			"`{name}` missing: {labels:?}"
+		);
+	}
+	for name in absent {
+		assert!(
+			!labels.iter().any(|l| l == name),
+			"`{name}` offered: {labels:?}"
+		);
+	}
+}
+
+const COMPLETION_ITEMS: &str = "struct Point(x: u32);\nfunc helper() {}\n";
+
+#[test]
+fn completion_of_a_value_offers_locals_first_then_items() {
+	let labels = completions(&format!(
+		"{COMPLETION_ITEMS}func f(count: u32) {{\n    local total = count;\n    to$0\n}}\n"
+	))
+	.expect("a name is being written");
+	assert_offers(&labels, &["total", "count", "helper", "Point"], &["u32"]);
+	assert_eq!(&labels[..2], ["count", "total"], "locals sort first");
+}
+
+#[test]
+fn completion_of_a_type_offers_types() {
+	let labels = completions(&format!(
+		"{COMPLETION_ITEMS}func f<T>(count: u32) {{\n    local p: P$0 = Point(1);\n}}\n"
+	))
+	.expect("a type is being written");
+	assert_offers(&labels, &["T", "Point", "u32"], &["count"]);
+}
+
+#[test]
+fn completion_where_nothing_is_written_yet() {
+	// A local's value, a local's type, a statement, an argument.
+	for (source, tier_name) in [
+		("func f() {\n    local a = $0\n}\n", "helper"),
+		("func f() {\n    local a: $0\n}\n", "u32"),
+		("func f() {\n    helper();\n    $0\n}\n", "helper"),
+		(
+			"func g(a: u32, b: u32) {}\nfunc f() {\n    g(1, $0)\n}\n",
+			"helper",
+		),
+	] {
+		let labels = completions(&format!("{COMPLETION_ITEMS}{source}"))
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(&labels, &[tier_name], &[]);
+	}
+}
+
+#[test]
+fn completion_at_the_end_of_a_constant_initializer() {
+	let labels = completions("const B: u32 = 1;\nconst A: u32 = B$0;\n")
+		.expect("an initializer is a body");
+	assert_offers(&labels, &["B", "A"], &[]);
+}
+
+#[test]
+fn completion_in_a_value_after_a_part_left_out() {
+	// An enum with no repr: its variant's value; a constant with no type.
+	for source in [
+		"const B: u32 = 1;\nenum E { A = B$0 }\n",
+		"const B: u32 = 1;\nglobal g = B$0;\n",
+	] {
+		let labels = completions(source)
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(&labels, &["B"], &[]);
+	}
+}
+
+#[test]
+fn completion_inside_a_keyword_blocks_braces() {
+	let labels = completions(&format!(
+		"{COMPLETION_ITEMS}func f() {{\n    block :done {{ $0 }};\n}}\n"
+	))
+	.expect("the room inside the braces");
+	assert_offers(&labels, &["helper"], &[]);
+}
+
+#[test]
+fn completion_offers_nothing_where_no_name_is_looked_up() {
+	for source in [
+		// A comment, a binding's own name, a literal, a member, a segment
+		// after a type.
+		"func f() {\n    // hel$0\n}\n",
+		"func f() {\n    local na$0me = 1;\n}\n",
+		"func f() {\n    local a: u32 = 12$0;\n}\n",
+		"func f(p: Point) {\n    p.x$0;\n}\n",
+		// After a type: its members, which are not completed yet.
+		"func f() {\n    Point::$0\n}\n",
+		// A parameter's own name, and its type's later segment.
+		"func f(cou$0nt: u32) {}\n",
+		"func f(p: Point::$0) {}\n",
+		// A use and an export.
+		"use hel$0per;\n",
+		// Right after a call's arguments.
+		"func f() {\n    helper()$0;\n}\n",
+		// A keyword block's keyword and label, before its braces.
+		"func f() {\n    blo$0ck { 1 };\n}\n",
+		"func f() {\n    block :do$0ne { 1 };\n}\n",
+	] {
+		assert_eq!(
+			completions(&format!("{COMPLETION_ITEMS}{source}")),
+			None,
+			"{source:?}"
+		);
+	}
+}
+
+#[test]
+fn completion_after_a_module_offers_what_it_makes_visible() {
+	let source = "mod shapes {\n    pub func area() -> u32 { 1 }\n    func hidden() {}\n}\nfunc f() {\n    shapes::$0\n}\n";
+	let labels = completions(source).expect("a segment after a module");
+	assert_offers(&labels, &["area"], &["hidden", "f"]);
+	// A segment being written continues the same path.
+	let typed = completions(&source.replace("::$0", "::ar$0")).unwrap();
+	assert_offers(&typed, &["area"], &["hidden"]);
+}
+
+#[test]
+fn completion_after_an_enum_offers_its_variants() {
+	let labels = completions(
+		"enum Kind(u8) { A = 0, B }\nfunc f(k: Kind) -> u8 {\n    match k {\n        Kind::$0 => 1,\n        _ => 2,\n    }\n}\n",
+	)
+	.expect("a pattern path after an enum");
+	assert_eq!(labels, ["A", "B"]);
+}
+
+#[test]
+fn completion_of_a_label_offers_the_ones_a_jump_can_name() {
+	let source = "func f() {\n    loop :outer {\n        block :inner {\n            break :$0\n        }\n    }\n}\n";
+	assert_eq!(completions(source).unwrap(), ["inner", "outer"]);
+	let continuing = source.replace("break :$0", "continue :$0");
+	assert_eq!(
+		completions(&continuing).unwrap(),
+		["outer"],
+		"a `continue` restarts only a loop"
+	);
+}
+
+#[test]
+fn completion_in_a_signature_offers_its_parameters_and_types() {
+	for (source, expected, absent) in [
+		// A parameter's type: the function's own parameters.
+		(
+			"func f<T>(p: Po$0) {}\n",
+			&["T", "Point", "u32"][..],
+			&["p"][..],
+		),
+		// A parameter's type not written yet, and a field's.
+		(
+			"func f(x: u32, y: $0) -> u32 {}\n",
+			&["Point", "u32"],
+			&["x"],
+		),
+		("func f(x: u32, y:$0) -> u32 {}\n", &["Point", "u32"], &[]),
+		("struct Pair(a: u32, b: $0);\n", &["Point", "u32"], &[]),
+		// A result, a field, a bound.
+		("func f<T>() -> T$0 {}\n", &["T"], &[]),
+		("struct Pair<A>(left: A$0);\n", &["A", "Point"], &[]),
+		(
+			"trait Show {}\nfunc f<T: Sh$0>() {}\n",
+			&["Show"],
+			&["T", "Point"],
+		),
+		// A bound not written yet, as a supertrait.
+		(
+			"trait Show {}\ntrait X: $0 {}\n",
+			&["Show", "Add"],
+			&["Point", "u32"],
+		),
+		// A trait's member: its own parameters; its associated type's
+		// bound, in the trait's scope.
+		(
+			"trait Tr {\n    func m<U>(self: Self, u: U$0);\n}\n",
+			&["U"],
+			&[],
+		),
+		(
+			"trait Show {}\ntrait Tr {\n    type Item: Sh$0;\n}\n",
+			&["Show"],
+			&[],
+		),
+		// What has no bounds: a typeset's members, an associated type's
+		// default.
+		("typeset Small { u8, u1$0 }\n", &["u16"], &[]),
+		(
+			"trait Show {}\ntrait Tr {\n    type Item = u3$0;\n}\n",
+			&["Self", "Point", "u32"],
+			&["Show", "Tr"],
+		),
+		// An impl: its header, its members' signatures and associated types,
+		// with the impl's parameters.
+		(
+			"struct W<T>(v: T);\ntrait Tr { type Item; }\nimpl<T> Tr for W<T$0> {\n    type Item = T;\n}\n",
+			&["T", "W"],
+			&[],
+		),
+		(
+			"struct W<T>(v: T);\ntrait Tr { type Item; }\nimpl<T> Tr for W<T> {\n    type Item = T$0;\n}\n",
+			&["T"],
+			&[],
+		),
+		(
+			"struct W<T>(v: T);\nimpl<T> W<T> {\n    func get<U>(self: Self, u: U$0) {}\n}\n",
+			&["U", "T"],
+			&[],
+		),
+	] {
+		let labels = completions(&format!("{COMPLETION_ITEMS}{source}"))
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert!(
+			expected.iter().all(|name| labels.iter().any(|l| l == name))
+				&& absent.iter().all(|name| labels.iter().all(|l| l != name)),
+			"wrong completions in {source:?}: {labels:?}"
+		);
+	}
+}
+
+#[test]
+fn completion_lists_the_renamed_literal_kinds() {
+	let labels = completions("const N: con$0 = 42;\n")
+		.expect("a constant annotation offers literal kinds");
+	assert_offers(
+		&labels,
+		&["const_int", "const_float", "const_char"],
+		&["integer", "char"],
+	);
+}
+
+#[test]
+fn completion_in_a_missing_function_result_offers_types() {
+	for (source, parameters) in [
+		("pub func f<T>(x: T) -> $0 {}", &["T"][..]),
+		("func f()->$0{}", &[][..]),
+		("func f() -> $0 { 1 }", &[][..]),
+		(
+			"struct W<T>(v: T); impl<T> W<T> { pub func to_f64(self: Self) -> $0 { 1 } }",
+			&["Self", "T"][..],
+		),
+		(
+			"trait Tr: StackValue { func f(self: Self) -> f64; } impl Tr for Point { func f(self: Self) -> $0 { 1 } }",
+			&["Self"][..],
+		),
+		("trait Tr { func f(self: Self) -> $0; }", &["Self"][..]),
+		(
+			"trait Tr { func f(self: Self) -> $0 { self } }",
+			&["Self"][..],
+		),
+	] {
+		let labels = completions(&format!(
+			"{COMPLETION_ITEMS}trait Show {{}}\n{source}\n"
+		))
+		.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(&labels, &["Point", "u32", "f64"], &["x", "Show"]);
+		assert_offers(&labels, parameters, &[]);
+	}
+}
+
+#[test]
+fn completion_distinguishes_bounds_from_impl_traits() {
+	const ITEMS: &str = "trait Show {}\ntypeset Small { u8, u16 }\nstruct Point();\nfunc helper() {}\n";
+	for source in [
+		"func f<T: Sh$0>() {}",
+		"func f<T: $0>() {}",
+		"func f<T:$0>() {}",
+		"trait X: Sh$0 {}",
+		"trait X: $0 {}",
+		"trait X:$0 {}",
+		"trait X { type Item: $0; }",
+		"trait X { type Item: $0 = u8; }",
+		"typeset X: $0 { u8 }",
+		"func f<T: Show where { Item: $0 }>() {}",
+		"func f<T>() { <T as Sh$0>::x; }",
+	] {
+		let labels = completions(&format!("{ITEMS}{source}\n"))
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(
+			&labels,
+			&["Show", "Small", "Add", "PointerSize", "core"],
+			&["Self", "T", "Point", "u32", "helper"],
+		);
+	}
+	let labels = completions(&format!("{ITEMS}impl Sh$0 for Point {{}}\n"))
+		.expect("an impl names a declared trait");
+	assert_offers(
+		&labels,
+		&["Show", "Add", "core"],
+		&["Small", "PointerSize", "Self", "Point", "u32", "helper"],
+	);
+	// The same distinction applies to the final segment after a namespace.
+	const MODULE: &str = "mod names { pub trait Show {} pub typeset Small { u8 } pub struct Other(); pub func helper() {} }\nstruct Point();\n";
+	for (source, bound) in [
+		("func f<T: names::Sh$0>() {}", true),
+		("trait X: names::Sh$0 {}", true),
+		("impl names::Sh$0 for Point {}", false),
+	] {
+		let labels = completions(&format!("{MODULE}{source}\n"))
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(&labels, &["Show"], &["Other", "helper"]);
+		assert_eq!(
+			labels.iter().any(|name| name == "Small"),
+			bound,
+			"{source:?}"
+		);
+	}
+}
+
+const NAMED_CALLS: &str = "\
+func g(alpha: u32, beta: u32) {}
+struct W();
+trait Tr { func m(self: Self, count: u32); }
+impl Tr for W { func m(self: Self, _: u32) {} }
+impl W { func own(self: Self, first: u32) {} }
+func h(u32) {}
+";
+
+#[test]
+fn completion_of_a_named_argument_offers_the_callees_names() {
+	for (source, expected, absent) in [
+		// The room in the braces, and a name being written (a shorthand).
+		("g({ $0 })", &["alpha", "beta"][..], &["helper"][..]),
+		("g({ al$0 })", &["alpha", "beta"], &[]),
+		// A name written already is reported if written again.
+		("g({ alpha: 1, $0 })", &["beta"], &["alpha"]),
+		// A struct's fields.
+		("Point({ $0 })", &["x"], &[]),
+		// A method's receiver: named through its type, given by the object.
+		("W::own({ $0 })", &["self", "first"], &[]),
+		("W().own({ $0 })", &["first"], &["self"]),
+		// A trait impl's function is named as its trait declares it, even
+		// where the impl leaves the parameter unnamed.
+		("W().m({ $0 })", &["count"], &["self"]),
+	] {
+		let labels = completions(&format!(
+			"{COMPLETION_ITEMS}{NAMED_CALLS}func f() {{\n    {source};\n}}\n"
+		))
+		.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(&labels, expected, absent);
+	}
+}
+
+#[test]
+fn completion_after_a_named_arguments_colon_offers_values() {
+	let labels = completions(&format!(
+		"{COMPLETION_ITEMS}{NAMED_CALLS}func f(n: u32) {{\n    g({{ alpha: $0 }});\n}}\n"
+	))
+	.expect("a value not written yet");
+	assert_offers(&labels, &["n", "helper"], &["alpha", "beta"]);
+}
+
+#[test]
+fn completion_offers_no_argument_names_the_checker_would_refuse() {
+	for source in [
+		// An unnamed parameter makes a call positional only (E2123).
+		"func f() {\n    h({ $0 });\n}\n",
+		// After the list.
+		"func f() {\n    g({ alpha: 1, beta: 2 })$0;\n}\n",
+		// Braces not closed yet.
+		"func f() {\n    g({ $0",
+	] {
+		assert_eq!(
+			completions(&format!("{COMPLETION_ITEMS}{NAMED_CALLS}{source}")),
+			None,
+			"{source:?}"
+		);
+	}
+}
+
+/// What each label inserts at `$0` for a client that takes snippets: the
+/// label itself when the item carries no text of its own.
+fn inserted(source: &str) -> Vec<(String, String)> {
+	let items = completion_items(&format!("{COMPLETION_ITEMS}{source}"), true)
+		.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+	(items.into_iter())
+		.map(|item| {
+			let text = item.insert_text.unwrap_or_else(|| item.label.clone());
+			(item.label, text)
+		})
+		.collect()
+}
+
+#[test]
+fn completion_inserts_a_call_of_a_function_or_a_constructor() {
+	let find = |source: &str, label: &str| {
+		inserted(source)
+			.into_iter()
+			.find(|(each, _)| each == label)
+			.unwrap_or_else(|| panic!("`{label}` missing in {source:?}"))
+			.1
+	};
+	let body = "func g(a: u32) {}\nfunc f(n: u32) {\n    $0\n}\n";
+	// A call's parameters to fill, none, and a constructor's fields.
+	assert_eq!(find(body, "g"), "g($1)");
+	assert_eq!(find(body, "helper"), "helper()");
+	assert_eq!(find(body, "Point"), "Point($1)");
+	// A local is its name.
+	assert_eq!(find(body, "n"), "n");
+	// Written as a type, a function is its name; a call written already
+	// keeps its arguments.
+	assert_eq!(find("func f(p: hel$0) {}\n", "helper"), "helper");
+	assert_eq!(find("func f() {\n    hel$0(1);\n}\n", "helper"), "helper");
+	// A client without snippets gets the name.
+	let items = completion_items(
+		&format!("{COMPLETION_ITEMS}func f() {{\n    $0\n}}\n"),
+		false,
+	)
+	.expect("names in a body");
+	assert!(items.iter().all(|item| item.insert_text.is_none()));
+}
+
+#[test]
+fn completion_after_a_module_in_a_signature() {
+	let labels = completions(
+		"mod shapes {\n    pub struct Square();\n    struct Hidden();\n}\nfunc f(s: shapes::$0) {}\n",
+	)
+	.expect("a segment after a module");
+	assert_offers(&labels, &["Square"], &["Hidden"]);
 }

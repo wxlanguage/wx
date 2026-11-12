@@ -10,7 +10,10 @@ use super::{BodyContext, StaticTarget, TypeEquality};
 use crate::diagnostics::DiagnosticCode;
 use crate::tir::body::{ExprIdx, ExprKind, ExprObligation, Obligations};
 use crate::tir::decls::ConstIdx;
-use crate::tir::literals::{CharMiss, ConcreteType, IntegerMiss, UntypedValue};
+use crate::tir::literals::{
+	CharMiss, ConcreteType, FloatMiss, IntegerMiss, UntypedValue,
+};
+use crate::tir::numbers::DecimalFloat;
 use crate::tir::solver::{NormalizationDepth, RewriteFlags};
 use crate::tir::types::{Type, TypeIndex};
 
@@ -60,9 +63,16 @@ impl BodyContext<'_> {
 	/// value would. A constant without a value reports itself.
 	fn decide_representable(&mut self, expr: ExprIdx, target: TypeIndex) {
 		// Without a value, a representability clause in scope said it is.
-		let Some((constant, Some(value))) = self.untyped_value(expr, target)
-		else {
+		let Some((constant, value)) = self.untyped_value(expr, target) else {
 			return;
+		};
+		let value = match value {
+			UntypedValue::Known(value) => value,
+			UntypedValue::KnownFloat(value) => {
+				self.decide_float_representable(expr, target, constant, value);
+				return;
+			}
+			UntypedValue::Abstract | UntypedValue::Failed => return,
 		};
 		let kind = self.sema.constants[usize::from(constant)].ty;
 		let name = self.sema.decls.name(constant).inner;
@@ -71,7 +81,7 @@ impl BodyContext<'_> {
 		for concrete in
 			self.sema.concrete_types(self.scope.assumption_env, target)
 		{
-			let held = if kind == TypeIndex::CHAR_LITERAL {
+			let held = if kind == TypeIndex::CONST_CHAR {
 				u32::try_from(value)
 					.map_err(|_| CharMiss::OutOfRange)
 					.and_then(|code_point| concrete.holds_char(code_point))
@@ -133,16 +143,79 @@ impl BodyContext<'_> {
 		}
 	}
 
+	fn decide_float_representable(
+		&mut self,
+		expr: ExprIdx,
+		target: TypeIndex,
+		constant: ConstIdx,
+		value: DecimalFloat,
+	) {
+		let name = self
+			.strings
+			.resolve(self.sema.decls.name(constant).inner)
+			.unwrap()
+			.to_owned();
+		let at = self.source_span(expr);
+		for concrete in
+			self.sema.concrete_types(self.scope.assumption_env, target)
+		{
+			let Err(miss) = self.sema.read_float_literal(value, concrete)
+			else {
+				continue;
+			};
+			let ty = self
+				.sema
+				.type_formatter(self.strings)
+				.display_type(concrete.ty());
+			let diagnostic = match miss {
+				FloatMiss::TooLarge | FloatMiss::TooSmall => {
+					let (code, description) = match miss {
+						FloatMiss::TooLarge => {
+							(DiagnosticCode::FloatLiteralOverflow, "large")
+						}
+						FloatMiss::TooSmall => {
+							(DiagnosticCode::FloatLiteralUnderflow, "small")
+						}
+						FloatMiss::WrongKind => unreachable!(),
+					};
+					Diagnostic::error()
+						.with_code(code.code())
+						.with_message(format!(
+							"constant `{name}` is too {description} to represent in `{ty}`"
+						))
+						.with_label(at.primary_label().with_message(format!(
+							"its value is `{}`",
+							self.sema.numbers.decimal_text(value)
+						)))
+				}
+				FloatMiss::WrongKind => match concrete {
+					ConcreteType::Target(_) => {
+						self.report_unable_to_coerce(expr, target)
+					}
+					ConcreteType::Member(typeset, member) => {
+						self.sema.report_typeset_member(
+							self.strings,
+							format_args!("constant `{name}`"),
+							typeset,
+							member,
+							at,
+						)
+					}
+				},
+			};
+			return self.reject(expr, diagnostic);
+		}
+	}
+
 	/// The constant an untyped `expr` names, and its value. `None` when it has
 	/// none here: it failed (reported where it is), or it is a trait's constant
 	/// over a type not known here and no representability clause in scope says
-	/// it is representable as `target` (reported); `Some` with no value when
-	/// one does.
+	/// it is representable as `target` (reported); `Abstract` when one does.
 	fn untyped_value(
 		&mut self,
 		expr: ExprIdx,
 		target: TypeIndex,
-	) -> Option<(ConstIdx, Option<i128>)> {
+	) -> Option<(ConstIdx, UntypedValue)> {
 		let (constant, args) = match self.body.kind(expr) {
 			ExprKind::Const { constant, .. } => (constant, Vec::new()),
 			ExprKind::AbstractConst {
@@ -157,7 +230,9 @@ impl BodyContext<'_> {
 			.untyped_value(self.strings, env, constant, &args)
 			.ok()?
 		{
-			UntypedValue::Known(value) => Some((constant, Some(value))),
+			value @ (UntypedValue::Known(_) | UntypedValue::KnownFloat(_)) => {
+				Some((constant, value))
+			}
 			UntypedValue::Failed => None,
 			UntypedValue::Abstract => {
 				let subject = self.normalized(args[0]);
@@ -172,7 +247,7 @@ impl BodyContext<'_> {
 					)
 					.ok()?
 				{
-					return Some((constant, None));
+					return Some((constant, UntypedValue::Abstract));
 				}
 				let diagnostic = self.sema.report_unrepresentable_constant(
 					self.strings,

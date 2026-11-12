@@ -155,6 +155,66 @@ impl Tier {
 	}
 }
 
+/// What a path's final name must denote in its context. `Type`, `Bound`
+/// and `Trait` all use the type tier, but accept different declarations:
+/// `resolve_type_path`, `resolve_trait_bound_path` and `resolve_trait`
+/// make those decisions in the checker.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum NameUse {
+	/// A value, for example a function called in an expression.
+	Value,
+	/// A type, for example a parameter's annotation or `type Item = X`.
+	Type,
+	/// A bound (`T: X`, `trait Y: X`) or `<T as X>`: a trait or typeset.
+	Bound,
+	/// The trait in `impl X for T`: a declared trait, never a typeset.
+	Trait,
+}
+
+impl NameUse {
+	/// The tier the name is looked up in.
+	pub fn tier(self) -> Tier {
+		match self {
+			NameUse::Value => Tier::Value,
+			NameUse::Type | NameUse::Bound | NameUse::Trait => Tier::Type,
+		}
+	}
+
+	/// Whether a declaration can end a path in this context. In the value
+	/// tier, every declaration found by lookup is a value.
+	pub(super) fn takes(self, kind: DeclKind) -> bool {
+		match (self, kind.type_role()) {
+			(NameUse::Value, _) => true,
+			(_, None) => false,
+			(NameUse::Type, Some(role)) => role == TypeRole::Type,
+			(NameUse::Bound, Some(role)) => {
+				matches!(role, TypeRole::Trait | TypeRole::TypeSet)
+			}
+			(NameUse::Trait, Some(role)) => role == TypeRole::Trait,
+		}
+	}
+
+	/// Whether completion may offer this declaration: it can end the path,
+	/// or it is a namespace the path can continue into (`shapes::Square`).
+	pub(super) fn admits(self, kind: DeclKind) -> bool {
+		self.takes(kind) || kind.type_role() == Some(TypeRole::Namespace)
+	}
+}
+
+/// A declaration's role in the type tier, independent of where it is used.
+/// `NameUse` determines which roles a context accepts. A typeset supplies
+/// a generated trait for bounds, but cannot be implemented directly. A
+/// namespace can only be a prefix of a path to a type, trait or typeset.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum TypeRole {
+	Type,
+	Trait,
+	TypeSet,
+	Namespace,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub(super) struct BindingKey {
@@ -921,9 +981,10 @@ pub struct IntrinsicDefs {
 	/// core's `Integer` typeset, whose members are the integer primitives.
 	/// Enum representations are checked against it.
 	pub integer: Option<TypesetIdx>,
-	/// The literal kinds `integer` and `char`, written `{integer}` and
-	/// `{char}`: the types of literals that have no type yet.
+	/// Literal kinds: the types of literals that have no concrete type yet,
+	/// also used to annotate untyped constants.
 	pub integer_kind: Option<TypeAliasIdx>,
+	pub float_kind: Option<TypeAliasIdx>,
 	pub char_kind: Option<TypeAliasIdx>,
 	pub add: Option<TraitIdx>,
 	pub sub: Option<TraitIdx>,
@@ -1010,6 +1071,7 @@ impl IntrinsicDefs {
 			self.f64,
 			self.funcref,
 			self.integer_kind,
+			self.float_kind,
 			self.char_kind,
 		]
 		.contains(&Some(alias))
@@ -1033,8 +1095,9 @@ impl IntrinsicDefs {
 			"f32" => &mut self.f32,
 			"f64" => &mut self.f64,
 			"funcref" => &mut self.funcref,
-			"integer" => &mut self.integer_kind,
-			"char" => &mut self.char_kind,
+			"const_int" => &mut self.integer_kind,
+			"const_float" => &mut self.float_kind,
+			"const_char" => &mut self.char_kind,
 			_ => return None,
 		})
 	}
@@ -1158,6 +1221,28 @@ pub enum DeclKind {
 }
 
 impl DeclKind {
+	/// What this declaration is in the type tier; `None` for one only the
+	/// value tier holds (a constant, a variant). A function and a global are
+	/// types of their own (their item types).
+	pub fn type_role(self) -> Option<TypeRole> {
+		match self {
+			DeclKind::Struct(_)
+			| DeclKind::Enum(_)
+			| DeclKind::TypeAlias(_)
+			| DeclKind::Memory(_)
+			| DeclKind::Function(_)
+			| DeclKind::Global(_)
+			| DeclKind::AssocType(_) => Some(TypeRole::Type),
+			DeclKind::Trait(_) => Some(TypeRole::Trait),
+			DeclKind::TypeSet(_) => Some(TypeRole::TypeSet),
+			DeclKind::Module(_)
+			| DeclKind::Package(_)
+			| DeclKind::PackageInstance(_)
+			| DeclKind::Import(_) => Some(TypeRole::Namespace),
+			DeclKind::EnumVariant(_) | DeclKind::Const(_) => None,
+		}
+	}
+
 	/// What kind of symbol this is, for diagnostics.
 	pub fn noun(self) -> &'static str {
 		match self {
@@ -2243,6 +2328,32 @@ impl Declarations {
 	/// written in one file.
 	pub fn file_id(&self, loc: ItemLoc) -> FileId {
 		self.namespaces.file_id(loc.namespace)
+	}
+
+	/// What an unqualified name `key` written in `accessor` binds: in the
+	/// scope itself (its declarations, `use`s and globs), else in the core
+	/// prelude, and never in an enclosing scope; with the namespace it was
+	/// found in, which an accessibility check is made against. The first
+	/// segment of every path, and nothing else, is looked up this way.
+	pub(super) fn lookup_unqualified(
+		&self,
+		accessor: Scope,
+		key: BindingKey,
+	) -> (Namespace, BindingLookup) {
+		let own = Namespace::from(accessor);
+		match self.namespaces.lookup(&self.use_items, accessor, own, key) {
+			BindingLookup::NotFound => {
+				let prelude = Namespace::Package(self.core_package);
+				let found = self.namespaces.lookup(
+					&self.use_items,
+					accessor,
+					prelude,
+					key,
+				);
+				(prelude, found)
+			}
+			found => (own, found),
+		}
 	}
 
 	/// The name `index`'s declaration is written with, from its row.

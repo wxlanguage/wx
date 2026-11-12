@@ -401,11 +401,11 @@ impl Semantics {
 		let piece = match *self.types.resolve(ty) {
 			Type::Error
 			| Type::Infer
-			| Type::IntegerLiteral
-			| Type::FloatLiteral
-			| Type::CharLiteral
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
 			| Type::Value { .. }
-			| Type::Const { .. } => return Err(SolverError::Poisoned),
+			| Type::ConstRef { .. } => return Err(SolverError::Poisoned),
 			Type::Never
 			| Type::Function { .. }
 			| Type::Memory { .. }

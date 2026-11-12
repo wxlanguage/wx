@@ -8,10 +8,10 @@ Linked changes:
 1. `[T]` and `[T; N]` become types of their own, a slice and an array: what a
    pointer points at, with no memory.
 2. A length is a count: it has no machine type until it meets a memory.
-3. A constant may be untyped, `const X: {integer} = 4;`, used like a literal.
+3. A constant may be untyped, `const X: const_int = 4;`, used like a literal.
 4. An abstract constant's representability is stated in a bound,
    `T: Array where { const LEN: u8 }`.
-5. Array and string literals are arrays (`[{integer}; 3]`, `[u8; 5]`),
+5. Array and string literals are arrays (`[const_int; 3]`, `[u8; 5]`),
    placed in a memory when coerced to a pointer; `{array}` and `{string}` go.
 6. `Sized`, a compiler-answered trait with untyped `SIZE` and `ALIGN`: a
    type's layout in linear memory. It replaces `size_of`/`align_of`, and
@@ -77,9 +77,9 @@ An array or string literal is data not yet in a memory, so it has an array
 type, and the literal pseudo-types `{array}` and `{string}` are gone:
 
 ```
-[1, 2, 3]          : [{integer}; 3]
-[0; 16]            : [{integer}; 16]
-[0; N]             : [{integer}; N]
+[1, 2, 3]          : [const_int; 3]
+[0; 16]            : [const_int; 16]
+[0; N]             : [const_int; N]
 [x; _]             : [T; _]          (the length is its context's)
 "hello"            : [u8; 5]
 ```
@@ -106,7 +106,7 @@ type, and the literal pseudo-types `{array}` and `{string}` are gone:
   where the expected type is known, never inside generic inference) is a
   possible later convenience.
 - `Type::StringLiteral` and `Type::ArrayLiteral` are deleted, and the
-  pre-interned slots after them (`FUNCREF`, `CHAR_LITERAL`) renumbered in
+  pre-interned slots after them (`FUNCREF`, `CONST_CHAR`) renumbered in
   the same edit: only the list and its constants must agree.
 - A constant may hold an array: `const GREETING: [u8; 5] = "hello";` is data
   in no memory, and each use places a copy of it as a literal is placed
@@ -120,7 +120,7 @@ type, and the literal pseudo-types `{array}` and `{string}` are gone:
 - Not done: an array of arrays placed in memory (`heap::&[[u8; 2]; 2]`)
   checks but does not evaluate, since `layout` gives an array no layout until
   `Sized`; and a literal kind inside a constant's array type
-  (`const C: [{integer}; 3]`) is still E2128.
+  (`const C: [const_int; 3]`) is still E2128.
 
 ## Runtime positions
 
@@ -136,7 +136,7 @@ Checked where a written type is lowered and where a local takes its type. The
 slice half is to become "a value position needs a `StackValue`", with fields
 free (see "Values are `StackValue`s"); the literal half stays.
 Inside a constant's declared type neither half applies: a constant may be
-`{integer}`, `[u8; 5]` or (later) `[{integer}; 3]`.
+`const_int`, `[u8; 5]` or (later) `[const_int; 3]`.
 
 ## Values are `StackValue`s (implemented)
 
@@ -497,7 +497,7 @@ own:
   type `M::Size`: `len<M>(self: M::&Self) -> M::Size` returns the fat
   pointer's length or `N`.
 - A constant named as a length must have the pointer's `Size` as its type, or
-  be an untyped `{integer}` count that fits it (`CheckConstantType`, also
+  be an untyped `const_int` count that fits it (`CheckConstantType`, also
   recorded by the pointer). A bare array type's constant length is not
   checked for its type yet.
 
@@ -531,7 +531,7 @@ pub trait Slice {
 }
 
 pub trait Array: Slice {
-    const LEN: {integer};
+    const LEN: const_int;
     func as_slice<M: Memory>(self: M::&Self) -> M::&[Self::Value];
     func as_slice_mut<M: Memory>(self: M::*Self) -> M::*[Self::Value];
 }
@@ -579,37 +579,51 @@ a pointer to a slice is one step too far (`x.*[i]`).
 A constant may have a literal kind as its type:
 
 ```wx
-pub type integer;        // std: binds the pre-interned INTEGER_LITERAL slot
-pub type char;           // CHAR_LITERAL; later float (strings are arrays)
+pub type const_int;      // core: binds the pre-interned CONST_INT slot
+pub type const_float;    // CONST_FLOAT
+pub type const_char;     // CONST_CHAR
 
-const X: {integer} = 4;
-const U: {char} = 'u';
-const P: ({integer}, {integer}) = (1, 2);
+const X: const_int = 4;
+const PI: const_float = 3.14159265358979323846264338327950288;
+const U: const_char = 'u';
+// Planned, currently rejected:
+// const P: (const_int, const_int) = (1, 2);
 ```
 
-- `{T}` is a new `TypeExpression::Literal`: the parser takes any type inside
-  and knows no kind names. Lowering resolves `T` like any type path and checks
-  that it is a literal kind (a pre-interned literal slot); otherwise "`Point`
-  is not a literal kind". The braces construct nothing: `{integer}` is the
-  type `integer` is bound to, and they say that it is meant.
-- A path that resolves to a literal kind outside braces is an error:
-  "`integer` is a literal kind; write `{integer}`" (for `char`: "did you mean
-  `Char`?"). Shadowing is ordinary: a user's own `integer` makes `{integer}`
-  "not a literal kind" in its scope.
-- A literal kind, or a tuple or array containing one, may only be a
-  constant's declared type (free, trait and impl constants):
-  `func f(x: {integer})` and `local x: {integer}` are errors under the
-  runtime-position rule, since an untyped value cannot exist at runtime.
+- Literal kinds are named by ordinary type paths (`const_int`, `const_float`, `const_char`,
+  `core::const_int`). The checker recognizes the resolved type rather than a
+  separate syntax form. Shadowing is ordinary: a user's own `const_int` is
+  checked as that user's type.
+- A literal kind is currently allowed only as the whole annotation of a free
+  or trait constant. Runtime annotations (`func f(x: const_int)`, `local x:
+  const_int`), type aliases and kinds nested in compound annotations remain
+  E2128. Untyped impl constants and tuple/array annotations containing kinds
+  remain unimplemented.
 - The kind is written, never inferred from the initializer: inferring it
   would read another constant's body while building signatures
-  (`const Y = X + 1`). `const X = 4;` stays E2002, suggesting `: {integer}`.
-- `{integer}` checks nothing at the definition but the kind: the initializer
-  is an integer literal, another `{integer}` constant, or an operator over
-  them (`{char}` is a char literal; `'a' + 1` is one too, so it is not an
-  `{integer}`). It is evaluated in an exact domain (`i128`) before it has a
+  (`const Y = X + 1`). `const X = 4;` stays E2002, suggesting `: const_int`.
+- `const_int` checks nothing at the definition but the kind: the initializer
+  is an integer literal, another `const_int` constant, or an operator over
+  them (`const_char` is a char literal; `'a' + 1` is one too, so it is not an
+  `const_int`). It is evaluated in an exact domain (`i128`) before it has a
   type, since one value serves every use; overflow there is the one error at
   the definition. `0 - 1` is `-1` and fails only where it meets an unsigned
   type.
+- `const_float` preserves an exact decimal value without choosing `f32` or
+  `f64`. `ExprKind::Float(DecimalFloat)` holds inline ranges into the single
+  `Semantics::numbers` limb buffer: unsigned significand and exponent
+  magnitudes in base 2^32, with separate signs. Temporary `num-bigint` values
+  parse and normalize decimal input. `NumberStorage::to_f32`/`to_f64`
+  format exact scientific notation and use Rust's parser at the requested
+  width, preserving correct rounding and subnormals without custom conversion
+  arithmetic. No expression owns a vector, no numeric text enters the name
+  interner, and semantics retains no source files.
+  Negation and references preserve the value and negative zero; binary
+  untyped floating arithmetic is explicitly unsupported until an exact
+  evaluator is implemented. Typed primitive operations continue to evaluate
+  at their concrete widths; function and method calls remain unsupported.
+  Overflow and underflow are checked at each typed use, including generic
+  instances. Literal records and cached values never hold an f64 default.
 - Each use checks the fit as a literal does: `coerce` gets an arm for a
   `Const` of literal type that reads its value and runs `coerce_int`'s check.
   In a function body the value is known; in a constant body (checked
@@ -691,8 +705,8 @@ A type's layout in linear memory, as a trait:
 /// need. `SIZE` is a multiple of `ALIGN`, so it is also the stride between
 /// the elements of an array.
 pub trait Sized {
-    const SIZE: {integer};
-    const ALIGN: {integer};
+    const SIZE: const_int;
+    const ALIGN: const_int;
 }
 ```
 
@@ -812,9 +826,8 @@ Mem::Size }`. At a call:
 `const PAGE_SIZE<S: PointerSize>: S = 65536;` is the bounded form: `S` is a
 bound, proved once for each member at the definition, and every instance is
 typed. Use it when one definition must be safe at every type of a set without
-per-use checks (`PAGE_SIZE` in abstract-memory code). `{integer}` is not a
-bound and checks nothing ahead of time; the two coexist. Typesets never go
-inside the braces.
+per-use checks (`PAGE_SIZE` in abstract-memory code). `const_int` is not a
+bound and checks nothing ahead of time; the two coexist. A literal kind is not a typeset or a bound.
 
 ## Order of work
 
@@ -826,7 +839,7 @@ Each step ends with tests green.
    item, and anything else (an alias of a slice included) is
    `InvalidImplTarget`. Pinned by a test.
 2. Done (2026-10-30). Untyped constants, free constants: parse `{T}`, std's
-   `pub type integer;` and `pub type char;` bound to their slots, the
+   `pub type const_int;` and `pub type const_char;` bound to their slots, the
    bare-path error, the literal-kind half of the runtime-position rule,
    constant bodies checked against their kind, exact arithmetic in `eval.rs`,
    the `coerce` arm, untyped constants as lengths.

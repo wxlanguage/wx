@@ -19,10 +19,21 @@ use crate::projects::{ManifestState, ProjectState, discover_package_root};
 use crate::snapshot::Snapshot;
 use crate::trace::Trace;
 
+/// What the client says about itself at `initialize`, applied once, before
+/// anything else.
+#[derive(Default)]
+pub(crate) struct ClientConfig {
+	pub(crate) workspace_folders: Vec<PathBuf>,
+	/// Whether the client accepts `workspace/semanticTokens/refresh`.
+	pub(crate) semantic_tokens_refresh: bool,
+	/// Whether the client takes snippets in completion items.
+	pub(crate) completion_snippets: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct ServerState {
+	pub(crate) client: ClientConfig,
 	pub(crate) open_documents: HashMap<PathBuf, OpenDocument>,
-	pub(crate) workspace_folders: Vec<PathBuf>,
 	/// One snapshot per package root, rebuilt whole on every event that can
 	/// change it. Invalidation belongs on the event, not on the read.
 	pub(crate) cached: HashMap<PathBuf, Snapshot>,
@@ -34,9 +45,6 @@ pub(crate) struct ServerState {
 	/// F's own project", never derived from the publication map ("which
 	/// files does root R reach", many-to-many).
 	pub(crate) own_root: HashMap<PathBuf, PathBuf>,
-	/// Whether the client accepts `workspace/semanticTokens/refresh`, from
-	/// `initialize`.
-	pub(crate) semantic_tokens_refresh: bool,
 }
 
 impl ServerState {
@@ -169,7 +177,7 @@ pub(crate) fn compute_active_refresh(
 	for root in &old_roots {
 		if let Some(root) = discover_package_root(
 			&state.open_documents,
-			&state.workspace_folders,
+			&state.client.workspace_folders,
 			&root.join("wx.json"),
 		) {
 			roots.insert(root);
@@ -180,7 +188,7 @@ pub(crate) fn compute_active_refresh(
 	for file in files {
 		match discover_package_root(
 			&state.open_documents,
-			&state.workspace_folders,
+			&state.client.workspace_folders,
 			&file,
 		) {
 			Some(root) => {

@@ -13,6 +13,7 @@ use super::patterns::PatternContext;
 use super::{BodyBuilder, ScopeType};
 use crate::ast::{self, Separated, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::symbols::Keyword;
 use crate::tir::body::{
 	self, Body, ExprIdx, ExprKind, ExprObligation, LabelIdx, LocalIdx,
 	Obligations, Scope, ScopeIdx, ScopeKind,
@@ -71,12 +72,7 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 		expected: TypeIndex,
 	) -> ScopeIdx {
-		let scope = self.body.push_scope(Scope {
-			kind,
-			parent: Some(self.current),
-			label,
-			span,
-		});
+		let scope = self.body.push_scope(kind, Some(self.current), label, span);
 		self.scope_types.push(ScopeType {
 			expected,
 			ty: TypeIndex::INFER,
@@ -97,7 +93,9 @@ impl BodyBuilder<'_, '_> {
 		ty: TypeIndex,
 		mut_span: Option<TextSpan>,
 	) -> LocalIdx {
-		let local = self.body.push_local(body::Local { name, ty, mut_span });
+		let local = self
+			.body
+			.push_local(self.current, body::Local { name, ty, mut_span });
 		self.lookup.insert((self.current, name.inner), local);
 		local
 	}
@@ -137,7 +135,8 @@ impl BodyBuilder<'_, '_> {
 			}
 			_ => (statements, None),
 		};
-		let (built, diverges) = self.build_statements(statements, result);
+		let (built, diverges) =
+			self.build_statements(statements, result, span.end);
 		let result = result.map(|result| {
 			let hint = self.scope_hint(scope);
 			let value = self.build(result, hint);
@@ -162,16 +161,19 @@ impl BodyBuilder<'_, '_> {
 
 	/// Builds `statements`, and whether one of them diverges (is `!`). What
 	/// follows the first that does, `result` included, is reported
-	/// unreachable once, and still checked.
+	/// unreachable once, and still checked. Each `local` among them opens
+	/// the rest of the block, up to `end`, as a scope of its own; the
+	/// block's own scope closes them all when it is left.
 	fn build_statements(
 		&mut self,
 		statements: &[Separated<Spanned<ast::Statement>>],
 		result: Option<&Spanned<ast::Expression>>,
+		block_end: u32,
 	) -> (Vec<ExprIdx>, bool) {
 		let mut built = Vec::with_capacity(statements.len());
 		let mut diverges_at = None;
 		for (at, statement) in statements.iter().enumerate() {
-			let statement = self.build_statement(&statement.inner);
+			let statement = self.build_statement(&statement.inner, block_end);
 			if diverges_at.is_none()
 				&& self.body.ty(statement) == TypeIndex::NEVER
 			{
@@ -209,6 +211,7 @@ impl BodyBuilder<'_, '_> {
 	fn build_statement(
 		&mut self,
 		statement: &Spanned<ast::Statement>,
+		block_end: u32,
 	) -> ExprIdx {
 		match &statement.inner {
 			ast::Statement::Expression(expr) => {
@@ -237,9 +240,14 @@ impl BodyBuilder<'_, '_> {
 				}
 				value
 			}
-			ast::Statement::LocalDefinition { pattern, ty, value } => {
-				self.build_local(pattern, ty.as_deref(), value, statement.span)
-			}
+			ast::Statement::LocalDefinition { pattern, ty, value } => self
+				.build_local(
+					pattern,
+					ty.as_deref(),
+					value,
+					statement.span,
+					block_end,
+				),
 		}
 	}
 
@@ -263,13 +271,16 @@ impl BodyBuilder<'_, '_> {
 
 	/// `local pattern [: ty] = value`. Without a written type the local
 	/// takes the value's, which must be known: an untyped literal needs an
-	/// annotation.
+	/// annotation. What the pattern binds is declared in the rest of the
+	/// block, up to `block_end`, a scope opened after the value is built
+	/// (`ScopeKind::Remainder`).
 	fn build_local(
 		&mut self,
 		pattern: &Spanned<ast::Pattern>,
 		ty: Option<&Spanned<ast::TypeExpression>>,
 		value: &Spanned<ast::Expression>,
 		span: TextSpan,
+		block_end: u32,
 	) -> ExprIdx {
 		let declared = ty.map(|ty| {
 			let ty = self.builder.resolve_value_type(
@@ -297,7 +308,7 @@ impl BodyBuilder<'_, '_> {
 		let unplaced =
 			declared.is_none() && self.sema.types.needs_context(local_ty);
 		if unplaced
-			|| self.sema.types.has_literal(local_ty)
+			|| self.sema.types.has_const_kind(local_ty)
 			|| self.sema.types.has_infer(local_ty)
 		{
 			self.sema.diagnostics.push(
@@ -318,6 +329,12 @@ impl BodyBuilder<'_, '_> {
 		} else {
 			TypeIndex::UNIT
 		};
+		self.enter_scope(
+			ScopeKind::Remainder,
+			None,
+			TextSpan::new(span.end, block_end),
+			TypeIndex::INFER,
+		);
 		let pattern =
 			self.check_pattern(pattern, local_ty, &mut PatternContext::local());
 		self.body
@@ -344,10 +361,11 @@ impl BodyBuilder<'_, '_> {
 		let mut built = Vec::with_capacity(arms.len());
 		for arm in arms {
 			let arm = &arm.inner;
+			// Its bindings are in scope after its pattern.
 			let scope = self.enter_scope(
 				ScopeKind::Block,
 				None,
-				arm.span,
+				TextSpan::new(arm.inner.pattern.span.end, arm.span.end),
 				TypeIndex::INFER,
 			);
 			let pattern = self.check_pattern(
@@ -377,7 +395,7 @@ impl BodyBuilder<'_, '_> {
 	/// The type a match's arms share: the first typed one's, which every
 	/// untyped arm takes; `!` gives way to the others, and with no arm the
 	/// match is `!`. While the arms are untyped they join among themselves
-	/// (`{integer}` with `{float}` is `{float}`) and the match waits for its
+	/// (`const_int` with `{float}` is `{float}`) and the match waits for its
 	/// context, which coerces each of them.
 	fn join_arms(&mut self, arms: &[ExprIdx]) -> TypeIndex {
 		let Some(&first) = arms
@@ -485,7 +503,7 @@ impl BodyBuilder<'_, '_> {
 	) -> ExprIdx {
 		match &branch.inner {
 			ast::Expression::Block { statements, .. } => {
-				self.build_block(statements, expected, None, branch.span)
+				self.build_block(&statements.inner, expected, None, branch.span)
 			}
 			_ => self.build(branch, expected),
 		}
@@ -518,18 +536,18 @@ impl BodyBuilder<'_, '_> {
 			// A character literal with an integer one is a character, and two
 			// numeric literals are a float if either is.
 			(true, true)
-				if first_ty == TypeIndex::CHAR_LITERAL
-					&& second_ty == TypeIndex::INTEGER_LITERAL
-					|| first_ty == TypeIndex::INTEGER_LITERAL
-						&& second_ty == TypeIndex::CHAR_LITERAL =>
+				if first_ty == TypeIndex::CONST_CHAR
+					&& second_ty == TypeIndex::CONST_INT
+					|| first_ty == TypeIndex::CONST_INT
+						&& second_ty == TypeIndex::CONST_CHAR =>
 			{
-				TypeIndex::CHAR_LITERAL
+				TypeIndex::CONST_CHAR
 			}
 			(true, true)
-				if first_ty.is_number_literal()
-					&& second_ty.is_number_literal() =>
+				if first_ty.is_numeric_const_kind()
+					&& second_ty.is_numeric_const_kind() =>
 			{
-				TypeIndex::FLOAT_LITERAL
+				TypeIndex::CONST_FLOAT
 			}
 			_ => {
 				let diagnostic = self
@@ -551,8 +569,11 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let scope = self.enter_scope(ScopeKind::Loop, label, span, expected);
-		let (built, _) =
-			self.build_statements(block.inner.as_block_statements(), None);
+		let (built, _) = self.build_statements(
+			block.inner.as_block_statements(),
+			None,
+			block.span.end,
+		);
 		self.leave_scope(scope);
 		let ty = self.scope_type(scope);
 		let statements = self.body.push_args(built);
@@ -617,13 +638,18 @@ impl BodyBuilder<'_, '_> {
 	}
 
 	/// The scope a `break` or `continue` leaves: the one whose label it names,
-	/// else the nearest loop. Reports and gives `None` when there is none.
+	/// else the nearest loop. Reports and gives `None` when there is none,
+	/// and gives `None` silently for a label not written yet (`break :`),
+	/// which the parser reported.
 	fn jump_target(
 		&mut self,
 		label: Option<Spanned<SymbolU32>>,
 		span: TextSpan,
 		jump: Jump,
 	) -> Option<ScopeIdx> {
+		if label.is_some_and(|name| name.inner == Keyword::Error.symbol()) {
+			return None;
+		}
 		let mut at = Some(self.current);
 		while let Some(scope) = at {
 			let Scope {

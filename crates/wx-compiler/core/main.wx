@@ -31,12 +31,16 @@ pub struct Char(value: u32);
 /// A reference to a function of any signature: a Wasm `funcref`.
 pub type funcref;
 
-/// The literal kinds, written `{integer}` and `{char}`: the type of a literal
-/// that has no type yet, and of an untyped constant
-/// (`const X: {integer} = 4;`), which takes its type where it is used.
-pub type integer;
+/// The literal kinds `const_int`, `const_float` and `const_char` describe
+/// literals and constants with no concrete type yet
+/// (`const X: const_int = 4;`), which takes its type where it is used.
+pub type const_int;
 
-pub type char;
+/// An untyped floating constant. Its exact decimal value is preserved until
+/// a use supplies `f32` or `f64`. Binary arithmetic is not supported yet.
+pub type const_float;
+
+pub type const_char;
 
 /// Aborts execution by trapping: normal control flow never continues past a
 /// call to `trap`, so it has the bottom type `!`.
@@ -260,7 +264,7 @@ pub trait Slice {
 /// A slice whose length is part of its type, `[T; N]`: the compiler
 /// implements it for every array.
 pub trait Array: Slice {
-    const LEN: {integer};
+    const LEN: const_int;
 
     func as_slice<
         Self: Array where { const LEN: Mem::Size, Value: StackValue },

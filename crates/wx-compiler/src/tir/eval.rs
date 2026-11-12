@@ -43,7 +43,9 @@ use super::decls::{
 	ConstIdx, EnumIdx, FunctionIdx, GlobalIdx, MemberKind, MemberOwner,
 	MemoryIdx,
 };
+use super::literals::ConcreteType;
 use super::members::{TraitImplLookup, TraitMemberSelection};
+use super::numbers::DecimalFloat;
 use super::signatures::Semantics;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, Solver, SolverError, SolverFrame,
@@ -134,6 +136,8 @@ pub(super) struct EvalError {
 pub(super) enum EvalErrorKind {
 	/// The node is not a constant expression.
 	NotConst,
+	/// Precision-independent floating arithmetic is not implemented yet.
+	UnsupportedFloatArithmetic,
 	/// The result is not representable as the operand type, or a shift amount
 	/// is outside its width.
 	Overflow(Operation),
@@ -163,10 +167,12 @@ pub(super) enum ConstValueState {
 	/// Being checked or evaluated; asking for it again closes a loop.
 	InProgress,
 	Evaluated(ConstValue),
-	/// The value of an untyped constant (`const X: {integer}`): a number of
+	/// The value of an untyped constant (`const X: const_int`): a number of
 	/// its kind, exact, with no type until a use gives it one
 	/// (`Semantics::exact_value`).
 	Exact(i128),
+	/// Exact decimal value and sign, with no concrete precision yet.
+	FloatLiteral(DecimalFloat),
 	/// Not evaluated at all: the evaluator holds no values of its type
 	/// (`check_value_type`), or it has no initializer. A constant that reads
 	/// it is not a constant expression.
@@ -186,7 +192,9 @@ impl ConstValueState {
 			Self::Evaluated(value) => Some(Ok(value)),
 			// Read as a number of a type only through `exact_value`, by the
 			// use that gives it one.
-			Self::NoValue | Self::Exact(_) => Some(Err(Unevaluable::NoValue)),
+			Self::NoValue | Self::Exact(_) | Self::FloatLiteral(_) => {
+				Some(Err(Unevaluable::NoValue))
+			}
 			Self::Poisoned | Self::Failed(_) => Some(Err(Unevaluable::Silent)),
 		}
 	}
@@ -226,7 +234,7 @@ enum Halt {
 
 /// A constant with the type arguments its body is read with: its impl's, or
 /// `Self` for a trait's default. `args` is the list of the interned
-/// `Type::Const`, so equal instances are equal; empty for a constant with no
+/// `Type::ConstRef`, so equal instances are equal; empty for a constant with no
 /// parameters, which is its own one instance.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
@@ -594,7 +602,7 @@ impl Semantics {
 		// An untyped constant is a count where a type reads it.
 		if self.constants[usize::from(instance.constant)]
 			.ty
-			.is_literal()
+			.is_const_kind()
 		{
 			return self
 				.exact_value(strings, instance.constant)
@@ -606,7 +614,7 @@ impl Semantics {
 			.and_then(value_bits)
 	}
 
-	/// The value of an untyped constant (`const X: {integer}`), memoized and
+	/// The value of an untyped constant (`const X: const_int`), memoized and
 	/// read on the solver's stack as any constant's is. `Err` as
 	/// `const_value`'s.
 	pub(super) fn exact_value(
@@ -622,6 +630,25 @@ impl Semantics {
 		}
 		match *self.solver.const_state(instance) {
 			ConstValueState::Exact(value) => Ok(value),
+			ConstValueState::NoValue => Err(Unevaluable::NoValue),
+			_ => Err(Unevaluable::Silent),
+		}
+	}
+
+	/// A `const_float` instance's exact decimal value, with no default
+	/// precision. Only its typed use converts that value to f32 or f64.
+	pub(super) fn float_value(
+		&mut self,
+		strings: &StringInterner,
+		instance: Instance,
+	) -> Result<DecimalFloat, Unevaluable> {
+		if let Err(Unevaluable::Silent) =
+			self.instance_value(strings, instance, None)
+		{
+			return Err(Unevaluable::Silent);
+		}
+		match *self.solver.const_state(instance) {
+			ConstValueState::FloatLiteral(value) => Ok(value),
 			ConstValueState::NoValue => Err(Unevaluable::NoValue),
 			_ => Err(Unevaluable::Silent),
 		}
@@ -966,7 +993,8 @@ impl Semantics {
 			args: &args,
 		};
 		// An untyped constant's value is one exact number of its kind.
-		let untyped = self.constants[usize::from(const_index)].ty.is_literal();
+		let declared = self.constants[usize::from(const_index)].ty;
+		let untyped = declared.is_const_kind();
 		let scalars = if untyped {
 			Ok(Vec::new())
 		} else {
@@ -974,7 +1002,11 @@ impl Semantics {
 		};
 		let mut stack = Vec::new();
 		let mut exact = None;
+		let mut float_literal = None;
 		let evaluated = match &scalars {
+			Ok(_) if declared == TypeIndex::CONST_FLOAT => self
+				.eval_untyped_float(strings, owner, root)
+				.map(|value| float_literal = Some(value)),
 			Ok(_) if untyped => self
 				.eval_exact(strings, owner, root)
 				.map(|value| exact = Some(value)),
@@ -997,6 +1029,9 @@ impl Semantics {
 		};
 
 		let state = match evaluated {
+			Ok(()) if let Some(value) = float_literal => {
+				ConstValueState::FloatLiteral(value)
+			}
 			Ok(()) if let Some(value) = exact => ConstValueState::Exact(value),
 			Ok(())
 				if stack
@@ -1153,13 +1188,17 @@ impl Semantics {
 				}
 				None => return Err(own(EvalErrorKind::NotConst)),
 			},
-			ExprKind::Float(value) => match Primitive::of(ty) {
-				Some(Primitive::F32) => {
-					stack.push(ConstScalar::f32(value as f32))
-				}
-				Some(Primitive::F64) => stack.push(ConstScalar::f64(value)),
-				_ => return Err(own(EvalErrorKind::NotConst)),
-			},
+			ExprKind::Float(literal) => {
+				let value = self
+					.read_float_literal(literal, ConcreteType::Target(ty))
+					.ok()
+					.ok_or(own(EvalErrorKind::NotConst))?;
+				stack.push(match Primitive::of(ty) {
+					Some(Primitive::F32) => ConstScalar::f32(value as f32),
+					Some(Primitive::F64) => ConstScalar::f64(value),
+					_ => return Err(own(EvalErrorKind::NotConst)),
+				});
+			}
 			// A function item and a global's or a memory's handle are
 			// zero-sized: the type says everything.
 			ExprKind::Function { .. }
@@ -1297,6 +1336,67 @@ impl Semantics {
 			}
 		}
 		Ok(())
+	}
+
+	/// Preserve a floating literal through references and sign changes.
+	/// Binary arithmetic requires a precision-independent evaluator; calls
+	/// and other unsupported expressions follow the normal constant rules.
+	fn eval_untyped_float(
+		&mut self,
+		strings: &StringInterner,
+		owner: Owner<'_>,
+		expr: ExprIdx,
+	) -> Result<DecimalFloat, Halt> {
+		let body = body_of(self, owner);
+		let (kind, ty, span) =
+			(body.kind(expr), body.ty(expr), body.span(expr));
+		if ty == TypeIndex::ERROR {
+			return Err(Halt::Silent);
+		}
+		let own = |kind| Halt::Own(EvalError { span, kind });
+		match kind {
+			ExprKind::Float(value) => Ok(value),
+			ExprKind::PrimitiveUnary {
+				op: UnaryOp::InvertSign,
+				operand,
+			} => {
+				let mut value =
+					self.eval_untyped_float(strings, owner, operand)?;
+				value.negative = !value.negative;
+				Ok(value)
+			}
+			ExprKind::Const {
+				constant,
+				type_args,
+			}
+			| ExprKind::AbstractConst {
+				constant,
+				type_args,
+			} => {
+				let args = self.generic_args.types(type_args).to_vec();
+				let args: Vec<_> = args
+					.into_iter()
+					.map(|arg| self.instance_type(strings, owner, arg))
+					.collect();
+				let resolved = self
+					.resolve_constant(strings, constant, &args)
+					.map_err(|_| Halt::Silent)?;
+				let ResolvedConstant::Instance(instance) = resolved else {
+					return Err(own(EvalErrorKind::NotConst));
+				};
+				self.float_value(strings, instance)
+					.map_err(|error| match error {
+						Unevaluable::NoValue => own(EvalErrorKind::NotConst),
+						Unevaluable::Silent => Halt::Silent,
+					})
+			}
+			ExprKind::PrimitiveBinary { .. }
+			| ExprKind::PrimitiveUnary { .. } => {
+				Err(own(EvalErrorKind::UnsupportedFloatArithmetic))
+			}
+			ExprKind::Error => Err(Halt::Silent),
+			_ => Err(own(EvalErrorKind::NotConst)),
+		}
 	}
 
 	/// The exact value of a node of an untyped constant's body: a literal of
@@ -1470,7 +1570,7 @@ impl Semantics {
 		match body_of(self, owner).kind(count) {
 			ExprKind::Int(bits) => Ok(bits),
 			ExprKind::Const { constant, .. } => {
-				let length = self.types.intern_const(constant, &[]);
+				let length = self.types.intern_const_ref(constant, &[]);
 				self.length_value(strings, owner, length)
 			}
 			// Reported where the count is written.
@@ -1697,15 +1797,15 @@ impl Semantics {
 	}
 
 	/// The instance of `constant` with `args`, keyed by its interned
-	/// `Type::Const`.
+	/// `Type::ConstRef`.
 	fn instance(&mut self, constant: ConstIdx, args: &[TypeIndex]) -> Instance {
 		if args.is_empty() {
 			return Instance::of(constant);
 		}
-		let interned = self.types.intern_const(constant, args);
-		let Type::Const { type_args, .. } = *self.types.resolve(interned)
+		let interned = self.types.intern_const_ref(constant, args);
+		let Type::ConstRef { type_args, .. } = *self.types.resolve(interned)
 		else {
-			unreachable!("a constant interns as a `Type::Const`")
+			unreachable!("a constant interns as a `Type::ConstRef`")
 		};
 		Instance {
 			constant,
@@ -1802,9 +1902,34 @@ impl Semantics {
 	) -> Result<(), Halt> {
 		match self.resolve_constant(strings, constant, args) {
 			Ok(ResolvedConstant::Instance(instance))
+				if self.constants[usize::from(instance.constant)].ty
+					== TypeIndex::CONST_FLOAT =>
+			{
+				let value =
+					self.float_value(strings, instance).map_err(|error| {
+						match error {
+							Unevaluable::NoValue => Halt::Own(EvalError {
+								span,
+								kind: EvalErrorKind::NotConst,
+							}),
+							Unevaluable::Silent => Halt::Silent,
+						}
+					})?;
+				let read = self
+					.read_float_literal(value, ConcreteType::Target(ty))
+					.ok()
+					.ok_or(Halt::Silent)?;
+				stack.push(match ty {
+					TypeIndex::F32 => ConstScalar::f32(read as f32),
+					TypeIndex::F64 => ConstScalar::f64(read),
+					_ => return Err(Halt::Silent),
+				});
+				Ok(())
+			}
+			Ok(ResolvedConstant::Instance(instance))
 				if self.constants[usize::from(instance.constant)]
 					.ty
-					.is_literal() =>
+					.is_const_kind() =>
 			{
 				let value = match self.exact_value(strings, instance.constant) {
 					Ok(value) => value,
@@ -2080,6 +2205,9 @@ impl EvalErrorKind {
 	fn code(self) -> DiagnosticCode {
 		match self {
 			Self::NotConst => DiagnosticCode::NotConstEvaluatable,
+			Self::UnsupportedFloatArithmetic => {
+				DiagnosticCode::UnsupportedExpression
+			}
 			_ => DiagnosticCode::ConstEvaluationFailed,
 		}
 	}
@@ -2087,6 +2215,10 @@ impl EvalErrorKind {
 	fn label(self) -> String {
 		match self {
 			Self::NotConst => "not a constant expression".to_string(),
+			Self::UnsupportedFloatArithmetic => {
+				"untyped floating-point arithmetic is not supported yet"
+					.to_string()
+			}
 			Self::Overflow(operation) => {
 				format!("attempt to {} with overflow", operation.verb())
 			}
@@ -2416,6 +2548,16 @@ fn literal(
 	negated: bool,
 	scalar: Primitive,
 ) -> Option<ConstScalar> {
+	// Integer spelling stays an Int node even when its checked type is a
+	// float. Representability was checked before evaluation.
+	let sign = if negated { -1.0 } else { 1.0 };
+	match scalar {
+		Primitive::F32 => {
+			return Some(ConstScalar::f32(sign as f32 * value as f32));
+		}
+		Primitive::F64 => return Some(ConstScalar::f64(sign * value as f64)),
+		_ => {}
+	}
 	if !scalar.is_signed() {
 		if negated && value != 0 {
 			return None;
@@ -3348,14 +3490,129 @@ mod tests {
 	}
 
 	#[test]
+	fn an_untyped_float_preserves_its_exact_value_until_each_use() {
+		const TEXT: &str =
+			"1.0000000596046447753906250000000000000000000000000000001";
+		let mut case = TestCase::new(&format!(
+			"const F: const_float = {TEXT};\nconst NEG: const_float = -F;\nconst A: f32 = F;\nconst B: f64 = NEG;\nconst ZERO: const_float = -0.0e100;\nconst Z: f32 = ZERO;"
+		));
+		case.diagnostics().assert_none();
+		let ConstValueState::FloatLiteral(literal) = *case.state("F") else {
+			panic!("an untyped float must retain its literal");
+		};
+
+		assert!(
+			case.strings.get(TEXT).is_none(),
+			"float text must not enter the name interner"
+		);
+		let direct = TEXT.parse::<f32>().unwrap();
+		assert_ne!(
+			direct.to_bits(),
+			(TEXT.parse::<f64>().unwrap() as f32).to_bits(),
+			"this value detects double rounding"
+		);
+		assert_eq!(case.value("A"), [ConstScalar::f32(direct)]);
+		assert_eq!(
+			case.value("B"),
+			[ConstScalar::f64(-TEXT.parse::<f64>().unwrap())]
+		);
+		assert_eq!(case.value("Z"), [ConstScalar::f32(-0.0)]);
+		// The numeric value must not depend on retaining the original source.
+		let DeclKind::Const(index) = case.resolve(Tier::Value, "F") else {
+			unreachable!()
+		};
+		let file = case
+			.sema
+			.decls
+			.file_id(case.sema.decls.constants[usize::from(index)].loc);
+		case.files.update(file, "edited".to_string());
+
+		assert_eq!(
+			case.sema
+				.read_float_literal(
+					literal,
+					ConcreteType::Target(TypeIndex::F32)
+				)
+				.unwrap(),
+			f64::from(direct)
+		);
+	}
+
+	#[test]
+	fn an_untyped_float_is_checked_at_each_use() {
+		for (literal, target, code) in [
+			("1e39", "f32", DiagnosticCode::FloatLiteralOverflow),
+			("1e-50", "f32", DiagnosticCode::FloatLiteralUnderflow),
+			("1e400", "f64", DiagnosticCode::FloatLiteralOverflow),
+			("1e-400", "f64", DiagnosticCode::FloatLiteralUnderflow),
+			(
+				"1e999999999999999999999999999999999999999999",
+				"f64",
+				DiagnosticCode::FloatLiteralOverflow,
+			),
+			(
+				"1e-999999999999999999999999999999999999999999",
+				"f64",
+				DiagnosticCode::FloatLiteralUnderflow,
+			),
+		] {
+			let case = TestCase::new(&format!(
+				"const F: const_float = {literal}; const A: {target} = F;"
+			));
+			case.diagnostics().assert_codes(&[code]);
+		}
+		TestCase::new(
+			"const HUGE: const_float = 1e400; const TINY: const_float = 1e-400;",
+		)
+		.diagnostics()
+		.assert_none();
+	}
+
+	#[test]
+	fn an_untyped_float_has_no_default_and_no_binary_arithmetic_yet() {
+		for (source, code) in [
+			(
+				"const F: const_float = 1.25; func f() { local x = F; }",
+				DiagnosticCode::TypeAnnotationRequired,
+			),
+			(
+				"const F: const_float = 1.0 + 2.0;",
+				DiagnosticCode::UnsupportedExpression,
+			),
+			(
+				"const F: const_float = 1.0 / 3.0;",
+				DiagnosticCode::UnsupportedExpression,
+			),
+			("const F: const_float = 1;", DiagnosticCode::TypeMistmatch),
+			(
+				"const F: const_float = 1.25; const BAD: u32 = F;",
+				DiagnosticCode::UnableToCoerce,
+			),
+			(
+				"func f() -> f64 { 1.25 } const F: f64 = f();",
+				DiagnosticCode::NotConstEvaluatable,
+			),
+		] {
+			TestCase::new(source).diagnostics().assert_codes(&[code]);
+		}
+	}
+
+	#[test]
+	fn untyped_float_references_keep_cycle_detection() {
+		TestCase::new("const A: const_float = B; const B: const_float = A;")
+			.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicConstant]);
+	}
+
+	#[test]
 	fn an_untyped_constant_takes_the_type_of_each_use() {
 		let case = TestCase::new(indoc! {r#"
-				const X: {integer} = 200 + 55;
+				const X: const_int = 200 + 55;
 				const A: u8 = X;
 				const B: i64 = -X;
 				const C: u32 = X * 2;
 				const F: f32 = X;
-				const U: {char} = 'u';
+				const U: const_char = 'u';
 				const CODE: u8 = U;
 				const LETTER: Char = U;
 			"#});
@@ -3376,13 +3633,13 @@ mod tests {
 	#[test]
 	fn an_untyped_constant_is_computed_exactly() {
 		let case = TestCase::new(indoc! {r#"
-				const BIG: {integer} = 1 << 70;
-				const SHIFTED: {integer} = BIG >> 66;
+				const BIG: const_int = 1 << 70;
+				const SHIFTED: const_int = BIG >> 66;
 				const SMALL: u8 = SHIFTED;
 				const TYPED_OPERAND: u8 = BIG >> 66;
-				const MINUS_ONE: {integer} = 0 - 1;
+				const MINUS_ONE: const_int = 0 - 1;
 				const SIGNED: i8 = MINUS_ONE;
-				const TOO_BIG: {integer} = 1 << 127;
+				const TOO_BIG: const_int = 1 << 127;
 			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::IntegerLiteralOutOfRange,
@@ -3401,8 +3658,8 @@ mod tests {
 	#[test]
 	fn an_untyped_constant_is_checked_where_it_is_used() {
 		let case = TestCase::new(indoc! {r#"
-				const X: {integer} = 300;
-				const MINUS: {integer} = -1;
+				const X: const_int = 300;
+				const MINUS: const_int = -1;
 				const A: u8 = X;
 				const B: u16 = X;
 				func f() -> u32 { MINUS }
@@ -3424,7 +3681,7 @@ mod tests {
 	#[test]
 	fn an_untyped_constant_has_no_default_type() {
 		let case = TestCase::new(indoc! {r#"
-				const X: {integer} = 4;
+				const X: const_int = 4;
 				func f() { local x = X; }
 			"#});
 		case.diagnostics()
@@ -3434,10 +3691,10 @@ mod tests {
 	#[test]
 	fn an_untyped_constant_holds_only_its_kind() {
 		let case = TestCase::new(indoc! {r#"
-				const LETTER: {integer} = 'a';
+				const LETTER: const_int = 'a';
 				const TYPED: u32 = 4;
-				const NAMED: {integer} = TYPED;
-				const NUMBER: {char} = 'a' + 1;
+				const NAMED: const_int = TYPED;
+				const NUMBER: const_char = 'a' + 1;
 			"#});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
@@ -3452,9 +3709,9 @@ mod tests {
 	fn an_untyped_constant_is_an_array_length() {
 		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
-				const N: {integer} = 2 * 2;
-				const NEGATIVE: {integer} = -4;
-				const HUGE: {integer} = 1 << 40;
+				const N: const_int = 2 * 2;
+				const NEGATIVE: const_int = -4;
+				const HUGE: const_int = 1 << 40;
 				const S: heap::&[u8; N] = "abcd";
 				const T: heap::&[u8; NEGATIVE] = "abcd";
 				func g(p: heap::&[u8; HUGE]) {}

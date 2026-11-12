@@ -11,6 +11,7 @@ mod layout;
 mod literals;
 mod lower;
 mod members;
+mod numbers;
 mod obligations;
 mod operators;
 mod paths;
@@ -28,13 +29,14 @@ use crate::symbols::StringInterner;
 use crate::vfs::CompilationUnit;
 
 pub use self::body::{
-	Body, BodyOwner, Label, LabelIdx, Local, LocalIdx, ParamIdx,
+	Body, BodyOwner, Label, LabelIdx, LabelKind, Local, LocalIdx, ParamIdx,
 };
 use self::decls::Declarations;
 pub use self::decls::{
 	AssocTypeIdx, ConstIdx, DeclKind, EnumIdx, FieldIdx, FunctionIdx,
 	GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, MemberOwner, MemoryIdx,
-	StructIdx, TraitIdx, TraitImplIdx, TypeAliasIdx, TypesetIdx, UseItemIndex,
+	NameUse, StructIdx, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx, TypeRole,
+	TypesetIdx, UseItemIndex,
 };
 pub use self::eval::{AllocIdx, ConstScalar, Val};
 pub use self::format::{BoundFormatter, TypeFormatter};

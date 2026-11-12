@@ -89,47 +89,51 @@ items:
               Block:
                 label: ~
                 statements:
-                  - inner:
-                      inner:
-                        Expression:
-                          inner:
-                            Binary:
-                              left:
-                                inner:
-                                  Path:
-                                    - ident:
-                                        inner: 35
-                                        span:
-                                          start: 38
-                                          end: 39
-                                      type_args: []
-                                span:
-                                  start: 38
-                                  end: 39
-                              operator:
-                                inner: Add
-                                span:
-                                  start: 40
-                                  end: 41
-                              right:
-                                inner:
-                                  Path:
-                                    - ident:
-                                        inner: 37
-                                        span:
-                                          start: 42
-                                          end: 43
-                                      type_args: []
-                                span:
-                                  start: 42
-                                  end: 43
-                          span:
-                            start: 38
-                            end: 43
-                      span:
-                        start: 38
-                        end: 43
-                    separator: ~
+                  inner:
+                    - inner:
+                        inner:
+                          Expression:
+                            inner:
+                              Binary:
+                                left:
+                                  inner:
+                                    Path:
+                                      - ident:
+                                          inner: 35
+                                          span:
+                                            start: 38
+                                            end: 39
+                                        type_args: []
+                                  span:
+                                    start: 38
+                                    end: 39
+                                operator:
+                                  inner: Add
+                                  span:
+                                    start: 40
+                                    end: 41
+                                right:
+                                  inner:
+                                    Path:
+                                      - ident:
+                                          inner: 37
+                                          span:
+                                            start: 42
+                                            end: 43
+                                        type_args: []
+                                  span:
+                                    start: 42
+                                    end: 43
+                            span:
+                              start: 38
+                              end: 43
+                        span:
+                          start: 38
+                          end: 43
+                      separator: ~
+                  span:
+                    start: 32
+                    end: 45
             span:
               start: 32
               end: 45

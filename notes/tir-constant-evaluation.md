@@ -5,13 +5,26 @@ Status as of 2026-10-25, branch `tir-refactor`. Companion to
 `tir-body-checking-plan.md`.
 
 - Committed: `6ff4e9f` (array lengths as type-level constants, `Type::Value`),
-  `6acc3be` (lengths named by free constants, `Type::Const`).
+  `6acc3be` (lengths named by free constants, `Type::ConstRef`).
 - Uncommitted: constant evaluation moved onto the solver (`impl Solver` in
   `eval.rs`), and on top of it the phase design below (sections 1, 2, 4, 5 and
   6 of the implementation map). The on-demand walk (`ensure_named_bodies`,
   `Body::named_constants`) is gone.
 
 ## Type-level constants
+
+Floating literals (2026-11-12): `ExprKind::Float(DecimalFloat)` owns inline
+significand/exponent limb ranges and signs. `Semantics::numbers` owns the
+single base-2^32 limb buffer (`tir/numbers.rs`). No source files, shared
+source allocations or interned numeric spellings are retained. `num-bigint`
+is used for temporary exact parsing and formatting. `NumberStorage::to_f32`
+and `to_f64` format exact scientific notation and delegate rounding to Rust's
+parser at the requested width. No custom binary conversion or intermediate
+floating precision is involved, so generic instances do not share a value
+rounded at another width. `const_float` caches this exact
+decimal record through references and negation. Untyped binary float
+arithmetic reports E2114 for now; typed primitive operations are evaluated
+at their operand widths, and calls remain non-constant expressions.
 
 Constants live in the type space (as in GHC's DataKinds), not in a separate
 `Const` space as in rustc. There is no `kind()` function: kinds are checked by
@@ -25,7 +38,7 @@ after that.
   normalizes to `u32`.
 - `Type::Array { of, length: TypeIndex, memory, ownership }`: the length is a
   `Value`, a `Const`, or `INFER` (a written `_`, filled by a literal).
-- `Type::Const { constant, type_args }`: a constant named in a type. It is the
+- `Type::ConstRef { constant, type_args }`: a constant named in a type. It is the
   constant counterpart of `TypeProjection` (it carries `HAS_PROJECTION`):
   normalization replaces it with its `Value`. `type_args` follows
   `Type::Function`'s layout (an impl's arguments, then its own; `[Self]` for a
@@ -70,7 +83,7 @@ type reads as existential (one hidden type), which is useless in abstract code.
 - A use instantiates `S` from the position: `M::&[u8; N]` gives
   `Const { N, [<M as Memory>::Size] }`, so `CheckConstantType` holds by
   construction and `S: PointerSize` is an ordinary bound obligation.
-- Evaluation is memoized per instance, keyed by the interned `Type::Const`.
+- Evaluation is memoized per instance, keyed by the interned `Type::ConstRef`.
 
 ## Evaluation is the solver's
 
@@ -88,7 +101,7 @@ is).
 - A loop (`A = B; B = A`) is reading a constant that is `InProgress`: the loop
   is the frames from its first evaluation up, owned by its first-defined member.
   It is read from the same stack as a loop through projections.
-- Normalizing a `Type::Const` evaluates it in place: no retry protocol between
+- Normalizing a `Type::ConstRef` evaluates it in place: no retry protocol between
   the solver and `TypeContext`.
 - The solver reads built bodies and builds none: it reads constant signatures,
   constant bodies and strings (a string literal's contents) through the
@@ -213,7 +226,7 @@ match yet; the plan is an ambiguous obligation decided with the recorded checks.
    the scope of value-free building.
 2. Implement the phases on top of the solver-side evaluation; drop the walk.
 3. ~~Substituted evaluation~~ (done 2026-10-30): `T::SIZE` / `Foo::SIZE` /
-   `<T as Tr>::SIZE` lower to `Type::Const` (a trait's declaration over
+   `<T as Tr>::SIZE` lower to `Type::ConstRef` (a trait's declaration over
    `[Self]`); `resolve_constant` selects the impl's member, the inherited
    default, or the compiler's answer (`Array::SIZE`); an instance
    (`eval::Instance`) is evaluated with its arguments substituted, memoized in
@@ -376,7 +389,7 @@ Where the code differs from the plan above:
   `RewriteFlags` flag set (`EQUALITIES`, `DEFINITIONS`, `VALUES`), part of a
   request's cache key. A constant's body normalizes without `VALUES`, so a
   `Const` stays as written and the trigger is syntactic: a comparison or a
-  literal's length that still holds a `Const` (`has_const`) is recorded, every
+  literal's length that still holds a `Const` (`has_const_ref`) is recorded, every
   `match` is, and so is any obligation that can reach a value
   (`Obligation::reads_values`). A function's or global's body, and a recorded
   check being decided, use every fact. So `Pending` no longer means "a constant

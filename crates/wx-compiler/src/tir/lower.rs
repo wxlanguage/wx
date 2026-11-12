@@ -56,6 +56,7 @@ use super::decls::{
 };
 use super::eval::Val;
 use super::intrinsics::Intrinsic;
+use super::literals::ConcreteType;
 use super::members::ResolvedFunction;
 use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags};
@@ -1135,7 +1136,20 @@ impl<'a> Lowerer<'a> {
 				};
 				Ok(state.push(kind, ty))
 			}
-			ExprKind::Float(value) => {
+			ExprKind::Float(literal) => {
+				let target = match ty {
+					mir::ValueType::F32 => TypeIndex::F32,
+					mir::ValueType::F64 => TypeIndex::F64,
+					_ => unreachable!(
+						"a float needs a concrete type before lowering"
+					),
+				};
+
+				let value = self
+					.sema
+					.read_float_literal(literal, ConcreteType::Target(target))
+					.ok()
+					.ok_or(())?;
 				Ok(state.push(mir::ExprKind::Float { value }, ty))
 			}
 			ExprKind::Local(local) => {
@@ -2444,6 +2458,139 @@ mod tests {
 
 	/// Check, lower, inline, encode, and instantiate `source`, returning the
 	/// live store and instance for calling exports.
+	#[test]
+	fn a_trait_floating_constant_uses_its_representability_bound() {
+		let source = r#"
+			trait Scale { const VALUE: const_float = 1.25; }
+			struct S();
+			impl Scale for S {}
+			func value<T: Scale where { const VALUE: f32 }>() -> f64 { T::VALUE }
+			func run() -> f64 { value::<S>() }
+			export run as "run";
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let function = instance
+			.get_typed_func::<(), f64>(&mut store, "run")
+			.unwrap();
+		assert_eq!(function.call(&mut store, ()).unwrap(), 1.25);
+	}
+
+	#[test]
+	fn math_coefficients_keep_their_documented_float_bits() {
+		// Spellings and reference bits from examples/math/{k_sin,k_cos,lib}.wx.
+		let source = r#"
+			const S1: f64 = -1.66666666666666324348e-01;
+			const S2: f64 = 8.33333333332248946124e-03;
+			const C1: f64 = 4.16666666666666019037e-02;
+			const PI: const_float = 3.14159265358979323846264338327950288;
+			func s1() -> f64 { S1 }
+			func s2() -> f64 { S2 }
+			func c1() -> f64 { C1 }
+			func pi64() -> f64 { PI }
+			func pi32() -> f32 { PI }
+			export { s1 as "s1", s2 as "s2", c1 as "c1", pi64 as "pi64", pi32 as "pi32" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		for (name, bits) in [
+			("s1", 0xBFC5_5555_5555_5549),
+			("s2", 0x3F81_1111_1110_F8A6),
+			("c1", 0x3FA5_5555_5555_554C),
+			("pi64", 0x4009_21FB_5444_2D18),
+		] {
+			let function = instance
+				.get_typed_func::<(), f64>(&mut store, name)
+				.unwrap();
+			assert_eq!(
+				function.call(&mut store, ()).unwrap().to_bits(),
+				bits,
+				"{name}"
+			);
+		}
+		let function = instance
+			.get_typed_func::<(), f32>(&mut store, "pi32")
+			.unwrap();
+		assert_eq!(
+			function.call(&mut store, ()).unwrap().to_bits(),
+			0x4049_0FDB
+		);
+	}
+
+	#[test]
+	fn generic_float_literals_decode_at_each_instances_precision() {
+		let source = r#"
+			typeset Floats: StackValue { f32, f64 }
+			func value<F: Floats>() -> F {
+				1.0000000596046447753906250000000000000000000000000000001
+			}
+			func narrow() -> f32 { value::<f32>() }
+			func wide() -> f64 { value::<f64>() }
+			export { narrow as "narrow", wide as "wide" }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			let text =
+				"1.0000000596046447753906250000000000000000000000000000001";
+			let narrow = instance
+				.get_typed_func::<(), f32>(&mut store, "narrow")
+				.unwrap();
+			assert_eq!(
+				narrow.call(&mut store, ()).unwrap().to_bits(),
+				text.parse::<f32>().unwrap().to_bits()
+			);
+			let wide = instance
+				.get_typed_func::<(), f64>(&mut store, "wide")
+				.unwrap();
+			assert_eq!(
+				wide.call(&mut store, ()).unwrap().to_bits(),
+				text.parse::<f64>().unwrap().to_bits()
+			);
+		}
+	}
+
+	#[test]
+	fn floating_constants_lower_at_the_type_of_each_use() {
+		let source = r#"
+			const F: const_float = 1.0000000596046447753906250000000000000000000000000000001;
+			const NEG_ZERO: const_float = -0.0;
+			const ADDED: f32 = F + 1.0;
+			func narrow() -> f32 { F }
+			func wide() -> f64 { F }
+			func zero() -> f32 { NEG_ZERO }
+			func added() -> f32 { ADDED }
+			export { narrow as "narrow", wide as "wide", zero as "zero", added as "added" }
+		"#;
+		let (mut store, instance) = instantiate(source);
+		let text = "1.0000000596046447753906250000000000000000000000000000001";
+		let narrow = instance
+			.get_typed_func::<(), f32>(&mut store, "narrow")
+			.unwrap();
+		assert_eq!(
+			narrow.call(&mut store, ()).unwrap().to_bits(),
+			text.parse::<f32>().unwrap().to_bits()
+		);
+		let wide = instance
+			.get_typed_func::<(), f64>(&mut store, "wide")
+			.unwrap();
+		assert_eq!(
+			wide.call(&mut store, ()).unwrap().to_bits(),
+			text.parse::<f64>().unwrap().to_bits()
+		);
+		let zero = instance
+			.get_typed_func::<(), f32>(&mut store, "zero")
+			.unwrap();
+		assert_eq!(
+			zero.call(&mut store, ()).unwrap().to_bits(),
+			(-0.0f32).to_bits()
+		);
+		let added = instance
+			.get_typed_func::<(), f32>(&mut store, "added")
+			.unwrap();
+		assert_eq!(
+			added.call(&mut store, ()).unwrap(),
+			text.parse::<f32>().unwrap() + 1.0
+		);
+	}
+
 	fn instantiate(source: &str) -> (wasmtime::Store<()>, wasmtime::Instance) {
 		instantiate_with_policy(source, Some(mir::inline::Policy::DEFAULT))
 	}
