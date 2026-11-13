@@ -406,14 +406,15 @@ fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
 	let mut any_would_change = false;
 
 	for module in &selection.modules {
-		let ast = &selection.asts[module.file_id.as_usize()];
+		let index = module.file_id.as_usize();
+		let ast = &selection.asts[index];
 		// `Parser::parse` is error-recovering — it always returns *an*
 		// AST, never a hard failure, so a syntax error alone wouldn't stop
 		// this loop otherwise. That's the right call for `compile`/
 		// `check`, which only report and abort; `format` overwrites the
 		// file in place, so rendering and writing a recovered, error-laden
 		// AST back over the original would silently corrupt it instead.
-		if ast.diagnostics.has_errors() {
+		if selection.parse_diagnostics[index].has_errors() {
 			eprintln!(
 				"error: '{}' has syntax errors, skipping (run `wx check \
 				 {}` for details)",
@@ -426,6 +427,7 @@ fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
 		let file = selection.files.get(module.file_id).unwrap();
 		let formatted = wx_fmt::format(
 			ast,
+			&selection.comments[index],
 			&selection.interner,
 			&file.source,
 			selection.config,

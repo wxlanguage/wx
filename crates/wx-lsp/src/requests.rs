@@ -167,7 +167,7 @@ pub(crate) fn format(
 			Path::new(module.file_path.as_str()) == path.as_path()
 		})?;
 	let ast = compilation.ast(module.file_id);
-	if ast.diagnostics.has_errors() {
+	if compilation.parse_diagnostics(module.file_id).has_errors() {
 		return None;
 	}
 	let file = compilation.files.get(module.file_id).ok()?;
@@ -177,8 +177,15 @@ pub(crate) fn format(
 		return None;
 	};
 	let config = wx_fmt::RendererConfig::from_manifest(manifest.format);
-	let formatted =
-		trace.step("render", || wx_fmt::format(ast, &strings, source, config));
+	let formatted = trace.step("render", || {
+		wx_fmt::format(
+			ast,
+			compilation.comments(module.file_id),
+			&strings,
+			source,
+			config,
+		)
+	});
 	// An already-formatted file is the common case for format-on-save. No
 	// edits leaves the buffer untouched, so the client never sends a
 	// `didChange` and nothing re-checks an identical document.

@@ -15,12 +15,12 @@ use tower_lsp_server::ls_types::{
 };
 use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
-	BoundId, Comment, ConstArgument, ConstId, Destructure, EnumEntry, ExprId,
-	Expression, FunctionSignature, FunctionTypeParam, ImplItem,
-	ImportDeclaration, ImportEntry, InColumn, Item, List, NamedArgument, PatId,
-	Path, PathSegment, Pattern, PatternElement, PatternFieldItem,
-	QualifiedPathRoot, Spanned, Statement, TraitItem, TypeArgument,
-	TypeExpression, TypeId, TypeParam,
+	BoundId, Comment, CommentMap, ConstArgument, ConstId, Destructure,
+	EnumEntry, ExprId, Expression, FunctionSignature, FunctionTypeParam,
+	ImplItem, ImportDeclaration, ImportEntry, InColumn, Item, List,
+	NamedArgument, PatId, Path, PathSegment, Pattern, PatternElement,
+	PatternFieldItem, QualifiedPathRoot, Spanned, Statement, TraitItem,
+	TypeArgument, TypeExpression, TypeId, TypeParam,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::tir::{DeclKind, Definition, LabelKind, NameUse};
@@ -42,8 +42,11 @@ pub(crate) fn completion(
 		file,
 		position.position,
 	)?;
-	let Position { site, within } =
-		position_at(snapshot.compilation.ast(file), offset)?;
+	let Position { site, within } = position_at(
+		snapshot.compilation.ast(file),
+		snapshot.compilation.comments(file),
+		offset,
+	)?;
 	let declaration = match within {
 		Within::Signature(Anchor::Name(name)) | Within::Body(name) => {
 			snapshot.declared_at(SourceSpan::new(file, name))?
@@ -286,10 +289,14 @@ fn item(
 /// One path down the module's syntax: at each level the child at the
 /// cursor is found by a binary search of its siblings, which are in source
 /// order and do not overlap.
-pub(crate) fn position_at(ast: &AST, offset: u32) -> Option<Position> {
+pub(crate) fn position_at(
+	ast: &AST,
+	comments: &CommentMap,
+	offset: u32,
+) -> Option<Position> {
 	let cursor = Cursor { offset, ast };
 	// Inside a comment: its start is the `//` itself, its end the line's.
-	let comment = cursor.child(&ast.comments.0);
+	let comment = cursor.child(&comments.0);
 	if comment.is_some_and(|comment| comment.span.start < offset) {
 		return None;
 	}

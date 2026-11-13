@@ -553,7 +553,9 @@ pub struct Parser<'input> {
 	source: &'input str,
 	lexer: Lexer<'input>,
 	strings: &'input mut StringInterner,
-	ast: AST,
+	file_id: FileId,
+	ast: AstBuilder,
+	diagnostics: Vec<Diagnostic<FileId>>,
 }
 
 /// The tokens that open, separate and close a delimited list.
@@ -602,35 +604,37 @@ trait ListItem {
 	/// Whether the item ends at a block-like expression's `}`, so the next
 	/// one needs no separator before it, as a block-like expression is never
 	/// an operand.
-	fn ends_in_block(&self, _ast: &AST) -> bool {
+	fn ends_in_block(&self, _ast: &AstBuilder) -> bool {
 		false
 	}
 }
 
 impl ListItem for Statement {
 	/// A `local` needs its `;` even when its value is block-like.
-	fn ends_in_block(&self, ast: &AST) -> bool {
+	fn ends_in_block(&self, ast: &AstBuilder) -> bool {
 		match *self {
-			Statement::Expression(expr) => ast.expr(expr).is_block_like(),
+			Statement::Expression(expr) => {
+				ast.exprs.kinds[usize::from(expr)].is_block_like()
+			}
 			Statement::LocalDefinition { .. } => false,
 		}
 	}
 }
 
 impl ListItem for MatchArm {
-	fn ends_in_block(&self, ast: &AST) -> bool {
-		ast.expr(self.body).is_block_like()
+	fn ends_in_block(&self, ast: &AstBuilder) -> bool {
+		ast.exprs.kinds[usize::from(self.body)].is_block_like()
 	}
 }
 
 impl ListItem for Item {
-	fn ends_in_block(&self, _ast: &AST) -> bool {
+	fn ends_in_block(&self, _ast: &AstBuilder) -> bool {
 		self.is_block_like()
 	}
 }
 
 impl ListItem for ImplItem {
-	fn ends_in_block(&self, _ast: &AST) -> bool {
+	fn ends_in_block(&self, _ast: &AstBuilder) -> bool {
 		match self {
 			ImplItem::Function { .. } => true,
 			ImplItem::Constant { .. } | ImplItem::AssocType { .. } => false,
@@ -639,7 +643,7 @@ impl ListItem for ImplItem {
 }
 
 impl ListItem for TraitItem {
-	fn ends_in_block(&self, _ast: &AST) -> bool {
+	fn ends_in_block(&self, _ast: &AstBuilder) -> bool {
 		match self {
 			TraitItem::Function { body, .. } => body.is_some(),
 			TraitItem::Const { .. } | TraitItem::AssociatedType { .. } => false,
@@ -666,13 +670,15 @@ impl<'ctx> Parser<'ctx> {
 		file_id: FileId,
 		files: &'ctx vfs::Files,
 		strings: &'ctx mut StringInterner,
-	) -> AST {
+	) -> Parsed {
 		let source = &files.get(file_id).unwrap().source;
 		let mut parser = Self {
 			source,
 			lexer: Lexer::new(source),
 			strings,
-			ast: AST::new(file_id),
+			file_id,
+			ast: AstBuilder::default(),
+			diagnostics: Vec::new(),
 		};
 
 		let mut items: Vec<Spanned<Item>> = Vec::new();
@@ -712,10 +718,10 @@ impl<'ctx> Parser<'ctx> {
 				Err(_) => continue,
 			}
 		}
-		parser.ast.root = parser.ast.push_nodes(items);
+		let root = parser.ast.push_nodes(items);
 
 		if parser.lexer.has_crlf {
-			parser.ast.diagnostics.push(Diagnostic::warning()
+			parser.diagnostics.push(Diagnostic::warning()
 				.with_code(DiagnosticCode::CrlfLineEndings.code())
 				.with_message("file contains carriage returns (`\\r\\n`)")
 				.with_label(
@@ -725,21 +731,29 @@ impl<'ctx> Parser<'ctx> {
 			);
 		}
 
-		let Parser { mut ast, lexer, .. } = parser;
+		let Parser {
+			lexer,
+			ast,
+			mut diagnostics,
+			..
+		} = parser;
 		// Appended, in whatever position they land: nothing downstream reads
 		// diagnostics positionally, each one carries its own span, and the
 		// CRLF warning above is already out of source order. `extend` over an
 		// exact-size iterator reserves once and moves each `Diagnostic` — not
 		// a cheap thing to shuffle, holding an owned message and two `Vec`s —
 		// exactly once.
-		ast.diagnostics.extend(
+		diagnostics.extend(
 			lexer
 				.unknown_spans
 				.iter()
 				.map(|span| report_unknown_token(file_id, *span)),
 		);
-		ast.comments = CommentMap(lexer.comments.into_boxed_slice());
-		ast
+		Parsed {
+			ast: ast.finish(root),
+			comments: CommentMap(lexer.comments.into_boxed_slice()),
+			diagnostics,
+		}
 	}
 
 	fn recover_from_invalid_item(
@@ -761,8 +775,8 @@ impl<'ctx> Parser<'ctx> {
 			}
 		};
 
-		self.ast.diagnostics.push(report_invalid_item(
-			self.ast.file_id,
+		self.diagnostics.push(report_invalid_item(
+			self.file_id,
 			match end_token {
 				Some(end_token) => {
 					TextSpan::new(start_token.span.start, end_token.span.end)
@@ -857,8 +871,8 @@ impl<'ctx> Parser<'ctx> {
 			} else if next == Token::Eof {
 				break self.report_unclosed(delimiters, open, end);
 			} else if needs {
-				self.ast.diagnostics.push(report_missing_separator(
-					self.ast.file_id,
+				self.diagnostics.push(report_missing_separator(
+					self.file_id,
 					TextSpan::new(end, end),
 					delimiters.separator,
 				));
@@ -895,9 +909,9 @@ impl<'ctx> Parser<'ctx> {
 		at: u32,
 	) -> TextSpan {
 		let expected_close_span = TextSpan::new(at, at);
-		self.ast.diagnostics.push(report_unclosed_delimiter(
+		self.diagnostics.push(report_unclosed_delimiter(
 			UnclosedDelimiterDiagnostic {
-				file_id: self.ast.file_id,
+				file_id: self.file_id,
 				close_token: delimiters.close,
 				open_span: open,
 				expected_close_span,
@@ -908,7 +922,7 @@ impl<'ctx> Parser<'ctx> {
 
 	/// A delimited list's items, written whole into the tree, spanned by
 	/// its delimiters.
-	fn push_delimited<T: InVec>(
+	fn push_delimited<T: BuildVec>(
 		&mut self,
 		list: Delimited<T>,
 	) -> Spanned<List<T>> {
@@ -921,7 +935,7 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// [`Parser::push_delimited`], for nodes kept with their spans.
-	fn push_delimited_nodes<T: InColumn>(
+	fn push_delimited_nodes<T: BuildColumn>(
 		&mut self,
 		list: Delimited<T>,
 	) -> Spanned<List<T>> {
@@ -939,8 +953,8 @@ impl<'ctx> Parser<'ctx> {
 		if token.inner == expected_token {
 			Ok(token)
 		} else {
-			self.ast.diagnostics.push(report_unexpected_token(
-				self.ast.file_id,
+			self.diagnostics.push(report_unexpected_token(
+				self.file_id,
 				token,
 				expected_token,
 			));
@@ -979,16 +993,16 @@ impl<'ctx> Parser<'ctx> {
 				.get_or_intern(token.span.extract_str(self.source)),
 			Token::Keyword(keyword) => {
 				if !allowed.contains(&keyword) {
-					self.ast.diagnostics.push(report_reserved_identifier(
-						self.ast.file_id,
+					self.diagnostics.push(report_reserved_identifier(
+						self.file_id,
 						token.span,
 					));
 				}
 				keyword.symbol()
 			}
 			_ => {
-				self.ast.diagnostics.push(report_unexpected_token(
-					self.ast.file_id,
+				self.diagnostics.push(report_unexpected_token(
+					self.file_id,
 					token,
 					Token::Identifier,
 				));
@@ -1014,8 +1028,8 @@ impl<'ctx> Parser<'ctx> {
 				name_token.inner,
 				Token::Identifier | Token::Keyword(_)
 			) {
-				parser.ast.diagnostics.push(report_invalid_attribute(
-					parser.ast.file_id,
+				parser.diagnostics.push(report_invalid_attribute(
+					parser.file_id,
 					name_token.span,
 				));
 				return Err(());
@@ -1035,9 +1049,9 @@ impl<'ctx> Parser<'ctx> {
 
 			let close_token = parser.lexer.peek();
 			if close_token.inner != Token::CloseBracket {
-				parser.ast.diagnostics.push(report_unclosed_delimiter(
+				parser.diagnostics.push(report_unclosed_delimiter(
 					UnclosedDelimiterDiagnostic {
-						file_id: parser.ast.file_id,
+						file_id: parser.file_id,
 						open_span: open_bracket.span,
 						close_token: Token::CloseBracket,
 						expected_close_span: close_token.span,
@@ -1090,7 +1104,7 @@ impl<'ctx> Parser<'ctx> {
 					}
 				}
 				let close = parser.next_expect(Token::CloseParen)?.span;
-				parser.ast.diagnostics.push(
+				parser.diagnostics.push(
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::AttributeArgumentsAreNamed.code(),
@@ -1099,7 +1113,7 @@ impl<'ctx> Parser<'ctx> {
 							"an attribute's arguments are named as a call's",
 						)
 						.with_label(Label::primary(
-							parser.ast.file_id,
+							parser.file_id,
 							TextSpan::new(open.start, close.end),
 						))
 						.with_note("write `#[name({ argument: value, .. })]`"),
@@ -1115,7 +1129,10 @@ impl<'ctx> Parser<'ctx> {
 		let start = parser.lexer.peek().span.start;
 		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
-			span: TextSpan::new(start, parser.ast.type_span(ty).end),
+			span: TextSpan::new(
+				start,
+				parser.ast.types.spans[usize::from(ty)].end,
+			),
 			inner: FunctionParam { binding, ty },
 		})
 	}
@@ -1140,10 +1157,9 @@ impl<'ctx> Parser<'ctx> {
 		);
 		if !named {
 			if let Some(mut_span) = mut_span {
-				parser.ast.diagnostics.push(report_mut_without_name(
-					parser.ast.file_id,
-					mut_span,
-				));
+				parser
+					.diagnostics
+					.push(report_mut_without_name(parser.file_id, mut_span));
 			}
 			return Ok((None, parser.parse_type_expression()?));
 		}
@@ -1161,8 +1177,8 @@ impl<'ctx> Parser<'ctx> {
 		if let Some(colon) = parser.lexer.next_if(Token::Colon) {
 			let binding = if underscore {
 				if let Some(mut_span) = mut_span {
-					parser.ast.diagnostics.push(report_mut_without_name(
-						parser.ast.file_id,
+					parser.diagnostics.push(report_mut_without_name(
+						parser.file_id,
 						mut_span,
 					));
 				}
@@ -1196,10 +1212,9 @@ impl<'ctx> Parser<'ctx> {
 		match mut_span {
 			// `mut _`: the type `_`, without the `mut`.
 			Some(mut_span) if underscore => {
-				parser.ast.diagnostics.push(report_mut_without_name(
-					parser.ast.file_id,
-					mut_span,
-				));
+				parser
+					.diagnostics
+					.push(report_mut_without_name(parser.file_id, mut_span));
 				Ok((
 					None,
 					parser.ast.push_type(TypeExpression::Infer, name_span),
@@ -1214,10 +1229,9 @@ impl<'ctx> Parser<'ctx> {
 						Token::Comma | Token::CloseParen
 					) =>
 			{
-				parser.ast.diagnostics.push(report_mut_without_name(
-					parser.ast.file_id,
-					mut_span,
-				));
+				parser
+					.diagnostics
+					.push(report_mut_without_name(parser.file_id, mut_span));
 				Ok((None, parser.parse_type_path_from(name)?))
 			}
 			// `_` is the type `_`.
@@ -1228,8 +1242,8 @@ impl<'ctx> Parser<'ctx> {
 			None if !receiver => Ok((None, parser.parse_type_path_from(name)?)),
 			// `mut x`, `self` or `mut self`: a name, but no type.
 			_ => {
-				parser.ast.diagnostics.push(report_binding_without_type(
-					parser.ast.file_id,
+				parser.diagnostics.push(report_binding_without_type(
+					parser.file_id,
 					name_span,
 				));
 				let missing = parser.ast.push_type(
@@ -1262,7 +1276,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(
 			fn_span.span.start,
 			match result {
-				Some(result) => self.ast.type_span(result).end,
+				Some(result) => self.ast.types.spans[usize::from(result)].end,
 				None => params.span.end,
 			},
 		);
@@ -1313,8 +1327,8 @@ impl<'ctx> Parser<'ctx> {
 					Token::Float => Literal::Float,
 					// `-` must be followed by the number it negates.
 					_ => {
-						self.ast.diagnostics.push(report_unexpected_token(
-							self.ast.file_id,
+						self.diagnostics.push(report_unexpected_token(
+							self.file_id,
 							number,
 							Token::Int,
 						));
@@ -1347,9 +1361,9 @@ impl<'ctx> Parser<'ctx> {
 				break;
 			}
 			if peeked.inner == Token::Eof {
-				self.ast.diagnostics.push(report_unclosed_delimiter(
+				self.diagnostics.push(report_unclosed_delimiter(
 					UnclosedDelimiterDiagnostic {
-						file_id: self.ast.file_id,
+						file_id: self.file_id,
 						open_span,
 						close_token: Token::RightArrow,
 						expected_close_span: peeked.span,
@@ -1373,7 +1387,7 @@ impl<'ctx> Parser<'ctx> {
 				Some(const_span) => {
 					self.next_expect(Token::Colon)?;
 					let ty = self.parse_type_expression()?;
-					let end = self.ast.type_span(ty).end;
+					let end = self.ast.types.spans[usize::from(ty)].end;
 					(
 						TypeParam::Const {
 							const_span,
@@ -1391,7 +1405,7 @@ impl<'ctx> Parser<'ctx> {
 						None => None,
 					};
 					let end = bounds.map_or(name.span.end, |bounds| {
-						self.ast.bound_span(bounds).end
+						self.ast.bounds.spans[usize::from(bounds)].end
 					});
 					(TypeParam::Type { name, bounds }, end)
 				}
@@ -1422,9 +1436,9 @@ impl<'ctx> Parser<'ctx> {
 		if peeked.inner == Token::DoubleRightArrow {
 			return self.lexer.split_double_right_arrow();
 		}
-		self.ast.diagnostics.push(report_unclosed_delimiter(
+		self.diagnostics.push(report_unclosed_delimiter(
 			UnclosedDelimiterDiagnostic {
-				file_id: self.ast.file_id,
+				file_id: self.file_id,
 				open_span,
 				close_token: Token::RightArrow,
 				expected_close_span: peeked.span,
@@ -1454,9 +1468,9 @@ impl<'ctx> Parser<'ctx> {
 				break self.lexer.split_double_right_arrow();
 			}
 			if peeked.inner == Token::Eof {
-				self.ast.diagnostics.push(report_unclosed_delimiter(
+				self.diagnostics.push(report_unclosed_delimiter(
 					UnclosedDelimiterDiagnostic {
-						file_id: self.ast.file_id,
+						file_id: self.file_id,
 						open_span,
 						close_token: Token::RightArrow,
 						expected_close_span: peeked.span,
@@ -1472,11 +1486,16 @@ impl<'ctx> Parser<'ctx> {
 			}
 		};
 
+		let span_of = |argument| match argument {
+			TypeArgument::Type(ty) => self.ast.types.spans[usize::from(ty)],
+			TypeArgument::Const(constant) => {
+				self.ast.consts.spans[usize::from(constant)]
+			}
+		};
 		let args_span = match (args.first(), args.last()) {
-			(Some(&first), Some(&last)) => TextSpan::new(
-				self.ast.type_argument_span(first).start,
-				self.ast.type_argument_span(last).end,
-			),
+			(Some(&first), Some(&last)) => {
+				TextSpan::new(span_of(first).start, span_of(last).end)
+			}
 			_ => TextSpan::new(open_span.end, open_span.end),
 		};
 		Ok((self.ast.push_list(args), args_span, close_span))
@@ -1496,8 +1515,8 @@ impl<'ctx> Parser<'ctx> {
 		if let Some(span) = const_span
 			&& (self.at_literal() || at_underscore)
 		{
-			self.ast.diagnostics.push(report_redundant_const_marker(
-				self.ast.file_id,
+			self.diagnostics.push(report_redundant_const_marker(
+				self.file_id,
 				span,
 				"this argument is a constant already",
 			));
@@ -1561,8 +1580,8 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_length(&mut self) -> Result<ConstId, ()> {
 		if let Some(Keyword::Const) = self.peek_keyword() {
 			let span = self.lexer.next().span;
-			self.ast.diagnostics.push(report_redundant_const_marker(
-				self.ast.file_id,
+			self.diagnostics.push(report_redundant_const_marker(
+				self.file_id,
 				span,
 				"a length is a constant already",
 			));
@@ -1588,9 +1607,9 @@ impl<'ctx> Parser<'ctx> {
 				break self.lexer.next().span;
 			}
 			if peeked.inner == Token::Eof {
-				self.ast.diagnostics.push(report_unclosed_delimiter(
+				self.diagnostics.push(report_unclosed_delimiter(
 					UnclosedDelimiterDiagnostic {
-						file_id: self.ast.file_id,
+						file_id: self.file_id,
 						open_span,
 						close_token: Token::CloseBrace,
 						expected_close_span: peeked.span,
@@ -1611,17 +1630,17 @@ impl<'ctx> Parser<'ctx> {
 			let (kind, end) = match (const_span, colon) {
 				(None, Some(colon)) => {
 					let bound = self.parse_bounds_expression(colon.span.end)?;
-					let end = self.ast.bound_span(bound).end;
+					let end = self.ast.bounds.spans[usize::from(bound)].end;
 					(AssocBindingKind::Bound(bound), end)
 				}
 				(None, None) => {
 					let ty = self.parse_type_expression()?;
-					let end = self.ast.type_span(ty).end;
+					let end = self.ast.types.spans[usize::from(ty)].end;
 					(AssocBindingKind::Equals(ty), end)
 				}
 				(Some(const_span), Some(_)) => {
 					let ty = self.parse_type_expression()?;
-					let end = self.ast.type_span(ty).end;
+					let end = self.ast.types.spans[usize::from(ty)].end;
 					(
 						AssocBindingKind::ConstRepresentable { const_span, ty },
 						end,
@@ -1629,7 +1648,7 @@ impl<'ctx> Parser<'ctx> {
 				}
 				(Some(const_span), None) => {
 					let value = self.parse_const_argument()?;
-					let end = self.ast.const_span(value).end;
+					let end = self.ast.consts.spans[usize::from(value)].end;
 					(AssocBindingKind::ConstEquals { const_span, value }, end)
 				}
 			};
@@ -1664,8 +1683,8 @@ impl<'ctx> Parser<'ctx> {
 				| Token::CloseBrace
 				| Token::Eof
 		) {
-			self.ast.diagnostics.push(report_unexpected_token(
-				self.ast.file_id,
+			self.diagnostics.push(report_unexpected_token(
+				self.file_id,
 				token,
 				Token::Identifier,
 			));
@@ -1691,7 +1710,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(
 			signature.span.start,
 			match block {
-				Some(block) => parser.ast.block_span(block).end,
+				Some(block) => parser.ast.blocks.spans[usize::from(block)].end,
 				None => signature.span.end,
 			},
 		);
@@ -1835,8 +1854,8 @@ impl<'ctx> Parser<'ctx> {
 				| Token::SemiColon
 				| Token::Eq
 		) {
-			self.ast.diagnostics.push(report_unexpected_token(
-				self.ast.file_id,
+			self.diagnostics.push(report_unexpected_token(
+				self.file_id,
 				token,
 				Token::Identifier,
 			));
@@ -1854,8 +1873,8 @@ impl<'ctx> Parser<'ctx> {
 			bounds.push(self.parse_bound()?);
 		}
 		let span = TextSpan::new(
-			self.ast.bound_span(bounds[0]).start,
-			self.ast.bound_span(*bounds.last().unwrap()).end,
+			self.ast.bounds.spans[usize::from(bounds[0])].start,
+			self.ast.bounds.spans[usize::from(*bounds.last().unwrap())].end,
 		);
 		let bounds = self.ast.push_list(bounds);
 		Ok(self
@@ -1906,8 +1925,8 @@ impl<'ctx> Parser<'ctx> {
 			// No type starts here: reported, and the token is left for
 			// whatever it closes or starts.
 			_ => {
-				self.ast.diagnostics.push(report_unexpected_token(
-					self.ast.file_id,
+				self.diagnostics.push(report_unexpected_token(
+					self.file_id,
 					token,
 					Token::Identifier,
 				));
@@ -1958,9 +1977,9 @@ impl<'ctx> Parser<'ctx> {
 				// whatever it closes or starts.
 				_ => {
 					let token = self.lexer.peek();
-					self.ast.diagnostics.push(
+					self.diagnostics.push(
 						report_expected_path_segment_or_memory_tag(
-							self.ast.file_id,
+							self.file_id,
 							token,
 						),
 					);
@@ -2048,7 +2067,8 @@ impl<'ctx> Parser<'ctx> {
 		let memory = memory.map(|segments| self.ast.push_list(segments));
 
 		let inner = self.parse_type_expression()?;
-		let span = TextSpan::new(start, self.ast.type_span(inner).end);
+		let span =
+			TextSpan::new(start, self.ast.types.spans[usize::from(inner)].end);
 		Ok(self.ast.push_type(
 			TypeExpression::Pointer {
 				ownership,
@@ -2079,8 +2099,8 @@ impl<'ctx> Parser<'ctx> {
 				))
 			}
 			_ => {
-				self.ast.diagnostics.push(report_unexpected_token(
-					self.ast.file_id,
+				self.diagnostics.push(report_unexpected_token(
+					self.file_id,
 					next,
 					Token::CloseBracket,
 				));
@@ -2094,7 +2114,7 @@ impl<'ctx> Parser<'ctx> {
 		let ty = parser.parse_type_expression()?;
 		Ok(Spanned {
 			inner: ty,
-			span: parser.ast.type_span(ty),
+			span: parser.ast.types.spans[usize::from(ty)],
 		})
 	}
 
@@ -2114,13 +2134,15 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<FunctionTypeParam>, ()> {
 		let ty = parser.parse_type_expression()?;
 		// A single-segment path followed by `:` is a named parameter (`self: T`).
-		let single_ident = match parser.ast.ty(ty) {
-			TypeExpression::Path(segments) => match parser.ast.list(segments) {
-				[segment] if segment.type_args.is_empty() => {
-					Some(segment.ident)
+		let single_ident = match parser.ast.types.kinds[usize::from(ty)] {
+			TypeExpression::Path(segments) => {
+				match &parser.ast.segments[segments.range()] {
+					[segment] if segment.type_args.is_empty() => {
+						Some(segment.ident)
+					}
+					_ => None,
 				}
-				_ => None,
-			},
+			}
 			_ => None,
 		};
 		let (name, ty) = match single_ident {
@@ -2130,7 +2152,7 @@ impl<'ctx> Parser<'ctx> {
 			_ => (None, ty),
 		};
 
-		let ty_span = parser.ast.type_span(ty);
+		let ty_span = parser.ast.types.spans[usize::from(ty)];
 		let span =
 			TextSpan::new(name.map_or(ty_span, |n| n.span).start, ty_span.end);
 		Ok(Spanned {
@@ -2150,8 +2172,9 @@ impl<'ctx> Parser<'ctx> {
 			Some(_) => Some(Parser::parse_type_expression(self)?),
 			None => None,
 		};
-		let end = result
-			.map_or(params.span.end, |result| self.ast.type_span(result).end);
+		let end = result.map_or(params.span.end, |result| {
+			self.ast.types.spans[usize::from(result)].end
+		});
 		Ok(self.ast.push_type(
 			TypeExpression::Function {
 				params: list,
@@ -2272,9 +2295,8 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<ExprId, ()> {
 		let token = self.lexer.peek();
 		if !Self::starts_expression(token.inner) {
-			self.ast
-				.diagnostics
-				.push(report_expected_expression(self.ast.file_id, token));
+			self.diagnostics
+				.push(report_expected_expression(self.file_id, token));
 			return Err(());
 		}
 		let mut left = self.parse_prefix()?;
@@ -2288,13 +2310,13 @@ impl<'ctx> Parser<'ctx> {
 		// statement list, what follows is the next statement: `if c { .. }
 		// (a, b)` is two. Once that is reported, the operators are read as
 		// before, so the caller sees one diagnostic and a whole expression.
-		let kind = self.ast.expr(left);
+		let kind = self.ast.exprs.kinds[usize::from(left)];
 		if kind.is_block_like() {
 			let token = self.lexer.peek();
-			let span = self.ast.expr_span(left);
+			let span = self.ast.exprs.spans[usize::from(left)];
 			if limit_bp > BindingPower::Assignment {
-				self.ast.diagnostics.push(report_block_like_operand(
-					self.ast.file_id,
+				self.diagnostics.push(report_block_like_operand(
+					self.file_id,
 					kind,
 					span,
 					None,
@@ -2307,8 +2329,8 @@ impl<'ctx> Parser<'ctx> {
 				// can also start one (`(`, `[`, `-`) starts whatever comes
 				// next, and one that binds no tighter than `limit_bp`
 				// continues an enclosing expression instead.
-				self.ast.diagnostics.push(report_block_like_operand(
-					self.ast.file_id,
+				self.diagnostics.push(report_block_like_operand(
+					self.file_id,
 					kind,
 					span,
 					Some(token.span),
@@ -2401,10 +2423,8 @@ impl<'ctx> Parser<'ctx> {
 				// and kept, so the path up to it is still resolved.
 				_ => {
 					let bad = self.lexer.peek();
-					self.ast.diagnostics.push(report_invalid_namespace(
-						self.ast.file_id,
-						bad.span,
-					));
+					self.diagnostics
+						.push(report_invalid_namespace(self.file_id, bad.span));
 					segments.push(PathSegment::missing(colons.span.end));
 					break;
 				}
@@ -2425,9 +2445,8 @@ impl<'ctx> Parser<'ctx> {
 		let named = self.parse_named_arguments()?;
 		if self.lexer.peek().inner != Token::CloseParen {
 			let at = self.lexer.peek().span;
-			self.ast
-				.diagnostics
-				.push(report_mixed_call_arguments(self.ast.file_id, at));
+			self.diagnostics
+				.push(report_mixed_call_arguments(self.file_id, at));
 			while self.lexer.next_if(Token::Comma).is_some()
 				&& self.lexer.peek().inner != Token::CloseParen
 			{
@@ -2448,9 +2467,8 @@ impl<'ctx> Parser<'ctx> {
 		}
 		let named = parser.parse_named_arguments()?;
 		parser
-			.ast
 			.diagnostics
-			.push(report_mixed_call_arguments(parser.ast.file_id, named.span));
+			.push(report_mixed_call_arguments(parser.file_id, named.span));
 		Ok(Spanned {
 			inner: parser.ast.push_expr(Expression::Error, named.span),
 			span: named.span,
@@ -2485,9 +2503,8 @@ impl<'ctx> Parser<'ctx> {
 			parser.parse_expression(BindingPower::Default)?
 		} else {
 			parser
-				.ast
 				.diagnostics
-				.push(report_expected_expression(parser.ast.file_id, token));
+				.push(report_expected_expression(parser.file_id, token));
 			parser.ast.push_expr(
 				Expression::Error,
 				TextSpan::new(colon.span.end, token.span.start),
@@ -2500,7 +2517,7 @@ impl<'ctx> Parser<'ctx> {
 			},
 			span: TextSpan::new(
 				name.span.start,
-				parser.ast.expr_span(value).end,
+				parser.ast.exprs.spans[usize::from(value)].end,
 			),
 		})
 	}
@@ -2517,11 +2534,11 @@ impl<'ctx> Parser<'ctx> {
 		let callee = self.ast.push_expr(Expression::Path(path), path_span);
 		let named = self.parse_named_arguments()?;
 		let span = TextSpan::new(path_span.start, named.span.end);
-		self.ast.diagnostics.push(
+		self.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::StructLiteralIsACall.code())
 				.with_message("a struct is constructed by a call")
-				.with_label(Label::primary(self.ast.file_id, span))
+				.with_label(Label::primary(self.file_id, span))
 				.with_note("write `Name({ field: value, ... })`"),
 		);
 		Ok(self.ast.push_expr(
@@ -2538,7 +2555,7 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 		object: ExprId,
 	) -> Result<ExprId, ()> {
-		let start = self.ast.expr_span(object).start;
+		let start = self.ast.exprs.spans[usize::from(object)].start;
 		let dot = self.lexer.next(); // consume the dot
 		let token = self.lexer.peek();
 		let span = TextSpan::new(start, token.span.end);
@@ -2567,8 +2584,8 @@ impl<'ctx> Parser<'ctx> {
 			// missing one, so the object is still checked, and the token
 			// after the dot is left to close or start whatever it does.
 			_ => {
-				self.ast.diagnostics.push(report_missing_member(
-					self.ast.file_id,
+				self.diagnostics.push(report_missing_member(
+					self.file_id,
 					token,
 					self.source,
 				));
@@ -2596,12 +2613,10 @@ impl<'ctx> Parser<'ctx> {
 
 		let token = self.lexer.peek();
 		if !Self::starts_expression(token.inner) {
-			self.ast
-				.diagnostics
-				.push(report_incomplete_binary_expression(
-					self.ast.file_id,
-					operator_token.span,
-				));
+			self.diagnostics.push(report_incomplete_binary_expression(
+				self.file_id,
+				operator_token.span,
+			));
 			return Err(());
 		}
 		let right = self.parse_expression(bp)?;
@@ -2612,23 +2627,27 @@ impl<'ctx> Parser<'ctx> {
 		// Operators parse left-grouped, so a chain is always in `left`;
 		// written parentheses make a tuple, which is no chain.
 		if let Expression::Binary {
-			operator: left_operator,
+			operator,
+			operator_start,
 			..
-		} = self.ast.expr(left)
-			&& BindingPower::from(left_operator) == bp
+		} = self.ast.exprs.kinds[usize::from(left)]
+			&& BindingPower::from(operator) == bp
 		{
-			let left_operator = self.ast.operator_span(left);
+			let left_operator = TextSpan::new(
+				operator_start,
+				operator_start + operator.as_str().len() as u32,
+			);
 			match bp {
 				BindingPower::Comparison => {
-					self.ast.diagnostics.push(report_chained_comparisons(
-						self.ast.file_id,
+					self.diagnostics.push(report_chained_comparisons(
+						self.file_id,
 						left_operator,
 						operator_token.span,
 					));
 				}
 				BindingPower::Assignment => {
-					self.ast.diagnostics.push(report_chained_assignments(
-						self.ast.file_id,
+					self.diagnostics.push(report_chained_assignments(
+						self.file_id,
 						left_operator,
 						operator_token.span,
 					));
@@ -2638,8 +2657,8 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		let span = TextSpan::new(
-			self.ast.expr_span(left).start,
-			self.ast.expr_span(right).end,
+			self.ast.exprs.spans[usize::from(left)].start,
+			self.ast.exprs.spans[usize::from(right)].end,
 		);
 		Ok(self.ast.push_expr(
 			Expression::Binary {
@@ -2668,9 +2687,8 @@ impl<'ctx> Parser<'ctx> {
 			text.parse::<u64>().ok()
 		};
 		value.unwrap_or_else(|| {
-			self.ast
-				.diagnostics
-				.push(report_invalid_integer_literal(self.ast.file_id, span));
+			self.diagnostics
+				.push(report_invalid_integer_literal(self.file_id, span));
 			0
 		})
 	}
@@ -2692,10 +2710,8 @@ impl<'ctx> Parser<'ctx> {
 		// preserved exactly in TIR. `coerce_float` checks representability;
 		// evaluation and lowering convert at the concrete target width.
 		if token.span.extract_str(self.source).parse::<f64>().is_err() {
-			self.ast.diagnostics.push(report_invalid_float_literal(
-				self.ast.file_id,
-				token.span,
-			));
+			self.diagnostics
+				.push(report_invalid_float_literal(self.file_id, token.span));
 		}
 		Ok(self.ast.push_expr(Expression::Float, token.span))
 	}
@@ -2709,8 +2725,10 @@ impl<'ctx> Parser<'ctx> {
 				.push_expr(Expression::Return { value: None }, return_span));
 		}
 		let value = self.parse_expression(BindingPower::Default)?;
-		let span =
-			TextSpan::new(return_span.start, self.ast.expr_span(value).end);
+		let span = TextSpan::new(
+			return_span.start,
+			self.ast.exprs.spans[usize::from(value)].end,
+		);
 		Ok(self
 			.ast
 			.push_expr(Expression::Return { value: Some(value) }, span))
@@ -2726,7 +2744,7 @@ impl<'ctx> Parser<'ctx> {
 			None
 		};
 		let end = match (label, value) {
-			(_, Some(value)) => self.ast.expr_span(value).end,
+			(_, Some(value)) => self.ast.exprs.spans[usize::from(value)].end,
 			(Some(label), None) => label.span.end,
 			(None, None) => break_keyword.span.end,
 		};
@@ -2761,12 +2779,15 @@ impl<'ctx> Parser<'ctx> {
 	/// An element of a parenthesized list: an expression, or `value: Type`.
 	fn parse_element(parser: &mut Parser) -> Result<Spanned<ExprId>, ()> {
 		let value = parser.parse_expression(BindingPower::Default)?;
-		let start = parser.ast.expr_span(value).start;
+		let start = parser.ast.exprs.spans[usize::from(value)].start;
 		let (id, end) = if parser.lexer.next_if(Token::Colon).is_none() {
-			(value, parser.ast.expr_span(value).end)
+			(value, parser.ast.exprs.spans[usize::from(value)].end)
 		} else {
 			let ty = parser.parse_type_expression()?;
-			let span = TextSpan::new(start, parser.ast.type_span(ty).end);
+			let span = TextSpan::new(
+				start,
+				parser.ast.types.spans[usize::from(ty)].end,
+			);
 			let id = parser
 				.ast
 				.push_expr(Expression::Ascription { value, ty }, span);
@@ -2787,18 +2808,16 @@ impl<'ctx> Parser<'ctx> {
 
 		let token = self.lexer.peek();
 		if !Self::starts_expression(token.inner) {
-			self.ast
-				.diagnostics
-				.push(report_incomplete_unary_expression(
-					self.ast.file_id,
-					operator_token.span,
-				));
+			self.diagnostics.push(report_incomplete_unary_expression(
+				self.file_id,
+				operator_token.span,
+			));
 			return Err(());
 		}
 		let operand = self.parse_expression(BindingPower::Unary)?;
 		let span = TextSpan::new(
 			operator_token.span.start,
-			self.ast.expr_span(operand).end,
+			self.ast.exprs.spans[usize::from(operand)].end,
 		);
 		Ok(self
 			.ast
@@ -2812,8 +2831,10 @@ impl<'ctx> Parser<'ctx> {
 		let keyword_span = self.lexer.next().span;
 		let label = self.parse_label();
 		let block = self.parse_block()?;
-		let span =
-			TextSpan::new(keyword_span.start, self.ast.block_span(block).end);
+		let span = TextSpan::new(
+			keyword_span.start,
+			self.ast.blocks.spans[usize::from(block)].end,
+		);
 		Ok(self.ast.push_expr(Expression::Block { label, block }, span))
 	}
 
@@ -2826,8 +2847,8 @@ impl<'ctx> Parser<'ctx> {
 		let colon = self.lexer.next_if(Token::Colon)?;
 		let token = self.lexer.peek();
 		if token.inner != Token::Identifier {
-			self.ast.diagnostics.push(report_unexpected_token(
-				self.ast.file_id,
+			self.diagnostics.push(report_unexpected_token(
+				self.file_id,
 				token,
 				Token::Identifier,
 			));
@@ -2848,12 +2869,12 @@ impl<'ctx> Parser<'ctx> {
 	/// reported, and read as the block it was meant to be.
 	fn parse_bare_block_expression(&mut self) -> Result<ExprId, ()> {
 		let brace_span = self.lexer.peek().span;
-		self.ast.diagnostics.push(
+		self.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::BlockNeedsKeyword.code())
 				.with_message("a block expression is written `block { ... }`")
 				.with_label(
-					Label::primary(self.ast.file_id, brace_span)
+					Label::primary(self.file_id, brace_span)
 						.with_message("expected `block` before `{`"),
 				),
 		);
@@ -2864,7 +2885,7 @@ impl<'ctx> Parser<'ctx> {
 	/// arm's body), with no keyword and no label.
 	fn parse_block_expression(&mut self) -> Result<ExprId, ()> {
 		let block = self.parse_block()?;
-		let span = self.ast.block_span(block);
+		let span = self.ast.blocks.spans[usize::from(block)];
 		Ok(self
 			.ast
 			.push_expr(Expression::Block { label: None, block }, span))
@@ -2906,7 +2927,7 @@ impl<'ctx> Parser<'ctx> {
 		let expr = parser.parse_expression(BindingPower::Default)?;
 		Ok(Spanned {
 			inner: Statement::Expression(expr),
-			span: parser.ast.expr_span(expr),
+			span: parser.ast.exprs.spans[usize::from(expr)],
 		})
 	}
 
@@ -2916,7 +2937,7 @@ impl<'ctx> Parser<'ctx> {
 		let block = self.parse_block()?;
 		let span = TextSpan::new(
 			loop_keyword.span.start,
-			self.ast.block_span(block).end,
+			self.ast.blocks.spans[usize::from(block)].end,
 		);
 		Ok(self.ast.push_expr(Expression::Loop { label, block }, span))
 	}
@@ -2941,8 +2962,10 @@ impl<'ctx> Parser<'ctx> {
 			_ => None,
 		};
 		let end = match else_block {
-			Some(else_block) => self.ast.expr_span(else_block).end,
-			None => self.ast.block_span(then_block).end,
+			Some(else_block) => {
+				self.ast.exprs.spans[usize::from(else_block)].end
+			}
+			None => self.ast.blocks.spans[usize::from(then_block)].end,
 		};
 		let span = TextSpan::new(if_keyword.span.start, end);
 		let if_else = self.ast.push_expr(
@@ -2958,12 +2981,12 @@ impl<'ctx> Parser<'ctx> {
 		};
 		// Read as the block it would be written in, so a `break` to the label
 		// still finds it.
-		self.ast.diagnostics.push(
+		self.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::LabelOnIf.code())
 				.with_message("an `if` cannot be labelled")
 				.with_label(
-					Label::primary(self.ast.file_id, label.span)
+					Label::primary(self.file_id, label.span)
 						.with_message("a label names a `block` or a `loop`"),
 				)
 				.with_note(
@@ -3020,8 +3043,8 @@ impl<'ctx> Parser<'ctx> {
 		Ok(Spanned {
 			inner: MatchArm { pattern, body },
 			span: TextSpan::new(
-				parser.ast.pattern_span(pattern).start,
-				parser.ast.expr_span(body).end,
+				parser.ast.patterns.spans[usize::from(pattern)].start,
+				parser.ast.exprs.spans[usize::from(body)].end,
 			),
 		})
 	}
@@ -3038,9 +3061,11 @@ impl<'ctx> Parser<'ctx> {
 
 		if self.lexer.peek().inner == Token::LeftArrow {
 			let (args, args_span, close_span) = self.parse_type_args()?;
-			return match self.ast.expr(left) {
+			return match self.ast.exprs.kinds[usize::from(left)] {
 				Expression::ObjectAccess { member, .. }
-					if self.ast.segment(member).type_args.is_empty() =>
+					if self.ast.segments[usize::from(member)]
+						.type_args
+						.is_empty() =>
 				{
 					let segment = &mut self.ast.segments[usize::from(member)];
 					segment.type_args = args;
@@ -3050,8 +3075,8 @@ impl<'ctx> Parser<'ctx> {
 					Ok(left)
 				}
 				_ => {
-					self.ast.diagnostics.push(report_type_args_not_allowed(
-						self.ast.file_id,
+					self.diagnostics.push(report_type_args_not_allowed(
+						self.file_id,
 						TextSpan::new(colons.span.start, close_span.end),
 					));
 					Err(())
@@ -3060,9 +3085,8 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		let bad = self.lexer.peek();
-		self.ast
-			.diagnostics
-			.push(report_invalid_namespace(self.ast.file_id, bad.span));
+		self.diagnostics
+			.push(report_invalid_namespace(self.file_id, bad.span));
 		Err(())
 	}
 
@@ -3071,7 +3095,7 @@ impl<'ctx> Parser<'ctx> {
 	/// nothing else starts with `{` here), anything else a positional one.
 	/// A callee that names a method on an object makes it a method call.
 	fn parse_call_expression(&mut self, callee: ExprId) -> Result<ExprId, ()> {
-		let start = self.ast.expr_span(callee).start;
+		let start = self.ast.exprs.spans[usize::from(callee)].start;
 		let open = self.next_expect(Token::OpenParen)?.span;
 		if self.lexer.peek().inner == Token::OpenBrace {
 			let (arguments, end) = self.parse_named_call_arguments()?;
@@ -3145,8 +3169,10 @@ impl<'ctx> Parser<'ctx> {
 		_ = self.lexer.next(); // consume `[`
 		let index = self.parse_expression(BindingPower::Default)?;
 		let close_span = self.next_expect(Token::CloseBracket)?.span;
-		let span =
-			TextSpan::new(self.ast.expr_span(object).start, close_span.end);
+		let span = TextSpan::new(
+			self.ast.exprs.spans[usize::from(object)].start,
+			close_span.end,
+		);
 		Ok(self
 			.ast
 			.push_expr(Expression::Index { object, index }, span))
@@ -3165,7 +3191,7 @@ impl<'ctx> Parser<'ctx> {
 		let pattern = Parser::parse_pattern(parser)?;
 		Ok(Spanned {
 			inner: PatternElement::Pattern(pattern),
-			span: parser.ast.pattern_span(pattern),
+			span: parser.ast.patterns.spans[usize::from(pattern)],
 		})
 	}
 
@@ -3186,7 +3212,7 @@ impl<'ctx> Parser<'ctx> {
 			None
 		};
 		let end = pattern.map_or(name.span.end, |pattern| {
-			parser.ast.pattern_span(pattern).end
+			parser.ast.patterns.spans[usize::from(pattern)].end
 		});
 		Ok(Spanned {
 			inner: PatternFieldItem::Field(PatternField { name, pattern }),
@@ -3270,13 +3296,13 @@ impl<'ctx> Parser<'ctx> {
 		let path_start = path.first().unwrap().ident.span.start;
 		let named = Parser::parse_pattern_fields(parser)?;
 		let span = TextSpan::new(path_start, named.span.end);
-		parser.ast.diagnostics.push(
+		parser.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::StructLiteralIsACall.code())
 				.with_message(
 					"a struct pattern is written like its construction",
 				)
-				.with_label(Label::primary(parser.ast.file_id, span))
+				.with_label(Label::primary(parser.file_id, span))
 				.with_note("write `Name({ field, .. })` or `Name(a, b)`"),
 		);
 		Ok(PathTerm::Old(parser.ast.push_pattern(Pattern::Error, span)))
@@ -3319,8 +3345,8 @@ impl<'ctx> Parser<'ctx> {
 				// expression's path.
 				_ => {
 					let bad = parser.lexer.peek();
-					parser.ast.diagnostics.push(report_invalid_namespace(
-						parser.ast.file_id,
+					parser.diagnostics.push(report_invalid_namespace(
+						parser.file_id,
 						bad.span,
 					));
 					segments.push(PathSegment::missing(colons.span.end));
@@ -3379,9 +3405,8 @@ impl<'ctx> Parser<'ctx> {
 		);
 		if !ambiguous {
 			parser
-				.ast
 				.diagnostics
-				.push(report_redundant_const(parser.ast.file_id, const_span));
+				.push(report_redundant_const(parser.file_id, const_span));
 		}
 		let span = TextSpan::new(
 			const_span.start,
@@ -3402,8 +3427,10 @@ impl<'ctx> Parser<'ctx> {
 			alternatives.push(Parser::parse_primary(parser)?);
 		}
 		let span = TextSpan::new(
-			parser.ast.pattern_span(first).start,
-			parser.ast.pattern_span(*alternatives.last().unwrap()).end,
+			parser.ast.patterns.spans[usize::from(first)].start,
+			parser.ast.patterns.spans
+				[usize::from(*alternatives.last().unwrap())]
+			.end,
 		);
 		let alternatives = parser.ast.push_list(alternatives);
 		Ok(parser.ast.push_pattern(Pattern::Or(alternatives), span))
@@ -3449,9 +3476,8 @@ impl<'ctx> Parser<'ctx> {
 			Token::Keyword(Keyword::Local) => {
 				let span = parser.lexer.next().span;
 				parser
-					.ast
 					.diagnostics
-					.push(report_redundant_local(parser.ast.file_id, span));
+					.push(report_redundant_local(parser.file_id, span));
 				Err(())
 			}
 			Token::Identifier | Token::Keyword(_) => {
@@ -3459,8 +3485,8 @@ impl<'ctx> Parser<'ctx> {
 			}
 			_ => {
 				let token = parser.lexer.next();
-				parser.ast.diagnostics.push(report_unexpected_token(
-					parser.ast.file_id,
+				parser.diagnostics.push(report_unexpected_token(
+					parser.file_id,
 					token,
 					Token::Identifier,
 				));
@@ -3475,7 +3501,7 @@ impl<'ctx> Parser<'ctx> {
 		let local_keyword = parser.lexer.next();
 
 		let pattern = Parser::parse_pattern(parser)?;
-		let mut end = parser.ast.pattern_span(pattern).end;
+		let mut end = parser.ast.patterns.spans[usize::from(pattern)].end;
 
 		// A part not written yet (`local x: `, `local x: T`, `local x = `) is
 		// reported and kept as an error node, as a parameter's missing type
@@ -3495,7 +3521,7 @@ impl<'ctx> Parser<'ctx> {
 						parser.ast.push_type(TypeExpression::Error, gap)
 					}
 				};
-				end = parser.ast.type_span(ty).end;
+				end = parser.ast.types.spans[usize::from(ty)].end;
 				Some(ty)
 			}
 			None => None,
@@ -3510,13 +3536,10 @@ impl<'ctx> Parser<'ctx> {
 			if assigned.is_some() && Self::starts_expression(token.inner) {
 				parser.parse_expression(BindingPower::Default)?
 			} else {
-				parser
-					.ast
-					.diagnostics
-					.push(report_missing_local_initializer(
-						parser.ast.file_id,
-						token.span,
-					));
+				parser.diagnostics.push(report_missing_local_initializer(
+					parser.file_id,
+					token.span,
+				));
 				parser.ast.push_expr(
 					Expression::Error,
 					TextSpan::new(end, token.span.start),
@@ -3525,7 +3548,7 @@ impl<'ctx> Parser<'ctx> {
 
 		let span = TextSpan::new(
 			local_keyword.span.start,
-			parser.ast.expr_span(value).end,
+			parser.ast.exprs.spans[usize::from(value)].end,
 		);
 		Ok(Spanned {
 			inner: Statement::LocalDefinition { pattern, ty, value },
@@ -3555,20 +3578,17 @@ impl<'ctx> Parser<'ctx> {
 		let assigned = parser.lexer.next_if(Token::Eq).is_some();
 		let token = parser.lexer.peek();
 		if !assigned || !Self::starts_expression(token.inner) {
-			parser
-				.ast
-				.diagnostics
-				.push(report_missing_global_initializer(
-					parser.ast.file_id,
-					token.span,
-				));
+			parser.diagnostics.push(report_missing_global_initializer(
+				parser.file_id,
+				token.span,
+			));
 			return Err(());
 		}
 		let value = parser.parse_expression(BindingPower::Default)?;
 
 		let span = TextSpan::new(
 			global_keyword.span.start,
-			parser.ast.expr_span(value).end,
+			parser.ast.exprs.spans[usize::from(value)].end,
 		);
 		Ok(Spanned {
 			inner: Item::Global {
@@ -3599,8 +3619,10 @@ impl<'ctx> Parser<'ctx> {
 		let _ = parser.next_expect(Token::Eq)?;
 		let value = parser.parse_expression(BindingPower::Default)?;
 
-		let span =
-			TextSpan::new(const_span.start, parser.ast.expr_span(value).end);
+		let span = TextSpan::new(
+			const_span.start,
+			parser.ast.exprs.spans[usize::from(value)].end,
+		);
 		Ok(Spanned {
 			inner: Item::Const {
 				pub_span: None,
@@ -3681,12 +3703,12 @@ impl<'ctx> Parser<'ctx> {
 		// The repr is written like a struct's fields, `enum Ordering(i8)`.
 		// The old `enum Ordering: i8` is reported and read as the new form.
 		let repr = if let Some(colon) = parser.lexer.next_if(Token::Colon) {
-			parser.ast.diagnostics.push(
+			parser.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::EnumReprNeedsParentheses.code())
 					.with_message("an enum's repr is written in parentheses")
 					.with_label(
-						Label::primary(parser.ast.file_id, colon.span)
+						Label::primary(parser.file_id, colon.span)
 							.with_message("expected `(`"),
 					)
 					.with_note("write `enum Name(Type) { ... }`"),
@@ -3722,7 +3744,7 @@ impl<'ctx> Parser<'ctx> {
 						parser.parse_expression(BindingPower::Default)?;
 					let span = TextSpan::new(
 						name_token_span.start,
-						parser.ast.expr_span(expr).end,
+						parser.ast.exprs.spans[usize::from(expr)].end,
 					);
 					(Some(expr), span)
 				} else {
@@ -3778,7 +3800,7 @@ impl<'ctx> Parser<'ctx> {
 				let ty = parser.parse_type_expression()?;
 				let span = TextSpan::new(
 					type_span.start,
-					parser.ast.type_span(ty).end,
+					parser.ast.types.spans[usize::from(ty)].end,
 				);
 				Ok(Spanned {
 					inner: ImplItem::AssocType {
@@ -3810,7 +3832,7 @@ impl<'ctx> Parser<'ctx> {
 				let value = parser.parse_expression(BindingPower::Default)?;
 				let span = TextSpan::new(
 					const_span.start,
-					parser.ast.expr_span(value).end,
+					parser.ast.exprs.spans[usize::from(value)].end,
 				);
 				Ok(Spanned {
 					inner: ImplItem::Constant {
@@ -3846,7 +3868,7 @@ impl<'ctx> Parser<'ctx> {
 				let block = parser.parse_block()?;
 				let method_span = TextSpan::new(
 					fn_span.start,
-					parser.ast.block_span(block).end,
+					parser.ast.blocks.spans[usize::from(block)].end,
 				);
 				Ok(Spanned {
 					inner: ImplItem::Function {
@@ -3868,8 +3890,8 @@ impl<'ctx> Parser<'ctx> {
 			}
 			_ => {
 				let token = parser.lexer.next();
-				parser.ast.diagnostics.push(report_unexpected_token(
-					parser.ast.file_id,
+				parser.diagnostics.push(report_unexpected_token(
+					parser.file_id,
 					token,
 					Token::Identifier,
 				));
@@ -3893,7 +3915,6 @@ impl<'ctx> Parser<'ctx> {
 			let target = parser.parse_type_path()?;
 
 			let items = parser.separated(BLOCK, Parser::parse_impl_member)?;
-			let items = parser.push_delimited_nodes(items);
 
 			// A trait impl's members are reachable exactly where the trait
 			// is, so `pub` on one decides nothing. `parse_impl_member` still
@@ -3901,15 +3922,14 @@ impl<'ctx> Parser<'ctx> {
 			// carry visibility, and it has no way to tell which it is parsing
 			// — so the qualifier is judged here, where that is known, rather
 			// than by the member parser itself.
-			for index in 0..items.inner.len() {
+			for item in &items.items {
 				let (ImplItem::Function { pub_span, .. }
 				| ImplItem::Constant { pub_span, .. }
-				| ImplItem::AssocType { pub_span, .. }) =
-					parser.ast.list(items.inner)[index];
+				| ImplItem::AssocType { pub_span, .. }) = item.inner;
 				let Some(pub_span) = pub_span else {
 					continue;
 				};
-				parser.ast.diagnostics.push(
+				parser.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(
 							DiagnosticCode::VisibilityNotPermitted.code(),
@@ -3918,7 +3938,7 @@ impl<'ctx> Parser<'ctx> {
 							"visibility qualifiers are not permitted here",
 						)
 						.with_label(
-							Label::primary(parser.ast.file_id, pub_span)
+							Label::primary(parser.file_id, pub_span)
 								.with_message("remove the qualifier"),
 						)
 						.with_note(
@@ -3928,6 +3948,7 @@ impl<'ctx> Parser<'ctx> {
 				);
 			}
 
+			let items = parser.push_delimited_nodes(items);
 			let span = TextSpan::new(impl_span.start, items.span.end);
 			return Ok(Spanned {
 				inner: Item::TraitImpl {
@@ -3974,7 +3995,7 @@ impl<'ctx> Parser<'ctx> {
 
 				if let Some(Keyword::Pub) = parser.peek_keyword() {
 					let pub_span = parser.lexer.next().span;
-					parser.ast.diagnostics.push(
+					parser.diagnostics.push(
 						Diagnostic::warning()
 							.with_code(
 								DiagnosticCode::VisibilityNotPermitted.code(),
@@ -3983,7 +4004,7 @@ impl<'ctx> Parser<'ctx> {
 								"visibility qualifiers are not permitted here",
 							)
 							.with_label(
-								Label::primary(parser.ast.file_id, pub_span)
+								Label::primary(parser.file_id, pub_span)
 									.with_message("remove the qualifier"),
 							)
 							.with_note(
@@ -4018,10 +4039,13 @@ impl<'ctx> Parser<'ctx> {
 						let span = TextSpan::new(
 							type_span.start,
 							value
-								.map(|value| parser.ast.type_span(value))
+								.map(|value| {
+									parser.ast.types.spans[usize::from(value)]
+								})
 								.or_else(|| {
 									bounds.map(|bounds| {
-										parser.ast.bound_span(bounds)
+										parser.ast.bounds.spans
+											[usize::from(bounds)]
 									})
 								})
 								.unwrap_or(name_span)
@@ -4060,8 +4084,13 @@ impl<'ctx> Parser<'ctx> {
 						let span = TextSpan::new(
 							const_span.start,
 							match value {
-								Some(value) => parser.ast.expr_span(value).end,
-								None => parser.ast.type_span(ty).end,
+								Some(value) => {
+									parser.ast.exprs.spans[usize::from(value)]
+										.end
+								}
+								None => {
+									parser.ast.types.spans[usize::from(ty)].end
+								}
 							},
 						);
 						Ok(Spanned {
@@ -4088,7 +4117,10 @@ impl<'ctx> Parser<'ctx> {
 						let span = TextSpan::new(
 							signature.span.start,
 							match body {
-								Some(body) => parser.ast.block_span(body).end,
+								Some(body) => {
+									parser.ast.blocks.spans[usize::from(body)]
+										.end
+								}
 								None => signature.span.end,
 							},
 						);
@@ -4104,8 +4136,8 @@ impl<'ctx> Parser<'ctx> {
 					}
 					_ => {
 						let token = parser.lexer.next();
-						parser.ast.diagnostics.push(report_unexpected_token(
-							parser.ast.file_id,
+						parser.diagnostics.push(report_unexpected_token(
+							parser.file_id,
 							token,
 							Token::Identifier,
 						));
@@ -4189,14 +4221,14 @@ impl<'ctx> Parser<'ctx> {
 		// form: reported, and read the same way so the rest still parses.
 		let open_token = if parser.lexer.peek().inner == Token::OpenBrace {
 			let brace = parser.lexer.peek();
-			parser.ast.diagnostics.push(
+			parser.diagnostics.push(
 				Diagnostic::error()
 					.with_code(
 						DiagnosticCode::StructFieldsNeedParentheses.code(),
 					)
 					.with_message("struct fields are written in parentheses")
 					.with_label(
-						Label::primary(parser.ast.file_id, brace.span)
+						Label::primary(parser.file_id, brace.span)
 							.with_message("expected `(`"),
 					)
 					.with_note("write `struct Name(field: Type, ...);`"),
@@ -4245,7 +4277,10 @@ impl<'ctx> Parser<'ctx> {
 			.then(|| parser.lexer.next().span);
 		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
-			span: TextSpan::new(start, parser.ast.type_span(ty).end),
+			span: TextSpan::new(
+				start,
+				parser.ast.types.spans[usize::from(ty)].end,
+			),
 			inner: StructField {
 				pub_span,
 				binding,
@@ -4284,7 +4319,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		let end = match body {
-			Some(body) => parser.ast.type_span(body).end,
+			Some(body) => parser.ast.types.spans[usize::from(body)].end,
 			None => name_span.end,
 		};
 		let span = TextSpan::new(type_span.start, end);
@@ -4310,9 +4345,8 @@ impl<'ctx> Parser<'ctx> {
 			Ok(handler) => handler,
 			Err(_) => {
 				parser
-					.ast
 					.diagnostics
-					.push(report_invalid_item(parser.ast.file_id, token.span));
+					.push(report_invalid_item(parser.file_id, token.span));
 				return Err(());
 			}
 		};
@@ -4341,7 +4375,7 @@ impl<'ctx> Parser<'ctx> {
 			| Item::Import { .. }
 			| Item::InherentImpl { .. }
 			| Item::TraitImpl { .. } => {
-				parser.ast.diagnostics.push(
+				parser.diagnostics.push(
 					Diagnostic::warning()
 						.with_code(
 							DiagnosticCode::VisibilityNotPermitted.code(),
@@ -4350,7 +4384,7 @@ impl<'ctx> Parser<'ctx> {
 							"visibility qualifiers are not permitted here",
 						)
 						.with_label(
-							Label::primary(parser.ast.file_id, pub_span)
+							Label::primary(parser.file_id, pub_span)
 								.with_message("remove the qualifier"),
 						),
 				);
@@ -4368,8 +4402,10 @@ impl<'ctx> Parser<'ctx> {
 		parser.next_expect(Token::Colon)?;
 		let size = parser.parse_type_expression()?;
 
-		let span =
-			TextSpan::new(memory_span.start, parser.ast.type_span(size).end);
+		let span = TextSpan::new(
+			memory_span.start,
+			parser.ast.types.spans[usize::from(size)].end,
+		);
 		Ok(Spanned {
 			inner: Item::Memory {
 				pub_span: None,
@@ -4403,7 +4439,7 @@ impl<'ctx> Parser<'ctx> {
 		let type_expr = self.parse_type_expression()?;
 		let span = TextSpan::new(
 			keyword_span.start,
-			self.ast.type_span(type_expr).end,
+			self.ast.types.spans[usize::from(type_expr)].end,
 		);
 
 		Ok(Spanned {
@@ -4423,8 +4459,10 @@ impl<'ctx> Parser<'ctx> {
 		let name = self.expect_name(&[])?;
 		let _ = self.next_expect(Token::Colon)?;
 		let size = self.parse_type_expression()?;
-		let span =
-			TextSpan::new(keyword_span.start, self.ast.type_span(size).end);
+		let span = TextSpan::new(
+			keyword_span.start,
+			self.ast.types.spans[usize::from(size)].end,
+		);
 		Ok(Spanned {
 			inner: ImportDeclaration::Memory { name, size },
 			span,
@@ -4448,14 +4486,14 @@ impl<'ctx> Parser<'ctx> {
 		if let Some(span) = pub_span
 			&& !matches!(keyword, Some(Keyword::Use))
 		{
-			parser.ast.diagnostics.push(
+			parser.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::VisibilityNotPermitted.code())
 					.with_message(
 						"visibility qualifiers are not permitted on host import declarations",
 					)
 					.with_label(
-						SourceSpan::new(parser.ast.file_id, span)
+						SourceSpan::new(parser.file_id, span)
 							.primary_label()
 							.with_message("remove `pub`"),
 					)
@@ -4473,11 +4511,10 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Use) => {
 				// A `use` imports nothing from the host, so no field names it.
 				if let Some(name) = external_name {
-					parser.ast.diagnostics.push(
-						report_invalid_item(parser.ast.file_id, name)
-							.with_message(
-								"a `use` item has no host field name",
-							),
+					parser.diagnostics.push(
+						report_invalid_item(parser.file_id, name).with_message(
+							"a `use` item has no host field name",
+						),
 					);
 				}
 				let use_span = parser.lexer.next().span;
@@ -4522,9 +4559,8 @@ impl<'ctx> Parser<'ctx> {
 				}),
 			_ => {
 				parser
-					.ast
 					.diagnostics
-					.push(report_invalid_item(parser.ast.file_id, token.span));
+					.push(report_invalid_item(parser.file_id, token.span));
 				Err(())
 			}
 		}
@@ -4544,9 +4580,8 @@ impl<'ctx> Parser<'ctx> {
 			}
 			Err(()) => {
 				parser
-					.ast
 					.diagnostics
-					.push(report_invalid_item(parser.ast.file_id, token.span));
+					.push(report_invalid_item(parser.file_id, token.span));
 				Err(())
 			}
 		}
@@ -4698,7 +4733,7 @@ impl<'ctx> Parser<'ctx> {
 				let signature = parser.parse_function_signature()?;
 				let end = if parser.lexer.peek().inner == Token::OpenBrace {
 					let body = parser.parse_block()?;
-					let span = parser.ast.block_span(body);
+					let span = parser.ast.blocks.spans[usize::from(body)];
 					parser.report_crate_member_body(span);
 					span.end
 				} else {
@@ -4722,11 +4757,11 @@ impl<'ctx> Parser<'ctx> {
 				let end = if parser.lexer.next_if(Token::Eq).is_some() {
 					let value =
 						parser.parse_expression(BindingPower::Default)?;
-					let span = parser.ast.expr_span(value);
+					let span = parser.ast.exprs.spans[usize::from(value)];
 					parser.report_crate_member_body(span);
 					span.end
 				} else {
-					parser.ast.type_span(ty).end
+					parser.ast.types.spans[usize::from(ty)].end
 				};
 				(
 					Item::PackageConst {
@@ -4751,8 +4786,10 @@ impl<'ctx> Parser<'ctx> {
 					};
 				let end = if parser.lexer.next_if(Token::Eq).is_some() {
 					let body = parser.parse_type_expression()?;
-					parser.report_crate_member_body(parser.ast.type_span(body));
-					parser.ast.type_span(body).end
+					parser.report_crate_member_body(
+						parser.ast.types.spans[usize::from(body)],
+					);
+					parser.ast.types.spans[usize::from(body)].end
 				} else {
 					name_span.end
 				};
@@ -4770,9 +4807,8 @@ impl<'ctx> Parser<'ctx> {
 			_ => {
 				let token = parser.lexer.peek();
 				parser
-					.ast
 					.diagnostics
-					.push(report_invalid_item(parser.ast.file_id, token.span));
+					.push(report_invalid_item(parser.file_id, token.span));
 				return Err(());
 			}
 		};
@@ -4783,12 +4819,12 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	fn report_crate_member_body(&mut self, span: TextSpan) {
-		self.ast.diagnostics.push(
+		self.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::PackageMemberHasBody.code())
 				.with_message("a package member cannot have a body")
 				.with_label(
-					Label::primary(self.ast.file_id, span)
+					Label::primary(self.file_id, span)
 						.with_message("remove this body"),
 				),
 		);
@@ -4807,12 +4843,12 @@ impl<'ctx> Parser<'ctx> {
 			_ = parser.lexer.next(); // consume "as"
 			parser.expect_name(&[])?
 		} else {
-			parser.ast.diagnostics.push(
+			parser.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::MissingPackageAlias.code())
 					.with_message("a package instance requires an `as` alias")
 					.with_label(
-						SourceSpan::new(parser.ast.file_id, token.span)
+						SourceSpan::new(parser.file_id, token.span)
 							.primary_label()
 							.with_message("expected `as <name>` here"),
 					),
@@ -4848,12 +4884,12 @@ impl<'ctx> Parser<'ctx> {
 				parser.expect_name(&[])?
 			}
 			_ => {
-				parser.ast.diagnostics.push(
+				parser.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::MissingImportAlias.code())
 						.with_message("import requires an `as` alias")
 						.with_label(
-							SourceSpan::new(parser.ast.file_id, token.span)
+							SourceSpan::new(parser.file_id, token.span)
 								.primary_label()
 								.with_message("expected `as <name>` here"),
 						),

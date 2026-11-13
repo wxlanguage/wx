@@ -133,6 +133,7 @@ fn main() {
 		size_of::<ast::Item>(),
 		size_of::<ast::PathSegment>(),
 	);
+	println!("tree header: {} B", size_of::<ast::AST>());
 
 	// One parse of the corpus, counted. The interner is warmed first, so its
 	// own growth is not counted as the tree's.

@@ -2304,6 +2304,7 @@ dependencies = [
 name = "wx-fmt"
 version = "0.5.0"
 dependencies = [
+ "codespan-reporting",
  "indoc",
  "string-interner",
  "wx-compiler",

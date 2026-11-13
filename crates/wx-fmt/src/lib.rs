@@ -3553,6 +3553,7 @@ fn ownership_sigil(ownership: ast::Ownership) -> Text {
 
 pub fn format(
 	ast: &ast::AST,
+	comments: &ast::CommentMap,
 	interner: &ast::StringInterner,
 	source: &str,
 	config: RendererConfig,
@@ -3561,7 +3562,7 @@ pub fn format(
 		interner,
 		source,
 		ast,
-		comments: &ast.comments,
+		comments,
 		arena: Arena::new(),
 	};
 	let body = builder.build(ast);

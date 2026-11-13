@@ -64,6 +64,7 @@ pub fn check(
 		core_package,
 		root_package,
 		asts,
+		..
 	} = compilation;
 	let mut diagnostics = Vec::new();
 	let mut resolutions = NameResolutions::default();

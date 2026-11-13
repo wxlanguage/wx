@@ -2,8 +2,6 @@
 source: crates/wx-compiler/src/ast/tests.rs
 expression: case.ast
 ---
-file_id: 0
-diagnostics: []
 root:
   start: 0
   len: 7

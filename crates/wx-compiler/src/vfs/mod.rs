@@ -340,6 +340,11 @@ pub struct CompilationUnit {
 	/// Every file's syntax tree, by its [`FileId`]: each loaded file is
 	/// parsed once, as it is added, so a tree's position is its file's id.
 	pub asts: Vec<ast::AST>,
+	/// Every file's comments, by its [`FileId`], for the formatter and the
+	/// editor; the checker never reads them.
+	pub comments: Vec<ast::CommentMap>,
+	/// What parsing each file reported, by its [`FileId`].
+	pub parse_diagnostics: Vec<Vec<Diagnostic<FileId>>>,
 	pub packages: Vec<Package>,
 	pub root_package: PackageId,
 	/// The package providing the items the language requires (its
@@ -356,11 +361,18 @@ impl CompilationUnit {
 		&self.asts[file.as_usize()]
 	}
 
+	/// The comments of `file`.
+	pub fn comments(&self, file: FileId) -> &ast::CommentMap {
+		&self.comments[file.as_usize()]
+	}
+
+	/// What parsing `file` reported.
+	pub fn parse_diagnostics(&self, file: FileId) -> &[Diagnostic<FileId>] {
+		&self.parse_diagnostics[file.as_usize()]
+	}
+
 	pub fn collect_parser_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
-		self.asts
-			.iter()
-			.flat_map(|ast| ast.diagnostics.iter().cloned())
-			.collect()
+		self.parse_diagnostics.iter().flatten().cloned().collect()
 	}
 
 	pub fn collect_linker_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
@@ -376,7 +388,7 @@ impl CompilationUnit {
 			.flat_map(|package| {
 				package.diagnostics.iter().chain(
 					package.modules.iter().flat_map(|module| {
-						self.ast(module.file_id).diagnostics.iter()
+						self.parse_diagnostics(module.file_id).iter()
 					}),
 				)
 			})
@@ -389,9 +401,11 @@ impl CompilationUnit {
 /// uses the same symbol identities. Building releases the borrow.
 pub struct CompilationUnitBuilder<'strings> {
 	pub files: Files,
-	/// Each file's syntax tree, pushed as the file is added, so a tree's
-	/// position is its file's id.
+	/// Each file's syntax tree, comments and parse diagnostics, pushed as
+	/// the file is added, so their position is the file's id.
 	pub asts: Vec<ast::AST>,
+	pub comments: Vec<ast::CommentMap>,
+	pub parse_diagnostics: Vec<Vec<Diagnostic<FileId>>>,
 	strings: &'strings mut StringInterner,
 	pub packages: Vec<Package>,
 	/// Set once the core exists, and seeded into every package loaded
@@ -469,6 +483,8 @@ impl<'strings> CompilationUnitBuilder<'strings> {
 		Self {
 			files: Files::new(),
 			asts: Vec::new(),
+			comments: Vec::new(),
+			parse_diagnostics: Vec::new(),
 			strings,
 			packages: Vec::new(),
 			core: None,
@@ -599,6 +615,8 @@ impl<'strings> CompilationUnitBuilder<'strings> {
 		CompilationUnit {
 			files: self.files,
 			asts: self.asts,
+			comments: self.comments,
+			parse_diagnostics: self.parse_diagnostics,
 			packages: self.packages,
 			root_package,
 			core_package,
@@ -661,8 +679,11 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 			.expect(
 				"file count should never realistically approach FileId's limit",
 			);
-		let ast =
-			ast::Parser::parse(file_id, &self.ctx.files, self.ctx.strings);
+		let ast::Parsed {
+			ast,
+			comments,
+			diagnostics,
+		} = ast::Parser::parse(file_id, &self.ctx.files, self.ctx.strings);
 		debug_assert_eq!(self.ctx.asts.len(), file_id.as_usize());
 
 		let module_id = ModuleId(self.modules.len() as u32);
@@ -678,7 +699,7 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 					})
 				}
 				ast::Item::Module { items, .. } => {
-					self.check_nested_module_declarations(&ast, items);
+					self.check_nested_module_declarations(file_id, &ast, items);
 					None
 				}
 				_ => None,
@@ -694,6 +715,8 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 			file_path,
 		});
 		self.ctx.asts.push(ast);
+		self.ctx.comments.push(comments);
+		self.ctx.parse_diagnostics.push(diagnostics);
 
 		let mut children = Vec::with_capacity(child_decls.len());
 		for module in child_decls.into_iter() {
@@ -749,10 +772,10 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 	/// per inline level).
 	fn check_nested_module_declarations(
 		&mut self,
+		file_id: FileId,
 		ast: &ast::AST,
 		items: ast::List<ast::Item>,
 	) {
-		let file_id = ast.file_id;
 		for item in ast.list(items) {
 			match *item {
 				ast::Item::ModuleDeclaration { name, .. } => {
@@ -772,7 +795,7 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 					self.diagnostics.push(diagnostic);
 				}
 				ast::Item::Module { items, .. } => {
-					self.check_nested_module_declarations(ast, items);
+					self.check_nested_module_declarations(file_id, ast, items);
 				}
 				_ => {}
 			}

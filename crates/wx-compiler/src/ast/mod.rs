@@ -36,11 +36,16 @@ pub struct Comment {
 
 pub struct CommentMap(pub Box<[Comment]>);
 
-impl CommentMap {
-	pub fn empty() -> Self {
-		Self(Box::new([]))
-	}
+/// What parsing a file gives, kept apart by who reads it: the tree, which
+/// the checker reads; the comments, which only the formatter and the editor
+/// do; and what the parser reported.
+pub struct Parsed {
+	pub ast: AST,
+	pub comments: CommentMap,
+	pub diagnostics: Vec<Diagnostic<FileId>>,
+}
 
+impl CommentMap {
 	/// Returns all comments whose spans fall entirely within `[start, end)`.
 	pub fn between(&self, start: u32, end: u32) -> &[Comment] {
 		let lo = self.0.partition_point(|c| c.span.end <= start);
@@ -1306,17 +1311,10 @@ pub trait Listed: Sized {
 	fn store(ast: &AST) -> &[Self];
 }
 
-/// A list's items in a plain vector, written with `AST::push_list`.
-trait InVec: Listed {
-	fn vec_mut(ast: &mut AST) -> &mut Vec<Self>;
-}
-
-/// A list's items in a [`Column`], each with its span, written with
-/// `AST::push_nodes` and read with [`AST::spanned`].
+/// A list's items in a [`Column`], each with its span, read with
+/// [`AST::spanned`].
 pub trait InColumn: Listed {
 	fn spans(ast: &AST) -> &[TextSpan];
-	#[doc(hidden)]
-	fn column_mut(ast: &mut AST) -> &mut Column<Self>;
 }
 
 /// A node in a [`Column`] that is addressed on its own, by its position.
@@ -1326,6 +1324,16 @@ pub trait Identified: InColumn {
 	fn id(index: u32) -> Self::Id;
 }
 
+/// Where the parser writes a list kept in a plain vector.
+trait BuildVec: Sized {
+	fn vec_mut(builder: &mut AstBuilder) -> &mut Vec<Self>;
+}
+
+/// Where the parser writes a list or a node kept in a column.
+trait BuildColumn: Sized {
+	fn column_mut(builder: &mut AstBuilder) -> &mut ColumnBuilder<Self>;
+}
+
 macro_rules! listed {
 	($($item:ty => $field:ident),+ $(,)?) => {
 		$(impl Listed for $item {
@@ -1333,9 +1341,9 @@ macro_rules! listed {
 				&ast.$field
 			}
 		}
-		impl InVec for $item {
-			fn vec_mut(ast: &mut AST) -> &mut Vec<Self> {
-				&mut ast.$field
+		impl BuildVec for $item {
+			fn vec_mut(builder: &mut AstBuilder) -> &mut Vec<Self> {
+				&mut builder.$field
 			}
 		})+
 	};
@@ -1352,8 +1360,10 @@ macro_rules! columns {
 			fn spans(ast: &AST) -> &[TextSpan] {
 				&ast.$field.spans
 			}
-			fn column_mut(ast: &mut AST) -> &mut Column<Self> {
-				&mut ast.$field
+		}
+		impl BuildColumn for $item {
+			fn column_mut(builder: &mut AstBuilder) -> &mut ColumnBuilder<Self> {
+				&mut builder.$field
 			}
 		})+
 	};
@@ -1411,13 +1421,18 @@ identified! {
 /// A column of nodes of one kind, each with its span; a node's id is its
 /// position.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-#[doc(hidden)]
-pub struct Column<K> {
+struct Column<K> {
+	kinds: Box<[K]>,
+	spans: Box<[TextSpan]>,
+}
+
+/// A [`Column`] while the parser writes it.
+struct ColumnBuilder<K> {
 	kinds: Vec<K>,
 	spans: Vec<TextSpan>,
 }
 
-impl<K> Default for Column<K> {
+impl<K> Default for ColumnBuilder<K> {
 	fn default() -> Self {
 		Self {
 			kinds: Vec::new(),
@@ -1426,27 +1441,31 @@ impl<K> Default for Column<K> {
 	}
 }
 
-impl<K> Column<K> {
+impl<K> ColumnBuilder<K> {
 	fn push(&mut self, kind: K, span: TextSpan) -> u32 {
 		let index = u32::try_from(self.kinds.len()).unwrap();
 		self.kinds.push(kind);
 		self.spans.push(span);
 		index
 	}
+
+	fn finish(self) -> Column<K> {
+		Column {
+			kinds: self.kinds.into_boxed_slice(),
+			spans: self.spans.into_boxed_slice(),
+		}
+	}
 }
 
 /// One file's syntax tree: every node lives in a column addressed by id (a
 /// child before its parent), and every list is a [`List`], its items
 /// contiguous (`notes/ast-arena-plan.md`). The file's own items are
-/// [`AST::root`].
+/// [`AST::root`]. It is read only; the parser writes an [`AstBuilder`] and
+/// finishes it into one, each vector fitted to its contents.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AST {
-	pub file_id: FileId,
-	pub diagnostics: Vec<Diagnostic<FileId>>,
 	/// The items written at the top of the file.
 	pub root: List<Item>,
-	#[cfg_attr(any(debug_assertions, test), serde(skip))]
-	pub comments: CommentMap,
 	types: Column<TypeExpression>,
 	consts: Column<ConstArgument>,
 	bounds: Column<BoundExpression>,
@@ -1454,6 +1473,44 @@ pub struct AST {
 	exprs: Column<Expression>,
 	stmts: Column<Statement>,
 	blocks: Column<Block>,
+	qualified_roots: Box<[QualifiedPathRoot]>,
+	segments: Box<[PathSegment]>,
+	type_args: Box<[TypeArgument]>,
+	type_lists: Box<[TypeId]>,
+	bound_lists: Box<[BoundId]>,
+	assoc_bindings: Box<[AssocBinding]>,
+	function_type_params: Box<[FunctionTypeParam]>,
+	pat_lists: Box<[PatId]>,
+	pattern_elements: Box<[PatternElement]>,
+	pattern_fields: Box<[PatternFieldItem]>,
+	expr_lists: Box<[ExprId]>,
+	stmt_lists: Box<[StmtId]>,
+	named_arguments: Box<[NamedArgument]>,
+	arms: Box<[MatchArm]>,
+	items: Column<Item>,
+	impl_items: Column<ImplItem>,
+	trait_items: Column<TraitItem>,
+	use_trees: Column<UseTree>,
+	type_params: Column<TypeParam>,
+	function_params: Column<FunctionParam>,
+	struct_fields: Column<StructField>,
+	enum_entries: Column<EnumEntry>,
+	import_entries: Column<ImportEntry>,
+	attributes: Box<[Attribute]>,
+	export_entries: Box<[ExportEntry]>,
+	paths: Box<[Path]>,
+}
+
+/// An [`AST`] while the parser writes it.
+#[derive(Default)]
+struct AstBuilder {
+	types: ColumnBuilder<TypeExpression>,
+	consts: ColumnBuilder<ConstArgument>,
+	bounds: ColumnBuilder<BoundExpression>,
+	patterns: ColumnBuilder<Pattern>,
+	exprs: ColumnBuilder<Expression>,
+	stmts: ColumnBuilder<Statement>,
+	blocks: ColumnBuilder<Block>,
 	qualified_roots: Vec<QualifiedPathRoot>,
 	segments: Vec<PathSegment>,
 	type_args: Vec<TypeArgument>,
@@ -1468,63 +1525,152 @@ pub struct AST {
 	stmt_lists: Vec<StmtId>,
 	named_arguments: Vec<NamedArgument>,
 	arms: Vec<MatchArm>,
-	items: Column<Item>,
-	impl_items: Column<ImplItem>,
-	trait_items: Column<TraitItem>,
-	use_trees: Column<UseTree>,
-	type_params: Column<TypeParam>,
-	function_params: Column<FunctionParam>,
-	struct_fields: Column<StructField>,
-	enum_entries: Column<EnumEntry>,
-	import_entries: Column<ImportEntry>,
+	items: ColumnBuilder<Item>,
+	impl_items: ColumnBuilder<ImplItem>,
+	trait_items: ColumnBuilder<TraitItem>,
+	use_trees: ColumnBuilder<UseTree>,
+	type_params: ColumnBuilder<TypeParam>,
+	function_params: ColumnBuilder<FunctionParam>,
+	struct_fields: ColumnBuilder<StructField>,
+	enum_entries: ColumnBuilder<EnumEntry>,
+	import_entries: ColumnBuilder<ImportEntry>,
 	attributes: Vec<Attribute>,
 	export_entries: Vec<ExportEntry>,
 	paths: Vec<Path>,
 }
 
-impl AST {
-	fn new(file_id: FileId) -> Self {
-		Self {
-			file_id,
-			diagnostics: Vec::new(),
-			root: List::EMPTY,
-			comments: CommentMap::empty(),
-			types: Column::default(),
-			consts: Column::default(),
-			bounds: Column::default(),
-			patterns: Column::default(),
-			exprs: Column::default(),
-			stmts: Column::default(),
-			blocks: Column::default(),
-			qualified_roots: Vec::new(),
-			segments: Vec::new(),
-			type_args: Vec::new(),
-			type_lists: Vec::new(),
-			bound_lists: Vec::new(),
-			assoc_bindings: Vec::new(),
-			function_type_params: Vec::new(),
-			pat_lists: Vec::new(),
-			pattern_elements: Vec::new(),
-			pattern_fields: Vec::new(),
-			expr_lists: Vec::new(),
-			stmt_lists: Vec::new(),
-			named_arguments: Vec::new(),
-			arms: Vec::new(),
-			items: Column::default(),
-			impl_items: Column::default(),
-			trait_items: Column::default(),
-			use_trees: Column::default(),
-			type_params: Column::default(),
-			function_params: Column::default(),
-			struct_fields: Column::default(),
-			enum_entries: Column::default(),
-			import_entries: Column::default(),
-			attributes: Vec::new(),
-			export_entries: Vec::new(),
-			paths: Vec::new(),
+impl AstBuilder {
+	fn finish(self, root: List<Item>) -> AST {
+		AST {
+			root,
+			types: self.types.finish(),
+			consts: self.consts.finish(),
+			bounds: self.bounds.finish(),
+			patterns: self.patterns.finish(),
+			exprs: self.exprs.finish(),
+			stmts: self.stmts.finish(),
+			blocks: self.blocks.finish(),
+			qualified_roots: self.qualified_roots.into_boxed_slice(),
+			segments: self.segments.into_boxed_slice(),
+			type_args: self.type_args.into_boxed_slice(),
+			type_lists: self.type_lists.into_boxed_slice(),
+			bound_lists: self.bound_lists.into_boxed_slice(),
+			assoc_bindings: self.assoc_bindings.into_boxed_slice(),
+			function_type_params: self.function_type_params.into_boxed_slice(),
+			pat_lists: self.pat_lists.into_boxed_slice(),
+			pattern_elements: self.pattern_elements.into_boxed_slice(),
+			pattern_fields: self.pattern_fields.into_boxed_slice(),
+			expr_lists: self.expr_lists.into_boxed_slice(),
+			stmt_lists: self.stmt_lists.into_boxed_slice(),
+			named_arguments: self.named_arguments.into_boxed_slice(),
+			arms: self.arms.into_boxed_slice(),
+			items: self.items.finish(),
+			impl_items: self.impl_items.finish(),
+			trait_items: self.trait_items.finish(),
+			use_trees: self.use_trees.finish(),
+			type_params: self.type_params.finish(),
+			function_params: self.function_params.finish(),
+			struct_fields: self.struct_fields.finish(),
+			enum_entries: self.enum_entries.finish(),
+			import_entries: self.import_entries.finish(),
+			attributes: self.attributes.into_boxed_slice(),
+			export_entries: self.export_entries.into_boxed_slice(),
+			paths: self.paths.into_boxed_slice(),
 		}
 	}
 
+	fn push_type(&mut self, kind: TypeExpression, span: TextSpan) -> TypeId {
+		TypeId::new(self.types.push(kind, span))
+	}
+
+	fn push_const(&mut self, kind: ConstArgument, span: TextSpan) -> ConstId {
+		ConstId::new(self.consts.push(kind, span))
+	}
+
+	fn push_bound(&mut self, kind: BoundExpression, span: TextSpan) -> BoundId {
+		BoundId::new(self.bounds.push(kind, span))
+	}
+
+	fn push_pattern(&mut self, kind: Pattern, span: TextSpan) -> PatId {
+		PatId::new(self.patterns.push(kind, span))
+	}
+
+	fn push_expr(&mut self, kind: Expression, span: TextSpan) -> ExprId {
+		ExprId::new(self.exprs.push(kind, span))
+	}
+
+	fn push_statement(&mut self, kind: Statement, span: TextSpan) -> StmtId {
+		StmtId::new(self.stmts.push(kind, span))
+	}
+
+	fn push_block(&mut self, block: Block, span: TextSpan) -> BlockId {
+		BlockId::new(self.blocks.push(block, span))
+	}
+
+	fn push_segment(&mut self, segment: PathSegment) -> SegmentId {
+		let id = SegmentId::new(u32::try_from(self.segments.len()).unwrap());
+		self.segments.push(segment);
+		id
+	}
+
+	fn push_qualified_root(
+		&mut self,
+		root: QualifiedPathRoot,
+	) -> QualifiedRootId {
+		let id = QualifiedRootId::new(
+			u32::try_from(self.qualified_roots.len()).unwrap(),
+		);
+		self.qualified_roots.push(root);
+		id
+	}
+
+	/// Writes `items` as one list, contiguous: a list's items are all parsed
+	/// before it is written, so a nested list never lands inside it.
+	fn push_list<T: BuildVec>(
+		&mut self,
+		items: impl IntoIterator<Item = T>,
+	) -> List<T> {
+		let store = T::vec_mut(self);
+		let start = u32::try_from(store.len()).unwrap();
+		store.extend(items);
+		let len = u32::try_from(store.len()).unwrap() - start;
+		List {
+			start,
+			len,
+			of: PhantomData,
+		}
+	}
+
+	/// [`AstBuilder::push_list`], for nodes kept with their spans.
+	fn push_nodes<T: BuildColumn>(
+		&mut self,
+		nodes: impl IntoIterator<Item = Spanned<T>>,
+	) -> List<T> {
+		let column = T::column_mut(self);
+		let start = u32::try_from(column.kinds.len()).unwrap();
+		for node in nodes {
+			column.push(node.inner, node.span);
+		}
+		let len = u32::try_from(column.kinds.len()).unwrap() - start;
+		List {
+			start,
+			len,
+			of: PhantomData,
+		}
+	}
+
+	/// One node of a column addressed on its own, outside any list (a
+	/// `use` tree's rest).
+	fn push_node<T: Identified + BuildColumn>(
+		&mut self,
+		node: T,
+		span: TextSpan,
+	) -> T::Id {
+		T::id(T::column_mut(self).push(node, span))
+	}
+}
+
+impl AST {
 	pub fn ty(&self, id: TypeId) -> TypeExpression {
 		self.types.kinds[usize::from(id)]
 	}
@@ -1707,91 +1853,5 @@ impl AST {
 			segments.first().unwrap().ident.span.start,
 			segments.last().unwrap().ident.span.end,
 		)
-	}
-
-	fn push_type(&mut self, kind: TypeExpression, span: TextSpan) -> TypeId {
-		TypeId::new(self.types.push(kind, span))
-	}
-
-	fn push_const(&mut self, kind: ConstArgument, span: TextSpan) -> ConstId {
-		ConstId::new(self.consts.push(kind, span))
-	}
-
-	fn push_bound(&mut self, kind: BoundExpression, span: TextSpan) -> BoundId {
-		BoundId::new(self.bounds.push(kind, span))
-	}
-
-	fn push_pattern(&mut self, kind: Pattern, span: TextSpan) -> PatId {
-		PatId::new(self.patterns.push(kind, span))
-	}
-
-	fn push_expr(&mut self, kind: Expression, span: TextSpan) -> ExprId {
-		ExprId::new(self.exprs.push(kind, span))
-	}
-
-	fn push_statement(&mut self, kind: Statement, span: TextSpan) -> StmtId {
-		StmtId::new(self.stmts.push(kind, span))
-	}
-
-	fn push_block(&mut self, block: Block, span: TextSpan) -> BlockId {
-		BlockId::new(self.blocks.push(block, span))
-	}
-
-	fn push_segment(&mut self, segment: PathSegment) -> SegmentId {
-		let id = SegmentId::new(u32::try_from(self.segments.len()).unwrap());
-		self.segments.push(segment);
-		id
-	}
-
-	fn push_qualified_root(
-		&mut self,
-		root: QualifiedPathRoot,
-	) -> QualifiedRootId {
-		let id = QualifiedRootId::new(
-			u32::try_from(self.qualified_roots.len()).unwrap(),
-		);
-		self.qualified_roots.push(root);
-		id
-	}
-
-	/// Writes `items` as one list, contiguous: a list's items are all parsed
-	/// before it is written, so a nested list never lands inside it.
-	fn push_list<T: InVec>(
-		&mut self,
-		items: impl IntoIterator<Item = T>,
-	) -> List<T> {
-		let store = T::vec_mut(self);
-		let start = u32::try_from(store.len()).unwrap();
-		store.extend(items);
-		let len = u32::try_from(store.len()).unwrap() - start;
-		List {
-			start,
-			len,
-			of: PhantomData,
-		}
-	}
-
-	/// [`AST::push_list`], for nodes kept with their spans.
-	fn push_nodes<T: InColumn>(
-		&mut self,
-		nodes: impl IntoIterator<Item = Spanned<T>>,
-	) -> List<T> {
-		let column = T::column_mut(self);
-		let start = u32::try_from(column.kinds.len()).unwrap();
-		for node in nodes {
-			column.push(node.inner, node.span);
-		}
-		let len = u32::try_from(column.kinds.len()).unwrap() - start;
-		List {
-			start,
-			len,
-			of: PhantomData,
-		}
-	}
-
-	/// One node of a column addressed on its own, outside any list (a
-	/// `use` tree's rest).
-	fn push_node<T: Identified>(&mut self, node: T, span: TextSpan) -> T::Id {
-		T::id(T::column_mut(self).push(node, span))
 	}
 }

@@ -16,7 +16,9 @@ use crate::vfs::{FileOrigin, Files};
 struct TestCase {
 	strings: StringInterner,
 	files: Files,
+	file_id: FileId,
 	ast: AST,
+	diagnostics: Vec<Diagnostic<FileId>>,
 }
 
 impl TestCase {
@@ -29,19 +31,21 @@ impl TestCase {
 		let file_id = files
 			.add("main.wx".to_string(), source.to_string(), FileOrigin::Local)
 			.unwrap();
-		let ast = Parser::parse(file_id, &files, &mut strings);
+		let parsed = Parser::parse(file_id, &files, &mut strings);
 		TestCase {
 			strings,
 			files,
-			ast,
+			file_id,
+			ast: parsed.ast,
+			diagnostics: parsed.diagnostics,
 		}
 	}
 
 	/// Everything the parser reported. See [`DiagnosticView`] for the
-	/// assertions; prefer them over poking at `ast.diagnostics` directly, since
+	/// assertions; prefer them over poking at `diagnostics` directly, since
 	/// they render the offending source when they fail.
 	fn diagnostics(&self) -> DiagnosticView<'_> {
-		DiagnosticView::new("parse", &self.ast.diagnostics, &self.files)
+		DiagnosticView::new("parse", &self.diagnostics, &self.files)
 	}
 
 	/// Resolves an interned symbol, so assertions can name things rather than
@@ -724,7 +728,7 @@ fn test_impl_placeholder_is_rejected_by_parser() {
 fn test_impl_target_must_be_a_path() {
 	let case = TestCase::new("impl (Point) {}");
 	assert_eq!(
-		case.ast.diagnostics[0].code.as_deref(),
+		case.diagnostics[0].code.as_deref(),
 		Some(DiagnosticCode::UnexpectedToken.code())
 	);
 }
@@ -733,7 +737,7 @@ fn test_impl_target_must_be_a_path() {
 fn test_typeset_member_must_be_a_path() {
 	let case = TestCase::new("typeset Bad { (i32, i32) }");
 	assert_eq!(
-		case.ast.diagnostics[0].code.as_deref(),
+		case.diagnostics[0].code.as_deref(),
 		Some(DiagnosticCode::UnexpectedToken.code())
 	);
 }
@@ -955,7 +959,7 @@ fn test_export_alias() {
 		.alias
 		.expect("`as \"wasm_add\"` should record an alias");
 	assert_eq!(
-		alias.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
+		alias.extract_str(&case.files.get(case.file_id).unwrap().source),
 		r#""wasm_add""#
 	);
 }
@@ -2473,7 +2477,6 @@ fn test_missing_initializer() {
         global y: i32
     "});
 	let missing_initializer_count = case
-		.ast
 		.diagnostics
 		.iter()
 		.filter(|d| {
@@ -2625,7 +2628,7 @@ fn test_package_instances() {
 	};
 	assert!(pub_span.is_none());
 	assert_eq!(
-		package.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
+		package.extract_str(&case.files.get(case.file_id).unwrap().source),
 		"\"math\"",
 		"the key stays as written, quotes included"
 	);
@@ -3128,7 +3131,7 @@ fn import_blocks_preserve_reexport_visibility() {
 		panic!("expected a public use item");
 	};
 	assert_eq!(
-		span.extract_str(&case.files.get(case.ast.file_id).unwrap().source),
+		span.extract_str(&case.files.get(case.file_id).unwrap().source),
 		"pub"
 	);
 	assert!(matches!(
@@ -3478,7 +3481,7 @@ fn a_bound_list_may_lead_with_a_plus() {
 		BoundExpression::BoundList(b) if b.len() == 3
 	));
 	// The list's span starts at its first bound, not at the `+`.
-	let source = &case.files.get(case.ast.file_id).unwrap().source;
+	let source = &case.files.get(case.file_id).unwrap().source;
 	assert_eq!(
 		case.ast.bound_span(*bounds).extract_str(source),
 		"Add\n    + Sub\n    + PartialEq"
@@ -4119,7 +4122,7 @@ fn test_crate_contract_items_reject_bodies() {
 	] {
 		let case = TestCase::new(source);
 		assert!(
-			case.ast.diagnostics.iter().any(|diagnostic| {
+			case.diagnostics.iter().any(|diagnostic| {
 				diagnostic.code.as_deref()
 					== Some(DiagnosticCode::PackageMemberHasBody.code())
 			}),

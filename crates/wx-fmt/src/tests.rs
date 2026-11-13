@@ -8,7 +8,10 @@ use super::*;
 pub(super) struct TestCase {
 	pub(super) interner: ast::StringInterner,
 	files: vfs::Files,
+	file_id: vfs::FileId,
 	pub(super) ast: ast::AST,
+	pub(super) comments: ast::CommentMap,
+	diagnostics: Vec<codespan_reporting::diagnostic::Diagnostic<vfs::FileId>>,
 }
 
 impl TestCase {
@@ -22,12 +25,15 @@ impl TestCase {
 				vfs::FileOrigin::Local,
 			)
 			.unwrap();
-		let ast = ast::Parser::parse(file_id, &files, &mut interner);
+		let parsed = ast::Parser::parse(file_id, &files, &mut interner);
 
 		TestCase {
 			interner,
 			files,
-			ast,
+			file_id,
+			ast: parsed.ast,
+			comments: parsed.comments,
+			diagnostics: parsed.diagnostics,
 		}
 	}
 }
@@ -43,8 +49,9 @@ fn test_format_simple_function() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
@@ -75,11 +82,12 @@ fn test_format_crate_contract_items() {
         package \"math\" as math;
     "};
 	let case = TestCase::new(source);
-	assert!(case.ast.diagnostics.is_empty());
+	assert!(case.diagnostics.is_empty());
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -104,8 +112,9 @@ fn test_format_use_trees() {
 	let case = TestCase::new(source);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
@@ -131,11 +140,12 @@ fn test_format_uses_and_reexports_in_import_blocks() {
 	let expected = source.replace('\t', "    ");
 	for input in [source, expected.as_str()] {
 		let case = TestCase::new(input);
-		assert!(case.ast.diagnostics.is_empty());
+		assert!(case.diagnostics.is_empty());
 		let output = format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -163,8 +173,9 @@ fn test_format_import_block() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -204,8 +215,9 @@ fn test_format_keeps_an_import_field_name_only_when_it_is_not_the_entrys_own() {
 	let case = TestCase::new(source);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -233,8 +245,9 @@ fn test_format_single_import_function_stays_inline() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -265,8 +278,9 @@ fn test_format_module_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -302,8 +316,9 @@ fn test_format_impl_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -341,8 +356,9 @@ fn test_format_trait_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -373,8 +389,9 @@ fn test_format_where_clause_assoc_type_bound() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -422,8 +439,9 @@ fn test_format_qualified_path() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -456,8 +474,9 @@ fn test_format_const_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -484,8 +503,9 @@ fn test_format_enum_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -508,8 +528,9 @@ fn an_old_enum_repr_is_formatted_in_parentheses() {
 	let case = TestCase::new("enum Status: i32 { Foo }\n");
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -532,8 +553,9 @@ fn a_constant_parameter_and_arguments_keep_only_the_meaningful_const() {
 	);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -557,8 +579,9 @@ fn an_array_length_is_formatted_without_a_marker() {
 	);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -585,8 +608,9 @@ fn a_bracketed_constant_path_is_formatted_as_written() {
 	let case = TestCase::new(source);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -607,8 +631,9 @@ fn a_literal_kind_is_formatted_as_a_path() {
 	let case = TestCase::new(source);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -626,8 +651,9 @@ fn test_format_struct_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -652,8 +678,9 @@ fn test_format_parameter_and_field_slots() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -677,8 +704,9 @@ fn test_format_typeset_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -700,8 +728,9 @@ fn test_format_typeset_with_bound_clause() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -741,8 +770,9 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
     "#});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -781,8 +811,9 @@ fn test_format_generic_struct_stays_inline() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -811,8 +842,9 @@ fn test_format_generic_function() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -842,8 +874,9 @@ fn test_format_struct_init() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
@@ -875,8 +908,9 @@ fn test_format_struct_init_block_value() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -912,8 +946,9 @@ fn test_format_local_patterns() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -952,8 +987,9 @@ fn test_format_pattern_constants() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -986,8 +1022,9 @@ fn test_format_impl_trait_items() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -1018,8 +1055,9 @@ fn test_format_block_like_statement_semicolon() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -1044,8 +1082,9 @@ fn test_format_block_like_statement_semicolon() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -1068,8 +1107,9 @@ fn test_format_call_args_wrap() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -1130,8 +1170,9 @@ fn test_format_local_definition_wraps() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -1211,8 +1252,9 @@ fn test_format_inline_blocks() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -1282,8 +1324,9 @@ fn test_format_keeps_pub_on_memory_and_global() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -1311,8 +1354,9 @@ fn test_format_memory_config() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -1350,8 +1394,9 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -1393,8 +1438,9 @@ fn test_format_comments_preserved() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -1735,8 +1781,9 @@ fn test_format_long_type_params_wrap() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -1763,8 +1810,9 @@ fn test_format_address_of() {
     "#});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -1792,8 +1840,9 @@ fn test_format_impl_trait_multi_segment() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -1823,8 +1872,9 @@ fn test_format_impl_trait_generic_type_params() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
@@ -1863,8 +1913,9 @@ fn test_format_deep_indent_past_max_width_does_not_panic() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 10,
 			indent_width: 4,
@@ -1884,8 +1935,9 @@ fn test_format_trailing_comments_keep_their_line() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -1961,8 +2013,9 @@ fn test_format_doc_comment_never_trails() {
 	);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig::default(),
 	);
 	assert_eq!(
@@ -1990,8 +2043,9 @@ fn test_format_blank_lines_around_attributes() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -2045,8 +2099,9 @@ fn test_format_no_trailing_whitespace() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig::default(),
 	);
 	assert!(
@@ -2068,8 +2123,9 @@ fn test_format_comment_after_a_list_opener_wraps() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -2173,8 +2229,9 @@ fn test_format_trailing_comment_after_a_non_block_item_is_kept() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -2207,8 +2264,9 @@ fn test_format_trait_body_comments_are_kept_in_place() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -2236,8 +2294,9 @@ fn test_format_comment_only_file_is_preserved() {
 	let case = TestCase::new(source);
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig::default(),
 	);
 	assert_eq!(output, source);
@@ -2252,8 +2311,9 @@ fn test_format_blank_line_between_leading_comments() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -2297,8 +2357,9 @@ fn test_format_empty_body_comments_match_a_non_empty_one() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -2345,8 +2406,9 @@ fn test_format_no_blank_line_after_a_list_opener() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig::default(),
 		)
 	};
@@ -2398,8 +2460,9 @@ fn export_aliases_preserve_their_quoted_source_spelling() {
 		let case = TestCase::new(src);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
-			&case.files.get(case.ast.file_id).unwrap().source,
+			&case.files.get(case.file_id).unwrap().source,
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
@@ -2421,6 +2484,7 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 		let case = TestCase::new(source);
 		format(
 			&case.ast,
+			&case.comments,
 			&case.interner,
 			source,
 			RendererConfig {
@@ -2456,23 +2520,30 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 fn checked_format(source: &str, width: u32, indent: u8) -> String {
 	let case = TestCase::new(source);
 	assert!(
-		case.ast.diagnostics.is_empty(),
+		case.diagnostics.is_empty(),
 		"{:#?}\n{source}",
-		case.ast.diagnostics
+		case.diagnostics
 	);
 	let config = RendererConfig {
 		max_line_width: width,
 		indent_width: indent,
 	};
-	let output = format(&case.ast, &case.interner, source, config);
+	let output =
+		format(&case.ast, &case.comments, &case.interner, source, config);
 	let reparsed = TestCase::new(&output);
 	assert!(
-		reparsed.ast.diagnostics.is_empty(),
+		reparsed.diagnostics.is_empty(),
 		"{:#?}\n{output}",
-		reparsed.ast.diagnostics
+		reparsed.diagnostics
 	);
 	assert_eq!(
-		format(&reparsed.ast, &reparsed.interner, &output, config),
+		format(
+			&reparsed.ast,
+			&reparsed.comments,
+			&reparsed.interner,
+			&output,
+			config
+		),
 		output,
 		"idempotence: {source}"
 	);
@@ -3269,13 +3340,14 @@ fn test_format_current_syntax_forms() {
         }
     "};
 	let case = TestCase::new(source);
-	assert!(
-		case.ast.diagnostics.is_empty(),
-		"{:#?}",
-		case.ast.diagnostics
+	assert!(case.diagnostics.is_empty(), "{:#?}", case.diagnostics);
+	let output = format(
+		&case.ast,
+		&case.comments,
+		&case.interner,
+		source,
+		RendererConfig::default(),
 	);
-	let output =
-		format(&case.ast, &case.interner, source, RendererConfig::default());
 	assert_eq!(
 		output,
 		indoc! {"
@@ -3406,8 +3478,9 @@ fn test_format_one_element_tuple_as_its_element() {
     "});
 	let output = format(
 		&case.ast,
+		&case.comments,
 		&case.interner,
-		&case.files.get(case.ast.file_id).unwrap().source,
+		&case.files.get(case.file_id).unwrap().source,
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
