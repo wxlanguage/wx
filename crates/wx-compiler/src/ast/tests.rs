@@ -253,7 +253,7 @@ impl TestCase {
 	}
 
 	fn item(&self, index: usize) -> &Item {
-		&self.ast.items[index].inner.inner
+		&self.ast.list(self.ast.root)[index]
 	}
 
 	/// The entries of function `index`'s block; see [`TestCase::entries`].
@@ -313,10 +313,7 @@ impl TestCase {
 		value
 	}
 
-	fn struct_fields(
-		&self,
-		index: usize,
-	) -> &[Separated<Spanned<StructField>>] {
+	fn struct_fields(&self, index: usize) -> &[StructField] {
 		let Item::Struct { fields, .. } = self.item(index) else {
 			panic!(
 				"item {index} is {}, not a struct",
@@ -324,7 +321,7 @@ impl TestCase {
 			)
 		};
 
-		fields
+		self.ast.list(*fields)
 	}
 }
 
@@ -386,8 +383,8 @@ fn item_kind(item: &Item) -> &'static str {
 	}
 }
 
-fn bounds(param: &Spanned<TypeParam>) -> Option<BoundId> {
-	match param.inner {
+fn bounds(param: &TypeParam) -> Option<BoundId> {
+	match *param {
 		TypeParam::Type { bounds, .. } => bounds,
 		TypeParam::Const { .. } => None,
 	}
@@ -520,7 +517,7 @@ fn test_function_mut_param() {
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 
-	let param = &case.function_signature(0).params[0].inner.inner;
+	let param = &case.ast.list(case.function_signature(0).params)[0];
 	let Some(Binding::Name { mut_span, name }) = param.binding else {
 		panic!("`n` is named")
 	};
@@ -553,7 +550,7 @@ fn test_fn_pointer_param() {
     "});
 	case.diagnostics().assert_none();
 
-	let param = &case.function_signature(0).params[0].inner.inner;
+	let param = &case.ast.list(case.function_signature(0).params)[0];
 	let ty = case.ast.ty(param.ty);
 	let TypeExpression::Function { params, result } = ty else {
 		panic!("expected a function type, got {ty:?}")
@@ -605,15 +602,15 @@ fn test_type_expression_forms() {
 	};
 
 	assert!(matches!(
-		Some(case.ast.ty(fields[0].inner.inner.ty)),
+		Some(case.ast.ty(case.ast.list(*fields)[0].ty)),
 		Some(TypeExpression::Pointer { .. })
 	));
 	assert!(matches!(
-		pointee(&case.ast, case.ast.ty(fields[1].inner.inner.ty)),
+		pointee(&case.ast, case.ast.ty(case.ast.list(*fields)[1].ty)),
 		TypeExpression::Slice { .. }
 	));
 	let TypeExpression::Array { length, .. } =
-		pointee(&case.ast, case.ast.ty(fields[2].inner.inner.ty))
+		pointee(&case.ast, case.ast.ty(case.ast.list(*fields)[2].ty))
 	else {
 		panic!("expected a pointer to an array")
 	};
@@ -622,11 +619,11 @@ fn test_type_expression_forms() {
 		ConstArgument::Literal(Literal::Int(4))
 	));
 	assert!(matches!(
-		Some(case.ast.ty(fields[3].inner.inner.ty)),
+		Some(case.ast.ty(case.ast.list(*fields)[3].ty)),
 		Some(TypeExpression::Tuple { elements }) if elements.len() == 2
 	));
 	assert!(matches!(
-		Some(case.ast.ty(fields[4].inner.inner.ty)),
+		Some(case.ast.ty(case.ast.list(*fields)[4].ty)),
 		Some(TypeExpression::Path(p)) if p.len() == 2
 	));
 }
@@ -653,14 +650,17 @@ fn test_impl() {
 		attributes,
 		signature,
 		..
-	} = &items[0].inner.inner
+	} = &case.ast.list(*items)[0]
 	else {
 		panic!("expected a method")
 	};
 	assert_eq!(case.name(signature.name.inner), "double");
 	assert!(pub_span.is_some(), "`pub func` should record a pub span");
 	assert_eq!(attributes.len(), 1);
-	assert_eq!(case.name(attributes[0].name.inner), "inline");
+	assert_eq!(
+		case.name(case.ast.list(*attributes)[0].name.inner),
+		"inline"
+	);
 }
 
 #[test]
@@ -685,8 +685,14 @@ fn test_impl_trait_for_type() {
 		panic!("item 0 is {}, not a trait impl", item_kind(case.item(0)))
 	};
 	assert_eq!(trait_name.segments.len(), 1);
-	assert_eq!(case.name(trait_name.segments[0].ident.inner), "Drawable");
-	assert_eq!(case.name(target.segments[0].ident.inner), "Point");
+	assert_eq!(
+		case.name(case.ast.list(trait_name.segments)[0].ident.inner),
+		"Drawable"
+	);
+	assert_eq!(
+		case.name(case.ast.list(target.segments)[0].ident.inner),
+		"Point"
+	);
 	assert_eq!(items.len(), 1);
 }
 
@@ -764,7 +770,7 @@ fn test_trait_items() {
 	);
 	assert_eq!(items.len(), 3);
 
-	let TraitItem::Const { name, .. } = &items[0].inner.inner else {
+	let TraitItem::Const { name, .. } = &case.ast.list(*items)[0] else {
 		panic!("expected an associated const")
 	};
 	assert_eq!(case.name(name.inner), "SIZE");
@@ -772,7 +778,7 @@ fn test_trait_items() {
 	// `render` is abstract, `grow` carries a default body
 	let TraitItem::Function {
 		signature, body, ..
-	} = &items[1].inner.inner
+	} = &case.ast.list(*items)[1]
 	else {
 		panic!("expected a trait method")
 	};
@@ -787,7 +793,7 @@ fn test_trait_items() {
 		body,
 		attributes,
 		..
-	} = &items[2].inner.inner
+	} = &case.ast.list(*items)[2]
 	else {
 		panic!("expected a trait method")
 	};
@@ -858,7 +864,7 @@ fn test_pub_on_impl_assoc_type_is_recorded() {
 	let Item::TraitImpl { items, .. } = case.item(0) else {
 		panic!("expected trait impl item")
 	};
-	let ImplItem::AssocType { pub_span, .. } = &items[0].inner.inner else {
+	let ImplItem::AssocType { pub_span, .. } = &case.ast.list(*items)[0] else {
 		panic!("expected an associated type")
 	};
 	assert!(pub_span.is_some());
@@ -943,7 +949,7 @@ fn test_export_alias() {
 		panic!("item 1 is {}, not an export block", item_kind(case.item(1)))
 	};
 	assert_eq!(entries.len(), 1);
-	let entry = &entries[0].inner.inner;
+	let entry = &case.ast.list(*entries)[0];
 	assert_eq!(case.name(entry.name.inner), "add");
 	let alias = entry
 		.alias
@@ -967,28 +973,23 @@ fn single_exports_preserve_raw_aliases_and_use_item_separators() {
     "};
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
-	assert_eq!(case.ast.items.len(), 5);
+	assert_eq!(case.ast.root.len(), 5);
 	assert!(case.strings.get("line\n").is_none());
 
-	for index in 0..4 {
-		let item = &case.ast.items[index];
-		let Item::Export { entry } = &item.inner.inner else {
+	for (index, item) in case.ast.spanned(case.ast.root).take(4).enumerate() {
+		let Item::Export { entry } = item.inner else {
 			panic!("expected single export");
 		};
-		assert_eq!(case.name(entry.inner.name.inner), "foo");
-		assert_eq!(item.separator.is_some(), index % 2 == 1);
+		assert_eq!(case.name(entry.name.inner), "foo");
 		if index < 2 {
-			assert!(entry.inner.alias.is_none());
-			assert_eq!(entry.span.extract_str(source), "foo");
-			assert_eq!(item.inner.span.extract_str(source), "export foo");
+			assert!(entry.alias.is_none());
+			assert_eq!(entry.span().extract_str(source), "foo");
+			assert_eq!(item.span.extract_str(source), "export foo");
 		} else {
+			assert_eq!(entry.alias.unwrap().extract_str(source), "\"line\\n\"");
+			assert_eq!(entry.span().extract_str(source), "foo as \"line\\n\"");
 			assert_eq!(
-				entry.inner.alias.unwrap().extract_str(source),
-				"\"line\\n\""
-			);
-			assert_eq!(entry.span.extract_str(source), "foo as \"line\\n\"");
-			assert_eq!(
-				item.inner.span.extract_str(source),
+				item.span.extract_str(source),
 				"export foo as \"line\\n\""
 			);
 		}
@@ -1605,9 +1606,7 @@ fn struct_fields_have_optional_names() {
 		case.struct_fields(index)
 			.iter()
 			.map(|f| {
-				f.inner
-					.inner
-					.binding
+				f.binding
 					.and_then(Binding::name)
 					.map(|n| case.name(n.inner).to_string())
 			})
@@ -1620,14 +1619,14 @@ fn struct_fields_have_optional_names() {
 	// A positional field's type that starts with an identifier is parsed on
 	// from it: `math::Number`, `heap::*u8`.
 	assert!(matches!(
-		case.ast.ty(case.struct_fields(2)[1].inner.inner.ty),
+		case.ast.ty(case.struct_fields(2)[1].ty),
 		TypeExpression::Path(ref segments) if segments.len() == 2
 	));
 	assert!(matches!(
-		case.ast.ty(case.struct_fields(1)[1].inner.inner.ty),
+		case.ast.ty(case.struct_fields(1)[1].ty),
 		TypeExpression::Pointer { .. }
 	));
-	assert!(case.struct_fields(1)[1].inner.inner.pub_span.is_some());
+	assert!(case.struct_fields(1)[1].pub_span.is_some());
 }
 
 /// A parameter and a field are both written `binding: Type`, or `Type`
@@ -1642,13 +1641,11 @@ fn parameters_and_fields_share_the_slot_grammar() {
 	case.diagnostics().assert_none();
 	let expected: [Option<&str>; 6] =
 		[None, None, Some("c"), Some("d"), None, None];
-	let params = &case.function_signature(0).params;
+	let params = case.ast.list(case.function_signature(0).params);
 	let names: Vec<_> = params
 		.iter()
 		.map(|param| {
 			param
-				.inner
-				.inner
 				.binding
 				.and_then(Binding::name)
 				.map(|n| case.name(n.inner))
@@ -1658,7 +1655,7 @@ fn parameters_and_fields_share_the_slot_grammar() {
 	let muts: Vec<_> = params
 		.iter()
 		.map(|param| {
-			param.inner.inner.binding.is_some_and(|b| {
+			param.binding.is_some_and(|b| {
 				matches!(
 					b,
 					Binding::Name {
@@ -1671,13 +1668,10 @@ fn parameters_and_fields_share_the_slot_grammar() {
 		.collect();
 	assert_eq!(muts, [false, false, false, true, false, false]);
 	// `_:` is written, a binding that binds nothing; a type alone has none.
-	assert!(params[0].inner.inner.binding.is_none());
-	assert!(matches!(
-		params[1].inner.inner.binding,
-		Some(Binding::Wildcard(_))
-	));
+	assert!(params[0].binding.is_none());
+	assert!(matches!(params[1].binding, Some(Binding::Wildcard(_))));
 	// `x` alone is the type `x`, `_` alone the type `_`.
-	let ty = |index: usize| case.ast.ty(params[index].inner.inner.ty);
+	let ty = |index: usize| case.ast.ty(params[index].ty);
 	assert!(
 		matches!(ty(4), TypeExpression::Path(segments) if segments.len() == 1)
 	);
@@ -1688,8 +1682,6 @@ fn parameters_and_fields_share_the_slot_grammar() {
 		.iter()
 		.map(|field| {
 			field
-				.inner
-				.inner
 				.binding
 				.and_then(Binding::name)
 				.map(|n| case.name(n.inner))
@@ -1702,7 +1694,7 @@ fn parameters_and_fields_share_the_slot_grammar() {
 	let muts: Vec<_> = fields
 		.iter()
 		.map(|field| {
-			field.inner.inner.binding.is_some_and(|b| {
+			field.binding.is_some_and(|b| {
 				matches!(
 					b,
 					Binding::Name {
@@ -1714,7 +1706,7 @@ fn parameters_and_fields_share_the_slot_grammar() {
 		})
 		.collect();
 	assert_eq!(muts, [false, false, false, true, true, false, false]);
-	assert!(fields[4].inner.inner.pub_span.is_some());
+	assert!(fields[4].pub_span.is_some());
 }
 
 /// `self` is a binding like any other: its type is written.
@@ -1726,7 +1718,7 @@ fn the_receiver_is_written_with_its_type() {
     "});
 	case.diagnostics().assert_none();
 	for index in 0..2 {
-		let param = &case.function_signature(index).params[0].inner.inner;
+		let param = &case.ast.list(case.function_signature(index).params)[0];
 		let Some(Binding::Name { mut_span, name }) = param.binding else {
 			panic!("`self` is a name")
 		};
@@ -1807,13 +1799,11 @@ fn a_binding_without_a_type_recovers_with_an_error_type() {
 		DiagnosticCode::MissingTypeAnnotation,
 		DiagnosticCode::MissingTypeAnnotation,
 	]);
-	let params = &case.function_signature(0).params;
+	let params = case.ast.list(case.function_signature(0).params);
 	let names: Vec<_> = params
 		.iter()
 		.map(|param| {
 			param
-				.inner
-				.inner
 				.binding
 				.and_then(Binding::name)
 				.map(|n| case.name(n.inner))
@@ -1821,10 +1811,7 @@ fn a_binding_without_a_type_recovers_with_an_error_type() {
 		.collect();
 	assert_eq!(names, [Some("self"), Some("x"), Some("y")]);
 	for param in &params[..2] {
-		assert!(matches!(
-			case.ast.ty(param.inner.inner.ty),
-			TypeExpression::Error
-		));
+		assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
 	}
 }
 
@@ -2473,7 +2460,7 @@ fn test_invalid_attribute_and_namespace_diagnostics() {
 		DiagnosticCode::InvalidItem,
 		DiagnosticCode::InvalidNamespace,
 	]);
-	assert_eq!(case.ast.items.len(), 2);
+	assert_eq!(case.ast.root.len(), 2);
 	assert!(matches!(case.item(0), Item::Function { .. }));
 }
 
@@ -2497,7 +2484,7 @@ fn test_missing_initializer() {
 		missing_initializer_count, 2,
 		"expected one MissingInitializer for local and one for global"
 	);
-	assert_eq!(case.ast.items.len(), 1);
+	assert_eq!(case.ast.root.len(), 1);
 	// The local is kept, its value an error node.
 	let [statement] = *case.function_block(0) else {
 		panic!("expected the local to be kept");
@@ -2560,7 +2547,7 @@ fn test_module_pub_items_and_associated_types() {
 	};
 	assert!(pub_span.is_some());
 	assert!(matches!(
-		items.inner[0].inner.inner,
+		case.ast.list(*items)[0],
 		Item::Function {
 			pub_span: Some(_),
 			..
@@ -2582,7 +2569,7 @@ fn test_module_pub_items_and_associated_types() {
 	};
 	assert!(pub_span.is_some());
 	assert!(matches!(
-		trait_items[0].inner.inner,
+		case.ast.list(*trait_items)[0],
 		TraitItem::AssociatedType { ref bounds, .. }
 			if matches!(
 				bounds.map(|b| case.ast.bound(b)),
@@ -2597,7 +2584,7 @@ fn test_module_pub_items_and_associated_types() {
 		panic!("expected trait impl")
 	};
 	assert!(matches!(
-		impl_items[0].inner.inner,
+		case.ast.list(*impl_items)[0],
 		ImplItem::AssocType { .. }
 	));
 }
@@ -2673,11 +2660,11 @@ fn test_package_instance_in_a_nested_module() {
 	let Item::Module { items, .. } = case.item(0) else {
 		panic!("expected a module")
 	};
-	let Item::Module { items, .. } = &items.inner[0].inner.inner else {
+	let Item::Module { items, .. } = &case.ast.list(*items)[0] else {
 		panic!("expected a nested module")
 	};
 	assert!(matches!(
-		items.inner[0].inner.inner,
+		case.ast.list(*items)[0],
 		Item::PackageInstance {
 			pub_span: Some(_),
 			..
@@ -2754,15 +2741,17 @@ fn test_generic_signatures() {
 	case.diagnostics().assert_none();
 
 	let signature = case.function_signature(0);
-	let params: Vec<&str> = signature
-		.type_params
+	let params: Vec<&str> = case
+		.ast
+		.list(signature.type_params)
 		.iter()
-		.map(|param| case.name(param.inner.name().inner))
+		.map(|param| case.name(param.name().inner))
 		.collect();
 	assert_eq!(params, ["T", "U", "V"]);
 	// only the bounded ones carry a bound expression
-	let bounded: Vec<bool> = signature
-		.type_params
+	let bounded: Vec<bool> = case
+		.ast
+		.list(signature.type_params)
 		.iter()
 		.map(|param| bounds(param).is_some())
 		.collect();
@@ -2777,9 +2766,11 @@ fn a_type_parameter_and_a_binding_span_what_is_written() {
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	let text = |span: TextSpan| span.extract_str(source);
-	let params = &case.function_signature(0).type_params;
-	assert_eq!(text(params[0].span), "T: Memory where { Size = u32 }");
-	assert_eq!(text(params[1].span), "const N: u8");
+	let type_params = case.function_signature(0).type_params;
+	let params = case.ast.list(type_params);
+	let spans = case.ast.spans(type_params);
+	assert_eq!(text(spans[0]), "T: Memory where { Size = u32 }");
+	assert_eq!(text(spans[1]), "const N: u8");
 	let Some(BoundExpression::WithBindings { bindings, .. }) =
 		bounds(&params[0]).map(|bound| case.ast.bound(bound))
 	else {
@@ -2792,17 +2783,18 @@ fn a_type_parameter_and_a_binding_span_what_is_written() {
 fn a_constant_parameter_is_marked_and_typed() {
 	let case = TestCase::new("func f<T: Add, const N: u32>() {}");
 	case.diagnostics().assert_none();
-	let [first, second] = &*case.function_signature(0).type_params else {
+	let [first, second] = case.ast.list(case.function_signature(0).type_params)
+	else {
 		panic!("expected two parameters")
 	};
 	assert!(matches!(
-		first.inner,
+		*first,
 		TypeParam::Type {
 			bounds: Some(_),
 			..
 		}
 	));
-	let TypeParam::Const { name, ty, .. } = &second.inner else {
+	let TypeParam::Const { name, ty, .. } = second else {
 		panic!("expected a constant parameter")
 	};
 	assert_eq!(case.name(name.inner), "N");
@@ -2848,9 +2840,9 @@ fn a_type_path_takes_constant_arguments() {
 	let case =
 		TestCase::new("func f<const N: u32>(b: Buffer<u8, const N, 4>) {}");
 	case.diagnostics().assert_none();
-	let TypeExpression::Path(segments) =
-		case.ast
-			.ty(case.function_signature(0).params[0].inner.inner.ty)
+	let TypeExpression::Path(segments) = case
+		.ast
+		.ty(case.ast.list(case.function_signature(0).params)[0].ty)
 	else {
 		panic!("expected a path")
 	};
@@ -2877,11 +2869,11 @@ fn an_array_length_is_a_literal_or_a_path() {
         }
     "});
 	case.diagnostics().assert_none();
-	let params = &case.function_signature(0).params;
+	let params = case.ast.list(case.function_signature(0).params);
 	for (param, length) in params.iter().zip([1, 2]) {
 		let TypeExpression::Array {
 			length: written, ..
-		} = pointee(&case.ast, case.ast.ty(param.inner.inner.ty))
+		} = pointee(&case.ast, case.ast.ty(param.ty))
 		else {
 			panic!("expected an array type")
 		};
@@ -2919,10 +2911,10 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
         }
     "});
 	case.diagnostics().assert_none();
-	let params = &case.function_signature(0).params;
+	let params = case.ast.list(case.function_signature(0).params);
 	let length = |at: usize| {
 		let TypeExpression::Array { length, .. } =
-			pointee(&case.ast, case.ast.ty(params[at].inner.inner.ty))
+			pointee(&case.ast, case.ast.ty(params[at].ty))
 		else {
 			panic!("expected an array type")
 		};
@@ -2933,8 +2925,7 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
 		ConstArgument::QualifiedPath { segments, .. } if segments.len() == 1
 	));
 	assert!(matches!(length(1), ConstArgument::Grouped { .. }));
-	let TypeExpression::Path(segments) = case.ast.ty(params[2].inner.inner.ty)
-	else {
+	let TypeExpression::Path(segments) = case.ast.ty(params[2].ty) else {
 		panic!("expected a path")
 	};
 	assert!(matches!(
@@ -3005,15 +2996,17 @@ fn test_generic_struct() {
 	assert_eq!(case.strings.resolve(name.inner), Some("Pair"));
 	assert_eq!(type_params.len(), 2);
 	assert_eq!(
-		case.strings.resolve(type_params[0].inner.name().inner),
+		case.strings
+			.resolve(case.ast.list(*type_params)[0].name().inner),
 		Some("T")
 	);
-	assert!(bounds(&type_params[0]).is_none());
+	assert!(bounds(&case.ast.list(*type_params)[0]).is_none());
 	assert_eq!(
-		case.strings.resolve(type_params[1].inner.name().inner),
+		case.strings
+			.resolve(case.ast.list(*type_params)[1].name().inner),
 		Some("U")
 	);
-	assert!(bounds(&type_params[1]).is_none());
+	assert!(bounds(&case.ast.list(*type_params)[1]).is_none());
 	assert_eq!(fields.len(), 2);
 }
 
@@ -3030,7 +3023,7 @@ fn test_generic_struct_with_bounds() {
 	};
 	assert_eq!(type_params.len(), 1);
 	assert!(matches!(
-		bounds(&type_params[0]).map(|b| case.ast.bound(b)),
+		bounds(&case.ast.list(*type_params)[0]).map(|b| case.ast.bound(b)),
 		Some(BoundExpression::BoundList(list)) if list.len() == 2
 	));
 }
@@ -3048,7 +3041,7 @@ fn test_import_alias_and_entry_kinds() {
 	case.diagnostics().assert_none();
 	let Item::Import {
 		internal_name,
-		items,
+		entries: items,
 		..
 	} = case.item(0)
 	else {
@@ -3056,14 +3049,14 @@ fn test_import_alias_and_entry_kinds() {
 	};
 	assert_eq!(case.strings.resolve(internal_name.inner), Some("host"));
 	assert!(matches!(
-		items.inner[0].inner.inner,
+		case.ast.list(*items)[0],
 		ImportEntry::Declaration {
 			declaration: ImportDeclaration::Function { .. },
 			..
 		}
 	));
 	assert!(matches!(
-		items.inner[1].inner.inner,
+		case.ast.list(*items)[1],
 		ImportEntry::Declaration {
 			declaration: ImportDeclaration::Global {
 				mut_span: Some(_),
@@ -3073,7 +3066,7 @@ fn test_import_alias_and_entry_kinds() {
 		}
 	));
 	assert!(matches!(
-		items.inner[2].inner.inner,
+		case.ast.list(*items)[2],
 		ImportEntry::Declaration {
 			declaration: ImportDeclaration::Memory { .. },
 			..
@@ -3093,24 +3086,24 @@ fn import_blocks_accept_private_use_trees() {
 		}
 	"#});
 	case.diagnostics().assert_none();
-	let Item::Import { items, .. } = case.item(0) else {
+	let Item::Import { entries: items, .. } = case.item(0) else {
 		panic!("expected import block")
 	};
-	assert_eq!(items.inner.len(), 5);
+	assert_eq!(items.len(), 5);
 	assert!(matches!(
-		items.inner[0].inner.inner,
+		case.ast.list(*items)[0],
 		ImportEntry::Use { pub_span: None, .. }
 	));
 	assert!(matches!(
-		items.inner[1].inner.inner,
+		case.ast.list(*items)[1],
 		ImportEntry::Use { pub_span: None, .. }
 	));
 	assert!(matches!(
-		items.inner[2].inner.inner,
+		case.ast.list(*items)[2],
 		ImportEntry::Use { pub_span: None, .. }
 	));
 	assert!(matches!(
-		items.inner[3].inner.inner,
+		case.ast.list(*items)[3],
 		ImportEntry::Declaration {
 			declaration: ImportDeclaration::Memory { .. },
 			..
@@ -3124,13 +3117,13 @@ fn import_blocks_preserve_reexport_visibility() {
 		r#"import "host" as host { pub use super::{Packet, Width}; func send(); }"#,
 	);
 	case.diagnostics().assert_none();
-	let Item::Import { items, .. } = case.item(0) else {
+	let Item::Import { entries: items, .. } = case.item(0) else {
 		panic!("expected import block")
 	};
 	let ImportEntry::Use {
 		pub_span: Some(span),
 		..
-	} = &items.inner[0].inner.inner
+	} = &case.ast.list(*items)[0]
 	else {
 		panic!("expected a public use item");
 	};
@@ -3139,7 +3132,7 @@ fn import_blocks_preserve_reexport_visibility() {
 		"pub"
 	);
 	assert!(matches!(
-		items.inner[1].inner.inner,
+		case.ast.list(*items)[1],
 		ImportEntry::Declaration {
 			declaration: ImportDeclaration::Function { .. },
 			..
@@ -3157,21 +3150,20 @@ fn import_entries_may_name_the_host_field_they_import() {
 	}"#;
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
-	let Item::Import { items, .. } = case.item(0) else {
+	let Item::Import { entries: items, .. } = case.item(0) else {
 		panic!("expected import block")
 	};
-	let fields: Vec<_> = items
-		.inner
-		.iter()
+	let fields: Vec<_> = case
+		.ast
+		.spanned(*items)
 		.map(|entry| {
-			let ImportEntry::Declaration { external_name, .. } =
-				&entry.inner.inner
+			let ImportEntry::Declaration { external_name, .. } = entry.inner
 			else {
 				panic!("expected a declaration")
 			};
 			(
 				external_name.map(|span| span.extract_str(source)),
-				entry.inner.span.extract_str(source).split(':').next(),
+				entry.span.extract_str(source).split(':').next(),
 			)
 		})
 		.collect();
@@ -3268,7 +3260,7 @@ fn test_generic_application_type_args() {
 	let Item::Function { signature, .. } = case.item(1) else {
 		panic!("expected function")
 	};
-	let param_ty = case.ast.ty(signature.params[0].inner.inner.ty);
+	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty);
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
@@ -3294,7 +3286,7 @@ fn test_path_continues_after_a_segment_with_type_args() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
-	let param_ty = case.ast.ty(signature.params[0].inner.inner.ty);
+	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty);
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
@@ -3328,7 +3320,8 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
-	let bounds = bounds(&signature.type_params[0]).expect("expected bounds");
+	let bounds = bounds(&case.ast.list(signature.type_params)[0])
+		.expect("expected bounds");
 	let BoundExpression::WithBindings { path, bindings } =
 		case.ast.bound(bounds)
 	else {
@@ -3347,8 +3340,9 @@ fn a_constant_binding_is_marked_const() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
-	let kinds: Vec<_> = signature
-		.type_params
+	let kinds: Vec<_> = case
+		.ast
+		.list(signature.type_params)
 		.iter()
 		.map(|param| {
 			let bounds = bounds(param).expect("expected bounds");
@@ -3381,13 +3375,14 @@ fn self_is_a_type_parameter_name() {
 	let Item::Trait { items, .. } = case.item(0) else {
 		panic!("expected trait")
 	};
-	let TraitItem::Function { signature, .. } = &items[0].inner.inner else {
+	let TraitItem::Function { signature, .. } = &case.ast.list(*items)[0]
+	else {
 		panic!("expected function")
 	};
 	assert_eq!(signature.type_params.len(), 2);
 	assert_eq!(
 		case.strings
-			.resolve(signature.type_params[0].inner.name().inner),
+			.resolve(case.ast.list(signature.type_params)[0].name().inner),
 		Some("Self")
 	);
 }
@@ -3527,14 +3522,15 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 				let TraitItem::AssociatedType {
 					bounds: Some(bound),
 					..
-				} = items[0].inner.inner
+				} = case.ast.list(*items)[0]
 				else {
 					panic!("expected an associated type")
 				};
 				bound
 			}
 			Item::Function { signature, .. } => {
-				let bound = bounds(&signature.type_params[0]).unwrap();
+				let bound =
+					bounds(&case.ast.list(signature.type_params)[0]).unwrap();
 				if let BoundExpression::WithBindings { bindings, .. } =
 					case.ast.bound(bound)
 				{
@@ -3758,8 +3754,8 @@ fn test_qualified_and_grouped_paths_in_type_position() {
     "});
 	case.diagnostics().assert_none();
 
-	let params = &case.function_signature(0).params;
-	let ty = |index: usize| case.ast.ty(params[index].inner.inner.ty);
+	let params = case.ast.list(case.function_signature(0).params);
+	let ty = |index: usize| case.ast.ty(params[index].ty);
 	let TypeExpression::QualifiedPath { root, segments } = ty(0) else {
 		panic!("expected a qualified path type")
 	};
@@ -3785,10 +3781,10 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
     "});
 	case.diagnostics().assert_none();
 
-	let params = &case.function_signature(0).params;
+	let params = case.ast.list(case.function_signature(0).params);
 	for index in 0..2 {
 		let TypeExpression::QualifiedPath { root, segments } =
-			case.ast.ty(params[index].inner.inner.ty)
+			case.ast.ty(params[index].ty)
 		else {
 			panic!("expected a qualified path type")
 		};
@@ -3918,7 +3914,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 			Item::InherentImpl { items, .. } => {
 				let ImplItem::Function {
 					signature, block, ..
-				} = &items[0].inner.inner
+				} = &case.ast.list(*items)[0]
 				else {
 					panic!("expected a method")
 				};
@@ -3927,7 +3923,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 			Item::Trait { items, .. } => {
 				let TraitItem::Function {
 					signature, body, ..
-				} = &items[0].inner.inner
+				} = &case.ast.list(*items)[0]
 				else {
 					panic!("expected a trait method")
 				};
@@ -3962,7 +3958,7 @@ fn test_never_type() {
 	let case = TestCase::new("func f(a: !) -> ! {}");
 	case.diagnostics().assert_none();
 	let signature = case.function_signature(0);
-	let param = signature.params[0].inner.inner.ty;
+	let param = case.ast.list(signature.params)[0].ty;
 	assert!(matches!(case.ast.ty(param), TypeExpression::Never));
 	let result = signature.result.expect("a result type");
 	assert!(matches!(case.ast.ty(result), TypeExpression::Never));
@@ -3979,17 +3975,16 @@ fn test_infer_and_memory_tagged_types() {
 
 	// a memory-tagged type names the memory its pointer belongs to, a
 	// pointer to a slice included
-	let params = &case.function_signature(0).params;
+	let params = case.ast.list(case.function_signature(0).params);
 	for index in [0, 1] {
-		let ty = case.ast.ty(params[index].inner.inner.ty);
+		let ty = case.ast.ty(params[index].ty);
 		let TypeExpression::Pointer { memory, .. } = ty else {
 			panic!("expected a pointer type");
 		};
 		let memory = memory.expect("tagged with an explicit memory");
 		assert_eq!(case.name(case.ast.list(memory)[0].ident.inner), "heap");
 	}
-	let TypeExpression::Pointer { inner, .. } =
-		case.ast.ty(params[1].inner.inner.ty)
+	let TypeExpression::Pointer { inner, .. } = case.ast.ty(params[1].ty)
 	else {
 		unreachable!()
 	};
@@ -4040,14 +4035,14 @@ fn test_imported_function_is_a_declaration_without_a_body() {
     "});
 	case.diagnostics().assert_none();
 
-	let Item::Import { items: entries, .. } = case.item(0) else {
+	let Item::Import { entries, .. } = case.item(0) else {
 		panic!("item 0 is {}, not an import", item_kind(case.item(0)))
 	};
-	assert_eq!(entries.inner.len(), 1);
+	assert_eq!(entries.len(), 1);
 	let ImportEntry::Declaration {
 		declaration: ImportDeclaration::Function { signature, .. },
 		..
-	} = &entries.inner[0].inner.inner
+	} = &case.ast.list(*entries)[0]
 	else {
 		panic!("expected an imported function")
 	};
@@ -4079,7 +4074,10 @@ fn test_bodyless_function_is_a_declaration() {
 		)
 	};
 	assert_eq!(case.name(signature.name.inner), "raw_load");
-	assert_eq!(case.name(attributes[0].name.inner), "intrinsic");
+	assert_eq!(
+		case.name(case.ast.list(*attributes)[0].name.inner),
+		"intrinsic"
+	);
 
 	// the one with a body still parses as a plain function
 	assert!(matches!(case.item(1), Item::Function { .. }));
@@ -4142,7 +4140,7 @@ fn test_impl_associated_const() {
 	let Item::InherentImpl { items, .. } = case.item(0) else {
 		panic!("item 0 is {}, not an impl", item_kind(case.item(0)))
 	};
-	let ImplItem::Constant { name, ty, .. } = &items[0].inner.inner else {
+	let ImplItem::Constant { name, ty, .. } = &case.ast.list(*items)[0] else {
 		panic!("expected an associated const")
 	};
 	assert_eq!(case.name(name.inner), "ZERO");
@@ -4162,8 +4160,12 @@ fn test_attribute_with_arguments() {
 	let Item::Memory { attributes, .. } = case.item(0) else {
 		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
 	};
-	assert_eq!(case.name(attributes[0].name.inner), "memory_limits");
-	let AttributeValue::Named(args) = &attributes[0].value else {
+	assert_eq!(
+		case.name(case.ast.list(*attributes)[0].name.inner),
+		"memory_limits"
+	);
+	let AttributeValue::Named(args) = &case.ast.list(*attributes)[0].value
+	else {
 		panic!("expected named attribute arguments")
 	};
 	let arguments: Vec<(&str, u64)> = case
@@ -4195,7 +4197,8 @@ fn old_attribute_arguments_are_reported_and_read_as_named() {
 	let Item::Memory { attributes, .. } = case.item(0) else {
 		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
 	};
-	let AttributeValue::Named(args) = &attributes[0].value else {
+	let AttributeValue::Named(args) = &case.ast.list(*attributes)[0].value
+	else {
 		panic!("expected named attribute arguments")
 	};
 	let names: Vec<&str> = case
@@ -4305,7 +4308,8 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let Item::Function { attributes, .. } = case.item(0) else {
 		panic!("expected function");
 	};
-	let AttributeValue::Named(args) = &attributes[0].value else {
+	let AttributeValue::Named(args) = &case.ast.list(*attributes)[0].value
+	else {
 		panic!("expected attribute args");
 	};
 	let Some(value) = case.ast.list(*args)[0].value else {
@@ -4322,7 +4326,7 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	for span in [
 		arg,
 		external_name,
-		entries[0].inner.inner.alias.as_ref().unwrap(),
+		case.ast.list(*entries)[0].alias.as_ref().unwrap(),
 	] {
 		assert_eq!(span.extract_str(source), r#""line\nslash\\n""#);
 	}
@@ -4354,7 +4358,7 @@ fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
     "};
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
-	assert_eq!(case.ast.items.len(), 4);
+	assert_eq!(case.ast.root.len(), 4);
 	assert!(case.strings.get("ok").is_none());
 	assert!(case.strings.get(r#""\o""#).is_none());
 	let statements = case.function_block(0);
@@ -4380,7 +4384,7 @@ fn a_type_argument_list_may_open_with_a_qualified_type() {
 	let case = TestCase::new("func f(x: Is<<A as B>::C, D>) {}");
 	case.diagnostics().assert_none();
 
-	let param = &case.function_signature(0).params[0].inner.inner;
+	let param = &case.ast.list(case.function_signature(0).params)[0];
 	let TypeExpression::Path(segments) = case.ast.ty(param.ty) else {
 		panic!("expected a path type, got {:?}", case.ast.ty(param.ty))
 	};
@@ -4521,9 +4525,11 @@ fn dots_in_an_enum_body_are_an_entry_wherever_they_are_written() {
 		let Item::Enum { entries, .. } = case.item(0) else {
 			panic!("expected enum item")
 		};
-		let written: String = entries
+		let written: String = case
+			.ast
+			.list(*entries)
 			.iter()
-			.map(|entry| match entry.inner.inner {
+			.map(|entry| match entry {
 				EnumEntry::Variant(_) => 'V',
 				EnumEntry::Rest => 'R',
 			})
@@ -4584,7 +4590,7 @@ fn a_keyword_after_a_dot_starts_the_next_statement() {
 	assert_eq!(block.len(), 2);
 	assert_eq!(case.shape(case.entry_expr(&block, 0)), "(. p <error>)");
 	assert_eq!(case.shape(case.local_value(&block, 1)), "1");
-	assert_eq!(case.ast.items.len(), 2, "the next item still parses");
+	assert_eq!(case.ast.root.len(), 2, "the next item still parses");
 }
 
 #[test]
@@ -4630,12 +4636,12 @@ fn a_type_path_with_no_last_segment_keeps_its_prefix() {
 	let case = TestCase::new("func f(a: core::) {}\nfunc g() {}");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
-	let param = &case.function_signature(0).params[0].inner.inner;
+	let param = &case.ast.list(case.function_signature(0).params)[0];
 	let TypeExpression::Path(path) = case.ast.ty(param.ty) else {
 		panic!("expected a path type")
 	};
 	assert_eq!(case.path(case.ast.list(path)), "core::<error>");
-	assert_eq!(case.ast.items.len(), 2);
+	assert_eq!(case.ast.root.len(), 2);
 }
 
 #[test]
@@ -4745,9 +4751,9 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	let case = TestCase::new(source);
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
-	let params = &case.function_signature(0).params;
+	let params = case.ast.list(case.function_signature(0).params);
 	assert_eq!(params.len(), 2);
-	let param = &params[1].inner.inner;
+	let param = &params[1];
 	assert!(matches!(param.binding, Some(Binding::Name { .. })));
 	assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
 	assert_eq!(case.ast.type_span(param.ty), TextSpan::new(17, 18));
@@ -4760,7 +4766,7 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	};
 	assert_eq!(fields.len(), 2);
 	assert!(matches!(
-		case.ast.ty(fields[1].inner.inner.ty),
+		case.ast.ty(case.ast.list(*fields)[1].ty),
 		TypeExpression::Error
 	));
 }

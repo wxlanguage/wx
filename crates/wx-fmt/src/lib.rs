@@ -358,8 +358,9 @@ enum Before {
 	Entry { end: u32 },
 	/// An entry that always stands apart from the next — a block-like item, an
 	/// impl member. Like `Entry`, but a blank line goes in even where the
-	/// author left none. Paired with `After::End` it degenerates to `Entry`:
-	/// there is nothing following for it to stand apart from.
+	/// author left none, even before the comments that close a list, so a
+	/// list's last gap is always an `Entry`: there is nothing following for
+	/// it to stand apart from.
 	SpacedEntry { end: u32 },
 }
 
@@ -648,7 +649,7 @@ impl<'a> Builder<'a> {
 
 	fn build(&mut self, ast: &ast::AST) -> NodeId {
 		self.build_item_list(
-			&ast.items,
+			ast.root,
 			TextSpan::new(0, self.source.len() as u32),
 		)
 	}
@@ -658,66 +659,48 @@ impl<'a> Builder<'a> {
 	/// the list too, so both ends of `span` matter.
 	fn build_item_list(
 		&mut self,
-		items: &[ast::Separated<ast::Spanned<ast::Item>>],
+		items: ast::List<ast::Item>,
 		span: TextSpan,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-
-		let Some(first) = items.first() else {
-			// Nothing but comments — a header-only file, or a `mod` body with
-			// something to say and nothing to declare. They are still the
-			// list's comments, so they are still emitted.
-			self.push_between(
-				&mut nodes,
-				Before::Opener { from: span.start },
-				After::End { at: span.end },
-			);
-			return self.arena.concat(nodes);
-		};
-
-		// The file header, or the line opening a `mod` body. At the top of a
-		// file the break this emits has nothing in front of it and disappears.
-		self.push_between(
-			&mut nodes,
-			Before::Opener { from: span.start },
-			After::Entry {
-				start: first.inner.span.start,
-			},
-		);
-
-		for (index, item) in items.iter().enumerate() {
-			if index > 0 {
-				let prev = &items[index - 1];
-				let end = prev.inner.span.end;
+		// The item before, and whether it is block-like.
+		let mut previous: Option<(u32, bool)> = None;
+		for item in ast.spanned(items) {
+			let block_like = item.inner.is_block_like();
+			let before = match previous {
+				// The file header, or the line opening a `mod` body. At the
+				// top of a file the break this emits has nothing in front of
+				// it and disappears.
+				None => Before::Opener { from: span.start },
 				// Block-like items always stand apart, however the author
 				// spaced them.
-				let spaced = prev.inner.inner.is_block_like()
-					|| item.inner.inner.is_block_like();
-				self.push_between(
-					&mut nodes,
-					match spaced {
-						true => Before::SpacedEntry { end },
-						false => Before::Entry { end },
-					},
-					After::Entry {
-						start: item.inner.span.start,
-					},
-				);
-			}
-			let id = self.build_item(&item.inner.inner, item.inner.span);
-			nodes.push(id);
+				Some((end, previous_block_like))
+					if previous_block_like || block_like =>
+				{
+					Before::SpacedEntry { end }
+				}
+				Some((end, _)) => Before::Entry { end },
+			};
+			self.push_between(
+				&mut nodes,
+				before,
+				After::Entry {
+					start: item.span.start,
+				},
+			);
+			nodes.push(self.build_item(&item.inner, item.span));
+			previous = Some((item.span.end, block_like));
 		}
-
 		// Comments after the last item, before the closing `}` or the end of
-		// the file. The first of them may still trail the last item's line.
-		self.push_between(
-			&mut nodes,
-			Before::Entry {
-				end: items.last().unwrap().inner.span.end,
-			},
-			After::End { at: span.end },
-		);
-
+		// the file: all of them, in a header-only file or a `mod` body with
+		// something to say and nothing to declare. The first may still trail
+		// the last item's line.
+		let before = match previous {
+			None => Before::Opener { from: span.start },
+			Some((end, _)) => Before::Entry { end },
+		};
+		self.push_between(&mut nodes, before, After::End { at: span.end });
 		self.arena.concat(nodes)
 	}
 
@@ -731,7 +714,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut items: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut items, attributes);
+				self.build_attributes(&mut items, *attributes);
 				let attribute_count = items.len();
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
@@ -753,7 +736,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut items: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut items, attributes);
+				self.build_attributes(&mut items, *attributes);
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
@@ -768,7 +751,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut items = Vec::new();
-				self.build_attributes(&mut items, attributes);
+				self.build_attributes(&mut items, *attributes);
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
@@ -785,7 +768,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut items = Vec::new();
-				self.build_attributes(&mut items, attributes);
+				self.build_attributes(&mut items, *attributes);
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
@@ -805,14 +788,14 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut items = Vec::new();
-				self.build_attributes(&mut items, attributes);
+				self.build_attributes(&mut items, *attributes);
 				if pub_span.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				items.push(self.text(Text::Package));
 				items.push(self.text(Text::TypeKw));
 				items.push(self.symbol(name.inner));
-				self.build_type_params(&mut items, type_params);
+				self.build_type_params(&mut items, *type_params);
 				items.push(self.text(Text::Semi));
 				self.arena.concat(items)
 			}
@@ -827,29 +810,30 @@ impl<'a> Builder<'a> {
 			} => self.build_global_definition(
 				*pub_span,
 				*mut_span,
-				attributes,
+				*attributes,
 				name,
 				*type_annotation,
 				*value,
 			),
 			ast::Item::Export { entry } => {
 				let mut parts: Vec<NodeId> = vec![self.text(Text::Export)];
-				parts.push(self.build_export_entry(&entry.inner));
+				parts.push(self.build_export_entry(entry));
 				parts.push(self.text(Text::Semi));
 				self.arena.concat(parts)
 			}
 			ast::Item::ExportBlock { entries, .. } => {
-				self.build_export_definition(span, entries)
+				self.build_export_definition(span, *entries)
 			}
 			ast::Item::Import {
 				external_name,
 				internal_name,
-				items: entries,
+				entries,
+				..
 			} => self.build_import_definition(
 				span,
 				external_name,
 				Some(internal_name),
-				&entries.inner,
+				*entries,
 			),
 			ast::Item::Memory {
 				pub_span,
@@ -859,7 +843,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut parts: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut parts, attributes);
+				self.build_attributes(&mut parts, *attributes);
 				if pub_span.is_some() {
 					parts.push(self.text(Text::Pub));
 				}
@@ -878,14 +862,19 @@ impl<'a> Builder<'a> {
 				entries,
 				..
 			} => self.build_enum_definition(
-				span, *pub_span, attributes, *repr, name, entries,
+				span,
+				*pub_span,
+				*attributes,
+				*repr,
+				name,
+				*entries,
 			),
 			ast::Item::InherentImpl {
 				type_params,
 				target,
 				items,
 				..
-			} => self.build_impl_definition(span, type_params, target, items),
+			} => self.build_impl_definition(span, *type_params, target, *items),
 			ast::Item::TraitImpl {
 				type_params,
 				trait_name,
@@ -894,10 +883,10 @@ impl<'a> Builder<'a> {
 				..
 			} => self.build_impl_trait_definition(
 				span,
-				type_params,
+				*type_params,
 				trait_name,
 				target,
-				items,
+				*items,
 			),
 			ast::Item::Const {
 				pub_span,
@@ -907,18 +896,18 @@ impl<'a> Builder<'a> {
 				value,
 				..
 			} => self.build_const_definition(
-				*pub_span, attributes, name, *ty, *value,
+				*pub_span,
+				*attributes,
+				name,
+				*ty,
+				*value,
 			),
 			ast::Item::Module {
 				pub_span,
 				name,
 				items,
-			} => self.build_module_definition(
-				span,
-				*pub_span,
-				name,
-				&items.inner,
-			),
+				..
+			} => self.build_module_definition(span, *pub_span, name, *items),
 			ast::Item::ModuleDeclaration { pub_span, name } => {
 				self.build_module_declaration(*pub_span, name)
 			}
@@ -932,10 +921,10 @@ impl<'a> Builder<'a> {
 			} => self.build_trait_definition(
 				span,
 				*pub_span,
-				attributes,
+				*attributes,
 				name,
 				*supertraits,
-				items,
+				*items,
 			),
 			ast::Item::Struct {
 				attributes,
@@ -945,10 +934,10 @@ impl<'a> Builder<'a> {
 				pub_span,
 			} => self.build_struct_declaration(
 				span,
-				attributes,
+				*attributes,
 				name,
-				type_params,
-				fields,
+				*type_params,
+				*fields,
 				*pub_span,
 			),
 			ast::Item::TypeSet {
@@ -959,7 +948,12 @@ impl<'a> Builder<'a> {
 				members,
 				..
 			} => self.build_typeset_definition(
-				span, *pub_span, attributes, name, *bounds, members,
+				span,
+				*pub_span,
+				*attributes,
+				name,
+				*bounds,
+				*members,
 			),
 			ast::Item::TypeAlias {
 				pub_span,
@@ -971,9 +965,9 @@ impl<'a> Builder<'a> {
 			} => self.build_type_alias_definition(
 				*pub_span,
 				name,
-				type_params,
+				*type_params,
 				*body,
-				attributes,
+				*attributes,
 			),
 			ast::Item::PackageInstance {
 				pub_span,
@@ -997,7 +991,7 @@ impl<'a> Builder<'a> {
 					items.push(self.text(Text::Pub));
 				}
 				items.push(self.text(Text::Use));
-				let tree = self.build_use_tree(&tree.inner);
+				let tree = self.build_use_tree(self.ast.use_tree(*tree));
 				items.push(tree);
 				items.push(self.text(Text::Semi));
 				self.arena.concat(items)
@@ -1009,7 +1003,7 @@ impl<'a> Builder<'a> {
 	/// breaking like an `export` block does: a `use` names things that live
 	/// elsewhere, so its length tracks the path being imported rather than
 	/// the size of anything in this file, and it stays short in practice.
-	fn build_use_tree(&mut self, tree: &ast::UseTree) -> NodeId {
+	fn build_use_tree(&mut self, tree: ast::UseTree) -> NodeId {
 		match tree {
 			ast::UseTree::Glob { segment } => {
 				let segment = self.symbol(segment.inner);
@@ -1032,19 +1026,23 @@ impl<'a> Builder<'a> {
 			ast::UseTree::Path { segment, rest } => {
 				let segment = self.symbol(segment.inner);
 				let colons = self.text(Text::ColonColon);
-				let rest = self.build_use_tree(&rest.inner);
+				let rest = self.build_use_tree(self.ast.use_tree(rest));
 				self.arena.concat(vec![segment, colons, rest])
 			}
-			ast::UseTree::Group { segment, branches } => {
+			ast::UseTree::Group {
+				segment, branches, ..
+			} => {
 				let mut items: Vec<NodeId> = vec![
 					self.symbol(segment.inner),
 					self.text(Text::ColonColonLBrace),
 				];
-				for (index, element) in branches.inner.iter().enumerate() {
+				for (index, &element) in
+					self.ast.list(branches).iter().enumerate()
+				{
 					if index > 0 {
 						items.push(self.text(Text::CommaSp));
 					}
-					let element = self.build_use_tree(&element.inner.inner);
+					let element = self.build_use_tree(element);
 					items.push(element);
 				}
 				items.push(self.text(Text::RBrace));
@@ -1058,8 +1056,9 @@ impl<'a> Builder<'a> {
 		span: TextSpan,
 		module: &TextSpan,
 		alias: Option<&ast::Spanned<SymbolU32>>,
-		entries: &[ast::Separated<ast::Spanned<ast::ImportEntry>>],
+		entries: ast::List<ast::ImportEntry>,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut items: Vec<NodeId> =
 			vec![self.text(Text::Import), self.source_text(*module)];
 
@@ -1073,39 +1072,31 @@ impl<'a> Builder<'a> {
 		if entries.is_empty() {
 			self.build_empty_braced_comments(&mut items, span);
 		} else {
-			let last_end = entries.last().unwrap().inner.span.end;
-
 			let mut entry_items: Vec<NodeId> = Vec::new();
-			self.push_between(
-				&mut entry_items,
-				Before::Opener { from: span.start },
-				After::Entry {
-					start: entries[0].inner.span.start,
-				},
-			);
-
-			for (index, entry) in entries.iter().enumerate() {
-				if index > 0 {
-					self.push_between(
-						&mut entry_items,
-						Before::Entry {
-							end: entries[index - 1].inner.span.end,
-						},
-						After::Entry {
-							start: entry.inner.span.start,
-						},
-					);
-				}
+			let mut before = Before::Opener { from: span.start };
+			for entry in ast.spanned(entries) {
+				self.push_between(
+					&mut entry_items,
+					before,
+					After::Entry {
+						start: entry.span.start,
+					},
+				);
+				before = Before::Entry {
+					end: entry.span.end,
+				};
 
 				let mut entry_nodes: Vec<NodeId> = Vec::new();
 
-				match &entry.inner.inner {
+				match &entry.inner {
 					ast::ImportEntry::Use { tree, pub_span } => {
 						if pub_span.is_some() {
 							entry_nodes.push(self.text(Text::Pub));
 						}
 						entry_nodes.push(self.text(Text::Use));
-						entry_nodes.push(self.build_use_tree(&tree.inner));
+						entry_nodes.push(
+							self.build_use_tree(self.ast.use_tree(*tree)),
+						);
 					}
 					ast::ImportEntry::Declaration {
 						external_name,
@@ -1172,9 +1163,8 @@ impl<'a> Builder<'a> {
 					}
 				}
 
-				if entry.separator.is_some() {
-					entry_nodes.push(self.text(Text::Semi));
-				}
+				// Every entry ends with a `;`, the last one included.
+				entry_nodes.push(self.text(Text::Semi));
 
 				let entry_concat = self.arena.concat(entry_nodes);
 				entry_items.push(entry_concat);
@@ -1182,7 +1172,7 @@ impl<'a> Builder<'a> {
 
 			self.push_between(
 				&mut entry_items,
-				Before::Entry { end: last_end },
+				before,
 				After::End { at: span.end },
 			);
 
@@ -1201,7 +1191,7 @@ impl<'a> Builder<'a> {
 		span: TextSpan,
 		pub_span: Option<TextSpan>,
 		name: &ast::Spanned<SymbolU32>,
-		items: &[ast::Separated<ast::Spanned<ast::Item>>],
+		items: ast::List<ast::Item>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
 		if pub_span.is_some() {
@@ -1244,14 +1234,14 @@ impl<'a> Builder<'a> {
 	fn build_impl_definition(
 		&mut self,
 		span: TextSpan,
-		type_params: &[ast::Spanned<ast::TypeParam>],
+		type_params: ast::List<ast::TypeParam>,
 		target: &ast::Path,
-		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
+		items: ast::List<ast::ImplItem>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = vec![self.text(Text::Impl)];
 		self.build_type_params(&mut nodes, type_params);
 		nodes.push(self.text(Text::Space));
-		nodes.push(self.build_type_path(&target.segments));
+		nodes.push(self.build_type_path(self.ast.list(target.segments)));
 		nodes.push(self.text(Text::SpaceLBrace));
 
 		if !items.is_empty() {
@@ -1271,17 +1261,17 @@ impl<'a> Builder<'a> {
 	fn build_impl_trait_definition(
 		&mut self,
 		span: TextSpan,
-		type_params: &[ast::Spanned<ast::TypeParam>],
+		type_params: ast::List<ast::TypeParam>,
 		trait_name: &ast::Path,
 		target: &ast::Path,
-		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
+		items: ast::List<ast::ImplItem>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = vec![self.text(Text::Impl)];
 		self.build_type_params(&mut nodes, type_params);
 		nodes.push(self.text(Text::Space));
-		let trait_id = self.build_type_path(&trait_name.segments);
+		let trait_id = self.build_type_path(self.ast.list(trait_name.segments));
 		let for_kw = self.text(Text::ForKw);
-		let target_id = self.build_type_path(&target.segments);
+		let target_id = self.build_type_path(self.ast.list(target.segments));
 		let brace = self.text(Text::SpaceLBrace);
 		nodes.extend([trait_id, for_kw, target_id, brace]);
 
@@ -1302,41 +1292,31 @@ impl<'a> Builder<'a> {
 	fn build_impl_item_list(
 		&mut self,
 		span: TextSpan,
-		items: &[ast::Separated<ast::Spanned<ast::ImplItem>>],
+		items: ast::List<ast::ImplItem>,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		let Some(first) = items.first() else {
-			return self.arena.concat(nodes);
-		};
-
-		self.push_between(
-			&mut nodes,
-			Before::Opener { from: span.start },
-			After::Entry {
-				start: first.inner.span.start,
-			},
-		);
-
-		for (index, item) in items.iter().enumerate() {
-			if index > 0 {
-				self.push_between(
-					&mut nodes,
+		let mut previous_end = None;
+		for item in ast.spanned(items) {
+			self.push_between(
+				&mut nodes,
+				match previous_end {
+					None => Before::Opener { from: span.start },
 					// Impl members always stand apart.
-					Before::SpacedEntry {
-						end: items[index - 1].inner.span.end,
-					},
-					After::Entry {
-						start: item.inner.span.start,
-					},
-				);
-			}
-			nodes.push(self.build_impl_item(&item.inner.inner));
+					Some(end) => Before::SpacedEntry { end },
+				},
+				After::Entry {
+					start: item.span.start,
+				},
+			);
+			nodes.push(self.build_impl_item(&item.inner));
+			previous_end = Some(item.span.end);
 		}
-
 		self.push_between(
 			&mut nodes,
-			Before::Entry {
-				end: items.last().unwrap().inner.span.end,
+			match previous_end {
+				None => Before::Opener { from: span.start },
+				Some(end) => Before::Entry { end },
 			},
 			After::End { at: span.end },
 		);
@@ -1353,7 +1333,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut nodes, attributes);
+				self.build_attributes(&mut nodes, *attributes);
 				let attribute_count = nodes.len();
 				if pub_span.is_some() {
 					nodes.push(self.text(Text::Pub));
@@ -1376,7 +1356,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut nodes, attributes);
+				self.build_attributes(&mut nodes, *attributes);
 				if pub_span.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
@@ -1398,7 +1378,7 @@ impl<'a> Builder<'a> {
 				attributes,
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut nodes, attributes);
+				self.build_attributes(&mut nodes, *attributes);
 				if pub_span.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
@@ -1416,10 +1396,10 @@ impl<'a> Builder<'a> {
 		&mut self,
 		span: TextSpan,
 		pub_span: Option<TextSpan>,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 		name: &ast::Spanned<SymbolU32>,
 		supertraits: Option<ast::BoundId>,
-		items: &[ast::Separated<ast::Spanned<ast::TraitItem>>],
+		items: ast::List<ast::TraitItem>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut nodes, attributes);
@@ -1453,41 +1433,31 @@ impl<'a> Builder<'a> {
 	fn build_trait_item_list(
 		&mut self,
 		span: TextSpan,
-		items: &[ast::Separated<ast::Spanned<ast::TraitItem>>],
+		items: ast::List<ast::TraitItem>,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		let Some(first) = items.first() else {
-			return self.arena.concat(nodes);
-		};
-
-		self.push_between(
-			&mut nodes,
-			Before::Opener { from: span.start },
-			After::Entry {
-				start: first.inner.span.start,
-			},
-		);
-
-		for (index, item) in items.iter().enumerate() {
-			if index > 0 {
-				self.push_between(
-					&mut nodes,
+		let mut previous_end = None;
+		for item in ast.spanned(items) {
+			self.push_between(
+				&mut nodes,
+				match previous_end {
+					None => Before::Opener { from: span.start },
 					// Trait members always stand apart, like impl members.
-					Before::SpacedEntry {
-						end: items[index - 1].inner.span.end,
-					},
-					After::Entry {
-						start: item.inner.span.start,
-					},
-				);
-			}
-			nodes.push(self.build_trait_item(&item.inner.inner));
+					Some(end) => Before::SpacedEntry { end },
+				},
+				After::Entry {
+					start: item.span.start,
+				},
+			);
+			nodes.push(self.build_trait_item(&item.inner));
+			previous_end = Some(item.span.end);
 		}
-
 		self.push_between(
 			&mut nodes,
-			Before::Entry {
-				end: items.last().unwrap().inner.span.end,
+			match previous_end {
+				None => Before::Opener { from: span.start },
+				Some(end) => Before::Entry { end },
 			},
 			After::End { at: span.end },
 		);
@@ -1503,7 +1473,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut nodes, attributes);
+				self.build_attributes(&mut nodes, *attributes);
 				let attribute_count = nodes.len();
 				self.build_function_signature(&mut nodes, signature);
 				match body {
@@ -1530,7 +1500,7 @@ impl<'a> Builder<'a> {
 				..
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut nodes, attributes);
+				self.build_attributes(&mut nodes, *attributes);
 				nodes.push(self.text(Text::Const));
 				nodes.push(self.symbol(name.inner));
 				nodes.push(self.text(Text::ColonSp));
@@ -1549,7 +1519,7 @@ impl<'a> Builder<'a> {
 				value,
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				self.build_attributes(&mut nodes, attributes);
+				self.build_attributes(&mut nodes, *attributes);
 				nodes.push(self.text(Text::TypeKw));
 				nodes.push(self.symbol(name.inner));
 				if let Some(b) = bounds {
@@ -1569,7 +1539,7 @@ impl<'a> Builder<'a> {
 	fn build_const_definition(
 		&mut self,
 		pub_span: Option<TextSpan>,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 		name: &ast::Spanned<SymbolU32>,
 		ty: Option<ast::TypeId>,
 		value: ast::ExprId,
@@ -1595,9 +1565,9 @@ impl<'a> Builder<'a> {
 		&mut self,
 		pub_span: Option<TextSpan>,
 		name: &ast::Spanned<SymbolU32>,
-		type_params: &[ast::Spanned<ast::TypeParam>],
+		type_params: ast::List<ast::TypeParam>,
 		body: Option<ast::TypeId>,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut nodes, attributes);
@@ -1635,19 +1605,18 @@ impl<'a> Builder<'a> {
 
 		if !arms.is_empty() {
 			let mut arm_items: Vec<NodeId> = Vec::new();
+			let mut before = Before::Opener { from: span.start };
 			for (index, arm) in arms.iter().enumerate() {
 				self.push_between(
 					&mut arm_items,
-					match index {
-						0 => Before::Opener { from: span.start },
-						_ => Before::Entry {
-							end: arm_span(&arms[index - 1]).end,
-						},
-					},
+					before,
 					After::Entry {
 						start: arm_span(arm).start,
 					},
 				);
+				before = Before::Entry {
+					end: arm_span(arm).end,
+				};
 				let mut an: Vec<NodeId> = Vec::new();
 				self.build_pattern(&mut an, arm.pattern);
 				an.push(self.text(Text::FatArrow));
@@ -1667,9 +1636,7 @@ impl<'a> Builder<'a> {
 			}
 			self.push_between(
 				&mut arm_items,
-				Before::Entry {
-					end: arm_span(arms.last().unwrap()).end,
-				},
+				before,
 				After::End { at: span.end },
 			);
 
@@ -1688,11 +1655,12 @@ impl<'a> Builder<'a> {
 		&mut self,
 		span: TextSpan,
 		pub_span: Option<TextSpan>,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 		repr: Option<ast::TypeId>,
 		name: &ast::Spanned<SymbolU32>,
-		entries: &[ast::Separated<ast::Spanned<ast::EnumEntry>>],
+		entries: ast::List<ast::EnumEntry>,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut nodes, attributes);
 		if pub_span.is_some() {
@@ -1708,16 +1676,10 @@ impl<'a> Builder<'a> {
 		nodes.push(self.text(Text::SpaceLBrace));
 
 		// A body of only `..`, with nothing around it: `{ .. }`.
-		if let [only] = entries
-			&& matches!(only.inner.inner, ast::EnumEntry::Rest)
-			&& self
-				.comments
-				.between(span.start, only.inner.span.start)
-				.is_empty()
-			&& self
-				.comments
-				.between(only.inner.span.end, span.end)
-				.is_empty()
+		if let ([ast::EnumEntry::Rest], [only]) =
+			(ast.list(entries), ast.spans(entries))
+			&& self.comments.between(span.start, only.start).is_empty()
+			&& self.comments.between(only.end, span.end).is_empty()
 		{
 			nodes.push(self.text(Text::Space));
 			nodes.push(self.text(Text::DotDot));
@@ -1728,21 +1690,20 @@ impl<'a> Builder<'a> {
 
 		if !entries.is_empty() {
 			let mut entry_items: Vec<NodeId> = Vec::new();
-			for (index, entry) in entries.iter().enumerate() {
+			let mut before = Before::Opener { from: span.start };
+			for (index, entry) in ast.spanned(entries).enumerate() {
 				self.push_between(
 					&mut entry_items,
-					match index {
-						0 => Before::Opener { from: span.start },
-						_ => Before::Entry {
-							end: entries[index - 1].inner.span.end,
-						},
-					},
+					before,
 					After::Entry {
-						start: entry.inner.span.start,
+						start: entry.span.start,
 					},
 				);
+				before = Before::Entry {
+					end: entry.span.end,
+				};
 				let mut en: Vec<NodeId> = Vec::new();
-				match &entry.inner.inner {
+				match &entry.inner {
 					ast::EnumEntry::Variant(variant) => {
 						en.push(self.symbol(variant.name.inner));
 						if let Some(value) = variant.value {
@@ -1757,19 +1718,14 @@ impl<'a> Builder<'a> {
 				// list, as it does in a pattern.
 				if index + 1 < entries.len() {
 					en.push(self.text(Text::Comma));
-				} else if matches!(
-					entry.inner.inner,
-					ast::EnumEntry::Variant(_)
-				) {
+				} else if matches!(entry.inner, ast::EnumEntry::Variant(_)) {
 					en.push(self.if_break_comma());
 				}
 				entry_items.push(self.arena.concat(en));
 			}
 			self.push_between(
 				&mut entry_items,
-				Before::Entry {
-					end: entries.last().unwrap().inner.span.end,
-				},
+				before,
 				After::End { at: span.end },
 			);
 
@@ -1794,11 +1750,12 @@ impl<'a> Builder<'a> {
 		&mut self,
 		span: TextSpan,
 		pub_span: Option<TextSpan>,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 		name: &ast::Spanned<SymbolU32>,
 		bounds: Option<ast::BoundId>,
-		members: &[ast::Separated<ast::Spanned<ast::Path>>],
+		members: ast::List<ast::Path>,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut items: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut items, attributes);
 		if pub_span.is_some() {
@@ -1810,11 +1767,12 @@ impl<'a> Builder<'a> {
 			items.push(self.text(Text::ColonSp));
 			items.push(self.build_bound_expression(bounds));
 		}
-		let entries = members
+		let entries = ast
+			.list(members)
 			.iter()
 			.map(|member| {
-				let path = self.build_type_path(&member.inner.inner.segments);
-				(member.inner.span, path)
+				let path = self.build_type_path(ast.list(member.segments));
+				(member.span, path)
 			})
 			.collect();
 		items.push(self.build_delimited_list(
@@ -1830,12 +1788,13 @@ impl<'a> Builder<'a> {
 	fn build_struct_declaration(
 		&mut self,
 		span: TextSpan,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 		name: &ast::Spanned<SymbolU32>,
-		type_params: &[ast::Spanned<ast::TypeParam>],
-		fields: &[ast::Separated<ast::Spanned<ast::StructField>>],
+		type_params: ast::List<ast::TypeParam>,
+		fields: ast::List<ast::StructField>,
 		pub_span: Option<TextSpan>,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut items: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut items, attributes);
 		if pub_span.is_some() {
@@ -1845,19 +1804,19 @@ impl<'a> Builder<'a> {
 		items.push(self.symbol(name.inner));
 		self.build_type_params(&mut items, type_params);
 
-		let entries = fields
-			.iter()
+		let entries = ast
+			.spanned(fields)
 			.map(|field| {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				if field.inner.inner.pub_span.is_some() {
+				if field.inner.pub_span.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
 				self.build_binding_and_type(
 					&mut nodes,
-					field.inner.inner.binding,
-					field.inner.inner.ty,
+					field.inner.binding,
+					field.inner.ty,
 				);
-				(field.inner.span, self.arena.concat(nodes))
+				(field.span, self.arena.concat(nodes))
 			})
 			.collect();
 		items.push(self.build_delimited_list(
@@ -1874,39 +1833,30 @@ impl<'a> Builder<'a> {
 	fn build_export_definition(
 		&mut self,
 		span: TextSpan,
-		entries: &[ast::Separated<ast::Spanned<ast::ExportEntry>>],
+		entries: ast::List<ast::ExportEntry>,
 	) -> NodeId {
+		let ast = self.ast;
 		let mut items: Vec<NodeId> = vec![self.text(Text::ExportLBrace)];
 
 		if entries.is_empty() {
 			self.build_empty_braced_comments(&mut items, span);
 		} else {
-			let last_end = entries.last().unwrap().inner.span.end;
-
 			let mut entry_items: Vec<NodeId> = Vec::new();
-			self.push_between(
-				&mut entry_items,
-				Before::Opener { from: span.start },
-				After::Entry {
-					start: entries[0].inner.span.start,
-				},
-			);
+			let mut before = Before::Opener { from: span.start };
+			for entry in ast.list(entries) {
+				let entry_span = entry.span();
+				self.push_between(
+					&mut entry_items,
+					before,
+					After::Entry {
+						start: entry_span.start,
+					},
+				);
+				before = Before::Entry {
+					end: entry_span.end,
+				};
 
-			for (index, entry) in entries.iter().enumerate() {
-				if index > 0 {
-					self.push_between(
-						&mut entry_items,
-						Before::Entry {
-							end: entries[index - 1].inner.span.end,
-						},
-						After::Entry {
-							start: entry.inner.span.start,
-						},
-					);
-				}
-
-				let mut en: Vec<NodeId> =
-					vec![self.build_export_entry(&entry.inner.inner)];
+				let mut en: Vec<NodeId> = vec![self.build_export_entry(entry)];
 				// An export block always breaks, so every entry ends with a
 				// comma, the last one included.
 				en.push(self.text(Text::Comma));
@@ -1915,7 +1865,7 @@ impl<'a> Builder<'a> {
 
 			self.push_between(
 				&mut entry_items,
-				Before::Entry { end: last_end },
+				before,
 				After::End { at: span.end },
 			);
 
@@ -2031,9 +1981,10 @@ impl<'a> Builder<'a> {
 	fn build_attributes(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 	) {
-		for attr in attributes {
+		let ast = self.ast;
+		for attr in ast.list(attributes) {
 			out.push(self.text(Text::HashLBracket));
 			out.push(self.symbol(attr.name.inner));
 			match &attr.value {
@@ -2058,15 +2009,16 @@ impl<'a> Builder<'a> {
 	fn build_type_params(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		type_params: &[ast::Spanned<ast::TypeParam>],
+		type_params: ast::List<ast::TypeParam>,
 	) {
 		if type_params.is_empty() {
 			return;
 		}
+		let type_params = self.ast.list(type_params);
 		let mut nodes: Vec<NodeId> = vec![self.text(Text::Lt)];
 		let mut inner: Vec<NodeId> = vec![self.line()];
 		for (index, param) in type_params.iter().enumerate() {
-			match &param.inner {
+			match param {
 				ast::TypeParam::Type { name, bounds } => {
 					inner.push(self.symbol(name.inner));
 					if let Some(bounds) = bounds {
@@ -2103,18 +2055,19 @@ impl<'a> Builder<'a> {
 	) {
 		out.push(self.text(Text::Func));
 		out.push(self.symbol(signature.name.inner));
-		self.build_type_params(out, &signature.type_params);
+		self.build_type_params(out, signature.type_params);
 		let mut paren_nodes: Vec<NodeId> = vec![self.text(Text::LParen)];
 
-		if !signature.params.is_empty() {
+		let signature_params = self.ast.list(signature.params);
+		if !signature_params.is_empty() {
 			let mut params: Vec<NodeId> = vec![self.line()];
-			for (index, param) in signature.params.iter().enumerate() {
+			for (index, param) in signature_params.iter().enumerate() {
 				self.build_binding_and_type(
 					&mut params,
-					param.inner.inner.binding,
-					param.inner.inner.ty,
+					param.binding,
+					param.ty,
 				);
-				if index + 1 < signature.params.len() {
+				if index + 1 < signature_params.len() {
 					params.push(self.text(Text::Comma));
 					params.push(self.soft_line());
 				} else {
@@ -2163,7 +2116,7 @@ impl<'a> Builder<'a> {
 		&mut self,
 		pub_span: Option<TextSpan>,
 		mut_span: Option<TextSpan>,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 		name: &ast::Spanned<SymbolU32>,
 		type_annotation: Option<ast::TypeId>,
 		value: ast::ExprId,
@@ -2302,22 +2255,23 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let mut inner = Vec::new();
 
+		let mut previous_end = None;
 		for (index, &entry) in entries.iter().enumerate() {
+			let entry_span = self.entry_span(entry);
 			// The break between two statements is emitted here rather
 			// than at the end of the previous turn, so that turn can
 			// close its line with `;` and let the gap append whatever
 			// comment trails it.
-			if index > 0 {
+			if let Some(end) = previous_end {
 				self.push_between(
 					&mut inner,
-					Before::Entry {
-						end: self.entry_span(entries[index - 1]).end,
-					},
+					Before::Entry { end },
 					After::Entry {
-						start: self.entry_span(entry).start,
+						start: entry_span.start,
 					},
 				);
 			}
+			previous_end = Some(entry_span.end);
 			let last = index + 1 == entries.len();
 			match entry {
 				Entry::Tail(tail) => inner.push(self.build_expression(tail)),

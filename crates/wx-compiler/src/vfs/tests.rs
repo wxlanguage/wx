@@ -183,7 +183,7 @@ fn compilation_units_share_a_caller_owned_interner() {
 		let package = &unit.packages[unit.root_package.as_usize()];
 		let module = &package.modules[package.root.as_usize()];
 		let ast::Item::Function { signature, .. } =
-			&unit.ast(module.file_id).items[0].inner.inner
+			unit.ast(module.file_id).list(unit.ast(module.file_id).root)[0]
 		else {
 			panic!("expected a function");
 		};
@@ -251,13 +251,12 @@ fn load_package_diagnoses_missing_child_module_without_aborting() {
 		"the unresolved `boo` module should be omitted, not present as a stub"
 	);
 	assert!(
-		case.asts[root.file_id.as_usize()]
-			.items
-			.iter()
-			.any(|item| matches!(
-				&item.inner.inner,
-				ast::Item::Function { .. }
-			)),
+		{
+			let ast = &case.asts[root.file_id.as_usize()];
+			ast.list(ast.root)
+				.iter()
+				.any(|item| matches!(item, ast::Item::Function { .. }))
+		},
 		"the rest of main.wx should still parse normally"
 	);
 	case.diagnostics()

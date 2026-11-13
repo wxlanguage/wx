@@ -42,8 +42,8 @@ impl BodyBuilder<'_, '_> {
 		let return_type = self.sema.types.collapse_error(return_type);
 		let span = self.ast().block_span(block);
 		self.enter_root(span, return_type);
-		for (at, param) in signature.params.iter().enumerate() {
-			let param = &param.inner.inner;
+		for (at, param) in self.ast().list(signature.params).iter().enumerate()
+		{
 			let ty = self.sema.types.list(param_types)[at];
 			let ty = self.context().normalized(ty);
 			let ty = self.sema.types.collapse_error(ty);

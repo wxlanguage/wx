@@ -110,6 +110,7 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	strings: &'a StringInterner,
 	decls: &'a Declarations,
 	ast_nodes: &'a [AstEntry<'ast>],
+	asts: &'ast [ast::AST],
 	inherent: FxHashMap<ImplTarget, Vec<InherentImplIdx>>,
 	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
 	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
@@ -161,6 +162,7 @@ impl ImplDispatch {
 		strings: &StringInterner,
 		decls: &Declarations,
 		ast_nodes: &[AstEntry<'_>],
+		asts: &[ast::AST],
 	) -> Self {
 		ImplDispatchBuilder::new(
 			diagnostics,
@@ -168,6 +170,7 @@ impl ImplDispatch {
 			strings,
 			decls,
 			ast_nodes,
+			asts,
 		)
 		.build()
 	}
@@ -210,6 +213,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		strings: &'a StringInterner,
 		decls: &'a Declarations,
 		ast_nodes: &'a [AstEntry<'ast>],
+		asts: &'ast [ast::AST],
 	) -> Self {
 		Self {
 			diagnostics,
@@ -217,6 +221,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			strings,
 			decls,
 			ast_nodes,
+			asts,
 			inherent: FxHashMap::default(),
 			traits: FxHashMap::default(),
 			inherent_targets: vec![None; decls.inherent_impls.len()],
@@ -248,13 +253,13 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						entry.file_id,
 						entry.namespace,
 						target_path,
-						type_params,
+						*type_params,
 					) else {
 						continue;
 					};
 					let target = Spanned {
 						inner: target,
-						span: target_path.span(),
+						span: target_path.span,
 					};
 					self.inherent_targets[usize::from(*block_index)] =
 						Some(target);
@@ -280,12 +285,12 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 							entry.file_id,
 							entry.namespace,
 							target_path,
-							type_params,
+							*type_params,
 						)
 						.ok()
 						.map(|inner| Spanned {
 							inner,
-							span: target_path.span(),
+							span: target_path.span,
 						});
 					let trait_idx = self.resolve_trait(
 						entry.file_id,
@@ -296,7 +301,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						TraitImplHead {
 							trait_decl: trait_idx.map(|idx| Spanned {
 								inner: idx,
-								span: trait_name.span(),
+								span: trait_name.span,
 							}),
 							target,
 						};
@@ -305,7 +310,12 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						self.register_trait(
 							target,
 							trait_idx,
-							trait_name.segments.last().unwrap().ident.inner,
+							self.asts[entry.file_id.as_usize()]
+								.list(trait_name.segments)
+								.last()
+								.unwrap()
+								.ident
+								.inner,
 							*block_index,
 							entry.file_id,
 						);
@@ -319,6 +329,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						unreachable!()
 					};
 					let decl = &decls.typesets[usize::from(*typeset_index)];
+					let members =
+						self.asts[entry.file_id.as_usize()].list(*members);
 					for (member, &impl_index) in
 						members.iter().zip(decl.member_impls.iter())
 					{
@@ -326,19 +338,19 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 							.resolve_target(
 								entry.file_id,
 								entry.namespace,
-								&member.inner.inner,
-								&[],
+								member,
+								ast::List::EMPTY,
 							)
 							.ok()
 							.map(|inner| Spanned {
 								inner,
-								span: member.inner.span,
+								span: member.span,
 							});
 						self.trait_headers[usize::from(impl_index)] =
 							TraitImplHead {
 								trait_decl: Some(Spanned {
 									inner: decl.trait_index,
-									span: member.inner.span,
+									span: member.span,
 								}),
 								target,
 							};
@@ -774,11 +786,15 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		file_id: FileId,
 		namespace: Scope,
 		path: &ast::Path,
-		params: &[Spanned<ast::TypeParam>],
+		params: ast::List<ast::TypeParam>,
 	) -> Result<ImplTarget, ()> {
-		if params.iter().any(|param| {
-			param.inner.name().inner == path.segments[0].ident.inner
-		}) {
+		let ast = &self.asts[file_id.as_usize()];
+		let segments = ast.list(path.segments);
+		if ast
+			.list(params)
+			.iter()
+			.any(|param| param.name().inner == segments[0].ident.inner)
+		{
 			self.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::InvalidImplTarget.code())
@@ -786,7 +802,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						"cannot use a type parameter as an impl target",
 					)
 					.with_label(
-						SourceSpan::new(file_id, path.span()).primary_label(),
+						SourceSpan::new(file_id, path.span).primary_label(),
 					),
 			);
 			return Err(());
@@ -797,7 +813,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			self.strings,
 			self.decls,
 		)
-		.resolve_definition(file_id, namespace, &path.segments, Tier::Type);
+		.resolve_definition(file_id, namespace, segments, Tier::Type);
 		let kind = definition?.symbol_kind(self.decls);
 		let target = match kind {
 			DeclKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
@@ -819,7 +835,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						kind.noun()
 					))
 					.with_label(
-						SourceSpan::new(file_id, path.span()).primary_label(),
+						SourceSpan::new(file_id, path.span).primary_label(),
 					),
 			);
 		})
@@ -831,20 +847,21 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		namespace: Scope,
 		path: &ast::Path,
 	) -> Option<TraitIdx> {
+		let segments = self.asts[file_id.as_usize()].list(path.segments);
 		let definition = PathResolver::new(
 			self.diagnostics,
 			self.resolutions,
 			self.strings,
 			self.decls,
 		)
-		.resolve_definition(file_id, namespace, &path.segments, Tier::Type);
+		.resolve_definition(file_id, namespace, segments, Tier::Type);
 		match definition.ok()?.symbol_kind(self.decls) {
 			DeclKind::Trait(idx) => Some(idx),
 			other => {
 				self.diagnostics.push(report_not_a_trait_bound(
 					file_id,
 					self.strings,
-					path.segments.last().unwrap().ident,
+					segments.last().unwrap().ident,
 					other,
 				));
 				None
@@ -977,6 +994,7 @@ mod tests {
 				&strings,
 				&decls,
 				&ast_nodes,
+				&graph.asts,
 			);
 			Self {
 				files: graph.files,

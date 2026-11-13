@@ -2476,17 +2476,19 @@ fn checked_format(source: &str, width: u32, indent: u8) -> String {
 		output,
 		"idempotence: {source}"
 	);
-	for (before, after) in case.ast.items.iter().zip(&reparsed.ast.items) {
+	let items = case.ast.list(case.ast.root);
+	let reparsed_items = reparsed.ast.list(reparsed.ast.root);
+	for (before, after) in items.iter().zip(reparsed_items) {
 		if let (
 			ast::Item::Function { block: a, .. },
 			ast::Item::Function { block: b, .. },
-		) = (&before.inner.inner, &after.inner.inner)
+		) = (*before, *after)
 		{
 			Roles {
 				a: &case.ast,
 				b: &reparsed.ast,
 			}
-			.block(*a, *b);
+			.block(a, b);
 		}
 	}
 	output

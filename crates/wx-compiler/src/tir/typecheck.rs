@@ -1642,11 +1642,11 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		already_reported: bool,
 		args: &mut [TypeIndex],
 	) {
-		for at in 0..args.len() {
-			if !self.sema.types.has_infer(args[at]) {
+		for (at, arg) in args.iter_mut().enumerate() {
+			if !self.sema.types.has_infer(*arg) {
 				continue;
 			}
-			args[at] = TypeIndex::ERROR;
+			*arg = TypeIndex::ERROR;
 			if already_reported {
 				continue;
 			}

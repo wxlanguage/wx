@@ -623,150 +623,43 @@ impl ListItem for MatchArm {
 	}
 }
 
+impl ListItem for Item {
+	fn ends_in_block(&self, _ast: &AST) -> bool {
+		self.is_block_like()
+	}
+}
+
+impl ListItem for ImplItem {
+	fn ends_in_block(&self, _ast: &AST) -> bool {
+		match self {
+			ImplItem::Function { .. } => true,
+			ImplItem::Constant { .. } | ImplItem::AssocType { .. } => false,
+		}
+	}
+}
+
+impl ListItem for TraitItem {
+	fn ends_in_block(&self, _ast: &AST) -> bool {
+		match self {
+			TraitItem::Function { body, .. } => body.is_some(),
+			TraitItem::Const { .. } | TraitItem::AssociatedType { .. } => false,
+		}
+	}
+}
+
 impl ListItem for ExprId {}
 impl ListItem for TypeId {}
 impl ListItem for FunctionTypeParam {}
 impl ListItem for NamedArgument {}
 impl ListItem for PatternElement {}
 impl ListItem for PatternFieldItem {}
-
-struct SeparatedGroup<T> {
-	item_handler: fn(parser: &mut Parser) -> Result<Spanned<T>, ()>,
-	open_token: Token,
-	close_token: Token,
-	separator_token: Token,
-	/// Optional callback to determine if a missing separator should emit a
-	/// diagnostic. If None, always emits a diagnostic. If Some, calls the
-	/// function with the item.
-	should_warn_missing_separator: Option<fn(&T) -> bool>,
-}
-
-impl<T> SeparatedGroup<T> {
-	fn parse(
-		self,
-		parser: &mut Parser,
-	) -> Result<Spanned<Box<[Separated<Spanned<T>>]>>, ()> {
-		let open_span = parser.next_expect(self.open_token)?.span;
-		self.parse_after_open(parser, open_span)
-	}
-
-	/// `parse`, for a caller that consumed the opening token itself to look
-	/// past it.
-	fn parse_after_open(
-		self,
-		parser: &mut Parser,
-		open_span: TextSpan,
-	) -> Result<Spanned<Box<[Separated<Spanned<T>>]>>, ()> {
-		let mut items: Vec<Separated<Spanned<T>>> = Vec::new();
-
-		let close_span = loop {
-			let token = parser.lexer.peek();
-			if token.inner == self.close_token {
-				break parser.lexer.next().span;
-			}
-
-			if token.inner == Token::Eof {
-				let expected_close_span = match items.last() {
-					Some(last) => {
-						TextSpan::new(last.inner.span.end, last.inner.span.end)
-					}
-					None => TextSpan::new(open_span.end, open_span.end),
-				};
-				parser.ast.diagnostics.push(report_unclosed_delimiter(
-					UnclosedDelimiterDiagnostic {
-						file_id: parser.ast.file_id,
-						close_token: self.close_token,
-						open_span,
-						expected_close_span,
-					},
-				));
-				break expected_close_span;
-			}
-
-			let item = match self.parse_with_recovery(parser) {
-				Some(item) => item,
-				None => continue,
-			};
-
-			let next_token = parser.lexer.peek();
-			if next_token.inner == self.separator_token {
-				let separator_span = parser.lexer.next().span;
-				items.push(Separated {
-					inner: item,
-					separator: Some(separator_span),
-				});
-				continue;
-			}
-			if next_token.inner == self.close_token {
-				items.push(Separated {
-					inner: item,
-					separator: None,
-				});
-				break parser.lexer.next().span;
-			}
-
-			if next_token.inner == Token::Eof {
-				let eof_span = TextSpan::new(item.span.end, item.span.end);
-				parser.ast.diagnostics.push(report_unclosed_delimiter(
-					UnclosedDelimiterDiagnostic {
-						file_id: parser.ast.file_id,
-						close_token: self.close_token,
-						open_span,
-						expected_close_span: eof_span,
-					},
-				));
-				items.push(Separated {
-					inner: item,
-					separator: None,
-				});
-				break eof_span;
-			}
-
-			let should_warn = self
-				.should_warn_missing_separator
-				.map(|f| f(&item.inner))
-				.unwrap_or(true);
-
-			if should_warn {
-				parser.ast.diagnostics.push(report_missing_separator(
-					parser.ast.file_id,
-					TextSpan::new(item.span.end, item.span.end),
-					self.separator_token,
-				));
-			}
-			items.push(Separated {
-				inner: item,
-				separator: None,
-			});
-		};
-
-		Ok(Spanned {
-			inner: items.into_boxed_slice(),
-			span: TextSpan::new(open_span.start, close_span.end),
-		})
-	}
-
-	fn parse_with_recovery(&self, parser: &mut Parser) -> Option<Spanned<T>> {
-		match (self.item_handler)(parser) {
-			Ok(item) => Some(item),
-			Err(_) => loop {
-				let token = parser.lexer.peek();
-				match token.inner {
-					t if t == self.separator_token => {
-						parser.lexer.next();
-						return None;
-					}
-					t if t == self.close_token || t == Token::Eof => {
-						return None;
-					}
-					_ => {
-						parser.lexer.next();
-					}
-				}
-			},
-		}
-	}
-}
+impl ListItem for FunctionParam {}
+impl ListItem for StructField {}
+impl ListItem for EnumEntry {}
+impl ListItem for ExportEntry {}
+impl ListItem for ImportEntry {}
+impl ListItem for UseTree {}
+impl ListItem for Path {}
 
 impl<'ctx> Parser<'ctx> {
 	pub fn parse(
@@ -782,6 +675,7 @@ impl<'ctx> Parser<'ctx> {
 			ast: AST::new(file_id),
 		};
 
+		let mut items: Vec<Spanned<Item>> = Vec::new();
 		loop {
 			let item_attrs = match Parser::parse_attributes(&mut parser) {
 				Ok(attrs) => attrs,
@@ -809,27 +703,16 @@ impl<'ctx> Parser<'ctx> {
 			match item_handler(&mut parser) {
 				Ok(mut item) => {
 					item.inner.set_attributes(item_attrs);
-					let separator_span = if !item.inner.is_block_like() {
-						let token = parser.lexer.peek();
-						match token.inner {
-							Token::SemiColon => Some(parser.lexer.next().span),
-							_ => {
-								// TODO: report missing semicolon
-								None
-							}
-						}
-					} else {
-						None
-					};
-
-					parser.ast.items.push(Separated {
-						inner: item,
-						separator: separator_span,
-					});
+					// TODO: report a missing semicolon
+					if !item.inner.ends_in_block(&parser.ast) {
+						parser.lexer.next_if(Token::SemiColon);
+					}
+					items.push(item);
 				}
 				Err(_) => continue,
 			}
 		}
+		parser.ast.root = parser.ast.push_nodes(items);
 
 		if parser.lexer.has_crlf {
 			parser.ast.diagnostics.push(Diagnostic::warning()
@@ -1025,7 +908,7 @@ impl<'ctx> Parser<'ctx> {
 
 	/// A delimited list's items, written whole into the tree, spanned by
 	/// its delimiters.
-	fn push_delimited<T: Listed>(
+	fn push_delimited<T: InVec>(
 		&mut self,
 		list: Delimited<T>,
 	) -> Spanned<List<T>> {
@@ -1033,6 +916,17 @@ impl<'ctx> Parser<'ctx> {
 			inner: self
 				.ast
 				.push_list(list.items.into_iter().map(|item| item.inner)),
+			span: list.span,
+		}
+	}
+
+	/// [`Parser::push_delimited`], for nodes kept with their spans.
+	fn push_delimited_nodes<T: InColumn>(
+		&mut self,
+		list: Delimited<T>,
+	) -> Spanned<List<T>> {
+		Spanned {
+			inner: self.ast.push_nodes(list.items),
 			span: list.span,
 		}
 	}
@@ -1107,7 +1001,7 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_attributes(parser: &mut Parser) -> Result<Box<[Attribute]>, ()> {
+	fn parse_attributes(parser: &mut Parser) -> Result<List<Attribute>, ()> {
 		let mut attrs = Vec::new();
 		loop {
 			if parser.lexer.peek().inner != Token::Hash {
@@ -1160,7 +1054,7 @@ impl<'ctx> Parser<'ctx> {
 				value,
 			});
 		}
-		Ok(attrs.into_boxed_slice())
+		Ok(parser.ast.push_list(attrs))
 	}
 
 	/// `({ name: value, .. })`, as a call by name writes its arguments. The
@@ -1356,17 +1250,12 @@ impl<'ctx> Parser<'ctx> {
 		let type_params = if self.lexer.peek().inner == Token::LeftArrow {
 			self.parse_type_params()?
 		} else {
-			Box::new([])
+			List::EMPTY
 		};
 
-		let params = SeparatedGroup {
-			open_token: Token::OpenParen,
-			close_token: Token::CloseParen,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_function_param_item,
-			should_warn_missing_separator: None,
-		}
-		.parse(self)?;
+		let params =
+			self.separated(PARENS, Parser::parse_function_param_item)?;
+		let params = self.push_delimited_nodes(params);
 
 		let result = self.parse_function_result()?;
 
@@ -1447,7 +1336,7 @@ impl<'ctx> Parser<'ctx> {
 
 	/// Parse `<T, U: Bound1 + Bound2, const N: u32>` — generic parameter
 	/// declarations.
-	fn parse_type_params(&mut self) -> Result<Box<[Spanned<TypeParam>]>, ()> {
+	fn parse_type_params(&mut self) -> Result<List<TypeParam>, ()> {
 		let open_span = self.next_expect(Token::LeftArrow)?.span;
 		let mut params: Vec<Spanned<TypeParam>> = Vec::new();
 
@@ -1517,7 +1406,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		Ok(params.into_boxed_slice())
+		Ok(self.ast.push_nodes(params))
 	}
 
 	/// Consumes a single closing `>` for an angle-bracket construct opened at
@@ -1636,8 +1525,8 @@ impl<'ctx> Parser<'ctx> {
 			};
 			let root = self.parse_bracketed_root(open_span)?;
 			let path = self.parse_value_path()?;
-			let span = TextSpan::new(open_span.start, path.span().end);
-			let segments = self.ast.push_list(path.segments);
+			let span = TextSpan::new(open_span.start, path.span.end);
+			let segments = path.segments;
 			let kind = match root {
 				BracketedRoot::Qualified(root) => {
 					ConstArgument::QualifiedPath {
@@ -1810,18 +1699,28 @@ impl<'ctx> Parser<'ctx> {
 			inner: match block {
 				Some(block) => Item::Function {
 					pub_span: None,
-					attributes: Box::new([]),
+					attributes: List::EMPTY,
 					signature: signature.inner,
 					block,
 				},
 				None => Item::FunctionDeclaration {
 					pub_span: None,
-					attributes: Box::new([]),
+					attributes: List::EMPTY,
 					signature: signature.inner,
 				},
 			},
 			span,
 		})
+	}
+
+	/// A path written into the tree, spanned from its first name to its
+	/// last.
+	fn push_path(&mut self, segments: Vec<PathSegment>) -> Path {
+		let span = AST::path_span(&segments);
+		Path {
+			segments: self.ast.push_list(segments),
+			span,
+		}
 	}
 
 	/// Parse a path in expression/value position: a call-site path
@@ -1857,9 +1756,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		Ok(Path {
-			segments: segments.into_boxed_slice(),
-		})
+		Ok(self.push_path(segments))
 	}
 
 	/// Parse a path in a type-directed position: an ordinary type
@@ -1888,16 +1785,14 @@ impl<'ctx> Parser<'ctx> {
 			ident = self.parse_path_ident()?;
 		}
 
-		Ok(Path {
-			segments: segments.into_boxed_slice(),
-		})
+		Ok(self.push_path(segments))
 	}
 
 	/// Parse a single bound: a path optionally followed by `where { ... }` bindings.
 	fn parse_bound(&mut self) -> Result<BoundId, ()> {
 		let path = self.parse_type_path()?;
-		let path_span = path.span();
-		let segments = self.ast.push_list(path.segments);
+		let path_span = path.span;
+		let segments = path.segments;
 
 		if self.peek_keyword() == Some(Keyword::Where) {
 			let bindings = self.parse_where_bindings()?;
@@ -2091,8 +1986,8 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<TypeId, ()> {
 		let root = self.parse_bracketed_root(open_span)?;
 		let path = self.parse_type_path()?;
-		let span = TextSpan::new(open_span.start, path.span().end);
-		let segments = self.ast.push_list(path.segments);
+		let span = TextSpan::new(open_span.start, path.span.end);
+		let segments = path.segments;
 		let kind = match root {
 			BracketedRoot::Qualified(root) => TypeExpression::QualifiedPath {
 				root: self.ast.push_qualified_root(root),
@@ -2119,7 +2014,7 @@ impl<'ctx> Parser<'ctx> {
 			let close_span = self.expect_close_angle(open_span);
 			BracketedRoot::Qualified(QualifiedPathRoot {
 				self_type,
-				trait_path: self.ast.push_list(trait_path.segments),
+				trait_path: trait_path.segments,
 				span: TextSpan::new(open_span.start, close_span.end),
 			})
 		} else {
@@ -2454,8 +2349,8 @@ impl<'ctx> Parser<'ctx> {
 		let open_span = self.lexer.next().span; // consume `<`
 		let root = self.parse_bracketed_root(open_span)?;
 		let path = self.parse_value_path()?;
-		let span = TextSpan::new(open_span.start, path.span().end);
-		let segments = self.ast.push_list(path.segments);
+		let span = TextSpan::new(open_span.start, path.span.end);
+		let segments = path.segments;
 		let kind = match root {
 			BracketedRoot::Qualified(root) => Expression::QualifiedPath {
 				root: self.ast.push_qualified_root(root),
@@ -3682,7 +3577,7 @@ impl<'ctx> Parser<'ctx> {
 				name,
 				ty,
 				value,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 			},
 			span,
 		})
@@ -3715,7 +3610,7 @@ impl<'ctx> Parser<'ctx> {
 				},
 				ty,
 				value,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 			},
 			span,
 		})
@@ -3733,19 +3628,13 @@ impl<'ctx> Parser<'ctx> {
 			let entry = Parser::parse_export_entry(parser)?;
 			let span = TextSpan::new(export_keyword.span.start, entry.span.end);
 			return Ok(Spanned {
-				inner: Item::Export { entry },
+				inner: Item::Export { entry: entry.inner },
 				span,
 			});
 		}
 
-		let entries = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_export_entry,
-			should_warn_missing_separator: None,
-		}
-		.parse(parser)?;
+		let entries = parser.separated(BRACES, Parser::parse_export_entry)?;
+		let entries = parser.push_delimited(entries);
 
 		let span = TextSpan::new(export_keyword.span.start, entries.span.end);
 
@@ -3813,50 +3702,46 @@ impl<'ctx> Parser<'ctx> {
 
 		// A `..` is an entry of the body like a variant. Where it stands and
 		// how many there are is judged when the enum's signature is built.
-		let entries = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::Comma,
-			item_handler:
-				|parser: &mut Parser| -> Result<Spanned<EnumEntry>, ()> {
-					if let Some(dots) = parser.lexer.next_if(Token::DotDot) {
-						return Ok(Spanned {
-							inner: EnumEntry::Rest,
-							span: dots.span,
-						});
-					}
-					let Spanned {
-						inner: name_symbol,
-						span: name_token_span,
-					} = parser.expect_name(&[])?;
+		let entries = parser.separated(
+			BRACES,
+			|parser: &mut Parser| -> Result<Spanned<EnumEntry>, ()> {
+				if let Some(dots) = parser.lexer.next_if(Token::DotDot) {
+					return Ok(Spanned {
+						inner: EnumEntry::Rest,
+						span: dots.span,
+					});
+				}
+				let Spanned {
+					inner: name_symbol,
+					span: name_token_span,
+				} = parser.expect_name(&[])?;
 
-					let (value, span) =
-						if parser.lexer.next_if(Token::Eq).is_some() {
-							let expr = parser
-								.parse_expression(BindingPower::Default)?;
-							let span = TextSpan::new(
-								name_token_span.start,
-								parser.ast.expr_span(expr).end,
-							);
-							(Some(expr), span)
-						} else {
-							(None, name_token_span)
-						};
+				let (value, span) = if parser.lexer.next_if(Token::Eq).is_some()
+				{
+					let expr =
+						parser.parse_expression(BindingPower::Default)?;
+					let span = TextSpan::new(
+						name_token_span.start,
+						parser.ast.expr_span(expr).end,
+					);
+					(Some(expr), span)
+				} else {
+					(None, name_token_span)
+				};
 
-					Ok(Spanned {
-						inner: EnumEntry::Variant(EnumVariant {
-							name: Spanned {
-								inner: name_symbol,
-								span: name_token_span,
-							},
-							value,
-						}),
-						span,
-					})
-				},
-			should_warn_missing_separator: None,
-		}
-		.parse(parser)?;
+				Ok(Spanned {
+					inner: EnumEntry::Variant(EnumVariant {
+						name: Spanned {
+							inner: name_symbol,
+							span: name_token_span,
+						},
+						value,
+					}),
+					span,
+				})
+			},
+		)?;
+		let entries = parser.push_delimited_nodes(entries);
 
 		let span = TextSpan::new(enum_span.start, entries.span.end);
 
@@ -3869,7 +3754,7 @@ impl<'ctx> Parser<'ctx> {
 					span: name_span,
 				},
 				entries: entries.inner,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 			},
 			span,
 		})
@@ -3903,7 +3788,7 @@ impl<'ctx> Parser<'ctx> {
 							span: name_span,
 						},
 						ty,
-						attributes: Box::new([]),
+						attributes: List::EMPTY,
 					},
 					span,
 				})
@@ -3936,7 +3821,7 @@ impl<'ctx> Parser<'ctx> {
 						},
 						ty,
 						value,
-						attributes: Box::new([]),
+						attributes: List::EMPTY,
 					},
 					span,
 				})
@@ -3951,16 +3836,11 @@ impl<'ctx> Parser<'ctx> {
 					if parser.lexer.peek().inner == Token::LeftArrow {
 						parser.parse_type_params()?
 					} else {
-						Box::new([])
+						List::EMPTY
 					};
-				let params = SeparatedGroup {
-					open_token: Token::OpenParen,
-					close_token: Token::CloseParen,
-					separator_token: Token::Comma,
-					item_handler: Parser::parse_function_param_item,
-					should_warn_missing_separator: None,
-				}
-				.parse(parser)?;
+				let params = parser
+					.separated(PARENS, Parser::parse_function_param_item)?;
+				let params = parser.push_delimited_nodes(params);
 
 				let result = parser.parse_function_result()?;
 				let block = parser.parse_block()?;
@@ -4004,7 +3884,7 @@ impl<'ctx> Parser<'ctx> {
 		let type_params = if parser.lexer.peek().inner == Token::LeftArrow {
 			parser.parse_type_params()?
 		} else {
-			Box::new([])
+			List::EMPTY
 		};
 
 		let first_path = parser.parse_type_path()?;
@@ -4012,16 +3892,8 @@ impl<'ctx> Parser<'ctx> {
 			parser.lexer.next(); // consume `for`
 			let target = parser.parse_type_path()?;
 
-			let items = SeparatedGroup {
-				open_token: Token::OpenBrace,
-				close_token: Token::CloseBrace,
-				separator_token: Token::SemiColon,
-				item_handler: Parser::parse_impl_member,
-				should_warn_missing_separator: Some(|item: &ImplItem| {
-					!item.is_block_like()
-				}),
-			}
-			.parse(parser)?;
+			let items = parser.separated(BLOCK, Parser::parse_impl_member)?;
+			let items = parser.push_delimited_nodes(items);
 
 			// A trait impl's members are reachable exactly where the trait
 			// is, so `pub` on one decides nothing. `parse_impl_member` still
@@ -4029,11 +3901,12 @@ impl<'ctx> Parser<'ctx> {
 			// carry visibility, and it has no way to tell which it is parsing
 			// — so the qualifier is judged here, where that is known, rather
 			// than by the member parser itself.
-			for item in items.inner.iter() {
+			for index in 0..items.inner.len() {
 				let (ImplItem::Function { pub_span, .. }
 				| ImplItem::Constant { pub_span, .. }
-				| ImplItem::AssocType { pub_span, .. }) = &item.inner.inner;
-				let Some(pub_span) = *pub_span else {
+				| ImplItem::AssocType { pub_span, .. }) =
+					parser.ast.list(items.inner)[index];
+				let Some(pub_span) = pub_span else {
 					continue;
 				};
 				parser.ast.diagnostics.push(
@@ -4067,16 +3940,8 @@ impl<'ctx> Parser<'ctx> {
 			});
 		};
 
-		let items = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::SemiColon,
-			item_handler: Parser::parse_impl_member,
-			should_warn_missing_separator: Some(|item: &ImplItem| {
-				!item.is_block_like()
-			}),
-		}
-		.parse(parser)?;
+		let items = parser.separated(BLOCK, Parser::parse_impl_member)?;
+		let items = parser.push_delimited_nodes(items);
 
 		let span = TextSpan::new(impl_span.start, items.span.end);
 		Ok(Spanned {
@@ -4102,177 +3967,160 @@ impl<'ctx> Parser<'ctx> {
 				None => None,
 			};
 
-		let items = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::SemiColon,
-			item_handler:
-				|parser: &mut Parser| -> Result<Spanned<TraitItem>, ()> {
-					let attributes = Parser::parse_attributes(parser)?;
+		let items = parser.separated(
+			BLOCK,
+			|parser: &mut Parser| -> Result<Spanned<TraitItem>, ()> {
+				let attributes = Parser::parse_attributes(parser)?;
 
-					if let Some(Keyword::Pub) = parser.peek_keyword() {
-						let pub_span = parser.lexer.next().span;
-						parser.ast.diagnostics.push(
-							Diagnostic::warning()
-								.with_code(
-									DiagnosticCode::VisibilityNotPermitted
-										.code(),
-								)
-								.with_message(
-									"visibility qualifiers are not permitted here",
-								)
-								.with_label(
-									Label::primary(
-										parser.ast.file_id,
-										pub_span,
-									)
+				if let Some(Keyword::Pub) = parser.peek_keyword() {
+					let pub_span = parser.lexer.next().span;
+					parser.ast.diagnostics.push(
+						Diagnostic::warning()
+							.with_code(
+								DiagnosticCode::VisibilityNotPermitted.code(),
+							)
+							.with_message(
+								"visibility qualifiers are not permitted here",
+							)
+							.with_label(
+								Label::primary(parser.ast.file_id, pub_span)
 									.with_message("remove the qualifier"),
-								)
-								.with_note(
-									"trait items always share the visibility of their trait",
-								),
-						);
-					}
+							)
+							.with_note(
+								"trait items always share the visibility of their trait",
+							),
+					);
+				}
 
-					match parser.peek_keyword() {
-						Some(Keyword::Type) => {
-							let type_span = parser.lexer.next().span;
-							let Spanned {
-								inner: name_symbol,
-								span: name_span,
-							} = parser.expect_name(&[])?;
+				match parser.peek_keyword() {
+					Some(Keyword::Type) => {
+						let type_span = parser.lexer.next().span;
+						let Spanned {
+							inner: name_symbol,
+							span: name_span,
+						} = parser.expect_name(&[])?;
 
-							let bounds: Option<BoundId> =
-								match parser.lexer.next_if(Token::Colon) {
-									Some(colon) => {
-										Some(parser.parse_bounds_expression(
-											colon.span.end,
-										)?)
-									}
-									None => None,
-								};
-							let value =
-								if parser.lexer.next_if(Token::Eq).is_some() {
-									Some(parser.parse_type_expression()?)
-								} else {
-									None
-								};
-							let span = TextSpan::new(
-								type_span.start,
-								value
-									.map(|value| parser.ast.type_span(value))
-									.or_else(|| {
-										bounds.map(|bounds| {
-											parser.ast.bound_span(bounds)
-										})
-									})
-									.unwrap_or(name_span)
-									.end,
-							);
-							Ok(Spanned {
-								inner: TraitItem::AssociatedType {
-									name: Spanned {
-										inner: name_symbol,
-										span: name_span,
-									},
-									bounds,
-									value,
-									attributes,
-								},
-								span,
-							})
-						}
-						Some(Keyword::Const) => {
-							let const_span = parser.lexer.next().span;
-							let Spanned {
-								inner: name_symbol,
-								span: name_span,
-							} = parser.expect_name(&[])?;
-							parser.next_expect(Token::Colon)?;
-							let ty = parser.parse_type_expression()?;
-							let value =
-								if parser.lexer.next_if(Token::Eq).is_some() {
-									Some(parser.parse_expression(
-										BindingPower::Default,
+						let bounds: Option<BoundId> =
+							match parser.lexer.next_if(Token::Colon) {
+								Some(colon) => {
+									Some(parser.parse_bounds_expression(
+										colon.span.end,
 									)?)
-								} else {
-									None
-								};
-							let span = TextSpan::new(
-								const_span.start,
-								match value {
-									Some(value) => {
-										parser.ast.expr_span(value).end
-									}
-									None => parser.ast.type_span(ty).end,
+								}
+								None => None,
+							};
+						let value = if parser.lexer.next_if(Token::Eq).is_some()
+						{
+							Some(parser.parse_type_expression()?)
+						} else {
+							None
+						};
+						let span = TextSpan::new(
+							type_span.start,
+							value
+								.map(|value| parser.ast.type_span(value))
+								.or_else(|| {
+									bounds.map(|bounds| {
+										parser.ast.bound_span(bounds)
+									})
+								})
+								.unwrap_or(name_span)
+								.end,
+						);
+						Ok(Spanned {
+							inner: TraitItem::AssociatedType {
+								name: Spanned {
+									inner: name_symbol,
+									span: name_span,
 								},
-							);
-							Ok(Spanned {
-								inner: TraitItem::Const {
-									name: Spanned {
-										inner: name_symbol,
-										span: name_span,
-									},
-									ty,
-									value,
-									attributes,
+								bounds,
+								value,
+								attributes,
+							},
+							span,
+						})
+					}
+					Some(Keyword::Const) => {
+						let const_span = parser.lexer.next().span;
+						let Spanned {
+							inner: name_symbol,
+							span: name_span,
+						} = parser.expect_name(&[])?;
+						parser.next_expect(Token::Colon)?;
+						let ty = parser.parse_type_expression()?;
+						let value = if parser.lexer.next_if(Token::Eq).is_some()
+						{
+							Some(
+								parser
+									.parse_expression(BindingPower::Default)?,
+							)
+						} else {
+							None
+						};
+						let span = TextSpan::new(
+							const_span.start,
+							match value {
+								Some(value) => parser.ast.expr_span(value).end,
+								None => parser.ast.type_span(ty).end,
+							},
+						);
+						Ok(Spanned {
+							inner: TraitItem::Const {
+								name: Spanned {
+									inner: name_symbol,
+									span: name_span,
 								},
-								span,
-							})
-						}
-						Some(Keyword::Func) => {
-							let signature =
-								parser.parse_function_signature()?;
-							let body = if parser.lexer.peek().inner
-								== Token::OpenBrace
-							{
+								ty,
+								value,
+								attributes,
+							},
+							span,
+						})
+					}
+					Some(Keyword::Func) => {
+						let signature = parser.parse_function_signature()?;
+						let body =
+							if parser.lexer.peek().inner == Token::OpenBrace {
 								Some(parser.parse_block()?)
 							} else {
 								None
 							};
-							let span = TextSpan::new(
-								signature.span.start,
-								match body {
-									Some(body) => {
-										parser.ast.block_span(body).end
-									}
-									None => signature.span.end,
-								},
-							);
+						let span = TextSpan::new(
+							signature.span.start,
+							match body {
+								Some(body) => parser.ast.block_span(body).end,
+								None => signature.span.end,
+							},
+						);
 
-							Ok(Spanned {
-								inner: TraitItem::Function {
-									attributes,
-									signature: signature.inner,
-									body,
-								},
-								span,
-							})
-						}
-						_ => {
-							let token = parser.lexer.next();
-							parser.ast.diagnostics.push(
-								report_unexpected_token(
-									parser.ast.file_id,
-									token,
-									Token::Identifier,
-								),
-							);
-							Err(())
-						}
+						Ok(Spanned {
+							inner: TraitItem::Function {
+								attributes,
+								signature: signature.inner,
+								body,
+							},
+							span,
+						})
 					}
-				},
-			should_warn_missing_separator: Some(|item: &TraitItem| {
-				!item.is_block_like()
-			}),
-		}
-		.parse(parser)?;
+					_ => {
+						let token = parser.lexer.next();
+						parser.ast.diagnostics.push(report_unexpected_token(
+							parser.ast.file_id,
+							token,
+							Token::Identifier,
+						));
+						Err(())
+					}
+				}
+			},
+		)?;
+		let items = parser.push_delimited_nodes(items);
 
 		let span = TextSpan::new(trait_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::Trait {
 				pub_span: None,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 				name,
 				supertraits,
 				items: items.inner,
@@ -4298,24 +4146,18 @@ impl<'ctx> Parser<'ctx> {
 			None => None,
 		};
 
-		let members = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::Comma,
-			item_handler: |parser: &mut Parser| {
-				let path = parser.parse_type_path()?;
-				let span = path.span();
-				Ok(Spanned { inner: path, span })
-			},
-			should_warn_missing_separator: None,
-		}
-		.parse(parser)?;
+		let members = parser.separated(BRACES, |parser: &mut Parser| {
+			let path = parser.parse_type_path()?;
+			let span = path.span;
+			Ok(Spanned { inner: path, span })
+		})?;
+		let members = parser.push_delimited(members);
 
 		let span = TextSpan::new(typeset_span.start, members.span.end);
 		Ok(Spanned {
 			inner: Item::TypeSet {
 				pub_span: None,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 				name,
 				bounds,
 				members: members.inner,
@@ -4335,7 +4177,7 @@ impl<'ctx> Parser<'ctx> {
 		let type_params = if parser.lexer.peek().inner == Token::LeftArrow {
 			parser.parse_type_params()?
 		} else {
-			Box::new([])
+			List::EMPTY
 		};
 
 		let name = Spanned {
@@ -4368,20 +4210,21 @@ impl<'ctx> Parser<'ctx> {
 		} else {
 			Token::CloseParen
 		};
-		let fields = SeparatedGroup {
-			open_token,
-			close_token,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_struct_field,
-			should_warn_missing_separator: None,
-		}
-		.parse(parser)?;
+		let fields = parser.separated(
+			Delimiters {
+				open: open_token,
+				close: close_token,
+				separator: Token::Comma,
+			},
+			Parser::parse_struct_field,
+		)?;
+		let fields = parser.push_delimited_nodes(fields);
 
 		let span = TextSpan::new(struct_span.start, fields.span.end);
 		Ok(Spanned {
 			inner: Item::Struct {
 				pub_span: None,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 				name,
 				type_params,
 				fields: fields.inner,
@@ -4423,7 +4266,7 @@ impl<'ctx> Parser<'ctx> {
 		let type_params = if parser.lexer.peek().inner == Token::LeftArrow {
 			parser.parse_type_params()?
 		} else {
-			Box::new([])
+			List::EMPTY
 		};
 
 		// No `= TypeExpr` body — a bodiless `type Name;` declaration, only
@@ -4454,7 +4297,7 @@ impl<'ctx> Parser<'ctx> {
 				},
 				type_params,
 				body,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 			},
 			span,
 		})
@@ -4530,7 +4373,7 @@ impl<'ctx> Parser<'ctx> {
 		Ok(Spanned {
 			inner: Item::Memory {
 				pub_span: None,
-				attributes: Box::new([]),
+				attributes: List::EMPTY,
 				name,
 				size,
 			},
@@ -4642,7 +4485,10 @@ impl<'ctx> Parser<'ctx> {
 				let tree = Self::parse_use_tree(parser)?;
 				Ok(Spanned {
 					span: TextSpan::new(start, tree.span.end),
-					inner: ImportEntry::Use { pub_span, tree },
+					inner: ImportEntry::Use {
+						pub_span,
+						tree: parser.ast.push_node(tree.inner, tree.span),
+					},
 				})
 			}
 			Some(Keyword::Func) => {
@@ -4687,7 +4533,8 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_module_body_item(
 		parser: &mut Parser,
 	) -> Result<Spanned<Item>, ()> {
-		let item_attrs = Parser::parse_attributes(parser).unwrap_or_default();
+		let item_attrs =
+			Parser::parse_attributes(parser).unwrap_or(List::EMPTY);
 		let token = parser.lexer.peek();
 		match parser.get_item_handler(token) {
 			Ok(handler) => {
@@ -4714,16 +4561,9 @@ impl<'ctx> Parser<'ctx> {
 		} = parser.expect_name(&[])?;
 
 		if parser.lexer.peek().inner == Token::OpenBrace {
-			let items = SeparatedGroup {
-				open_token: Token::OpenBrace,
-				close_token: Token::CloseBrace,
-				separator_token: Token::SemiColon,
-				item_handler: Parser::parse_module_body_item,
-				should_warn_missing_separator: Some(|item: &Item| {
-					!item.is_block_like()
-				}),
-			}
-			.parse(parser)?;
+			let items =
+				parser.separated(BLOCK, Parser::parse_module_body_item)?;
+			let items = parser.push_delimited_nodes(items);
 
 			let span = TextSpan::new(module_span.start, items.span.end);
 			Ok(Spanned {
@@ -4733,7 +4573,8 @@ impl<'ctx> Parser<'ctx> {
 						inner: name_symbol,
 						span: name_span,
 					},
-					items,
+					items: items.inner,
+					braces: items.span,
 				},
 				span,
 			})
@@ -4758,9 +4599,10 @@ impl<'ctx> Parser<'ctx> {
 		// items are separated by `SemiColon` at the group level (see
 		// `parse_module_item`).
 		let tree = Self::parse_use_tree(parser)?;
-
+		let span = TextSpan::new(use_span.start, tree.span.end);
+		let tree = parser.ast.push_node(tree.inner, tree.span);
 		Ok(Spanned {
-			span: TextSpan::new(use_span.start, tree.span.end),
+			span,
 			inner: Item::Use {
 				pub_span: None,
 				tree,
@@ -4799,29 +4641,26 @@ impl<'ctx> Parser<'ctx> {
 					});
 				}
 				Token::OpenBrace => {
-					let branches = SeparatedGroup {
-						open_token: Token::OpenBrace,
-						close_token: Token::CloseBrace,
-						separator_token: Token::Comma,
-						item_handler: Self::parse_use_tree,
-						should_warn_missing_separator: None,
-					}
-					.parse(parser)?;
+					let branches =
+						parser.separated(BRACES, Self::parse_use_tree)?;
+					let branches = parser.push_delimited_nodes(branches);
 					let span =
 						TextSpan::new(segment.span.start, branches.span.end);
 					return Ok(Spanned {
-						inner: UseTree::Group { segment, branches },
+						inner: UseTree::Group {
+							segment,
+							branches: branches.inner,
+							braces: branches.span,
+						},
 						span,
 					});
 				}
 				Token::Identifier => {
 					let rest = Parser::parse_use_tree(parser)?;
 					let span = TextSpan::new(segment.span.start, rest.span.end);
+					let rest = parser.ast.push_node(rest.inner, rest.span);
 					return Ok(Spanned {
-						inner: UseTree::Path {
-							segment,
-							rest: Box::new(rest),
-						},
+						inner: UseTree::Path { segment, rest },
 						span,
 					});
 				}
@@ -4869,7 +4708,7 @@ impl<'ctx> Parser<'ctx> {
 					Item::PackageFunction {
 						pub_span: None,
 						crate_span,
-						attributes: Box::new([]),
+						attributes: List::EMPTY,
 						signature: signature.inner,
 					},
 					end,
@@ -4893,7 +4732,7 @@ impl<'ctx> Parser<'ctx> {
 					Item::PackageConst {
 						pub_span: None,
 						crate_span,
-						attributes: Box::new([]),
+						attributes: List::EMPTY,
 						name,
 						ty,
 					},
@@ -4908,7 +4747,7 @@ impl<'ctx> Parser<'ctx> {
 					if parser.lexer.peek().inner == Token::LeftArrow {
 						parser.parse_type_params()?
 					} else {
-						Box::new([])
+						List::EMPTY
 					};
 				let end = if parser.lexer.next_if(Token::Eq).is_some() {
 					let body = parser.parse_type_expression()?;
@@ -4921,7 +4760,7 @@ impl<'ctx> Parser<'ctx> {
 					Item::PackageType {
 						pub_span: None,
 						crate_span,
-						attributes: Box::new([]),
+						attributes: List::EMPTY,
 						name,
 						type_params,
 					},
@@ -5028,14 +4867,8 @@ impl<'ctx> Parser<'ctx> {
 			}
 		};
 
-		let items = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::SemiColon,
-			item_handler: Parser::parse_import_entry,
-			should_warn_missing_separator: None,
-		}
-		.parse(parser)?;
+		let items = parser.separated(BLOCK, Parser::parse_import_entry)?;
+		let items = parser.push_delimited_nodes(items);
 
 		let span = TextSpan::new(import_keyword.span.start, items.span.end);
 
@@ -5043,7 +4876,8 @@ impl<'ctx> Parser<'ctx> {
 			inner: Item::Import {
 				external_name,
 				internal_name,
-				items,
+				entries: items.inner,
+				braces: items.span,
 			},
 			span,
 		})

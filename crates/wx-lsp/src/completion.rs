@@ -17,10 +17,10 @@ use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
 	BoundId, Comment, ConstArgument, ConstId, Destructure, EnumEntry, ExprId,
 	Expression, FunctionSignature, FunctionTypeParam, ImplItem,
-	ImportDeclaration, ImportEntry, Item, NamedArgument, PatId, Path,
-	PathSegment, Pattern, PatternElement, PatternFieldItem, QualifiedPathRoot,
-	Separated, Spanned, Statement, TraitItem, TypeArgument, TypeExpression,
-	TypeId, TypeParam,
+	ImportDeclaration, ImportEntry, InColumn, Item, List, NamedArgument, PatId,
+	Path, PathSegment, Pattern, PatternElement, PatternFieldItem,
+	QualifiedPathRoot, Spanned, Statement, TraitItem, TypeArgument,
+	TypeExpression, TypeId, TypeParam,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::tir::{DeclKind, Definition, LabelKind, NameUse};
@@ -293,7 +293,7 @@ pub(crate) fn position_at(ast: &AST, offset: u32) -> Option<Position> {
 	if comment.is_some_and(|comment| comment.span.start < offset) {
 		return None;
 	}
-	cursor.item(&cursor.child(&ast.items)?.inner.inner)
+	cursor.item(&cursor.node(ast.root)?)
 }
 
 /// A piece of syntax the walker searches by where it is written.
@@ -307,9 +307,9 @@ impl<T> Node for Spanned<T> {
 	}
 }
 
-impl<T: Node> Node for Separated<T> {
+impl Node for Path {
 	fn span(&self) -> TextSpan {
-		self.inner.span()
+		self.span
 	}
 }
 
@@ -363,6 +363,13 @@ impl Cursor<'_> {
 		Some(&siblings[self.child_index(siblings)?])
 	}
 
+	/// The node of `list` the cursor touches, as `child` finds it among the
+	/// spans its column keeps beside it.
+	fn node<T: InColumn + Copy>(&self, list: List<T>) -> Option<T> {
+		let index = self.child_index_by(self.ast.spans(list), |span| *span)?;
+		Some(self.ast.list(list)[index])
+	}
+
 	/// `child`, for siblings whose spans are read through the tree (`span`):
 	/// the ids of types, bounds and type arguments.
 	fn child_by<'s, T>(
@@ -406,7 +413,7 @@ impl Cursor<'_> {
 			Item::PackageType {
 				name, type_params, ..
 			} => Within::Signature(Anchor::Name(name.span))
-				.position(self.type_params(type_params)),
+				.position(self.type_params(*type_params)),
 			Item::Global {
 				name, ty, value, ..
 			}
@@ -420,7 +427,7 @@ impl Cursor<'_> {
 				..
 			} => Within::Signature(Anchor::Name(name.span))
 				.position(repr.and_then(|repr| self.ty(repr)))
-				.or_else(|| match &self.child(entries)?.inner.inner {
+				.or_else(|| match &self.node(*entries)? {
 					EnumEntry::Variant(variant) => {
 						Within::Body(variant.name.span)
 							.position(self.expression(variant.value?))
@@ -433,8 +440,8 @@ impl Cursor<'_> {
 				fields,
 				..
 			} => Within::Signature(Anchor::Name(name.span)).position(
-				self.type_params(type_params)
-					.or_else(|| self.ty(self.child(fields)?.inner.inner.ty)),
+				self.type_params(*type_params)
+					.or_else(|| self.ty(self.node(*fields)?.ty)),
 			),
 			Item::TypeAlias {
 				name,
@@ -442,7 +449,7 @@ impl Cursor<'_> {
 				body,
 				..
 			} => Within::Signature(Anchor::Name(name.span)).position(
-				self.type_params(type_params).or_else(|| self.ty((*body)?)),
+				self.type_params(*type_params).or_else(|| self.ty((*body)?)),
 			),
 			Item::TypeSet {
 				name,
@@ -454,8 +461,8 @@ impl Cursor<'_> {
 					.as_ref()
 					.and_then(|bounds| self.bound(*bounds))
 					.or_else(|| {
-						let member = self.child(members)?;
-						self.path(&member.inner.inner.segments, NameUse::Type)
+						let member = self.child(self.ast.list(*members))?;
+						self.path(self.ast.list(member.segments), NameUse::Type)
 					}),
 			),
 			Item::Trait {
@@ -471,7 +478,7 @@ impl Cursor<'_> {
 							.as_ref()
 							.and_then(|bounds| self.bound(*bounds)),
 					)
-					.or_else(|| match &self.child(items)?.inner.inner {
+					.or_else(|| match &self.node(*items)? {
 						TraitItem::Function {
 							signature, body, ..
 						} => self.function(signature, *body),
@@ -494,16 +501,16 @@ impl Cursor<'_> {
 				type_params,
 				target,
 				items,
-			} => self.impl_block(type_params, None, target, items),
+			} => self.impl_block(*type_params, None, target, *items),
 			Item::TraitImpl {
 				type_params,
 				trait_name,
 				target,
 				items,
-			} => self.impl_block(type_params, Some(trait_name), target, items),
-			Item::Import { items, .. } => {
+			} => self.impl_block(*type_params, Some(trait_name), target, *items),
+			Item::Import { entries, .. } => {
 				let ImportEntry::Declaration { declaration, .. } =
-					&self.child(&items.inner)?.inner.inner
+					&self.node(*entries)?
 				else {
 					return None;
 				};
@@ -518,9 +525,7 @@ impl Cursor<'_> {
 					}
 				}
 			}
-			Item::Module { items, .. } => {
-				self.item(&self.child(&items.inner)?.inner.inner)
-			}
+			Item::Module { items, .. } => self.item(&self.node(*items)?),
 			Item::Export { .. }
 			| Item::ExportBlock { .. }
 			| Item::ModuleDeclaration { .. }
@@ -537,8 +542,8 @@ impl Cursor<'_> {
 	) -> Option<Position> {
 		let name = signature.name.span;
 		let site = self
-			.type_params(&signature.type_params)
-			.or_else(|| self.ty(self.child(&signature.params)?.inner.inner.ty))
+			.type_params(signature.type_params)
+			.or_else(|| self.ty(self.node(signature.params)?.ty))
 			.or_else(|| self.ty(signature.result?));
 		Within::Signature(Anchor::Name(name))
 			.position(site)
@@ -560,18 +565,22 @@ impl Cursor<'_> {
 	/// An impl: its header, read in its own scope, and its members.
 	fn impl_block(
 		&self,
-		type_params: &[Spanned<TypeParam>],
+		type_params: List<TypeParam>,
 		trait_name: Option<&Path>,
 		target: &Path,
-		items: &[Separated<Spanned<ImplItem>>],
+		items: List<ImplItem>,
 	) -> Option<Position> {
-		let header = Within::Signature(Anchor::ImplTarget(target.span()));
+		let header = Within::Signature(Anchor::ImplTarget(target.span));
 		let site = self
 			.type_params(type_params)
-			.or_else(|| self.path(&trait_name?.segments, NameUse::Trait))
-			.or_else(|| self.path(&target.segments, NameUse::Type));
+			.or_else(|| {
+				self.path(self.ast.list(trait_name?.segments), NameUse::Trait)
+			})
+			.or_else(|| {
+				self.path(self.ast.list(target.segments), NameUse::Type)
+			});
 		header.position(site).or_else(|| {
-			match &self.child(items)?.inner.inner {
+			match &self.node(items)? {
 				ImplItem::Function {
 					signature, block, ..
 				} => self.function(signature, Some(*block)),
@@ -584,8 +593,8 @@ impl Cursor<'_> {
 		})
 	}
 
-	fn type_params(&self, params: &[Spanned<TypeParam>]) -> Option<Site> {
-		match self.child(params)?.inner {
+	fn type_params(&self, params: List<TypeParam>) -> Option<Site> {
+		match self.node(params)? {
 			TypeParam::Type { bounds, .. } => self.bound(bounds?),
 			TypeParam::Const { ty, .. } => self.ty(ty),
 		}

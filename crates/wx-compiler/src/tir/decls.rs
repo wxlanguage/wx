@@ -428,26 +428,30 @@ impl AttributeTarget {
 	}
 
 	/// The attributes written on an item, and what they are written on.
-	fn of_item(item: &ast::Item) -> Option<(Self, &[ast::Attribute])> {
+	fn of_item(item: &ast::Item) -> Option<(Self, ast::List<ast::Attribute>)> {
 		Some(match item {
 			ast::Item::Function { attributes, .. } => {
-				(Self::Function, attributes)
+				(Self::Function, *attributes)
 			}
 			ast::Item::FunctionDeclaration { attributes, .. }
 			| ast::Item::PackageFunction { attributes, .. } => {
-				(Self::BodilessFunction, attributes)
+				(Self::BodilessFunction, *attributes)
 			}
-			ast::Item::Struct { attributes, .. } => (Self::Struct, attributes),
-			ast::Item::Memory { attributes, .. } => (Self::Memory, attributes),
-			ast::Item::Enum { attributes, .. } => (Self::Enum, attributes),
+			ast::Item::Struct { attributes, .. } => (Self::Struct, *attributes),
+			ast::Item::Memory { attributes, .. } => (Self::Memory, *attributes),
+			ast::Item::Enum { attributes, .. } => (Self::Enum, *attributes),
 			ast::Item::Const { attributes, .. }
-			| ast::Item::PackageConst { attributes, .. } => (Self::Constant, attributes),
-			ast::Item::Global { attributes, .. } => (Self::Global, attributes),
+			| ast::Item::PackageConst { attributes, .. } => {
+				(Self::Constant, *attributes)
+			}
+			ast::Item::Global { attributes, .. } => (Self::Global, *attributes),
 			ast::Item::TypeAlias { attributes, .. }
-			| ast::Item::PackageType { attributes, .. } => (Self::TypeAlias, attributes),
-			ast::Item::Trait { attributes, .. } => (Self::Trait, attributes),
+			| ast::Item::PackageType { attributes, .. } => {
+				(Self::TypeAlias, *attributes)
+			}
+			ast::Item::Trait { attributes, .. } => (Self::Trait, *attributes),
 			ast::Item::TypeSet { attributes, .. } => {
-				(Self::Typeset, attributes)
+				(Self::Typeset, *attributes)
 			}
 			ast::Item::Export { .. }
 			| ast::Item::ExportBlock { .. }
@@ -461,37 +465,39 @@ impl AttributeTarget {
 		})
 	}
 
-	fn of_trait_item(item: &ast::TraitItem) -> (Self, &[ast::Attribute]) {
+	fn of_trait_item(
+		item: &ast::TraitItem,
+	) -> (Self, ast::List<ast::Attribute>) {
 		match item {
 			ast::TraitItem::Function {
 				attributes,
 				body: Some(_),
 				..
-			} => (Self::Function, attributes),
+			} => (Self::Function, *attributes),
 			ast::TraitItem::Function {
 				attributes,
 				body: None,
 				..
-			} => (Self::BodilessFunction, attributes),
+			} => (Self::BodilessFunction, *attributes),
 			ast::TraitItem::Const { attributes, .. } => {
-				(Self::Constant, attributes)
+				(Self::Constant, *attributes)
 			}
 			ast::TraitItem::AssociatedType { attributes, .. } => {
-				(Self::AssociatedType, attributes)
+				(Self::AssociatedType, *attributes)
 			}
 		}
 	}
 
-	fn of_impl_item(item: &ast::ImplItem) -> (Self, &[ast::Attribute]) {
+	fn of_impl_item(item: &ast::ImplItem) -> (Self, ast::List<ast::Attribute>) {
 		match item {
 			ast::ImplItem::Function { attributes, .. } => {
-				(Self::Function, attributes)
+				(Self::Function, *attributes)
 			}
 			ast::ImplItem::Constant { attributes, .. } => {
-				(Self::Constant, attributes)
+				(Self::Constant, *attributes)
 			}
 			ast::ImplItem::AssocType { attributes, .. } => {
-				(Self::AssociatedType, attributes)
+				(Self::AssociatedType, *attributes)
 			}
 		}
 	}
@@ -2512,12 +2518,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		{
 			let scope = file_namespaces[source_module.file_id.as_usize()];
 			let ast = &asts[source_module.file_id.as_usize()];
-			for item in ast.items.iter() {
-				builder.scan_item(
-					source_module.file_id,
-					scope,
-					&item.inner.inner,
-				);
+			for item in ast.list(ast.root) {
+				builder.scan_item(source_module.file_id, scope, item);
 			}
 		}
 
@@ -2831,8 +2833,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		target: AttributeTarget,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 	) -> Attributes {
+		let attributes = self.ast(file_id).list(attributes);
 		let mut flags = Attributes::empty();
 		let mut first: [Option<TextSpan>; KnownAttribute::ALL.len()] =
 			[None; KnownAttribute::ALL.len()];
@@ -2888,8 +2891,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	fn resolve_memory_limits(
 		&mut self,
 		file_id: FileId,
-		attributes: &[ast::Attribute],
+		attributes: ast::List<ast::Attribute>,
 	) -> MemoryLimits {
+		let ast = self.ast(file_id);
+		let attributes = ast.list(attributes);
 		let mut limits = MemoryLimits::default();
 		let Some(arguments) =
 			attributes
@@ -2907,7 +2912,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		else {
 			return limits;
 		};
-		let ast = &self.asts[file_id.as_usize()];
 		let mut written = [None::<TextSpan>; 2];
 		for argument in ast.list(*arguments) {
 			let name = self.strings.resolve(argument.name.inner).unwrap();
@@ -3364,12 +3368,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		}
 	}
 
+	/// A file's tree, borrowed for as long as the builder's input.
+	fn ast(&self, file_id: FileId) -> &'ast ast::AST {
+		&self.asts[file_id.as_usize()]
+	}
+
 	pub(super) fn scan_item(
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
 		item: &'ast ast::Item,
 	) {
+		let ast = self.ast(file_id);
 		let attributes = match AttributeTarget::of_item(item) {
 			Some((target, attributes)) => {
 				self.scan_attributes(file_id, target, attributes)
@@ -3416,7 +3426,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 
 				let params =
-					self.scan_free_function_params(file_id, &signature.params);
+					self.scan_free_function_params(file_id, signature.params);
 				let function_impls = self.synthesize_function_impls(
 					file_id,
 					namespace,
@@ -3515,10 +3525,11 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// The name is also the struct's constructor, called like a
 				// function. Constructing it takes every field, so it is only
 				// as visible as the struct and every one of its fields.
+				let fields = ast.list(*fields);
 				let constructor_visibility = fields.iter().fold(
 					Visibility::from(*pub_span),
 					|visibility, f| {
-						visibility.cap(Visibility::from(f.inner.inner.pub_span))
+						visibility.cap(Visibility::from(f.pub_span))
 					},
 				);
 				self.insert_type_and_value(
@@ -3534,7 +3545,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let mut field_pub_spans = Vec::with_capacity(fields.len());
 				let mut lookup: FxHashMap<SymbolU32, FieldIdx> =
 					FxHashMap::default();
-				for field in fields.iter().map(|f| &f.inner.inner) {
+				for field in fields {
 					let index = FieldIdx::new(
 						u32::try_from(field_names.len()).unwrap(),
 					);
@@ -3597,16 +3608,17 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			} => {
 				// The variants among the entries, in written order, and the
 				// first `..`.
-				let variants: Vec<&ast::EnumVariant> = entries
+				let variants: Vec<&ast::EnumVariant> = ast
+					.list(*entries)
 					.iter()
-					.filter_map(|entry| match &entry.inner.inner {
+					.filter_map(|entry| match entry {
 						ast::EnumEntry::Variant(variant) => Some(variant),
 						ast::EnumEntry::Rest => None,
 					})
 					.collect();
-				let open = entries.iter().find_map(|entry| {
-					matches!(entry.inner.inner, ast::EnumEntry::Rest)
-						.then_some(entry.inner.span)
+				let open = ast.spanned(*entries).find_map(|entry| {
+					matches!(entry.inner, ast::EnumEntry::Rest)
+						.then_some(entry.span)
 				});
 				let enum_index =
 					EnumIdx::new(u32::try_from(self.enums.len()).unwrap());
@@ -3762,7 +3774,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					MemoryIdx::new(u32::try_from(self.memories.len()).unwrap());
 				let (trait_impl_index, size_assoc_type_index) =
 					self.synthesize_memory_impl(file_id, namespace, name.span);
-				let limits = self.resolve_memory_limits(file_id, written);
+				let limits = self.resolve_memory_limits(file_id, *written);
 				let loc = self.push_decl(
 					Namespace::from(namespace),
 					ItemDecl::new(
@@ -3833,6 +3845,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				name,
 				items,
 				pub_span,
+				..
 			} => {
 				let module =
 					self.push_module(namespace, file_id, *name, *pub_span);
@@ -3855,12 +3868,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					);
 				}
 
-				for item in items.inner.iter() {
-					self.scan_item(
-						file_id,
-						Scope::Module(module),
-						&item.inner.inner,
-					);
+				for item in ast.list(*items) {
+					self.scan_item(file_id, Scope::Module(module), item);
 				}
 			}
 			// Nothing to do: Phase 1a already created this module's
@@ -3907,18 +3916,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let mut members: Vec<TraitMemberDecl> = Vec::new();
 				let mut bindings: FxHashMap<BindingKey, MemberIdx> =
 					FxHashMap::default();
-				for item in items.iter() {
+				for item in ast.list(*items) {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (target, attributes) =
-						AttributeTarget::of_trait_item(&item.inner.inner);
+						AttributeTarget::of_trait_item(item);
 					let attributes =
 						self.scan_attributes(file_id, target, attributes);
-					let (member, key) = match &item.inner.inner {
+					let (member, key) = match item {
 						ast::TraitItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
 								file_id,
-								&signature.params,
+								signature.params,
 							);
 							let is_method = params.first().is_some_and(|p| {
 								p.is_some_and(|p| {
@@ -3954,7 +3963,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::TraitFunction {
 									trait_index,
-									item: &item.inner.inner,
+									item,
 									function_index,
 								},
 							});
@@ -3992,7 +4001,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								node: AstNodeRef::TraitConst {
 									const_index,
 									trait_index,
-									item: &item.inner.inner,
+									item,
 								},
 							});
 							(
@@ -4022,7 +4031,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								node: AstNodeRef::TraitAssocType {
 									assoc_type_index,
 									trait_index,
-									item: &item.inner.inner,
+									item,
 								},
 							});
 							(
@@ -4142,14 +4151,14 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					namespace,
 					node: AstNodeRef::InherentImplBlock { item, block_index },
 				});
-				for impl_item in items.iter() {
+				for impl_item in ast.list(*items) {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (target, attributes) =
-						AttributeTarget::of_impl_item(&impl_item.inner.inner);
+						AttributeTarget::of_impl_item(impl_item);
 					let attributes =
 						self.scan_attributes(file_id, target, attributes);
-					let (member, key, binding) = match &impl_item.inner.inner {
+					let (member, key, binding) = match impl_item {
 						ast::ImplItem::Function {
 							signature,
 							pub_span,
@@ -4157,7 +4166,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						} => {
 							let params = self.scan_impl_function_params(
 								file_id,
-								&signature.params,
+								signature.params,
 							);
 							let is_method = params.first().is_some_and(|p| {
 								p.is_some_and(|p| {
@@ -4192,7 +4201,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::InherentImplFunction {
-									item: &impl_item.inner.inner,
+									item: impl_item,
 									block_index,
 									function_index,
 								},
@@ -4231,7 +4240,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::InherentImplConst {
 									const_index,
-									item: &impl_item.inner.inner,
+									item: impl_item,
 									block_index,
 								},
 							});
@@ -4298,7 +4307,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			ast::Item::Import {
 				internal_name,
 				external_name,
-				items,
+				entries,
+				..
 			} => {
 				let internal_name = *internal_name;
 				let external_name = Spanned {
@@ -4337,12 +4347,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// Imported declarations are written inside the block: resolve
 				// their signatures (and synthetic impls) in its sibling scope.
 				let namespace = Scope::Import(import);
-				for item in items.inner.iter() {
-					let (import_block, external_name) = match &item.inner.inner
-					{
+				for (item, &item_span) in
+					ast.list(*entries).iter().zip(ast.spans(*entries))
+				{
+					let (import_block, external_name) = match item {
 						ast::ImportEntry::Use { tree, pub_span } => {
 							self.scan_use_tree(
-								namespace, tree, None, *pub_span,
+								file_id, namespace, *tree, None, *pub_span,
 							);
 							continue;
 						}
@@ -4373,7 +4384,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								loc,
 								external_name,
 								*name,
-								item.inner.span,
+								item_span,
 							);
 							self.memories.push(MemoryDecl {
 								loc,
@@ -4405,7 +4416,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						} => {
 							let params = self.scan_free_function_params(
 								file_id,
-								&signature.params,
+								signature.params,
 							);
 							let function_impls = self
 								.synthesize_function_impls(
@@ -4436,7 +4447,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								loc,
 								external_name,
 								signature.name,
-								item.inner.span,
+								item_span,
 							);
 							let binding =
 								Binding::definition(loc, Visibility::Public);
@@ -4494,7 +4505,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								loc,
 								external_name,
 								*name,
-								item.inner.span,
+								item_span,
 							);
 							let binding =
 								Binding::definition(loc, Visibility::Public);
@@ -4519,7 +4530,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				}
 			}
 			ast::Item::Use { tree, pub_span } => {
-				self.scan_use_tree(namespace, tree, None, *pub_span);
+				self.scan_use_tree(file_id, namespace, *tree, None, *pub_span);
 			}
 			ast::Item::PackageInstance {
 				pub_span,
@@ -4531,15 +4542,11 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 			}
 			ast::Item::Export { entry } => {
-				self.scan_export_entry(file_id, namespace, &entry.inner);
+				self.scan_export_entry(file_id, namespace, entry);
 			}
 			ast::Item::ExportBlock { entries, .. } => {
-				for entry in entries {
-					self.scan_export_entry(
-						file_id,
-						namespace,
-						&entry.inner.inner,
-					);
+				for entry in ast.list(*entries) {
+					self.scan_export_entry(file_id, namespace, entry);
 				}
 			}
 			ast::Item::TypeSet {
@@ -4600,7 +4607,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					bindings: FxHashMap::default(),
 					members: Vec::new(),
 				});
-				let member_impls: Box<[TraitImplIdx]> = members
+				let member_impls: Box<[TraitImplIdx]> = ast
+					.list(*members)
 					.iter()
 					.map(|_| {
 						self.push_trait_impl(TraitImplDecl {
@@ -4643,18 +4651,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					namespace,
 					node: AstNodeRef::TraitImplBlock { item, block_index },
 				});
-				for item in items.iter() {
+				for item in ast.list(*items) {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (target, attributes) =
-						AttributeTarget::of_impl_item(&item.inner.inner);
+						AttributeTarget::of_impl_item(item);
 					let attributes =
 						self.scan_attributes(file_id, target, attributes);
-					let (member, key) = match &item.inner.inner {
+					let (member, key) = match item {
 						ast::ImplItem::Function { signature, .. } => {
 							let params = self.scan_impl_function_params(
 								file_id,
-								&signature.params,
+								signature.params,
 							);
 							let is_method = params.first().is_some_and(|p| {
 								p.is_some_and(|p| {
@@ -4689,7 +4697,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplFunction {
-									item: &item.inner.inner,
+									item,
 									block_index,
 									function_index,
 								},
@@ -4727,7 +4735,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::TraitImplConstant {
 									const_index,
-									item: &item.inner.inner,
+									item,
 									block_index,
 								},
 							});
@@ -4757,7 +4765,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::TraitImplAssocType {
 									assoc_type_index,
-									item: &item.inner.inner,
+									item,
 									block_index,
 								},
 							});
@@ -4822,8 +4830,30 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 
 	fn scan_use_tree(
 		&mut self,
+		file_id: FileId,
 		namespace: Scope,
-		tree: &ast::Spanned<ast::UseTree>,
+		tree: ast::UseTreeId,
+		parent_segment: Option<UsePathIndex>,
+		pub_span: Option<TextSpan>,
+	) {
+		let ast = self.ast(file_id);
+		self.scan_use_node(
+			file_id,
+			namespace,
+			Spanned {
+				inner: ast.use_tree(tree),
+				span: ast.use_tree_span(tree),
+			},
+			parent_segment,
+			pub_span,
+		);
+	}
+
+	fn scan_use_node(
+		&mut self,
+		file_id: FileId,
+		namespace: Scope,
+		tree: Spanned<ast::UseTree>,
 		parent_segment: Option<UsePathIndex>,
 		pub_span: Option<TextSpan>,
 	) {
@@ -4867,17 +4897,26 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					segment: *segment,
 					parent: parent_segment,
 				});
-				self.scan_use_tree(namespace, rest, Some(path), pub_span);
+				self.scan_use_tree(
+					file_id,
+					namespace,
+					*rest,
+					Some(path),
+					pub_span,
+				);
 			}
-			ast::UseTree::Group { segment, branches } => {
+			ast::UseTree::Group {
+				segment, branches, ..
+			} => {
 				let path = self.push_use_path(UsePathSegment {
 					segment: *segment,
 					parent: parent_segment,
 				});
-				for branch in branches.inner.iter() {
-					self.scan_use_tree(
+				for branch in self.ast(file_id).spanned(*branches) {
+					self.scan_use_node(
+						file_id,
 						namespace,
-						&branch.inner,
+						branch,
 						Some(path),
 						pub_span,
 					);
@@ -4891,7 +4930,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	fn scan_free_function_params(
 		&mut self,
 		file_id: FileId,
-		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
+		params: ast::List<ast::FunctionParam>,
 	) -> Box<[Option<Spanned<SymbolU32>>]> {
 		let names = self.scan_param_names(file_id, params);
 		for name in names.iter().flatten() {
@@ -4913,7 +4952,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	fn scan_impl_function_params(
 		&mut self,
 		file_id: FileId,
-		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
+		params: ast::List<ast::FunctionParam>,
 	) -> Box<[Option<Spanned<SymbolU32>>]> {
 		let names = self.scan_param_names(file_id, params);
 		for (index, name) in names.iter().enumerate() {
@@ -4933,11 +4972,12 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	fn scan_param_names(
 		&mut self,
 		file_id: FileId,
-		params: &[ast::Separated<Spanned<ast::FunctionParam>>],
+		params: ast::List<ast::FunctionParam>,
 	) -> Box<[Option<Spanned<SymbolU32>>]> {
+		let params = self.ast(file_id).list(params);
 		let mut names: Vec<Option<Spanned<SymbolU32>>> =
 			Vec::with_capacity(params.len());
-		for param in params.iter().map(|param| &param.inner.inner) {
+		for param in params {
 			let name = param.binding.and_then(ast::Binding::name);
 			if let Some(name) = name
 				&& let Some(&first) =
@@ -5421,7 +5461,7 @@ mod tests {
 		let tree = case.graph.ast(module.file_id);
 		let ast::Item::TypeAlias {
 			body: Some(body), ..
-		} = &tree.items.last().unwrap().inner.inner
+		} = tree.list(tree.root).last().unwrap()
 		else {
 			panic!("expected an alias");
 		};

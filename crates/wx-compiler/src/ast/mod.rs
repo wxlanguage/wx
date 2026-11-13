@@ -163,18 +163,6 @@ pub struct Spanned<T> {
 
 impl<T: Copy> Copy for Spanned<T> {}
 
-/// Represents an item in a separated list, storing both the item and its
-/// trailing separator.
-///
-/// Used for comma-separated lists like function parameters `(a, b, c)` or
-/// statement sequences. The `separator` field holds the token that follows this
-/// item (e.g., `,` or `;`), if present.
-#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub struct Separated<T> {
-	pub inner: T,
-	pub separator: Option<TextSpan>,
-}
-
 /// An expression, in its file's [`AST`]: children by id, lists by
 /// [`List`], its span in the column beside it.
 #[derive(Clone, Copy)]
@@ -411,25 +399,14 @@ impl PathSegment {
 }
 
 /// A parsed, non-empty `::`-separated path — `i32`, `module::Type`,
-/// `Point<i32>`. Its own type rather than a bare `Box<[PathSegment]>`
-/// specifically so its span can be a real method: Rust doesn't allow an
-/// inherent impl on `[PathSegment]` itself, only on a named local type, and
-/// a stored `Spanned` wrapper around the box would just duplicate what
-/// `span()` recomputes on demand from the segments themselves.
+/// `Point<i32>` — where an item names a type or a trait.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Path {
-	pub segments: Box<[PathSegment]>,
-}
-
-impl Path {
-	/// The span of the whole path, from its first segment's identifier to
-	/// its last — not including any trailing generic arguments.
-	pub fn span(&self) -> TextSpan {
-		TextSpan::new(
-			self.segments.first().unwrap().ident.span.start,
-			self.segments.last().unwrap().ident.span.end,
-		)
-	}
+	pub segments: List<PathSegment>,
+	/// From its first segment's name to its last's, not including any
+	/// trailing type arguments ([`AST::path_span`]).
+	pub span: TextSpan,
 }
 
 /// The `<Type as Trait>` clause of a qualified path (`<Type as
@@ -478,6 +455,7 @@ impl Expression {
 
 /// A generic parameter declaration: a type, `T` or `T: Bound1 + Bound2`, or
 /// a constant, `const N: Type`.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TypeParam {
 	/// A type, with its trait bounds. `None` = unconstrained.
@@ -794,6 +772,7 @@ impl Binding {
 	}
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 /// A parameter, written like a struct field: `binding: Type`, or `Type`
 /// alone, which binds nothing as `_: Type` does. The receiver is
@@ -804,6 +783,7 @@ pub struct FunctionParam {
 }
 
 /// The payload of an attribute.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum AttributeValue {
 	/// `#[inline]` — name only, no payload.
@@ -816,19 +796,21 @@ pub enum AttributeValue {
 
 /// A single attribute on an item, e.g. `#[inline]` or
 /// `#[memory_limits({ min_pages: 1 })]`.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Attribute {
 	pub name: Spanned<SymbolU32>,
 	pub value: AttributeValue,
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ImplItem {
 	/// A method or associated function — TIR distinguishes the two after
 	/// parsing, by checking whether the first param is named `self`.
 	Function {
 		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		signature: FunctionSignature,
 		block: BlockId,
 	},
@@ -837,7 +819,7 @@ pub enum ImplItem {
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 	},
 	AssocType {
 		/// Always an error to have set — an associated type is only legal in
@@ -847,24 +829,16 @@ pub enum ImplItem {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 	},
 }
 
-impl ImplItem {
-	pub fn is_block_like(&self) -> bool {
-		match self {
-			ImplItem::Function { .. } => true,
-			ImplItem::Constant { .. } | ImplItem::AssocType { .. } => false,
-		}
-	}
-}
-
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TraitItem {
 	/// A method with an optional default body.
 	Function {
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		signature: FunctionSignature,
 		/// `None` = abstract (must be provided by impl); `Some` = default
 		/// implementation.
@@ -875,14 +849,14 @@ pub enum TraitItem {
 	/// default value impls may omit and inherit as-is.
 	Const {
 		name: Spanned<SymbolU32>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		ty: TypeId,
 		value: Option<ExprId>,
 	},
 	/// An associated type declaration, optionally with a default value.
 	AssociatedType {
 		name: Spanned<SymbolU32>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		/// Trait bounds the concrete type must satisfy. `None` = unconstrained.
 		bounds: Option<BoundId>,
 		/// Used when an impl does not provide this associated type.
@@ -890,21 +864,13 @@ pub enum TraitItem {
 	},
 }
 
-impl TraitItem {
-	pub fn is_block_like(&self) -> bool {
-		match self {
-			TraitItem::Function { body, .. } => body.is_some(),
-			TraitItem::Const { .. } | TraitItem::AssociatedType { .. } => false,
-		}
-	}
-}
-
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct FunctionSignature {
 	pub name: Spanned<SymbolU32>,
 	/// Generic type parameters `<T, U: Bound>`. Empty = monomorphic.
-	pub type_params: Box<[Spanned<TypeParam>]>,
-	pub params: Box<[Separated<Spanned<FunctionParam>>]>,
+	pub type_params: List<TypeParam>,
+	pub params: List<FunctionParam>,
 	pub result: Option<TypeId>,
 }
 
@@ -919,6 +885,7 @@ pub struct FunctionSignature {
 /// would be invisible to earlier lookups), while a `Name` *cannot* be
 /// resolved that early — files are prescanned in order, so `use math::add;`
 /// in `main.wx` runs before `math.wx`'s items exist.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum UseTree {
 	/// `*` — every visible name in the namespace walked to so far.
@@ -931,19 +898,18 @@ pub enum UseTree {
 	/// One `::`-separated segment and whatever follows it.
 	Path {
 		segment: Spanned<SymbolU32>,
-		rest: Box<Spanned<UseTree>>,
+		rest: UseTreeId,
 	},
 	/// `{ .. }` — several subtrees sharing the prefix walked to so far.
-	/// `Separated<Spanned<_>>` is what `SeparatedGroup::parse` returns, and
-	/// matches `ExportEntry`'s shape. Nothing reads the separator spans: a
-	/// `use` group is formatted on one line, so it never emits a trailing
-	/// comma the way a broken `export` block does.
 	Group {
 		segment: Spanned<SymbolU32>,
-		branches: Spanned<Box<[Separated<Spanned<UseTree>>]>>,
+		branches: List<UseTree>,
+		/// The braces, `{` through `}`.
+		braces: TextSpan,
 	},
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct ExportEntry {
 	pub name: Spanned<SymbolU32>,
@@ -951,6 +917,15 @@ pub struct ExportEntry {
 	pub alias: Option<TextSpan>,
 }
 
+impl ExportEntry {
+	/// The entry as written: its name through its alias.
+	pub fn span(&self) -> TextSpan {
+		let end = self.alias.map_or(self.name.span.end, |alias| alias.end);
+		TextSpan::new(self.name.span.start, end)
+	}
+}
+
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ImportDeclaration {
 	Function {
@@ -967,6 +942,7 @@ pub enum ImportDeclaration {
 	},
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ImportEntry {
 	Declaration {
@@ -978,10 +954,11 @@ pub enum ImportEntry {
 	/// A source-level import/re-export, not an entity imported from the host.
 	Use {
 		pub_span: Option<TextSpan>,
-		tree: Spanned<UseTree>,
+		tree: UseTreeId,
 	},
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct EnumVariant {
 	pub name: Spanned<SymbolU32>,
@@ -989,6 +966,7 @@ pub struct EnumVariant {
 }
 
 /// An entry of an enum body, as written.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum EnumEntry {
 	Variant(EnumVariant),
@@ -998,39 +976,40 @@ pub enum EnumEntry {
 	Rest,
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Item {
 	Function {
 		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		signature: FunctionSignature,
 		block: BlockId,
 	},
 	FunctionDeclaration {
 		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		signature: FunctionSignature,
 	},
 	/// A package contract member whose implementation is supplied externally.
 	PackageFunction {
 		pub_span: Option<TextSpan>,
 		crate_span: TextSpan,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		signature: FunctionSignature,
 	},
 	PackageConst {
 		pub_span: Option<TextSpan>,
 		crate_span: TextSpan,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 	},
 	PackageType {
 		pub_span: Option<TextSpan>,
 		crate_span: TextSpan,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
-		type_params: Box<[Spanned<TypeParam>]>,
+		type_params: List<TypeParam>,
 	},
 	Global {
 		pub_span: Option<TextSpan>,
@@ -1038,41 +1017,43 @@ pub enum Item {
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 	},
 	Export {
-		entry: Spanned<ExportEntry>,
+		entry: ExportEntry,
 	},
 	ExportBlock {
 		/// Span of the `export` keyword.
 		keyword_span: TextSpan,
-		entries: Box<[Separated<Spanned<ExportEntry>>]>,
+		entries: List<ExportEntry>,
 	},
 	Import {
 		external_name: TextSpan,
 		internal_name: Spanned<SymbolU32>,
-		items: Spanned<Box<[Separated<Spanned<ImportEntry>>]>>,
+		entries: List<ImportEntry>,
+		/// The braces, `{` through `}`.
+		braces: TextSpan,
 	},
 	Enum {
 		pub_span: Option<TextSpan>,
 		repr: Option<TypeId>,
 		name: Spanned<SymbolU32>,
-		entries: Box<[Separated<Spanned<EnumEntry>>]>,
-		attributes: Box<[Attribute]>,
+		entries: List<EnumEntry>,
+		attributes: List<Attribute>,
 	},
 	/// `impl Type { ... }`
 	InherentImpl {
-		type_params: Box<[Spanned<TypeParam>]>,
+		type_params: List<TypeParam>,
 		target: Path,
-		items: Box<[Separated<Spanned<ImplItem>>]>,
+		items: List<ImplItem>,
 	},
 	/// `impl Trait for Type { ... }` / `impl<T> Trait for Type<T> { ... }`
 	TraitImpl {
-		type_params: Box<[Spanned<TypeParam>]>,
+		type_params: List<TypeParam>,
 		/// Plain path to the trait, e.g. `module::Trait`.
 		trait_name: Path,
 		target: Path,
-		items: Box<[Separated<Spanned<ImplItem>>]>,
+		items: List<ImplItem>,
 	},
 	/// `struct Point(x: i32, y: i32);`, `struct Pair(i32, i32);` — one form
 	/// for every struct. A field's name is optional, field by field, like its
@@ -1080,14 +1061,14 @@ pub enum Item {
 	/// name when every field has one.
 	Struct {
 		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
-		type_params: Box<[Spanned<TypeParam>]>,
-		fields: Box<[Separated<Spanned<StructField>>]>,
+		type_params: List<TypeParam>,
+		fields: List<StructField>,
 	},
 	Memory {
 		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		size: TypeId,
 	},
@@ -1096,12 +1077,14 @@ pub enum Item {
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 	},
 	Module {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		items: Spanned<Box<[Separated<Spanned<Item>>]>>,
+		items: List<Item>,
+		/// The braces, `{` through `}`.
+		braces: TextSpan,
 	},
 	ModuleDeclaration {
 		pub_span: Option<TextSpan>,
@@ -1119,11 +1102,11 @@ pub enum Item {
 	},
 	Trait {
 		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		/// Supertrait bounds: `trait X: Y + Z { ... }`.  `None` = no bounds.
 		supertraits: Option<BoundId>,
-		items: Box<[Separated<Spanned<TraitItem>>]>,
+		items: List<TraitItem>,
 	},
 	/// `typeset Name: A + B { T1, T2, ... }` — a closed compile-time set of
 	/// concrete types. The optional bound clause after `:` applies to every
@@ -1131,19 +1114,16 @@ pub enum Item {
 	/// typeset may rely on those bounds. `None` = no bounds required.
 	TypeSet {
 		pub_span: Option<TextSpan>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		bounds: Option<BoundId>,
-		/// `SeparatedGroup` always wraps each item in `Spanned<T>`; `Path`'s
-		/// own `span()` makes that wrapper redundant here, but there's no
-		/// avoiding it without changing `SeparatedGroup` itself.
-		members: Box<[Separated<Spanned<Path>>]>,
+		members: List<Path>,
 	},
 	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
 	/// brings names from another namespace into this one.
 	Use {
 		pub_span: Option<TextSpan>,
-		tree: Spanned<UseTree>,
+		tree: UseTreeId,
 	},
 	/// `type Name = TypeExpr;` or `type Name<T> = TypeExpr;` — a transparent
 	/// alias. `body` is `None` only for a bodiless `#[intrinsic] type Name;`
@@ -1151,12 +1131,13 @@ pub enum Item {
 	TypeAlias {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		type_params: Box<[Spanned<TypeParam>]>,
+		type_params: List<TypeParam>,
 		body: Option<TypeId>,
-		attributes: Box<[Attribute]>,
+		attributes: List<Attribute>,
 	},
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct StructField {
 	pub pub_span: Option<TextSpan>,
@@ -1167,6 +1148,7 @@ pub struct StructField {
 }
 
 impl Item {
+	/// Whether the item ends at its own `}`, so no `;` follows it.
 	pub fn is_block_like(&self) -> bool {
 		match self {
 			Item::Function { .. }
@@ -1196,7 +1178,7 @@ impl Item {
 
 	/// Backfills the attributes parsed ahead of an item onto whichever item
 	/// kinds carry an `attributes` field. No-op for kinds that don't.
-	pub fn set_attributes(&mut self, attrs: Box<[Attribute]>) {
+	pub fn set_attributes(&mut self, attrs: List<Attribute>) {
 		match self {
 			Item::Function { attributes, .. }
 			| Item::FunctionDeclaration { attributes, .. }
@@ -1226,6 +1208,22 @@ impl Item {
 	}
 }
 
+index_newtype!(
+	/// An item, in its file's [`AST`].
+	ItemId
+);
+index_newtype!(
+	/// A member of an `impl` block, in its file's [`AST`].
+	ImplItemId
+);
+index_newtype!(
+	/// A member of a trait, in its file's [`AST`].
+	TraitItemId
+);
+index_newtype!(
+	/// A node of a `use` tree, in its file's [`AST`].
+	UseTreeId
+);
 index_newtype!(
 	/// A type expression, in its file's [`AST`].
 	TypeId
@@ -1297,22 +1295,76 @@ impl<T> List<T> {
 	pub fn is_empty(self) -> bool {
 		self.len == 0
 	}
+
+	fn range(self) -> std::ops::Range<usize> {
+		self.start as usize..(self.start + self.len) as usize
+	}
 }
 
-/// What an [`AST`] holds in a list, and which of its vectors holds it.
+/// What an [`AST`] holds in a list, read with [`AST::list`].
 pub trait Listed: Sized {
-	fn store(ast: &AST) -> &Vec<Self>;
-	fn store_mut(ast: &mut AST) -> &mut Vec<Self>;
+	fn store(ast: &AST) -> &[Self];
+}
+
+/// A list's items in a plain vector, written with `AST::push_list`.
+trait InVec: Listed {
+	fn vec_mut(ast: &mut AST) -> &mut Vec<Self>;
+}
+
+/// A list's items in a [`Column`], each with its span, written with
+/// `AST::push_nodes` and read with [`AST::spanned`].
+pub trait InColumn: Listed {
+	fn spans(ast: &AST) -> &[TextSpan];
+	#[doc(hidden)]
+	fn column_mut(ast: &mut AST) -> &mut Column<Self>;
+}
+
+/// A node in a [`Column`] that is addressed on its own, by its position.
+pub trait Identified: InColumn {
+	type Id: Copy;
+	#[doc(hidden)]
+	fn id(index: u32) -> Self::Id;
 }
 
 macro_rules! listed {
 	($($item:ty => $field:ident),+ $(,)?) => {
 		$(impl Listed for $item {
-			fn store(ast: &AST) -> &Vec<Self> {
+			fn store(ast: &AST) -> &[Self] {
 				&ast.$field
 			}
-			fn store_mut(ast: &mut AST) -> &mut Vec<Self> {
+		}
+		impl InVec for $item {
+			fn vec_mut(ast: &mut AST) -> &mut Vec<Self> {
 				&mut ast.$field
+			}
+		})+
+	};
+}
+
+macro_rules! columns {
+	($($item:ty => $field:ident),+ $(,)?) => {
+		$(impl Listed for $item {
+			fn store(ast: &AST) -> &[Self] {
+				&ast.$field.kinds
+			}
+		}
+		impl InColumn for $item {
+			fn spans(ast: &AST) -> &[TextSpan] {
+				&ast.$field.spans
+			}
+			fn column_mut(ast: &mut AST) -> &mut Column<Self> {
+				&mut ast.$field
+			}
+		})+
+	};
+}
+
+macro_rules! identified {
+	($($item:ty => $id:ident),+ $(,)?) => {
+		$(impl Identified for $item {
+			type Id = $id;
+			fn id(index: u32) -> $id {
+				$id::new(index)
 			}
 		})+
 	};
@@ -1332,12 +1384,35 @@ listed! {
 	StmtId => stmt_lists,
 	NamedArgument => named_arguments,
 	MatchArm => arms,
+	Attribute => attributes,
+	ExportEntry => export_entries,
+	Path => paths,
+}
+
+columns! {
+	Item => items,
+	ImplItem => impl_items,
+	TraitItem => trait_items,
+	UseTree => use_trees,
+	TypeParam => type_params,
+	FunctionParam => function_params,
+	StructField => struct_fields,
+	EnumEntry => enum_entries,
+	ImportEntry => import_entries,
+}
+
+identified! {
+	Item => ItemId,
+	ImplItem => ImplItemId,
+	TraitItem => TraitItemId,
+	UseTree => UseTreeId,
 }
 
 /// A column of nodes of one kind, each with its span; a node's id is its
 /// position.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-struct Column<K> {
+#[doc(hidden)]
+pub struct Column<K> {
 	kinds: Vec<K>,
 	spans: Vec<TextSpan>,
 }
@@ -1360,15 +1435,16 @@ impl<K> Column<K> {
 	}
 }
 
-/// One file's syntax tree. Types, patterns, expressions, statements and
-/// blocks live in columns addressed by id (a child before its parent), and
-/// lists by [`List`]; items are still a tree, holding those ids
-/// (`notes/ast-arena-plan.md`).
+/// One file's syntax tree: every node lives in a column addressed by id (a
+/// child before its parent), and every list is a [`List`], its items
+/// contiguous (`notes/ast-arena-plan.md`). The file's own items are
+/// [`AST::root`].
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AST {
 	pub file_id: FileId,
 	pub diagnostics: Vec<Diagnostic<FileId>>,
-	pub items: Vec<Separated<Spanned<Item>>>,
+	/// The items written at the top of the file.
+	pub root: List<Item>,
 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub comments: CommentMap,
 	types: Column<TypeExpression>,
@@ -1392,6 +1468,18 @@ pub struct AST {
 	stmt_lists: Vec<StmtId>,
 	named_arguments: Vec<NamedArgument>,
 	arms: Vec<MatchArm>,
+	items: Column<Item>,
+	impl_items: Column<ImplItem>,
+	trait_items: Column<TraitItem>,
+	use_trees: Column<UseTree>,
+	type_params: Column<TypeParam>,
+	function_params: Column<FunctionParam>,
+	struct_fields: Column<StructField>,
+	enum_entries: Column<EnumEntry>,
+	import_entries: Column<ImportEntry>,
+	attributes: Vec<Attribute>,
+	export_entries: Vec<ExportEntry>,
+	paths: Vec<Path>,
 }
 
 impl AST {
@@ -1399,7 +1487,7 @@ impl AST {
 		Self {
 			file_id,
 			diagnostics: Vec::new(),
-			items: Vec::new(),
+			root: List::EMPTY,
 			comments: CommentMap::empty(),
 			types: Column::default(),
 			consts: Column::default(),
@@ -1422,6 +1510,18 @@ impl AST {
 			stmt_lists: Vec::new(),
 			named_arguments: Vec::new(),
 			arms: Vec::new(),
+			items: Column::default(),
+			impl_items: Column::default(),
+			trait_items: Column::default(),
+			use_trees: Column::default(),
+			type_params: Column::default(),
+			function_params: Column::default(),
+			struct_fields: Column::default(),
+			enum_entries: Column::default(),
+			import_entries: Column::default(),
+			attributes: Vec::new(),
+			export_entries: Vec::new(),
+			paths: Vec::new(),
 		}
 	}
 
@@ -1533,7 +1633,64 @@ impl AST {
 	}
 
 	pub fn list<T: Listed>(&self, list: List<T>) -> &[T] {
-		&T::store(self)[list.start as usize..][..list.len as usize]
+		&T::store(self)[list.range()]
+	}
+
+	/// A list's items, each with its span.
+	pub fn spanned<'a, T: InColumn + Copy + 'a>(
+		&'a self,
+		list: List<T>,
+	) -> impl ExactSizeIterator<Item = Spanned<T>> + 'a {
+		let range = list.range();
+		T::store(self)[range.clone()]
+			.iter()
+			.zip(&T::spans(self)[range])
+			.map(|(&inner, &span)| Spanned { inner, span })
+	}
+
+	/// The spans of a list's items, in the list's order.
+	pub fn spans<T: InColumn>(&self, list: List<T>) -> &[TextSpan] {
+		&T::spans(self)[list.range()]
+	}
+
+	/// A list's items by id.
+	pub fn ids<T: Identified>(
+		&self,
+		list: List<T>,
+	) -> impl ExactSizeIterator<Item = T::Id> + use<T> {
+		(list.start..list.start + list.len).map(T::id)
+	}
+
+	pub fn item(&self, id: ItemId) -> Item {
+		self.items.kinds[usize::from(id)]
+	}
+
+	pub fn item_span(&self, id: ItemId) -> TextSpan {
+		self.items.spans[usize::from(id)]
+	}
+
+	pub fn impl_item(&self, id: ImplItemId) -> ImplItem {
+		self.impl_items.kinds[usize::from(id)]
+	}
+
+	pub fn impl_item_span(&self, id: ImplItemId) -> TextSpan {
+		self.impl_items.spans[usize::from(id)]
+	}
+
+	pub fn trait_item(&self, id: TraitItemId) -> TraitItem {
+		self.trait_items.kinds[usize::from(id)]
+	}
+
+	pub fn trait_item_span(&self, id: TraitItemId) -> TextSpan {
+		self.trait_items.spans[usize::from(id)]
+	}
+
+	pub fn use_tree(&self, id: UseTreeId) -> UseTree {
+		self.use_trees.kinds[usize::from(id)]
+	}
+
+	pub fn use_tree_span(&self, id: UseTreeId) -> TextSpan {
+		self.use_trees.spans[usize::from(id)]
 	}
 
 	pub fn type_argument_span(&self, argument: TypeArgument) -> TextSpan {
@@ -1599,11 +1756,11 @@ impl AST {
 
 	/// Writes `items` as one list, contiguous: a list's items are all parsed
 	/// before it is written, so a nested list never lands inside it.
-	fn push_list<T: Listed>(
+	fn push_list<T: InVec>(
 		&mut self,
 		items: impl IntoIterator<Item = T>,
 	) -> List<T> {
-		let store = T::store_mut(self);
+		let store = T::vec_mut(self);
 		let start = u32::try_from(store.len()).unwrap();
 		store.extend(items);
 		let len = u32::try_from(store.len()).unwrap() - start;
@@ -1612,5 +1769,29 @@ impl AST {
 			len,
 			of: PhantomData,
 		}
+	}
+
+	/// [`AST::push_list`], for nodes kept with their spans.
+	fn push_nodes<T: InColumn>(
+		&mut self,
+		nodes: impl IntoIterator<Item = Spanned<T>>,
+	) -> List<T> {
+		let column = T::column_mut(self);
+		let start = u32::try_from(column.kinds.len()).unwrap();
+		for node in nodes {
+			column.push(node.inner, node.span);
+		}
+		let len = u32::try_from(column.kinds.len()).unwrap() - start;
+		List {
+			start,
+			len,
+			of: PhantomData,
+		}
+	}
+
+	/// One node of a column addressed on its own, outside any list (a
+	/// `use` tree's rest).
+	fn push_node<T: Identified>(&mut self, node: T, span: TextSpan) -> T::Id {
+		T::id(T::column_mut(self).push(node, span))
 	}
 }

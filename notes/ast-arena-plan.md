@@ -251,8 +251,23 @@ building.
       messages and formatting. The retained tree is 27.3 B/token of data;
       the 37.1 measured includes the columns' growth slack (shrinking them
       to fit, tried and not kept, gives the 27.3).
-   4. items, members and the remaining lists; `Spanned` and `Separated`
-      removed; TIR's `AstEntry` by id.
+   4. **Done (4.4a).** Items, impl and trait members, `use` trees, type and
+      function parameters, struct fields, enum and import entries are
+      columns, each kept with its span; attributes, export entries and
+      typeset members plain vectors. A list's items are contiguous, so a
+      node's id is its position (`ast.ids(list)`, `ast.item(id)`) and no id
+      list is stored; `ast.spanned(list)` reads items with their spans. Every
+      item is `Copy`: a `Box` became a `List` or an id (a `use` tree's rest
+      is a `UseTreeId`), so the tree has no drop glue left. The file's items
+      are `ast.root`. `Separated` and `SeparatedGroup` are gone: every
+      delimited list goes through `separated`, an item that ends in a block
+      needing no separator (`ListItem::ends_in_block`). No separator is
+      stored; wx-fmt writes `;` after every import entry, the last one too.
+      `Spanned<SymbolU32>` stays for names. TIR still holds `&'ast` item
+      references in `AstEntry`, taken from the lists.
+
+      **4.4b**, next: TIR's `AstEntry` by id (`ItemId`, `ImplItemId`,
+      `TraitItemId`), read through the file's tree, without its lifetime.
 
    The old and new forms coexist inside `Ast` while a step is in flight.
 5. The snapshot printer (with 4.3 at the latest, when the snapshots' trees
@@ -263,14 +278,15 @@ building.
 
 ## Results
 
-| | before | after step 3 | after 4.1 | after 4.2 | after 4.3 | after step 4 |
+| | before | after step 3 | after 4.1 | after 4.2 | after 4.3 | after 4.4a |
 |---|---|---|---|---|---|---|
-| lex | 0.64 ms | 0.80 ms | 0.81 ms | 0.80 ms | 0.82 ms | |
-| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | 2.68 ms | 2.44 ms | |
-| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | 0.34 ms | 0.07 ms | |
-| allocations/token | 0.86 | 0.86 | 0.72 | 0.72 | 0.49 | |
-| retained bytes/token | 49.2 | 49.2 | 38.2 | 37.1 | 37.1 (27.3 data) | |
-| expression node | 80 B | 80 B | 48 B | 48 B | 24 B + 8 B span | |
+| lex | 0.64 ms | 0.80 ms | 0.81 ms | 0.80 ms | 0.82 ms | 0.82 ms |
+| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | 2.68 ms | 2.44 ms | 2.36 ms |
+| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | 0.34 ms | 0.07 ms | 0.03 ms |
+| allocations/token | 0.86 | 0.86 | 0.72 | 0.72 | 0.49 | 0.45 |
+| retained bytes/token | 49.2 | 49.2 | 38.2 | 37.1 | 37.1 (27.3 data) | 36.4 |
+| expression node | 80 B | 80 B | 48 B | 48 B | 24 B + 8 B span | 24 B + 8 B span |
+| item | 104 B | 104 B | 104 B | 104 B | 104 B | 64 B + 8 B span |
 
 The expected outcome, an estimate to be checked against this table: parsing
 about 1.6–1.9 ms, dropping near zero, the retained tree about a third of its

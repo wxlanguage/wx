@@ -4,285 +4,9 @@ expression: case.ast
 ---
 file_id: 0
 diagnostics: []
-items:
-  - inner:
-      inner:
-        Function:
-          pub_span: ~
-          attributes: []
-          signature:
-            name:
-              inner: 34
-              span:
-                start: 5
-                end: 8
-            type_params: []
-            params:
-              - inner:
-                  inner:
-                    binding:
-                      Name:
-                        mut_span: ~
-                        name:
-                          inner: 35
-                          span:
-                            start: 9
-                            end: 10
-                    ty: 0
-                  span:
-                    start: 9
-                    end: 15
-                separator:
-                  start: 15
-                  end: 16
-              - inner:
-                  inner:
-                    binding:
-                      Name:
-                        mut_span: ~
-                        name:
-                          inner: 37
-                          span:
-                            start: 17
-                            end: 18
-                    ty: 1
-                  span:
-                    start: 17
-                    end: 23
-                separator: ~
-            result: 2
-          block: 0
-      span:
-        start: 0
-        end: 45
-    separator: ~
-  - inner:
-      inner:
-        Memory:
-          pub_span: ~
-          attributes: []
-          name:
-            inner: 38
-            span:
-              start: 54
-              end: 57
-          size: 3
-      span:
-        start: 47
-        end: 62
-    separator:
-      start: 62
-      end: 63
-  - inner:
-      inner:
-        Global:
-          pub_span: ~
-          mut_span:
-            start: 71
-            end: 74
-          name:
-            inner: 40
-            span:
-              start: 75
-              end: 82
-          ty: 4
-          value: 3
-          attributes: []
-      span:
-        start: 64
-        end: 91
-    separator:
-      start: 91
-      end: 92
-  - inner:
-      inner:
-        Const:
-          pub_span: ~
-          name:
-            inner: 41
-            span:
-              start: 99
-              end: 102
-          ty: 5
-          value: 4
-          attributes: []
-      span:
-        start: 93
-        end: 113
-    separator:
-      start: 113
-      end: 114
-  - inner:
-      inner:
-        Struct:
-          pub_span: ~
-          attributes: []
-          name:
-            inner: 42
-            span:
-              start: 123
-              end: 128
-          type_params: []
-          fields:
-            - inner:
-                inner:
-                  pub_span:
-                    start: 134
-                    end: 137
-                  binding:
-                    Name:
-                      mut_span: ~
-                      name:
-                        inner: 43
-                        span:
-                          start: 138
-                          end: 139
-                  ty: 6
-                span:
-                  start: 134
-                  end: 144
-              separator:
-                start: 144
-                end: 145
-            - inner:
-                inner:
-                  pub_span: ~
-                  binding:
-                    Name:
-                      mut_span: ~
-                      name:
-                        inner: 44
-                        span:
-                          start: 150
-                          end: 151
-                  ty: 7
-                span:
-                  start: 150
-                  end: 156
-              separator:
-                start: 156
-                end: 157
-      span:
-        start: 116
-        end: 159
-    separator:
-      start: 159
-      end: 160
-  - inner:
-      inner:
-        Import:
-          external_name:
-            start: 169
-            end: 174
-          internal_name:
-            inner: 45
-            span:
-              start: 178
-              end: 181
-          items:
-            inner:
-              - inner:
-                  inner:
-                    Declaration:
-                      external_name: ~
-                      declaration:
-                        Function:
-                          signature:
-                            name:
-                              inner: 46
-                              span:
-                                start: 193
-                                end: 196
-                            type_params: []
-                            params:
-                              - inner:
-                                  inner:
-                                    binding:
-                                      Name:
-                                        mut_span: ~
-                                        name:
-                                          inner: 47
-                                          span:
-                                            start: 197
-                                            end: 204
-                                    ty: 8
-                                  span:
-                                    start: 197
-                                    end: 212
-                                separator: ~
-                            result: ~
-                  span:
-                    start: 188
-                    end: 213
-                separator: ~
-            span:
-              start: 182
-              end: 215
-      span:
-        start: 162
-        end: 215
-    separator: ~
-  - inner:
-      inner:
-        Enum:
-          pub_span: ~
-          repr: ~
-          name:
-            inner: 49
-            span:
-              start: 222
-              end: 227
-          entries:
-            - inner:
-                inner:
-                  Variant:
-                    name:
-                      inner: 50
-                      span:
-                        start: 234
-                        end: 237
-                    value: ~
-                span:
-                  start: 234
-                  end: 237
-              separator:
-                start: 237
-                end: 238
-            - inner:
-                inner:
-                  Variant:
-                    name:
-                      inner: 51
-                      span:
-                        start: 243
-                        end: 248
-                    value: 5
-                span:
-                  start: 243
-                  end: 252
-              separator:
-                start: 252
-                end: 253
-            - inner:
-                inner:
-                  Variant:
-                    name:
-                      inner: 52
-                      span:
-                        start: 258
-                        end: 262
-                    value: ~
-                span:
-                  start: 258
-                  end: 262
-              separator:
-                start: 262
-                end: 263
-          attributes: []
-      span:
-        start: 217
-        end: 265
-    separator: ~
+root:
+  start: 0
+  len: 7
 types:
   kinds:
     - Path:
@@ -519,3 +243,254 @@ expr_lists: []
 stmt_lists: []
 named_arguments: []
 arms: []
+items:
+  kinds:
+    - Function:
+        pub_span: ~
+        attributes:
+          start: 0
+          len: 0
+        signature:
+          name:
+            inner: 34
+            span:
+              start: 5
+              end: 8
+          type_params:
+            start: 0
+            len: 0
+          params:
+            start: 0
+            len: 2
+          result: 2
+        block: 0
+    - Memory:
+        pub_span: ~
+        attributes:
+          start: 0
+          len: 0
+        name:
+          inner: 38
+          span:
+            start: 54
+            end: 57
+        size: 3
+    - Global:
+        pub_span: ~
+        mut_span:
+          start: 71
+          end: 74
+        name:
+          inner: 40
+          span:
+            start: 75
+            end: 82
+        ty: 4
+        value: 3
+        attributes:
+          start: 0
+          len: 0
+    - Const:
+        pub_span: ~
+        name:
+          inner: 41
+          span:
+            start: 99
+            end: 102
+        ty: 5
+        value: 4
+        attributes:
+          start: 0
+          len: 0
+    - Struct:
+        pub_span: ~
+        attributes:
+          start: 0
+          len: 0
+        name:
+          inner: 42
+          span:
+            start: 123
+            end: 128
+        type_params:
+          start: 0
+          len: 0
+        fields:
+          start: 0
+          len: 2
+    - Import:
+        external_name:
+          start: 169
+          end: 174
+        internal_name:
+          inner: 45
+          span:
+            start: 178
+            end: 181
+        entries:
+          start: 0
+          len: 1
+        braces:
+          start: 182
+          end: 215
+    - Enum:
+        pub_span: ~
+        repr: ~
+        name:
+          inner: 49
+          span:
+            start: 222
+            end: 227
+        entries:
+          start: 0
+          len: 3
+        attributes:
+          start: 0
+          len: 0
+  spans:
+    - start: 0
+      end: 45
+    - start: 47
+      end: 62
+    - start: 64
+      end: 91
+    - start: 93
+      end: 113
+    - start: 116
+      end: 159
+    - start: 162
+      end: 215
+    - start: 217
+      end: 265
+impl_items:
+  kinds: []
+  spans: []
+trait_items:
+  kinds: []
+  spans: []
+use_trees:
+  kinds: []
+  spans: []
+type_params:
+  kinds: []
+  spans: []
+function_params:
+  kinds:
+    - binding:
+        Name:
+          mut_span: ~
+          name:
+            inner: 35
+            span:
+              start: 9
+              end: 10
+      ty: 0
+    - binding:
+        Name:
+          mut_span: ~
+          name:
+            inner: 37
+            span:
+              start: 17
+              end: 18
+      ty: 1
+    - binding:
+        Name:
+          mut_span: ~
+          name:
+            inner: 47
+            span:
+              start: 197
+              end: 204
+      ty: 8
+  spans:
+    - start: 9
+      end: 15
+    - start: 17
+      end: 23
+    - start: 197
+      end: 212
+struct_fields:
+  kinds:
+    - pub_span:
+        start: 134
+        end: 137
+      binding:
+        Name:
+          mut_span: ~
+          name:
+            inner: 43
+            span:
+              start: 138
+              end: 139
+      ty: 6
+    - pub_span: ~
+      binding:
+        Name:
+          mut_span: ~
+          name:
+            inner: 44
+            span:
+              start: 150
+              end: 151
+      ty: 7
+  spans:
+    - start: 134
+      end: 144
+    - start: 150
+      end: 156
+enum_entries:
+  kinds:
+    - Variant:
+        name:
+          inner: 50
+          span:
+            start: 234
+            end: 237
+        value: ~
+    - Variant:
+        name:
+          inner: 51
+          span:
+            start: 243
+            end: 248
+        value: 5
+    - Variant:
+        name:
+          inner: 52
+          span:
+            start: 258
+            end: 262
+        value: ~
+  spans:
+    - start: 234
+      end: 237
+    - start: 243
+      end: 252
+    - start: 258
+      end: 262
+import_entries:
+  kinds:
+    - Declaration:
+        external_name: ~
+        declaration:
+          Function:
+            signature:
+              name:
+                inner: 46
+                span:
+                  start: 193
+                  end: 196
+              type_params:
+                start: 0
+                len: 0
+              params:
+                start: 2
+                len: 1
+              result: ~
+  spans:
+    - start: 188
+      end: 213
+attributes: []
+export_entries: []
+paths: []

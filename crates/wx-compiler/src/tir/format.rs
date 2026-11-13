@@ -462,6 +462,7 @@ mod tests {
 				&strings,
 				&decls,
 				&ast_nodes,
+				&graph.asts,
 			);
 			let mut sema = Semantics::new(
 				decls,

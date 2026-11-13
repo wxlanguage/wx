@@ -4,292 +4,9 @@ expression: case.ast
 ---
 file_id: 0
 diagnostics: []
-items:
-  - inner:
-      inner:
-        Use:
-          pub_span: ~
-          tree:
-            inner:
-              Glob:
-                segment:
-                  inner: 34
-                  span:
-                    start: 4
-                    end: 8
-            span:
-              start: 4
-              end: 11
-      span:
-        start: 0
-        end: 11
-    separator:
-      start: 11
-      end: 12
-  - inner:
-      inner:
-        Use:
-          pub_span: ~
-          tree:
-            inner:
-              Path:
-                segment:
-                  inner: 34
-                  span:
-                    start: 17
-                    end: 21
-                rest:
-                  inner:
-                    Name:
-                      segment:
-                        inner: 35
-                        span:
-                          start: 23
-                          end: 26
-                      alias: ~
-                  span:
-                    start: 23
-                    end: 26
-            span:
-              start: 17
-              end: 26
-      span:
-        start: 13
-        end: 26
-    separator:
-      start: 26
-      end: 27
-  - inner:
-      inner:
-        Use:
-          pub_span: ~
-          tree:
-            inner:
-              Path:
-                segment:
-                  inner: 34
-                  span:
-                    start: 32
-                    end: 36
-                rest:
-                  inner:
-                    Name:
-                      segment:
-                        inner: 35
-                        span:
-                          start: 38
-                          end: 41
-                      alias:
-                        inner: 36
-                        span:
-                          start: 45
-                          end: 49
-                  span:
-                    start: 38
-                    end: 49
-            span:
-              start: 32
-              end: 49
-      span:
-        start: 28
-        end: 49
-    separator:
-      start: 49
-      end: 50
-  - inner:
-      inner:
-        Use:
-          pub_span: ~
-          tree:
-            inner:
-              Group:
-                segment:
-                  inner: 34
-                  span:
-                    start: 55
-                    end: 59
-                branches:
-                  inner:
-                    - inner:
-                        inner:
-                          Name:
-                            segment:
-                              inner: 35
-                              span:
-                                start: 62
-                                end: 65
-                            alias: ~
-                        span:
-                          start: 62
-                          end: 65
-                      separator:
-                        start: 65
-                        end: 66
-                    - inner:
-                        inner:
-                          Name:
-                            segment:
-                              inner: 37
-                              span:
-                                start: 67
-                                end: 70
-                            alias: ~
-                        span:
-                          start: 67
-                          end: 70
-                      separator: ~
-                  span:
-                    start: 61
-                    end: 71
-            span:
-              start: 55
-              end: 71
-      span:
-        start: 51
-        end: 71
-    separator:
-      start: 71
-      end: 72
-  - inner:
-      inner:
-        Use:
-          pub_span: ~
-          tree:
-            inner:
-              Group:
-                segment:
-                  inner: 34
-                  span:
-                    start: 77
-                    end: 81
-                branches:
-                  inner:
-                    - inner:
-                        inner:
-                          Group:
-                            segment:
-                              inner: 38
-                              span:
-                                start: 84
-                                end: 88
-                            branches:
-                              inner:
-                                - inner:
-                                    inner:
-                                      Name:
-                                        segment:
-                                          inner: 39
-                                          span:
-                                            start: 91
-                                            end: 94
-                                        alias: ~
-                                    span:
-                                      start: 91
-                                      end: 94
-                                  separator:
-                                    start: 94
-                                    end: 95
-                                - inner:
-                                    inner:
-                                      Name:
-                                        segment:
-                                          inner: 40
-                                          span:
-                                            start: 96
-                                            end: 99
-                                        alias: ~
-                                    span:
-                                      start: 96
-                                      end: 99
-                                  separator: ~
-                              span:
-                                start: 90
-                                end: 100
-                        span:
-                          start: 84
-                          end: 100
-                      separator:
-                        start: 100
-                        end: 101
-                    - inner:
-                        inner:
-                          Glob:
-                            segment:
-                              inner: 41
-                              span:
-                                start: 102
-                                end: 105
-                        span:
-                          start: 102
-                          end: 108
-                      separator: ~
-                  span:
-                    start: 83
-                    end: 109
-            span:
-              start: 77
-              end: 109
-      span:
-        start: 73
-        end: 109
-    separator:
-      start: 109
-      end: 110
-  - inner:
-      inner:
-        Use:
-          pub_span: ~
-          tree:
-            inner:
-              Path:
-                segment:
-                  inner: 42
-                  span:
-                    start: 115
-                    end: 116
-                rest:
-                  inner:
-                    Path:
-                      segment:
-                        inner: 43
-                        span:
-                          start: 118
-                          end: 119
-                      rest:
-                        inner:
-                          Path:
-                            segment:
-                              inner: 44
-                              span:
-                                start: 121
-                                end: 122
-                            rest:
-                              inner:
-                                Name:
-                                  segment:
-                                    inner: 45
-                                    span:
-                                      start: 124
-                                      end: 125
-                                  alias: ~
-                              span:
-                                start: 124
-                                end: 125
-                        span:
-                          start: 121
-                          end: 125
-                  span:
-                    start: 118
-                    end: 125
-            span:
-              start: 115
-              end: 125
-      span:
-        start: 111
-        end: 125
-    separator:
-      start: 125
-      end: 126
+root:
+  start: 0
+  len: 6
 types:
   kinds: []
   spans: []
@@ -325,3 +42,233 @@ expr_lists: []
 stmt_lists: []
 named_arguments: []
 arms: []
+items:
+  kinds:
+    - Use:
+        pub_span: ~
+        tree: 0
+    - Use:
+        pub_span: ~
+        tree: 2
+    - Use:
+        pub_span: ~
+        tree: 4
+    - Use:
+        pub_span: ~
+        tree: 7
+    - Use:
+        pub_span: ~
+        tree: 12
+    - Use:
+        pub_span: ~
+        tree: 16
+  spans:
+    - start: 0
+      end: 11
+    - start: 13
+      end: 26
+    - start: 28
+      end: 49
+    - start: 51
+      end: 71
+    - start: 73
+      end: 109
+    - start: 111
+      end: 125
+impl_items:
+  kinds: []
+  spans: []
+trait_items:
+  kinds: []
+  spans: []
+use_trees:
+  kinds:
+    - Glob:
+        segment:
+          inner: 34
+          span:
+            start: 4
+            end: 8
+    - Name:
+        segment:
+          inner: 35
+          span:
+            start: 23
+            end: 26
+        alias: ~
+    - Path:
+        segment:
+          inner: 34
+          span:
+            start: 17
+            end: 21
+        rest: 1
+    - Name:
+        segment:
+          inner: 35
+          span:
+            start: 38
+            end: 41
+        alias:
+          inner: 36
+          span:
+            start: 45
+            end: 49
+    - Path:
+        segment:
+          inner: 34
+          span:
+            start: 32
+            end: 36
+        rest: 3
+    - Name:
+        segment:
+          inner: 35
+          span:
+            start: 62
+            end: 65
+        alias: ~
+    - Name:
+        segment:
+          inner: 37
+          span:
+            start: 67
+            end: 70
+        alias: ~
+    - Group:
+        segment:
+          inner: 34
+          span:
+            start: 55
+            end: 59
+        branches:
+          start: 5
+          len: 2
+        braces:
+          start: 61
+          end: 71
+    - Name:
+        segment:
+          inner: 39
+          span:
+            start: 91
+            end: 94
+        alias: ~
+    - Name:
+        segment:
+          inner: 40
+          span:
+            start: 96
+            end: 99
+        alias: ~
+    - Group:
+        segment:
+          inner: 38
+          span:
+            start: 84
+            end: 88
+        branches:
+          start: 8
+          len: 2
+        braces:
+          start: 90
+          end: 100
+    - Glob:
+        segment:
+          inner: 41
+          span:
+            start: 102
+            end: 105
+    - Group:
+        segment:
+          inner: 34
+          span:
+            start: 77
+            end: 81
+        branches:
+          start: 10
+          len: 2
+        braces:
+          start: 83
+          end: 109
+    - Name:
+        segment:
+          inner: 45
+          span:
+            start: 124
+            end: 125
+        alias: ~
+    - Path:
+        segment:
+          inner: 44
+          span:
+            start: 121
+            end: 122
+        rest: 13
+    - Path:
+        segment:
+          inner: 43
+          span:
+            start: 118
+            end: 119
+        rest: 14
+    - Path:
+        segment:
+          inner: 42
+          span:
+            start: 115
+            end: 116
+        rest: 15
+  spans:
+    - start: 4
+      end: 11
+    - start: 23
+      end: 26
+    - start: 17
+      end: 26
+    - start: 38
+      end: 49
+    - start: 32
+      end: 49
+    - start: 62
+      end: 65
+    - start: 67
+      end: 70
+    - start: 55
+      end: 71
+    - start: 91
+      end: 94
+    - start: 96
+      end: 99
+    - start: 84
+      end: 100
+    - start: 102
+      end: 108
+    - start: 77
+      end: 109
+    - start: 124
+      end: 125
+    - start: 121
+      end: 125
+    - start: 118
+      end: 125
+    - start: 115
+      end: 125
+type_params:
+  kinds: []
+  spans: []
+function_params:
+  kinds: []
+  spans: []
+struct_fields:
+  kinds: []
+  spans: []
+enum_entries:
+  kinds: []
+  spans: []
+import_entries:
+  kinds: []
+  spans: []
+attributes: []
+export_entries: []
+paths: []

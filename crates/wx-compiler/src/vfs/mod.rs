@@ -667,21 +667,18 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 
 		let module_id = ModuleId(self.modules.len() as u32);
 		let child_decls: Box<[ModuleDeclaration]> = ast
-			.items
+			.list(ast.root)
 			.iter()
-			.filter_map(|item| match &item.inner.inner {
+			.filter_map(|item| match *item {
 				ast::Item::ModuleDeclaration { name, pub_span } => {
 					Some(ModuleDeclaration {
 						parent: module_id,
-						name: *name,
-						pub_span: *pub_span,
+						name,
+						pub_span,
 					})
 				}
 				ast::Item::Module { items, .. } => {
-					self.check_nested_module_declarations(
-						file_id,
-						&items.inner,
-					);
+					self.check_nested_module_declarations(&ast, items);
 					None
 				}
 				_ => None,
@@ -752,11 +749,12 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 	/// per inline level).
 	fn check_nested_module_declarations(
 		&mut self,
-		file_id: FileId,
-		items: &[ast::Separated<ast::Spanned<ast::Item>>],
+		ast: &ast::AST,
+		items: ast::List<ast::Item>,
 	) {
-		for item in items {
-			match &item.inner.inner {
+		let file_id = ast.file_id;
+		for item in ast.list(items) {
+			match *item {
 				ast::Item::ModuleDeclaration { name, .. } => {
 					let diagnostic = Diagnostic::error()
 						.with_code(
@@ -774,10 +772,7 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 					self.diagnostics.push(diagnostic);
 				}
 				ast::Item::Module { items, .. } => {
-					self.check_nested_module_declarations(
-						file_id,
-						&items.inner,
-					);
+					self.check_nested_module_declarations(ast, items);
 				}
 				_ => {}
 			}

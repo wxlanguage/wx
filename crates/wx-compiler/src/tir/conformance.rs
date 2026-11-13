@@ -1324,17 +1324,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 				self.function_syntax(declaration),
 				self.function_syntax(function),
 			);
-			// A left-out result is `()`; its function's name stands for it.
-			let written = |syntax: &ast::FunctionSignature| {
-				if position < params {
-					WrittenType::Written(syntax.params[position].inner.inner.ty)
-				} else {
-					syntax.result.map_or(
-						WrittenType::Implied(syntax.name.span),
-						WrittenType::Written,
-					)
-				}
-			};
 			let (expected_file, found_file) = (
 				sema.decls.file_id(
 					sema.decls.functions[usize::from(declaration)].loc,
@@ -1342,6 +1331,19 @@ impl<'ast> SemanticsBuilder<'ast> {
 				sema.decls
 					.file_id(sema.decls.functions[usize::from(function)].loc),
 			);
+			// A left-out result is `()`; its function's name stands for it.
+			let written = |file_id, syntax: &ast::FunctionSignature| {
+				if position < params {
+					WrittenType::Written(
+						self.ast(file_id).list(syntax.params)[position].ty,
+					)
+				} else {
+					syntax.result.map_or(
+						WrittenType::Implied(syntax.name.span),
+						WrittenType::Written,
+					)
+				}
+			};
 			let head = sema.signature_mismatch(
 				&self.strings,
 				trait_index,
@@ -1352,8 +1354,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				&self.strings,
 				self.asts,
 				head,
-				(expected_file, written(expected_syntax)),
-				(found_file, written(syntax)),
+				(expected_file, written(expected_file, expected_syntax)),
+				(found_file, written(found_file, syntax)),
 				(expected, found),
 			);
 			return Ok(());
@@ -1497,9 +1499,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 					let file_id = sema.decls.file_id(
 						sema.decls.functions[usize::from(function)].loc,
 					);
-					let param =
-						&self.function_syntax(function).params[position];
-					self.ast(file_id).type_span(param.inner.inner.ty)
+					let params = self.function_syntax(function).params;
+					let param = self.ast(file_id).list(params)[position];
+					self.ast(file_id).type_span(param.ty)
 				},
 				|name| name.span,
 			)

@@ -361,8 +361,8 @@ impl BodyBuilder<'_, '_> {
 		// the same way and of the same type in both.
 		let mut product = None;
 		let mut alternatives = None;
-		for at in 0..context.frames.len() {
-			match context.frames[at].kind {
+		for (at, frame) in context.frames.iter().enumerate() {
+			match frame.kind {
 				FrameKind::Product => {
 					if product.is_none() {
 						product = self.frame_binding(context, at, name.inner);

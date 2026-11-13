@@ -724,12 +724,10 @@ impl Semantics {
 		file_id: FileId,
 		owner: GenericEnvOwner,
 		parent: GenericEnvIdx,
-		params: &[Spanned<ast::TypeParam>],
+		params: &[ast::TypeParam],
 	) -> Option<TypeIndex> {
 		let mut subject = None;
-		for (index, param) in
-			params.iter().map(|param| &param.inner).enumerate()
-		{
+		for (index, param) in params.iter().enumerate() {
 			if !is_self_entry(param) {
 				continue;
 			}
@@ -1431,13 +1429,14 @@ fn report_missing_enum_repr(
 /// `check_discriminants` decides that.
 fn report_open_markers(
 	file_id: FileId,
-	entries: &[ast::Separated<ast::Spanned<ast::EnumEntry>>],
+	ast: &ast::AST,
+	entries: ast::List<ast::EnumEntry>,
 ) -> Vec<Diagnostic<FileId>> {
-	let rests: Vec<(usize, TextSpan)> = entries
-		.iter()
+	let rests: Vec<(usize, TextSpan)> = ast
+		.spanned(entries)
 		.enumerate()
-		.filter(|(_, entry)| matches!(entry.inner.inner, ast::EnumEntry::Rest))
-		.map(|(at, entry)| (at, entry.inner.span))
+		.filter(|(_, entry)| matches!(entry.inner, ast::EnumEntry::Rest))
+		.map(|(at, entry)| (at, entry.span))
 		.collect();
 	let mut reports = Vec::new();
 	let Some(&(first_at, first)) = rests.first() else {
@@ -1868,19 +1867,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 		namespace: Scope,
 		owner: GenericEnvOwner,
 		parent: GenericEnvIdx,
-		params: &[Spanned<ast::TypeParam>],
+		params: ast::List<ast::TypeParam>,
 	) -> GenericEnvIdx {
+		let params = self.ast(file_id).list(params);
 		let first_obligation = obligations.len();
 		// `Self` is never a parameter: written first in a trait's function it
 		// bounds the trait's `Self`, in a trait impl's the impl's target, and
 		// anywhere else it is reported.
 		let self_subject = sema.self_entry(file_id, owner, parent, params);
-		let declared = || {
-			params
-				.iter()
-				.map(|param| &param.inner)
-				.filter(|param| !is_self_entry(param))
-		};
+		let declared = || params.iter().filter(|param| !is_self_entry(param));
 		// An impl always owns a frame, even an empty one: it is where a `Self`
 		// written inside the impl finds the impl it means (`resolve_impl_self`).
 		let is_impl = matches!(
@@ -1914,7 +1909,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		);
 		// What the bounds are written on: the `Self` entry's subject, else
 		// each parameter, in order.
-		let self_entry = self_subject.map(|_| &params[0].inner);
+		let self_entry = self_subject.map(|_| &params[0]);
 		let written = || self_entry.into_iter().chain(declared());
 		// In a trait impl's function the entry is about the impl's target:
 		// a use proves its clauses as written, and the function assumes
@@ -2104,10 +2099,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				TypeObligation::NormalizeSelfEntry {
 					frame: generic_env,
 					clauses: BoundClauses::Final(entry),
-					reference: SourceSpan::new(
-						file_id,
-						params[0].inner.name().span,
-					),
+					reference: SourceSpan::new(file_id, params[0].name().span),
 				},
 			);
 		}
@@ -2129,7 +2121,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let Some(head) = head else {
 			return TypeIndex::ERROR;
 		};
-		let Some(segment) = path.segments.last() else {
+		let Some(segment) = self.ast(scope.file_id).list(path.segments).last()
+		else {
 			unreachable!("an impl target path is nonempty")
 		};
 		let ImplTarget::Struct(struct_index) = head.inner else {
@@ -2230,8 +2223,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		signature: &ast::FunctionSignature,
 	) -> (Option<TextSpan>, Option<TextSpan>) {
 		let ast = self.ast(file_id);
-		let args = match &signature.params[..] {
-			[param] => Some(ast.type_span(param.inner.inner.ty)),
+		let args = match ast.list(signature.params) {
+			[param] => Some(ast.type_span(param.ty)),
 			_ => None,
 		};
 		(args, signature.result.map(|result| ast.type_span(result)))
@@ -2314,23 +2307,20 @@ impl<'ast> SemanticsBuilder<'ast> {
 			namespace,
 			GenericEnvOwner::Function(function_index),
 			GenericEnvIdx::ROOT,
-			&signature.type_params,
+			signature.type_params,
 		);
 
-		let param_types: Vec<TypeIndex> = signature
-			.params
+		let param_types: Vec<TypeIndex> = self
+			.ast(file_id)
+			.list(signature.params)
 			.iter()
 			.map(|param| {
 				// A free function has no `Self`: its `self` was reported
 				// where it is written.
-				let receiver = param
-					.inner
-					.inner
-					.binding
-					.and_then(ast::Binding::name)
-					.is_some_and(|name| {
-						name.inner == Keyword::SelfLower.symbol()
-					});
+				let receiver =
+					param.binding.and_then(ast::Binding::name).is_some_and(
+						|name| name.inner == Keyword::SelfLower.symbol(),
+					);
 				if receiver {
 					return TypeIndex::ERROR;
 				}
@@ -2345,7 +2335,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							.assumption_envs
 							.of_frame(generic_env),
 					},
-					param.inner.inner.ty,
+					param.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
 				)
 			})
@@ -2405,12 +2395,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 			namespace,
 			GenericEnvOwner::Function(function_index),
 			parent,
-			&signature.type_params,
+			signature.type_params,
 		);
 
 		// Definition collection diagnoses misplaced receivers.
-		let param_types: Vec<TypeIndex> = signature
-			.params
+		let param_types: Vec<TypeIndex> = self
+			.ast(file_id)
+			.list(signature.params)
 			.iter()
 			.map(|param| {
 				self.resolve_value_type(
@@ -2422,16 +2413,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 						generic_env: scope,
 						assumption_env: sema.assumption_envs.of_frame(scope),
 					},
-					param.inner.inner.ty,
+					param.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
 				)
 			})
 			.collect();
 
-		if let Some(param) = signature.params.first()
+		if let Some(param) = self.ast(file_id).list(signature.params).first()
 			&& param
-				.inner
-				.inner
 				.binding
 				.and_then(ast::Binding::name)
 				.is_some_and(|name| name.inner == Keyword::SelfLower.symbol())
@@ -2452,7 +2441,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				frame: scope,
 				ty: param_types[0],
 				self_type,
-				reference: self.type_site(file_id, param.inner.inner.ty),
+				reference: self.type_site(file_id, param.ty),
 			});
 		}
 
@@ -2751,7 +2740,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								namespace,
 								GenericEnvOwner::TypeAlias(type_alias_index),
 								GenericEnvIdx::ROOT,
-								type_params,
+								*type_params,
 							);
 							let target = match body {
 								Some(body) => self.resolve_type(
@@ -3282,7 +3271,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					GenericEnvOwner::Struct(struct_index),
 					GenericEnvIdx::ROOT,
-					ast_type_params,
+					*ast_type_params,
 				);
 				// Written before fields are touched, not alongside
 				// `field_types` below, so a self-/mutually-referencing
@@ -3301,8 +3290,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// duplicate is unreachable).
 				let mut field_types: Vec<TypeIndex> =
 					Vec::with_capacity(fields.len());
-				for f in fields.iter() {
-					let ty_expr = f.inner.inner.ty;
+				for f in self.ast(file_id).list(*fields) {
+					let ty_expr = f.ty;
 					let ty = self.resolve_type(
 						sema,
 						obligations,
@@ -3390,7 +3379,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					GenericEnvOwner::InherentImpl(block_index),
 					GenericEnvIdx::ROOT,
-					type_params,
+					*type_params,
 				);
 				let target_type = self.resolve_impl_target(
 					sema,
@@ -3409,13 +3398,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 						type_params: scope,
 						target: Spanned {
 							inner: target_type,
-							span: target.span(),
+							span: target.span,
 						},
 					});
 				if !sema.generic_envs.param_types(scope).is_empty() {
 					obligations.push(TypeObligation::CheckImplRequirements {
 						impl_kind: ImplKind::Inherent(block_index),
-						reference: SourceSpan::new(file_id, target.span()),
+						reference: SourceSpan::new(file_id, target.span),
 					});
 				}
 				SignatureLocation::InherentImpl(block_index)
@@ -3506,7 +3495,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					GenericEnvOwner::TraitImpl(block_index),
 					GenericEnvIdx::ROOT,
-					type_params,
+					*type_params,
 				);
 				let header = sema.impl_dispatch.trait_header(block_index);
 				let target_type = self.resolve_impl_target(
@@ -3526,13 +3515,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 						type_params: scope,
 						target: Spanned {
 							inner: target_type,
-							span: target.span(),
+							span: target.span,
 						},
 					});
 				if !sema.generic_envs.param_types(scope).is_empty() {
 					obligations.push(TypeObligation::CheckImplRequirements {
 						impl_kind: ImplKind::Trait(block_index),
-						reference: SourceSpan::new(file_id, target.span()),
+						reference: SourceSpan::new(file_id, target.span),
 					});
 				}
 				// A default this impl inherits means something here that it
@@ -3559,7 +3548,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								},
 								reference: SourceSpan::new(
 									file_id,
-									target.span(),
+									target.span,
 								),
 							});
 						}
@@ -3628,8 +3617,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}
 				};
 
-				sema.diagnostics
-					.extend(report_open_markers(file_id, entries));
+				sema.diagnostics.extend(report_open_markers(
+					file_id,
+					self.ast(file_id),
+					*entries,
+				));
 
 				sema.enums[usize::from(enum_index)] =
 					EnumSignature { repr: repr_type };
@@ -3718,6 +3710,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// Dispatch already registered each member as a synthetic impl.
 				// Resolve its complete type and fill the pre-allocated signature.
 				let mut resolved_members = Vec::with_capacity(members.len());
+				let members = self.ast(file_id).list(*members);
 				for (m, &impl_index) in members.iter().zip(member_impls.iter())
 				{
 					let member_ty = self.resolve_impl_target(
@@ -3731,12 +3724,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 								.assumption_envs
 								.of_frame(GenericEnvIdx::ROOT),
 						},
-						&m.inner.inner,
+						m,
 						sema.impl_dispatch.trait_header(impl_index).target,
 					);
 					let target_spanned = Spanned {
 						inner: member_ty,
-						span: m.inner.span,
+						span: m.span,
 					};
 					// No frame: a typeset member is a concrete type by
 					// construction (it's the thing being implemented for),
@@ -7764,6 +7757,7 @@ pub(super) mod tests {
 			strings,
 			&decls,
 			&ast_nodes,
+			&graph.asts,
 		);
 		DiagnosticView::new("prescan/dispatch", &diagnostics, &graph.files)
 			.assert_none();

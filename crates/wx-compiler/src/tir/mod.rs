@@ -83,6 +83,7 @@ pub fn check(
 		strings,
 		&decls,
 		&ast_nodes,
+		asts,
 	);
 	let mut sema =
 		Semantics::new(decls, impl_dispatch, diagnostics, resolutions, strings);
