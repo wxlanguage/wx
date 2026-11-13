@@ -109,7 +109,7 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	resolutions: &'a mut NameResolutions,
 	strings: &'a StringInterner,
 	decls: &'a Declarations,
-	ast_nodes: &'a [AstEntry<'ast>],
+	ast_nodes: &'a [AstEntry],
 	asts: &'ast [ast::AST],
 	inherent: FxHashMap<ImplTarget, Vec<InherentImplIdx>>,
 	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
@@ -161,7 +161,7 @@ impl ImplDispatch {
 		resolutions: &mut NameResolutions,
 		strings: &StringInterner,
 		decls: &Declarations,
-		ast_nodes: &[AstEntry<'_>],
+		ast_nodes: &[AstEntry],
 		asts: &[ast::AST],
 	) -> Self {
 		ImplDispatchBuilder::new(
@@ -212,7 +212,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		resolutions: &'a mut NameResolutions,
 		strings: &'a StringInterner,
 		decls: &'a Declarations,
-		ast_nodes: &'a [AstEntry<'ast>],
+		ast_nodes: &'a [AstEntry],
 		asts: &'ast [ast::AST],
 	) -> Self {
 		Self {
@@ -238,14 +238,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	fn build(mut self) -> ImplDispatch {
 		let ast_nodes = self.ast_nodes;
 		let decls = self.decls;
+		let asts = self.asts;
 		for entry in ast_nodes {
+			let ast = &asts[entry.file_id.as_usize()];
 			match &entry.node {
 				AstNodeRef::InherentImplBlock { item, block_index } => {
 					let ast::Item::InherentImpl {
 						type_params,
 						target: target_path,
 						..
-					} = item
+					} = &ast.item(*item)
 					else {
 						unreachable!()
 					};
@@ -276,7 +278,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						trait_name,
 						target: target_path,
 						..
-					} = item
+					} = &ast.item(*item)
 					else {
 						unreachable!()
 					};
@@ -310,8 +312,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						self.register_trait(
 							target,
 							trait_idx,
-							self.asts[entry.file_id.as_usize()]
-								.list(trait_name.segments)
+							ast.list(trait_name.segments)
 								.last()
 								.unwrap()
 								.ident
@@ -325,12 +326,13 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					typeset_index,
 					item,
 				} => {
-					let ast::Item::TypeSet { name, members, .. } = item else {
+					let ast::Item::TypeSet { name, members, .. } =
+						&ast.item(*item)
+					else {
 						unreachable!()
 					};
 					let decl = &decls.typesets[usize::from(*typeset_index)];
-					let members =
-						self.asts[entry.file_id.as_usize()].list(*members);
+					let members = ast.list(*members);
 					for (member, &impl_index) in
 						members.iter().zip(decl.member_impls.iter())
 					{
@@ -366,7 +368,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					}
 				}
 				AstNodeRef::Memory { memory_index, item } => {
-					let ast::Item::Memory { name, .. } = item else {
+					let ast::Item::Memory { name, .. } = &ast.item(*item)
+					else {
 						unreachable!()
 					};
 					self.register_memory_impl(
@@ -377,11 +380,13 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				}
 				AstNodeRef::ImportedMemory {
 					memory_index,
-					import_block,
+					import_entry,
 					..
 				} => {
-					let ast::ImportDeclaration::Memory { name, .. } =
-						import_block
+					let ast::ImportEntry::Declaration {
+						declaration: ast::ImportDeclaration::Memory { name, .. },
+						..
+					} = &ast.import_entry(*import_entry)
 					else {
 						unreachable!()
 					};
@@ -392,7 +397,9 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					);
 				}
 				AstNodeRef::Global { global_index, item } => {
-					let ast::Item::Global { name, mut_span, .. } = item else {
+					let ast::Item::Global { name, mut_span, .. } =
+						&ast.item(*item)
+					else {
 						unreachable!()
 					};
 					self.register_global_impl(
@@ -404,12 +411,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				}
 				AstNodeRef::ImportedGlobal {
 					global_index,
-					import_block,
+					import_entry,
 					..
 				} => {
-					let ast::ImportDeclaration::Global {
-						name, mut_span, ..
-					} = import_block
+					let ast::ImportEntry::Declaration {
+						declaration:
+							ast::ImportDeclaration::Global {
+								name, mut_span, ..
+							},
+						..
+					} = &ast.import_entry(*import_entry)
 					else {
 						unreachable!()
 					};

@@ -1003,20 +1003,19 @@ impl<'ast> SemanticsBuilder<'ast> {
 					TraitMemberSelection::Impl(MemberKind::AssociatedType(
 						provider,
 					)) => {
-						let AstNodeRef::TraitImplAssocType {
-							item: ast::ImplItem::AssocType { ty, .. },
-							..
-						} = *self.ast_node(SignatureQuery::AssocType(provider))
+						let entry =
+							self.ast_entry(SignatureQuery::AssocType(provider));
+						let AstNodeRef::TraitImplAssocType { item, .. } =
+							entry.node
 						else {
 							unreachable!("a trait impl's associated type")
 						};
-						self.type_site(
-							sema.decls.file_id(
-								sema.decls.assoc_types[usize::from(provider)]
-									.loc,
-							),
-							*ty,
-						)
+						let ast::ImplItem::AssocType { ty, .. } =
+							self.ast(entry.file_id).impl_item(item)
+						else {
+							unreachable!("a trait impl's associated type")
+						};
+						self.type_site(entry.file_id, ty)
 					}
 					_ => at_target,
 				};
@@ -1163,21 +1162,25 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.as_ref()
 			.is_some_and(|signature| signature.value.is_some()),
 			MemberKind::Function(index) | MemberKind::Method(index) => {
+				let entry = self.ast_entry(SignatureQuery::Function(index));
+				let AstNodeRef::TraitFunction { item, .. } = entry.node else {
+					return false;
+				};
 				matches!(
-					*self.ast_node(SignatureQuery::Function(index)),
-					AstNodeRef::TraitFunction {
-						item: ast::TraitItem::Function { body: Some(_), .. },
-						..
-					}
+					self.ast(entry.file_id).trait_item(item),
+					ast::TraitItem::Function { body: Some(_), .. }
 				)
 			}
-			MemberKind::Constant(index) => matches!(
-				*self.ast_node(SignatureQuery::Const(index)),
-				AstNodeRef::TraitConst {
-					item: ast::TraitItem::Const { value: Some(_), .. },
-					..
-				}
-			),
+			MemberKind::Constant(index) => {
+				let entry = self.ast_entry(SignatureQuery::Const(index));
+				let AstNodeRef::TraitConst { item, .. } = entry.node else {
+					return false;
+				};
+				matches!(
+					self.ast(entry.file_id).trait_item(item),
+					ast::TraitItem::Const { value: Some(_), .. }
+				)
+			}
 		}
 	}
 
@@ -1354,8 +1357,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				&self.strings,
 				self.asts,
 				head,
-				(expected_file, written(expected_file, expected_syntax)),
-				(found_file, written(found_file, syntax)),
+				(expected_file, written(expected_file, &expected_syntax)),
+				(found_file, written(found_file, &syntax)),
 				(expected, found),
 			);
 			return Ok(());
@@ -1408,29 +1411,29 @@ impl<'ast> SemanticsBuilder<'ast> {
 		}
 		// A constant whose type is left out is reported and typed `ERROR`, so
 		// both are written here.
-		let AstNodeRef::TraitConst {
-			item: ast::TraitItem::Const {
-				ty: expected_ty, ..
-			},
-			..
-		} = *self.ast_node(SignatureQuery::Const(declaration))
+		let expected_entry = self.ast_entry(SignatureQuery::Const(declaration));
+		let AstNodeRef::TraitConst { item, .. } = expected_entry.node else {
+			unreachable!("a trait's constant")
+		};
+		let ast::TraitItem::Const {
+			ty: expected_ty, ..
+		} = self.ast(expected_entry.file_id).trait_item(item)
 		else {
 			unreachable!("a trait's constant")
 		};
-		let AstNodeRef::TraitImplConstant {
-			item: ast::ImplItem::Constant { ty: Some(ty), .. },
-			..
-		} = *self.ast_node(SignatureQuery::Const(constant))
+		let found_entry = self.ast_entry(SignatureQuery::Const(constant));
+		let AstNodeRef::TraitImplConstant { item, .. } = found_entry.node
+		else {
+			unreachable!("a trait impl's constant")
+		};
+		let ast::ImplItem::Constant { ty: Some(ty), .. } =
+			self.ast(found_entry.file_id).impl_item(item)
 		else {
 			unreachable!("a trait impl's constant with a written type")
 		};
 		let name = sema.decls.name(constant).inner;
-		let (expected_file, found_file) = (
-			sema.decls
-				.file_id(sema.decls.constants[usize::from(declaration)].loc),
-			sema.decls
-				.file_id(sema.decls.constants[usize::from(constant)].loc),
-		);
+		let (expected_file, found_file) =
+			(expected_entry.file_id, found_entry.file_id);
 		let head = Diagnostic::error()
 			.with_code(DiagnosticCode::TraitImplConstTypeMismatch.code())
 			.with_message(format!(
@@ -1442,8 +1445,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&self.strings,
 			self.asts,
 			head,
-			(expected_file, WrittenType::Written(*expected_ty)),
-			(found_file, WrittenType::Written(*ty)),
+			(expected_file, WrittenType::Written(expected_ty)),
+			(found_file, WrittenType::Written(ty)),
 			(expected, found),
 		);
 		Ok(())
@@ -1451,19 +1454,26 @@ impl<'ast> SemanticsBuilder<'ast> {
 
 	/// The written signature of a trait's or a trait impl's function, for
 	/// its spans.
-	fn function_syntax(
-		&self,
-		function: FunctionIdx,
-	) -> &'ast ast::FunctionSignature {
-		match *self.ast_node(SignatureQuery::Function(function)) {
-			AstNodeRef::TraitFunction {
-				item: ast::TraitItem::Function { signature, .. },
-				..
+	fn function_syntax(&self, function: FunctionIdx) -> ast::FunctionSignature {
+		let entry = self.ast_entry(SignatureQuery::Function(function));
+		let ast = self.ast(entry.file_id);
+		match entry.node {
+			AstNodeRef::TraitFunction { item, .. } => {
+				let ast::TraitItem::Function { signature, .. } =
+					ast.trait_item(item)
+				else {
+					unreachable!("a trait's function")
+				};
+				signature
 			}
-			| AstNodeRef::TraitImplFunction {
-				item: ast::ImplItem::Function { signature, .. },
-				..
-			} => signature,
+			AstNodeRef::TraitImplFunction { item, .. } => {
+				let ast::ImplItem::Function { signature, .. } =
+					ast.impl_item(item)
+				else {
+					unreachable!("a trait impl's function")
+				};
+				signature
+			}
 			_ => unreachable!("a trait's or a trait impl's function"),
 		}
 	}

@@ -1221,6 +1221,14 @@ index_newtype!(
 	UseTreeId
 );
 index_newtype!(
+	/// An entry of an enum body, in its file's [`AST`].
+	EnumEntryId
+);
+index_newtype!(
+	/// An entry of an import block, in its file's [`AST`].
+	ImportEntryId
+);
+index_newtype!(
 	/// A type expression, in its file's [`AST`].
 	TypeId
 );
@@ -1407,6 +1415,8 @@ identified! {
 	ImplItem => ImplItemId,
 	TraitItem => TraitItemId,
 	UseTree => UseTreeId,
+	EnumEntry => EnumEntryId,
+	ImportEntry => ImportEntryId,
 }
 
 /// A column of nodes of one kind, each with its span; a node's id is its
@@ -1820,6 +1830,14 @@ impl AST {
 
 	pub fn trait_item_span(&self, id: TraitItemId) -> TextSpan {
 		self.trait_items.spans[usize::from(id)]
+	}
+
+	pub fn enum_entry(&self, id: EnumEntryId) -> EnumEntry {
+		self.enum_entries.kinds[usize::from(id)]
+	}
+
+	pub fn import_entry(&self, id: ImportEntryId) -> ImportEntry {
+		self.import_entries.kinds[usize::from(id)]
 	}
 
 	pub fn use_tree(&self, id: UseTreeId) -> UseTree {

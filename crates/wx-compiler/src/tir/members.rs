@@ -1574,7 +1574,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 	) -> Result<(), ()> {
 		let query = SignatureQuery::AssocType(assoc_type_index);
 		assert!(
-			matches!(self.ast_node(query), AstNodeRef::TraitAssocType { .. }),
+			matches!(
+				self.ast_entry(query).node,
+				AstNodeRef::TraitAssocType { .. }
+			),
 			"bound access requires a trait declaration, not a provider"
 		);
 		match self.ensure_signature(

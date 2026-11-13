@@ -262,8 +262,8 @@ building.
       delimited list goes through `separated`, an item that ends in a block
       needing no separator (`ListItem::ends_in_block`). No separator is
       stored; wx-fmt writes `;` after every import entry, the last one too.
-      `Spanned<SymbolU32>` stays for names. TIR still holds `&'ast` item
-      references in `AstEntry`, taken from the lists.
+      `Spanned<SymbolU32>` stays for names. TIR still held `&'ast` item
+      references in `AstEntry`, taken from the lists, until 4.4b.
 
       **4.4c, done.** The finished tree and its builder are two types:
       `AST` holds boxed slices fitted to their contents and only reads;
@@ -288,8 +288,12 @@ building.
       block's statements in place of `stmt_lists` was measured too and left
       out: that list is under 1% of the tree.
 
-      **4.4b**, next: TIR's `AstEntry` by id (`ItemId`, `ImplItemId`,
-      `TraitItemId`), read through the file's tree, without its lifetime.
+      **4.4b, done.** TIR's `AstEntry` names its node by id (`ItemId`,
+      `TraitItemId`, `ImplItemId`, and the new `EnumEntryId` and
+      `ImportEntryId`) and has no lifetime; a reader takes the node from the
+      entry's file (`ast.item(id)`), and `SemanticsBuilder::ast_entry`
+      replaces `ast_node`, since a node alone no longer says which tree it is
+      in. `SemanticsBuilder` keeps `'ast`: it still borrows the trees.
 
    The old and new forms coexist inside `Ast` while a step is in flight.
 5. The snapshot printer (with 4.3 at the latest, when the snapshots' trees

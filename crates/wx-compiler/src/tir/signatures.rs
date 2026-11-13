@@ -478,7 +478,7 @@ pub(super) struct SemanticsBuilder<'ast> {
 	/// The only interning checking does is a string literal's contents.
 	pub(super) strings: &'ast mut StringInterner,
 	/// The prescan's declarations, in parse order (`Declarations::build`).
-	entries: &'ast [AstEntry<'ast>],
+	entries: &'ast [AstEntry],
 	query_state: FxHashMap<SignatureQuery, QueryEntry>,
 	/// In-progress queries, in call order.
 	query_stack: Vec<QueryInfo>,
@@ -1600,7 +1600,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		files: &'ast Files,
 		asts: &'ast [ast::AST],
 		strings: &'ast mut StringInterner,
-		entries: &'ast [AstEntry<'ast>],
+		entries: &'ast [AstEntry],
 	) -> Self {
 		let query_state = entries
 			.iter()
@@ -1748,37 +1748,44 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// diagnostics come out in.
 	fn check_bodies(&mut self, sema: &mut Semantics) {
 		for entry in self.entries {
+			let ast = self.ast(entry.file_id);
 			match entry.node {
-				AstNodeRef::Function {
-					item:
-						ast::Item::Function {
-							signature, block, ..
-						},
-					..
-				} => self.check_function_body(sema, entry, signature, *block),
-				// A required trait method has no block.
-				AstNodeRef::TraitFunction {
-					item:
-						ast::TraitItem::Function {
-							signature,
-							body: Some(block),
-							..
-						},
-					..
-				} => self.check_function_body(sema, entry, signature, *block),
+				AstNodeRef::Function { item, .. } => {
+					if let ast::Item::Function {
+						signature, block, ..
+					} = ast.item(item)
+					{
+						self.check_function_body(
+							sema, entry, &signature, block,
+						);
+					}
+				}
+				AstNodeRef::TraitFunction { item, .. } => {
+					// A required trait method has no block.
+					if let ast::TraitItem::Function {
+						signature,
+						body: Some(block),
+						..
+					} = ast.trait_item(item)
+					{
+						self.check_function_body(
+							sema, entry, &signature, block,
+						);
+					}
+				}
 				AstNodeRef::TraitImplFunction { item, .. }
 				| AstNodeRef::InherentImplFunction { item, .. } => {
 					if let ast::ImplItem::Function {
 						signature, block, ..
-					} = item
+					} = ast.impl_item(item)
 					{
 						self.check_function_body(
-							sema, entry, signature, *block,
+							sema, entry, &signature, block,
 						);
 					}
 				}
 				AstNodeRef::Global { global_index, item } => {
-					let ast::Item::Global { value, .. } = item else {
+					let ast::Item::Global { value, .. } = ast.item(item) else {
 						unreachable!("a global's entry is a global")
 					};
 					let owner = BodyOwner::Global(global_index);
@@ -1787,7 +1794,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					let reported = sema.diagnostics.len();
 					let (mut body, obligations) =
 						BodyBuilder::new(sema, self, scope, owner)
-							.check_body(*value, ty);
+							.check_body(value, ty);
 					BodyContext::new(sema, &self.strings, &mut body, scope)
 						.decide(obligations);
 					sema.global_bodies[usize::from(global_index)] =
@@ -1807,7 +1814,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 	fn check_function_body(
 		&mut self,
 		sema: &mut Semantics,
-		entry: &AstEntry<'_>,
+		entry: &AstEntry,
 		signature: &ast::FunctionSignature,
 		block: ast::BlockId,
 	) {
@@ -2193,7 +2200,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema.types.intern_struct(struct_index, &args)
 	}
 
-	/// `query`'s own `AstNodeRef` — `decls.rs`'s output, so this is pure
+	/// `query`'s own entry, its file and node — `decls.rs`'s output, so this is pure
 	/// identity: reading it never forces `ensure_signature` and is valid
 	/// the moment `Semantics` exists, before any query has run at
 	/// all. This is how a pre-seeded kind's own index
@@ -2201,8 +2208,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// without forcing that item's signature — the six pre-seeded kinds no
 	/// longer get an early `SignatureLocation` seeded into `query_state`;
 	/// they get this instead, which was already sitting there.
-	pub(super) fn ast_node(&self, query: SignatureQuery) -> &AstNodeRef<'ast> {
-		&self.entries[self.ast_index(query) as usize].node
+	pub(super) fn ast_entry(&self, query: SignatureQuery) -> &AstEntry {
+		&self.entries[self.ast_index(query) as usize]
 	}
 
 	/// The declaration's position in parse order, which is definition order.
@@ -2555,8 +2562,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let query = SignatureQuery::Const(const_index);
 		let entry = &self.entries[self.query_state[&query].ast_index as usize];
 		let scope = sema.owner_scope(BodyOwner::Const(const_index));
+		let ast = self.ast(entry.file_id);
 		let value = match entry.node {
-			AstNodeRef::Constant { item, .. } => match item {
+			AstNodeRef::Constant { item, .. } => match ast.item(item) {
 				ast::Item::Const { value, .. } => value,
 				ast::Item::PackageConst { .. } => {
 					sema.const_bodies[usize::from(const_index)] =
@@ -2566,7 +2574,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				_ => unreachable!(),
 			},
 			AstNodeRef::TraitConst { item, .. } => {
-				let ast::TraitItem::Const { value, .. } = item else {
+				let ast::TraitItem::Const { value, .. } = ast.trait_item(item)
+				else {
 					unreachable!()
 				};
 				// A required trait constant has no initializer.
@@ -2579,14 +2588,21 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			AstNodeRef::TraitImplConstant { item, .. }
 			| AstNodeRef::InherentImplConst { item, .. } => {
-				let ast::ImplItem::Constant { value, .. } = item else {
+				let ast::ImplItem::Constant { value, .. } = ast.impl_item(item)
+				else {
 					unreachable!()
 				};
 				value
 			}
 			AstNodeRef::EnumVariant {
-				enum_index, item, ..
+				enum_index,
+				variant,
+				..
 			} => {
+				let ast::EnumEntry::Variant(variant) = ast.enum_entry(variant)
+				else {
+					unreachable!("a variant's entry is a variant")
+				};
 				let repr = sema.enum_repr(enum_index);
 				// The run is contiguous (`EnumDecl::variants`), so the variant
 				// before this one is the constant before it.
@@ -2600,7 +2616,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					scope,
 					BodyOwner::Const(const_index),
 				)
-				.check_variant_value(item, previous, repr);
+				.check_variant_value(&variant, previous, repr);
 				sema.keep_const_body(const_index, body, obligations);
 				return;
 			}
@@ -2609,7 +2625,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let ty = sema.constants[usize::from(const_index)].ty;
 		let (body, obligations) =
 			BodyBuilder::new(sema, self, scope, BodyOwner::Const(const_index))
-				.check_body(*value, ty);
+				.check_body(value, ty);
 		sema.keep_const_body(const_index, body, obligations);
 	}
 
@@ -2708,13 +2724,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 		obligations: &mut Vec<TypeObligation>,
 		file_id: FileId,
 		namespace: Scope,
-		ast_node: AstNodeRef<'_>,
+		ast_node: AstNodeRef,
 	) -> SignatureLocation {
+		let ast = self.ast(file_id);
 		match ast_node {
 			AstNodeRef::TypeAlias {
 				item,
 				type_alias_index,
 			} => {
+				let item = &ast.item(item);
 				let (name, type_params, body, crate_member) = match item {
 					ast::Item::TypeAlias {
 						name,
@@ -2788,6 +2806,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				SignatureLocation::TypeAlias(type_alias_index)
 			}
 			AstNodeRef::Constant { const_index, item } => {
+				let item = &ast.item(item);
 				let (name, ty) = match item {
 					ast::Item::Const { name, ty, .. } => (*name, *ty),
 					ast::Item::PackageConst { name, ty, .. } => {
@@ -2807,6 +2826,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			AstNodeRef::Trait { trait_index, item } => {
+				let item = &ast.item(item);
 				let ast::Item::Trait {
 					name, supertraits, ..
 				} = item
@@ -2868,6 +2888,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				item,
 				function_index,
 			} => {
+				let item = &ast.trait_item(item);
 				let ast::TraitItem::Function { signature, .. } = item else {
 					unreachable!()
 				};
@@ -2904,6 +2925,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				trait_index,
 				item,
 			} => {
+				let item = &ast.trait_item(item);
 				let ast::TraitItem::Const { ty, .. } = item else {
 					unreachable!()
 				};
@@ -2939,6 +2961,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				trait_index,
 				item,
 			} => {
+				let item = &ast.trait_item(item);
 				let ast::TraitItem::AssociatedType {
 					name,
 					bounds,
@@ -3014,6 +3037,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				block_index,
 				function_index,
 			} => {
+				let item = &ast.impl_item(item);
 				let ast::ImplItem::Function { signature, .. } = item else {
 					unreachable!()
 				};
@@ -3044,6 +3068,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				block_index,
 				const_index,
 			} => {
+				let item = &ast.impl_item(item);
 				let ast::ImplItem::Constant { name, ty, .. } = item else {
 					unreachable!()
 				};
@@ -3075,6 +3100,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				item,
 				block_index,
 			} => {
+				let item = &ast.impl_item(item);
 				let ast::ImplItem::AssocType { ty, .. } = item else {
 					unreachable!()
 				};
@@ -3128,6 +3154,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				SignatureLocation::AssocType(assoc_type_index)
 			}
 			AstNodeRef::Memory { memory_index, item } => {
+				let item = &ast.item(item);
 				let ast::Item::Memory { name, size, .. } = item else {
 					unreachable!()
 				};
@@ -3143,9 +3170,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			AstNodeRef::ImportedMemory {
 				memory_index,
-				import_block,
+				import_entry,
 				..
 			} => {
+				let ast::ImportEntry::Declaration {
+					declaration: import_block,
+					..
+				} = &ast.import_entry(import_entry)
+				else {
+					unreachable!("an imported declaration's entry")
+				};
 				let ast::ImportDeclaration::Memory { name, size, .. } =
 					import_block
 				else {
@@ -3162,6 +3196,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			AstNodeRef::Global { global_index, item } => {
+				let item = &ast.item(item);
 				let ast::Item::Global {
 					name, ty, mut_span, ..
 				} = item
@@ -3218,9 +3253,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			AstNodeRef::ImportedGlobal {
 				global_index,
-				import_block,
+				import_entry,
 				..
 			} => {
+				let ast::ImportEntry::Declaration {
+					declaration: import_block,
+					..
+				} = &ast.import_entry(import_entry)
+				else {
+					unreachable!("an imported declaration's entry")
+				};
 				let ast::ImportDeclaration::Global {
 					name, ty, mut_span, ..
 				} = import_block
@@ -3262,6 +3304,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			AstNodeRef::Struct { struct_index, item } => {
+				let item = &ast.item(item);
 				let ast::Item::Struct {
 					type_params: ast_type_params,
 					fields,
@@ -3330,6 +3373,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				item,
 				func_index: function_index,
 			} => {
+				let item = &ast.item(item);
 				let (ast::Item::Function { signature, .. }
 				| ast::Item::FunctionDeclaration { signature, .. }
 				| ast::Item::PackageFunction { signature, .. }) = item
@@ -3351,9 +3395,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			AstNodeRef::ImportedFunction {
 				function_index,
-				import_block,
+				import_entry,
 				import_index,
 			} => {
+				let ast::ImportEntry::Declaration {
+					declaration: import_block,
+					..
+				} = &ast.import_entry(import_entry)
+				else {
+					unreachable!("an imported declaration's entry")
+				};
 				let ast::ImportDeclaration::Function { signature, .. } =
 					import_block
 				else {
@@ -3371,6 +3422,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			AstNodeRef::InherentImplBlock { item, block_index } => {
+				let item = &ast.item(item);
 				let ast::Item::InherentImpl {
 					type_params,
 					target,
@@ -3421,6 +3473,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				block_index,
 				function_index,
 			} => {
+				let item = &ast.impl_item(item);
 				let ast::ImplItem::Function { signature, .. } = item else {
 					unreachable!()
 				};
@@ -3457,6 +3510,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				item,
 				block_index,
 			} => {
+				let item = &ast.impl_item(item);
 				let ast::ImplItem::Constant { name, ty, .. } = item else {
 					unreachable!()
 				};
@@ -3487,6 +3541,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			AstNodeRef::TraitImplBlock { item, block_index } => {
+				let item = &ast.item(item);
 				let ast::Item::TraitImpl {
 					type_params,
 					target,
@@ -3564,6 +3619,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				SignatureLocation::TraitImpl(block_index)
 			}
 			AstNodeRef::Enum { enum_index, item } => {
+				let item = &ast.item(item);
 				let ast::Item::Enum {
 					repr,
 					name,
@@ -3652,6 +3708,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				typeset_index,
 				item,
 			} => {
+				let item = &ast.item(item);
 				let ast::Item::TypeSet {
 					name,
 					bounds,
@@ -7853,7 +7910,9 @@ pub(super) mod tests {
 		};
 		assert_ne!(declaration, provider);
 		assert!(matches!(
-			builder.ast_node(SignatureQuery::AssocType(declaration)),
+			builder
+				.ast_entry(SignatureQuery::AssocType(declaration))
+				.node,
 			AstNodeRef::TraitAssocType { .. }
 		));
 		(declaration, provider, reference)

@@ -23,12 +23,12 @@ use crate::{
 	vfs::{FileId, Files, Package, PackageId},
 };
 
-// `'ast` (borrowed by `ast_nodes`) is kept separate from `'ctx`
+// `'ast` (the packages and the trees) is kept separate from `'ctx`
 // (`diagnostics`/`strings`/`files`) so that building a registry doesn't pin
 // down how long the caller's diagnostics list or string interner stay
-// borrowed — only `packages` needs to outlive `ast_nodes`, which `build()`
-// hands back separately from the (lifetime-free) `Declarations`
-// itself, for Phase 2's demand-driven signature pass to walk.
+// borrowed. `build()` hands `ast_nodes` back beside `Declarations`, for
+// Phase 2's demand-driven signature pass to walk; each entry names its
+// node by id in its file's tree, so neither borrows the trees.
 struct DeclarationsBuilder<'ast, 'ctx> {
 	diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	strings: &'ctx mut StringInterner,
@@ -46,7 +46,7 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	namespaces: Namespaces,
 	modules: Vec<ModuleDecl>,
 	imports: Vec<ImportDecl>,
-	ast_nodes: Vec<AstEntry<'ast>>,
+	ast_nodes: Vec<AstEntry>,
 	exports: FxHashMap<SymbolU32, ExportEntrySource>,
 	import_entries: FxHashMap<ItemLoc, ImportEntry>,
 	package_contracts: Vec<PackageContract>,
@@ -710,126 +710,127 @@ impl DeclIdx {
 	pub(super) const SELF: Self = DeclIdx(0);
 }
 
+/// One declaration as written: its node, by id in the tree of `file_id`.
 #[derive(Clone)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub(super) struct AstEntry<'ast> {
+pub(super) struct AstEntry {
 	pub(super) file_id: FileId,
 	/// The scope the item is written in, where its signature resolves: for
 	/// an imported declaration, its import block's own scope.
 	pub(super) namespace: Scope,
-	pub(super) node: AstNodeRef<'ast>,
+	pub(super) node: AstNodeRef,
 }
 
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub(super) enum AstNodeRef<'ast> {
+pub(super) enum AstNodeRef {
 	Function {
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 		func_index: FunctionIdx,
 	},
 	Struct {
 		struct_index: StructIdx,
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 	},
 	Enum {
 		enum_index: EnumIdx,
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 	},
 	Global {
 		global_index: GlobalIdx,
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 	},
 	Memory {
 		memory_index: MemoryIdx,
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 	},
 	Constant {
 		const_index: ConstIdx,
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 	},
 	TypeSet {
 		typeset_index: TypesetIdx,
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 	},
 	TypeAlias {
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 		type_alias_index: TypeAliasIdx,
 	},
 	Trait {
 		trait_index: TraitIdx,
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 	},
 	TraitFunction {
 		trait_index: TraitIdx,
-		item: &'ast ast::TraitItem,
+		item: ast::TraitItemId,
 		function_index: FunctionIdx,
 	},
 	TraitConst {
 		const_index: ConstIdx,
 		trait_index: TraitIdx,
-		item: &'ast ast::TraitItem,
+		item: ast::TraitItemId,
 	},
 	EnumVariant {
 		const_index: ConstIdx,
 		enum_index: EnumIdx,
-		item: &'ast ast::EnumVariant,
+		variant: ast::EnumEntryId,
 	},
 	TraitAssocType {
 		assoc_type_index: AssocTypeIdx,
 		trait_index: TraitIdx,
-		item: &'ast ast::TraitItem,
+		item: ast::TraitItemId,
 	},
 	TraitImplBlock {
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 		block_index: TraitImplIdx,
 	},
 	TraitImplFunction {
-		item: &'ast ast::ImplItem,
+		item: ast::ImplItemId,
 		block_index: TraitImplIdx,
 		function_index: FunctionIdx,
 	},
 	TraitImplConstant {
 		const_index: ConstIdx,
-		item: &'ast ast::ImplItem,
+		item: ast::ImplItemId,
 		block_index: TraitImplIdx,
 	},
 	TraitImplAssocType {
 		assoc_type_index: AssocTypeIdx,
-		item: &'ast ast::ImplItem,
+		item: ast::ImplItemId,
 		block_index: TraitImplIdx,
 	},
 	InherentImplBlock {
-		item: &'ast ast::Item,
+		item: ast::ItemId,
 		block_index: InherentImplIdx,
 	},
 	InherentImplFunction {
-		item: &'ast ast::ImplItem,
+		item: ast::ImplItemId,
 		block_index: InherentImplIdx,
 		function_index: FunctionIdx,
 	},
 	InherentImplConst {
 		const_index: ConstIdx,
-		item: &'ast ast::ImplItem,
+		item: ast::ImplItemId,
 		block_index: InherentImplIdx,
 	},
 	ImportedMemory {
 		memory_index: MemoryIdx,
 		import_index: ImportIdx,
-		import_block: &'ast ast::ImportDeclaration,
+		import_entry: ast::ImportEntryId,
 	},
 	ImportedFunction {
 		function_index: FunctionIdx,
 		import_index: ImportIdx,
-		import_block: &'ast ast::ImportDeclaration,
+		import_entry: ast::ImportEntryId,
 	},
 	ImportedGlobal {
 		global_index: GlobalIdx,
 		import_index: ImportIdx,
-		import_block: &'ast ast::ImportDeclaration,
+		import_entry: ast::ImportEntryId,
 	},
 }
 
-impl AstNodeRef<'_> {
+impl AstNodeRef {
 	/// The declaration this entry writes.
 	pub(super) fn query(&self) -> SignatureQuery {
 		match *self {
@@ -2385,7 +2386,7 @@ impl Declarations {
 		resolutions: &mut NameResolutions,
 		core_package: PackageId,
 		root_package: PackageId,
-	) -> (Self, Vec<AstEntry<'ast>>) {
+	) -> (Self, Vec<AstEntry>) {
 		DeclarationsBuilder::build(
 			packages,
 			asts,
@@ -2416,7 +2417,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		resolutions: &mut NameResolutions,
 		core_package: PackageId,
 		root_package: PackageId,
-	) -> (Declarations, Vec<AstEntry<'ast>>) {
+	) -> (Declarations, Vec<AstEntry>) {
 		let mut namespaces = Namespaces::default();
 		for package in packages {
 			debug_assert_eq!(
@@ -2518,8 +2519,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		{
 			let scope = file_namespaces[source_module.file_id.as_usize()];
 			let ast = &asts[source_module.file_id.as_usize()];
-			for item in ast.list(ast.root) {
-				builder.scan_item(source_module.file_id, scope, item);
+			for id in ast.ids(ast.root) {
+				builder.scan_item(source_module.file_id, scope, id);
 			}
 		}
 
@@ -3377,9 +3378,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
-		item: &'ast ast::Item,
+		id: ast::ItemId,
 	) {
 		let ast = self.ast(file_id);
+		let item = &ast.item(id);
 		let attributes = match AttributeTarget::of_item(item) {
 			Some((target, attributes)) => {
 				self.scan_attributes(file_id, target, attributes)
@@ -3454,7 +3456,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::Function { item, func_index },
+					node: AstNodeRef::Function {
+						item: id,
+						func_index,
+					},
 				});
 			}
 			ast::Item::Global {
@@ -3503,7 +3508,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::Global { global_index, item },
+					node: AstNodeRef::Global {
+						global_index,
+						item: id,
+					},
 				});
 			}
 			ast::Item::Struct {
@@ -3597,7 +3605,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::Struct { struct_index, item },
+					node: AstNodeRef::Struct {
+						struct_index,
+						item: id,
+					},
 				});
 			}
 			ast::Item::Enum {
@@ -3608,11 +3619,11 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			} => {
 				// The variants among the entries, in written order, and the
 				// first `..`.
-				let variants: Vec<&ast::EnumVariant> = ast
-					.list(*entries)
-					.iter()
-					.filter_map(|entry| match entry {
-						ast::EnumEntry::Variant(variant) => Some(variant),
+				let variants: Vec<(ast::EnumEntryId, &ast::EnumVariant)> = ast
+					.ids(*entries)
+					.zip(ast.list(*entries))
+					.filter_map(|(id, entry)| match entry {
+						ast::EnumEntry::Variant(variant) => Some((id, variant)),
 						ast::EnumEntry::Rest => None,
 					})
 					.collect();
@@ -3636,7 +3647,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let first_variant =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				let mut variant_locs = Vec::with_capacity(variants.len());
-				for (offset, variant) in variants.iter().enumerate() {
+				for (offset, (_, variant)) in variants.iter().enumerate() {
 					let const_index = ConstIdx::new(
 						u32::from(first_variant)
 							+ u32::try_from(offset).unwrap(),
@@ -3680,12 +3691,15 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::Enum { enum_index, item },
+					node: AstNodeRef::Enum {
+						enum_index,
+						item: id,
+					},
 				});
 
 				// A variant's written value is read in the scope around the
 				// enum, like any constant's initializer.
-				for (offset, (&variant, variant_key)) in
+				for (offset, (&(entry, variant), variant_key)) in
 					variants.iter().zip(variant_locs).enumerate()
 				{
 					let const_index = ConstIdx::new(
@@ -3704,7 +3718,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						node: AstNodeRef::EnumVariant {
 							const_index,
 							enum_index,
-							item: variant,
+							variant: entry,
 						},
 					});
 				}
@@ -3759,7 +3773,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					file_id,
 					namespace,
 					node: AstNodeRef::TypeAlias {
-						item,
+						item: id,
 						type_alias_index,
 					},
 				});
@@ -3801,7 +3815,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::Memory { memory_index, item },
+					node: AstNodeRef::Memory {
+						memory_index,
+						item: id,
+					},
 				});
 			}
 			ast::Item::Const { pub_span, name, .. }
@@ -3838,7 +3855,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::Constant { const_index, item },
+					node: AstNodeRef::Constant {
+						const_index,
+						item: id,
+					},
 				});
 			}
 			ast::Item::Module {
@@ -3868,8 +3888,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					);
 				}
 
-				for item in ast.list(*items) {
-					self.scan_item(file_id, Scope::Module(module), item);
+				for id in ast.ids(*items) {
+					self.scan_item(file_id, Scope::Module(module), id);
 				}
 			}
 			// Nothing to do: Phase 1a already created this module's
@@ -3910,13 +3930,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::Trait { trait_index, item },
+					node: AstNodeRef::Trait {
+						trait_index,
+						item: id,
+					},
 				});
 
 				let mut members: Vec<TraitMemberDecl> = Vec::new();
 				let mut bindings: FxHashMap<BindingKey, MemberIdx> =
 					FxHashMap::default();
-				for item in ast.list(*items) {
+				for (member_id, item) in ast.ids(*items).zip(ast.list(*items)) {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (target, attributes) =
@@ -3963,7 +3986,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::TraitFunction {
 									trait_index,
-									item,
+									item: member_id,
 									function_index,
 								},
 							});
@@ -4001,7 +4024,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								node: AstNodeRef::TraitConst {
 									const_index,
 									trait_index,
-									item,
+									item: member_id,
 								},
 							});
 							(
@@ -4031,7 +4054,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								node: AstNodeRef::TraitAssocType {
 									assoc_type_index,
 									trait_index,
-									item,
+									item: member_id,
 								},
 							});
 							(
@@ -4149,9 +4172,14 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::InherentImplBlock { item, block_index },
+					node: AstNodeRef::InherentImplBlock {
+						item: id,
+						block_index,
+					},
 				});
-				for impl_item in ast.list(*items) {
+				for (member_id, impl_item) in
+					ast.ids(*items).zip(ast.list(*items))
+				{
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (target, attributes) =
@@ -4201,7 +4229,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::InherentImplFunction {
-									item: impl_item,
+									item: member_id,
 									block_index,
 									function_index,
 								},
@@ -4240,7 +4268,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::InherentImplConst {
 									const_index,
-									item: impl_item,
+									item: member_id,
 									block_index,
 								},
 							});
@@ -4347,8 +4375,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// Imported declarations are written inside the block: resolve
 				// their signatures (and synthetic impls) in its sibling scope.
 				let namespace = Scope::Import(import);
-				for (item, &item_span) in
-					ast.list(*entries).iter().zip(ast.spans(*entries))
+				for ((entry, item), &item_span) in ast
+					.ids(*entries)
+					.zip(ast.list(*entries))
+					.zip(ast.spans(*entries))
 				{
 					let (import_block, external_name) = match item {
 						ast::ImportEntry::Use { tree, pub_span } => {
@@ -4407,7 +4437,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								node: AstNodeRef::ImportedMemory {
 									memory_index,
 									import_index: import,
-									import_block,
+									import_entry: entry,
 								},
 							});
 						}
@@ -4464,7 +4494,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								node: AstNodeRef::ImportedFunction {
 									function_index,
 									import_index: import,
-									import_block,
+									import_entry: entry,
 								},
 							});
 						}
@@ -4522,7 +4552,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								node: AstNodeRef::ImportedGlobal {
 									global_index,
 									import_index: import,
-									import_block,
+									import_entry: entry,
 								},
 							});
 						}
@@ -4630,7 +4660,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					namespace,
 					node: AstNodeRef::TypeSet {
 						typeset_index,
-						item,
+						item: id,
 					},
 				});
 			}
@@ -4649,9 +4679,12 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.ast_nodes.push(AstEntry {
 					file_id,
 					namespace,
-					node: AstNodeRef::TraitImplBlock { item, block_index },
+					node: AstNodeRef::TraitImplBlock {
+						item: id,
+						block_index,
+					},
 				});
-				for item in ast.list(*items) {
+				for (member_id, item) in ast.ids(*items).zip(ast.list(*items)) {
 					let member_index =
 						MemberIdx::new(u32::try_from(members.len()).unwrap());
 					let (target, attributes) =
@@ -4697,7 +4730,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								node: AstNodeRef::TraitImplFunction {
-									item,
+									item: member_id,
 									block_index,
 									function_index,
 								},
@@ -4735,7 +4768,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::TraitImplConstant {
 									const_index,
-									item,
+									item: member_id,
 									block_index,
 								},
 							});
@@ -4765,7 +4798,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::TraitImplAssocType {
 									assoc_type_index,
-									item,
+									item: member_id,
 									block_index,
 								},
 							});
