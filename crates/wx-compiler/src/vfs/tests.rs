@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
+use crate::symbols::Keyword;
 use crate::testing::DiagnosticView;
 
 /// Builds a [`VirtualFileSource`] from `(path, source)` pairs.
@@ -25,27 +26,40 @@ pub(super) fn workspace(files: &[(&str, &str)]) -> VirtualFileSource {
 	)
 }
 
-/// One package loaded from virtual files, kept together with the builder
-/// that produced it so diagnostics can be rendered against its `Files`.
+/// One package loaded from virtual files and the inputs needed to inspect it.
 struct TestCase {
-	builder: CompilationUnitBuilder,
-	package: PackageId,
+	files: Files,
+	asts: Vec<ast::AST>,
+	strings: StringInterner,
+	package: Package,
 }
 
 impl TestCase {
-	/// Loads `files` as a binary package rooted at `entry`, which must be
+	/// Loads `files` as a package rooted at `entry`, which must be
 	/// readable — a missing entry file is a hard error rather than a
 	/// diagnostic, and has its own test.
 	fn binary(entry: &str, files: &[(&str, &str)]) -> Self {
-		let mut builder = CompilationUnitBuilder::new();
+		let mut strings = Keyword::create_interner();
+		let mut builder = CompilationUnitBuilder::new(&mut strings);
 		let package = builder
-			.load_binary(AbsolutePath::new(entry), &workspace(files))
+			.load_package(AbsolutePath::new(entry), &workspace(files))
 			.expect("the entry file is readable");
-		TestCase { builder, package }
+		let CompilationUnitBuilder {
+			files,
+			asts,
+			mut packages,
+			..
+		} = builder;
+		TestCase {
+			files,
+			asts,
+			strings,
+			package: packages.remove(package.as_usize()),
+		}
 	}
 
-	fn graph(&self) -> &PackageGraph {
-		&self.builder.packages[self.package.as_usize()]
+	fn graph(&self) -> &Package {
+		&self.package
 	}
 
 	/// Diagnostics raised while resolving this package's `mod` declarations
@@ -53,14 +67,10 @@ impl TestCase {
 	///
 	/// Scoped to the one package rather than going through
 	/// [`CompilationUnit::link_diagnostics`]: these tests stop at
-	/// `load_binary` and never `build()`, since building demands a stdlib
+	/// `load_package` and never `build()`, since building demands a core
 	/// that a single-package module-resolution test has no use for.
 	fn diagnostics(&self) -> DiagnosticView<'_> {
-		DiagnosticView::new(
-			"link",
-			&self.graph().diagnostics,
-			&self.builder.files,
-		)
+		DiagnosticView::new("link", &self.graph().diagnostics, &self.files)
 	}
 
 	fn root_module(&self) -> &SourceModule {
@@ -78,8 +88,7 @@ impl TestCase {
 	}
 
 	fn name(&self, symbol: SymbolU32) -> &str {
-		self.builder
-			.interner
+		self.strings
 			.resolve(symbol)
 			.expect("symbol was interned while loading")
 	}
@@ -127,7 +136,7 @@ fn as_absolute(path: &Path) -> AbsolutePath {
 fn load_package_parses_entry_file() {
 	let case = TestCase::binary(
 		"/main.wx",
-		&[("/main.wx", "mod math;"), ("/math.wx", "fn add() {} ")],
+		&[("/main.wx", "mod math;"), ("/math.wx", "func add() {} ")],
 	);
 	case.diagnostics().assert_none();
 	assert_eq!(case.graph().modules.len(), 2);
@@ -143,13 +152,84 @@ fn load_package_parses_entry_file() {
 
 #[test]
 fn load_package_reports_missing_entry_file() {
-	let mut builder = CompilationUnitBuilder::new();
+	let mut strings = Keyword::create_interner();
+	let mut builder = CompilationUnitBuilder::new(&mut strings);
 	assert_eq!(
-		builder.load_binary(AbsolutePath::new("/missing.wx"), &workspace(&[])),
+		builder.load_package(AbsolutePath::new("/missing.wx"), &workspace(&[])),
 		Err(()),
 		"expected missing entry file to be a fatal error, not a diagnostic \
 		 — there's no package to build without it"
 	);
+}
+
+#[test]
+fn compilation_units_share_a_caller_owned_interner() {
+	use crate::diagnostics::Diagnostics;
+	use indoc::indoc;
+
+	fn load(source: &str, strings: &mut StringInterner) -> CompilationUnit {
+		let mut builder = CompilationUnitBuilder::new(strings);
+		builder.load_core();
+		let root = builder
+			.load_package(
+				AbsolutePath::new("/main.wx"),
+				&workspace(&[("/main.wx", source)]),
+			)
+			.unwrap();
+		builder.build(root)
+	}
+
+	fn function_name(unit: &CompilationUnit) -> SymbolU32 {
+		let package = &unit.packages[unit.root_package.as_usize()];
+		let module = &package.modules[package.root.as_usize()];
+		let ast::Item::Function { signature, .. } =
+			unit.ast(module.file_id).list(unit.ast(module.file_id).root)[0]
+		else {
+			panic!("expected a function");
+		};
+		signature.name.inner
+	}
+
+	let mut strings = Keyword::create_interner();
+	let first = load(
+		indoc! {"
+		func shared(first_value: u32) -> u32 {
+			first_value
+		}
+		export shared
+	"},
+		&mut strings,
+	);
+	let shared = function_name(&first);
+	let second = load(
+		indoc! {"
+		func shared(second_value: u32) -> u32 {
+			second_value
+		}
+		export shared
+	"},
+		&mut strings,
+	);
+	assert_eq!(function_name(&second), shared);
+	assert_eq!(strings.resolve(shared), Some("shared"));
+	assert_ne!(strings.get("first_value"), strings.get("second_value"));
+	assert_eq!(strings.get("func"), Some(Keyword::Func.symbol()));
+
+	for unit in [&first, &second] {
+		assert!(!unit.collect_diagnostics().has_errors());
+		let sema = crate::tir::check(unit, &mut strings);
+		let diagnostics = sema.diagnostics();
+		assert!(!diagnostics.has_errors(), "{diagnostics:?}");
+	}
+	drop(second);
+	let mut sema = crate::tir::check(&first, &mut strings);
+	let mir = crate::tir::lower(&mut sema, &strings).ok();
+	let diagnostics = sema.diagnostics();
+	assert!(!diagnostics.has_errors(), "{diagnostics:?}");
+	let mut mir =
+		mir.expect("the first unit still lowers after interner growth");
+	crate::backend::emit(&mut mir, &strings, None)
+		.expect("shared symbols still encode");
 }
 
 #[test]
@@ -161,7 +241,7 @@ fn load_package_diagnoses_missing_child_module_without_aborting() {
 	// same file — still load normally.
 	let case = TestCase::binary(
 		"/main.wx",
-		&[("/main.wx", "mod boo;\nfn works() -> i32 { 1 }")],
+		&[("/main.wx", "mod boo;\nfunc works() -> i32 { 1 }")],
 	);
 
 	let root = case.root_module();
@@ -171,10 +251,12 @@ fn load_package_diagnoses_missing_child_module_without_aborting() {
 		"the unresolved `boo` module should be omitted, not present as a stub"
 	);
 	assert!(
-		root.ast.items.iter().any(|item| matches!(
-			&item.inner.inner,
-			ast::Item::Function { .. }
-		)),
+		{
+			let ast = &case.asts[root.file_id.as_usize()];
+			ast.list(ast.root)
+				.iter()
+				.any(|item| matches!(item, ast::Item::Function { .. }))
+		},
 		"the rest of main.wx should still parse normally"
 	);
 	case.diagnostics()
@@ -188,8 +270,8 @@ fn load_package_rejects_ambiguous_module_paths() {
 		"/main.wx",
 		&[
 			("/main.wx", "mod math;"),
-			("/math.wx", "fn from_file() {}"),
-			("/math/mod.wx", "fn from_dir() {}"),
+			("/math.wx", "func from_file() {}"),
+			("/math/mod.wx", "func from_dir() {}"),
 		],
 	);
 
@@ -210,11 +292,12 @@ fn load_package_resolves_module_directory_file() {
 	// would exercise actual directory traversal or path normalisation.
 	let dir = TempDir::new("dir-module-root");
 	let entry = dir.write("main.wx", "mod math;");
-	let child_path = dir.write("math/mod.wx", "fn add() {}");
+	let child_path = dir.write("math/mod.wx", "func add() {}");
 
-	let mut builder = CompilationUnitBuilder::new();
+	let mut strings = Keyword::create_interner();
+	let mut builder = CompilationUnitBuilder::new(&mut strings);
 	let package_id = builder
-		.load_binary(as_absolute(&entry), &NativeFileSource)
+		.load_package(as_absolute(&entry), &NativeFileSource)
 		.unwrap();
 	let graph = &builder.packages[package_id.as_usize()];
 
@@ -228,14 +311,15 @@ fn load_package_resolves_module_directory_file() {
 
 #[test]
 fn load_virtual_compilation_resolves_child_modules_from_workspace_files() {
-	let mut builder = CompilationUnitBuilder::new();
-	builder.load_stdlib();
+	let mut strings = Keyword::create_interner();
+	let mut builder = CompilationUnitBuilder::new(&mut strings);
+	builder.load_core();
 	let root_id = builder
-		.load_binary(
+		.load_package(
 			AbsolutePath::new("/src/main.wx"),
 			&workspace(&[
 				("/src/main.wx", "mod math;"),
-				("/src/math.wx", "fn add() {}"),
+				("/src/math.wx", "func add() {}"),
 			]),
 		)
 		.expect("failed to load package");
@@ -267,7 +351,7 @@ fn load_virtual_compilation_child_of_a_sibling_file_module_resolves_under_its_ow
 		&[
 			("/src/main.wx", "mod a;"),
 			("/src/a.wx", "mod shared;"),
-			("/src/shared.wx", "pub fn x() -> i32 { 1 }"),
+			("/src/shared.wx", "pub func x() -> i32 { 1 }"),
 		],
 	);
 
@@ -293,7 +377,7 @@ fn load_package_diagnoses_module_declaration_nested_inside_inline_module() {
 		"/main.wx",
 		&[(
 			"/main.wx",
-			"mod utils { mod extra; }\nfn works() -> i32 { 1 }",
+			"mod utils { mod extra; }\nfunc works() -> i32 { 1 }",
 		)],
 	);
 

@@ -1,0 +1,59 @@
+// Hello, world for a WASI host (`wasmtime run`, Node's `node:wasi`, ...).
+// WASI has no `print`: the program calls `fd_write` with a list of buffers.
+// Everything here is static data, so there is no allocator.
+memory heap: u32;
+
+// The descriptors every WASI program starts with. The host may hand out
+// others (from `path_open`, say), which this program does not use.
+enum FileDescriptor(u32) {
+    StdIn = 0,
+    StdOut = 1,
+    StdErr = 2,
+}
+
+// What every WASI function returns: 0 on success, otherwise an error code.
+// These are the ones a write can fail with; the full list of 77 is in
+// `examples/wasi_preview1_port`. The host may return a code not listed here,
+// so the enum ends in `..`: it is open, every `u16` is a valid `Errno`, and a
+// `match` on it needs a `_` arm.
+enum Errno(u16) {
+    Success = 0,
+    Again = 6,
+    Badf = 8,
+    Fault = 21,
+    Fbig = 22,
+    Intr = 27,
+    Inval = 28,
+    Io = 29,
+    Nospc = 51,
+    Perm = 63,
+    Pipe = 64,
+    ..
+}
+
+import "wasi_snapshot_preview1" as wasi {
+    use super::*;
+    func fd_write(
+        fd: FileDescriptor,
+        io_vecs: heap::&[heap::&[u8]],
+        bytes_written: heap::*u32,
+    ) -> Errno;
+}
+
+func main() {
+    // A one-element list of buffers. In memory it is the pair (address,
+    // length) that WASI calls an iovec.
+    local io_vecs: heap::&[heap::&[u8]] = ["Hello, world!\n"];
+    // fd_write reports how many bytes it wrote through a pointer, so it needs
+    // a writable u32: the first word after the static data.
+    local written = heap::DATA_END;
+    match wasi::fd_write(FileDescriptor::StdOut, io_vecs, transmute(written)) {
+        Errno::Success => (),
+        _ => trap(),
+    }
+}
+
+export {
+    main as "_start",
+    heap as "memory",
+}

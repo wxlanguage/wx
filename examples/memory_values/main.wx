@@ -1,0 +1,12 @@
+// A struct value does not need an allocation or even a linear memory.
+// The host receives the two fields as two WebAssembly results.
+struct Reading(raw: i32, calibrated: i32);
+
+func calibrate(raw: i32, offset: i32) -> Reading {
+    local reading = Reading({ raw, calibrated: raw + offset });
+    reading
+}
+
+export {
+    calibrate,
+}

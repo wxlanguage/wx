@@ -1,0 +1,5 @@
+// Appended to main.wx by the runner, in a temporary package.
+// A rule table is bytes in `policy`; the packet parser takes bytes in `io`.
+func wrong_memory() -> Verdict {
+    decide(RULES)
+}

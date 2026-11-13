@@ -1,0 +1,979 @@
+//! Requirements a declaration's signature states, and the contexts that solve
+//! them. Construction lowers written syntax and never checks a bound; a site
+//! that needs one registers an `TypeObligation` with the signature being built,
+//! and the declaration keeps them. Checking the declaration, once every
+//! signature exists, checks them. A check never changes a stored signature: a
+//! failure is diagnosed and nothing is rewritten.
+//!
+//! A check runs on an `ObligationChecker`, which borrows only what checking
+//! may touch, through the module that owns its question (bound satisfaction,
+//! the solver's judgements); this module records requirements, dispatches
+//! checks, and reports what a solver could not finish.
+//!
+//! What is written inside a declaration (a constant's initializer, an enum's
+//! discriminants) is not an obligation: it is a body, checked by the body
+//! phase that follows this pass (`Semantics::check_bodies`).
+
+use codespan_reporting::diagnostic::Diagnostic;
+use string_interner::symbol::SymbolU32;
+
+use super::bounds::{AssumptionEnvIdx, BoundClauses};
+use super::decls::{AssocTypeIdx, TraitIdx};
+use super::literals::ConcreteType;
+use super::members::report_type_does_not_implement_trait;
+use super::signatures::Semantics;
+use super::solver::{
+	Definition, ImplMember, NormalizationDepth, ProjectionCycle, RewriteFlags,
+	SolverError, Verdict,
+};
+use super::types::{
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
+	TypeIndex,
+};
+use crate::ast::StringInterner;
+use crate::diagnostics::{DiagnosticCode, SourceSpan};
+use crate::vfs::FileId;
+
+/// Requirements refer to their eventual bound table, so a provisional table
+/// cannot lose inherited requirements that have not been published yet.
+#[derive(Clone, Copy)]
+pub(super) enum BoundRequirements {
+	/// What `env`'s item states in its own assumption env, for a use that
+	/// gives `args`, flat over `env`'s whole chain: a binding's value is
+	/// written in the declaration, so it may name any of them. A failure is
+	/// reported where the argument its clause is about is given.
+	Frame {
+		env: GenericEnvIdx,
+		args: GenericArgs,
+	},
+	/// The declared bounds of `declaration`, a member of `trait_index`, whose
+	/// `Self` is `receiver`.
+	AssociatedType {
+		declaration: AssocTypeIdx,
+		trait_index: TraitIdx,
+		receiver: TypeIndex,
+		/// The value checked against them.
+		value: TypeIndex,
+	},
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TypeObligation {
+	/// A method receives its enclosing `Self` by value or through exactly
+	/// one pointer. Compare after signatures exist so aliases and associated
+	/// types have their meaning, rather than inspecting the written syntax.
+	CheckReceiverType {
+		frame: GenericEnvIdx,
+		ty: TypeIndex,
+		self_type: TypeIndex,
+		reference: SourceSpan,
+	},
+	CheckBounds {
+		frame: GenericEnvIdx,
+		requirements: BoundRequirements,
+		reference: SourceSpan,
+		owner: GenericEnvOwner,
+	},
+	CheckTraitMembership {
+		frame: GenericEnvIdx,
+		subject: TypeIndex,
+		required: TraitIdx,
+		reference: SourceSpan,
+	},
+	/// A written type is normalized once, so a cycle or an exhausted budget
+	/// inside it is found even if nothing ever reads the type. The result is
+	/// discarded: the stored type stays as written.
+	CheckWellFormed {
+		frame: GenericEnvIdx,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	},
+	/// An impl member's value (its own, or the trait default it inherits) has a
+	/// meaning. Unlike `CheckWellFormed`, the judgement is the solver's, made
+	/// once whoever asks first (`Verdict`); this check reports the failure
+	/// the member owns, so a loop through definitions is reported once, where
+	/// it is defined, and readers of a poisoned value stay silent. `reference`
+	/// is the written value, or the impl's target for an inherited default.
+	CheckAssocValue {
+		member: ImplMember,
+		reference: SourceSpan,
+	},
+	/// A generic impl's requirements have a meaning: proving them for its own
+	/// parameters in its own scope does not need the impl itself. Like
+	/// `CheckAssocValue`, the judgement is the solver's, made once whoever
+	/// asks first; this check reports a loop the impl owns, once, at the bound
+	/// it closed in, and every selection of the impl stays silent.
+	/// `reference` is the impl's target, for a judgement that ran out of
+	/// budget.
+	CheckImplRequirements {
+		impl_kind: ImplKind,
+		reference: SourceSpan,
+	},
+	/// A constant written in a type is representable as its type `ty`, as
+	/// written: an array's length as its memory's `Size`. An abstract type is
+	/// any member of the typesets its bounds name, so the value must be
+	/// representable as every one of them, and the type works with each.
+	CheckConstantRepresentable {
+		frame: GenericEnvIdx,
+		ty: TypeIndex,
+		bits: u64,
+		reference: SourceSpan,
+	},
+	/// A constant named in a type (an array's length) has exactly the type its
+	/// position needs, `expected` as written: a constant of another type is a
+	/// mismatch, even one whose value would be representable. Both types are
+	/// compared normalized with every fact, so a constant either names is read;
+	/// a constant's body therefore records it for after the values exist.
+	CheckConstantType {
+		frame: GenericEnvIdx,
+		/// The `Type::ConstRef` the length names.
+		length: TypeIndex,
+		expected: TypeIndex,
+		reference: SourceSpan,
+	},
+	/// A type held by value (a parameter's, a result's, a function type's
+	/// part, a local's) is a `StackValue`. A field, a tuple's element and a
+	/// type argument need nothing: their container states what it needs.
+	CheckValueType {
+		frame: GenericEnvIdx,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	},
+	/// `Projection::name` was written, and the projection's declared bounds do
+	/// not name `name`. Whether its *value* has such a member depends on impls,
+	/// which construction cannot read, so the type was lowered to `ERROR` and
+	/// this decides what to say: a plain "no such member", or, when the value
+	/// does have one, that the trait must be named (with the spelling).
+	CheckProjectionMember {
+		frame: GenericEnvIdx,
+		projection: TypeIndex,
+		name: SymbolU32,
+		reference: SourceSpan,
+	},
+	/// A trait impl function's `Self` entry, `clauses` about the impl's
+	/// target, is normalized into what the function assumes
+	/// (`normalize_self_entry`). First in the function's run, so its other
+	/// checks read the completed env; `reference` is the entry's `Self`.
+	NormalizeSelfEntry {
+		frame: GenericEnvIdx,
+		clauses: BoundClauses,
+		reference: SourceSpan,
+	},
+}
+
+impl Semantics {
+	/// The diagnostic for a normalization that ran out of its recursion budget,
+	/// reported at `site`, the construct that asked.
+	pub(super) fn overflow_diagnostic(
+		&self,
+		site: SourceSpan,
+	) -> Diagnostic<FileId> {
+		Diagnostic::error()
+			.with_code(DiagnosticCode::TypeNormalizationOverflow.code())
+			.with_message("type normalization exceeded its recursion limit")
+			.with_label(site.primary_label())
+	}
+
+	/// The diagnostic for a projection that requires itself, reported at
+	/// `site`, the construct that asked.
+	pub(super) fn cycle_diagnostic(
+		&self,
+		strings: &StringInterner,
+		cycle: &ProjectionCycle,
+		site: SourceSpan,
+	) -> Diagnostic<FileId> {
+		let formatter = self.type_formatter(strings);
+		let mut diagnostic = Diagnostic::error()
+			.with_code(DiagnosticCode::CyclicAssociatedType.code())
+			.with_message(format!(
+				"cycle detected when normalizing `{}`",
+				formatter.display_type(cycle.projection)
+			))
+			.with_label(site.primary_label());
+		for step in cycle.steps.iter().copied() {
+			diagnostic = diagnostic.with_label(
+				site.secondary_label().with_message(format!(
+					"requires normalizing `{}`",
+					formatter.display_type(step)
+				)),
+			);
+		}
+		diagnostic
+	}
+}
+
+impl Semantics {
+	pub(super) fn check_obligation(
+		&mut self,
+		strings: &StringInterner,
+		obligation: &TypeObligation,
+	) -> Result<(), ()> {
+		match *obligation {
+			TypeObligation::CheckReceiverType {
+				frame,
+				ty,
+				self_type,
+				reference,
+			} => {
+				let env = self.assumption_envs.of_frame(frame);
+				let normalized = (|| {
+					let ty = self.normalize(
+						strings,
+						env,
+						ty,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					let self_type = self.normalize(
+						strings,
+						env,
+						self_type,
+						NormalizationDepth::Deep,
+						RewriteFlags::ALL,
+					)?;
+					Ok((ty, self_type))
+				})();
+				let (normalized, self_type) = match normalized {
+					Ok(types) => types,
+					Err(SolverError::Pending) => return Err(()),
+					// The written type's well-formedness check owns this error.
+					Err(_) => return Ok(()),
+				};
+				if !self.types.has_error(normalized)
+					&& !self.types.has_error(self_type)
+					&& normalized != self_type
+					&& !matches!(self.types.resolve(normalized), Type::Pointer { to, .. } if *to == self_type)
+				{
+					let name = self.type_formatter(strings).display_type(ty);
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(DiagnosticCode::InvalidSelfType.code())
+							.with_message(format!(
+								"invalid `self` parameter type: `{name}`"
+							))
+							.with_label(reference.primary_label().with_message(
+								"type of `self` must be `Self` or a type that dereferences to it",
+							))
+							.with_note(
+								"consider changing to `Self` or `*Self`",
+							),
+					);
+				}
+				Ok(())
+			}
+			TypeObligation::CheckBounds {
+				frame,
+				requirements,
+				reference,
+				owner,
+			} => match self.check_bound_requirements(
+				strings,
+				self.assumption_envs.of_frame(frame),
+				requirements,
+				reference,
+				owner,
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+			TypeObligation::CheckTraitMembership {
+				frame,
+				subject,
+				required,
+				reference,
+			} => {
+				match self.find_trait_impl_query(
+					strings,
+					self.assumption_envs.of_frame(frame),
+					subject,
+					required,
+				) {
+					Ok(Some(_)) => Ok(()),
+					Ok(None) => {
+						let diagnostic = report_type_does_not_implement_trait(
+							&self.type_formatter(strings),
+							reference.file_id,
+							reference.span,
+							subject,
+							required,
+						);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(strings, &cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+				}
+			}
+			TypeObligation::CheckWellFormed {
+				frame,
+				ty,
+				reference,
+			} => {
+				match self.normalize(
+					strings,
+					self.assumption_envs.of_frame(frame),
+					ty,
+					NormalizationDepth::Deep,
+					RewriteFlags::ALL,
+				) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(strings, &cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+				}
+			}
+			// A judgement the definition owns: its verdict holds the failure,
+			// whoever asked first.
+			TypeObligation::CheckAssocValue { member, reference } => {
+				// This check owns the judgement, so it asks once (which computes
+				// and memoizes the verdict) and reports the failure the verdict
+				// kept for it. A failure another definition owns was reported
+				// there and stays silent here. Only "not decided yet" is
+				// forwarded.
+				match self.assoc_value(strings, member, None) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+					Err(_) => {
+						match self.solver.verdict(Definition::Member(member)) {
+							Verdict::Resolved => Ok(()),
+							Verdict::Overflowed => {
+								self.diagnostics
+									.push(self.overflow_diagnostic(reference));
+								Ok(())
+							}
+							Verdict::Cyclic(cycle) => {
+								let diagnostic = self.cycle_diagnostic(
+									strings, cycle, reference,
+								);
+								self.diagnostics.push(diagnostic);
+								Ok(())
+							}
+							Verdict::Poisoned => Ok(()),
+							Verdict::Unchecked | Verdict::InProgress => {
+								unreachable!(
+									"a finished judgement has a verdict"
+								)
+							}
+						}
+					}
+				}
+			}
+			TypeObligation::CheckImplRequirements {
+				impl_kind,
+				reference,
+			} => {
+				// Like `CheckAssocValue`: ask once, then report the failure the
+				// impl's own verdict holds. Every selection of a failed impl
+				// stays silent.
+				match self.requirements_verdict(strings, impl_kind) {
+					Ok(()) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+					Err(_) => {
+						let definition = Definition::Requirements(impl_kind);
+						match self.solver.verdict(definition) {
+							Verdict::Resolved => Ok(()),
+							Verdict::Overflowed => {
+								self.diagnostics
+									.push(self.overflow_diagnostic(reference));
+								Ok(())
+							}
+							// Reported at the bound the loop closed in, not at the
+							// impl: that is the requirement that names the impl
+							// again.
+							Verdict::Cyclic(cycle) => {
+								let bound = cycle.bound.expect(
+									"an impl's requirements own a loop in a bound",
+								);
+								let diagnostic = self.cycle_diagnostic(
+									strings,
+									cycle,
+									self.bounds.span(bound),
+								);
+								self.diagnostics.push(diagnostic);
+								Ok(())
+							}
+							Verdict::Poisoned => Ok(()),
+							Verdict::Unchecked | Verdict::InProgress => {
+								unreachable!(
+									"a finished judgement has a verdict"
+								)
+							}
+						}
+					}
+				}
+			}
+			TypeObligation::CheckConstantRepresentable {
+				frame,
+				ty,
+				bits,
+				reference,
+			} => match self.check_constant_representable(
+				strings,
+				self.assumption_envs.of_frame(frame),
+				ty,
+				bits,
+				reference,
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+			TypeObligation::CheckConstantType {
+				frame,
+				length,
+				expected,
+				reference,
+			} => match self.check_constant_type(
+				strings,
+				self.assumption_envs.of_frame(frame),
+				length,
+				expected,
+				reference,
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+			TypeObligation::CheckValueType {
+				frame,
+				ty,
+				reference,
+			} => {
+				match self.check_value_type(
+					strings,
+					self.assumption_envs.of_frame(frame),
+					ty,
+					reference,
+				) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(strings, &cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
+				}
+			}
+			TypeObligation::NormalizeSelfEntry {
+				frame,
+				clauses,
+				reference,
+			} => match self.normalize_self_entry(strings, frame, clauses) {
+				Ok(()) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+			TypeObligation::CheckProjectionMember {
+				frame,
+				projection,
+				name,
+				reference,
+			} => match self.check_projection_member(
+				strings,
+				self.assumption_envs.of_frame(frame),
+				projection,
+				name,
+				reference,
+			) {
+				Ok(_) => Ok(()),
+				Err(SolverError::Cycle(cycle)) => {
+					let diagnostic =
+						self.cycle_diagnostic(strings, &cycle, reference);
+					self.diagnostics.push(diagnostic);
+					Ok(())
+				}
+				Err(SolverError::Overflow) => {
+					self.diagnostics.push(self.overflow_diagnostic(reference));
+					Ok(())
+				}
+				Err(SolverError::Poisoned) => Ok(()),
+				Err(SolverError::Pending) => Err(()),
+			},
+		}
+	}
+}
+
+impl Semantics {
+	/// `bits` is representable as `ty`: an integer type, or every member of
+	/// every typeset an abstract one is bounded by.
+	fn check_constant_representable(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+		bits: u64,
+		reference: SourceSpan,
+	) -> Result<(), SolverError> {
+		let ty = self.normalize(
+			strings,
+			assumption_context,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)?;
+		for concrete in self.concrete_types(assumption_context, ty) {
+			if concrete.holds_integer(i128::from(bits)).is_ok() {
+				continue;
+			}
+			// A length's type is a memory's `Size`: an integer type, or the
+			// members of `PointerSize`.
+			let diagnostic = match concrete {
+				ConcreteType::Member(typeset, member) => self
+					.report_typeset_member(
+						strings,
+						format_args!("`{bits}`"),
+						typeset,
+						member,
+						reference,
+					),
+				ConcreteType::Target(_) => self.report_out_of_range(
+					strings,
+					format_args!("`{bits}`"),
+					ty,
+					reference,
+				),
+			};
+			self.diagnostics.push(diagnostic);
+			return Err(SolverError::Poisoned);
+		}
+		Ok(())
+	}
+
+	/// `ty` may be held by value: it is a `StackValue`.
+	pub(super) fn check_value_type(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+		reference: SourceSpan,
+	) -> Result<(), SolverError> {
+		match self.stack_value_repr(strings, assumption_context, ty) {
+			Ok(_) => return Ok(()),
+			Err(SolverError::Poisoned) => {}
+			Err(error) => return Err(error),
+		}
+		let Some(part) =
+			self.explain_non_stack_value(strings, assumption_context, ty)?
+		else {
+			return Err(SolverError::Poisoned);
+		};
+		self.diagnostics.push(
+			self.not_stack_value_diagnostic(strings, ty, part, reference),
+		);
+		Err(SolverError::Poisoned)
+	}
+
+	/// `ty`, held by value at `reference`, is no `StackValue` because of
+	/// `part` (`explain_non_stack_value`).
+	pub(super) fn not_stack_value_diagnostic(
+		&self,
+		strings: &StringInterner,
+		ty: TypeIndex,
+		part: TypeIndex,
+		reference: SourceSpan,
+	) -> Diagnostic<FileId> {
+		let formatter = self.type_formatter(strings);
+		let (found, part_name) =
+			(formatter.display_type(ty), formatter.display_type(part));
+		let (label, note) = match self.types.resolve(part) {
+			Type::Slice { .. } => (
+				"a slice",
+				format!(
+					"`{part_name}` is a slice, which only a pointer holds, as \
+					 `M::&{part_name}`"
+				),
+			),
+			Type::Array { .. } => (
+				"an array",
+				format!(
+					"`{part_name}` is an array, which only a pointer holds, \
+					 as `M::&{part_name}`"
+				),
+			),
+			_ => (
+				"not a `StackValue`",
+				format!(
+					"`{part_name}` is not known to be a `StackValue`: \
+					 require `{part_name}: StackValue`"
+				),
+			),
+		};
+		let message = if part == ty {
+			format!("`{found}` cannot be held by value")
+		} else {
+			format!(
+				"`{found}` cannot be held by value, since it holds \
+				 `{part_name}`"
+			)
+		};
+		Diagnostic::error()
+			.with_code(DiagnosticCode::NotStackValue.code())
+			.with_message(message)
+			.with_label(reference.primary_label().with_message(label))
+			.with_note(note)
+	}
+
+	/// The constant's type, in its own scope, is `expected`, in the scope
+	/// the constant is named in.
+	fn check_constant_type(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		length: TypeIndex,
+		expected: TypeIndex,
+		reference: SourceSpan,
+	) -> Result<(), SolverError> {
+		let Type::ConstRef {
+			constant,
+			type_args,
+		} = *self.types.resolve(length)
+		else {
+			unreachable!("a length checked for its type names a constant")
+		};
+		let signature = &self.constants[usize::from(constant)];
+		let (mut ty, frame) = (signature.ty, signature.env);
+		let mut env = self.assumption_envs.of_frame(frame);
+		// With its arguments, the declared type is read where it is named.
+		if !type_args.is_empty() {
+			let args: Box<[TypeIndex]> = self.types.list(type_args).into();
+			ty = self.types.substitute(
+				ty,
+				Substitution {
+					envs: &self.generic_envs,
+					env: frame,
+					args: &args,
+				},
+			);
+			env = assumption_context;
+		}
+		let found = self.normalize(
+			strings,
+			env,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)?;
+		let expected = self.normalize(
+			strings,
+			assumption_context,
+			expected,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)?;
+		if found == expected
+			|| found == TypeIndex::ERROR
+			|| expected == TypeIndex::ERROR
+		{
+			return Ok(());
+		}
+		// An untyped integer constant is a count: its value is representable as
+		// the length's type, as a literal length's does.
+		if found == TypeIndex::CONST_INT {
+			let Ok(value) = self.exact_value(strings, constant) else {
+				return Ok(());
+			};
+			return match u64::try_from(value) {
+				Ok(bits) => self.check_constant_representable(
+					strings,
+					assumption_context,
+					expected,
+					bits,
+					reference,
+				),
+				Err(_) => {
+					let message = format!(
+						"an array's length is a count, but `{}` is `{value}`",
+						strings
+							.resolve(self.decls.name(constant).inner)
+							.unwrap()
+					);
+					self.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::IntegerLiteralOutOfRange.code(),
+							)
+							.with_message(message)
+							.with_label(reference.primary_label()),
+					);
+					Err(SolverError::Poisoned)
+				}
+			};
+		}
+		let formatter = self.type_formatter(strings);
+		let (expected, found) = (
+			formatter.display_type(expected),
+			formatter.display_type(found),
+		);
+		let name = self.decls.name(constant).inner;
+		let name = strings.resolve(name).unwrap();
+		self.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypeMistmatch.code())
+				.with_message(format!(
+					"an array's length is a `{expected}`, but `{name}` is a \
+					 `{found}`"
+				))
+				.with_label(reference.primary_label().with_message(format!(
+					"expected `{expected}`, found `{found}`"
+				)))
+				.with_note("an array's length is of its memory's `Size`"),
+		);
+		Err(SolverError::Poisoned)
+	}
+}
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use indoc::indoc;
+
+	use super::*;
+	use crate::ast::Keyword;
+	use crate::testing::DiagnosticView;
+	use crate::vfs::{self, Files};
+
+	struct TestCase {
+		files: Files,
+		diagnostics: Vec<Diagnostic<FileId>>,
+	}
+
+	impl TestCase {
+		fn new(source: &str) -> Self {
+			let mut strings = Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
+			builder.load_core();
+			let root = builder
+				.load_package(
+					vfs::AbsolutePath::new("/main.wx"),
+					&vfs::VirtualFileSource::from_relative(HashMap::from([(
+						"main.wx".to_string(),
+						source.to_string(),
+					)])),
+				)
+				.unwrap();
+			let graph = builder.build(root);
+			DiagnosticView::new(
+				"parse/link",
+				&graph.collect_diagnostics(),
+				&graph.files,
+			)
+			.assert_no_errors();
+			let sema = crate::tir::check(&graph, &mut strings);
+			Self {
+				files: graph.files,
+				diagnostics: sema.diagnostics,
+			}
+		}
+
+		fn diagnostics(&self) -> DiagnosticView<'_> {
+			DiagnosticView::new("check", &self.diagnostics, &self.files)
+		}
+	}
+
+	#[test]
+	fn receiver_types_reject_unrelated_types_wrappers_and_double_pointers() {
+		for receiver in [
+			"u32",
+			"Other",
+			"Wrapper<Self>",
+			"heap::&heap::&Self",
+			"heap::&Other",
+		] {
+			let source = format!(
+				"memory heap: u32; struct S(); struct Other(); struct Wrapper<T>(T); \
+				 impl S {{ func bad(self: {receiver}) {{}} }}"
+			);
+			let case = TestCase::new(&source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::InvalidSelfType]);
+			let diagnostic = &case.diagnostics[0];
+			assert!(
+				diagnostic
+					.message
+					.starts_with("invalid `self` parameter type: `")
+			);
+			assert_eq!(
+				diagnostic.severity,
+				codespan_reporting::diagnostic::Severity::Error
+			);
+			assert_eq!(diagnostic.labels.len(), 1);
+			let label = &diagnostic.labels[0];
+			assert_eq!(
+				label.style,
+				codespan_reporting::diagnostic::LabelStyle::Primary
+			);
+			assert_eq!(
+				&case.files.get(label.file_id).unwrap().source
+					[label.range.clone()],
+				receiver
+			);
+			assert_eq!(
+				label.message,
+				"type of `self` must be `Self` or a type that dereferences to it"
+			);
+			assert_eq!(
+				diagnostic.notes,
+				["consider changing to `Self` or `*Self`"]
+			);
+		}
+	}
+
+	#[test]
+	fn receiver_types_are_checked_in_trait_declarations_and_impls() {
+		let case = TestCase::new(indoc! {"
+			trait Tr: StackValue { func bad(self: u32); }
+			struct S();
+			impl Tr for S { func bad(self: u32) {} }
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InvalidSelfType,
+			DiagnosticCode::InvalidSelfType,
+		]);
+	}
+
+	#[test]
+	fn receiver_types_accept_self_and_one_pointer_in_generic_methods() {
+		let case = TestCase::new(indoc! {"
+			memory heap: u32;
+			struct S<T>(T);
+			impl<T: StackValue> S<T> {
+				func explicit(self: Self) {}
+				func named(self: S<T>) {}
+				func shared(self: heap::&Self) {}
+				func exclusive(self: heap::*Self) {}
+				func generic<M: Memory>(self: M::&Self) {}
+				func associated(x: u32) {}
+			}
+			trait Tr: StackValue {
+				func shared<M: Memory>(self: M::&Self);
+				func exclusive<M: Memory>(self: M::*Self);
+			}
+			func free(x: u32) {}
+		"});
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn receiver_types_read_aliases_and_later_associated_type_values() {
+		let case = TestCase::new(indoc! {"
+			memory heap: u32;
+			struct S();
+			impl S {
+				func alias(self: Alias) {}
+				func pointer_alias(self: Ref) {}
+				func projected(self: Self::This) {}
+				func pointer_projected(self: heap::&Self::This) {}
+			}
+			type Alias = S;
+			type Ref = heap::&S;
+			trait Identity { type This: StackValue; }
+			impl Identity for S { type This = S; }
+		"});
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn receiver_types_use_the_methods_self_refinements() {
+		let case = TestCase::new(indoc! {"
+			trait Tr: StackValue {
+				type This: StackValue;
+				func refined<Self: Tr where { This = Self }>(self: Self::This);
+			}
+		"});
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
+	fn receiver_types_do_not_add_errors_for_broken_types_or_positions() {
+		for (source, code) in [
+			(
+				"struct S(); impl S { func f(self: Missing) {} }",
+				DiagnosticCode::UndeclaredIdentifier,
+			),
+			(
+				"struct S(); impl S { func f(self: _) {} }",
+				DiagnosticCode::InferInSignature,
+			),
+			(
+				"struct S(); type Bad = Bad; impl S { func f(self: Bad) {} }",
+				DiagnosticCode::CyclicTypeAlias,
+			),
+			(
+				"struct S(); impl S { func f(x: u8, self: u32) {} }",
+				DiagnosticCode::SelfParamPosition,
+			),
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics().assert_codes(&[code]);
+		}
+	}
+}

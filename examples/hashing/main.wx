@@ -1,89 +1,198 @@
-use std::*;
+// Hashing in wx.
+//
+// Rust's `Hasher` mutates through `&mut self` and absorbs `&[u8]`. wx has no
+// `&mut` and wasm locals have no address, so neither half of that API maps
+// directly:
+//
+//  * The hasher is threaded by value: `write_*` takes `Self` and returns the
+//    updated hasher. This is the wx encoding of `&mut self`, and it works
+//    just as well for a stack hasher as for a handle into linear memory.
+//  * Stack values are absorbed as words. `write_bytes` is for data that is
+//    already in a memory (a slice, a string); a pointer to it is itself a
+//    stack value, so no allocation is needed to hash it.
+//
+// `finish` still returns a `u64`, exactly as in Rust.
 
-trait Hasher {
-  fn write<Mem: std::Memory>(self: Mem::*Self, bytes: Mem::&[u8]);
+trait Hasher: StackValue {
+    /// The only required state transition: absorb one byte.
+    func write_byte(self: Self, byte: u8) -> Self;
 
-  fn finish(self) -> u64;
+    /// Collapse the state to the final `u64`.
+    func finish(self: Self) -> u64;
 
-  #[inline]
-  fn hash<Mem: Memory, T: Hash>(self: Mem::*Self, value: Mem::&T) {
-    value.hash(self);
-  }
+    /// Absorb a 32-bit word as its four little-endian bytes.
+    #[inline]
+    func write_u32(self: Self, word: u32) -> Self {
+        local mut state = self;
+        local mut rest = u64_extend_u32(word);
+        local mut i: u64 = 0;
+        loop {
+            if i == 4 { break };
+            state = state.write_byte(low_byte(rest));
+            rest >>= 8;
+            i += 1;
+        }
+        state
+    }
+
+    /// Absorb a 64-bit word as its eight little-endian bytes.
+    #[inline]
+    func write_u64(self: Self, word: u64) -> Self {
+        local mut state = self;
+        local mut rest = word;
+        local mut i: u64 = 0;
+        loop {
+            if i == 8 { break };
+            state = state.write_byte(low_byte(rest));
+            rest >>= 8;
+            i += 1;
+        }
+        state
+    }
+
+    /// Absorb a run of bytes that already lives in a memory.
+    #[inline]
+    func write_bytes<Mem: Memory>(self: Self, bytes: Mem::&[u8]) -> Self {
+        local mut state = self;
+        local mut i: Mem::Size = 0;
+        loop {
+            if i == bytes.len() { break };
+            state = state.write_byte(bytes[i]);
+            i += 1;
+        }
+        state
+    }
+
+    /// Rust's `hasher.hash(value)`, with the state threaded through instead of
+    /// mutated through a pointer.
+    #[inline]
+    func hash<T: Hash>(self: Self, value: T) -> Self {
+        value.hash(self)
+    }
 }
 
-type Ptr<T: std::Memory> = T::&u8;
+/// A value that can feed itself to any hasher. It takes `Self` by value: every
+/// stored value can be read out of memory, but a wasm local cannot be pointed
+/// at, so by-value is the direction that works everywhere.
+trait Hash: StackValue {
+    func hash<H: Hasher>(self: Self, state: H) -> H;
+}
+
+/// The low byte of a word, used by the trait's derived word methods.
+#[inline]
+func low_byte(word: u64) -> u8 {
+    transmute::<i32, u8>(i32_wrap_i64(transmute::<u64, i64>(word & 0xff)))
+}
 
 // FNV-1a: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
 const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
 
-struct DefaultHasher {
-  value: u64,
+#[inline]
+func fnv_byte(hash: u64, byte: u64) -> u64 {
+    (hash ^ (byte & 0xff)) * FNV_PRIME
 }
 
-impl DefaultHasher {
-  pub fn new() -> Self {
-    Self::{ value: FNV_OFFSET_BASIS }
-  }
+struct Fnv(value: u64);
+
+impl Fnv {
+    pub func new() -> Self {
+        Self({ value: FNV_OFFSET_BASIS })
+    }
 }
 
-impl Hasher for DefaultHasher {
-  fn write<Mem: Memory>(self: Mem::*Self, bytes: Mem::&[u8]) {
-    local mut i: Mem::Size = 0;
-    loop {
-      if i == bytes.len() { break };
-      self.*.value ^= u64_extend_u32(bytes[i] as u32) * FNV_PRIME;
-      i += 1;
-    };
-  }
+// Only `write_byte` and `finish` are required. `write_u32`, `write_u64`,
+// `write_bytes` and `hash` are derived in the trait; a hasher may override the
+// word/byte-run methods as fast paths, as long as it computes the same hash the
+// default would.
+impl Hasher for Fnv {
+    #[inline]
+    func write_byte(self: Self, byte: u8) -> Self {
+        Self({
+            value: fnv_byte(
+                self.value,
+                u64_extend_u32(transmute::<u8, u32>(byte)),
+            ),
+        })
+    }
 
-  fn finish(self) -> u64 {
-    self.value
-  }
-}
-
-trait Hash {
-  fn hash<Mem: Memory, H: Hasher>(self: Mem::&Self, state: Mem::*H);
+    func finish(self: Self) -> u64 {
+        self.value
+    }
 }
 
 impl Hash for i32 {
-  fn hash<Mem: Memory, H: Hasher>(self: Mem::&Self, state: Mem::*H) {
-    local bytes =
-      slice_from_parts::<Mem, u8>(self as Mem::&u8, size_of::<i32, Mem>());
-    state.write(bytes);
-  }
-}
-
-memory heap: Memory where { Size = u32 };
-global mut bump: heap::*u8 = heap::DATA_END;
-
-struct BumpAllocator {}
-
-impl Allocator for BumpAllocator {
-  type Mem = heap;
-
-  fn reserve(self: heap::*Self, layout: Layout<heap>) -> heap::*u8 {
-    local ptr = ptr::align_up::<heap>(bump as u32, layout.align());
-    local new_end = ptr + layout.size();
-    local cur_end = heap.size_bytes();
-    if new_end > cur_end {
-      local needed = (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
-      if heap.grow(needed) == -1 { unreachable }
+    #[inline]
+    func hash<H: Hasher>(self: Self, state: H) -> H {
+        state.write_u32(transmute::<i32, u32>(self))
     }
-    bump = new_end as heap::*u8;
-    ptr as heap::*u8
-  }
 }
 
-fn hash_i32(value: i32) -> u64 {
-  local bump: heap::*BumpAllocator = ptr::null_mut();
-  local value = bump.alloc(value);
-  local hasher = bump.alloc(DefaultHasher::new());
-  hasher.hash(value);
-  hasher.*.finish()
+impl Hash for u32 {
+    #[inline]
+    func hash<H: Hasher>(self: Self, state: H) -> H {
+        state.write_u32(self)
+    }
+}
+
+impl Hash for u64 {
+    #[inline]
+    func hash<H: Hasher>(self: Self, state: H) -> H {
+        state.write_u64(self)
+    }
+}
+
+/// Structs hash field by field, never as their raw bytes: the layout's padding
+/// is not part of the value and may be uninitialized.
+struct Point(x: i32, y: i32);
+
+impl Hash for Point {
+    #[inline]
+    func hash<H: Hasher>(self: Self, state: H) -> H {
+        local s = state.write_u32(transmute::<i32, u32>(self.x));
+        s.write_u32(transmute::<i32, u32>(self.y))
+    }
+}
+
+#[memory_limits({ min_pages: 1 })]
+memory heap: u32;
+
+/// A string is a pointer into `heap`. The pointer is a stack value, so a
+/// `Str` is a `StackValue` and hashing one allocates nothing.
+struct Str(bytes: heap::&[u8]);
+
+impl Hash for Str {
+    func hash<H: Hasher>(self: Self, state: H) -> H {
+        // Length-prefix variable-length data, so nested values stay distinct.
+        local s = state.write_u32(self.bytes.len());
+        s.write_bytes(self.bytes)
+    }
+}
+
+/// Hash a stack `i32` without touching linear memory.
+func hash_i32(value: i32) -> u64 {
+    Fnv::new().hash(value).finish()
+}
+
+/// Same hasher, same `Hash` impl, a larger key.
+func hash_point(x: i32, y: i32) -> u64 {
+    Fnv::new().hash(Point(x, y)).finish()
+}
+
+/// A 64-bit key exercises the word sink's 64-bit path.
+func hash_u64(value: u64) -> u64 {
+    Fnv::new().hash(value).finish()
+}
+
+/// Bytes that already live in memory: only the pointer is on the stack.
+func hash_str(bytes: heap::&[u8]) -> u64 {
+    Fnv::new().hash(Str(bytes)).finish()
 }
 
 export {
-  heap as "memory",
-  hash_i32,
+    heap as "memory",
+    hash_i32,
+    hash_point,
+    hash_u64,
+    hash_str,
 }

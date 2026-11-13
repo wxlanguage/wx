@@ -17,14 +17,14 @@ export interface VfsDir {
 
 export type VfsNode = VfsFile | VfsDir;
 
-const DEFAULT_MAIN_WX = `use std::*;
+const DEFAULT_MAIN_WX = `use core::*;
 memory heap: Memory where { Size = u32 };
 
 import "console" {
-	fn log(message: heap::[]u8);
+	func log(message: heap::[]u8);
 }
 
-fn main() {
+func main() {
 	console::log("hello from wx!");
 }
 

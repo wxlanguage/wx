@@ -15,12 +15,12 @@
 //
 // Unlike `sinf`, there are no dedicated branches for the first few multiples of pi/2 here —
 // `rem_pio2` already special-cases those internally.
-use crate::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
+use package::{k_cos::k_cos, k_sin::k_sin, rem_pio2::rem_pio2};
 
 /// The sine of `x`, with `x` in radians.
 ///
 /// `sin(inf)`, `sin(-inf)` and `sin(NaN)` are all NaN.
-pub fn sin(x: f64) -> f64 {
+pub func sin(x: f64) -> f64 {
     // High 32 bits of `x` with the sign cleared — see `rem_pio2` on why this stays a `u64`.
     local ix = (x.to_bits() >> 32) & 0x7fffffff;
 
@@ -30,9 +30,9 @@ pub fn sin(x: f64) -> f64 {
             // |x| < 2**-26, where sin(x) rounds to x. The original raises the inexact and
             // underflow flags here; wasm has no floating-point exception flags to raise.
             return x;
-        };
+        }
         return k_sin(x, 0.0, 0);
-    };
+    }
 
     // sin(Inf or NaN) is NaN
     if ix >= 0x7ff00000 { return x - x };
@@ -40,9 +40,9 @@ pub fn sin(x: f64) -> f64 {
     // argument reduction needed
     local (n, y0, y1) = rem_pio2(x);
     match n & 3 {
-        0 -> { k_sin(y0, y1, 1) },
-        1 -> { k_cos(y0, y1) },
-        2 -> { -k_sin(y0, y1, 1) },
-        _ -> { -k_cos(y0, y1) }
+        0 => k_sin(y0, y1, 1),
+        1 => k_cos(y0, y1),
+        2 => -k_sin(y0, y1, 1),
+        _ => -k_cos(y0, y1),
     }
 }

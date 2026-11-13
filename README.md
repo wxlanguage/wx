@@ -43,6 +43,19 @@ cargo build --release -p wx-cli
 ./target/release/wx build .
 ```
 
+A minimal `wx.json` only needs an entry file:
+
+```json
+{ "entry": "main.wx" }
+```
+
+Every package can be imported or compiled to WebAssembly, with or without
+exports. Only the package providing the language's primitives, operator traits,
+and intrinsics declares `"type": "core"`; ordinary packages omit `type` and use
+the embedded core automatically. Its items are available through the prelude
+and the `core::` namespace. The former `"lib"`, `"bin"`, and `"std"` package types
+are no longer accepted.
+
 **Editor support**
 
 Search for "WX" in the VS Code Extensions view for syntax highlighting, diagnostics, completions, and formatting. Other editors aren't supported yet.
@@ -104,7 +117,7 @@ flowchart TB
 ### Pipeline stages
 
 - **Syntax Tree (AST)** — `ast::Parser::parse()`. Lexes and parses one file's source text into a syntax tree.
-- **Compilation Graph (VFS)** — `vfs::CompilationGraphBuilder`. Parses and assembles every file into a `CompilationGraph`; always loads `std/main.wx` first (`load_stdlib()`), then the user's files (`load_binary()`), enabling multi-file module compilation.
+- **Compilation Graph (VFS)** — `vfs::CompilationUnitBuilder`. Parses and assembles source files into a `CompilationUnit`; loads the embedded core (`load_core()`) unless the root provides it, then loads packages (`load_package()`), enabling multi-file compilation.
 - **Typed IR (TIR)** — `tir::TIR::build()`. Type checking, name resolution, and semantic validation across the whole compilation graph.
 - **Middle IR (MIR)** — `mir::MIR::build()`. Desugaring, monomorphization, and inlining + dead-code elimination.
 - **Optimizer (OPT)** — `opt::builder::Builder::build()`, run per function from inside codegen. Builds a sea-of-nodes SSA graph for optimization.

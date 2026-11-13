@@ -7,16 +7,16 @@ use codespan_reporting::files;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast;
-use crate::diagnostics::DiagnosticCode;
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::symbols::StringInterner;
 
 mod manifest;
 pub use manifest::{
 	DependencySource, FormatManifest, PackageManifest, PackageManifestKind,
-	PackageName,
 };
 
 mod resolve;
-pub use resolve::{open_manifest, open_manifest_with_manifests, package_kind};
+pub use resolve::{open_manifest, open_manifest_with_manifests};
 
 mod path;
 pub use path::{AbsolutePath, RelativePath};
@@ -27,14 +27,13 @@ mod tests;
 /// Which kind of backend produced a file's content. This is what an editor
 /// actually needs to know to address the file: a `Local` file has a real
 /// location on disk and can be opened directly via `file://`; a `Virtual`
-/// file has no such location (today: the embedded stdlib; potentially a
+/// file has no such location (today: the embedded core; potentially a
 /// future remote-fetched dependency) and must instead be served through our
 /// own `wx://` scheme. Deliberately binary rather than e.g. a third "remote"
 /// variant — from the editor's addressing perspective there are only ever
 /// these two cases.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum FileOrigin {
 	Local,
 	Virtual,
@@ -124,7 +123,7 @@ impl FileSource for VirtualFileSource {
 }
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct File {
 	pub name: String,
 	pub source: String,
@@ -148,8 +147,8 @@ impl File {
 	}
 }
 
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(Copy, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct FileId(u32);
 
 impl FileId {
@@ -160,7 +159,7 @@ impl FileId {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Files {
 	files: Vec<File>,
 }
@@ -258,8 +257,7 @@ impl<'files> files::Files<'files> for Files {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct ModuleId(u32);
 
 impl ModuleId {
@@ -275,8 +273,7 @@ impl ModuleId {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct PackageId(u32);
 
 impl PackageId {
@@ -302,7 +299,7 @@ pub struct ModuleDeclaration {
 	pub name: ast::Spanned<SymbolU32>,
 	/// Whether the declaration was `pub`. Independently optional — a
 	/// declaration that exists but isn't `pub` is a normal, valid state.
-	pub pub_span: Option<ast::TextSpan>,
+	pub pub_span: Option<TextSpan>,
 }
 
 pub struct SourceModule {
@@ -310,76 +307,72 @@ pub struct SourceModule {
 	pub children: Vec<ModuleId>,
 	/// `None` only for the package root, which has no declaring site.
 	pub declaration: Option<ModuleDeclaration>,
+	/// Its file, which is also how its syntax tree is found
+	/// ([`CompilationUnit::ast`]).
 	pub file_id: FileId,
 	pub file_path: AbsolutePath,
-	pub ast: ast::AST,
 }
 
-/// What a package *is*, as declared by its manifest — deliberately carries
-/// no name. A package's name is a property of the edge that reached it (see
-/// [`PackageGraph::dependencies`]), not of the package itself. The stdlib is
-/// not a kind either: it's an ordinary `Library` that additionally happens
-/// to be [`CompilationUnit::stdlib_package`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PackageKind {
-	/// Produces a WASM module and cannot be imported.
-	Binary,
-	/// Importable, and subject to the library restrictions (no `export`,
-	/// no `memory`, ...).
-	Library,
-}
-
-pub struct PackageGraph {
+pub struct Package {
 	pub id: PackageId,
 	pub root: ModuleId,
-	pub kind: PackageKind,
-	/// The other packages *this* package may refer to, keyed by the name it
-	/// refers to them by — its own `dependencies` keys, plus the implicit
-	/// `std`.
+	/// The packages this package's manifest declares, by the key it
+	/// declares them under. A key only *makes a package available*: nothing
+	/// is nameable in the source until a package instance,
+	/// `package "<key>" as <alias>;`, instantiates it, which is also what lets
+	/// one package be instantiated under several aliases, in any module. The core is registered here
+	/// first, as `core`, since every package depends on it.
 	///
-	/// A name lives here, on the edge, rather than on the target: the same
+	/// A key lives here, on the edge, rather than on the target: the same
 	/// package can legitimately be `foo` here and `bar` in another package's
-	/// map, and no package has a name of its own at all. Nothing outside
-	/// this map can name a package, which is what keeps a transitive
-	/// dependency invisible to anyone who didn't declare it.
-	///
-	/// Read these as an implicit `mod <key>;` at the top of the package's
-	/// entry file — that's exactly the meaning TIR gives them, and why a
-	/// local `mod foo;` colliding with a key here is an ordinary
-	/// duplicate definition rather than an ambiguity to arbitrate.
+	/// map, and no package has a name of its own at all.
 	pub dependencies: HashMap<SymbolU32, PackageId>,
-	/// Inverse of [`Self::dependencies`]. Well-defined only because
-	/// [`CompilationUnitBuilder::add_dependency`] keeps the mapping
-	/// injective: a package is declared under exactly one name here, which
-	/// is what makes that name its canonical one — it has none of its own.
-	pub dependency_names: HashMap<PackageId, SymbolU32>,
 	pub entry_path: AbsolutePath,
 	pub modules: Vec<SourceModule>,
 	pub diagnostics: Vec<Diagnostic<FileId>>,
 	pub path_to_module: HashMap<AbsolutePath, ModuleId>,
 }
 
+/// Parsed inputs. All symbols use the caller-owned interner supplied while
+/// loading; keep that interner available when interpreting these inputs.
 pub struct CompilationUnit {
 	pub files: Files,
-	pub packages: Vec<PackageGraph>,
+	/// Every file's syntax tree, by its [`FileId`]: each loaded file is
+	/// parsed once, as it is added, so a tree's position is its file's id.
+	pub asts: Vec<ast::AST>,
+	/// Every file's comments, by its [`FileId`], for the formatter and the
+	/// editor; the checker never reads them.
+	pub comments: Vec<ast::CommentMap>,
+	/// What parsing each file reported, by its [`FileId`].
+	pub parse_diagnostics: Vec<Vec<Diagnostic<FileId>>>,
+	pub packages: Vec<Package>,
 	pub root_package: PackageId,
-	/// The package providing the language's `#[tag = "..."]` items (the
-	/// twelve operator traits `resolve_operator_traits` looks up). Always
+	/// The package providing the items the language requires (its
+	/// primitives, operator traits and intrinsics, found by name). Always
 	/// present — see [`CompilationUnitBuilder::build`] for why this is not an
 	/// `Option`. Equal to `root_package` when the root package *is* the
-	/// stdlib.
-	pub stdlib_package: PackageId,
-	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
+	/// core.
+	pub core_package: PackageId,
 }
 
 impl CompilationUnit {
+	/// The syntax tree of `file`.
+	pub fn ast(&self, file: FileId) -> &ast::AST {
+		&self.asts[file.as_usize()]
+	}
+
+	/// The comments of `file`.
+	pub fn comments(&self, file: FileId) -> &ast::CommentMap {
+		&self.comments[file.as_usize()]
+	}
+
+	/// What parsing `file` reported.
+	pub fn parse_diagnostics(&self, file: FileId) -> &[Diagnostic<FileId>] {
+		&self.parse_diagnostics[file.as_usize()]
+	}
+
 	pub fn collect_parser_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
-		self.packages
-			.iter()
-			.flat_map(|package| package.modules.iter())
-			.flat_map(|module| module.ast.diagnostics.iter().cloned())
-			.collect()
+		self.parse_diagnostics.iter().flatten().cloned().collect()
 	}
 
 	pub fn collect_linker_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
@@ -394,10 +387,9 @@ impl CompilationUnit {
 			.iter()
 			.flat_map(|package| {
 				package.diagnostics.iter().chain(
-					package
-						.modules
-						.iter()
-						.flat_map(|module| module.ast.diagnostics.iter()),
+					package.modules.iter().flat_map(|module| {
+						self.parse_diagnostics(module.file_id).iter()
+					}),
 				)
 			})
 			.cloned()
@@ -405,64 +397,70 @@ impl CompilationUnit {
 	}
 }
 
-pub struct CompilationUnitBuilder {
+/// Temporary loader. Its single interner borrow ensures every loaded package
+/// uses the same symbol identities. Building releases the borrow.
+pub struct CompilationUnitBuilder<'strings> {
 	pub files: Files,
-	pub id_generator: ast::DefIdGenerator,
-	pub interner: ast::StringInterner,
-	pub packages: Vec<PackageGraph>,
-	/// Set once the stdlib exists, and seeded into every package loaded
-	/// afterwards as its implicit `std` dependency. `None` only while the
-	/// stdlib itself is being loaded — which is exactly what keeps it from
+	/// Each file's syntax tree, comments and parse diagnostics, pushed as
+	/// the file is added, so their position is the file's id.
+	pub asts: Vec<ast::AST>,
+	pub comments: Vec<ast::CommentMap>,
+	pub parse_diagnostics: Vec<Vec<Diagnostic<FileId>>>,
+	strings: &'strings mut StringInterner,
+	pub packages: Vec<Package>,
+	/// Set once the core exists, and seeded into every package loaded
+	/// afterwards as its implicit `core` dependency. `None` only while the
+	/// core itself is being loaded — which is exactly what keeps it from
 	/// depending on itself, with no check needed.
-	stdlib: Option<PackageId>,
+	core: Option<PackageId>,
 }
 
-/// Every `.wx` file under `std/`, embedded at build time as
-/// `("/"-prefixed path relative to `std/`, source)` and sorted by path.
+/// Every `.wx` file under `core/`, embedded at build time as
+/// `("/"-prefixed path relative to `core/`, source)` and sorted by path.
 /// Generated by `build.rs` — see there for why this is a directory walk
 /// rather than a hand-maintained list, and why the path is `/`-prefixed
-/// (matching `AbsolutePath`'s convention so `load_stdlib` can wrap each
+/// (matching `AbsolutePath`'s convention so `load_core` can wrap each
 /// entry directly, with no runtime string-patching to make it absolute).
 ///
 /// The un-prefixed remainder is exactly the key the module resolver looks
-/// up, so `std/math/mod.wx` appears here as `/math/mod.wx`, which is what a
+/// up, so `core/math/mod.wx` appears here as `/math/mod.wx`, which is what a
 /// `mod math;` declaration in `main.wx` resolves to.
-pub const STDLIB_FILES: &[(&str, &str)] =
-	include!(concat!(env!("OUT_DIR"), "/stdlib_files.rs"));
+pub const CORE_FILES: &[(&str, &str)] =
+	include!(concat!(env!("OUT_DIR"), "/core_files.rs"));
 
-/// Serves the embedded stdlib to the loader, reading straight out of
-/// [`STDLIB_FILES`].
+/// Serves the embedded core to the loader, reading straight out of
+/// [`CORE_FILES`].
 ///
 /// The alternative — copying the table into a [`VirtualFileSource`]'s map —
 /// builds an owned duplicate of sources already sitting in the binary, one
 /// that exists only to be read once and dropped. Reading the table directly
-/// keeps it the single place the stdlib's contents live.
+/// keeps it the single place the core's contents live.
 ///
-/// Files are tagged [`FileOrigin::Virtual`]: the stdlib has no on-disk home,
+/// Files are tagged [`FileOrigin::Virtual`]: the core has no on-disk home,
 /// and consumers key off `Local` to pick out the user's own files.
-pub struct StdlibFileSource;
+pub struct CoreFileSource;
 
-impl StdlibFileSource {
-	/// The source of one embedded stdlib file, keyed as in [`STDLIB_FILES`] —
+impl CoreFileSource {
+	/// The source of one embedded core file, keyed as in [`CORE_FILES`] —
 	/// `path` must already be `/`-prefixed (e.g.
 	/// `AbsolutePath::new("/math/mod.wx")`), same as every other consumer of
-	/// this convention; the caller (serving `wx://std/...` documents to the
+	/// this convention; the caller (serving `wx://core/...` documents to the
 	/// editor) is responsible for constructing one, same as any other
 	/// frontend.
 	///
-	/// Public because go-to-definition needs to land inside the stdlib
+	/// Public because go-to-definition needs to land inside the core
 	/// without it existing on disk, and because both trait methods below
 	/// want the same lookup — `exists` in particular, which would otherwise
 	/// have to allocate a whole `String` just to answer a yes/no.
 	pub fn source(path: &AbsolutePath) -> Option<&'static str> {
-		STDLIB_FILES
+		CORE_FILES
 			.iter()
 			.find(|(name, _)| *name == path.as_str())
 			.map(|(_, source)| *source)
 	}
 }
 
-impl FileSource for StdlibFileSource {
+impl FileSource for CoreFileSource {
 	fn read_to_string(&self, path: &AbsolutePath) -> Result<String, ()> {
 		Self::source(path).map(String::from).ok_or(())
 	}
@@ -476,81 +474,64 @@ impl FileSource for StdlibFileSource {
 	}
 }
 
-impl Default for CompilationUnitBuilder {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl CompilationUnitBuilder {
-	pub fn new() -> Self {
+impl<'strings> CompilationUnitBuilder<'strings> {
+	/// Uses one caller-owned interner for every package loaded by this builder.
+	/// It must be seeded with [`crate::symbols::Keyword::create_interner`].
+	/// Consuming the builder with [`Self::build`] releases its interner borrow;
+	/// the resulting compilation owns only parsed inputs.
+	pub fn new(strings: &'strings mut StringInterner) -> Self {
 		Self {
 			files: Files::new(),
-			id_generator: ast::DefIdGenerator::new(),
-			interner: ast::StringInterner::new(),
+			asts: Vec::new(),
+			comments: Vec::new(),
+			parse_diagnostics: Vec::new(),
+			strings,
 			packages: Vec::new(),
-			stdlib: None,
+			core: None,
 		}
 	}
 
-	/// Loads the embedded stdlib and marks it as this compilation's, so
-	/// every package loaded afterwards gets `std` seeded into its
+	/// Loads the embedded core and marks it as this compilation's, so
+	/// every package loaded afterwards gets `core` seeded into its
 	/// dependencies.
 	///
-	/// [`StdlibFileSource`] resolves reads against [`STDLIB_FILES`] on demand,
-	/// so the stdlib is an ordinary multi-file package from here on: `mod
+	/// [`CoreFileSource`] resolves reads against [`CORE_FILES`] on demand,
+	/// so the core is an ordinary multi-file package from here on: `mod
 	/// foo;` in `main.wx` resolves against the embedded table exactly as it
-	/// would against the filesystem for a user package. Adding a stdlib file
+	/// would against the filesystem for a user package. Adding a core file
 	/// needs no change here.
 	///
 	/// The entry point is embedded, so this can never actually hit the "entry
 	/// point unreadable" case `load_package` guards against.
-	pub fn load_stdlib(&mut self) -> PackageId {
+	pub fn load_core(&mut self) -> PackageId {
 		let id = self
-			.load_package(
-				PackageKind::Library,
-				AbsolutePath::new("/main.wx"),
-				&StdlibFileSource,
-			)
-			.expect("embedded stdlib source should always be readable");
-		self.set_stdlib(id);
+			.load_package(AbsolutePath::new("/main.wx"), &CoreFileSource)
+			.expect("embedded core source should always be readable");
+		self.set_core(id);
 		id
 	}
 
-	/// Marks an already-loaded package as this compilation's stdlib — used
-	/// by `open_manifest` when the root declares `"type": "std"` and so
+	/// Marks an already-loaded package as this compilation's core — used
+	/// by `open_manifest` when the root declares `"type": "core"` and so
 	/// provides the tagged items itself, which can't go through
-	/// [`Self::load_stdlib`] because its sources come from a manifest rather
-	/// than from [`STDLIB_FILES`].
+	/// [`Self::load_core`] because its sources come from a manifest rather
+	/// than from [`CORE_FILES`].
 	///
-	/// Must run before any package that should be able to name `std`: the
+	/// Must run before any package that should be able to name `core`: the
 	/// seed in [`Self::load_package`] only applies to packages loaded after
 	/// this point.
-	pub fn set_stdlib(&mut self, package: PackageId) {
-		self.stdlib = Some(package);
+	pub fn set_core(&mut self, package: PackageId) {
+		self.core = Some(package);
 	}
 
-	#[inline]
-	pub fn load_binary(
-		&mut self,
-		entry_path: AbsolutePath,
-		file_source: &impl FileSource,
-	) -> Result<PackageId, ()> {
-		self.load_package(PackageKind::Binary, entry_path, file_source)
-	}
-
-	/// Records that `owner` refers to `dependency` by `name`, diagnosing a
-	/// collision itself rather than handing one back.
+	/// Records that `owner`'s manifest declares `dependency` under `name`,
+	/// diagnosing a collision itself rather than handing one back.
 	///
-	/// A `dependencies` entry is a *declaration*, not an alias — it's what
-	/// introduces a package into the compilation, the way `mod foo;`
-	/// introduces a module. So the mapping is kept one-to-one in both
-	/// directions: declaring one package under two names is a duplicate
-	/// declaration, and a second name is spelled with an alias instead.
-	///
-	/// An existing binding always wins, which is what makes the seeded `std`
-	/// survive a manifest that tries to bind that name — the stdlib is
-	/// unreplaceable with no reserved-key check anywhere.
+	/// A key is a declaration of availability, not a binding, so the same
+	/// package may be declared under several keys. Two declarations of one
+	/// *name* are different: nothing says which of them a package instance means.
+	/// An existing entry always wins, which is what makes the `core` registered
+	/// first survive a manifest that tries to use that name.
 	pub fn add_dependency(
 		&mut self,
 		owner: PackageId,
@@ -558,34 +539,19 @@ impl CompilationUnitBuilder {
 		dependency: PackageId,
 	) {
 		let package = &mut self.packages[owner.as_usize()];
-		if let Some(existing) =
-			package.dependency_names.get(&dependency).copied()
-		{
-			let diagnostic = Diagnostic::error()
-				.with_code(DiagnosticCode::PackageDeclaredTwice.code())
-				.with_message(format!(
-					"this package is already declared as `{}`, so it cannot \
-			 also be declared as `{}`",
-					self.interner.resolve(existing).unwrap(),
-					self.interner.resolve(name).unwrap(),
-				));
-			package.diagnostics.push(diagnostic);
-			return;
-		}
 		if package.dependencies.contains_key(&name) {
 			let diagnostic = Diagnostic::error()
 				.with_code(DiagnosticCode::DuplicatePackageName.code())
 				.with_message(format!(
 					"the name `{}` is already used by another package this one \
-			 depends on",
-					self.interner.resolve(name).unwrap()
+					 depends on",
+					self.strings.resolve(name).unwrap()
 				));
 			package.diagnostics.push(diagnostic);
 			return;
 		}
 
 		package.dependencies.insert(name, dependency);
-		package.dependency_names.insert(dependency, name);
 	}
 
 	/// Loads a package starting from `entry_path`. Fails only if the entry
@@ -595,29 +561,24 @@ impl CompilationUnitBuilder {
 	/// broken submodule doesn't take down the whole package.
 	pub fn load_package(
 		&mut self,
-		kind: PackageKind,
 		entry_path: AbsolutePath,
 		file_source: &impl FileSource,
 	) -> Result<PackageId, ()> {
 		let package_id = PackageId(self.packages.len() as u32);
 
-		// Every package can reach the stdlib under the name `std` without
-		// declaring it — seeded here rather than left to each caller so it
-		// cannot be forgotten, and seeded *before* any manifest key is
-		// inserted so that declaring `"std"` yourself collides with it
-		// instead of replacing it. `self.stdlib` is still `None` while the
-		// stdlib itself is being loaded, so it never depends on itself.
+		// Every package depends on the core, so it is registered first,
+		// under the name `core`, before any manifest key: declaring `"core"`
+		// yourself then collides with it instead of replacing it.
+		// `self.core` is still `None` while the core itself is being
+		// loaded, so it never depends on itself.
 		//
 		// Computed before the loader takes its `&mut self`.
-		let (dependencies, dependency_names) = match self.stdlib {
-			Some(stdlib) => {
-				let std = self.interner.get_or_intern("std");
-				(
-					HashMap::from([(std, stdlib)]),
-					HashMap::from([(stdlib, std)]),
-				)
+		let dependencies = match self.core {
+			Some(core) => {
+				let name = self.strings.get_or_intern("core");
+				HashMap::from([(name, core)])
 			}
-			None => (HashMap::new(), HashMap::new()),
+			None => HashMap::new(),
 		};
 
 		let mut loader = Loader::new(self, package_id, file_source);
@@ -627,11 +588,9 @@ impl CompilationUnitBuilder {
 
 		// Built into a local first: moving the loader's fields out here is
 		// what ends its borrow of `self`, which the push then needs.
-		let package_graph = PackageGraph {
+		let package_graph = Package {
 			id: package_id,
-			kind,
 			dependencies,
-			dependency_names,
 			root,
 			entry_path,
 			modules: loader.modules,
@@ -643,43 +602,43 @@ impl CompilationUnitBuilder {
 		Ok(package_id)
 	}
 
-	/// Panics if no stdlib was ever established. Every compilation has
-	/// exactly one provider of the language's `#[tag = "..."]` items — the
-	/// embedded stdlib, or the root package itself when it declares
-	/// `"type": "std"` — so a `CompilationUnit` without one isn't a state
-	/// worth representing. The stdlib is taken from the builder rather than
-	/// passed in, so the value that gets recorded is necessarily the same
-	/// one that was seeded into every package's dependencies; passing it
-	/// separately would let the two disagree.
+	/// Panics if no core was ever established. Every compilation has
+	/// exactly one provider of the items the language requires — the
+	/// embedded core, or the root package itself when it declares
+	/// `"type": "core"` — so a `CompilationUnit` without one isn't a state
+	///worth representing.
 	pub fn build(self, root_package: PackageId) -> CompilationUnit {
-		let stdlib_package = self.stdlib.expect(
-			"a stdlib must be established (`load_stdlib` or `set_stdlib`) \
+		let core_package = self.core.expect(
+			"a core must be established (`load_core` or `set_core`) \
 			 before building a compilation",
 		);
 		CompilationUnit {
 			files: self.files,
+			asts: self.asts,
+			comments: self.comments,
+			parse_diagnostics: self.parse_diagnostics,
 			packages: self.packages,
 			root_package,
-			stdlib_package,
-			id_generator: self.id_generator,
-			interner: self.interner,
+			core_package,
 		}
 	}
 }
 
-struct Loader<'ctx, 'src, S: FileSource> {
+struct Loader<'ctx, 'src, 'strings, S: FileSource> {
 	package_id: PackageId,
 	file_source: &'src S,
 	modules: Vec<SourceModule>,
 	diagnostics: Vec<Diagnostic<FileId>>,
 	path_to_module: HashMap<AbsolutePath, ModuleId>,
-	ctx: &'ctx mut CompilationUnitBuilder,
+	ctx: &'ctx mut CompilationUnitBuilder<'strings>,
 }
 
-impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
+impl<'ctx, 'src, 'strings, Source: FileSource>
+	Loader<'ctx, 'src, 'strings, Source>
+{
 	#[inline]
 	fn new(
-		ctx: &'ctx mut CompilationUnitBuilder,
+		ctx: &'ctx mut CompilationUnitBuilder<'strings>,
 		package_id: PackageId,
 		file_source: &'src Source,
 	) -> Self {
@@ -720,29 +679,33 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			.expect(
 				"file count should never realistically approach FileId's limit",
 			);
-		let ast = ast::Parser::parse(
-			file_id,
-			&self.ctx.files,
-			&mut self.ctx.interner,
-			&mut self.ctx.id_generator,
-		);
-		let child_decls: Box<
-			[(ast::Spanned<SymbolU32>, Option<ast::TextSpan>)],
-		> = ast.items
+		let ast::Parsed {
+			ast,
+			comments,
+			diagnostics,
+		} = ast::Parser::parse(file_id, &self.ctx.files, self.ctx.strings);
+		debug_assert_eq!(self.ctx.asts.len(), file_id.as_usize());
+
+		let module_id = ModuleId(self.modules.len() as u32);
+		let child_decls: Box<[ModuleDeclaration]> = ast
+			.list(ast.root)
 			.iter()
-			.filter_map(|item| match &item.inner.inner {
+			.filter_map(|item| match *item {
 				ast::Item::ModuleDeclaration { name, pub_span } => {
-					Some((*name, *pub_span))
+					Some(ModuleDeclaration {
+						parent: module_id,
+						name,
+						pub_span,
+					})
 				}
 				ast::Item::Module { items, .. } => {
-					self.diagnose_nested_module_declarations(file_id, items);
+					self.check_nested_module_declarations(file_id, &ast, items);
 					None
 				}
 				_ => None,
 			})
 			.collect();
 
-		let module_id = ModuleId(self.modules.len() as u32);
 		self.path_to_module.insert(file_path.clone(), module_id);
 		self.modules.push(SourceModule {
 			package_id: self.package_id,
@@ -750,14 +713,18 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			declaration,
 			file_id,
 			file_path,
-			ast,
 		});
+		self.ctx.asts.push(ast);
+		self.ctx.comments.push(comments);
+		self.ctx.parse_diagnostics.push(diagnostics);
 
 		let mut children = Vec::with_capacity(child_decls.len());
-		for (child_name, child_pub_span) in child_decls {
-			let Some(child_path) =
-				self.resolve_child_module_path(&owned_dir, child_name, file_id)
-			else {
+		for module in child_decls.into_iter() {
+			let Some(child_path) = self.resolve_child_module_path(
+				&owned_dir,
+				module.name,
+				file_id,
+			) else {
 				continue; // already diagnosed as ambiguous
 			};
 			// A module's own children always live under a directory named
@@ -766,18 +733,15 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 			// same `owned_dir` for its children (both `src/math/`), same as
 			// Rust's `foo.rs`/`foo/mod.rs` being interchangeable.
 			let child_name_str =
-				self.ctx.interner.resolve(child_name.inner).expect(
+				self.ctx.strings.resolve(module.name.inner).expect(
 					"module symbol should resolve while loading package",
 				);
 			let child_owned_dir =
 				owned_dir.join(&RelativePath::new(child_name_str.to_string()));
+			let name_span = SourceSpan::new(file_id, module.name.span);
 			match self.load_module(
 				child_path.clone(),
-				Some(ModuleDeclaration {
-					parent: module_id,
-					name: child_name,
-					pub_span: child_pub_span,
-				}),
+				Some(module),
 				child_owned_dir,
 			) {
 				Ok(child_id) => children.push(child_id),
@@ -788,13 +752,9 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 							"module file not found: `{}`",
 							child_path.as_str()
 						))
-						.with_label(
-							Label::primary(file_id, child_name.span)
-								.with_message(format!(
-									"no such file: `{}`",
-									child_path.as_str()
-								)),
-						);
+						.with_label(name_span.primary_label().with_message(
+							format!("no such file: `{}`", child_path.as_str()),
+						));
 					self.diagnostics.push(diagnostic);
 				}
 			}
@@ -810,13 +770,14 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	/// require walking up through however many inline wrappers enclose it
 	/// (unlike Rust, which resolves it by accumulating a directory segment
 	/// per inline level).
-	fn diagnose_nested_module_declarations(
+	fn check_nested_module_declarations(
 		&mut self,
 		file_id: FileId,
-		items: &[ast::Separated<ast::Spanned<ast::Item>>],
+		ast: &ast::AST,
+		items: ast::List<ast::Item>,
 	) {
-		for item in items {
-			match &item.inner.inner {
+		for item in ast.list(items) {
+			match *item {
 				ast::Item::ModuleDeclaration { name, .. } => {
 					let diagnostic = Diagnostic::error()
 						.with_code(
@@ -834,7 +795,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 					self.diagnostics.push(diagnostic);
 				}
 				ast::Item::Module { items, .. } => {
-					self.diagnose_nested_module_declarations(file_id, items);
+					self.check_nested_module_declarations(file_id, ast, items);
 				}
 				_ => {}
 			}
@@ -858,7 +819,7 @@ impl<'ctx, 'src, Source: FileSource> Loader<'ctx, 'src, Source> {
 	) -> Option<AbsolutePath> {
 		let module_name = self
 			.ctx
-			.interner
+			.strings
 			.resolve(child_module_name.inner)
 			.expect("module symbol should resolve while loading package");
 		let sibling_file =

@@ -122,10 +122,8 @@ fn main() {
 	}
 }
 
-/// The other subcommands are synchronous; only this one needs an async
-/// runtime, so it builds one for itself rather than making `main` async.
-/// Current-thread is enough — `tower_lsp_server::Server` schedules its own
-/// request concurrency independent of the runtime's thread count.
+/// Serves the language server over stdio. A current-thread runtime is enough:
+/// the server's state lives on one task, and checking is synchronous.
 fn cmd_lsp() {
 	tokio::runtime::Builder::new_current_thread()
 		.build()
@@ -246,9 +244,12 @@ fn resolve_cli_path(file_path: &str) -> vfs::AbsolutePath {
 /// `wx.json`/`entry`. There's no anonymous, manifest-less mode any more
 /// than `wx format` has one; every file `build`/`check` touches belongs to
 /// a project.
-fn load_compilation(path: &str) -> vfs::CompilationUnit {
+fn load_compilation(
+	path: &str,
+	strings: &mut symbols::StringInterner,
+) -> vfs::CompilationUnit {
 	let absolute = resolve_cli_path(path);
-	match vfs::open_manifest(absolute, &vfs::NativeFileSource) {
+	match vfs::open_manifest(absolute, &vfs::NativeFileSource, strings) {
 		Ok(compilation) => compilation,
 		Err(()) => {
 			eprintln!(
@@ -309,29 +310,26 @@ fn abort_if_errors(count: usize) {
 }
 
 fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
-	let mut compilation = load_compilation(project_path);
-
-	if compilation.packages[compilation.root_package.as_usize()].kind
-		== vfs::PackageKind::Library
-	{
-		eprintln!(
-			"error: '{project_path}' is a library package and has no WASM \
-			 output to emit; use `wx check` instead"
-		);
-		std::process::exit(1);
-	}
+	let mut strings = symbols::Keyword::create_interner();
+	let compilation = load_compilation(project_path, &mut strings);
 
 	let diagnostics = compilation.collect_diagnostics();
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let tir = tir::TIR::build(&mut compilation);
-	emit_diagnostics(&compilation, &tir.diagnostics, format.clone());
-	abort_if_errors(tir.diagnostics.error_count());
+	let mut sema = tir::check(&compilation, &mut strings);
+	let lowered = tir::lower(&mut sema, &strings);
+	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
+	abort_if_errors(sema.diagnostics().error_count());
+	let mut mir =
+		lowered.expect("lowering without an error diagnostic produces MIR");
 
-	let mir =
-		mir::MIR::build(&tir, &compilation.interner, compilation.id_generator);
-	let module = codegen::Builder::build(&mir, &compilation.interner).unwrap();
+	let Ok(module) =
+		backend::emit(&mut mir, &strings, Some(mir::inline::Policy::DEFAULT))
+	else {
+		eprintln!("error: WebAssembly code generation failed");
+		std::process::exit(1);
+	};
 	let bytecode = module.encode();
 
 	if output == Some("-") {
@@ -343,13 +341,30 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 		Some(path) => path.to_string(),
 		None => format!("{}.wasm", output_stem(project_path)),
 	};
-	let mut file = fs::File::create(&out_path).unwrap();
-	file.write_all(&bytecode).unwrap();
+	if let Err(error) = fs::write(&out_path, &bytecode) {
+		eprintln!("error: could not write '{out_path}': {error}");
+		std::process::exit(1);
+	}
 	eprintln!("Wrote {} bytes to {out_path}", bytecode.len());
 }
 
+/// Derives a default output filename from the project's own directory
+/// name — `path` is always a directory, so there's no file extension to
+/// strip. Resolved to an absolute path first so `.`/`./` name the real
+/// directory rather than becoming a literal `.`.
+fn output_stem(path: &str) -> String {
+	let absolute = resolve_cli_path(path);
+	absolute
+		.as_str()
+		.rsplit('/')
+		.find(|segment| !segment.is_empty())
+		.unwrap_or("out")
+		.to_string()
+}
+
 fn cmd_check(project_path: &str, format: MessageFormat) {
-	let mut compilation = load_compilation(project_path);
+	let mut strings = symbols::Keyword::create_interner();
+	let compilation = load_compilation(project_path, &mut strings);
 
 	// Gathered once, then both printed and counted — rather than walking the
 	// package graph a second time to recount what was just printed.
@@ -357,9 +372,9 @@ fn cmd_check(project_path: &str, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let tir = tir::TIR::build(&mut compilation);
-	emit_diagnostics(&compilation, &tir.diagnostics, format.clone());
-	abort_if_errors(tir.diagnostics.error_count());
+	let sema = tir::check(&compilation, &mut strings);
+	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
+	abort_if_errors(sema.diagnostics().error_count());
 
 	println!("No errors found.");
 }
@@ -391,13 +406,15 @@ fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
 	let mut any_would_change = false;
 
 	for module in &selection.modules {
+		let index = module.file_id.as_usize();
+		let ast = &selection.asts[index];
 		// `Parser::parse` is error-recovering — it always returns *an*
 		// AST, never a hard failure, so a syntax error alone wouldn't stop
 		// this loop otherwise. That's the right call for `compile`/
 		// `check`, which only report and abort; `format` overwrites the
 		// file in place, so rendering and writing a recovered, error-laden
 		// AST back over the original would silently corrupt it instead.
-		if module.ast.diagnostics.has_errors() {
+		if selection.parse_diagnostics[index].has_errors() {
 			eprintln!(
 				"error: '{}' has syntax errors, skipping (run `wx check \
 				 {}` for details)",
@@ -409,7 +426,8 @@ fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
 
 		let file = selection.files.get(module.file_id).unwrap();
 		let formatted = wx_fmt::format(
-			&module.ast,
+			ast,
+			&selection.comments[index],
 			&selection.interner,
 			&file.source,
 			selection.config,
@@ -430,18 +448,4 @@ fn cmd_format(project_path: &str, files: Option<&[String]>, check: bool) {
 	if any_error || (check && any_would_change) {
 		std::process::exit(1);
 	}
-}
-
-/// Derives a default output filename from the project's own directory
-/// name — `path` is always a directory now, so there's no file extension
-/// to strip the way there used to be. Resolved to an absolute path first
-/// so `.`/`./` name the real directory rather than becoming a literal `.`.
-fn output_stem(path: &str) -> String {
-	let absolute = resolve_cli_path(path);
-	absolute
-		.as_str()
-		.rsplit('/')
-		.find(|segment| !segment.is_empty())
-		.unwrap_or("out")
-		.to_string()
 }

@@ -1,0 +1,799 @@
+//! Blocks, statements, locals and control flow: `{ .. }`, `local`, `if`,
+//! `loop`, labels, `break`, `continue` and `return`.
+//!
+//! Every block is a scope (`body::Scope`), entered before anything inside it
+//! is checked. A value given to a scope (a block's result, a `break`, a
+//! `return`) is held to the scope's type: the context's expectation when there
+//! is one, else the type the first value settled on (`ScopeType`).
+
+use codespan_reporting::diagnostic::{Diagnostic, Label};
+use string_interner::symbol::SymbolU32;
+
+use super::patterns::PatternContext;
+use super::{BodyBuilder, ScopeType};
+use crate::ast::{self, Spanned};
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::symbols::Keyword;
+use crate::tir::body::{
+	self, Body, ExprIdx, ExprKind, ExprObligation, LabelIdx, LocalIdx,
+	Obligations, Scope, ScopeIdx, ScopeKind,
+};
+use crate::tir::decls::FunctionIdx;
+use crate::tir::resolutions::{Reference, Site};
+use crate::tir::signatures::InferPolicy;
+use crate::tir::types::TypeIndex;
+
+impl BodyBuilder<'_, '_> {
+	/// Checks a function's block as its body. Its named parameters are the
+	/// root scope's first locals (`Body::params` says which parameter each
+	/// is), and the block's statements are written directly in the root
+	/// scope, which `return` leaves.
+	pub(in crate::tir) fn check_function(
+		mut self,
+		function_index: FunctionIdx,
+		signature: &ast::FunctionSignature,
+		block: ast::BlockId,
+	) -> (Body, Obligations) {
+		let function = &self.sema.functions[usize::from(function_index)];
+		let (param_types, return_type) =
+			(function.param_types, function.return_type);
+		// A type with a reported part in it expects nothing more.
+		let return_type = self.context().normalized(return_type);
+		let return_type = self.sema.types.collapse_error(return_type);
+		let span = self.ast().block_span(block);
+		self.enter_root(span, return_type);
+		for (at, param) in self.ast().list(signature.params).iter().enumerate()
+		{
+			let ty = self.sema.types.list(param_types)[at];
+			let ty = self.context().normalized(ty);
+			let ty = self.sema.types.collapse_error(ty);
+			// An unnamed parameter binds nothing, so it has no local.
+			let local = match param.binding {
+				Some(ast::Binding::Name { mut_span, name }) => {
+					Some(self.declare_local(name, ty, mut_span))
+				}
+				Some(ast::Binding::Wildcard(_)) | None => None,
+			};
+			self.body.push_param(local);
+		}
+		self.build_block_in(ScopeIdx::ROOT, block, span);
+		(self.body, self.obligations)
+	}
+
+	/// Enters a new scope inside the current one; `leave_scope` returns to
+	/// its parent.
+	pub(super) fn enter_scope(
+		&mut self,
+		kind: ScopeKind,
+		label: Option<LabelIdx>,
+		span: TextSpan,
+		expected: TypeIndex,
+	) -> ScopeIdx {
+		let scope = self.body.push_scope(kind, Some(self.current), label, span);
+		self.scope_types.push(ScopeType {
+			expected,
+			ty: TypeIndex::INFER,
+		});
+		self.current = scope;
+		scope
+	}
+
+	pub(super) fn leave_scope(&mut self, scope: ScopeIdx) {
+		self.current = self.body.scope(scope).parent.unwrap();
+	}
+
+	/// Declares a local in the current scope. It is visible from here on, and
+	/// hides any local of the same name declared before it.
+	pub(super) fn declare_local(
+		&mut self,
+		name: Spanned<SymbolU32>,
+		ty: TypeIndex,
+		mut_span: Option<TextSpan>,
+	) -> LocalIdx {
+		let local = self
+			.body
+			.push_local(self.current, body::Local { name, ty, mut_span });
+		self.lookup.insert((self.current, name.inner), local);
+		local
+	}
+
+	/// `{ .. }` in a scope of its own, held to `expected`.
+	pub(super) fn build_block(
+		&mut self,
+		block: ast::BlockId,
+		expected: TypeIndex,
+		label: Option<LabelIdx>,
+		span: TextSpan,
+	) -> ExprIdx {
+		let scope = self.enter_scope(ScopeKind::Block, label, span, expected);
+		let block = self.build_block_in(scope, block, span);
+		self.leave_scope(scope);
+		block
+	}
+
+	/// The statements of a block, in `scope`, which is the current one. Its
+	/// tail, the last expression written without a `;`, is its result.
+	fn build_block_in(
+		&mut self,
+		scope: ScopeIdx,
+		block: ast::BlockId,
+		span: TextSpan,
+	) -> ExprIdx {
+		let ast = self.ast();
+		let ast::Block { statements, tail } = ast.block(block);
+		let (statements, result) = (ast.list(statements), tail);
+		let (built, diverges) =
+			self.build_statements(statements, result, span.end);
+		let result = result.map(|result| {
+			let hint = self.scope_hint(scope);
+			let value = self.build(result, hint);
+			self.give(scope, value, true);
+			value
+		});
+		if result.is_none() && !diverges {
+			self.give_unit(scope, span);
+		}
+		let ty = self.scope_type(scope);
+		let statements = self.body.push_args(built);
+		self.body.push(
+			ExprKind::Block {
+				scope,
+				statements,
+				result,
+			},
+			ty,
+			span,
+		)
+	}
+
+	/// Builds `statements`, and whether one of them diverges (is `!`). What
+	/// follows the first that does, `result` included, is reported
+	/// unreachable once, and still checked. Each `local` among them opens
+	/// the rest of the block, up to `end`, as a scope of its own; the
+	/// block's own scope closes them all when it is left.
+	fn build_statements(
+		&mut self,
+		statements: &[ast::StmtId],
+		result: Option<ast::ExprId>,
+		block_end: u32,
+	) -> (Vec<ExprIdx>, bool) {
+		let ast = self.ast();
+		let mut built = Vec::with_capacity(statements.len());
+		let mut diverges_at = None;
+		for (at, &statement) in statements.iter().enumerate() {
+			let statement = self.build_statement(statement, block_end);
+			if diverges_at.is_none()
+				&& self.body.ty(statement) == TypeIndex::NEVER
+			{
+				diverges_at = Some(at);
+			}
+			built.push(statement);
+		}
+		let Some(at) = diverges_at else {
+			return (built, false);
+		};
+		let start = statements
+			.get(at + 1)
+			.map(|&statement| ast.statement_span(statement).start)
+			.or(result.map(|result| ast.expr_span(result).start));
+		let end = result.map(|result| ast.expr_span(result).end).or(statements
+			.last()
+			.map(|&statement| ast.statement_span(statement).end));
+		if let (Some(start), Some(end)) = (start, end) {
+			self.sema.diagnostics.push(
+				Diagnostic::warning()
+					.with_code(DiagnosticCode::UnreachableCode.code())
+					.with_message("unreachable code")
+					.with_label(
+						Label::primary(
+							self.scope.file_id,
+							TextSpan::new(start, end),
+						)
+						.with_message("this code will never be executed"),
+					),
+			);
+		}
+		(built, true)
+	}
+
+	fn build_statement(
+		&mut self,
+		statement: ast::StmtId,
+		block_end: u32,
+	) -> ExprIdx {
+		let ast = self.ast();
+		match ast.statement(statement) {
+			ast::Statement::Expression(expr) => {
+				self.build_expression_statement(expr)
+			}
+			ast::Statement::LocalDefinition { pattern, ty, value } => self
+				.build_local(
+					pattern,
+					ty,
+					value,
+					ast.statement_span(statement),
+					block_end,
+				),
+		}
+	}
+
+	/// An expression as a statement: its value, if it has one, must be used.
+	fn build_expression_statement(&mut self, expr: ast::ExprId) -> ExprIdx {
+		let value = self.build(expr, TypeIndex::INFER);
+		let ty = self.body.ty(value);
+		if self.sema.types.needs_context(ty) {
+			self.report_annotation_required(value);
+		} else if ty != TypeIndex::UNIT
+			&& ty != TypeIndex::NEVER
+			&& ty != TypeIndex::ERROR
+		{
+			let at = self.context().source_span(value);
+			self.sema.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::UnusedValue.code())
+					.with_message("value must be used")
+					.with_label(
+						at.primary_label().with_message("value never used"),
+					)
+					.with_note(
+						"if you don't need the value, drop it with \
+						 an assignment to `_`",
+					),
+			);
+		}
+		value
+	}
+
+	/// `(value: ty)`: the value checked as a local of that type would be. The
+	/// ascription leaves no node of its own.
+	pub(super) fn build_ascription(
+		&mut self,
+		value: ast::ExprId,
+		ty: ast::TypeId,
+	) -> ExprIdx {
+		let ty = self.builder.resolve_value_type(
+			self.sema,
+			&mut self.obligations.types,
+			self.scope,
+			ty,
+			InferPolicy::Allow,
+		);
+		let ty = self.context().normalized(ty);
+		self.check(value, ty)
+	}
+
+	/// `local pattern [: ty] = value`. Without a written type the local
+	/// takes the value's, which must be known: an untyped literal needs an
+	/// annotation. What the pattern binds is declared in the rest of the
+	/// block, up to `block_end`, a scope opened after the value is built
+	/// (`ScopeKind::Remainder`).
+	fn build_local(
+		&mut self,
+		pattern: ast::PatId,
+		ty: Option<ast::TypeId>,
+		value: ast::ExprId,
+		span: TextSpan,
+		block_end: u32,
+	) -> ExprIdx {
+		let declared = ty.map(|ty| {
+			let ty = self.builder.resolve_value_type(
+				self.sema,
+				&mut self.obligations.types,
+				self.scope,
+				ty,
+				InferPolicy::Allow,
+			);
+			self.context().normalized(ty)
+		});
+		let value = match declared {
+			Some(declared) => self.check(value, declared),
+			None => self.build(value, TypeIndex::INFER),
+		};
+		let value_ty = self.body.ty(value);
+		// A written `_` in the type is learned from the value.
+		let mut local_ty = match declared {
+			Some(declared) => {
+				self.sema.types.meet(declared, value_ty).unwrap_or(declared)
+			}
+			None => value_ty,
+		};
+		// A written slice or array is reported as held by value.
+		let unplaced =
+			declared.is_none() && self.sema.types.needs_context(local_ty);
+		if unplaced
+			|| self.sema.types.has_const_kind(local_ty)
+			|| self.sema.types.has_infer(local_ty)
+		{
+			self.sema.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
+					.with_message("type annotation required")
+					.with_label(
+						Label::primary(
+							self.scope.file_id,
+							self.ast().pattern_span(pattern),
+						)
+						.with_message("cannot infer the type of this local"),
+					),
+			);
+			local_ty = TypeIndex::ERROR;
+		}
+		let ty = if value_ty == TypeIndex::NEVER {
+			TypeIndex::NEVER
+		} else {
+			TypeIndex::UNIT
+		};
+		self.enter_scope(
+			ScopeKind::Remainder,
+			None,
+			TextSpan::new(span.end, block_end),
+			TypeIndex::INFER,
+		);
+		let pattern =
+			self.check_pattern(pattern, local_ty, &mut PatternContext::local());
+		self.body
+			.push(ExprKind::LocalDeclaration { pattern, value }, ty, span)
+	}
+
+	/// `match scrutinee { pattern => expr | { .. }, .. }`. Each arm's bindings
+	/// are declared in a scope of its own, around its body. The arms share a
+	/// type as an `if`'s branches do. The arms must cover every value, and each
+	/// must match one the arms before it do not (`exhaustiveness`).
+	pub(super) fn build_match(
+		&mut self,
+		scrutinee: ast::ExprId,
+		arms: &[ast::MatchArm],
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let scrutinee = self.build(scrutinee, TypeIndex::INFER);
+		let mut scrutinee_ty = self.body.ty(scrutinee);
+		if self.sema.types.needs_context(scrutinee_ty) {
+			self.report_annotation_required(scrutinee);
+			scrutinee_ty = TypeIndex::ERROR;
+		}
+		let mut built = Vec::with_capacity(arms.len());
+		let ast = self.ast();
+		for &ast::MatchArm { pattern, body } in arms {
+			// Its bindings are in scope after its pattern.
+			let scope = self.enter_scope(
+				ScopeKind::Block,
+				None,
+				TextSpan::new(
+					ast.pattern_span(pattern).end,
+					ast.expr_span(body).end,
+				),
+				TypeIndex::INFER,
+			);
+			let pattern = self.check_pattern(
+				pattern,
+				scrutinee_ty,
+				&mut PatternContext::arm(),
+			);
+			let body = self.build_branch(body, expected);
+			self.leave_scope(scope);
+			built.push(body::Arm {
+				scope,
+				pattern,
+				body,
+			});
+		}
+		let bodies: Vec<ExprIdx> = built.iter().map(|arm| arm.body).collect();
+		let ty = self.join_arms(&bodies);
+		let arms = self.body.push_arms(built);
+		let expr =
+			self.body
+				.push(ExprKind::Match { scrutinee, arms }, ty, span);
+		// An arm may compare with a constant, whose value is not known yet.
+		self.obligations.exprs.push(ExprObligation::Match(expr));
+		expr
+	}
+
+	/// The type a match's arms share: the first typed one's, which every
+	/// untyped arm takes; `!` gives way to the others, and with no arm the
+	/// match is `!`. While the arms are untyped they join among themselves
+	/// (`const_int` with `{float}` is `{float}`) and the match waits for its
+	/// context, which coerces each of them.
+	fn join_arms(&mut self, arms: &[ExprIdx]) -> TypeIndex {
+		let Some(&first) = arms
+			.iter()
+			.find(|&&arm| self.body.ty(arm) != TypeIndex::NEVER)
+		else {
+			return TypeIndex::NEVER;
+		};
+		let mut joined = first;
+		let mut ty = self.body.ty(first);
+		for &arm in arms {
+			if arm == first || self.body.ty(arm) == TypeIndex::NEVER {
+				continue;
+			}
+			ty = self.join_branches(joined, arm);
+			if ty == TypeIndex::ERROR {
+				return ty;
+			}
+			// An untyped arm that gave way keeps the typed one as the one the
+			// rest join.
+			if !self.sema.types.needs_context(self.body.ty(arm)) {
+				joined = arm;
+			}
+		}
+		// `join_branches` coerced only the arm a typed one met (`joined`);
+		// the untyped arms joined before it still wait for a type
+		// (`0, 1, g()` with `g() -> u8`). The match is typed now, so its
+		// context will not coerce them.
+		if ty != TypeIndex::ERROR && !self.sema.types.needs_context(ty) {
+			for &arm in arms {
+				if self.sema.types.needs_context(self.body.ty(arm)) {
+					self.coerce(arm, ty);
+				}
+			}
+		}
+		ty
+	}
+
+	/// `if condition { .. } else { .. }`. Without `else` the `if` is `()`, so
+	/// its block must be too; when it is not, the `if` is an error, which its
+	/// context does not report again. With one, the branches share a type: an untyped
+	/// branch takes the other's, and `!` gives way to the other.
+	pub(super) fn build_if_else(
+		&mut self,
+		condition: ast::ExprId,
+		then_block: ast::BlockId,
+		else_block: Option<ast::ExprId>,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let condition = self.check(condition, TypeIndex::BOOL);
+		let then_span = self.ast().block_span(then_block);
+		let Some(else_block) = else_block else {
+			let then_block =
+				self.build_block(then_block, TypeIndex::INFER, None, then_span);
+			let then_ty = self.body.ty(then_block);
+			let mut ty = TypeIndex::UNIT;
+			if then_ty != TypeIndex::UNIT
+				&& then_ty != TypeIndex::NEVER
+				&& then_ty != TypeIndex::ERROR
+			{
+				ty = TypeIndex::ERROR;
+				let found = self
+					.sema
+					.type_formatter(self.builder.strings)
+					.display_type(then_ty);
+				let at = self.context().source_span(then_block);
+				self.sema.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::MissingElseBlock.code())
+						.with_message("`if` may be missing an `else` clause")
+						.with_label(at.primary_label().with_message(format!(
+							"expected `()`, found `{found}`"
+						)))
+						.with_note("`if` without `else` evaluates to `()`"),
+				);
+			}
+			return self.body.push(
+				ExprKind::IfElse {
+					condition,
+					then_block,
+					else_block: None,
+				},
+				ty,
+				span,
+			);
+		};
+		let then_block =
+			self.build_block(then_block, expected, None, then_span);
+		let else_block = self.build_branch(else_block, expected);
+		let ty = self.join_branches(then_block, else_block);
+		self.body.push(
+			ExprKind::IfElse {
+				condition,
+				then_block,
+				else_block: Some(else_block),
+			},
+			ty,
+			span,
+		)
+	}
+
+	/// An `else` branch or a match arm's body: a block, the `if` of an
+	/// `else if`, or an arm's expression.
+	fn build_branch(
+		&mut self,
+		branch: ast::ExprId,
+		expected: TypeIndex,
+	) -> ExprIdx {
+		let ast = self.ast();
+		match ast.expr(branch) {
+			ast::Expression::Block { label: None, block } => {
+				self.build_block(block, expected, None, ast.expr_span(branch))
+			}
+			_ => self.build(branch, expected),
+		}
+	}
+
+	/// The type two branches share, coercing an untyped one to the other's.
+	fn join_branches(&mut self, first: ExprIdx, second: ExprIdx) -> TypeIndex {
+		let (first_ty, second_ty) = (self.body.ty(first), self.body.ty(second));
+		if first_ty == TypeIndex::NEVER {
+			return second_ty;
+		}
+		if second_ty == TypeIndex::NEVER || first_ty == second_ty {
+			return first_ty;
+		}
+		if first_ty == TypeIndex::ERROR || second_ty == TypeIndex::ERROR {
+			return TypeIndex::ERROR;
+		}
+		match (
+			self.sema.types.needs_context(first_ty),
+			self.sema.types.needs_context(second_ty),
+		) {
+			(true, false) => {
+				self.coerce(first, second_ty);
+				second_ty
+			}
+			(false, true) => {
+				self.coerce(second, first_ty);
+				first_ty
+			}
+			// A character literal with an integer one is a character, and two
+			// numeric literals are a float if either is.
+			(true, true)
+				if first_ty == TypeIndex::CONST_CHAR
+					&& second_ty == TypeIndex::CONST_INT
+					|| first_ty == TypeIndex::CONST_INT
+						&& second_ty == TypeIndex::CONST_CHAR =>
+			{
+				TypeIndex::CONST_CHAR
+			}
+			(true, true)
+				if first_ty.is_numeric_const_kind()
+					&& second_ty.is_numeric_const_kind() =>
+			{
+				TypeIndex::CONST_FLOAT
+			}
+			_ => {
+				let diagnostic = self
+					.context()
+					.report_type_mismatch(first_ty, second_ty, second);
+				self.sema.diagnostics.push(diagnostic);
+				TypeIndex::ERROR
+			}
+		}
+	}
+
+	/// `loop { .. }`: its statements are checked as statements, its tail
+	/// included. Its type is what its `break`s give it.
+	pub(super) fn build_loop(
+		&mut self,
+		block: ast::BlockId,
+		expected: TypeIndex,
+		label: Option<LabelIdx>,
+		span: TextSpan,
+	) -> ExprIdx {
+		let scope = self.enter_scope(ScopeKind::Loop, label, span, expected);
+		let ast = self.ast();
+		let ast::Block { statements, tail } = ast.block(block);
+		let (mut built, _) = self.build_statements(
+			ast.list(statements),
+			tail,
+			ast.block_span(block).end,
+		);
+		if let Some(tail) = tail {
+			built.push(self.build_expression_statement(tail));
+		}
+		self.leave_scope(scope);
+		let ty = self.scope_type(scope);
+		let statements = self.body.push_args(built);
+		self.body
+			.push(ExprKind::Loop { scope, statements }, ty, span)
+	}
+
+	/// `break`, leaving the nearest loop, or the scope `label` names, with
+	/// `value` (`()` without one).
+	pub(super) fn build_break(
+		&mut self,
+		label: Option<Spanned<SymbolU32>>,
+		value: Option<ast::ExprId>,
+		span: TextSpan,
+	) -> ExprIdx {
+		let Some(scope) = self.jump_target(label, span, Jump::Break) else {
+			return self.body.push(ExprKind::Error, TypeIndex::NEVER, span);
+		};
+		let value = value.map(|value| {
+			let hint = self.scope_hint(scope);
+			let value = self.build(value, hint);
+			self.give(scope, value, false);
+			value
+		});
+		if value.is_none() {
+			self.give_unit(scope, span);
+		}
+		self.body
+			.push(ExprKind::Break { scope, value }, TypeIndex::NEVER, span)
+	}
+
+	/// `continue`, restarting the nearest loop, or the loop `label` names.
+	pub(super) fn build_continue(
+		&mut self,
+		label: Option<Spanned<SymbolU32>>,
+		span: TextSpan,
+	) -> ExprIdx {
+		let Some(scope) = self.jump_target(label, span, Jump::Continue) else {
+			return self.body.push(ExprKind::Error, TypeIndex::NEVER, span);
+		};
+		self.body
+			.push(ExprKind::Continue { scope }, TypeIndex::NEVER, span)
+	}
+
+	/// `return`, leaving the body with `value` (`()` without one).
+	pub(super) fn build_return(
+		&mut self,
+		value: Option<ast::ExprId>,
+		span: TextSpan,
+	) -> ExprIdx {
+		let value = value.map(|value| {
+			let hint = self.scope_hint(ScopeIdx::ROOT);
+			let value = self.build(value, hint);
+			self.give(ScopeIdx::ROOT, value, false);
+			value
+		});
+		if value.is_none() {
+			self.give_unit(ScopeIdx::ROOT, span);
+		}
+		self.body
+			.push(ExprKind::Return { value }, TypeIndex::NEVER, span)
+	}
+
+	/// The scope a `break` or `continue` leaves: the one whose label it names,
+	/// else the nearest loop. Reports and gives `None` when there is none,
+	/// and gives `None` silently for a label not written yet (`break :`),
+	/// which the parser reported.
+	fn jump_target(
+		&mut self,
+		label: Option<Spanned<SymbolU32>>,
+		span: TextSpan,
+		jump: Jump,
+	) -> Option<ScopeIdx> {
+		if label.is_some_and(|name| name.inner == Keyword::Error.symbol()) {
+			return None;
+		}
+		let mut at = Some(self.current);
+		while let Some(scope) = at {
+			let Scope {
+				kind,
+				parent,
+				label: scope_label,
+				..
+			} = *self.body.scope(scope);
+			let found = match (label, scope_label) {
+				(Some(name), Some(scope_label)) => {
+					self.body.label(scope_label).name.inner == name.inner
+				}
+				(Some(_), None) => false,
+				(None, _) => kind == ScopeKind::Loop,
+			};
+			if found {
+				if let (Some(name), Some(scope_label)) = (label, scope_label) {
+					self.sema.resolutions.record(
+						Site::Label(SourceSpan::new(
+							self.scope.file_id,
+							name.span,
+						)),
+						Reference::Label {
+							owner: self.owner,
+							label: scope_label,
+						},
+					);
+				}
+				if jump == Jump::Continue && kind != ScopeKind::Loop {
+					self.sema.diagnostics.push(
+						Diagnostic::error()
+							.with_code(
+								DiagnosticCode::ContinueOutsideOfLoop.code(),
+							)
+							.with_message("`continue` can only restart a loop")
+							.with_label(Label::primary(
+								self.scope.file_id,
+								span,
+							)),
+					);
+					return None;
+				}
+				return Some(scope);
+			}
+			at = parent;
+		}
+		let diagnostic = match (label, jump) {
+			(Some(name), _) => {
+				let name_text =
+					self.builder.strings.resolve(name.inner).unwrap();
+				Diagnostic::error()
+					.with_code(DiagnosticCode::UndeclaredLabel.code())
+					.with_message(format!(
+						"use of undeclared label `{name_text}`"
+					))
+					.with_label(
+						Label::primary(self.scope.file_id, name.span)
+							.with_message("undeclared label"),
+					)
+			}
+			(None, Jump::Break) => Diagnostic::error()
+				.with_code(DiagnosticCode::BreakOutsideOfLoop.code())
+				.with_message("`break` outside of a loop or labelled block")
+				.with_label(Label::primary(self.scope.file_id, span)),
+			(None, Jump::Continue) => Diagnostic::error()
+				.with_code(DiagnosticCode::ContinueOutsideOfLoop.code())
+				.with_message("`continue` outside of a loop")
+				.with_label(Label::primary(self.scope.file_id, span)),
+		};
+		self.sema.diagnostics.push(diagnostic);
+		None
+	}
+
+	/// What a value given to `scope` is expected to be: the type an earlier
+	/// value settled on, else the context's expectation.
+	fn scope_hint(&self, scope: ScopeIdx) -> TypeIndex {
+		let ScopeType { expected, ty } = self.scope_types[usize::from(scope)];
+		if ty != TypeIndex::INFER { ty } else { expected }
+	}
+
+	/// The scope's type once its block is checked: `!` when nothing gave it
+	/// a value.
+	fn scope_type(&self, scope: ScopeIdx) -> TypeIndex {
+		match self.scope_types[usize::from(scope)].ty {
+			TypeIndex::INFER => TypeIndex::NEVER,
+			ty => ty,
+		}
+	}
+
+	/// Holds `value`, given to `scope`, to its type, or settles the scope's
+	/// type on it when nothing is known yet. A `!` value settles nothing. An
+	/// untyped value settles it only for a block's result
+	/// (`allow_untyped`), which the context coerces later; a `break` or
+	/// `return` needs a type.
+	fn give(&mut self, scope: ScopeIdx, value: ExprIdx, allow_untyped: bool) {
+		let ty = self.body.ty(value);
+		if ty == TypeIndex::NEVER {
+			return;
+		}
+		let hint = self.scope_hint(scope);
+		let slot = &mut self.scope_types[usize::from(scope)];
+		if hint != TypeIndex::INFER {
+			if slot.ty == TypeIndex::INFER {
+				slot.ty = hint;
+			}
+			self.expect(value, hint);
+			return;
+		}
+		if self.sema.types.needs_context(ty) && !allow_untyped {
+			self.report_annotation_required(value);
+			self.scope_types[usize::from(scope)].ty = TypeIndex::ERROR;
+			return;
+		}
+		self.scope_types[usize::from(scope)].ty = ty;
+	}
+
+	/// `give` for a `()` with no node of its own: a block without a result,
+	/// a bare `break` or `return`, reported at `span`.
+	fn give_unit(&mut self, scope: ScopeIdx, span: TextSpan) {
+		let hint = self.scope_hint(scope);
+		let slot = &mut self.scope_types[usize::from(scope)];
+		if hint == TypeIndex::INFER || hint == TypeIndex::UNIT {
+			slot.ty = TypeIndex::UNIT;
+			return;
+		}
+		slot.ty = TypeIndex::ERROR;
+		if hint == TypeIndex::ERROR {
+			return;
+		}
+		let diagnostic =
+			self.context().mismatch_at(hint, TypeIndex::UNIT, span);
+		self.sema.diagnostics.push(diagnostic);
+	}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Jump {
+	Break,
+	Continue,
+}

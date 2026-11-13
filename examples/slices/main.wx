@@ -1,0 +1,14 @@
+// Sub-slices built explicitly from a starting address and length.
+
+/// The `length` elements of `bytes` from `start`. Traps if they are not all
+/// inside `bytes`.
+pub func slice_at<M: Memory>(
+    bytes: M::&[u8],
+    start: M::Size,
+    length: M::Size,
+) -> M::&[u8] {
+    if start > bytes.len() || length > bytes.len() - start { trap() };
+    // The address of element `start` does not exist at the very end.
+    if length == 0 { return "" };
+    slice_from_parts(bytes[start].&, length)
+}

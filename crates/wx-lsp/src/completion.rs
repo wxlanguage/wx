@@ -1,872 +1,1141 @@
-use std::collections::{HashMap, HashSet};
+//! Completion: what may be written at the cursor, read from the module's
+//! syntax, and the names that fit there, from the checker
+//! (`notes/lsp-completion-plan.md`).
+//!
+//! The syntax only says what kind of position the cursor is in, and which
+//! declaration it is in, by the span of it the checker keeps; every
+//! candidate comes from the checker's own lookups (`Semantics::names_at`,
+//! `names_in_signature`, `names_in`, `member_names`, `Body::labels_at`), so
+//! nothing is offered that the checker would not accept written there.
 
 use string_interner::symbol::SymbolU32;
 use tower_lsp_server::ls_types::{
-	CompletionItem, CompletionItemKind, InsertTextFormat,
+	CompletionItem, CompletionItemKind, CompletionItemLabelDetails,
+	CompletionParams, CompletionResponse, Documentation, InsertTextFormat,
+	MarkupContent, MarkupKind,
 };
-use wx_compiler::ast::StringInterner;
+use wx_compiler::ast::{
+	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
+	BoundId, Comment, CommentMap, ConstArgument, ConstId, Destructure,
+	EnumEntry, ExprId, Expression, FunctionSignature, FunctionTypeParam,
+	ImplItem, ImportDeclaration, ImportEntry, InColumn, Item, List,
+	NamedArgument, PatId, Path, PathSegment, Pattern, PatternElement,
+	PatternFieldItem, QualifiedPathRoot, Spanned, Statement, TraitItem,
+	TypeArgument, TypeExpression, TypeId, TypeParam,
+};
+use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::tir::{
-	ImplEntry, ImplTarget, ModuleDeclarationKind, NamespaceIndex, TIR,
-	TypeFormatter,
+	DeclKind, Definition, LabelKind, MemberKind, MemberOwner, NameUse,
 };
-use wx_compiler::vfs::{FileId, PackageGraph};
 
-use crate::symbol_index::{ImplRef, SymbolIndex, SymbolKind};
+use crate::call;
+use crate::convert::position_to_offset;
+use crate::hover;
+use crate::snapshot::Snapshot;
+use crate::state::ServerState;
 
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(PartialEq)]
-pub enum CompletionContext {
-	/// Cursor is in expression/statement position. Prefix may be empty (blank trigger).
-	Identifier,
-	/// Cursor is after `.` — show fields and methods of the receiver type.
-	/// `receiver_end` is the exclusive-end byte offset of the receiver text in source.
-	DotAccess { receiver_end: usize },
-	/// Cursor is after `::` — show module members, enum variants, or associated items.
-	/// `lhs_end` is the exclusive-end byte offset of the LHS name in source.
-	PathAccess { lhs_end: usize },
-	/// Cursor is in a type annotation position (after `:` that is not `::`).
-	TypeAnnotation,
-	/// Cursor sits directly against a colon run that cannot open a path: a
-	/// lone `:`, or three or more. Nothing is offered rather than guessing
-	/// which of the two a half-typed `::` will become.
-	Unavailable,
-}
-
-/// Classifies the completion trigger context at `offset` bytes into `source`.
-pub fn classify_context(source: &str, offset: usize) -> CompletionContext {
-	// Counted on the raw text, before any trimming: `x:` and `x: ` differ
-	// here, and must — only the first has the cursor pressed against the
-	// colon, mid-token. A run of exactly two is the `::` this is all for; a
-	// run of one is either a half-typed `::` or an annotation whose type
-	// hasn't been started, and neither has anything to offer yet.
-	let trailing_colons = source[..offset]
-		.bytes()
-		.rev()
-		.take_while(|&byte| byte == b':')
-		.count();
-	if trailing_colons == 1 || trailing_colons >= 3 {
-		return CompletionContext::Unavailable;
-	}
-
-	// Strip the identifier prefix currently being typed.
-	let prefix_start = source[..offset]
-		.bytes()
-		.rposition(|b| !b.is_ascii_alphanumeric() && b != b'_')
-		.map_or(0, |i| i + 1);
-
-	// Everything before the prefix, with trailing ASCII whitespace removed.
-	let before = source[..prefix_start]
-		.trim_end_matches(|c: char| c.is_ascii_whitespace());
-
-	if before.is_empty() {
-		return CompletionContext::Identifier;
-	}
-
-	let before_bytes = before.as_bytes();
-
-	match before_bytes[before_bytes.len() - 1] {
-		b'.' => {
-			let before_dot = before[..before.len() - 1]
-				.trim_end_matches(|c: char| c.is_ascii_whitespace());
-			CompletionContext::DotAccess {
-				receiver_end: before_dot.len(),
-			}
+/// The names that can be written at the cursor, in a body or a signature.
+pub(crate) fn completion(
+	state: &mut ServerState,
+	params: &CompletionParams,
+) -> Option<CompletionResponse> {
+	let position = &params.text_document_position;
+	let snippets = state.client.completion_snippets;
+	let label_details = state.client.completion_label_details;
+	let (snapshot, file) =
+		state.resolve_uri_mut(&position.text_document.uri)?;
+	let offset = position_to_offset(
+		&snapshot.compilation.files,
+		file,
+		position.position,
+	)?;
+	let Position { site, within } = position_at(
+		snapshot.compilation.ast(file),
+		snapshot.compilation.comments(file),
+		offset,
+	)?;
+	let declaration = match within {
+		Within::Signature(Anchor::Name(name)) | Within::Body(name) => {
+			snapshot.declared_at(SourceSpan::new(file, name))?
 		}
-		b':' if before_bytes.len() >= 2
-			&& before_bytes[before_bytes.len() - 2] == b':' =>
+		Within::Signature(Anchor::ImplTarget(target)) => {
+			snapshot.impl_with_target(SourceSpan::new(file, target))?
+		}
+	};
+	let ast = snapshot.compilation.ast(file);
+	let sema = &mut snapshot.sema;
+	// A function, method or constructor written as a value is inserted as its
+	// call, unless the call is written already (`hel|per()`).
+	let source = &snapshot.compilation.files.get(file).ok()?.source;
+	let called = source[offset as usize..]
+		.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+		.starts_with('(');
+	let insert = match site {
+		Site::Name(NameUse::Value)
+		| Site::Segment {
+			used_as: NameUse::Value,
+			..
+		}
+		| Site::Member { .. }
+			if snippets && !called =>
 		{
-			let before_colons = before[..before.len() - 2]
-				.trim_end_matches(|c: char| c.is_ascii_whitespace());
-			CompletionContext::PathAccess {
-				lhs_end: before_colons.len(),
-			}
+			Insert::Call
 		}
-		b':' => CompletionContext::TypeAnnotation,
-		_ => CompletionContext::Identifier,
-	}
-}
-
-pub fn find_enclosing_function(
-	tir: &TIR,
-	file_id: FileId,
-	cursor_offset: u32,
-) -> Option<usize> {
-	tir.items.functions.iter().position(|f| {
-		f.file_id == file_id
-			&& f.body.is_some_and(|body_idx| {
-				let body = &tir.items.bodies[usize::from(body_idx)];
-				let span = body.stack.scopes[0].span;
-				span.start <= cursor_offset && span.end > cursor_offset
-			})
-	})
-}
-
-/// Collects completion items for all locals visible at `cursor_offset` inside the given function.
-/// Walks the innermost scope containing the cursor, then follows the parent chain upward.
-pub fn local_completion_items(
-	tir: &TIR,
-	func_index: usize,
-	interner: &StringInterner,
-	packages: &[PackageGraph],
-	cursor_offset: u32,
-	prefix: &str,
-) -> Vec<CompletionItem> {
-	let function = &tir.items.functions[func_index];
-	// Names render as the function's own package sees them.
-	let formatter = TypeFormatter::new(
-		&tir.types,
-		&tir.items,
-		&tir.modules,
-		interner,
-		packages,
-		tir.modules.namespaces[usize::from(function.namespace)].package,
-	);
-	let body = match function.body {
-		Some(idx) => &tir.items.bodies[usize::from(idx)],
-		None => return vec![],
+		_ => Insert::Name,
 	};
-	let num_params = function.params.len();
-
-	let innermost_idx = body
-		.stack
-		.scopes_with_indices()
-		.filter(|(_, s)| {
-			s.span.start <= cursor_offset && s.span.end > cursor_offset
-		})
-		.min_by_key(|(_, s)| s.span.end - s.span.start)
-		.map(|(index, _)| index);
-
-	let innermost_idx = match innermost_idx {
-		Some(i) => i,
-		None => return vec![],
-	};
-
-	let mut items = vec![];
-	let mut current = Some(innermost_idx);
-
-	while let Some(scope_idx) = current {
-		let scope = &body.stack.scopes[usize::from(scope_idx)];
-		let is_innermost = scope_idx == innermost_idx;
-		let is_root = u32::from(scope_idx) == 0;
-
-		for (local_idx, local) in scope.locals.iter().enumerate() {
-			let is_param = is_root && local_idx < num_params;
-			// In the innermost scope, skip locals not yet declared (except params which
-			// are always in scope). Ancestor-scope locals are always visible.
-			if !is_param
-				&& is_innermost
-				&& local.name.span.start >= cursor_offset
-			{
-				continue;
+	let member = matches!(site, Site::Member { .. });
+	let mut argument_types = None;
+	let names = match site {
+		Site::Name(used_as) => match within {
+			Within::Body(_) => {
+				sema.names_at(sema.body_of(declaration)?, offset, used_as)
 			}
-			let name = match interner.resolve(local.name.inner) {
-				Some(n) => n,
-				None => continue,
-			};
-			if !name.starts_with(prefix) {
-				continue;
+			Within::Signature(_) => {
+				sema.names_in_signature(declaration, used_as)
 			}
-			let detail = formatter.display_type(local.ty).ok();
-			// `0_` sorts before `global_completion_items`' `1_` prefix, so
-			// locals are listed first regardless of alphabetical label order.
-			let sort_text = Some(format!("0_{name}"));
-			items.push(CompletionItem {
-				label: name.to_string(),
-				kind: Some(CompletionItemKind::VARIABLE),
-				detail,
-				sort_text,
-				..Default::default()
-			});
-		}
-
-		current = scope.parent;
-	}
-
-	items
-}
-
-/// Namespace of the module containing `file_id`, for completion requests
-/// that fall outside any function body (no enclosing-function namespace to
-/// fall back on). Only inline `mod foo { }` blocks are missed here —
-/// those share the file of their enclosing function, which already carries
-/// the right namespace.
-/// TODO: both halves are linear scans. The right fix is `File::package`
-/// (`vfs::Files` gaining a `PackageId` per file), which turns this into a
-/// `package_namespaces` lookup plus one comparison — blocked only on
-/// `cmd_format`, the one caller that still builds a bare `Files` with no
-/// package.
-fn file_namespace(tir: &TIR, file_id: FileId) -> Option<NamespaceIndex> {
-	// A package's entry file has no `mod` declaration of its own — its
-	// scope is the package's root namespace, which records that file id.
-	// Checked first because a compilation holds only a handful of packages,
-	// while `module_decls` grows with every file in it.
-	for &namespace_idx in tir.modules.package_namespaces.values() {
-		if matches!(
-			tir.modules.namespaces[usize::from(namespace_idx)].declaration,
-			ModuleDeclarationKind::Package(package_file)
-				if package_file == file_id
-		) {
-			return Some(namespace_idx);
-		}
-	}
-
-	tir.modules
-		.module_decls
-		.iter()
-		.find(|decl| decl.own_file_id == Some(file_id))
-		.map(|decl| decl.namespace_idx)
-}
-
-/// The set of namespaces whose direct symbols are visible from `start`:
-/// `start` itself, its `use path::*` wildcard imports, then each ancestor
-/// namespace (and its wildcard imports) up to the implicit root. Mirrors the
-/// walk `lookup_global_symbol` performs in the type checker, but collects
-/// every reachable namespace instead of stopping at the first name match.
-pub fn visible_namespaces(
-	tir: &TIR,
-	start: NamespaceIndex,
-) -> HashSet<NamespaceIndex> {
-	let mut visible = HashSet::new();
-	let mut current = Some(start);
-	// Running out of parents means we've walked off the top of the package.
-	// Its own root namespace was visited on the way, so its wildcard imports
-	// are already in `visible` — there's no separate root scope to splice in.
-	while let Some(idx) = current {
-		if !visible.insert(idx) {
-			break;
-		}
-		let ns = &tir.modules.namespaces[usize::from(idx)];
-		visible.extend(ns.wildcard_imports.iter().map(|i| i.namespace));
-		current = ns.parent;
-	}
-	visible
-}
-
-/// Maps a `global_definitions` entry to its `CompletionItem`, without the
-/// `sort_text` bare-identifier completion prefixes on top (see callers).
-/// Shared between `global_completion_items` and `path_completion_items`'s
-/// `Namespace::` branch — both list a namespace's direct members, just
-/// filtered differently (visibility vs. exact namespace match).
-fn global_definition_completion_item(
-	tir: &TIR,
-	name: String,
-	kind: &SymbolKind,
-) -> Option<CompletionItem> {
-	Some(match kind {
-		SymbolKind::Function(def_id) => {
-			let fi = usize::from(tir.items.function_index(*def_id)?);
-			let func = &tir.items.functions[fi];
-			let (insert_text, insert_text_format) = if func.params.is_empty() {
-				(format!("{}()", name), InsertTextFormat::PLAIN_TEXT)
-			} else {
-				(format!("{}($1)", name), InsertTextFormat::SNIPPET)
-			};
-			CompletionItem {
-				label: name,
-				kind: Some(CompletionItemKind::FUNCTION),
-				insert_text: Some(insert_text),
-				insert_text_format: Some(insert_text_format),
-				..Default::default()
-			}
-		}
-		SymbolKind::Global(_) => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::VARIABLE),
-			..Default::default()
 		},
-		SymbolKind::Const(_) => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::CONSTANT),
-			..Default::default()
-		},
-		SymbolKind::Struct(_) => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::STRUCT),
-			..Default::default()
-		},
-		SymbolKind::Enum(_) => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::ENUM),
-			..Default::default()
-		},
-		// Never reached: `EnumVariant` is never pushed into
-		// `global_definitions` — it's only ever accessed as a
-		// qualified `Enum::Variant` member, never bare.
-		SymbolKind::Namespace(_) => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::MODULE),
-			..Default::default()
-		},
-		SymbolKind::Trait(_) => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::INTERFACE),
-			..Default::default()
-		},
-		SymbolKind::TypeSet(_) => CompletionItem {
-			label: name,
-			kind: Some(CompletionItemKind::TYPE_PARAMETER),
-			..Default::default()
-		},
-		SymbolKind::AssocType { .. } | SymbolKind::TypeAlias(_) => {
-			CompletionItem {
-				label: name,
-				kind: Some(CompletionItemKind::TYPE_PARAMETER),
-				..Default::default()
-			}
-		}
-		_ => return None,
-	})
-}
-
-/// Prefix-searches `symbol_index.global_definitions` and maps each match visible
-/// from `visible_from` to a `CompletionItem`.
-pub fn global_completion_items(
-	tir: &TIR,
-	interner: &StringInterner,
-	symbol_index: &SymbolIndex,
-	prefix: &str,
-	visible_from: &HashSet<NamespaceIndex>,
-) -> Vec<CompletionItem> {
-	let lower = symbol_index
-		.global_definitions
-		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
-
-	symbol_index.global_definitions[lower..]
-		.iter()
-		.take_while(|def| {
-			interner.resolve(def.name).unwrap().starts_with(prefix)
-		})
-		.filter(|def| visible_from.contains(&def.namespace))
-		.filter_map(|def| {
-			let name = interner.resolve(def.name)?.to_string();
-			let item =
-				global_definition_completion_item(tir, name, &def.info.kind)?;
-			// Sorts after `local_completion_items`' `0_` prefix, so locals
-			// in scope are listed before same-prefix globals.
-			Some(CompletionItem {
-				sort_text: Some(format!("1_{}", item.label)),
-				..item
-			})
-		})
-		.collect()
-}
-
-/// Kinds valid in type position. Doesn't yet distinguish a plain type
-/// annotation from a bound (`T: Trait`) — both currently get this same,
-/// type-only list, so a bound position won't offer `Trait`/`TypeSet` names
-/// the way it ideally should; narrowing that further needs detecting
-/// whether the colon sits inside a `<...>` list, which is out of scope for
-/// now (see `CompletionContext::TypeAnnotation`'s doc comment). Doesn't
-/// cover primitive type names (`i32`, `bool`, ...) either — those aren't
-/// `SymbolKind`s today, but are expected to become ordinary stdlib items
-/// once primitives move to intrinsics, at which point this list picks them
-/// up automatically with no changes needed here.
-fn is_type_like(kind: &SymbolKind) -> bool {
-	matches!(
-		kind,
-		SymbolKind::Struct(_)
-			| SymbolKind::Enum(_)
-			| SymbolKind::TypeSet(_)
-			| SymbolKind::TypeAlias(_)
-			| SymbolKind::Namespace(_)
-	)
-}
-
-/// Like `global_completion_items`, but restricted to kinds valid in type
-/// position (see `is_type_like`). Doesn't yet include in-scope type
-/// parameters — unlike locals, those aren't in `global_definitions` at all
-/// (it explicitly excludes scope-sensitive items), so offering them needs a
-/// separate walk of the enclosing function's own + inherited type params,
-/// the way `local_completion_items` walks scopes for locals.
-pub fn type_completion_items(
-	tir: &TIR,
-	interner: &StringInterner,
-	symbol_index: &SymbolIndex,
-	prefix: &str,
-	visible_from: &HashSet<NamespaceIndex>,
-) -> Vec<CompletionItem> {
-	let lower = symbol_index
-		.global_definitions
-		.partition_point(|def| interner.resolve(def.name).unwrap() < prefix);
-	symbol_index.global_definitions[lower..]
-		.iter()
-		.take_while(|def| {
-			interner.resolve(def.name).unwrap().starts_with(prefix)
-		})
-		.filter(|def| visible_from.contains(&def.namespace))
-		.filter(|def| is_type_like(&def.info.kind))
-		.filter_map(|def| {
-			let name = interner.resolve(def.name)?.to_string();
-			global_definition_completion_item(tir, name, &def.info.kind)
-		})
-		.collect()
-}
-
-/// Maps every entry in an impl block's/trait impl's/trait's own `members`
-/// map to a `CompletionItem`, gated on `pub_span.is_some()` — per the "`pub
-/// fn` only" rule (see `Common pitfalls` in `CLAUDE.md`): a non-`pub` member
-/// isn't reachable via `Type::name()` at all, so it shouldn't complete as if
-/// it were.
-fn member_completion_items(
-	tir: &TIR,
-	interner: &StringInterner,
-	members: &HashMap<SymbolU32, ImplEntry>,
-	prefix: &str,
-) -> Vec<CompletionItem> {
-	members
-		.iter()
-		.filter_map(|(name_sym, entry)| {
-			let name = interner.resolve(*name_sym)?;
-			if !name.starts_with(prefix) {
+		// What the prefix means, as checking resolved it; a prefix that did
+		// not resolve has nothing after it.
+		Site::Segment { prefix, used_as } => {
+			let (_, reference) = sema.symbol_at(file, prefix.start)?;
+			let Definition::Item(prefix) = reference.definition() else {
 				return None;
-			}
-			match entry {
-				ImplEntry::Method(fi) => {
-					let func = tir.items.functions.get(usize::from(*fi))?;
-					func.pub_span?;
-					let insert_text = if func.params.len() <= 1 {
-						format!("{name}()")
-					} else {
-						format!("{name}($1)")
-					};
-					Some(CompletionItem {
-						label: name.to_string(),
-						kind: Some(CompletionItemKind::METHOD),
-						insert_text: Some(insert_text),
-						insert_text_format: Some(if func.params.len() <= 1 {
-							InsertTextFormat::PLAIN_TEXT
-						} else {
-							InsertTextFormat::SNIPPET
-						}),
-						..Default::default()
-					})
-				}
-				ImplEntry::AssocFunction(fi) => {
-					let func = tir.items.functions.get(usize::from(*fi))?;
-					func.pub_span?;
-					let insert_text = if func.params.is_empty() {
-						format!("{name}()")
-					} else {
-						format!("{name}($1)")
-					};
-					Some(CompletionItem {
-						label: name.to_string(),
-						kind: Some(CompletionItemKind::FUNCTION),
-						insert_text: Some(insert_text),
-						insert_text_format: Some(if func.params.is_empty() {
-							InsertTextFormat::PLAIN_TEXT
-						} else {
-							InsertTextFormat::SNIPPET
-						}),
-						..Default::default()
-					})
-				}
-				ImplEntry::AssocConstant(ci) => {
-					let constant = tir.items.constants.get(usize::from(*ci))?;
-					constant.pub_span?;
-					Some(CompletionItem {
-						label: name.to_string(),
-						kind: Some(CompletionItemKind::CONSTANT),
-						..Default::default()
-					})
-				}
-				ImplEntry::AssocType { .. } => Some(CompletionItem {
-					label: name.to_string(),
-					kind: Some(CompletionItemKind::TYPE_PARAMETER),
-					..Default::default()
-				}),
-			}
-		})
-		.collect()
-}
-
-/// Every impl block/trait impl targeting `target`'s member completions,
-/// merged — via `SymbolIndex::impls_by_target`, the same `ImplTarget`-keyed
-/// reverse index `reference_search_kinds`/`implementation_locations` use, so
-/// this stays O(1) instead of scanning every impl in the program.
-fn impl_member_completion_items(
-	tir: &TIR,
-	interner: &StringInterner,
-	symbol_index: &SymbolIndex,
-	target: ImplTarget,
-	prefix: &str,
-) -> Vec<CompletionItem> {
-	symbol_index
-		.impls_by_target
-		.get(&target)
-		.into_iter()
-		.flatten()
-		.flat_map(|r| {
-			let members = match r {
-				ImplRef::Inherent(idx) => tir
-					.items
-					.inherent_impls
-					.get(usize::from(*idx))
-					.map(|b| &b.members),
-				ImplRef::Trait(idx) => tir
-					.items
-					.trait_impls
-					.get(usize::from(*idx))
-					.map(|ti| &ti.members),
 			};
-			members
+			sema.names_in(declaration, prefix, used_as)
+		}
+		Site::Member { object } => {
+			let owner = sema.body_of(declaration)?;
+			let body = sema.owner_body(owner)?;
+			let receiver = body.operand_ty(body.operand_of(ast, object)?);
+			sema.member_names(&snapshot.strings, owner, receiver)
+		}
+		Site::Label(jump) => {
+			let owner = sema.body_of(declaration)?;
+			let body = sema.owner_body(owner)?;
+			body.labels_at(offset)
 				.into_iter()
-				.flat_map(|m| member_completion_items(tir, interner, m, prefix))
+				.filter(|&(_, kind)| match jump {
+					Jump::Break => true,
+					// A `continue` restarts only a loop.
+					Jump::Continue => kind == LabelKind::Loop,
+				})
+				.map(|(label, _)| {
+					(
+						body.label(label).name.inner,
+						Definition::Label { owner, label },
+					)
+				})
+				.collect()
+		}
+		// A name written twice is reported (E2121), so the ones written are
+		// not offered again.
+		Site::Argument {
+			call,
+			callee,
+			given,
+			written,
+		} => {
+			let (_, reference) = sema.symbol_at(file, callee.start)?;
+			let names = sema.argument_names(reference.definition(), given);
+			// Names and visibility still come from the checker's contract.
+			// Only their displayed types use this call's inferred arguments.
+			argument_types = sema
+				.body_of(declaration)
+				.and_then(|owner| {
+					call::signature(sema, &snapshot.strings, owner, ast, call)
+				})
+				.map(|signature| signature.parameters);
+			names
+				.into_iter()
+				.filter(|(name, _)| !written.contains(name))
+				.collect()
+		}
+	};
+	let items = names
+		.into_iter()
+		.enumerate()
+		.map(|(index, (name, definition))| {
+			let mut item = item(
+				snapshot,
+				name,
+				definition,
+				insert,
+				member.then_some(index),
+				label_details,
+			);
+			if let Some((_, ty)) =
+				argument_types.as_ref().and_then(|parameters| {
+					parameters
+						.iter()
+						.find(|(parameter, _)| *parameter == Some(name))
+				}) {
+				let ty = snapshot
+					.sema
+					.type_formatter(&snapshot.strings)
+					.display_type(*ty);
+				item.detail = Some(format!("{}: {ty}", item.label));
+			}
+			item
 		})
-		.collect()
+		.collect();
+	Some(CompletionResponse::Array(items))
 }
 
-/// Resolves a single bare identifier (no `::` of its own) to the `SymbolKind`
-/// it names, the same way `global_completion_items` looks names up — via
-/// `symbol_index.global_definitions`, taking the first match visible from
-/// `visible`. Ambiguity (the same name visible from two different reachable
-/// namespaces) is vanishingly rare for type/namespace names in practice, so
-/// "first visible match" is good enough rather than reimplementing the
-/// compiler's full shadowing precedence here.
-fn resolve_bare_name(
-	symbol_index: &SymbolIndex,
-	interner: &StringInterner,
-	name: &str,
-	visible: &HashSet<NamespaceIndex>,
-) -> Option<SymbolKind> {
-	let lower = symbol_index
-		.global_definitions
-		.partition_point(|def| interner.resolve(def.name).unwrap() < name);
-	symbol_index.global_definitions[lower..]
-		.iter()
-		.take_while(|def| interner.resolve(def.name).unwrap() == name)
-		.find(|def| visible.contains(&def.namespace))
-		.map(|def| def.info.kind)
+/// Where the cursor is: what can be written there, and in which part of
+/// which declaration.
+pub(crate) struct Position {
+	site: Site,
+	within: Within,
 }
 
-/// Completions after `Type::`/`namespace::`/`Trait::`. `lhs_end` is the
-/// exclusive-end byte offset of everything before the `::` (see
-/// `classify_context`) — only a single bare identifier immediately before it
-/// is handled; a deeper path (`a::b::`) bails out to no completions, same as
-/// the `DotAccess`/`PathAccess` TODOs this replaces did.
-fn path_completion_items(
-	tir: &TIR,
-	interner: &StringInterner,
-	symbol_index: &SymbolIndex,
-	source: &str,
-	lhs_end: usize,
-	prefix: &str,
-	visible: &HashSet<NamespaceIndex>,
-) -> Vec<CompletionItem> {
-	let lhs_text = &source[..lhs_end];
-	let trimmed_end = lhs_text
-		.trim_end_matches(|c: char| c.is_ascii_whitespace())
-		.len();
-	let trimmed = &lhs_text[..trimmed_end];
-	let ident_start = trimmed
-		.bytes()
-		.rposition(|b| !b.is_ascii_alphanumeric() && b != b'_')
-		.map_or(0, |i| i + 1);
-	// `a::b::` — the identifier right before `::` is itself preceded by
-	// another `::`. Not yet supported (see doc comment).
-	if trimmed[..ident_start].trim_end().ends_with("::") {
-		return Vec::new();
-	}
-	let lhs_name = &trimmed[ident_start..];
-	if lhs_name.is_empty() {
-		return Vec::new();
-	}
+/// The part of a declaration the cursor is in: a signature, read in the
+/// declaration's scope, or a body, which adds its locals and labels. Only a
+/// named declaration has a body.
+#[derive(Clone, Copy)]
+pub(crate) enum Within {
+	Signature(Anchor),
+	/// The body of the declaration named at this span.
+	Body(TextSpan),
+}
 
-	let Some(resolved) =
-		resolve_bare_name(symbol_index, interner, lhs_name, visible)
-	else {
-		return Vec::new();
-	};
+impl Within {
+	/// The position of `site`, when the cursor is at one, in this part.
+	fn position(self, site: Option<Site>) -> Option<Position> {
+		Some(Position {
+			site: site?,
+			within: self,
+		})
+	}
+}
 
-	match resolved {
-		SymbolKind::Namespace(ns_idx) => symbol_index
-			.global_definitions
-			.iter()
-			.filter(|def| def.namespace == ns_idx)
-			.filter_map(|def| {
-				let name = interner.resolve(def.name)?;
-				if !name.starts_with(prefix) {
-					return None;
+/// A declaration, by the one span of it the checker keeps: an item's name
+/// (a member's included), an impl's target path (`Semantics::impls`).
+#[derive(Clone, Copy)]
+pub(crate) enum Anchor {
+	Name(TextSpan),
+	ImplTarget(TextSpan),
+}
+
+/// What an item inserts: its name, or, for a function, method or constructor in
+/// a value position, its call (when the client takes snippets).
+#[derive(Clone, Copy)]
+pub(crate) enum Insert {
+	Name,
+	Call,
+}
+
+/// A `break` or a `continue`.
+#[derive(Clone, Copy)]
+pub(crate) enum Jump {
+	Break,
+	Continue,
+}
+
+/// What can be written at the cursor, as completion offers it.
+pub(crate) enum Site {
+	/// A bare name, used as its `NameUse` says.
+	Name(NameUse),
+	/// A path's segment after another, used as `used_as` in what the one
+	/// before it, written at `prefix`, means.
+	Segment { prefix: TextSpan, used_as: NameUse },
+	/// A member of the object as the body checked it.
+	Member { object: ExprId },
+	/// The label of a jump.
+	Label(Jump),
+	/// The name of an argument in a call by name: one of the parameters of
+	/// the callee whose last name is written at `callee`, in `call`, after
+	/// the first `given` (a method call's receiver), and not among the
+	/// `written` ones.
+	Argument {
+		call: ExprId,
+		callee: TextSpan,
+		given: usize,
+		written: Vec<SymbolU32>,
+	},
+}
+
+/// One candidate. Locals and type parameters sort before items, as the
+/// lookup tries them first. Members keep the order the checker lists them in.
+fn item(
+	snapshot: &Snapshot,
+	name: SymbolU32,
+	definition: Definition,
+	insert: Insert,
+	member_index: Option<usize>,
+	label_details: bool,
+) -> CompletionItem {
+	let label = snapshot
+		.strings
+		.resolve(name)
+		.unwrap_or_default()
+		.to_string();
+	let (kind, rank) = match definition {
+		Definition::Local { .. } => (CompletionItemKind::VARIABLE, 0),
+		Definition::TypeParam { .. } => (CompletionItemKind::TYPE_PARAMETER, 0),
+		Definition::InherentImplTarget(_) | Definition::TraitImplTarget(_) => {
+			(CompletionItemKind::STRUCT, 0)
+		}
+		Definition::Label { .. } => (CompletionItemKind::REFERENCE, 0),
+		// An argument's name: what a call by name may give, in order.
+		Definition::Parameter { .. } => (CompletionItemKind::VARIABLE, 0),
+		Definition::Field { .. } => (CompletionItemKind::FIELD, 0),
+		Definition::Member(MemberKind::Method(_)) => {
+			(CompletionItemKind::METHOD, 0)
+		}
+		Definition::Item(loc) => {
+			let kind = match snapshot.sema.declaration_kind(loc) {
+				DeclKind::Module(_)
+				| DeclKind::Import(_)
+				| DeclKind::Package(_)
+				| DeclKind::PackageInstance(_) => CompletionItemKind::MODULE,
+				DeclKind::Enum(_) => CompletionItemKind::ENUM,
+				DeclKind::EnumVariant(_) => CompletionItemKind::ENUM_MEMBER,
+				DeclKind::Struct(_)
+				| DeclKind::Memory(_)
+				| DeclKind::AssocType(_)
+				| DeclKind::TypeAlias(_) => CompletionItemKind::STRUCT,
+				DeclKind::Trait(_) | DeclKind::TypeSet(_) => {
+					CompletionItemKind::INTERFACE
 				}
-				global_definition_completion_item(
-					tir,
-					name.to_string(),
-					&def.info.kind,
-				)
-			})
-			.collect(),
-		SymbolKind::Enum(id) => {
-			let mut items = Vec::new();
-			if let Some(ei) = tir.items.enum_index(id) {
-				let enum_ = &tir.items.enums[usize::from(ei)];
-				items.extend(enum_.variants.iter().filter_map(|v| {
-					let name = interner.resolve(v.name.inner)?;
-					if !name.starts_with(prefix) {
-						return None;
-					}
-					Some(CompletionItem {
-						label: name.to_string(),
-						kind: Some(CompletionItemKind::ENUM_MEMBER),
-						..Default::default()
-					})
-				}));
-			}
-			if let Some(idx) = tir.items.enum_index(id) {
-				items.extend(impl_member_completion_items(
-					tir,
-					interner,
-					symbol_index,
-					ImplTarget::Enum(idx),
-					prefix,
-				));
-			}
-			items
-		}
-		SymbolKind::Struct(id) => {
-			tir.items.struct_index(id).map_or_else(Vec::new, |idx| {
-				impl_member_completion_items(
-					tir,
-					interner,
-					symbol_index,
-					ImplTarget::Struct(idx),
-					prefix,
-				)
-			})
-		}
-		SymbolKind::Trait(id) => {
-			tir.items.trait_index(id).map_or_else(Vec::new, |idx| {
-				member_completion_items(
-					tir,
-					interner,
-					&tir.items.traits[usize::from(idx)].entries,
-					prefix,
-				)
-			})
-		}
-		_ => Vec::new(),
-	}
-}
-
-pub fn completion_items(
-	tir: &TIR,
-	interner: &StringInterner,
-	packages: &[PackageGraph],
-	symbol_index: &SymbolIndex,
-	file_id: FileId,
-	source: &str,
-	offset: usize,
-) -> Vec<CompletionItem> {
-	let prefix_start = source[..offset]
-		.bytes()
-		.rposition(|b| !b.is_ascii_alphanumeric() && b != b'_')
-		.map_or(0, |i| i + 1);
-	let prefix = &source[prefix_start..offset];
-	let cursor_offset = offset as u32;
-	let func_index = find_enclosing_function(tir, file_id, cursor_offset);
-	let current_namespace = match func_index {
-		Some(fi) => Some(tir.items.functions[fi].namespace),
-		None => file_namespace(tir, file_id),
-	};
-	// No namespace means the file isn't part of the compilation, so nothing
-	// is in scope to complete.
-	let Some(current_namespace) = current_namespace else {
-		return vec![];
-	};
-	let visible = visible_namespaces(tir, current_namespace);
-
-	match classify_context(source, offset) {
-		CompletionContext::Identifier => {
-			let mut items = match func_index {
-				Some(func_index) => local_completion_items(
-					tir,
-					func_index,
-					interner,
-					packages,
-					cursor_offset,
-					prefix,
-				),
-				None => Vec::new(),
+				DeclKind::Global(_) => CompletionItemKind::VARIABLE,
+				DeclKind::Function(_) => CompletionItemKind::FUNCTION,
+				DeclKind::Const(_) => CompletionItemKind::CONSTANT,
 			};
-
-			items.extend(global_completion_items(
-				tir,
-				interner,
-				symbol_index,
-				prefix,
-				&visible,
-			));
-			items
+			(kind, 1)
 		}
-		CompletionContext::DotAccess { .. } => {
-			// TODO: resolve receiver type → impl_block_list + struct fields
-			vec![]
-		}
-		CompletionContext::PathAccess { lhs_end } => path_completion_items(
-			tir,
-			interner,
-			symbol_index,
-			source,
-			lhs_end,
-			prefix,
-			&visible,
+		// Nothing else is listed: `names_at`, `names_in`, `labels_at` and
+		// `argument_names` and `member_names` give locals, type parameters,
+		// items, labels, parameters, fields and methods.
+		_ => (CompletionItemKind::TEXT, 1),
+	};
+	let params = match definition {
+		Definition::Member(MemberKind::Method(function)) => Some(
+			snapshot.sema.decls.functions[usize::from(function)]
+				.params
+				.len() - 1,
 		),
-		CompletionContext::TypeAnnotation => {
-			type_completion_items(tir, interner, symbol_index, prefix, &visible)
+		Definition::Member(MemberKind::Function(function)) => Some(
+			snapshot.sema.decls.functions[usize::from(function)]
+				.params
+				.len(),
+		),
+		Definition::Item(loc) => {
+			let decls = &snapshot.sema.decls;
+			match snapshot.sema.declaration_kind(loc) {
+				DeclKind::Function(function) => {
+					Some(decls.functions[usize::from(function)].params.len())
+				}
+				DeclKind::Struct(index) => {
+					Some(decls.structs[usize::from(index)].field_names.len())
+				}
+				_ => None,
+			}
 		}
-		CompletionContext::Unavailable => vec![],
+		_ => None,
+	};
+	// The call punctuation uses the primary label's color. Filtering and
+	// insertion use the original name, including when a call is already written.
+	let display_label = match params {
+		Some(0) => format!("{label}()"),
+		Some(_) => format!("{label}(…)"),
+		None => label.clone(),
+	};
+	let insert_text = match insert {
+		Insert::Call => params.map(|params| match params {
+			0 => format!("{label}()"),
+			_ => format!("{label}($1)"),
+		}),
+		Insert::Name => params.map(|_| label.clone()),
+	};
+	let label_details = if label_details {
+		params.map(|_| {
+			let mut detail = None;
+			if let Definition::Member(MemberKind::Method(function)) = definition
+			{
+				let trait_index = match snapshot.sema.decls.functions
+					[usize::from(function)]
+				.owner
+				{
+					MemberOwner::Trait(index) => Some(index),
+					MemberOwner::TraitImpl(index) => {
+						snapshot.sema.trait_impl_trait(index)
+					}
+					MemberOwner::Free | MemberOwner::InherentImpl(_) => None,
+				};
+				if let Some(index) = trait_index {
+					let decl = &snapshot.sema.decls.traits[usize::from(index)];
+					if let Some(name) = snapshot
+						.strings
+						.resolve(snapshot.sema.decls.item(decl.loc).name.inner)
+					{
+						detail = Some(format!("(as {name})"));
+					}
+				}
+			}
+			CompletionItemLabelDetails {
+				detail,
+				description: hover::callable_type(
+					&snapshot.sema,
+					&snapshot.strings,
+					definition,
+				),
+			}
+		})
+	} else {
+		None
+	};
+
+	CompletionItem {
+		insert_text_format: (matches!(insert, Insert::Call)
+			&& params.is_some())
+		.then_some(InsertTextFormat::SNIPPET),
+		insert_text,
+		sort_text: Some(match member_index {
+			Some(index) => format!("{rank}{index:04}"),
+			None => format!("{rank}{label}"),
+		}),
+		detail: hover::signature(&snapshot.sema, &snapshot.strings, definition),
+		documentation: hover::documentation(
+			&snapshot.sema,
+			&snapshot.compilation.files,
+			definition,
+		)
+		.map(|value| {
+			Documentation::MarkupContent(MarkupContent {
+				kind: MarkupKind::Markdown,
+				value,
+			})
+		}),
+		kind: Some(kind),
+		label: display_label,
+		filter_text: params.map(|_| label),
+		label_details,
+		..Default::default()
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
+/// What can be written at `offset`, and where: a name being written (its
+/// own span reaches the cursor), a member after an object, or a value or
+/// type not written yet (an error node the parser kept, or the room between
+/// a block's statements or a list's elements), in a declaration's signature
+/// or body. `None`
+/// anywhere else: in a comment, a declaration's own name, a literal, a
+/// segment after a type, a `use` or an `export`.
+///
+/// One path down the module's syntax: at each level the child at the
+/// cursor is found by a binary search of its siblings, which are in source
+/// order and do not overlap.
+pub(crate) fn position_at(
+	ast: &AST,
+	comments: &CommentMap,
+	offset: u32,
+) -> Option<Position> {
+	let cursor = Cursor { offset, ast };
+	// Inside a comment: its start is the `//` itself, its end the line's.
+	let comment = cursor.child(&comments.0);
+	if comment.is_some_and(|comment| comment.span.start < offset) {
+		return None;
+	}
+	cursor.item(&cursor.node(ast.root)?)
+}
 
-	#[test]
-	fn empty_source_is_identifier() {
-		assert_eq!(classify_context("", 0), CompletionContext::Identifier);
+/// A piece of syntax the walker searches by where it is written.
+trait Node {
+	fn span(&self) -> TextSpan;
+}
+
+impl<T> Node for Spanned<T> {
+	fn span(&self) -> TextSpan {
+		self.span
+	}
+}
+
+impl Node for Path {
+	fn span(&self) -> TextSpan {
+		self.span
+	}
+}
+
+impl Node for AssocBinding {
+	fn span(&self) -> TextSpan {
+		self.span
+	}
+}
+
+impl Node for FunctionTypeParam {
+	fn span(&self) -> TextSpan {
+		self.span
+	}
+}
+
+impl Node for Comment {
+	fn span(&self) -> TextSpan {
+		self.span
+	}
+}
+
+struct Cursor<'a> {
+	offset: u32,
+	/// The file's tree, where its type syntax is read by id.
+	ast: &'a AST,
+}
+
+impl Cursor<'_> {
+	/// Whether the cursor touches `span`: inside it, or at either end, where
+	/// a name being typed ends.
+	fn at(&self, span: TextSpan) -> bool {
+		span.start <= self.offset && self.offset <= span.end
 	}
 
-	#[test]
-	fn bare_identifier_at_end_is_identifier() {
-		assert_eq!(classify_context("foo", 3), CompletionContext::Identifier);
+	/// Whether the cursor is between the delimiters that start and end
+	/// `span`, where something not written yet can go.
+	fn inside(&self, span: TextSpan) -> bool {
+		span.start < self.offset && self.offset < span.end
 	}
 
-	#[test]
-	fn blank_inside_block_is_identifier() {
-		let src = "fn add(a: i32, b: i32) -> i32 {\n    ";
-		assert_eq!(
-			classify_context(src, src.len()),
-			CompletionContext::Identifier
-		);
+	/// The one of `siblings` (in source order, not overlapping, as written)
+	/// the cursor touches. When two do, one ending where the next starts,
+	/// the first: the name being typed ends at the cursor.
+	fn child<'a, T: Node>(&self, siblings: &'a [T]) -> Option<&'a T> {
+		Some(&siblings[self.child_index(siblings)?])
 	}
 
-	#[test]
-	fn partial_identifier_after_operator_is_identifier() {
-		assert_eq!(
-			classify_context("let x = fo", 10),
-			CompletionContext::Identifier
-		);
+	/// The node of `list` the cursor touches, as `child` finds it among the
+	/// spans its column keeps beside it.
+	fn node<T: InColumn + Copy>(&self, list: List<T>) -> Option<T> {
+		let index = self.child_index_by(self.ast.spans(list), |span| *span)?;
+		Some(self.ast.list(list)[index])
 	}
 
-	#[test]
-	fn after_open_brace_is_identifier() {
-		assert_eq!(classify_context("{ ", 2), CompletionContext::Identifier);
+	/// `child`, for siblings whose spans are read through the tree (`span`):
+	/// the ids of types, bounds and type arguments.
+	fn child_by<'s, T>(
+		&self,
+		siblings: &'s [T],
+		span: impl Fn(&T) -> TextSpan,
+	) -> Option<&'s T> {
+		Some(&siblings[self.child_index_by(siblings, span)?])
 	}
 
-	#[test]
-	fn dot_no_prefix_is_dot_access() {
-		// "a." — receiver is "a" with exclusive end 1
-		assert_eq!(
-			classify_context("a.", 2),
-			CompletionContext::DotAccess { receiver_end: 1 }
-		);
+	/// Where in `siblings` the one `child_by` finds is.
+	fn child_index_by<T>(
+		&self,
+		siblings: &[T],
+		span: impl Fn(&T) -> TextSpan,
+	) -> Option<usize> {
+		let index =
+			siblings.partition_point(|sibling| span(sibling).end < self.offset);
+		self.at(span(siblings.get(index)?)).then_some(index)
 	}
 
-	#[test]
-	fn dot_with_partial_field_prefix_is_dot_access() {
-		// "foo.bar" at offset 7 — prefix "bar", receiver "foo"
-		assert_eq!(
-			classify_context("foo.bar", 7),
-			CompletionContext::DotAccess { receiver_end: 3 }
-		);
+	/// Where in `siblings` the one `child` finds is.
+	fn child_index<T: Node>(&self, siblings: &[T]) -> Option<usize> {
+		let index = siblings
+			.partition_point(|sibling| sibling.span().end < self.offset);
+		self.at(siblings.get(index)?.span()).then_some(index)
 	}
 
-	#[test]
-	fn dot_with_spaces_is_dot_access() {
-		// "foo . " — spaces around dot, receiver_end still points past "foo"
-		assert_eq!(
-			classify_context("foo . ", 6),
-			CompletionContext::DotAccess { receiver_end: 3 }
-		);
+	fn item(&self, item: &Item) -> Option<Position> {
+		match item {
+			Item::Function {
+				signature, block, ..
+			} => self.function(signature, Some(*block)),
+			Item::FunctionDeclaration { signature, .. }
+			| Item::PackageFunction { signature, .. } => self.function(signature, None),
+			Item::PackageConst { name, ty, .. }
+			| Item::Memory { name, size: ty, .. } => {
+				Within::Signature(Anchor::Name(name.span))
+					.position(self.ty(*ty))
+			}
+			Item::PackageType {
+				name, type_params, ..
+			} => Within::Signature(Anchor::Name(name.span))
+				.position(self.type_params(*type_params)),
+			Item::Global {
+				name, ty, value, ..
+			}
+			| Item::Const {
+				name, ty, value, ..
+			} => self.constant(name.span, *ty, Some(*value)),
+			Item::Enum {
+				name,
+				repr,
+				entries,
+				..
+			} => Within::Signature(Anchor::Name(name.span))
+				.position(repr.and_then(|repr| self.ty(repr)))
+				.or_else(|| match &self.node(*entries)? {
+					EnumEntry::Variant(variant) => {
+						Within::Body(variant.name.span)
+							.position(self.expression(variant.value?))
+					}
+					EnumEntry::Rest => None,
+				}),
+			Item::Struct {
+				name,
+				type_params,
+				fields,
+				..
+			} => Within::Signature(Anchor::Name(name.span)).position(
+				self.type_params(*type_params)
+					.or_else(|| self.ty(self.node(*fields)?.ty)),
+			),
+			Item::TypeAlias {
+				name,
+				type_params,
+				body,
+				..
+			} => Within::Signature(Anchor::Name(name.span)).position(
+				self.type_params(*type_params).or_else(|| self.ty((*body)?)),
+			),
+			Item::TypeSet {
+				name,
+				bounds,
+				members,
+				..
+			} => Within::Signature(Anchor::Name(name.span)).position(
+				bounds
+					.as_ref()
+					.and_then(|bounds| self.bound(*bounds))
+					.or_else(|| {
+						let member = self.child(self.ast.list(*members))?;
+						self.path(self.ast.list(member.segments), NameUse::Type)
+					}),
+			),
+			Item::Trait {
+				name,
+				supertraits,
+				items,
+				..
+			} => {
+				let header = Within::Signature(Anchor::Name(name.span));
+				header
+					.position(
+						supertraits
+							.as_ref()
+							.and_then(|bounds| self.bound(*bounds)),
+					)
+					.or_else(|| match &self.node(*items)? {
+						TraitItem::Function {
+							signature, body, ..
+						} => self.function(signature, *body),
+						TraitItem::Const {
+							name, ty, value, ..
+						} => self.constant(name.span, Some(*ty), *value),
+						// Read in the trait's scope, where `Self` is the
+						// trait's.
+						TraitItem::AssociatedType { bounds, value, .. } => {
+							header.position(
+								bounds
+									.as_ref()
+									.and_then(|bounds| self.bound(*bounds))
+									.or_else(|| self.ty(*value.as_ref()?)),
+							)
+						}
+					})
+			}
+			Item::InherentImpl {
+				type_params,
+				target,
+				items,
+			} => self.impl_block(*type_params, None, target, *items),
+			Item::TraitImpl {
+				type_params,
+				trait_name,
+				target,
+				items,
+			} => self.impl_block(*type_params, Some(trait_name), target, *items),
+			Item::Import { entries, .. } => {
+				let ImportEntry::Declaration { declaration, .. } =
+					&self.node(*entries)?
+				else {
+					return None;
+				};
+				match declaration {
+					ImportDeclaration::Function { signature } => {
+						self.function(signature, None)
+					}
+					ImportDeclaration::Global { name, ty, .. }
+					| ImportDeclaration::Memory { name, size: ty } => {
+						Within::Signature(Anchor::Name(name.span))
+							.position(self.ty(*ty))
+					}
+				}
+			}
+			Item::Module { items, .. } => self.item(&self.node(*items)?),
+			Item::Export { .. }
+			| Item::ExportBlock { .. }
+			| Item::ModuleDeclaration { .. }
+			| Item::PackageInstance { .. }
+			| Item::Use { .. } => None,
+		}
 	}
 
-	#[test]
-	fn double_colon_no_prefix_is_path_access() {
-		// "Foo::" — lhs exclusive end is 3
-		assert_eq!(
-			classify_context("Foo::", 5),
-			CompletionContext::PathAccess { lhs_end: 3 }
-		);
+	/// A function, by its name: its signature, then its body if it has one.
+	fn function(
+		&self,
+		signature: &FunctionSignature,
+		body: Option<BlockId>,
+	) -> Option<Position> {
+		let name = signature.name.span;
+		let site = self
+			.type_params(signature.type_params)
+			.or_else(|| self.ty(self.node(signature.params)?.ty))
+			.or_else(|| self.ty(signature.result?));
+		Within::Signature(Anchor::Name(name))
+			.position(site)
+			.or_else(|| Within::Body(name).position(self.block(body?)))
 	}
 
-	#[test]
-	fn double_colon_with_partial_name_is_path_access() {
-		// "math::add" — prefix "add", lhs "math"
-		assert_eq!(
-			classify_context("math::add", 9),
-			CompletionContext::PathAccess { lhs_end: 4 }
-		);
+	/// A constant or a global, by its name: its type, then its value.
+	fn constant(
+		&self,
+		name: TextSpan,
+		ty: Option<TypeId>,
+		value: Option<ExprId>,
+	) -> Option<Position> {
+		Within::Signature(Anchor::Name(name))
+			.position(ty.and_then(|ty| self.ty(ty)))
+			.or_else(|| Within::Body(name).position(self.expression(value?)))
 	}
 
-	/// A colon the cursor is pressed against offers nothing — matching
-	/// rust-analyzer, which bails when the token to the immediate left is a
-	/// lone `:` rather than guessing what it will become.
-	#[test]
-	fn cursor_against_a_lone_colon_is_unavailable() {
-		assert_eq!(
-			classify_context("local x:", 8),
-			CompletionContext::Unavailable,
-			"a half-typed annotation has no type to complete yet"
-		);
-		assert_eq!(
-			classify_context("use std:", 8),
-			CompletionContext::Unavailable,
-			"the first colon of a `::` must not offer annotation types"
-		);
-		assert_eq!(
-			classify_context("use std:::", 10),
-			CompletionContext::Unavailable,
-			"three colons cannot open a path"
-		);
+	/// An impl: its header, read in its own scope, and its members.
+	fn impl_block(
+		&self,
+		type_params: List<TypeParam>,
+		trait_name: Option<&Path>,
+		target: &Path,
+		items: List<ImplItem>,
+	) -> Option<Position> {
+		let header = Within::Signature(Anchor::ImplTarget(target.span));
+		let site = self
+			.type_params(type_params)
+			.or_else(|| {
+				self.path(self.ast.list(trait_name?.segments), NameUse::Trait)
+			})
+			.or_else(|| {
+				self.path(self.ast.list(target.segments), NameUse::Type)
+			});
+		header.position(site).or_else(|| {
+			match &self.node(items)? {
+				ImplItem::Function {
+					signature, block, ..
+				} => self.function(signature, Some(*block)),
+				ImplItem::Constant {
+					name, ty, value, ..
+				} => self.constant(name.span, *ty, Some(*value)),
+				// Read in the impl's scope.
+				ImplItem::AssocType { ty, .. } => header.position(self.ty(*ty)),
+			}
+		})
 	}
 
-	/// The space is the whole difference: it moves the cursor off the colon,
-	/// so the annotation is now a position to complete rather than a token
-	/// mid-edit.
-	#[test]
-	fn a_space_after_the_colon_restores_type_completions() {
-		assert_eq!(
-			classify_context("local x: ", 9),
-			CompletionContext::TypeAnnotation
-		);
-		assert_eq!(
-			classify_context("local x: i", 10),
-			CompletionContext::TypeAnnotation,
-			"typing the type's first letter must keep completing it"
-		);
+	fn type_params(&self, params: List<TypeParam>) -> Option<Site> {
+		match self.node(params)? {
+			TypeParam::Type { bounds, .. } => self.bound(bounds?),
+			TypeParam::Const { ty, .. } => self.ty(ty),
+		}
 	}
 
-	#[test]
-	fn colon_after_name_with_space_is_type_annotation() {
-		assert_eq!(
-			classify_context("local x: ", 9),
-			CompletionContext::TypeAnnotation
-		);
+	fn bound(&self, bound: BoundId) -> Option<Site> {
+		if !self.at(self.ast.bound_span(bound)) {
+			return None;
+		}
+		self.bound_expression(self.ast.bound(bound))
 	}
 
-	#[test]
-	fn colon_with_partial_type_is_type_annotation() {
-		// "fn f(a: i" — prefix "i"
-		assert_eq!(
-			classify_context("fn f(a: i", 9),
-			CompletionContext::TypeAnnotation
-		);
+	/// A bound names a trait or a typeset; a binding's own name (`Size` in
+	/// `where { Size = u32 }`) is a member of it, not completed yet.
+	fn bound_expression(&self, bound: BoundExpression) -> Option<Site> {
+		let ast = self.ast;
+		match bound {
+			// A bound the parser expected and did not find.
+			BoundExpression::Error => Some(Site::Name(NameUse::Bound)),
+			BoundExpression::Path(segments) => {
+				self.path(ast.list(segments), NameUse::Bound)
+			}
+			BoundExpression::WithBindings { path, bindings } => self
+				.path(ast.list(path), NameUse::Bound)
+				.or_else(|| match self.child(ast.list(bindings))?.kind {
+					AssocBindingKind::Equals(ty)
+					| AssocBindingKind::ConstRepresentable { ty, .. } => self.ty(ty),
+					AssocBindingKind::Bound(bound) => self.bound(bound),
+					AssocBindingKind::ConstEquals { value, .. } => {
+						self.const_argument(value)
+					}
+				}),
+			BoundExpression::BoundList(bounds) => self.bound(
+				*self.child_by(ast.list(bounds), |&b| ast.bound_span(b))?,
+			),
+		}
 	}
 
-	#[test]
-	fn single_colon_not_confused_with_double_colon() {
-		// Sanity: a completed `::` opens a path; one colon is still
-		// mid-token and opens nothing.
-		assert_eq!(
-			classify_context("Foo::", 5),
-			CompletionContext::PathAccess { lhs_end: 3 }
-		);
-		assert_eq!(classify_context("a:", 2), CompletionContext::Unavailable);
+	fn statement(&self, statement: Statement) -> Option<Site> {
+		match statement {
+			Statement::Expression(expression) => self.expression(expression),
+			Statement::LocalDefinition { pattern, ty, value } => self
+				.pattern(pattern)
+				.or_else(|| self.ty(ty?))
+				.or_else(|| self.expression(value)),
+		}
 	}
 
-	#[test]
-	fn partial_identifier_mid_expression_is_identifier() {
-		// "a + b" cursor after "b" — no special trigger
-		assert_eq!(classify_context("a + b", 5), CompletionContext::Identifier);
+	/// A block: the statement at the cursor, its tail, or between its
+	/// braces, where a statement can start.
+	fn block(&self, block: BlockId) -> Option<Site> {
+		let ast = self.ast;
+		let span = ast.block_span(block);
+		if !self.at(span) {
+			return None;
+		}
+		let Block { statements, tail } = ast.block(block);
+		let statement =
+			self.child_by(ast.list(statements), |&s| ast.statement_span(s));
+		match (statement, tail) {
+			(Some(&statement), _) => self.statement(ast.statement(statement)),
+			(None, Some(tail)) if self.at(ast.expr_span(tail)) => {
+				self.expression(tail)
+			}
+			_ => self.inside(span).then_some(Site::Name(NameUse::Value)),
+		}
+	}
+
+	fn expression(&self, expression: ExprId) -> Option<Site> {
+		let ast = self.ast;
+		let span = ast.expr_span(expression);
+		if !self.at(span) {
+			return None;
+		}
+		match ast.expr(expression) {
+			// A value the parser expected and did not find.
+			Expression::Error => Some(Site::Name(NameUse::Value)),
+			Expression::Path(segments) => {
+				self.path(ast.list(segments), NameUse::Value)
+			}
+			// Before the braces is the keyword and the label, where nothing
+			// is looked up.
+			Expression::Block { block, .. } => self.block(block),
+			Expression::Unary { operand, .. } => self.expression(operand),
+			Expression::Binary { left, right, .. } => {
+				self.expression(left).or_else(|| self.expression(right))
+			}
+			Expression::Call {
+				callee, arguments, ..
+			} => self.expression(callee).or_else(|| {
+				self.list(ast.arguments_span(expression), ast.list(arguments))
+			}),
+			// A method's object gives its receiver, one argument given.
+			Expression::NamedCall {
+				callee,
+				arguments,
+				braces,
+			} => {
+				let (name, given) = match ast.expr(callee) {
+					Expression::Path(segments)
+					| Expression::QualifiedPath { segments, .. } => (
+						ast.list(segments)
+							.last()
+							.map(|segment| segment.ident.span),
+						0,
+					),
+					Expression::ObjectAccess { member, .. } => {
+						(Some(ast.segment(member).ident.span), 1)
+					}
+					_ => (None, 0),
+				};
+				self.expression(callee).or_else(|| {
+					self.named(
+						expression,
+						name,
+						given,
+						ast.list(arguments),
+						braces,
+					)
+				})
+			}
+			Expression::ObjectAccess { object, member } => self
+				.expression(object)
+				.or_else(|| self.type_args(&ast.segment(member)))
+				.or_else(|| {
+					(ast.expr_span(object).end < self.offset
+						&& self.offset <= ast.segment(member).ident.span.end)
+						.then_some(Site::Member { object })
+				}),
+			Expression::Deref { pointer: value }
+			| Expression::AddressOf { value } => self.expression(value),
+			Expression::Return { value } => self.expression(value?),
+			Expression::Break { label, value } => self
+				.label(label, Jump::Break)
+				.or_else(|| self.expression(value?)),
+			Expression::Continue { label } => self.label(label, Jump::Continue),
+			Expression::IfElse {
+				condition,
+				then_block,
+				else_block,
+			} => self
+				.expression(condition)
+				.or_else(|| self.block(then_block))
+				.or_else(|| self.expression(else_block?)),
+			Expression::Match { scrutinee, arms } => {
+				self.expression(scrutinee).or_else(|| {
+					let arm = self.child_by(ast.list(arms), |arm| {
+						TextSpan::new(
+							ast.pattern_span(arm.pattern).start,
+							ast.expr_span(arm.body).end,
+						)
+					})?;
+					self.pattern(arm.pattern)
+						.or_else(|| self.expression(arm.body))
+				})
+			}
+			Expression::Loop { block, .. } => self.block(block),
+			Expression::QualifiedPath { root, .. } => {
+				self.qualified_root(ast.qualified_root(root))
+			}
+			Expression::Grouped { inner, .. } => self.ty(inner),
+			Expression::Tuple { elements }
+			| Expression::ArrayList { elements } => self.list(span, ast.list(elements)),
+			Expression::Ascription { value, ty } => {
+				self.expression(value).or_else(|| self.ty(ty))
+			}
+			Expression::ArrayRepeat { value, count } => self
+				.expression(value)
+				.or_else(|| self.const_argument(count)),
+			Expression::Index { object, index } => {
+				self.expression(object).or_else(|| self.expression(index))
+			}
+			Expression::Int { .. }
+			| Expression::Float
+			| Expression::Char
+			| Expression::String
+			| Expression::Placeholder => None,
+		}
+	}
+
+	/// A list of values in the delimiters that start and end `delimiters`:
+	/// the element at the cursor, or a value not written yet in the room
+	/// between two (`f(a, |)`).
+	fn list(&self, delimiters: TextSpan, elements: &[ExprId]) -> Option<Site> {
+		match self.child_by(elements, |&element| self.ast.expr_span(element)) {
+			Some(&element) => self.expression(element),
+			None => self
+				.inside(delimiters)
+				.then_some(Site::Name(NameUse::Value)),
+		}
+	}
+
+	/// A call's named arguments, in their braces: the name of the one at the
+	/// cursor, or one not written yet in the room between two, is one of the
+	/// callee's parameters (`callee`, its last name, if it has one; `given`,
+	/// as `Site::Argument` says); after a name's `:` is its value. Outside
+	/// the braces nothing is: a list not closed yet offers no names.
+	fn named(
+		&self,
+		call: ExprId,
+		callee: Option<TextSpan>,
+		given: usize,
+		arguments: &[NamedArgument],
+		braces: TextSpan,
+	) -> Option<Site> {
+		if !self.inside(braces) {
+			return None;
+		}
+		let ast = self.ast;
+		let at = self.child_index_by(arguments, |argument| {
+			let end = argument.value.map_or(argument.name.span.end, |value| {
+				ast.expr_span(value).end
+			});
+			TextSpan::new(argument.name.span.start, end)
+		});
+		if let Some(at) = at {
+			let argument = &arguments[at];
+			if !self.at(argument.name.span) {
+				return self.expression(argument.value?);
+			}
+		}
+		let written = (arguments.iter().enumerate())
+			.filter(|&(index, _)| Some(index) != at)
+			.map(|(_, argument)| argument.name.inner)
+			.collect();
+		Some(Site::Argument {
+			call,
+			callee: callee?,
+			given,
+			written,
+		})
+	}
+
+	fn ty(&self, ty: TypeId) -> Option<Site> {
+		let ast = self.ast;
+		if !self.at(ast.type_span(ty)) {
+			return None;
+		}
+		match ast.ty(ty) {
+			// A type the parser expected and did not find.
+			TypeExpression::Error => Some(Site::Name(NameUse::Type)),
+			TypeExpression::Path(segments) => {
+				self.path(ast.list(segments), NameUse::Type)
+			}
+			TypeExpression::Tuple { elements } => self
+				.ty(*self
+					.child_by(ast.list(elements), |&e| ast.type_span(e))?),
+			TypeExpression::Function { params, result } => self
+				.child(ast.list(params))
+				.and_then(|param| self.ty(param.ty))
+				.or_else(|| self.ty(result?)),
+			TypeExpression::Pointer { inner, .. }
+			| TypeExpression::Slice { inner }
+			| TypeExpression::Grouped { inner, .. } => self.ty(inner),
+			TypeExpression::Array { inner, length } => {
+				self.ty(inner).or_else(|| self.const_argument(length))
+			}
+			TypeExpression::QualifiedPath { root, .. } => {
+				self.qualified_root(ast.qualified_root(root))
+			}
+			TypeExpression::Infer | TypeExpression::Never => None,
+		}
+	}
+
+	fn pattern(&self, pattern: PatId) -> Option<Site> {
+		let ast = self.ast;
+		if !self.at(ast.pattern_span(pattern)) {
+			return None;
+		}
+		match ast.pattern(pattern) {
+			// `const MAX`: a constant, named in the value tier.
+			Pattern::Constant { path } => {
+				self.path(ast.list(path), NameUse::Value)
+			}
+			Pattern::Or(alternatives) => self.pattern(
+				*self.child_by(ast.list(alternatives), |&alternative| {
+					ast.pattern_span(alternative)
+				})?,
+			),
+			Pattern::Destructure(Destructure::Tuple { elements }) => {
+				self.pattern_elements(ast.list(elements))
+			}
+			Pattern::Destructure(Destructure::Struct { path, elements }) => {
+				self.path(ast.list(path), NameUse::Value)
+					.or_else(|| self.pattern_elements(ast.list(elements)))
+			}
+			Pattern::Destructure(Destructure::NamedStruct { path, fields }) => {
+				self.path(ast.list(path), NameUse::Value).or_else(|| {
+					let field =
+						self.child_by(ast.list(fields), |item| match *item {
+							PatternFieldItem::Field(field) => {
+								let end = field
+									.pattern
+									.map_or(field.name.span.end, |pattern| {
+										ast.pattern_span(pattern).end
+									});
+								TextSpan::new(field.name.span.start, end)
+							}
+							PatternFieldItem::Rest(span) => span,
+						})?;
+					match *field {
+						PatternFieldItem::Field(field) => {
+							self.pattern(field.pattern?)
+						}
+						PatternFieldItem::Rest(_) => None,
+					}
+				})
+			}
+			// A binding declares its name; nothing is looked up.
+			Pattern::Binding { .. }
+			| Pattern::Wildcard
+			| Pattern::Literal(_)
+			| Pattern::Error => None,
+		}
+	}
+
+	fn pattern_elements(&self, elements: &[PatternElement]) -> Option<Site> {
+		let ast = self.ast;
+		let element = self.child_by(elements, |element| match *element {
+			PatternElement::Pattern(pattern) => ast.pattern_span(pattern),
+			PatternElement::Rest(span) => span,
+		})?;
+		match *element {
+			PatternElement::Pattern(pattern) => self.pattern(pattern),
+			PatternElement::Rest(_) => None,
+		}
+	}
+
+	/// A path: each segment is looked up in `tier` when it is the last, and
+	/// as a type when a namespace follows it, as path resolution does
+	/// (`try_resolve_path`); the first one is a bare name, and a later one
+	/// is looked up in what the segment before it means. A segment not
+	/// written yet (`a::`) is the error symbol at the empty span after the
+	/// `::`. Type arguments on any segment are types of their own.
+	fn path(&self, segments: &[PathSegment], used_as: NameUse) -> Option<Site> {
+		let ast = self.ast;
+		let index = self.child_index_by(segments, |segment| {
+			TextSpan::new(
+				segment.ident.span.start,
+				ast.type_args_span(segment).end,
+			)
+		})?;
+		if !self.at(segments[index].ident.span) {
+			return self.type_args(&segments[index]);
+		}
+		let used_as = if index + 1 == segments.len() {
+			used_as
+		} else {
+			NameUse::Type
+		};
+		Some(match index.checked_sub(1) {
+			None => Site::Name(used_as),
+			Some(before) => Site::Segment {
+				prefix: segments[before].ident.span,
+				used_as,
+			},
+		})
+	}
+
+	/// `<T as Tr>` before a path's segments: a type and a trait (read as a
+	/// bound is). What
+	/// follows it is a member of the type, which is not completed yet.
+	fn qualified_root(&self, root: QualifiedPathRoot) -> Option<Site> {
+		self.ty(root.self_type).or_else(|| {
+			self.path(self.ast.list(root.trait_path), NameUse::Bound)
+		})
+	}
+
+	/// The label of a jump. A label not written yet (`break :`) is the
+	/// error symbol at the empty span after the `:`.
+	fn label(
+		&self,
+		label: Option<Spanned<SymbolU32>>,
+		jump: Jump,
+	) -> Option<Site> {
+		self.at(label?.span).then_some(Site::Label(jump))
+	}
+
+	fn type_args(&self, segment: &PathSegment) -> Option<Site> {
+		let ast = self.ast;
+		let argument = self
+			.child_by(ast.list(segment.type_args), |&argument| {
+				ast.type_argument_span(argument)
+			})?;
+		match *argument {
+			TypeArgument::Type(ty) => self.ty(ty),
+			TypeArgument::Const(constant) => self.const_argument(constant),
+		}
+	}
+
+	fn const_argument(&self, constant: ConstId) -> Option<Site> {
+		let ast = self.ast;
+		if !self.at(ast.const_span(constant)) {
+			return None;
+		}
+		match ast.constant(constant) {
+			ConstArgument::Path(segments) => {
+				self.path(ast.list(segments), NameUse::Value)
+			}
+			ConstArgument::QualifiedPath { root, .. } => {
+				self.qualified_root(ast.qualified_root(root))
+			}
+			ConstArgument::Grouped { inner, .. } => self.ty(inner),
+			ConstArgument::Literal(_) | ConstArgument::Infer => None,
+		}
 	}
 }

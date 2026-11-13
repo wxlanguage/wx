@@ -1,27 +1,26 @@
-memory heap: Memory where { Size = u32 };
+memory heap: u32;
 
 import "console" as console {
-    fn log(message: &[u8]);
+    use super::heap;
+    func log(message: heap::&[u8]);
 }
 
-fn fibonacci(n: i32) -> i32 {
+func fibonacci(n: i32) -> i32 {
     if n <= 1 { return n };
 
-    console::log("calculating fibonacci");
-    console::log("gewgew");
     fibonacci(n - 1) + fibonacci(n - 2)
 }
 
-fn fibonacci_iterative(mut n: i32) -> i32 {
-    if n <= 1 { return n }
+func fibonacci_iterative(mut n: i32) -> i32 {
+    if n <= 1 { return n };
 
     local mut a: i32 = 0;
     local mut b: i32 = 1;
     local mut c: i32 = 0;
 
     loop {
-        if n == 0 { break a }
-        if n == 1 { break b }
+        if n == 0 { break a };
+        if n == 1 { break b };
 
         c = a + b;
         a = b;
@@ -30,12 +29,38 @@ fn fibonacci_iterative(mut n: i32) -> i32 {
     }
 }
 
-fn main() {
+func binary_search<
+    M: Memory where { Size: Sub + Add + Div + Ord },
+    T: Ord,
+>(arr: M::&[T], target: T) -> (Bool, M::Size) {
+    local mut low: M::Size = 0;
+    local mut high = arr.len();
+
+    loop {
+        if low == high { return (False, 0) };
+
+        local mid = low + (high - low) / 2;
+        match arr[mid].cmp(target) {
+            Ordering::Less => low = mid + 1,
+            Ordering::Greater => high = mid,
+            Ordering::Equal => return (True, mid),
+        }
+    }
+}
+
+func contains(arr: heap::&[u32], target: u32) -> Bool {
+    local (found, _) = binary_search(arr, target);
+    found
+}
+
+func main() {
     console::log("hello");
 }
 
 export {
     fibonacci,
     fibonacci_iterative,
+    contains,
     main,
+    heap as "memory",
 }

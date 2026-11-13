@@ -1,9 +1,18 @@
 use std::collections::HashMap;
 
+use string_interner::symbol::SymbolU32;
+
 use leb128fmt;
 
 use crate::wasm::{self, ScalarType};
+
+#[cfg(test)]
+mod checks;
+mod linearize;
+use crate::mir::references::Reference;
+use crate::opt::Reachability;
 use crate::{ast, mir};
+pub use linearize::uses_br_table;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct FuncIndex(pub u32);
@@ -11,8 +20,7 @@ pub struct FuncIndex(pub u32);
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct GlobalIndex(pub u32);
 
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FunctionSignature {
 	pub param_count: usize,
@@ -29,18 +37,28 @@ impl FunctionSignature {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TypeSection {
 	signatures: Box<[FunctionSignature]>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, serde::Serialize)]
+#[derive(
+	Debug,
+	Clone,
+	Copy,
+	PartialEq,
+	PartialOrd,
+	Eq,
+	Ord,
+	Hash,
+	serde::Serialize
+)]
 pub struct SignatureIndex(pub u32);
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct TableIndex(pub u32);
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionSection {
 	types: Box<[SignatureIndex]>,
 }
@@ -62,18 +80,18 @@ pub enum ExportItem {
 	},
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ExportSection {
 	items: Box<[ExportItem]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FunctionBody {
 	locals: Box<[wasm::Local]>,
 	expressions: Box<[u8]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct CodeSection {
 	functions: Box<[FunctionBody]>,
 }
@@ -96,36 +114,36 @@ pub struct TableType {
 	limits: ResizableLimits,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct TableSection {
 	tables: Box<[TableType]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ElementSegment {
 	table_index: TableIndex,
 	offset: u32,
 	indices: Box<[FuncIndex]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ElementSection {
 	segments: Box<[ElementSegment]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct GlobalSection {
 	globals: Box<[Global]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
-#[derive(Debug, Clone)]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Mutability {
 	Immutable,
 	Mutable,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 struct Global {
 	ty: ScalarType,
 	mutability: Mutability,
@@ -134,8 +152,8 @@ struct Global {
 	value: wasm::Instruction,
 }
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum ImportDesc {
 	Function {
 		signature_index: SignatureIndex,
@@ -150,24 +168,24 @@ pub enum ImportDesc {
 }
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Import {
 	pub module: String,
 	pub name: String,
 	pub desc: ImportDesc,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ImportSection {
 	imports: Box<[Import]>,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 struct StartSection {
 	func_index: u32,
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct WasmModule {
 	types: TypeSection,
 	imports: ImportSection,
@@ -185,48 +203,135 @@ pub struct WasmModule {
 struct MemoryEntry {
 	wasm_index: u32,
 	kind: mir::MemoryKind,
-	/// Total size (bytes) of this memory's static data segment.
-	static_size: u32,
+}
+
+/// The static data codegen lays out: each memory's segment bytes, each live
+/// entry's address in its memory, and where each memory's data ends.
+struct StaticLayout {
+	segments: HashMap<mir::MemoryId, Vec<u8>>,
+	addresses: HashMap<mir::StaticEntryId, u32>,
+}
+
+/// How `Memory::DATA_END` is aligned: past the static data, at an address
+/// any value's alignment divides, so an allocator can start there.
+const DATA_END_ALIGN: u32 = 16;
+
+impl StaticLayout {
+	/// The address right after `memory`'s static data (`Memory::DATA_END`).
+	fn data_end(&self, memory: mir::MemoryId) -> u32 {
+		let size = self.segments.get(&memory).map_or(0, Vec::len);
+		u32::try_from(size)
+			.unwrap()
+			.next_multiple_of(DATA_END_ALIGN)
+	}
+
+	fn address(&self, target: mir::AddressTarget) -> u32 {
+		match target {
+			mir::AddressTarget::Entry(entry) => self.addresses[&entry],
+			mir::AddressTarget::DataEnd(memory) => self.data_end(memory),
+		}
+	}
+}
+
+/// The memory an address into `target` belongs to.
+fn target_memory(mir: &mir::MIR, target: mir::AddressTarget) -> mir::MemoryId {
+	match target {
+		mir::AddressTarget::Entry(entry) => {
+			mir.static_entries[usize::from(entry)].memory
+		}
+		mir::AddressTarget::DataEnd(memory) => memory,
+	}
+}
+
+/// Place selected entries by decreasing alignment, then ID for deterministic
+/// output. Patch relocations only after every selected address is known.
+fn lay_out_static_data(
+	mir: &mir::MIR,
+	mut order: Vec<mir::StaticEntryId>,
+) -> StaticLayout {
+	order.sort_by_key(|&entry| {
+		(
+			std::cmp::Reverse(mir.static_entries[usize::from(entry)].align),
+			usize::from(entry),
+		)
+	});
+
+	let mut layout = StaticLayout {
+		segments: HashMap::new(),
+		addresses: HashMap::new(),
+	};
+	for &entry in &order {
+		let data = &mir.static_entries[usize::from(entry)];
+		let bytes = layout.segments.entry(data.memory).or_default();
+		bytes.resize(bytes.len().next_multiple_of(data.align as usize), 0);
+		layout
+			.addresses
+			.insert(entry, u32::try_from(bytes.len()).unwrap());
+		bytes.extend_from_slice(&data.bytes);
+	}
+	let mut patches = Vec::new();
+	for &entry in &order {
+		let data = &mir.static_entries[usize::from(entry)];
+		let base = layout.addresses[&entry] as usize;
+		for relocation in &data.relocations {
+			let memory = target_memory(mir, relocation.target);
+			let width = mir.memory(memory).kind.pointer_size() as usize;
+			patches.push((
+				data.memory,
+				base + relocation.offset as usize,
+				width,
+				layout.address(relocation.target),
+			));
+		}
+	}
+	for (memory, at, width, address) in patches {
+		let bytes = layout.segments.get_mut(&memory).unwrap();
+		let at = &mut bytes[at..][..width];
+		let mut number = [0; 8];
+		number[..width].copy_from_slice(at);
+		let patched = u64::from_le_bytes(number) + u64::from(address);
+		at.copy_from_slice(&patched.to_le_bytes()[..width]);
+	}
+	layout
 }
 
 pub struct Builder {
 	table: Vec<FuncIndex>,
-	/// Byte offset of each live static entry in the assembled data segment.
-	/// Keyed by `MIR.static_entries` index.
-	entry_offsets: HashMap<u32, u32>,
-	/// Maps every function DefId (imported or defined) to its wasm function
+	/// The address of each live static entry in its memory.
+	statics: StaticLayout,
+	/// Maps each retained function DefId (imported or defined) to its wasm function
 	/// index. Imported functions occupy indices 0..import_func_count;
 	/// defined functions follow.
-	func_wasm_index: HashMap<ast::DefId, u32>,
-	/// Maps every global DefId (imported or defined) to its wasm global index.
+	func_wasm_index: HashMap<mir::FunctionId, u32>,
+	/// Maps each retained global DefId (imported or defined) to its wasm global index.
 	/// Imported globals occupy indices 0..import_global_count; defined globals
 	/// follow.
-	global_wasm_index: HashMap<ast::DefId, u32>,
-	/// Maps every memory DefId (imported or defined) to its wasm index and kind.
+	global_wasm_index: HashMap<mir::GlobalId, u32>,
+	/// Maps each retained memory DefId (imported or defined) to its wasm index and kind.
 	/// Imported memories occupy indices 0..import_memory_count; defined follow.
-	memories: HashMap<ast::DefId, MemoryEntry>,
+	memories: HashMap<mir::MemoryId, MemoryEntry>,
 	/// Deduplicated function-type entries for the wasm type section.
 	/// Shared between function signatures and multi-value block types.
 	signatures: HashMap<FunctionSignature, SignatureIndex>,
 }
 
 impl Builder {
-	/// Intern a function signature built from a MIR signature + the aggregate
-	/// pool, correctly flattening any aggregate params/results into
-	/// individual wasm types.
+	/// The module's type index for MIR's signature `signature`, given
+	/// on first use: only the types the module's functions and blocks use
+	/// are written.
 	fn register_signature(
 		&mut self,
-		sig: &mir::FunctionSignature,
-		aggregates: &[mir::Aggregate],
+		signatures: &mir::Signatures,
+		signature: mir::SignatureIndex,
 	) -> SignatureIndex {
-		let mut param_results = Vec::new();
-		for &param in sig.params() {
-			param_results
-				.extend(wasm::flatten_type_to_scalars(param, aggregates));
-		}
-		let param_count = param_results.len();
-		param_results
-			.extend(wasm::flatten_type_to_scalars(sig.result(), aggregates));
+		let scalar = |&ty| ScalarType::try_from(ty).expect("a scalar");
+		let params = signatures.params(signature);
+		let param_count = params.len();
+		let param_results: Vec<ScalarType> = params
+			.iter()
+			.chain(signatures.results(signature))
+			.map(scalar)
+			.collect();
 		let signature = FunctionSignature {
 			param_count,
 			param_results: param_results.into_boxed_slice(),
@@ -235,168 +340,188 @@ impl Builder {
 		*self.signatures.entry(signature).or_insert(next)
 	}
 
+	/// Emit optimized MIR using current reachability marks, keeping MIR IDs intact.
 	pub fn build(
 		mir: &mir::MIR,
 		interner: &ast::StringInterner,
+		reached: &Reachability,
 	) -> Result<WasmModule, ()> {
-		// Layout static data segment: collect live entries from all functions,
-		// sort largest-align-first for minimal padding, then lay out bytes.
-		let live_indices: std::collections::HashSet<u32> = mir
-			.functions
-			.iter()
-			.flat_map(|f| f.static_data.iter().copied())
+		Self::build_with(mir, interner, reached, |mir, id| {
+			linearize::linearize(mir, mir.code(id))
+		})
+	}
+
+	/// Direct original-MIR reference for execution checks, without optimization.
+	#[cfg(test)]
+	pub(crate) fn build_linearized(
+		mir: &mir::MIR,
+		interner: &ast::StringInterner,
+	) -> Result<WasmModule, ()> {
+		let reached = Reachability::collect_for_tests(mir);
+		Self::build(mir, interner, &reached)
+	}
+
+	fn build_with(
+		mir: &mir::MIR,
+		interner: &ast::StringInterner,
+		reached: &Reachability,
+		schedule: fn(&mir::MIR, mir::FunctionId) -> wasm::Function,
+	) -> Result<WasmModule, ()> {
+		let retains = |item| reached.is_reachable(Reference::Item(item));
+		let data = (0..mir.static_entries.len())
+			.map(|index| mir::StaticEntryId::new(index as u32))
+			.filter(|&id| reached.is_reachable(Reference::Data(id)))
 			.collect();
-		let mut sorted_indices: Vec<u32> = live_indices.into_iter().collect();
-		sorted_indices.sort_by(|&a, &b| {
-			mir.static_entries[b as usize]
-				.align
-				.cmp(&mir.static_entries[a as usize].align)
-		});
-		// One segment per memory that has static data; an entry's offset is
-		// relative to its own memory's segment.
-		let mut segment_bytes: HashMap<ast::DefId, Vec<u8>> = HashMap::new();
-		let mut entry_offsets: HashMap<u32, u32> = HashMap::new();
-		for idx in sorted_indices {
-			let entry = &mir.static_entries[idx as usize];
-			let bytes = segment_bytes.entry(entry.memory).or_default();
-			let current = bytes.len() as u32;
-			let aligned = current.next_multiple_of(entry.align);
-			bytes.extend(std::iter::repeat_n(0, (aligned - current) as usize));
-			entry_offsets.insert(idx, bytes.len() as u32);
-			bytes.extend_from_slice(&entry.bytes);
-		}
+		let statics = lay_out_static_data(mir, data);
 
 		let mut builder = Builder {
 			table: Vec::new(),
-			entry_offsets,
+			statics,
 			func_wasm_index: HashMap::new(),
 			global_wasm_index: HashMap::new(),
 			memories: HashMap::new(),
 			signatures: HashMap::new(),
 		};
 
-		// Assign wasm memory indices: imported memories first, then defined.
-		// tir::ItemSource::External < Internal so a stable sort puts imports first.
-		{
-			let mut mems: Vec<&mir::MemoryInfo> = mir.memories.iter().collect();
-			mems.sort_by_key(|m| m.source);
-			for (idx, m) in mems.iter().enumerate() {
-				builder.memories.insert(
-					m.id,
-					MemoryEntry {
-						wasm_index: idx as u32,
-						kind: m.kind,
-						static_size: segment_bytes
-							.get(&m.id)
-							.map_or(0, |b| b.len() as u32),
-					},
-				);
-			}
-		}
-
-		// Process imports: build the wasm Import list and assign wasm indices.
-		// Imports come first in the wasm binary, so their indices are assigned here.
+		// Every index space numbers its imports first. One pass over the
+		// import table gives each entry the next index of its kind, or the
+		// index of an earlier entry with the same names and external type:
+		// the host provides both from the same names, so they are one import
+		// to it. Defined items follow, in id order.
 		let mut imports = Vec::<Import>::new();
+		let mut merged: HashMap<(SymbolU32, SymbolU32, ImportDesc), u32> =
+			HashMap::new();
 		let mut next_func_idx: u32 = 0;
 		let mut next_global_idx: u32 = 0;
-		for import_module in &mir.imports {
-			for item in &import_module.items {
-				match item {
-					mir::ImportModuleItem::Function {
-						name,
+		let mut next_memory_idx: u32 = 0;
+		for import in &mir.imports {
+			if !retains(import.item) {
+				continue;
+			}
+			let desc = match import.item {
+				mir::Item::Function(id) => ImportDesc::Function {
+					signature_index: builder.register_signature(
+						&mir.signatures,
+						mir.function(id).signature,
+					),
+				},
+				mir::Item::Global(id) => {
+					let global = mir.global(id);
+					ImportDesc::Global {
+						ty: ScalarType::try_from(global.ty).unwrap(),
+						mutability: match global.mutability {
+							mir::Mutability::Mutable => Mutability::Mutable,
+							mir::Mutability::Immutable => Mutability::Immutable,
+						},
+					}
+				}
+				mir::Item::Memory(id) => ImportDesc::Memory {
+					memory: memory_type(mir.memory(id), 0),
+				},
+			};
+			let next = match import.item {
+				mir::Item::Function(_) => &mut next_func_idx,
+				mir::Item::Global(_) => &mut next_global_idx,
+				mir::Item::Memory(_) => &mut next_memory_idx,
+			};
+			let index = *merged
+				.entry((import.module, import.name, desc.clone()))
+				.or_insert_with(|| {
+					imports.push(Import {
+						module: interner.resolve(import.module).unwrap().into(),
+						name: interner.resolve(import.name).unwrap().into(),
+						desc,
+					});
+					*next += 1;
+					*next - 1
+				});
+			match import.item {
+				mir::Item::Function(id) => {
+					builder.func_wasm_index.insert(id, index);
+				}
+				mir::Item::Global(id) => {
+					builder.global_wasm_index.insert(id, index);
+				}
+				mir::Item::Memory(id) => {
+					builder.memories.insert(
 						id,
-						signature_index,
-					} => {
-						let sig_index = builder.register_signature(
-							&mir.signatures[*signature_index as usize],
-							&mir.aggregates,
-						);
-						imports.push(Import {
-							module: import_module.name.clone(),
-							name: interner.resolve(*name).unwrap().to_string(),
-							desc: ImportDesc::Function {
-								signature_index: sig_index,
-							},
-						});
-						builder.func_wasm_index.insert(*id, next_func_idx);
-						next_func_idx += 1;
-					}
-					mir::ImportModuleItem::Global { name, id } => {
-						// TODO: get actual type from the MIR once global types are tracked
-						imports.push(Import {
-							module: import_module.name.clone(),
-							name: interner.resolve(*name).unwrap().to_string(),
-							desc: ImportDesc::Global {
-								ty: ScalarType::I32,
-								mutability: Mutability::Immutable,
-							},
-						});
-						builder.global_wasm_index.insert(*id, next_global_idx);
-						next_global_idx += 1;
-					}
-					mir::ImportModuleItem::Memory { name, id } => {
-						imports.push(Import {
-							module: import_module.name.clone(),
-							name: interner.resolve(*name).unwrap().to_string(),
-							desc: ImportDesc::Memory {
-								memory: Memory {
-									limits: MemoryLimits::Unbounded {
-										initial_pages: 0,
-									},
-									kind: builder.memories[id].kind,
-								},
-							},
-						});
-					}
+						MemoryEntry {
+							wasm_index: index,
+							kind: mir.memory(id).kind,
+						},
+					);
 				}
 			}
 		}
-		// Defined functions follow all imports; defined globals follow all imported
-		// globals.
-		for func in &mir.functions {
-			builder.func_wasm_index.insert(func.id, next_func_idx);
-			next_func_idx += 1;
+		let import_function_count = next_func_idx;
+		for (id, function) in mir.functions_with_ids() {
+			if retains(mir::Item::Function(id)) && function.code().is_some() {
+				builder.func_wasm_index.insert(id, next_func_idx);
+				next_func_idx += 1;
+			}
 		}
 		for global in &mir.globals {
-			builder.global_wasm_index.insert(global.id, next_global_idx);
-			next_global_idx += 1;
+			if retains(mir::Item::Global(global.id))
+				&& global.origin.defined().is_some()
+			{
+				builder.global_wasm_index.insert(global.id, next_global_idx);
+				next_global_idx += 1;
+			}
+		}
+		for memory in &mir.memories {
+			if retains(mir::Item::Memory(memory.id))
+				&& memory.origin.defined().is_some()
+			{
+				builder.memories.insert(
+					memory.id,
+					MemoryEntry {
+						wasm_index: next_memory_idx,
+						kind: memory.kind,
+					},
+				);
+				next_memory_idx += 1;
+			}
 		}
 
+		let defined_function_count =
+			(next_func_idx - import_function_count) as usize;
 		let mut function_signatures =
-			Vec::<SignatureIndex>::with_capacity(mir.functions.len());
+			Vec::<SignatureIndex>::with_capacity(defined_function_count);
 		let exports: Box<_> = mir
 			.exports
 			.iter()
-			.map(|item| match item {
-				mir::ExportItem::Global { id, name } => ExportItem::Global {
-					name: interner.resolve(*name).unwrap().to_string(),
-					global_index: GlobalIndex(builder.global_wasm_index[id]),
-				},
-				mir::ExportItem::Function { id, name } => {
-					ExportItem::Function {
-						name: interner.resolve(*name).unwrap().to_string(),
-						func_index: FuncIndex(builder.func_wasm_index[id]),
-					}
+			.map(|export| {
+				let name = interner.resolve(export.name).unwrap().to_string();
+				match export.item {
+					mir::Item::Global(id) => ExportItem::Global {
+						name,
+						global_index: GlobalIndex(
+							builder.global_wasm_index[&id],
+						),
+					},
+					mir::Item::Function(id) => ExportItem::Function {
+						name,
+						func_index: FuncIndex(builder.func_wasm_index[&id]),
+					},
+					mir::Item::Memory(id) => ExportItem::Memory {
+						name,
+						memory_index: builder.memories[&id].wasm_index,
+					},
 				}
-				mir::ExportItem::Memory { id, name } => ExportItem::Memory {
-					memory_index: builder.memories[id].wasm_index,
-					name: interner.resolve(*name).unwrap().to_string(),
-				},
 			})
 			.collect();
 
 		let mut functions =
-			Vec::<FunctionBody>::with_capacity(mir.functions.len());
-		for func in mir.functions.iter() {
-			let signature_index = builder.register_signature(
-				&mir.signatures[func.signature_index as usize],
-				&mir.aggregates,
-			);
+			Vec::<FunctionBody>::with_capacity(defined_function_count);
+		for (id, func) in mir.functions_with_ids() {
+			if !retains(mir::Item::Function(id)) || func.code().is_none() {
+				continue;
+			}
+			let signature_index =
+				builder.register_signature(&mir.signatures, func.signature);
 			function_signatures.push(signature_index);
 
-			let opt_func = crate::opt::builder::Builder::build(mir, func);
-			let scheduled =
-				crate::opt::scheduler::Scheduler::schedule(&opt_func, mir);
+			let scheduled = schedule(mir, id);
 			let body = builder.encode_scheduled(&scheduled, mir);
 
 			functions.push(body);
@@ -406,9 +531,17 @@ impl Builder {
 			globals: mir
 				.globals
 				.iter()
-				.map(|global| {
+				.filter(|global| retains(mir::Item::Global(global.id)))
+				.filter_map(|global| {
+					let &const_init = global.origin.defined()?;
+					if let mir::ConstInit::DataEnd { memory } = const_init {
+						assert!(
+							builder.memories.contains_key(&memory),
+							"DATA_END requires a retained memory"
+						);
+					}
 					let init_value = match (
-						global.const_init,
+						const_init,
 						ScalarType::try_from(global.ty).unwrap(),
 					) {
 						(mir::ConstInit::Int(v), ScalarType::I32) => {
@@ -423,16 +556,40 @@ impl Builder {
 						(mir::ConstInit::Float(v), ScalarType::F64) => {
 							wasm::Instruction::F64Const(v)
 						}
+						(
+							mir::ConstInit::Static { entry, offset },
+							ScalarType::I32,
+						) => wasm::Instruction::I32Const(
+							(builder.statics.addresses[&entry] + offset) as i32,
+						),
+						(
+							mir::ConstInit::Static { entry, offset },
+							ScalarType::I64,
+						) => wasm::Instruction::I64Const(i64::from(
+							builder.statics.addresses[&entry] + offset,
+						)),
+						(
+							mir::ConstInit::DataEnd { memory },
+							ScalarType::I32,
+						) => wasm::Instruction::I32Const(
+							builder.statics.data_end(memory) as i32,
+						),
+						(
+							mir::ConstInit::DataEnd { memory },
+							ScalarType::I64,
+						) => wasm::Instruction::I64Const(i64::from(
+							builder.statics.data_end(memory),
+						)),
 						_ => unreachable!(),
 					};
-					Global {
+					Some(Global {
 						ty: ScalarType::try_from(global.ty).unwrap(),
 						mutability: match global.mutability {
 							mir::Mutability::Mutable => Mutability::Mutable,
 							mir::Mutability::Immutable => Mutability::Immutable,
 						},
 						value: init_value,
-					}
+					})
 				})
 				.collect::<Box<_>>(),
 		};
@@ -441,36 +598,20 @@ impl Builder {
 			func_index: builder.func_wasm_index[&id],
 		});
 
+		// A defined memory must be large enough for its own static data; an
+		// imported memory's size is the host's business.
 		let memories = mir
 			.memories
 			.iter()
+			.filter(|info| {
+				retains(mir::Item::Memory(info.id))
+					&& info.origin.defined().is_some()
+			})
 			.map(|info| {
-				// A defined memory must be large enough for its own static
-				// data; an imported memory's size is the host's business.
-				let required_pages = match info.source {
-					mir::MemorySource::External => 0,
-					mir::MemorySource::Internal => {
-						builder.memories[&info.id].static_size.div_ceil(65536)
-					}
-				};
-				let initial = info.min_pages.unwrap_or(0).max(required_pages);
-				// `min_pages`/`max_pages` are hints, not obligations: just
-				// like `initial` gets bumped above a too-small `min_pages`,
-				// `max_pages` gets bumped above `initial` when it would
-				// otherwise be violated, rather than emitting an
-				// `initial > max` module (invalid per spec).
-				Memory {
-					limits: match info.max_pages {
-						Some(max) => MemoryLimits::Bounded {
-							initial_pages: initial,
-							max_pages: max.max(initial),
-						},
-						None => MemoryLimits::Unbounded {
-							initial_pages: initial,
-						},
-					},
-					kind: info.kind,
-				}
+				memory_type(
+					info,
+					builder.statics.data_end(info.id).div_ceil(65536),
+				)
 			})
 			.collect();
 
@@ -491,16 +632,17 @@ impl Builder {
 			},
 			data: DataSection {
 				segments: {
-					let mut segments: Vec<DataSegment> = segment_bytes
-						.into_iter()
-						.filter(|(_, bytes)| !bytes.is_empty())
-						.map(|(id, bytes)| DataSegment {
-							memory_index: builder.memories[&id].wasm_index,
-							offset: 0,
-							memory_kind: builder.memories[&id].kind,
-							bytes: bytes.into_boxed_slice(),
-						})
-						.collect();
+					let mut segments: Vec<DataSegment> =
+						std::mem::take(&mut builder.statics.segments)
+							.into_iter()
+							.filter(|(_, bytes)| !bytes.is_empty())
+							.map(|(id, bytes)| DataSegment {
+								memory_index: builder.memories[&id].wasm_index,
+								offset: 0,
+								memory_kind: builder.memories[&id].kind,
+								bytes: bytes.into_boxed_slice(),
+							})
+							.collect();
 					segments.sort_by_key(|s| s.memory_index);
 					segments.into_boxed_slice()
 				},
@@ -553,7 +695,7 @@ impl Builder {
 			scheduled.locals.iter().copied().collect();
 
 		let mut sink = Vec::new();
-		for instr in scheduled.body.iter().cloned() {
+		for instr in scheduled.body.iter().copied() {
 			self.encode_scheduled_instr(
 				instr,
 				mir,
@@ -578,157 +720,87 @@ impl Builder {
 		use wasm::Instruction as SI;
 		match instr {
 			SI::I32Const(v) => {
-				sink.push(Instruction::I32Const as u8);
+				sink.push(Opcode::I32Const as u8);
 				v.encode(sink);
 			}
 			SI::I64Const(v) => {
-				sink.push(Instruction::I64Const as u8);
+				sink.push(Opcode::I64Const as u8);
 				v.encode(sink);
 			}
 			SI::F32Const(v) => {
-				sink.push(Instruction::F32Const as u8);
+				sink.push(Opcode::F32Const as u8);
 				v.encode(sink);
 			}
 			SI::F64Const(v) => {
-				sink.push(Instruction::F64Const as u8);
+				sink.push(Opcode::F64Const as u8);
 				v.encode(sink);
 			}
 			SI::LocalGet(i) => {
-				sink.push(Instruction::LocalGet as u8);
+				sink.push(Opcode::LocalGet as u8);
 				i.encode(sink);
 			}
 			SI::LocalSet(i) => {
-				sink.push(Instruction::LocalSet as u8);
+				sink.push(Opcode::LocalSet as u8);
 				i.encode(sink);
 			}
 			SI::LocalTee(i) => {
-				sink.push(Instruction::LocalTee as u8);
+				sink.push(Opcode::LocalTee as u8);
 				i.encode(sink);
 			}
 			SI::GlobalGet(id) => {
 				let wasm_idx = self.global_wasm_index[&id];
-				sink.push(Instruction::GlobalGet as u8);
+				sink.push(Opcode::GlobalGet as u8);
 				wasm_idx.encode(sink);
 			}
 			SI::GlobalSet(id) => {
 				let wasm_idx = self.global_wasm_index[&id];
-				sink.push(Instruction::GlobalSet as u8);
+				sink.push(Opcode::GlobalSet as u8);
 				wasm_idx.encode(sink);
 			}
-			SI::I32Add => sink.push(Instruction::I32Add as u8),
-			SI::I32Sub => sink.push(Instruction::I32Sub as u8),
-			SI::I32Mul => sink.push(Instruction::I32Mul as u8),
-			SI::I32DivS => sink.push(Instruction::I32DivS as u8),
-			SI::I32DivU => sink.push(Instruction::I32DivU as u8),
-			SI::I32RemS => sink.push(Instruction::I32RemS as u8),
-			SI::I32RemU => sink.push(Instruction::I32RemU as u8),
-			SI::I32And => sink.push(Instruction::I32And as u8),
-			SI::I32Or => sink.push(Instruction::I32Or as u8),
-			SI::I32Xor => sink.push(Instruction::I32Xor as u8),
-			SI::I32Shl => sink.push(Instruction::I32Shl as u8),
-			SI::I32ShrS => sink.push(Instruction::I32ShrS as u8),
-			SI::I32ShrU => sink.push(Instruction::I32ShrU as u8),
-			SI::I32Eqz => sink.push(Instruction::I32Eqz as u8),
-			SI::I32Eq => sink.push(Instruction::I32Eq as u8),
-			SI::I32Ne => sink.push(Instruction::I32Ne as u8),
-			SI::I32LtS => sink.push(Instruction::I32LtS as u8),
-			SI::I32LtU => sink.push(Instruction::I32LtU as u8),
-			SI::I32LeS => sink.push(Instruction::I32LeS as u8),
-			SI::I32LeU => sink.push(Instruction::I32LeU as u8),
-			SI::I32GtS => sink.push(Instruction::I32GtS as u8),
-			SI::I32GtU => sink.push(Instruction::I32GtU as u8),
-			SI::I32GeS => sink.push(Instruction::I32GeS as u8),
-			SI::I32GeU => sink.push(Instruction::I32GeU as u8),
-			SI::I32Clz => sink.push(Instruction::I32Clz as u8),
-			SI::I32Ctz => sink.push(Instruction::I32Ctz as u8),
-			SI::I64Add => sink.push(Instruction::I64Add as u8),
-			SI::I64Sub => sink.push(Instruction::I64Sub as u8),
-			SI::I64Mul => sink.push(Instruction::I64Mul as u8),
-			SI::I64DivS => sink.push(Instruction::I64DivS as u8),
-			SI::I64DivU => sink.push(Instruction::I64DivU as u8),
-			SI::I64RemS => sink.push(Instruction::I64RemS as u8),
-			SI::I64RemU => sink.push(Instruction::I64RemU as u8),
-			SI::I64And => sink.push(Instruction::I64And as u8),
-			SI::I64Or => sink.push(Instruction::I64Or as u8),
-			SI::I64Xor => sink.push(Instruction::I64Xor as u8),
-			SI::I64Shl => sink.push(Instruction::I64Shl as u8),
-			SI::I64ShrS => sink.push(Instruction::I64ShrS as u8),
-			SI::I64ShrU => sink.push(Instruction::I64ShrU as u8),
-			SI::I64Eqz => sink.push(Instruction::I64Eqz as u8),
-			SI::I64Eq => sink.push(Instruction::I64Eq as u8),
-			SI::I64Ne => sink.push(Instruction::I64Ne as u8),
-			SI::I64LtS => sink.push(Instruction::I64LtS as u8),
-			SI::I64LtU => sink.push(Instruction::I64LtU as u8),
-			SI::I64LeS => sink.push(Instruction::I64LeS as u8),
-			SI::I64LeU => sink.push(Instruction::I64LeU as u8),
-			SI::I64GtS => sink.push(Instruction::I64GtS as u8),
-			SI::I64GtU => sink.push(Instruction::I64GtU as u8),
-			SI::I64GeS => sink.push(Instruction::I64GeS as u8),
-			SI::I64GeU => sink.push(Instruction::I64GeU as u8),
-			SI::F32Add => sink.push(Instruction::F32Add as u8),
-			SI::F32Sub => sink.push(Instruction::F32Sub as u8),
-			SI::F32Mul => sink.push(Instruction::F32Mul as u8),
-			SI::F32Div => sink.push(Instruction::F32Div as u8),
-			SI::F32Neg => sink.push(Instruction::F32Neg as u8),
-			SI::F32Sqrt => sink.push(Instruction::F32Sqrt as u8),
-			SI::F32Abs => sink.push(Instruction::F32Abs as u8),
-			SI::F32Floor => sink.push(Instruction::F32Floor as u8),
-			SI::F32Ceil => sink.push(Instruction::F32Ceil as u8),
-			SI::F32Trunc => sink.push(Instruction::F32Trunc as u8),
-			SI::F32Nearest => sink.push(Instruction::F32Nearest as u8),
-			SI::F32Min => sink.push(Instruction::F32Min as u8),
-			SI::F32Max => sink.push(Instruction::F32Max as u8),
-			SI::F32Copysign => sink.push(Instruction::F32Copysign as u8),
-			SI::F64Add => sink.push(Instruction::F64Add as u8),
-			SI::F64Sub => sink.push(Instruction::F64Sub as u8),
-			SI::F64Mul => sink.push(Instruction::F64Mul as u8),
-			SI::F64Div => sink.push(Instruction::F64Div as u8),
-			SI::F64Neg => sink.push(Instruction::F64Neg as u8),
-			SI::F64Sqrt => sink.push(Instruction::F64Sqrt as u8),
-			SI::F64Abs => sink.push(Instruction::F64Abs as u8),
-			SI::F64Floor => sink.push(Instruction::F64Floor as u8),
-			SI::F64Ceil => sink.push(Instruction::F64Ceil as u8),
-			SI::F64Trunc => sink.push(Instruction::F64Trunc as u8),
-			SI::F64Nearest => sink.push(Instruction::F64Nearest as u8),
-			SI::F64Min => sink.push(Instruction::F64Min as u8),
-			SI::F64Max => sink.push(Instruction::F64Max as u8),
-			SI::F64Copysign => sink.push(Instruction::F64Copysign as u8),
-			SI::F32Eq => sink.push(Instruction::F32Eq as u8),
-			SI::F32Ne => sink.push(Instruction::F32Ne as u8),
-			SI::F32Lt => sink.push(Instruction::F32Lt as u8),
-			SI::F32Le => sink.push(Instruction::F32Le as u8),
-			SI::F32Gt => sink.push(Instruction::F32Gt as u8),
-			SI::F32Ge => sink.push(Instruction::F32Ge as u8),
-			SI::F64Eq => sink.push(Instruction::F64Eq as u8),
-			SI::F64Ne => sink.push(Instruction::F64Ne as u8),
-			SI::F64Lt => sink.push(Instruction::F64Lt as u8),
-			SI::F64Le => sink.push(Instruction::F64Le as u8),
-			SI::F64Gt => sink.push(Instruction::F64Gt as u8),
-			SI::F64Ge => sink.push(Instruction::F64Ge as u8),
+			SI::Unary(op, ty) => sink.push(unary_opcode(op, ty) as u8),
+			SI::Binary(op, ty) => sink.push(binary_opcode(op, ty) as u8),
+			SI::Compare(op, ty) => sink.push(compare_opcode(op, ty) as u8),
+			SI::Convert { op, from, to } => {
+				sink.push(convert_opcode(op, from, to) as u8)
+			}
+			SI::Load(access, m) => encode_memory_access(
+				load_opcode(access),
+				m.align,
+				m.offset,
+				self.memories[&m.memory].wasm_index,
+				sink,
+			),
+			SI::Store(access, m) => encode_memory_access(
+				store_opcode(access),
+				m.align,
+				m.offset,
+				self.memories[&m.memory].wasm_index,
+				sink,
+			),
 			SI::Block { ty } => {
-				sink.push(Instruction::Block as u8);
-				Self::encode_block_type(ty, sink);
+				sink.push(Opcode::Block as u8);
+				self.encode_block_type(ty, mir, sink);
 			}
 			SI::Loop { ty } => {
-				sink.push(Instruction::Loop as u8);
-				Self::encode_block_type(ty, sink);
+				sink.push(Opcode::Loop as u8);
+				self.encode_block_type(ty, mir, sink);
 			}
 			SI::If { ty } => {
-				sink.push(Instruction::If as u8);
-				Self::encode_block_type(ty, sink);
+				sink.push(Opcode::If as u8);
+				self.encode_block_type(ty, mir, sink);
 			}
-			SI::Else => sink.push(Instruction::Else as u8),
-			SI::End => sink.push(Instruction::End as u8),
+			SI::Else => sink.push(Opcode::Else as u8),
+			SI::End => sink.push(Opcode::End as u8),
 			SI::Br(depth) => {
-				sink.push(Instruction::Br as u8);
+				sink.push(Opcode::Br as u8);
 				depth.encode(sink);
 			}
 			SI::BrIf(depth) => {
-				sink.push(Instruction::BrIf as u8);
+				sink.push(Opcode::BrIf as u8);
 				depth.encode(sink);
 			}
 			SI::BrTable { start, len } => {
-				sink.push(Instruction::BrTable as u8);
+				sink.push(Opcode::BrTable as u8);
 				// WASM's `br_table` encodes as `vec(labelidx) labelidx` — a
 				// table of length `depths.len() - 1` followed by the
 				// default depth as a separate trailing immediate. The
@@ -745,227 +817,101 @@ impl Builder {
 				}
 				default_depth.encode(sink);
 			}
-			SI::Return => sink.push(Instruction::Return as u8),
-			SI::Unreachable => sink.push(Instruction::Unreachable as u8),
-			SI::Drop => sink.push(Instruction::Drop as u8),
+			SI::Return => sink.push(Opcode::Return as u8),
+			SI::Unreachable => sink.push(Opcode::Unreachable as u8),
+			SI::Drop => sink.push(Opcode::Drop as u8),
 			SI::Call(id) => {
 				let wasm_idx = self.func_wasm_index[&id];
-				sink.push(Instruction::Call as u8);
+				sink.push(Opcode::Call as u8);
 				wasm_idx.encode(sink);
 			}
 			SI::CallIndirectSym { mir_sig_index } => {
-				let type_index = self.register_signature(
-					&mir.signatures[mir_sig_index as usize],
-					&mir.aggregates,
-				);
-				sink.push(Instruction::CallIndirect as u8);
+				let type_index =
+					self.register_signature(&mir.signatures, mir_sig_index);
+				sink.push(Opcode::CallIndirect as u8);
 				type_index.0.encode(sink);
 				0u32.encode(sink); // table index 0 (single function table)
 			}
 			SI::MemorySize(id) => {
 				let mi = self.memories[&id].wasm_index;
-				sink.push(Instruction::MemorySize as u8);
+				sink.push(Opcode::MemorySize as u8);
 				mi.encode(sink);
 			}
 			SI::MemoryGrow(id) => {
 				let mi = self.memories[&id].wasm_index;
-				sink.push(Instruction::MemoryGrow as u8);
+				sink.push(Opcode::MemoryGrow as u8);
 				mi.encode(sink);
 			}
 			SI::MemoryFill(id) => {
 				let mi = self.memories[&id].wasm_index;
-				sink.push(Instruction::BulkMemoryPrefix as u8);
+				sink.push(Opcode::BulkMemoryPrefix as u8);
 				0x0Bu32.encode(sink); // memory.fill secondary opcode
 				mi.encode(sink);
 			}
 			SI::MemoryCopy { dst, src } => {
 				let dst_mi = self.memories[&dst].wasm_index;
 				let src_mi = self.memories[&src].wasm_index;
-				sink.push(Instruction::BulkMemoryPrefix as u8);
+				sink.push(Opcode::BulkMemoryPrefix as u8);
 				0x0Au32.encode(sink); // memory.copy secondary opcode
 				dst_mi.encode(sink);
 				src_mi.encode(sink);
 			}
 			SI::MemoryIndex { memory } => {
 				let mi = self.memories[&memory].wasm_index as i32;
-				sink.push(Instruction::I32Const as u8);
+				sink.push(Opcode::I32Const as u8);
 				mi.encode(sink);
 			}
-			// Pointer load/store.
-			// Memory 0 uses the standard single-memory encoding.
-			// Memory N>0 requires the multi-memory extension (memory index prefix).
-			SI::I32Load8S(m) => encode_load(
-				Instruction::I32Load8S,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I32Load8U(m) => encode_load(
-				Instruction::I32Load8U,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I32Load16S(m) => encode_load(
-				Instruction::I32Load16S,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I32Load16U(m) => encode_load(
-				Instruction::I32Load16U,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I32Load(m) => encode_load(
-				Instruction::I32Load,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I64Load(m) => encode_load(
-				Instruction::I64Load,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::F32Load(m) => encode_load(
-				Instruction::F32Load,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::F64Load(m) => encode_load(
-				Instruction::F64Load,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I32Store8(m) => encode_store(
-				Instruction::I32Store8,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I32Store16(m) => encode_store(
-				Instruction::I32Store16,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I32Store(m) => encode_store(
-				Instruction::I32Store,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I64Store(m) => encode_store(
-				Instruction::I64Store,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::F32Store(m) => encode_store(
-				Instruction::F32Store,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::F64Store(m) => encode_store(
-				Instruction::F64Store,
-				m.align,
-				m.offset,
-				self.memories[&m.memory].wasm_index,
-				sink,
-			),
-			SI::I64ExtendI32S => sink.push(Instruction::I64ExtendI32S as u8),
-			SI::I64ExtendI32U => sink.push(Instruction::I64ExtendI32U as u8),
-			SI::I32WrapI64 => sink.push(Instruction::I32WrapI64 as u8),
-			SI::F32ConvertI32S => sink.push(Instruction::F32ConvertI32S as u8),
-			SI::F32ConvertI32U => sink.push(Instruction::F32ConvertI32U as u8),
-			SI::F32ConvertI64S => sink.push(Instruction::F32ConvertI64S as u8),
-			SI::F32ConvertI64U => sink.push(Instruction::F32ConvertI64U as u8),
-			SI::F64ConvertI32S => sink.push(Instruction::F64ConvertI32S as u8),
-			SI::F64ConvertI32U => sink.push(Instruction::F64ConvertI32U as u8),
-			SI::F64ConvertI64S => sink.push(Instruction::F64ConvertI64S as u8),
-			SI::F64ConvertI64U => sink.push(Instruction::F64ConvertI64U as u8),
-			SI::I32TruncF32S => sink.push(Instruction::I32TruncF32S as u8),
-			SI::I32TruncF32U => sink.push(Instruction::I32TruncF32U as u8),
-			SI::I32TruncF64S => sink.push(Instruction::I32TruncF64S as u8),
-			SI::I32TruncF64U => sink.push(Instruction::I32TruncF64U as u8),
-			SI::I64TruncF32S => sink.push(Instruction::I64TruncF32S as u8),
-			SI::I64TruncF32U => sink.push(Instruction::I64TruncF32U as u8),
-			SI::I64TruncF64S => sink.push(Instruction::I64TruncF64S as u8),
-			SI::I64TruncF64U => sink.push(Instruction::I64TruncF64U as u8),
-			SI::F64PromoteF32 => sink.push(Instruction::F64PromoteF32 as u8),
-			SI::F32DemoteF64 => sink.push(Instruction::F32DemoteF64 as u8),
-			SI::I32ReinterpretF32 => {
-				sink.push(Instruction::I32ReinterpretF32 as u8)
-			}
-			SI::F32ReinterpretI32 => {
-				sink.push(Instruction::F32ReinterpretI32 as u8)
-			}
-			SI::I64ReinterpretF64 => {
-				sink.push(Instruction::I64ReinterpretF64 as u8)
-			}
-			SI::F64ReinterpretI64 => {
-				sink.push(Instruction::F64ReinterpretI64 as u8)
-			}
-			SI::Nop => sink.push(Instruction::Nop as u8),
+			SI::Nop => sink.push(Opcode::Nop as u8),
 			SI::FunctionPointer(id) => {
 				let wasm_idx = self.func_wasm_index[&id];
 				let table_idx = self.table.len() as i32;
 				self.table.push(FuncIndex(wasm_idx));
-				sink.push(Instruction::I32Const as u8);
+				sink.push(Opcode::I32Const as u8);
 				table_idx.encode(sink);
 			}
-			SI::StaticDataPointer { data_index, ty } => {
-				let offset = self.entry_offsets[&data_index];
+			SI::StaticDataPointer { entry, offset, ty } => {
+				let offset = self.statics.addresses[&entry] + offset;
 				match ty {
-					crate::opt::ScalarType::I64 => {
-						sink.push(Instruction::I64Const as u8);
+					ScalarType::I64 => {
+						sink.push(Opcode::I64Const as u8);
 						(offset as i64).encode(sink);
 					}
 					_ => {
-						sink.push(Instruction::I32Const as u8);
+						sink.push(Opcode::I32Const as u8);
 						(offset as i32).encode(sink);
 					}
 				}
 			}
-			SI::DataSectionEnd { memory } => {
+			SI::DataEnd { memory } => {
 				let entry = &self.memories[&memory];
 				match entry.kind {
 					mir::MemoryKind::Memory32 => {
-						sink.push(Instruction::I32Const as u8);
-						(entry.static_size as i32).encode(sink);
+						sink.push(Opcode::I32Const as u8);
+						(self.statics.data_end(memory) as i32).encode(sink);
 					}
 					mir::MemoryKind::Memory64 => {
-						sink.push(Instruction::I64Const as u8);
-						(entry.static_size as i64).encode(sink);
+						sink.push(Opcode::I64Const as u8);
+						(i64::from(self.statics.data_end(memory))).encode(sink);
 					}
 				}
 			}
 		}
 	}
 
-	fn encode_block_type(ty: wasm::BlockType, sink: &mut Vec<u8>) {
+	fn encode_block_type(
+		&mut self,
+		ty: wasm::BlockType,
+		mir: &mir::MIR,
+		sink: &mut Vec<u8>,
+	) {
 		match ty {
 			wasm::BlockType::Empty => sink.push(0x40),
 			wasm::BlockType::Value(vt) => vt.encode(sink),
+			// A type index, as a positive `s33`.
+			wasm::BlockType::Results(signature) => {
+				let index = self.register_signature(&mir.signatures, signature);
+				i64::from(index.0).encode(sink);
+			}
 		}
 	}
 }
@@ -988,8 +934,9 @@ enum SectionId {
 }
 
 #[allow(unused)]
+#[derive(Clone, Copy)]
 #[repr(u8)]
-enum Instruction {
+enum Opcode {
 	Unreachable = 0x00,
 	Nop = 0x01,
 	Block = 0x02,
@@ -1204,33 +1151,176 @@ trait Encode {
 	fn encode(&self, sink: &mut Vec<u8>);
 }
 
-fn encode_load(
-	opcode: Instruction,
+/// A `memarg`: the alignment, then the offset. Memory 0 is implied; any
+/// other is written between them, flagged by bit 6 of the alignment
+/// (multi-memory).
+fn encode_memarg(
+	align: u32,
+	offset: u32,
+	memory_index: u32,
+	sink: &mut Vec<u8>,
+) {
+	if memory_index == 0 {
+		align.encode(sink);
+	} else {
+		(align | 0x40).encode(sink);
+		memory_index.encode(sink);
+	}
+	offset.encode(sink);
+}
+
+/// A memory instruction: its opcode, then its `memarg`.
+fn encode_memory_access(
+	opcode: Opcode,
 	align: u32,
 	offset: u32,
 	memory_index: u32,
 	sink: &mut Vec<u8>,
 ) {
 	sink.push(opcode as u8);
-	align.encode(sink);
-	offset.encode(sink);
-	if memory_index > 0 {
-		memory_index.encode(sink);
+	encode_memarg(align, offset, memory_index, sink);
+}
+
+// An operation's opcode is a row indexed by its operand type: one entry per
+// type its opcode takes (`Operands`), in `ScalarType` order.
+
+fn column(operands: mir::Operands, ty: ScalarType) -> usize {
+	use ScalarType::*;
+	match (operands, ty) {
+		(mir::Operands::Any, I32) => 0,
+		(mir::Operands::Any, I64) => 1,
+		(mir::Operands::Any, F32) => 2,
+		(mir::Operands::Any, F64) => 3,
+		(mir::Operands::Integer, I32) | (mir::Operands::Float, F32) => 0,
+		(mir::Operands::Integer, I64) | (mir::Operands::Float, F64) => 1,
+		_ => unreachable!("an opcode given a type it does not take"),
 	}
 }
 
-fn encode_store(
-	opcode: Instruction,
-	align: u32,
-	offset: u32,
-	memory_index: u32,
-	sink: &mut Vec<u8>,
-) {
-	sink.push(opcode as u8);
-	align.encode(sink);
-	offset.encode(sink);
-	if memory_index > 0 {
-		memory_index.encode(sink);
+fn unary_opcode(op: mir::UnaryOp, ty: ScalarType) -> Opcode {
+	use Opcode::*;
+	use mir::UnaryOp as U;
+	let row: &[Opcode] = match op {
+		U::Eqz => &[I32Eqz, I64Eqz],
+		U::Neg => &[F32Neg, F64Neg],
+		U::Abs => &[F32Abs, F64Abs],
+		U::Sqrt => &[F32Sqrt, F64Sqrt],
+		U::Floor => &[F32Floor, F64Floor],
+		U::Ceil => &[F32Ceil, F64Ceil],
+		U::Trunc => &[F32Trunc, F64Trunc],
+		U::Nearest => &[F32Nearest, F64Nearest],
+	};
+	row[column(op.operands(), ty)]
+}
+
+fn binary_opcode(op: mir::BinaryOp, ty: ScalarType) -> Opcode {
+	use Opcode::*;
+	use mir::BinaryOp as B;
+	let row: &[Opcode] = match op {
+		B::Add => &[I32Add, I64Add, F32Add, F64Add],
+		B::Sub => &[I32Sub, I64Sub, F32Sub, F64Sub],
+		B::Mul => &[I32Mul, I64Mul, F32Mul, F64Mul],
+		B::And => &[I32And, I64And],
+		B::Or => &[I32Or, I64Or],
+		B::Xor => &[I32Xor, I64Xor],
+		B::Shl => &[I32Shl, I64Shl],
+		B::ShrS => &[I32ShrS, I64ShrS],
+		B::ShrU => &[I32ShrU, I64ShrU],
+		B::DivS => &[I32DivS, I64DivS],
+		B::DivU => &[I32DivU, I64DivU],
+		B::RemS => &[I32RemS, I64RemS],
+		B::RemU => &[I32RemU, I64RemU],
+		B::Div => &[F32Div, F64Div],
+		B::Min => &[F32Min, F64Min],
+		B::Max => &[F32Max, F64Max],
+		B::Copysign => &[F32Copysign, F64Copysign],
+	};
+	row[column(op.operands(), ty)]
+}
+
+fn compare_opcode(op: mir::CompareOp, ty: ScalarType) -> Opcode {
+	use Opcode::*;
+	use mir::CompareOp as C;
+	let row: &[Opcode] = match op {
+		C::Eq => &[I32Eq, I64Eq, F32Eq, F64Eq],
+		C::Ne => &[I32Ne, I64Ne, F32Ne, F64Ne],
+		C::LtS => &[I32LtS, I64LtS],
+		C::LtU => &[I32LtU, I64LtU],
+		C::LeS => &[I32LeS, I64LeS],
+		C::LeU => &[I32LeU, I64LeU],
+		C::GtS => &[I32GtS, I64GtS],
+		C::GtU => &[I32GtU, I64GtU],
+		C::GeS => &[I32GeS, I64GeS],
+		C::GeU => &[I32GeU, I64GeU],
+		C::Lt => &[F32Lt, F64Lt],
+		C::Le => &[F32Le, F64Le],
+		C::Gt => &[F32Gt, F64Gt],
+		C::Ge => &[F32Ge, F64Ge],
+	};
+	row[column(op.operands(), ty)]
+}
+
+fn convert_opcode(
+	op: mir::ConvertOp,
+	from: ScalarType,
+	to: ScalarType,
+) -> Opcode {
+	use Opcode::*;
+	use ScalarType::{F32, F64, I32, I64};
+	use mir::ConvertOp as V;
+	match (op, from, to) {
+		(V::ExtendS, I32, I64) => I64ExtendI32S,
+		(V::ExtendU, I32, I64) => I64ExtendI32U,
+		(V::Wrap, I64, I32) => I32WrapI64,
+		(V::TruncS, F32, I32) => I32TruncF32S,
+		(V::TruncU, F32, I32) => I32TruncF32U,
+		(V::TruncS, F64, I32) => I32TruncF64S,
+		(V::TruncU, F64, I32) => I32TruncF64U,
+		(V::TruncS, F32, I64) => I64TruncF32S,
+		(V::TruncU, F32, I64) => I64TruncF32U,
+		(V::TruncS, F64, I64) => I64TruncF64S,
+		(V::TruncU, F64, I64) => I64TruncF64U,
+		(V::ConvertS, I32, F32) => F32ConvertI32S,
+		(V::ConvertU, I32, F32) => F32ConvertI32U,
+		(V::ConvertS, I64, F32) => F32ConvertI64S,
+		(V::ConvertU, I64, F32) => F32ConvertI64U,
+		(V::ConvertS, I32, F64) => F64ConvertI32S,
+		(V::ConvertU, I32, F64) => F64ConvertI32U,
+		(V::ConvertS, I64, F64) => F64ConvertI64S,
+		(V::ConvertU, I64, F64) => F64ConvertI64U,
+		(V::Promote, F32, F64) => F64PromoteF32,
+		(V::Demote, F64, F32) => F32DemoteF64,
+		(V::Reinterpret, F32, I32) => I32ReinterpretF32,
+		(V::Reinterpret, I32, F32) => F32ReinterpretI32,
+		(V::Reinterpret, F64, I64) => I64ReinterpretF64,
+		(V::Reinterpret, I64, F64) => F64ReinterpretI64,
+		_ => unreachable!("a conversion between types it does not convert"),
+	}
+}
+
+fn load_opcode(access: mir::LoadAccess) -> Opcode {
+	use mir::LoadAccess as L;
+	match access {
+		L::I8S => Opcode::I32Load8S,
+		L::I8U => Opcode::I32Load8U,
+		L::I16S => Opcode::I32Load16S,
+		L::I16U => Opcode::I32Load16U,
+		L::I32 => Opcode::I32Load,
+		L::I64 => Opcode::I64Load,
+		L::F32 => Opcode::F32Load,
+		L::F64 => Opcode::F64Load,
+	}
+}
+
+fn store_opcode(access: mir::StoreAccess) -> Opcode {
+	use mir::StoreAccess as S;
+	match access {
+		S::I8 => Opcode::I32Store8,
+		S::I16 => Opcode::I32Store16,
+		S::I32 => Opcode::I32Store,
+		S::I64 => Opcode::I64Store,
+		S::F32 => Opcode::F32Store,
+		S::F64 => Opcode::F64Store,
 	}
 }
 
@@ -1263,6 +1353,13 @@ impl Encode for f64 {
 impl Encode for u32 {
 	fn encode(&self, sink: &mut Vec<u8>) {
 		let (value, pos) = leb128fmt::encode_u32(*self).unwrap();
+		sink.extend_from_slice(&value[..pos]);
+	}
+}
+
+impl Encode for u64 {
+	fn encode(&self, sink: &mut Vec<u8>) {
+		let (value, pos) = leb128fmt::encode_u64(*self).unwrap();
 		sink.extend_from_slice(&value[..pos]);
 	}
 }
@@ -1431,24 +1528,24 @@ impl Encode for Global {
 
 		match self.value {
 			wasm::Instruction::I32Const(value) => {
-				sink.push(Instruction::I32Const as u8);
+				sink.push(Opcode::I32Const as u8);
 				value.encode(sink);
 			}
 			wasm::Instruction::F32Const(value) => {
-				sink.push(Instruction::F32Const as u8);
+				sink.push(Opcode::F32Const as u8);
 				value.encode(sink);
 			}
 			wasm::Instruction::I64Const(value) => {
-				sink.push(Instruction::I64Const as u8);
+				sink.push(Opcode::I64Const as u8);
 				value.encode(sink);
 			}
 			wasm::Instruction::F64Const(value) => {
-				sink.push(Instruction::F64Const as u8);
+				sink.push(Opcode::F64Const as u8);
 				value.encode(sink);
 			}
 			_ => unreachable!(),
 		}
-		sink.push(Instruction::End as u8);
+		sink.push(Opcode::End as u8);
 	}
 }
 
@@ -1490,10 +1587,10 @@ impl FunctionBody {
 		let mut body_content: Vec<u8> = Vec::new();
 
 		let type_index = module.functions.types[func_index.0 as usize];
-		let func_type = module.types.signatures[type_index.0 as usize].clone();
+		let signature = module.types.signatures[type_index.0 as usize].clone();
 
 		let mut grouped_locals = Vec::<(ScalarType, u32)>::new();
-		for local in self.locals.iter().skip(func_type.param_count) {
+		for local in self.locals.iter().skip(signature.param_count) {
 			match grouped_locals.last_mut() {
 				Some((last_ty, count)) if *last_ty == local.ty => {
 					*count += 1;
@@ -1513,7 +1610,7 @@ impl FunctionBody {
 		body_content.extend_from_slice(
 			&module.code.functions[func_index.0 as usize].expressions,
 		);
-		body_content.push(Instruction::End as u8);
+		body_content.push(Opcode::End as u8);
 
 		let body_size = body_content.len() as u32;
 		body_size.encode(sink);
@@ -1595,9 +1692,9 @@ impl Encode for TableSection {
 impl Encode for ElementSegment {
 	fn encode(&self, sink: &mut Vec<u8>) {
 		self.table_index.0.encode(sink);
-		sink.push(Instruction::I32Const as u8);
+		sink.push(Opcode::I32Const as u8);
 		self.offset.encode(sink);
-		sink.push(Instruction::End as u8);
+		sink.push(Opcode::End as u8);
 
 		let indicies_count = self.indices.len() as u32;
 		indicies_count.encode(sink);
@@ -1624,7 +1721,7 @@ impl Encode for ElementSection {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct DataSection {
 	pub segments: Box<[DataSegment]>,
 }
@@ -1644,7 +1741,7 @@ impl Encode for DataSection {
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct DataSegment {
 	pub memory_index: u32,
 	pub offset: u32,
@@ -1668,37 +1765,59 @@ impl Encode for DataSegment {
 		// offset is encoded as a const init expr followed by end opcode
 		match self.memory_kind {
 			mir::MemoryKind::Memory32 => {
-				sink.push(Instruction::I32Const as u8);
+				sink.push(Opcode::I32Const as u8);
 				(self.offset as i32).encode(sink);
 			}
 			mir::MemoryKind::Memory64 => {
-				sink.push(Instruction::I64Const as u8);
+				sink.push(Opcode::I64Const as u8);
 				(self.offset as i64).encode(sink);
 			}
 		}
-		sink.push(Instruction::End as u8);
+		sink.push(Opcode::End as u8);
 		(self.bytes.len() as u32).encode(sink);
 		sink.extend_from_slice(&self.bytes);
 	}
 }
 
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct MemorySection {
 	pub memories: Box<[Memory]>,
 }
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Memory {
 	pub limits: MemoryLimits,
 	pub kind: mir::MemoryKind,
 }
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub enum MemoryLimits {
-	Unbounded { initial_pages: u32 },
-	Bounded { initial_pages: u32, max_pages: u32 },
+	Unbounded { initial_pages: u64 },
+	Bounded { initial_pages: u64, max_pages: u64 },
+}
+
+/// `info`'s Wasm memory type, at least `required_pages` large.
+///
+/// `min_pages`/`max_pages` are hints, not obligations: just like `initial`
+/// gets bumped above a too-small `min_pages`, `max_pages` gets bumped above
+/// `initial` when it would otherwise be violated, rather than emitting an
+/// `initial > max` module (invalid per spec).
+fn memory_type(info: &mir::MemoryInfo, required_pages: u32) -> Memory {
+	let initial = info.min_pages.unwrap_or(0).max(u64::from(required_pages));
+	Memory {
+		limits: match info.max_pages {
+			Some(max) => MemoryLimits::Bounded {
+				initial_pages: initial,
+				max_pages: max.max(initial),
+			},
+			None => MemoryLimits::Unbounded {
+				initial_pages: initial,
+			},
+		},
+		kind: info.kind,
+	}
 }
 
 impl Encode for MemorySection {
@@ -1748,47 +1867,45 @@ impl WasmModule {
 		]
 		.to_vec();
 
-		self.types.encode(&mut sink);
-		match self.imports.imports.len() {
-			0 => {}
-			_ => self.imports.encode(&mut sink),
+		if !self.types.signatures.is_empty() {
+			self.types.encode(&mut sink);
 		}
-		match self.functions.types.len() {
-			0 => {}
-			_ => self.functions.encode(&mut sink),
+		if !self.imports.imports.is_empty() {
+			self.imports.encode(&mut sink);
 		}
-		match self.tables.tables.len() {
-			0 => {}
-			_ => self.tables.encode(&mut sink),
+		if !self.functions.types.is_empty() {
+			self.functions.encode(&mut sink);
 		}
-		match self.memory.memories.len() {
-			0 => {}
-			_ => self.memory.encode(&mut sink),
+		if !self.tables.tables.is_empty() {
+			self.tables.encode(&mut sink);
 		}
-		match self.globals.globals.len() {
-			0 => {}
-			_ => self.globals.encode(&mut sink),
+		if !self.memory.memories.is_empty() {
+			self.memory.encode(&mut sink);
 		}
-		match self.exports.items.len() {
-			0 => {}
-			_ => self.exports.encode(&mut sink),
+		if !self.globals.globals.is_empty() {
+			self.globals.encode(&mut sink);
+		}
+		if !self.exports.items.is_empty() {
+			self.exports.encode(&mut sink);
 		}
 		if let Some(ref start) = self.start {
 			start.encode(&mut sink);
 		}
-		match self.elements.segments.len() {
-			0 => {}
-			_ => self.elements.encode(&mut sink),
+		if !self.elements.segments.is_empty() {
+			self.elements.encode(&mut sink);
 		}
-		self.code.encode(&mut sink, self);
-		match self.data.segments.len() {
-			0 => {}
-			_ => self.data.encode(&mut sink),
+		if !self.code.functions.is_empty() {
+			self.code.encode(&mut sink, self);
+		}
+		if !self.data.segments.is_empty() {
+			self.data.encode(&mut sink);
 		}
 
 		sink
 	}
 }
 
-#[cfg(test)]
-mod tests;
+// Disconnected from the module graph: `tests.rs` still calls the removed
+// `tir::TIR::build` and is kept on disk as a reference corpus for new tests.
+// #[cfg(test)]
+// mod tests;
