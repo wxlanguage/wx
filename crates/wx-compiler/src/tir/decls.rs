@@ -2370,6 +2370,7 @@ impl Declarations {
 	/// alongside it.
 	pub(super) fn build<'ast>(
 		packages: &'ast [Package],
+		asts: &'ast [ast::AST],
 		files: &Files,
 		strings: &mut ast::StringInterner,
 		diagnostics: &mut Vec<Diagnostic<FileId>>,
@@ -2379,6 +2380,7 @@ impl Declarations {
 	) -> (Self, Vec<AstEntry<'ast>>) {
 		DeclarationsBuilder::build(
 			packages,
+			asts,
 			files,
 			strings,
 			diagnostics,
@@ -2399,6 +2401,7 @@ impl Declarations {
 impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	fn build(
 		packages: &'ast [Package],
+		asts: &'ast [ast::AST],
 		files: &'ctx Files,
 		strings: &'ctx mut ast::StringInterner,
 		diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
@@ -2505,7 +2508,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			.flat_map(|package_graph| package_graph.modules.iter())
 		{
 			let scope = file_namespaces[source_module.file_id.as_usize()];
-			for item in source_module.ast.items.iter() {
+			let ast = &asts[source_module.file_id.as_usize()];
+			for item in ast.items.iter() {
 				builder.scan_item(
 					source_module.file_id,
 					scope,
@@ -5232,6 +5236,7 @@ mod tests {
 			let mut resolutions = NameResolutions::default();
 			let (decls, ast_nodes) = Declarations::build(
 				&graph.packages,
+				&graph.asts,
 				&graph.files,
 				&mut strings,
 				&mut diagnostics,
@@ -5405,16 +5410,17 @@ mod tests {
 		case.diagnostics().assert_none();
 		let package = &case.graph.packages[case.decls.root_package.as_usize()];
 		let module = &package.modules[package.root.as_usize()];
+		let tree = case.graph.ast(module.file_id);
 		let ast::Item::TypeAlias {
 			body: Some(body), ..
-		} = &module.ast.items.last().unwrap().inner.inner
+		} = &tree.items.last().unwrap().inner.inner
 		else {
 			panic!("expected an alias");
 		};
-		let ast::TypeExpression::Path(segments) = module.ast.ty(*body) else {
+		let ast::TypeExpression::Path(segments) = tree.ty(*body) else {
 			panic!("expected a type path");
 		};
-		let segments = module.ast.list(segments);
+		let segments = tree.list(segments);
 		let result = case.resolve_segments(
 			module.file_id,
 			case.root_namespace(),
@@ -7132,6 +7138,7 @@ mod tests {
 		let mut resolutions = NameResolutions::default();
 		let _ = Declarations::build(
 			&graph.packages,
+			&graph.asts,
 			&graph.files,
 			&mut strings,
 			&mut diagnostics,

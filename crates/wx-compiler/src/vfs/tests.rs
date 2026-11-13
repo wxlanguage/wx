@@ -29,6 +29,7 @@ pub(super) fn workspace(files: &[(&str, &str)]) -> VirtualFileSource {
 /// One package loaded from virtual files and the inputs needed to inspect it.
 struct TestCase {
 	files: Files,
+	asts: Vec<ast::AST>,
 	strings: StringInterner,
 	package: Package,
 }
@@ -45,11 +46,13 @@ impl TestCase {
 			.expect("the entry file is readable");
 		let CompilationUnitBuilder {
 			files,
+			asts,
 			mut packages,
 			..
 		} = builder;
 		TestCase {
 			files,
+			asts,
 			strings,
 			package: packages.remove(package.as_usize()),
 		}
@@ -180,7 +183,7 @@ fn compilation_units_share_a_caller_owned_interner() {
 		let package = &unit.packages[unit.root_package.as_usize()];
 		let module = &package.modules[package.root.as_usize()];
 		let ast::Item::Function { signature, .. } =
-			&module.ast.items[0].inner.inner
+			&unit.ast(module.file_id).items[0].inner.inner
 		else {
 			panic!("expected a function");
 		};
@@ -248,10 +251,13 @@ fn load_package_diagnoses_missing_child_module_without_aborting() {
 		"the unresolved `boo` module should be omitted, not present as a stub"
 	);
 	assert!(
-		root.ast.items.iter().any(|item| matches!(
-			&item.inner.inner,
-			ast::Item::Function { .. }
-		)),
+		case.asts[root.file_id.as_usize()]
+			.items
+			.iter()
+			.any(|item| matches!(
+				&item.inner.inner,
+				ast::Item::Function { .. }
+			)),
 		"the rest of main.wx should still parse normally"
 	);
 	case.diagnostics()

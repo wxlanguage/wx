@@ -571,6 +571,7 @@ mod tests {
 			let mut resolutions = NameResolutions::default();
 			let (decls, ast_nodes) = Declarations::build(
 				&graph.packages,
+				&graph.asts,
 				&graph.files,
 				&mut strings,
 				&mut diagnostics,

@@ -1540,7 +1540,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		if !self.sema.check_type_arg_count(
 			self.builder.strings,
 			self.scope,
-			self.ast(),
+			self.builder.asts,
 			segment,
 			params_env,
 			owner,
@@ -1700,7 +1700,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			let diagnostic = self.sema.report_type_args_on_impl_self(
 				self.builder.strings,
 				self.scope.file_id,
-				self.builder.ast(self.scope.file_id),
 				segment,
 				impl_kind,
 			);

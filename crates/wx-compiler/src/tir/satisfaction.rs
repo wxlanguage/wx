@@ -71,7 +71,7 @@ impl Semantics {
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		ast: &ast::AST,
+		asts: &[ast::AST],
 		segment: &ast::PathSegment,
 		params_env: GenericEnvIdx,
 		parent_args: &[TypeIndex],
@@ -79,7 +79,7 @@ impl Semantics {
 		owner: GenericEnvOwner,
 	) -> Box<[TypeIndex]> {
 		if !self.check_type_arg_count(
-			strings, scope, ast, segment, params_env, owner,
+			strings, scope, asts, segment, params_env, owner,
 		) {
 			let expected = self.generic_envs.param_names(params_env).len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
@@ -93,10 +93,11 @@ impl Semantics {
 			"a bound is substituted over the frame's whole chain"
 		);
 		let parents = parent_args.iter().map(|&ty| (ty, segment.ident.span));
+		let ast = &asts[scope.file_id.as_usize()];
 		let written = ast
 			.list(segment.type_args)
 			.iter()
-			.map(|&written| ast.type_argument_span(written));
+			.map(|&argument| ast.type_argument_span(argument));
 		let generic_args = self
 			.generic_args
 			.push(parents.chain(args.iter().copied().zip(written)));
@@ -119,7 +120,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		scope: LexicalScope,
-		ast: &ast::AST,
+		asts: &[ast::AST],
 		segment: &ast::PathSegment,
 		params_env: GenericEnvIdx,
 		owner: GenericEnvOwner,
@@ -132,7 +133,7 @@ impl Semantics {
 			strings,
 			&self.decls,
 			scope.file_id,
-			ast,
+			&asts[scope.file_id.as_usize()],
 			segment,
 			owner,
 			self.generic_envs.param_names(params_env),

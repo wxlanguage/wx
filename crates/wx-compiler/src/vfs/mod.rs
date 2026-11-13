@@ -307,9 +307,10 @@ pub struct SourceModule {
 	pub children: Vec<ModuleId>,
 	/// `None` only for the package root, which has no declaring site.
 	pub declaration: Option<ModuleDeclaration>,
+	/// Its file, which is also how its syntax tree is found
+	/// ([`CompilationUnit::ast`]).
 	pub file_id: FileId,
 	pub file_path: AbsolutePath,
-	pub ast: ast::AST,
 }
 
 pub struct Package {
@@ -336,6 +337,9 @@ pub struct Package {
 /// loading; keep that interner available when interpreting these inputs.
 pub struct CompilationUnit {
 	pub files: Files,
+	/// Every file's syntax tree, by its [`FileId`]: each loaded file is
+	/// parsed once, as it is added, so a tree's position is its file's id.
+	pub asts: Vec<ast::AST>,
 	pub packages: Vec<Package>,
 	pub root_package: PackageId,
 	/// The package providing the items the language requires (its
@@ -347,11 +351,15 @@ pub struct CompilationUnit {
 }
 
 impl CompilationUnit {
+	/// The syntax tree of `file`.
+	pub fn ast(&self, file: FileId) -> &ast::AST {
+		&self.asts[file.as_usize()]
+	}
+
 	pub fn collect_parser_diagnostics(&self) -> Vec<Diagnostic<FileId>> {
-		self.packages
+		self.asts
 			.iter()
-			.flat_map(|package| package.modules.iter())
-			.flat_map(|module| module.ast.diagnostics.iter().cloned())
+			.flat_map(|ast| ast.diagnostics.iter().cloned())
 			.collect()
 	}
 
@@ -367,10 +375,9 @@ impl CompilationUnit {
 			.iter()
 			.flat_map(|package| {
 				package.diagnostics.iter().chain(
-					package
-						.modules
-						.iter()
-						.flat_map(|module| module.ast.diagnostics.iter()),
+					package.modules.iter().flat_map(|module| {
+						self.ast(module.file_id).diagnostics.iter()
+					}),
 				)
 			})
 			.cloned()
@@ -382,6 +389,9 @@ impl CompilationUnit {
 /// uses the same symbol identities. Building releases the borrow.
 pub struct CompilationUnitBuilder<'strings> {
 	pub files: Files,
+	/// Each file's syntax tree, pushed as the file is added, so a tree's
+	/// position is its file's id.
+	pub asts: Vec<ast::AST>,
 	strings: &'strings mut StringInterner,
 	pub packages: Vec<Package>,
 	/// Set once the core exists, and seeded into every package loaded
@@ -458,6 +468,7 @@ impl<'strings> CompilationUnitBuilder<'strings> {
 	pub fn new(strings: &'strings mut StringInterner) -> Self {
 		Self {
 			files: Files::new(),
+			asts: Vec::new(),
 			strings,
 			packages: Vec::new(),
 			core: None,
@@ -587,6 +598,7 @@ impl<'strings> CompilationUnitBuilder<'strings> {
 		);
 		CompilationUnit {
 			files: self.files,
+			asts: self.asts,
 			packages: self.packages,
 			root_package,
 			core_package,
@@ -651,6 +663,7 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 			);
 		let ast =
 			ast::Parser::parse(file_id, &self.ctx.files, self.ctx.strings);
+		debug_assert_eq!(self.ctx.asts.len(), file_id.as_usize());
 
 		let module_id = ModuleId(self.modules.len() as u32);
 		let child_decls: Box<[ModuleDeclaration]> = ast
@@ -682,8 +695,8 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 			declaration,
 			file_id,
 			file_path,
-			ast,
 		});
+		self.ctx.asts.push(ast);
 
 		let mut children = Vec::with_capacity(child_decls.len());
 		for module in child_decls.into_iter() {

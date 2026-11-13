@@ -289,6 +289,7 @@ mod tests {
 		let mut resolutions = NameResolutions::default();
 		let (decls, _) = Declarations::build(
 			&graph.packages,
+			&graph.asts,
 			&graph.files,
 			&mut strings,
 			&mut diagnostics,

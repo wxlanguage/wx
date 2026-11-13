@@ -63,11 +63,13 @@ pub fn check(
 		packages,
 		core_package,
 		root_package,
+		asts,
 	} = compilation;
 	let mut diagnostics = Vec::new();
 	let mut resolutions = NameResolutions::default();
 	let (decls, ast_nodes) = Declarations::build(
 		packages,
+		asts,
 		files,
 		strings,
 		&mut diagnostics,
@@ -84,8 +86,7 @@ pub fn check(
 	);
 	let mut sema =
 		Semantics::new(decls, impl_dispatch, diagnostics, resolutions, strings);
-	SemanticsBuilder::new(files, packages, strings, &ast_nodes)
-		.build(&mut sema);
+	SemanticsBuilder::new(files, asts, strings, &ast_nodes).build(&mut sema);
 	sema
 }
 

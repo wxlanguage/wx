@@ -7,10 +7,12 @@ use wx_fmt::RendererConfig;
 
 /// Everything a `wx format` invocation needs for one project: the parsed
 /// modules to actually rewrite, the shared `Files`/interner they were
-/// parsed with, and the project's own resolved format config — read once,
-/// here, so nothing downstream re-resolves or re-reads it per file.
+/// parsed with (with every file's tree, by its id), and the project's own
+/// resolved format config — read once, here, so nothing downstream
+/// re-resolves or re-reads it per file.
 pub struct FormatSelection {
 	pub files: Files,
+	pub asts: Vec<ast::AST>,
 	pub interner: ast::StringInterner,
 	pub modules: Vec<SourceModule>,
 	pub config: RendererConfig,
@@ -64,6 +66,7 @@ pub fn expand_project(
 
 	Ok(FormatSelection {
 		files: builder.files,
+		asts: builder.asts,
 		interner,
 		modules,
 		config,

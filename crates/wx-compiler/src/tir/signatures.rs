@@ -30,7 +30,7 @@ use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::tir::decls::TypeAliasIdx;
 use crate::tir::types::GenericEnvOwner;
-use crate::vfs::{FileId, Files, Package};
+use crate::vfs::{FileId, Files};
 
 use super::body::{
 	Body, BodyIdx, BodyOwner, ConstBody, FunctionImplementation, Obligations,
@@ -470,8 +470,9 @@ pub(super) struct QueryInfo {
 pub(super) struct SemanticsBuilder<'ast> {
 	/// Source text, for literals whose value is read from their span.
 	pub(super) files: &'ast Files,
-	/// Each file's syntax tree, where a declaration's written types are read.
-	syntax: Syntax<'ast>,
+	/// Each file's syntax tree, by its id ([`crate::vfs::CompilationUnit::asts`]), where
+	/// a declaration's written types are read.
+	pub(super) asts: &'ast [ast::AST],
 	/// The only interning checking does is a string literal's contents.
 	pub(super) strings: &'ast mut StringInterner,
 	/// The prescan's declarations, in parse order (`Declarations::build`).
@@ -482,31 +483,6 @@ pub(super) struct SemanticsBuilder<'ast> {
 	/// Every declaration's obligations, one contiguous run per declaration
 	/// (`QueryEntry::obligations`).
 	obligations: Vec<TypeObligation>,
-}
-
-/// Each file's syntax tree, by its id. A written type is an id in the tree
-/// of the file it is written in, which every lowering knows
-/// (`LexicalScope::file_id`).
-pub(super) struct Syntax<'ast> {
-	trees: Vec<Option<&'ast ast::AST>>,
-}
-
-impl<'ast> Syntax<'ast> {
-	pub(super) fn new(packages: &'ast [Package]) -> Self {
-		let mut trees = Vec::new();
-		for module in packages.iter().flat_map(|package| &package.modules) {
-			let index = module.file_id.as_usize();
-			if trees.len() <= index {
-				trees.resize(index + 1, None);
-			}
-			trees[index] = Some(&module.ast);
-		}
-		Self { trees }
-	}
-
-	pub(super) fn get(&self, file_id: FileId) -> &'ast ast::AST {
-		self.trees[file_id.as_usize()].expect("every source file is parsed")
-	}
 }
 
 /// Where code is written: the file its spans are in, the namespace its
@@ -829,7 +805,6 @@ impl Semantics {
 		&self,
 		strings: &StringInterner,
 		file_id: FileId,
-		ast: &ast::AST,
 		segment: &ast::PathSegment,
 		impl_kind: ImplKind,
 	) -> Diagnostic<FileId> {
@@ -850,30 +825,22 @@ impl Semantics {
 					.target,
 			),
 		};
-		let args = ast.list(segment.type_args);
-		let (first, last) = (args[0], args[args.len() - 1]);
 		let target_name =
 			self.type_formatter(strings).display_type(target.inner);
 		let diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
 			.with_message("type arguments are not allowed on `Self`")
 			.with_labels(vec![
-				SourceSpan::new(
-					file_id,
-					TextSpan::new(
-						ast.type_argument_span(first).start,
-						ast.type_argument_span(last).end,
-					),
-				)
-				.primary_label()
-				.with_message(format!(
-					"type argument{} not allowed",
-					if segment.type_args.len() == 1 {
-						""
-					} else {
-						"s"
-					}
-				)),
+				SourceSpan::new(file_id, segment.args_span)
+					.primary_label()
+					.with_message(format!(
+						"type argument{} not allowed",
+						if segment.type_args.len() == 1 {
+							""
+						} else {
+							"s"
+						}
+					)),
 				SourceSpan::new(file_id, segment.ident.span)
 					.secondary_label()
 					.with_message("not allowed on `Self`"),
@@ -958,8 +925,7 @@ impl Semantics {
 		generic_env: GenericEnvIdx,
 		param_types: TypeList,
 		return_type: TypeIndex,
-		ast: &ast::AST,
-		signature: &ast::FunctionSignature,
+		(args_span, result_span): (Option<TextSpan>, Option<TextSpan>),
 	) {
 		let function_decl = &self.decls.functions[usize::from(function_index)];
 		let function_impls = function_decl.function_impls;
@@ -984,11 +950,6 @@ impl Semantics {
 		let call_trait = self.decls.intrinsics.call.expect(
 			"checked by impls.rs's dispatch pass before any signature is resolved",
 		);
-		let args_span = match &signature.params[..] {
-			[param] => Some(ast.type_span(param.inner.inner.ty)),
-			_ => None,
-		};
-		let result_span = signature.result.map(|result| ast.type_span(result));
 		for (provider, value, span) in [
 			(function_impls.args_assoc_type_index, args, args_span),
 			(
@@ -1631,7 +1592,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// `ensure_signature` resolves it.
 	pub(super) fn new(
 		files: &'ast Files,
-		packages: &'ast [Package],
+		asts: &'ast [ast::AST],
 		strings: &'ast mut StringInterner,
 		entries: &'ast [AstEntry<'ast>],
 	) -> Self {
@@ -1651,7 +1612,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.collect();
 		Self {
 			files,
-			syntax: Syntax::new(packages),
+			asts,
 			strings,
 			entries,
 			query_state,
@@ -2220,7 +2181,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&self.strings,
 			obligations,
 			scope,
-			self.ast(scope.file_id),
+			self.asts,
 			segment,
 			params_env,
 			&[],
@@ -2256,7 +2217,22 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// The syntax tree of the file `file_id`, where the ids a declaration
 	/// written there holds are read.
 	pub(super) fn ast(&self, file_id: FileId) -> &'ast ast::AST {
-		self.syntax.get(file_id)
+		&self.asts[file_id.as_usize()]
+	}
+
+	/// Where a function's one parameter type is written (when it writes one
+	/// alone) and where its result type is, if written.
+	fn function_type_spans(
+		&self,
+		file_id: FileId,
+		signature: &ast::FunctionSignature,
+	) -> (Option<TextSpan>, Option<TextSpan>) {
+		let ast = self.ast(file_id);
+		let args = match &signature.params[..] {
+			[param] => Some(ast.type_span(param.inner.inner.ty)),
+			_ => None,
+		};
+		(args, signature.result.map(|result| ast.type_span(result)))
 	}
 
 	/// Where the type `ty`, written in the file `file_id`, is.
@@ -2397,8 +2373,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			generic_env,
 			param_types,
 			return_type,
-			self.ast(file_id),
-			signature,
+			self.function_type_spans(file_id, signature),
 		);
 		sema.functions[usize::from(function_index)] = FunctionSignature {
 			type_params: generic_env,
@@ -2503,8 +2478,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			scope,
 			param_types,
 			return_type,
-			self.ast(file_id),
-			signature,
+			self.function_type_spans(file_id, signature),
 		);
 		sema.functions[usize::from(function_index)] = FunctionSignature {
 			type_params: scope,
@@ -4307,7 +4281,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let diagnostic = sema.report_type_args_on_impl_self(
 					&self.strings,
 					scope.file_id,
-					self.ast(scope.file_id),
 					first,
 					impl_kind,
 				);
@@ -4449,7 +4422,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							&self.strings,
 							obligations,
 							scope,
-							self.ast(scope.file_id),
+							self.asts,
 							stopped,
 							type_params,
 							&[],
@@ -4514,7 +4487,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					&self.strings,
 					obligations,
 					scope,
-					self.ast(scope.file_id),
+					self.asts,
 					stopped,
 					params_env,
 					&[],
@@ -4632,7 +4605,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					&self.strings,
 					obligations,
 					scope,
-					self.ast(scope.file_id),
+					self.asts,
 					stopped,
 					params_env,
 					&[],
@@ -4736,7 +4709,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&self.strings,
 			obligations,
 			scope,
-			self.ast(scope.file_id),
+			self.asts,
 			segment,
 			own,
 			parent_args,
@@ -7775,6 +7748,7 @@ pub(super) mod tests {
 		let mut resolutions = NameResolutions::default();
 		let (decls, ast_nodes) = Declarations::build(
 			&graph.packages,
+			&graph.asts,
 			&graph.files,
 			strings,
 			&mut diagnostics,
@@ -7797,7 +7771,7 @@ pub(super) mod tests {
 			&mut sema,
 			&mut SemanticsBuilder::new(
 				&graph.files,
-				&graph.packages,
+				&graph.asts,
 				strings,
 				&ast_nodes,
 			),

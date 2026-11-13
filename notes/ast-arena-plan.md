@@ -196,13 +196,19 @@ building.
       the segment column; paths in expressions, patterns and items are
       still `Box<[PathSegment]>` (both read as `&[PathSegment]`). Lists are
       still collected in a `Vec` and written whole (`push_list`); the
-      scratch stack comes with `separated` in 4.3. Consumers reach the tree
-      through the file the type is written in: `SemanticsBuilder::ast(file)`
-      (from `Syntax`, built from the packages), `BodyBuilder::ast()`,
-      `type_site(file, ty)` for a diagnostic's site; conformance's
-      `WrittenType::Written` carries the tree it is in, since a trait and
-      its impl can be in different files. wx-fmt's `Builder` and the LSP's
-      completion `Cursor` hold the file's tree. Every example builds to
+      scratch stack comes with `separated` in 4.3. Every file's tree lives
+      in one table on `CompilationUnit`, `asts: Vec<AST>` indexed by
+      `FileId` and filled as the loader parses each file
+      (`compilation.ast(file)`); a `SourceModule` holds only its `file_id`.
+      A consumer reaches a tree through the file a type is written in:
+      `SemanticsBuilder::ast(file)` over the borrowed table,
+      `BodyBuilder::ast()`, `type_site(file, ty)` for a diagnostic's site.
+      `Semantics` holds no syntax, so its few methods that read a written
+      type's spans (`resolve_type_args`, the argument-count check,
+      conformance's `report_type_mismatch`) take the table as a parameter
+      and read each span by the file id they already carry, only when they
+      need it. wx-fmt's `Builder` and the LSP's completion `Cursor` hold
+      the file's tree. Every example builds to
       byte-identical Wasm with identical messages; the two parser snapshots
       now show ids and the columns (step 5 makes them readable again).
    2. patterns;

@@ -528,20 +528,31 @@ impl Semantics {
 	/// side is labelled with the parts that differ at the depth its syntax
 	/// reaches; a note names the parts further in, when its syntax stops short
 	/// (an alias, a projection, `Self`).
-	fn report_type_mismatch<'ast>(
+	/// `asts` are every file's trees, where each written type is read by
+	/// the file it is in.
+	fn report_type_mismatch(
 		&mut self,
 		strings: &StringInterner,
+		asts: &[ast::AST],
 		head: Diagnostic<FileId>,
-		(expected_file, expected_written): (FileId, WrittenType<'ast>),
-		(found_file, found_written): (FileId, WrittenType<'ast>),
+		(expected_file, expected_written): (FileId, WrittenType),
+		(found_file, found_written): (FileId, WrittenType),
 		(expected, found): (TypeIndex, TypeIndex),
 	) {
 		let mut path = Vec::new();
 		self.innermost_difference(expected, found, &mut path);
-		let (at_expected, _) =
-			self.written_part(expected_file, expected_written, &path);
-		let (at_found, depth) =
-			self.written_part(found_file, found_written, &path);
+		let (at_expected, _) = self.written_part(
+			&asts[expected_file.as_usize()],
+			expected_file,
+			expected_written,
+			&path,
+		);
+		let (at_found, depth) = self.written_part(
+			&asts[found_file.as_usize()],
+			found_file,
+			found_written,
+			&path,
+		);
 		let (label_expected, label_found) = match depth {
 			0 => (expected, found),
 			depth => (path[depth - 1].1, path[depth - 1].2),
@@ -583,14 +594,15 @@ impl Semantics {
 	/// and a path to a struct or a function with its arguments. It stops at
 	/// anything whose meaning is not spelled where it is written: an alias,
 	/// a parameter, `Self`, a projection.
-	fn written_part<'ast>(
+	fn written_part(
 		&self,
+		ast: &ast::AST,
 		file_id: FileId,
-		written: WrittenType<'ast>,
+		written: WrittenType,
 		path: &[(TypePathStep, TypeIndex, TypeIndex)],
 	) -> (TextSpan, usize) {
-		let (ast, mut current) = match written {
-			WrittenType::Written(ast, written) => (ast, written),
+		let mut current = match written {
+			WrittenType::Written(written) => written,
 			WrittenType::Implied(span) => return (span, 0),
 		};
 		let mut taken = 0;
@@ -858,9 +870,8 @@ impl Semantics {
 /// Where a compared type is written: its syntax, or, for a type left out
 /// (a function's `()` result), the span that stands for it.
 #[derive(Clone, Copy)]
-enum WrittenType<'ast> {
-	/// A type written in the file whose tree this is.
-	Written(&'ast ast::AST, ast::TypeId),
+enum WrittenType {
+	Written(ast::TypeId),
 	Implied(TextSpan),
 }
 
@@ -1314,21 +1325,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 				self.function_syntax(function),
 			);
 			// A left-out result is `()`; its function's name stands for it.
-			let written =
-				|file_id: FileId, syntax: &'ast ast::FunctionSignature| {
-					let ast = self.ast(file_id);
-					if position < params {
-						WrittenType::Written(
-							ast,
-							syntax.params[position].inner.inner.ty,
-						)
-					} else {
-						syntax.result.map_or(
-							WrittenType::Implied(syntax.name.span),
-							|result| WrittenType::Written(ast, result),
-						)
-					}
-				};
+			let written = |syntax: &ast::FunctionSignature| {
+				if position < params {
+					WrittenType::Written(syntax.params[position].inner.inner.ty)
+				} else {
+					syntax.result.map_or(
+						WrittenType::Implied(syntax.name.span),
+						WrittenType::Written,
+					)
+				}
+			};
 			let (expected_file, found_file) = (
 				sema.decls.file_id(
 					sema.decls.functions[usize::from(declaration)].loc,
@@ -1344,9 +1350,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 			sema.report_type_mismatch(
 				&self.strings,
+				self.asts,
 				head,
-				(expected_file, written(expected_file, expected_syntax)),
-				(found_file, written(found_file, syntax)),
+				(expected_file, written(expected_syntax)),
+				(found_file, written(syntax)),
 				(expected, found),
 			);
 			return Ok(());
@@ -1431,12 +1438,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 			));
 		sema.report_type_mismatch(
 			&self.strings,
+			self.asts,
 			head,
-			(
-				expected_file,
-				WrittenType::Written(self.ast(expected_file), *expected_ty),
-			),
-			(found_file, WrittenType::Written(self.ast(found_file), *ty)),
+			(expected_file, WrittenType::Written(*expected_ty)),
+			(found_file, WrittenType::Written(*ty)),
 			(expected, found),
 		);
 		Ok(())

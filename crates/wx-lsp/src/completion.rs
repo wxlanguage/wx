@@ -41,13 +41,8 @@ pub(crate) fn completion(
 		file,
 		position.position,
 	)?;
-	let module = snapshot
-		.compilation
-		.packages
-		.iter()
-		.flat_map(|package| package.modules.iter())
-		.find(|module| module.file_id == file)?;
-	let Position { site, within } = position_at(&module.ast, offset)?;
+	let Position { site, within } =
+		position_at(snapshot.compilation.ast(file), offset)?;
 	let declaration = match within {
 		Within::Signature(Anchor::Name(name)) | Within::Body(name) => {
 			snapshot.declared_at(SourceSpan::new(file, name))?
@@ -538,9 +533,7 @@ impl Cursor<'_> {
 		let name = signature.name.span;
 		let site = self
 			.type_params(&signature.type_params)
-			.or_else(|| {
-				self.ty(self.child(&signature.params)?.inner.inner.ty)
-			})
+			.or_else(|| self.ty(self.child(&signature.params)?.inner.inner.ty))
 			.or_else(|| self.ty(signature.result?));
 		Within::Signature(Anchor::Name(name))
 			.position(site)
