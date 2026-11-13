@@ -1,5 +1,7 @@
 use indoc::indoc;
 
+use super::lexer::*;
+use super::parser::*;
 use super::*;
 use crate::diagnostics::DiagnosticCode;
 use crate::testing::DiagnosticView;
