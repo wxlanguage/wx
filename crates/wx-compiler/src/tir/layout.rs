@@ -670,6 +670,7 @@ mod tests {
 				&mut resolutions,
 				&self.strings,
 				&self.sema.decls,
+				&[],
 			)
 			.resolve_path(file_id, root, &[segment], Tier::Value);
 			let loc = target.loc().unwrap_or_else(|| {

@@ -1214,6 +1214,7 @@ mod tests {
 				&mut resolutions,
 				&self.strings,
 				&self.sema.decls,
+				&[],
 			)
 			.resolve_path(
 				self.file,

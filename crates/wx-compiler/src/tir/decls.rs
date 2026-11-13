@@ -5408,6 +5408,7 @@ mod tests {
 				&mut resolutions,
 				&self.strings,
 				&self.decls,
+				&[],
 			)
 			.resolve_path(file_id, namespace, segments, tier);
 			ResolutionResult {

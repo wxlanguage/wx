@@ -116,9 +116,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 15
-      end: 15
   - ident:
       inner: 36
       span:
@@ -127,9 +124,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 23
-      end: 23
   - ident:
       inner: 36
       span:
@@ -138,9 +132,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 31
-      end: 31
   - ident:
       inner: 35
       span:
@@ -149,9 +140,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 39
-      end: 39
   - ident:
       inner: 37
       span:
@@ -160,9 +148,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 43
-      end: 43
   - ident:
       inner: 39
       span:
@@ -171,9 +156,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 62
-      end: 62
   - ident:
       inner: 36
       span:
@@ -182,9 +164,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 87
-      end: 87
   - ident:
       inner: 36
       span:
@@ -193,9 +172,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 107
-      end: 107
   - ident:
       inner: 36
       span:
@@ -204,9 +180,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 144
-      end: 144
   - ident:
       inner: 36
       span:
@@ -215,9 +188,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 156
-      end: 156
   - ident:
       inner: 48
       span:
@@ -226,9 +196,6 @@ segments:
     type_args:
       start: 0
       len: 0
-    args_span:
-      start: 212
-      end: 212
 type_args: []
 type_lists: []
 bound_lists: []

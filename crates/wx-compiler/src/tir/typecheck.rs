@@ -1163,6 +1163,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			&mut self.sema.resolutions,
 			self.builder.strings,
 			&self.sema.decls,
+			self.builder.asts,
 		)
 		.walk_path(
 			self.scope.file_id,
@@ -1710,6 +1711,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		if !segment.type_args.is_empty() {
 			let diagnostic = self.sema.report_type_args_on_impl_self(
 				self.builder.strings,
+				self.ast(),
 				self.scope.file_id,
 				segment,
 				impl_kind,
@@ -3152,6 +3154,7 @@ mod tests {
 				&mut resolutions,
 				&self.strings,
 				&self.sema.decls,
+				&[],
 			)
 			.resolve_path(file_id, root, &segments, Tier::Value)
 			.loc()

@@ -309,6 +309,7 @@ impl Semantics {
 	fn resolve_exports(
 		&mut self,
 		strings: &StringInterner,
+		asts: &[ast::AST],
 	) -> FxHashMap<SymbolU32, ExportedItem> {
 		let mut exports = FxHashMap::with_capacity_and_hasher(
 			self.decls.exports.len(),
@@ -323,6 +324,7 @@ impl Semantics {
 				&mut self.resolutions,
 				strings,
 				&self.decls,
+				asts,
 			)
 			.resolve_definition(
 				file_id,
@@ -802,6 +804,7 @@ impl Semantics {
 	pub(super) fn report_type_args_on_impl_self(
 		&self,
 		strings: &StringInterner,
+		ast: &ast::AST,
 		file_id: FileId,
 		segment: &ast::PathSegment,
 		impl_kind: ImplKind,
@@ -829,7 +832,7 @@ impl Semantics {
 			.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
 			.with_message("type arguments are not allowed on `Self`")
 			.with_labels(vec![
-				SourceSpan::new(file_id, segment.args_span)
+				SourceSpan::new(file_id, ast.type_args_span(segment))
 					.primary_label()
 					.with_message(format!(
 						"type argument{} not allowed",
@@ -1192,6 +1195,7 @@ impl Semantics {
 	fn type_constant_length(
 		&mut self,
 		strings: &StringInterner,
+		ast: &ast::AST,
 		scope: LexicalScope,
 		selected: Option<(ConstIdx, Vec<TypeIndex>)>,
 		member: &ast::PathSegment,
@@ -1203,6 +1207,7 @@ impl Semantics {
 			self.diagnostics.push(report_type_args_not_allowed(
 				strings,
 				&self.decls,
+				ast,
 				scope.file_id,
 				member,
 				TypeArgsNotAllowedOn::Declaration(DeclKind::Const(constant)),
@@ -1326,6 +1331,7 @@ impl Semantics {
 	pub(super) fn resolve_trait_bound_path(
 		&mut self,
 		strings: &StringInterner,
+		asts: &[ast::AST],
 		file_id: FileId,
 		namespace: Scope,
 		segments: &[ast::PathSegment],
@@ -1335,6 +1341,7 @@ impl Semantics {
 			&mut self.resolutions,
 			strings,
 			&self.decls,
+			asts,
 		)
 		.resolve_definition(file_id, namespace, segments, Tier::Type)
 		.ok()?;
@@ -1643,7 +1650,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		self.check_declarations(sema);
 		self.check_constant_bodies(sema);
 		self.check_bodies(sema);
-		sema.exports = sema.resolve_exports(&self.strings);
+		sema.exports = sema.resolve_exports(&self.strings, self.asts);
 		debug_assert!(
 			self.query_state
 				.values()
@@ -3943,6 +3950,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				);
 				return sema.type_constant_length(
 					&self.strings,
+					self.ast(scope.file_id),
 					scope,
 					selected,
 					member,
@@ -3961,6 +3969,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						let selected = sema
 							.resolve_trait_bound_path(
 								&self.strings,
+								self.asts,
 								scope.file_id,
 								scope.namespace,
 								ast.list(ast.qualified_root(root).trait_path),
@@ -3977,6 +3986,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							});
 						return sema.type_constant_length(
 							&self.strings,
+							self.ast(scope.file_id),
 							scope,
 							selected,
 							member,
@@ -4019,6 +4029,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				&mut sema.resolutions,
 				&self.strings,
 				&sema.decls,
+				self.asts,
 			)
 			.walk_path(
 				scope.file_id,
@@ -4062,6 +4073,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				);
 				return sema.type_constant_length(
 					&self.strings,
+					self.ast(scope.file_id),
 					scope,
 					selected,
 					member,
@@ -4239,6 +4251,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				sema.diagnostics.push(report_type_args_not_allowed(
 					&self.strings,
 					&sema.decls,
+					self.ast(scope.file_id),
 					scope.file_id,
 					first,
 					TypeArgsNotAllowedOn::TypeParam {
@@ -4275,6 +4288,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 				let diagnostic = sema.report_type_args_on_impl_self(
 					&self.strings,
+					self.ast(scope.file_id),
 					scope.file_id,
 					first,
 					impl_kind,
@@ -4289,6 +4303,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				&mut sema.resolutions,
 				&self.strings,
 				&sema.decls,
+				self.asts,
 			)
 			.walk_path(scope.file_id, scope.namespace, segments, Tier::Type);
 			let Some(loc) = walk.target.loc() else {
@@ -4366,6 +4381,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				sema.diagnostics.push(report_type_args_not_allowed(
 					&self.strings,
 					&sema.decls,
+					self.ast(scope.file_id),
 					scope.file_id,
 					stopped,
 					TypeArgsNotAllowedOn::Declaration(kind),
@@ -4507,6 +4523,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema.diagnostics.push(report_type_args_not_allowed(
 						&self.strings,
 						&sema.decls,
+						self.ast(scope.file_id),
 						scope.file_id,
 						stopped,
 						TypeArgsNotAllowedOn::Declaration(DeclKind::Enum(
@@ -4540,6 +4557,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema.diagnostics.push(report_type_args_not_allowed(
 						&self.strings,
 						&sema.decls,
+						self.ast(scope.file_id),
 						scope.file_id,
 						stopped,
 						TypeArgsNotAllowedOn::Declaration(kind),
@@ -4629,6 +4647,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema.diagnostics.push(report_type_args_not_allowed(
 						&self.strings,
 						&sema.decls,
+						self.ast(scope.file_id),
 						scope.file_id,
 						stopped,
 						TypeArgsNotAllowedOn::Declaration(kind),
@@ -4737,6 +4756,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema.diagnostics.push(report_type_args_not_allowed(
 			&self.strings,
 			&sema.decls,
+			self.ast(scope.file_id),
 			scope.file_id,
 			segment,
 			TypeArgsNotAllowedOn::Declaration(DeclKind::AssocType(
@@ -4842,6 +4862,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 				let Some(required_trait) = sema.resolve_trait_bound_path(
 					&self.strings,
+					self.asts,
 					scope.file_id,
 					scope.namespace,
 					ast.list(root.trait_path),
@@ -5579,6 +5600,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		};
 		let Some(trait_index) = sema.resolve_trait_bound_path(
 			&self.strings,
+			self.asts,
 			file_id,
 			namespace,
 			segments,
@@ -8024,6 +8046,7 @@ pub(super) mod tests {
 				&mut resolutions,
 				&self.strings,
 				&self.sema.decls,
+				&[],
 			)
 			.resolve_path(file_id, root, &segments, tier);
 			let loc = target.loc().unwrap_or_else(|| {

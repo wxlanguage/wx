@@ -205,6 +205,7 @@ impl BodyBuilder<'_, '_> {
 				);
 				let qualified = self.sema.resolve_trait_bound_path(
 					self.builder.strings,
+					self.builder.asts,
 					self.scope.file_id,
 					self.scope.namespace,
 					self.ast().list(root.trait_path),
@@ -304,6 +305,7 @@ impl BodyBuilder<'_, '_> {
 			self.sema.diagnostics.push(report_type_args_not_allowed(
 				self.builder.strings,
 				&self.sema.decls,
+				self.ast(),
 				self.scope.file_id,
 				member,
 				TypeArgsNotAllowedOn::Declaration(DeclKind::Const(constant)),

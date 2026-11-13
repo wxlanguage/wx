@@ -320,12 +320,6 @@ impl Node for Path {
 	}
 }
 
-impl Node for PathSegment {
-	fn span(&self) -> TextSpan {
-		PathSegment::span(self)
-	}
-}
-
 impl Node for AssocBinding {
 	fn span(&self) -> TextSpan {
 		self.span
@@ -924,7 +918,13 @@ impl Cursor<'_> {
 	/// written yet (`a::`) is the error symbol at the empty span after the
 	/// `::`. Type arguments on any segment are types of their own.
 	fn path(&self, segments: &[PathSegment], used_as: NameUse) -> Option<Site> {
-		let index = self.child_index(segments)?;
+		let ast = self.ast;
+		let index = self.child_index_by(segments, |segment| {
+			TextSpan::new(
+				segment.ident.span.start,
+				ast.type_args_span(segment).end,
+			)
+		})?;
 		if !self.at(segments[index].ident.span) {
 			return self.type_args(&segments[index]);
 		}

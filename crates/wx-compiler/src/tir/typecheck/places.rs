@@ -171,8 +171,11 @@ impl BodyBuilder<'_, '_> {
 					.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
 					.with_message("type arguments are not allowed here")
 					.with_label(
-						Label::primary(self.scope.file_id, segment.args_span)
-							.with_message("a field takes no type arguments"),
+						Label::primary(
+							self.scope.file_id,
+							self.ast().type_args_span(segment),
+						)
+						.with_message("a field takes no type arguments"),
 					),
 			);
 		}

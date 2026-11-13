@@ -1449,11 +1449,9 @@ impl<'ctx> Parser<'ctx> {
 
 	/// Parse `<Type1, 5, const SIZE>` arguments, after a type's name or a
 	/// turbofish's `::`. Returns the args and the closing `>` span.
-	/// Parse `<Type1, 5, const SIZE>` arguments: the list, the span from the
-	/// first argument to the last, and the closing `>`'s span.
 	fn parse_type_args(
 		&mut self,
-	) -> Result<(List<TypeArgument>, TextSpan, TextSpan), ()> {
+	) -> Result<(List<TypeArgument>, TextSpan), ()> {
 		let open_span = self.next_expect(Token::LeftArrow)?.span;
 		let mut args: Vec<TypeArgument> = Vec::new();
 
@@ -1486,19 +1484,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 		};
 
-		let span_of = |argument| match argument {
-			TypeArgument::Type(ty) => self.ast.types.spans[usize::from(ty)],
-			TypeArgument::Const(constant) => {
-				self.ast.consts.spans[usize::from(constant)]
-			}
-		};
-		let args_span = match (args.first(), args.last()) {
-			(Some(&first), Some(&last)) => {
-				TextSpan::new(span_of(first).start, span_of(last).end)
-			}
-			_ => TextSpan::new(open_span.end, open_span.end),
-		};
-		Ok((self.ast.push_list(args), args_span, close_span))
+		Ok((self.ast.push_list(args), close_span))
 	}
 
 	/// One type argument: a literal is a constant; `const` marks a path as
@@ -1759,10 +1745,9 @@ impl<'ctx> Parser<'ctx> {
 			self.lexer.next(); // consume `::`
 			match self.lexer.peek().inner {
 				Token::LeftArrow => {
-					let (type_args, args_span, _) = self.parse_type_args()?;
+					let (type_args, _) = self.parse_type_args()?;
 					let last = segments.last_mut().unwrap();
 					last.type_args = type_args;
-					last.args_span = args_span;
 				}
 				Token::Identifier | Token::Keyword(_) => {
 					let ident = self.parse_path_ident()?;
@@ -1792,9 +1777,8 @@ impl<'ctx> Parser<'ctx> {
 		loop {
 			let mut segment = PathSegment::new(ident);
 			if self.lexer.peek().inner == Token::LeftArrow {
-				let (args, args_span, _) = self.parse_type_args()?;
+				let (args, _) = self.parse_type_args()?;
 				segment.type_args = args;
-				segment.args_span = args_span;
 			}
 			segments.push(segment);
 			if self.lexer.peek().inner != Token::ColonColon {
@@ -1951,9 +1935,8 @@ impl<'ctx> Parser<'ctx> {
 			let mut segment = PathSegment::new(ident);
 			let mut end = ident.span.end;
 			if self.lexer.peek().inner == Token::LeftArrow {
-				let (args, args_span, close_span) = self.parse_type_args()?;
+				let (args, close_span) = self.parse_type_args()?;
 				segment.type_args = args;
-				segment.args_span = args_span;
 				end = close_span.end;
 			}
 			segments.push(segment);
@@ -2403,10 +2386,9 @@ impl<'ctx> Parser<'ctx> {
 			match next.inner {
 				// `::<T, U>` — turbofish type args for the last segment
 				Token::LeftArrow => {
-					let (type_args, args_span, _) = self.parse_type_args()?;
+					let (type_args, _) = self.parse_type_args()?;
 					let last = segments.last_mut().unwrap();
 					last.type_args = type_args;
-					last.args_span = args_span;
 					// Loop continues: next `::` starts a new segment.
 				}
 				// `::{ ... }` — the old struct literal
@@ -3060,7 +3042,7 @@ impl<'ctx> Parser<'ctx> {
 		let colons = self.lexer.next(); // consume `::`
 
 		if self.lexer.peek().inner == Token::LeftArrow {
-			let (args, args_span, close_span) = self.parse_type_args()?;
+			let (args, close_span) = self.parse_type_args()?;
 			return match self.ast.exprs.kinds[usize::from(left)] {
 				Expression::ObjectAccess { member, .. }
 					if self.ast.segments[usize::from(member)]
@@ -3069,7 +3051,6 @@ impl<'ctx> Parser<'ctx> {
 				{
 					let segment = &mut self.ast.segments[usize::from(member)];
 					segment.type_args = args;
-					segment.args_span = args_span;
 					self.ast.exprs.spans[usize::from(left)].end =
 						close_span.end;
 					Ok(left)
@@ -3324,10 +3305,9 @@ impl<'ctx> Parser<'ctx> {
 			match next.inner {
 				// `::<T, U>` — turbofish for the last segment
 				Token::LeftArrow => {
-					let (type_args, args_span, _) = parser.parse_type_args()?;
+					let (type_args, _) = parser.parse_type_args()?;
 					let last = segments.last_mut().unwrap();
 					last.type_args = type_args;
-					last.args_span = args_span;
 				}
 				// `::{ ... }` — the old named pattern, gone
 				Token::OpenBrace => {

@@ -190,9 +190,8 @@ building.
       their siblings, at most 24 B each by assertion); a qualified root is
       a `QualifiedRootId`; every list is a `List<T>` read with
       `ast.list(..)`. `PathSegment` is `Copy`, its arguments a
-      `List<TypeArgument>` and their extent its own `args_span`, so a
-      segment's span and the "type arguments not allowed" diagnostic need
-      no tree. A path inside a type, a bound or a constant argument lives in
+      `List<TypeArgument>` (their extent was its own `args_span` until
+      4.4d). A path inside a type, a bound or a constant argument lives in
       the segment column; paths in expressions, patterns and items are
       still `Box<[PathSegment]>` (both read as `&[PathSegment]`). Lists are
       still collected in a `Vec` and written whole (`push_list`); the
@@ -280,6 +279,15 @@ building.
       vectors' growth slack (36.4 to 25.0 B/token) for about 900 shrinking
       reallocations.
 
+      **4.4d, done.** `PathSegment` drops `args_span` (28 to 20 B; the
+      segment column is the tree's second largest, after expressions): where
+      a segment's type arguments are written is read from the tree,
+      `ast.type_args_span(segment)`. Only the "type arguments not allowed"
+      reports and editor completion read it, so `PathResolver` and those
+      reports are given the trees. Retained 25.0 to 23.2 B/token. Storing a
+      block's statements in place of `stmt_lists` was measured too and left
+      out: that list is under 1% of the tree.
+
       **4.4b**, next: TIR's `AstEntry` by id (`ItemId`, `ImplItemId`,
       `TraitItemId`), read through the file's tree, without its lifetime.
 
@@ -292,15 +300,15 @@ building.
 
 ## Results
 
-| | before | after step 3 | after 4.1 | after 4.2 | after 4.3 | after 4.4a | after 4.4c |
-|---|---|---|---|---|---|---|---|
-| lex | 0.64 ms | 0.80 ms | 0.81 ms | 0.80 ms | 0.82 ms | 0.82 ms | 0.81 ms |
-| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | 2.68 ms | 2.44 ms | 2.36 ms | 2.39 ms |
-| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | 0.34 ms | 0.07 ms | 0.03 ms | 0.03 ms |
-| allocations/token | 0.86 | 0.86 | 0.72 | 0.72 | 0.49 | 0.45 | 0.48 |
-| retained bytes/token | 49.2 | 49.2 | 38.2 | 37.1 | 37.1 (27.3 data) | 36.4 | 25.0 |
-| expression node | 80 B | 80 B | 48 B | 48 B | 24 B + 8 B span | 24 B + 8 B span | 24 B + 8 B span |
-| item | 104 B | 104 B | 104 B | 104 B | 104 B | 64 B + 8 B span | 64 B + 8 B span |
+| | before | after step 3 | after 4.1 | after 4.2 | after 4.3 | after 4.4a | after 4.4c | after 4.4d |
+|---|---|---|---|---|---|---|---|---|
+| lex | 0.64 ms | 0.80 ms | 0.81 ms | 0.80 ms | 0.82 ms | 0.82 ms | 0.81 ms | 0.80 ms |
+| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | 2.68 ms | 2.44 ms | 2.36 ms | 2.39 ms | 2.34 ms |
+| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | 0.34 ms | 0.07 ms | 0.03 ms | 0.03 ms | 0.03 ms |
+| allocations/token | 0.86 | 0.86 | 0.72 | 0.72 | 0.49 | 0.45 | 0.48 | 0.48 |
+| retained bytes/token | 49.2 | 49.2 | 38.2 | 37.1 | 37.1 (27.3 data) | 36.4 | 25.0 | 23.2 |
+| expression node | 80 B | 80 B | 48 B | 48 B | 24 B + 8 B span | 24 B + 8 B span | 24 B + 8 B span | 24 B + 8 B span |
+| item | 104 B | 104 B | 104 B | 104 B | 104 B | 64 B + 8 B span | 64 B + 8 B span | 64 B + 8 B span |
 
 The expected outcome, an estimate to be checked against this table: parsing
 about 1.6–1.9 ms, dropping near zero, the retained tree about a third of its

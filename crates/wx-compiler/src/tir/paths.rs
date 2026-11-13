@@ -58,7 +58,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::{
-	ast::{PathSegment, StringInterner},
+	ast::{self, PathSegment, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	vfs::FileId,
 };
@@ -145,6 +145,10 @@ pub(super) struct PathResolver<'r> {
 	resolutions: &'r mut NameResolutions,
 	strings: &'r StringInterner,
 	decls: &'r Declarations,
+	/// Each file's tree, by its id, where a segment's type arguments are
+	/// read when reporting them. A path built outside a tree (an export's
+	/// name, a test's) has none, so it is resolved with no trees.
+	asts: &'r [ast::AST],
 }
 
 impl<'r> PathResolver<'r> {
@@ -153,12 +157,14 @@ impl<'r> PathResolver<'r> {
 		resolutions: &'r mut NameResolutions,
 		strings: &'r StringInterner,
 		decls: &'r Declarations,
+		asts: &'r [ast::AST],
 	) -> Self {
 		Self {
 			diagnostics,
 			resolutions,
 			strings,
 			decls,
+			asts,
 		}
 	}
 
@@ -358,6 +364,7 @@ impl<'r> PathResolver<'r> {
 			self.diagnostics.push(report_type_args_not_allowed(
 				self.strings,
 				self.decls,
+				&self.asts[file_id.as_usize()],
 				file_id,
 				segment,
 				TypeArgsNotAllowedOn::Declaration(
@@ -665,6 +672,7 @@ mod tests {
 				&mut NameResolutions::default(),
 				&self.strings,
 				&self.decls,
+				&self.graph.asts,
 			)
 			.try_resolve_path(file_id, from, &segments, tier)
 		}
@@ -695,6 +703,7 @@ mod tests {
 				&mut resolutions,
 				&self.strings,
 				&self.decls,
+				&self.graph.asts,
 			)
 			.resolve_path(file_id, from, segments, tier);
 			ResolutionResult {
@@ -837,6 +846,7 @@ mod tests {
 			&mut resolutions,
 			&case.strings,
 			&case.decls,
+			&case.graph.asts,
 		)
 		.walk_path(file_id, root, &segments, Tier::Type);
 
@@ -1112,6 +1122,7 @@ mod tests {
 			&mut NameResolutions::default(),
 			&case.strings,
 			&case.decls,
+			&case.graph.asts,
 		)
 		.resolve_definition(file_id, root, &segments, Tier::Type);
 		assert!(definition.is_ok());

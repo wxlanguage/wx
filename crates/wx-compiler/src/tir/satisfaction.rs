@@ -808,6 +808,7 @@ pub(super) enum TypeArgsNotAllowedOn<'a> {
 pub(super) fn report_type_args_not_allowed(
 	strings: &StringInterner,
 	decls: &Declarations,
+	ast: &ast::AST,
 	file_id: FileId,
 	segment: &ast::PathSegment,
 	target: TypeArgsNotAllowedOn<'_>,
@@ -827,7 +828,7 @@ pub(super) fn report_type_args_not_allowed(
 	};
 	let name = strings.resolve(segment.ident.inner).unwrap();
 	let mut labels = vec![
-		SourceSpan::new(file_id, segment.args_span)
+		SourceSpan::new(file_id, ast.type_args_span(segment))
 			.primary_label()
 			.with_message(format!(
 				"type argument{} not allowed",
@@ -998,6 +999,7 @@ mod tests {
 				&mut resolutions,
 				&self.strings,
 				&self.sema.decls,
+				&[],
 			)
 			.resolve_path(file_id, root, &segments, tier)
 			.loc()

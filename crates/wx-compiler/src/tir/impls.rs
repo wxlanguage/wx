@@ -812,6 +812,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			self.resolutions,
 			self.strings,
 			self.decls,
+			self.asts,
 		)
 		.resolve_definition(file_id, namespace, segments, Tier::Type);
 		let kind = definition?.symbol_kind(self.decls);
@@ -853,6 +854,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			self.resolutions,
 			self.strings,
 			self.decls,
+			self.asts,
 		)
 		.resolve_definition(file_id, namespace, segments, Tier::Type);
 		match definition.ok()?.symbol_kind(self.decls) {

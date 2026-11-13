@@ -367,9 +367,6 @@ pub struct Block {
 pub struct PathSegment {
 	pub ident: Spanned<SymbolU32>,
 	pub type_args: List<TypeArgument>,
-	/// Where the type arguments are written, from the first to the last;
-	/// empty, at the end of the name, when there are none.
-	pub args_span: TextSpan,
 }
 
 impl PathSegment {
@@ -378,7 +375,6 @@ impl PathSegment {
 		Self {
 			ident,
 			type_args: List::EMPTY,
-			args_span: TextSpan::new(ident.span.end, ident.span.end),
 		}
 	}
 
@@ -390,11 +386,6 @@ impl PathSegment {
 			inner: Keyword::Error.symbol(),
 			span: TextSpan::new(at, at),
 		})
-	}
-
-	/// The span of the segment: its name through its last type argument.
-	pub fn span(&self) -> TextSpan {
-		TextSpan::new(self.ident.span.start, self.args_span.end)
 	}
 
 	/// Whether no name is written here: the parser reported it already.
@@ -1843,6 +1834,19 @@ impl AST {
 		match argument {
 			TypeArgument::Type(ty) => self.type_span(ty),
 			TypeArgument::Const(constant) => self.const_span(constant),
+		}
+	}
+
+	/// Where a segment's type arguments are written, from the first to the
+	/// last; empty, at the end of its name, when it has none.
+	pub fn type_args_span(&self, segment: &PathSegment) -> TextSpan {
+		let args = self.list(segment.type_args);
+		match (args.first(), args.last()) {
+			(Some(&first), Some(&last)) => TextSpan::new(
+				self.type_argument_span(first).start,
+				self.type_argument_span(last).end,
+			),
+			_ => TextSpan::new(segment.ident.span.end, segment.ident.span.end),
 		}
 	}
 
