@@ -154,8 +154,8 @@ parser and its `report_*` diagnostics; `ast/tests.rs` stays as it is.
   not change.
 - **LSP.** `completion.rs` walks the tree; `hover.rs` touches it once.
 - **Parser tests.** The two snapshots (`top_level_items`, `use_tree_forms`)
-  serialize the tree; they need a printer that resolves ids into a nested
-  tree, so a snapshot still reads as one. `shape()` is rewritten over ids.
+  print the tree through `ast/printer.rs`, which resolves ids into a nested
+  S-expression (step 5); `shape()` is that printer.
 
 ## Steps
 
@@ -296,8 +296,15 @@ building.
       in. `SemanticsBuilder` keeps `'ast`: it still borrows the trees.
 
    The old and new forms coexist inside `Ast` while a step is in flight.
-5. The snapshot printer (with 4.3 at the latest, when the snapshots' trees
-   change).
+5. **Done.** The snapshot printer, `ast/printer.rs` (test-only): a `Sexp`
+   (an atom or a list) printed flat, for one-line assertions, or wrapped at
+   a width, for snapshots; and a `Printer` that builds one from the tree.
+   Items, statements, expressions and patterns are S-expressions, the type
+   level (types, bounds, constant arguments, paths) canonical source text,
+   literals as written, no spans. `shape()` and the pattern renderer are
+   the printer now, and the two snapshots print the tree instead of
+   serializing its columns; `top_level_items` covers every item form and
+   statement kind.
 6. Revisit: error nodes instead of `Err`; a byte-based lexer instead of
    `Chars` (the lexer is a fifth of the time) if the numbers still call for
    it.

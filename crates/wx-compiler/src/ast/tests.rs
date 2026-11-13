@@ -2,6 +2,7 @@ use indoc::indoc;
 
 use super::lexer::*;
 use super::parser::*;
+use super::printer::Printer;
 use super::*;
 use crate::diagnostics::DiagnosticCode;
 use crate::testing::DiagnosticView;
@@ -49,7 +50,7 @@ impl TestCase {
 	}
 
 	/// Resolves an interned symbol, so assertions can name things rather than
-	/// compare opaque `SymbolU32` integers (which is all a snapshot shows).
+	/// compare opaque `SymbolU32` integers.
 	fn name(&self, symbol: SymbolU32) -> &str {
 		self.strings
 			.resolve(symbol)
@@ -68,163 +69,33 @@ impl TestCase {
 		signature
 	}
 
-	/// Renders an expression as a compact S-expression: `a + b * c` becomes
+	/// The printer over this file's tree.
+	fn printer(&self) -> Printer<'_> {
+		let source = &self.files.get(self.file_id).unwrap().source;
+		Printer::new(&self.ast, &self.strings, source)
+	}
+
+	/// An expression on one line, as an S-expression: `a + b * c` is
 	/// `(+ a (* b c))`.
 	///
 	/// Precedence and associativity are claims about *tree shape*, and a
 	/// nest of `matches!` states that shape far less clearly than the shape
-	/// itself does. Only the node kinds those tests need are rendered;
-	/// anything else falls back to its variant name, which is enough to make
-	/// a mismatch obvious.
+	/// itself does.
 	fn shape(&self, expr: ExprId) -> String {
-		match self.ast.expr(expr) {
-			Expression::Binary {
-				operator,
-				left,
-				right,
-				..
-			} => format!(
-				"({} {} {})",
-				operator,
-				self.shape(left),
-				self.shape(right)
-			),
-			// `u` prefix keeps unary `-` distinguishable from binary `-`
-			Expression::Unary { operator, operand } => {
-				format!("(u{} {})", operator, self.shape(operand))
-			}
-			Expression::Path(segments) => self.path(self.ast.list(segments)),
-			Expression::ObjectAccess { object, member } => format!(
-				"(. {} {})",
-				self.shape(object),
-				self.name(self.ast.segment(member).ident.inner)
-			),
-			Expression::Int { value } => value.to_string(),
-			Expression::Tuple { elements } => {
-				self.list("tuple", self.ast.list(elements))
-			}
-			Expression::Call {
-				callee, arguments, ..
-			} => self.list(
-				&format!("call {}", self.shape(callee)),
-				self.ast.list(arguments),
-			),
-			Expression::Ascription { value, ty } => {
-				let ty = match self.ast.ty(ty) {
-					TypeExpression::Path(path) => {
-						self.path(self.ast.list(path))
-					}
-					_ => "<type>".to_string(),
-				};
-				format!("(: {} {ty})", self.shape(value))
-			}
-			other => format!("<{}>", expression_kind(&other)),
-		}
+		self.printer().expr(expr).flat()
 	}
 
-	fn list(&self, head: &str, elements: &[ExprId]) -> String {
-		let mut shape = format!("({head}");
-		for &element in elements {
-			shape.push(' ');
-			shape.push_str(&self.shape(element));
-		}
-		shape.push(')');
-		shape
-	}
-
-	/// A pattern as an S-expression that names every node, so what each
-	/// term is visible: a binding is `x`, a constant is `(const x)`, a
-	/// qualified path is `(value Ordering::Less)`.
+	/// A pattern on one line, naming every node, so what each term is
+	/// shows: a binding is `x`, a constant `(const x)`.
 	fn pattern(&self, pattern: PatId) -> String {
-		match self.ast.pattern(pattern) {
-			Pattern::Wildcard => "_".to_string(),
-			Pattern::Binding { mutable, name } => match mutable {
-				true => format!("mut {}", self.name(name.inner)),
-				false => self.name(name.inner).to_string(),
-			},
-			Pattern::Constant { path } => match self.ast.list(path) {
-				[segment] if segment.type_args.is_empty() => {
-					format!("(const {})", self.name(segment.ident.inner))
-				}
-				path => format!("(const {})", self.path(path)),
-			},
-			Pattern::Literal(Literal::Int(value)) => value.to_string(),
-			Pattern::Literal(Literal::NegInt(value)) => {
-				format!("-{value}")
-			}
-			Pattern::Literal(Literal::Char) => "char".to_string(),
-			Pattern::Literal(Literal::Float) => "float".to_string(),
-			Pattern::Literal(Literal::String) => "string".to_string(),
-			Pattern::Or(alternatives) => {
-				let alternatives = self
-					.ast
-					.list(alternatives)
-					.iter()
-					.map(|&alternative| self.pattern(alternative))
-					.collect::<Vec<_>>();
-				format!("(| {})", alternatives.join(" "))
-			}
-			Pattern::Destructure(destructure) => self.destructure(destructure),
-			Pattern::Error => "<error>".to_string(),
-		}
+		self.printer().pattern(pattern).flat()
 	}
 
-	fn destructure(&self, destructure: Destructure) -> String {
-		let elements = |elements: List<PatternElement>| {
-			self.ast
-				.list(elements)
-				.iter()
-				.map(|element| match *element {
-					PatternElement::Pattern(pattern) => self.pattern(pattern),
-					PatternElement::Rest(_) => "..".to_string(),
-				})
-				.collect::<Vec<_>>()
-		};
-		match destructure {
-			Destructure::Tuple { elements: items } => {
-				let mut parts = vec!["tuple".to_string()];
-				parts.extend(elements(items));
-				format!("({})", parts.join(" "))
-			}
-			Destructure::Struct {
-				path,
-				elements: items,
-			} => {
-				let mut parts = vec![self.path(self.ast.list(path))];
-				parts.extend(elements(items));
-				format!("({})", parts.join(" "))
-			}
-			Destructure::NamedStruct { path, fields } => {
-				let fields = self
-					.ast
-					.list(fields)
-					.iter()
-					.map(|item| match *item {
-						PatternFieldItem::Field(field) => match field.pattern {
-							Some(pattern) => format!(
-								"{}: {}",
-								self.name(field.name.inner),
-								self.pattern(pattern)
-							),
-							None => self.name(field.name.inner).to_string(),
-						},
-						PatternFieldItem::Rest(_) => "..".to_string(),
-					})
-					.collect::<Vec<_>>();
-				format!(
-					"({} {{ {} }})",
-					self.path(self.ast.list(path)),
-					fields.join(", ")
-				)
-			}
-		}
-	}
-
-	fn path(&self, path: &[PathSegment]) -> String {
-		path.iter()
-			.map(|segment| self.name(segment.ident.inner))
-			.collect::<Vec<_>>()
-			.join("::")
+	/// The whole file, one item to a paragraph, as a snapshot shows it.
+	fn tree(&self) -> String {
+		let items = self.printer().file();
+		let items = items.iter().map(|item| item.pretty(80));
+		items.collect::<Vec<_>>().join("\n\n") + "\n"
 	}
 
 	/// Every `local` pattern in function `index`, rendered.
@@ -337,27 +208,6 @@ fn shape_of(expression: &str) -> String {
 	case.shape(case.entry_expr(&case.function_block(0), 0))
 }
 
-/// Fallback naming for [`TestCase::shape`] — just enough to identify an
-/// unexpected node without depending on `Debug`.
-fn expression_kind(expression: &Expression) -> &'static str {
-	match expression {
-		Expression::Call { .. } => "call",
-		Expression::NamedCall { .. } => "named-call",
-		Expression::ObjectAccess { .. } => "field",
-		Expression::Tuple { .. } => "tuple",
-		Expression::IfElse { .. } => "if",
-		Expression::Match { .. } => "match",
-		Expression::Loop { .. } => "loop",
-		Expression::Block { .. } => "block",
-		Expression::Float => "float",
-		Expression::Char => "char",
-		Expression::String => "string",
-		Expression::Placeholder => "placeholder",
-		Expression::Error => "error",
-		_ => "other",
-	}
-}
-
 /// Names an item variant, so a failed destructure says what was actually
 /// parsed instead of only what was wanted.
 fn item_kind(item: &Item) -> &'static str {
@@ -449,31 +299,82 @@ enum Entry {
 
 #[test]
 fn test_top_level_items() {
-	let case = TestCase::new(indoc! {"
-        func add(a: i32, b: i32) -> i32 {
-            a + b
+	// Every item form, and a body using every kind of statement, so the
+	// snapshot shows how each one parses.
+	let case = TestCase::new(indoc! {r#"
+        #[inline]
+        pub func add<T: Add + Copy, const N: u32>(a: T, mut b: T, _: u8, u16) -> T {
+            local x: i32 = 1;
+            local (p, mut q) = pair;
+            local Point({ x, y: py, .. }) = point;
+            f(a, (b: u8));
+            g({ value: 1, x });
+            point.inner.&.*[0] = [0; 4];
+            local items = [1, 2, -3];
+            local text = "hi\n";
+            local letter = 'a';
+            local ratio = 1.5;
+            local call = Wrap::<u8>::new(x).get::<T>();
+            local qualified = <T as Shape>::SIDES + <heap::&[u8]>::len(s);
+            if a < b { return a; } else if c { x } else { _ = y; }
+            block :outer {
+                loop :inner {
+                    match n {
+                        0 | 1 => break :outer x,
+                        const MAX => continue :inner,
+                        Pair(a, ..) => { f(a) },
+                        _ => break,
+                    }
+                }
+            }
+            a + b * 2
         }
-
-        memory MEM: u32;
+        func declared(heap::&[u8]) -> !;
+        pub package func clz(value: u32) -> u32;
+        package const SIZE: u32;
+        pub package type Pointer<M>;
+        #[memory_limits({ min_pages: 1, max_pages: 10 })]
+        memory heap: u32;
         global mut counter: i32 = 0;
         const MAX: i32 = 100;
-
-        struct Point(
-            pub x: i32,
-            y: i32,
-        );
-
-        import \"env\" as env {
-            func log(message: string)
+        struct Point(pub x: i32, y: i32);
+        pub struct Pair<T>(T, pub mut flag: u8);
+        enum Color(u8) { Red, Green = 1, Blue, .. }
+        import "env" as env {
+            "Log": func log(message: heap::&[u8]);
+            global mut ticks: u64;
+            memory shared: u32;
+            pub use super::Point;
         }
-
-        enum Color {
-            Red,
-            Green = 1,
-            Blue,
+        export { add, MAX as "max" }
+        export counter;
+        mod inner { pub struct Unit(); }
+        mod outer;
+        pub package "math" as math;
+        trait Shape: Display + Memory where { Size = u32 } {
+            type Size: PointerSize;
+            type Default = u32;
+            const SIDES: u32;
+            const CORNERS: u32 = 4;
+            func area(self: Self) -> f32;
+            func double(self: Self) -> f32 { self.area() * 2.0 }
         }
-    "});
-	insta::assert_yaml_snapshot!(case.ast);
+        impl<T> Pair<T> {
+            pub const ZERO: u8 = 0;
+            pub func first(self: Self) -> T { local Pair(a, _) = self; a }
+        }
+        impl Shape for Point {
+            type Size = u32;
+            const SIDES: u32 = 4;
+            func area(self: Self) -> f32 { 1.0 }
+        }
+        pub typeset Int: Copy { u8, u16, u32 }
+        use math::{add as plus, trig::*};
+        type Bytes<M: Memory> = M::&[u8; 4];
+        type Callback = func(x: u32, u8) -> (u32, u64);
+    "#});
+	case.diagnostics().assert_none();
+	insta::assert_snapshot!(case.tree());
 }
 
 #[test]
@@ -938,7 +839,7 @@ fn test_use_tree_forms() {
     "});
 
 	case.diagnostics().assert_none();
-	insta::assert_yaml_snapshot!(case.ast);
+	insta::assert_snapshot!(case.tree());
 }
 
 #[test]
@@ -1342,7 +1243,10 @@ fn an_element_of_a_parenthesized_list_may_be_ascribed() {
 	// The ascription covers the whole element.
 	assert_eq!(shape_of("(a + b: u64)"), "(tuple (: (+ a b) u64))");
 	// A type ends at the list's `,` or `)`, so `<` opens its arguments.
-	assert_eq!(shape_of("(x: m::Wrap<u8>, y)"), "(tuple (: x m::Wrap) y)");
+	assert_eq!(
+		shape_of("(x: m::Wrap<u8>, y)"),
+		"(tuple (: x m::Wrap<u8>) y)"
+	);
 	// A labelled block is still a value of an element.
 	let case = TestCase::new("func f() { (block :l { break :l 1 }: u8) }");
 	case.diagnostics().assert_none();
@@ -1372,10 +1276,7 @@ impl TestCase {
 			callee, arguments, ..
 		} = expression
 		else {
-			panic!(
-				"expected a named call, found {}",
-				expression_kind(&expression)
-			)
+			panic!("expected a named call")
 		};
 		let Expression::Path(path) = self.ast.expr(callee) else {
 			panic!("expected a path callee")
@@ -1876,12 +1777,7 @@ fn test_call_field_namespace() {
 	};
 	assert_eq!(case.name(case.ast.segment(member).ident.inner), "x");
 
-	let Expression::Path(segments) =
-		case.local_definition_value(&statements, 3)
-	else {
-		panic!("expected a path")
-	};
-	assert_eq!(case.path(case.ast.list(segments)), "console::log");
+	assert_eq!(case.shape(case.local_value(&statements, 3)), "console::log");
 
 	let Expression::Call { arguments, .. } =
 		case.statement_expression(&statements, 4)
@@ -2110,7 +2006,7 @@ fn test_pattern_simple_binding() {
         }
     "});
 	case.diagnostics().assert_none();
-	assert_eq!(case.local_patterns(0), ["x", "mut y", "_"]);
+	assert_eq!(case.local_patterns(0), ["x", "(mut y)", "_"]);
 }
 
 #[test]
@@ -2130,7 +2026,7 @@ fn test_pattern_tuple_destructuring() {
 		case.local_patterns(0),
 		[
 			"(tuple a b)",
-			"(tuple mut c _)",
+			"(tuple (mut c) _)",
 			"(tuple x (tuple y z))",
 			"(tuple a ..)",
 			"(tuple .. z)",
@@ -2153,9 +2049,9 @@ fn test_pattern_struct_destructuring() {
 	assert_eq!(
 		case.local_patterns(0),
 		[
-			"(Point { x, y })",
-			"(Point { x: a, y: b })",
-			"(geom::Point { x, .. })",
+			"(Point (named x y))",
+			"(Point (named (x a) (y b)))",
+			"(geom::Point (named x ..))",
 			"(Point a ..)",
 		]
 	);
@@ -2177,7 +2073,7 @@ fn a_pattern_path_starts_where_an_expression_path_can() {
 		case.local_patterns(0),
 		[
 			"(Self a ..)",
-			"(package::geom::Point { x, .. })",
+			"(package::geom::Point (named x ..))",
 			"(super::super::Point b ..)",
 		]
 	);
@@ -2201,7 +2097,11 @@ fn test_pattern_rests_are_kept_as_written() {
 	case.diagnostics().assert_none();
 	assert_eq!(
 		case.local_patterns(0),
-		["(tuple .. a ..)", "(Point .. ..)", "(Point { .., x, .. })"]
+		[
+			"(tuple .. a ..)",
+			"(Point .. ..)",
+			"(Point (named .. x ..))"
+		]
 	);
 }
 
@@ -2229,9 +2129,9 @@ fn test_pattern_terms_say_what_they_are() {
 			"(Point 0 0)",
 			"(Point x (const MAX))",
 			"(Point x 0)",
-			"(Point -1 (| char true))",
-			"(tuple mut x _)",
-			"(Point { x, y: (const MAX) })",
+			"(Point -1 (| 'a' true))",
+			"(tuple (mut x) _)",
+			"(Point (named x (y (const MAX))))",
 			"x",
 		]
 	);
@@ -3785,9 +3685,9 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
 	case.diagnostics().assert_none();
 
 	let params = case.ast.list(case.function_signature(0).params);
-	for index in 0..2 {
+	for param in &params[..2] {
 		let TypeExpression::QualifiedPath { root, segments } =
-			case.ast.ty(params[index].ty)
+			case.ast.ty(param.ty)
 		else {
 			panic!("expected a qualified path type")
 		};
@@ -4429,7 +4329,7 @@ fn a_block_like_statement_ends_at_its_brace() {
 		("if c { a() } (x, y)", "(tuple x y)"),
 		("if c { a() } else { b() } (x, y)", "(tuple x y)"),
 		("match n { _ => a() } -1", "(u- 1)"),
-		("loop { break } [1]", "<other>"),
+		("loop { break } [1]", "(array 1)"),
 		("block { a() } (x)", "(tuple x)"),
 	] {
 		let case = TestCase::new(&format!("func f() {{ {source} }}"));
@@ -4454,13 +4354,13 @@ fn a_block_like_statement_ends_at_its_brace() {
 fn a_parenthesized_block_like_expression_is_an_operand() {
 	assert_eq!(
 		shape_of("(if c { f } else { g })(x)"),
-		"(call (tuple <if>) x)"
+		"(call (tuple (if c (block f) (block g))) x)"
 	);
 	assert_eq!(
 		shape_of("x + (match n { _ => 1 })"),
-		"(+ x (tuple <match>))"
+		"(+ x (tuple (match n (=> _ 1))))"
 	);
-	assert_eq!(shape_of("-(block { 1 })"), "(u- (tuple <block>))");
+	assert_eq!(shape_of("-(block { 1 })"), "(u- (tuple (block 1)))");
 }
 
 /// A block-like expression fills any whole expression position, an
@@ -4479,7 +4379,10 @@ fn a_block_like_expression_fills_a_whole_position() {
 			.diagnostics()
 			.assert_none();
 	}
-	assert_eq!(shape_of("x = if c { 1 } else { 2 }"), "(= x <if>)");
+	assert_eq!(
+		shape_of("x = if c { 1 } else { 2 }"),
+		"(= x (if c (block 1) (block 2)))"
+	);
 	TestCase::new("func f() { x = if c { 1 } else { 2 } + 3 }")
 		.diagnostics()
 		.assert_codes(&[DiagnosticCode::BlockLikeOperand]);
@@ -4640,10 +4543,7 @@ fn a_type_path_with_no_last_segment_keeps_its_prefix() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let param = &case.ast.list(case.function_signature(0).params)[0];
-	let TypeExpression::Path(path) = case.ast.ty(param.ty) else {
-		panic!("expected a path type")
-	};
-	assert_eq!(case.path(case.ast.list(path)), "core::<error>");
+	assert_eq!(case.printer().ty(param.ty), "core::<error>");
 	assert_eq!(case.ast.root.len(), 2);
 }
 

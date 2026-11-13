@@ -15,6 +15,8 @@ use crate::{diagnostics::TextSpan, index::index_newtype, vfs::FileId};
 mod lexer;
 mod parser;
 #[cfg(test)]
+mod printer;
+#[cfg(test)]
 mod tests;
 
 #[cfg(feature = "bench")]
@@ -1421,7 +1423,6 @@ identified! {
 
 /// A column of nodes of one kind, each with its span; a node's id is its
 /// position.
-#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 struct Column<K> {
 	kinds: Box<[K]>,
 	spans: Box<[TextSpan]>,
@@ -1463,7 +1464,6 @@ impl<K> ColumnBuilder<K> {
 /// contiguous (`notes/ast-arena-plan.md`). The file's own items are
 /// [`AST::root`]. It is read only; the parser writes an [`AstBuilder`] and
 /// finishes it into one, each vector fitted to its contents.
-#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AST {
 	/// The items written at the top of the file.
 	pub root: List<Item>,

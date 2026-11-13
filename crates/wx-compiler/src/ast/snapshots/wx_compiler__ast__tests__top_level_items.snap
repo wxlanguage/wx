@@ -1,461 +1,101 @@
 ---
 source: crates/wx-compiler/src/ast/tests.rs
-expression: case.ast
+expression: case.tree()
 ---
-root:
-  start: 0
-  len: 7
-types:
-  kinds:
-    - Path:
-        start: 0
-        len: 1
-    - Path:
-        start: 1
-        len: 1
-    - Path:
-        start: 2
-        len: 1
-    - Path:
-        start: 5
-        len: 1
-    - Path:
-        start: 6
-        len: 1
-    - Path:
-        start: 7
-        len: 1
-    - Path:
-        start: 8
-        len: 1
-    - Path:
-        start: 9
-        len: 1
-    - Path:
-        start: 10
-        len: 1
-  spans:
-    - start: 12
-      end: 15
-    - start: 20
-      end: 23
-    - start: 28
-      end: 31
-    - start: 59
-      end: 62
-    - start: 84
-      end: 87
-    - start: 104
-      end: 107
-    - start: 141
-      end: 144
-    - start: 153
-      end: 156
-    - start: 206
-      end: 212
-consts:
-  kinds: []
-  spans: []
-bounds:
-  kinds: []
-  spans: []
-patterns:
-  kinds: []
-  spans: []
-exprs:
-  kinds:
-    - Path:
-        start: 3
-        len: 1
-    - Path:
-        start: 4
-        len: 1
-    - Binary:
-        operator: Add
-        operator_start: 40
-        left: 0
-        right: 1
-    - Int:
-        value: 0
-    - Int:
-        value: 100
-    - Int:
-        value: 1
-  spans:
-    - start: 38
-      end: 39
-    - start: 42
-      end: 43
-    - start: 38
-      end: 43
-    - start: 90
-      end: 91
-    - start: 110
-      end: 113
-    - start: 251
-      end: 252
-stmts:
-  kinds: []
-  spans: []
-blocks:
-  kinds:
-    - statements:
-        start: 0
-        len: 0
-      tail: 2
-  spans:
-    - start: 32
-      end: 45
-qualified_roots: []
-segments:
-  - ident:
-      inner: 36
-      span:
-        start: 12
-        end: 15
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 36
-      span:
-        start: 20
-        end: 23
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 36
-      span:
-        start: 28
-        end: 31
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 35
-      span:
-        start: 38
-        end: 39
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 37
-      span:
-        start: 42
-        end: 43
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 39
-      span:
-        start: 59
-        end: 62
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 36
-      span:
-        start: 84
-        end: 87
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 36
-      span:
-        start: 104
-        end: 107
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 36
-      span:
-        start: 141
-        end: 144
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 36
-      span:
-        start: 153
-        end: 156
-    type_args:
-      start: 0
-      len: 0
-  - ident:
-      inner: 48
-      span:
-        start: 206
-        end: 212
-    type_args:
-      start: 0
-      len: 0
-type_args: []
-type_lists: []
-bound_lists: []
-assoc_bindings: []
-function_type_params: []
-pat_lists: []
-pattern_elements: []
-pattern_fields: []
-expr_lists: []
-stmt_lists: []
-named_arguments: []
-arms: []
-items:
-  kinds:
-    - Function:
-        pub_span: ~
-        attributes:
-          start: 0
-          len: 0
-        signature:
-          name:
-            inner: 34
-            span:
-              start: 5
-              end: 8
-          type_params:
-            start: 0
-            len: 0
-          params:
-            start: 0
-            len: 2
-          result: 2
-        block: 0
-    - Memory:
-        pub_span: ~
-        attributes:
-          start: 0
-          len: 0
-        name:
-          inner: 38
-          span:
-            start: 54
-            end: 57
-        size: 3
-    - Global:
-        pub_span: ~
-        mut_span:
-          start: 71
-          end: 74
-        name:
-          inner: 40
-          span:
-            start: 75
-            end: 82
-        ty: 4
-        value: 3
-        attributes:
-          start: 0
-          len: 0
-    - Const:
-        pub_span: ~
-        name:
-          inner: 41
-          span:
-            start: 99
-            end: 102
-        ty: 5
-        value: 4
-        attributes:
-          start: 0
-          len: 0
-    - Struct:
-        pub_span: ~
-        attributes:
-          start: 0
-          len: 0
-        name:
-          inner: 42
-          span:
-            start: 123
-            end: 128
-        type_params:
-          start: 0
-          len: 0
-        fields:
-          start: 0
-          len: 2
-    - Import:
-        external_name:
-          start: 169
-          end: 174
-        internal_name:
-          inner: 45
-          span:
-            start: 178
-            end: 181
-        entries:
-          start: 0
-          len: 1
-        braces:
-          start: 182
-          end: 215
-    - Enum:
-        pub_span: ~
-        repr: ~
-        name:
-          inner: 49
-          span:
-            start: 222
-            end: 227
-        entries:
-          start: 0
-          len: 3
-        attributes:
-          start: 0
-          len: 0
-  spans:
-    - start: 0
-      end: 45
-    - start: 47
-      end: 62
-    - start: 64
-      end: 91
-    - start: 93
-      end: 113
-    - start: 116
-      end: 159
-    - start: 162
-      end: 215
-    - start: 217
-      end: 265
-impl_items:
-  kinds: []
-  spans: []
-trait_items:
-  kinds: []
-  spans: []
-use_trees:
-  kinds: []
-  spans: []
-type_params:
-  kinds: []
-  spans: []
-function_params:
-  kinds:
-    - binding:
-        Name:
-          mut_span: ~
-          name:
-            inner: 35
-            span:
-              start: 9
-              end: 10
-      ty: 0
-    - binding:
-        Name:
-          mut_span: ~
-          name:
-            inner: 37
-            span:
-              start: 17
-              end: 18
-      ty: 1
-    - binding:
-        Name:
-          mut_span: ~
-          name:
-            inner: 47
-            span:
-              start: 197
-              end: 204
-      ty: 8
-  spans:
-    - start: 9
-      end: 15
-    - start: 17
-      end: 23
-    - start: 197
-      end: 212
-struct_fields:
-  kinds:
-    - pub_span:
-        start: 134
-        end: 137
-      binding:
-        Name:
-          mut_span: ~
-          name:
-            inner: 43
-            span:
-              start: 138
-              end: 139
-      ty: 6
-    - pub_span: ~
-      binding:
-        Name:
-          mut_span: ~
-          name:
-            inner: 44
-            span:
-              start: 150
-              end: 151
-      ty: 7
-  spans:
-    - start: 134
-      end: 144
-    - start: 150
-      end: 156
-enum_entries:
-  kinds:
-    - Variant:
-        name:
-          inner: 50
-          span:
-            start: 234
-            end: 237
-        value: ~
-    - Variant:
-        name:
-          inner: 51
-          span:
-            start: 243
-            end: 248
-        value: 5
-    - Variant:
-        name:
-          inner: 52
-          span:
-            start: 258
-            end: 262
-        value: ~
-  spans:
-    - start: 234
-      end: 237
-    - start: 243
-      end: 252
-    - start: 258
-      end: 262
-import_entries:
-  kinds:
-    - Declaration:
-        external_name: ~
-        declaration:
-          Function:
-            signature:
-              name:
-                inner: 46
-                span:
-                  start: 193
-                  end: 196
-              type_params:
-                start: 0
-                len: 0
-              params:
-                start: 2
-                len: 1
-              result: ~
-  spans:
-    - start: 188
-      end: 213
-attributes: []
-export_entries: []
-paths: []
+(func pub add
+  (attr inline)
+  (type-params (T Add + Copy) (const N u32))
+  (params (a T) (mut b T) (_ u8) u16)
+  (result T)
+  (block
+    (local x (type i32) 1)
+    (local (tuple p (mut q)) pair)
+    (local (Point (named x (y py) ..)) point)
+    (; (call f a (tuple (: b u8))))
+    (; (call g (named (value 1) x)))
+    (; (= (index (.* (.& (. point inner))) 0) (repeat 0 4)))
+    (local items (array 1 2 (u- 3)))
+    (local text "hi\n")
+    (local letter 'a')
+    (local ratio 1.5)
+    (local call (call (. (call Wrap::<u8>::new x) get::<T>)))
+    (local qualified (+ <T as Shape>::SIDES (call <heap::&[u8]>::len s)))
+    (; (if (< a b) (block (; (return a))) (if c (block x) (block (; (= _ y))))))
+    (;
+      (block :outer
+        (loop :inner
+          (match n
+            (=> (| 0 1) (break :outer x))
+            (=> (const MAX) (continue :inner))
+            (=> (Pair a ..) (block (call f a)))
+            (=> _ (break))))))
+    (+ a (* b 2))))
+
+(func declared (params heap::&[u8]) (result !))
+
+(package-func pub clz (params (value u32)) (result u32))
+
+(package-const SIZE (type u32))
+
+(package-type pub Pointer (type-params M))
+
+(memory heap (attr memory_limits (min_pages 1) (max_pages 10)) u32)
+
+(global mut counter (type i32) 0)
+
+(const MAX (type i32) 100)
+
+(struct Point (field pub x i32) (field y i32))
+
+(struct pub Pair (type-params T) (field T) (field pub mut flag u8))
+
+(enum Color (repr u8) Red (= Green 1) Blue ..)
+
+(import "env" env
+  (func "Log" log (params (message heap::&[u8])))
+  (global mut ticks (type u64))
+  (memory shared u32)
+  (use pub super::Point))
+
+(export-block add (MAX "max"))
+
+(export counter)
+
+(mod inner (struct pub Unit))
+
+(mod-decl outer)
+
+(package pub "math" math)
+
+(trait Shape
+  (supertraits Display + Memory where { Size = u32 })
+  (type Size (bounds PointerSize))
+  (type Default (default u32))
+  (const SIDES (type u32))
+  (const CORNERS (type u32) 4)
+  (func area (params (self Self)) (result f32))
+  (func double
+    (params (self Self))
+    (result f32)
+    (block (* (call (. self area)) 2.0))))
+
+(impl Pair<T>
+  (type-params T)
+  (const pub ZERO (type u8) 0)
+  (func pub first
+    (params (self Self))
+    (result T)
+    (block (local (Pair a _) self) a)))
+
+(impl Shape for Point
+  (type Size u32)
+  (const SIDES (type u32) 4)
+  (func area (params (self Self)) (result f32) (block 1.0)))
+
+(typeset pub Int (bounds Copy) u8 u16 u32)
+
+(use (group math (as add plus) trig::*))
+
+(type Bytes (type-params (M Memory)) M::&[u8; 4])
+
+(type Callback func(x: u32, u8) -> (u32, u64))
