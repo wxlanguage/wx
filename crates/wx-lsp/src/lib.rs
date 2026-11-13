@@ -1,5 +1,6 @@
 mod actor;
 mod backend;
+mod call;
 mod completion;
 mod convert;
 mod diagnostics;
@@ -9,6 +10,7 @@ mod projects;
 mod rename;
 mod requests;
 mod semantic_tokens;
+mod signature_help;
 mod snapshot;
 mod state;
 pub mod task;

@@ -833,7 +833,9 @@ impl<'ctx> Parser<'ctx> {
 	/// [`Parser::separated`], with the opening token at `open` consumed
 	/// already. A missing separator is reported, unless the item before it
 	/// ends in a block ([`ListItem::ends_in_block`]), and the list goes on;
-	/// an item that fails is skipped to the next separator.
+	/// invalid punctuation is skipped to the next separator. An unconsumed
+	/// keyword that cannot start an item, or an enclosing delimiter, closes
+	/// the unfinished group and is left for its enclosing parser.
 	fn separated_after<T: ListItem>(
 		&mut self,
 		delimiters: Delimiters,
@@ -847,13 +849,31 @@ impl<'ctx> Parser<'ctx> {
 			if token.inner == delimiters.close {
 				break self.lexer.next().span;
 			}
-			if token.inner == Token::Eof {
-				let at = items.last().map_or(open.end, |last| last.span.end);
-				break self.report_unclosed(delimiters, open, at);
+			if token.inner == Token::Eof
+				|| (matches!(
+					token.inner,
+					Token::CloseParen
+						| Token::CloseBrace
+						| Token::CloseBracket
+						| Token::SemiColon
+				) && token.inner != delimiters.separator)
+			{
+				break self.report_unclosed(delimiters, open, token.span.start);
 			}
 			let parsed = match item(self) {
 				Ok(parsed) => parsed,
 				Err(()) => {
+					// A rejected word can start an enclosing declaration.
+					// Invalid punctuation still uses separator recovery.
+					if matches!(token.inner, Token::Keyword(_))
+						&& self.lexer.peek().span.start == token.span.start
+					{
+						break self.report_unclosed(
+							delimiters,
+							open,
+							token.span.start,
+						);
+					}
 					self.skip_to_separator(delimiters);
 					continue;
 				}
@@ -869,7 +889,8 @@ impl<'ctx> Parser<'ctx> {
 			} else if next == delimiters.close {
 				break self.lexer.next().span;
 			} else if next == Token::Eof {
-				break self.report_unclosed(delimiters, open, end);
+				let at = self.lexer.peek().span.start;
+				break self.report_unclosed(delimiters, open, at);
 			} else if needs {
 				self.diagnostics.push(report_missing_separator(
 					self.file_id,
@@ -894,14 +915,23 @@ impl<'ctx> Parser<'ctx> {
 				self.lexer.next();
 				return;
 			}
-			if token == delimiters.close || token == Token::Eof {
+			if token == delimiters.close
+				|| token == Token::Eof
+				|| matches!(
+					token,
+					Token::CloseParen
+						| Token::CloseBrace
+						| Token::CloseBracket
+						| Token::SemiColon
+				) {
 				return;
 			}
 			self.lexer.next();
 		}
 	}
 
-	/// A list the file ends inside: reported, and closed at `at`.
+	/// A list missing its closing delimiter: reported and closed at `at`,
+	/// without consuming the token that belongs to its enclosing parser.
 	fn report_unclosed(
 		&mut self,
 		delimiters: Delimiters,
@@ -1080,7 +1110,7 @@ impl<'ctx> Parser<'ctx> {
 		let open = parser.next_expect(Token::OpenParen)?.span;
 		match parser.lexer.peek().inner {
 			Token::OpenBrace => {
-				Ok(parser.parse_named_call_arguments()?.0.inner)
+				Ok(parser.parse_named_call_arguments(open)?.0.inner)
 			}
 			Token::CloseParen => {
 				parser.lexer.next();
@@ -2168,14 +2198,23 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// Whether `token` starts an expression: what [`Parser::parse_prefix`]
-	/// reads. Any word does, a keyword included (`local` read where an
-	/// expression should be is reported as a reserved name, as a path).
+	/// reads. Declaration keywords are not expressions: leaving them for
+	/// the enclosing parser lets unfinished groups preserve the next item.
 	fn starts_expression(token: Token) -> bool {
 		matches!(
 			token,
 			Token::Identifier
-				| Token::Keyword(_)
-				| Token::Int | Token::Float
+				| Token::Keyword(
+					Keyword::Return
+						| Keyword::If | Keyword::Loop
+						| Keyword::Match | Keyword::Break
+						| Keyword::Continue
+						| Keyword::Underscore
+						| Keyword::Block | Keyword::SelfLower
+						| Keyword::SelfPascal
+						| Keyword::Package | Keyword::Super
+				) | Token::Int
+				| Token::Float
 				| Token::String
 				| Token::Char
 				| Token::OpenBrace
@@ -2418,14 +2457,16 @@ impl<'ctx> Parser<'ctx> {
 		Ok(self.ast.push_expr(Expression::Path(path), span))
 	}
 
-	/// A named list and the `)` after it, the `(` consumed. The list is the
-	/// call's only argument: anything else before `)` is reported, and read
-	/// for recovery. Returns the arguments and where the call ends.
+	/// A named list and the `)` after it, the `(` consumed. A comma after
+	/// the list mixes named and positional arguments, read for recovery.
+	/// A missing `)` keeps the list and leaves the next token untouched.
+	/// Returns the arguments and where the call ends.
 	fn parse_named_call_arguments(
 		&mut self,
+		open: TextSpan,
 	) -> Result<(Spanned<List<NamedArgument>>, u32), ()> {
 		let named = self.parse_named_arguments()?;
-		if self.lexer.peek().inner != Token::CloseParen {
+		if self.lexer.peek().inner == Token::Comma {
 			let at = self.lexer.peek().span;
 			self.diagnostics
 				.push(report_mixed_call_arguments(self.file_id, at));
@@ -2435,8 +2476,15 @@ impl<'ctx> Parser<'ctx> {
 				self.parse_expression(BindingPower::Default)?;
 			}
 		}
-		let close_span = self.next_expect(Token::CloseParen)?.span;
-		Ok((named, close_span.end))
+		let end = match self.lexer.next_if(Token::CloseParen) {
+			Some(close) => close.span.end,
+			None => {
+				let at = self.lexer.peek().span.start;
+				self.report_unclosed(PARENS, open, at);
+				at
+			}
+		};
+		Ok((named, end))
 	}
 
 	/// One positional argument. A named list here follows other arguments,
@@ -2473,6 +2521,19 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_named_argument(
 		parser: &mut Parser,
 	) -> Result<Spanned<NamedArgument>, ()> {
+		// Declaration keywords belong to the enclosing parser; expression
+		// keywords used as names still receive the reserved-name diagnostic.
+		let token = parser.lexer.peek();
+		if matches!(token.inner, Token::Keyword(_))
+			&& !Self::starts_expression(token.inner)
+		{
+			parser.diagnostics.push(report_unexpected_token(
+				parser.file_id,
+				token,
+				Token::Identifier,
+			));
+			return Err(());
+		}
 		let name = parser.expect_name(&[Keyword::SelfLower])?;
 		let Some(colon) = parser.lexer.next_if(Token::Colon) else {
 			return Ok(Spanned {
@@ -3079,7 +3140,7 @@ impl<'ctx> Parser<'ctx> {
 		let start = self.ast.exprs.spans[usize::from(callee)].start;
 		let open = self.next_expect(Token::OpenParen)?.span;
 		if self.lexer.peek().inner == Token::OpenBrace {
-			let (arguments, end) = self.parse_named_call_arguments()?;
+			let (arguments, end) = self.parse_named_call_arguments(open)?;
 			return Ok(self.ast.push_expr(
 				Expression::NamedCall {
 					callee,
@@ -3137,10 +3198,31 @@ impl<'ctx> Parser<'ctx> {
 		while self.lexer.next_if(Token::Comma).is_some()
 			&& self.lexer.peek().inner != Token::CloseBracket
 		{
-			elements.push(self.parse_expression(BindingPower::Default)?);
+			let token = self.lexer.peek();
+			match self.parse_expression(BindingPower::Default) {
+				Ok(element) => elements.push(element),
+				Err(()) if self.lexer.peek().span.start == token.span.start => {
+					break;
+				}
+				Err(()) => return Err(()),
+			}
 		}
 
-		let close_span = self.next_expect(Token::CloseBracket)?.span;
+		let close_span = match self.lexer.next_if(Token::CloseBracket) {
+			Some(close) => close.span,
+			None => {
+				let at = self.lexer.peek().span.start;
+				self.report_unclosed(
+					Delimiters {
+						open: Token::OpenBracket,
+						close: Token::CloseBracket,
+						separator: Token::Comma,
+					},
+					open_span,
+					at,
+				)
+			}
+		};
 		let span = TextSpan::new(open_span.start, close_span.end);
 		let elements = self.ast.push_list(elements);
 		Ok(self.ast.push_expr(Expression::ArrayList { elements }, span))

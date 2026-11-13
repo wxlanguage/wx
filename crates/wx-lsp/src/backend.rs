@@ -16,10 +16,10 @@ use tower_lsp_server::ls_types::{
 	ReferenceParams, Registration, RenameOptions, RenameParams,
 	SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
 	SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
-	SemanticTokensServerCapabilities, ServerCapabilities,
-	TextDocumentPositionParams, TextDocumentSyncCapability,
-	TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri,
-	WorkspaceEdit,
+	SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp,
+	SignatureHelpOptions, SignatureHelpParams, TextDocumentPositionParams,
+	TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+	TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService};
 use wx_compiler::vfs::{AbsolutePath, CoreFileSource};
@@ -82,6 +82,23 @@ impl LanguageServer for Backend {
 				.and_then(|workspace| workspace.semantic_tokens.as_ref())
 				.and_then(|tokens| tokens.refresh_support)
 				.unwrap_or(false),
+			signature_label_offsets: params
+				.capabilities
+				.text_document
+				.as_ref()
+				.and_then(|document| document.signature_help.as_ref())
+				.and_then(|help| help.signature_information.as_ref())
+				.and_then(|signature| signature.parameter_information.as_ref())
+				.and_then(|parameter| parameter.label_offset_support)
+				.unwrap_or(false),
+			completion_label_details: params
+				.capabilities
+				.text_document
+				.as_ref()
+				.and_then(|document| document.completion.as_ref())
+				.and_then(|completion| completion.completion_item.as_ref())
+				.and_then(|item| item.label_details_support)
+				.unwrap_or(false),
 			completion_snippets: params
 				.capabilities
 				.text_document
@@ -114,7 +131,20 @@ impl LanguageServer for Backend {
 					},
 				)),
 				hover_provider: Some(HoverProviderCapability::Simple(true)),
-				completion_provider: Some(CompletionOptions::default()),
+				completion_provider: Some(CompletionOptions {
+					trigger_characters: Some(vec![".".into(), ":".into()]),
+					..Default::default()
+				}),
+				signature_help_provider: Some(SignatureHelpOptions {
+					trigger_characters: Some(vec![
+						"(".into(),
+						",".into(),
+						"{".into(),
+						":".into(),
+					]),
+					retrigger_characters: Some(vec![")".into(), "}".into()]),
+					..Default::default()
+				}),
 				definition_provider: Some(OneOf::Left(true)),
 				references_provider: Some(OneOf::Left(true)),
 				rename_provider: Some(OneOf::Right(RenameOptions {
@@ -269,6 +299,17 @@ impl LanguageServer for Backend {
 		Ok(self
 			.state
 			.query(|reply| Command::Completion(params, reply))
+			.await
+			.flatten())
+	}
+
+	async fn signature_help(
+		&self,
+		params: SignatureHelpParams,
+	) -> Result<Option<SignatureHelp>> {
+		Ok(self
+			.state
+			.query(|reply| Command::SignatureHelp(params, reply))
 			.await
 			.flatten())
 	}

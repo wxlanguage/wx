@@ -228,7 +228,7 @@ impl TypeList {
 /// whole chain as `Substitution` reads them.
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Copy)]
-pub(super) struct GenericArgs {
+pub struct GenericArgs {
 	start: u32,
 	len: u32,
 }
@@ -262,7 +262,7 @@ impl GenericArgs {
 /// written argument, the value it was learned from, or the use. Uses are
 /// not interned, so this is apart from the interner's lists.
 #[derive(Default)]
-pub(super) struct GenericArgArena {
+pub struct GenericArgArena {
 	types: Vec<TypeIndex>,
 	spans: Vec<TextSpan>,
 }
@@ -285,7 +285,7 @@ impl GenericArgArena {
 		}
 	}
 
-	pub(super) fn types(&self, args: GenericArgs) -> &[TypeIndex] {
+	pub fn types(&self, args: GenericArgs) -> &[TypeIndex] {
 		&self.types[args.range()]
 	}
 
@@ -1006,7 +1006,7 @@ impl TypeInterner {
 	}
 
 	/// Whether something in `ty` was reported (an `Error` anywhere in it).
-	pub(super) fn has_error(&self, ty: TypeIndex) -> bool {
+	pub fn has_error(&self, ty: TypeIndex) -> bool {
 		self.flags[usize::from(ty)].contains(TypeFlags::HAS_ERROR)
 	}
 
@@ -1805,7 +1805,7 @@ impl GenericEnvArena {
 	/// The arguments that instantiate `env`'s chain with its own parameters,
 	/// each at its flat slot (`flat_slot`).
 	#[inline]
-	pub(super) fn identity_args(&self, env: GenericEnvIdx) -> &[TypeIndex] {
+	pub fn identity_args(&self, env: GenericEnvIdx) -> &[TypeIndex] {
 		&self.types[self.identity_range(env)]
 	}
 

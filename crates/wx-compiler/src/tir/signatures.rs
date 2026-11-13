@@ -540,7 +540,7 @@ pub struct Semantics {
 	/// right after `push_param_frame` created it.
 	pub(super) assumption_envs: AssumptionEnvArena,
 	/// Every use's generic arguments, with where each is given.
-	pub(super) generic_args: GenericArgArena,
+	pub generic_args: GenericArgArena,
 	pub type_aliases: Vec<TypeAliasSignature>,
 	pub traits: Vec<TraitSignature>,
 	pub structs: Vec<StructSignature>,
@@ -585,6 +585,45 @@ fn is_self_entry(param: &ast::TypeParam) -> bool {
 }
 
 impl Semantics {
+	/// Substitute the flat arguments of `env` into a type. The arguments
+	/// must cover every parameter on its chain. This preserves projections;
+	/// reducing them is a separate normalization query.
+	pub fn substitute_type(
+		&mut self,
+		ty: TypeIndex,
+		env: GenericEnvIdx,
+		args: &[TypeIndex],
+	) -> TypeIndex {
+		self.types.substitute(
+			ty,
+			super::types::Substitution {
+				envs: &self.generic_envs,
+				env,
+				args,
+			},
+		)
+	}
+
+	/// Reduce a type using the assumptions of a body's owner. The query
+	/// emits no diagnostic; an unavailable normalization has no answer.
+	pub fn normalize_in_body(
+		&mut self,
+		strings: &StringInterner,
+		owner: BodyOwner,
+		ty: TypeIndex,
+	) -> Option<TypeIndex> {
+		let scope = self.owner_scope(owner);
+		self.normalize(
+			strings,
+			scope.assumption_env,
+			ty,
+			super::solver::NormalizationDepth::Deep,
+			super::solver::RewriteFlags::EQUALITIES
+				| super::solver::RewriteFlags::DEFINITIONS,
+		)
+		.ok()
+	}
+
 	/// Every diagnostic checking and lowering reported, in the order they
 	/// were found.
 	pub fn diagnostics(&self) -> &[Diagnostic<FileId>] {
@@ -7872,12 +7911,11 @@ pub(super) mod tests {
 		let reference = SourceSpan::new(file_id, TextSpan::new(0, 1));
 		let name = builder.strings.get(name).unwrap();
 		let key = BindingKey::ty(name);
-		let MemberLookup::Found(member) = builder.resolve_applicable_member(
-			sema,
+		let MemberLookup::Found(member) = sema.resolve_applicable_member(
+			builder.strings,
 			AssumptionEnvIdx::ROOT,
 			receiver,
 			key,
-			reference,
 		) else {
 			panic!("expected one associated type");
 		};
@@ -11056,13 +11094,12 @@ pub(super) mod tests {
 				{
 					let name = builder.strings.get(name).unwrap();
 					let key = BindingKey::new(Tier::Value, name);
-					let MemberLookup::Found(member) = builder
+					let MemberLookup::Found(member) = sema
 						.resolve_applicable_member(
-							sema,
+							builder.strings,
 							AssumptionEnvIdx::ROOT,
 							receiver,
 							key,
-							reference,
 						)
 					else {
 						panic!("expected value member")
@@ -11127,12 +11164,11 @@ pub(super) mod tests {
 				// No declaration exists for this impl member, so it must not
 				// become a projection with a provider index as its identity.
 				assert!(matches!(
-					builder.resolve_applicable_member(
-						sema,
+					sema.resolve_applicable_member(
+						builder.strings,
 						AssumptionEnvIdx::ROOT,
 						receiver,
-						BindingKey::ty(builder.strings.get("Extra").unwrap()),
-						reference
+						BindingKey::ty(builder.strings.get("Extra").unwrap())
 					),
 					MemberLookup::NotFound
 				));
@@ -16987,10 +17023,6 @@ pub(super) mod tests {
 				|sema, builder| {
 					builder.build(sema);
 					let assumption_context = sema.functions[0].type_params;
-					let reference = SourceSpan::new(
-						sema.decls.file_id(sema.decls.functions[0].loc),
-						TextSpan::new(0, 1),
-					);
 					let proof = sema
 						.find_trait_impl_query(
 							builder.strings,
@@ -17005,13 +17037,12 @@ pub(super) mod tests {
 					);
 					let key =
 						BindingKey::ty(builder.strings.get("Output").unwrap());
-					let MemberLookup::Found(member) = builder
+					let MemberLookup::Found(member) = sema
 						.resolve_applicable_member(
-							sema,
+							builder.strings,
 							sema.assumption_envs.of_frame(assumption_context),
 							TypeIndex::I32,
 							key,
-							reference,
 						)
 					else {
 						panic!("provider member expected")
@@ -17079,19 +17110,14 @@ pub(super) mod tests {
 				);
 				let env = sema.functions[0].type_params;
 				let ty = sema.types.list(sema.functions[0].param_types)[0];
-				let reference = SourceSpan::new(
-					sema.decls.file_id(sema.decls.functions[0].loc),
-					TextSpan::new(0, 1),
-				);
 				assert!(sema.diagnostics.is_empty(), "{:?}", sema.diagnostics);
 				sema.solver.set_limit_for_test(8);
 				assert!(matches!(
-					builder.resolve_applicable_member(
-						sema,
+					sema.resolve_applicable_member(
+						builder.strings,
 						sema.assumption_envs.of_frame(env),
 						ty,
-						BindingKey::ty(builder.strings.get("Output").unwrap()),
-						reference
+						BindingKey::ty(builder.strings.get("Output").unwrap())
 					),
 					MemberLookup::Stuck(
 						crate::tir::solver::SolverError::Overflow
@@ -17101,12 +17127,11 @@ pub(super) mod tests {
 				assert!(sema.diagnostics.is_empty(), "{:?}", sema.diagnostics);
 				sema.solver.set_limit_for_test(128);
 				assert!(matches!(
-					builder.resolve_applicable_member(
-						sema,
+					sema.resolve_applicable_member(
+						builder.strings,
 						sema.assumption_envs.of_frame(env),
 						ty,
-						BindingKey::ty(builder.strings.get("Output").unwrap()),
-						reference
+						BindingKey::ty(builder.strings.get("Output").unwrap())
 					),
 					MemberLookup::NotFound
 				));
@@ -17140,20 +17165,15 @@ pub(super) mod tests {
 					let signature = &sema.functions[index];
 					let assumption_context = signature.type_params;
 					let receiver = sema.types.list(signature.param_types)[0];
-					let reference = SourceSpan::new(
-						sema.decls.file_id(sema.decls.functions[index].loc),
-						TextSpan::new(0, 1),
-					);
 					let key = BindingKey::value(
 						builder.strings.get("selected").unwrap(),
 					);
-					let MemberLookup::Found(member) = builder
+					let MemberLookup::Found(member) = sema
 						.resolve_applicable_member(
-							sema,
+							builder.strings,
 							sema.assumption_envs.of_frame(assumption_context),
 							receiver,
 							key,
-							reference,
 						)
 					else {
 						panic!("trait member expected")

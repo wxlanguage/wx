@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::Uri;
 use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::symbols::{Keyword, StringInterner};
-use wx_compiler::tir::{self, Definition, Semantics};
+use wx_compiler::tir::{self, BodyOwner, Definition, Semantics};
 use wx_compiler::vfs::{self, AbsolutePath, FileId, FileSource as _};
 
 use crate::convert::file_id_to_uri;
@@ -108,6 +108,26 @@ impl Snapshot {
 	/// anything.
 	pub(crate) fn declared_at(&self, span: SourceSpan) -> Option<Definition> {
 		self.definitions.get(&span).copied()
+	}
+
+	/// The owner whose checked body contains this expression. This inverse
+	/// query is needed only by requests, so it reads the declaration index
+	/// and existing operands instead of recording another table at checking.
+	pub(crate) fn expression_owner(
+		&self,
+		file: FileId,
+		expr: wx_compiler::ast::ExprId,
+	) -> Option<BodyOwner> {
+		let ast = self.compilation.ast(file);
+		self.definitions
+			.iter()
+			.filter(|(span, _)| span.file_id == file)
+			.filter_map(|(_, &definition)| self.sema.body_of(definition))
+			.find(|&owner| {
+				self.sema
+					.owner_body(owner)
+					.is_some_and(|body| body.operand_of(ast, expr).is_some())
+			})
 	}
 
 	/// The file `uri` names in this snapshot. Matched by rebuilding each

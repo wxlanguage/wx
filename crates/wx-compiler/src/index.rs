@@ -7,12 +7,12 @@
 /// index being used against another, such as a function ID indexing a local
 /// table instead of the function table.
 macro_rules! index_newtype {
-	($(#[$meta:meta])* $name:ident) => {
+	($(#[$meta:meta])* $field_visibility:vis $name:ident) => {
 		$(#[$meta])*
 		#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 		#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 		#[cfg_attr(test, derive(PartialOrd, Ord))]
-		pub struct $name(u32);
+		pub struct $name($field_visibility u32);
 
 		impl $name {
 			#[inline]

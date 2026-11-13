@@ -642,7 +642,10 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				callee, arguments, ..
 			} => self.build_call(
 				callee,
-				Arguments::Positional(ast.list(arguments)),
+				Arguments {
+					kind: ArgumentList::Positional(ast.list(arguments)),
+					span: ast.arguments_span(expr),
+				},
 				Expected::Type(expected),
 				span,
 			),
@@ -650,7 +653,10 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				callee, arguments, ..
 			} => self.build_call(
 				callee,
-				Arguments::Named(ast.list(arguments)),
+				Arguments {
+					kind: ArgumentList::Named(ast.list(arguments)),
+					span: ast.arguments_span(expr),
+				},
 				Expected::Type(expected),
 				span,
 			),
@@ -1455,8 +1461,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		self.expect_arguments(&target, &type_args, &given);
 		let args = self.use_args(&target, segment, &type_args, &given);
 		self.check_use_bounds(&target, 0, segment, args);
-		let fields = self
-			.arguments_value(&target, &type_args, &given, 0, reported, span);
+		let fields = self.arguments_value(
+			&target,
+			&type_args,
+			&given,
+			0,
+			reported,
+			arguments.span,
+		);
 		let ty = self.sema.types.intern_struct(struct_index, &type_args);
 		let ty = self.sema.types.collapse_error(ty);
 		// Fields need nothing; the value made of them does.
@@ -3011,9 +3023,17 @@ enum ValuePath<'s> {
 	Member(MemberPath<'s>),
 }
 
+/// A written call's arguments and their delimiters, borrowed from the AST.
+/// The span belongs to their packed value; the call keeps its own span.
+#[derive(Clone, Copy)]
+struct Arguments<'e> {
+	kind: ArgumentList<'e>,
+	span: TextSpan,
+}
+
 /// A call's arguments, by position or by name.
 #[derive(Clone, Copy)]
-enum Arguments<'e> {
+enum ArgumentList<'e> {
 	Positional(&'e [ast::ExprId]),
 	Named(&'e [ast::NamedArgument]),
 }

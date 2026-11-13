@@ -15,7 +15,8 @@ use tower_lsp_server::ls_types::{
 	GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, Location,
 	PrepareRenameResponse, ReferenceParams, RenameParams, SemanticTokensParams,
 	SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
-	TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
+	SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
+	Uri, WorkspaceEdit,
 };
 
 use crate::convert::path_to_file_uri;
@@ -25,7 +26,7 @@ use crate::state::{
 	refresh_project_manifest,
 };
 use crate::trace::{Trace, flush_logs};
-use crate::{completion, rename, requests};
+use crate::{completion, rename, requests, signature_help};
 
 pub(crate) enum Command {
 	Initialize(ClientConfig),
@@ -52,6 +53,7 @@ pub(crate) enum Command {
 		CompletionParams,
 		oneshot::Sender<Option<CompletionResponse>>,
 	),
+	SignatureHelp(SignatureHelpParams, oneshot::Sender<Option<SignatureHelp>>),
 	References(ReferenceParams, oneshot::Sender<Option<Vec<Location>>>),
 	PrepareRename(
 		TextDocumentPositionParams,
@@ -185,6 +187,9 @@ pub(crate) async fn handle_command(
 		}
 		Command::Completion(params, reply) => {
 			let _ = reply.send(completion::completion(state, &params));
+		}
+		Command::SignatureHelp(params, reply) => {
+			let _ = reply.send(signature_help::signature_help(state, &params));
 		}
 		Command::References(params, reply) => {
 			let _ = reply.send(requests::references(state, &params));

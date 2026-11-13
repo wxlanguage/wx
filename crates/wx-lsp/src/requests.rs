@@ -89,13 +89,12 @@ pub(crate) fn hover(
 	let (name, definition) = snapshot.definition_at(file, offset)?;
 	let signature =
 		hover::signature(&snapshot.sema, &snapshot.strings, definition)?;
-	let doc = hover::has_doc_comment(definition)
-		.then(|| snapshot.sema.definition_span(definition))
-		.flatten()
-		.and_then(|definition| {
-			let source = &files.get(definition.file_id).ok()?.source;
-			hover::leading_doc_comment(source, definition.span.start)
-		});
+	let signature =
+		match hover::owner(&snapshot.sema, &snapshot.strings, definition) {
+			Some(owner) => format!("{owner}\n{signature}"),
+			None => signature,
+		};
+	let doc = hover::documentation(&snapshot.sema, files, definition);
 	let value = match doc {
 		Some(doc) => format!("```wx\n{signature}\n```\n\n---\n\n{doc}"),
 		None => format!("```wx\n{signature}\n```"),

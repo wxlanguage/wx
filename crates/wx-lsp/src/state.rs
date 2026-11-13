@@ -28,6 +28,10 @@ pub(crate) struct ClientConfig {
 	pub(crate) semantic_tokens_refresh: bool,
 	/// Whether the client takes snippets in completion items.
 	pub(crate) completion_snippets: bool,
+	/// Whether completion labels can carry secondary text.
+	pub(crate) completion_label_details: bool,
+	/// Whether parameter labels may be UTF-16 offsets into the signature.
+	pub(crate) signature_label_offsets: bool,
 }
 
 #[derive(Default)]
@@ -54,17 +58,31 @@ impl ServerState {
 	/// path order that reaches it, so the choice never depends on hash
 	/// order.
 	pub(crate) fn resolve_uri(&self, uri: &Uri) -> Option<(&Snapshot, FileId)> {
-		let own = uri_to_path(uri)
-			.and_then(|path| self.own_root.get(&path))
-			.and_then(|root| self.cached.get(root));
-		let mut roots: Vec<_> = self.cached.iter().collect();
-		roots.sort_by(|a, b| a.0.cmp(b.0));
-		own.into_iter()
-			.chain(roots.into_iter().map(|(_, snapshot)| snapshot))
-			.find_map(|snapshot| {
-				let file = snapshot.file_for(uri)?;
-				Some((snapshot, file))
-			})
+		let (root, file) = self.root_for_uri(uri)?;
+		Some((self.cached.get(root)?, file))
+	}
+
+	/// The same snapshot as `resolve_uri`, lent mutably so queries can fill
+	/// the checker's normalization caches.
+	pub(crate) fn resolve_uri_mut(
+		&mut self,
+		uri: &Uri,
+	) -> Option<(&mut Snapshot, FileId)> {
+		let (root, file) = self.root_for_uri(uri)?;
+		let root = root.clone();
+		Some((self.cached.get_mut(&root)?, file))
+	}
+
+	/// Choose a root before borrowing its snapshot, so shared and mutable
+	/// requests use the same ownership and path order.
+	fn root_for_uri(&self, uri: &Uri) -> Option<(&PathBuf, FileId)> {
+		let own = uri_to_path(uri).and_then(|path| self.own_root.get(&path));
+		let mut roots: Vec<_> = self.cached.keys().collect();
+		roots.sort();
+		own.into_iter().chain(roots).find_map(|root| {
+			let file = self.cached.get(root)?.file_for(uri)?;
+			Some((root, file))
+		})
 	}
 }
 

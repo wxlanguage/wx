@@ -305,8 +305,53 @@ that inserts the ascription.
    offer the enum `Ordering` that a path could start with. A block's
    statements carry the span of their braces, so the room inside a
    keyword block starts at its `{`, not at `block`.
-4. `Body::operand_with_span`, with the `Deref` and place-only tests.
+4. Done: `Body::operand_of(ast, expr)` (and `operand_ty`) returns
+   `tir::Operand`, the type `build_operand` already built with, moved into
+   `body.rs`. It looks through a tuple of one and an ascription, which add no
+   node, then takes the first expression with the remaining span, else the last
+   place. Tests in `tir/body.rs`: the pointer over its `Deref`, place-only
+   objects (`p.inner`, `p.*`), a receiver over its `.*.&`, an unfinished `o.`,
+   `(o)`, `(o: T)`, `((o: T))`, and `(5: u8)` as a `u8`.
 5. The member search split; `x.|` completion.
+   - 5a, done: the search is `Semantics::resolve_applicable_member` (and
+     `resolve_bound_member`, `declared_bound_member`), reading finished
+     signatures only; every caller runs after the sweep's signatures exist.
+     `SemanticsBuilder::declared_bound_member` keeps the forcing
+     (`prepare_declarations_of`) for type paths, which `select_associated_type`
+     resolves while signatures are built. The decisions the checker reports
+     are split out: `Semantics::member_accessible`, `field_accessible`, and
+     `receiver_fit` (`ReceiverFit`, the method-call rules `build_method_call`
+     applied inline). A body's scope is `Semantics::owner_scope`.
+   - 5b, done: `Semantics::member_names(strings, owner, receiver)`, the
+     receiver being `Body::operand_ty` of the object. Fields as `build_field`
+     reaches them (through one pointer at most, accessible), then methods:
+     candidate names from `method_candidates` (inherent impls and
+     `trait_candidates` for a concrete head, `declared_traits` and
+     `assumed_traits` for an abstract one, both for a projection that
+     normalizes to a concrete head), each kept when
+     `resolve_applicable_member` finds a method uniquely, `member_accessible`
+     allows it and `receiver_fit` is `Direct` or `Shared`. A receiver that
+     `needs_context` gives nothing; one with holes gives fields only (the
+     checker's `select_inherent_with_holes` stays on `BodyBuilder`). Tests in
+     `tir/members.rs`: agreement with every `.` access the checker resolved,
+     exact lists per receiver kind (value, exclusive, shared, place, bound,
+     associated type's bound), privacy.
+   - 5c, done: `wx-lsp/src/completion.rs` walks to `Site::Member`, reads
+     the object's receiver with `Body::operand_of` and `operand_ty`, and
+     renders `member_names` in its declaration order (fields, then methods).
+     Methods have their own item kind and call snippets omit `self`, unless
+     the call is written already. `state.rs` lends mutable snapshots through
+     the same root lookup as shared requests; `backend.rs` advertises `.`
+     and `:` triggers. Tests in `wx-lsp/src/tests.rs`: exact member lists for
+     values, exclusive/shared pointers, partial names, place and parenthesized
+     objects, call results and method chains, trait bounds, next-line members,
+     privacy, method snippets and existing calls, completion inside the object,
+     and advertised triggers. Written calls carry their AST argument-list
+     span through the temporary `Arguments` (`tir/typecheck.rs`,
+     `typecheck/members.rs`, `typecheck/calls.rs`); empty packed tuples use
+     that span so `operand_of` finds the call result. Tests also cover empty
+     constructors, function items called through locals, function references
+     and `Call` implementations, including the packed tuples' exact spans.
 6. Later: ranking by the expected type (the checker has `Expected` but does
    not keep it), `completionItem/resolve` through `hover::signature`, the
    E2002 code action.

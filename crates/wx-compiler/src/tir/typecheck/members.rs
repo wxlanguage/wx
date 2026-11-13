@@ -16,18 +16,17 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::calls::{Callee, Dispatch};
-use super::{Arguments, BodyBuilder};
+use super::{ArgumentList, Arguments, BodyBuilder};
 use crate::ast::{self, Ownership};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::decls::{
-	BindingKey, ConstIdx, DeclKind, Declared, InherentImplIdx, MemberKind,
-	TraitIdx,
+	BindingKey, ConstIdx, DeclKind, InherentImplIdx, MemberKind, TraitIdx,
 };
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
-	ApplicableMember, MemberLookup, TraitImplLookup, TraitMemberSelection,
-	report_ambiguous_type_member,
+	ApplicableMember, MemberLookup, ReceiverFit, TraitImplLookup,
+	TraitMemberSelection, report_ambiguous_type_member,
 };
 use crate::tir::resolutions::{Reference, Site};
 use crate::tir::satisfaction::{
@@ -400,7 +399,10 @@ impl BodyBuilder<'_, '_> {
 				callee, arguments, ..
 			} => self.build_call(
 				callee,
-				Arguments::Positional(ast.list(arguments)),
+				Arguments {
+					kind: ArgumentList::Positional(ast.list(arguments)),
+					span: ast.arguments_span(object),
+				},
 				Expected::Receiver(receiver_of),
 				span,
 			),
@@ -408,7 +410,10 @@ impl BodyBuilder<'_, '_> {
 				callee, arguments, ..
 			} => self.build_call(
 				callee,
-				Arguments::Named(ast.list(arguments)),
+				Arguments {
+					kind: ArgumentList::Named(ast.list(arguments)),
+					span: ast.arguments_span(object),
+				},
 				Expected::Receiver(receiver_of),
 				span,
 			),
@@ -465,38 +470,20 @@ impl BodyBuilder<'_, '_> {
 			}
 		};
 		let mut receiver = receiver;
-		if let Type::Pointer {
-			to,
-			memory,
-			ownership,
-		} = *self.sema.types.resolve(receiver_ty)
-		{
-			let params =
-				self.sema.functions[usize::from(callee.function)].param_types;
-			let declared = self.sema.types.list(params)[0];
-			let Type::Pointer {
-				ownership: declared,
-				..
-			} = *self.sema.types.resolve(declared)
-			else {
+		match self.sema.receiver_fit(receiver_ty, callee.function) {
+			ReceiverFit::Direct | ReceiverFit::ValueForPointer => {}
+			ReceiverFit::Shared { to, memory } => {
+				receiver = self.shared_receiver(receiver, to, memory);
+			}
+			ReceiverFit::ByValueThroughPointer => {
 				self.report_by_value_through_pointer(receiver_ty, method);
 				self.build_unchecked_arguments(arguments);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
-			};
-			match (ownership, declared) {
-				(Ownership::Exclusive, Ownership::Shared) => {
-					receiver = self.shared_receiver(receiver, to, memory);
-				}
-				(Ownership::Shared, Ownership::Exclusive) => {
-					self.report_shared_receiver(receiver, method);
-					self.build_unchecked_arguments(arguments);
-					return self.body.push(
-						ExprKind::Error,
-						TypeIndex::ERROR,
-						span,
-					);
-				}
-				_ => {}
+			}
+			ReceiverFit::SharedForExclusive => {
+				self.report_shared_receiver(receiver, method);
+				self.build_unchecked_arguments(arguments);
+				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 		}
 		self.build_function_call(
@@ -551,12 +538,11 @@ impl BodyBuilder<'_, '_> {
 				learned = Some(impl_args);
 				MemberLookup::Found(found)
 			}
-			None => self.builder.resolve_applicable_member(
-				self.sema,
+			None => self.sema.resolve_applicable_member(
+				self.builder.strings,
 				self.scope.assumption_env,
 				receiver,
 				key,
-				reference,
 			),
 		};
 		let found = match lookup {
@@ -852,41 +838,20 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// Reports a member not visible here: an inherent member by its own
-	/// visibility, a trait's by the trait's.
+	/// Reports a member not visible here (`Semantics::member_accessible`).
 	fn check_member_access(
 		&mut self,
 		found: ApplicableMember,
 		key: BindingKey,
 		member: &ast::PathSegment,
 	) {
-		let decls = &self.sema.decls;
-		let (namespace, visibility) = match found {
-			ApplicableMember::Inherent { impl_index, .. } => {
-				let impl_decl = &decls.inherent_impls[usize::from(impl_index)];
-				let member =
-					&impl_decl.members[usize::from(impl_decl.bindings[&key])];
-				(
-					impl_decl.namespace,
-					decls.item(member.kind.loc(decls)).visibility,
-				)
-			}
-			ApplicableMember::TraitImplMember { trait_index, .. }
-			| ApplicableMember::AbstractTraitMember { trait_index, .. } => {
-				let trait_decl = &decls.traits[usize::from(trait_index)];
-				(
-					decls.scope(trait_decl.loc),
-					decls.item(trait_decl.loc).visibility,
-				)
-			}
-		};
-		if decls.namespaces.is_accessible_from(
-			self.scope.namespace,
-			namespace.into(),
-			visibility,
-		) {
+		if self
+			.sema
+			.member_accessible(found, key, self.scope.namespace)
+		{
 			return;
 		}
+		let decls = &self.sema.decls;
 		let noun = member_noun(found.selected_kind(decls));
 		let name = self.builder.strings.resolve(member.ident.inner).unwrap();
 		self.sema.diagnostics.push(

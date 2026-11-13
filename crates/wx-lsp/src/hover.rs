@@ -5,14 +5,15 @@
 //! how that reads on screen is decided in this module.
 
 use string_interner::symbol::SymbolU32;
-use wx_compiler::ast::{Spanned, StringInterner};
+use wx_compiler::ast::{Keyword, Spanned, StringInterner};
 use wx_compiler::tir::{
 	AssocTypeIdx, ConstIdx, ConstScalar, DeclKind, Definition, FieldIdx,
 	FunctionIdx, GenericEnvIdx, MemberKind, MemberOwner, Semantics, StructIdx,
 	Type, Val,
 };
+use wx_compiler::vfs::Files;
 
-/// What to show for one hovered name: a signature, as `wx` source.
+/// A definition's signature as `wx` source; its owner is separate context.
 pub(crate) fn signature(
 	sema: &Semantics,
 	strings: &StringInterner,
@@ -173,6 +174,86 @@ pub(crate) fn signature(
 	}
 }
 
+/// A compact callable type for a completion's right-hand description. The
+/// name is already in its label; only `self` keeps its parameter name.
+pub(crate) fn callable_type(
+	sema: &Semantics,
+	strings: &StringInterner,
+	definition: Definition,
+) -> Option<String> {
+	let renderer = Renderer { sema, strings };
+	let function = match definition {
+		Definition::Member(
+			MemberKind::Function(function) | MemberKind::Method(function),
+		) => function,
+		Definition::Item(loc) => match sema.declaration_kind(loc) {
+			DeclKind::Function(function) => function,
+			DeclKind::Struct(index) => {
+				let decl = &sema.decls.structs[usize::from(index)];
+				let signature = &sema.structs[usize::from(index)];
+				let fields = sema
+					.types
+					.list(signature.field_types)
+					.iter()
+					.map(|&ty| renderer.ty(ty))
+					.collect::<Vec<_>>();
+				return Some(format!(
+					"func({}) -> {}{}",
+					fields.join(", "),
+					renderer.name(sema.decls.item(decl.loc).name),
+					renderer.type_params(signature.type_params)
+				));
+			}
+			_ => return None,
+		},
+		_ => return None,
+	};
+	let decl = &sema.decls.functions[usize::from(function)];
+	let signature = &sema.functions[usize::from(function)];
+	let params = sema
+		.types
+		.list(signature.param_types)
+		.iter()
+		.zip(&decl.params)
+		.map(|(&ty, name)| {
+			let ty = renderer.ty(ty);
+			if name
+				.is_some_and(|name| name.inner == Keyword::SelfLower.symbol())
+			{
+				format!("self: {ty}")
+			} else {
+				ty
+			}
+		})
+		.collect::<Vec<_>>();
+	Some(format!(
+		"func({}) -> {}",
+		params.join(", "),
+		renderer.ty(signature.return_type)
+	))
+}
+
+/// The enclosing trait or impl, when a hovered function has one. Completion
+/// already shows trait provenance beside its label and uses only the signature.
+pub(crate) fn owner(
+	sema: &Semantics,
+	strings: &StringInterner,
+	definition: Definition,
+) -> Option<String> {
+	let function = match definition {
+		Definition::Item(loc) => match sema.declaration_kind(loc) {
+			DeclKind::Function(function) => function,
+			_ => return None,
+		},
+		Definition::Member(
+			MemberKind::Function(function) | MemberKind::Method(function),
+		) => function,
+		_ => return None,
+	};
+	Renderer { sema, strings }
+		.member_owner(sema.decls.functions[usize::from(function)].owner)
+}
+
 /// The one integer a constant's value holds, signed as its type reads it.
 /// A narrow signed integer is held sign-extended.
 fn integer(value: &[ConstScalar]) -> Option<i128> {
@@ -232,17 +313,13 @@ impl Renderer<'_> {
 				None => self.ty(*ty),
 			})
 			.collect();
-		let signature = format!(
+		format!(
 			"func {}{}({}) -> {}",
 			self.name(self.sema.decls.item(decl.loc).name),
 			self.type_params(self.sema.function_own_type_params(function)),
 			params.join(", "),
 			self.ty(signature.return_type)
-		);
-		match self.member_owner(decl.owner) {
-			Some(header) => format!("{header}\n{signature}"),
-			None => signature,
-		}
+		)
 	}
 
 	fn member_owner(&self, owner: MemberOwner) -> Option<String> {
@@ -365,11 +442,20 @@ impl Renderer<'_> {
 	}
 }
 
-/// Whether `definition` is an item whose declaration can carry a doc
-/// comment. A parameter, a field or a type parameter is written on its
-/// owner's line, where the owner's comment would be mistaken for its own.
-pub(crate) fn has_doc_comment(definition: Definition) -> bool {
-	matches!(definition, Definition::Item(_) | Definition::Member(_))
+/// Documentation attached to a definition, read from its own source file.
+/// Parameters, fields and type parameters share their owner's line, where
+/// the owner's comment must not be mistaken for their own documentation.
+pub(crate) fn documentation(
+	sema: &Semantics,
+	files: &Files,
+	definition: Definition,
+) -> Option<String> {
+	if !matches!(definition, Definition::Item(_) | Definition::Member(_)) {
+		return None;
+	}
+	let span = sema.definition_span(definition)?;
+	let source = &files.get(span.file_id).ok()?.source;
+	leading_doc_comment(source, span.span.start)
 }
 
 /// The `///` lines directly above the declaration whose name is written at

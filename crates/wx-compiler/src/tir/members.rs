@@ -10,21 +10,22 @@
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
-use crate::ast::{self, Spanned, StringInterner};
+use crate::ast::{self, Ownership, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::small_vec::SmallVec;
 use crate::vfs::FileId;
 
+use super::body::BodyOwner;
 use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
 use super::decls::{
-	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, Declarations, FunctionIdx,
-	InherentImplIdx, MemberKind, MemberOwner, SignatureQuery, Tier, TraitIdx,
-	TraitImplIdx,
+	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, Declarations, Declared,
+	FieldIdx, FunctionIdx, InherentImplIdx, MemberKind, MemberOwner, Scope,
+	SignatureQuery, StructIdx, Tier, TraitIdx, TraitImplIdx, Visibility,
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
 use super::obligations::{BoundRequirements, TypeObligation};
-use super::resolutions::{Reference, Site};
+use super::resolutions::{Definition, Reference, Site};
 use super::signatures::{
 	InferPolicy, LexicalScope, QueryInfo, Semantics, SemanticsBuilder,
 	SignatureLocation, SignatureStatus,
@@ -201,7 +202,7 @@ impl Declarations {
 		})
 	}
 
-	fn member_key(&self, declaration: MemberKind) -> BindingKey {
+	pub(super) fn member_key(&self, declaration: MemberKind) -> BindingKey {
 		let name = match declaration {
 			MemberKind::Function(index) | MemberKind::Method(index) => {
 				self.name(index).inner
@@ -1008,6 +1009,408 @@ pub(super) fn report_type_does_not_implement_trait(
 		)
 }
 
+/// How a method call's receiver gives the method its `self`. There is no
+/// auto-deref: a method of a pointer's pointee is called on the pointer only
+/// when it takes `self` by pointer, and the pointer itself is then `self`.
+#[derive(Clone, Copy)]
+pub(super) enum ReceiverFit {
+	/// As written: a value for a method taking `self` by value, a pointer
+	/// for one taking it by a pointer of the same ownership.
+	Direct,
+	/// An exclusive pointer for a `self: M::&Self` method, given as
+	/// `receiver.*.&`: the one conversion. `to` and `memory` are the
+	/// pointer's.
+	Shared { to: TypeIndex, memory: TypeIndex },
+	/// A pointer for a method taking `self` by value.
+	ByValueThroughPointer,
+	/// A shared pointer for a `self: M::*Self` method.
+	SharedForExclusive,
+	/// A value for a method taking `self` by pointer. The call's argument
+	/// check reports it, as it would any argument of the wrong type.
+	ValueForPointer,
+}
+
+impl Semantics {
+	/// The member `key` of `receiver` in the scope `assumption_context`:
+	/// the shared applicability and ambiguity search. Declaration identity
+	/// and implementation selection happen after it completes. It reads
+	/// finished signatures only, so it runs once every signature exists: in
+	/// bodies, and after the sweep.
+	pub(super) fn resolve_applicable_member(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		receiver: TypeIndex,
+		key: BindingKey,
+	) -> MemberLookup {
+		if matches!(
+			self.types.resolve(receiver),
+			Type::TypeParam { .. } | Type::TypeProjection { .. }
+		) {
+			match self.resolve_bound_member(
+				strings,
+				assumption_context,
+				receiver,
+				key,
+			) {
+				MemberLookup::NotFound => {}
+				found => return found,
+			}
+		}
+		let receiver = match self.normalize(
+			strings,
+			assumption_context,
+			receiver,
+			NormalizationDepth::Shallow,
+			RewriteFlags::ALL,
+		) {
+			Ok(receiver) => receiver,
+			Err(error) => return error.into(),
+		};
+		if receiver == TypeIndex::ERROR {
+			return MemberLookup::Error;
+		}
+		match ImplTarget::from_type(self.types.resolve(receiver)) {
+			Some(target) => self.resolve_concrete_member(
+				strings,
+				assumption_context,
+				receiver,
+				target,
+				key,
+			),
+			None => self.resolve_bound_member(
+				strings,
+				assumption_context,
+				receiver,
+				key,
+			),
+		}
+	}
+
+	/// The fields and methods a name after `.` can select on a value of
+	/// type `receiver` (`Body::operand_ty`) in `owner`'s body, each with
+	/// what it would refer to, as the checker would: a struct's fields
+	/// accessible here, through one pointer at most (`build_field`), then
+	/// the methods the member lookup selects uniquely by that name, that
+	/// are accessible here, and that the receiver can give `self`
+	/// (`build_method_call`). Fields in declaration order, then methods in
+	/// the order their impls and traits declare them.
+	///
+	/// The names are listed from every impl and trait that could supply
+	/// one, and each is kept only when the lookup itself finds it, so
+	/// nothing is offered that the checker would reject written there. A
+	/// receiver whose type still needs its context (`(5).`) has no members,
+	/// and one with parts not inferred (`Layout<_>`) offers only fields:
+	/// `select_inherent_with_holes` is the checker's alone so far.
+	pub fn member_names(
+		&mut self,
+		strings: &StringInterner,
+		owner: BodyOwner,
+		receiver: TypeIndex,
+	) -> Vec<(SymbolU32, Definition)> {
+		let scope = self.owner_scope(owner);
+		let mut found = Vec::new();
+		if receiver == TypeIndex::ERROR || self.types.needs_context(receiver) {
+			return found;
+		}
+		// A field is reached through one pointer at most.
+		let object = match *self.types.resolve(receiver) {
+			Type::Pointer { to, .. } => to,
+			_ => receiver,
+		};
+		if let Type::Struct { struct_index, .. } = *self.types.resolve(object) {
+			let decl = &self.decls.structs[usize::from(struct_index)];
+			for (at, name) in decl.field_names.iter().enumerate() {
+				let field = FieldIdx::new(at as u32);
+				if let Some(name) = name
+					&& decl.lookup.get(&name.inner) == Some(&field)
+					&& self.field_accessible(
+						struct_index,
+						field,
+						scope.namespace,
+					) {
+					found.push((
+						name.inner,
+						Definition::Field {
+							owner: struct_index,
+							field,
+						},
+					));
+				}
+			}
+		}
+		if self.types.has_infer(receiver) {
+			return found;
+		}
+		let receiver = self
+			.normalize(
+				strings,
+				scope.assumption_env,
+				receiver,
+				NormalizationDepth::Deep,
+				RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+			)
+			.unwrap_or(receiver);
+		// A method is looked up on a pointer's pointee.
+		let path = match *self.types.resolve(receiver) {
+			Type::Pointer { to, .. } => to,
+			_ => receiver,
+		};
+		for key in self.method_candidates(strings, scope.assumption_env, path) {
+			let MemberLookup::Found(member) = self.resolve_applicable_member(
+				strings,
+				scope.assumption_env,
+				path,
+				key,
+			) else {
+				continue;
+			};
+			let MemberKind::Method(method) = member.selected_kind(&self.decls)
+			else {
+				continue;
+			};
+			if self.member_accessible(member, key, scope.namespace)
+				&& matches!(
+					self.receiver_fit(receiver, method),
+					ReceiverFit::Direct | ReceiverFit::Shared { .. }
+				) {
+				found.push((
+					key.symbol,
+					Definition::Member(MemberKind::Method(method)),
+				));
+			}
+		}
+		found
+	}
+
+	/// The names of value members some impl or trait could supply to
+	/// `receiver`, each once, in declaration order: a superset of what the
+	/// member lookup finds. For a concrete head, the inherent impls and
+	/// the traits with an impl for it (`trait_candidates`); for an
+	/// abstract type, the traits its bounds and the scope's assumptions
+	/// name. Both, for a projection a shallow normalization makes concrete.
+	fn method_candidates(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		receiver: TypeIndex,
+	) -> Vec<BindingKey> {
+		let mut traits: Vec<TraitIdx> = Vec::new();
+		let mut members: Vec<MemberKind> = Vec::new();
+		let normalized = self
+			.normalize(
+				strings,
+				assumption_context,
+				receiver,
+				NormalizationDepth::Shallow,
+				RewriteFlags::ALL,
+			)
+			.unwrap_or(receiver);
+		for ty in [receiver, normalized] {
+			if let Some(target) = ImplTarget::from_type(self.types.resolve(ty))
+			{
+				for &index in self.impl_dispatch.inherent_candidates(target) {
+					let impl_decl =
+						&self.decls.inherent_impls[usize::from(index)];
+					members.extend(
+						impl_decl.members.iter().map(|member| member.kind),
+					);
+				}
+				traits.extend(self.trait_candidates(target));
+			} else {
+				let tables = self.clause_tables();
+				traits.extend(tables.declared_traits(
+					&self.types,
+					assumption_context,
+					ty,
+					self.solver.state.recursion_budget,
+				));
+				traits.extend(
+					tables
+						.assumed_traits(assumption_context)
+						.map(|(_, trait_index)| trait_index),
+				);
+			}
+		}
+		let mut seen_traits = Vec::new();
+		for trait_index in traits {
+			if !seen_traits.contains(&trait_index) {
+				seen_traits.push(trait_index);
+				members.extend(
+					self.decls.traits[usize::from(trait_index)]
+						.members
+						.iter()
+						.map(|member| member.kind),
+				);
+			}
+		}
+		let mut keys = Vec::new();
+		for member in members {
+			let key = self.decls.member_key(member);
+			if key.tier == Tier::Value && !keys.contains(&key) {
+				keys.push(key);
+			}
+		}
+		keys
+	}
+
+	/// How `receiver`, normalized, gives `method` its `self`
+	/// (`ReceiverFit`). `method` takes `self` first.
+	pub(super) fn receiver_fit(
+		&self,
+		receiver: TypeIndex,
+		method: FunctionIdx,
+	) -> ReceiverFit {
+		let params = self.functions[usize::from(method)].param_types;
+		let declared = match *self.types.resolve(self.types.list(params)[0]) {
+			Type::Pointer { ownership, .. } => Some(ownership),
+			_ => None,
+		};
+		let Type::Pointer {
+			to,
+			memory,
+			ownership,
+		} = *self.types.resolve(receiver)
+		else {
+			return match declared {
+				Some(_) => ReceiverFit::ValueForPointer,
+				None => ReceiverFit::Direct,
+			};
+		};
+		match (ownership, declared) {
+			(_, None) => ReceiverFit::ByValueThroughPointer,
+			(Ownership::Exclusive, Some(Ownership::Shared)) => {
+				ReceiverFit::Shared { to, memory }
+			}
+			(Ownership::Shared, Some(Ownership::Exclusive)) => {
+				ReceiverFit::SharedForExclusive
+			}
+			_ => ReceiverFit::Direct,
+		}
+	}
+
+	/// Whether the member `found`, selected for `key`, is visible from
+	/// `accessor`: an inherent member by its own visibility, a trait's by
+	/// the trait's.
+	pub(super) fn member_accessible(
+		&self,
+		found: ApplicableMember,
+		key: BindingKey,
+		accessor: Scope,
+	) -> bool {
+		let decls = &self.decls;
+		let (namespace, visibility) = match found {
+			ApplicableMember::Inherent { impl_index, .. } => {
+				let impl_decl = &decls.inherent_impls[usize::from(impl_index)];
+				let member =
+					&impl_decl.members[usize::from(impl_decl.bindings[&key])];
+				(
+					impl_decl.namespace,
+					decls.item(member.kind.loc(decls)).visibility,
+				)
+			}
+			ApplicableMember::TraitImplMember { trait_index, .. }
+			| ApplicableMember::AbstractTraitMember { trait_index, .. } => {
+				let trait_decl = &decls.traits[usize::from(trait_index)];
+				(
+					decls.scope(trait_decl.loc),
+					decls.item(trait_decl.loc).visibility,
+				)
+			}
+		};
+		decls.namespaces.is_accessible_from(
+			accessor,
+			namespace.into(),
+			visibility,
+		)
+	}
+
+	/// Whether `field` of the struct `struct_index` is visible from
+	/// `accessor`, by its own `pub`.
+	pub(super) fn field_accessible(
+		&self,
+		struct_index: StructIdx,
+		field: FieldIdx,
+		accessor: Scope,
+	) -> bool {
+		let decl = &self.decls.structs[usize::from(struct_index)];
+		self.decls.namespaces.is_accessible_from(
+			accessor,
+			self.decls.scope(decl.loc).into(),
+			Visibility::from(decl.field_pub_spans[usize::from(field)]),
+		)
+	}
+
+	/// Traits supplied by the receiver's own declared bounds, by name only.
+	/// `Pending` while an associated declaration along its projection path
+	/// has no signature yet (`SemanticsBuilder::declared_bound_member`
+	/// forces them first).
+	pub(super) fn declared_bound_member(
+		&self,
+		assumption_context: AssumptionEnvIdx,
+		receiver: TypeIndex,
+		key: BindingKey,
+	) -> MemberLookup {
+		if !matches!(
+			self.types.resolve(receiver),
+			Type::TypeParam { .. } | Type::TypeProjection { .. }
+		) {
+			return MemberLookup::NotFound;
+		}
+		let mut path = receiver;
+		while let Type::TypeProjection {
+			base,
+			assoc_type_index,
+			..
+		} = *self.types.resolve(path)
+		{
+			if self.assoc_types[usize::from(assoc_type_index)].is_none() {
+				return MemberLookup::Pending;
+			}
+			path = base;
+		}
+		Semantics::select_declared_member(
+			&self.decls,
+			self.clause_tables().declared_traits(
+				&self.types,
+				assumption_context,
+				receiver,
+				self.solver.state.recursion_budget,
+			),
+			key,
+		)
+	}
+
+	fn resolve_bound_member(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		receiver: TypeIndex,
+		key: BindingKey,
+	) -> MemberLookup {
+		// Preserve direct declaration lookup, including known provisional
+		// memberships. Equality-based discovery is a fallback when these bounds
+		// do not identify the requested name.
+		match self.declared_bound_member(assumption_context, receiver, key) {
+			MemberLookup::NotFound => {}
+			found => return found,
+		}
+		let (traits, readiness) =
+			match self.assumed_member_traits(assumption_context, key) {
+				Ok(traits) => traits,
+				Err(lookup) => return lookup,
+			};
+		self.resolve_trait_member_candidates(
+			strings,
+			assumption_context,
+			receiver,
+			key,
+			traits,
+			readiness,
+		)
+	}
+}
+
 impl<'ast> SemanticsBuilder<'ast> {
 	/// Selects the trait that supplies an associated type named by `key` off
 	/// `receiver`, for a written type path. Selection reads declarations only:
@@ -1115,62 +1518,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 			MemberLookup::Pending
 		} else {
 			Semantics::classify(candidates)
-		}
-	}
-
-	/// Shared applicability and ambiguity search. Declaration identity and
-	/// implementation selection happen after this search completes.
-	pub(super) fn resolve_applicable_member(
-		&mut self,
-		sema: &mut Semantics,
-		assumption_context: AssumptionEnvIdx,
-		receiver: TypeIndex,
-		key: BindingKey,
-		reference: SourceSpan,
-	) -> MemberLookup {
-		if matches!(
-			sema.types.resolve(receiver),
-			Type::TypeParam { .. } | Type::TypeProjection { .. }
-		) {
-			match self.resolve_bound_member(
-				sema,
-				assumption_context,
-				receiver,
-				key,
-				reference,
-			) {
-				MemberLookup::NotFound => {}
-				found => return found,
-			}
-		}
-		let receiver = match sema.normalize(
-			self.strings,
-			assumption_context,
-			receiver,
-			NormalizationDepth::Shallow,
-			RewriteFlags::ALL,
-		) {
-			Ok(receiver) => receiver,
-			Err(error) => return error.into(),
-		};
-		if receiver == TypeIndex::ERROR {
-			return MemberLookup::Error;
-		}
-		match ImplTarget::from_type(sema.types.resolve(receiver)) {
-			Some(target) => sema.resolve_concrete_member(
-				self.strings,
-				assumption_context,
-				receiver,
-				target,
-				key,
-			),
-			None => self.resolve_bound_member(
-				sema,
-				assumption_context,
-				receiver,
-				key,
-				reference,
-			),
 		}
 	}
 
@@ -1494,7 +1841,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 		None
 	}
 
-	/// Traits supplied by the receiver's own declared bounds, by name only.
+	/// `Semantics::declared_bound_member`, after forcing the associated
+	/// declarations along `receiver`'s projection path, which a type path
+	/// may name before their signatures exist.
 	pub(super) fn declared_bound_member(
 		&mut self,
 		sema: &mut Semantics,
@@ -1503,64 +1852,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 		key: BindingKey,
 		reference: SourceSpan,
 	) -> MemberLookup {
-		if !matches!(
-			sema.types.resolve(receiver),
-			Type::TypeParam { .. } | Type::TypeProjection { .. }
-		) {
-			return MemberLookup::NotFound;
-		}
 		if self
 			.prepare_declarations_of(sema, receiver, reference)
 			.is_err()
 		{
 			return MemberLookup::Error;
 		}
-		Semantics::select_declared_member(
-			&sema.decls,
-			sema.clause_tables().declared_traits(
-				&sema.types,
-				assumption_context,
-				receiver,
-				sema.solver.state.recursion_budget,
-			),
-			key,
-		)
-	}
-
-	fn resolve_bound_member(
-		&mut self,
-		sema: &mut Semantics,
-		assumption_context: AssumptionEnvIdx,
-		receiver: TypeIndex,
-		key: BindingKey,
-		reference: SourceSpan,
-	) -> MemberLookup {
-		// Preserve direct declaration lookup, including known provisional
-		// memberships. Equality-based discovery is a fallback when these bounds
-		// do not identify the requested name.
-		match self.declared_bound_member(
-			sema,
-			assumption_context,
-			receiver,
-			key,
-			reference,
-		) {
-			MemberLookup::NotFound => {}
-			found => return found,
-		}
-		let (traits, readiness) =
-			match sema.assumed_member_traits(assumption_context, key) {
-				Ok(traits) => traits,
-				Err(lookup) => return lookup,
-			};
-		sema.resolve_trait_member_candidates(
-			self.strings,
-			assumption_context,
-			receiver,
-			key,
-			traits,
-			readiness,
-		)
+		sema.declared_bound_member(assumption_context, receiver, key)
 	}
 
 	/// Forces a trait declaration's bounds, never an impl provider's value.
@@ -1604,5 +1902,251 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			SignatureStatus::CycleReported => Err(()),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use codespan_reporting::diagnostic::Severity;
+	use indoc::indoc;
+
+	use super::*;
+	use crate::ast::{ExprId, Expression};
+	use crate::symbols::Keyword;
+	use crate::tir::body::ScopeIdx;
+	use crate::tir::resolutions::Definition;
+	use crate::tir::signatures::tests::source_graph;
+	use crate::vfs;
+
+	/// A checked source, read as completion reads it.
+	struct Case<'s> {
+		source: &'s str,
+		file: FileId,
+		graph: vfs::CompilationUnit,
+		strings: StringInterner,
+		sema: Semantics,
+	}
+
+	impl<'s> Case<'s> {
+		fn new(source: &'s str) -> Self {
+			let mut strings = Keyword::create_interner();
+			let graph = source_graph(source, &mut strings);
+			let sema = crate::tir::check(&graph, &mut strings);
+			let errors: Vec<_> = sema
+				.diagnostics
+				.iter()
+				.filter(|diagnostic| diagnostic.severity >= Severity::Error)
+				.collect();
+			assert!(errors.is_empty(), "{errors:?}");
+			let file = sema
+				.decls
+				.namespaces
+				.file_id(Scope::Package(sema.decls.root_package).into());
+			Self {
+				source,
+				file,
+				graph,
+				strings,
+				sema,
+			}
+		}
+
+		/// The body of the function in this file whose block holds
+		/// `offset`.
+		fn owner_at(&self, offset: u32) -> BodyOwner {
+			let decls = &self.sema.decls;
+			(0..decls.functions.len())
+				.map(|index| FunctionIdx::new(index as u32))
+				.filter(|&function| {
+					decls.file_id(decls.functions[usize::from(function)].loc)
+						== self.file
+				})
+				.map(BodyOwner::Function)
+				.find(|&owner| {
+					self.sema.owner_body(owner).is_some_and(|body| {
+						let span = body.scope(ScopeIdx::ROOT).span;
+						span.start <= offset && offset < span.end
+					})
+				})
+				.unwrap_or_else(|| panic!("no body at {offset}"))
+		}
+
+		/// What `member_names` offers after the object of the access
+		/// `object.member`, an `ObjectAccess` of the AST.
+		fn offered_after(
+			&mut self,
+			object: ExprId,
+		) -> Vec<(SymbolU32, Definition)> {
+			let ast = self.graph.ast(self.file);
+			let owner = self.owner_at(ast.expr_span(object).start);
+			let body = self.sema.owner_body(owner).unwrap();
+			let operand = body
+				.operand_of(ast, object)
+				.expect("the object was checked");
+			let receiver = body.operand_ty(operand);
+			self.sema.member_names(&self.strings, owner, receiver)
+		}
+
+		/// The names offered after the object in the one `written`: what
+		/// it starts with, up to its last `.`.
+		fn offered(&mut self, written: &str) -> Vec<String> {
+			let mut found = self.source.match_indices(written);
+			let (start, _) =
+				found.next().unwrap_or_else(|| panic!("no `{written}`"));
+			assert!(found.next().is_none(), "`{written}` is written twice");
+			let dot = written.rfind('.').expect("an access");
+			let span = TextSpan::new(start as u32, (start + dot) as u32);
+			let ast = self.graph.ast(self.file);
+			let object = ast
+				.exprs
+				.spans
+				.iter()
+				.enumerate()
+				.filter(|&(_, &at)| at == span)
+				.map(|(index, _)| ast::ExprId(index as u32))
+				.last()
+				.unwrap_or_else(|| {
+					panic!("no expression `{}`", &written[..dot])
+				});
+			self.offered_after(object)
+				.into_iter()
+				.map(|(name, _)| self.strings.resolve(name).unwrap().to_owned())
+				.collect()
+		}
+	}
+
+	const RECEIVERS: &str = indoc! {"
+		memory heap: u32;
+		trait Show: StackValue {
+		    func show(self: Self) -> u32;
+		}
+		trait Peek {
+		    func peek(self: heap::&Self) -> u32;
+		}
+		struct Inner(pub v: u32);
+		impl Inner {
+		    pub func get(self: heap::&Self) -> u32 { self.v }
+		    pub func set(self: heap::*Self, v: u32) { self.v = v; }
+		    pub func double(self: Self) -> u32 { self.v + self.v }
+		    pub func make() -> Inner { Inner(0) }
+		}
+		impl Show for Inner {
+		    func show(self: Self) -> u32 { self.v }
+		}
+		impl Peek for Inner {
+		    func peek(self: heap::&Self) -> u32 { self.v }
+		}
+		struct Outer(inner: Inner, n: u32);
+		func generic<T: Show + Peek>(t: T, r: heap::&T) -> u32 {
+		    t.show() + r.peek()
+		}
+		func f(i: Inner, p: heap::*Inner, s: heap::&Inner, o: heap::*Outer) -> u32 {
+		    local a = i.v + i.double() + i.show();
+		    local b = p.get() + p.v + p.peek();
+		    p.set(1);
+		    local c = s.get() + s.peek() + o.inner.v + o.n;
+		    a + b + c
+		}
+	"};
+
+	/// Every field and method the checker selected after a `.` is offered
+	/// there, as what it referred to.
+	#[test]
+	fn member_names_agree_with_the_checker() {
+		let mut case = Case::new(RECEIVERS);
+		let ast = case.graph.ast(case.file);
+		let accesses: Vec<_> = ast
+			.exprs
+			.kinds
+			.iter()
+			.filter_map(|&expr| match expr {
+				Expression::ObjectAccess { object, member } => {
+					Some((object, ast.segment(member).ident))
+				}
+				_ => None,
+			})
+			.collect();
+		let mut checked = 0;
+		for (object, member) in accesses {
+			let site = Site::Value(SourceSpan::new(case.file, member.span));
+			let Some(reference) = case.sema.resolutions.get(site) else {
+				continue;
+			};
+			let offered = case.offered_after(object);
+			assert!(
+				offered.contains(&(member.inner, reference.definition())),
+				"`{}` is not offered at {}",
+				case.strings.resolve(member.inner).unwrap(),
+				member.span.start,
+			);
+			checked += 1;
+		}
+		assert!(checked >= 15, "only {checked} accesses checked");
+	}
+
+	/// A value gives `self` by value only; a pointer gives it by pointer,
+	/// an exclusive one to either ownership. Fields first, then methods;
+	/// a function without `self` is never offered.
+	#[test]
+	fn a_receiver_is_offered_the_methods_it_can_call() {
+		let mut case = Case::new(RECEIVERS);
+		assert_eq!(case.offered("i.double"), ["v", "double", "show"]);
+		assert_eq!(case.offered("p.get"), ["v", "get", "set", "peek"]);
+		assert_eq!(case.offered("s.get"), ["v", "get", "peek"]);
+		// A pointer to a struct with no impls: its fields.
+		assert_eq!(case.offered("o.inner"), ["inner", "n"]);
+		// A place of a struct value, through the pointer `o`: no pointer
+		// is left for `self`.
+		assert_eq!(case.offered("o.inner.v"), ["v", "double", "show"]);
+	}
+
+	/// An abstract receiver is offered what its bounds declare.
+	#[test]
+	fn an_abstract_receiver_is_offered_its_bounds() {
+		let mut case = Case::new(RECEIVERS);
+		assert_eq!(case.offered("t.show"), ["show"]);
+		assert_eq!(case.offered("r.peek"), ["peek"]);
+		// An associated type, by its declared bounds.
+		let source = format!(
+			"{RECEIVERS}trait Container {{ type Item: Show; }}
+			func h<C: Container>(x: C::Item) -> u32 {{ x.show() }}"
+		);
+		let mut case = Case::new(&source);
+		assert_eq!(case.offered("x.show"), ["show"]);
+	}
+
+	/// A private field or method is not offered outside its module.
+	#[test]
+	fn a_private_member_is_not_offered() {
+		let mut case = Case::new(indoc! {"
+			mod m {
+			    pub struct P(pub a: u32, b: u32);
+			    impl P {
+			        pub func x(self: Self) -> u32 { 0 }
+			        func y(self: Self) -> u32 { 0 }
+			    }
+			}
+			func g(q: m::P) -> u32 {
+			    q.x()
+			}
+		"});
+		assert_eq!(case.offered("q.x"), ["a", "x"]);
+	}
+
+	/// A receiver with no type yet has no members.
+	#[test]
+	fn a_receiver_without_a_type_is_offered_nothing() {
+		let mut case = Case::new("func g() {}\n");
+		let owner = case.owner_at(case.source.find('{').unwrap() as u32 + 1);
+		assert!(
+			case.sema
+				.member_names(&case.strings, owner, TypeIndex::CONST_INT)
+				.is_empty()
+		);
+		assert!(
+			case.sema
+				.member_names(&case.strings, owner, TypeIndex::ERROR)
+				.is_empty()
+		);
 	}
 }

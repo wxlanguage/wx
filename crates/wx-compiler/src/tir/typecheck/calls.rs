@@ -19,7 +19,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::members::Expected;
-use super::{Arguments, BodyBuilder};
+use super::{ArgumentList, Arguments, BodyBuilder};
 use crate::ast::{self, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
@@ -32,8 +32,7 @@ use crate::tir::resolutions::{AccessKind, Definition, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
-	GenericArgs, GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
-	TypeList,
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, Type, TypeIndex, TypeList,
 };
 use crate::vfs::FileId;
 
@@ -178,6 +177,17 @@ impl CallTarget {
 }
 
 impl Semantics {
+	/// Parameter names from the declaration that defines the call contract.
+	/// A trait implementation uses its trait's names, including where the
+	/// implementation leaves a parameter unnamed.
+	pub fn function_parameter_names(
+		&self,
+		function: FunctionIdx,
+	) -> &[Option<Spanned<SymbolU32>>] {
+		let function = naming_declaration(self, function);
+		&self.decls.functions[usize::from(function)].params
+	}
+
 	/// The names a call by name of `callee` can give, with what each names,
 	/// in its parameters' order after the first `given` (a method call's
 	/// receiver, which its object gives and no name can), as the checker
@@ -475,7 +485,12 @@ impl BodyBuilder<'_, '_> {
 		self.check_use_bounds(&target, proven, segment, use_args);
 		let skipped = usize::from(receiver.is_some());
 		let args = self.arguments_value(
-			&target, &type_args, &given, skipped, reported, span,
+			&target,
+			&type_args,
+			&given,
+			skipped,
+			reported,
+			arguments.span,
 		);
 		let ty = self.instantiate(return_type, env, &type_args);
 		let ty = self.sema.types.collapse_error(ty);
@@ -589,11 +604,16 @@ impl BodyBuilder<'_, '_> {
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
-		match arguments {
-			Arguments::Positional(arguments) => self.positional_arguments(
-				target, type_args, arguments, given, span,
+		match arguments.kind {
+			ArgumentList::Positional(values) => self.positional_arguments(
+				target,
+				type_args,
+				values,
+				given,
+				span,
+				arguments.span,
 			),
-			Arguments::Named(arguments) => {
+			ArgumentList::Named(arguments) => {
 				self.named_arguments(target, type_args, arguments, given, span)
 			}
 		}
@@ -656,12 +676,18 @@ impl BodyBuilder<'_, '_> {
 		arguments: &[ast::ExprId],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
+		arguments_span: TextSpan,
 	) -> bool {
 		let skipped = given.len();
 		let open = target.param_types.len() - skipped;
 		if open == 1 && arguments.len() != 1 {
 			return self.whole_argument_list(
-				target, type_args, arguments, given, span,
+				target,
+				type_args,
+				arguments,
+				given,
+				span,
+				arguments_span,
 			);
 		}
 		if open != 1
@@ -743,6 +769,7 @@ impl BodyBuilder<'_, '_> {
 		arguments: &[ast::ExprId],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
+		arguments_span: TextSpan,
 	) -> bool {
 		let param = ParamIdx::new(given.len() as u32);
 		let declared =
@@ -769,7 +796,7 @@ impl BodyBuilder<'_, '_> {
 					ast.expr_span(last).end,
 				)
 			}
-			_ => span,
+			_ => arguments_span,
 		};
 		let value = self.build_tuple(arguments, hint, span);
 		self.learn_argument(target, type_args, declared, value);
@@ -994,14 +1021,7 @@ impl BodyBuilder<'_, '_> {
 		env: GenericEnvIdx,
 		args: &[TypeIndex],
 	) -> TypeIndex {
-		let ty = self.sema.types.substitute(
-			ty,
-			Substitution {
-				envs: &self.sema.generic_envs,
-				env,
-				args,
-			},
-		);
+		let ty = self.sema.substitute_type(ty, env, args);
 		let ty = self.context().normalized(ty);
 		self.sema.types.collapse_error(ty)
 	}
@@ -1074,23 +1094,28 @@ impl BodyBuilder<'_, '_> {
 			} => Some((func_index, type_args)),
 			_ => None,
 		};
-		let callee = match (callee, arguments, item) {
+		let callee = match (callee, arguments.kind, item) {
 			(None, ..) => {
 				self.build_unchecked_arguments(arguments);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
-			(Some(_), Arguments::Named(_), None) => {
+			(Some(_), ArgumentList::Named(_), None) => {
 				self.report_named_value_call(ty, span);
 				self.build_unchecked_arguments(arguments);
 				return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			}
 			(
 				Some(ValueCallee::Reference { param, result }),
-				Arguments::Positional(arguments),
+				ArgumentList::Positional(values),
 				_,
 			) => {
-				let args =
-					self.build_packed_arguments(ty, param, arguments, span);
+				let args = self.build_packed_arguments(
+					ty,
+					param,
+					values,
+					span,
+					arguments.span,
+				);
 				let kind = ExprKind::CallRef {
 					callee: value,
 					args,
@@ -1098,26 +1123,35 @@ impl BodyBuilder<'_, '_> {
 				return self.body.push(kind, result, span);
 			}
 			(Some(ValueCallee::Call(callee)), ..) => callee,
-			(Some(ValueCallee::Reference { .. }), Arguments::Named(_), _) => {
+			(
+				Some(ValueCallee::Reference { .. }),
+				ArgumentList::Named(_),
+				_,
+			) => {
 				unreachable!("a function reference is not an item")
 			}
 		};
-		let (packed, result) = match (item, arguments) {
+		let (packed, result) = match (item, arguments.kind) {
 			(Some((function, type_args)), _) => {
 				self.build_item_arguments(function, type_args, arguments, span)
 			}
 			// Read from the trait, not the impl's `call`, whose shape nothing
 			// has checked yet.
-			(None, Arguments::Positional(arguments)) => {
+			(None, ArgumentList::Positional(values)) => {
 				let intrinsics = &self.sema.decls.intrinsics;
 				let (args, result) =
 					(intrinsics.call_args, intrinsics.call_result);
 				let args_type = self.call_projection(ty, args);
-				let packed =
-					self.build_packed_arguments(ty, args_type, arguments, span);
+				let packed = self.build_packed_arguments(
+					ty,
+					args_type,
+					values,
+					span,
+					arguments.span,
+				);
 				(packed, self.call_projection(ty, result))
 			}
-			(None, Arguments::Named(_)) => unreachable!("reported above"),
+			(None, ArgumentList::Named(_)) => unreachable!("reported above"),
 		};
 		let value_span = self.body.span(value);
 		let type_args = self
@@ -1157,8 +1191,14 @@ impl BodyBuilder<'_, '_> {
 			self.sema.functions[usize::from(function)].return_type;
 		let result =
 			self.instantiate(return_type, target.generic_env, &type_args);
-		let args = self
-			.arguments_value(&target, &type_args, &given, 0, reported, span);
+		let args = self.arguments_value(
+			&target,
+			&type_args,
+			&given,
+			0,
+			reported,
+			arguments.span,
+		);
 		(args, result)
 	}
 
@@ -1183,8 +1223,9 @@ impl BodyBuilder<'_, '_> {
 		self.sema.types.collapse_error(projection)
 	}
 
-	/// A call's arguments as a tuple of `values`, spanning them (the call's
-	/// `span` for none).
+	/// A call's arguments as a tuple of `values`, spanning them, or the
+	/// supplied `span` for none. A written call supplies its argument-list
+	/// span so the tuple does not hide the call's result in `operand_of`.
 	pub(super) fn pack(
 		&mut self,
 		values: impl IntoIterator<Item = ExprIdx>,
@@ -1306,6 +1347,7 @@ impl BodyBuilder<'_, '_> {
 		args_type: TypeIndex,
 		arguments: &[ast::ExprId],
 		span: TextSpan,
+		arguments_span: TextSpan,
 	) -> ExprIdx {
 		if let [argument] = arguments {
 			let value = self.build(*argument, args_type);
@@ -1341,7 +1383,7 @@ impl BodyBuilder<'_, '_> {
 			Some(_) => args_type,
 			None => TypeIndex::ERROR,
 		};
-		self.pack(values, ElementOrder::InOrder, ty, span)
+		self.pack(values, ElementOrder::InOrder, ty, arguments_span)
 	}
 
 	/// Checks the arguments of a call that has no target, for their own
@@ -1350,13 +1392,13 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		arguments: Arguments<'_>,
 	) {
-		match arguments {
-			Arguments::Positional(arguments) => {
+		match arguments.kind {
+			ArgumentList::Positional(arguments) => {
 				for argument in arguments {
 					self.build(*argument, TypeIndex::ERROR);
 				}
 			}
-			Arguments::Named(arguments) => {
+			ArgumentList::Named(arguments) => {
 				for argument in arguments {
 					self.build_named_argument(argument, TypeIndex::ERROR);
 				}

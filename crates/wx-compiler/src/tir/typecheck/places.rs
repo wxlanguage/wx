@@ -19,19 +19,14 @@ use super::{BodyBuilder, SelectedMethod};
 use crate::ast::{self, BinaryOp, Ownership, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::symbols::Keyword;
-use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceIdx, PlaceKind};
-use crate::tir::decls::{TraitIdx, Visibility};
+use crate::tir::body::{
+	ExprIdx, ExprKind, Operand, Place, PlaceIdx, PlaceKind,
+};
+use crate::tir::decls::TraitIdx;
 use crate::tir::operators::is_primitive_binary;
 use crate::tir::resolutions::{AccessKind, Reference, Site};
 use crate::tir::solver::SolverError;
 use crate::tir::types::{Substitution, Type, TypeIndex};
-
-/// What the left of `=`, the operand of `.&` or the object of `.field` is.
-#[derive(Clone, Copy)]
-enum Operand {
-	Place(PlaceIdx),
-	Value(ExprIdx),
-}
 
 /// What defines an `op=`.
 enum CompoundMethod {
@@ -181,10 +176,7 @@ impl BodyBuilder<'_, '_> {
 		}
 		let mut object =
 			self.build_operand(object, AccessKind::Read, &mut None);
-		let mut object_ty = match object {
-			Operand::Place(place) => self.body.place(place).ty,
-			Operand::Value(value) => self.body.ty(value),
-		};
+		let mut object_ty = self.body.operand_ty(object);
 		if let Type::Pointer {
 			to,
 			memory,
@@ -578,12 +570,10 @@ impl BodyBuilder<'_, '_> {
 			},
 		);
 		*site = Some(recorded);
-		let visibility =
-			Visibility::from(decl.field_pub_spans[usize::from(field)]);
-		if !self.sema.decls.namespaces.is_accessible_from(
+		if !self.sema.field_accessible(
+			struct_index,
+			field,
 			self.scope.namespace,
-			self.sema.decls.scope(decl.loc).into(),
-			visibility,
 		) {
 			self.sema.diagnostics.push(
 				Diagnostic::error()

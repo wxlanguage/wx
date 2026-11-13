@@ -26,8 +26,9 @@ use super::decls::{
 };
 use super::numbers::DecimalFloat;
 use super::obligations::TypeObligation;
+use super::signatures::Semantics;
 use super::types::{GenericArgs, TypeIndex};
-use crate::ast::{BinaryOp, Spanned, UnaryOp};
+use crate::ast::{AST, BinaryOp, ExprId, Expression, Spanned, UnaryOp};
 use crate::diagnostics::TextSpan;
 use crate::index::index_newtype;
 
@@ -592,6 +593,91 @@ pub(super) enum PlaceKind {
 	Element { object: PlaceIdx, index: ExprIdx },
 }
 
+/// What an expression written in source was checked as: a value, or a
+/// place in linear memory when it names one and its use keeps it a place
+/// (the left of `=`, the operand of `.&`, the object of `.field`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum Operand {
+	Place(PlaceIdx),
+	Value(ExprIdx),
+}
+
+/// A call as checking built it: the selected function and type arguments,
+/// a function reference, or a construction. A function can name a trait
+/// declaration whose implementation is selected when instantiated. Operands
+/// belong to the queried body; type arguments index the existing arena.
+pub enum Call {
+	Function {
+		function: FunctionIdx,
+		type_args: GenericArgs,
+		receiver: Option<Operand>,
+		arguments: Operand,
+	},
+	Reference {
+		callee: Operand,
+		arguments: Operand,
+	},
+	Constructor {
+		structure: StructIdx,
+		fields: Operand,
+	},
+}
+
+impl Semantics {
+	/// Inspect a checked call without resolving its callee again or
+	/// interpreting its packed arguments as a written parameter list.
+	pub fn call_of(&self, owner: BodyOwner, value: ExprIdx) -> Option<Call> {
+		let body = self.owner_body(owner)?;
+		Some(match body.kind(value) {
+			ExprKind::Call {
+				function,
+				type_args,
+				args,
+			}
+			| ExprKind::AbstractCall {
+				method: function,
+				type_args,
+				args,
+			} => Call::Function {
+				function,
+				type_args,
+				receiver: None,
+				arguments: Operand::Value(args),
+			},
+			ExprKind::MethodCall {
+				function,
+				type_args,
+				receiver,
+				args,
+			}
+			| ExprKind::AbstractMethodCall {
+				method: function,
+				type_args,
+				receiver,
+				args,
+			} => Call::Function {
+				function,
+				type_args,
+				receiver: Some(Operand::Value(receiver)),
+				arguments: Operand::Value(args),
+			},
+			ExprKind::CallRef { callee, args } => Call::Reference {
+				callee: Operand::Value(callee),
+				arguments: Operand::Value(args),
+			},
+			ExprKind::StructConstructor {
+				struct_index,
+				fields,
+			} => Call::Constructor {
+				structure: struct_index,
+				fields: Operand::Value(fields),
+			},
+			_ => return None,
+		})
+	}
+}
+
 /// One definition's checked expression tree.
 #[derive(Default)]
 pub struct Body {
@@ -778,6 +864,55 @@ impl Body {
 		&self.params
 	}
 
+	/// What the expression `expr` of `ast`, in this body, was checked as.
+	/// A tuple of one is checked as its element and an ascription as its
+	/// value, neither adding a node, so they are looked through to the node
+	/// that was built: `(o)` and `(o: T)` are what `o` was checked as, and
+	/// `(5: u8)` is the literal, which coercion made a `u8` in place.
+	pub fn operand_of(&self, ast: &AST, expr: ExprId) -> Option<Operand> {
+		let mut expr = expr;
+		loop {
+			expr = match ast.expr(expr) {
+				Expression::Tuple { elements } if elements.len() == 1 => {
+					ast.list(elements)[0]
+				}
+				Expression::Ascription { value, .. } => value,
+				_ => break,
+			};
+		}
+		self.operand_with_span(ast.expr_span(expr))
+	}
+
+	/// What the expression written at exactly `span` was checked as: the
+	/// first expression pushed with that span, else the last place.
+	///
+	/// An expression is preferred because a place may share its span with
+	/// one: `p.field` goes through the pointer `p` with a `Deref` place at
+	/// `p`'s span, and `p` is what was written. Among expressions the first
+	/// is the one written, as a child is pushed before its parent and what
+	/// the checker adds around a value (`receiver.*.&` for a method's shared
+	/// receiver) reuses its span. A place is the answer only where no value
+	/// was made: a place a field access keeps (`p.inner` in `p.inner.x`,
+	/// `p.*` in `p.*.x`). Among places the last is the outermost, which is
+	/// what was written.
+	fn operand_with_span(&self, span: TextSpan) -> Option<Operand> {
+		if let Some(at) = self.spans.iter().position(|&at| at == span) {
+			return Some(Operand::Value(ExprIdx::new(at as u32)));
+		}
+		self.places
+			.iter()
+			.rposition(|place| place.span == span)
+			.map(|at| Operand::Place(PlaceIdx::new(at as u32)))
+	}
+
+	/// The type of the value `operand` is, or is the location of.
+	pub fn operand_ty(&self, operand: Operand) -> TypeIndex {
+		match operand {
+			Operand::Place(place) => self.place(place).ty,
+			Operand::Value(value) => self.ty(value),
+		}
+	}
+
 	pub(super) fn place(&self, place: PlaceIdx) -> &Place {
 		&self.places[usize::from(place)]
 	}
@@ -958,12 +1093,13 @@ mod tests {
 	use crate::tir::resolutions::Reference;
 	use crate::tir::signatures::Semantics;
 	use crate::tir::signatures::tests::source_graph;
-	use crate::vfs::FileId;
+	use crate::vfs::{self, FileId};
 
 	/// A checked source, read through its bodies.
 	struct Case<'s> {
 		source: &'s str,
 		file: FileId,
+		graph: vfs::CompilationUnit,
 		strings: StringInterner,
 		sema: Semantics,
 	}
@@ -972,6 +1108,34 @@ mod tests {
 		fn new(source: &'s str) -> Self {
 			let mut strings = Keyword::create_interner();
 			let graph = source_graph(source, &mut strings);
+			Self::checked(source, graph, strings)
+		}
+
+		/// A source the parser reports and recovers from.
+		fn recovered(source: &'s str) -> Self {
+			let mut strings = Keyword::create_interner();
+			let mut builder = vfs::CompilationUnitBuilder::new(&mut strings);
+			builder.load_core();
+			let root = builder
+				.load_package(
+					vfs::AbsolutePath::new("/main.wx"),
+					&vfs::VirtualFileSource::from_relative(
+						std::collections::HashMap::from([(
+							"main.wx".to_string(),
+							source.to_string(),
+						)]),
+					),
+				)
+				.unwrap();
+			let graph = builder.build(root);
+			Self::checked(source, graph, strings)
+		}
+
+		fn checked(
+			source: &'s str,
+			graph: vfs::CompilationUnit,
+			mut strings: StringInterner,
+		) -> Self {
 			let sema = crate::tir::check(&graph, &mut strings);
 			let file = sema
 				.decls
@@ -980,6 +1144,7 @@ mod tests {
 			Self {
 				source,
 				file,
+				graph,
 				strings,
 				sema,
 			}
@@ -1109,6 +1274,255 @@ mod tests {
 			checked += 1;
 		}
 		assert!(checked > 20, "only {checked} uses checked");
+	}
+
+	/// What `operand_with_span` finds in `function` at `object`, which
+	/// starts the one occurrence of `written` in the source, and its type.
+	fn operand(
+		case: &Case<'_>,
+		function: &str,
+		written: &str,
+		object: &str,
+	) -> (Operand, String) {
+		assert!(written.starts_with(object));
+		let mut found = case.source.match_indices(written);
+		let (start, _) =
+			found.next().unwrap_or_else(|| panic!("no `{written}`"));
+		assert!(found.next().is_none(), "`{written}` is written twice");
+		let start = start as u32;
+		let span = TextSpan::new(start, start + object.len() as u32);
+		let ast = case.graph.ast(case.file);
+		// The outermost one written there: a child comes before its parent.
+		let expr = ast
+			.exprs
+			.spans
+			.iter()
+			.enumerate()
+			.filter(|&(_, &at)| at == span)
+			.map(|(index, _)| ExprId(index as u32))
+			.last()
+			.unwrap_or_else(|| panic!("no expression `{object}`"));
+		let body = case.body(function);
+		let operand = body
+			.operand_of(ast, expr)
+			.unwrap_or_else(|| panic!("nothing at `{object}`"));
+		let ty = case
+			.sema
+			.type_formatter(&case.strings)
+			.display_type(body.operand_ty(operand));
+		(operand, ty)
+	}
+
+	fn is_local(body: &Body, operand: Operand) -> bool {
+		matches!(
+			operand,
+			Operand::Value(value) if matches!(body.kind(value), ExprKind::Local(_))
+		)
+	}
+
+	const RECEIVERS: &str = indoc! {"
+		memory heap: u32;
+		struct Inner(v: u32);
+		impl Inner {
+		    pub func get(self: heap::&Self) -> u32 { self.*.v }
+		}
+		struct Outer(inner: Inner, n: u32);
+	"};
+
+	/// The object of a field through a pointer is the pointer as written,
+	/// not the `Deref` place `p.n` goes through, which has `p`'s span.
+	#[test]
+	fn an_object_through_a_pointer_is_the_pointer() {
+		let source = format!(
+			"{RECEIVERS}func f(o: Outer, p: heap::*Outer) {{
+			    local a = o.n;
+			    local b = p.n;
+			}}"
+		);
+		let case = Case::new(&source);
+		let body = case.body("f");
+		let (value, ty) = operand(&case, "f", "o.n", "o");
+		assert!(is_local(body, value));
+		assert_eq!(ty, "Outer");
+		let (pointer, ty) = operand(&case, "f", "p.n", "p");
+		assert!(is_local(body, pointer));
+		assert_eq!(ty, "heap::*Outer");
+	}
+
+	/// A place a field access keeps has no value at its span: `p.inner` in
+	/// `p.inner.v`, `p.*` in `p.*.n`.
+	#[test]
+	fn an_object_kept_a_place_is_the_place() {
+		let source = format!(
+			"{RECEIVERS}func f(p: heap::*Outer) {{
+			    local a = p.inner.v;
+			    local b = p.*.n;
+			}}"
+		);
+		let case = Case::new(&source);
+		let body = case.body("f");
+		let (inner, ty) = operand(&case, "f", "p.inner.v", "p.inner");
+		let Operand::Place(inner) = inner else {
+			panic!("`p.inner` is a value");
+		};
+		assert!(matches!(body.place(inner).kind, PlaceKind::Field { .. }));
+		assert_eq!(ty, "Inner");
+		let (pointee, ty) = operand(&case, "f", "p.*.n", "p.*");
+		let Operand::Place(pointee) = pointee else {
+			panic!("`p.*` is a value");
+		};
+		assert!(matches!(body.place(pointee).kind, PlaceKind::Deref { .. }));
+		assert_eq!(ty, "Outer");
+	}
+
+	/// A method's receiver is the value written, not what the checker adds
+	/// around it at its span: `q.*.&` for an exclusive `q` given to a
+	/// `self: heap::&Self` method.
+	#[test]
+	fn a_receiver_is_the_value_written() {
+		let source = format!(
+			"{RECEIVERS}func f(q: heap::*Inner) -> u32 {{
+			    q.get()
+			}}"
+		);
+		let case = Case::new(&source);
+		let body = case.body("f");
+		let (receiver, ty) = operand(&case, "f", "q.get", "q");
+		assert!(is_local(body, receiver));
+		assert_eq!(ty, "heap::*Inner");
+	}
+
+	/// Empty argument tuples must not hide a call's result at its span.
+	#[test]
+	fn a_call_receiver_is_its_result() {
+		let source = indoc! {"
+		    struct Empty();
+		    impl Empty { pub func id(self: Self) -> Self { self } }
+		    struct Caller();
+		    impl Call for Caller {
+		        type Args = ();
+		        type Result = f32;
+		        func call(self: Self, args: ()) -> f32 { 1.0 }
+		    }
+		    func make() -> f32 { 1.0 }
+		    func consume_unit(args: ()) -> f32 { 1.0 }
+		    func f(x: f32, cb: func() -> f32, c: Caller) {
+		        local g = make;
+		        _ = x.trunc().abs();
+		        _ = x.trunc({}).ceil();
+		        _ = make().floor();
+		        _ = consume_unit().floor();
+		        _ = make({}).floor();
+		        _ = g().floor();
+		        _ = g({}).floor();
+		        _ = cb().floor();
+		        _ = c().floor();
+		        _ = Empty().id();
+		        _ = Empty({}).id();
+		    }
+		"};
+		let case = Case::new(source);
+		assert!(
+			case.sema.diagnostics().is_empty(),
+			"{:?}",
+			case.sema.diagnostics()
+		);
+		let body = case.body("f");
+		let ast = case.graph.ast(case.file);
+		for (written, object, expected) in [
+			("x.trunc().abs", "x.trunc()", "f32"),
+			("x.trunc({}).ceil", "x.trunc({})", "f32"),
+			("make().floor", "make()", "f32"),
+			("consume_unit().floor", "consume_unit()", "f32"),
+			("make({}).floor", "make({})", "f32"),
+			("g().floor", "g()", "f32"),
+			("g({}).floor", "g({})", "f32"),
+			("cb().floor", "cb()", "f32"),
+			("c().floor", "c()", "f32"),
+			("Empty().id", "Empty()", "Empty"),
+			("Empty({}).id", "Empty({})", "Empty"),
+		] {
+			let (value, ty) = operand(&case, "f", written, object);
+			assert_eq!(ty, expected, "{object}");
+			let Operand::Value(value) = value else {
+				panic!("`{object}` is a place");
+			};
+			let args = match body.kind(value) {
+				ExprKind::Call { args, .. }
+				| ExprKind::AbstractCall { args, .. }
+				| ExprKind::AbstractMethodCall { args, .. }
+				| ExprKind::MethodCall { args, .. }
+				| ExprKind::CallRef { args, .. } => args,
+				ExprKind::StructConstructor { fields, .. } => fields,
+				_ => panic!("`{object}` is not a call or construction"),
+			};
+			let expr = ast
+				.exprs
+				.spans
+				.iter()
+				.position(|&span| span == body.span(value))
+				.map(|index| ExprId(index as u32))
+				.unwrap();
+			assert_eq!(body.span(args), ast.arguments_span(expr), "{object}");
+		}
+	}
+
+	/// An access with no name after its `.` still builds its object, which
+	/// completion reads.
+	#[test]
+	fn an_unfinished_access_keeps_its_object() {
+		let source = format!(
+			"{RECEIVERS}func f(o: Outer, p: heap::*Outer) {{
+			    local a = o.;
+			    local b = p.inner.;
+			}}"
+		);
+		let case = Case::recovered(&source);
+		let body = case.body("f");
+		let (object, ty) = operand(&case, "f", "o.;", "o");
+		assert!(is_local(body, object));
+		assert_eq!(ty, "Outer");
+		let (inner, ty) = operand(&case, "f", "p.inner.;", "p.inner");
+		assert!(matches!(inner, Operand::Place(_)));
+		assert_eq!(ty, "Inner");
+	}
+
+	/// A tuple of one and an ascription add no node: what they hold is
+	/// looked through, nested too.
+	#[test]
+	fn a_parenthesized_or_ascribed_object_is_its_value() {
+		let source = format!(
+			"{RECEIVERS}func f(o: Outer) {{
+			    local a = (o).n;
+			    local b = (o: Outer).n;
+			    local c = ((o: Outer)).n;
+			}}"
+		);
+		let case = Case::new(&source);
+		let body = case.body("f");
+		for (written, object) in [
+			("(o).n", "(o)"),
+			("(o: Outer).n", "(o: Outer)"),
+			("((o: Outer)).n", "((o: Outer))"),
+		] {
+			let (operand, ty) = operand(&case, "f", written, object);
+			assert!(is_local(body, operand), "`{object}`");
+			assert_eq!(ty, "Outer", "`{object}`");
+		}
+	}
+
+	/// An ascribed literal is the literal, which coercion gave the type.
+	#[test]
+	fn an_ascribed_literal_has_its_type() {
+		let source = "func f() -> u8 {\n    (5: u8).add(1)\n}\n";
+		let case = Case::new(source);
+		let body = case.body("f");
+		let (literal, ty) = operand(&case, "f", "(5: u8).add", "(5: u8)");
+		assert!(matches!(
+			literal,
+			Operand::Value(value) if matches!(body.kind(value), ExprKind::Int(_))
+		));
+		assert_eq!(ty, "u8");
 	}
 
 	#[test]

@@ -29,7 +29,8 @@ use crate::symbols::StringInterner;
 use crate::vfs::CompilationUnit;
 
 pub use self::body::{
-	Body, BodyOwner, Label, LabelIdx, LabelKind, Local, LocalIdx, ParamIdx,
+	Body, BodyOwner, Call, ExprIdx, Label, LabelIdx, LabelKind, Local,
+	LocalIdx, Operand, ParamIdx, PlaceIdx,
 };
 use self::decls::Declarations;
 pub use self::decls::{
@@ -48,7 +49,7 @@ use self::resolutions::NameResolutions;
 pub use self::resolutions::{AccessKind, Definition, Reference, Route};
 pub use self::signatures::Semantics;
 use self::signatures::SemanticsBuilder;
-pub use self::types::{GenericEnvIdx, Primitive, Type, TypeIndex};
+pub use self::types::{GenericArgs, GenericEnvIdx, Primitive, Type, TypeIndex};
 
 /// Checks declarations and bodies into a live [`Semantics`], which holds
 /// their diagnostics. Parser and package diagnostics remain available on

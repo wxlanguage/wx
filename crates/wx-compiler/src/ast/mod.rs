@@ -1253,7 +1253,7 @@ index_newtype!(
 );
 index_newtype!(
 	/// An expression, in its file's [`AST`].
-	ExprId
+	pub ExprId
 );
 index_newtype!(
 	/// A statement, in its file's [`AST`].
@@ -1423,9 +1423,9 @@ identified! {
 
 /// A column of nodes of one kind, each with its span; a node's id is its
 /// position.
-struct Column<K> {
-	kinds: Box<[K]>,
-	spans: Box<[TextSpan]>,
+pub struct Column<K> {
+	pub kinds: Box<[K]>,
+	pub spans: Box<[TextSpan]>,
 }
 
 /// A [`Column`] while the parser writes it.
@@ -1471,7 +1471,7 @@ pub struct AST {
 	consts: Column<ConstArgument>,
 	bounds: Column<BoundExpression>,
 	patterns: Column<Pattern>,
-	exprs: Column<Expression>,
+	pub exprs: Column<Expression>,
 	stmts: Column<Statement>,
 	blocks: Column<Block>,
 	qualified_roots: Box<[QualifiedPathRoot]>,

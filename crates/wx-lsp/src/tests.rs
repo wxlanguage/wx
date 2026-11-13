@@ -784,7 +784,7 @@ fn references_return_empty_for_unused_symbols_and_none_for_unresolved_names() {
 }
 
 #[tokio::test]
-async fn initialization_advertises_references() {
+async fn initialization_advertises_references_and_completion_triggers() {
 	let service = backend_with_drained_socket();
 	let result = service
 		.inner()
@@ -794,6 +794,23 @@ async fn initialization_advertises_references() {
 	assert_eq!(
 		result.capabilities.references_provider,
 		Some(tower_lsp_server::ls_types::OneOf::Left(true))
+	);
+	assert_eq!(
+		result
+			.capabilities
+			.completion_provider
+			.unwrap()
+			.trigger_characters,
+		Some(vec![".".into(), ":".into()])
+	);
+	let help = result.capabilities.signature_help_provider.unwrap();
+	assert_eq!(
+		help.trigger_characters,
+		Some(vec!["(".into(), ",".into(), "{".into(), ":".into()])
+	);
+	assert_eq!(
+		help.retrigger_characters,
+		Some(vec![")".into(), "}".into()])
 	);
 }
 
@@ -2028,15 +2045,20 @@ fn rename_refuses_a_module_in_a_file_of_its_own() {
 
 // ── Completion ──────────────────────────────────────────────────────────
 
-/// The labels completion offers where `$0` is written in `source`, in the
-/// order they sort; `None` when it offers nothing there.
+/// The names completion offers at `$0`, before display punctuation, in
+/// client sort order; `None` when it offers nothing there.
 fn completions(source: &str) -> Option<Vec<String>> {
 	let items = completion_items(source, false)?;
-	Some(items.into_iter().map(|item| item.label).collect())
+	Some(
+		items
+			.into_iter()
+			.map(|item| item.filter_text.unwrap_or(item.label))
+			.collect(),
+	)
 }
 
 /// The items offered at `$0`, sorted as the client shows them, by a server
-/// whose client takes snippets or not.
+/// whose client supports secondary labels and takes snippets or not.
 fn completion_items(
 	source: &str,
 	snippets: bool,
@@ -2046,6 +2068,7 @@ fn completion_items(
 	let root = PathBuf::from("/test/main.wx");
 	let (mut state, _) = analyzed(&root, &text);
 	state.client.completion_snippets = snippets;
+	state.client.completion_label_details = true;
 	let uri = Uri::from_file_path(&root).unwrap();
 	let line = text[..offset].matches('\n').count();
 	let line_start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
@@ -2062,7 +2085,7 @@ fn completion_items(
 		context: None,
 	};
 	let Some(tower_lsp_server::ls_types::CompletionResponse::Array(mut items)) =
-		crate::completion::completion(&state, &params)
+		crate::completion::completion(&mut state, &params)
 	else {
 		return None;
 	};
@@ -2160,12 +2183,10 @@ fn completion_inside_a_keyword_blocks_braces() {
 #[test]
 fn completion_offers_nothing_where_no_name_is_looked_up() {
 	for source in [
-		// A comment, a binding's own name, a literal, a member, a segment
-		// after a type.
+		// A comment, a binding's own name, a literal, a segment after a type.
 		"func f() {\n    // hel$0\n}\n",
 		"func f() {\n    local na$0me = 1;\n}\n",
 		"func f() {\n    local a: u32 = 12$0;\n}\n",
-		"func f(p: Point) {\n    p.x$0;\n}\n",
 		// After a type: its members, which are not completed yet.
 		"func f() {\n    Point::$0\n}\n",
 		// A parameter's own name, and its type's later segment.
@@ -2455,7 +2476,7 @@ fn inserted(source: &str) -> Vec<(String, String)> {
 	(items.into_iter())
 		.map(|item| {
 			let text = item.insert_text.unwrap_or_else(|| item.label.clone());
-			(item.label, text)
+			(item.filter_text.unwrap_or(item.label), text)
 		})
 		.collect()
 }
@@ -2486,7 +2507,16 @@ fn completion_inserts_a_call_of_a_function_or_a_constructor() {
 		false,
 	)
 	.expect("names in a body");
-	assert!(items.iter().all(|item| item.insert_text.is_none()));
+	assert!(items.iter().all(|item| item.insert_text_format.is_none()));
+	assert_eq!(
+		items
+			.iter()
+			.find(|item| item.filter_text.as_deref() == Some("helper"))
+			.unwrap()
+			.insert_text
+			.as_deref(),
+		Some("helper")
+	);
 }
 
 #[test]
@@ -2496,4 +2526,929 @@ fn completion_after_a_module_in_a_signature() {
 	)
 	.expect("a segment after a module");
 	assert_offers(&labels, &["Square"], &["Hidden"]);
+}
+
+const MEMBER_RECEIVERS: &str = "
+memory heap: u32;
+struct Inner(pub z: u32, pub a: u32);
+impl Inner {
+    pub func get(self: heap::&Self) -> u32 { self.z }
+    pub func set(self: heap::*Self, v: u32) { self.z = v; }
+    pub func twice(self: Self) -> u32 { self.z + self.z }
+    pub func add(self: Self, v: u32) -> u32 { self.z + v }
+    pub func make() -> Inner { Inner(0, 0) }
+}
+struct Outer(inner: Inner);
+";
+
+#[test]
+fn completion_of_a_member_keeps_fields_then_methods_in_declaration_order() {
+	for (receiver, expected) in [
+		("Inner", vec!["z", "a", "twice", "add"]),
+		("heap::*Inner", vec!["z", "a", "get", "set"]),
+		("heap::&Inner", vec!["z", "a", "get"]),
+	] {
+		let labels = completions(&format!(
+			"{MEMBER_RECEIVERS}func f(i: {receiver}) {{ local a = i.$0 }}"
+		))
+		.expect("members of a checked receiver");
+		assert_eq!(labels, expected, "{receiver}");
+	}
+}
+
+#[test]
+fn completion_of_a_partly_written_member_returns_every_candidate() {
+	assert_eq!(
+		completions(&format!(
+			"{MEMBER_RECEIVERS}func f(p: heap::*Inner) {{ p.ge$0; }}"
+		))
+		.unwrap(),
+		["z", "a", "get", "set"]
+	);
+}
+
+#[test]
+fn completion_of_a_member_reads_place_and_parenthesized_objects() {
+	for (params, object) in [
+		("o: heap::*Outer", "o.inner"),
+		("i: Inner", "(i)"),
+		("i: Inner", "(i: Inner)"),
+	] {
+		assert_eq!(
+			completions(&format!(
+				"{MEMBER_RECEIVERS}func f({params}) {{ local a = {object}.$0 }}"
+			))
+			.unwrap(),
+			["z", "a", "twice", "add"],
+			"{object}"
+		);
+	}
+}
+
+#[test]
+fn completion_of_a_member_uses_the_receivers_trait_bounds() {
+	assert_eq!(
+		completions(
+			"trait Show: StackValue { func show(self: Self) -> u32; }
+			func f<T: Show>(t: T) { local a = t.$0 }"
+		)
+		.unwrap(),
+		["show"]
+	);
+}
+
+#[test]
+fn completion_before_a_member_on_the_next_line_has_an_empty_prefix() {
+	assert_eq!(
+		completions(&format!(
+			"{MEMBER_RECEIVERS}func f(p: heap::*Inner) {{ p.$0\nfoo(1); }}"
+		))
+		.unwrap(),
+		["z", "a", "get", "set"]
+	);
+}
+
+#[test]
+fn completion_of_a_method_inserts_only_the_arguments_after_self() {
+	use tower_lsp_server::ls_types::{CompletionItemKind, InsertTextFormat};
+
+	for (access, snippets, expected, format) in [
+		(
+			"p.ge$0",
+			true,
+			Some("get()"),
+			Some(InsertTextFormat::SNIPPET),
+		),
+		("p.ge$0()", true, Some("get"), None),
+		(
+			"p.se$0",
+			true,
+			Some("set($1)"),
+			Some(InsertTextFormat::SNIPPET),
+		),
+		("p.se$0(1)", true, Some("set"), None),
+		("p.ge$0", false, Some("get"), None),
+	] {
+		let items = completion_items(
+			&format!(
+				"{MEMBER_RECEIVERS}func f(p: heap::*Inner) {{ {access}; }}"
+			),
+			snippets,
+		)
+		.unwrap();
+		assert_eq!(
+			items
+				.iter()
+				.map(|item| item.label.as_str())
+				.collect::<Vec<_>>(),
+			["z", "a", "get()", "set(…)"]
+		);
+		for field in &items[..2] {
+			assert_eq!(field.kind, Some(CompletionItemKind::FIELD));
+			assert_eq!(field.insert_text, None);
+			assert_eq!(field.insert_text_format, None);
+		}
+		let label = if access.starts_with("p.ge") {
+			"get"
+		} else {
+			"set"
+		};
+		let method = items
+			.iter()
+			.find(|item| {
+				item.filter_text.as_deref().unwrap_or(&item.label) == label
+			})
+			.unwrap();
+		assert_eq!(method.kind, Some(CompletionItemKind::METHOD));
+		assert_eq!(method.insert_text.as_deref(), expected, "{access}");
+		assert_eq!(method.insert_text_format, format, "{access}");
+	}
+}
+
+#[test]
+fn completion_of_a_member_excludes_private_fields_and_methods() {
+	assert_eq!(
+		completions(
+			"mod m {
+			    pub struct S(pub a: u32, b: u32);
+			    impl S {
+			        pub func get(self: Self) -> u32 { self.a }
+			        func hidden(self: Self) -> u32 { self.b }
+			    }
+			}
+			func f(i: m::S) { local a = i.$0 }"
+		)
+		.unwrap(),
+		["a", "get"]
+	);
+}
+
+#[test]
+fn completion_inside_a_members_object_still_offers_local_names() {
+	let labels = completions(&format!(
+		"{MEMBER_RECEIVERS}func f(i: Inner) {{ i$0.z; }}"
+	))
+	.unwrap();
+	assert_offers(&labels, &["i"], &["z", "a", "twice", "add", "get", "set"]);
+}
+
+#[test]
+fn completion_after_a_method_call_offers_the_results_members() {
+	for object in [
+		"x.trunc()",
+		"x.trunc().abs()",
+		"x.trunc({})",
+		"x.trunc( /* arguments */ )",
+		"x.trunc({ /* arguments */ })",
+	] {
+		let labels = completions(&format!("func f(x: f32) {{ {object}.$0 }}"))
+			.expect("members of the call's f32 result");
+		assert_offers(&labels, &["trunc", "promote", "to_bits"], &[]);
+	}
+	assert_eq!(
+		completions(&format!(
+			"{MEMBER_RECEIVERS}func f() {{ Inner::make().$0 }}"
+		))
+		.unwrap(),
+		["z", "a", "twice", "add"]
+	);
+}
+
+#[test]
+fn completion_after_a_call_of_a_value_uses_its_result() {
+	for object in ["g()", "g({})", "cb()", "c()", "consume_unit()"] {
+		let labels = completions(&format!(
+			"struct Caller();
+			impl Call for Caller {{
+			    type Args = ();
+			    type Result = f32;
+			    func call(self: Self, args: ()) -> f32 {{ 1.0 }}
+			}}
+			func make() -> f32 {{ 1.0 }}
+			func consume_unit(args: ()) -> f32 {{ 1.0 }}
+			func f(cb: func() -> f32, c: Caller) {{
+			    local g = make;
+			    {object}.$0
+			    local n: u32 = 1;
+			}}"
+		))
+		.unwrap_or_else(|| panic!("no members after {object}"));
+		assert_offers(&labels, &["trunc", "promote", "to_bits"], &[]);
+	}
+}
+
+#[test]
+fn completion_after_an_empty_construction_uses_the_struct() {
+	for object in ["Empty()", "Empty({})"] {
+		assert_eq!(
+			completions(&format!(
+				"struct Empty();
+				impl Empty {{ pub func id(self: Self) -> Self {{ self }} }}
+				func f() {{ {object}.$0 }}"
+			))
+			.unwrap(),
+			["id"],
+			"{object}"
+		);
+	}
+}
+
+// ── Signature help ──────────────────────────────────────────────────────
+
+/// Signature help at `$0`, with the client's requested label format.
+fn signature_help(
+	source: &str,
+	offsets: bool,
+) -> Option<tower_lsp_server::ls_types::SignatureHelp> {
+	let offset = source.find("$0").expect("a `$0` marks the cursor");
+	let text = source.replacen("$0", "", 1);
+	let root = PathBuf::from("/test/main.wx");
+	let (mut state, _) = analyzed(&root, &text);
+	state.client.signature_label_offsets = offsets;
+	let line = text[..offset].matches('\n').count();
+	let start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
+	let params = tower_lsp_server::ls_types::SignatureHelpParams {
+		text_document_position_params: TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier {
+				uri: Uri::from_file_path(root).unwrap(),
+			},
+			position: Position {
+				line: line as u32,
+				character: text[start..offset].encode_utf16().count() as u32,
+			},
+		},
+		work_done_progress_params: Default::default(),
+		context: None,
+	};
+	crate::signature_help::signature_help(&mut state, &params)
+}
+
+const SIGNATURE_FUNCTIONS: &str =
+	"func pair(first: u32, second: u32) -> u32 { first }\n";
+
+#[test]
+fn signature_help_tracks_positional_arguments_and_incomplete_calls() {
+	for (call, active) in [
+		("pair($0)", Some(0)),
+		("pair(1, $0)", Some(1)),
+		("pair(1$0)", Some(0)),
+		("pair(1, 2$0)", Some(1)),
+		("pair(1, 2 $0)", Some(1)),
+		("pair(1, 2, $0)", None),
+		("pair(   $0", Some(0)),
+		("pair(1,   $0", Some(1)),
+		("pair(1, $0 }", Some(1)),
+		("local values = [pair(1, $0", Some(1)),
+	] {
+		let help = signature_help(
+			&format!("{SIGNATURE_FUNCTIONS}func f() {{ {call}"),
+			true,
+		)
+		.unwrap_or_else(|| panic!("no signature for {call}"));
+		assert_eq!(
+			help.signatures[0].label,
+			"func pair(first: u32, second: u32) -> u32",
+			"{call}"
+		);
+		assert_eq!(help.active_parameter, active, "{call}");
+	}
+}
+
+#[test]
+fn signature_help_tracks_named_arguments_by_name_and_recovers_the_call() {
+	for call in [
+		"pair({ second: $0 })",
+		"pair({ second: $0",
+		"pair({ second: $0 }",
+		"pair({ first: 1, second: $0",
+		"pair({ second$0 })",
+	] {
+		let help = signature_help(
+			&format!("{SIGNATURE_FUNCTIONS}func f() {{ {call}"),
+			true,
+		)
+		.unwrap_or_else(|| panic!("no signature for {call}"));
+		assert_eq!(
+			help.signatures[0].label,
+			"func pair(first: u32, second: u32) -> u32"
+		);
+		assert_eq!(help.active_parameter, Some(1), "{call}");
+	}
+	let help = signature_help(
+		&format!("{SIGNATURE_FUNCTIONS}func f() {{ pair({{ $0"),
+		true,
+	)
+	.unwrap();
+	assert_eq!(help.active_parameter, None);
+}
+
+#[test]
+fn signature_help_chooses_the_innermost_call_and_ignores_comment_commas() {
+	let source =
+		"func outer(a: u32, b: u32) {} func inner(value: u32) -> u32 { value }";
+	for (call, label, active) in [
+		(
+			"outer(inner($0), 2)",
+			"func inner(value: u32) -> u32",
+			Some(0),
+		),
+		(
+			"outer(inner(1), $0)",
+			"func outer(a: u32, b: u32) -> ()",
+			Some(1),
+		),
+		(
+			"outer(1, 2 // a comma ,\n $0)",
+			"func outer(a: u32, b: u32) -> ()",
+			Some(1),
+		),
+	] {
+		let help =
+			signature_help(&format!("{source}func f() {{ {call}; }}"), true)
+				.unwrap();
+		assert_eq!(help.signatures[0].label, label);
+		assert_eq!(help.active_parameter, active);
+	}
+}
+
+#[test]
+fn signature_help_omits_only_an_implicit_method_receiver() {
+	let source = "struct S(); impl S { pub func get(self: Self, count: u32) -> u32 { count } pub func sin(self: Self) -> f64 { 0.0 } }";
+	for (call, expected, active) in [
+		("s.get($0)", "func get(count: u32) -> u32", Some(0)),
+		("s.sin($0)", "func sin() -> f64", None),
+		(
+			"S::get(s, $0)",
+			"func get(self: S, count: u32) -> u32",
+			Some(1),
+		),
+		(
+			"s.get({ count: $0 })",
+			"func get(count: u32) -> u32",
+			Some(0),
+		),
+	] {
+		let help = signature_help(
+			&format!("{source}func f(s: S) {{ {call}; }}"),
+			true,
+		)
+		.unwrap();
+		assert_eq!(help.signatures[0].label, expected);
+		assert_eq!(help.active_parameter, active);
+	}
+}
+
+#[test]
+fn signature_help_instantiates_types_and_keeps_unknown_generic_names() {
+	let source = "func id<T: StackValue>(value: T) -> T { value } struct Point(x: u32, y: u32);";
+	for (call, expected) in [
+		("id::<u32>($0)", "func id(value: u32) -> u32"),
+		("id($0)", "func id(value: ()) -> ()"),
+		("Point(1, $0)", "Point(x: u32, y: u32) -> Point"),
+	] {
+		let help =
+			signature_help(&format!("{source}func f() {{ {call}; }}"), true)
+				.unwrap();
+		assert_eq!(help.signatures[0].label, expected);
+	}
+}
+
+#[test]
+fn signature_help_supports_function_items_references_and_tuple_parameters() {
+	for (body, expected, active) in [
+		(
+			"local g = pair; g(1, $0)",
+			"func g(first: u32, second: u32) -> u32",
+			Some(1),
+		),
+		("cb(1, $0)", "func cb(u32, u32) -> u32", Some(1)),
+		("one(1, $0)", "func one(args: (u32, u32)) -> u32", Some(0)),
+		(
+			"pair(p$0)",
+			"func pair(first: u32, second: u32) -> u32",
+			None,
+		),
+	] {
+		let help = signature_help(&format!("{SIGNATURE_FUNCTIONS}func one(args: (u32, u32)) -> u32 {{ 0 }} func f(cb: func(u32, u32) -> u32, p: (u32, u32)) {{ {body}; }}"), true).unwrap();
+		assert_eq!(help.signatures[0].label, expected);
+		assert_eq!(help.active_parameter, active, "{body}");
+	}
+}
+
+#[test]
+fn signature_help_offers_nothing_outside_arguments_or_for_unresolved_calls() {
+	for body in [
+		"pair$0(1, 2);",
+		"pair(1, 2)$0;",
+		"unknown($0);",
+		"// pair($0\n",
+		"local text = \"pair($0\";",
+	] {
+		assert_eq!(
+			signature_help(
+				&format!("{SIGNATURE_FUNCTIONS}func f() {{ {body} }}"),
+				true
+			),
+			None,
+			"{body}"
+		);
+	}
+}
+
+#[test]
+fn signature_help_uses_trait_parameter_names_and_bound_methods() {
+	let source =
+		"trait Get: StackValue { func get(self: Self, count: u32) -> u32; }
+	struct S(); impl Get for S { func get(self: Self, u32) -> u32 { 0 } }";
+	for function in [
+		"func f(s: S) { s.get({ count: $0 }); }",
+		"func f<T: Get>(s: T) { s.get($0); }",
+	] {
+		let help =
+			signature_help(&format!("{source}{function}"), true).unwrap();
+		assert_eq!(help.signatures[0].label, "func get(count: u32) -> u32");
+		assert_eq!(help.active_parameter, Some(0));
+	}
+}
+
+#[test]
+fn signature_help_reads_custom_call_signatures_and_generic_constructors() {
+	let source = "struct C(); impl Call for C {
+	    type Args = (u32, u32); type Result = u32;
+	    func call(self: Self, args: (u32, u32)) -> u32 { 0 }
+	}
+	struct Point<T: StackValue>(x: T, y: T);
+	func pick<T: StackValue>(a: T, b: T) -> T { a }";
+	for (call, label) in [
+		("c(1, $0)", "func c(args: (u32, u32)) -> u32"),
+		("Point::<u32>($0)", "Point(x: u32, y: u32) -> Point<u32>"),
+		("Point($0)", "Point(x: T, y: T) -> Point<T>"),
+		("pick($0)", "func pick(a: T, b: T) -> T"),
+	] {
+		let help = signature_help(
+			&format!("{source}func f(c: C) {{ {call}; }}"),
+			true,
+		)
+		.unwrap();
+		assert_eq!(help.signatures[0].label, label, "{call}");
+	}
+}
+
+#[test]
+fn signature_help_renders_parameter_labels_and_documentation() {
+	use tower_lsp_server::ls_types::{Documentation, ParameterLabel};
+
+	let source = "/// Reads a value.\nfunc read(alpha: u32, beta: u32) {}\nfunc f() { local text: [u8; 4] = \"😀\"; read(1, $0); }";
+	for offsets in [true, false] {
+		let help = signature_help(source, offsets).unwrap();
+		let signature = &help.signatures[0];
+		assert_eq!(signature.label, "func read(alpha: u32, beta: u32) -> ()");
+		assert_eq!(signature.active_parameter, Some(1));
+		let parameters = signature.parameters.as_ref().unwrap();
+		if offsets {
+			assert_eq!(
+				parameters[0].label,
+				ParameterLabel::LabelOffsets([10, 20])
+			);
+			assert_eq!(
+				parameters[1].label,
+				ParameterLabel::LabelOffsets([22, 31])
+			);
+		} else {
+			assert_eq!(
+				parameters[0].label,
+				ParameterLabel::Simple("alpha: u32".into())
+			);
+			assert_eq!(
+				parameters[1].label,
+				ParameterLabel::Simple("beta: u32".into())
+			);
+		}
+		let Some(Documentation::MarkupContent(doc)) = &signature.documentation
+		else {
+			panic!("missing documentation");
+		};
+		assert_eq!(doc.value, "Reads a value.");
+	}
+}
+
+#[test]
+fn completion_labels_name_the_trait_that_supplies_a_method() {
+	let source = "trait Named: StackValue { func named(self: Self) -> u32; }
+	trait Defaulted: StackValue { func defaulted(self: Self) -> u32 { 0 } }
+	struct S(pub field: u32);
+	impl S { pub func inherent(self: Self) -> u32 { self.field } }
+	impl Named for S { func named(self: Self) -> u32 { self.field } }
+	impl Defaulted for S {}
+	func f(s: S) { s.$0 }";
+	let items = completion_items(source, true).unwrap();
+	assert_eq!(
+		items
+			.iter()
+			.skip(1)
+			.map(|item| item.detail.as_deref())
+			.collect::<Vec<_>>(),
+		[
+			Some("func inherent(self: S) -> u32"),
+			Some("func named(self: S) -> u32"),
+			Some("func defaulted(self: Self) -> u32"),
+		]
+	);
+	assert_eq!(
+		items
+			.iter()
+			.skip(1)
+			.map(|item| item
+				.label_details
+				.as_ref()
+				.and_then(|details| details.description.as_deref()))
+			.collect::<Vec<_>>(),
+		[
+			Some("func(self: S) -> u32"),
+			Some("func(self: S) -> u32"),
+			Some("func(self: Self) -> u32"),
+		]
+	);
+	let labels: Vec<_> = items
+		.iter()
+		.map(|item| {
+			(
+				item.label.as_str(),
+				item.label_details
+					.as_ref()
+					.and_then(|details| details.detail.as_deref()),
+				item.insert_text.as_deref(),
+			)
+		})
+		.collect();
+	assert_eq!(
+		labels,
+		[
+			("field", None, None),
+			("inherent()", None, Some("inherent()")),
+			("named()", Some("(as Named)"), Some("named()")),
+			("defaulted()", Some("(as Defaulted)"), Some("defaulted()")),
+		]
+	);
+}
+
+#[test]
+fn completion_labels_name_a_methods_declaring_supertrait() {
+	let items = completion_items(
+		"trait Named: StackValue { func named(self: Self) -> u32; }
+		trait Sub: Named {}
+		func f<T: Sub>(s: T) { s.$0 }",
+		false,
+	)
+	.unwrap();
+	assert_eq!(items.len(), 1);
+	assert_eq!(items[0].label, "named()");
+	assert_eq!(
+		items[0].label_details.as_ref().unwrap().detail.as_deref(),
+		Some("(as Named)")
+	);
+	assert_eq!(items[0].insert_text.as_deref(), Some("named"));
+}
+
+#[test]
+fn completion_omits_secondary_labels_for_clients_without_support() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = "trait Named: StackValue { func named(self: Self) -> u32; }
+	func f<T: Named>(s: T) { s. }";
+	let (mut state, _) = analyzed(&root, source);
+	let mut position = position_of(source, "s.", 0);
+	position.character += 2;
+	let params = tower_lsp_server::ls_types::CompletionParams {
+		text_document_position: TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier {
+				uri: Uri::from_file_path(root).unwrap(),
+			},
+			position,
+		},
+		work_done_progress_params: Default::default(),
+		partial_result_params: Default::default(),
+		context: None,
+	};
+	let Some(tower_lsp_server::ls_types::CompletionResponse::Array(items)) =
+		crate::completion::completion(&mut state, &params)
+	else {
+		panic!("a member site");
+	};
+	assert_eq!(items.len(), 1);
+	assert_eq!(items[0].label, "named()");
+	assert_eq!(items[0].label_details, None);
+}
+
+#[test]
+fn completion_documentation_renders_item_doc_comments_as_markdown() {
+	use tower_lsp_server::ls_types::{
+		Documentation, MarkupContent, MarkupKind,
+	};
+
+	let items = completion_items(
+		"/// Computes **a value** using `x`.
+		///
+		/// More details.
+		func documented(x: u32) -> u32 { x }
+		func plain() {}
+		func f() { $0 }",
+		false,
+	)
+	.unwrap();
+	let documented = items
+		.iter()
+		.find(|item| item.filter_text.as_deref() == Some("documented"))
+		.unwrap();
+	assert_eq!(
+		documented.detail.as_deref(),
+		Some("func documented(x: u32) -> u32")
+	);
+	assert_eq!(
+		documented.documentation,
+		Some(Documentation::MarkupContent(MarkupContent {
+			kind: MarkupKind::Markdown,
+			value: "Computes **a value** using `x`.\n\nMore details.".into(),
+		}))
+	);
+	assert_eq!(
+		items
+			.iter()
+			.find(|item| item.filter_text.as_deref() == Some("plain"))
+			.unwrap()
+			.documentation,
+		None
+	);
+}
+
+#[test]
+fn completion_documentation_uses_the_selected_methods_declaration() {
+	use tower_lsp_server::ls_types::{
+		Documentation, MarkupContent, MarkupKind,
+	};
+
+	let items = completion_items(
+		"trait Tr: StackValue {
+		    func get(self: Self) -> u32;
+		    /// The default method.
+		    func defaulted(self: Self) -> u32 { 0 }
+		}
+		/// Documentation for the struct.
+		struct S(pub field: u32);
+		impl S { pub func plain(self: Self) {} }
+		impl Tr for S {
+		    /// Reads **this** value.
+		    ///
+		    /// Returned in `u32`.
+		    func get(self: Self) -> u32 { self.field }
+		}
+		func f(s: S) { s.$0 }",
+		true,
+	)
+	.unwrap();
+	for (label, expected) in [
+		("field", None),
+		("plain", None),
+		("get", Some("Reads **this** value.\n\nReturned in `u32`.")),
+		("defaulted", Some("The default method.")),
+	] {
+		let item = items
+			.iter()
+			.find(|item| {
+				item.filter_text.as_deref().unwrap_or(&item.label) == label
+			})
+			.unwrap();
+		assert_eq!(
+			item.documentation,
+			expected.map(|value| Documentation::MarkupContent(MarkupContent {
+				kind: MarkupKind::Markdown,
+				value: value.into(),
+			})),
+			"{label}"
+		);
+	}
+}
+
+#[test]
+fn completion_documentation_does_not_use_a_functions_docs_for_its_parameters() {
+	for (source, label) in [
+		(
+			"/// The function.\nfunc f(parameter: u32) { $0 }",
+			"parameter",
+		),
+		(
+			"/// The function.\nfunc f(parameter: u32) {}\nfunc g() { f({ $0 }); }",
+			"parameter",
+		),
+	] {
+		let items = completion_items(source, false).unwrap();
+		assert_eq!(
+			items
+				.iter()
+				.find(|item| item.filter_text.as_deref().unwrap_or(&item.label)
+					== label)
+				.unwrap()
+				.documentation,
+			None
+		);
+	}
+}
+
+#[test]
+fn completion_displays_call_punctuation_and_compact_signatures() {
+	for (access, snippets, get_insert, set_insert) in [
+		("p.$0", true, Some("get()"), Some("set($1)")),
+		("p.$0", false, Some("get"), Some("set")),
+		("p.ge$0()", true, Some("get"), Some("set")),
+	] {
+		let items = completion_items(
+			&format!(
+				"{MEMBER_RECEIVERS}func f(p: heap::*Inner) {{ {access}; }}"
+			),
+			snippets,
+		)
+		.unwrap();
+		assert_eq!(
+			items
+				.iter()
+				.map(|item| item.label.as_str())
+				.collect::<Vec<_>>(),
+			["z", "a", "get()", "set(…)"]
+		);
+		assert_eq!(items[0].label_details, None);
+		assert_eq!(items[1].label_details, None);
+		for (label, punctuation, description, inserted) in [
+			("get", "()", "func(self: heap::&Inner) -> u32", get_insert),
+			(
+				"set",
+				"(…)",
+				"func(self: heap::*Inner, u32) -> ()",
+				set_insert,
+			),
+		] {
+			let item = items
+				.iter()
+				.find(|item| {
+					item.filter_text.as_deref().unwrap_or(&item.label) == label
+				})
+				.unwrap();
+			let details = item.label_details.as_ref().unwrap();
+			assert_eq!(item.label, format!("{label}{punctuation}"));
+			assert_eq!(item.filter_text.as_deref(), Some(label));
+			assert_eq!(details.detail, None);
+			assert_eq!(details.description.as_deref(), Some(description));
+			assert_eq!(item.insert_text.as_deref(), inserted);
+		}
+	}
+}
+
+#[test]
+fn completion_displays_call_punctuation_for_functions_and_constructors() {
+	let items = completion_items("func zero() {} func one(value: u32) -> u32 { value } struct Empty(); struct Pair(a: u32, b: u32); func f() { $0 }", false).unwrap();
+	for (label, punctuation, description) in [
+		("zero", "()", "func() -> ()"),
+		("one", "(…)", "func(u32) -> u32"),
+		("Empty", "()", "func() -> Empty"),
+		("Pair", "(…)", "func(u32, u32) -> Pair"),
+	] {
+		let item = items
+			.iter()
+			.find(|item| {
+				item.filter_text.as_deref().unwrap_or(&item.label) == label
+			})
+			.unwrap();
+		let details = item.label_details.as_ref().unwrap();
+		assert_eq!(item.label, format!("{label}{punctuation}"));
+		assert_eq!(item.filter_text.as_deref(), Some(label));
+		assert_eq!(details.detail, None);
+		assert_eq!(details.description.as_deref(), Some(description));
+		assert_eq!(item.insert_text.as_deref(), Some(label));
+		assert_eq!(item.insert_text_format, None);
+	}
+}
+
+#[test]
+fn named_argument_completion_instantiates_a_methods_self_type() {
+	for call in ["x.add({ $0 })", "x.add({ rh$0 })", "x.add({ rhs$0: 0.0 })"] {
+		let items =
+			completion_items(&format!("func f(x: f64) {{ {call}; }}"), false)
+				.unwrap();
+		assert_eq!(
+			items
+				.iter()
+				.map(|item| item.label.as_str())
+				.collect::<Vec<_>>(),
+			["rhs"]
+		);
+		assert_eq!(items[0].detail.as_deref(), Some("rhs: f64"), "{call}");
+	}
+}
+
+#[test]
+fn named_argument_completion_uses_inferred_and_explicit_generic_arguments() {
+	let declarations = "func choose<T: StackValue>(first: T, second: T) -> T { first }\nstruct Pair<T: StackValue>(first: T, second: T);";
+	for (function, expected) in [
+		(
+			"func f(x: f64) { choose({ first: x, $0 }); }",
+			vec![("second", "second: f64")],
+		),
+		(
+			"func f() { choose::<u32>({ $0 }); }",
+			vec![("first", "first: u32"), ("second", "second: u32")],
+		),
+		(
+			"func f() { choose({ $0 }); }",
+			vec![("first", "first: T"), ("second", "second: T")],
+		),
+		(
+			"func f<T: StackValue>(x: T) { choose({ first: x, $0 }); }",
+			vec![("second", "second: T")],
+		),
+		(
+			"func f(x: u32) { Pair({ first: x, $0 }); }",
+			vec![("second", "second: u32")],
+		),
+	] {
+		let items =
+			completion_items(&format!("{declarations}{function}"), false)
+				.unwrap();
+		assert_eq!(
+			items
+				.iter()
+				.map(|item| (
+					item.label.as_str(),
+					item.detail.as_deref().unwrap()
+				))
+				.collect::<Vec<_>>(),
+			expected,
+			"{function}"
+		);
+	}
+}
+
+#[test]
+fn named_argument_completion_normalizes_associated_types_when_known() {
+	let declarations = "trait Has: StackValue {
+	    type Item: StackValue;
+	    func put(self: Self, value: Self::Item) {}
+	}
+	struct S(); impl Has for S { type Item = u32; }";
+	for (function, expected) in [
+		("func f(s: S) { s.put({ $0 }); }", "value: u32"),
+		(
+			"func f<T: Has>(s: T) { s.put({ $0 }); }",
+			"value: <T as Has>::Item",
+		),
+	] {
+		let items =
+			completion_items(&format!("{declarations}{function}"), false)
+				.unwrap();
+		assert_eq!(items.len(), 1);
+		assert_eq!(items[0].label, "value");
+		assert_eq!(items[0].detail.as_deref(), Some(expected), "{function}");
+	}
+}
+
+#[test]
+fn named_argument_completion_keeps_the_traits_parameter_names() {
+	let declarations =
+		"trait Tr: StackValue { func take(self: Self, rhs: Self); }
+	struct S(); impl Tr for S { func take(self: Self, _: Self) {} }";
+	for (call, expected) in [
+		("s.take({ $0 })", vec![("rhs", "rhs: S")]),
+		(
+			"S::take({ $0 })",
+			vec![("rhs", "rhs: S"), ("self", "self: S")],
+		),
+	] {
+		let items = completion_items(
+			&format!("{declarations}func f(s: S) {{ {call}; }}"),
+			false,
+		)
+		.unwrap();
+		assert_eq!(
+			items
+				.iter()
+				.map(|item| (
+					item.label.as_str(),
+					item.detail.as_deref().unwrap()
+				))
+				.collect::<Vec<_>>(),
+			expected,
+			"{call}"
+		);
+	}
+}
+
+#[test]
+fn named_argument_completion_keeps_declaration_types_without_a_checked_call() {
+	let items = completion_items(
+		"memory heap: u32;
+		trait Tr: StackValue { func take(self: Self, rhs: Self); }
+		func f<T: Tr>(p: heap::&T) { p.take({ $0 }); }",
+		false,
+	)
+	.unwrap();
+	assert_eq!(items.len(), 1);
+	assert_eq!(items[0].label, "rhs");
+	assert_eq!(items[0].detail.as_deref(), Some("rhs: Self"));
 }

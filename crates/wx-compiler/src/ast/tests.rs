@@ -4694,3 +4694,55 @@ fn a_label_with_no_name_keeps_its_jump() {
 	assert_eq!(label.span, TextSpan::new(25, 25), "right after the `:`");
 	assert!(value.is_none(), "the `}}` closes the loop");
 }
+
+#[test]
+fn unfinished_calls_keep_the_cursor_and_the_following_statement() {
+	for call in ["f(", "f(1,", "f({", "f({ a:", "f({ a: 1,", "f({ a: 1 }"] {
+		let source = format!("func g() {{ {call}   ");
+		let case = TestCase::new(&source);
+		let entries = case.function_block(0);
+		assert_eq!(entries.len(), 1, "{call}");
+		let expr = match entries[0] {
+			Entry::Tail(expr)
+			| Entry::Statement(Statement::Expression(expr)) => expr,
+			_ => panic!("no call in {call}"),
+		};
+		assert!(
+			matches!(
+				case.ast.expr(expr),
+				Expression::Call { .. } | Expression::NamedCall { .. }
+			),
+			"{call}"
+		);
+		assert_eq!(
+			case.ast.expr_span(expr).end as usize,
+			source.len(),
+			"{call}"
+		);
+
+		let case = TestCase::new(&format!(
+			"func g() {{ {call}\n local after: u32 = 2; }}\nfunc next() {{}}"
+		));
+		assert_eq!(case.local_patterns(0), ["after"], "{call}");
+		assert_eq!(
+			case.name(case.function_signature(1).name.inner),
+			"next",
+			"{call}"
+		);
+	}
+}
+
+#[test]
+fn unfinished_groups_preserve_the_next_statement() {
+	for value in ["[1,", "(1,", "[(1,", "([1,)", "[(1,]"] {
+		let case = TestCase::new(&format!(
+			"func f() {{ local x = {value}\nlocal next: u32 = 2; }}\nfunc after() {{}}"
+		));
+		assert_eq!(case.local_patterns(0), ["x", "next"], "{value}");
+		assert_eq!(
+			case.name(case.function_signature(1).name.inner),
+			"after",
+			"{value}"
+		);
+	}
+}
