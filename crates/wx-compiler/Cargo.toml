@@ -24,6 +24,11 @@ harness = false
 # and fails on the missing import.
 required-features = ["bench"]
 
+[[bench]]
+name = "parser"
+harness = false
+required-features = ["bench"]
+
 [dependencies]
 codespan-reporting = { workspace = true, features = ["serialization"] }
 leb128fmt = "0.1.0"

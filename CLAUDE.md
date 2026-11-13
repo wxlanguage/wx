@@ -143,7 +143,7 @@ The core is embedded at build time by `crates/wx-compiler/build.rs`, which walks
 
 ## Key modules (`crates/wx-compiler/src/`)
 
-- **`ast/`** — lexer + parser → AST nodes
+- **`ast/`** — `mod.rs` (the tree), `lexer.rs` (tokens, on-demand lexer), `parser.rs` (recursive descent + Pratt loop, its `report_*` diagnostics); `benches/parser.rs` measures it. Being moved to an arena: `notes/ast-arena-plan.md`
 - **`tir/`** (live) — `decls.rs` (phase 1 prescan → `Declarations`), `imports.rs` (`use`/glob resolution), `paths.rs` (shared path walking), `impls.rs` (`ImplDispatch`), `types.rs` (`TypeInterner`, `GenericEnvArena`), `signatures.rs` (`Semantics`, `SemanticsBuilder`, `ensure_signature`, `build`), plus `bounds.rs`, `obligations.rs` (`Obligation`, `ObligationChecker`), `solver.rs`, `satisfaction.rs`, `members.rs`, `literals.rs`, `format.rs`; bodies: `body.rs` (`Body`: expressions, scopes, locals, labels, places, patterns, match arms, as columns; every checked body lives in `Semantics::bodies` and its owner holds a `BodyIdx`; a `local` opens the rest of its block as a `ScopeKind::Remainder` scope, so each scope declares one run of locals and `Body::locals_at` reads what is in scope from the scope tree alone), `typecheck.rs` + `typecheck/` (`BodyContext`), `operators.rs`, `eval.rs` (constant evaluation, on the solver), `usefulness.rs`
 - **`tir/lower.rs` + `tir/lower/`** — TIR → MIR lowering (`constants`, `intrinsics`, `patterns`, `places`, `shapes`, `statics`): monomorphization on a `FunctionInstance` worklist, layouts from `tir/layout.rs`, static data from the evaluator
 - **`tir/mod.rs`** — module wiring and the `check`/`lower` entry points
