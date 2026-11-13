@@ -1,7 +1,7 @@
 //! The lexer: source text to tokens, on demand. Comments and unknown
 //! characters are recorded on the side and never reach the parser.
 
-use super::{Comment, CommentKind, Spanned};
+use super::{Comment, CommentKind, Keyword, Spanned};
 use crate::diagnostics::TextSpan;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -12,7 +12,12 @@ pub enum Token {
 	Float,
 	Char,
 	String,
+	/// A name: a word that is not a keyword.
 	Identifier,
+	/// A word the language reserves, classified once, here. `self`, `Self`,
+	/// `super`, `package` and `_` are keywords that also name things; which
+	/// of them a name may be is the parser's to say where it reads one.
+	Keyword(Keyword),
 	// Delimiters
 	Colon,
 	ColonColon,
@@ -68,6 +73,8 @@ pub enum Token {
 	Eof,
 }
 
+const _: () = assert!(size_of::<Token>() == 1);
+
 impl std::fmt::Display for Token {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		use Token::*;
@@ -77,6 +84,7 @@ impl std::fmt::Display for Token {
 			Char => "char",
 			String => "string",
 			Identifier => "identifier",
+			Keyword(keyword) => keyword.as_str(),
 			Colon => ":",
 			ColonColon => "::",
 			SemiColon => ";",
@@ -148,7 +156,7 @@ pub fn bench_lex_to_eof(src: &str) -> usize {
 
 pub(super) struct Lexer<'src> {
 	pub(super) chars: std::str::Chars<'src>,
-	pub(super) src_len: usize,
+	pub(super) source: &'src str,
 	pub(super) peeked: Option<Spanned<Token>>,
 	pub(super) comments: Vec<Comment>,
 	pub(super) has_crlf: bool,
@@ -161,7 +169,7 @@ impl<'src> Lexer<'src> {
 	pub(super) fn new(input: &'src str) -> Lexer<'src> {
 		Lexer {
 			chars: input.chars(),
-			src_len: input.len(),
+			source: input,
 			peeked: None,
 			comments: Vec::new(),
 			has_crlf: false,
@@ -171,7 +179,7 @@ impl<'src> Lexer<'src> {
 
 	/// Current byte offset into the source.
 	pub(super) fn offset(&self) -> usize {
-		self.src_len - self.chars.as_str().len()
+		self.source.len() - self.chars.as_str().len()
 	}
 
 	pub(super) fn peek(&mut self) -> Spanned<Token> {
@@ -280,7 +288,7 @@ impl<'src> Lexer<'src> {
 		let token = match self.chars.next().unwrap_or(EOF) {
 			// Patterns are ordered by frequency of occurrence in typical source code
 			// Most Frequent
-			'A'..='Z' | 'a'..='z' | '_' => self.consume_identifier(),
+			'A'..='Z' | 'a'..='z' | '_' => self.consume_word(start),
 			'0'..='9' => self.consume_number(),
 
 			// Common Punctuation & Operators
@@ -489,12 +497,14 @@ impl<'src> Lexer<'src> {
 		self.chars = cursor;
 	}
 
+	/// An identifier, or the keyword it spells.
 	#[inline]
-	pub(super) fn consume_identifier(&mut self) -> Token {
+	pub(super) fn consume_word(&mut self, start: u32) -> Token {
 		self.eat_while(
 			|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'),
 		);
-		Token::Identifier
+		let word = &self.source[start as usize..self.offset()];
+		Keyword::try_from(word).map_or(Token::Identifier, Token::Keyword)
 	}
 
 	pub(super) fn consume_number(&mut self) -> Token {

@@ -652,6 +652,23 @@ fn test_impl_trait_for_type() {
 }
 
 #[test]
+fn test_function_name_cannot_be_a_keyword() {
+	// A function's name is a name like any other item's: a keyword is
+	// reported as reserved, once, and the rest of the function is still read.
+	for source in [
+		"func memory() {}",
+		"func local(x: u32) -> u32 { x }",
+		"trait T { func loop(self: Self); }",
+		"impl P { func match() {} }",
+		"import \"env\" as env { func global(); }",
+	] {
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
+	}
+}
+
+#[test]
 fn test_impl_placeholder_is_rejected_by_parser() {
 	let case = TestCase::new("impl _ {}");
 	case.diagnostics()

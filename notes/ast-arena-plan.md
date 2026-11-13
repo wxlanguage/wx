@@ -1,6 +1,6 @@
 # The AST as an arena
 
-Status as of 2026-11-13, branch `tir-refactor`. Steps 1 and 2 are done; the
+Status as of 2026-11-13, branch `tir-refactor`. Steps 1–3 are done; the
 rest is the plan. The decisions under "Design" were taken with the
 recommendations below and can be revisited as the port shows what they cost.
 
@@ -169,8 +169,19 @@ building.
    a move only, with `pub(super)` where the parser and the tests reach into
    the lexer. `BracketedRoot` and the operators' `TryFrom<Token>` impls moved
    to the parser, their only user.
-3. Keywords classified in the lexer; the Pratt tables replaced by matches.
-   Measured on its own.
+3. **Done.** Keywords classified in the lexer (`Token::Keyword`, one byte);
+   the parser reads a name through `expect_name(allowed)`, which accepts an
+   identifier or one of the keywords that name something where it is read
+   and reports any other as reserved, replacing the `next_expect(Identifier)`
+   + `intern_identifier` pairs and four hand-written variants of it. The
+   Pratt tables became `starts_expression`, `parse_prefix` and
+   `infix_power`; the postfix handlers lost their unused power parameter
+   and `BindingPower::Primary` went. Speed-neutral, as measured: the lexer
+   pays for the classification (0.64 → 0.80 ms) what the parser saves
+   (lex + parse 2.90 → 2.87 ms); the gain is the code (−180 lines). It also
+   fixed an inconsistency in the grammar: a function's name could be a
+   keyword (`func memory(..)`), read silently where every other item's name
+   reports it as reserved; it is now a name like the others.
 4. The arena, bottom-up, each with its consumers ported:
    1. types (`TypeExpression`, path segments, bounds, type arguments);
    2. patterns;
@@ -189,10 +200,11 @@ building.
 
 | | before | after step 3 | after step 4 |
 |---|---|---|---|
-| lex + parse | 2.90 ms | | |
-| drop tree | 0.48 ms | | |
-| allocations/token | 0.86 | | |
-| retained bytes/token | 49.2 | | |
+| lex | 0.64 ms | 0.80 ms | |
+| lex + parse | 2.90 ms | 2.87 ms | |
+| drop tree | 0.48 ms | 0.49 ms | |
+| allocations/token | 0.86 | 0.86 | |
+| retained bytes/token | 49.2 | 49.2 | |
 
 The expected outcome, an estimate to be checked against this table: parsing
 about 1.6–1.9 ms, dropping near zero, the retained tree about a third of its

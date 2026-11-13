@@ -497,7 +497,6 @@ pub(super) enum BindingPower {
 	Unary,
 	Postfix,
 	Member,
-	Primary,
 }
 
 impl From<BinaryOp> for BindingPower {
@@ -827,9 +826,7 @@ impl<'ctx> Parser<'ctx> {
 		token: Spanned<Token>,
 	) -> Result<fn(parser: &mut Parser) -> Result<Spanned<Item>, ()>, ()> {
 		let keyword = match token.inner {
-			Token::Identifier => {
-				Keyword::try_from(token.span.extract_str(self.source)).ok()
-			}
+			Token::Keyword(keyword) => Some(keyword),
 			_ => None,
 		};
 
@@ -874,38 +871,55 @@ impl<'ctx> Parser<'ctx> {
 
 	#[inline]
 	fn peek_keyword(&mut self) -> Option<Keyword> {
-		let token = self.lexer.peek();
-		match token.inner {
-			Token::Identifier => {
-				Keyword::try_from(token.span.extract_str(self.source)).ok()
-			}
+		match self.lexer.peek().inner {
+			Token::Keyword(keyword) => Some(keyword),
 			_ => None,
 		}
 	}
 
-	/// Whether the identifier token at `span` spells a keyword.
-	fn is_keyword(&self, span: TextSpan) -> bool {
-		Keyword::try_from(span.extract_str(self.source)).is_ok()
+	/// Whether `token` may follow a `::`: any name, and `super`
+	/// (`super::super::x`). Another keyword is the next statement's, after a
+	/// path the user has not finished (`a::` on a line of its own, then
+	/// `local ..`).
+	fn is_later_segment(token: Token) -> bool {
+		matches!(token, Token::Identifier | Token::Keyword(Keyword::Super))
 	}
 
-	/// Whether the identifier token at `span` may follow a `::`: any name,
-	/// and `super` (`super::super::x`). Another keyword is the next
-	/// statement's, after a path the user has not finished (`a::` on a line
-	/// of its own, then `local ..`).
-	fn is_later_segment(&self, span: TextSpan) -> bool {
-		matches!(
-			Keyword::try_from(span.extract_str(self.source)),
-			Err(_) | Ok(Keyword::Super)
-		)
-	}
-
-	fn intern_identifier(&mut self, span: TextSpan) -> SymbolU32 {
-		if self.is_keyword(span) {
-			self.ast
-				.diagnostics
-				.push(report_reserved_identifier(self.ast.file_id, span));
-		}
-		self.strings.get_or_intern(span.extract_str(self.source))
+	/// A name: an identifier, or one of the keywords in `allowed`, which name
+	/// something where this one is read (`self`, `Self`, `super`, `package`,
+	/// `_`). Any other keyword is reported as reserved and read as the name it
+	/// spells, so what follows it is still parsed.
+	fn expect_name(
+		&mut self,
+		allowed: &[Keyword],
+	) -> Result<Spanned<SymbolU32>, ()> {
+		let token = self.lexer.next();
+		let inner = match token.inner {
+			Token::Identifier => self
+				.strings
+				.get_or_intern(token.span.extract_str(self.source)),
+			Token::Keyword(keyword) => {
+				if !allowed.contains(&keyword) {
+					self.ast.diagnostics.push(report_reserved_identifier(
+						self.ast.file_id,
+						token.span,
+					));
+				}
+				keyword.symbol()
+			}
+			_ => {
+				self.ast.diagnostics.push(report_unexpected_token(
+					self.ast.file_id,
+					token,
+					Token::Identifier,
+				));
+				return Err(());
+			}
+		};
+		Ok(Spanned {
+			inner,
+			span: token.span,
+		})
 	}
 
 	fn parse_attributes(parser: &mut Parser) -> Result<Box<[Attribute]>, ()> {
@@ -917,7 +931,10 @@ impl<'ctx> Parser<'ctx> {
 			parser.lexer.next();
 			let open_bracket = parser.next_expect(Token::OpenBracket)?;
 			let name_token = parser.lexer.peek();
-			if name_token.inner != Token::Identifier {
+			if !matches!(
+				name_token.inner,
+				Token::Identifier | Token::Keyword(_)
+			) {
 				parser.ast.diagnostics.push(report_invalid_attribute(
 					parser.ast.file_id,
 					name_token.span,
@@ -979,11 +996,8 @@ impl<'ctx> Parser<'ctx> {
 			_ => {
 				let mut arguments = Vec::new();
 				loop {
-					let name_span = parser.next_expect(Token::Identifier)?.span;
-					let name = Spanned {
-						inner: parser.intern_identifier(name_span),
-						span: name_span,
-					};
+					let name = parser.expect_name(&[])?;
+					let name_span = name.span;
 					parser.next_expect(Token::Eq)?;
 					let value =
 						parser.parse_expression(BindingPower::Default)?;
@@ -1054,13 +1068,12 @@ impl<'ctx> Parser<'ctx> {
 		let mut_span = matches!(parser.peek_keyword(), Some(Keyword::Mut))
 			.then(|| parser.lexer.next().span);
 
-		let token = parser.lexer.peek();
-		let keyword = Keyword::try_from(token.span.extract_str(parser.source));
-		let named = token.inner == Token::Identifier
-			&& matches!(
-				keyword,
-				Err(_) | Ok(Keyword::Underscore | Keyword::SelfLower)
-			);
+		let token = parser.lexer.peek().inner;
+		let named = matches!(
+			token,
+			Token::Identifier
+				| Token::Keyword(Keyword::Underscore | Keyword::SelfLower)
+		);
 		if !named {
 			if let Some(mut_span) = mut_span {
 				parser.ast.diagnostics.push(report_mut_without_name(
@@ -1072,9 +1085,9 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		let name_span = parser.lexer.next().span;
-		let underscore = matches!(keyword, Ok(Keyword::Underscore));
+		let underscore = token == Token::Keyword(Keyword::Underscore);
 		// `self` is never a type, so it is always a name.
-		let receiver = matches!(keyword, Ok(Keyword::SelfLower));
+		let receiver = token == Token::Keyword(Keyword::SelfLower);
 		let name = Spanned {
 			inner: parser
 				.strings
@@ -1174,27 +1187,7 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 	) -> Result<Spanned<FunctionSignature>, ()> {
 		let fn_span = self.lexer.next();
-		let name_token = self.lexer.peek();
-		let name_span = match name_token.inner {
-			Token::Identifier => self.lexer.next().span,
-			_ => {
-				return {
-					self.ast.diagnostics.push(report_unexpected_token(
-						self.ast.file_id,
-						name_token,
-						Token::Identifier,
-					));
-					Err(())
-				};
-			}
-		};
-		let name_symbol = self
-			.strings
-			.get_or_intern(name_span.extract_str(self.source));
-		let name = Spanned {
-			inner: name_symbol,
-			span: name_span,
-		};
+		let name = self.expect_name(&[])?;
 
 		let type_params = if self.lexer.peek().inner == Token::LeftArrow {
 			self.parse_type_params()?
@@ -1319,19 +1312,7 @@ impl<'ctx> Parser<'ctx> {
 			};
 			// `Self` is a name here, as `self` is among a function's
 			// parameters; where it may stand is the signature's to check.
-			let self_type =
-				matches!(self.peek_keyword(), Some(Keyword::SelfPascal));
-			let name_span = self.next_expect(Token::Identifier)?.span;
-			let name_symbol = if self_type {
-				self.strings
-					.get_or_intern(name_span.extract_str(self.source))
-			} else {
-				self.intern_identifier(name_span)
-			};
-			let name = Spanned {
-				inner: name_symbol,
-				span: name_span,
-			};
+			let name = self.expect_name(&[Keyword::SelfPascal])?;
 
 			let (param, end) = match const_span {
 				// A constant's type is always written: nothing else says
@@ -1566,11 +1547,7 @@ impl<'ctx> Parser<'ctx> {
 				Some(Keyword::Const) => Some(self.lexer.next().span),
 				_ => None,
 			};
-			let name_span = self.next_expect(Token::Identifier)?.span;
-			let name = Spanned {
-				inner: self.intern_identifier(name_span),
-				span: name_span,
-			};
+			let name = self.expect_name(&[])?;
 			let colon = self.lexer.next_if(Token::Colon);
 			if colon.is_none() {
 				self.next_expect(Token::Eq)?;
@@ -1703,7 +1680,7 @@ impl<'ctx> Parser<'ctx> {
 					let (type_args, _) = self.parse_type_args()?;
 					segments.last_mut().unwrap().type_args = type_args;
 				}
-				Token::Identifier => {
+				Token::Identifier | Token::Keyword(_) => {
 					let ident = self.parse_path_ident()?;
 					segments.push(PathSegment {
 						ident,
@@ -1757,12 +1734,7 @@ impl<'ctx> Parser<'ctx> {
 		let path = self.parse_type_path()?;
 		let path_span = path.span();
 
-		let peeked = self.lexer.peek();
-		if peeked.inner == Token::Identifier
-			&& matches!(
-				Keyword::try_from(peeked.span.extract_str(self.source)),
-				Ok(Keyword::Where)
-			) {
+		if self.peek_keyword() == Some(Keyword::Where) {
 			let bindings = self.parse_where_bindings()?;
 			let span = TextSpan::new(path_span.start, bindings.span.end);
 			return Ok(Spanned {
@@ -1848,44 +1820,26 @@ impl<'ctx> Parser<'ctx> {
 					span,
 				})
 			}
-			Token::Identifier => {
-				let (first_tok, first_sym) = match Keyword::try_from(
-					token.span.extract_str(self.source),
-				) {
-					Ok(Keyword::Underscore) => {
-						let span = self.lexer.next().span;
-						return Ok(Spanned {
-							inner: TypeExpression::Infer,
-							span,
-						});
-					}
-					Ok(Keyword::Func) => {
-						return Parser::parse_function_type_expression(self);
-					}
-					// `Self` is valid in type paths for `Self::AssocType`, etc.;
-					// `crate`/`super` are path roots the resolver
-					// pre-populates every namespace with (see
-					// `intern_path_segment`) — none of the three are ever
-					// reserved here, so they intern like ordinary text.
-					Ok(Keyword::SelfPascal)
-					| Ok(Keyword::Package)
-					| Ok(Keyword::Super) => {
-						let tok = self.lexer.next();
-						let sym = self
-							.strings
-							.get_or_intern(tok.span.extract_str(self.source));
-						(tok, sym)
-					}
-					_ => {
-						let tok = self.lexer.next();
-						let sym = self.intern_identifier(tok.span);
-						(tok, sym)
-					}
-				};
-				self.parse_type_path_from(Spanned {
-					inner: first_sym,
-					span: first_tok.span,
+			Token::Keyword(Keyword::Underscore) => {
+				let span = self.lexer.next().span;
+				Ok(Spanned {
+					inner: TypeExpression::Infer,
+					span,
 				})
+			}
+			Token::Keyword(Keyword::Func) => {
+				Parser::parse_function_type_expression(self)
+			}
+			// `Self` is valid in type paths for `Self::AssocType`, etc.;
+			// `package`/`super` are path roots every namespace binds. Any
+			// other keyword is reported as reserved and read as a name.
+			Token::Identifier | Token::Keyword(_) => {
+				let first = self.expect_name(&[
+					Keyword::SelfPascal,
+					Keyword::Package,
+					Keyword::Super,
+				])?;
+				self.parse_type_path_from(first)
 			}
 			Token::OpenParen => self.parse_tuple_or_paren_type_expression(),
 			Token::OpenBracket => self.parse_slice_type_expression(),
@@ -1939,7 +1893,7 @@ impl<'ctx> Parser<'ctx> {
 			let colons = self.lexer.next(); // consume `::`
 			let next = self.lexer.peek();
 			match next.inner {
-				Token::Identifier if self.is_later_segment(next.span) => {
+				token if Self::is_later_segment(token) => {
 					ident = self.parse_path_ident()?;
 				}
 				Token::Star | Token::Amper => {
@@ -2176,106 +2130,78 @@ impl<'ctx> Parser<'ctx> {
 		}
 	}
 
-	fn nud_lookup(
-		&mut self,
-		token: Spanned<Token>,
-	) -> Option<(
-		fn(parser: &mut Parser) -> Result<Spanned<Expression>, ()>,
-		BindingPower,
-	)> {
-		match token.inner {
-			Token::Identifier => {
-				match Keyword::try_from(token.span.extract_str(self.source)) {
-					Ok(Keyword::Return) => Some((
-						Parser::parse_return_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::If) => Some((
-						Parser::parse_if_else_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::Loop) => Some((
-						Parser::parse_loop_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::Match) => Some((
-						Parser::parse_match_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::Break) => Some((
-						Parser::parse_break_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::Continue) => Some((
-						Parser::parse_continue_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::Underscore) => Some((
-						Parser::parse_placeholder_expression,
-						BindingPower::Primary,
-					)),
-					Ok(Keyword::Block) => Some((
-						Parser::parse_keyword_block_expression,
-						BindingPower::Primary,
-					)),
-					_ => Some((
-						Parser::parse_path_expression,
-						BindingPower::Primary,
-					)),
-				}
+	/// Whether `token` starts an expression: what [`Parser::parse_prefix`]
+	/// reads. Any word does, a keyword included (`local` read where an
+	/// expression should be is reported as a reserved name, as a path).
+	fn starts_expression(token: Token) -> bool {
+		matches!(
+			token,
+			Token::Identifier
+				| Token::Keyword(_)
+				| Token::Int | Token::Float
+				| Token::String
+				| Token::Char
+				| Token::OpenBrace
+				| Token::OpenParen
+				| Token::OpenBracket
+				| Token::LeftArrow
+				| Token::Minus
+				| Token::Bang
+				| Token::Caret
+		)
+	}
+
+	/// The expression an operand starts with, before any operator: a
+	/// literal, a path, a prefix operator, a bracketed list or a block-like
+	/// expression. The caller has checked [`Parser::starts_expression`].
+	fn parse_prefix(&mut self) -> Result<Spanned<Expression>, ()> {
+		match self.lexer.peek().inner {
+			Token::Keyword(Keyword::Return) => {
+				Parser::parse_return_expression(self)
 			}
-			Token::Int => {
-				Some((Parser::parse_int_expression, BindingPower::Primary))
+			Token::Keyword(Keyword::If) => {
+				Parser::parse_if_else_expression(self)
 			}
-			Token::Float => {
-				Some((Parser::parse_float_expression, BindingPower::Primary))
+			Token::Keyword(Keyword::Loop) => {
+				Parser::parse_loop_expression(self)
 			}
-			Token::OpenBrace => Some((
-				Parser::parse_bare_block_expression,
-				BindingPower::Primary,
-			)),
-			Token::OpenParen => {
-				Some((Parser::parse_tuple_expression, BindingPower::Default))
+			Token::Keyword(Keyword::Match) => {
+				Parser::parse_match_expression(self)
 			}
+			Token::Keyword(Keyword::Break) => {
+				Parser::parse_break_expression(self)
+			}
+			Token::Keyword(Keyword::Continue) => {
+				Parser::parse_continue_expression(self)
+			}
+			Token::Keyword(Keyword::Underscore) => {
+				Parser::parse_placeholder_expression(self)
+			}
+			Token::Keyword(Keyword::Block) => {
+				Parser::parse_keyword_block_expression(self)
+			}
+			Token::Identifier | Token::Keyword(_) => {
+				Parser::parse_path_expression(self)
+			}
+			Token::Int => Parser::parse_int_expression(self),
+			Token::Float => Parser::parse_float_expression(self),
+			Token::String => Parser::parse_string_expression(self),
+			Token::Char => Parser::parse_char_expression(self),
+			Token::OpenBrace => Parser::parse_bare_block_expression(self),
+			Token::OpenParen => Parser::parse_tuple_expression(self),
+			Token::OpenBracket => Parser::parse_array_expression(self),
+			Token::LeftArrow => Parser::parse_qualified_path_expression(self),
 			Token::Minus | Token::Bang | Token::Caret => {
-				Some((Parser::parse_unary_expression, BindingPower::Unary))
+				Parser::parse_unary_expression(self)
 			}
-			Token::String => {
-				Some((Parser::parse_string_expression, BindingPower::Primary))
-			}
-			Token::Char => {
-				Some((Parser::parse_char_expression, BindingPower::Primary))
-			}
-			Token::OpenBracket => {
-				Some((Parser::parse_array_expression, BindingPower::Primary))
-			}
-			Token::LeftArrow => Some((
-				Parser::parse_qualified_path_expression,
-				BindingPower::Primary,
-			)),
-			_ => None,
+			_ => unreachable!("the caller checked `starts_expression`"),
 		}
 	}
 
-	fn led_lookup(
-		&mut self,
-		token: Spanned<Token>,
-	) -> Option<(
-		fn(
-			parser: &mut Parser,
-			left: Spanned<Expression>,
-			bp: BindingPower,
-		) -> Result<Spanned<Expression>, ()>,
-		BindingPower,
-	)> {
-		match token.inner {
-			Token::Plus | Token::Minus => {
-				Some((Parser::parse_binary_expression, BindingPower::Additive))
-			}
-			Token::Star | Token::Slash | Token::Percent => Some((
-				Parser::parse_binary_expression,
-				BindingPower::Multiplicative,
-			)),
+	/// How tightly `token` binds the operand before it, if it continues an
+	/// expression: a binary operator, or a postfix call, index, `.` or `::`.
+	fn infix_power(token: Token) -> Option<BindingPower> {
+		Some(match token {
 			Token::Eq
 			| Token::PlusEq
 			| Token::MinusEq
@@ -2286,57 +2212,29 @@ impl<'ctx> Parser<'ctx> {
 			| Token::VbarEq
 			| Token::CaretEq
 			| Token::DoubleLeftArrowEq
-			| Token::DoubleRightArrowEq => Some((
-				Parser::parse_binary_expression,
-				BindingPower::Assignment,
-			)),
-			Token::DoubleVbar => {
-				Some((Parser::parse_binary_expression, BindingPower::LogicalOr))
-			}
-			Token::DoubleAmper => Some((
-				Parser::parse_binary_expression,
-				BindingPower::LogicalAnd,
-			)),
-			Token::Vbar => {
-				Some((Parser::parse_binary_expression, BindingPower::BitwiseOr))
-			}
-			Token::Caret => Some((
-				Parser::parse_binary_expression,
-				BindingPower::BitwiseXor,
-			)),
-			Token::Amper => Some((
-				Parser::parse_binary_expression,
-				BindingPower::BitwiseAnd,
-			)),
+			| Token::DoubleRightArrowEq => BindingPower::Assignment,
+			Token::DoubleVbar => BindingPower::LogicalOr,
+			Token::DoubleAmper => BindingPower::LogicalAnd,
+			Token::Vbar => BindingPower::BitwiseOr,
+			Token::Caret => BindingPower::BitwiseXor,
+			Token::Amper => BindingPower::BitwiseAnd,
 			Token::EqEq
 			| Token::BangEq
-			| Token::LeftArrowEq
 			| Token::LeftArrow
+			| Token::LeftArrowEq
 			| Token::RightArrow
-			| Token::RightArrowEq => Some((
-				Parser::parse_binary_expression,
-				BindingPower::Comparison,
-			)),
-			Token::DoubleLeftArrow | Token::DoubleRightArrow => Some((
-				Parser::parse_binary_expression,
-				BindingPower::BitwiseShift,
-			)),
-			Token::OpenParen => {
-				Some((Parser::parse_call_expression, BindingPower::Postfix))
+			| Token::RightArrowEq => BindingPower::Comparison,
+			Token::DoubleLeftArrow | Token::DoubleRightArrow => {
+				BindingPower::BitwiseShift
 			}
-			Token::ColonColon => Some((
-				Parser::parse_type_application_expression,
-				BindingPower::Member,
-			)),
-			Token::Dot => Some((
-				Parser::parse_object_access_expression,
-				BindingPower::Member,
-			)),
-			Token::OpenBracket => {
-				Some((Parser::parse_index_expression, BindingPower::Postfix))
+			Token::Plus | Token::Minus => BindingPower::Additive,
+			Token::Star | Token::Slash | Token::Percent => {
+				BindingPower::Multiplicative
 			}
-			_ => None,
-		}
+			Token::OpenParen | Token::OpenBracket => BindingPower::Postfix,
+			Token::Dot | Token::ColonColon => BindingPower::Member,
+			_ => return None,
+		})
 	}
 
 	/// An expression. Like every parse function, it has reported whatever
@@ -2346,16 +2244,13 @@ impl<'ctx> Parser<'ctx> {
 		limit_bp: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
 		let token = self.lexer.peek();
-		let nud_handler = match self.nud_lookup(token) {
-			Some((nud_handler, _)) => nud_handler,
-			None => {
-				self.ast
-					.diagnostics
-					.push(report_expected_expression(self.ast.file_id, token));
-				return Err(());
-			}
-		};
-		let mut left = nud_handler(self)?;
+		if !Self::starts_expression(token.inner) {
+			self.ast
+				.diagnostics
+				.push(report_expected_expression(self.ast.file_id, token));
+			return Err(());
+		}
+		let mut left = self.parse_prefix()?;
 
 		// A block-like expression is never an operand: it fills an
 		// expression position whole and ends at its closing `}`, so no
@@ -2374,10 +2269,9 @@ impl<'ctx> Parser<'ctx> {
 					&left,
 					None,
 				));
-			} else if self
-				.led_lookup(token)
-				.is_some_and(|(_, bp)| bp > limit_bp)
-				&& self.nud_lookup(token).is_none()
+			} else if Self::infix_power(token.inner)
+				.is_some_and(|bp| bp > limit_bp)
+				&& !Self::starts_expression(token.inner)
 			{
 				// A token that can only continue this expression; one that
 				// can also start one (`(`, `[`, `-`) starts whatever comes
@@ -2394,15 +2288,24 @@ impl<'ctx> Parser<'ctx> {
 		}
 
 		loop {
-			let token = self.lexer.peek();
-
-			let (led_handler, operator_bp) = match self.led_lookup(token) {
-				Some((_, bp)) if bp <= limit_bp => break,
-				Some((handler, bp)) => (handler, bp),
-				None => break,
+			let token = self.lexer.peek().inner;
+			let power = match Self::infix_power(token) {
+				Some(power) if power > limit_bp => power,
+				_ => break,
 			};
-
-			left = led_handler(self, left, operator_bp)?;
+			left = match token {
+				Token::OpenParen => Parser::parse_call_expression(self, left)?,
+				Token::OpenBracket => {
+					Parser::parse_index_expression(self, left)?
+				}
+				Token::Dot => {
+					Parser::parse_object_access_expression(self, left)?
+				}
+				Token::ColonColon => {
+					Parser::parse_type_application_expression(self, left)?
+				}
+				_ => Parser::parse_binary_expression(self, left, power)?,
+			};
 		}
 		Ok(left)
 	}
@@ -2439,33 +2342,18 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_path_expression(
 		parser: &mut Parser,
 	) -> Result<Spanned<Expression>, ()> {
-		let token = parser.lexer.next();
-		let text = token.span.extract_str(parser.source);
-
-		match Keyword::try_from(text) {
-			Ok(Keyword::SelfLower)
-			| Ok(Keyword::SelfPascal)
-			| Ok(Keyword::Underscore)
-			| Ok(Keyword::Package)
-			| Ok(Keyword::Super)
-			| Err(_) => {}
-			Ok(_) => {
-				parser.ast.diagnostics.push(report_reserved_identifier(
-					parser.ast.file_id,
-					token.span,
-				));
-			}
-		}
-
-		let symbol = parser.strings.get_or_intern(text);
-		let start = token.span;
+		let first = parser.expect_name(&[
+			Keyword::SelfLower,
+			Keyword::SelfPascal,
+			Keyword::Underscore,
+			Keyword::Package,
+			Keyword::Super,
+		])?;
+		let start = first.span;
 
 		// Start the path with the first segment (no type args yet).
 		let mut segments: Vec<PathSegment> = vec![PathSegment {
-			ident: Spanned {
-				inner: symbol,
-				span: token.span,
-			},
+			ident: first,
 			type_args: Box::new([]),
 		}];
 
@@ -2490,15 +2378,9 @@ impl<'ctx> Parser<'ctx> {
 					);
 				}
 				// `::ident` — next path segment
-				Token::Identifier if parser.is_later_segment(next.span) => {
-					let seg_token = parser.lexer.next();
-					let seg_text = seg_token.span.extract_str(parser.source);
-					let seg_symbol = parser.strings.get_or_intern(seg_text);
+				token if Self::is_later_segment(token) => {
 					segments.push(PathSegment {
-						ident: Spanned {
-							inner: seg_symbol,
-							span: seg_token.span,
-						},
+						ident: parser.expect_name(&[Keyword::Super])?,
 						type_args: Box::new([]),
 					});
 				}
@@ -2588,19 +2470,11 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_named_argument(
 		parser: &mut Parser,
 	) -> Result<Spanned<NamedArgument>, ()> {
-		let name_token = parser.next_expect(Token::Identifier)?;
-		let text = name_token.span.extract_str(parser.source);
-		let name = Spanned {
-			inner: match Keyword::try_from(text) {
-				Ok(Keyword::SelfLower) => parser.strings.get_or_intern(text),
-				_ => parser.intern_identifier(name_token.span),
-			},
-			span: name_token.span,
-		};
+		let name = parser.expect_name(&[Keyword::SelfLower])?;
 		let (value, span) = match parser.lexer.next_if(Token::Colon) {
 			Some(colon) => {
 				let token = parser.lexer.peek();
-				let value = if parser.nud_lookup(token).is_some() {
+				let value = if Self::starts_expression(token.inner) {
 					parser.parse_expression(BindingPower::Default)?
 				} else {
 					parser.ast.diagnostics.push(report_expected_expression(
@@ -2612,10 +2486,10 @@ impl<'ctx> Parser<'ctx> {
 						span: TextSpan::new(colon.span.end, token.span.start),
 					}
 				};
-				let span = TextSpan::new(name_token.span.start, value.span.end);
+				let span = TextSpan::new(name.span.start, value.span.end);
 				(Some(Box::new(value)), span)
 			}
-			None => (None, name_token.span),
+			None => (None, name.span),
 		};
 		Ok(Spanned {
 			inner: NamedArgument { name, value },
@@ -2660,7 +2534,6 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_object_access_expression(
 		parser: &mut Parser,
 		object: Spanned<Expression>,
-		_: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
 		let dot = parser.lexer.next(); // consume the dot
 		let token = parser.lexer.peek();
@@ -2686,7 +2559,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 			// A keyword is never a member: `x.` on a line of its own is
 			// followed by the next statement's `local`, `return`, ...
-			Token::Identifier if !parser.is_keyword(token.span) => {
+			Token::Identifier => {
 				parser.lexer.next();
 				Ok(Spanned {
 					inner: Expression::ObjectAccess {
@@ -2737,7 +2610,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		let token = parser.lexer.peek();
-		if parser.nud_lookup(token).is_none() {
+		if !Self::starts_expression(token.inner) {
 			parser
 				.ast
 				.diagnostics
@@ -2883,7 +2756,7 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<Expression>, ()> {
 		let return_span = parser.lexer.next().span;
 		let token = parser.lexer.peek();
-		if parser.nud_lookup(token).is_none() {
+		if !Self::starts_expression(token.inner) {
 			return Ok(Spanned {
 				inner: Expression::Return { value: None },
 				span: return_span,
@@ -2905,7 +2778,7 @@ impl<'ctx> Parser<'ctx> {
 		let break_keyword = parser.lexer.next();
 		let label = parser.parse_label();
 		let token = parser.lexer.peek();
-		let value = if parser.nud_lookup(token).is_some() {
+		let value = if Self::starts_expression(token.inner) {
 			Some(parser.parse_expression(BindingPower::Default)?)
 		} else {
 			None
@@ -2993,7 +2866,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		let token = parser.lexer.peek();
-		if parser.nud_lookup(token).is_none() {
+		if !Self::starts_expression(token.inner) {
 			parser
 				.ast
 				.diagnostics
@@ -3044,7 +2917,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_label(&mut self) -> Option<Spanned<SymbolU32>> {
 		let colon = self.lexer.next_if(Token::Colon)?;
 		let token = self.lexer.peek();
-		if token.inner != Token::Identifier || self.is_keyword(token.span) {
+		if token.inner != Token::Identifier {
 			self.ast.diagnostics.push(report_unexpected_token(
 				self.ast.file_id,
 				token,
@@ -3088,28 +2961,18 @@ impl<'ctx> Parser<'ctx> {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::SemiColon,
-			item_handler: |parser| {
-				let token = parser.lexer.peek();
-				let keyword = match token.inner {
-					Token::Identifier => {
-						Keyword::try_from(token.span.extract_str(parser.source))
-							.ok()
-					}
-					_ => None,
-				};
-				match keyword {
-					Some(Keyword::Local) => {
-						Parser::parse_local_definition_statement(parser)
-					}
-					_ => {
-						let expr =
-							parser.parse_expression(BindingPower::Default)?;
-						let span = expr.span;
-						Ok(Spanned {
-							inner: Statement::Expression(Box::new(expr)),
-							span,
-						})
-					}
+			item_handler: |parser| match parser.peek_keyword() {
+				Some(Keyword::Local) => {
+					Parser::parse_local_definition_statement(parser)
+				}
+				_ => {
+					let expr =
+						parser.parse_expression(BindingPower::Default)?;
+					let span = expr.span;
+					Ok(Spanned {
+						inner: Statement::Expression(Box::new(expr)),
+						span,
+					})
 				}
 			},
 			should_warn_missing_separator: Some(|stmt| {
@@ -3267,7 +3130,6 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_type_application_expression(
 		parser: &mut Parser,
 		left: Spanned<Expression>,
-		_: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
 		let colons = parser.lexer.next(); // consume `::`
 
@@ -3309,7 +3171,6 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_call_expression(
 		parser: &mut Parser,
 		callee: Spanned<Expression>,
-		_: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
 		let start = callee.span.start;
 		let open_span = parser.next_expect(Token::OpenParen)?.span;
@@ -3433,7 +3294,6 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_index_expression(
 		parser: &mut Parser,
 		object: Spanned<Expression>,
-		_: BindingPower,
 	) -> Result<Spanned<Expression>, ()> {
 		_ = parser.lexer.next(); // consume `[`
 		let index = Box::new(parser.parse_expression(BindingPower::Default)?);
@@ -3476,11 +3336,8 @@ impl<'ctx> Parser<'ctx> {
 				span: dot_dot.span,
 			});
 		}
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
-		};
+		let name = parser.expect_name(&[])?;
+		let name_span = name.span;
 		let pattern = if parser.lexer.next_if(Token::Colon).is_some() {
 			Some(Parser::parse_pattern(parser)?)
 		} else {
@@ -3594,19 +3451,13 @@ impl<'ctx> Parser<'ctx> {
 	/// A path: one or more segments, `A::B`. As in an expression, it may
 	/// start at `Self`, `crate` or `super`.
 	fn parse_path(parser: &mut Parser) -> Result<PathTerm, ()> {
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let text = name_span.extract_str(parser.source);
-		let first = match Keyword::try_from(text) {
-			Ok(Keyword::SelfPascal | Keyword::Package | Keyword::Super) => {
-				parser.strings.get_or_intern(text)
-			}
-			_ => parser.intern_identifier(name_span),
-		};
+		let first = parser.expect_name(&[
+			Keyword::SelfPascal,
+			Keyword::Package,
+			Keyword::Super,
+		])?;
 		let mut segments = vec![PathSegment {
-			ident: Spanned {
-				inner: first,
-				span: name_span,
-			},
+			ident: first,
 			type_args: Box::new([]),
 		}];
 
@@ -3624,16 +3475,11 @@ impl<'ctx> Parser<'ctx> {
 					return Parser::parse_old_struct_pattern(parser, &segments);
 				}
 				// `::ident` — another path segment
-				Token::Identifier if parser.is_later_segment(next.span) => {
+				token if Self::is_later_segment(token) => {
 					// A later segment is a name, `super` included, as in an
 					// expression.
-					let seg_span = parser.next_expect(Token::Identifier)?.span;
-					let seg_text = seg_span.extract_str(parser.source);
 					segments.push(PathSegment {
-						ident: Spanned {
-							inner: parser.strings.get_or_intern(seg_text),
-							span: seg_span,
-						},
+						ident: parser.expect_name(&[Keyword::Super])?,
 						type_args: Box::new([]),
 					});
 				}
@@ -3766,46 +3612,39 @@ impl<'ctx> Parser<'ctx> {
 					span: literal.span,
 				})
 			}
-			Token::Identifier => {
-				let text = token.span.extract_str(parser.source);
-				match Keyword::try_from(text) {
-					Ok(Keyword::Underscore) => {
-						let span = parser.lexer.next().span;
-						Ok(Spanned {
-							inner: Pattern::Wildcard,
-							span,
-						})
-					}
-					Ok(Keyword::Mut) => {
-						let mut_span = parser.lexer.next().span;
-						let name_span =
-							parser.next_expect(Token::Identifier)?.span;
-						let name = Spanned {
-							inner: parser.intern_identifier(name_span),
-							span: name_span,
-						};
-						Ok(Spanned {
-							inner: Pattern::Binding {
-								mut_span: Some(mut_span),
-								name,
-							},
-							span: TextSpan::new(mut_span.start, name_span.end),
-						})
-					}
-					Ok(Keyword::Const) => {
-						let const_span = parser.lexer.next().span;
-						Parser::parse_const_pattern(parser, const_span)
-					}
-					Ok(Keyword::Local) => {
-						let span = parser.lexer.next().span;
-						parser.ast.diagnostics.push(report_redundant_local(
-							parser.ast.file_id,
-							span,
-						));
-						Err(())
-					}
-					_ => Parser::parse_path_pattern(parser),
-				}
+			Token::Keyword(Keyword::Underscore) => {
+				let span = parser.lexer.next().span;
+				Ok(Spanned {
+					inner: Pattern::Wildcard,
+					span,
+				})
+			}
+			Token::Keyword(Keyword::Mut) => {
+				let mut_span = parser.lexer.next().span;
+				let name = parser.expect_name(&[])?;
+				let name_span = name.span;
+				Ok(Spanned {
+					inner: Pattern::Binding {
+						mut_span: Some(mut_span),
+						name,
+					},
+					span: TextSpan::new(mut_span.start, name_span.end),
+				})
+			}
+			Token::Keyword(Keyword::Const) => {
+				let const_span = parser.lexer.next().span;
+				Parser::parse_const_pattern(parser, const_span)
+			}
+			Token::Keyword(Keyword::Local) => {
+				let span = parser.lexer.next().span;
+				parser
+					.ast
+					.diagnostics
+					.push(report_redundant_local(parser.ast.file_id, span));
+				Err(())
+			}
+			Token::Identifier | Token::Keyword(_) => {
+				Parser::parse_path_pattern(parser)
 			}
 			_ => {
 				let token = parser.lexer.next();
@@ -3855,22 +3694,22 @@ impl<'ctx> Parser<'ctx> {
 			end = eq.span.end;
 		}
 		let token = parser.lexer.peek();
-		let value = if assigned.is_some() && parser.nud_lookup(token).is_some()
-		{
-			parser.parse_expression(BindingPower::Default)?
-		} else {
-			parser
-				.ast
-				.diagnostics
-				.push(report_missing_local_initializer(
-					parser.ast.file_id,
-					token.span,
-				));
-			Spanned {
-				inner: Expression::Error,
-				span: TextSpan::new(end, token.span.start),
-			}
-		};
+		let value =
+			if assigned.is_some() && Self::starts_expression(token.inner) {
+				parser.parse_expression(BindingPower::Default)?
+			} else {
+				parser
+					.ast
+					.diagnostics
+					.push(report_missing_local_initializer(
+						parser.ast.file_id,
+						token.span,
+					));
+				Spanned {
+					inner: Expression::Error,
+					span: TextSpan::new(end, token.span.start),
+				}
+			};
 
 		let span = TextSpan::new(local_keyword.span.start, value.span.end);
 		Ok(Spanned {
@@ -3887,21 +3726,15 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Item>, ()> {
 		let global_keyword = parser.lexer.next();
-		let token = parser.lexer.peek();
-		let mut_span =
-			match Keyword::try_from(token.span.extract_str(parser.source)) {
-				Ok(Keyword::Mut) => {
-					let mut_token = parser.lexer.next();
-					Some(mut_token.span)
-				}
-				_ => None,
-			};
-
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
+		let mut_span = match parser.peek_keyword() {
+			Some(Keyword::Mut) => {
+				let mut_token = parser.lexer.next();
+				Some(mut_token.span)
+			}
+			_ => None,
 		};
+
+		let name = parser.expect_name(&[])?;
 
 		let ty = match parser.lexer.next_if(Token::Colon) {
 			Some(_) => Some(Box::new(parser.parse_type_expression()?)),
@@ -3910,7 +3743,7 @@ impl<'ctx> Parser<'ctx> {
 
 		let assigned = parser.lexer.next_if(Token::Eq).is_some();
 		let token = parser.lexer.peek();
-		if !assigned || parser.nud_lookup(token).is_none() {
+		if !assigned || !Self::starts_expression(token.inner) {
 			parser
 				.ast
 				.diagnostics
@@ -3938,8 +3771,10 @@ impl<'ctx> Parser<'ctx> {
 
 	fn parse_const_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let const_span = parser.lexer.next().span;
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name_symbol = parser.intern_identifier(name_span);
+		let Spanned {
+			inner: name_symbol,
+			span: name_span,
+		} = parser.expect_name(&[])?;
 
 		let ty = if parser.lexer.next_if(Token::Colon).is_some() {
 			Some(Box::new(parser.parse_type_expression()?))
@@ -4011,8 +3846,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_export_entry(
 		parser: &mut Parser,
 	) -> Result<Spanned<ExportEntry>, ()> {
-		let name_token = parser.next_expect(Token::Identifier)?;
-		let name_symbol = parser.intern_identifier(name_token.span);
+		let name = parser.expect_name(&[])?;
 
 		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
 			parser.lexer.next();
@@ -4022,18 +3856,12 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		let span = match alias {
-			Some(alias) => TextSpan::new(name_token.span.start, alias.end),
-			None => name_token.span,
+			Some(alias) => TextSpan::new(name.span.start, alias.end),
+			None => name.span,
 		};
 
 		Ok(Spanned {
-			inner: ExportEntry {
-				name: Spanned {
-					inner: name_symbol,
-					span: name_token.span,
-				},
-				alias,
-			},
+			inner: ExportEntry { name, alias },
 			span,
 		})
 	}
@@ -4041,8 +3869,10 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_enum_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let enum_span = parser.lexer.next().span;
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name_symbol = parser.intern_identifier(name_span);
+		let Spanned {
+			inner: name_symbol,
+			span: name_span,
+		} = parser.expect_name(&[])?;
 
 		// The repr is written like a struct's fields, `enum Ordering(i8)`.
 		// The old `enum Ordering: i8` is reported and read as the new form.
@@ -4080,27 +3910,29 @@ impl<'ctx> Parser<'ctx> {
 							span: dots.span,
 						});
 					}
-					let name_token = parser.next_expect(Token::Identifier)?;
-					let name_symbol = parser.intern_identifier(name_token.span);
+					let Spanned {
+						inner: name_symbol,
+						span: name_token_span,
+					} = parser.expect_name(&[])?;
 
 					let (value, span) =
 						if parser.lexer.next_if(Token::Eq).is_some() {
 							let expr = parser
 								.parse_expression(BindingPower::Default)?;
 							let span = TextSpan::new(
-								name_token.span.start,
+								name_token_span.start,
 								expr.span.end,
 							);
 							(Some(Box::new(expr)), span)
 						} else {
-							(None, name_token.span)
+							(None, name_token_span)
 						};
 
 					Ok(Spanned {
 						inner: EnumEntry::Variant(EnumVariant {
 							name: Spanned {
 								inner: name_symbol,
-								span: name_token.span,
+								span: name_token_span,
 							},
 							value,
 						}),
@@ -4138,8 +3970,10 @@ impl<'ctx> Parser<'ctx> {
 		match parser.peek_keyword() {
 			Some(Keyword::Type) => {
 				let type_span = parser.lexer.next().span;
-				let name_span = parser.next_expect(Token::Identifier)?.span;
-				let name_symbol = parser.intern_identifier(name_span);
+				let Spanned {
+					inner: name_symbol,
+					span: name_span,
+				} = parser.expect_name(&[])?;
 				parser.next_expect(Token::Eq)?;
 				let ty = parser.parse_type_expression()?;
 				let span = TextSpan::new(type_span.start, ty.span.end);
@@ -4161,8 +3995,10 @@ impl<'ctx> Parser<'ctx> {
 			}
 			Some(Keyword::Const) => {
 				let const_span = parser.lexer.next().span;
-				let name_span = parser.next_expect(Token::Identifier)?.span;
-				let name_symbol = parser.intern_identifier(name_span);
+				let Spanned {
+					inner: name_symbol,
+					span: name_span,
+				} = parser.expect_name(&[])?;
 
 				let ty = if parser.lexer.next_if(Token::Colon).is_some() {
 					Some(Box::new(parser.parse_type_expression()?))
@@ -4189,8 +4025,10 @@ impl<'ctx> Parser<'ctx> {
 			}
 			Some(Keyword::Func) => {
 				let fn_span = parser.lexer.next().span;
-				let name_span = parser.next_expect(Token::Identifier)?.span;
-				let name_symbol = parser.intern_identifier(name_span);
+				let Spanned {
+					inner: name_symbol,
+					span: name_span,
+				} = parser.expect_name(&[])?;
 				let type_params =
 					if parser.lexer.peek().inner == Token::LeftArrow {
 						parser.parse_type_params()?
@@ -4333,11 +4171,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_trait_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let trait_span = parser.lexer.next().span;
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
-		};
+		let name = parser.expect_name(&[])?;
 
 		let supertraits: Option<Spanned<BoundExpression>> =
 			match parser.lexer.next_if(Token::Colon) {
@@ -4382,10 +4216,10 @@ impl<'ctx> Parser<'ctx> {
 					match parser.peek_keyword() {
 						Some(Keyword::Type) => {
 							let type_span = parser.lexer.next().span;
-							let name_span =
-								parser.next_expect(Token::Identifier)?.span;
-							let name_symbol =
-								parser.intern_identifier(name_span);
+							let Spanned {
+								inner: name_symbol,
+								span: name_span,
+							} = parser.expect_name(&[])?;
 
 							let bounds: Option<Spanned<BoundExpression>> =
 								match parser.lexer.next_if(Token::Colon) {
@@ -4428,10 +4262,10 @@ impl<'ctx> Parser<'ctx> {
 						}
 						Some(Keyword::Const) => {
 							let const_span = parser.lexer.next().span;
-							let name_span =
-								parser.next_expect(Token::Identifier)?.span;
-							let name_symbol =
-								parser.intern_identifier(name_span);
+							let Spanned {
+								inner: name_symbol,
+								span: name_span,
+							} = parser.expect_name(&[])?;
 							parser.next_expect(Token::Colon)?;
 							let ty = parser.parse_type_expression()?;
 							let value =
@@ -4526,11 +4360,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_typeset_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let typeset_span = parser.lexer.next().span; // consume `typeset`
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
-		};
+		let name = parser.expect_name(&[])?;
 
 		// Optional bound clause: `typeset Name: A + B { .. }` — mirrors a
 		// trait's supertrait list. The `where { .. }` bindings a single bound
@@ -4574,8 +4404,10 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_struct_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let struct_span = parser.lexer.next().span;
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name_symbol = parser.intern_identifier(name_span);
+		let Spanned {
+			inner: name_symbol,
+			span: name_span,
+		} = parser.expect_name(&[])?;
 
 		let type_params = if parser.lexer.peek().inner == Token::LeftArrow {
 			parser.parse_type_params()?
@@ -4660,8 +4492,10 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_type_alias_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let type_span = parser.lexer.next().span;
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name_symbol = parser.intern_identifier(name_span);
+		let Spanned {
+			inner: name_symbol,
+			span: name_span,
+		} = parser.expect_name(&[])?;
 
 		let type_params = if parser.lexer.peek().inner == Token::LeftArrow {
 			parser.parse_type_params()?
@@ -4763,11 +4597,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_memory_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let memory_span = parser.lexer.next().span;
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: parser.intern_identifier(name_span),
-			span: name_span,
-		};
+		let name = parser.expect_name(&[])?;
 
 		parser.next_expect(Token::Colon)?;
 		let size = Box::new(parser.parse_type_expression()?);
@@ -4788,15 +4618,15 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 	) -> Result<Spanned<ImportDeclaration>, ()> {
 		let keyword_span = self.lexer.next().span;
-		let token = self.lexer.peek();
-		let mut_span =
-			match Keyword::try_from(token.span.extract_str(self.source)) {
-				Ok(Keyword::Mut) => Some(self.lexer.next().span),
-				_ => None,
-			};
+		let mut_span = match self.peek_keyword() {
+			Some(Keyword::Mut) => Some(self.lexer.next().span),
+			_ => None,
+		};
 
-		let name_span = self.next_expect(Token::Identifier)?.span;
-		let name_symbol = self.intern_identifier(name_span);
+		let Spanned {
+			inner: name_symbol,
+			span: name_span,
+		} = self.expect_name(&[])?;
 		let name = Spanned {
 			inner: name_symbol,
 			span: name_span,
@@ -4820,11 +4650,7 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 	) -> Result<Spanned<ImportDeclaration>, ()> {
 		let keyword_span = self.lexer.next().span;
-		let name_span = self.next_expect(Token::Identifier)?.span;
-		let name = Spanned {
-			inner: self.intern_identifier(name_span),
-			span: name_span,
-		};
+		let name = self.expect_name(&[])?;
 		let _ = self.next_expect(Token::Colon)?;
 		let size = Box::new(self.parse_type_expression()?);
 		let span = TextSpan::new(keyword_span.start, size.span.end);
@@ -4847,12 +4673,7 @@ impl<'ctx> Parser<'ctx> {
 			None => None,
 		};
 		let token = parser.lexer.peek();
-		let keyword = match token.inner {
-			Token::Identifier => {
-				Keyword::try_from(token.span.extract_str(parser.source)).ok()
-			}
-			_ => None,
-		};
+		let keyword = parser.peek_keyword();
 		if let Some(span) = pub_span
 			&& !matches!(keyword, Some(Keyword::Use))
 		{
@@ -4959,8 +4780,10 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_module_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let module_span = parser.lexer.next().span; // consume `mod`
 
-		let name_span = parser.next_expect(Token::Identifier)?.span;
-		let name_symbol = parser.intern_identifier(name_span);
+		let Spanned {
+			inner: name_symbol,
+			span: name_span,
+		} = parser.expect_name(&[])?;
 
 		if parser.lexer.peek().inner == Token::OpenBrace {
 			let items = SeparatedGroup {
@@ -5018,23 +4841,11 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	fn parse_path_ident(&mut self) -> Result<Spanned<SymbolU32>, ()> {
-		let token = self.next_expect(Token::Identifier)?;
-		let text = token.span.extract_str(self.source);
-		let symbol = match Keyword::try_from(text) {
-			Ok(Keyword::Package | Keyword::Super | Keyword::SelfLower)
-			| Err(_) => self.strings.get_or_intern(text),
-			Ok(kwd) => {
-				self.ast.diagnostics.push(report_reserved_identifier(
-					self.ast.file_id,
-					token.span,
-				));
-				kwd.symbol()
-			}
-		};
-		Ok(Spanned {
-			inner: symbol,
-			span: token.span,
-		})
+		self.expect_name(&[
+			Keyword::Package,
+			Keyword::Super,
+			Keyword::SelfLower,
+		])
 	}
 
 	/// One node of a `use` tree, recursing on `::` and `{ .. }`.
@@ -5090,18 +4901,9 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		let alias = if token.inner == Token::Identifier
-			&& let Ok(Keyword::As) =
-				Keyword::try_from(token.span.extract_str(parser.source))
-		{
+		let alias = if token.inner == Token::Keyword(Keyword::As) {
 			_ = parser.lexer.next(); // consume "as"
-			let alias = parser.next_expect(Token::Identifier)?;
-			let alias_symbol = parser.intern_identifier(alias.span);
-
-			Some(Spanned {
-				inner: alias_symbol,
-				span: alias.span,
-			})
+			Some(parser.expect_name(&[])?)
 		} else {
 			None
 		};
@@ -5146,11 +4948,7 @@ impl<'ctx> Parser<'ctx> {
 			}
 			Some(Keyword::Const) => {
 				parser.lexer.next();
-				let name_span = parser.next_expect(Token::Identifier)?.span;
-				let name = Spanned {
-					inner: parser.intern_identifier(name_span),
-					span: name_span,
-				};
+				let name = parser.expect_name(&[])?;
 				parser.next_expect(Token::Colon)?;
 				let ty = parser.parse_type_expression()?;
 				let end = if parser.lexer.next_if(Token::Eq).is_some() {
@@ -5174,11 +4972,8 @@ impl<'ctx> Parser<'ctx> {
 			}
 			Some(Keyword::Type) => {
 				parser.lexer.next();
-				let name_span = parser.next_expect(Token::Identifier)?.span;
-				let name = Spanned {
-					inner: parser.intern_identifier(name_span),
-					span: name_span,
-				};
+				let name = parser.expect_name(&[])?;
+				let name_span = name.span;
 				let type_params =
 					if parser.lexer.peek().inner == Token::LeftArrow {
 						parser.parse_type_params()?
@@ -5241,11 +5036,7 @@ impl<'ctx> Parser<'ctx> {
 		let token = parser.lexer.peek();
 		let alias = if matches!(parser.peek_keyword(), Some(Keyword::As)) {
 			_ = parser.lexer.next(); // consume "as"
-			let alias_span = parser.next_expect(Token::Identifier)?.span;
-			Spanned {
-				inner: parser.intern_identifier(alias_span),
-				span: alias_span,
-			}
+			parser.expect_name(&[])?
 		} else {
 			parser.ast.diagnostics.push(
 				Diagnostic::error()
@@ -5283,21 +5074,9 @@ impl<'ctx> Parser<'ctx> {
 
 		let token = parser.lexer.peek();
 		let internal_name = match token.inner {
-			Token::Identifier
-				if matches!(
-					Keyword::try_from(token.span.extract_str(parser.source)),
-					Ok(Keyword::As)
-				) =>
-			{
+			Token::Keyword(Keyword::As) => {
 				_ = parser.lexer.next(); // consume "as"
-
-				let alias_token = parser.next_expect(Token::Identifier)?;
-				let alias_symbol = parser.intern_identifier(alias_token.span);
-
-				Spanned {
-					inner: alias_symbol,
-					span: alias_token.span,
-				}
+				parser.expect_name(&[])?
 			}
 			_ => {
 				parser.ast.diagnostics.push(

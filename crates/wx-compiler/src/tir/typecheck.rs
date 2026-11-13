@@ -5776,7 +5776,7 @@ mod tests {
 		let case = TestCase::new(indoc! {r#"
 				func short<M: Memory>(a: M::&[u8; 5]) {}
 				func long<M: Memory>(a: M::&[u8; 5000000000]) {}
-				func local<M: Memory>() {
+				func annotated_local<M: Memory>() {
 					local a: M::&[u8; 5000000000] = [0; _];
 				}
 			"#});
@@ -7566,7 +7566,7 @@ mod tests {
 					d: Is<heap::&[[u16]], (u32, u32)>,
 					e: Is<heap::&heap::&[u8], ()>,
 				) {}
-				func memory<M: Memory>(a: Is<M::&[u8], M::Size>, b: Is<M::*u8, ()>) {}
+				func abstract_memory<M: Memory>(a: Is<M::&[u8], M::Size>, b: Is<M::*u8, ()>) {}
 				func thin<M: Memory, T: StackValue, A: Array>(
 					a: Is<M::&T, ()>,
 					b: Is<M::*A, ()>,

@@ -12,7 +12,8 @@ macro_rules! define_keywords {
 			$variant:ident => $text:literal
 		),+ $(,)?
 	) => {
-		#[derive(Clone, Copy)]
+		#[derive(Clone, Copy, PartialEq, Eq)]
+		#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 		pub enum Keyword {
 			$(
 				$(#[$meta])*
@@ -32,6 +33,13 @@ macro_rules! define_keywords {
 		}
 
 		impl Keyword {
+			/// The keyword as it is written.
+			pub fn as_str(self) -> &'static str {
+				match self {
+					$( Keyword::$variant => $text, )+
+				}
+			}
+
 			/// A fresh interner with every keyword string pre-interned, in
 			/// declaration order, so each keyword's raw index lines up with
 			/// what [`Keyword::symbol`] fabricates directly from the enum
