@@ -417,6 +417,9 @@ consts:
 bounds:
   kinds: []
   spans: []
+patterns:
+  kinds: []
+  spans: []
 qualified_roots: []
 segments:
   - ident:
@@ -523,3 +526,6 @@ type_lists: []
 bound_lists: []
 assoc_bindings: []
 function_type_params: []
+pat_lists: []
+pattern_elements: []
+pattern_fields: []

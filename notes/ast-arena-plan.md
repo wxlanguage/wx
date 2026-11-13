@@ -211,7 +211,17 @@ building.
       the file's tree. Every example builds to
       byte-identical Wasm with identical messages; the two parser snapshots
       now show ids and the columns (step 5 makes them readable again).
-   2. patterns;
+   2. **Done.** Patterns. `Pattern` is a `Copy` kind in a column (`PatId`,
+      `ast.pattern(id)`/`pattern_span(id)`, 24 B by assertion); `|`'s
+      alternatives are a `List<PatId>`, a positional list a
+      `List<PatternElement>` and a named one a `List<PatternFieldItem>`,
+      where `..` carries its own span. A pattern's path is in the segment
+      column. The separators' spans are gone, since no consumer read them
+      (wx-fmt prints its own). A binding keeps `mutable: bool` rather than
+      the `mut`'s span: the pattern starts at its `mut`, so
+      `ast.pattern_mut_span(id)` gives it back, and the kind fits in 24 B.
+      TIR's `check_pattern` takes a `PatId` and reads the column. Every
+      example builds to byte-identical Wasm, messages and formatting.
    3. expressions and statements, with `separated` and the scratch stack;
    4. items, members and the remaining lists; `Spanned` and `Separated`
       removed; TIR's `AstEntry` by id.
@@ -225,14 +235,14 @@ building.
 
 ## Results
 
-| | before | after step 3 | after 4.1 | after step 4 |
-|---|---|---|---|---|
-| lex | 0.64 ms | 0.80 ms | 0.81 ms | |
-| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | |
-| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | |
-| allocations/token | 0.86 | 0.86 | 0.72 | |
-| retained bytes/token | 49.2 | 49.2 | 38.2 | |
-| `Spanned<Expression>` | 80 B | 80 B | 48 B | |
+| | before | after step 3 | after 4.1 | after 4.2 | after step 4 |
+|---|---|---|---|---|---|
+| lex | 0.64 ms | 0.80 ms | 0.81 ms | 0.80 ms | |
+| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | 2.68 ms | |
+| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | 0.34 ms | |
+| allocations/token | 0.86 | 0.86 | 0.72 | 0.72 | |
+| retained bytes/token | 49.2 | 49.2 | 38.2 | 37.1 | |
+| `Spanned<Expression>` | 80 B | 80 B | 48 B | 48 B | |
 
 The expected outcome, an estimate to be checked against this table: parsing
 about 1.6–1.9 ms, dropping near zero, the retained tree about a third of its

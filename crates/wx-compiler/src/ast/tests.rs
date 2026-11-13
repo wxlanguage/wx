@@ -134,18 +134,18 @@ impl TestCase {
 	/// A pattern as an S-expression that names every node, so what each
 	/// term is visible: a binding is `x`, a constant is `(const x)`, a
 	/// qualified path is `(value Ordering::Less)`.
-	fn pattern(&self, pattern: &Pattern) -> String {
-		match pattern {
+	fn pattern(&self, pattern: PatId) -> String {
+		match self.ast.pattern(pattern) {
 			Pattern::Wildcard => "_".to_string(),
-			Pattern::Binding { mut_span, name } => match mut_span {
-				Some(_) => format!("mut {}", self.name(name.inner)),
-				None => self.name(name.inner).to_string(),
+			Pattern::Binding { mutable, name } => match mutable {
+				true => format!("mut {}", self.name(name.inner)),
+				false => self.name(name.inner).to_string(),
 			},
-			Pattern::Constant { path } => match &**path {
+			Pattern::Constant { path } => match self.ast.list(path) {
 				[segment] if segment.type_args.is_empty() => {
 					format!("(const {})", self.name(segment.ident.inner))
 				}
-				_ => format!("(const {})", self.path(path)),
+				path => format!("(const {})", self.path(path)),
 			},
 			Pattern::Literal(Literal::Int(value)) => value.to_string(),
 			Pattern::Literal(Literal::NegInt(value)) => {
@@ -155,9 +155,11 @@ impl TestCase {
 			Pattern::Literal(Literal::Float) => "float".to_string(),
 			Pattern::Literal(Literal::String) => "string".to_string(),
 			Pattern::Or(alternatives) => {
-				let alternatives = alternatives
+				let alternatives = self
+					.ast
+					.list(alternatives)
 					.iter()
-					.map(|alternative| self.pattern(&alternative.inner.inner))
+					.map(|&alternative| self.pattern(alternative))
 					.collect::<Vec<_>>();
 				format!("(| {})", alternatives.join(" "))
 			}
@@ -166,13 +168,14 @@ impl TestCase {
 		}
 	}
 
-	fn destructure(&self, destructure: &Destructure) -> String {
-		let elements = |elements: &PatternElements| {
-			elements
+	fn destructure(&self, destructure: Destructure) -> String {
+		let elements = |elements: List<PatternElement>| {
+			self.ast
+				.list(elements)
 				.iter()
-				.map(|element| match &element.inner.inner {
+				.map(|element| match *element {
 					PatternElement::Pattern(pattern) => self.pattern(pattern),
-					PatternElement::Rest => "..".to_string(),
+					PatternElement::Rest(_) => "..".to_string(),
 				})
 				.collect::<Vec<_>>()
 		};
@@ -186,28 +189,32 @@ impl TestCase {
 				path,
 				elements: items,
 			} => {
-				let mut parts = vec![self.path(path)];
+				let mut parts = vec![self.path(self.ast.list(path))];
 				parts.extend(elements(items));
 				format!("({})", parts.join(" "))
 			}
 			Destructure::NamedStruct { path, fields } => {
-				let fields = fields
+				let fields = self
+					.ast
+					.list(fields)
 					.iter()
-					.map(|item| match &item.inner.inner {
-						PatternFieldItem::Field(field) => {
-							match &field.pattern {
-								Some(pattern) => format!(
-									"{}: {}",
-									self.name(field.name.inner),
-									self.pattern(&pattern.inner)
-								),
-								None => self.name(field.name.inner).to_string(),
-							}
-						}
-						PatternFieldItem::Rest => "..".to_string(),
+					.map(|item| match *item {
+						PatternFieldItem::Field(field) => match field.pattern {
+							Some(pattern) => format!(
+								"{}: {}",
+								self.name(field.name.inner),
+								self.pattern(pattern)
+							),
+							None => self.name(field.name.inner).to_string(),
+						},
+						PatternFieldItem::Rest(_) => "..".to_string(),
 					})
 					.collect::<Vec<_>>();
-				format!("({} {{ {} }})", self.path(path), fields.join(", "))
+				format!(
+					"({} {{ {} }})",
+					self.path(self.ast.list(path)),
+					fields.join(", ")
+				)
 			}
 		}
 	}
@@ -225,7 +232,7 @@ impl TestCase {
 			.iter()
 			.filter_map(|statement| match &statement.inner.inner {
 				Statement::LocalDefinition { pattern, .. } => {
-					Some(self.pattern(&pattern.inner))
+					Some(self.pattern(*pattern))
 				}
 				Statement::Expression(_) => None,
 			})
@@ -241,7 +248,7 @@ impl TestCase {
 			panic!("expected a match")
 		};
 		arms.iter()
-			.map(|arm| self.pattern(&arm.inner.inner.pattern.inner))
+			.map(|arm| self.pattern(arm.inner.inner.pattern))
 			.collect()
 	}
 
@@ -404,14 +411,14 @@ fn local_definition_value(
 fn local_definition_pattern(
 	statements: &[Separated<Spanned<Statement>>],
 	index: usize,
-) -> &Pattern {
+) -> PatId {
 	let Statement::LocalDefinition { pattern, .. } =
 		&statements[index].inner.inner
 	else {
 		panic!("expected local definition")
 	};
 
-	&pattern.inner
+	*pattern
 }
 
 // ── Top-level items ──────────────────────────────────────────────────────────
@@ -480,13 +487,14 @@ fn test_enum_repr_after_name() {
 #[test]
 fn test_function_mut_param() {
 	// mut on a parameter; mut local with compound assignment
-	let case = TestCase::new(indoc! {"
+	let source = indoc! {"
         func sum_down(mut n: i32) -> i32 {
             local mut acc: i32 = 0;
             acc += n;
             acc
         }
-    "});
+    "};
+	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 
 	let param = &case.function_signature(0).params[0].inner.inner;
@@ -498,15 +506,17 @@ fn test_function_mut_param() {
 
 	// `mut` on a local lives on its binding pattern, not on the statement
 	let statements = case.function_block(0);
-	let Pattern::Binding { mut_span, name } =
-		local_definition_pattern(statements, 0)
-	else {
+	let pattern = local_definition_pattern(statements, 0);
+	let Pattern::Binding { name, .. } = case.ast.pattern(pattern) else {
 		panic!("expected a binding pattern")
 	};
 	assert_eq!(case.name(name.inner), "acc");
-	assert!(
-		mut_span.is_some(),
-		"`local mut acc` should record a mut span"
+	assert_eq!(
+		case.ast
+			.pattern_mut_span(pattern)
+			.map(std::ops::Range::from),
+		Some(source.find("mut acc").unwrap()..source.find(" acc").unwrap()),
+		"`local mut acc` should record its `mut`"
 	);
 }
 
@@ -4614,7 +4624,7 @@ fn a_pattern_path_with_no_last_segment_keeps_its_prefix() {
 	};
 	assert_eq!(arms.len(), 2);
 	assert_eq!(
-		case.pattern(&arms[0].inner.inner.pattern.inner),
+		case.pattern(arms[0].inner.inner.pattern),
 		"(const Ordering::<error>)"
 	);
 }

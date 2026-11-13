@@ -240,9 +240,8 @@ impl BodyBuilder<'_, '_> {
 				}
 				value
 			}
-			ast::Statement::LocalDefinition { pattern, ty, value } => {
-				self.build_local(pattern, *ty, value, statement.span, block_end)
-			}
+			ast::Statement::LocalDefinition { pattern, ty, value } => self
+				.build_local(*pattern, *ty, value, statement.span, block_end),
 		}
 	}
 
@@ -271,7 +270,7 @@ impl BodyBuilder<'_, '_> {
 	/// (`ScopeKind::Remainder`).
 	fn build_local(
 		&mut self,
-		pattern: &Spanned<ast::Pattern>,
+		pattern: ast::PatId,
 		ty: Option<ast::TypeId>,
 		value: &Spanned<ast::Expression>,
 		span: TextSpan,
@@ -311,10 +310,11 @@ impl BodyBuilder<'_, '_> {
 					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
 					.with_message("type annotation required")
 					.with_label(
-						Label::primary(self.scope.file_id, pattern.span)
-							.with_message(
-								"cannot infer the type of this local",
-							),
+						Label::primary(
+							self.scope.file_id,
+							self.ast().pattern_span(pattern),
+						)
+						.with_message("cannot infer the type of this local"),
 					),
 			);
 			local_ty = TypeIndex::ERROR;
@@ -360,11 +360,14 @@ impl BodyBuilder<'_, '_> {
 			let scope = self.enter_scope(
 				ScopeKind::Block,
 				None,
-				TextSpan::new(arm.inner.pattern.span.end, arm.span.end),
+				TextSpan::new(
+					self.ast().pattern_span(arm.inner.pattern).end,
+					arm.span.end,
+				),
 				TypeIndex::INFER,
 			);
 			let pattern = self.check_pattern(
-				&arm.inner.pattern,
+				arm.inner.pattern,
 				scrutinee_ty,
 				&mut PatternContext::arm(),
 			);

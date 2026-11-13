@@ -353,7 +353,7 @@ pub struct NamedArgument {
 /// compares with that value, a qualified path with that constant.
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct MatchArm {
-	pub pattern: Spanned<Pattern>,
+	pub pattern: PatId,
 	pub body: Box<Spanned<Expression>>,
 }
 
@@ -657,25 +657,27 @@ const _: () = assert!(size_of::<BoundExpression>() <= 24);
 /// The parser resolves every term while parsing, so a name reaches the AST
 /// already decided — a [`Pattern::Binding`] or a [`Pattern::Constant`] —
 /// and never as something a later stage has to reinterpret.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Pattern {
 	/// `_`
 	Wildcard,
-	/// `[mut] name`
+	/// `[mut] name`. A binding written `mut` starts at it, so its span is
+	/// [`AST::pattern_mut_span`].
 	Binding {
-		mut_span: Option<TextSpan>,
+		mutable: bool,
 		name: Spanned<SymbolU32>,
 	},
 	/// A constant, named by a path: `const MAX`, `Ordering::Less`,
 	/// `Self::LIMIT`. A path of one segment can only be a constant the
 	/// author marked with `const`; a longer one names a constant already.
 	Constant {
-		path: Box<[PathSegment]>,
+		path: List<PathSegment>,
 	},
 	/// `0`, `-1`, `'a'`
 	Literal(Literal),
-	/// `A | B | C`; each separator is a `|`.
-	Or(Box<[Separated<Spanned<Pattern>>]>),
+	/// `A | B | C`
+	Or(List<PatId>),
 	Destructure(Destructure),
 	/// A pattern the parser could not read: the diagnostic is already out,
 	/// and nothing here can be checked.
@@ -683,53 +685,56 @@ pub enum Pattern {
 }
 
 /// Destructuring; each of its children is a pattern of its own.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Destructure {
 	/// `(a, .., z)`
-	Tuple { elements: PatternElements },
+	Tuple { elements: List<PatternElement> },
 	/// `Name(pat, ..)` or `module::Name(pat, ..)`, written exactly as its
 	/// construction is (`Name(1, 2)`), so a pattern and a value read the same
 	/// way.
 	Struct {
-		path: Box<[PathSegment]>,
-		elements: PatternElements,
+		path: List<PathSegment>,
+		elements: List<PatternElement>,
 	},
 	/// `Name({ field, other: pat, .. })`, as `Name({ x: 1, y: 2 })` constructs
 	/// it.
 	NamedStruct {
-		path: Box<[PathSegment]>,
-		fields: PatternFields,
+		path: List<PathSegment>,
+		fields: List<PatternFieldItem>,
 	},
 }
 
-/// A positional list exactly as written: how many `..` there are and where
-/// is a semantic question TIR answers, not a parse-time assumption.
-pub type PatternElements = Box<[Separated<Spanned<PatternElement>>]>;
-
+/// One entry of a positional list, exactly as written: how many `..` there
+/// are and where is a semantic question TIR answers, not a parse-time
+/// assumption.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum PatternElement {
-	Pattern(Pattern),
-	/// `..`
-	Rest,
+	Pattern(PatId),
+	/// `..`, at this span.
+	Rest(TextSpan),
 }
 
-/// A named list exactly as written; see [`PatternElements`].
-pub type PatternFields = Box<[Separated<Spanned<PatternFieldItem>>]>;
-
+/// One entry of a named list, exactly as written; see [`PatternElement`].
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum PatternFieldItem {
 	Field(PatternField),
-	/// `..`
-	Rest,
+	/// `..`, at this span.
+	Rest(TextSpan),
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct PatternField {
 	pub name: Spanned<SymbolU32>,
 	/// `None` = shorthand `{ x }`: the field binds a local of its own name,
 	/// the same as `{ x: x }`.
-	pub pattern: Option<Spanned<Pattern>>,
+	pub pattern: Option<PatId>,
 }
+
+const _: () = assert!(size_of::<Pattern>() <= 24);
 
 /// A literal written where a value is compared or given as a type
 /// argument: a pattern's, or a constant argument's.
@@ -760,7 +765,7 @@ pub enum Statement {
 	Expression(Box<Spanned<Expression>>),
 	/// `local <pattern> [: type] = {expr}`
 	LocalDefinition {
-		pattern: Spanned<Pattern>,
+		pattern: PatId,
 		ty: Option<TypeId>,
 		value: Box<Spanned<Expression>>,
 	},
@@ -1248,6 +1253,10 @@ index_newtype!(
 	/// The `<Type as Trait>` of a qualified path, in its file's [`AST`].
 	QualifiedRootId
 );
+index_newtype!(
+	/// A pattern, in its file's [`AST`].
+	PatId
+);
 
 /// A run of one of the [`AST`]'s lists, read with [`AST::list`]: the
 /// segments of a path, the arguments of a segment, the elements of a tuple
@@ -1310,6 +1319,9 @@ listed! {
 	BoundId => bound_lists,
 	AssocBinding => assoc_bindings,
 	FunctionTypeParam => function_type_params,
+	PatId => pat_lists,
+	PatternElement => pattern_elements,
+	PatternFieldItem => pattern_fields,
 }
 
 /// A column of nodes of one kind, each with its span; a node's id is its
@@ -1338,9 +1350,9 @@ impl<K> Column<K> {
 	}
 }
 
-/// One file's syntax tree. Type syntax lives in columns addressed by id (a
-/// child before its parent) and lists by [`List`]; items, expressions and
-/// patterns are still a tree, holding those ids
+/// One file's syntax tree. Type syntax and patterns live in columns
+/// addressed by id (a child before its parent) and lists by [`List`]; items
+/// and expressions are still a tree, holding those ids
 /// (`notes/ast-arena-plan.md`).
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AST {
@@ -1352,6 +1364,7 @@ pub struct AST {
 	types: Column<TypeExpression>,
 	consts: Column<ConstArgument>,
 	bounds: Column<BoundExpression>,
+	patterns: Column<Pattern>,
 	qualified_roots: Vec<QualifiedPathRoot>,
 	segments: Vec<PathSegment>,
 	type_args: Vec<TypeArgument>,
@@ -1359,6 +1372,9 @@ pub struct AST {
 	bound_lists: Vec<BoundId>,
 	assoc_bindings: Vec<AssocBinding>,
 	function_type_params: Vec<FunctionTypeParam>,
+	pat_lists: Vec<PatId>,
+	pattern_elements: Vec<PatternElement>,
+	pattern_fields: Vec<PatternFieldItem>,
 }
 
 impl AST {
@@ -1371,6 +1387,7 @@ impl AST {
 			types: Column::default(),
 			consts: Column::default(),
 			bounds: Column::default(),
+			patterns: Column::default(),
 			qualified_roots: Vec::new(),
 			segments: Vec::new(),
 			type_args: Vec::new(),
@@ -1378,6 +1395,9 @@ impl AST {
 			bound_lists: Vec::new(),
 			assoc_bindings: Vec::new(),
 			function_type_params: Vec::new(),
+			pat_lists: Vec::new(),
+			pattern_elements: Vec::new(),
+			pattern_fields: Vec::new(),
 		}
 	}
 
@@ -1403,6 +1423,27 @@ impl AST {
 
 	pub fn bound_span(&self, id: BoundId) -> TextSpan {
 		self.bounds.spans[usize::from(id)]
+	}
+
+	pub fn pattern(&self, id: PatId) -> Pattern {
+		self.patterns.kinds[usize::from(id)]
+	}
+
+	pub fn pattern_span(&self, id: PatId) -> TextSpan {
+		self.patterns.spans[usize::from(id)]
+	}
+
+	/// The `mut` of a binding written with one, which the pattern starts
+	/// at.
+	pub fn pattern_mut_span(&self, id: PatId) -> Option<TextSpan> {
+		match self.pattern(id) {
+			Pattern::Binding { mutable: true, .. } => {
+				let start = self.pattern_span(id).start;
+				let len = Keyword::Mut.as_str().len() as u32;
+				Some(TextSpan::new(start, start + len))
+			}
+			_ => None,
+		}
 	}
 
 	pub fn qualified_root(&self, id: QualifiedRootId) -> QualifiedPathRoot {
@@ -1439,6 +1480,10 @@ impl AST {
 
 	fn push_bound(&mut self, kind: BoundExpression, span: TextSpan) -> BoundId {
 		BoundId::new(self.bounds.push(kind, span))
+	}
+
+	fn push_pattern(&mut self, kind: Pattern, span: TextSpan) -> PatId {
+		PatId::new(self.patterns.push(kind, span))
 	}
 
 	fn push_qualified_root(

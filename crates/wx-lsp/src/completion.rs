@@ -17,7 +17,7 @@ use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, BoundExpression, BoundId, Comment,
 	ConstArgument, ConstId, Destructure, EnumEntry, Expression,
 	FunctionSignature, FunctionTypeParam, ImplItem, ImportDeclaration,
-	ImportEntry, Item, NamedArgument, Path, PathSegment, Pattern,
+	ImportEntry, Item, NamedArgument, PatId, Path, PathSegment, Pattern,
 	PatternElement, PatternFieldItem, QualifiedPathRoot, Separated, Spanned,
 	Statement, TraitItem, TypeArgument, TypeExpression, TypeId, TypeParam,
 };
@@ -623,7 +623,7 @@ impl Cursor<'_> {
 		match statement {
 			Statement::Expression(expression) => self.expression(expression),
 			Statement::LocalDefinition { pattern, ty, value } => self
-				.pattern(&pattern.inner, pattern.span)
+				.pattern(*pattern)
 				.or_else(|| self.ty((*ty)?))
 				.or_else(|| self.expression(value)),
 		}
@@ -702,7 +702,7 @@ impl Cursor<'_> {
 			Expression::Match { scrutinee, arms } => {
 				self.expression(scrutinee).or_else(|| {
 					let arm = &self.child(arms)?.inner.inner;
-					self.pattern(&arm.pattern.inner, arm.pattern.span)
+					self.pattern(arm.pattern)
 						.or_else(|| self.expression(&arm.body))
 				})
 			}
@@ -809,32 +809,47 @@ impl Cursor<'_> {
 		}
 	}
 
-	fn pattern(&self, pattern: &Pattern, span: TextSpan) -> Option<Site> {
-		if !self.at(span) {
+	fn pattern(&self, pattern: PatId) -> Option<Site> {
+		let ast = self.ast;
+		if !self.at(ast.pattern_span(pattern)) {
 			return None;
 		}
-		match pattern {
+		match ast.pattern(pattern) {
 			// `const MAX`: a constant, named in the value tier.
-			Pattern::Constant { path } => self.path(path, NameUse::Value),
-			Pattern::Or(alternatives) => {
-				let alternative = &self.child(alternatives)?.inner;
-				self.pattern(&alternative.inner, alternative.span)
+			Pattern::Constant { path } => {
+				self.path(ast.list(path), NameUse::Value)
 			}
+			Pattern::Or(alternatives) => self.pattern(
+				*self.child_by(ast.list(alternatives), |&alternative| {
+					ast.pattern_span(alternative)
+				})?,
+			),
 			Pattern::Destructure(Destructure::Tuple { elements }) => {
-				self.pattern_elements(elements)
+				self.pattern_elements(ast.list(elements))
 			}
 			Pattern::Destructure(Destructure::Struct { path, elements }) => {
-				self.path(path, NameUse::Value)
-					.or_else(|| self.pattern_elements(elements))
+				self.path(ast.list(path), NameUse::Value)
+					.or_else(|| self.pattern_elements(ast.list(elements)))
 			}
 			Pattern::Destructure(Destructure::NamedStruct { path, fields }) => {
-				self.path(path, NameUse::Value).or_else(|| {
-					match &self.child(fields)?.inner.inner {
+				self.path(ast.list(path), NameUse::Value).or_else(|| {
+					let field =
+						self.child_by(ast.list(fields), |item| match *item {
+							PatternFieldItem::Field(field) => {
+								let end = field
+									.pattern
+									.map_or(field.name.span.end, |pattern| {
+										ast.pattern_span(pattern).end
+									});
+								TextSpan::new(field.name.span.start, end)
+							}
+							PatternFieldItem::Rest(span) => span,
+						})?;
+					match *field {
 						PatternFieldItem::Field(field) => {
-							let pattern = field.pattern.as_ref()?;
-							self.pattern(&pattern.inner, pattern.span)
+							self.pattern(field.pattern?)
 						}
-						PatternFieldItem::Rest => None,
+						PatternFieldItem::Rest(_) => None,
 					}
 				})
 			}
@@ -846,16 +861,15 @@ impl Cursor<'_> {
 		}
 	}
 
-	fn pattern_elements(
-		&self,
-		elements: &[Separated<Spanned<PatternElement>>],
-	) -> Option<Site> {
-		let element = &self.child(elements)?.inner;
-		match &element.inner {
-			PatternElement::Pattern(pattern) => {
-				self.pattern(pattern, element.span)
-			}
-			PatternElement::Rest => None,
+	fn pattern_elements(&self, elements: &[PatternElement]) -> Option<Site> {
+		let ast = self.ast;
+		let element = self.child_by(elements, |element| match *element {
+			PatternElement::Pattern(pattern) => ast.pattern_span(pattern),
+			PatternElement::Rest(span) => span,
+		})?;
+		match *element {
+			PatternElement::Pattern(pattern) => self.pattern(pattern),
+			PatternElement::Rest(_) => None,
 		}
 	}
 

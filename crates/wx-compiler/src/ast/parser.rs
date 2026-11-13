@@ -545,7 +545,7 @@ impl From<BinaryOp> for BindingPower {
 /// which is reported and read as an error.
 enum PathTerm {
 	Path(Box<[PathSegment]>),
-	Old(Spanned<Pattern>),
+	Old(PatId),
 }
 
 pub struct Parser<'input> {
@@ -3064,7 +3064,10 @@ impl<'ctx> Parser<'ctx> {
 					} else {
 						parser.parse_expression(BindingPower::Default)?
 					};
-					let span = TextSpan::new(pattern.span.start, body.span.end);
+					let span = TextSpan::new(
+						parser.ast.pattern_span(pattern).start,
+						body.span.end,
+					);
 					Ok(Spanned {
 						inner: MatchArm {
 							pattern,
@@ -3284,14 +3287,14 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<PatternElement>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
-				inner: PatternElement::Rest,
+				inner: PatternElement::Rest(dot_dot.span),
 				span: dot_dot.span,
 			});
 		}
 		let pattern = Parser::parse_pattern(parser)?;
 		Ok(Spanned {
-			inner: PatternElement::Pattern(pattern.inner),
-			span: pattern.span,
+			inner: PatternElement::Pattern(pattern),
+			span: parser.ast.pattern_span(pattern),
 		})
 	}
 
@@ -3301,80 +3304,51 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<PatternFieldItem>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
-				inner: PatternFieldItem::Rest,
+				inner: PatternFieldItem::Rest(dot_dot.span),
 				span: dot_dot.span,
 			});
 		}
 		let name = parser.expect_name(&[])?;
-		let name_span = name.span;
 		let pattern = if parser.lexer.next_if(Token::Colon).is_some() {
 			Some(Parser::parse_pattern(parser)?)
 		} else {
 			None
 		};
-		let span = match &pattern {
-			Some(p) => TextSpan::new(name_span.start, p.span.end),
-			None => name_span,
-		};
+		let end = pattern.map_or(name.span.end, |pattern| {
+			parser.ast.pattern_span(pattern).end
+		});
 		Ok(Spanned {
 			inner: PatternFieldItem::Field(PatternField { name, pattern }),
-			span,
+			span: TextSpan::new(name.span.start, end),
 		})
 	}
 
 	/// `{ field, other: pat, .. }`, braces included, as written.
 	fn parse_pattern_fields(
 		parser: &mut Parser,
-	) -> Result<Spanned<PatternFields>, ()> {
-		SeparatedGroup {
+	) -> Result<Spanned<List<PatternFieldItem>>, ()> {
+		let fields = SeparatedGroup {
 			open_token: Token::OpenBrace,
 			close_token: Token::CloseBrace,
 			separator_token: Token::Comma,
 			should_warn_missing_separator: None,
 			item_handler: Parser::parse_pattern_field_item,
 		}
-		.parse(parser)
-	}
-
-	/// `(pat, .., pat)`.
-	fn parse_tuple_pattern(
-		parser: &mut Parser,
-	) -> Result<Spanned<Pattern>, ()> {
-		let elements = SeparatedGroup {
-			open_token: Token::OpenParen,
-			close_token: Token::CloseParen,
-			separator_token: Token::Comma,
-			should_warn_missing_separator: None,
-			item_handler: Parser::parse_pattern_element,
-		}
 		.parse(parser)?;
 		Ok(Spanned {
-			inner: Pattern::Destructure(Destructure::Tuple {
-				elements: elements.inner,
-			}),
-			span: elements.span,
+			inner: parser.ast.push_list(
+				fields.inner.into_iter().map(|field| field.inner.inner),
+			),
+			span: fields.span,
 		})
 	}
 
-	/// `Path(pat, ..)` or `Path({ field, .. })`, with `path` consumed and `(`
-	/// next — decided on the token after `(`, exactly as a call's arguments.
-	fn parse_struct_pattern(
+	/// The elements of a positional list, `(pat, .., pat)`, with the `(`
+	/// at `open_span` consumed.
+	fn parse_pattern_elements(
 		parser: &mut Parser,
-		path: Box<[PathSegment]>,
-	) -> Result<Spanned<Pattern>, ()> {
-		let path_start = path.first().unwrap().ident.span.start;
-		let open_span = parser.next_expect(Token::OpenParen)?.span;
-		if parser.lexer.peek().inner == Token::OpenBrace {
-			let fields = Parser::parse_pattern_fields(parser)?;
-			let close_span = parser.next_expect(Token::CloseParen)?.span;
-			return Ok(Spanned {
-				inner: Pattern::Destructure(Destructure::NamedStruct {
-					path,
-					fields: fields.inner,
-				}),
-				span: TextSpan::new(path_start, close_span.end),
-			});
-		}
+		open_span: TextSpan,
+	) -> Result<Spanned<List<PatternElement>>, ()> {
 		let elements = SeparatedGroup {
 			open_token: Token::OpenParen,
 			close_token: Token::CloseParen,
@@ -3384,12 +3358,57 @@ impl<'ctx> Parser<'ctx> {
 		}
 		.parse_after_open(parser, open_span)?;
 		Ok(Spanned {
-			inner: Pattern::Destructure(Destructure::Struct {
+			inner: parser.ast.push_list(
+				elements
+					.inner
+					.into_iter()
+					.map(|element| element.inner.inner),
+			),
+			span: elements.span,
+		})
+	}
+
+	/// `(pat, .., pat)`.
+	fn parse_tuple_pattern(parser: &mut Parser) -> Result<PatId, ()> {
+		let open_span = parser.next_expect(Token::OpenParen)?.span;
+		let elements = Parser::parse_pattern_elements(parser, open_span)?;
+		Ok(parser.ast.push_pattern(
+			Pattern::Destructure(Destructure::Tuple {
+				elements: elements.inner,
+			}),
+			elements.span,
+		))
+	}
+
+	/// `Path(pat, ..)` or `Path({ field, .. })`, with `path` consumed and `(`
+	/// next — decided on the token after `(`, exactly as a call's arguments.
+	fn parse_struct_pattern(
+		parser: &mut Parser,
+		path: Box<[PathSegment]>,
+	) -> Result<PatId, ()> {
+		let path_start = path.first().unwrap().ident.span.start;
+		let open_span = parser.next_expect(Token::OpenParen)?.span;
+		if parser.lexer.peek().inner == Token::OpenBrace {
+			let fields = Parser::parse_pattern_fields(parser)?;
+			let close_span = parser.next_expect(Token::CloseParen)?.span;
+			let path = parser.ast.push_list(path);
+			return Ok(parser.ast.push_pattern(
+				Pattern::Destructure(Destructure::NamedStruct {
+					path,
+					fields: fields.inner,
+				}),
+				TextSpan::new(path_start, close_span.end),
+			));
+		}
+		let elements = Parser::parse_pattern_elements(parser, open_span)?;
+		let path = parser.ast.push_list(path);
+		Ok(parser.ast.push_pattern(
+			Pattern::Destructure(Destructure::Struct {
 				path,
 				elements: elements.inner,
 			}),
-			span: TextSpan::new(path_start, elements.span.end),
-		})
+			TextSpan::new(path_start, elements.span.end),
+		))
 	}
 
 	/// `Path::{ ... }`, the old named pattern: gone. The fields are read and
@@ -3411,10 +3430,7 @@ impl<'ctx> Parser<'ctx> {
 				.with_label(Label::primary(parser.ast.file_id, span))
 				.with_note("write `Name({ field, .. })` or `Name(a, b)`"),
 		);
-		Ok(PathTerm::Old(Spanned {
-			inner: Pattern::Error,
-			span,
-		}))
+		Ok(PathTerm::Old(parser.ast.push_pattern(Pattern::Error, span)))
 	}
 
 	/// A path: one or more segments, `A::B`. As in an expression, it may
@@ -3469,7 +3485,7 @@ impl<'ctx> Parser<'ctx> {
 
 	/// A term that starts with a path: a struct pattern (`Path(..)`), a
 	/// qualified path (a constant), or a single-segment name (a binding).
-	fn parse_path_pattern(parser: &mut Parser) -> Result<Spanned<Pattern>, ()> {
+	fn parse_path_pattern(parser: &mut Parser) -> Result<PatId, ()> {
 		let segments = match Parser::parse_path(parser)? {
 			PathTerm::Path(segments) => segments,
 			PathTerm::Old(pattern) => return Ok(pattern),
@@ -3481,23 +3497,17 @@ impl<'ctx> Parser<'ctx> {
 
 		// A single segment with no type arguments is a name, and a name
 		// binds; anything longer is a path, and a path is a constant.
-		let span = TextSpan::new(
-			segments[0].ident.span.start,
-			segments.last().unwrap().ident.span.end,
-		);
-		match &*segments {
-			[segment] if segment.type_args.is_empty() => Ok(Spanned {
-				inner: Pattern::Binding {
-					mut_span: None,
-					name: segment.ident,
-				},
-				span,
-			}),
-			_ => Ok(Spanned {
-				inner: Pattern::Constant { path: segments },
-				span,
-			}),
-		}
+		let span = AST::path_span(&segments);
+		let kind = match &*segments {
+			[segment] if segment.type_args.is_empty() => Pattern::Binding {
+				mutable: false,
+				name: segment.ident,
+			},
+			_ => Pattern::Constant {
+				path: parser.ast.push_list(segments),
+			},
+		};
+		Ok(parser.ast.push_pattern(kind, span))
 	}
 
 	/// `const P`: a name marked `const` compares with the constant of that
@@ -3506,7 +3516,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_const_pattern(
 		parser: &mut Parser,
 		const_span: TextSpan,
-	) -> Result<Spanned<Pattern>, ()> {
+	) -> Result<PatId, ()> {
 		let path = match Parser::parse_path(parser)? {
 			PathTerm::Path(path) => path,
 			PathTerm::Old(_) => return Err(()),
@@ -3528,43 +3538,32 @@ impl<'ctx> Parser<'ctx> {
 			const_span.start,
 			path.last().unwrap().ident.span.end,
 		);
-		Ok(Spanned {
-			inner: Pattern::Constant { path },
-			span,
-		})
+		let path = parser.ast.push_list(path);
+		Ok(parser.ast.push_pattern(Pattern::Constant { path }, span))
 	}
 
 	/// A pattern, alternatives included: `|` joins them.
-	fn parse_pattern(parser: &mut Parser) -> Result<Spanned<Pattern>, ()> {
+	fn parse_pattern(parser: &mut Parser) -> Result<PatId, ()> {
 		let first = Parser::parse_primary(parser)?;
 		if parser.lexer.peek().inner != Token::Vbar {
 			return Ok(first);
 		}
-		let start = first.span.start;
-		let mut alternatives = Vec::new();
-		let mut current = first;
-		while let Some(bar) = parser.lexer.next_if(Token::Vbar) {
-			alternatives.push(Separated {
-				inner: current,
-				separator: Some(bar.span),
-			});
-			current = Parser::parse_primary(parser)?;
+		let mut alternatives = vec![first];
+		while parser.lexer.next_if(Token::Vbar).is_some() {
+			alternatives.push(Parser::parse_primary(parser)?);
 		}
-		let end = current.span.end;
-		alternatives.push(Separated {
-			inner: current,
-			separator: None,
-		});
-		Ok(Spanned {
-			inner: Pattern::Or(alternatives.into()),
-			span: TextSpan::new(start, end),
-		})
+		let span = TextSpan::new(
+			parser.ast.pattern_span(first).start,
+			parser.ast.pattern_span(*alternatives.last().unwrap()).end,
+		);
+		let alternatives = parser.ast.push_list(alternatives);
+		Ok(parser.ast.push_pattern(Pattern::Or(alternatives), span))
 	}
 
 	/// One term of a pattern. What it is follows from its own shape: a
 	/// literal compares with that value, a qualified path with that
 	/// constant, and a name binds — unless `const` says it is a constant.
-	fn parse_primary(parser: &mut Parser) -> Result<Spanned<Pattern>, ()> {
+	fn parse_primary(parser: &mut Parser) -> Result<PatId, ()> {
 		let token = parser.lexer.peek();
 		match token.inner {
 			Token::OpenParen => Parser::parse_tuple_pattern(parser),
@@ -3574,29 +3573,25 @@ impl<'ctx> Parser<'ctx> {
 			| Token::String
 			| Token::Minus => {
 				let literal = parser.parse_literal()?;
-				Ok(Spanned {
-					inner: Pattern::Literal(literal.inner),
-					span: literal.span,
-				})
+				Ok(parser.ast.push_pattern(
+					Pattern::Literal(literal.inner),
+					literal.span,
+				))
 			}
 			Token::Keyword(Keyword::Underscore) => {
 				let span = parser.lexer.next().span;
-				Ok(Spanned {
-					inner: Pattern::Wildcard,
-					span,
-				})
+				Ok(parser.ast.push_pattern(Pattern::Wildcard, span))
 			}
 			Token::Keyword(Keyword::Mut) => {
 				let mut_span = parser.lexer.next().span;
 				let name = parser.expect_name(&[])?;
-				let name_span = name.span;
-				Ok(Spanned {
-					inner: Pattern::Binding {
-						mut_span: Some(mut_span),
+				Ok(parser.ast.push_pattern(
+					Pattern::Binding {
+						mutable: true,
 						name,
 					},
-					span: TextSpan::new(mut_span.start, name_span.end),
-				})
+					TextSpan::new(mut_span.start, name.span.end),
+				))
 			}
 			Token::Keyword(Keyword::Const) => {
 				let const_span = parser.lexer.next().span;
@@ -3631,7 +3626,7 @@ impl<'ctx> Parser<'ctx> {
 		let local_keyword = parser.lexer.next();
 
 		let pattern = Parser::parse_pattern(parser)?;
-		let mut end = pattern.span.end;
+		let mut end = parser.ast.pattern_span(pattern).end;
 
 		// A part not written yet (`local x: `, `local x: T`, `local x = `) is
 		// reported and kept as an error node, as a parameter's missing type

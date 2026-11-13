@@ -1635,8 +1635,7 @@ impl<'a> Builder<'a> {
 					},
 				);
 				let mut an: Vec<NodeId> = Vec::new();
-				let pattern = &arm.inner.inner.pattern;
-				self.build_pattern(&mut an, &pattern.inner, pattern.span);
+				self.build_pattern(&mut an, arm.inner.inner.pattern);
 				an.push(self.text(Text::FatArrow));
 				let body = &arm.inner.inner.body;
 				let body = match &body.inner {
@@ -2795,51 +2794,42 @@ impl<'a> Builder<'a> {
 	/// one way to print each of them: a name binds, a literal is printed as
 	/// it was written, a qualified path compares with that constant, and a
 	/// one-segment path is a constant marked with `const`.
-	fn build_pattern(
-		&mut self,
-		out: &mut Vec<NodeId>,
-		pattern: &ast::Pattern,
-		span: TextSpan,
-	) {
-		match pattern {
+	fn build_pattern(&mut self, out: &mut Vec<NodeId>, pattern: ast::PatId) {
+		let ast = self.ast;
+		match ast.pattern(pattern) {
 			ast::Pattern::Wildcard => out.push(self.text(Text::Underscore)),
-			ast::Pattern::Binding { mut_span, name } => {
-				if mut_span.is_some() {
+			ast::Pattern::Binding { mutable, name } => {
+				if mutable {
 					out.push(self.text(Text::Mut));
 				}
 				out.push(self.symbol(name.inner));
 			}
 			ast::Pattern::Constant { path } => {
+				let path = ast.list(path);
 				// A path of one segment can only be a constant the author
 				// marked with `const`; a longer one is a constant already.
-				if let [segment] = &**path
+				if let [segment] = path
 					&& segment.type_args.is_empty()
 				{
 					out.push(self.text(Text::Const));
 				}
 				out.push(self.build_value_path(path));
 			}
-			ast::Pattern::Literal(_) => {
-				out.push(self.source_text(span));
+			ast::Pattern::Literal(_) | ast::Pattern::Error => {
+				out.push(self.source_text(ast.pattern_span(pattern)));
 			}
 			ast::Pattern::Or(alternatives) => {
-				for (i, alternative) in alternatives.iter().enumerate() {
+				for (i, &alternative) in
+					ast.list(alternatives).iter().enumerate()
+				{
 					if i > 0 {
 						out.push(self.text(Text::VbarSp));
 					}
-					let alternative = &alternative.inner;
-					self.build_pattern(
-						out,
-						&alternative.inner,
-						alternative.span,
-					);
+					self.build_pattern(out, alternative);
 				}
 			}
 			ast::Pattern::Destructure(destructure) => {
 				self.build_destructure(out, destructure);
-			}
-			ast::Pattern::Error => {
-				out.push(self.source_text(span));
 			}
 		}
 	}
@@ -2848,21 +2838,22 @@ impl<'a> Builder<'a> {
 	fn build_destructure(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		destructure: &ast::Destructure,
+		destructure: ast::Destructure,
 	) {
+		let ast = self.ast;
 		let elements = |this: &mut Self,
 		                out: &mut Vec<NodeId>,
-		                elements: &ast::PatternElements| {
+		                elements: &[ast::PatternElement]| {
 			out.push(this.text(Text::LParen));
 			for (i, element) in elements.iter().enumerate() {
 				if i > 0 {
 					out.push(this.text(Text::CommaSp));
 				}
-				match &element.inner.inner {
+				match *element {
 					ast::PatternElement::Pattern(pattern) => {
-						this.build_pattern(out, pattern, element.inner.span);
+						this.build_pattern(out, pattern);
 					}
-					ast::PatternElement::Rest => {
+					ast::PatternElement::Rest(_) => {
 						out.push(this.text(Text::DotDot));
 					}
 				}
@@ -2872,25 +2863,25 @@ impl<'a> Builder<'a> {
 		match destructure {
 			// A tuple of one is its element, unless it groups alternatives.
 			ast::Destructure::Tuple { elements: items }
-				if let [item] = &**items
-					&& let ast::PatternElement::Pattern(pattern) =
-						&item.inner.inner
-					&& !matches!(pattern, ast::Pattern::Or(_)) =>
+				if let [ast::PatternElement::Pattern(pattern)] =
+					*ast.list(items)
+					&& !matches!(ast.pattern(pattern), ast::Pattern::Or(_)) =>
 			{
-				self.build_pattern(out, pattern, item.inner.span);
+				self.build_pattern(out, pattern);
 			}
 			ast::Destructure::Tuple { elements: items } => {
-				elements(self, out, items);
+				elements(self, out, ast.list(items));
 			}
 			ast::Destructure::Struct {
 				path,
 				elements: items,
 			} => {
-				out.push(self.build_value_path(path));
-				elements(self, out, items);
+				out.push(self.build_value_path(ast.list(path)));
+				elements(self, out, ast.list(items));
 			}
 			ast::Destructure::NamedStruct { path, fields } => {
-				out.push(self.build_value_path(path));
+				let fields = ast.list(fields);
+				out.push(self.build_value_path(ast.list(path)));
 				out.push(self.text(Text::LParen));
 				out.push(self.text(Text::LBrace));
 				for (i, item) in fields.iter().enumerate() {
@@ -2899,19 +2890,15 @@ impl<'a> Builder<'a> {
 					} else {
 						Text::Space
 					}));
-					match &item.inner.inner {
+					match *item {
 						ast::PatternFieldItem::Field(field) => {
 							out.push(self.symbol(field.name.inner));
-							if let Some(pattern) = &field.pattern {
+							if let Some(pattern) = field.pattern {
 								out.push(self.text(Text::ColonSp));
-								self.build_pattern(
-									out,
-									&pattern.inner,
-									pattern.span,
-								);
+								self.build_pattern(out, pattern);
 							}
 						}
-						ast::PatternFieldItem::Rest => {
+						ast::PatternFieldItem::Rest(_) => {
 							out.push(self.text(Text::DotDot));
 						}
 					}
@@ -2936,7 +2923,7 @@ impl<'a> Builder<'a> {
 				value,
 			} => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Local)];
-				self.build_pattern(&mut items, &pattern.inner, pattern.span);
+				self.build_pattern(&mut items, *pattern);
 				if let Some(annotation) = type_annotation {
 					items.push(self.text(Text::ColonSp));
 					items.push(self.build_type_expression(*annotation));

@@ -160,50 +160,38 @@ impl BodyBuilder<'_, '_> {
 	/// current scope.
 	pub(super) fn check_pattern(
 		&mut self,
-		pattern: &Spanned<ast::Pattern>,
+		pattern: ast::PatId,
 		expected: TypeIndex,
 		context: &mut PatternContext,
 	) -> PatIdx {
-		self.check_one_pattern(&pattern.inner, pattern.span, expected, context)
-	}
-
-	fn check_one_pattern(
-		&mut self,
-		pattern: &ast::Pattern,
-		span: TextSpan,
-		expected: TypeIndex,
-		context: &mut PatternContext,
-	) -> PatIdx {
-		match pattern {
+		let ast = self.ast();
+		let span = ast.pattern_span(pattern);
+		match ast.pattern(pattern) {
 			ast::Pattern::Wildcard => {
 				self.body
 					.push_pattern(PatternKind::Wildcard, expected, span)
 			}
-			ast::Pattern::Binding { mut_span, name } => {
-				self.bind(*name, *mut_span, expected, span, context)
+			ast::Pattern::Binding { name, .. } => {
+				let mut_span = ast.pattern_mut_span(pattern);
+				self.bind(name, mut_span, expected, span, context)
 			}
 			ast::Pattern::Constant { path } => {
 				let expected = self.check_refutable(context, span, expected);
-				self.check_value_path(path, span, expected)
+				self.check_value_path(ast.list(path), span, expected)
 			}
 			ast::Pattern::Literal(literal) => {
 				let expected = self.check_refutable(context, span, expected);
-				self.check_literal(literal, span, expected)
+				self.check_literal(&literal, span, expected)
 			}
 			ast::Pattern::Or(alternatives) => {
 				// The alternatives of a `|` bind the same names: the same
 				// name in two of them is one local, which they share.
 				context.open(FrameKind::Alternatives);
 				let mut checked = Vec::with_capacity(alternatives.len());
-				for alternative in alternatives {
-					let alternative = &alternative.inner;
+				for &alternative in ast.list(alternatives) {
 					context.open(FrameKind::Product);
-					let pattern = self.check_one_pattern(
-						&alternative.inner,
-						alternative.span,
-						expected,
-						context,
-					);
+					let pattern =
+						self.check_pattern(alternative, expected, context);
 					let bound = context.close();
 					checked.push(Alternative { pattern, bound });
 				}
@@ -580,31 +568,26 @@ impl BodyBuilder<'_, '_> {
 	/// A tuple or struct pattern, with one child per element or field.
 	fn check_destructure(
 		&mut self,
-		destructure: &ast::Destructure,
+		destructure: ast::Destructure,
 		span: TextSpan,
 		expected: TypeIndex,
 		context: &mut PatternContext,
 	) -> PatIdx {
+		let ast = self.ast();
 		match destructure {
 			// A tuple of one is its element: `(p,)` and `(p)` are `p`.
 			ast::Destructure::Tuple { elements }
-				if let [element] = &**elements
-					&& let ast::PatternElement::Pattern(pattern) =
-						&element.inner.inner =>
+				if let [ast::PatternElement::Pattern(pattern)] =
+					*ast.list(elements) =>
 			{
-				self.check_one_pattern(
-					pattern,
-					element.inner.span,
-					expected,
-					context,
-				)
+				self.check_pattern(pattern, expected, context)
 			}
 			ast::Destructure::Tuple { elements } => {
 				self.check_tuple(elements, span, expected, context)
 			}
 			ast::Destructure::Struct { path, elements } => {
 				let Some((struct_index, ty, types)) =
-					self.pattern_struct(path, span, expected)
+					self.pattern_struct(ast.list(path), span, expected)
 				else {
 					return self.check_poisoned(elements, span, context);
 				};
@@ -628,12 +611,10 @@ impl BodyBuilder<'_, '_> {
 			}
 			ast::Destructure::NamedStruct { path, fields } => {
 				let Some((struct_index, ty, types)) =
-					self.pattern_struct(path, span, expected)
+					self.pattern_struct(ast.list(path), span, expected)
 				else {
-					for item in fields {
-						if let ast::PatternFieldItem::Field(field) =
-							&item.inner.inner
-						{
+					for item in ast.list(fields) {
+						if let ast::PatternFieldItem::Field(field) = item {
 							self.check_field(field, TypeIndex::ERROR, context);
 						}
 					}
@@ -664,7 +645,7 @@ impl BodyBuilder<'_, '_> {
 	/// `(a, b)` against `expected`, with one child per element.
 	fn check_tuple(
 		&mut self,
-		elements: &ast::PatternElements,
+		elements: ast::List<ast::PatternElement>,
 		span: TextSpan,
 		expected: TypeIndex,
 		context: &mut PatternContext,
@@ -695,24 +676,16 @@ impl BodyBuilder<'_, '_> {
 	/// one field. `None` when the counts cannot fit (reported).
 	fn check_field_list(
 		&mut self,
-		elements: &ast::PatternElements,
+		elements: ast::List<ast::PatternElement>,
 		struct_index: StructIdx,
 		types: &[TypeIndex],
 		span: TextSpan,
 		context: &mut PatternContext,
 	) -> Option<PatIdx> {
-		match (types, &**elements) {
-			(_, [element])
-				if let ast::PatternElement::Pattern(pattern) =
-					&element.inner.inner =>
-			{
+		match (types, self.ast().list(elements)) {
+			(_, &[ast::PatternElement::Pattern(pattern)]) => {
 				let ty = self.sema.types.intern_tuple(types);
-				Some(self.check_one_pattern(
-					pattern,
-					element.inner.span,
-					ty,
-					context,
-				))
+				Some(self.check_pattern(pattern, ty, context))
 			}
 			(&[field], _)
 				if let Type::Tuple { .. } = self.sema.types.resolve(field) =>
@@ -755,24 +728,20 @@ impl BodyBuilder<'_, '_> {
 	/// `None` when the counts cannot fit (reported, every child still checked).
 	fn check_elements(
 		&mut self,
-		elements: &ast::PatternElements,
+		elements: ast::List<ast::PatternElement>,
 		types: &[TypeIndex],
 		span: TextSpan,
 		context: &mut PatternContext,
 		struct_index: Option<StructIdx>,
 	) -> Option<Vec<PatIdx>> {
 		let mut rest: Option<(usize, TextSpan)> = None;
-		let mut written: Vec<(&ast::Pattern, TextSpan)> = Vec::new();
-		for item in elements {
-			match &item.inner.inner {
-				ast::PatternElement::Pattern(pattern) => {
-					written.push((pattern, item.inner.span));
-				}
-				ast::PatternElement::Rest => match rest {
-					Some((_, first)) => {
-						self.report_duplicate_rest(item.inner.span, first);
-					}
-					None => rest = Some((written.len(), item.inner.span)),
+		let mut written: Vec<ast::PatId> = Vec::new();
+		for &item in self.ast().list(elements) {
+			match item {
+				ast::PatternElement::Pattern(pattern) => written.push(pattern),
+				ast::PatternElement::Rest(at) => match rest {
+					Some((_, first)) => self.report_duplicate_rest(at, first),
+					None => rest = Some((written.len(), at)),
 				},
 			}
 		}
@@ -789,23 +758,16 @@ impl BodyBuilder<'_, '_> {
 				span,
 				struct_index,
 			);
-			for (pattern, span) in written {
-				self.check_one_pattern(
-					pattern,
-					span,
-					TypeIndex::ERROR,
-					context,
-				);
+			for pattern in written {
+				self.check_pattern(pattern, TypeIndex::ERROR, context);
 			}
 			return None;
 		}
 		let before = rest.map_or(written.len(), |(at, _)| at);
 		let after = written.len() - before;
 		let mut children = Vec::with_capacity(count);
-		for (at, &(pattern, span)) in written[..before].iter().enumerate() {
-			children.push(
-				self.check_one_pattern(pattern, span, types[at], context),
-			);
+		for (at, &pattern) in written[..before].iter().enumerate() {
+			children.push(self.check_pattern(pattern, types[at], context));
 		}
 		if let Some((_, rest_span)) = rest {
 			for &ty in &types[before..count - after] {
@@ -816,9 +778,9 @@ impl BodyBuilder<'_, '_> {
 				));
 			}
 		}
-		for (at, &(pattern, span)) in written[before..].iter().enumerate() {
+		for (at, &pattern) in written[before..].iter().enumerate() {
 			let ty = types[count - after + at];
-			children.push(self.check_one_pattern(pattern, span, ty, context));
+			children.push(self.check_pattern(pattern, ty, context));
 		}
 		Some(children)
 	}
@@ -828,7 +790,7 @@ impl BodyBuilder<'_, '_> {
 	/// it is reported and matched as `_`.
 	fn check_fields(
 		&mut self,
-		fields: &ast::PatternFields,
+		fields: ast::List<ast::PatternFieldItem>,
 		struct_index: StructIdx,
 		types: &[TypeIndex],
 		span: TextSpan,
@@ -850,8 +812,8 @@ impl BodyBuilder<'_, '_> {
 					))
 					.with_label(Label::primary(self.scope.file_id, span)),
 			);
-			for item in fields {
-				if let ast::PatternFieldItem::Field(field) = &item.inner.inner {
+			for item in self.ast().list(fields) {
+				if let ast::PatternFieldItem::Field(field) = item {
 					self.check_field(field, TypeIndex::ERROR, context);
 				}
 			}
@@ -860,14 +822,12 @@ impl BodyBuilder<'_, '_> {
 		let mut rest: Option<TextSpan> = None;
 		let mut given: Vec<Option<(PatIdx, TextSpan)>> =
 			vec![None; types.len()];
-		for item in fields {
-			let field = match &item.inner.inner {
-				ast::PatternFieldItem::Rest => {
+		for item in self.ast().list(fields) {
+			let field = match item {
+				ast::PatternFieldItem::Rest(at) => {
 					match rest {
-						Some(first) => {
-							self.report_duplicate_rest(item.inner.span, first)
-						}
-						None => rest = Some(item.inner.span),
+						Some(first) => self.report_duplicate_rest(*at, first),
+						None => rest = Some(*at),
 					}
 					continue;
 				}
@@ -986,13 +946,8 @@ impl BodyBuilder<'_, '_> {
 		expected: TypeIndex,
 		context: &mut PatternContext,
 	) -> PatIdx {
-		match &field.pattern {
-			Some(pattern) => self.check_one_pattern(
-				&pattern.inner,
-				pattern.span,
-				expected,
-				context,
-			),
+		match field.pattern {
+			Some(pattern) => self.check_pattern(pattern, expected, context),
 			// `{ x }` — the field binds a local of its own name.
 			None => {
 				self.bind(field.name, None, expected, field.name.span, context)
@@ -1373,18 +1328,13 @@ impl BodyBuilder<'_, '_> {
 	/// checked against `ERROR` so their bindings are still declared.
 	fn check_poisoned(
 		&mut self,
-		elements: &ast::PatternElements,
+		elements: ast::List<ast::PatternElement>,
 		span: TextSpan,
 		context: &mut PatternContext,
 	) -> PatIdx {
-		for item in elements {
-			if let ast::PatternElement::Pattern(pattern) = &item.inner.inner {
-				self.check_one_pattern(
-					pattern,
-					item.inner.span,
-					TypeIndex::ERROR,
-					context,
-				);
+		for item in self.ast().list(elements) {
+			if let ast::PatternElement::Pattern(pattern) = *item {
+				self.check_pattern(pattern, TypeIndex::ERROR, context);
 			}
 		}
 		self.error_pattern(span)
