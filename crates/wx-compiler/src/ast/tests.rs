@@ -72,60 +72,57 @@ impl TestCase {
 	/// itself does. Only the node kinds those tests need are rendered;
 	/// anything else falls back to its variant name, which is enough to make
 	/// a mismatch obvious.
-	fn shape(&self, expr: &Expression) -> String {
-		match expr {
+	fn shape(&self, expr: ExprId) -> String {
+		match self.ast.expr(expr) {
 			Expression::Binary {
 				operator,
 				left,
 				right,
+				..
 			} => format!(
 				"({} {} {})",
-				operator.inner,
-				self.shape(&left.inner),
-				self.shape(&right.inner)
+				operator,
+				self.shape(left),
+				self.shape(right)
 			),
 			// `u` prefix keeps unary `-` distinguishable from binary `-`
 			Expression::Unary { operator, operand } => {
-				format!("(u{} {})", operator.inner, self.shape(&operand.inner))
+				format!("(u{} {})", operator, self.shape(operand))
 			}
-			Expression::Path(segments) => segments
-				.iter()
-				.map(|segment| self.name(segment.ident.inner))
-				.collect::<Vec<_>>()
-				.join("::"),
+			Expression::Path(segments) => self.path(self.ast.list(segments)),
 			Expression::ObjectAccess { object, member } => format!(
 				"(. {} {})",
-				self.shape(&object.inner),
-				self.name(member.ident.inner)
+				self.shape(object),
+				self.name(self.ast.segment(member).ident.inner)
 			),
 			Expression::Int { value } => value.to_string(),
-			Expression::Tuple { elements } => self.list("tuple", elements),
-			Expression::Call { callee, arguments } => self.list(
-				&format!("call {}", self.shape(&callee.inner)),
-				&arguments.inner,
+			Expression::Tuple { elements } => {
+				self.list("tuple", self.ast.list(elements))
+			}
+			Expression::Call {
+				callee, arguments, ..
+			} => self.list(
+				&format!("call {}", self.shape(callee)),
+				self.ast.list(arguments),
 			),
 			Expression::Ascription { value, ty } => {
-				let ty = match self.ast.ty(*ty) {
+				let ty = match self.ast.ty(ty) {
 					TypeExpression::Path(path) => {
 						self.path(self.ast.list(path))
 					}
 					_ => "<type>".to_string(),
 				};
-				format!("(: {} {ty})", self.shape(&value.inner))
+				format!("(: {} {ty})", self.shape(value))
 			}
-			other => format!("<{}>", expression_kind(other)),
+			other => format!("<{}>", expression_kind(&other)),
 		}
 	}
 
-	fn list(
-		&self,
-		head: &str,
-		elements: &[Separated<Spanned<Expression>>],
-	) -> String {
+	fn list(&self, head: &str, elements: &[ExprId]) -> String {
 		let mut shape = format!("({head}");
-		for element in elements {
+		for &element in elements {
 			shape.push(' ');
-			shape.push_str(&self.shape(&element.inner.inner));
+			shape.push_str(&self.shape(element));
 		}
 		shape.push(')');
 		shape
@@ -230,11 +227,12 @@ impl TestCase {
 	fn local_patterns(&self, index: usize) -> Vec<String> {
 		self.function_block(index)
 			.iter()
-			.filter_map(|statement| match &statement.inner.inner {
-				Statement::LocalDefinition { pattern, .. } => {
-					Some(self.pattern(*pattern))
-				}
-				Statement::Expression(_) => None,
+			.filter_map(|entry| match *entry {
+				Entry::Statement(Statement::LocalDefinition {
+					pattern,
+					..
+				}) => Some(self.pattern(pattern)),
+				_ => None,
 			})
 			.collect()
 	}
@@ -243,12 +241,14 @@ impl TestCase {
 	/// statement, rendered.
 	fn arm_patterns(&self, index: usize) -> Vec<String> {
 		let Expression::Match { arms, .. } =
-			statement_expression(self.function_block(index), 0)
+			self.statement_expression(&self.function_block(index), 0)
 		else {
 			panic!("expected a match")
 		};
-		arms.iter()
-			.map(|arm| self.pattern(arm.inner.inner.pattern))
+		self.ast
+			.list(arms)
+			.iter()
+			.map(|arm| self.pattern(arm.pattern))
 			.collect()
 	}
 
@@ -256,7 +256,8 @@ impl TestCase {
 		&self.ast.items[index].inner.inner
 	}
 
-	fn function_block(&self, index: usize) -> &[Separated<Spanned<Statement>>] {
+	/// The entries of function `index`'s block; see [`TestCase::entries`].
+	fn function_block(&self, index: usize) -> Vec<Entry> {
 		let Item::Function { block, .. } = self.item(index) else {
 			panic!(
 				"item {index} is {}, not a function",
@@ -264,7 +265,52 @@ impl TestCase {
 			)
 		};
 
-		block.inner.as_block_statements()
+		self.entries(*block)
+	}
+
+	/// A block's entries as written: its statements, then its tail.
+	fn entries(&self, block: BlockId) -> Vec<Entry> {
+		let Block { statements, tail } = self.ast.block(block);
+		let statements = self.ast.list(statements).iter();
+		statements
+			.map(|&statement| Entry::Statement(self.ast.statement(statement)))
+			.chain(tail.map(Entry::Tail))
+			.collect()
+	}
+
+	/// The expression entry `index` is, a statement's or the tail.
+	fn entry_expr(&self, entries: &[Entry], index: usize) -> ExprId {
+		match entries[index] {
+			Entry::Statement(Statement::Expression(expr))
+			| Entry::Tail(expr) => expr,
+			Entry::Statement(_) => panic!("expected expression statement"),
+		}
+	}
+
+	fn statement_expression(
+		&self,
+		entries: &[Entry],
+		index: usize,
+	) -> Expression {
+		self.ast.expr(self.entry_expr(entries, index))
+	}
+
+	fn local_definition_value(
+		&self,
+		entries: &[Entry],
+		index: usize,
+	) -> Expression {
+		self.ast.expr(self.local_value(entries, index))
+	}
+
+	/// The value of the `local` entry `index` is.
+	fn local_value(&self, entries: &[Entry], index: usize) -> ExprId {
+		let Entry::Statement(Statement::LocalDefinition { value, .. }) =
+			entries[index]
+		else {
+			panic!("expected local definition")
+		};
+		value
 	}
 
 	fn struct_fields(
@@ -287,7 +333,7 @@ impl TestCase {
 fn shape_of(expression: &str) -> String {
 	let case = TestCase::new(&format!("func f() {{ {expression} }}"));
 	case.diagnostics().assert_none();
-	case.shape(statement_expression(case.function_block(0), 0))
+	case.shape(case.entry_expr(&case.function_block(0), 0))
 }
 
 /// Fallback naming for [`TestCase::shape`] — just enough to identify an
@@ -296,8 +342,6 @@ fn expression_kind(expression: &Expression) -> &'static str {
 	match expression {
 		Expression::Call { .. } => "call",
 		Expression::NamedCall { .. } => "named-call",
-		Expression::MethodCall(_) => "method-call",
-		Expression::NamedMethodCall(_) => "named-method-call",
 		Expression::ObjectAccess { .. } => "field",
 		Expression::Tuple { .. } => "tuple",
 		Expression::IfElse { .. } => "if",
@@ -353,15 +397,15 @@ fn bounds(param: &Spanned<TypeParam>) -> Option<BoundId> {
 /// function is, rendered by kind: `type`, `literal` or the constant path.
 fn call_type_args(case: &TestCase, index: usize) -> Vec<String> {
 	let Expression::Call { callee, .. } =
-		statement_expression(case.function_block(0), index)
+		case.statement_expression(&case.function_block(0), index)
 	else {
 		panic!("expected a call")
 	};
-	let Expression::Path(segments) = &callee.inner else {
+	let Expression::Path(segments) = case.ast.expr(callee) else {
 		panic!("expected a path callee")
 	};
 	case.ast
-		.list(segments[0].type_args)
+		.list(case.ast.list(segments)[0].type_args)
 		.iter()
 		.map(|&arg| match arg {
 			TypeArgument::Type(_) => "type".to_string(),
@@ -384,41 +428,20 @@ fn call_type_args(case: &TestCase, index: usize) -> Vec<String> {
 		.collect()
 }
 
-fn statement_expression(
-	statements: &[Separated<Spanned<Statement>>],
-	index: usize,
-) -> &Expression {
-	let Statement::Expression(expr) = &statements[index].inner.inner else {
-		panic!("expected expression statement")
-	};
-
-	&expr.inner
-}
-
-fn local_definition_value(
-	statements: &[Separated<Spanned<Statement>>],
-	index: usize,
-) -> &Expression {
-	let Statement::LocalDefinition { value, .. } =
-		&statements[index].inner.inner
+fn local_definition_pattern(entries: &[Entry], index: usize) -> PatId {
+	let Entry::Statement(Statement::LocalDefinition { pattern, .. }) =
+		entries[index]
 	else {
 		panic!("expected local definition")
 	};
-
-	&value.inner
+	pattern
 }
 
-fn local_definition_pattern(
-	statements: &[Separated<Spanned<Statement>>],
-	index: usize,
-) -> PatId {
-	let Statement::LocalDefinition { pattern, .. } =
-		&statements[index].inner.inner
-	else {
-		panic!("expected local definition")
-	};
-
-	*pattern
+/// An entry of a block, as written: a statement, or its tail.
+#[derive(Clone, Copy)]
+enum Entry {
+	Statement(Statement),
+	Tail(ExprId),
 }
 
 // ── Top-level items ──────────────────────────────────────────────────────────
@@ -506,7 +529,7 @@ fn test_function_mut_param() {
 
 	// `mut` on a local lives on its binding pattern, not on the statement
 	let statements = case.function_block(0);
-	let pattern = local_definition_pattern(statements, 0);
+	let pattern = local_definition_pattern(&statements, 0);
 	let Pattern::Binding { name, .. } = case.ast.pattern(pattern) else {
 		panic!("expected a binding pattern")
 	};
@@ -989,16 +1012,19 @@ fn test_literals() {
 	let statements = case.function_block(0);
 
 	assert!(
-		matches!(local_definition_value(statements, 0), Expression::Float),
+		matches!(
+			case.local_definition_value(&statements, 0),
+			Expression::Float
+		),
 		"expected a float literal"
 	);
 	// Literal contents are recovered from spans and interpreted in TIR.
 	assert!(matches!(
-		local_definition_value(statements, 1),
+		case.local_definition_value(&statements, 1),
 		Expression::Char
 	));
 	assert!(matches!(
-		local_definition_value(statements, 2),
+		case.local_definition_value(&statements, 2),
 		Expression::String
 	));
 }
@@ -1021,16 +1047,22 @@ fn test_if_else() {
 		condition,
 		then_block,
 		else_block,
-	} = statement_expression(statements, 0)
+	} = case.statement_expression(&statements, 0)
 	else {
 		panic!("expected an if/else")
 	};
-	assert!(matches!(condition.inner, Expression::Binary { .. }));
-	assert!(matches!(then_block.inner, Expression::Block { .. }));
+	assert!(matches!(
+		case.ast.expr(condition),
+		Expression::Binary { .. }
+	));
+	assert_eq!(case.entries(then_block).len(), 1);
 	// `else if` nests an `if` in the else position; the checker and lowering
 	// both expect either a block or a nested `if` there.
-	let else_block = else_block.as_ref().expect("`else` should be recorded");
-	assert!(matches!(else_block.inner, Expression::Block { .. }));
+	let else_block = else_block.expect("`else` should be recorded");
+	assert!(matches!(
+		case.ast.expr(else_block),
+		Expression::Block { .. }
+	));
 }
 
 #[test]
@@ -1046,17 +1078,18 @@ fn test_else_if_nests_an_if_in_the_else_position() {
 
 	let statements = case.function_block(0);
 	let Expression::IfElse { else_block, .. } =
-		statement_expression(statements, 0)
+		case.statement_expression(&statements, 0)
 	else {
 		panic!("expected an if/else")
 	};
-	let else_block = else_block.as_ref().expect("`else` should be recorded");
-	let Expression::IfElse { else_block, .. } = &else_block.inner else {
+	let else_block = else_block.expect("`else` should be recorded");
+	let Expression::IfElse { else_block, .. } = case.ast.expr(else_block)
+	else {
 		panic!("expected the else position to hold a nested if")
 	};
 	assert!(
 		matches!(
-			else_block.as_deref().map(|block| &block.inner),
+			else_block.map(|block| case.ast.expr(block)),
 			Some(Expression::Block { .. })
 		),
 		"the nested if's own else must still be a block"
@@ -1078,11 +1111,11 @@ fn test_match_int_literal_patterns() {
 
 	let statements = case.function_block(0);
 	let Expression::Match { scrutinee, .. } =
-		statement_expression(statements, 0)
+		case.statement_expression(&statements, 0)
 	else {
 		panic!("expected a match")
 	};
-	assert!(matches!(scrutinee.inner, Expression::Path(_)));
+	assert!(matches!(case.ast.expr(scrutinee), Expression::Path(_)));
 	assert_eq!(case.arm_patterns(0), ["0", "(| 1 2)", "_"]);
 }
 
@@ -1100,22 +1133,14 @@ fn test_match_arm_bodies_may_be_expressions_or_blocks() {
 	case.diagnostics().assert_none();
 
 	let Expression::Match { arms, .. } =
-		statement_expression(case.function_block(0), 0)
+		case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected a match")
 	};
-	assert!(matches!(
-		arms[0].inner.inner.body.inner,
-		Expression::Int { .. }
-	));
-	assert!(matches!(
-		arms[1].inner.inner.body.inner,
-		Expression::Block { .. }
-	));
-	assert!(matches!(
-		arms[2].inner.inner.body.inner,
-		Expression::Binary { .. }
-	));
+	let body = |at: usize| case.ast.expr(case.ast.list(arms)[at].body);
+	assert!(matches!(body(0), Expression::Int { .. }));
+	assert!(matches!(body(1), Expression::Block { .. }));
+	assert!(matches!(body(2), Expression::Binary { .. }));
 }
 
 #[test]
@@ -1203,29 +1228,22 @@ fn test_loop_break_label() {
 
 	// the loop carries its own label
 	let statements = case.function_block(0);
-	let Expression::Loop { label, block } = statement_expression(statements, 0)
+	let Expression::Loop { label, block } =
+		case.statement_expression(&statements, 0)
 	else {
 		panic!("expected a loop")
 	};
 	assert_eq!(case.name(label.expect("a labelled loop").inner), "result");
-	let Expression::Block { statements, .. } = &block.inner else {
-		panic!("expected a block as the loop body")
-	};
+	let statements = case.entries(block);
 
 	// `break :result n` carries both a label and a value
 	let Expression::IfElse { then_block, .. } =
-		statement_expression(&statements.inner, 0)
+		case.statement_expression(&statements, 0)
 	else {
 		panic!("expected an if")
 	};
-	let Expression::Block {
-		statements: body, ..
-	} = &then_block.inner
-	else {
-		panic!("expected a block")
-	};
 	let Expression::Break { label, value } =
-		statement_expression(&body.inner, 0)
+		case.statement_expression(&case.entries(then_block), 0)
 	else {
 		panic!("expected a break")
 	};
@@ -1236,7 +1254,7 @@ fn test_loop_break_label() {
 	assert!(value.is_some(), "`break :result n` should record a value");
 
 	assert!(matches!(
-		statement_expression(&statements.inner, 2),
+		case.statement_expression(&statements, 2),
 		Expression::Continue { .. }
 	));
 }
@@ -1255,13 +1273,13 @@ fn a_label_is_written_after_its_keyword() {
 	let statements = case.function_block(0);
 	let Expression::Loop {
 		label: Some(outer), ..
-	} = statement_expression(statements, 0)
+	} = case.statement_expression(&statements, 0)
 	else {
 		panic!("expected a labelled loop")
 	};
 	let Expression::Block {
 		label: Some(found), ..
-	} = statement_expression(statements, 1)
+	} = case.statement_expression(&statements, 1)
 	else {
 		panic!("expected a labelled block")
 	};
@@ -1296,14 +1314,14 @@ fn a_labelled_if_is_reported_and_read_as_a_labelled_block_around_it() {
 		.assert_codes(&[DiagnosticCode::LabelOnIf]);
 	let Expression::Block {
 		label: Some(label),
-		statements,
-	} = statement_expression(case.function_block(0), 0)
+		block,
+	} = case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected a labelled block")
 	};
 	assert_eq!(case.name(label.inner), "l");
 	assert!(matches!(
-		statement_expression(&statements.inner, 0),
+		case.statement_expression(&case.entries(block), 0),
 		Expression::IfElse { .. }
 	));
 }
@@ -1334,25 +1352,31 @@ fn an_ascription_is_only_an_element() {
 	let case = TestCase::new("func f() { g({ x: 1 }) }");
 	case.diagnostics().assert_none();
 	assert!(matches!(
-		statement_expression(case.function_block(0), 0),
+		case.statement_expression(&case.function_block(0), 0),
 		Expression::NamedCall { .. }
 	));
 }
 
-/// A named call's path callee and arguments.
-fn named_call(
-	expression: &Expression,
-) -> (&[PathSegment], &[Separated<Spanned<NamedArgument>>]) {
-	let Expression::NamedCall { callee, arguments } = expression else {
-		panic!(
-			"expected a named call, found {}",
-			expression_kind(expression)
-		)
-	};
-	let Expression::Path(path) = &callee.inner else {
-		panic!("expected a path callee")
-	};
-	(path, &arguments.inner)
+impl TestCase {
+	/// A named call's path callee and arguments.
+	fn named_call(
+		&self,
+		expression: Expression,
+	) -> (&[PathSegment], &[NamedArgument]) {
+		let Expression::NamedCall {
+			callee, arguments, ..
+		} = expression
+		else {
+			panic!(
+				"expected a named call, found {}",
+				expression_kind(&expression)
+			)
+		};
+		let Expression::Path(path) = self.ast.expr(callee) else {
+			panic!("expected a path callee")
+		};
+		(self.ast.list(path), self.ast.list(arguments))
+	}
 }
 
 #[test]
@@ -1364,13 +1388,13 @@ fn a_named_argument_with_no_value_keeps_its_name() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let (_, arguments) =
-		named_call(statement_expression(case.function_block(0), 0));
+		case.named_call(case.statement_expression(&case.function_block(0), 0));
 	assert_eq!(arguments.len(), 2);
-	let value = (arguments[0].inner.inner.value.as_ref())
+	let value = (arguments[0].value)
 		.expect("the value is kept, not read as a shorthand");
-	assert!(matches!(value.inner, Expression::Error));
-	assert_eq!(value.span, TextSpan::new(17, 18));
-	assert!(arguments[1].inner.inner.value.is_some());
+	assert!(matches!(case.ast.expr(value), Expression::Error));
+	assert_eq!(case.ast.expr_span(value), TextSpan::new(17, 18));
+	assert!(arguments[1].value.is_some());
 }
 
 #[test]
@@ -1379,18 +1403,13 @@ fn a_call_keeps_the_span_of_its_delimiters() {
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
-	let Expression::Call { arguments, .. } =
-		statement_expression(statements, 0)
-	else {
-		panic!("expected a call")
-	};
-	assert_eq!(arguments.span.extract_str(source), "(1, 2)");
-	let Expression::NamedCall { arguments, .. } =
-		statement_expression(statements, 1)
-	else {
-		panic!("expected a named call")
-	};
-	assert_eq!(arguments.span.extract_str(source), "{ a: 1 }");
+	let call = case.entry_expr(&statements, 0);
+	assert_eq!(case.ast.arguments_span(call).extract_str(source), "(1, 2)");
+	let call = case.entry_expr(&statements, 1);
+	assert_eq!(
+		case.ast.arguments_span(call).extract_str(source),
+		"{ a: 1 }"
+	);
 }
 
 #[test]
@@ -1407,30 +1426,29 @@ fn test_named_call() {
     "});
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
-	let call =
-		|index: usize| named_call(local_definition_value(statements, index));
+	let call = |index: usize| {
+		case.named_call(case.local_definition_value(&statements, index))
+	};
 
 	// explicit `x: x` records a value; shorthand `x` leaves it `None`
 	let (path, explicit) = call(0);
 	assert_eq!(case.name(path[0].ident.inner), "Point");
-	assert!(explicit.iter().all(|f| f.inner.inner.value.is_some()));
+	assert!(explicit.iter().all(|f| f.value.is_some()));
 
 	let (_, shorthand) = call(1);
 	assert!(
-		shorthand.iter().all(|f| f.inner.inner.value.is_none()),
+		shorthand.iter().all(|f| f.value.is_none()),
 		"`Point({{ x, y }})` is shorthand, so no explicit values"
 	);
-	let names: Vec<&str> = shorthand
-		.iter()
-		.map(|f| case.name(f.inner.inner.name.inner))
-		.collect();
+	let names: Vec<&str> =
+		shorthand.iter().map(|f| case.name(f.name.inner)).collect();
 	assert_eq!(names, ["x", "y"]);
 
 	assert!(call(2).1.is_empty());
 	// No arguments at all is the positional form.
 	assert!(matches!(
-		local_definition_value(statements, 3),
-		Expression::Call { arguments, .. } if arguments.inner.is_empty()
+		case.local_definition_value(&statements, 3),
+		Expression::Call { arguments, .. } if arguments.is_empty()
 	));
 }
 
@@ -1444,18 +1462,24 @@ fn test_named_method_call_and_turbofish() {
     "});
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
-	let (path, arguments) = named_call(local_definition_value(stmts, 0));
+	let (path, arguments) =
+		case.named_call(case.local_definition_value(&stmts, 0));
 	// the turbofish binds to the final segment: `Point::<f32>`
 	assert_eq!(path.len(), 1);
 	assert_eq!(path[0].type_args.len(), 1);
 	assert_eq!(arguments.len(), 2);
 
-	let Expression::NamedMethodCall(call) = statement_expression(stmts, 1)
+	let Expression::NamedCall {
+		callee, arguments, ..
+	} = case.statement_expression(&stmts, 1)
 	else {
 		panic!("expected a named method call")
 	};
-	assert_eq!(case.name(call.method.ident.inner), "move_to");
-	assert_eq!(call.arguments.inner.len(), 2);
+	let Expression::ObjectAccess { member, .. } = case.ast.expr(callee) else {
+		panic!("expected a method as the callee")
+	};
+	assert_eq!(case.name(case.ast.segment(member).ident.inner), "move_to");
+	assert_eq!(arguments.len(), 2);
 }
 
 #[test]
@@ -1470,8 +1494,9 @@ fn a_receiver_is_given_by_name_as_self() {
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
 	for index in 0..2 {
-		let (_, arguments) = named_call(statement_expression(stmts, index));
-		assert_eq!(case.name(arguments[0].inner.inner.name.inner), "self");
+		let (_, arguments) =
+			case.named_call(case.statement_expression(&stmts, index));
+		assert_eq!(case.name(arguments[0].name.inner), "self");
 	}
 
 	let case = TestCase::new("func f() { g({ loop: 1 }); }");
@@ -1505,15 +1530,15 @@ fn a_plain_block_is_written_with_its_keyword() {
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
 	assert!(matches!(
-		local_definition_value(statements, 0),
+		case.local_definition_value(&statements, 0),
 		Expression::Block { .. }
 	));
 	assert!(matches!(
-		statement_expression(statements, 1),
+		case.statement_expression(&statements, 1),
 		Expression::Block { .. }
 	));
 	assert!(matches!(
-		statement_expression(statements, 2),
+		case.statement_expression(&statements, 2),
 		Expression::Block { label: Some(_), .. }
 	));
 
@@ -1522,7 +1547,7 @@ fn a_plain_block_is_written_with_its_keyword() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::BlockNeedsKeyword]);
 	assert!(matches!(
-		local_definition_value(case.function_block(0), 0),
+		case.local_definition_value(&case.function_block(0), 0),
 		Expression::Block { .. }
 	));
 }
@@ -1559,7 +1584,8 @@ fn old_struct_forms_are_reported_and_read_as_the_new_ones() {
 	]);
 	assert_eq!(case.struct_fields(0).len(), 2);
 	let statements = case.function_block(1);
-	let (_, arguments) = named_call(local_definition_value(statements, 0));
+	let (_, arguments) =
+		case.named_call(case.local_definition_value(&statements, 0));
 	assert_eq!(arguments.len(), 2);
 	// The old *pattern* form is gone: it is reported and read as an error,
 	// not as the new one.
@@ -1802,8 +1828,8 @@ fn a_binding_without_a_type_recovers_with_an_error_type() {
 	}
 }
 
-/// Parentheses always make a `Tuple`, recorded as written, separators
-/// included; what one element means is TIR's.
+/// Parentheses always make a `Tuple`, of the elements written (a trailing
+/// comma adds none); what one element means is TIR's.
 #[test]
 fn test_parenthesized_lists_are_tuples_as_written() {
 	let case = TestCase::new(indoc! {"
@@ -1816,21 +1842,12 @@ fn test_parenthesized_lists_are_tuples_as_written() {
 
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
-	assert!(matches!(
-		local_definition_value(statements, 0),
-		Expression::Tuple { elements }
-			if matches!(&**elements, [element] if element.separator.is_none())
-	));
-	assert!(matches!(
-		local_definition_value(statements, 1),
-		Expression::Tuple { elements }
-			if matches!(&**elements, [element] if element.separator.is_some())
-	));
-	assert!(matches!(
-		local_definition_value(statements, 2),
-		Expression::Tuple { elements }
-			if matches!(&**elements, [_, last] if last.separator.is_some())
-	));
+	for (index, count) in [(0, 1), (1, 1), (2, 2)] {
+		assert!(matches!(
+			case.local_definition_value(&statements, index),
+			Expression::Tuple { elements } if elements.len() == count
+		));
+	}
 }
 
 #[test]
@@ -1850,11 +1867,11 @@ fn test_call_field_namespace() {
 
 	let unary = |index: usize| {
 		let Expression::Unary { operator, .. } =
-			local_definition_value(statements, index)
+			case.local_definition_value(&statements, index)
 		else {
 			panic!("expected a unary expression")
 		};
-		operator.inner
+		operator
 	};
 	assert_eq!(unary(0), UnaryOp::InvertSign);
 	assert_eq!(unary(1), UnaryOp::BitNot);
@@ -1862,26 +1879,25 @@ fn test_call_field_namespace() {
 	// `p.x` is field access; `console::log` is a two-segment path — the
 	// distinction between `.` and `::` is settled here, not in TIR
 	let Expression::ObjectAccess { member, .. } =
-		local_definition_value(statements, 2)
+		case.local_definition_value(&statements, 2)
 	else {
 		panic!("expected field access")
 	};
-	assert_eq!(case.name(member.ident.inner), "x");
+	assert_eq!(case.name(case.ast.segment(member).ident.inner), "x");
 
-	let Expression::Path(segments) = local_definition_value(statements, 3)
+	let Expression::Path(segments) =
+		case.local_definition_value(&statements, 3)
 	else {
 		panic!("expected a path")
 	};
-	let path: Vec<&str> =
-		segments.iter().map(|s| case.name(s.ident.inner)).collect();
-	assert_eq!(path, ["console", "log"]);
+	assert_eq!(case.path(case.ast.list(segments)), "console::log");
 
 	let Expression::Call { arguments, .. } =
-		statement_expression(statements, 4)
+		case.statement_expression(&statements, 4)
 	else {
 		panic!("expected a call")
 	};
-	assert_eq!(arguments.inner.len(), 2);
+	assert_eq!(arguments.len(), 2);
 }
 
 #[test]
@@ -1893,18 +1909,16 @@ fn test_operator_precedence() {
     "});
 
 	let statements = case.function_block(0);
-	let Expression::Binary { right, .. } = statement_expression(statements, 0)
+	let Expression::Binary { right, .. } =
+		case.statement_expression(&statements, 0)
 	else {
 		panic!("expected outer binary expression")
 	};
 	assert!(
 		matches!(
-			&right.inner,
+			case.ast.expr(right),
 			Expression::Binary {
-				operator: Spanned {
-					inner: BinaryOp::Mul,
-					..
-				},
+				operator: BinaryOp::Mul,
 				..
 			}
 		),
@@ -1922,19 +1936,16 @@ fn test_left_associativity() {
 
 	let statements = case.function_block(0);
 	let Expression::Binary { left, operator, .. } =
-		statement_expression(statements, 0)
+		case.statement_expression(&statements, 0)
 	else {
 		panic!("expected outer binary expression")
 	};
-	assert_eq!(operator.inner, BinaryOp::Sub);
+	assert_eq!(operator, BinaryOp::Sub);
 	assert!(
 		matches!(
-			&left.inner,
+			case.ast.expr(left),
 			Expression::Binary {
-				operator: Spanned {
-					inner: BinaryOp::Sub,
-					..
-				},
+				operator: BinaryOp::Sub,
 				..
 			}
 		),
@@ -1956,25 +1967,31 @@ fn test_chained_member_access() {
 	let statements = case.function_block(0);
 
 	let Expression::ObjectAccess { object, member } =
-		local_definition_value(statements, 0)
+		case.local_definition_value(&statements, 0)
 	else {
 		panic!("expected object access")
 	};
-	assert_eq!(case.name(member.ident.inner), "y");
-	let Expression::ObjectAccess { member: inner, .. } = &object.inner else {
+	let name = |member| case.name(case.ast.segment(member).ident.inner);
+	assert_eq!(name(member), "y");
+	let Expression::ObjectAccess { member: inner, .. } = case.ast.expr(object)
+	else {
 		panic!("`p.x.y` should nest as `(p.x).y`")
 	};
-	assert_eq!(case.name(inner.ident.inner), "x");
+	assert_eq!(name(inner), "x");
 
 	let Expression::ObjectAccess { object, member } =
-		local_definition_value(statements, 1)
+		case.local_definition_value(&statements, 1)
 	else {
 		panic!("expected object access")
 	};
-	assert_eq!(case.name(member.ident.inner), "z");
+	assert_eq!(name(member), "z");
 	assert!(
-		matches!(object.inner, Expression::MethodCall(_)),
-		"`p.foo().z` should access the call's result"
+		matches!(
+			case.ast.expr(object),
+			Expression::Call { callee, .. }
+				if matches!(case.ast.expr(callee), Expression::ObjectAccess { .. })
+		),
+		"`p.foo().z` should access the method call's result"
 	);
 }
 
@@ -1988,12 +2005,12 @@ fn test_address_of() {
     "});
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
-	let expr = local_definition_value(stmts, 0);
+	let expr = case.local_definition_value(&stmts, 0);
 	let Expression::AddressOf { value } = expr else {
 		panic!("expected AddressOf, got {expr:?}");
 	};
 	assert!(
-		matches!(value.inner, Expression::Deref { .. }),
+		matches!(case.ast.expr(value), Expression::Deref { .. }),
 		"expected Deref as AddressOf operand"
 	);
 }
@@ -2008,15 +2025,15 @@ fn test_address_of_through_field() {
     "});
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
-	let expr = local_definition_value(stmts, 0);
+	let expr = case.local_definition_value(&stmts, 0);
 	let Expression::AddressOf { value } = expr else {
 		panic!("expected AddressOf, got {expr:?}");
 	};
-	let Expression::ObjectAccess { object, .. } = &value.inner else {
+	let Expression::ObjectAccess { object, .. } = case.ast.expr(value) else {
 		panic!("expected ObjectAccess inside AddressOf");
 	};
 	assert!(
-		matches!(object.inner, Expression::Deref { .. }),
+		matches!(case.ast.expr(object), Expression::Deref { .. }),
 		"expected Deref as root of field place"
 	);
 }
@@ -2034,15 +2051,15 @@ fn test_numeric_literal_forms() {
 	let statements = case.function_block(0);
 	assert_eq!(statements.len(), 3);
 	assert!(matches!(
-		local_definition_value(statements, 0),
+		case.local_definition_value(&statements, 0),
 		Expression::Int { value: 255 }
 	));
 	assert!(matches!(
-		local_definition_value(statements, 1),
+		case.local_definition_value(&statements, 1),
 		Expression::Int { value: 10 }
 	));
 	assert!(matches!(
-		local_definition_value(statements, 2),
+		case.local_definition_value(&statements, 2),
 		Expression::Int { value: 1_000_000 }
 	));
 }
@@ -2068,7 +2085,10 @@ fn test_scientific_notation_float_literals() {
 	// value is assembled in TIR — see `test_scientific_notation_float_values`.
 	for i in 0..statements.len() {
 		assert!(
-			matches!(local_definition_value(statements, i), Expression::Float),
+			matches!(
+				case.local_definition_value(&statements, i),
+				Expression::Float
+			),
 			"statement {i} should parse as a float literal"
 		);
 	}
@@ -2328,7 +2348,8 @@ fn test_pattern_with_type_annotation() {
 	case.diagnostics().assert_none();
 	let stmts = case.function_block(0);
 
-	let Statement::LocalDefinition { ty, .. } = &stmts[0].inner.inner else {
+	let Entry::Statement(Statement::LocalDefinition { ty, .. }) = stmts[0]
+	else {
 		panic!("expected local definition")
 	};
 	assert_eq!(case.local_patterns(0), ["(tuple a b)"]);
@@ -2384,7 +2405,7 @@ fn test_invalid_integer_literal() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::InvalidNumericLiteral]);
 	assert!(matches!(
-		statement_expression(case.function_block(0), 0),
+		case.statement_expression(&case.function_block(0), 0),
 		Expression::Int { value: 0 }
 	));
 }
@@ -2403,7 +2424,7 @@ fn test_invalid_float_literal_empty_exponent() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::InvalidNumericLiteral]);
 	assert!(matches!(
-		statement_expression(case.function_block(0), 0),
+		case.statement_expression(&case.function_block(0), 0),
 		Expression::Float
 	));
 }
@@ -2478,13 +2499,13 @@ fn test_missing_initializer() {
 	);
 	assert_eq!(case.ast.items.len(), 1);
 	// The local is kept, its value an error node.
-	let [statement] = case.function_block(0) else {
+	let [statement] = *case.function_block(0) else {
 		panic!("expected the local to be kept");
 	};
 	assert!(matches!(
-		&statement.inner.inner,
-		Statement::LocalDefinition { value, .. }
-			if matches!(value.inner, Expression::Error)
+		statement,
+		Entry::Statement(Statement::LocalDefinition { value, .. })
+			if matches!(case.ast.expr(value), Expression::Error)
 	));
 }
 
@@ -2707,18 +2728,15 @@ fn test_chained_comparison_error() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::ChainedComparison]);
 	let Expression::Binary { left, operator, .. } =
-		statement_expression(case.function_block(0), 0)
+		case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected outer comparison")
 	};
-	assert_eq!(operator.inner, BinaryOp::Less);
+	assert_eq!(operator, BinaryOp::Less);
 	assert!(matches!(
-		&left.inner,
+		case.ast.expr(left),
 		Expression::Binary {
-			operator: Spanned {
-				inner: BinaryOp::Less,
-				..
-			},
+			operator: BinaryOp::Less,
 			..
 		}
 	));
@@ -2873,11 +2891,11 @@ fn an_array_length_is_a_literal_or_a_path() {
 		));
 	}
 	let Expression::ArrayRepeat { count, .. } =
-		local_definition_value(case.function_block(0), 0)
+		case.local_definition_value(&case.function_block(0), 0)
 	else {
 		panic!("expected an array repeat")
 	};
-	assert!(matches!(case.ast.constant(*count), ConstArgument::Path(_)));
+	assert!(matches!(case.ast.constant(count), ConstArgument::Path(_)));
 
 	// Only a constant can be a length, so `const` says nothing; and a
 	// computation is not one.
@@ -2928,12 +2946,12 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
 			)
 	));
 	let Expression::ArrayRepeat { count, .. } =
-		local_definition_value(case.function_block(0), 0)
+		case.local_definition_value(&case.function_block(0), 0)
 	else {
 		panic!("expected an array repeat")
 	};
 	assert!(matches!(
-		case.ast.constant(*count),
+		case.ast.constant(count),
 		ConstArgument::QualifiedPath { .. }
 	));
 }
@@ -2945,24 +2963,24 @@ fn an_array_length_can_be_left_to_its_context() {
 	);
 	case.diagnostics()
 		.assert_warning(DiagnosticCode::RedundantConstMarker);
-	let Statement::LocalDefinition { ty: Some(ty), .. } =
-		&case.function_block(0)[0].inner.inner
+	let Entry::Statement(Statement::LocalDefinition { ty: Some(ty), .. }) =
+		case.function_block(0)[0]
 	else {
 		panic!("expected a local with a type")
 	};
 	let TypeExpression::Array { length, .. } =
-		pointee(&case.ast, case.ast.ty(*ty))
+		pointee(&case.ast, case.ast.ty(ty))
 	else {
 		panic!("expected an array type")
 	};
 	assert!(matches!(case.ast.constant(length), ConstArgument::Infer));
 	for at in [0, 1] {
 		let Expression::ArrayRepeat { count, .. } =
-			local_definition_value(case.function_block(0), at)
+			case.local_definition_value(&case.function_block(0), at)
 		else {
 			panic!("expected an array repeat")
 		};
-		assert!(matches!(case.ast.constant(*count), ConstArgument::Infer));
+		assert!(matches!(case.ast.constant(count), ConstArgument::Infer));
 	}
 }
 
@@ -3194,15 +3212,17 @@ fn test_turbofish_call() {
 	case.diagnostics().assert_none();
 
 	let statements = case.function_block(0);
-	let Expression::Call { callee, arguments } =
-		statement_expression(statements, 0)
+	let Expression::Call {
+		callee, arguments, ..
+	} = case.statement_expression(&statements, 0)
 	else {
 		panic!("expected a call")
 	};
-	assert_eq!(arguments.inner.len(), 1);
-	let Expression::Path(segments) = &callee.inner else {
+	assert_eq!(arguments.len(), 1);
+	let Expression::Path(segments) = case.ast.expr(callee) else {
 		panic!("expected a path callee")
 	};
+	let segments = case.ast.list(segments);
 	// the turbofish binds to the final segment, not to the call
 	assert_eq!(segments.len(), 1);
 	assert_eq!(case.name(segments[0].ident.inner), "identity");
@@ -3219,14 +3239,20 @@ fn test_turbofish_method_call() {
 	case.diagnostics().assert_none();
 
 	let statements = case.function_block(0);
-	// a called member's turbofish is a `MethodCall`'s
-	let Expression::MethodCall(call) = statement_expression(statements, 0)
+	// a called member's turbofish is its method's
+	let Expression::Call {
+		callee, arguments, ..
+	} = case.statement_expression(&statements, 0)
 	else {
 		panic!("expected a method call")
 	};
-	assert_eq!(case.name(call.method.ident.inner), "transform");
-	assert_eq!(call.method.type_args.len(), 1);
-	assert!(call.arguments.inner.is_empty());
+	let Expression::ObjectAccess { member, .. } = case.ast.expr(callee) else {
+		panic!("expected a member as the callee")
+	};
+	let method = case.ast.segment(member);
+	assert_eq!(case.name(method.ident.inner), "transform");
+	assert_eq!(method.type_args.len(), 1);
+	assert!(arguments.is_empty());
 }
 
 #[test]
@@ -3655,30 +3681,27 @@ fn test_index_and_array_literal_expressions() {
 	let statements = case.function_block(0);
 
 	let Expression::ArrayList { elements } =
-		local_definition_value(statements, 0)
+		case.local_definition_value(&statements, 0)
 	else {
 		panic!("expected an array literal")
 	};
-	let separated: Vec<bool> = (elements.iter())
-		.map(|element| element.separator.is_some())
-		.collect();
-	assert_eq!(separated, [true, true, false]);
+	assert_eq!(elements.len(), 3);
 
 	// `[value; count]` keeps the two apart rather than expanding the value
 	let Expression::ArrayRepeat { value, count } =
-		local_definition_value(statements, 1)
+		case.local_definition_value(&statements, 1)
 	else {
 		panic!("expected an array repeat")
 	};
-	assert_eq!(case.shape(&value.inner), "0");
+	assert_eq!(case.shape(value), "0");
 	assert!(matches!(
-		case.ast.constant(*count),
+		case.ast.constant(count),
 		ConstArgument::Literal(Literal::Int(8))
 	));
 
 	// A subscript is an index expression.
 	assert!(matches!(
-		local_definition_value(statements, 2),
+		case.local_definition_value(&statements, 2),
 		Expression::Index { .. }
 	));
 }
@@ -3700,14 +3723,16 @@ fn test_qualified_path_records_its_trait_and_grouped_does_not() {
 	case.diagnostics().assert_none();
 
 	let Expression::Call { callee, .. } =
-		statement_expression(case.function_block(0), 0)
+		case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected a call")
 	};
-	let Expression::QualifiedPath { root, segments } = &callee.inner else {
+	let Expression::QualifiedPath { root, segments } = case.ast.expr(callee)
+	else {
 		panic!("expected a qualified path")
 	};
-	let root = case.ast.qualified_root(*root);
+	let root = case.ast.qualified_root(root);
+	let segments = case.ast.list(segments);
 	assert_eq!(
 		case.name(case.ast.list(root.trait_path)[0].ident.inner),
 		"Show"
@@ -3715,13 +3740,14 @@ fn test_qualified_path_records_its_trait_and_grouped_does_not() {
 	assert_eq!(case.name(segments[0].ident.inner), "render");
 
 	let Expression::Call { callee, .. } =
-		statement_expression(case.function_block(1), 0)
+		case.statement_expression(&case.function_block(1), 0)
 	else {
 		panic!("expected a call")
 	};
-	let Expression::Grouped { segments, .. } = &callee.inner else {
+	let Expression::Grouped { segments, .. } = case.ast.expr(callee) else {
 		panic!("expected a grouped path — `<T>::x` names no trait")
 	};
+	let segments = case.ast.list(segments);
 	assert_eq!(case.name(segments[0].ident.inner), "origin");
 }
 
@@ -3798,16 +3824,17 @@ fn test_keyword_expressions() {
 	let statements = case.function_block(0);
 
 	assert!(matches!(
-		local_definition_value(statements, 0),
+		case.local_definition_value(&statements, 0),
 		Expression::Path(_)
 	));
 	assert!(matches!(
-		local_definition_value(statements, 1),
+		case.local_definition_value(&statements, 1),
 		Expression::Path(_)
 	));
 
 	// `return` carries an optional value
-	let Expression::Return { value } = statement_expression(statements, 2)
+	let Expression::Return { value } =
+		case.statement_expression(&statements, 2)
 	else {
 		panic!("expected a return")
 	};
@@ -3819,7 +3846,7 @@ fn test_bare_return_has_no_value() {
 	let case = TestCase::new("func f() { return; }");
 	case.diagnostics().assert_none();
 	let Expression::Return { value } =
-		statement_expression(case.function_block(0), 0)
+		case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected a return")
 	};
@@ -3835,11 +3862,11 @@ fn test_turbofish_on_a_member_is_kept_on_its_segment() {
     "});
 	case.diagnostics().assert_none();
 	let Expression::ObjectAccess { member, .. } =
-		local_definition_value(case.function_block(0), 0)
+		case.local_definition_value(&case.function_block(0), 0)
 	else {
 		panic!("expected an object access")
 	};
-	assert_eq!(member.type_args.len(), 1);
+	assert_eq!(case.ast.segment(member).type_args.len(), 1);
 }
 
 #[test]
@@ -3887,7 +3914,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 		let (signature, body) = match case.item(0) {
 			Item::Function {
 				signature, block, ..
-			} => (signature, Some(block.as_ref())),
+			} => (signature, Some(*block)),
 			Item::InherentImpl { items, .. } => {
 				let ImplItem::Function {
 					signature, block, ..
@@ -3895,7 +3922,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 				else {
 					panic!("expected a method")
 				};
-				(signature, Some(block.as_ref()))
+				(signature, Some(*block))
 			}
 			Item::Trait { items, .. } => {
 				let TraitItem::Function {
@@ -3904,7 +3931,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 				else {
 					panic!("expected a trait method")
 				};
-				(signature, body.as_deref())
+				(signature, *body)
 			}
 			_ => panic!("expected a function in {source:?}"),
 		};
@@ -3917,8 +3944,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 			"->"
 		);
 		if let Some(body) = body {
-			assert!(matches!(body.inner, Expression::Block { .. }));
-			assert_eq!(body.span.start, result.end);
+			assert_eq!(case.ast.block_span(body).start, result.end);
 		}
 		assert_eq!(case.name(case.function_signature(1).name.inner), "after");
 	}
@@ -3969,8 +3995,8 @@ fn test_infer_and_memory_tagged_types() {
 	};
 	assert!(matches!(case.ast.ty(inner), TypeExpression::Slice { .. }));
 
-	let Statement::LocalDefinition { ty, .. } =
-		&case.function_block(0)[0].inner.inner
+	let Entry::Statement(Statement::LocalDefinition { ty, .. }) =
+		case.function_block(0)[0]
 	else {
 		panic!("expected a local definition")
 	};
@@ -4140,16 +4166,17 @@ fn test_attribute_with_arguments() {
 	let AttributeValue::Named(args) = &attributes[0].value else {
 		panic!("expected named attribute arguments")
 	};
-	let arguments: Vec<(&str, u64)> = args
+	let arguments: Vec<(&str, u64)> = case
+		.ast
+		.list(*args)
 		.iter()
 		.map(|arg| {
-			let arg = &arg.inner.inner;
 			let Some(Expression::Int { value }) =
-				arg.value.as_deref().map(|value| &value.inner)
+				arg.value.map(|value| case.ast.expr(value))
 			else {
 				panic!("expected an integer value")
 			};
-			(case.name(arg.name.inner), *value)
+			(case.name(arg.name.inner), value)
 		})
 		.collect();
 	assert_eq!(arguments, [("min_pages", 1), ("max_pages", 4)]);
@@ -4171,9 +4198,11 @@ fn old_attribute_arguments_are_reported_and_read_as_named() {
 	let AttributeValue::Named(args) = &attributes[0].value else {
 		panic!("expected named attribute arguments")
 	};
-	let names: Vec<&str> = args
+	let names: Vec<&str> = case
+		.ast
+		.list(*args)
 		.iter()
-		.map(|arg| case.name(arg.inner.inner.name.inner))
+		.map(|arg| case.name(arg.name.inner))
 		.collect();
 	assert_eq!(names, ["min_pages", "max_pages"]);
 }
@@ -4279,11 +4308,11 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let AttributeValue::Named(args) = &attributes[0].value else {
 		panic!("expected attribute args");
 	};
-	let Some(value) = &args[0].inner.inner.value else {
+	let Some(value) = case.ast.list(*args)[0].value else {
 		panic!("expected a written value");
 	};
-	assert!(matches!(value.inner, Expression::String));
-	let arg = &value.span;
+	assert!(matches!(case.ast.expr(value), Expression::String));
+	let arg = &case.ast.expr_span(value);
 	let Item::Import { external_name, .. } = case.item(1) else {
 		panic!("expected import");
 	};
@@ -4298,7 +4327,7 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 		assert_eq!(span.extract_str(source), r#""line\nslash\\n""#);
 	}
 	assert!(matches!(
-		local_definition_value(case.function_block(0), 0),
+		case.local_definition_value(&case.function_block(0), 0),
 		Expression::String
 	));
 }
@@ -4331,7 +4360,7 @@ fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
 	let statements = case.function_block(0);
 	for index in [0, 1] {
 		assert!(matches!(
-			local_definition_value(statements, index),
+			case.local_definition_value(&statements, index),
 			Expression::String
 		));
 	}
@@ -4401,11 +4430,11 @@ fn a_block_like_statement_ends_at_its_brace() {
 		let statements = case.function_block(0);
 		assert_eq!(statements.len(), 2, "{source}");
 		assert!(
-			statement_expression(statements, 0).is_block_like(),
+			case.statement_expression(&statements, 0).is_block_like(),
 			"{source}"
 		);
 		assert_eq!(
-			case.shape(statement_expression(statements, 1)),
+			case.shape(case.entry_expr(&statements, 1)),
 			second,
 			"{source}"
 		);
@@ -4518,12 +4547,13 @@ fn a_member_access_with_no_member_keeps_its_object() {
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let block = case.function_block(0);
 	assert_eq!(block.len(), 1);
-	assert_eq!(case.shape(statement_expression(block, 0)), "(. p <error>)");
+	assert_eq!(case.shape(case.entry_expr(&block, 0)), "(. p <error>)");
 	let Expression::ObjectAccess { member, .. } =
-		statement_expression(block, 0)
+		case.statement_expression(&block, 0)
 	else {
 		unreachable!()
 	};
+	let member = case.ast.segment(member);
 	assert!(member.is_missing());
 	assert_eq!(
 		member.ident.span,
@@ -4552,8 +4582,8 @@ fn a_keyword_after_a_dot_starts_the_next_statement() {
 		.assert_error_saying("expected a member name after `.`, found `local`");
 	let block = case.function_block(0);
 	assert_eq!(block.len(), 2);
-	assert_eq!(case.shape(statement_expression(block, 0)), "(. p <error>)");
-	assert_eq!(case.shape(local_definition_value(block, 1)), "1");
+	assert_eq!(case.shape(case.entry_expr(&block, 0)), "(. p <error>)");
+	assert_eq!(case.shape(case.local_value(&block, 1)), "1");
 	assert_eq!(case.ast.items.len(), 2, "the next item still parses");
 }
 
@@ -4562,12 +4592,15 @@ fn a_dot_before_a_call_is_a_method_call_with_no_method() {
 	let case = TestCase::new("func f() { p.(1) }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
-	let Expression::MethodCall(call) =
-		statement_expression(case.function_block(0), 0)
+	let Expression::Call { callee, .. } =
+		case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected a method call")
 	};
-	assert!(call.method.is_missing());
+	let Expression::ObjectAccess { member, .. } = case.ast.expr(callee) else {
+		panic!("expected a member as the callee")
+	};
+	assert!(case.ast.segment(member).is_missing());
 }
 
 #[test]
@@ -4584,7 +4617,7 @@ fn a_path_with_no_last_segment_keeps_its_prefix() {
 	]);
 	let block = case.function_block(0);
 	assert_eq!(block.len(), 2);
-	assert_eq!(case.shape(statement_expression(block, 0)), "a::b::<error>");
+	assert_eq!(case.shape(case.entry_expr(&block, 0)), "a::b::<error>");
 }
 
 #[test]
@@ -4618,13 +4651,13 @@ fn a_pattern_path_with_no_last_segment_keeps_its_prefix() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::InvalidNamespace]);
 	let Expression::Match { arms, .. } =
-		statement_expression(case.function_block(0), 0)
+		case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected a match")
 	};
 	assert_eq!(arms.len(), 2);
 	assert_eq!(
-		case.pattern(arms[0].inner.inner.pattern),
+		case.pattern(case.ast.list(arms)[0].pattern),
 		"(const Ordering::<error>)"
 	);
 }
@@ -4633,18 +4666,19 @@ fn a_pattern_path_with_no_last_segment_keeps_its_prefix() {
 /// yet is reported and kept as an error node spanning the gap where it
 /// belongs, up to the token after it, which is left alone.
 fn local_parts(case: &TestCase) -> (Option<TextSpan>, TextSpan, bool, bool) {
-	let [statement] = case.function_block(0) else {
+	let [statement] = *case.function_block(0) else {
 		panic!("expected the local alone");
 	};
-	let Statement::LocalDefinition { ty, value, .. } = &statement.inner.inner
+	let Entry::Statement(Statement::LocalDefinition { ty, value, .. }) =
+		statement
 	else {
 		panic!("expected a local");
 	};
 	(
 		ty.map(|ty| case.ast.type_span(ty)),
-		value.span,
+		case.ast.expr_span(value),
 		ty.is_some_and(|ty| matches!(case.ast.ty(ty), TypeExpression::Error)),
-		matches!(value.inner, Expression::Error),
+		matches!(case.ast.expr(value), Expression::Error),
 	)
 }
 
@@ -4676,11 +4710,16 @@ fn a_local_with_no_value_after_its_eq_ends_its_statement() {
 		.assert_codes(&[DiagnosticCode::MissingInitializer]);
 	let block = case.function_block(0);
 	assert_eq!(block.len(), 2, "the next statement still parses");
-	let Statement::LocalDefinition { value, .. } = &block[0].inner.inner else {
+	let Entry::Statement(Statement::LocalDefinition { value, .. }) = block[0]
+	else {
 		panic!("expected a local");
 	};
-	assert!(matches!(value.inner, Expression::Error));
-	assert_eq!(value.span, TextSpan::new(20, 22), "the gap before the `;`");
+	assert!(matches!(case.ast.expr(value), Expression::Error));
+	assert_eq!(
+		case.ast.expr_span(value),
+		TextSpan::new(20, 22),
+		"the gap before the `;`"
+	);
 }
 
 #[test]
@@ -4688,15 +4727,15 @@ fn a_keyword_block_keeps_the_span_of_its_braces() {
 	let source = "func f() { block :done { 1 } }";
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
-	let block = &case.function_block(0)[0].inner.inner;
-	let Statement::Expression(block) = block else {
-		panic!("expected an expression statement")
-	};
-	let Expression::Block { statements, .. } = &block.inner else {
+	let expr = case.entry_expr(&case.function_block(0), 0);
+	let Expression::Block { block, .. } = case.ast.expr(expr) else {
 		panic!("expected a block")
 	};
-	assert_eq!(block.span.extract_str(source), "block :done { 1 }");
-	assert_eq!(statements.span.extract_str(source), "{ 1 }");
+	assert_eq!(
+		case.ast.expr_span(expr).extract_str(source),
+		"block :done { 1 }"
+	);
+	assert_eq!(case.ast.block_span(block).extract_str(source), "{ 1 }");
 }
 
 #[test]
@@ -4732,12 +4771,12 @@ fn a_label_with_no_name_keeps_its_jump() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let Expression::Loop { block, .. } =
-		statement_expression(case.function_block(0), 0)
+		case.statement_expression(&case.function_block(0), 0)
 	else {
 		panic!("expected a loop");
 	};
 	let Expression::Break { label, value } =
-		statement_expression(block.inner.as_block_statements(), 0)
+		case.statement_expression(&case.entries(block), 0)
 	else {
 		panic!("expected the break to be kept");
 	};

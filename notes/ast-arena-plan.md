@@ -222,7 +222,35 @@ building.
       `ast.pattern_mut_span(id)` gives it back, and the kind fits in 24 B.
       TIR's `check_pattern` takes a `PatId` and reads the column. Every
       example builds to byte-identical Wasm, messages and formatting.
-   3. expressions and statements, with `separated` and the scratch stack;
+   3. **Done.** Expressions, statements and blocks. Each is a `Copy` kind
+      in a column (`ExprId`, `StmtId`, `BlockId`; `Expression` at most 24 B
+      by assertion, `Statement` 16 B). A block is its statements and its
+      `tail`, the last expression written without `;`, which is the only
+      thing a statement's `;` ever told a consumer: TIR's block result and
+      wx-fmt's `;` read it, and no `;` is stored. `if`, `loop` and function
+      bodies hold a `BlockId`; an `else` branch and a match arm's body are
+      expressions (an `Expression::Block` with no label, or an `if`). A
+      method call is a `Call` (or `NamedCall`) whose callee is an
+      `ObjectAccess`, as `x.m::<T>` already was before its call; this
+      removed `MethodCall`/`NamedMethodCall` and their boxes, and
+      `(x.f)(a)`, whose callee is a tuple, stays a call of the field. A
+      member's name is a `SegmentId` into the segment column, since a
+      `PathSegment` (28 B) does not fit a kind. A binary node keeps its
+      operator's start (`ast.operator_span`); a positional call the `(`'s
+      (`ast.arguments_span`), a named call its braces. No separator is
+      stored anywhere in these lists: nothing read one but statements'.
+      `separated` replaces `SeparatedGroup` for every list that ends as a
+      `List` (expressions, named arguments, arms, statements, patterns,
+      tuple types, function-type parameters): delimiters are constants
+      (`PARENS`, `BRACES`, `BLOCK`), it is generic over the item, and it
+      collects into a local `Vec`, so the scratch stack is not built; the
+      item-level lists keep `SeparatedGroup` until 4.4. Lists of items that
+      are not ids made the plan's single `u32` scratch impossible without
+      giving every arm, argument and field pattern an id of its own, which
+      nothing needs. Every example and core build to byte-identical Wasm,
+      messages and formatting. The retained tree is 27.3 B/token of data;
+      the 37.1 measured includes the columns' growth slack (shrinking them
+      to fit, tried and not kept, gives the 27.3).
    4. items, members and the remaining lists; `Spanned` and `Separated`
       removed; TIR's `AstEntry` by id.
 
@@ -235,14 +263,14 @@ building.
 
 ## Results
 
-| | before | after step 3 | after 4.1 | after 4.2 | after step 4 |
-|---|---|---|---|---|---|
-| lex | 0.64 ms | 0.80 ms | 0.81 ms | 0.80 ms | |
-| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | 2.68 ms | |
-| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | 0.34 ms | |
-| allocations/token | 0.86 | 0.86 | 0.72 | 0.72 | |
-| retained bytes/token | 49.2 | 49.2 | 38.2 | 37.1 | |
-| `Spanned<Expression>` | 80 B | 80 B | 48 B | 48 B | |
+| | before | after step 3 | after 4.1 | after 4.2 | after 4.3 | after step 4 |
+|---|---|---|---|---|---|---|
+| lex | 0.64 ms | 0.80 ms | 0.81 ms | 0.80 ms | 0.82 ms | |
+| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | 2.68 ms | 2.44 ms | |
+| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | 0.34 ms | 0.07 ms | |
+| allocations/token | 0.86 | 0.86 | 0.72 | 0.72 | 0.49 | |
+| retained bytes/token | 49.2 | 49.2 | 38.2 | 37.1 | 37.1 (27.3 data) | |
+| expression node | 80 B | 80 B | 48 B | 48 B | 24 B + 8 B span | |
 
 The expected outcome, an estimate to be checked against this table: parsing
 about 1.6–1.9 ms, dropping near zero, the retained tree about a third of its

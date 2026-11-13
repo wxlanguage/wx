@@ -17,7 +17,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::calls::{Callee, Dispatch};
 use super::{Arguments, BodyBuilder};
-use crate::ast::{self, Ownership, Spanned};
+use crate::ast::{self, Ownership};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::decls::{
@@ -108,18 +108,18 @@ impl<'s> RootedPath<'s> {
 	/// `expr`'s, when it is one; `ast` is the tree it is written in.
 	pub(super) fn of_expression(
 		ast: &'s ast::AST,
-		expr: &'s ast::Expression,
+		expr: ast::Expression,
 	) -> Option<Self> {
 		Some(match expr {
 			ast::Expression::QualifiedPath { root, segments } => {
 				Self::Qualified {
-					root: ast.qualified_root(*root),
-					segments,
+					root: ast.qualified_root(root),
+					segments: ast.list(segments),
 				}
 			}
 			ast::Expression::Grouped { inner, segments } => Self::Grouped {
-				inner: *inner,
-				segments,
+				inner,
+				segments: ast.list(segments),
 			},
 			_ => return None,
 		})
@@ -388,35 +388,25 @@ impl BodyBuilder<'_, '_> {
 	/// nothing.
 	fn build_receiver(
 		&mut self,
-		object: &Spanned<ast::Expression>,
+		object: ast::ExprId,
 		receiver_of: ReceiverOf,
 	) -> ExprIdx {
-		let span = object.span;
-		match &object.inner {
-			ast::Expression::Call { callee, arguments } => self.build_call(
+		let ast = self.ast();
+		let span = ast.expr_span(object);
+		match ast.expr(object) {
+			ast::Expression::Call {
+				callee, arguments, ..
+			} => self.build_call(
 				callee,
-				Arguments::Positional(&arguments.inner),
+				Arguments::Positional(ast.list(arguments)),
 				Expected::Receiver(receiver_of),
 				span,
 			),
-			ast::Expression::NamedCall { callee, arguments } => self
-				.build_call(
-					callee,
-					Arguments::Named(&arguments.inner),
-					Expected::Receiver(receiver_of),
-					span,
-				),
-			ast::Expression::MethodCall(call) => self.build_method_call(
-				&call.object,
-				&call.method,
-				Arguments::Positional(&call.arguments.inner),
-				Expected::Receiver(receiver_of),
-				span,
-			),
-			ast::Expression::NamedMethodCall(call) => self.build_method_call(
-				&call.object,
-				&call.method,
-				Arguments::Named(&call.arguments.inner),
+			ast::Expression::NamedCall {
+				callee, arguments, ..
+			} => self.build_call(
+				callee,
+				Arguments::Named(ast.list(arguments)),
 				Expected::Receiver(receiver_of),
 				span,
 			),
@@ -433,7 +423,7 @@ impl BodyBuilder<'_, '_> {
 	/// is `receiver.*.&`.
 	pub(super) fn build_method_call(
 		&mut self,
-		object: &Spanned<ast::Expression>,
+		object: ast::ExprId,
 		method: &ast::PathSegment,
 		arguments: Arguments<'_>,
 		expected: Expected,

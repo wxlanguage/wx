@@ -40,6 +40,8 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	/// What a package instance looks its key up in: each
 	/// package's manifest-declared dependencies.
 	packages: &'ast [Package],
+	/// Every file's syntax tree, by its `FileId`.
+	asts: &'ast [ast::AST],
 
 	namespaces: Namespaces,
 	modules: Vec<ModuleDecl>,
@@ -2474,6 +2476,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			core_package,
 			root_package,
 			packages,
+			asts,
 			imports: Vec::new(),
 			modules: Vec::new(),
 			traits: Vec::new(),
@@ -2904,9 +2907,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		else {
 			return limits;
 		};
+		let ast = &self.asts[file_id.as_usize()];
 		let mut written = [None::<TextSpan>; 2];
-		for argument in arguments.iter() {
-			let argument = &argument.inner.inner;
+		for argument in ast.list(*arguments) {
 			let name = self.strings.resolve(argument.name.inner).unwrap();
 			let (slot, bound) = match name {
 				"min_pages" => (0, &mut limits.min_pages),
@@ -2951,13 +2954,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			written[slot] = Some(argument.name.span);
 			// A count of pages is an integer literal; the shorthand
 			// `{ min_pages }` names nothing an attribute can read.
-			match argument.value.as_deref() {
-				Some(&Spanned {
-					inner: ast::Expression::Int { value },
-					span,
-				}) => *bound = Some(Spanned { inner: value, span }),
+			let value = argument.value.map(|value| (ast.expr(value), value));
+			match value {
+				Some((ast::Expression::Int { value }, id)) => {
+					*bound = Some(Spanned {
+						inner: value,
+						span: ast.expr_span(id),
+					})
+				}
 				value => {
-					let span = value.map_or(argument.name.span, |v| v.span);
+					let span = value.map_or(argument.name.span, |(_, id)| {
+						ast.expr_span(id)
+					});
 					self.diagnostics.push(
 						Diagnostic::error()
 							.with_code(

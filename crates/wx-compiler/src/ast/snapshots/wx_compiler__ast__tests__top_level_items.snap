@@ -51,69 +51,7 @@ items:
                     end: 23
                 separator: ~
             result: 2
-          block:
-            inner:
-              Block:
-                label: ~
-                statements:
-                  inner:
-                    - inner:
-                        inner:
-                          Expression:
-                            inner:
-                              Binary:
-                                left:
-                                  inner:
-                                    Path:
-                                      - ident:
-                                          inner: 35
-                                          span:
-                                            start: 38
-                                            end: 39
-                                        type_args:
-                                          start: 0
-                                          len: 0
-                                        args_span:
-                                          start: 39
-                                          end: 39
-                                  span:
-                                    start: 38
-                                    end: 39
-                                operator:
-                                  inner: Add
-                                  span:
-                                    start: 40
-                                    end: 41
-                                right:
-                                  inner:
-                                    Path:
-                                      - ident:
-                                          inner: 37
-                                          span:
-                                            start: 42
-                                            end: 43
-                                        type_args:
-                                          start: 0
-                                          len: 0
-                                        args_span:
-                                          start: 43
-                                          end: 43
-                                  span:
-                                    start: 42
-                                    end: 43
-                            span:
-                              start: 38
-                              end: 43
-                        span:
-                          start: 38
-                          end: 43
-                      separator: ~
-                  span:
-                    start: 32
-                    end: 45
-            span:
-              start: 32
-              end: 45
+          block: 0
       span:
         start: 0
         end: 45
@@ -148,13 +86,7 @@ items:
               start: 75
               end: 82
           ty: 4
-          value:
-            inner:
-              Int:
-                value: 0
-            span:
-              start: 90
-              end: 91
+          value: 3
           attributes: []
       span:
         start: 64
@@ -172,13 +104,7 @@ items:
               start: 99
               end: 102
           ty: 5
-          value:
-            inner:
-              Int:
-                value: 100
-            span:
-              start: 110
-              end: 113
+          value: 4
           attributes: []
       span:
         start: 93
@@ -330,13 +256,7 @@ items:
                       span:
                         start: 243
                         end: 248
-                    value:
-                      inner:
-                        Int:
-                          value: 1
-                      span:
-                        start: 251
-                        end: 252
+                    value: 5
                 span:
                   start: 243
                   end: 252
@@ -375,12 +295,6 @@ types:
         start: 2
         len: 1
     - Path:
-        start: 3
-        len: 1
-    - Path:
-        start: 4
-        len: 1
-    - Path:
         start: 5
         len: 1
     - Path:
@@ -391,6 +305,12 @@ types:
         len: 1
     - Path:
         start: 8
+        len: 1
+    - Path:
+        start: 9
+        len: 1
+    - Path:
+        start: 10
         len: 1
   spans:
     - start: 12
@@ -420,6 +340,50 @@ bounds:
 patterns:
   kinds: []
   spans: []
+exprs:
+  kinds:
+    - Path:
+        start: 3
+        len: 1
+    - Path:
+        start: 4
+        len: 1
+    - Binary:
+        operator: Add
+        operator_start: 40
+        left: 0
+        right: 1
+    - Int:
+        value: 0
+    - Int:
+        value: 100
+    - Int:
+        value: 1
+  spans:
+    - start: 38
+      end: 39
+    - start: 42
+      end: 43
+    - start: 38
+      end: 43
+    - start: 90
+      end: 91
+    - start: 110
+      end: 113
+    - start: 251
+      end: 252
+stmts:
+  kinds: []
+  spans: []
+blocks:
+  kinds:
+    - statements:
+        start: 0
+        len: 0
+      tail: 2
+  spans:
+    - start: 32
+      end: 45
 qualified_roots: []
 segments:
   - ident:
@@ -455,6 +419,28 @@ segments:
     args_span:
       start: 31
       end: 31
+  - ident:
+      inner: 35
+      span:
+        start: 38
+        end: 39
+    type_args:
+      start: 0
+      len: 0
+    args_span:
+      start: 39
+      end: 39
+  - ident:
+      inner: 37
+      span:
+        start: 42
+        end: 43
+    type_args:
+      start: 0
+      len: 0
+    args_span:
+      start: 43
+      end: 43
   - ident:
       inner: 39
       span:
@@ -529,3 +515,7 @@ function_type_params: []
 pat_lists: []
 pattern_elements: []
 pattern_fields: []
+expr_lists: []
+stmt_lists: []
+named_arguments: []
+arms: []

@@ -14,12 +14,13 @@ use tower_lsp_server::ls_types::{
 	InsertTextFormat,
 };
 use wx_compiler::ast::{
-	AST, AssocBinding, AssocBindingKind, BoundExpression, BoundId, Comment,
-	ConstArgument, ConstId, Destructure, EnumEntry, Expression,
-	FunctionSignature, FunctionTypeParam, ImplItem, ImportDeclaration,
-	ImportEntry, Item, NamedArgument, PatId, Path, PathSegment, Pattern,
-	PatternElement, PatternFieldItem, QualifiedPathRoot, Separated, Spanned,
-	Statement, TraitItem, TypeArgument, TypeExpression, TypeId, TypeParam,
+	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
+	BoundId, Comment, ConstArgument, ConstId, Destructure, EnumEntry, ExprId,
+	Expression, FunctionSignature, FunctionTypeParam, ImplItem,
+	ImportDeclaration, ImportEntry, Item, NamedArgument, PatId, Path,
+	PathSegment, Pattern, PatternElement, PatternFieldItem, QualifiedPathRoot,
+	Separated, Spanned, Statement, TraitItem, TypeArgument, TypeExpression,
+	TypeId, TypeParam,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::tir::{DeclKind, Definition, LabelKind, NameUse};
@@ -369,10 +370,18 @@ impl Cursor<'_> {
 		siblings: &'s [T],
 		span: impl Fn(&T) -> TextSpan,
 	) -> Option<&'s T> {
+		Some(&siblings[self.child_index_by(siblings, span)?])
+	}
+
+	/// Where in `siblings` the one `child_by` finds is.
+	fn child_index_by<T>(
+		&self,
+		siblings: &[T],
+		span: impl Fn(&T) -> TextSpan,
+	) -> Option<usize> {
 		let index =
 			siblings.partition_point(|sibling| span(sibling).end < self.offset);
-		let child = siblings.get(index)?;
-		self.at(span(child)).then_some(child)
+		self.at(span(siblings.get(index)?)).then_some(index)
 	}
 
 	/// Where in `siblings` the one `child` finds is.
@@ -386,7 +395,7 @@ impl Cursor<'_> {
 		match item {
 			Item::Function {
 				signature, block, ..
-			} => self.function(signature, Some(block)),
+			} => self.function(signature, Some(*block)),
 			Item::FunctionDeclaration { signature, .. }
 			| Item::PackageFunction { signature, .. } => self.function(signature, None),
 			Item::PackageConst { name, ty, .. }
@@ -403,7 +412,7 @@ impl Cursor<'_> {
 			}
 			| Item::Const {
 				name, ty, value, ..
-			} => self.constant(name.span, *ty, Some(value)),
+			} => self.constant(name.span, *ty, Some(*value)),
 			Item::Enum {
 				name,
 				repr,
@@ -414,7 +423,7 @@ impl Cursor<'_> {
 				.or_else(|| match &self.child(entries)?.inner.inner {
 					EnumEntry::Variant(variant) => {
 						Within::Body(variant.name.span)
-							.position(self.expression(variant.value.as_ref()?))
+							.position(self.expression(variant.value?))
 					}
 					EnumEntry::Rest => None,
 				}),
@@ -465,14 +474,10 @@ impl Cursor<'_> {
 					.or_else(|| match &self.child(items)?.inner.inner {
 						TraitItem::Function {
 							signature, body, ..
-						} => self.function(signature, body.as_deref()),
+						} => self.function(signature, *body),
 						TraitItem::Const {
 							name, ty, value, ..
-						} => self.constant(
-							name.span,
-							Some(*ty),
-							value.as_deref(),
-						),
+						} => self.constant(name.span, Some(*ty), *value),
 						// Read in the trait's scope, where `Self` is the
 						// trait's.
 						TraitItem::AssociatedType { bounds, value, .. } => {
@@ -528,7 +533,7 @@ impl Cursor<'_> {
 	fn function(
 		&self,
 		signature: &FunctionSignature,
-		body: Option<&Spanned<Expression>>,
+		body: Option<BlockId>,
 	) -> Option<Position> {
 		let name = signature.name.span;
 		let site = self
@@ -537,7 +542,7 @@ impl Cursor<'_> {
 			.or_else(|| self.ty(signature.result?));
 		Within::Signature(Anchor::Name(name))
 			.position(site)
-			.or_else(|| Within::Body(name).position(self.expression(body?)))
+			.or_else(|| Within::Body(name).position(self.block(body?)))
 	}
 
 	/// A constant or a global, by its name: its type, then its value.
@@ -545,7 +550,7 @@ impl Cursor<'_> {
 		&self,
 		name: TextSpan,
 		ty: Option<TypeId>,
-		value: Option<&Spanned<Expression>>,
+		value: Option<ExprId>,
 	) -> Option<Position> {
 		Within::Signature(Anchor::Name(name))
 			.position(ty.and_then(|ty| self.ty(ty)))
@@ -569,10 +574,10 @@ impl Cursor<'_> {
 			match &self.child(items)?.inner.inner {
 				ImplItem::Function {
 					signature, block, ..
-				} => self.function(signature, Some(block)),
+				} => self.function(signature, Some(*block)),
 				ImplItem::Constant {
 					name, ty, value, ..
-				} => self.constant(name.span, *ty, Some(value)),
+				} => self.constant(name.span, *ty, Some(*value)),
 				// Read in the impl's scope.
 				ImplItem::AssocType { ty, .. } => header.position(self.ty(*ty)),
 			}
@@ -619,106 +624,126 @@ impl Cursor<'_> {
 		}
 	}
 
-	fn statement(&self, statement: &Statement) -> Option<Site> {
+	fn statement(&self, statement: Statement) -> Option<Site> {
 		match statement {
 			Statement::Expression(expression) => self.expression(expression),
 			Statement::LocalDefinition { pattern, ty, value } => self
-				.pattern(*pattern)
-				.or_else(|| self.ty((*ty)?))
+				.pattern(pattern)
+				.or_else(|| self.ty(ty?))
 				.or_else(|| self.expression(value)),
 		}
 	}
 
-	fn expression(&self, expression: &Spanned<Expression>) -> Option<Site> {
-		if !self.at(expression.span) {
+	/// A block: the statement at the cursor, its tail, or between its
+	/// braces, where a statement can start.
+	fn block(&self, block: BlockId) -> Option<Site> {
+		let ast = self.ast;
+		let span = ast.block_span(block);
+		if !self.at(span) {
 			return None;
 		}
-		match &expression.inner {
+		let Block { statements, tail } = ast.block(block);
+		let statement =
+			self.child_by(ast.list(statements), |&s| ast.statement_span(s));
+		match (statement, tail) {
+			(Some(&statement), _) => self.statement(ast.statement(statement)),
+			(None, Some(tail)) if self.at(ast.expr_span(tail)) => {
+				self.expression(tail)
+			}
+			_ => self.inside(span).then_some(Site::Name(NameUse::Value)),
+		}
+	}
+
+	fn expression(&self, expression: ExprId) -> Option<Site> {
+		let ast = self.ast;
+		let span = ast.expr_span(expression);
+		if !self.at(span) {
+			return None;
+		}
+		match ast.expr(expression) {
 			// A value the parser expected and did not find.
 			Expression::Error => Some(Site::Name(NameUse::Value)),
-			Expression::Path(segments) => self.path(segments, NameUse::Value),
-			Expression::Block { statements, .. } => {
-				match self.child(&statements.inner) {
-					Some(statement) => self.statement(&statement.inner.inner),
-					// Between statements, inside the braces: a statement
-					// can start here. Before them is the keyword and the
-					// label, where nothing is looked up.
-					None => self
-						.inside(statements.span)
-						.then_some(Site::Name(NameUse::Value)),
-				}
+			Expression::Path(segments) => {
+				self.path(ast.list(segments), NameUse::Value)
 			}
+			// Before the braces is the keyword and the label, where nothing
+			// is looked up.
+			Expression::Block { block, .. } => self.block(block),
 			Expression::Unary { operand, .. } => self.expression(operand),
 			Expression::Binary { left, right, .. } => {
 				self.expression(left).or_else(|| self.expression(right))
 			}
-			Expression::Call { callee, arguments } => self
-				.expression(callee)
-				.or_else(|| self.list(arguments.span, &arguments.inner)),
-			Expression::NamedCall { callee, arguments } => {
-				let name = match &callee.inner {
+			Expression::Call {
+				callee, arguments, ..
+			} => self.expression(callee).or_else(|| {
+				self.list(ast.arguments_span(expression), ast.list(arguments))
+			}),
+			// A method's object gives its receiver, one argument given.
+			Expression::NamedCall {
+				callee,
+				arguments,
+				braces,
+			} => {
+				let (name, given) = match ast.expr(callee) {
 					Expression::Path(segments)
-					| Expression::QualifiedPath { segments, .. } => {
-						segments.last().map(|segment| segment.ident.span)
+					| Expression::QualifiedPath { segments, .. } => (
+						ast.list(segments)
+							.last()
+							.map(|segment| segment.ident.span),
+						0,
+					),
+					Expression::ObjectAccess { member, .. } => {
+						(Some(ast.segment(member).ident.span), 1)
 					}
-					_ => None,
+					_ => (None, 0),
 				};
-				self.expression(callee)
-					.or_else(|| self.named(name, 0, arguments))
+				self.expression(callee).or_else(|| {
+					self.named(name, given, ast.list(arguments), braces)
+				})
 			}
-			Expression::MethodCall(call) => self
-				.expression(&call.object)
-				.or_else(|| self.type_args(&call.method))
-				.or_else(|| {
-					self.list(call.arguments.span, &call.arguments.inner)
-				}),
-			// The object gives the method's receiver.
-			Expression::NamedMethodCall(call) => self
-				.expression(&call.object)
-				.or_else(|| self.type_args(&call.method))
-				.or_else(|| {
-					self.named(Some(call.method.ident.span), 1, &call.arguments)
-				}),
-			Expression::ObjectAccess { object, member } => {
-				self.expression(object).or_else(|| self.type_args(member))
-			}
+			Expression::ObjectAccess { object, member } => self
+				.expression(object)
+				.or_else(|| self.type_args(&ast.segment(member))),
 			Expression::Deref { pointer: value }
 			| Expression::AddressOf { value } => self.expression(value),
-			Expression::Return { value } => self.expression(value.as_ref()?),
+			Expression::Return { value } => self.expression(value?),
 			Expression::Break { label, value } => self
-				.label(*label, Jump::Break)
-				.or_else(|| self.expression(value.as_ref()?)),
-			Expression::Continue { label } => {
-				self.label(*label, Jump::Continue)
-			}
+				.label(label, Jump::Break)
+				.or_else(|| self.expression(value?)),
+			Expression::Continue { label } => self.label(label, Jump::Continue),
 			Expression::IfElse {
 				condition,
 				then_block,
 				else_block,
 			} => self
 				.expression(condition)
-				.or_else(|| self.expression(then_block))
-				.or_else(|| self.expression(else_block.as_ref()?)),
+				.or_else(|| self.block(then_block))
+				.or_else(|| self.expression(else_block?)),
 			Expression::Match { scrutinee, arms } => {
 				self.expression(scrutinee).or_else(|| {
-					let arm = &self.child(arms)?.inner.inner;
+					let arm = self.child_by(ast.list(arms), |arm| {
+						TextSpan::new(
+							ast.pattern_span(arm.pattern).start,
+							ast.expr_span(arm.body).end,
+						)
+					})?;
 					self.pattern(arm.pattern)
-						.or_else(|| self.expression(&arm.body))
+						.or_else(|| self.expression(arm.body))
 				})
 			}
-			Expression::Loop { block, .. } => self.expression(block),
+			Expression::Loop { block, .. } => self.block(block),
 			Expression::QualifiedPath { root, .. } => {
-				self.qualified_root(self.ast.qualified_root(*root))
+				self.qualified_root(ast.qualified_root(root))
 			}
-			Expression::Grouped { inner, .. } => self.ty(*inner),
+			Expression::Grouped { inner, .. } => self.ty(inner),
 			Expression::Tuple { elements }
-			| Expression::ArrayList { elements } => self.list(expression.span, elements),
+			| Expression::ArrayList { elements } => self.list(span, ast.list(elements)),
 			Expression::Ascription { value, ty } => {
-				self.expression(value).or_else(|| self.ty(*ty))
+				self.expression(value).or_else(|| self.ty(ty))
 			}
 			Expression::ArrayRepeat { value, count } => self
 				.expression(value)
-				.or_else(|| self.const_argument(*count)),
+				.or_else(|| self.const_argument(count)),
 			Expression::Index { object, index } => {
 				self.expression(object).or_else(|| self.expression(index))
 			}
@@ -733,13 +758,9 @@ impl Cursor<'_> {
 	/// A list of values in the delimiters that start and end `delimiters`:
 	/// the element at the cursor, or a value not written yet in the room
 	/// between two (`f(a, |)`).
-	fn list(
-		&self,
-		delimiters: TextSpan,
-		elements: &[Separated<Spanned<Expression>>],
-	) -> Option<Site> {
-		match self.child(elements) {
-			Some(element) => self.expression(&element.inner),
+	fn list(&self, delimiters: TextSpan, elements: &[ExprId]) -> Option<Site> {
+		match self.child_by(elements, |&element| self.ast.expr_span(element)) {
+			Some(&element) => self.expression(element),
 			None => self
 				.inside(delimiters)
 				.then_some(Site::Name(NameUse::Value)),
@@ -755,21 +776,28 @@ impl Cursor<'_> {
 		&self,
 		callee: Option<TextSpan>,
 		given: usize,
-		arguments: &Spanned<Box<[Separated<Spanned<NamedArgument>>]>>,
+		arguments: &[NamedArgument],
+		braces: TextSpan,
 	) -> Option<Site> {
-		if !self.inside(arguments.span) {
+		if !self.inside(braces) {
 			return None;
 		}
-		let at = self.child_index(&arguments.inner);
+		let ast = self.ast;
+		let at = self.child_index_by(arguments, |argument| {
+			let end = argument.value.map_or(argument.name.span.end, |value| {
+				ast.expr_span(value).end
+			});
+			TextSpan::new(argument.name.span.start, end)
+		});
 		if let Some(at) = at {
-			let argument = &arguments.inner[at].inner.inner;
+			let argument = &arguments[at];
 			if !self.at(argument.name.span) {
-				return self.expression(argument.value.as_deref()?);
+				return self.expression(argument.value?);
 			}
 		}
-		let written = (arguments.inner.iter().enumerate())
+		let written = (arguments.iter().enumerate())
 			.filter(|&(index, _)| Some(index) != at)
-			.map(|(_, argument)| argument.inner.inner.name.inner)
+			.map(|(_, argument)| argument.name.inner)
 			.collect();
 		Some(Site::Argument {
 			callee: callee?,

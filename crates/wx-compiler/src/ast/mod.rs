@@ -175,6 +175,9 @@ pub struct Separated<T> {
 	pub separator: Option<TextSpan>,
 }
 
+/// An expression, in its file's [`AST`]: children by id, lists by
+/// [`List`], its span in the column beside it.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Expression {
 	Error,
@@ -192,76 +195,78 @@ pub enum Expression {
 	/// (`coerce_float`), because the correct rounding (f32 vs f64)
 	/// isn't known until then. Same span-only treatment as `Char` / `String`.
 	Float,
-	/// `-{expr}`
+	/// `-{expr}`; the operator is where the expression starts
+	/// ([`AST::operator_span`]).
 	Unary {
-		operator: Spanned<UnaryOp>,
-		operand: Box<Spanned<Expression>>,
+		operator: UnaryOp,
+		operand: ExprId,
 	},
-	/// `{expr} + {expr}`
+	/// `{expr} + {expr}`; the operator is written at `operator_start`
+	/// ([`AST::operator_span`]).
 	Binary {
-		left: Box<Spanned<Expression>>,
-		operator: Spanned<BinaryOp>,
-		right: Box<Spanned<Expression>>,
+		operator: BinaryOp,
+		operator_start: u32,
+		left: ExprId,
+		right: ExprId,
 	},
-	/// `{expr}::<...>(a, b)`: a function call, or the construction of a
-	/// struct, by position. The arguments are spanned by their parentheses.
+	/// `{expr}(a, b)`: a call, or the construction of a struct, by
+	/// position. A callee that is an [`Expression::ObjectAccess`] makes it
+	/// a method call (`x.m::<T>(a)`); a parenthesized one, `(x.f)(a)`, is a
+	/// call of the field's value. The arguments are spanned from the `(` at
+	/// `open` to the end of the call ([`AST::arguments_span`]).
 	Call {
-		callee: Box<Spanned<Expression>>,
-		arguments: Spanned<Box<[Separated<Spanned<Expression>>]>>,
+		callee: ExprId,
+		arguments: List<ExprId>,
+		open: u32,
 	},
-	/// `{expr}::<...>({ x: a, y })`: the same, naming each parameter (or
-	/// field). The named list is the call's only argument, spanned by its
-	/// braces.
+	/// `{expr}({ x: a, y })`: the same, naming each parameter (or field).
+	/// The named list is the call's only argument, spanned by its braces.
 	NamedCall {
-		callee: Box<Spanned<Expression>>,
-		arguments: Spanned<Box<[Separated<Spanned<NamedArgument>>]>>,
+		callee: ExprId,
+		arguments: List<NamedArgument>,
+		braces: TextSpan,
 	},
-	/// `{expr}.{method}::<...>(a, b)`
-	MethodCall(Box<MethodCallExpr>),
-	/// `{expr}.{method}::<...>({ x: a, y })`
-	NamedMethodCall(Box<MethodCallExpr<NamedArgument>>),
 	/// `{expr}.{member}`, or `{expr}.{member}::<...>`: the type arguments
-	/// are only meaningful when a call follows, which makes it a
-	/// `MethodCall`; the checker rejects them on a field.
+	/// are only meaningful when it is called, which makes it a method
+	/// call; the checker rejects them on a field.
 	ObjectAccess {
-		object: Box<Spanned<Expression>>,
-		member: PathSegment,
+		object: ExprId,
+		member: SegmentId,
 	},
 	/// `{expr}.*`
 	Deref {
-		pointer: Box<Spanned<Expression>>,
+		pointer: ExprId,
 	},
 	/// `{expr}.&` — always produces a shared reference.
 	AddressOf {
-		value: Box<Spanned<Expression>>,
+		value: ExprId,
 	},
 	/// `return {expr}`
 	Return {
-		value: Option<Box<Spanned<Expression>>>,
+		value: Option<ExprId>,
 	},
-	/// `block :label { ... }`, or a construct's own block (`if`, `loop`, a
-	/// match arm, a function body), which has no label. The statements are
-	/// spanned by their braces, which a keyword block's own span starts
-	/// before.
+	/// `block :label { ... }`, or a construct's own block where an
+	/// expression is expected (an `else` branch, a match arm), which has no
+	/// label. A keyword block's span starts before its braces.
 	Block {
 		label: Option<Spanned<SymbolU32>>,
-		statements: Spanned<Box<[Separated<Spanned<Statement>>]>>,
+		block: BlockId,
 	},
 	/// `break (:{label})? {expr}?`
 	Break {
 		label: Option<Spanned<SymbolU32>>,
-		value: Option<Box<Spanned<Expression>>>,
+		value: Option<ExprId>,
 	},
-	/// `if {expr} { ... }`
+	/// `if {expr} { ... } else ...`; an `else` is a block or another `if`.
 	IfElse {
-		condition: Box<Spanned<Expression>>,
-		then_block: Box<Spanned<Expression>>,
-		else_block: Option<Box<Spanned<Expression>>>,
+		condition: ExprId,
+		then_block: BlockId,
+		else_block: Option<ExprId>,
 	},
 	/// `match {expr} { {pattern} => { ... }, ... }`
 	Match {
-		scrutinee: Box<Spanned<Expression>>,
-		arms: Box<[Separated<Spanned<MatchArm>>]>,
+		scrutinee: ExprId,
+		arms: List<MatchArm>,
 	},
 	/// `continue (:{label})?`
 	Continue {
@@ -270,7 +275,7 @@ pub enum Expression {
 	/// `loop :label { ... }`
 	Loop {
 		label: Option<Spanned<SymbolU32>>,
-		block: Box<Spanned<Expression>>,
+		block: BlockId,
 	},
 	/// `_` — discard in value position (e.g. `_ = expr;`)
 	Placeholder,
@@ -279,16 +284,14 @@ pub enum Expression {
 	/// 'a' — raw source text (including quotes) is recovered from span
 	Char,
 	/// A `::` separated path: `foo`, `module::Point`, `module::Point::<i32>`.
-	/// Replaces bare `Identifier`, `NamespaceAccess`, and path-typed
-	/// `TypeApplication` as the canonical representation for named references.
-	Path(Box<[PathSegment]>),
+	Path(List<PathSegment>),
 	/// `<Type as Trait>::item` — a qualified path pinning down exactly
 	/// which trait's item is meant. Composes with the usual postfix grammar
 	/// (`Call`, `ObjectAccess`, `Index`) like any other primary expression,
 	/// e.g. `<Type as Trait>::method(x)`.
 	QualifiedPath {
 		root: QualifiedRootId,
-		segments: Box<[PathSegment]>,
+		segments: List<PathSegment>,
 	},
 	/// `<Type>::item` — a bare bracketed type used as a path root, with no
 	/// trait qualification. Distinct from `QualifiedPath`: this doesn't
@@ -297,64 +300,67 @@ pub enum Expression {
 	/// written as a plain path segment (e.g. `<[T]>::method()`).
 	Grouped {
 		inner: TypeId,
-		segments: Box<[PathSegment]>,
+		segments: List<PathSegment>,
 	},
 	/// `(a, b, c)`, `(a)`, `(a,)` or `()`: any parenthesized list, as
 	/// written. One element is that element, which TIR unwraps.
 	Tuple {
-		elements: Box<[Separated<Spanned<Expression>>]>,
+		elements: List<ExprId>,
 	},
 	/// `value: Type`, an element of a parenthesized list (`(5: i32)`,
 	/// `f(x: u8, y)`) checked against the type it is written with. It
 	/// converts nothing.
 	Ascription {
-		value: Box<Spanned<Expression>>,
+		value: ExprId,
 		ty: TypeId,
 	},
 	/// `[a, b, c]`
 	ArrayList {
-		elements: Box<[Separated<Spanned<Expression>>]>,
+		elements: List<ExprId>,
 	},
 	/// `[value; count]`; the count is a length, a literal or a constant.
 	ArrayRepeat {
-		value: Box<Spanned<Expression>>,
+		value: ExprId,
 		count: ConstId,
 	},
 	/// `expr[index]`
 	Index {
-		object: Box<Spanned<Expression>>,
-		index: Box<Spanned<Expression>>,
+		object: ExprId,
+		index: ExprId,
 	},
 }
 
-#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-/// A method call; `Argument` is `Expression` for one by position and
-/// `NamedArgument` for one by name.
-pub struct MethodCallExpr<Argument = Expression> {
-	pub object: Box<Spanned<Expression>>,
-	/// The method's name, with the type arguments written on it
-	/// (`.m::<T>(..)`).
-	pub method: PathSegment,
-	/// Spanned by their delimiters: the parentheses of a list by position,
-	/// the braces of one by name.
-	pub arguments: Spanned<Box<[Separated<Spanned<Argument>>]>>,
-}
+const _: () = assert!(size_of::<Expression>() <= 24);
 
+/// `name: expr`, or the shorthand `name` for `name: name`, in a named list.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct NamedArgument {
 	pub name: Spanned<SymbolU32>,
 	/// `None` means shorthand: `{ name }` is equivalent to `{ name: name }`
-	pub value: Option<Box<Spanned<Expression>>>,
+	pub value: Option<ExprId>,
 }
 
 /// One arm of a `match` expression: `{pattern} => { ... }` or
 /// `{pattern} => expr`. The pattern
 /// says what each of its terms is on its own: a name binds, a literal
 /// compares with that value, a qualified path with that constant.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct MatchArm {
 	pub pattern: PatId,
-	pub body: Box<Spanned<Expression>>,
+	pub body: ExprId,
+}
+
+/// A block's statements, as written between its braces: each statement in
+/// order, and the expression written last without a `;`, which is the
+/// block's value.
+#[derive(Clone, Copy)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub struct Block {
+	pub statements: List<StmtId>,
+	/// The last expression, written without `;`: the block's value.
+	pub tail: Option<ExprId>,
 }
 
 /// One segment of a `::` path, with optional turbofish type args.
@@ -460,21 +466,13 @@ pub enum BoundExpression {
 
 impl Expression {
 	pub fn is_block_like(&self) -> bool {
-		match self {
+		matches!(
+			self,
 			Expression::Block { .. }
-			| Expression::IfElse { .. }
-			| Expression::Loop { .. }
-			| Expression::Match { .. } => true,
-			_ => false,
-		}
-	}
-
-	#[inline]
-	pub fn as_block_statements(&self) -> &[Separated<Spanned<Statement>>] {
-		match self {
-			Expression::Block { statements, .. } => &statements.inner,
-			_ => unreachable!("expected a block expression"),
-		}
+				| Expression::IfElse { .. }
+				| Expression::Loop { .. }
+				| Expression::Match { .. }
+		)
 	}
 }
 
@@ -759,25 +757,17 @@ pub enum Literal {
 	String,
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Statement {
-	/// `{expr}`
-	Expression(Box<Spanned<Expression>>),
+	/// `{expr};`, or a block-like expression with its `;` left out.
+	Expression(ExprId),
 	/// `local <pattern> [: type] = {expr}`
 	LocalDefinition {
 		pattern: PatId,
 		ty: Option<TypeId>,
-		value: Box<Spanned<Expression>>,
+		value: ExprId,
 	},
-}
-
-impl Statement {
-	pub fn is_block_like(&self) -> bool {
-		match self {
-			Statement::Expression(expr) => expr.inner.is_block_like(),
-			Statement::LocalDefinition { .. } => false,
-		}
-	}
 }
 
 #[derive(Clone, Copy)]
@@ -821,7 +811,7 @@ pub enum AttributeValue {
 	/// `#[memory_limits({ min_pages: 1, max_pages: 10 })]` — arguments by
 	/// name, written as a call's (`f({ x: 1 })`). What each value may be is
 	/// the attribute's to say, where it is resolved.
-	Named(Box<[Separated<Spanned<NamedArgument>>]>),
+	Named(List<NamedArgument>),
 }
 
 /// A single attribute on an item, e.g. `#[inline]` or
@@ -840,13 +830,13 @@ pub enum ImplItem {
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
-		block: Box<Spanned<Expression>>,
+		block: BlockId,
 	},
 	Constant {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
-		value: Box<Spanned<Expression>>,
+		value: ExprId,
 		attributes: Box<[Attribute]>,
 	},
 	AssocType {
@@ -878,7 +868,7 @@ pub enum TraitItem {
 		signature: FunctionSignature,
 		/// `None` = abstract (must be provided by impl); `Some` = default
 		/// implementation.
-		body: Option<Box<Spanned<Expression>>>,
+		body: Option<BlockId>,
 	},
 	/// An associated constant declaration, with an optional default value.
 	/// `None` = abstract (must be provided by every impl); `Some` = a
@@ -887,7 +877,7 @@ pub enum TraitItem {
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
 		ty: TypeId,
-		value: Option<Box<Spanned<Expression>>>,
+		value: Option<ExprId>,
 	},
 	/// An associated type declaration, optionally with a default value.
 	AssociatedType {
@@ -995,7 +985,7 @@ pub enum ImportEntry {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct EnumVariant {
 	pub name: Spanned<SymbolU32>,
-	pub value: Option<Box<Spanned<Expression>>>,
+	pub value: Option<ExprId>,
 }
 
 /// An entry of an enum body, as written.
@@ -1014,7 +1004,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		signature: FunctionSignature,
-		block: Box<Spanned<Expression>>,
+		block: BlockId,
 	},
 	FunctionDeclaration {
 		pub_span: Option<TextSpan>,
@@ -1047,7 +1037,7 @@ pub enum Item {
 		mut_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
-		value: Box<Spanned<Expression>>,
+		value: ExprId,
 		attributes: Box<[Attribute]>,
 	},
 	Export {
@@ -1105,7 +1095,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
-		value: Box<Spanned<Expression>>,
+		value: ExprId,
 		attributes: Box<[Attribute]>,
 	},
 	Module {
@@ -1257,6 +1247,22 @@ index_newtype!(
 	/// A pattern, in its file's [`AST`].
 	PatId
 );
+index_newtype!(
+	/// An expression, in its file's [`AST`].
+	ExprId
+);
+index_newtype!(
+	/// A statement, in its file's [`AST`].
+	StmtId
+);
+index_newtype!(
+	/// A block, `{ ... }`, in its file's [`AST`].
+	BlockId
+);
+index_newtype!(
+	/// One path segment, in its file's [`AST`]: a member's name.
+	SegmentId
+);
 
 /// A run of one of the [`AST`]'s lists, read with [`AST::list`]: the
 /// segments of a path, the arguments of a segment, the elements of a tuple
@@ -1322,6 +1328,10 @@ listed! {
 	PatId => pat_lists,
 	PatternElement => pattern_elements,
 	PatternFieldItem => pattern_fields,
+	ExprId => expr_lists,
+	StmtId => stmt_lists,
+	NamedArgument => named_arguments,
+	MatchArm => arms,
 }
 
 /// A column of nodes of one kind, each with its span; a node's id is its
@@ -1350,9 +1360,9 @@ impl<K> Column<K> {
 	}
 }
 
-/// One file's syntax tree. Type syntax and patterns live in columns
-/// addressed by id (a child before its parent) and lists by [`List`]; items
-/// and expressions are still a tree, holding those ids
+/// One file's syntax tree. Types, patterns, expressions, statements and
+/// blocks live in columns addressed by id (a child before its parent), and
+/// lists by [`List`]; items are still a tree, holding those ids
 /// (`notes/ast-arena-plan.md`).
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AST {
@@ -1365,6 +1375,9 @@ pub struct AST {
 	consts: Column<ConstArgument>,
 	bounds: Column<BoundExpression>,
 	patterns: Column<Pattern>,
+	exprs: Column<Expression>,
+	stmts: Column<Statement>,
+	blocks: Column<Block>,
 	qualified_roots: Vec<QualifiedPathRoot>,
 	segments: Vec<PathSegment>,
 	type_args: Vec<TypeArgument>,
@@ -1375,6 +1388,10 @@ pub struct AST {
 	pat_lists: Vec<PatId>,
 	pattern_elements: Vec<PatternElement>,
 	pattern_fields: Vec<PatternFieldItem>,
+	expr_lists: Vec<ExprId>,
+	stmt_lists: Vec<StmtId>,
+	named_arguments: Vec<NamedArgument>,
+	arms: Vec<MatchArm>,
 }
 
 impl AST {
@@ -1388,6 +1405,9 @@ impl AST {
 			consts: Column::default(),
 			bounds: Column::default(),
 			patterns: Column::default(),
+			exprs: Column::default(),
+			stmts: Column::default(),
+			blocks: Column::default(),
 			qualified_roots: Vec::new(),
 			segments: Vec::new(),
 			type_args: Vec::new(),
@@ -1398,6 +1418,10 @@ impl AST {
 			pat_lists: Vec::new(),
 			pattern_elements: Vec::new(),
 			pattern_fields: Vec::new(),
+			expr_lists: Vec::new(),
+			stmt_lists: Vec::new(),
+			named_arguments: Vec::new(),
+			arms: Vec::new(),
 		}
 	}
 
@@ -1446,6 +1470,64 @@ impl AST {
 		}
 	}
 
+	pub fn expr(&self, id: ExprId) -> Expression {
+		self.exprs.kinds[usize::from(id)]
+	}
+
+	pub fn expr_span(&self, id: ExprId) -> TextSpan {
+		self.exprs.spans[usize::from(id)]
+	}
+
+	pub fn statement(&self, id: StmtId) -> Statement {
+		self.stmts.kinds[usize::from(id)]
+	}
+
+	pub fn statement_span(&self, id: StmtId) -> TextSpan {
+		self.stmts.spans[usize::from(id)]
+	}
+
+	pub fn block(&self, id: BlockId) -> Block {
+		self.blocks.kinds[usize::from(id)]
+	}
+
+	/// A block's span, its braces; a block with none written (an `if`
+	/// labelled by mistake, read as the block around it) spans its tail.
+	pub fn block_span(&self, id: BlockId) -> TextSpan {
+		self.blocks.spans[usize::from(id)]
+	}
+
+	pub fn segment(&self, id: SegmentId) -> PathSegment {
+		self.segments[usize::from(id)]
+	}
+
+	/// Where a unary or binary expression's operator is written.
+	pub fn operator_span(&self, id: ExprId) -> TextSpan {
+		let (start, text) = match self.expr(id) {
+			Expression::Unary { operator, .. } => {
+				(self.expr_span(id).start, operator.as_str())
+			}
+			Expression::Binary {
+				operator,
+				operator_start,
+				..
+			} => (operator_start, operator.as_str()),
+			_ => unreachable!("only an operator expression has an operator"),
+		};
+		TextSpan::new(start, start + text.len() as u32)
+	}
+
+	/// Where a call's arguments are written: from the `(` to the end of the
+	/// call for a positional list, the braces of a named one.
+	pub fn arguments_span(&self, id: ExprId) -> TextSpan {
+		match self.expr(id) {
+			Expression::Call { open, .. } => {
+				TextSpan::new(open, self.expr_span(id).end)
+			}
+			Expression::NamedCall { braces, .. } => braces,
+			_ => unreachable!("only a call has arguments"),
+		}
+	}
+
 	pub fn qualified_root(&self, id: QualifiedRootId) -> QualifiedPathRoot {
 		self.qualified_roots[usize::from(id)]
 	}
@@ -1484,6 +1566,24 @@ impl AST {
 
 	fn push_pattern(&mut self, kind: Pattern, span: TextSpan) -> PatId {
 		PatId::new(self.patterns.push(kind, span))
+	}
+
+	fn push_expr(&mut self, kind: Expression, span: TextSpan) -> ExprId {
+		ExprId::new(self.exprs.push(kind, span))
+	}
+
+	fn push_statement(&mut self, kind: Statement, span: TextSpan) -> StmtId {
+		StmtId::new(self.stmts.push(kind, span))
+	}
+
+	fn push_block(&mut self, block: Block, span: TextSpan) -> BlockId {
+		BlockId::new(self.blocks.push(block, span))
+	}
+
+	fn push_segment(&mut self, segment: PathSegment) -> SegmentId {
+		let id = SegmentId::new(u32::try_from(self.segments.len()).unwrap());
+		self.segments.push(segment);
+		id
 	}
 
 	fn push_qualified_root(

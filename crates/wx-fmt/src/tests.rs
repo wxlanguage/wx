@@ -2482,139 +2482,142 @@ fn checked_format(source: &str, width: u32, indent: u8) -> String {
 			ast::Item::Function { block: b, .. },
 		) = (&before.inner.inner, &after.inner.inner)
 		{
-			preserve_roles(&a.inner, &b.inner);
+			Roles {
+				a: &case.ast,
+				b: &reparsed.ast,
+			}
+			.block(*a, *b);
 		}
 	}
 	output
 }
 
-// Compare nested block roles while allowing separator normalization and
-// redundant `else { if .. }` wrappers to become `else if ..`.
-fn preserve_roles(a: &ast::Expression, b: &ast::Expression) {
-	use ast::Expression as E;
-	assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
-	match (a, b) {
-		(E::Block { statements: a, .. }, E::Block { statements: b, .. }) => {
-			let (a, b) = (&a.inner, &b.inner);
-			assert_eq!(a.len(), b.len());
-			let count = a.len();
-			for (i, (a, b)) in a.iter().zip(b).enumerate() {
-				match (&a.inner.inner, &b.inner.inner) {
-					(
-						ast::Statement::Expression(x),
-						ast::Statement::Expression(y),
-					) => {
-						if i + 1 == count || !x.inner.is_block_like() {
-							assert_eq!(
-								a.separator.is_some(),
-								b.separator.is_some(),
-								"expression role changed"
-							);
-						}
-						preserve_roles(&x.inner, &y.inner);
-					}
-					(
-						ast::Statement::LocalDefinition { value: x, .. },
-						ast::Statement::LocalDefinition { value: y, .. },
-					) => {
-						assert!(b.separator.is_some());
-						preserve_roles(&x.inner, &y.inner);
-					}
-					_ => panic!("statement kind changed"),
-				}
+/// Compares the roles of two trees' nested blocks, the source's (`a`) and
+/// its formatted output's (`b`): each block keeps its statements and its
+/// tail, while redundant `else { if .. }` wrappers may become `else if ..`.
+struct Roles<'t> {
+	a: &'t ast::AST,
+	b: &'t ast::AST,
+}
+
+impl Roles<'_> {
+	fn block(&self, a: ast::BlockId, b: ast::BlockId) {
+		let (a, b) = (self.a.block(a), self.b.block(b));
+		let (sa, sb) = (self.a.list(a.statements), self.b.list(b.statements));
+		assert_eq!(sa.len(), sb.len(), "statement count changed");
+		assert_eq!(a.tail.is_some(), b.tail.is_some(), "tail changed");
+		for (&x, &y) in sa.iter().zip(sb) {
+			match (self.a.statement(x), self.b.statement(y)) {
+				(
+					ast::Statement::Expression(x),
+					ast::Statement::Expression(y),
+				)
+				| (
+					ast::Statement::LocalDefinition { value: x, .. },
+					ast::Statement::LocalDefinition { value: y, .. },
+				) => self.expr(x, y),
+				_ => panic!("statement kind changed"),
 			}
 		}
-		(
-			E::IfElse {
-				condition: ac,
-				then_block: at,
-				else_block: ae,
-			},
-			E::IfElse {
-				condition: bc,
-				then_block: bt,
-				else_block: be,
-			},
-		) => {
-			preserve_roles(&ac.inner, &bc.inner);
-			preserve_roles(&at.inner, &bt.inner);
-			assert_eq!(ae.is_some(), be.is_some());
-			if let (Some(a), Some(b)) = (ae, be) {
-				if let E::Block { label, statements } = &a.inner
-					&& matches!(b.inner, E::IfElse { .. })
+		if let (Some(x), Some(y)) = (a.tail, b.tail) {
+			self.expr(x, y);
+		}
+	}
+
+	fn expr(&self, a: ast::ExprId, b: ast::ExprId) {
+		use ast::Expression as E;
+		let (ea, eb) = (self.a.expr(a), self.b.expr(b));
+		assert_eq!(std::mem::discriminant(&ea), std::mem::discriminant(&eb));
+		match (ea, eb) {
+			(E::Block { block: a, .. }, E::Block { block: b, .. })
+			| (E::Loop { block: a, .. }, E::Loop { block: b, .. }) => self.block(a, b),
+			(
+				E::IfElse {
+					condition: ac,
+					then_block: at,
+					else_block: ae,
+				},
+				E::IfElse {
+					condition: bc,
+					then_block: bt,
+					else_block: be,
+				},
+			) => {
+				self.expr(ac, bc);
+				self.block(at, bt);
+				assert_eq!(ae.is_some(), be.is_some());
+				let (Some(a), Some(b)) = (ae, be) else {
+					return;
+				};
+				if let E::Block { label, block } = self.a.expr(a)
+					&& matches!(self.b.expr(b), E::IfElse { .. })
 				{
 					assert!(label.is_none());
-					let [statement] = &*statements.inner else {
-						panic!("removed else block with multiple statements");
-					};
-					assert!(statement.separator.is_none());
-					let ast::Statement::Expression(nested) =
-						&statement.inner.inner
-					else {
-						panic!("removed else block without a tail expression");
-					};
-					preserve_roles(&nested.inner, &b.inner);
+					let block = self.a.block(block);
+					assert!(
+						block.statements.is_empty(),
+						"removed else block with statements"
+					);
+					let nested = block
+						.tail
+						.expect("removed else block without a tail expression");
+					self.expr(nested, b);
 				} else {
-					preserve_roles(&a.inner, &b.inner);
+					self.expr(a, b);
 				}
 			}
-		}
-		(E::Loop { block: a, .. }, E::Loop { block: b, .. }) => {
-			preserve_roles(&a.inner, &b.inner)
-		}
-		(
-			E::Match {
-				scrutinee: a,
-				arms: aa,
-			},
-			E::Match {
-				scrutinee: b,
-				arms: ba,
-			},
-		) => {
-			preserve_roles(&a.inner, &b.inner);
-			assert_eq!(aa.len(), ba.len());
-			for (a, b) in aa.iter().zip(ba) {
-				preserve_roles(
-					&a.inner.inner.body.inner,
-					&b.inner.inner.body.inner,
-				);
-			}
-		}
-		(
-			E::NamedCall { arguments: a, .. },
-			E::NamedCall { arguments: b, .. },
-		) => {
-			let (a, b) = (&a.inner, &b.inner);
-			assert_eq!(a.len(), b.len());
-			for (a, b) in a.iter().zip(b) {
-				if let (Some(a), Some(b)) =
-					(&a.inner.inner.value, &b.inner.inner.value)
-				{
-					preserve_roles(&a.inner, &b.inner);
+			(
+				E::Match {
+					scrutinee: a,
+					arms: aa,
+				},
+				E::Match {
+					scrutinee: b,
+					arms: ba,
+				},
+			) => {
+				self.expr(a, b);
+				let (aa, ba) = (self.a.list(aa), self.b.list(ba));
+				assert_eq!(aa.len(), ba.len());
+				for (a, b) in aa.iter().zip(ba) {
+					self.expr(a.body, b.body);
 				}
 			}
-		}
-		(E::NamedMethodCall(a), E::NamedMethodCall(b)) => {
-			preserve_roles(&a.object.inner, &b.object.inner);
-			assert_eq!(a.arguments.inner.len(), b.arguments.inner.len());
-			for (a, b) in a.arguments.inner.iter().zip(&b.arguments.inner) {
-				if let (Some(a), Some(b)) =
-					(&a.inner.inner.value, &b.inner.inner.value)
-				{
-					preserve_roles(&a.inner, &b.inner);
+			(
+				E::NamedCall {
+					callee: ac,
+					arguments: a,
+					..
+				},
+				E::NamedCall {
+					callee: bc,
+					arguments: b,
+					..
+				},
+			) => {
+				self.expr(ac, bc);
+				let (a, b) = (self.a.list(a), self.b.list(b));
+				assert_eq!(a.len(), b.len());
+				for (a, b) in a.iter().zip(b) {
+					if let (Some(a), Some(b)) = (a.value, b.value) {
+						self.expr(a, b);
+					}
 				}
 			}
-		}
-		(
-			E::Return { value: a } | E::Break { value: a, .. },
-			E::Return { value: b } | E::Break { value: b, .. },
-		) => {
-			if let (Some(a), Some(b)) = (a, b) {
-				preserve_roles(&a.inner, &b.inner);
+			(
+				E::ObjectAccess { object: a, .. },
+				E::ObjectAccess { object: b, .. },
+			) => self.expr(a, b),
+			(
+				E::Return { value: a } | E::Break { value: a, .. },
+				E::Return { value: b } | E::Break { value: b, .. },
+			) => {
+				if let (Some(a), Some(b)) = (a, b) {
+					self.expr(a, b);
+				}
 			}
+			_ => {}
 		}
-		_ => {}
 	}
 }
 

@@ -181,10 +181,11 @@ fn report_incomplete_unary_expression(
 /// is itself the operand an operator before it parsed.
 fn report_block_like_operand(
 	file_id: FileId,
-	expression: &Spanned<Expression>,
+	expression: Expression,
+	span: TextSpan,
 	operator: Option<TextSpan>,
 ) -> Diagnostic<FileId> {
-	let keyword = match expression.inner {
+	let keyword = match expression {
 		Expression::IfElse { .. } => "if",
 		Expression::Match { .. } => "match",
 		Expression::Loop { .. } => "loop",
@@ -199,11 +200,11 @@ fn report_block_like_operand(
 				format!("this operator would take the `{keyword}`"),
 			))
 			.with_label(
-				Label::secondary(file_id, expression.span)
+				Label::secondary(file_id, span)
 					.with_message(format!("the `{keyword}` ends here")),
 			),
 		None => diagnostic.with_label(
-			Label::primary(file_id, expression.span)
+			Label::primary(file_id, span)
 				.with_message(format!("this `{keyword}` is an operand")),
 		),
 	};
@@ -555,6 +556,80 @@ pub struct Parser<'input> {
 	ast: AST,
 }
 
+/// The tokens that open, separate and close a delimited list.
+#[derive(Clone, Copy)]
+struct Delimiters {
+	open: Token,
+	close: Token,
+	separator: Token,
+}
+
+/// `( a, b )`
+const PARENS: Delimiters = Delimiters {
+	open: Token::OpenParen,
+	close: Token::CloseParen,
+	separator: Token::Comma,
+};
+
+/// `{ a, b }`
+const BRACES: Delimiters = Delimiters {
+	open: Token::OpenBrace,
+	close: Token::CloseBrace,
+	separator: Token::Comma,
+};
+
+/// `{ a; b }`
+const BLOCK: Delimiters = Delimiters {
+	open: Token::OpenBrace,
+	close: Token::CloseBrace,
+	separator: Token::SemiColon,
+};
+
+/// A delimited list as parsed: its items, its span, delimiters included,
+/// and whether a separator follows the last item.
+struct Delimited<T> {
+	items: Vec<Spanned<T>>,
+	span: TextSpan,
+	trailing: bool,
+}
+
+/// What reads one item of a delimited list. Its `Err` means it has
+/// reported, and the list skips to the next separator.
+type ItemParser<T> = fn(&mut Parser) -> Result<Spanned<T>, ()>;
+
+/// An item of a delimited list.
+trait ListItem {
+	/// Whether the item ends at a block-like expression's `}`, so the next
+	/// one needs no separator before it, as a block-like expression is never
+	/// an operand.
+	fn ends_in_block(&self, _ast: &AST) -> bool {
+		false
+	}
+}
+
+impl ListItem for Statement {
+	/// A `local` needs its `;` even when its value is block-like.
+	fn ends_in_block(&self, ast: &AST) -> bool {
+		match *self {
+			Statement::Expression(expr) => ast.expr(expr).is_block_like(),
+			Statement::LocalDefinition { .. } => false,
+		}
+	}
+}
+
+impl ListItem for MatchArm {
+	fn ends_in_block(&self, ast: &AST) -> bool {
+		ast.expr(self.body).is_block_like()
+	}
+}
+
+impl ListItem for ExprId {}
+impl ListItem for TypeId {}
+impl ListItem for FunctionTypeParam {}
+impl ListItem for NamedArgument {}
+impl ListItem for PatternElement {}
+impl ListItem for PatternFieldItem {}
+
 struct SeparatedGroup<T> {
 	item_handler: fn(parser: &mut Parser) -> Result<Spanned<T>, ()>,
 	open_token: Token,
@@ -847,6 +922,121 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	#[inline]
+	/// A delimited list: the opening token, the items, each followed by the
+	/// separator (the last one optionally), and the closing token.
+	fn separated<T: ListItem>(
+		&mut self,
+		delimiters: Delimiters,
+		item: ItemParser<T>,
+	) -> Result<Delimited<T>, ()> {
+		let open = self.next_expect(delimiters.open)?.span;
+		Ok(self.separated_after(delimiters, open, item))
+	}
+
+	/// [`Parser::separated`], with the opening token at `open` consumed
+	/// already. A missing separator is reported, unless the item before it
+	/// ends in a block ([`ListItem::ends_in_block`]), and the list goes on;
+	/// an item that fails is skipped to the next separator.
+	fn separated_after<T: ListItem>(
+		&mut self,
+		delimiters: Delimiters,
+		open: TextSpan,
+		item: ItemParser<T>,
+	) -> Delimited<T> {
+		let mut items: Vec<Spanned<T>> = Vec::new();
+		let mut trailing = false;
+		let close = loop {
+			let token = self.lexer.peek();
+			if token.inner == delimiters.close {
+				break self.lexer.next().span;
+			}
+			if token.inner == Token::Eof {
+				let at = items.last().map_or(open.end, |last| last.span.end);
+				break self.report_unclosed(delimiters, open, at);
+			}
+			let parsed = match item(self) {
+				Ok(parsed) => parsed,
+				Err(()) => {
+					self.skip_to_separator(delimiters);
+					continue;
+				}
+			};
+			let end = parsed.span.end;
+			let next = self.lexer.peek().inner;
+			let needs = !parsed.inner.ends_in_block(&self.ast);
+			items.push(parsed);
+			trailing = false;
+			if next == delimiters.separator {
+				self.lexer.next();
+				trailing = true;
+			} else if next == delimiters.close {
+				break self.lexer.next().span;
+			} else if next == Token::Eof {
+				break self.report_unclosed(delimiters, open, end);
+			} else if needs {
+				self.ast.diagnostics.push(report_missing_separator(
+					self.ast.file_id,
+					TextSpan::new(end, end),
+					delimiters.separator,
+				));
+			}
+		};
+		Delimited {
+			items,
+			span: TextSpan::new(open.start, close.end),
+			trailing,
+		}
+	}
+
+	/// After an item that failed (and reported): skips to the next
+	/// separator, consumed, or to the list's end, left for the list.
+	fn skip_to_separator(&mut self, delimiters: Delimiters) {
+		loop {
+			let token = self.lexer.peek().inner;
+			if token == delimiters.separator {
+				self.lexer.next();
+				return;
+			}
+			if token == delimiters.close || token == Token::Eof {
+				return;
+			}
+			self.lexer.next();
+		}
+	}
+
+	/// A list the file ends inside: reported, and closed at `at`.
+	fn report_unclosed(
+		&mut self,
+		delimiters: Delimiters,
+		open: TextSpan,
+		at: u32,
+	) -> TextSpan {
+		let expected_close_span = TextSpan::new(at, at);
+		self.ast.diagnostics.push(report_unclosed_delimiter(
+			UnclosedDelimiterDiagnostic {
+				file_id: self.ast.file_id,
+				close_token: delimiters.close,
+				open_span: open,
+				expected_close_span,
+			},
+		));
+		expected_close_span
+	}
+
+	/// A delimited list's items, written whole into the tree, spanned by
+	/// its delimiters.
+	fn push_delimited<T: Listed>(
+		&mut self,
+		list: Delimited<T>,
+	) -> Spanned<List<T>> {
+		Spanned {
+			inner: self
+				.ast
+				.push_list(list.items.into_iter().map(|item| item.inner)),
+			span: list.span,
+		}
+	}
+
 	fn next_expect(
 		&mut self,
 		expected_token: Token,
@@ -978,40 +1168,28 @@ impl<'ctx> Parser<'ctx> {
 	/// stands for.
 	fn parse_attribute_arguments(
 		parser: &mut Parser,
-	) -> Result<Box<[Separated<Spanned<NamedArgument>>]>, ()> {
+	) -> Result<List<NamedArgument>, ()> {
 		let open = parser.next_expect(Token::OpenParen)?.span;
 		match parser.lexer.peek().inner {
 			Token::OpenBrace => {
-				Ok(Parser::parse_named_call_arguments(parser)?.0.inner)
+				Ok(parser.parse_named_call_arguments()?.0.inner)
 			}
 			Token::CloseParen => {
 				parser.lexer.next();
-				Ok(Box::default())
+				Ok(List::EMPTY)
 			}
 			_ => {
 				let mut arguments = Vec::new();
 				loop {
 					let name = parser.expect_name(&[])?;
-					let name_span = name.span;
 					parser.next_expect(Token::Eq)?;
 					let value =
 						parser.parse_expression(BindingPower::Default)?;
-					let span = TextSpan::new(name_span.start, value.span.end);
-					let separator = parser
-						.lexer
-						.next_if(Token::Comma)
-						.map(|comma| comma.span);
-					arguments.push(Separated {
-						inner: Spanned {
-							inner: NamedArgument {
-								name,
-								value: Some(Box::new(value)),
-							},
-							span,
-						},
-						separator,
+					arguments.push(NamedArgument {
+						name,
+						value: Some(value),
 					});
-					if separator.is_none()
+					if parser.lexer.next_if(Token::Comma).is_none()
 						|| parser.lexer.peek().inner == Token::CloseParen
 					{
 						break;
@@ -1032,7 +1210,7 @@ impl<'ctx> Parser<'ctx> {
 						))
 						.with_note("write `#[name({ argument: value, .. })]`"),
 				);
-				Ok(arguments.into_boxed_slice())
+				Ok(parser.ast.push_list(arguments))
 			}
 		}
 	}
@@ -1617,14 +1795,14 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<Item>, ()> {
 		let signature = Parser::parse_function_signature(parser)?;
 		let block = if parser.lexer.peek().inner == Token::OpenBrace {
-			Some(Box::new(Parser::parse_block_expression(parser)?))
+			Some(parser.parse_block()?)
 		} else {
 			None
 		};
 		let span = TextSpan::new(
 			signature.span.start,
-			match &block {
-				Some(block) => block.span.end,
+			match block {
+				Some(block) => parser.ast.block_span(block).end,
 				None => signature.span.end,
 			},
 		);
@@ -2026,21 +2204,14 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	fn parse_tuple_or_paren_type_expression(&mut self) -> Result<TypeId, ()> {
-		let grouped = SeparatedGroup {
-			open_token: Token::OpenParen,
-			close_token: Token::CloseParen,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_type_item,
-			should_warn_missing_separator: None,
-		}
-		.parse(self)?;
-
-		let elements = self
-			.ast
-			.push_list(grouped.inner.iter().map(|element| element.inner.inner));
-		Ok(self
-			.ast
-			.push_type(TypeExpression::Tuple { elements }, grouped.span))
+		let elements = self.separated(PARENS, Parser::parse_type_item)?;
+		let elements = self.push_delimited(elements);
+		Ok(self.ast.push_type(
+			TypeExpression::Tuple {
+				elements: elements.inner,
+			},
+			elements.span,
+		))
 	}
 
 	fn parse_function_type_param(
@@ -2075,17 +2246,10 @@ impl<'ctx> Parser<'ctx> {
 
 	fn parse_function_type_expression(&mut self) -> Result<TypeId, ()> {
 		let func_keyword = self.lexer.next();
-		let params = SeparatedGroup {
-			open_token: Token::OpenParen,
-			close_token: Token::CloseParen,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_function_type_param,
-			should_warn_missing_separator: None,
-		}
-		.parse(self)?;
-		let list = self
-			.ast
-			.push_list(params.inner.iter().map(|param| param.inner.inner));
+		let params =
+			self.separated(PARENS, Parser::parse_function_type_param)?;
+		let params = self.push_delimited(params);
+		let list = params.inner;
 
 		let result = match self.lexer.next_if(Token::MinusRightArrow) {
 			Some(_) => Some(Parser::parse_type_expression(self)?),
@@ -2126,45 +2290,41 @@ impl<'ctx> Parser<'ctx> {
 	/// The expression an operand starts with, before any operator: a
 	/// literal, a path, a prefix operator, a bracketed list or a block-like
 	/// expression. The caller has checked [`Parser::starts_expression`].
-	fn parse_prefix(&mut self) -> Result<Spanned<Expression>, ()> {
+	fn parse_prefix(&mut self) -> Result<ExprId, ()> {
 		match self.lexer.peek().inner {
-			Token::Keyword(Keyword::Return) => {
-				Parser::parse_return_expression(self)
-			}
-			Token::Keyword(Keyword::If) => {
-				Parser::parse_if_else_expression(self)
-			}
-			Token::Keyword(Keyword::Loop) => {
-				Parser::parse_loop_expression(self)
-			}
-			Token::Keyword(Keyword::Match) => {
-				Parser::parse_match_expression(self)
-			}
-			Token::Keyword(Keyword::Break) => {
-				Parser::parse_break_expression(self)
-			}
+			Token::Keyword(Keyword::Return) => self.parse_return_expression(),
+			Token::Keyword(Keyword::If) => self.parse_if_else_expression(),
+			Token::Keyword(Keyword::Loop) => self.parse_loop_expression(),
+			Token::Keyword(Keyword::Match) => self.parse_match_expression(),
+			Token::Keyword(Keyword::Break) => self.parse_break_expression(),
 			Token::Keyword(Keyword::Continue) => {
-				Parser::parse_continue_expression(self)
+				self.parse_continue_expression()
 			}
 			Token::Keyword(Keyword::Underscore) => {
-				Parser::parse_placeholder_expression(self)
+				self.parse_placeholder_expression()
 			}
 			Token::Keyword(Keyword::Block) => {
-				Parser::parse_keyword_block_expression(self)
+				self.parse_keyword_block_expression()
 			}
 			Token::Identifier | Token::Keyword(_) => {
-				Parser::parse_path_expression(self)
+				self.parse_path_expression()
 			}
-			Token::Int => Parser::parse_int_expression(self),
-			Token::Float => Parser::parse_float_expression(self),
-			Token::String => Parser::parse_string_expression(self),
-			Token::Char => Parser::parse_char_expression(self),
-			Token::OpenBrace => Parser::parse_bare_block_expression(self),
-			Token::OpenParen => Parser::parse_tuple_expression(self),
-			Token::OpenBracket => Parser::parse_array_expression(self),
-			Token::LeftArrow => Parser::parse_qualified_path_expression(self),
+			Token::Int => self.parse_int_expression(),
+			Token::Float => self.parse_float_expression(),
+			Token::String => {
+				let span = self.lexer.next().span;
+				Ok(self.ast.push_expr(Expression::String, span))
+			}
+			Token::Char => {
+				let span = self.lexer.next().span;
+				Ok(self.ast.push_expr(Expression::Char, span))
+			}
+			Token::OpenBrace => self.parse_bare_block_expression(),
+			Token::OpenParen => self.parse_tuple_expression(),
+			Token::OpenBracket => self.parse_array_expression(),
+			Token::LeftArrow => self.parse_qualified_path_expression(),
 			Token::Minus | Token::Bang | Token::Caret => {
-				Parser::parse_unary_expression(self)
+				self.parse_unary_expression()
 			}
 			_ => unreachable!("the caller checked `starts_expression`"),
 		}
@@ -2214,7 +2374,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_expression(
 		&mut self,
 		limit_bp: BindingPower,
-	) -> Result<Spanned<Expression>, ()> {
+	) -> Result<ExprId, ()> {
 		let token = self.lexer.peek();
 		if !Self::starts_expression(token.inner) {
 			self.ast
@@ -2233,12 +2393,15 @@ impl<'ctx> Parser<'ctx> {
 		// statement list, what follows is the next statement: `if c { .. }
 		// (a, b)` is two. Once that is reported, the operators are read as
 		// before, so the caller sees one diagnostic and a whole expression.
-		if left.inner.is_block_like() {
+		let kind = self.ast.expr(left);
+		if kind.is_block_like() {
 			let token = self.lexer.peek();
+			let span = self.ast.expr_span(left);
 			if limit_bp > BindingPower::Assignment {
 				self.ast.diagnostics.push(report_block_like_operand(
 					self.ast.file_id,
-					&left,
+					kind,
+					span,
 					None,
 				));
 			} else if Self::infix_power(token.inner)
@@ -2251,7 +2414,8 @@ impl<'ctx> Parser<'ctx> {
 				// continues an enclosing expression instead.
 				self.ast.diagnostics.push(report_block_like_operand(
 					self.ast.file_id,
-					&left,
+					kind,
+					span,
 					Some(token.span),
 				));
 			} else {
@@ -2266,17 +2430,13 @@ impl<'ctx> Parser<'ctx> {
 				_ => break,
 			};
 			left = match token {
-				Token::OpenParen => Parser::parse_call_expression(self, left)?,
-				Token::OpenBracket => {
-					Parser::parse_index_expression(self, left)?
-				}
-				Token::Dot => {
-					Parser::parse_object_access_expression(self, left)?
-				}
+				Token::OpenParen => self.parse_call_expression(left)?,
+				Token::OpenBracket => self.parse_index_expression(left)?,
+				Token::Dot => self.parse_object_access_expression(left)?,
 				Token::ColonColon => {
-					Parser::parse_type_application_expression(self, left)?
+					self.parse_type_application_expression(left)?
 				}
-				_ => Parser::parse_binary_expression(self, left, power)?,
+				_ => self.parse_binary_expression(left, power)?,
 			};
 		}
 		Ok(left)
@@ -2290,53 +2450,43 @@ impl<'ctx> Parser<'ctx> {
 	/// Ordinary postfix parsing (`Call`, `ObjectAccess`, `Index`) applies on
 	/// top of the returned expression via the normal Pratt loop, so `<Type
 	/// as Trait>::method(x)` needs no extra handling here.
-	fn parse_qualified_path_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let open_span = parser.lexer.next().span; // consume `<`
-		let root = parser.parse_bracketed_root(open_span)?;
-		let segments = parser.parse_value_path()?;
-		let span = TextSpan::new(open_span.start, segments.span().end);
-		let segments = segments.segments;
-		Ok(Spanned {
-			inner: match root {
-				BracketedRoot::Qualified(root) => Expression::QualifiedPath {
-					root: parser.ast.push_qualified_root(root),
-					segments,
-				},
-				BracketedRoot::Grouped(inner) => {
-					Expression::Grouped { inner, segments }
-				}
+	fn parse_qualified_path_expression(&mut self) -> Result<ExprId, ()> {
+		let open_span = self.lexer.next().span; // consume `<`
+		let root = self.parse_bracketed_root(open_span)?;
+		let path = self.parse_value_path()?;
+		let span = TextSpan::new(open_span.start, path.span().end);
+		let segments = self.ast.push_list(path.segments);
+		let kind = match root {
+			BracketedRoot::Qualified(root) => Expression::QualifiedPath {
+				root: self.ast.push_qualified_root(root),
+				segments,
 			},
-			span,
-		})
+			BracketedRoot::Grouped(inner) => {
+				Expression::Grouped { inner, segments }
+			}
+		};
+		Ok(self.ast.push_expr(kind, span))
 	}
 
-	fn parse_path_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let first = parser.expect_name(&[
+	fn parse_path_expression(&mut self) -> Result<ExprId, ()> {
+		let first = self.expect_name(&[
 			Keyword::SelfLower,
 			Keyword::SelfPascal,
 			Keyword::Underscore,
 			Keyword::Package,
 			Keyword::Super,
 		])?;
-		let start = first.span;
 
 		// Start the path with the first segment (no type args yet).
 		let mut segments: Vec<PathSegment> = vec![PathSegment::new(first)];
 
-		loop {
-			if parser.lexer.peek().inner != Token::ColonColon {
-				break;
-			}
-			let colons = parser.lexer.next(); // consume `::`
-			let next = parser.lexer.peek();
+		while self.lexer.peek().inner == Token::ColonColon {
+			let colons = self.lexer.next(); // consume `::`
+			let next = self.lexer.peek();
 			match next.inner {
 				// `::<T, U>` — turbofish type args for the last segment
 				Token::LeftArrow => {
-					let (type_args, args_span, _) = parser.parse_type_args()?;
+					let (type_args, args_span, _) = self.parse_type_args()?;
 					let last = segments.last_mut().unwrap();
 					last.type_args = type_args;
 					last.args_span = args_span;
@@ -2344,23 +2494,20 @@ impl<'ctx> Parser<'ctx> {
 				}
 				// `::{ ... }` — the old struct literal
 				Token::OpenBrace => {
-					return Parser::parse_struct_literal_as_call(
-						parser,
-						segments.into(),
-					);
+					return self.parse_struct_literal_as_call(&segments);
 				}
 				// `::ident` — next path segment
 				token if Self::is_later_segment(token) => {
 					segments.push(PathSegment::new(
-						parser.expect_name(&[Keyword::Super])?,
+						self.expect_name(&[Keyword::Super])?,
 					));
 				}
 				// Anything else after `::` is a missing segment: reported,
 				// and kept, so the path up to it is still resolved.
 				_ => {
-					let bad = parser.lexer.peek();
-					parser.ast.diagnostics.push(report_invalid_namespace(
-						parser.ast.file_id,
+					let bad = self.lexer.peek();
+					self.ast.diagnostics.push(report_invalid_namespace(
+						self.ast.file_id,
 						bad.span,
 					));
 					segments.push(PathSegment::missing(colons.span.end));
@@ -2369,34 +2516,30 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		let end = segments.last().unwrap().ident.span;
-		let span = TextSpan::new(start.start, end.end);
-		Ok(Spanned {
-			inner: Expression::Path(segments.into()),
-			span,
-		})
+		let span = AST::path_span(&segments);
+		let path = self.ast.push_list(segments);
+		Ok(self.ast.push_expr(Expression::Path(path), span))
 	}
 
 	/// A named list and the `)` after it, the `(` consumed. The list is the
 	/// call's only argument: anything else before `)` is reported, and read
 	/// for recovery. Returns the arguments and where the call ends.
 	fn parse_named_call_arguments(
-		parser: &mut Parser,
-	) -> Result<(Spanned<Box<[Separated<Spanned<NamedArgument>>]>>, u32), ()> {
-		let named = Parser::parse_named_arguments(parser)?;
-		if parser.lexer.peek().inner != Token::CloseParen {
-			let at = parser.lexer.peek().span;
-			parser
-				.ast
+		&mut self,
+	) -> Result<(Spanned<List<NamedArgument>>, u32), ()> {
+		let named = self.parse_named_arguments()?;
+		if self.lexer.peek().inner != Token::CloseParen {
+			let at = self.lexer.peek().span;
+			self.ast
 				.diagnostics
-				.push(report_mixed_call_arguments(parser.ast.file_id, at));
-			while parser.lexer.next_if(Token::Comma).is_some()
-				&& parser.lexer.peek().inner != Token::CloseParen
+				.push(report_mixed_call_arguments(self.ast.file_id, at));
+			while self.lexer.next_if(Token::Comma).is_some()
+				&& self.lexer.peek().inner != Token::CloseParen
 			{
-				parser.parse_expression(BindingPower::Default)?;
+				self.parse_expression(BindingPower::Default)?;
 			}
 		}
-		let close_span = parser.next_expect(Token::CloseParen)?.span;
+		let close_span = self.next_expect(Token::CloseParen)?.span;
 		Ok((named, close_span.end))
 	}
 
@@ -2404,33 +2547,27 @@ impl<'ctx> Parser<'ctx> {
 	/// which is a mix: reported, and read so the call still parses.
 	fn parse_positional_argument(
 		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
+	) -> Result<Spanned<ExprId>, ()> {
 		if parser.lexer.peek().inner != Token::OpenBrace {
 			return Parser::parse_element(parser);
 		}
-		let named = Parser::parse_named_arguments(parser)?;
+		let named = parser.parse_named_arguments()?;
 		parser
 			.ast
 			.diagnostics
 			.push(report_mixed_call_arguments(parser.ast.file_id, named.span));
 		Ok(Spanned {
-			inner: Expression::Error,
+			inner: parser.ast.push_expr(Expression::Error, named.span),
 			span: named.span,
 		})
 	}
 
 	/// `{ name: expr, name, .. }`, braces included.
 	fn parse_named_arguments(
-		parser: &mut Parser,
-	) -> Result<Spanned<Box<[Separated<Spanned<NamedArgument>>]>>, ()> {
-		SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_named_argument,
-			should_warn_missing_separator: None,
-		}
-		.parse(parser)
+		&mut self,
+	) -> Result<Spanned<List<NamedArgument>>, ()> {
+		let named = self.separated(BRACES, Parser::parse_named_argument)?;
+		Ok(self.push_delimited(named))
 	}
 
 	/// `name: expr`, or the shorthand `name` for `name: name`. `self` is a
@@ -2442,29 +2579,34 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<NamedArgument>, ()> {
 		let name = parser.expect_name(&[Keyword::SelfLower])?;
-		let (value, span) = match parser.lexer.next_if(Token::Colon) {
-			Some(colon) => {
-				let token = parser.lexer.peek();
-				let value = if Self::starts_expression(token.inner) {
-					parser.parse_expression(BindingPower::Default)?
-				} else {
-					parser.ast.diagnostics.push(report_expected_expression(
-						parser.ast.file_id,
-						token,
-					));
-					Spanned {
-						inner: Expression::Error,
-						span: TextSpan::new(colon.span.end, token.span.start),
-					}
-				};
-				let span = TextSpan::new(name.span.start, value.span.end);
-				(Some(Box::new(value)), span)
-			}
-			None => (None, name.span),
+		let Some(colon) = parser.lexer.next_if(Token::Colon) else {
+			return Ok(Spanned {
+				inner: NamedArgument { name, value: None },
+				span: name.span,
+			});
+		};
+		let token = parser.lexer.peek();
+		let value = if Self::starts_expression(token.inner) {
+			parser.parse_expression(BindingPower::Default)?
+		} else {
+			parser
+				.ast
+				.diagnostics
+				.push(report_expected_expression(parser.ast.file_id, token));
+			parser.ast.push_expr(
+				Expression::Error,
+				TextSpan::new(colon.span.end, token.span.start),
+			)
 		};
 		Ok(Spanned {
-			inner: NamedArgument { name, value },
-			span,
+			inner: NamedArgument {
+				name,
+				value: Some(value),
+			},
+			span: TextSpan::new(
+				name.span.start,
+				parser.ast.expr_span(value).end,
+			),
 		})
 	}
 
@@ -2472,123 +2614,102 @@ impl<'ctx> Parser<'ctx> {
 	/// next. A struct is constructed by a call now: reported, and read as the
 	/// named call `Path({ ... })` it stands for.
 	fn parse_struct_literal_as_call(
-		parser: &mut Parser,
-		path: Box<[PathSegment]>,
-	) -> Result<Spanned<Expression>, ()> {
-		let path_span = TextSpan::new(
-			path.first().unwrap().ident.span.start,
-			path.last().unwrap().ident.span.end,
-		);
-		let named = Parser::parse_named_arguments(parser)?;
-		parser.ast.diagnostics.push(
+		&mut self,
+		path: &[PathSegment],
+	) -> Result<ExprId, ()> {
+		let path_span = AST::path_span(path);
+		let path = self.ast.push_list(path.iter().copied());
+		let callee = self.ast.push_expr(Expression::Path(path), path_span);
+		let named = self.parse_named_arguments()?;
+		let span = TextSpan::new(path_span.start, named.span.end);
+		self.ast.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::StructLiteralIsACall.code())
 				.with_message("a struct is constructed by a call")
-				.with_label(Label::primary(
-					parser.ast.file_id,
-					TextSpan::new(path_span.start, named.span.end),
-				))
+				.with_label(Label::primary(self.ast.file_id, span))
 				.with_note("write `Name({ field: value, ... })`"),
 		);
-		Ok(Spanned {
-			span: TextSpan::new(path_span.start, named.span.end),
-			inner: Expression::NamedCall {
-				callee: Box::new(Spanned {
-					inner: Expression::Path(path),
-					span: path_span,
-				}),
-				arguments: named,
+		Ok(self.ast.push_expr(
+			Expression::NamedCall {
+				callee,
+				arguments: named.inner,
+				braces: named.span,
 			},
-		})
+			span,
+		))
 	}
 
 	fn parse_object_access_expression(
-		parser: &mut Parser,
-		object: Spanned<Expression>,
-	) -> Result<Spanned<Expression>, ()> {
-		let dot = parser.lexer.next(); // consume the dot
-		let token = parser.lexer.peek();
-		let span = TextSpan::new(object.span.start, token.span.end);
-		match token.inner {
+		&mut self,
+		object: ExprId,
+	) -> Result<ExprId, ()> {
+		let start = self.ast.expr_span(object).start;
+		let dot = self.lexer.next(); // consume the dot
+		let token = self.lexer.peek();
+		let span = TextSpan::new(start, token.span.end);
+		let (kind, span) = match token.inner {
 			Token::Star => {
-				parser.lexer.next();
-				Ok(Spanned {
-					inner: Expression::Deref {
-						pointer: Box::new(object),
-					},
-					span,
-				})
+				self.lexer.next();
+				(Expression::Deref { pointer: object }, span)
 			}
 			Token::Amper => {
-				parser.lexer.next();
-				Ok(Spanned {
-					inner: Expression::AddressOf {
-						value: Box::new(object),
-					},
-					span,
-				})
+				self.lexer.next();
+				(Expression::AddressOf { value: object }, span)
 			}
 			// A keyword is never a member: `x.` on a line of its own is
 			// followed by the next statement's `local`, `return`, ...
 			Token::Identifier => {
-				parser.lexer.next();
-				Ok(Spanned {
-					inner: Expression::ObjectAccess {
-						object: Box::new(object),
-						member: PathSegment::new(Spanned {
-							inner: parser.strings.get_or_intern(
-								token.span.extract_str(parser.source),
-							),
-							span: token.span,
-						}),
-					},
-					span,
-				})
+				self.lexer.next();
+				let member = self.ast.push_segment(PathSegment::new(Spanned {
+					inner: self
+						.strings
+						.get_or_intern(token.span.extract_str(self.source)),
+					span: token.span,
+				}));
+				(Expression::ObjectAccess { object, member }, span)
 			}
 			// `x.` with no member: reported, and kept as an access of a
 			// missing one, so the object is still checked, and the token
 			// after the dot is left to close or start whatever it does.
 			_ => {
-				parser.ast.diagnostics.push(report_missing_member(
-					parser.ast.file_id,
+				self.ast.diagnostics.push(report_missing_member(
+					self.ast.file_id,
 					token,
-					parser.source,
+					self.source,
 				));
-				let span = TextSpan::new(object.span.start, dot.span.end);
-				Ok(Spanned {
-					inner: Expression::ObjectAccess {
-						object: Box::new(object),
-						member: PathSegment::missing(dot.span.end),
-					},
-					span,
-				})
+				let member =
+					self.ast.push_segment(PathSegment::missing(dot.span.end));
+				(
+					Expression::ObjectAccess { object, member },
+					TextSpan::new(start, dot.span.end),
+				)
 			}
-		}
+		};
+		Ok(self.ast.push_expr(kind, span))
 	}
 
 	fn parse_binary_expression(
-		parser: &mut Parser,
-		left: Spanned<Expression>,
+		&mut self,
+		left: ExprId,
 		bp: BindingPower,
-	) -> Result<Spanned<Expression>, ()> {
-		let operator_token = parser.lexer.next();
+	) -> Result<ExprId, ()> {
+		let operator_token = self.lexer.next();
 		let operator = match BinaryOp::try_from(operator_token.inner) {
 			Ok(operator) => operator,
 			Err(_) => unreachable!(),
 		};
 
-		let token = parser.lexer.peek();
+		let token = self.lexer.peek();
 		if !Self::starts_expression(token.inner) {
-			parser
-				.ast
+			self.ast
 				.diagnostics
 				.push(report_incomplete_binary_expression(
-					parser.ast.file_id,
+					self.ast.file_id,
 					operator_token.span,
 				));
 			return Err(());
 		}
-		let right = parser.parse_expression(bp)?;
+		let right = self.parse_expression(bp)?;
 
 		// Comparisons and assignments do not associate: neither grouping of
 		// `a < b < c` or `a = b = c` means anything (a comparison is a `Bool`,
@@ -2598,21 +2719,22 @@ impl<'ctx> Parser<'ctx> {
 		if let Expression::Binary {
 			operator: left_operator,
 			..
-		} = &left.inner
-			&& BindingPower::from(left_operator.inner) == bp
+		} = self.ast.expr(left)
+			&& BindingPower::from(left_operator) == bp
 		{
+			let left_operator = self.ast.operator_span(left);
 			match bp {
 				BindingPower::Comparison => {
-					parser.ast.diagnostics.push(report_chained_comparisons(
-						parser.ast.file_id,
-						left_operator.span,
+					self.ast.diagnostics.push(report_chained_comparisons(
+						self.ast.file_id,
+						left_operator,
 						operator_token.span,
 					));
 				}
 				BindingPower::Assignment => {
-					parser.ast.diagnostics.push(report_chained_assignments(
-						parser.ast.file_id,
-						left_operator.span,
+					self.ast.diagnostics.push(report_chained_assignments(
+						self.ast.file_id,
+						left_operator,
 						operator_token.span,
 					));
 				}
@@ -2620,28 +2742,19 @@ impl<'ctx> Parser<'ctx> {
 			}
 		}
 
-		let span = TextSpan::new(left.span.start, right.span.end);
-		Ok(Spanned {
-			inner: Expression::Binary {
-				left: Box::new(left),
-				right: Box::new(right),
-				operator: Spanned {
-					inner: operator,
-					span: operator_token.span,
-				},
+		let span = TextSpan::new(
+			self.ast.expr_span(left).start,
+			self.ast.expr_span(right).end,
+		);
+		Ok(self.ast.push_expr(
+			Expression::Binary {
+				operator,
+				operator_start: operator_token.span.start,
+				left,
+				right,
 			},
 			span,
-		})
-	}
-
-	fn parse_string_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let token = parser.lexer.next();
-		Ok(Spanned {
-			inner: Expression::String,
-			span: token.span,
-		})
+		))
 	}
 
 	/// The value of the integer literal at `span`, reported and read as `0`
@@ -2667,33 +2780,15 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	fn parse_char_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let token = parser.lexer.next();
-		Ok(Spanned {
-			inner: Expression::Char,
-			span: token.span,
-		})
-	}
-
-	fn parse_int_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let token = parser.lexer.next();
+	fn parse_int_expression(&mut self) -> Result<ExprId, ()> {
+		let token = self.lexer.next();
 		debug_assert!(matches!(token.inner, Token::Int));
-		let value = parser.integer_literal(token.span);
-
-		Ok(Spanned {
-			inner: Expression::Int { value },
-			span: token.span,
-		})
+		let value = self.integer_literal(token.span);
+		Ok(self.ast.push_expr(Expression::Int { value }, token.span))
 	}
 
-	fn parse_float_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let token = parser.lexer.next();
+	fn parse_float_expression(&mut self) -> Result<ExprId, ()> {
+		let token = self.lexer.next();
 		debug_assert!(matches!(token.inner, Token::Float));
 
 		// Syntactic validity only — `f64::from_str` and `f32::from_str` accept
@@ -2701,180 +2796,130 @@ impl<'ctx> Parser<'ctx> {
 		// `1e+`) without committing to a value. The literal's actual value is
 		// preserved exactly in TIR. `coerce_float` checks representability;
 		// evaluation and lowering convert at the concrete target width.
-		if token
-			.span
-			.extract_str(parser.source)
-			.parse::<f64>()
-			.is_err()
-		{
-			parser.ast.diagnostics.push(report_invalid_float_literal(
-				parser.ast.file_id,
+		if token.span.extract_str(self.source).parse::<f64>().is_err() {
+			self.ast.diagnostics.push(report_invalid_float_literal(
+				self.ast.file_id,
 				token.span,
 			));
 		}
-
-		Ok(Spanned {
-			inner: Expression::Float,
-			span: token.span,
-		})
+		Ok(self.ast.push_expr(Expression::Float, token.span))
 	}
 
-	fn parse_return_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let return_span = parser.lexer.next().span;
-		let token = parser.lexer.peek();
+	fn parse_return_expression(&mut self) -> Result<ExprId, ()> {
+		let return_span = self.lexer.next().span;
+		let token = self.lexer.peek();
 		if !Self::starts_expression(token.inner) {
-			return Ok(Spanned {
-				inner: Expression::Return { value: None },
-				span: return_span,
-			});
+			return Ok(self
+				.ast
+				.push_expr(Expression::Return { value: None }, return_span));
 		}
-		let expr = parser.parse_expression(BindingPower::Default)?;
-		let span = TextSpan::new(return_span.start, expr.span.end);
-		Ok(Spanned {
-			inner: Expression::Return {
-				value: Some(Box::new(expr)),
-			},
-			span,
-		})
+		let value = self.parse_expression(BindingPower::Default)?;
+		let span =
+			TextSpan::new(return_span.start, self.ast.expr_span(value).end);
+		Ok(self
+			.ast
+			.push_expr(Expression::Return { value: Some(value) }, span))
 	}
 
-	fn parse_break_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let break_keyword = parser.lexer.next();
-		let label = parser.parse_label();
-		let token = parser.lexer.peek();
+	fn parse_break_expression(&mut self) -> Result<ExprId, ()> {
+		let break_keyword = self.lexer.next();
+		let label = self.parse_label();
+		let token = self.lexer.peek();
 		let value = if Self::starts_expression(token.inner) {
-			Some(parser.parse_expression(BindingPower::Default)?)
+			Some(self.parse_expression(BindingPower::Default)?)
 		} else {
 			None
 		};
-
-		let span = match (label, &value) {
-			(_, Some(value)) => {
-				TextSpan::new(break_keyword.span.start, value.span.end)
-			}
-			(Some(label), None) => {
-				TextSpan::new(break_keyword.span.start, label.span.end)
-			}
-			(None, None) => break_keyword.span,
+		let end = match (label, value) {
+			(_, Some(value)) => self.ast.expr_span(value).end,
+			(Some(label), None) => label.span.end,
+			(None, None) => break_keyword.span.end,
 		};
-		Ok(Spanned {
-			inner: Expression::Break {
-				label,
-				value: value.map(Box::new),
-			},
-			span,
-		})
+		Ok(self.ast.push_expr(
+			Expression::Break { label, value },
+			TextSpan::new(break_keyword.span.start, end),
+		))
 	}
 
-	fn parse_continue_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let continue_keyword = parser.lexer.next();
-		let label = parser.parse_label();
-
-		let span = match label {
-			Some(label) => {
-				TextSpan::new(continue_keyword.span.start, label.span.end)
-			}
-			None => continue_keyword.span,
-		};
-		Ok(Spanned {
-			inner: Expression::Continue { label },
-			span,
-		})
+	fn parse_continue_expression(&mut self) -> Result<ExprId, ()> {
+		let continue_keyword = self.lexer.next();
+		let label = self.parse_label();
+		let end =
+			label.map_or(continue_keyword.span.end, |label| label.span.end);
+		Ok(self.ast.push_expr(
+			Expression::Continue { label },
+			TextSpan::new(continue_keyword.span.start, end),
+		))
 	}
 
-	fn parse_tuple_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let grouped = SeparatedGroup {
-			open_token: Token::OpenParen,
-			close_token: Token::CloseParen,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_element,
-			should_warn_missing_separator: None,
-		}
-		.parse(parser)?;
-
-		Ok(Spanned {
-			inner: Expression::Tuple {
-				elements: grouped.inner,
+	fn parse_tuple_expression(&mut self) -> Result<ExprId, ()> {
+		let elements = self.separated(PARENS, Parser::parse_element)?;
+		let elements = self.push_delimited(elements);
+		Ok(self.ast.push_expr(
+			Expression::Tuple {
+				elements: elements.inner,
 			},
-			span: grouped.span,
-		})
+			elements.span,
+		))
 	}
 
 	/// An element of a parenthesized list: an expression, or `value: Type`.
-	fn parse_element(parser: &mut Parser) -> Result<Spanned<Expression>, ()> {
+	fn parse_element(parser: &mut Parser) -> Result<Spanned<ExprId>, ()> {
 		let value = parser.parse_expression(BindingPower::Default)?;
-		if parser.lexer.next_if(Token::Colon).is_none() {
-			return Ok(value);
-		}
-		let ty = parser.parse_type_expression()?;
+		let start = parser.ast.expr_span(value).start;
+		let (id, end) = if parser.lexer.next_if(Token::Colon).is_none() {
+			(value, parser.ast.expr_span(value).end)
+		} else {
+			let ty = parser.parse_type_expression()?;
+			let span = TextSpan::new(start, parser.ast.type_span(ty).end);
+			let id = parser
+				.ast
+				.push_expr(Expression::Ascription { value, ty }, span);
+			(id, span.end)
+		};
 		Ok(Spanned {
-			span: TextSpan::new(value.span.start, parser.ast.type_span(ty).end),
-			inner: Expression::Ascription {
-				value: Box::new(value),
-				ty,
-			},
+			inner: id,
+			span: TextSpan::new(start, end),
 		})
 	}
 
-	fn parse_unary_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let operator_token = parser.lexer.next();
+	fn parse_unary_expression(&mut self) -> Result<ExprId, ()> {
+		let operator_token = self.lexer.next();
 		let operator = match UnaryOp::try_from(operator_token.inner) {
 			Ok(operator) => operator,
 			Err(_) => unreachable!(),
 		};
 
-		let token = parser.lexer.peek();
+		let token = self.lexer.peek();
 		if !Self::starts_expression(token.inner) {
-			parser
-				.ast
+			self.ast
 				.diagnostics
 				.push(report_incomplete_unary_expression(
-					parser.ast.file_id,
+					self.ast.file_id,
 					operator_token.span,
 				));
 			return Err(());
 		}
-		let operand = parser.parse_expression(BindingPower::Unary)?;
-
-		let span = TextSpan::new(operator_token.span.start, operand.span.end);
-		Ok(Spanned {
-			inner: Expression::Unary {
-				operator: Spanned {
-					inner: operator,
-					span: operator_token.span,
-				},
-				operand: Box::new(operand),
-			},
-			span,
-		})
+		let operand = self.parse_expression(BindingPower::Unary)?;
+		let span = TextSpan::new(
+			operator_token.span.start,
+			self.ast.expr_span(operand).end,
+		);
+		Ok(self
+			.ast
+			.push_expr(Expression::Unary { operator, operand }, span))
 	}
 
 	/// `block :label { ... }`: a plain block in expression position. Blocks
 	/// that belong to a construct (`if`, `loop`, a match arm, a function body)
 	/// are parsed by it directly and need no keyword.
-	fn parse_keyword_block_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let keyword_span = parser.lexer.next().span;
-		let label = parser.parse_label();
-		let block = Parser::parse_block_expression(parser)?;
-		let Expression::Block { statements, .. } = block.inner else {
-			unreachable!("a block parses as a block")
-		};
-		Ok(Spanned {
-			span: TextSpan::new(keyword_span.start, block.span.end),
-			inner: Expression::Block { label, statements },
-		})
+	fn parse_keyword_block_expression(&mut self) -> Result<ExprId, ()> {
+		let keyword_span = self.lexer.next().span;
+		let label = self.parse_label();
+		let block = self.parse_block()?;
+		let span =
+			TextSpan::new(keyword_span.start, self.ast.block_span(block).end);
+		Ok(self.ast.push_expr(Expression::Block { label, block }, span))
 	}
 
 	/// `:label` after `block`, a loop's keyword, `break` or `continue`. A `:`
@@ -2906,221 +2951,212 @@ impl<'ctx> Parser<'ctx> {
 	/// `{ ... }` where an expression starts: the plain block without its
 	/// keyword. `{` is reserved for named arguments in a call, so this is
 	/// reported, and read as the block it was meant to be.
-	fn parse_bare_block_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let brace_span = parser.lexer.peek().span;
-		parser.ast.diagnostics.push(
+	fn parse_bare_block_expression(&mut self) -> Result<ExprId, ()> {
+		let brace_span = self.lexer.peek().span;
+		self.ast.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::BlockNeedsKeyword.code())
 				.with_message("a block expression is written `block { ... }`")
 				.with_label(
-					Label::primary(parser.ast.file_id, brace_span)
+					Label::primary(self.ast.file_id, brace_span)
 						.with_message("expected `block` before `{`"),
 				),
 		);
-		Parser::parse_block_expression(parser)
+		self.parse_block_expression()
 	}
 
-	fn parse_block_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let statements = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::SemiColon,
-			item_handler: |parser| match parser.peek_keyword() {
-				Some(Keyword::Local) => {
-					Parser::parse_local_definition_statement(parser)
-				}
-				_ => {
-					let expr =
-						parser.parse_expression(BindingPower::Default)?;
-					let span = expr.span;
-					Ok(Spanned {
-						inner: Statement::Expression(Box::new(expr)),
-						span,
-					})
-				}
-			},
-			should_warn_missing_separator: Some(|stmt| {
-				!Statement::is_block_like(stmt)
-			}),
+	/// A block where an expression is expected (an `else` branch, a match
+	/// arm's body), with no keyword and no label.
+	fn parse_block_expression(&mut self) -> Result<ExprId, ()> {
+		let block = self.parse_block()?;
+		let span = self.ast.block_span(block);
+		Ok(self
+			.ast
+			.push_expr(Expression::Block { label: None, block }, span))
+	}
+
+	/// `{ statement; ... tail }`: the statements, and the expression written
+	/// last without a `;`, which is the block's value. A block-like
+	/// statement needs no `;` before the next one.
+	fn parse_block(&mut self) -> Result<BlockId, ()> {
+		let open = self.next_expect(Token::OpenBrace)?.span;
+		let mut list =
+			self.separated_after(BLOCK, open, Parser::parse_statement);
+		let tail = match list.items.last() {
+			Some(&Spanned {
+				inner: Statement::Expression(expr),
+				..
+			}) if !list.trailing => {
+				list.items.pop();
+				Some(expr)
+			}
+			_ => None,
+		};
+		let statements: Vec<StmtId> = list
+			.items
+			.into_iter()
+			.map(|statement| {
+				self.ast.push_statement(statement.inner, statement.span)
+			})
+			.collect();
+		let statements = self.ast.push_list(statements);
+		Ok(self.ast.push_block(Block { statements, tail }, list.span))
+	}
+
+	/// One statement in a block: a `local`, or an expression.
+	fn parse_statement(parser: &mut Parser) -> Result<Spanned<Statement>, ()> {
+		if let Some(Keyword::Local) = parser.peek_keyword() {
+			return Parser::parse_local_definition_statement(parser);
 		}
-		.parse(parser)?;
-
+		let expr = parser.parse_expression(BindingPower::Default)?;
 		Ok(Spanned {
-			span: statements.span,
-			inner: Expression::Block {
-				label: None,
-				statements,
-			},
+			inner: Statement::Expression(expr),
+			span: parser.ast.expr_span(expr),
 		})
 	}
 
-	fn parse_loop_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let loop_keyword = parser.lexer.next();
-		let label = parser.parse_label();
-		let block = Parser::parse_block_expression(parser)?;
-
-		let span = TextSpan::new(loop_keyword.span.start, block.span.end);
-		Ok(Spanned {
-			inner: Expression::Loop {
-				label,
-				block: Box::new(block),
-			},
-			span,
-		})
+	fn parse_loop_expression(&mut self) -> Result<ExprId, ()> {
+		let loop_keyword = self.lexer.next();
+		let label = self.parse_label();
+		let block = self.parse_block()?;
+		let span = TextSpan::new(
+			loop_keyword.span.start,
+			self.ast.block_span(block).end,
+		);
+		Ok(self.ast.push_expr(Expression::Loop { label, block }, span))
 	}
 
-	fn parse_if_else_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let if_keyword = parser.lexer.next();
-		let label = parser.parse_label();
-		let condition = parser.parse_expression(BindingPower::Default)?;
-		let then_block = Parser::parse_block_expression(parser)?;
-		let else_block = match parser.peek_keyword() {
+	fn parse_if_else_expression(&mut self) -> Result<ExprId, ()> {
+		let if_keyword = self.lexer.next();
+		let label = self.parse_label();
+		let condition = self.parse_expression(BindingPower::Default)?;
+		let then_block = self.parse_block()?;
+		let else_block = match self.peek_keyword() {
 			Some(Keyword::Else) => {
-				let _ = parser.lexer.next();
+				let _ = self.lexer.next();
 				// `else if` nests an `if` in the else position; `else { .. }`
 				// stays a plain block. TIR's `IfElse` branch and the checker's
 				// `build_branch` already describe both shapes.
-				if matches!(parser.peek_keyword(), Some(Keyword::If)) {
-					Some(Box::new(Parser::parse_if_else_expression(parser)?))
+				if matches!(self.peek_keyword(), Some(Keyword::If)) {
+					Some(self.parse_if_else_expression()?)
 				} else {
-					Some(Box::new(Parser::parse_block_expression(parser)?))
+					Some(self.parse_block_expression()?)
 				}
 			}
 			_ => None,
 		};
-		let end = else_block.as_ref().map_or(then_block.span, |b| b.span).end;
-		let if_else = Spanned {
-			inner: Expression::IfElse {
-				condition: Box::new(condition),
-				then_block: Box::new(then_block),
+		let end = match else_block {
+			Some(else_block) => self.ast.expr_span(else_block).end,
+			None => self.ast.block_span(then_block).end,
+		};
+		let span = TextSpan::new(if_keyword.span.start, end);
+		let if_else = self.ast.push_expr(
+			Expression::IfElse {
+				condition,
+				then_block,
 				else_block,
 			},
-			span: TextSpan::new(if_keyword.span.start, end),
-		};
+			span,
+		);
 		let Some(label) = label else {
 			return Ok(if_else);
 		};
 		// Read as the block it would be written in, so a `break` to the label
 		// still finds it.
-		parser.ast.diagnostics.push(
+		self.ast.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::LabelOnIf.code())
 				.with_message("an `if` cannot be labelled")
 				.with_label(
-					Label::primary(parser.ast.file_id, label.span)
+					Label::primary(self.ast.file_id, label.span)
 						.with_message("a label names a `block` or a `loop`"),
 				)
 				.with_note(
 					"write it on a block around the `if`: `block :label { if .. }`",
 				),
 		);
-		let span = if_else.span;
-		Ok(Spanned {
-			inner: Expression::Block {
-				label: Some(label),
-				// No braces are written: the block is the `if` alone.
-				statements: Spanned {
-					inner: Box::new([Separated {
-						inner: Spanned {
-							inner: Statement::Expression(Box::new(if_else)),
-							span,
-						},
-						separator: None,
-					}]),
-					span,
-				},
+		// No braces are written: the block is the `if` alone.
+		let block = self.ast.push_block(
+			Block {
+				statements: List::EMPTY,
+				tail: Some(if_else),
 			},
 			span,
-		})
+		);
+		Ok(self.ast.push_expr(
+			Expression::Block {
+				label: Some(label),
+				block,
+			},
+			span,
+		))
 	}
 
-	fn parse_match_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let match_keyword = parser.lexer.next();
-		let scrutinee = parser.parse_expression(BindingPower::Default)?;
-
-		let arms = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::Comma,
-			item_handler:
-				|parser: &mut Parser| -> Result<Spanned<MatchArm>, ()> {
-					let pattern = Parser::parse_pattern(parser)?;
-					parser.next_expect(Token::FatArrow)?;
-					// A braced body is a block; a bare expression must be
-					// separated by a comma like a statement.
-					let body = if parser.lexer.peek().inner == Token::OpenBrace
-					{
-						Parser::parse_block_expression(parser)?
-					} else {
-						parser.parse_expression(BindingPower::Default)?
-					};
-					let span = TextSpan::new(
-						parser.ast.pattern_span(pattern).start,
-						body.span.end,
-					);
-					Ok(Spanned {
-						inner: MatchArm {
-							pattern,
-							body: Box::new(body),
-						},
-						span,
-					})
-				},
-			// A block body is self-delimiting, so its trailing comma stays
-			// optional, exactly as a block-like statement's separator does.
-			// Any other body needs a comma before the next arm.
-			should_warn_missing_separator: Some(|arm| {
-				!arm.body.inner.is_block_like()
-			}),
-		}
-		.parse(parser)?;
-
+	fn parse_match_expression(&mut self) -> Result<ExprId, ()> {
+		let match_keyword = self.lexer.next();
+		let scrutinee = self.parse_expression(BindingPower::Default)?;
+		let open = self.next_expect(Token::OpenBrace)?.span;
+		// A block body is self-delimiting, so its trailing comma stays
+		// optional, exactly as a block-like statement's separator does. Any
+		// other body needs a comma before the next arm.
+		let arms = self.separated_after(BRACES, open, Parser::parse_match_arm);
+		let arms = self.push_delimited(arms);
 		let span = TextSpan::new(match_keyword.span.start, arms.span.end);
-		Ok(Spanned {
-			inner: Expression::Match {
-				scrutinee: Box::new(scrutinee),
+		Ok(self.ast.push_expr(
+			Expression::Match {
+				scrutinee,
 				arms: arms.inner,
 			},
 			span,
+		))
+	}
+
+	/// `pattern => { .. }` or `pattern => expr`.
+	fn parse_match_arm(parser: &mut Parser) -> Result<Spanned<MatchArm>, ()> {
+		let pattern = Parser::parse_pattern(parser)?;
+		parser.next_expect(Token::FatArrow)?;
+		// A braced body is a block; a bare expression must be separated by a
+		// comma like a statement.
+		let body = if parser.lexer.peek().inner == Token::OpenBrace {
+			parser.parse_block_expression()?
+		} else {
+			parser.parse_expression(BindingPower::Default)?
+		};
+		Ok(Spanned {
+			inner: MatchArm { pattern, body },
+			span: TextSpan::new(
+				parser.ast.pattern_span(pattern).start,
+				parser.ast.expr_span(body).end,
+			),
 		})
 	}
 
 	/// Handles `expr::<T, U>` when `expr` is not a path (paths take their
-	/// type arguments in `parse_identifier_expression`). Only a member
-	/// (`obj.method::<T>`) accepts them; they join its segment.
+	/// type arguments in `parse_path_expression`). Only a member
+	/// (`obj.method::<T>`) accepts them; they join its segment, and the
+	/// access, still the operand being read, ends after them.
 	fn parse_type_application_expression(
-		parser: &mut Parser,
-		left: Spanned<Expression>,
-	) -> Result<Spanned<Expression>, ()> {
-		let colons = parser.lexer.next(); // consume `::`
+		&mut self,
+		left: ExprId,
+	) -> Result<ExprId, ()> {
+		let colons = self.lexer.next(); // consume `::`
 
-		if parser.lexer.peek().inner == Token::LeftArrow {
-			let (args, args_span, close_span) = parser.parse_type_args()?;
-			let span = TextSpan::new(left.span.start, close_span.end);
-			return match left.inner {
-				Expression::ObjectAccess { object, mut member }
-					if member.type_args.is_empty() =>
+		if self.lexer.peek().inner == Token::LeftArrow {
+			let (args, args_span, close_span) = self.parse_type_args()?;
+			return match self.ast.expr(left) {
+				Expression::ObjectAccess { member, .. }
+					if self.ast.segment(member).type_args.is_empty() =>
 				{
-					member.type_args = args;
-					member.args_span = args_span;
-					Ok(Spanned {
-						inner: Expression::ObjectAccess { object, member },
-						span,
-					})
+					let segment = &mut self.ast.segments[usize::from(member)];
+					segment.type_args = args;
+					segment.args_span = args_span;
+					self.ast.exprs.spans[usize::from(left)].end =
+						close_span.end;
+					Ok(left)
 				}
 				_ => {
-					parser.ast.diagnostics.push(report_type_args_not_allowed(
-						parser.ast.file_id,
+					self.ast.diagnostics.push(report_type_args_not_allowed(
+						self.ast.file_id,
 						TextSpan::new(colons.span.start, close_span.end),
 					));
 					Err(())
@@ -3128,11 +3164,10 @@ impl<'ctx> Parser<'ctx> {
 			};
 		}
 
-		let bad = parser.lexer.peek();
-		parser
-			.ast
+		let bad = self.lexer.peek();
+		self.ast
 			.diagnostics
-			.push(report_invalid_namespace(parser.ast.file_id, bad.span));
+			.push(report_invalid_namespace(self.ast.file_id, bad.span));
 		Err(())
 	}
 
@@ -3140,145 +3175,86 @@ impl<'ctx> Parser<'ctx> {
 	/// `(`: `{` opens a named list (a plain block is spelled `block { }`, so
 	/// nothing else starts with `{` here), anything else a positional one.
 	/// A callee that names a method on an object makes it a method call.
-	fn parse_call_expression(
-		parser: &mut Parser,
-		callee: Spanned<Expression>,
-	) -> Result<Spanned<Expression>, ()> {
-		let start = callee.span.start;
-		let open_span = parser.next_expect(Token::OpenParen)?.span;
-		if parser.lexer.peek().inner == Token::OpenBrace {
-			let (arguments, end) = Parser::parse_named_call_arguments(parser)?;
-			let inner = match Parser::method_callee(callee) {
-				Ok((object, method)) => {
-					Expression::NamedMethodCall(Box::new(MethodCallExpr {
-						object,
-						method,
-						arguments,
-					}))
-				}
-				Err(callee) => Expression::NamedCall {
-					callee: Box::new(callee),
-					arguments,
+	fn parse_call_expression(&mut self, callee: ExprId) -> Result<ExprId, ()> {
+		let start = self.ast.expr_span(callee).start;
+		let open = self.next_expect(Token::OpenParen)?.span;
+		if self.lexer.peek().inner == Token::OpenBrace {
+			let (arguments, end) = self.parse_named_call_arguments()?;
+			return Ok(self.ast.push_expr(
+				Expression::NamedCall {
+					callee,
+					arguments: arguments.inner,
+					braces: arguments.span,
 				},
-			};
-			return Ok(Spanned {
-				inner,
-				span: TextSpan::new(start, end),
-			});
+				TextSpan::new(start, end),
+			));
 		}
-		let arguments = SeparatedGroup {
-			open_token: Token::OpenParen,
-			close_token: Token::CloseParen,
-			separator_token: Token::Comma,
-			item_handler: Parser::parse_positional_argument,
-			should_warn_missing_separator: None,
-		}
-		.parse_after_open(parser, open_span)?;
-		let span = TextSpan::new(start, arguments.span.end);
-		let inner = match Parser::method_callee(callee) {
-			Ok((object, method)) => {
-				Expression::MethodCall(Box::new(MethodCallExpr {
-					object,
-					method,
-					arguments,
-				}))
-			}
-			Err(callee) => Expression::Call {
-				callee: Box::new(callee),
-				arguments,
+		let arguments = self.separated_after(
+			PARENS,
+			open,
+			Parser::parse_positional_argument,
+		);
+		let arguments = self.push_delimited(arguments);
+		Ok(self.ast.push_expr(
+			Expression::Call {
+				callee,
+				arguments: arguments.inner,
+				open: open.start,
 			},
-		};
-		Ok(Spanned { inner, span })
+			TextSpan::new(start, arguments.span.end),
+		))
 	}
 
-	/// The object, method and type arguments of a callee that names a method
-	/// (`object.method`, `object.method::<T>`); any other callee back as is.
-	#[allow(clippy::type_complexity)]
-	fn method_callee(
-		callee: Spanned<Expression>,
-	) -> Result<(Box<Spanned<Expression>>, PathSegment), Spanned<Expression>> {
-		match callee.inner {
-			Expression::ObjectAccess { object, member } => Ok((object, member)),
-			inner => Err(Spanned {
-				inner,
-				span: callee.span,
-			}),
-		}
-	}
+	fn parse_array_expression(&mut self) -> Result<ExprId, ()> {
+		let open_span = self.next_expect(Token::OpenBracket)?.span;
 
-	fn parse_array_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let open_span = parser.next_expect(Token::OpenBracket)?.span;
-
-		if let Some(close) = parser.lexer.next_if(Token::CloseBracket) {
+		if let Some(close) = self.lexer.next_if(Token::CloseBracket) {
 			let span = TextSpan::new(open_span.start, close.span.end);
-			return Ok(Spanned {
-				inner: Expression::ArrayList {
-					elements: Box::new([]),
+			return Ok(self.ast.push_expr(
+				Expression::ArrayList {
+					elements: List::EMPTY,
 				},
 				span,
-			});
+			));
 		}
 
-		let first = parser.parse_expression(BindingPower::Default)?;
+		let first = self.parse_expression(BindingPower::Default)?;
 
-		if parser.lexer.next_if(Token::SemiColon).is_some() {
-			let count = parser.parse_length()?;
-			let close_span = parser.next_expect(Token::CloseBracket)?.span;
+		if self.lexer.next_if(Token::SemiColon).is_some() {
+			let count = self.parse_length()?;
+			let close_span = self.next_expect(Token::CloseBracket)?.span;
 			let span = TextSpan::new(open_span.start, close_span.end);
-			return Ok(Spanned {
-				inner: Expression::ArrayRepeat {
-					value: Box::new(first),
+			return Ok(self.ast.push_expr(
+				Expression::ArrayRepeat {
+					value: first,
 					count,
 				},
 				span,
-			});
+			));
 		}
 
-		let mut elements = Vec::new();
-		let mut element = first;
-		loop {
-			let separator =
-				parser.lexer.next_if(Token::Comma).map(|comma| comma.span);
-			let last = separator.is_none()
-				|| parser.lexer.peek().inner == Token::CloseBracket;
-			elements.push(Separated {
-				inner: element,
-				separator,
-			});
-			if last {
-				break;
-			}
-			element = parser.parse_expression(BindingPower::Default)?;
+		let mut elements = vec![first];
+		while self.lexer.next_if(Token::Comma).is_some()
+			&& self.lexer.peek().inner != Token::CloseBracket
+		{
+			elements.push(self.parse_expression(BindingPower::Default)?);
 		}
 
-		let close_span = parser.next_expect(Token::CloseBracket)?.span;
+		let close_span = self.next_expect(Token::CloseBracket)?.span;
 		let span = TextSpan::new(open_span.start, close_span.end);
-		Ok(Spanned {
-			inner: Expression::ArrayList {
-				elements: elements.into_boxed_slice(),
-			},
-			span,
-		})
+		let elements = self.ast.push_list(elements);
+		Ok(self.ast.push_expr(Expression::ArrayList { elements }, span))
 	}
 
-	fn parse_index_expression(
-		parser: &mut Parser,
-		object: Spanned<Expression>,
-	) -> Result<Spanned<Expression>, ()> {
-		_ = parser.lexer.next(); // consume `[`
-		let index = Box::new(parser.parse_expression(BindingPower::Default)?);
-
-		let close_span = parser.next_expect(Token::CloseBracket)?.span;
-		let span = TextSpan::new(object.span.start, close_span.end);
-		Ok(Spanned {
-			inner: Expression::Index {
-				object: Box::new(object),
-				index,
-			},
-			span,
-		})
+	fn parse_index_expression(&mut self, object: ExprId) -> Result<ExprId, ()> {
+		_ = self.lexer.next(); // consume `[`
+		let index = self.parse_expression(BindingPower::Default)?;
+		let close_span = self.next_expect(Token::CloseBracket)?.span;
+		let span =
+			TextSpan::new(self.ast.expr_span(object).start, close_span.end);
+		Ok(self
+			.ast
+			.push_expr(Expression::Index { object, index }, span))
 	}
 
 	/// `..`, or one element in the list.
@@ -3327,20 +3303,9 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_pattern_fields(
 		parser: &mut Parser,
 	) -> Result<Spanned<List<PatternFieldItem>>, ()> {
-		let fields = SeparatedGroup {
-			open_token: Token::OpenBrace,
-			close_token: Token::CloseBrace,
-			separator_token: Token::Comma,
-			should_warn_missing_separator: None,
-			item_handler: Parser::parse_pattern_field_item,
-		}
-		.parse(parser)?;
-		Ok(Spanned {
-			inner: parser.ast.push_list(
-				fields.inner.into_iter().map(|field| field.inner.inner),
-			),
-			span: fields.span,
-		})
+		let fields =
+			parser.separated(BRACES, Parser::parse_pattern_field_item)?;
+		Ok(parser.push_delimited(fields))
 	}
 
 	/// The elements of a positional list, `(pat, .., pat)`, with the `(`
@@ -3349,23 +3314,12 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 		open_span: TextSpan,
 	) -> Result<Spanned<List<PatternElement>>, ()> {
-		let elements = SeparatedGroup {
-			open_token: Token::OpenParen,
-			close_token: Token::CloseParen,
-			separator_token: Token::Comma,
-			should_warn_missing_separator: None,
-			item_handler: Parser::parse_pattern_element,
-		}
-		.parse_after_open(parser, open_span)?;
-		Ok(Spanned {
-			inner: parser.ast.push_list(
-				elements
-					.inner
-					.into_iter()
-					.map(|element| element.inner.inner),
-			),
-			span: elements.span,
-		})
+		let elements = parser.separated_after(
+			PARENS,
+			open_span,
+			Parser::parse_pattern_element,
+		);
+		Ok(parser.push_delimited(elements))
 	}
 
 	/// `(pat, .., pat)`.
@@ -3668,19 +3622,18 @@ impl<'ctx> Parser<'ctx> {
 						parser.ast.file_id,
 						token.span,
 					));
-				Spanned {
-					inner: Expression::Error,
-					span: TextSpan::new(end, token.span.start),
-				}
+				parser.ast.push_expr(
+					Expression::Error,
+					TextSpan::new(end, token.span.start),
+				)
 			};
 
-		let span = TextSpan::new(local_keyword.span.start, value.span.end);
+		let span = TextSpan::new(
+			local_keyword.span.start,
+			parser.ast.expr_span(value).end,
+		);
 		Ok(Spanned {
-			inner: Statement::LocalDefinition {
-				pattern,
-				ty,
-				value: Box::new(value),
-			},
+			inner: Statement::LocalDefinition { pattern, ty, value },
 			span,
 		})
 	}
@@ -3718,14 +3671,17 @@ impl<'ctx> Parser<'ctx> {
 		}
 		let value = parser.parse_expression(BindingPower::Default)?;
 
-		let span = TextSpan::new(global_keyword.span.start, value.span.end);
+		let span = TextSpan::new(
+			global_keyword.span.start,
+			parser.ast.expr_span(value).end,
+		);
 		Ok(Spanned {
 			inner: Item::Global {
 				pub_span: None,
 				mut_span,
 				name,
 				ty,
-				value: Box::new(value),
+				value,
 				attributes: Box::new([]),
 			},
 			span,
@@ -3748,7 +3704,8 @@ impl<'ctx> Parser<'ctx> {
 		let _ = parser.next_expect(Token::Eq)?;
 		let value = parser.parse_expression(BindingPower::Default)?;
 
-		let span = TextSpan::new(const_span.start, value.span.end);
+		let span =
+			TextSpan::new(const_span.start, parser.ast.expr_span(value).end);
 		Ok(Spanned {
 			inner: Item::Const {
 				pub_span: None,
@@ -3757,21 +3714,16 @@ impl<'ctx> Parser<'ctx> {
 					span: name_span,
 				},
 				ty,
-				value: Box::new(value),
+				value,
 				attributes: Box::new([]),
 			},
 			span,
 		})
 	}
 
-	fn parse_placeholder_expression(
-		parser: &mut Parser,
-	) -> Result<Spanned<Expression>, ()> {
-		let underscore = parser.lexer.next();
-		Ok(Spanned {
-			inner: Expression::Placeholder,
-			span: underscore.span,
-		})
+	fn parse_placeholder_expression(&mut self) -> Result<ExprId, ()> {
+		let span = self.lexer.next().span;
+		Ok(self.ast.push_expr(Expression::Placeholder, span))
 	}
 
 	fn parse_export_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
@@ -3884,9 +3836,9 @@ impl<'ctx> Parser<'ctx> {
 								.parse_expression(BindingPower::Default)?;
 							let span = TextSpan::new(
 								name_token_span.start,
-								expr.span.end,
+								parser.ast.expr_span(expr).end,
 							);
-							(Some(Box::new(expr)), span)
+							(Some(expr), span)
 						} else {
 							(None, name_token_span)
 						};
@@ -3971,7 +3923,10 @@ impl<'ctx> Parser<'ctx> {
 
 				_ = parser.next_expect(Token::Eq)?;
 				let value = parser.parse_expression(BindingPower::Default)?;
-				let span = TextSpan::new(const_span.start, value.span.end);
+				let span = TextSpan::new(
+					const_span.start,
+					parser.ast.expr_span(value).end,
+				);
 				Ok(Spanned {
 					inner: ImplItem::Constant {
 						pub_span,
@@ -3980,7 +3935,7 @@ impl<'ctx> Parser<'ctx> {
 							span: name_span,
 						},
 						ty,
-						value: Box::new(value),
+						value,
 						attributes: Box::new([]),
 					},
 					span,
@@ -4008,8 +3963,11 @@ impl<'ctx> Parser<'ctx> {
 				.parse(parser)?;
 
 				let result = parser.parse_function_result()?;
-				let block = Parser::parse_block_expression(parser)?;
-				let method_span = TextSpan::new(fn_span.start, block.span.end);
+				let block = parser.parse_block()?;
+				let method_span = TextSpan::new(
+					fn_span.start,
+					parser.ast.block_span(block).end,
+				);
 				Ok(Spanned {
 					inner: ImplItem::Function {
 						pub_span,
@@ -4023,7 +3981,7 @@ impl<'ctx> Parser<'ctx> {
 							params: params.inner,
 							result,
 						},
-						block: Box::new(block),
+						block,
 					},
 					span: method_span,
 				})
@@ -4234,16 +4192,18 @@ impl<'ctx> Parser<'ctx> {
 							let ty = parser.parse_type_expression()?;
 							let value =
 								if parser.lexer.next_if(Token::Eq).is_some() {
-									Some(Box::new(parser.parse_expression(
+									Some(parser.parse_expression(
 										BindingPower::Default,
-									)?))
+									)?)
 								} else {
 									None
 								};
 							let span = TextSpan::new(
 								const_span.start,
-								match &value {
-									Some(value) => value.span.end,
+								match value {
+									Some(value) => {
+										parser.ast.expr_span(value).end
+									}
 									None => parser.ast.type_span(ty).end,
 								},
 							);
@@ -4266,16 +4226,16 @@ impl<'ctx> Parser<'ctx> {
 							let body = if parser.lexer.peek().inner
 								== Token::OpenBrace
 							{
-								Some(Box::new(Parser::parse_block_expression(
-									parser,
-								)?))
+								Some(parser.parse_block()?)
 							} else {
 								None
 							};
 							let span = TextSpan::new(
 								signature.span.start,
-								match &body {
-									Some(body) => body.span.end,
+								match body {
+									Some(body) => {
+										parser.ast.block_span(body).end
+									}
 									None => signature.span.end,
 								},
 							);
@@ -4898,9 +4858,10 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Func) => {
 				let signature = parser.parse_function_signature()?;
 				let end = if parser.lexer.peek().inner == Token::OpenBrace {
-					let body = Parser::parse_block_expression(parser)?;
-					parser.report_crate_member_body(body.span);
-					body.span.end
+					let body = parser.parse_block()?;
+					let span = parser.ast.block_span(body);
+					parser.report_crate_member_body(span);
+					span.end
 				} else {
 					signature.span.end
 				};
@@ -4922,8 +4883,9 @@ impl<'ctx> Parser<'ctx> {
 				let end = if parser.lexer.next_if(Token::Eq).is_some() {
 					let value =
 						parser.parse_expression(BindingPower::Default)?;
-					parser.report_crate_member_body(value.span);
-					value.span.end
+					let span = parser.ast.expr_span(value);
+					parser.report_crate_member_body(span);
+					span.end
 				} else {
 					parser.ast.type_span(ty).end
 				};

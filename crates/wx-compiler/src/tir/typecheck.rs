@@ -71,8 +71,7 @@ use super::types::{
 	TypeIndex,
 };
 use crate::ast::{
-	self, BinaryOp, Keyword, Ownership, Separated, Spanned, StringInterner,
-	UnaryOp,
+	self, BinaryOp, Keyword, Ownership, Spanned, StringInterner, UnaryOp,
 };
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -434,11 +433,11 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// Checks `expr` as the whole body, against `expected`.
 	pub(super) fn check_body(
 		mut self,
-		expr: &Spanned<ast::Expression>,
+		expr: ast::ExprId,
 		expected: TypeIndex,
 	) -> (Body, Obligations) {
 		let expected = self.context().normalized(expected);
-		self.enter_root(expr.span, expected);
+		self.enter_root(self.ast().expr_span(expr), expected);
 		self.check(expr, expected);
 		(self.body, self.obligations)
 	}
@@ -470,7 +469,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 			return (self.body, self.obligations);
 		}
-		match (variant.value.as_deref(), previous) {
+		match (variant.value, previous) {
 			(Some(value), _) => self.check(value, repr),
 			(None, Some(previous)) => {
 				self.body
@@ -502,11 +501,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// Builds `expr` and holds it to `expected`: an untyped literal takes that
 	/// type, any other type must equal it, and `!` fits any type, since no
 	/// value ever arrives. `INFER` and `ERROR` expect nothing.
-	fn check(
-		&mut self,
-		expr: &Spanned<ast::Expression>,
-		expected: TypeIndex,
-	) -> ExprIdx {
+	fn check(&mut self, expr: ast::ExprId, expected: TypeIndex) -> ExprIdx {
 		let built = self.build(expr, expected);
 		self.expect(built, expected)
 	}
@@ -575,18 +570,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// (`Wrapper<_>`) constrains only the others. A construct whose meaning
 	/// depends on its type reads it; the node's type may still differ, which
 	/// is `expect`'s to report. An untyped literal stays untyped.
-	fn build(
-		&mut self,
-		expr: &Spanned<ast::Expression>,
-		expected: TypeIndex,
-	) -> ExprIdx {
-		let span = expr.span;
-		match &expr.inner {
-			ast::Expression::Int { value } => self.body.push(
-				ExprKind::Int(*value),
-				TypeIndex::CONST_INT,
-				span,
-			),
+	fn build(&mut self, expr: ast::ExprId, expected: TypeIndex) -> ExprIdx {
+		let ast = self.ast();
+		let span = ast.expr_span(expr);
+		match ast.expr(expr) {
+			ast::Expression::Int { value } => {
+				self.body
+					.push(ExprKind::Int(value), TypeIndex::CONST_INT, span)
+			}
 			ast::Expression::Float => {
 				let source =
 					&self.builder.files.get(self.scope.file_id).unwrap().source;
@@ -623,51 +614,64 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			}
 			ast::Expression::Char => self.build_char(span),
 			ast::Expression::Unary { operator, operand } => {
-				self.build_unary(*operator, operand, expected, span)
+				let operator = Spanned {
+					inner: operator,
+					span: ast.operator_span(expr),
+				};
+				self.build_unary(operator, operand, expected, span)
 			}
 			ast::Expression::Binary {
 				left,
 				operator,
 				right,
-			} => self.build_binary(*operator, left, right, expected, span),
-			ast::Expression::Path(segments) => {
-				self.build_path(segments, expected, span, AccessKind::Read)
+				..
+			} => {
+				let operator = Spanned {
+					inner: operator,
+					span: ast.operator_span(expr),
+				};
+				self.build_binary(operator, left, right, expected, span)
 			}
-			ast::Expression::Call { callee, arguments } => self.build_call(
+			ast::Expression::Path(segments) => self.build_path(
+				ast.list(segments),
+				expected,
+				span,
+				AccessKind::Read,
+			),
+			ast::Expression::Call {
+				callee, arguments, ..
+			} => self.build_call(
 				callee,
-				Arguments::Positional(&arguments.inner),
+				Arguments::Positional(ast.list(arguments)),
 				Expected::Type(expected),
 				span,
 			),
-			ast::Expression::NamedCall { callee, arguments } => self
-				.build_call(
-					callee,
-					Arguments::Named(&arguments.inner),
-					Expected::Type(expected),
-					span,
-				),
+			ast::Expression::NamedCall {
+				callee, arguments, ..
+			} => self.build_call(
+				callee,
+				Arguments::Named(ast.list(arguments)),
+				Expected::Type(expected),
+				span,
+			),
 			ast::Expression::Tuple { elements } => {
-				self.build_tuple(elements, expected, span)
+				self.build_tuple(ast.list(elements), expected, span)
 			}
-			ast::Expression::Block { label, statements } => {
+			ast::Expression::Block { label, block } => {
 				// A name not written yet (`block : {`) declares nothing.
 				let label = label
 					.filter(|name| name.inner != Keyword::Error.symbol())
 					.map(|name| {
 						self.body.push_label(super::body::Label { name })
 					});
-				self.build_block(&statements.inner, expected, label, span)
+				self.build_block(block, expected, label, span)
 			}
 			ast::Expression::IfElse {
 				condition,
 				then_block,
 				else_block,
 			} => self.build_if_else(
-				condition,
-				then_block,
-				else_block.as_deref(),
-				expected,
-				span,
+				condition, then_block, else_block, expected, span,
 			),
 			ast::Expression::Loop { label, block } => {
 				// A name not written yet (`block : {`) declares nothing.
@@ -679,14 +683,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.build_loop(block, expected, label, span)
 			}
 			ast::Expression::Break { label, value } => {
-				self.build_break(*label, value.as_deref(), span)
+				self.build_break(label, value, span)
 			}
 			ast::Expression::Continue { label } => {
-				self.build_continue(*label, span)
+				self.build_continue(label, span)
 			}
-			ast::Expression::Return { value } => {
-				self.build_return(value.as_deref(), span)
-			}
+			ast::Expression::Return { value } => self.build_return(value, span),
 			ast::Expression::Deref { .. }
 			| ast::Expression::ObjectAccess { .. }
 			| ast::Expression::Index { .. } => self.build_read(expr),
@@ -710,40 +712,25 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 			ast::Expression::Ascription { value, ty } => {
-				self.build_ascription(value, *ty)
+				self.build_ascription(value, ty)
 			}
-			ast::Expression::MethodCall(call) => self.build_method_call(
-				&call.object,
-				&call.method,
-				Arguments::Positional(&call.arguments.inner),
-				Expected::Type(expected),
-				span,
-			),
-			ast::Expression::NamedMethodCall(call) => self.build_method_call(
-				&call.object,
-				&call.method,
-				Arguments::Named(&call.arguments.inner),
-				Expected::Type(expected),
-				span,
-			),
 			ast::Expression::Match { scrutinee, arms } => {
-				self.build_match(scrutinee, arms, expected, span)
+				self.build_match(scrutinee, ast.list(arms), expected, span)
 			}
 			ast::Expression::String => self.build_string(span),
-			ast::Expression::QualifiedPath { .. }
-			| ast::Expression::Grouped { .. } => {
-				let rooted =
-					RootedPath::of_expression(self.ast(), &expr.inner).unwrap();
+			kind @ (ast::Expression::QualifiedPath { .. }
+			| ast::Expression::Grouped { .. }) => {
+				let rooted = RootedPath::of_expression(ast, kind).unwrap();
 				match self.resolve_rooted_path(rooted, span) {
 					Ok(path) => self.build_member_value(path, expected, span),
 					Err(error) => error,
 				}
 			}
 			ast::Expression::ArrayList { elements } => {
-				self.build_array(elements, expected, span)
+				self.build_array(ast.list(elements), expected, span)
 			}
 			ast::Expression::ArrayRepeat { value, count } => {
-				self.build_array_repeat(value, *count, expected, span)
+				self.build_array_repeat(value, count, expected, span)
 			}
 		}
 	}
@@ -788,12 +775,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// is its element: `(x,)` is `(x)`.
 	fn build_tuple(
 		&mut self,
-		elements: &[Separated<Spanned<ast::Expression>>],
+		elements: &[ast::ExprId],
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
-		if let [element] = elements {
-			return self.build(&element.inner, expected);
+		if let [element] = *elements {
+			return self.build(element, expected);
 		}
 		let hints = match *self.sema.types.resolve(expected) {
 			Type::Tuple { elements: hints }
@@ -805,12 +792,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		};
 		let mut values = Vec::with_capacity(elements.len());
 		let mut types = Vec::with_capacity(elements.len());
-		for (at, element) in elements.iter().enumerate() {
+		for (at, &element) in elements.iter().enumerate() {
 			let hint = match hints {
 				Some(hints) => self.sema.types.list(hints)[at],
 				None => TypeIndex::INFER,
 			};
-			let value = self.build(&element.inner, hint);
+			let value = self.build(element, hint);
 			values.push(value);
 			types.push(self.body.ty(value));
 		}
@@ -831,14 +818,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// each element against.
 	fn build_array(
 		&mut self,
-		elements: &[Separated<Spanned<ast::Expression>>],
+		elements: &[ast::ExprId],
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		let hint = self.array_element_hint(expected);
 		let values: Vec<ExprIdx> = self.static_scope(span, |this| {
 			(elements.iter())
-				.map(|element| this.build(&element.inner, hint))
+				.map(|&element| this.build(element, hint))
 				.collect()
 		});
 		let of = values
@@ -862,7 +849,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// memory's `Size`.
 	fn build_array_repeat(
 		&mut self,
-		value: &Spanned<ast::Expression>,
+		value: ast::ExprId,
 		count: ast::ConstId,
 		expected: TypeIndex,
 		span: TextSpan,
@@ -1254,28 +1241,52 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		None
 	}
 
-	/// A call: of a function named by a path, the construction of a struct,
-	/// or of any other value whose type is callable (`build_value_call`).
-	/// As a method call's receiver, a function's call reads its expected
-	/// type from the method.
+	/// A call. A callee that names a member of an object (`x.m(..)`) makes
+	/// it a method call; `(x.f)(..)`, whose callee is a parenthesized list,
+	/// calls the field's value.
 	fn build_call(
 		&mut self,
-		callee: &Spanned<ast::Expression>,
+		callee: ast::ExprId,
 		arguments: Arguments<'_>,
 		expected: Expected,
 		span: TextSpan,
 	) -> ExprIdx {
-		let segments = match &callee.inner {
-			ast::Expression::Path(segments) => segments,
-			ast::Expression::QualifiedPath { .. }
-			| ast::Expression::Grouped { .. } => {
-				let rooted =
-					RootedPath::of_expression(self.ast(), &callee.inner)
-						.unwrap();
-				return match self.resolve_rooted_path(rooted, callee.span) {
+		let ast = self.ast();
+		match ast.expr(callee) {
+			ast::Expression::ObjectAccess { object, member } => self
+				.build_method_call(
+					object,
+					&ast.segment(member),
+					arguments,
+					expected,
+					span,
+				),
+			_ => self.build_plain_call(callee, arguments, expected, span),
+		}
+	}
+
+	/// A call whose callee names no method: of a function named by a path,
+	/// the construction of a struct, or of any other value whose type is
+	/// callable (`build_value_call`). As a method call's receiver, a
+	/// function's call reads its expected type from the method.
+	fn build_plain_call(
+		&mut self,
+		callee: ast::ExprId,
+		arguments: Arguments<'_>,
+		expected: Expected,
+		span: TextSpan,
+	) -> ExprIdx {
+		let ast = self.ast();
+		let callee_span = ast.expr_span(callee);
+		let segments = match ast.expr(callee) {
+			ast::Expression::Path(segments) => ast.list(segments),
+			kind @ (ast::Expression::QualifiedPath { .. }
+			| ast::Expression::Grouped { .. }) => {
+				let rooted = RootedPath::of_expression(ast, kind).unwrap();
+				return match self.resolve_rooted_path(rooted, callee_span) {
 					Ok(path) => self.build_member_call(
 						path,
-						callee.span,
+						callee_span,
 						arguments,
 						expected,
 						span,
@@ -1291,21 +1302,21 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				return self.build_value_call(callee, arguments, span);
 			}
 		};
-		if let [segment] = &**segments
+		if let [segment] = segments
 			&& segment.type_args.is_empty()
 			&& self.lookup_local(segment.ident.inner).is_some()
 		{
 			let callee = self.build_path(
 				segments,
 				TypeIndex::INFER,
-				callee.span,
+				callee_span,
 				AccessKind::Read,
 			);
 			return self.build_value_call(callee, arguments, span);
 		}
 		// `Self(..)` constructs the struct the impl around it is for, with
 		// that target's arguments.
-		if let [segment] = &**segments
+		if let [segment] = segments
 			&& segment.ident.inner == Keyword::SelfPascal.symbol()
 		{
 			let Some((struct_index, type_args)) =
@@ -1336,7 +1347,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			Ok(ValuePath::Member(path)) => {
 				return self.build_member_call(
 					path,
-					callee.span,
+					callee_span,
 					arguments,
 					expected,
 					span,
@@ -1357,7 +1368,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			let callee = self.build_path(
 				segments,
 				TypeIndex::INFER,
-				callee.span,
+				callee_span,
 				AccessKind::Read,
 			);
 			return self.build_value_call(callee, arguments, span);
@@ -1852,7 +1863,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	fn build_unary(
 		&mut self,
 		op: Spanned<UnaryOp>,
-		operand: &Spanned<ast::Expression>,
+		operand: ast::ExprId,
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
@@ -1897,8 +1908,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	fn build_binary(
 		&mut self,
 		op: Spanned<BinaryOp>,
-		left: &Spanned<ast::Expression>,
-		right: &Spanned<ast::Expression>,
+		left: ast::ExprId,
+		right: ast::ExprId,
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
@@ -3001,8 +3012,8 @@ enum ValuePath<'s> {
 /// A call's arguments, by position or by name.
 #[derive(Clone, Copy)]
 enum Arguments<'e> {
-	Positional(&'e [ast::Separated<Spanned<ast::Expression>>]),
-	Named(&'e [ast::Separated<Spanned<ast::NamedArgument>>]),
+	Positional(&'e [ast::ExprId]),
+	Named(&'e [ast::NamedArgument]),
 }
 
 #[cfg(test)]

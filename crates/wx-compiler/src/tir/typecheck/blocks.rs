@@ -11,7 +11,7 @@ use string_interner::symbol::SymbolU32;
 
 use super::patterns::PatternContext;
 use super::{BodyBuilder, ScopeType};
-use crate::ast::{self, Separated, Spanned};
+use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::symbols::Keyword;
 use crate::tir::body::{
@@ -32,7 +32,7 @@ impl BodyBuilder<'_, '_> {
 		mut self,
 		function_index: FunctionIdx,
 		signature: &ast::FunctionSignature,
-		block: &Spanned<ast::Expression>,
+		block: ast::BlockId,
 	) -> (Body, Obligations) {
 		let function = &self.sema.functions[usize::from(function_index)];
 		let (param_types, return_type) =
@@ -40,7 +40,8 @@ impl BodyBuilder<'_, '_> {
 		// A type with a reported part in it expects nothing more.
 		let return_type = self.context().normalized(return_type);
 		let return_type = self.sema.types.collapse_error(return_type);
-		self.enter_root(block.span, return_type);
+		let span = self.ast().block_span(block);
+		self.enter_root(span, return_type);
 		for (at, param) in signature.params.iter().enumerate() {
 			let param = &param.inner.inner;
 			let ty = self.sema.types.list(param_types)[at];
@@ -55,11 +56,7 @@ impl BodyBuilder<'_, '_> {
 			};
 			self.body.push_param(local);
 		}
-		self.build_block_in(
-			ScopeIdx::ROOT,
-			block.inner.as_block_statements(),
-			block.span,
-		);
+		self.build_block_in(ScopeIdx::ROOT, block, span);
 		(self.body, self.obligations)
 	}
 
@@ -103,38 +100,28 @@ impl BodyBuilder<'_, '_> {
 	/// `{ .. }` in a scope of its own, held to `expected`.
 	pub(super) fn build_block(
 		&mut self,
-		statements: &[Separated<Spanned<ast::Statement>>],
+		block: ast::BlockId,
 		expected: TypeIndex,
 		label: Option<LabelIdx>,
 		span: TextSpan,
 	) -> ExprIdx {
 		let scope = self.enter_scope(ScopeKind::Block, label, span, expected);
-		let block = self.build_block_in(scope, statements, span);
+		let block = self.build_block_in(scope, block, span);
 		self.leave_scope(scope);
 		block
 	}
 
-	/// The statements of a block, in `scope`, which is the current one. A
-	/// last expression without a `;` is the block's result.
+	/// The statements of a block, in `scope`, which is the current one. Its
+	/// tail, the last expression written without a `;`, is its result.
 	fn build_block_in(
 		&mut self,
 		scope: ScopeIdx,
-		statements: &[Separated<Spanned<ast::Statement>>],
+		block: ast::BlockId,
 		span: TextSpan,
 	) -> ExprIdx {
-		let (statements, result) = match statements.split_last() {
-			Some((last, rest)) if last.separator.is_none() => {
-				match &last.inner.inner {
-					ast::Statement::Expression(result) => {
-						(rest, Some(&**result))
-					}
-					ast::Statement::LocalDefinition { .. } => {
-						(statements, None)
-					}
-				}
-			}
-			_ => (statements, None),
-		};
+		let ast = self.ast();
+		let ast::Block { statements, tail } = ast.block(block);
+		let (statements, result) = (ast.list(statements), tail);
 		let (built, diverges) =
 			self.build_statements(statements, result, span.end);
 		let result = result.map(|result| {
@@ -166,14 +153,15 @@ impl BodyBuilder<'_, '_> {
 	/// block's own scope closes them all when it is left.
 	fn build_statements(
 		&mut self,
-		statements: &[Separated<Spanned<ast::Statement>>],
-		result: Option<&Spanned<ast::Expression>>,
+		statements: &[ast::StmtId],
+		result: Option<ast::ExprId>,
 		block_end: u32,
 	) -> (Vec<ExprIdx>, bool) {
+		let ast = self.ast();
 		let mut built = Vec::with_capacity(statements.len());
 		let mut diverges_at = None;
-		for (at, statement) in statements.iter().enumerate() {
-			let statement = self.build_statement(&statement.inner, block_end);
+		for (at, &statement) in statements.iter().enumerate() {
+			let statement = self.build_statement(statement, block_end);
 			if diverges_at.is_none()
 				&& self.body.ty(statement) == TypeIndex::NEVER
 			{
@@ -186,11 +174,11 @@ impl BodyBuilder<'_, '_> {
 		};
 		let start = statements
 			.get(at + 1)
-			.map(|statement| statement.inner.span.start)
-			.or(result.map(|result| result.span.start));
-		let end = result
-			.map(|result| result.span.end)
-			.or(statements.last().map(|statement| statement.inner.span.end));
+			.map(|&statement| ast.statement_span(statement).start)
+			.or(result.map(|result| ast.expr_span(result).start));
+		let end = result.map(|result| ast.expr_span(result).end).or(statements
+			.last()
+			.map(|&statement| ast.statement_span(statement).end));
 		if let (Some(start), Some(end)) = (start, end) {
 			self.sema.diagnostics.push(
 				Diagnostic::warning()
@@ -210,46 +198,57 @@ impl BodyBuilder<'_, '_> {
 
 	fn build_statement(
 		&mut self,
-		statement: &Spanned<ast::Statement>,
+		statement: ast::StmtId,
 		block_end: u32,
 	) -> ExprIdx {
-		match &statement.inner {
+		let ast = self.ast();
+		match ast.statement(statement) {
 			ast::Statement::Expression(expr) => {
-				let value = self.build(expr, TypeIndex::INFER);
-				let ty = self.body.ty(value);
-				if self.sema.types.needs_context(ty) {
-					self.report_annotation_required(value);
-				} else if ty != TypeIndex::UNIT
-					&& ty != TypeIndex::NEVER
-					&& ty != TypeIndex::ERROR
-				{
-					let at = self.context().source_span(value);
-					self.sema.diagnostics.push(
-						Diagnostic::error()
-							.with_code(DiagnosticCode::UnusedValue.code())
-							.with_message("value must be used")
-							.with_label(
-								at.primary_label()
-									.with_message("value never used"),
-							)
-							.with_note(
-								"if you don't need the value, drop it with \
-								 an assignment to `_`",
-							),
-					);
-				}
-				value
+				self.build_expression_statement(expr)
 			}
 			ast::Statement::LocalDefinition { pattern, ty, value } => self
-				.build_local(*pattern, *ty, value, statement.span, block_end),
+				.build_local(
+					pattern,
+					ty,
+					value,
+					ast.statement_span(statement),
+					block_end,
+				),
 		}
+	}
+
+	/// An expression as a statement: its value, if it has one, must be used.
+	fn build_expression_statement(&mut self, expr: ast::ExprId) -> ExprIdx {
+		let value = self.build(expr, TypeIndex::INFER);
+		let ty = self.body.ty(value);
+		if self.sema.types.needs_context(ty) {
+			self.report_annotation_required(value);
+		} else if ty != TypeIndex::UNIT
+			&& ty != TypeIndex::NEVER
+			&& ty != TypeIndex::ERROR
+		{
+			let at = self.context().source_span(value);
+			self.sema.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::UnusedValue.code())
+					.with_message("value must be used")
+					.with_label(
+						at.primary_label().with_message("value never used"),
+					)
+					.with_note(
+						"if you don't need the value, drop it with \
+						 an assignment to `_`",
+					),
+			);
+		}
+		value
 	}
 
 	/// `(value: ty)`: the value checked as a local of that type would be. The
 	/// ascription leaves no node of its own.
 	pub(super) fn build_ascription(
 		&mut self,
-		value: &Spanned<ast::Expression>,
+		value: ast::ExprId,
 		ty: ast::TypeId,
 	) -> ExprIdx {
 		let ty = self.builder.resolve_value_type(
@@ -272,7 +271,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		pattern: ast::PatId,
 		ty: Option<ast::TypeId>,
-		value: &Spanned<ast::Expression>,
+		value: ast::ExprId,
 		span: TextSpan,
 		block_end: u32,
 	) -> ExprIdx {
@@ -342,8 +341,8 @@ impl BodyBuilder<'_, '_> {
 	/// must match one the arms before it do not (`exhaustiveness`).
 	pub(super) fn build_match(
 		&mut self,
-		scrutinee: &Spanned<ast::Expression>,
-		arms: &[Separated<Spanned<ast::MatchArm>>],
+		scrutinee: ast::ExprId,
+		arms: &[ast::MatchArm],
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
@@ -354,24 +353,24 @@ impl BodyBuilder<'_, '_> {
 			scrutinee_ty = TypeIndex::ERROR;
 		}
 		let mut built = Vec::with_capacity(arms.len());
-		for arm in arms {
-			let arm = &arm.inner;
+		let ast = self.ast();
+		for &ast::MatchArm { pattern, body } in arms {
 			// Its bindings are in scope after its pattern.
 			let scope = self.enter_scope(
 				ScopeKind::Block,
 				None,
 				TextSpan::new(
-					self.ast().pattern_span(arm.inner.pattern).end,
-					arm.span.end,
+					ast.pattern_span(pattern).end,
+					ast.expr_span(body).end,
 				),
 				TypeIndex::INFER,
 			);
 			let pattern = self.check_pattern(
-				arm.inner.pattern,
+				pattern,
 				scrutinee_ty,
 				&mut PatternContext::arm(),
 			);
-			let body = self.build_branch(&arm.inner.body, expected);
+			let body = self.build_branch(body, expected);
 			self.leave_scope(scope);
 			built.push(body::Arm {
 				scope,
@@ -438,15 +437,17 @@ impl BodyBuilder<'_, '_> {
 	/// branch takes the other's, and `!` gives way to the other.
 	pub(super) fn build_if_else(
 		&mut self,
-		condition: &Spanned<ast::Expression>,
-		then_block: &Spanned<ast::Expression>,
-		else_block: Option<&Spanned<ast::Expression>>,
+		condition: ast::ExprId,
+		then_block: ast::BlockId,
+		else_block: Option<ast::ExprId>,
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		let condition = self.check(condition, TypeIndex::BOOL);
+		let then_span = self.ast().block_span(then_block);
 		let Some(else_block) = else_block else {
-			let then_block = self.build_branch(then_block, TypeIndex::INFER);
+			let then_block =
+				self.build_block(then_block, TypeIndex::INFER, None, then_span);
 			let then_ty = self.body.ty(then_block);
 			let mut ty = TypeIndex::UNIT;
 			if then_ty != TypeIndex::UNIT
@@ -479,7 +480,8 @@ impl BodyBuilder<'_, '_> {
 				span,
 			);
 		};
-		let then_block = self.build_branch(then_block, expected);
+		let then_block =
+			self.build_block(then_block, expected, None, then_span);
 		let else_block = self.build_branch(else_block, expected);
 		let ty = self.join_branches(then_block, else_block);
 		self.body.push(
@@ -493,15 +495,17 @@ impl BodyBuilder<'_, '_> {
 		)
 	}
 
-	/// An `if`'s branch: a block, or the `if` of an `else if`.
+	/// An `else` branch or a match arm's body: a block, the `if` of an
+	/// `else if`, or an arm's expression.
 	fn build_branch(
 		&mut self,
-		branch: &Spanned<ast::Expression>,
+		branch: ast::ExprId,
 		expected: TypeIndex,
 	) -> ExprIdx {
-		match &branch.inner {
-			ast::Expression::Block { statements, .. } => {
-				self.build_block(&statements.inner, expected, None, branch.span)
+		let ast = self.ast();
+		match ast.expr(branch) {
+			ast::Expression::Block { label: None, block } => {
+				self.build_block(block, expected, None, ast.expr_span(branch))
 			}
 			_ => self.build(branch, expected),
 		}
@@ -557,21 +561,26 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// `loop { .. }`: its statements are checked as statements, a last one
-	/// without `;` included. Its type is what its `break`s give it.
+	/// `loop { .. }`: its statements are checked as statements, its tail
+	/// included. Its type is what its `break`s give it.
 	pub(super) fn build_loop(
 		&mut self,
-		block: &Spanned<ast::Expression>,
+		block: ast::BlockId,
 		expected: TypeIndex,
 		label: Option<LabelIdx>,
 		span: TextSpan,
 	) -> ExprIdx {
 		let scope = self.enter_scope(ScopeKind::Loop, label, span, expected);
-		let (built, _) = self.build_statements(
-			block.inner.as_block_statements(),
-			None,
-			block.span.end,
+		let ast = self.ast();
+		let ast::Block { statements, tail } = ast.block(block);
+		let (mut built, _) = self.build_statements(
+			ast.list(statements),
+			tail,
+			ast.block_span(block).end,
 		);
+		if let Some(tail) = tail {
+			built.push(self.build_expression_statement(tail));
+		}
 		self.leave_scope(scope);
 		let ty = self.scope_type(scope);
 		let statements = self.body.push_args(built);
@@ -584,7 +593,7 @@ impl BodyBuilder<'_, '_> {
 	pub(super) fn build_break(
 		&mut self,
 		label: Option<Spanned<SymbolU32>>,
-		value: Option<&Spanned<ast::Expression>>,
+		value: Option<ast::ExprId>,
 		span: TextSpan,
 	) -> ExprIdx {
 		let Some(scope) = self.jump_target(label, span, Jump::Break) else {
@@ -619,7 +628,7 @@ impl BodyBuilder<'_, '_> {
 	/// `return`, leaving the body with `value` (`()` without one).
 	pub(super) fn build_return(
 		&mut self,
-		value: Option<&Spanned<ast::Expression>>,
+		value: Option<ast::ExprId>,
 		span: TextSpan,
 	) -> ExprIdx {
 		let value = value.map(|value| {

@@ -1749,7 +1749,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							signature, block, ..
 						},
 					..
-				} => self.check_function_body(sema, entry, signature, block),
+				} => self.check_function_body(sema, entry, signature, *block),
 				// A required trait method has no block.
 				AstNodeRef::TraitFunction {
 					item:
@@ -1759,14 +1759,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 							..
 						},
 					..
-				} => self.check_function_body(sema, entry, signature, block),
+				} => self.check_function_body(sema, entry, signature, *block),
 				AstNodeRef::TraitImplFunction { item, .. }
 				| AstNodeRef::InherentImplFunction { item, .. } => {
 					if let ast::ImplItem::Function {
 						signature, block, ..
 					} = item
 					{
-						self.check_function_body(sema, entry, signature, block);
+						self.check_function_body(
+							sema, entry, signature, *block,
+						);
 					}
 				}
 				AstNodeRef::Global { global_index, item } => {
@@ -1779,7 +1781,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					let reported = sema.diagnostics.len();
 					let (mut body, obligations) =
 						BodyBuilder::new(sema, self, scope, owner)
-							.check_body(value, ty);
+							.check_body(*value, ty);
 					BodyContext::new(sema, &self.strings, &mut body, scope)
 						.decide(obligations);
 					sema.global_bodies[usize::from(global_index)] =
@@ -1801,7 +1803,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		entry: &AstEntry<'_>,
 		signature: &ast::FunctionSignature,
-		block: &Spanned<ast::Expression>,
+		block: ast::BlockId,
 	) {
 		let SignatureQuery::Function(function_index) = entry.node.query()
 		else {
@@ -2611,7 +2613,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let ty = sema.constants[usize::from(const_index)].ty;
 		let (body, obligations) =
 			BodyBuilder::new(sema, self, scope, BodyOwner::Const(const_index))
-				.check_body(value, ty);
+				.check_body(*value, ty);
 		sema.keep_const_body(const_index, body, obligations);
 	}
 

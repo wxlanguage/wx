@@ -43,10 +43,7 @@ enum CompoundMethod {
 
 impl BodyBuilder<'_, '_> {
 	/// `p.*` or `value.field` where its value is used.
-	pub(super) fn build_read(
-		&mut self,
-		expr: &Spanned<ast::Expression>,
-	) -> ExprIdx {
+	pub(super) fn build_read(&mut self, expr: ast::ExprId) -> ExprIdx {
 		match self.build_operand(expr, AccessKind::Read, &mut None) {
 			Operand::Place(place) => self.load(place),
 			Operand::Value(value) => value,
@@ -70,36 +67,37 @@ impl BodyBuilder<'_, '_> {
 	/// so that an index which finds its object a pointer can make it a read.
 	fn build_operand(
 		&mut self,
-		expr: &Spanned<ast::Expression>,
+		expr: ast::ExprId,
 		access: AccessKind,
 		site: &mut Option<Site>,
 	) -> Operand {
-		match &expr.inner {
+		let ast = self.ast();
+		let span = ast.expr_span(expr);
+		match ast.expr(expr) {
 			// `(p.*).x`: parentheses are a tuple of one, kept a place
 			// rather than loaded as a value.
 			ast::Expression::Tuple { elements } if elements.len() == 1 => {
-				self.build_operand(&elements[0].inner, access, site)
+				self.build_operand(ast.list(elements)[0], access, site)
 			}
 			ast::Expression::Deref { pointer } => {
-				self.build_deref(pointer, expr.span)
+				self.build_deref(pointer, span)
 			}
-			ast::Expression::ObjectAccess { object, member } => {
-				self.build_field(object, member, expr.span, access, site)
-			}
+			ast::Expression::ObjectAccess { object, member } => self
+				.build_field(object, &ast.segment(member), span, access, site),
 			ast::Expression::Index { object, index } => {
-				self.build_index(object, index, expr.span, access, site)
+				self.build_index(object, index, span, access, site)
 			}
 			ast::Expression::Path(segments) => {
 				let value = self.build_path(
-					segments,
+					ast.list(segments),
 					TypeIndex::INFER,
-					expr.span,
+					span,
 					access,
 				);
 				if let ExprKind::Local(_) = self.body.kind(value) {
 					*site = Some(Site::Value(SourceSpan::new(
 						self.scope.file_id,
-						expr.span,
+						span,
 					)));
 				}
 				Operand::Value(value)
@@ -110,11 +108,7 @@ impl BodyBuilder<'_, '_> {
 
 	/// `pointer.*`: the place the pointer points at, in its memory, writable
 	/// when the pointer is exclusive.
-	fn build_deref(
-		&mut self,
-		pointer: &Spanned<ast::Expression>,
-		span: TextSpan,
-	) -> Operand {
+	fn build_deref(&mut self, pointer: ast::ExprId, span: TextSpan) -> Operand {
 		let pointer = self.build(pointer, TypeIndex::INFER);
 		let pointer_ty = self.body.ty(pointer);
 		match *self.sema.types.resolve(pointer_ty) {
@@ -164,7 +158,7 @@ impl BodyBuilder<'_, '_> {
 	/// `p.field` is `p.*.field`, and a pointer to a pointer has no fields.
 	fn build_field(
 		&mut self,
-		object: &Spanned<ast::Expression>,
+		object: ast::ExprId,
 		segment: &ast::PathSegment,
 		span: TextSpan,
 		access: AccessKind,
@@ -245,13 +239,13 @@ impl BodyBuilder<'_, '_> {
 	/// sequence is, and the index is that memory's `Size`.
 	fn build_index(
 		&mut self,
-		object: &Spanned<ast::Expression>,
-		index: &Spanned<ast::Expression>,
+		object: ast::ExprId,
+		index: ast::ExprId,
 		span: TextSpan,
 		access: AccessKind,
 		site: &mut Option<Site>,
 	) -> Operand {
-		let object_span = object.span;
+		let object_span = self.ast().expr_span(object);
 		let object = match self.build_operand(object, access, site) {
 			Operand::Place(place) => {
 				let ty = self.body.place(place).ty;
@@ -304,7 +298,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		sequence: PlaceIdx,
 		element: TypeIndex,
-		index: &Spanned<ast::Expression>,
+		index: ast::ExprId,
 		span: TextSpan,
 	) -> Operand {
 		let Place {
@@ -621,7 +615,7 @@ impl BodyBuilder<'_, '_> {
 	/// has an address; a local or a call's result does not.
 	pub(super) fn build_address_of(
 		&mut self,
-		value: &Spanned<ast::Expression>,
+		value: ast::ExprId,
 		span: TextSpan,
 	) -> ExprIdx {
 		match self.build_operand(value, AccessKind::Read, &mut None) {
@@ -663,11 +657,11 @@ impl BodyBuilder<'_, '_> {
 	/// `target = value`.
 	pub(super) fn build_assign(
 		&mut self,
-		target: &Spanned<ast::Expression>,
-		value: &Spanned<ast::Expression>,
+		target: ast::ExprId,
+		value: ast::ExprId,
 		span: TextSpan,
 	) -> ExprIdx {
-		if let ast::Expression::Placeholder = target.inner {
+		if let ast::Expression::Placeholder = self.ast().expr(target) {
 			let value = self.build(value, TypeIndex::INFER);
 			let ty = self.body.ty(value);
 			if self.sema.types.needs_context(ty) {
@@ -718,8 +712,8 @@ impl BodyBuilder<'_, '_> {
 	pub(super) fn build_compound_assign(
 		&mut self,
 		op: Spanned<BinaryOp>,
-		target: &Spanned<ast::Expression>,
-		value: &Spanned<ast::Expression>,
+		target: ast::ExprId,
+		value: ast::ExprId,
 		span: TextSpan,
 	) -> ExprIdx {
 		let plain = plain_operator(op.inner);

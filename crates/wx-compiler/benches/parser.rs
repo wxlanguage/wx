@@ -124,9 +124,9 @@ fn main() {
 		ids.len()
 	);
 	println!(
-		"node sizes: Spanned<Expression> {} B, TypeExpression {} B, Pattern {} B, \
+		"node sizes: Expression {} B, TypeExpression {} B, Pattern {} B, \
 		 Statement {} B, Item {} B, PathSegment {} B",
-		size_of::<ast::Spanned<ast::Expression>>(),
+		size_of::<ast::Expression>(),
 		size_of::<ast::TypeExpression>(),
 		size_of::<ast::Pattern>(),
 		size_of::<ast::Statement>(),

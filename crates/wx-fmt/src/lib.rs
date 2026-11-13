@@ -325,6 +325,13 @@ impl Arena {
 	}
 }
 
+/// An entry of a block as written: a statement, or the tail after them.
+#[derive(Clone, Copy)]
+enum Entry {
+	Statement(ast::StmtId),
+	Tail(ast::ExprId),
+}
+
 struct Builder<'a> {
 	interner: &'a ast::StringInterner,
 	source: &'a str,
@@ -731,7 +738,7 @@ impl<'a> Builder<'a> {
 				}
 				self.build_function_signature(&mut items, signature);
 				items.push(self.text(Text::Space));
-				let body = self.build_fn_body(block);
+				let body = self.build_fn_body(*block);
 				items.push(body);
 				let declaration = items.split_off(attribute_count);
 				let concat = self.arena.concat(declaration);
@@ -823,7 +830,7 @@ impl<'a> Builder<'a> {
 				attributes,
 				name,
 				*type_annotation,
-				value,
+				*value,
 			),
 			ast::Item::Export { entry } => {
 				let mut parts: Vec<NodeId> = vec![self.text(Text::Export)];
@@ -900,7 +907,7 @@ impl<'a> Builder<'a> {
 				value,
 				..
 			} => self.build_const_definition(
-				*pub_span, attributes, name, *ty, value,
+				*pub_span, attributes, name, *ty, *value,
 			),
 			ast::Item::Module {
 				pub_span,
@@ -1353,7 +1360,7 @@ impl<'a> Builder<'a> {
 				}
 				self.build_function_signature(&mut nodes, signature);
 				nodes.push(self.text(Text::Space));
-				nodes.push(self.build_fn_body(block));
+				nodes.push(self.build_fn_body(*block));
 				let declaration = nodes.split_off(attribute_count);
 				let concat = self.arena.concat(declaration);
 				let declaration = self.arena.group(concat);
@@ -1380,7 +1387,7 @@ impl<'a> Builder<'a> {
 					nodes.push(self.build_type_expression(*ty));
 				}
 				nodes.push(self.text(Text::EqSp));
-				nodes.push(self.build_expression(value));
+				nodes.push(self.build_expression(*value));
 				nodes.push(self.text(Text::Semi));
 				self.arena.concat(nodes)
 			}
@@ -1502,7 +1509,7 @@ impl<'a> Builder<'a> {
 				match body {
 					Some(body) => {
 						nodes.push(self.text(Text::Space));
-						nodes.push(self.build_fn_body(body));
+						nodes.push(self.build_fn_body(*body));
 						let declaration = nodes.split_off(attribute_count);
 						let concat = self.arena.concat(declaration);
 						let declaration = self.arena.group(concat);
@@ -1528,7 +1535,7 @@ impl<'a> Builder<'a> {
 				nodes.push(self.symbol(name.inner));
 				nodes.push(self.text(Text::ColonSp));
 				nodes.push(self.build_type_expression(*ty));
-				if let Some(value) = value {
+				if let Some(value) = *value {
 					nodes.push(self.text(Text::EqSp));
 					nodes.push(self.build_expression(value));
 				}
@@ -1565,7 +1572,7 @@ impl<'a> Builder<'a> {
 		attributes: &[ast::Attribute],
 		name: &ast::Spanned<SymbolU32>,
 		ty: Option<ast::TypeId>,
-		value: &ast::Spanned<ast::Expression>,
+		value: ast::ExprId,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut nodes, attributes);
@@ -1611,9 +1618,16 @@ impl<'a> Builder<'a> {
 	fn build_match_expression(
 		&mut self,
 		span: TextSpan,
-		scrutinee: &ast::Spanned<ast::Expression>,
-		arms: &[ast::Separated<ast::Spanned<ast::MatchArm>>],
+		scrutinee: ast::ExprId,
+		arms: &[ast::MatchArm],
 	) -> NodeId {
+		let ast = self.ast;
+		let arm_span = |arm: &ast::MatchArm| {
+			TextSpan::new(
+				ast.pattern_span(arm.pattern).start,
+				ast.expr_span(arm.body).end,
+			)
+		};
 		let match_kw = self.text(Text::Match);
 		let scrutinee_id = self.build_expression(scrutinee);
 		let mut nodes: Vec<NodeId> =
@@ -1627,22 +1641,21 @@ impl<'a> Builder<'a> {
 					match index {
 						0 => Before::Opener { from: span.start },
 						_ => Before::Entry {
-							end: arms[index - 1].inner.span.end,
+							end: arm_span(&arms[index - 1]).end,
 						},
 					},
 					After::Entry {
-						start: arm.inner.span.start,
+						start: arm_span(arm).start,
 					},
 				);
 				let mut an: Vec<NodeId> = Vec::new();
-				self.build_pattern(&mut an, arm.inner.inner.pattern);
+				self.build_pattern(&mut an, arm.pattern);
 				an.push(self.text(Text::FatArrow));
-				let body = &arm.inner.inner.body;
-				let body = match &body.inner {
-					ast::Expression::Block { statements, .. } => {
-						self.build_block_content(&statements.inner, body.span)
+				let body = match ast.expr(arm.body) {
+					ast::Expression::Block { block, .. } => {
+						self.build_block_content(block, ast.expr_span(arm.body))
 					}
-					_ => self.build_expression(body),
+					_ => self.build_expression(arm.body),
 				};
 				an.push(self.arena.group(body));
 				if index + 1 < arms.len() {
@@ -1655,7 +1668,7 @@ impl<'a> Builder<'a> {
 			self.push_between(
 				&mut arm_items,
 				Before::Entry {
-					end: arms.last().unwrap().inner.span.end,
+					end: arm_span(arms.last().unwrap()).end,
 				},
 				After::End { at: span.end },
 			);
@@ -1732,7 +1745,7 @@ impl<'a> Builder<'a> {
 				match &entry.inner.inner {
 					ast::EnumEntry::Variant(variant) => {
 						en.push(self.symbol(variant.name.inner));
-						if let Some(value) = &variant.value {
+						if let Some(value) = variant.value {
 							en.push(self.text(Text::EqSp));
 							en.push(self.build_expression(value));
 						}
@@ -2029,7 +2042,10 @@ impl<'a> Builder<'a> {
 				// attribute's line while it fits.
 				ast::AttributeValue::Named(arguments) => {
 					let mut items = Vec::new();
-					self.build_named_call_args(&mut items, arguments);
+					self.build_named_call_args(
+						&mut items,
+						self.ast.list(*arguments),
+					);
 					let concat = self.arena.concat(items);
 					out.push(self.arena.group(concat));
 				}
@@ -2150,7 +2166,7 @@ impl<'a> Builder<'a> {
 		attributes: &[ast::Attribute],
 		name: &ast::Spanned<SymbolU32>,
 		type_annotation: Option<ast::TypeId>,
-		value: &ast::Spanned<ast::Expression>,
+		value: ast::ExprId,
 	) -> NodeId {
 		let mut items: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut items, attributes);
@@ -2172,13 +2188,11 @@ impl<'a> Builder<'a> {
 		self.arena.concat(items)
 	}
 
-	fn build_fn_body(
-		&mut self,
-		block: &ast::Spanned<ast::Expression>,
-	) -> NodeId {
-		let statements = block.inner.as_block_statements();
-		if statements.is_empty() {
-			return self.build_block_content(statements, block.span);
+	fn build_fn_body(&mut self, block: ast::BlockId) -> NodeId {
+		let span = self.ast.block_span(block);
+		let entries = self.entries(block);
+		if entries.is_empty() {
+			return self.build_block_content(block, span);
 		}
 
 		// Function bodies always put their contents between hard brace lines.
@@ -2186,20 +2200,35 @@ impl<'a> Builder<'a> {
 		let mut inner = Vec::new();
 		self.push_between(
 			&mut inner,
-			Before::Opener {
-				from: block.span.start,
-			},
+			Before::Opener { from: span.start },
 			After::Entry {
-				start: statements[0].inner.span.start,
+				start: self.entry_span(entries[0]).start,
 			},
 		);
-		inner.push(self.build_block_statements(statements, block.span));
+		inner.push(self.build_block_statements(&entries, span));
 		let inner = self.arena.concat(inner);
 		let open = self.text(Text::LBrace);
 		let inner = self.arena.indent(inner);
 		let line = self.hard_line();
 		let close = self.text(Text::RBrace);
 		self.arena.concat4(open, inner, line, close)
+	}
+
+	/// A block's entries as written: its statements, then its tail.
+	fn entries(&self, block: ast::BlockId) -> Vec<Entry> {
+		let ast::Block { statements, tail } = self.ast.block(block);
+		let statements = self.ast.list(statements).iter();
+		statements
+			.map(|&statement| Entry::Statement(statement))
+			.chain(tail.map(Entry::Tail))
+			.collect()
+	}
+
+	fn entry_span(&self, entry: Entry) -> TextSpan {
+		match entry {
+			Entry::Statement(statement) => self.ast.statement_span(statement),
+			Entry::Tail(tail) => self.ast.expr_span(tail),
+		}
 	}
 
 	/// Comments anywhere within a block prevent compact layout.
@@ -2211,24 +2240,24 @@ impl<'a> Builder<'a> {
 	}
 
 	/// Leaves brace lines ungrouped so paired `if` branches or a block-like
-	/// expression can own the layout decision.
+	/// expression can own the layout decision. `block_span` is where its
+	/// comments are looked for: its braces, or from a keyword block's
+	/// keyword.
 	fn build_block_content(
 		&mut self,
-		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
+		block: ast::BlockId,
 		block_span: TextSpan,
 	) -> NodeId {
+		let entries = self.entries(block);
 		let mut items: Vec<NodeId> = vec![self.text(Text::LBrace)];
 
-		if statements.is_empty() {
+		if entries.is_empty() {
 			self.build_empty_braced_comments(&mut items, block_span);
 		} else {
-			let single = statements.len() == 1
-				&& statements[0].separator.is_none()
-				&& matches!(
-					&statements[0].inner.inner,
-					ast::Statement::Expression(expression)
-						if !expression.inner.is_block_like()
-				) && !self.block_has_comments(block_span);
+			let single = matches!(
+				*entries,
+				[Entry::Tail(tail)] if !self.ast.expr(tail).is_block_like()
+			) && !self.block_has_comments(block_span);
 			let mut inner: Vec<NodeId> = Vec::new();
 			if single {
 				// No comments anywhere in here, so there is no gap to place —
@@ -2242,12 +2271,12 @@ impl<'a> Builder<'a> {
 						from: block_span.start,
 					},
 					After::Entry {
-						start: statements[0].inner.span.start,
+						start: self.entry_span(entries[0]).start,
 					},
 				);
 			}
 
-			inner.push(self.build_block_statements(statements, block_span));
+			inner.push(self.build_block_statements(&entries, block_span));
 
 			let inner_concat = self.arena.concat(inner);
 			items.push(self.arena.indent(inner_concat));
@@ -2264,14 +2293,16 @@ impl<'a> Builder<'a> {
 
 	/// Statement separators and inter-entry comments are shared by function
 	/// bodies and expression blocks; brace layout belongs to their callers.
+	/// Every statement ends in `;`, a block-like one's only while it stays
+	/// on one line, and the tail in none.
 	fn build_block_statements(
 		&mut self,
-		statements: &[ast::Separated<ast::Spanned<ast::Statement>>],
+		entries: &[Entry],
 		block_span: TextSpan,
 	) -> NodeId {
 		let mut inner = Vec::new();
 
-		for (index, statement) in statements.iter().enumerate() {
+		for (index, &entry) in entries.iter().enumerate() {
 			// The break between two statements is emitted here rather
 			// than at the end of the previous turn, so that turn can
 			// close its line with `;` and let the gap append whatever
@@ -2280,36 +2311,37 @@ impl<'a> Builder<'a> {
 				self.push_between(
 					&mut inner,
 					Before::Entry {
-						end: statements[index - 1].inner.span.end,
+						end: self.entry_span(entries[index - 1]).end,
 					},
 					After::Entry {
-						start: statement.inner.span.start,
+						start: self.entry_span(entry).start,
 					},
 				);
 			}
-			let last = index + 1 == statements.len();
-			if let ast::Statement::Expression(expression) =
-				&statement.inner.inner
-				&& expression.inner.is_block_like()
-				&& !last
-			{
-				let semi = self.text(Text::Semi);
-				let suffix = self.arena.alloc(Node::IfFlat(semi));
-				// The suffix shares the expression's group so its width and
-				// presence participate in the same layout decision.
-				let contents = self.build_expression_contents(expression);
-				let contents = self.arena.concat2(contents, suffix);
-				inner.push(self.arena.group(contents));
-			} else {
-				inner.push(self.build_statement(&statement.inner.inner));
-				let needs_semi = !last
-					|| statement.separator.is_some()
-					|| matches!(
-						statement.inner.inner,
-						ast::Statement::LocalDefinition { .. }
-					);
-				if needs_semi {
-					inner.push(self.text(Text::Semi));
+			let last = index + 1 == entries.len();
+			match entry {
+				Entry::Tail(tail) => inner.push(self.build_expression(tail)),
+				Entry::Statement(statement) => {
+					match self.ast.statement(statement) {
+						ast::Statement::Expression(expression)
+							if self.ast.expr(expression).is_block_like()
+								&& !last =>
+						{
+							let semi = self.text(Text::Semi);
+							let suffix = self.arena.alloc(Node::IfFlat(semi));
+							// The suffix shares the expression's group so its
+							// width and presence participate in the same layout
+							// decision.
+							let contents =
+								self.build_expression_contents(expression);
+							let contents = self.arena.concat2(contents, suffix);
+							inner.push(self.arena.group(contents));
+						}
+						statement => {
+							inner.push(self.build_statement(statement));
+							inner.push(self.text(Text::Semi));
+						}
+					}
 				}
 			}
 		}
@@ -2319,7 +2351,7 @@ impl<'a> Builder<'a> {
 		self.push_between(
 			&mut inner,
 			Before::Entry {
-				end: statements.last().unwrap().inner.span.end,
+				end: self.entry_span(*entries.last().unwrap()).end,
 			},
 			After::End { at: block_span.end },
 		);
@@ -2329,40 +2361,33 @@ impl<'a> Builder<'a> {
 
 	/// Keep a block-like value attached to its call or assignment opener,
 	/// letting its own braces supply indentation rather than adding wrappers.
-	fn is_huggable(expr: &ast::Expression) -> bool {
-		if expr.is_block_like() {
-			return true;
-		}
-		match expr {
+	fn is_huggable(&self, expr: ast::ExprId) -> bool {
+		match self.ast.expr(expr) {
+			kind if kind.is_block_like() => true,
 			ast::Expression::Call { arguments, .. } => {
-				arguments.inner.len() == 1
-					&& Self::is_huggable(&arguments.inner[0].inner.inner)
-			}
-			ast::Expression::MethodCall(mc) => {
-				mc.arguments.inner.len() == 1
-					&& Self::is_huggable(&mc.arguments.inner[0].inner.inner)
+				matches!(self.ast.list(arguments), &[argument] if self.is_huggable(argument))
 			}
 			// A call by name is its own braces: they break open in place.
-			ast::Expression::NamedCall { .. }
-			| ast::Expression::NamedMethodCall(_) => true,
+			ast::Expression::NamedCall { .. } => true,
 			_ => false,
 		}
 	}
 
-	/// `object.method` and its turbofish, up to where the arguments open.
-	fn build_method_callee(
+	/// `object.member` and its turbofish: a field, or a method up to where
+	/// its arguments open.
+	fn build_member(
 		&mut self,
-		object: &ast::Spanned<ast::Expression>,
-		method: &ast::Spanned<SymbolU32>,
-		type_args: ast::List<ast::TypeArgument>,
+		object: ast::ExprId,
+		member: ast::PathSegment,
 	) -> Vec<NodeId> {
 		let obj_id = self.build_expression(object);
 		let dot = self.text(Text::Dot);
-		let method_sym = self.symbol(method.inner);
+		let method_sym = self.symbol(member.ident.inner);
 		let mut items: Vec<NodeId> = vec![obj_id, dot, method_sym];
-		if !type_args.is_empty() {
+		if !member.type_args.is_empty() {
 			items.push(self.text(Text::ColonColonLt));
-			for (i, &arg) in self.ast.list(type_args).iter().enumerate() {
+			for (i, &arg) in self.ast.list(member.type_args).iter().enumerate()
+			{
 				if i > 0 {
 					items.push(self.text(Text::CommaSp));
 				}
@@ -2379,18 +2404,15 @@ impl<'a> Builder<'a> {
 	fn build_named_call_args(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		arguments: &[ast::Separated<ast::Spanned<ast::NamedArgument>>],
+		arguments: &[ast::NamedArgument],
 	) {
 		out.push(self.text(Text::LParen));
 		out.push(self.text(Text::LBrace));
 
 		let has_block_value = arguments.iter().any(|argument| {
 			argument
-				.inner
-				.inner
 				.value
-				.as_ref()
-				.is_some_and(|v| v.inner.is_block_like())
+				.is_some_and(|value| self.ast.expr(value).is_block_like())
 		});
 		if !arguments.is_empty() {
 			let argument_count = arguments.len();
@@ -2401,9 +2423,8 @@ impl<'a> Builder<'a> {
 			};
 			let mut argument_items: Vec<NodeId> = vec![sep];
 			for (index, argument) in arguments.iter().enumerate() {
-				argument_items
-					.push(self.symbol(argument.inner.inner.name.inner));
-				if let Some(value) = &argument.inner.inner.value {
+				argument_items.push(self.symbol(argument.name.inner));
+				if let Some(value) = argument.value {
 					argument_items.push(self.text(Text::ColonSp));
 					argument_items.push(self.build_expression(value));
 				}
@@ -2438,16 +2459,17 @@ impl<'a> Builder<'a> {
 	fn build_call_args(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		arguments: &[ast::Separated<ast::Spanned<ast::Expression>>],
+		arguments: &[ast::ExprId],
 	) {
 		out.push(self.text(Text::LParen));
-		if arguments.len() == 1 && Self::is_huggable(&arguments[0].inner.inner)
+		if let &[argument] = arguments
+			&& self.is_huggable(argument)
 		{
-			out.push(self.build_expression(&arguments[0].inner));
+			out.push(self.build_expression(argument));
 		} else if !arguments.is_empty() {
 			let mut arg_nodes: Vec<NodeId> = vec![self.line()];
-			for (index, arg) in arguments.iter().enumerate() {
-				arg_nodes.push(self.build_expression(&arg.inner));
+			for (index, &arg) in arguments.iter().enumerate() {
+				arg_nodes.push(self.build_expression(arg));
 				if index + 1 < arguments.len() {
 					arg_nodes.push(self.text(Text::Comma));
 					arg_nodes.push(self.soft_line());
@@ -2464,33 +2486,27 @@ impl<'a> Builder<'a> {
 
 	/// An `else { if .. }` wrapper is redundant only when the `if` is its
 	/// sole value. Keep wrappers that terminate the value or own comments.
-	fn else_if_expression<'b>(
-		&self,
-		block: &'b ast::Spanned<ast::Expression>,
-	) -> Option<&'b ast::Spanned<ast::Expression>> {
+	fn else_if_expression(&self, block: ast::ExprId) -> Option<ast::ExprId> {
 		let ast::Expression::Block {
 			label: None,
-			statements,
-		} = &block.inner
+			block: inner,
+		} = self.ast.expr(block)
 		else {
 			return None;
 		};
-		let [statement] = &*statements.inner else {
+		let [Entry::Tail(expression)] = *self.entries(inner) else {
 			return None;
 		};
-		let ast::Statement::Expression(expression) = &statement.inner.inner
-		else {
-			return None;
-		};
-		if statement.separator.is_some()
-			|| !matches!(expression.inner, ast::Expression::IfElse { .. })
+		let span = self.ast.expr_span(block);
+		let expression_span = self.ast.expr_span(expression);
+		if !matches!(self.ast.expr(expression), ast::Expression::IfElse { .. })
 			|| !self
 				.comments
-				.between(block.span.start, expression.span.start)
+				.between(span.start, expression_span.start)
 				.is_empty()
 			|| !self
 				.comments
-				.between(expression.span.end, block.span.end)
+				.between(expression_span.end, span.end)
 				.is_empty()
 		{
 			return None;
@@ -2498,28 +2514,23 @@ impl<'a> Builder<'a> {
 		Some(expression)
 	}
 
-	fn build_expression(
-		&mut self,
-		expression: &ast::Spanned<ast::Expression>,
-	) -> NodeId {
+	fn build_expression(&mut self, expression: ast::ExprId) -> NodeId {
 		let contents = self.build_expression_contents(expression);
-		if expression.inner.is_block_like() {
+		if self.ast.expr(expression).is_block_like() {
 			self.arena.group(contents)
 		} else {
 			contents
 		}
 	}
 
-	fn build_expression_contents(
-		&mut self,
-		expression: &ast::Spanned<ast::Expression>,
-	) -> NodeId {
-		match &expression.inner {
+	fn build_expression_contents(&mut self, expression: ast::ExprId) -> NodeId {
+		let ast = self.ast;
+		let span = ast.expr_span(expression);
+		match ast.expr(expression) {
 			ast::Expression::QualifiedPath { root, segments } => {
-				let ast = self.ast;
-				let root = ast.qualified_root(*root);
+				let root = ast.qualified_root(root);
 				let self_type_node = self.build_type_expression(root.self_type);
-				let segments = self.build_value_path(segments);
+				let segments = self.build_value_path(ast.list(segments));
 				self.build_qualified_path(
 					self_type_node,
 					Some(ast.list(root.trait_path)),
@@ -2527,26 +2538,29 @@ impl<'a> Builder<'a> {
 				)
 			}
 			ast::Expression::Grouped { inner, segments } => {
-				let inner_node = self.build_type_expression(*inner);
-				let segments = self.build_value_path(segments);
+				let inner_node = self.build_type_expression(inner);
+				let segments = self.build_value_path(ast.list(segments));
 				self.build_qualified_path(inner_node, None, segments)
 			}
-			ast::Expression::Path(path) => self.build_value_path(path),
+			ast::Expression::Path(path) => {
+				self.build_value_path(ast.list(path))
+			}
 			ast::Expression::Binary {
 				left,
 				operator,
 				right,
+				..
 			} => {
-				let mut operands: Vec<&ast::Spanned<ast::Expression>> =
-					vec![right, left];
+				let mut operands: Vec<ast::ExprId> = vec![right, left];
 				let mut current = left;
 				while let ast::Expression::Binary {
 					left: l,
 					operator: op,
 					right: r,
-				} = &current.inner
+					..
+				} = ast.expr(current)
 				{
-					if op.inner == operator.inner {
+					if op == operator {
 						*operands.last_mut().unwrap() = r;
 						operands.push(l);
 						current = l;
@@ -2558,8 +2572,8 @@ impl<'a> Builder<'a> {
 
 				let first = self.build_expression(operands[0]);
 				let mut parts: Vec<NodeId> = vec![first];
-				let op_text = Text::from(operator.inner);
-				for operand in &operands[1..] {
+				let op_text = Text::from(operator);
+				for &operand in &operands[1..] {
 					let sl = self.soft_line();
 					let op_id = self.text(op_text);
 					let sp = self.text(Text::Space);
@@ -2570,13 +2584,12 @@ impl<'a> Builder<'a> {
 				let concat = self.arena.concat(parts);
 				self.arena.group(concat)
 			}
-			ast::Expression::Block { label, statements } => {
+			ast::Expression::Block { label, block } => {
 				// A plain block in expression position is spelled `block { .. }`;
 				// the blocks owned by a construct (`if`, `loop`, a match arm, a
 				// function body) go straight to `build_block_content`.
-				let keyword = self.labelled_keyword(Text::Block, *label);
-				let content = self
-					.build_block_content(&statements.inner, expression.span);
+				let keyword = self.labelled_keyword(Text::Block, label);
+				let content = self.build_block_content(block, span);
 				self.arena.concat2(keyword, content)
 			}
 			ast::Expression::Placeholder => self.text(Text::Underscore),
@@ -2589,13 +2602,12 @@ impl<'a> Builder<'a> {
 				let cond = self.build_expression(condition);
 				let sp = self.text(Text::Space);
 
-				let then_statements = then_block.inner.as_block_statements();
-				let else_data = else_block.as_deref().map(|b| match &b.inner {
-					ast::Expression::Block { statements, .. } => {
+				let else_data = else_block.map(|b| match ast.expr(b) {
+					ast::Expression::Block { block, .. } => {
 						if let Some(nested) = self.else_if_expression(b) {
 							self.build_expression_contents(nested)
 						} else {
-							self.build_block_content(&statements.inner, b.span)
+							self.build_block_content(block, ast.expr_span(b))
 						}
 					}
 					// A continuation belongs to the same layout group as the
@@ -2603,8 +2615,10 @@ impl<'a> Builder<'a> {
 					_ => self.build_expression_contents(b),
 				});
 
-				let then_id =
-					self.build_block_content(then_statements, then_block.span);
+				let then_id = self.build_block_content(
+					then_block,
+					ast.block_span(then_block),
+				);
 				let mut items: Vec<NodeId> = vec![if_kw, cond, sp, then_id];
 				if let Some(else_id) = else_data {
 					items.push(self.text(Text::Else));
@@ -2613,15 +2627,13 @@ impl<'a> Builder<'a> {
 				self.arena.concat(items)
 			}
 			ast::Expression::Loop { label, block } => {
-				let loop_kw = self.labelled_keyword(Text::Loop, *label);
-				let block_id = self.build_block_content(
-					block.inner.as_block_statements(),
-					block.span,
-				);
+				let loop_kw = self.labelled_keyword(Text::Loop, label);
+				let block_id =
+					self.build_block_content(block, ast.block_span(block));
 				self.arena.concat2(loop_kw, block_id)
 			}
 			ast::Expression::Match { scrutinee, arms } => {
-				self.build_match_expression(expression.span, scrutinee, arms)
+				self.build_match_expression(span, scrutinee, ast.list(arms))
 			}
 			ast::Expression::Break { label, value } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Break)];
@@ -2652,73 +2664,53 @@ impl<'a> Builder<'a> {
 				self.arena.concat(items)
 			}
 			ast::Expression::Int { .. } | ast::Expression::Float => {
-				self.source_text(expression.span)
+				self.source_text(span)
 			}
 			// A tuple of one is its element; its parentheses may still group
 			// it, so they are kept and its comma is dropped.
 			ast::Expression::Tuple { elements }
-				if let [value] = &**elements =>
+				if let &[value] = ast.list(elements) =>
 			{
 				let open = self.text(Text::LParen);
-				let val = self.build_expression(&value.inner);
+				let val = self.build_expression(value);
 				let close = self.text(Text::RParen);
 				self.arena.concat3(open, val, close)
 			}
-			ast::Expression::Call { callee, arguments } => {
+			ast::Expression::Call {
+				callee, arguments, ..
+			} => {
 				let callee_id = self.build_expression(callee);
 				let mut items: Vec<NodeId> = vec![callee_id];
-				self.build_call_args(&mut items, &arguments.inner);
+				self.build_call_args(&mut items, ast.list(arguments));
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
 			}
-			ast::Expression::MethodCall(mc) => {
-				let mut items = self.build_method_callee(
-					&mc.object,
-					&mc.method.ident,
-					mc.method.type_args,
-				);
-				self.build_call_args(&mut items, &mc.arguments.inner);
-				let concat = self.arena.concat(items);
-				self.arena.group(concat)
-			}
-			ast::Expression::NamedCall { callee, arguments } => {
+			ast::Expression::NamedCall {
+				callee, arguments, ..
+			} => {
 				let callee_id = self.build_expression(callee);
 				let mut items: Vec<NodeId> = vec![callee_id];
-				self.build_named_call_args(&mut items, &arguments.inner);
-				let concat = self.arena.concat(items);
-				self.arena.group(concat)
-			}
-			ast::Expression::NamedMethodCall(mc) => {
-				let mut items = self.build_method_callee(
-					&mc.object,
-					&mc.method.ident,
-					mc.method.type_args,
-				);
-				self.build_named_call_args(&mut items, &mc.arguments.inner);
+				self.build_named_call_args(&mut items, ast.list(arguments));
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
 			}
 			ast::Expression::Ascription { value, ty } => {
 				let val = self.build_expression(value);
 				let colon_sp = self.text(Text::ColonSp);
-				let ty_id = self.build_type_expression(*ty);
+				let ty_id = self.build_type_expression(ty);
 				self.arena.concat3(val, colon_sp, ty_id)
 			}
 			ast::Expression::Error => unreachable!(),
 			ast::Expression::Unary { operator, operand } => {
-				let op_id = self.text(Text::from(operator.inner));
+				let op_id = self.text(Text::from(operator));
 				let operand_id = self.build_expression(operand);
 				self.arena.concat2(op_id, operand_id)
 			}
 			ast::Expression::String | ast::Expression::Char => {
-				self.source_text(expression.span)
+				self.source_text(span)
 			}
 			ast::Expression::ObjectAccess { object, member } => {
-				let items = self.build_method_callee(
-					object,
-					&member.ident,
-					member.type_args,
-				);
+				let items = self.build_member(object, ast.segment(member));
 				self.arena.concat(items)
 			}
 			ast::Expression::Deref { pointer } => {
@@ -2733,11 +2725,11 @@ impl<'a> Builder<'a> {
 			}
 			ast::Expression::ArrayList { elements } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::LBracket)];
-				for (i, element) in elements.iter().enumerate() {
+				for (i, &element) in ast.list(elements).iter().enumerate() {
 					if i > 0 {
 						items.push(self.text(Text::CommaSp));
 					}
-					items.push(self.build_expression(&element.inner));
+					items.push(self.build_expression(element));
 				}
 				items.push(self.text(Text::RBracket));
 				self.arena.concat(items)
@@ -2747,7 +2739,7 @@ impl<'a> Builder<'a> {
 				let val = self.build_expression(value);
 				let semi_sp = self.text(Text::Semi);
 				let sp = self.text(Text::Space);
-				let cnt = self.build_const_argument(*count);
+				let cnt = self.build_const_argument(count);
 				let close = self.text(Text::RBracket);
 				self.arena.concat(vec![open, val, semi_sp, sp, cnt, close])
 			}
@@ -2759,13 +2751,14 @@ impl<'a> Builder<'a> {
 				self.arena.concat4(obj_id, open, idx, close)
 			}
 			ast::Expression::Tuple { elements } => {
+				let elements = ast.list(elements);
 				let mut items: Vec<NodeId> = vec![self.text(Text::LParen)];
 
 				if !elements.is_empty() {
 					let last_idx = elements.len() - 1;
 					let mut element_items: Vec<NodeId> = vec![self.line()];
-					for (index, element) in elements.iter().enumerate() {
-						let el = self.build_expression(&element.inner);
+					for (index, &element) in elements.iter().enumerate() {
+						let el = self.build_expression(element);
 						let mut nodes: Vec<NodeId> = vec![el];
 						if index < last_idx {
 							nodes.push(self.text(Text::Comma));
@@ -2912,7 +2905,7 @@ impl<'a> Builder<'a> {
 		}
 	}
 
-	fn build_statement(&mut self, statement: &ast::Statement) -> NodeId {
+	fn build_statement(&mut self, statement: ast::Statement) -> NodeId {
 		match statement {
 			ast::Statement::Expression(expression) => {
 				self.build_expression(expression)
@@ -2923,13 +2916,13 @@ impl<'a> Builder<'a> {
 				value,
 			} => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Local)];
-				self.build_pattern(&mut items, *pattern);
+				self.build_pattern(&mut items, pattern);
 				if let Some(annotation) = type_annotation {
 					items.push(self.text(Text::ColonSp));
-					items.push(self.build_type_expression(*annotation));
+					items.push(self.build_type_expression(annotation));
 				}
 				let value_node = self.build_expression(value);
-				if Self::is_huggable(&value.inner) {
+				if self.is_huggable(value) {
 					items.push(self.text(Text::EqSp));
 					items.push(value_node);
 				} else {

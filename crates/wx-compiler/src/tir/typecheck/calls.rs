@@ -20,7 +20,7 @@ use string_interner::symbol::SymbolU32;
 
 use super::members::Expected;
 use super::{Arguments, BodyBuilder};
-use crate::ast::{self, Separated, Spanned, StringInterner};
+use crate::ast::{self, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::decls::{
@@ -653,7 +653,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		target: &CallTarget,
 		type_args: &mut [TypeIndex],
-		arguments: &[Separated<Spanned<ast::Expression>>],
+		arguments: &[ast::ExprId],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
@@ -668,7 +668,7 @@ impl BodyBuilder<'_, '_> {
 			&& let [argument] = arguments
 		{
 			return self
-				.one_value_for_all(target, type_args, argument, given, span);
+				.one_value_for_all(target, type_args, *argument, given, span);
 		}
 		let reported = arguments.len() != open;
 		if reported {
@@ -677,7 +677,7 @@ impl BodyBuilder<'_, '_> {
 		given.reserve_exact(arguments.len().min(open));
 		for (at, argument) in arguments.iter().enumerate() {
 			if at >= open {
-				self.build(&argument.inner, TypeIndex::INFER);
+				self.build(*argument, TypeIndex::INFER);
 				continue;
 			}
 			let param = ParamIdx::new((skipped + at) as u32);
@@ -685,7 +685,7 @@ impl BodyBuilder<'_, '_> {
 				self.sema.types.list(target.param_types)[usize::from(param)];
 			let hint =
 				self.instantiate(declared, target.generic_env, type_args);
-			let value = self.build(&argument.inner, hint);
+			let value = self.build(*argument, hint);
 			self.learn_argument(target, type_args, declared, value);
 			given.push(GivenArgument {
 				param: Some(param),
@@ -705,7 +705,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		target: &CallTarget,
 		type_args: &mut [TypeIndex],
-		argument: &Separated<Spanned<ast::Expression>>,
+		argument: ast::ExprId,
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
@@ -713,7 +713,7 @@ impl BodyBuilder<'_, '_> {
 		let open = target.param_types.len() - skipped;
 		let declared = self.declared_after(target, skipped);
 		let hint = self.instantiate(declared, target.generic_env, type_args);
-		let value = self.build(&argument.inner, hint);
+		let value = self.build(argument, hint);
 		let actual = self.body.ty(value);
 		let is_tuple =
 			matches!(self.sema.types.resolve(actual), Type::Tuple { .. });
@@ -740,7 +740,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		target: &CallTarget,
 		type_args: &mut [TypeIndex],
-		arguments: &[Separated<Spanned<ast::Expression>>],
+		arguments: &[ast::ExprId],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
@@ -757,13 +757,17 @@ impl BodyBuilder<'_, '_> {
 				self.report_argument_count(target, 1, arguments.len(), span);
 			}
 			for argument in arguments {
-				self.build(&argument.inner, TypeIndex::INFER);
+				self.build(*argument, TypeIndex::INFER);
 			}
 			return true;
 		}
 		let span = match (arguments.first(), arguments.last()) {
-			(Some(first), Some(last)) => {
-				TextSpan::new(first.inner.span.start, last.inner.span.end)
+			(Some(&first), Some(&last)) => {
+				let ast = self.ast();
+				TextSpan::new(
+					ast.expr_span(first).start,
+					ast.expr_span(last).end,
+				)
 			}
 			_ => span,
 		};
@@ -786,7 +790,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		target: &CallTarget,
 		type_args: &mut [TypeIndex],
-		arguments: &[Separated<Spanned<ast::NamedArgument>>],
+		arguments: &[ast::NamedArgument],
 		given: &mut Vec<GivenArgument>,
 		span: TextSpan,
 	) -> bool {
@@ -811,10 +815,7 @@ impl BodyBuilder<'_, '_> {
 					.with_label(target.kind.declared_here(self.sema)),
 			);
 			for argument in arguments {
-				self.build_named_argument(
-					&argument.inner.inner,
-					TypeIndex::INFER,
-				);
+				self.build_named_argument(argument, TypeIndex::INFER);
 			}
 			return true;
 		}
@@ -824,7 +825,6 @@ impl BodyBuilder<'_, '_> {
 		let mut named: Vec<(ParamIdx, TextSpan)> =
 			Vec::with_capacity(arguments.len());
 		for argument in arguments {
-			let argument = &argument.inner.inner;
 			let name = argument.name;
 			let param =
 				target.find_param(&self.sema.decls, name.inner, skipped);
@@ -952,7 +952,7 @@ impl BodyBuilder<'_, '_> {
 		argument: &ast::NamedArgument,
 		hint: TypeIndex,
 	) -> ExprIdx {
-		match &argument.value {
+		match argument.value {
 			Some(value) => self.build(value, hint),
 			None => {
 				let path = [ast::PathSegment::new(argument.name)];
@@ -1304,11 +1304,11 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		callee_type: TypeIndex,
 		args_type: TypeIndex,
-		arguments: &[Separated<Spanned<ast::Expression>>],
+		arguments: &[ast::ExprId],
 		span: TextSpan,
 	) -> ExprIdx {
 		if let [argument] = arguments {
-			let value = self.build(&argument.inner, args_type);
+			let value = self.build(*argument, args_type);
 			return self.expect(value, args_type);
 		}
 		let element_types = match *self.sema.types.resolve(args_type) {
@@ -1333,7 +1333,7 @@ impl BodyBuilder<'_, '_> {
 				let hint = element_types.map_or(TypeIndex::ERROR, |types| {
 					self.sema.types.list(types)[at]
 				});
-				let value = self.build(&argument.inner, hint);
+				let value = self.build(*argument, hint);
 				self.expect(value, hint)
 			})
 			.collect();
@@ -1353,15 +1353,12 @@ impl BodyBuilder<'_, '_> {
 		match arguments {
 			Arguments::Positional(arguments) => {
 				for argument in arguments {
-					self.build(&argument.inner, TypeIndex::ERROR);
+					self.build(*argument, TypeIndex::ERROR);
 				}
 			}
 			Arguments::Named(arguments) => {
 				for argument in arguments {
-					self.build_named_argument(
-						&argument.inner.inner,
-						TypeIndex::ERROR,
-					);
+					self.build_named_argument(argument, TypeIndex::ERROR);
 				}
 			}
 		}
