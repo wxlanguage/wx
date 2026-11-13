@@ -240,14 +240,9 @@ impl BodyBuilder<'_, '_> {
 				}
 				value
 			}
-			ast::Statement::LocalDefinition { pattern, ty, value } => self
-				.build_local(
-					pattern,
-					ty.as_deref(),
-					value,
-					statement.span,
-					block_end,
-				),
+			ast::Statement::LocalDefinition { pattern, ty, value } => {
+				self.build_local(pattern, *ty, value, statement.span, block_end)
+			}
 		}
 	}
 
@@ -256,7 +251,7 @@ impl BodyBuilder<'_, '_> {
 	pub(super) fn build_ascription(
 		&mut self,
 		value: &Spanned<ast::Expression>,
-		ty: &Spanned<ast::TypeExpression>,
+		ty: ast::TypeId,
 	) -> ExprIdx {
 		let ty = self.builder.resolve_value_type(
 			self.sema,
@@ -277,7 +272,7 @@ impl BodyBuilder<'_, '_> {
 	fn build_local(
 		&mut self,
 		pattern: &Spanned<ast::Pattern>,
-		ty: Option<&Spanned<ast::TypeExpression>>,
+		ty: Option<ast::TypeId>,
 		value: &Spanned<ast::Expression>,
 		span: TextSpan,
 		block_end: u32,

@@ -84,7 +84,8 @@ pub fn check(
 	);
 	let mut sema =
 		Semantics::new(decls, impl_dispatch, diagnostics, resolutions, strings);
-	SemanticsBuilder::new(files, strings, &ast_nodes).build(&mut sema);
+	SemanticsBuilder::new(files, packages, strings, &ast_nodes)
+		.build(&mut sema);
 	sema
 }
 

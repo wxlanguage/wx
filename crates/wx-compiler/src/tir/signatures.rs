@@ -30,7 +30,7 @@ use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
 use crate::tir::decls::TypeAliasIdx;
 use crate::tir::types::GenericEnvOwner;
-use crate::vfs::{FileId, Files};
+use crate::vfs::{FileId, Files, Package};
 
 use super::body::{
 	Body, BodyIdx, BodyOwner, ConstBody, FunctionImplementation, Obligations,
@@ -72,28 +72,28 @@ use super::types::{
 /// membership builder (`Semantics::trait_clauses`) and the source-bound
 /// resolver (`Semantics::fill_source_bounds`), so the two cannot disagree
 /// about which occurrences exist.
-struct BoundOccurrence<'expr> {
+struct BoundOccurrence {
 	id: BoundId,
 	trait_index: TraitIdx,
 	span: SourceSpan,
-	bindings: Vec<BindingOccurrence<'expr>>,
+	bindings: Vec<BindingOccurrence>,
 }
 
-struct BindingOccurrence<'expr> {
+struct BindingOccurrence {
 	name: Spanned<SymbolU32>,
-	kind: BindingOccurrenceKind<'expr>,
+	kind: BindingOccurrenceKind,
 }
 
 /// An entry and the member it names. A written type is not resolved yet:
 /// `fill_source_bounds` resolves it once every sibling param has
 /// provisional memberships published.
-enum BindingOccurrenceKind<'expr> {
-	Equals(TypeProjectionTarget, &'expr Spanned<ast::TypeExpression>),
-	Bound(TypeProjectionTarget, Vec<BoundOccurrence<'expr>>),
-	Representable(ConstantTarget, &'expr Spanned<ast::TypeExpression>),
+enum BindingOccurrenceKind {
+	Equals(TypeProjectionTarget, ast::TypeId),
+	Bound(TypeProjectionTarget, Vec<BoundOccurrence>),
+	Representable(ConstantTarget, ast::TypeId),
 }
 
-impl BindingOccurrenceKind<'_> {
+impl BindingOccurrenceKind {
 	/// Whether two entries name one member.
 	fn same_member(&self, other: &Self) -> bool {
 		match (self, other) {
@@ -317,10 +317,7 @@ impl Semantics {
 		for (&external_name, source) in &self.decls.exports {
 			let file_id = source.external_span.file_id;
 			let reference = SourceSpan::new(file_id, source.name.span);
-			let segments = [ast::PathSegment {
-				ident: source.name,
-				type_args: Box::new([]),
-			}];
+			let segments = [ast::PathSegment::new(source.name)];
 			let Ok(key) = PathResolver::new(
 				&mut self.diagnostics,
 				&mut self.resolutions,
@@ -473,6 +470,8 @@ pub(super) struct QueryInfo {
 pub(super) struct SemanticsBuilder<'ast> {
 	/// Source text, for literals whose value is read from their span.
 	pub(super) files: &'ast Files,
+	/// Each file's syntax tree, where a declaration's written types are read.
+	syntax: Syntax<'ast>,
 	/// The only interning checking does is a string literal's contents.
 	pub(super) strings: &'ast mut StringInterner,
 	/// The prescan's declarations, in parse order (`Declarations::build`).
@@ -483,6 +482,31 @@ pub(super) struct SemanticsBuilder<'ast> {
 	/// Every declaration's obligations, one contiguous run per declaration
 	/// (`QueryEntry::obligations`).
 	obligations: Vec<TypeObligation>,
+}
+
+/// Each file's syntax tree, by its id. A written type is an id in the tree
+/// of the file it is written in, which every lowering knows
+/// (`LexicalScope::file_id`).
+pub(super) struct Syntax<'ast> {
+	trees: Vec<Option<&'ast ast::AST>>,
+}
+
+impl<'ast> Syntax<'ast> {
+	pub(super) fn new(packages: &'ast [Package]) -> Self {
+		let mut trees = Vec::new();
+		for module in packages.iter().flat_map(|package| &package.modules) {
+			let index = module.file_id.as_usize();
+			if trees.len() <= index {
+				trees.resize(index + 1, None);
+			}
+			trees[index] = Some(&module.ast);
+		}
+		Self { trees }
+	}
+
+	pub(super) fn get(&self, file_id: FileId) -> &'ast ast::AST {
+		self.trees[file_id.as_usize()].expect("every source file is parsed")
+	}
 }
 
 /// Where code is written: the file its spans are in, the namespace its
@@ -805,6 +829,7 @@ impl Semantics {
 		&self,
 		strings: &StringInterner,
 		file_id: FileId,
+		ast: &ast::AST,
 		segment: &ast::PathSegment,
 		impl_kind: ImplKind,
 	) -> Diagnostic<FileId> {
@@ -825,10 +850,8 @@ impl Semantics {
 					.target,
 			),
 		};
-		let (first, last) = (
-			segment.type_args.first().unwrap(),
-			segment.type_args.last().unwrap(),
-		);
+		let args = ast.list(segment.type_args);
+		let (first, last) = (args[0], args[args.len() - 1]);
 		let target_name =
 			self.type_formatter(strings).display_type(target.inner);
 		let diagnostic = Diagnostic::error()
@@ -837,7 +860,10 @@ impl Semantics {
 			.with_labels(vec![
 				SourceSpan::new(
 					file_id,
-					TextSpan::new(first.span().start, last.span().end),
+					TextSpan::new(
+						ast.type_argument_span(first).start,
+						ast.type_argument_span(last).end,
+					),
 				)
 				.primary_label()
 				.with_message(format!(
@@ -932,6 +958,7 @@ impl Semantics {
 		generic_env: GenericEnvIdx,
 		param_types: TypeList,
 		return_type: TypeIndex,
+		ast: &ast::AST,
 		signature: &ast::FunctionSignature,
 	) {
 		let function_decl = &self.decls.functions[usize::from(function_index)];
@@ -958,10 +985,10 @@ impl Semantics {
 			"checked by impls.rs's dispatch pass before any signature is resolved",
 		);
 		let args_span = match &signature.params[..] {
-			[param] => Some(param.inner.inner.ty.span),
+			[param] => Some(ast.type_span(param.inner.inner.ty)),
 			_ => None,
 		};
-		let result_span = signature.result.as_ref().map(|result| result.span);
+		let result_span = signature.result.map(|result| ast.type_span(result));
 		for (provider, value, span) in [
 			(function_impls.args_assoc_type_index, args, args_span),
 			(
@@ -1604,6 +1631,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// `ensure_signature` resolves it.
 	pub(super) fn new(
 		files: &'ast Files,
+		packages: &'ast [Package],
 		strings: &'ast mut StringInterner,
 		entries: &'ast [AstEntry<'ast>],
 	) -> Self {
@@ -1623,6 +1651,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.collect();
 		Self {
 			files,
+			syntax: Syntax::new(packages),
 			strings,
 			entries,
 			query_state,
@@ -1993,7 +2022,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema,
 					file_id,
 					namespace,
-					bound,
+					*bound,
 					&mut occurrences,
 				),
 				ast::TypeParam::Type { bounds: None, .. } => {}
@@ -2173,10 +2202,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 		}
 		let params_env = sema.structs[usize::from(struct_index)].type_params;
-		let resolved_args: Box<[TypeIndex]> = segment
-			.type_args
+		let resolved_args: Box<[TypeIndex]> = self
+			.ast(scope.file_id)
+			.list(segment.type_args)
 			.iter()
-			.map(|arg| {
+			.map(|&arg| {
 				self.resolve_type_argument(
 					sema,
 					obligations,
@@ -2190,6 +2220,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&self.strings,
 			obligations,
 			scope,
+			self.ast(scope.file_id),
 			segment,
 			params_env,
 			&[],
@@ -2222,6 +2253,21 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// that, no early `return`: `query_stack`'s frame has to pop and
 	/// `state` has to reach `Resolved` no matter which arm runs below, or
 	/// this query is left `InProgress` forever.
+	/// The syntax tree of the file `file_id`, where the ids a declaration
+	/// written there holds are read.
+	pub(super) fn ast(&self, file_id: FileId) -> &'ast ast::AST {
+		self.syntax.get(file_id)
+	}
+
+	/// Where the type `ty`, written in the file `file_id`, is.
+	pub(super) fn type_site(
+		&self,
+		file_id: FileId,
+		ty: ast::TypeId,
+	) -> SourceSpan {
+		SourceSpan::new(file_id, self.ast(file_id).type_span(ty))
+	}
+
 	pub(super) fn ensure_signature(
 		&mut self,
 		sema: &mut Semantics,
@@ -2321,7 +2367,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							.assumption_envs
 							.of_frame(generic_env),
 					},
-					&param.inner.inner.ty,
+					param.inner.inner.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
 				)
 			})
@@ -2337,7 +2383,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					generic_env,
 					assumption_env: sema.assumption_envs.of_frame(generic_env),
 				},
-				result,
+				*result,
 				InferPolicy::Reject(InferSignatureKind::ReturnType),
 			),
 			None => TypeIndex::UNIT,
@@ -2351,6 +2397,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			generic_env,
 			param_types,
 			return_type,
+			self.ast(file_id),
 			signature,
 		);
 		sema.functions[usize::from(function_index)] = FunctionSignature {
@@ -2398,7 +2445,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						generic_env: scope,
 						assumption_env: sema.assumption_envs.of_frame(scope),
 					},
-					&param.inner.inner.ty,
+					param.inner.inner.ty,
 					InferPolicy::Reject(InferSignatureKind::Function),
 				)
 			})
@@ -2428,7 +2475,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				frame: scope,
 				ty: param_types[0],
 				self_type,
-				reference: SourceSpan::new(file_id, param.inner.inner.ty.span),
+				reference: self.type_site(file_id, param.inner.inner.ty),
 			});
 		}
 
@@ -2442,7 +2489,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					generic_env: scope,
 					assumption_env: sema.assumption_envs.of_frame(scope),
 				},
-				result,
+				*result,
 				InferPolicy::Reject(InferSignatureKind::ReturnType),
 			),
 			None => TypeIndex::UNIT,
@@ -2456,6 +2503,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			scope,
 			param_types,
 			return_type,
+			self.ast(file_id),
 			signature,
 		);
 		sema.functions[usize::from(function_index)] = FunctionSignature {
@@ -2476,7 +2524,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		const_index: ConstIdx,
 		scope: GenericEnvIdx,
 		name: Spanned<SymbolU32>,
-		ty: Option<&Spanned<ast::TypeExpression>>,
+		ty: Option<ast::TypeId>,
 	) -> SignatureLocation {
 		let lexical = LexicalScope {
 			file_id,
@@ -2502,7 +2550,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								"an untyped constant in an impl is not supported by the checker yet",
 							)
 							.with_label(
-								SourceSpan::new(file_id, type_expr.span)
+								self.type_site(file_id, type_expr)
 									.primary_label(),
 							),
 					);
@@ -2605,7 +2653,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		namespace: Scope,
 		memory_index: MemoryIdx,
 		name: Spanned<SymbolU32>,
-		size: &Spanned<ast::TypeExpression>,
+		size: ast::TypeId,
 	) -> SignatureLocation {
 		let memory_decl = &sema.decls.memories[usize::from(memory_index)];
 		let trait_impl_index = memory_decl.trait_impl_index;
@@ -2660,7 +2708,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				receiver: memory_type,
 				value: resolved_size,
 			},
-			SourceSpan::new(file_id, size.span),
+			self.type_site(file_id, size),
 			GenericEnvOwner::Trait(memory_trait),
 		);
 
@@ -2701,7 +2749,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						type_params,
 						body,
 						..
-					} => (name, type_params, body.as_deref(), false),
+					} => (name, type_params, *body, false),
 					ast::Item::PackageType {
 						name, type_params, ..
 					} => (name, type_params, None, true),
@@ -2769,9 +2817,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			AstNodeRef::Constant { const_index, item } => {
 				let (name, ty) = match item {
-					ast::Item::Const { name, ty, .. } => (*name, ty.as_deref()),
+					ast::Item::Const { name, ty, .. } => (*name, *ty),
 					ast::Item::PackageConst { name, ty, .. } => {
-						(*name, Some(ty.as_ref()))
+						(*name, Some(*ty))
 					}
 					_ => unreachable!(),
 				};
@@ -2833,7 +2881,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							.assumption_envs
 							.of_frame(self_scope),
 					},
-					supertraits.as_ref(),
+					*supertraits,
 					BoundSubject::Scope(self_scope),
 					subject,
 					name.inner,
@@ -2906,7 +2954,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				};
 				// A literal kind leaves this constant untyped; each use gives it a type.
 				let resolved_ty =
-					self.resolve_constant_type(sema, obligations, lexical, ty);
+					self.resolve_constant_type(sema, obligations, lexical, *ty);
 
 				sema.constants[usize::from(const_index)] = ConstantSignature {
 					ty: resolved_ty,
@@ -2960,7 +3008,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							.assumption_envs
 							.of_frame(self_scope),
 					},
-					bounds.as_ref(),
+					*bounds,
 					BoundSubject::Assoc(assoc_type_index),
 					subject,
 					name.inner,
@@ -2977,7 +3025,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								.assumption_envs
 								.of_frame(self_scope),
 						},
-						value,
+						*value,
 						InferPolicy::Reject(InferSignatureKind::AssocBinding),
 					)
 				});
@@ -3047,7 +3095,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					const_index,
 					scope,
 					*name,
-					ty.as_deref(),
+					*ty,
 				)
 			}
 			AstNodeRef::TraitImplAssocType {
@@ -3092,7 +3140,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					},
 					block_index,
 					assoc_type_index,
-					ty,
+					*ty,
 				);
 
 				// An impl provides a value, it doesn't declare a
@@ -3118,7 +3166,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					memory_index,
 					*name,
-					size,
+					*size,
 				)
 			}
 			AstNodeRef::ImportedMemory {
@@ -3138,7 +3186,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					memory_index,
 					*name,
-					size,
+					*size,
 				)
 			}
 			AstNodeRef::Global { global_index, item } => {
@@ -3172,9 +3220,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 								},
 								global_decl.trait_impl_index,
 								global_decl.value_assoc_type_index,
-								ty,
+								*ty,
 							),
-							span: ty.span,
+							span: self.ast(file_id).type_span(*ty),
 						}
 					}
 					None => {
@@ -3227,9 +3275,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 						},
 						global_decl.trait_impl_index,
 						global_decl.value_assoc_type_index,
-						ty,
+						*ty,
 					),
-					span: ty.span,
+					span: self.ast(file_id).type_span(*ty),
 				};
 				sema.resolve_global_signature(
 					&self.strings,
@@ -3278,7 +3326,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let mut field_types: Vec<TypeIndex> =
 					Vec::with_capacity(fields.len());
 				for f in fields.iter() {
-					let ty_expr = &f.inner.inner.ty;
+					let ty_expr = f.inner.inner.ty;
 					let ty = self.resolve_type(
 						sema,
 						obligations,
@@ -3296,7 +3344,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					self.check_struct_direct_recursion(
 						sema,
 						file_id,
-						ty_expr.span,
+						self.ast(file_id).type_span(ty_expr),
 						ty,
 					);
 					field_types.push(ty);
@@ -3463,7 +3511,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					const_index,
 					scope,
 					*name,
-					ty.as_deref(),
+					*ty,
 				)
 			}
 			AstNodeRef::TraitImplBlock { item, block_index } => {
@@ -3567,7 +3615,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 									.assumption_envs
 									.of_frame(GenericEnvIdx::ROOT),
 							},
-							repr_expr,
+							*repr_expr,
 							InferPolicy::Reject(InferSignatureKind::EnumRepr),
 						);
 						if resolved != TypeIndex::ERROR
@@ -3587,7 +3635,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								.unwrap();
 							let diagnostic = report_enum_repr_not_integer(
 								file_id,
-								repr_expr.span,
+								self.ast(file_id).type_span(*repr_expr),
 								name,
 								sema.decls.declaration_span(typeset.loc),
 							);
@@ -3682,7 +3730,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							.assumption_envs
 							.of_frame(self_scope),
 					},
-					bounds.as_ref(),
+					*bounds,
 					BoundSubject::Scope(self_scope),
 					subject,
 					name.inner,
@@ -3786,7 +3834,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		memory: &Option<Box<[ast::PathSegment]>>,
+		memory: Option<&[ast::PathSegment]>,
 		span: TextSpan,
 		infer_policy: InferPolicy,
 	) -> Result<TypeIndex, ()> {
@@ -3820,16 +3868,17 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		arg: &ast::TypeArgument,
+		arg: ast::TypeArgument,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		match arg {
 			ast::TypeArgument::Type(ty) => {
 				self.resolve_type(sema, obligations, scope, ty, infer_policy)
 			}
-			ast::TypeArgument::Const(constant) => {
-				sema.report_const_argument(scope, constant.span)
-			}
+			ast::TypeArgument::Const(constant) => sema.report_const_argument(
+				scope,
+				self.ast(scope.file_id).const_span(constant),
+			),
 		}
 	}
 
@@ -3839,7 +3888,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		arg: &ast::TypeArgument,
+		arg: ast::TypeArgument,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		match arg {
@@ -3850,9 +3899,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				ty,
 				infer_policy,
 			),
-			ast::TypeArgument::Const(constant) => {
-				sema.report_const_argument(scope, constant.span)
-			}
+			ast::TypeArgument::Const(constant) => sema.report_const_argument(
+				scope,
+				self.ast(scope.file_id).const_span(constant),
+			),
 		}
 	}
 
@@ -3864,18 +3914,19 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		length: &Spanned<ast::ConstArgument>,
+		length: ast::ConstId,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
-		let site = SourceSpan::new(scope.file_id, length.span);
-		let diagnostic = match length.inner {
+		let ast = self.ast(scope.file_id);
+		let site = SourceSpan::new(scope.file_id, ast.const_span(length));
+		let diagnostic = match ast.constant(length) {
 			ast::ConstArgument::Literal(ast::Literal::Int(bits)) => {
 				return sema.types.intern(Type::Value { bits });
 			}
 			ast::ConstArgument::Infer => match infer_policy {
 				InferPolicy::Allow => return TypeIndex::INFER,
 				InferPolicy::Reject(kind) => {
-					report_infer_in_signature(scope.file_id, length.span, kind)
+					report_infer_in_signature(scope.file_id, site.span, kind)
 				}
 			},
 			ast::ConstArgument::Literal(_) => Diagnostic::error()
@@ -3884,22 +3935,21 @@ impl<'ast> SemanticsBuilder<'ast> {
 				.with_label(
 					site.primary_label().with_message("not an integer"),
 				),
-			ast::ConstArgument::Path(ref segments) => {
+			ast::ConstArgument::Path(segments) => {
 				return self.constant_length(
 					sema,
 					obligations,
 					scope,
-					segments,
+					ast.list(segments),
 					site,
 					infer_policy,
 				);
 			}
-			ast::ConstArgument::Grouped {
-				ref inner,
-				ref segments,
-			} => {
-				let (member, prefix) =
-					segments.split_last().expect("a path has a segment");
+			ast::ConstArgument::Grouped { inner, segments } => {
+				let (member, prefix) = ast
+					.list(segments)
+					.split_last()
+					.expect("a path has a segment");
 				let root = self.resolve_type_expression(
 					sema,
 					obligations,
@@ -3929,50 +3979,49 @@ impl<'ast> SemanticsBuilder<'ast> {
 					member,
 				);
 			}
-			ast::ConstArgument::QualifiedPath {
-				ref root,
-				ref segments,
-			} => match &segments[..] {
-				[member] => {
-					let receiver = self.resolve_type_expression(
-						sema,
-						obligations,
-						scope,
-						&root.self_type,
-						infer_policy,
-					);
-					let selected = sema
-						.resolve_trait_bound_path(
-							&self.strings,
-							scope.file_id,
-							scope.namespace,
-							&root.trait_path,
-						)
-						.and_then(|required_trait| {
-							sema.select_qualified_constant(
+			ast::ConstArgument::QualifiedPath { root, segments } => {
+				match ast.list(segments) {
+					[member] => {
+						let receiver = self.resolve_type_expression(
+							sema,
+							obligations,
+							scope,
+							ast.qualified_root(root).self_type,
+							infer_policy,
+						);
+						let selected = sema
+							.resolve_trait_bound_path(
 								&self.strings,
-								obligations,
-								scope,
-								receiver,
-								required_trait,
-								member,
+								scope.file_id,
+								scope.namespace,
+								ast.list(ast.qualified_root(root).trait_path),
 							)
-						});
-					return sema.type_constant_length(
-						&self.strings,
-						scope,
-						selected,
-						member,
-					);
-				}
-				_ => Diagnostic::bug()
-					.with_code(DiagnosticCode::UnsupportedExpression.code())
-					.with_message(
-						"checking a path past a trait-qualified member is not \
+							.and_then(|required_trait| {
+								sema.select_qualified_constant(
+									&self.strings,
+									obligations,
+									scope,
+									receiver,
+									required_trait,
+									member,
+								)
+							});
+						return sema.type_constant_length(
+							&self.strings,
+							scope,
+							selected,
+							member,
+						);
+					}
+					_ => Diagnostic::bug()
+						.with_code(DiagnosticCode::UnsupportedExpression.code())
+						.with_message(
+							"checking a path past a trait-qualified member is not \
 						 supported yet",
-					)
-					.with_label(site.primary_label()),
-			},
+						)
+						.with_label(site.primary_label()),
+				}
+			}
 		};
 		sema.diagnostics.push(diagnostic);
 		TypeIndex::ERROR
@@ -4083,7 +4132,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		type_expr: &Spanned<ast::TypeExpression>,
+		type_expr: ast::TypeId,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let ty = self.resolve_type_expression(
@@ -4097,7 +4146,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			obligations.push(TypeObligation::CheckWellFormed {
 				frame: scope.generic_env,
 				ty,
-				reference: SourceSpan::new(scope.file_id, type_expr.span),
+				reference: self.type_site(scope.file_id, type_expr),
 			});
 		}
 		ty
@@ -4110,7 +4159,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		type_expr: &Spanned<ast::TypeExpression>,
+		type_expr: ast::TypeId,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let ty = self.resolve_type(
@@ -4120,7 +4169,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			type_expr,
 			infer_policy,
 		);
-		sema.record_value_type(obligations, scope, ty, type_expr.span);
+		let span = self.ast(scope.file_id).type_span(type_expr);
+		sema.record_value_type(obligations, scope, ty, span);
 		ty
 	}
 
@@ -4137,7 +4187,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		scope: LexicalScope,
 		impl_index: TraitImplIdx,
 		provider: AssocTypeIdx,
-		type_expr: &Spanned<ast::TypeExpression>,
+		type_expr: ast::TypeId,
 	) -> TypeIndex {
 		let infer_policy =
 			InferPolicy::Reject(InferSignatureKind::AssocBinding);
@@ -4175,7 +4225,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					impl_index,
 					declaration,
 				},
-				reference: SourceSpan::new(scope.file_id, type_expr.span),
+				reference: self.type_site(scope.file_id, type_expr),
 			});
 		}
 		ty
@@ -4208,7 +4258,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				.record(site, Reference::TypeParam { env: frame, index });
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
-				for arg in &first.type_args {
+				for &arg in self.ast(scope.file_id).list(first.type_args) {
 					self.resolve_type_argument_expression(
 						sema,
 						obligations,
@@ -4245,7 +4295,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 			if !first.type_args.is_empty() {
 				// Resolved only to report what is wrong inside them.
-				for arg in &first.type_args {
+				for &arg in self.ast(scope.file_id).list(first.type_args) {
 					self.resolve_type_argument_expression(
 						sema,
 						obligations,
@@ -4257,6 +4307,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let diagnostic = sema.report_type_args_on_impl_self(
 					&self.strings,
 					scope.file_id,
+					self.ast(scope.file_id),
 					first,
 					impl_kind,
 				);
@@ -4335,7 +4386,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						.is_some() =>
 			{
 				// Resolved only to report what is wrong inside them.
-				for arg in &stopped.type_args {
+				for &arg in self.ast(scope.file_id).list(stopped.type_args) {
 					self.resolve_type_argument_expression(
 						sema,
 						obligations,
@@ -4380,10 +4431,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 							type_params,
 							target,
 						} = sema.type_aliases[usize::from(index)];
-						let resolved_args: Box<[TypeIndex]> = stopped
-							.type_args
+						let resolved_args: Box<[TypeIndex]> = self
+							.ast(scope.file_id)
+							.list(stopped.type_args)
 							.iter()
-							.map(|arg| {
+							.map(|&arg| {
 								self.resolve_type_argument_expression(
 									sema,
 									obligations,
@@ -4397,6 +4449,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							&self.strings,
 							obligations,
 							scope,
+							self.ast(scope.file_id),
 							stopped,
 							type_params,
 							&[],
@@ -4443,10 +4496,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let params_env =
 					sema.structs[usize::from(struct_index)].type_params;
 
-				let resolved_args: Box<[TypeIndex]> = stopped
-					.type_args
+				let resolved_args: Box<[TypeIndex]> = self
+					.ast(scope.file_id)
+					.list(stopped.type_args)
 					.iter()
-					.map(|arg| {
+					.map(|&arg| {
 						self.resolve_type_argument_expression(
 							sema,
 							obligations,
@@ -4460,6 +4514,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					&self.strings,
 					obligations,
 					scope,
+					self.ast(scope.file_id),
 					stopped,
 					params_env,
 					&[],
@@ -4471,7 +4526,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			DeclKind::Enum(enum_index) => {
 				if !stopped.type_args.is_empty() {
 					// Resolved only to report what is wrong inside them.
-					for arg in &stopped.type_args {
+					for &arg in self.ast(scope.file_id).list(stopped.type_args)
+					{
 						self.resolve_type_argument_expression(
 							sema,
 							obligations,
@@ -4503,7 +4559,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema.types.intern(Type::Memory { memory_index })
 				} else {
 					// Resolved only to report what is wrong inside them.
-					for arg in &stopped.type_args {
+					for &arg in self.ast(scope.file_id).list(stopped.type_args)
+					{
 						self.resolve_type_argument_expression(
 							sema,
 							obligations,
@@ -4557,10 +4614,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 				let params_env =
 					sema.functions[usize::from(func_index)].type_params;
-				let resolved_args: Box<[TypeIndex]> = stopped
-					.type_args
+				let resolved_args: Box<[TypeIndex]> = self
+					.ast(scope.file_id)
+					.list(stopped.type_args)
 					.iter()
-					.map(|arg| {
+					.map(|&arg| {
 						self.resolve_type_argument_expression(
 							sema,
 							obligations,
@@ -4574,6 +4632,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					&self.strings,
 					obligations,
 					scope,
+					self.ast(scope.file_id),
 					stopped,
 					params_env,
 					&[],
@@ -4589,7 +4648,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema.types.intern(Type::Global { global_index })
 				} else {
 					// Resolved only to report what is wrong inside them.
-					for arg in &stopped.type_args {
+					for &arg in self.ast(scope.file_id).list(stopped.type_args)
+					{
 						self.resolve_type_argument_expression(
 							sema,
 							obligations,
@@ -4658,10 +4718,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 		} else {
 			GenericEnvIdx::ROOT
 		};
-		let written: Box<[TypeIndex]> = segment
-			.type_args
+		let written: Box<[TypeIndex]> = self
+			.ast(scope.file_id)
+			.list(segment.type_args)
 			.iter()
-			.map(|arg| {
+			.map(|&arg| {
 				self.resolve_type_argument_expression(
 					sema,
 					obligations,
@@ -4675,6 +4736,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&self.strings,
 			obligations,
 			scope,
+			self.ast(scope.file_id),
 			segment,
 			own,
 			parent_args,
@@ -4695,7 +4757,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		assoc_type_index: AssocTypeIdx,
 		infer_policy: InferPolicy,
 	) {
-		for arg in &segment.type_args {
+		for &arg in self.ast(scope.file_id).list(segment.type_args) {
 			self.resolve_type_argument_expression(
 				sema,
 				obligations,
@@ -4723,10 +4785,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		type_expr: &Spanned<ast::TypeExpression>,
+		type_expr: ast::TypeId,
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
-		match &type_expr.inner {
+		let ast = self.ast(scope.file_id);
+		match ast.ty(type_expr) {
 			// Reported by the parser.
 			ast::TypeExpression::Error => TypeIndex::ERROR,
 			ast::TypeExpression::Infer => match infer_policy {
@@ -4734,7 +4797,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				InferPolicy::Reject(kind) => {
 					sema.diagnostics.push(report_infer_in_signature(
 						scope.file_id,
-						type_expr.span,
+						ast.type_span(type_expr),
 						kind,
 					));
 					TypeIndex::ERROR
@@ -4746,7 +4809,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema,
 					obligations,
 					scope,
-					segments,
+					ast.list(segments),
 					infer_policy,
 				);
 				if !ty.is_const_kind() {
@@ -4760,11 +4823,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 							"a literal kind is only the type of a constant",
 						)
 						.with_label(
-							SourceSpan::new(scope.file_id, type_expr.span)
-								.primary_label()
-								.with_message(
-									"no value of this type exists at runtime",
-								),
+							SourceSpan::new(
+								scope.file_id,
+								ast.type_span(type_expr),
+							)
+							.primary_label()
+							.with_message(
+								"no value of this type exists at runtime",
+							),
 						)
 						.with_note(
 							"a literal kind types an untyped constant: `const X: const_int = 4;`",
@@ -4789,16 +4855,18 @@ impl<'ast> SemanticsBuilder<'ast> {
 					obligations,
 					scope,
 					current,
-					segments,
+					ast.list(segments),
 					infer_policy,
 				)
 			}
 			ast::TypeExpression::QualifiedPath { root, segments } => {
+				let root = ast.qualified_root(root);
+				let segments = ast.list(segments);
 				let base_ty = self.resolve_type_expression(
 					sema,
 					obligations,
 					scope,
-					&root.self_type,
+					root.self_type,
 					infer_policy,
 				);
 				if base_ty == TypeIndex::ERROR {
@@ -4808,7 +4876,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					&self.strings,
 					scope.file_id,
 					scope.namespace,
-					&root.trait_path,
+					ast.list(root.trait_path),
 				) else {
 					return TypeIndex::ERROR;
 				};
@@ -4887,8 +4955,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// One parameter type: a single one is itself, any other count
 				// is its tuple (`()` for none). Each is held by value.
 				let mut elements = Vec::with_capacity(params.len());
-				for param in params.iter() {
-					let written = &param.inner.inner.ty;
+				for param in ast.list(params) {
+					let written = param.ty;
 					let ty = self.resolve_type_expression(
 						sema,
 						obligations,
@@ -4900,7 +4968,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						obligations,
 						scope,
 						ty,
-						written.span,
+						ast.type_span(written),
 					);
 					elements.push(ty);
 				}
@@ -4918,7 +4986,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							obligations,
 							scope,
 							ty,
-							result.span,
+							ast.type_span(result),
 						);
 						ty
 					}
@@ -4945,8 +5013,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema,
 					obligations,
 					scope,
-					memory,
-					type_expr.span,
+					memory.map(|memory| ast.list(memory)),
+					ast.type_span(type_expr),
 					infer_policy,
 				) else {
 					return TypeIndex::ERROR;
@@ -4955,21 +5023,21 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// `Size`, which must represent it.
 				if let ast::TypeExpression::Array {
 					length: written, ..
-				} = &inner.inner && let Type::Array { length, .. } =
-					*sema.types.resolve(to)
+				} = ast.ty(inner)
+					&& let Type::Array { length, .. } = *sema.types.resolve(to)
 				{
 					sema.length_representable(
 						obligations,
 						scope,
 						memory,
 						length,
-						SourceSpan::new(scope.file_id, written.span),
+						SourceSpan::new(scope.file_id, ast.const_span(written)),
 					);
 				}
 				sema.types.intern(Type::Pointer {
 					to,
 					memory,
-					ownership: *ownership,
+					ownership,
 				})
 			}
 			ast::TypeExpression::Slice { inner } => {
@@ -5005,12 +5073,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			ast::TypeExpression::Tuple { elements } => {
 				let mut elems: Vec<TypeIndex> =
 					Vec::with_capacity(elements.len());
-				for element in elements.iter() {
+				for &element in ast.list(elements) {
 					let ty = self.resolve_type_expression(
 						sema,
 						obligations,
 						scope,
-						&element.inner,
+						element,
 						infer_policy,
 					);
 					elems.push(ty);
@@ -5029,10 +5097,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		type_expr: &Spanned<ast::TypeExpression>,
+		type_expr: ast::TypeId,
 	) -> TypeIndex {
 		let policy = InferPolicy::Reject(InferSignatureKind::Const);
-		let ast::TypeExpression::Path(segments) = &type_expr.inner else {
+		let ast = self.ast(scope.file_id);
+		let ast::TypeExpression::Path(segments) = ast.ty(type_expr) else {
 			return self.resolve_type(
 				sema,
 				obligations,
@@ -5041,13 +5110,21 @@ impl<'ast> SemanticsBuilder<'ast> {
 				policy,
 			);
 		};
-		let ty =
-			self.resolve_type_path(sema, obligations, scope, segments, policy);
+		let ty = self.resolve_type_path(
+			sema,
+			obligations,
+			scope,
+			ast.list(segments),
+			policy,
+		);
 		if ty != TypeIndex::ERROR && !ty.is_const_kind() {
 			obligations.push(TypeObligation::CheckWellFormed {
 				frame: scope.generic_env,
 				ty,
-				reference: SourceSpan::new(scope.file_id, type_expr.span),
+				reference: SourceSpan::new(
+					scope.file_id,
+					ast.type_span(type_expr),
+				),
 			});
 		}
 		ty
@@ -5358,7 +5435,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
-		bound: Option<&Spanned<ast::BoundExpression>>,
+		bound: Option<ast::BoundId>,
 		location: BoundSubject,
 		subject: TypeIndex,
 		name: SymbolU32,
@@ -5446,7 +5523,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		out: &mut Vec<TraitClause>,
 		subject: TypeIndex,
-		occurrences: &[BoundOccurrence<'_>],
+		occurrences: &[BoundOccurrence],
 	) {
 		for occurrence in occurrences {
 			self.collect_trait_clauses(
@@ -5466,7 +5543,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		out: &mut Vec<TraitClause>,
 		subject: TypeIndex,
-		occurrence: &BoundOccurrence<'_>,
+		occurrence: &BoundOccurrence,
 		origin: BoundId,
 	) {
 		push_trait_clause(
@@ -5505,19 +5582,20 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// proven to agree by comparing how many `BoundId`s each had reserved;
 	/// walking a shared `BoundOccurrence` tree instead makes that agreement
 	/// structural rather than an invariant to maintain by hand.
-	fn collect_bound_occurrences<'expr>(
+	fn collect_bound_occurrences(
 		&mut self,
 		sema: &mut Semantics,
 		file_id: FileId,
 		namespace: Scope,
-		expr: &'expr Spanned<ast::BoundExpression>,
-		out: &mut Vec<BoundOccurrence<'expr>>,
+		expr: ast::BoundId,
+		out: &mut Vec<BoundOccurrence>,
 	) {
-		let (segments, bindings) = match &expr.inner {
+		let ast = self.ast(file_id);
+		let (segments, bindings) = match ast.bound(expr) {
 			// Not written yet: the parser reported it, and it states nothing.
 			ast::BoundExpression::Error => return,
 			ast::BoundExpression::BoundList(list) => {
-				for entry in list.iter() {
+				for &entry in ast.list(list) {
 					self.collect_bound_occurrences(
 						sema, file_id, namespace, entry, out,
 					);
@@ -5525,13 +5603,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				return;
 			}
 			ast::BoundExpression::Path(segments) => {
-				(segments.as_ref(), &[][..])
+				(ast.list(segments), &[][..])
 			}
 			ast::BoundExpression::WithBindings { path, bindings } => {
-				let ast::BoundExpression::Path(segments) = path.as_ref() else {
-					unreachable!("WithBindings.path is always a plain Path")
-				};
-				(segments.as_ref(), bindings.as_ref())
+				(ast.list(path), ast.list(bindings))
 			}
 		};
 		let Some(trait_index) = sema.resolve_trait_bound_path(
@@ -5542,10 +5617,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 		) else {
 			return;
 		};
-		let span = SourceSpan::new(file_id, expr.span);
+		let span = SourceSpan::new(file_id, ast.bound_span(expr));
 		let id = sema.bounds.reserve(trait_index, span);
 		let mut occurrence_bindings = Vec::new();
-		for binding in bindings.iter().map(|binding| &binding.inner) {
+		for binding in bindings {
 			let key = match binding.kind {
 				ast::AssocBindingKind::ConstEquals { const_span, .. } => {
 					sema.diagnostics.push(
@@ -5605,7 +5680,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				MemberLookup::Error => continue,
 				_ => None,
 			};
-			let kind = match &binding.kind {
+			let kind = match binding.kind {
 				ast::AssocBindingKind::Equals(ty) => member
 					.and_then(ApplicableMember::type_declaration)
 					.map(|target| BindingOccurrenceKind::Equals(target, ty)),
@@ -5665,7 +5740,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 						&self.strings,
 						SourceSpan::new(
 							file_id,
-							TextSpan::new(binding.name.span.start, ty.span.end),
+							TextSpan::new(
+								binding.name.span.start,
+								ast.type_span(*ty).end,
+							),
 						),
 						target.constant,
 						declared,
@@ -5676,7 +5754,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			if occurrence_bindings
 				.iter()
-				.any(|b: &BindingOccurrence<'expr>| b.kind.same_member(&kind))
+				.any(|b: &BindingOccurrence| b.kind.same_member(&kind))
 			{
 				sema.diagnostics.push(report_duplicate_assoc_type_binding(
 					file_id,
@@ -5710,8 +5788,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		subject: TypeIndex,
-		occurrences: &[BoundOccurrence<'_>],
+		occurrences: &[BoundOccurrence],
 	) {
+		let ast = self.ast(scope.file_id);
 		for occurrence in occurrences {
 			let mut source_bindings =
 				Vec::with_capacity(occurrence.bindings.len());
@@ -5725,14 +5804,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 							sema,
 							obligations,
 							scope,
-							ty,
+							*ty,
 							InferPolicy::Reject(
 								InferSignatureKind::AssocBinding,
 							),
 						);
 						let value = Spanned {
 							inner: value,
-							span: ty.span,
+							span: ast.type_span(*ty),
 						};
 						// The value must be one the trait's associated type
 						// can take: `Size = i32` against `type Size:
@@ -5747,7 +5826,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 									receiver: subject,
 									value: value.inner,
 								},
-								SourceSpan::new(scope.file_id, ty.span),
+								SourceSpan::new(
+									scope.file_id,
+									ast.type_span(*ty),
+								),
 								GenericEnvOwner::Trait(target.trait_index),
 							);
 						}
@@ -5773,7 +5855,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							sema,
 							obligations,
 							scope,
-							ty,
+							*ty,
 							InferPolicy::Reject(
 								InferSignatureKind::AssocBinding,
 							),
@@ -5782,7 +5864,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							*target,
 							Spanned {
 								inner: resolved,
-								span: ty.span,
+								span: ast.type_span(*ty),
 							},
 						)
 					}
@@ -7713,7 +7795,12 @@ pub(super) mod tests {
 			Semantics::new(decls, dispatch, diagnostics, resolutions, strings);
 		check(
 			&mut sema,
-			&mut SemanticsBuilder::new(&graph.files, strings, &ast_nodes),
+			&mut SemanticsBuilder::new(
+				&graph.files,
+				&graph.packages,
+				strings,
+				&ast_nodes,
+			),
 		);
 	}
 
@@ -7950,15 +8037,14 @@ pub(super) mod tests {
 
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
-				.map(|segment| ast::PathSegment {
-					ident: Spanned {
+				.map(|segment| {
+					ast::PathSegment::new(Spanned {
 						inner: self
 							.strings
 							.get(segment)
 							.expect("already interned from source"),
 						span: TextSpan::new(0, 0),
-					},
-					type_args: Box::new([]),
+					})
 				})
 				.collect();
 			let mut scratch = Vec::new();

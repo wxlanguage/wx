@@ -3000,13 +3000,10 @@ mod tests {
 		fn resolve(&self, tier: Tier, name: &str) -> DeclKind {
 			let root = Scope::Package(self.sema.decls.root_package);
 			let file_id = self.sema.decls.namespaces.file_id(root.into());
-			let segment = ast::PathSegment {
-				ident: Spanned {
-					inner: self.strings.get(name).unwrap(),
-					span: TextSpan::new(0, 0),
-				},
-				type_args: Box::new([]),
-			};
+			let segment = ast::PathSegment::new(Spanned {
+				inner: self.strings.get(name).unwrap(),
+				span: TextSpan::new(0, 0),
+			});
 			let mut scratch = Vec::new();
 			let mut resolutions = NameResolutions::default();
 			PathResolver::new(

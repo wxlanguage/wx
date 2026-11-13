@@ -8,7 +8,9 @@ use string_interner::symbol::SymbolU32;
 // Compatibility exports for existing compiler consumers.
 pub use crate::symbols::{Keyword, StringInterner};
 
-use crate::{diagnostics::TextSpan, vfs::FileId};
+use std::marker::PhantomData;
+
+use crate::{diagnostics::TextSpan, index::index_newtype, vfs::FileId};
 
 mod lexer;
 mod parser;
@@ -285,7 +287,7 @@ pub enum Expression {
 	/// (`Call`, `ObjectAccess`, `Index`) like any other primary expression,
 	/// e.g. `<Type as Trait>::method(x)`.
 	QualifiedPath {
-		root: QualifiedPathRoot,
+		root: QualifiedRootId,
 		segments: Box<[PathSegment]>,
 	},
 	/// `<Type>::item` — a bare bracketed type used as a path root, with no
@@ -294,7 +296,7 @@ pub enum Expression {
 	/// `Type::item` would), it's purely for self-types that can't be
 	/// written as a plain path segment (e.g. `<[T]>::method()`).
 	Grouped {
-		inner: Box<Spanned<TypeExpression>>,
+		inner: TypeId,
 		segments: Box<[PathSegment]>,
 	},
 	/// `(a, b, c)`, `(a)`, `(a,)` or `()`: any parenthesized list, as
@@ -307,7 +309,7 @@ pub enum Expression {
 	/// converts nothing.
 	Ascription {
 		value: Box<Spanned<Expression>>,
-		ty: Box<Spanned<TypeExpression>>,
+		ty: TypeId,
 	},
 	/// `[a, b, c]`
 	ArrayList {
@@ -316,7 +318,7 @@ pub enum Expression {
 	/// `[value; count]`; the count is a length, a literal or a constant.
 	ArrayRepeat {
 		value: Box<Spanned<Expression>>,
-		count: Spanned<ConstArgument>,
+		count: ConstId,
 	},
 	/// `expr[index]`
 	Index {
@@ -361,33 +363,39 @@ pub struct MatchArm {
 /// spelling of `type_args` depends on which parser produced the segment —
 /// bare `<...>` from `parse_type_path`, turbofish `::<...>` from
 /// `parse_value_path` — never both; empty when no type args are provided.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct PathSegment {
 	pub ident: Spanned<SymbolU32>,
-	pub type_args: Box<[TypeArgument]>,
+	pub type_args: List<TypeArgument>,
+	/// Where the type arguments are written, from the first to the last;
+	/// empty, at the end of the name, when there are none.
+	pub args_span: TextSpan,
 }
 
 impl PathSegment {
+	/// A segment with no type arguments.
+	pub fn new(ident: Spanned<SymbolU32>) -> Self {
+		Self {
+			ident,
+			type_args: List::EMPTY,
+			args_span: TextSpan::new(ident.span.end, ident.span.end),
+		}
+	}
+
 	/// The name a member access or a path is missing (`x.` or `a::`, with no
 	/// name after it): the error symbol, at the empty span right after the
 	/// `.` or `::`. The parser has reported it, so a lookup of it is silent.
 	fn missing(at: u32) -> Self {
-		Self {
-			ident: Spanned {
-				inner: Keyword::Error.symbol(),
-				span: TextSpan::new(at, at),
-			},
-			type_args: Box::new([]),
-		}
+		Self::new(Spanned {
+			inner: Keyword::Error.symbol(),
+			span: TextSpan::new(at, at),
+		})
 	}
 
 	/// The span of the segment: its name through its last type argument.
 	pub fn span(&self) -> TextSpan {
-		let end = self
-			.type_args
-			.last()
-			.map_or(self.ident.span.end, |argument| argument.span().end);
-		TextSpan::new(self.ident.span.start, end)
+		TextSpan::new(self.ident.span.start, self.args_span.end)
 	}
 
 	/// Whether no name is written here: the parser reported it already.
@@ -424,27 +432,30 @@ impl Path {
 /// `<self_type as trait_path>`, not including the trailing `::item`) rather
 /// than that span having to be reconstructed from separately-threaded
 /// pieces at every diagnostic call site.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct QualifiedPathRoot {
-	pub self_type: Box<Spanned<TypeExpression>>,
-	pub trait_path: Box<[PathSegment]>,
+	pub self_type: TypeId,
+	pub trait_path: List<PathSegment>,
 	pub span: TextSpan,
 }
 
+/// A trait or typeset bound expression.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum BoundExpression {
 	/// A bound the parser expected and did not find (`trait X: {`).
 	Error,
 	/// `Trait` or `module::Trait`
-	Path(Box<[PathSegment]>),
+	Path(List<PathSegment>),
 	/// `Memory where { Size = u32, Size: UnsignedInt }` — trait bound with
 	/// associated-type bindings.
 	WithBindings {
-		path: Box<BoundExpression>,
-		bindings: Box<[Spanned<AssocBinding>]>,
+		path: List<PathSegment>,
+		bindings: List<AssocBinding>,
 	},
 	/// `Bound1 + Bound2 + Bound3` — multiple bounds joined by `+`.
-	BoundList(Box<[Spanned<BoundExpression>]>),
+	BoundList(List<BoundId>),
 }
 
 impl Expression {
@@ -474,13 +485,13 @@ pub enum TypeParam {
 	/// A type, with its trait bounds. `None` = unconstrained.
 	Type {
 		name: Spanned<SymbolU32>,
-		bounds: Option<Spanned<BoundExpression>>,
+		bounds: Option<BoundId>,
 	},
 	/// `const N: Type`, a constant of type `ty`.
 	Const {
 		const_span: TextSpan,
 		name: Spanned<SymbolU32>,
-		ty: Box<Spanned<TypeExpression>>,
+		ty: TypeId,
 	},
 }
 
@@ -495,73 +506,69 @@ impl TypeParam {
 /// One argument in a `<...>` list. What it is follows from its own shape: a
 /// literal is a constant, and anything else is a type unless `const` marks
 /// it as a constant (`const SIZE`).
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TypeArgument {
-	Type(Spanned<TypeExpression>),
-	Const(Spanned<ConstArgument>),
-}
-
-impl TypeArgument {
-	pub fn span(&self) -> TextSpan {
-		match self {
-			Self::Type(ty) => ty.span,
-			Self::Const(constant) => constant.span,
-		}
-	}
+	Type(TypeId),
+	Const(ConstId),
 }
 
 /// A constant argument: `5`, `-1`, `'a'`, or a path marked `const`. An
 /// array's length can also be `_`, left to its context.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ConstArgument {
 	Literal(Literal),
-	Path(Box<[PathSegment]>),
+	Path(List<PathSegment>),
 	/// `<Type as Trait>::NAME`.
 	QualifiedPath {
-		root: QualifiedPathRoot,
-		segments: Box<[PathSegment]>,
+		root: QualifiedRootId,
+		segments: List<PathSegment>,
 	},
 	/// `<Type>::NAME`, for a type no path names (`<heap::&[u8; 4]>::SIZE`).
 	Grouped {
-		inner: Box<Spanned<TypeExpression>>,
-		segments: Box<[PathSegment]>,
+		inner: TypeId,
+		segments: List<PathSegment>,
 	},
 	Infer,
 }
 
+/// A parameter of a function type, `func(i32, self: T)`, named or not.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct FunctionTypeParam {
 	pub name: Option<Spanned<SymbolU32>>,
-	pub ty: Box<Spanned<TypeExpression>>,
+	pub ty: TypeId,
+	pub span: TextSpan,
 }
 
 /// One entry of a `where { .. }` block, constraining a member of the bound's
 /// trait: an associated type (`Size = u32`, `Size: UnsignedInt`) or, marked
 /// `const`, an associated constant (`const LEN: u32`, `const LEN = 4`).
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct AssocBinding {
 	pub name: Spanned<SymbolU32>,
 	pub kind: AssocBindingKind,
+	pub span: TextSpan,
 }
 
 /// What an [`AssocBinding`] states. The `const` keyword alone tells a
 /// constant's entry from a type's.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum AssocBindingKind {
 	/// `Size = u32` — the associated type must equal exactly this type.
-	Equals(Spanned<TypeExpression>),
+	Equals(TypeId),
 	/// `Size: UnsignedInt` — the associated type must satisfy this bound.
-	Bound(Spanned<BoundExpression>),
+	Bound(BoundId),
 	/// `const LEN: u32` — the constant's value must be representable as this
 	/// type.
-	ConstRepresentable {
-		const_span: TextSpan,
-		ty: Spanned<TypeExpression>,
-	},
+	ConstRepresentable { const_span: TextSpan, ty: TypeId },
 	/// `const LEN = 4` — the constant must have this value.
 	ConstEquals {
 		const_span: TextSpan,
-		value: Spanned<ConstArgument>,
+		value: ConstId,
 	},
 }
 
@@ -575,6 +582,7 @@ pub enum Ownership {
 	Shared,
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum TypeExpression {
 	/// A type the parser expected and did not find, already reported; it
@@ -589,16 +597,14 @@ pub enum TypeExpression {
 	/// of segments; any segment (including the first) may carry bare
 	/// `<...>` generic arguments. Turbofish is never accepted in type
 	/// position, only in expression position (see `parse_value_path`).
-	Path(Box<[PathSegment]>),
+	Path(List<PathSegment>),
 	/// `(T, U, V)`, `(T)`, `(T,)` or `()`: any parenthesized list, as
 	/// written. One element is that type, which TIR unwraps.
-	Tuple {
-		elements: Box<[Separated<Spanned<TypeExpression>>]>,
-	},
+	Tuple { elements: List<TypeId> },
 	/// `func(i32, i32) -> i32`
 	Function {
-		params: Box<[Separated<Spanned<FunctionTypeParam>>]>,
-		result: Option<Box<Spanned<TypeExpression>>>,
+		params: List<FunctionTypeParam>,
+		result: Option<TypeId>,
 	},
 	/// `*u8` or `&u8`; `heap::*u8` names the memory it points into, and
 	/// `heap::&[u8]` is a pointer to the slice `[u8]`. The parser accepts
@@ -609,34 +615,38 @@ pub enum TypeExpression {
 	/// against an arbitrary inner type expression.
 	Pointer {
 		ownership: Ownership,
-		memory: Option<Box<[PathSegment]>>,
-		inner: Box<Spanned<TypeExpression>>,
+		memory: Option<List<PathSegment>>,
+		inner: TypeId,
 	},
 	/// `[u8]`, a slice: a run of values in no memory, held by a pointer.
-	Slice { inner: Box<Spanned<TypeExpression>> },
+	Slice { inner: TypeId },
 	/// `[u8; 5]` or `[u8; N]`, an array: a slice of a known length.
 	Array {
-		inner: Box<Spanned<TypeExpression>>,
+		inner: TypeId,
 		/// A literal or a constant, as a constant argument is.
-		length: Spanned<ConstArgument>,
+		length: ConstId,
 	},
 	/// `<Type as Trait>::Item` — a qualified path that pins down exactly
 	/// which trait's item is meant, disambiguating a name that would
 	/// otherwise be ambiguous (or first-match) across multiple bounds/impls
 	/// on `self_type`.
 	QualifiedPath {
-		root: QualifiedPathRoot,
-		segments: Box<[PathSegment]>,
+		root: QualifiedRootId,
+		segments: List<PathSegment>,
 	},
 	/// `<Type>::Item` — a bare bracketed type used as a path root, with no
 	/// trait qualification. See `Expression::Grouped` for why this is kept
 	/// distinct from `QualifiedPath` rather than making its `trait_path`
 	/// optional.
 	Grouped {
-		inner: Box<Spanned<TypeExpression>>,
-		segments: Box<[PathSegment]>,
+		inner: TypeId,
+		segments: List<PathSegment>,
 	},
 }
+
+const _: () = assert!(size_of::<TypeExpression>() <= 24);
+const _: () = assert!(size_of::<ConstArgument>() <= 24);
+const _: () = assert!(size_of::<BoundExpression>() <= 24);
 
 /// A pattern, as written. What each term *is* follows from its own shape:
 /// a name binds, a literal compares with that value, a qualified path
@@ -723,6 +733,7 @@ pub struct PatternField {
 
 /// A literal written where a value is compared or given as a type
 /// argument: a pattern's, or a constant argument's.
+#[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Literal {
 	/// `1`; the value is the number itself.
@@ -750,7 +761,7 @@ pub enum Statement {
 	/// `local <pattern> [: type] = {expr}`
 	LocalDefinition {
 		pattern: Spanned<Pattern>,
-		ty: Option<Box<Spanned<TypeExpression>>>,
+		ty: Option<TypeId>,
 		value: Box<Spanned<Expression>>,
 	},
 }
@@ -794,7 +805,7 @@ impl Binding {
 /// `self: Type`.
 pub struct FunctionParam {
 	pub binding: Option<Binding>,
-	pub ty: Box<Spanned<TypeExpression>>,
+	pub ty: TypeId,
 }
 
 /// The payload of an attribute.
@@ -829,7 +840,7 @@ pub enum ImplItem {
 	Constant {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		ty: Option<Box<Spanned<TypeExpression>>>,
+		ty: Option<TypeId>,
 		value: Box<Spanned<Expression>>,
 		attributes: Box<[Attribute]>,
 	},
@@ -840,7 +851,7 @@ pub enum ImplItem {
 		/// dropping it here made the formatter delete `pub` from the source.
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		ty: Box<Spanned<TypeExpression>>,
+		ty: TypeId,
 		attributes: Box<[Attribute]>,
 	},
 }
@@ -870,7 +881,7 @@ pub enum TraitItem {
 	Const {
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
-		ty: Box<Spanned<TypeExpression>>,
+		ty: TypeId,
 		value: Option<Box<Spanned<Expression>>>,
 	},
 	/// An associated type declaration, optionally with a default value.
@@ -878,9 +889,9 @@ pub enum TraitItem {
 		name: Spanned<SymbolU32>,
 		attributes: Box<[Attribute]>,
 		/// Trait bounds the concrete type must satisfy. `None` = unconstrained.
-		bounds: Option<Spanned<BoundExpression>>,
+		bounds: Option<BoundId>,
 		/// Used when an impl does not provide this associated type.
-		value: Option<Box<Spanned<TypeExpression>>>,
+		value: Option<TypeId>,
 	},
 }
 
@@ -899,7 +910,7 @@ pub struct FunctionSignature {
 	/// Generic type parameters `<T, U: Bound>`. Empty = monomorphic.
 	pub type_params: Box<[Spanned<TypeParam>]>,
 	pub params: Box<[Separated<Spanned<FunctionParam>>]>,
-	pub result: Option<Box<Spanned<TypeExpression>>>,
+	pub result: Option<TypeId>,
 }
 
 /// One node of a `use` tree. `use a::b::*` is
@@ -953,11 +964,11 @@ pub enum ImportDeclaration {
 	Global {
 		mut_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		ty: Box<Spanned<TypeExpression>>,
+		ty: TypeId,
 	},
 	Memory {
 		name: Spanned<SymbolU32>,
-		size: Box<Spanned<TypeExpression>>,
+		size: TypeId,
 	},
 }
 
@@ -1017,7 +1028,7 @@ pub enum Item {
 		crate_span: TextSpan,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
-		ty: Box<Spanned<TypeExpression>>,
+		ty: TypeId,
 	},
 	PackageType {
 		pub_span: Option<TextSpan>,
@@ -1030,7 +1041,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		mut_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		ty: Option<Box<Spanned<TypeExpression>>>,
+		ty: Option<TypeId>,
 		value: Box<Spanned<Expression>>,
 		attributes: Box<[Attribute]>,
 	},
@@ -1049,7 +1060,7 @@ pub enum Item {
 	},
 	Enum {
 		pub_span: Option<TextSpan>,
-		repr: Option<Box<Spanned<TypeExpression>>>,
+		repr: Option<TypeId>,
 		name: Spanned<SymbolU32>,
 		entries: Box<[Separated<Spanned<EnumEntry>>]>,
 		attributes: Box<[Attribute]>,
@@ -1083,12 +1094,12 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
-		size: Box<Spanned<TypeExpression>>,
+		size: TypeId,
 	},
 	Const {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
-		ty: Option<Box<Spanned<TypeExpression>>>,
+		ty: Option<TypeId>,
 		value: Box<Spanned<Expression>>,
 		attributes: Box<[Attribute]>,
 	},
@@ -1116,7 +1127,7 @@ pub enum Item {
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
 		/// Supertrait bounds: `trait X: Y + Z { ... }`.  `None` = no bounds.
-		supertraits: Option<Spanned<BoundExpression>>,
+		supertraits: Option<BoundId>,
 		items: Box<[Separated<Spanned<TraitItem>>]>,
 	},
 	/// `typeset Name: A + B { T1, T2, ... }` — a closed compile-time set of
@@ -1127,7 +1138,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		attributes: Box<[Attribute]>,
 		name: Spanned<SymbolU32>,
-		bounds: Option<Spanned<BoundExpression>>,
+		bounds: Option<BoundId>,
 		/// `SeparatedGroup` always wraps each item in `Spanned<T>`; `Path`'s
 		/// own `span()` makes that wrapper redundant here, but there's no
 		/// avoiding it without changing `SeparatedGroup` itself.
@@ -1146,7 +1157,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		name: Spanned<SymbolU32>,
 		type_params: Box<[Spanned<TypeParam>]>,
-		body: Option<Box<Spanned<TypeExpression>>>,
+		body: Option<TypeId>,
 		attributes: Box<[Attribute]>,
 	},
 }
@@ -1157,7 +1168,7 @@ pub struct StructField {
 	/// `None` for a positional field: `struct Pair(i32, i32);`. A binding's
 	/// `mut` is parsed; what it allows is not checked yet.
 	pub binding: Option<Binding>,
-	pub ty: Box<Spanned<TypeExpression>>,
+	pub ty: TypeId,
 }
 
 impl Item {
@@ -1220,6 +1231,117 @@ impl Item {
 	}
 }
 
+index_newtype!(
+	/// A type expression, in its file's [`AST`].
+	TypeId
+);
+index_newtype!(
+	/// A constant argument (a length, a `const` type argument), in its
+	/// file's [`AST`].
+	ConstId
+);
+index_newtype!(
+	/// A bound, in its file's [`AST`].
+	BoundId
+);
+index_newtype!(
+	/// The `<Type as Trait>` of a qualified path, in its file's [`AST`].
+	QualifiedRootId
+);
+
+/// A run of one of the [`AST`]'s lists, read with [`AST::list`]: the
+/// segments of a path, the arguments of a segment, the elements of a tuple
+/// type. A list is written once, whole, so its items are contiguous.
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub struct List<T> {
+	start: u32,
+	len: u32,
+	#[cfg_attr(any(debug_assertions, test), serde(skip))]
+	of: PhantomData<T>,
+}
+
+impl<T> Clone for List<T> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+impl<T> Copy for List<T> {}
+
+impl<T> List<T> {
+	pub const EMPTY: Self = Self {
+		start: 0,
+		len: 0,
+		of: PhantomData,
+	};
+
+	pub fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub fn is_empty(self) -> bool {
+		self.len == 0
+	}
+}
+
+/// What an [`AST`] holds in a list, and which of its vectors holds it.
+pub trait Listed: Sized {
+	fn store(ast: &AST) -> &Vec<Self>;
+	fn store_mut(ast: &mut AST) -> &mut Vec<Self>;
+}
+
+macro_rules! listed {
+	($($item:ty => $field:ident),+ $(,)?) => {
+		$(impl Listed for $item {
+			fn store(ast: &AST) -> &Vec<Self> {
+				&ast.$field
+			}
+			fn store_mut(ast: &mut AST) -> &mut Vec<Self> {
+				&mut ast.$field
+			}
+		})+
+	};
+}
+
+listed! {
+	PathSegment => segments,
+	TypeArgument => type_args,
+	TypeId => type_lists,
+	BoundId => bound_lists,
+	AssocBinding => assoc_bindings,
+	FunctionTypeParam => function_type_params,
+}
+
+/// A column of nodes of one kind, each with its span; a node's id is its
+/// position.
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+struct Column<K> {
+	kinds: Vec<K>,
+	spans: Vec<TextSpan>,
+}
+
+impl<K> Default for Column<K> {
+	fn default() -> Self {
+		Self {
+			kinds: Vec::new(),
+			spans: Vec::new(),
+		}
+	}
+}
+
+impl<K> Column<K> {
+	fn push(&mut self, kind: K, span: TextSpan) -> u32 {
+		let index = u32::try_from(self.kinds.len()).unwrap();
+		self.kinds.push(kind);
+		self.spans.push(span);
+		index
+	}
+}
+
+/// One file's syntax tree. Type syntax lives in columns addressed by id (a
+/// child before its parent) and lists by [`List`]; items, expressions and
+/// patterns are still a tree, holding those ids
+/// (`notes/ast-arena-plan.md`).
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct AST {
 	pub file_id: FileId,
@@ -1227,4 +1349,123 @@ pub struct AST {
 	pub items: Vec<Separated<Spanned<Item>>>,
 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub comments: CommentMap,
+	types: Column<TypeExpression>,
+	consts: Column<ConstArgument>,
+	bounds: Column<BoundExpression>,
+	qualified_roots: Vec<QualifiedPathRoot>,
+	segments: Vec<PathSegment>,
+	type_args: Vec<TypeArgument>,
+	type_lists: Vec<TypeId>,
+	bound_lists: Vec<BoundId>,
+	assoc_bindings: Vec<AssocBinding>,
+	function_type_params: Vec<FunctionTypeParam>,
+}
+
+impl AST {
+	fn new(file_id: FileId) -> Self {
+		Self {
+			file_id,
+			diagnostics: Vec::new(),
+			items: Vec::new(),
+			comments: CommentMap::empty(),
+			types: Column::default(),
+			consts: Column::default(),
+			bounds: Column::default(),
+			qualified_roots: Vec::new(),
+			segments: Vec::new(),
+			type_args: Vec::new(),
+			type_lists: Vec::new(),
+			bound_lists: Vec::new(),
+			assoc_bindings: Vec::new(),
+			function_type_params: Vec::new(),
+		}
+	}
+
+	pub fn ty(&self, id: TypeId) -> TypeExpression {
+		self.types.kinds[usize::from(id)]
+	}
+
+	pub fn type_span(&self, id: TypeId) -> TextSpan {
+		self.types.spans[usize::from(id)]
+	}
+
+	pub fn constant(&self, id: ConstId) -> ConstArgument {
+		self.consts.kinds[usize::from(id)]
+	}
+
+	pub fn const_span(&self, id: ConstId) -> TextSpan {
+		self.consts.spans[usize::from(id)]
+	}
+
+	pub fn bound(&self, id: BoundId) -> BoundExpression {
+		self.bounds.kinds[usize::from(id)]
+	}
+
+	pub fn bound_span(&self, id: BoundId) -> TextSpan {
+		self.bounds.spans[usize::from(id)]
+	}
+
+	pub fn qualified_root(&self, id: QualifiedRootId) -> QualifiedPathRoot {
+		self.qualified_roots[usize::from(id)]
+	}
+
+	pub fn list<T: Listed>(&self, list: List<T>) -> &[T] {
+		&T::store(self)[list.start as usize..][..list.len as usize]
+	}
+
+	pub fn type_argument_span(&self, argument: TypeArgument) -> TextSpan {
+		match argument {
+			TypeArgument::Type(ty) => self.type_span(ty),
+			TypeArgument::Const(constant) => self.const_span(constant),
+		}
+	}
+
+	/// The span of a non-empty path, from its first segment's name to its
+	/// last's, not including trailing type arguments.
+	pub fn path_span(segments: &[PathSegment]) -> TextSpan {
+		TextSpan::new(
+			segments.first().unwrap().ident.span.start,
+			segments.last().unwrap().ident.span.end,
+		)
+	}
+
+	fn push_type(&mut self, kind: TypeExpression, span: TextSpan) -> TypeId {
+		TypeId::new(self.types.push(kind, span))
+	}
+
+	fn push_const(&mut self, kind: ConstArgument, span: TextSpan) -> ConstId {
+		ConstId::new(self.consts.push(kind, span))
+	}
+
+	fn push_bound(&mut self, kind: BoundExpression, span: TextSpan) -> BoundId {
+		BoundId::new(self.bounds.push(kind, span))
+	}
+
+	fn push_qualified_root(
+		&mut self,
+		root: QualifiedPathRoot,
+	) -> QualifiedRootId {
+		let id = QualifiedRootId::new(
+			u32::try_from(self.qualified_roots.len()).unwrap(),
+		);
+		self.qualified_roots.push(root);
+		id
+	}
+
+	/// Writes `items` as one list, contiguous: a list's items are all parsed
+	/// before it is written, so a nested list never lands inside it.
+	fn push_list<T: Listed>(
+		&mut self,
+		items: impl IntoIterator<Item = T>,
+	) -> List<T> {
+		let store = T::store_mut(self);
+		let start = u32::try_from(store.len()).unwrap();
+		store.extend(items);
+		let len = u32::try_from(store.len()).unwrap() - start;
+		List {
+			start,
+			len,
+			of: PhantomData,
+		}
+	}
 }

@@ -71,15 +71,16 @@ impl Semantics {
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
+		ast: &ast::AST,
 		segment: &ast::PathSegment,
 		params_env: GenericEnvIdx,
 		parent_args: &[TypeIndex],
 		args: &[TypeIndex],
 		owner: GenericEnvOwner,
 	) -> Box<[TypeIndex]> {
-		if !self
-			.check_type_arg_count(strings, scope, segment, params_env, owner)
-		{
+		if !self.check_type_arg_count(
+			strings, scope, ast, segment, params_env, owner,
+		) {
 			let expected = self.generic_envs.param_names(params_env).len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
@@ -92,7 +93,10 @@ impl Semantics {
 			"a bound is substituted over the frame's whole chain"
 		);
 		let parents = parent_args.iter().map(|&ty| (ty, segment.ident.span));
-		let written = segment.type_args.iter().map(|written| written.span());
+		let written = ast
+			.list(segment.type_args)
+			.iter()
+			.map(|&written| ast.type_argument_span(written));
 		let generic_args = self
 			.generic_args
 			.push(parents.chain(args.iter().copied().zip(written)));
@@ -115,6 +119,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		scope: LexicalScope,
+		ast: &ast::AST,
 		segment: &ast::PathSegment,
 		params_env: GenericEnvIdx,
 		owner: GenericEnvOwner,
@@ -127,6 +132,7 @@ impl Semantics {
 			strings,
 			&self.decls,
 			scope.file_id,
+			ast,
 			segment,
 			owner,
 			self.generic_envs.param_names(params_env),
@@ -819,24 +825,17 @@ pub(super) fn report_type_args_not_allowed(
 		),
 	};
 	let name = strings.resolve(segment.ident.inner).unwrap();
-	let (first, last) = (
-		segment.type_args.first().unwrap(),
-		segment.type_args.last().unwrap(),
-	);
 	let mut labels = vec![
-		SourceSpan::new(
-			file_id,
-			TextSpan::new(first.span().start, last.span().end),
-		)
-		.primary_label()
-		.with_message(format!(
-			"type argument{} not allowed",
-			if segment.type_args.len() == 1 {
-				""
-			} else {
-				"s"
-			}
-		)),
+		SourceSpan::new(file_id, segment.args_span)
+			.primary_label()
+			.with_message(format!(
+				"type argument{} not allowed",
+				if segment.type_args.len() == 1 {
+					""
+				} else {
+					"s"
+				}
+			)),
 		SourceSpan::new(file_id, segment.ident.span)
 			.secondary_label()
 			.with_message(format!("not allowed on {noun} `{name}`")),
@@ -865,6 +864,7 @@ fn report_type_arg_count_mismatch(
 	strings: &StringInterner,
 	decls: &Declarations,
 	file_id: FileId,
+	ast: &ast::AST,
 	segment: &ast::PathSegment,
 	owner: GenericEnvOwner,
 	params: &[Spanned<SymbolU32>],
@@ -873,7 +873,7 @@ fn report_type_arg_count_mismatch(
 	let declaration = owner.name(decls).map(|declared| {
 		(SourceSpan::new(owner.file_id(decls), declared.span), params)
 	});
-	let args = &segment.type_args;
+	let args = ast.list(segment.type_args);
 	let params = declaration.map_or(&[][..], |(_, params)| params);
 	let expected = params.len();
 	let found = args.len();
@@ -887,8 +887,9 @@ fn report_type_arg_count_mismatch(
 				plural(expected)
 			)),
 	];
-	for (index, arg) in args.iter().enumerate() {
-		let label = SourceSpan::new(file_id, arg.span()).secondary_label();
+	for (index, &arg) in args.iter().enumerate() {
+		let label = SourceSpan::new(file_id, ast.type_argument_span(arg))
+			.secondary_label();
 		labels.push(if index + 1 == args.len() {
 			if expected == 0 {
 				label.with_message("remove the unnecessary generics")
@@ -979,15 +980,14 @@ mod tests {
 			let file_id = self.sema.decls.namespaces.file_id(root.into());
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
-				.map(|segment| ast::PathSegment {
-					ident: Spanned {
+				.map(|segment| {
+					ast::PathSegment::new(Spanned {
 						inner: self
 							.strings
 							.get(segment)
 							.expect("already interned from source"),
 						span: TextSpan::new(0, 0),
-					},
-					type_args: Box::new([]),
+					})
 				})
 				.collect();
 			let mut diagnostics = Vec::new();

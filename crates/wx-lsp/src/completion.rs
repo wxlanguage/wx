@@ -14,11 +14,12 @@ use tower_lsp_server::ls_types::{
 	InsertTextFormat,
 };
 use wx_compiler::ast::{
-	AST, AssocBindingKind, BoundExpression, Comment, ConstArgument,
-	Destructure, EnumEntry, Expression, FunctionSignature, ImplItem,
-	ImportDeclaration, ImportEntry, Item, NamedArgument, Path, PathSegment,
-	Pattern, PatternElement, PatternFieldItem, QualifiedPathRoot, Separated,
-	Spanned, Statement, TraitItem, TypeArgument, TypeExpression, TypeParam,
+	AST, AssocBinding, AssocBindingKind, BoundExpression, BoundId, Comment,
+	ConstArgument, ConstId, Destructure, EnumEntry, Expression,
+	FunctionSignature, FunctionTypeParam, ImplItem, ImportDeclaration,
+	ImportEntry, Item, NamedArgument, Path, PathSegment, Pattern,
+	PatternElement, PatternFieldItem, QualifiedPathRoot, Separated, Spanned,
+	Statement, TraitItem, TypeArgument, TypeExpression, TypeId, TypeParam,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::tir::{DeclKind, Definition, LabelKind, NameUse};
@@ -290,7 +291,7 @@ fn item(
 /// cursor is found by a binary search of its siblings, which are in source
 /// order and do not overlap.
 pub(crate) fn position_at(ast: &AST, offset: u32) -> Option<Position> {
-	let cursor = Cursor { offset };
+	let cursor = Cursor { offset, ast };
 	// Inside a comment: its start is the `//` itself, its end the line's.
 	let comment = cursor.child(&ast.comments.0);
 	if comment.is_some_and(|comment| comment.span.start < offset) {
@@ -322,9 +323,15 @@ impl Node for PathSegment {
 	}
 }
 
-impl Node for TypeArgument {
+impl Node for AssocBinding {
 	fn span(&self) -> TextSpan {
-		TypeArgument::span(self)
+		self.span
+	}
+}
+
+impl Node for FunctionTypeParam {
+	fn span(&self) -> TextSpan {
+		self.span
 	}
 }
 
@@ -334,11 +341,13 @@ impl Node for Comment {
 	}
 }
 
-struct Cursor {
+struct Cursor<'a> {
 	offset: u32,
+	/// The file's tree, where its type syntax is read by id.
+	ast: &'a AST,
 }
 
-impl Cursor {
+impl Cursor<'_> {
 	/// Whether the cursor touches `span`: inside it, or at either end, where
 	/// a name being typed ends.
 	fn at(&self, span: TextSpan) -> bool {
@@ -358,6 +367,19 @@ impl Cursor {
 		Some(&siblings[self.child_index(siblings)?])
 	}
 
+	/// `child`, for siblings whose spans are read through the tree (`span`):
+	/// the ids of types, bounds and type arguments.
+	fn child_by<'s, T>(
+		&self,
+		siblings: &'s [T],
+		span: impl Fn(&T) -> TextSpan,
+	) -> Option<&'s T> {
+		let index =
+			siblings.partition_point(|sibling| span(sibling).end < self.offset);
+		let child = siblings.get(index)?;
+		self.at(span(child)).then_some(child)
+	}
+
 	/// Where in `siblings` the one `child` finds is.
 	fn child_index<T: Node>(&self, siblings: &[T]) -> Option<usize> {
 		let index = siblings
@@ -374,7 +396,8 @@ impl Cursor {
 			| Item::PackageFunction { signature, .. } => self.function(signature, None),
 			Item::PackageConst { name, ty, .. }
 			| Item::Memory { name, size: ty, .. } => {
-				Within::Signature(Anchor::Name(name.span)).position(self.ty(ty))
+				Within::Signature(Anchor::Name(name.span))
+					.position(self.ty(*ty))
 			}
 			Item::PackageType {
 				name, type_params, ..
@@ -385,14 +408,14 @@ impl Cursor {
 			}
 			| Item::Const {
 				name, ty, value, ..
-			} => self.constant(name.span, ty.as_deref(), Some(value)),
+			} => self.constant(name.span, *ty, Some(value)),
 			Item::Enum {
 				name,
 				repr,
 				entries,
 				..
 			} => Within::Signature(Anchor::Name(name.span))
-				.position(repr.as_deref().and_then(|repr| self.ty(repr)))
+				.position(repr.and_then(|repr| self.ty(repr)))
 				.or_else(|| match &self.child(entries)?.inner.inner {
 					EnumEntry::Variant(variant) => {
 						Within::Body(variant.name.span)
@@ -407,7 +430,7 @@ impl Cursor {
 				..
 			} => Within::Signature(Anchor::Name(name.span)).position(
 				self.type_params(type_params)
-					.or_else(|| self.ty(&self.child(fields)?.inner.inner.ty)),
+					.or_else(|| self.ty(self.child(fields)?.inner.inner.ty)),
 			),
 			Item::TypeAlias {
 				name,
@@ -415,8 +438,7 @@ impl Cursor {
 				body,
 				..
 			} => Within::Signature(Anchor::Name(name.span)).position(
-				self.type_params(type_params)
-					.or_else(|| self.ty(body.as_deref()?)),
+				self.type_params(type_params).or_else(|| self.ty((*body)?)),
 			),
 			Item::TypeSet {
 				name,
@@ -426,7 +448,7 @@ impl Cursor {
 			} => Within::Signature(Anchor::Name(name.span)).position(
 				bounds
 					.as_ref()
-					.and_then(|bounds| self.bound(bounds))
+					.and_then(|bounds| self.bound(*bounds))
 					.or_else(|| {
 						let member = self.child(members)?;
 						self.path(&member.inner.inner.segments, NameUse::Type)
@@ -443,7 +465,7 @@ impl Cursor {
 					.position(
 						supertraits
 							.as_ref()
-							.and_then(|bounds| self.bound(bounds)),
+							.and_then(|bounds| self.bound(*bounds)),
 					)
 					.or_else(|| match &self.child(items)?.inner.inner {
 						TraitItem::Function {
@@ -451,17 +473,19 @@ impl Cursor {
 						} => self.function(signature, body.as_deref()),
 						TraitItem::Const {
 							name, ty, value, ..
-						} => {
-							self.constant(name.span, Some(ty), value.as_deref())
-						}
+						} => self.constant(
+							name.span,
+							Some(*ty),
+							value.as_deref(),
+						),
 						// Read in the trait's scope, where `Self` is the
 						// trait's.
 						TraitItem::AssociatedType { bounds, value, .. } => {
 							header.position(
 								bounds
 									.as_ref()
-									.and_then(|bounds| self.bound(bounds))
-									.or_else(|| self.ty(value.as_ref()?)),
+									.and_then(|bounds| self.bound(*bounds))
+									.or_else(|| self.ty(*value.as_ref()?)),
 							)
 						}
 					})
@@ -490,7 +514,7 @@ impl Cursor {
 					ImportDeclaration::Global { name, ty, .. }
 					| ImportDeclaration::Memory { name, size: ty } => {
 						Within::Signature(Anchor::Name(name.span))
-							.position(self.ty(ty))
+							.position(self.ty(*ty))
 					}
 				}
 			}
@@ -514,8 +538,10 @@ impl Cursor {
 		let name = signature.name.span;
 		let site = self
 			.type_params(&signature.type_params)
-			.or_else(|| self.ty(&self.child(&signature.params)?.inner.inner.ty))
-			.or_else(|| self.ty(signature.result.as_deref()?));
+			.or_else(|| {
+				self.ty(self.child(&signature.params)?.inner.inner.ty)
+			})
+			.or_else(|| self.ty(signature.result?));
 		Within::Signature(Anchor::Name(name))
 			.position(site)
 			.or_else(|| Within::Body(name).position(self.expression(body?)))
@@ -525,7 +551,7 @@ impl Cursor {
 	fn constant(
 		&self,
 		name: TextSpan,
-		ty: Option<&Spanned<TypeExpression>>,
+		ty: Option<TypeId>,
 		value: Option<&Spanned<Expression>>,
 	) -> Option<Position> {
 		Within::Signature(Anchor::Name(name))
@@ -553,39 +579,40 @@ impl Cursor {
 				} => self.function(signature, Some(block)),
 				ImplItem::Constant {
 					name, ty, value, ..
-				} => self.constant(name.span, ty.as_deref(), Some(value)),
+				} => self.constant(name.span, *ty, Some(value)),
 				// Read in the impl's scope.
-				ImplItem::AssocType { ty, .. } => header.position(self.ty(ty)),
+				ImplItem::AssocType { ty, .. } => header.position(self.ty(*ty)),
 			}
 		})
 	}
 
 	fn type_params(&self, params: &[Spanned<TypeParam>]) -> Option<Site> {
-		match &self.child(params)?.inner {
-			TypeParam::Type { bounds, .. } => self.bound(bounds.as_ref()?),
+		match self.child(params)?.inner {
+			TypeParam::Type { bounds, .. } => self.bound(bounds?),
 			TypeParam::Const { ty, .. } => self.ty(ty),
 		}
 	}
 
-	fn bound(&self, bound: &Spanned<BoundExpression>) -> Option<Site> {
-		if !self.at(bound.span) {
+	fn bound(&self, bound: BoundId) -> Option<Site> {
+		if !self.at(self.ast.bound_span(bound)) {
 			return None;
 		}
-		self.bound_expression(&bound.inner)
+		self.bound_expression(self.ast.bound(bound))
 	}
 
 	/// A bound names a trait or a typeset; a binding's own name (`Size` in
 	/// `where { Size = u32 }`) is a member of it, not completed yet.
-	fn bound_expression(&self, bound: &BoundExpression) -> Option<Site> {
+	fn bound_expression(&self, bound: BoundExpression) -> Option<Site> {
+		let ast = self.ast;
 		match bound {
 			// A bound the parser expected and did not find.
 			BoundExpression::Error => Some(Site::Name(NameUse::Bound)),
 			BoundExpression::Path(segments) => {
-				self.path(segments, NameUse::Bound)
+				self.path(ast.list(segments), NameUse::Bound)
 			}
 			BoundExpression::WithBindings { path, bindings } => self
-				.bound_expression(path)
-				.or_else(|| match &self.child(bindings)?.inner.kind {
+				.path(ast.list(path), NameUse::Bound)
+				.or_else(|| match self.child(ast.list(bindings))?.kind {
 					AssocBindingKind::Equals(ty)
 					| AssocBindingKind::ConstRepresentable { ty, .. } => self.ty(ty),
 					AssocBindingKind::Bound(bound) => self.bound(bound),
@@ -593,9 +620,9 @@ impl Cursor {
 						self.const_argument(value)
 					}
 				}),
-			BoundExpression::BoundList(bounds) => {
-				self.bound(self.child(bounds)?)
-			}
+			BoundExpression::BoundList(bounds) => self.bound(
+				*self.child_by(ast.list(bounds), |&b| ast.bound_span(b))?,
+			),
 		}
 	}
 
@@ -604,7 +631,7 @@ impl Cursor {
 			Statement::Expression(expression) => self.expression(expression),
 			Statement::LocalDefinition { pattern, ty, value } => self
 				.pattern(&pattern.inner, pattern.span)
-				.or_else(|| self.ty(ty.as_deref()?))
+				.or_else(|| self.ty((*ty)?))
 				.or_else(|| self.expression(value)),
 		}
 	}
@@ -687,16 +714,18 @@ impl Cursor {
 				})
 			}
 			Expression::Loop { block, .. } => self.expression(block),
-			Expression::QualifiedPath { root, .. } => self.qualified_root(root),
-			Expression::Grouped { inner, .. } => self.ty(inner),
+			Expression::QualifiedPath { root, .. } => {
+				self.qualified_root(self.ast.qualified_root(*root))
+			}
+			Expression::Grouped { inner, .. } => self.ty(*inner),
 			Expression::Tuple { elements }
 			| Expression::ArrayList { elements } => self.list(expression.span, elements),
 			Expression::Ascription { value, ty } => {
-				self.expression(value).or_else(|| self.ty(ty))
+				self.expression(value).or_else(|| self.ty(*ty))
 			}
 			Expression::ArrayRepeat { value, count } => self
 				.expression(value)
-				.or_else(|| self.const_argument(count)),
+				.or_else(|| self.const_argument(*count)),
 			Expression::Index { object, index } => {
 				self.expression(object).or_else(|| self.expression(index))
 			}
@@ -756,23 +785,24 @@ impl Cursor {
 		})
 	}
 
-	fn ty(&self, ty: &Spanned<TypeExpression>) -> Option<Site> {
-		if !self.at(ty.span) {
+	fn ty(&self, ty: TypeId) -> Option<Site> {
+		let ast = self.ast;
+		if !self.at(ast.type_span(ty)) {
 			return None;
 		}
-		match &ty.inner {
+		match ast.ty(ty) {
 			// A type the parser expected and did not find.
 			TypeExpression::Error => Some(Site::Name(NameUse::Type)),
 			TypeExpression::Path(segments) => {
-				self.path(segments, NameUse::Type)
+				self.path(ast.list(segments), NameUse::Type)
 			}
-			TypeExpression::Tuple { elements } => {
-				self.ty(&self.child(elements)?.inner)
-			}
+			TypeExpression::Tuple { elements } => self
+				.ty(*self
+					.child_by(ast.list(elements), |&e| ast.type_span(e))?),
 			TypeExpression::Function { params, result } => self
-				.child(params)
-				.and_then(|param| self.ty(&param.inner.inner.ty))
-				.or_else(|| self.ty(result.as_ref()?)),
+				.child(ast.list(params))
+				.and_then(|param| self.ty(param.ty))
+				.or_else(|| self.ty(result?)),
 			TypeExpression::Pointer { inner, .. }
 			| TypeExpression::Slice { inner }
 			| TypeExpression::Grouped { inner, .. } => self.ty(inner),
@@ -780,7 +810,7 @@ impl Cursor {
 				self.ty(inner).or_else(|| self.const_argument(length))
 			}
 			TypeExpression::QualifiedPath { root, .. } => {
-				self.qualified_root(root)
+				self.qualified_root(ast.qualified_root(root))
 			}
 			TypeExpression::Infer | TypeExpression::Never => None,
 		}
@@ -864,9 +894,10 @@ impl Cursor {
 	/// `<T as Tr>` before a path's segments: a type and a trait (read as a
 	/// bound is). What
 	/// follows it is a member of the type, which is not completed yet.
-	fn qualified_root(&self, root: &QualifiedPathRoot) -> Option<Site> {
-		self.ty(&root.self_type)
-			.or_else(|| self.path(&root.trait_path, NameUse::Bound))
+	fn qualified_root(&self, root: QualifiedPathRoot) -> Option<Site> {
+		self.ty(root.self_type).or_else(|| {
+			self.path(self.ast.list(root.trait_path), NameUse::Bound)
+		})
 	}
 
 	/// The label of a jump. A label not written yet (`break :`) is the
@@ -880,25 +911,28 @@ impl Cursor {
 	}
 
 	fn type_args(&self, segment: &PathSegment) -> Option<Site> {
-		match self.child(&segment.type_args)? {
+		let ast = self.ast;
+		let argument = self
+			.child_by(ast.list(segment.type_args), |&argument| {
+				ast.type_argument_span(argument)
+			})?;
+		match *argument {
 			TypeArgument::Type(ty) => self.ty(ty),
 			TypeArgument::Const(constant) => self.const_argument(constant),
 		}
 	}
 
-	fn const_argument(
-		&self,
-		constant: &Spanned<ConstArgument>,
-	) -> Option<Site> {
-		if !self.at(constant.span) {
+	fn const_argument(&self, constant: ConstId) -> Option<Site> {
+		let ast = self.ast;
+		if !self.at(ast.const_span(constant)) {
 			return None;
 		}
-		match &constant.inner {
+		match ast.constant(constant) {
 			ConstArgument::Path(segments) => {
-				self.path(segments, NameUse::Value)
+				self.path(ast.list(segments), NameUse::Value)
 			}
 			ConstArgument::QualifiedPath { root, .. } => {
-				self.qualified_root(root)
+				self.qualified_root(ast.qualified_root(root))
 			}
 			ConstArgument::Grouped { inner, .. } => self.ty(inner),
 			ConstArgument::Literal(_) | ConstArgument::Infer => None,

@@ -477,7 +477,7 @@ impl TryFrom<Token> for UnaryOp {
 /// A parsed `<Type as Trait>::` or `<Type>::`, before what follows it.
 enum BracketedRoot {
 	Qualified(QualifiedPathRoot),
-	Grouped(Box<Spanned<TypeExpression>>),
+	Grouped(TypeId),
 }
 
 /// A trait or typeset bound expression.
@@ -704,12 +704,7 @@ impl<'ctx> Parser<'ctx> {
 			source,
 			lexer: Lexer::new(source),
 			strings,
-			ast: AST {
-				file_id,
-				diagnostics: Vec::new(),
-				items: Vec::new(),
-				comments: CommentMap::empty(),
-			},
+			ast: AST::new(file_id),
 		};
 
 		loop {
@@ -1048,11 +1043,8 @@ impl<'ctx> Parser<'ctx> {
 		let start = parser.lexer.peek().span.start;
 		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
-			span: TextSpan::new(start, ty.span.end),
-			inner: FunctionParam {
-				binding,
-				ty: Box::new(ty),
-			},
+			span: TextSpan::new(start, parser.ast.type_span(ty).end),
+			inner: FunctionParam { binding, ty },
 		})
 	}
 
@@ -1064,7 +1056,7 @@ impl<'ctx> Parser<'ctx> {
 	/// is in.
 	fn parse_binding_and_type(
 		parser: &mut Parser,
-	) -> Result<(Option<Binding>, Spanned<TypeExpression>), ()> {
+	) -> Result<(Option<Binding>, TypeId), ()> {
 		let mut_span = matches!(parser.peek_keyword(), Some(Keyword::Mut))
 			.then(|| parser.lexer.next().span);
 
@@ -1119,20 +1111,16 @@ impl<'ctx> Parser<'ctx> {
 					{
 						return Err(());
 					}
-					Spanned {
-						inner: TypeExpression::Error,
-						span: TextSpan::new(colon.span.end, token.span.start),
-					}
+					parser.ast.push_type(
+						TypeExpression::Error,
+						TextSpan::new(colon.span.end, token.span.start),
+					)
 				}
 			};
 			return Ok((Some(binding), ty));
 		}
 		// Not followed by `:`: a type, unless it can only be a name, which is
 		// then given an error type.
-		let missing = Spanned {
-			inner: TypeExpression::Error,
-			span: TextSpan::new(name_span.end, name_span.end),
-		};
 		match mut_span {
 			// `mut _`: the type `_`, without the `mut`.
 			Some(mut_span) if underscore => {
@@ -1142,10 +1130,7 @@ impl<'ctx> Parser<'ctx> {
 				));
 				Ok((
 					None,
-					Spanned {
-						inner: TypeExpression::Infer,
-						span: name_span,
-					},
+					parser.ast.push_type(TypeExpression::Infer, name_span),
 				))
 			}
 			// `mut heap::*u8`: `mut` before a type that goes on past its
@@ -1166,10 +1151,7 @@ impl<'ctx> Parser<'ctx> {
 			// `_` is the type `_`.
 			None if underscore => Ok((
 				None,
-				Spanned {
-					inner: TypeExpression::Infer,
-					span: name_span,
-				},
+				parser.ast.push_type(TypeExpression::Infer, name_span),
 			)),
 			None if !receiver => Ok((None, parser.parse_type_path_from(name)?)),
 			// `mut x`, `self` or `mut self`: a name, but no type.
@@ -1178,6 +1160,10 @@ impl<'ctx> Parser<'ctx> {
 					parser.ast.file_id,
 					name_span,
 				));
+				let missing = parser.ast.push_type(
+					TypeExpression::Error,
+					TextSpan::new(name_span.end, name_span.end),
+				);
 				Ok((Some(Binding::Name { mut_span, name }), missing))
 			}
 		}
@@ -1208,8 +1194,8 @@ impl<'ctx> Parser<'ctx> {
 
 		let span = TextSpan::new(
 			fn_span.span.start,
-			match &result {
-				Some(result) => result.span.end,
+			match result {
+				Some(result) => self.ast.type_span(result).end,
 				None => params.span.end,
 			},
 		);
@@ -1320,12 +1306,12 @@ impl<'ctx> Parser<'ctx> {
 				Some(const_span) => {
 					self.next_expect(Token::Colon)?;
 					let ty = self.parse_type_expression()?;
-					let end = ty.span.end;
+					let end = self.ast.type_span(ty).end;
 					(
 						TypeParam::Const {
 							const_span,
 							name,
-							ty: Box::new(ty),
+							ty,
 						},
 						end,
 					)
@@ -1337,9 +1323,9 @@ impl<'ctx> Parser<'ctx> {
 						}
 						None => None,
 					};
-					let end = bounds
-						.as_ref()
-						.map_or(name.span.end, |bounds| bounds.span.end);
+					let end = bounds.map_or(name.span.end, |bounds| {
+						self.ast.bound_span(bounds).end
+					});
 					(TypeParam::Type { name, bounds }, end)
 				}
 			};
@@ -1382,9 +1368,11 @@ impl<'ctx> Parser<'ctx> {
 
 	/// Parse `<Type1, 5, const SIZE>` arguments, after a type's name or a
 	/// turbofish's `::`. Returns the args and the closing `>` span.
+	/// Parse `<Type1, 5, const SIZE>` arguments: the list, the span from the
+	/// first argument to the last, and the closing `>`'s span.
 	fn parse_type_args(
 		&mut self,
-	) -> Result<(Box<[TypeArgument]>, TextSpan), ()> {
+	) -> Result<(List<TypeArgument>, TextSpan, TextSpan), ()> {
 		let open_span = self.next_expect(Token::LeftArrow)?.span;
 		let mut args: Vec<TypeArgument> = Vec::new();
 
@@ -1417,7 +1405,14 @@ impl<'ctx> Parser<'ctx> {
 			}
 		};
 
-		Ok((args.into_boxed_slice(), close_span))
+		let args_span = match (args.first(), args.last()) {
+			(Some(&first), Some(&last)) => TextSpan::new(
+				self.ast.type_argument_span(first).start,
+				self.ast.type_argument_span(last).end,
+			),
+			_ => TextSpan::new(open_span.end, open_span.end),
+		};
+		Ok((self.ast.push_list(args), args_span, close_span))
 	}
 
 	/// One type argument: a literal is a constant; `const` marks a path as
@@ -1449,12 +1444,10 @@ impl<'ctx> Parser<'ctx> {
 	/// A constant: a literal, `_`, or a path naming one, written with a
 	/// bracketed root (`<T as Array>::LEN`, `<[u8; 4]>::LEN`) or
 	/// without.
-	fn parse_const_argument(&mut self) -> Result<Spanned<ConstArgument>, ()> {
+	fn parse_const_argument(&mut self) -> Result<ConstId, ()> {
 		if let Some(Keyword::Underscore) = self.peek_keyword() {
-			return Ok(Spanned {
-				inner: ConstArgument::Infer,
-				span: self.lexer.next().span,
-			});
+			let span = self.lexer.next().span;
+			return Ok(self.ast.push_const(ConstArgument::Infer, span));
 		}
 		if let Token::LeftArrow | Token::DoubleLeftArrow =
 			self.lexer.peek().inner
@@ -1464,45 +1457,41 @@ impl<'ctx> Parser<'ctx> {
 				_ => self.lexer.split_double_left_arrow(),
 			};
 			let root = self.parse_bracketed_root(open_span)?;
-			let segments = self.parse_value_path()?;
-			let span = TextSpan::new(open_span.start, segments.span().end);
-			let segments = segments.segments;
-			return Ok(Spanned {
-				inner: match root {
-					BracketedRoot::Qualified(root) => {
-						ConstArgument::QualifiedPath { root, segments }
+			let path = self.parse_value_path()?;
+			let span = TextSpan::new(open_span.start, path.span().end);
+			let segments = self.ast.push_list(path.segments);
+			let kind = match root {
+				BracketedRoot::Qualified(root) => {
+					ConstArgument::QualifiedPath {
+						root: self.ast.push_qualified_root(root),
+						segments,
 					}
-					BracketedRoot::Grouped(inner) => {
-						ConstArgument::Grouped { inner, segments }
-					}
-				},
-				span,
-			});
+				}
+				BracketedRoot::Grouped(inner) => {
+					ConstArgument::Grouped { inner, segments }
+				}
+			};
+			return Ok(self.ast.push_const(kind, span));
 		}
 		if self.at_literal() {
 			let literal = self.parse_literal()?;
-			return Ok(Spanned {
-				inner: ConstArgument::Literal(literal.inner),
-				span: literal.span,
-			});
+			return Ok(self.ast.push_const(
+				ConstArgument::Literal(literal.inner),
+				literal.span,
+			));
 		}
 		let path = match Parser::parse_path(self)? {
 			PathTerm::Path(path) => path,
 			PathTerm::Old(_) => return Err(()),
 		};
-		let span = TextSpan::new(
-			path[0].ident.span.start,
-			path.last().unwrap().ident.span.end,
-		);
-		Ok(Spanned {
-			inner: ConstArgument::Path(path),
-			span,
-		})
+		let span = AST::path_span(&path);
+		let segments = self.ast.push_list(path);
+		Ok(self.ast.push_const(ConstArgument::Path(segments), span))
 	}
 
 	/// An array's length, in a type or a repeat: only a constant can be
 	/// written there, so `const` says nothing.
-	fn parse_length(&mut self) -> Result<Spanned<ConstArgument>, ()> {
+	fn parse_length(&mut self) -> Result<ConstId, ()> {
 		if let Some(Keyword::Const) = self.peek_keyword() {
 			let span = self.lexer.next().span;
 			self.ast.diagnostics.push(report_redundant_const_marker(
@@ -1521,10 +1510,10 @@ impl<'ctx> Parser<'ctx> {
 	/// token by the caller.
 	fn parse_where_bindings(
 		&mut self,
-	) -> Result<Spanned<Box<[Spanned<AssocBinding>]>>, ()> {
+	) -> Result<Spanned<List<AssocBinding>>, ()> {
 		self.lexer.next(); // consume `where`
 		let open_span = self.next_expect(Token::OpenBrace)?.span;
-		let mut bindings: Vec<Spanned<AssocBinding>> = Vec::new();
+		let mut bindings: Vec<AssocBinding> = Vec::new();
 
 		let close_span = loop {
 			let peeked = self.lexer.peek();
@@ -1555,17 +1544,17 @@ impl<'ctx> Parser<'ctx> {
 			let (kind, end) = match (const_span, colon) {
 				(None, Some(colon)) => {
 					let bound = self.parse_bounds_expression(colon.span.end)?;
-					let end = bound.span.end;
+					let end = self.ast.bound_span(bound).end;
 					(AssocBindingKind::Bound(bound), end)
 				}
 				(None, None) => {
 					let ty = self.parse_type_expression()?;
-					let end = ty.span.end;
+					let end = self.ast.type_span(ty).end;
 					(AssocBindingKind::Equals(ty), end)
 				}
 				(Some(const_span), Some(_)) => {
 					let ty = self.parse_type_expression()?;
-					let end = ty.span.end;
+					let end = self.ast.type_span(ty).end;
 					(
 						AssocBindingKind::ConstRepresentable { const_span, ty },
 						end,
@@ -1573,13 +1562,14 @@ impl<'ctx> Parser<'ctx> {
 				}
 				(Some(const_span), None) => {
 					let value = self.parse_const_argument()?;
-					let end = value.span.end;
+					let end = self.ast.const_span(value).end;
 					(AssocBindingKind::ConstEquals { const_span, value }, end)
 				}
 			};
 			self.lexer.next_if(Token::Comma);
-			bindings.push(Spanned {
-				inner: AssocBinding { name, kind },
+			bindings.push(AssocBinding {
+				name,
+				kind,
 				span: TextSpan::new(
 					const_span.map_or(name.span.start, |span| span.start),
 					end,
@@ -1588,16 +1578,14 @@ impl<'ctx> Parser<'ctx> {
 		};
 
 		Ok(Spanned {
-			inner: bindings.into_boxed_slice(),
+			inner: self.ast.push_list(bindings),
 			span: TextSpan::new(open_span.start, close_span.end),
 		})
 	}
 
 	/// Keep a result annotation whose type is not written yet, spanning the
 	/// gap after `->`. Leave the body or declaration delimiter for the caller.
-	fn parse_function_result(
-		&mut self,
-	) -> Result<Option<Box<Spanned<TypeExpression>>>, ()> {
+	fn parse_function_result(&mut self) -> Result<Option<TypeId>, ()> {
 		let Some(arrow) = self.lexer.next_if(Token::MinusRightArrow) else {
 			return Ok(None);
 		};
@@ -1614,14 +1602,14 @@ impl<'ctx> Parser<'ctx> {
 				token,
 				Token::Identifier,
 			));
-			Spanned {
-				inner: TypeExpression::Error,
-				span: TextSpan::new(arrow.span.end, token.span.start),
-			}
+			self.ast.push_type(
+				TypeExpression::Error,
+				TextSpan::new(arrow.span.end, token.span.start),
+			)
 		} else {
 			self.parse_type_expression()?
 		};
-		Ok(Some(Box::new(ty)))
+		Ok(Some(ty))
 	}
 
 	fn parse_function_definition_item(
@@ -1668,24 +1656,21 @@ impl<'ctx> Parser<'ctx> {
 	/// position has no such ambiguity to avoid.
 	fn parse_value_path(&mut self) -> Result<Path, ()> {
 		let first_ident = self.parse_path_ident()?;
-		let mut segments: Vec<PathSegment> = vec![PathSegment {
-			ident: first_ident,
-			type_args: Box::new([]),
-		}];
+		let mut segments: Vec<PathSegment> =
+			vec![PathSegment::new(first_ident)];
 
 		while self.lexer.peek().inner == Token::ColonColon {
 			self.lexer.next(); // consume `::`
 			match self.lexer.peek().inner {
 				Token::LeftArrow => {
-					let (type_args, _) = self.parse_type_args()?;
-					segments.last_mut().unwrap().type_args = type_args;
+					let (type_args, args_span, _) = self.parse_type_args()?;
+					let last = segments.last_mut().unwrap();
+					last.type_args = type_args;
+					last.args_span = args_span;
 				}
 				Token::Identifier | Token::Keyword(_) => {
 					let ident = self.parse_path_ident()?;
-					segments.push(PathSegment {
-						ident,
-						type_args: Box::new([]),
-					});
+					segments.push(PathSegment::new(ident));
 				}
 				_ => {
 					// `::` consumed but no valid continuation — stop and let the caller handle it
@@ -1711,12 +1696,13 @@ impl<'ctx> Parser<'ctx> {
 		let mut ident = self.parse_path_ident()?;
 		let mut segments: Vec<PathSegment> = Vec::new();
 		loop {
-			let mut type_args: Box<[TypeArgument]> = Box::new([]);
+			let mut segment = PathSegment::new(ident);
 			if self.lexer.peek().inner == Token::LeftArrow {
-				let (args, _) = self.parse_type_args()?;
-				type_args = args;
+				let (args, args_span, _) = self.parse_type_args()?;
+				segment.type_args = args;
+				segment.args_span = args_span;
 			}
-			segments.push(PathSegment { ident, type_args });
+			segments.push(segment);
 			if self.lexer.peek().inner != Token::ColonColon {
 				break;
 			}
@@ -1730,26 +1716,26 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// Parse a single bound: a path optionally followed by `where { ... }` bindings.
-	fn parse_bound(&mut self) -> Result<Spanned<BoundExpression>, ()> {
+	fn parse_bound(&mut self) -> Result<BoundId, ()> {
 		let path = self.parse_type_path()?;
 		let path_span = path.span();
+		let segments = self.ast.push_list(path.segments);
 
 		if self.peek_keyword() == Some(Keyword::Where) {
 			let bindings = self.parse_where_bindings()?;
 			let span = TextSpan::new(path_span.start, bindings.span.end);
-			return Ok(Spanned {
-				inner: BoundExpression::WithBindings {
-					path: Box::new(BoundExpression::Path(path.segments)),
+			return Ok(self.ast.push_bound(
+				BoundExpression::WithBindings {
+					path: segments,
 					bindings: bindings.inner,
 				},
 				span,
-			});
+			));
 		}
 
-		Ok(Spanned {
-			inner: BoundExpression::Path(path.segments),
-			span: path_span,
-		})
+		Ok(self
+			.ast
+			.push_bound(BoundExpression::Path(segments), path_span))
 	}
 
 	/// Parse one or more `+`-separated bounds: `Bound1 + Bound2 + ...`,
@@ -1764,10 +1750,7 @@ impl<'ctx> Parser<'ctx> {
 	/// to that token, as a missing type is, so what holds it is kept too.
 	/// Anything else there is a bound written wrong, which the caller's
 	/// recovery skips.
-	fn parse_bounds_expression(
-		&mut self,
-		after: u32,
-	) -> Result<Spanned<BoundExpression>, ()> {
+	fn parse_bounds_expression(&mut self, after: u32) -> Result<BoundId, ()> {
 		let _ = self.lexer.next_if(Token::Plus);
 		let token = self.lexer.peek();
 		if matches!(
@@ -1784,30 +1767,30 @@ impl<'ctx> Parser<'ctx> {
 				token,
 				Token::Identifier,
 			));
-			return Ok(Spanned {
-				inner: BoundExpression::Error,
-				span: TextSpan::new(after, token.span.start),
-			});
+			return Ok(self.ast.push_bound(
+				BoundExpression::Error,
+				TextSpan::new(after, token.span.start),
+			));
 		}
 		let first = self.parse_bound()?;
 		if self.lexer.peek().inner != Token::Plus {
 			return Ok(first);
 		}
-		let mut bounds: Vec<Spanned<BoundExpression>> = vec![first];
+		let mut bounds: Vec<BoundId> = vec![first];
 		while self.lexer.next_if(Token::Plus).is_some() {
 			bounds.push(self.parse_bound()?);
 		}
 		let span = TextSpan::new(
-			bounds.first().unwrap().span.start,
-			bounds.last().unwrap().span.end,
+			self.ast.bound_span(bounds[0]).start,
+			self.ast.bound_span(*bounds.last().unwrap()).end,
 		);
-		Ok(Spanned {
-			inner: BoundExpression::BoundList(bounds.into_boxed_slice()),
-			span,
-		})
+		let bounds = self.ast.push_list(bounds);
+		Ok(self
+			.ast
+			.push_bound(BoundExpression::BoundList(bounds), span))
 	}
 
-	fn parse_type_expression(&mut self) -> Result<Spanned<TypeExpression>, ()> {
+	fn parse_type_expression(&mut self) -> Result<TypeId, ()> {
 		let token = self.lexer.peek();
 		match token.inner {
 			Token::Star | Token::Amper => {
@@ -1815,17 +1798,11 @@ impl<'ctx> Parser<'ctx> {
 			}
 			Token::Bang => {
 				let span = self.lexer.next().span;
-				Ok(Spanned {
-					inner: TypeExpression::Never,
-					span,
-				})
+				Ok(self.ast.push_type(TypeExpression::Never, span))
 			}
 			Token::Keyword(Keyword::Underscore) => {
 				let span = self.lexer.next().span;
-				Ok(Spanned {
-					inner: TypeExpression::Infer,
-					span,
-				})
+				Ok(self.ast.push_type(TypeExpression::Infer, span))
 			}
 			Token::Keyword(Keyword::Func) => {
 				Parser::parse_function_type_expression(self)
@@ -1875,18 +1852,19 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_type_path_from(
 		&mut self,
 		first: Spanned<SymbolU32>,
-	) -> Result<Spanned<TypeExpression>, ()> {
+	) -> Result<TypeId, ()> {
 		let mut ident = first;
 		let mut segments: Vec<PathSegment> = Vec::new();
 		let path_end = loop {
-			let mut type_args: Box<[TypeArgument]> = Box::new([]);
+			let mut segment = PathSegment::new(ident);
 			let mut end = ident.span.end;
 			if self.lexer.peek().inner == Token::LeftArrow {
-				let (args, close_span) = self.parse_type_args()?;
-				type_args = args;
+				let (args, args_span, close_span) = self.parse_type_args()?;
+				segment.type_args = args;
+				segment.args_span = args_span;
 				end = close_span.end;
 			}
-			segments.push(PathSegment { ident, type_args });
+			segments.push(segment);
 			if self.lexer.peek().inner != Token::ColonColon {
 				break end;
 			}
@@ -1900,9 +1878,7 @@ impl<'ctx> Parser<'ctx> {
 					// `::` consumed, followed by a pointer/slice/array sigil —
 					// a memory-tagged type (`heap::*u8`), tagged with the path
 					// built up so far.
-					return self.parse_pointer_type_expression(Some(
-						segments.into_boxed_slice(),
-					));
+					return self.parse_pointer_type_expression(Some(segments));
 				}
 				// A missing segment: reported, and kept, as in an
 				// expression's path. The token after `::` is left for
@@ -1921,10 +1897,11 @@ impl<'ctx> Parser<'ctx> {
 			}
 		};
 
-		Ok(Spanned {
-			inner: TypeExpression::Path(segments.into_boxed_slice()),
-			span: TextSpan::new(first.span.start, path_end),
-		})
+		let segments = self.ast.push_list(segments);
+		Ok(self.ast.push_type(
+			TypeExpression::Path(segments),
+			TextSpan::new(first.span.start, path_end),
+		))
 	}
 
 	/// Parse `<Type as Trait>::Item` (a trait-qualified path) or `<Type>::Item`
@@ -1933,22 +1910,21 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_qualified_path_type_expression(
 		&mut self,
 		open_span: TextSpan,
-	) -> Result<Spanned<TypeExpression>, ()> {
+	) -> Result<TypeId, ()> {
 		let root = self.parse_bracketed_root(open_span)?;
-		let segments = self.parse_type_path()?;
-		let span = TextSpan::new(open_span.start, segments.span().end);
-		let segments = segments.segments;
-		Ok(Spanned {
-			inner: match root {
-				BracketedRoot::Qualified(root) => {
-					TypeExpression::QualifiedPath { root, segments }
-				}
-				BracketedRoot::Grouped(inner) => {
-					TypeExpression::Grouped { inner, segments }
-				}
+		let path = self.parse_type_path()?;
+		let span = TextSpan::new(open_span.start, path.span().end);
+		let segments = self.ast.push_list(path.segments);
+		let kind = match root {
+			BracketedRoot::Qualified(root) => TypeExpression::QualifiedPath {
+				root: self.ast.push_qualified_root(root),
+				segments,
 			},
-			span,
-		})
+			BracketedRoot::Grouped(inner) => {
+				TypeExpression::Grouped { inner, segments }
+			}
+		};
+		Ok(self.ast.push_type(kind, span))
 	}
 
 	/// `<Type as Trait>::` or `<Type>::`, after its opening `<`
@@ -1958,14 +1934,14 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 		open_span: TextSpan,
 	) -> Result<BracketedRoot, ()> {
-		let self_type = Box::new(self.parse_type_expression()?);
+		let self_type = self.parse_type_expression()?;
 		let root = if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
 			let trait_path = self.parse_type_path()?;
 			let close_span = self.expect_close_angle(open_span);
 			BracketedRoot::Qualified(QualifiedPathRoot {
 				self_type,
-				trait_path: trait_path.segments,
+				trait_path: self.ast.push_list(trait_path.segments),
 				span: TextSpan::new(open_span.start, close_span.end),
 			})
 		} else {
@@ -1984,8 +1960,8 @@ impl<'ctx> Parser<'ctx> {
 	/// tag is written before it.
 	fn parse_pointer_type_expression(
 		&mut self,
-		memory: Option<Box<[PathSegment]>>,
-	) -> Result<Spanned<TypeExpression>, ()> {
+		memory: Option<Vec<PathSegment>>,
+	) -> Result<TypeId, ()> {
 		let sigil = self.lexer.next();
 		let ownership = if sigil.inner == Token::Star {
 			Ownership::Exclusive
@@ -1996,39 +1972,38 @@ impl<'ctx> Parser<'ctx> {
 			.as_ref()
 			.and_then(|segments| segments.first())
 			.map_or(sigil.span.start, |segment| segment.ident.span.start);
+		let memory = memory.map(|segments| self.ast.push_list(segments));
 
 		let inner = self.parse_type_expression()?;
-		let span = TextSpan::new(start, inner.span.end);
-		Ok(Spanned {
-			inner: TypeExpression::Pointer {
+		let span = TextSpan::new(start, self.ast.type_span(inner).end);
+		Ok(self.ast.push_type(
+			TypeExpression::Pointer {
 				ownership,
 				memory,
-				inner: Box::new(inner),
+				inner,
 			},
 			span,
-		})
+		))
 	}
 
 	/// Parses a slice or an array, `[T]` or `[T; N]`, from its `[` (not yet
 	/// consumed).
-	fn parse_slice_type_expression(
-		&mut self,
-	) -> Result<Spanned<TypeExpression>, ()> {
+	fn parse_slice_type_expression(&mut self) -> Result<TypeId, ()> {
 		let open = self.lexer.next().span; // consume `[`
-		let inner = Box::new(self.parse_type_expression()?);
+		let inner = self.parse_type_expression()?;
 		let next = self.lexer.next();
 		match next.inner {
-			Token::CloseBracket => Ok(Spanned {
-				inner: TypeExpression::Slice { inner },
-				span: TextSpan::new(open.start, next.span.end),
-			}),
+			Token::CloseBracket => Ok(self.ast.push_type(
+				TypeExpression::Slice { inner },
+				TextSpan::new(open.start, next.span.end),
+			)),
 			Token::SemiColon => {
 				let length = self.parse_length()?;
 				let close_span = self.next_expect(Token::CloseBracket)?.span;
-				Ok(Spanned {
-					inner: TypeExpression::Array { inner, length },
-					span: TextSpan::new(open.start, close_span.end),
-				})
+				Ok(self.ast.push_type(
+					TypeExpression::Array { inner, length },
+					TextSpan::new(open.start, close_span.end),
+				))
 			}
 			_ => {
 				self.ast.diagnostics.push(report_unexpected_token(
@@ -2041,24 +2016,31 @@ impl<'ctx> Parser<'ctx> {
 		}
 	}
 
-	fn parse_tuple_or_paren_type_expression(
-		&mut self,
-	) -> Result<Spanned<TypeExpression>, ()> {
+	/// A type as a list item: its id, spanned as the type is.
+	fn parse_type_item(parser: &mut Parser) -> Result<Spanned<TypeId>, ()> {
+		let ty = parser.parse_type_expression()?;
+		Ok(Spanned {
+			inner: ty,
+			span: parser.ast.type_span(ty),
+		})
+	}
+
+	fn parse_tuple_or_paren_type_expression(&mut self) -> Result<TypeId, ()> {
 		let grouped = SeparatedGroup {
 			open_token: Token::OpenParen,
 			close_token: Token::CloseParen,
 			separator_token: Token::Comma,
-			item_handler: |parser| parser.parse_type_expression(),
+			item_handler: Parser::parse_type_item,
 			should_warn_missing_separator: None,
 		}
 		.parse(self)?;
 
-		Ok(Spanned {
-			inner: TypeExpression::Tuple {
-				elements: grouped.inner,
-			},
-			span: grouped.span,
-		})
+		let elements = self
+			.ast
+			.push_list(grouped.inner.iter().map(|element| element.inner.inner));
+		Ok(self
+			.ast
+			.push_type(TypeExpression::Tuple { elements }, grouped.span))
 	}
 
 	fn parse_function_type_param(
@@ -2066,38 +2048,32 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<FunctionTypeParam>, ()> {
 		let ty = parser.parse_type_expression()?;
 		// A single-segment path followed by `:` is a named parameter (`self: T`).
-		let single_ident = match &ty.inner {
-			TypeExpression::Path(segs)
-				if segs.len() == 1 && segs[0].type_args.is_empty() =>
-			{
-				Some(segs[0].ident)
-			}
+		let single_ident = match parser.ast.ty(ty) {
+			TypeExpression::Path(segments) => match parser.ast.list(segments) {
+				[segment] if segment.type_args.is_empty() => {
+					Some(segment.ident)
+				}
+				_ => None,
+			},
 			_ => None,
 		};
-		let (name, ty) = if let Some(name_ident) = single_ident {
-			if parser.lexer.next_if(Token::Colon).is_some() {
-				let new_ty = parser.parse_type_expression()?;
-				(Some(name_ident), Box::new(new_ty))
-			} else {
-				(None, Box::new(ty))
+		let (name, ty) = match single_ident {
+			Some(name) if parser.lexer.next_if(Token::Colon).is_some() => {
+				(Some(name), parser.parse_type_expression()?)
 			}
-		} else {
-			(None, Box::new(ty))
+			_ => (None, ty),
 		};
 
-		let span = TextSpan::new(
-			name.map(|n| n.span).unwrap_or(ty.span).start,
-			ty.span.end,
-		);
+		let ty_span = parser.ast.type_span(ty);
+		let span =
+			TextSpan::new(name.map_or(ty_span, |n| n.span).start, ty_span.end);
 		Ok(Spanned {
-			inner: FunctionTypeParam { name, ty },
+			inner: FunctionTypeParam { name, ty, span },
 			span,
 		})
 	}
 
-	fn parse_function_type_expression(
-		&mut self,
-	) -> Result<Spanned<TypeExpression>, ()> {
+	fn parse_function_type_expression(&mut self) -> Result<TypeId, ()> {
 		let func_keyword = self.lexer.next();
 		let params = SeparatedGroup {
 			open_token: Token::OpenParen,
@@ -2107,27 +2083,23 @@ impl<'ctx> Parser<'ctx> {
 			should_warn_missing_separator: None,
 		}
 		.parse(self)?;
+		let list = self
+			.ast
+			.push_list(params.inner.iter().map(|param| param.inner.inner));
 
-		if self.lexer.next_if(Token::MinusRightArrow).is_some() {
-			let result = Box::new(Parser::parse_type_expression(self)?);
-			let span = TextSpan::new(func_keyword.span.start, result.span.end);
-			Ok(Spanned {
-				inner: TypeExpression::Function {
-					params: params.inner,
-					result: Some(result),
-				},
-				span,
-			})
-		} else {
-			let span = TextSpan::new(func_keyword.span.start, params.span.end);
-			Ok(Spanned {
-				inner: TypeExpression::Function {
-					params: params.inner,
-					result: None,
-				},
-				span,
-			})
-		}
+		let result = match self.lexer.next_if(Token::MinusRightArrow) {
+			Some(_) => Some(Parser::parse_type_expression(self)?),
+			None => None,
+		};
+		let end = result
+			.map_or(params.span.end, |result| self.ast.type_span(result).end);
+		Ok(self.ast.push_type(
+			TypeExpression::Function {
+				params: list,
+				result,
+			},
+			TextSpan::new(func_keyword.span.start, end),
+		))
 	}
 
 	/// Whether `token` starts an expression: what [`Parser::parse_prefix`]
@@ -2328,9 +2300,10 @@ impl<'ctx> Parser<'ctx> {
 		let segments = segments.segments;
 		Ok(Spanned {
 			inner: match root {
-				BracketedRoot::Qualified(root) => {
-					Expression::QualifiedPath { root, segments }
-				}
+				BracketedRoot::Qualified(root) => Expression::QualifiedPath {
+					root: parser.ast.push_qualified_root(root),
+					segments,
+				},
 				BracketedRoot::Grouped(inner) => {
 					Expression::Grouped { inner, segments }
 				}
@@ -2352,10 +2325,7 @@ impl<'ctx> Parser<'ctx> {
 		let start = first.span;
 
 		// Start the path with the first segment (no type args yet).
-		let mut segments: Vec<PathSegment> = vec![PathSegment {
-			ident: first,
-			type_args: Box::new([]),
-		}];
+		let mut segments: Vec<PathSegment> = vec![PathSegment::new(first)];
 
 		loop {
 			if parser.lexer.peek().inner != Token::ColonColon {
@@ -2366,8 +2336,10 @@ impl<'ctx> Parser<'ctx> {
 			match next.inner {
 				// `::<T, U>` — turbofish type args for the last segment
 				Token::LeftArrow => {
-					let (type_args, _close) = parser.parse_type_args()?;
-					segments.last_mut().unwrap().type_args = type_args;
+					let (type_args, args_span, _) = parser.parse_type_args()?;
+					let last = segments.last_mut().unwrap();
+					last.type_args = type_args;
+					last.args_span = args_span;
 					// Loop continues: next `::` starts a new segment.
 				}
 				// `::{ ... }` — the old struct literal
@@ -2379,10 +2351,9 @@ impl<'ctx> Parser<'ctx> {
 				}
 				// `::ident` — next path segment
 				token if Self::is_later_segment(token) => {
-					segments.push(PathSegment {
-						ident: parser.expect_name(&[Keyword::Super])?,
-						type_args: Box::new([]),
-					});
+					segments.push(PathSegment::new(
+						parser.expect_name(&[Keyword::Super])?,
+					));
 				}
 				// Anything else after `::` is a missing segment: reported,
 				// and kept, so the path up to it is still resolved.
@@ -2564,15 +2535,12 @@ impl<'ctx> Parser<'ctx> {
 				Ok(Spanned {
 					inner: Expression::ObjectAccess {
 						object: Box::new(object),
-						member: PathSegment {
-							ident: Spanned {
-								inner: parser.strings.get_or_intern(
-									token.span.extract_str(parser.source),
-								),
-								span: token.span,
-							},
-							type_args: Box::new([]),
-						},
+						member: PathSegment::new(Spanned {
+							inner: parser.strings.get_or_intern(
+								token.span.extract_str(parser.source),
+							),
+							span: token.span,
+						}),
 					},
 					span,
 				})
@@ -2848,10 +2816,10 @@ impl<'ctx> Parser<'ctx> {
 		}
 		let ty = parser.parse_type_expression()?;
 		Ok(Spanned {
-			span: TextSpan::new(value.span.start, ty.span.end),
+			span: TextSpan::new(value.span.start, parser.ast.type_span(ty).end),
 			inner: Expression::Ascription {
 				value: Box::new(value),
-				ty: Box::new(ty),
+				ty,
 			},
 		})
 	}
@@ -3134,13 +3102,14 @@ impl<'ctx> Parser<'ctx> {
 		let colons = parser.lexer.next(); // consume `::`
 
 		if parser.lexer.peek().inner == Token::LeftArrow {
-			let (args, close_span) = parser.parse_type_args()?;
+			let (args, args_span, close_span) = parser.parse_type_args()?;
 			let span = TextSpan::new(left.span.start, close_span.end);
 			return match left.inner {
 				Expression::ObjectAccess { object, mut member }
 					if member.type_args.is_empty() =>
 				{
 					member.type_args = args;
+					member.args_span = args_span;
 					Ok(Spanned {
 						inner: Expression::ObjectAccess { object, member },
 						span,
@@ -3456,10 +3425,7 @@ impl<'ctx> Parser<'ctx> {
 			Keyword::Package,
 			Keyword::Super,
 		])?;
-		let mut segments = vec![PathSegment {
-			ident: first,
-			type_args: Box::new([]),
-		}];
+		let mut segments = vec![PathSegment::new(first)];
 
 		while parser.lexer.peek().inner == Token::ColonColon {
 			let colons = parser.lexer.next(); // consume `::`
@@ -3467,8 +3433,10 @@ impl<'ctx> Parser<'ctx> {
 			match next.inner {
 				// `::<T, U>` — turbofish for the last segment
 				Token::LeftArrow => {
-					let (type_args, _close) = parser.parse_type_args()?;
-					segments.last_mut().unwrap().type_args = type_args;
+					let (type_args, args_span, _) = parser.parse_type_args()?;
+					let last = segments.last_mut().unwrap();
+					last.type_args = type_args;
+					last.args_span = args_span;
 				}
 				// `::{ ... }` — the old named pattern, gone
 				Token::OpenBrace => {
@@ -3478,10 +3446,9 @@ impl<'ctx> Parser<'ctx> {
 				token if Self::is_later_segment(token) => {
 					// A later segment is a name, `super` included, as in an
 					// expression.
-					segments.push(PathSegment {
-						ident: parser.expect_name(&[Keyword::Super])?,
-						type_args: Box::new([]),
-					});
+					segments.push(PathSegment::new(
+						parser.expect_name(&[Keyword::Super])?,
+					));
 				}
 				// A missing segment: reported, and kept, as in an
 				// expression's path.
@@ -3674,17 +3641,18 @@ impl<'ctx> Parser<'ctx> {
 		// position there is in it (what completion reads).
 		let ty = match parser.lexer.next_if(Token::Colon) {
 			Some(colon) => {
-				let ty = parser.parse_type_expression().unwrap_or_else(|()| {
-					Spanned {
-						inner: TypeExpression::Error,
-						span: TextSpan::new(
+				let ty = match parser.parse_type_expression() {
+					Ok(ty) => ty,
+					Err(()) => {
+						let gap = TextSpan::new(
 							colon.span.end,
 							parser.lexer.peek().span.start,
-						),
+						);
+						parser.ast.push_type(TypeExpression::Error, gap)
 					}
-				});
-				end = ty.span.end;
-				Some(Box::new(ty))
+				};
+				end = parser.ast.type_span(ty).end;
+				Some(ty)
 			}
 			None => None,
 		};
@@ -3737,7 +3705,7 @@ impl<'ctx> Parser<'ctx> {
 		let name = parser.expect_name(&[])?;
 
 		let ty = match parser.lexer.next_if(Token::Colon) {
-			Some(_) => Some(Box::new(parser.parse_type_expression()?)),
+			Some(_) => Some(parser.parse_type_expression()?),
 			None => None,
 		};
 
@@ -3777,7 +3745,7 @@ impl<'ctx> Parser<'ctx> {
 		} = parser.expect_name(&[])?;
 
 		let ty = if parser.lexer.next_if(Token::Colon).is_some() {
-			Some(Box::new(parser.parse_type_expression()?))
+			Some(parser.parse_type_expression()?)
 		} else {
 			None
 		};
@@ -3887,11 +3855,11 @@ impl<'ctx> Parser<'ctx> {
 					)
 					.with_note("write `enum Name(Type) { ... }`"),
 			);
-			Some(Box::new(parser.parse_type_expression()?))
+			Some(parser.parse_type_expression()?)
 		} else if parser.lexer.next_if(Token::OpenParen).is_some() {
 			let repr = parser.parse_type_expression()?;
 			parser.next_expect(Token::CloseParen)?;
-			Some(Box::new(repr))
+			Some(repr)
 		} else {
 			None
 		};
@@ -3976,7 +3944,10 @@ impl<'ctx> Parser<'ctx> {
 				} = parser.expect_name(&[])?;
 				parser.next_expect(Token::Eq)?;
 				let ty = parser.parse_type_expression()?;
-				let span = TextSpan::new(type_span.start, ty.span.end);
+				let span = TextSpan::new(
+					type_span.start,
+					parser.ast.type_span(ty).end,
+				);
 				Ok(Spanned {
 					inner: ImplItem::AssocType {
 						pub_span,
@@ -3984,10 +3955,7 @@ impl<'ctx> Parser<'ctx> {
 							inner: name_symbol,
 							span: name_span,
 						},
-						ty: Box::new(Spanned {
-							inner: ty.inner,
-							span: ty.span,
-						}),
+						ty,
 						attributes: Box::new([]),
 					},
 					span,
@@ -4001,7 +3969,7 @@ impl<'ctx> Parser<'ctx> {
 				} = parser.expect_name(&[])?;
 
 				let ty = if parser.lexer.next_if(Token::Colon).is_some() {
-					Some(Box::new(parser.parse_type_expression()?))
+					Some(parser.parse_type_expression()?)
 				} else {
 					None
 				};
@@ -4173,7 +4141,7 @@ impl<'ctx> Parser<'ctx> {
 
 		let name = parser.expect_name(&[])?;
 
-		let supertraits: Option<Spanned<BoundExpression>> =
+		let supertraits: Option<BoundId> =
 			match parser.lexer.next_if(Token::Colon) {
 				Some(colon) => {
 					Some(parser.parse_bounds_expression(colon.span.end)?)
@@ -4221,7 +4189,7 @@ impl<'ctx> Parser<'ctx> {
 								span: name_span,
 							} = parser.expect_name(&[])?;
 
-							let bounds: Option<Spanned<BoundExpression>> =
+							let bounds: Option<BoundId> =
 								match parser.lexer.next_if(Token::Colon) {
 									Some(colon) => {
 										Some(parser.parse_bounds_expression(
@@ -4232,18 +4200,19 @@ impl<'ctx> Parser<'ctx> {
 								};
 							let value =
 								if parser.lexer.next_if(Token::Eq).is_some() {
-									Some(Box::new(
-										parser.parse_type_expression()?,
-									))
+									Some(parser.parse_type_expression()?)
 								} else {
 									None
 								};
 							let span = TextSpan::new(
 								type_span.start,
 								value
-									.as_ref()
-									.map(|v| v.span)
-									.or_else(|| bounds.as_ref().map(|b| b.span))
+									.map(|value| parser.ast.type_span(value))
+									.or_else(|| {
+										bounds.map(|bounds| {
+											parser.ast.bound_span(bounds)
+										})
+									})
 									.unwrap_or(name_span)
 									.end,
 							);
@@ -4280,7 +4249,7 @@ impl<'ctx> Parser<'ctx> {
 								const_span.start,
 								match &value {
 									Some(value) => value.span.end,
-									None => ty.span.end,
+									None => parser.ast.type_span(ty).end,
 								},
 							);
 							Ok(Spanned {
@@ -4289,7 +4258,7 @@ impl<'ctx> Parser<'ctx> {
 										inner: name_symbol,
 										span: name_span,
 									},
-									ty: Box::new(ty),
+									ty,
 									value,
 									attributes,
 								},
@@ -4367,13 +4336,12 @@ impl<'ctx> Parser<'ctx> {
 		// may carry are handled by `parse_bounds_expression`; the members
 		// brace that follows is unambiguous because that never continues past
 		// a `+`.
-		let bounds: Option<Spanned<BoundExpression>> =
-			match parser.lexer.next_if(Token::Colon) {
-				Some(colon) => {
-					Some(parser.parse_bounds_expression(colon.span.end)?)
-				}
-				None => None,
-			};
+		let bounds: Option<BoundId> = match parser.lexer.next_if(Token::Colon) {
+			Some(colon) => {
+				Some(parser.parse_bounds_expression(colon.span.end)?)
+			}
+			None => None,
+		};
 
 		let members = SeparatedGroup {
 			open_token: Token::OpenBrace,
@@ -4479,11 +4447,11 @@ impl<'ctx> Parser<'ctx> {
 			.then(|| parser.lexer.next().span);
 		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
-			span: TextSpan::new(start, ty.span.end),
+			span: TextSpan::new(start, parser.ast.type_span(ty).end),
 			inner: StructField {
 				pub_span,
 				binding,
-				ty: Box::new(ty),
+				ty,
 			},
 		})
 	}
@@ -4512,13 +4480,13 @@ impl<'ctx> Parser<'ctx> {
 		// use of this branch.
 		let body = if parser.lexer.peek().inner == Token::Eq {
 			parser.lexer.next();
-			Some(Box::new(parser.parse_type_expression()?))
+			Some(parser.parse_type_expression()?)
 		} else {
 			None
 		};
 
-		let end = match &body {
-			Some(body) => body.span.end,
+		let end = match body {
+			Some(body) => parser.ast.type_span(body).end,
 			None => name_span.end,
 		};
 		let span = TextSpan::new(type_span.start, end);
@@ -4600,9 +4568,10 @@ impl<'ctx> Parser<'ctx> {
 		let name = parser.expect_name(&[])?;
 
 		parser.next_expect(Token::Colon)?;
-		let size = Box::new(parser.parse_type_expression()?);
+		let size = parser.parse_type_expression()?;
 
-		let span = TextSpan::new(memory_span.start, size.span.end);
+		let span =
+			TextSpan::new(memory_span.start, parser.ast.type_span(size).end);
 		Ok(Spanned {
 			inner: Item::Memory {
 				pub_span: None,
@@ -4634,13 +4603,16 @@ impl<'ctx> Parser<'ctx> {
 
 		let _ = self.next_expect(Token::Colon)?;
 		let type_expr = self.parse_type_expression()?;
-		let span = TextSpan::new(keyword_span.start, type_expr.span.end);
+		let span = TextSpan::new(
+			keyword_span.start,
+			self.ast.type_span(type_expr).end,
+		);
 
 		Ok(Spanned {
 			inner: ImportDeclaration::Global {
 				mut_span,
 				name,
-				ty: Box::new(type_expr),
+				ty: type_expr,
 			},
 			span,
 		})
@@ -4652,8 +4624,9 @@ impl<'ctx> Parser<'ctx> {
 		let keyword_span = self.lexer.next().span;
 		let name = self.expect_name(&[])?;
 		let _ = self.next_expect(Token::Colon)?;
-		let size = Box::new(self.parse_type_expression()?);
-		let span = TextSpan::new(keyword_span.start, size.span.end);
+		let size = self.parse_type_expression()?;
+		let span =
+			TextSpan::new(keyword_span.start, self.ast.type_span(size).end);
 		Ok(Spanned {
 			inner: ImportDeclaration::Memory { name, size },
 			span,
@@ -4957,7 +4930,7 @@ impl<'ctx> Parser<'ctx> {
 					parser.report_crate_member_body(value.span);
 					value.span.end
 				} else {
-					ty.span.end
+					parser.ast.type_span(ty).end
 				};
 				(
 					Item::PackageConst {
@@ -4965,7 +4938,7 @@ impl<'ctx> Parser<'ctx> {
 						crate_span,
 						attributes: Box::new([]),
 						name,
-						ty: Box::new(ty),
+						ty,
 					},
 					end,
 				)
@@ -4982,8 +4955,8 @@ impl<'ctx> Parser<'ctx> {
 					};
 				let end = if parser.lexer.next_if(Token::Eq).is_some() {
 					let body = parser.parse_type_expression()?;
-					parser.report_crate_member_body(body.span);
-					body.span.end
+					parser.report_crate_member_body(parser.ast.type_span(body));
+					parser.ast.type_span(body).end
 				} else {
 					name_span.end
 				};

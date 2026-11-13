@@ -5331,12 +5331,11 @@ mod tests {
 			let file_id = self.decls.namespaces.file_id(namespace.into());
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
-				.map(|segment| ast::PathSegment {
-					ident: Spanned {
+				.map(|segment| {
+					ast::PathSegment::new(Spanned {
 						inner: self.strings.get_or_intern(segment),
 						span: TextSpan::new(0, 0),
-					},
-					type_args: Box::new([]),
+					})
 				})
 				.collect();
 			self.resolve_segments(file_id, namespace, tier, &segments)
@@ -5412,9 +5411,10 @@ mod tests {
 		else {
 			panic!("expected an alias");
 		};
-		let ast::TypeExpression::Path(segments) = &body.inner else {
+		let ast::TypeExpression::Path(segments) = module.ast.ty(*body) else {
 			panic!("expected a type path");
 		};
+		let segments = module.ast.list(segments);
 		let result = case.resolve_segments(
 			module.file_id,
 			case.root_namespace(),

@@ -469,8 +469,12 @@ mod tests {
 				resolutions,
 				&strings,
 			);
-			let mut builder =
-				SemanticsBuilder::new(&graph.files, &mut strings, &ast_nodes);
+			let mut builder = SemanticsBuilder::new(
+				&graph.files,
+				&graph.packages,
+				&mut strings,
+				&ast_nodes,
+			);
 			for entry in &ast_nodes {
 				let _ = builder.ensure_signature(
 					&mut sema,

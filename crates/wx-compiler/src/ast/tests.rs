@@ -105,8 +105,10 @@ impl TestCase {
 				&arguments.inner,
 			),
 			Expression::Ascription { value, ty } => {
-				let ty = match &ty.inner {
-					TypeExpression::Path(path) => self.path(path),
+				let ty = match self.ast.ty(*ty) {
+					TypeExpression::Path(path) => {
+						self.path(self.ast.list(path))
+					}
 					_ => "<type>".to_string(),
 				};
 				format!("(: {} {ty})", self.shape(&value.inner))
@@ -333,9 +335,9 @@ fn item_kind(item: &Item) -> &'static str {
 	}
 }
 
-fn bounds(param: &Spanned<TypeParam>) -> Option<&Spanned<BoundExpression>> {
-	match &param.inner {
-		TypeParam::Type { bounds, .. } => bounds.as_ref(),
+fn bounds(param: &Spanned<TypeParam>) -> Option<BoundId> {
+	match param.inner {
+		TypeParam::Type { bounds, .. } => bounds,
 		TypeParam::Const { .. } => None,
 	}
 }
@@ -351,22 +353,26 @@ fn call_type_args(case: &TestCase, index: usize) -> Vec<String> {
 	let Expression::Path(segments) = &callee.inner else {
 		panic!("expected a path callee")
 	};
-	segments[0]
-		.type_args
+	case.ast
+		.list(segments[0].type_args)
 		.iter()
-		.map(|arg| match arg {
+		.map(|&arg| match arg {
 			TypeArgument::Type(_) => "type".to_string(),
-			TypeArgument::Const(constant) => match &constant.inner {
-				ConstArgument::Literal(_) => "literal".to_string(),
-				ConstArgument::Infer => "_".to_string(),
-				ConstArgument::Path(path) => path
-					.iter()
-					.map(|segment| case.name(segment.ident.inner))
-					.collect::<Vec<_>>()
-					.join("::"),
-				ConstArgument::QualifiedPath { .. }
-				| ConstArgument::Grouped { .. } => "rooted".to_string(),
-			},
+			TypeArgument::Const(constant) => {
+				match case.ast.constant(constant) {
+					ConstArgument::Literal(_) => "literal".to_string(),
+					ConstArgument::Infer => "_".to_string(),
+					ConstArgument::Path(path) => case
+						.ast
+						.list(path)
+						.iter()
+						.map(|segment| case.name(segment.ident.inner))
+						.collect::<Vec<_>>()
+						.join("::"),
+					ConstArgument::QualifiedPath { .. }
+					| ConstArgument::Grouped { .. } => "rooted".to_string(),
+				}
+			}
 		})
 		.collect()
 }
@@ -462,10 +468,11 @@ fn test_enum_repr_after_name() {
 
 	assert_eq!(case.strings.resolve(name.inner), Some("Status"));
 	assert!(matches!(
-		repr.as_deref().map(|repr| &repr.inner),
+		repr.map(|repr| case.ast.ty(repr)),
 		Some(TypeExpression::Path(p))
 			if p.len() == 1
-				&& case.strings.resolve(p[0].ident.inner) == Some("i32")
+				&& case.strings.resolve(case.ast.list(p)[0].ident.inner)
+					== Some("i32")
 	));
 	assert_eq!(entries.len(), 2);
 }
@@ -514,7 +521,7 @@ fn test_fn_pointer_param() {
 	case.diagnostics().assert_none();
 
 	let param = &case.function_signature(0).params[0].inner.inner;
-	let ty = &param.ty.inner;
+	let ty = case.ast.ty(param.ty);
 	let TypeExpression::Function { params, result } = ty else {
 		panic!("expected a function type, got {ty:?}")
 	};
@@ -523,11 +530,11 @@ fn test_fn_pointer_param() {
 }
 
 /// What the pointer type `ty` points at.
-fn pointee(ty: &TypeExpression) -> &TypeExpression {
+fn pointee(ast: &AST, ty: TypeExpression) -> TypeExpression {
 	let TypeExpression::Pointer { inner, .. } = ty else {
 		panic!("expected a pointer type, got {ty:?}")
 	};
-	&inner.inner
+	ast.ty(inner)
 }
 
 #[test]
@@ -537,14 +544,14 @@ fn a_slice_is_a_type_of_its_own() {
 	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
 		panic!("expected a constant")
 	};
-	assert!(matches!(ty.inner, TypeExpression::Array { .. }));
+	assert!(matches!(case.ast.ty(*ty), TypeExpression::Array { .. }));
 	let Item::TypeAlias {
 		body: Some(body), ..
 	} = case.item(1)
 	else {
 		panic!("expected a type alias")
 	};
-	assert!(matches!(body.inner, TypeExpression::Slice { .. }));
+	assert!(matches!(case.ast.ty(*body), TypeExpression::Slice { .. }));
 }
 
 #[test]
@@ -565,29 +572,28 @@ fn test_type_expression_forms() {
 	};
 
 	assert!(matches!(
-		Some(&fields[0].inner.inner.ty.inner),
+		Some(case.ast.ty(fields[0].inner.inner.ty)),
 		Some(TypeExpression::Pointer { .. })
 	));
 	assert!(matches!(
-		pointee(&fields[1].inner.inner.ty.inner),
+		pointee(&case.ast, case.ast.ty(fields[1].inner.inner.ty)),
 		TypeExpression::Slice { .. }
 	));
+	let TypeExpression::Array { length, .. } =
+		pointee(&case.ast, case.ast.ty(fields[2].inner.inner.ty))
+	else {
+		panic!("expected a pointer to an array")
+	};
 	assert!(matches!(
-		Some(pointee(&fields[2].inner.inner.ty.inner)),
-		Some(TypeExpression::Array {
-			length: Spanned {
-				inner: ConstArgument::Literal(Literal::Int(4)),
-				..
-			},
-			..
-		})
+		case.ast.constant(length),
+		ConstArgument::Literal(Literal::Int(4))
 	));
 	assert!(matches!(
-		Some(&fields[3].inner.inner.ty.inner),
+		Some(case.ast.ty(fields[3].inner.inner.ty)),
 		Some(TypeExpression::Tuple { elements }) if elements.len() == 2
 	));
 	assert!(matches!(
-		Some(&fields[4].inner.inner.ty.inner),
+		Some(case.ast.ty(fields[4].inner.inner.ty)),
 		Some(TypeExpression::Path(p)) if p.len() == 2
 	));
 }
@@ -1578,11 +1584,11 @@ fn struct_fields_have_optional_names() {
 	// A positional field's type that starts with an identifier is parsed on
 	// from it: `math::Number`, `heap::*u8`.
 	assert!(matches!(
-		case.struct_fields(2)[1].inner.inner.ty.inner,
+		case.ast.ty(case.struct_fields(2)[1].inner.inner.ty),
 		TypeExpression::Path(ref segments) if segments.len() == 2
 	));
 	assert!(matches!(
-		case.struct_fields(1)[1].inner.inner.ty.inner,
+		case.ast.ty(case.struct_fields(1)[1].inner.inner.ty),
 		TypeExpression::Pointer { .. }
 	));
 	assert!(case.struct_fields(1)[1].inner.inner.pub_span.is_some());
@@ -1635,7 +1641,7 @@ fn parameters_and_fields_share_the_slot_grammar() {
 		Some(Binding::Wildcard(_))
 	));
 	// `x` alone is the type `x`, `_` alone the type `_`.
-	let ty = |index: usize| &params[index].inner.inner.ty.inner;
+	let ty = |index: usize| case.ast.ty(params[index].inner.inner.ty);
 	assert!(
 		matches!(ty(4), TypeExpression::Path(segments) if segments.len() == 1)
 	);
@@ -1779,7 +1785,10 @@ fn a_binding_without_a_type_recovers_with_an_error_type() {
 		.collect();
 	assert_eq!(names, [Some("self"), Some("x"), Some("y")]);
 	for param in &params[..2] {
-		assert!(matches!(param.inner.inner.ty.inner, TypeExpression::Error));
+		assert!(matches!(
+			case.ast.ty(param.inner.inner.ty),
+			TypeExpression::Error
+		));
 	}
 }
 
@@ -2545,7 +2554,7 @@ fn test_module_pub_items_and_associated_types() {
 		trait_items[0].inner.inner,
 		TraitItem::AssociatedType { ref bounds, .. }
 			if matches!(
-				bounds.as_ref().map(|b| &b.inner),
+				bounds.map(|b| case.ast.bound(b)),
 				Some(BoundExpression::BoundList(list)) if list.len() == 2
 			)
 	));
@@ -2744,11 +2753,11 @@ fn a_type_parameter_and_a_binding_span_what_is_written() {
 	assert_eq!(text(params[0].span), "T: Memory where { Size = u32 }");
 	assert_eq!(text(params[1].span), "const N: u8");
 	let Some(BoundExpression::WithBindings { bindings, .. }) =
-		bounds(&params[0]).map(|bound| &bound.inner)
+		bounds(&params[0]).map(|bound| case.ast.bound(bound))
 	else {
 		panic!("expected a bound with bindings")
 	};
-	assert_eq!(text(bindings[0].span), "Size = u32");
+	assert_eq!(text(case.ast.list(bindings)[0].span), "Size = u32");
 }
 
 #[test]
@@ -2769,7 +2778,7 @@ fn a_constant_parameter_is_marked_and_typed() {
 		panic!("expected a constant parameter")
 	};
 	assert_eq!(case.name(name.inner), "N");
-	assert!(matches!(ty.inner, TypeExpression::Path(_)));
+	assert!(matches!(case.ast.ty(*ty), TypeExpression::Path(_)));
 
 	// A constant's type is always written.
 	let case = TestCase::new("func f<const N>() {}");
@@ -2812,18 +2821,23 @@ fn a_type_path_takes_constant_arguments() {
 		TestCase::new("func f<const N: u32>(b: Buffer<u8, const N, 4>) {}");
 	case.diagnostics().assert_none();
 	let TypeExpression::Path(segments) =
-		&case.function_signature(0).params[0].inner.inner.ty.inner
+		case.ast
+			.ty(case.function_signature(0).params[0].inner.inner.ty)
 	else {
 		panic!("expected a path")
 	};
+	let segments = case.ast.list(segments);
 	assert!(matches!(
-		&*segments[0].type_args,
-		[
+		case.ast.list(segments[0].type_args),
+		&[
 			TypeArgument::Type(_),
 			TypeArgument::Const(path),
 			TypeArgument::Const(literal),
-		] if matches!(path.inner, ConstArgument::Path(_))
-			&& matches!(literal.inner, ConstArgument::Literal(Literal::Int(4)))
+		] if matches!(case.ast.constant(path), ConstArgument::Path(_))
+			&& matches!(
+				case.ast.constant(literal),
+				ConstArgument::Literal(Literal::Int(4))
+			)
 	));
 }
 
@@ -2839,12 +2853,12 @@ fn an_array_length_is_a_literal_or_a_path() {
 	for (param, length) in params.iter().zip([1, 2]) {
 		let TypeExpression::Array {
 			length: written, ..
-		} = pointee(&param.inner.inner.ty.inner)
+		} = pointee(&case.ast, case.ast.ty(param.inner.inner.ty))
 		else {
 			panic!("expected an array type")
 		};
 		assert!(matches!(
-			&written.inner,
+			case.ast.constant(written),
 			ConstArgument::Path(path) if path.len() == length
 		));
 	}
@@ -2853,7 +2867,7 @@ fn an_array_length_is_a_literal_or_a_path() {
 	else {
 		panic!("expected an array repeat")
 	};
-	assert!(matches!(count.inner, ConstArgument::Path(_)));
+	assert!(matches!(case.ast.constant(*count), ConstArgument::Path(_)));
 
 	// Only a constant can be a length, so `const` says nothing; and a
 	// computation is not one.
@@ -2880,31 +2894,38 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
 	let params = &case.function_signature(0).params;
 	let length = |at: usize| {
 		let TypeExpression::Array { length, .. } =
-			pointee(&params[at].inner.inner.ty.inner)
+			pointee(&case.ast, case.ast.ty(params[at].inner.inner.ty))
 		else {
 			panic!("expected an array type")
 		};
-		&length.inner
+		case.ast.constant(length)
 	};
 	assert!(matches!(
 		length(0),
 		ConstArgument::QualifiedPath { segments, .. } if segments.len() == 1
 	));
 	assert!(matches!(length(1), ConstArgument::Grouped { .. }));
-	let TypeExpression::Path(segments) = &params[2].inner.inner.ty.inner else {
+	let TypeExpression::Path(segments) = case.ast.ty(params[2].inner.inner.ty)
+	else {
 		panic!("expected a path")
 	};
 	assert!(matches!(
-		&*segments[0].type_args,
-		[TypeArgument::Const(constant)]
-			if matches!(constant.inner, ConstArgument::QualifiedPath { .. })
+		case.ast.list(case.ast.list(segments)[0].type_args),
+		&[TypeArgument::Const(constant)]
+			if matches!(
+				case.ast.constant(constant),
+				ConstArgument::QualifiedPath { .. }
+			)
 	));
 	let Expression::ArrayRepeat { count, .. } =
 		local_definition_value(case.function_block(0), 0)
 	else {
 		panic!("expected an array repeat")
 	};
-	assert!(matches!(count.inner, ConstArgument::QualifiedPath { .. }));
+	assert!(matches!(
+		case.ast.constant(*count),
+		ConstArgument::QualifiedPath { .. }
+	));
 }
 
 #[test]
@@ -2919,17 +2940,19 @@ fn an_array_length_can_be_left_to_its_context() {
 	else {
 		panic!("expected a local with a type")
 	};
-	let TypeExpression::Array { length, .. } = pointee(&ty.inner) else {
+	let TypeExpression::Array { length, .. } =
+		pointee(&case.ast, case.ast.ty(*ty))
+	else {
 		panic!("expected an array type")
 	};
-	assert!(matches!(length.inner, ConstArgument::Infer));
+	assert!(matches!(case.ast.constant(length), ConstArgument::Infer));
 	for at in [0, 1] {
 		let Expression::ArrayRepeat { count, .. } =
 			local_definition_value(case.function_block(0), at)
 		else {
 			panic!("expected an array repeat")
 		};
-		assert!(matches!(count.inner, ConstArgument::Infer));
+		assert!(matches!(case.ast.constant(*count), ConstArgument::Infer));
 	}
 }
 
@@ -2979,7 +3002,7 @@ fn test_generic_struct_with_bounds() {
 	};
 	assert_eq!(type_params.len(), 1);
 	assert!(matches!(
-		bounds(&type_params[0]).map(|b| &b.inner),
+		bounds(&type_params[0]).map(|b| case.ast.bound(b)),
 		Some(BoundExpression::BoundList(list)) if list.len() == 2
 	));
 }
@@ -3209,21 +3232,21 @@ fn test_generic_application_type_args() {
 	let Item::Function { signature, .. } = case.item(1) else {
 		panic!("expected function")
 	};
-	let param_ty = &signature.params[0].inner.inner.ty.inner;
+	let param_ty = case.ast.ty(signature.params[0].inner.inner.ty);
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
+	let segments = case.ast.list(segments);
 	assert_eq!(segments.len(), 1);
-	let type_args = &segments[0].type_args;
+	let type_args = case.ast.list(segments[0].type_args);
 	assert_eq!(type_args.len(), 2);
-	assert!(matches!(
-		&type_args[0],
-		TypeArgument::Type(ty) if matches!(ty.inner, TypeExpression::Path(_))
-	));
-	assert!(matches!(
-		&type_args[1],
-		TypeArgument::Type(ty) if matches!(ty.inner, TypeExpression::Path(_))
-	));
+	for &argument in type_args {
+		assert!(matches!(
+			argument,
+			TypeArgument::Type(ty)
+				if matches!(case.ast.ty(ty), TypeExpression::Path(_))
+		));
+	}
 }
 
 #[test]
@@ -3235,10 +3258,11 @@ fn test_path_continues_after_a_segment_with_type_args() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
-	let param_ty = &signature.params[0].inner.inner.ty.inner;
+	let param_ty = case.ast.ty(signature.params[0].inner.inner.ty);
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
+	let segments = case.ast.list(segments);
 	assert_eq!(segments.len(), 2);
 	assert_eq!(case.name(segments[0].ident.inner), "Vec");
 	assert_eq!(segments[0].type_args.len(), 1);
@@ -3269,10 +3293,12 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 		panic!("expected function")
 	};
 	let bounds = bounds(&signature.type_params[0]).expect("expected bounds");
-	let BoundExpression::WithBindings { path, bindings } = &bounds.inner else {
+	let BoundExpression::WithBindings { path, bindings } =
+		case.ast.bound(bounds)
+	else {
 		panic!("expected WithBindings")
 	};
-	assert!(matches!(path.as_ref(), BoundExpression::Path(_)));
+	assert_eq!(path.len(), 1);
 	assert_eq!(bindings.len(), 1);
 }
 
@@ -3290,11 +3316,12 @@ fn a_constant_binding_is_marked_const() {
 		.iter()
 		.map(|param| {
 			let bounds = bounds(param).expect("expected bounds");
-			let BoundExpression::WithBindings { bindings, .. } = &bounds.inner
+			let BoundExpression::WithBindings { bindings, .. } =
+				case.ast.bound(bounds)
 			else {
 				panic!("expected WithBindings")
 			};
-			&bindings[0].inner.kind
+			case.ast.list(bindings)[0].kind
 		})
 		.collect();
 	assert!(matches!(
@@ -3303,13 +3330,8 @@ fn a_constant_binding_is_marked_const() {
 	));
 	assert!(matches!(
 		kinds[1],
-		AssocBindingKind::ConstEquals {
-			value: Spanned {
-				inner: ConstArgument::Literal(_),
-				..
-			},
-			..
-		}
+		AssocBindingKind::ConstEquals { value, .. }
+			if matches!(case.ast.constant(value), ConstArgument::Literal(_))
 	));
 }
 
@@ -3394,9 +3416,10 @@ fn test_typeset_bound_clause_parses() {
 	let Some(bounds) = bounds else {
 		panic!("expected a bound clause")
 	};
-	assert!(
-		matches!(bounds.inner, BoundExpression::BoundList(ref b) if b.len() == 2)
-	);
+	assert!(matches!(
+		case.ast.bound(*bounds),
+		BoundExpression::BoundList(b) if b.len() == 2
+	));
 }
 
 #[test]
@@ -3419,13 +3442,14 @@ fn a_bound_list_may_lead_with_a_plus() {
 	else {
 		panic!("expected a typeset with bounds")
 	};
-	assert!(
-		matches!(bounds.inner, BoundExpression::BoundList(ref b) if b.len() == 3)
-	);
+	assert!(matches!(
+		case.ast.bound(*bounds),
+		BoundExpression::BoundList(b) if b.len() == 3
+	));
 	// The list's span starts at its first bound, not at the `+`.
 	let source = &case.files.get(case.ast.file_id).unwrap().source;
 	assert_eq!(
-		bounds.span.extract_str(source),
+		case.ast.bound_span(*bounds).extract_str(source),
 		"Add\n    + Sub\n    + PartialEq"
 	);
 	let Item::Trait {
@@ -3435,7 +3459,10 @@ fn a_bound_list_may_lead_with_a_plus() {
 	else {
 		panic!("expected a trait with a supertrait")
 	};
-	assert!(matches!(supertraits.inner, BoundExpression::Path(_)));
+	assert!(matches!(
+		case.ast.bound(*supertraits),
+		BoundExpression::Path(_)
+	));
 }
 
 #[test]
@@ -3459,12 +3486,12 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 			| Item::TypeSet {
 				bounds: Some(bound),
 				..
-			} => bound,
+			} => *bound,
 			Item::Trait { items, .. } => {
 				let TraitItem::AssociatedType {
 					bounds: Some(bound),
 					..
-				} = &items[0].inner.inner
+				} = items[0].inner.inner
 				else {
 					panic!("expected an associated type")
 				};
@@ -3473,10 +3500,10 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 			Item::Function { signature, .. } => {
 				let bound = bounds(&signature.type_params[0]).unwrap();
 				if let BoundExpression::WithBindings { bindings, .. } =
-					&bound.inner
+					case.ast.bound(bound)
 				{
 					let AssocBindingKind::Bound(bound) =
-						&bindings[0].inner.kind
+						case.ast.list(bindings)[0].kind
 					else {
 						panic!("expected an associated bound")
 					};
@@ -3487,9 +3514,13 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 			}
 			_ => panic!("expected the owner to survive in {source:?}"),
 		};
-		assert!(matches!(bound.inner, BoundExpression::Error), "{source:?}");
-		assert_eq!(bound.span.extract_str(source), "  ");
-		assert_eq!(source.as_bytes()[bound.span.start as usize - 1], b':');
+		assert!(
+			matches!(case.ast.bound(bound), BoundExpression::Error),
+			"{source:?}"
+		);
+		let span = case.ast.bound_span(bound);
+		assert_eq!(span.extract_str(source), "  ");
+		assert_eq!(source.as_bytes()[span.start as usize - 1], b':');
 		assert_eq!(case.name(case.function_signature(1).name.inner), "after");
 	}
 }
@@ -3515,7 +3546,7 @@ fn test_typeset_bound_clause_with_where_bindings_parses() {
 	};
 	assert_eq!(members.len(), 2);
 	assert!(matches!(
-		bounds.as_ref().map(|b| &b.inner),
+		bounds.map(|b| case.ast.bound(b)),
 		Some(BoundExpression::WithBindings { .. })
 	));
 }
@@ -3631,7 +3662,7 @@ fn test_index_and_array_literal_expressions() {
 	};
 	assert_eq!(case.shape(&value.inner), "0");
 	assert!(matches!(
-		count.inner,
+		case.ast.constant(*count),
 		ConstArgument::Literal(Literal::Int(8))
 	));
 
@@ -3666,7 +3697,11 @@ fn test_qualified_path_records_its_trait_and_grouped_does_not() {
 	let Expression::QualifiedPath { root, segments } = &callee.inner else {
 		panic!("expected a qualified path")
 	};
-	assert_eq!(case.name(root.trait_path[0].ident.inner), "Show");
+	let root = case.ast.qualified_root(*root);
+	assert_eq!(
+		case.name(case.ast.list(root.trait_path)[0].ident.inner),
+		"Show"
+	);
 	assert_eq!(case.name(segments[0].ident.inner), "render");
 
 	let Expression::Call { callee, .. } =
@@ -3688,12 +3723,16 @@ fn test_qualified_and_grouped_paths_in_type_position() {
 	case.diagnostics().assert_none();
 
 	let params = &case.function_signature(0).params;
-	let ty = |index: usize| &params[index].inner.inner.ty.inner;
+	let ty = |index: usize| case.ast.ty(params[index].inner.inner.ty);
 	let TypeExpression::QualifiedPath { root, segments } = ty(0) else {
 		panic!("expected a qualified path type")
 	};
-	assert_eq!(case.name(root.trait_path[0].ident.inner), "Show");
-	assert_eq!(case.name(segments[0].ident.inner), "Out");
+	let root = case.ast.qualified_root(root);
+	assert_eq!(
+		case.name(case.ast.list(root.trait_path)[0].ident.inner),
+		"Show"
+	);
+	assert_eq!(case.name(case.ast.list(segments)[0].ident.inner), "Out");
 
 	assert!(
 		matches!(ty(1), TypeExpression::Grouped { .. }),
@@ -3713,18 +3752,22 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
 	let params = &case.function_signature(0).params;
 	for index in 0..2 {
 		let TypeExpression::QualifiedPath { root, segments } =
-			&params[index].inner.inner.ty.inner
+			case.ast.ty(params[index].inner.inner.ty)
 		else {
 			panic!("expected a qualified path type")
 		};
-		assert_eq!(case.name(root.trait_path[0].ident.inner), "Draw");
-		assert_eq!(case.name(segments[0].ident.inner), "Frame");
+		let root = case.ast.qualified_root(root);
+		let first = |segments: List<PathSegment>| {
+			case.name(case.ast.list(segments)[0].ident.inner)
+		};
+		assert_eq!(first(root.trait_path), "Draw");
+		assert_eq!(first(segments), "Frame");
 		let TypeExpression::QualifiedPath { root: inner, .. } =
-			&root.self_type.inner
+			case.ast.ty(root.self_type)
 		else {
 			panic!("the self type is itself a qualified path")
 		};
-		assert_eq!(case.name(inner.trait_path[0].ident.inner), "Show");
+		assert_eq!(first(case.ast.qualified_root(inner).trait_path), "Show");
 	}
 }
 
@@ -3808,11 +3851,14 @@ fn test_literal_kind_type() {
 	let Item::Const { ty: Some(ty), .. } = case.item(0) else {
 		panic!("expected a typed constant");
 	};
-	let TypeExpression::Path(segments) = &ty.inner else {
+	let TypeExpression::Path(segments) = case.ast.ty(*ty) else {
 		panic!("expected a literal kind");
 	};
-	assert_eq!(case.name(segments[0].ident.inner), "const_int");
-	assert_eq!(ty.span, TextSpan::new(9, 18));
+	assert_eq!(
+		case.name(case.ast.list(segments)[0].ident.inner),
+		"const_int"
+	);
+	assert_eq!(case.ast.type_span(*ty), TextSpan::new(9, 18));
 }
 
 #[test]
@@ -3852,19 +3898,17 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 			}
 			_ => panic!("expected a function in {source:?}"),
 		};
-		let result = signature
-			.result
-			.as_ref()
-			.expect("the result annotation survives");
-		assert!(matches!(result.inner, TypeExpression::Error));
-		assert_eq!(result.span.extract_str(source), "  ");
+		let result = signature.result.expect("the result annotation survives");
+		assert!(matches!(case.ast.ty(result), TypeExpression::Error));
+		let result = case.ast.type_span(result);
+		assert_eq!(result.extract_str(source), "  ");
 		assert_eq!(
-			&source[result.span.start as usize - 2..result.span.start as usize],
+			&source[result.start as usize - 2..result.start as usize],
 			"->"
 		);
 		if let Some(body) = body {
 			assert!(matches!(body.inner, Expression::Block { .. }));
-			assert_eq!(body.span.start, result.span.end);
+			assert_eq!(body.span.start, result.end);
 		}
 		assert_eq!(case.name(case.function_signature(1).name.inner), "after");
 	}
@@ -3882,10 +3926,10 @@ fn test_never_type() {
 	let case = TestCase::new("func f(a: !) -> ! {}");
 	case.diagnostics().assert_none();
 	let signature = case.function_signature(0);
-	let param = &signature.params[0].inner.inner.ty;
-	assert!(matches!(param.inner, TypeExpression::Never));
-	let result = signature.result.as_ref().expect("a result type");
-	assert!(matches!(result.inner, TypeExpression::Never));
+	let param = signature.params[0].inner.inner.ty;
+	assert!(matches!(case.ast.ty(param), TypeExpression::Never));
+	let result = signature.result.expect("a result type");
+	assert!(matches!(case.ast.ty(result), TypeExpression::Never));
 }
 
 #[test]
@@ -3901,18 +3945,19 @@ fn test_infer_and_memory_tagged_types() {
 	// pointer to a slice included
 	let params = &case.function_signature(0).params;
 	for index in [0, 1] {
-		let ty = &params[index].inner.inner.ty.inner;
+		let ty = case.ast.ty(params[index].inner.inner.ty);
 		let TypeExpression::Pointer { memory, .. } = ty else {
 			panic!("expected a pointer type");
 		};
-		let memory = memory.as_ref().expect("tagged with an explicit memory");
-		assert_eq!(case.name(memory[0].ident.inner), "heap");
+		let memory = memory.expect("tagged with an explicit memory");
+		assert_eq!(case.name(case.ast.list(memory)[0].ident.inner), "heap");
 	}
-	let TypeExpression::Pointer { inner, .. } = &params[1].inner.inner.ty.inner
+	let TypeExpression::Pointer { inner, .. } =
+		case.ast.ty(params[1].inner.inner.ty)
 	else {
 		unreachable!()
 	};
-	assert!(matches!(inner.inner, TypeExpression::Slice { .. }));
+	assert!(matches!(case.ast.ty(inner), TypeExpression::Slice { .. }));
 
 	let Statement::LocalDefinition { ty, .. } =
 		&case.function_block(0)[0].inner.inner
@@ -3920,7 +3965,7 @@ fn test_infer_and_memory_tagged_types() {
 		panic!("expected a local definition")
 	};
 	assert!(matches!(
-		ty.as_ref().expect("annotated `_`").inner,
+		case.ast.ty(ty.expect("annotated `_`")),
 		TypeExpression::Infer
 	));
 }
@@ -4297,22 +4342,22 @@ fn a_type_argument_list_may_open_with_a_qualified_type() {
 	case.diagnostics().assert_none();
 
 	let param = &case.function_signature(0).params[0].inner.inner;
-	let TypeExpression::Path(segments) = &param.ty.inner else {
-		panic!("expected a path type, got {:?}", param.ty.inner)
+	let TypeExpression::Path(segments) = case.ast.ty(param.ty) else {
+		panic!("expected a path type, got {:?}", case.ast.ty(param.ty))
 	};
-	let [segment] = &segments[..] else {
+	let [segment] = case.ast.list(segments) else {
 		panic!("expected one segment, got {}", segments.len())
 	};
 	assert_eq!(case.name(segment.ident.inner), "Is");
-	let [TypeArgument::Type(first), TypeArgument::Type(_)] =
-		&segment.type_args[..]
+	let &[TypeArgument::Type(first), TypeArgument::Type(_)] =
+		case.ast.list(segment.type_args)
 	else {
 		panic!("expected two type arguments, got {:?}", segment.type_args)
 	};
 	assert!(
-		matches!(first.inner, TypeExpression::QualifiedPath { .. }),
+		matches!(case.ast.ty(first), TypeExpression::QualifiedPath { .. }),
 		"the first argument should be `<A as B>::C`, got {:?}",
-		first.inner
+		case.ast.ty(first)
 	);
 }
 
@@ -4543,10 +4588,10 @@ fn a_type_path_with_no_last_segment_keeps_its_prefix() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let param = &case.function_signature(0).params[0].inner.inner;
-	let TypeExpression::Path(path) = &param.ty.inner else {
+	let TypeExpression::Path(path) = case.ast.ty(param.ty) else {
 		panic!("expected a path type")
 	};
-	assert_eq!(case.path(path), "core::<error>");
+	assert_eq!(case.path(case.ast.list(path)), "core::<error>");
 	assert_eq!(case.ast.items.len(), 2);
 }
 
@@ -4586,10 +4631,9 @@ fn local_parts(case: &TestCase) -> (Option<TextSpan>, TextSpan, bool, bool) {
 		panic!("expected a local");
 	};
 	(
-		ty.as_ref().map(|ty| ty.span),
+		ty.map(|ty| case.ast.type_span(ty)),
 		value.span,
-		ty.as_ref()
-			.is_some_and(|ty| matches!(ty.inner, TypeExpression::Error)),
+		ty.is_some_and(|ty| matches!(case.ast.ty(ty), TypeExpression::Error)),
 		matches!(value.inner, Expression::Error),
 	)
 }
@@ -4656,8 +4700,8 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	assert_eq!(params.len(), 2);
 	let param = &params[1].inner.inner;
 	assert!(matches!(param.binding, Some(Binding::Name { .. })));
-	assert!(matches!(param.ty.inner, TypeExpression::Error));
-	assert_eq!(param.ty.span, TextSpan::new(17, 18));
+	assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
+	assert_eq!(case.ast.type_span(param.ty), TextSpan::new(17, 18));
 
 	let case = TestCase::new("struct P(a: u32, b: );");
 	case.diagnostics()
@@ -4667,7 +4711,7 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	};
 	assert_eq!(fields.len(), 2);
 	assert!(matches!(
-		fields[1].inner.inner.ty.inner,
+		case.ast.ty(fields[1].inner.inner.ty),
 		TypeExpression::Error
 	));
 }

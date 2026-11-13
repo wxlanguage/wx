@@ -1199,12 +1199,11 @@ mod tests {
 		fn declaration(&self, path: &str, tier: Tier) -> ItemLoc {
 			let segments: Box<[ast::PathSegment]> = path
 				.split("::")
-				.map(|name| ast::PathSegment {
-					ident: Spanned {
+				.map(|name| {
+					ast::PathSegment::new(Spanned {
 						inner: self.strings.get(name).unwrap(),
 						span: TextSpan::new(0, 0),
-					},
-					type_args: Box::new([]),
+					})
 				})
 				.collect();
 			// Keep synthetic lookup spans out of the table under test.

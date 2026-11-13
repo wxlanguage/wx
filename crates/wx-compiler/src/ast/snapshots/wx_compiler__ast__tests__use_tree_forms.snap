@@ -290,3 +290,19 @@ items:
     separator:
       start: 125
       end: 126
+types:
+  kinds: []
+  spans: []
+consts:
+  kinds: []
+  spans: []
+bounds:
+  kinds: []
+  spans: []
+qualified_roots: []
+segments: []
+type_args: []
+type_lists: []
+bound_lists: []
+assoc_bindings: []
+function_type_params: []

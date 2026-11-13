@@ -589,26 +589,26 @@ impl Semantics {
 		written: WrittenType<'ast>,
 		path: &[(TypePathStep, TypeIndex, TypeIndex)],
 	) -> (TextSpan, usize) {
-		let mut current = match written {
-			WrittenType::Written(written) => written,
+		let (ast, mut current) = match written {
+			WrittenType::Written(ast, written) => (ast, written),
 			WrittenType::Implied(span) => return (span, 0),
 		};
 		let mut taken = 0;
 		loop {
 			// A tuple of one is its element.
-			while let ast::TypeExpression::Tuple { elements } = &current.inner
-				&& let [element] = &elements[..]
+			while let ast::TypeExpression::Tuple { elements } = ast.ty(current)
+				&& let &[element] = ast.list(elements)
 			{
-				current = &element.inner;
+				current = element;
 			}
 			let Some(&(step, ..)) = path.get(taken) else {
-				return (current.span, taken);
+				return (ast.type_span(current), taken);
 			};
-			let next = match (&current.inner, step) {
+			let next = match (ast.ty(current), step) {
 				(
 					ast::TypeExpression::Tuple { elements },
 					TypePathStep::TupleElement(index),
-				) => elements.get(index).map(|element| &element.inner),
+				) => ast.list(elements).get(index).copied(),
 				(
 					ast::TypeExpression::Pointer { inner, .. },
 					TypePathStep::Pointee,
@@ -617,17 +617,17 @@ impl Semantics {
 					ast::TypeExpression::Slice { inner }
 					| ast::TypeExpression::Array { inner, .. },
 					TypePathStep::Element,
-				) => Some(&**inner),
+				) => Some(inner),
 				(
 					ast::TypeExpression::Array { length, .. },
 					TypePathStep::Length,
-				) => return (length.span, taken + 1),
+				) => return (ast.const_span(length), taken + 1),
 				(
 					ast::TypeExpression::Pointer { memory, .. },
 					TypePathStep::Memory,
 				) => {
 					if let Some([first, .., last] | [first @ last]) =
-						memory.as_deref()
+						memory.map(|memory| ast.list(memory))
 					{
 						return (
 							TextSpan::new(
@@ -642,20 +642,20 @@ impl Semantics {
 				(
 					ast::TypeExpression::Function { result, .. },
 					TypePathStep::Result,
-				) => result.as_deref(),
+				) => result,
 				// The parameter list is sugar for one parameter: a list of
 				// several is that tuple, whose elements are its entries.
 				(
 					ast::TypeExpression::Function { params, .. },
 					TypePathStep::Parameter,
-				) => match &params[..] {
-					[param] => Some(&*param.inner.inner.ty),
+				) => match ast.list(params) {
+					[param] => Some(param.ty),
 					params => match path.get(taken + 1) {
 						Some(&(TypePathStep::TupleElement(index), ..))
 							if index < params.len() =>
 						{
 							taken += 1;
-							Some(&*params[index].inner.inner.ty)
+							Some(params[index].ty)
 						}
 						_ => None,
 					},
@@ -664,7 +664,10 @@ impl Semantics {
 					ast::TypeExpression::Path(segments),
 					TypePathStep::TypeArgument(index),
 				) => {
-					let last = segments.last().expect("a path is never empty");
+					let last = ast
+						.list(segments)
+						.last()
+						.expect("a path is never empty");
 					let site =
 						Site::Type(SourceSpan::new(file_id, last.ident.span));
 					let spells_its_arguments = self
@@ -680,8 +683,8 @@ impl Semantics {
 								DeclKind::Struct(_) | DeclKind::Function(_)
 							)
 						});
-					match last.type_args.get(index) {
-						Some(ast::TypeArgument::Type(argument))
+					match ast.list(last.type_args).get(index) {
+						Some(&ast::TypeArgument::Type(argument))
 							if spells_its_arguments =>
 						{
 							Some(argument)
@@ -692,7 +695,7 @@ impl Semantics {
 				_ => None,
 			};
 			let Some(next) = next else {
-				return (current.span, taken);
+				return (ast.type_span(current), taken);
 			};
 			current = next;
 			taken += 1;
@@ -856,7 +859,8 @@ impl Semantics {
 /// (a function's `()` result), the span that stands for it.
 #[derive(Clone, Copy)]
 enum WrittenType<'ast> {
-	Written(&'ast Spanned<ast::TypeExpression>),
+	/// A type written in the file whose tree this is.
+	Written(&'ast ast::AST, ast::TypeId),
 	Implied(TextSpan),
 }
 
@@ -995,12 +999,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 						else {
 							unreachable!("a trait impl's associated type")
 						};
-						SourceSpan::new(
+						self.type_site(
 							sema.decls.file_id(
 								sema.decls.assoc_types[usize::from(provider)]
 									.loc,
 							),
-							ty.span,
+							*ty,
 						)
 					}
 					_ => at_target,
@@ -1310,18 +1314,28 @@ impl<'ast> SemanticsBuilder<'ast> {
 				self.function_syntax(function),
 			);
 			// A left-out result is `()`; its function's name stands for it.
-			let written = |syntax: &'ast ast::FunctionSignature| {
-				if position < params {
-					WrittenType::Written(
-						&syntax.params[position].inner.inner.ty,
-					)
-				} else {
-					syntax.result.as_deref().map_or(
-						WrittenType::Implied(syntax.name.span),
-						WrittenType::Written,
-					)
-				}
-			};
+			let written =
+				|file_id: FileId, syntax: &'ast ast::FunctionSignature| {
+					let ast = self.ast(file_id);
+					if position < params {
+						WrittenType::Written(
+							ast,
+							syntax.params[position].inner.inner.ty,
+						)
+					} else {
+						syntax.result.map_or(
+							WrittenType::Implied(syntax.name.span),
+							|result| WrittenType::Written(ast, result),
+						)
+					}
+				};
+			let (expected_file, found_file) = (
+				sema.decls.file_id(
+					sema.decls.functions[usize::from(declaration)].loc,
+				),
+				sema.decls
+					.file_id(sema.decls.functions[usize::from(function)].loc),
+			);
 			let head = sema.signature_mismatch(
 				&self.strings,
 				trait_index,
@@ -1331,18 +1345,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			sema.report_type_mismatch(
 				&self.strings,
 				head,
-				(
-					sema.decls.file_id(
-						sema.decls.functions[usize::from(declaration)].loc,
-					),
-					written(expected_syntax),
-				),
-				(
-					sema.decls.file_id(
-						sema.decls.functions[usize::from(function)].loc,
-					),
-					written(syntax),
-				),
+				(expected_file, written(expected_file, expected_syntax)),
+				(found_file, written(found_file, syntax)),
 				(expected, found),
 			);
 			return Ok(());
@@ -1412,6 +1416,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			unreachable!("a trait impl's constant with a written type")
 		};
 		let name = sema.decls.name(constant).inner;
+		let (expected_file, found_file) = (
+			sema.decls
+				.file_id(sema.decls.constants[usize::from(declaration)].loc),
+			sema.decls
+				.file_id(sema.decls.constants[usize::from(constant)].loc),
+		);
 		let head = Diagnostic::error()
 			.with_code(DiagnosticCode::TraitImplConstTypeMismatch.code())
 			.with_message(format!(
@@ -1423,16 +1433,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&self.strings,
 			head,
 			(
-				sema.decls.file_id(
-					sema.decls.constants[usize::from(declaration)].loc,
-				),
-				WrittenType::Written(expected_ty),
+				expected_file,
+				WrittenType::Written(self.ast(expected_file), *expected_ty),
 			),
-			(
-				sema.decls
-					.file_id(sema.decls.constants[usize::from(constant)].loc),
-				WrittenType::Written(ty),
-			),
+			(found_file, WrittenType::Written(self.ast(found_file), *ty)),
 			(expected, found),
 		);
 		Ok(())
@@ -1485,11 +1489,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let at = |function: FunctionIdx, name: Option<Spanned<SymbolU32>>| {
 			name.map_or_else(
 				|| {
-					self.function_syntax(function).params[position]
-						.inner
-						.inner
-						.ty
-						.span
+					let file_id = sema.decls.file_id(
+						sema.decls.functions[usize::from(function)].loc,
+					);
+					let param =
+						&self.function_syntax(function).params[position];
+					self.ast(file_id).type_span(param.inner.inner.ty)
 				},
 				|name| name.span,
 			)

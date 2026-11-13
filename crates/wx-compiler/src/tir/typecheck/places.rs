@@ -171,19 +171,14 @@ impl BodyBuilder<'_, '_> {
 		site: &mut Option<Site>,
 	) -> Operand {
 		let member = segment.ident;
-		if let (Some(first), Some(last)) =
-			(segment.type_args.first(), segment.type_args.last())
-		{
+		if !segment.type_args.is_empty() {
 			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
 					.with_message("type arguments are not allowed here")
 					.with_label(
-						Label::primary(
-							self.scope.file_id,
-							TextSpan::new(first.span().start, last.span().end),
-						)
-						.with_message("a field takes no type arguments"),
+						Label::primary(self.scope.file_id, segment.args_span)
+							.with_message("a field takes no type arguments"),
 					),
 			);
 		}

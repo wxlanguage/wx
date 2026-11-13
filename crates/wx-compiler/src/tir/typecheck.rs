@@ -382,6 +382,11 @@ impl<'a> BodyContext<'a> {
 }
 
 impl<'a, 'ast> BodyBuilder<'a, 'ast> {
+	/// The syntax tree of the file the body is written in.
+	pub(super) fn ast(&self) -> &'ast ast::AST {
+		self.builder.ast(self.scope.file_id)
+	}
+
 	pub(super) fn new(
 		sema: &'a mut Semantics,
 		builder: &'a mut SemanticsBuilder<'ast>,
@@ -705,7 +710,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 			ast::Expression::Ascription { value, ty } => {
-				self.build_ascription(value, ty)
+				self.build_ascription(value, *ty)
 			}
 			ast::Expression::MethodCall(call) => self.build_method_call(
 				&call.object,
@@ -727,7 +732,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::String => self.build_string(span),
 			ast::Expression::QualifiedPath { .. }
 			| ast::Expression::Grouped { .. } => {
-				let rooted = RootedPath::of_expression(&expr.inner).unwrap();
+				let rooted =
+					RootedPath::of_expression(self.ast(), &expr.inner).unwrap();
 				match self.resolve_rooted_path(rooted, span) {
 					Ok(path) => self.build_member_value(path, expected, span),
 					Err(error) => error,
@@ -737,7 +743,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.build_array(elements, expected, span)
 			}
 			ast::Expression::ArrayRepeat { value, count } => {
-				self.build_array_repeat(value, count, expected, span)
+				self.build_array_repeat(value, *count, expected, span)
 			}
 		}
 	}
@@ -857,7 +863,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	fn build_array_repeat(
 		&mut self,
 		value: &Spanned<ast::Expression>,
-		count: &Spanned<ast::ConstArgument>,
+		count: ast::ConstId,
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
@@ -885,17 +891,16 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 
 	/// A repeat's count as written: an integer literal or a constant's path,
 	/// `None` for `_`.
-	fn build_repeat_count(
-		&mut self,
-		count: &Spanned<ast::ConstArgument>,
-	) -> Option<ExprIdx> {
-		match &count.inner {
+	fn build_repeat_count(&mut self, count: ast::ConstId) -> Option<ExprIdx> {
+		let ast = self.ast();
+		let span = ast.const_span(count);
+		match ast.constant(count) {
 			ast::ConstArgument::Infer => None,
 			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
 				Some(self.body.push(
-					ExprKind::Int(*value),
+					ExprKind::Int(value),
 					TypeIndex::CONST_INT,
-					count.span,
+					span,
 				))
 			}
 			ast::ConstArgument::Literal(_) => {
@@ -904,31 +909,26 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 						.with_code(DiagnosticCode::TypeMistmatch.code())
 						.with_message("an array's length is an integer")
 						.with_label(
-							Label::primary(self.scope.file_id, count.span)
+							Label::primary(self.scope.file_id, span)
 								.with_message("not an integer"),
 						),
 				);
-				Some(self.body.push(
-					ExprKind::Error,
-					TypeIndex::ERROR,
-					count.span,
-				))
+				Some(self.body.push(ExprKind::Error, TypeIndex::ERROR, span))
 			}
 			ast::ConstArgument::Path(segments) => Some(self.build_path(
-				segments,
+				ast.list(segments),
 				TypeIndex::INFER,
-				count.span,
+				span,
 				AccessKind::Read,
 			)),
 			ast::ConstArgument::QualifiedPath { .. }
 			| ast::ConstArgument::Grouped { .. } => {
-				let rooted = RootedPath::of_constant(&count.inner).unwrap();
-				Some(match self.resolve_rooted_path(rooted, count.span) {
-					Ok(path) => self.build_member_value(
-						path,
-						TypeIndex::INFER,
-						count.span,
-					),
+				let rooted =
+					RootedPath::of_constant(ast, ast.constant(count)).unwrap();
+				Some(match self.resolve_rooted_path(rooted, span) {
+					Ok(path) => {
+						self.build_member_value(path, TypeIndex::INFER, span)
+					}
 					Err(error) => error,
 				})
 			}
@@ -1269,7 +1269,9 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::Path(segments) => segments,
 			ast::Expression::QualifiedPath { .. }
 			| ast::Expression::Grouped { .. } => {
-				let rooted = RootedPath::of_expression(&callee.inner).unwrap();
+				let rooted =
+					RootedPath::of_expression(self.ast(), &callee.inner)
+						.unwrap();
 				return match self.resolve_rooted_path(rooted, callee.span) {
 					Ok(path) => self.build_member_call(
 						path,
@@ -1520,7 +1522,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		let slots = &mut type_args[start..start + len];
 		// Every written argument is resolved, extra ones too, for their own
 		// diagnostics.
-		for (at, arg) in segment.type_args.iter().enumerate() {
+		for (at, &arg) in self.ast().list(segment.type_args).iter().enumerate()
+		{
 			let ty = self.builder.resolve_type_argument(
 				self.sema,
 				&mut self.obligations.types,
@@ -1537,6 +1540,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		if !self.sema.check_type_arg_count(
 			self.builder.strings,
 			self.scope,
+			self.ast(),
 			segment,
 			params_env,
 			owner,
@@ -1562,12 +1566,13 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		.then(|| self.sema.generic_envs.parent_count(env));
 		let identity = self.sema.generic_envs.identity_args(env);
 		let body = &self.body;
+		let ast = self.ast();
 		let span_of = |slot: usize| {
-			if let Some(written) = written_from
+			if let Some(&written) = written_from
 				.and_then(|start| slot.checked_sub(start))
-				.and_then(|at| segment.type_args.get(at))
+				.and_then(|at| ast.list(segment.type_args).get(at))
 			{
-				return written.span();
+				return ast.type_argument_span(written);
 			}
 			given
 				.iter()
@@ -1695,6 +1700,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			let diagnostic = self.sema.report_type_args_on_impl_self(
 				self.builder.strings,
 				self.scope.file_id,
+				self.builder.ast(self.scope.file_id),
 				segment,
 				impl_kind,
 			);
@@ -3122,12 +3128,11 @@ mod tests {
 			let file_id = self.sema.decls.namespaces.file_id(root.into());
 			let segments: Box<[ast::PathSegment]> = name
 				.split("::")
-				.map(|segment| ast::PathSegment {
-					ident: Spanned {
+				.map(|segment| {
+					ast::PathSegment::new(Spanned {
 						inner: self.strings.get(segment).unwrap(),
 						span: TextSpan::new(0, 0),
-					},
-					type_args: Box::new([]),
+					})
 				})
 				.collect();
 			let mut scratch = Vec::new();

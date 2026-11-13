@@ -642,13 +642,10 @@ mod tests {
 					} else {
 						TextSpan::new(0, 0)
 					};
-					PathSegment {
-						ident: crate::ast::Spanned {
-							inner: self.strings.get_or_intern(name),
-							span,
-						},
-						type_args: Box::new([]),
-					}
+					PathSegment::new(crate::ast::Spanned {
+						inner: self.strings.get_or_intern(name),
+						span,
+					})
 				})
 				.collect()
 		}

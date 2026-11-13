@@ -1,7 +1,7 @@
 # The AST as an arena
 
-Status as of 2026-11-13, branch `tir-refactor`. Steps 1–3 are done; the
-rest is the plan. The decisions under "Design" were taken with the
+Status as of 2026-11-13, branch `tir-refactor`. Steps 1–3 and 4.1 are done;
+the rest is the plan. The decisions under "Design" were taken with the
 recommendations below and can be revisited as the port shows what they cost.
 
 ## Why
@@ -183,7 +183,28 @@ building.
    keyword (`func memory(..)`), read silently where every other item's name
    reports it as reserved; it is now a name like the others.
 4. The arena, bottom-up, each with its consumers ported:
-   1. types (`TypeExpression`, path segments, bounds, type arguments);
+   1. **Done.** Types (`TypeExpression`, bounds, constant arguments, type
+      arguments). `TypeExpression`, `BoundExpression` and `ConstArgument`
+      keep their names and become `Copy` kinds in columns (`TypeId`,
+      `BoundId`, `ConstId`, read with `ast.ty(id)`/`type_span(id)` and
+      their siblings, at most 24 B each by assertion); a qualified root is
+      a `QualifiedRootId`; every list is a `List<T>` read with
+      `ast.list(..)`. `PathSegment` is `Copy`, its arguments a
+      `List<TypeArgument>` and their extent its own `args_span`, so a
+      segment's span and the "type arguments not allowed" diagnostic need
+      no tree. A path inside a type, a bound or a constant argument lives in
+      the segment column; paths in expressions, patterns and items are
+      still `Box<[PathSegment]>` (both read as `&[PathSegment]`). Lists are
+      still collected in a `Vec` and written whole (`push_list`); the
+      scratch stack comes with `separated` in 4.3. Consumers reach the tree
+      through the file the type is written in: `SemanticsBuilder::ast(file)`
+      (from `Syntax`, built from the packages), `BodyBuilder::ast()`,
+      `type_site(file, ty)` for a diagnostic's site; conformance's
+      `WrittenType::Written` carries the tree it is in, since a trait and
+      its impl can be in different files. wx-fmt's `Builder` and the LSP's
+      completion `Cursor` hold the file's tree. Every example builds to
+      byte-identical Wasm with identical messages; the two parser snapshots
+      now show ids and the columns (step 5 makes them readable again).
    2. patterns;
    3. expressions and statements, with `separated` and the scratch stack;
    4. items, members and the remaining lists; `Spanned` and `Separated`
@@ -198,13 +219,14 @@ building.
 
 ## Results
 
-| | before | after step 3 | after step 4 |
-|---|---|---|---|
-| lex | 0.64 ms | 0.80 ms | |
-| lex + parse | 2.90 ms | 2.87 ms | |
-| drop tree | 0.48 ms | 0.49 ms | |
-| allocations/token | 0.86 | 0.86 | |
-| retained bytes/token | 49.2 | 49.2 | |
+| | before | after step 3 | after 4.1 | after step 4 |
+|---|---|---|---|---|
+| lex | 0.64 ms | 0.80 ms | 0.81 ms | |
+| lex + parse | 2.90 ms | 2.87 ms | 2.69 ms | |
+| drop tree | 0.48 ms | 0.49 ms | 0.35 ms | |
+| allocations/token | 0.86 | 0.86 | 0.72 | |
+| retained bytes/token | 49.2 | 49.2 | 38.2 | |
+| `Spanned<Expression>` | 80 B | 80 B | 48 B | |
 
 The expected outcome, an estimate to be checked against this table: parsing
 about 1.6–1.9 ms, dropping near zero, the retained tree about a third of its

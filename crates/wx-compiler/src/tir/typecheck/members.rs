@@ -94,41 +94,53 @@ impl<'s> MemberPath<'s> {
 pub(super) enum RootedPath<'s> {
 	/// `<T as Trait>::member`.
 	Qualified {
-		root: &'s ast::QualifiedPathRoot,
+		root: ast::QualifiedPathRoot,
 		segments: &'s [ast::PathSegment],
 	},
 	/// `<T>::member`.
 	Grouped {
-		inner: &'s Spanned<ast::TypeExpression>,
+		inner: ast::TypeId,
 		segments: &'s [ast::PathSegment],
 	},
 }
 
 impl<'s> RootedPath<'s> {
-	/// `expr`'s, when it is one.
-	pub(super) fn of_expression(expr: &'s ast::Expression) -> Option<Self> {
+	/// `expr`'s, when it is one; `ast` is the tree it is written in.
+	pub(super) fn of_expression(
+		ast: &'s ast::AST,
+		expr: &'s ast::Expression,
+	) -> Option<Self> {
 		Some(match expr {
 			ast::Expression::QualifiedPath { root, segments } => {
-				Self::Qualified { root, segments }
+				Self::Qualified {
+					root: ast.qualified_root(*root),
+					segments,
+				}
 			}
-			ast::Expression::Grouped { inner, segments } => {
-				Self::Grouped { inner, segments }
-			}
+			ast::Expression::Grouped { inner, segments } => Self::Grouped {
+				inner: *inner,
+				segments,
+			},
 			_ => return None,
 		})
 	}
 
-	/// `argument`'s, when it is one.
+	/// `argument`'s, when it is one; `ast` is the tree it is written in.
 	pub(super) fn of_constant(
-		argument: &'s ast::ConstArgument,
+		ast: &'s ast::AST,
+		argument: ast::ConstArgument,
 	) -> Option<Self> {
 		Some(match argument {
 			ast::ConstArgument::QualifiedPath { root, segments } => {
-				Self::Qualified { root, segments }
+				Self::Qualified {
+					root: ast.qualified_root(root),
+					segments: ast.list(segments),
+				}
 			}
-			ast::ConstArgument::Grouped { inner, segments } => {
-				Self::Grouped { inner, segments }
-			}
+			ast::ConstArgument::Grouped { inner, segments } => Self::Grouped {
+				inner,
+				segments: ast.list(segments),
+			},
 			_ => return None,
 		})
 	}
@@ -188,14 +200,14 @@ impl BodyBuilder<'_, '_> {
 					self.sema,
 					&mut self.obligations.types,
 					self.scope,
-					&root.self_type,
+					root.self_type,
 					InferPolicy::Allow,
 				);
 				let qualified = self.sema.resolve_trait_bound_path(
 					self.builder.strings,
 					self.scope.file_id,
 					self.scope.namespace,
-					&root.trait_path,
+					self.ast().list(root.trait_path),
 				);
 				let Some(qualified) = qualified else {
 					return Err(self.body.push(

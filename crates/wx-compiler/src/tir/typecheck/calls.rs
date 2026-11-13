@@ -955,10 +955,7 @@ impl BodyBuilder<'_, '_> {
 		match &argument.value {
 			Some(value) => self.build(value, hint),
 			None => {
-				let path = [ast::PathSegment {
-					ident: argument.name,
-					type_args: Box::new([]),
-				}];
+				let path = [ast::PathSegment::new(argument.name)];
 				self.build_path(
 					&path,
 					hint,
