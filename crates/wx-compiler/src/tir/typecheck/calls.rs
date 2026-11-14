@@ -190,11 +190,26 @@ impl Semantics {
 			.names(self.decls.functions[usize::from(function)].params)
 	}
 
+	/// What `Self(..)` calls in an impl for `target`: the struct's
+	/// constructor, as `impl_self_struct` reads it.
+	fn self_constructor(
+		&self,
+		target: Option<TypeIndex>,
+	) -> Option<CallTarget> {
+		match *self.types.resolve(target?) {
+			Type::Struct { struct_index, .. } => {
+				Some(CallTarget::struct_constructor(self, struct_index))
+			}
+			_ => None,
+		}
+	}
+
 	/// The names a call by name of `callee` can give, with what each names,
 	/// in its parameters' order after the first `given` (a method call's
 	/// receiver, which its object gives and no name can), as the checker
 	/// matches them (`CallTarget::param_names`): a function's, or for a trait
-	/// impl's function its trait declaration's, or a struct's fields. Nothing
+	/// impl's function its trait declaration's, or a struct's fields (named, or
+	/// `Self` in an impl for it). Nothing
 	/// for a target with an unnamed parameter, which is called by position
 	/// only, or for a callee that is no function or struct.
 	pub fn argument_names(
@@ -205,17 +220,30 @@ impl Semantics {
 		let target = match callee {
 			Definition::Item(loc) => match self.declaration_kind(loc) {
 				DeclKind::Function(function) => {
-					CallTarget::function(self, function)
+					Some(CallTarget::function(self, function))
 				}
 				DeclKind::Struct(struct_index) => {
-					CallTarget::struct_constructor(self, struct_index)
+					Some(CallTarget::struct_constructor(self, struct_index))
 				}
-				_ => return Vec::new(),
+				_ => None,
 			},
 			Definition::Member(
 				MemberKind::Function(function) | MemberKind::Method(function),
-			) => CallTarget::function(self, function),
-			_ => return Vec::new(),
+			) => Some(CallTarget::function(self, function)),
+			Definition::InherentImplTarget(index) => self.self_constructor(
+				self.inherent_impls[usize::from(index)]
+					.as_ref()
+					.map(|header| header.target.inner),
+			),
+			Definition::TraitImplTarget(index) => self.self_constructor(
+				self.trait_impls[usize::from(index)]
+					.as_ref()
+					.map(|header| header.target.inner),
+			),
+			_ => None,
+		};
+		let Some(target) = target else {
+			return Vec::new();
 		};
 		let names = target.param_names(&self.decls);
 		if names.iter().any(Option::is_none) {

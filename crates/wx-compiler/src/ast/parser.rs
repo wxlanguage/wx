@@ -1666,34 +1666,103 @@ impl<'ctx> Parser<'ctx> {
 				Some(Keyword::Const) => Some(self.lexer.next().span),
 				_ => None,
 			};
-			let name = self.expect_name(&[])?;
+			let ends_entry = |parser: &mut Self| {
+				matches!(
+					parser.lexer.peek().inner,
+					Token::Comma | Token::CloseBrace
+				)
+			};
+			let missing = |parser: &mut Self, after: u32| {
+				let next = parser.lexer.peek().span.start;
+				parser.ast.push_type(
+					TypeExpression::Error,
+					TextSpan::new(after, next),
+				)
+			};
+			// `const` with no name after it (`{ const }`) keeps the entry
+			// with the error symbol as its name, spanning the gap, as a path's
+			// missing segment does.
+			let name = match const_span {
+				Some(const_span) if ends_entry(self) => {
+					let token = self.lexer.peek();
+					self.diagnostics.push(report_unexpected_token(
+						self.file_id,
+						token,
+						Token::Identifier,
+					));
+					Spanned {
+						inner: Keyword::Error.symbol(),
+						span: TextSpan::new(const_span.end, token.span.start),
+					}
+				}
+				_ => self.expect_name(&[])?,
+			};
 			let colon = self.lexer.next_if(Token::Colon);
-			if colon.is_none() {
-				self.next_expect(Token::Eq)?;
-			}
-			let (kind, end) = match (const_span, colon) {
-				(None, Some(colon)) => {
-					let bound = self.parse_bounds_expression(colon.span.end)?;
-					let end = self.ast.bounds.spans[usize::from(bound)].end;
-					(AssocBindingKind::Bound(bound), end)
+			// A name with nothing after it (`{ Si }`) or a type not written
+			// yet (`{ Size = }`), where the entry ends, is kept with an error
+			// type spanning the gap up to that token, as a missing type is
+			// elsewhere, so the name can be completed.
+			let (kind, end) = if colon.is_none() && ends_entry(self) {
+				// Reported once: a missing name already is.
+				if name.inner != Keyword::Error.symbol() {
+					let token = self.lexer.peek();
+					self.diagnostics.push(report_unexpected_token(
+						self.file_id,
+						token,
+						Token::Eq,
+					));
 				}
-				(None, None) => {
-					let ty = self.parse_type_expression()?;
-					let end = self.ast.types.spans[usize::from(ty)].end;
-					(AssocBindingKind::Equals(ty), end)
-				}
-				(Some(const_span), Some(_)) => {
-					let ty = self.parse_type_expression()?;
-					let end = self.ast.types.spans[usize::from(ty)].end;
-					(
+				let ty = missing(self, name.span.end);
+				let end = self.ast.types.spans[usize::from(ty)].end;
+				match const_span {
+					None => (AssocBindingKind::Equals(ty), end),
+					Some(const_span) => (
 						AssocBindingKind::ConstRepresentable { const_span, ty },
 						end,
-					)
+					),
 				}
-				(Some(const_span), None) => {
-					let value = self.parse_const_argument()?;
-					let end = self.ast.consts.spans[usize::from(value)].end;
-					(AssocBindingKind::ConstEquals { const_span, value }, end)
+			} else {
+				let after = match colon {
+					Some(colon) => colon.span.end,
+					None => self.next_expect(Token::Eq)?.span.end,
+				};
+				let parse_type = |parser: &mut Self| match parser
+					.parse_type_expression()
+				{
+					Ok(ty) => Ok(ty),
+					Err(()) if ends_entry(parser) => Ok(missing(parser, after)),
+					Err(()) => Err(()),
+				};
+				match (const_span, colon) {
+					(None, Some(_)) => {
+						let bound = self.parse_bounds_expression(after)?;
+						let end = self.ast.bounds.spans[usize::from(bound)].end;
+						(AssocBindingKind::Bound(bound), end)
+					}
+					(None, None) => {
+						let ty = parse_type(self)?;
+						let end = self.ast.types.spans[usize::from(ty)].end;
+						(AssocBindingKind::Equals(ty), end)
+					}
+					(Some(const_span), Some(_)) => {
+						let ty = parse_type(self)?;
+						let end = self.ast.types.spans[usize::from(ty)].end;
+						(
+							AssocBindingKind::ConstRepresentable {
+								const_span,
+								ty,
+							},
+							end,
+						)
+					}
+					(Some(const_span), None) => {
+						let value = self.parse_const_argument()?;
+						let end = self.ast.consts.spans[usize::from(value)].end;
+						(
+							AssocBindingKind::ConstEquals { const_span, value },
+							end,
+						)
+					}
 				}
 			};
 			self.lexer.next_if(Token::Comma);
@@ -1862,6 +1931,7 @@ impl<'ctx> Parser<'ctx> {
 				BoundExpression::WithBindings {
 					path: segments,
 					bindings: bindings.inner,
+					open_brace: bindings.span.start,
 				},
 				span,
 			));

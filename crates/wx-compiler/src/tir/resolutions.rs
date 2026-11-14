@@ -33,9 +33,10 @@ use super::decls::Declared;
 use super::decls::{
 	BindingKey, BindingLookup, ConstIdx, DeclKind, EnumIdx, FieldIdx,
 	FieldOwner, FunctionIdx, GlobalIdx, InherentImplIdx, ItemLoc, MemberKind,
-	NameUse, Namespace, PackageMemberItem, Scope, StructIdx, Tier,
+	NameUse, Namespace, PackageMemberItem, Scope, StructIdx, Tier, TraitIdx,
 	TraitImplIdx, UseItemIndex,
 };
+use super::members::MemberLookup;
 use super::signatures::Semantics;
 use super::types::{GenericEnvIdx, GenericEnvOwner, ImplKind};
 use crate::ast::Keyword;
@@ -292,6 +293,16 @@ impl Reference {
 			}
 		}
 	}
+}
+
+/// A member an entry of a bound's `where { .. }` block can name
+/// (`Semantics::binding_names`).
+#[derive(Clone, Copy)]
+pub struct BindingName {
+	pub name: SymbolU32,
+	pub member: MemberKind,
+	/// The supertrait that declares it, for one the bound's trait inherits.
+	pub inherited_from: Option<TraitIdx>,
 }
 
 impl Semantics {
@@ -936,30 +947,34 @@ impl Semantics {
 		}
 	}
 
-	/// Every name a path written in `declaration` (its signature or its
-	/// body; see `names_in_signature` for what it may be) can continue with,
-	/// used as `used_as` says, after a prefix that means `prefix`, with what
-	/// it would refer to: what the walk's lookup of the next segment finds in
-	/// the namespace `prefix` enters (`Namespaces::lookup`), accessible from
-	/// where the path is written, that can be written there. Empty when
-	/// `prefix` enters no namespace: what follows a type is one of its
-	/// members, which the member search finds.
+	/// Every name a path written in `accessor` can continue with, used as
+	/// `used_as` says, after a prefix that means `prefix`, with what it would
+	/// refer to: what the walk's lookup of the next segment finds in the
+	/// namespace `prefix` enters (`Namespaces::lookup`), accessible from
+	/// `accessor`, that can be written there. Empty when `prefix` enters no
+	/// namespace: what follows a type is one of its members, which the member
+	/// search finds. A `use` leaf (`NameUse::Import`) binds its name in both
+	/// tiers, so each name is listed once, and never a path keyword: the
+	/// scope binds its own already.
 	pub fn names_in(
 		&self,
-		declaration: Definition,
+		accessor: Scope,
 		prefix: ItemLoc,
 		used_as: NameUse,
 	) -> Vec<(SymbolU32, Definition)> {
-		let Some((accessor, _)) = self.signature_scope(declaration) else {
-			return Vec::new();
-		};
 		let namespaces = &self.decls.namespaces;
 		let Some(base) = namespaces.entered_by(prefix) else {
 			return Vec::new();
 		};
-		let mut found = Vec::new();
+		let mut found: Vec<(SymbolU32, Definition)> = Vec::new();
 		for &tier in used_as.listed_tiers() {
 			for name in self.candidates(&[base], tier) {
+				if used_as == NameUse::Import
+					&& (is_path_keyword(name)
+						|| found.iter().any(|&(listed, _)| listed == name))
+				{
+					continue;
+				}
 				let key = BindingKey::new(tier, name);
 				if let BindingLookup::Found {
 					target, reachable, ..
@@ -977,6 +992,136 @@ impl Semantics {
 			}
 		}
 		found
+	}
+
+	/// Every name a bare identifier written directly in `scope`, outside any
+	/// declaration, can mean, used as `used_as` says: a `use` path's first
+	/// segment, looked up as any path's first segment is (the scope, then the
+	/// core prelude), with no type parameters or locals in scope.
+	pub fn names_in_scope(
+		&self,
+		scope: Scope,
+		used_as: NameUse,
+	) -> Vec<(SymbolU32, Definition)> {
+		let mut found = Vec::new();
+		self.scope_names(
+			scope,
+			GenericEnvIdx::ROOT,
+			used_as,
+			|_| false,
+			&mut found,
+		);
+		found
+	}
+
+	/// Every member an entry of a `where { .. }` block in a bound of the
+	/// trait declared at `bound` can name, in `tiers` (a type's entry, a
+	/// `const` one's, or one not marked yet): the trait's own, or else the
+	/// one its supertraits declare, where only one does, as the checker
+	/// selects a binding's target (`binding_target`). Nearest first:
+	/// the trait's own, then its supertraits' (`written_supertraits`), each
+	/// in declaration order.
+	pub fn binding_names(
+		&self,
+		bound: ItemLoc,
+		tiers: &[Tier],
+	) -> Vec<BindingName> {
+		let DeclKind::Trait(trait_index) = self.declaration_kind(bound) else {
+			return Vec::new();
+		};
+		let decls = &self.decls;
+		// A function is no binding's target.
+		let declared = |trait_index, key| {
+			decls
+				.declared_trait_member(trait_index, key)
+				.filter(|kind| {
+					matches!(
+						kind,
+						MemberKind::AssociatedType(_) | MemberKind::Constant(_)
+					)
+				})
+		};
+		let traits = self.written_supertraits(trait_index);
+		let supertraits = &traits[1..];
+		let mut found: Vec<BindingName> = Vec::new();
+		for &owner in &traits {
+			for member in &decls.traits[usize::from(owner)].members {
+				let key = decls.member_key(member.kind);
+				if !tiers.contains(&key.tier)
+					|| found.iter().any(|found| {
+						found.name == key.symbol
+							&& found.member.tier() == key.tier
+					}) {
+					continue;
+				}
+				let selected = match declared(trait_index, key) {
+					Some(member) => Some((member, None)),
+					None => {
+						let declaring = (supertraits.iter().copied()).filter(
+							|&supertrait| declared(supertrait, key).is_some(),
+						);
+						match Semantics::select_declared_member(
+							decls, declaring, key,
+						) {
+							MemberLookup::Found(member) => {
+								Some((member.selected_kind(decls), Some(owner)))
+							}
+							_ => None,
+						}
+					}
+				};
+				let Some((member, inherited_from)) = selected else {
+					continue;
+				};
+				found.push(BindingName {
+					name: key.symbol,
+					member,
+					inherited_from,
+				});
+			}
+		}
+		found
+	}
+
+	/// `trait_index` and every trait it inherits, nearest first: the ones
+	/// it writes itself, then theirs, breadth-first. A trait's env holds
+	/// every supertrait; the ones it writes itself are those brought in by
+	/// their own bound.
+	fn written_supertraits(&self, trait_index: TraitIdx) -> Vec<TraitIdx> {
+		let mut traits = vec![trait_index];
+		let mut next = 0;
+		while let Some(&current) = traits.get(next) {
+			next += 1;
+			let env = self.traits[usize::from(current)].env;
+			let own_self = self.generic_envs.param_types(env)[0];
+			let range = self.assumption_envs.requirements(env).range();
+			for clause in self.clauses.traits(range) {
+				if clause.subject == own_self
+					&& clause.source == clause.origin
+					&& !traits.contains(&clause.trait_index)
+				{
+					traits.push(clause.trait_index);
+				}
+			}
+		}
+		traits
+	}
+
+	/// The scope `declaration` is written in, where a path in its signature
+	/// or body is looked up (see `names_in_signature` for what it may be).
+	pub fn declaration_scope(&self, declaration: Definition) -> Option<Scope> {
+		Some(self.signature_scope(declaration)?.0)
+	}
+
+	/// The scope a file's top-level items are written in.
+	pub fn file_scope(&self, file: FileId) -> Scope {
+		self.decls.file_namespaces[file.as_usize()]
+	}
+
+	/// The scope a module or an import block declared at `loc` opens, where
+	/// the items written inside it are.
+	pub fn scope_entered_by(&self, loc: ItemLoc) -> Option<Scope> {
+		self.decls.namespaces.entered_by(loc)?.as_scope()
 	}
 
 	/// Every name of `tier` a lookup in `roots` might find, each once: their
@@ -1067,6 +1212,13 @@ impl Semantics {
 			}
 		}
 	}
+}
+
+/// `self`, `super` or `package`, which every scope binds itself.
+fn is_path_keyword(name: SymbolU32) -> bool {
+	[Keyword::SelfLower, Keyword::Super, Keyword::Package]
+		.iter()
+		.any(|keyword| keyword.symbol() == name)
 }
 
 #[cfg(test)]
@@ -3012,9 +3164,18 @@ mod tests {
 		// The function the path is written in.
 		let declaration =
 			Definition::Item(analysis.declaration("f", Tier::Value));
-		let mut names: Vec<_> = analysis
-			.sema
-			.names_in(declaration, prefix, used_as)
+		let accessor = analysis.sema.declaration_scope(declaration).unwrap();
+		sorted_names(
+			analysis,
+			analysis.sema.names_in(accessor, prefix, used_as),
+		)
+	}
+
+	fn sorted_names(
+		analysis: &Analysis,
+		names: Vec<(SymbolU32, Definition)>,
+	) -> Vec<String> {
+		let mut names: Vec<_> = names
 			.into_iter()
 			.map(|(name, _)| {
 				analysis.strings.resolve(name).unwrap().to_string()
@@ -3022,6 +3183,74 @@ mod tests {
 			.collect();
 		names.sort();
 		names
+	}
+
+	#[test]
+	fn a_use_path_continues_into_namespaces_and_ends_in_anything() {
+		let analysis = Analysis::new(indoc! {"
+			mod shapes {
+			    pub struct Square(pub side: u32);
+			    pub func area() -> u32 { 1 }
+			    pub const SIDES: u32 = 4;
+			    func hidden() {}
+			    pub mod inner {}
+			    pub enum Kind(u8) { A = 0, B }
+			}
+			use shapes::area;
+			func f() {}
+		"});
+		let root = analysis.sema.file_scope(analysis.file);
+		let shapes = analysis.declaration("shapes", Tier::Type);
+		assert_eq!(
+			sorted_names(
+				&analysis,
+				analysis.sema.names_in(root, shapes, NameUse::Namespace)
+			),
+			["Kind", "inner", "package", "self"]
+		);
+		// Each name once, though `Square` and `area` are in both tiers, and
+		// no path keyword, which would bind the scope's own name again.
+		assert_eq!(
+			sorted_names(
+				&analysis,
+				analysis.sema.names_in(root, shapes, NameUse::Import)
+			),
+			["Kind", "SIDES", "Square", "area", "inner"],
+			"`hidden` is private to `shapes`"
+		);
+	}
+
+	#[test]
+	fn a_use_path_starts_in_its_scope_and_the_prelude() {
+		let analysis = Analysis::new(indoc! {"
+			mod shapes {
+			    pub mod inner {}
+			    pub func area() -> u32 { 1 }
+			}
+			func f() {}
+		"});
+		let first = |scope| {
+			sorted_names(
+				&analysis,
+				analysis.sema.names_in_scope(scope, NameUse::Namespace),
+			)
+		};
+		let root = first(analysis.sema.file_scope(analysis.file));
+		for name in ["shapes", "core", "package", "self", "Bool", "Ordering"] {
+			assert!(root.contains(&name.to_string()), "{name}: {root:?}");
+		}
+		for name in ["f", "area", "i32", "super"] {
+			assert!(!root.contains(&name.to_string()), "{name}: {root:?}");
+		}
+		let shapes = analysis.declaration("shapes", Tier::Type);
+		let inside = first(analysis.sema.scope_entered_by(shapes).unwrap());
+		for name in ["inner", "super", "self", "package", "Bool"] {
+			assert!(inside.contains(&name.to_string()), "{name}: {inside:?}");
+		}
+		// `core` is bound in the package's root scope only.
+		for name in ["shapes", "core", "area"] {
+			assert!(!inside.contains(&name.to_string()), "{name}: {inside:?}");
+		}
 	}
 
 	#[test]

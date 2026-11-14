@@ -3277,7 +3277,7 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 	};
 	let bounds = bounds(&case.ast.list(signature.type_params)[0])
 		.expect("expected bounds");
-	let BoundExpression::WithBindings { path, bindings } =
+	let BoundExpression::WithBindings { path, bindings, .. } =
 		case.ast.bound(bounds)
 	else {
 		panic!("expected WithBindings")
@@ -3509,6 +3509,57 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 		assert_eq!(span.extract_str(source), "  ");
 		assert_eq!(source.as_bytes()[span.start as usize - 1], b':');
 		assert_eq!(case.name(case.function_signature(1).name.inner), "after");
+	}
+}
+
+#[test]
+fn a_binding_with_nothing_after_its_name_or_its_eq_keeps_the_bound() {
+	for (source, gap, printed) in [
+		("func f<M: Memory where { Si }>() {}", " ", "Si = <error>"),
+		(
+			"func f<M: Memory where { Size = }>() {}",
+			" ",
+			"Size = <error>",
+		),
+		(
+			"func f<M: Memory where { Size, Item = u8 }>() {}",
+			"",
+			"Size = <error>, Item = u8",
+		),
+		(
+			"func f<T: Array where { const LEN }>() {}",
+			" ",
+			"const LEN: <error>",
+		),
+		(
+			"func f<T: Array where { const }>() {}",
+			"",
+			"const <error>: <error>",
+		),
+	] {
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		let bound =
+			bounds(&case.ast.list(case.function_signature(0).type_params)[0])
+				.unwrap();
+		let BoundExpression::WithBindings {
+			bindings,
+			open_brace,
+			..
+		} = case.ast.bound(bound)
+		else {
+			panic!("expected a bound with bindings in {source:?}")
+		};
+		assert_eq!(source.as_bytes()[open_brace as usize], b'{');
+		let first = case.ast.list(bindings)[0];
+		let (AssocBindingKind::Equals(ty)
+		| AssocBindingKind::ConstRepresentable { ty, .. }) = first.kind
+		else {
+			panic!("expected a type entry in {source:?}")
+		};
+		assert_eq!(case.ast.type_span(ty).extract_str(source), gap);
+		assert!(case.tree().contains(printed), "{}", case.tree());
 	}
 }
 

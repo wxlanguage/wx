@@ -2049,7 +2049,7 @@ pub typeset PointerSize:
 
 package func global_get<G: Global>(g: G) -> G::Value;
 
-package func global_set<G: Global>(g: G, value: G::Value);
+package func global_set<G: GlobalMut>(g: G, value: G::Value);
 
 /// How a value sits on the Wasm stack; the compiler answers it from the type's
 /// structure. `Repr` is the value's Wasm values as wx's own primitives: its

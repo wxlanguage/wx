@@ -19,10 +19,18 @@ use std::fmt::Write as _;
 
 use crate::ast::{Ownership, StringInterner};
 
-use super::bounds::{BindingRequirement, BoundArena, BoundId};
-use super::decls::{ConstIdx, Declarations, MemberOwner};
+use super::bounds::{
+	BindingRequirement, BoundArena, BoundId, SourceTraitBound,
+};
+use super::decls::{
+	ConstIdx, DeclKind, Declarations, MemberKind, MemberOwner, TraitIdx,
+};
+use super::resolutions::Definition;
 use super::signatures::Semantics;
-use super::types::{GenericEnvArena, Type, TypeIndex, TypeInterner};
+use super::types::{
+	GenericEnvArena, GenericEnvIdx, GenericEnvOwner, Type, TypeIndex,
+	TypeInterner,
+};
 
 /// The bytes a type may take in a message, as rustc shortens a long type.
 const TYPE_DISPLAY_BUDGET: usize = 64;
@@ -72,21 +80,94 @@ impl Semantics {
 	}
 }
 
-impl BoundFormatter<'_> {
-	pub fn display_bound(&self, bound: BoundId) -> String {
-		let mut buffer = String::new();
-		self.write_bound(&mut buffer, bound);
-		buffer
+impl Semantics {
+	/// The bounds written on `definition`, as written: a type parameter's,
+	/// an associated type declaration's, a trait's or a typeset's
+	/// supertraits. What they imply is left out, and a trait's own `Self` is
+	/// the trait itself. `None` when nothing is written.
+	pub fn display_written_bounds(
+		&self,
+		strings: &StringInterner,
+		definition: Definition,
+	) -> Option<String> {
+		if let Definition::TypeParam { env, index: 0 } = definition
+			&& let GenericEnvOwner::Trait(trait_index) =
+				self.generic_envs.owner(env)
+		{
+			let name = self.decls.name(trait_index).inner;
+			return Some(strings.resolve(name)?.to_string());
+		}
+		let bounds = self.written_bounds(definition);
+		let bounds = self.bound_formatter(strings).display_bounds(&bounds);
+		(!bounds.is_empty()).then_some(bounds)
 	}
 
+	fn written_bounds(&self, definition: Definition) -> Vec<BoundId> {
+		match definition {
+			Definition::TypeParam { env, index } => {
+				let subject =
+					self.generic_envs.param_types(env)[index as usize];
+				self.bounds_written_on(env, subject)
+			}
+			Definition::Member(MemberKind::AssociatedType(index)) => self
+				.assoc_types[usize::from(index)]
+			.as_ref()
+			.map_or_else(Vec::new, |signature| {
+				signature.declared_bounds.to_vec()
+			}),
+			Definition::Item(loc) => match self.declaration_kind(loc) {
+				DeclKind::AssocType(index) => self.written_bounds(
+					Definition::Member(MemberKind::AssociatedType(index)),
+				),
+				DeclKind::Trait(index) => self.supertraits_written_on(index),
+				DeclKind::TypeSet(index) => self.supertraits_written_on(
+					self.decls.typesets[usize::from(index)].trait_index,
+				),
+				_ => Vec::new(),
+			},
+			_ => Vec::new(),
+		}
+	}
+
+	fn supertraits_written_on(&self, trait_index: TraitIdx) -> Vec<BoundId> {
+		let env = self.traits[usize::from(trait_index)].env;
+		self.bounds_written_on(env, self.generic_envs.param_types(env)[0])
+	}
+
+	/// The bounds `env`'s item writes on `subject`, in written order: the
+	/// clauses about it that a bound written there states itself, not one
+	/// it brings in from a supertrait.
+	fn bounds_written_on(
+		&self,
+		env: GenericEnvIdx,
+		subject: TypeIndex,
+	) -> Vec<BoundId> {
+		let range = self.assumption_envs.requirements(env).range();
+		let mut bounds = Vec::new();
+		for clause in self.clauses.traits(range) {
+			if clause.subject == subject
+				&& clause.source == clause.origin
+				&& !bounds.contains(&clause.source)
+			{
+				bounds.push(clause.source);
+			}
+		}
+		bounds
+	}
+}
+
+impl BoundFormatter<'_> {
 	pub fn display_bounds(&self, bounds: &[BoundId]) -> String {
 		let mut buffer = String::new();
 		self.write_bounds(&mut buffer, bounds);
 		buffer
 	}
 
+	/// Writes `bounds` joined by ` + `, leaving out one a signature cycle cut
+	/// short.
 	fn write_bounds(&self, f: &mut String, bounds: &[BoundId]) {
-		for (i, bound) in bounds.iter().copied().enumerate() {
+		let resolved = bounds.iter().filter_map(|&id| self.bounds.resolved(id));
+		for (i, bound) in resolved.enumerate() {
 			if i > 0 {
 				f.push_str(" + ");
 			}
@@ -94,8 +175,7 @@ impl BoundFormatter<'_> {
 		}
 	}
 
-	fn write_bound(&self, f: &mut String, bound: BoundId) {
-		let bound = self.bounds.get(bound);
+	fn write_bound(&self, f: &mut String, bound: &SourceTraitBound) {
 		let symbol = self.type_formatter.decls.name(bound.trait_index).inner;
 		f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
 		if bound.bindings.is_empty() {
@@ -721,7 +801,7 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bound(case.declared_bounds("grow", "S")[0]),
+				.display_bounds(&case.declared_bounds("grow", "S")[..1]),
 			"Store where { Size: Unsigned }"
 		);
 	}

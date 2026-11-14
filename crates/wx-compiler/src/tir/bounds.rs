@@ -545,6 +545,15 @@ impl BoundArena {
 		}
 	}
 
+	/// The bound at `id` if it finished resolving: a bound a signature
+	/// cycle cut short stays reserved.
+	pub(super) fn resolved(&self, id: BoundId) -> Option<&SourceTraitBound> {
+		match &self.bounds[usize::from(id)] {
+			BoundEntry::Resolved(bound) => Some(bound),
+			BoundEntry::Reserved { .. } => None,
+		}
+	}
+
 	pub(super) fn binding(&self, reference: BindingRef) -> &SourceAssocBinding {
 		&self.get(reference.bound).bindings[reference.index as usize]
 	}

@@ -5689,7 +5689,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			ast::BoundExpression::Path(segments) => {
 				(ast.list(segments), &[][..])
 			}
-			ast::BoundExpression::WithBindings { path, bindings } => {
+			ast::BoundExpression::WithBindings { path, bindings, .. } => {
 				(ast.list(path), ast.list(bindings))
 			}
 		};
@@ -5792,6 +5792,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 			};
 			let Some(kind) = kind else {
+				// A name not written yet (`const }`) the parser reported.
+				if binding.name.inner == Keyword::Error.symbol() {
+					continue;
+				}
 				let noun = match key.tier {
 					Tier::Type => "an associated type",
 					Tier::Value => "a constant",

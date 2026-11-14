@@ -434,6 +434,8 @@ pub enum BoundExpression {
 	WithBindings {
 		path: List<PathSegment>,
 		bindings: List<AssocBinding>,
+		/// Where the `{` is; the bound's span ends at the `}`.
+		open_brace: u32,
 	},
 	/// `Bound1 + Bound2 + Bound3` — multiple bounds joined by `+`.
 	BoundList(List<BoundId>),

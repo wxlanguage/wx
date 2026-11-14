@@ -46,7 +46,9 @@ pub use self::literals::{
 	StringLiteralError, StringLiteralErrorKind, unescape_string_literal,
 };
 use self::resolutions::NameResolutions;
-pub use self::resolutions::{AccessKind, Definition, Reference, Route};
+pub use self::resolutions::{
+	AccessKind, BindingName, Definition, Reference, Route,
+};
 pub use self::signatures::Semantics;
 use self::signatures::SemanticsBuilder;
 pub use self::types::{GenericArgs, GenericEnvIdx, Primitive, Type, TypeIndex};

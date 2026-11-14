@@ -9,7 +9,7 @@ use wx_compiler::ast::{Keyword, Spanned, StringInterner};
 use wx_compiler::tir::{
 	AssocTypeIdx, ConstIdx, ConstScalar, DeclKind, Definition, FieldIdx,
 	FieldOwner, FunctionIdx, GenericEnvIdx, MemberKind, MemberOwner, Semantics,
-	StructIdx, Type, Val,
+	StructIdx, Type, TypesetIdx, Val,
 };
 use wx_compiler::vfs::Files;
 
@@ -52,17 +52,11 @@ pub(crate) fn signature(
 			DeclKind::EnumVariant(index) => renderer.variant(index),
 			DeclKind::Trait(index) => {
 				let decl = &sema.decls.traits[usize::from(index)];
-				Some(format!(
-					"trait {}",
-					renderer.name(sema.decls.item(decl.loc).name)
-				))
+				let name = renderer.name(sema.decls.item(decl.loc).name);
+				Some(renderer.bounded(format!("trait {name}"), definition))
 			}
 			DeclKind::TypeSet(index) => {
-				let decl = &sema.decls.typesets[usize::from(index)];
-				Some(format!(
-					"typeset {}",
-					renderer.name(sema.decls.item(decl.loc).name)
-				))
+				Some(renderer.typeset(index, definition))
 			}
 			DeclKind::Memory(index) => {
 				let decl = &sema.decls.memories[usize::from(index)];
@@ -123,7 +117,8 @@ pub(crate) fn signature(
 		Definition::TypeParam { env, index } => {
 			let names = sema.generic_envs.param_names(env);
 			let name = names.get(index as usize)?;
-			Some(format!("type {}", renderer.name(*name)))
+			let head = format!("type {}", renderer.name(*name));
+			Some(renderer.bounded(head, definition))
 		}
 		Definition::Member(MemberKind::Function(function))
 		| Definition::Member(MemberKind::Method(function)) => {
@@ -291,16 +286,40 @@ impl Renderer<'_> {
 		if names.is_empty() {
 			return String::new();
 		}
-		let mut result = String::from("<");
-		use std::fmt::Write;
-		for (i, name) in names.iter().enumerate() {
-			if i > 0 {
-				result.push_str(", ");
-			}
-			write!(result, "{}", self.name(*name)).unwrap();
+		let params: Vec<_> = (names.iter().enumerate())
+			.map(|(index, name)| {
+				let index = index as u32;
+				let head = self.name(*name).to_string();
+				self.bounded(head, Definition::TypeParam { env, index })
+			})
+			.collect();
+		format!("<{}>", params.join(", "))
+	}
+
+	/// `head`, followed by the bounds written on `definition`, if any.
+	fn bounded(&self, head: String, definition: Definition) -> String {
+		match self.sema.display_written_bounds(self.strings, definition) {
+			Some(bounds) => format!("{head}: {bounds}"),
+			None => head,
 		}
-		result.push('>');
-		result
+	}
+
+	/// `typeset Name: Bounds { A, B }`: its bounds and its members.
+	fn typeset(&self, index: TypesetIdx, definition: Definition) -> String {
+		let decl = &self.sema.decls.typesets[usize::from(index)];
+		let name = self.name(self.sema.decls.item(decl.loc).name);
+		let members: Vec<_> = (decl.member_impls.iter())
+			.filter_map(|&member| {
+				let header =
+					self.sema.trait_impls[usize::from(member)].as_ref()?;
+				Some(self.ty(header.target.inner))
+			})
+			.collect();
+		format!(
+			"{} {{ {} }}",
+			self.bounded(format!("typeset {name}"), definition),
+			members.join(", ")
+		)
 	}
 
 	fn function(&self, function: FunctionIdx) -> String {
@@ -392,15 +411,21 @@ impl Renderer<'_> {
 		)
 	}
 
+	/// `type Name: Bounds = Value`: a declaration's bounds and default, or
+	/// an impl's value.
 	fn associated_type(&self, index: AssocTypeIdx) -> String {
 		let decl = &self.sema.decls.assoc_types[usize::from(index)];
 		let name = self.name(self.sema.decls.item(decl.loc).name);
+		let head = self.bounded(
+			format!("type {name}"),
+			Definition::Member(MemberKind::AssociatedType(index)),
+		);
 		match self.sema.assoc_types[usize::from(index)]
 			.as_ref()
 			.and_then(|signature| signature.value)
 		{
-			Some(value) => format!("type {name} = {}", self.ty(value)),
-			None => format!("type {name}"),
+			Some(value) => format!("{head} = {}", self.ty(value)),
+			None => head,
 		}
 	}
 

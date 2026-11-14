@@ -1,7 +1,7 @@
 # LSP completion
 
-Status: steps 1 to 5 done (2026-11-14, branch `tir-refactor`); `use`
-trees and members through a type (`Point::`) next, then step 6.
+Status: steps 1 to 5 and `use` trees done (2026-11-14, branch
+`tir-refactor`); members through a type (`Point::`) next, then step 6.
 Supersedes `lsp-completions.md`, a session log from the removed `wx-lsp-next`
 crate, kept for history.
 
@@ -309,6 +309,31 @@ that inserts the ascription.
    block's
    statements carry the span of their braces, so the room inside a
    keyword block starts at its `{`, not at `block`.
+   `use` trees: a `use` is written in a scope, not a declaration
+   (`Within::Use`: the file's, or the one an inline module or import block
+   opens, `Semantics::file_scope`/`scope_entered_by`). Its first segment is
+   looked up as any path's (the scope, then the prelude:
+   `Semantics::names_in_scope`), and offers namespaces; a segment with more
+   after it offers namespaces (`NameUse::Namespace`: modules, packages,
+   enums, import blocks); the last after a prefix offers anything, each name
+   once and no path keyword (`NameUse::Import`); in a group, a gap is a leaf,
+   minus the names the group lists. An alias and a `*` offer nothing. `use |`
+   keeps its item (the parser's `parse_use_root`). `names_in` takes the
+   accessor `Scope` (`declaration_scope` gives a declaration's).
+   `where { .. }` entries: inside the braces (`BoundExpression::WithBindings`
+   keeps `open_brace`), an entry's name, or one not written yet, is one of
+   `Semantics::binding_names(trait, tiers)`: the trait's own associated
+   types and constants, then its supertraits'
+   where only one declares the name, as `binding_target` selects, minus the
+   names written. An entry marked `const` offers constants, one with its
+   `=` or `:` written types, and any other both, a constant inserted as
+   `const LEN`.
+   Nearest first (the trait's own, then its supertraits breadth-first, by
+   the supertraits each trait writes itself), and an inherited one names its
+   trait as a method does, `Repr (as StackValue)`.
+   The parser keeps `{ Si }` and `{ Size = }` with an error type spanning
+   the gap, and `{ const }` with the error symbol as its name (one E1002
+   each); the checker adds only E2078 for a name the trait lacks.
 4. Done: `Body::operand_of(ast, expr)` (and `operand_ty`) returns
    `tir::Operand`, the type `build_operand` already built with, moved into
    `body.rs`. It looks through a tuple of one and an ascription, which add no

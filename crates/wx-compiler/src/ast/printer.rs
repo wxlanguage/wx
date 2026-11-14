@@ -1116,7 +1116,7 @@ impl<'a> Printer<'a> {
 		match self.ast.bound(bound) {
 			BoundExpression::Error => "<error>".to_string(),
 			BoundExpression::Path(segments) => self.type_path(segments),
-			BoundExpression::WithBindings { path, bindings } => {
+			BoundExpression::WithBindings { path, bindings, .. } => {
 				let bindings = self
 					.ast
 					.list(bindings)

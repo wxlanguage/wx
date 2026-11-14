@@ -946,7 +946,7 @@ fn hover_renders_signatures_from_the_resolved_name() {
 	let call = hover("add", 1).expect("hover on the call");
 	assert!(
 		call.starts_with(
-			"```wx\nfunc add<T>(a: i32, b: i32, extra: T) -> i32\n```"
+			"```wx\nfunc add<T: StackValue>(a: i32, b: i32, extra: T) -> i32\n```"
 		),
 		"{call}"
 	);
@@ -965,7 +965,7 @@ fn hover_renders_signatures_from_the_resolved_name() {
 		"```wx\nstruct Point(x: i32, y: i32)\n```"
 	);
 	assert_eq!(hover("i32", 1).unwrap(), "```wx\ntype i32\n```");
-	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T\n```");
+	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T: StackValue\n```");
 	assert_eq!(hover("export", 0), None);
 }
 
@@ -1060,15 +1060,15 @@ fn hover_separates_inherent_impl_and_function_type_params() {
 	for (needle, expected) in [
 		(
 			"size(",
-			"impl<Mem> Layout<Mem>\nfunc size(self: Layout<Mem>) -> <Mem as Memory>::Size",
+			"impl<Mem: Memory> Layout<Mem>\nfunc size(self: Layout<Mem>) -> <Mem as Memory>::Size",
 		),
 		(
 			"with_extra",
-			"impl<Mem> Layout<Mem>\nfunc with_extra<T>(self: Layout<Mem>, extra: T) -> T",
+			"impl<Mem: Memory> Layout<Mem>\nfunc with_extra<T: StackValue>(self: Layout<Mem>, extra: T) -> T",
 		),
 		(
 			"make",
-			"impl<Mem> Layout<Mem>\nfunc make(size: <Mem as Memory>::Size) -> Layout<Mem>",
+			"impl<Mem: Memory> Layout<Mem>\nfunc make(size: <Mem as Memory>::Size) -> Layout<Mem>",
 		),
 	] {
 		for occurrence in 0..2 {
@@ -1110,7 +1110,7 @@ fn hover_separates_trait_impl_and_function_type_params() {
 	let uri = Uri::from_file_path(&root).unwrap();
 	assert_eq!(
 		hover_text(&state, &uri, source, "convert", 0).unwrap(),
-		"```wx\ntrait Convert\nfunc convert<U>(self: Self, value: U) -> U\n```",
+		"```wx\ntrait Convert\nfunc convert<U: StackValue>(self: Self, value: U) -> U\n```",
 	);
 	assert_eq!(
 		hover_text(&state, &uri, source, "identity", 0).unwrap(),
@@ -1119,11 +1119,11 @@ fn hover_separates_trait_impl_and_function_type_params() {
 	for (needle, expected) in [
 		(
 			"convert",
-			"impl<T> Convert for Wrapper<T>\nfunc convert<U>(self: Wrapper<T>, value: U) -> U",
+			"impl<T: StackValue> Convert for Wrapper<T>\nfunc convert<U: StackValue>(self: Wrapper<T>, value: U) -> U",
 		),
 		(
 			"identity",
-			"impl<T> Convert for Wrapper<T>\nfunc identity(self: Wrapper<T>) -> Wrapper<T>",
+			"impl<T: StackValue> Convert for Wrapper<T>\nfunc identity(self: Wrapper<T>) -> Wrapper<T>",
 		),
 	] {
 		for occurrence in 1..3 {
@@ -1167,12 +1167,14 @@ fn hover_and_goto_definition_work_on_the_declaration_itself() {
 	assert_eq!(hover("Red", 0).unwrap(), "```wx\nColor::Red = 0\n```");
 	let function = hover("twice", 0).unwrap();
 	assert!(
-		function.starts_with("```wx\nfunc twice<T>(value: i32, extra: T)"),
+		function.starts_with(
+			"```wx\nfunc twice<T: StackValue>(value: i32, extra: T)"
+		),
 		"{function}"
 	);
 	assert!(function.contains("Doubles."), "{function}");
 	assert_eq!(hover("value:", 0).unwrap(), "```wx\nvalue: i32\n```");
-	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T\n```");
+	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T: StackValue\n```");
 	assert_eq!(
 		hover("total", 0).unwrap(),
 		"```wx\nlocal mut total: i32\n```"
@@ -2192,8 +2194,6 @@ fn completion_offers_nothing_where_no_name_is_looked_up() {
 		// A parameter's own name, and its type's later segment.
 		"func f(cou$0nt: u32) {}\n",
 		"func f(p: Point::$0) {}\n",
-		// A use and an export.
-		"use hel$0per;\n",
 		// Right after a call's arguments.
 		"func f() {\n    helper()$0;\n}\n",
 		// A keyword block's keyword and label, before its braces.
@@ -2206,6 +2206,114 @@ fn completion_offers_nothing_where_no_name_is_looked_up() {
 			"{source:?}"
 		);
 	}
+}
+
+const USE_ITEMS: &str = "mod shapes {
+    pub struct Square(pub side: u32);
+    pub func area() -> u32 { 1 }
+    func hidden() {}
+    pub mod inner { pub func deep() {} }
+    pub enum Kind(u8) { A = 0, B }
+}
+";
+
+/// The labels offered at `$0` in a `use` written after `USE_ITEMS`, sorted.
+fn use_completions(source: &str) -> Option<Vec<String>> {
+	let mut labels = completions(&format!("{USE_ITEMS}{source}"))?;
+	labels.sort();
+	Some(labels)
+}
+
+#[test]
+fn completion_of_a_use_path_starts_in_its_scope_and_the_prelude() {
+	let root = ["Bool", "Ordering", "core", "package", "self", "shapes"];
+	for source in [
+		"use $0;\n",
+		"use sha$0;\n",
+		"use sha$0::*;\n",
+		"use $0\nfunc f() {}\n",
+	] {
+		assert_eq!(use_completions(source).unwrap(), root, "{source:?}");
+	}
+	// No enclosing module's names, and `core` is bound in the root only.
+	assert_eq!(
+		use_completions("mod m {\n    use $0;\n}\n").unwrap(),
+		["Bool", "Ordering", "package", "self", "super"]
+	);
+	assert_eq!(
+		use_completions("import \"env\" as env {\n    use $0;\n}\n").unwrap(),
+		["Bool", "Ordering", "package", "self", "super"]
+	);
+}
+
+#[test]
+fn completion_of_a_use_path_continues_into_namespaces() {
+	assert_eq!(
+		use_completions("use shapes::in$0ner::deep;\n").unwrap(),
+		["Kind", "inner", "package", "self"]
+	);
+	assert_eq!(
+		use_completions("use shapes::Kind::$0;\n").unwrap(),
+		["A", "B"]
+	);
+}
+
+#[test]
+fn completion_of_a_use_leaf_offers_anything_once() {
+	// `hidden` is private to `shapes`; `Square` and `area` are in both tiers.
+	assert_eq!(
+		use_completions("use shapes::$0;\n").unwrap(),
+		["Kind", "Square", "area", "inner"]
+	);
+	assert_eq!(
+		use_completions("use shapes::inner::$0;\n").unwrap(),
+		["deep"]
+	);
+	// A group: a gap is a leaf, minus the names the group lists already.
+	assert_eq!(
+		use_completions("use shapes::{area, $0};\n").unwrap(),
+		["Kind", "Square", "inner"]
+	);
+	assert_eq!(
+		use_completions("use shapes::{ar$0, Kind};\n").unwrap(),
+		["Square", "area", "inner"]
+	);
+	assert_eq!(
+		use_completions("use shapes::{area, inner::$0};\n").unwrap(),
+		["deep"]
+	);
+	assert_eq!(
+		use_completions("use shapes::{area, in$0ner::deep};\n").unwrap(),
+		["Kind", "inner", "package", "self"]
+	);
+}
+
+#[test]
+fn completion_of_a_use_offers_nothing_for_an_alias_or_a_glob() {
+	for source in [
+		"use shapes::area as a$0;\n",
+		"use shapes::{area as a$0};\n",
+		"use shapes::*$0;\n",
+	] {
+		assert_eq!(use_completions(source), None, "{source:?}");
+	}
+}
+
+#[test]
+fn completion_of_a_use_inserts_the_name_only() {
+	let items =
+		completion_items(&format!("{USE_ITEMS}use shapes::ar$0;\n"), true)
+			.unwrap();
+	let area = items
+		.iter()
+		.find(|item| item.filter_text.as_deref() == Some("area"))
+		.unwrap();
+	assert_eq!(area.insert_text.as_deref(), Some("area"));
+	assert_ne!(
+		area.insert_text_format,
+		Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET),
+		"no call snippet: {area:?}"
+	);
 }
 
 #[test]
@@ -2396,6 +2504,171 @@ fn completion_in_a_missing_function_result_offers_types() {
 	}
 }
 
+const BINDING_ITEMS: &str = "trait Base { type Item; const LEN: const_int; const SIZE: u32; }
+trait Container: Base { type Key; const COUNT: const_int; type Value; func get(self: Self); }
+trait Other { type Item; }
+trait Both: Base + Other { type Own; }
+trait Deep: Container { type Extra; }
+";
+
+fn binding_completions(source: &str) -> Option<Vec<String>> {
+	let mut labels = completions(&format!("{BINDING_ITEMS}{source}\n"))?;
+	labels.sort();
+	Some(labels)
+}
+
+#[test]
+fn completion_of_a_where_entry_offers_associated_types_and_constants() {
+	for source in [
+		"func f<T: Container where { $0 }>() {}",
+		"func f<T: Container where {$0}>() {}",
+		"func f<T: Container where { Va$0 }>() {}",
+		"trait X { type T: Container where { $0 }; }",
+		"func f<T: Show + Container where { $0 }>() {}",
+	] {
+		assert_eq!(
+			binding_completions(source).unwrap(),
+			["COUNT", "Item", "Key", "LEN", "SIZE", "Value"],
+			"{source:?}"
+		);
+	}
+	// An entry with its `=` written is a type's, one marked `const` a
+	// constant's.
+	assert_eq!(
+		binding_completions("func f<T: Container where { Va$0 = u8 }>() {}")
+			.unwrap(),
+		["Item", "Key", "Value"]
+	);
+	assert_eq!(
+		binding_completions("func f<T: Container where { const L$0 }>() {}")
+			.unwrap(),
+		["COUNT", "LEN", "SIZE"]
+	);
+	// The names written already are not offered again.
+	assert_eq!(
+		binding_completions(
+			"func f<T: Container where { Key = u32, const LEN: u8, $0 }>() {}"
+		)
+		.unwrap(),
+		["COUNT", "Item", "SIZE", "Value"]
+	);
+	assert_eq!(
+		binding_completions(
+			"func f<T: Container where { Key = u32, It$0, Value = u8 }>() {}"
+		)
+		.unwrap(),
+		["COUNT", "Item", "LEN", "SIZE"]
+	);
+	// Two supertraits declaring `Item` make it ambiguous, as the checker
+	// finds it.
+	assert_eq!(
+		binding_completions("func f<T: Both where { $0 }>() {}").unwrap(),
+		["LEN", "Own", "SIZE"]
+	);
+	assert_eq!(
+		binding_completions("func f<M: Memory where { $0 }>() {}").unwrap(),
+		["DATA_END", "PAGE_SIZE", "Repr", "Size"]
+	);
+	assert_eq!(
+		binding_completions("func f<T: Array where { $0 }>() {}").unwrap(),
+		["LEN", "Value"]
+	);
+}
+
+#[test]
+fn completion_of_a_where_entry_lists_the_nearest_trait_first() {
+	let entries = |source: &str| {
+		completion_items(&format!("{BINDING_ITEMS}{source}\n"), false)
+			.unwrap()
+			.into_iter()
+			.map(|item| {
+				let from =
+					item.label_details.and_then(|details| details.detail);
+				(item.label, from)
+			})
+			.collect::<Vec<_>>()
+	};
+	let own = |name: &str| (name.to_string(), None);
+	let from = |name: &str, from: &str| {
+		(name.to_string(), Some(format!("(as {from})")))
+	};
+	assert_eq!(
+		entries("func f<T: Deep where { $0 }>() {}"),
+		[
+			own("Extra"),
+			from("Key", "Container"),
+			from("COUNT", "Container"),
+			from("Value", "Container"),
+			from("Item", "Base"),
+			from("LEN", "Base"),
+			from("SIZE", "Base"),
+		]
+	);
+	assert_eq!(
+		entries("func f<M: Memory where { $0 }>() {}"),
+		[
+			own("Size"),
+			own("DATA_END"),
+			own("PAGE_SIZE"),
+			from("Repr", "StackValue"),
+		]
+	);
+}
+
+#[test]
+fn completion_of_a_where_entry_inserts_a_constants_keyword() {
+	let inserted = |source: &str| {
+		completion_items(&format!("{BINDING_ITEMS}{source}\n"), true)
+			.unwrap()
+			.into_iter()
+			.map(|item| {
+				(
+					item.filter_text.unwrap_or(item.label.clone()),
+					item.insert_text,
+				)
+			})
+			.collect::<Vec<_>>()
+	};
+	let name = |name: &str| (name.to_string(), None);
+	let constant =
+		|name: &str| (name.to_string(), Some(format!("const {name}")));
+	for source in [
+		"func f<T: Base where { $0 }>() {}",
+		"func f<T: Base where { L$0 }>() {}",
+	] {
+		assert_eq!(
+			inserted(source),
+			[name("Item"), constant("LEN"), constant("SIZE")]
+		);
+	}
+	for source in [
+		"func f<T: Base where { const L$0 }>() {}",
+		"func f<T: Base where { const $0 }>() {}",
+		"func f<T: Base where { const $0}>() {}",
+		"func f<T: Base where { Item = u8, const $0 }>() {}",
+		"func f<T: Base where { const $0, Item = u8 }>() {}",
+	] {
+		assert_eq!(inserted(source), [name("LEN"), name("SIZE")], "{source:?}");
+	}
+}
+
+#[test]
+fn completion_after_a_where_entry_offers_types_or_bounds() {
+	let labels =
+		binding_completions("func f<T: Container where { Key = $0 }>() {}")
+			.unwrap();
+	assert_offers(&labels, &["u32", "Bool"], &["Base", "Item", "Key"]);
+	let labels =
+		binding_completions("func f<T: Container where { Key: $0 }>() {}")
+			.unwrap();
+	assert_offers(&labels, &["Base", "Add"], &["u32", "Key"]);
+	// Outside the braces, nothing of the trait's.
+	assert_eq!(
+		binding_completions("func f<T: Container where$0 { }>() {}"),
+		None
+	);
+}
+
 #[test]
 fn completion_distinguishes_bounds_from_impl_traits() {
 	const ITEMS: &str = "trait Show {}\ntypeset Small { u8, u16 }\nstruct Point();\nfunc helper() {}\n";
@@ -2476,6 +2749,26 @@ fn completion_of_a_named_argument_offers_the_callees_names() {
 		))
 		.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
 		assert_offers(&labels, expected, absent);
+	}
+}
+
+#[test]
+fn completion_of_a_named_argument_through_self_offers_the_structs_fields() {
+	const PAIR: &str = "struct Pair(first: u32, second: u32);\n";
+	for source in [
+		"impl Pair { func make() -> Self { Self({ $0 }) } }",
+		"impl Pair { func make() -> Self { Pair({ $0 }) } }",
+		"impl Pair { func make() -> Self { Self({ first: 1, $0 }) } }",
+		"trait Make { func make() -> Self; }\nimpl Make for Pair { func make() -> Self { Self({ $0 }) } }",
+	] {
+		let labels = completions(&format!("{PAIR}{source}\n"))
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		let expected: &[&str] = if source.contains("first: 1") {
+			&["second"]
+		} else {
+			&["first", "second"]
+		};
+		assert_eq!(labels, expected, "{source:?}");
 	}
 }
 
@@ -3489,4 +3782,62 @@ fn named_argument_completion_keeps_declaration_types_without_a_checked_call() {
 	assert_eq!(items.len(), 1);
 	assert_eq!(items[0].label, "rhs");
 	assert_eq!(items[0].detail.as_deref(), Some("rhs: Self"));
+}
+
+#[test]
+fn hover_shows_the_bounds_written_on_a_type() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		trait Show {}
+		trait Container: StackValue {
+		    type Item: Show + StackValue;
+		    type Key = u32;
+		    type Value: StackValue where { Repr: StackScalar };
+		    func get(self: Self) -> Self;
+		}
+		struct Box(value: u32);
+		impl Container for Box {
+		    type Item = Box;
+		    type Value = u32;
+		    func get(self: Self) -> Self { self }
+		}
+		typeset Small: Add { u8, u16 }
+		func f<M: Memory where { Size = u32 }, T: Container where { Value: Show }>(m: M) {}
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(&root).unwrap();
+	let hover = |needle, occurrence| {
+		hover_text(&state, &uri, source, needle, occurrence).unwrap()
+	};
+	for (needle, occurrence, expected) in [
+		// An associated type's declaration, with its default, and nested
+		// bindings; an impl's value has no bounds of its own.
+		("Item", 0, "type Item: Show + StackValue"),
+		("Key", 0, "type Key = u32"),
+		(
+			"Value:",
+			0,
+			"type Value: StackValue where { Repr: StackScalar }",
+		),
+		("Item", 1, "type Item = Box"),
+		// What a trait or typeset writes, not what it implies; a trait's
+		// own `Self` is the trait.
+		("Container", 0, "trait Container: StackValue"),
+		("Self", 0, "type Self: Container"),
+		("Small", 0, "typeset Small: Add { u8, u16 }"),
+		// Type parameters, alone and in their declaration's signature.
+		("M:", 0, "type M: Memory where { Size = u32 }"),
+		("T:", 0, "type T: Container where { Value: Show }"),
+		(
+			"f<",
+			0,
+			"func f<M: Memory where { Size = u32 }, T: Container where { Value: Show }>(m: M) -> ()",
+		),
+	] {
+		assert_eq!(
+			hover(needle, occurrence),
+			format!("```wx\n{expected}\n```"),
+			"{needle}, occurrence {occurrence}"
+		);
+	}
 }

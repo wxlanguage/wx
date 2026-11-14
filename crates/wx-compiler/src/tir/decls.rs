@@ -156,10 +156,11 @@ impl Tier {
 	}
 }
 
-/// What a path's final name must denote in its context. `Type`, `Bound`
-/// and `Trait` all use the type tier, but accept different declarations:
-/// `resolve_type_path`, `resolve_trait_bound_path` and `resolve_trait`
-/// make those decisions in the checker.
+/// What a path's final name must denote in its context. `Type`, `Bound`,
+/// `Trait` and `Namespace` all use the type tier, but accept different
+/// declarations: `resolve_type_path`, `resolve_trait_bound_path` and
+/// `resolve_trait` make those decisions in the checker, and import
+/// resolution `Namespace`'s.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum NameUse {
@@ -171,14 +172,24 @@ pub enum NameUse {
 	Bound,
 	/// The trait in `impl X for T`: a declared trait, never a typeset.
 	Trait,
+	/// A `use` path's segment with more after it, or its first: a namespace
+	/// the path continues into.
+	Namespace,
+	/// A `use` path's last segment after a prefix: anything, since the leaf
+	/// binds the name in both tiers.
+	Import,
 }
 
 impl NameUse {
-	/// The tier the name is looked up in.
-	pub fn tier(self) -> Tier {
+	/// Whether the name is looked up in `tier`.
+	fn looked_up_in(self, tier: Tier) -> bool {
 		match self {
-			NameUse::Value => Tier::Value,
-			NameUse::Type | NameUse::Bound | NameUse::Trait => Tier::Type,
+			NameUse::Value => tier == Tier::Value,
+			NameUse::Import => true,
+			NameUse::Type
+			| NameUse::Bound
+			| NameUse::Trait
+			| NameUse::Namespace => tier == Tier::Type,
 		}
 	}
 
@@ -186,23 +197,30 @@ impl NameUse {
 	/// tier, every declaration found by lookup is a value.
 	pub(super) fn takes(self, kind: DeclKind) -> bool {
 		match (self, kind.type_role()) {
-			(NameUse::Value, _) => true,
+			(NameUse::Value | NameUse::Import, _) => true,
 			(_, None) => false,
 			(NameUse::Type, Some(role)) => role == TypeRole::Type,
 			(NameUse::Bound, Some(role)) => {
 				matches!(role, TypeRole::Trait | TypeRole::TypeSet)
 			}
 			(NameUse::Trait, Some(role)) => role == TypeRole::Trait,
+			// An enum is a type, and the namespace of its variants.
+			(NameUse::Namespace, Some(role)) => {
+				role == TypeRole::Namespace || matches!(kind, DeclKind::Enum(_))
+			}
 		}
 	}
 
-	/// The tiers completion lists names from: the one the name is looked up
+	/// The tiers completion lists names from: the ones the name is looked up
 	/// in, and for a value the type tier too, since a path's prefix is read
 	/// as a type (`shapes::area`).
 	pub(super) fn listed_tiers(self) -> &'static [Tier] {
 		match self {
-			NameUse::Value => &[Tier::Value, Tier::Type],
-			NameUse::Type | NameUse::Bound | NameUse::Trait => &[Tier::Type],
+			NameUse::Value | NameUse::Import => &[Tier::Value, Tier::Type],
+			NameUse::Type
+			| NameUse::Bound
+			| NameUse::Trait
+			| NameUse::Namespace => &[Tier::Type],
 		}
 	}
 
@@ -210,7 +228,7 @@ impl NameUse {
 	/// can end the path, found where the name is looked up, or it is a
 	/// namespace the path can continue into (`shapes::Square`).
 	pub(super) fn admits(self, tier: Tier, kind: DeclKind) -> bool {
-		(tier == self.tier() && self.takes(kind))
+		(self.looked_up_in(tier) && self.takes(kind))
 			|| kind.type_role() == Some(TypeRole::Namespace)
 	}
 }

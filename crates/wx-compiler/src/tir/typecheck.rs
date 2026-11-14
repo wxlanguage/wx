@@ -8393,6 +8393,15 @@ mod tests {
 		let (case, _) = TestCase::recovered("use nowhere::;\n");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
+		// A bound's entry: a constant's name, a type's `=` and its type.
+		for source in [
+			"func f<T: Array where { const }>() {}\n",
+			"func f<T: Array where { const, Value = u8 }>() {}\n",
+			"func f<M: Memory where { Size }>() {}\n",
+			"func f<M: Memory where { Size = }>() {}\n",
+		] {
+			assert_recovered(source, unexpected);
+		}
 	}
 
 	/// The statement after an unfinished one, and the items after it, are

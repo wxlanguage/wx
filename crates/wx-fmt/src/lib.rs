@@ -3022,7 +3022,7 @@ impl<'a> Builder<'a> {
 			ast::BoundExpression::Path(segs) => {
 				self.build_type_path(ast.list(segs))
 			}
-			ast::BoundExpression::WithBindings { path, bindings } => {
+			ast::BoundExpression::WithBindings { path, bindings, .. } => {
 				// `where { A = u32, B: Tr }` when it fits; otherwise one
 				// binding per line, as other braced lists break.
 				let base_id = self.build_type_path(ast.list(path));

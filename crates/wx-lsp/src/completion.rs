@@ -5,7 +5,8 @@
 //! The syntax only says what kind of position the cursor is in, and which
 //! declaration it is in, by the span of it the checker keeps; every
 //! candidate comes from the checker's own lookups (`Semantics::names_at`,
-//! `names_in_signature`, `names_in`, `member_names`, `Body::labels_at`), so
+//! `names_in_signature`, `names_in`, `names_in_scope`, `member_names`,
+//! `Body::labels_at`), so
 //! nothing is offered that the checker would not accept written there.
 
 use string_interner::symbol::SymbolU32;
@@ -21,11 +22,12 @@ use wx_compiler::ast::{
 	ImplItem, ImportDeclaration, ImportEntry, InColumn, Item, List,
 	NamedArgument, PatId, Path, PathSegment, Pattern, PatternElement,
 	PatternFieldItem, QualifiedPathRoot, Spanned, Statement, TraitItem,
-	TypeArgument, TypeExpression, TypeId, TypeParam,
+	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::tir::{
-	DeclKind, Definition, LabelKind, MemberKind, MemberOwner, NameUse,
+	BindingName, DeclKind, Definition, LabelKind, MemberKind, MemberOwner,
+	NameUse, Tier, TraitIdx,
 };
 
 use crate::call;
@@ -56,11 +58,26 @@ pub(crate) fn completion(
 	)?;
 	let declaration = match within {
 		Within::Signature(Anchor::Name(name)) | Within::Body(name) => {
-			snapshot.declared_at(SourceSpan::new(file, name))?
+			Some(snapshot.declared_at(SourceSpan::new(file, name))?)
 		}
 		Within::Signature(Anchor::ImplTarget(target)) => {
-			snapshot.impl_with_target(SourceSpan::new(file, target))?
+			Some(snapshot.impl_with_target(SourceSpan::new(file, target))?)
 		}
+		Within::Use(_) => None,
+	};
+	// Where a `use` is written: the file, or the module or import block
+	// named at a span.
+	let use_scope = match within {
+		Within::Use(Enclosing::File) => Some(snapshot.sema.file_scope(file)),
+		Within::Use(Enclosing::Name(name)) => {
+			let Definition::Item(loc) =
+				snapshot.declared_at(SourceSpan::new(file, name))?
+			else {
+				return None;
+			};
+			Some(snapshot.sema.scope_entered_by(loc)?)
+		}
+		_ => None,
 	};
 	let ast = snapshot.compilation.ast(file);
 	let sema = &mut snapshot.sema;
@@ -88,11 +105,12 @@ pub(crate) fn completion(
 	let names = match site {
 		Site::Name(used_as) => match within {
 			Within::Body(_) => {
-				sema.names_at(sema.body_of(declaration)?, offset, used_as)
+				sema.names_at(sema.body_of(declaration?)?, offset, used_as)
 			}
 			Within::Signature(_) => {
-				sema.names_in_signature(declaration, used_as)
+				sema.names_in_signature(declaration?, used_as)
 			}
+			Within::Use(_) => sema.names_in_scope(use_scope?, used_as),
 		},
 		// What the prefix means, as checking resolved it; a prefix that did
 		// not resolve has nothing after it.
@@ -101,16 +119,31 @@ pub(crate) fn completion(
 			let Definition::Item(prefix) = reference.definition() else {
 				return None;
 			};
-			sema.names_in(declaration, prefix, used_as)
+			let accessor = match use_scope {
+				Some(scope) => scope,
+				None => sema.declaration_scope(declaration?)?,
+			};
+			sema.names_in(accessor, prefix, used_as)
+		}
+		// A name a group lists already would be bound twice.
+		Site::Import { prefix, written } => {
+			let (_, reference) = sema.symbol_at(file, prefix.start)?;
+			let Definition::Item(prefix) = reference.definition() else {
+				return None;
+			};
+			sema.names_in(use_scope?, prefix, NameUse::Import)
+				.into_iter()
+				.filter(|(name, _)| !written.contains(name))
+				.collect()
 		}
 		Site::Member { object } => {
-			let owner = sema.body_of(declaration)?;
+			let owner = sema.body_of(declaration?)?;
 			let body = sema.owner_body(owner)?;
 			let receiver = body.operand_ty(body.operand_of(ast, object)?);
 			sema.member_names(&snapshot.strings, owner, receiver)
 		}
 		Site::Label(jump) => {
-			let owner = sema.body_of(declaration)?;
+			let owner = sema.body_of(declaration?)?;
 			let body = sema.owner_body(owner)?;
 			body.labels_at(offset)
 				.into_iter()
@@ -127,6 +160,28 @@ pub(crate) fn completion(
 				})
 				.collect()
 		}
+		// A name written twice is a duplicate binding, so the ones written
+		// are not offered again.
+		Site::Binding {
+			bound,
+			entry,
+			written,
+		} => {
+			let (_, reference) = sema.symbol_at(file, bound.start)?;
+			let Definition::Item(bound) = reference.definition() else {
+				return None;
+			};
+			let items = (sema.binding_names(bound, entry.tiers()).into_iter())
+				.filter(|binding| {
+					!written.contains(&(binding.member.tier(), binding.name))
+				})
+				.enumerate()
+				.map(|(index, binding)| {
+					binding_item(snapshot, binding, entry, index, label_details)
+				})
+				.collect();
+			return Some(CompletionResponse::Array(items));
+		}
 		// A name written twice is reported (E2121), so the ones written are
 		// not offered again.
 		Site::Argument {
@@ -140,7 +195,7 @@ pub(crate) fn completion(
 			// Names and visibility still come from the checker's contract.
 			// Only their displayed types use this call's inferred arguments.
 			argument_types = sema
-				.body_of(declaration)
+				.body_of(declaration?)
 				.and_then(|owner| {
 					call::signature(sema, &snapshot.strings, owner, ast, call)
 				})
@@ -196,6 +251,8 @@ pub(crate) enum Within {
 	Signature(Anchor),
 	/// The body of the declaration named at this span.
 	Body(TextSpan),
+	/// A `use`, written directly in a scope rather than in a declaration.
+	Use(Enclosing),
 }
 
 impl Within {
@@ -214,6 +271,37 @@ impl Within {
 pub(crate) enum Anchor {
 	Name(TextSpan),
 	ImplTarget(TextSpan),
+}
+
+/// The scope a `use` is written in: the file's own, or the one a module or
+/// an import block named at this span opens.
+#[derive(Clone, Copy)]
+pub(crate) enum Enclosing {
+	File,
+	Name(TextSpan),
+}
+
+/// What the entry of a bound's `where { .. }` block at the cursor can still
+/// name.
+#[derive(Clone, Copy)]
+pub(crate) enum Entry {
+	/// Not written yet, or a name with nothing after it: an associated type,
+	/// or a constant, inserted with its `const`.
+	Unmarked,
+	/// An associated type's, its `=` or `:` written.
+	Type,
+	/// A constant's, marked `const`.
+	Constant,
+}
+
+impl Entry {
+	fn tiers(self) -> &'static [Tier] {
+		match self {
+			Self::Unmarked => &[Tier::Type, Tier::Value],
+			Self::Type => &[Tier::Type],
+			Self::Constant => &[Tier::Value],
+		}
+	}
 }
 
 /// What an item inserts: its name, or, for a function, method or constructor in
@@ -242,6 +330,20 @@ pub(crate) enum Site {
 	Member { object: ExprId },
 	/// The label of a jump.
 	Label(Jump),
+	/// The last segment of a `use` path, after the one written at `prefix`,
+	/// in a group that lists `written` already.
+	Import {
+		prefix: TextSpan,
+		written: Vec<SymbolU32>,
+	},
+	/// The name of an entry of a bound's `where { .. }` block, the `entry`
+	/// at the cursor: a member of the trait whose name is written at `bound`,
+	/// not among the `written` ones (by tier).
+	Binding {
+		bound: TextSpan,
+		entry: Entry,
+		written: Vec<(Tier, SymbolU32)>,
+	},
 	/// The name of an argument in a call by name: one of the parameters of
 	/// the callee whose last name is written at `callee`, in `call`, after
 	/// the first `given` (a method call's receiver), and not among the
@@ -281,6 +383,12 @@ fn item(
 		Definition::Field { .. } => (CompletionItemKind::FIELD, 0),
 		Definition::Member(MemberKind::Method(_)) => {
 			(CompletionItemKind::METHOD, 0)
+		}
+		Definition::Member(MemberKind::AssociatedType(_)) => {
+			(CompletionItemKind::STRUCT, 0)
+		}
+		Definition::Member(MemberKind::Constant(_)) => {
+			(CompletionItemKind::CONSTANT, 0)
 		}
 		Definition::Item(loc) => {
 			let kind = match snapshot.sema.declaration_kind(loc) {
@@ -363,13 +471,7 @@ fn item(
 					MemberOwner::Free | MemberOwner::InherentImpl(_) => None,
 				};
 				if let Some(index) = trait_index {
-					let decl = &snapshot.sema.decls.traits[usize::from(index)];
-					if let Some(name) = snapshot
-						.strings
-						.resolve(snapshot.sema.decls.item(decl.loc).name.inner)
-					{
-						detail = Some(format!("(as {name})"));
-					}
+					detail = as_trait(snapshot, index);
 				}
 			}
 			CompletionItemLabelDetails {
@@ -414,13 +516,52 @@ fn item(
 	}
 }
 
+/// A member an entry of a bound's `where { .. }` block names, at `index` in
+/// the order the checker lists them. An inherited one names its trait, as a
+/// method does; a constant in an entry not marked yet inserts its `const`.
+fn binding_item(
+	snapshot: &Snapshot,
+	binding: BindingName,
+	entry: Entry,
+	index: usize,
+	label_details: bool,
+) -> CompletionItem {
+	let mut item = item(
+		snapshot,
+		binding.name,
+		Definition::Member(binding.member),
+		Insert::Name,
+		Some(index),
+		label_details,
+	);
+	if let (Entry::Unmarked, MemberKind::Constant(_)) = (entry, binding.member)
+	{
+		item.insert_text = Some(format!("const {}", item.label));
+		item.filter_text = Some(item.label.clone());
+	}
+	if label_details && let Some(from) = binding.inherited_from {
+		item.label_details = Some(CompletionItemLabelDetails {
+			detail: as_trait(snapshot, from),
+			description: None,
+		});
+	}
+	item
+}
+
+/// The secondary label of a member a trait supplies: `(as Trait)`.
+fn as_trait(snapshot: &Snapshot, index: TraitIdx) -> Option<String> {
+	let decls = &snapshot.sema.decls;
+	let name = decls.item(decls.traits[usize::from(index)].loc).name.inner;
+	Some(format!("(as {})", snapshot.strings.resolve(name)?))
+}
+
 /// What can be written at `offset`, and where: a name being written (its
 /// own span reaches the cursor), a member after an object, or a value or
 /// type not written yet (an error node the parser kept, or the room between
 /// a block's statements or a list's elements), in a declaration's signature
 /// or body. `None`
 /// anywhere else: in a comment, a declaration's own name, a literal, a
-/// segment after a type, a `use` or an `export`.
+/// segment after a type, a `use` path's alias or `*`, or an `export`.
 ///
 /// One path down the module's syntax: at each level the child at the
 /// cursor is found by a binary search of its siblings, which are in source
@@ -436,7 +577,7 @@ pub(crate) fn position_at(
 	if comment.is_some_and(|comment| comment.span.start < offset) {
 		return None;
 	}
-	cursor.item(&cursor.node(ast.root)?)
+	cursor.item(&cursor.node(ast.root)?, Enclosing::File)
 }
 
 /// A piece of syntax the walker searches by where it is written.
@@ -535,7 +676,8 @@ impl Cursor<'_> {
 		self.at(siblings.get(index)?.span()).then_some(index)
 	}
 
-	fn item(&self, item: &Item) -> Option<Position> {
+	/// An item written in the scope `scope`.
+	fn item(&self, item: &Item, scope: Enclosing) -> Option<Position> {
 		match item {
 			Item::Function {
 				signature, block, ..
@@ -643,11 +785,21 @@ impl Cursor<'_> {
 				target,
 				items,
 			} => self.impl_block(*type_params, Some(trait_name), target, *items),
-			Item::Import { entries, .. } => {
-				let ImportEntry::Declaration { declaration, .. } =
-					&self.node(*entries)?
-				else {
-					return None;
+			Item::Import {
+				entries,
+				internal_name,
+				..
+			} => {
+				let entry = self.node(*entries)?;
+				let declaration = match &entry {
+					ImportEntry::Declaration { declaration, .. } => declaration,
+					ImportEntry::Use { tree, .. } => {
+						return self.use_tree(
+							self.ast.use_tree(*tree),
+							None,
+							Enclosing::Name(internal_name.span),
+						);
+					}
 				};
 				match declaration {
 					ImportDeclaration::Function { signature } => {
@@ -660,13 +812,104 @@ impl Cursor<'_> {
 					}
 				}
 			}
-			Item::Module { items, .. } => self.item(&self.node(*items)?),
+			Item::Module { name, items, .. } => {
+				self.item(&self.node(*items)?, Enclosing::Name(name.span))
+			}
+			Item::Use { tree, .. } => {
+				self.use_tree(self.ast.use_tree(*tree), None, scope)
+			}
 			Item::Export { .. }
 			| Item::ExportBlock { .. }
 			| Item::ModuleDeclaration { .. }
-			| Item::PackageInstance { .. }
-			| Item::Use { .. } => None,
+			| Item::PackageInstance { .. } => None,
 		}
+	}
+
+	/// A `use` tree written in `scope`, after the segment written at
+	/// `prefix`, as import resolution reads it: the first segment is looked
+	/// up in the scope, one with more after it is a namespace, and the last
+	/// after a prefix (a leaf) is anything. Inside a group's braces, a gap
+	/// between branches is a leaf not written yet. An alias and a `*` are
+	/// nothing to complete.
+	fn use_tree(
+		&self,
+		tree: UseTree,
+		prefix: Option<TextSpan>,
+		scope: Enclosing,
+	) -> Option<Position> {
+		// A segment with more after it, or the first one.
+		let continued = |segment: Spanned<_>| {
+			self.at(segment.span).then_some(match prefix {
+				None => Site::Name(NameUse::Namespace),
+				Some(prefix) => Site::Segment {
+					prefix,
+					used_as: NameUse::Namespace,
+				},
+			})
+		};
+		let site = match tree {
+			UseTree::Name { segment, .. } => match prefix {
+				None => continued(segment),
+				Some(prefix) => self.at(segment.span).then(|| Site::Import {
+					prefix,
+					written: Vec::new(),
+				}),
+			},
+			UseTree::Glob { segment } => continued(segment),
+			UseTree::Path { segment, rest } => {
+				if continued(segment).is_none() {
+					let rest = self.ast.use_tree(rest);
+					return self.use_tree(rest, Some(segment.span), scope);
+				}
+				continued(segment)
+			}
+			UseTree::Group {
+				segment,
+				branches,
+				braces,
+			} => {
+				if continued(segment).is_some() || !self.inside(braces) {
+					continued(segment)
+				} else {
+					let trees = self.ast.list(branches);
+					let at = self
+						.child_index_by(self.ast.spans(branches), |span| *span);
+					match at.map(|index| trees[index]) {
+						// Its alias.
+						Some(UseTree::Name { segment: name, .. })
+							if !self.at(name.span) =>
+						{
+							None
+						}
+						Some(
+							branch @ (UseTree::Path { .. }
+							| UseTree::Glob { .. }
+							| UseTree::Group { .. }),
+						) => {
+							return self.use_tree(
+								branch,
+								Some(segment.span),
+								scope,
+							);
+						}
+						// A leaf being written, or one not written yet.
+						_ => Some(Site::Import {
+							prefix: segment.span,
+							written: (trees.iter().enumerate())
+								.filter(|&(index, _)| Some(index) != at)
+								.filter_map(|(_, tree)| match tree {
+									UseTree::Name { segment, .. } => {
+										Some(segment.inner)
+									}
+									_ => None,
+								})
+								.collect(),
+						}),
+					}
+				}
+			}
+		};
+		Within::Use(scope).position(site)
 	}
 
 	/// A function, by its name: its signature, then its body if it has one.
@@ -735,36 +978,100 @@ impl Cursor<'_> {
 		}
 	}
 
+	/// A bound names a trait or a typeset; a binding's own name (`Size` in
+	/// `where { Size = u32 }`) is a member of the trait.
 	fn bound(&self, bound: BoundId) -> Option<Site> {
-		if !self.at(self.ast.bound_span(bound)) {
+		let ast = self.ast;
+		let span = ast.bound_span(bound);
+		if !self.at(span) {
 			return None;
 		}
-		self.bound_expression(self.ast.bound(bound))
-	}
-
-	/// A bound names a trait or a typeset; a binding's own name (`Size` in
-	/// `where { Size = u32 }`) is a member of it, not completed yet.
-	fn bound_expression(&self, bound: BoundExpression) -> Option<Site> {
-		let ast = self.ast;
-		match bound {
+		match ast.bound(bound) {
 			// A bound the parser expected and did not find.
 			BoundExpression::Error => Some(Site::Name(NameUse::Bound)),
 			BoundExpression::Path(segments) => {
 				self.path(ast.list(segments), NameUse::Bound)
 			}
-			BoundExpression::WithBindings { path, bindings } => self
-				.path(ast.list(path), NameUse::Bound)
-				.or_else(|| match self.child(ast.list(bindings))?.kind {
+			BoundExpression::WithBindings {
+				path,
+				bindings,
+				open_brace,
+			} => self.path(ast.list(path), NameUse::Bound).or_else(|| {
+				self.bindings(
+					ast.list(path).last()?.ident.span,
+					ast.list(bindings),
+					TextSpan::new(open_brace, span.end),
+				)
+			}),
+			BoundExpression::BoundList(bounds) => self.bound(
+				*self.child_by(ast.list(bounds), |&b| ast.bound_span(b))?,
+			),
+		}
+	}
+
+	/// A bound's `where { .. }` entries, in their braces: the name of the
+	/// one at the cursor, or one not written yet in the room between two, is
+	/// a member of the trait named at `bound` that the entry can still name
+	/// (`Entry`), minus the names written already; after its `=` or `:` is
+	/// a type or a bound.
+	fn bindings(
+		&self,
+		bound: TextSpan,
+		bindings: &[AssocBinding],
+		braces: TextSpan,
+	) -> Option<Site> {
+		if !self.inside(braces) {
+			return None;
+		}
+		let at = self.child_index_by(bindings, |binding| binding.span);
+		let mut entry = Entry::Unmarked;
+		if let Some(at) = at {
+			let binding = &bindings[at];
+			if !self.at(binding.name.span) {
+				return match binding.kind {
 					AssocBindingKind::Equals(ty)
 					| AssocBindingKind::ConstRepresentable { ty, .. } => self.ty(ty),
 					AssocBindingKind::Bound(bound) => self.bound(bound),
 					AssocBindingKind::ConstEquals { value, .. } => {
 						self.const_argument(value)
 					}
-				}),
-			BoundExpression::BoundList(bounds) => self.bound(
-				*self.child_by(ast.list(bounds), |&b| ast.bound_span(b))?,
-			),
+				};
+			}
+			entry = self.entry(binding);
+		}
+		Some(Site::Binding {
+			bound,
+			entry,
+			written: (bindings.iter().enumerate())
+				.filter(|&(index, _)| Some(index) != at)
+				.map(|(_, binding)| {
+					let tier = match self.entry(binding) {
+						Entry::Constant => Tier::Value,
+						Entry::Unmarked | Entry::Type => Tier::Type,
+					};
+					(tier, binding.name.inner)
+				})
+				.collect(),
+		})
+	}
+
+	/// What an entry of a `where` block is, by what is written around its
+	/// name. A name with nothing after it is kept with an error type that
+	/// starts right at its end, where its `=` would be (`{ Si }`).
+	fn entry(&self, binding: &AssocBinding) -> Entry {
+		match binding.kind {
+			AssocBindingKind::ConstRepresentable { .. }
+			| AssocBindingKind::ConstEquals { .. } => Entry::Constant,
+			AssocBindingKind::Equals(ty)
+				if matches!(self.ast.ty(ty), TypeExpression::Error)
+					&& self.ast.type_span(ty).start
+						== binding.name.span.end =>
+			{
+				Entry::Unmarked
+			}
+			AssocBindingKind::Equals(_) | AssocBindingKind::Bound(_) => {
+				Entry::Type
+			}
 		}
 	}
 
