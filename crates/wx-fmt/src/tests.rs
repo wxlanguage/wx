@@ -371,12 +371,69 @@ fn test_format_trait_items() {
                 type Output: Show + Clone;
 
                 const SIZE: u32;
-
                 func render(self: Self);
 
                 #[inline]
                 func grow(self: Self, delta: u32) -> u32 {
                     delta
+                }
+            }
+        "}
+	);
+}
+
+#[test]
+fn a_declaration_ending_in_a_brace_stands_apart_and_others_keep_their_grouping()
+{
+	// An impl's constants keep the author's grouping (at most one blank line);
+	// a function, which ends at its `}`, stands apart from both neighbours.
+	let source = indoc! {"
+        impl Errno {
+            pub const SUCCESS: Self = Self(0);
+            pub const BADF: Self = Self(8);
+
+
+            pub const PIPE: Self = Self(64);
+            pub func code(self: Self) -> u16 { 0 }
+            pub const LAST: Self = Self(76);
+        }
+    "};
+	assert_eq!(
+		checked_format(source, 80, 4),
+		indoc! {"
+            impl Errno {
+                pub const SUCCESS: Self = Self(0);
+                pub const BADF: Self = Self(8);
+
+                pub const PIPE: Self = Self(64);
+
+                pub func code(self: Self) -> u16 {
+                    0
+                }
+
+                pub const LAST: Self = Self(76);
+            }
+        "}
+	);
+
+	// A trait's bodiless declarations group like constants; a default body
+	// stands apart.
+	let source = indoc! {"
+        trait Order {
+            func lt(self: Self, other: Self) -> Bool;
+            func le(self: Self, other: Self) -> Bool;
+            func ge(self: Self, other: Self) -> Bool { other.le(self) }
+        }
+    "};
+	assert_eq!(
+		checked_format(source, 80, 4),
+		indoc! {"
+            trait Order {
+                func lt(self: Self, other: Self) -> Bool;
+                func le(self: Self, other: Self) -> Bool;
+
+                func ge(self: Self, other: Self) -> Bool {
+                    other.le(self)
                 }
             }
         "}

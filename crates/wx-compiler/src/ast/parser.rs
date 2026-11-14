@@ -629,25 +629,19 @@ impl ListItem for MatchArm {
 
 impl ListItem for Item {
 	fn ends_in_block(&self, _ast: &AstBuilder) -> bool {
-		self.is_block_like()
+		self.ends_in_brace()
 	}
 }
 
 impl ListItem for ImplItem {
 	fn ends_in_block(&self, _ast: &AstBuilder) -> bool {
-		match self {
-			ImplItem::Function { .. } => true,
-			ImplItem::Constant { .. } | ImplItem::AssocType { .. } => false,
-		}
+		self.ends_in_brace()
 	}
 }
 
 impl ListItem for TraitItem {
 	fn ends_in_block(&self, _ast: &AstBuilder) -> bool {
-		match self {
-			TraitItem::Function { body, .. } => body.is_some(),
-			TraitItem::Const { .. } | TraitItem::AssociatedType { .. } => false,
-		}
+		self.ends_in_brace()
 	}
 }
 

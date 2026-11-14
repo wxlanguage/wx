@@ -43,17 +43,11 @@ pub struct Errno(pub code: u16);
 
 impl Errno {
     pub const SUCCESS: Self = Self(0);
-
     pub const AGAIN: Self = Self(6);
-
     pub const BADF: Self = Self(8);
-
     pub const INTR: Self = Self(27);
-
     pub const INVAL: Self = Self(28);
-
     pub const IO: Self = Self(29);
-
     pub const PIPE: Self = Self(64);
 
     /// Ends the program, with the code as its exit status, unless this is
@@ -104,9 +98,7 @@ import "wasi_snapshot_preview1" as sys {
 
 impl Fd {
     pub const STDIN: Self = Self(0);
-
     pub const STDOUT: Self = Self(1);
-
     pub const STDERR: Self = Self(2);
 
     /// The descriptor the host numbered `raw`.

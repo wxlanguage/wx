@@ -356,12 +356,34 @@ enum Before {
 	/// The end of an entry's content. A comment on that same line trails it,
 	/// and a blank line the author left is kept.
 	Entry { end: u32 },
-	/// An entry that always stands apart from the next — a block-like item, an
-	/// impl member. Like `Entry`, but a blank line goes in even where the
+	/// An entry that always stands apart from the next — a declaration that
+	/// ends in `}`, or one followed by such a declaration. Like `Entry`, but a blank line goes in even where the
 	/// author left none, even before the comments that close a list, so a
 	/// list's last gap is always an `Entry`: there is nothing following for
 	/// it to stand apart from.
 	SpacedEntry { end: u32 },
+}
+
+impl Before {
+	/// The gap before an item of a list of declarations (a file, a `mod`, an
+	/// impl or a trait body) that opens at `from`, given the item before it
+	/// (its end, and whether it ended in `}`) and whether this one ends in
+	/// `}`. An item that ends at its own `}` stands apart from its neighbours,
+	/// however the author spaced them; between items that end in `;` the
+	/// author's blank line is kept, as a grouping (a run of constants).
+	fn declaration(
+		from: u32,
+		previous: Option<(u32, bool)>,
+		ends_in_brace: bool,
+	) -> Self {
+		match previous {
+			None => Before::Opener { from },
+			Some((end, previous)) if previous || ends_in_brace => {
+				Before::SpacedEntry { end }
+			}
+			Some((end, _)) => Before::Entry { end },
+		}
+	}
 }
 
 /// What sits *after* a gap. Decides only whether a line is opened once the
@@ -664,33 +686,22 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		// The item before, and whether it is block-like.
+		// The item before, and whether it ended in `}`. Before the first, the
+		// opener is the file header or the line opening a `mod` body; at the
+		// top of a file the break it emits has nothing in front of it and
+		// disappears.
 		let mut previous: Option<(u32, bool)> = None;
 		for item in ast.spanned(items) {
-			let block_like = item.inner.is_block_like();
-			let before = match previous {
-				// The file header, or the line opening a `mod` body. At the
-				// top of a file the break this emits has nothing in front of
-				// it and disappears.
-				None => Before::Opener { from: span.start },
-				// Block-like items always stand apart, however the author
-				// spaced them.
-				Some((end, previous_block_like))
-					if previous_block_like || block_like =>
-				{
-					Before::SpacedEntry { end }
-				}
-				Some((end, _)) => Before::Entry { end },
-			};
+			let ends_in_brace = item.inner.ends_in_brace();
 			self.push_between(
 				&mut nodes,
-				before,
+				Before::declaration(span.start, previous, ends_in_brace),
 				After::Entry {
 					start: item.span.start,
 				},
 			);
 			nodes.push(self.build_item(&item.inner, item.span));
-			previous = Some((item.span.end, block_like));
+			previous = Some((item.span.end, ends_in_brace));
 		}
 		// Comments after the last item, before the closing `}` or the end of
 		// the file: all of them, in a header-only file or a `mod` body with
@@ -1296,27 +1307,24 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		let mut previous_end = None;
+		let mut previous: Option<(u32, bool)> = None;
 		for item in ast.spanned(items) {
+			let ends_in_brace = item.inner.ends_in_brace();
 			self.push_between(
 				&mut nodes,
-				match previous_end {
-					None => Before::Opener { from: span.start },
-					// Impl members always stand apart.
-					Some(end) => Before::SpacedEntry { end },
-				},
+				Before::declaration(span.start, previous, ends_in_brace),
 				After::Entry {
 					start: item.span.start,
 				},
 			);
 			nodes.push(self.build_impl_item(&item.inner));
-			previous_end = Some(item.span.end);
+			previous = Some((item.span.end, ends_in_brace));
 		}
 		self.push_between(
 			&mut nodes,
-			match previous_end {
+			match previous {
 				None => Before::Opener { from: span.start },
-				Some(end) => Before::Entry { end },
+				Some((end, _)) => Before::Entry { end },
 			},
 			After::End { at: span.end },
 		);
@@ -1437,27 +1445,24 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		let mut previous_end = None;
+		let mut previous: Option<(u32, bool)> = None;
 		for item in ast.spanned(items) {
+			let ends_in_brace = item.inner.ends_in_brace();
 			self.push_between(
 				&mut nodes,
-				match previous_end {
-					None => Before::Opener { from: span.start },
-					// Trait members always stand apart, like impl members.
-					Some(end) => Before::SpacedEntry { end },
-				},
+				Before::declaration(span.start, previous, ends_in_brace),
 				After::Entry {
 					start: item.span.start,
 				},
 			);
 			nodes.push(self.build_trait_item(&item.inner));
-			previous_end = Some(item.span.end);
+			previous = Some((item.span.end, ends_in_brace));
 		}
 		self.push_between(
 			&mut nodes,
-			match previous_end {
+			match previous {
 				None => Before::Opener { from: span.start },
-				Some(end) => Before::Entry { end },
+				Some((end, _)) => Before::Entry { end },
 			},
 			After::End { at: span.end },
 		);

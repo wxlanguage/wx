@@ -21,25 +21,15 @@ struct Errno(pub code: u16);
 
 impl Errno {
     pub const SUCCESS: Self = Self(0);
-
     pub const AGAIN: Self = Self(6);
-
     pub const BADF: Self = Self(8);
-
     pub const FAULT: Self = Self(21);
-
     pub const FBIG: Self = Self(22);
-
     pub const INTR: Self = Self(27);
-
     pub const INVAL: Self = Self(28);
-
     pub const IO: Self = Self(29);
-
     pub const NOSPC: Self = Self(51);
-
     pub const PERM: Self = Self(63);
-
     pub const PIPE: Self = Self(64);
 }
 

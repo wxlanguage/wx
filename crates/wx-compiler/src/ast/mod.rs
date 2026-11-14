@@ -862,6 +862,28 @@ pub enum TraitItem {
 	},
 }
 
+impl ImplItem {
+	/// Whether the member ends at its own `}` (a function), so no `;` follows
+	/// it; see [`Item::ends_in_brace`].
+	pub fn ends_in_brace(&self) -> bool {
+		match self {
+			ImplItem::Function { .. } => true,
+			ImplItem::Constant { .. } | ImplItem::AssocType { .. } => false,
+		}
+	}
+}
+
+impl TraitItem {
+	/// Whether the member ends at its own `}` (a function with a default
+	/// body), so no `;` follows it; see [`Item::ends_in_brace`].
+	pub fn ends_in_brace(&self) -> bool {
+		match self {
+			TraitItem::Function { body, .. } => body.is_some(),
+			TraitItem::Const { .. } | TraitItem::AssociatedType { .. } => false,
+		}
+	}
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct FunctionSignature {
@@ -1135,8 +1157,10 @@ pub struct StructField {
 }
 
 impl Item {
-	/// Whether the item ends at its own `}`, so no `;` follows it.
-	pub fn is_block_like(&self) -> bool {
+	/// Whether the item ends at its own `}`, so no `;` follows it. The
+	/// formatter puts a blank line around such an item; between items that end
+	/// in `;` it keeps the author's.
+	pub fn ends_in_brace(&self) -> bool {
 		match self {
 			Item::Function { .. }
 			| Item::ExportBlock { .. }
