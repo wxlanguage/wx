@@ -182,13 +182,11 @@ means on a struct, restricted by the enum being closed:
 - **In a `match`,** `Ordering(n)` matches every value: after all the variants
   it is unreachable (correct for a closed enum), and before some of them it is
   a catch-all that binds the number.
-- **Namespace.** An enum's name is in the type namespace only, so today both
-  `local E(n) = e` and `E(x)` are E2007, "cannot find value `E`". The pattern
-  should resolve it as the enum (a struct pattern is resolved through the value
-  namespace, where a struct's name also is); whether the enum's name enters the
-  value namespace, as a struct's does (and so may no longer share its name with
-  a function), or the pattern looks it up as a type, is the implementer's
-  choice. Either way the construction error above has to be reachable.
+- **Namespace.** Decided: the enum's name is in the value namespace too, as a
+  struct's is (so it may not share its name with a function or a struct in the
+  same scope). `E(n)` then resolves as a struct pattern does, `E(x)` reaches the
+  construction error (E2142), and a bare `E` is "expected a value, found enum"
+  (E2110).
 - **Field access** `o.value` is a read of the one field, as on a struct; there
   is no positional access (`o.0`), as there is none on a struct or a tuple.
 - **Several fields** are the deferred wider reprs below: written with this
@@ -206,6 +204,25 @@ need no new syntax when wider reprs come; until then the signature check reports
 them unsupported (E2114). wx-fmt prints the list as a struct's, and `mut` is
 reported by the signature check (E2141, `MutableEnumRepr`), since it is
 well-formed syntax that means nothing here.
+
+Step 2 (reading) is done. The repr's fields live in the same field arena as a
+struct's (`Declarations::fields`, owned by a `FieldOwner`), and the struct
+pattern and field access code reads either: `PatternKind::Fields { owner, .. }`
+replaces `PatternKind::Struct`, and `ExprKind::FieldAccess` takes its owner
+from the object's type. On an enum:
+
+- a pattern of its fields holds no test (E2143, `TestInEnumRepr`, and the
+  pattern is then the error pattern); usefulness counts it as `_`, so after
+  every variant it is unreachable and before some a catch-all;
+- a field access is always a value, never a place, so `=`, `op=` and `.&` on
+  it are refused (E2013, "cannot assign to the repr of enum");
+- reading needs every field read to be visible (E2076);
+- lowering reuses the struct path: a pattern retypes the matched scalar as the
+  repr, and a field read is the enum's value itself.
+
+Step 3 (the construction error) came with it: `E(5)` and `E({ value: 5 })`
+are E2142, `EnumConstructedFromRepr`. Left: step 4, `pub` on core's reprs and
+replacing `transmute` where reading the field says the same.
 
 ### Change 2: remove open enums
 

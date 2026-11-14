@@ -266,6 +266,8 @@ define_diagnostic_codes! {
 		InvalidMemoryLimits => "E2139",
 		LocalInStaticData => "E2140",
 		MutableEnumRepr => "E2141",
+		EnumConstructedFromRepr => "E2142",
+		TestInEnumRepr => "E2143",
 	}
 }
 

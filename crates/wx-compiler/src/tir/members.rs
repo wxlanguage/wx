@@ -19,8 +19,8 @@ use super::body::BodyOwner;
 use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
 use super::decls::{
 	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, Declarations, Declared,
-	FieldIdx, FunctionIdx, InherentImplIdx, MemberKind, MemberOwner, Scope,
-	SignatureQuery, StructIdx, Tier, TraitIdx, TraitImplIdx,
+	FieldIdx, FieldOwner, FunctionIdx, InherentImplIdx, MemberKind,
+	MemberOwner, Scope, SignatureQuery, Tier, TraitIdx, TraitImplIdx,
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
@@ -1118,28 +1118,23 @@ impl Semantics {
 			Type::Pointer { to, .. } => to,
 			_ => receiver,
 		};
-		if let Type::Struct { struct_index, .. } = *self.types.resolve(object) {
-			let decl = &self.decls.structs[usize::from(struct_index)];
-			for (at, name) in
-				self.decls.fields.names(decl.fields).iter().enumerate()
+		let owner = match *self.types.resolve(object) {
+			Type::Struct { struct_index, .. } => {
+				Some(FieldOwner::Struct(struct_index))
+			}
+			Type::Enum { enum_index } => Some(FieldOwner::Enum(enum_index)),
+			_ => None,
+		};
+		if let Some(owner) = owner {
+			let fields = owner.fields(&self.decls);
+			for (at, name) in self.decls.fields.names(fields).iter().enumerate()
 			{
 				let field = FieldIdx::new(at as u32);
 				if let Some(name) = *name
-					&& self.decls.fields.lookup(decl.fields, name)
-						== Some(field) && self.field_accessible(
-					struct_index,
-					field,
-					scope.namespace,
-				) {
-					found.push((
-						name,
-						Definition::Field {
-							owner: crate::tir::decls::FieldOwner::Struct(
-								struct_index,
-							),
-							field,
-						},
-					));
+					&& self.decls.fields.lookup(fields, name) == Some(field)
+					&& self.field_accessible(owner, field, scope.namespace)
+				{
+					found.push((name, Definition::Field { owner, field }));
 				}
 			}
 		}
@@ -1329,19 +1324,19 @@ impl Semantics {
 		)
 	}
 
-	/// Whether `field` of the struct `struct_index` is visible from
+	/// Whether `field` of `owner`, a struct or an enum, is visible from
 	/// `accessor`, by its own `pub`.
 	pub(super) fn field_accessible(
 		&self,
-		struct_index: StructIdx,
+		owner: FieldOwner,
 		field: FieldIdx,
 		accessor: Scope,
 	) -> bool {
-		let decl = &self.decls.structs[usize::from(struct_index)];
+		let fields = owner.fields(&self.decls);
 		self.decls.namespaces.is_accessible_from(
 			accessor,
-			self.decls.scope(decl.loc).into(),
-			self.decls.fields.visibility(decl.fields)[usize::from(field)],
+			self.decls.scope(owner.loc(&self.decls)).into(),
+			self.decls.fields.visibility(fields)[usize::from(field)],
 		)
 	}
 

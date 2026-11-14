@@ -1890,6 +1890,11 @@ impl<'a> Lowerer<'a> {
 		field: FieldIdx,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
+		// An enum is held as its repr, so its one field is the value itself.
+		let object_ty = self.expr_ty(body, state, object);
+		if let Type::Enum { .. } = *self.sema.types.resolve(object_ty) {
+			return self.lower_expr(body, state, object);
+		}
 		// A chain rooted in a local needs just one absolute slot selection,
 		// rather than a temporary subpack for every source field on the path.
 		let mut root = object;
@@ -1904,7 +1909,6 @@ impl<'a> Lowerer<'a> {
 		if state.ty(object_value) == mir::ValueType::Never {
 			return Ok(object_value);
 		}
-		let object_ty = self.expr_ty(body, state, object);
 		let range =
 			self.field_range(object_ty, state, field, body.span(expr))?;
 		let (set, run) = self.temporary(state, object_value);
@@ -2729,6 +2733,56 @@ mod tests {
 		assert_eq!(f.call(&mut store, 0).unwrap(), 10);
 		assert_eq!(f.call(&mut store, 8).unwrap(), 20);
 		assert_eq!(f.call(&mut store, 77).unwrap(), 177);
+	}
+
+	#[test]
+	fn an_enums_repr_is_the_variants_number() {
+		// Read by position, by name, by field access, and as a catch-all;
+		// a negative number keeps its sign.
+		let (mut store, instance) = instantiate(
+			r#"
+			enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
+			enum Ordering2(i8) { Less = -1, Equal = 0, Greater = 1 }
+			func pick(x: u32) -> Signal {
+				if x == 0 { Signal::Hangup } else { Signal::Interrupt }
+			}
+			func by_field(x: u32) -> i32 { pick(x).number }
+			func by_position(x: u32) -> i32 { local Signal(n) = pick(x); n }
+			func by_name(x: u32) -> i32 { local Signal({ number }) = pick(x); number }
+			func order(x: i32) -> i32 {
+				local o = if x < 0 {
+					Ordering2::Less
+				} else if x == 0 {
+					Ordering2::Equal
+				} else {
+					Ordering2::Greater
+				};
+				match o {
+					Ordering2::Equal => 100,
+					Ordering2(n) => transmute::<i8, i32>(n),
+				}
+			}
+			export {
+				by_field as "by_field",
+				by_position as "by_position",
+				by_name as "by_name",
+				order as "order",
+			}
+		"#,
+		);
+		for name in ["by_field", "by_position", "by_name"] {
+			let f = instance
+				.get_typed_func::<u32, i32>(&mut store, name)
+				.unwrap();
+			assert_eq!(f.call(&mut store, 0).unwrap(), 1, "{name}");
+			assert_eq!(f.call(&mut store, 1).unwrap(), 2, "{name}");
+		}
+		let order = instance
+			.get_typed_func::<i32, i32>(&mut store, "order")
+			.unwrap();
+		assert_eq!(order.call(&mut store, -5).unwrap(), -1);
+		assert_eq!(order.call(&mut store, 0).unwrap(), 100);
+		assert_eq!(order.call(&mut store, 5).unwrap(), 1);
 	}
 
 	#[test]

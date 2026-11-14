@@ -22,7 +22,7 @@ use crate::symbols::Keyword;
 use crate::tir::body::{
 	ExprIdx, ExprKind, Operand, Place, PlaceIdx, PlaceKind,
 };
-use crate::tir::decls::TraitIdx;
+use crate::tir::decls::{FieldOwner, TraitIdx};
 use crate::tir::operators::is_primitive_binary;
 use crate::tir::resolutions::{AccessKind, Reference, Site};
 use crate::tir::solver::SolverError;
@@ -196,7 +196,7 @@ impl BodyBuilder<'_, '_> {
 			}));
 			object_ty = to;
 		}
-		let Some((field, ty)) =
+		let Some((owner, field, ty)) =
 			self.select_field(object_ty, member, access, site)
 		else {
 			return Operand::Value(self.body.push(
@@ -205,6 +205,20 @@ impl BodyBuilder<'_, '_> {
 				span,
 			));
 		};
+		// An enum's repr is read, never written: its value is always one of
+		// the variants. So it is a value even where the enum is a place, and
+		// `=` and `.&` on it are refused as on any value.
+		if let FieldOwner::Enum(_) = owner {
+			let object = match object {
+				Operand::Place(place) => self.load(place),
+				Operand::Value(value) => value,
+			};
+			return Operand::Value(self.body.push(
+				ExprKind::FieldAccess { object, field },
+				ty,
+				span,
+			));
+		}
 		match object {
 			Operand::Place(object) => {
 				let Place {
@@ -505,7 +519,7 @@ impl BodyBuilder<'_, '_> {
 		member: Spanned<SymbolU32>,
 		access: AccessKind,
 		site: &mut Option<Site>,
-	) -> Option<(crate::tir::decls::FieldIdx, TypeIndex)> {
+	) -> Option<(FieldOwner, crate::tir::decls::FieldIdx, TypeIndex)> {
 		// No name is written (`x.` unfinished): the parser reported it.
 		if object_ty == TypeIndex::ERROR
 			|| member.inner == Keyword::Error.symbol()
@@ -513,46 +527,59 @@ impl BodyBuilder<'_, '_> {
 			return None;
 		}
 		let name = self.builder.strings.resolve(member.inner).unwrap();
-		let Type::Struct {
-			struct_index,
-			type_args,
-		} = *self.sema.types.resolve(object_ty)
-		else {
-			let found = self
-				.sema
-				.type_formatter(self.builder.strings)
-				.display_type(object_ty);
-			let mut diagnostic = Diagnostic::error()
-				.with_code(DiagnosticCode::UnknownStructField.code())
-				.with_message(format!("no field `{name}` on type `{found}`"))
-				.with_label(Label::primary(self.scope.file_id, member.span));
-			// The object was a pointer to it, gone through once already.
-			if matches!(
-				self.sema.types.resolve(object_ty),
-				Type::Pointer { .. }
-			) {
-				diagnostic = diagnostic.with_note(
-					"a field is reached through one pointer, not two: \
+		let (owner, type_args) = match *self.sema.types.resolve(object_ty) {
+			Type::Struct {
+				struct_index,
+				type_args,
+			} => (FieldOwner::Struct(struct_index), type_args),
+			// An enum has no type parameters.
+			Type::Enum { enum_index } => (
+				FieldOwner::Enum(enum_index),
+				crate::tir::types::TypeList::EMPTY,
+			),
+			_ => {
+				let found = self
+					.sema
+					.type_formatter(self.builder.strings)
+					.display_type(object_ty);
+				let mut diagnostic = Diagnostic::error()
+					.with_code(DiagnosticCode::UnknownStructField.code())
+					.with_message(format!(
+						"no field `{name}` on type `{found}`"
+					))
+					.with_label(Label::primary(
+						self.scope.file_id,
+						member.span,
+					));
+				// The object was a pointer to it, gone through once already.
+				if matches!(
+					self.sema.types.resolve(object_ty),
+					Type::Pointer { .. }
+				) {
+					diagnostic = diagnostic.with_note(
+						"a field is reached through one pointer, not two: \
 					 dereference the outer one first, as `p.*.field`",
-				);
+					);
+				}
+				self.sema.diagnostics.push(diagnostic);
+				return None;
 			}
-			self.sema.diagnostics.push(diagnostic);
-			return None;
 		};
-		let decl = &self.sema.decls.structs[usize::from(struct_index)];
-		let struct_name = self
+		let decls = &self.sema.decls;
+		let noun = owner.noun();
+		let owner_name = self
 			.builder
 			.strings
-			.resolve(self.sema.decls.item(decl.loc).name.inner)
+			.resolve(decls.item(owner.loc(decls)).name.inner)
 			.unwrap();
 		let Some(field) =
-			self.sema.decls.fields.lookup(decl.fields, member.inner)
+			decls.fields.lookup(owner.fields(decls), member.inner)
 		else {
 			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::UnknownStructField.code())
 					.with_message(format!(
-						"no such field `{name}` in struct `{struct_name}`"
+						"no such field `{name}` in {noun} `{owner_name}`"
 					))
 					.with_label(Label::primary(
 						self.scope.file_id,
@@ -567,21 +594,20 @@ impl BodyBuilder<'_, '_> {
 			recorded,
 			Reference::Field {
 				access,
-				owner: crate::tir::decls::FieldOwner::Struct(struct_index),
+				owner,
 				field,
 			},
 		);
 		*site = Some(recorded);
-		if !self.sema.field_accessible(
-			struct_index,
-			field,
-			self.scope.namespace,
-		) {
+		if !self
+			.sema
+			.field_accessible(owner, field, self.scope.namespace)
+		{
 			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::PrivateStructField.code())
 					.with_message(format!(
-						"field `{name}` of struct `{struct_name}` is private"
+						"field `{name}` of {noun} `{owner_name}` is private"
 					))
 					.with_label(
 						Label::primary(self.scope.file_id, member.span)
@@ -589,21 +615,31 @@ impl BodyBuilder<'_, '_> {
 					),
 			);
 		}
-		let declared = self
-			.sema
-			.types
-			.list(self.sema.structs[usize::from(struct_index)].field_types)
-			[usize::from(field)];
-		let args = self.sema.types.list(type_args).to_vec();
-		let ty = self.sema.types.substitute(
-			declared,
-			Substitution {
-				envs: &self.sema.generic_envs,
-				env: self.sema.structs[usize::from(struct_index)].type_params,
-				args: &args,
-			},
-		);
-		Some((field, self.context().normalized(ty)))
+		let ty = match owner {
+			FieldOwner::Struct(struct_index) => {
+				let signature = &self.sema.structs[usize::from(struct_index)];
+				let (declared, env) = (
+					self.sema.types.list(signature.field_types)
+						[usize::from(field)],
+					signature.type_params,
+				);
+				let args = self.sema.types.list(type_args).to_vec();
+				self.sema.types.substitute(
+					declared,
+					Substitution {
+						envs: &self.sema.generic_envs,
+						env,
+						args: &args,
+					},
+				)
+			}
+			FieldOwner::Enum(enum_index) => self
+				.sema
+				.types
+				.list(self.sema.enums[usize::from(enum_index)].field_types)
+				[usize::from(field)],
+		};
+		Some((owner, field, self.context().normalized(ty)))
 	}
 
 	/// `place.&`: a shared pointer to a place, in its memory. Only a place
@@ -869,11 +905,39 @@ impl BodyBuilder<'_, '_> {
 		target: ExprIdx,
 		access: AccessKind,
 	) -> bool {
+		let span = self.body.span(target);
 		let mut root = target;
 		while let ExprKind::FieldAccess { object, .. } = self.body.kind(root) {
+			// An enum's repr is never written: its value is one of the
+			// variants, so changing it is assigning one.
+			if let Type::Enum { enum_index } =
+				*self.sema.types.resolve(self.body.ty(object))
+			{
+				let name = self.sema.decls.name(enum_index).inner;
+				let name = self.builder.strings.resolve(name).unwrap();
+				self.sema.diagnostics.push(
+					Diagnostic::error()
+						.with_code(
+							DiagnosticCode::InvalidAssignmentTarget.code(),
+						)
+						.with_message(format!(
+							"cannot assign to the repr of enum `{name}`"
+						))
+						.with_label(
+							Label::primary(self.scope.file_id, span)
+								.with_message(
+									"its value is one of the variants",
+								),
+						)
+						.with_note(format!(
+							"to change the value, assign a variant: \
+							 `{name}::Variant`"
+						)),
+				);
+				return false;
+			}
 			root = object;
 		}
-		let span = self.body.span(target);
 		match self.body.kind(root) {
 			ExprKind::Error => true,
 			ExprKind::Local(local) => {

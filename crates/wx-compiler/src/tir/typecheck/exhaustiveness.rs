@@ -14,7 +14,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
 use crate::tir::body::{ExprIdx, ExprKind, PatIdx, PatternKind, PatternRange};
-use crate::tir::decls::{ConstIdx, EnumIdx};
+use crate::tir::decls::{ConstIdx, EnumIdx, FieldOwner};
 use crate::tir::eval::ConstScalar;
 use crate::tir::signatures::Semantics;
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
@@ -203,15 +203,21 @@ impl BodyContext<'_> {
 		let ty = self.body.pattern_ty(pattern);
 		Some(match self.body.pattern(pattern) {
 			PatternKind::Wildcard | PatternKind::Bind(_) => Patterns::WILD,
+			// An enum's repr holds no test (checked where it is built), so it
+			// matches whatever variant the value is.
+			PatternKind::Fields {
+				owner: FieldOwner::Enum(_),
+				..
+			} => Patterns::WILD,
 			// A struct is split as its fields' tuple; a lone field's value is
 			// not one, so it is the struct's one child.
-			PatternKind::Struct {
-				struct_index,
+			PatternKind::Fields {
+				owner: FieldOwner::Struct(struct_index),
 				fields,
 			} => {
 				let fields = self.lower_pattern(fields, pats)?;
-				let count = self.sema.structs[usize::from(struct_index)]
-					.field_types
+				let count = self.sema.decls.structs[usize::from(struct_index)]
+					.fields
 					.len();
 				if count == 1 {
 					pats.arena.ctor(Ctor::Single, &[fields])

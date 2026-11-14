@@ -1112,6 +1112,22 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.report_struct_used_as_value(name.inner, span);
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
+			DeclKind::Enum(enum_index) => {
+				let name = self.sema.decls.name(enum_index).inner;
+				let name = self.builder.strings.resolve(name).unwrap();
+				self.sema.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::StructUsedAsValue.code())
+						.with_message(format!(
+							"expected a value, found enum `{name}`"
+						))
+						.with_label(Label::primary(self.scope.file_id, span))
+						.with_note(format!(
+							"an enum's values are its variants: `{name}::Variant`"
+						)),
+				);
+				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
+			}
 			DeclKind::Function(function_index) => self.build_function_value(
 				Callee::new(self.sema, function_index, &[], 0),
 				segments.last().unwrap(),
@@ -1370,6 +1386,29 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		let kind = key.symbol_kind(&self.sema.decls);
+		// An enum's values are its variants: it is never built from its
+		// repr, by position or by name, whoever may read the repr.
+		if let DeclKind::Enum(enum_index) = kind {
+			let name = self.sema.decls.name(enum_index).inner;
+			let name = self.builder.strings.resolve(name).unwrap();
+			self.sema.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::EnumConstructedFromRepr.code())
+					.with_message(format!(
+						"enum `{name}` is not constructed from its repr"
+					))
+					.with_label(
+						Label::primary(self.scope.file_id, span)
+							.with_message("its values are its variants"),
+					)
+					.with_note(format!(
+						"name a variant, `{name}::Variant`; for a value of every \
+						 number, declare a struct holding it"
+					)),
+			);
+			self.build_unchecked_arguments(arguments);
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		}
 		// Any other item is called as the value it names.
 		if !matches!(kind, DeclKind::Struct(_) | DeclKind::Function(_)) {
 			let callee = self.build_path(
@@ -3579,15 +3618,11 @@ mod tests {
 				PatternKind::Tuple(elements) => {
 					list("tuple", body.patterns(elements))
 				}
-				PatternKind::Struct {
-					struct_index,
-					fields,
-				} => {
-					let name = self.sema.decls.name(struct_index).inner;
+				PatternKind::Fields { owner, fields } => {
+					let decls = &self.sema.decls;
+					let name = decls.item(owner.loc(decls)).name.inner;
 					let name = self.strings.resolve(name).unwrap();
-					let count = self.sema.structs[usize::from(struct_index)]
-						.field_types
-						.len();
+					let count = owner.fields(decls).len();
 					match body.pattern(fields) {
 						PatternKind::Tuple(children) if count != 1 => {
 							list(name, body.patterns(children))
@@ -6904,6 +6939,120 @@ mod tests {
 		));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+	}
+
+	#[test]
+	fn an_enums_repr_is_read_as_its_fields() {
+		// By position, by name, and by field access, typed as the repr.
+		let case = TestCase::new(indoc! {"
+				enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
+				enum Ordering2(i8) { Less = -1, Equal = 0, Greater = 1 }
+				func f(s: Signal, o: Ordering2) -> i32 {
+					local Signal(a) = s;
+					local Signal({ number }) = s;
+					local Signal(_) = s;
+					local Ordering2(b): Ordering2 = o;
+					local c: i8 = b;
+					local d: i32 = s.number;
+					a + number + d
+				}
+		"});
+		case.diagnostics().assert_none();
+
+		// Only a named repr is matched by name.
+		let case = TestCase::new(indoc! {"
+				enum Ordering2(i8) { Less = -1, Equal = 0, Greater = 1 }
+				func f(o: Ordering2) { local Ordering2({ value }) = o; }
+		"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TupleStructBracePattern]);
+	}
+
+	#[test]
+	fn an_enum_is_never_constructed_from_its_repr() {
+		let case = TestCase::new(indoc! {"
+				enum Signal(pub number: i32) { Hangup = 1, Interrupt = 2 }
+				func f() {
+					local a = Signal(5);
+					local b = Signal({ number: 5 });
+					local c = Signal;
+				}
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::EnumConstructedFromRepr,
+			DiagnosticCode::EnumConstructedFromRepr,
+			DiagnosticCode::StructUsedAsValue,
+		]);
+	}
+
+	#[test]
+	fn an_enums_repr_is_never_written() {
+		// It is a value even of a `mut` local: changing it is assigning a
+		// variant, and it has no address.
+		let case = TestCase::new(indoc! {"
+				enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
+				func f(mut s: Signal) {
+					s.number = 2;
+					s.number += 1;
+					local p = s.number.&;
+					s = Signal::Interrupt;
+				}
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::InvalidAssignmentTarget,
+			DiagnosticCode::InvalidAssignmentTarget,
+			DiagnosticCode::InvalidAssignmentTarget,
+		]);
+		case.diagnostics()
+			.assert_error_saying("cannot assign to the repr of enum `Signal`");
+	}
+
+	#[test]
+	fn an_enums_repr_matches_every_value() {
+		// After every variant it is unreachable; before them it is a
+		// catch-all that binds the number.
+		let source = |arms: &str| {
+			format!(
+				"enum Ordering2(i8) {{ Less = -1, Equal = 0, Greater = 1 }}\n\
+				 func f(o: Ordering2) -> i8 {{ match o {{ {arms} }} }}\n"
+			)
+		};
+		let case = TestCase::new(&source(
+			"Ordering2::Less => 0, Ordering2::Equal => 1, \
+			 Ordering2::Greater => 2, Ordering2(n) => n",
+		));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnreachableMatchArm]);
+		let case =
+			TestCase::new(&source("Ordering2::Less => 0, Ordering2(n) => n"));
+		case.diagnostics().assert_none();
+
+		// A test inside it is refused, and says nothing about the arms
+		// after it.
+		let case = TestCase::new(&source("Ordering2(1) => 0, _ => 1"));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TestInEnumRepr]);
+	}
+
+	#[test]
+	fn outside_its_module_an_enums_repr_is_read_where_it_is_pub() {
+		let case = TestCase::new(indoc! {"
+				mod inner {
+					pub enum Hidden(value: i8) { A = 0 }
+					pub enum Shown(pub value: i8) { A = 0 }
+					func here(h: Hidden) -> i8 { h.value }
+				}
+				func f(h: inner::Hidden, s: inner::Shown) -> i8 {
+					local inner::Hidden(a) = h;
+					local b = h.value;
+					local inner::Shown(c) = s;
+					s.value
+				}
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::PrivateStructField,
+			DiagnosticCode::PrivateStructField,
+		]);
 	}
 
 	#[test]

@@ -22,7 +22,8 @@
 use string_interner::symbol::SymbolU32;
 
 use super::decls::{
-	ConstIdx, FieldIdx, FunctionIdx, GlobalIdx, ImportIdx, MemoryIdx, StructIdx,
+	ConstIdx, FieldIdx, FieldOwner, FunctionIdx, GlobalIdx, ImportIdx,
+	MemoryIdx, StructIdx,
 };
 use super::numbers::DecimalFloat;
 use super::obligations::TypeObligation;
@@ -198,12 +199,14 @@ pub(super) enum PatternKind {
 	Bind(LocalIdx),
 	/// One child per element of the tuple's type.
 	Tuple(PatternRange),
-	/// Its fields as one value, of the struct's field tuple (a lone field's
+	/// Its fields as one value, of the owner's field tuple (a lone field's
 	/// own type): a tuple of one child per field in declaration order, or any
-	/// pattern of that type (`P(p)`, `P(_)`). The type arguments are the
-	/// pattern's type's.
-	Struct {
-		struct_index: StructIdx,
+	/// pattern of that type (`P(p)`, `P(_)`). A struct's type arguments are
+	/// the pattern's type's. An enum's fields are its repr (`Ordering(n)`),
+	/// and hold no test: the variants are its values, so its repr matches
+	/// whichever it is.
+	Fields {
+		owner: FieldOwner,
 		fields: PatIdx,
 	},
 

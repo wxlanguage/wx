@@ -168,7 +168,7 @@ impl Lowerer<'_> {
 				.patterns(children)
 				.iter()
 				.all(|&child| self.pattern_irrefutable(body, child)),
-			PatternKind::Struct { fields, .. } => {
+			PatternKind::Fields { fields, .. } => {
 				self.pattern_irrefutable(body, fields)
 			}
 			PatternKind::Or(alternatives) => {
@@ -450,7 +450,7 @@ impl Lowerer<'_> {
 				}
 				Ok(condition)
 			}
-			PatternKind::Struct { fields, .. } => {
+			PatternKind::Fields { fields, .. } => {
 				let fields_ty = self.pattern_ty(body, state, fields);
 				let subject = self.retype(
 					state,
@@ -796,7 +796,7 @@ impl Lowerer<'_> {
 				}
 				Ok(())
 			}
-			PatternKind::Struct { fields, .. } => {
+			PatternKind::Fields { fields, .. } => {
 				let fields_ty = self.pattern_ty(body, state, fields);
 				let subject = self.retype(
 					state,

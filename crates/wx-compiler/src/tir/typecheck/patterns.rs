@@ -30,7 +30,9 @@ use super::{BodyBuilder, Integer, ValuePath};
 use crate::ast::{self, Keyword, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprKind, LocalIdx, PatIdx, PatternKind};
-use crate::tir::decls::{BindingTarget, DeclKind, StructIdx, TraitIdx};
+use crate::tir::decls::{
+	BindingTarget, DeclKind, EnumIdx, FieldIdx, FieldOwner, TraitIdx,
+};
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
 use crate::tir::resolutions::{AccessKind, Reference, Site};
@@ -586,32 +588,21 @@ impl BodyBuilder<'_, '_> {
 				self.check_tuple(elements, span, expected, context)
 			}
 			ast::Destructure::Struct { path, elements } => {
-				let Some((struct_index, ty, types)) =
-					self.pattern_struct(ast.list(path), span, expected)
+				let Some((owner, ty, types)) =
+					self.pattern_owner(ast.list(path), span, expected)
 				else {
 					return self.check_poisoned(elements, span, context);
 				};
-				let Some(fields) = self.check_field_list(
-					elements,
-					struct_index,
-					&types,
-					span,
-					context,
-				) else {
+				let Some(fields) = self
+					.check_field_list(elements, owner, &types, span, context)
+				else {
 					return self.error_pattern(span);
 				};
-				self.body.push_pattern(
-					PatternKind::Struct {
-						struct_index,
-						fields,
-					},
-					ty,
-					span,
-				)
+				self.push_fields_pattern(owner, fields, ty, span)
 			}
 			ast::Destructure::NamedStruct { path, fields } => {
-				let Some((struct_index, ty, types)) =
-					self.pattern_struct(ast.list(path), span, expected)
+				let Some((owner, ty, types)) =
+					self.pattern_owner(ast.list(path), span, expected)
 				else {
 					for item in ast.list(fields) {
 						if let ast::PatternFieldItem::Field(field) = item {
@@ -620,26 +611,84 @@ impl BodyBuilder<'_, '_> {
 					}
 					return self.error_pattern(span);
 				};
-				let Some(children) = self.check_fields(
-					fields,
-					struct_index,
-					&types,
-					span,
-					context,
-				) else {
+				let Some(children) =
+					self.check_fields(fields, owner, &types, span, context)
+				else {
 					return self.error_pattern(span);
 				};
 				let fields = self.fields_value(children, &types, span);
-				self.body.push_pattern(
-					PatternKind::Struct {
-						struct_index,
-						fields,
-					},
-					ty,
-					span,
-				)
+				self.push_fields_pattern(owner, fields, ty, span)
 			}
 		}
+	}
+
+	/// `Name(fields)`, of type `ty`. An enum's fields are its repr, which
+	/// matches whatever variant the value is, so a test inside one (a
+	/// literal, a constant, alternatives) is reported, and the pattern is
+	/// then the error pattern: naming the variant is how a value is tested.
+	fn push_fields_pattern(
+		&mut self,
+		owner: FieldOwner,
+		fields: PatIdx,
+		ty: TypeIndex,
+		span: TextSpan,
+	) -> PatIdx {
+		if let FieldOwner::Enum(_) = owner
+			&& let Some(test) = self.first_test(fields)
+		{
+			let name = self.owner_name(owner);
+			self.sema.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TestInEnumRepr.code())
+					.with_message(format!(
+						"the repr of enum `{name}` is matched by a binding or \
+						 `_` only"
+					))
+					.with_label(
+						Label::primary(
+							self.scope.file_id,
+							self.body.pattern_span(test),
+						)
+						.with_message("this tests a value"),
+					)
+					.with_note(format!(
+						"its value is always one of the variants; to test \
+						 which, name the variant: `{name}::Variant`"
+					)),
+			);
+			return self.error_pattern(span);
+		}
+		self.body
+			.push_pattern(PatternKind::Fields { owner, fields }, ty, span)
+	}
+
+	/// The first test in `pattern`, which otherwise matches every value.
+	fn first_test(&self, pattern: PatIdx) -> Option<PatIdx> {
+		match self.body.pattern(pattern) {
+			PatternKind::Wildcard
+			| PatternKind::Bind(_)
+			| PatternKind::Error => None,
+			PatternKind::Tuple(children) => self
+				.body
+				.patterns(children)
+				.iter()
+				.find_map(|&child| self.first_test(child)),
+			PatternKind::Fields { fields, .. } => self.first_test(fields),
+			PatternKind::Int(_)
+			| PatternKind::Char(_)
+			| PatternKind::Constant { .. }
+			| PatternKind::AbstractConstant { .. }
+			| PatternKind::Or(_) => Some(pattern),
+		}
+	}
+
+	/// The written name of a struct or an enum, for a diagnostic.
+	fn owner_name(&self, owner: FieldOwner) -> &str {
+		let decls = &self.sema.decls;
+		self.builder
+			.strings
+			.resolve(decls.item(owner.loc(decls)).name.inner)
+			.unwrap()
 	}
 
 	/// `(a, b)` against `expected`, with one child per element.
@@ -677,7 +726,7 @@ impl BodyBuilder<'_, '_> {
 	fn check_field_list(
 		&mut self,
 		elements: ast::List<ast::PatternElement>,
-		struct_index: StructIdx,
+		owner: FieldOwner,
 		types: &[TypeIndex],
 		span: TextSpan,
 		context: &mut PatternContext,
@@ -698,7 +747,7 @@ impl BodyBuilder<'_, '_> {
 					types,
 					span,
 					context,
-					Some(struct_index),
+					Some(owner),
 				)?;
 				Some(self.fields_value(children, types, span))
 			}
@@ -732,7 +781,7 @@ impl BodyBuilder<'_, '_> {
 		types: &[TypeIndex],
 		span: TextSpan,
 		context: &mut PatternContext,
-		struct_index: Option<StructIdx>,
+		owner: Option<FieldOwner>,
 	) -> Option<Vec<PatIdx>> {
 		let mut rest: Option<(usize, TextSpan)> = None;
 		let mut written: Vec<ast::PatId> = Vec::new();
@@ -756,7 +805,7 @@ impl BodyBuilder<'_, '_> {
 				written.len(),
 				rest.is_some(),
 				span,
-				struct_index,
+				owner,
 			);
 			for pattern in written {
 				self.check_pattern(pattern, TypeIndex::ERROR, context);
@@ -791,23 +840,19 @@ impl BodyBuilder<'_, '_> {
 	fn check_fields(
 		&mut self,
 		fields: ast::List<ast::PatternFieldItem>,
-		struct_index: StructIdx,
+		owner: FieldOwner,
 		types: &[TypeIndex],
 		span: TextSpan,
 		context: &mut PatternContext,
 	) -> Option<Vec<PatIdx>> {
-		let decl = &self.sema.decls.structs[usize::from(struct_index)];
-		if !self.sema.decls.fields.is_fully_named(decl.fields) {
-			let name = self
-				.builder
-				.strings
-				.resolve(self.sema.decls.item(decl.loc).name.inner)
-				.unwrap();
+		let range = owner.fields(&self.sema.decls);
+		if !self.sema.decls.fields.is_fully_named(range) {
+			let (noun, name) = (owner.noun(), self.owner_name(owner));
 			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::TupleStructBracePattern.code())
 					.with_message(format!(
-						"struct `{name}` has unnamed fields, so it is matched \
+						"{noun} `{name}` has unnamed fields, so it is matched \
 						 with `{name}(...)`"
 					))
 					.with_label(Label::primary(self.scope.file_id, span)),
@@ -834,23 +879,17 @@ impl BodyBuilder<'_, '_> {
 				ast::PatternFieldItem::Field(field) => field,
 			};
 			let name = field.name;
-			let decl = &self.sema.decls.structs[usize::from(struct_index)];
-			let Some(index) =
-				self.sema.decls.fields.lookup(decl.fields, name.inner)
+			let Some(index) = self.sema.decls.fields.lookup(range, name.inner)
 			else {
-				let struct_name = self
-					.builder
-					.strings
-					.resolve(self.sema.decls.item(decl.loc).name.inner)
-					.unwrap();
+				let (noun, owner_name) = (owner.noun(), self.owner_name(owner));
 				let field_name =
 					self.builder.strings.resolve(name.inner).unwrap();
 				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::UnknownStructField.code())
 						.with_message(format!(
-							"no such field `{field_name}` in struct \
-							 `{struct_name}`"
+							"no such field `{field_name}` in {noun} \
+							 `{owner_name}`"
 						))
 						.with_label(
 							SourceSpan::new(self.scope.file_id, name.span)
@@ -864,7 +903,7 @@ impl BodyBuilder<'_, '_> {
 				Site::Value(SourceSpan::new(self.scope.file_id, name.span)),
 				Reference::Field {
 					access: AccessKind::Read,
-					owner: crate::tir::decls::FieldOwner::Struct(struct_index),
+					owner,
 					field: index,
 				},
 			);
@@ -896,23 +935,17 @@ impl BodyBuilder<'_, '_> {
 			given[at] = Some((child, name.span));
 		}
 		if rest.is_none() {
-			let decl = &self.sema.decls.structs[usize::from(struct_index)];
 			let missing: Vec<String> = given
 				.iter()
 				.enumerate()
 				.filter(|(_, given)| given.is_none())
 				.map(|(at, _)| {
-					let name =
-						self.sema.decls.fields.names(decl.fields)[at].unwrap();
+					let name = self.sema.decls.fields.names(range)[at].unwrap();
 					format!("`{}`", self.builder.strings.resolve(name).unwrap())
 				})
 				.collect();
 			if !missing.is_empty() {
-				let struct_name = self
-					.builder
-					.strings
-					.resolve(self.sema.decls.item(decl.loc).name.inner)
-					.unwrap();
+				let owner_name = self.owner_name(owner);
 				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::MissingStructFields.code())
@@ -923,7 +956,7 @@ impl BodyBuilder<'_, '_> {
 						))
 						.with_label(Label::primary(self.scope.file_id, span))
 						.with_note(format!(
-							"write `..` to match the rest of `{struct_name}`"
+							"write `..` to match the rest of `{owner_name}`"
 						)),
 				);
 			}
@@ -958,15 +991,16 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// The struct a struct pattern names, its type as matched (the expected
-	/// type, which must be that struct), and its fields' types. `None` when
-	/// the path names no struct, or the expected type is not it (reported).
-	fn pattern_struct(
+	/// The struct or enum a pattern of fields names, its type as matched
+	/// (the expected type, which must be that type), and its fields' types.
+	/// `None` when the path names neither, or the expected type is not it
+	/// (reported).
+	fn pattern_owner(
 		&mut self,
 		path: &[ast::PathSegment],
 		span: TextSpan,
 		expected: TypeIndex,
-	) -> Option<(StructIdx, TypeIndex, Vec<TypeIndex>)> {
+	) -> Option<(FieldOwner, TypeIndex, Vec<TypeIndex>)> {
 		let segment = path.last().unwrap();
 		let (struct_index, written) = if let [segment] = path
 			&& segment.ident.inner == Keyword::SelfPascal.symbol()
@@ -992,6 +1026,18 @@ impl BodyBuilder<'_, '_> {
 			};
 			let key = walk.target.loc()?;
 			let kind = key.symbol_kind(&self.sema.decls);
+			if let DeclKind::Enum(enum_index) = kind {
+				if let BindingTarget::Inaccessible(key) = walk.target {
+					self.sema.diagnostics.push(report_private_identifier(
+						&self.sema.decls.namespaces,
+						self.builder.strings,
+						segment.ident.inner,
+						SourceSpan::new(self.scope.file_id, segment.ident.span),
+						Some(key),
+					));
+				}
+				return self.pattern_enum(enum_index, segment, span, expected);
+			}
 			let DeclKind::Struct(struct_index) = kind else {
 				self.report_not_a_struct(&format!("a {}", kind.noun()), span);
 				return None;
@@ -1044,7 +1090,79 @@ impl BodyBuilder<'_, '_> {
 				self.context().field_type(struct_index, &type_args, field)
 			})
 			.collect();
-		Some((struct_index, ty, types))
+		Some((FieldOwner::Struct(struct_index), ty, types))
+	}
+
+	/// `pattern_owner` for an enum: its repr is read, so every field of it
+	/// must be visible here (E2076, as for a field access).
+	fn pattern_enum(
+		&mut self,
+		enum_index: EnumIdx,
+		segment: &ast::PathSegment,
+		span: TextSpan,
+		expected: TypeIndex,
+	) -> Option<(FieldOwner, TypeIndex, Vec<TypeIndex>)> {
+		let owner = FieldOwner::Enum(enum_index);
+		if !segment.type_args.is_empty() {
+			self.sema.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::TypeArgumentsNotAllowed.code())
+					.with_message("type arguments are not allowed here")
+					.with_label(
+						Label::primary(
+							self.scope.file_id,
+							self.ast().type_args_span(segment),
+						)
+						.with_message("an enum takes no type arguments"),
+					),
+			);
+		}
+		let range = owner.fields(&self.sema.decls);
+		let hidden = (0..range.len()).any(|field| {
+			!self.sema.field_accessible(
+				owner,
+				FieldIdx::new(field as u32),
+				self.scope.namespace,
+			)
+		});
+		if hidden {
+			let name = self.owner_name(owner);
+			self.sema.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::PrivateStructField.code())
+					.with_message(format!(
+						"the repr of enum `{name}` is private"
+					))
+					.with_label(
+						Label::primary(self.scope.file_id, segment.ident.span)
+							.with_message("private repr"),
+					)
+					.with_note(format!(
+						"it is read where the enum's module is; make it \
+						 `pub` to read it elsewhere: `enum {name}(pub ...)`"
+					)),
+			);
+		}
+		let named = self.sema.types.intern(Type::Enum { enum_index });
+		let ty = if expected == TypeIndex::ERROR {
+			TypeIndex::ERROR
+		} else {
+			match self.sema.types.meet(expected, named) {
+				Some(ty) => ty,
+				None => {
+					let diagnostic =
+						self.context().mismatch_at(expected, named, span);
+					self.sema.diagnostics.push(diagnostic);
+					return None;
+				}
+			}
+		};
+		let types = self
+			.sema
+			.types
+			.list(self.sema.enums[usize::from(enum_index)].field_types)
+			.to_vec();
+		Some((owner, ty, types))
 	}
 
 	/// A literal, against the type it is compared with. An integer is stored
@@ -1415,15 +1533,14 @@ impl BodyBuilder<'_, '_> {
 		written: usize,
 		rest: bool,
 		span: TextSpan,
-		struct_index: Option<StructIdx>,
+		owner: Option<FieldOwner>,
 	) {
 		let plural = |n: usize| if n == 1 { "" } else { "s" };
-		let (noun, owner) = match struct_index {
-			Some(struct_index) => {
-				let name = self.sema.decls.name(struct_index);
-				let name = self.builder.strings.resolve(name.inner).unwrap();
-				("field", format!("struct `{name}`"))
-			}
+		let (noun, owner) = match owner {
+			Some(owner) => (
+				"field",
+				format!("{} `{}`", owner.noun(), self.owner_name(owner)),
+			),
 			None => ("element", "the tuple".to_string()),
 		};
 		let at_least = if rest { "at least " } else { "" };
