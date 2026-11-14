@@ -378,7 +378,7 @@ impl<'r> PathResolver<'r> {
 				),
 			));
 		}
-		let target = match &resolution.stopped_with {
+		let target = match resolution.stopped_with {
 			BindingLookup::Found { target, .. } => {
 				match resolution.first_inaccessible {
 					// The named item itself is not visible here: the caller, which
@@ -397,9 +397,9 @@ impl<'r> PathResolver<'r> {
 							),
 							Some(loc),
 						));
-						*target
+						target
 					}
-					None => *target,
+					None => target,
 				}
 			}
 			BindingLookup::NotFound { skipped } => {

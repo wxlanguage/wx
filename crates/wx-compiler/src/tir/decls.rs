@@ -1608,8 +1608,9 @@ pub struct ScopeTable {
 	/// The package this scope belongs to — every scope is inside exactly
 	/// one, so it's stored rather than recovered by walking parents.
 	pub package_id: PackageId,
-	/// Namespaces brought into scope via `use path::*;`. Checked during
-	/// lookup after direct bindings.
+	/// Namespaces brought into scope via `use path::*;`, in the order they
+	/// resolved, which nothing reads. Checked during lookup after direct
+	/// bindings.
 	pub glob_imports: Vec<GlobImport>,
 }
 
@@ -1776,8 +1777,14 @@ impl CandidateMerge {
 		}
 	}
 
+	/// Keeps the binding the earliest-written glob skipped: globs are
+	/// walked in the order they resolved, not the order they are written.
 	fn skip(&mut self, skipped: SkippedBinding) {
-		self.skipped.get_or_insert(skipped);
+		match &mut self.skipped {
+			Some(kept)
+				if usize::from(kept.glob) <= usize::from(skipped.glob) => {}
+			kept => *kept = Some(skipped),
+		}
 	}
 
 	fn push(&mut self, candidate: GlobCandidate) {

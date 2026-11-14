@@ -47,7 +47,8 @@ impl ImportSlot {
 	/// paired with the consulted binding's own visibility — needed to cap
 	/// the new binding's visibility (see [`Visibility::cap`]), so a `pub
 	/// use` can't escalate a private item's reach. `None` when there's
-	/// nothing to install at all.
+	/// nothing to install at all; a poisoned slot installs an error, so its
+	/// uses stay silent.
 	fn resolved(self) -> Option<(BindingTarget, Visibility)> {
 		match self {
 			Self::Accessible(key, visibility) => {
@@ -56,7 +57,8 @@ impl ImportSlot {
 			Self::Inaccessible(key, visibility) => {
 				Some((BindingTarget::Inaccessible(key), visibility))
 			}
-			Self::Absent | Self::Poisoned => None,
+			Self::Poisoned => Some((BindingTarget::Error, Visibility::Public)),
+			Self::Absent => None,
 		}
 	}
 
@@ -240,6 +242,20 @@ impl<'r> ImportResolver<'r> {
 	/// a definition answers the name anyway, since re-entering it would
 	/// report a cycle that is not there.
 	fn settle(&mut self, scope: Scope, name: SymbolU32, current: UseItemIndex) {
+		// A glob may bring in any name, so every one in `scope` is resolved,
+		// but one already being resolved is left to finish: its path is what
+		// asks (`pub use self::b::*;`), and a cycle through globs is
+		// `compute_glob_import`'s to report.
+		if let Some(globs) = self.pending_glob_targets.get(&scope) {
+			for glob in globs {
+				if !matches!(
+					self.item_state[usize::from(glob)],
+					ResolveStatus::Resolving
+				) {
+					self.ensure_import_item(glob);
+				}
+			}
+		}
 		let Some(candidates) = self.pending_named_imports.get(&(scope, name))
 		else {
 			return;
@@ -704,7 +720,6 @@ impl<'r> ImportResolver<'r> {
 		let source_span =
 			SourceSpan::new(self.namespaces.file_id(accessor.into()), span);
 
-		let mut ambiguity = None;
 		let (target, visibility, reachable) =
 			match self.lookup(accessor, scope, key, current) {
 				BindingLookup::NotFound { .. } => {
@@ -724,17 +739,16 @@ impl<'r> ImportResolver<'r> {
 					}
 					(target, visibility, reachable)
 				}
+				// Recovered as an error, as any path's ambiguity is.
 				BindingLookup::Ambiguous(candidates) => {
-					ambiguity = Some(report_ambiguous_identifier(
+					let ambiguity = report_ambiguous_identifier(
 						self.namespaces,
 						self.strings,
 						key.symbol,
 						source_span,
-						&candidates,
-					));
-					// Recovered as its first candidate, which is reachable.
-					let first = candidates[0];
-					(first.target, first.visibility, first.reachable)
+						candidates,
+					);
+					return (ImportSlot::Poisoned, Some(ambiguity));
 				}
 			};
 		// Nothing is reported here: whether an inaccessible slot is an error
@@ -756,7 +770,7 @@ impl<'r> ImportResolver<'r> {
 			// whoever caused that, nothing new to report here.
 			BindingTarget::Error => ImportSlot::Poisoned,
 		};
-		(slot, ambiguity)
+		(slot, None)
 	}
 
 	fn ensure_import_path(
@@ -883,12 +897,10 @@ impl<'r> ImportResolver<'r> {
 						self.strings,
 						segment.segment.inner,
 						source_span,
-						&candidates,
+						candidates,
 					);
 					self.diagnostics.push(diagnostic);
-					// Recovered as its first candidate, which is reachable.
-					let first = candidates[0];
-					(first.target, first.reachable)
+					return Err(());
 				}
 			};
 
@@ -1080,13 +1092,16 @@ pub(super) fn report_ambiguous_identifier(
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
-	candidates: &[GlobCandidate],
+	mut candidates: Box<[GlobCandidate]>,
 ) -> Diagnostic<FileId> {
 	let resolved_name = strings.resolve(name).unwrap();
 	let mut diagnostic = Diagnostic::error()
 		.with_code(DiagnosticCode::AmbiguousIdentifier.code())
 		.with_message(format!("`{resolved_name}` is ambiguous"))
 		.with_label(span.primary_label().with_message("ambiguous name"));
+	// In the order the globs are written, not the order they resolved in.
+	// Stable, so the candidates one glob led to keep their order.
+	candidates.sort_by_key(|candidate| usize::from(candidate.glob));
 	for (index, candidate) in candidates.iter().enumerate() {
 		let loc = candidate.target.loc().expect(
 			"an ambiguity candidate always carries a real DefKey — \
@@ -2057,6 +2072,106 @@ mod tests {
 		let original = case.expect_direct_decl(a, Tier::Value, "helper");
 		let reexported = case.expect_direct_decl(root, Tier::Value, "helper");
 		assert_eq!(reexported, original);
+	}
+
+	#[test]
+	fn named_use_reaches_through_a_glob_written_after_it() {
+		let case = TestCase::new(indoc! {"
+			use b::helper;
+			mod b {
+				pub use package::a::*;
+			}
+			mod a {
+				pub func helper() -> i32 { 1 }
+			}
+		"});
+		case.diagnostics().assert_none();
+
+		let root = case.root_namespace();
+		let a = case.child_namespace(root, "a");
+		assert_eq!(
+			case.expect_direct_decl(root, Tier::Value, "helper"),
+			case.expect_direct_decl(a, Tier::Value, "helper"),
+		);
+	}
+
+	#[test]
+	fn use_path_continues_through_a_glob_written_after_it() {
+		let case = TestCase::new(indoc! {"
+			use b::inner::helper;
+			mod b {
+				pub use package::a::*;
+			}
+			mod a {
+				pub mod inner {
+					pub func helper() -> i32 { 1 }
+				}
+			}
+		"});
+		case.diagnostics().assert_none();
+
+		let root = case.root_namespace();
+		let inner =
+			case.child_namespace(case.child_namespace(root, "a"), "inner");
+		assert_eq!(
+			case.expect_direct_decl(root, Tier::Value, "helper"),
+			case.expect_direct_decl(inner, Tier::Value, "helper"),
+		);
+	}
+
+	#[test]
+	fn a_glob_whose_path_starts_in_its_own_scope_resolves() {
+		// Resolving the glob's path looks in `a`, which settles `a`'s
+		// globs: the glob itself, which is left to finish.
+		let case = TestCase::new(indoc! {"
+			use a::helper;
+			mod a {
+				pub use self::inner::*;
+				pub mod inner {
+					pub func helper() -> i32 { 1 }
+				}
+			}
+		"});
+		case.diagnostics().assert_none();
+
+		let root = case.root_namespace();
+		let a = case.child_namespace(root, "a");
+		let inner = case.child_namespace(a, "inner");
+		assert_eq!(case.glob_targets(a), [inner]);
+		assert_eq!(
+			case.expect_direct_decl(root, Tier::Value, "helper"),
+			case.expect_direct_decl(inner, Tier::Value, "helper"),
+		);
+	}
+
+	#[test]
+	fn an_ambiguous_use_is_recovered_as_an_error() {
+		// Only the value tier is ambiguous: a constant is a value, a
+		// function both a value and a type.
+		let case = TestCase::new(indoc! {"
+			mod a {
+				pub func pick() -> i32 { 1 }
+			}
+			mod b {
+				pub const pick: i32 = 2;
+			}
+			mod hub {
+				pub use package::a::*;
+				pub use package::b::*;
+			}
+			use hub::pick;
+		"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::AmbiguousIdentifier]);
+
+		let root = case.root_namespace();
+		let value = case.direct_binding(root, Tier::Value, "pick").unwrap();
+		assert!(matches!(value.target, BindingTarget::Error));
+		let a = case.child_namespace(root, "a");
+		assert_eq!(
+			case.expect_direct_decl(root, Tier::Type, "pick"),
+			case.expect_direct_decl(a, Tier::Type, "pick"),
+		);
 	}
 
 	#[test]
