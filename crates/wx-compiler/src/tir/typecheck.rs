@@ -1761,13 +1761,15 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	/// its constructor is.
 	fn constructor_accessible(&self, struct_index: StructIdx) -> bool {
 		let decl = &self.sema.decls.structs[usize::from(struct_index)];
-		decl.field_pub_spans.iter().all(|&pub_span| {
-			self.sema.decls.namespaces.is_accessible_from(
-				self.scope.namespace,
-				self.sema.decls.scope(decl.loc).into(),
-				Visibility::from(pub_span),
-			)
-		})
+		self.sema.decls.fields.visibility(decl.fields).iter().all(
+			|&visibility| {
+				self.sema.decls.namespaces.is_accessible_from(
+					self.scope.namespace,
+					self.sema.decls.scope(decl.loc).into(),
+					visibility,
+				)
+			},
+		)
 	}
 
 	fn report_local_in_static_data(&mut self, span: TextSpan) {
@@ -1814,15 +1816,18 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		let name = strings
 			.resolve(self.sema.decls.item(decl.loc).name.inner)
 			.unwrap();
-		let private: Vec<String> = decl
-			.field_names
+		let private: Vec<String> = self
+			.sema
+			.decls
+			.fields
+			.names(decl.fields)
 			.iter()
-			.zip(&decl.field_pub_spans)
+			.zip(self.sema.decls.fields.visibility(decl.fields))
 			.enumerate()
-			.filter(|(_, (_, pub_span))| pub_span.is_none())
+			.filter(|(_, (_, visibility))| **visibility == Visibility::Private)
 			.map(|(at, (name, _))| match name {
 				Some(name) => {
-					format!("`{}`", strings.resolve(name.inner).unwrap())
+					format!("`{}`", strings.resolve(*name).unwrap())
 				}
 				None => format!("field {at}"),
 			})
@@ -1845,16 +1850,18 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			.with_label(
 				site.primary_label().with_message("private constructor"),
 			);
-		for (name, pub_span) in
-			decl.field_names.iter().zip(&decl.field_pub_spans)
+		let fields = &self.sema.decls.fields;
+		for (at, visibility) in
+			fields.visibility(decl.fields).iter().enumerate()
 		{
-			if pub_span.is_none()
-				&& let Some(field_name) = name
+			let field = crate::tir::decls::FieldIdx::new(at as u32);
+			if *visibility == Visibility::Private
+				&& fields.name(decl.fields, field).is_some()
 			{
 				diagnostic = diagnostic.with_label(
 					SourceSpan::new(
 						self.sema.decls.file_id(decl.loc),
-						field_name.span,
+						fields.name_span(decl.fields, field),
 					)
 					.secondary_label()
 					.with_message("private field"),
@@ -3695,10 +3702,10 @@ mod tests {
 			else {
 				panic!("a field of a non-struct");
 			};
-			let field = self.sema.decls.structs[usize::from(struct_index)]
-				.field_names[usize::from(field)]
-			.unwrap();
-			self.strings.resolve(field.inner).unwrap()
+			let decls = &self.sema.decls;
+			let fields = decls.structs[usize::from(struct_index)].fields;
+			let field = decls.fields.name(fields, field).unwrap();
+			self.strings.resolve(field).unwrap()
 		}
 
 		/// A jump's target: its label, else the kind of scope it leaves.

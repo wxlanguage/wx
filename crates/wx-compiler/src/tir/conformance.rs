@@ -1271,24 +1271,33 @@ impl<'ast> SemanticsBuilder<'ast> {
 				continue;
 			}
 			if position < params {
-				let expected_name = sema.decls.functions
-					[usize::from(declaration)]
-				.params[position];
-				let name = sema.decls.functions[usize::from(function)].params
-					[position];
+				let names = |function: FunctionIdx| {
+					sema.decls.params.names(
+						sema.decls.functions[usize::from(function)].params,
+					)[position]
+				};
+				let (expected_name, name) =
+					(names(declaration), names(function));
+				let spanned = |function: FunctionIdx| {
+					let params =
+						sema.decls.functions[usize::from(function)].params;
+					sema.decls.params.name(params, position).map(|inner| {
+						Spanned {
+							inner,
+							span: sema.decls.params.name_span(params, position),
+						}
+					})
+				};
 				// Leaving the parameter unnamed only binds no local: the contract
 				// is still the trait's, and so are the names calls use.
-				if name.is_some()
-					&& expected_name.map(|name| name.inner)
-						!= name.map(|name| name.inner)
-				{
+				if name.is_some() && expected_name != name {
 					self.report_name_mismatch(
 						sema,
 						trait_index,
 						member,
 						(declaration, function),
 						position,
-						(expected_name, name),
+						(spanned(declaration), spanned(function)),
 					);
 					return Ok(());
 				}

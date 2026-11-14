@@ -34,10 +34,10 @@ pub use self::body::{
 };
 use self::decls::Declarations;
 pub use self::decls::{
-	AssocTypeIdx, ConstIdx, DeclKind, EnumIdx, FieldIdx, FunctionIdx,
-	GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, MemberOwner, MemoryIdx,
-	NameUse, StructIdx, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx, TypeRole,
-	TypesetIdx, UseItemIndex,
+	AssocTypeIdx, ConstIdx, DeclKind, EnumIdx, FieldIdx, FieldOwner,
+	FunctionIdx, GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, MemberOwner,
+	MemoryIdx, NameUse, StructIdx, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx,
+	TypeRole, TypesetIdx, UseItemIndex,
 };
 pub use self::eval::{AllocIdx, ConstScalar, Val};
 pub use self::format::{BoundFormatter, TypeFormatter};

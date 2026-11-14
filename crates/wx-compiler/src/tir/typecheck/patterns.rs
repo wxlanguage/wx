@@ -797,7 +797,7 @@ impl BodyBuilder<'_, '_> {
 		context: &mut PatternContext,
 	) -> Option<Vec<PatIdx>> {
 		let decl = &self.sema.decls.structs[usize::from(struct_index)];
-		if !decl.is_fully_named() {
+		if !self.sema.decls.fields.is_fully_named(decl.fields) {
 			let name = self
 				.builder
 				.strings
@@ -835,7 +835,9 @@ impl BodyBuilder<'_, '_> {
 			};
 			let name = field.name;
 			let decl = &self.sema.decls.structs[usize::from(struct_index)];
-			let Some(index) = decl.lookup.get(&name.inner).copied() else {
+			let Some(index) =
+				self.sema.decls.fields.lookup(decl.fields, name.inner)
+			else {
 				let struct_name = self
 					.builder
 					.strings
@@ -862,7 +864,7 @@ impl BodyBuilder<'_, '_> {
 				Site::Value(SourceSpan::new(self.scope.file_id, name.span)),
 				Reference::Field {
 					access: AccessKind::Read,
-					owner: struct_index,
+					owner: crate::tir::decls::FieldOwner::Struct(struct_index),
 					field: index,
 				},
 			);
@@ -900,7 +902,8 @@ impl BodyBuilder<'_, '_> {
 				.enumerate()
 				.filter(|(_, given)| given.is_none())
 				.map(|(at, _)| {
-					let name = decl.field_names[at].unwrap().inner;
+					let name =
+						self.sema.decls.fields.names(decl.fields)[at].unwrap();
 					format!("`{}`", self.builder.strings.resolve(name).unwrap())
 				})
 				.collect();

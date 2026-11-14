@@ -280,8 +280,8 @@ fn classify(
 /// A function with a `self` receiver is a method; any other is a function.
 fn function(snapshot: &Snapshot, index: FunctionIdx) -> TokenType {
 	let function = &snapshot.sema.decls.functions[usize::from(index)];
-	match function.params.first() {
-		Some(Some(name)) if name.inner == Keyword::SelfLower.symbol() => {
+	match snapshot.sema.decls.params.names(function.params).first() {
+		Some(&Some(name)) if name == Keyword::SelfLower.symbol() => {
 			TokenType::Method
 		}
 		_ => TokenType::Function,

@@ -545,7 +545,9 @@ impl BodyBuilder<'_, '_> {
 			.strings
 			.resolve(self.sema.decls.item(decl.loc).name.inner)
 			.unwrap();
-		let Some(&field) = decl.lookup.get(&member.inner) else {
+		let Some(field) =
+			self.sema.decls.fields.lookup(decl.fields, member.inner)
+		else {
 			self.sema.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::UnknownStructField.code())
@@ -565,7 +567,7 @@ impl BodyBuilder<'_, '_> {
 			recorded,
 			Reference::Field {
 				access,
-				owner: struct_index,
+				owner: crate::tir::decls::FieldOwner::Struct(struct_index),
 				field,
 			},
 		);

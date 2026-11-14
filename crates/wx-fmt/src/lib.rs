@@ -1812,7 +1812,6 @@ impl<'a> Builder<'a> {
 		fields: ast::List<ast::StructField>,
 		pub_span: Option<TextSpan>,
 	) -> NodeId {
-		let ast = self.ast;
 		let mut items: Vec<NodeId> = Vec::new();
 		self.build_attributes(&mut items, attributes);
 		if pub_span.is_some() {

@@ -326,7 +326,7 @@ fn item(
 					Some(decls.functions[usize::from(function)].params.len())
 				}
 				DeclKind::Struct(index) => {
-					Some(decls.structs[usize::from(index)].field_names.len())
+					Some(decls.structs[usize::from(index)].fields.len())
 				}
 				_ => None,
 			}

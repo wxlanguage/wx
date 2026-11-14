@@ -154,11 +154,15 @@ pub struct StructSignature {
 
 /// The repr every variant's value is held in. A variant is a constant
 /// (`decls::EnumDecl::variants`), so its value is the constant query's, checked
-/// after construction. `TypeIndex::ERROR` if `repr` was missing or resolved to
-/// a non-integer type — either way already diagnosed once, here, when that
-/// happened.
+/// after construction. `TypeIndex::ERROR` if `repr` was missing, resolved to
+/// a non-integer type or is several fields — each already diagnosed once,
+/// here, when that happened.
 pub struct EnumSignature {
 	pub repr: TypeIndex,
+	/// The repr's fields' types as written, in declaration order, as
+	/// `StructSignature::field_types` (`decls::EnumDecl::fields`): the one
+	/// field's is `repr`.
+	pub field_types: TypeList,
 }
 
 /// Resolved member types only — identity (the backing trait, the
@@ -711,6 +715,7 @@ impl Semantics {
 				.iter()
 				.map(|_| EnumSignature {
 					repr: TypeIndex::ERROR,
+					field_types: TypeList::EMPTY,
 				})
 				.collect(),
 			typesets: decls
@@ -3636,19 +3641,67 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}
 				}
 
-				let repr_type = match ast.list(*repr) {
-					[] => {
+				// Every field's type, as a struct's are; the repr is the one
+				// field's, an integer.
+				let scope = LexicalScope {
+					file_id,
+					namespace,
+					generic_env: GenericEnvIdx::ROOT,
+					assumption_env: sema
+						.assumption_envs
+						.of_frame(GenericEnvIdx::ROOT),
+				};
+				let mut field_types: Vec<TypeIndex> = ast
+					.list(*repr)
+					.iter()
+					.map(|field| {
+						self.resolve_type(
+							sema,
+							obligations,
+							scope,
+							field.ty,
+							InferPolicy::Reject(InferSignatureKind::EnumRepr),
+						)
+					})
+					.collect();
+				let repr_type = match (ast.list(*repr), &mut *field_types) {
+					([], _) => {
 						sema.diagnostics
 							.push(report_missing_enum_repr(file_id, name.span));
 						TypeIndex::ERROR
 					}
+					([field], [ty]) => {
+						if *ty != TypeIndex::ERROR && !ty.is_integer() {
+							let integer = sema.decls.intrinsics.integer.expect(
+								"the core must declare the `Integer` typeset",
+							);
+							let typeset =
+								&sema.decls.typesets[usize::from(integer)];
+							let name = self
+								.strings
+								.resolve(
+									sema.decls.item(typeset.loc).name.inner,
+								)
+								.unwrap();
+							let diagnostic = report_enum_repr_not_integer(
+								file_id,
+								self.ast(file_id).type_span(field.ty),
+								name,
+								sema.decls.declaration_span(typeset.loc),
+							);
+							sema.diagnostics.push(diagnostic);
+							*ty = TypeIndex::ERROR;
+						}
+						*ty
+					}
 					// Several fields are a wider repr (`notes/open-enums.md`,
-					// "Deferred: enums over a wider repr").
-					[_, _, ..] => {
-						let fields = ast.spans(*repr);
+					// "Deferred: enums over a wider repr"): their types are
+					// kept, and the repr they make is not supported yet.
+					(fields, _) => {
+						let spans = ast.spans(*repr);
 						let span = TextSpan::new(
-							fields[0].start,
-							fields[fields.len() - 1].end,
+							spans[0].start,
+							spans[fields.len() - 1].end,
 						);
 						sema.diagnostics.push(
 							Diagnostic::bug()
@@ -3667,52 +3720,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 						);
 						TypeIndex::ERROR
 					}
-					[repr_expr] => {
-						let resolved = self.resolve_type(
-							sema,
-							obligations,
-							LexicalScope {
-								file_id,
-								namespace,
-								generic_env: GenericEnvIdx::ROOT,
-								assumption_env: sema
-									.assumption_envs
-									.of_frame(GenericEnvIdx::ROOT),
-							},
-							repr_expr.ty,
-							InferPolicy::Reject(InferSignatureKind::EnumRepr),
-						);
-						if resolved != TypeIndex::ERROR
-							&& !resolved.is_integer()
-						{
-							let integer = sema.decls.intrinsics.integer.expect(
-								"the core must declare the `Integer` \
-									 typeset",
-							);
-							let typeset =
-								&sema.decls.typesets[usize::from(integer)];
-							let name = self
-								.strings
-								.resolve(
-									sema.decls.item(typeset.loc).name.inner,
-								)
-								.unwrap();
-							let diagnostic = report_enum_repr_not_integer(
-								file_id,
-								self.ast(file_id).type_span(repr_expr.ty),
-								name,
-								sema.decls.declaration_span(typeset.loc),
-							);
-							sema.diagnostics.push(diagnostic);
-							TypeIndex::ERROR
-						} else {
-							resolved
-						}
-					}
 				};
 
-				sema.enums[usize::from(enum_index)] =
-					EnumSignature { repr: repr_type };
+				sema.enums[usize::from(enum_index)] = EnumSignature {
+					repr: repr_type,
+					field_types: sema.types.push_list(&field_types),
+				};
 				SignatureLocation::Enum(enum_index)
 			}
 			// A variant is a constant of its enum's type; its value, written or
@@ -6382,7 +6395,7 @@ pub(super) mod tests {
 						);
 						let (args, order) = match body.kind(fields) {
 							ExprKind::Tuple { elements, order }
-								if decl.field_names.len() != 1 =>
+								if decl.fields.len() != 1 =>
 							{
 								(body.args(elements).to_vec(), order)
 							}
@@ -6391,11 +6404,12 @@ pub(super) mod tests {
 						for (at, &arg) in args.iter().enumerate() {
 							text.push(' ');
 							if let ElementOrder::Permuted { .. } = order {
-								let name = decl.field_names[usize::from(
-									body.declared_index(order, at),
-								)]
-								.unwrap()
-								.inner;
+								let name = case
+									.sema
+									.decls
+									.fields
+									.names(decl.fields)[usize::from(body.declared_index(order, at))]
+								.unwrap();
 								text.push_str(strings.resolve(name).unwrap());
 								text.push('=');
 							}
@@ -10214,12 +10228,13 @@ pub(super) mod tests {
 		let DeclKind::Function(index) = case.resolve(Tier::Value, "f") else {
 			panic!("expected a function");
 		};
-		let names: Vec<_> = case.sema.decls.functions[usize::from(index)]
+		let names: Vec<_> = case
+			.sema
+			.decls
 			.params
+			.names(case.sema.decls.functions[usize::from(index)].params)
 			.iter()
-			.map(|param| {
-				param.map(|name| case.strings.resolve(name.inner).unwrap())
-			})
+			.map(|param| param.map(|name| case.strings.resolve(name).unwrap()))
 			.collect();
 		assert_eq!(names, [None, None, Some("c")]);
 	}
@@ -18479,13 +18494,15 @@ pub(super) mod tests {
             type Alias = S;
             enum E(i32) { A = 0 }
             mod inner {}
-            export { T, Alias, E, i32, inner }
+            export { T, Alias, i32, inner }
         "#,
 		);
-		// `S` is not here: a struct's name is also its constructor, a value.
+		// `S` and `E` are not here: a struct's name and an enum's are values
+		// too (a constructor, a pattern over the repr), so exporting one is
+		// `CannotExportItem` instead.
 		assert_eq!(
 			case.sema.diagnostics.len(),
-			5,
+			4,
 			"{:?}",
 			case.sema.diagnostics
 		);

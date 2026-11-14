@@ -20,7 +20,7 @@ use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
 use super::decls::{
 	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, Declarations, Declared,
 	FieldIdx, FunctionIdx, InherentImplIdx, MemberKind, MemberOwner, Scope,
-	SignatureQuery, StructIdx, Tier, TraitIdx, TraitImplIdx, Visibility,
+	SignatureQuery, StructIdx, Tier, TraitIdx, TraitImplIdx,
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
@@ -1120,19 +1120,23 @@ impl Semantics {
 		};
 		if let Type::Struct { struct_index, .. } = *self.types.resolve(object) {
 			let decl = &self.decls.structs[usize::from(struct_index)];
-			for (at, name) in decl.field_names.iter().enumerate() {
+			for (at, name) in
+				self.decls.fields.names(decl.fields).iter().enumerate()
+			{
 				let field = FieldIdx::new(at as u32);
-				if let Some(name) = name
-					&& decl.lookup.get(&name.inner) == Some(&field)
-					&& self.field_accessible(
-						struct_index,
-						field,
-						scope.namespace,
-					) {
+				if let Some(name) = *name
+					&& self.decls.fields.lookup(decl.fields, name)
+						== Some(field) && self.field_accessible(
+					struct_index,
+					field,
+					scope.namespace,
+				) {
 					found.push((
-						name.inner,
+						name,
 						Definition::Field {
-							owner: struct_index,
+							owner: crate::tir::decls::FieldOwner::Struct(
+								struct_index,
+							),
 							field,
 						},
 					));
@@ -1337,7 +1341,7 @@ impl Semantics {
 		self.decls.namespaces.is_accessible_from(
 			accessor,
 			self.decls.scope(decl.loc).into(),
-			Visibility::from(decl.field_pub_spans[usize::from(field)]),
+			self.decls.fields.visibility(decl.fields)[usize::from(field)],
 		)
 	}
 

@@ -54,6 +54,8 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	trait_impls: Vec<TraitImplDecl>,
 	inherent_impls: Vec<InherentImplDecl>,
 	structs: Vec<StructDecl>,
+	fields: FieldArena,
+	params: ParamArena,
 	type_aliases: Vec<TypeAliasDecl>,
 	enums: Vec<EnumDecl>,
 	typesets: Vec<TypesetDecl>,
@@ -290,16 +292,7 @@ pub struct InherentImplDecl {
 pub struct StructDecl {
 	/// Its row, in the table of the scope it is written in.
 	pub loc: ItemLoc,
-	/// Each field's name, `None` for a positional field.
-	pub field_names: Box<[Option<Spanned<SymbolU32>>]>,
-	/// Each field's `pub`, index-aligned with `field_names`.
-	pub field_pub_spans: Box<[Option<TextSpan>]>,
-	/// The named fields by name, each to its first occurrence.
-	#[cfg_attr(
-		test,
-		serde(serialize_with = "crate::testing::serialize_sorted_map")
-	)]
-	pub lookup: FxHashMap<SymbolU32, FieldIdx>,
+	pub fields: FieldRange,
 	/// How the fields are placed in linear memory.
 	pub order: FieldOrder,
 }
@@ -503,11 +496,196 @@ impl AttributeTarget {
 	}
 }
 
-impl StructDecl {
-	/// Whether every field has a name: only then can the struct be
+/// A run of `Declarations::fields`: a struct's fields, or an enum's repr
+/// (`enum Ordering(pub value: i8)`), written and read the same way. A
+/// `FieldIdx` is a position in its owner's run; the types are the owner's
+/// signature's (`field_types`), index-aligned with it.
+#[derive(Clone, Copy)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub struct FieldRange {
+	start: u32,
+	len: u32,
+}
+
+impl FieldRange {
+	pub fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub fn is_empty(self) -> bool {
+		self.len == 0
+	}
+
+	fn range(self) -> std::ops::Range<usize> {
+		self.start as usize..(self.start + self.len) as usize
+	}
+}
+
+/// Every declared field, each owner's one contiguous run, as columns. What
+/// checking reads is kept apart from where it is written: a lookup scans
+/// `names` alone, an access check reads `visibility`, and only a diagnostic or
+/// the language server reads `name_spans`.
+#[derive(Default)]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+pub struct FieldArena {
+	/// Each field's name, `None` for a positional field.
+	names: Vec<Option<SymbolU32>>,
+	/// Each field's `pub`.
+	visibility: Vec<Visibility>,
+	/// Where each field's name is written; an empty span at the field's start
+	/// for a positional one, which is never read, since `names` already says
+	/// it has none.
+	name_spans: Vec<TextSpan>,
+}
+
+impl FieldArena {
+	/// Each field's name, in declaration order.
+	pub fn names(&self, fields: FieldRange) -> &[Option<SymbolU32>] {
+		&self.names[fields.range()]
+	}
+
+	/// Each field's visibility, index-aligned with [`Self::names`].
+	pub fn visibility(&self, fields: FieldRange) -> &[Visibility] {
+		&self.visibility[fields.range()]
+	}
+
+	/// The field's name, `None` for a positional one.
+	pub fn name(
+		&self,
+		fields: FieldRange,
+		field: FieldIdx,
+	) -> Option<SymbolU32> {
+		self.names(fields)[usize::from(field)]
+	}
+
+	/// Where the field's name is written: what a diagnostic or the language
+	/// server points at. Meaningful only for a named field.
+	pub fn name_span(&self, fields: FieldRange, field: FieldIdx) -> TextSpan {
+		self.name_spans[fields.range()][usize::from(field)]
+	}
+
+	/// `field`, written at `span`.
+	fn push(&mut self, field: &ast::StructField, span: TextSpan) {
+		let name = field.binding.and_then(ast::Binding::name);
+		self.names.push(name.map(|name| name.inner));
+		self.visibility.push(Visibility::from(field.pub_span));
+		self.name_spans.push(
+			name.map_or(TextSpan::new(span.start, span.start), |name| {
+				name.span
+			}),
+		);
+	}
+
+	/// The field named `name`: its first occurrence, as a duplicate is
+	/// reported and keeps its slot but is not reachable by name. A scan: a
+	/// run of fields is short, and comparing its symbols in place is cheaper
+	/// than a map per owner.
+	pub fn lookup(
+		&self,
+		fields: FieldRange,
+		name: SymbolU32,
+	) -> Option<FieldIdx> {
+		self.names(fields)
+			.iter()
+			.position(|&field| field == Some(name))
+			.map(|at| FieldIdx::new(at as u32))
+	}
+
+	/// Whether every field has a name: only then can its owner be
 	/// constructed (`P({ x: 1, y: 2 })`) or destructured by name.
-	pub fn is_fully_named(&self) -> bool {
-		self.field_names.iter().all(Option::is_some)
+	pub fn is_fully_named(&self, fields: FieldRange) -> bool {
+		self.names(fields).iter().all(Option::is_some)
+	}
+}
+
+/// A run of `Declarations::params`: one function's parameters. A `ParamIdx`
+/// is a position in it; the types are the function's signature's
+/// (`param_types`), index-aligned with it.
+#[derive(Clone, Copy)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub struct ParamRange {
+	start: u32,
+	len: u32,
+}
+
+impl ParamRange {
+	pub fn len(self) -> usize {
+		self.len as usize
+	}
+
+	pub fn is_empty(self) -> bool {
+		self.len == 0
+	}
+
+	fn range(self) -> std::ops::Range<usize> {
+		self.start as usize..(self.start + self.len) as usize
+	}
+}
+
+/// Every function's parameters, each function's one contiguous run, as
+/// columns, split as `FieldArena` is: the names a call by name is matched
+/// against, and where each is written.
+#[derive(Default)]
+#[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
+pub struct ParamArena {
+	/// Each parameter's name, `None` for an unnamed one.
+	names: Vec<Option<SymbolU32>>,
+	/// Where each parameter's name is written; an empty span at the
+	/// parameter's start for an unnamed one, which is never read.
+	name_spans: Vec<TextSpan>,
+}
+
+impl ParamArena {
+	/// Each parameter's name, in declaration order.
+	pub fn names(&self, params: ParamRange) -> &[Option<SymbolU32>] {
+		&self.names[params.range()]
+	}
+
+	/// The parameter's name, `None` for an unnamed one.
+	pub fn name(&self, params: ParamRange, param: usize) -> Option<SymbolU32> {
+		self.names(params)[param]
+	}
+
+	/// Where the parameter's name is written. Meaningful only for a named
+	/// one.
+	pub fn name_span(&self, params: ParamRange, param: usize) -> TextSpan {
+		self.name_spans[params.range()][param]
+	}
+}
+
+/// What declares a list of fields: a struct, or an enum, whose fields are its
+/// repr.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub enum FieldOwner {
+	Struct(StructIdx),
+	Enum(EnumIdx),
+}
+
+impl FieldOwner {
+	/// Its row, in the table of the scope it is written in.
+	pub fn loc(self, decls: &Declarations) -> ItemLoc {
+		match self {
+			FieldOwner::Struct(index) => decls.structs[usize::from(index)].loc,
+			FieldOwner::Enum(index) => decls.enums[usize::from(index)].loc,
+		}
+	}
+
+	pub fn fields(self, decls: &Declarations) -> FieldRange {
+		match self {
+			FieldOwner::Struct(index) => {
+				decls.structs[usize::from(index)].fields
+			}
+			FieldOwner::Enum(index) => decls.enums[usize::from(index)].fields,
+		}
+	}
+
+	/// `"struct"` or `"enum"`, for diagnostics.
+	pub fn noun(self) -> &'static str {
+		match self {
+			FieldOwner::Struct(_) => "struct",
+			FieldOwner::Enum(_) => "enum",
+		}
 	}
 }
 
@@ -525,6 +703,11 @@ pub struct EnumDecl {
 	/// the variant before `c` is `c - 1` while that is still in the range. Any
 	/// change to how variants are pushed must keep them together.
 	pub variants: Range<ConstIdx>,
+	/// The repr, written as a struct's fields (`enum Ordering(pub value: i8)`)
+	/// and read as one's (`Ordering(n)`, `o.value`, where its `pub` allows).
+	/// Its value is always one of the variants, so it is never written or
+	/// constructed from, whatever its visibility.
+	pub fields: FieldRange,
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
@@ -561,8 +744,8 @@ pub struct FunctionDecl {
 	/// written in.
 	pub loc: ItemLoc,
 	pub owner: MemberOwner,
-	/// Each parameter's name, `None` for an unnamed one.
-	pub params: Box<[Option<Spanned<SymbolU32>>]>,
+	/// Its parameters' run of `Declarations::params`.
+	pub params: ParamRange,
 	pub function_impls: FunctionImpls,
 	/// Only ever `INLINE`, and only on a function with a body.
 	pub attributes: Attributes,
@@ -935,6 +1118,10 @@ pub struct Declarations {
 	pub inherent_impls: Vec<InherentImplDecl>,
 	pub structs: Vec<StructDecl>,
 	pub enums: Vec<EnumDecl>,
+	/// The fields every struct and enum declares, each one's a run.
+	pub fields: FieldArena,
+	/// The parameters every function declares, each one's a run.
+	pub params: ParamArena,
 	pub typesets: Vec<TypesetDecl>,
 	pub functions: Vec<FunctionDecl>,
 	pub memories: Vec<MemoryDecl>,
@@ -2488,6 +2675,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			type_aliases: Vec::new(),
 			structs: Vec::new(),
 			enums: Vec::new(),
+			fields: FieldArena::default(),
+			params: ParamArena::default(),
 			typesets: Vec::new(),
 			functions: Vec::new(),
 			memories: Vec::new(),
@@ -2546,6 +2735,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			inherent_impls: builder.inherent_impls,
 			structs: builder.structs,
 			enums: builder.enums,
+			fields: builder.fields,
+			params: builder.params,
 			typesets: builder.typesets,
 			functions: builder.functions,
 			memories: builder.memories,
@@ -3047,6 +3238,49 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		}
 	}
 
+	/// A struct's fields, or an enum's repr, as one run of `fields`: a
+	/// duplicate name keeps its slot (positions still match the declaration)
+	/// but is unreachable by name.
+	fn scan_fields(
+		&mut self,
+		file_id: FileId,
+		fields: &[ast::StructField],
+		spans: &[TextSpan],
+	) -> FieldRange {
+		let start = u32::try_from(self.fields.names.len()).unwrap();
+		for (field, &span) in fields.iter().zip(spans) {
+			let name = field.binding.and_then(ast::Binding::name);
+			if let Some(name) = name {
+				if name.inner == Keyword::SelfLower.symbol() {
+					self.diagnostics
+						.push(report_self_field(file_id, name.span));
+				}
+				let before = FieldRange {
+					start,
+					len: u32::try_from(self.fields.names.len()).unwrap()
+						- start,
+				};
+				if let Some(first) = self.fields.lookup(before, name.inner) {
+					let first_name = Spanned {
+						inner: name.inner,
+						span: self.fields.name_span(before, first),
+					};
+					self.diagnostics.push(report_duplicate_struct_field(
+						self.strings,
+						file_id,
+						name,
+						first_name,
+					));
+				}
+			}
+			self.fields.push(field, span);
+		}
+		FieldRange {
+			start,
+			len: u32::try_from(fields.len()).unwrap(),
+		}
+	}
+
 	/// Binds one declaration under its name in both tiers, as a struct,
 	/// function or memory is. It is one definition, so a clash in either
 	/// tier is reported once, the value's first.
@@ -3529,6 +3763,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// The name is also the struct's constructor, called like a
 				// function. Constructing it takes every field, so it is only
 				// as visible as the struct and every one of its fields.
+				let spans = ast.spans(*fields);
 				let fields = ast.list(*fields);
 				let constructor_visibility = fields.iter().fold(
 					Visibility::from(*pub_span),
@@ -3544,42 +3779,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					name.span,
 				);
 
-				let mut field_names: Vec<Option<Spanned<SymbolU32>>> =
-					Vec::with_capacity(fields.len());
-				let mut field_pub_spans = Vec::with_capacity(fields.len());
-				let mut lookup: FxHashMap<SymbolU32, FieldIdx> =
-					FxHashMap::default();
-				for field in fields {
-					let index = FieldIdx::new(
-						u32::try_from(field_names.len()).unwrap(),
-					);
-					// A duplicate name keeps its slot (positions still match
-					// the declaration) but is unreachable by name.
-					let name = field.binding.and_then(ast::Binding::name);
-					if let Some(name) = name {
-						if name.inner == Keyword::SelfLower.symbol() {
-							self.diagnostics
-								.push(report_self_field(file_id, name.span));
-						}
-						if let Some(&first_index) = lookup.get(&name.inner) {
-							let first_name = field_names
-								[usize::from(first_index)]
-							.expect("only named fields are looked up");
-							self.diagnostics.push(
-								report_duplicate_struct_field(
-									self.strings,
-									file_id,
-									name,
-									first_name,
-								),
-							);
-						} else {
-							lookup.insert(name.inner, index);
-						}
-					}
-					field_names.push(name);
-					field_pub_spans.push(field.pub_span);
-				}
+				let fields = self.scan_fields(file_id, fields, spans);
 
 				if self.namespaces.scope(namespace).package_id
 					== self.core_package
@@ -3589,9 +3789,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				}
 				self.structs.push(StructDecl {
 					loc,
-					field_names: field_names.into_boxed_slice(),
-					field_pub_spans: field_pub_spans.into_boxed_slice(),
-					lookup,
+					fields,
 					order: if attributes.contains(Attributes::FIXED_ORDER) {
 						FieldOrder::Fixed
 					} else {
@@ -3609,10 +3807,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			}
 			ast::Item::Enum {
 				pub_span,
+				repr,
 				name,
 				variants,
 				..
 			} => {
+				let fields = self.scan_fields(
+					file_id,
+					ast.list(*repr),
+					ast.spans(*repr),
+				);
 				let variants = || ast.ids(*variants).zip(ast.list(*variants));
 				let enum_index =
 					EnumIdx::new(u32::try_from(self.enums.len()).unwrap());
@@ -3663,11 +3867,18 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.enums.push(EnumDecl {
 					loc,
 					variants: first_variant..end_variant,
+					fields,
 				});
-				self.insert_binding(
+				// In the value tier too, as a struct's name is: `Ordering(n)`
+				// is a pattern over its repr, and `Ordering(5)` is reported as
+				// a construction, which an enum never allows.
+				let binding =
+					Binding::definition(loc, Visibility::from(*pub_span));
+				self.insert_type_and_value(
 					Namespace::from(namespace),
-					BindingKey::ty(name.inner),
-					Binding::definition(loc, Visibility::from(*pub_span)),
+					name.inner,
+					binding.clone(),
+					binding,
 					name.span,
 				);
 				self.ast_nodes.push(AstEntry {
@@ -3934,11 +4145,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								signature.params,
 							);
-							let is_method = params.first().is_some_and(|p| {
-								p.is_some_and(|p| {
-									p.inner == Keyword::SelfLower.symbol()
-								})
-							});
+							let is_method = self.params.names(params).first()
+								== Some(&Some(Keyword::SelfLower.symbol()));
 							let function_impls = self
 								.synthesize_function_impls(
 									file_id,
@@ -4178,11 +4386,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								signature.params,
 							);
-							let is_method = params.first().is_some_and(|p| {
-								p.is_some_and(|p| {
-									p.inner == Keyword::SelfLower.symbol()
-								})
-							});
+							let is_method = self.params.names(params).first()
+								== Some(&Some(Keyword::SelfLower.symbol()));
 							let function_impls = self
 								.synthesize_function_impls(
 									file_id,
@@ -4679,11 +4884,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								signature.params,
 							);
-							let is_method = params.first().is_some_and(|p| {
-								p.is_some_and(|p| {
-									p.inner == Keyword::SelfLower.symbol()
-								})
-							});
+							let is_method = self.params.names(params).first()
+								== Some(&Some(Keyword::SelfLower.symbol()));
 							let function_impls = self
 								.synthesize_function_impls(
 									file_id,
@@ -4946,68 +5148,87 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		params: ast::List<ast::FunctionParam>,
-	) -> Box<[Option<Spanned<SymbolU32>>]> {
-		let names = self.scan_param_names(file_id, params);
-		for name in names.iter().flatten() {
-			if name.inner == Keyword::SelfLower.symbol() {
+	) -> ParamRange {
+		let range = self.scan_param_names(file_id, params);
+		for (at, &name) in self.params.names(range).iter().enumerate() {
+			if name == Some(Keyword::SelfLower.symbol()) {
+				let span = self.params.name_span(range, at);
 				self.diagnostics
-					.push(report_self_param_position(file_id, name.span));
+					.push(report_self_param_position(file_id, span));
 			}
 		}
-		names
+		range
 	}
 
 	/// Validates a trait/impl function's parameter list: every name unique,
 	/// `self` (if present) only as the very first parameter. Whether `self`
 	/// is actually present — i.e. whether this member is
 	/// `MemberKind::Method` or `MemberKind::Function` — is for the caller
-	/// to read straight off `params.first()` against
+	/// to read straight off the first name against
 	/// `Keyword::SelfLower.symbol()`, same constant-time check this uses;
 	/// nothing here needs to hand that fact back out.
 	fn scan_impl_function_params(
 		&mut self,
 		file_id: FileId,
 		params: ast::List<ast::FunctionParam>,
-	) -> Box<[Option<Spanned<SymbolU32>>]> {
-		let names = self.scan_param_names(file_id, params);
-		for (index, name) in names.iter().enumerate() {
-			if let Some(name) = name
-				&& name.inner == Keyword::SelfLower.symbol()
-				&& index != 0
-			{
+	) -> ParamRange {
+		let range = self.scan_param_names(file_id, params);
+		for (at, &name) in self.params.names(range).iter().enumerate().skip(1) {
+			if name == Some(Keyword::SelfLower.symbol()) {
+				let span = self.params.name_span(range, at);
 				self.diagnostics
-					.push(report_self_param_position(file_id, name.span));
+					.push(report_self_param_position(file_id, span));
 			}
 		}
-		names
+		range
 	}
 
-	/// Each parameter's name, `None` for an unnamed one, reporting a name
-	/// bound twice. Unnamed parameters never clash.
+	/// Each parameter's name, `None` for an unnamed one, as one run of
+	/// `params`, reporting a name bound twice. Unnamed parameters never clash.
 	fn scan_param_names(
 		&mut self,
 		file_id: FileId,
 		params: ast::List<ast::FunctionParam>,
-	) -> Box<[Option<Spanned<SymbolU32>>]> {
-		let params = self.ast(file_id).list(params);
-		let mut names: Vec<Option<Spanned<SymbolU32>>> =
-			Vec::with_capacity(params.len());
-		for param in params {
+	) -> ParamRange {
+		let ast = self.ast(file_id);
+		let start = u32::try_from(self.params.names.len()).unwrap();
+		for (param, &span) in ast.list(params).iter().zip(ast.spans(params)) {
 			let name = param.binding.and_then(ast::Binding::name);
-			if let Some(name) = name
-				&& let Some(&first) =
-					names.iter().flatten().find(|s| s.inner == name.inner)
-			{
-				self.diagnostics.push(report_duplicate_function_parameter(
-					self.strings,
-					file_id,
-					name,
-					first,
-				));
+			if let Some(name) = name {
+				let before = ParamRange {
+					start,
+					len: u32::try_from(self.params.names.len()).unwrap()
+						- start,
+				};
+				if let Some(first) = self
+					.params
+					.names(before)
+					.iter()
+					.position(|&first| first == Some(name.inner))
+				{
+					let first = Spanned {
+						inner: name.inner,
+						span: self.params.name_span(before, first),
+					};
+					self.diagnostics.push(report_duplicate_function_parameter(
+						self.strings,
+						file_id,
+						name,
+						first,
+					));
+				}
 			}
-			names.push(name);
+			self.params.names.push(name.map(|name| name.inner));
+			self.params.name_spans.push(
+				name.map_or(TextSpan::new(span.start, span.start), |name| {
+					name.span
+				}),
+			);
 		}
-		names.into_boxed_slice()
+		ParamRange {
+			start,
+			len: u32::try_from(params.len()).unwrap(),
+		}
 	}
 }
 
@@ -6262,9 +6483,10 @@ mod tests {
 		};
 		assert_eq!(
 			case.strings.resolve(
-				case.decls.functions[usize::from(index)].params[0]
+				case.decls
+					.params
+					.name(case.decls.functions[usize::from(index)].params, 0)
 					.unwrap()
-					.inner
 			),
 			Some("original")
 		);
@@ -6398,9 +6620,13 @@ mod tests {
 			};
 			assert_eq!(
 				case.strings.resolve(
-					case.decls.functions[usize::from(index)].params[0]
+					case.decls
+						.params
+						.name(
+							case.decls.functions[usize::from(index)].params,
+							0
+						)
 						.unwrap()
-						.inner
 				),
 				Some("original")
 			);
@@ -6489,15 +6715,18 @@ mod tests {
 		};
 		let struct_decl = &case.decls.structs[usize::from(point_struct_index)];
 
-		let (names, lookup) = (&struct_decl.field_names, &struct_decl.lookup);
+		let names = case.decls.fields.names(struct_decl.fields);
 		// Both occurrences keep a real field slot — duplicate name isn't
 		// dropped, only unreachable by name — so a later field's index
 		// still matches its declaration position.
 		assert_eq!(names.len(), 2);
-		let name = names[0].unwrap().inner;
-		assert_eq!(names[1].unwrap().inner, name);
+		let name = names[0].unwrap();
+		assert_eq!(names[1].unwrap(), name);
 		// `lookup` only ever points at the first occurrence.
-		assert_eq!(lookup.get(&name), Some(&FieldIdx::new(0)));
+		assert_eq!(
+			case.decls.fields.lookup(struct_decl.fields, name),
+			Some(FieldIdx::new(0))
+		);
 	}
 
 	#[test]
@@ -6520,16 +6749,14 @@ mod tests {
 			else {
 				panic!("expected `{path}` to be a function");
 			};
-			let params: Vec<_> = case.decls.functions[usize::from(index)]
-				.params
-				.iter()
-				.map(|param| param.unwrap())
-				.collect();
+			let range = case.decls.functions[usize::from(index)].params;
+			let params = case.decls.params.names(range);
 			assert_eq!(params.len(), 2);
-			assert_eq!(params[0].inner, params[1].inner);
+			assert_eq!(params[0].unwrap(), params[1].unwrap());
+			let span = |at| case.decls.params.name_span(range, at);
 			let labels = &case.diagnostics[0].labels;
-			assert_eq!(labels[0].range, std::ops::Range::from(params[1].span));
-			assert_eq!(labels[1].range, std::ops::Range::from(params[0].span));
+			assert_eq!(labels[0].range, std::ops::Range::from(span(1)));
+			assert_eq!(labels[1].range, std::ops::Range::from(span(0)));
 		}
 	}
 
@@ -6565,12 +6792,12 @@ mod tests {
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::DuplicateFunctionParameter]);
 			let function = &case.decls.functions[0];
-			let names: Vec<_> = function
+			let names: Vec<_> = case
+				.decls
 				.params
+				.names(function.params)
 				.iter()
-				.map(|param| {
-					case.strings.resolve(param.unwrap().inner).unwrap()
-				})
+				.map(|param| case.strings.resolve(param.unwrap()).unwrap())
 				.collect();
 			assert_eq!(names, ["x", "x", "tail"]);
 			case.diagnostics().assert_error_with(

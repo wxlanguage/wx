@@ -8,8 +8,8 @@ use string_interner::symbol::SymbolU32;
 use wx_compiler::ast::{Keyword, Spanned, StringInterner};
 use wx_compiler::tir::{
 	AssocTypeIdx, ConstIdx, ConstScalar, DeclKind, Definition, FieldIdx,
-	FunctionIdx, GenericEnvIdx, MemberKind, MemberOwner, Semantics, StructIdx,
-	Type, Val,
+	FieldOwner, FunctionIdx, GenericEnvIdx, MemberKind, MemberOwner, Semantics,
+	StructIdx, Type, Val,
 };
 use wx_compiler::vfs::Files;
 
@@ -214,12 +214,10 @@ pub(crate) fn callable_type(
 		.types
 		.list(signature.param_types)
 		.iter()
-		.zip(&decl.params)
-		.map(|(&ty, name)| {
+		.zip(sema.decls.params.names(decl.params))
+		.map(|(&ty, &name)| {
 			let ty = renderer.ty(ty);
-			if name
-				.is_some_and(|name| name.inner == Keyword::SelfLower.symbol())
-			{
+			if name == Some(Keyword::SelfLower.symbol()) {
 				format!("self: {ty}")
 			} else {
 				ty
@@ -276,7 +274,11 @@ struct Renderer<'a> {
 
 impl Renderer<'_> {
 	fn name(&self, name: Spanned<SymbolU32>) -> &str {
-		self.strings.resolve(name.inner).unwrap_or("?")
+		self.symbol(name.inner)
+	}
+
+	fn symbol(&self, symbol: SymbolU32) -> &str {
+		self.strings.resolve(symbol).unwrap_or("?")
 	}
 
 	fn ty(&self, ty: wx_compiler::tir::TypeIndex) -> String {
@@ -307,9 +309,11 @@ impl Renderer<'_> {
 		let types = self.sema.types.list(signature.param_types);
 		let params: Vec<_> = types
 			.iter()
-			.zip(decl.params.iter())
+			.zip(self.sema.decls.params.names(decl.params))
 			.map(|(ty, name)| match name {
-				Some(name) => format!("{}: {}", self.name(*name), self.ty(*ty)),
+				Some(name) => {
+					format!("{}: {}", self.symbol(*name), self.ty(*ty))
+				}
 				None => self.ty(*ty),
 			})
 			.collect();
@@ -362,9 +366,11 @@ impl Renderer<'_> {
 		let types = self.sema.types.list(signature.field_types);
 		let fields: Vec<_> = types
 			.iter()
-			.zip(decl.field_names.iter())
+			.zip(self.sema.decls.fields.names(decl.fields))
 			.map(|(ty, name)| match name {
-				Some(name) => format!("{}: {}", self.name(*name), self.ty(*ty)),
+				Some(name) => {
+					format!("{}: {}", self.symbol(*name), self.ty(*ty))
+				}
 				None => self.ty(*ty),
 			})
 			.collect();
@@ -417,16 +423,24 @@ impl Renderer<'_> {
 		))
 	}
 
-	fn field(&self, owner: StructIdx, field: FieldIdx) -> Option<String> {
-		let decl = &self.sema.decls.structs[usize::from(owner)];
-		let signature = &self.sema.structs[usize::from(owner)];
-		let ty = self
+	fn field(&self, owner: FieldOwner, field: FieldIdx) -> Option<String> {
+		let types = match owner {
+			FieldOwner::Struct(index) => {
+				self.sema.structs[usize::from(index)].field_types
+			}
+			FieldOwner::Enum(index) => {
+				self.sema.enums[usize::from(index)].field_types
+			}
+		};
+		let ty = self.sema.types.list(types).get(usize::from(field))?;
+		let name = self
 			.sema
-			.types
-			.list(signature.field_types)
-			.get(usize::from(field))?;
-		let name = decl.field_names.get(usize::from(field))?.as_ref()?;
-		Some(format!("{}: {}", self.name(*name), self.ty(*ty)))
+			.decls
+			.fields
+			.names(owner.fields(&self.sema.decls))
+			.get(usize::from(field))
+			.copied()??;
+		Some(format!("{}: {}", self.symbol(name), self.ty(*ty)))
 	}
 
 	fn parameter(
@@ -437,8 +451,14 @@ impl Renderer<'_> {
 		let decl = &self.sema.decls.functions[usize::from(function)];
 		let signature = &self.sema.functions[usize::from(function)];
 		let ty = self.sema.types.list(signature.param_types).get(parameter)?;
-		let name = decl.params.get(parameter)?.as_ref()?;
-		Some(format!("{}: {}", self.name(*name), self.ty(*ty)))
+		let name = self
+			.sema
+			.decls
+			.params
+			.names(decl.params)
+			.get(parameter)
+			.copied()??;
+		Some(format!("{}: {}", self.symbol(name), self.ty(*ty)))
 	}
 }
 

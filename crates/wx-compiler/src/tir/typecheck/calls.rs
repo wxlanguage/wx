@@ -20,7 +20,7 @@ use string_interner::symbol::SymbolU32;
 
 use super::members::Expected;
 use super::{ArgumentList, Arguments, BodyBuilder};
-use crate::ast::{self, Spanned, StringInterner};
+use crate::ast::{self, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::decls::{
@@ -148,14 +148,14 @@ impl CallTarget {
 	pub(super) fn param_names<'d>(
 		&self,
 		decls: &'d Declarations,
-	) -> &'d [Option<Spanned<SymbolU32>>] {
+	) -> &'d [Option<SymbolU32>] {
 		match self.names {
-			CallTargetKind::Function(function) => {
-				&decls.functions[usize::from(function)].params
-			}
-			CallTargetKind::StructConstructor(struct_index) => {
-				&decls.structs[usize::from(struct_index)].field_names
-			}
+			CallTargetKind::Function(function) => decls
+				.params
+				.names(decls.functions[usize::from(function)].params),
+			CallTargetKind::StructConstructor(struct_index) => decls
+				.fields
+				.names(decls.structs[usize::from(struct_index)].fields),
 		}
 	}
 
@@ -171,7 +171,7 @@ impl CallTarget {
 			.iter()
 			.enumerate()
 			.skip(from)
-			.find(|(_, param)| param.is_some_and(|param| param.inner == name))
+			.find(|(_, param)| **param == Some(name))
 			.map(|(at, _)| ParamIdx::new(at as u32))
 	}
 }
@@ -183,9 +183,11 @@ impl Semantics {
 	pub fn function_parameter_names(
 		&self,
 		function: FunctionIdx,
-	) -> &[Option<Spanned<SymbolU32>>] {
+	) -> &[Option<SymbolU32>] {
 		let function = naming_declaration(self, function);
-		&self.decls.functions[usize::from(function)].params
+		self.decls
+			.params
+			.names(self.decls.functions[usize::from(function)].params)
 	}
 
 	/// The names a call by name of `callee` can give, with what each names,
@@ -233,12 +235,12 @@ impl Semantics {
 					}
 					CallTargetKind::StructConstructor(owner) => {
 						Definition::Field {
-							owner,
+							owner: crate::tir::decls::FieldOwner::Struct(owner),
 							field: FieldIdx::new(at as u32),
 						}
 					}
 				};
-				Some((name.as_ref()?.inner, definition))
+				Some(((*name)?, definition))
 			})
 			.collect()
 	}
@@ -892,7 +894,7 @@ impl BodyBuilder<'_, '_> {
 					parameter: param,
 				},
 				CallTargetKind::StructConstructor(owner) => Reference::Field {
-					owner,
+					owner: crate::tir::decls::FieldOwner::Struct(owner),
 					field: FieldIdx::new(u32::from(param)),
 					access: AccessKind::Initialize,
 				},
@@ -941,9 +943,8 @@ impl BodyBuilder<'_, '_> {
 			.map(|at| ParamIdx::new(at as u32))
 			.filter(|&param| !named.iter().any(|&(named, _)| named == param))
 			.filter_map(|param| {
-				let name = target.param_names(&self.sema.decls)
-					[usize::from(param)]?
-				.inner;
+				let name =
+					target.param_names(&self.sema.decls)[usize::from(param)]?;
 				(target.find_param(&self.sema.decls, name, skipped)
 					== Some(param))
 				.then(|| {

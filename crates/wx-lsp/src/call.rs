@@ -87,11 +87,7 @@ pub(crate) fn signature(
 			};
 			let decl = &sema.decls.functions[usize::from(function)];
 			let signature = &sema.functions[usize::from(function)];
-			let names = sema
-				.function_parameter_names(function)
-				.iter()
-				.map(|name| name.map(|name| name.inner))
-				.collect::<Vec<_>>();
+			let names = sema.function_parameter_names(function).to_vec();
 			(
 				Some(Definition::Item(decl.loc)),
 				signature.type_params,
@@ -115,11 +111,7 @@ pub(crate) fn signature(
 					.identity_args(signature.type_params)
 					.to_vec(),
 			};
-			let names = decl
-				.field_names
-				.iter()
-				.map(|name| name.map(|name| name.inner))
-				.collect::<Vec<_>>();
+			let names = sema.decls.fields.names(decl.fields).to_vec();
 			let params = sema.types.list(signature.field_types).to_vec();
 			let definition = Definition::Item(decl.loc);
 			let env = signature.type_params;

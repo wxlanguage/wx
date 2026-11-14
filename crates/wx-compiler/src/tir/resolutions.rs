@@ -31,9 +31,10 @@ use std::collections::BTreeMap;
 use super::body::{BodyOwner, LabelIdx, LocalIdx, ParamIdx};
 use super::decls::Declared;
 use super::decls::{
-	BindingKey, BindingLookup, ConstIdx, DeclKind, FieldIdx, FunctionIdx,
-	GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, NameUse, Namespace,
-	PackageMemberItem, Scope, StructIdx, Tier, TraitImplIdx, UseItemIndex,
+	BindingKey, BindingLookup, ConstIdx, DeclKind, EnumIdx, FieldIdx,
+	FieldOwner, FunctionIdx, GlobalIdx, InherentImplIdx, ItemLoc, MemberKind,
+	NameUse, Namespace, PackageMemberItem, Scope, StructIdx, Tier,
+	TraitImplIdx, UseItemIndex,
 };
 use super::signatures::Semantics;
 use super::types::{GenericEnvIdx, GenericEnvOwner, ImplKind};
@@ -161,7 +162,7 @@ pub enum Reference {
 	},
 	/// A field selected, matched or named by an argument.
 	Field {
-		owner: StructIdx,
+		owner: FieldOwner,
 		field: FieldIdx,
 		access: AccessKind,
 	},
@@ -223,7 +224,7 @@ pub enum Definition {
 		local: LocalIdx,
 	},
 	Field {
-		owner: StructIdx,
+		owner: FieldOwner,
 		field: FieldIdx,
 	},
 	Parameter {
@@ -592,9 +593,13 @@ impl Semantics {
 				parameter,
 			} => {
 				let function = &decls.functions[usize::from(function)];
-				let name =
-					function.params.get(usize::from(parameter))?.as_ref()?;
-				Some(SourceSpan::new(decls.file_id(function.loc), name.span))
+				let at = usize::from(parameter);
+				if at >= function.params.len() {
+					return None;
+				}
+				decls.params.name(function.params, at)?;
+				let span = decls.params.name_span(function.params, at);
+				Some(SourceSpan::new(decls.file_id(function.loc), span))
 			}
 		}
 	}
@@ -614,9 +619,17 @@ impl Semantics {
 				found.insert(span, definition);
 			}
 		};
-		for (index, decl) in decls.structs.iter().enumerate() {
-			let owner = StructIdx::new(index as u32);
-			for field in 0..decl.field_names.len() {
+		let structs = decls.structs.iter().enumerate().map(|(index, decl)| {
+			(
+				FieldOwner::Struct(StructIdx::new(index as u32)),
+				decl.fields,
+			)
+		});
+		let enums = decls.enums.iter().enumerate().map(|(index, decl)| {
+			(FieldOwner::Enum(EnumIdx::new(index as u32)), decl.fields)
+		});
+		for (owner, fields) in structs.chain(enums) {
+			for field in 0..fields.len() {
 				add(Definition::Field {
 					owner,
 					field: FieldIdx::new(field as u32),
@@ -684,12 +697,18 @@ impl Semantics {
 
 	fn field_definition(
 		&self,
-		owner: StructIdx,
+		owner: FieldOwner,
 		field: FieldIdx,
 	) -> Option<SourceSpan> {
-		let decl = &self.decls.structs[usize::from(owner)];
-		let name = decl.field_names.get(usize::from(field))?.as_ref()?;
-		Some(SourceSpan::new(self.decls.file_id(decl.loc), name.span))
+		let fields = owner.fields(&self.decls);
+		if usize::from(field) >= fields.len() {
+			return None;
+		}
+		self.decls.fields.name(fields, field)?;
+		Some(SourceSpan::new(
+			self.decls.file_id(owner.loc(&self.decls)),
+			self.decls.fields.name_span(fields, field),
+		))
 	}
 
 	/// The body `declaration` owns: a function's block, a constant's or a
@@ -1566,7 +1585,7 @@ mod tests {
 		assert_eq!(
 			first,
 			Reference::Field {
-				owner: a.struct_index("A"),
+				owner: FieldOwner::Struct(a.struct_index("A")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Write,
 			}
@@ -1574,7 +1593,7 @@ mod tests {
 		assert_eq!(
 			a.reference("\n\ta.value\n", "value"),
 			Reference::Field {
-				owner: a.struct_index("A"),
+				owner: FieldOwner::Struct(a.struct_index("A")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Read
 			}
@@ -1598,7 +1617,7 @@ mod tests {
 		assert_eq!(
 			a.reference("b.value;", "value"),
 			Reference::Field {
-				owner: a.struct_index("B"),
+				owner: FieldOwner::Struct(a.struct_index("B")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Read,
 			}
@@ -1656,7 +1675,7 @@ mod tests {
 			}
 		"});
 		let field = Reference::Field {
-			owner: a.struct_index("S"),
+			owner: FieldOwner::Struct(a.struct_index("S")),
 			field: FieldIdx::new(1),
 			access: AccessKind::Initialize,
 		};
@@ -1799,7 +1818,7 @@ mod tests {
 		assert_eq!(
 			a.reference("{ value: x", "value"),
 			Reference::Field {
-				owner: a.struct_index("S"),
+				owner: FieldOwner::Struct(a.struct_index("S")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Read,
 			}
@@ -1824,7 +1843,7 @@ mod tests {
 		assert_eq!(
 			a.reference("p.value =", "value"),
 			Reference::Field {
-				owner: a.struct_index("S"),
+				owner: FieldOwner::Struct(a.struct_index("S")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Write,
 			}
@@ -1888,7 +1907,7 @@ mod tests {
 		assert_eq!(
 			a.reference("s.value", "value"),
 			Reference::Field {
-				owner: a.struct_index("m::S"),
+				owner: FieldOwner::Struct(a.struct_index("m::S")),
 				field: FieldIdx::new(1),
 				access: AccessKind::Read,
 			}
@@ -1908,7 +1927,7 @@ mod tests {
 		assert_eq!(
 			a.reference("{ value }", "value"),
 			Reference::Field {
-				owner: a.struct_index("S"),
+				owner: FieldOwner::Struct(a.struct_index("S")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Read,
 			}
@@ -2367,7 +2386,7 @@ mod tests {
 			assert_eq!(
 				a.reference(context, field),
 				Reference::Field {
-					owner: a.struct_index(owner),
+					owner: FieldOwner::Struct(a.struct_index(owner)),
 					field: FieldIdx::new(index),
 					access,
 				}
@@ -2388,7 +2407,7 @@ mod tests {
 		assert_eq!(
 			a.reference("p.data[i][j] =", "data"),
 			Reference::Field {
-				owner: a.struct_index("Rows"),
+				owner: FieldOwner::Struct(a.struct_index("Rows")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Read,
 			}
@@ -2470,7 +2489,7 @@ mod tests {
 			assert_eq!(
 				a.reference(context, "data"),
 				Reference::Field {
-					owner: a.struct_index("Buffer"),
+					owner: FieldOwner::Struct(a.struct_index("Buffer")),
 					field: FieldIdx::new(0),
 					access
 				}
@@ -2480,7 +2499,7 @@ mod tests {
 			assert_eq!(
 				a.reference(context, "pointer"),
 				Reference::Field {
-					owner: a.struct_index("Buffer"),
+					owner: FieldOwner::Struct(a.struct_index("Buffer")),
 					field: FieldIdx::new(1),
 					access: AccessKind::Read
 				}
@@ -2496,7 +2515,7 @@ mod tests {
 		assert_eq!(
 			a.reference("p.data[block", "data"),
 			Reference::Field {
-				owner: a.struct_index("Buffer"),
+				owner: FieldOwner::Struct(a.struct_index("Buffer")),
 				field: FieldIdx::new(0),
 				access: AccessKind::Write
 			}
@@ -3004,7 +3023,8 @@ mod tests {
 		let prefix = "shapes::area";
 		assert_eq!(
 			names_after(&analysis, prefix, "shapes", NameUse::Value),
-			["Square", "area"],
+			// An enum's name is a value path too (`Kind::A`, `Kind(n)`).
+			["Kind", "Square", "area"],
 			"`hidden` is private to `shapes`"
 		);
 		// A constructor is a value only where every field is accessible.
