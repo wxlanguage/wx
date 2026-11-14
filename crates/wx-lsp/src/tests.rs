@@ -2219,6 +2219,44 @@ fn completion_after_a_module_offers_what_it_makes_visible() {
 }
 
 #[test]
+fn completion_of_a_value_offers_the_namespaces_a_path_starts_with() {
+	let source = "mod shapes {\n    pub func area() -> u32 { 1 }\n}\nfunc f() {\n    sha$0\n}\n";
+	let items = completion_items(source, true).expect("a value position");
+	let shapes = items
+		.iter()
+		.find(|item| item.label == "shapes")
+		.expect("the module is offered");
+	assert_eq!(
+		shapes.kind,
+		Some(tower_lsp_server::ls_types::CompletionItemKind::MODULE)
+	);
+	assert_eq!(shapes.insert_text, None, "a module is not called");
+	let labels: Vec<_> = items.into_iter().map(|item| item.label).collect();
+	// The root module has no `super`.
+	assert_offers(&labels, &["core", "package", "self"], &["super"]);
+	// A local of the module's name does not hide it: a path's prefix is
+	// read as a type.
+	let shadowed = completions(
+		&source.replace("    sha$0", "    local shapes: u32 = 1;\n    sha$0"),
+	)
+	.unwrap();
+	assert_eq!(
+		shadowed.iter().filter(|label| *label == "shapes").count(),
+		2,
+		"{shadowed:?}"
+	);
+}
+
+#[test]
+fn completion_after_a_module_in_a_value_offers_its_modules() {
+	let source = "mod a {\n    pub mod b {\n        pub func g() {}\n    }\n    mod hidden {}\n    pub func h() {}\n}\nfunc f() {\n    a::$0\n}\n";
+	let labels = completions(source).expect("a segment after a module");
+	assert_offers(&labels, &["b", "h"], &["hidden", "f"]);
+	let labels = completions(&source.replace("a::$0", "package::$0")).unwrap();
+	assert_offers(&labels, &["a", "f"], &[]);
+}
+
+#[test]
 fn completion_after_an_enum_offers_its_variants() {
 	let labels = completions(
 		"enum Kind(u8) { A = 0, B }\nfunc f(k: Kind) -> u8 {\n    match k {\n        Kind::$0 => 1,\n        _ => 2,\n    }\n}\n",

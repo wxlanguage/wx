@@ -11,6 +11,7 @@ use crate::{
 	ast::{Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
 	small_vec::SmallVec,
+	symbols::Keyword,
 	vfs::FileId,
 };
 
@@ -369,6 +370,11 @@ impl<'r> ImportResolver<'r> {
 			// namespace, same as the first segment of any `use` path.
 			None => namespace.into(),
 		};
+		// `use a::` with no name: the parser reported it, and the prefix is
+		// resolved; there is nothing to bind.
+		if name.inner == Keyword::Error.symbol() {
+			return;
+		}
 
 		// Force any not-yet-resolved `use` in `scope` first — it might be
 		// a re-export chain that hasn't installed its binding yet:

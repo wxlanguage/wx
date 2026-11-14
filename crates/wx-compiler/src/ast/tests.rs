@@ -4542,6 +4542,33 @@ fn a_keyword_after_a_dot_starts_the_next_statement() {
 }
 
 #[test]
+fn a_use_path_with_no_name_keeps_its_prefix() {
+	let case = TestCase::new(indoc! {"
+		use a::b::;
+		use c::{d::, e};
+		func f() {}
+	"});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::UnexpectedToken,
+	]);
+	case.diagnostics().assert_error_saying(
+		"expected a name, `*` or `{` after `::`, found `;`",
+	);
+	assert_eq!(
+		case.tree(),
+		"(use a::b::<error>)\n\n(use (group c d::<error> e))\n\n(func f (params) (block))\n"
+	);
+}
+
+#[test]
+fn a_use_path_continues_through_super() {
+	let case = TestCase::new("use super::super::a;");
+	case.diagnostics().assert_none();
+	assert_eq!(case.tree(), "(use super::super::a)\n");
+}
+
+#[test]
 fn a_dot_before_a_call_is_a_method_call_with_no_method() {
 	let case = TestCase::new("func f() { p.(1) }");
 	case.diagnostics()

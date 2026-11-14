@@ -853,7 +853,8 @@ impl Semantics {
 	/// from `namespace`, that can be written there and that no parameter, or
 	/// local (`is_local`), of their name takes first. A trait, in a bound or
 	/// an impl, is looked up among the items alone, so no parameter is one
-	/// or hides one.
+	/// or hides one. A value also lists the namespaces a path can start
+	/// with, from the type tier, where no local hides them.
 	fn scope_names(
 		&self,
 		namespace: Scope,
@@ -899,32 +900,38 @@ impl Semantics {
 				found.push((self_name, definition));
 			}
 		}
-		let hidden = |name: SymbolU32| match used_as {
-			NameUse::Value => is_local(name),
-			NameUse::Type => self.generic_envs.resolve(env, name).is_some(),
-			NameUse::Bound | NameUse::Trait => false,
+		// A local hides a value, and a type parameter a type, a value path's
+		// prefix included.
+		let hidden = |tier: Tier, name: SymbolU32| match (used_as, tier) {
+			(NameUse::Value, Tier::Value) => is_local(name),
+			(NameUse::Value | NameUse::Type, Tier::Type) => {
+				self.generic_envs.resolve(env, name).is_some()
+			}
+			_ => false,
 		};
-		let tier = used_as.tier();
 		let roots = [
 			Namespace::from(namespace),
 			Namespace::Package(self.decls.core_package),
 		];
-		for name in self.candidates(&roots, tier) {
-			if hidden(name) {
-				continue;
-			}
-			let key = BindingKey::new(tier, name);
-			let (base, lookup) = self.decls.lookup_unqualified(namespace, key);
-			if let BindingLookup::Found {
-				target, visibility, ..
-			} = lookup && let Some(loc) = target.loc()
-				&& used_as.admits(self.declaration_kind(loc))
-				&& self
-					.decls
-					.namespaces
-					.is_accessible_from(namespace, base, visibility)
-			{
-				found.push((name, Definition::Item(loc)));
+		for &tier in used_as.listed_tiers() {
+			for name in self.candidates(&roots, tier) {
+				if hidden(tier, name) {
+					continue;
+				}
+				let key = BindingKey::new(tier, name);
+				let (base, lookup) =
+					self.decls.lookup_unqualified(namespace, key);
+				if let BindingLookup::Found {
+					target, visibility, ..
+				} = lookup && let Some(loc) = target.loc()
+					&& used_as.admits(tier, self.declaration_kind(loc))
+					&& self
+						.decls
+						.namespaces
+						.is_accessible_from(namespace, base, visibility)
+				{
+					found.push((name, Definition::Item(loc)));
+				}
 			}
 		}
 	}
@@ -943,7 +950,6 @@ impl Semantics {
 		prefix: ItemLoc,
 		used_as: NameUse,
 	) -> Vec<(SymbolU32, Definition)> {
-		let tier = used_as.tier();
 		let Some((accessor, _)) = self.signature_scope(declaration) else {
 			return Vec::new();
 		};
@@ -952,16 +958,22 @@ impl Semantics {
 			return Vec::new();
 		};
 		let mut found = Vec::new();
-		for name in self.candidates(&[base], tier) {
-			let key = BindingKey::new(tier, name);
-			if let BindingLookup::Found {
-				target, visibility, ..
-			} = namespaces.lookup(&self.decls.use_items, accessor, base, key)
-				&& let Some(loc) = target.loc()
-				&& used_as.admits(self.declaration_kind(loc))
-				&& namespaces.is_accessible_from(accessor, base, visibility)
-			{
-				found.push((name, Definition::Item(loc)));
+		for &tier in used_as.listed_tiers() {
+			for name in self.candidates(&[base], tier) {
+				let key = BindingKey::new(tier, name);
+				if let BindingLookup::Found {
+					target, visibility, ..
+				} = namespaces.lookup(
+					&self.decls.use_items,
+					accessor,
+					base,
+					key,
+				) && let Some(loc) = target.loc()
+					&& used_as.admits(tier, self.declaration_kind(loc))
+					&& namespaces.is_accessible_from(accessor, base, visibility)
+				{
+					found.push((name, Definition::Item(loc)));
+				}
 			}
 		}
 		found
@@ -2832,8 +2844,14 @@ mod tests {
 		for item in ["LIMIT", "f", "shared", "True", "transmute"] {
 			assert_eq!(listed(&names, item), 1, "`{item}` in {names:?}");
 		}
-		// A module is a type-tier name.
-		assert_eq!(listed(&names, "helpers"), 0);
+		// A module is a type-tier name, which a value path can start with.
+		for namespace in ["helpers", "core", "package", "self"] {
+			assert_eq!(
+				listed(&names, namespace),
+				1,
+				"`{namespace}` in {names:?}"
+			);
+		}
 	}
 
 	#[test]
@@ -3023,8 +3041,9 @@ mod tests {
 		let prefix = "shapes::area";
 		assert_eq!(
 			names_after(&analysis, prefix, "shapes", NameUse::Value),
-			// An enum's name is a value path too (`Kind::A`, `Kind(n)`).
-			["Kind", "Square", "area"],
+			// An enum's name is a value path too (`Kind::A`, `Kind(n)`), and
+			// the module's own path keywords continue it.
+			["Kind", "Square", "area", "package", "self", "super"],
 			"`hidden` is private to `shapes`"
 		);
 		// A constructor is a value only where every field is accessible.
@@ -3039,7 +3058,7 @@ mod tests {
 				"shapes",
 				NameUse::Value
 			),
-			["area"]
+			["area", "package", "self", "super"]
 		);
 		assert_eq!(
 			names_after(&analysis, prefix, "shapes", NameUse::Type),

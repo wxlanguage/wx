@@ -199,10 +199,22 @@ impl NameUse {
 		}
 	}
 
-	/// Whether completion may offer this declaration: it can end the path,
-	/// or it is a namespace the path can continue into (`shapes::Square`).
-	pub(super) fn admits(self, kind: DeclKind) -> bool {
-		self.takes(kind) || kind.type_role() == Some(TypeRole::Namespace)
+	/// The tiers completion lists names from: the one the name is looked up
+	/// in, and for a value the type tier too, since a path's prefix is read
+	/// as a type (`shapes::area`).
+	pub(super) fn listed_tiers(self) -> &'static [Tier] {
+		match self {
+			NameUse::Value => &[Tier::Value, Tier::Type],
+			NameUse::Type | NameUse::Bound | NameUse::Trait => &[Tier::Type],
+		}
+	}
+
+	/// Whether completion may offer this declaration, found in `tier`: it
+	/// can end the path, found where the name is looked up, or it is a
+	/// namespace the path can continue into (`shapes::Square`).
+	pub(super) fn admits(self, tier: Tier, kind: DeclKind) -> bool {
+		(tier == self.tier() && self.takes(kind))
+			|| kind.type_role() == Some(TypeRole::Namespace)
 	}
 }
 

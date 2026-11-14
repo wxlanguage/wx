@@ -88,6 +88,23 @@ fn report_expected_path_segment_or_memory_tag(
 		)
 }
 
+/// A `use` path's `::` followed by none of a name, `*` or `{`.
+fn report_expected_use_segment(
+	file_id: FileId,
+	received: Spanned<Token>,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UnexpectedToken.code())
+		.with_message(format!(
+			"expected a name, `*` or `{{` after `::`, found `{}`",
+			received.inner
+		))
+		.with_label(
+			Label::primary(file_id, received.span)
+				.with_message("expected a name, `*` or `{` here"),
+		)
+}
+
 fn report_missing_separator(
 	file_id: FileId,
 	span: TextSpan,
@@ -4721,7 +4738,7 @@ impl<'ctx> Parser<'ctx> {
 		let segment = parser.parse_path_ident()?;
 		let token = parser.lexer.peek();
 		if token.inner == Token::ColonColon {
-			_ = parser.lexer.next();
+			let colons = parser.lexer.next();
 			let token = parser.lexer.peek();
 			match token.inner {
 				Token::Star => {
@@ -4749,7 +4766,7 @@ impl<'ctx> Parser<'ctx> {
 						span,
 					});
 				}
-				Token::Identifier => {
+				token if Self::is_later_segment(token) => {
 					let rest = Parser::parse_use_tree(parser)?;
 					let span = TextSpan::new(segment.span.start, rest.span.end);
 					let rest = parser.ast.push_node(rest.inner, rest.span);
@@ -4758,7 +4775,30 @@ impl<'ctx> Parser<'ctx> {
 						span,
 					});
 				}
-				_ => unreachable!(),
+				// A missing name: reported, and kept as the error symbol, so
+				// the prefix is still resolved. The token is left alone.
+				_ => {
+					parser.diagnostics.push(report_expected_use_segment(
+						parser.file_id,
+						token,
+					));
+					let at = colons.span.end;
+					let missing = Spanned {
+						inner: Keyword::Error.symbol(),
+						span: TextSpan::new(at, at),
+					};
+					let rest = parser.ast.push_node(
+						UseTree::Name {
+							segment: missing,
+							alias: None,
+						},
+						missing.span,
+					);
+					return Ok(Spanned {
+						inner: UseTree::Path { segment, rest },
+						span: TextSpan::new(segment.span.start, at),
+					});
+				}
 			}
 		}
 

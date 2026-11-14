@@ -8381,6 +8381,18 @@ mod tests {
 		);
 		assert_recovered("func f(a: core::) {}\n", unexpected);
 		assert_recovered("struct S(a: Ordering::);\n", unexpected);
+		// A use path, and one whose prefix does not resolve, which is.
+		assert_recovered("mod a {}\nuse a::;\n", unexpected);
+		assert_recovered(
+			"mod a {\n    pub mod b {}\n    pub mod c {}\n}\nuse a::{b::, c::};\n",
+			&[
+				DiagnosticCode::UnexpectedToken,
+				DiagnosticCode::UnexpectedToken,
+			],
+		);
+		let (case, _) = TestCase::recovered("use nowhere::;\n");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
 	}
 
 	/// The statement after an unfinished one, and the items after it, are

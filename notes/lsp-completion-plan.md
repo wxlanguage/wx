@@ -1,7 +1,7 @@
 # LSP completion
 
-Status: steps 1 to 3 done (2026-11-12, branch `tir-refactor`); the rest
-planned.
+Status: steps 1 to 5 done (2026-11-14, branch `tir-refactor`); `use`
+trees and members through a type (`Point::`) next, then step 6.
 Supersedes `lsp-completions.md`, a session log from the removed `wx-lsp-next`
 crate, kept for history.
 
@@ -66,9 +66,10 @@ without `as` (`ast/mod.rs`, `decls.rs`'s early return on the error alias).
   line of its own would otherwise read the next statement's `local` as its
   member and lose that statement.
 - Covered: member access (field, method), expression paths, pattern paths,
-  type paths. Not yet: a bound's path (`parse_type_path`), `<T as Tr>::`,
-  `expr::` after a non-path (`parse_type_application_expression`), use
-  trees.
+  type paths, use trees (`use a::;` is a `Name` leaf with the error symbol;
+  import resolution resolves its prefix and binds nothing). Not yet: a
+  bound's path (`parse_type_path`), `<T as Tr>::`, `expr::` after a
+  non-path (`parse_type_application_expression`).
 - The checker selects nothing for a missing name and reports nothing more:
   `PathSegment::is_missing` is checked where a lookup's failure is reported
   (`PathResolver`'s walk, `type_member_found`, `select_member`,
@@ -301,8 +302,11 @@ that inserts the ascription.
    when the client takes snippets (`ClientConfig`, from `initialize`) and
    no `(` follows. Open: the type
    tier lists every function, core's intrinsics included, since a function
-   is a type of its own; correct, and noisy. Open: a value position offers values only, so `Ord|` does not
-   offer the enum `Ordering` that a path could start with. A block's
+   is a type of its own; correct, and noisy. A value position also lists
+   the type tier's namespaces (`NameUse::listed_tiers`, `admits` by the
+   tier found in), since a path's prefix is read as a type: `sha|` offers
+   the module `shapes`, `a::|` its submodules, and no local hides them. A
+   block's
    statements carry the span of their braces, so the room inside a
    keyword block starts at its `{`, not at `block`.
 4. Done: `Body::operand_of(ast, expr)` (and `operand_ty`) returns
