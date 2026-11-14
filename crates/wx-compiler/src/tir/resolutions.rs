@@ -505,7 +505,7 @@ impl Semantics {
 		// this function's name being this function makes it one.
 		let name = BindingKey::value(decls.name(function).inner);
 		let package_function = decls.package_contracts
-			[decls.core_package.as_usize()]
+			[decls.namespaces.core_package().as_usize()]
 		.members
 		.get(&name)
 		.is_some_and(|member| {
@@ -911,7 +911,7 @@ impl Semantics {
 		};
 		let roots = [
 			Namespace::from(namespace),
-			Namespace::Package(self.decls.core_package),
+			Namespace::Package(self.decls.namespaces.core_package()),
 		];
 		for &tier in used_as.listed_tiers() {
 			for name in self.candidates(&roots, tier) {
@@ -919,7 +919,11 @@ impl Semantics {
 					continue;
 				}
 				let key = BindingKey::new(tier, name);
-				let lookup = self.decls.lookup_unqualified(namespace, key);
+				let lookup = self.decls.namespaces.lookup_unqualified(
+					&self.decls.use_items,
+					namespace,
+					key,
+				);
 				if let BindingLookup::Found {
 					target, reachable, ..
 				} = lookup && let Some(loc) = target.loc()

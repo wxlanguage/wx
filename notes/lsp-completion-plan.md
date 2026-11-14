@@ -176,7 +176,7 @@ offset, tier) -> Vec<(SymbolU32, Definition)>`. The server only renders
   both tiers: it is a type of its own too.
 - Items: candidate names from the scope's bindings, the namespaces its
   globs reach, and the core prelude (a superset), each kept when
-  `Declarations::lookup_unqualified` finds it, unambiguously, and it is
+  `Namespaces::lookup_unqualified` finds it, unambiguously, and it is
   accessible from the scope. `lookup_unqualified` is the first segment of
   every path (own scope, then the prelude), extracted from
   `PathResolver::try_resolve_path`, which now calls it, so the prelude rule

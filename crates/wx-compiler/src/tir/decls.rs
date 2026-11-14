@@ -33,9 +33,6 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	diagnostics: &'ctx mut Vec<Diagnostic<FileId>>,
 	strings: &'ctx mut StringInterner,
 	files: &'ctx Files,
-	/// The package a builtin name (`u8`, `Add`, ...) is only recognized in.
-	/// Always present, from `CompilationUnit::core_package`.
-	core_package: PackageId,
 	root_package: PackageId,
 	/// What a package instance looks its key up in: each
 	/// package's manifest-declared dependencies.
@@ -1109,7 +1106,6 @@ pub(super) enum PackageMemberItem {
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Declarations {
-	pub core_package: PackageId,
 	pub root_package: PackageId,
 	pub namespaces: Namespaces,
 	/// The scope each file's top-level items live in, indexed by `FileId`.
@@ -1658,9 +1654,12 @@ impl ScopeTable {
 /// `packages` by `PackageId`, `modules` by `ModuleIdx`, `enums` by `EnumIdx`
 /// and `imports` by `ImportIdx`. An owner and its table are pushed together,
 /// which is what keeps the two aligned.
-#[derive(Default)]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct Namespaces {
+	/// The package that provides the core: its root is the prelude, the
+	/// last place an unqualified name is looked up, and a builtin name
+	/// (`u8`, `Add`, ...) is only recognized in it.
+	core_package: PackageId,
 	packages: Vec<ScopeTable>,
 	modules: Vec<ScopeTable>,
 	enums: Vec<SymbolTable>,
@@ -1872,6 +1871,21 @@ impl CandidateMerge {
 }
 
 impl Namespaces {
+	fn new(core_package: PackageId) -> Self {
+		Self {
+			core_package,
+			packages: Vec::new(),
+			modules: Vec::new(),
+			enums: Vec::new(),
+			imports: Vec::new(),
+			package_instances: Vec::new(),
+		}
+	}
+
+	pub fn core_package(&self) -> PackageId {
+		self.core_package
+	}
+
 	pub(super) fn symbols(&self, namespace: Namespace) -> &SymbolTable {
 		match namespace {
 			Namespace::Package(package) => {
@@ -2230,6 +2244,32 @@ impl Namespaces {
 			None => self.indirect_lookup(use_items, accessor, target, key),
 		}
 	}
+
+	/// What an unqualified name `key` written in `accessor` binds: in the
+	/// scope itself (its declarations, `use`s and globs), else in the core
+	/// prelude, and never in an enclosing scope. The first segment of every
+	/// path, and nothing else, is looked up this way.
+	pub(super) fn lookup_unqualified(
+		&self,
+		use_items: &[UseItemDecl],
+		accessor: Scope,
+		key: BindingKey,
+	) -> BindingLookup {
+		let own = Namespace::from(accessor);
+		match self.lookup(use_items, accessor, own, key) {
+			BindingLookup::NotFound { skipped } => {
+				let prelude = Namespace::Package(self.core_package);
+				match self.lookup(use_items, accessor, prelude, key) {
+					// What the scope's own globs skipped explains the miss.
+					BindingLookup::NotFound { .. } => {
+						BindingLookup::NotFound { skipped }
+					}
+					found => found,
+				}
+			}
+			found => found,
+		}
+	}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2576,36 +2616,6 @@ impl Declarations {
 		self.namespaces.file_id(loc.namespace)
 	}
 
-	/// What an unqualified name `key` written in `accessor` binds: in the
-	/// scope itself (its declarations, `use`s and globs), else in the core
-	/// prelude, and never in an enclosing scope. The first segment of every
-	/// path, and nothing else, is looked up this way.
-	pub(super) fn lookup_unqualified(
-		&self,
-		accessor: Scope,
-		key: BindingKey,
-	) -> BindingLookup {
-		let own = Namespace::from(accessor);
-		match self.namespaces.lookup(&self.use_items, accessor, own, key) {
-			BindingLookup::NotFound { skipped } => {
-				let prelude = Namespace::Package(self.core_package);
-				match self.namespaces.lookup(
-					&self.use_items,
-					accessor,
-					prelude,
-					key,
-				) {
-					// What the scope's own globs skipped explains the miss.
-					BindingLookup::NotFound { .. } => {
-						BindingLookup::NotFound { skipped }
-					}
-					found => found,
-				}
-			}
-			found => found,
-		}
-	}
-
 	/// The name `index`'s declaration is written with, from its row.
 	pub(super) fn name(&self, index: impl Declared) -> Spanned<SymbolU32> {
 		self.item(index.loc(self)).name
@@ -2659,7 +2669,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		core_package: PackageId,
 		root_package: PackageId,
 	) -> (Declarations, Vec<AstEntry>) {
-		let mut namespaces = Namespaces::default();
+		let mut namespaces = Namespaces::new(core_package);
 		for package in packages {
 			debug_assert_eq!(
 				namespaces.packages.len(),
@@ -2721,7 +2731,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			namespaces,
 			strings,
 			files,
-			core_package,
 			root_package,
 			packages,
 			asts,
@@ -2779,7 +2788,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		);
 
 		let decls = Declarations {
-			core_package,
 			root_package,
 			namespaces: builder.namespaces,
 			file_namespaces,
@@ -3840,7 +3848,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let fields = self.scan_fields(file_id, fields, spans);
 
 				if self.namespaces.scope(namespace).package_id
-					== self.core_package
+					== self.namespaces.core_package
 					&& self.strings.resolve(name.inner) == Some("Char")
 				{
 					self.intrinsics.char = Some(struct_index);
@@ -3917,7 +3925,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				let end_variant =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				if self.namespaces.scope(namespace).package_id
-					== self.core_package
+					== self.namespaces.core_package
 					&& self.strings.resolve(name.inner) == Some("Bool")
 				{
 					self.intrinsics.bool = Some(enum_index);
@@ -4000,7 +4008,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 				if bodyless
 					&& self.namespaces.scope(namespace).package_id
-						== self.core_package
+						== self.namespaces.core_package
 				{
 					if let Some(name_str) = self.strings.resolve(name.inner) {
 						if let Some(slot) =
@@ -4170,7 +4178,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					name.span,
 				);
 				if self.namespaces.scope(namespace).package_id
-					== self.core_package
+					== self.namespaces.core_package
 				{
 					if let Some(slot) = self.intrinsics.trait_slot_mut(
 						self.strings.resolve(name.inner).unwrap(),
@@ -4834,7 +4842,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					u32::try_from(self.typesets.len()).unwrap(),
 				);
 				if self.namespaces.scope(namespace).package_id
-					== self.core_package
+					== self.namespaces.core_package
 				{
 					if let Some(name_str) = self.strings.resolve(name.inner) {
 						if let Some(slot) =

@@ -202,7 +202,11 @@ impl<'r> PathResolver<'r> {
 			// The first segment is unqualified: its scope, then the core
 			// prelude. Every later one is looked up only in `base`.
 			let outcome = if index == 0 {
-				self.decls.lookup_unqualified(accessor, key)
+				self.decls.namespaces.lookup_unqualified(
+					&self.decls.use_items,
+					accessor,
+					key,
+				)
 			} else {
 				self.decls.namespaces.lookup(
 					&self.decls.use_items,

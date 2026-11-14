@@ -193,6 +193,80 @@ impl<'r> ImportResolver<'r> {
 		}
 	}
 
+	/// What `key` binds for `accessor` in `target`, or, for a path's first
+	/// segment (`None`), unqualified: in `accessor` itself, else in the core
+	/// prelude. Each scope read is settled first.
+	fn lookup(
+		&mut self,
+		accessor: Scope,
+		target: Option<Namespace>,
+		key: BindingKey,
+		current: UseItemIndex,
+	) -> BindingLookup {
+		match target {
+			Some(target) => {
+				if let Some(scope) = target.as_scope() {
+					self.settle(scope, key.symbol, current);
+				}
+				self.namespaces
+					.lookup(self.use_items, accessor, target, key)
+			}
+			None => {
+				let prelude = Scope::Package(self.namespaces.core_package());
+				self.settle(accessor, key.symbol, current);
+				self.settle(prelude, key.symbol, current);
+				self.namespaces.lookup_unqualified(
+					self.use_items,
+					accessor,
+					key,
+				)
+			}
+		}
+	}
+
+	/// Resolves every pending `use` that may bind `name` in `scope`, so a
+	/// lookup there reads its final bindings. A name can come from a `use`
+	/// not resolved yet, a re-export or an alias a path continues through:
+	///
+	///   use inner::helper;
+	///   mod inner { pub use other::helper; }
+	///
+	///   use alias::helper;
+	///   use real as alias;
+	///
+	/// Skips `current`, the item whose resolution asks: a bare `use foo;`
+	/// or `use x::x;` is a candidate for its own name, and forcing it would
+	/// be forcing itself. A candidate already being resolved is skipped when
+	/// a definition answers the name anyway, since re-entering it would
+	/// report a cycle that is not there.
+	fn settle(&mut self, scope: Scope, name: SymbolU32, current: UseItemIndex) {
+		let Some(candidates) = self.pending_named_imports.get(&(scope, name))
+		else {
+			return;
+		};
+		for candidate in candidates {
+			if candidate == current {
+				continue;
+			}
+			if matches!(
+				self.item_state[usize::from(candidate)],
+				ResolveStatus::Resolving
+			) {
+				let bindings = &self.namespaces.symbols(scope.into()).bindings;
+				let defined = [BindingKey::ty(name), BindingKey::value(name)]
+					.iter()
+					.filter_map(|key| bindings.get(key))
+					.any(|binding| {
+						!matches!(binding.target, BindingTarget::Error)
+					});
+				if defined {
+					continue;
+				}
+			}
+			self.ensure_import_item(candidate);
+		}
+	}
+
 	fn insert_binding(
 		&mut self,
 		scope: Scope,
@@ -362,13 +436,13 @@ impl<'r> ImportResolver<'r> {
 		let scope = match prefix {
 			Some(prefix) => {
 				match self.ensure_import_path(namespace, prefix, index) {
-					Ok(ns) => ns,
+					Ok(ns) => Some(ns),
 					Err(()) => return,
 				}
 			}
-			// Bare `use foo;` — look up `foo` directly in the writing
-			// namespace, same as the first segment of any `use` path.
-			None => namespace.into(),
+			// Bare `use foo;` — looked up as the first segment of any
+			// `use` path is.
+			None => None,
 		};
 		// `use a::` with no name: the parser reported it, and the prefix is
 		// resolved; there is nothing to bind.
@@ -376,62 +450,19 @@ impl<'r> ImportResolver<'r> {
 			return;
 		}
 
-		// Force any not-yet-resolved `use` in `scope` first — it might be
-		// a re-export chain that hasn't installed its binding yet:
-		//
-		//   use inner::helper;
-		//   mod inner { pub use other::helper; }
-		//
-		// Skips its own index: a bare `use foo;` binds under the very
-		// key "foo" it then searches for, so without the skip it would
-		// always find itself `Resolving` and report a spurious cycle for
-		// what's really just "nothing else defines this name" (a genuine
-		// cycle still gets caught — that only ever comes from another
-		// item's chain looping back, never from this one).
-		if let Some(candidates) = scope.as_scope().and_then(|scope| {
-			self.pending_named_imports.get(&(scope, name.inner))
-		}) {
-			for candidate in candidates {
-				if candidate == index {
-					continue;
-				}
-
-				if matches!(
-					self.item_state[usize::from(candidate)],
-					ResolveStatus::Resolving
-				) {
-					// A concrete type or value already answers this lookup, so
-					// re-entering a candidate would create a spurious cycle.
-					let bindings = &self.namespaces.symbols(scope).bindings;
-					let has_real_binding = bindings
-						.get(&BindingKey::ty(name.inner))
-						.is_some_and(|binding| {
-							!matches!(binding.target, BindingTarget::Error)
-						}) || bindings
-						.get(&BindingKey::value(name.inner))
-						.is_some_and(|binding| {
-							!matches!(binding.target, BindingTarget::Error)
-						});
-					if has_real_binding {
-						continue;
-					}
-				}
-
-				self.ensure_import_item(candidate);
-			}
-		}
-
 		let (mut type_decl, type_ambiguity) = self.resolve_member_decl(
 			namespace,
 			scope,
 			BindingKey::ty(name.inner),
 			name.span,
+			index,
 		);
 		let (mut value_decl, value_ambiguity) = self.resolve_member_decl(
 			namespace,
 			scope,
 			BindingKey::value(name.inner),
 			name.span,
+			index,
 		);
 		// Both tiers can name the same candidates (a function is a type and
 		// a value), but the leaf is one name: report its ambiguity once.
@@ -665,50 +696,47 @@ impl<'r> ImportResolver<'r> {
 	fn resolve_member_decl(
 		&mut self,
 		accessor: Scope,
-		scope: Namespace,
+		scope: Option<Namespace>,
 		key: BindingKey,
 		span: TextSpan,
+		current: UseItemIndex,
 	) -> (ImportSlot, Option<Diagnostic<FileId>>) {
 		let source_span =
 			SourceSpan::new(self.namespaces.file_id(accessor.into()), span);
 
 		let mut ambiguity = None;
-		let (target, visibility, reachable) = match self.namespaces.lookup(
-			self.use_items,
-			accessor,
-			scope,
-			key,
-		) {
-			BindingLookup::NotFound { .. } => {
-				return (ImportSlot::Absent, None);
-			}
-			BindingLookup::Found {
-				target,
-				visibility,
-				reachable,
-				import,
-			} => {
-				if let Some(loc) = target.loc() {
-					self.resolutions.record(
-						Site::new(key.tier, source_span),
-						Reference::from_lookup(loc, import),
-					);
+		let (target, visibility, reachable) =
+			match self.lookup(accessor, scope, key, current) {
+				BindingLookup::NotFound { .. } => {
+					return (ImportSlot::Absent, None);
 				}
-				(target, visibility, reachable)
-			}
-			BindingLookup::Ambiguous(candidates) => {
-				ambiguity = Some(report_ambiguous_identifier(
-					self.namespaces,
-					self.strings,
-					key.symbol,
-					source_span,
-					&candidates,
-				));
-				// Recovered as its first candidate, which is reachable.
-				let first = candidates[0];
-				(first.target, first.visibility, first.reachable)
-			}
-		};
+				BindingLookup::Found {
+					target,
+					visibility,
+					reachable,
+					import,
+				} => {
+					if let Some(loc) = target.loc() {
+						self.resolutions.record(
+							Site::new(key.tier, source_span),
+							Reference::from_lookup(loc, import),
+						);
+					}
+					(target, visibility, reachable)
+				}
+				BindingLookup::Ambiguous(candidates) => {
+					ambiguity = Some(report_ambiguous_identifier(
+						self.namespaces,
+						self.strings,
+						key.symbol,
+						source_span,
+						&candidates,
+					));
+					// Recovered as its first candidate, which is reachable.
+					let first = candidates[0];
+					(first.target, first.visibility, first.reachable)
+				}
+			};
 		// Nothing is reported here: whether an inaccessible slot is an error
 		// depends on the leaf's other namespace (`compute_named_import`), and
 		// an ambiguity is the leaf's to report once.
@@ -778,22 +806,18 @@ impl<'r> ImportResolver<'r> {
 	) -> Result<Namespace, ()> {
 		let segment = self.use_paths[usize::from(path)];
 		match segment.parent {
-			None => self.binding_to_import_scope(
-				origin.into(),
-				origin,
-				path,
-				current_item,
-			),
+			None => {
+				self.binding_to_import_scope(None, origin, path, current_item)
+			}
 			// Every segment after the first looks its own name up inside
-			// the namespace the previous segment resolved to, rather than
-			// `origin` — the first segment is the only one looked up
-			// directly in `origin`'s own bindings (the `None` branch above),
+			// the namespace the previous segment resolved to; only the
+			// first is looked up unqualified (the `None` branch above),
 			// since there's no prior scope yet to look inside of.
 			Some(parent) => {
 				let parent_scope =
 					self.ensure_import_path(origin, parent, current_item)?;
 				self.binding_to_import_scope(
-					parent_scope,
+					Some(parent_scope),
 					origin,
 					path,
 					current_item,
@@ -802,21 +826,20 @@ impl<'r> ImportResolver<'r> {
 		}
 	}
 
-	/// Looks up `path`'s own segment in `target_namespace`'s bindings,
+	/// Looks up `path`'s own segment in `target_namespace`'s bindings (or
+	/// unqualified, for a first segment: `None`),
 	/// records both kinds of access (the binding slot itself, and — if it
 	/// points to a real def — the def), and validates it as a walkable
 	/// scope. `accessor` is who's asking, for the visibility check and for
 	/// `source_span`'s file (a `use` path is always written in one file,
 	/// regardless of which namespace each segment resolves into).
-	/// `current_item` is whichever `use` item's own resolution is driving
-	/// this particular call — needed so the `pending_named_imports` forcing
-	/// below can skip it: a path segment can be shared across a `use`
-	/// group's branches (`use a::{b, c};`), but at any moment there's
-	/// exactly one item whose resolution triggered computing it, and
-	/// forcing *that one* would just be forcing itself mid-resolution.
+	/// `current_item` is the `use` item whose resolution drives this call,
+	/// which `lookup` does not force: a path segment can be shared across a
+	/// group's branches (`use a::{b, c};`), but only one item triggered
+	/// computing it.
 	fn binding_to_import_scope(
 		&mut self,
-		target_namespace: Namespace,
+		target_namespace: Option<Namespace>,
 		accessor: Scope,
 		path: UsePathIndex,
 		current_item: UseItemIndex,
@@ -824,77 +847,50 @@ impl<'r> ImportResolver<'r> {
 		let segment = self.use_paths[usize::from(path)];
 		let key = BindingKey::ty(segment.segment.inner);
 
-		// Force any not-yet-resolved `use` that might install this exact
-		// name first — a path prefix can be a `use`-created alias, not
-		// just a direct `mod`, and the two must resolve in either order:
-		//
-		//   use alias::helper;
-		//   use real as alias;
-		//   mod real { pub func helper() {} }
-		//
-		// Skips `current_item`: `use x::x;` registers itself as a
-		// candidate for its own prefix segment "x", so forcing it here
-		// would just be forcing this same resolution from inside itself.
-		if let Some(candidates) =
-			target_namespace.as_scope().and_then(|scope| {
-				self.pending_named_imports
-					.get(&(scope, segment.segment.inner))
-			}) {
-			for candidate in candidates {
-				if candidate != current_item {
-					self.ensure_import_item(candidate);
-				}
-			}
-		}
-
 		let source_span = SourceSpan::new(
 			self.namespaces.file_id(accessor.into()),
 			segment.segment.span,
 		);
 
-		let (target, reachable) = match self.namespaces.lookup(
-			self.use_items,
-			accessor,
-			target_namespace,
-			key,
-		) {
-			BindingLookup::NotFound { .. } => {
-				let diagnostic = self.report_unresolved_import(
-					segment.parent,
-					segment.segment.inner,
-					source_span,
-				);
-				self.diagnostics.push(diagnostic);
-				return Err(());
-			}
-			BindingLookup::Found {
-				target,
-				reachable,
-				import,
-				..
-			} => {
-				if let Some(loc) = target.loc() {
-					self.resolutions.record(
-						Site::new(key.tier, source_span),
-						Reference::from_lookup(loc, import),
+		let (target, reachable) =
+			match self.lookup(accessor, target_namespace, key, current_item) {
+				BindingLookup::NotFound { .. } => {
+					let diagnostic = self.report_unresolved_import(
+						segment.parent,
+						segment.segment.inner,
+						source_span,
 					);
+					self.diagnostics.push(diagnostic);
+					return Err(());
 				}
-				(target, reachable)
-			}
-			BindingLookup::Ambiguous(candidates) => {
-				let diagnostic = report_ambiguous_identifier(
-					self.namespaces,
-					self.strings,
-					segment.segment.inner,
-					source_span,
-					&candidates,
-				);
-				self.diagnostics.push(diagnostic);
-				// Recovered as its first candidate, which is reachable.
-				let first = candidates[0];
-				(first.target, first.reachable)
-			}
-		};
+				BindingLookup::Found {
+					target,
+					reachable,
+					import,
+					..
+				} => {
+					if let Some(loc) = target.loc() {
+						self.resolutions.record(
+							Site::new(key.tier, source_span),
+							Reference::from_lookup(loc, import),
+						);
+					}
+					(target, reachable)
+				}
+				BindingLookup::Ambiguous(candidates) => {
+					let diagnostic = report_ambiguous_identifier(
+						self.namespaces,
+						self.strings,
+						segment.segment.inner,
+						source_span,
+						&candidates,
+					);
+					self.diagnostics.push(diagnostic);
+					// Recovered as its first candidate, which is reachable.
+					let first = candidates[0];
+					(first.target, first.reachable)
+				}
+			};
 
 		if !reachable {
 			// Reported here and now, not deferred like a leaf's
@@ -1743,7 +1739,7 @@ mod tests {
 		// Same shape as the leaf-level self-reference above, but through
 		// the prefix instead: `x`'s own use item registers itself as a
 		// candidate for the prefix segment "x", so forcing it from
-		// within `binding_to_import_scope` would force this exact
+		// within the prefix's lookup would force this exact
 		// resolution from inside itself — a single unresolvable claim,
 		// not a genuine multi-item cycle.
 		let case = TestCase::new(indoc! {"
@@ -1811,6 +1807,53 @@ mod tests {
 		case.expect_direct_decl(outer, Tier::Value, "via_self");
 		case.expect_direct_decl(inner, Tier::Value, "via_super");
 		case.expect_direct_decl(inner, Tier::Value, "via_crate");
+	}
+
+	#[test]
+	fn use_path_starts_in_the_core_prelude() {
+		let case = TestCase::new(indoc! {"
+			use Bool::*;
+			use Ordering::Less;
+			mod inner {
+				use Ordering as Order;
+			}
+		"});
+		case.diagnostics().assert_none();
+
+		let root = case.root_namespace();
+		let core = Namespace::Package(case.decls.namespaces.core_package());
+		let ordering = case.child_namespace(core, "Ordering");
+		assert_eq!(
+			case.expect_direct_decl(root, Tier::Value, "Less"),
+			case.expect_direct_decl(ordering, Tier::Value, "Less"),
+		);
+		assert_eq!(
+			case.glob_targets(root),
+			[case.child_namespace(core, "Bool")]
+		);
+		let inner = case.child_namespace(root, "inner");
+		assert_eq!(
+			case.expect_direct_decl(inner, Tier::Type, "Order"),
+			case.expect_direct_decl(core, Tier::Type, "Ordering"),
+		);
+	}
+
+	#[test]
+	fn use_path_finds_its_own_scope_before_the_prelude() {
+		let case = TestCase::new(indoc! {"
+			mod Ordering {
+				pub func Less() {}
+			}
+			use Ordering::Less;
+		"});
+		case.diagnostics().assert_none();
+
+		let root = case.root_namespace();
+		let own = case.child_namespace(root, "Ordering");
+		assert_eq!(
+			case.expect_direct_decl(root, Tier::Value, "Less"),
+			case.expect_direct_decl(own, Tier::Value, "Less"),
+		);
 	}
 
 	#[test]

@@ -307,7 +307,7 @@ fn core_intrinsics(
 	sema: &Semantics,
 ) -> FxHashMap<FunctionIdx, Intrinsic> {
 	let decls = &sema.decls;
-	decls.package_contracts[decls.core_package.as_usize()]
+	decls.package_contracts[decls.namespaces.core_package().as_usize()]
 		.members
 		.values()
 		.filter_map(|member| match member.item {

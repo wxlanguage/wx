@@ -763,7 +763,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			| ImplTarget::Funcref
 			| ImplTarget::TypedFuncref
 			| ImplTarget::Array
-			| ImplTarget::Slice => Scope::Package(decls.core_package),
+			| ImplTarget::Slice => Scope::Package(decls.namespaces.core_package()),
 		};
 		if decls.namespaces.scope(target_scope).package_id
 			== decls.namespaces.scope(namespace).package_id
