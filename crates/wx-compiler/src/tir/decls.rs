@@ -525,10 +525,6 @@ pub struct EnumDecl {
 	/// the variant before `c` is `c - 1` while that is still in the range. Any
 	/// change to how variants are pushed must keep them together.
 	pub variants: Range<ConstIdx>,
-	/// The first `..` in the body, if there is one: the variants name some of
-	/// the enum's values and every value of its repr is valid. A `..` is not
-	/// a variant and has no constant.
-	pub open: Option<TextSpan>,
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
@@ -773,7 +769,7 @@ pub(super) enum AstNodeRef {
 	EnumVariant {
 		const_index: ConstIdx,
 		enum_index: EnumIdx,
-		variant: ast::EnumEntryId,
+		variant: ast::EnumVariantId,
 	},
 	TraitAssocType {
 		assoc_type_index: AssocTypeIdx,
@@ -3614,23 +3610,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			ast::Item::Enum {
 				pub_span,
 				name,
-				entries,
+				variants,
 				..
 			} => {
-				// The variants among the entries, in written order, and the
-				// first `..`.
-				let variants: Vec<(ast::EnumEntryId, &ast::EnumVariant)> = ast
-					.ids(*entries)
-					.zip(ast.list(*entries))
-					.filter_map(|(id, entry)| match entry {
-						ast::EnumEntry::Variant(variant) => Some((id, variant)),
-						ast::EnumEntry::Rest => None,
-					})
-					.collect();
-				let open = ast.spanned(*entries).find_map(|entry| {
-					matches!(entry.inner, ast::EnumEntry::Rest)
-						.then_some(entry.span)
-				});
+				let variants = || ast.ids(*variants).zip(ast.list(*variants));
 				let enum_index =
 					EnumIdx::new(u32::try_from(self.enums.len()).unwrap());
 				let own_namespace = Namespace::Enum(enum_index);
@@ -3646,8 +3629,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// Each variant's row, in the enum's own table.
 				let first_variant =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
-				let mut variant_locs = Vec::with_capacity(variants.len());
-				for (offset, (_, variant)) in variants.iter().enumerate() {
+				let mut variant_locs = Vec::with_capacity(variants().len());
+				for (offset, (_, variant)) in variants().enumerate() {
 					let const_index = ConstIdx::new(
 						u32::from(first_variant)
 							+ u32::try_from(offset).unwrap(),
@@ -3680,7 +3663,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.enums.push(EnumDecl {
 					loc,
 					variants: first_variant..end_variant,
-					open,
 				});
 				self.insert_binding(
 					Namespace::from(namespace),
@@ -3699,8 +3681,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 
 				// A variant's written value is read in the scope around the
 				// enum, like any constant's initializer.
-				for (offset, (&(entry, variant), variant_key)) in
-					variants.iter().zip(variant_locs).enumerate()
+				for (offset, ((entry, variant), variant_key)) in
+					variants().zip(variant_locs).enumerate()
 				{
 					let const_index = ConstIdx::new(
 						u32::from(first_variant)
@@ -5897,7 +5879,7 @@ mod tests {
 	fn every_declaration_is_a_row_its_arena_entry_points_at() {
 		let source = indoc! {r#"
 			pub struct Point(x: u32, y: u32);
-			enum Color(u8) { Red = 0, Green, .. }
+			enum Color(u8) { Red = 0, Green }
 			pub trait Shape {
 				type Unit;
 				const SIDES: u32;

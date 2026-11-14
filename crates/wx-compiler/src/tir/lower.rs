@@ -2695,28 +2695,55 @@ mod tests {
 	}
 
 	#[test]
-	fn a_value_no_variant_names_reaches_an_open_enums_wildcard() {
-		let program = |dots: &str, last: &str| {
-			format!(
-				r#"
-				enum E(u8) {{ A = 0, B = 1, {dots} }}
-				func f(x: u8) -> u32 {{
-					match transmute::<u8, E>(x) {{ E::A => 10, E::B => 20, {last} }}
-				}}
-				export {{ f as "f" }}
-			"#
-			)
-		};
-		let (mut store, instance) = instantiate(&program("..", "_ => 30"));
+	fn a_value_no_constant_names_reaches_a_structs_catch_all() {
+		// An open set of values is a struct with constants: a value no
+		// constant names takes the catch-all, with its number.
+		let (mut store, instance) = instantiate(
+			r#"
+			struct Errno(pub code: u16);
+			impl Errno {
+				pub const SUCCESS: Self = Self(0);
+				pub const BADF: Self = Self(8);
+			}
+			impl PartialEq for Errno {
+				func eq(self: Self, other: Self) -> Bool {
+					local Errno(a) = self;
+					local Errno(b) = other;
+					a == b
+				}
+			}
+			impl Eq for Errno {}
+			func f(x: u16) -> u32 {
+				match Errno(x) {
+					Errno::SUCCESS => 10,
+					Errno::BADF => 20,
+					Errno(code) => 100 + transmute::<u16, u32>(code),
+				}
+			}
+			export { f as "f" }
+		"#,
+		);
 		let f = instance
 			.get_typed_func::<u32, u32>(&mut store, "f")
 			.unwrap();
 		assert_eq!(f.call(&mut store, 0).unwrap(), 10);
-		assert_eq!(f.call(&mut store, 1).unwrap(), 20);
-		assert_eq!(f.call(&mut store, 7).unwrap(), 30);
+		assert_eq!(f.call(&mut store, 8).unwrap(), 20);
+		assert_eq!(f.call(&mut store, 77).unwrap(), 177);
+	}
 
-		// Closed, the same value is a hazard that traps.
-		let (mut store, instance) = instantiate(&program("", ""));
+	#[test]
+	fn a_value_no_variant_names_traps_in_a_closed_enums_match() {
+		// A closed enum's variants are all its values; one made otherwise is
+		// a hazard, and the `match` traps on it.
+		let (mut store, instance) = instantiate(
+			r#"
+			enum E(u8) { A = 0, B = 1 }
+			func f(x: u8) -> u32 {
+				match transmute::<u8, E>(x) { E::A => 10, E::B => 20 }
+			}
+			export { f as "f" }
+		"#,
+		);
 		let f = instance
 			.get_typed_func::<u32, u32>(&mut store, "f")
 			.unwrap();

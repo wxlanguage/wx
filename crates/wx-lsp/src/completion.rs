@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::{
 use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
 	BoundId, Comment, CommentMap, ConstArgument, ConstId, Destructure,
-	EnumEntry, ExprId, Expression, FunctionSignature, FunctionTypeParam,
+	EnumVariant, ExprId, Expression, FunctionSignature, FunctionTypeParam,
 	ImplItem, ImportDeclaration, ImportEntry, InColumn, Item, List,
 	NamedArgument, PatId, Path, PathSegment, Pattern, PatternElement,
 	PatternFieldItem, QualifiedPathRoot, Spanned, Statement, TraitItem,
@@ -560,16 +560,14 @@ impl Cursor<'_> {
 			Item::Enum {
 				name,
 				repr,
-				entries,
+				variants,
 				..
 			} => Within::Signature(Anchor::Name(name.span))
 				.position(repr.and_then(|repr| self.ty(repr)))
-				.or_else(|| match &self.node(*entries)? {
-					EnumEntry::Variant(variant) => {
-						Within::Body(variant.name.span)
-							.position(self.expression(variant.value?))
-					}
-					EnumEntry::Rest => None,
+				.or_else(|| {
+					let variant: EnumVariant = self.node(*variants)?;
+					Within::Body(variant.name.span)
+						.position(self.expression(variant.value?))
 				}),
 			Item::Struct {
 				name,

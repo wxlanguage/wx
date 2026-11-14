@@ -659,7 +659,7 @@ impl ListItem for PatternElement {}
 impl ListItem for PatternFieldItem {}
 impl ListItem for FunctionParam {}
 impl ListItem for StructField {}
-impl ListItem for EnumEntry {}
+impl ListItem for EnumVariant {}
 impl ListItem for ExportEntry {}
 impl ListItem for ImportEntry {}
 impl ListItem for UseTree {}
@@ -3784,16 +3784,31 @@ impl<'ctx> Parser<'ctx> {
 			None
 		};
 
-		// A `..` is an entry of the body like a variant. Where it stands and
-		// how many there are is judged when the enum's signature is built.
-		let entries = parser.separated(
+		// An enum is closed: its variants are all its values. A `..` once made
+		// it open; it is reported and skipped, pointing at the form that
+		// replaced it.
+		let variants = parser.separated(
 			BRACES,
-			|parser: &mut Parser| -> Result<Spanned<EnumEntry>, ()> {
+			|parser: &mut Parser| -> Result<Spanned<EnumVariant>, ()> {
 				if let Some(dots) = parser.lexer.next_if(Token::DotDot) {
-					return Ok(Spanned {
-						inner: EnumEntry::Rest,
-						span: dots.span,
-					});
+					parser.diagnostics.push(
+						Diagnostic::error()
+							.with_code(DiagnosticCode::RestInEnumBody.code())
+							.with_message("an enum body lists variants only")
+							.with_label(
+								Label::primary(parser.file_id, dots.span)
+									.with_message(
+										"an enum's variants are all its values",
+									),
+							)
+							.with_note(
+								"for named values of a wider type, write a struct \
+								 holding it with constants in its impl: \
+								 `struct Name(pub value: Type);` and \
+								 `impl Name { pub const A: Self = Self(0); }`",
+							),
+					);
+					return Err(());
 				}
 				let Spanned {
 					inner: name_symbol,
@@ -3814,20 +3829,20 @@ impl<'ctx> Parser<'ctx> {
 				};
 
 				Ok(Spanned {
-					inner: EnumEntry::Variant(EnumVariant {
+					inner: EnumVariant {
 						name: Spanned {
 							inner: name_symbol,
 							span: name_token_span,
 						},
 						value,
-					}),
+					},
 					span,
 				})
 			},
 		)?;
-		let entries = parser.push_delimited_nodes(entries);
+		let variants = parser.push_delimited_nodes(variants);
 
-		let span = TextSpan::new(enum_span.start, entries.span.end);
+		let span = TextSpan::new(enum_span.start, variants.span.end);
 
 		Ok(Spanned {
 			inner: Item::Enum {
@@ -3837,7 +3852,7 @@ impl<'ctx> Parser<'ctx> {
 					inner: name_symbol,
 					span: name_span,
 				},
-				entries: entries.inner,
+				variants: variants.inner,
 				attributes: List::EMPTY,
 			},
 			span,

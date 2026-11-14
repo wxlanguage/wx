@@ -13,10 +13,10 @@ func main() {
     local mut i: u32 = 0;
     loop {
         if i == arguments.len() { break };
-        Fd::Stdout.write(arena, fmt::decimal::<heap>(digits, i));
-        Fd::Stdout.write(arena, ": ");
-        Fd::Stdout.write(arena, arguments[i]);
-        Fd::Stdout.write(arena, "\n");
+        Fd::STDOUT.write(arena, fmt::decimal::<heap>(digits, i));
+        Fd::STDOUT.write(arena, ": ");
+        Fd::STDOUT.write(arena, arguments[i]);
+        Fd::STDOUT.write(arena, "\n");
         i += 1;
     }
 }

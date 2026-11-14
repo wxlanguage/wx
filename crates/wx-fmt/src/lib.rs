@@ -859,7 +859,7 @@ impl<'a> Builder<'a> {
 				attributes,
 				repr,
 				name,
-				entries,
+				variants,
 				..
 			} => self.build_enum_definition(
 				span,
@@ -867,7 +867,7 @@ impl<'a> Builder<'a> {
 				*attributes,
 				*repr,
 				name,
-				*entries,
+				*variants,
 			),
 			ast::Item::InherentImpl {
 				type_params,
@@ -1658,7 +1658,7 @@ impl<'a> Builder<'a> {
 		attributes: ast::List<ast::Attribute>,
 		repr: Option<ast::TypeId>,
 		name: &ast::Spanned<SymbolU32>,
-		entries: ast::List<ast::EnumEntry>,
+		variants: ast::List<ast::EnumVariant>,
 	) -> NodeId {
 		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
@@ -1675,50 +1675,31 @@ impl<'a> Builder<'a> {
 		}
 		nodes.push(self.text(Text::SpaceLBrace));
 
-		// A body of only `..`, with nothing around it: `{ .. }`.
-		if let ([ast::EnumEntry::Rest], [only]) =
-			(ast.list(entries), ast.spans(entries))
-			&& self.comments.between(span.start, only.start).is_empty()
-			&& self.comments.between(only.end, span.end).is_empty()
-		{
-			nodes.push(self.text(Text::Space));
-			nodes.push(self.text(Text::DotDot));
-			nodes.push(self.text(Text::Space));
-			nodes.push(self.text(Text::RBrace));
-			return self.arena.concat(nodes);
-		}
-
-		if !entries.is_empty() {
+		if !variants.is_empty() {
 			let mut entry_items: Vec<NodeId> = Vec::new();
 			let mut before = Before::Opener { from: span.start };
-			for (index, entry) in ast.spanned(entries).enumerate() {
+			for (index, variant) in ast.spanned(variants).enumerate() {
 				self.push_between(
 					&mut entry_items,
 					before,
 					After::Entry {
-						start: entry.span.start,
+						start: variant.span.start,
 					},
 				);
 				before = Before::Entry {
-					end: entry.span.end,
+					end: variant.span.end,
 				};
 				let mut en: Vec<NodeId> = Vec::new();
-				match &entry.inner {
-					ast::EnumEntry::Variant(variant) => {
-						en.push(self.symbol(variant.name.inner));
-						if let Some(value) = variant.value {
-							en.push(self.text(Text::EqSp));
-							en.push(self.build_expression(value));
-						}
-					}
-					ast::EnumEntry::Rest => en.push(self.text(Text::DotDot)),
+				en.push(self.symbol(variant.inner.name.inner));
+				if let Some(value) = variant.inner.value {
+					en.push(self.text(Text::EqSp));
+					en.push(self.build_expression(value));
 				}
-				// Entries are separated by commas. The last takes one when the
-				// body breaks, except a `..`, which takes none: it ends the
-				// list, as it does in a pattern.
-				if index + 1 < entries.len() {
+				// Variants are separated by commas, and the last takes one when
+				// the body breaks.
+				if index + 1 < variants.len() {
 					en.push(self.text(Text::Comma));
-				} else if matches!(entry.inner, ast::EnumEntry::Variant(_)) {
+				} else {
 					en.push(self.if_break_comma());
 				}
 				entry_items.push(self.arena.concat(en));

@@ -339,7 +339,7 @@ fn test_top_level_items() {
         const MAX: i32 = 100;
         struct Point(pub x: i32, y: i32);
         pub struct Pair<T>(T, pub mut flag: u8);
-        enum Color(u8) { Red, Green = 1, Blue, .. }
+        enum Color(u8) { Red, Green = 1, Blue }
         import "env" as env {
             "Log": func log(message: heap::&[u8]);
             global mut ticks: u64;
@@ -391,7 +391,7 @@ fn test_enum_repr_after_name() {
 	let Item::Enum {
 		repr,
 		name,
-		entries,
+		variants,
 		..
 	} = case.item(0)
 	else {
@@ -406,7 +406,7 @@ fn test_enum_repr_after_name() {
 				&& case.strings.resolve(case.ast.list(p)[0].ident.inner)
 					== Some("i32")
 	));
-	assert_eq!(entries.len(), 2);
+	assert_eq!(variants.len(), 2);
 }
 
 #[test]
@@ -1463,11 +1463,11 @@ fn an_old_enum_repr_is_reported_and_read_as_the_new_one() {
 	let case = TestCase::new("enum Status: i32 { Foo }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::EnumReprNeedsParentheses]);
-	let Item::Enum { repr, entries, .. } = case.item(0) else {
+	let Item::Enum { repr, variants, .. } = case.item(0) else {
 		panic!("expected enum item")
 	};
 	assert!(repr.is_some());
-	assert_eq!(entries.len(), 1);
+	assert_eq!(variants.len(), 1);
 
 	let case = TestCase::new("enum Status(i32 { Foo }");
 	case.diagnostics()
@@ -4415,32 +4415,22 @@ fn a_block_like_expression_is_not_an_operand() {
 }
 
 #[test]
-fn dots_in_an_enum_body_are_an_entry_wherever_they_are_written() {
-	// The parser records `..` as written; where it stands and how many there
-	// are is judged when the enum's signature is built.
-	for (source, shape) in [
-		("enum E(u8) { A, B, .. }", "VVR"),
-		("enum E(u8) { A, B, .., }", "VVR"),
-		("enum E(u8) { A, .., B }", "VRV"),
-		("enum E(u8) { .., .. }", "RR"),
-		("enum E(u8) { .. }", "R"),
-		("enum E(u8) { A, B }", "VV"),
+fn dots_in_an_enum_body_are_reported_and_skipped() {
+	// An enum is closed: `..` no longer opens it. It is reported, with the
+	// struct form as the hint, and the variants around it are still read.
+	for (source, variants) in [
+		("enum E(u8) { A, B, .. }", 2),
+		("enum E(u8) { A, .., B }", 2),
+		("enum E(u8) { .. }", 0),
 	] {
 		let case = TestCase::new(source);
-		case.diagnostics().assert_none();
-		let Item::Enum { entries, .. } = case.item(0) else {
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::RestInEnumBody]);
+		case.diagnostics().assert_error_saying("write a struct");
+		let Item::Enum { variants: list, .. } = case.item(0) else {
 			panic!("expected enum item")
 		};
-		let written: String = case
-			.ast
-			.list(*entries)
-			.iter()
-			.map(|entry| match entry {
-				EnumEntry::Variant(_) => 'V',
-				EnumEntry::Rest => 'R',
-			})
-			.collect();
-		assert_eq!(written, shape, "{source}");
+		assert_eq!(list.len(), variants, "{source}");
 	}
 }
 

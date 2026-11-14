@@ -1,221 +1,277 @@
-# Open enums: a trailing `..` for values the enum does not name
+# Open sets of values: a struct with constants, not an open enum
 
-Status: design, not implemented. Written 2026-11-05 for an implementer who has
-not seen the discussion; everything needed is here or linked.
+Status: decided 2026-11-14. Change 2 (removing open enums) is done; Change 1
+(destructuring an enum) is not implemented. This replaces the 2026-11-05
+design in this note (an enum body ending in `..`), which was implemented and is
+to be removed. What it was, and why it was dropped, is in "The design this
+replaces" below. What a constant pattern means, and so how `Errno`'s constants
+are matched, is `notes/structural-eq.md`'s, decided the same day.
 
 ## Problem
 
-A WX enum is a repr integer type plus named constants. It is erased to its
-repr scalar: no tag, no layout of its own (`CLAUDE.md`, "Enums and `match`"). So
-a value of an enum type can hold any number its repr holds, for example through
-`transmute::<u16, Errno>(77)`, or by being a host function's result.
+A WX enum is a repr integer type plus named constants, erased to its repr
+scalar: no tag, no layout of its own. Every enum is **closed**: its variants
+are taken to be all its values, so a `match` that names every variant is
+exhaustive, and the impossible case compiles to `unreachable`.
 
-Today every enum is **closed**: its variants are taken to be all its values.
-`match` over one is exhaustive when every variant is covered, and the compiled
-code for the impossible case is `unreachable`. Checked on the current compiler:
+That is the wrong type for numbers that come from outside the module. The
+motivating case is `examples/hello_wasi`: `fd_write` returns WASI's `errno`, a
+`u16` of which the program names a handful of codes while the host may return
+any other. The program has to be able to say "these are the codes I know, and
+the type holds others", and the compiler has to make it handle the others.
+
+## Decision
+
+### `enum` is closed; a struct with constants is open
+
+The two are different things, and the language spells them differently:
+
+- An **enumeration** lists its values, and the list is the whole type. That is
+  what `enum` means, and stays all it means.
+- A **set of named values of a wider type** is a struct holding that type, with
+  the names as constants in its inherent impl:
 
 ```wx
-enum E(u8) { A = 0, B = 1 }
-func f(x: u8) -> u32 {
-    match transmute::<u8, E>(x) { E::A => 10, E::B => 20 }
+struct Errno(pub code: u16);
+
+impl Errno {
+    pub const SUCCESS: Self = Self(0);
+    pub const BADF: Self = Self(8);
+    pub const PIPE: Self = Self(64);
+}
+
+impl Eq for Errno {} // structural: `==` and the patterns compare `code`
+
+func describe(e: Errno) -> u32 {
+    match e {
+        Errno::SUCCESS => 0,
+        Errno::BADF => 1,
+        Errno(code) => report(code), // every other code, with its number
+    }
 }
 ```
 
-compiles to `if x == 0 { 10 } else if x == 1 { 20 } else { unreachable }`. So
-`f(7)` traps. That is a sound choice for a closed enum, but it is the wrong
-type for numbers that come from outside the module. The motivating case is
-`examples/hello_wasi`: `fd_write` returns WASI's `errno`, a `u16` of which the
-program names a handful of codes and the host may return any other. The program
-should be able to say "these are the codes I know, and the type holds others",
-and the compiler should make the program handle the others.
+Being open is not a marker: it follows from what a struct already is. On the
+current compiler this program needs `PartialEq` written out (`eq` comparing the
+two `code`s) beside the empty `Eq` impl, and then checks and builds; the empty
+impl alone is `notes/structural-eq.md`'s.
 
-## Proposal
+- **Exhaustiveness.** A struct has one constructor, and its constants do not
+  cover it, so a `match` needs a catch-all, `Errno(code)` or `_`. Without one it
+  is E2066 with the witness `Errno(_)`. Checked on the current compiler.
+- **Construction.** `Errno(77)` builds any code, through the struct's ordinary
+  constructor: no `transmute`.
+- **Reading the number.** `local Errno(code) = e`, a struct pattern.
+- **Who may do either** follows the struct rule: the constructor and the
+  pattern are usable only where the field is visible, so `pub` on `code`
+  decides whether other modules can make or read raw codes.
+- **Representation.** A one-field struct is laid out as its field, so `Errno`
+  is one `u16`, exactly what the enum was.
 
-An enum body may end with `..`:
+### Constant patterns need the type to be `Eq`
+
+A constant pattern needs its type to be `Eq`, and `Eq` is structural equality,
+implemented by the compiler and asked for with an empty impl
+(`notes/structural-eq.md`). So `Errno::BADF` is matched as its value,
+`Errno(8)`, and `==` on `Errno` is the same comparison. Whether a type has `Eq`
+is still decided by an impl, never by the pattern that needs it: a struct
+without the impl has no constant patterns, and a float field keeps a struct
+from having one.
+
+This first said the opposite: a constant pattern compared by a written `eq`,
+and matching `Errno::BADF` as `Errno(8)` was rejected as equality synthesized
+from the fields behind the user's back. That rejection stands for a
+user-written `Eq`, which may compare anything; it does not apply once the type
+asks for structural equality and `==` is that comparison.
+
+What follows:
+
+- The `match` compares values, with no `eq` call to inline.
+- Exhaustiveness is unchanged: the struct's one constructor is not covered by
+  its constants, so a `match` needs a catch-all.
+- Usefulness compares constants by value: `Errno(8)` then `Errno::BADF` is
+  unreachable.
+
+**Opaque constants have an identity** (done 2026-11-14; once `Eq` is structural
+it is needed only for constants with no value at check time, `T::MAX`).
+`Ctor::Opaque(u32)`
+(`tir/usefulness.rs`) is a position in a per-match table that
+`check_match_usefulness` builds (`OpaqueKey` in
+`tir/typecheck/exhaustiveness.rs`): the constant's evaluated value when there
+is one, else the constant with its type arguments (which covers
+`AbstractConstant`, `T::MAX`). An opaque constructor is covered by a wildcard
+or the same identity, so `Errno::BADF` written twice, or `ALSO_BADF` of the
+same value after it, is unreachable: it runs the same `eq` on the same
+arguments, already false when control reached it. Constants with different
+values say nothing either way (a written `eq` may equate them) and stay
+possibly useful; they never complete a type. The usefulness pass only compares
+identities and does not know what makes two constants the same.
+
+This trusts `eq` to be deterministic, which WX does not enforce today: the
+`Eq` contract is the guarantee, as reflexivity already is, until the effect
+system can check it. Structural `Eq` removes the trust: the compiler owns the
+comparison.
+
+The derive this note first planned for (`struct Point: PartialEq + Eq (..)`,
+generating the impls from the declaration) is replaced by the empty
+`impl Eq for Point {}`, whose bounds are written like any impl's.
+
+### Change 1: any enum may be destructured into its repr
 
 ```wx
-enum Errno(u16) {
-    Success = 0,
-    Badf = 8,
-    Pipe = 64,
-    ..
-}
+enum Ordering(i8) { Less = -1, Equal = 0, Greater = 1 }
+
+local Ordering(n) = o; // n: i8
 ```
 
-An enum written this way is **open**: its variants name some of its values, and
-every value of the repr is a valid value of the enum. Concretely:
+Reading the number of a closed enum is always safe: its value is one of its
+variants, and the declaration writes every variant's number. It replaces
+`transmute::<Ordering, i8>(o)`, which names the type and is only checked to
+have the same representation; the pattern checks against the declared repr.
+The repr is already written like a field (`enum Ordering(i8)`), so the pattern
+reads as what it does.
 
-1. **Exhaustiveness.** A `match` on an open enum is exhaustive only if it covers
-   every value of the repr, so in practice it needs a `_` arm (or a binding arm)
-   even when every named variant has an arm. The `_` arm is never reported as
-   unreachable for being redundant after the named variants (it is unreachable
-   only if the named variants really cover the whole repr range, which the
-   existing integer logic already decides).
-2. **Validity.** `transmute` from the repr integer (or any type of the same
-   `StackValue::Repr`) to an open enum is always meaningful: no value is out of
-   range. Nothing else about `transmute`'s checking changes. A closed enum keeps
-   today's behaviour (a value matching no variant is a hazard that traps in an
-   exhaustive `match`).
-3. **Everything else is unchanged.** Representation, layout, lowering, constant
-   evaluation, `==`/`!=`/ordering, `Enum::Variant` paths, duplicate-name and
-   duplicate-value checks, auto-increment. The `..` is not a variant: it has no
-   name, no value and no `ConstIdx`.
+- **Destructuring, not construction.** `Ordering(5)` as an expression is an
+  error of its own (a closed enum is not built from its repr: use a variant,
+  or a struct if every number is valid). Building a value from a number is the
+  one thing that could break "the variants are all its values"; reading one
+  cannot.
+- **What goes inside.** A binding or `_` only, to start with. A literal
+  (`Ordering(-1)`) would work, since usefulness already reasons about integer
+  values, but it is a second way to write `Ordering::Less`.
+- **In a `match`,** `Ordering(n)` matches every value: after all the variants
+  it is unreachable (correct for a closed enum), and before some of them it is
+  a catch-all that binds the number.
+- **Visibility.** Allowed wherever the enum is visible. The variants' numbers
+  are public with the enum already, so reading them hides nothing; the repr
+  takes no `pub`, which keeps `pub` meaning "may construct and read" on struct
+  fields.
+- **Namespace.** An enum's name is in the type namespace only, so today both
+  `local E(n) = e` and `E(x)` are E2007, "cannot find value `E`". The pattern
+  should resolve it as the enum (a struct pattern is resolved through the value
+  namespace, where a struct's name also is); whether the enum's name enters the
+  value namespace, as a struct's does (and so may no longer share its name with
+  a function), or the pattern looks it up as a type, is the implementer's
+  choice. Either way the construction error above has to be reachable.
+- **Lowering** does nothing: the enum is already erased to that scalar, and the
+  binding is the same value. Core can use it (`local Bool(b) = x`); `Char` is a
+  struct and has it already.
 
-The point of the design is that it changes only what the checker believes about
-the set of values. Because the enum is already erased to its repr, there is no
-new runtime or code-generation work.
+### Change 2: remove open enums
 
-### Syntax and what is judged where
+The body `..` goes: `ast::EnumEntry::Rest` (the body is variants again),
+`EnumDecl::open`, `CtorSet::Open` and its witness rendering, W2013
+`MisplacedOpenMarker` and W2014 `RedundantOpenMarker` (and the
+`check_discriminants` check that raises it), and wx-fmt's handling of `..`
+(the normalization that moved it last and dropped repeats). A `..` in an enum
+body becomes a parse error with a hint to use a struct with constants.
 
-Syntax and validation are separate. The parser takes `..` as an entry of the
-body, like a variant, and reports nothing about it; the checker judges it.
+Done 2026-11-14: the body is a `List<EnumVariant>` again (`EnumVariantId`), and
+a `..` is E1030 (`RestInEnumBody`), reported and skipped. `examples/hello_wasi`
+and `examples/wasi` (`Errno`, `Fd`) are structs with constants; `Fd` is never
+compared, so it has no `Eq`.
+`examples/hello_wasi`'s `Errno` becomes the struct above, with its `Eq` impl
+(and a written `PartialEq` until structural `Eq` is implemented) and its
+`match` ending in `Errno(code) => ..` or `_ => trap()`.
 
-- **AST** (`ast/mod.rs`): `Item::Enum { entries: Box<[Separated<Spanned<EnumEntry>>]>, .. }`
-  with `enum EnumEntry { Variant(EnumVariant), Rest }`. `..` may be written
-  anywhere and any number of times (`A, .., B` and `.., ..` parse). A trailing
-  comma after it is read. `enum E(u8) { .. }` is allowed: an enum whose values
-  are exactly its repr's, a distinct type with the meaning of `struct E(u8)`.
-  Useless, but harmless.
-- **Prescan** (`tir/defs.rs`): the variants are the `Variant` entries, in order,
-  and only they get constants, so `EnumDef::variants` stays one contiguous run.
-  `EnumDef::open` is the span of the first `Rest`, if any.
-- **Enum signature** (`tir/signatures.rs`, `report_open_markers`), from the
-  entries alone, as warnings, because any `..` opens the enum and so where it
-  stands or how many there are does not change the meaning:
-  - W2013 `MisplacedOpenMarker`: the first `..` has entries after it.
-  - W2014 `RedundantOpenMarker`: a second or later `..`, which adds nothing.
-- **`check_discriminants`** (`tir/eval.rs`), which has the variants' values:
-  W2014 `RedundantOpenMarker` again when the distinct values already number
-  every value of the repr (`u8` with 256 variants), so the `..` admits nothing.
-  It needs values, which exist only after the constant bodies are built, so it
-  cannot be decided in the signature.
-- An enum with `..` still needs its repr, like any other (E2036,
-  `MissingEnumRepr`, otherwise).
-- **Formatter** (`wx-fmt`): `..` is an entry printed where it stands. Every entry
-  but the last takes a comma; the last takes the break-only trailing comma
-  unless it is a `..`, which takes none (as in a pattern), so a trailing comma
-  after a last `..` is dropped. A body of only `..` with no comments prints as
-  `{ .. }`.
+## Why this, and not a marker on the enum
 
-### What `..` means elsewhere in WX (why this spelling)
+The previous design was semantically sound. What failed was the spelling: the
+`..` sat after the variants, so on a long enum the reader had to scan to the
+bottom to learn something that changes how every `match` on it is written. The
+search for a better spelling ran into three constraints:
 
-In a destructuring `local` and in struct patterns, `..` already means "this
-list is not claimed to be complete" (`Point({ x, .. })`; `..` opts out of
-exhaustiveness). In an enum body it says the same about the list of variants.
-The match arm that handles the rest stays `_`, which is "any value" in every
-other position. The alternatives are in the next section.
+- **No new keywords.** That rules out `open enum`.
+- **No attributes for meaning.** An attribute says how a declaration is
+  compiled or laid out, never which programs are well typed. The test: delete
+  it, and no program changes whether it checks or what it means. `#[inline]`
+  passes; `#[fixed_order]` changes byte offsets, which matter to a host sharing
+  memory, but no expression's type or meaning; `#[memory_limits]` configures
+  the module. Openness fails the test both ways (an exhaustive `match` stops
+  being one, `_` arms become reachable or unreachable, `Errno(5)` becomes
+  valid), so `#[open]` is out.
+- **Punctuation in the header** (`enum Errno(u16, ..)`, `enum Errno(..u16)`,
+  OCaml's `[> ..]` delimiters as `{> .. }`) either reads as something else (more
+  fields, a range, a token found nowhere else) or, written as a row-style tail
+  (`{ A = 0, ..u16 }`), moves the repr back to the bottom.
 
-## Alternatives considered
+Haskell's answer is the one that needs no marker: an open set of codes is a
+newtype with pattern synonyms (`newtype Errno = Errno Word16`,
+`pattern Success = Errno 0`). The type is the whole integer, and the names are
+names for some of its values. WX can say the same with what it has, a struct,
+its inherent impl's constants, and an `Eq` impl that lets them be patterns.
 
-| Option | Verdict |
+Under structural `Eq` the two forms are one idea, named values of an `Eq` type:
+a struct with an `Eq` impl and constants is open, an enum over an `Eq` repr is
+closed (`notes/structural-eq.md`, "Enum reprs").
+
+What it costs: each name is longer to write (`pub const BADF: Self = Self(8)`
+against `Badf = 8`), the type needs its `Eq` impl, and the enum's checks on its
+values (duplicate values, the anchor auto-increment requires, E2071) do not
+apply to constants. Both are acceptable for the few types whose values come
+from outside the program, and a closed enum, the common case, is unchanged.
+
+Also considered and rejected:
+
+| Option | Why not |
 | --- | --- |
-| Trailing `_`, as in Zig (`enum(u16) { a = 0, _ }`) | Same semantics; rejected only on spelling. `_` is "a value" everywhere in WX, so it would read as an unnamed variant. `..` matches WX's existing "list not complete" marker. If the spelling is reconsidered, nothing below changes except the token. |
-| Attribute, `#[open]` or `#[non_exhaustive]` | Rejected. Rust's `#[non_exhaustive]` means "may gain variants later, every value is still a known variant", which is the opposite of this. Whether every number is valid is a property of the type that decides what `match` and `transmute` may do, so it belongs in the declaration's text, not in metadata. |
-| Keyword, `open enum E(u16) { .. }` | Rejected: a new keyword for a modifier that changes the meaning of the body, and Rust-style syntax avoids new keywords. |
-| Newtype plus constants (`struct Errno(code: u16)` with associated consts) | Already expressible (not verified here), which is why an enum is not strictly needed. Rejected as the answer: constant patterns on a struct need an `Eq` impl and path-qualified constants, and the type is not an enum for tooling (variant listing, exhaustiveness witnesses). |
-| A catch-all variant that carries the number (`Unknown(u16)`) | Rejected. Enums are erased to their repr; a variant with a payload would need a layout and a tag. |
+| A struct with a body of named values, `struct Errno(pub code: u16) { SUCCESS = 0 }` | It is the inherent impl's constants written inside the declaration: a second way to declare them, for brevity only. |
+| A catch-all variant carrying the number (`Unknown(u16)`) | Enums are erased to their repr; a payload needs a layout and a tag. |
+| Trailing `_`, as in Zig (`enum(u16) { a = 0, _ }`) | The placement problem of `..`, and `_` reads as an unnamed variant. |
+| `..` kept, placed first by the formatter | Visible, but against how `..` reads everywhere else in WX (last, "and the rest"), and still a marker for something a struct already is. |
 
-## Design details
+## Deferred: enums over a wider repr
 
-### Exhaustiveness (`tir/typecheck/exhaustiveness.rs`, `tir/usefulness.rs`)
+An enum whose repr is more than one integer, `enum Direction((i8, i8)) {
+North = (0, -1), .. }` or `enum Color(Rgb) { Red = Rgb(255, 0, 0) }` (the
+closed counterpart of a struct with constants), was first rejected here. Under
+structural `Eq` it has a precise meaning: what a closed enum needs of its repr
+is `Repr: Eq + StackValue`, not an integer (`notes/structural-eq.md`, "Enum
+reprs"); variants are distinct when their values differ, a `match` compares
+structurally, and `local Direction((dx, dy)) = d` reads the pair (Change 1). So
+it is deferred, to be implemented later, not rejected.
 
-`..` means the rest: every value of the repr the variants do not name. `ctor_set`
-gives an open enum `CtorSet::Open(values)`: the variants' values, listed, and
-one more constructor for the rest, which no pattern covers but a wildcard.
-(Only a variant can name an enum's value in a pattern: `transmute` is not
-evaluated at compile time, so there is no constant of an unnamed value.) The
-work is proportional to the number of variants, not to the width of the repr,
-and the algorithm reads it as follows:
+What stays to weigh when it is: such an enum is several scalars wide, so it
+cannot be a `global` and comparing it compares every field; lowering cannot
+switch on it with `br_table` directly (a small tuple could be packed into one
+integer key, `(i8, i8)` in 16 bits); usefulness needs a constructor per variant
+where `Ctor::Value(u64)` holds one scalar; and data per case is often still
+better served by a closed integer enum and a method matching on `self`. Until
+then E2055 keeps reprs to integers.
 
-- `Open` is never complete, so a `match` needs a `_` or binding arm.
-- Missing witnesses are the variants no row names, in order, then `_` for the
-  rest. `match o { Open::A => .. }` reports ``patterns `Open::B`, `Open::C` and
-  `_` ``; with every variant named it reports `_` alone.
-- If the variants name every value of the repr (a `u8` with 256 variants) there
-  is no rest: `ctor_set` returns `Listed` as for a closed enum, so naming them
-  all is exhaustive and a `_` after them is unreachable. The `..` is then
-  redundant and warned (W2014).
+## The design this replaces
 
-`Char` needs nothing special in `ctor_set`: it is std's `struct Char(value: u32)`,
-so it has the struct's one constructor and a `u32` field. A char pattern lowers
-as that struct with its code point, and `render_witness` prints a `Char`
-witness as a char literal.
-
-### Prescan and signatures
-
-See "Syntax and what is judged where" above. `AstNodeRef::Enum` in
-`signatures.rs` destructures `Item::Enum { repr, name, entries, .. }`; the
-`EnumVariant` entries of `ast_nodes` are pushed only for real variants.
-
-### Formatter
-
-Described above. The "already formatted input reports no edits" rule applies
-(`CLAUDE.md`, "`wx format` and the LSP formatting request must agree"), so the
-tests format their own output, with comments around the `..` and with a `..`
-in the middle of the body.
-
-### Lowering and evaluation
-
-No change is expected. A `match` over an enum lowers its patterns as integer
-comparisons (and `br_table` for a dense set); the `_` arm is the default. The
-only thing to confirm with a runtime test is that an out-of-range value reaches
-the `_` arm instead of `unreachable`, which is the point of the feature.
-
-### Documentation
-
-- `CLAUDE.md`: one bullet under "Language features", next to the enum bullet
-  ("Enums and `match`").
-- `examples/hello_wasi/main.wx`: give `Errno` a trailing `..` and keep its
-  `match` with `_ => trap()`; update the comment above the enum (it currently
-  explains that the host may return codes not listed and that `_` is needed).
-  Rebuild and run `node --no-warnings examples/test_memory_examples.mjs`.
-- Thesis, `thesis/chapters/en/04-stack-values.typ` (`transmute`): optional
-  follow-up for the author, not part of this task.
+From 2026-11-05: an enum body could end in `..`
+(`enum Errno(u16) { Success = 0, Badf = 8, .. }`), making the enum **open**:
+its variants named some of its values and every value of the repr was valid.
+`ctor_set` gave it `CtorSet::Open`, the variants plus one constructor for the
+rest that only a wildcard covered, so a `match` needed `_` even with every
+variant named; witnesses named the uncovered variants and then `_`. The parser
+took `..` as an entry anywhere, any number of times; the signature warned about
+one not last (W2013) or repeated (W2014), and `check_discriminants` about one
+made redundant by variants naming every value (W2014). Representation and
+lowering were unchanged. Its weakness was the one described above, and
+`transmute::<u16, Errno>(x)` was still how a host's number became an `Errno`.
 
 ## Tests
 
-Write new tests where the code under test is (`CLAUDE.md`, "Testing patterns").
+Write each where the code under test is (`CLAUDE.md`, "Testing patterns").
 
-- **Parser** (`ast/tests.rs`): `..` last parses and is recorded; `..` not last,
-  a second `..`, and `..` with no repr each report a diagnostic (assert the
-  specific code with `DiagnosticView`); `{ .. }` alone parses.
-- **TIR** (`tir/typecheck.rs` or `exhaustiveness.rs` tests, with `TestCase::new`):
-  closed enum, all variants covered: no error (unchanged). Open enum, all named
-  variants covered, no `_`: `NonExhaustiveMatch` (E2066). Open enum with a `_`
-  arm: no error and no `UnreachableMatchArm` warning. Open enum where the arms
-  list every value of a small repr (`enum E(u8)` with all 256 would be long;
-  use a typed 1-bit-wide-ish case through a macro-generated source, or skip if
-  unwieldy and say so). A `local` destructuring or `==` use of an open enum
-  compiles.
-- **Lowering** (`tir/lower.rs` tests, run under wasmtime): the `f(7)` program
-  above with `..` on `E` returns the `_` arm's value, where without `..` it
-  traps.
-- **Formatter** (`wx-fmt` tests): idempotence and comment placement, as above.
-- **Examples**: `examples/hello_wasi` still prints and passes
-  `node --no-warnings examples/test_memory_examples.mjs`.
+- **The struct form** (works today; pin it): the `describe` program checks;
+  without the catch-all it is E2066 with witness `Errno(_)`; without the `Eq`
+  impl it is E2063. Lowering (`tir/lower.rs`, under wasmtime):
+  `describe(Errno(77))` takes the catch-all.
+- **Change 1**: `local Ordering(n) = o` gives the variant's number at runtime;
+  `Ordering(5)` as an expression is the new error; `Ordering(n)` after every
+  variant is unreachable and before them a catch-all; a pattern other than a
+  binding or `_` inside is refused.
+- **Change 2**: a `..` in an enum body is the parse error; the parser, TIR and
+  wx-fmt tests for open enums are removed with the code.
+- **Examples**: `examples/hello_wasi` checks, builds and prints.
 
-## Out of scope
+## Documentation
 
-- Conversion functions or a `TryFrom`-style API between the repr and an enum.
-- Changing what a *closed* enum does for an unlisted value (it traps in an
-  exhaustive `match` today; a later change may make that checked at
-  `transmute`).
-- Any change to `wx-lsp`, which does not compile on this branch and must not be
-  "fixed" as a side effect (`CLAUDE.md`, "Current state").
-- Thesis text.
-
-## Working notes for the implementer
-
-- Baseline: 1317 `wx-compiler` and 73 `wx-fmt` tests pass; clippy is not clean
-  (about 45 dead-code warnings, 8 `too_many_arguments`, one
-  `large_enum_variant`): do not add warnings of your own, and do not try to
-  clear the existing ones.
-- Never edit `.snap` files by hand. A change to `std/main.wx` shifts byte
-  offsets in snapshots; this task should not need one.
-- Run `cargo fmt`, `cargo test -p wx-compiler`, `cargo test -p wx-fmt` and the
-  clippy line from `CLAUDE.md` (`cargo clippy --workspace --no-deps -- -D
-  warnings` fails on the existing warnings; compare against the baseline
-  instead of expecting it clean).
-- The user's tree has staged edits in `crates/wx-compiler/src/tir/signatures.rs`.
-  Do not stash, reset or revert anything there; work in a git worktree if
-  you can, and report if a change you need collides with theirs.
+- `CLAUDE.md`: replace the "Open enums" bullet under "Language features" with
+  enum destructuring, and say that an open set of values is a struct with
+  constants and an `Eq` impl.
+- `examples/hello_wasi/main.wx`: the comment above `Errno`.

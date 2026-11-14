@@ -16,8 +16,8 @@ func print(
     value: u32,
     separator: heap::&[u8],
 ) {
-    Fd::Stdout.write(arena, fmt::decimal::<heap>(digits, value));
-    Fd::Stdout.write(arena, separator);
+    Fd::STDOUT.write(arena, fmt::decimal::<heap>(digits, value));
+    Fd::STDOUT.write(arena, separator);
 }
 
 func main() {
@@ -30,7 +30,7 @@ func main() {
     // Whether the previous byte, in this chunk or an earlier one, was in a word.
     local mut in_word = False;
     loop {
-        local chunk = Fd::Stdin.read(arena, buffer);
+        local chunk = Fd::STDIN.read(arena, buffer);
         if chunk.len() == 0 { break };
         bytes += chunk.len();
         local mut i: u32 = 0;

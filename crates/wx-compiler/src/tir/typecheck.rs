@@ -6798,7 +6798,10 @@ mod tests {
 					}
 				}
 			"});
-		case.diagnostics().assert_none();
+		// `S::ZERO` is `0`, and `P(0, _)` is matched by the first and third
+		// arms already: the arm is reachable through `T::MAX` alone.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnreachableMatchArm]);
 		assert_eq!(
 			case.shape("f"),
 			"(block => (match p#0 \
@@ -6843,124 +6846,57 @@ mod tests {
 	}
 
 	#[test]
-	fn an_open_enum_is_exhaustive_only_with_a_wildcard() {
-		let case = TestCase::new(indoc! {"
-				enum Closed(u8) { A = 0, B = 1, C = 2 }
-				enum Open(u8) { A = 0, B = 1, .. }
-				func closed(c: Closed) -> u8 {
-					match c { Closed::A => { 1 }, Closed::B => { 2 }, Closed::C => { 3 } }
+	fn an_open_set_of_values_is_a_struct_with_constants() {
+		// What an open enum was: a struct holding the repr, its names as
+		// constants. Its one constructor is not covered by the constants, so a
+		// `match` needs a catch-all, which may read the number.
+		let errno = indoc! {"
+				struct Errno(pub code: u16);
+				impl Errno {
+					pub const SUCCESS: Self = Self(0);
+					pub const BADF: Self = Self(8);
 				}
-				func named(o: Open) -> u8 {
-					match o { Open::A => { 1 }, Open::B => { 2 } }
-				}
-				func rest(o: Open) -> u8 {
-					match o { Open::A => { 1 }, Open::B => { 2 }, _ => { 3 } }
-				}
-				func binding(o: Open) -> u8 {
-					match o { Open::A => { 1 }, other => { 2 } }
-				}
-				func destructure(o: Open) { local x = o; local _ = o; }
-				func same(a: Open, b: Open) -> Bool { a == b }
-			"});
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::NonExhaustiveMatch]);
-	}
-
-	#[test]
-	fn an_open_enum_is_its_variants_and_the_rest() {
-		// What is not covered is named by variant first, then `_` for the rest.
-		let case = TestCase::new(indoc! {"
-				enum Open(u8) { A = 0, B = 1, C = 2, .. }
-				func f(o: Open) -> u8 { match o { Open::A => { 1 } } }
-			"});
-		case.diagnostics()
-			.assert_error_saying("patterns `Open::B`, `Open::C` and `_`");
-
-		// Inside a tuple, and with a signed repr.
-		let case = TestCase::new(indoc! {"
-				enum Sign(i8) { Minus = -1, Zero = 0, .. }
-				func f(a: Sign, b: Bool) -> u8 {
-					match (a, b) {
-						(Sign::Minus, _) => { 1 },
-						(Sign::Zero, _) => { 2 },
-						(_, _) => { 3 },
+				impl PartialEq for Errno {
+					func eq(self: Self, other: Self) -> Bool {
+						local Errno(a) = self;
+						local Errno(b) = other;
+						a == b
 					}
 				}
-			"});
-		case.diagnostics().assert_none();
-	}
-
-	#[test]
-	fn an_open_enum_that_names_every_value_has_no_rest() {
-		// `..` admits nothing here (and is warned about), so the enum is closed
-		// in effect: listing every variant is exhaustive, and a wildcard after
-		// them is unreachable.
-		let all: Vec<String> =
-			(0..256).map(|n| format!("V{n} = {n}")).collect();
-		let arms: Vec<String> =
-			(0..256).map(|n| format!("E::V{n} => {{ 1 }}")).collect();
-		let source = format!(
-			"enum E(u8) {{ {}, .. }}\nfunc f(e: E) -> u8 {{ match e {{ {} }} }}",
-			all.join(", "),
-			arms.join(", ")
-		);
-		let case = TestCase::new(source.as_str());
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::RedundantOpenMarker]);
-
-		let source = format!(
-			"enum E(u8) {{ {}, .. }}\nfunc f(e: E) -> u8 {{ match e {{ {}, _ => {{ 2 }} }} }}",
-			all.join(", "),
-			arms.join(", ")
-		);
-		let case = TestCase::new(source.as_str());
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::RedundantOpenMarker,
-			DiagnosticCode::UnreachableMatchArm,
-		]);
-	}
-
-	#[test]
-	fn the_dots_of_an_enum_are_judged_when_its_signature_is_built() {
-		// Fine: one `..`, last.
-		let case = TestCase::new("enum E(u8) { A = 0, .. }");
-		case.diagnostics().assert_none();
-
-		// Any `..` opens the enum, so a misplaced one only draws a warning.
-		let case = TestCase::new("enum E(u8) { A = 0, .., B = 1 }");
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::MisplacedOpenMarker]);
-
-		// A second adds nothing.
-		let case = TestCase::new("enum E(u8) { A = 0, .., .. }");
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::MisplacedOpenMarker,
-			DiagnosticCode::RedundantOpenMarker,
-		]);
-
-		// Nothing is left for it to admit once the variants name every value.
-		let all: Vec<String> =
-			(0..256).map(|n| format!("V{n} = {n}")).collect();
-		let source = format!("enum E(u8) {{ {}, .. }}", all.join(", "));
-		let case = TestCase::new(source.as_str());
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::RedundantOpenMarker]);
-
-		// One value short, it is not.
-		let source = format!("enum E(u8) {{ {}, .. }}", all[1..].join(", "));
-		let case = TestCase::new(source.as_str());
-		case.diagnostics().assert_none();
-	}
-
-	#[test]
-	fn an_open_enum_missing_arm_is_a_wildcard() {
-		let case = TestCase::new(indoc! {"
-				enum Open(u8) { A = 0, .. }
-				func named(o: Open) -> u8 {
-					match o { Open::A => { 1 } }
+		"};
+		let eq = "impl Eq for Errno {}\n";
+		let case = TestCase::new(&format!(
+			"{errno}{eq}{}",
+			indoc! {"
+				func describe(e: Errno) -> u16 {
+					match e { Errno::SUCCESS => 0, Errno::BADF => 1, Errno(code) => code }
 				}
-			"});
-		case.diagnostics().assert_error_saying("pattern `_`");
+				func any(n: u16) -> Errno { Errno(n) }
+			"}
+		));
+		case.diagnostics().assert_none();
+
+		let case = TestCase::new(&format!(
+			"{errno}{eq}{}",
+			indoc! {"
+				func describe(e: Errno) -> u16 {
+					match e { Errno::SUCCESS => 0, Errno::BADF => 1 }
+				}
+			"}
+		));
+		case.diagnostics().assert_error_saying("pattern `Errno(_)`");
+
+		// A constant is a pattern only for a type with `Eq`.
+		let case = TestCase::new(&format!(
+			"{errno}{}",
+			indoc! {"
+				func describe(e: Errno) -> u16 {
+					match e { Errno::SUCCESS => 0, _ => 1 }
+				}
+			"}
+		));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
 	}
 
 	#[test]
@@ -7024,6 +6960,135 @@ mod tests {
 			DiagnosticCode::NonConstantGlobalInitializer,
 			DiagnosticCode::UnreachableMatchArm,
 		]);
+	}
+
+	#[test]
+	fn an_alternative_the_arms_before_it_cover_is_unreachable() {
+		// The arm is reachable through `3`, but its `0` matches only what
+		// the first arm does: the alternative is reported, not the arm.
+		let source = indoc! {"
+				func f(n: u32) -> u32 {
+					match n {
+						0 => 1,
+						1 => 2,
+						3 | 0 => 3,
+						_ => 4,
+					}
+				}
+			"};
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnreachableMatchArm]);
+		let warning = case
+			.sema
+			.diagnostics
+			.iter()
+			.find(|d| d.message == "unreachable pattern")
+			.expect("the alternative is reported as a pattern");
+		let at = source.find("3 | 0").unwrap() + "3 | ".len();
+		assert_eq!(warning.labels[0].range, at..at + 1);
+	}
+
+	#[test]
+	fn an_opaque_constant_written_again_is_unreachable() {
+		// A struct's constant is compared by its `Eq`, so it is opaque to the
+		// match. The same constant again, or another of the same value, runs
+		// the same `eq` on the same value; one of another value may still
+		// match, whatever `eq` says, and none of them completes the struct.
+		let case = TestCase::new(indoc! {"
+				struct Errno(pub code: u16);
+				impl Errno {
+					pub const BADF: Self = Self(8);
+					pub const ALSO_BADF: Self = Self(8);
+					pub const PIPE: Self = Self(64);
+				}
+				impl PartialEq for Errno {
+					func eq(self: Self, other: Self) -> Bool {
+						local Errno(a) = self;
+						local Errno(b) = other;
+						a == b
+					}
+				}
+				impl Eq for Errno {}
+				func f(e: Errno) {
+					match e {
+						Errno::BADF => {},
+						Errno::BADF => {},
+						Errno::ALSO_BADF => {},
+						Errno::PIPE => {},
+					}
+				}
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::NonExhaustiveMatch,
+		]);
+		case.diagnostics()
+			.assert_error_saying("pattern `Errno(_)` not covered");
+	}
+
+	#[test]
+	fn a_constant_after_a_struct_of_wildcards_is_unreachable() {
+		// `Errno(_)` and `Errno(code)` match every `Errno`, whatever `eq`
+		// says, so a constant after either is never compared. `Errno(8)`
+		// matches only some: whether the constant's arm is reachable after it
+		// depends on what `eq` compares, so it is not reported.
+		let case = TestCase::new(indoc! {"
+				struct Errno(pub code: u16);
+				impl Errno { pub const BADF: Self = Self(8); }
+				impl PartialEq for Errno {
+					func eq(self: Self, other: Self) -> Bool {
+						local Errno(a) = self;
+						local Errno(b) = other;
+						a == b
+					}
+				}
+				impl Eq for Errno {}
+				func f(e: Errno) {
+					match e {
+						Errno(_) => {},
+						Errno::BADF => {},
+					}
+					match e {
+						Errno(code) => {},
+						Errno::BADF => {},
+					}
+					match e {
+						Errno(8) => {},
+						Errno::BADF => {},
+						_ => {},
+					}
+				}
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnreachableMatchArm,
+			DiagnosticCode::UnreachableMatchArm,
+		]);
+	}
+
+	#[test]
+	fn a_trait_constant_written_again_is_unreachable() {
+		// Over an abstract `Self` it has no value, so its identity is the
+		// declaration with its `Self`: the same one again is the same test, and
+		// the same declaration over another type is not.
+		let case = TestCase::new(indoc! {"
+				trait Limit: Eq { const MAX: Self; }
+				func f<T: Limit, U: Limit>(x: T, y: U) {
+					match x {
+						T::MAX => {},
+						T::MAX => {},
+						_ => {},
+					}
+					match (x, y) {
+						(T::MAX, _) => {},
+						(_, U::MAX) => {},
+						_ => {},
+					}
+				}
+			"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnreachableMatchArm]);
 	}
 
 	#[test]
@@ -7208,9 +7273,11 @@ mod tests {
 					match x { (a, b) | (b, a) => {} }
 				}
 			"});
+		// `(b, a)` also matches only what `(a, b)` does.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::UnreachableMatchArm,
 		]);
 		case.diagnostics().assert_error_saying(
 			"in the same arm, a binding must have the same type in all \
@@ -7229,12 +7296,15 @@ mod tests {
 					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) => {}, _ => {} }
 				}
 			"});
+		// In the third, `((a, 1), 3)` matches only what the first
+		// alternative's `(a, 1)` does.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NotBoundInAllAlternatives,
 			DiagnosticCode::NotBoundInAllAlternatives,
 			DiagnosticCode::NotBoundInAllAlternatives,
 			DiagnosticCode::NotBoundInAllAlternatives,
 			DiagnosticCode::NotBoundInAllAlternatives,
+			DiagnosticCode::UnreachableMatchArm,
 		]);
 	}
 

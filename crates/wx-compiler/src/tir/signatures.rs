@@ -1468,58 +1468,6 @@ fn report_missing_enum_repr(
 		)
 }
 
-/// What the written `..` of an enum body get wrong without changing its
-/// meaning: any `..` opens the enum, so a second one adds nothing, and one
-/// that entries follow is easy to miss. A `..` is also redundant when the
-/// variants already name every value, which needs their values, so
-/// `check_discriminants` decides that.
-fn report_open_markers(
-	file_id: FileId,
-	ast: &ast::AST,
-	entries: ast::List<ast::EnumEntry>,
-) -> Vec<Diagnostic<FileId>> {
-	let rests: Vec<(usize, TextSpan)> = ast
-		.spanned(entries)
-		.enumerate()
-		.filter(|(_, entry)| matches!(entry.inner, ast::EnumEntry::Rest))
-		.map(|(at, entry)| (at, entry.span))
-		.collect();
-	let mut reports = Vec::new();
-	let Some(&(first_at, first)) = rests.first() else {
-		return reports;
-	};
-	if first_at + 1 != entries.len() {
-		reports.push(
-			Diagnostic::warning()
-				.with_code(DiagnosticCode::MisplacedOpenMarker.code())
-				.with_message("`..` should be the last entry of an enum body")
-				.with_label(
-					SourceSpan::new(file_id, first)
-						.primary_label()
-						.with_message("entries follow it"),
-				),
-		);
-	}
-	for &(_, span) in &rests[1..] {
-		reports.push(
-			Diagnostic::warning()
-				.with_code(DiagnosticCode::RedundantOpenMarker.code())
-				.with_message("this `..` is redundant")
-				.with_label(
-					SourceSpan::new(file_id, span)
-						.primary_label()
-						.with_message("an earlier `..` already opens the enum"),
-				)
-				.with_label(
-					SourceSpan::new(file_id, first)
-						.secondary_label()
-						.with_message("the enum is open here"),
-				),
-		);
-	}
-	reports
-}
-
 fn report_missing_type_alias_body(
 	file_id: FileId,
 	span: TextSpan,
@@ -2638,10 +2586,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				variant,
 				..
 			} => {
-				let ast::EnumEntry::Variant(variant) = ast.enum_entry(variant)
-				else {
-					unreachable!("a variant's entry is a variant")
-				};
+				let variant = ast.enum_variant(variant);
 				let repr = sema.enum_repr(enum_index);
 				// The run is contiguous (`EnumDecl::variants`), so the variant
 				// before this one is the constant before it.
@@ -3659,13 +3604,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			AstNodeRef::Enum { enum_index, item } => {
 				let item = &ast.item(item);
-				let ast::Item::Enum {
-					repr,
-					name,
-					entries,
-					..
-				} = item
-				else {
+				let ast::Item::Enum { repr, name, .. } = item else {
 					unreachable!()
 				};
 
@@ -3718,12 +3657,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						TypeIndex::ERROR
 					}
 				};
-
-				sema.diagnostics.extend(report_open_markers(
-					file_id,
-					self.ast(file_id),
-					*entries,
-				));
 
 				sema.enums[usize::from(enum_index)] =
 					EnumSignature { repr: repr_type };

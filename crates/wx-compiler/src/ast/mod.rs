@@ -963,17 +963,6 @@ pub struct EnumVariant {
 	pub value: Option<ExprId>,
 }
 
-/// An entry of an enum body, as written.
-#[derive(Clone, Copy)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub enum EnumEntry {
-	Variant(EnumVariant),
-	/// A `..`: the variants name some of the enum's values, and every value of
-	/// its repr is valid. It is not a variant. Where it is written, and how
-	/// many there are, is for the checker to judge.
-	Rest,
-}
-
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Item {
@@ -1036,7 +1025,7 @@ pub enum Item {
 		pub_span: Option<TextSpan>,
 		repr: Option<TypeId>,
 		name: Spanned<SymbolU32>,
-		entries: List<EnumEntry>,
+		variants: List<EnumVariant>,
 		attributes: List<Attribute>,
 	},
 	/// `impl Type { ... }`
@@ -1223,8 +1212,8 @@ index_newtype!(
 	UseTreeId
 );
 index_newtype!(
-	/// An entry of an enum body, in its file's [`AST`].
-	EnumEntryId
+	/// A variant of an enum body, in its file's [`AST`].
+	EnumVariantId
 );
 index_newtype!(
 	/// An entry of an import block, in its file's [`AST`].
@@ -1408,7 +1397,7 @@ columns! {
 	TypeParam => type_params,
 	FunctionParam => function_params,
 	StructField => struct_fields,
-	EnumEntry => enum_entries,
+	EnumVariant => enum_variants,
 	ImportEntry => import_entries,
 }
 
@@ -1417,7 +1406,7 @@ identified! {
 	ImplItem => ImplItemId,
 	TraitItem => TraitItemId,
 	UseTree => UseTreeId,
-	EnumEntry => EnumEntryId,
+	EnumVariant => EnumVariantId,
 	ImportEntry => ImportEntryId,
 }
 
@@ -1495,7 +1484,7 @@ pub struct AST {
 	type_params: Column<TypeParam>,
 	function_params: Column<FunctionParam>,
 	struct_fields: Column<StructField>,
-	enum_entries: Column<EnumEntry>,
+	enum_variants: Column<EnumVariant>,
 	import_entries: Column<ImportEntry>,
 	attributes: Box<[Attribute]>,
 	export_entries: Box<[ExportEntry]>,
@@ -1533,7 +1522,7 @@ struct AstBuilder {
 	type_params: ColumnBuilder<TypeParam>,
 	function_params: ColumnBuilder<FunctionParam>,
 	struct_fields: ColumnBuilder<StructField>,
-	enum_entries: ColumnBuilder<EnumEntry>,
+	enum_variants: ColumnBuilder<EnumVariant>,
 	import_entries: ColumnBuilder<ImportEntry>,
 	attributes: Vec<Attribute>,
 	export_entries: Vec<ExportEntry>,
@@ -1572,7 +1561,7 @@ impl AstBuilder {
 			type_params: self.type_params.finish(),
 			function_params: self.function_params.finish(),
 			struct_fields: self.struct_fields.finish(),
-			enum_entries: self.enum_entries.finish(),
+			enum_variants: self.enum_variants.finish(),
 			import_entries: self.import_entries.finish(),
 			attributes: self.attributes.into_boxed_slice(),
 			export_entries: self.export_entries.into_boxed_slice(),
@@ -1832,8 +1821,8 @@ impl AST {
 		self.trait_items.spans[usize::from(id)]
 	}
 
-	pub fn enum_entry(&self, id: EnumEntryId) -> EnumEntry {
-		self.enum_entries.kinds[usize::from(id)]
+	pub fn enum_variant(&self, id: EnumVariantId) -> EnumVariant {
+		self.enum_variants.kinds[usize::from(id)]
 	}
 
 	pub fn import_entry(&self, id: ImportEntryId) -> ImportEntry {

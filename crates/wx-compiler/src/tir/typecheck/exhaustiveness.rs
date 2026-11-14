@@ -2,73 +2,163 @@
 //! usefulness pass (`tir::usefulness`), and what it finds, reported.
 //!
 //! A constant compares as its value when it is one number, else it is
-//! opaque: it covers nothing but itself, so a match naming it still needs
-//! `_`. One that `eval` cannot reduce to a number is opaque, and an enum whose
-//! variants have no value is unlisted. A constant's body is built before any
-//! value exists, so its matches are decided once they do
-//! (`ExprObligation::Match`).
+//! opaque: it is compared by its type's `Eq`, covers nothing but itself, and
+//! a match naming it still needs `_`. Each opaque constant of a match is given
+//! an identity (`OpaqueKey`), so that the same one written twice is found
+//! unreachable. An enum whose variants have no value is unlisted. A constant's
+//! body is built before any value exists, so its matches are decided once they
+//! do (`ExprObligation::Match`).
 
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::{BodyContext, Integer};
 use crate::diagnostics::DiagnosticCode;
-use crate::tir::body::{ExprIdx, ExprKind, PatIdx, PatternKind};
+use crate::tir::body::{ExprIdx, ExprKind, PatIdx, PatternKind, PatternRange};
 use crate::tir::decls::{ConstIdx, EnumIdx};
+use crate::tir::eval::ConstScalar;
+use crate::tir::signatures::Semantics;
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
-use crate::tir::usefulness::{Ctor, CtorSet, Pat, Shapes, Witness, witnesses};
+use crate::tir::usefulness::{
+	Ctor, CtorSet, PatId, Patterns, Shapes, Usefulness, Witness,
+};
 
 /// How many missing patterns a non-exhaustive match names.
 const SHOWN_WITNESSES: usize = 3;
 
+/// An opaque constant as its pattern names it: the constant and its type
+/// arguments (`[Self]` for a trait's declaration). What makes two of a match
+/// the same test is `same`'s to decide. The usefulness pass sees only its
+/// position in the match's table (`Ctor::Opaque`).
+#[derive(Clone, Copy)]
+struct OpaqueKey {
+	constant: ConstIdx,
+	type_args: GenericArgs,
+}
+
+impl OpaqueKey {
+	/// Whether two are one test. Two with values are when their values are,
+	/// whatever they are named: `eq` is called with the same arguments.
+	/// Otherwise they are when they are the same constant of the same
+	/// arguments, which has one value even where it is not known; arguments
+	/// are compared by their types, since each pattern holds its own list. A
+	/// constant either has a value or not, so a pair of one with a value and
+	/// one without is two constants, and not the same.
+	fn same(self, other: OpaqueKey, sema: &Semantics) -> bool {
+		match (self.value(sema), other.value(sema)) {
+			(Some(a), Some(b)) => a == b,
+			_ => {
+				let args = &sema.generic_args;
+				self.constant == other.constant
+					&& args.types(self.type_args) == args.types(other.type_args)
+			}
+		}
+	}
+
+	/// Its value, from the solver's memo, when it has no arguments and has
+	/// been evaluated.
+	fn value(self, sema: &Semantics) -> Option<&[ConstScalar]> {
+		match self.type_args.is_empty() {
+			true => sema.evaluated_value(self.constant),
+			false => None,
+		}
+	}
+}
+
+/// One match's patterns, as `lower_pattern` builds them for the usefulness
+/// pass: its arena, the identities of its opaque constants, whose positions
+/// are the ids `Ctor::Opaque` holds, and the pattern each `|` was lowered
+/// from, to point at its alternatives.
+struct MatchPatterns {
+	arena: Patterns,
+	opaque: Vec<OpaqueKey>,
+	ors: Vec<(PatId, PatIdx)>,
+}
+
 impl BodyContext<'_> {
 	/// Reports each arm of `expr`, a `match`, that the arms before it cover,
-	/// and the values no arm matches. A match with a pattern that failed to
+	/// each alternative of an `|` that the arms and alternatives before it
+	/// cover, and the values no arm matches. A match with a pattern that failed to
 	/// check is left alone: what failed has said why. Decided as an
 	/// `ExprObligation`, since an arm may compare with a constant's value.
 	pub(super) fn check_match_usefulness(&mut self, expr: ExprIdx) {
 		let ExprKind::Match { scrutinee, arms } = self.body.kind(expr) else {
 			unreachable!("usefulness is a match's")
 		};
-		let arms = self.body.arms(arms).to_vec();
 		let ty = self.body.ty(scrutinee);
 		if self.sema.types.has_error(ty) {
 			return;
 		}
-		let mut rows = Vec::with_capacity(arms.len());
-		for arm in &arms {
-			let Some(pattern) = self.lower_pattern(arm.pattern) else {
+		let mut pats = MatchPatterns {
+			arena: Patterns::new(),
+			opaque: Vec::new(),
+			ors: Vec::new(),
+		};
+		let count = self.body.arms(arms).len();
+		let mut lowered = Vec::with_capacity(count);
+		for at in 0..count {
+			let pattern = self.body.arms(arms)[at].pattern;
+			let Some(pattern) = self.lower_pattern(pattern, &mut pats) else {
 				return;
 			};
-			rows.push(vec![pattern]);
+			lowered.push(pattern);
 		}
-		let unreachable: Vec<PatIdx> = (0..arms.len())
-			.filter(|&at| {
-				witnesses(self, &rows[..at], &rows[at], &[ty], 1).is_empty()
-			})
-			.map(|at| arms[at].pattern)
+		let MatchPatterns { arena, ors, .. } = pats;
+		let analysis = Usefulness::new(self, &arena).analyse(
+			&lowered,
+			ty,
+			SHOWN_WITNESSES + 1,
+		);
+		// Arms and alternatives, reported in source order.
+		let mut unreachable: Vec<(PatIdx, bool)> = analysis
+			.unreachable_arms()
+			.into_iter()
+			.map(|at| (self.body.arms(arms)[at].pattern, true))
 			.collect();
-		let missing =
-			witnesses(self, &rows, &[Pat::Wild], &[ty], SHOWN_WITNESSES + 1);
-		for pattern in unreachable {
+		for alternative in analysis.unreachable_alternatives() {
+			let (_, or) = ors
+				.iter()
+				.find(|(id, _)| *id == alternative.or)
+				.expect("every `|` is recorded where it is lowered");
+			let PatternKind::Or(alternatives) = self.body.pattern(*or) else {
+				unreachable!("an `|` is lowered from an `|` pattern")
+			};
+			let pattern =
+				self.body.patterns(alternatives)[alternative.index as usize];
+			unreachable.push((pattern, false));
+		}
+		unreachable
+			.sort_by_key(|&(pattern, _)| self.body.pattern_span(pattern).start);
+		for (pattern, is_arm) in unreachable {
 			let span = self.body.pattern_span(pattern);
+			let (message, label) = match is_arm {
+				true => (
+					"unreachable match arm",
+					"the arms before it match every value this does",
+				),
+				false => (
+					"unreachable pattern",
+					"the arms and alternatives before it match every value \
+					 this does",
+				),
+			};
 			self.sema.diagnostics.push(
 				Diagnostic::warning()
 					.with_code(DiagnosticCode::UnreachableMatchArm.code())
-					.with_message("unreachable match arm")
+					.with_message(message)
 					.with_label(
-						Label::primary(self.scope.file_id, span).with_message(
-							"the arms before it match every value this does",
-						),
+						Label::primary(self.scope.file_id, span)
+							.with_message(label),
 					),
 			);
 		}
+		let missing = analysis.missing;
 		if missing.is_empty() {
 			return;
 		}
 		let shown: Vec<String> = missing
 			.iter()
 			.take(SHOWN_WITNESSES)
-			.map(|row| format!("`{}`", self.render_witness(&row[0])))
+			.map(|witness| format!("`{}`", self.render_witness(witness)))
 			.collect();
 		let listed = match &*shown {
 			[one] => format!("pattern {one}"),
@@ -103,67 +193,112 @@ impl BodyContext<'_> {
 		);
 	}
 
-	/// `pattern` as the usefulness pass sees it; `None` when it holds a
-	/// pattern that failed to check.
-	fn lower_pattern(&mut self, pattern: PatIdx) -> Option<Pat> {
+	/// `pattern` as the usefulness pass sees it, pushed into the match's
+	/// arena; `None` when it holds a pattern that failed to check.
+	fn lower_pattern(
+		&mut self,
+		pattern: PatIdx,
+		pats: &mut MatchPatterns,
+	) -> Option<PatId> {
 		let ty = self.body.pattern_ty(pattern);
-		let value = |value: u64| Pat::Ctor(Ctor::Value(value), Vec::new());
 		Some(match self.body.pattern(pattern) {
-			PatternKind::Wildcard | PatternKind::Bind(_) => Pat::Wild,
+			PatternKind::Wildcard | PatternKind::Bind(_) => Patterns::WILD,
 			// A struct is split as its fields' tuple; a lone field's value is
 			// not one, so it is the struct's one child.
 			PatternKind::Struct {
 				struct_index,
 				fields,
 			} => {
-				let fields = self.lower_pattern(fields)?;
+				let fields = self.lower_pattern(fields, pats)?;
 				let count = self.sema.structs[usize::from(struct_index)]
 					.field_types
 					.len();
 				if count == 1 {
-					Pat::Ctor(Ctor::Single, vec![fields])
+					pats.arena.ctor(Ctor::Single, &[fields])
 				} else {
 					fields
 				}
 			}
 			PatternKind::Tuple(children) => {
-				let children = self.body.patterns(children).to_vec();
-				let mut lowered = Vec::with_capacity(children.len());
-				for child in children {
-					lowered.push(self.lower_pattern(child)?);
-				}
-				Pat::Ctor(Ctor::Single, lowered)
+				let children = self.lower_patterns(children, pats)?;
+				pats.arena.ctor(Ctor::Single, &children)
 			}
-			PatternKind::Int(bits) => value(bits),
+			PatternKind::Int(bits) => pats.arena.ctor(Ctor::Value(bits), &[]),
 			// `Char` is a struct of its code point, which is what a char
 			// pattern compares.
 			PatternKind::Char(c) if ty == TypeIndex::CHAR => {
-				Pat::Ctor(Ctor::Single, vec![value(u64::from(c))])
+				let code = pats.arena.ctor(Ctor::Value(u64::from(c)), &[]);
+				pats.arena.ctor(Ctor::Single, &[code])
 			}
-			PatternKind::Char(c) => value(u64::from(c)),
+			PatternKind::Char(c) => {
+				pats.arena.ctor(Ctor::Value(u64::from(c)), &[])
+			}
 			PatternKind::Constant {
 				constant,
 				type_args,
 			} => match self.pattern_constant_value(constant, type_args, ty) {
 				Some(bits) if ty == TypeIndex::CHAR => {
-					Pat::Ctor(Ctor::Single, vec![value(bits)])
+					let code = pats.arena.ctor(Ctor::Value(bits), &[]);
+					pats.arena.ctor(Ctor::Single, &[code])
 				}
-				Some(bits) => value(bits),
-				None => Pat::Ctor(Ctor::Opaque, Vec::new()),
+				Some(bits) => pats.arena.ctor(Ctor::Value(bits), &[]),
+				None => self.opaque_pattern(constant, type_args, pats),
 			},
-			PatternKind::AbstractConstant { .. } => {
-				Pat::Ctor(Ctor::Opaque, Vec::new())
-			}
+			PatternKind::AbstractConstant {
+				constant,
+				type_args,
+			} => self.opaque_pattern(constant, type_args, pats),
 			PatternKind::Or(alternatives) => {
-				let alternatives = self.body.patterns(alternatives).to_vec();
-				let mut lowered = Vec::with_capacity(alternatives.len());
-				for alternative in alternatives {
-					lowered.push(self.lower_pattern(alternative)?);
-				}
-				Pat::Or(lowered)
+				let lowered = self.lower_patterns(alternatives, pats)?;
+				let or = pats.arena.or(&lowered);
+				pats.ors.push((or, pattern));
+				or
 			}
 			PatternKind::Error => return None,
 		})
+	}
+
+	/// Each pattern of `list`, lowered; `None` when one failed to check.
+	fn lower_patterns(
+		&mut self,
+		list: PatternRange,
+		pats: &mut MatchPatterns,
+	) -> Option<Vec<PatId>> {
+		(0..self.body.patterns(list).len())
+			.map(|at| {
+				let pattern = self.body.patterns(list)[at];
+				self.lower_pattern(pattern, pats)
+			})
+			.collect()
+	}
+
+	/// An opaque constant, its id the position of its identity in the match's
+	/// table, added there if it is the first of its identity in the match.
+	fn opaque_pattern(
+		&mut self,
+		constant: ConstIdx,
+		type_args: GenericArgs,
+		pats: &mut MatchPatterns,
+	) -> PatId {
+		// Evaluated first, so that `same` can read its value; one that has
+		// none is compared as the constant it is.
+		if type_args.is_empty() {
+			let _ = self.sema.const_value(self.strings, constant);
+		}
+		let key = OpaqueKey {
+			constant,
+			type_args,
+		};
+		let sema = &*self.sema;
+		let opaque = &mut pats.opaque;
+		let at = match opaque.iter().position(|known| known.same(key, sema)) {
+			Some(at) => at,
+			None => {
+				opaque.push(key);
+				opaque.len() - 1
+			}
+		};
+		pats.arena.ctor(Ctor::Opaque(at as u32), &[])
 	}
 
 	/// The value a constant of type `ty` compares as, when this body can
@@ -287,22 +422,7 @@ impl Shapes for BodyContext<'_> {
 		match *self.sema.types.resolve(ty) {
 			Type::Tuple { .. } | Type::Struct { .. } => CtorSet::Single,
 			Type::Enum { enum_index } => {
-				let open = self.sema.decls.enums[usize::from(enum_index)]
-					.open
-					.is_some();
-				let range = Integer::from_type(self.sema.enum_repr(enum_index))
-					.map(|integer| u128::from(integer.mask()) + 1);
 				match self.variant_values(enum_index) {
-					// An open enum has the rest of its repr's values, unless
-					// its variants name them all: then it is closed in effect.
-					Some(values)
-						if open
-							&& range.is_none_or(|range| {
-								(values.len() as u128) < range
-							}) =>
-					{
-						CtorSet::Open(values)
-					}
 					Some(values) => CtorSet::Listed(values),
 					None => CtorSet::Unlisted,
 				}

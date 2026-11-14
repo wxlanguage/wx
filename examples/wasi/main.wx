@@ -35,39 +35,52 @@ pub func arena() -> heap::*Arena {
     Arena::bootstrap(heap)
 }
 
-/// The codes a stream program can meet; the full list is in
-/// `examples/wasi_preview1_port`. The host may return others, which `..`
-/// admits, so a `match` on an `Errno` needs a `_` arm.
-pub enum Errno(u16) {
-    Success = 0,
-    Again = 6,
-    Badf = 8,
-    Intr = 27,
-    Inval = 28,
-    Io = 29,
-    Pipe = 64,
-    ..
-}
+/// A WASI error code. The host may return any `u16`, so this is a struct
+/// holding the number, not an enum, and a `match` on an `Errno` needs a
+/// catch-all arm. The codes a stream program can meet are named; the full
+/// list is in `examples/wasi_preview1_port`.
+pub struct Errno(pub code: u16);
 
 impl Errno {
+    pub const SUCCESS: Self = Self(0);
+
+    pub const AGAIN: Self = Self(6);
+
+    pub const BADF: Self = Self(8);
+
+    pub const INTR: Self = Self(27);
+
+    pub const INVAL: Self = Self(28);
+
+    pub const IO: Self = Self(29);
+
+    pub const PIPE: Self = Self(64);
+
     /// Ends the program, with the code as its exit status, unless this is
-    /// `Success`.
+    /// `SUCCESS`.
     pub func or_exit(self: Self) {
         match self {
-            Errno::Success => (),
-            _ => sys::proc_exit(transmute(self)),
+            Errno::SUCCESS => (),
+            Errno(code) => sys::proc_exit(transmute(code)),
         }
     }
 }
 
-/// A file descriptor. The three every program starts with are named; the host
-/// hands out others (from `path_open`, say), which `..` admits.
-pub enum Fd(u32) {
-    Stdin = 0,
-    Stdout = 1,
-    Stderr = 2,
-    ..
+impl PartialEq for Errno {
+    #[inline]
+    func eq(self: Self, other: Self) -> Bool {
+        local Errno(a) = self;
+        local Errno(b) = other;
+        a == b
+    }
 }
+
+impl Eq for Errno {}
+
+/// A file descriptor. The three every program starts with are named; the host
+/// hands out others (from `path_open`, say), so this is a struct holding the
+/// number, not an enum.
+pub struct Fd(pub raw: u32);
 
 import "wasi_snapshot_preview1" as sys {
     use super::*;
@@ -90,9 +103,15 @@ import "wasi_snapshot_preview1" as sys {
 }
 
 impl Fd {
+    pub const STDIN: Self = Self(0);
+
+    pub const STDOUT: Self = Self(1);
+
+    pub const STDERR: Self = Self(2);
+
     /// The descriptor the host numbered `raw`.
     pub func from_raw(raw: u32) -> Self {
-        transmute(raw)
+        Self(raw)
     }
 
     /// Writes all of `bytes`, retrying after a partial write.
@@ -106,10 +125,10 @@ impl Fd {
         local count = arena.allocate_value::<u32>(0);
         local mut rest = bytes;
         local error = loop {
-            if rest.len() == 0 { break Errno::Success };
+            if rest.len() == 0 { break Errno::SUCCESS };
             io_vecs[0] = rest;
             local error = sys::fd_write(self, io_vecs, count);
-            if error != Errno::Success { break error };
+            if error != Errno::SUCCESS { break error };
             rest = slices::slice_at(rest, count.*, rest.len() - count.*);
         };
         arena.release(mark);
@@ -127,7 +146,7 @@ impl Fd {
         Errno,
         heap::&[u8],
     ) {
-        if buffer.*.&.len() == 0 { return (Errno::Inval, "") };
+        if buffer.*.&.len() == 0 { return (Errno::INVAL, "") };
         local mark = arena.mark();
         local io_vecs = arena.allocate_slice_uninit::<heap::*[u8]>(1);
         local count = arena.allocate_value::<u32>(0);
@@ -135,8 +154,8 @@ impl Fd {
         local error = sys::fd_read(self, io_vecs.*.&, count);
         local read = count.*;
         arena.release(mark);
-        if error != Errno::Success { return (error, "") };
-        (Errno::Success, slices::slice_at(buffer.*.&, 0, read))
+        if error != Errno::SUCCESS { return (error, "") };
+        (Errno::SUCCESS, slices::slice_at(buffer.*.&, 0, read))
     }
 
     pub func read(
@@ -154,8 +173,8 @@ impl Fd {
 /// with status 1. A failure to print is not reported: there is nowhere left
 /// to report it.
 pub func panic(arena: heap::*Arena, message: heap::&[u8]) -> ! {
-    _ = Fd::Stderr.try_write(arena, message);
-    _ = Fd::Stderr.try_write(arena, "\n");
+    _ = Fd::STDERR.try_write(arena, message);
+    _ = Fd::STDERR.try_write(arena, "\n");
     sys::proc_exit(1)
 }
 
@@ -175,14 +194,14 @@ pub func try_args(arena: heap::*Arena) -> (Errno, heap::&[heap::&[u8]]) {
     local total = count.*;
     local text_size = size.*;
     arena.release(mark);
-    if error != Errno::Success || total == 0 { return (error, []) };
+    if error != Errno::SUCCESS || total == 0 { return (error, []) };
 
     // The host also fills in a pointer to each argument. They are not needed:
     // the arguments follow one another in the text, each ending in a NUL.
     local pointers = arena.allocate_slice_uninit::<heap::&u8>(total);
     local text = arena.allocate_slice_uninit::<u8>(text_size);
     error = sys::args_get(pointers[0].&, text[0].&);
-    if error != Errno::Success { return (error, []) };
+    if error != Errno::SUCCESS { return (error, []) };
     local arguments = arena.allocate_slice_uninit::<heap::&[u8]>(total);
 
     local mut next: u32 = 0;
@@ -197,7 +216,7 @@ pub func try_args(arena: heap::*Arena) -> (Errno, heap::&[heap::&[u8]]) {
         }
         at += 1;
     }
-    (Errno::Success, arguments.*.&)
+    (Errno::SUCCESS, arguments.*.&)
 }
 
 pub func args(arena: heap::*Arena) -> heap::&[heap::&[u8]] {

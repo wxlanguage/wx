@@ -6,9 +6,9 @@ func main() {
     local arena = wasi::arena();
     local buffer = arena.allocate_slice_uninit::<u8>(4096);
     loop {
-        local chunk = Fd::Stdin.read(arena, buffer);
+        local chunk = Fd::STDIN.read(arena, buffer);
         if chunk.len() == 0 { break };
-        Fd::Stdout.write(arena, chunk);
+        Fd::STDOUT.write(arena, chunk);
     }
 }
 

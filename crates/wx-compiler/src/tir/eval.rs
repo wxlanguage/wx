@@ -677,49 +677,12 @@ impl Semantics {
 			self.decls.file_id(enum_decl.loc),
 			self.decls.item(enum_decl.loc).name.span,
 		);
-		let (run, open) = (enum_decl.variants.clone(), enum_decl.open);
+		let run = enum_decl.variants.clone();
 		let mut values = Vec::new();
 		for variant in u32::from(run.start)..u32::from(run.end) {
 			let variant = ConstIdx::new(variant);
 			if let Ok(&[value]) = self.const_value(strings, variant) {
 				values.push((value, variant));
-			}
-		}
-		// An open enum whose variants already name every value of its repr has
-		// nothing left for its `..` to admit.
-		if let Some(open) = open
-			&& values.len() as u32 == u32::from(run.end) - u32::from(run.start)
-		{
-			let bits: u32 = match self.enum_repr(enum_index) {
-				TypeIndex::U8 | TypeIndex::I8 => 8,
-				TypeIndex::U16 | TypeIndex::I16 => 16,
-				TypeIndex::U32 | TypeIndex::I32 => 32,
-				_ => 64,
-			};
-			let mut distinct: Vec<u64> = values
-				.iter()
-				.map(|(value, _)| match value.val {
-					Val::I32(bits) => u64::from(bits),
-					Val::I64(bits) => bits,
-					_ => unreachable!("an enum's repr is an integer"),
-				})
-				.collect();
-			distinct.sort_unstable();
-			distinct.dedup();
-			if distinct.len() as u128 == 1u128 << bits {
-				self.diagnostics.push(
-					Diagnostic::warning()
-						.with_code(DiagnosticCode::RedundantOpenMarker.code())
-						.with_message("this `..` is redundant")
-						.with_label(
-							SourceSpan::new(file_id, open)
-								.primary_label()
-								.with_message(
-									"the variants already name every value of \
-									 the repr",
-								),
-						),
-				);
 			}
 		}
 		// Every variant has the repr's scalar, an integer, so equal values are
@@ -904,6 +867,18 @@ impl Solver {
 }
 
 impl Semantics {
+	/// A constant's memoized value, read without evaluating anything: `None`
+	/// until `const_value` has evaluated it, and for one that has no value.
+	pub(super) fn evaluated_value(
+		&self,
+		const_index: ConstIdx,
+	) -> Option<&[ConstScalar]> {
+		match &self.solver.const_values[usize::from(const_index)] {
+			ConstValueState::Evaluated(value) => Some(value),
+			_ => None,
+		}
+	}
+
 	/// The memoized value of a constant, evaluated on first use. The
 	/// evaluation is a frame on the solver's own stack, with a budget of its
 	/// own, as an impl member's judgement is: reaching the constant again

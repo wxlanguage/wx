@@ -49,7 +49,7 @@ expression: case.tree()
 
 (struct pub Pair (type-params T) (field T) (field pub mut flag u8))
 
-(enum Color (repr u8) Red (= Green 1) Blue ..)
+(enum Color (repr u8) Red (= Green 1) Blue)
 
 (import "env" env
   (func "Log" log (params (message heap::&[u8])))

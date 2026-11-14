@@ -250,7 +250,7 @@ impl<'a> Printer<'a> {
 				pub_span,
 				repr,
 				name,
-				entries,
+				variants,
 				attributes,
 			} => Sexp::head(
 				"enum",
@@ -261,23 +261,21 @@ impl<'a> Printer<'a> {
 					.chain(repr.map(|repr| {
 						Sexp::head("repr", [Sexp::atom(self.ty(repr))])
 					}))
-					.chain(self.ast.list(entries).iter().map(|entry| {
-						match *entry {
-							EnumEntry::Variant(EnumVariant {
-								name,
-								value: None,
-							}) => Sexp::atom(self.name(name.inner)),
-							EnumEntry::Variant(EnumVariant {
+					.chain(self.ast.list(variants).iter().map(|variant| {
+						match *variant {
+							EnumVariant { name, value: None } => {
+								Sexp::atom(self.name(name.inner))
+							}
+							EnumVariant {
 								name,
 								value: Some(value),
-							}) => Sexp::head(
+							} => Sexp::head(
 								"=",
 								[
 									Sexp::atom(self.name(name.inner)),
 									self.expr(value),
 								],
 							),
-							EnumEntry::Rest => Sexp::atom(".."),
 						}
 					})),
 			),
