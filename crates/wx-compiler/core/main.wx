@@ -9,7 +9,9 @@ pub type u64;
 pub type f32;
 pub type f64;
 
-pub enum Bool(u8) {
+/// Its number is part of its contract (`False` is 0, `True` is 1), so the
+/// repr is `pub`: `local Bool(n) = b` reads it anywhere.
+pub enum Bool(pub u8) {
     False = 0,
     True = 1,
 }
@@ -105,7 +107,9 @@ pub trait PartialOrd: PartialEq {
     func ge(self: Self, other: Self) -> Bool;
 }
 
-pub enum Ordering(i8) {
+/// Its number is part of its contract (the sign of the comparison), so
+/// the repr is `pub`: `local Ordering(n) = o` reads it anywhere.
+pub enum Ordering(pub i8) {
     Less = -1,
     Equal = 0,
     Greater = 1,

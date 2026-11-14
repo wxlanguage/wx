@@ -7056,6 +7056,20 @@ mod tests {
 	}
 
 	#[test]
+	fn cores_bool_and_ordering_have_a_public_repr() {
+		// Their numbers are their contract, so any package reads them.
+		let case = TestCase::new(indoc! {"
+				func f(b: Bool, o: Ordering) -> i8 {
+					local Bool(n): Bool = b;
+					local m: u8 = n;
+					local Ordering(sign) = o;
+					sign
+				}
+		"});
+		case.diagnostics().assert_none();
+	}
+
+	#[test]
 	fn a_struct_pattern_of_its_fields_as_one_value_counts_for_exhaustiveness() {
 		let case = TestCase::new(indoc! {"
 				struct P(x: u8, y: u16);

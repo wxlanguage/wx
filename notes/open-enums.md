@@ -221,8 +221,16 @@ from the object's type. On an enum:
   repr, and a field read is the enum's value itself.
 
 Step 3 (the construction error) came with it: `E(5)` and `E({ value: 5 })`
-are E2142, `EnumConstructedFromRepr`. Left: step 4, `pub` on core's reprs and
-replacing `transmute` where reading the field says the same.
+are E2142, `EnumConstructedFromRepr`.
+
+Step 4 is done: core declares `pub enum Bool(pub u8)` and
+`pub enum Ordering(pub i8)`. No `transmute` in core or the examples was
+replaced: a read gives exactly the repr's type, and each of them converts to a
+different one (core's `Bool` impls pass `self` to an `i32` intrinsic,
+`Ordering::of` turns a `Bool` into an `i8` and builds an `Ordering` from a
+number, which only `transmute` may, and the examples widen a `u8` or `u16`
+repr to `u32`). Reading the repr replaces a `transmute::<E, Repr>`, which none
+of them is.
 
 ### Change 2: remove open enums
 

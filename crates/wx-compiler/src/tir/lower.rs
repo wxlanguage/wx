@@ -2786,6 +2786,25 @@ mod tests {
 	}
 
 	#[test]
+	fn an_orderings_repr_is_the_sign_of_the_comparison() {
+		let (mut store, instance) = instantiate(
+			r#"
+			func sign(a: u32, b: u32) -> i32 {
+				local Ordering(n) = Ordering::of(a, b);
+				transmute::<i8, i32>(n)
+			}
+			export { sign as "sign" }
+		"#,
+		);
+		let sign = instance
+			.get_typed_func::<(u32, u32), i32>(&mut store, "sign")
+			.unwrap();
+		assert_eq!(sign.call(&mut store, (1, 2)).unwrap(), -1);
+		assert_eq!(sign.call(&mut store, (2, 2)).unwrap(), 0);
+		assert_eq!(sign.call(&mut store, (3, 2)).unwrap(), 1);
+	}
+
+	#[test]
 	fn a_value_no_variant_names_traps_in_a_closed_enums_match() {
 		// A closed enum's variants are all its values; one made otherwise is
 		// a hazard, and the `match` traps on it.
