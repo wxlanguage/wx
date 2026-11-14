@@ -88,6 +88,23 @@ fn report_expected_path_segment_or_memory_tag(
 		)
 }
 
+/// A `use` followed by no path.
+fn report_expected_use_path(
+	file_id: FileId,
+	received: Spanned<Token>,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::UnexpectedToken.code())
+		.with_message(format!(
+			"expected a path after `use`, found `{}`",
+			received.inner
+		))
+		.with_label(
+			Label::primary(file_id, received.span)
+				.with_message("expected a name here"),
+		)
+}
+
 /// A `use` path's `::` followed by none of a name, `*` or `{`.
 fn report_expected_use_segment(
 	file_id: FileId,
@@ -4595,7 +4612,7 @@ impl<'ctx> Parser<'ctx> {
 				}
 				let use_span = parser.lexer.next().span;
 				let start = pub_span.unwrap_or(use_span).start;
-				let tree = Self::parse_use_tree(parser)?;
+				let tree = Self::parse_use_root(parser, use_span)?;
 				Ok(Spanned {
 					span: TextSpan::new(start, tree.span.end),
 					inner: ImportEntry::Use {
@@ -4709,7 +4726,7 @@ impl<'ctx> Parser<'ctx> {
 		// The trailing `;` is deliberately left for the caller: top-level
 		// items are separated by `SemiColon` at the group level (see
 		// `parse_module_item`).
-		let tree = Self::parse_use_tree(parser)?;
+		let tree = Self::parse_use_root(parser, use_span)?;
 		let span = TextSpan::new(use_span.start, tree.span.end);
 		let tree = parser.ast.push_node(tree.inner, tree.span);
 		Ok(Spanned {
@@ -4718,6 +4735,42 @@ impl<'ctx> Parser<'ctx> {
 				pub_span: None,
 				tree,
 			},
+		})
+	}
+
+	/// The tree after `use`. With no path (`use ;`), reported, and kept as
+	/// a leaf named with the error symbol over the gap up to the next token,
+	/// which is left alone. A keyword other than a path's own starts the
+	/// next item, as after a `.`. A `*` or `{` is a path written wrong, not
+	/// one not written yet, and is an error of its own.
+	fn parse_use_root(
+		parser: &mut Parser,
+		use_span: TextSpan,
+	) -> Result<Spanned<UseTree>, ()> {
+		let token = parser.lexer.peek();
+		if matches!(
+			token.inner,
+			Token::Identifier
+				| Token::Keyword(
+					Keyword::Package | Keyword::Super | Keyword::SelfLower
+				) | Token::Star
+				| Token::OpenBrace
+		) {
+			return Self::parse_use_tree(parser);
+		}
+		parser
+			.diagnostics
+			.push(report_expected_use_path(parser.file_id, token));
+		let missing = Spanned {
+			inner: Keyword::Error.symbol(),
+			span: TextSpan::new(use_span.end, token.span.start),
+		};
+		Ok(Spanned {
+			inner: UseTree::Name {
+				segment: missing,
+				alias: None,
+			},
+			span: missing.span,
 		})
 	}
 

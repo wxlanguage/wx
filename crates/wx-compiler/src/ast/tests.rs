@@ -4562,6 +4562,62 @@ fn a_use_path_with_no_name_keeps_its_prefix() {
 }
 
 #[test]
+fn a_use_with_no_path_keeps_the_item() {
+	let case = TestCase::new("use  ;\nfunc f() {}");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	case.diagnostics()
+		.assert_error_saying("expected a path after `use`, found `;`");
+	assert_eq!(case.tree(), "(use <error>)\n\n(func f (params) (block))\n");
+	let Item::Use { tree, .. } =
+		case.ast.item(case.ast.ids(case.ast.root).next().unwrap())
+	else {
+		panic!("expected a `use`")
+	};
+	let UseTree::Name { segment, alias } = case.ast.use_tree(tree) else {
+		panic!("expected a leaf")
+	};
+	assert_eq!(segment.inner, Keyword::Error.symbol());
+	assert!(alias.is_none());
+	assert_eq!(
+		segment.span,
+		TextSpan::new(3, 5),
+		"the missing path spans the gap up to the `;`"
+	);
+}
+
+/// A keyword other than a path's own starts the next item, so `use` at the
+/// end of a line does not take the next item's `func` as its path.
+#[test]
+fn a_keyword_after_use_starts_the_next_item() {
+	let case = TestCase::new(indoc! {"
+		use
+		func f() {}
+		mod m {
+		    pub use
+		}
+	"});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::UnexpectedToken,
+	]);
+	case.diagnostics()
+		.assert_error_saying("expected a path after `use`, found `func`");
+	assert_eq!(
+		case.tree(),
+		"(use <error>)\n\n(func f (params) (block))\n\n(mod m (use pub <error>))\n"
+	);
+}
+
+#[test]
+fn an_import_block_use_with_no_path_keeps_the_entry() {
+	let case = TestCase::new("import \"env\" as env { use ; }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	assert_eq!(case.tree(), "(import \"env\" env (use <error>))\n");
+}
+
+#[test]
 fn a_use_path_continues_through_super() {
 	let case = TestCase::new("use super::super::a;");
 	case.diagnostics().assert_none();
