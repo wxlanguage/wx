@@ -919,16 +919,12 @@ impl Semantics {
 					continue;
 				}
 				let key = BindingKey::new(tier, name);
-				let (base, lookup) =
-					self.decls.lookup_unqualified(namespace, key);
+				let lookup = self.decls.lookup_unqualified(namespace, key);
 				if let BindingLookup::Found {
-					target, visibility, ..
+					target, reachable, ..
 				} = lookup && let Some(loc) = target.loc()
 					&& used_as.admits(tier, self.declaration_kind(loc))
-					&& self
-						.decls
-						.namespaces
-						.is_accessible_from(namespace, base, visibility)
+					&& reachable
 				{
 					found.push((name, Definition::Item(loc)));
 				}
@@ -962,7 +958,7 @@ impl Semantics {
 			for name in self.candidates(&[base], tier) {
 				let key = BindingKey::new(tier, name);
 				if let BindingLookup::Found {
-					target, visibility, ..
+					target, reachable, ..
 				} = namespaces.lookup(
 					&self.decls.use_items,
 					accessor,
@@ -970,7 +966,7 @@ impl Semantics {
 					key,
 				) && let Some(loc) = target.loc()
 					&& used_as.admits(tier, self.declaration_kind(loc))
-					&& namespaces.is_accessible_from(accessor, base, visibility)
+					&& reachable
 				{
 					found.push((name, Definition::Item(loc)));
 				}
@@ -3042,8 +3038,8 @@ mod tests {
 		assert_eq!(
 			names_after(&analysis, prefix, "shapes", NameUse::Value),
 			// An enum's name is a value path too (`Kind::A`, `Kind(n)`), and
-			// the module's own path keywords continue it.
-			["Kind", "Square", "area", "package", "self", "super"],
+			// the module's public path keywords continue it.
+			["Kind", "Square", "area", "package", "self"],
 			"`hidden` is private to `shapes`"
 		);
 		// A constructor is a value only where every field is accessible.
@@ -3058,12 +3054,12 @@ mod tests {
 				"shapes",
 				NameUse::Value
 			),
-			["area", "package", "self", "super"]
+			["area", "package", "self"]
 		);
 		assert_eq!(
 			names_after(&analysis, prefix, "shapes", NameUse::Type),
-			["Kind", "Square", "area", "package", "self", "super"],
-			"a module's path keywords are bindings of its own"
+			["Kind", "Square", "area", "package", "self"],
+			"a module's public path keywords are bindings of its own"
 		);
 		assert_eq!(
 			names_after(&analysis, "Kind::A", "Kind", NameUse::Value),
@@ -3076,7 +3072,7 @@ mod tests {
 		"});
 		assert_eq!(
 			names_after(&traits, "shapes::Square", "shapes", NameUse::Bound),
-			["Show", "package", "self", "super"]
+			["Show", "package", "self"]
 		);
 	}
 

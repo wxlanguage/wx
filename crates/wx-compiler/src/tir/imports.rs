@@ -17,9 +17,9 @@ use crate::{
 
 use super::decls::{
 	Binding, BindingKey, BindingLookup, BindingTarget,
-	DuplicateDefinitionDiagnostic, GlobImport, ItemLoc, Namespace, Namespaces,
-	Scope, UseItemDecl, UseItemIndex, UseItemKind, UsePathIndex,
-	UsePathSegment, Visibility,
+	DuplicateDefinitionDiagnostic, GlobCandidate, GlobImport, ItemLoc,
+	Namespace, Namespaces, Scope, UseItemDecl, UseItemIndex, UseItemKind,
+	UsePathIndex, UsePathSegment, Visibility,
 };
 use super::resolutions::{NameResolutions, Reference, Site};
 
@@ -673,16 +673,19 @@ impl<'r> ImportResolver<'r> {
 			SourceSpan::new(self.namespaces.file_id(accessor.into()), span);
 
 		let mut ambiguity = None;
-		let (target, visibility) = match self.namespaces.lookup(
+		let (target, visibility, reachable) = match self.namespaces.lookup(
 			self.use_items,
 			accessor,
 			scope,
 			key,
 		) {
-			BindingLookup::NotFound => return (ImportSlot::Absent, None),
+			BindingLookup::NotFound { .. } => {
+				return (ImportSlot::Absent, None);
+			}
 			BindingLookup::Found {
 				target,
 				visibility,
+				reachable,
 				import,
 			} => {
 				if let Some(loc) = target.loc() {
@@ -691,7 +694,7 @@ impl<'r> ImportResolver<'r> {
 						Reference::from_lookup(loc, import),
 					);
 				}
-				(target, visibility)
+				(target, visibility, reachable)
 			}
 			BindingLookup::Ambiguous(candidates) => {
 				ambiguity = Some(report_ambiguous_identifier(
@@ -701,11 +704,9 @@ impl<'r> ImportResolver<'r> {
 					source_span,
 					&candidates,
 				));
-				// Every surviving candidate here was already confirmed
-				// accessible to `accessor` by `indirect_lookup` — `Public`
-				// is just a stand-in that reproduces that same "yes" below,
-				// not a claim about its real declared visibility.
-				(candidates[0].0, Visibility::Public)
+				// Recovered as its first candidate, which is reachable.
+				let first = candidates[0];
+				(first.target, first.visibility, first.reachable)
 			}
 		};
 		// Nothing is reported here: whether an inaccessible slot is an error
@@ -717,15 +718,11 @@ impl<'r> ImportResolver<'r> {
 			BindingTarget::Inaccessible(loc) => {
 				ImportSlot::Inaccessible(loc, visibility)
 			}
+			BindingTarget::Accessible(loc) if reachable => {
+				ImportSlot::Accessible(loc, visibility)
+			}
 			BindingTarget::Accessible(loc) => {
-				if self
-					.namespaces
-					.is_accessible_from(accessor, scope, visibility)
-				{
-					ImportSlot::Accessible(loc, visibility)
-				} else {
-					ImportSlot::Inaccessible(loc, visibility)
-				}
+				ImportSlot::Inaccessible(loc, visibility)
 			}
 			// An `Error`-recovery placeholder — already diagnosed by
 			// whoever caused that, nothing new to report here.
@@ -855,13 +852,13 @@ impl<'r> ImportResolver<'r> {
 			segment.segment.span,
 		);
 
-		let (target, visibility) = match self.namespaces.lookup(
+		let (target, reachable) = match self.namespaces.lookup(
 			self.use_items,
 			accessor,
 			target_namespace,
 			key,
 		) {
-			BindingLookup::NotFound => {
+			BindingLookup::NotFound { .. } => {
 				let diagnostic = self.report_unresolved_import(
 					segment.parent,
 					segment.segment.inner,
@@ -872,8 +869,9 @@ impl<'r> ImportResolver<'r> {
 			}
 			BindingLookup::Found {
 				target,
-				visibility,
+				reachable,
 				import,
+				..
 			} => {
 				if let Some(loc) = target.loc() {
 					self.resolutions.record(
@@ -881,7 +879,7 @@ impl<'r> ImportResolver<'r> {
 						Reference::from_lookup(loc, import),
 					);
 				}
-				(target, visibility)
+				(target, reachable)
 			}
 			BindingLookup::Ambiguous(candidates) => {
 				let diagnostic = report_ambiguous_identifier(
@@ -892,19 +890,13 @@ impl<'r> ImportResolver<'r> {
 					&candidates,
 				);
 				self.diagnostics.push(diagnostic);
-				// Every surviving candidate here was already confirmed
-				// accessible to `accessor` by `indirect_lookup` — `Public`
-				// is just a stand-in that reproduces that same "yes" below,
-				// not a claim about its real declared visibility.
-				(candidates[0].0, Visibility::Public)
+				// Recovered as its first candidate, which is reachable.
+				let first = candidates[0];
+				(first.target, first.reachable)
 			}
 		};
 
-		if !self.namespaces.is_accessible_from(
-			accessor,
-			target_namespace,
-			visibility,
-		) {
+		if !reachable {
 			// Reported here and now, not deferred like a leaf's
 			// `BindingTarget::Inaccessible` — this *is* the reference
 			// site, so there's nothing to defer to. Walking continues
@@ -1092,15 +1084,15 @@ pub(super) fn report_ambiguous_identifier(
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
-	candidates: &[(BindingTarget, SourceSpan)],
+	candidates: &[GlobCandidate],
 ) -> Diagnostic<FileId> {
 	let resolved_name = strings.resolve(name).unwrap();
 	let mut diagnostic = Diagnostic::error()
 		.with_code(DiagnosticCode::AmbiguousIdentifier.code())
 		.with_message(format!("`{resolved_name}` is ambiguous"))
 		.with_label(span.primary_label().with_message("ambiguous name"));
-	for (index, (target, candidate_span)) in candidates.iter().enumerate() {
-		let loc = target.loc().expect(
+	for (index, candidate) in candidates.iter().enumerate() {
+		let loc = candidate.target.loc().expect(
 			"an ambiguity candidate always carries a real DefKey — \
 			 CandidateMerge::push never lets a BindingTarget::Error \
 			 become one",
@@ -1108,7 +1100,7 @@ pub(super) fn report_ambiguous_identifier(
 		let noun = namespaces.kind(loc).noun();
 		let also = if index == 0 { "" } else { "also " };
 		diagnostic = diagnostic.with_label(
-			candidate_span.secondary_label().with_message(format!(
+			candidate.span.secondary_label().with_message(format!(
 				"could {also}refer to the {noun} imported here"
 			)),
 		);

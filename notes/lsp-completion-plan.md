@@ -187,10 +187,10 @@ offset, tier) -> Vec<(SymbolU32, Definition)>`. The server only renders
   alias's, trait's, constant's or impl's; the root's for the rest). An
   associated type is read in its trait's or impl's scope, which the walker
   passes. `names_at` and it share `scope_names`.
-- Found while testing: a glob brings in a private item of the module it
-  names (`mod helpers { func private() {} } use helpers::*;` lets the
-  parent call `private()`; Rust rejects it). That is the checker's
-  lookup, which `names_at` follows; to be fixed there, not here.
+- Found while testing, fixed in the checker (2026-11-14): a glob brought
+  in a private item of the module it names, `super` included (so `super`
+  resolved at a package root after `use helpers::*;`). A glob now brings in
+  only what its own scope can see there, and `super` is private.
 
 ### 4. The receiver of `x.|`: from the AST and the body, by span
 
@@ -273,8 +273,8 @@ that inserts the ascription.
    declaration, prefix, tier)` lists what the walk's lookup finds in the
    namespace it enters (a module, a package, an enum's variants),
    accessible from where the path is written; a prefix that is a type gives nothing, its members being step 5's.
-   A module's `self`, `super` and `package` are listed: they are bindings
-   of its own, and `shapes::super::x` resolves. Labels: `break :` and
+   A module's `self` and `package` are listed: they are public bindings
+   of its own (`super` is private, so `shapes::super` is not a path). Labels: `break :` and
    `continue :` with no name keep the jump, the error symbol in place of
    the label (`Parser::parse_label`, now shared by all four), which the
    checker neither declares nor looks up; `Body::labels_at` gives the

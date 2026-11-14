@@ -202,10 +202,7 @@ impl<'r> PathResolver<'r> {
 			// The first segment is unqualified: its scope, then the core
 			// prelude. Every later one is looked up only in `base`.
 			let outcome = if index == 0 {
-				let (found_in, outcome) =
-					self.decls.lookup_unqualified(accessor, key);
-				base = found_in;
-				outcome
+				self.decls.lookup_unqualified(accessor, key)
 			} else {
 				self.decls.namespaces.lookup(
 					&self.decls.use_items,
@@ -219,6 +216,7 @@ impl<'r> PathResolver<'r> {
 				BindingLookup::Found {
 					target,
 					visibility,
+					reachable,
 					import,
 				} => {
 					// `target.loc()` computed once and reused below —
@@ -238,11 +236,8 @@ impl<'r> PathResolver<'r> {
 					}
 					if first_inaccessible.is_none()
 						&& let Some(loc) = loc
-						&& !self.decls.namespaces.is_accessible_from(
-							accessor,
-							base,
-							*visibility,
-						) {
+						&& !reachable
+					{
 						first_inaccessible = Some((index as u32, loc));
 					}
 					if is_last {
@@ -279,28 +274,35 @@ impl<'r> PathResolver<'r> {
 							Some((index as u32, loc));
 					}
 					base = namespace;
-					entered_by = Some((*target, *visibility, *import));
+					entered_by =
+						Some((*target, *visibility, *reachable, *import));
 				}
 				// An enum's table holds only its variants; a name it does not
 				// bind may be a member of its impls, which is the caller's to
 				// look up past the enum, as past any other type.
-				BindingLookup::NotFound
+				BindingLookup::NotFound { .. }
 					if let Namespace::Enum(_) = base
-						&& let Some((target, visibility, import)) =
-							entered_by =>
+						&& let Some((
+							target,
+							visibility,
+							reachable,
+							import,
+						)) = entered_by =>
 				{
 					return PathResolution {
 						stopped_at: index as u32 - 1,
 						stopped_with: BindingLookup::Found {
 							target,
 							visibility,
+							reachable,
 							import,
 						},
 						first_inaccessible,
 						first_namespace_with_type_args,
 					};
 				}
-				BindingLookup::NotFound | BindingLookup::Ambiguous(_) => {
+				BindingLookup::NotFound { .. }
+				| BindingLookup::Ambiguous(_) => {
 					return PathResolution {
 						stopped_at: index as u32,
 						stopped_with: outcome,
@@ -396,17 +398,32 @@ impl<'r> PathResolver<'r> {
 					None => *target,
 				}
 			}
-			BindingLookup::NotFound => {
+			BindingLookup::NotFound { skipped } => {
 				// No name is written (`a::` unfinished): the parser
 				// reported it.
 				if !segments[stopped_at as usize].is_missing() {
-					self.diagnostics.push(report_not_found(
+					let name = segments[stopped_at as usize].ident.inner;
+					let mut diagnostic = report_not_found(
 						self.strings,
 						file_id,
 						span,
 						seg_tier,
-						segments[stopped_at as usize].ident.inner,
-					));
+						name,
+					);
+					if let Some(skipped) = skipped {
+						let namespaces = &self.decls.namespaces;
+						let glob = namespaces
+							.glob_span(&self.decls.use_items, skipped.glob);
+						let noun = namespaces.kind(skipped.loc).noun();
+						let name = self.strings.resolve(name).unwrap();
+						diagnostic = diagnostic.with_label(
+							glob.secondary_label().with_message(format!(
+								"{noun} `{name}` is private to the module this \
+								 glob names, so it is not brought in"
+							)),
+						);
+					}
+					self.diagnostics.push(diagnostic);
 				}
 				BindingTarget::Error
 			}
@@ -772,7 +789,10 @@ mod tests {
 
 		let resolution = case.try_resolve(inner_namespace, Tier::Type, "Outer");
 		assert_eq!(resolution.stopped_at, 0);
-		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
+		assert!(matches!(
+			resolution.stopped_with,
+			BindingLookup::NotFound { .. }
+		));
 	}
 
 	#[test]
@@ -789,7 +809,10 @@ mod tests {
 		let resolution =
 			case.try_resolve(root, Tier::Type, "inner::deeper::Outer");
 		assert_eq!(resolution.stopped_at, 2);
-		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
+		assert!(matches!(
+			resolution.stopped_with,
+			BindingLookup::NotFound { .. }
+		));
 	}
 
 	#[test]
@@ -808,7 +831,10 @@ mod tests {
 
 		let resolution = case.try_resolve(root, Tier::Type, "inner::i32");
 		assert_eq!(resolution.stopped_at, 1);
-		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
+		assert!(matches!(
+			resolution.stopped_with,
+			BindingLookup::NotFound { .. }
+		));
 	}
 
 	#[test]
@@ -890,7 +916,10 @@ mod tests {
 		let root = case.root_namespace();
 		let resolution = case.try_resolve(root, Tier::Type, "DoesNotExist");
 		assert_eq!(resolution.stopped_at, 0);
-		assert!(matches!(resolution.stopped_with, BindingLookup::NotFound));
+		assert!(matches!(
+			resolution.stopped_with,
+			BindingLookup::NotFound { .. }
+		));
 	}
 
 	#[test]

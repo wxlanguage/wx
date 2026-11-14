@@ -1621,6 +1621,9 @@ impl ScopeTable {
 	/// A module or import block has the same explicit scope qualifiers:
 	/// `self` names its own declaration `own`, `super` the one of the scope
 	/// it is written in, `parent_key`, and `package` its package's root.
+	/// `super` is private, so it is reached from the scope and its
+	/// descendants only (`super::super::x`): a glob from its parent does not
+	/// bring it in, and `shapes::super` is not a path.
 	fn child(
 		mut symbols: SymbolTable,
 		own: ItemLoc,
@@ -1628,17 +1631,18 @@ impl ScopeTable {
 		parent_key: ItemLoc,
 		package_id: PackageId,
 	) -> Self {
-		for (name, target) in [
-			(Keyword::SelfLower, own),
+		for (name, target, visibility) in [
+			(Keyword::SelfLower, own, Visibility::Public),
 			(
 				Keyword::Package,
 				ItemLoc::new(Namespace::Package(package_id), DeclIdx::SELF),
+				Visibility::Public,
 			),
-			(Keyword::Super, parent_key),
+			(Keyword::Super, parent_key, Visibility::Private),
 		] {
 			symbols.bindings.insert(
 				BindingKey::ty(name.symbol()),
-				Binding::definition(target, Visibility::Public),
+				Binding::definition(target, visibility),
 			);
 		}
 		Self {
@@ -1668,31 +1672,42 @@ pub struct Namespaces {
 }
 
 /// The result of [`Namespaces::lookup`]/[`Namespaces::indirect_lookup`].
-/// `Found` pairs a target with its visibility — an accessibility check and
-/// re-export capping both need both at once, and this holds regardless of
-/// whether `accessor` can actually see it; that's left for the caller to
-/// decide, same as a direct (non-glob) hit always has been.
+/// `Found` says whether the accessor can reach the binding, decided by the
+/// lookup against the namespace the binding is in, since only the lookup
+/// knows which that is; its visibility is kept for re-export capping.
 ///
-/// `Ambiguous` carries every surviving candidate paired with the `pub use`
-/// edge responsible for it — the diagnostic needs to name each one, same as
-/// two colliding ordinary globs already do. The same `ItemLoc` reached through
+/// `Ambiguous` carries every surviving candidate with the glob responsible
+/// for it, which the diagnostic names. The same `ItemLoc` reached through
 /// two different edges is merged into one candidate before it ever becomes
-/// an entry here, not after — see `indirect_lookup`. No visibility here: by
-/// construction, every entry that survives into this variant was already
-/// confirmed accessible to whichever `accessor` `indirect_lookup` was asked
-/// on behalf of, so there's nothing left for it to say.
+/// an entry here, not after — see `indirect_lookup`. Every entry is
+/// reachable from the accessor: `CandidateMerge` lets only those compete.
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum BindingLookup {
-	NotFound,
+	/// Nothing binds the name; `skipped` is what a glob passed over as
+	/// private to the namespace it names, which explains the failure.
+	NotFound {
+		skipped: Option<SkippedBinding>,
+	},
 	Found {
 		target: BindingTarget,
 		visibility: Visibility,
+		/// Whether the accessor may name the binding where it is bound.
+		reachable: bool,
 		/// The `use` item in the looked-up namespace that made the binding
 		/// visible there, a named import or a glob; `None` for a declaration
 		/// in that namespace.
 		import: Option<UseItemIndex>,
 	},
-	Ambiguous(Box<[(BindingTarget, SourceSpan)]>),
+	Ambiguous(Box<[GlobCandidate]>),
+}
+
+/// A binding a glob did not bring in, being private to the namespace the glob
+/// names: what it names, and the glob.
+#[derive(Clone, Copy)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub(super) struct SkippedBinding {
+	pub(super) loc: ItemLoc,
+	pub(super) glob: UseItemIndex,
 }
 
 /// `indirect_lookup`'s in-progress merge of the glob candidates it's walked
@@ -1707,29 +1722,32 @@ pub(super) enum BindingLookup {
 /// silently, same as `try_insert_binding` resolves the same disagreement
 /// for a direct same-namespace collision.
 ///
-/// Separately, `is_accessible_from(accessor, ..)` asks whether *this
-/// query's* accessor can see a given def at all, checked fresh. A lone real
-/// candidate is always kept as `One`, visibility included, regardless of
-/// that check — deferred to the caller, same as a direct hit. It's only
-/// consulted the moment a second, distinct `ItemLoc` would otherwise promote
-/// this into a real ambiguity: a candidate `accessor` could never legally
-/// choose is excluded right then, rather than surviving into a misleading
-/// `Ambiguous`.
-struct CandidateMerge<'a> {
-	namespaces: &'a Namespaces,
-	accessor: Scope,
+/// Separately, a candidate's `reachable` says whether *this query's*
+/// accessor may name it. A lone real candidate is always kept as `One`,
+/// whether reachable or not, for the caller to report, same as a direct hit.
+/// It's only consulted the moment a second, distinct `ItemLoc` would
+/// otherwise promote this into a real ambiguity: a candidate `accessor`
+/// could never legally choose is excluded right then, rather than surviving
+/// into a misleading `Ambiguous`.
+struct CandidateMerge {
 	candidates: Candidates,
+	/// The first binding a glob skipped; never a candidate, only what a
+	/// `NotFound` reports.
+	skipped: Option<SkippedBinding>,
 }
 
 /// A binding a glob leads to, and the glob that leads there.
 #[derive(Clone, Copy)]
-struct GlobCandidate {
-	target: BindingTarget,
-	visibility: Visibility,
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub(super) struct GlobCandidate {
+	pub(super) target: BindingTarget,
+	pub(super) visibility: Visibility,
+	/// Whether the accessor may name the binding where it is bound.
+	pub(super) reachable: bool,
 	/// The glob's span: what an ambiguity between candidates names.
-	span: SourceSpan,
+	pub(super) span: SourceSpan,
 	/// The glob's `use` item.
-	glob: UseItemIndex,
+	pub(super) glob: UseItemIndex,
 }
 
 enum Candidates {
@@ -1748,16 +1766,19 @@ enum Candidates {
 	// candidate turns out to still be a real competitor, its span is what
 	// seeds the new `Many` entry.
 	One(GlobCandidate),
-	Many(Vec<(BindingTarget, SourceSpan)>),
+	Many(Vec<GlobCandidate>),
 }
 
-impl<'a> CandidateMerge<'a> {
-	fn new(namespaces: &'a Namespaces, accessor: Scope) -> Self {
+impl CandidateMerge {
+	fn new() -> Self {
 		Self {
-			namespaces,
-			accessor,
 			candidates: Candidates::Empty,
+			skipped: None,
 		}
+	}
+
+	fn skip(&mut self, skipped: SkippedBinding) {
+		self.skipped.get_or_insert(skipped);
 	}
 
 	fn push(&mut self, candidate: GlobCandidate) {
@@ -1789,23 +1810,10 @@ impl<'a> CandidateMerge<'a> {
 					return;
 				}
 
-				let first_reachable = self.namespaces.is_accessible_from(
-					self.accessor,
-					first_key.namespace,
-					first.visibility,
-				);
-				let this_reachable = self.namespaces.is_accessible_from(
-					self.accessor,
-					loc.namespace,
-					candidate.visibility,
-				);
-
-				match (first_reachable, this_reachable) {
+				match (first.reachable, candidate.reachable) {
 					(true, true) => {
-						self.candidates = Candidates::Many(vec![
-							(first.target, first.span),
-							(candidate.target, candidate.span),
-						]);
+						self.candidates =
+							Candidates::Many(vec![*first, candidate]);
 					}
 					// Only one side is a real option for `accessor` — that
 					// one just replaces `first` outright (or stays, if it
@@ -1818,30 +1826,26 @@ impl<'a> CandidateMerge<'a> {
 				}
 			}
 			Candidates::Many(items) => {
-				if !self.namespaces.is_accessible_from(
-					self.accessor,
-					loc.namespace,
-					candidate.visibility,
-				) {
+				if !candidate.reachable {
 					return;
 				}
 				let slot = items
 					.iter_mut()
-					.find(|(target, _)| target.loc() == Some(loc));
+					.find(|item| item.target.loc() == Some(loc));
 				match slot {
 					Some(slot)
 						if matches!(
 							candidate.target,
 							BindingTarget::Accessible(_)
 						) && matches!(
-							slot.0,
+							slot.target,
 							BindingTarget::Inaccessible(_)
 						) =>
 					{
-						*slot = (candidate.target, candidate.span);
+						*slot = candidate;
 					}
 					Some(_) => {}
-					None => items.push((candidate.target, candidate.span)),
+					None => items.push(candidate),
 				}
 			}
 		}
@@ -1849,11 +1853,14 @@ impl<'a> CandidateMerge<'a> {
 
 	fn finish(self) -> BindingLookup {
 		match self.candidates {
-			Candidates::Empty => BindingLookup::NotFound,
+			Candidates::Empty => BindingLookup::NotFound {
+				skipped: self.skipped,
+			},
 			Candidates::Error(found) | Candidates::One(found) => {
 				BindingLookup::Found {
 					target: found.target,
 					visibility: found.visibility,
+					reachable: found.reachable,
 					import: Some(found.glob),
 				}
 			}
@@ -2110,9 +2117,9 @@ impl Namespaces {
 		key: BindingKey,
 	) -> BindingLookup {
 		let Some(target) = target.as_scope() else {
-			return BindingLookup::NotFound;
+			return BindingLookup::NotFound { skipped: None };
 		};
-		let mut candidates = CandidateMerge::new(self, accessor);
+		let mut candidates = CandidateMerge::new();
 
 		for glob in self.scope(target).glob_imports.iter().copied() {
 			let item = &use_items[usize::from(glob.use_item)];
@@ -2124,37 +2131,54 @@ impl Namespaces {
 			) {
 				continue;
 			}
-			let UseItemKind::Glob { span, .. } = item.kind else {
-				unreachable!("a glob edge is always produced by a glob item")
-			};
-			let edge_span =
-				SourceSpan::new(self.scope(target).symbols.file_id, span);
+			let edge_span = self.glob_span(use_items, glob.use_item);
 
 			match self.lookup(use_items, accessor, glob.namespace, key) {
-				BindingLookup::NotFound => {}
+				BindingLookup::NotFound { skipped } => {
+					if let Some(skipped) = skipped {
+						candidates.skip(skipped);
+					}
+				}
+				// A glob brings in only what the scope it is written in can
+				// see in the namespace it names.
 				BindingLookup::Found {
-					target, visibility, ..
+					target: found,
+					visibility,
+					..
+				} if !self.is_accessible_from(
+					target,
+					glob.namespace,
+					visibility,
+				) =>
+				{
+					if let Some(loc) = found.loc() {
+						candidates.skip(SkippedBinding {
+							loc,
+							glob: glob.use_item,
+						});
+					}
+				}
+				// Reachable as far as the binding is: the glob itself is
+				// visible to `accessor`, checked above.
+				BindingLookup::Found {
+					target,
+					visibility,
+					reachable,
+					..
 				} => {
 					candidates.push(GlobCandidate {
 						target,
 						visibility,
+						reachable,
 						span: edge_span,
 						glob: glob.use_item,
 					});
 				}
 				BindingLookup::Ambiguous(nested) => {
-					// Every nested entry was already confirmed accessible
-					// to this same `accessor` one recursion level down
-					// (that's what let it survive into `Ambiguous` at
-					// all) — `Public` is just a stand-in that reproduces
-					// that same "yes" when re-checked just below, not a
-					// claim about its real declared visibility.
-					for (target, span) in nested.iter().copied() {
+					for candidate in nested {
 						candidates.push(GlobCandidate {
-							target,
-							visibility: Visibility::Public,
-							span,
 							glob: glob.use_item,
+							..candidate
 						});
 					}
 				}
@@ -2162,6 +2186,19 @@ impl Namespaces {
 		}
 
 		candidates.finish()
+	}
+
+	/// Where the glob `index` is written.
+	pub(super) fn glob_span(
+		&self,
+		use_items: &[UseItemDecl],
+		index: UseItemIndex,
+	) -> SourceSpan {
+		let item = &use_items[usize::from(index)];
+		let UseItemKind::Glob { span, .. } = item.kind else {
+			unreachable!("a glob edge is always produced by a glob item")
+		};
+		SourceSpan::new(self.file_id(item.namespace.into()), span)
 	}
 
 	/// What `target` exposes to `accessor` — `direct_lookup`, falling back
@@ -2180,6 +2217,11 @@ impl Namespaces {
 			Some(binding) => BindingLookup::Found {
 				target: binding.target,
 				visibility: binding.visibility,
+				reachable: self.is_accessible_from(
+					accessor,
+					target,
+					binding.visibility,
+				),
 				import: match binding.source {
 					BindingSource::Definition => None,
 					BindingSource::Import(import) => Some(import),
@@ -2536,27 +2578,31 @@ impl Declarations {
 
 	/// What an unqualified name `key` written in `accessor` binds: in the
 	/// scope itself (its declarations, `use`s and globs), else in the core
-	/// prelude, and never in an enclosing scope; with the namespace it was
-	/// found in, which an accessibility check is made against. The first
-	/// segment of every path, and nothing else, is looked up this way.
+	/// prelude, and never in an enclosing scope. The first segment of every
+	/// path, and nothing else, is looked up this way.
 	pub(super) fn lookup_unqualified(
 		&self,
 		accessor: Scope,
 		key: BindingKey,
-	) -> (Namespace, BindingLookup) {
+	) -> BindingLookup {
 		let own = Namespace::from(accessor);
 		match self.namespaces.lookup(&self.use_items, accessor, own, key) {
-			BindingLookup::NotFound => {
+			BindingLookup::NotFound { skipped } => {
 				let prelude = Namespace::Package(self.core_package);
-				let found = self.namespaces.lookup(
+				match self.namespaces.lookup(
 					&self.use_items,
 					accessor,
 					prelude,
 					key,
-				);
-				(prelude, found)
+				) {
+					// What the scope's own globs skipped explains the miss.
+					BindingLookup::NotFound { .. } => {
+						BindingLookup::NotFound { skipped }
+					}
+					found => found,
+				}
 			}
-			found => (own, found),
+			found => found,
 		}
 	}
 
@@ -6023,10 +6069,11 @@ mod tests {
 			case.resolve(Tier::Type, "host::package").expect_success(),
 			root
 		);
-		assert_eq!(
-			case.resolve(Tier::Type, "host::super").expect_success(),
-			root
-		);
+		// `super` is private to the block: from outside it is no path.
+		assert!(matches!(
+			case.resolve(Tier::Type, "host::super").target,
+			BindingTarget::Inaccessible(_)
+		));
 		case.resolve(Tier::Type, "host::host")
 			.diagnostics()
 			.assert_error(DiagnosticCode::UndeclaredIdentifier);
@@ -7003,8 +7050,80 @@ mod tests {
 				b.into(),
 				BindingKey::value(helper),
 			),
-			BindingLookup::NotFound
+			BindingLookup::NotFound { .. }
 		));
+	}
+
+	/// A glob brings in what the scope it is written in can see in the
+	/// namespace it names: not that namespace's private items, its private
+	/// imports, or its `super`, which is a private binding like any other.
+	#[test]
+	fn a_glob_brings_in_only_what_its_scope_can_see() {
+		let source = indoc! {"
+			mod helpers {
+				pub func shared() {}
+				func private() {}
+				use package::other::named;
+			}
+			mod other {
+				pub func named() {}
+			}
+			use helpers::*;
+			mod outer {
+				mod inner {
+					func hidden() {}
+				}
+				pub use inner::*;
+			}
+			mod deep {
+				pub use deeper::*;
+				mod deeper {
+					func buried() {}
+				}
+			}
+			use deep::*;
+		"};
+		let mut case = TestCase::new(source);
+		case.diagnostics().assert_none();
+		assert!(matches!(
+			case.resolve(Tier::Value, "shared").expect_success(),
+			DeclKind::Function(_),
+		));
+		// What a glob skipped is named on it, from a first segment and from a
+		// later one.
+		let glob = |text: &str| {
+			let start = source.find(text).unwrap();
+			start..start + text.len()
+		};
+		for (tier, path, label, at) in [
+			(Tier::Value, "private", "function `private`", "helpers::*"),
+			(Tier::Value, "named", "function `named`", "helpers::*"),
+			(Tier::Type, "super", "package `super`", "helpers::*"),
+			(
+				Tier::Value,
+				"outer::hidden",
+				"function `hidden`",
+				"inner::*",
+			),
+			// Skipped behind a glob another glob leads through: named on
+			// the one that skipped it.
+			(Tier::Value, "buried", "function `buried`", "deeper::*"),
+		] {
+			let result = case.resolve(tier, path);
+			result
+				.diagnostics()
+				.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+			let labels = &result.diagnostics[0].labels;
+			assert!(
+				labels.iter().any(|l| l.range == glob(at)
+					&& l.message.starts_with(label)
+					&& l.message.ends_with("so it is not brought in")),
+				"`{path}`: {labels:?}"
+			);
+		}
+		// A name no glob skipped is reported plainly.
+		let result = case.resolve(Tier::Value, "nowhere");
+		assert_eq!(result.diagnostics[0].labels.len(), 1);
 	}
 
 	#[test]
@@ -7090,13 +7209,42 @@ mod tests {
 			BindingLookup::Found {
 				target: BindingTarget::Accessible(found),
 				visibility,
+				reachable,
 				import: Some(_),
 			} => {
 				assert_eq!(found, *original);
 				assert_eq!(visibility, Visibility::Public);
+				assert!(reachable);
 			}
 			other => panic!("expected a single found candidate, got {other:?}"),
 		}
+	}
+
+	/// A candidate is reachable or not where its binding is, not where its
+	/// item is declared: `pick` reaches `s` through `use super::*` as `n`'s
+	/// private alias, which `s` may name, so it competes with `f::pick`.
+	#[test]
+	fn a_glob_candidate_is_judged_where_it_is_bound() {
+		let mut case = TestCase::new(indoc! {"
+			mod n {
+				use package::e::pick;
+				pub mod s {
+					use super::*;
+					use package::f::*;
+				}
+			}
+			mod e {
+				pub func pick() -> i32 { 1 }
+			}
+			mod f {
+				pub func pick() -> i32 { 2 }
+			}
+		"});
+		case.diagnostics().assert_none();
+		let s = case.scope("n::s");
+		case.resolve_from(s, Tier::Value, "pick")
+			.diagnostics()
+			.assert_error(DiagnosticCode::AmbiguousIdentifier);
 	}
 
 	#[test]

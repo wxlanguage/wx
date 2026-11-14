@@ -170,9 +170,17 @@ private `use super::*` in the block combined with `use host::*` in its parent is
 rejected; named imports in at least one direction avoid that loop. No lookup
 trail or new per-hop accessor-resolution semantics are used.
 
-Known separate follow-up: glob lookup can expose a private named alias when
-its underlying definition is visible to the accessor. Import-block `use`
-support deliberately does not change that existing glob-visibility behaviour.
+A glob brings in only what the scope it is written in can see in the
+namespace it names (`indirect_lookup`): not that namespace's private items or
+private imports. A module's `super` is a private binding like any other, so
+it is reached from the module and its descendants (`super::super::x`), never
+through a glob or from outside (`shapes::super` is E2065). A name a glob
+skipped is reported as not found (E2007), with a label on the glob that names
+it: the lookup that skipped it returns it (`BindingLookup::NotFound { skipped }`,
+from `CandidateMerge`), so reporting walks nothing again. Whether the accessor
+may name a binding is the lookup's to decide, against the namespace the binding
+is in (`BindingLookup::Found::reachable`); callers read it rather than check a
+visibility themselves, and keep the visibility only to cap a re-export.
 
 **Phase 1 — `Declarations::build`** (`decls.rs`, with `imports.rs`/`paths.rs`): seeds one root scope per package (`package`/`self` are real bindings, and `core` is bound in every package but the core's own; other dependencies are bound by package instances as they are scanned), creates one scope per file, prescans every item into `ast_nodes: Vec<AstEntry>` (parse order; each names its node by id in its file's tree, `ast.item(id)`) and per-kind arenas with stable indices (`FunctionIdx`, `StructIdx`, …), and resolves `use` imports and globs on demand. Output is read-only afterwards. `ImplDispatch::build` then indexes impl targets. Namespaces are addressed by their owner: a `Namespace` (`Package`/`Module`/`Enum`/`Import`) is what a path continues into, a `Scope` (`Package`/`Module`/`Import`) is where code is written (an unqualified lookup's start, a privacy check's accessor, every item's `namespace`). Their tables live in `decls.namespaces: Namespaces`, one list per owner kind indexed by the owner's own index. Only a scope has a parent, globs and `self`/`package`/`super`; an enum's table holds just its variants. Imported declarations and their synthetic impls use their block's own scope: sibling names resolve directly, enclosing names need `super::` or `package::`, exactly as in modules. There is no enclosing-scope fallback in path resolution.
 
