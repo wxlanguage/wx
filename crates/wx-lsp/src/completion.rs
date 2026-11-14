@@ -563,7 +563,7 @@ impl Cursor<'_> {
 				variants,
 				..
 			} => Within::Signature(Anchor::Name(name.span))
-				.position(repr.and_then(|repr| self.ty(repr)))
+				.position(self.node(*repr).and_then(|field| self.ty(field.ty)))
 				.or_else(|| {
 					let variant: EnumVariant = self.node(*variants)?;
 					Within::Body(variant.name.span)

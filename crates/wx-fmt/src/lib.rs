@@ -1661,7 +1661,7 @@ impl<'a> Builder<'a> {
 		span: TextSpan,
 		pub_span: Option<TextSpan>,
 		attributes: ast::List<ast::Attribute>,
-		repr: Option<ast::TypeId>,
+		repr: ast::List<ast::StructField>,
 		name: &ast::Spanned<SymbolU32>,
 		variants: ast::List<ast::EnumVariant>,
 	) -> NodeId {
@@ -1673,10 +1673,20 @@ impl<'a> Builder<'a> {
 		}
 		nodes.push(self.text(Text::Enum));
 		nodes.push(self.symbol(name.inner));
-		if let Some(repr) = repr {
-			nodes.push(self.text(Text::LParen));
-			nodes.push(self.build_type_expression(repr));
-			nodes.push(self.text(Text::RParen));
+		// The repr is printed as a struct's fields are.
+		if !repr.is_empty() {
+			// The parentheses' own span is not kept: the list runs from the
+			// name to its last field, and a comment after that is the body's.
+			let entries = self.build_struct_fields(repr);
+			let end =
+				entries.last().map_or(name.span.end, |(span, _)| span.end);
+			nodes.push(self.build_delimited_list(
+				TextSpan::new(name.span.end, end),
+				Text::LParen,
+				Text::RParen,
+				false,
+				entries,
+			));
 		}
 		nodes.push(self.text(Text::SpaceLBrace));
 
@@ -1771,6 +1781,28 @@ impl<'a> Builder<'a> {
 		self.arena.concat(items)
 	}
 
+	/// A struct's fields, or an enum's repr, each with its span.
+	fn build_struct_fields(
+		&mut self,
+		fields: ast::List<ast::StructField>,
+	) -> Vec<(TextSpan, NodeId)> {
+		self.ast
+			.spanned(fields)
+			.map(|field| {
+				let mut nodes: Vec<NodeId> = Vec::new();
+				if field.inner.pub_span.is_some() {
+					nodes.push(self.text(Text::Pub));
+				}
+				self.build_binding_and_type(
+					&mut nodes,
+					field.inner.binding,
+					field.inner.ty,
+				);
+				(field.span, self.arena.concat(nodes))
+			})
+			.collect()
+	}
+
 	fn build_struct_declaration(
 		&mut self,
 		span: TextSpan,
@@ -1790,21 +1822,7 @@ impl<'a> Builder<'a> {
 		items.push(self.symbol(name.inner));
 		self.build_type_params(&mut items, type_params);
 
-		let entries = ast
-			.spanned(fields)
-			.map(|field| {
-				let mut nodes: Vec<NodeId> = Vec::new();
-				if field.inner.pub_span.is_some() {
-					nodes.push(self.text(Text::Pub));
-				}
-				self.build_binding_and_type(
-					&mut nodes,
-					field.inner.binding,
-					field.inner.ty,
-				);
-				(field.span, self.arena.concat(nodes))
-			})
-			.collect();
+		let entries = self.build_struct_fields(fields);
 		items.push(self.build_delimited_list(
 			span,
 			Text::LParen,

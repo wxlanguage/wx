@@ -1045,7 +1045,10 @@ pub enum Item {
 	},
 	Enum {
 		pub_span: Option<TextSpan>,
-		repr: Option<TypeId>,
+		/// The repr, written as a struct's fields: `(i8)`, `(pub value: i8)`.
+		/// Empty when no parentheses are written. Several fields are a wider
+		/// repr, parsed for the day it is implemented.
+		repr: List<StructField>,
 		name: Spanned<SymbolU32>,
 		variants: List<EnumVariant>,
 		attributes: List<Attribute>,

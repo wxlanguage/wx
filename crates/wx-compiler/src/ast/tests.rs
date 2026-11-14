@@ -400,7 +400,7 @@ fn test_enum_repr_after_name() {
 
 	assert_eq!(case.strings.resolve(name.inner), Some("Status"));
 	assert!(matches!(
-		repr.map(|repr| case.ast.ty(repr)),
+		case.ast.list(*repr).first().map(|repr| case.ast.ty(repr.ty)),
 		Some(TypeExpression::Path(p))
 			if p.len() == 1
 				&& case.strings.resolve(case.ast.list(p)[0].ident.inner)
@@ -1459,15 +1459,67 @@ fn a_plain_block_is_written_with_its_keyword() {
 }
 
 #[test]
-fn an_old_enum_repr_is_reported_and_read_as_the_new_one() {
-	let case = TestCase::new("enum Status: i32 { Foo }");
-	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::EnumReprNeedsParentheses]);
+fn an_enum_repr_is_written_as_a_struct_field() {
+	let case = TestCase::new(indoc! {"
+        enum A(i8) { X = 0 }
+        enum B(value: i8) { X = 0 }
+        enum C(_: i8) { X = 0 }
+        pub enum D(pub i8) { X = 0 }
+    "});
+	case.diagnostics().assert_none();
+	let repr = |index| {
+		let Item::Enum { repr, .. } = case.item(index) else {
+			panic!("expected enum item")
+		};
+		case.ast.list(*repr)[0]
+	};
+	assert!(repr(0).binding.is_none() && repr(0).pub_span.is_none());
+	assert_eq!(
+		repr(1)
+			.binding
+			.and_then(Binding::name)
+			.and_then(|name| case.strings.resolve(name.inner)),
+		Some("value"),
+	);
+	// `_` names nothing, as on a struct field or a parameter.
+	assert!(repr(2).binding.and_then(Binding::name).is_none());
+	assert!(repr(3).pub_span.is_some());
+}
+
+#[test]
+fn a_mut_enum_repr_is_parsed_as_written() {
+	// Whether it means anything is the checker's to say (E2141).
+	let case = TestCase::new("enum E(mut value: i8) { X = 0 }");
+	case.diagnostics().assert_none();
 	let Item::Enum { repr, variants, .. } = case.item(0) else {
 		panic!("expected enum item")
 	};
-	assert!(repr.is_some());
+	assert!(matches!(
+		case.ast.list(*repr)[0].binding,
+		Some(Binding::Name {
+			mut_span: Some(_),
+			..
+		})
+	));
 	assert_eq!(variants.len(), 1);
+}
+
+#[test]
+fn an_enum_repr_may_list_several_fields() {
+	// A wider repr, which the checker does not support yet.
+	let case = TestCase::new("enum Direction(dx: i8, dy: i8) { Up = (0, -1) }");
+	case.diagnostics().assert_none();
+	let Item::Enum { repr, .. } = case.item(0) else {
+		panic!("expected enum item")
+	};
+	assert_eq!(repr.len(), 2);
+}
+
+#[test]
+fn an_enum_repr_after_a_colon_is_not_read() {
+	let case = TestCase::new("enum Status: i32 { Foo }");
+	case.diagnostics()
+		.assert_error(DiagnosticCode::UnexpectedToken);
 
 	let case = TestCase::new("enum Status(i32 { Foo }");
 	case.diagnostics()

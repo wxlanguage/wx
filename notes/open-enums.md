@@ -1,7 +1,8 @@
 # Open sets of values: a struct with constants, not an open enum
 
 Status: decided 2026-11-14. Change 2 (removing open enums) is done; Change 1
-(destructuring an enum) is not implemented. This replaces the 2026-11-05
+(an enum's repr as a field that may be read, revised the same day) is not
+implemented. This replaces the 2026-11-05
 design in this note (an enum body ending in `..`), which was implemented and is
 to be removed. What it was, and why it was dropped, is in "The design this
 replaces" below. What a constant pattern means, and so how `Errno`'s constants
@@ -116,36 +117,71 @@ The derive this note first planned for (`struct Point: PartialEq + Eq (..)`,
 generating the impls from the declaration) is replaced by the empty
 `impl Eq for Point {}`, whose bounds are written like any impl's.
 
-### Change 1: any enum may be destructured into its repr
+### Change 1: an enum's repr is a field, and may be read
+
+Revised 2026-11-14: the repr is written and read as a struct field, with the
+struct field grammar and `pub` deciding who may read it. This replaces the first
+version of this change, under which the repr took no name and no `pub` and
+could be read wherever the enum was visible.
 
 ```wx
-enum Ordering(i8) { Less = -1, Equal = 0, Greater = 1 }
+pub enum Ordering(pub i8) { Less = -1, Equal = 0, Greater = 1 }
+enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
 
-local Ordering(n) = o; // n: i8
+local Ordering(n) = o;   // n: i8
+local Signal({ number }) = s;
+s.number
 ```
 
-Reading the number of a closed enum is always safe: its value is one of its
+An enum is read as a struct over its repr whose values are a closed list known
+at compile time. Reading the number is always safe: the value is one of its
 variants, and the declaration writes every variant's number. It replaces
 `transmute::<Ordering, i8>(o)`, which names the type and is only checked to
-have the same representation; the pattern checks against the declared repr.
-The repr is already written like a field (`enum Ordering(i8)`), so the pattern
-reads as what it does.
+have the same representation; reading the field checks against the declared
+repr.
 
-- **Destructuring, not construction.** `Ordering(5)` as an expression is an
-  error of its own (a closed enum is not built from its repr: use a variant,
+**The repr is a struct field.** It is parsed as a `StructField` (a binding, a
+`pub`, a type) where the enum's repr type is today, and each part means what it
+means on a struct, restricted by the enum being closed:
+
+| Part | Meaning | |
+| --- | --- | --- |
+| Type, `(i8)` | The repr. What a closed enum needs of it is `Repr: Eq + StackValue` (`notes/structural-eq.md`, "Enum reprs"); E2055 keeps it to integers until a wider repr is implemented | As today |
+| Name, `(value: i8)` | The number is read by name, `o.value` and `Ordering({ value })`, as well as by position | Allowed |
+| `_`, `(_: i8)` | No name, the same as `(i8)` (`Binding::name` is `None` for both), as on a struct field or a parameter | Allowed |
+| `pub`, `(pub i8)` | Code outside the enum's module may read the number | Allowed; private by default |
+| `mut`, `(mut value: i8)` | Writing the number in place | An error |
+
+- **Construction from the repr is never allowed**, by position or by name,
+  whatever the visibility: `Ordering(5)` and `Ordering({ value: 5 })` are an
+  error of their own (a closed enum is not built from its repr: use a variant,
   or a struct if every number is valid). Building a value from a number is the
   one thing that could break "the variants are all its values"; reading one
   cannot.
-- **What goes inside.** A binding or `_` only, to start with. A literal
-  (`Ordering(-1)`) would work, since usefulness already reasons about integer
-  values, but it is a second way to write `Ordering::Less`.
+- **`pub` decides who may read the number**, as it decides who may use a struct
+  field. On a struct it grants construction and reading; on an enum it grants
+  reading only, because being closed removes construction whatever the
+  visibility, so `pub` grants what the type allows and keeps one meaning.
+  Without `pub` the enum's module and its descendants may read it (the
+  default visibility, `CLAUDE.md`), elsewhere it is the private-field error
+  (E2076) for the pattern and the field access alike. Private by default
+  because seeing the numbers in the declaration is not the same as their being
+  API: if any module can read them, renumbering the variants breaks code, as
+  `e as i32` makes every Rust enum's discriminants public whether the author
+  meant it or not. An enum whose numbers are a contract says so: core's
+  `pub enum Ordering(pub i8)` and `pub enum Bool(pub u8)`. `transmute` and a
+  host import see the representation regardless, as for any type.
+- **`mut` is an error**, with a hint to assign a variant. Writing the number in
+  place can store a value no variant names, and restricting the write to
+  variants' values is assigning the enum (`o = Ordering::Less`), which already
+  works. Whatever `mut` comes to mean on a struct field (it is parsed and not
+  checked yet), it has nothing to mean here.
+- **What a pattern takes inside.** A binding or `_` only, to start with. A
+  literal (`Ordering(-1)`) would work, since usefulness already reasons about
+  integer values, but it is a second way to write `Ordering::Less`.
 - **In a `match`,** `Ordering(n)` matches every value: after all the variants
   it is unreachable (correct for a closed enum), and before some of them it is
   a catch-all that binds the number.
-- **Visibility.** Allowed wherever the enum is visible. The variants' numbers
-  are public with the enum already, so reading them hides nothing; the repr
-  takes no `pub`, which keeps `pub` meaning "may construct and read" on struct
-  fields.
 - **Namespace.** An enum's name is in the type namespace only, so today both
   `local E(n) = e` and `E(x)` are E2007, "cannot find value `E`". The pattern
   should resolve it as the enum (a struct pattern is resolved through the value
@@ -153,9 +189,23 @@ reads as what it does.
   value namespace, as a struct's does (and so may no longer share its name with
   a function), or the pattern looks it up as a type, is the implementer's
   choice. Either way the construction error above has to be reachable.
+- **Field access** `o.value` is a read of the one field, as on a struct; there
+  is no positional access (`o.0`), as there is none on a struct or a tuple.
+- **Several fields** are the deferred wider reprs below: written with this
+  grammar, `enum Direction(dx: i8, dy: i8)` read as `d.dx` needs no syntax of
+  its own when it comes.
 - **Lowering** does nothing: the enum is already erased to that scalar, and the
-  binding is the same value. Core can use it (`local Bool(b) = x`); `Char` is a
-  struct and has it already.
+  binding or the access is the same value. Core can use it
+  (`local Bool(b) = x`); `Char` is a struct and has it already.
+- **wx-fmt** prints the repr as it prints a struct field. The old
+  `enum E: i8` form is removed (no longer read, and E1024 with it).
+
+Step 1 (syntax) is done: the repr is parsed as a list of struct fields
+(`List<StructField>`, empty when no parentheses are written), so several fields
+need no new syntax when wider reprs come; until then the signature check reports
+them unsupported (E2114). wx-fmt prints the list as a struct's, and `mut` is
+reported by the signature check (E2141, `MutableEnumRepr`), since it is
+well-formed syntax that means nothing here.
 
 ### Change 2: remove open enums
 
@@ -261,17 +311,18 @@ Write each where the code under test is (`CLAUDE.md`, "Testing patterns").
   without the catch-all it is E2066 with witness `Errno(_)`; without the `Eq`
   impl it is E2063. Lowering (`tir/lower.rs`, under wasmtime):
   `describe(Errno(77))` takes the catch-all.
-- **Change 1**: `local Ordering(n) = o` gives the variant's number at runtime;
-  `Ordering(5)` as an expression is the new error; `Ordering(n)` after every
-  variant is unreachable and before them a catch-all; a pattern other than a
-  binding or `_` inside is refused.
+- **Change 1**: `local Ordering(n) = o`, `Signal({ number })` and `s.number`
+  give the variant's number at runtime; `Ordering(5)` and
+  `Ordering({ value: 5 })` as expressions are the new error; `Ordering(n)`
+  after every variant is unreachable and before them a catch-all; a pattern
+  other than a binding or `_` inside is refused; outside the module, reading a
+  repr without `pub` is E2076 and with `pub` is fine; `(mut v: i8)` is the
+  error; `(_: i8)` is `(i8)`; wx-fmt round-trips each form.
 - **Change 2**: a `..` in an enum body is the parse error; the parser, TIR and
   wx-fmt tests for open enums are removed with the code.
 - **Examples**: `examples/hello_wasi` checks, builds and prints.
 
 ## Documentation
 
-- `CLAUDE.md`: replace the "Open enums" bullet under "Language features" with
-  enum destructuring, and say that an open set of values is a struct with
-  constants and an `Eq` impl.
-- `examples/hello_wasi/main.wx`: the comment above `Errno`.
+- `CLAUDE.md`: the enums bullet under "Language features" gets the repr as a
+  field (name, `pub`, reading it, no construction, no `mut`).

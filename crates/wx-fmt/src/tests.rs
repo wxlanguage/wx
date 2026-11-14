@@ -581,8 +581,18 @@ fn test_format_enum_items() {
 }
 
 #[test]
-fn an_old_enum_repr_is_formatted_in_parentheses() {
-	let case = TestCase::new("enum Status: i32 { Foo }\n");
+fn an_enum_repr_is_formatted_as_a_struct_field() {
+	// Every form a struct field takes: plain, named, `_`, `pub`, and `mut`,
+	// which the parser reports and the formatter keeps as written.
+	let source = indoc! {"
+        enum A(i8) { X = 0 }
+        enum B(value: i8) { X = 0 }
+        enum C(_: i8) { X = 0 }
+        pub enum D(pub i8) { X = 0 }
+        enum E(pub mut value: i8) { X = 0 }
+        enum F(dx: i8, dy: i8) { X = (0, 0) }
+    "};
+	let case = TestCase::new(source);
 	let output = format(
 		&case.ast,
 		&case.comments,
@@ -596,8 +606,28 @@ fn an_old_enum_repr_is_formatted_in_parentheses() {
 	assert_eq!(
 		output,
 		indoc! {"
-            enum Status(i32) {
-                Foo,
+            enum A(i8) {
+                X = 0,
+            }
+
+            enum B(value: i8) {
+                X = 0,
+            }
+
+            enum C(_: i8) {
+                X = 0,
+            }
+
+            pub enum D(pub i8) {
+                X = 0,
+            }
+
+            enum E(pub mut value: i8) {
+                X = 0,
+            }
+
+            enum F(dx: i8, dy: i8) {
+                X = (0, 0),
             }
         "}
 	);

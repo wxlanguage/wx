@@ -115,7 +115,6 @@ define_diagnostic_codes! {
 		MissingPackageAlias => "E1021",
 		InvalidMutBinding => "E1022",
 		MissingTypeAnnotation => "E1023",
-		EnumReprNeedsParentheses => "E1024",
 		LabelOnIf => "E1025",
 		PackageMemberHasBody => "E1026",
 		AttributeArgumentsAreNamed => "E1027",
@@ -266,6 +265,7 @@ define_diagnostic_codes! {
 		MalformedAttribute => "E2138",
 		InvalidMemoryLimits => "E2139",
 		LocalInStaticData => "E2140",
+		MutableEnumRepr => "E2141",
 	}
 }
 

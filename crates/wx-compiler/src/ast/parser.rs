@@ -3756,26 +3756,14 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		} = parser.expect_name(&[])?;
 
-		// The repr is written like a struct's fields, `enum Ordering(i8)`.
-		// The old `enum Ordering: i8` is reported and read as the new form.
-		let repr = if let Some(colon) = parser.lexer.next_if(Token::Colon) {
-			parser.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::EnumReprNeedsParentheses.code())
-					.with_message("an enum's repr is written in parentheses")
-					.with_label(
-						Label::primary(parser.file_id, colon.span)
-							.with_message("expected `(`"),
-					)
-					.with_note("write `enum Name(Type) { ... }`"),
-			);
-			Some(parser.parse_type_expression()?)
-		} else if parser.lexer.next_if(Token::OpenParen).is_some() {
-			let repr = parser.parse_type_expression()?;
-			parser.next_expect(Token::CloseParen)?;
-			Some(repr)
+		// The repr is written as a struct's fields, `enum Ordering(pub i8)`.
+		// What each part may be on an enum is the checker's to say.
+		let repr = if parser.lexer.peek().inner == Token::OpenParen {
+			let fields =
+				parser.separated(PARENS, Parser::parse_struct_field)?;
+			parser.push_delimited_nodes(fields).inner
 		} else {
-			None
+			List::EMPTY
 		};
 
 		// An enum is closed: its variants are all its values. A `..` once made

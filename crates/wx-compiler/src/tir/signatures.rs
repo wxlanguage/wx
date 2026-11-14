@@ -1482,6 +1482,21 @@ fn report_missing_type_alias_body(
 		)
 }
 
+fn report_mutable_enum_repr(
+	file_id: FileId,
+	mut_span: TextSpan,
+) -> Diagnostic<FileId> {
+	Diagnostic::error()
+		.with_code(DiagnosticCode::MutableEnumRepr.code())
+		.with_message("an enum's repr cannot be `mut`")
+		.with_label(
+			SourceSpan::new(file_id, mut_span)
+				.primary_label()
+				.with_message("its value is always one of the variants"),
+		)
+		.with_note("to change the value, assign a variant: `e = Name::Variant`")
+}
+
 fn report_enum_repr_not_integer(
 	file_id: FileId,
 	span: TextSpan,
@@ -3608,8 +3623,51 @@ impl<'ast> SemanticsBuilder<'ast> {
 					unreachable!()
 				};
 
-				let repr_type = match repr {
-					Some(repr_expr) => {
+				// The repr's value is one of the variants, so it is never
+				// written in place: changing it is assigning a variant.
+				for field in ast.list(*repr) {
+					if let Some(ast::Binding::Name {
+						mut_span: Some(mut_span),
+						..
+					}) = field.binding
+					{
+						sema.diagnostics
+							.push(report_mutable_enum_repr(file_id, mut_span));
+					}
+				}
+
+				let repr_type = match ast.list(*repr) {
+					[] => {
+						sema.diagnostics
+							.push(report_missing_enum_repr(file_id, name.span));
+						TypeIndex::ERROR
+					}
+					// Several fields are a wider repr (`notes/open-enums.md`,
+					// "Deferred: enums over a wider repr").
+					[_, _, ..] => {
+						let fields = ast.spans(*repr);
+						let span = TextSpan::new(
+							fields[0].start,
+							fields[fields.len() - 1].end,
+						);
+						sema.diagnostics.push(
+							Diagnostic::bug()
+								.with_code(
+									DiagnosticCode::UnsupportedExpression
+										.code(),
+								)
+								.with_message(
+									"an enum's repr of several fields is not \
+									 supported yet",
+								)
+								.with_label(
+									SourceSpan::new(file_id, span)
+										.primary_label(),
+								),
+						);
+						TypeIndex::ERROR
+					}
+					[repr_expr] => {
 						let resolved = self.resolve_type(
 							sema,
 							obligations,
@@ -3621,7 +3679,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 									.assumption_envs
 									.of_frame(GenericEnvIdx::ROOT),
 							},
-							*repr_expr,
+							repr_expr.ty,
 							InferPolicy::Reject(InferSignatureKind::EnumRepr),
 						);
 						if resolved != TypeIndex::ERROR
@@ -3641,7 +3699,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								.unwrap();
 							let diagnostic = report_enum_repr_not_integer(
 								file_id,
-								self.ast(file_id).type_span(*repr_expr),
+								self.ast(file_id).type_span(repr_expr.ty),
 								name,
 								sema.decls.declaration_span(typeset.loc),
 							);
@@ -3650,11 +3708,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						} else {
 							resolved
 						}
-					}
-					None => {
-						sema.diagnostics
-							.push(report_missing_enum_repr(file_id, name.span));
-						TypeIndex::ERROR
 					}
 				};
 
@@ -10457,6 +10510,35 @@ pub(super) mod tests {
 				builder.build(sema);
 			},
 		);
+	}
+
+	#[test]
+	fn an_enum_repr_is_a_field_that_cannot_be_mut() {
+		// A name, `_` and `pub` are a struct field's, and mean the same here.
+		let case = TestCase::new(
+			"enum A(value: i8) { X = 0 } enum B(_: i8) { X = 0 } \
+			 pub enum C(pub i8) { X = 0 }",
+		);
+		case.diagnostics().assert_none();
+
+		// The repr is still read, so the enum keeps its type.
+		let case = TestCase::new("enum E(mut value: i8) { X = 0 }");
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MutableEnumRepr]);
+		assert_eq!(case.sema.enums.last().unwrap().repr, TypeIndex::I8);
+	}
+
+	#[test]
+	fn an_enum_repr_of_several_fields_is_not_supported_yet() {
+		// `TestCase` drops E2114, which is the claim here.
+		let mut strings = Keyword::create_interner();
+		let graph = source_graph(
+			"enum Direction(dx: i8, dy: i8) { Up = 0 }",
+			&mut strings,
+		);
+		let sema = crate::tir::check(&graph, &mut strings);
+		DiagnosticView::new("signature", &sema.diagnostics, &graph.files)
+			.assert_error_saying("an enum's repr of several fields");
 	}
 
 	#[test]

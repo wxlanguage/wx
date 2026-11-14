@@ -258,8 +258,13 @@ impl<'a> Printer<'a> {
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
-					.chain(repr.map(|repr| {
-						Sexp::head("repr", [Sexp::atom(self.ty(repr))])
+					.chain(self.ast.list(repr).iter().map(|field| {
+						Sexp::head(
+							"repr",
+							self.visibility(field.pub_span)
+								.into_iter()
+								.chain(self.bound_to(field.binding, field.ty)),
+						)
 					}))
 					.chain(self.ast.list(variants).iter().map(|variant| {
 						match *variant {
