@@ -12,59 +12,49 @@
 // `from_bits` calls like the original — wx doesn't constant-fold `from_bits`, so a literal
 // avoids paying a runtime instruction for an always-the-same value.
 
-pub func scalbnf(x: f32, n: i32) -> f32 {
-    local mut x: f32 = x;
-    local mut n: i32 = n;
-
+pub func scalbnf(mut x: f32, mut n: i32) -> f32 {
     if n > 127 {
         // 2^Emax (0x1p127)
-        x = x * 1.7014118346046923e38;
-        n = n - 127;
+        x *= 1.7014118346046923e38;
+        n -= 127;
         if n > 127 {
-            x = x * 1.7014118346046923e38;
-            n = n - 127;
+            x *= 1.7014118346046923e38;
+            n -= 127;
             if n > 127 { n = 127 };
         }
-    } else {
+    } else if n < -126 {
+        // 2^Emin * 2^sig_total_bits (0x1p-126 * 0x1p24) — the largest prescale that
+        // still can't push `x` subnormal, avoiding double rounding.
+        x *= 1.1754943508222875e-38 * 16777216.0;
+        n += 126 - 24;
         if n < -126 {
-            // 2^Emin * 2^sig_total_bits (0x1p-126 * 0x1p24) — the largest prescale that
-            // still can't push `x` subnormal, avoiding double rounding.
-            x = x * 1.1754943508222875e-38 * 16777216.0;
-            n = n + 126 - 24;
-            if n < -126 {
-                x = x * 1.1754943508222875e-38 * 16777216.0;
-                n = n + 126 - 24;
-                if n < -126 { n = -126 };
-            }
+            x *= 1.1754943508222875e-38 * 16777216.0;
+            n += 126 - 24;
+            if n < -126 { n = -126 };
         }
     }
 
     x * f32::from_bits(transmute::<_, u32>(127 + n) << 23)
 }
 
-pub func scalbn(x: f64, n: i32) -> f64 {
-    local mut x = x;
-    local mut n = n;
-
+pub func scalbn(mut x: f64, mut n: i32) -> f64 {
     if n > 1023 {
         // 2^Emax (0x1p1023)
-        x = x * 8.98846567431158e307;
-        n = n - 1023;
+        x *= 8.98846567431158e307;
+        n -= 1023;
         if n > 1023 {
-            x = x * 8.98846567431158e307;
-            n = n - 1023;
+            x *= 8.98846567431158e307;
+            n -= 1023;
             if n > 1023 { n = 1023 };
         }
-    } else {
+    } else if n < -1022 {
+        // 2^Emin * 2^sig_total_bits (0x1p-1022 * 0x1p53)
+        x *= 2.2250738585072014e-308 * 9007199254740992.0;
+        n += 1022 - 53;
         if n < -1022 {
-            // 2^Emin * 2^sig_total_bits (0x1p-1022 * 0x1p53)
-            x = x * 2.2250738585072014e-308 * 9007199254740992.0;
-            n = n + 1022 - 53;
-            if n < -1022 {
-                x = x * 2.2250738585072014e-308 * 9007199254740992.0;
-                n = n + 1022 - 53;
-                if n < -1022 { n = -1022 };
-            }
+            x *= 2.2250738585072014e-308 * 9007199254740992.0;
+            n += 1022 - 53;
+            if n < -1022 { n = -1022 };
         }
     }
 
