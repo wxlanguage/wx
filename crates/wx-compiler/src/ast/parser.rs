@@ -1079,7 +1079,7 @@ impl<'ctx> Parser<'ctx> {
 			if parser.lexer.peek().inner != Token::Hash {
 				break;
 			}
-			parser.lexer.next();
+			let hash = parser.lexer.next().span;
 			let open_bracket = parser.next_expect(Token::OpenBracket)?;
 			let name_token = parser.lexer.peek();
 			if !matches!(
@@ -1117,16 +1117,19 @@ impl<'ctx> Parser<'ctx> {
 				));
 				return Err(());
 			}
-			parser.lexer.next();
-			attrs.push(Attribute {
-				name: Spanned {
-					inner: name_symbol,
-					span: name_span,
+			let close = parser.lexer.next().span;
+			attrs.push(Spanned {
+				inner: Attribute {
+					name: Spanned {
+						inner: name_symbol,
+						span: name_span,
+					},
+					value,
 				},
-				value,
+				span: TextSpan::new(hash.start, close.end),
 			});
 		}
-		Ok(parser.ast.push_list(attrs))
+		Ok(parser.ast.push_nodes(attrs))
 	}
 
 	/// `({ name: value, .. })`, as a call by name writes its arguments. The

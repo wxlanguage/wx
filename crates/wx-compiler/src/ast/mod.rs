@@ -873,6 +873,14 @@ impl ImplItem {
 			ImplItem::Constant { .. } | ImplItem::AssocType { .. } => false,
 		}
 	}
+
+	pub fn attributes(&self) -> List<Attribute> {
+		match *self {
+			ImplItem::Function { attributes, .. }
+			| ImplItem::Constant { attributes, .. }
+			| ImplItem::AssocType { attributes, .. } => attributes,
+		}
+	}
 }
 
 impl TraitItem {
@@ -882,6 +890,14 @@ impl TraitItem {
 		match self {
 			TraitItem::Function { body, .. } => body.is_some(),
 			TraitItem::Const { .. } | TraitItem::AssociatedType { .. } => false,
+		}
+	}
+
+	pub fn attributes(&self) -> List<Attribute> {
+		match *self {
+			TraitItem::Function { attributes, .. }
+			| TraitItem::Const { attributes, .. }
+			| TraitItem::AssociatedType { attributes, .. } => attributes,
 		}
 	}
 }
@@ -1192,6 +1208,34 @@ impl Item {
 		}
 	}
 
+	/// The item's attributes; empty for kinds that carry none.
+	pub fn attributes(&self) -> List<Attribute> {
+		match *self {
+			Item::Function { attributes, .. }
+			| Item::FunctionDeclaration { attributes, .. }
+			| Item::PackageFunction { attributes, .. }
+			| Item::PackageConst { attributes, .. }
+			| Item::PackageType { attributes, .. }
+			| Item::Trait { attributes, .. }
+			| Item::TypeSet { attributes, .. }
+			| Item::Const { attributes, .. }
+			| Item::Global { attributes, .. }
+			| Item::Enum { attributes, .. }
+			| Item::TypeAlias { attributes, .. }
+			| Item::Memory { attributes, .. }
+			| Item::Struct { attributes, .. } => attributes,
+			Item::Export { .. }
+			| Item::ExportBlock { .. }
+			| Item::Import { .. }
+			| Item::InherentImpl { .. }
+			| Item::TraitImpl { .. }
+			| Item::Module { .. }
+			| Item::ModuleDeclaration { .. }
+			| Item::PackageInstance { .. }
+			| Item::Use { .. } => List::EMPTY,
+		}
+	}
+
 	/// Backfills the attributes parsed ahead of an item onto whichever item
 	/// kinds carry an `attributes` field. No-op for kinds that don't.
 	pub fn set_attributes(&mut self, attrs: List<Attribute>) {
@@ -1413,7 +1457,6 @@ listed! {
 	StmtId => stmt_lists,
 	NamedArgument => named_arguments,
 	MatchArm => arms,
-	Attribute => attributes,
 	ExportEntry => export_entries,
 	Path => paths,
 }
@@ -1428,6 +1471,7 @@ columns! {
 	StructField => struct_fields,
 	EnumVariant => enum_variants,
 	ImportEntry => import_entries,
+	Attribute => attributes,
 }
 
 identified! {
@@ -1515,7 +1559,7 @@ pub struct AST {
 	struct_fields: Column<StructField>,
 	enum_variants: Column<EnumVariant>,
 	import_entries: Column<ImportEntry>,
-	attributes: Box<[Attribute]>,
+	attributes: Column<Attribute>,
 	export_entries: Box<[ExportEntry]>,
 	paths: Box<[Path]>,
 }
@@ -1553,7 +1597,7 @@ struct AstBuilder {
 	struct_fields: ColumnBuilder<StructField>,
 	enum_variants: ColumnBuilder<EnumVariant>,
 	import_entries: ColumnBuilder<ImportEntry>,
-	attributes: Vec<Attribute>,
+	attributes: ColumnBuilder<Attribute>,
 	export_entries: Vec<ExportEntry>,
 	paths: Vec<Path>,
 }
@@ -1592,7 +1636,7 @@ impl AstBuilder {
 			struct_fields: self.struct_fields.finish(),
 			enum_variants: self.enum_variants.finish(),
 			import_entries: self.import_entries.finish(),
-			attributes: self.attributes.into_boxed_slice(),
+			attributes: self.attributes.finish(),
 			export_entries: self.export_entries.into_boxed_slice(),
 			paths: self.paths.into_boxed_slice(),
 		}

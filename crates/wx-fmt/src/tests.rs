@@ -3390,6 +3390,87 @@ fn a_block_value_breaks_a_call_by_name() {
 	);
 }
 
+/// A call by name keeps the comments written among its arguments, which keep
+/// it broken: a commented-out argument, one trailing an argument, and one
+/// before the closing brace.
+#[test]
+fn comments_in_a_call_by_name_are_kept() {
+	let source = indoc! {"
+        func f() {
+            g({
+                a: 1,
+                // b: 2,
+                c: 3, // three
+                // d: 4,
+            });
+            g({ a: 1, // one
+                c: 3 });
+        }
+    "};
+	assert_eq!(
+		checked_format(source, 80, 4),
+		indoc! {"
+            func f() {
+                g({
+                    a: 1,
+                    // b: 2,
+                    c: 3, // three
+                    // d: 4,
+                });
+                g({
+                    a: 1, // one
+                    c: 3,
+                });
+            }
+        "},
+	);
+}
+
+/// A comment among an item's attributes stays where it is written: inside an
+/// attribute's arguments, trailing an attribute, between two attributes, or
+/// between the last one and the item, in a file, an impl and a trait alike.
+#[test]
+fn comments_among_attributes_are_kept() {
+	let source = indoc! {"
+        // before
+        #[memory_limits({
+            // first
+            min_pages: 1,
+            // max_pages: 4,
+        })]
+        memory heap: u32;
+
+        #[inline] // trailing
+        // between
+        #[inline]
+        // last
+        func f() {}
+
+        impl S {
+            #[inline]
+            // member
+            func g() {}
+        }
+
+        trait T {
+            #[inline]
+            // member
+            func h();
+        }
+    "};
+	assert_eq!(checked_format(source, 80, 4), source);
+}
+
+/// An attribute stays on the line above its item: a blank line the author
+/// left after it is dropped.
+#[test]
+fn no_blank_line_under_an_attribute() {
+	assert_eq!(
+		checked_format("#[inline]\n\n// c\n\nfunc f() {}\n", 80, 4),
+		"#[inline]\n// c\n\nfunc f() {}\n",
+	);
+}
+
 /// Forms that exist only in the current syntax, each written the way the
 /// formatter should leave it: a single `export`, `use` globs and groups,
 /// package instances, structs with unnamed fields, patterns that mirror construction, calls by
