@@ -33,6 +33,7 @@ use wx_compiler::tir::{
 use crate::call;
 use crate::convert::position_to_offset;
 use crate::hover;
+use crate::query;
 use crate::snapshot::Snapshot;
 use crate::state::ServerState;
 
@@ -68,7 +69,9 @@ pub(crate) fn completion(
 	// Where a `use` is written: the file, or the module or import block
 	// named at a span.
 	let use_scope = match within {
-		Within::Use(Enclosing::File) => Some(snapshot.sema.file_scope(file)),
+		Within::Use(Enclosing::File) => {
+			Some(snapshot.sema.decls.file_namespaces[file.as_usize()])
+		}
 		Within::Use(Enclosing::Name(name)) => {
 			let Definition::Item(loc) =
 				snapshot.declared_at(SourceSpan::new(file, name))?
@@ -104,9 +107,11 @@ pub(crate) fn completion(
 	let mut argument_types = None;
 	let names = match site {
 		Site::Name(used_as) => match within {
-			Within::Body(_) => {
-				sema.names_at(sema.body_of(declaration?)?, offset, used_as)
-			}
+			Within::Body(_) => sema.names_at(
+				query::body_of(sema, declaration?)?,
+				offset,
+				used_as,
+			),
 			Within::Signature(_) => {
 				sema.names_in_signature(declaration?, used_as)
 			}
@@ -115,7 +120,7 @@ pub(crate) fn completion(
 		// What the prefix means, as checking resolved it; a prefix that did
 		// not resolve has nothing after it.
 		Site::Segment { prefix, used_as } => {
-			let (_, reference) = sema.symbol_at(file, prefix.start)?;
+			let (_, reference) = query::symbol_at(sema, file, prefix.start)?;
 			let Definition::Item(prefix) = reference.definition() else {
 				return None;
 			};
@@ -127,7 +132,7 @@ pub(crate) fn completion(
 		}
 		// A name a group lists already would be bound twice.
 		Site::Import { prefix, written } => {
-			let (_, reference) = sema.symbol_at(file, prefix.start)?;
+			let (_, reference) = query::symbol_at(sema, file, prefix.start)?;
 			let Definition::Item(prefix) = reference.definition() else {
 				return None;
 			};
@@ -137,13 +142,13 @@ pub(crate) fn completion(
 				.collect()
 		}
 		Site::Member { object } => {
-			let owner = sema.body_of(declaration?)?;
+			let owner = query::body_of(sema, declaration?)?;
 			let body = sema.owner_body(owner)?;
 			let receiver = body.operand_ty(body.operand_of(ast, object)?);
 			sema.member_names(&snapshot.strings, owner, receiver)
 		}
 		Site::Label(jump) => {
-			let owner = sema.body_of(declaration?)?;
+			let owner = query::body_of(sema, declaration?)?;
 			let body = sema.owner_body(owner)?;
 			body.labels_at(offset)
 				.into_iter()
@@ -167,7 +172,7 @@ pub(crate) fn completion(
 			entry,
 			written,
 		} => {
-			let (_, reference) = sema.symbol_at(file, bound.start)?;
+			let (_, reference) = query::symbol_at(sema, file, bound.start)?;
 			let Definition::Item(bound) = reference.definition() else {
 				return None;
 			};
@@ -190,12 +195,11 @@ pub(crate) fn completion(
 			given,
 			written,
 		} => {
-			let (_, reference) = sema.symbol_at(file, callee.start)?;
+			let (_, reference) = query::symbol_at(sema, file, callee.start)?;
 			let names = sema.argument_names(reference.definition(), given);
 			// Names and visibility still come from the checker's contract.
 			// Only their displayed types use this call's inferred arguments.
-			argument_types = sema
-				.body_of(declaration?)
+			argument_types = query::body_of(sema, declaration?)
 				.and_then(|owner| {
 					call::signature(sema, &snapshot.strings, owner, ast, call)
 				})
@@ -266,7 +270,7 @@ impl Within {
 }
 
 /// A declaration, by the one span of it the checker keeps: an item's name
-/// (a member's included), an impl's target path (`Semantics::impls`).
+/// (a member's included), an impl's target path (`query::impls`).
 #[derive(Clone, Copy)]
 pub(crate) enum Anchor {
 	Name(TextSpan),

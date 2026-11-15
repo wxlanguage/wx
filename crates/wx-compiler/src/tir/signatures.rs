@@ -521,7 +521,7 @@ pub struct Semantics {
 	pub(super) numbers: NumberStorage,
 	pub(super) diagnostics: Vec<Diagnostic<FileId>>,
 	/// Every written name resolved so far; see `resolutions.rs`.
-	pub(super) resolutions: NameResolutions,
+	pub resolutions: NameResolutions,
 	/// The engine's state; its queries are `Semantics`' methods, so that one
 	/// can re-enter body checking.
 	pub(super) solver: Solver,
@@ -632,23 +632,6 @@ impl Semantics {
 	/// were found.
 	pub fn diagnostics(&self) -> &[Diagnostic<FileId>] {
 		&self.diagnostics
-	}
-
-	/// The function's own parameter frame, or the empty root frame when its
-	/// signature uses an enclosing impl's or trait's frame instead.
-	pub fn function_own_type_params(
-		&self,
-		function: FunctionIdx,
-	) -> GenericEnvIdx {
-		let env = self.functions[usize::from(function)].type_params;
-		if env != GenericEnvIdx::ROOT
-			&& self.generic_envs.owner(env)
-				== GenericEnvOwner::Function(function)
-		{
-			env
-		} else {
-			GenericEnvIdx::ROOT
-		}
 	}
 
 	/// The trait an impl implements, if its written trait name resolved.

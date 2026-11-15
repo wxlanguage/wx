@@ -32,6 +32,7 @@ use wx_compiler::vfs::FileId;
 use crate::convert::{
 	byte_offset_to_utf16_offset, byte_to_position, position_to_offset,
 };
+use crate::query;
 use crate::snapshot::Snapshot;
 
 /// The token types, in legend order: a token's type is its index here.
@@ -128,7 +129,7 @@ pub(crate) fn tokens(
 	// even when it is not coloured itself.
 	let mut tokens: BTreeMap<TextSpan, Option<(TokenType, u32)>> =
 		BTreeMap::new();
-	for (span, reference) in snapshot.sema.resolutions_in(file) {
+	for (span, reference) in query::resolutions_in(&snapshot.sema, file) {
 		let span = span.span;
 		if !wanted(span) {
 			continue;
@@ -214,7 +215,7 @@ fn classify(
 ) -> Option<(TokenType, u32)> {
 	let sema = &snapshot.sema;
 	let decls = &sema.decls;
-	let default_library = match sema.is_compiler_provided(definition) {
+	let default_library = match query::is_compiler_provided(sema, definition) {
 		true => DEFAULT_LIBRARY,
 		false => 0,
 	};

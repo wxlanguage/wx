@@ -1,6 +1,6 @@
 //! Hover text, rendered here from the compiler's resolved names and tables.
 //!
-//! The compiler answers what a name means (`Semantics::symbol_at`) and
+//! The compiler records what a name means (`query::symbol_at` reads it) and
 //! exposes its declarations, signatures and type formatter; everything about
 //! how that reads on screen is decided in this module.
 
@@ -8,8 +8,8 @@ use string_interner::symbol::SymbolU32;
 use wx_compiler::ast::{Keyword, Spanned, StringInterner};
 use wx_compiler::tir::{
 	AssocTypeIdx, ConstIdx, ConstScalar, DeclKind, Definition, FieldIdx,
-	FieldOwner, FunctionIdx, GenericEnvIdx, MemberKind, MemberOwner, Semantics,
-	StructIdx, Type, TypesetIdx, Val,
+	FieldOwner, FunctionIdx, GenericEnvIdx, GenericEnvOwner, MemberKind,
+	MemberOwner, Semantics, StructIdx, Type, TypesetIdx, Val,
 };
 use wx_compiler::vfs::Files;
 
@@ -296,11 +296,23 @@ impl Renderer<'_> {
 		format!("<{}>", params.join(", "))
 	}
 
-	/// `head`, followed by the bounds written on `definition`, if any.
+	/// `head`, followed by the bounds written on `definition`, if any. A
+	/// trait's own `Self` is bounded by the trait itself.
 	fn bounded(&self, head: String, definition: Definition) -> String {
-		match self.sema.display_written_bounds(self.strings, definition) {
-			Some(bounds) => format!("{head}: {bounds}"),
-			None => head,
+		if let Definition::TypeParam { env, index: 0 } = definition
+			&& let GenericEnvOwner::Trait(trait_index) =
+				self.sema.generic_envs.owner(env)
+		{
+			let name = self.name(self.sema.decls.name(trait_index));
+			return format!("{head}: {name}");
+		}
+		let bounds = self.sema.written_bounds(definition);
+		let bounds =
+			(self.sema.bound_formatter(self.strings)).display_bounds(&bounds);
+		if bounds.is_empty() {
+			head
+		} else {
+			format!("{head}: {bounds}")
 		}
 	}
 
@@ -322,6 +334,20 @@ impl Renderer<'_> {
 		)
 	}
 
+	/// The function's own parameter frame, or the empty root frame when its
+	/// signature uses an enclosing impl's or trait's frame instead.
+	fn own_type_params(&self, function: FunctionIdx) -> GenericEnvIdx {
+		let env = self.sema.functions[usize::from(function)].type_params;
+		if env != GenericEnvIdx::ROOT
+			&& self.sema.generic_envs.owner(env)
+				== GenericEnvOwner::Function(function)
+		{
+			env
+		} else {
+			GenericEnvIdx::ROOT
+		}
+	}
+
 	fn function(&self, function: FunctionIdx) -> String {
 		let decl = &self.sema.decls.functions[usize::from(function)];
 		let signature = &self.sema.functions[usize::from(function)];
@@ -339,7 +365,7 @@ impl Renderer<'_> {
 		format!(
 			"func {}{}({}) -> {}",
 			self.name(self.sema.decls.item(decl.loc).name),
-			self.type_params(self.sema.function_own_type_params(function)),
+			self.type_params(self.own_type_params(function)),
 			params.join(", "),
 			self.ty(signature.return_type)
 		)

@@ -21,6 +21,7 @@ use crate::convert::{
 use crate::diagnostics::diagnostic_locations;
 use crate::hover;
 use crate::projects::{ManifestState, discover_package_root};
+use crate::query;
 use crate::semantic_tokens;
 use crate::snapshot::load_compilation;
 use crate::state::ServerState;
@@ -37,7 +38,7 @@ pub(crate) fn goto_definition(
 	let files = &snapshot.compilation.files;
 	let offset = position_to_offset(files, file, position.position)?;
 	let (_, definition) = snapshot.definition_at(file, offset)?;
-	let definition = snapshot.sema.definition_target(definition)?;
+	let definition = query::definition_target(&snapshot.sema, definition)?;
 	Some(GotoDefinitionResponse::Scalar(Location {
 		uri: file_id_to_uri(files, definition.file_id)?,
 		range: span_to_range(files, definition)?,
@@ -55,7 +56,7 @@ pub(crate) fn references(
 	let files = &snapshot.compilation.files;
 	let offset = position_to_offset(files, file, position.position)?;
 	let (_, definition) = snapshot.definition_at(file, offset)?;
-	let mut spans = snapshot.sema.references_to(definition);
+	let mut spans = query::references_to(&snapshot.sema, definition);
 	if params.context.include_declaration
 		&& let Some(span) = snapshot.sema.definition_span(definition)
 		&& span.span.start != span.span.end

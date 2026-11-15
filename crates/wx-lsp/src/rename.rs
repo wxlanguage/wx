@@ -30,6 +30,7 @@ use wx_compiler::tir::{DeclKind, Definition, Reference};
 use wx_compiler::vfs::{FileId, FileOrigin};
 
 use crate::convert::{file_id_to_uri, position_to_offset, span_to_range};
+use crate::query;
 use crate::snapshot::Snapshot;
 use crate::state::ServerState;
 
@@ -74,7 +75,7 @@ pub(crate) fn rename(
 	let files = &snapshot.compilation.files;
 	let old = target.old.as_str();
 	let old_symbol = snapshot.strings.get(old);
-	let mut spans = sema.references_to(target.definition);
+	let mut spans = query::references_to(sema, target.definition);
 	spans.push(target.declaration);
 	spans.sort_unstable();
 	spans.dedup();
@@ -113,7 +114,7 @@ pub(crate) fn rename(
 			Some(Side::Label) => format!("{new}: {old}"),
 			Some(Side::Value) => format!("{old}: {new}"),
 			None if old_symbol.is_some_and(|symbol| {
-				sema.exported_under_own_name(symbol, span)
+				query::exported_under_own_name(sema, symbol, span)
 			}) =>
 			{
 				format!("{new} as \"{old}\"")
@@ -178,7 +179,7 @@ fn target(
 		));
 	}
 	// Go-to-definition leads to a module's own file instead of its name.
-	if sema.definition_target(definition) != Some(declaration) {
+	if query::definition_target(sema, definition) != Some(declaration) {
 		return Err(format!(
 			"`{old}` is a module in a file of its own, which renaming does \
 			 not move yet"
@@ -216,12 +217,12 @@ fn shorthand_side(
 ) -> Option<Side> {
 	let sema = &snapshot.sema;
 	let (mut ours_label, mut other, mut other_label) = (false, false, false);
-	for reference in sema.references_at(span) {
+	for reference in query::references_at(sema, span) {
 		let label = matches!(
 			reference,
 			Reference::Field { .. } | Reference::Parameter { .. }
 		);
-		if sema.same_definition(reference.definition(), definition) {
+		if query::same_definition(sema, reference.definition(), definition) {
 			ours_label |= label;
 		} else {
 			other = true;
@@ -229,10 +230,9 @@ fn shorthand_side(
 		}
 	}
 	// A pattern's shorthand binds a local where it names the field.
-	if snapshot
-		.declared_at(span)
-		.is_some_and(|declared| !sema.same_definition(declared, definition))
-	{
+	if snapshot.declared_at(span).is_some_and(|declared| {
+		!query::same_definition(sema, declared, definition)
+	}) {
 		other = true;
 	}
 	match (other, ours_label, other_label) {

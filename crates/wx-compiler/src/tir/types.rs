@@ -1578,7 +1578,7 @@ pub(super) struct Substitution<'a> {
 /// array — so `name`/`file_id` can reach straight into `decls.structs[..]`. Constants and enums are also represented for
 /// diagnostics, even though they currently have no type parameters.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum GenericEnvOwner {
+pub enum GenericEnvOwner {
 	Constant(ConstIdx),
 	Enum(EnumIdx),
 	Struct(StructIdx),
@@ -1721,7 +1721,7 @@ impl GenericEnvIdx {
 	/// below rather than on the arena that produces the rest — built via the
 	/// tuple constructor directly since `GenericEnvIdx::new` isn't `const fn`,
 	/// the one place within this module that's allowed to reach past it.
-	pub(super) const ROOT: GenericEnvIdx = GenericEnvIdx(0);
+	pub const ROOT: GenericEnvIdx = GenericEnvIdx(0);
 }
 
 impl GenericEnvArena {
@@ -1825,7 +1825,7 @@ impl GenericEnvArena {
 	}
 
 	#[inline]
-	pub(super) fn owner(&self, env: GenericEnvIdx) -> GenericEnvOwner {
+	pub fn owner(&self, env: GenericEnvIdx) -> GenericEnvOwner {
 		match &self.envs[usize::from(env)] {
 			GenericEnv::Frame { owner, .. } => *owner,
 			_ => unreachable!(),

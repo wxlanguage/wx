@@ -45,13 +45,15 @@ use self::impls::ImplDispatch;
 pub use self::literals::{
 	StringLiteralError, StringLiteralErrorKind, unescape_string_literal,
 };
-use self::resolutions::NameResolutions;
 pub use self::resolutions::{
-	AccessKind, BindingName, Definition, Reference, Route,
+	AccessKind, BindingName, Definition, NameResolutions, Reference, Route,
+	Site,
 };
 pub use self::signatures::Semantics;
 use self::signatures::SemanticsBuilder;
-pub use self::types::{GenericArgs, GenericEnvIdx, Primitive, Type, TypeIndex};
+pub use self::types::{
+	GenericArgs, GenericEnvIdx, GenericEnvOwner, Primitive, Type, TypeIndex,
+};
 
 /// Checks declarations and bodies into a live [`Semantics`], which holds
 /// their diagnostics. Parser and package diagnostics remain available on

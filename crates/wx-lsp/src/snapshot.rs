@@ -17,6 +17,7 @@ use crate::convert::file_id_to_uri;
 use crate::diagnostics::{AnalysisResult, add_compiler_diagnostic};
 use crate::documents::{OpenDocument, OverlayFileSource};
 use crate::projects::{ManifestState, ProjectState};
+use crate::query;
 use crate::trace::Trace;
 
 pub(crate) struct Snapshot {
@@ -25,7 +26,7 @@ pub(crate) struct Snapshot {
 	pub(crate) sema: Semantics,
 	/// Every declared name, by where it is written.
 	definitions: BTreeMap<SourceSpan, Definition>,
-	/// Every impl, by its target's path (`Semantics::impls`), the one span
+	/// Every impl, by its target's path (`query::impls`), the one span
 	/// an impl keeps.
 	impls: BTreeMap<SourceSpan, Definition>,
 }
@@ -49,8 +50,8 @@ impl Snapshot {
 		)?;
 		let sema =
 			trace.step("check", || tir::check(&compilation, &mut strings));
-		let definitions = sema.definitions();
-		let impls = sema.impls().collect();
+		let definitions = query::definitions(&sema);
+		let impls = query::impls(&sema).collect();
 		Ok(Self {
 			compilation,
 			strings,
@@ -68,7 +69,9 @@ impl Snapshot {
 		file: FileId,
 		offset: u32,
 	) -> Option<(SourceSpan, Definition)> {
-		if let Some((span, reference)) = self.sema.symbol_at(file, offset) {
+		if let Some((span, reference)) =
+			query::symbol_at(&self.sema, file, offset)
+		{
 			return Some((span, reference.definition()));
 		}
 		let probe = SourceSpan::new(
@@ -122,7 +125,9 @@ impl Snapshot {
 		self.definitions
 			.iter()
 			.filter(|(span, _)| span.file_id == file)
-			.filter_map(|(_, &definition)| self.sema.body_of(definition))
+			.filter_map(|(_, &definition)| {
+				query::body_of(&self.sema, definition)
+			})
 			.find(|&owner| {
 				self.sema
 					.owner_body(owner)

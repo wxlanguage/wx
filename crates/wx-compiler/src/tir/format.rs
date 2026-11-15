@@ -28,8 +28,7 @@ use super::decls::{
 use super::resolutions::Definition;
 use super::signatures::Semantics;
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, GenericEnvOwner, Type, TypeIndex,
-	TypeInterner,
+	GenericEnvArena, GenericEnvIdx, Type, TypeIndex, TypeInterner,
 };
 
 /// The bytes a type may take in a message, as rustc shortens a long type.
@@ -83,26 +82,8 @@ impl Semantics {
 impl Semantics {
 	/// The bounds written on `definition`, as written: a type parameter's,
 	/// an associated type declaration's, a trait's or a typeset's
-	/// supertraits. What they imply is left out, and a trait's own `Self` is
-	/// the trait itself. `None` when nothing is written.
-	pub fn display_written_bounds(
-		&self,
-		strings: &StringInterner,
-		definition: Definition,
-	) -> Option<String> {
-		if let Definition::TypeParam { env, index: 0 } = definition
-			&& let GenericEnvOwner::Trait(trait_index) =
-				self.generic_envs.owner(env)
-		{
-			let name = self.decls.name(trait_index).inner;
-			return Some(strings.resolve(name)?.to_string());
-		}
-		let bounds = self.written_bounds(definition);
-		let bounds = self.bound_formatter(strings).display_bounds(&bounds);
-		(!bounds.is_empty()).then_some(bounds)
-	}
-
-	fn written_bounds(&self, definition: Definition) -> Vec<BoundId> {
+	/// supertraits. What they imply is left out.
+	pub fn written_bounds(&self, definition: Definition) -> Vec<BoundId> {
 		match definition {
 			Definition::TypeParam { env, index } => {
 				let subject =

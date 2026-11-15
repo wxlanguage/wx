@@ -16,7 +16,7 @@ macro_rules! index_newtype {
 
 		impl $name {
 			#[inline]
-			pub(crate) fn new(index: u32) -> Self {
+			pub fn new(index: u32) -> Self {
 				Self(index)
 			}
 		}

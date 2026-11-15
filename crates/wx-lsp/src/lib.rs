@@ -7,6 +7,7 @@ mod diagnostics;
 mod documents;
 mod hover;
 mod projects;
+mod query;
 mod rename;
 mod requests;
 mod semantic_tokens;

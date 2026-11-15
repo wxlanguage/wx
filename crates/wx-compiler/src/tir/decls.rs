@@ -1094,7 +1094,7 @@ impl AstNodeRef {
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub(super) struct ExportEntrySource {
+pub struct ExportEntrySource {
 	pub namespace: Scope,
 	pub name: Spanned<SymbolU32>,
 	pub external_span: SourceSpan,
@@ -1132,7 +1132,7 @@ pub struct Declarations {
 	pub modules: Vec<ModuleDecl>,
 	pub imports: Vec<ImportDecl>,
 	/// Selected crate's compilation exports, keyed by decoded external name.
-	pub(super) exports: FxHashMap<SymbolU32, ExportEntrySource>,
+	pub exports: FxHashMap<SymbolU32, ExportEntrySource>,
 	/// The entry each host-imported declaration is written in, by its row.
 	#[cfg_attr(any(debug_assertions, test), serde(skip))]
 	pub(super) import_entries: FxHashMap<ItemLoc, ImportEntry>,
@@ -2642,8 +2642,22 @@ impl Declarations {
 	}
 
 	/// The name `index`'s declaration is written with, from its row.
-	pub(super) fn name(&self, index: impl Declared) -> Spanned<SymbolU32> {
+	pub fn name(&self, index: impl Declared) -> Spanned<SymbolU32> {
 		self.item(index.loc(self)).name
+	}
+
+	/// Whether `function` is one of core's package functions, which the
+	/// compiler fulfils as core's instantiator (`transmute`, the intrinsics).
+	pub fn is_core_package_function(&self, function: FunctionIdx) -> bool {
+		// Only a package function enters a contract, so core's entry under
+		// this function's name being this function makes it one.
+		let name = BindingKey::value(self.name(function).inner);
+		self.package_contracts[self.namespaces.core_package().as_usize()]
+			.members
+			.get(&name)
+			.is_some_and(|member| {
+				member.item == PackageMemberItem::Function(function)
+			})
 	}
 
 	/// Returns the registry alongside `ast_nodes` — every top-level item in

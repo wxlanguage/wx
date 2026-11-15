@@ -1245,10 +1245,14 @@ mod tests {
 			);
 		});
 		let mut checked = 0;
-		for (span, reference) in case.sema.resolutions_in(case.file) {
+		for (site, &reference) in &case.sema.resolutions.by_site {
+			let span = site.span();
 			let Reference::Local { owner, local, .. } = reference else {
 				continue;
 			};
+			if span.file_id != case.file {
+				continue;
+			}
 			let body = case.sema.owner_body(owner).unwrap();
 			let offered = body.locals_at(span.span.start);
 			let name = body.local(local).name.inner;
@@ -1619,7 +1623,16 @@ mod tests {
 			body.local_named_at(at, body.local(LocalIdx::new(0)).name.inner);
 		assert_eq!(found, Some(LocalIdx::new(0)));
 		// The checker's lookup recorded the same local for that use.
-		let (_, reference) = case.sema.symbol_at(case.file, at).unwrap();
+		let (_, &reference) = case
+			.sema
+			.resolutions
+			.by_site
+			.iter()
+			.find(|(site, _)| {
+				let span = site.span();
+				span.file_id == case.file && span.span.start == at
+			})
+			.unwrap();
 		assert!(matches!(
 			reference,
 			Reference::Local { local, .. } if local == LocalIdx::new(0)
