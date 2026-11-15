@@ -507,6 +507,9 @@ pub enum ConstArgument {
 		segments: List<PathSegment>,
 	},
 	Infer,
+	/// A length the parser expected and did not find (`[u8; ]`), spanning
+	/// the gap up to the `]`.
+	Error,
 }
 
 /// A parameter of a function type, `func(i32, self: T)`, named or not.

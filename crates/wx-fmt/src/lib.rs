@@ -2869,6 +2869,7 @@ impl<'a> Builder<'a> {
 				match self.ast.constant(constant) {
 					ast::ConstArgument::Literal(_)
 					| ast::ConstArgument::Infer => self.build_const_argument(constant),
+					ast::ConstArgument::Error => unreachable!(),
 					// Without its marker, a path is read as a type.
 					ast::ConstArgument::Path(_)
 					| ast::ConstArgument::QualifiedPath { .. }
@@ -2890,6 +2891,7 @@ impl<'a> Builder<'a> {
 			ast::ConstArgument::Literal(_) | ast::ConstArgument::Infer => {
 				self.source_text(ast.const_span(constant))
 			}
+			ast::ConstArgument::Error => unreachable!(),
 			ast::ConstArgument::Path(path) => {
 				self.build_value_path(ast.list(path))
 			}

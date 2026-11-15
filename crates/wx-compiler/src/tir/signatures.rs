@@ -3977,6 +3977,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			ast::ConstArgument::Literal(ast::Literal::Int(bits)) => {
 				return sema.types.intern(Type::Value { bits });
 			}
+			// Reported by the parser.
+			ast::ConstArgument::Error => return TypeIndex::ERROR,
 			ast::ConstArgument::Infer => match infer_policy {
 				InferPolicy::Allow => return TypeIndex::INFER,
 				InferPolicy::Reject(kind) => {

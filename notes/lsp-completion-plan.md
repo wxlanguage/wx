@@ -1,7 +1,7 @@
 # LSP completion
 
-Status: steps 1 to 5 and `use` trees done (2026-11-14, branch
-`tir-refactor`); members through a type (`Point::`) next, then step 6.
+Status: steps 1 to 5, `use` trees and members through a type (`Point::`)
+done (2026-11-15, branch `tir-refactor`); step 6 next.
 Supersedes `lsp-completions.md`, a session log from the removed `wx-lsp-next`
 crate, kept for history.
 
@@ -67,9 +67,11 @@ without `as` (`ast/mod.rs`, `decls.rs`'s early return on the error alias).
   member and lose that statement.
 - Covered: member access (field, method), expression paths, pattern paths,
   type paths, use trees (`use a::;` is a `Name` leaf with the error symbol;
-  import resolution resolves its prefix and binds nothing). Not yet: a
-  bound's path (`parse_type_path`), `<T as Tr>::`, `expr::` after a
-  non-path (`parse_type_application_expression`).
+  import resolution resolves its prefix and binds nothing), and the
+  segment after a bracketed root (`<T as Tr>::`, `<T>::`) in an
+  expression, a type and a const argument. Not yet: a bound's path
+  (`parse_type_path`), `expr::` after a non-path
+  (`parse_type_application_expression`).
 - The checker selects nothing for a missing name and reports nothing more:
   `PathSegment::is_missing` is checked where a lookup's failure is reported
   (`PathResolver`'s walk, `type_member_found`, `select_member`,
@@ -381,6 +383,39 @@ that inserts the ascription.
      that span so `operand_of` finds the call result. Tests also cover empty
      constructors, function items called through locals, function references
      and `Call` implementations, including the packed tuples' exact spans.
+   - 5d, done: members through a type, `Semantics::type_member_names`
+     (`tir/members.rs`). The prefix's last segment is read from
+     `NameResolutions`; its type is the one `resolve_value_path` reads for
+     that name (`named_type`: a struct, a generic one with its arguments
+     unknown, an enum, a primitive or non-generic alias, a type parameter,
+     an impl's `Self`), and arguments written on the prefix are not read.
+     Candidates from `member_candidates` (`method_candidates` with a tier),
+     each kept when `resolve_applicable_member` finds it and
+     `member_accessible` allows it: functions, methods and constants as a
+     value, associated types as a type. A receiver with holes reads its
+     inherent impls through `inherent_candidates_with_holes`, moved from
+     `BodyBuilder` to `Semantics`. The server adds them after an enum's
+     variants (a variant hides a member of its name) and inserts a method's
+     `self` as an argument (`Point::flip($1)`). Tests: agreement with every
+     value path the checker resolved, and exact lists, in `tir/members.rs`;
+     server tests in `wx-lsp/src/tests.rs`.
+   - 5e, done: after a trait-qualified root, `<T as Tr>::`, in a body or a
+     signature. No type is needed: the checker looks the name up in `Tr`'s
+     own declarations only (`resolve_trait_member_declaration`, not its
+     supertraits') and checks that `T` implements `Tr` apart, so the
+     candidates are `Semantics::trait_member_names(trait, used_as)`, the
+     trait read from the name recorded at its path. A value offers its
+     functions, methods and constants, a type its associated types, an
+     array's length its constants alone (`select_qualified_constant`). A
+     constant argument is a position of its own, `NameUse::Constant`: it
+     takes constants and variants, lists the modules, structs, enums and
+     aliases a path to one goes through, and `NameUse::takes_member` says
+     which members each position takes, after a type or a trait alike; so
+     `[u8; S|]`, `[u8; Kind::|]` and `[u8; Point::|]` offer constants only.
+     A length not written yet (`[u8; ]`, `[v; ]`) is kept as
+     `ConstArgument::Error` spanning the gap, as a missing type is, and is a
+     constant's name there. A segment after a member (`<T as Tr>::Item::`)
+     and `<T>::` are not completed.
 6. Later: ranking by the expected type (the checker has `Expected` but does
    not keep it), `completionItem/resolve` through `hover::signature`, the
    E2002 code action.

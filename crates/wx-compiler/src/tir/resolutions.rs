@@ -436,7 +436,7 @@ impl Semantics {
 	/// Where `owner`'s signature is read: the scope its declaration is
 	/// written in, and its generic env, which holds its own type parameters
 	/// and those of its trait or impl (see `names_in_signature`).
-	fn signature_scope(
+	pub(super) fn signature_scope(
 		&self,
 		owner: Definition,
 	) -> Option<(Scope, GenericEnvIdx)> {
@@ -699,6 +699,37 @@ impl Semantics {
 					member,
 					inherited_from,
 				});
+			}
+		}
+		found
+	}
+
+	/// Every member a path can name after a trait-qualified root,
+	/// `<T as Tr>::`, `bound` being `Tr`'s declaration, used as `used_as`
+	/// says (`NameUse::takes_member`): `Tr`'s own declarations, as its
+	/// lookup searches them (`resolve_trait_member_declaration`), in
+	/// declaration order. `T` does not choose them: whether it implements
+	/// `Tr` is checked apart.
+	pub fn trait_member_names(
+		&self,
+		bound: ItemLoc,
+		used_as: NameUse,
+	) -> Vec<(SymbolU32, Definition)> {
+		let DeclKind::Trait(trait_index) = self.declaration_kind(bound) else {
+			return Vec::new();
+		};
+		let decls = &self.decls;
+		let trait_decl = &decls.traits[usize::from(trait_index)];
+		let mut found = Vec::new();
+		for (index, member) in trait_decl.members.iter().enumerate() {
+			let key = decls.member_key(member.kind);
+			if used_as.takes_member(member.kind)
+				&& trait_decl
+					.bindings
+					.get(&key)
+					.is_some_and(|&at| usize::from(at) == index)
+			{
+				found.push((key.symbol, Definition::Member(member.kind)));
 			}
 		}
 		found

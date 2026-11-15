@@ -1172,6 +1172,7 @@ impl<'a> Printer<'a> {
 				self.rooted(&format!("<{}>", self.ty(inner)), segments, "")
 			}
 			ConstArgument::Infer => "_".to_string(),
+			ConstArgument::Error => "<error>".to_string(),
 		}
 	}
 

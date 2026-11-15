@@ -13,14 +13,15 @@ use string_interner::symbol::SymbolU32;
 use crate::ast::{self, Ownership, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::small_vec::SmallVec;
+use crate::symbols::Keyword;
 use crate::vfs::FileId;
 
 use super::body::BodyOwner;
 use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
 use super::decls::{
-	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, Declarations, Declared,
-	FieldIdx, FieldOwner, FunctionIdx, InherentImplIdx, MemberKind,
-	MemberOwner, Scope, SignatureQuery, Tier, TraitIdx, TraitImplIdx,
+	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, DeclKind, Declarations,
+	Declared, FieldIdx, FieldOwner, FunctionIdx, InherentImplIdx, MemberKind,
+	MemberOwner, NameUse, Scope, SignatureQuery, Tier, TraitIdx, TraitImplIdx,
 };
 use super::format::TypeFormatter;
 use super::impls::ImplTarget;
@@ -34,7 +35,7 @@ use super::solver::{
 	Assumption, NormalizationDepth, RewriteFlags, SolverError,
 };
 use super::types::{
-	GenericEnvIdx, GenericEnvOwner, Type, TypeIndex, TypeInterner,
+	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex, TypeInterner,
 };
 
 /// What type-relative member applicability found.
@@ -632,6 +633,11 @@ impl Semantics {
 	) -> Result<MemberKind, ()> {
 		let trait_decl = &self.decls.traits[usize::from(required_trait)];
 		let Some(&member_index) = trait_decl.bindings.get(&key) else {
+			// No name is written (`<T as Tr>::` unfinished): the parser
+			// reported it.
+			if name.inner == Keyword::Error.symbol() {
+				return Err(());
+			}
 			self.diagnostics.push(report_missing_trait_member(
 				file_id,
 				strings,
@@ -1155,7 +1161,12 @@ impl Semantics {
 			Type::Pointer { to, .. } => to,
 			_ => receiver,
 		};
-		for key in self.method_candidates(strings, scope.assumption_env, path) {
+		for key in self.member_candidates(
+			strings,
+			scope.assumption_env,
+			path,
+			Tier::Value,
+		) {
 			let MemberLookup::Found(member) = self.resolve_applicable_member(
 				strings,
 				scope.assumption_env,
@@ -1182,17 +1193,201 @@ impl Semantics {
 		found
 	}
 
-	/// The names of value members some impl or trait could supply to
-	/// `receiver`, each once, in declaration order: a superset of what the
-	/// member lookup finds. For a concrete head, the inherent impls and
+	/// The inherent impls of `target` that declare `key` and whose target,
+	/// with what `receiver` (partly unknown) teaches their parameters, still
+	/// meets it: each with the member and the impl's arguments learned.
+	/// Reports nothing.
+	pub(super) fn inherent_candidates_with_holes(
+		&mut self,
+		target: ImplTarget,
+		receiver: TypeIndex,
+		key: BindingKey,
+	) -> Vec<(InherentImplIdx, MemberKind, Box<[TypeIndex]>)> {
+		let impl_dispatch = &self.impl_dispatch;
+		let mut candidates = Vec::new();
+		for &impl_index in impl_dispatch.inherent_candidates(target) {
+			let impl_decl = &self.decls.inherent_impls[usize::from(impl_index)];
+			let Some(&member_index) = impl_decl.bindings.get(&key) else {
+				continue;
+			};
+			let kind = impl_decl.members[usize::from(member_index)].kind;
+			let Some(header) = &self.inherent_impls[usize::from(impl_index)]
+			else {
+				continue;
+			};
+			let (env, pattern) = (header.type_params, header.target.inner);
+			let count = self.generic_envs.generic_count(env);
+			let mut impl_args =
+				vec![TypeIndex::INFER; count].into_boxed_slice();
+			self.types.learn(
+				&self.generic_envs,
+				env,
+				&mut impl_args,
+				pattern,
+				receiver,
+			);
+			let instantiated = self.types.substitute(
+				pattern,
+				Substitution {
+					envs: &self.generic_envs,
+					env,
+					args: &impl_args,
+				},
+			);
+			if self.types.meet(instantiated, receiver).is_some() {
+				candidates.push((impl_index, kind, impl_args));
+			}
+		}
+		candidates
+	}
+
+	/// The members a path can name after a prefix that names a type,
+	/// `prefix` (`Point::`, `Self::`, `T::`), written in `declaration`'s
+	/// signature or body, used as `used_as` says (`NameUse::takes_member`),
+	/// with what each would refer to: the members the checker's member
+	/// lookup selects uniquely by that name (`select_member`) and that are
+	/// accessible there. A
+	/// generic struct named without its arguments is the struct with them
+	/// unknown, as `resolve_value_path` reads it, and offers its inherent
+	/// members alone, all `select_inherent_with_holes` selects; arguments
+	/// written on the prefix are not read, so `W::<u8>::` offers what
+	/// some `W` has.
+	pub fn type_member_names(
+		&mut self,
+		strings: &StringInterner,
+		declaration: Definition,
+		prefix: Definition,
+		used_as: NameUse,
+	) -> Vec<(SymbolU32, Definition)> {
+		let tier = match used_as {
+			NameUse::Value | NameUse::Constant => Tier::Value,
+			NameUse::Type => Tier::Type,
+			_ => return Vec::new(),
+		};
+		let (Some((namespace, env)), Some(receiver)) =
+			(self.signature_scope(declaration), self.named_type(prefix))
+		else {
+			return Vec::new();
+		};
+		let assumption_env = self.assumption_envs.of_frame(env);
+		let mut found = Vec::new();
+		if receiver == TypeIndex::ERROR {
+			return found;
+		}
+		if self.types.has_infer(receiver) {
+			let Some(target) =
+				ImplTarget::from_type(self.types.resolve(receiver))
+			else {
+				return found;
+			};
+			let keys = self
+				.impl_dispatch
+				.inherent_candidates(target)
+				.iter()
+				.flat_map(|&index| {
+					self.decls.inherent_impls[usize::from(index)]
+						.members
+						.iter()
+						.map(|member| self.decls.member_key(member.kind))
+				});
+			let keys: Vec<BindingKey> =
+				keys.filter(|key| key.tier == tier).collect();
+			for key in keys {
+				let candidates =
+					self.inherent_candidates_with_holes(target, receiver, key);
+				if let [(impl_index, kind, _)] = candidates[..]
+					&& used_as.takes_member(kind)
+					&& self.member_accessible(
+						ApplicableMember::Inherent { impl_index, kind },
+						key,
+						namespace,
+					) {
+					found.push((key.symbol, Definition::Member(kind)));
+				}
+			}
+			return found;
+		}
+		for key in
+			self.member_candidates(strings, assumption_env, receiver, tier)
+		{
+			if let MemberLookup::Found(member) = self.resolve_applicable_member(
+				strings,
+				assumption_env,
+				receiver,
+				key,
+			) && self.member_accessible(member, key, namespace)
+			{
+				let kind = member.selected_kind(&self.decls);
+				if used_as.takes_member(kind) {
+					found.push((key.symbol, Definition::Member(kind)));
+				}
+			}
+		}
+		found
+	}
+
+	/// The type a path ending at `definition` names when no type argument
+	/// is written on it: a generic struct's unknown, as `resolve_value_path`
+	/// builds it. `None` for what is no type, or one whose arguments a path
+	/// cannot leave out (a generic alias).
+	fn named_type(&mut self, definition: Definition) -> Option<TypeIndex> {
+		Some(match definition {
+			Definition::Item(loc) => match self.declaration_kind(loc) {
+				DeclKind::Struct(index) => {
+					let params = self.structs[usize::from(index)].type_params;
+					let count = self.generic_envs.param_names(params).len();
+					self.types
+						.intern_struct(index, &vec![TypeIndex::INFER; count])
+				}
+				DeclKind::Enum(enum_index) => {
+					self.types.intern(Type::Enum { enum_index })
+				}
+				DeclKind::TypeAlias(index) => {
+					match self.decls.intrinsics.identity_of(index) {
+						Some(primitive) => primitive,
+						None => {
+							let alias = &self.type_aliases[usize::from(index)];
+							if !self
+								.generic_envs
+								.param_names(alias.type_params)
+								.is_empty()
+							{
+								return None;
+							}
+							alias.target
+						}
+					}
+				}
+				_ => return None,
+			},
+			Definition::TypeParam { env, index } => {
+				self.generic_envs.param_types(env)[index as usize]
+			}
+			Definition::InherentImplTarget(index) => {
+				self.inherent_impls[usize::from(index)]
+					.as_ref()?
+					.target
+					.inner
+			}
+			Definition::TraitImplTarget(index) => {
+				self.trait_impls[usize::from(index)].as_ref()?.target.inner
+			}
+			_ => return None,
+		})
+	}
+
+	/// The names of members some impl or trait could supply to
+	/// `receiver` in `tier`, each once, in declaration order: a superset of
+	/// what the member lookup finds. For a concrete head, the inherent impls and
 	/// the traits with an impl for it (`trait_candidates`); for an
 	/// abstract type, the traits its bounds and the scope's assumptions
 	/// name. Both, for a projection a shallow normalization makes concrete.
-	fn method_candidates(
+	fn member_candidates(
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
+		tier: Tier,
 	) -> Vec<BindingKey> {
 		let mut traits: Vec<TraitIdx> = Vec::new();
 		let mut members: Vec<MemberKind> = Vec::new();
@@ -1246,7 +1441,7 @@ impl Semantics {
 		let mut keys = Vec::new();
 		for member in members {
 			let key = self.decls.member_key(member);
-			if key.tier == Tier::Value && !keys.contains(&key) {
+			if key.tier == tier && !keys.contains(&key) {
 				keys.push(key);
 			}
 		}
@@ -1911,7 +2106,6 @@ mod tests {
 
 	use super::*;
 	use crate::ast::{ExprId, Expression};
-	use crate::symbols::Keyword;
 	use crate::tir::body::ScopeIdx;
 	use crate::tir::resolutions::Definition;
 	use crate::tir::signatures::tests::source_graph;
@@ -2147,5 +2341,141 @@ mod tests {
 				.member_names(&case.strings, owner, TypeIndex::ERROR)
 				.is_empty()
 		);
+	}
+
+	const TYPE_PATHS: &str = indoc! {"
+		trait Show: StackValue {
+		    func show(self: Self) -> u32;
+		    func make() -> Self;
+		}
+		struct P(v: u32);
+		impl P {
+		    pub const ZERO: u32 = 0;
+		    pub func new() -> Self { Self(0) }
+		    pub func get(self: Self) -> u32 { Self::ZERO }
+		}
+		impl Show for P {
+		    func show(self: Self) -> u32 { P::get(self) }
+		    func make() -> Self { P::new() }
+		}
+		struct W<T>(value: T);
+		impl<T: StackValue> W<T> {
+		    pub func wrap(value: T) -> Self { Self(value) }
+		}
+		enum Kind(u8) { A = 0, B }
+		impl Kind {
+		    pub func of(n: u8) -> Self { Kind::A }
+		}
+		func f<T: Show>() -> u32 {
+		    local p = P::make();
+		    local w = W::wrap(P::ZERO);
+		    local k = Kind::of(1);
+		    T::show(T::make()) + P::show(p)
+		}
+	"};
+
+	impl Case<'_> {
+		/// What `type_member_names` offers as a value after the path
+		/// `prefix` written at `offset` resolved to.
+		fn offered_after_type(
+			&mut self,
+			offset: u32,
+			prefix: Definition,
+		) -> Vec<(SymbolU32, Definition)> {
+			let BodyOwner::Function(function) = self.owner_at(offset) else {
+				unreachable!("`owner_at` finds functions")
+			};
+			let declaration = Definition::Item(
+				self.sema.decls.functions[usize::from(function)].loc,
+			);
+			self.sema.type_member_names(
+				&self.strings,
+				declaration,
+				prefix,
+				NameUse::Value,
+			)
+		}
+	}
+
+	/// Every member the checker selected after a type in a value path
+	/// (`P::new`, `Self::ZERO`, `T::make`, `W::wrap`) is offered there, as
+	/// what it referred to.
+	#[test]
+	fn type_member_names_agree_with_the_checker() {
+		let mut case = Case::new(TYPE_PATHS);
+		let ast = case.graph.ast(case.file);
+		let paths: Vec<_> = ast
+			.exprs
+			.kinds
+			.iter()
+			.filter_map(|&expr| match expr {
+				Expression::Path(segments) => match *ast.list(segments) {
+					[.., prefix, member] => Some((prefix.ident, member.ident)),
+					_ => None,
+				},
+				_ => None,
+			})
+			.collect();
+		let mut checked = 0;
+		for (prefix, member) in paths {
+			let at =
+				|tier| Site::new(tier, SourceSpan::new(case.file, prefix.span));
+			let site = Site::Value(SourceSpan::new(case.file, member.span));
+			let Some(Reference::Member(kind)) = case.sema.resolutions.get(site)
+			else {
+				continue;
+			};
+			let prefix_reference = case
+				.sema
+				.resolutions
+				.get(at(Tier::Type))
+				.or_else(|| case.sema.resolutions.get(at(Tier::Value)))
+				.expect("a member's prefix is resolved");
+			let offered = case.offered_after_type(
+				prefix.span.start,
+				prefix_reference.definition(),
+			);
+			assert!(
+				offered.contains(&(member.inner, Definition::Member(kind))),
+				"`{}` is not offered at {}",
+				case.strings.resolve(member.inner).unwrap(),
+				member.span.start,
+			);
+			checked += 1;
+		}
+		assert!(checked >= 9, "only {checked} paths checked");
+	}
+
+	/// A concrete type is offered its inherent members and those of the
+	/// traits it implements; an abstract one, its bounds'; a generic type
+	/// written without its arguments, its inherent members alone.
+	#[test]
+	fn a_type_is_offered_its_members() {
+		let mut case = Case::new(TYPE_PATHS);
+		let names = |case: &mut Case<'_>, written: &str| {
+			let offset = case.source.find(written).unwrap() as u32;
+			let site = Site::Type(SourceSpan::new(
+				case.file,
+				TextSpan::new(
+					offset,
+					offset + written.find(':').unwrap() as u32,
+				),
+			));
+			let prefix = case.sema.resolutions.get(site).unwrap().definition();
+			let offered = case.offered_after_type(offset, prefix);
+			offered
+				.into_iter()
+				.map(|(name, _)| {
+					case.strings.resolve(name).unwrap().to_string()
+				})
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(
+			names(&mut case, "P::make"),
+			["ZERO", "new", "get", "show", "make"]
+		);
+		assert_eq!(names(&mut case, "T::show"), ["show", "make"]);
+		assert_eq!(names(&mut case, "W::wrap"), ["wrap"]);
+		assert_eq!(names(&mut case, "Kind::of"), ["of"]);
 	}
 }

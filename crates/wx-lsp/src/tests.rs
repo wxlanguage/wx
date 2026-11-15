@@ -2189,9 +2189,8 @@ fn completion_offers_nothing_where_no_name_is_looked_up() {
 		"func f() {\n    // hel$0\n}\n",
 		"func f() {\n    local na$0me = 1;\n}\n",
 		"func f() {\n    local a: u32 = 12$0;\n}\n",
-		// After a type: its members, which are not completed yet.
-		"func f() {\n    Point::$0\n}\n",
-		// A parameter's own name, and its type's later segment.
+		// A parameter's own name, and an associated type of a type that
+		// has none.
 		"func f(cou$0nt: u32) {}\n",
 		"func f(p: Point::$0) {}\n",
 		// Right after a call's arguments.
@@ -2371,6 +2370,220 @@ fn completion_after_an_enum_offers_its_variants() {
 	)
 	.expect("a pattern path after an enum");
 	assert_eq!(labels, ["A", "B"]);
+}
+
+const TYPE_MEMBER_ITEMS: &str = "trait Show: StackValue {
+    func show(self: Self) -> u32;
+    func make() -> Self;
+}
+mod shapes {
+    pub struct Point(pub x: u32);
+    impl Point {
+        pub const ZERO: u32 = 0;
+        pub func origin() -> Self { Self(0) }
+        pub func flip(self: Self) -> Self { self }
+        func hidden() {}
+    }
+}
+impl Show for shapes::Point {
+    func show(self: Self) -> u32 { 1 }
+    func make() -> Self { shapes::Point(0) }
+}
+";
+
+#[test]
+fn completion_after_a_type_offers_its_members() {
+	let labels = completions(&format!(
+		"{TYPE_MEMBER_ITEMS}func f() {{\n    shapes::Point::$0\n}}\n"
+	))
+	.expect("a segment after a type");
+	assert_offers(
+		&labels,
+		&["ZERO", "origin", "flip", "show", "make"],
+		&["hidden", "x"],
+	);
+	// Its own impl's private member is visible inside the module.
+	let labels = completions(&TYPE_MEMBER_ITEMS.replace(
+		"func hidden() {}",
+		"func hidden() {}\n        func g() { Point::$0 }",
+	))
+	.unwrap();
+	assert_offers(&labels, &["hidden", "origin"], &[]);
+}
+
+#[test]
+fn completion_after_self_and_a_type_parameter_offers_their_members() {
+	let labels = completions(&TYPE_MEMBER_ITEMS.replace(
+		"func hidden() {}",
+		"func hidden() {}\n        func g() { Self::$0 }",
+	))
+	.expect("a segment after `Self`");
+	assert_offers(&labels, &["hidden", "origin", "show"], &[]);
+	let labels = completions(&format!(
+		"{TYPE_MEMBER_ITEMS}func f<T: Show>() -> T {{\n    T::$0\n}}\n"
+	))
+	.expect("a segment after a type parameter");
+	assert_eq!(labels, ["make", "show"]);
+}
+
+#[test]
+fn completion_after_a_type_inserts_a_methods_self() {
+	let items = completion_items(
+		&format!("{TYPE_MEMBER_ITEMS}func f() {{\n    shapes::Point::$0\n}}\n"),
+		true,
+	)
+	.unwrap();
+	let insert = |name: &str| {
+		items
+			.iter()
+			.find(|item| item.filter_text.as_deref() == Some(name))
+			.and_then(|item| item.insert_text.clone())
+	};
+	assert_eq!(insert("flip").as_deref(), Some("flip($1)"));
+	assert_eq!(insert("origin").as_deref(), Some("origin()"));
+}
+
+#[test]
+fn completion_after_a_generic_type_without_arguments_offers_inherent_members() {
+	let labels = completions(&format!(
+		"{TYPE_MEMBER_ITEMS}struct Wrap<T>(value: T);\nimpl<T: StackValue> Wrap<T> {{\n    pub func new(value: T) -> Self {{ Self(value) }}\n}}\nimpl<T: StackValue> Show for Wrap<T> {{\n    func show(self: Self) -> u32 {{ 1 }}\n    func make() -> Self {{ Wrap::make() }}\n}}\nfunc f() {{\n    Wrap::$0\n}}\n"
+	))
+	.expect("a segment after a generic type");
+	assert_eq!(labels, ["new"]);
+}
+
+#[test]
+fn completion_after_an_enum_in_a_value_offers_variants_then_members() {
+	let labels = completions(
+		"enum Kind(u8) { A = 0, B }\nimpl Kind {\n    pub func of(n: u8) -> Self { Kind::A }\n}\nfunc f() {\n    Kind::$0\n}\n",
+	)
+	.expect("a segment after an enum");
+	assert_offers(&labels, &["A", "B", "of"], &[]);
+}
+
+#[test]
+fn completion_after_a_type_in_a_signature_offers_associated_types() {
+	let labels = completions(
+		"trait Container {\n    type Item;\n    const SIZE: u32;\n}\nfunc f<C: Container>(item: C::$0) {}\n",
+	)
+	.expect("a type segment after a type parameter");
+	assert_eq!(labels, ["Item"]);
+}
+
+const QUALIFIED_ITEMS: &str = "trait Base: StackValue {
+    func base() -> u32;
+}
+trait Tr: Base {
+    type Item;
+    type Other;
+    const SIZE: u32;
+    func make() -> Self;
+    func show(self: Self) -> u32;
+}
+memory heap: u32;
+";
+
+#[test]
+fn completion_after_a_trait_qualified_root_in_a_value_offers_its_values() {
+	// The trait's own members only, as its lookup searches: not `Base`'s.
+	let labels = completions(&format!(
+		"{QUALIFIED_ITEMS}func f<T: Tr>() {{\n    <T as Tr>::$0\n}}\n"
+	))
+	.expect("a member after a trait-qualified root");
+	assert_eq!(labels, ["SIZE", "make", "show"]);
+	// A partly written name, and the type before `as` does not choose them.
+	let labels = completions(&format!(
+		"{QUALIFIED_ITEMS}func f() {{\n    <u32 as Tr>::ma$0\n}}\n"
+	))
+	.unwrap();
+	assert_eq!(labels, ["SIZE", "make", "show"]);
+}
+
+#[test]
+fn completion_after_a_trait_qualified_root_in_a_type_offers_its_types() {
+	let labels = completions(&format!(
+		"{QUALIFIED_ITEMS}func f<T: Tr>(item: <T as Tr>::$0) {{}}\n"
+	))
+	.expect("a type after a trait-qualified root in a signature");
+	assert_eq!(labels, ["Item", "Other"]);
+	let labels = completions(&format!(
+		"{QUALIFIED_ITEMS}func f<T: Tr>() {{\n    local item: <T as Tr>::$0 = 1;\n}}\n"
+	))
+	.expect("a type after a trait-qualified root in a body");
+	assert_eq!(labels, ["Item", "Other"]);
+}
+
+#[test]
+fn completion_after_a_trait_qualified_root_in_a_length_offers_its_constants() {
+	let labels = completions(&format!(
+		"{QUALIFIED_ITEMS}func f<T: Tr>(p: heap::&[u8; <T as Tr>::$0]) {{}}\n"
+	))
+	.expect("a constant after a trait-qualified root in a length");
+	assert_eq!(labels, ["SIZE"]);
+}
+
+const LENGTH_ITEMS: &str = "memory heap: u32;
+const SIZE: u32 = 4;
+func helper() -> u32 { 1 }
+enum Kind(u32) { A = 0, B }
+struct Point(x: u32);
+impl Point {
+    pub const DIM: u32 = 2;
+    pub func new() -> Self { Self(0) }
+}
+mod m {
+    pub const INNER: u32 = 1;
+    pub func f() {}
+}
+";
+
+#[test]
+fn completion_in_a_length_offers_constants_and_what_leads_to_them() {
+	// A constant, and what a path to one starts with; no function or local.
+	for source in [
+		"func f(p: heap::&[u8; $0]) {}\n",
+		"func f(p: heap::&[u8; S$0]) {}\n",
+		"func f() {\n    local count = 1;\n    local p: heap::&[u8; $0] = [0; 4];\n}\n",
+		"func f() {\n    local count = 1;\n    local p: heap::&[u8; 4] = [0; $0];\n}\n",
+	] {
+		let labels = completions(&format!("{LENGTH_ITEMS}{source}"))
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(
+			&labels,
+			&["SIZE", "Kind", "Point", "m"],
+			&["helper", "count", "f"],
+		);
+	}
+	// After a module, an enum and a type: their constants alone.
+	let after = |prefix: &str| {
+		completions(&format!(
+			"{LENGTH_ITEMS}func f(p: heap::&[u8; {prefix}::$0]) {{}}\n"
+		))
+	};
+	assert_offers(&after("m").unwrap(), &["INNER"], &["f"]);
+	assert_eq!(after("Kind").unwrap(), ["A", "B"]);
+	assert_eq!(after("Point").unwrap(), ["DIM"]);
+}
+
+#[test]
+fn completion_after_a_trait_qualified_root_inserts_a_methods_self() {
+	let items = completion_items(
+		&format!(
+			"{QUALIFIED_ITEMS}func f<T: Tr>() {{\n    <T as Tr>::$0\n}}\n"
+		),
+		true,
+	)
+	.unwrap();
+	let insert = |name: &str| {
+		items
+			.iter()
+			.find(|item| {
+				item.filter_text.as_deref().unwrap_or(&item.label) == name
+			})
+			.and_then(|item| item.insert_text.clone())
+	};
+	assert_eq!(insert("show").as_deref(), Some("show($1)"));
+	assert_eq!(insert("make").as_deref(), Some("make()"));
 }
 
 #[test]

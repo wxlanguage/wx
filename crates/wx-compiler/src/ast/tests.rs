@@ -264,6 +264,7 @@ fn call_type_args(case: &TestCase, index: usize) -> Vec<String> {
 				match case.ast.constant(constant) {
 					ConstArgument::Literal(_) => "literal".to_string(),
 					ConstArgument::Infer => "_".to_string(),
+					ConstArgument::Error => "<error>".to_string(),
 					ConstArgument::Path(path) => case
 						.ast
 						.list(path)
@@ -4720,6 +4721,56 @@ fn a_type_path_with_no_last_segment_keeps_its_prefix() {
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let param = &case.ast.list(case.function_signature(0).params)[0];
 	assert_eq!(case.printer().ty(param.ty), "core::<error>");
+	assert_eq!(case.ast.root.len(), 2);
+}
+
+#[test]
+fn a_qualified_path_with_no_segment_keeps_its_root() {
+	let case = TestCase::new(indoc! {"
+		func f() {
+		    <T as Tr>::
+		    local c = 1;
+		}
+	"});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::InvalidNamespace,
+		DiagnosticCode::MissingSeparator,
+	]);
+	let block = case.function_block(0);
+	assert_eq!(block.len(), 2);
+	assert_eq!(case.shape(case.entry_expr(&block, 0)), "<T as Tr>::<error>");
+	// In a type, and in an array's length.
+	let case = TestCase::new(
+		"func f(a: <T as Tr>::, b: heap::&[u8; <T as Array>::]) {}\nfunc g() {}",
+	);
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::InvalidNamespace,
+		DiagnosticCode::InvalidNamespace,
+	]);
+	let params = case.ast.list(case.function_signature(0).params);
+	assert_eq!(case.printer().ty(params[0].ty), "<T as Tr>::<error>");
+	assert_eq!(
+		case.printer().ty(params[1].ty),
+		"heap::&[u8; <T as Array>::<error>]"
+	);
+	assert_eq!(case.ast.root.len(), 2);
+}
+
+#[test]
+fn an_array_with_no_length_keeps_the_array() {
+	let case = TestCase::new(
+		"func f(a: heap::&[u8; ]) {\n    local b = [0; ];\n}\nfunc g() {}",
+	);
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::UnexpectedToken,
+	]);
+	let param = &case.ast.list(case.function_signature(0).params)[0];
+	assert_eq!(case.printer().ty(param.ty), "heap::&[u8; <error>]");
+	assert_eq!(
+		case.shape(case.local_value(&case.function_block(0), 0)),
+		"(repeat 0 <error>)"
+	);
 	assert_eq!(case.ast.root.len(), 2);
 }
 

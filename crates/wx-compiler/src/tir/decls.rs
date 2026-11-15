@@ -166,6 +166,9 @@ impl Tier {
 pub enum NameUse {
 	/// A value, for example a function called in an expression.
 	Value,
+	/// A constant argument, for example an array's length: a constant or
+	/// an enum's variant.
+	Constant,
 	/// A type, for example a parameter's annotation or `type Item = X`.
 	Type,
 	/// A bound (`T: X`, `trait Y: X`) or `<T as X>`: a trait or typeset.
@@ -184,7 +187,7 @@ impl NameUse {
 	/// Whether the name is looked up in `tier`.
 	fn looked_up_in(self, tier: Tier) -> bool {
 		match self {
-			NameUse::Value => tier == Tier::Value,
+			NameUse::Value | NameUse::Constant => tier == Tier::Value,
 			NameUse::Import => true,
 			NameUse::Type
 			| NameUse::Bound
@@ -198,6 +201,9 @@ impl NameUse {
 	pub(super) fn takes(self, kind: DeclKind) -> bool {
 		match (self, kind.type_role()) {
 			(NameUse::Value | NameUse::Import, _) => true,
+			(NameUse::Constant, _) => {
+				matches!(kind, DeclKind::Const(_) | DeclKind::EnumVariant(_))
+			}
 			(_, None) => false,
 			(NameUse::Type, Some(role)) => role == TypeRole::Type,
 			(NameUse::Bound, Some(role)) => {
@@ -211,12 +217,33 @@ impl NameUse {
 		}
 	}
 
+	/// Whether a member can end a path in this context, after a type or a
+	/// trait (`Point::new`, `<T as Tr>::Item`).
+	pub(super) fn takes_member(self, kind: MemberKind) -> bool {
+		match self {
+			NameUse::Value => matches!(
+				kind,
+				MemberKind::Function(_)
+					| MemberKind::Method(_)
+					| MemberKind::Constant(_)
+			),
+			NameUse::Constant => matches!(kind, MemberKind::Constant(_)),
+			NameUse::Type => matches!(kind, MemberKind::AssociatedType(_)),
+			NameUse::Bound
+			| NameUse::Trait
+			| NameUse::Namespace
+			| NameUse::Import => false,
+		}
+	}
+
 	/// The tiers completion lists names from: the ones the name is looked up
 	/// in, and for a value the type tier too, since a path's prefix is read
 	/// as a type (`shapes::area`).
 	pub(super) fn listed_tiers(self) -> &'static [Tier] {
 		match self {
-			NameUse::Value | NameUse::Import => &[Tier::Value, Tier::Type],
+			NameUse::Value | NameUse::Constant | NameUse::Import => {
+				&[Tier::Value, Tier::Type]
+			}
 			NameUse::Type
 			| NameUse::Bound
 			| NameUse::Trait
@@ -226,10 +253,20 @@ impl NameUse {
 
 	/// Whether completion may offer this declaration, found in `tier`: it
 	/// can end the path, found where the name is looked up, or it is a
-	/// namespace the path can continue into (`shapes::Square`).
+	/// namespace the path can continue into (`shapes::Square`). A constant
+	/// is reached through a type with members too (`Kind::A`,
+	/// `Point::SIZE`).
 	pub(super) fn admits(self, tier: Tier, kind: DeclKind) -> bool {
 		(self.looked_up_in(tier) && self.takes(kind))
 			|| kind.type_role() == Some(TypeRole::Namespace)
+			|| (self == NameUse::Constant
+				&& tier == Tier::Type
+				&& matches!(
+					kind,
+					DeclKind::Struct(_)
+						| DeclKind::Enum(_)
+						| DeclKind::TypeAlias(_)
+				))
 	}
 }
 

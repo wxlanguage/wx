@@ -20,9 +20,7 @@ use super::{ArgumentList, Arguments, BodyBuilder};
 use crate::ast::{self, Ownership};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
-use crate::tir::decls::{
-	BindingKey, ConstIdx, DeclKind, InherentImplIdx, MemberKind, TraitIdx,
-};
+use crate::tir::decls::{BindingKey, ConstIdx, DeclKind, MemberKind, TraitIdx};
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
 	ApplicableMember, MemberLookup, ReceiverFit, TraitImplLookup,
@@ -684,8 +682,9 @@ impl BodyBuilder<'_, '_> {
 			self.report_no_member(receiver, member);
 			return None;
 		};
-		let mut candidates =
-			self.inherent_candidates_with_holes(target, receiver, key);
+		let mut candidates = self
+			.sema
+			.inherent_candidates_with_holes(target, receiver, key);
 		// A type's inherent impls declare a name once between them, so a
 		// second candidate is a duplicate already reported.
 		if candidates.len() > 1 {
@@ -712,56 +711,6 @@ impl BodyBuilder<'_, '_> {
 			return None;
 		};
 		Some((ApplicableMember::Inherent { impl_index, kind }, impl_args))
-	}
-
-	/// The inherent impls of `target` that declare `key` and whose target,
-	/// with what `receiver` (partly unknown) teaches their parameters, still
-	/// meets it: each with the member and the impl's arguments learned.
-	/// Reports nothing.
-	fn inherent_candidates_with_holes(
-		&mut self,
-		target: ImplTarget,
-		receiver: TypeIndex,
-		key: BindingKey,
-	) -> Vec<(InherentImplIdx, MemberKind, Box<[TypeIndex]>)> {
-		let impl_dispatch = &self.sema.impl_dispatch;
-		let mut candidates = Vec::new();
-		for &impl_index in impl_dispatch.inherent_candidates(target) {
-			let impl_decl =
-				&self.sema.decls.inherent_impls[usize::from(impl_index)];
-			let Some(&member_index) = impl_decl.bindings.get(&key) else {
-				continue;
-			};
-			let kind = impl_decl.members[usize::from(member_index)].kind;
-			let Some(header) =
-				&self.sema.inherent_impls[usize::from(impl_index)]
-			else {
-				continue;
-			};
-			let (env, pattern) = (header.type_params, header.target.inner);
-			let count = self.sema.generic_envs.generic_count(env);
-			let mut impl_args =
-				vec![TypeIndex::INFER; count].into_boxed_slice();
-			self.sema.types.learn(
-				&self.sema.generic_envs,
-				env,
-				&mut impl_args,
-				pattern,
-				receiver,
-			);
-			let instantiated = self.sema.types.substitute(
-				pattern,
-				Substitution {
-					envs: &self.sema.generic_envs,
-					env,
-					args: &impl_args,
-				},
-			);
-			if self.sema.types.meet(instantiated, receiver).is_some() {
-				candidates.push((impl_index, kind, impl_args));
-			}
-		}
-		candidates
 	}
 
 	/// What a method call expects of its receiver, before the receiver has
@@ -794,8 +743,9 @@ impl BodyBuilder<'_, '_> {
 		else {
 			return TypeIndex::INFER;
 		};
-		let mut candidates =
-			self.inherent_candidates_with_holes(target, selected, method);
+		let mut candidates = self
+			.sema
+			.inherent_candidates_with_holes(target, selected, method);
 		// More than one is a duplicate, reported where it is declared.
 		if candidates.len() != 1 {
 			return TypeIndex::INFER;

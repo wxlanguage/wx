@@ -889,6 +889,10 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		let span = ast.const_span(count);
 		match ast.constant(count) {
 			ast::ConstArgument::Infer => None,
+			// Reported by the parser.
+			ast::ConstArgument::Error => {
+				Some(self.body.push(ExprKind::Error, TypeIndex::ERROR, span))
+			}
 			ast::ConstArgument::Literal(ast::Literal::Int(value)) => {
 				Some(self.body.push(
 					ExprKind::Int(value),
@@ -2428,7 +2432,9 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		if self.body.ty(expr) == TypeIndex::NEVER {
 			return;
 		}
-		if target == TypeIndex::ERROR {
+		// A target with an error anywhere in it (`heap::&[u8; NOPE]`) was
+		// reported where it was written.
+		if self.sema.types.has_error(target) {
 			self.body.set_ty(expr, TypeIndex::ERROR);
 			return;
 		}
@@ -8355,6 +8361,17 @@ mod tests {
 		);
 	}
 
+	/// A value coerced to a type with an error inside it is not reported
+	/// again: the error was, where the type is written.
+	#[test]
+	fn a_type_with_an_error_inside_is_reported_once() {
+		let case = TestCase::new(
+			"memory heap: u32;\nfunc f() {\n    local a: heap::&[u8; NOPE] = [0; 4];\n}\n",
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+	}
+
 	#[test]
 	fn a_missing_path_segment_is_reported_once() {
 		let namespace = &[DiagnosticCode::InvalidNamespace];
@@ -8396,6 +8413,23 @@ mod tests {
 		let (case, _) = TestCase::recovered("use nowhere::;\n");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnresolvedImport]);
+		// After a trait-qualified root: a value, a type, an array's length.
+		let qualified = "trait Tr: StackValue {\n    type Item;\n    func make() -> Self;\n}\n";
+		for source in [
+			"func f<T: Tr>() {\n    local a = <T as Tr>::\n}\n",
+			"func f<T: Tr>(a: <T as Tr>::) {}\n",
+			"memory heap: u32;\nfunc f<T: Array>(a: heap::&[u8; <T as Array>::]) {}\n",
+		] {
+			assert_recovered(&format!("{qualified}{source}"), namespace);
+		}
+		// An array's length: in a signature, a local's type and a repeat.
+		for source in [
+			"memory heap: u32;\nfunc f(a: heap::&[u8; ]) {}\n",
+			"memory heap: u32;\nfunc f() {\n    local a: heap::&[u8; ] = [0; 4];\n}\n",
+			"memory heap: u32;\nfunc f() {\n    local a: heap::&[u8; 4] = [0; ];\n}\n",
+		] {
+			assert_recovered(source, unexpected);
+		}
 		// A bound's entry: a constant's name, a type's `=` and its type.
 		for source in [
 			"func f<T: Array where { const }>() {}\n",

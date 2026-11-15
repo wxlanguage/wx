@@ -6,6 +6,7 @@
 //! declaration it is in, by the span of it the checker keeps; every
 //! candidate comes from the checker's own lookups (`Semantics::names_at`,
 //! `names_in_signature`, `names_in`, `names_in_scope`, `member_names`,
+//! `type_member_names`,
 //! `Body::labels_at`), so
 //! nothing is offered that the checker would not accept written there.
 
@@ -96,6 +97,10 @@ pub(crate) fn completion(
 			used_as: NameUse::Value,
 			..
 		}
+		| Site::TraitMember {
+			used_as: NameUse::Value,
+			..
+		}
 		| Site::Member { .. }
 			if snippets && !called =>
 		{
@@ -121,14 +126,33 @@ pub(crate) fn completion(
 		// not resolve has nothing after it.
 		Site::Segment { prefix, used_as } => {
 			let (_, reference) = query::symbol_at(sema, file, prefix.start)?;
-			let Definition::Item(prefix) = reference.definition() else {
-				return None;
+			let prefix = reference.definition();
+			let mut names = match prefix {
+				Definition::Item(loc) => {
+					let accessor = match use_scope {
+						Some(scope) => scope,
+						None => sema.declaration_scope(declaration?)?,
+					};
+					sema.names_in(accessor, loc, used_as)
+				}
+				_ => Vec::new(),
 			};
-			let accessor = match use_scope {
-				Some(scope) => scope,
-				None => sema.declaration_scope(declaration?)?,
-			};
-			sema.names_in(accessor, prefix, used_as)
+			// After a type, its members, which a `use` cannot name. The walk
+			// finds what the type's namespace binds (an enum's variant) first.
+			if let Some(declaration) = declaration {
+				let members = sema.type_member_names(
+					&snapshot.strings,
+					declaration,
+					prefix,
+					used_as,
+				);
+				for (name, definition) in members {
+					if !names.iter().any(|&(listed, _)| listed == name) {
+						names.push((name, definition));
+					}
+				}
+			}
+			names
 		}
 		// A name a group lists already would be bound twice.
 		Site::Import { prefix, written } => {
@@ -140,6 +164,17 @@ pub(crate) fn completion(
 				.into_iter()
 				.filter(|(name, _)| !written.contains(name))
 				.collect()
+		}
+		Site::TraitMember {
+			trait_name,
+			used_as,
+		} => {
+			let (_, reference) =
+				query::symbol_at(sema, file, trait_name.start)?;
+			let Definition::Item(bound) = reference.definition() else {
+				return None;
+			};
+			sema.trait_member_names(bound, used_as)
 		}
 		Site::Member { object } => {
 			let owner = query::body_of(sema, declaration?)?;
@@ -332,6 +367,13 @@ pub(crate) enum Site {
 	Segment { prefix: TextSpan, used_as: NameUse },
 	/// A member of the object as the body checked it.
 	Member { object: ExprId },
+	/// The segment after a trait-qualified root, `<T as Tr>::`, used as
+	/// `used_as`: one of the members of the trait whose last name is
+	/// written at `trait_name`.
+	TraitMember {
+		trait_name: TextSpan,
+		used_as: NameUse,
+	},
 	/// The label of a jump.
 	Label(Jump),
 	/// The last segment of a `use` path, after the one written at `prefix`,
@@ -361,7 +403,10 @@ pub(crate) enum Site {
 }
 
 /// One candidate. Locals and type parameters sort before items, as the
-/// lookup tries them first. Members keep the order the checker lists them in.
+/// lookup tries them first. Members after `.` (`member_index`) keep the
+/// order the checker lists them in, and their receiver gives a method's
+/// `self`; named through a type (`Point::flip(p)`), a method takes it as an
+/// argument.
 fn item(
 	snapshot: &Snapshot,
 	name: SymbolU32,
@@ -387,6 +432,9 @@ fn item(
 		Definition::Field { .. } => (CompletionItemKind::FIELD, 0),
 		Definition::Member(MemberKind::Method(_)) => {
 			(CompletionItemKind::METHOD, 0)
+		}
+		Definition::Member(MemberKind::Function(_)) => {
+			(CompletionItemKind::FUNCTION, 0)
 		}
 		Definition::Member(MemberKind::AssociatedType(_)) => {
 			(CompletionItemKind::STRUCT, 0)
@@ -415,18 +463,20 @@ fn item(
 			};
 			(kind, 1)
 		}
-		// Nothing else is listed: `names_at`, `names_in`, `labels_at` and
-		// `argument_names` and `member_names` give locals, type parameters,
-		// items, labels, parameters, fields and methods.
-		_ => (CompletionItemKind::TEXT, 1),
 	};
 	let params = match definition {
-		Definition::Member(MemberKind::Method(function)) => Some(
-			snapshot.sema.decls.functions[usize::from(function)]
-				.params
-				.len() - 1,
-		),
-		Definition::Member(MemberKind::Function(function)) => Some(
+		Definition::Member(MemberKind::Method(function))
+			if member_index.is_some() =>
+		{
+			Some(
+				snapshot.sema.decls.functions[usize::from(function)]
+					.params
+					.len() - 1,
+			)
+		}
+		Definition::Member(
+			MemberKind::Function(function) | MemberKind::Method(function),
+		) => Some(
 			snapshot.sema.decls.functions[usize::from(function)]
 				.params
 				.len(),
@@ -1198,9 +1248,12 @@ impl Cursor<'_> {
 				})
 			}
 			Expression::Loop { block, .. } => self.block(block),
-			Expression::QualifiedPath { root, .. } => {
-				self.qualified_root(ast.qualified_root(root))
-			}
+			Expression::QualifiedPath { root, segments } => self
+				.qualified_path(
+					ast.qualified_root(root),
+					ast.list(segments),
+					NameUse::Value,
+				),
 			Expression::Grouped { inner, .. } => self.ty(inner),
 			Expression::Tuple { elements }
 			| Expression::ArrayList { elements } => self.list(span, ast.list(elements)),
@@ -1298,9 +1351,12 @@ impl Cursor<'_> {
 			TypeExpression::Array { inner, length } => {
 				self.ty(inner).or_else(|| self.const_argument(length))
 			}
-			TypeExpression::QualifiedPath { root, .. } => {
-				self.qualified_root(ast.qualified_root(root))
-			}
+			TypeExpression::QualifiedPath { root, segments } => self
+				.qualified_path(
+					ast.qualified_root(root),
+					ast.list(segments),
+					NameUse::Type,
+				),
 			TypeExpression::Infer | TypeExpression::Never => None,
 		}
 	}
@@ -1400,13 +1456,32 @@ impl Cursor<'_> {
 		})
 	}
 
-	/// `<T as Tr>` before a path's segments: a type and a trait (read as a
-	/// bound is). What
-	/// follows it is a member of the type, which is not completed yet.
-	fn qualified_root(&self, root: QualifiedPathRoot) -> Option<Site> {
-		self.ty(root.self_type).or_else(|| {
-			self.path(self.ast.list(root.trait_path), NameUse::Bound)
-		})
+	/// `<T as Tr>::` and the segments after it: a type and a trait (read
+	/// as a bound is), then one of the trait's members, used as `used_as`
+	/// when it is the last segment and as a type when more follow. What
+	/// follows a member is a member of it, which is not completed.
+	fn qualified_path(
+		&self,
+		root: QualifiedPathRoot,
+		segments: &[PathSegment],
+		used_as: NameUse,
+	) -> Option<Site> {
+		let trait_path = self.ast.list(root.trait_path);
+		self.ty(root.self_type)
+			.or_else(|| self.path(trait_path, NameUse::Bound))
+			.or_else(|| {
+				let first = segments.first()?;
+				if !self.at(first.ident.span) {
+					return self.type_args(first);
+				}
+				Some(Site::TraitMember {
+					trait_name: trait_path.last()?.ident.span,
+					used_as: match segments.len() {
+						1 => used_as,
+						_ => NameUse::Type,
+					},
+				})
+			})
 	}
 
 	/// The label of a jump. A label not written yet (`break :`) is the
@@ -1438,12 +1513,17 @@ impl Cursor<'_> {
 		}
 		match ast.constant(constant) {
 			ConstArgument::Path(segments) => {
-				self.path(ast.list(segments), NameUse::Value)
+				self.path(ast.list(segments), NameUse::Constant)
 			}
-			ConstArgument::QualifiedPath { root, .. } => {
-				self.qualified_root(ast.qualified_root(root))
-			}
+			ConstArgument::QualifiedPath { root, segments } => self
+				.qualified_path(
+					ast.qualified_root(root),
+					ast.list(segments),
+					NameUse::Constant,
+				),
 			ConstArgument::Grouped { inner, .. } => self.ty(inner),
+			// A length not written yet (`[u8; ]`).
+			ConstArgument::Error => Some(Site::Name(NameUse::Constant)),
 			ConstArgument::Literal(_) | ConstArgument::Infer => None,
 		}
 	}

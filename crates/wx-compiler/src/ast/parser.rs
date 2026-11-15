@@ -1589,8 +1589,17 @@ impl<'ctx> Parser<'ctx> {
 				Token::LeftArrow => self.lexer.next().span,
 				_ => self.lexer.split_double_left_arrow(),
 			};
-			let root = self.parse_bracketed_root(open_span)?;
-			let path = self.parse_value_path()?;
+			let (root, after) = self.parse_bracketed_root(open_span)?;
+			// A name not written yet (`<T as Tr>::`) is reported and kept, so
+			// the root is still resolved.
+			let path = if Self::is_later_segment(self.lexer.peek().inner) {
+				self.parse_value_path()?
+			} else {
+				let bad = self.lexer.peek();
+				self.diagnostics
+					.push(report_invalid_namespace(self.file_id, bad.span));
+				self.push_path(vec![PathSegment::missing(after)])
+			};
 			let span = TextSpan::new(open_span.start, path.span.end);
 			let segments = path.segments;
 			let kind = match root {
@@ -1622,15 +1631,30 @@ impl<'ctx> Parser<'ctx> {
 		Ok(self.ast.push_const(ConstArgument::Path(segments), span))
 	}
 
-	/// An array's length, in a type or a repeat: only a constant can be
-	/// written there, so `const` says nothing.
-	fn parse_length(&mut self) -> Result<ConstId, ()> {
+	/// An array's length, in a type or a repeat, after the `;` that ends at
+	/// `after`: only a constant can be written there, so `const` says
+	/// nothing. A length not written yet (`[u8; ]`) is reported and kept as
+	/// an error node spanning the gap up to the `]`, as a missing type is,
+	/// so the array is kept too.
+	fn parse_length(&mut self, after: u32) -> Result<ConstId, ()> {
 		if let Some(Keyword::Const) = self.peek_keyword() {
 			let span = self.lexer.next().span;
 			self.diagnostics.push(report_redundant_const_marker(
 				self.file_id,
 				span,
 				"a length is a constant already",
+			));
+		}
+		let token = self.lexer.peek();
+		if token.inner == Token::CloseBracket {
+			self.diagnostics.push(report_unexpected_token(
+				self.file_id,
+				token,
+				Token::Identifier,
+			));
+			return Ok(self.ast.push_const(
+				ConstArgument::Error,
+				TextSpan::new(after, token.span.start),
 			));
 		}
 		self.parse_const_argument()
@@ -2117,8 +2141,17 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 		open_span: TextSpan,
 	) -> Result<TypeId, ()> {
-		let root = self.parse_bracketed_root(open_span)?;
-		let path = self.parse_type_path()?;
+		let (root, after) = self.parse_bracketed_root(open_span)?;
+		// A name not written yet (`<T as Tr>::`) is reported and kept, so
+		// the root is still resolved.
+		let path = if Self::is_later_segment(self.lexer.peek().inner) {
+			self.parse_type_path()?
+		} else {
+			let bad = self.lexer.peek();
+			self.diagnostics
+				.push(report_invalid_namespace(self.file_id, bad.span));
+			self.push_path(vec![PathSegment::missing(after)])
+		};
 		let span = TextSpan::new(open_span.start, path.span.end);
 		let segments = path.segments;
 		let kind = match root {
@@ -2134,12 +2167,13 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// `<Type as Trait>::` or `<Type>::`, after its opening `<`
-	/// (`open_span`), up to and including the `::`. Which one it is hinges
-	/// entirely on whether `as` follows the type.
+	/// (`open_span`), up to and including the `::`, with where that `::`
+	/// ends. Which one it is hinges entirely on whether `as` follows the
+	/// type.
 	fn parse_bracketed_root(
 		&mut self,
 		open_span: TextSpan,
-	) -> Result<BracketedRoot, ()> {
+	) -> Result<(BracketedRoot, u32), ()> {
 		let self_type = self.parse_type_expression()?;
 		let root = if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
@@ -2154,8 +2188,8 @@ impl<'ctx> Parser<'ctx> {
 			self.expect_close_angle(open_span);
 			BracketedRoot::Grouped(self_type)
 		};
-		self.next_expect(Token::ColonColon)?;
-		Ok(root)
+		let colons = self.next_expect(Token::ColonColon)?;
+		Ok((root, colons.span.end))
 	}
 
 	/// Parses a leading `*`/`&` sigil (not yet consumed — the caller only
@@ -2205,7 +2239,7 @@ impl<'ctx> Parser<'ctx> {
 				TextSpan::new(open.start, next.span.end),
 			)),
 			Token::SemiColon => {
-				let length = self.parse_length()?;
+				let length = self.parse_length(next.span.end)?;
 				let close_span = self.next_expect(Token::CloseBracket)?.span;
 				Ok(self.ast.push_type(
 					TypeExpression::Array { inner, length },
@@ -2492,8 +2526,17 @@ impl<'ctx> Parser<'ctx> {
 	/// as Trait>::method(x)` needs no extra handling here.
 	fn parse_qualified_path_expression(&mut self) -> Result<ExprId, ()> {
 		let open_span = self.lexer.next().span; // consume `<`
-		let root = self.parse_bracketed_root(open_span)?;
-		let path = self.parse_value_path()?;
+		let (root, after) = self.parse_bracketed_root(open_span)?;
+		// A name not written yet (`<T as Tr>::`) is reported and kept, so
+		// the root is still resolved.
+		let path = if Self::is_later_segment(self.lexer.peek().inner) {
+			self.parse_value_path()?
+		} else {
+			let bad = self.lexer.peek();
+			self.diagnostics
+				.push(report_invalid_namespace(self.file_id, bad.span));
+			self.push_path(vec![PathSegment::missing(after)])
+		};
 		let span = TextSpan::new(open_span.start, path.span.end);
 		let segments = path.segments;
 		let kind = match root {
@@ -3282,8 +3325,8 @@ impl<'ctx> Parser<'ctx> {
 
 		let first = self.parse_expression(BindingPower::Default)?;
 
-		if self.lexer.next_if(Token::SemiColon).is_some() {
-			let count = self.parse_length()?;
+		if let Some(semicolon) = self.lexer.next_if(Token::SemiColon) {
+			let count = self.parse_length(semicolon.span.end)?;
 			let close_span = self.next_expect(Token::CloseBracket)?.span;
 			let span = TextSpan::new(open_span.start, close_span.end);
 			return Ok(self.ast.push_expr(
