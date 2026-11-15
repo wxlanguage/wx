@@ -677,10 +677,11 @@ pub enum Destructure {
 		elements: List<PatternElement>,
 	},
 	/// `Name({ field, other: pat, .. })`, as `Name({ x: 1, y: 2 })` constructs
-	/// it.
+	/// it; `open_brace` is where its `{` starts.
 	NamedStruct {
 		path: List<PathSegment>,
 		fields: List<PatternFieldItem>,
+		open_brace: u32,
 	},
 }
 

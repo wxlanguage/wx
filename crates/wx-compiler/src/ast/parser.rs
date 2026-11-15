@@ -3478,6 +3478,7 @@ impl<'ctx> Parser<'ctx> {
 				Pattern::Destructure(Destructure::NamedStruct {
 					path,
 					fields: fields.inner,
+					open_brace: fields.span.start,
 				}),
 				TextSpan::new(path_start, close_span.end),
 			));

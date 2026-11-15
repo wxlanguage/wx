@@ -2110,6 +2110,22 @@ fn test_pattern_struct_destructuring() {
 	);
 }
 
+/// A struct pattern with braces keeps where its `{` starts, which tells the
+/// room inside them from the path before.
+#[test]
+fn a_named_struct_pattern_keeps_its_open_brace() {
+	let source = "func f(p: Point) {\n    local Point({ x }) = p;\n}\n";
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	let pattern = local_definition_pattern(&case.function_block(0), 0);
+	let Pattern::Destructure(Destructure::NamedStruct { open_brace, .. }) =
+		case.ast.pattern(pattern)
+	else {
+		panic!("expected a struct pattern with braces")
+	};
+	assert_eq!(open_brace as usize, source.find("({").unwrap() + 1);
+}
+
 #[test]
 fn a_pattern_path_starts_where_an_expression_path_can() {
 	// `Self`, `crate` and `super` lead a path, and `super` continues one;

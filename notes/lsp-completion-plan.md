@@ -416,6 +416,15 @@ that inserts the ascription.
      `ConstArgument::Error` spanning the gap, as a missing type is, and is a
      constant's name there. A segment after a member (`<T as Tr>::Item::`)
      and `<T>::` are not completed.
+   - 5f, done: patterns. A struct pattern with braces, `Name({ x, | })`,
+     offers the fields not written yet, `Semantics::pattern_field_names`,
+     as the checker matches them (`pattern_owner`, `check_fields`): a
+     struct's fields, `Self`'s in an impl for one, or an enum's repr, and
+     nothing for an owner with an unnamed field. The pattern keeps where
+     its `{` starts (`Destructure::NamedStruct::open_brace`; `Pattern`
+     stays 24 bytes), which tells the room inside the braces from the path.
+     A constant pattern (`const |`, `Kind::|`) is `NameUse::Constant`. A
+     destructure's own path (`Po|(..)`) still lists every value.
 6. Later: ranking by the expected type (the checker has `Expected` but does
    not keep it), `completionItem/resolve` through `hover::signature`, the
    E2002 code action.

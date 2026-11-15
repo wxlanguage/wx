@@ -35,7 +35,8 @@ use crate::tir::decls::{
 };
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
-use crate::tir::resolutions::{AccessKind, Reference, Site};
+use crate::tir::resolutions::{AccessKind, Definition, Reference, Site};
+use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
 use crate::vfs::FileId;
@@ -600,7 +601,7 @@ impl BodyBuilder<'_, '_> {
 				};
 				self.push_fields_pattern(owner, fields, ty, span)
 			}
-			ast::Destructure::NamedStruct { path, fields } => {
+			ast::Destructure::NamedStruct { path, fields, .. } => {
 				let Some((owner, ty, types)) =
 					self.pattern_owner(ast.list(path), span, expected)
 				else {
@@ -1569,5 +1570,58 @@ impl Integer {
 		} else {
 			self.max()
 		}
+	}
+}
+
+impl Semantics {
+	/// The names a struct pattern with braces, `Name({ .. })`, can give
+	/// after a path that means `owner`, with the field each names, in
+	/// declaration order, as the checker matches them (`pattern_owner`,
+	/// `check_fields`): a struct's fields (named, or `Self` in an impl for
+	/// it), or an enum's repr. Nothing for an owner with an unnamed field,
+	/// which is matched by position only, or for a path naming neither.
+	pub fn pattern_field_names(
+		&self,
+		owner: Definition,
+	) -> Vec<(SymbolU32, Definition)> {
+		let target = match owner {
+			Definition::InherentImplTarget(index) => self.inherent_impls
+				[usize::from(index)]
+			.as_ref()
+			.map(|header| header.target.inner),
+			Definition::TraitImplTarget(index) => self.trait_impls
+				[usize::from(index)]
+			.as_ref()
+			.map(|header| header.target.inner),
+			_ => None,
+		};
+		let owner = match (owner, target) {
+			(Definition::Item(loc), _) => match self.declaration_kind(loc) {
+				DeclKind::Struct(index) => FieldOwner::Struct(index),
+				DeclKind::Enum(index) => FieldOwner::Enum(index),
+				_ => return Vec::new(),
+			},
+			(_, Some(target)) => match *self.types.resolve(target) {
+				Type::Struct { struct_index, .. } => {
+					FieldOwner::Struct(struct_index)
+				}
+				_ => return Vec::new(),
+			},
+			_ => return Vec::new(),
+		};
+		let fields = owner.fields(&self.decls);
+		if !self.decls.fields.is_fully_named(fields) {
+			return Vec::new();
+		}
+		let mut found = Vec::new();
+		for (at, name) in self.decls.fields.names(fields).iter().enumerate() {
+			let field = FieldIdx::new(at as u32);
+			if let Some(name) = *name
+				&& self.decls.fields.lookup(fields, name) == Some(field)
+			{
+				found.push((name, Definition::Field { owner, field }));
+			}
+		}
+		found
 	}
 }

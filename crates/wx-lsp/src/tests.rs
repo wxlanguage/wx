@@ -2586,6 +2586,80 @@ fn completion_after_a_trait_qualified_root_inserts_a_methods_self() {
 	assert_eq!(insert("make").as_deref(), Some("make()"));
 }
 
+const PATTERN_ITEMS: &str = "struct Point(x: u32, y: u32, z: u32);
+struct Pair(u32, u32);
+enum Signal(pub number: i32) { Off = 0, On }
+const LIMIT: u32 = 4;
+func helper() -> u32 { 1 }
+";
+
+#[test]
+fn completion_in_a_struct_pattern_offers_its_fields() {
+	// In a destructuring and a match arm, the room after a comma, and a
+	// name being written: the fields not written yet.
+	for source in [
+		"func f(p: Point) {\n    local Point({ x, $0 }) = p;\n}\n",
+		"func f(p: Point) {\n    local Point({ x, y$0 }) = p;\n}\n",
+		"func f(p: Point) -> u32 {\n    match p {\n        Point({ y$0, x }) => 1,\n    }\n}\n",
+	] {
+		let labels = completions(&format!("{PATTERN_ITEMS}{source}"))
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_eq!(labels, ["y", "z"], "{source:?}");
+	}
+	// An enum's repr, read as a struct's fields are.
+	let labels = completions(&format!(
+		"{PATTERN_ITEMS}func f(s: Signal) {{\n    local Signal({{ $0 }}) = s;\n}}\n"
+	))
+	.unwrap();
+	assert_eq!(labels, ["number"]);
+	// `Self` in an impl for the struct.
+	let labels = completions(&format!(
+		"{PATTERN_ITEMS}impl Point {{\n    func g(self: Self) {{\n        local Self({{ z, $0 }}) = self;\n    }}\n}}\n"
+	))
+	.unwrap();
+	assert_eq!(labels, ["x", "y"]);
+}
+
+#[test]
+fn completion_in_a_struct_pattern_offers_nothing_the_checker_would_refuse() {
+	for source in [
+		// Unnamed fields are matched by position only.
+		"func f(p: Pair) {\n    local Pair({ $0 }) = p;\n}\n",
+		// After `..`, and outside the braces.
+		"func f(p: Point) {\n    local Point({ x, ..$0 }) = p;\n}\n",
+		"func f(p: Point) {\n    local Point({ x })$0 = p;\n}\n",
+	] {
+		assert_eq!(
+			completions(&format!("{PATTERN_ITEMS}{source}")),
+			None,
+			"{source:?}"
+		);
+	}
+}
+
+#[test]
+fn completion_in_a_fields_pattern_reads_the_pattern_after_its_colon() {
+	let labels = completions(&format!(
+		"{PATTERN_ITEMS}func f(p: Point) -> u32 {{\n    match p {{\n        Point({{ x: const L$0, .. }}) => 1,\n        _ => 2,\n    }}\n}}\n"
+	))
+	.expect("a constant in a field's pattern");
+	assert_offers(&labels, &["LIMIT"], &["x", "helper"]);
+}
+
+#[test]
+fn completion_of_a_constant_pattern_offers_constants() {
+	let labels = completions(&format!(
+		"{PATTERN_ITEMS}func f(n: u32) -> u32 {{\n    match n {{\n        const L$0 => 1,\n        _ => 2,\n    }}\n}}\n"
+	))
+	.expect("a constant pattern");
+	assert_offers(&labels, &["LIMIT", "Signal"], &["helper", "n"]);
+	let labels = completions(&format!(
+		"{PATTERN_ITEMS}func f(s: Signal) -> u32 {{\n    match s {{\n        Signal::$0 => 1,\n        _ => 2,\n    }}\n}}\n"
+	))
+	.expect("a variant pattern");
+	assert_eq!(labels, ["Off", "On"]);
+}
+
 #[test]
 fn completion_of_a_label_offers_the_ones_a_jump_can_name() {
 	let source = "func f() {\n    loop :outer {\n        block :inner {\n            break :$0\n        }\n    }\n}\n";

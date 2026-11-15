@@ -989,7 +989,11 @@ impl<'a> Printer<'a> {
 					self.pattern_elements(elements),
 				)
 			}
-			Pattern::Destructure(Destructure::NamedStruct { path, fields }) => {
+			Pattern::Destructure(Destructure::NamedStruct {
+				path,
+				fields,
+				..
+			}) => {
 				let fields =
 					self.ast.list(fields).iter().map(|field| match *field {
 						PatternFieldItem::Field(PatternField {

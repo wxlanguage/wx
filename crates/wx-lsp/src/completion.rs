@@ -222,6 +222,15 @@ pub(crate) fn completion(
 				.collect();
 			return Some(CompletionResponse::Array(items));
 		}
+		// A field matched twice is reported, so the ones written are not
+		// offered again.
+		Site::PatternField { owner, written } => {
+			let (_, reference) = query::symbol_at(sema, file, owner.start)?;
+			sema.pattern_field_names(reference.definition())
+				.into_iter()
+				.filter(|(name, _)| !written.contains(name))
+				.collect()
+		}
 		// A name written twice is reported (E2121), so the ones written are
 		// not offered again.
 		Site::Argument {
@@ -389,6 +398,13 @@ pub(crate) enum Site {
 		bound: TextSpan,
 		entry: Entry,
 		written: Vec<(Tier, SymbolU32)>,
+	},
+	/// The name of a field in a struct pattern with braces: one of the
+	/// fields of the struct or enum whose last name is written at `owner`,
+	/// not among the `written` ones.
+	PatternField {
+		owner: TextSpan,
+		written: Vec<SymbolU32>,
 	},
 	/// The name of an argument in a call by name: one of the parameters of
 	/// the callee whose last name is written at `callee`, in `call`, after
@@ -1369,7 +1385,7 @@ impl Cursor<'_> {
 		match ast.pattern(pattern) {
 			// `const MAX`: a constant, named in the value tier.
 			Pattern::Constant { path } => {
-				self.path(ast.list(path), NameUse::Value)
+				self.path(ast.list(path), NameUse::Constant)
 			}
 			Pattern::Or(alternatives) => self.pattern(
 				*self.child_by(ast.list(alternatives), |&alternative| {
@@ -1383,26 +1399,19 @@ impl Cursor<'_> {
 				self.path(ast.list(path), NameUse::Value)
 					.or_else(|| self.pattern_elements(ast.list(elements)))
 			}
-			Pattern::Destructure(Destructure::NamedStruct { path, fields }) => {
-				self.path(ast.list(path), NameUse::Value).or_else(|| {
-					let field =
-						self.child_by(ast.list(fields), |item| match *item {
-							PatternFieldItem::Field(field) => {
-								let end = field
-									.pattern
-									.map_or(field.name.span.end, |pattern| {
-										ast.pattern_span(pattern).end
-									});
-								TextSpan::new(field.name.span.start, end)
-							}
-							PatternFieldItem::Rest(span) => span,
-						})?;
-					match *field {
-						PatternFieldItem::Field(field) => {
-							self.pattern(field.pattern?)
-						}
-						PatternFieldItem::Rest(_) => None,
-					}
+			Pattern::Destructure(Destructure::NamedStruct {
+				path,
+				fields,
+				open_brace,
+			}) => {
+				let path = ast.list(path);
+				// The braces end right before the `)` that closes the pattern.
+				let braces = TextSpan::new(
+					open_brace,
+					ast.pattern_span(pattern).end - 1,
+				);
+				self.path(path, NameUse::Value).or_else(|| {
+					self.pattern_fields(path, ast.list(fields), braces)
 				})
 			}
 			// A binding declares its name; nothing is looked up.
@@ -1411,6 +1420,51 @@ impl Cursor<'_> {
 			| Pattern::Literal(_)
 			| Pattern::Error => None,
 		}
+	}
+
+	/// A struct pattern's fields, in their braces: the name of the one at the
+	/// cursor, or one not written yet in the room between two, is one of the
+	/// fields of what `path` names; after a name's `:` is its pattern.
+	fn pattern_fields(
+		&self,
+		path: &[PathSegment],
+		fields: &[PatternFieldItem],
+		braces: TextSpan,
+	) -> Option<Site> {
+		if !self.inside(braces) {
+			return None;
+		}
+		let ast = self.ast;
+		let at = self.child_index_by(fields, |item| match *item {
+			PatternFieldItem::Field(field) => {
+				let end =
+					field.pattern.map_or(field.name.span.end, |pattern| {
+						ast.pattern_span(pattern).end
+					});
+				TextSpan::new(field.name.span.start, end)
+			}
+			PatternFieldItem::Rest(span) => span,
+		});
+		if let Some(at) = at {
+			match fields[at] {
+				PatternFieldItem::Field(field) if !self.at(field.name.span) => {
+					return self.pattern(field.pattern?);
+				}
+				PatternFieldItem::Field(_) => {}
+				PatternFieldItem::Rest(_) => return None,
+			}
+		}
+		let written = (fields.iter().enumerate())
+			.filter(|&(index, _)| Some(index) != at)
+			.filter_map(|(_, item)| match item {
+				PatternFieldItem::Field(field) => Some(field.name.inner),
+				PatternFieldItem::Rest(_) => None,
+			})
+			.collect();
+		Some(Site::PatternField {
+			owner: path.last()?.ident.span,
+			written,
+		})
 	}
 
 	fn pattern_elements(&self, elements: &[PatternElement]) -> Option<Site> {

@@ -2773,7 +2773,7 @@ impl<'a> Builder<'a> {
 				out.push(self.build_value_path(ast.list(path)));
 				elements(self, out, ast.list(items));
 			}
-			ast::Destructure::NamedStruct { path, fields } => {
+			ast::Destructure::NamedStruct { path, fields, .. } => {
 				let fields = ast.list(fields);
 				out.push(self.build_value_path(ast.list(path)));
 				out.push(self.text(Text::LParen));
