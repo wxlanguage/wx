@@ -24,8 +24,8 @@ use crate::ast::{self, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
 use crate::tir::decls::{
-	AssocTypeIdx, BindingKey, DeclKind, Declarations, FieldIdx, FunctionIdx,
-	MemberKind, MemberOwner, StructIdx,
+	AssocTypeIdx, DeclKind, Declarations, FieldIdx, FunctionIdx, MemberKind,
+	MemberOwner, StructIdx,
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::resolutions::{AccessKind, Definition, Reference, Site};
@@ -114,9 +114,6 @@ pub(super) struct CallTarget {
 	pub(super) generic_env: GenericEnvIdx,
 	/// Each parameter's type as declared, `self` included.
 	pub(super) param_types: TypeList,
-	/// The declaration whose parameter names a call by name spells: a
-	/// function's naming declaration, or the struct (`param_names`).
-	names: CallTargetKind,
 }
 
 impl CallTarget {
@@ -126,7 +123,6 @@ impl CallTarget {
 			kind: CallTargetKind::Function(function),
 			generic_env: signature.type_params,
 			param_types: signature.param_types,
-			names: CallTargetKind::Function(naming_declaration(sema, function)),
 		}
 	}
 
@@ -139,7 +135,6 @@ impl CallTarget {
 			kind: CallTargetKind::StructConstructor(struct_index),
 			generic_env: signature.type_params,
 			param_types: signature.field_types,
-			names: CallTargetKind::StructConstructor(struct_index),
 		}
 	}
 
@@ -149,7 +144,7 @@ impl CallTarget {
 		&self,
 		decls: &'d Declarations,
 	) -> &'d [Option<SymbolU32>] {
-		match self.names {
+		match self.kind {
 			CallTargetKind::Function(function) => decls
 				.params
 				.names(decls.functions[usize::from(function)].params),
@@ -177,19 +172,6 @@ impl CallTarget {
 }
 
 impl Semantics {
-	/// Parameter names from the declaration that defines the call contract.
-	/// A trait implementation uses its trait's names, including where the
-	/// implementation leaves a parameter unnamed.
-	pub fn function_parameter_names(
-		&self,
-		function: FunctionIdx,
-	) -> &[Option<SymbolU32>] {
-		let function = naming_declaration(self, function);
-		self.decls
-			.params
-			.names(self.decls.functions[usize::from(function)].params)
-	}
-
 	/// What `Self(..)` calls in an impl for `target`: the struct's
 	/// constructor, as `impl_self_struct` reads it.
 	fn self_constructor(
@@ -207,11 +189,10 @@ impl Semantics {
 	/// The names a call by name of `callee` can give, with what each names,
 	/// in its parameters' order after the first `given` (a method call's
 	/// receiver, which its object gives and no name can), as the checker
-	/// matches them (`CallTarget::param_names`): a function's, or for a trait
-	/// impl's function its trait declaration's, or a struct's fields (named, or
-	/// `Self` in an impl for it). Nothing
-	/// for a target with an unnamed parameter, which is called by position
-	/// only, or for a callee that is no function or struct.
+	/// matches them (`CallTarget::param_names`): a function's own, or a
+	/// struct's fields (named, or `Self` in an impl for it). Nothing for a
+	/// target with an unnamed parameter, which is called by position only, or
+	/// for a callee that is no function or struct.
 	pub fn argument_names(
 		&self,
 		callee: Definition,
@@ -254,7 +235,7 @@ impl Semantics {
 			.enumerate()
 			.skip(given)
 			.filter_map(|(at, name)| {
-				let definition = match target.names {
+				let definition = match target.kind {
 					CallTargetKind::Function(function) => {
 						Definition::Parameter {
 							function,
@@ -330,31 +311,6 @@ impl CallTargetKind {
 			}
 		};
 		declaration.secondary_label().with_message("declared here")
-	}
-}
-
-/// The declaration whose parameter names a call of `function` by name uses:
-/// for a trait impl's function, its trait's declaration, so a call is named
-/// the same whichever impl it reaches; otherwise the function itself. An impl
-/// function its trait does not declare names its own.
-fn naming_declaration(sema: &Semantics, function: FunctionIdx) -> FunctionIdx {
-	let decl = &sema.decls.functions[usize::from(function)];
-	let MemberOwner::TraitImpl(impl_index) = decl.owner else {
-		return function;
-	};
-	let Some(trait_index) =
-		sema.impl_dispatch.trait_header(impl_index).trait_decl
-	else {
-		return function;
-	};
-	match sema.decls.declared_trait_member(
-		trait_index.inner,
-		BindingKey::value(sema.decls.item(decl.loc).name.inner),
-	) {
-		Some(
-			MemberKind::Function(declaration) | MemberKind::Method(declaration),
-		) => declaration,
-		_ => function,
 	}
 }
 
@@ -918,7 +874,7 @@ impl BodyBuilder<'_, '_> {
 			};
 			let label = match target.kind {
 				CallTargetKind::Function(function) => Reference::Parameter {
-					function: naming_declaration(self.sema, function),
+					function,
 					parameter: param,
 				},
 				CallTargetKind::StructConstructor(owner) => Reference::Field {

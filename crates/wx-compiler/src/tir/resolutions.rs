@@ -156,10 +156,9 @@ pub enum Reference {
 		field: FieldIdx,
 		access: AccessKind,
 	},
-	/// A named argument's parameter, owned by the declaration whose names the
-	/// call uses (the trait declaration for a trait implementation's method).
-	/// This does not require the callee to have a body or a corresponding
-	/// local.
+	/// A named argument's parameter, of the function the call selected (a
+	/// trait's declaration, for a call through an abstract type). This does
+	/// not require the callee to have a body or a corresponding local.
 	Parameter {
 		function: FunctionIdx,
 		parameter: ParamIdx,
@@ -1397,14 +1396,14 @@ mod tests {
 	}
 
 	#[test]
-	fn trait_argument_labels_refer_to_the_naming_declaration_without_a_body() {
+	fn argument_labels_refer_to_the_selected_functions_parameter() {
 		let a = Analysis::clean(indoc! {"
 			trait Make: StackValue {
 				func make(value: u32) -> Self;
 			}
 			struct S(value: u32);
 			impl Make for S {
-				func make(_: u32) -> Self { S(0) }
+				func make(value: u32) -> Self { S(0) }
 			}
 			func concrete(value: u32) -> S {
 				S::make({ value })
@@ -1413,22 +1412,34 @@ mod tests {
 				T::make({ value })
 			}
 		"});
+		let make = a.strings.get("make").unwrap();
 		let DeclKind::Trait(trait_index) = a.resolve("Make", Tier::Type) else {
 			panic!("expected a trait");
 		};
-		let Some(MemberKind::Function(function)) =
-			a.sema.decls.declared_trait_member(
-				trait_index,
-				crate::tir::decls::BindingKey::value(
-					a.strings.get("make").unwrap(),
-				),
-			)
+		let Some(MemberKind::Function(declaration)) = a
+			.sema
+			.decls
+			.declared_trait_member(trait_index, BindingKey::value(make))
 		else {
 			panic!("expected the trait's function declaration");
 		};
-		for (call, caller) in [
-			("S::make({ value })", "concrete"),
-			("T::make({ value })", "generic"),
+		let decls = &a.sema.decls;
+		let implementation = (0..decls.functions.len())
+			.map(|index| FunctionIdx::new(index as u32))
+			.find(|&function| {
+				let decl = &decls.functions[usize::from(function)];
+				matches!(
+					decl.owner,
+					crate::tir::decls::MemberOwner::TraitImpl(_)
+				) && decls.name(function).inner == make
+					&& decls.file_id(decl.loc) == a.file
+			})
+			.unwrap();
+		// A concrete call names the impl's parameter; a call through the
+		// trait, the declaration's, which has no body.
+		for (call, caller, function) in [
+			("S::make({ value })", "concrete", implementation),
+			("T::make({ value })", "generic", declaration),
 		] {
 			assert_eq!(
 				a.shorthand(call, "value"),

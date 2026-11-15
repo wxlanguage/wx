@@ -5,8 +5,9 @@
 //! - every member the impl writes is one the trait declares, of the same
 //!   kind, and every declaration without a default is provided;
 //! - a function's signature is the declaration's read with `Self` as the
-//!   target: the same number of own type parameters and parameters, the same
-//!   parameter names, the same types; a constant has the declaration's type;
+//!   target: the same number of own type parameters and parameters, every
+//!   parameter name the declaration gives (an impl may name one it leaves
+//!   unnamed), the same types; a constant has the declaration's type;
 //! - the target implements the trait's supertraits, with their bindings
 //!   (`Self`'s clauses in the trait's frame, proved for the target);
 //! - every associated type's value (the impl's own, or the default it
@@ -1288,9 +1289,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 						}
 					})
 				};
-				// Leaving the parameter unnamed only binds no local: the contract
-				// is still the trait's, and so are the names calls use.
-				if name.is_some() && expected_name != name {
+				// A concrete call names the impl's parameters, so the impl keeps
+				// every name the trait gives and may name one it leaves unnamed.
+				if expected_name.is_some() && expected_name != name {
 					self.report_name_mismatch(
 						sema,
 						trait_index,
@@ -1488,11 +1489,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 	}
 
 	/// A parameter's name is part of the trait's contract: a call by name
-	/// uses the declaration's names, whichever impl it reaches. So an impl
-	/// names a parameter as the trait does, or leaves it unnamed, which binds
-	/// no local and changes nothing for callers; it never renames one, nor
-	/// names one the trait leaves unnamed. Only the name is compared; whether
-	/// its local is `mut` is the body's own.
+	/// through the trait uses it, and a concrete call uses the impl's own
+	/// names, which accept at least what the trait's do. So an impl keeps
+	/// every name the trait gives (never renaming it or leaving it unnamed)
+	/// and may name a parameter the trait leaves unnamed. Only the name is
+	/// compared; whether its local is `mut` is the body's own.
 	fn report_name_mismatch(
 		&mut self,
 		sema: &mut Semantics,
@@ -1553,8 +1554,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			)
 			.with_note(
 				"a parameter's name is part of the trait's contract: a call \
-				 by name uses the trait's names, so an impl names it the same \
-				 or leaves it unnamed",
+				 by name may use it, so an impl keeps it",
 			);
 		sema.diagnostics.push(diagnostic);
 	}
@@ -1888,25 +1888,29 @@ mod tests {
 		"}
 		);
 		let case = TestCase::new(&source);
-		// `named` and `bare` leave the trait's name unbound, which keeps the
-		// contract.
+		// `unnamed` names a parameter the trait leaves unnamed, which a
+		// concrete call may use; `named` and `bare` drop the trait's name.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitImplSignatureMismatch,
 			DiagnosticCode::TraitImplSignatureMismatch,
 			DiagnosticCode::TraitImplSignatureMismatch,
+			DiagnosticCode::TraitImplSignatureMismatch,
 		]);
-		let [renamed, unnamed, receiver] = &case.sema.diagnostics[..] else {
+		let [renamed, named, bare, receiver] = &case.sema.diagnostics[..]
+		else {
 			unreachable!()
 		};
 		assert_eq!(labelled(&source, renamed, 0), "other");
 		assert_eq!(renamed.labels[0].message, "expected `rhs`, found `other`");
 		assert_eq!(labelled(&source, renamed, 1), "rhs");
-		assert_eq!(
-			unnamed.labels[0].message,
-			"expected an unnamed parameter, found `at`"
-		);
-		// An unnamed parameter is pointed at by its type.
-		assert_eq!(labelled(&source, unnamed, 1), "u32");
+		for dropped in [named, bare] {
+			assert_eq!(
+				dropped.labels[0].message,
+				"expected `at`, found an unnamed parameter"
+			);
+			// An unnamed parameter is pointed at by its type.
+			assert_eq!(labelled(&source, dropped, 0), "u32");
+		}
 		assert_eq!(receiver.labels[0].message, "expected `self`, found `this`");
 	}
 

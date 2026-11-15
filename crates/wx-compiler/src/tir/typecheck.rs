@@ -6505,28 +6505,27 @@ mod tests {
 	}
 
 	#[test]
-	fn a_trait_impl_function_is_called_by_its_traits_names() {
+	fn a_concrete_call_uses_the_impls_names() {
 		let case = TestCase::new(indoc! {"
 				struct P(v: u32);
 				impl Add for P {
 					func add(self: Self, other: Self) -> Self { other }
 				}
-				func concrete(p: P, q: P) -> P { p.add({ rhs: q }) }
-				func path(p: P, q: P) -> P { P::add({ rhs: q, self: p }) }
-				func generic<T: Add>(a: T, b: T) -> T { a.add({ rhs: b }) }
 				func impl_name(p: P, q: P) -> P { p.add({ other: q }) }
+				func path(p: P, q: P) -> P { P::add({ other: q, self: p }) }
+				func trait_name(p: P, q: P) -> P { p.add({ rhs: q }) }
+				func generic<T: Add>(a: T, b: T) -> T { a.add({ rhs: b }) }
 			"});
-		// The impl's own name breaks the trait's contract, and calls still use
-		// the trait's.
+		// Renaming breaks the trait's contract; a concrete call still reads
+		// the impl as written, and a call through the trait the declaration.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitImplSignatureMismatch,
 			DiagnosticCode::UnknownParameterName,
 			DiagnosticCode::MissingArguments,
 		]);
-		case.diagnostics().assert_error_saying(
-			"function `add` has no parameter named `other`",
-		);
-		assert_eq!(case.shape("concrete"), "(block => (call add p#0 q#1))");
+		case.diagnostics()
+			.assert_error_saying("function `add` has no parameter named `rhs`");
+		assert_eq!(case.shape("impl_name"), "(block => (call add p#0 q#1))");
 		assert_eq!(case.shape("path"), "(block => (call add 1=q#1 0=p#0))");
 		assert_eq!(
 			case.shape("generic"),
@@ -6542,7 +6541,7 @@ mod tests {
 				}
 				struct S(n: u32);
 				impl Make for S {
-					func make(value: u32, _: u32) -> Self { S(value) }
+					func make(value: u32, scale: u32) -> Self { S(value) }
 				}
 				impl S {
 					pub func twice(self: Self, by: u32) -> u32 { by }
@@ -6577,7 +6576,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_call_by_name_follows_the_traits_names_even_where_it_leaves_one_out() {
+	fn an_impl_may_name_a_parameter_its_trait_leaves_unnamed() {
 		let case = TestCase::new(indoc! {"
 				trait Scale: StackValue {
 					func scale(self: Self, u32) -> Self;
@@ -6587,19 +6586,23 @@ mod tests {
 					func scale(self: Self, by: u32) -> Self { self }
 				}
 				func named(s: S) -> S { s.scale({ by: 2 }) }
-				func positional(s: S) -> S { s.scale(2) }
+				func generic<T: Scale>(t: T) -> T { t.scale({ by: 2 }) }
+				func positional<T: Scale>(t: T) -> T { t.scale(2) }
 			"});
-		// Naming the parameter breaks the trait's contract, and the call still
-		// follows the trait's declaration, which has no name to call it by.
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::TraitImplSignatureMismatch,
-			DiagnosticCode::PositionalOnlyCall,
-		]);
+		// The impl's name is its own to give, so a concrete call may use it;
+		// the trait's declaration has none, so a call through it is by
+		// position.
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::PositionalOnlyCall]);
 		case.diagnostics().assert_error_saying(
 			"function `scale` has an unnamed parameter, so it is called by \
 			 position",
 		);
-		assert_eq!(case.shape("positional"), "(block => (call scale s#0 2))");
+		assert_eq!(case.shape("named"), "(block => (call scale s#0 2))");
+		assert_eq!(
+			case.shape("positional"),
+			"(block => (abstract scale<T> t#0 2))"
+		);
 	}
 
 	#[test]

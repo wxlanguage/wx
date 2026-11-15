@@ -87,7 +87,7 @@ pub(crate) fn signature(
 			};
 			let decl = &sema.decls.functions[usize::from(function)];
 			let signature = &sema.functions[usize::from(function)];
-			let names = sema.function_parameter_names(function).to_vec();
+			let names = sema.decls.params.names(decl.params).to_vec();
 			(
 				Some(Definition::Item(decl.loc)),
 				signature.type_params,

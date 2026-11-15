@@ -2721,8 +2721,8 @@ fn completion_distinguishes_bounds_from_impl_traits() {
 const NAMED_CALLS: &str = "\
 func g(alpha: u32, beta: u32) {}
 struct W();
-trait Tr { func m(self: Self, count: u32); }
-impl Tr for W { func m(self: Self, _: u32) {} }
+trait Tr { func m(self: Self, u32); }
+impl Tr for W { func m(self: Self, count: u32) {} }
 impl W { func own(self: Self, first: u32) {} }
 func h(u32) {}
 ";
@@ -2740,8 +2740,8 @@ fn completion_of_a_named_argument_offers_the_callees_names() {
 		// A method's receiver: named through its type, given by the object.
 		("W::own({ $0 })", &["self", "first"], &[]),
 		("W().own({ $0 })", &["first"], &["self"]),
-		// A trait impl's function is named as its trait declares it, even
-		// where the impl leaves the parameter unnamed.
+		// A trait impl's function is named as the impl names it, even where
+		// its trait leaves the parameter unnamed.
 		("W().m({ $0 })", &["count"], &["self"]),
 	] {
 		let labels = completions(&format!(
@@ -3287,10 +3287,10 @@ fn signature_help_offers_nothing_outside_arguments_or_for_unresolved_calls() {
 }
 
 #[test]
-fn signature_help_uses_trait_parameter_names_and_bound_methods() {
+fn signature_help_names_parameters_through_impls_and_bounds() {
 	let source =
 		"trait Get: StackValue { func get(self: Self, count: u32) -> u32; }
-	struct S(); impl Get for S { func get(self: Self, u32) -> u32 { 0 } }";
+	struct S(); impl Get for S { func get(self: Self, count: u32) -> u32 { 0 } }";
 	for function in [
 		"func f(s: S) { s.get({ count: $0 }); }",
 		"func f<T: Get>(s: T) { s.get($0); }",
@@ -3740,10 +3740,9 @@ fn named_argument_completion_normalizes_associated_types_when_known() {
 }
 
 #[test]
-fn named_argument_completion_keeps_the_traits_parameter_names() {
-	let declarations =
-		"trait Tr: StackValue { func take(self: Self, rhs: Self); }
-	struct S(); impl Tr for S { func take(self: Self, _: Self) {} }";
+fn named_argument_completion_uses_the_impls_parameter_names() {
+	let declarations = "trait Tr: StackValue { func take(self: Self, Self); }
+	struct S(); impl Tr for S { func take(self: Self, rhs: Self) {} }";
 	for (call, expected) in [
 		("s.take({ $0 })", vec![("rhs", "rhs: S")]),
 		(
