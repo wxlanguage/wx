@@ -801,7 +801,7 @@ async fn initialization_advertises_references_and_completion_triggers() {
 			.completion_provider
 			.unwrap()
 			.trigger_characters,
-		Some(vec![".".into(), ":".into()])
+		Some(vec![".".into(), ":".into(), "\"".into()])
 	);
 	let help = result.capabilities.signature_help_provider.unwrap();
 	assert_eq!(
@@ -4126,4 +4126,173 @@ fn hover_shows_the_bounds_written_on_a_type() {
 			"{needle}, occurrence {occurrence}"
 		);
 	}
+}
+
+const KEYS_APP: &str = "/keys/app/main.wx";
+const KEYS_LIB: &str = "/keys/lib/main.wx";
+
+/// A server that has checked `text` as `KEYS_APP`, whose manifest declares
+/// `lib` and `"odd\key"`, both the package at `KEYS_LIB`.
+fn package_keys_state(text: &str) -> ServerState {
+	let app = PathBuf::from(KEYS_APP);
+	let lib = PathBuf::from(KEYS_LIB);
+	let mut state = ServerState::default();
+	state
+		.open_documents
+		.insert(app.clone(), open_document(text));
+	state
+		.open_documents
+		.insert(lib.clone(), open_document("pub func run() {}"));
+	state.open_documents.insert(
+		app.parent().unwrap().join("wx.json"),
+		open_document(
+			r#"{"entry":"main.wx","dependencies":{
+				"lib":{"type":"local","path":"../lib"},
+				"odd\"key":{"type":"local","path":"../lib"}}}"#,
+		),
+	);
+	state.open_documents.insert(
+		lib.parent().unwrap().join("wx.json"),
+		open_document(r#"{"entry":"main.wx"}"#),
+	);
+	compute_refresh(&mut state, &app, &mut Vec::new());
+	state
+}
+
+/// The items offered at `$0` in `KEYS_APP` (`package_keys_state`).
+fn package_key_items(
+	source: &str,
+) -> Option<Vec<tower_lsp_server::ls_types::CompletionItem>> {
+	let offset = source.find("$0").expect("a `$0` marks the cursor");
+	let text = source.replacen("$0", "", 1);
+	let app = PathBuf::from(KEYS_APP);
+	let mut state = package_keys_state(&text);
+	let line = text[..offset].matches('\n').count();
+	let line_start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
+	let params = tower_lsp_server::ls_types::CompletionParams {
+		text_document_position: TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier {
+				uri: Uri::from_file_path(&app).unwrap(),
+			},
+			position: Position {
+				line: line as u32,
+				character: (offset - line_start) as u32,
+			},
+		},
+		work_done_progress_params: Default::default(),
+		partial_result_params: Default::default(),
+		context: None,
+	};
+	match crate::completion::completion(&mut state, &params)? {
+		tower_lsp_server::ls_types::CompletionResponse::Array(items) => {
+			Some(items)
+		}
+		_ => None,
+	}
+}
+
+/// Each item's label and the text its edit writes over `range`.
+fn package_key_edits(
+	items: &[tower_lsp_server::ls_types::CompletionItem],
+) -> Vec<(&str, Range, &str)> {
+	items
+		.iter()
+		.map(|item| {
+			let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+				edit,
+			)) = &item.text_edit
+			else {
+				panic!("`{}` has no text edit", item.label);
+			};
+			(item.label.as_str(), edit.range, edit.new_text.as_str())
+		})
+		.collect()
+}
+
+#[test]
+fn completion_of_a_package_key_offers_the_manifests_dependencies() {
+	let span = |start, end| Range {
+		start: Position::new(0, start),
+		end: Position::new(0, end),
+	};
+	// Between empty quotes; the core is not offered.
+	let items = package_key_items("package \"$0\" as lib;\n").unwrap();
+	assert_eq!(
+		package_key_edits(&items),
+		[
+			("lib", span(9, 9), "lib"),
+			("odd\"key", span(9, 9), "odd\\\"key")
+		]
+	);
+	// Inside a written key, all of it is replaced.
+	let items = package_key_items("package \"l$0i\" as lib;\n").unwrap();
+	assert_eq!(package_key_edits(&items)[0], ("lib", span(9, 11), "lib"));
+	// An open literal is closed, and nothing after the cursor is replaced.
+	let items = package_key_items("package \"l$0").unwrap();
+	assert_eq!(package_key_edits(&items)[0], ("lib", span(9, 10), "lib\""));
+	// Before the opening quote and after the closing one is not the key.
+	assert!(package_key_items("package $0\"lib\" as lib;\n").is_none());
+	assert!(package_key_items("package \"lib\"$0 as lib;\n").is_none());
+	// Nor is another string literal.
+	assert!(
+		package_key_items("import \"$0env\" as env { func f(); }\n").is_none()
+	);
+}
+
+#[test]
+fn goto_definition_on_a_package_key_opens_the_packages_entry_file() {
+	let source = "package \"lib\" as lib;\nfunc main() { lib::run(); }\n";
+	let state = package_keys_state(source);
+	let app = Uri::from_file_path(KEYS_APP).unwrap();
+	let definition = |needle, occurrence| match requests::goto_definition(
+		&state,
+		&definition_params(&app, position_of(source, needle, occurrence)),
+	) {
+		Some(GotoDefinitionResponse::Scalar(location)) => location,
+		other => panic!("{needle}: {other:?}"),
+	};
+	// On the key, from either quote, into the package.
+	for needle in ["\"lib\"", "lib\" as"] {
+		let location = definition(needle, 0);
+		assert_eq!(location.uri, Uri::from_file_path(KEYS_LIB).unwrap());
+		assert_eq!(location.range, Range::default());
+	}
+	// The alias, written or used, is the instance's own name.
+	for needle in ["lib;", "lib::"] {
+		let location = definition(needle, 0);
+		assert_eq!(location.uri, app);
+		assert_eq!(location.range.start, position_of(source, "lib;", 0));
+	}
+}
+
+#[test]
+fn hover_on_a_package_key_shows_where_its_package_is() {
+	let source = "package \"lib\" as lib;\nfunc main() { lib::run(); }\n";
+	let state = package_keys_state(source);
+	let app = Uri::from_file_path(KEYS_APP).unwrap();
+	assert_eq!(
+		hover_text(&state, &app, source, "lib\"", 0),
+		Some(format!("```wx\npackage\n```\n\n---\n\n`{KEYS_LIB}`"))
+	);
+	// The alias is the instance.
+	for needle in ["lib;", "lib::"] {
+		assert_eq!(
+			hover_text(&state, &app, source, needle, 0).as_deref(),
+			Some("```wx\npackage \"lib\" as lib\n```"),
+			"{needle}"
+		);
+	}
+}
+
+#[test]
+fn semantic_tokens_leave_a_package_key_a_string() {
+	let source = "package \"lib\" as lib;\nfunc main() { lib::run(); }\n";
+	let state = package_keys_state(source);
+	let app = Uri::from_file_path(KEYS_APP).unwrap();
+	let tokens = semantic_tokens(&state, &app, source, None);
+	assert!(
+		!tokens.iter().any(|token| token.starts_with('"')),
+		"{tokens:?}"
+	);
+	assert!(tokens.contains(&"lib:namespace.declaration".to_owned()));
 }

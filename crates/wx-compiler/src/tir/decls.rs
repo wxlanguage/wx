@@ -17,8 +17,9 @@ use crate::{
 	index::index_newtype,
 	small_vec::SmallVec,
 	tir::{
-		imports::ImportResolver, literals::unescape_string_literal,
-		resolutions::NameResolutions,
+		imports::ImportResolver,
+		literals::unescape_string_literal,
+		resolutions::{NameResolutions, Reference, Route, Site},
 	},
 	vfs::{FileId, Files, Package, PackageId},
 };
@@ -2851,6 +2852,24 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				builder.scan_item(source_module.file_id, scope, id);
 			}
 		}
+		// A package instance's key names the package it instantiates, as
+		// `package::` names a package's own: by its row.
+		for instance in &builder.namespaces.package_instances {
+			let Some(package) = instance.package else {
+				continue;
+			};
+			let file = builder.namespaces.file_id(instance.loc.namespace);
+			resolutions.record(
+				Site::Label(SourceSpan::new(file, instance.package_name.span)),
+				Reference::Item {
+					item: ItemLoc::new(
+						Namespace::Package(package),
+						DeclIdx::SELF,
+					),
+					route: Route::Direct,
+				},
+			);
+		}
 
 		ImportResolver::resolve_imports(
 			builder.diagnostics,
@@ -5585,6 +5604,8 @@ mod tests {
 		strings: StringInterner,
 		decls: Declarations,
 		diagnostics: Vec<Diagnostic<FileId>>,
+		/// What Phase 1 recorded: imports and package instances' keys.
+		resolutions: NameResolutions,
 	}
 
 	/// The written trait impl declaring `member`, among the synthetic impls
@@ -5681,6 +5702,7 @@ mod tests {
 				strings,
 				decls,
 				diagnostics,
+				resolutions,
 			}
 		}
 
@@ -7732,7 +7754,22 @@ mod tests {
 			case.strings.resolve(case.decls.item(item.loc).name.inner),
 			Some("m")
 		);
-		assert!(item.package.is_some());
+		// The key names the package, by its row.
+		let package = item.package.unwrap();
+		let key = SourceSpan::new(
+			case.decls.file_id(item.loc),
+			item.package_name.span,
+		);
+		assert!(
+			case.resolutions.get(Site::Label(key))
+				== Some(Reference::Item {
+					item: ItemLoc::new(
+						Namespace::Package(package),
+						DeclIdx::SELF
+					),
+					route: Route::Direct,
+				})
+		);
 
 		assert!(matches!(
 			case.resolve(Tier::Value, "m::add").expect_success(),
@@ -7909,11 +7946,14 @@ mod tests {
 
 		case.diagnostics()
 			.assert_error(DiagnosticCode::UnknownPackage);
-		assert!(
-			case.decls.namespaces.package_instances()[0]
-				.package
-				.is_none()
+		let item = &case.decls.namespaces.package_instances()[0];
+		assert!(item.package.is_none());
+		// Nor does the key name anything.
+		let key = SourceSpan::new(
+			case.decls.file_id(item.loc),
+			item.package_name.span,
 		);
+		assert!(case.resolutions.get(Site::Label(key)).is_none());
 
 		// The alias is still bound, to a poisoned binding: a path through it
 		// ends in `Error` without a second diagnostic, since the one at the

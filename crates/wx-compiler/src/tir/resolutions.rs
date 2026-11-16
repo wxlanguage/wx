@@ -54,7 +54,8 @@ pub enum Site {
 	/// Looked up among values.
 	Value(SourceSpan),
 	/// A name that picks out a declaration by where it is written: a named
-	/// argument's parameter or field, a `break`'s label.
+	/// argument's parameter or field, a `break`'s label, or by what a
+	/// manifest declares: a package instance's key, its package.
 	Label(SourceSpan),
 }
 

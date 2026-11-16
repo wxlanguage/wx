@@ -13,8 +13,8 @@
 use string_interner::symbol::SymbolU32;
 use tower_lsp_server::ls_types::{
 	CompletionItem, CompletionItemKind, CompletionItemLabelDetails,
-	CompletionParams, CompletionResponse, Documentation, InsertTextFormat,
-	MarkupContent, MarkupKind,
+	CompletionParams, CompletionResponse, CompletionTextEdit, Documentation,
+	InsertTextFormat, MarkupContent, MarkupKind, TextEdit,
 };
 use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
@@ -30,9 +30,10 @@ use wx_compiler::tir::{
 	BindingName, DeclKind, Definition, LabelKind, MemberKind, MemberOwner,
 	NameUse, Tier, TraitIdx,
 };
+use wx_compiler::vfs::FileId;
 
 use crate::call;
-use crate::convert::position_to_offset;
+use crate::convert::{position_to_offset, span_to_range};
 use crate::hover;
 use crate::query;
 use crate::snapshot::Snapshot;
@@ -58,6 +59,9 @@ pub(crate) fn completion(
 		snapshot.compilation.comments(file),
 		offset,
 	)?;
+	if let Site::PackageKey { literal } = site {
+		return package_keys(snapshot, file, literal, offset);
+	}
 	let declaration = match within {
 		Within::Signature(Anchor::Name(name)) | Within::Body(name) => {
 			Some(snapshot.declared_at(SourceSpan::new(file, name))?)
@@ -233,6 +237,7 @@ pub(crate) fn completion(
 		}
 		// A name written twice is reported (E2121), so the ones written are
 		// not offered again.
+		Site::PackageKey { .. } => return None,
 		Site::Argument {
 			call,
 			callee,
@@ -284,6 +289,76 @@ pub(crate) fn completion(
 	Some(CompletionResponse::Array(items))
 }
 
+/// The keys the manifest of `file`'s package declares its dependencies
+/// under, for the literal of a package instance written at `literal`, the
+/// cursor at `offset` in it. Each replaces what is written between the
+/// quotes, and closes a literal left open. The core, bound in every package
+/// already, is not offered.
+fn package_keys(
+	snapshot: &Snapshot,
+	file: FileId,
+	literal: TextSpan,
+	offset: u32,
+) -> Option<CompletionResponse> {
+	let compilation = &snapshot.compilation;
+	let source = &compilation.files.get(file).ok()?.source;
+	// Read as the lexer reads it: an escape skips the character after it,
+	// and an unescaped quote closes the literal.
+	let mut contents =
+		source[literal.start as usize + 1..literal.end as usize].chars();
+	let mut closed = false;
+	while let Some(c) = contents.next() {
+		match c {
+			'\\' => _ = contents.next(),
+			'"' => closed = true,
+			_ => {}
+		}
+	}
+	// After the closing quote is past the literal.
+	if closed && offset == literal.end {
+		return None;
+	}
+	// An open literal runs to the end of the file, so only what is typed
+	// before the cursor is replaced.
+	let end = if closed { literal.end - 1 } else { offset };
+	let range = span_to_range(
+		&compilation.files,
+		SourceSpan::new(file, TextSpan::new(literal.start + 1, end)),
+	)?;
+	let package = compilation.package_of(file)?;
+	let mut keys: Vec<_> = (package.dependencies.iter())
+		.filter(|&(_, &dependency)| dependency != compilation.core_package)
+		.filter_map(|(&key, &dependency)| {
+			Some((snapshot.strings.resolve(key)?, dependency))
+		})
+		.collect();
+	keys.sort_unstable_by_key(|&(key, _)| key);
+	let items = keys
+		.into_iter()
+		.map(|(key, dependency)| {
+			let mut new_text = key.replace('\\', "\\\\").replace('"', "\\\"");
+			if !closed {
+				new_text.push('"');
+			}
+			let root = compilation.packages[dependency.as_usize()]
+				.entry_path
+				.parent();
+			CompletionItem {
+				label: key.to_owned(),
+				kind: Some(CompletionItemKind::MODULE),
+				detail: Some(root.as_str().to_owned()),
+				filter_text: Some(key.to_owned()),
+				text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+					range,
+					new_text,
+				})),
+				..CompletionItem::default()
+			}
+		})
+		.collect();
+	Some(CompletionResponse::Array(items))
+}
+
 /// Where the cursor is: what can be written there, and in which part of
 /// which declaration.
 pub(crate) struct Position {
@@ -299,7 +374,8 @@ pub(crate) enum Within {
 	Signature(Anchor),
 	/// The body of the declaration named at this span.
 	Body(TextSpan),
-	/// A `use`, written directly in a scope rather than in a declaration.
+	/// A `use` or a package instance, written directly in a scope rather
+	/// than in a declaration.
 	Use(Enclosing),
 }
 
@@ -416,6 +492,9 @@ pub(crate) enum Site {
 		given: usize,
 		written: Vec<SymbolU32>,
 	},
+	/// The manifest key of a package instance, in its string literal
+	/// written at `literal`, opening quote included.
+	PackageKey { literal: TextSpan },
 }
 
 /// One candidate. Locals and type parameters sort before items, as the
@@ -890,8 +969,15 @@ impl Cursor<'_> {
 			}
 			Item::Export { .. }
 			| Item::ExportBlock { .. }
-			| Item::ModuleDeclaration { .. }
-			| Item::PackageInstance { .. } => None,
+			| Item::ModuleDeclaration { .. } => None,
+			// Between the quotes, or after the opening one of a literal not
+			// closed yet.
+			Item::PackageInstance { package, .. } => {
+				(package.start < self.offset && self.offset <= package.end)
+					.then_some(())?;
+				Within::Use(scope)
+					.position(Some(Site::PackageKey { literal: *package }))
+			}
 		}
 	}
 

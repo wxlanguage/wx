@@ -366,6 +366,13 @@ impl CompilationUnit {
 		&self.comments[file.as_usize()]
 	}
 
+	/// The package `file` is a module of.
+	pub fn package_of(&self, file: FileId) -> Option<&Package> {
+		self.packages.iter().find(|package| {
+			package.modules.iter().any(|module| module.file_id == file)
+		})
+	}
+
 	/// What parsing `file` reported.
 	pub fn parse_diagnostics(&self, file: FileId) -> &[Diagnostic<FileId>] {
 		&self.parse_diagnostics[file.as_usize()]

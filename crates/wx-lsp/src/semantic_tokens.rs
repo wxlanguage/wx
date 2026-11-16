@@ -208,7 +208,9 @@ fn token(
 /// The token type and modifiers of a name of `definition`, whether it
 /// declares it or uses it: what the definition is, and `defaultLibrary` for
 /// one the compiler provides. `None` for a label, which no standard type
-/// fits.
+/// fits, and for a package, whose one name that is not a keyword is a
+/// package instance's key: a string literal, which the editor's grammar
+/// colours.
 fn classify(
 	snapshot: &Snapshot,
 	definition: Definition,
@@ -221,9 +223,9 @@ fn classify(
 	};
 	let (kind, modifiers) = match definition {
 		Definition::Item(key) => match sema.declaration_kind(key) {
+			DeclKind::Package(_) => return None,
 			DeclKind::Module(_)
 			| DeclKind::Import(_)
-			| DeclKind::Package(_)
 			| DeclKind::PackageInstance(_) => (TokenType::Namespace, 0),
 			DeclKind::Enum(_) => (TokenType::Enum, 0),
 			DeclKind::EnumVariant(_) => (TokenType::EnumMember, 0),

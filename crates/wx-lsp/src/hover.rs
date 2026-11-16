@@ -103,6 +103,9 @@ pub(crate) fn signature(
 					renderer.name(sema.decls.item(decl.loc).name)
 				))
 			}
+			// Named by no name of its own, only by the key each dependent
+			// declares it under; `documentation` says where its source is.
+			DeclKind::Package(_) => Some("package".to_owned()),
 			DeclKind::PackageInstance(index) => {
 				let decl = &sema.decls.namespaces.package_instances()
 					[usize::from(index)];
@@ -112,7 +115,6 @@ pub(crate) fn signature(
 					renderer.name(sema.decls.item(decl.loc).name)
 				))
 			}
-			_ => None,
 		},
 		Definition::TypeParam { env, index } => {
 			let names = sema.generic_envs.param_names(env);
@@ -525,8 +527,15 @@ pub(crate) fn documentation(
 		return None;
 	}
 	let span = sema.definition_span(definition)?;
-	let source = &files.get(span.file_id).ok()?.source;
-	leading_doc_comment(source, span.span.start)
+	let file = files.get(span.file_id).ok()?;
+	// A package is declared at the start of its entry file, which is what
+	// describes it.
+	if let Definition::Item(key) = definition
+		&& let DeclKind::Package(_) = sema.declaration_kind(key)
+	{
+		return Some(format!("`{}`", file.name));
+	}
+	leading_doc_comment(&file.source, span.span.start)
 }
 
 /// The `///` lines directly above the declaration whose name is written at

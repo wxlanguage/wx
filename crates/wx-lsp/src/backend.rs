@@ -132,7 +132,12 @@ impl LanguageServer for Backend {
 				)),
 				hover_provider: Some(HoverProviderCapability::Simple(true)),
 				completion_provider: Some(CompletionOptions {
-					trigger_characters: Some(vec![".".into(), ":".into()]),
+					// `"` opens a package instance's manifest key.
+					trigger_characters: Some(vec![
+						".".into(),
+						":".into(),
+						"\"".into(),
+					]),
 					..Default::default()
 				}),
 				signature_help_provider: Some(SignatureHelpOptions {
