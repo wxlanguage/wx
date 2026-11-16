@@ -2707,24 +2707,18 @@ impl Roles<'_> {
 				},
 			) => {
 				match (ha, hb) {
-					(Some(ha), Some(hb)) => self.expr(
-						self.a.loop_header(ha).initializer,
-						self.b.loop_header(hb).initializer,
-					),
-					// Only the state `() = ()` is dropped.
-					(Some(ha), None) => {
-						let header = self.a.loop_header(ha);
-						assert!(header.state.is_empty(), "loop state dropped");
-						assert!(
-							matches!(
-								self.a.expr(header.initializer),
-								E::Tuple { elements } if elements.is_empty()
-							),
-							"loop state dropped"
-						);
+					(Some(ha), Some(hb)) => {
+						let a_initials =
+							self.a.list(self.a.loop_header(ha).initials);
+						let b_initials =
+							self.b.list(self.b.loop_header(hb).initials);
+						assert_eq!(a_initials.len(), b_initials.len());
+						for (&a, &b) in a_initials.iter().zip(b_initials) {
+							self.expr(a, b);
+						}
 					}
 					(None, None) => {}
-					(None, Some(_)) => panic!("loop state added"),
+					_ => panic!("loop parameters changed"),
 				}
 				self.block(a, b)
 			}
@@ -3792,12 +3786,12 @@ fn a_slot_without_a_type_is_printed_as_written() {
 }
 
 #[test]
-fn a_loop_state_and_a_continue_value_are_printed_after_their_labels() {
+fn loop_parameters_and_a_continue_value_are_printed_after_their_labels() {
 	let source = indoc! {"
         func f(n: u32) -> u32 {
-            loop :rows (mut a: u32, b) = (0, n) {
+            loop :rows (mut a: u32 = 0, b = n) {
                 if a == b { continue :rows (a, b + 1) };
-                loop i = (0: u32) {
+                loop (i = (0: u32)) {
                     if i == n { break };
                     continue i + 1;
                 }
@@ -3808,15 +3802,13 @@ fn a_loop_state_and_a_continue_value_are_printed_after_their_labels() {
 	assert_eq!(checked_format(source, 80, 4), source);
 	for (source, expected) in [
 		(
-			"loop i:u32=0{ continue  i+1 }",
-			"loop i: u32 = 0 { continue i + 1 }",
+			"loop(i:u32=0){ continue  i+1 }",
+			"loop (i: u32 = 0) { continue i + 1 }",
 		),
-		// One slot is the list of it.
-		("loop (i: u32,) = 0 { }", "loop i: u32 = 0 {}"),
-		// The state `()` is none; one computed is kept.
-		("loop () = () { }", "loop {}"),
-		("loop :l () = () { }", "loop :l {}"),
-		("loop () = f() { }", "loop () = f() {}"),
+		("loop (i: u32 = 0,) { }", "loop (i: u32 = 0) {}"),
+		// No parameters are no list.
+		("loop () { }", "loop {}"),
+		("loop :l () { }", "loop :l {}"),
 	] {
 		assert_eq!(
 			checked_format(&format!("func f() {{ {source} }}"), 80, 4),

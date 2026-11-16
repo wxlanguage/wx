@@ -26,6 +26,7 @@ use wx_compiler::ast::{
 	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree, rest_span,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
+use wx_compiler::symbols::Keyword;
 use wx_compiler::tir::{
 	BindingName, DeclKind, Definition, LabelKind, MemberKind, MemberOwner,
 	NameUse, Tier, TraitIdx,
@@ -239,9 +240,31 @@ pub(crate) fn completion(
 		// not offered again.
 		Site::PackageKey { .. } => return None,
 		Site::Argument {
-			call,
-			callee,
-			given,
+			target: ArgumentTarget::Loop { jump },
+			written,
+		} => {
+			let owner = query::body_of(sema, declaration?)?;
+			let body = sema.owner_body(owner)?;
+			let target = body.loop_of(ast, jump)?;
+			let mut names = Vec::new();
+			let mut types = Vec::new();
+			for local in body.scope_locals(target) {
+				let name = body.local(local).name.inner;
+				types.push((Some(name), body.local(local).ty));
+				// A name the parser reported missing is no name to give.
+				if name != Keyword::Error.symbol() && !written.contains(&name) {
+					names.push((name, Definition::Local { owner, local }));
+				}
+			}
+			argument_types = Some(types);
+			names
+		}
+		Site::Argument {
+			target: ArgumentTarget::Call {
+				call,
+				callee,
+				given,
+			},
 			written,
 		} => {
 			let (_, reference) = query::symbol_at(sema, file, callee.start)?;
@@ -483,19 +506,29 @@ pub(crate) enum Site {
 		owner: TextSpan,
 		written: Vec<SymbolU32>,
 	},
-	/// The name of an argument in a call by name: one of the parameters of
-	/// the callee whose last name is written at `callee`, in `call`, after
-	/// the first `given` (a method call's receiver), and not among the
-	/// `written` ones.
+	/// The name of an argument in a named list: one of the parameters of
+	/// `target`, not among the `written` ones.
 	Argument {
-		call: ExprId,
-		callee: TextSpan,
-		given: usize,
+		target: ArgumentTarget,
 		written: Vec<SymbolU32>,
 	},
 	/// The manifest key of a package instance, in its string literal
 	/// written at `literal`, opening quote included.
 	PackageKey { literal: TextSpan },
+}
+
+/// What has the parameters a named list's names name.
+pub(crate) enum ArgumentTarget {
+	/// The callee whose last name is written at `callee`, in `call`, after
+	/// the first `given` (a method call's receiver).
+	Call {
+		call: ExprId,
+		callee: TextSpan,
+		given: usize,
+	},
+	/// The loop the `continue`, or the `loop` whose body's result the list
+	/// is, written as `jump` gives its next state to, as it was checked.
+	Loop { jump: ExprId },
 }
 
 /// One candidate. Locals and type parameters sort before items, as the
@@ -1314,17 +1347,16 @@ impl Cursor<'_> {
 					_ => (None, 0),
 				};
 				self.expression(callee).or_else(|| {
-					self.named(
-						expression,
-						name,
+					let target = name.map(|callee| ArgumentTarget::Call {
+						call: expression,
+						callee,
 						given,
-						ast.list(arguments),
-						braces,
-					)
+					});
+					self.named(target, ast.list(arguments), braces)
 				})
 			}
-			// What its names may be is the checker's to know (a loop's state);
-			// only the values are walked.
+			// Elsewhere than a loop's next state (`named_state`) its names
+			// mean nothing; only the values are walked.
 			Expression::NamedList { arguments, .. } => ast
 				.list(arguments)
 				.iter()
@@ -1343,9 +1375,13 @@ impl Cursor<'_> {
 			Expression::Break { label, value } => self
 				.label(label, Jump::Break)
 				.or_else(|| self.expression(value?)),
-			Expression::Continue { label, value } => self
-				.label(label, Jump::Continue)
-				.or_else(|| self.expression(value?)),
+			Expression::Continue { label, value } => {
+				self.label(label, Jump::Continue).or_else(|| {
+					let value = value?;
+					self.named_state(value, expression)
+						.or_else(|| self.expression(value))
+				})
+			}
 			Expression::IfElse {
 				condition,
 				then_block,
@@ -1368,9 +1404,19 @@ impl Cursor<'_> {
 			Expression::Loop { header, block, .. } => header
 				.and_then(|header| {
 					let header = ast.loop_header(header);
-					self.node(header.state)
-						.and_then(|slot| self.ty(slot.ty?))
-						.or_else(|| self.expression(header.initializer))
+					self.node(header.params)
+						.and_then(|param| self.ty(param.ty?))
+						.or_else(|| {
+							let initials = ast.list(header.initials);
+							let initial = self
+								.child_by(initials, |&initial| {
+									ast.expr_span(initial)
+								})?;
+							self.expression(*initial)
+						})
+				})
+				.or_else(|| {
+					self.named_state(ast.block(block).tail?, expression)
 				})
 				.or_else(|| self.block(block)),
 			Expression::QualifiedPath { root, segments } => self
@@ -1411,16 +1457,14 @@ impl Cursor<'_> {
 		}
 	}
 
-	/// A call's named arguments, in their braces: the name of the one at the
-	/// cursor, or one not written yet in the room between two, is one of the
-	/// callee's parameters (`callee`, its last name, if it has one; `given`,
-	/// as `Site::Argument` says); after a name's `:` is its value. Outside
-	/// the braces nothing is: a list not closed yet offers no names.
+	/// A named list's arguments, in their braces: the name of the one at the
+	/// cursor, or one not written yet in the room between two, is one of
+	/// `target`'s parameters (none for a callee without a last name); after
+	/// a name's `:` is its value. Outside the braces nothing is: a list not
+	/// closed yet offers no names.
 	fn named(
 		&self,
-		call: ExprId,
-		callee: Option<TextSpan>,
-		given: usize,
+		target: Option<ArgumentTarget>,
 		arguments: &[NamedArgument],
 		braces: TextSpan,
 	) -> Option<Site> {
@@ -1445,11 +1489,22 @@ impl Cursor<'_> {
 			.map(|(_, argument)| argument.name.inner)
 			.collect();
 		Some(Site::Argument {
-			call,
-			callee: callee?,
-			given,
+			target: target?,
 			written,
 		})
+	}
+
+	/// A named list written directly as the next state of the `continue` or
+	/// `loop` written as `jump`: its names are the parameters of the loop it
+	/// was checked to give them to. `None` for any other value.
+	fn named_state(&self, value: ExprId, jump: ExprId) -> Option<Site> {
+		let ast = self.ast;
+		let Expression::NamedList { arguments, braces } = ast.expr(value)
+		else {
+			return None;
+		};
+		let target = Some(ArgumentTarget::Loop { jump });
+		self.named(target, ast.list(arguments), braces)
 	}
 
 	fn ty(&self, ty: TypeId) -> Option<Site> {

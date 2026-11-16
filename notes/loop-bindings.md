@@ -1,13 +1,14 @@
 # Loops: the block/loop model and loop-scoped bindings
 
-Status: 2026-11-16. Decided: the model (a `loop` is a fused Wasm `block` +
-`loop`); the jump targets (an unlabelled `break` leaves the nearest written
-`block` or loop, `continue` restarts the nearest loop), implemented; and a
-loop's state (`loop (i: u32, total) = e { .. }`, each iteration entered with
-the next state, given by the body's value or `continue`'s, positionally or by
-name), not implemented. Revised 2026-11-16: the header is a signature, a list
-of slots as a function's parameters are, not a pattern with a type on the
-whole. Open: whether `while` takes a header.
+Status: 2026-11-16. Decided and implemented: the model (a `loop` is a fused
+Wasm `block` + `loop`); the jump targets (an unlabelled `break` leaves the
+nearest written `block` or loop, `continue` restarts the nearest loop); and a
+loop's parameters (`loop (i: u32 = 0, total = n) { .. }`, each iteration
+entered with the next state, given by the body's value or `continue`'s,
+positionally or by name), lowered to Wasm loop parameters. Revised the same
+day: each parameter takes its own initial value, in place of one initializer
+for the whole state (`loop (i, total) = (0, n)`). Open: whether `while` takes
+parameters.
 
 ## Problem
 
@@ -145,48 +146,50 @@ every construct's braces `ScopeKind::Body`, and `jump_target` reads the kind.
 Before this, all three were `Expression::Block` and wx-fmt printed an arm's
 `block` without its keyword, dropping its label; it keeps both now.
 
-## Decision: a loop has a state, given each iteration
+## Decision: a loop has parameters, given each iteration
 
-A loop may declare a state in its header. Each iteration is entered with a
-value of it: the first from the initializer, every next one from the body.
+A loop may declare parameters after its label. Each iteration is entered with
+a value for them, its state: the first from their initial values, every next
+one from the body.
 
 ```wx
-loop :label (a: A, b, mut c: C) = e { body }
-loop :label a: A = e { body }
+loop :label (a: A = x, b = y, mut c: C = z) { body }
 ```
 
-- **The header is a signature**: the loop body's parameter list, written as a
-  function's is. Each slot is `name` or `mut name` with an optional `: T`
-  (`notes/binders.md`, "A slot's type may be left to inference"). One slot
-  needs no parentheses, as a one-element list is its element. No
-  destructuring and no `_`: every part of the state has a name. The label is
-  optional.
-- **The state's type** is the tuple of the slots' types (one slot's type for
-  one slot). A slot's type is written, or inferred from the initializer
-  ("Typing the state").
-- **`e` is the first state**, evaluated once, before the first iteration, and
-  given as every next state is: positionally or by name
-  (`= ({ i: 0, total: x })`).
+- **The header is a parameter list**, in parentheses, written as a
+  function's is, each parameter followed by `= value`. A parameter is `name`
+  or `mut name` with an optional `: T` (`notes/binders.md`, "A slot's type may
+  be left to inference"). No destructuring and no `_`: every part of the state
+  has a name. `loop () { .. }` is a loop without parameters, as is
+  `loop { .. }`, and wx-fmt prints it so. The label is optional.
+- **Each initial value is checked as a `local`'s value is.** It is held to the
+  parameter's written type, and a parameter without one takes the value's
+  type, which must be known (E2002 for an untyped literal, as `local i = 0;`).
+- **The initial values are evaluated once, before the first iteration**, left
+  to right, outside the loop: they see neither the parameters nor the loop's
+  label (`loop (i: u32 = i + 1)` reads an outer `i`).
+- **The state's type** is the tuple of the parameters' types, one parameter's
+  type for one parameter, `()` for none. It is fixed by the header.
 - **The body's value is the next state.** Falling off the end of the body
-  starts the next iteration with the body's tail; `continue v` starts it with
-  `v`. Either way the whole state is given.
-- **The bindings hold the current state for one iteration.** They are
-  immutable unless `mut`, which lets the body assign them within the iteration;
-  the next iteration still takes its state from the body's value, never from
-  what a binding was left holding.
-- **`break` leaves the loop**, with the loop's value, as without a header. The
-  state is not the loop's value; to hand it out, `break` it.
-- **Its scope is the loop** (header and body), and nothing after it.
+  starts the next iteration with the body's result; `continue v` starts it
+  with `v`. Either way the whole state is given.
+- **The parameters hold the current state for one iteration.** They are
+  immutable unless `mut`, which lets the body assign them within the
+  iteration; the next iteration still takes its state from the body's value,
+  never from what a parameter was left holding.
+- **`break` leaves the loop**, with the loop's value, as without parameters.
+  The state is not the loop's value; to hand it out, `break` it.
+- **Their scope is the loop's body**, and nothing after it.
 
-A loop without a header is the case of the state `()`: its tail is `()`, and a
-bare `continue` is `continue ()`. Nothing changes for it.
+A loop without parameters is the case of the state `()`: its result is `()`,
+and a bare `continue` is `continue ()`.
 
 Each iteration is entered like a call of the body, with the header as its
-parameters: the initializer is the arguments of the first call, and the tail
-and `continue`'s value those of each next one. The syntax follows the
-analogy: the header is a parameter list, not a pattern, so it allows only
-what a state needs (names, `mut`, types), and its names are what a named
-next state uses, as a call by name uses a function's.
+parameters: the initial values are the arguments of the first call, and the
+body's result and `continue`'s value those of each next one. Writing each
+initial value beside its parameter keeps a name, its type and where it starts
+together, as `local i: u32 = 0` does, instead of matching a header's
+positions against a separate tuple.
 
 ### Giving the next state
 
@@ -194,137 +197,111 @@ The next state is a whole value, given in one of two forms, as a call's
 arguments are:
 
 - **Positionally**, as a value of the state's type: `(i + 1, total + x)`, or
-  `i + 1` for one binding (a one-element tuple is its element).
+  `i + 1` for one parameter (a one-element tuple is its element).
 - **By name**, as a named list: `({ i: i + 1, total: total + x })`, with the
-  shorthand `({ i: i + 1, total })` for a value handed on unchanged. Each name is
-  a header binding.
+  shorthand `({ i: i + 1, total })` for a value handed on unchanged. Each name
+  is a parameter of the loop.
 
-The named form follows the rules of a call by name: every name is required
-(E2122 for a missing one), an unknown name is E2120, a repeated one E2121, and
-the two forms do not mix in one list (E1018). Leaving a name out does not keep
-its value: forgetting to advance a counter is an error, not a silent infinite
-loop.
+The named form follows the rules of a call by name, with the same
+diagnostics: every name is required (E2122 for a missing one), an unknown name
+is E2120, a repeated one E2121, and the two forms do not mix in one list
+(E1018). Leaving a name out does not keep its value: forgetting to advance a
+counter is an error, not a silent infinite loop. A call by name and a named
+state share their matching (`match_names` in `tir/typecheck/calls.rs`).
 
-All of the next state is computed before any binding takes it, so the update
-is simultaneous: `(b, a + b)` reads the old `a` and `b`.
+All of the next state is computed before any parameter takes it, so the
+update is simultaneous: `(b, a + b)` reads the old `a` and `b`.
 
-### `({ .. })`: parsed anywhere, checked where its names are known
+### `({ .. })`: parsed anywhere, meaningful only written directly
 
-A parenthesized list that starts with `{` is a named list. The parser accepts
-it wherever an expression can start (today a `{` there is a block without its
-keyword, E1017). It has no type of its own: tuple types have no names, so no
-expected type can say what its names mean. The checker accepts it only where
-the names are known:
+A parenthesized list that starts with `{` is a named list, and the parser
+accepts it wherever an expression can start. It has no type of its own: tuple
+types have no names, so no expected type can say what its names mean. The
+checker gives its names a meaning only where it is written directly as a
+loop's next state:
 
-- a header loop's body tail, and
+- the body's result, and
 - `continue`'s value, naming that loop (or the nearest one).
 
-Anywhere else it is one error, saying that a named list needs a place whose
-names are known. `break ({ .. })` is one such place: the loop's value has no
-names.
-
-### Typing the state
-
-The state's type comes from the two sources a `local`'s does:
-
-Each slot's type comes from the two sources a `local`'s does, per slot:
-
-**Written on the slot**, `name: T`. The initializer's part for that slot is
-checked against `T`, so its literals take their types from it:
+Anywhere else it is E2144, with its values still checked. That includes a
+named list in a branch of an `if` or `match` that is the body's result, and
+one in parentheses (`(({ .. }))`, a one-element tuple). A branch gives the
+state by name with `continue`:
 
 ```wx
-loop i: u32 = 0 { .. }
-loop (i: u32, total: u32) = (0, 0) { .. }
+match arr[mid].cmp(target) {
+    Ordering::Less => continue ({ low: mid + 1, high }),
+    Ordering::Greater => continue ({ low, high: mid }),
+    Ordering::Equal => return (True, mid),
+}
 ```
 
-**Inferred from the initializer**, when the slot has no type or `_`: its
-part of the initializer gives it, typed already or by ascription:
-
-```wx
-loop at = start { .. }                       // `start: u32`
-loop (next, start, at) = (0: u32, 0: u32, 0: u32) { .. }
-loop (i: u32, total) = (0, x) { .. }         // mixed
-```
-
-The initializer is checked against the tuple of the slots' types, with
-`INFER` for an untyped slot, so a written type and an ascription meet as in
-a `local` and must agree. **An untyped slot whose part is a literal** is
-E2002, as `local i = 0;` is.
-
-The state's type is fixed once the initializer is checked. The body's tail
-and each `continue`'s value are checked against it and never inform it:
-inference ends with the header, as it ends at a `;`. So
-`loop i = 0 { .. (i + 1: u32) }` is still E2002 at the `0`.
-
-### Why no `local` keyword
-
-It carries nothing. After `loop`, only a label (`:name`) or the body (`{`) can
-come today, so any other token starts a header, decided by its first token. A
-binder without a keyword already has precedent where its position says what it
-is: a function's parameters, which the header is written as.
+Letting the names flow through branches as the expected type does would take
+a context carried beside every expected type, for this one use. If the type
+system gains types that carry names, a named list could be checked against
+them like any value, and this restriction would fall away.
 
 ### Parsing
 
-The parser reads an optional label, then a header if the next token is not
-`{`, then the block. A header is a slot list in parentheses, read with the
-parameter list's own slot parser (`parse_binding_and_type`, the same
-recovery), or one slot without them; then `=` and the initializer. The
-initializer parses as an `if`'s condition does: `{` never starts an expression
-in WX, so it ends at the body's `{`. `continue` takes an optional value after
-its optional label, as `break` does.
+The parser reads an optional label, then a parameter list if the next token
+is not `{`, then the block. Each parameter is read with the parameter list's
+own slot parser (`parse_binding_and_type`, the same recovery), then `=` and
+its initial value; a missing one is reported (E1010) and kept as an error
+node. `continue` takes an optional value after its optional label, as `break`
+does.
 
-The AST holds the slots as a `List<FunctionParam>` (a `Binding` and an
-optional type), whether or not parentheses were written, and the initializer;
-wx-fmt prints one slot without parentheses. `loop () = () { }` is the state
-`()`, the same as no header: accepted, and dropped by wx-fmt as unnecessary
-syntax when the initializer is written `()` too. One that computes something
-(`loop () = f() { }`) is kept: dropping it would drop the call, and wx-fmt
-does not know types.
+The AST's `LoopHeader` holds two lists, the parameters (a
+`List<FunctionParam>`) and their initial values (a `List<ExprId>`), in the
+stores that already hold those kinds, one initial value per parameter. An
+empty `()` is no header.
+
+### Checking
+
+The initial values are built in the scope around the loop, then the
+parameters are declared, all together, as the loop scope's locals, with their
+completed types. The first state is the initial values as one value (a tuple
+of them, or the lone one), `ExprKind::Loop`'s `entry`. The state's type is
+stored with the loop's scope while its body is checked, for the body's result
+and each `continue`. A repeated parameter name is E2097, as in a function, and
+the name finds the first.
 
 ### Wasm
 
-Each binding is a Wasm local (function-wide; the scope is a WX naming rule).
-The initializer is stored before the loop; at the back edge the next state is
-computed onto the stack and stored, last value first, then `br` repeats:
+A Wasm `loop` is a block whose type is a function type, `[params] -> []`, and
+a `br` to it carries values for its parameters. A loop's state maps onto that:
+
+- MIR's `Loop` carries its signature and its entry value, `LoopParam` reads
+  one of its parameters, and `Continue` carries the next state.
+- An immutable parameter reads the loop's Wasm parameters where it is used,
+  and has no local of its own. A `mut` one is a local, set from them at the
+  top of the body.
+- The block type is the signature: `0x40` for `[] -> []`, a value type for
+  `[] -> [t]`, and a type index otherwise (`BlockType::Signature`).
 
 ```wat
 i32.const 0
-i32.const 0
-local.set $total
-local.set $i            ;; the first state
+local.get $n            ;; the first state
 block
-  loop
+  loop (param i32 i32)
     ...                 ;; body
-    local.get $i
-    i32.const 1
-    i32.add             ;; next i
-    local.get $total
-    ...                 ;; next total
-    local.set $total
-    local.set $i        ;; the next state, stored at once
-    br 0
+    br 0                ;; with the next state on the stack
   end
 end
 ```
 
-A shorthand value handed on unchanged (`({ total, .. })`) is a store of a local
-into itself, which the optimizer drops.
-
-This is not WX's form of Wasm's loop parameters. A Wasm loop parameter is a
-value on the operand stack, unnamed and not a place; a named binding read more
-than once has to live in a local, so a WX loop's state is in locals either way.
-Carrying it across the back edge on the stack instead is an encoding choice
-codegen may make, and rarely saves anything. Wasm loop parameters stay without
-WX syntax; WX has no syntax for stack values anywhere.
+Where values sit between uses is the scheduler's choice, not the language's:
+codegen takes a loop's parameters off the stack into locals at its top today,
+and opt still materializes a header's parameters as locals. Keeping them on
+the stack where a value is consumed at once is an optimization for later.
 
 ## Examples
 
 Assume `memory heap: u32;`, so `xs.len()` is a `u32`.
 
-**Counting.** No `mut`: each iteration's `i` is the last one's tail.
+**Counting.** No `mut`: each iteration's `i` is the last one's result.
 
 ```wx
-loop i: u32 = 0 {
+loop (i: u32 = 0) {
     if i == n { break };
     visit(i);
     i + 1
@@ -335,20 +312,9 @@ loop i: u32 = 0 {
 
 ```wx
 func sum(xs: heap::&[u32]) -> u32 {
-    loop (i, total) = (0: u32, 0: u32) {
+    loop (i: u32 = 0, total: u32 = 0) {
         if i == xs.len() { break total };
         ({ i: i + 1, total: total + xs[i] })
-    }
-}
-```
-
-**Finding an index.**
-
-```wx
-func index_of(xs: heap::&[u8], wanted: u8) -> u32 {
-    loop i: u32 = 0 {
-        if i == xs.len() || xs[i] == wanted { break i };
-        i + 1
     }
 }
 ```
@@ -357,7 +323,7 @@ func index_of(xs: heap::&[u8], wanted: u8) -> u32 {
 `examples/wasi/main.wx`).
 
 ```wx
-loop (next, start, at) = (0: u32, 0: u32, 0: u32) {
+loop (next: u32 = 0, start: u32 = 0, at: u32 = 0) {
     if at == text.len() { break };
     if text[at] == '\0' {
         arguments[next] = slices::slice_at(text, start, at - start);
@@ -367,11 +333,11 @@ loop (next, start, at) = (0: u32, 0: u32, 0: u32) {
 }
 ```
 
-**The same, updated in place.** `mut` binders are assigned within the
+**The same, updated in place.** `mut` parameters are assigned within the
 iteration and handed on by shorthand.
 
 ```wx
-loop (mut next, mut start, mut at) = (0: u32, 0: u32, 0: u32) {
+loop (mut next: u32 = 0, mut start: u32 = 0, mut at: u32 = 0) {
     if at == text.len() { break };
     if text[at] == '\0' {
         arguments[next] = slices::slice_at(text, start, at - start);
@@ -383,26 +349,11 @@ loop (mut next, mut start, mut at) = (0: u32, 0: u32, 0: u32) {
 }
 ```
 
-**Two pointers, reversing in place.**
-
-```wx
-func reverse(xs: heap::*[u8]) {
-    if xs.len() == 0 { return };
-    loop (i: u32, j: u32) = (0, xs.len() - 1) {
-        if i >= j { break };
-        local t = xs[i];
-        xs[i] = xs[j];
-        xs[j] = t;
-        (i + 1, j - 1)
-    }
-}
-```
-
 **Fibonacci.** The update is simultaneous, so no temporary.
 
 ```wx
 func fib(n: u32) -> u32 {
-    loop (a, b, k) = (0: u32, 1: u32, n) {
+    loop (a: u32 = 0, b: u32 = 1, k = n) {
         if k == 0 { break a };
         (b, a + b, k - 1)
     }
@@ -413,9 +364,9 @@ func fib(n: u32) -> u32 {
 on every row. A labelled `continue` gives the state of the loop it names.
 
 ```wx
-loop :rows row: u32 = 0 {
+loop :rows (row: u32 = 0) {
     if row == height { break };
-    loop col: u32 = 0 {
+    loop (col: u32 = 0) {
         if col == width { break };
         if skip(row, col) { continue col + 1 };
         if done(row, col) { break :rows };
@@ -427,72 +378,75 @@ loop :rows row: u32 = 0 {
 }
 ```
 
-**No state.** A plain `loop` stays as it is.
-
-```wx
-loop {
-    if try_read() { break };
-}
-```
-
 ## Edge cases
 
-1. **The initializer is outside the bindings' scope.** `loop i: u32 = i + 1 {`
-   reads an outer `i`; the header's `i` shadows it inside the loop.
-2. **The initializer is outside the loop's targets.** An unlabelled `break` in
-   it leaves an enclosing `block` or loop, not this one; `break :label` naming
-   this loop is an undeclared label (E2011), since the initializer is not
-   inside it.
-3. **A diverging initializer** (`loop x = return {`) makes the loop
-   unreachable, and it is warned as a statement after a `return` is.
+1. **The initial values are outside the parameters' scope.**
+   `loop (i: u32 = i + 1)` reads an outer `i`; the parameter shadows it
+   inside the body. An initial value does not see the parameters before it
+   either.
+2. **The initial values are outside the loop's targets.** An unlabelled
+   `break` in one leaves an enclosing `block` or loop, not this one;
+   `break :label` naming this loop is an undeclared label (E2011).
+3. **A diverging initial value** (`loop (x = return)`) makes the loop
+   unreachable: its type is `!`.
 4. **A body that forgets the next state is a type error.** A body ending in a
    statement (`i += 1;`) is `()`, which is not the state's type (E2001, at the
-   body's end). A body whose every path breaks, returns or continues is `!`, and
-   fits.
-5. **A bare `continue` in a loop with a state is a mismatch**, as `continue ()`
-   against the state's type. It never means "carry on unchanged".
-6. **A labelled `continue` gives the named loop's state** (`continue :rows
-   row + 1` from an inner loop), and a named list there takes that loop's names.
-7. **The state is not the loop's value.** The loop's type is what its `break`s
-   give, `!` without one.
+   body's end). A body whose every path breaks, returns or continues is `!`,
+   and fits.
+5. **A bare `continue` in a loop with parameters is a mismatch**, as
+   `continue ()` against the state's type. It never means "carry on
+   unchanged".
+6. **A labelled `continue` gives the named loop's state**
+   (`continue :rows row + 1` from an inner loop), and a named list there takes
+   that loop's names.
+7. **The state is not the loop's value.** The loop's type is what its
+   `break`s give, `!` without one.
 8. **A value that does not change across iterations** belongs in a `local`
    before the loop, not in the state, where it would be handed on every time.
 9. **Each outer iteration re-runs an inner header** (the nested example).
-10. **Label placement.** The label stays right after the keyword, before the
-    slots, `loop :outer i: u32 = 0 {`.
-11. **A slot's type ends at `,`, `)` or `=`.** No type contains `=`; a label
-    starts with `:` and a slot never does, so `loop :i {` and
-    `loop i: u32 = 0 {` are told apart by their first token.
+10. **A parameter's type ends at `,`, `)` or `=`.** No type contains `=`.
 
 ## Variants considered
 
+**One initializer for the whole state**, `loop (i: u32, total) = (0, n)`, the
+previous form of this decision, with one parameter allowed without
+parentheses. A header's positions had to be matched against a separate tuple,
+which gets error-prone past a few parameters, and the first state needed its
+own named form (`= ({ i: 0, total: n })`) to stay readable. It could start
+from one computed value (`= pair()`); with initial values per parameter that
+is a `local` before the loop.
+
+**Initial values as defaults.** `= x` here is not a default: a function
+parameter's default would be evaluated per call when omitted, while an
+initial value is evaluated once and every next state still gives every
+parameter. An omitted name in a named next state is an error, not "keep it".
+
 **The header as a `local` initialized once.** `loop P = e { body }` as
 `block { local P = e; loop { body } }`: a mutation carries into the next
-iteration because the binding is the same local, and the body's tail stays
-`()`. This was the first decision. Replaced, because the next state is then
-implicit: forgetting `i += 1` loops forever silently, and the data flow between
-iterations is spread over assignments. Its one advantage, not restating the
-state, is what the named form's shorthand gives back (`({ next, start, at })`).
+iteration because the binding is the same local, and the body's result stays
+`()`. Replaced, because the next state is then implicit: forgetting `i += 1`
+loops forever silently, and the data flow between iterations is spread over
+assignments. Its one advantage, not restating the state, is what the named
+form's shorthand gives back (`({ next, start, at })`).
 
 **Leaving a name out keeps its value** (struct-update style). Shorter, and
 forgetting the counter is a silent infinite loop again.
 
 **The header as a pattern with a type on the whole**
-(`loop (i, total): (u32, u32) = (0, 0)`), the first form of this decision.
-A pattern allows more than a state needs (destructuring, `_`, literals,
-constants, alternatives), each of which the checker would then refuse, and it
-puts the types away from the names they belong to. The signature allows
-exactly names, `mut` and types, and the parameter list's parser and recovery
-come with it.
+(`loop (i, total): (u32, u32) = (0, 0)`). A pattern allows more than a state
+needs (destructuring, `_`, literals, constants, alternatives), each of which
+the checker would then refuse, and it puts the types away from the names they
+belong to.
 
-**Destructuring in the header** (`loop (Point(x, y), n) = ..`). The positional
-form would still work, but a destructured part has no name for the named form,
-and naming the leaves instead would need every part bound to rebuild the value
-(a `_` or `..` throws parts away) and the constructor to be accessible.
-Destructuring goes in the body, as in a function.
+**Destructuring in the header** (`loop (Point(x, y) = p)`). A destructured
+part has no name for the named form. Destructuring goes in the body, as in a
+function.
 
-**Implicit carry of the bindings' current values** at the end of the body. With
-immutable bindings, falling off the end repeats the same state forever.
+**A named next state through branches**, by the expected type: see
+"`({ .. })`: parsed anywhere, meaningful only written directly".
+
+**Implicit carry of the parameters' current values** at the end of the body.
+With immutable parameters, falling off the end repeats the same state forever.
 
 **Wasm-literal constructs** (`loop` not repeating by itself; `break` and
 `continue` as one jump whose direction is the target's). Every ordinary loop
@@ -504,33 +458,9 @@ one, and the step is the body's value.
 
 ## Open
 
-### `while` and a header
+### `while` and parameters
 
-After `while`, a condition may start where a header would, and a slot list
-can look like an expression for arbitrarily long (`while (a, b: T) = ..`
-against `while (a, b) == c`), which would need backtracking. Leaning: a header on
-`loop` only. Decide with `while`.
-
-## Implementation sketch
-
-- **AST:** `Expression::Loop` gains an optional header (its slots, a
-  `List<FunctionParam>`, and an initializer); `FunctionParam`'s type becomes
-  optional for every slot (`notes/binders.md`); `Expression::Continue` gains an optional
-  value; a named list is a new expression holding a `List<NamedArgument>`, as a
-  call by name does. The parser reads the header after the label when the next
-  token is not `{`, and a named list when `(` is followed by `{`.
-- **TIR:** the loop's scope records the state's type and its bindings, which
-  are locals of the loop scope. The body's tail and each `continue`'s value are
-  held to the state's type (`expect`, so its coercions apply), a named list
-  arranged into the bindings' order by name, with the call-by-name diagnostics.
-  A named list anywhere else is reported once. A slot without a type takes
-  its part of the initializer's type.
-- **Lowering:** the initializer is assigned to the bindings before MIR's
-  `Loop`; at the end of the body and before each `Continue`, the next state is
-  evaluated in full and then assigned. MIR and codegen keep their `Loop`.
-- **wx-fmt:** print the header after the label (one slot without
-  parentheses), `continue`'s value, and named lists; wrapping a long header is
-  a layout decision of its own, likely a parameter list's.
-- **LSP:** the bindings are ordinary locals, so hover, go-to-definition and
-  rename work through the existing tables; completion inside a named list
-  offers the header's names, as inside a call by name.
+After `while`, a condition may start where a parameter list would, and a
+parameter list can look like an expression for arbitrarily long
+(`while (a: T = x) ..` against `while (a) == b`), which would need
+backtracking. Leaning: parameters on `loop` only. Decide with `while`.

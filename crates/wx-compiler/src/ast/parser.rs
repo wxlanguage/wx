@@ -617,6 +617,15 @@ struct Delimited<T> {
 	trailing: bool,
 }
 
+/// A loop's parameter as it is read, before the header splits its list
+/// into parameters and initial values.
+struct LoopParamItem {
+	param: Spanned<FunctionParam>,
+	initial: ExprId,
+}
+
+impl ListItem for LoopParamItem {}
+
 /// What reads one item of a delimited list. Its `Err` means it has
 /// reported, and the list skips to the next separator.
 type ItemParser<T> = fn(&mut Parser) -> Result<Spanned<T>, ()>;
@@ -1222,17 +1231,14 @@ impl<'ctx> Parser<'ctx> {
 	/// reported and kept with a missing name ([`Binding::missing`]), so the
 	/// item keeps its arity. Anything else where the binding or the `:` goes
 	/// is reported, and the list's recovery skips the slot. A slot ends at a
-	/// list's `,` or `)`, or at the `=` or `{` after a loop's one slot
-	/// (`loop i = 0 {`), wherever it is written. `self` is parsed
+	/// list's `,` or `)`, or at the `=` before a loop's parameter's initial
+	/// value, wherever it is written. `self` is parsed
 	/// like any name; the item it is in says whether it may stand there.
 	fn parse_binding_and_type(
 		parser: &mut Parser,
 	) -> Result<(Binding, Option<TypeId>, TextOffset), ()> {
 		let ends_slot = |token: Token| {
-			matches!(
-				token,
-				Token::Comma | Token::CloseParen | Token::Eq | Token::OpenBrace
-			)
+			matches!(token, Token::Comma | Token::CloseParen | Token::Eq)
 		};
 		let mut_at = matches!(parser.peek_keyword(), Some(Keyword::Mut))
 			.then(|| parser.lexer.next().span.start);
@@ -3158,12 +3164,10 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_loop_expression(&mut self) -> Result<ExprId, ()> {
 		let loop_keyword = self.lexer.next();
 		let label = self.parse_label();
-		// After the label only the body's `{` or a state can come, and no
-		// pattern starts with `{`.
 		let header = if self.lexer.peek().inner == Token::OpenBrace {
 			None
 		} else {
-			Some(self.parse_loop_header()?)
+			self.parse_loop_header()?
 		};
 		let block = self.parse_block()?;
 		let span = TextSpan::new(
@@ -3180,54 +3184,60 @@ impl<'ctx> Parser<'ctx> {
 		))
 	}
 
-	/// A loop's state, `slots = e`: one slot (`i: u32`), or a list of them
-	/// in parentheses, each read as a parameter is
-	/// ([`Parser::parse_binding_and_type`]), with its type optional. The
-	/// initializer ends at the body's `{`, as an `if`'s condition does, since
-	/// `{` never starts an expression; one not written is reported and kept
-	/// as an error node spanning the gap where it belongs.
-	fn parse_loop_header(&mut self) -> Result<LoopHeaderId, ()> {
-		let state = if self.lexer.peek().inner == Token::OpenParen {
-			let slots =
-				self.separated(PARENS, Parser::parse_function_param_item)?;
-			self.push_delimited_nodes(slots)
-		} else {
-			let slot = Parser::parse_function_param_item(self)?;
-			Spanned {
-				span: slot.span,
-				inner: self.ast.push_nodes([slot]),
-			}
-		};
-		let mut end = state.span.end;
-		let assigned = self.lexer.next_if(Token::Eq);
+	/// A loop's parameters, `(a: u32 = 0, b = n)`, each read as a
+	/// function's is, with its type optional, and then its initial value.
+	/// `()` is no parameters at all, as no list is.
+	fn parse_loop_header(&mut self) -> Result<Option<LoopHeaderId>, ()> {
+		let list = self.separated(PARENS, Parser::parse_loop_param_item)?;
+		if list.items.is_empty() {
+			return Ok(None);
+		}
+		let params = self
+			.ast
+			.push_nodes(list.items.iter().map(|item| item.inner.param));
+		let initials = self
+			.ast
+			.push_list(list.items.into_iter().map(|item| item.inner.initial));
+		Ok(Some(
+			self.ast.push_loop_header(LoopHeader { params, initials }),
+		))
+	}
+
+	/// `a: u32 = 0`. An initial value not written is reported and kept as an
+	/// error node spanning the gap where it belongs.
+	fn parse_loop_param_item(
+		parser: &mut Parser,
+	) -> Result<Spanned<LoopParamItem>, ()> {
+		let param = Parser::parse_function_param_item(parser)?;
+		let mut end = param.span.end;
+		let assigned = parser.lexer.next_if(Token::Eq);
 		if let Some(eq) = assigned {
 			end = eq.span.end;
 		}
-		// A `{` here is the body, not a block written without its keyword.
-		let token = self.lexer.peek();
-		let initializer = if assigned.is_some()
-			&& token.inner != Token::OpenBrace
-			&& Self::starts_expression(token.inner)
-		{
-			self.parse_expression(BindingPower::Default)?
-		} else {
-			self.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::MissingInitializer.code())
-					.with_message("missing first state of the loop")
-					.with_note("example syntax: loop i: u32 = 0 { .. }")
-					.with_label(Label::primary(self.file_id, token.span)),
-			);
-			self.ast.push_expr(
-				Expression::Error,
-				TextSpan::new(end, token.span.start),
-			)
-		};
-		Ok(self.ast.push_loop_header(LoopHeader {
-			state: state.inner,
-			state_span: state.span,
-			initializer,
-		}))
+		let token = parser.lexer.peek();
+		let initial =
+			if assigned.is_some() && Self::starts_expression(token.inner) {
+				parser.parse_expression(BindingPower::Default)?
+			} else {
+				parser.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::MissingInitializer.code())
+						.with_message(
+							"missing initial value of the loop's parameter",
+						)
+						.with_note("example syntax: loop (i: u32 = 0) { .. }")
+						.with_label(Label::primary(parser.file_id, token.span)),
+				);
+				parser.ast.push_expr(
+					Expression::Error,
+					TextSpan::new(end, token.span.start),
+				)
+			};
+		let end = parser.ast.exprs.spans[usize::from(initial)].end;
+		Ok(Spanned {
+			span: TextSpan::new(param.span.start, end),
+			inner: LoopParamItem { param, initial },
+		})
 	}
 
 	fn parse_if_else_expression(&mut self) -> Result<ExprId, ()> {

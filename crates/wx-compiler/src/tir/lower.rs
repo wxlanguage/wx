@@ -143,7 +143,7 @@ impl LocalRun {
 }
 
 /// What a source local is bound to in MIR: its locals, or, for an immutable
-/// slot of a loop's state, the loop's parameters, read where they are used.
+/// parameter of a loop, the loop's Wasm parameters, read where they are used.
 #[derive(Clone, Copy)]
 enum Binding {
 	Locals(LocalRun),
@@ -1127,7 +1127,7 @@ impl<'a> Lowerer<'a> {
 				state.bindings[usize::from(*local)] = Binding::Locals(run);
 			}
 		}
-		// An immutable slot of a loop's state is the loop's parameters; a
+		// An immutable parameter of a loop is the loop's Wasm parameters; a
 		// `mut` one is a local of its own, set from them.
 		let mut in_params = vec![false; body.locals().len()];
 		for scope in (0..body.scope_count() as u32).map(ScopeIdx::new) {
@@ -1135,17 +1135,17 @@ impl<'a> Lowerer<'a> {
 				continue;
 			}
 			let mut start = 0;
-			for slot in body.scope_locals(scope) {
-				let local = body.local(slot);
+			for param in body.scope_locals(scope) {
+				let local = body.local(param);
 				let ty = self.substitute(local.ty, env, &state.args);
 				let ty = self.lower_type(ty, file_id, local.name.span)?;
 				let len = self.signatures.scalars(&ty).len() as u32;
 				if local.mut_span.is_none() {
 					let label = state.label(scope);
 					let range = ScalarRange::new(start, len);
-					state.bindings[usize::from(slot)] =
+					state.bindings[usize::from(param)] =
 						Binding::LoopParams { label, range };
-					in_params[usize::from(slot)] = true;
+					in_params[usize::from(param)] = true;
 				}
 				start += len;
 			}
@@ -1379,9 +1379,9 @@ impl<'a> Lowerer<'a> {
 			}
 			ExprKind::Loop {
 				scope,
-				first,
+				entry,
 				body: loop_body,
-			} => self.lower_loop(body, state, scope, first, loop_body, ty),
+			} => self.lower_loop(body, state, scope, entry, loop_body, ty),
 			ExprKind::Break { scope, value } => {
 				let value = match value {
 					Some(value) => Some(self.lower_expr(body, state, value)?),
@@ -1799,22 +1799,23 @@ impl<'a> Lowerer<'a> {
 		}
 	}
 
-	/// `loop (slots) = first { body }` as a Wasm `loop` taking the state as
-	/// its parameters: `first` is its entry, and the body's result, the next
-	/// state, what it restarts with. An immutable slot is read as the
-	/// parameters where it is used; a `mut` one is set from them first.
+	/// `loop (a = x, b = y) { body }` as a Wasm `loop` taking the state as
+	/// its parameters: `entry` is what it is entered with, and the body's
+	/// result, the next state, what it restarts with. An immutable parameter
+	/// is read as the loop's parameters where it is used; a `mut` one is a
+	/// local set from them first.
 	fn lower_loop(
 		&mut self,
 		body: &Body,
 		state: &mut FunctionState,
 		scope: ScopeIdx,
-		first: Option<ExprIdx>,
+		entry: Option<ExprIdx>,
 		loop_body: ExprIdx,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
-		let entry = match first {
-			Some(first) => {
-				let entry = self.lower_expr(body, state, first)?;
+		let entry = match entry {
+			Some(entry) => {
+				let entry = self.lower_expr(body, state, entry)?;
 				// A first state that never arrives never starts the loop.
 				if state.ty(entry) == mir::ValueType::Never {
 					return Ok(entry);
@@ -1839,16 +1840,16 @@ impl<'a> Lowerer<'a> {
 			self.lower_type(body_ty, state.file_id, body.span(loop_body))?;
 		let mut lowered = Vec::new();
 		let mut start = 0;
-		for slot in body.scope_locals(scope) {
-			let local = body.local(slot);
-			let slot_ty = self.substitute(local.ty, state.env, &state.args);
-			let slot_ty =
-				self.lower_type(slot_ty, state.file_id, local.name.span)?;
-			let len = self.signatures.scalars(&slot_ty).len() as u32;
-			if let Binding::Locals(run) = state.bindings[usize::from(slot)] {
+		for param in body.scope_locals(scope) {
+			let local = body.local(param);
+			let param_ty = self.substitute(local.ty, state.env, &state.args);
+			let param_ty =
+				self.lower_type(param_ty, state.file_id, local.name.span)?;
+			let len = self.signatures.scalars(&param_ty).len() as u32;
+			if let Binding::Locals(run) = state.bindings[usize::from(param)] {
 				let range = ScalarRange::new(start, len);
 				let params = Binding::LoopParams { label, range };
-				let value = self.read_binding(state, params, slot_ty);
+				let value = self.read_binding(state, params, param_ty);
 				lowered.push(self.write_locals(state, run, value));
 			}
 			start += len;
@@ -7509,13 +7510,13 @@ mod tests {
 		}
 	}
 
-	/// An immutable slot is the loop's parameter, read where it is used: it
-	/// has no local of its own.
+	/// An immutable parameter is the loop's Wasm parameter, read where it is
+	/// used: it has no local of its own.
 	#[test]
 	fn a_loop_state_is_the_loops_parameters() {
 		let source = r#"
             func count(n: u32) -> u32 {
-                loop i: u32 = 0 {
+                loop (i: u32 = 0) {
                     if i == n { break i * 2 };
                     i + 1
                 }
@@ -7532,7 +7533,7 @@ mod tests {
 	fn a_named_state_sums_and_a_continue_skips() {
 		let source = r#"
             func sum(n: u32) -> u32 {
-                loop (i: u32, total: u32) = (0, 0) {
+                loop (i: u32 = 0, total: u32 = 0) {
                     if i == n { break total };
                     if i == 2 { continue ({ total, i: i + 1 }) };
                     ({ i: i + 1, total: total + i })
@@ -7549,7 +7550,7 @@ mod tests {
 	fn a_next_state_is_given_at_once() {
 		let source = r#"
             func fib(n: u32) -> u32 {
-                loop (a: u32, b: u32, k) = (0, 1, n) {
+                loop (a: u32 = 0, b: u32 = 1, k = n) {
                     if k == 0 { break a };
                     (b, a + b, k - 1)
                 }
@@ -7559,13 +7560,13 @@ mod tests {
 		assert_runs(source, "fib", &[(0, 0), (1, 1), (2, 1), (10, 55)]);
 	}
 
-	/// A `mut` slot is a local set from the parameters, assigned within the
-	/// iteration and handed on.
+	/// A `mut` parameter is a local set from the Wasm parameters, assigned
+	/// within the iteration and handed on.
 	#[test]
-	fn a_mut_slot_is_assigned_within_an_iteration() {
+	fn a_mut_parameter_is_assigned_within_an_iteration() {
 		let source = r#"
             func steps(n: u32) -> u32 {
-                loop (mut at: u32, taken: u32) = (0, 0) {
+                loop (mut at: u32 = 0, taken: u32 = 0) {
                     if at >= n { break taken };
                     at += 1;
                     if at % 3 == 0 { at += 1 };
@@ -7583,9 +7584,9 @@ mod tests {
 	fn nested_loops_restart_with_their_own_state() {
 		let source = r#"
             func cells(n: u32) -> u32 {
-                loop :rows (row: u32, seen: u32) = (0, 0) {
+                loop :rows (row: u32 = 0, seen: u32 = 0) {
                     if row == n { break seen };
-                    loop (col: u32, here: u32) = (0, seen) {
+                    loop (col: u32 = 0, here: u32 = seen) {
                         if col == row { continue :rows (row + 1, here) };
                         (col + 1, here + 1)
                     }
@@ -7597,13 +7598,14 @@ mod tests {
 		assert_runs(source, "cells", &[(0, 0), (1, 0), (4, 6)]);
 	}
 
-	/// A slot of a struct type is several parameters; its fields read them.
+	/// A parameter of a struct type is several Wasm parameters; its fields
+	/// read them.
 	#[test]
-	fn a_struct_slot_is_read_by_its_fields() {
+	fn a_struct_parameter_is_read_by_its_fields() {
 		let source = r#"
             struct Range(start: u32, end: u32);
             func width(n: u32) -> u32 {
-                loop (r: Range, steps: u32) = (Range(0, n), 0) {
+                loop (r: Range = Range(0, n), steps: u32 = 0) {
                     if r.start == r.end { break steps };
                     (Range(r.start + 1, r.end), steps + 1)
                 }

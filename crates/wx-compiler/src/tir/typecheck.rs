@@ -138,6 +138,9 @@ struct ScopeType {
 	/// The type the first value given to the scope settled on (its result,
 	/// a `break`, a `return`); `INFER` until one does.
 	ty: TypeIndex,
+	/// The state a `continue` restarting the scope gives it: its parameters'
+	/// types as one, `()` for a scope without any.
+	state: TypeIndex,
 }
 
 impl<'a> BodyContext<'a> {
@@ -458,6 +461,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		self.scope_types.push(ScopeType {
 			expected,
 			ty: TypeIndex::INFER,
+			state: TypeIndex::UNIT,
 		});
 	}
 
@@ -3569,24 +3573,25 @@ mod tests {
 					items.extend(else_block);
 					list("if", &items)
 				}
-				// `(loop (i#1 total#2) = first .. => next)`: the body's block
-				// inline, after the slots and the first state.
+				// `(loop (i#1 total#2) = entry .. => next)`: the body's block
+				// inline, after the parameters and the first state.
 				ExprKind::Loop {
 					scope,
-					first,
+					entry,
 					body: loop_body,
 				} => {
 					let inner = self.render(body, loop_body);
 					let inner = inner.strip_prefix("(block").unwrap();
-					let head = match first {
-						Some(first) => {
-							let slots: Vec<String> = (body.scope_locals(scope))
-								.map(|slot| self.local_name(body, slot))
-								.collect();
+					let head = match entry {
+						Some(entry) => {
+							let params: Vec<String> = (body
+								.scope_locals(scope))
+							.map(|param| self.local_name(body, param))
+							.collect();
 							format!(
 								"(loop ({}) = {}",
-								slots.join(" "),
-								self.render(body, first)
+								params.join(" "),
+								self.render(body, entry)
 							)
 						}
 						None => "(loop".to_string(),
@@ -4222,31 +4227,24 @@ mod tests {
 			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
 	}
 
-	/// A slot's type is written, or its part of the first state's; the body's
+	/// A parameter's type is written, or its initial value's; the body's
 	/// result and each `continue`'s value are the next state, positionally or
 	/// by name.
 	#[test]
-	fn a_loop_state_is_typed_by_its_slots_and_first_state() {
+	fn a_loop_state_is_typed_by_its_parameters() {
 		let case = TestCase::new(indoc! {"
 				func sum(n: u32) -> u32 {
-					loop (i: u32, total) = (0, n) {
+					loop (i: u32 = 0, total = n) {
 						if i == n { break total };
 						if i == 7 { continue (i + 2, total) };
 						({ total: total + i, i: i + 1 })
 					}
 				}
 				func count() -> u32 {
-					loop mut i: u32 = 0 {
+					loop (mut i: u32 = 0) {
 						i += 1;
 						if i > 3 { break i };
 						({ i })
-					}
-				}
-				func by_name(n: u32) -> u32 {
-					local zero: u32 = 0;
-					loop (a, b) = ({ b: n, a: zero }) {
-						if a == b { break a };
-						(a + 1, b)
 					}
 				}
 			"});
@@ -4266,15 +4264,6 @@ mod tests {
 			 (if (== i#1 7) (block => (continue loop (tuple (+ i#1 2) total#2)))) \
 			 => (tuple 1=(+ total#2 i#1) 0=(+ i#1 1))))"
 		);
-		assert_eq!(
-			case.locals("by_name"),
-			[
-				("n".into(), "u32".into()),
-				("zero".into(), "u32".into()),
-				("a".into(), "u32".into()),
-				("b".into(), "u32".into())
-			]
-		);
 	}
 
 	/// The first state is built outside the loop: it reads the names around
@@ -4283,7 +4272,7 @@ mod tests {
 	fn a_loop_state_is_first_given_outside_the_loop() {
 		let case = TestCase::new(indoc! {"
 				func f(i: u32) -> u32 {
-					loop i: u32 = i + 1 { break i }
+					loop (i: u32 = i + 1) { break i }
 				}
 			"});
 		case.diagnostics().assert_none();
@@ -4294,21 +4283,21 @@ mod tests {
 
 		let case = TestCase::new(indoc! {"
 				func f() {
-					loop :l i: u32 = block { break :l 0 } { break }
+					loop :l (i: u32 = block { break :l 0 }) { break }
 				}
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredLabel]);
 	}
 
-	/// A slot left to the first state needs a typed part of it, as a `local`
-	/// does; the state's type is fixed there, so nothing later reports it
-	/// again.
+	/// A parameter without a written type needs a typed initial value, as a
+	/// `local` does; the state's type is fixed there, so nothing later
+	/// reports it again.
 	#[test]
-	fn an_untyped_slot_needs_a_typed_first_state() {
+	fn an_untyped_parameter_needs_a_typed_initial_value() {
 		let case = TestCase::new(indoc! {"
 				func f() -> u32 {
-					loop (i, j: u32) = (0, 0) {
+					loop (i = 0, j: u32 = 0) {
 						if j == 0 { break 1 };
 						(i + 1: u32, j)
 					}
@@ -4324,7 +4313,7 @@ mod tests {
 	fn a_loop_body_gives_the_whole_next_state() {
 		let case = TestCase::new(indoc! {"
 				func f(c: Bool) {
-					loop i: u32 = 0 {
+					loop (i: u32 = 0) {
 						if c { continue };
 						if c { continue c };
 						if c { break };
@@ -4340,19 +4329,19 @@ mod tests {
 		// A body whose every path leaves gives nothing, and fits.
 		let case = TestCase::new(indoc! {"
 				func f() -> u32 {
-					loop i: u32 = 0 { break i }
+					loop (i: u32 = 0) { break i }
 				}
 			"});
 		case.diagnostics().assert_none();
 	}
 
-	/// A named next state follows a call by name's rules: every slot once,
-	/// and nothing else.
+	/// A named next state follows a call by name's rules: every parameter
+	/// once, and nothing else.
 	#[test]
-	fn a_named_state_gives_every_slot_once() {
+	fn a_named_state_gives_every_parameter_once() {
 		let case = TestCase::new(indoc! {"
 				func f(c: Bool) {
-					loop (a: u32, b: u32) = (0, 0) {
+					loop (a: u32 = 0, b: u32 = 0) {
 						if c { continue ({ a: 1, x: 2, b }) };
 						if c { continue ({ a: 1, a: 2, b }) };
 						({ a: 1 })
@@ -4370,17 +4359,20 @@ mod tests {
 			.assert_error_saying("missing argument `b` for the loop");
 	}
 
-	/// A repeated slot name is reported where it is declared, as a
-	/// function's is. The slot keeps its place in the state, but the name
-	/// finds the first, in the body and in a named state.
+	/// A repeated parameter name is reported where it is declared, as a
+	/// function's is. The parameter keeps its place in the state, but the
+	/// name finds the first, in the body and in a named state.
 	#[test]
-	fn a_repeated_slot_name_finds_the_first() {
+	fn a_repeated_parameter_name_finds_the_first() {
 		let case = TestCase::new(indoc! {"
 				func positional() -> u32 {
-					loop (a: u32, a: u64) = (1, 2) { break a }
+					loop (a: u32 = 1, a: u64 = 2) { break a }
 				}
 				func named() -> u32 {
-					loop (a: u32, a: u64) = ({ a: 1 }) { break a }
+					loop (a: u32 = 1, a: u64 = 2) {
+						if a == 1 { break a };
+						({ a: a + 1 })
+					}
 				}
 			"});
 		case.diagnostics().assert_codes(&[
@@ -4395,9 +4387,9 @@ mod tests {
 	fn a_labelled_continue_gives_the_named_loops_state() {
 		let case = TestCase::new(indoc! {"
 				func f(n: u32) -> u32 {
-					loop :rows row: u32 = 0 {
+					loop :rows (row: u32 = 0) {
 						if row == n { break row };
-						loop col: u32 = 0 {
+						loop (col: u32 = 0) {
 							if col == n { continue :rows ({ row: row + 1 }) };
 							col + 1
 						}
@@ -4414,7 +4406,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func f(x: u32) -> u32 {
 					local y = ({ a: x, b: missing });
-					loop i: u32 = 0 {
+					loop (i: u32 = 0) {
 						if i == 0 { break ({ i }) };
 						if i == 1 { ({ i }) } else { i }
 					}
@@ -4423,6 +4415,25 @@ mod tests {
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NamedListWithoutNames,
 			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::NamedListWithoutNames,
+			DiagnosticCode::NamedListWithoutNames,
+		]);
+	}
+
+	/// Only a named list written directly is a next state by name: one in
+	/// parentheses is a parenthesized value, as anywhere else.
+	#[test]
+	fn a_named_state_is_written_directly() {
+		let case = TestCase::new(indoc! {"
+				func f() -> u32 {
+					loop (i: u32 = 0) {
+						if i == 3 { break i };
+						if i == 1 { continue (({ i: i + 2 })) };
+						(({ i: i + 1 }))
+					}
+				}
+			"});
+		case.diagnostics().assert_codes(&[
 			DiagnosticCode::NamedListWithoutNames,
 			DiagnosticCode::NamedListWithoutNames,
 		]);

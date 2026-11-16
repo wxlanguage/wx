@@ -3059,6 +3059,43 @@ fn completion_of_a_named_argument_through_self_offers_the_structs_fields() {
 	}
 }
 
+/// A loop's next state by name, written directly as `continue`'s value or
+/// as the body's result, offers the parameters of the loop it restarts,
+/// with their types.
+#[test]
+fn completion_of_a_named_state_offers_the_loops_parameters() {
+	let source = |site: &str| {
+		format!(
+			"func f(n: u32) -> u32 {{\n    loop :outer (low: u32 = 0, high = n) {{\n        \
+			 if low == high {{ break low }};\n        loop (i: u32 = 0) {{\n            \
+			 {site}\n        }}\n    }}\n}}\n"
+		)
+	};
+	for (site, expected, absent) in [
+		("continue ({ $0 })", &["i"][..], &["low", "high"][..]),
+		("continue :outer ({ $0 })", &["low", "high"], &["i"]),
+		("continue :outer ({ low: 1, $0 })", &["high"], &["low"]),
+		("({ $0 })", &["i"], &["low", "high"]),
+	] {
+		let labels = completions(&source(site))
+			.unwrap_or_else(|| panic!("nothing offered in {site:?}"));
+		assert_offers(&labels, expected, absent);
+	}
+	let items =
+		completion_items(&source("continue :outer ({ $0 })"), false).unwrap();
+	let mut details: Vec<_> =
+		items.iter().map(|item| item.detail.as_deref()).collect();
+	details.sort();
+	assert_eq!(details, [Some("high: u32"), Some("low: u32")]);
+
+	// A named list anywhere else, wrapped in parentheses included, gives
+	// no loop's state.
+	for site in ["local x = ({ $0 });", "continue (({ $0 }))"] {
+		let labels = completions(&source(site)).unwrap_or_default();
+		assert_offers(&labels, &[], &["i", "low", "high"]);
+	}
+}
+
 #[test]
 fn completion_after_a_named_arguments_colon_offers_values() {
 	let labels = completions(&format!(

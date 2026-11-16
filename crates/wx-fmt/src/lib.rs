@@ -2525,41 +2525,27 @@ impl<'a> Builder<'a> {
 				block,
 			} => {
 				let mut items = vec![self.labelled_keyword(Text::Loop, label)];
-				// The state is printed on the keyword's line, its slots as a
-				// parameter list's, one without parentheses. `() = ()` is
-				// the state `()`, the same as none, and is dropped; an
-				// initializer that computes something is kept.
-				let header = header.map(|header| ast.loop_header(header));
-				if let Some(ast::LoopHeader {
-					state, initializer, ..
-				}) = header && !(state.is_empty()
-					&& matches!(
-						ast.expr(initializer),
-						ast::Expression::Tuple { elements } if elements.is_empty()
-					)) {
-					let slots = ast.list(state);
-					if let [slot] = slots {
+				// The parameters are printed on the keyword's line, each as a
+				// function's parameter is, then its initial value.
+				if let Some(header) = header {
+					let ast::LoopHeader { params, initials } =
+						ast.loop_header(header);
+					items.push(self.text(Text::LParen));
+					let params =
+						ast.list(params).iter().zip(ast.list(initials));
+					for (index, (param, &initial)) in params.enumerate() {
+						if index > 0 {
+							items.push(self.text(Text::CommaSp));
+						}
 						self.build_binding_and_type(
 							&mut items,
-							slot.binding,
-							slot.ty,
+							param.binding,
+							param.ty,
 						);
-					} else {
-						items.push(self.text(Text::LParen));
-						for (index, slot) in slots.iter().enumerate() {
-							if index > 0 {
-								items.push(self.text(Text::CommaSp));
-							}
-							self.build_binding_and_type(
-								&mut items,
-								slot.binding,
-								slot.ty,
-							);
-						}
-						items.push(self.text(Text::RParen));
+						items.push(self.text(Text::EqSp));
+						items.push(self.build_expression(initial));
 					}
-					items.push(self.text(Text::EqSp));
-					items.push(self.build_expression(initializer));
+					items.push(self.text(Text::RParen));
 					items.push(self.text(Text::Space));
 				}
 				items.push(

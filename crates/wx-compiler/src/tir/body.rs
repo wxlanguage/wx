@@ -417,14 +417,15 @@ pub(super) enum ExprKind {
 		then_block: ExprIdx,
 		else_block: Option<ExprIdx>,
 	},
-	/// `loop (slots) = first { body }`, owning `scope`, which declares the
-	/// slots, in order. `first` is the first state, built outside the loop;
-	/// `body` is a `Block` whose result is the next state. A loop without a
-	/// header has no slots and the state `()`. Its type comes from the
-	/// `break`s that leave it; with none, it never ends and is `!`.
+	/// `loop (a = x, b = y) { body }`, owning `scope`, which declares the
+	/// parameters, in order. `entry` is the first state, their initial
+	/// values as one, built outside the loop; `body` is a `Block` whose
+	/// result is the next state. A loop without parameters has the state
+	/// `()`. Its type comes from the `break`s that leave it; with none, it
+	/// never ends and is `!`.
 	Loop {
 		scope: ScopeIdx,
-		first: Option<ExprIdx>,
+		entry: Option<ExprIdx>,
 		body: ExprIdx,
 	},
 	/// Leaves `scope`, a loop or a labelled block, giving it `value`.
@@ -757,7 +758,7 @@ impl Body {
 	}
 
 	/// The locals `scope` declares, in order.
-	pub(super) fn scope_locals(
+	pub fn scope_locals(
 		&self,
 		scope: ScopeIdx,
 	) -> impl ExactSizeIterator<Item = LocalIdx> + use<> {
@@ -903,6 +904,22 @@ impl Body {
 			};
 		}
 		self.operand_with_span(ast.expr_span(expr))
+	}
+
+	/// The loop the expression `expr` of `ast` gives its next state to, as
+	/// it was checked: a `continue`'s target, or a loop itself. `None` for a
+	/// `continue` with no target, which was checked as an error.
+	pub fn loop_of(&self, ast: &AST, expr: ExprId) -> Option<ScopeIdx> {
+		let Operand::Value(at) = self.operand_with_span(ast.expr_span(expr))?
+		else {
+			return None;
+		};
+		match self.kind(at) {
+			ExprKind::Continue { scope, .. } | ExprKind::Loop { scope, .. } => {
+				Some(scope)
+			}
+			_ => None,
+		}
 	}
 
 	/// What the expression written at exactly `span` was checked as: the
@@ -1102,12 +1119,6 @@ impl Body {
 
 	pub(super) fn set_ty(&mut self, expr: ExprIdx, ty: TypeIndex) {
 		self.types[usize::from(expr)] = ty;
-	}
-
-	/// Settles the type of a local declared before what gives it was built:
-	/// a loop's slot, typed by the first state.
-	pub(super) fn set_local_ty(&mut self, local: LocalIdx, ty: TypeIndex) {
-		self.locals[usize::from(local)].ty = ty;
 	}
 }
 

@@ -1194,41 +1194,42 @@ fn test_loop_break_label() {
 }
 
 #[test]
-fn a_loop_takes_a_state_after_its_label() {
+fn a_loop_takes_parameters_after_its_label() {
 	assert_eq!(
-		shape_of("loop i: u32 = 0 { i + 1 }"),
-		"(loop (state (slots (i u32)) 0) (+ i 1))"
-	);
-	assert_eq!(shape_of("loop i = n { }"), "(loop (state (slots (i)) n))");
-	assert_eq!(
-		shape_of("loop :rows (mut a: u32, b) = (0, n) { (b, a) }"),
-		"(loop :rows (state (slots (mut a u32) (b)) (tuple 0 n)) \
-		 (tuple b a))"
-	);
-	// The initializer ends at the body's `{`, as a condition does.
-	assert_eq!(
-		shape_of("loop at: _ = start + 1 { }"),
-		"(loop (state (slots (at _)) (+ start 1)))"
+		shape_of("loop (i: u32 = 0) { i + 1 }"),
+		"(loop (params (= (i u32) 0)) (+ i 1))"
 	);
 	assert_eq!(
-		shape_of("loop () = () { }"),
-		"(loop (state (slots) (tuple)))"
+		shape_of("loop :rows (mut a: u32 = 0, b = n) { (b, a) }"),
+		"(loop :rows (params (= (mut a u32) 0) (= (b) n)) (tuple b a))"
 	);
+	assert_eq!(
+		shape_of("loop (at: _ = start + 1,) { }"),
+		"(loop (params (= (at _) (+ start 1))))"
+	);
+	// An initial value may be block-like: the list's `)` ends it.
+	assert_eq!(
+		shape_of("loop (i = block { 0 }) { }"),
+		"(loop (params (= (i) (block 0))))"
+	);
+	// No parameters are no list.
+	assert_eq!(shape_of("loop () { }"), "(loop)");
 	assert_eq!(shape_of("loop :l { }"), "(loop :l)");
 }
 
-/// The state's slots are a parameter list's: a type alone or `_` is no
-/// name, and a pattern is no slot.
+/// The parameters are a parameter list's: a type alone or `_` is no name,
+/// a pattern is no parameter, and the list is in parentheses.
 #[test]
-fn a_loop_state_is_slots_not_a_pattern() {
+fn a_loops_parameters_are_not_patterns() {
 	for (body, message) in [
-		("loop (_: u32) = 0 { }", "expected a name, found `_`"),
+		("loop (_: u32 = 0) { }", "expected a name, found `_`"),
 		(
-			"loop (*u8, a: u8) = (p, 1) { }",
+			"loop (*u8 = p, a: u8 = 1) { }",
 			"expected a name before this type",
 		),
-		("loop Point(x, y) = p { }", "expected `:`, found `(`"),
-		("loop 0 = 0 { }", "expected a name, found `integer`"),
+		("loop (Point(x, y) = p) { }", "expected `:`, found `(`"),
+		("loop (0 = 0) { }", "expected a name, found `integer`"),
+		("loop i: u32 = 0 { }", "expected `(`, found `identifier`"),
 	] {
 		let case = TestCase::new(&format!("func f() {{ {body} }}"));
 		case.diagnostics().assert_error_saying(message);
@@ -1262,8 +1263,12 @@ fn a_named_list_is_an_expression_on_its_own() {
 }
 
 #[test]
-fn a_loop_state_without_a_first_value_is_reported() {
-	for body in ["loop i: u32 { }", "loop i = { }", "loop i { }"] {
+fn a_loop_parameter_without_an_initial_value_is_reported() {
+	for body in [
+		"loop (i: u32) { }",
+		"loop (i = ) { }",
+		"loop (i, j = 0) { }",
+	] {
 		let case = TestCase::new(&format!("func f() {{ {body} }}"));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::MissingInitializer]);
@@ -2353,7 +2358,8 @@ fn test_unclosed_delimiter() {
 
 #[test]
 fn test_invalid_function_param_type_reports_parse_error() {
-	// `=` may end a slot (a loop's), so `x` is kept with an error type, and
+	// `=` may end a slot (before a loop parameter's initial value), so `x` is
+	// kept with an error type, and
 	// the list reports the `=` it does not expect.
 	let case = TestCase::new(indoc! {"
         func f(x: =) {}

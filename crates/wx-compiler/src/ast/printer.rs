@@ -773,7 +773,7 @@ impl<'a> Printer<'a> {
 		self.headed_block(head, label, None, block)
 	}
 
-	/// A block after its label and, for a loop, its state.
+	/// A block after its label and, for a loop, its parameters.
 	fn headed_block(
 		&self,
 		head: &str,
@@ -783,17 +783,19 @@ impl<'a> Printer<'a> {
 	) -> Sexp {
 		let Block { statements, tail } = self.ast.block(block);
 		let header = header.map(|header| {
-			let LoopHeader {
-				state, initializer, ..
-			} = self.ast.loop_header(header);
-			let slots =
-				self.ast.list(state).iter().map(|slot| {
-					Sexp::List(self.bound_to(slot.binding, slot.ty))
+			let LoopHeader { params, initials } = self.ast.loop_header(header);
+			let params = (self.ast.list(params).iter())
+				.zip(self.ast.list(initials))
+				.map(|(param, &initial)| {
+					Sexp::head(
+						"=",
+						[
+							Sexp::List(self.bound_to(param.binding, param.ty)),
+							self.expr(initial),
+						],
+					)
 				});
-			Sexp::head(
-				"state",
-				[Sexp::head("slots", slots), self.expr(initializer)],
-			)
+			Sexp::head("params", params)
 		});
 		Sexp::head(
 			head,

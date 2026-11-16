@@ -283,8 +283,8 @@ pub enum Expression {
 		label: Option<Spanned<SymbolU32>>,
 		value: Option<ExprId>,
 	},
-	/// `loop :label { ... }`, or `loop :label P: T = e { ... }` with a
-	/// state ([`LoopHeader`]).
+	/// `loop :label { ... }`, or `loop :label (p: T = e) { ... }` with
+	/// parameters ([`LoopHeader`]).
 	Loop {
 		label: Option<Spanned<SymbolU32>>,
 		header: Option<LoopHeaderId>,
@@ -354,17 +354,16 @@ pub struct NamedArgument {
 	pub value: Option<ExprId>,
 }
 
-/// A loop's state, `(a: A, b) = e` between its label and its body: the
-/// loop body's parameter list, each slot written as a parameter is with its
-/// type optional, and the first state (`notes/loop-bindings.md`). One slot
-/// may be written without parentheses, and is the same list.
+/// A loop's parameters, `(a: u32 = 0, b = n)` between its label and its
+/// body: the loop body's parameter list, each written as a function's
+/// parameter is with its type optional, and the value it starts with,
+/// `initials[i]` for `params[i]` (`notes/loop-bindings.md`). The parser
+/// writes both lists, as long as each other.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct LoopHeader {
-	pub state: List<FunctionParam>,
-	/// The slots, with the parentheses when written.
-	pub state_span: TextSpan,
-	pub initializer: ExprId,
+	pub params: List<FunctionParam>,
+	pub initials: List<ExprId>,
 }
 
 /// One arm of a `match` expression: `{pattern} => { ... }` or
@@ -1755,6 +1754,7 @@ impl AstBuilder {
 	}
 
 	fn push_loop_header(&mut self, header: LoopHeader) -> LoopHeaderId {
+		debug_assert_eq!(header.params.len(), header.initials.len());
 		let id =
 			LoopHeaderId::new(u32::try_from(self.loop_headers.len()).unwrap());
 		self.loop_headers.push(header);
@@ -1923,15 +1923,6 @@ impl AST {
 
 	pub fn loop_header(&self, id: LoopHeaderId) -> LoopHeader {
 		self.loop_headers[usize::from(id)]
-	}
-
-	/// From the state's slots to the end of its initializer.
-	pub fn loop_header_span(&self, id: LoopHeaderId) -> TextSpan {
-		let header = self.loop_header(id);
-		TextSpan::new(
-			header.state_span.start,
-			self.expr_span(header.initializer).end,
-		)
 	}
 
 	pub fn list<T: Listed>(&self, list: List<T>) -> &[T] {

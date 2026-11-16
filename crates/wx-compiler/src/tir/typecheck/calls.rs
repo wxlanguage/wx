@@ -968,11 +968,11 @@ impl BodyBuilder<'_, '_> {
 				return Some(kind.declared_here(self.sema));
 			}
 			NamedOwner::Loop(scope) => {
-				let mut slots = self.body.scope_locals(scope);
-				let first = self.body.local(slots.next()?).name.span;
-				let last = slots
+				let mut params = self.body.scope_locals(scope);
+				let first = self.body.local(params.next()?).name.span;
+				let last = params
 					.last()
-					.map_or(first, |slot| self.body.local(slot).name.span);
+					.map_or(first, |param| self.body.local(param).name.span);
 				TextSpan::new(first.start, last.end)
 			}
 		};

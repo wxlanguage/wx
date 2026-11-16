@@ -16,13 +16,13 @@ use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan};
 use crate::symbols::Keyword;
 use crate::tir::body::{
-	self, Body, ExprIdx, ExprKind, ExprObligation, LabelIdx, LocalIdx,
-	Obligations, ParamIdx, Scope, ScopeIdx, ScopeKind,
+	self, Body, ElementOrder, ExprIdx, ExprKind, ExprObligation, LabelIdx,
+	LocalIdx, Obligations, ParamIdx, Scope, ScopeIdx, ScopeKind,
 };
 use crate::tir::decls::{FunctionIdx, report_duplicate_parameter};
 use crate::tir::resolutions::{AccessKind, Reference, Site};
 use crate::tir::signatures::InferPolicy;
-use crate::tir::types::{Type, TypeIndex};
+use crate::tir::types::TypeIndex;
 
 impl BodyBuilder<'_, '_> {
 	/// Checks a function's block as its body. Its named parameters are the
@@ -75,6 +75,7 @@ impl BodyBuilder<'_, '_> {
 		self.scope_types.push(ScopeType {
 			expected,
 			ty: TypeIndex::INFER,
+			state: TypeIndex::UNIT,
 		});
 		self.current = scope;
 		scope
@@ -300,14 +301,9 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 		block_end: TextOffset,
 	) -> ExprIdx {
-		let declared = self.declared_type(ty);
-		let value = self.build(value, declared);
-		let (value, mut local_ty) = self.complete(value, declared);
-		if !self.is_known(local_ty, declared) {
-			let span = self.ast().pattern_span(pattern);
-			self.report_uninferred(span, "local");
-			local_ty = TypeIndex::ERROR;
-		}
+		let pattern_span = self.ast().pattern_span(pattern);
+		let (value, local_ty) =
+			self.build_initial(ty, value, pattern_span, InitializerKind::Local);
 		let ty = if self.body.ty(value) == TypeIndex::NEVER {
 			TypeIndex::NEVER
 		} else {
@@ -341,43 +337,46 @@ impl BodyBuilder<'_, '_> {
 		self.context().normalized(ty)
 	}
 
-	/// Holds `value`, built with `declared` as its hint, to `declared`, and
-	/// completes `declared` with its type: what the bindings it is given to
-	/// are, as far as `is_known` says.
-	fn complete(
+	/// `value`, the initial value of a binding declared `ty`, held to it, and
+	/// the type the binding takes: the declared one completed by the value's.
+	/// It must be known: no part left unknown or untyped (a literal), and no
+	/// data in no memory that the value brought (a written slice or array is
+	/// reported where it is written, as held by value). One that is not is
+	/// reported at `span`, the binding, and is `ERROR`.
+	fn build_initial(
 		&mut self,
-		value: ExprIdx,
-		declared: TypeIndex,
+		ty: Option<ast::TypeId>,
+		value: ast::ExprId,
+		span: TextSpan,
+		kind: InitializerKind,
 	) -> (ExprIdx, TypeIndex) {
+		let declared = self.declared_type(ty);
+		let value = self.build(value, declared);
 		let value = self.expect(value, declared);
 		let actual = self.body.ty(value);
 		let ty = self.sema.types.meet(declared, actual).unwrap_or(declared);
-		(value, ty)
-	}
-
-	/// Whether `ty`, `declared` completed by a value, is known enough for a
-	/// binding: no part left unknown or untyped (a literal), and no data in
-	/// no memory that the value brought. A written slice or array is
-	/// reported where it is written, as held by value.
-	fn is_known(&self, ty: TypeIndex, declared: TypeIndex) -> bool {
 		let types = &self.sema.types;
-		!types.has_infer(ty)
+		let known = !types.has_infer(ty)
 			&& !types.has_const_kind(ty)
-			&& (!types.has_unplaced(ty) || types.has_unplaced(declared))
-	}
-
-	/// E2002 at `span`, a binding (`what`) whose type is not known.
-	fn report_uninferred(&mut self, span: TextSpan, what: &str) {
+			&& (!types.has_unplaced(ty) || types.has_unplaced(declared));
+		if known {
+			return (value, ty);
+		}
+		let binding = match kind {
+			InitializerKind::Local => "local",
+			InitializerKind::LoopParam => "parameter",
+		};
 		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::TypeAnnotationRequired.code())
 				.with_message("type annotation required")
 				.with_label(
 					Label::primary(self.scope.file_id, span).with_message(
-						format!("cannot infer the type of this {what}"),
+						format!("cannot infer the type of this {binding}"),
 					),
 				),
 		);
+		(value, TypeIndex::ERROR)
 	}
 
 	/// `match scrutinee { pattern => expr | { .. }, .. }`. Each arm's bindings
@@ -618,12 +617,14 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// `loop :l (a: A, b) = first { body }`, or `loop { body }` with the
-	/// state `()`. The slots are the loop scope's locals, in order, declared
-	/// before `first` is built outside the loop (it sees neither them nor the
-	/// loop's label) and typed by it: a slot without a written type takes its
-	/// part of `first`'s. The body is a block of its own, whose result is the
-	/// next state. The loop's type is what its `break`s give it.
+	/// `loop :l (a: A = x, b = y) { body }`, or `loop { body }` without
+	/// parameters, whose state is `()`. Each initial value is built before
+	/// the loop, outside it (it sees neither the parameters nor the loop's
+	/// label), and types its parameter as a `local`'s value does. The
+	/// parameters are then the loop scope's locals, in order, and the first
+	/// state is their initial values as one. The body is a block of its own,
+	/// whose result is the next state. The loop's type is what its `break`s
+	/// give it.
 	pub(super) fn build_loop(
 		&mut self,
 		header: Option<ast::LoopHeaderId>,
@@ -633,53 +634,81 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let ast = self.ast();
-		let header = header.map(|header| ast.loop_header(header));
-		// The slots are in scope after the first state, up to the loop's end.
-		let start = header
-			.map_or(span.start, |header| ast.expr_span(header.initializer).end);
+		let block_span = ast.block_span(block);
 		let outer = self.current;
 		let scope = self.enter_scope(
 			ScopeKind::Loop,
 			label,
-			TextSpan::new(start, span.end),
+			TextSpan::new(block_span.start, span.end),
 			expected,
 		);
-		let first = header.map(|header| {
-			self.declare_slots(ast.list(header.state));
+		let entry = header.map(|header| {
+			let header = ast.loop_header(header);
+			let params = ast.list(header.params);
+			let initials = ast.list(header.initials);
 			self.current = outer;
-			let first = self.build_first_state(scope, header.initializer);
+			let mut values = Vec::with_capacity(params.len());
+			let mut types = Vec::with_capacity(params.len());
+			for (param, &initial) in params.iter().zip(initials) {
+				let span = param.binding.name.span;
+				let (value, ty) = self.build_initial(
+					param.ty,
+					initial,
+					span,
+					InitializerKind::LoopParam,
+				);
+				values.push(value);
+				// A parameter whose name the parser reported missing makes the
+				// state an error, which nothing reports again.
+				types.push(if param.binding.is_missing() {
+					TypeIndex::ERROR
+				} else {
+					ty
+				});
+			}
 			self.current = scope;
-			first
+			self.declare_params(params, &types);
+			let state = match *types {
+				[ty] => ty,
+				_ => self.sema.types.intern_tuple(&types),
+			};
+			let state = self.sema.types.collapse_error(state);
+			self.scope_types[usize::from(scope)].state = state;
+			if let [value] = *values {
+				return value;
+			}
+			self.pack(values, ElementOrder::InOrder, state, span)
 		});
-		let state = self.state_type(scope);
-		let block_span = ast.block_span(block);
+		let state = self.scope_types[usize::from(scope)].state;
 		let body =
 			self.build_block(ScopeKind::Body, block, state, None, block_span);
 		self.leave_scope(scope);
 		// A first state that never arrives never starts the loop.
-		let ty = match first {
-			Some(first) if self.body.ty(first) == TypeIndex::NEVER => {
+		let ty = match entry {
+			Some(entry) if self.body.ty(entry) == TypeIndex::NEVER => {
 				TypeIndex::NEVER
 			}
 			_ => self.scope_type(scope),
 		};
 		self.body
-			.push(ExprKind::Loop { scope, first, body }, ty, span)
+			.push(ExprKind::Loop { scope, entry, body }, ty, span)
 	}
 
-	/// Declares a loop's slots in the current scope, the loop's, each of its
-	/// written type or `INFER` until the first state gives it one. A slot
-	/// whose name the parser reported missing keeps its position, an `ERROR`
-	/// that no name finds, so the state is one too. A repeated name is
-	/// reported, and finds the first.
-	fn declare_slots(&mut self, slots: &[ast::FunctionParam]) {
-		for slot in slots {
-			let ty = self.declared_type(slot.ty);
-			let binding = slot.binding;
+	/// Declares a loop's parameters in the current scope, the loop's, of
+	/// `types`. A parameter whose name the parser reported missing keeps its
+	/// position, and no name finds it. A repeated name is reported, and
+	/// finds the first.
+	fn declare_params(
+		&mut self,
+		params: &[ast::FunctionParam],
+		types: &[TypeIndex],
+	) {
+		for (param, &ty) in params.iter().zip(types) {
+			let binding = param.binding;
 			if binding.is_missing() {
 				let local = body::Local {
 					name: binding.name,
-					ty: TypeIndex::ERROR,
+					ty,
 					mut_span: None,
 				};
 				self.body.push_local(self.current, local);
@@ -687,7 +716,7 @@ impl BodyBuilder<'_, '_> {
 			}
 			let mut_span = binding.mut_at.map(|at| Keyword::Mut.span_at(at));
 			let first = (self.body.scope_locals(self.current))
-				.map(|slot| self.body.local(slot).name)
+				.map(|param| self.body.local(param).name)
 				.find(|first| first.inner == binding.name.inner);
 			let Some(first) = first else {
 				self.declare_local(binding.name, ty, mut_span);
@@ -708,52 +737,6 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// The first state, completing the slots' types as a `local`'s value
-	/// does its type: a slot whose part is still not known is reported, and
-	/// is `ERROR`. One that never arrives completes nothing, silently.
-	fn build_first_state(
-		&mut self,
-		scope: ScopeIdx,
-		initializer: ast::ExprId,
-	) -> ExprIdx {
-		let declared = self.state_type(scope);
-		let value = self.build_state(scope, initializer, declared);
-		let (value, state) = self.complete(value, declared);
-		let arrives = self.body.ty(value) != TypeIndex::NEVER;
-		let slots: Vec<LocalIdx> = self.body.scope_locals(scope).collect();
-		let parts = match (slots.len(), *self.sema.types.resolve(state)) {
-			(1, _) => vec![state],
-			(count, Type::Tuple { elements }) if elements.len() == count => {
-				self.sema.types.list(elements).to_vec()
-			}
-			_ => vec![TypeIndex::ERROR; slots.len()],
-		};
-		for (slot, mut ty) in slots.into_iter().zip(parts) {
-			let local = *self.body.local(slot);
-			if !arrives || !self.is_known(ty, local.ty) {
-				if arrives {
-					self.report_uninferred(local.name.span, "slot");
-				}
-				ty = TypeIndex::ERROR;
-			}
-			self.body.set_local_ty(slot, ty);
-		}
-		value
-	}
-
-	/// The type of a loop's state, from its slots: `()` for none, a slot's
-	/// type for one, else the tuple of them. `ERROR` once a part is.
-	fn state_type(&mut self, scope: ScopeIdx) -> TypeIndex {
-		let types: Vec<TypeIndex> = (self.body.scope_locals(scope))
-			.map(|slot| self.body.local(slot).ty)
-			.collect();
-		let ty = match *types {
-			[ty] => ty,
-			_ => self.sema.types.intern_tuple(&types),
-		};
-		self.sema.types.collapse_error(ty)
-	}
-
 	/// The loop whose next state `scope`'s result is: its body's.
 	fn loop_of_body(&self, scope: ScopeIdx) -> Option<ScopeIdx> {
 		let Scope { kind, parent, .. } = *self.body.scope(scope);
@@ -761,9 +744,9 @@ impl BodyBuilder<'_, '_> {
 		(self.body.scope(parent).kind == ScopeKind::Loop).then_some(parent)
 	}
 
-	/// A state given to the loop `target`: its first, its body's result or a
-	/// `continue`'s value, positionally (`expected` hints it) or by name. The
-	/// caller holds it to the state.
+	/// A next state given to the loop `target`: its body's result or a
+	/// `continue`'s value, positionally (`expected` hints it) or by name,
+	/// written directly. The caller holds it to the state.
 	fn build_state(
 		&mut self,
 		target: ScopeIdx,
@@ -790,18 +773,18 @@ impl BodyBuilder<'_, '_> {
 		arguments: &[ast::NamedArgument],
 		span: TextSpan,
 	) -> ExprIdx {
-		let slots: Vec<LocalIdx> = self.body.scope_locals(target).collect();
-		let names: Vec<Option<SymbolU32>> = (slots.iter())
-			.map(|&slot| self.body.local(slot).name.inner)
+		let params: Vec<LocalIdx> = self.body.scope_locals(target).collect();
+		let names: Vec<Option<SymbolU32>> = (params.iter())
+			.map(|&param| self.body.local(param).name.inner)
 			.map(|name| (name != Keyword::Error.symbol()).then_some(name))
 			.collect();
 		let owner = NamedOwner::Loop(target);
 		let matches = self.match_names(&names, arguments, owner, span);
-		let mut types = vec![TypeIndex::ERROR; slots.len()];
+		let mut types = vec![TypeIndex::ERROR; params.len()];
 		let mut values = Vec::with_capacity(matches.len());
 		for &NamedMatch { argument, param } in &matches {
 			let argument = &arguments[argument as usize];
-			let slot = slots[param as usize];
+			let local = params[param as usize];
 			self.sema.resolutions.record(
 				Site::Label(SourceSpan::new(
 					self.scope.file_id,
@@ -809,17 +792,17 @@ impl BodyBuilder<'_, '_> {
 				)),
 				Reference::Local {
 					owner: self.owner,
-					local: slot,
+					local,
 					access: AccessKind::Write,
 				},
 			);
-			let ty = self.body.local(slot).ty;
+			let ty = self.body.local(local).ty;
 			let value = self.build_named_argument(argument, ty);
 			let value = self.expect(value, ty);
 			types[param as usize] = self.body.ty(value);
 			values.push(value);
 		}
-		if matches.len() != arguments.len() || matches.len() != slots.len() {
+		if matches.len() != arguments.len() || matches.len() != params.len() {
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		}
 		// One parameter's state is its value.
@@ -897,7 +880,7 @@ impl BodyBuilder<'_, '_> {
 			}
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
-		let state = self.state_type(scope);
+		let state = self.scope_types[usize::from(scope)].state;
 		let value = value.map(|value| {
 			let value = self.build_state(scope, value, state);
 			self.expect(value, state)
@@ -1095,6 +1078,13 @@ impl BodyBuilder<'_, '_> {
 			self.context().mismatch_at(hint, TypeIndex::UNIT, span);
 		self.sema.diagnostics.push(diagnostic);
 	}
+}
+
+/// What an initial value is given to (`BodyBuilder::build_initial`).
+#[derive(Clone, Copy)]
+enum InitializerKind {
+	Local,
+	LoopParam,
 }
 
 /// How control flows through a block's statements.
