@@ -3069,6 +3069,15 @@ fn completion_after_a_named_arguments_colon_offers_values() {
 }
 
 #[test]
+fn completion_in_a_named_lists_value_offers_values() {
+	let labels = completions(&format!(
+		"{COMPLETION_ITEMS}func f(n: u32) {{\n    ({{ alpha: $0 }});\n}}\n"
+	))
+	.expect("a value not written yet");
+	assert_offers(&labels, &["n", "helper"], &[]);
+}
+
+#[test]
 fn completion_offers_no_argument_names_the_checker_would_refuse() {
 	for source in [
 		// After the list.

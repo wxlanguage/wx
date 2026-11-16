@@ -2275,7 +2275,8 @@ impl<'a> Builder<'a> {
 				matches!(self.ast.list(arguments), &[argument] if self.is_huggable(argument))
 			}
 			// A call by name is its own braces: they break open in place.
-			ast::Expression::NamedCall { .. } => true,
+			ast::Expression::NamedCall { .. }
+			| ast::Expression::NamedList { .. } => true,
 			_ => false,
 		}
 	}
@@ -2305,9 +2306,10 @@ impl<'a> Builder<'a> {
 		items
 	}
 
-	/// The `({ name: value, shorthand })` of a call by name. The braces hug
-	/// the parentheses and are a delimited list, so they break onto one field
-	/// per line once they don't fit, keeping the comments written in them.
+	/// The `({ name: value, shorthand })` of a call by name, or of a named
+	/// list on its own. The braces hug the parentheses and are a delimited
+	/// list, so they break onto one field per line once they don't fit,
+	/// keeping the comments written in them.
 	fn build_named_call_args(
 		&mut self,
 		out: &mut Vec<NodeId>,
@@ -2629,6 +2631,12 @@ impl<'a> Builder<'a> {
 			} => {
 				let callee_id = self.build_expression(callee);
 				let mut items: Vec<NodeId> = vec![callee_id];
+				self.build_named_call_args(&mut items, arguments, braces);
+				let concat = self.arena.concat(items);
+				self.arena.group(concat)
+			}
+			ast::Expression::NamedList { arguments, braces } => {
+				let mut items: Vec<NodeId> = Vec::new();
 				self.build_named_call_args(&mut items, arguments, braces);
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)

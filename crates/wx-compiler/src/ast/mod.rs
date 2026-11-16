@@ -225,6 +225,14 @@ pub enum Expression {
 		arguments: List<NamedArgument>,
 		braces: TextSpan,
 	},
+	/// `({ x: a, y })`: a named list on its own, outside a call. It has no
+	/// type of its own; where its names are known (a loop's next state) it
+	/// is arranged by them. Spanned by its parentheses, the list by its
+	/// braces.
+	NamedList {
+		arguments: List<NamedArgument>,
+		braces: TextSpan,
+	},
 	/// `{expr}.{member}`, or `{expr}.{member}::<...>`: the type arguments
 	/// are only meaningful when it is called, which makes it a method
 	/// call; the checker rejects them on a field.

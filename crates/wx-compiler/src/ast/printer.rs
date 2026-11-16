@@ -874,6 +874,9 @@ impl<'a> Printer<'a> {
 					Sexp::head("named", self.named(arguments)),
 				],
 			),
+			Expression::NamedList { arguments, .. } => {
+				Sexp::head("named", self.named(arguments))
+			}
 			Expression::ObjectAccess { object, member } => Sexp::head(
 				".",
 				[

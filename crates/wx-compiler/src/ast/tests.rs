@@ -1244,6 +1244,24 @@ fn a_continue_takes_a_value_after_its_label() {
 }
 
 #[test]
+fn a_named_list_is_an_expression_on_its_own() {
+	assert_eq!(
+		shape_of("({ i: i + 1, total })"),
+		"(named (i (+ i 1)) total)"
+	);
+	assert_eq!(
+		shape_of("continue :rows ({ row: row + 1 })"),
+		"(continue :rows (named (row (+ row 1))))"
+	);
+	// Named and positional values do not mix in one list, either way round.
+	for body in ["({ a: 1 }, 2)", "(1, { a: 2 })"] {
+		let case = TestCase::new(&format!("func f() {{ {body} }}"));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MixedCallArguments]);
+	}
+}
+
+#[test]
 fn a_loop_state_without_a_first_value_is_reported() {
 	for body in ["loop i: u32 { }", "loop i = { }", "loop i { }"] {
 		let case = TestCase::new(&format!("func f() {{ {body} }}"));

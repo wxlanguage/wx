@@ -1323,6 +1323,12 @@ impl Cursor<'_> {
 					)
 				})
 			}
+			// What its names may be is the checker's to know (a loop's state);
+			// only the values are walked.
+			Expression::NamedList { arguments, .. } => ast
+				.list(arguments)
+				.iter()
+				.find_map(|argument| self.expression(argument.value?)),
 			Expression::ObjectAccess { object, member } => self
 				.expression(object)
 				.or_else(|| self.type_args(&ast.segment(member)))

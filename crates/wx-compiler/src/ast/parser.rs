@@ -2978,8 +2978,25 @@ impl<'ctx> Parser<'ctx> {
 		))
 	}
 
+	/// `(a, b)`, or a named list `({ x: a, y })`, decided on the token after
+	/// `(` as a call's arguments are.
 	fn parse_tuple_expression(&mut self) -> Result<ExprId, ()> {
-		let elements = self.separated(PARENS, Parser::parse_element)?;
+		let open = self.next_expect(Token::OpenParen)?.span;
+		if self.lexer.peek().inner == Token::OpenBrace {
+			let (arguments, end) = self.parse_named_call_arguments(open)?;
+			return Ok(self.ast.push_expr(
+				Expression::NamedList {
+					arguments: arguments.inner,
+					braces: arguments.span,
+				},
+				TextSpan::new(open.start, end),
+			));
+		}
+		let elements = self.separated_after(
+			PARENS,
+			open,
+			Parser::parse_positional_argument,
+		);
 		let elements = self.push_delimited(elements);
 		Ok(self.ast.push_expr(
 			Expression::Tuple {

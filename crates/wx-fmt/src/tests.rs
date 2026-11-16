@@ -3826,6 +3826,30 @@ fn a_loop_state_and_a_continue_value_are_printed_after_their_labels() {
 }
 
 #[test]
+fn a_named_list_is_printed_as_a_call_by_names_arguments() {
+	for (source, expected) in [
+		("({i:i+1,total})", "({ i: i + 1, total })"),
+		("continue :l ({ i })", "continue :l ({ i })"),
+	] {
+		assert_eq!(
+			checked_format(&format!("func f() {{ {source} }}"), 80, 4),
+			format!("func f() {{\n    {expected}\n}}\n")
+		);
+	}
+	// Too long: one name per line, the braces hugging the parentheses.
+	let source = indoc! {"
+        func f() {
+            continue ({
+                next: next_index + 1,
+                start: at_position + 1,
+                at: at_position + 1,
+            })
+        }
+    "};
+	assert_eq!(checked_format(source, 40, 4), source);
+}
+
+#[test]
 fn a_bound_list_breaks_with_each_bound_led_by_its_plus() {
 	// A leading `+` is accepted and is layout only: a list that fits is
 	// written on one line without it.

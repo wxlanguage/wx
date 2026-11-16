@@ -729,6 +729,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				}
 				self.build_continue(label, span)
 			}
+			ast::Expression::NamedList { arguments, .. } => {
+				for argument in ast.list(arguments) {
+					if let Some(value) = argument.value {
+						self.build(value, TypeIndex::ERROR);
+					}
+				}
+				self.unsupported(span, "a named list")
+			}
 			ast::Expression::Return { value } => self.build_return(value, span),
 			ast::Expression::Deref { .. }
 			| ast::Expression::ObjectAccess { .. }
@@ -8622,6 +8630,21 @@ mod tests {
 		DiagnosticView::new("parse", &parser, &case.files)
 			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 		case.diagnostics().assert_none();
+	}
+
+	/// A named list has no type of its own: until a loop's state gives its
+	/// names a meaning, it is reported once, and its values are still checked.
+	#[test]
+	fn a_named_list_is_not_checked_yet() {
+		let case = TestCase::new(indoc! {"
+			func f(x: u32) {
+			    local y = ({ a: x, b: missing });
+			}
+		"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::UnsupportedExpression,
+		]);
 	}
 
 	/// A named argument whose value is not written yet still names its
