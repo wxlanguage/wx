@@ -29,6 +29,13 @@ debug = "line-tables-only"
 [profile.release]
 strip = true
 
+# Size-focused browser compiler builds, without changing native release builds.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
 [workspace.dependencies]
 codespan-reporting = "0.13.1"
 string-interner = "0.20.0"
