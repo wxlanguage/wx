@@ -23,7 +23,7 @@ use wx_compiler::ast::{
 	ImplItem, ImportDeclaration, ImportEntry, InColumn, Item, List,
 	NamedArgument, PatId, Path, PathSegment, Pattern, PatternElement,
 	PatternFieldItem, QualifiedPathRoot, Spanned, Statement, TraitItem,
-	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree,
+	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree, rest_span,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::tir::{
@@ -1536,7 +1536,7 @@ impl Cursor<'_> {
 					});
 				TextSpan::new(field.name.span.start, end)
 			}
-			PatternFieldItem::Rest(span) => span,
+			PatternFieldItem::Rest(at) => rest_span(at),
 		});
 		if let Some(at) = at {
 			match fields[at] {
@@ -1564,7 +1564,7 @@ impl Cursor<'_> {
 		let ast = self.ast;
 		let element = self.child_by(elements, |element| match *element {
 			PatternElement::Pattern(pattern) => ast.pattern_span(pattern),
-			PatternElement::Rest(span) => span,
+			PatternElement::Rest(at) => rest_span(at),
 		})?;
 		match *element {
 			PatternElement::Pattern(pattern) => self.pattern(pattern),

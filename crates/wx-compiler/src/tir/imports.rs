@@ -363,7 +363,7 @@ impl<'r> ImportResolver<'r> {
 				match item.kind {
 					UseItemKind::Name { name, alias, .. } => {
 						let local_name = alias.unwrap_or(name);
-						let visibility = Visibility::from(item.pub_span);
+						let visibility = Visibility::from(item.pub_at);
 
 						// `index`'s own (still-paused, outer) call already
 						// pushed it here before ever reaching this
@@ -487,7 +487,7 @@ impl<'r> ImportResolver<'r> {
 		}
 
 		let local_name = alias.unwrap_or(name);
-		let declared_visibility = Visibility::from(item.pub_span);
+		let declared_visibility = Visibility::from(item.pub_at);
 
 		// A leaf imports whatever it can. An inaccessible namespace next to an
 		// accessible one is installed `Inaccessible`, unreported: the type of
@@ -682,7 +682,7 @@ impl<'r> ImportResolver<'r> {
 		let mut deepest: Option<Scope> = None;
 		for use_item in cycle.iter().copied() {
 			let item = &self.use_items[usize::from(use_item)];
-			if item.pub_span.is_some() {
+			if item.pub_at.is_some() {
 				continue;
 			}
 			let candidate = item.namespace;

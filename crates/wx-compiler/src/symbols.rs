@@ -5,6 +5,8 @@
 
 use string_interner::symbol::{Symbol, SymbolU32};
 
+use crate::diagnostics::TextSpan;
+
 macro_rules! define_keywords {
 	(
 		$(
@@ -124,5 +126,12 @@ impl Keyword {
 	pub fn symbol(self) -> SymbolU32 {
 		SymbolU32::try_from_usize(self as usize)
 			.expect("keyword index always fits in a SymbolU32")
+	}
+
+	/// The span of this keyword written starting `at`. A syntax node keeps
+	/// only where a keyword starts (`pub_at`, `mut_at`, `const_at`, ...): its
+	/// text is fixed, so the rest of its span is known.
+	pub fn span_at(self, at: u32) -> TextSpan {
+		TextSpan::new(at, at + self.as_str().len() as u32)
 	}
 }

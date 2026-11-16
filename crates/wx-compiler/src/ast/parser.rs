@@ -1240,8 +1240,8 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_binding_and_type(
 		parser: &mut Parser,
 	) -> Result<(Binding, TypeId), ()> {
-		let mut_span = matches!(parser.peek_keyword(), Some(Keyword::Mut))
-			.then(|| parser.lexer.next().span);
+		let mut_at = matches!(parser.peek_keyword(), Some(Keyword::Mut))
+			.then(|| parser.lexer.next().span.start);
 		let token = parser.lexer.peek();
 		let binding = match token.inner {
 			Token::Identifier | Token::Keyword(Keyword::SelfLower) => {
@@ -1252,7 +1252,7 @@ impl<'ctx> Parser<'ctx> {
 						.get_or_intern(span.extract_str(parser.source)),
 					span,
 				};
-				Binding { mut_span, name }
+				Binding { mut_at, name }
 			}
 			// `_: Type`: a parameter or a field is named, and a value is
 			// dropped with the `_` pattern instead (`_ = name;`).
@@ -1263,7 +1263,7 @@ impl<'ctx> Parser<'ctx> {
 					token.span,
 					"expected a name, found `_`",
 				));
-				Binding::missing(mut_span, token.span.start)
+				Binding::missing(mut_at, token.span.start)
 			}
 			// A type alone: kept, with its name missing.
 			Token::Star
@@ -1280,7 +1280,7 @@ impl<'ctx> Parser<'ctx> {
 					parser.ast.types.spans[usize::from(ty)],
 					"expected a name before this type",
 				));
-				return Ok((Binding::missing(mut_span, token.span.start), ty));
+				return Ok((Binding::missing(mut_at, token.span.start), ty));
 			}
 			_ => {
 				parser.diagnostics.push(report_missing_binding(
@@ -1466,7 +1466,7 @@ impl<'ctx> Parser<'ctx> {
 					let end = self.ast.types.spans[usize::from(ty)].end;
 					(
 						TypeParam::Const {
-							const_span,
+							const_at: const_span.start,
 							name,
 							ty,
 						},
@@ -1759,7 +1759,10 @@ impl<'ctx> Parser<'ctx> {
 				match const_span {
 					None => (AssocBindingKind::Equals(ty), end),
 					Some(const_span) => (
-						AssocBindingKind::ConstRepresentable { const_span, ty },
+						AssocBindingKind::ConstRepresentable {
+							const_at: const_span.start,
+							ty,
+						},
 						end,
 					),
 				}
@@ -1791,7 +1794,7 @@ impl<'ctx> Parser<'ctx> {
 						let end = self.ast.types.spans[usize::from(ty)].end;
 						(
 							AssocBindingKind::ConstRepresentable {
-								const_span,
+								const_at: const_span.start,
 								ty,
 							},
 							end,
@@ -1801,7 +1804,10 @@ impl<'ctx> Parser<'ctx> {
 						let value = self.parse_const_argument()?;
 						let end = self.ast.consts.spans[usize::from(value)].end;
 						(
-							AssocBindingKind::ConstEquals { const_span, value },
+							AssocBindingKind::ConstEquals {
+								const_at: const_span.start,
+								value,
+							},
 							end,
 						)
 					}
@@ -1872,13 +1878,13 @@ impl<'ctx> Parser<'ctx> {
 		Ok(Spanned {
 			inner: match block {
 				Some(block) => Item::Function {
-					pub_span: None,
+					pub_at: None,
 					attributes: List::EMPTY,
 					signature: signature.inner,
 					block,
 				},
 				None => Item::FunctionDeclaration {
-					pub_span: None,
+					pub_at: None,
 					attributes: List::EMPTY,
 					signature: signature.inner,
 				},
@@ -3410,7 +3416,7 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<PatternElement>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
-				inner: PatternElement::Rest(dot_dot.span),
+				inner: PatternElement::Rest(dot_dot.span.start),
 				span: dot_dot.span,
 			});
 		}
@@ -3427,7 +3433,7 @@ impl<'ctx> Parser<'ctx> {
 	) -> Result<Spanned<PatternFieldItem>, ()> {
 		if let Some(dot_dot) = parser.lexer.next_if(Token::DotDot) {
 			return Ok(Spanned {
-				inner: PatternFieldItem::Rest(dot_dot.span),
+				inner: PatternFieldItem::Rest(dot_dot.span.start),
 				span: dot_dot.span,
 			});
 		}
@@ -3786,11 +3792,8 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<Item>, ()> {
 		let global_keyword = parser.lexer.next();
-		let mut_span = match parser.peek_keyword() {
-			Some(Keyword::Mut) => {
-				let mut_token = parser.lexer.next();
-				Some(mut_token.span)
-			}
+		let mut_at = match parser.peek_keyword() {
+			Some(Keyword::Mut) => Some(parser.lexer.next().span.start),
 			_ => None,
 		};
 
@@ -3818,8 +3821,8 @@ impl<'ctx> Parser<'ctx> {
 		);
 		Ok(Spanned {
 			inner: Item::Global {
-				pub_span: None,
-				mut_span,
+				pub_at: None,
+				mut_at,
 				name,
 				ty,
 				value,
@@ -3851,7 +3854,7 @@ impl<'ctx> Parser<'ctx> {
 		);
 		Ok(Spanned {
 			inner: Item::Const {
-				pub_span: None,
+				pub_at: None,
 				name: Spanned {
 					inner: name_symbol,
 					span: name_span,
@@ -3888,7 +3891,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::ExportBlock {
-				keyword_span: export_keyword.span,
+				export_at: export_keyword.span.start,
 				entries: entries.inner,
 			},
 			span,
@@ -3998,7 +4001,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: Item::Enum {
-				pub_span: None,
+				pub_at: None,
 				repr,
 				name: Spanned {
 					inner: name_symbol,
@@ -4013,8 +4016,8 @@ impl<'ctx> Parser<'ctx> {
 
 	fn parse_impl_member(parser: &mut Parser) -> Result<Spanned<ImplItem>, ()> {
 		let attrs = Parser::parse_attributes(parser)?;
-		let pub_span = match parser.peek_keyword() {
-			Some(Keyword::Pub) => Some(parser.lexer.next().span),
+		let pub_at = match parser.peek_keyword() {
+			Some(Keyword::Pub) => Some(parser.lexer.next().span.start),
 			_ => None,
 		};
 
@@ -4033,7 +4036,7 @@ impl<'ctx> Parser<'ctx> {
 				);
 				Ok(Spanned {
 					inner: ImplItem::AssocType {
-						pub_span,
+						pub_at,
 						name: Spanned {
 							inner: name_symbol,
 							span: name_span,
@@ -4065,7 +4068,7 @@ impl<'ctx> Parser<'ctx> {
 				);
 				Ok(Spanned {
 					inner: ImplItem::Constant {
-						pub_span,
+						pub_at,
 						name: Spanned {
 							inner: name_symbol,
 							span: name_span,
@@ -4101,7 +4104,7 @@ impl<'ctx> Parser<'ctx> {
 				);
 				Ok(Spanned {
 					inner: ImplItem::Function {
-						pub_span,
+						pub_at,
 						attributes: attrs,
 						signature: FunctionSignature {
 							name: Spanned {
@@ -4152,10 +4155,10 @@ impl<'ctx> Parser<'ctx> {
 			// — so the qualifier is judged here, where that is known, rather
 			// than by the member parser itself.
 			for item in &items.items {
-				let (ImplItem::Function { pub_span, .. }
-				| ImplItem::Constant { pub_span, .. }
-				| ImplItem::AssocType { pub_span, .. }) = item.inner;
-				let Some(pub_span) = pub_span else {
+				let (ImplItem::Function { pub_at, .. }
+				| ImplItem::Constant { pub_at, .. }
+				| ImplItem::AssocType { pub_at, .. }) = item.inner;
+				let Some(pub_at) = pub_at else {
 					continue;
 				};
 				parser.diagnostics.push(
@@ -4167,8 +4170,11 @@ impl<'ctx> Parser<'ctx> {
 							"visibility qualifiers are not permitted here",
 						)
 						.with_label(
-							Label::primary(parser.file_id, pub_span)
-								.with_message("remove the qualifier"),
+							Label::primary(
+								parser.file_id,
+								Keyword::Pub.span_at(pub_at),
+							)
+							.with_message("remove the qualifier"),
 						)
 						.with_note(
 							"trait impl items always share the visibility of \
@@ -4380,7 +4386,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(trait_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::Trait {
-				pub_span: None,
+				pub_at: None,
 				attributes: List::EMPTY,
 				name,
 				supertraits,
@@ -4417,7 +4423,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(typeset_span.start, members.span.end);
 		Ok(Spanned {
 			inner: Item::TypeSet {
-				pub_span: None,
+				pub_at: None,
 				attributes: List::EMPTY,
 				name,
 				bounds,
@@ -4484,7 +4490,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(struct_span.start, fields.span.end);
 		Ok(Spanned {
 			inner: Item::Struct {
-				pub_span: None,
+				pub_at: None,
 				attributes: List::EMPTY,
 				name,
 				type_params,
@@ -4499,8 +4505,8 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<StructField>, ()> {
 		let start = parser.lexer.peek().span.start;
-		let pub_span = matches!(parser.peek_keyword(), Some(Keyword::Pub))
-			.then(|| parser.lexer.next().span);
+		let pub_at = matches!(parser.peek_keyword(), Some(Keyword::Pub))
+			.then(|| parser.lexer.next().span.start);
 		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
 			span: TextSpan::new(
@@ -4508,7 +4514,7 @@ impl<'ctx> Parser<'ctx> {
 				parser.ast.types.spans[usize::from(ty)].end,
 			),
 			inner: StructField {
-				pub_span,
+				pub_at,
 				binding,
 				ty,
 			},
@@ -4551,7 +4557,7 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(type_span.start, end);
 		Ok(Spanned {
 			inner: Item::TypeAlias {
-				pub_span: None,
+				pub_at: None,
 				name: Spanned {
 					inner: name_symbol,
 					span: name_span,
@@ -4579,23 +4585,23 @@ impl<'ctx> Parser<'ctx> {
 
 		let mut item = handler(parser)?;
 		match &mut item.inner {
-			Item::Function { pub_span: span, .. }
-			| Item::FunctionDeclaration { pub_span: span, .. }
-			| Item::PackageFunction { pub_span: span, .. }
-			| Item::PackageConst { pub_span: span, .. }
-			| Item::PackageType { pub_span: span, .. }
-			| Item::Global { pub_span: span, .. }
-			| Item::Enum { pub_span: span, .. }
-			| Item::Struct { pub_span: span, .. }
-			| Item::Const { pub_span: span, .. }
-			| Item::Module { pub_span: span, .. }
-			| Item::ModuleDeclaration { pub_span: span, .. }
-			| Item::Trait { pub_span: span, .. }
-			| Item::TypeSet { pub_span: span, .. }
-			| Item::Memory { pub_span: span, .. }
-			| Item::TypeAlias { pub_span: span, .. }
-			| Item::PackageInstance { pub_span: span, .. }
-			| Item::Use { pub_span: span, .. } => *span = Some(pub_span),
+			Item::Function { pub_at: span, .. }
+			| Item::FunctionDeclaration { pub_at: span, .. }
+			| Item::PackageFunction { pub_at: span, .. }
+			| Item::PackageConst { pub_at: span, .. }
+			| Item::PackageType { pub_at: span, .. }
+			| Item::Global { pub_at: span, .. }
+			| Item::Enum { pub_at: span, .. }
+			| Item::Struct { pub_at: span, .. }
+			| Item::Const { pub_at: span, .. }
+			| Item::Module { pub_at: span, .. }
+			| Item::ModuleDeclaration { pub_at: span, .. }
+			| Item::Trait { pub_at: span, .. }
+			| Item::TypeSet { pub_at: span, .. }
+			| Item::Memory { pub_at: span, .. }
+			| Item::TypeAlias { pub_at: span, .. }
+			| Item::PackageInstance { pub_at: span, .. }
+			| Item::Use { pub_at: span, .. } => *span = Some(pub_span.start),
 			Item::Export { .. }
 			| Item::ExportBlock { .. }
 			| Item::Import { .. }
@@ -4634,7 +4640,7 @@ impl<'ctx> Parser<'ctx> {
 		);
 		Ok(Spanned {
 			inner: Item::Memory {
-				pub_span: None,
+				pub_at: None,
 				attributes: List::EMPTY,
 				name,
 				size,
@@ -4647,8 +4653,8 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 	) -> Result<Spanned<ImportDeclaration>, ()> {
 		let keyword_span = self.lexer.next().span;
-		let mut_span = match self.peek_keyword() {
-			Some(Keyword::Mut) => Some(self.lexer.next().span),
+		let mut_at = match self.peek_keyword() {
+			Some(Keyword::Mut) => Some(self.lexer.next().span.start),
 			_ => None,
 		};
 
@@ -4670,7 +4676,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: ImportDeclaration::Global {
-				mut_span,
+				mut_at,
 				name,
 				ty: type_expr,
 			},
@@ -4698,8 +4704,8 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_import_entry(
 		parser: &mut Parser,
 	) -> Result<Spanned<ImportEntry>, ()> {
-		let pub_span = matches!(parser.peek_keyword(), Some(Keyword::Pub))
-			.then(|| parser.lexer.next().span);
+		let pub_at = matches!(parser.peek_keyword(), Some(Keyword::Pub))
+			.then(|| parser.lexer.next().span.start);
 		let external_name = match parser.lexer.next_if(Token::String) {
 			Some(string) => {
 				parser.next_expect(Token::Colon)?;
@@ -4709,7 +4715,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 		let token = parser.lexer.peek();
 		let keyword = parser.peek_keyword();
-		if let Some(span) = pub_span
+		if let Some(at) = pub_at
 			&& !matches!(keyword, Some(Keyword::Use))
 		{
 			parser.diagnostics.push(
@@ -4719,9 +4725,12 @@ impl<'ctx> Parser<'ctx> {
 						"visibility qualifiers are not permitted on host import declarations",
 					)
 					.with_label(
-						SourceSpan::new(parser.file_id, span)
-							.primary_label()
-							.with_message("remove `pub`"),
+						SourceSpan::new(
+							parser.file_id,
+							Keyword::Pub.span_at(at),
+						)
+						.primary_label()
+						.with_message("remove `pub`"),
 					)
 					.with_note(
 						"inside an import block, `pub` is supported on `use` items only",
@@ -4744,12 +4753,12 @@ impl<'ctx> Parser<'ctx> {
 					);
 				}
 				let use_span = parser.lexer.next().span;
-				let start = pub_span.unwrap_or(use_span).start;
+				let start = pub_at.unwrap_or(use_span.start);
 				let tree = Self::parse_use_root(parser, use_span)?;
 				Ok(Spanned {
 					span: TextSpan::new(start, tree.span.end),
 					inner: ImportEntry::Use {
-						pub_span,
+						pub_at,
 						tree: parser.ast.push_node(tree.inner, tree.span),
 					},
 				})
@@ -4829,7 +4838,7 @@ impl<'ctx> Parser<'ctx> {
 			let span = TextSpan::new(module_span.start, items.span.end);
 			Ok(Spanned {
 				inner: Item::Module {
-					pub_span: None,
+					pub_at: None,
 					name: Spanned {
 						inner: name_symbol,
 						span: name_span,
@@ -4842,7 +4851,7 @@ impl<'ctx> Parser<'ctx> {
 		} else {
 			Ok(Spanned {
 				inner: Item::ModuleDeclaration {
-					pub_span: None,
+					pub_at: None,
 					name: Spanned {
 						inner: name_symbol,
 						span: name_span,
@@ -4864,10 +4873,7 @@ impl<'ctx> Parser<'ctx> {
 		let tree = parser.ast.push_node(tree.inner, tree.span);
 		Ok(Spanned {
 			span,
-			inner: Item::Use {
-				pub_span: None,
-				tree,
-			},
+			inner: Item::Use { pub_at: None, tree },
 		})
 	}
 
@@ -5009,9 +5015,9 @@ impl<'ctx> Parser<'ctx> {
 
 	/// `package func`, `package const`, `package type`, or a package instance.
 	fn parse_crate_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
-		let crate_span = parser.lexer.next().span;
+		let package_span = parser.lexer.next().span;
 		if parser.lexer.peek().inner == Token::String {
-			return Parser::parse_package_instance(parser, crate_span);
+			return Parser::parse_package_instance(parser, package_span);
 		}
 		let (item, end) = match parser.peek_keyword() {
 			Some(Keyword::Func) => {
@@ -5026,8 +5032,8 @@ impl<'ctx> Parser<'ctx> {
 				};
 				(
 					Item::PackageFunction {
-						pub_span: None,
-						crate_span,
+						pub_at: None,
+						package_at: package_span.start,
 						attributes: List::EMPTY,
 						signature: signature.inner,
 					},
@@ -5050,8 +5056,8 @@ impl<'ctx> Parser<'ctx> {
 				};
 				(
 					Item::PackageConst {
-						pub_span: None,
-						crate_span,
+						pub_at: None,
+						package_at: package_span.start,
 						attributes: List::EMPTY,
 						name,
 						ty,
@@ -5080,8 +5086,8 @@ impl<'ctx> Parser<'ctx> {
 				};
 				(
 					Item::PackageType {
-						pub_span: None,
-						crate_span,
+						pub_at: None,
+						package_at: package_span.start,
 						attributes: List::EMPTY,
 						name,
 						type_params,
@@ -5099,7 +5105,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 		Ok(Spanned {
 			inner: item,
-			span: TextSpan::new(crate_span.start, end),
+			span: TextSpan::new(package_span.start, end),
 		})
 	}
 
@@ -5119,7 +5125,7 @@ impl<'ctx> Parser<'ctx> {
 	/// every other item's.
 	fn parse_package_instance(
 		parser: &mut Parser,
-		crate_span: TextSpan,
+		package_span: TextSpan,
 	) -> Result<Spanned<Item>, ()> {
 		let package = parser.next_expect(Token::String)?.span;
 
@@ -5146,11 +5152,11 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			span: TextSpan::new(
-				crate_span.start,
+				package_span.start,
 				package.end.max(alias.span.end),
 			),
 			inner: Item::PackageInstance {
-				pub_span: None,
+				pub_at: None,
 				package,
 				alias,
 			},

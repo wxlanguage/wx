@@ -135,8 +135,8 @@ impl<'a> Printer<'a> {
 		label.map(|label| Sexp::atom(format!(":{}", self.name(label.inner))))
 	}
 
-	fn visibility(&self, pub_span: Option<TextSpan>) -> Option<Sexp> {
-		pub_span.map(|_| Sexp::atom("pub"))
+	fn visibility(&self, pub_at: Option<u32>) -> Option<Sexp> {
+		pub_at.map(|_| Sexp::atom("pub"))
 	}
 
 	// ── Items ───────────────────────────────────────────────────────────────
@@ -144,74 +144,74 @@ impl<'a> Printer<'a> {
 	fn item(&self, item: &Item) -> Sexp {
 		match *item {
 			Item::Function {
-				pub_span,
+				pub_at,
 				attributes,
 				signature,
 				block,
 			} => self.function(
 				"func",
-				pub_span,
+				pub_at,
 				attributes,
 				&signature,
 				Some(block),
 			),
 			Item::FunctionDeclaration {
-				pub_span,
+				pub_at,
 				attributes,
 				signature,
-			} => self.function("func", pub_span, attributes, &signature, None),
+			} => self.function("func", pub_at, attributes, &signature, None),
 			Item::PackageFunction {
-				pub_span,
+				pub_at,
 				attributes,
 				signature,
 				..
 			} => self.function(
 				"package-func",
-				pub_span,
+				pub_at,
 				attributes,
 				&signature,
 				None,
 			),
 			Item::PackageConst {
-				pub_span,
+				pub_at,
 				attributes,
 				name,
 				ty,
 				..
 			} => Sexp::head(
 				"package-const",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
 					.chain([Sexp::head("type", [Sexp::atom(self.ty(ty))])]),
 			),
 			Item::PackageType {
-				pub_span,
+				pub_at,
 				attributes,
 				name,
 				type_params,
 				..
 			} => Sexp::head(
 				"package-type",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
 					.chain(self.type_params(type_params)),
 			),
 			Item::Global {
-				pub_span,
-				mut_span,
+				pub_at,
+				mut_at,
 				name,
 				ty,
 				value,
 				attributes,
 			} => Sexp::head(
 				"global",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
-					.chain(mut_span.map(|_| Sexp::atom("mut")))
+					.chain(mut_at.map(|_| Sexp::atom("mut")))
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
 					.chain(self.annotation(ty))
@@ -247,21 +247,21 @@ impl<'a> Printer<'a> {
 				),
 			),
 			Item::Enum {
-				pub_span,
+				pub_at,
 				repr,
 				name,
 				variants,
 				attributes,
 			} => Sexp::head(
 				"enum",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
 					.chain(self.ast.list(repr).iter().map(|field| {
 						Sexp::head(
 							"repr",
-							self.visibility(field.pub_span)
+							self.visibility(field.pub_at)
 								.into_iter()
 								.chain(self.bound_to(field.binding, field.ty)),
 						)
@@ -322,14 +322,14 @@ impl<'a> Printer<'a> {
 				),
 			),
 			Item::Struct {
-				pub_span,
+				pub_at,
 				attributes,
 				name,
 				type_params,
 				fields,
 			} => Sexp::head(
 				"struct",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
@@ -337,34 +337,34 @@ impl<'a> Printer<'a> {
 					.chain(self.ast.list(fields).iter().map(|field| {
 						Sexp::head(
 							"field",
-							self.visibility(field.pub_span)
+							self.visibility(field.pub_at)
 								.into_iter()
 								.chain(self.bound_to(field.binding, field.ty)),
 						)
 					})),
 			),
 			Item::Memory {
-				pub_span,
+				pub_at,
 				attributes,
 				name,
 				size,
 			} => Sexp::head(
 				"memory",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
 					.chain([Sexp::atom(self.ty(size))]),
 			),
 			Item::Const {
-				pub_span,
+				pub_at,
 				name,
 				ty,
 				value,
 				attributes,
 			} => Sexp::head(
 				"const",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
@@ -372,45 +372,45 @@ impl<'a> Printer<'a> {
 					.chain([self.expr(value)]),
 			),
 			Item::Module {
-				pub_span,
+				pub_at,
 				name,
 				items,
 				..
 			} => Sexp::head(
 				"mod",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(
 						self.ast.list(items).iter().map(|item| self.item(item)),
 					),
 			),
-			Item::ModuleDeclaration { pub_span, name } => Sexp::head(
+			Item::ModuleDeclaration { pub_at, name } => Sexp::head(
 				"mod-decl",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))]),
 			),
 			Item::PackageInstance {
-				pub_span,
+				pub_at,
 				package,
 				alias,
 			} => Sexp::head(
 				"package",
-				self.visibility(pub_span).into_iter().chain([
+				self.visibility(pub_at).into_iter().chain([
 					Sexp::atom(self.text(package)),
 					Sexp::atom(self.name(alias.inner)),
 				]),
 			),
 			Item::Trait {
-				pub_span,
+				pub_at,
 				attributes,
 				name,
 				supertraits,
 				items,
 			} => Sexp::head(
 				"trait",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
@@ -428,14 +428,14 @@ impl<'a> Printer<'a> {
 					),
 			),
 			Item::TypeSet {
-				pub_span,
+				pub_at,
 				attributes,
 				name,
 				bounds,
 				members,
 			} => Sexp::head(
 				"typeset",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
@@ -446,21 +446,21 @@ impl<'a> Printer<'a> {
 						Sexp::atom(self.type_path(member.segments))
 					})),
 			),
-			Item::Use { pub_span, tree } => Sexp::head(
+			Item::Use { pub_at, tree } => Sexp::head(
 				"use",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([self.use_tree(String::new(), tree)]),
 			),
 			Item::TypeAlias {
-				pub_span,
+				pub_at,
 				name,
 				type_params,
 				body,
 				attributes,
 			} => Sexp::head(
 				"type",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
@@ -473,26 +473,26 @@ impl<'a> Printer<'a> {
 	fn impl_item(&self, item: &ImplItem) -> Sexp {
 		match *item {
 			ImplItem::Function {
-				pub_span,
+				pub_at,
 				attributes,
 				signature,
 				block,
 			} => self.function(
 				"func",
-				pub_span,
+				pub_at,
 				attributes,
 				&signature,
 				Some(block),
 			),
 			ImplItem::Constant {
-				pub_span,
+				pub_at,
 				name,
 				ty,
 				value,
 				attributes,
 			} => Sexp::head(
 				"const",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
@@ -500,13 +500,13 @@ impl<'a> Printer<'a> {
 					.chain([self.expr(value)]),
 			),
 			ImplItem::AssocType {
-				pub_span,
+				pub_at,
 				name,
 				ty,
 				attributes,
 			} => Sexp::head(
 				"type",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
@@ -560,14 +560,14 @@ impl<'a> Printer<'a> {
 	fn function(
 		&self,
 		head: &str,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		signature: &FunctionSignature,
 		block: Option<BlockId>,
 	) -> Sexp {
 		Sexp::head(
 			head,
-			self.visibility(pub_span)
+			self.visibility(pub_at)
 				.into_iter()
 				.chain(self.signature(signature, attributes))
 				.chain(block.map(|block| self.block("block", None, block))),
@@ -598,7 +598,7 @@ impl<'a> Printer<'a> {
 	/// `mut x T`.
 	fn bound_to(&self, binding: Binding, ty: TypeId) -> Vec<Sexp> {
 		binding
-			.mut_span
+			.mut_at
 			.map(|_| Sexp::atom("mut"))
 			.into_iter()
 			.chain([
@@ -681,12 +681,12 @@ impl<'a> Printer<'a> {
 							.into_iter()
 							.chain(self.signature(&signature, List::EMPTY)),
 					),
-					ImportDeclaration::Global { mut_span, name, ty } => {
+					ImportDeclaration::Global { mut_at, name, ty } => {
 						Sexp::head(
 							"global",
 							external
 								.into_iter()
-								.chain(mut_span.map(|_| Sexp::atom("mut")))
+								.chain(mut_at.map(|_| Sexp::atom("mut")))
 								.chain([
 									Sexp::atom(self.name(name.inner)),
 									Sexp::head(
@@ -705,9 +705,9 @@ impl<'a> Printer<'a> {
 					),
 				}
 			}
-			ImportEntry::Use { pub_span, tree } => Sexp::head(
+			ImportEntry::Use { pub_at, tree } => Sexp::head(
 				"use",
-				self.visibility(pub_span)
+				self.visibility(pub_at)
 					.into_iter()
 					.chain([self.use_tree(String::new(), tree)]),
 			),

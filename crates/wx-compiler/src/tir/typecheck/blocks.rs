@@ -51,7 +51,9 @@ impl BodyBuilder<'_, '_> {
 			// binds nothing.
 			let binding = param.binding;
 			let local = (!binding.is_missing()).then(|| {
-				self.declare_local(binding.name, ty, binding.mut_span)
+				let mut_span =
+					binding.mut_at.map(|at| Keyword::Mut.span_at(at));
+				self.declare_local(binding.name, ty, mut_span)
 			});
 			self.body.push_param(local);
 		}

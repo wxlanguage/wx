@@ -424,9 +424,9 @@ fn test_function_mut_param() {
 	case.diagnostics().assert_none();
 
 	let param = &case.ast.list(case.function_signature(0).params)[0];
-	let Binding { mut_span, name } = param.binding;
+	let Binding { mut_at, name } = param.binding;
 	assert_eq!(case.name(name.inner), "n");
-	assert!(mut_span.is_some(), "`mut n` should record a mut span");
+	assert!(mut_at.is_some(), "`mut n` should record a mut span");
 
 	// `mut` on a local lives on its binding pattern, not on the statement
 	let statements = case.function_block(0);
@@ -550,7 +550,7 @@ fn test_impl() {
 	};
 	assert_eq!(items.len(), 1);
 	let ImplItem::Function {
-		pub_span,
+		pub_at,
 		attributes,
 		signature,
 		..
@@ -559,7 +559,7 @@ fn test_impl() {
 		panic!("expected a method")
 	};
 	assert_eq!(case.name(signature.name.inner), "double");
-	assert!(pub_span.is_some(), "`pub func` should record a pub span");
+	assert!(pub_at.is_some(), "`pub func` should record a pub span");
 	assert_eq!(attributes.len(), 1);
 	assert_eq!(
 		case.name(case.ast.list(*attributes)[0].name.inner),
@@ -768,14 +768,14 @@ fn test_pub_on_impl_assoc_type_is_recorded() {
 	let Item::TraitImpl { items, .. } = case.item(0) else {
 		panic!("expected trait impl item")
 	};
-	let ImplItem::AssocType { pub_span, .. } = &case.ast.list(*items)[0] else {
+	let ImplItem::AssocType { pub_at, .. } = &case.ast.list(*items)[0] else {
 		panic!("expected an associated type")
 	};
-	assert!(pub_span.is_some());
+	assert!(pub_at.is_some());
 }
 
 #[test]
-fn test_pub_memory_and_global_record_pub_span() {
+fn test_pub_memory_and_global_record_pub() {
 	let case = TestCase::new(indoc! {"
         pub memory MEM: u32;
         pub global mut G: u32 = 0;
@@ -783,18 +783,18 @@ fn test_pub_memory_and_global_record_pub_span() {
     "});
 
 	case.diagnostics().assert_none();
-	let Item::Memory { pub_span, .. } = case.item(0) else {
+	let Item::Memory { pub_at, .. } = case.item(0) else {
 		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
 	};
-	assert!(pub_span.is_some());
-	let Item::Global { pub_span, .. } = case.item(1) else {
+	assert!(pub_at.is_some());
+	let Item::Global { pub_at, .. } = case.item(1) else {
 		panic!("item 1 is {}, not a global", item_kind(case.item(1)))
 	};
-	assert!(pub_span.is_some());
-	let Item::Memory { pub_span, .. } = case.item(2) else {
+	assert!(pub_at.is_some());
+	let Item::Memory { pub_at, .. } = case.item(2) else {
 		panic!("item 2 is {}, not a memory", item_kind(case.item(2)))
 	};
-	assert!(pub_span.is_none());
+	assert!(pub_at.is_none());
 }
 
 #[test]
@@ -818,10 +818,10 @@ fn test_pub_use_reexports_without_diagnostic() {
     "});
 
 	case.diagnostics().assert_none();
-	let Item::Use { pub_span, .. } = case.item(0) else {
+	let Item::Use { pub_at, .. } = case.item(0) else {
 		panic!("expected use item")
 	};
-	assert!(pub_span.is_some());
+	assert!(pub_at.is_some());
 }
 
 /// Every `use` form the grammar accepts, in one snapshot — the tree shape
@@ -1496,8 +1496,8 @@ fn an_enum_repr_is_written_as_a_struct_field() {
 		case.ast.list(*repr)[0]
 	};
 	assert_eq!(case.name(repr(0).binding.name.inner), "value");
-	assert!(repr(0).pub_span.is_none());
-	assert!(repr(1).pub_span.is_some());
+	assert!(repr(0).pub_at.is_none());
+	assert!(repr(1).pub_at.is_some());
 }
 
 #[test]
@@ -1508,7 +1508,7 @@ fn a_mut_enum_repr_is_parsed_as_written() {
 	let Item::Enum { repr, variants, .. } = case.item(0) else {
 		panic!("expected enum item")
 	};
-	assert!(case.ast.list(*repr)[0].binding.mut_span.is_some());
+	assert!(case.ast.list(*repr)[0].binding.mut_at.is_some());
 	assert_eq!(variants.len(), 1);
 }
 
@@ -1571,11 +1571,7 @@ fn parameters_and_fields_share_the_slot_grammar() {
 	let describe = |binding: Binding| {
 		format!(
 			"{}{}",
-			if binding.mut_span.is_some() {
-				"mut "
-			} else {
-				""
-			},
+			if binding.mut_at.is_some() { "mut " } else { "" },
 			case.name(binding.name.inner)
 		)
 	};
@@ -1590,7 +1586,7 @@ fn parameters_and_fields_share_the_slot_grammar() {
 	let names: Vec<_> =
 		fields.iter().map(|field| describe(field.binding)).collect();
 	assert_eq!(names, ["a", "mut d", "mut e"]);
-	assert!(fields[2].pub_span.is_some());
+	assert!(fields[2].pub_at.is_some());
 	assert!(matches!(
 		case.ast.ty(fields[1].ty),
 		TypeExpression::Pointer { .. }
@@ -1608,9 +1604,9 @@ fn the_receiver_is_written_with_its_type() {
 	case.diagnostics().assert_none();
 	for index in 0..2 {
 		let param = &case.ast.list(case.function_signature(index).params)[0];
-		let Binding { mut_span, name } = param.binding;
+		let Binding { mut_at, name } = param.binding;
 		assert_eq!(case.name(name.inner), "self");
-		assert_eq!(mut_span.is_some(), index == 1);
+		assert_eq!(mut_at.is_some(), index == 1);
 	}
 }
 
@@ -2477,35 +2473,32 @@ fn test_module_pub_items_and_associated_types() {
 
 	case.diagnostics().assert_none();
 
-	let Item::Module {
-		pub_span, items, ..
-	} = case.item(0)
-	else {
+	let Item::Module { pub_at, items, .. } = case.item(0) else {
 		panic!("expected public module")
 	};
-	assert!(pub_span.is_some());
+	assert!(pub_at.is_some());
 	assert!(matches!(
 		case.ast.list(*items)[0],
 		Item::Function {
-			pub_span: Some(_),
+			pub_at: Some(_),
 			..
 		}
 	));
 
-	let Item::Struct { pub_span, .. } = case.item(1) else {
+	let Item::Struct { pub_at, .. } = case.item(1) else {
 		panic!("expected public struct")
 	};
-	assert!(pub_span.is_some());
+	assert!(pub_at.is_some());
 
 	let Item::Trait {
-		pub_span,
+		pub_at,
 		items: trait_items,
 		..
 	} = case.item(2)
 	else {
 		panic!("expected public trait")
 	};
-	assert!(pub_span.is_some());
+	assert!(pub_at.is_some());
 	assert!(matches!(
 		case.ast.list(*trait_items)[0],
 		TraitItem::AssociatedType { ref bounds, .. }
@@ -2533,11 +2526,11 @@ fn test_external_module_item() {
 
 	case.diagnostics().assert_none();
 
-	let Item::ModuleDeclaration { pub_span, name, .. } = case.item(0) else {
+	let Item::ModuleDeclaration { pub_at, name, .. } = case.item(0) else {
 		panic!("expected external module")
 	};
 
-	assert!(pub_span.is_none());
+	assert!(pub_at.is_none());
 	assert_eq!(case.strings.resolve(name.inner), Some("math"));
 }
 
@@ -2551,7 +2544,7 @@ fn test_package_instances() {
 	case.diagnostics().assert_none();
 
 	let Item::PackageInstance {
-		pub_span,
+		pub_at,
 		package,
 		alias,
 	} = case.item(0)
@@ -2561,7 +2554,7 @@ fn test_package_instances() {
 			item_kind(case.item(0))
 		)
 	};
-	assert!(pub_span.is_none());
+	assert!(pub_at.is_none());
 	assert_eq!(
 		package.extract_str(&case.files.get(case.file_id).unwrap().source),
 		"\"math\"",
@@ -2569,16 +2562,13 @@ fn test_package_instances() {
 	);
 	assert_eq!(case.strings.resolve(alias.inner), Some("math"));
 
-	let Item::PackageInstance {
-		pub_span, alias, ..
-	} = case.item(1)
-	else {
+	let Item::PackageInstance { pub_at, alias, .. } = case.item(1) else {
 		panic!(
 			"expected a package instance, got {}",
 			item_kind(case.item(1))
 		)
 	};
-	assert!(pub_span.is_some());
+	assert!(pub_at.is_some());
 	assert_eq!(case.strings.resolve(alias.inner), Some("math2"));
 }
 
@@ -2604,7 +2594,7 @@ fn test_package_instance_in_a_nested_module() {
 	assert!(matches!(
 		case.ast.list(*items)[0],
 		Item::PackageInstance {
-			pub_span: Some(_),
+			pub_at: Some(_),
 			..
 		}
 	));
@@ -2997,7 +2987,7 @@ fn test_import_alias_and_entry_kinds() {
 		case.ast.list(*items)[1],
 		ImportEntry::Declaration {
 			declaration: ImportDeclaration::Global {
-				mut_span: Some(_),
+				mut_at: Some(_),
 				..
 			},
 			..
@@ -3030,15 +3020,15 @@ fn import_blocks_accept_private_use_trees() {
 	assert_eq!(items.len(), 5);
 	assert!(matches!(
 		case.ast.list(*items)[0],
-		ImportEntry::Use { pub_span: None, .. }
+		ImportEntry::Use { pub_at: None, .. }
 	));
 	assert!(matches!(
 		case.ast.list(*items)[1],
-		ImportEntry::Use { pub_span: None, .. }
+		ImportEntry::Use { pub_at: None, .. }
 	));
 	assert!(matches!(
 		case.ast.list(*items)[2],
-		ImportEntry::Use { pub_span: None, .. }
+		ImportEntry::Use { pub_at: None, .. }
 	));
 	assert!(matches!(
 		case.ast.list(*items)[3],
@@ -3059,14 +3049,15 @@ fn import_blocks_preserve_reexport_visibility() {
 		panic!("expected import block")
 	};
 	let ImportEntry::Use {
-		pub_span: Some(span),
-		..
-	} = &case.ast.list(*items)[0]
+		pub_at: Some(at), ..
+	} = case.ast.list(*items)[0]
 	else {
 		panic!("expected a public use item");
 	};
 	assert_eq!(
-		span.extract_str(&case.files.get(case.file_id).unwrap().source),
+		Keyword::Pub
+			.span_at(at)
+			.extract_str(&case.files.get(case.file_id).unwrap().source),
 		"pub"
 	);
 	assert!(matches!(
@@ -4083,17 +4074,17 @@ fn test_crate_contract_items_parse_and_keep_visibility() {
 	case.diagnostics().assert_none();
 	assert!(matches!(
 		case.item(0),
-		Item::PackageType { pub_span: Some(_), name, .. }
+		Item::PackageType { pub_at: Some(_), name, .. }
 			if case.name(name.inner) == "Word"
 	));
 	assert!(matches!(
 		case.item(1),
-		Item::PackageConst { pub_span: None, name, .. }
+		Item::PackageConst { pub_at: None, name, .. }
 			if case.name(name.inner) == "LIMIT"
 	));
 	assert!(matches!(
 		case.item(2),
-		Item::PackageFunction { pub_span: Some(_), signature, .. }
+		Item::PackageFunction { pub_at: Some(_), signature, .. }
 			if case.name(signature.name.inner) == "choose"
 	));
 	assert!(matches!(case.item(3), Item::PackageInstance { .. }));

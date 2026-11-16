@@ -789,10 +789,15 @@ impl BodyBuilder<'_, '_> {
 		for &item in self.ast().list(elements) {
 			match item {
 				ast::PatternElement::Pattern(pattern) => written.push(pattern),
-				ast::PatternElement::Rest(at) => match rest {
-					Some((_, first)) => self.report_duplicate_rest(at, first),
-					None => rest = Some((written.len(), at)),
-				},
+				ast::PatternElement::Rest(at) => {
+					let at = ast::rest_span(at);
+					match rest {
+						Some((_, first)) => {
+							self.report_duplicate_rest(at, first)
+						}
+						None => rest = Some((written.len(), at)),
+					}
+				}
 			}
 		}
 		let count = types.len();
@@ -863,9 +868,10 @@ impl BodyBuilder<'_, '_> {
 		for item in self.ast().list(fields) {
 			let field = match item {
 				ast::PatternFieldItem::Rest(at) => {
+					let at = ast::rest_span(*at);
 					match rest {
-						Some(first) => self.report_duplicate_rest(*at, first),
-						None => rest = Some(*at),
+						Some(first) => self.report_duplicate_rest(at, first),
+						None => rest = Some(at),
 					}
 					continue;
 				}

@@ -7,7 +7,7 @@ use codespan_reporting::files;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast;
-use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::symbols::StringInterner;
 
 mod manifest;
@@ -299,7 +299,7 @@ pub struct ModuleDeclaration {
 	pub name: ast::Spanned<SymbolU32>,
 	/// Whether the declaration was `pub`. Independently optional — a
 	/// declaration that exists but isn't `pub` is a normal, valid state.
-	pub pub_span: Option<TextSpan>,
+	pub pub_at: Option<u32>,
 }
 
 pub struct SourceModule {
@@ -698,11 +698,11 @@ impl<'ctx, 'src, 'strings, Source: FileSource>
 			.list(ast.root)
 			.iter()
 			.filter_map(|item| match *item {
-				ast::Item::ModuleDeclaration { name, pub_span } => {
+				ast::Item::ModuleDeclaration { name, pub_at } => {
 					Some(ModuleDeclaration {
 						parent: module_id,
 						name,
-						pub_span,
+						pub_at,
 					})
 				}
 				ast::Item::Module { items, .. } => {

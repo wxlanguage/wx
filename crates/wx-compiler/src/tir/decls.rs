@@ -134,7 +134,7 @@ pub enum UseItemKind {
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct UseItemDecl {
 	pub namespace: Scope,
-	pub pub_span: Option<TextSpan>,
+	pub pub_at: Option<u32>,
 	pub kind: UseItemKind,
 }
 
@@ -633,7 +633,7 @@ impl FieldArena {
 	fn push(&mut self, field: &ast::StructField, span: TextSpan) {
 		let name = (!field.binding.is_missing()).then_some(field.binding.name);
 		self.names.push(name.map(|name| name.inner));
-		self.visibility.push(Visibility::from(field.pub_span));
+		self.visibility.push(Visibility::from(field.pub_at));
 		self.name_spans.push(
 			name.map_or(TextSpan::new(span.start, span.start), |name| {
 				name.span
@@ -1411,8 +1411,9 @@ pub enum Visibility {
 	Private,
 }
 
-impl From<Option<TextSpan>> for Visibility {
-	fn from(value: Option<TextSpan>) -> Self {
+/// From where a `pub` starts, if one is written (`pub_at`).
+impl From<Option<u32>> for Visibility {
+	fn from(value: Option<u32>) -> Self {
 		match value {
 			Some(_) => Visibility::Public,
 			None => Visibility::Private,
@@ -2200,7 +2201,7 @@ impl Namespaces {
 
 		for glob in self.scope(target).glob_imports.iter().copied() {
 			let item = &use_items[usize::from(glob.use_item)];
-			let glob_visibility = Visibility::from(item.pub_span);
+			let glob_visibility = Visibility::from(item.pub_at);
 			if !self.is_accessible_from(
 				accessor,
 				target.into(),
@@ -2461,7 +2462,7 @@ pub struct ModuleDecl {
 /// One `use path::*;` edge — the namespace it resolved to, plus which item
 /// produced it.
 ///
-/// `use_item` is a back-reference, not a copy: `pub_span`, the declaring
+/// `use_item` is a back-reference, not a copy: `pub_at`, the declaring
 /// namespace, and (via `UseItemKind::Glob`) the `x::*` span all already live
 /// on the `UseItemDecl` — duplicating them here would just be two copies of
 /// the same fact able to drift, the same reason `Binding::source` points at
@@ -2983,13 +2984,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						parent_namespace,
 						source_module.file_id,
 						declaration.name,
-						declaration.pub_span,
+						declaration.pub_at,
 					);
 					if let Err(collision) = self.bind_child(
 						parent_namespace,
 						declaration.name.inner,
 						self.modules[usize::from(module)].loc,
-						Visibility::from(declaration.pub_span),
+						Visibility::from(declaration.pub_at),
 					) {
 						self.diagnostics.push(
 							DuplicateDefinitionDiagnostic {
@@ -3546,7 +3547,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		package: TextSpan,
 		alias: Spanned<SymbolU32>,
 	) {
@@ -3586,7 +3587,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		let index = PackageInstanceIdx::new(
 			u32::try_from(self.namespaces.package_instances.len()).unwrap(),
 		);
-		let visibility = Visibility::from(pub_span);
+		let visibility = Visibility::from(pub_at);
 		let loc = self.push_decl(
 			Namespace::from(namespace),
 			ItemDecl::new(DeclKind::PackageInstance(index), alias, visibility),
@@ -3631,7 +3632,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		parent: Scope,
 		own_file: FileId,
 		name: Spanned<SymbolU32>,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 	) -> ModuleIdx {
 		let index = ModuleIdx::new(u32::try_from(self.modules.len()).unwrap());
 		let package_id = self.namespaces.scope(parent).package_id;
@@ -3640,7 +3641,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			ItemDecl::new(
 				DeclKind::Module(index),
 				name,
-				Visibility::from(pub_span),
+				Visibility::from(pub_at),
 			),
 		);
 		let parent_key = self.scope_key(parent);
@@ -3782,19 +3783,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		};
 		match item {
 			ast::Item::Function {
-				signature,
-				pub_span,
-				..
+				signature, pub_at, ..
 			}
 			| ast::Item::FunctionDeclaration {
-				signature,
-				pub_span,
-				..
+				signature, pub_at, ..
 			}
 			| ast::Item::PackageFunction {
-				signature,
-				pub_span,
-				..
+				signature, pub_at, ..
 			} => {
 				let func_index = FunctionIdx::new(
 					u32::try_from(self.functions.len()).unwrap(),
@@ -3804,13 +3799,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::Function(func_index),
 						signature.name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				// A function is a value and, like a struct, its own type: each
 				// one is a zero-sized type of its own (`foo<i32>`).
 				let binding =
-					Binding::definition(loc, Visibility::from(*pub_span));
+					Binding::definition(loc, Visibility::from(*pub_at));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					signature.name.inner,
@@ -3855,8 +3850,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Global {
-				pub_span,
-				mut_span,
+				pub_at,
+				mut_at,
 				name,
 				..
 			} => {
@@ -3870,14 +3865,14 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					file_id,
 					namespace,
 					name.span,
-					mut_span.is_some(),
+					mut_at.is_some(),
 				);
 				let loc = self.push_decl(
 					Namespace::from(namespace),
 					ItemDecl::new(
 						DeclKind::Global(global_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				self.globals.push(GlobalDecl {
@@ -3889,7 +3884,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// The name is the global's zero-sized value and its own
 				// type, the one `Global` is implemented for.
 				let binding =
-					Binding::definition(loc, Visibility::from(*pub_span));
+					Binding::definition(loc, Visibility::from(*pub_at));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,
@@ -3907,7 +3902,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Struct {
-				pub_span,
+				pub_at,
 				name,
 				fields,
 				..
@@ -3919,7 +3914,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::Struct(struct_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				// The name is also the struct's constructor, called like a
@@ -3927,16 +3922,15 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// as visible as the struct and every one of its fields.
 				let spans = ast.spans(*fields);
 				let fields = ast.list(*fields);
-				let constructor_visibility = fields.iter().fold(
-					Visibility::from(*pub_span),
-					|visibility, f| {
-						visibility.cap(Visibility::from(f.pub_span))
-					},
-				);
+				let constructor_visibility = fields
+					.iter()
+					.fold(Visibility::from(*pub_at), |visibility, f| {
+						visibility.cap(Visibility::from(f.pub_at))
+					});
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,
-					Binding::definition(loc, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_at)),
 					Binding::definition(loc, constructor_visibility),
 					name.span,
 				);
@@ -3968,7 +3962,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Enum {
-				pub_span,
+				pub_at,
 				repr,
 				name,
 				variants,
@@ -3988,7 +3982,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::Enum(enum_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				self.namespaces.enums.push(SymbolTable::new(file_id));
@@ -4035,7 +4029,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				// is a pattern over its repr, and `Ordering(5)` is reported as
 				// a construction, which an enum never allows.
 				let binding =
-					Binding::definition(loc, Visibility::from(*pub_span));
+					Binding::definition(loc, Visibility::from(*pub_at));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,
@@ -4078,8 +4072,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					});
 				}
 			}
-			ast::Item::TypeAlias { pub_span, name, .. }
-			| ast::Item::PackageType { pub_span, name, .. } => {
+			ast::Item::TypeAlias { pub_at, name, .. }
+			| ast::Item::PackageType { pub_at, name, .. } => {
 				let bodyless = match item {
 					ast::Item::TypeAlias { body, .. } => body.is_none(),
 					ast::Item::PackageType { .. } => true,
@@ -4093,13 +4087,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::TypeAlias(type_alias_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
-					Binding::definition(loc, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_at)),
 					name.span,
 				);
 				if bodyless
@@ -4134,7 +4128,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				});
 			}
 			ast::Item::Memory {
-				pub_span,
+				pub_at,
 				name,
 				attributes: written,
 				..
@@ -4149,7 +4143,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::Memory(memory_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				self.memories.push(MemoryDecl {
@@ -4159,7 +4153,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					limits,
 				});
 				let binding =
-					Binding::definition(loc, Visibility::from(*pub_span));
+					Binding::definition(loc, Visibility::from(*pub_at));
 				self.insert_type_and_value(
 					Namespace::from(namespace),
 					name.inner,
@@ -4176,8 +4170,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					},
 				});
 			}
-			ast::Item::Const { pub_span, name, .. }
-			| ast::Item::PackageConst { pub_span, name, .. } => {
+			ast::Item::Const { pub_at, name, .. }
+			| ast::Item::PackageConst { pub_at, name, .. } => {
 				let const_index =
 					ConstIdx::new(u32::try_from(self.constants.len()).unwrap());
 				let loc = self.push_decl(
@@ -4185,7 +4179,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::Const(const_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				self.constants.push(ConstDecl {
@@ -4195,7 +4189,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::value(name.inner),
-					Binding::definition(loc, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_at)),
 					name.span,
 				);
 				if matches!(item, ast::Item::PackageConst { .. }) {
@@ -4219,16 +4213,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			ast::Item::Module {
 				name,
 				items,
-				pub_span,
+				pub_at,
 				..
 			} => {
 				let module =
-					self.push_module(namespace, file_id, *name, *pub_span);
+					self.push_module(namespace, file_id, *name, *pub_at);
 				if let Err(collision) = self.bind_child(
 					namespace,
 					name.inner,
 					self.modules[usize::from(module)].loc,
-					Visibility::from(*pub_span),
+					Visibility::from(*pub_at),
 				) {
 					self.diagnostics.push(
 						DuplicateDefinitionDiagnostic {
@@ -4254,7 +4248,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			ast::Item::Trait {
 				name,
 				items,
-				pub_span,
+				pub_at,
 				..
 			} => {
 				let trait_index =
@@ -4264,13 +4258,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::Trait(trait_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
-					Binding::definition(loc, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_at)),
 					name.span,
 				);
 				if self.namespaces.scope(namespace).package_id
@@ -4540,9 +4534,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						self.scan_attributes(file_id, target, attributes);
 					let (member, key, binding) = match impl_item {
 						ast::ImplItem::Function {
-							signature,
-							pub_span,
-							..
+							signature, pub_at, ..
 						} => {
 							let params = self.scan_impl_function_params(
 								file_id,
@@ -4564,7 +4556,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								ItemDecl::new(
 									DeclKind::Function(function_index),
 									signature.name,
-									Visibility::from(*pub_span),
+									Visibility::from(*pub_at),
 								),
 							);
 							self.functions.push(FunctionDecl {
@@ -4596,7 +4588,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								member_index,
 							)
 						}
-						ast::ImplItem::Constant { name, pub_span, .. } => {
+						ast::ImplItem::Constant { name, pub_at, .. } => {
 							let const_index = ConstIdx::new(
 								u32::try_from(self.constants.len()).unwrap(),
 							);
@@ -4605,7 +4597,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								ItemDecl::new(
 									DeclKind::Const(const_index),
 									*name,
-									Visibility::from(*pub_span),
+									Visibility::from(*pub_at),
 								),
 							);
 							self.constants.push(ConstDecl {
@@ -4730,9 +4722,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					.zip(ast.spans(*entries))
 				{
 					let (import_block, external_name) = match item {
-						ast::ImportEntry::Use { tree, pub_span } => {
+						ast::ImportEntry::Use { tree, pub_at } => {
 							self.scan_use_tree(
-								file_id, namespace, *tree, None, *pub_span,
+								file_id, namespace, *tree, None, *pub_at,
 							);
 							continue;
 						}
@@ -4848,9 +4840,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							});
 						}
 						ast::ImportDeclaration::Global {
-							mut_span,
-							name,
-							..
+							mut_at, name, ..
 						} => {
 							let global_index = GlobalIdx::new(
 								u32::try_from(self.globals.len()).unwrap(),
@@ -4863,7 +4853,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								file_id,
 								namespace,
 								name.span,
-								mut_span.is_some(),
+								mut_at.is_some(),
 							);
 							let loc = self.push_decl(
 								own_namespace,
@@ -4908,16 +4898,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					}
 				}
 			}
-			ast::Item::Use { tree, pub_span } => {
-				self.scan_use_tree(file_id, namespace, *tree, None, *pub_span);
+			ast::Item::Use { tree, pub_at } => {
+				self.scan_use_tree(file_id, namespace, *tree, None, *pub_at);
 			}
 			ast::Item::PackageInstance {
-				pub_span,
+				pub_at,
 				package,
 				alias,
 			} => {
 				self.scan_package_instance(
-					file_id, namespace, *pub_span, *package, *alias,
+					file_id, namespace, *pub_at, *package, *alias,
 				);
 			}
 			ast::Item::Export { entry } => {
@@ -4930,7 +4920,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			}
 			ast::Item::TypeSet {
 				name,
-				pub_span,
+				pub_at,
 				members,
 				..
 			} => {
@@ -4953,13 +4943,13 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					ItemDecl::new(
 						DeclKind::TypeSet(typeset_index),
 						*name,
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				self.insert_binding(
 					Namespace::from(namespace),
 					BindingKey::ty(name.inner),
-					Binding::definition(loc, Visibility::from(*pub_span)),
+					Binding::definition(loc, Visibility::from(*pub_at)),
 					name.span,
 				);
 				// Its trait is generated: a row of its own, with the typeset's
@@ -4977,7 +4967,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								name.span.start,
 							),
 						},
-						Visibility::from(*pub_span),
+						Visibility::from(*pub_at),
 					),
 				);
 				let actual_index = self.push_trait(TraitDecl {
@@ -5213,7 +5203,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		namespace: Scope,
 		tree: ast::UseTreeId,
 		parent_segment: Option<UsePathIndex>,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 	) {
 		let ast = self.ast(file_id);
 		self.scan_use_node(
@@ -5224,7 +5214,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				span: ast.use_tree_span(tree),
 			},
 			parent_segment,
-			pub_span,
+			pub_at,
 		);
 	}
 
@@ -5234,7 +5224,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		namespace: Scope,
 		tree: Spanned<ast::UseTree>,
 		parent_segment: Option<UsePathIndex>,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 	) {
 		match &tree.inner {
 			ast::UseTree::Name { segment, alias } => {
@@ -5246,7 +5236,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						prefix: parent_segment,
 					},
 					namespace,
-					pub_span,
+					pub_at,
 				});
 				self.pending_named_imports
 					.entry((namespace, local_name))
@@ -5264,7 +5254,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						span: tree.span,
 					},
 					namespace,
-					pub_span,
+					pub_at,
 				});
 				self.pending_glob_targets
 					.entry(namespace)
@@ -5281,7 +5271,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 					namespace,
 					*rest,
 					Some(path),
-					pub_span,
+					pub_at,
 				);
 			}
 			ast::UseTree::Group {
@@ -5297,7 +5287,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						namespace,
 						branch,
 						Some(path),
-						pub_span,
+						pub_at,
 					);
 				}
 			}

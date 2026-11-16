@@ -1148,7 +1148,7 @@ impl Semantics {
 		file_id: FileId,
 		global_index: GlobalIdx,
 		name: Spanned<SymbolU32>,
-		mut_span: Option<TextSpan>,
+		mut_at: Option<u32>,
 		value: Spanned<TypeIndex>,
 	) -> SignatureLocation {
 		let global_decl = &self.decls.globals[usize::from(global_index)];
@@ -1203,7 +1203,7 @@ impl Semantics {
 				},
 			});
 		if let Some(mut_trait_impl_index) = mut_trait_impl_index {
-			debug_assert!(mut_span.is_some());
+			debug_assert!(mut_at.is_some());
 			self.trait_impls[usize::from(mut_trait_impl_index)] =
 				Some(TraitImplSignature {
 					type_params: GenericEnvIdx::ROOT,
@@ -1990,22 +1990,24 @@ impl<'ast> SemanticsBuilder<'ast> {
 				ast::TypeParam::Type { bounds: None, .. } => {}
 				// Kept as a type parameter with no bounds, so the arguments
 				// still line up, until constants are checked.
-				ast::TypeParam::Const {
-					const_span, name, ..
-				} => sema.diagnostics.push(
-					Diagnostic::bug()
-						.with_code(DiagnosticCode::UnsupportedExpression.code())
-						.with_message(
-							"constant parameters are not supported yet",
-						)
-						.with_label(
-							SourceSpan::new(
-								file_id,
-								TextSpan::new(const_span.start, name.span.end),
+				ast::TypeParam::Const { const_at, name, .. } => {
+					sema.diagnostics.push(
+						Diagnostic::bug()
+							.with_code(
+								DiagnosticCode::UnsupportedExpression.code(),
 							)
-							.primary_label(),
-						),
-				),
+							.with_message(
+								"constant parameters are not supported yet",
+							)
+							.with_label(
+								SourceSpan::new(
+									file_id,
+									TextSpan::new(*const_at, name.span.end),
+								)
+								.primary_label(),
+							),
+					)
+				}
 			}
 			bounded.push((subject, ast_param.name().inner, occurrences));
 		}
@@ -3180,7 +3182,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			AstNodeRef::Global { global_index, item } => {
 				let item = &ast.item(item);
 				let ast::Item::Global {
-					name, ty, mut_span, ..
+					name, ty, mut_at, ..
 				} = item
 				else {
 					unreachable!()
@@ -3229,7 +3231,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					global_index,
 					*name,
-					*mut_span,
+					*mut_at,
 					value,
 				)
 			}
@@ -3246,7 +3248,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					unreachable!("an imported declaration's entry")
 				};
 				let ast::ImportDeclaration::Global {
-					name, ty, mut_span, ..
+					name, ty, mut_at, ..
 				} = import_block
 				else {
 					unreachable!()
@@ -3281,7 +3283,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					global_index,
 					*name,
-					*mut_span,
+					*mut_at,
 					value,
 				)
 			}
@@ -3609,9 +3611,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// The repr's value is one of the variants, so it is never
 				// written in place: changing it is assigning a variant.
 				for field in ast.list(*repr) {
-					if let Some(mut_span) = field.binding.mut_span {
-						sema.diagnostics
-							.push(report_mutable_enum_repr(file_id, mut_span));
+					if let Some(at) = field.binding.mut_at {
+						sema.diagnostics.push(report_mutable_enum_repr(
+							file_id,
+							Keyword::Mut.span_at(at),
+						));
 					}
 				}
 
@@ -5683,7 +5687,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let mut occurrence_bindings = Vec::new();
 		for binding in bindings {
 			let key = match binding.kind {
-				ast::AssocBindingKind::ConstEquals { const_span, .. } => {
+				ast::AssocBindingKind::ConstEquals { const_at, .. } => {
 					sema.diagnostics.push(
 						Diagnostic::bug()
 							.with_code(
@@ -5697,7 +5701,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								SourceSpan::new(
 									file_id,
 									TextSpan::new(
-										const_span.start,
+										const_at,
 										binding.name.span.end,
 									),
 								)

@@ -737,11 +737,11 @@ impl<'a> Builder<'a> {
 			ast::Item::Function {
 				signature,
 				block,
-				pub_span,
+				pub_at,
 				..
 			} => {
 				let mut items: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				self.build_function_signature(&mut items, signature);
@@ -752,12 +752,10 @@ impl<'a> Builder<'a> {
 				self.arena.group(concat)
 			}
 			ast::Item::FunctionDeclaration {
-				pub_span,
-				signature,
-				..
+				pub_at, signature, ..
 			} => {
 				let mut items: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				self.build_function_signature(&mut items, signature);
@@ -765,12 +763,10 @@ impl<'a> Builder<'a> {
 				self.arena.concat(items)
 			}
 			ast::Item::PackageFunction {
-				pub_span,
-				signature,
-				..
+				pub_at, signature, ..
 			} => {
 				let mut items = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				items.push(self.text(Text::Package));
@@ -779,10 +775,10 @@ impl<'a> Builder<'a> {
 				self.arena.concat(items)
 			}
 			ast::Item::PackageConst {
-				pub_span, name, ty, ..
+				pub_at, name, ty, ..
 			} => {
 				let mut items = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				items.push(self.text(Text::Package));
@@ -794,13 +790,13 @@ impl<'a> Builder<'a> {
 				self.arena.concat(items)
 			}
 			ast::Item::PackageType {
-				pub_span,
+				pub_at,
 				name,
 				type_params,
 				..
 			} => {
 				let mut items = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				items.push(self.text(Text::Package));
@@ -811,15 +807,15 @@ impl<'a> Builder<'a> {
 				self.arena.concat(items)
 			}
 			ast::Item::Global {
-				pub_span,
-				mut_span,
+				pub_at,
+				mut_at,
 				name,
 				ty: type_annotation,
 				value,
 				..
 			} => self.build_global_definition(
-				*pub_span,
-				*mut_span,
+				*pub_at,
+				*mut_at,
 				name,
 				*type_annotation,
 				*value,
@@ -845,13 +841,10 @@ impl<'a> Builder<'a> {
 				*entries,
 			),
 			ast::Item::Memory {
-				pub_span,
-				name,
-				size,
-				..
+				pub_at, name, size, ..
 			} => {
 				let mut parts: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					parts.push(self.text(Text::Pub));
 				}
 				parts.push(self.text(Text::Memory));
@@ -862,13 +855,13 @@ impl<'a> Builder<'a> {
 				self.arena.concat(parts)
 			}
 			ast::Item::Enum {
-				pub_span,
+				pub_at,
 				repr,
 				name,
 				variants,
 				..
 			} => self
-				.build_enum_definition(span, *pub_span, *repr, name, *variants),
+				.build_enum_definition(span, *pub_at, *repr, name, *variants),
 			ast::Item::InherentImpl {
 				type_params,
 				target,
@@ -889,30 +882,30 @@ impl<'a> Builder<'a> {
 				*items,
 			),
 			ast::Item::Const {
-				pub_span,
+				pub_at,
 				name,
 				ty,
 				value,
 				..
-			} => self.build_const_definition(*pub_span, name, *ty, *value),
+			} => self.build_const_definition(*pub_at, name, *ty, *value),
 			ast::Item::Module {
-				pub_span,
+				pub_at,
 				name,
 				items,
 				..
-			} => self.build_module_definition(span, *pub_span, name, *items),
-			ast::Item::ModuleDeclaration { pub_span, name } => {
-				self.build_module_declaration(*pub_span, name)
+			} => self.build_module_definition(span, *pub_at, name, *items),
+			ast::Item::ModuleDeclaration { pub_at, name } => {
+				self.build_module_declaration(*pub_at, name)
 			}
 			ast::Item::Trait {
-				pub_span,
+				pub_at,
 				name,
 				supertraits,
 				items,
 				..
 			} => self.build_trait_definition(
 				span,
-				*pub_span,
+				*pub_at,
 				name,
 				*supertraits,
 				*items,
@@ -921,43 +914,43 @@ impl<'a> Builder<'a> {
 				name,
 				type_params,
 				fields,
-				pub_span,
+				pub_at,
 				..
 			} => self.build_struct_declaration(
 				span,
 				name,
 				*type_params,
 				*fields,
-				*pub_span,
+				*pub_at,
 			),
 			ast::Item::TypeSet {
-				pub_span,
+				pub_at,
 				name,
 				bounds,
 				members,
 				..
 			} => self.build_typeset_definition(
-				span, *pub_span, name, *bounds, *members,
+				span, *pub_at, name, *bounds, *members,
 			),
 			ast::Item::TypeAlias {
-				pub_span,
+				pub_at,
 				name,
 				type_params,
 				body,
 				..
 			} => self.build_type_alias_definition(
-				*pub_span,
+				*pub_at,
 				name,
 				*type_params,
 				*body,
 			),
 			ast::Item::PackageInstance {
-				pub_span,
+				pub_at,
 				package,
 				alias,
 			} => {
 				let mut parts: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					parts.push(self.text(Text::Pub));
 				}
 				parts.push(self.text(Text::Package));
@@ -967,9 +960,9 @@ impl<'a> Builder<'a> {
 				parts.push(self.text(Text::Semi));
 				self.arena.concat(parts)
 			}
-			ast::Item::Use { tree, pub_span } => {
+			ast::Item::Use { tree, pub_at } => {
 				let mut items: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					items.push(self.text(Text::Pub));
 				}
 				items.push(self.text(Text::Use));
@@ -1071,8 +1064,8 @@ impl<'a> Builder<'a> {
 				let mut entry_nodes: Vec<NodeId> = Vec::new();
 
 				match &entry.inner {
-					ast::ImportEntry::Use { tree, pub_span } => {
-						if pub_span.is_some() {
+					ast::ImportEntry::Use { tree, pub_at } => {
+						if pub_at.is_some() {
 							entry_nodes.push(self.text(Text::Pub));
 						}
 						entry_nodes.push(self.text(Text::Use));
@@ -1120,13 +1113,13 @@ impl<'a> Builder<'a> {
 								entry_nodes = vec![group];
 							}
 							ast::ImportDeclaration::Global {
-								mut_span,
+								mut_at,
 								name,
 								ty,
 								..
 							} => {
 								entry_nodes.push(self.text(Text::Global));
-								if mut_span.is_some() {
+								if mut_at.is_some() {
 									entry_nodes.push(self.text(Text::Mut));
 								}
 								entry_nodes.push(self.symbol(name.inner));
@@ -1171,12 +1164,12 @@ impl<'a> Builder<'a> {
 	fn build_module_definition(
 		&mut self,
 		span: TextSpan,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: &ast::Spanned<SymbolU32>,
 		items: ast::List<ast::Item>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			nodes.push(self.text(Text::Pub));
 		}
 		nodes.push(self.text(Text::Module));
@@ -1200,11 +1193,11 @@ impl<'a> Builder<'a> {
 
 	fn build_module_declaration(
 		&mut self,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: &ast::Spanned<SymbolU32>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			nodes.push(self.text(Text::Pub));
 		}
 		nodes.push(self.text(Text::Module));
@@ -1307,13 +1300,13 @@ impl<'a> Builder<'a> {
 	fn build_impl_item(&mut self, item: &ast::ImplItem) -> NodeId {
 		match item {
 			ast::ImplItem::Function {
-				pub_span,
+				pub_at,
 				signature,
 				block,
 				..
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
 				self.build_function_signature(&mut nodes, signature);
@@ -1323,14 +1316,14 @@ impl<'a> Builder<'a> {
 				self.arena.group(concat)
 			}
 			ast::ImplItem::Constant {
-				pub_span,
+				pub_at,
 				name,
 				ty,
 				value,
 				..
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
 				nodes.push(self.text(Text::Const));
@@ -1345,10 +1338,10 @@ impl<'a> Builder<'a> {
 				self.arena.concat(nodes)
 			}
 			ast::ImplItem::AssocType {
-				pub_span, name, ty, ..
+				pub_at, name, ty, ..
 			} => {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				if pub_span.is_some() {
+				if pub_at.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
 				nodes.push(self.text(Text::TypeKw));
@@ -1364,13 +1357,13 @@ impl<'a> Builder<'a> {
 	fn build_trait_definition(
 		&mut self,
 		span: TextSpan,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: &ast::Spanned<SymbolU32>,
 		supertraits: Option<ast::BoundId>,
 		items: ast::List<ast::TraitItem>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			nodes.push(self.text(Text::Pub));
 		}
 		nodes.push(self.text(Text::Trait));
@@ -1490,13 +1483,13 @@ impl<'a> Builder<'a> {
 
 	fn build_const_definition(
 		&mut self,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: &ast::Spanned<SymbolU32>,
 		ty: Option<ast::TypeId>,
 		value: ast::ExprId,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			nodes.push(self.text(Text::Pub));
 		}
 		nodes.push(self.text(Text::Const));
@@ -1513,13 +1506,13 @@ impl<'a> Builder<'a> {
 
 	fn build_type_alias_definition(
 		&mut self,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: &ast::Spanned<SymbolU32>,
 		type_params: ast::List<ast::TypeParam>,
 		body: Option<ast::TypeId>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			nodes.push(self.text(Text::Pub));
 		}
 		nodes.push(self.text(Text::TypeKw));
@@ -1606,14 +1599,14 @@ impl<'a> Builder<'a> {
 	fn build_enum_definition(
 		&mut self,
 		span: TextSpan,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		repr: ast::List<ast::StructField>,
 		name: &ast::Spanned<SymbolU32>,
 		variants: ast::List<ast::EnumVariant>,
 	) -> NodeId {
 		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			nodes.push(self.text(Text::Pub));
 		}
 		nodes.push(self.text(Text::Enum));
@@ -1690,14 +1683,14 @@ impl<'a> Builder<'a> {
 	fn build_typeset_definition(
 		&mut self,
 		span: TextSpan,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: &ast::Spanned<SymbolU32>,
 		bounds: Option<ast::BoundId>,
 		members: ast::List<ast::Path>,
 	) -> NodeId {
 		let ast = self.ast;
 		let mut items: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			items.push(self.text(Text::Pub));
 		}
 		items.push(self.text(Text::Typeset));
@@ -1733,7 +1726,7 @@ impl<'a> Builder<'a> {
 			.spanned(fields)
 			.map(|field| {
 				let mut nodes: Vec<NodeId> = Vec::new();
-				if field.inner.pub_span.is_some() {
+				if field.inner.pub_at.is_some() {
 					nodes.push(self.text(Text::Pub));
 				}
 				self.build_binding_and_type(
@@ -1752,10 +1745,10 @@ impl<'a> Builder<'a> {
 		name: &ast::Spanned<SymbolU32>,
 		type_params: ast::List<ast::TypeParam>,
 		fields: ast::List<ast::StructField>,
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 	) -> NodeId {
 		let mut items: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			items.push(self.text(Text::Pub));
 		}
 		items.push(self.text(Text::Struct));
@@ -2060,7 +2053,7 @@ impl<'a> Builder<'a> {
 		binding: ast::Binding,
 		ty: ast::TypeId,
 	) {
-		if binding.mut_span.is_some() {
+		if binding.mut_at.is_some() {
 			out.push(self.text(Text::Mut));
 		}
 		out.push(self.symbol(binding.name.inner));
@@ -2070,18 +2063,18 @@ impl<'a> Builder<'a> {
 
 	fn build_global_definition(
 		&mut self,
-		pub_span: Option<TextSpan>,
-		mut_span: Option<TextSpan>,
+		pub_at: Option<u32>,
+		mut_at: Option<u32>,
 		name: &ast::Spanned<SymbolU32>,
 		type_annotation: Option<ast::TypeId>,
 		value: ast::ExprId,
 	) -> NodeId {
 		let mut items: Vec<NodeId> = Vec::new();
-		if pub_span.is_some() {
+		if pub_at.is_some() {
 			items.push(self.text(Text::Pub));
 		}
 		items.push(self.text(Text::Global));
-		if mut_span.is_some() {
+		if mut_at.is_some() {
 			items.push(self.text(Text::Mut));
 		}
 		items.push(self.symbol(name.inner));

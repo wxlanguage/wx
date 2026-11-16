@@ -397,7 +397,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					);
 				}
 				AstNodeRef::Global { global_index, item } => {
-					let ast::Item::Global { name, mut_span, .. } =
+					let ast::Item::Global { name, mut_at, .. } =
 						&ast.item(*item)
 					else {
 						unreachable!()
@@ -405,7 +405,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					self.register_global_impl(
 						*global_index,
 						name.span,
-						*mut_span,
+						*mut_at,
 						entry.file_id,
 					);
 				}
@@ -416,9 +416,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				} => {
 					let ast::ImportEntry::Declaration {
 						declaration:
-							ast::ImportDeclaration::Global {
-								name, mut_span, ..
-							},
+							ast::ImportDeclaration::Global { name, mut_at, .. },
 						..
 					} = &ast.import_entry(*import_entry)
 					else {
@@ -427,7 +425,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					self.register_global_impl(
 						*global_index,
 						name.span,
-						*mut_span,
+						*mut_at,
 						entry.file_id,
 					);
 				}
@@ -542,7 +540,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		&mut self,
 		global_index: GlobalIdx,
 		name_span: TextSpan,
-		mut_span: Option<TextSpan>,
+		mut_at: Option<u32>,
 		file_id: FileId,
 	) {
 		let decls = self.decls;
@@ -574,7 +572,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			file_id,
 		);
 		if let Some(mut_trait_impl_index) = global_decl.mut_trait_impl_index {
-			debug_assert!(mut_span.is_some());
+			debug_assert!(mut_at.is_some());
 			let global_mut_trait_idx =
 				decls.intrinsics.global_mut.unwrap_or_else(|| {
 					panic!(

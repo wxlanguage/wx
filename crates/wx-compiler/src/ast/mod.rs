@@ -477,7 +477,7 @@ pub enum TypeParam {
 	},
 	/// `const N: Type`, a constant of type `ty`.
 	Const {
-		const_span: TextSpan,
+		const_at: u32,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 	},
@@ -555,12 +555,9 @@ pub enum AssocBindingKind {
 	Bound(BoundId),
 	/// `const LEN: u32` — the constant's value must be representable as this
 	/// type.
-	ConstRepresentable { const_span: TextSpan, ty: TypeId },
+	ConstRepresentable { const_at: u32, ty: TypeId },
 	/// `const LEN = 4` — the constant must have this value.
-	ConstEquals {
-		const_span: TextSpan,
-		value: ConstId,
-	},
+	ConstEquals { const_at: u32, value: ConstId },
 }
 
 /// `*T` = exclusive pointer/slice/array, `&T` = shared, always read-only.
@@ -704,8 +701,8 @@ pub enum Destructure {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum PatternElement {
 	Pattern(PatId),
-	/// `..`, at this span.
-	Rest(TextSpan),
+	/// `..`, starting here ([`rest_span`]).
+	Rest(u32),
 }
 
 /// One entry of a named list, exactly as written; see [`PatternElement`].
@@ -713,8 +710,8 @@ pub enum PatternElement {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum PatternFieldItem {
 	Field(PatternField),
-	/// `..`, at this span.
-	Rest(TextSpan),
+	/// `..`, starting here ([`rest_span`]).
+	Rest(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -764,6 +761,12 @@ pub enum Statement {
 	},
 }
 
+/// The span of a `..` rest written starting `at`: [`Keyword::span_at`] for
+/// the one fixed token that is not a keyword.
+pub fn rest_span(at: u32) -> TextSpan {
+	TextSpan::new(at, at + 2)
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 /// What a parameter or a field is bound to, written before its `:`: `name`
@@ -771,7 +774,7 @@ pub enum Statement {
 /// of its item's interface (a call or a construction by name, `.name`), and
 /// a value is dropped with the `_` pattern instead.
 pub struct Binding {
-	pub mut_span: Option<TextSpan>,
+	pub mut_at: Option<u32>,
 	pub name: Spanned<SymbolU32>,
 }
 
@@ -780,9 +783,9 @@ impl Binding {
 	/// the error symbol, at the empty span where the name goes. The parser
 	/// has reported it, so the slot is kept, unnamed, and nothing reports it
 	/// again.
-	pub fn missing(mut_span: Option<TextSpan>, at: u32) -> Self {
+	pub fn missing(mut_at: Option<u32>, at: u32) -> Self {
 		Self {
-			mut_span,
+			mut_at,
 			name: Spanned {
 				inner: Keyword::Error.symbol(),
 				span: TextSpan::new(at, at),
@@ -832,13 +835,13 @@ pub enum ImplItem {
 	/// A method or associated function — TIR distinguishes the two after
 	/// parsing, by checking whether the first param is named `self`.
 	Function {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 		block: BlockId,
 	},
 	Constant {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
@@ -849,7 +852,7 @@ pub enum ImplItem {
 		/// a trait impl, where visibility comes from the trait. Recorded
 		/// anyway so the qualifier can be reported and round-tripped:
 		/// dropping it here made the formatter delete `pub` from the source.
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 		attributes: List<Attribute>,
@@ -993,7 +996,7 @@ pub enum ImportDeclaration {
 		signature: FunctionSignature,
 	},
 	Global {
-		mut_span: Option<TextSpan>,
+		mut_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 	},
@@ -1014,7 +1017,7 @@ pub enum ImportEntry {
 	},
 	/// A source-level import/re-export, not an entity imported from the host.
 	Use {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		tree: UseTreeId,
 	},
 }
@@ -1030,40 +1033,40 @@ pub struct EnumVariant {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Item {
 	Function {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 		block: BlockId,
 	},
 	FunctionDeclaration {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 	},
 	/// A package contract member whose implementation is supplied externally.
 	PackageFunction {
-		pub_span: Option<TextSpan>,
-		crate_span: TextSpan,
+		pub_at: Option<u32>,
+		package_at: u32,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 	},
 	PackageConst {
-		pub_span: Option<TextSpan>,
-		crate_span: TextSpan,
+		pub_at: Option<u32>,
+		package_at: u32,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 	},
 	PackageType {
-		pub_span: Option<TextSpan>,
-		crate_span: TextSpan,
+		pub_at: Option<u32>,
+		package_at: u32,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
 	},
 	Global {
-		pub_span: Option<TextSpan>,
-		mut_span: Option<TextSpan>,
+		pub_at: Option<u32>,
+		mut_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
@@ -1073,8 +1076,8 @@ pub enum Item {
 		entry: ExportEntry,
 	},
 	ExportBlock {
-		/// Span of the `export` keyword.
-		keyword_span: TextSpan,
+		/// Where the `export` keyword starts.
+		export_at: u32,
 		entries: List<ExportEntry>,
 	},
 	Import {
@@ -1085,7 +1088,7 @@ pub enum Item {
 		braces: TextSpan,
 	},
 	Enum {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		/// The repr, written as a struct's fields: `(i8)`, `(pub value: i8)`.
 		/// Empty when no parentheses are written. Several fields are a wider
 		/// repr, parsed for the day it is implemented.
@@ -1113,34 +1116,34 @@ pub enum Item {
 	/// `pub`; a struct is constructed by a call, by position always and by
 	/// name when every field has one.
 	Struct {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
 		fields: List<StructField>,
 	},
 	Memory {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		size: TypeId,
 	},
 	Const {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
 		attributes: List<Attribute>,
 	},
 	Module {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 		items: List<Item>,
 		/// The braces, `{` through `}`.
 		braces: TextSpan,
 	},
 	ModuleDeclaration {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 	},
 	/// A package instance, `package "math" as math;` — instantiates the package the manifest
@@ -1148,13 +1151,13 @@ pub enum Item {
 	/// `pub`, whoever can see this module can also name the package through
 	/// it. Allowed in any module, not just a package's root.
 	PackageInstance {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		/// The raw quoted manifest key, decoded where it is resolved.
 		package: TextSpan,
 		alias: Spanned<SymbolU32>,
 	},
 	Trait {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		/// Supertrait bounds: `trait X: Y + Z { ... }`.  `None` = no bounds.
@@ -1166,7 +1169,7 @@ pub enum Item {
 	/// member: each member must satisfy `A + B`, and a body generic over the
 	/// typeset may rely on those bounds. `None` = no bounds required.
 	TypeSet {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		bounds: Option<BoundId>,
@@ -1175,14 +1178,14 @@ pub enum Item {
 	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
 	/// brings names from another namespace into this one.
 	Use {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		tree: UseTreeId,
 	},
 	/// `type Name = TypeExpr;` or `type Name<T> = TypeExpr;` — a transparent
 	/// alias. `body` is `None` only for a bodiless `#[intrinsic] type Name;`
 	/// declaration (primitives).
 	TypeAlias {
-		pub_span: Option<TextSpan>,
+		pub_at: Option<u32>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
 		body: Option<TypeId>,
@@ -1193,7 +1196,7 @@ pub enum Item {
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct StructField {
-	pub pub_span: Option<TextSpan>,
+	pub pub_at: Option<u32>,
 	/// A binding's `mut` is parsed; what it allows is not checked yet.
 	pub binding: Binding,
 	pub ty: TypeId,
@@ -1793,9 +1796,7 @@ impl AST {
 	pub fn pattern_mut_span(&self, id: PatId) -> Option<TextSpan> {
 		match self.pattern(id) {
 			Pattern::Binding { mutable: true, .. } => {
-				let start = self.pattern_span(id).start;
-				let len = Keyword::Mut.as_str().len() as u32;
-				Some(TextSpan::new(start, start + len))
+				Some(Keyword::Mut.span_at(self.pattern_span(id).start))
 			}
 			_ => None,
 		}
