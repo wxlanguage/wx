@@ -4,7 +4,7 @@
 
 package "alloc" as alloc;
 
-enum FileDescriptor(u8) {
+enum FileDescriptor(value: u8) {
     StdIn = 0,
     StdOut,
     StdErr,

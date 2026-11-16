@@ -5,7 +5,7 @@ memory heap: u32;
 
 // The descriptors every WASI program starts with. The host may hand out
 // others (from `path_open`, say), which this program does not use.
-enum FileDescriptor(u32) {
+enum FileDescriptor(value: u32) {
     StdIn = 0,
     StdOut = 1,
     StdErr = 2,

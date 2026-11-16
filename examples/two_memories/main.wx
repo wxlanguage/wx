@@ -23,7 +23,7 @@ import "host" as host {
 
 memory policy: u32;
 
-enum Verdict(u32) {
+enum Verdict(value: u32) {
     Drop = 0,
     Accept = 1,
     // Wrong version, a header cut short, or a length that disagrees with the

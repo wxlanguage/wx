@@ -30,7 +30,7 @@ func alloc<T: StackValue>() -> heap::*T {
 }
 
 // ── game state ────────────────────────────────────────────────────────────────
-enum Direction(u32) {
+enum Direction(value: u32) {
     Right = 0,
     Down = 1,
     Left = 2,

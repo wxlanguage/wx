@@ -16,7 +16,7 @@ struct Range<Idx>(start: Idx, end: Idx);
 
 struct RangeIter<Idx>(start: Idx, end: Idx);
 
-enum Option(u8) {
+enum Option(value: u8) {
     None = 0,
     Some = 1,
 }
