@@ -120,7 +120,7 @@ pub(crate) fn tokens(
 	};
 	let written = |span: TextSpan| {
 		source
-			.get(span.start as usize..span.end as usize)
+			.get(usize::from(span.start)..usize::from(span.end))
 			.unwrap_or("")
 	};
 
@@ -168,7 +168,7 @@ pub(crate) fn tokens(
 		let Some((kind, modifiers)) = token else {
 			continue;
 		};
-		let position = byte_to_position(files, file, span.start as usize)?;
+		let position = byte_to_position(files, file, usize::from(span.start))?;
 		let delta_line = position.line - line;
 		data.push(SemanticToken {
 			delta_line,

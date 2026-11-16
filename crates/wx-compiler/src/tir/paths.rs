@@ -536,6 +536,7 @@ mod tests {
 	use indoc::indoc;
 
 	use super::*;
+	use crate::diagnostics::TextOffset;
 	use crate::testing::DiagnosticView;
 	use crate::tir::decls::{DeclKind, Declarations};
 	use crate::vfs;
@@ -667,9 +668,11 @@ mod tests {
 				.map(|name| {
 					let span = if let Some(start) = offset {
 						offset = Some(start + name.len() + 2);
-						TextSpan::new(start as u32, (start + name.len()) as u32)
+						TextSpan::from(
+							start as u32..(start + name.len()) as u32,
+						)
 					} else {
-						TextSpan::new(0, 0)
+						TextSpan::empty_at(TextOffset::ZERO)
 					};
 					PathSegment::new(crate::ast::Spanned {
 						inner: self.strings.get_or_intern(name),

@@ -7,7 +7,7 @@ use std::str::FromStr;
 use codespan_reporting::diagnostic::Severity;
 use codespan_reporting::files::Files as _;
 use tower_lsp_server::ls_types::{DiagnosticSeverity, Position, Range, Uri};
-use wx_compiler::diagnostics::SourceSpan;
+use wx_compiler::diagnostics::{SourceSpan, TextOffset};
 use wx_compiler::vfs::{self, FileId};
 
 /// Converts a UTF-16 code unit offset within `line` — the unit LSP's
@@ -57,23 +57,26 @@ pub(crate) fn position_to_offset(
 	files: &vfs::Files,
 	file_id: FileId,
 	position: Position,
-) -> Option<u32> {
+) -> Option<TextOffset> {
 	let line_range = files.line_range(file_id, position.line as usize).ok()?;
 	let source = files.source(file_id).ok()?;
 	let line_text = &source[line_range.clone()];
 	let byte_in_line =
 		utf16_offset_to_byte_offset(line_text, position.character as usize);
-	Some((line_range.start + byte_in_line) as u32)
+	Some(TextOffset::from((line_range.start + byte_in_line) as u32))
 }
 
 pub(crate) fn span_to_range(
 	files: &vfs::Files,
 	source: SourceSpan,
 ) -> Option<Range> {
-	let start =
-		byte_to_position(files, source.file_id, source.span.start as usize)?;
+	let start = byte_to_position(
+		files,
+		source.file_id,
+		usize::from(source.span.start),
+	)?;
 	let end =
-		byte_to_position(files, source.file_id, source.span.end as usize)?;
+		byte_to_position(files, source.file_id, usize::from(source.span.end))?;
 	Some(Range { start, end })
 }
 

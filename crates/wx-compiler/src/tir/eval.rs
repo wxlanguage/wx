@@ -2898,6 +2898,7 @@ mod tests {
 	use super::*;
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::DiagnosticCode;
+	use crate::diagnostics::TextOffset;
 	use crate::testing::DiagnosticView;
 	use crate::tir::decls::{DeclKind, Scope, Tier};
 	use crate::tir::paths::PathResolver;
@@ -2977,7 +2978,7 @@ mod tests {
 			let file_id = self.sema.decls.namespaces.file_id(root.into());
 			let segment = ast::PathSegment::new(Spanned {
 				inner: self.strings.get(name).unwrap(),
-				span: TextSpan::new(0, 0),
+				span: TextSpan::empty_at(TextOffset::ZERO),
 			});
 			let mut scratch = Vec::new();
 			let mut resolutions = NameResolutions::default();

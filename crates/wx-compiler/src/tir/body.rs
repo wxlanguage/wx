@@ -30,7 +30,7 @@ use super::obligations::TypeObligation;
 use super::signatures::Semantics;
 use super::types::{GenericArgs, TypeIndex};
 use crate::ast::{AST, BinaryOp, ExprId, Expression, Spanned, UnaryOp};
-use crate::diagnostics::TextSpan;
+use crate::diagnostics::{TextOffset, TextSpan};
 use crate::index::index_newtype;
 
 index_newtype!(BodyIdx);
@@ -771,7 +771,7 @@ impl Body {
 	/// The innermost scope covering `offset`, if `offset` is in the body. A
 	/// scope is pushed after the one holding it, and siblings do not
 	/// overlap, so it is the last one covering `offset`.
-	fn scope_at(&self, offset: u32) -> Option<ScopeIdx> {
+	fn scope_at(&self, offset: TextOffset) -> Option<ScopeIdx> {
 		self.scopes
 			.iter()
 			.rposition(|scope| {
@@ -784,7 +784,7 @@ impl Body {
 	/// first, each with the locals it declares.
 	fn scopes_from(
 		&self,
-		offset: u32,
+		offset: TextOffset,
 	) -> impl Iterator<Item = (Scope, impl Iterator<Item = LocalIdx>)> + '_ {
 		std::iter::successors(self.scope_at(offset), |&at| {
 			self.scope(at).parent
@@ -802,7 +802,7 @@ impl Body {
 	/// locals of the scopes around it are out of reach, since using one is
 	/// an error (E2140), so they are left out. Empty when `offset` is not
 	/// in the body.
-	pub fn locals_at(&self, offset: u32) -> Vec<LocalIdx> {
+	pub fn locals_at(&self, offset: TextOffset) -> Vec<LocalIdx> {
 		let mut found: Vec<LocalIdx> = Vec::new();
 		for (scope, locals) in self.scopes_from(offset) {
 			for local in locals {
@@ -827,7 +827,7 @@ impl Body {
 	/// hides an item of its name.
 	pub fn local_named_at(
 		&self,
-		offset: u32,
+		offset: TextOffset,
 		name: SymbolU32,
 	) -> Option<LocalIdx> {
 		self.scopes_from(offset)
@@ -838,7 +838,7 @@ impl Body {
 	/// The labels a `break` or `continue` written at `offset` can name: for
 	/// each name, the one its lookup finds there (`jump_target`), innermost
 	/// first, with what it is written on.
-	pub fn labels_at(&self, offset: u32) -> Vec<(LabelIdx, LabelKind)> {
+	pub fn labels_at(&self, offset: TextOffset) -> Vec<(LabelIdx, LabelKind)> {
 		let mut found: Vec<(LabelIdx, LabelKind)> = Vec::new();
 		for (scope, _) in self.scopes_from(offset) {
 			let Some(label) = scope.label else {
@@ -1185,11 +1185,11 @@ mod tests {
 				.find(&format!("// {mark}"))
 				.unwrap_or_else(|| panic!("no `// {mark}`"));
 			let body = self.body(function);
-			body.locals_at(offset as u32)
+			body.locals_at(TextOffset::from(offset as u32))
 				.into_iter()
 				.map(|local| {
 					let name = body.local(local).name;
-					let line = self.source[..name.span.start as usize]
+					let line = self.source[..usize::from(name.span.start)]
 						.matches('\n')
 						.count() + 1;
 					format!(
@@ -1268,7 +1268,7 @@ mod tests {
 				body.local_named_at(span.span.start, name),
 				Some(local),
 				"`local_named_at` at {}",
-				case.source[span.span.start as usize..]
+				case.source[usize::from(span.span.start)..]
 					.lines()
 					.next()
 					.unwrap()
@@ -1277,7 +1277,7 @@ mod tests {
 				same_name,
 				[local],
 				"at {}",
-				case.source[span.span.start as usize..]
+				case.source[usize::from(span.span.start)..]
 					.lines()
 					.next()
 					.unwrap()
@@ -1301,7 +1301,7 @@ mod tests {
 			found.next().unwrap_or_else(|| panic!("no `{written}`"));
 		assert!(found.next().is_none(), "`{written}` is written twice");
 		let start = start as u32;
-		let span = TextSpan::new(start, start + object.len() as u32);
+		let span = TextSpan::from(start..start + object.len() as u32);
 		let ast = case.graph.ast(case.file);
 		// The outermost one written there: a child comes before its parent.
 		let expr = ast
@@ -1621,7 +1621,7 @@ mod tests {
 		"};
 		let case = Case::new(source);
 		let body = case.body("f");
-		let at = source.find("[x]").unwrap() as u32 + 1;
+		let at = TextOffset::from(source.find("[x]").unwrap() as u32 + 1);
 		assert!(body.locals_at(at).is_empty());
 		let found =
 			body.local_named_at(at, body.local(LocalIdx::new(0)).name.inner);
@@ -1647,7 +1647,7 @@ mod tests {
 	fn labels(case: &Case, function: &str, mark: &str) -> Vec<String> {
 		let offset = case.source.find(&format!("// {mark}")).unwrap();
 		let body = case.body(function);
-		body.labels_at(offset as u32)
+		body.labels_at(TextOffset::from(offset as u32))
 			.into_iter()
 			.map(|(label, kind)| {
 				let name = case.strings.resolve(body.label(label).name.inner);

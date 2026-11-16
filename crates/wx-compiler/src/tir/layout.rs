@@ -619,6 +619,7 @@ mod tests {
 
 	use super::*;
 	use crate::ast::{self, Spanned, StringInterner};
+	use crate::diagnostics::TextOffset;
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
 	use crate::tir::decls::{DeclKind, FunctionIdx, Scope, Tier};
@@ -661,7 +662,7 @@ mod tests {
 					.strings
 					.get(name)
 					.expect("already interned from source"),
-				span: TextSpan::new(0, 0),
+				span: TextSpan::empty_at(TextOffset::ZERO),
 			});
 			let mut scratch = Vec::new();
 			let mut resolutions = NameResolutions::default();

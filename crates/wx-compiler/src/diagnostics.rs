@@ -269,28 +269,123 @@ define_diagnostic_codes! {
 	}
 }
 
+/// A byte position in a file's text. A length is a plain `u32`: an offset
+/// plus a length is an offset, and an offset minus an offset is a length.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(
+	any(debug_assertions, test),
+	derive(Debug, serde::Serialize),
+	serde(transparent)
+)]
+pub struct TextOffset(u32);
+
+impl TextOffset {
+	pub const ZERO: TextOffset = TextOffset(0);
+}
+
+impl From<u32> for TextOffset {
+	fn from(offset: u32) -> Self {
+		TextOffset(offset)
+	}
+}
+
+impl From<TextOffset> for u32 {
+	fn from(offset: TextOffset) -> Self {
+		offset.0
+	}
+}
+
+impl core::fmt::Display for TextOffset {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+impl From<TextOffset> for usize {
+	fn from(offset: TextOffset) -> Self {
+		offset.0 as usize
+	}
+}
+
+impl core::ops::Add<u32> for TextOffset {
+	type Output = TextOffset;
+
+	fn add(self, len: u32) -> TextOffset {
+		TextOffset(self.0 + len)
+	}
+}
+
+impl core::ops::AddAssign<u32> for TextOffset {
+	fn add_assign(&mut self, len: u32) {
+		self.0 += len;
+	}
+}
+
+impl core::ops::Sub<u32> for TextOffset {
+	type Output = TextOffset;
+
+	fn sub(self, len: u32) -> TextOffset {
+		TextOffset(self.0 - len)
+	}
+}
+
+/// The length between two offsets.
+impl core::ops::Sub for TextOffset {
+	type Output = u32;
+
+	fn sub(self, start: TextOffset) -> u32 {
+		self.0 - start.0
+	}
+}
+
+/// A run of a file's text, from `start` up to, not including, `end`.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct TextSpan {
-	pub start: u32,
-	pub end: u32,
+	pub start: TextOffset,
+	pub end: TextOffset,
 }
 
 impl TextSpan {
-	pub fn new(start: u32, end: u32) -> TextSpan {
+	pub fn new(start: TextOffset, end: TextOffset) -> TextSpan {
 		debug_assert!(end >= start);
 		TextSpan { start, end }
 	}
 
+	/// The empty span at `at`: where something not written would go.
+	pub fn empty_at(at: TextOffset) -> TextSpan {
+		TextSpan { start: at, end: at }
+	}
+
+	pub fn len(self) -> u32 {
+		self.end - self.start
+	}
+
+	pub fn is_empty(self) -> bool {
+		self.start == self.end
+	}
+
+	pub fn contains(self, offset: TextOffset) -> bool {
+		self.start <= offset && offset < self.end
+	}
+
 	#[inline]
 	pub fn extract_str<'a>(&self, source: &'a str) -> &'a str {
-		&source[self.start as usize..self.end as usize]
+		&source[usize::from(self.start)..usize::from(self.end)]
+	}
+}
+
+/// A span written as numbers, `TextSpan::from(3..5)`: a test's, or a
+/// position computed from text found in a source.
+impl From<core::ops::Range<u32>> for TextSpan {
+	fn from(range: core::ops::Range<u32>) -> Self {
+		TextSpan::new(range.start.into(), range.end.into())
 	}
 }
 
 impl From<TextSpan> for core::ops::Range<usize> {
 	fn from(val: TextSpan) -> Self {
-		val.start as usize..val.end as usize
+		usize::from(val.start)..usize::from(val.end)
 	}
 }
 

@@ -1959,7 +1959,7 @@ impl IntrinsicDefs {
 mod tests {
 	use super::*;
 	use crate::ast::{Keyword, Ownership};
-	use crate::diagnostics::TextSpan;
+	use crate::diagnostics::{TextOffset, TextSpan};
 
 	#[test]
 	fn types_meet_where_the_unknown_parts_give_way() {
@@ -2081,7 +2081,7 @@ mod tests {
 		let mut envs = GenericEnvArena::new();
 		let name = Spanned {
 			inner: Keyword::SelfPascal.symbol(),
-			span: TextSpan::new(0, 0),
+			span: TextSpan::empty_at(TextOffset::ZERO),
 		};
 		for count in [2, 1] {
 			envs.push_param_frame(

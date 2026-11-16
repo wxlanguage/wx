@@ -347,7 +347,8 @@ fn position_conversion_handles_non_ascii_lines() {
 	let file = file_id_for(snapshot, &root);
 	let files = &snapshot.compilation.files;
 
-	let offset = position_to_offset(files, file, position).unwrap() as usize;
+	let offset =
+		usize::from(position_to_offset(files, file, position).unwrap());
 	assert_eq!(offset, al_byte_offset);
 	assert!(source.is_char_boundary(offset));
 	// Round-tripping recovers the UTF-16 count, not a byte count.

@@ -6,6 +6,7 @@
 
 use string_interner::symbol::SymbolU32;
 use wx_compiler::ast::{Keyword, Spanned, StringInterner};
+use wx_compiler::diagnostics::TextOffset;
 use wx_compiler::tir::{
 	AssocTypeIdx, ConstIdx, ConstScalar, DeclKind, Definition, FieldIdx,
 	FieldOwner, FunctionIdx, GenericEnvIdx, GenericEnvOwner, MemberKind,
@@ -549,10 +550,10 @@ pub(crate) fn documentation(
 /// `name_offset`, skipping attribute lines between them.
 pub(crate) fn leading_doc_comment(
 	source: &str,
-	name_offset: u32,
+	name_offset: TextOffset,
 ) -> Option<String> {
 	let mut doc_lines = Vec::new();
-	let mut line_start = source[..name_offset as usize]
+	let mut line_start = source[..usize::from(name_offset)]
 		.rfind('\n')
 		.map_or(0, |i| i + 1);
 	while line_start > 0 {

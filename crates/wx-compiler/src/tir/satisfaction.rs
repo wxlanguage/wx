@@ -953,6 +953,7 @@ mod tests {
 
 	use super::*;
 	use crate::ast::{self, Spanned};
+	use crate::diagnostics::TextOffset;
 	use crate::diagnostics::TextSpan;
 	use crate::tir::decls::{DeclKind, Scope, Tier};
 	use crate::tir::paths::PathResolver;
@@ -988,7 +989,7 @@ mod tests {
 							.strings
 							.get(segment)
 							.expect("already interned from source"),
-						span: TextSpan::new(0, 0),
+						span: TextSpan::empty_at(TextOffset::ZERO),
 					})
 				})
 				.collect();

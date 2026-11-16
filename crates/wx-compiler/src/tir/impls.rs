@@ -9,7 +9,7 @@ use string_interner::symbol::SymbolU32;
 
 use crate::{
 	ast::{self, Spanned, StringInterner},
-	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
+	diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan},
 	tir::decls::{EnumIdx, FunctionIdx, GlobalIdx, MemoryIdx, StructIdx},
 	vfs::FileId,
 };
@@ -540,7 +540,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		&mut self,
 		global_index: GlobalIdx,
 		name_span: TextSpan,
-		mut_at: Option<u32>,
+		mut_at: Option<TextOffset>,
 		file_id: FileId,
 	) {
 		let decls = self.decls;

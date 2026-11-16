@@ -7,7 +7,7 @@ use codespan_reporting::files;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast;
-use crate::diagnostics::{DiagnosticCode, SourceSpan};
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset};
 use crate::symbols::StringInterner;
 
 mod manifest;
@@ -299,7 +299,7 @@ pub struct ModuleDeclaration {
 	pub name: ast::Spanned<SymbolU32>,
 	/// Whether the declaration was `pub`. Independently optional — a
 	/// declaration that exists but isn't `pub` is a normal, valid state.
-	pub pub_at: Option<u32>,
+	pub pub_at: Option<TextOffset>,
 }
 
 pub struct SourceModule {

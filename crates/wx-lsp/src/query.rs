@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use string_interner::symbol::SymbolU32;
-use wx_compiler::diagnostics::{SourceSpan, TextSpan};
+use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
 use wx_compiler::tir::{
 	BodyOwner, ConstIdx, DeclKind, Definition, EnumIdx, FieldIdx, FieldOwner,
 	FunctionIdx, GlobalIdx, InherentImplIdx, LabelIdx, LocalIdx, MemberKind,
@@ -34,13 +34,13 @@ fn priority(site: Site) -> u8 {
 pub(crate) fn symbol_at(
 	sema: &Semantics,
 	file: FileId,
-	offset: u32,
+	offset: TextOffset,
 ) -> Option<(SourceSpan, Reference)> {
 	let probe = Site::Label(SourceSpan::new(
 		file,
 		TextSpan {
 			start: offset,
-			end: u32::MAX,
+			end: TextOffset::from(u32::MAX),
 		},
 	));
 	let mut found: Option<(SourceSpan, Site, Reference)> = None;
@@ -72,7 +72,7 @@ pub(crate) fn resolutions_in(
 ) -> impl Iterator<Item = (SourceSpan, Reference)> + '_ {
 	// The least site of `file`: the empty span at its start, first role.
 	let start =
-		Site::Type(SourceSpan::new(file, TextSpan { start: 0, end: 0 }));
+		Site::Type(SourceSpan::new(file, TextSpan::empty_at(TextOffset::ZERO)));
 	let mut entries = sema
 		.resolutions
 		.by_site
@@ -206,7 +206,7 @@ pub(crate) fn definition_target(
 		if module.own_file != sema.decls.file_id(module.loc) {
 			return Some(SourceSpan::new(
 				module.own_file,
-				TextSpan { start: 0, end: 0 },
+				TextSpan::empty_at(TextOffset::ZERO),
 			));
 		}
 	}
@@ -445,7 +445,7 @@ mod tests {
 				+ context.find(name).unwrap();
 			SourceSpan::new(
 				self.file,
-				TextSpan::new(start as u32, (start + name.len()) as u32),
+				TextSpan::from(start as u32..(start + name.len()) as u32),
 			)
 		}
 
@@ -498,7 +498,7 @@ mod tests {
 		}
 
 		/// What go-to-definition from `offset` reaches.
-		fn definition_at(&self, offset: u32) -> Option<SourceSpan> {
+		fn definition_at(&self, offset: TextOffset) -> Option<SourceSpan> {
 			let (_, reference) = symbol_at(&self.sema, self.file, offset)?;
 			definition_target(&self.sema, reference.definition())
 		}
@@ -664,7 +664,7 @@ mod tests {
 			let length = self.source[start as usize..]
 				.find(|c: char| !c.is_alphanumeric() && c != '_')
 				.unwrap_or(self.source.len() - start as usize);
-			TextSpan::new(start, start + length as u32)
+			TextSpan::from(start..start + length as u32)
 		}
 
 		/// Asserts that the cursor on the name marked `used` (at its start,
@@ -742,9 +742,12 @@ mod tests {
 	fn definition_at_is_none_away_from_a_resolved_name() {
 		let source = "func f() { local x = 1; }";
 		let analysis = Analysis::new(source);
-		let keyword = source.find("local").unwrap() as u32;
+		let keyword = TextOffset::from(source.find("local").unwrap() as u32);
 		assert_eq!(analysis.definition_at(keyword), None);
-		assert_eq!(analysis.definition_at(source.len() as u32 + 5), None);
+		assert_eq!(
+			analysis.definition_at(TextOffset::from(source.len() as u32 + 5)),
+			None
+		);
 	}
 
 	#[test]

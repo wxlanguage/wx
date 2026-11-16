@@ -2106,6 +2106,7 @@ mod tests {
 
 	use super::*;
 	use crate::ast::{ExprId, Expression};
+	use crate::diagnostics::TextOffset;
 	use crate::tir::body::ScopeIdx;
 	use crate::tir::resolutions::Definition;
 	use crate::tir::signatures::tests::source_graph;
@@ -2146,7 +2147,7 @@ mod tests {
 
 		/// The body of the function in this file whose block holds
 		/// `offset`.
-		fn owner_at(&self, offset: u32) -> BodyOwner {
+		fn owner_at(&self, offset: TextOffset) -> BodyOwner {
 			let decls = &self.sema.decls;
 			(0..decls.functions.len())
 				.map(|index| FunctionIdx::new(index as u32))
@@ -2188,7 +2189,7 @@ mod tests {
 				found.next().unwrap_or_else(|| panic!("no `{written}`"));
 			assert!(found.next().is_none(), "`{written}` is written twice");
 			let dot = written.rfind('.').expect("an access");
-			let span = TextSpan::new(start as u32, (start + dot) as u32);
+			let span = TextSpan::from(start as u32..(start + dot) as u32);
 			let ast = self.graph.ast(self.file);
 			let object = ast
 				.exprs
@@ -2330,7 +2331,9 @@ mod tests {
 	#[test]
 	fn a_receiver_without_a_type_is_offered_nothing() {
 		let mut case = Case::new("func g() {}\n");
-		let owner = case.owner_at(case.source.find('{').unwrap() as u32 + 1);
+		let owner = case.owner_at(TextOffset::from(
+			case.source.find('{').unwrap() as u32 + 1,
+		));
 		assert!(
 			case.sema
 				.member_names(&case.strings, owner, TypeIndex::CONST_INT)
@@ -2379,7 +2382,7 @@ mod tests {
 		/// `prefix` written at `offset` resolved to.
 		fn offered_after_type(
 			&mut self,
-			offset: u32,
+			offset: TextOffset,
 			prefix: Definition,
 		) -> Vec<(SymbolU32, Definition)> {
 			let BodyOwner::Function(function) = self.owner_at(offset) else {
@@ -2453,7 +2456,8 @@ mod tests {
 	fn a_type_is_offered_its_members() {
 		let mut case = Case::new(TYPE_PATHS);
 		let names = |case: &mut Case<'_>, written: &str| {
-			let offset = case.source.find(written).unwrap() as u32;
+			let offset =
+				TextOffset::from(case.source.find(written).unwrap() as u32);
 			let site = Site::Type(SourceSpan::new(
 				case.file,
 				TextSpan::new(

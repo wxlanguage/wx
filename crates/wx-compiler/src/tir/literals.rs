@@ -12,7 +12,7 @@ use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{GenericEnvOwner, Substitution, Type, TypeIndex};
 use crate::ast::{Spanned, StringInterner, UnaryOp};
 use crate::{
-	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
+	diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan},
 	vfs::FileId,
 };
 
@@ -35,8 +35,8 @@ impl StringLiteralError {
 		let reference = SourceSpan::new(
 			literal.file_id,
 			TextSpan::new(
-				literal.span.start + self.span.start,
-				literal.span.start + self.span.end,
+				literal.span.start + u32::from(self.span.start),
+				literal.span.start + u32::from(self.span.end),
 			),
 		);
 		let (code, message, label) = match self.kind {
@@ -66,7 +66,10 @@ pub fn unescape_string_literal(
 ) -> Result<Cow<'_, str>, StringLiteralError> {
 	let unterminated = || StringLiteralError {
 		kind: StringLiteralErrorKind::Unterminated,
-		span: TextSpan::new(0, source.len() as u32),
+		span: TextSpan::new(
+			TextOffset::ZERO,
+			TextOffset::from(source.len() as u32),
+		),
 	};
 	let mut chars = source.char_indices();
 	if chars.next() != Some((0, '"')) {
@@ -97,8 +100,10 @@ pub fn unescape_string_literal(
 						return Err(StringLiteralError {
 							kind: StringLiteralErrorKind::UnknownEscape(ch),
 							span: TextSpan::new(
-								escape_offset as u32,
-								(escape_offset + ch.len_utf8()) as u32,
+								TextOffset::from(escape_offset as u32),
+								TextOffset::from(
+									(escape_offset + ch.len_utf8()) as u32,
+								),
 							),
 						});
 					}
@@ -150,7 +155,7 @@ mod tests {
 		] {
 			let error = unescape_string_literal(source).unwrap_err();
 			assert_eq!(error.kind, StringLiteralErrorKind::UnknownEscape(ch));
-			assert_eq!(error.span, TextSpan::new(start, end));
+			assert_eq!(error.span, TextSpan::from(start..end));
 		}
 	}
 
@@ -159,7 +164,7 @@ mod tests {
 		for source in ["\"", "\"text", "\"text\\", r#""text\""#, "not quoted"] {
 			let error = unescape_string_literal(source).unwrap_err();
 			assert_eq!(error.kind, StringLiteralErrorKind::Unterminated);
-			assert_eq!(error.span, TextSpan::new(0, source.len() as u32));
+			assert_eq!(error.span, TextSpan::from(0..source.len() as u32));
 		}
 	}
 }

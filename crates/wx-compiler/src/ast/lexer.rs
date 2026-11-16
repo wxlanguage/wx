@@ -2,7 +2,7 @@
 //! characters are recorded on the side and never reach the parser.
 
 use super::{Comment, CommentKind, Keyword, Spanned};
-use crate::diagnostics::TextSpan;
+use crate::diagnostics::{TextOffset, TextSpan};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
@@ -178,8 +178,9 @@ impl<'src> Lexer<'src> {
 	}
 
 	/// Current byte offset into the source.
-	pub(super) fn offset(&self) -> usize {
-		self.source.len() - self.chars.as_str().len()
+	pub(super) fn offset(&self) -> TextOffset {
+		let offset = self.source.len() - self.chars.as_str().len();
+		TextOffset::from(u32::try_from(offset).unwrap())
 	}
 
 	pub(super) fn peek(&mut self) -> Spanned<Token> {
@@ -284,7 +285,7 @@ impl<'src> Lexer<'src> {
 		}
 		self.chars = cursor;
 
-		let start = self.offset() as u32;
+		let start = self.offset();
 		let token = match self.chars.next().unwrap_or(EOF) {
 			// Patterns are ordered by frequency of occurrence in typical source code
 			// Most Frequent
@@ -326,7 +327,7 @@ impl<'src> Lexer<'src> {
 			'\0' => Token::Eof,
 			_ => Token::Unknown,
 		};
-		let span = TextSpan::new(start, self.offset() as u32);
+		let span = TextSpan::new(start, self.offset());
 
 		Spanned { inner: token, span }
 	}
@@ -499,11 +500,11 @@ impl<'src> Lexer<'src> {
 
 	/// An identifier, or the keyword it spells.
 	#[inline]
-	pub(super) fn consume_word(&mut self, start: u32) -> Token {
+	pub(super) fn consume_word(&mut self, start: TextOffset) -> Token {
 		self.eat_while(
 			|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'),
 		);
-		let word = &self.source[start as usize..self.offset()];
+		let word = TextSpan::new(start, self.offset()).extract_str(self.source);
 		Keyword::try_from(word).map_or(Token::Identifier, Token::Keyword)
 	}
 

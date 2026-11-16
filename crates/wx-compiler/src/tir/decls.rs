@@ -13,7 +13,7 @@ use string_interner::symbol::SymbolU32;
 
 use crate::{
 	ast::{self, Keyword, Spanned, StringInterner},
-	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
+	diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan},
 	index::index_newtype,
 	small_vec::SmallVec,
 	tir::{
@@ -134,7 +134,7 @@ pub enum UseItemKind {
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct UseItemDecl {
 	pub namespace: Scope,
-	pub pub_at: Option<u32>,
+	pub pub_at: Option<TextOffset>,
 	pub kind: UseItemKind,
 }
 
@@ -1412,8 +1412,8 @@ pub enum Visibility {
 }
 
 /// From where a `pub` starts, if one is written (`pub_at`).
-impl From<Option<u32>> for Visibility {
-	fn from(value: Option<u32>) -> Self {
+impl From<Option<TextOffset>> for Visibility {
+	fn from(value: Option<TextOffset>) -> Self {
 		match value {
 			Some(_) => Visibility::Public,
 			None => Visibility::Private,
@@ -2765,7 +2765,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				DeclKind::Package(package.id),
 				Spanned {
 					inner: Keyword::Package.symbol(),
-					span: TextSpan::new(0, 0),
+					span: TextSpan::empty_at(TextOffset::ZERO),
 				},
 				Visibility::Private,
 			));
@@ -3547,7 +3547,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		package: TextSpan,
 		alias: Spanned<SymbolU32>,
 	) {
@@ -3632,7 +3632,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		parent: Scope,
 		own_file: FileId,
 		name: Spanned<SymbolU32>,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 	) -> ModuleIdx {
 		let index = ModuleIdx::new(u32::try_from(self.modules.len()).unwrap());
 		let package_id = self.namespaces.scope(parent).package_id;
@@ -5203,7 +5203,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		namespace: Scope,
 		tree: ast::UseTreeId,
 		parent_segment: Option<UsePathIndex>,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 	) {
 		let ast = self.ast(file_id);
 		self.scan_use_node(
@@ -5224,7 +5224,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		namespace: Scope,
 		tree: Spanned<ast::UseTree>,
 		parent_segment: Option<UsePathIndex>,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 	) {
 		match &tree.inner {
 			ast::UseTree::Name { segment, alias } => {
@@ -5780,7 +5780,7 @@ mod tests {
 				.map(|segment| {
 					ast::PathSegment::new(Spanned {
 						inner: self.strings.get_or_intern(segment),
-						span: TextSpan::new(0, 0),
+						span: TextSpan::empty_at(TextOffset::ZERO),
 					})
 				})
 				.collect();
@@ -6194,7 +6194,7 @@ mod tests {
 		let mut case = TestCase::new(source);
 		let at = |text: &str| {
 			let start = u32::try_from(source.find(text).unwrap()).unwrap();
-			TextSpan::new(start, start + u32::try_from(text.len()).unwrap())
+			TextSpan::from(start..start + u32::try_from(text.len()).unwrap())
 		};
 		let mut entry = |path: &str| {
 			let loc = case.resolve(Tier::Value, path).target().loc().unwrap();
@@ -6379,7 +6379,7 @@ mod tests {
 			let row = namespaces.item(own);
 			assert_eq!(row.kind, DeclKind::Package(package.package_id));
 			assert_eq!(row.name.inner, Keyword::Package.symbol());
-			assert_eq!(row.name.span, TextSpan::new(0, 0));
+			assert_eq!(row.name.span, TextSpan::empty_at(TextOffset::ZERO));
 		}
 		// The user's members, generated rows and import entries are rows of
 		// the scope they are written in, under their own names.
@@ -7983,7 +7983,9 @@ mod tests {
 				.map(|label| label.range.clone())
 				.collect();
 			assert!(
-				ranges.contains(&(alias.start as usize..alias.end as usize)),
+				ranges.contains(
+					&(usize::from(alias.start)..usize::from(alias.end))
+				),
 				"{source}: no label on the crate alias, got {ranges:?}"
 			);
 		}

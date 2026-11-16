@@ -5,7 +5,7 @@
 
 use string_interner::symbol::{Symbol, SymbolU32};
 
-use crate::diagnostics::TextSpan;
+use crate::diagnostics::{TextOffset, TextSpan};
 
 macro_rules! define_keywords {
 	(
@@ -131,7 +131,7 @@ impl Keyword {
 	/// The span of this keyword written starting `at`. A syntax node keeps
 	/// only where a keyword starts (`pub_at`, `mut_at`, `const_at`, ...): its
 	/// text is fixed, so the rest of its span is known.
-	pub fn span_at(self, at: u32) -> TextSpan {
+	pub fn span_at(self, at: TextOffset) -> TextSpan {
 		TextSpan::new(at, at + self.as_str().len() as u32)
 	}
 }

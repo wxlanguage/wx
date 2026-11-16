@@ -10,7 +10,11 @@ pub use crate::symbols::{Keyword, StringInterner};
 
 use std::marker::PhantomData;
 
-use crate::{diagnostics::TextSpan, index::index_newtype, vfs::FileId};
+use crate::{
+	diagnostics::{TextOffset, TextSpan},
+	index::index_newtype,
+	vfs::FileId,
+};
 
 mod lexer;
 mod parser;
@@ -49,7 +53,7 @@ pub struct Parsed {
 
 impl CommentMap {
 	/// Returns all comments whose spans fall entirely within `[start, end)`.
-	pub fn between(&self, start: u32, end: u32) -> &[Comment] {
+	pub fn between(&self, start: TextOffset, end: TextOffset) -> &[Comment] {
 		let lo = self.0.partition_point(|c| c.span.end <= start);
 		let hi = self.0.partition_point(|c| c.span.start < end);
 		&self.0[lo..hi]
@@ -200,7 +204,7 @@ pub enum Expression {
 	/// ([`AST::operator_span`]).
 	Binary {
 		operator: BinaryOp,
-		operator_start: u32,
+		operator_start: TextOffset,
 		left: ExprId,
 		right: ExprId,
 	},
@@ -212,7 +216,7 @@ pub enum Expression {
 	Call {
 		callee: ExprId,
 		arguments: List<ExprId>,
-		open: u32,
+		open: TextOffset,
 	},
 	/// `{expr}({ x: a, y })`: the same, naming each parameter (or field).
 	/// The named list is the call's only argument, spanned by its braces.
@@ -395,7 +399,7 @@ impl PathSegment {
 	/// The name a member access or a path is missing (`x.` or `a::`, with no
 	/// name after it): the error symbol, at the empty span right after the
 	/// `.` or `::`. The parser has reported it, so a lookup of it is silent.
-	fn missing(at: u32) -> Self {
+	fn missing(at: TextOffset) -> Self {
 		Self::new(Spanned {
 			inner: Keyword::Error.symbol(),
 			span: TextSpan::new(at, at),
@@ -447,7 +451,7 @@ pub enum BoundExpression {
 		path: List<PathSegment>,
 		bindings: List<AssocBinding>,
 		/// Where the `{` is; the bound's span ends at the `}`.
-		open_brace: u32,
+		open_brace: TextOffset,
 	},
 	/// `Bound1 + Bound2 + Bound3` — multiple bounds joined by `+`.
 	BoundList(List<BoundId>),
@@ -477,7 +481,7 @@ pub enum TypeParam {
 	},
 	/// `const N: Type`, a constant of type `ty`.
 	Const {
-		const_at: u32,
+		const_at: TextOffset,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 	},
@@ -555,9 +559,12 @@ pub enum AssocBindingKind {
 	Bound(BoundId),
 	/// `const LEN: u32` — the constant's value must be representable as this
 	/// type.
-	ConstRepresentable { const_at: u32, ty: TypeId },
+	ConstRepresentable { const_at: TextOffset, ty: TypeId },
 	/// `const LEN = 4` — the constant must have this value.
-	ConstEquals { const_at: u32, value: ConstId },
+	ConstEquals {
+		const_at: TextOffset,
+		value: ConstId,
+	},
 }
 
 /// `*T` = exclusive pointer/slice/array, `&T` = shared, always read-only.
@@ -690,7 +697,7 @@ pub enum Destructure {
 	NamedStruct {
 		path: List<PathSegment>,
 		fields: List<PatternFieldItem>,
-		open_brace: u32,
+		open_brace: TextOffset,
 	},
 }
 
@@ -702,7 +709,7 @@ pub enum Destructure {
 pub enum PatternElement {
 	Pattern(PatId),
 	/// `..`, starting here ([`rest_span`]).
-	Rest(u32),
+	Rest(TextOffset),
 }
 
 /// One entry of a named list, exactly as written; see [`PatternElement`].
@@ -711,7 +718,7 @@ pub enum PatternElement {
 pub enum PatternFieldItem {
 	Field(PatternField),
 	/// `..`, starting here ([`rest_span`]).
-	Rest(u32),
+	Rest(TextOffset),
 }
 
 #[derive(Clone, Copy)]
@@ -763,7 +770,7 @@ pub enum Statement {
 
 /// The span of a `..` rest written starting `at`: [`Keyword::span_at`] for
 /// the one fixed token that is not a keyword.
-pub fn rest_span(at: u32) -> TextSpan {
+pub fn rest_span(at: TextOffset) -> TextSpan {
 	TextSpan::new(at, at + 2)
 }
 
@@ -774,7 +781,7 @@ pub fn rest_span(at: u32) -> TextSpan {
 /// of its item's interface (a call or a construction by name, `.name`), and
 /// a value is dropped with the `_` pattern instead.
 pub struct Binding {
-	pub mut_at: Option<u32>,
+	pub mut_at: Option<TextOffset>,
 	pub name: Spanned<SymbolU32>,
 }
 
@@ -783,7 +790,7 @@ impl Binding {
 	/// the error symbol, at the empty span where the name goes. The parser
 	/// has reported it, so the slot is kept, unnamed, and nothing reports it
 	/// again.
-	pub fn missing(mut_at: Option<u32>, at: u32) -> Self {
+	pub fn missing(mut_at: Option<TextOffset>, at: TextOffset) -> Self {
 		Self {
 			mut_at,
 			name: Spanned {
@@ -835,13 +842,13 @@ pub enum ImplItem {
 	/// A method or associated function — TIR distinguishes the two after
 	/// parsing, by checking whether the first param is named `self`.
 	Function {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 		block: BlockId,
 	},
 	Constant {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
@@ -852,7 +859,7 @@ pub enum ImplItem {
 		/// a trait impl, where visibility comes from the trait. Recorded
 		/// anyway so the qualifier can be reported and round-tripped:
 		/// dropping it here made the formatter delete `pub` from the source.
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 		attributes: List<Attribute>,
@@ -996,7 +1003,7 @@ pub enum ImportDeclaration {
 		signature: FunctionSignature,
 	},
 	Global {
-		mut_at: Option<u32>,
+		mut_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 	},
@@ -1017,7 +1024,7 @@ pub enum ImportEntry {
 	},
 	/// A source-level import/re-export, not an entity imported from the host.
 	Use {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		tree: UseTreeId,
 	},
 }
@@ -1033,40 +1040,40 @@ pub struct EnumVariant {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum Item {
 	Function {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 		block: BlockId,
 	},
 	FunctionDeclaration {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 	},
 	/// A package contract member whose implementation is supplied externally.
 	PackageFunction {
-		pub_at: Option<u32>,
-		package_at: u32,
+		pub_at: Option<TextOffset>,
+		package_at: TextOffset,
 		attributes: List<Attribute>,
 		signature: FunctionSignature,
 	},
 	PackageConst {
-		pub_at: Option<u32>,
-		package_at: u32,
+		pub_at: Option<TextOffset>,
+		package_at: TextOffset,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		ty: TypeId,
 	},
 	PackageType {
-		pub_at: Option<u32>,
-		package_at: u32,
+		pub_at: Option<TextOffset>,
+		package_at: TextOffset,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
 	},
 	Global {
-		pub_at: Option<u32>,
-		mut_at: Option<u32>,
+		pub_at: Option<TextOffset>,
+		mut_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
@@ -1077,7 +1084,7 @@ pub enum Item {
 	},
 	ExportBlock {
 		/// Where the `export` keyword starts.
-		export_at: u32,
+		export_at: TextOffset,
 		entries: List<ExportEntry>,
 	},
 	Import {
@@ -1088,7 +1095,7 @@ pub enum Item {
 		braces: TextSpan,
 	},
 	Enum {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		/// The repr, written as a struct's fields: `(i8)`, `(pub value: i8)`.
 		/// Empty when no parentheses are written. Several fields are a wider
 		/// repr, parsed for the day it is implemented.
@@ -1116,34 +1123,34 @@ pub enum Item {
 	/// `pub`; a struct is constructed by a call, by position always and by
 	/// name when every field has one.
 	Struct {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
 		fields: List<StructField>,
 	},
 	Memory {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		size: TypeId,
 	},
 	Const {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		ty: Option<TypeId>,
 		value: ExprId,
 		attributes: List<Attribute>,
 	},
 	Module {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		items: List<Item>,
 		/// The braces, `{` through `}`.
 		braces: TextSpan,
 	},
 	ModuleDeclaration {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 	},
 	/// A package instance, `package "math" as math;` — instantiates the package the manifest
@@ -1151,13 +1158,13 @@ pub enum Item {
 	/// `pub`, whoever can see this module can also name the package through
 	/// it. Allowed in any module, not just a package's root.
 	PackageInstance {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		/// The raw quoted manifest key, decoded where it is resolved.
 		package: TextSpan,
 		alias: Spanned<SymbolU32>,
 	},
 	Trait {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		/// Supertrait bounds: `trait X: Y + Z { ... }`.  `None` = no bounds.
@@ -1169,7 +1176,7 @@ pub enum Item {
 	/// member: each member must satisfy `A + B`, and a body generic over the
 	/// typeset may rely on those bounds. `None` = no bounds required.
 	TypeSet {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		bounds: Option<BoundId>,
@@ -1178,14 +1185,14 @@ pub enum Item {
 	/// `use math::add;`, `use math::*;`, `use math::{trig::sin, ops::*};` —
 	/// brings names from another namespace into this one.
 	Use {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		tree: UseTreeId,
 	},
 	/// `type Name = TypeExpr;` or `type Name<T> = TypeExpr;` — a transparent
 	/// alias. `body` is `None` only for a bodiless `#[intrinsic] type Name;`
 	/// declaration (primitives).
 	TypeAlias {
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
 		body: Option<TypeId>,
@@ -1196,7 +1203,7 @@ pub enum Item {
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct StructField {
-	pub pub_at: Option<u32>,
+	pub pub_at: Option<TextOffset>,
 	/// A binding's `mut` is parsed; what it allows is not checked yet.
 	pub binding: Binding,
 	pub ty: TypeId,

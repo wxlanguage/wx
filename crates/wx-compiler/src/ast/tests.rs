@@ -1323,7 +1323,7 @@ fn a_named_argument_with_no_value_keeps_its_name() {
 	let value = (arguments[0].value)
 		.expect("the value is kept, not read as a shorthand");
 	assert!(matches!(case.ast.expr(value), Expression::Error));
-	assert_eq!(case.ast.expr_span(value), TextSpan::new(17, 18));
+	assert_eq!(case.ast.expr_span(value), TextSpan::from(17..18));
 	assert!(arguments[1].value.is_some());
 }
 
@@ -2085,7 +2085,7 @@ fn a_named_struct_pattern_keeps_its_open_brace() {
 	else {
 		panic!("expected a struct pattern with braces")
 	};
-	assert_eq!(open_brace as usize, source.find("({").unwrap() + 1);
+	assert_eq!(usize::from(open_brace), source.find("({").unwrap() + 1);
 }
 
 #[test]
@@ -3481,7 +3481,7 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 		);
 		let span = case.ast.bound_span(bound);
 		assert_eq!(span.extract_str(source), "  ");
-		assert_eq!(source.as_bytes()[span.start as usize - 1], b':');
+		assert_eq!(source.as_bytes()[usize::from(span.start) - 1], b':');
 		assert_eq!(case.name(case.function_signature(1).name.inner), "after");
 	}
 }
@@ -3525,7 +3525,7 @@ fn a_binding_with_nothing_after_its_name_or_its_eq_keeps_the_bound() {
 		else {
 			panic!("expected a bound with bindings in {source:?}")
 		};
-		assert_eq!(source.as_bytes()[open_brace as usize], b'{');
+		assert_eq!(source.as_bytes()[usize::from(open_brace)], b'{');
 		let first = case.ast.list(bindings)[0];
 		let (AssocBindingKind::Equals(ty)
 		| AssocBindingKind::ConstRepresentable { ty, .. }) = first.kind
@@ -3871,7 +3871,7 @@ fn test_literal_kind_type() {
 		case.name(case.ast.list(segments)[0].ident.inner),
 		"const_int"
 	);
-	assert_eq!(case.ast.type_span(*ty), TextSpan::new(9, 18));
+	assert_eq!(case.ast.type_span(*ty), TextSpan::from(9..18));
 }
 
 #[test]
@@ -3916,7 +3916,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 		let result = case.ast.type_span(result);
 		assert_eq!(result.extract_str(source), "  ");
 		assert_eq!(
-			&source[result.start as usize - 2..result.start as usize],
+			&source[usize::from(result.start) - 2..usize::from(result.start)],
 			"->"
 		);
 		if let Some(body) = body {
@@ -4536,7 +4536,7 @@ fn a_member_access_with_no_member_keeps_its_object() {
 	assert!(member.is_missing());
 	assert_eq!(
 		member.ident.span,
-		TextSpan::new(13, 13),
+		TextSpan::from(13..13),
 		"the missing name is the empty span right after the `.`"
 	);
 }
@@ -4606,7 +4606,7 @@ fn a_use_with_no_path_keeps_the_item() {
 	assert!(alias.is_none());
 	assert_eq!(
 		segment.span,
-		TextSpan::new(3, 5),
+		TextSpan::from(3..5),
 		"the missing path spans the gap up to the `;`"
 	);
 }
@@ -4797,9 +4797,9 @@ fn a_local_with_a_type_and_no_value_keeps_its_type() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::MissingInitializer]);
 	let (ty, value, ty_missing, value_missing) = local_parts(&case);
-	assert_eq!(ty, Some(TextSpan::new(20, 22)));
+	assert_eq!(ty, Some(TextSpan::from(20..22)));
 	assert!(!ty_missing && value_missing);
-	assert_eq!(value, TextSpan::new(22, 23), "up to the `}}`");
+	assert_eq!(value, TextSpan::from(22..23), "up to the `}}`");
 }
 
 #[test]
@@ -4808,7 +4808,7 @@ fn a_local_with_no_type_after_its_colon_keeps_the_rest() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let (ty, _, ty_missing, value_missing) = local_parts(&case);
-	assert_eq!(ty, Some(TextSpan::new(19, 21)), "the gap before the `=`");
+	assert_eq!(ty, Some(TextSpan::from(19..21)), "the gap before the `=`");
 	assert!(ty_missing && !value_missing);
 }
 
@@ -4826,7 +4826,7 @@ fn a_local_with_no_value_after_its_eq_ends_its_statement() {
 	assert!(matches!(case.ast.expr(value), Expression::Error));
 	assert_eq!(
 		case.ast.expr_span(value),
-		TextSpan::new(20, 22),
+		TextSpan::from(20..22),
 		"the gap before the `;`"
 	);
 }
@@ -4858,7 +4858,7 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	assert_eq!(params.len(), 2);
 	let param = &params[1];
 	assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
-	assert_eq!(case.ast.type_span(param.ty), TextSpan::new(17, 18));
+	assert_eq!(case.ast.type_span(param.ty), TextSpan::from(17..18));
 
 	let case = TestCase::new("struct P(a: u32, b: );");
 	case.diagnostics()
@@ -4890,7 +4890,7 @@ fn a_label_with_no_name_keeps_its_jump() {
 	};
 	let label = label.expect("the label is kept");
 	assert_eq!(label.inner, Keyword::Error.symbol());
-	assert_eq!(label.span, TextSpan::new(25, 25), "right after the `:`");
+	assert_eq!(label.span, TextSpan::from(25..25), "right after the `:`");
 	assert!(value.is_none(), "the `}}` closes the loop");
 }
 
@@ -4914,7 +4914,7 @@ fn unfinished_calls_keep_the_cursor_and_the_following_statement() {
 			"{call}"
 		);
 		assert_eq!(
-			case.ast.expr_span(expr).end as usize,
+			usize::from(case.ast.expr_span(expr).end),
 			source.len(),
 			"{call}"
 		);

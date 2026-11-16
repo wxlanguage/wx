@@ -39,7 +39,7 @@ use super::members::MemberLookup;
 use super::signatures::Semantics;
 use super::types::{GenericEnvIdx, GenericEnvOwner, ImplKind};
 use crate::ast::Keyword;
-use crate::diagnostics::SourceSpan;
+use crate::diagnostics::{SourceSpan, TextOffset};
 use crate::vfs::FileId;
 use string_interner::symbol::SymbolU32;
 
@@ -389,7 +389,7 @@ impl Semantics {
 	pub fn names_at(
 		&self,
 		owner: BodyOwner,
-		offset: u32,
+		offset: TextOffset,
 		used_as: NameUse,
 	) -> Vec<(SymbolU32, Definition)> {
 		let Some(body) = self.owner_body(owner) else {
@@ -984,8 +984,9 @@ mod tests {
 		/// What `names_at` lists at the comment `// {mark}`, as `name` for an
 		/// item, `name (local)` and `name (param)` for the others.
 		fn names(&self, mark: &str, used_as: NameUse) -> Vec<String> {
-			let offset =
-				self.source.find(&format!("// {mark}")).unwrap() as u32;
+			let offset = TextOffset::from(
+				self.source.find(&format!("// {mark}")).unwrap() as u32,
+			);
 			// Every test writes its mark in `f`.
 			let owner = BodyOwner::Function(self.function_index("f"));
 			self.sema
@@ -1007,7 +1008,7 @@ mod tests {
 		fn span(&self, context: &str, name: &str) -> TextSpan {
 			let start = self.source.find(context).unwrap()
 				+ context.find(name).unwrap();
-			TextSpan::new(start as u32, (start + name.len()) as u32)
+			TextSpan::from(start as u32..(start + name.len()) as u32)
 		}
 
 		fn value(&self, context: &str, name: &str) -> Reference {
@@ -1032,7 +1033,7 @@ mod tests {
 				.map(|name| {
 					ast::PathSegment::new(Spanned {
 						inner: self.strings.get(name).unwrap(),
-						span: TextSpan::new(0, 0),
+						span: TextSpan::empty_at(TextOffset::ZERO),
 					})
 				})
 				.collect();

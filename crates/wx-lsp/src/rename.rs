@@ -244,7 +244,7 @@ fn shorthand_side(
 
 fn text(snapshot: &Snapshot, span: SourceSpan) -> Option<&str> {
 	let source = &snapshot.compilation.files.get(span.file_id).ok()?.source;
-	source.get(span.span.start as usize..span.span.end as usize)
+	source.get(usize::from(span.span.start)..usize::from(span.span.end))
 }
 
 /// Whether `name` is written as an identifier is: an ASCII letter or `_`,

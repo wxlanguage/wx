@@ -613,8 +613,11 @@ mod tests {
 			let (env, index) = self.parameter(function, param);
 			let names = self.sema.generic_envs.param_names(env);
 			let after = names[index].span.end;
-			let before =
-				names.get(index + 1).map_or(u32::MAX, |n| n.span.start);
+			let before = names
+				.get(index + 1)
+				.map_or(crate::diagnostics::TextOffset::from(u32::MAX), |n| {
+					n.span.start
+				});
 			let file_id = self.sema.decls.file_id(
 				self.sema.decls.functions[usize::from(self.function(function))]
 					.loc,

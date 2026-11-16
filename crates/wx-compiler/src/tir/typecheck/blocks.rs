@@ -12,7 +12,7 @@ use string_interner::symbol::SymbolU32;
 use super::patterns::PatternContext;
 use super::{BodyBuilder, ScopeType};
 use crate::ast::{self, Spanned};
-use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
+use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan};
 use crate::symbols::Keyword;
 use crate::tir::body::{
 	self, Body, ExprIdx, ExprKind, ExprObligation, LabelIdx, LocalIdx,
@@ -168,7 +168,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		statements: &[ast::StmtId],
 		result: Option<ast::ExprId>,
-		block_end: u32,
+		block_end: TextOffset,
 	) -> (Vec<ExprIdx>, StatementFlow) {
 		let ast = self.ast();
 		let mut built = Vec::with_capacity(statements.len());
@@ -220,7 +220,7 @@ impl BodyBuilder<'_, '_> {
 	fn build_statement(
 		&mut self,
 		statement: ast::StmtId,
-		block_end: u32,
+		block_end: TextOffset,
 	) -> ExprIdx {
 		let ast = self.ast();
 		match ast.statement(statement) {
@@ -294,7 +294,7 @@ impl BodyBuilder<'_, '_> {
 		ty: Option<ast::TypeId>,
 		value: ast::ExprId,
 		span: TextSpan,
-		block_end: u32,
+		block_end: TextOffset,
 	) -> ExprIdx {
 		let declared = ty.map(|ty| {
 			let ty = self.builder.resolve_value_type(

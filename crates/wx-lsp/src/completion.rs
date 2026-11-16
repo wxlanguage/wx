@@ -25,7 +25,7 @@ use wx_compiler::ast::{
 	PatternFieldItem, QualifiedPathRoot, Spanned, Statement, TraitItem,
 	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree, rest_span,
 };
-use wx_compiler::diagnostics::{SourceSpan, TextSpan};
+use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
 use wx_compiler::tir::{
 	BindingName, DeclKind, Definition, LabelKind, MemberKind, MemberOwner,
 	NameUse, Tier, TraitIdx,
@@ -92,7 +92,7 @@ pub(crate) fn completion(
 	// A function, method or constructor written as a value is inserted as its
 	// call, unless the call is written already (`hel|per()`).
 	let source = &snapshot.compilation.files.get(file).ok()?.source;
-	let called = source[offset as usize..]
+	let called = source[usize::from(offset)..]
 		.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
 		.starts_with('(');
 	let insert = match site {
@@ -298,14 +298,15 @@ fn package_keys(
 	snapshot: &Snapshot,
 	file: FileId,
 	literal: TextSpan,
-	offset: u32,
+	offset: TextOffset,
 ) -> Option<CompletionResponse> {
 	let compilation = &snapshot.compilation;
 	let source = &compilation.files.get(file).ok()?.source;
 	// Read as the lexer reads it: an escape skips the character after it,
 	// and an unescaped quote closes the literal.
-	let mut contents =
-		source[literal.start as usize + 1..literal.end as usize].chars();
+	let mut contents = source
+		[usize::from(literal.start) + 1..usize::from(literal.end)]
+		.chars();
 	let mut closed = false;
 	while let Some(c) = contents.next() {
 		match c {
@@ -718,7 +719,7 @@ fn as_trait(snapshot: &Snapshot, index: TraitIdx) -> Option<String> {
 pub(crate) fn position_at(
 	ast: &AST,
 	comments: &CommentMap,
-	offset: u32,
+	offset: TextOffset,
 ) -> Option<Position> {
 	let cursor = Cursor { offset, ast };
 	// Inside a comment: its start is the `//` itself, its end the line's.
@@ -765,7 +766,7 @@ impl Node for Comment {
 }
 
 struct Cursor<'a> {
-	offset: u32,
+	offset: TextOffset,
 	/// The file's tree, where its type syntax is read by id.
 	ast: &'a AST,
 }

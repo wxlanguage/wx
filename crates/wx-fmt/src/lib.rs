@@ -1,6 +1,6 @@
 use string_interner::symbol::SymbolU32;
 use wx_compiler::ast;
-use wx_compiler::diagnostics::TextSpan;
+use wx_compiler::diagnostics::{TextOffset, TextSpan};
 use wx_compiler::tir::unescape_string_literal;
 
 #[cfg(test)]
@@ -352,19 +352,19 @@ enum Before {
 	/// body, not the line it sits on — and no blank line sits directly under
 	/// one, because there is nothing above it for the blank to separate the
 	/// body from.
-	Opener { from: u32 },
+	Opener { from: TextOffset },
 	/// The end of an entry's content. A comment on that same line trails it,
 	/// and a blank line the author left is kept.
-	Entry { end: u32 },
+	Entry { end: TextOffset },
 	/// An entry that always stands apart from the next — a declaration that
 	/// ends in `}`, or one followed by such a declaration. Like `Entry`, but a blank line goes in even where the
 	/// author left none, even before the comments that close a list, so a
 	/// list's last gap is always an `Entry`: there is nothing following for
 	/// it to stand apart from.
-	SpacedEntry { end: u32 },
+	SpacedEntry { end: TextOffset },
 	/// The end of an attribute. A comment on its line trails it, and no
 	/// blank line separates it from what it is attached to.
-	Attribute { end: u32 },
+	Attribute { end: TextOffset },
 }
 
 impl Before {
@@ -375,8 +375,8 @@ impl Before {
 	/// however the author spaced them; between items that end in `;` the
 	/// author's blank line is kept, as a grouping (a run of constants).
 	fn declaration(
-		from: u32,
-		previous: Option<(u32, bool)>,
+		from: TextOffset,
+		previous: Option<(TextOffset, bool)>,
 		ends_in_brace: bool,
 	) -> Self {
 		match previous {
@@ -396,11 +396,11 @@ enum After {
 	/// Another entry begins at `start`. Its line is opened once the comments
 	/// are placed, so an empty gap is just the line break and the caller can
 	/// push the entry straight on.
-	Entry { start: u32 },
+	Entry { start: TextOffset },
 	/// The list ends at `at` — a closing brace, or the end of the file. That
 	/// bounds which comments belong to the gap and nothing more: no line is
 	/// opened, because nothing follows.
-	End { at: u32 },
+	End { at: TextOffset },
 }
 
 /// What to do about a blank line at a break.
@@ -529,16 +529,16 @@ impl<'a> Builder<'a> {
 	/// to trail, however little separates it from `prev_end`.
 	fn split_trailing_comment(
 		&self,
-		prev_end: u32,
+		prev_end: TextOffset,
 		gap: &'a [ast::Comment],
 	) -> (Option<&'a ast::Comment>, &'a [ast::Comment]) {
 		match gap.split_first() {
 			Some((first, rest))
 				if first.kind != ast::CommentKind::Doc
-					&& !self.source
-						[prev_end as usize..first.span.start as usize]
+					&& !self.source[usize::from(prev_end)
+						..usize::from(first.span.start)]
 						.contains('\n')
-					&& !self.source[..prev_end as usize]
+					&& !self.source[..usize::from(prev_end)]
 						.trim_end()
 						.is_empty() =>
 			{
@@ -552,16 +552,18 @@ impl<'a> Builder<'a> {
 	fn push_line_break(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		from: u32,
-		to: u32,
+		from: TextOffset,
+		to: TextOffset,
 		blank: Blank,
 	) {
 		let wants_blank = match blank {
 			Blank::Force => true,
 			Blank::Suppress => false,
-			Blank::Preserve => {
-				Self::has_blank_line(self.source, from as usize, to as usize)
-			}
+			Blank::Preserve => Self::has_blank_line(
+				self.source,
+				usize::from(from),
+				usize::from(to),
+			),
 		};
 		if wants_blank {
 			out.push(self.blank_line());
@@ -579,10 +581,10 @@ impl<'a> Builder<'a> {
 	fn push_own_line_comments(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		cursor: u32,
+		cursor: TextOffset,
 		comments: &[ast::Comment],
 		first: Blank,
-	) -> u32 {
+	) -> TextOffset {
 		let mut cursor = cursor;
 		for (index, comment) in comments.iter().enumerate() {
 			let blank = if index == 0 { first } else { Blank::Preserve };
@@ -671,8 +673,8 @@ impl<'a> Builder<'a> {
 				Blank::Suppress => false,
 				Blank::Preserve => Self::has_blank_line(
 					self.source,
-					cursor as usize,
-					next as usize,
+					usize::from(cursor),
+					usize::from(next),
 				),
 			};
 			if trailing.is_none() && own_line.is_empty() && !wants_blank {
@@ -687,7 +689,7 @@ impl<'a> Builder<'a> {
 	fn build(&mut self, ast: &ast::AST) -> NodeId {
 		self.build_item_list(
 			ast.root,
-			TextSpan::new(0, self.source.len() as u32),
+			TextSpan::from(0..self.source.len() as u32),
 		)
 	}
 
@@ -705,7 +707,7 @@ impl<'a> Builder<'a> {
 		// opener is the file header or the line opening a `mod` body; at the
 		// top of a file the break it emits has nothing in front of it and
 		// disappears.
-		let mut previous: Option<(u32, bool)> = None;
+		let mut previous: Option<(TextOffset, bool)> = None;
 		for item in ast.spanned(items) {
 			let ends_in_brace = item.inner.ends_in_brace();
 			let attributes = item.inner.attributes();
@@ -1164,7 +1166,7 @@ impl<'a> Builder<'a> {
 	fn build_module_definition(
 		&mut self,
 		span: TextSpan,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
 		items: ast::List<ast::Item>,
 	) -> NodeId {
@@ -1193,7 +1195,7 @@ impl<'a> Builder<'a> {
 
 	fn build_module_declaration(
 		&mut self,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
@@ -1271,7 +1273,7 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		let mut previous: Option<(u32, bool)> = None;
+		let mut previous: Option<(TextOffset, bool)> = None;
 		for item in ast.spanned(items) {
 			let ends_in_brace = item.inner.ends_in_brace();
 			let attributes = item.inner.attributes();
@@ -1357,7 +1359,7 @@ impl<'a> Builder<'a> {
 	fn build_trait_definition(
 		&mut self,
 		span: TextSpan,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
 		supertraits: Option<ast::BoundId>,
 		items: ast::List<ast::TraitItem>,
@@ -1397,7 +1399,7 @@ impl<'a> Builder<'a> {
 	) -> NodeId {
 		let ast = self.ast;
 		let mut nodes: Vec<NodeId> = Vec::new();
-		let mut previous: Option<(u32, bool)> = None;
+		let mut previous: Option<(TextOffset, bool)> = None;
 		for item in ast.spanned(items) {
 			let ends_in_brace = item.inner.ends_in_brace();
 			let attributes = item.inner.attributes();
@@ -1483,7 +1485,7 @@ impl<'a> Builder<'a> {
 
 	fn build_const_definition(
 		&mut self,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
 		ty: Option<ast::TypeId>,
 		value: ast::ExprId,
@@ -1506,7 +1508,7 @@ impl<'a> Builder<'a> {
 
 	fn build_type_alias_definition(
 		&mut self,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
 		type_params: ast::List<ast::TypeParam>,
 		body: Option<ast::TypeId>,
@@ -1599,7 +1601,7 @@ impl<'a> Builder<'a> {
 	fn build_enum_definition(
 		&mut self,
 		span: TextSpan,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		repr: ast::List<ast::StructField>,
 		name: &ast::Spanned<SymbolU32>,
 		variants: ast::List<ast::EnumVariant>,
@@ -1683,7 +1685,7 @@ impl<'a> Builder<'a> {
 	fn build_typeset_definition(
 		&mut self,
 		span: TextSpan,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
 		bounds: Option<ast::BoundId>,
 		members: ast::List<ast::Path>,
@@ -1745,7 +1747,7 @@ impl<'a> Builder<'a> {
 		name: &ast::Spanned<SymbolU32>,
 		type_params: ast::List<ast::TypeParam>,
 		fields: ast::List<ast::StructField>,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 	) -> NodeId {
 		let mut items: Vec<NodeId> = Vec::new();
 		if pub_at.is_some() {
@@ -1921,7 +1923,7 @@ impl<'a> Builder<'a> {
 		&mut self,
 		out: &mut Vec<NodeId>,
 		attributes: ast::List<ast::Attribute>,
-		start: u32,
+		start: TextOffset,
 	) {
 		let ast = self.ast;
 		let spans = ast.spans(attributes);
@@ -1957,7 +1959,7 @@ impl<'a> Builder<'a> {
 		&self,
 		attributes: ast::List<ast::Attribute>,
 		span: TextSpan,
-	) -> u32 {
+	) -> TextOffset {
 		self.ast
 			.spans(attributes)
 			.first()
@@ -2063,8 +2065,8 @@ impl<'a> Builder<'a> {
 
 	fn build_global_definition(
 		&mut self,
-		pub_at: Option<u32>,
-		mut_at: Option<u32>,
+		pub_at: Option<TextOffset>,
+		mut_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
 		type_annotation: Option<ast::TypeId>,
 		value: ast::ExprId,

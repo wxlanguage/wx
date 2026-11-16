@@ -3124,6 +3124,7 @@ mod tests {
 	use super::super::solver::{NormalizationDepth, RewriteFlags};
 	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
 	use crate::ast::{self, Spanned, StringInterner};
+	use crate::diagnostics::TextOffset;
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
 	use crate::testing::DiagnosticView;
 	use crate::vfs::{self, FileId, Files};
@@ -3232,7 +3233,7 @@ mod tests {
 				.map(|segment| {
 					ast::PathSegment::new(Spanned {
 						inner: self.strings.get(segment).unwrap(),
-						span: TextSpan::new(0, 0),
+						span: TextSpan::empty_at(TextOffset::ZERO),
 					})
 				})
 				.collect();
@@ -3820,7 +3821,7 @@ mod tests {
 		let start = SOURCE.find("a + b").unwrap() as u32;
 		let site = Site::Value(crate::diagnostics::SourceSpan::new(
 			file_id,
-			TextSpan::new(start, start + 1),
+			TextSpan::from(start..start + 1),
 		));
 		assert!(matches!(
 			case.sema.resolutions.get(site),
@@ -4309,7 +4310,7 @@ mod tests {
 		let start = (SOURCE.rfind(":outer").unwrap() + 1) as u32;
 		let site = Site::Label(crate::diagnostics::SourceSpan::new(
 			file_id,
-			TextSpan::new(start, start + "outer".len() as u32),
+			TextSpan::from(start..start + "outer".len() as u32),
 		));
 		assert!(matches!(
 			case.sema.resolutions.get(site),

@@ -27,7 +27,9 @@ use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, Keyword, Spanned, StringInterner};
-use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
+use crate::diagnostics::{
+	DiagnosticCode, Diagnostics, SourceSpan, TextOffset, TextSpan,
+};
 use crate::tir::decls::TypeAliasIdx;
 use crate::tir::types::GenericEnvOwner;
 use crate::vfs::{FileId, Files};
@@ -1148,7 +1150,7 @@ impl Semantics {
 		file_id: FileId,
 		global_index: GlobalIdx,
 		name: Spanned<SymbolU32>,
-		mut_at: Option<u32>,
+		mut_at: Option<TextOffset>,
 		value: Spanned<TypeIndex>,
 	) -> SignatureLocation {
 		let global_decl = &self.decls.globals[usize::from(global_index)];
@@ -1570,9 +1572,7 @@ fn report_pointer_without_memory(
 	let written = files
 		.get(file_id)
 		.ok()
-		.and_then(|file| {
-			file.source.get(span.start as usize..span.end as usize)
-		})
+		.and_then(|file| file.source.get(core::ops::Range::<usize>::from(span)))
 		.unwrap_or("*T");
 	Diagnostic::error()
 		.with_code(DiagnosticCode::PointerWithoutMemory.code())
@@ -6067,7 +6067,7 @@ pub(super) mod tests {
 		let span_of = |context: &str, name: &str| {
 			let start =
 				SOURCE.find(context).unwrap() + context.find(name).unwrap();
-			TextSpan::new(start as u32, (start + name.len()) as u32)
+			TextSpan::from(start as u32..(start + name.len()) as u32)
 		};
 		let at = |context: &str, name: &str| {
 			let site =
@@ -7713,7 +7713,7 @@ pub(super) mod tests {
 					);
 					let reference = SourceSpan::new(
 						sema.decls.file_id(sema.decls.traits[1].loc),
-						TextSpan::new(0, 1),
+						TextSpan::from(0..1),
 					);
 					builder
 						.ensure_assoc_type_bounds(sema, declaration, reference)
@@ -7889,7 +7889,7 @@ pub(super) mod tests {
 			.decls
 			.namespaces
 			.file_id(Namespace::Package(sema.decls.root_package));
-		let reference = SourceSpan::new(file_id, TextSpan::new(0, 1));
+		let reference = SourceSpan::new(file_id, TextSpan::from(0..1));
 		let name = builder.strings.get(name).unwrap();
 		let key = BindingKey::ty(name);
 		let MemberLookup::Found(member) = sema.resolve_applicable_member(
@@ -8122,7 +8122,7 @@ pub(super) mod tests {
 							.strings
 							.get(segment)
 							.expect("already interned from source"),
-						span: TextSpan::new(0, 0),
+						span: TextSpan::empty_at(TextOffset::ZERO),
 					})
 				})
 				.collect();
@@ -10416,9 +10416,9 @@ pub(super) mod tests {
 			);
 			assert_eq!(
 				declaration.range,
-				case.sema.decls.item(definition.loc).name.span.start as usize
-					..case.sema.decls.item(definition.loc).name.span.end
-						as usize
+				core::ops::Range::<usize>::from(
+					case.sema.decls.item(definition.loc).name.span
+				)
 			);
 			assert_eq!(declaration.message, "enum `Color` defined here");
 		}
@@ -10663,8 +10663,10 @@ pub(super) mod tests {
 		);
 		assert_eq!(
 			declaration.range,
-			case.sema.decls.item(definition.loc).name.span.start as usize
-				..case.sema.decls.item(definition.loc).name.span.end as usize
+			usize::from(case.sema.decls.item(definition.loc).name.span.start)
+				..usize::from(
+					case.sema.decls.item(definition.loc).name.span.end
+				)
 		);
 		assert_eq!(case.enum_signature("Color").repr, TypeIndex::ERROR);
 	}
@@ -11080,7 +11082,7 @@ pub(super) mod tests {
 					.unwrap();
 				let reference = SourceSpan::new(
 					sema.decls.file_id(sema.decls.traits[0].loc),
-					TextSpan::new(0, 1),
+					TextSpan::from(0..1),
 				);
 				for (name, overridden) in
 					[("overridden", true), ("inherited", false)]
@@ -14492,7 +14494,7 @@ pub(super) mod tests {
 				let env = sema.functions[0].type_params;
 				let reference = SourceSpan::new(
 					sema.decls.file_id(sema.decls.traits[0].loc),
-					TextSpan::new(0, 1),
+					TextSpan::from(0..1),
 				);
 				let declaration = match sema.decls.traits[0].members[0].kind {
 					MemberKind::AssociatedType(index) => index,
@@ -14764,7 +14766,7 @@ pub(super) mod tests {
 			|sema, builder| {
 				let reference = SourceSpan::new(
 					sema.decls.file_id(sema.decls.traits[0].loc),
-					TextSpan::new(0, 1),
+					TextSpan::from(0..1),
 				);
 				sema.solver.set_limit_for_test(4);
 				// A projection at the bottom: a type without one is already normal
@@ -14820,7 +14822,7 @@ pub(super) mod tests {
 				let env = sema.functions[0].type_params;
 				let reference = SourceSpan::new(
 					sema.decls.file_id(sema.decls.traits[0].loc),
-					TextSpan::new(0, 1),
+					TextSpan::from(0..1),
 				);
 				let declaration = match sema.decls.traits[0].members[0].kind {
 					MemberKind::AssociatedType(index) => index,
@@ -17844,7 +17846,7 @@ pub(super) mod tests {
 				.name
 				.span;
 			assert!(
-				label.range.start >= sibling_span.start as usize,
+				label.range.start >= usize::from(sibling_span.start),
 				"the violation belongs to `sibling`: {diagnostic:?}"
 			);
 		}
@@ -18987,7 +18989,7 @@ pub(super) mod tests {
 			.match_indices("Self")
 			.map(|(at, _)| {
 				let start = u32::try_from(at).unwrap();
-				let span = TextSpan::new(start, start + 4);
+				let span = TextSpan::from(start..start + 4);
 				case.sema
 					.resolutions
 					.by_site

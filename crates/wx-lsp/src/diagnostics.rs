@@ -120,7 +120,7 @@ fn label_location(
 		files,
 		SourceSpan::new(
 			label.file_id,
-			TextSpan::new(label.range.start as u32, label.range.end as u32),
+			TextSpan::from(label.range.start as u32..label.range.end as u32),
 		),
 	)?;
 	Some((path, range))
@@ -238,7 +238,9 @@ fn diagnostic_related_information(
 			files,
 			SourceSpan::new(
 				label.file_id,
-				TextSpan::new(label.range.start as u32, label.range.end as u32),
+				TextSpan::from(
+					label.range.start as u32..label.range.end as u32,
+				),
 			),
 		)?;
 		Some(DiagnosticRelatedInformation {

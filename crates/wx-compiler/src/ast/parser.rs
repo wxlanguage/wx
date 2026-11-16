@@ -7,7 +7,7 @@ use string_interner::symbol::SymbolU32;
 use super::lexer::{Lexer, Token};
 use super::*;
 use crate::{
-	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
+	diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan},
 	vfs::{self, FileId},
 };
 
@@ -759,7 +759,7 @@ impl<'ctx> Parser<'ctx> {
 				.with_code(DiagnosticCode::CrlfLineEndings.code())
 				.with_message("file contains carriage returns (`\\r\\n`)")
 				.with_label(
-					Label::primary(file_id, TextSpan::new(0, 0)).with_message(
+					Label::primary(file_id, TextSpan::empty_at(TextOffset::ZERO)).with_message(
 						"carriage returns can shift text spans; consider using LF (`\\n`) line endings instead",
 				))
 			);
@@ -995,7 +995,7 @@ impl<'ctx> Parser<'ctx> {
 		&mut self,
 		delimiters: Delimiters,
 		open: TextSpan,
-		at: u32,
+		at: TextOffset,
 	) -> TextSpan {
 		let expected_close_span = TextSpan::new(at, at);
 		self.diagnostics.push(report_unclosed_delimiter(
@@ -1651,7 +1651,7 @@ impl<'ctx> Parser<'ctx> {
 	/// nothing. A length not written yet (`[u8; ]`) is reported and kept as
 	/// an error node spanning the gap up to the `]`, as a missing type is,
 	/// so the array is kept too.
-	fn parse_length(&mut self, after: u32) -> Result<ConstId, ()> {
+	fn parse_length(&mut self, after: TextOffset) -> Result<ConstId, ()> {
 		if let Some(Keyword::Const) = self.peek_keyword() {
 			let span = self.lexer.next().span;
 			self.diagnostics.push(report_redundant_const_marker(
@@ -1714,7 +1714,7 @@ impl<'ctx> Parser<'ctx> {
 					Token::Comma | Token::CloseBrace
 				)
 			};
-			let missing = |parser: &mut Self, after: u32| {
+			let missing = |parser: &mut Self, after: TextOffset| {
 				let next = parser.lexer.peek().span.start;
 				parser.ast.push_type(
 					TypeExpression::Error,
@@ -2002,7 +2002,10 @@ impl<'ctx> Parser<'ctx> {
 	/// to that token, as a missing type is, so what holds it is kept too.
 	/// Anything else there is a bound written wrong, which the caller's
 	/// recovery skips.
-	fn parse_bounds_expression(&mut self, after: u32) -> Result<BoundId, ()> {
+	fn parse_bounds_expression(
+		&mut self,
+		after: TextOffset,
+	) -> Result<BoundId, ()> {
 		let _ = self.lexer.next_if(Token::Plus);
 		let token = self.lexer.peek();
 		if matches!(
@@ -2194,7 +2197,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_bracketed_root(
 		&mut self,
 		open_span: TextSpan,
-	) -> Result<(BracketedRoot, u32), ()> {
+	) -> Result<(BracketedRoot, TextOffset), ()> {
 		let self_type = self.parse_type_expression()?;
 		let root = if matches!(self.peek_keyword(), Some(Keyword::As)) {
 			self.lexer.next(); // consume `as`
@@ -2629,7 +2632,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_named_call_arguments(
 		&mut self,
 		open: TextSpan,
-	) -> Result<(Spanned<List<NamedArgument>>, u32), ()> {
+	) -> Result<(Spanned<List<NamedArgument>>, TextOffset), ()> {
 		let named = self.parse_named_arguments()?;
 		if self.lexer.peek().inner == Token::Comma {
 			let at = self.lexer.peek().span;

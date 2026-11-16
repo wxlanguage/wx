@@ -155,7 +155,7 @@ The core is embedded at build time by `crates/wx-compiler/build.rs`, which walks
 - **`codegen/mod.rs`** — WASM bytecode emitter; `Builder::build` is the entry point, linearizing each reached function (`linearize.rs`) and encoding the module
 - **`vfs/`** — `mod.rs` (`CompilationUnit`, `PackageGraph`, `Files`, file sources), `manifest.rs` (`wx.json` schema), `resolve.rs` (manifest → package graph), `path.rs` (`AbsolutePath`/`RelativePath`)
 - **`testing/`** — `#[cfg(test)]`-only shared test vocabulary; `DiagnosticView` (see Testing patterns)
-- **`diagnostics.rs`** — the single `define_diagnostic_codes!` macro and the `Code` trait, shared by every stage
+- **`diagnostics.rs`** — the single `define_diagnostic_codes!` macro and the `Code` trait, shared by every stage; and positions in a file's text: `TextOffset` (a byte position; an offset plus a `u32` length is an offset, an offset minus an offset is a length, `usize::from` indexes the source) and `TextSpan { start, end }` of two of them (`TextSpan::from(3..5)` for one written as numbers). A syntax node keeps only where a fixed-length keyword starts (`pub_at`, `mut_at`, `const_at`: `Option<TextOffset>`), and `Keyword::span_at(at)` gives its span
 - **`../core/main.wx`** — standard library source (sibling to `src/`), embedded via `build.rs`
 
 The pretty-printer used to live at `fmt/` in this crate; it's now its own crate, `wx-fmt` (`crates/wx-fmt/src/lib.rs`), used by both `wx-cli` (the `format` subcommand) and `wx-lsp` (the LSP formatting request).

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::Uri;
-use wx_compiler::diagnostics::{SourceSpan, TextSpan};
+use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
 use wx_compiler::symbols::{Keyword, StringInterner};
 use wx_compiler::tir::{self, BodyOwner, Definition, Semantics};
 use wx_compiler::vfs::{self, AbsolutePath, FileId, FileSource as _};
@@ -67,7 +67,7 @@ impl Snapshot {
 	pub(crate) fn definition_at(
 		&self,
 		file: FileId,
-		offset: u32,
+		offset: TextOffset,
 	) -> Option<(SourceSpan, Definition)> {
 		if let Some((span, reference)) =
 			query::symbol_at(&self.sema, file, offset)
@@ -78,7 +78,7 @@ impl Snapshot {
 			file,
 			TextSpan {
 				start: offset,
-				end: u32::MAX,
+				end: TextOffset::from(u32::MAX),
 			},
 		);
 		let (&span, &definition) =
@@ -100,7 +100,7 @@ impl Snapshot {
 		&self,
 		file: FileId,
 	) -> impl Iterator<Item = (SourceSpan, Definition)> + '_ {
-		let start = SourceSpan::new(file, TextSpan { start: 0, end: 0 });
+		let start = SourceSpan::new(file, TextSpan::empty_at(TextOffset::ZERO));
 		self.definitions
 			.range(start..)
 			.take_while(move |(span, _)| span.file_id == file)

@@ -58,7 +58,7 @@ pub(crate) fn signature_help(
 				_ => return false,
 			};
 			let span = ast.arguments_span(expr);
-			let closed = source[..span.end as usize].ends_with(close)
+			let closed = source[..usize::from(span.end)].ends_with(close)
 				&& last.is_none_or(|last| last < span.end)
 				&& !comments.iter().any(|comment| {
 					comment.span.start < span.end
@@ -131,7 +131,7 @@ pub(crate) fn signature_help(
 						|| offset < ast.expr_span(arguments[at]).start)
 				{
 					let end = ast.expr_span(arguments[at - 1]).end;
-					let comma = source[end as usize..offset as usize]
+					let comma = source[usize::from(end)..usize::from(offset)]
 						.char_indices()
 						.any(|(rel, c)| {
 							let at = end + rel as u32;

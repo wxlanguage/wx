@@ -128,14 +128,14 @@ impl<'a> Printer<'a> {
 	}
 
 	fn text(&self, span: TextSpan) -> &'a str {
-		&self.source[span.start as usize..span.end as usize]
+		&self.source[usize::from(span.start)..usize::from(span.end)]
 	}
 
 	fn label(&self, label: Option<Spanned<SymbolU32>>) -> Option<Sexp> {
 		label.map(|label| Sexp::atom(format!(":{}", self.name(label.inner))))
 	}
 
-	fn visibility(&self, pub_at: Option<u32>) -> Option<Sexp> {
+	fn visibility(&self, pub_at: Option<TextOffset>) -> Option<Sexp> {
 		pub_at.map(|_| Sexp::atom("pub"))
 	}
 
@@ -560,7 +560,7 @@ impl<'a> Printer<'a> {
 	fn function(
 		&self,
 		head: &str,
-		pub_at: Option<u32>,
+		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		signature: &FunctionSignature,
 		block: Option<BlockId>,
