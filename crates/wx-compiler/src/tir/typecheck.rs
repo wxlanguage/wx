@@ -3828,21 +3828,6 @@ mod tests {
 		));
 	}
 
-	/// An unnamed parameter is passed like any other, but binds no local.
-	#[test]
-	fn an_unnamed_parameter_binds_no_local() {
-		let case = TestCase::new("func f(u32, _: u8, c: u32) -> u32 { c }");
-		case.diagnostics().assert_none();
-		assert_eq!(case.locals("f"), [("c".into(), "u32".into())]);
-		let params: Vec<_> = case
-			.body("f")
-			.params()
-			.iter()
-			.map(|local| local.map(u32::from))
-			.collect();
-		assert_eq!(params, [None, None, Some(0)]);
-	}
-
 	#[test]
 	fn a_block_result_takes_the_return_type() {
 		let case = TestCase::new(indoc! {"
@@ -5234,7 +5219,7 @@ mod tests {
 	#[test]
 	fn constant_parameters_and_arguments_are_not_checked_yet() {
 		let case = TestCase::new(indoc! {r#"
-				struct Buffer<const N: u32>(u8);
+				struct Buffer<const N: u32>(a: u8);
 				func f(b: Buffer<4>) {}
 			"#});
 		case.diagnostics().assert_codes(&[
@@ -5418,7 +5403,7 @@ mod tests {
 					func late<T: StackValue, Self: Show>(t: T);
 					func f(self: Self);
 				}
-				struct S<Self>(u8);
+				struct S<Self>(a: u8);
 				func free<Self: Show>() {}
 				impl S { func inherent<Self: Show>() {} }
 				impl Tr for S {
@@ -5958,7 +5943,7 @@ mod tests {
 					Side::Left => { 1 },
 					Side::Right => { 2 },
 				};
-				enum Side(u8) { Left = 0, Right = 1 }
+				enum Side(value: u8) { Left = 0, Right = 1 }
 			"#});
 		// Both matches are exhaustive once the constants they read are known;
 		// a match is not evaluated (yet), which is all that is reported.
@@ -6153,7 +6138,7 @@ mod tests {
 	#[test]
 	fn a_path_through_a_type_calls_its_member_directly() {
 		let case = TestCase::new(indoc! {"
-				enum E(u8) { A = 0 }
+				enum E(value: u8) { A = 0 }
 				impl E { pub func pick<T: StackValue>(t: T) -> E { E::A } }
 				struct W<T>(x: T);
 				impl<T: StackValue> W<T> {
@@ -6410,7 +6395,7 @@ mod tests {
 					func bare() { local w = Self; }
 					func written() -> W { Self::<u8>(1) }
 				}
-				enum E(u8) { A = 0 }
+				enum E(value: u8) { A = 0 }
 				impl E { func variant() -> E { Self(0) } }
 				trait Tr: StackValue { func make() -> Self { Self() } }
 				func free() { Self(); }
@@ -6693,36 +6678,6 @@ mod tests {
 	}
 
 	#[test]
-	fn an_impl_may_name_a_parameter_its_trait_leaves_unnamed() {
-		let case = TestCase::new(indoc! {"
-				trait Scale: StackValue {
-					func scale(self: Self, u32) -> Self;
-				}
-				struct S(n: u32);
-				impl Scale for S {
-					func scale(self: Self, by: u32) -> Self { self }
-				}
-				func named(s: S) -> S { s.scale({ by: 2 }) }
-				func generic<T: Scale>(t: T) -> T { t.scale({ by: 2 }) }
-				func positional<T: Scale>(t: T) -> T { t.scale(2) }
-			"});
-		// The impl's name is its own to give, so a concrete call may use it;
-		// the trait's declaration has none, so a call through it is by
-		// position.
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::PositionalOnlyCall]);
-		case.diagnostics().assert_error_saying(
-			"function `scale` has an unnamed parameter, so it is called by \
-			 position",
-		);
-		assert_eq!(case.shape("named"), "(block => (call scale s#0 2))");
-		assert_eq!(
-			case.shape("positional"),
-			"(block => (abstract scale<T> t#0 2))"
-		);
-	}
-
-	#[test]
 	fn a_call_by_name_reaches_the_first_parameter_of_a_name_declared_twice() {
 		let case = TestCase::new(indoc! {"
 				func d(a: u32, a: u32) {}
@@ -6757,11 +6712,9 @@ mod tests {
 					pub func m(self: Self, n: u32) {}
 				}
 				func f(a: u32, b: i64) {}
-				func g(u32, b: u32) {}
 				func unknown() { f({ a: 1, b: 2, c: 3 }) }
 				func twice() { f({ a: 1, a: 2, b: 3 }) }
 				func missing() { f({ b: 2 }) }
-				func unnamed() { g({ b: 1 }) }
 				func receiver(s: S) { s.m({ self: s, n: 1 }) }
 				func mismatch(x: i64) { f({ a: x, b: x }) }
 			"});
@@ -6769,7 +6722,6 @@ mod tests {
 			DiagnosticCode::UnknownParameterName,
 			DiagnosticCode::DuplicateNamedArgument,
 			DiagnosticCode::MissingArguments,
-			DiagnosticCode::PositionalOnlyCall,
 			DiagnosticCode::UnknownParameterName,
 			DiagnosticCode::TypeMistmatch,
 		]);
@@ -6779,10 +6731,6 @@ mod tests {
 			.assert_error_saying("argument `a` given more than once");
 		case.diagnostics().assert_error_saying(
 			"missing argument `a` in call to function `f`",
-		);
-		case.diagnostics().assert_error_saying(
-			"function `g` has an unnamed parameter, so it is called by \
-			 position",
 		);
 		case.diagnostics()
 			.assert_error_saying("function `m` has no parameter named `self`");
@@ -6794,13 +6742,11 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func pair<T: StackValue>(a: T, b: T) -> T { a }
 				func none<T: StackValue>(flag: Bool) -> T { loop {} }
-				func g<T: StackValue>(T, b: u32) -> T { loop {} }
 				struct W<T>(x: T, y: T);
 				func missing() { pair(1); }
 				func missing_by_name() { pair({ a: 1 }); }
 				func extra() { none(True, 1); }
 				func unknown_name() { none({ flag: True, other: 1 }); }
-				func positional_only() { g({ b: 1 }); }
 				func construction() { W(1); }
 				func construction_by_name() { W({ x: 1 }); }
 				func uninferred() { none(True); }
@@ -6810,7 +6756,6 @@ mod tests {
 			DiagnosticCode::MissingArguments,
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::UnknownParameterName,
-			DiagnosticCode::PositionalOnlyCall,
 			DiagnosticCode::ArgumentCountMismatch,
 			DiagnosticCode::MissingArguments,
 			DiagnosticCode::TypeAnnotationRequired,
@@ -6874,14 +6819,13 @@ mod tests {
 	fn a_local_pattern_must_fit_its_value() {
 		let case = TestCase::new(indoc! {"
 				struct Point(x: u32, y: u32);
-				struct Pair(u32, u32);
+				struct Pair(a: u32, b: u32);
 				func f(p: Point, t: (u32, u32), q: Pair) {
 					local (a, b, c) = t;
 					local Point(x, .., ..) = p;
 					local Point({ x }) = p;
 					local Point({ z, .. }) = p;
 					local (n, n) = t;
-					local Pair({ .. }) = q;
 					local (m, k) = p;
 					local Pair(r, s) = p;
 				}
@@ -6892,7 +6836,6 @@ mod tests {
 			DiagnosticCode::MissingStructFields,
 			DiagnosticCode::UnknownStructField,
 			DiagnosticCode::DuplicatePatternBinding,
-			DiagnosticCode::TupleStructBracePattern,
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
 		]);
@@ -6944,7 +6887,7 @@ mod tests {
 	#[test]
 	fn a_match_compares_with_constants_and_destructures() {
 		let case = TestCase::new(indoc! {"
-				enum Dir(u8) { North = 0, South = 1 }
+				enum Dir(value: u8) { North = 0, South = 1 }
 				const LIMIT: u8 = 10;
 				struct P(x: u8, d: Dir);
 				trait Lim { const MAX: u8; }
@@ -7066,7 +7009,7 @@ mod tests {
 		// By position, by name, and by field access, typed as the repr.
 		let case = TestCase::new(indoc! {"
 				enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
-				enum Ordering2(i8) { Less = -1, Equal = 0, Greater = 1 }
+				enum Ordering2(value: i8) { Less = -1, Equal = 0, Greater = 1 }
 				func f(s: Signal, o: Ordering2) -> i32 {
 					local Signal(a) = s;
 					local Signal({ number }) = s;
@@ -7078,14 +7021,6 @@ mod tests {
 				}
 		"});
 		case.diagnostics().assert_none();
-
-		// Only a named repr is matched by name.
-		let case = TestCase::new(indoc! {"
-				enum Ordering2(i8) { Less = -1, Equal = 0, Greater = 1 }
-				func f(o: Ordering2) { local Ordering2({ value }) = o; }
-		"});
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::TupleStructBracePattern]);
 	}
 
 	#[test]
@@ -7133,7 +7068,7 @@ mod tests {
 		// catch-all that binds the number.
 		let source = |arms: &str| {
 			format!(
-				"enum Ordering2(i8) {{ Less = -1, Equal = 0, Greater = 1 }}\n\
+				"enum Ordering2(value: i8) {{ Less = -1, Equal = 0, Greater = 1 }}\n\
 				 func f(o: Ordering2) -> i8 {{ match o {{ {arms} }} }}\n"
 			)
 		};
@@ -7219,7 +7154,7 @@ mod tests {
 		// A constant's value is known wherever a pattern may name it: in a
 		// function's block, in a global's initializer, in a constant's own.
 		let case = TestCase::new(indoc! {"
-				enum Dir(u8) { North = 0, East = 1, South = 2 }
+				enum Dir(value: u8) { North = 0, East = 1, South = 2 }
 				const N: Dir = Dir::North;
 				global g: Dir = match (N) {
 					const N => { Dir::North },
@@ -7448,7 +7383,7 @@ mod tests {
 	#[test]
 	fn an_enum_satisfies_eq_and_partial_eq_structurally() {
 		let case = TestCase::new(indoc! {"
-				enum Color(u8) { Red = 0, Green }
+				enum Color(value: u8) { Red = 0, Green }
 				func needs_eq<T: Eq>(value: T) {}
 				func needs_partial<T: PartialEq>(value: T) {}
 				func f(color: Color) {
@@ -7751,7 +7686,7 @@ mod tests {
 	#[test]
 	fn a_match_must_cover_every_value() {
 		let case = TestCase::new(indoc! {"
-				enum Dir(u8) { North = 0, East, South, West }
+				enum Dir(value: u8) { North = 0, East, South, West }
 				struct P(x: Bool, y: Bool);
 				func a(d: Dir) -> u8 {
 					match d { Dir::North => { 0 }, Dir::East => { 1 } }
@@ -7818,7 +7753,7 @@ mod tests {
 	#[test]
 	fn a_constant_counts_by_its_value_unless_it_is_abstract() {
 		let case = TestCase::new(indoc! {"
-				enum Dir(u8) { North = 0, East, South }
+				enum Dir(value: u8) { North = 0, East, South }
 				const N: Dir = Dir::North;
 				trait Lim { const MAX: u8; }
 				func k(d: Dir) {

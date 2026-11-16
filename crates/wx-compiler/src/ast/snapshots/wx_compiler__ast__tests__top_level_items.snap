@@ -5,7 +5,7 @@ expression: case.tree()
 (func pub add
   (attr inline)
   (type-params (T Add + Copy) (const N u32))
-  (params (a T) (mut b T) (_ u8) u16)
+  (params (a T) (mut b T) (d u8) (c u16))
   (result T)
   (block
     (local x (type i32) 1)
@@ -31,7 +31,7 @@ expression: case.tree()
             (=> _ (break))))))
     (+ a (* b 2))))
 
-(func declared (params heap::&[u8]) (result !))
+(func declared (params (a heap::&[u8])) (result !))
 
 (package-func pub clz (params (value u32)) (result u32))
 
@@ -47,9 +47,9 @@ expression: case.tree()
 
 (struct Point (field pub x i32) (field y i32))
 
-(struct pub Pair (type-params T) (field T) (field pub mut flag u8))
+(struct pub Pair (type-params T) (field a T) (field pub mut flag u8))
 
-(enum Color (repr u8) Red (= Green 1) Blue)
+(enum Color (repr value u8) Red (= Green 1) Blue)
 
 (import "env" env
   (func "Log" log (params (message heap::&[u8])))

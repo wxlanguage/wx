@@ -47,13 +47,12 @@ impl BodyBuilder<'_, '_> {
 			let ty = self.sema.types.list(param_types)[at];
 			let ty = self.context().normalized(ty);
 			let ty = self.sema.types.collapse_error(ty);
-			// An unnamed parameter binds nothing, so it has no local.
-			let local = match param.binding {
-				Some(ast::Binding::Name { mut_span, name }) => {
-					Some(self.declare_local(name, ty, mut_span))
-				}
-				Some(ast::Binding::Wildcard(_)) | None => None,
-			};
+			// A parameter whose name is missing (reported by the parser)
+			// binds nothing.
+			let binding = param.binding;
+			let local = (!binding.is_missing()).then(|| {
+				self.declare_local(binding.name, ty, binding.mut_span)
+			});
 			self.body.push_param(local);
 		}
 		self.build_block_in(ScopeIdx::ROOT, block, span);

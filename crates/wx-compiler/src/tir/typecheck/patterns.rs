@@ -837,7 +837,9 @@ impl BodyBuilder<'_, '_> {
 
 	/// The children of `Name({ x, y: pat, .. })`, one per field in
 	/// declaration order. A field not named is covered by `..`; without one
-	/// it is reported and matched as `_`.
+	/// it is reported and matched as `_`. An owner with a field name the
+	/// parser reported missing is not matched by name: its fields are
+	/// checked against nothing, and nothing more is reported.
 	fn check_fields(
 		&mut self,
 		fields: ast::List<ast::PatternFieldItem>,
@@ -848,16 +850,6 @@ impl BodyBuilder<'_, '_> {
 	) -> Option<Vec<PatIdx>> {
 		let range = owner.fields(&self.sema.decls);
 		if !self.sema.decls.fields.is_fully_named(range) {
-			let (noun, name) = (owner.noun(), self.owner_name(owner));
-			self.sema.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::TupleStructBracePattern.code())
-					.with_message(format!(
-						"{noun} `{name}` has unnamed fields, so it is matched \
-						 with `{name}(...)`"
-					))
-					.with_label(Label::primary(self.scope.file_id, span)),
-			);
 			for item in self.ast().list(fields) {
 				if let ast::PatternFieldItem::Field(field) = item {
 					self.check_field(field, TypeIndex::ERROR, context);

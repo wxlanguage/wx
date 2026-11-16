@@ -304,7 +304,7 @@ fn test_top_level_items() {
 	// snapshot shows how each one parses.
 	let case = TestCase::new(indoc! {r#"
         #[inline]
-        pub func add<T: Add + Copy, const N: u32>(a: T, mut b: T, _: u8, u16) -> T {
+        pub func add<T: Add + Copy, const N: u32>(a: T, mut b: T, d: u8, c: u16) -> T {
             local x: i32 = 1;
             local (p, mut q) = pair;
             local Point({ x, y: py, .. }) = point;
@@ -330,7 +330,7 @@ fn test_top_level_items() {
             }
             a + b * 2
         }
-        func declared(heap::&[u8]) -> !;
+        func declared(a: heap::&[u8]) -> !;
         pub package func clz(value: u32) -> u32;
         package const SIZE: u32;
         pub package type Pointer<M>;
@@ -339,8 +339,8 @@ fn test_top_level_items() {
         global mut counter: i32 = 0;
         const MAX: i32 = 100;
         struct Point(pub x: i32, y: i32);
-        pub struct Pair<T>(T, pub mut flag: u8);
-        enum Color(u8) { Red, Green = 1, Blue }
+        pub struct Pair<T>(a: T, pub mut flag: u8);
+        enum Color(value: u8) { Red, Green = 1, Blue }
         import "env" as env {
             "Log": func log(message: heap::&[u8]);
             global mut ticks: u64;
@@ -381,7 +381,7 @@ fn test_top_level_items() {
 #[test]
 fn test_enum_repr_after_name() {
 	let case = TestCase::new(indoc! {"
-        enum Status(i32) {
+        enum Status(value: i32) {
             Foo,
             Bar,
         }
@@ -424,9 +424,7 @@ fn test_function_mut_param() {
 	case.diagnostics().assert_none();
 
 	let param = &case.ast.list(case.function_signature(0).params)[0];
-	let Some(Binding::Name { mut_span, name }) = param.binding else {
-		panic!("`n` is named")
-	};
+	let Binding { mut_span, name } = param.binding;
 	assert_eq!(case.name(name.inner), "n");
 	assert!(mut_span.is_some(), "`mut n` should record a mut span");
 
@@ -1092,7 +1090,7 @@ fn test_a_match_arm_expression_body_needs_a_separator() {
 #[test]
 fn test_match_enum_variant_patterns() {
 	let case = TestCase::new(indoc! {"
-        enum FileDescriptor(u8) {
+        enum FileDescriptor(value: u8) {
             StdIn,
             StdOut,
             StdErr,
@@ -1487,10 +1485,8 @@ fn a_plain_block_is_written_with_its_keyword() {
 #[test]
 fn an_enum_repr_is_written_as_a_struct_field() {
 	let case = TestCase::new(indoc! {"
-        enum A(i8) { X = 0 }
-        enum B(value: i8) { X = 0 }
-        enum C(_: i8) { X = 0 }
-        pub enum D(pub i8) { X = 0 }
+        enum A(value: i8) { X = 0 }
+        pub enum B(pub value: i8) { X = 0 }
     "});
 	case.diagnostics().assert_none();
 	let repr = |index| {
@@ -1499,17 +1495,9 @@ fn an_enum_repr_is_written_as_a_struct_field() {
 		};
 		case.ast.list(*repr)[0]
 	};
-	assert!(repr(0).binding.is_none() && repr(0).pub_span.is_none());
-	assert_eq!(
-		repr(1)
-			.binding
-			.and_then(Binding::name)
-			.and_then(|name| case.strings.resolve(name.inner)),
-		Some("value"),
-	);
-	// `_` names nothing, as on a struct field or a parameter.
-	assert!(repr(2).binding.and_then(Binding::name).is_none());
-	assert!(repr(3).pub_span.is_some());
+	assert_eq!(case.name(repr(0).binding.name.inner), "value");
+	assert!(repr(0).pub_span.is_none());
+	assert!(repr(1).pub_span.is_some());
 }
 
 #[test]
@@ -1520,13 +1508,7 @@ fn a_mut_enum_repr_is_parsed_as_written() {
 	let Item::Enum { repr, variants, .. } = case.item(0) else {
 		panic!("expected enum item")
 	};
-	assert!(matches!(
-		case.ast.list(*repr)[0].binding,
-		Some(Binding::Name {
-			mut_span: Some(_),
-			..
-		})
-	));
+	assert!(case.ast.list(*repr)[0].binding.mut_span.is_some());
 	assert_eq!(variants.len(), 1);
 }
 
@@ -1576,120 +1558,44 @@ fn old_struct_forms_are_reported_and_read_as_the_new_ones() {
 	assert_eq!(case.local_patterns(1)[1], "<error>");
 }
 
-#[test]
-fn struct_fields_have_optional_names() {
-	let case = TestCase::new(indoc! {"
-        struct Named(pub x: i32, y: Vec<T>);
-        struct Positional(i32, pub heap::*u8, func(i32) -> i32, Self, _);
-        struct Mixed(pub id: u32, math::Number);
-        struct Unit();
-    "});
-	case.diagnostics().assert_none();
-	let names = |index: usize| -> Vec<Option<String>> {
-		case.struct_fields(index)
-			.iter()
-			.map(|f| {
-				f.binding
-					.and_then(Binding::name)
-					.map(|n| case.name(n.inner).to_string())
-			})
-			.collect()
-	};
-	assert_eq!(names(0), [Some("x".into()), Some("y".into())]);
-	assert_eq!(names(1), [None, None, None, None, None]);
-	assert_eq!(names(2), [Some("id".into()), None]);
-	assert!(names(3).is_empty());
-	// A positional field's type that starts with an identifier is parsed on
-	// from it: `math::Number`, `heap::*u8`.
-	assert!(matches!(
-		case.ast.ty(case.struct_fields(2)[1].ty),
-		TypeExpression::Path(ref segments) if segments.len() == 2
-	));
-	assert!(matches!(
-		case.ast.ty(case.struct_fields(1)[1].ty),
-		TypeExpression::Pointer { .. }
-	));
-	assert!(case.struct_fields(1)[1].pub_span.is_some());
-}
-
-/// A parameter and a field are both written `binding: Type`, or `Type`
-/// alone. A binding (`_`, `name`, `mut name`) is always followed by `:`, so
-/// anything else is a type.
+/// A parameter and a field are both written `binding: Type`, a binding
+/// being `name` or `mut name`.
 #[test]
 fn parameters_and_fields_share_the_slot_grammar() {
 	let case = TestCase::new(indoc! {"
-        func f(i32, _: u8, c: i32, mut d: i32, x, _) {}
-        struct S(i32, _: u8, c: i32, mut d: i32, pub mut e: i32, x, _);
+        func f(a: i32, mut d: heap::*u8) {}
+        struct S(a: i32, mut d: heap::*u8, pub mut e: i32);
+        struct Unit();
     "});
 	case.diagnostics().assert_none();
-	let expected: [Option<&str>; 6] =
-		[None, None, Some("c"), Some("d"), None, None];
-	let params = case.ast.list(case.function_signature(0).params);
-	let names: Vec<_> = params
+	let describe = |binding: Binding| {
+		format!(
+			"{}{}",
+			if binding.mut_span.is_some() {
+				"mut "
+			} else {
+				""
+			},
+			case.name(binding.name.inner)
+		)
+	};
+	let params: Vec<_> = case
+		.ast
+		.list(case.function_signature(0).params)
 		.iter()
-		.map(|param| {
-			param
-				.binding
-				.and_then(Binding::name)
-				.map(|n| case.name(n.inner))
-		})
+		.map(|param| describe(param.binding))
 		.collect();
-	assert_eq!(names, expected);
-	let muts: Vec<_> = params
-		.iter()
-		.map(|param| {
-			param.binding.is_some_and(|b| {
-				matches!(
-					b,
-					Binding::Name {
-						mut_span: Some(_),
-						..
-					}
-				)
-			})
-		})
-		.collect();
-	assert_eq!(muts, [false, false, false, true, false, false]);
-	// `_:` is written, a binding that binds nothing; a type alone has none.
-	assert!(params[0].binding.is_none());
-	assert!(matches!(params[1].binding, Some(Binding::Wildcard(_))));
-	// `x` alone is the type `x`, `_` alone the type `_`.
-	let ty = |index: usize| case.ast.ty(params[index].ty);
-	assert!(
-		matches!(ty(4), TypeExpression::Path(segments) if segments.len() == 1)
-	);
-	assert!(matches!(ty(5), TypeExpression::Infer));
-
+	assert_eq!(params, ["a", "mut d"]);
 	let fields = case.struct_fields(1);
-	let names: Vec<_> = fields
-		.iter()
-		.map(|field| {
-			field
-				.binding
-				.and_then(Binding::name)
-				.map(|n| case.name(n.inner))
-		})
-		.collect();
-	assert_eq!(
-		names,
-		[None, None, Some("c"), Some("d"), Some("e"), None, None]
-	);
-	let muts: Vec<_> = fields
-		.iter()
-		.map(|field| {
-			field.binding.is_some_and(|b| {
-				matches!(
-					b,
-					Binding::Name {
-						mut_span: Some(_),
-						..
-					}
-				)
-			})
-		})
-		.collect();
-	assert_eq!(muts, [false, false, false, true, true, false, false]);
-	assert!(fields[4].pub_span.is_some());
+	let names: Vec<_> =
+		fields.iter().map(|field| describe(field.binding)).collect();
+	assert_eq!(names, ["a", "mut d", "mut e"]);
+	assert!(fields[2].pub_span.is_some());
+	assert!(matches!(
+		case.ast.ty(fields[1].ty),
+		TypeExpression::Pointer { .. }
+	));
+	assert!(case.struct_fields(2).is_empty());
 }
 
 /// `self` is a binding like any other: its type is written.
@@ -1702,18 +1608,17 @@ fn the_receiver_is_written_with_its_type() {
 	case.diagnostics().assert_none();
 	for index in 0..2 {
 		let param = &case.ast.list(case.function_signature(index).params)[0];
-		let Some(Binding::Name { mut_span, name }) = param.binding else {
-			panic!("`self` is a name")
-		};
+		let Binding { mut_span, name } = param.binding;
 		assert_eq!(case.name(name.inner), "self");
 		assert_eq!(mut_span.is_some(), index == 1);
 	}
 }
 
-/// A binding needs a type, and `mut` needs a name, in a parameter and in a
-/// field alike.
+/// A slot starts with a binding: a lone identifier is one, with no type;
+/// a type is not one, and neither is `_`, in a parameter and in a field
+/// alike. Each is reported once.
 #[test]
-fn a_binding_needs_a_type_and_mut_a_name() {
+fn a_slot_starts_with_a_binding_and_its_type() {
 	for (source, code, message) in [
 		(
 			"func f(self) {}",
@@ -1726,7 +1631,7 @@ fn a_binding_needs_a_type_and_mut_a_name() {
 			"expected a type annotation",
 		),
 		(
-			"func f(mut i32) {}",
+			"func f(i32) {}",
 			DiagnosticCode::MissingTypeAnnotation,
 			"expected a type annotation",
 		),
@@ -1736,34 +1641,39 @@ fn a_binding_needs_a_type_and_mut_a_name() {
 			"expected a type annotation",
 		),
 		(
-			"func f(mut heap::*u8) {}",
-			DiagnosticCode::InvalidMutBinding,
-			"`mut` needs a name",
-		),
-		(
-			"struct S(mut i32);",
+			"struct S(i32);",
 			DiagnosticCode::MissingTypeAnnotation,
 			"expected a type annotation",
 		),
 		(
-			"func f(mut _: i32) {}",
-			DiagnosticCode::InvalidMutBinding,
-			"`mut` needs a name",
+			"func f(heap::*u8) {}",
+			DiagnosticCode::UnexpectedToken,
+			"expected `:`, found `::`",
 		),
 		(
-			"func f(mut _) {}",
-			DiagnosticCode::InvalidMutBinding,
-			"`mut` needs a name",
+			"func f(*u8) {}",
+			DiagnosticCode::UnexpectedToken,
+			"expected a name before this type",
 		),
 		(
 			"func f(mut *u8) {}",
-			DiagnosticCode::InvalidMutBinding,
-			"`mut` needs a name",
+			DiagnosticCode::UnexpectedToken,
+			"expected a name before this type",
 		),
 		(
-			"struct S(mut _: i32);",
-			DiagnosticCode::InvalidMutBinding,
-			"`mut` needs a name",
+			"func f(_: u32) {}",
+			DiagnosticCode::UnexpectedToken,
+			"expected a name, found `_`",
+		),
+		(
+			"struct S(pub _: u32);",
+			DiagnosticCode::UnexpectedToken,
+			"expected a name, found `_`",
+		),
+		(
+			"struct S([u8]);",
+			DiagnosticCode::UnexpectedToken,
+			"expected a name before this type",
 		),
 	] {
 		let case = TestCase::new(source);
@@ -1771,6 +1681,42 @@ fn a_binding_needs_a_type_and_mut_a_name() {
 		diagnostics.assert_codes(&[code]);
 		diagnostics.assert_error_saying(message);
 	}
+}
+
+/// A slot whose name is missing, `_: u8` or a type alone, is kept with the
+/// missing name, so the item keeps its arity; `=` starts no binding and no
+/// type, so its slot is skipped, and the next one is read.
+#[test]
+fn a_slot_missing_its_name_is_kept() {
+	let case = TestCase::new("func f(_: u8, (u8, u16), = 1, d: u32) {}");
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::UnexpectedToken,
+	]);
+	let params = case.ast.list(case.function_signature(0).params);
+	assert_eq!(params.len(), 3);
+	assert!(params[0].binding.is_missing() && params[1].binding.is_missing());
+	assert!(matches!(
+		case.ast.ty(params[1].ty),
+		TypeExpression::Tuple { .. }
+	));
+	assert_eq!(case.name(params[2].binding.name.inner), "d");
+}
+
+/// A failed list item skips a group it opens whole, and stops at a keyword
+/// that only starts an item, so a group left open keeps what follows.
+#[test]
+fn a_failed_list_item_is_skipped_up_to_the_next_item() {
+	let case = TestCase::new(indoc! {"
+        func f(= (a, b), c: u32) {}
+        func g(= (a, b
+        struct S(x: u32);
+    "});
+	let params = case.ast.list(case.function_signature(0).params);
+	assert_eq!(params.len(), 1);
+	assert_eq!(case.name(params[0].binding.name.inner), "c");
+	assert_eq!(case.struct_fields(2).len(), 1);
 }
 
 /// A binding written without its type keeps its name and is given an error
@@ -1785,14 +1731,9 @@ fn a_binding_without_a_type_recovers_with_an_error_type() {
 	let params = case.ast.list(case.function_signature(0).params);
 	let names: Vec<_> = params
 		.iter()
-		.map(|param| {
-			param
-				.binding
-				.and_then(Binding::name)
-				.map(|n| case.name(n.inner))
-		})
+		.map(|param| case.name(param.binding.name.inner))
 		.collect();
-	assert_eq!(names, [Some("self"), Some("x"), Some("y")]);
+	assert_eq!(names, ["self", "x", "y"]);
 	for param in &params[..2] {
 		assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
 	}
@@ -4564,9 +4505,9 @@ fn dots_in_an_enum_body_are_reported_and_skipped() {
 	// An enum is closed: `..` no longer opens it. It is reported, with the
 	// struct form as the hint, and the variants around it are still read.
 	for (source, variants) in [
-		("enum E(u8) { A, B, .. }", 2),
-		("enum E(u8) { A, .., B }", 2),
-		("enum E(u8) { .. }", 0),
+		("enum E(value: u8) { A, B, .. }", 2),
+		("enum E(value: u8) { A, .., B }", 2),
+		("enum E(value: u8) { .. }", 0),
 	] {
 		let case = TestCase::new(source);
 		case.diagnostics()
@@ -4925,7 +4866,6 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	let params = case.ast.list(case.function_signature(0).params);
 	assert_eq!(params.len(), 2);
 	let param = &params[1];
-	assert!(matches!(param.binding, Some(Binding::Name { .. })));
 	assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
 	assert_eq!(case.ast.type_span(param.ty), TextSpan::new(17, 18));
 

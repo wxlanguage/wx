@@ -5,9 +5,9 @@
 //! - every member the impl writes is one the trait declares, of the same
 //!   kind, and every declaration without a default is provided;
 //! - a function's signature is the declaration's read with `Self` as the
-//!   target: the same number of own type parameters and parameters, every
-//!   parameter name the declaration gives (an impl may name one it leaves
-//!   unnamed), the same types; a constant has the declaration's type;
+//!   target: the same number of own type parameters and parameters, the
+//!   same parameter names, the same types; a constant has the declaration's
+//!   type;
 //! - the target implements the trait's supertraits, with their bindings
 //!   (`Self`'s clauses in the trait's frame, proved for the target);
 //! - every associated type's value (the impl's own, or the default it
@@ -1290,15 +1290,18 @@ impl<'ast> SemanticsBuilder<'ast> {
 					})
 				};
 				// A concrete call names the impl's parameters, so the impl keeps
-				// every name the trait gives and may name one it leaves unnamed.
-				if expected_name.is_some() && expected_name != name {
+				// every name the trait gives. A name the parser reported missing
+				// is compared with nothing.
+				if let (Some(expected), Some(found)) =
+					(spanned(declaration), spanned(function))
+					&& expected_name != name
+				{
 					self.report_name_mismatch(
 						sema,
 						trait_index,
 						member,
 						(declaration, function),
-						position,
-						(spanned(declaration), spanned(function)),
+						(expected, found),
 					);
 					return Ok(());
 				}
@@ -1490,9 +1493,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 
 	/// A parameter's name is part of the trait's contract: a call by name
 	/// through the trait uses it, and a concrete call uses the impl's own
-	/// names, which accept at least what the trait's do. So an impl keeps
-	/// every name the trait gives (never renaming it or leaving it unnamed)
-	/// and may name a parameter the trait leaves unnamed. Only the name is
+	/// names. So an impl keeps every name the trait gives. Only the name is
 	/// compared; whether its local is `mut` is the body's own.
 	fn report_name_mismatch(
 		&mut self,
@@ -1500,31 +1501,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 		trait_index: TraitIdx,
 		member: MemberKind,
 		(declaration, function): (FunctionIdx, FunctionIdx),
-		position: usize,
-		(expected, found): (
-			Option<Spanned<SymbolU32>>,
-			Option<Spanned<SymbolU32>>,
-		),
+		(expected, found): (Spanned<SymbolU32>, Spanned<SymbolU32>),
 	) {
-		let describe = |name: Option<Spanned<SymbolU32>>| match name {
-			Some(name) => {
-				format!("`{}`", self.strings.resolve(name.inner).unwrap())
-			}
-			None => "an unnamed parameter".to_owned(),
-		};
-		// An unnamed parameter is pointed at by its type.
-		let at = |function: FunctionIdx, name: Option<Spanned<SymbolU32>>| {
-			name.map_or_else(
-				|| {
-					let file_id = sema.decls.file_id(
-						sema.decls.functions[usize::from(function)].loc,
-					);
-					let params = self.function_syntax(function).params;
-					let param = self.ast(file_id).list(params)[position];
-					self.ast(file_id).type_span(param.ty)
-				},
-				|name| name.span,
-			)
+		let describe = |name: Spanned<SymbolU32>| {
+			format!("`{}`", self.strings.resolve(name.inner).unwrap())
 		};
 		let diagnostic = sema
 			.signature_mismatch(&self.strings, trait_index, member, function)
@@ -1533,7 +1513,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema.decls.file_id(
 						sema.decls.functions[usize::from(function)].loc,
 					),
-					at(function, found),
+					found.span,
 				)
 				.primary_label()
 				.with_message(format!(
@@ -1547,7 +1527,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema.decls.file_id(
 						sema.decls.functions[usize::from(declaration)].loc,
 					),
-					at(declaration, expected),
+					expected.span,
 				)
 				.secondary_label()
 				.with_message("parameter in trait"),
@@ -1568,7 +1548,7 @@ mod tests {
 	use super::*;
 	use crate::diagnostics::DiagnosticCode;
 	use crate::testing::DiagnosticView;
-	use crate::tir::signatures::tests::source_graph;
+	use crate::tir::signatures::tests::{recovered_source_graph, source_graph};
 	use crate::vfs::Files;
 
 	/// A checked `Semantics`, with the files it was checked from.
@@ -1872,46 +1852,54 @@ mod tests {
 			indoc! {"
 			trait Store: StackValue {
 				func renamed(self: Self, rhs: u32);
-				func unnamed(self: Self, u32);
-				func named(self: Self, at: u32);
-				func bare(self: Self, at: u32);
+				func kept(self: Self, at: u32);
 				func receiver(self: Self);
 			}
 			struct Bag();
 			impl Store for Bag {
 				func renamed(self: Self, other: u32) {}
-				func unnamed(self: Self, at: u32) {}
-				func named(self: Self, _: u32) {}
-				func bare(self: Self, u32) {}
+				func kept(self: Self, at: u32) {}
 				func receiver(this: Self) {}
 			}
 		"}
 		);
 		let case = TestCase::new(&source);
-		// `unnamed` names a parameter the trait leaves unnamed, which a
-		// concrete call may use; `named` and `bare` drop the trait's name.
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TraitImplSignatureMismatch,
 			DiagnosticCode::TraitImplSignatureMismatch,
-			DiagnosticCode::TraitImplSignatureMismatch,
-			DiagnosticCode::TraitImplSignatureMismatch,
 		]);
-		let [renamed, named, bare, receiver] = &case.sema.diagnostics[..]
-		else {
+		let [renamed, receiver] = &case.sema.diagnostics[..] else {
 			unreachable!()
 		};
 		assert_eq!(labelled(&source, renamed, 0), "other");
 		assert_eq!(renamed.labels[0].message, "expected `rhs`, found `other`");
 		assert_eq!(labelled(&source, renamed, 1), "rhs");
-		for dropped in [named, bare] {
-			assert_eq!(
-				dropped.labels[0].message,
-				"expected `at`, found an unnamed parameter"
-			);
-			// An unnamed parameter is pointed at by its type.
-			assert_eq!(labelled(&source, dropped, 0), "u32");
-		}
 		assert_eq!(receiver.labels[0].message, "expected `self`, found `this`");
+	}
+
+	/// A name the parser reported missing, in the trait or in the impl, is
+	/// compared with nothing, so it is reported once.
+	#[test]
+	fn a_missing_parameter_name_is_not_a_mismatch() {
+		let source = format!(
+			"{PRELUDE}{}",
+			indoc! {"
+			trait Store: StackValue {
+				func a(self: Self, _: u32);
+				func b(self: Self, at: u32);
+			}
+			struct Bag();
+			impl Store for Bag {
+				func a(self: Self, at: u32) {}
+				func b(self: Self, _: u32) {}
+			}
+		"}
+		);
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph = recovered_source_graph(&source, &mut strings);
+		let sema = crate::tir::check(&graph, &mut strings);
+		DiagnosticView::new("conformance", &sema.diagnostics, &graph.files)
+			.assert_none();
 	}
 
 	#[test]

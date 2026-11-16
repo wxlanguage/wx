@@ -1,6 +1,6 @@
 # Binders: names in parameters, fields and patterns
 
-Status: decided 2026-11-16, not implemented. Plan below.
+Status: decided 2026-11-16. Implemented, except the loop header, which is built with `notes/loop-bindings.md`. "As built" records where the implementation went another way than the plan.
 
 ## Problem
 
@@ -154,6 +154,35 @@ away the by-name construction and `.name` access.
 **`_` kept as a parameter binder.** It is what forces E2123 and the
 conformance rule, and its one use, marking a parameter unused, is served by
 `_ = param;` without touching the interface.
+
+## As built
+
+The plan below said `_` would be parsed in a binder slot and reported by the
+checker. It went simpler, in the parser alone:
+
+- **A binding is `name` or `mut name`** (`ast::Binding`, a struct; there is no
+  `Wildcard`), and every `FunctionParam` and `StructField` has one.
+- **`_: T` and a type alone** (`(u8, u16)`, `*u8`, `func(A) -> R`) are
+  reported ("expected a name, found `_`", "expected a name before this type",
+  E1002 `UnexpectedToken`, no code of its own) and kept with a missing name,
+  the error symbol (`Binding::missing`), as `x.` keeps a missing
+  `PathSegment`. The item keeps its arity, and checking treats the slot as
+  unnamed and stays silent on it: no local, no name to call or match by, no
+  duplicate, no conformance mismatch.
+- **A lone identifier** with the slot ending after it (`func log(i32)`) is a
+  binding with no type: E1023 and an error type. An identifier followed by
+  anything else (`heap::*u8`) is "expected `:`", and the slot is skipped:
+  telling a name from a type there is the lookahead this removes.
+- **Anything else** is "expected a name", and the list skips the slot.
+  `skip_to_separator` now skips a group it opens whole (`(..)`, `[..]`,
+  `{..}`), and stops at a keyword that only starts an item at any depth, so
+  a group left open does not swallow the items after it.
+- **E2123** stays, for a value called through `Call` by name; its
+  unnamed-parameter case is gone. **E2088** (`TupleStructBracePattern`) is
+  retired: no valid struct has an unnamed field. **E1022** (`mut` needs a
+  name) is retired: `mut` before something that is no name is "expected a
+  name".
+- **Hover** prints an enum's repr with its name (`enum Color(value: u8)`).
 
 ## Plan
 

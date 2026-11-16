@@ -766,35 +766,42 @@ pub enum Statement {
 
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-/// What a parameter or a field is bound to, written before a `:`. One left
-/// out is no `Binding` at all, and binds nothing as `_` does.
-pub enum Binding {
-	/// `_`: binds nothing.
-	Wildcard(TextSpan),
-	/// `name` or `mut name`.
-	Name {
-		mut_span: Option<TextSpan>,
-		name: Spanned<SymbolU32>,
-	},
+/// What a parameter or a field is bound to, written before its `:`: `name`
+/// or `mut name`. There is no `_`: a parameter's or a field's name is part
+/// of its item's interface (a call or a construction by name, `.name`), and
+/// a value is dropped with the `_` pattern instead.
+pub struct Binding {
+	pub mut_span: Option<TextSpan>,
+	pub name: Spanned<SymbolU32>,
 }
 
 impl Binding {
-	/// The name bound, `None` for `_`.
-	pub fn name(self) -> Option<Spanned<SymbolU32>> {
-		match self {
-			Binding::Wildcard(_) => None,
-			Binding::Name { name, .. } => Some(name),
+	/// The name a slot is missing (`_: u8`, or a type alone, `(u8, u16)`):
+	/// the error symbol, at the empty span where the name goes. The parser
+	/// has reported it, so the slot is kept, unnamed, and nothing reports it
+	/// again.
+	pub fn missing(mut_span: Option<TextSpan>, at: u32) -> Self {
+		Self {
+			mut_span,
+			name: Spanned {
+				inner: Keyword::Error.symbol(),
+				span: TextSpan::new(at, at),
+			},
 		}
+	}
+
+	/// Whether no name is written here: the parser reported it already.
+	pub fn is_missing(&self) -> bool {
+		self.name.inner == Keyword::Error.symbol()
 	}
 }
 
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-/// A parameter, written like a struct field: `binding: Type`, or `Type`
-/// alone, which binds nothing as `_: Type` does. The receiver is
-/// `self: Type`.
+/// A parameter, written like a struct field: `binding: Type`. The receiver
+/// is `self: Type`.
 pub struct FunctionParam {
-	pub binding: Option<Binding>,
+	pub binding: Binding,
 	pub ty: TypeId,
 }
 
@@ -1187,9 +1194,8 @@ pub enum Item {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct StructField {
 	pub pub_span: Option<TextSpan>,
-	/// `None` for a positional field: `struct Pair(i32, i32);`. A binding's
-	/// `mut` is parsed; what it allows is not checked yet.
-	pub binding: Option<Binding>,
+	/// A binding's `mut` is parsed; what it allows is not checked yet.
+	pub binding: Binding,
 	pub ty: TypeId,
 }
 

@@ -3033,7 +3033,7 @@ mod tests {
 				struct Q();
 				impl Tr for P { const Y: u32 = 7; }
 				impl Tr for Q { const X: u32 = 2; const Y: u32 = 3; }
-				struct W<T>(T);
+				struct W<T>(a: T);
 				impl<T: Tr> Tr for W<T> { const Y: u32 = T::X * 10; }
 				const INHERITED: u32 = P::X;
 				const OVERRIDDEN: u32 = <Q as Tr>::X;

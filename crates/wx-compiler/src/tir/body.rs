@@ -1206,7 +1206,7 @@ mod tests {
 	#[test]
 	fn locals_at_agrees_with_the_checker() {
 		let case = Case::new(indoc! {"
-			func f(a: u32, _: u32, mut b: u32) -> u32 {
+			func f(a: u32, c: u32, mut b: u32) -> u32 {
 			    local x = a;
 			    local x = x + b;
 			    b = x;

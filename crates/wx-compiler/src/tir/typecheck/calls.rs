@@ -138,8 +138,8 @@ impl CallTarget {
 		}
 	}
 
-	/// Each parameter's name as a call by name spells it, `None` when it is
-	/// unnamed.
+	/// Each parameter's name as a call by name spells it, `None` for a name
+	/// the parser reported missing.
 	pub(super) fn param_names<'d>(
 		&self,
 		decls: &'d Declarations,
@@ -191,8 +191,8 @@ impl Semantics {
 	/// receiver, which its object gives and no name can), as the checker
 	/// matches them (`CallTarget::param_names`): a function's own, or a
 	/// struct's fields (named, or `Self` in an impl for it). Nothing for a
-	/// target with an unnamed parameter, which is called by position only, or
-	/// for a callee that is no function or struct.
+	/// target with a name the parser reported missing, or for a callee that
+	/// is no function or struct.
 	pub fn argument_names(
 		&self,
 		callee: Definition,
@@ -798,9 +798,10 @@ impl BodyBuilder<'_, '_> {
 	}
 
 	/// `f({ b: 2, a })`: each argument gives the parameter of its name, in
-	/// written order. A target with an unnamed parameter is called by
-	/// position only. An argument naming no parameter, or one already given,
-	/// is built and dropped.
+	/// written order. An argument naming no parameter, or one already given,
+	/// is built and dropped. A target with a name the parser reported missing
+	/// is not matched: its arguments are built, and nothing more is
+	/// reported.
 	fn named_arguments(
 		&mut self,
 		target: &CallTarget,
@@ -812,23 +813,7 @@ impl BodyBuilder<'_, '_> {
 		let skipped = given.len();
 		let param_names = target.param_names(&self.sema.decls);
 		let count = param_names.len();
-		let positional_only =
-			param_names[skipped..].iter().any(Option::is_none);
-		if positional_only {
-			let (kind, target_name) = (
-				target.kind.describe(),
-				target.kind.name(self.builder.strings, self.sema),
-			);
-			self.sema.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::PositionalOnlyCall.code())
-					.with_message(format!(
-						"{kind} `{target_name}` has an unnamed parameter, so \
-						 it is called by position"
-					))
-					.with_label(Label::primary(self.scope.file_id, span))
-					.with_label(target.kind.declared_here(self.sema)),
-			);
+		if param_names[skipped..].iter().any(Option::is_none) {
 			for argument in arguments {
 				self.build_named_argument(argument, TypeIndex::INFER);
 			}

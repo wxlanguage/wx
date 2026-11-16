@@ -2362,7 +2362,7 @@ mod tests {
 		impl<T: StackValue> W<T> {
 		    pub func wrap(value: T) -> Self { Self(value) }
 		}
-		enum Kind(u8) { A = 0, B }
+		enum Kind(value: u8) { A = 0, B }
 		impl Kind {
 		    pub func of(n: u8) -> Self { Kind::A }
 		}

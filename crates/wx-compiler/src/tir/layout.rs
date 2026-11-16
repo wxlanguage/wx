@@ -784,7 +784,7 @@ mod tests {
 	#[test]
 	fn primitives_and_addresses_take_their_width() {
 		let source = with_memories(indoc! {"
-			enum Small(u16) { A = 0 }
+			enum Small(value: u16) { A = 0 }
 			func f(
 				a: u8, b: u16, c: u32, d: u64, e: Bool, g: f64,
 				h: heap::&u8, i: wide::*u64, j: heap::&[u8; 4],
@@ -879,12 +879,12 @@ mod tests {
 	#[test]
 	fn a_nested_aggregate_is_flattened_at_its_offset() {
 		let source = with_memories(indoc! {"
-			enum Small(u16) { A = 0 }
+			enum Small(value: u16) { A = 0 }
 			struct Text(len: u8, bytes: heap::&[u8]);
 			struct Outer(a: u8, inner: Text);
 			struct WideText(len: u8, bytes: wide::&[u8]);
 			struct Tagged(tag: Small, x: u32);
-			struct Pair<T>(T, T);
+			struct Pair<T>(a: T, b: T);
 			func f(
 				a: Text, b: Outer, c: WideText, d: Tagged,
 				e: Pair<Pair<u8>>,
@@ -972,11 +972,11 @@ mod tests {
 	#[test]
 	fn types_of_one_layout_share_it() {
 		let source = with_memories(indoc! {"
-			struct Pair<A, B>(A, B);
+			struct Pair<A, B>(a: A, b: B);
 			struct Named(x: u32, y: u8);
 			#[fixed_order]
-			struct Swapped(u8, u32);
-			struct Wrap<T>(T);
+			struct Swapped(a: u8, b: u32);
+			struct Wrap<T>(a: T);
 			func f<T: StackValue>(
 				a: Pair<u32, u8>, b: (u32, u8), c: Named, d: Swapped,
 				e: Wrap<heap::&T>, g: Wrap<heap::&u8>,
@@ -1018,7 +1018,7 @@ mod tests {
 	#[test]
 	fn an_abstract_part_or_a_reference_has_no_layout() {
 		let source = with_memories(indoc! {"
-			struct Wrap<T>(T);
+			struct Wrap<T>(a: T);
 			func f<T: StackValue, Mem: Memory>(
 				a: T, b: Wrap<T>, c: heap::&T, d: Mem::&u8,
 				e: func(u32) -> u32, g: (u8, func(u32) -> u32),

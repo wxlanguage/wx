@@ -580,12 +580,10 @@ impl<'a> Printer<'a> {
 		signature: &FunctionSignature,
 		attributes: List<Attribute>,
 	) -> impl Iterator<Item = Sexp> + use<'_, 'a> {
-		let params = self.ast.list(signature.params).iter().map(|param| {
-			match self.bound_to(param.binding, param.ty) {
-				mut parts if parts.len() == 1 => parts.remove(0),
-				parts => Sexp::List(parts),
-			}
-		});
+		let params =
+			self.ast.list(signature.params).iter().map(|param| {
+				Sexp::List(self.bound_to(param.binding, param.ty))
+			});
 		[Sexp::atom(self.name(signature.name.inner))]
 			.into_iter()
 			.chain(self.attributes(attributes))
@@ -596,19 +594,18 @@ impl<'a> Printer<'a> {
 			}))
 	}
 
-	/// What a parameter or a field is bound to, then its type: `T` alone
-	/// when nothing is bound, else `x T`, `mut x T` or `_ T`.
-	fn bound_to(&self, binding: Option<Binding>, ty: TypeId) -> Vec<Sexp> {
-		let ty = Sexp::atom(self.ty(ty));
-		match binding {
-			None => vec![ty],
-			Some(Binding::Wildcard(_)) => vec![Sexp::atom("_"), ty],
-			Some(Binding::Name { mut_span, name }) => mut_span
-				.map(|_| Sexp::atom("mut"))
-				.into_iter()
-				.chain([Sexp::atom(self.name(name.inner)), ty])
-				.collect(),
-		}
+	/// What a parameter or a field is bound to, then its type: `x T` or
+	/// `mut x T`.
+	fn bound_to(&self, binding: Binding, ty: TypeId) -> Vec<Sexp> {
+		binding
+			.mut_span
+			.map(|_| Sexp::atom("mut"))
+			.into_iter()
+			.chain([
+				Sexp::atom(self.name(binding.name.inner)),
+				Sexp::atom(self.ty(ty)),
+			])
+			.collect()
 	}
 
 	/// `(type T)`, when a type is written.

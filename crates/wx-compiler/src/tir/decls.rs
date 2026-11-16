@@ -593,12 +593,12 @@ impl FieldRange {
 #[derive(Default)]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct FieldArena {
-	/// Each field's name, `None` for a positional field.
+	/// Each field's name, `None` for one the parser reported missing.
 	names: Vec<Option<SymbolU32>>,
 	/// Each field's `pub`.
 	visibility: Vec<Visibility>,
 	/// Where each field's name is written; an empty span at the field's start
-	/// for a positional one, which is never read, since `names` already says
+	/// for a missing one, which is never read, since `names` already says
 	/// it has none.
 	name_spans: Vec<TextSpan>,
 }
@@ -614,7 +614,7 @@ impl FieldArena {
 		&self.visibility[fields.range()]
 	}
 
-	/// The field's name, `None` for a positional one.
+	/// The field's name, `None` for one the parser reported missing.
 	pub fn name(
 		&self,
 		fields: FieldRange,
@@ -631,7 +631,7 @@ impl FieldArena {
 
 	/// `field`, written at `span`.
 	fn push(&mut self, field: &ast::StructField, span: TextSpan) {
-		let name = field.binding.and_then(ast::Binding::name);
+		let name = (!field.binding.is_missing()).then_some(field.binding.name);
 		self.names.push(name.map(|name| name.inner));
 		self.visibility.push(Visibility::from(field.pub_span));
 		self.name_spans.push(
@@ -693,10 +693,10 @@ impl ParamRange {
 #[derive(Default)]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub struct ParamArena {
-	/// Each parameter's name, `None` for an unnamed one.
+	/// Each parameter's name, `None` for one the parser reported missing.
 	names: Vec<Option<SymbolU32>>,
 	/// Where each parameter's name is written; an empty span at the
-	/// parameter's start for an unnamed one, which is never read.
+	/// parameter's start for a missing one, which is never read.
 	name_spans: Vec<TextSpan>,
 }
 
@@ -706,7 +706,7 @@ impl ParamArena {
 		&self.names[params.range()]
 	}
 
-	/// The parameter's name, `None` for an unnamed one.
+	/// The parameter's name, `None` for one the parser reported missing.
 	pub fn name(&self, params: ParamRange, param: usize) -> Option<SymbolU32> {
 		self.names(params)[param]
 	}
@@ -3410,7 +3410,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	) -> FieldRange {
 		let start = u32::try_from(self.fields.names.len()).unwrap();
 		for (field, &span) in fields.iter().zip(spans) {
-			let name = field.binding.and_then(ast::Binding::name);
+			let name =
+				(!field.binding.is_missing()).then_some(field.binding.name);
 			if let Some(name) = name {
 				if name.inner == Keyword::SelfLower.symbol() {
 					self.diagnostics
@@ -5344,8 +5345,9 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		range
 	}
 
-	/// Each parameter's name, `None` for an unnamed one, as one run of
-	/// `params`, reporting a name bound twice. Unnamed parameters never clash.
+	/// Each parameter's name, `None` for one the parser reported missing, as
+	/// one run of `params`, reporting a name bound twice. Missing names never
+	/// clash.
 	fn scan_param_names(
 		&mut self,
 		file_id: FileId,
@@ -5354,7 +5356,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		let ast = self.ast(file_id);
 		let start = u32::try_from(self.params.names.len()).unwrap();
 		for (param, &span) in ast.list(params).iter().zip(ast.spans(params)) {
-			let name = param.binding.and_then(ast::Binding::name);
+			let name =
+				(!param.binding.is_missing()).then_some(param.binding.name);
 			if let Some(name) = name {
 				let before = ParamRange {
 					start,
@@ -5916,7 +5919,7 @@ mod tests {
 			type f32;
 			type f64;
 			type funcref;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 		case.diagnostics().assert_none();
@@ -6265,7 +6268,7 @@ mod tests {
 	fn every_declaration_is_a_row_its_arena_entry_points_at() {
 		let source = indoc! {r#"
 			pub struct Point(x: u32, y: u32);
-			enum Color(u8) { Red = 0, Green }
+			enum Color(value: u8) { Red = 0, Green }
 			pub trait Shape {
 				type Unit;
 				const SIDES: u32;
@@ -6808,7 +6811,7 @@ mod tests {
 	#[test]
 	fn tuple_struct_with_all_pub_fields_has_a_public_constructor() {
 		let mut case = TestCase::new(indoc! {"
-			pub struct Point(pub i32, pub i32);
+			pub struct Point(pub a: i32, pub b: i32);
 		"});
 		case.diagnostics().assert_none();
 
@@ -6830,7 +6833,7 @@ mod tests {
 	#[test]
 	fn tuple_struct_with_a_private_field_has_a_private_constructor() {
 		let mut case = TestCase::new(indoc! {"
-			pub struct Point(pub i32, i32);
+			pub struct Point(pub a: i32, b: i32);
 		"});
 		case.diagnostics().assert_none();
 

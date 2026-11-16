@@ -159,7 +159,7 @@ fn test_format_uses_and_reexports_in_import_blocks() {
 fn test_format_import_block() {
 	let case = TestCase::new(indoc! {"
         import \"math\" as math {
-            func sqrt(f64) -> f64;
+            func sqrt(a: f64) -> f64;
             func pow(base: f64, exponent: f64) -> f64;
             func log(x: string);
         }
@@ -185,7 +185,7 @@ fn test_format_import_block() {
 		output,
 		indoc! {"
             import \"math\" as math {
-                func sqrt(f64) -> f64;
+                func sqrt(a: f64) -> f64;
                 func pow(base: f64, exponent: f64) -> f64;
                 func log(x: string);
             }
@@ -552,7 +552,7 @@ fn test_format_const_items() {
 #[test]
 fn test_format_enum_items() {
 	let case = TestCase::new(indoc! {"
-        enum Status(i32) {
+        enum Status(value: i32) {
             Foo,
             Bar = 1,
             Baz,
@@ -571,7 +571,7 @@ fn test_format_enum_items() {
 	assert_eq!(
 		output,
 		indoc! {"
-            enum Status(i32) {
+            enum Status(value: i32) {
                 Foo,
                 Bar = 1,
                 Baz,
@@ -582,13 +582,11 @@ fn test_format_enum_items() {
 
 #[test]
 fn an_enum_repr_is_formatted_as_a_struct_field() {
-	// Every form a struct field takes: plain, named, `_`, `pub`, and `mut`,
-	// which the parser reports and the formatter keeps as written.
+	// Every form a struct field takes: named, `pub`, and `mut`, which the
+	// checker reports and the formatter keeps as written.
 	let source = indoc! {"
-        enum A(i8) { X = 0 }
-        enum B(value: i8) { X = 0 }
-        enum C(_: i8) { X = 0 }
-        pub enum D(pub i8) { X = 0 }
+        enum A(value: i8) { X = 0 }
+        pub enum D(pub value: i8) { X = 0 }
         enum E(pub mut value: i8) { X = 0 }
         enum F(dx: i8, dy: i8) { X = (0, 0) }
     "};
@@ -606,19 +604,11 @@ fn an_enum_repr_is_formatted_as_a_struct_field() {
 	assert_eq!(
 		output,
 		indoc! {"
-            enum A(i8) {
+            enum A(value: i8) {
                 X = 0,
             }
 
-            enum B(value: i8) {
-                X = 0,
-            }
-
-            enum C(_: i8) {
-                X = 0,
-            }
-
-            pub enum D(pub i8) {
+            pub enum D(pub value: i8) {
                 X = 0,
             }
 
@@ -756,12 +746,12 @@ fn test_format_struct_items() {
 	);
 }
 
-/// Parameters and fields print as written, `_: T` included.
+/// Parameters and fields print as written.
 #[test]
 fn test_format_parameter_and_field_slots() {
 	let case = TestCase::new(indoc! {"
-        func f(i32, _: u8, mut d: i32) {}
-        struct S(_: u8, pub mut e: i32);
+        func f(a: i32, b: u8, mut d: i32) {}
+        struct S(b: u8, pub mut e: i32);
     "});
 	let output = format(
 		&case.ast,
@@ -776,9 +766,9 @@ fn test_format_parameter_and_field_slots() {
 	assert_eq!(
 		output,
 		indoc! {"
-            func f(i32, _: u8, mut d: i32) {}
+            func f(a: i32, b: u8, mut d: i32) {}
 
-            struct S(_: u8, pub mut e: i32);
+            struct S(b: u8, pub mut e: i32);
         "}
 	);
 }
@@ -2046,7 +2036,7 @@ fn test_format_trailing_comments_keep_their_line() {
             // own-line before closing brace
         );
 
-        enum E(u32) {
+        enum E(value: u32) {
             A = 0, // trailing on variant
             B = 1,
         }
@@ -2226,7 +2216,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             x: u32,
         );
 
-        enum E(u32) { // opens an `enum`
+        enum E(value: u32) { // opens an `enum`
             A = 0,
         }
 
@@ -2266,7 +2256,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
             x: u32,
         );
 
-        enum E(u32) {
+        enum E(value: u32) {
             // opens an `enum`
             A = 0,
         }
@@ -3499,7 +3489,7 @@ fn test_format_current_syntax_forms() {
         use a::b::*;
         use a::{b, c::{d, e as f}, g::*};
 
-        struct Pair(i32, pub u8);
+        struct Pair(a: i32, pub b: u8);
 
         struct Unit();
 
@@ -3540,7 +3530,7 @@ fn test_format_current_syntax_forms() {
             use a::b::*;
             use a::{b, c::{d, e as f}, g::*};
 
-            struct Pair(i32, pub u8);
+            struct Pair(a: i32, pub b: u8);
 
             struct Unit();
 

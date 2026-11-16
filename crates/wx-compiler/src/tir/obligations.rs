@@ -849,7 +849,7 @@ mod tests {
 			"heap::&Other",
 		] {
 			let source = format!(
-				"memory heap: u32; struct S(); struct Other(); struct Wrapper<T>(T); \
+				"memory heap: u32; struct S(); struct Other(); struct Wrapper<T>(a: T); \
 				 impl S {{ func bad(self: {receiver}) {{}} }}"
 			);
 			let case = TestCase::new(&source);
@@ -904,7 +904,7 @@ mod tests {
 	fn receiver_types_accept_self_and_one_pointer_in_generic_methods() {
 		let case = TestCase::new(indoc! {"
 			memory heap: u32;
-			struct S<T>(T);
+			struct S<T>(a: T);
 			impl<T: StackValue> S<T> {
 				func explicit(self: Self) {}
 				func named(self: S<T>) {}

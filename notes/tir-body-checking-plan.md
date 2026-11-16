@@ -345,6 +345,10 @@ There is no parameter or field without a type, the receiver's included:
 `self` is a name like any other and is written `self: Self` (or
 `self: M::*Self`); its type is never implied.
 
+Superseded (2026-11-16) by `notes/binders.md`: every slot is named, a lone
+identifier is a binding with no type, and `_` is no binding. The table below
+is the rule it replaced.
+
 | written | parameter | field |
 |---|---|---|
 | `i32`, `_: i32` | unnamed, binds nothing | unnamed: built and destructured by position only |

@@ -976,7 +976,7 @@ fn hover_renders_the_other_declaration_kinds() {
 		memory heap: u32;
 		global mut bump: u32 = 4;
 		global fixed: u32 = 1;
-		enum Color(u8) { Red = 0, Green = 1 }
+		enum Color(value: u8) { Red = 0, Green = 1 }
 		trait Shape { type Unit; }
 		typeset Small { u8, u16 }
 		func main() -> u32 {
@@ -1002,7 +1002,7 @@ fn hover_renders_the_other_declaration_kinds() {
 	assert_eq!(hover("Red;", 0).unwrap(), "```wx\nColor::Red = 0\n```");
 	assert_eq!(
 		hover("Color::", 0).unwrap(),
-		"```wx\nenum Color(u8) { .. }\n```"
+		"```wx\nenum Color(value: u8) { .. }\n```"
 	);
 }
 
@@ -1141,7 +1141,7 @@ fn hover_and_goto_definition_work_on_the_declaration_itself() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
 		struct Point(x: i32, y: i32);
-		enum Color(u8) { Red = 0 }
+		enum Color(value: u8) { Red = 0 }
 		/// Doubles.
 		func twice<T: StackValue>(value: i32, extra: T) -> i32 {
 		    local mut total: i32 = value;
@@ -1162,7 +1162,7 @@ fn hover_and_goto_definition_work_on_the_declaration_itself() {
 	assert_eq!(hover("x:", 0).unwrap(), "```wx\nx: i32\n```");
 	assert_eq!(
 		hover("Color", 0).unwrap(),
-		"```wx\nenum Color(u8) { .. }\n```"
+		"```wx\nenum Color(value: u8) { .. }\n```"
 	);
 	assert_eq!(hover("Red", 0).unwrap(), "```wx\nColor::Red = 0\n```");
 	let function = hover("twice", 0).unwrap();
@@ -1173,7 +1173,8 @@ fn hover_and_goto_definition_work_on_the_declaration_itself() {
 		"{function}"
 	);
 	assert!(function.contains("Doubles."), "{function}");
-	assert_eq!(hover("value:", 0).unwrap(), "```wx\nvalue: i32\n```");
+	assert_eq!(hover("value:", 0).unwrap(), "```wx\nvalue: u8\n```");
+	assert_eq!(hover("value:", 1).unwrap(), "```wx\nvalue: i32\n```");
 	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T: StackValue\n```");
 	assert_eq!(
 		hover("total", 0).unwrap(),
@@ -2212,7 +2213,7 @@ const USE_ITEMS: &str = "mod shapes {
     pub func area() -> u32 { 1 }
     func hidden() {}
     pub mod inner { pub func deep() {} }
-    pub enum Kind(u8) { A = 0, B }
+    pub enum Kind(value: u8) { A = 0, B }
 }
 ";
 
@@ -2366,7 +2367,7 @@ fn completion_after_a_module_in_a_value_offers_its_modules() {
 #[test]
 fn completion_after_an_enum_offers_its_variants() {
 	let labels = completions(
-		"enum Kind(u8) { A = 0, B }\nfunc f(k: Kind) -> u8 {\n    match k {\n        Kind::$0 => 1,\n        _ => 2,\n    }\n}\n",
+		"enum Kind(value: u8) { A = 0, B }\nfunc f(k: Kind) -> u8 {\n    match k {\n        Kind::$0 => 1,\n        _ => 2,\n    }\n}\n",
 	)
 	.expect("a pattern path after an enum");
 	assert_eq!(labels, ["A", "B"]);
@@ -2455,7 +2456,7 @@ fn completion_after_a_generic_type_without_arguments_offers_inherent_members() {
 #[test]
 fn completion_after_an_enum_in_a_value_offers_variants_then_members() {
 	let labels = completions(
-		"enum Kind(u8) { A = 0, B }\nimpl Kind {\n    pub func of(n: u8) -> Self { Kind::A }\n}\nfunc f() {\n    Kind::$0\n}\n",
+		"enum Kind(value: u8) { A = 0, B }\nimpl Kind {\n    pub func of(n: u8) -> Self { Kind::A }\n}\nfunc f() {\n    Kind::$0\n}\n",
 	)
 	.expect("a segment after an enum");
 	assert_offers(&labels, &["A", "B", "of"], &[]);
@@ -2525,7 +2526,7 @@ fn completion_after_a_trait_qualified_root_in_a_length_offers_its_constants() {
 const LENGTH_ITEMS: &str = "memory heap: u32;
 const SIZE: u32 = 4;
 func helper() -> u32 { 1 }
-enum Kind(u32) { A = 0, B }
+enum Kind(value: u32) { A = 0, B }
 struct Point(x: u32);
 impl Point {
     pub const DIM: u32 = 2;
@@ -2587,7 +2588,7 @@ fn completion_after_a_trait_qualified_root_inserts_a_methods_self() {
 }
 
 const PATTERN_ITEMS: &str = "struct Point(x: u32, y: u32, z: u32);
-struct Pair(u32, u32);
+struct Pair(a: u32, b: u32);
 enum Signal(pub number: i32) { Off = 0, On }
 const LIMIT: u32 = 4;
 func helper() -> u32 { 1 }
@@ -2623,8 +2624,6 @@ fn completion_in_a_struct_pattern_offers_its_fields() {
 #[test]
 fn completion_in_a_struct_pattern_offers_nothing_the_checker_would_refuse() {
 	for source in [
-		// Unnamed fields are matched by position only.
-		"func f(p: Pair) {\n    local Pair({ $0 }) = p;\n}\n",
 		// After `..`, and outside the braces.
 		"func f(p: Point) {\n    local Point({ x, ..$0 }) = p;\n}\n",
 		"func f(p: Point) {\n    local Point({ x })$0 = p;\n}\n",
@@ -3008,10 +3007,10 @@ fn completion_distinguishes_bounds_from_impl_traits() {
 const NAMED_CALLS: &str = "\
 func g(alpha: u32, beta: u32) {}
 struct W();
-trait Tr { func m(self: Self, u32); }
+trait Tr { func m(self: Self, a: u32); }
 impl Tr for W { func m(self: Self, count: u32) {} }
 impl W { func own(self: Self, first: u32) {} }
-func h(u32) {}
+func h(a: u32) {}
 ";
 
 #[test]
@@ -3071,8 +3070,6 @@ fn completion_after_a_named_arguments_colon_offers_values() {
 #[test]
 fn completion_offers_no_argument_names_the_checker_would_refuse() {
 	for source in [
-		// An unnamed parameter makes a call positional only (E2123).
-		"func f() {\n    h({ $0 });\n}\n",
 		// After the list.
 		"func f() {\n    g({ alpha: 1, beta: 2 })$0;\n}\n",
 		// Braces not closed yet.
@@ -4028,7 +4025,8 @@ fn named_argument_completion_normalizes_associated_types_when_known() {
 
 #[test]
 fn named_argument_completion_uses_the_impls_parameter_names() {
-	let declarations = "trait Tr: StackValue { func take(self: Self, Self); }
+	let declarations =
+		"trait Tr: StackValue { func take(self: Self, a: Self); }
 	struct S(); impl Tr for S { func take(self: Self, rhs: Self) {} }";
 	for (call, expected) in [
 		("s.take({ $0 })", vec![("rhs", "rhs: S")]),

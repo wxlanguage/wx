@@ -432,10 +432,17 @@ impl Renderer<'_> {
 	fn enumeration(&self, index: wx_compiler::tir::EnumIdx) -> String {
 		let decl = &self.sema.decls.enums[usize::from(index)];
 		let signature = &self.sema.enums[usize::from(index)];
+		// The repr as its field is written, `value: u8`; a wider repr is not
+		// supported, so its first field is all there is.
+		let repr = match self.sema.decls.fields.names(decl.fields).first() {
+			Some(Some(name)) => {
+				format!("{}: {}", self.symbol(*name), self.ty(signature.repr))
+			}
+			_ => self.ty(signature.repr),
+		};
 		format!(
-			"enum {}({}) {{ .. }}",
+			"enum {}({repr}) {{ .. }}",
 			self.name(self.sema.decls.item(decl.loc).name),
-			self.ty(signature.repr)
 		)
 	}
 

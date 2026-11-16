@@ -2649,7 +2649,7 @@ mod tests {
 			pub trait Function: Call {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 			package func unknown_operation();
 		"#;
@@ -2742,7 +2742,7 @@ mod tests {
 		let (mut store, instance) = instantiate(
 			r#"
 			enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
-			enum Ordering2(i8) { Less = -1, Equal = 0, Greater = 1 }
+			enum Ordering2(value: i8) { Less = -1, Equal = 0, Greater = 1 }
 			func pick(x: u32) -> Signal {
 				if x == 0 { Signal::Hangup } else { Signal::Interrupt }
 			}
@@ -2810,7 +2810,7 @@ mod tests {
 		// a hazard, and the `match` traps on it.
 		let (mut store, instance) = instantiate(
 			r#"
-			enum E(u8) { A = 0, B = 1 }
+			enum E(value: u8) { A = 0, B = 1 }
 			func f(x: u8) -> u32 {
 				match transmute::<u8, E>(x) { E::A => 10, E::B => 20 }
 			}
@@ -4012,7 +4012,7 @@ mod tests {
 	#[test]
 	fn a_one_value_newtype_global_is_held_as_its_scalar() {
 		let source = r#"
-			struct Meters(u32);
+			struct Meters(a: u32);
 			global mut length: Meters = Meters(3);
 			func double() -> u32 {
 				local Meters(x) = length.get();
@@ -6030,7 +6030,7 @@ mod tests {
 	#[test]
 	fn enum_variant_constants_include_implicit_discriminants() {
 		let source = r#"
-            enum Color(u8) { Red = 3, Green, Blue }
+            enum Color(value: u8) { Red = 3, Green, Blue }
             func green() -> Color { Color::Green }
             func blue() -> Color { Color::Blue }
             export { green as "green", blue as "blue" }
@@ -6447,7 +6447,7 @@ mod tests {
 	#[test]
 	fn an_exhaustive_enum_match_has_no_default() {
 		let source = r#"
-            enum Color(u8) { Red = 0, Green, Blue }
+            enum Color(value: u8) { Red = 0, Green, Blue }
             func run(c: Color) -> i32 {
                 match c {
                     Color::Red => { 1 },
@@ -6492,7 +6492,7 @@ mod tests {
 	#[test]
 	fn a_binding_default_receives_the_scrutinee() {
 		let source = r#"
-            enum Color(u8) { Red = 0, Green, Blue }
+            enum Color(value: u8) { Red = 0, Green, Blue }
             func run(c: Color) -> i32 {
                 match c {
                     Color::Red => { 1 },
@@ -6720,7 +6720,7 @@ mod tests {
 	#[test]
 	fn an_enum_with_negative_discriminants_matches() {
 		let source = r#"
-            enum Sign(i8) { Neg = -1, Zero = 0, Pos = 1 }
+            enum Sign(value: i8) { Neg = -1, Zero = 0, Pos = 1 }
             func run(s: Sign) -> i32 {
                 match s {
                     Sign::Neg => { 1 },

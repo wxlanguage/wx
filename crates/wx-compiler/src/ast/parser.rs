@@ -319,18 +319,19 @@ fn report_redundant_local(
 		.with_note("a name binds by default")
 }
 
-fn report_mut_without_name(
+fn report_missing_binding(
 	file_id: FileId,
-	mut_span: TextSpan,
+	span: TextSpan,
+	message: &str,
 ) -> Diagnostic<FileId> {
 	Diagnostic::error()
-		.with_code(DiagnosticCode::InvalidMutBinding.code())
-		.with_message("`mut` needs a name")
+		.with_code(DiagnosticCode::UnexpectedToken.code())
+		.with_message(message)
 		.with_label(
-			Label::primary(file_id, mut_span)
-				.with_message("nothing without a name can be mutated"),
+			Label::primary(file_id, span)
+				.with_message("a parameter or a field needs a name"),
 		)
-		.with_note("write `mut name: Type`, or leave out `mut`")
+		.with_note("write `name: Type`")
 }
 
 fn report_binding_without_type(
@@ -940,24 +941,49 @@ impl<'ctx> Parser<'ctx> {
 	}
 
 	/// After an item that failed (and reported): skips to the next
-	/// separator, consumed, or to the list's end, left for the list.
+	/// separator, consumed, or to the list's end, left for the list. A group
+	/// the item opened (`(u8, u16)`, `[u8]`) is skipped whole. A keyword that
+	/// only starts an item stops it at any depth, left for the enclosing
+	/// parser, so a group left open does not swallow the items after it.
 	fn skip_to_separator(&mut self, delimiters: Delimiters) {
+		let mut depth = 0u32;
 		loop {
 			let token = self.lexer.peek().inner;
-			if token == delimiters.separator {
-				self.lexer.next();
-				return;
-			}
-			if token == delimiters.close
-				|| token == Token::Eof
-				|| matches!(
-					token,
-					Token::CloseParen
-						| Token::CloseBrace
-						| Token::CloseBracket
-						| Token::SemiColon
-				) {
-				return;
+			match token {
+				Token::Eof
+				| Token::Keyword(
+					Keyword::Struct
+					| Keyword::Enum
+					| Keyword::Impl
+					| Keyword::Trait
+					| Keyword::Typeset
+					| Keyword::Type
+					| Keyword::Mod
+					| Keyword::Use
+					| Keyword::Import
+					| Keyword::Export
+					| Keyword::Global
+					| Keyword::Memory,
+				) => return,
+				Token::OpenParen | Token::OpenBrace | Token::OpenBracket => {
+					depth += 1;
+				}
+				Token::CloseParen | Token::CloseBrace | Token::CloseBracket
+					if depth > 0 =>
+				{
+					depth -= 1;
+				}
+				_ if depth > 0 => {}
+				_ if token == delimiters.separator => {
+					self.lexer.next();
+					return;
+				}
+				Token::CloseParen
+				| Token::CloseBrace
+				| Token::CloseBracket
+				| Token::SemiColon => return,
+				_ if token == delimiters.close => return,
+				_ => {}
 			}
 			self.lexer.next();
 		}
@@ -1203,122 +1229,106 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// What a parameter or a struct field is written as: `binding: Type`, or
-	/// `Type` alone, which binds nothing. A binding is `_`, `name` or
-	/// `mut name`, and is always followed by `:`, so anything else is a type
-	/// (`x` alone is the type `x`). `self` is a name like any other, and is
-	/// written with its type; where it may stand is checked by the item it
-	/// is in.
+	/// What a parameter or a struct field is written as: `binding: Type`, a
+	/// binding being `name` or `mut name`. A binding alone in its slot
+	/// (`func log(i32)`) is reported and given an error type. A slot whose
+	/// name is missing, `_: u8` or a type alone (`(u8, u16)`, `*u8`), is
+	/// reported and kept with a missing name ([`Binding::missing`]), so the
+	/// item keeps its arity. Anything else where the binding or the `:` goes
+	/// is reported, and the list's recovery skips the slot. `self` is parsed
+	/// like any name; the item it is in says whether it may stand there.
 	fn parse_binding_and_type(
 		parser: &mut Parser,
-	) -> Result<(Option<Binding>, TypeId), ()> {
+	) -> Result<(Binding, TypeId), ()> {
 		let mut_span = matches!(parser.peek_keyword(), Some(Keyword::Mut))
 			.then(|| parser.lexer.next().span);
-
-		let token = parser.lexer.peek().inner;
-		let named = matches!(
-			token,
-			Token::Identifier
-				| Token::Keyword(Keyword::Underscore | Keyword::SelfLower)
-		);
-		if !named {
-			if let Some(mut_span) = mut_span {
-				parser
-					.diagnostics
-					.push(report_mut_without_name(parser.file_id, mut_span));
+		let token = parser.lexer.peek();
+		let binding = match token.inner {
+			Token::Identifier | Token::Keyword(Keyword::SelfLower) => {
+				let span = parser.lexer.next().span;
+				let name = Spanned {
+					inner: parser
+						.strings
+						.get_or_intern(span.extract_str(parser.source)),
+					span,
+				};
+				Binding { mut_span, name }
 			}
-			return Ok((None, parser.parse_type_expression()?));
-		}
-
-		let name_span = parser.lexer.next().span;
-		let underscore = token == Token::Keyword(Keyword::Underscore);
-		// `self` is never a type, so it is always a name.
-		let receiver = token == Token::Keyword(Keyword::SelfLower);
-		let name = Spanned {
-			inner: parser
-				.strings
-				.get_or_intern(name_span.extract_str(parser.source)),
-			span: name_span,
-		};
-		if let Some(colon) = parser.lexer.next_if(Token::Colon) {
-			let binding = if underscore {
-				if let Some(mut_span) = mut_span {
-					parser.diagnostics.push(report_mut_without_name(
-						parser.file_id,
-						mut_span,
-					));
-				}
-				Binding::Wildcard(name_span)
-			} else {
-				Binding::Name { mut_span, name }
-			};
-			let ty = match parser.parse_type_expression() {
-				Ok(ty) => ty,
-				// A type not written yet, where the entry ends (`y: )`,
-				// `y: ,`), has been reported; it is kept as an error node
-				// spanning the gap up to that token, so the binding is still
-				// declared. Anything else there is a type written wrong, which
-				// the list's recovery skips.
-				Err(()) => {
-					let token = parser.lexer.peek();
-					if !matches!(token.inner, Token::Comma | Token::CloseParen)
-					{
-						return Err(());
-					}
-					parser.ast.push_type(
-						TypeExpression::Error,
-						TextSpan::new(colon.span.end, token.span.start),
-					)
-				}
-			};
-			return Ok((Some(binding), ty));
-		}
-		// Not followed by `:`: a type, unless it can only be a name, which is
-		// then given an error type.
-		match mut_span {
-			// `mut _`: the type `_`, without the `mut`.
-			Some(mut_span) if underscore => {
-				parser
-					.diagnostics
-					.push(report_mut_without_name(parser.file_id, mut_span));
-				Ok((
-					None,
-					parser.ast.push_type(TypeExpression::Infer, name_span),
-				))
-			}
-			// `mut heap::*u8`: `mut` before a type that goes on past its
-			// first name.
-			Some(mut_span)
-				if !receiver
-					&& !matches!(
-						parser.lexer.peek().inner,
-						Token::Comma | Token::CloseParen
-					) =>
-			{
-				parser
-					.diagnostics
-					.push(report_mut_without_name(parser.file_id, mut_span));
-				Ok((None, parser.parse_type_path_from(name)?))
-			}
-			// `_` is the type `_`.
-			None if underscore => Ok((
-				None,
-				parser.ast.push_type(TypeExpression::Infer, name_span),
-			)),
-			None if !receiver => Ok((None, parser.parse_type_path_from(name)?)),
-			// `mut x`, `self` or `mut self`: a name, but no type.
-			_ => {
-				parser.diagnostics.push(report_binding_without_type(
+			// `_: Type`: a parameter or a field is named, and a value is
+			// dropped with the `_` pattern instead (`_ = name;`).
+			Token::Keyword(Keyword::Underscore) => {
+				parser.lexer.next();
+				parser.diagnostics.push(report_missing_binding(
 					parser.file_id,
-					name_span,
+					token.span,
+					"expected a name, found `_`",
 				));
-				let missing = parser.ast.push_type(
-					TypeExpression::Error,
-					TextSpan::new(name_span.end, name_span.end),
-				);
-				Ok((Some(Binding::Name { mut_span, name }), missing))
+				Binding::missing(mut_span, token.span.start)
 			}
-		}
+			// A type alone: kept, with its name missing.
+			Token::Star
+			| Token::Amper
+			| Token::Bang
+			| Token::OpenParen
+			| Token::OpenBracket
+			| Token::LeftArrow
+			| Token::DoubleLeftArrow
+			| Token::Keyword(Keyword::Func | Keyword::SelfPascal) => {
+				let ty = parser.parse_type_expression()?;
+				parser.diagnostics.push(report_missing_binding(
+					parser.file_id,
+					parser.ast.types.spans[usize::from(ty)],
+					"expected a name before this type",
+				));
+				return Ok((Binding::missing(mut_span, token.span.start), ty));
+			}
+			_ => {
+				parser.diagnostics.push(report_missing_binding(
+					parser.file_id,
+					token.span,
+					&format!("expected a name, found `{}`", token.inner),
+				));
+				return Err(());
+			}
+		};
+		let Some(colon) = parser.lexer.next_if(Token::Colon) else {
+			let next = parser.lexer.peek();
+			if !matches!(next.inner, Token::Comma | Token::CloseParen) {
+				parser.diagnostics.push(report_unexpected_token(
+					parser.file_id,
+					next,
+					Token::Colon,
+				));
+				return Err(());
+			}
+			parser
+				.diagnostics
+				.push(report_binding_without_type(parser.file_id, token.span));
+			let missing = parser.ast.push_type(
+				TypeExpression::Error,
+				TextSpan::new(token.span.end, token.span.end),
+			);
+			return Ok((binding, missing));
+		};
+		let ty = match parser.parse_type_expression() {
+			Ok(ty) => ty,
+			// A type not written yet, where the entry ends (`y: )`, `y: ,`),
+			// has been reported; it is kept as an error node spanning the gap
+			// up to that token, so the binding is still declared. Anything
+			// else there is a type written wrong, which the list's recovery
+			// skips.
+			Err(()) => {
+				let token = parser.lexer.peek();
+				if !matches!(token.inner, Token::Comma | Token::CloseParen) {
+					return Err(());
+				}
+				parser.ast.push_type(
+					TypeExpression::Error,
+					TextSpan::new(colon.span.end, token.span.start),
+				)
+			}
+		};
+		Ok((binding, ty))
 	}
 
 	fn parse_function_signature(
@@ -4484,10 +4494,7 @@ impl<'ctx> Parser<'ctx> {
 		})
 	}
 
-	/// `[pub] [name:] Type`, decided on one token: a type that starts with a
-	/// keyword (`func`, `_`, `Self`, ...) is never a name, and a plain identifier
-	/// is a name exactly when `:` follows it; otherwise it was the first
-	/// segment of the field's type, which is parsed on from there.
+	/// `[pub] name: Type`, the slot a parameter is (`parse_binding_and_type`).
 	fn parse_struct_field(
 		parser: &mut Parser,
 	) -> Result<Spanned<StructField>, ()> {

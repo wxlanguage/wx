@@ -2057,23 +2057,14 @@ impl<'a> Builder<'a> {
 	fn build_binding_and_type(
 		&mut self,
 		out: &mut Vec<NodeId>,
-		binding: Option<ast::Binding>,
+		binding: ast::Binding,
 		ty: ast::TypeId,
 	) {
-		match binding {
-			Some(ast::Binding::Wildcard(_)) => {
-				out.push(self.text(Text::Underscore));
-				out.push(self.text(Text::ColonSp));
-			}
-			Some(ast::Binding::Name { mut_span, name }) => {
-				if mut_span.is_some() {
-					out.push(self.text(Text::Mut));
-				}
-				out.push(self.symbol(name.inner));
-				out.push(self.text(Text::ColonSp));
-			}
-			None => {}
+		if binding.mut_span.is_some() {
+			out.push(self.text(Text::Mut));
 		}
+		out.push(self.symbol(binding.name.inner));
+		out.push(self.text(Text::ColonSp));
 		out.push(self.build_type_expression(ty));
 	}
 

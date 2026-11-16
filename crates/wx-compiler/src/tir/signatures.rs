@@ -2322,9 +2322,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// A free function has no `Self`: its `self` was reported
 				// where it is written.
 				let receiver =
-					param.binding.and_then(ast::Binding::name).is_some_and(
-						|name| name.inner == Keyword::SelfLower.symbol(),
-					);
+					param.binding.name.inner == Keyword::SelfLower.symbol();
 				if receiver {
 					return TypeIndex::ERROR;
 				}
@@ -2424,10 +2422,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.collect();
 
 		if let Some(param) = self.ast(file_id).list(signature.params).first()
-			&& param
-				.binding
-				.and_then(ast::Binding::name)
-				.is_some_and(|name| name.inner == Keyword::SelfLower.symbol())
+			&& param.binding.name.inner == Keyword::SelfLower.symbol()
 		{
 			let self_type = match sema.generic_envs.owner(parent) {
 				GenericEnvOwner::Trait(_) => {
@@ -3614,11 +3609,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// The repr's value is one of the variants, so it is never
 				// written in place: changing it is assigning a variant.
 				for field in ast.list(*repr) {
-					if let Some(ast::Binding::Name {
-						mut_span: Some(mut_span),
-						..
-					}) = field.binding
-					{
+					if let Some(mut_span) = field.binding.mut_span {
 						sema.diagnostics
 							.push(report_mutable_enum_repr(file_id, mut_span));
 					}
@@ -6755,7 +6746,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_mismatched_initializer_has_no_value() {
 			let case = TestCase::new(
-				"enum E(i32) { A = 1 }
+				"enum E(value: i32) { A = 1 }
 					const X: i32 = E::A;",
 			);
 			// `E::A` is held as an `i32`, but it is an `E`: reported once, and
@@ -6767,7 +6758,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn a_variant_value_naming_its_enum_reports_only_the_mismatch() {
-			let case = TestCase::new("enum E(i32) { A = E::B, B }");
+			let case = TestCase::new("enum E(value: i32) { A = E::B, B }");
 			// `B` counts on from `A`, and `A` names `B`; the mismatch makes `A`
 			// an error before any loop is evaluated.
 			case.diagnostics()
@@ -6831,7 +6822,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_struct_is_constructed_by_calling_its_name() {
 			let case = TestCase::new(
-				"struct Meters(u32);
+				"struct Meters(a: u32);
 					struct Point(x: i32, y: i32);
 					struct Line(from: Point, to: Point);
 					const M: Meters = Meters(5);
@@ -6878,7 +6869,6 @@ pub(super) mod tests {
 					"const P: Point = Point({ x: 1, x: 2, y: 3 });",
 					DuplicateNamedArgument,
 				),
-				("const P: Pair = Pair({ a: 1 });", PositionalOnlyCall),
 				(
 					"const P: Point = Point::<u8>(1, 2);",
 					TypeArgumentCountMismatch,
@@ -6887,7 +6877,6 @@ pub(super) mod tests {
 			] {
 				let case = TestCase::new(&format!(
 					"struct Point(x: i32, y: i32);
-						struct Pair(i32, i32);
 						{initializer}"
 				));
 				// Reported once: the value is poisoned, not evaluated again.
@@ -6898,7 +6887,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_generic_struct_takes_its_arguments_from_the_expected_type() {
 			let case = TestCase::new(
-				"struct Wrapper<T>(T);
+				"struct Wrapper<T>(a: T);
 					struct Pair<A, B>(first: A, second: B);
 					const W: Wrapper<u32> = Wrapper(5);
 					const P: Pair<u8, i64> = Pair({ second: -1, first: 2 });
@@ -6930,7 +6919,7 @@ pub(super) mod tests {
 		fn a_written_argument_is_used_and_a_written_placeholder_is_taken_from_the_expected_type()
 		 {
 			let case = TestCase::new(
-				"struct Wrapper<T>(T);
+				"struct Wrapper<T>(a: T);
 					struct Pair<A, B>(first: A, second: B);
 					const W: Wrapper<u32> = Wrapper::<u32>(5);
 					const P: Pair<u8, u16> = Pair::<_, u16>(1, 2);
@@ -7004,9 +6993,9 @@ pub(super) mod tests {
 				),
 			] {
 				let case = TestCase::new(&format!(
-					"struct Wrapper<T>(T);
+					"struct Wrapper<T>(a: T);
 						struct Pair<A, B>(first: A, second: B);
-						struct Bounded<T: Add>(T);
+						struct Bounded<T: Add>(a: T);
 						struct Unit();
 						{initializer}"
 				));
@@ -7017,7 +7006,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_tuple_is_its_elements_in_order() {
 			let case = TestCase::new(
-				"struct Wrapper<T>(T);
+				"struct Wrapper<T>(a: T);
 					const T: (u8, u16) = (1, 2);
 					const U: () = ();
 					const O: (Bool,) = (True,);
@@ -7088,9 +7077,9 @@ pub(super) mod tests {
 		fn a_struct_is_constructed_only_where_every_field_is_accessible() {
 			let case = TestCase::new(
 				"mod shapes {
-						pub struct Pair(pub i32, i32);
+						pub struct Pair(pub a: i32, b: i32);
 						pub struct Point(pub x: i32, y: i32);
-						pub struct Open(pub i32);
+						pub struct Open(pub a: i32);
 						const INSIDE: Pair = Pair(1, 2);
 					}
 					const A: shapes::Pair = shapes::Pair(1, 2);
@@ -7220,7 +7209,7 @@ pub(super) mod tests {
 		fn a_variant_without_a_value_counts_on_from_the_one_before_it() {
 			let case = TestCase::new(
 				"const BASE: i16 = 10;
-					enum E(i16) { A = BASE * 2, B, C = -2, D, F }
+					enum E(value: i16) { A = BASE * 2, B, C = -2, D, F }
 					const X: E = E::B;",
 			);
 			case.diagnostics().assert_none();
@@ -7248,7 +7237,7 @@ pub(super) mod tests {
 
 		#[test]
 		fn the_first_variant_needs_a_value_to_count_from() {
-			let case = TestCase::new("enum E(u8) { A, B, C = 1, D }");
+			let case = TestCase::new("enum E(value: u8) { A, B, C = 1, D }");
 			// Reported once, at `A`; `B` counts on from it and is silent.
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::EnumVariantRequiresExplicitValue,
@@ -7273,21 +7262,20 @@ pub(super) mod tests {
 
 		#[test]
 		fn counting_past_the_repr_is_reported_once_at_the_variant() {
-			let case = TestCase::new("enum E(u8) { A = 255, B, C }");
+			let case = TestCase::new("enum E(value: u8) { A = 255, B, C }");
 			// `B` owns the overflow; `C` reads a failed value and is silent.
 			case.diagnostics()
 				.assert_codes(&[DiagnosticCode::ConstEvaluationFailed]);
 			let diagnostic = &case.sema.diagnostics[0];
 			assert_eq!(diagnostic.message, "evaluation of constant `B` failed");
-			let source = "enum E(u8) { A = 255, B, C }";
+			let source = "enum E(value: u8) { A = 255, B, C }";
 			assert_eq!(&source[diagnostic.labels[0].range.clone()], "B");
 			assert_eq!(state(&case, "E::C"), &ConstValueState::Poisoned);
 		}
 
 		#[test]
 		fn variants_sharing_a_value_are_reported_once_per_value() {
-			let source =
-				"enum E(i32) { F = 7, A = 1, B = 0, C, D = 1, G = 7, H = 2 }";
+			let source = "enum E(value: i32) { F = 7, A = 1, B = 0, C, D = 1, G = 7, H = 2 }";
 			let case = TestCase::new(source);
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::EnumDuplicateValue,
@@ -7375,7 +7363,7 @@ pub(super) mod tests {
 				func unrelated<V: Other>() {}
 				type u8;
 				type u32;
-				enum Bool(u8) { False = 0, True = 1 }
+				enum Bool(value: u8) { False = 0, True = 1 }
 				struct Char(value: u32);
 			"});
 			assert!(
@@ -7649,7 +7637,7 @@ pub(super) mod tests {
 		#[test]
 		fn readiness_includes_unvisited_siblings_and_updates_on_publication() {
 			with_pending_core_signatures(
-				"trait A {} trait B {} func f<T: A, U: B>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+				"trait A {} trait B {} func f<T: A, U: B>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
 					let query = SignatureQuery::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(
@@ -7681,7 +7669,7 @@ pub(super) mod tests {
 		#[test]
 		fn declaration_reading_preserves_pending_without_forcing_queries() {
 			with_pending_core_signatures(
-				"trait Inner {} trait Outer { type Item: Inner; } func f<T: Outer>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+				"trait Inner {} trait Outer { type Item: Inner; } func f<T: Outer>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
 					let query = SignatureQuery::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(
@@ -7774,7 +7762,7 @@ pub(super) mod tests {
 		#[test]
 		fn recursive_declarations_are_read_along_finite_subject_paths() {
 			let mut case = TestCase::core(
-				"trait Node { type Next: Node; } func f<T: Node>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+				"trait Node { type Next: Node; } func f<T: Node>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 			);
 			assert!(case.sema.diagnostics.is_empty());
 			let scope = case.function_signature("f").type_params;
@@ -7983,6 +7971,25 @@ pub(super) mod tests {
 		source: &str,
 		strings: &mut StringInterner,
 	) -> vfs::CompilationUnit {
+		let graph = recovered_source_graph(source, strings);
+		// Lowering and signature checks only see their own diagnostics;
+		// parser and linker errors stay on the graph for the caller. A test
+		// source must never hide one behind recovery, so check here.
+		DiagnosticView::new(
+			"parse",
+			&graph.collect_diagnostics(),
+			&graph.files,
+		)
+		.assert_no_errors();
+		graph
+	}
+
+	/// [`source_graph`], keeping whatever the parser reported and recovered
+	/// from, for a test about how checking treats what recovery kept.
+	pub(in crate::tir) fn recovered_source_graph(
+		source: &str,
+		strings: &mut StringInterner,
+	) -> vfs::CompilationUnit {
 		let mut builder = vfs::CompilationUnitBuilder::new(strings);
 		builder.load_core();
 		let root_id = builder
@@ -7996,17 +8003,7 @@ pub(super) mod tests {
 				),
 			)
 			.unwrap();
-		let graph = builder.build(root_id);
-		// Lowering and signature checks only see their own diagnostics;
-		// parser and linker errors stay on the graph for the caller. A test
-		// source must never hide one behind recovery, so check here.
-		DiagnosticView::new(
-			"parse",
-			&graph.collect_diagnostics(),
-			&graph.files,
-		)
-		.assert_no_errors();
-		graph
+		builder.build(root_id)
 	}
 
 	/// Parses `source` as a single-file binary playing the core's own role
@@ -8740,7 +8737,7 @@ pub(super) mod tests {
 			struct S();
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -8825,7 +8822,7 @@ pub(super) mod tests {
 			trait Tr {}
 			impl Tr for u32 {}
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 		assert!(
@@ -8859,7 +8856,7 @@ pub(super) mod tests {
 			impl<T> Tr for T {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 		assert!(case.sema.impl_dispatch.is_empty());
@@ -8883,7 +8880,7 @@ pub(super) mod tests {
 			type Alias = u32;
 			typeset Int { Alias }
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 		assert_eq!(
@@ -8908,7 +8905,7 @@ pub(super) mod tests {
 			impl Tr for S {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 		let target =
@@ -8936,7 +8933,7 @@ pub(super) mod tests {
 			impl Missing {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 		assert!(case.sema.impl_dispatch.is_empty());
@@ -8961,7 +8958,7 @@ pub(super) mod tests {
 			impl<T: Bound> S {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -8984,7 +8981,7 @@ pub(super) mod tests {
 			impl S for S {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -9082,7 +9079,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn tuple_struct_placeholders_get_separate_diagnostics() {
-		let case = TestCase::new("struct Pair(_, _);");
+		let case = TestCase::new("struct Pair(a: _, b: _);");
 
 		assert_eq!(
 			case.sema.diagnostics.len(),
@@ -9382,7 +9379,7 @@ pub(super) mod tests {
 	#[test]
 	fn a_tuple_struct_resolves() {
 		let case = TestCase::new(indoc! {"
-			struct Pair(i32, i32);
+			struct Pair(a: i32, b: i32);
 		"});
 
 		assert!(
@@ -10107,7 +10104,7 @@ pub(super) mod tests {
 			pub trait Function: Call {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 			mod operations { pub package func trap() -> !; }
 			func f32_sqrt();
@@ -10189,10 +10186,10 @@ pub(super) mod tests {
 	#[test]
 	fn a_lone_identifier_parameter_is_its_type() {
 		for source in [
-			"func f(x) { } ",
-			"func f(x); ",
-			"trait Foo: StackValue { func get(self: Self, x) -> Self; } ",
-			"struct S(); impl S { func get(self: Self, x) -> Self { self } } ",
+			"func f(a: x) { } ",
+			"func f(a: x); ",
+			"trait Foo: StackValue { func get(self: Self, a: x) -> Self; } ",
+			"struct S(); impl S { func get(self: Self, a: x) -> Self { self } } ",
 		] {
 			let case = TestCase::new(source);
 			let diagnostics = case.diagnostics();
@@ -10200,32 +10197,6 @@ pub(super) mod tests {
 			diagnostics
 				.assert_error_saying("cannot find type `x` in this scope");
 		}
-	}
-
-	#[test]
-	fn an_unnamed_parameter_has_its_written_type() {
-		let case = TestCase::new(indoc! {"
-				func f(i32, _: u8, c: i32);
-				pub trait Call { type Args; type Result; }
-				pub trait Function: Call {}
-			"});
-		case.diagnostics().assert_none();
-		assert_eq!(
-			case.param_types("f"),
-			&[TypeIndex::I32, TypeIndex::U8, TypeIndex::I32]
-		);
-		let DeclKind::Function(index) = case.resolve(Tier::Value, "f") else {
-			panic!("expected a function");
-		};
-		let names: Vec<_> = case
-			.sema
-			.decls
-			.params
-			.names(case.sema.decls.functions[usize::from(index)].params)
-			.iter()
-			.map(|param| param.map(|name| case.strings.resolve(name).unwrap()))
-			.collect();
-		assert_eq!(names, [None, None, Some("c")]);
 	}
 
 	#[test]
@@ -10344,7 +10315,7 @@ pub(super) mod tests {
 			const FIRST: Alias = colors::Color::Red;
 			struct Paint( color: Alias );
 			type Alias = colors::Color;
-			mod colors { pub enum Color(i32) { Red = 0, Green } }
+			mod colors { pub enum Color(value: i32) { Red = 0, Green } }
 		"});
 		assert!(
 			case.sema.diagnostics.is_empty(),
@@ -10405,8 +10376,8 @@ pub(super) mod tests {
 	fn enum_types_reject_generic_arguments() {
 		let source = indoc! {"
 			func f(x: Color<i32>, y: nested::Color<i32, i32>) {}
-			enum Color(i32) { Red = 0 }
-			mod nested { pub enum Color(i32) { Red = 0 } }
+			enum Color(value: i32) { Red = 0 }
+			mod nested { pub enum Color(value: i32) { Red = 0 } }
 		"};
 		let case = TestCase::new(source);
 		case.diagnostics().assert_codes(&[
@@ -10454,7 +10425,7 @@ pub(super) mod tests {
 		with_pending_signatures(
 			indoc! {"
 			func f(x: Color) -> Color {}
-			enum Color(i32) { Red }
+			enum Color(value: i32) { Red }
 		"},
 			|sema, builder| {
 				let function_index = sema
@@ -10518,10 +10489,9 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_enum_repr_is_a_field_that_cannot_be_mut() {
-		// A name, `_` and `pub` are a struct field's, and mean the same here.
+		// A name and `pub` are a struct field's, and mean the same here.
 		let case = TestCase::new(
-			"enum A(value: i8) { X = 0 } enum B(_: i8) { X = 0 } \
-			 pub enum C(pub i8) { X = 0 }",
+			"enum A(value: i8) { X = 0 } pub enum C(pub value: i8) { X = 0 }",
 		);
 		case.diagnostics().assert_none();
 
@@ -10551,11 +10521,11 @@ pub(super) mod tests {
 		for (declaration, code) in [
 			("enum Color { Red }", DiagnosticCode::MissingEnumRepr),
 			(
-				"enum Color(Color) { Red }",
+				"enum Color(value: Color) { Red }",
 				DiagnosticCode::EnumReprNotInteger,
 			),
 			(
-				"type Repr = Color; enum Color(Repr) { Red }",
+				"type Repr = Color; enum Color(value: Repr) { Red }",
 				DiagnosticCode::EnumReprNotInteger,
 			),
 		] {
@@ -10590,7 +10560,7 @@ pub(super) mod tests {
 	#[test]
 	fn an_enum_repr_resolves_to_the_named_integer_type() {
 		let case = TestCase::new(indoc! {"
-			enum Color(i32) { Red = 0, Green, Blue }
+			enum Color(value: i32) { Red = 0, Green, Blue }
 		"});
 
 		assert!(
@@ -10606,7 +10576,7 @@ pub(super) mod tests {
 	#[test]
 	fn an_enum_variant_is_a_constant_of_its_enum() {
 		let mut case = TestCase::new(indoc! {"
-			enum Color(i32) { Red = 0, Green = 4 }
+			enum Color(value: i32) { Red = 0, Green = 4 }
 		"});
 		case.diagnostics().assert_none();
 		let DeclKind::Enum(enum_index) = case.resolve(Tier::Type, "Color")
@@ -10649,7 +10619,7 @@ pub(super) mod tests {
 	#[test]
 	fn an_enum_with_a_non_integer_repr_is_diagnosed() {
 		let case = TestCase::new(indoc! {"
-			enum Color(Bool) { Red, Green, Blue }
+			enum Color(value: Bool) { Red, Green, Blue }
 		"});
 
 		assert_eq!(
@@ -11086,7 +11056,7 @@ pub(super) mod tests {
 		pub trait Call { type Args; type Result; } pub trait Function: Call {}
 		type u8;
 		type u32;
-		enum Bool(u8) { False = 0, True = 1 }
+		enum Bool(value: u8) { False = 0, True = 1 }
 		struct Char(value: u32);
 		"},
 			|sema, builder| {
@@ -11290,7 +11260,7 @@ pub(super) mod tests {
 			trait Memory { type Size: PointerSize; }
 			memory heap: u32;
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -11330,7 +11300,7 @@ pub(super) mod tests {
 			trait Memory { type Size: PointerSize; }
 			memory heap: Bool;
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -11365,7 +11335,7 @@ pub(super) mod tests {
 			trait Global { type Value; }
 			global counter: u32 = 0;
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -11406,7 +11376,7 @@ pub(super) mod tests {
 			trait GlobalMut: Global {}
 			global mut counter: u32 = 0;
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -11473,7 +11443,7 @@ pub(super) mod tests {
 				memory shared: u32;
 			}
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"#});
 		assert!(
@@ -11723,7 +11693,7 @@ pub(super) mod tests {
 				global counter: u32;
 			}
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"#});
 		assert!(
@@ -11762,7 +11732,7 @@ pub(super) mod tests {
 				global mut counter: u32;
 			}
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"#});
 		assert!(
@@ -12898,7 +12868,7 @@ pub(super) mod tests {
 			}
 			struct S();
 			impl Service for S {
-				func get(self: Self, x, y: _) -> _ {}
+				func get(self: Self, a: x, y: _) -> _ {}
 				const VALUE: _ = 0;
 			}
 		"});
@@ -13069,7 +13039,7 @@ pub(super) mod tests {
 			}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"};
 		let case = TestCase::core(source);
@@ -13720,7 +13690,7 @@ pub(super) mod tests {
 			type u32;
 			typeset Int { u32 }
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -13749,7 +13719,7 @@ pub(super) mod tests {
 			type u32;
 			typeset Int { u32 }
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -13770,7 +13740,7 @@ pub(super) mod tests {
 			type u32;
 			typeset Int { u32, u32 }
 			type u8;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"});
 
@@ -14434,7 +14404,7 @@ pub(super) mod tests {
 			impl Container for Wrapper { type Item = i32; }
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"},
 			|sema, builder| {
@@ -14505,7 +14475,7 @@ pub(super) mod tests {
 	#[test]
 	fn normalization_preserves_abstract_and_inference_projections() {
 		with_pending_core_signatures(
-			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let query = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
@@ -14587,7 +14557,7 @@ pub(super) mod tests {
 			pub trait Call { type Args; type Result; } pub trait Function: Call {}
 			type u8;
 			type u32;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 		"},
 			|sema, builder| {
@@ -14699,7 +14669,7 @@ pub(super) mod tests {
 	#[test]
 	fn repeated_sibling_projections_are_not_a_cycle() {
 		with_pending_core_signatures(
-			"type i32; trait Container { type Item; } struct Wrapper(); impl Container for Wrapper { type Item = i32; } type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+			"type i32; trait Container { type Item; } struct Wrapper(); impl Container for Wrapper { type Item = i32; } type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let receiver = sema.types.intern_struct(StructIdx::new(0), &[]);
 				let (declaration, _, reference) =
@@ -14833,7 +14803,7 @@ pub(super) mod tests {
 	#[test]
 	fn distinct_projection_chain_hits_depth_limit_without_exact_repetition() {
 		with_pending_core_signatures(
-			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+			"pub trait Call { type Args; type Result; } pub trait Function: Call {} trait Container { type Item; } func f<T>() {} type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let query = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
@@ -16004,7 +15974,7 @@ pub(super) mod tests {
 	#[test]
 	fn normalization_does_not_cache_an_unfinished_assumption_set() {
 		with_pending_core_signatures(
-			"type i32; trait Container { type Item; } func f<T: Container where { Item = i32 }>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+			"type i32; trait Container { type Item; } func f<T: Container where { Item = i32 }>() {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 			|sema, builder| {
 				let query = SignatureQuery::Function(FunctionIdx::new(0));
 				let _ = builder.ensure_signature(
@@ -17036,7 +17006,7 @@ pub(super) mod tests {
                 pub trait Call { type Args; type Result; } pub trait Function: Call {}
                 type u8;
                 type u32;
-                enum Bool(u8) { False = 0, True = 1 }
+                enum Bool(value: u8) { False = 0, True = 1 }
                 struct Char(value: u32);
             "},
 				|sema, builder| {
@@ -17115,7 +17085,7 @@ pub(super) mod tests {
 				" }".repeat(16)
 			);
 			let source = format!(
-				"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} trait Node {{ type Next: Node; }} trait Project {{ type Output; }} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);",
+				"pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} trait Node {{ type Next: Node; }} trait Project {{ type Output; }} func f<T: Node where {{ {nested} }}, U: Node>(x: T{path}) {{}} type u8; type u32; enum Bool(value: u8) {{ False = 0, True = 1 }} struct Char(value: u32);",
 				path = "::Next".repeat(16)
 			);
 			with_pending_core_signatures(&source, |sema, builder| {
@@ -17376,7 +17346,7 @@ pub(super) mod tests {
 				pub trait Call { type Args; type Result; } pub trait Function: Call {}
 				type u8; type i32; type u32; type i64; type u64; type f32; type f64;
 				type funcref;
-				enum Bool(u8) { False = 0, True = 1 }
+				enum Bool(value: u8) { False = 0, True = 1 }
 				struct Char(value: u32);
 				trait StackValue { type Repr; }
 				typeset StackScalar { i32, i64, f32, f64, funcref }
@@ -17403,10 +17373,10 @@ pub(super) mod tests {
 		fn a_repr_is_the_flattened_parts_in_declaration_order() {
 			let source = with_stack_value(indoc! {"
 				struct Point(x: u32, y: u32);
-				struct Meters(u32);
+				struct Meters(a: u32);
 				struct Unit();
-				struct Wrap<T>(T);
-				enum Small(u8) { A = 0 }
+				struct Wrap<T>(a: T);
+				enum Small(value: u8) { A = 0 }
 				func f(
 					a: Is<u8, i32>,
 					b: Is<Point, (i32, i32)>,
@@ -17444,7 +17414,7 @@ pub(super) mod tests {
 		fn a_type_containing_never_is_held_as_never() {
 			let source = with_stack_value(indoc! {"
 				struct S(x: !);
-				struct Wrap<T>(T);
+				struct Wrap<T>(a: T);
 				func f(
 					a: Is<!, !>,
 					b: Is<(u32, !), !>,
@@ -17488,7 +17458,7 @@ pub(super) mod tests {
 		#[test]
 		fn an_abstract_part_must_be_assumed_a_stack_value() {
 			let source = with_stack_value(indoc! {"
-				struct Wrap<T>(T);
+				struct Wrap<T>(a: T);
 				func bounded<T: StackValue>(x: Needs<Wrap<T>>) {}
 				func unbounded<T>(x: Needs<Wrap<T>>) {}
 			"});
@@ -17500,10 +17470,10 @@ pub(super) mod tests {
 		#[test]
 		fn a_global_of_one_wasm_value_is_accepted() {
 			let source = with_stack_value(indoc! {"
-				struct Meters(u32);
-				struct Tagged(u64, ());
-				struct Wrap<T>(T);
-				enum Small(u8) { A = 0 }
+				struct Meters(a: u32);
+				struct Tagged(a: u64, b: ());
+				struct Wrap<T>(a: T);
+				enum Small(value: u8) { A = 0 }
 				global int: u32 = 0;
 				global float: f64 = 0;
 				global newtype: Meters = Meters(0);
@@ -17527,7 +17497,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_global_of_zero_or_several_wasm_values_is_rejected() {
 			let source = with_stack_value(indoc! {"
-				struct Pair(u32, f64);
+				struct Pair(a: u32, b: f64);
 				struct Unit();
 				global pair: Pair = Pair(0, 0);
 				global unit: Unit = Unit();
@@ -17556,7 +17526,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_generic_repr_reduces_through_its_parts() {
 			let source = with_stack_value(indoc! {"
-				struct Wrap<T>(T);
+				struct Wrap<T>(a: T);
 				struct Pair<A, B>(a: A, b: B);
 				struct Header<M: Memory>(len: u32, data: M::*u8);
 				func unwrap<T: StackValue>(w: Wrap<T>) -> T {
@@ -17940,7 +17910,7 @@ pub(super) mod tests {
 		#[test]
 		fn equality_proofs_wait_for_facts_and_do_not_cache_a_pending_answer() {
 			with_pending_core_signatures(
-				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(u8) { False = 0, True = 1 } struct Char(value: u32);",
+				"trait Marker {} trait Container { type Item; } func f<T: Container where { Item = U } + Container where { Item: Marker }, U>(x: T::Item) {} pub trait Call { type Args; type Result; } pub trait Function: Call {} type u8; type u32; enum Bool(value: u8) { False = 0, True = 1 } struct Char(value: u32);",
 				|sema, builder| {
 					let id = SignatureQuery::Function(FunctionIdx::new(0));
 					let _ = builder.ensure_signature(
@@ -17997,7 +17967,7 @@ pub(super) mod tests {
 			let nested =
 				format!("{}U::Item{}", "Wrap<".repeat(16), ">".repeat(16));
 			let source = format!(
-				"trait Marker {{}} trait Container {{ type Item; }} struct Wrap<X>(); func f<T: Container where {{ Item = {nested} }} + Container where {{ Item: Marker }}, U: Container>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type u8; type u32; enum Bool(u8) {{ False = 0, True = 1 }} struct Char(value: u32);"
+				"trait Marker {{}} trait Container {{ type Item; }} struct Wrap<X>(); func f<T: Container where {{ Item = {nested} }} + Container where {{ Item: Marker }}, U: Container>() {{}} pub trait Call {{ type Args; type Result; }} pub trait Function: Call {{}} type u8; type u32; enum Bool(value: u8) {{ False = 0, True = 1 }} struct Char(value: u32);"
 			);
 			with_pending_core_signatures(&source, |sema, builder| {
 				builder.build(sema);
@@ -18413,7 +18383,7 @@ pub(super) mod tests {
                 mod nested { export { missing } }
                 type u8;
                 type u32;
-                enum Bool(u8) { False = 0, True = 1 }
+                enum Bool(value: u8) { False = 0, True = 1 }
                 struct Char(value: u32);
             "#
 				.to_string(),
@@ -18481,7 +18451,7 @@ pub(super) mod tests {
             struct S();
             trait T {}
             type Alias = S;
-            enum E(i32) { A = 0 }
+            enum E(value: i32) { A = 0 }
             mod inner {}
             export { T, Alias, i32, inner }
         "#,

@@ -1977,7 +1977,7 @@ mod tests {
 	fn constant_patterns_record_the_constant_and_enum_path_segments() {
 		let a = Analysis::clean(indoc! {"
 			const LIMIT: u32 = 1;
-			enum E(u8) { A = 0, B = 1 }
+			enum E(value: u8) { A = 0, B = 1 }
 			func f(x: u32) -> u32 {
 				match x { const LIMIT => 1, _ => 0 }
 			}
@@ -2357,7 +2357,7 @@ mod tests {
 		const DECLARATIONS: &str = "
 			mod m {}
 			struct S();
-			enum E(u8) { A = 0 }
+			enum E(value: u8) { A = 0 }
 			type Alias = u32;
 			memory heap: u32;
 			func g() {}
@@ -2452,7 +2452,7 @@ mod tests {
 			    pub const SIDES: u32 = 4;
 			    func hidden() {}
 			    pub mod inner {}
-			    pub enum Kind(u8) { A = 0, B }
+			    pub enum Kind(value: u8) { A = 0, B }
 			}
 			use shapes::area;
 			func f() {}
@@ -2521,7 +2521,7 @@ mod tests {
 			    pub struct Square(pub side: u32);
 			    pub func area() -> u32 { 1 }
 			    func hidden() {}
-			    pub enum Kind(u8) { A = 0, B }
+			    pub enum Kind(value: u8) { A = 0, B }
 			}
 			func f() {
 			    shapes::area();

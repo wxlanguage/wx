@@ -1043,7 +1043,7 @@ mod tests {
 				"dep.wx".to_string(),
 				indoc! {"
 				pub struct Point();
-				pub enum Kind(u8) { A = 0 }
+				pub enum Kind(value: u8) { A = 0 }
 				impl Point {}
 				mod nested { impl super::Kind {} }
 			"}
@@ -1116,7 +1116,7 @@ mod tests {
 			),
 			(
 				"geom.wx".to_string(),
-				"pub struct Point<T>(T); pub enum Kind(u8) { A = 0 }"
+				"pub struct Point<T>(a: T); pub enum Kind(value: u8) { A = 0 }"
 					.to_string(),
 			),
 		]));
@@ -1147,7 +1147,7 @@ mod tests {
 	fn inherent_impl_locality_allows_core_to_implement_its_builtins() {
 		let source = indoc! {"
 			type u8; type u32; type funcref;
-			enum Bool(u8) { False = 0, True = 1 }
+			enum Bool(value: u8) { False = 0, True = 1 }
 			struct Char(value: u32);
 			mod nested {
 				impl u8 {} impl u32 {} impl funcref {}
