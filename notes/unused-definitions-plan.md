@@ -104,7 +104,9 @@ warnings; it builds no bodies.
 - **Exemptions:** the std package, items of dependency packages (report the
   user's packages only), wasm `import` declarations, anything named by the
   export block, `pub` items of a `lib` package, trait declarations' members,
-  trait impls' members, and `_`-prefixed names (decide).
+  trait impls' members. Not `_`-prefixed names, and not trait impls'
+  parameters: an unused parameter is dropped in the body, `_ = param;`
+  (`notes/binders.md`).
 
 ### Step 2: a TIR dependency graph
 
@@ -205,7 +207,13 @@ local to one body, so a graph adds nothing).
 
 - Does `ReadWrite` count as a read for W2001? rustc flags a variable that is only
   ever compound-assigned. Leaning: no, `Read` only.
-- `_`-prefixed names exempt, or only the bare `_`?
+- ~~`_`-prefixed names exempt, or only the bare `_`?~~ Decided 2026-11-16
+  (`notes/binders.md`): no exemption. `_` is no longer a binder, and a
+  parameter's name is part of its function's interface (calls by name, trait
+  conformance), so renaming it to silence W2001 would break callers. A local
+  or parameter that is never read is warned; the fix is to read it or drop it,
+  `_ = x;`, which counts as a read of `x` (`ExprKind::Drop`'s operand is an
+  ordinary value read).
 - Open enums name only some values; unused-variant warnings are probably wrong
   there.
 - Report only the root package, or every package the user owns?
