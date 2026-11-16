@@ -2525,27 +2525,40 @@ impl<'a> Builder<'a> {
 				block,
 			} => {
 				let mut items = vec![self.labelled_keyword(Text::Loop, label)];
-				// The parameters are printed on the keyword's line, each as a
-				// function's parameter is, then its initial value.
+				// The parameters are laid out as a function's are, each
+				// followed by its initial value.
 				if let Some(header) = header {
 					let ast::LoopHeader { params, initials } =
 						ast.loop_header(header);
-					items.push(self.text(Text::LParen));
-					let params =
-						ast.list(params).iter().zip(ast.list(initials));
-					for (index, (param, &initial)) in params.enumerate() {
-						if index > 0 {
-							items.push(self.text(Text::CommaSp));
+					let mut paren_nodes: Vec<NodeId> =
+						vec![self.text(Text::LParen)];
+					let params = ast.list(params);
+					if !params.is_empty() {
+						let mut nodes: Vec<NodeId> = vec![self.line()];
+						let entries =
+							params.iter().zip(ast.list(initials)).enumerate();
+						for (index, (param, &initial)) in entries {
+							self.build_binding_and_type(
+								&mut nodes,
+								param.binding,
+								param.ty,
+							);
+							nodes.push(self.text(Text::EqSp));
+							nodes.push(self.build_expression(initial));
+							if index + 1 < params.len() {
+								nodes.push(self.text(Text::Comma));
+								nodes.push(self.soft_line());
+							} else {
+								nodes.push(self.if_break_comma());
+							}
 						}
-						self.build_binding_and_type(
-							&mut items,
-							param.binding,
-							param.ty,
-						);
-						items.push(self.text(Text::EqSp));
-						items.push(self.build_expression(initial));
+						let nodes = self.arena.concat(nodes);
+						paren_nodes.push(self.arena.indent(nodes));
+						paren_nodes.push(self.line());
 					}
-					items.push(self.text(Text::RParen));
+					paren_nodes.push(self.text(Text::RParen));
+					let paren_nodes = self.arena.concat(paren_nodes);
+					items.push(self.arena.group(paren_nodes));
 					items.push(self.text(Text::Space));
 				}
 				items.push(

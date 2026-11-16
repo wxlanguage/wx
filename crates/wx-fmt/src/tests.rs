@@ -3818,6 +3818,30 @@ fn loop_parameters_and_a_continue_value_are_printed_after_their_labels() {
 }
 
 #[test]
+fn loop_parameters_too_long_for_a_line_are_printed_one_per_line() {
+	let expected = indoc! {"
+        func f() {
+            loop (
+                lines: u32 = 0,
+                words: u32 = 0,
+                bytes: u32 = 0,
+                in_word: Bool = False,
+            ) {}
+        }
+    "};
+	assert_eq!(
+		checked_format(
+			"func f() { loop (lines: u32 = 0, words: u32 = 0, bytes: u32 = 0, \
+			 in_word: Bool = False) {} }",
+			80,
+			4,
+		),
+		expected
+	);
+	assert_eq!(checked_format(expected, 80, 4), expected);
+}
+
+#[test]
 fn a_named_list_is_printed_as_a_call_by_names_arguments() {
 	for (source, expected) in [
 		("({i:i+1,total})", "({ i: i + 1, total })"),

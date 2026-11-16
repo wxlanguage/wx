@@ -661,21 +661,16 @@ func write_all(fd: Fd, bytes: heap::&[u8]) {
 
 // Decimal, not hex, so the demo output reads naturally; values here are all
 // small (enum tags, event counts), so a 10-digit buffer is more than enough.
-func write_decimal(fd: Fd, mut value: u32) {
+func write_decimal(fd: Fd, value: u32) {
     local alloc = allocator();
     local buf = alloc.allocate_slice_uninit::<u8>(10);
-    local mut i: u32 = 10;
-    if value == 0 {
+    local i = loop (mut i: u32 = 10, value = value) {
         i -= 1;
-        buf[i] = '0';
-    } else {
-        loop {
-            if value == 0 { break };
-            i -= 1;
-            buf[i] = '0' + transmute::<_, u8>(value % 10);
-            value /= 10;
-        }
-    }
+        buf[i] = '0' + transmute::<_, u8>(value % 10);
+        local rest = value / 10;
+        if rest == 0 { break i };
+        (i, rest)
+    };
     write_all(fd, slice_from_parts(buf[i].&, 10 - i));
 }
 

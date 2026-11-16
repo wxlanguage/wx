@@ -95,9 +95,9 @@ impl Allocator for BumpAllocator {
 func test() {
     local range: Range<u32> = Range({ start: 0, end: 10 });
     local range_iter = range.into_iter();
-    loop {
+    loop (i: u32 = 0) {
         local x = range_iter.next();
         if i > 10 { break };
-        i += 1;
+        continue i + 1;
     };
 }

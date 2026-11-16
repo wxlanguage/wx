@@ -23,44 +23,28 @@ trait Hasher: StackValue {
     /// Absorb a 32-bit word as its four little-endian bytes.
     #[inline]
     func write_u32(self: Self, word: u32) -> Self {
-        local mut state = self;
-        local mut rest = u64_extend_u32(word);
-        local mut i: u64 = 0;
-        loop {
-            if i == 4 { break };
-            state = state.write_byte(low_byte(rest));
-            rest >>= 8;
-            i += 1;
+        loop (state = self, rest = u64_extend_u32(word), i: u64 = 0) {
+            if i == 4 { break state };
+            (state.write_byte(low_byte(rest)), rest >> 8, i + 1)
         }
-        state
     }
 
     /// Absorb a 64-bit word as its eight little-endian bytes.
     #[inline]
     func write_u64(self: Self, word: u64) -> Self {
-        local mut state = self;
-        local mut rest = word;
-        local mut i: u64 = 0;
-        loop {
-            if i == 8 { break };
-            state = state.write_byte(low_byte(rest));
-            rest >>= 8;
-            i += 1;
+        loop (state = self, rest = word, i: u64 = 0) {
+            if i == 8 { break state };
+            (state.write_byte(low_byte(rest)), rest >> 8, i + 1)
         }
-        state
     }
 
     /// Absorb a run of bytes that already lives in a memory.
     #[inline]
     func write_bytes<Mem: Memory>(self: Self, bytes: Mem::&[u8]) -> Self {
-        local mut state = self;
-        local mut i: Mem::Size = 0;
-        loop {
-            if i == bytes.len() { break };
-            state = state.write_byte(bytes[i]);
-            i += 1;
+        loop (state = self, i: Mem::Size = 0) {
+            if i == bytes.len() { break state };
+            (state.write_byte(bytes[i]), i + 1)
         }
-        state
     }
 
     /// Rust's `hasher.hash(value)`, with the state threaded through instead of

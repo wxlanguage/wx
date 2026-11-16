@@ -13,14 +13,14 @@ pub const HEX_LEN: u32 = 8;
 
 /// `value` in decimal, written at the end of `buffer`, which must hold
 /// `DECIMAL_LEN` bytes.
-pub func decimal<M: Memory>(buffer: M::*[u8], mut value: u32) -> M::&[u8] {
-    local mut at = buffer.len();
-    loop {
+pub func decimal<M: Memory>(buffer: M::*[u8], value: u32) -> M::&[u8] {
+    local at = loop (mut at = buffer.len(), value = value) {
         at -= 1;
         buffer[at] = transmute('0' + value % 10);
-        value /= 10;
-        if value == 0 { break };
-    }
+        local rest = value / 10;
+        if rest == 0 { break at };
+        (at, rest)
+    };
     slices::slice_at(buffer, at, buffer.len() - at)
 }
 
@@ -37,9 +37,8 @@ pub func signed<M: Memory>(buffer: M::*[u8], value: i32) -> M::&[u8] {
 
 /// `value` in lowercase hexadecimal without leading zeros, written at the end
 /// of `buffer`, which must hold `HEX_LEN` bytes.
-pub func hex<M: Memory>(buffer: M::*[u8], mut value: u32) -> M::&[u8] {
-    local mut at = buffer.len();
-    loop {
+pub func hex<M: Memory>(buffer: M::*[u8], value: u32) -> M::&[u8] {
+    local at = loop (mut at = buffer.len(), value = value) {
         at -= 1;
         local digit = value % 16;
         buffer[at]
@@ -48,8 +47,9 @@ pub func hex<M: Memory>(buffer: M::*[u8], mut value: u32) -> M::&[u8] {
             } else {
                 'a' + digit - 10
             });
-        value /= 16;
-        if value == 0 { break };
-    }
+        local rest = value / 16;
+        if rest == 0 { break at };
+        (at, rest)
+    };
     slices::slice_at(buffer, at, buffer.len() - at)
 }

@@ -24,28 +24,30 @@ func main() {
     local arena = wasi::arena();
     local buffer = arena.allocate_slice_uninit::<u8>(4096);
     local digits = arena.allocate_slice_uninit::<u8>(fmt::DECIMAL_LEN);
-    local mut lines: u32 = 0;
-    local mut words: u32 = 0;
-    local mut bytes: u32 = 0;
-    // Whether the previous byte, in this chunk or an earlier one, was in a word.
-    local mut in_word = False;
-    loop {
+    // `in_word`: whether the previous byte, in this chunk or an earlier one,
+    // was in a word.
+    local (lines, words, bytes) = loop (
+        lines: u32 = 0,
+        words: u32 = 0,
+        bytes: u32 = 0,
+        in_word = False,
+    ) {
         local chunk = Fd::STDIN.read(arena, buffer);
-        if chunk.len() == 0 { break };
-        bytes += chunk.len();
-        loop (i: u32 = 0) {
-            if i == chunk.len() { break };
+        if chunk.len() == 0 { break (lines, words, bytes) };
+        local (lines, words, in_word) = loop (
+            i: u32 = 0,
+            lines = lines,
+            words = words,
+            in_word = in_word,
+        ) {
+            if i == chunk.len() { break (lines, words, in_word) };
             local byte = chunk[i];
-            if byte == '\n' { lines += 1 };
-            if is_space(byte) {
-                in_word = False;
-            } else {
-                if !in_word { words += 1 };
-                in_word = True;
-            }
-            continue i + 1;
-        }
-    }
+            local lines = if byte == '\n' { lines + 1 } else { lines };
+            if is_space(byte) { continue (i + 1, lines, words, False) };
+            (i + 1, lines, if in_word { words } else { words + 1 }, True)
+        };
+        (lines, words, bytes + chunk.len(), in_word)
+    };
     print(arena, digits, lines, " ");
     print(arena, digits, words, " ");
     print(arena, digits, bytes, "\n");

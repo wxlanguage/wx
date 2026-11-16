@@ -63,13 +63,10 @@ pub func demo() -> i32 {
     local n2 = Node::new(2, n1);
     local n3 = Node::new(3, n2);
 
-    local mut sum: i32 = 0;
-    local mut cur = n3;
-    loop {
+    loop (sum: i32 = 0, cur = n3) {
         if cur.is_null() { break sum };
         local node = cur.as_ref();
-        sum += node.value;
-        cur = node.next;
+        (sum + node.value, node.next)
     }
 }
 

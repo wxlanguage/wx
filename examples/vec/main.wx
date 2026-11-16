@@ -110,19 +110,15 @@ pub func demo() -> i32 {
     local alloc = bootstrap_allocator();
     local v = Vec::<i32>::new_in(alloc);
 
-    local mut n: i32 = 1;
-    loop {
+    loop (n: i32 = 1) {
         if n > 10 { break };
         v.push(n);
-        n += 1;
+        continue n + 1;
     }
 
-    local mut sum: i32 = 0;
-    local mut i: u32 = 0;
-    loop {
+    loop (sum: i32 = 0, i: u32 = 0) {
         if i == v.len() { break sum };
-        sum += v.get(i);
-        i += 1;
+        (sum + v.get(i), i + 1)
     }
 }
 

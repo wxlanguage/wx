@@ -54,19 +54,15 @@ func is_wall(x: f64, y: f64) -> Bool {
 // Scans row-major for the first open cell and spawns the player there, so an
 // uploaded map doesn't need to guarantee any particular cell is walkable.
 func find_spawn() {
-    local mut found = False;
-    loop (y: i32 = 0) {
-        if found { break };
+    loop :rows (y: i32 = 0) {
         if y >= transmute(map_h.get()) { break };
-        local mut x: i32 = 0;
         loop (x: i32 = 0) {
-            if found { break };
             if x >= transmute(map_w.get()) { break };
             if map_at(x, y) == 0 {
                 player_x.set(x.to_f64() + 0.5);
                 player_y.set(y.to_f64() + 0.5);
                 player_angle.set(0.0);
-                found = True;
+                break :rows;
             }
             continue x + 1;
         }
@@ -131,8 +127,8 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
     local dir_x = angle.cos();
     local dir_y = angle.sin();
 
-    local mut map_x = ox.floor().to_i32();
-    local mut map_y = oy.floor().to_i32();
+    local map_x = ox.floor().to_i32();
+    local map_y = oy.floor().to_i32();
 
     local mut delta_dist_x: f64 = 1000000000000.0;
     local mut delta_dist_y: f64 = 1000000000000.0;
@@ -159,21 +155,21 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
         side_dist_y = (map_y.to_f64() + 1.0 - oy) * delta_dist_y;
     }
 
-    local mut side: i32 = 0;
-    local mut hit = False;
-    loop {
-        if hit { break };
+    local (map_x, map_y, side) = loop (
+        map_x = map_x,
+        map_y = map_y,
+        side_dist_x = side_dist_x,
+        side_dist_y = side_dist_y,
+    ) {
         if side_dist_x < side_dist_y {
-            side_dist_x += delta_dist_x;
-            map_x += step_x;
-            side = 0;
-        } else {
-            side_dist_y += delta_dist_y;
-            map_y += step_y;
-            side = 1;
+            local map_x = map_x + step_x;
+            if map_at(map_x, map_y) != 0 { break (map_x, map_y, (0: i32)) };
+            continue (map_x, map_y, side_dist_x + delta_dist_x, side_dist_y);
         }
-        if map_at(map_x, map_y) != 0 { hit = True }
-    }
+        local map_y = map_y + step_y;
+        if map_at(map_x, map_y) != 0 { break (map_x, map_y, 1) };
+        (map_x, map_y, side_dist_x, side_dist_y + delta_dist_y)
+    };
 
     local dist = if side == 0 {
         (map_x.to_f64() - ox + (1.0 - step_x.to_f64()) / 2.0) / dir_x

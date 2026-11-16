@@ -175,11 +175,13 @@ func draw() {
         0xFFFFFF00,
     );
 
-    local mut cur = RawPtr::<heap, Node>::from_addr(head.get());
-    local mut color: u32 = 0xFFFF0000; // the head, then the body
-    loop {
-        if cur.is_null() { break };
-        local n = cur.as_ref();
+    // The head is red, then the body green.
+    loop (
+        curr = RawPtr::<heap, Node>::from_addr(head.get()),
+        color: u32 = 0xFFFF0000,
+    ) {
+        if curr.is_null() { break };
+        local n = curr.as_ref();
         host::draw_rect(
             n.x * CELL_SIZE,
             n.y * CELL_SIZE,
@@ -187,8 +189,7 @@ func draw() {
             CELL_SIZE,
             color,
         );
-        color = 0xFF00FF00;
-        cur = n.next;
+        (n.next, 0xFF00FF00)
     }
 }
 
